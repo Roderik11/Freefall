@@ -1,0 +1,27 @@
+# Build output
+bin/
+obj/
+
+# Visual Studio
+.vs/
+
+# Debug/log files
+*.txt
+*.log
+
+# Temporary shader files
+debug_shader.fx
+
+# PowerShell scripts (dev-only)
+*.ps1
+
+# Binary resources (textures, terrain data)
+*.dds
+*.png
+Resources/Terrain/
+
+# Antigravity agent
+.agent/
+
+# Backup files
+*.backup

@@ -1,0 +1,211 @@
+#include "common.fx"
+// @RenderState(RenderTargets=4)
+
+// Unified Push Constant Layout (Slots 2-11)
+// Used by all batched geometry shaders (gbuffer, gbuffer_skinned, mesh_skybox)
+// Slots 0-1: Reserved for light/composition passes (texture indices)
+#define TransformSlotsIdx GET_INDEX(2)  // StructuredBuffer<uint> - transform slot per instance
+#define MaterialIDsIdx GET_INDEX(3)     // StructuredBuffer<uint> - material ID per instance
+#define SortedIndicesIdx GET_INDEX(4)   // StructuredBuffer<uint> - sorted draw order indices
+#define BoneWeightsIdx GET_INDEX(5)     // Unused for static meshes (0)
+#define BonesIdx GET_INDEX(6)           // Unused for static meshes (0)
+#define IndexBufferIdx GET_INDEX(7)     // StructuredBuffer<uint> - mesh index buffer (BINDLESS!)
+#define BaseIndex GET_INDEX(8)          // Base index offset into index buffer for mesh parts
+#define PosBufferIdx GET_INDEX(9)       // StructuredBuffer<float3> - vertex positions
+#define NormBufferIdx GET_INDEX(10)     // StructuredBuffer<float3> - vertex normals
+#define UVBufferIdx GET_INDEX(11)       // StructuredBuffer<float2> - vertex UVs
+#define NumBones GET_INDEX(12)           // Number of bones (for skinned shaders)
+#define InstanceBaseOffset GET_INDEX(13) // Base offset for instance ID (per-command)
+#define DebugMode GET_INDEX(16)          // Debug visualization mode (set per-frame, not per-draw)
+
+struct VSOutput
+{
+    float4 Position : SV_POSITION;
+    float3 Normal : NORMAL;
+    float2 TexCoord : TEXCOORD0;
+    float4 WorldPos : TEXCOORD1;
+    nointerpolation uint MaterialID : TEXCOORD2;
+    float Depth : TEXCOORD3;
+};
+
+VSOutput VS(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_InstanceID)
+{
+    VSOutput output;
+
+    // Instance data buffers - now using slot indices instead of direct transforms
+    StructuredBuffer<uint> transformSlots = ResourceDescriptorHeap[TransformSlotsIdx];
+    StructuredBuffer<row_major matrix> globalTransforms = ResourceDescriptorHeap[GlobalTransformBufferIdx];
+    StructuredBuffer<uint> materialIDs = ResourceDescriptorHeap[MaterialIDsIdx];
+    StructuredBuffer<uint> sortedIndices = ResourceDescriptorHeap[SortedIndicesIdx];
+    
+    // Bindless index buffer - primitiveVertexID is 0 to N-1, add BaseIndex to offset into correct mesh part
+    StructuredBuffer<uint> indices = ResourceDescriptorHeap[IndexBufferIdx];
+    uint vertexID = indices[primitiveVertexID + BaseIndex];
+    
+    // Mesh data buffers - use resolved vertexID
+    StructuredBuffer<float3> positions = ResourceDescriptorHeap[PosBufferIdx];
+    StructuredBuffer<float3> normals = ResourceDescriptorHeap[NormBufferIdx];
+    StructuredBuffer<float2> uvs = ResourceDescriptorHeap[UVBufferIdx];
+    
+    // Get instance data position using InstanceBaseOffset + local instance ID
+    // Both sortedIndices and materialIDs are indexed by this same position (order-independent design)
+    uint dataPos = InstanceBaseOffset + instanceID;
+    
+    // sortedIndices contains TransformSlot directly (compacted by prefix sum)
+    uint slot = sortedIndices[dataPos];
+    
+    row_major matrix World = globalTransforms[slot];
+    
+    // materialIDs indexed by same position as sortedIndices
+    uint materialID = materialIDs[dataPos];
+    
+    float3 pos = positions[vertexID];
+    float3 norm = normals[vertexID];
+    float2 uv = uvs[vertexID];
+    
+    // Apply world transform (no skinning for static meshes)
+    float4 worldPos = mul(float4(pos, 1.0f), World);
+    output.WorldPos = worldPos;
+    output.Position = mul(mul(worldPos, View), Projection);
+    
+    // X-ray mode: push occluded instances (high bit set) to near depth
+    // so they always pass the depth test and render on top
+    if (materialID & 0x80000000u)
+        output.Position.z = 0.0;
+    
+    output.Normal = mul(norm, (float3x3)World);
+    output.TexCoord = uv;
+    output.TexCoord.y = 1 - output.TexCoord.y;
+    output.MaterialID = materialID;
+    output.Depth = output.Position.w; // View-space Z (linear)
+    return output;
+}
+
+struct PSOutput
+{
+    float4 Albedo : SV_Target0;
+    float4 Normal : SV_Target1;
+    float4 Data : SV_Target2;
+    float  Depth : SV_Target3;
+};
+
+// Shadow pass - minimal output structure
+struct ShadowVSOutput
+{
+    float4 Position : SV_POSITION;
+    float2 TexCoord : TEXCOORD0;
+    nointerpolation uint MaterialID : TEXCOORD1;
+};
+
+SamplerState Sampler : register(s0);
+
+// Shadow vertex shader - minimal output for depth-only rendering
+ShadowVSOutput VS_Shadow(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_InstanceID)
+{
+    ShadowVSOutput output;
+
+    StructuredBuffer<row_major matrix> globalTransforms = ResourceDescriptorHeap[GlobalTransformBufferIdx];
+    StructuredBuffer<uint> materialIDs = ResourceDescriptorHeap[MaterialIDsIdx];
+    StructuredBuffer<uint> sortedIndices = ResourceDescriptorHeap[SortedIndicesIdx];
+    
+    StructuredBuffer<uint> indices = ResourceDescriptorHeap[IndexBufferIdx];
+    uint vertexID = indices[primitiveVertexID + BaseIndex];
+    
+    StructuredBuffer<float3> positions = ResourceDescriptorHeap[PosBufferIdx];
+    StructuredBuffer<float2> uvs = ResourceDescriptorHeap[UVBufferIdx];
+    
+    uint dataPos = InstanceBaseOffset + instanceID;
+    uint slot = sortedIndices[dataPos];
+    row_major matrix World = globalTransforms[slot];
+    uint materialID = materialIDs[dataPos];
+    
+    float3 pos = positions[vertexID];
+    float2 uv = uvs[vertexID];
+    
+    float4 worldPos = mul(float4(pos, 1.0f), World);
+    output.Position = mul(mul(worldPos, View), Projection);
+    output.TexCoord = uv;
+    output.TexCoord.y = 1 - output.TexCoord.y;
+    output.MaterialID = materialID;
+    return output;
+}
+
+// Shadow pixel shader - alpha test only, depth written by hardware
+void PS_Shadow(ShadowVSOutput input)
+{
+    MaterialData mat = GET_MATERIAL(input.MaterialID);
+    Texture2D albedoTex = ResourceDescriptorHeap[mat.AlbedoIdx];
+    float alpha = albedoTex.Sample(Sampler, input.TexCoord).a;
+    clip(alpha - 0.25f);
+}
+
+PSOutput PS(VSOutput input)
+{
+    PSOutput output;
+    
+    // Unpack occlusion flag from materialID high bit (packed by CSGlobalScatter)
+    uint rawMaterialID = input.MaterialID;
+    bool isOccluded = (rawMaterialID & 0x80000000u) != 0;
+    uint materialID = rawMaterialID & 0x7FFFFFFFu;
+    
+    // Material lookup via MaterialID indirection
+    MaterialData mat = GET_MATERIAL(materialID);
+    Texture2D albedoTex = ResourceDescriptorHeap[mat.AlbedoIdx];
+    
+    float4 color = albedoTex.Sample(Sampler, input.TexCoord);
+    clip(color.a - 0.25f);
+    
+    // X-Ray occlusion debug mode (mode 4)
+    if (DebugMode == 4)
+    {
+        if (isOccluded)
+        {
+            // Color-code occluded instances using a hash of the transform slot
+            // Simple integer hash -> hue for distinct per-object colors
+            float hue = frac((float)(materialID * 2654435761u) * (1.0 / 4294967296.0));
+            float3 xrayColor = float3(
+                abs(hue * 6.0 - 3.0) - 1.0,
+                2.0 - abs(hue * 6.0 - 2.0),
+                2.0 - abs(hue * 6.0 - 4.0)
+            );
+            xrayColor = saturate(xrayColor);
+            
+            output.Albedo = float4(xrayColor * 0.7, 0.5);
+            output.Normal = float4(normalize(input.Normal), 0.0); // alpha=0 marks x-ray
+            output.Data = float4(1, 0, 0, 1); // x-ray flag in Data.r
+            output.Depth = 99999.0; // Push to far so it renders behind everything
+        }
+        else
+        {
+            // Visible instances: desaturate to make occluded pop
+            float luma = dot(color.rgb, float3(0.299, 0.587, 0.114));
+            output.Albedo = float4(lerp(float3(luma, luma, luma), color.rgb, 0.3), color.a);
+            output.Normal = float4(normalize(input.Normal), 1.0);
+            output.Data = float4(0, 0, 0, 1);
+            output.Depth = input.Depth;
+        }
+        return output;
+    }
+    
+    output.Albedo = color;
+    output.Normal = float4(normalize(input.Normal), 1.0f);
+    output.Data = float4(0, 0, 0, 1);
+    output.Depth = input.Depth;
+    return output;
+}
+
+technique11 GBuffer
+{
+    pass Opaque
+    {
+        SetVertexShader(CompileShader(vs_6_6, VS()));
+        SetPixelShader(CompileShader(ps_6_6, PS()));
+    }
+    
+    pass Shadow
+    {
+        SetVertexShader(CompileShader(vs_6_6, VS_Shadow()));
+        SetPixelShader(CompileShader(ps_6_6, PS_Shadow()));
+    }
+}
+
