@@ -59,15 +59,21 @@ VSOutput VS(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_InstanceI
     StructuredBuffer<float2> uvs = ResourceDescriptorHeap[UVBufferIdx];
     
     // Get instance data position using InstanceBaseOffset + local instance ID
-    // Both sortedIndices and materialIDs are indexed by this same position (order-independent design)
     uint dataPos = InstanceBaseOffset + instanceID;
     
-    // sortedIndices contains TransformSlot directly (compacted by prefix sum)
-    uint slot = sortedIndices[dataPos];
-    row_major matrix World = globalTransforms[slot];
+    // sortedIndices contains compacted original instanceIdx (with occlusion flag in high bit)
+    uint packedIdx = sortedIndices[dataPos];
+    bool isOccluded = (packedIdx & 0x80000000u) != 0;
+    uint idx = packedIdx & 0x7FFFFFFFu;
     
-    // materialIDs indexed by same position as sortedIndices
-    uint materialID = materialIDs[dataPos];
+    // Double-indirect: use original instance index to look up per-instance data from input buffers
+    uint slot = transformSlots[idx];
+    uint materialID = materialIDs[idx];
+    
+    // Re-pack occlusion flag into materialID high bit for PS
+    if (isOccluded)
+        materialID |= 0x80000000u;
+    row_major matrix World = globalTransforms[slot];
     
     float3 pos = positions[vertexID];
     float3 norm = normals[vertexID];
@@ -106,7 +112,7 @@ VSOutput VS(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_InstanceI
     output.Position = mul(mul(worldPos, View), Projection);
     
     // X-ray mode: push occluded instances (high bit set) to near depth
-    if (materialID & 0x80000000u)
+    if (isOccluded)
         output.Position.z = 0.0;
     
     output.Normal = mul(norm, (float3x3)World);
@@ -153,9 +159,14 @@ ShadowVSOutput VS_Shadow(uint primitiveVertexID : SV_VertexID, uint instanceID :
     StructuredBuffer<float2> uvs = ResourceDescriptorHeap[UVBufferIdx];
     
     uint dataPos = InstanceBaseOffset + instanceID;
-    uint slot = sortedIndices[dataPos];
+    uint packedIdx = sortedIndices[dataPos];
+    uint idx = packedIdx & 0x7FFFFFFFu;
+    
+    // Double-indirect: use original instance index to look up per-instance data
+    StructuredBuffer<uint> transformSlots = ResourceDescriptorHeap[TransformSlotsIdx];
+    uint slot = transformSlots[idx];
     row_major matrix World = globalTransforms[slot];
-    uint materialID = materialIDs[dataPos];
+    uint materialID = materialIDs[idx];
     
     float3 pos = positions[vertexID];
     float2 uv = uvs[vertexID];

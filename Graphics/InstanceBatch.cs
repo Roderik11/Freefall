@@ -90,11 +90,7 @@ namespace Freefall.Graphics
         private uint[] visibleIndicesSRVIndices = new uint[FrameCount];
         private CpuDescriptorHandle[] visibleIndicesCPUHandles = new CpuDescriptorHandle[FrameCount];
         
-        // GPU output: scattered material IDs (same order as visibleIndices)
-        private ID3D12Resource[] scatteredMaterialBuffers = new ID3D12Resource[FrameCount];
-        private uint[] scatteredMaterialUAVIndices = new uint[FrameCount];
-        private uint[] scatteredMaterialSRVIndices = new uint[FrameCount];
-        private CpuDescriptorHandle[] scatteredMaterialCPUHandles = new CpuDescriptorHandle[FrameCount];
+
         
         // GPU output: indirect commands (compute shader writes)
         private ID3D12Resource[] gpuCommandBuffers = new ID3D12Resource[FrameCount];
@@ -125,9 +121,7 @@ namespace Freefall.Graphics
         private ID3D12Resource[,] shadowVisibleIndicesBuffers = new ID3D12Resource[FrameCount, ShadowCascadeCount];
         private uint[,] shadowVisibleIndicesUAVIndices = new uint[FrameCount, ShadowCascadeCount];
         private uint[,] shadowVisibleIndicesSRVIndices = new uint[FrameCount, ShadowCascadeCount];
-        private ID3D12Resource[,] shadowScatteredMaterialBuffers = new ID3D12Resource[FrameCount, ShadowCascadeCount];
-        private uint[,] shadowScatteredMaterialUAVIndices = new uint[FrameCount, ShadowCascadeCount];
-        private uint[,] shadowScatteredMaterialSRVIndices = new uint[FrameCount, ShadowCascadeCount];
+
         private ID3D12Resource[,] shadowCommandBuffers = new ID3D12Resource[FrameCount, ShadowCascadeCount];
         private uint[,] shadowCommandUAVIndices = new uint[FrameCount, ShadowCascadeCount];
         private ID3D12Resource[,] shadowCounterBuffers = new ID3D12Resource[FrameCount, ShadowCascadeCount];
@@ -139,7 +133,7 @@ namespace Freefall.Graphics
         private CpuDescriptorHandle[,] shadowCounterCPUHandles = new CpuDescriptorHandle[FrameCount, ShadowCascadeCount];
         private CpuDescriptorHandle[,] shadowVisibleIndicesCPUHandles = new CpuDescriptorHandle[FrameCount, ShadowCascadeCount];
         private CpuDescriptorHandle[,] shadowHistogramCPUHandles = new CpuDescriptorHandle[FrameCount, ShadowCascadeCount];
-        private CpuDescriptorHandle[,] shadowScatteredMaterialCPUHandles = new CpuDescriptorHandle[FrameCount, ShadowCascadeCount];
+
 
         // Bone buffers per mesh
         private Dictionary<Mesh, (ID3D12Resource[] Buffers, uint[] Indices, int Capacity)> meshBoneBuffers = new();
@@ -259,12 +253,6 @@ namespace Freefall.Graphics
                 visibleIndicesSRVIndices[i] = Engine.Device.AllocateBindlessIndex();
                 Engine.Device.CreateStructuredBufferSRV(visibleIndicesBuffers[i], (uint)capacity, 4, visibleIndicesSRVIndices[i]);
                 
-                // GPU output: scattered material IDs (compute shader writes, same order as visibleIndices)
-                scatteredMaterialBuffers[i] = Engine.Device.CreateDefaultBuffer(slotSize);
-                scatteredMaterialUAVIndices[i] = Engine.Device.AllocateBindlessIndex();
-                Engine.Device.CreateStructuredBufferUAV(scatteredMaterialBuffers[i], (uint)capacity, 4, scatteredMaterialUAVIndices[i]);
-                scatteredMaterialSRVIndices[i] = Engine.Device.AllocateBindlessIndex();
-                Engine.Device.CreateStructuredBufferSRV(scatteredMaterialBuffers[i], (uint)capacity, 4, scatteredMaterialSRVIndices[i]);
 
                 // GPU output: indirect commands (compute shader writes)
                 gpuCommandBuffers[i] = Engine.Device.CreateDefaultBuffer(commandSize);
@@ -401,7 +389,7 @@ namespace Freefall.Graphics
             var cpuHeapDesc = new DescriptorHeapDescription
             {
                 Type = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView,
-                DescriptorCount = FrameCount * 4,
+                DescriptorCount = FrameCount * 3,
                 Flags = DescriptorHeapFlags.None
             };
             _cpuHeap = device.NativeDevice.CreateDescriptorHeap(cpuHeapDesc);
@@ -475,21 +463,6 @@ namespace Freefall.Graphics
                 device.NativeDevice.CreateUnorderedAccessView(histogramBuffers[i], null, histogramUavDesc, histogramCpuHandle);
                 histogramCPUHandles[i] = histogramCpuHandle;
                 
-                var scatteredMaterialCpuHandle = _cpuHeap.GetCPUDescriptorHandleForHeapStart() + ((int)((3 * FrameCount + i) * handleIncrementSize));
-                var scatteredMaterialUavDesc = new UnorderedAccessViewDescription
-                {
-                    Format = Vortice.DXGI.Format.Unknown,
-                    ViewDimension = UnorderedAccessViewDimension.Buffer,
-                    Buffer = new BufferUnorderedAccessView
-                    {
-                        FirstElement = 0,
-                        NumElements = (uint)capacity,
-                        StructureByteStride = sizeof(uint),
-                        Flags = BufferUnorderedAccessViewFlags.None
-                    }
-                };
-                device.NativeDevice.CreateUnorderedAccessView(scatteredMaterialBuffers[i], null, scatteredMaterialUavDesc, scatteredMaterialCpuHandle);
-                scatteredMaterialCPUHandles[i] = scatteredMaterialCpuHandle;
             }
         }
 
@@ -527,8 +500,7 @@ namespace Freefall.Graphics
             commandList.SetComputeRoot32BitConstant(0, Material.MaterialsBufferIndex, 25);
             commandList.SetComputeRoot32BitConstant(0, histogramUAVIndices[frameIndex], 26);
             commandList.SetComputeRoot32BitConstant(0, (uint)MeshRegistry.Count, 27);
-            commandList.SetComputeRoot32BitConstant(0, scatteredMaterialUAVIndices[frameIndex], 28);
-            commandList.SetComputeRoot32BitConstant(0, scatteredMaterialSRVIndices[frameIndex], 29);
+
             
             // Bone buffer for skinned batches (0 for static)
             uint boneBufferIdx = 0;
@@ -558,11 +530,7 @@ namespace Freefall.Graphics
                 histogramBuffers[frameIndex],
                 new Vortice.Mathematics.Int4(0, 0, 0, 0));
             
-            commandList.ClearUnorderedAccessViewUint(
-                device.GetGpuHandle(scatteredMaterialUAVIndices[frameIndex]),
-                scatteredMaterialCPUHandles[frameIndex],
-                scatteredMaterialBuffers[frameIndex],
-                new Vortice.Mathematics.Int4(0, 0, 0, 0));
+
             
             commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(null)));
 
@@ -604,7 +572,7 @@ namespace Freefall.Graphics
             int histogramSize = MeshRegistry.MaxMeshParts * sizeof(uint);
 
             // CPU descriptor heap for ClearUnorderedAccessViewUint (4 buffers per frame per cascade)
-            int totalShadowDescriptors = FrameCount * ShadowCascadeCount * 4;
+            int totalShadowDescriptors = FrameCount * ShadowCascadeCount * 3;
             var cpuHeapDesc = new DescriptorHeapDescription
             {
                 Type = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView,
@@ -644,24 +612,7 @@ namespace Freefall.Graphics
                     shadowVisibleIndicesCPUHandles[f, c] = visibleCpuHandle;
                     descriptorIdx++;
 
-                    // Scattered material IDs
-                    shadowScatteredMaterialBuffers[f, c] = device.CreateDefaultBuffer(instanceBufferSize);
-                    shadowScatteredMaterialUAVIndices[f, c] = device.AllocateBindlessIndex();
-                    device.CreateStructuredBufferUAV(shadowScatteredMaterialBuffers[f, c], (uint)capacity, sizeof(uint), shadowScatteredMaterialUAVIndices[f, c]);
-                    shadowScatteredMaterialSRVIndices[f, c] = device.AllocateBindlessIndex();
-                    device.CreateStructuredBufferSRV(shadowScatteredMaterialBuffers[f, c], (uint)capacity, sizeof(uint), shadowScatteredMaterialSRVIndices[f, c]);
 
-                    // CPU handle for scattered material clear
-                    var scatteredCpuHandle = _shadowCpuHeap.GetCPUDescriptorHandleForHeapStart() + (int)(descriptorIdx * handleIncrement);
-                    var scatteredUavDesc = new UnorderedAccessViewDescription
-                    {
-                        Format = Vortice.DXGI.Format.Unknown,
-                        ViewDimension = UnorderedAccessViewDimension.Buffer,
-                        Buffer = new BufferUnorderedAccessView { FirstElement = 0, NumElements = (uint)capacity, StructureByteStride = sizeof(uint) }
-                    };
-                    device.NativeDevice.CreateUnorderedAccessView(shadowScatteredMaterialBuffers[f, c], null, scatteredUavDesc, scatteredCpuHandle);
-                    shadowScatteredMaterialCPUHandles[f, c] = scatteredCpuHandle;
-                    descriptorIdx++;
 
                     // Indirect commands
                     shadowCommandBuffers[f, c] = device.CreateDefaultBuffer(commandSize);
@@ -743,8 +694,7 @@ namespace Freefall.Graphics
             commandList.SetComputeRoot32BitConstant(0, Material.MaterialsBufferIndex, 25);
             commandList.SetComputeRoot32BitConstant(0, shadowHistogramUAVIndices[frameIndex, cascadeIndex], 26);
             commandList.SetComputeRoot32BitConstant(0, (uint)MeshRegistry.Count, 27);
-            commandList.SetComputeRoot32BitConstant(0, shadowScatteredMaterialUAVIndices[frameIndex, cascadeIndex], 28);
-            commandList.SetComputeRoot32BitConstant(0, shadowScatteredMaterialSRVIndices[frameIndex, cascadeIndex], 29);
+
             // Bone buffer for skinned batches (0 for static)
             uint boneBufferIdx = 0;
             if (IsSkinned && _drawCount > 0)
@@ -775,11 +725,7 @@ namespace Freefall.Graphics
                 shadowHistogramBuffers[frameIndex, cascadeIndex],
                 new Vortice.Mathematics.Int4(0, 0, 0, 0));
             
-            commandList.ClearUnorderedAccessViewUint(
-                device.GetGpuHandle(shadowScatteredMaterialUAVIndices[frameIndex, cascadeIndex]),
-                shadowScatteredMaterialCPUHandles[frameIndex, cascadeIndex],
-                shadowScatteredMaterialBuffers[frameIndex, cascadeIndex],
-                new Vortice.Mathematics.Int4(0, 0, 0, 0));
+
             
             commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(null)));
 
@@ -859,10 +805,6 @@ namespace Freefall.Graphics
                     ResourceStates.UnorderedAccess,
                     ResourceStates.NonPixelShaderResource)));
             commandList.ResourceBarrier(new ResourceBarrier(
-                new ResourceTransitionBarrier(shadowScatteredMaterialBuffers[frameIndex, cascadeIndex],
-                    ResourceStates.UnorderedAccess,
-                    ResourceStates.NonPixelShaderResource)));
-            commandList.ResourceBarrier(new ResourceBarrier(
                 new ResourceTransitionBarrier(commandBuffer,
                     ResourceStates.UnorderedAccess,
                     ResourceStates.IndirectArgument)));
@@ -885,10 +827,6 @@ namespace Freefall.Graphics
                 new ResourceTransitionBarrier(shadowVisibleIndicesBuffers[frameIndex, cascadeIndex],
                     ResourceStates.NonPixelShaderResource,
                     ResourceStates.UnorderedAccess)));
-            commandList.ResourceBarrier(new ResourceBarrier(
-                new ResourceTransitionBarrier(shadowScatteredMaterialBuffers[frameIndex, cascadeIndex],
-                    ResourceStates.NonPixelShaderResource,
-                    ResourceStates.UnorderedAccess)));
         }
 
         #endregion
@@ -905,10 +843,7 @@ namespace Freefall.Graphics
                 new ResourceTransitionBarrier(visibleIndicesBuffers[frameIndex],
                     ResourceStates.UnorderedAccess,
                     ResourceStates.NonPixelShaderResource)));
-            commandList.ResourceBarrier(new ResourceBarrier(
-                new ResourceTransitionBarrier(scatteredMaterialBuffers[frameIndex],
-                    ResourceStates.UnorderedAccess,
-                    ResourceStates.NonPixelShaderResource)));
+
             
             commandList.ResourceBarrier(new ResourceBarrier(
                 new ResourceTransitionBarrier(commandBuffer,
@@ -932,10 +867,7 @@ namespace Freefall.Graphics
                 new ResourceTransitionBarrier(visibleIndicesBuffers[frameIndex],
                     ResourceStates.NonPixelShaderResource,
                     ResourceStates.UnorderedAccess)));
-            commandList.ResourceBarrier(new ResourceBarrier(
-                new ResourceTransitionBarrier(scatteredMaterialBuffers[frameIndex],
-                    ResourceStates.NonPixelShaderResource,
-                    ResourceStates.UnorderedAccess)));
+
         }
 
         /// <summary>
@@ -966,9 +898,7 @@ namespace Freefall.Graphics
                 DeferDispose(null, visibleIndicesSRVIndices[i]);
                 visibleIndicesBuffers[i] = null; visibleIndicesUAVIndices[i] = 0; visibleIndicesSRVIndices[i] = 0;
 
-                DeferDispose(scatteredMaterialBuffers[i], scatteredMaterialUAVIndices[i]);
-                DeferDispose(null, scatteredMaterialSRVIndices[i]);
-                scatteredMaterialBuffers[i] = null; scatteredMaterialUAVIndices[i] = 0; scatteredMaterialSRVIndices[i] = 0;
+
 
                 DeferDispose(gpuCommandBuffers[i], gpuCommandUAVIndices[i]);
                 gpuCommandBuffers[i] = null; gpuCommandUAVIndices[i] = 0;
@@ -1001,9 +931,7 @@ namespace Freefall.Graphics
                         DeferDispose(null, shadowVisibleIndicesSRVIndices[f, c]);
                         shadowVisibleIndicesBuffers[f, c] = null; shadowVisibleIndicesUAVIndices[f, c] = 0; shadowVisibleIndicesSRVIndices[f, c] = 0;
 
-                        DeferDispose(shadowScatteredMaterialBuffers[f, c], shadowScatteredMaterialUAVIndices[f, c]);
-                        DeferDispose(null, shadowScatteredMaterialSRVIndices[f, c]);
-                        shadowScatteredMaterialBuffers[f, c] = null; shadowScatteredMaterialUAVIndices[f, c] = 0; shadowScatteredMaterialSRVIndices[f, c] = 0;
+
 
                         DeferDispose(shadowCommandBuffers[f, c], shadowCommandUAVIndices[f, c]);
                         shadowCommandBuffers[f, c] = null; shadowCommandUAVIndices[f, c] = 0;
@@ -1071,9 +999,7 @@ namespace Freefall.Graphics
                         if (shadowVisibleIndicesUAVIndices[f, c] != 0) Engine.Device.ReleaseBindlessIndex(shadowVisibleIndicesUAVIndices[f, c]);
                         if (shadowVisibleIndicesSRVIndices[f, c] != 0) Engine.Device.ReleaseBindlessIndex(shadowVisibleIndicesSRVIndices[f, c]);
                         
-                        shadowScatteredMaterialBuffers[f, c]?.Dispose();
-                        if (shadowScatteredMaterialUAVIndices[f, c] != 0) Engine.Device.ReleaseBindlessIndex(shadowScatteredMaterialUAVIndices[f, c]);
-                        if (shadowScatteredMaterialSRVIndices[f, c] != 0) Engine.Device.ReleaseBindlessIndex(shadowScatteredMaterialSRVIndices[f, c]);
+
                         
                         shadowCommandBuffers[f, c]?.Dispose();
                         if (shadowCommandUAVIndices[f, c] != 0) Engine.Device.ReleaseBindlessIndex(shadowCommandUAVIndices[f, c]);

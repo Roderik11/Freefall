@@ -77,8 +77,7 @@ cbuffer PushConstants : register(b3)
 #define MaterialsBufferIdx    Indices[6].y   // SRV: materials array buffer
 #define HistogramIdx          Indices[6].z   // UAV: histogram buffer (count per MeshPartId)
 #define UniquePartCount       Indices[6].w   // Max unique MeshPartIds in registry
-#define MaterialIdsUAVIdx     Indices[7].x   // UAV: scattered material IDs buffer (OUTPUT, same order as VisibleIndices)
-#define ScatteredMaterialSRVIdx Indices[7].y  // SRV: scattered material IDs (read by vertex shader)
+// Slots [7].x and [7].y freed by Phase 1 scatter simplification (no longer scatter materialIds)
 #define BoneBufferIdx         Indices[7].z   // SRV: per-batch bone matrices buffer (0 for static batches)
 #define ShadowCascadeIdx      Indices[7].w   // Shadow cascade index (0-3) for shadow culling pass
 
@@ -478,6 +477,9 @@ void CSBlockScan(uint3 groupThreadId : SV_GroupThreadID)
 // Uses histogram prefix sum (counters buffer) for base offsets
 // Atomically increments counters to get unique output positions
 // MUST run AFTER CSHistogramPrefixSum so counters contains StartInstance offsets
+//
+// OUTPUT: one uint per visible instance = original instanceIdx
+// The VS uses this index to look up all per-instance data from input buffers.
 //-----------------------------------------------------------------------------
 [numthreads(256, 1, 1)]
 void CSGlobalScatter(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupId : SV_GroupID)
@@ -487,12 +489,9 @@ void CSGlobalScatter(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupId
         return;
     
     RWStructuredBuffer<uint> visibilityFlags = ResourceDescriptorHeap[VisibilityFlagsIdx];
-    StructuredBuffer<uint> transformSlots = ResourceDescriptorHeap[TransformSlotsIdx];
-    StructuredBuffer<uint> materialIds = ResourceDescriptorHeap[MaterialIdBufferIdx];  // Input material IDs
     StructuredBuffer<uint> subbatchIds = ResourceDescriptorHeap[SubbatchIdsIdx];  // Actually MeshPartId
     RWStructuredBuffer<uint> counters = ResourceDescriptorHeap[CounterBufferIdx];  // StartInstance offsets (prefix sum)
-    RWStructuredBuffer<uint> visibleOut = ResourceDescriptorHeap[VisibleIndicesUAVIdx];  // Output: scattered transform slots
-    RWStructuredBuffer<uint> materialOut = ResourceDescriptorHeap[MaterialIdsUAVIdx];   // Output: scattered material IDs
+    RWStructuredBuffer<uint> visibleOut = ResourceDescriptorHeap[VisibleIndicesUAVIdx];  // Output: compacted instance indices
     
     // Scatter visible instances (flag 1) and x-ray occluded instances (flag 2)
     uint flag = visibilityFlags[instanceIdx];
@@ -507,18 +506,13 @@ void CSGlobalScatter(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupId
         uint outputIdx;
         InterlockedAdd(counters[meshPartId], 1, outputIdx);
         
-        // Write transform slot AND material ID to same output position
-        // This keeps them in sync for the vertex shader
-        uint transformSlot = transformSlots[instanceIdx];
-        uint materialId = materialIds[instanceIdx];
-        
-        // Pack occlusion flag into materialID high bit for x-ray mode
-        // The GBuffer pixel shader will unpack this when DebugMode == 4
+        // Write original instance index — VS uses this to look up all per-instance data
+        // Pack occlusion flag into high bit for x-ray debug mode
+        uint packedIdx = instanceIdx;
         if (flag == 2)
-            materialId |= 0x80000000u;
+            packedIdx |= 0x80000000u;
         
-        visibleOut[outputIdx] = transformSlot;
-        materialOut[outputIdx] = materialId;
+        visibleOut[outputIdx] = packedIdx;
     }
 }
 
@@ -699,7 +693,7 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
     
     IndirectDrawCommand cmd;
     cmd.TransformSlotsBufIdx = TransformSlotsIdx;
-    cmd.MaterialIdBufIdx = ScatteredMaterialSRVIdx;  // Use SCATTERED material IDs (same order as SortedIndices)
+    cmd.MaterialIdBufIdx = MaterialIdBufferIdx;  // Input material IDs buffer (VS double-indirects via compacted index)
     cmd.SortedIndicesBufIdx = VisibleIndicesSRVIdx;
     cmd.BoneWeightsBufIdx = entry.BoneWeightsBufferIdx;
     cmd.BonesBufIdx = BoneBufferIdx;  // Per-batch bone buffer (0 for static batches)
