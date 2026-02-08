@@ -17,6 +17,7 @@ debug_shader.fx
 
 # Binary resources (textures, terrain data)
 *.dds
+!Resources/default_*.dds
 *.png
 Resources/Terrain/
 
