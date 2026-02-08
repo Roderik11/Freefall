@@ -56,7 +56,9 @@ namespace Freefall.Graphics
         public List<uint> MeshPartIds = new();
         public HashSet<int> UniqueMeshPartIds = new();
         public Material? FirstMaterial;
-        public bool HasSkinnedMesh;
+        
+        // Per-instance param staging: hash → list of ParameterValue (one per instance)
+        public Dictionary<int, List<ParameterValue>> PerInstanceParams = new();
         
         public int Count => Draws.Count;
         
@@ -88,9 +90,19 @@ namespace Freefall.Graphics
             MeshPartIds.Add((uint)meshPartId);
             UniqueMeshPartIds.Add(meshPartId);
             
-            // Track if any mesh in this bucket is skinned
-            if (mesh.Bones != null && mesh.Bones.Length > 0)
-                HasSkinnedMesh = true;
+            // Stage per-instance params from MaterialBlock (all params are per-instance by default)
+            if (block != null)
+            {
+                foreach (var (hash, param) in block.Parameters)
+                {
+                    if (!PerInstanceParams.TryGetValue(hash, out var list))
+                    {
+                        list = new List<ParameterValue>();
+                        PerInstanceParams[hash] = list;
+                    }
+                    list.Add(param);
+                }
+            }
         }
         
         public void Clear()
@@ -102,7 +114,8 @@ namespace Freefall.Graphics
             MeshPartIds.Clear();
             UniqueMeshPartIds.Clear();
             FirstMaterial = null;
-            HasSkinnedMesh = false;
+            foreach (var list in PerInstanceParams.Values)
+                list.Clear();
         }
     }
 
@@ -384,6 +397,10 @@ namespace Freefall.Graphics
             Culler = new GPUCuller(device);
             Culler.Initialize();
             Debug.Log("[CommandBuffer] GPU Culler initialized");
+            
+            // Register per-instance buffer slots (generic system)
+            // Bones: slot 30, stride = sizeof(Matrix4x4) = 64 bytes
+            InstanceBatch.RegisterPerInstanceSlot("Bones", 30, 64);
             
             // Create Hi-Z pyramid if renderer is already set up
             var renderer = DeferredRenderer.Current;

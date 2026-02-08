@@ -36,7 +36,6 @@ namespace Freefall.Components
                 TransformBuffer.Instance.SetTransform(_transformSlot, world);
             }
 
-            Params.SetParameter("World", world);
 
             // Use per-part materials if available
             if (Materials.Count > 0)

@@ -579,7 +579,9 @@ namespace Freefall.Graphics
 
     public class MaterialBlock
     {
-        private Dictionary<string, ParameterValue> _parameters = new Dictionary<string, ParameterValue>();
+        private Dictionary<int, ParameterValue> _parameters = new();
+
+        public Dictionary<int, ParameterValue> Parameters => _parameters;
 
         public void Clear()
         {
@@ -588,10 +590,11 @@ namespace Freefall.Graphics
 
         public void SetParameter<T>(string name, T value) where T : unmanaged
         {
-            if (!_parameters.TryGetValue(name, out var param))
+            int hash = name.GetHashCode();
+            if (!_parameters.TryGetValue(hash, out var param))
             {
                 param = new ParameterValue<T> { Name = name, Value = value };
-                _parameters.Add(name, param);
+                _parameters.Add(hash, param);
             }
             else if (param is ParameterValue<T> typedParam)
             {
@@ -601,10 +604,11 @@ namespace Freefall.Graphics
 
         public void SetTexture(string name, Texture value)
         {
-            if (!_parameters.TryGetValue(name, out var param))
+            int hash = name.GetHashCode();
+            if (!_parameters.TryGetValue(hash, out var param))
             {
                 param = new TextureParameterValue { Name = name, Value = value };
-                _parameters.Add(name, param);
+                _parameters.Add(hash, param);
             }
             else if (param is TextureParameterValue typedParam)
             {
@@ -615,10 +619,11 @@ namespace Freefall.Graphics
         // Support for unmanaged array types like Matrix4x4[], Vector4[]
         public void SetParameterArray<T>(string name, T[] value) where T : unmanaged
         {
-            if (!_parameters.TryGetValue(name, out var param))
+            int hash = name.GetHashCode();
+            if (!_parameters.TryGetValue(hash, out var param))
             {
                 param = new ArrayParameterValue<T> { Name = name, Value = value };
-                _parameters.Add(name, param);
+                _parameters.Add(hash, param);
             }
             else if (param is ArrayParameterValue<T> typedParam)
             {
@@ -628,11 +633,15 @@ namespace Freefall.Graphics
         
         public T? GetValue<T>(string name)
         {
-            if (_parameters.TryGetValue(name, out var param))
+            return GetValue<T>(name.GetHashCode());
+        }
+        
+        public T? GetValue<T>(int hash)
+        {
+            if (_parameters.TryGetValue(hash, out var param))
             {
-                // Use reflection to get the Value field/property
-                var paramType = param.GetType();
-                var valueField = paramType.GetField("Value");
+                // Use reflection to get the Value field
+                var valueField = param.GetType().GetField("Value");
                 if (valueField != null)
                 {
                     var value = valueField.GetValue(param);
@@ -643,9 +652,17 @@ namespace Freefall.Graphics
             return default;
         }
         
+        public T[]? GetArrayValue<T>(int hash) where T : unmanaged
+        {
+            if (_parameters.TryGetValue(hash, out var param) && param is ArrayParameterValue<T> typed)
+                return typed.Value;
+            return null;
+        }
+        
         public bool TryGetParameter<T>(string name, out T value) where T : unmanaged
         {
-            if (_parameters.TryGetValue(name, out var param) && param is ParameterValue<T> typedParam)
+            int hash = name.GetHashCode();
+            if (_parameters.TryGetValue(hash, out var param) && param is ParameterValue<T> typedParam)
             {
                 value = typedParam.Value;
                 return true;

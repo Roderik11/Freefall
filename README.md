@@ -8,9 +8,9 @@ Freefall is an experimental game engine written in C# with Direct3D 12, built en
 - **Deferred Shading** — GBuffer-based pipeline with directional and point light support
 - **Cascaded Shadow Maps** — 4-cascade PSSM with configurable lambda blending and texel snapping
 - **Hi-Z Occlusion Culling** — Hierarchical depth buffer for GPU-side occlusion tests
-- **Instance Batching** — Automatic draw call merging with per-material sub-batches
+- **Instance Batching** — Automatic draw call merging with per-material sub-batches and generic per-instance data buffers
 - **Persistent Transform Buffer** — Pooled GPU transform slots with dirty-flag uploads
-- **Skeletal Animation** — Bone matrix manager with GPU skinning support
+- **Skeletal Animation** — GPU skinning via generic per-instance buffer system (SoA pattern)
 - **Terrain** — Quadtree LOD with splatmap-based multi-texture blending
 - **Async Resource Streaming** — Two-phase loading (CPU parse → main-thread GPU upload) with time-budgeted work queue
 - **Shader System** — Custom FX parser with automatic render pass and pipeline state management

@@ -226,7 +226,7 @@ namespace Freefall
              characterController.Height = 1.8f;
 
              SpawnTrees(terrain, playerSpawn, 16f, 5);
-             //SpawnCharacters(10, terrain, playerSpawn, paladinMesh, paladinTexture, paladinMat);
+             SpawnCharacters(10, terrain, playerSpawn, paladinMesh, paladinTexture, paladinMat);
              
              // ===== CAMERA SETUP =====
              var cameraEntity = new Entity("Camera");

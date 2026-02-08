@@ -63,7 +63,49 @@ namespace Freefall.Graphics
         public int SubBatchCount { get; private set; }
 
         private int capacity = 0;
-        private bool IsSkinned { get; set; }
+        // Per-instance buffer registry: param hash → push constant slot
+        // Only params with a registered slot get GPU buffers
+        private static readonly Dictionary<int, PerInstanceSlot> _perInstanceSlots = new();
+        
+        /// <summary>
+        /// Register a per-instance param. Only registered params get GPU buffers.
+        /// </summary>
+        public static void RegisterPerInstanceSlot(string name, int pushConstantSlot, int elementStride)
+        {
+            _perInstanceSlots[name.GetHashCode()] = new PerInstanceSlot
+            {
+                Name = name,
+                Hash = name.GetHashCode(),
+                PushConstantSlot = pushConstantSlot,
+                ElementStride = elementStride
+            };
+        }
+        
+        public struct PerInstanceSlot
+        {
+            public string Name;
+            public int Hash;
+            public int PushConstantSlot;
+            public int ElementStride; // bytes per element (e.g. 64 for Matrix4x4)
+        }
+        
+        /// <summary>
+        /// Per-instance GPU buffer for a single parameter (SoA pattern).
+        /// Sparse: indexed by transformSlot, sized to (maxSlot+1) * elementsPerInstance.
+        /// </summary>
+        private class PerInstanceBuffer
+        {
+            public int ParamHash;
+            public ID3D12Resource[] Buffers = new ID3D12Resource[FrameCount];
+            public uint[] SRVIndices = new uint[FrameCount];
+            public int Capacity; // in slots
+            public int ElementsPerInstance; // e.g. numBones
+            public int ElementStride; // bytes per element
+            public bool Dirty;
+        }
+        
+        // Active per-instance buffers for this batch
+        private Dictionary<int, PerInstanceBuffer> _perInstanceBuffers = new();
         
         // Cached array to avoid per-frame allocation
         private ID3D12DescriptorHeap[]? _cachedSrvHeapArray;
@@ -135,8 +177,7 @@ namespace Freefall.Graphics
         private CpuDescriptorHandle[,] shadowHistogramCPUHandles = new CpuDescriptorHandle[FrameCount, ShadowCascadeCount];
 
 
-        // Bone buffers per mesh
-        private Dictionary<Mesh, (ID3D12Resource[] Buffers, uint[] Indices, int Capacity)> meshBoneBuffers = new();
+
 
         // Contiguous arrays for O(1) block-copy upload (stored in draw-order)
         private uint[] _transformSlots = Array.Empty<uint>();
@@ -158,8 +199,9 @@ namespace Freefall.Graphics
             _drawCount = 0;
             _uniqueMeshPartIds.Clear();
             SubBatchCount = 0;
-            IsSkinned = false;
             _maxTransformSlot = 0;
+            foreach (var buf in _perInstanceBuffers.Values)
+                buf.Dirty = false;
         }
 
         public void MergeFromBucket(DrawBucket bucket)
@@ -193,9 +235,16 @@ namespace Freefall.Graphics
             srcSpheres.CopyTo(_boundingSpheres.AsSpan(startIdx));
             srcPartIds.CopyTo(_subbatchIds.AsSpan(startIdx));
             
-            // Propagate skinned flag from bucket
-            if (bucket.HasSkinnedMesh)
-                IsSkinned = true;
+            // Mark per-instance buffers dirty if bucket has matching params
+            foreach (var (hash, _) in bucket.PerInstanceParams)
+            {
+                if (_perInstanceSlots.ContainsKey(hash))
+                {
+                    if (!_perInstanceBuffers.ContainsKey(hash))
+                        _perInstanceBuffers[hash] = new PerInstanceBuffer { ParamHash = hash };
+                    _perInstanceBuffers[hash].Dirty = true;
+                }
+            }
             
             // Track max transform slot for bone buffer sizing
             var slots = srcTransforms;
@@ -294,76 +343,113 @@ namespace Freefall.Graphics
                 subbatchIdBuffers[frameIndex].Unmap(0);
             }
 
-            if(IsSkinned)
-                UploadBoneBuffers(frameIndex);
+            // Upload generic per-instance buffers
+            UploadPerInstanceBuffers(frameIndex);
         }
 
-        private void UploadBoneBuffers(int frameIndex)
+        private void UploadPerInstanceBuffers(int frameIndex)
         {
             if (_drawCount == 0) return;
-
-            // All skinned meshes in a batch share the same skeleton
-            var mesh = _draws[0].Mesh;
-            if (mesh.Bones == null) return;
-
             int requiredSlots = _maxTransformSlot + 1;
 
-            EnsureBoneBuffer(mesh, requiredSlots);
-            var boneData = meshBoneBuffers[mesh];
-            var boneBuf = boneData.Buffers[frameIndex];
-
-            // Single Map/Unmap for the whole batch — bones indexed by transform slot
-            // This makes bone lookup scatter-safe: the shader uses the transform slot
-            // (which is already scattered correctly) to index into the bone buffer
-            unsafe
+            foreach (var (hash, pib) in _perInstanceBuffers)
             {
-                byte* pBone;
-                boneBuf.Map(0, null, (void**)&pBone);
-                var boneMatrixSpan = new Span<Matrix4x4>(pBone, boneData.Capacity * mesh.Bones.Length);
+                if (!pib.Dirty) continue;
+                if (!_perInstanceSlots.TryGetValue(hash, out var slotInfo)) continue;
 
+                // Determine elements per instance from first draw that has this param
+                int elementsPerInstance = 0;
                 for (int i = 0; i < _drawCount; ++i)
                 {
-                    var d = _draws[i];
-                    var bones = d.Block?.GetValue<Matrix4x4[]>("Bones");
-                    if (bones != null)
+                    var block = _draws[i].Block;
+                    if (block == null) continue;
+                    foreach (var (ph, pv) in block.Parameters)
                     {
-                        int baseIdx = d.TransformSlot * mesh.Bones.Length;
-                        for (int b = 0; b < bones.Length; ++b)
-                            boneMatrixSpan[baseIdx + b] = bones[b];
+                        if (ph == hash)
+                        {
+                            // Get array length from the value
+                            var valueField = pv.GetType().GetField("Value");
+                            if (valueField?.GetValue(pv) is Array arr)
+                                elementsPerInstance = arr.Length;
+                            break;
+                        }
                     }
+                    if (elementsPerInstance > 0) break;
                 }
+                if (elementsPerInstance == 0) continue;
 
-                boneBuf.Unmap(0);
+                pib.ElementsPerInstance = elementsPerInstance;
+                pib.ElementStride = slotInfo.ElementStride;
+
+                // Ensure GPU buffer capacity
+                EnsurePerInstanceBuffer(pib, requiredSlots);
+
+                // Map and write sparse data indexed by transformSlot
+                var buf = pib.Buffers[frameIndex];
+                int stride = pib.ElementStride;
+                unsafe
+                {
+                    byte* pData;
+                    buf.Map(0, null, (void**)&pData);
+
+                    for (int i = 0; i < _drawCount; ++i)
+                    {
+                        var d = _draws[i];
+                        if (d.Block == null) continue;
+                        if (!d.Block.Parameters.TryGetValue(hash, out var pv)) continue;
+
+                        var valueField = pv.GetType().GetField("Value");
+                        if (valueField?.GetValue(pv) is not Array arr) continue;
+
+                        int baseOffset = d.TransformSlot * elementsPerInstance * stride;
+                        // Pin the managed array and copy
+                        var handle = System.Runtime.InteropServices.GCHandle.Alloc(arr, System.Runtime.InteropServices.GCHandleType.Pinned);
+                        try
+                        {
+                            int byteCount = arr.Length * stride;
+                            Buffer.MemoryCopy(
+                                (void*)handle.AddrOfPinnedObject(),
+                                pData + baseOffset,
+                                (long)(pib.Capacity * elementsPerInstance * stride - baseOffset),
+                                byteCount);
+                        }
+                        finally
+                        {
+                            handle.Free();
+                        }
+                    }
+
+                    buf.Unmap(0);
+                }
             }
         }
 
-        private void EnsureBoneBuffer(Mesh mesh, int requiredSlots)
+        private void EnsurePerInstanceBuffer(PerInstanceBuffer pib, int requiredSlots)
         {
-            if (!meshBoneBuffers.TryGetValue(mesh, out var boneData) || boneData.Capacity < requiredSlots)
+            if (pib.Capacity >= requiredSlots) return;
+
+            // Dispose old buffers
+            for (int i = 0; i < FrameCount; ++i)
             {
-                if (boneData.Buffers != null)
-                {
-                    for (int i = 0; i < FrameCount; ++i)
-                    {
-                        boneData.Buffers[i]?.Dispose();
-                        if (boneData.Indices[i] != 0) Engine.Device.ReleaseBindlessIndex(boneData.Indices[i]);
-                    }
-                }
-
-                var newBuffers = new ID3D12Resource[FrameCount];
-                var newIndices = new uint[FrameCount];
-                int boneCount = mesh.Bones!.Length;
-                int bufferSize = requiredSlots * boneCount * 64;
-
-                for (int i = 0; i < FrameCount; ++i)
-                {
-                    newBuffers[i] = Engine.Device.CreateUploadBuffer(bufferSize);
-                    newIndices[i] = Engine.Device.AllocateBindlessIndex();
-                    Engine.Device.CreateStructuredBufferSRV(newBuffers[i], (uint)(requiredSlots * boneCount), 64, newIndices[i]);
-                }
-
-                meshBoneBuffers[mesh] = (newBuffers, newIndices, requiredSlots);
+                pib.Buffers[i]?.Dispose();
+                if (pib.SRVIndices[i] != 0) Engine.Device.ReleaseBindlessIndex(pib.SRVIndices[i]);
             }
+
+            int totalElements = requiredSlots * pib.ElementsPerInstance;
+            int bufferSize = totalElements * pib.ElementStride;
+
+            for (int i = 0; i < FrameCount; ++i)
+            {
+                pib.Buffers[i] = Engine.Device.CreateUploadBuffer(bufferSize);
+                pib.SRVIndices[i] = Engine.Device.AllocateBindlessIndex();
+                Engine.Device.CreateStructuredBufferSRV(
+                    pib.Buffers[i],
+                    (uint)totalElements,
+                    (uint)pib.ElementStride,
+                    pib.SRVIndices[i]);
+            }
+
+            pib.Capacity = requiredSlots;
         }
 
         public void Build(GraphicsDevice device, ID3D12GraphicsCommandList commandList, ulong frustumBufferAddress)
@@ -501,16 +587,15 @@ namespace Freefall.Graphics
             commandList.SetComputeRoot32BitConstant(0, histogramUAVIndices[frameIndex], 26);
             commandList.SetComputeRoot32BitConstant(0, (uint)MeshRegistry.Count, 27);
 
-            
-            // Bone buffer for skinned batches (0 for static)
-            uint boneBufferIdx = 0;
-            if (IsSkinned && _drawCount > 0)
+
+            // Push per-instance buffer SRV indices to their registered slots
+            foreach (var (hash, slotInfo) in _perInstanceSlots)
             {
-                var firstMesh = _draws[0].Mesh;
-                if (meshBoneBuffers.TryGetValue(firstMesh, out var boneData))
-                    boneBufferIdx = boneData.Indices[frameIndex];
+                uint srvIdx = 0;
+                if (_perInstanceBuffers.TryGetValue(hash, out var pib))
+                    srvIdx = pib.SRVIndices[frameIndex];
+                commandList.SetComputeRoot32BitConstant(0, srvIdx, (uint)slotInfo.PushConstantSlot);
             }
-            commandList.SetComputeRoot32BitConstant(0, boneBufferIdx, 30);
 
             commandList.ClearUnorderedAccessViewUint(
                 device.GetGpuHandle(counterBufferUAVIndices[frameIndex]),
@@ -695,15 +780,14 @@ namespace Freefall.Graphics
             commandList.SetComputeRoot32BitConstant(0, shadowHistogramUAVIndices[frameIndex, cascadeIndex], 26);
             commandList.SetComputeRoot32BitConstant(0, (uint)MeshRegistry.Count, 27);
 
-            // Bone buffer for skinned batches (0 for static)
-            uint boneBufferIdx = 0;
-            if (IsSkinned && _drawCount > 0)
+            // Push per-instance buffer SRV indices to their registered slots
+            foreach (var (hash, slotInfo) in _perInstanceSlots)
             {
-                var firstMesh = _draws[0].Mesh;
-                if (meshBoneBuffers.TryGetValue(firstMesh, out var boneData))
-                    boneBufferIdx = boneData.Indices[frameIndex];
+                uint srvIdx = 0;
+                if (_perInstanceBuffers.TryGetValue(hash, out var pib))
+                    srvIdx = pib.SRVIndices[frameIndex];
+                commandList.SetComputeRoot32BitConstant(0, srvIdx, (uint)slotInfo.PushConstantSlot);
             }
-            commandList.SetComputeRoot32BitConstant(0, boneBufferIdx, 30);
             commandList.SetComputeRoot32BitConstant(0, (uint)cascadeIndex, 31); // ShadowCascadeIdx
 
             // Clear UAV buffers before dispatching (matching regular Cull pattern)
@@ -1018,12 +1102,15 @@ namespace Freefall.Graphics
         public void Dispose()
         {
             DisposeBuffers();
-            foreach (var kvp in meshBoneBuffers)
+            foreach (var kvp in _perInstanceBuffers)
             {
-                foreach (var b in kvp.Value.Buffers) b?.Dispose();
-                foreach (var idx in kvp.Value.Indices) Engine.Device.ReleaseBindlessIndex(idx);
+                for (int i = 0; i < FrameCount; ++i)
+                {
+                    kvp.Value.Buffers[i]?.Dispose();
+                    if (kvp.Value.SRVIndices[i] != 0) Engine.Device.ReleaseBindlessIndex(kvp.Value.SRVIndices[i]);
+                }
             }
-            meshBoneBuffers.Clear();
+            _perInstanceBuffers.Clear();
         }
     }
 }

@@ -157,7 +157,6 @@ namespace Freefall.Graphics
             content = content.Replace("float4 b = n1 >= 0 ? 1 : 0;", "float4 b = select(n1 >= 0, 1.0f.xxxx, 0.0f.xxxx);");
 
             // No longer patching structs because it breaks other functions in the file.
-            // We'll satisfy the input layout in ForwardRenderer instead.
 
             return content;
         }

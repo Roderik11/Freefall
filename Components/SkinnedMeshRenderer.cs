@@ -70,14 +70,6 @@ namespace Freefall.Components
                     
                 _materialBlock.SetParameterArray("Bones", boneMatrices);
             }
-            
-            // Store world matrix (apply root rotation if set)
-            var world = Entity.Transform.WorldMatrix;
-            if (!Mesh.RootRotation.IsIdentity)
-            {
-                world = Mesh.RootRotation * world;
-            }
-            _materialBlock.SetParameter("World", world);
         }
 
         public void Draw()

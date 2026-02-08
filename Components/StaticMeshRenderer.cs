@@ -103,8 +103,6 @@ namespace Freefall.Components
                  TransformBuffer.Instance.SetTransform(_transformSlot, world);
              }
              
-             // Also set World for CPU path fallback
-             Params.SetParameter("World", world);
 
              // Like Apex: iterate through MeshParts and use element.Material
              if (elements != null && elements.Count > 0)
