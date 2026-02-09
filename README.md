@@ -36,7 +36,7 @@ Freefall is a fully GPU-driven deferred renderer. The CPU submits unsorted draw 
 
 | System | Description |
 |--------|-------------|
-| **InstanceBatch** | Core GPU-driven batcher. Manages SoA per-instance buffers, histogram culling pipeline, and `ExecuteIndirect`. One batch per Effect. |
+| **InstanceBatch** | Core GPU-driven batcher. All per-instance data (descriptors, bounding spheres, subbatch IDs, terrain patches, bones, lights) flows through a unified `PerInstanceBuffer` system with auto-resize. Manages histogram culling pipeline and `ExecuteIndirect`. One batch per Effect. |
 | **CommandBuffer** | Thread-safe draw call collector. `Enqueue` dispatches to all applicable passes based on the Effect's declared passes. Thread-local `DrawBucket`s enable lock-free parallel submission. |
 | **MeshRegistry** | Global GPU buffer of mesh metadata. Persistent `MeshPartID`s eliminate per-frame CPU grouping — the GPU looks up vertex/index info directly. |
 | **TransformBuffer** | Pooled persistent GPU transform slots with dirty-flag uploads. Entities hold a stable `TransformSlot` for their lifetime. |
@@ -48,13 +48,14 @@ Freefall is a fully GPU-driven deferred renderer. The CPU submits unsorted draw 
 ## Features
 
 - **GPU-Driven Rendering** — Indirect draw calls with compute-based visibility culling and instance scatter
-- **Deferred Shading** — GBuffer-based pipeline with directional lighting (point lights WIP)
+- **Deferred Shading** — GBuffer-based pipeline with directional and point light support
 - **Cascaded Shadow Maps** — 4-cascade PSSM with texel snapping, bounding-sphere stabilization, and Vogel disc filtering
 - **Hi-Z Occlusion Culling** — Hierarchical depth buffer for GPU-side occlusion tests
-- **Instance Batching** — Automatic draw call merging with generic per-instance data channels (SoA pattern)
+- **Unified Per-Instance Buffers** — All per-instance data (transforms, materials, bounding spheres, terrain patches, bones, lights) flows through a single generic SoA channel system with auto-resize and push-constant binding
 - **Persistent Transform Buffer** — Pooled GPU transform slots with dirty-flag uploads
 - **Skeletal Animation** — GPU skinning via per-instance bone buffers (registered as generic SoA channels)
 - **Terrain** — Quadtree LOD with splatmap-based multi-texture blending, integrated into the standard InstanceBatch pipeline
+- **Point Lights** — Deferred point lights via per-instance `StructuredBuffer`, rendered as sphere volumes with additive blending
 - **Bindless SM 6.6** — All resources accessed via `ResourceDescriptorHeap` and push constants; no Input Assembler
 - **Async Resource Streaming** — Two-phase loading (CPU parse → main-thread GPU upload) with time-budgeted work queue
 - **Shader System** — Custom FX parser with automatic render pass and pipeline state management

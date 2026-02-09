@@ -49,10 +49,12 @@ namespace Freefall.Graphics
     /// </summary>
     public class DrawBucket
     {
+        // Well-known hash keys for core per-instance data channels
+        public static readonly int DescriptorsHash = "Descriptors".GetHashCode();
+        public static readonly int BoundingSpheresHash = "BoundingSpheres".GetHashCode();
+        public static readonly int SubbatchIdsHash = "SubbatchIds".GetHashCode();
+        
         public List<InstanceBatch.RawDraw> Draws = new();
-        public List<InstanceDescriptor> Descriptors = new();
-        public List<Vector4> BoundingSpheres = new();
-        public List<uint> MeshPartIds = new();
         public HashSet<int> UniqueMeshPartIds = new();
         public Material? FirstMaterial;
         
@@ -95,14 +97,19 @@ namespace Freefall.Graphics
                 MaterialId = (uint)material.MaterialID,
                 MeshPartId = meshPartId,
             });
-            Descriptors.Add(new InstanceDescriptor
+            
+            // Stage core per-instance data through the generic PerInstanceStaging system
+            var descriptor = new InstanceDescriptor
             {
                 TransformSlot = (uint)transformSlot,
                 MaterialId = (uint)material.MaterialID,
                 CustomDataIdx = 0
-            });
-            BoundingSpheres.Add(mesh.LocalBoundingSphere);
-            MeshPartIds.Add((uint)meshPartId);
+            };
+            var sphere = mesh.LocalBoundingSphere;
+            var meshPartIdU = (uint)meshPartId;
+            StageCore(DescriptorsHash, 12, descriptor);       // InstanceDescriptor: 12 bytes
+            StageCore(BoundingSpheresHash, 16, sphere);        // Vector4: 16 bytes
+            StageCore(SubbatchIdsHash, 4, meshPartIdU);        // uint: 4 bytes
             UniqueMeshPartIds.Add(meshPartId);
             
             // Stage per-instance params into contiguous byte arrays (at Enqueue time, not MergeFromBucket)
@@ -147,13 +154,34 @@ namespace Freefall.Graphics
         public void Clear()
         {
             Draws.Clear();
-            Descriptors.Clear();
-            BoundingSpheres.Clear();
-            MeshPartIds.Clear();
             UniqueMeshPartIds.Clear();
             FirstMaterial = null;
             foreach (var staging in PerInstanceData.Values)
                 staging.Count = 0;
+        }
+        
+        /// <summary>
+        /// Stage a core per-instance value (Descriptor, BoundingSphere, SubbatchId) as raw bytes.
+        /// </summary>
+        private unsafe void StageCore<T>(int hash, int stride, T value) where T : unmanaged
+        {
+            if (!PerInstanceData.TryGetValue(hash, out var staging))
+            {
+                staging = new PerInstanceStaging
+                {
+                    PushConstantSlot = -1,  // Core data — bound by InstanceBatch, not shader
+                    ElementStride = stride,
+                    ElementsPerInstance = 1,
+                };
+                PerInstanceData[hash] = staging;
+            }
+            int needed = (staging.Count + 1) * stride;
+            if (staging.Data.Length < needed)
+                Array.Resize(ref staging.Data, Math.Max(staging.Data.Length * 2, needed));
+            
+            fixed (byte* ptr = &staging.Data[staging.Count * stride])
+                *(T*)ptr = value;
+            staging.Count++;
         }
     }
 

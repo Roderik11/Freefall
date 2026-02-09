@@ -26,6 +26,17 @@ namespace Freefall.Loaders
         {
             public List<SceneObject> Objects { get; set; } = new List<SceneObject>();
             public List<SceneObject> Trees { get; set; } = new List<SceneObject>();
+            public List<SceneLight> Lights { get; set; } = new List<SceneLight>();
+        }
+
+        [Serializable]
+        public class SceneLight
+        {
+            public string Type { get; set; } = "Point";
+            public string Position { get; set; } = "";
+            public string Color { get; set; } = "1;1;1";
+            public float Intensity { get; set; } = 1;
+            public float Range { get; set; } = 10;
         }
 
         [Serializable]
@@ -93,6 +104,21 @@ namespace Freefall.Loaders
                 count++;
                 if (count >= maxcount)
                     break;
+            }
+
+            // Load Lights
+            foreach (var light in scene.Lights)
+            {
+                if (string.Equals(light.Type, "Point", StringComparison.OrdinalIgnoreCase))
+                {
+                    var entity = new Entity("PointLight");
+                    entity.Transform.Position = StringToVector3(light.Position);
+
+                    var pointLight = entity.AddComponent<PointLight>();
+                    pointLight.Color = StringToColor3(light.Color);
+                    pointLight.Intensity = light.Intensity;
+                    pointLight.Range = light.Range;
+                }
             }
 
             // Load Trees
@@ -346,7 +372,28 @@ namespace Freefall.Loaders
             }
 
             await Task.WhenAll(createdTasks);
-            progress?.Report($"Done — {created} entities in scene.");
+
+            // Load Lights (lightweight — no mesh/texture loading needed)
+            int lightCount = 0;
+            foreach (var light in scene.Lights)
+            {
+                if (string.Equals(light.Type, "Point", StringComparison.OrdinalIgnoreCase))
+                {
+                    await Engine.RunOnMainThreadAsync(() =>
+                    {
+                        var entity = new Entity("PointLight");
+                        entity.Transform.Position = StringToVector3(light.Position);
+
+                        var pointLight = entity.AddComponent<PointLight>();
+                        pointLight.Color = StringToColor3(light.Color);
+                        pointLight.Intensity = light.Intensity;
+                        pointLight.Range = light.Range;
+                    });
+                    lightCount++;
+                }
+            }
+
+            progress?.Report($"Done — {created} entities, {lightCount} lights in scene.");
         }
 
         private StaticMesh CreateStaticMesh(Mesh mesh, string meshPath, bool tree = false)
@@ -400,6 +447,12 @@ namespace Freefall.Loaders
                 float.Parse(parts[1], System.Globalization.CultureInfo.InvariantCulture),
                 float.Parse(parts[2], System.Globalization.CultureInfo.InvariantCulture)
             );
+        }
+
+        private static Color3 StringToColor3(string str)
+        {
+            var v = StringToVector3(str);
+            return new Color3(v.X, v.Y, v.Z);
         }
 
         private static Quaternion StringToQuaternion(string str)

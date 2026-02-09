@@ -14,27 +14,18 @@ namespace Freefall.Components
         public List<Material> Materials { get; set; } = new List<Material>();
         protected MaterialBlock Params = new MaterialBlock();
 
-        // GPU persistent transform slot
-        private int _transformSlot = -1;
+
 
         public void Draw()
         {
             if (Mesh == null) return;
             if (Transform == null) return;
 
-            var world = Transform.WorldMatrix;
-
-            // Allocate transform slot on first use
-            if (_transformSlot < 0 && TransformBuffer.Instance != null)
-            {
-                _transformSlot = TransformBuffer.Instance.AllocateSlot();
-            }
+            var slot = Entity.Transform.TransformSlot;
 
             // Update TransformBuffer directly (GPU path)
-            if (_transformSlot >= 0)
-            {
-                TransformBuffer.Instance.SetTransform(_transformSlot, world);
-            }
+            if (slot >= 0)
+                TransformBuffer.Instance.SetTransform(slot, Entity.Transform.WorldMatrix);
 
 
             // Use per-part materials if available
@@ -45,7 +36,7 @@ namespace Freefall.Components
                     var mat = i < Materials.Count ? Materials[i] : Materials[Materials.Count - 1];
                     if (mat != null)
                     {
-                        CommandBuffer.Enqueue(Mesh, i, mat, Params, _transformSlot);
+                        CommandBuffer.Enqueue(Mesh, i, mat, Params, slot);
                     }
                 }
             }
@@ -54,7 +45,7 @@ namespace Freefall.Components
                 // Single material for all parts
                 for (int i = 0; i < Mesh.MeshParts.Count; i++)
                 {
-                    CommandBuffer.Enqueue(Mesh, i, Material, Params, _transformSlot);
+                    CommandBuffer.Enqueue(Mesh, i, Material, Params, slot);
                 }
             }
         }

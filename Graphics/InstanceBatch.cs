@@ -93,23 +93,14 @@ namespace Freefall.Graphics
         // Graphics slots (from shader resource bindings) are separate and used in Draw/DrawShadow.
         private static readonly Dictionary<int, int> ComputeSlots = new()
         {
-            { "Bones".GetHashCode(), 30 },        // Indices[7].z = BoneBufferIdx
+            { "Bones".GetHashCode(), 30 },              // Indices[7].z = BoneBufferIdx
+            { DrawBucket.BoundingSpheresHash, 2 },       // Indices[0].z = BoundingSpheresIdx
+            { DrawBucket.DescriptorsHash, 4 },            // Indices[1].x = DescriptorBufferIdx
+            { DrawBucket.SubbatchIdsHash, 23 },           // Indices[5].w = SubbatchIdsIdx
         };
         
         // Cached array to avoid per-frame allocation
         private ID3D12DescriptorHeap[]? _cachedSrvHeapArray;
-
-        // Descriptor buffer (TransformSlot + MaterialId + CustomDataIdx per instance)
-        private ID3D12Resource[] descriptorBuffers = new ID3D12Resource[FrameCount];
-        private uint[] descriptorSRVIndices = new uint[FrameCount];
-
-        // Bounding spheres for GPU culling
-        private ID3D12Resource[] boundingSpheresBuffers = new ID3D12Resource[FrameCount];
-        private uint[] boundingSpheresSRVIndices = new uint[FrameCount];
-
-        // Subbatch ID per instance (for GPU to determine command without contiguous ranges)
-        private ID3D12Resource[] subbatchIdBuffers = new ID3D12Resource[FrameCount];
-        private uint[] subbatchIdSRVIndices = new uint[FrameCount];
 
         // GPU output: visible instance indices (after culling)
         private ID3D12Resource[] visibleIndicesBuffers = new ID3D12Resource[FrameCount];
@@ -164,10 +155,6 @@ namespace Freefall.Graphics
 
 
 
-        // Contiguous arrays for O(1) block-copy upload (stored in draw-order)
-        private InstanceDescriptor[] _descriptors = Array.Empty<InstanceDescriptor>();
-        private Vector4[] _boundingSpheres = Array.Empty<Vector4>();
-        private uint[] _subbatchIds = Array.Empty<uint>();
         private int _drawCount = 0;
         private int _maxTransformSlot = 0;
         
@@ -208,19 +195,12 @@ namespace Freefall.Graphics
                 _uniqueMeshPartIds.Add(id);
             SubBatchCount = _uniqueMeshPartIds.Count;
             
-            // Block-copy GPU arrays using Span (slice to actual count)
-            var srcDescriptors = CollectionsMarshal.AsSpan(bucket.Descriptors).Slice(0, count);
-            var srcSpheres = CollectionsMarshal.AsSpan(bucket.BoundingSpheres).Slice(0, count);
-            var srcPartIds = CollectionsMarshal.AsSpan(bucket.MeshPartIds).Slice(0, count);
-            
-            srcDescriptors.CopyTo(_descriptors.AsSpan(startIdx));
-            srcSpheres.CopyTo(_boundingSpheres.AsSpan(startIdx));
-            srcPartIds.CopyTo(_subbatchIds.AsSpan(startIdx));
-            
-            // Block-copy pre-staged per-instance data from bucket (staged at Enqueue time)
+            // Block-copy all pre-staged per-instance data from bucket (staged at Enqueue time)
+            // This includes core channels (Descriptors, BoundingSpheres, SubbatchIds) and
+            // optional channels (TerrainPatchData, PointLightData, Bones, etc.)
             foreach (var (hash, staging) in bucket.PerInstanceData)
             {
-                if (staging.Count == 0 || staging.PushConstantSlot < 0) continue;
+                if (staging.Count == 0) continue;
                 
                 if (!_perInstanceBuffers.TryGetValue(hash, out var pib))
                 {
@@ -250,10 +230,10 @@ namespace Freefall.Graphics
             }
             
             // Track max transform slot for bone buffer sizing
-            for (int i = 0; i < srcDescriptors.Length; i++)
+            for (int i = startIdx; i < newTotal; i++)
             {
-                if ((int)srcDescriptors[i].TransformSlot > _maxTransformSlot)
-                    _maxTransformSlot = (int)srcDescriptors[i].TransformSlot;
+                if (_draws[i].TransformSlot > _maxTransformSlot)
+                    _maxTransformSlot = _draws[i].TransformSlot;
             }
             
             _drawCount = newTotal;
@@ -268,38 +248,18 @@ namespace Freefall.Graphics
             DeferDisposeBuffers();
 
             Array.Resize(ref _draws, capacity);
-            Array.Resize(ref _descriptors, capacity);
-            Array.Resize(ref _boundingSpheres, capacity);
-            Array.Resize(ref _subbatchIds, capacity);
 
-            int descriptorSize = capacity * 12; // 12 bytes per InstanceDescriptor
-            int sphereSize = capacity * 16;
             int slotSize = capacity * 4;
             int commandSize = MaxSubBatches * IndirectDrawSizes.IndirectCommandSize;
 
             for (int i = 0; i < FrameCount; ++i)
             {
-                // Descriptor buffer (TransformSlot + MaterialId + CustomDataIdx — 12 bytes per instance)
-                descriptorBuffers[i] = Engine.Device.CreateUploadBuffer(descriptorSize);
-                descriptorSRVIndices[i] = Engine.Device.AllocateBindlessIndex();
-                Engine.Device.CreateStructuredBufferSRV(descriptorBuffers[i], (uint)capacity, 12, descriptorSRVIndices[i]);
-
-                boundingSpheresBuffers[i] = Engine.Device.CreateUploadBuffer(sphereSize);
-                boundingSpheresSRVIndices[i] = Engine.Device.AllocateBindlessIndex();
-                Engine.Device.CreateStructuredBufferSRV(boundingSpheresBuffers[i], (uint)capacity, 16, boundingSpheresSRVIndices[i]);
-
-                // Subbatch ID per instance (GPU reads to determine command)
-                subbatchIdBuffers[i] = Engine.Device.CreateUploadBuffer(slotSize);
-                subbatchIdSRVIndices[i] = Engine.Device.AllocateBindlessIndex();
-                Engine.Device.CreateStructuredBufferSRV(subbatchIdBuffers[i], (uint)capacity, 4, subbatchIdSRVIndices[i]);
-
                 // GPU output: visible indices (compute shader writes)
                 visibleIndicesBuffers[i] = Engine.Device.CreateDefaultBuffer(slotSize);
                 visibleIndicesUAVIndices[i] = Engine.Device.AllocateBindlessIndex();
                 Engine.Device.CreateStructuredBufferUAV(visibleIndicesBuffers[i], (uint)capacity, 4, visibleIndicesUAVIndices[i]);
                 visibleIndicesSRVIndices[i] = Engine.Device.AllocateBindlessIndex();
                 Engine.Device.CreateStructuredBufferSRV(visibleIndicesBuffers[i], (uint)capacity, 4, visibleIndicesSRVIndices[i]);
-                
 
                 // GPU output: indirect commands (compute shader writes)
                 gpuCommandBuffers[i] = Engine.Device.CreateDefaultBuffer(commandSize);
@@ -314,29 +274,8 @@ namespace Freefall.Graphics
             if (_drawCount == 0) return;
             int frameIndex = Engine.FrameIndex % FrameCount;
 
-            unsafe
-            {
-                // Upload descriptors (12 bytes per instance: TransformSlot + MaterialId + CustomDataIdx)
-                byte* pDesc;
-                descriptorBuffers[frameIndex].Map(0, null, (void**)&pDesc);
-                fixed (InstanceDescriptor* pSrc = _descriptors)
-                    Buffer.MemoryCopy(pSrc, pDesc, _drawCount * 12, _drawCount * 12);
-                descriptorBuffers[frameIndex].Unmap(0);
-
-                byte* pSpheres;
-                boundingSpheresBuffers[frameIndex].Map(0, null, (void**)&pSpheres);
-                fixed (Vector4* pSphereSrc = _boundingSpheres)
-                    Buffer.MemoryCopy(pSphereSrc, pSpheres, _drawCount * 16, _drawCount * 16);
-                boundingSpheresBuffers[frameIndex].Unmap(0);
-
-                byte* pSubbatchIds;
-                subbatchIdBuffers[frameIndex].Map(0, null, (void**)&pSubbatchIds);
-                fixed (uint* pSubbatchSrc = _subbatchIds)
-                    Buffer.MemoryCopy(pSubbatchSrc, pSubbatchIds, _drawCount * 4, _drawCount * 4);
-                subbatchIdBuffers[frameIndex].Unmap(0);
-            }
-
-            // Upload generic per-instance buffers
+            // All per-instance data (descriptors, bounding spheres, subbatch IDs,
+            // terrain data, bones, etc.) is now uploaded through the unified path.
             UploadPerInstanceBuffers(frameIndex);
         }
 
@@ -348,7 +287,6 @@ namespace Freefall.Graphics
             foreach (var (hash, pib) in _perInstanceBuffers)
             {
                 if (!pib.Dirty) continue;
-                if (pib.PushConstantSlot < 0) continue;
                 if (pib.ElementStride == 0 || pib.ElementsPerInstance == 0) continue;
 
                 // Ensure GPU buffer capacity
@@ -517,9 +455,7 @@ namespace Freefall.Graphics
 
             commandList.SetComputeRoot32BitConstant(0, MeshRegistry.SrvIndex, 0);
             commandList.SetComputeRoot32BitConstant(0, gpuCommandUAVIndices[frameIndex], 1);
-            commandList.SetComputeRoot32BitConstant(0, boundingSpheresSRVIndices[frameIndex], 2);
             
-            commandList.SetComputeRoot32BitConstant(0, descriptorSRVIndices[frameIndex], 4);
             commandList.SetComputeRoot32BitConstant(0, visibleIndicesUAVIndices[frameIndex], 5);
             commandList.SetComputeRoot32BitConstant(0, counterBufferUAVIndices[frameIndex], 6);
             commandList.SetComputeRoot32BitConstant(0, (uint)SubBatchCount, 7);
@@ -528,7 +464,6 @@ namespace Freefall.Graphics
             commandList.SetComputeRoot32BitConstant(0, TransformBuffer.Instance?.SrvIndex ?? 0, 10);
             commandList.SetComputeRoot32BitConstant(0, visibilityFlagsUAVIndices[frameIndex], 11);
             commandList.SetComputeRoot32BitConstant(0, (uint)totalInstances, 13);
-            commandList.SetComputeRoot32BitConstant(0, subbatchIdSRVIndices[frameIndex], 23);
             commandList.SetComputeRoot32BitConstant(0, Material.MaterialsBufferIndex, 25);
             commandList.SetComputeRoot32BitConstant(0, histogramUAVIndices[frameIndex], 26);
             commandList.SetComputeRoot32BitConstant(0, (uint)MeshRegistry.Count, 27);
@@ -711,8 +646,6 @@ namespace Freefall.Graphics
             // Set push constants for shadow culling (using shadow-specific buffers)
             commandList.SetComputeRoot32BitConstant(0, MeshRegistry.SrvIndex, 0);
             commandList.SetComputeRoot32BitConstant(0, shadowCommandUAVIndices[frameIndex, cascadeIndex], 1);
-            commandList.SetComputeRoot32BitConstant(0, boundingSpheresSRVIndices[frameIndex], 2);
-            commandList.SetComputeRoot32BitConstant(0, descriptorSRVIndices[frameIndex], 4);
             commandList.SetComputeRoot32BitConstant(0, shadowVisibleIndicesUAVIndices[frameIndex, cascadeIndex], 5);
             commandList.SetComputeRoot32BitConstant(0, shadowCounterUAVIndices[frameIndex, cascadeIndex], 6);
             commandList.SetComputeRoot32BitConstant(0, (uint)SubBatchCount, 7);
@@ -720,7 +653,6 @@ namespace Freefall.Graphics
             commandList.SetComputeRoot32BitConstant(0, TransformBuffer.Instance?.SrvIndex ?? 0, 10);
             commandList.SetComputeRoot32BitConstant(0, shadowVisibilityUAVIndices[frameIndex, cascadeIndex], 11);
             commandList.SetComputeRoot32BitConstant(0, (uint)totalInstances, 13);
-            commandList.SetComputeRoot32BitConstant(0, subbatchIdSRVIndices[frameIndex], 23);
             commandList.SetComputeRoot32BitConstant(0, Material.MaterialsBufferIndex, 25);
             commandList.SetComputeRoot32BitConstant(0, shadowHistogramUAVIndices[frameIndex, cascadeIndex], 26);
             commandList.SetComputeRoot32BitConstant(0, (uint)MeshRegistry.Count, 27);
@@ -873,7 +805,7 @@ namespace Freefall.Graphics
             if (SubBatchCount == 0) return;
             
             if (Engine.FrameIndex % 60 == 0)
-                Debug.Log($"[Batch.Draw] Effect={Material?.Effect?.Name ?? "null"} DrawCount={_drawCount} SubBatches={SubBatchCount} DescSRV={descriptorSRVIndices[frameIndex]} Desc0={(_drawCount > 0 ? $"slot={_descriptors[0].TransformSlot},mat={_descriptors[0].MaterialId}" : "N/A")}");
+                Debug.Log($"[Batch.Draw] Effect={Material?.Effect?.Name ?? "null"} DrawCount={_drawCount} SubBatches={SubBatchCount} Desc0={(_drawCount > 0 ? $"slot={_draws[0].TransformSlot},mat={_draws[0].MaterialId}" : "N/A")}");
 
             var commandBuffer = gpuCommandBuffers[frameIndex];
             if (commandBuffer == null) return;
@@ -932,14 +864,6 @@ namespace Freefall.Graphics
         {
             for (int i = 0; i < FrameCount; ++i)
             {
-                DeferDispose(descriptorBuffers[i], descriptorSRVIndices[i]);
-                descriptorBuffers[i] = null; descriptorSRVIndices[i] = 0;
-
-                DeferDispose(boundingSpheresBuffers[i], boundingSpheresSRVIndices[i]);
-                boundingSpheresBuffers[i] = null; boundingSpheresSRVIndices[i] = 0;
-
-                DeferDispose(subbatchIdBuffers[i], subbatchIdSRVIndices[i]);
-                subbatchIdBuffers[i] = null; subbatchIdSRVIndices[i] = 0;
 
                 DeferDispose(visibleIndicesBuffers[i], visibleIndicesUAVIndices[i]);
                 DeferDispose(null, visibleIndicesSRVIndices[i]);
@@ -1000,12 +924,6 @@ namespace Freefall.Graphics
         {
             for (int i = 0; i < FrameCount; ++i)
             {
-                descriptorBuffers[i]?.Dispose();
-                if (descriptorSRVIndices[i] != 0) Engine.Device.ReleaseBindlessIndex(descriptorSRVIndices[i]);
-                
-                boundingSpheresBuffers[i]?.Dispose();
-                if (boundingSpheresSRVIndices[i] != 0) Engine.Device.ReleaseBindlessIndex(boundingSpheresSRVIndices[i]);
-                
                 visibleIndicesBuffers[i]?.Dispose();
                 if (visibleIndicesUAVIndices[i] != 0) Engine.Device.ReleaseBindlessIndex(visibleIndicesUAVIndices[i]);
                 if (visibleIndicesSRVIndices[i] != 0) Engine.Device.ReleaseBindlessIndex(visibleIndicesSRVIndices[i]);
@@ -1016,8 +934,6 @@ namespace Freefall.Graphics
                 counterBuffers[i]?.Dispose();
                 if (counterBufferUAVIndices[i] != 0) Engine.Device.ReleaseBindlessIndex(counterBufferUAVIndices[i]);
 
-                descriptorSRVIndices[i] = 0;
-                boundingSpheresSRVIndices[i] = 0;
                 visibleIndicesUAVIndices[i] = 0;
                 visibleIndicesSRVIndices[i] = 0;
                 gpuCommandUAVIndices[i] = 0;

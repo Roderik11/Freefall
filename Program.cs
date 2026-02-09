@@ -38,42 +38,18 @@ namespace Freefall
              light.Color = new Color3(1, 1, 1);
              light.Intensity = 1.0f;
 
-             /*
-             // Test Point Lights - DISABLED
-             // RED light - left of player
-             var redLightEntity = new Entity("RedLight");
-             redLightEntity.Transform.Position = new Vector3(1160, 15, 830);
-             var redLight = redLightEntity.AddComponent<PointLight>();
-             redLight.Color = new Color3(1, 0, 0);
-             redLight.Intensity = 10.0f;
-             redLight.Range = 30;
-
-             // GREEN light - in front of player
-             var greenLightEntity = new Entity("GreenLight");
-             greenLightEntity.Transform.Position = new Vector3(1167, 15, 837);
-             var greenLight = greenLightEntity.AddComponent<PointLight>();
-             greenLight.Color = new Color3(0, 1, 0);
-             greenLight.Intensity = 10.0f;
-             greenLight.Range = 30;
-
-             // BLUE light - right of player
-             var blueLightEntity = new Entity("BlueLight");
-             blueLightEntity.Transform.Position = new Vector3(1174, 15, 830);
-             var blueLight = blueLightEntity.AddComponent<PointLight>();
-             blueLight.Color = new Color3(0, 0, 1);
-             blueLight.Intensity = 10.0f;
-             blueLight.Range = 30;
-             */
 
              // Skybox
              var skyboxEntity = new Entity("Skybox");
              var skybox = skyboxEntity.AddComponent<SkyboxRenderer>();
              skybox.SunLight = light;
-             skybox.TimeOfDay = 16f; // Afternoon
+             skybox.TimeOfDay = 0f; // Afternoon
              skybox.AnimateTimeOfDay = false;
 
-             // Player spawn position (castle spawn from GameTestScene)
+             // Player spawn position (beach spawn from GameTestScene)
              Vector3 playerSpawn = new Vector3(1167, 0, 830);
+             // castle spawn from GameTestScene
+             playerSpawn = new Vector3(896, 164, 920);
 
              // Camera setup will be done after terrain is created (needs terrain reference)
 
@@ -225,6 +201,7 @@ namespace Freefall
              characterController.Terrain = terrain;
              characterController.Height = 1.8f;
 
+             //SpawnLights(playerSpawn, terrain);
              //SpawnTrees(terrain, playerSpawn, 16f, 5);
              //SpawnCharacters(10, terrain, playerSpawn, paladinMesh, paladinTexture, paladinMat);
              
@@ -280,9 +257,41 @@ namespace Freefall
              Debug.Log($"[NPCs] Spawned {minionCount} minions");
          }
 
+         private static void SpawnLights(Vector3 center, Terrain terrain)
+         {
+             // Test Point Lights — placed around player at terrain height + 5m
+             float lightHeight = 5f;
+             var redLightEntity = new Entity("RedLight");
+             var redPos = center + new Vector3(-10, 0, 0);
+             redPos.Y = terrain.GetHeight(redPos) + lightHeight;
+             redLightEntity.Transform.Position = redPos;
+             var redLight = redLightEntity.AddComponent<PointLight>();
+             redLight.Color = new Color3(1, 0, 0);
+             redLight.Intensity = 10.0f;
+             redLight.Range = 30;
+
+             var greenLightEntity = new Entity("GreenLight");
+             var greenPos = center + new Vector3(0, 0, 10);
+             greenPos.Y = terrain.GetHeight(greenPos) + lightHeight;
+             greenLightEntity.Transform.Position = greenPos;
+             var greenLight = greenLightEntity.AddComponent<PointLight>();
+             greenLight.Color = new Color3(0, 1, 0);
+             greenLight.Intensity = 10.0f;
+             greenLight.Range = 30;
+
+             var blueLightEntity = new Entity("BlueLight");
+             var bluePos = center + new Vector3(10, 0, 0);
+             bluePos.Y = terrain.GetHeight(bluePos) + lightHeight;
+             blueLightEntity.Transform.Position = bluePos;
+             var blueLight = blueLightEntity.AddComponent<PointLight>();
+             blueLight.Color = new Color3(0, 0, 1);
+             blueLight.Intensity = 10.0f;
+             blueLight.Range = 30;
+        }
+
          private static void SpawnTrees(Terrain terrain, Vector3 center, float minSpacing, int variationCount)
          {
-            // ===== TREES (5 variations � 100 instances = 500 total) =====
+            // ===== TREES (5 variations  100 instances = 500 total) =====
              // Test multi-draw batching: different meshes, same shader/PSO
              string[] oakVariations = {
                  @"D:\Projects\2024\ProjectXYZ\Resources\Tree Prototypes\Oak\Oak_Trees\Oak_01.fbx",
@@ -348,7 +357,6 @@ namespace Freefall
                  
                  var renderer = treeEntity.AddComponent<StaticMeshRenderer>();
                  renderer.StaticMesh = oakMeshes[variation];
-                 renderer.UseIndirectDrawing = true;
                  totalTrees++;
              }
              Debug.Log($"[Trees] Placed {totalTrees} trees using Poisson sampling ({oakMeshes.Length} variations, {minSpacing}m spacing)");

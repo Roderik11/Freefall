@@ -25,8 +25,7 @@ namespace Freefall.Components
         private Matrix4x4[]? boneMatrices;
         private MaterialBlock _materialBlock = new MaterialBlock();
         
-        // GPU persistent transform slot
-        private int _transformSlot = -1;
+
         
         private bool _initialized = false;
         
@@ -79,19 +78,15 @@ namespace Freefall.Components
             if (Mesh == null || Entity?.Transform == null) return;
             if (Materials == null || Materials.Count == 0) return;
 
-            // Allocate transform slot on first use
-            if (_transformSlot < 0 && TransformBuffer.Instance != null)
-            {
-                _transformSlot = TransformBuffer.Instance.AllocateSlot();
-            }
+            var slot = Entity.Transform.TransformSlot;
             
             // Update TransformBuffer with world matrix (apply root rotation if set)
-            if (_transformSlot >= 0)
+            if (slot >= 0)
             {
                 var world = Entity.Transform.WorldMatrix;
                 if (!Mesh.RootRotation.IsIdentity)
                     world = Mesh.RootRotation * world;
-                TransformBuffer.Instance.SetTransform(_transformSlot, world);
+                TransformBuffer.Instance.SetTransform(slot, world);
             }
 
             // Enqueue skinned draw command with MaterialBlock
@@ -100,7 +95,7 @@ namespace Freefall.Components
                 var boneCount = boneMatrices?.Length ?? 0;
                 var effectName = Materials.Count > 0 ? Materials[0]?.Effect?.Name ?? "null" : "no-mat";
                 var passCount = Materials.Count > 0 ? Materials[0]?.GetPasses()?.Count ?? 0 : 0;
-                Debug.Log($"[SkinnedMesh] Entity={Entity?.Name} Parts={Mesh.MeshParts.Count} Bones={boneCount} Effect={effectName} Passes={passCount} Slot={_transformSlot}");
+                Debug.Log($"[SkinnedMesh] Entity={Entity?.Name} Parts={Mesh.MeshParts.Count} Bones={boneCount} Effect={effectName} Passes={passCount} Slot={slot}");
             }
             for (int i = 0; i < Mesh.MeshParts.Count; i++)
             {
@@ -119,7 +114,7 @@ namespace Freefall.Components
                         i, 
                         material, 
                         _materialBlock,
-                        _transformSlot
+                        slot
                     );
                 }
             }

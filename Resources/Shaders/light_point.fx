@@ -1,103 +1,144 @@
-// Point Light Shader - Instanced rendering via bindless buffers
-// Uses LightInstanceData from structured buffer for per-instance transforms and properties
-
 #include "common.fx"
+// @RenderState(DepthTest=false, DepthWrite=false, Blend=Additive)
 
-// Per-instance light data (matches C# struct)
-struct LightInstanceData
+// Per-instance light data — packed into a StructuredBuffer, same pattern as terrain's TerrainPatchData
+struct PointLightData
 {
-    row_major float4x4 World;   // 64 bytes - Transform (position + range scale)
-    float3 LightColor;          // 12 bytes
-    float LightIntensity;       // 4 bytes
-    float LightRange;           // 4 bytes
-    float3 _Padding;            // 12 bytes
-};                              // Total: 96 bytes
+    float3 Color;
+    float Intensity;
+    float3 Position; // camera-relative
+    float Range;
+};
+
+// Standard InstanceBatch push constant layout (slots 2-15 set by command signature)
+#define DescriptorBufIdx GET_INDEX(2)
+#define Reserved0Idx GET_INDEX(3)
+#define SortedIndicesIdx GET_INDEX(4)
+#define IndexBufferIdx GET_INDEX(7)
+#define BaseIndex GET_INDEX(8)
+#define PosBufferIdx GET_INDEX(9)
+#define InstanceBaseOffset GET_INDEX(13)
+
+// Per-instance buffer: PointLightData (slot 1, same as terrain's TerrainDataIdx)
+#define LightDataIdx GET_INDEX(1)
+
+// G-Buffer textures (slots 17-18, set by Material.Apply, above command signature range)
+#define NormalTexIdx GET_INDEX(17)
+#define DepthTexIdx GET_INDEX(18)
+
+// Per-instance descriptor (matches C# InstanceDescriptor: 12 bytes)
+struct InstanceDescriptor
+{
+    uint TransformSlot;
+    uint MaterialId;
+    uint CustomDataIdx;
+};
+
+SamplerState Sampler : register(s0);
 
 struct VSOutput
 {
-    float4 Position   : SV_POSITION;
-    float4 Screen     : TEXCOORD0;
-    float3 LightWorld : TEXCOORD1;
-    float3 Color      : TEXCOORD2;
-    float Intensity   : TEXCOORD3;
-    float Range       : TEXCOORD4;
+    float4 Position : SV_POSITION;
+    float4 ScreenPos : TEXCOORD0;
+    nointerpolation uint InstanceIdx : TEXCOORD1;
 };
 
-// Light Pass Push Constant Layout
-// Slots 0-2: Light-specific textures and data
-// Slot 7: Vertex positions (shared with unified geometry layout)
-#define NormalTexIdx GET_INDEX(0)           // G-Buffer normal texture
-#define DepthTexIdx GET_INDEX(1)            // G-Buffer depth texture 
-#define LightInstanceBufferIdx GET_INDEX(2) // StructuredBuffer<LightInstanceData>
-#define PosBufferIdx GET_INDEX(7)           // StructuredBuffer<float3> - sphere vertex positions
-
-VSOutput VS(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
+// ── Vertex Shader ──────────────────────────────────────────────────────────
+// Same pattern as terrain: full GPU-driven pipeline with bindless buffers
+VSOutput VS(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_InstanceID)
 {
-    VSOutput output = (VSOutput)0;
+    VSOutput output;
 
-    // Read sphere vertex position from bindless buffer
-    StructuredBuffer<float3> positions = ResourceDescriptorHeap[PosBufferIdx];
-    float3 pos = positions[vertexID];
-
-    // Read light instance data from bindless buffer
-    StructuredBuffer<LightInstanceData> instances = ResourceDescriptorHeap[LightInstanceBufferIdx];
-    LightInstanceData light = instances[instanceID];
-
-    // Transform vertex position through World, View, Projection
-    float4 worldPos = mul(float4(pos, 1.0f), light.World);
-    float4 viewPos = mul(worldPos, View);
-    float4 clipPos = mul(viewPos, Projection);
+    // Instance data buffers
+    StructuredBuffer<InstanceDescriptor> descriptors = ResourceDescriptorHeap[DescriptorBufIdx];
+    StructuredBuffer<row_major matrix> globalTransforms = ResourceDescriptorHeap[GlobalTransformBufferIdx];
+    StructuredBuffer<uint> sortedIndices = ResourceDescriptorHeap[SortedIndicesIdx];
     
-    output.Position = clipPos;
-    output.Screen = clipPos;
-    output.LightWorld = light.World[3].xyz;  // Light position in world space
-    output.Color = light.LightColor;
-    output.Intensity = light.LightIntensity;
-    output.Range = light.LightRange;
+    // Bindless index buffer
+    StructuredBuffer<uint> indices = ResourceDescriptorHeap[IndexBufferIdx];
+    uint vertexID = indices[primitiveVertexID + BaseIndex];
+    
+    // Mesh position buffer
+    StructuredBuffer<float3> positions = ResourceDescriptorHeap[PosBufferIdx];
+    
+    // Instance lookup
+    uint dataPos = InstanceBaseOffset + instanceID;
+    uint packedIdx = sortedIndices[dataPos];
+    uint idx = packedIdx & 0x7FFFFFFFu;
+    
+    InstanceDescriptor desc = descriptors[idx];
+    uint slot = desc.TransformSlot;
+    
+    row_major matrix World = globalTransforms[slot];
+    
+    float3 pos = positions[vertexID];
+    
+    // Transform through World × View × Projection
+    float4 worldPos = mul(float4(pos, 1.0f), World);
+    output.Position = mul(mul(worldPos, View), Projection);
+    output.ScreenPos = output.Position;
+    output.InstanceIdx = idx;
     
     return output;
 }
 
-SamplerState Sampler : register(s0);
-SamplerState SamplerPoint : register(s1);
-
-// posFromDepth is defined in common.fx, returns float4
-
-float4 PS(VSOutput IN) : SV_TARGET
+// ── Pixel Shader ───────────────────────────────────────────────────────────
+// Reconstruct world pos from depth, compute point light contribution
+float4 PS(VSOutput input) : SV_Target
 {
-    // DEBUG: Just output the light color to confirm geometry is being drawn
-    return float4(IN.Color * IN.Intensity * 0.1, 1.0);
+    // Get screen UV from rasterized position
+    float2 screenPos = input.Position.xy;
     
-    /*
-    // Sample G-buffer
-    Texture2D<float4> normalTex = ResourceDescriptorHeap[NormalTexIdx];
-    Texture2D<float> depthTex = ResourceDescriptorHeap[DepthTexIdx];
+    // Get render target dimensions
+    Texture2D NormalTex = ResourceDescriptorHeap[NormalTexIdx];
+    Texture2D DepthTex = ResourceDescriptorHeap[DepthTexIdx];
     
-    float2 UV = IN.Screen.xy / IN.Screen.w;
-    UV = 0.5f * (float2(UV.x, -UV.y) + 1);
+    float w, h;
+    NormalTex.GetDimensions(w, h);
+    float2 uv = screenPos / float2(w, h);
     
-    float4 vNormals = normalTex.Sample(Sampler, UV);
-    float depth = depthTex.Sample(SamplerPoint, UV);
+    // Sample G-Buffer
+    float3 normal = NormalTex.Sample(Sampler, uv).xyz;
+    float depth = DepthTex.Sample(Sampler, uv).r;
     
-    // Reconstruct world position from depth
-    float3 worldPosition = posFromDepth(UV, depth, CameraInverse).xyz;
+    // Skip sky pixels
+    if (depth >= 1.0f)
+        discard;
     
-    // Calculate light contribution
-    float3 lightVec = IN.LightWorld - worldPosition;
-    float dist = length(lightVec);
-    float atten = 1 - saturate(dist / IN.Range);
-    atten *= atten; // Quadratic falloff
+    // Reconstruct world position from depth (camera-relative, zero-translation)
+    float4 worldPos = posFromDepth(uv, depth, CameraInverse);
     
-    float3 lightDir = normalize(lightVec);
-    float3 normal = normalize(mul(vNormals.xyz, (float3x3)ViewInverse));
+    // Read per-instance light data from structured buffer
+    StructuredBuffer<PointLightData> lightData = ResourceDescriptorHeap[LightDataIdx];
+    PointLightData light = lightData[input.InstanceIdx];
     
-    float NdotL = saturate(dot(normal, lightDir));
+    // Direction from surface to light
+    float3 toLight = light.Position - worldPos.xyz;
+    float dist = length(toLight);
     
-    return float4(IN.Color * IN.Intensity * atten * NdotL, 0);
-    */
+    // Early out if beyond range
+    if (dist > light.Range)
+        discard;
+    
+    float3 L = toLight / dist;
+    
+    // N·L
+    float NdotL = max(dot(normal, L), 0.0);
+    
+    if (NdotL <= 0.0)
+        discard;
+    
+    // Attenuation: smooth falloff at range boundary
+    float attenuation = saturate(1.0 - (dist / light.Range));
+    attenuation *= attenuation; // Quadratic falloff
+    
+    // Final lighting
+    float3 lighting = light.Color * light.Intensity * NdotL * attenuation;
+    
+    return float4(lighting, 1.0);
 }
 
-technique11 Standard
+technique11 PointLight
 {
     pass Light
     {

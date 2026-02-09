@@ -1,6 +1,7 @@
 using System.Numerics;
 using Vortice.Mathematics;
 using Freefall.Base;
+using Freefall.Graphics;
 
 namespace Freefall.Components
 {
@@ -9,6 +10,21 @@ namespace Freefall.Components
         public Vector3 Position { get; set; } = Vector3.Zero;
         public Quaternion Rotation { get; set; } = Quaternion.Identity;
         public Vector3 Scale { get; set; } = Vector3.One;
+
+        /// <summary>
+        /// GPU persistent transform slot in global TransformBuffer.
+        /// Allocated on first access, reused across frames.
+        /// </summary>
+        public int TransformSlot
+        {
+            get
+            {
+                if (_transformSlot < 0 && TransformBuffer.Instance != null)
+                    _transformSlot = TransformBuffer.Instance.AllocateSlot();
+                return _transformSlot;
+            }
+        }
+        private int _transformSlot = -1;
 
         public Matrix4x4 WorldMatrix
         {
