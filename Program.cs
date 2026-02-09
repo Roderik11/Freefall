@@ -246,7 +246,7 @@ namespace Freefall
              Debug.Log($"[Player] Created at {playerSpawn}");
 
              // ===== SCENE LOADING =====
-             //LoadScene(); // Disabled — per-resource copy path causes TDR during parallel loading. Re-enable after fixing.
+             LoadScene(); // Disabled — per-resource copy path causes TDR during parallel loading. Re-enable after fixing.
          }
 
          private static void SpawnCharacters(int count, Terrain terrain, Vector3 center, Mesh mesh, Texture texture, Material material = null)
