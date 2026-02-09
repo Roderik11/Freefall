@@ -108,10 +108,20 @@ namespace Freefall.Components
                 patch.BoundingBox = new BoundingBox(bb.Min, new Vector3(bb.Max.X, MaxHeight, bb.Max.Z));
             }
 
+            // Initialize quadtree
+            var extent = TerrainSize / 2;
+            quadtree = new QuadTreeNode(new Vector3(extent.X, 0, extent.Y), new Vector3(extent.X, MaxHeight * 10, extent.Y));
+            sizeFactor = quadtree.Extents.X / patchSize;
+
+            // Load control maps and setup layer tiling
+            if (Layers.Count > 0)
+            {
+                CreateControlMaps(device);
+                SetupLayerTiling();
+            }
+
             Debug.Log("[Terrain] Awake");
         }
-
-        private bool _initialized = false;
 
         private void CreateControlMaps(GraphicsDevice device)
         {
@@ -188,28 +198,13 @@ namespace Freefall.Components
 
         public void Update()
         {
-            if (!_initialized)
-            {
-                var extent = TerrainSize / 2;
-                quadtree = new QuadTreeNode(new Vector3(extent.X, 0, extent.Y), new Vector3(extent.X, MaxHeight * 10, extent.Y));
-                sizeFactor = quadtree.Extents.X / patchSize;
-
-                if (Layers.Count > 0)
-                {
-                    var device = Engine.Device;
-                    CreateControlMaps(device);
-                    SetupLayerTiling();
-                }
-                _initialized = true;
-            }
-
             if (Camera.Main == null) return;
             quadtree.Update(Camera.Main.Transform.Position - Transform.Position);
         }
 
         public void Draw()
         {
-            if (Camera.Main == null || !_initialized) return;
+            if (Camera.Main == null) return;
             
             // Quadtree traversal — collect visible patches
             nodesToRender.Clear();

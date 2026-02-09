@@ -506,37 +506,13 @@ namespace Freefall.Graphics
                 customQueues[pass] = new List<Action<ID3D12GraphicsCommandList>>();
         }
 
-        public static void Enqueue(RenderPass pass, Mesh mesh, int meshPartIndex, Material material, MaterialBlock materialBlock, int transformSlot = -1)
-        {
-            var key = new BatchKey(material.Effect);
-            current.passes[(int)pass].Add(new DrawCall 
-            {
-                Key = key,
-                Mesh = mesh,
-                MeshPartIndex = meshPartIndex,
-                Material = material,
-                MaterialBlock = materialBlock,
-                TransformSlot = transformSlot
-            });
-        }
-        
         public static void Enqueue(RenderPass pass, Action<ID3D12GraphicsCommandList> action)
         {
             current.customQueues[pass].Add(action);
         }
 
-        public static void Enqueue(RenderPass pass, Mesh mesh, Material material, MaterialBlock materialBlock, int transformSlot = -1)
-        {
-            for (int i = 0; i < mesh.MeshParts.Count; i++)
-            {
-                if (mesh.MeshParts[i].Enabled)
-                    Enqueue(pass, mesh, i, material, materialBlock, transformSlot);
-            }
-        }
-        
         /// <summary>
         /// Enqueue draw call into all applicable RenderPasses based on the Material's Effect passes.
-        /// Follows Spark pattern: one call, Effect defines which passes the geometry goes into.
         /// </summary>
         public static void Enqueue(Mesh mesh, int meshPartIndex, Material material, MaterialBlock materialBlock, int transformSlot = -1)
         {

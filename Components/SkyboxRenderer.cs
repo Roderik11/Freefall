@@ -11,6 +11,7 @@ namespace Freefall.Components
     {
         public Mesh Mesh;
         public Material Material;
+        public MaterialBlock Params = new MaterialBlock();
 
         // Sky mode
         public bool UseProceduralSky = true;
@@ -38,10 +39,15 @@ namespace Freefall.Components
 
         private float CloudTime = 0.0f;
 
-        private MaterialBlock _materialBlock = new MaterialBlock();
 
         public SkyboxRenderer()
         {
+        }
+
+        protected override void Awake()
+        {
+            Mesh = Mesh.CreateCube(Engine.Device, 100.0f);
+            Material = new Material(new Effect("mesh_skybox"));
         }
 
         public void Update()
@@ -63,9 +69,7 @@ namespace Freefall.Components
 
             // Update sun light
             if (UseProceduralSky && ControlSunLight && SunLight != null)
-            {
                 UpdateSunLight();
-            }
         }
 
         private void UpdateSunLight()
@@ -103,16 +107,6 @@ namespace Freefall.Components
 
         public void Draw()
         {
-            if (Mesh == null)
-            {
-                Mesh = Mesh.CreateCube(Engine.Device, 100.0f);
-            }
-
-            if (Material == null)
-            {
-                Material = new Material(new Effect("mesh_skybox"));
-            }
-
             var slot = Entity.Transform.TransformSlot;
 
             // Update transform in the global buffer
@@ -134,17 +128,7 @@ namespace Freefall.Components
                 Material.SetParameter("StarBrightness", StarBrightness);
             }
 
-            // Enqueue — RenderPass is inferred from the Effect's shader passes.
-            // InstanceBatch pipeline handles push constants, transform buffers, and draw calls.
-            CommandBuffer.Enqueue(Mesh, Material, _materialBlock, slot);
-
-            if (Engine.FrameIndex % 60 == 0)
-            {
-                Debug.Log("SkyboxRenderer", $"SunDir={SunDirection}, TimeOfDay={TimeOfDay}, CloudCoverage={CloudCoverage}, SunIntensity={SunIntensity}");
-                Debug.Log("SkyboxRenderer", $"TransformSlot={slot}, MeshParts={Mesh.MeshParts.Count}, MeshPartId={Mesh.GetMeshPartId(0)}");
-                Debug.Log("SkyboxRenderer", $"PosBuffer={Mesh.PosBufferIndex}, NormBuffer={Mesh.NormBufferIndex}, UVBuffer={Mesh.UVBufferIndex}, IndexBuffer={Mesh.IndexBufferIndex}");
-                Debug.Log("SkyboxRenderer", $"BoundingBox={Mesh.BoundingBox}, LocalSphere={Mesh.LocalBoundingSphere}");
-            }
+            CommandBuffer.Enqueue(Mesh, Material, Params, slot);
         }
     }
 }
