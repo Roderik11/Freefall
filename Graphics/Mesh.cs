@@ -336,6 +336,11 @@ namespace Freefall.Graphics
             GeneratePatchVertices(out var verts, out var norms, out var uvs);
             var mesh = new Mesh(device, verts, norms, uvs, indices);
             mesh.MeshParts.Add(new MeshPart { NumIndices = indices.Length });
+            // XZ: vertices span [-PatchOffset, +PatchOffset] = [-16, +16]
+            // Y: 0 in mesh space; actual height range set by Terrain.Awake via SetPatchBounds()
+            mesh.BoundingBox = new BoundingBox(
+                new Vector3(-PatchOffset, 0, -PatchOffset),
+                new Vector3(PatchOffset, 0, PatchOffset));
             return mesh;
         }
 

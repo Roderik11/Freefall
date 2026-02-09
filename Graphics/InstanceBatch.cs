@@ -63,60 +63,45 @@ namespace Freefall.Graphics
         public int SubBatchCount { get; private set; }
 
         private int capacity = 0;
-        // Per-instance buffer registry: param hash → push constant slot
-        // Only params with a registered slot get GPU buffers
-        private static readonly Dictionary<int, PerInstanceSlot> _perInstanceSlots = new();
-        
-        /// <summary>
-        /// Register a per-instance param. Only registered params get GPU buffers.
-        /// </summary>
-        public static void RegisterPerInstanceSlot(string name, int pushConstantSlot, int elementStride)
-        {
-            _perInstanceSlots[name.GetHashCode()] = new PerInstanceSlot
-            {
-                Name = name,
-                Hash = name.GetHashCode(),
-                PushConstantSlot = pushConstantSlot,
-                ElementStride = elementStride
-            };
-        }
-        
-        public struct PerInstanceSlot
-        {
-            public string Name;
-            public int Hash;
-            public int PushConstantSlot;
-            public int ElementStride; // bytes per element (e.g. 64 for Matrix4x4)
-        }
+
         
         /// <summary>
         /// Per-instance GPU buffer for a single parameter (SoA pattern).
-        /// Sparse: indexed by transformSlot, sized to (maxSlot+1) * elementsPerInstance.
+        /// Self-describing: carries its own PushConstantSlot and stride.
         /// </summary>
         private class PerInstanceBuffer
         {
             public int ParamHash;
+            public int PushConstantSlot; // which push constant slot to bind SRV to
             public ID3D12Resource[] Buffers = new ID3D12Resource[FrameCount];
             public uint[] SRVIndices = new uint[FrameCount];
             public int Capacity; // in slots
             public int ElementsPerInstance; // e.g. numBones
             public int ElementStride; // bytes per element
             public bool Dirty;
+            
+            // CPU staging buffer — filled during MergeFromBucket, uploaded in one MemoryCopy
+            public byte[] StagingData = Array.Empty<byte>();
+            public int StagingCapacity; // in slots (matches Capacity growth)
         }
         
         // Active per-instance buffers for this batch
         private Dictionary<int, PerInstanceBuffer> _perInstanceBuffers = new();
         
+        // Hardcoded compute push constant slots for per-instance buffers.
+        // These are core pipeline constants — compute layout is fixed in cull_instances.hlsl.
+        // Graphics slots (from shader resource bindings) are separate and used in Draw/DrawShadow.
+        private static readonly Dictionary<int, int> ComputeSlots = new()
+        {
+            { "Bones".GetHashCode(), 30 },        // Indices[7].z = BoneBufferIdx
+        };
+        
         // Cached array to avoid per-frame allocation
         private ID3D12DescriptorHeap[]? _cachedSrvHeapArray;
 
-        // Transform slots buffer (indices into global TransformBuffer)
-        private ID3D12Resource[] transformSlotBuffers = new ID3D12Resource[FrameCount];
-        private uint[] transformSlotSRVIndices = new uint[FrameCount];
-        
-        // Material ID buffer
-        private ID3D12Resource[] materialIdBuffers = new ID3D12Resource[FrameCount];
-        private uint[] materialIdSRVIndices = new uint[FrameCount];
+        // Descriptor buffer (TransformSlot + MaterialId + CustomDataIdx per instance)
+        private ID3D12Resource[] descriptorBuffers = new ID3D12Resource[FrameCount];
+        private uint[] descriptorSRVIndices = new uint[FrameCount];
 
         // Bounding spheres for GPU culling
         private ID3D12Resource[] boundingSpheresBuffers = new ID3D12Resource[FrameCount];
@@ -180,8 +165,7 @@ namespace Freefall.Graphics
 
 
         // Contiguous arrays for O(1) block-copy upload (stored in draw-order)
-        private uint[] _transformSlots = Array.Empty<uint>();
-        private uint[] _materialIds = Array.Empty<uint>();
+        private InstanceDescriptor[] _descriptors = Array.Empty<InstanceDescriptor>();
         private Vector4[] _boundingSpheres = Array.Empty<Vector4>();
         private uint[] _subbatchIds = Array.Empty<uint>();
         private int _drawCount = 0;
@@ -225,33 +209,51 @@ namespace Freefall.Graphics
             SubBatchCount = _uniqueMeshPartIds.Count;
             
             // Block-copy GPU arrays using Span (slice to actual count)
-            var srcTransforms = CollectionsMarshal.AsSpan(bucket.TransformSlots).Slice(0, count);
-            var srcMaterials = CollectionsMarshal.AsSpan(bucket.MaterialIds).Slice(0, count);
+            var srcDescriptors = CollectionsMarshal.AsSpan(bucket.Descriptors).Slice(0, count);
             var srcSpheres = CollectionsMarshal.AsSpan(bucket.BoundingSpheres).Slice(0, count);
             var srcPartIds = CollectionsMarshal.AsSpan(bucket.MeshPartIds).Slice(0, count);
             
-            srcTransforms.CopyTo(_transformSlots.AsSpan(startIdx));
-            srcMaterials.CopyTo(_materialIds.AsSpan(startIdx));
+            srcDescriptors.CopyTo(_descriptors.AsSpan(startIdx));
             srcSpheres.CopyTo(_boundingSpheres.AsSpan(startIdx));
             srcPartIds.CopyTo(_subbatchIds.AsSpan(startIdx));
             
-            // Mark per-instance buffers dirty if bucket has matching params
-            foreach (var (hash, _) in bucket.PerInstanceParams)
+            // Block-copy pre-staged per-instance data from bucket (staged at Enqueue time)
+            foreach (var (hash, staging) in bucket.PerInstanceData)
             {
-                if (_perInstanceSlots.ContainsKey(hash))
+                if (staging.Count == 0 || staging.PushConstantSlot < 0) continue;
+                
+                if (!_perInstanceBuffers.TryGetValue(hash, out var pib))
                 {
-                    if (!_perInstanceBuffers.ContainsKey(hash))
-                        _perInstanceBuffers[hash] = new PerInstanceBuffer { ParamHash = hash };
-                    _perInstanceBuffers[hash].Dirty = true;
+                    pib = new PerInstanceBuffer
+                    {
+                        ParamHash = hash,
+                        PushConstantSlot = staging.PushConstantSlot,
+                        ElementStride = staging.ElementStride,
+                        ElementsPerInstance = staging.ElementsPerInstance
+                    };
+                    _perInstanceBuffers[hash] = pib;
                 }
+                
+                // Ensure staging capacity (dense, indexed by instance)
+                int bytesPerInst = staging.BytesPerInstance;
+                int requiredBytes = newTotal * bytesPerInst;
+                if (pib.StagingData.Length < requiredBytes)
+                {
+                    int newCap = Math.Max(pib.StagingData.Length * 2, requiredBytes);
+                    Array.Resize(ref pib.StagingData, newCap);
+                }
+                
+                // Block-copy from bucket staging into batch staging
+                int srcBytes = staging.Count * bytesPerInst;
+                Buffer.BlockCopy(staging.Data, 0, pib.StagingData, startIdx * bytesPerInst, srcBytes);
+                pib.Dirty = true;
             }
             
             // Track max transform slot for bone buffer sizing
-            var slots = srcTransforms;
-            for (int i = 0; i < slots.Length; i++)
+            for (int i = 0; i < srcDescriptors.Length; i++)
             {
-                if ((int)slots[i] > _maxTransformSlot)
-                    _maxTransformSlot = (int)slots[i];
+                if ((int)srcDescriptors[i].TransformSlot > _maxTransformSlot)
+                    _maxTransformSlot = (int)srcDescriptors[i].TransformSlot;
             }
             
             _drawCount = newTotal;
@@ -266,25 +268,21 @@ namespace Freefall.Graphics
             DeferDisposeBuffers();
 
             Array.Resize(ref _draws, capacity);
-            Array.Resize(ref _transformSlots, capacity);
-            Array.Resize(ref _materialIds, capacity);
+            Array.Resize(ref _descriptors, capacity);
             Array.Resize(ref _boundingSpheres, capacity);
             Array.Resize(ref _subbatchIds, capacity);
 
-            int slotSize = capacity * 4;
+            int descriptorSize = capacity * 12; // 12 bytes per InstanceDescriptor
             int sphereSize = capacity * 16;
+            int slotSize = capacity * 4;
             int commandSize = MaxSubBatches * IndirectDrawSizes.IndirectCommandSize;
 
             for (int i = 0; i < FrameCount; ++i)
             {
-                // Input buffers (CPU → GPU upload)
-                transformSlotBuffers[i] = Engine.Device.CreateUploadBuffer(slotSize);
-                transformSlotSRVIndices[i] = Engine.Device.AllocateBindlessIndex();
-                Engine.Device.CreateStructuredBufferSRV(transformSlotBuffers[i], (uint)capacity, 4, transformSlotSRVIndices[i]);
-
-                materialIdBuffers[i] = Engine.Device.CreateUploadBuffer(slotSize);
-                materialIdSRVIndices[i] = Engine.Device.AllocateBindlessIndex();
-                Engine.Device.CreateStructuredBufferSRV(materialIdBuffers[i], (uint)capacity, 4, materialIdSRVIndices[i]);
+                // Descriptor buffer (TransformSlot + MaterialId + CustomDataIdx — 12 bytes per instance)
+                descriptorBuffers[i] = Engine.Device.CreateUploadBuffer(descriptorSize);
+                descriptorSRVIndices[i] = Engine.Device.AllocateBindlessIndex();
+                Engine.Device.CreateStructuredBufferSRV(descriptorBuffers[i], (uint)capacity, 12, descriptorSRVIndices[i]);
 
                 boundingSpheresBuffers[i] = Engine.Device.CreateUploadBuffer(sphereSize);
                 boundingSpheresSRVIndices[i] = Engine.Device.AllocateBindlessIndex();
@@ -318,17 +316,12 @@ namespace Freefall.Graphics
 
             unsafe
             {
-                byte* pSlots;
-                transformSlotBuffers[frameIndex].Map(0, null, (void**)&pSlots);
-                fixed (uint* pSrc = _transformSlots)
-                    Buffer.MemoryCopy(pSrc, pSlots, _drawCount * 4, _drawCount * 4);
-                transformSlotBuffers[frameIndex].Unmap(0);
-
-                byte* pMatId;
-                materialIdBuffers[frameIndex].Map(0, null, (void**)&pMatId);
-                fixed (uint* pMatSrc = _materialIds)
-                    Buffer.MemoryCopy(pMatSrc, pMatId, _drawCount * 4, _drawCount * 4);
-                materialIdBuffers[frameIndex].Unmap(0);
+                // Upload descriptors (12 bytes per instance: TransformSlot + MaterialId + CustomDataIdx)
+                byte* pDesc;
+                descriptorBuffers[frameIndex].Map(0, null, (void**)&pDesc);
+                fixed (InstanceDescriptor* pSrc = _descriptors)
+                    Buffer.MemoryCopy(pSrc, pDesc, _drawCount * 12, _drawCount * 12);
+                descriptorBuffers[frameIndex].Unmap(0);
 
                 byte* pSpheres;
                 boundingSpheresBuffers[frameIndex].Map(0, null, (void**)&pSpheres);
@@ -350,75 +343,30 @@ namespace Freefall.Graphics
         private void UploadPerInstanceBuffers(int frameIndex)
         {
             if (_drawCount == 0) return;
-            int requiredSlots = _maxTransformSlot + 1;
+            int requiredSlots = _drawCount; // Dense: per-instance data is indexed by instance, not TransformSlot
 
             foreach (var (hash, pib) in _perInstanceBuffers)
             {
                 if (!pib.Dirty) continue;
-                if (!_perInstanceSlots.TryGetValue(hash, out var slotInfo)) continue;
-
-                // Determine elements per instance from first draw that has this param
-                int elementsPerInstance = 0;
-                for (int i = 0; i < _drawCount; ++i)
-                {
-                    var block = _draws[i].Block;
-                    if (block == null) continue;
-                    foreach (var (ph, pv) in block.Parameters)
-                    {
-                        if (ph == hash)
-                        {
-                            // Get array length from the value
-                            var valueField = pv.GetType().GetField("Value");
-                            if (valueField?.GetValue(pv) is Array arr)
-                                elementsPerInstance = arr.Length;
-                            break;
-                        }
-                    }
-                    if (elementsPerInstance > 0) break;
-                }
-                if (elementsPerInstance == 0) continue;
-
-                pib.ElementsPerInstance = elementsPerInstance;
-                pib.ElementStride = slotInfo.ElementStride;
+                if (pib.PushConstantSlot < 0) continue;
+                if (pib.ElementStride == 0 || pib.ElementsPerInstance == 0) continue;
 
                 // Ensure GPU buffer capacity
                 EnsurePerInstanceBuffer(pib, requiredSlots);
 
-                // Map and write sparse data indexed by transformSlot
+                // Single MemoryCopy from pre-staged byte array — no iteration, no reflection
+                int bytesPerSlot = pib.ElementsPerInstance * pib.ElementStride;
+                int uploadBytes = requiredSlots * bytesPerSlot;
+                if (uploadBytes > pib.StagingData.Length)
+                    uploadBytes = pib.StagingData.Length;
+
                 var buf = pib.Buffers[frameIndex];
-                int stride = pib.ElementStride;
                 unsafe
                 {
                     byte* pData;
                     buf.Map(0, null, (void**)&pData);
-
-                    for (int i = 0; i < _drawCount; ++i)
-                    {
-                        var d = _draws[i];
-                        if (d.Block == null) continue;
-                        if (!d.Block.Parameters.TryGetValue(hash, out var pv)) continue;
-
-                        var valueField = pv.GetType().GetField("Value");
-                        if (valueField?.GetValue(pv) is not Array arr) continue;
-
-                        int baseOffset = d.TransformSlot * elementsPerInstance * stride;
-                        // Pin the managed array and copy
-                        var handle = System.Runtime.InteropServices.GCHandle.Alloc(arr, System.Runtime.InteropServices.GCHandleType.Pinned);
-                        try
-                        {
-                            int byteCount = arr.Length * stride;
-                            Buffer.MemoryCopy(
-                                (void*)handle.AddrOfPinnedObject(),
-                                pData + baseOffset,
-                                (long)(pib.Capacity * elementsPerInstance * stride - baseOffset),
-                                byteCount);
-                        }
-                        finally
-                        {
-                            handle.Free();
-                        }
-                    }
-
+                    fixed (byte* pSrc = pib.StagingData)
+                        Buffer.MemoryCopy(pSrc, pData, uploadBytes, uploadBytes);
                     buf.Unmap(0);
                 }
             }
@@ -428,11 +376,10 @@ namespace Freefall.Graphics
         {
             if (pib.Capacity >= requiredSlots) return;
 
-            // Dispose old buffers
+            // Defer disposal of old buffers — GPU may still be reading them from in-flight frames
             for (int i = 0; i < FrameCount; ++i)
             {
-                pib.Buffers[i]?.Dispose();
-                if (pib.SRVIndices[i] != 0) Engine.Device.ReleaseBindlessIndex(pib.SRVIndices[i]);
+                DeferDispose(pib.Buffers[i], pib.SRVIndices[i]);
             }
 
             int totalElements = requiredSlots * pib.ElementsPerInstance;
@@ -572,7 +519,7 @@ namespace Freefall.Graphics
             commandList.SetComputeRoot32BitConstant(0, gpuCommandUAVIndices[frameIndex], 1);
             commandList.SetComputeRoot32BitConstant(0, boundingSpheresSRVIndices[frameIndex], 2);
             
-            commandList.SetComputeRoot32BitConstant(0, transformSlotSRVIndices[frameIndex], 4);
+            commandList.SetComputeRoot32BitConstant(0, descriptorSRVIndices[frameIndex], 4);
             commandList.SetComputeRoot32BitConstant(0, visibleIndicesUAVIndices[frameIndex], 5);
             commandList.SetComputeRoot32BitConstant(0, counterBufferUAVIndices[frameIndex], 6);
             commandList.SetComputeRoot32BitConstant(0, (uint)SubBatchCount, 7);
@@ -582,19 +529,18 @@ namespace Freefall.Graphics
             commandList.SetComputeRoot32BitConstant(0, visibilityFlagsUAVIndices[frameIndex], 11);
             commandList.SetComputeRoot32BitConstant(0, (uint)totalInstances, 13);
             commandList.SetComputeRoot32BitConstant(0, subbatchIdSRVIndices[frameIndex], 23);
-            commandList.SetComputeRoot32BitConstant(0, materialIdSRVIndices[frameIndex], 24);
             commandList.SetComputeRoot32BitConstant(0, Material.MaterialsBufferIndex, 25);
             commandList.SetComputeRoot32BitConstant(0, histogramUAVIndices[frameIndex], 26);
             commandList.SetComputeRoot32BitConstant(0, (uint)MeshRegistry.Count, 27);
 
 
-            // Push per-instance buffer SRV indices to their registered slots
-            foreach (var (hash, slotInfo) in _perInstanceSlots)
+            // Bind per-instance buffer SRV indices to COMPUTE push constants (hardcoded slots).
+            // Compute and graphics slot namespaces differ — can't reuse PushConstantSlot here.
+            foreach (var (hash, pib) in _perInstanceBuffers)
             {
-                uint srvIdx = 0;
-                if (_perInstanceBuffers.TryGetValue(hash, out var pib))
-                    srvIdx = pib.SRVIndices[frameIndex];
-                commandList.SetComputeRoot32BitConstant(0, srvIdx, (uint)slotInfo.PushConstantSlot);
+                if (!ComputeSlots.TryGetValue(hash, out int computeSlot)) continue;
+                uint srvIdx = pib.SRVIndices[frameIndex];
+                commandList.SetComputeRoot32BitConstant(0, srvIdx, (uint)computeSlot);
             }
 
             commandList.ClearUnorderedAccessViewUint(
@@ -766,7 +712,7 @@ namespace Freefall.Graphics
             commandList.SetComputeRoot32BitConstant(0, MeshRegistry.SrvIndex, 0);
             commandList.SetComputeRoot32BitConstant(0, shadowCommandUAVIndices[frameIndex, cascadeIndex], 1);
             commandList.SetComputeRoot32BitConstant(0, boundingSpheresSRVIndices[frameIndex], 2);
-            commandList.SetComputeRoot32BitConstant(0, transformSlotSRVIndices[frameIndex], 4);
+            commandList.SetComputeRoot32BitConstant(0, descriptorSRVIndices[frameIndex], 4);
             commandList.SetComputeRoot32BitConstant(0, shadowVisibleIndicesUAVIndices[frameIndex, cascadeIndex], 5);
             commandList.SetComputeRoot32BitConstant(0, shadowCounterUAVIndices[frameIndex, cascadeIndex], 6);
             commandList.SetComputeRoot32BitConstant(0, (uint)SubBatchCount, 7);
@@ -775,18 +721,16 @@ namespace Freefall.Graphics
             commandList.SetComputeRoot32BitConstant(0, shadowVisibilityUAVIndices[frameIndex, cascadeIndex], 11);
             commandList.SetComputeRoot32BitConstant(0, (uint)totalInstances, 13);
             commandList.SetComputeRoot32BitConstant(0, subbatchIdSRVIndices[frameIndex], 23);
-            commandList.SetComputeRoot32BitConstant(0, materialIdSRVIndices[frameIndex], 24);
             commandList.SetComputeRoot32BitConstant(0, Material.MaterialsBufferIndex, 25);
             commandList.SetComputeRoot32BitConstant(0, shadowHistogramUAVIndices[frameIndex, cascadeIndex], 26);
             commandList.SetComputeRoot32BitConstant(0, (uint)MeshRegistry.Count, 27);
 
-            // Push per-instance buffer SRV indices to their registered slots
-            foreach (var (hash, slotInfo) in _perInstanceSlots)
+            // Bind per-instance buffer SRV indices to COMPUTE push constants (hardcoded slots).
+            foreach (var (hash, pib) in _perInstanceBuffers)
             {
-                uint srvIdx = 0;
-                if (_perInstanceBuffers.TryGetValue(hash, out var pib))
-                    srvIdx = pib.SRVIndices[frameIndex];
-                commandList.SetComputeRoot32BitConstant(0, srvIdx, (uint)slotInfo.PushConstantSlot);
+                if (!ComputeSlots.TryGetValue(hash, out int computeSlot)) continue;
+                uint srvIdx = pib.SRVIndices[frameIndex];
+                commandList.SetComputeRoot32BitConstant(0, srvIdx, (uint)computeSlot);
             }
             commandList.SetComputeRoot32BitConstant(0, (uint)cascadeIndex, 31); // ShadowCascadeIdx
 
@@ -883,6 +827,14 @@ namespace Freefall.Graphics
             // SceneConstants, but the shadow VS needs the light matrices.
             commandList.SetGraphicsRootConstantBufferView(1, shadowSceneCBVAddress);
 
+            // Bind per-instance buffer SRV indices to GRAPHICS push constants (same as Draw).
+            foreach (var (hash, pib) in _perInstanceBuffers)
+            {
+                if (pib.PushConstantSlot < 0) continue;
+                uint srvIdx = pib.SRVIndices[frameIndex];
+                commandList.SetGraphicsRoot32BitConstant(0, srvIdx, (uint)pib.PushConstantSlot);
+            }
+
             // Transition buffers for reading
             commandList.ResourceBarrier(new ResourceBarrier(
                 new ResourceTransitionBarrier(shadowVisibleIndicesBuffers[frameIndex, cascadeIndex],
@@ -919,9 +871,23 @@ namespace Freefall.Graphics
         {
             int frameIndex = Engine.FrameIndex % FrameCount;
             if (SubBatchCount == 0) return;
+            
+            if (Engine.FrameIndex % 60 == 0)
+                Debug.Log($"[Batch.Draw] Effect={Material?.Effect?.Name ?? "null"} DrawCount={_drawCount} SubBatches={SubBatchCount} DescSRV={descriptorSRVIndices[frameIndex]} Desc0={(_drawCount > 0 ? $"slot={_descriptors[0].TransformSlot},mat={_descriptors[0].MaterialId}" : "N/A")}");
 
             var commandBuffer = gpuCommandBuffers[frameIndex];
             if (commandBuffer == null) return;
+
+            // Bind per-instance buffer SRV indices to GRAPHICS push constants.
+            // The command signature only writes slots 2-15 per draw.
+            // Per-instance buffers (e.g. TerrainPatchData at slot 1) use slots outside
+            // the command signature range and must be set explicitly.
+            foreach (var (hash, pib) in _perInstanceBuffers)
+            {
+                if (pib.PushConstantSlot < 0) continue;
+                uint srvIdx = pib.SRVIndices[frameIndex];
+                commandList.SetGraphicsRoot32BitConstant(0, srvIdx, (uint)pib.PushConstantSlot);
+            }
 
             commandList.ResourceBarrier(new ResourceBarrier(
                 new ResourceTransitionBarrier(visibleIndicesBuffers[frameIndex],
@@ -966,11 +932,8 @@ namespace Freefall.Graphics
         {
             for (int i = 0; i < FrameCount; ++i)
             {
-                DeferDispose(transformSlotBuffers[i], transformSlotSRVIndices[i]);
-                transformSlotBuffers[i] = null; transformSlotSRVIndices[i] = 0;
-
-                DeferDispose(materialIdBuffers[i], materialIdSRVIndices[i]);
-                materialIdBuffers[i] = null; materialIdSRVIndices[i] = 0;
+                DeferDispose(descriptorBuffers[i], descriptorSRVIndices[i]);
+                descriptorBuffers[i] = null; descriptorSRVIndices[i] = 0;
 
                 DeferDispose(boundingSpheresBuffers[i], boundingSpheresSRVIndices[i]);
                 boundingSpheresBuffers[i] = null; boundingSpheresSRVIndices[i] = 0;
@@ -1037,11 +1000,8 @@ namespace Freefall.Graphics
         {
             for (int i = 0; i < FrameCount; ++i)
             {
-                transformSlotBuffers[i]?.Dispose();
-                if (transformSlotSRVIndices[i] != 0) Engine.Device.ReleaseBindlessIndex(transformSlotSRVIndices[i]);
-                
-                materialIdBuffers[i]?.Dispose();
-                if (materialIdSRVIndices[i] != 0) Engine.Device.ReleaseBindlessIndex(materialIdSRVIndices[i]);
+                descriptorBuffers[i]?.Dispose();
+                if (descriptorSRVIndices[i] != 0) Engine.Device.ReleaseBindlessIndex(descriptorSRVIndices[i]);
                 
                 boundingSpheresBuffers[i]?.Dispose();
                 if (boundingSpheresSRVIndices[i] != 0) Engine.Device.ReleaseBindlessIndex(boundingSpheresSRVIndices[i]);
@@ -1056,8 +1016,7 @@ namespace Freefall.Graphics
                 counterBuffers[i]?.Dispose();
                 if (counterBufferUAVIndices[i] != 0) Engine.Device.ReleaseBindlessIndex(counterBufferUAVIndices[i]);
 
-                transformSlotSRVIndices[i] = 0;
-                materialIdSRVIndices[i] = 0;
+                descriptorSRVIndices[i] = 0;
                 boundingSpheresSRVIndices[i] = 0;
                 visibleIndicesUAVIndices[i] = 0;
                 visibleIndicesSRVIndices[i] = 0;

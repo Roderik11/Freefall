@@ -568,7 +568,7 @@ namespace Freefall.Graphics
             uint counterBufferUAV,
             int counterOffset,
             uint transformBufferSRV,      // World matrices for culling sphere transforms
-            uint transformSlotsSRV)       // TransformSlot buffer for order-independent output
+            uint descriptorSRV)            // InstanceDescriptor buffer for TransformSlot lookup
         {
             if (!_initialized || _visibilityPSO == null || _mainPSO == null || subBatchCount == 0) return;
             
@@ -631,7 +631,7 @@ namespace Freefall.Graphics
             commandList.SetComputeRoot32BitConstant(0, (uint)counterOffset, 8);  // Counter offset for this batch
             commandList.SetComputeRoot32BitConstant(0, 0, 9);  // Slot 9: unused (VisibleIndicesSRVIdx set elsewhere)
             commandList.SetComputeRoot32BitConstant(0, transformBufferSRV, 10);  // Slot 10: CullTransformIdx for world-space sphere transform
-            commandList.SetComputeRoot32BitConstant(0, transformSlotsSRV, 11);   // Slot 11: TransformSlotsIdx for order-independent output
+            commandList.SetComputeRoot32BitConstant(0, descriptorSRV, 11);   // Slot 11: DescriptorBufferIdx for order-independent output
             
             uint threadGroupsSubBatches = ((uint)subBatchCount + 63) / 64;
             uint threadGroupsInstances = ((uint)totalInstances + 63) / 64;
@@ -662,7 +662,7 @@ namespace Freefall.Graphics
         /// <param name="cascadeIndex">Which cascade to cull for (0-3)</param>
         /// <param name="totalInstances">Total instance count</param>
         /// <param name="boundingSpheresSRV">SRV for bounding spheres</param>
-        /// <param name="transformSlotsSRV">SRV for transform slot indices</param>
+        /// <param name="descriptorSRV">SRV for InstanceDescriptor buffer</param>
         /// <param name="transformBufferSRV">SRV for world matrices</param>
         /// <param name="visibilityFlagsUAV">UAV for output visibility flags</param>
         public void DispatchShadowVisibility(
@@ -671,7 +671,7 @@ namespace Freefall.Graphics
             int cascadeIndex,
             int totalInstances,
             uint boundingSpheresSRV,
-            uint transformSlotsSRV,
+            uint descriptorSRV,
             uint transformBufferSRV,
             uint visibilityFlagsUAV)
         {
@@ -704,7 +704,7 @@ namespace Freefall.Graphics
             
             // Set push constants for CSVisibilityShadow
             commandList.SetComputeRoot32BitConstant(0, boundingSpheresSRV, 2);   // BoundingSpheresIdx
-            commandList.SetComputeRoot32BitConstant(0, transformSlotsSRV, 4);    // TransformSlotsIdx (Indices[1].x)
+            commandList.SetComputeRoot32BitConstant(0, descriptorSRV, 4);    // DescriptorBufferIdx (Indices[1].x)
             commandList.SetComputeRoot32BitConstant(0, transformBufferSRV, 10);  // GlobalTransformsIdx (Indices[2].z)
             commandList.SetComputeRoot32BitConstant(0, visibilityFlagsUAV, 11);  // VisibilityFlagsIdx (Indices[2].w)
             commandList.SetComputeRoot32BitConstant(0, (uint)totalInstances, 13); // TotalInstances (Indices[3].y)

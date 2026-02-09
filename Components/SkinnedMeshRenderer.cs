@@ -95,6 +95,13 @@ namespace Freefall.Components
             }
 
             // Enqueue skinned draw command with MaterialBlock
+            if (Engine.FrameIndex % 60 == 0)
+            {
+                var boneCount = boneMatrices?.Length ?? 0;
+                var effectName = Materials.Count > 0 ? Materials[0]?.Effect?.Name ?? "null" : "no-mat";
+                var passCount = Materials.Count > 0 ? Materials[0]?.GetPasses()?.Count ?? 0 : 0;
+                Debug.Log($"[SkinnedMesh] Entity={Entity?.Name} Parts={Mesh.MeshParts.Count} Bones={boneCount} Effect={effectName} Passes={passCount} Slot={_transformSlot}");
+            }
             for (int i = 0; i < Mesh.MeshParts.Count; i++)
             {
                 if (!Mesh.MeshParts[i].Enabled) continue;
@@ -106,8 +113,8 @@ namespace Freefall.Components
 
                 if (material != null)
                 {
+                    // Use pass-inferring Enqueue: Effect defines which passes (Opaque, Shadow, etc.)
                     CommandBuffer.Enqueue(
-                        RenderPass.Opaque, 
                         Mesh, 
                         i, 
                         material, 

@@ -154,6 +154,10 @@ namespace Freefall.Graphics
              // This enqueues DrawShadows callback into ShadowMap pass AND opaque batches
              ScriptExecution.Draw();
 
+             // Upload transforms AFTER Draw() so per-frame SetTransform() calls
+             // (e.g. terrain patch pool-slot reassignment) are captured before GPU reads
+             TransformBuffer.Instance?.Upload();
+
              // === GBuffer Draw ===
              // Cache GBuffer RTV handles to avoid per-frame allocation
              _cachedGBufferRtvHandles ??= new[] { Albedo.RtvHandle, Normals.RtvHandle, Data.RtvHandle, DepthGBuffer.RtvHandle };

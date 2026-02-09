@@ -45,7 +45,7 @@ cbuffer PushConstants : register(b3)
 #define BoundingSpheresIdx    Indices[0].z   // SRV: per-instance bounding spheres
 #define InstanceRangesIdx     Indices[0].w   // SRV: per-subbatch (start, count, meshPartId)
 
-#define TransformSlotsIdx     Indices[1].x   // SRV: per-instance transform slot indices
+#define DescriptorBufferIdx   Indices[1].x   // SRV: per-instance InstanceDescriptor buffer (TransformSlot, MaterialId, CustomDataIdx)
 #define VisibleIndicesUAVIdx  Indices[1].y   // UAV: output visible indices (compacted)
 #define CounterBufferIdx      Indices[1].z   // UAV: per-subbatch visible counts
 #define SubBatchCount         Indices[1].w   // Total number of subbatches
@@ -73,7 +73,6 @@ cbuffer PushConstants : register(b3)
 #define SubbatchIdsIdx        Indices[5].w   // SRV: per-instance subbatch index
 
 // Per-batch indices (set by CPU for each batch)
-#define MaterialIdBufferIdx   Indices[6].x   // SRV: per-instance material ID buffer (INPUT)
 #define MaterialsBufferIdx    Indices[6].y   // SRV: materials array buffer
 #define HistogramIdx          Indices[6].z   // UAV: histogram buffer (count per MeshPartId)
 #define UniquePartCount       Indices[6].w   // Max unique MeshPartIds in registry
@@ -114,11 +113,19 @@ struct MeshPartEntry
     uint Reserved9;
 };
 
+// Per-instance descriptor (matches C# InstanceDescriptor exactly: 12 bytes = 3 uints)
+struct InstanceDescriptor
+{
+    uint TransformSlot;
+    uint MaterialId;
+    uint CustomDataIdx;
+};
+
 // Must match C# IndirectDrawCommand exactly (72 bytes = 18 uints)
 struct IndirectDrawCommand
 {
-    uint TransformSlotsBufIdx;
-    uint MaterialIdBufIdx;
+    uint DescriptorBufIdx;
+    uint Reserved0;
     uint SortedIndicesBufIdx;
     uint BoneWeightsBufIdx;
     uint BonesBufIdx;
@@ -252,8 +259,8 @@ void CSVisibility(uint3 dispatchThreadId : SV_DispatchThreadID)
     
     StructuredBuffer<InstanceRange> ranges = ResourceDescriptorHeap[InstanceRangesIdx];
     StructuredBuffer<float4> spheres = ResourceDescriptorHeap[BoundingSpheresIdx];
-    StructuredBuffer<uint> transformSlots = ResourceDescriptorHeap[TransformSlotsIdx];
-    StructuredBuffer<float4x4> transforms = ResourceDescriptorHeap[GlobalTransformsIdx];
+    StructuredBuffer<InstanceDescriptor> descriptors = ResourceDescriptorHeap[DescriptorBufferIdx];
+    StructuredBuffer<row_major float4x4> transforms = ResourceDescriptorHeap[GlobalTransformsIdx];
     RWStructuredBuffer<uint> visibilityFlags = ResourceDescriptorHeap[VisibilityFlagsIdx];
     RWStructuredBuffer<uint> counters = ResourceDescriptorHeap[CounterBufferIdx];
     
@@ -269,11 +276,11 @@ void CSVisibility(uint3 dispatchThreadId : SV_DispatchThreadID)
     uint subBatch = subbatchIds[instanceIdx];
     
     // Data is stored in add-order, instanceIdx == drawIdx (identity mapping)
-    uint transformSlot = transformSlots[instanceIdx];
+    uint transformSlot = descriptors[instanceIdx].TransformSlot;
     float4 localSphere = spheres[instanceIdx];
     
     // Transform sphere to world space
-    float4x4 world = transforms[transformSlot];
+    row_major float4x4 world = transforms[transformSlot];
     float3 worldCenter = mul(float4(localSphere.xyz, 1.0), world).xyz;
     
     // Scale radius by maximum axis scale
@@ -534,7 +541,7 @@ void CSSortIndirection(uint3 dispatchThreadId : SV_DispatchThreadID)
     uint idx = dispatchThreadId.x;
     
     RWStructuredBuffer<uint> indirection = ResourceDescriptorHeap[IndirectionIdx];
-    StructuredBuffer<uint> transformSlots = ResourceDescriptorHeap[TransformSlotsIdx];
+    StructuredBuffer<InstanceDescriptor> descriptors = ResourceDescriptorHeap[DescriptorBufferIdx];
     
     uint stride = SortStride;     // Distance between elements to compare
     uint blockSize = SortSize;    // Size of current bitonic block
@@ -567,10 +574,10 @@ void CSSortIndirection(uint3 dispatchThreadId : SV_DispatchThreadID)
     uint leftIndir = leftValid ? indirection[leftIdx] : 0xFFFFFFFF;
     uint rightIndir = rightValid ? indirection[rightIdx] : 0xFFFFFFFF;
     
-    // Get sort keys (TransformSlot values) - stable keys assigned at entity creation
+    // Get sort keys (TransformSlot from descriptor) - stable keys assigned at entity creation
     // Use infinity (MAX_UINT) for out-of-bounds elements so they sort to the end
-    uint leftKey = (leftValid && leftIndir != 0xFFFFFFFF) ? transformSlots[leftIndir] : 0xFFFFFFFF;
-    uint rightKey = (rightValid && rightIndir != 0xFFFFFFFF) ? transformSlots[rightIndir] : 0xFFFFFFFF;
+    uint leftKey = (leftValid && leftIndir != 0xFFFFFFFF) ? descriptors[leftIndir].TransformSlot : 0xFFFFFFFF;
+    uint rightKey = (rightValid && rightIndir != 0xFFFFFFFF) ? descriptors[rightIndir].TransformSlot : 0xFFFFFFFF;
     
     // Compare and swap based on direction
     // ascending=true: we want leftKey <= rightKey, so swap if leftKey > rightKey
@@ -692,8 +699,8 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
     RWStructuredBuffer<IndirectDrawCommand> output = ResourceDescriptorHeap[OutputBufferIdx];
     
     IndirectDrawCommand cmd;
-    cmd.TransformSlotsBufIdx = TransformSlotsIdx;
-    cmd.MaterialIdBufIdx = MaterialIdBufferIdx;  // Input material IDs buffer (VS double-indirects via compacted index)
+    cmd.DescriptorBufIdx = DescriptorBufferIdx;
+    cmd.Reserved0 = 0;
     cmd.SortedIndicesBufIdx = VisibleIndicesSRVIdx;
     cmd.BoneWeightsBufIdx = entry.BoneWeightsBufferIdx;
     cmd.BonesBufIdx = BoneBufferIdx;  // Per-batch bone buffer (0 for static batches)
@@ -743,8 +750,8 @@ void CSVisibilityShadow(uint3 dispatchThreadId : SV_DispatchThreadID)
     uint instanceIdx = dispatchThreadId.x;
     
     StructuredBuffer<float4> spheres = ResourceDescriptorHeap[BoundingSpheresIdx];
-    StructuredBuffer<uint> transformSlots = ResourceDescriptorHeap[TransformSlotsIdx];
-    StructuredBuffer<float4x4> transforms = ResourceDescriptorHeap[GlobalTransformsIdx];
+    StructuredBuffer<InstanceDescriptor> descriptors = ResourceDescriptorHeap[DescriptorBufferIdx];
+    StructuredBuffer<row_major float4x4> transforms = ResourceDescriptorHeap[GlobalTransformsIdx];
     RWStructuredBuffer<uint> visibilityFlags = ResourceDescriptorHeap[VisibilityFlagsIdx];
     
     // Bounds check - write 0 for out-of-range
@@ -755,11 +762,11 @@ void CSVisibilityShadow(uint3 dispatchThreadId : SV_DispatchThreadID)
     }
     
     // Get transform and bounding sphere
-    uint transformSlot = transformSlots[instanceIdx];
+    uint transformSlot = descriptors[instanceIdx].TransformSlot;
     float4 localSphere = spheres[instanceIdx];
     
     // Transform sphere to world space
-    float4x4 world = transforms[transformSlot];
+    row_major float4x4 world = transforms[transformSlot];
     float3 worldCenter = mul(float4(localSphere.xyz, 1.0), world).xyz;
     
     // Scale radius by maximum axis scale

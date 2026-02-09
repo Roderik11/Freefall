@@ -50,15 +50,26 @@ namespace Freefall.Graphics
     public class DrawBucket
     {
         public List<InstanceBatch.RawDraw> Draws = new();
-        public List<uint> TransformSlots = new();
-        public List<uint> MaterialIds = new();
+        public List<InstanceDescriptor> Descriptors = new();
         public List<Vector4> BoundingSpheres = new();
         public List<uint> MeshPartIds = new();
         public HashSet<int> UniqueMeshPartIds = new();
         public Material? FirstMaterial;
         
-        // Per-instance param staging: hash → list of ParameterValue (one per instance)
-        public Dictionary<int, List<ParameterValue>> PerInstanceParams = new();
+        /// <summary>
+        /// Pre-staged per-instance data: hash → contiguous byte array (filled at Enqueue time).
+        /// </summary>
+        public class PerInstanceStaging
+        {
+            public int PushConstantSlot;    // Graphics push constant slot (from shader)
+            public int ElementStride;       // Bytes per element
+            public int ElementsPerInstance; // Elements per instance (1 for scalar, N for array)
+            public byte[] Data = Array.Empty<byte>();
+            public int Count;               // Number of instances staged
+            public int BytesPerInstance => ElementsPerInstance * ElementStride;
+        }
+        
+        public Dictionary<int, PerInstanceStaging> PerInstanceData = new();
         
         public int Count => Draws.Count;
         
@@ -84,23 +95,51 @@ namespace Freefall.Graphics
                 MaterialId = (uint)material.MaterialID,
                 MeshPartId = meshPartId,
             });
-            TransformSlots.Add((uint)transformSlot);
-            MaterialIds.Add((uint)material.MaterialID);
+            Descriptors.Add(new InstanceDescriptor
+            {
+                TransformSlot = (uint)transformSlot,
+                MaterialId = (uint)material.MaterialID,
+                CustomDataIdx = 0
+            });
             BoundingSpheres.Add(mesh.LocalBoundingSphere);
             MeshPartIds.Add((uint)meshPartId);
             UniqueMeshPartIds.Add(meshPartId);
             
-            // Stage per-instance params from MaterialBlock (all params are per-instance by default)
+            // Stage per-instance params into contiguous byte arrays (at Enqueue time, not MergeFromBucket)
             if (block != null)
             {
                 foreach (var (hash, param) in block.Parameters)
                 {
-                    if (!PerInstanceParams.TryGetValue(hash, out var list))
+                    if (param is TextureParameterValue) continue;
+                    
+                    // Auto-resolve graphics push constant slot from shader resource bindings
+                    if (param.PushConstantSlot < 0 && material.Effect != null)
+                        param.PushConstantSlot = material.Effect.GetPushConstantSlot(hash);
+                    
+                    int elemCount = param.GetElementCount();
+                    int elemStride = param.GetElementStride();
+                    if (elemCount == 0 || elemStride == 0) continue;
+                    
+                    if (!PerInstanceData.TryGetValue(hash, out var staging))
                     {
-                        list = new List<ParameterValue>();
-                        PerInstanceParams[hash] = list;
+                        staging = new PerInstanceStaging
+                        {
+                            PushConstantSlot = param.PushConstantSlot,
+                            ElementStride = elemStride,
+                            ElementsPerInstance = elemCount,
+                        };
+                        PerInstanceData[hash] = staging;
                     }
-                    list.Add(param);
+                    
+                    // Ensure capacity
+                    int bytesPerInst = staging.BytesPerInstance;
+                    int needed = (staging.Count + 1) * bytesPerInst;
+                    if (staging.Data.Length < needed)
+                        Array.Resize(ref staging.Data, Math.Max(staging.Data.Length * 2, needed));
+                    
+                    // Copy raw bytes at sequential offset (instance N at offset N * bytesPerInstance)
+                    param.CopyToStaging(staging.Data, staging.Count * bytesPerInst);
+                    staging.Count++;
                 }
             }
         }
@@ -108,14 +147,13 @@ namespace Freefall.Graphics
         public void Clear()
         {
             Draws.Clear();
-            TransformSlots.Clear();
-            MaterialIds.Clear();
+            Descriptors.Clear();
             BoundingSpheres.Clear();
             MeshPartIds.Clear();
             UniqueMeshPartIds.Clear();
             FirstMaterial = null;
-            foreach (var list in PerInstanceParams.Values)
-                list.Clear();
+            foreach (var staging in PerInstanceData.Values)
+                staging.Count = 0;
         }
     }
 
@@ -398,10 +436,6 @@ namespace Freefall.Graphics
             Culler.Initialize();
             Debug.Log("[CommandBuffer] GPU Culler initialized");
             
-            // Register per-instance buffer slots (generic system)
-            // Bones: slot 30, stride = sizeof(Matrix4x4) = 64 bytes
-            InstanceBatch.RegisterPerInstanceSlot("Bones", 30, 64);
-            
             // Create Hi-Z pyramid if renderer is already set up
             var renderer = DeferredRenderer.Current;
             if (renderer?.Depth != null)
@@ -492,6 +526,8 @@ namespace Freefall.Graphics
             // Iterate all passes defined in the Effect and enqueue to each
             foreach (var shaderPass in material.GetPasses())
             {
+                if(shaderPass.RenderPass == RenderPass.Shadow)
+                continue;
                 current.passes[(int)shaderPass.RenderPass].Add(drawCall);
             }
         }

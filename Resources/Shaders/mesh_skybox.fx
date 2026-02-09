@@ -4,8 +4,8 @@
 // Unified Push Constant Layout (Slots 2-15) - matches gbuffer.fx
 // Used by all batched geometry shaders (gbuffer, gbuffer_skinned, mesh_skybox)
 // Slots 0-1: Reserved for light/composition passes (texture indices)
-#define TransformSlotsIdx GET_INDEX(2)   // StructuredBuffer<uint> - transform slot per instance
-#define MaterialIDsIdx GET_INDEX(3)      // StructuredBuffer<uint> - material ID per instance
+#define DescriptorBufIdx GET_INDEX(2)    // StructuredBuffer<InstanceDescriptor> - per-instance descriptor
+#define Reserved0Idx GET_INDEX(3)         // Reserved (was MaterialIDsIdx)
 #define SortedIndicesIdx GET_INDEX(4)    // StructuredBuffer<uint> - sorted draw order indices
 #define BoneWeightsIdx GET_INDEX(5)      // Unused for skybox (0)
 #define BonesIdx GET_INDEX(6)            // Unused for skybox (0)
@@ -271,6 +271,14 @@ VertexOutput VS(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_Insta
 {
     VertexOutput output;
 
+    // Per-instance descriptor (matches C# InstanceDescriptor: 12 bytes)
+    struct InstanceDescriptor
+    {
+        uint TransformSlot;
+        uint MaterialId;
+        uint CustomDataIdx;
+    };
+
     // Bindless index buffer - primitiveVertexID is 0 to N-1, add BaseIndex to offset into correct mesh part
     StructuredBuffer<uint> indices = ResourceDescriptorHeap[IndexBufferIdx];
     uint vertexID = indices[primitiveVertexID + BaseIndex];
@@ -278,11 +286,15 @@ VertexOutput VS(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_Insta
     StructuredBuffer<float3> positions = ResourceDescriptorHeap[PosBufferIdx];
     StructuredBuffer<row_major matrix> globalTransforms = ResourceDescriptorHeap[GlobalTransformBufferIdx];
     StructuredBuffer<uint> sortedIndices = ResourceDescriptorHeap[SortedIndicesIdx];
+    StructuredBuffer<InstanceDescriptor> descriptors = ResourceDescriptorHeap[DescriptorBufIdx];
 
-    // Get sorted data index using InstanceBaseOffset (passed as push constant) + local instance ID
-    // sortedIndices contains TransformSlot directly (compacted by prefix sum)
+    // Double-indirection: command signature → sorted index → original instance → descriptor
     uint dataPos = InstanceBaseOffset + instanceID;
-    uint slot = sortedIndices[dataPos];
+    uint packedIdx = sortedIndices[dataPos];
+    uint idx = packedIdx & 0x7FFFFFFFu;
+
+    // Look up transform slot from descriptor buffer
+    uint slot = descriptors[idx].TransformSlot;
 
     float3 rawPos = positions[vertexID];
     

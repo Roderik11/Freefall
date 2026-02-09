@@ -101,13 +101,13 @@ namespace Freefall.Components
             if (_diagFrameCount == 15)
             {
                 var ls0 = lightSpace[0];
-                Debug.LogAlways($"[ShadowDiag] LightSpaces[0] Row0: ({ls0.M11:F4}, {ls0.M12:F4}, {ls0.M13:F4}, {ls0.M14:F4})");
-                Debug.LogAlways($"[ShadowDiag] LightSpaces[0] Row1: ({ls0.M21:F4}, {ls0.M22:F4}, {ls0.M23:F4}, {ls0.M24:F4})");
-                Debug.LogAlways($"[ShadowDiag] LightSpaces[0] Row2: ({ls0.M31:F4}, {ls0.M32:F4}, {ls0.M33:F4}, {ls0.M34:F4})");
-                Debug.LogAlways($"[ShadowDiag] LightSpaces[0] Row3: ({ls0.M41:F4}, {ls0.M42:F4}, {ls0.M43:F4}, {ls0.M44:F4})");
-                Debug.LogAlways($"[ShadowDiag] CameraInverse Row3: ({cameraInverse.M41:F4}, {cameraInverse.M42:F4}, {cameraInverse.M43:F4}, {cameraInverse.M44:F4})");
-                Debug.LogAlways($"[ShadowDiag] CamPos: {camera.Transform?.Position}");
-                Debug.LogAlways($"[ShadowDiag] LightDir: {Transform.Forward}");
+                Debug.Log($"[ShadowDiag] LightSpaces[0] Row0: ({ls0.M11:F4}, {ls0.M12:F4}, {ls0.M13:F4}, {ls0.M14:F4})");
+                Debug.Log($"[ShadowDiag] LightSpaces[0] Row1: ({ls0.M21:F4}, {ls0.M22:F4}, {ls0.M23:F4}, {ls0.M24:F4})");
+                Debug.Log($"[ShadowDiag] LightSpaces[0] Row2: ({ls0.M31:F4}, {ls0.M32:F4}, {ls0.M33:F4}, {ls0.M34:F4})");
+                Debug.Log($"[ShadowDiag] LightSpaces[0] Row3: ({ls0.M41:F4}, {ls0.M42:F4}, {ls0.M43:F4}, {ls0.M44:F4})");
+                Debug.Log($"[ShadowDiag] CameraInverse Row3: ({cameraInverse.M41:F4}, {cameraInverse.M42:F4}, {cameraInverse.M43:F4}, {cameraInverse.M44:F4})");
+                Debug.Log($"[ShadowDiag] CamPos: {camera.Transform?.Position}");
+                Debug.Log($"[ShadowDiag] LightDir: {Transform.Forward}");
             }
             
             commandList.IASetPrimitiveTopology(Vortice.Direct3D.PrimitiveTopology.TriangleStrip);

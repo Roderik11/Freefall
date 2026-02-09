@@ -65,6 +65,9 @@ namespace Freefall.Graphics
         // Resource bindings parsed from shader source (data-driven push constants)
         public List<ShaderResourceBinding> ResourceBindings { get; private set; } = new List<ShaderResourceBinding>();
         
+        // Hash→slot dictionary for O(1) push constant slot lookup by param name hash
+        private Dictionary<int, int> _resourceSlots = new();
+        
         // Render state metadata parsed from shader source (data-driven PSO creation)
         public ShaderRenderState RenderState { get; private set; } = new ShaderRenderState();
         
@@ -86,6 +89,7 @@ namespace Freefall.Graphics
                 // Copy references from existing
                 Techniques = existing.Techniques;
                 ResourceBindings = existing.ResourceBindings;
+                _resourceSlots = existing._resourceSlots;
                 RenderState = existing.RenderState;
                 _materialBlock = existing._materialBlock;
                 return;
@@ -114,6 +118,10 @@ namespace Freefall.Graphics
             // Parse resource bindings from shader source (data-driven push constants)
             ResourceBindings = FXParser.ParseResourceBindings(content);
             
+            // Build hash→slot lookup for O(1) resolution at enqueue time
+            foreach (var binding in ResourceBindings)
+                _resourceSlots[binding.Name.GetHashCode()] = binding.Slot;
+            
             // Parse render state metadata from shader source (data-driven PSO creation)
             RenderState = FXParser.ParseRenderState(content);
             
@@ -133,6 +141,12 @@ namespace Freefall.Graphics
         /// Get this effect's MaterialBlock for applying parameters
         /// </summary>
         public MaterialBlock GetMaterialBlock() => _materialBlock;
+        
+        /// <summary>
+        /// Look up push constant slot by parameter name hash. Returns -1 if not found.
+        /// </summary>
+        public int GetPushConstantSlot(int nameHash)
+            => _resourceSlots.TryGetValue(nameHash, out int slot) ? slot : -1;
 
         private string LoadWithIncludes(string path)
         {

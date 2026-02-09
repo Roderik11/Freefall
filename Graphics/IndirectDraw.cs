@@ -4,6 +4,17 @@ using System.Runtime.InteropServices;
 namespace Freefall.Graphics
 {
     /// <summary>
+    /// Compact per-instance descriptor: packs TransformSlot + MaterialId + CustomDataIdx
+    /// into a single GPU struct. Replaces parallel TransformSlots[] and MaterialIds[] arrays.
+    /// </summary>
+    [StructLayout(LayoutKind.Sequential)]
+    public struct InstanceDescriptor
+    {
+        public uint TransformSlot;   // index into GlobalTransformBuffer
+        public uint MaterialId;      // index into MaterialsBuffer
+        public uint CustomDataIdx;   // index into per-batch StructuredBuffer (future use, 0 for now)
+    }
+    /// <summary>
     /// Per-instance data for GPU-driven rendering.
     /// Stored in a GPU buffer and used by culling compute shader.
     /// </summary>
@@ -41,8 +52,8 @@ namespace Freefall.Graphics
     public struct IndirectDrawCommand
     {
         // Root constants matching slots 2-15 in push constant buffer
-        public uint TransformSlotsIdx;       // Slot 2: Index to transform slot buffer (uint indices into global buffer)
-        public uint MaterialIdBufferIdx;    // Slot 3: Index to material ID buffer 
+        public uint DescriptorBufferIdx;    // Slot 2: Index to InstanceDescriptor structured buffer
+        public uint Reserved0;              // Slot 3: Reserved (was MaterialIdBufferIdx)
         public uint SortedIndicesBufferIdx; // Slot 4: Index to sorted indices buffer
         public uint BoneWeightsBufferIdx;   // Slot 5: Index to bone weights buffer (0 for static)
         public uint BonesBufferIdx;         // Slot 6: Index to bones buffer (0 for static)

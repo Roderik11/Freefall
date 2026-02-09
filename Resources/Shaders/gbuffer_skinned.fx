@@ -4,8 +4,8 @@
 // Unified Push Constant Layout (Slots 2-15)
 // Used by all batched geometry shaders (gbuffer, gbuffer_skinned, mesh_skybox)
 // Slots 0-1: Reserved for light/composition passes (texture indices)
-#define TransformSlotsIdx GET_INDEX(2)      // StructuredBuffer<uint> - slot indices into GlobalTransformBuffer
-#define MaterialIDsIdx GET_INDEX(3)     // StructuredBuffer<uint> - material ID per instance
+#define DescriptorBufIdx GET_INDEX(2)       // StructuredBuffer<InstanceDescriptor> - per-instance descriptor
+#define Reserved0Idx GET_INDEX(3)            // Reserved (was MaterialIDsIdx)
 #define SortedIndicesIdx GET_INDEX(4)   // StructuredBuffer<uint> - sorted draw order indices
 #define BoneWeightsIdx GET_INDEX(5)     // StructuredBuffer<BoneWeight> - per-mesh bone weights
 #define BonesIdx GET_INDEX(6)           // StructuredBuffer<matrix> - batched bone matrices [inst0 bones][inst1 bones]...
@@ -37,14 +37,21 @@ struct VSOutput
     float Depth : TEXCOORD3;
 };
 
+// Per-instance descriptor (matches C# InstanceDescriptor: 12 bytes)
+struct InstanceDescriptor
+{
+    uint TransformSlot;
+    uint MaterialId;
+    uint CustomDataIdx;
+};
+
 VSOutput VS(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_InstanceID)
 {
     VSOutput output;
 
-    // Instance data buffers - now using slot indices instead of direct transforms
-    StructuredBuffer<uint> transformSlots = ResourceDescriptorHeap[TransformSlotsIdx];
+    // Instance data buffers - descriptor contains TransformSlot + MaterialId
+    StructuredBuffer<InstanceDescriptor> descriptors = ResourceDescriptorHeap[DescriptorBufIdx];
     StructuredBuffer<row_major matrix> globalTransforms = ResourceDescriptorHeap[GlobalTransformBufferIdx];
-    StructuredBuffer<uint> materialIDs = ResourceDescriptorHeap[MaterialIDsIdx];
     StructuredBuffer<uint> sortedIndices = ResourceDescriptorHeap[SortedIndicesIdx];
     StructuredBuffer<BoneWeight> boneWeights = ResourceDescriptorHeap[BoneWeightsIdx];
     StructuredBuffer<row_major matrix> bones = ResourceDescriptorHeap[BonesIdx];
@@ -66,9 +73,10 @@ VSOutput VS(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_InstanceI
     bool isOccluded = (packedIdx & 0x80000000u) != 0;
     uint idx = packedIdx & 0x7FFFFFFFu;
     
-    // Double-indirect: use original instance index to look up per-instance data from input buffers
-    uint slot = transformSlots[idx];
-    uint materialID = materialIDs[idx];
+    // Double-indirect: use original instance index to look up per-instance data from descriptor
+    InstanceDescriptor desc = descriptors[idx];
+    uint slot = desc.TransformSlot;
+    uint materialID = desc.MaterialId;
     
     // Re-pack occlusion flag into materialID high bit for PS
     if (isOccluded)
@@ -80,8 +88,9 @@ VSOutput VS(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_InstanceI
     float2 uv = uvs[vertexID];
     BoneWeight bw = boneWeights[vertexID];
     
-    // Bone matrices for this instance — indexed by transform slot (scatter-safe)
-    uint boneOffset = slot * NumBones;
+    // Bone matrices for this instance — indexed by arrival-order instance index
+    // (bone data is uploaded densely per-instance, not by TransformSlot)
+    uint boneOffset = idx * NumBones;
     
     matrix bone0 = bones[boneOffset + (uint)bw.BoneIDs.x];
     matrix bone1 = bones[boneOffset + (uint)bw.BoneIDs.y];
@@ -147,7 +156,6 @@ ShadowVSOutput VS_Shadow(uint primitiveVertexID : SV_VertexID, uint instanceID :
     ShadowVSOutput output;
 
     StructuredBuffer<row_major matrix> globalTransforms = ResourceDescriptorHeap[GlobalTransformBufferIdx];
-    StructuredBuffer<uint> materialIDs = ResourceDescriptorHeap[MaterialIDsIdx];
     StructuredBuffer<uint> sortedIndices = ResourceDescriptorHeap[SortedIndicesIdx];
     StructuredBuffer<BoneWeight> boneWeights = ResourceDescriptorHeap[BoneWeightsIdx];
     StructuredBuffer<row_major matrix> bones = ResourceDescriptorHeap[BonesIdx];
@@ -163,17 +171,19 @@ ShadowVSOutput VS_Shadow(uint primitiveVertexID : SV_VertexID, uint instanceID :
     uint idx = packedIdx & 0x7FFFFFFFu;
     
     // Double-indirect: use original instance index to look up per-instance data
-    StructuredBuffer<uint> transformSlots = ResourceDescriptorHeap[TransformSlotsIdx];
-    uint slot = transformSlots[idx];
+    StructuredBuffer<InstanceDescriptor> descriptors = ResourceDescriptorHeap[DescriptorBufIdx];
+    InstanceDescriptor desc = descriptors[idx];
+    uint slot = desc.TransformSlot;
     row_major matrix World = globalTransforms[slot];
-    uint materialID = materialIDs[idx];
+    uint materialID = desc.MaterialId;
     
     float3 pos = positions[vertexID];
     float2 uv = uvs[vertexID];
     BoneWeight bw = boneWeights[vertexID];
     
-    // Bone matrices for this instance — indexed by transform slot (scatter-safe)
-    uint boneOffset = slot * NumBones;
+    // Bone matrices for this instance — indexed by arrival-order instance index
+    // (bone data is uploaded densely per-instance, not by TransformSlot)
+    uint boneOffset = idx * NumBones;
     
     matrix bone0 = bones[boneOffset + (uint)bw.BoneIDs.x];
     matrix bone1 = bones[boneOffset + (uint)bw.BoneIDs.y];

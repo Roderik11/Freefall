@@ -1,22 +1,33 @@
 #include "common.fx"
 // @RenderState(RenderTargets=4)
 
-struct TerrainPatch
+// TerrainPatchData: per-instance data passed via the generic per-instance buffer system.
+// Transform comes from the global TransformBuffer (standard path).
+struct TerrainPatchData
 {
-	row_major float4x4 transform;
 	float4 rect;
 	float2 level;
 	float2 padding;
 };
 
-// Terrain Push Constant Layout (Slots 0-5)
-// Uses unified GET_INDEX approach like all other shaders
-#define PosBufferIdx GET_INDEX(0)       // StructuredBuffer<float3> - patch vertex positions
-#define TerrainDataIdx GET_INDEX(1)     // StructuredBuffer<TerrainPatch> - per-patch instance data
-#define HeightTexIdx GET_INDEX(2)       // Height map texture
-#define ControlMapsIdx GET_INDEX(3)     // Control/splat maps (Texture2DArray)
-#define DiffuseMapsIdx GET_INDEX(4)     // Diffuse texture array
-#define NormalMapsIdx GET_INDEX(5)      // Normal texture array
+// Standard InstanceBatch push constant layout (slots 2-15 set by command signature)
+#define DescriptorBufIdx GET_INDEX(2)
+#define Reserved0Idx GET_INDEX(3)
+#define SortedIndicesIdx GET_INDEX(4)
+#define IndexBufferIdx GET_INDEX(7)
+#define BaseIndex GET_INDEX(8)
+#define PosBufferIdx GET_INDEX(9)
+#define InstanceBaseOffset GET_INDEX(13)
+#define DebugMode GET_INDEX(16)
+
+// Per-instance buffer: TerrainPatchData (slot 1, via generic per-instance buffer system)
+#define TerrainDataIdx GET_INDEX(1)
+
+// Terrain-specific texture indices (slots 17-20, set by Material.Apply, above command signature range)
+#define HeightTexIdx GET_INDEX(17)
+#define ControlMapsIdx GET_INDEX(18)
+#define DiffuseMapsIdx GET_INDEX(19)
+#define NormalMapsIdx GET_INDEX(20)
 
 cbuffer terrain : register(b1)
 {
@@ -43,35 +54,68 @@ struct VertexOutput
 	float2 UV2			: TEXCOORD1;
     float Depth			: TEXCOORD2;
 	float Level			: TEXCOORD3;
+	nointerpolation uint Flags : TEXCOORD4;
 };
 
-VertexOutput VS(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
+// Per-instance descriptor (matches C# InstanceDescriptor: 12 bytes)
+struct InstanceDescriptor
+{
+    uint TransformSlot;
+    uint MaterialId;
+    uint CustomDataIdx;
+};
+
+VertexOutput VS(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_InstanceID)
 {
 	VertexOutput output;
 
-    StructuredBuffer<float3> positions = ResourceDescriptorHeap[PosBufferIdx]; // PosBuffer (PushConstants)
+	// Double-indirection: command signature → sorted index → original instance
+	StructuredBuffer<uint> sortedIndices = ResourceDescriptorHeap[SortedIndicesIdx];
+	uint dataPos = InstanceBaseOffset + instanceID;
+	uint packedIdx = sortedIndices[dataPos];
+	bool isOccluded = (packedIdx & 0x80000000u) != 0;
+	uint idx = packedIdx & 0x7FFFFFFFu;
+
+	// Transform from global buffer (standard path)
+	StructuredBuffer<InstanceDescriptor> descriptors = ResourceDescriptorHeap[DescriptorBufIdx];
+	StructuredBuffer<row_major matrix> globalTransforms = ResourceDescriptorHeap[GlobalTransformBufferIdx];
+	uint slot = descriptors[idx].TransformSlot;
+	row_major matrix world = globalTransforms[slot];
+
+	// Per-instance terrain patch data
+	StructuredBuffer<TerrainPatchData> terrainData = ResourceDescriptorHeap[TerrainDataIdx];
+	TerrainPatchData patch = terrainData[idx]; // indexed by instance (dense, matches staging order)
+
+	// Vertex position from bindless index + position buffers
+	StructuredBuffer<uint> indices = ResourceDescriptorHeap[IndexBufferIdx];
+	uint vertexID = indices[primitiveVertexID + BaseIndex];
+    StructuredBuffer<float3> positions = ResourceDescriptorHeap[PosBufferIdx];
     float3 pos = positions[vertexID];
 
     float2 uv = (pos.xz + float2(16, 16)) * 0.03125f; // 1/32;
     uv.y = 1 - uv.y;
 	
-	StructuredBuffer<TerrainPatch> terrainData = ResourceDescriptorHeap[TerrainDataIdx]; // TerrainData (PushConstants)
-	TerrainPatch patch = terrainData[instanceID];
 	float4 rect = patch.rect;
 	float2 heightUV = rect.xy + uv * float2(rect.z - rect.x, rect.w - rect.y);
     
     Texture2D HeightTex = ResourceDescriptorHeap[HeightTexIdx];
     float height = HeightTex.SampleLevel(sampHeightFilter, heightUV, 0).r;
 
-    float4 worldPosition = mul(float4(pos, 1), patch.transform);
+    float4 worldPosition = mul(float4(pos, 1), world);
     worldPosition.y += height * MaxHeight;
     worldPosition = mul(worldPosition, ViewProjection);
     
     output.Position = worldPosition;
-    output.Depth = worldPosition.w; // View-space Z (linear)
+    
+    // X-ray mode: push occluded instances to near depth
+    if (isOccluded)
+        output.Position.z = 0.0;
+    
+    output.Depth = worldPosition.w;
     output.UV = uv;
     output.UV2 = heightUV;
 	output.Level = patch.level.x;
+	output.Flags = isOccluded ? 1u : 0u;
 	return output;
 }
 
@@ -93,15 +137,13 @@ float3 GetNormal(float2 uv)
     h[2] = HeightTex.SampleLevel(sampHeightFilter, uv + float2(HeightTexel, 0), 0).r;
     h[3] = HeightTex.SampleLevel(sampHeightFilter, uv + float2(0, HeightTexel), 0).r;
 	
-    // Scale by MaxHeight to get world-space height differences
-    // Then divide by texel world size for proper gradient
-    float texelWorldSize = TerrainSize.x * HeightTexel; // World units per texel
+    float texelWorldSize = TerrainSize.x * HeightTexel;
     float heightScale = MaxHeight / texelWorldSize;
     
 	float3 n;
 	n.z = (h[0] - h[3]) * heightScale;
 	n.x = (h[1] - h[2]) * heightScale;
-	n.y = 1.0f; // Up direction
+	n.y = 1.0f;
 
 	return normalize(n);
 }
@@ -116,17 +158,12 @@ FragmentOutput PS(VertexOutput input)
     float4 normal = float4(0, 0, 0, 0);
 	
     float2 uv = input.UV2;
-    uv.y = 1 - uv.y; // Match Apex reference for splatting/texturing
+    uv.y = 1 - uv.y;
 
-    // Get texture arrays from bindless heap
-    // Slot 1: ControlMaps (Texture2DArray)
-    // Slot 2: DiffuseMaps (Texture2DArray)  
-    // Slot 3: NormalMaps (Texture2DArray)
     Texture2DArray ControlMaps = ResourceDescriptorHeap[ControlMapsIdx];
     Texture2DArray DiffuseMaps = ResourceDescriptorHeap[DiffuseMapsIdx];
     Texture2DArray NormalMaps = ResourceDescriptorHeap[NormalMapsIdx];
 
-    // Sample all 4 control map slices and blend 16 layers
     for (int i = 0; i < 4; ++i)
     {
         int startIndex = i * 4;
@@ -152,20 +189,92 @@ FragmentOutput PS(VertexOutput input)
         }
     }
 	
-    // Normalize the accumulated normal
     normal = float4(normal.xzy, 1);
     normal.xz = normal.xz * 2 - 1;
     normal = normalize(normal);
 
     terrainNormal = blend_linear(terrainNormal, normal.xyz);
-    // NOTE: Freefall uses world-space normals (unlike Apex which uses view-space)
     
-    output.Albedo = color;
+    // X-Ray occlusion debug mode (mode 4)
+    bool isOccluded = input.Flags != 0;
+    if (DebugMode == 4)
+    {
+        if (isOccluded)
+        {
+            float hue = frac(float(input.Level * 2654435761u) * (1.0 / 4294967296.0));
+            float3 xrayColor = float3(
+                abs(hue * 6.0 - 3.0) - 1.0,
+                2.0 - abs(hue * 6.0 - 2.0),
+                2.0 - abs(hue * 6.0 - 4.0)
+            );
+            xrayColor = saturate(xrayColor);
+            
+            output.Albedo = float4(xrayColor * 0.7, 0.5);
+            output.Normals = float4(terrainNormal, 0.0);
+            output.Data = float4(1, 0, 0, 1);
+            output.Depth = 99999.0;
+        }
+        else
+        {
+            float luma = dot(color.rgb, float3(0.299, 0.587, 0.114));
+            output.Albedo = float4(lerp(float3(luma, luma, luma), color.rgb, 0.3), color.a);
+            output.Normals = float4(terrainNormal, 1.0);
+            output.Data = float4(0, 0, 0, 1);
+            output.Depth = input.Depth;
+        }
+        return output;
+    }
 
+    output.Albedo = color;
     output.Normals = float4(terrainNormal.xyz, 1); 
-    output.Data = float4(0, 1, 0, 0); // Material info (G=Roughness?)
+    output.Data = float4(0, 1, 0, 0);
     output.Depth = input.Depth;
 
+    return output;
+}
+
+// Shadow pass: depth-only, apply height displacement
+struct ShadowVSOutput
+{
+    float4 Position : SV_POSITION;
+};
+
+ShadowVSOutput VS_Shadow(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_InstanceID)
+{
+    ShadowVSOutput output;
+
+    StructuredBuffer<uint> sortedIndices = ResourceDescriptorHeap[SortedIndicesIdx];
+    uint dataPos = InstanceBaseOffset + instanceID;
+    uint packedIdx = sortedIndices[dataPos];
+    uint idx = packedIdx & 0x7FFFFFFFu;
+
+    StructuredBuffer<InstanceDescriptor> descriptors = ResourceDescriptorHeap[DescriptorBufIdx];
+    StructuredBuffer<row_major matrix> globalTransforms = ResourceDescriptorHeap[GlobalTransformBufferIdx];
+    uint slot = descriptors[idx].TransformSlot;
+    row_major matrix world = globalTransforms[slot];
+
+    StructuredBuffer<TerrainPatchData> terrainData = ResourceDescriptorHeap[TerrainDataIdx];
+    TerrainPatchData patch = terrainData[idx];
+
+    StructuredBuffer<uint> indices = ResourceDescriptorHeap[IndexBufferIdx];
+    uint vertexID = indices[primitiveVertexID + BaseIndex];
+    StructuredBuffer<float3> positions = ResourceDescriptorHeap[PosBufferIdx];
+    float3 pos = positions[vertexID];
+
+    float2 uv = (pos.xz + float2(16, 16)) * 0.03125f;
+    uv.y = 1 - uv.y;
+
+    float4 rect = patch.rect;
+    float2 heightUV = rect.xy + uv * float2(rect.z - rect.x, rect.w - rect.y);
+    
+    Texture2D HeightTex = ResourceDescriptorHeap[HeightTexIdx];
+    float height = HeightTex.SampleLevel(sampHeightFilter, heightUV, 0).r;
+
+    float4 worldPosition = mul(float4(pos, 1), world);
+    worldPosition.y += height * MaxHeight;
+    worldPosition = mul(worldPosition, ViewProjection);
+
+    output.Position = worldPosition;
     return output;
 }
 
@@ -182,5 +291,9 @@ technique11 Terrain
         SetRasterizerState(Wireframe);
         SetVertexShader(CompileShader(vs_6_6, VS()));
         SetPixelShader(CompileShader(ps_6_6, PS()));
+    }
+    pass Shadow
+    {
+        SetVertexShader(CompileShader(vs_6_6, VS_Shadow()));
     }
 }

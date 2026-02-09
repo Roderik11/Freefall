@@ -1,26 +1,94 @@
 # Freefall
 
-Freefall is an experimental game engine written in C# with Direct3D 12, built entirely with [Google Antigravity](https://blog.google/technology/google-deepmind/antigravity-ai-code-editor/).
+Freefall is an experimental game engine written in C# with Direct3D 12, built entirely with [Google Antigravity](https://antigravity.google/blog).
+
+## Architecture
+
+Freefall is a fully GPU-driven deferred renderer. The CPU submits unsorted draw calls in parallel; a multi-pass compute pipeline handles visibility culling, histogram-based grouping, and indirect command generation — so the GPU draws only what is visible, with zero CPU sorting.
+
+```
+ ┌─────────────────────────── CPU ───────────────────────────┐     ┌──────────────── GPU ─────────────────┐
+ │                                                           │     │                                      │
+ │  Components (IParallel)                                   │     │  Compute (cull_instances.hlsl)        │
+ │    StaticMesh ─┐                                          │     │    CSVisibility (frustum cull)        │
+ │    SkinnedMesh ├──▶ ThreadLocal DrawBuckets               │     │    CSHistogram (count per mesh-part)  │
+ │    Terrain     ┘     (zero contention)                    │     │    CSPrefixSum (offsets)              │
+ │                         │                                 │     │    CSGlobalScatter (compact SoA)      │
+ │                   Block-Copy Merge ─▶ GPU Upload (O(1))   │     │    CSMain (build draw commands)       │
+ │                                                           │     │         │                             │
+ └───────────────────────────────────────────────────────────┘     │    ExecuteIndirect                    │
+                                                                   │    (draws only visible instances)     │
+                                                                   └──────────────────────────────────────┘
+```
+
+### Render Loop
+
+| Step | Pass | What happens |
+|------|------|--------------|
+| 1 | **Script Draw** | Components enqueue draws into the `CommandBuffer` |
+| 2 | **Opaque** | Merge buckets → upload → GPU cull → `ExecuteIndirect` → G-Buffer |
+| 3 | **Shadow** | Re-cull opaque batches per cascade → 4× `ExecuteIndirect` → shadow maps |
+| 4 | **Sky** | Skybox rendered as inside-out cube via the standard pipeline |
+| 5 | **Light** | Fullscreen quad reconstructs world pos, samples cascades, accumulates lighting |
+| 6 | **Compose** | `Albedo × LightBuffer` → backbuffer blit |
+
+### Key Systems
+
+| System | Description |
+|--------|-------------|
+| **InstanceBatch** | Core GPU-driven batcher. Manages SoA per-instance buffers, histogram culling pipeline, and `ExecuteIndirect`. One batch per Effect. |
+| **CommandBuffer** | Thread-safe draw call collector. `Enqueue` dispatches to all applicable passes based on the Effect's declared passes. Thread-local `DrawBucket`s enable lock-free parallel submission. |
+| **MeshRegistry** | Global GPU buffer of mesh metadata. Persistent `MeshPartID`s eliminate per-frame CPU grouping — the GPU looks up vertex/index info directly. |
+| **TransformBuffer** | Pooled persistent GPU transform slots with dirty-flag uploads. Entities hold a stable `TransformSlot` for their lifetime. |
+| **MaterialBlock** | Per-instance parameter overrides. Data is staged into contiguous byte arrays at enqueue time and uploaded as generic per-instance SoA buffers via push constants. |
+| **Material / Effect** | Data-driven PSO management. `@RenderState` annotations in shaders auto-configure blend, depth, raster state. `MasterEffects` pattern for global parameter broadcast. |
+| **GPUCuller** | 6-pass compute pipeline: Clear → Visibility → Histogram → PrefixSum → Scatter → CommandGen. Shared between camera and shadow passes. |
+| **DeferredRenderer** | Orchestrates the G-Buffer, shadow atlas, light accumulation, and composition passes. |
 
 ## Features
 
 - **GPU-Driven Rendering** — Indirect draw calls with compute-based visibility culling and instance scatter
-- **Deferred Shading** — GBuffer-based pipeline with directional and point light support
-- **Cascaded Shadow Maps** — 4-cascade PSSM with configurable lambda blending and texel snapping
+- **Deferred Shading** — GBuffer-based pipeline with directional lighting (point lights WIP)
+- **Cascaded Shadow Maps** — 4-cascade PSSM with texel snapping, bounding-sphere stabilization, and Vogel disc filtering
 - **Hi-Z Occlusion Culling** — Hierarchical depth buffer for GPU-side occlusion tests
-- **Instance Batching** — Automatic draw call merging with per-material sub-batches and generic per-instance data buffers
+- **Instance Batching** — Automatic draw call merging with generic per-instance data channels (SoA pattern)
 - **Persistent Transform Buffer** — Pooled GPU transform slots with dirty-flag uploads
-- **Skeletal Animation** — GPU skinning via generic per-instance buffer system (SoA pattern)
-- **Terrain** — Quadtree LOD with splatmap-based multi-texture blending
+- **Skeletal Animation** — GPU skinning via per-instance bone buffers (registered as generic SoA channels)
+- **Terrain** — Quadtree LOD with splatmap-based multi-texture blending, integrated into the standard InstanceBatch pipeline
+- **Bindless SM 6.6** — All resources accessed via `ResourceDescriptorHeap` and push constants; no Input Assembler
 - **Async Resource Streaming** — Two-phase loading (CPU parse → main-thread GPU upload) with time-budgeted work queue
 - **Shader System** — Custom FX parser with automatic render pass and pipeline state management
-- **Debug Visualization** — Cascade colors, shadow factor, depth, occlusion x-ray (F5 to cycle)
+- **Debug Visualization** — 10-mode diagnostic overlay: cascade colors, shadow factor, depth, normals, occlusion x-ray (F5 to cycle)
+
+## Project Structure
+
+```
+Freefall/
+├── Program.cs              # Entry point, Win32 message loop
+├── Engine.cs               # Frame lifecycle, entity management, main-thread marshalling
+├── Components/             # ECS components (Transform, Camera, Lights, Renderers, Terrain)
+├── Graphics/
+│   ├── GraphicsDevice.cs   # D3D12 device, swap chain, root signature, descriptor heaps
+│   ├── DeferredRenderer.cs # Render loop orchestration (G-Buffer → Shadows → Light → Compose)
+│   ├── CommandBuffer.cs    # Thread-safe draw call collection and pass dispatch
+│   ├── InstanceBatch.cs    # GPU-driven batching, culling, and ExecuteIndirect
+│   ├── GPUCuller.cs        # 6-pass compute culling pipeline
+│   ├── MeshRegistry.cs     # Global GPU mesh metadata buffer
+│   ├── TransformBuffer.cs  # Persistent pooled GPU transform slots
+│   ├── Material.cs         # Bindless material system with MaterialBlock overrides
+│   ├── Effect.cs           # Shader compilation, technique/pass management
+│   └── ...                 # Mesh, Texture, ConstantBuffer, StreamingManager, etc.
+├── Animation/              # Skeletal animation, clip playback, bone matrix management
+├── Resources/Shaders/      # HLSL shaders (gbuffer, terrain, skybox, cull_instances, etc.)
+├── Scripts/                # Gameplay scripts (FreeCamera, etc.)
+└── Assets/                 # Runtime assets (scenes, textures, models)
+```
 
 ## Tech Stack
 
 - .NET 10 / C#
 - Direct3D 12 via [Vortice.Windows](https://github.com/amerkoleci/Vortice.Windows)
-- HLSL compute and graphics shaders
+- HLSL compute and graphics shaders (SM 6.6)
 - Assimp for mesh importing
 
 ## Building

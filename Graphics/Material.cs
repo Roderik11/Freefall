@@ -236,8 +236,11 @@ namespace Freefall.Graphics
                     psoDesc.RenderTargetFormats = Array.Empty<Format>();
                     psoDesc.DepthStencilFormat = Format.D32_Float;
                     psoDesc.DepthStencilState = DepthStencilDescription.Default;
-                    // Force CullMode.Front for shadows to push acne to the back
-                    psoDesc.RasterizerState = new RasterizerDescription(CullMode.Front, FillMode.Solid);
+                    var shadowRaster = new RasterizerDescription(CullMode.None, FillMode.Solid);
+                    shadowRaster.DepthBias = 4000;
+                    shadowRaster.SlopeScaledDepthBias = 2.0f;
+                    shadowRaster.DepthBiasClamp = 0.0f;
+                    psoDesc.RasterizerState = shadowRaster;
                 }
                 
                 _passPipelineStates[passIndex] = new PipelineState(device, rootSignature, psoDesc);
@@ -550,8 +553,20 @@ namespace Freefall.Graphics
     public abstract class ParameterValue
     {
         public string Name = string.Empty;
+        /// <summary>
+        /// Push constant slot for per-instance GPU buffer binding.
+        /// -1 = not yet resolved. Resolved automatically at enqueue time from shader resource bindings.
+        /// </summary>
+        public int PushConstantSlot = -1;
         public abstract void SetToTarget(Material target);
         public abstract void SetToTarget(ConstantBuffer cb);
+        
+        /// <summary>Copy raw bytes of the value into dest at the given offset. Returns bytes written.</summary>
+        public virtual int CopyToStaging(byte[] dest, int offset) => 0;
+        /// <summary>Number of array elements (for ArrayParameterValue). 0 for scalars/textures.</summary>
+        public virtual int GetElementCount() => 0;
+        /// <summary>Byte stride per array element. 0 for scalars/textures.</summary>
+        public virtual int GetElementStride() => 0;
     }
 
     public sealed class ParameterValue<T> : ParameterValue where T : unmanaged
@@ -559,6 +574,21 @@ namespace Freefall.Graphics
         public T Value;
         public override void SetToTarget(Material target) => target.SetParameter(Name, Value);
         public override void SetToTarget(ConstantBuffer cb) => cb.SetParameter(Name, Value);
+        
+        public override int GetElementCount() => 1;
+        public override int GetElementStride() => System.Runtime.InteropServices.Marshal.SizeOf<T>();
+        public override int CopyToStaging(byte[] dest, int offset)
+        {
+            int size = System.Runtime.InteropServices.Marshal.SizeOf<T>();
+            unsafe
+            {
+                fixed (T* ptr = &Value)
+                {
+                    System.Runtime.InteropServices.Marshal.Copy((IntPtr)ptr, dest, offset, size);
+                }
+            }
+            return size;
+        }
     }
     
     // For object types like Texture (not unmanaged)
@@ -575,6 +605,24 @@ namespace Freefall.Graphics
         public T[] Value = null!;
         public override void SetToTarget(Material target) { } // Arrays don't apply to materials directly
         public override void SetToTarget(ConstantBuffer cb) => cb.SetParameterArray(Name, Value);
+        
+        public override int GetElementCount() => Value?.Length ?? 0;
+        public override int GetElementStride() => System.Runtime.InteropServices.Marshal.SizeOf<T>();
+        public override int CopyToStaging(byte[] dest, int offset)
+        {
+            if (Value == null || Value.Length == 0) return 0;
+            int byteCount = Value.Length * System.Runtime.InteropServices.Marshal.SizeOf<T>();
+            var handle = System.Runtime.InteropServices.GCHandle.Alloc(Value, System.Runtime.InteropServices.GCHandleType.Pinned);
+            try
+            {
+                System.Runtime.InteropServices.Marshal.Copy(handle.AddrOfPinnedObject(), dest, offset, byteCount);
+            }
+            finally
+            {
+                handle.Free();
+            }
+            return byteCount;
+        }
     }
 
     public class MaterialBlock

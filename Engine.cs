@@ -219,9 +219,6 @@ namespace Freefall
             // Reset per-frame descriptor allocations
             Device.ResetTemporaryDescriptors();
             
-            // Upload dirty transforms to GPU
-            TransformBuffer.Instance?.Upload();
-            
             var prepareTime = System.Diagnostics.Stopwatch.StartNew();
             RenderView.Prepare();
             prepareTime.Stop();

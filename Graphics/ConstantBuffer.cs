@@ -61,7 +61,7 @@ namespace Freefall.Graphics
                 var variable = reflectionBuffer.GetVariableByIndex(i);
                 var variableDesc = variable.Description;
                 _parameters[variableDesc.Name.GetHashCode()] = (int)variableDesc.StartOffset;
-                Debug.LogAlways($"[CBReflect] {Name}: var='{variableDesc.Name}' offset={variableDesc.StartOffset} size={variableDesc.Size} hash={variableDesc.Name.GetHashCode()}");
+                Debug.Log($"[CBReflect] {Name}: var='{variableDesc.Name}' offset={variableDesc.StartOffset} size={variableDesc.Size} hash={variableDesc.Name.GetHashCode()}");
             }
         }
 
