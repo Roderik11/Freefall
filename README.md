@@ -56,7 +56,6 @@ Freefall is a fully GPU-driven deferred renderer. The CPU submits unsorted draw 
 - **Skeletal Animation** — GPU skinning via per-instance bone buffers (registered as generic SoA channels)
 - **Terrain** — Quadtree LOD with splatmap-based multi-texture blending, integrated into the standard InstanceBatch pipeline
 - **GPU Terrain** — Fully GPU-driven restricted quadtree with compute-based node evaluation, CDLOD morphing, and indirect rendering
-- **Landscape** — Clipmap-style concentric ring terrain with per-ring grid snapping and smooth scrolling
 - **Point Lights** — Deferred point lights via per-instance `StructuredBuffer`, rendered as sphere volumes with additive blending
 - **Bindless SM 6.6** — All resources accessed via `ResourceDescriptorHeap` and push constants; no Input Assembler
 - **Async Resource Streaming** — Two-phase loading (CPU parse → main-thread GPU upload) with time-budgeted work queue
@@ -71,7 +70,7 @@ Freefall/
 ├── Program.cs              # Entry point, Win32 message loop
 ├── Engine.cs               # Frame lifecycle, entity management, main-thread marshalling
 ├── Base/                   # Entity-component framework (Entity, ComponentCache, ScriptExecution)
-├── Components/             # ECS components (Transform, Camera, Lights, Renderers, Terrain, GPUTerrain, Landscape)
+├── Components/             # ECS components (Transform, Camera, Lights, Renderers, Terrain, GPUTerrain)
 ├── Graphics/
 │   ├── GraphicsDevice.cs   # D3D12 device, swap chain, root signature, descriptor heaps
 │   ├── DeferredRenderer.cs # Render loop orchestration (G-Buffer → Shadows → Light → Compose)
@@ -84,7 +83,7 @@ Freefall/
 │   ├── Effect.cs           # Shader compilation, technique/pass management
 │   └── ...                 # Mesh, Texture, ConstantBuffer, StreamingManager, etc.
 ├── Animation/              # Skeletal animation, clip playback, bone matrix management
-├── Resources/Shaders/      # HLSL shaders (gbuffer, gputerrain, landscape, terrain, skybox, cull_instances, terrain_quadtree, etc.)
+├── Resources/Shaders/      # HLSL shaders (gbuffer, gputerrain, terrain, skybox, cull_instances, terrain_quadtree, etc.)
 ├── Scripts/                # Gameplay scripts (CharacterController, ThirdPersonCamera, etc.)
 └── Assets/                 # Runtime assets (scenes, textures, models)
 ```

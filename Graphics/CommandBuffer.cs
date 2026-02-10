@@ -622,10 +622,11 @@ namespace Freefall.Graphics
 
         public static void Execute(RenderPass pass, ID3D12GraphicsCommandList commandList, GraphicsDevice device)
         {
-            // 1. Custom Actions - iterate snapshot to avoid collection modified if actions enqueue more
+            // 1. Custom Actions (single-threaded submission, no concurrent modification possible)
             var queue = current.customQueues[pass];
-            var actions = queue.ToArray();
-            foreach (var action in actions) action(commandList);
+            for (int i = 0; i < queue.Count; i++)
+                queue[i](commandList);
+            queue.Clear();
 
             // 2. Batches
             current.passes[(int)pass].Execute(commandList, device, pass);

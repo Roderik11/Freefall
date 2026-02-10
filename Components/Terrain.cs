@@ -19,7 +19,7 @@ namespace Freefall.Components
             public Vector2 Tiling = Vector2.One;
         }
 
-        // PatchType enum is now in Freefall.Graphics namespace (shared with Landscape)
+        // PatchType enum is now in Freefall.Graphics namespace
 
         public class NodePayload
         {

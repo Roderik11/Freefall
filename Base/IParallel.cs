@@ -5,7 +5,5 @@ namespace Freefall.Base
     /// Components implementing this interface will be updated concurrently via Parallel.ForEach.
     /// Components not implementing this interface will be updated serially.
     /// </summary>
-    public interface IParallel
-    {
-    }
+    public interface IParallel { }
 }

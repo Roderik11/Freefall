@@ -4,9 +4,13 @@ using Freefall.Components;
 
 namespace Freefall.Base
 {
-    public abstract class Component
+    public abstract class Component : IInstanceId
     {
         private bool _awake;
+
+        private static volatile int _instanceCount;
+        private readonly int _instanceId = Interlocked.Increment(ref _instanceCount);
+        public int GetInstanceId() => _instanceId;
 
         [Browsable(false)]
         public Entity? Entity { get; internal set; }

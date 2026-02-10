@@ -51,10 +51,9 @@ namespace Freefall
              // castle spawn from GameTestScene
              playerSpawn = new Vector3(896, 164, 920);
 
-             // === TERRAIN / LANDSCAPE — toggle here ===
+             // === TERRAIN — toggle here ===
              IHeightProvider heightProvider = SpawnGPUTerrain();
              //IHeightProvider heightProvider = SpawnTerrain();
-             //IHeightProvider heightProvider = SpawnLandscape();
              
              // Ensure all terrain textures are uploaded before first render
              StreamingManager.Instance?.Flush();
@@ -354,114 +353,6 @@ namespace Freefall
              return gpuTerrain;
          }
 
-         private static IHeightProvider SpawnLandscape()
-         {
-             string assetsPath = @"D:\Projects\2024\ProjectXYZ\Resources\";
-             
-             // Reuse same texture layers as Terrain
-             var layers = new List<Landscape.TextureLayer>
-             {
-                 new Landscape.TextureLayer
-                 {
-                     Diffuse = new Texture(Engine.Device, assetsPath + "Terrain/Terrain Textures/Sand_01/Sand_01_Dif.png"),
-                     Normals = new Texture(Engine.Device, assetsPath + "Terrain/Terrain Textures/Sand_01/Sand_01_Nor.png"),
-                     Tiling = new Vector2(8, 8),
-                 },
-                 new Landscape.TextureLayer
-                 {
-                     Diffuse = new Texture(Engine.Device, assetsPath + "Terrain/Terrain Textures/RockWall_01/RockWall_Dif.png"),
-                     Normals = new Texture(Engine.Device, assetsPath + "Terrain/Terrain Textures/RockWall_01/Rock_01_Nor.png"),
-                     Tiling = new Vector2(7, 7),
-                 },
-                 new Landscape.TextureLayer
-                 {
-                     Diffuse = new Texture(Engine.Device, assetsPath + "Terrain/Terrain Textures/Dirt/Dirt_01_Dif.png"),
-                     Normals = new Texture(Engine.Device, assetsPath + "Terrain/Terrain Textures/Dirt/Dirt_01_Nor.png"),
-                     Tiling = new Vector2(4, 4),
-                 },
-                 new Landscape.TextureLayer
-                 {
-                     Diffuse = new Texture(Engine.Device, assetsPath + "Terrain/Terrain Textures/Sand_Dirt/Sand_Dirt.png"),
-                     Normals = new Texture(Engine.Device, assetsPath + "Terrain/Terrain Textures/Sand_Dirt/Sand_Dirt_Nor.png"),
-                     Tiling = new Vector2(20, 30),
-                 },
-                 new Landscape.TextureLayer
-                 {
-                     Diffuse = new Texture(Engine.Device, assetsPath + "Terrain/Terrain Textures/Sandstone/Sandstone_Dif.png"),
-                     Normals = new Texture(Engine.Device, assetsPath + "Terrain/Terrain Textures/Sandstone/Sandstone_Nor.png"),
-                     Tiling = new Vector2(10, 10),
-                 },
-                 new Landscape.TextureLayer
-                 {
-                     Diffuse = new Texture(Engine.Device, assetsPath + "Terrain/Terrain Textures/Gras_01/Gras_01_Dif.png"),
-                     Normals = new Texture(Engine.Device, assetsPath + "Terrain/Terrain Textures/Gras_01/Gras_01_Nor.png"),
-                     Tiling = new Vector2(4, 4),
-                 },
-                 new Landscape.TextureLayer
-                 {
-                     Diffuse = new Texture(Engine.Device, assetsPath + "Terrain/Terrain Textures/Sand_02/Sand_02_Dif.png"),
-                     Normals = new Texture(Engine.Device, assetsPath + "Terrain/Terrain Textures/Sand_02/Sand_02_Nor.png"),
-                     Tiling = new Vector2(10, 10),
-                 },
-                 new Landscape.TextureLayer
-                 {
-                     Diffuse = new Texture(Engine.Device, assetsPath + "Terrain/Terrain Textures/Leafs/Leafs_01_Dif.png"),
-                     Normals = new Texture(Engine.Device, assetsPath + "Terrain/Terrain Textures/Leafs/Leafs_01_Nor.png"),
-                     Tiling = new Vector2(3, 3),
-                 },
-                 new Landscape.TextureLayer
-                 {
-                     Diffuse = new Texture(Engine.Device, assetsPath + "Terrain/Terrain Textures/RockWall_01/RockWall_Dif.png"),
-                     Normals = new Texture(Engine.Device, assetsPath + "Terrain/Terrain Textures/RockWall_01/Rock_01_Nor.png"),
-                     Tiling = new Vector2(20, 15),
-                 },
-                 new Landscape.TextureLayer
-                 {
-                     Diffuse = new Texture(Engine.Device, assetsPath + "Terrain/Terrain Textures/Dirt/Dirt_02_Dif.png"),
-                     Normals = new Texture(Engine.Device, assetsPath + "Terrain/Terrain Textures/Dirt/Dirt_01_Nor.png"),
-                     Tiling = new Vector2(15, 15),
-                 },
-                 new Landscape.TextureLayer
-                 {
-                     Diffuse = new Texture(Engine.Device, assetsPath + "Terrain/Terrain Textures/Raw_Dirt/Raw_Dirt_Dif.png"),
-                     Normals = new Texture(Engine.Device, assetsPath + "Terrain/Terrain Textures/Raw_Dirt/Raw_Dirt_Nor.png"),
-                     Tiling = new Vector2(4, 4),
-                 },
-                 new Landscape.TextureLayer
-                 {
-                     Diffuse = new Texture(Engine.Device, assetsPath + "Terrain/Terrain Textures/Moos/Moss_01_Dif.png"),
-                     Normals = new Texture(Engine.Device, assetsPath + "Terrain/Terrain Textures/Moos/Moss_01_Nor.png"),
-                     Tiling = new Vector2(4, 4),
-                 },
-                 new Landscape.TextureLayer
-                 {
-                     Diffuse = new Texture(Engine.Device, assetsPath + "Terrain/Terrain Textures/RockWall_01/RockWall_Dif.png"),
-                     Normals = new Texture(Engine.Device, assetsPath + "Terrain/Terrain Textures/RockWall_01/Rock_01_Nor.png"),
-                     Tiling = new Vector2(200, 200),
-                 },
-             };
-
-             var heightmap = new Texture(Engine.Device, assetsPath + "terrain.dds");
-             var heightField = Texture.ReadHeightField(assetsPath + "terrain.dds");
-             var landscapeMaterial = new Material(new Effect("landscape"));
-
-             var landscapeEntity = new Entity("Landscape");
-             var landscape = landscapeEntity.AddComponent<Landscape>();
-             landscape.Material = landscapeMaterial;
-             landscape.TerrainSize = new Vector2(1700, 1700);
-             landscape.Heightmap = heightmap;
-             landscape.HeightField = heightField;
-             landscape.MaxHeight = 600;
-             landscape.RingCount = 6;
-             landscape.GridResolution = 32;
-             landscape.Layers = layers;
-             
-             // Same position as terrain
-             landscapeEntity.Transform.Position = new Vector3(842.0983f - 842.0983f, 85.85109f - 39.8f, 841.4021f - 839.8109f);
-             
-             Debug.Log("[Landscape] Entity created");
-             return landscape;
-         }
 
          private static void SpawnCharacters(int count, IHeightProvider terrain, Vector3 center, Mesh mesh, Texture texture, Material material = null)
          {

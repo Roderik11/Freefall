@@ -11,7 +11,7 @@ using Freefall.Animation;
 
 namespace Freefall.Graphics
 {
-    /// <summary>Patch edge stitching type — shared by Terrain and Landscape.</summary>
+    /// <summary>Patch edge stitching type for Terrain.</summary>
     public enum PatchType
     {
         Default,
@@ -763,114 +763,6 @@ namespace Freefall.Graphics
             return mesh;
         }
 
-        // ============================================================
-        // Landscape Patch Meshes — for Landscape component (patch-based clipmap)
-        // Each patch is an NxN grid in [0,1] XZ space, Y=0.
-        // Edge collapse flags control stitching to coarser neighbors.
-        // ============================================================
 
-        /// <summary>
-        /// Create all 10 landscape patch variants (Default + 8 stitched boundary types + Center with all edges collapsed).
-        /// Returns a dictionary keyed by PatchType for easy lookup.
-        /// </summary>
-        public static Dictionary<PatchType, Mesh> CreateLandscapePatches(GraphicsDevice device, int N = 8)
-        {
-            var patches = new Dictionary<PatchType, Mesh>
-            {
-                [PatchType.Default] = CreateLandscapePatch(device, N, false, false, false, false),
-                [PatchType.W]  = CreateLandscapePatch(device, N, true, false, false, false),
-                [PatchType.E]  = CreateLandscapePatch(device, N, false, true, false, false),
-                [PatchType.N]  = CreateLandscapePatch(device, N, false, false, true, false),
-                [PatchType.S]  = CreateLandscapePatch(device, N, false, false, false, true),
-                [PatchType.NW] = CreateLandscapePatch(device, N, true, false, true, false),
-                [PatchType.NE] = CreateLandscapePatch(device, N, false, true, true, false),
-                [PatchType.SW] = CreateLandscapePatch(device, N, true, false, false, true),
-                [PatchType.SE] = CreateLandscapePatch(device, N, false, true, false, true),
-                [PatchType.Center] = CreateLandscapePatch(device, N, true, true, true, true),
-            };
-            return patches;
-        }
-
-        /// <summary>
-        /// Create a single landscape patch mesh: NxN grid in [0,1] UV space.
-        /// Collapse flags control which outer edges have every-other vertex merged
-        /// to match a coarser neighbor's vertex spacing.
-        /// </summary>
-        public static Mesh CreateLandscapePatch(GraphicsDevice device, int N,
-            bool collapseW, bool collapseE, bool collapseN, bool collapseS)
-        {
-            int stride = N + 1;
-            int vertCount = stride * stride;
-            var verts = new Vector3[vertCount];
-            var norms = new Vector3[vertCount];
-            var uvs = new Vector2[vertCount];
-
-            for (int z = 0; z <= N; z++)
-            {
-                for (int x = 0; x <= N; x++)
-                {
-                    int i = z * stride + x;
-                    float fx = (float)x / N;
-                    float fz = (float)z / N;
-                    verts[i] = new Vector3(fx, 0, fz);
-                    norms[i] = Vector3.UnitY;
-                    uvs[i] = new Vector2(fx, fz);
-                }
-            }
-
-            var indices = new List<uint>();
-            int flipx = 0, flipy = 0;
-
-            for (int z = 0; z < N; z++)
-            {
-                flipy = 1 - flipy;
-                flipx = 0;
-                for (int x = 0; x < N; x++)
-                {
-                    flipx = 1 - flipx;
-
-                    int v0 = z * stride + x;           // bottom-left
-                    int v1 = v0 + 1;                    // bottom-right
-                    int v2 = (z + 1) * stride + x;      // top-left
-                    int v3 = v2 + 1;                     // top-right
-
-                    // West edge collapse (x == 0)
-                    if (collapseW && x == 0)
-                    {
-                        if (flipy == 1) v2 = v0;
-                        else v0 = (z > 0) ? (z - 1) * stride + x : v0;
-                    }
-
-                    // East edge collapse (x == N-1)
-                    if (collapseE && x == N - 1)
-                    {
-                        if (flipy == 1) v3 = (z + 1 < N) ? (z + 2) * stride + (x + 1) : v3;
-                        else v1 = v3;
-                    }
-
-                    // South edge collapse (z == 0)
-                    if (collapseS && z == 0)
-                    {
-                        if (flipx == 1) v1 = v0;
-                        else v0 = (x > 0) ? z * stride + (x - 1) : v0;
-                    }
-
-                    // North edge collapse (z == N-1)
-                    if (collapseN && z == N - 1)
-                    {
-                        if (flipx == 1) v3 = (x + 1 < N) ? (z + 1) * stride + (x + 2) : v3;
-                        else v2 = (z + 1) * stride + (x + 1);
-                    }
-
-                    indices.Add((uint)v2); indices.Add((uint)v1); indices.Add((uint)v0);
-                    indices.Add((uint)v2); indices.Add((uint)v3); indices.Add((uint)v1);
-                }
-            }
-
-            var mesh = new Mesh(device, verts, norms, uvs, indices.ToArray());
-            mesh.MeshParts.Add(new MeshPart { NumIndices = indices.Count });
-            mesh.BoundingBox = new BoundingBox(new Vector3(0, 0, 0), new Vector3(1, 0, 1));
-            return mesh;
-        }
     }
 }

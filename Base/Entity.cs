@@ -41,6 +41,9 @@ namespace Freefall.Base
     {
         public static readonly Type Type = typeof(T);
         internal static readonly List<T> List = new List<T>();
+        internal static readonly ComponentSet<IUpdate> UpdateList = new ComponentSet<IUpdate>();
+        internal static readonly ComponentSet<IDraw> DrawList = new ComponentSet<IDraw>();
+
         private static readonly Dictionary<int, int> Indices = new Dictionary<int, int>();
         private static readonly object _lock = new object();
 
@@ -81,6 +84,9 @@ namespace Freefall.Base
             List[last] = a;
 
             List.RemoveAt(last);
+
+            if (a is IUpdate update) UpdateList.Remove(update);
+            if (a is IDraw draw) DrawList.Remove(draw);
         }
 
         public static T Get(Entity entity)
@@ -110,10 +116,17 @@ namespace Freefall.Base
         {
             lock (_lock)
             {
-                if (Indices.TryGetValue(entity.GetHashCode(), out int result))
+                int hash = entity.GetHashCode();
+                if (Indices.TryGetValue(hash, out int result))
                     return List[result];
 
-                Indices.Add(entity.GetHashCode(), List.Count);
+                if (component is IUpdate update)
+                    UpdateList.Add(update);
+
+                if (component is IDraw draw)
+                    DrawList.Add(draw);
+
+                Indices.Add(hash, List.Count);
                 component.Entity = entity;
                 List.Add(component);
 
@@ -123,16 +136,18 @@ namespace Freefall.Base
 
         public void Update()
         {
+            if(!HasUpdate) return;
+            
             // Take snapshot for thread safety
-            T[] snapshot;
-            lock (_lock) { snapshot = List.ToArray(); }
+            IUpdate[] snapshot;
+            lock (_lock) { snapshot = UpdateList.Collection.ToArray(); }
             
             if (HasUpdate)
             {
                 if (IsParallel)
-                    Parallel.ForEach(snapshot, comp => ((IUpdate)comp).Update());
+                    Parallel.ForEach(snapshot, comp => comp.Update());
                 else
-                    foreach (var comp in snapshot) ((IUpdate)comp).Update();
+                    foreach (var comp in snapshot) comp.Update();
             }
         }
 
@@ -140,23 +155,10 @@ namespace Freefall.Base
         {
             if (!HasDraw) return;
             
-            // Snapshot count under lock — list only grows, no mid-Draw removals,
-            // so index-based iteration is safe without copying the entire array.
-            int count;
-            lock (_lock) { count = List.Count; }
-            
             if (IsParallel)
-            {
-                // Parallel path still needs snapshot for safe partitioning
-                T[] snapshot;
-                lock (_lock) { snapshot = List.ToArray(); }
-                Parallel.ForEach(snapshot, comp => ((IDraw)comp).Draw());
-            }
+                Parallel.ForEach(DrawList.Collection, comp => comp.Draw());
             else
-            {
-                for (int i = 0; i < count; i++)
-                    ((IDraw)List[i]).Draw();
-            }
+                foreach (var comp in DrawList.Collection) comp.Draw();
         }
 
         public override string ToString()
