@@ -21,7 +21,7 @@ namespace Freefall.Scripts
         private float smoothness = 20f;
 
         // Terrain reference for simple collision
-        public Terrain Terrain;
+        public IHeightProvider Terrain;
 
         public void Update()
         {

@@ -12,9 +12,7 @@ namespace Freefall.Components
         public Mesh? Mesh { get; set; }
         public Material? Material { get; set; }
         public List<Material> Materials { get; set; } = new List<Material>();
-        protected MaterialBlock Params = new MaterialBlock();
-
-
+        public MaterialBlock Params = new MaterialBlock();
 
         public void Draw()
         {
@@ -35,18 +33,14 @@ namespace Freefall.Components
                 {
                     var mat = i < Materials.Count ? Materials[i] : Materials[Materials.Count - 1];
                     if (mat != null)
-                    {
                         CommandBuffer.Enqueue(Mesh, i, mat, Params, slot);
-                    }
                 }
             }
             else if (Material != null)
             {
                 // Single material for all parts
                 for (int i = 0; i < Mesh.MeshParts.Count; i++)
-                {
                     CommandBuffer.Enqueue(Mesh, i, Material, Params, slot);
-                }
             }
         }
 

@@ -105,49 +105,47 @@ namespace Freefall.Graphics
                 MaterialId = (uint)material.MaterialID,
                 CustomDataIdx = 0
             };
-            var sphere = mesh.LocalBoundingSphere;
-            var meshPartIdU = (uint)meshPartId;
+
             StageCore(DescriptorsHash, 12, descriptor);       // InstanceDescriptor: 12 bytes
-            StageCore(BoundingSpheresHash, 16, sphere);        // Vector4: 16 bytes
-            StageCore(SubbatchIdsHash, 4, meshPartIdU);        // uint: 4 bytes
+            StageCore(BoundingSpheresHash, 16, mesh.LocalBoundingSphere);        // Vector4: 16 bytes
+            StageCore(SubbatchIdsHash, 4,  (uint)meshPartId);        // uint: 4 bytes
             UniqueMeshPartIds.Add(meshPartId);
             
+            if(block == null) return;
+
             // Stage per-instance params into contiguous byte arrays (at Enqueue time, not MergeFromBucket)
-            if (block != null)
+            foreach (var (hash, param) in block.Parameters)
             {
-                foreach (var (hash, param) in block.Parameters)
+                if (param is TextureParameterValue) continue;
+                
+                // Auto-resolve graphics push constant slot from shader resource bindings
+                if (param.PushConstantSlot < 0 && material.Effect != null)
+                    param.PushConstantSlot = material.Effect.GetPushConstantSlot(hash);
+                
+                int elemCount = param.GetElementCount();
+                int elemStride = param.GetElementStride();
+                if (elemCount == 0 || elemStride == 0) continue;
+                    
+                if (!PerInstanceData.TryGetValue(hash, out var staging))
                 {
-                    if (param is TextureParameterValue) continue;
-                    
-                    // Auto-resolve graphics push constant slot from shader resource bindings
-                    if (param.PushConstantSlot < 0 && material.Effect != null)
-                        param.PushConstantSlot = material.Effect.GetPushConstantSlot(hash);
-                    
-                    int elemCount = param.GetElementCount();
-                    int elemStride = param.GetElementStride();
-                    if (elemCount == 0 || elemStride == 0) continue;
-                    
-                    if (!PerInstanceData.TryGetValue(hash, out var staging))
+                    staging = new PerInstanceStaging
                     {
-                        staging = new PerInstanceStaging
-                        {
-                            PushConstantSlot = param.PushConstantSlot,
-                            ElementStride = elemStride,
-                            ElementsPerInstance = elemCount,
-                        };
-                        PerInstanceData[hash] = staging;
-                    }
-                    
-                    // Ensure capacity
-                    int bytesPerInst = staging.BytesPerInstance;
-                    int needed = (staging.Count + 1) * bytesPerInst;
-                    if (staging.Data.Length < needed)
-                        Array.Resize(ref staging.Data, Math.Max(staging.Data.Length * 2, needed));
-                    
-                    // Copy raw bytes at sequential offset (instance N at offset N * bytesPerInstance)
-                    param.CopyToStaging(staging.Data, staging.Count * bytesPerInst);
-                    staging.Count++;
+                        PushConstantSlot = param.PushConstantSlot,
+                        ElementStride = elemStride,
+                        ElementsPerInstance = elemCount,
+                    };
+                    PerInstanceData[hash] = staging;
                 }
+                    
+                // Ensure capacity
+                int bytesPerInst = staging.BytesPerInstance;
+                int needed = (staging.Count + 1) * bytesPerInst;
+                if (staging.Data.Length < needed)
+                    Array.Resize(ref staging.Data, Math.Max(staging.Data.Length * 2, needed));
+                    
+                // Copy raw bytes at sequential offset (instance N at offset N * bytesPerInstance)
+                param.CopyToStaging(staging.Data, staging.Count * bytesPerInst);
+                staging.Count++;
             }
         }
         
@@ -220,6 +218,7 @@ namespace Freefall.Graphics
             // Persistent batches - reused across frames
             private readonly Dictionary<BatchKey, InstanceBatch> batches = new Dictionary<BatchKey, InstanceBatch>();
             private readonly List<InstanceBatch> activeBatches = new List<InstanceBatch>();
+
             private readonly List<InstanceBatch> allBatches = new List<InstanceBatch>();
             
             /// <summary>
@@ -329,13 +328,52 @@ namespace Freefall.Graphics
                 bucket.Add(drawCall.Mesh, drawCall.MeshPartIndex, drawCall.Material, drawCall.MaterialBlock, drawCall.TransformSlot);
             }
 
+            /// <summary>
+            /// Create or find a batch for GPU-sourced data (bypasses CPU staging).
+            /// Attaches pre-filled buffer SRVs from a compute shader.
+            /// </summary>
+            public void EnsureGPUBatch(
+                BatchKey key, Material material, Mesh mesh, int meshPartId,
+                uint descriptorsSRV, uint spheresSRV, uint subbatchIdsSRV,
+                int instanceCount, ReadOnlySpan<InstanceBatch.GPUBufferBinding> customBindings)
+            {
+                if (!batches.TryGetValue(key, out var batch))
+                {
+                    batch = new InstanceBatch(key, material);
+                    batches.Add(key, batch);
+                    allBatches.Add(batch);
+                }
+
+                // Activate for this frame
+                if (batch._activeFrame != Engine.FrameIndex)
+                {
+                    batch._activeFrame = Engine.FrameIndex;
+                    batch.Clear();
+                    activeBatches.Add(batch);
+                }
+
+                // Attach GPU-generated buffers
+                batch.AttachGPUData(
+                    descriptorsSRV, spheresSRV, subbatchIdsSRV,
+                    instanceCount, meshPartId, customBindings);
+            }
+
             public void Execute(ID3D12GraphicsCommandList commandList, GraphicsDevice device, RenderPass pass)
             {
                 var totalSw = System.Diagnostics.Stopwatch.StartNew();
                                 
+                // 0. Execute custom actions (compute shader dispatches etc.) before batch processing
+                if (current.customQueues.TryGetValue(pass, out var actions) && actions.Count > 0)
+                {
+                    foreach (var action in actions)
+                        action(commandList);
+                    actions.Clear();
+                }
+
                 // 1. Batch draw calls by Effect
                 var batchingSw = System.Diagnostics.Stopwatch.StartNew();
-                activeBatches.Clear(); // Clear the active list, but keep the dictionary
+                
+                activeBatches.Clear();
                 
                 int drawCallCount = 0;
                 
@@ -370,6 +408,16 @@ namespace Freefall.Graphics
                         batch.MergeFromBucket(drawBucket);
                     }
                 }
+                
+                // Re-add GPU-sourced batches that were activated during Draw() via EnsureGPUBatch.
+                // These don't go through the bucket merge path but are already configured.
+                foreach (var batch in allBatches)
+                {
+                    if (batch._isGPUSourced && batch._activeFrame == Engine.FrameIndex
+                        && !activeBatches.Contains(batch))
+                        activeBatches.Add(batch);
+                }
+                
                 batchingSw.Stop();
 
                 // GPU culling requires Culler to be initialized
@@ -409,10 +457,7 @@ namespace Freefall.Graphics
                 buildSw.Stop();
                 sortDrawCallsSw.Stop();
 
-                // 6. Set topology ONCE for all batches (all use TriangleList)
-                commandList.IASetPrimitiveTopology(Vortice.Direct3D.PrimitiveTopology.TriangleList);
-
-                // 7. Draw
+                // 7. Draw (topology set per-batch: patch for tessellation, triangle list otherwise)
                 var applySw = System.Diagnostics.Stopwatch.StartNew();
                 var drawSw = System.Diagnostics.Stopwatch.StartNew();
                 
@@ -421,6 +466,11 @@ namespace Freefall.Graphics
                     // Apply Material (PSO)
                     applySw.Start();
                     batch.Material.Apply(commandList, device);
+                    // Set topology per-batch: tessellation shaders require patch topology
+                    var topology = batch.Material.HasTessellation
+                        ? Vortice.Direct3D.PrimitiveTopology.PatchListWith3ControlPoints
+                        : Vortice.Direct3D.PrimitiveTopology.TriangleList;
+                    commandList.IASetPrimitiveTopology(topology);
                     // Push constant slot 16: debug mode (not touched by command signature slots 2-15)
                     commandList.SetGraphicsRoot32BitConstant(0, (uint)Engine.Settings.DebugVisualizationMode, 16);
                     applySw.Stop();
@@ -510,6 +560,28 @@ namespace Freefall.Graphics
         {
             current.customQueues[pass].Add(action);
         }
+
+        /// <summary>
+        /// Register a GPU-sourced batch where per-instance buffers were generated by compute shader.
+        /// Bypasses CPU staging: the provided SRV indices point directly at GPU-filled buffers.
+        /// </summary>
+        public static void EnqueueGPUBatch(
+            Material material,
+            Mesh mesh,
+            int meshPartId,
+            uint descriptorsSRV,
+            uint spheresSRV,
+            uint subbatchIdsSRV,
+            int instanceCount,
+            ReadOnlySpan<InstanceBatch.GPUBufferBinding> customBindings = default)
+        {
+            var key = new BatchKey(material.Effect);
+            var pass = current.passes[(int)RenderPass.Opaque];
+
+            pass.EnsureGPUBatch(key, material, mesh, meshPartId,
+                descriptorsSRV, spheresSRV, subbatchIdsSRV, instanceCount, customBindings);
+        }
+
 
         /// <summary>
         /// Enqueue draw call into all applicable RenderPasses based on the Material's Effect passes.

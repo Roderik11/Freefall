@@ -28,6 +28,24 @@ SamplerState Sampler : register(s0);
 SamplerState ShadowClampSampler : register(s2); // Linear+Clamp for shadow map sampling (debug)
 SamplerComparisonState ShadowSampler : register(s3); // Comparison+Bilinear for PCF
 
+// Compute normal offset for shadow receiver to prevent acne.
+// Shifts world position along the surface normal before light-space projection.
+// Offset scales with shadow map texel size (from orthographic projection) and surface angle.
+float4 ApplyNormalOffset(float4 worldPos, float3 normal, float3 lightDir, row_major float4x4 lightVP, float shadowMapRes)
+{
+    // Orthographic projection: world-space size of one shadow texel
+    float texelWorldSize = 2.0 / (shadowMapRes * abs(lightVP._11));
+    
+    // Scale offset by sin(angle) — only surfaces at grazing angles need offset;
+    // well-lit flat surfaces (sinTheta ≈ 0) get near-zero offset to avoid shifting shadows
+    float cosTheta = saturate(dot(normal, -lightDir));
+    float sinTheta = sqrt(1.0 - cosTheta * cosTheta);
+    float offsetScale = texelWorldSize * sinTheta * 0.8;
+    offsetScale = min(offsetScale, 0.5); // hard clamp for large cascades
+    
+    return worldPos + float4(normal * offsetScale, 0);
+}
+
 struct VSOutput
 {
     float4 Position : SV_POSITION;

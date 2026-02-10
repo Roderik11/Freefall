@@ -10,6 +10,8 @@ namespace Freefall.Graphics
         public string Name { get; }
         public Shader? VertexShader { get; private set; }
         public Shader? PixelShader { get; private set; }
+        public Shader? HullShader { get; private set; }
+        public Shader? DomainShader { get; private set; }
         public string? RasterizerStateName { get; private set; }
 
         public EffectPass(string name, EffectPassDescription desc, string source)
@@ -22,12 +24,20 @@ namespace Freefall.Graphics
 
             if (!string.IsNullOrEmpty(desc.PixelShaderEntry))
                 PixelShader = new Shader(source, desc.PixelShaderEntry, desc.PixelShaderProfile ?? "ps_6_0");
+
+            if (!string.IsNullOrEmpty(desc.HullShaderEntry))
+                HullShader = new Shader(source, desc.HullShaderEntry, desc.HullShaderProfile ?? "hs_6_0");
+
+            if (!string.IsNullOrEmpty(desc.DomainShaderEntry))
+                DomainShader = new Shader(source, desc.DomainShaderEntry, desc.DomainShaderProfile ?? "ds_6_0");
         }
 
         public void Dispose()
         {
             VertexShader?.Dispose();
             PixelShader?.Dispose();
+            HullShader?.Dispose();
+            DomainShader?.Dispose();
         }
     }
 

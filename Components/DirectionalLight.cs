@@ -166,13 +166,58 @@ namespace Freefall.Components
             }
             
             // Draw each cascade using GPU-driven rendering
+            // Phase 1: Compute all 4 cascade matrices and frustum planes
             for (int i = 0; i < 4; i++)
             {
-                DrawCascade(commandList, i, camera, cameraPosition, shadowTex);
+                SetupCascade(i, camera, cameraPosition, shadowTex);
+            }
+            
+            // Phase 2: GPU-driven cull all 4 cascades per batch (unified visibility pass)
+            var culler = CommandBuffer.Culler;
+            var allBatches = CommandBuffer.GetAllBatches(RenderPass.Opaque);
+            int frameIndex = Engine.FrameIndex % FrameCount;
+            
+            if (culler != null && allBatches != null)
+            {
+                EnsureShadowCascadeBuffer();
+                UploadShadowCascadePlanes(frameIndex);
+                ulong cascadeBufferAddress = _shadowCascadeBuffers![frameIndex].GPUVirtualAddress;
+                
+                // Cull all 4 cascades for each batch using unified visibility pass
+                foreach (var batch in allBatches)
+                {
+                    batch.CullShadowAll(commandList, cascadeBufferAddress, culler);
+                }
+                
+                // Phase 3: Draw each cascade
+                for (int i = 0; i < 4; i++)
+                {
+                    // Set render target to depth-only
+                    commandList.OMSetRenderTargets(0, (CpuDescriptorHandle[]?)null, false, shadowTex.SliceDsvHandles[i]);
+                    
+                    ulong shadowSceneCBVAddress = _shadowSceneConstantsBuffers![frameIndex].GPUVirtualAddress + (ulong)(i * 512);
+                    foreach (var batch in allBatches)
+                    {
+                        var pass = batch.Material.GetPass(Material.Pass);
+                        batch.Material.SetPass(RenderPass.Shadow);
+                        batch.DrawShadow(commandList, i, shadowSceneCBVAddress);
+                        batch.Material.SetPass(pass);
+                    }
+                }
+            }
+            else
+            {
+                // Fallback: CPU geometry submission
+                CommandBuffer.Execute(RenderPass.Shadow, commandList, Engine.Device);
+                CommandBuffer.Clear();
             }
         }
-
-        private void DrawCascade(ID3D12GraphicsCommandList commandList, int index, Camera camera, Vector3 cameraPosition, DepthTextureArray2D shadowTex)
+        
+        /// <summary>
+        /// Compute cascade light matrices, upload SceneConstants, and extract frustum planes.
+        /// Does NOT issue any GPU commands — just CPU-side matrix setup.
+        /// </summary>
+        private void SetupCascade(int index, Camera camera, Vector3 cameraPosition, DepthTextureArray2D shadowTex)
         {
             var cascadeProjection = cascadeProjectionMatrices[index];
             
@@ -290,45 +335,10 @@ namespace Freefall.Components
             for (int i = 0; i < 6; i++)
                 cascadeFrustumPlanes[index][i] = planes[i];
             
-            // Set render target to depth-only
-            commandList.OMSetRenderTargets(0, (CpuDescriptorHandle[]?)null, false, shadowTex.SliceDsvHandles[index]);
-            
             // Upload shadow SceneConstants with offset shadowView for VS_Shadow
             EnsureShadowSceneConstantsBuffer();
             int frameIndex = Engine.FrameIndex % FrameCount;
             UploadShadowSceneConstants(frameIndex, index, shadowView, lightProj);
-            ulong shadowSceneCBVAddress = _shadowSceneConstantsBuffers![frameIndex].GPUVirtualAddress + (ulong)(index * 512);
-            
-            // GPU-driven shadow rendering: cull and draw each InstanceBatch
-            // Use ALL batches (not just camera-visible) so off-screen objects still cast shadows
-            var culler = CommandBuffer.Culler;
-            var allBatches = CommandBuffer.GetAllBatches(RenderPass.Opaque);
-            if (culler != null && allBatches != null)
-            {
-                // Upload all 4 cascade frustums to shadow cascade buffer
-                EnsureShadowCascadeBuffer();
-                UploadShadowCascadePlanes(frameIndex);
-                ulong cascadeBufferAddress = _shadowCascadeBuffers![frameIndex].GPUVirtualAddress;
-                
-                foreach (var batch in allBatches)
-                {
-                    var pass = batch.Material.GetPass(Material.Pass);
-                    batch.Material.SetPass(RenderPass.Shadow);
-                    batch.CullShadow(commandList, index, cascadeBufferAddress, culler);
-                    batch.DrawShadow(commandList, index, shadowSceneCBVAddress);
-                    batch.Material.SetPass(pass);
-                }
-            }
-            else if (Engine.FrameIndex % 60 == 0 && index == 0)
-            {
-                Debug.Log($"[Shadow] WARNING: No GPU path! culler={culler != null}");
-            }
-            else
-            {
-                // Fallback: CPU geometry submission
-                CommandBuffer.Execute(RenderPass.Shadow, commandList, Engine.Device);
-                CommandBuffer.Clear();
-            }
         }
                
         private void EnsureShadowCascadeBuffer()

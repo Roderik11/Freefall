@@ -73,12 +73,14 @@ cbuffer PushConstants : register(b3)
 #define SubbatchIdsIdx        Indices[5].w   // SRV: per-instance subbatch index
 
 // Per-batch indices (set by CPU for each batch)
+#define ShadowVisFlags0Idx    Indices[6].x   // UAV: shadow cascade 0 visibility flags (CSVisibilityShadow4)
 #define MaterialsBufferIdx    Indices[6].y   // SRV: materials array buffer
 #define HistogramIdx          Indices[6].z   // UAV: histogram buffer (count per MeshPartId)
 #define UniquePartCount       Indices[6].w   // Max unique MeshPartIds in registry
-// Slots [7].x and [7].y freed by Phase 1 scatter simplification (no longer scatter materialIds)
+#define ShadowVisFlags1Idx    Indices[7].x   // UAV: shadow cascade 1 visibility flags (CSVisibilityShadow4)
+#define ShadowVisFlags2Idx    Indices[7].y   // UAV: shadow cascade 2 visibility flags (CSVisibilityShadow4)
 #define BoneBufferIdx         Indices[7].z   // SRV: per-batch bone matrices buffer (0 for static batches)
-#define ShadowCascadeIdx      Indices[7].w   // Shadow cascade index (0-3) for shadow culling pass
+#define ShadowCascadeIdx      Indices[7].w   // Shadow cascade index (0-3) / cascade 3 vis flags UAV
 
 // Per-subbatch instance range (extended with MeshPartId)
 struct InstanceRange
@@ -496,25 +498,18 @@ void CSGlobalScatter(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupId
         return;
     
     RWStructuredBuffer<uint> visibilityFlags = ResourceDescriptorHeap[VisibilityFlagsIdx];
-    StructuredBuffer<uint> subbatchIds = ResourceDescriptorHeap[SubbatchIdsIdx];  // Actually MeshPartId
-    RWStructuredBuffer<uint> counters = ResourceDescriptorHeap[CounterBufferIdx];  // StartInstance offsets (prefix sum)
-    RWStructuredBuffer<uint> visibleOut = ResourceDescriptorHeap[VisibleIndicesUAVIdx];  // Output: compacted instance indices
+    StructuredBuffer<uint> subbatchIds = ResourceDescriptorHeap[SubbatchIdsIdx];
+    RWStructuredBuffer<uint> counters = ResourceDescriptorHeap[CounterBufferIdx];
+    RWStructuredBuffer<uint> visibleOut = ResourceDescriptorHeap[VisibleIndicesUAVIdx];
     
-    // Scatter visible instances (flag 1) and x-ray occluded instances (flag 2)
     uint flag = visibilityFlags[instanceIdx];
     if (flag >= 1)
     {
-        // Get MeshPartId for this instance
         uint meshPartId = subbatchIds[instanceIdx];
         
-        // Atomically increment counter to get unique output position
-        // counters[meshPartId] starts at prefix sum value (StartInstance offset)
-        // Each visible instance atomically increments to get unique slot
         uint outputIdx;
         InterlockedAdd(counters[meshPartId], 1, outputIdx);
         
-        // Write original instance index — VS uses this to look up all per-instance data
-        // Pack occlusion flag into high bit for x-ray debug mode
         uint packedIdx = instanceIdx;
         if (flag == 2)
             packedIdx |= 0x80000000u;
@@ -675,10 +670,9 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
     
     uint visibleCount = histogram[meshPartId];
     
-    // Skip MeshPartIds with no visible instances - avoids potential issues
+    // Skip MeshPartIds with no visible instances
     if (visibleCount == 0)
     {
-        // Write an empty command to maintain proper indexing
         RWStructuredBuffer<IndirectDrawCommand> output = ResourceDescriptorHeap[OutputBufferIdx];
         IndirectDrawCommand emptyCmd = (IndirectDrawCommand)0;
         output[meshPartId] = emptyCmd;
@@ -688,14 +682,11 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
     // After CSGlobalScatter, counters[k] has been incremented by visibleCount
     // Original StartInstance = counters[k] - visibleCount
     uint counterVal = counters[meshPartId];
-    // Protect against underflow (shouldn't happen but be safe)
     uint baseOffset = (counterVal >= visibleCount) ? (counterVal - visibleCount) : 0;
     
-    // Look up mesh metadata from global registry
     StructuredBuffer<MeshPartEntry> meshRegistry = ResourceDescriptorHeap[MeshRegistryIdx];
     MeshPartEntry entry = meshRegistry[meshPartId];
     
-    // Build command from registry entry
     RWStructuredBuffer<IndirectDrawCommand> output = ResourceDescriptorHeap[OutputBufferIdx];
     
     IndirectDrawCommand cmd;
@@ -703,7 +694,7 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
     cmd.Reserved0 = 0;
     cmd.SortedIndicesBufIdx = VisibleIndicesSRVIdx;
     cmd.BoneWeightsBufIdx = entry.BoneWeightsBufferIdx;
-    cmd.BonesBufIdx = BoneBufferIdx;  // Per-batch bone buffer (0 for static batches)
+    cmd.BonesBufIdx = BoneBufferIdx;
     cmd.IndexBufIdx = entry.IndexBufferIdx;
     cmd.BaseIndex = entry.BaseIndex;
     cmd.PosBufIdx = entry.PosBufferIdx;
@@ -790,4 +781,62 @@ void CSVisibilityShadow(uint3 dispatchThreadId : SV_DispatchThreadID)
     
     // Write visibility flag
     visibilityFlags[instanceIdx] = visible ? 1 : 0;
+}
+
+//-----------------------------------------------------------------------------
+// CSVisibilityShadow4: Unified 4-cascade shadow visibility pass
+// Tests all 4 cascade frustums per instance in a single dispatch.
+// Reads each instance's transform ONCE (not 4×), writes to 4 separate
+// visibility flag buffers via push constant UAV indices.
+//-----------------------------------------------------------------------------
+[numthreads(256, 1, 1)]
+void CSVisibilityShadow4(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    uint instanceIdx = dispatchThreadId.x;
+    
+    // Get all 4 output buffers
+    RWStructuredBuffer<uint> visFlags0 = ResourceDescriptorHeap[ShadowVisFlags0Idx];
+    RWStructuredBuffer<uint> visFlags1 = ResourceDescriptorHeap[ShadowVisFlags1Idx];
+    RWStructuredBuffer<uint> visFlags2 = ResourceDescriptorHeap[ShadowVisFlags2Idx];
+    RWStructuredBuffer<uint> visFlags3 = ResourceDescriptorHeap[ShadowCascadeIdx]; // Reuses slot 31
+    
+    // Bounds check - write 0 for out-of-range
+    if (instanceIdx >= TotalInstances)
+    {
+        visFlags0[instanceIdx] = 0;
+        visFlags1[instanceIdx] = 0;
+        visFlags2[instanceIdx] = 0;
+        visFlags3[instanceIdx] = 0;
+        return;
+    }
+    
+    // Load instance data ONCE (instead of 4× in separate dispatches)
+    StructuredBuffer<InstanceDescriptor> descriptors = ResourceDescriptorHeap[DescriptorBufferIdx];
+    StructuredBuffer<float4> spheres = ResourceDescriptorHeap[BoundingSpheresIdx];
+    StructuredBuffer<row_major float4x4> transforms = ResourceDescriptorHeap[GlobalTransformsIdx];
+    
+    uint transformSlot = descriptors[instanceIdx].TransformSlot;
+    float4 localSphere = spheres[instanceIdx];
+    
+    // Transform sphere to world space (done ONCE)
+    row_major float4x4 world = transforms[transformSlot];
+    float3 worldCenter = mul(float4(localSphere.xyz, 1.0), world).xyz;
+    
+    float3 scale = float3(
+        length(world[0].xyz),
+        length(world[1].xyz),
+        length(world[2].xyz)
+    );
+    float maxScale = max(scale.x, max(scale.y, scale.z));
+    float worldRadius = localSphere.w * maxScale;
+    
+    // Inflate for skinned meshes (same as CSVisibilityShadow)
+    if (BoneBufferIdx != 0)
+        worldRadius *= 1.5;
+    
+    // Test all 4 cascade frustums
+    visFlags0[instanceIdx] = IsVisibleShadow(worldCenter, worldRadius, 0) ? 1 : 0;
+    visFlags1[instanceIdx] = IsVisibleShadow(worldCenter, worldRadius, 1) ? 1 : 0;
+    visFlags2[instanceIdx] = IsVisibleShadow(worldCenter, worldRadius, 2) ? 1 : 0;
+    visFlags3[instanceIdx] = IsVisibleShadow(worldCenter, worldRadius, 3) ? 1 : 0;
 }

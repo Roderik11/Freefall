@@ -152,11 +152,15 @@ namespace Freefall.Graphics
 
              // Execute all IDraw components to enqueue draw commands
              // This enqueues DrawShadows callback into ShadowMap pass AND opaque batches
+             var drawTime = System.Diagnostics.Stopwatch.StartNew();
              ScriptExecution.Draw();
+             drawTime.Stop();
 
              // Upload transforms AFTER Draw() so per-frame SetTransform() calls
              // (e.g. terrain patch pool-slot reassignment) are captured before GPU reads
+             var uploadTime = System.Diagnostics.Stopwatch.StartNew();
              TransformBuffer.Instance?.Upload();
+             uploadTime.Stop();
 
              // === GBuffer Draw ===
              // Cache GBuffer RTV handles to avoid per-frame allocation
@@ -223,7 +227,7 @@ namespace Freefall.Graphics
              // Log every 60 frames
              if (Engine.FrameIndex % 60 == 0)
              {
-                 Debug.Log($"[FillGBuffer] Shadow: {shadowTime.Elapsed.TotalMilliseconds:F2}ms | Opaque: {opaqueTime.Elapsed.TotalMilliseconds:F2}ms | Sky: {skyTime.Elapsed.TotalMilliseconds:F2}ms");
+                 Debug.Log($"[FillGBuffer] Draw(): {drawTime.Elapsed.TotalMilliseconds:F2}ms | Upload: {uploadTime.Elapsed.TotalMilliseconds:F2}ms | Shadow: {shadowTime.Elapsed.TotalMilliseconds:F2}ms | Opaque: {opaqueTime.Elapsed.TotalMilliseconds:F2}ms | Sky: {skyTime.Elapsed.TotalMilliseconds:F2}ms");
              }
 
              // End GBuffer

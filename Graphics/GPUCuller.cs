@@ -30,6 +30,7 @@ namespace Freefall.Graphics
         private ID3D12PipelineState? _sortIndirectionPSO; // CSSortIndirection - per-subbatch indirection sort
         private ID3D12PipelineState? _mainPSO;          // CSMain - generate commands from histogram
         private ID3D12PipelineState? _visibilityShadowPSO; // CSVisibilityShadow - shadow cascade culling
+        private ID3D12PipelineState? _visibilityShadow4PSO; // CSVisibilityShadow4 - unified 4-cascade culling
         private ID3D12PipelineState? _downsamplePSO;    // CSDownsample - Hi-Z depth pyramid generation
         
         // SDSM depth analysis PSOs
@@ -97,6 +98,7 @@ namespace Freefall.Graphics
         public ID3D12PipelineState? MainPSO => _mainPSO;
         public ID3D12PipelineState? ClearPSO => _clearPSO;
         public ID3D12PipelineState? VisibilityShadowPSO => _visibilityShadowPSO;
+        public ID3D12PipelineState? VisibilityShadow4PSO => _visibilityShadow4PSO;
         public ID3D12PipelineState? DownsamplePSO => _downsamplePSO;
         
         // Hi-Z depth pyramid resources
@@ -267,6 +269,11 @@ namespace Freefall.Graphics
                 var visibilityShadowShader = new Shader(shaderSource, "CSVisibilityShadow", "cs_6_6");
                 _visibilityShadowPSO = _device.CreateComputePipelineState(visibilityShadowShader.Bytecode);
                 visibilityShadowShader.Dispose();
+                
+                // Pass 8: CSVisibilityShadow4 - unified 4-cascade visibility
+                var visShadow4Shader = new Shader(shaderSource, "CSVisibilityShadow4", "cs_6_6");
+                _visibilityShadow4PSO = _device.CreateComputePipelineState(visShadow4Shader.Bytecode);
+                visShadow4Shader.Dispose();
                 
                 // Hi-Z depth pyramid downsampler (separate shader file)
                 string pyramidPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Resources", "Shaders", "depth_pyramid.hlsl");

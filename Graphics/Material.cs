@@ -88,6 +88,18 @@ namespace Freefall.Graphics
         public int Technique { get; set; } = 0;
         
         public List<ShaderPass> GetPasses() => _subShaders.Count > Technique ? _subShaders[Technique].ShaderPasses : new();
+
+        /// <summary>True if the active pass has Hull+Domain shaders (requires patch topology).</summary>
+        public bool HasTessellation
+        {
+            get
+            {
+                var passes = GetPasses();
+                if (Pass < passes.Count)
+                    return passes[Pass].EffectPass.HullShader != null;
+                return false;
+            }
+        }
         
         /// <summary>
         /// Set active pass by RenderPass enum (Apex pattern)
@@ -227,6 +239,12 @@ namespace Freefall.Graphics
                 var psoDesc = psoDescBase;
                 psoDesc.VertexShader = currentPass.VertexShader?.Bytecode ?? default;
                 psoDesc.PixelShader = currentPass.PixelShader?.Bytecode ?? default;
+                psoDesc.HullShader = currentPass.HullShader?.Bytecode ?? default;
+                psoDesc.DomainShader = currentPass.DomainShader?.Bytecode ?? default;
+                
+                // Tessellation requires Patch topology type in PSO
+                if (currentPass.HullShader != null)
+                    psoDesc.PrimitiveTopologyType = PrimitiveTopologyType.Patch;
                 
                 // Shadow pass: depth-only rendering (0 RTVs, D32 DSV, depth write enabled)
                 // Use the parsed RenderPass enum instead of string comparison (Apex pattern)
@@ -254,6 +272,8 @@ namespace Freefall.Graphics
                 {
                     if (currentPass.VertexShader?.Reflection != null) CreateConstantBuffers(device, currentPass.VertexShader.Reflection);
                     if (currentPass.PixelShader?.Reflection != null) CreateConstantBuffers(device, currentPass.PixelShader.Reflection);
+                    if (currentPass.HullShader?.Reflection != null) CreateConstantBuffers(device, currentPass.HullShader.Reflection);
+                    if (currentPass.DomainShader?.Reflection != null) CreateConstantBuffers(device, currentPass.DomainShader.Reflection);
                 }
             }
             
@@ -290,11 +310,19 @@ namespace Freefall.Graphics
                         "SceneConstants" => 1,
                         "ObjectConstants" => 2,
                         "terrain" => 2,
+                        "landscape" => 2,
                         "tiling" => 3,
                         _ => -1 // Not bound automatically (e.g. PushConstants)
                     };
                     
                     _constantBuffers.Add(desc.Name, cb);
+                }
+                else
+                {
+                    // Merge variables from additional shader stages.
+                    // DXC optimizes out unused variables per-stage, so the DS may
+                    // reference cbuffer members (e.g., MaxHeight) that the VS doesn't.
+                    _constantBuffers[desc.Name].MergeVariables(buffer);
                 }
             }
 
@@ -611,17 +639,9 @@ namespace Freefall.Graphics
         public override int CopyToStaging(byte[] dest, int offset)
         {
             if (Value == null || Value.Length == 0) return 0;
-            int byteCount = Value.Length * System.Runtime.InteropServices.Marshal.SizeOf<T>();
-            var handle = System.Runtime.InteropServices.GCHandle.Alloc(Value, System.Runtime.InteropServices.GCHandleType.Pinned);
-            try
-            {
-                System.Runtime.InteropServices.Marshal.Copy(handle.AddrOfPinnedObject(), dest, offset, byteCount);
-            }
-            finally
-            {
-                handle.Free();
-            }
-            return byteCount;
+            var bytes = System.Runtime.InteropServices.MemoryMarshal.AsBytes(Value.AsSpan());
+            bytes.CopyTo(dest.AsSpan(offset));
+            return bytes.Length;
         }
     }
 

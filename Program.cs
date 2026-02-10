@@ -43,7 +43,7 @@ namespace Freefall
              var skyboxEntity = new Entity("Skybox");
              var skybox = skyboxEntity.AddComponent<SkyboxRenderer>();
              skybox.SunLight = light;
-             skybox.TimeOfDay = 0f; // Afternoon
+             skybox.TimeOfDay = 15f; // Afternoon
              skybox.AnimateTimeOfDay = false;
 
              // Player spawn position (beach spawn from GameTestScene)
@@ -51,9 +51,83 @@ namespace Freefall
              // castle spawn from GameTestScene
              playerSpawn = new Vector3(896, 164, 920);
 
-             // Camera setup will be done after terrain is created (needs terrain reference)
+             // === TERRAIN / LANDSCAPE — toggle here ===
+             IHeightProvider heightProvider = SpawnGPUTerrain();
+             //IHeightProvider heightProvider = SpawnTerrain();
+             //IHeightProvider heightProvider = SpawnLandscape();
+             
+             // Ensure all terrain textures are uploaded before first render
+             StreamingManager.Instance?.Flush();
 
-             // Terrain
+             // ===== PLAYER SETUP =====
+             // Load Paladin mesh (target mesh for animations)
+             var paladinMesh = Engine.Assets.Load<Mesh>(@"D:\Projects\2024\ProjectXYZ\Resources\Characters\Paladin\paladin_j_nordstrom.dae");
+             // Set root rotation to face correct direction (model is backwards)
+             paladinMesh.RootRotation = Matrix4x4.CreateRotationY(MathF.PI);
+             Debug.Log($"[Player] Loaded Paladin mesh with {paladinMesh.MeshParts.Count} parts, {paladinMesh.Bones?.Length ?? 0} bones");
+
+             // Load Knight mesh (source mesh for animations - animations are made for Knight)
+             var knightMesh = Engine.Assets.Load<Mesh>(@"D:\Projects\2024\ProjectXYZ\Resources\Characters\Knight\knight_d_pelegrini.dae");
+             Debug.Log($"[Player] Loaded Knight mesh with {knightMesh.MeshParts.Count} parts, {knightMesh.Bones?.Length ?? 0} bones");
+
+             // Retarget animations from Knight skeleton to Paladin skeleton
+             paladinMesh.BindPoseDifference(knightMesh);
+
+             // Set player spawn height from terrain
+             playerSpawn.Y = heightProvider.GetHeight(playerSpawn) + 0.1f;
+
+             // Create Player Entity
+             var playerEntity = new Entity("Player");
+             playerEntity.Transform.Position = playerSpawn;
+             playerEntity.Transform.Scale = Vector3.One; // Importer now handles cm to m conversion
+             
+             // Player mesh - Paladin model with SkinnedMeshRenderer
+             var playerRenderer = playerEntity.AddComponent<SkinnedMeshRenderer>();
+             playerRenderer.Mesh = paladinMesh;
+             playerRenderer.Enabled = true;  // DEBUG: Disabled to isolate tree flickering
+
+             // Load player texture
+             var paladinTexture = Engine.Assets.Load<Texture>(@"D:\Projects\2024\ProjectXYZ\Resources\Characters\Paladin\textures\Paladin_diffuse.png");
+             var paladinMat = new Material(new Effect("gbuffer_skinned")); // Use skinned shader for animated characters
+             paladinMat.SetTexture("Albedo", paladinTexture);
+             playerRenderer.Materials.Add(paladinMat);
+             
+             // Setup animations (creates Animator component with full state machine)
+             AnimationSetup.CreateBlendTreeAnimations(playerEntity, paladinMesh);
+             
+             // Player components
+             playerEntity.AddComponent<Player>();
+             var characterController = playerEntity.AddComponent<CharacterController>();
+             characterController.Terrain = heightProvider;
+             characterController.Height = 1.8f;
+
+             //SpawnLights(playerSpawn, heightProvider);
+             //SpawnTrees(heightProvider, playerSpawn, 16f, 5);
+             //SpawnCharacters(10, heightProvider, playerSpawn, paladinMesh, paladinTexture, paladinMat);
+             
+             // ===== CAMERA SETUP =====
+             var cameraEntity = new Entity("Camera");
+             var camera = cameraEntity.AddComponent<Camera>();
+             camera.FarPlane = 2048 * 8; // Match Apex
+             
+             // Third person camera following player
+             var thirdPersonCamera = cameraEntity.AddComponent<ThirdPersonCamera>();
+             thirdPersonCamera.Target = playerEntity;
+             thirdPersonCamera.Terrain = heightProvider;
+             thirdPersonCamera.Offset = Vector3.UnitY * 1.85f;
+
+             Camera.Main = camera;
+             
+             Input.IsMouseLocked = true;
+             
+             Debug.Log($"[Player] Created at {playerSpawn}");
+
+             // ===== SCENE LOADING =====
+             LoadScene(); // Disabled — per-resource copy path causes TDR during parallel loading. Re-enable after fixing.
+         }
+
+         private static IHeightProvider SpawnTerrain()
+         {
              string assetsPath = @"D:\Projects\2024\ProjectXYZ\Resources\";
              
              var terrainLayers = new List<Terrain.TextureLayer>
@@ -155,78 +229,241 @@ namespace Freefall
              terrainEntity.Transform.Position = new Vector3(842.0983f - 842.0983f, 85.85109f - 39.8f, 841.4021f - 839.8109f);
              
              Debug.Log("[Terrain] Entity created");
-             
-             // Ensure all terrain textures are uploaded before first render
-             StreamingManager.Instance?.Flush();
-
-             // ===== PLAYER SETUP =====
-             // Load Paladin mesh (target mesh for animations)
-             var paladinMesh = Engine.Assets.Load<Mesh>(@"D:\Projects\2024\ProjectXYZ\Resources\Characters\Paladin\paladin_j_nordstrom.dae");
-             // Set root rotation to face correct direction (model is backwards)
-             paladinMesh.RootRotation = Matrix4x4.CreateRotationY(MathF.PI);
-             Debug.Log($"[Player] Loaded Paladin mesh with {paladinMesh.MeshParts.Count} parts, {paladinMesh.Bones?.Length ?? 0} bones");
-
-             // Load Knight mesh (source mesh for animations - animations are made for Knight)
-             var knightMesh = Engine.Assets.Load<Mesh>(@"D:\Projects\2024\ProjectXYZ\Resources\Characters\Knight\knight_d_pelegrini.dae");
-             Debug.Log($"[Player] Loaded Knight mesh with {knightMesh.MeshParts.Count} parts, {knightMesh.Bones?.Length ?? 0} bones");
-
-             // Retarget animations from Knight skeleton to Paladin skeleton
-             paladinMesh.BindPoseDifference(knightMesh);
-
-             // Set player spawn height from terrain
-             playerSpawn.Y = terrain.GetHeight(playerSpawn) + 0.1f;
-
-             // Create Player Entity
-             var playerEntity = new Entity("Player");
-             playerEntity.Transform.Position = playerSpawn;
-             playerEntity.Transform.Scale = Vector3.One; // Importer now handles cm to m conversion
-             
-             // Player mesh - Paladin model with SkinnedMeshRenderer
-             var playerRenderer = playerEntity.AddComponent<SkinnedMeshRenderer>();
-             playerRenderer.Mesh = paladinMesh;
-             playerRenderer.Enabled = true;  // DEBUG: Disabled to isolate tree flickering
-
-             // Load player texture
-             var paladinTexture = Engine.Assets.Load<Texture>(@"D:\Projects\2024\ProjectXYZ\Resources\Characters\Paladin\textures\Paladin_diffuse.png");
-             var paladinMat = new Material(new Effect("gbuffer_skinned")); // Use skinned shader for animated characters
-             paladinMat.SetTexture("Albedo", paladinTexture);
-             playerRenderer.Materials.Add(paladinMat);
-             
-             // Setup animations (creates Animator component with full state machine)
-             AnimationSetup.CreateBlendTreeAnimations(playerEntity, paladinMesh);
-             
-             // Player components
-             playerEntity.AddComponent<Player>();
-             var characterController = playerEntity.AddComponent<CharacterController>();
-             characterController.Terrain = terrain;
-             characterController.Height = 1.8f;
-
-             //SpawnLights(playerSpawn, terrain);
-             //SpawnTrees(terrain, playerSpawn, 16f, 5);
-             //SpawnCharacters(10, terrain, playerSpawn, paladinMesh, paladinTexture, paladinMat);
-             
-             // ===== CAMERA SETUP =====
-             var cameraEntity = new Entity("Camera");
-             var camera = cameraEntity.AddComponent<Camera>();
-             camera.FarPlane = 2048 * 8; // Match Apex
-             
-             // Third person camera following player
-             var thirdPersonCamera = cameraEntity.AddComponent<ThirdPersonCamera>();
-             thirdPersonCamera.Target = playerEntity;
-             thirdPersonCamera.Terrain = terrain;
-             thirdPersonCamera.Offset = Vector3.UnitY * 1.85f;
-
-             Camera.Main = camera;
-             
-             Input.IsMouseLocked = true;
-             
-             Debug.Log($"[Player] Created at {playerSpawn}");
-
-             // ===== SCENE LOADING =====
-             LoadScene(); // Disabled — per-resource copy path causes TDR during parallel loading. Re-enable after fixing.
+             return terrain;
          }
 
-         private static void SpawnCharacters(int count, Terrain terrain, Vector3 center, Mesh mesh, Texture texture, Material material = null)
+         private static IHeightProvider SpawnGPUTerrain()
+         {
+             string assetsPath = @"D:\Projects\2024\ProjectXYZ\Resources\";
+             
+             var terrainLayers = new List<Terrain.TextureLayer>
+             {
+                 new Terrain.TextureLayer
+                 {
+                     Diffuse = new Texture(Engine.Device, assetsPath + "Terrain/Terrain Textures/Sand_01/Sand_01_Dif.png"),
+                     Normals = new Texture(Engine.Device, assetsPath + "Terrain/Terrain Textures/Sand_01/Sand_01_Nor.png"),
+                     Tiling = new Vector2(8, 8),
+                 },
+                 new Terrain.TextureLayer
+                 {
+                     Diffuse = new Texture(Engine.Device, assetsPath + "Terrain/Terrain Textures/RockWall_01/RockWall_Dif.png"),
+                     Normals = new Texture(Engine.Device, assetsPath + "Terrain/Terrain Textures/RockWall_01/Rock_01_Nor.png"),
+                     Tiling = new Vector2(7, 7),
+                 },
+                 new Terrain.TextureLayer
+                 {
+                     Diffuse = new Texture(Engine.Device, assetsPath + "Terrain/Terrain Textures/Dirt/Dirt_01_Dif.png"),
+                     Normals = new Texture(Engine.Device, assetsPath + "Terrain/Terrain Textures/Dirt/Dirt_01_Nor.png"),
+                     Tiling = new Vector2(4, 4),
+                 },
+                 new Terrain.TextureLayer
+                 {
+                     Diffuse = new Texture(Engine.Device, assetsPath + "Terrain/Terrain Textures/Sand_Dirt/Sand_Dirt.png"),
+                     Normals = new Texture(Engine.Device, assetsPath + "Terrain/Terrain Textures/Sand_Dirt/Sand_Dirt_Nor.png"),
+                     Tiling = new Vector2(20, 30),
+                 },
+                 new Terrain.TextureLayer
+                 {
+                     Diffuse = new Texture(Engine.Device, assetsPath + "Terrain/Terrain Textures/Sandstone/Sandstone_Dif.png"),
+                     Normals = new Texture(Engine.Device, assetsPath + "Terrain/Terrain Textures/Sandstone/Sandstone_Nor.png"),
+                     Tiling = new Vector2(10, 10),
+                 },
+                 new Terrain.TextureLayer
+                 {
+                     Diffuse = new Texture(Engine.Device, assetsPath + "Terrain/Terrain Textures/Gras_01/Gras_01_Dif.png"),
+                     Normals = new Texture(Engine.Device, assetsPath + "Terrain/Terrain Textures/Gras_01/Gras_01_Nor.png"),
+                     Tiling = new Vector2(4, 4),
+                 },
+                 new Terrain.TextureLayer
+                 {
+                     Diffuse = new Texture(Engine.Device, assetsPath + "Terrain/Terrain Textures/Sand_02/Sand_02_Dif.png"),
+                     Normals = new Texture(Engine.Device, assetsPath + "Terrain/Terrain Textures/Sand_02/Sand_02_Nor.png"),
+                     Tiling = new Vector2(10, 10),
+                 },
+                 new Terrain.TextureLayer
+                 {
+                     Diffuse = new Texture(Engine.Device, assetsPath + "Terrain/Terrain Textures/Leafs/Leafs_01_Dif.png"),
+                     Normals = new Texture(Engine.Device, assetsPath + "Terrain/Terrain Textures/Leafs/Leafs_01_Nor.png"),
+                     Tiling = new Vector2(3, 3),
+                 },
+                 new Terrain.TextureLayer
+                 {
+                     Diffuse = new Texture(Engine.Device, assetsPath + "Terrain/Terrain Textures/RockWall_01/RockWall_Dif.png"),
+                     Normals = new Texture(Engine.Device, assetsPath + "Terrain/Terrain Textures/RockWall_01/Rock_01_Nor.png"),
+                     Tiling = new Vector2(20, 15),
+                 },
+                 new Terrain.TextureLayer
+                 {
+                     Diffuse = new Texture(Engine.Device, assetsPath + "Terrain/Terrain Textures/Dirt/Dirt_02_Dif.png"),
+                     Normals = new Texture(Engine.Device, assetsPath + "Terrain/Terrain Textures/Dirt/Dirt_01_Nor.png"),
+                     Tiling = new Vector2(15, 15),
+                 },
+                 new Terrain.TextureLayer
+                 {
+                     Diffuse = new Texture(Engine.Device, assetsPath + "Terrain/Terrain Textures/Raw_Dirt/Raw_Dirt_Dif.png"),
+                     Normals = new Texture(Engine.Device, assetsPath + "Terrain/Terrain Textures/Raw_Dirt/Raw_Dirt_Nor.png"),
+                     Tiling = new Vector2(4, 4),
+                 },
+                 new Terrain.TextureLayer
+                 {
+                     Diffuse = new Texture(Engine.Device, assetsPath + "Terrain/Terrain Textures/Moos/Moss_01_Dif.png"),
+                     Normals = new Texture(Engine.Device, assetsPath + "Terrain/Terrain Textures/Moos/Moss_01_Nor.png"),
+                     Tiling = new Vector2(4, 4),
+                 },
+                 new Terrain.TextureLayer
+                 {
+                     Diffuse = new Texture(Engine.Device, assetsPath + "Terrain/Terrain Textures/RockWall_01/RockWall_Dif.png"),
+                     Normals = new Texture(Engine.Device, assetsPath + "Terrain/Terrain Textures/RockWall_01/Rock_01_Nor.png"),
+                     Tiling = new Vector2(200, 200),
+                 },
+             };
+
+             var heightmap = new Texture(Engine.Device, assetsPath + "terrain.dds");
+             var heightField = Texture.ReadHeightField(assetsPath + "terrain.dds");
+             var terrainMaterial = new Material(new Effect("gputerrain"));
+
+             var terrainEntity = new Entity("GPUTerrain");
+             var gpuTerrain = terrainEntity.AddComponent<GPUTerrain>();
+             gpuTerrain.Material = terrainMaterial;
+             gpuTerrain.TerrainSize = new Vector2(1700, 1700);
+             gpuTerrain.Heightmap = heightmap;
+             gpuTerrain.HeightField = heightField;
+             gpuTerrain.MaxHeight = 600;
+             gpuTerrain.Layers = terrainLayers;
+             gpuTerrain.DetailBalance = 2.0f;
+             gpuTerrain.MaxDepth = 7;
+
+             // Load splatmaps (same paths as Terrain.cs)
+             var splatPaths = new[] {
+                 "Resources/Terrain/Terrain_splatmap_0.dds",
+                 "Resources/Terrain/Terrain_splatmap_1.dds",
+                 "Resources/Terrain/Terrain_splatmap_2.dds",
+                 "Resources/Terrain/Terrain_splatmap_3.dds"
+             };
+             for (int i = 0; i < splatPaths.Length && i < gpuTerrain.ControlMaps.Length; i++)
+             {
+                 if (System.IO.File.Exists(splatPaths[i]))
+                     gpuTerrain.ControlMaps[i] = new Texture(Engine.Device, splatPaths[i]);
+                 else
+                     gpuTerrain.ControlMaps[i] = Texture.CreateFromData(Engine.Device, 1, 1, new byte[] {0,0,0,0});
+             }
+             
+             terrainEntity.Transform.Position = new Vector3(842.0983f - 842.0983f, 85.85109f - 39.8f, 841.4021f - 839.8109f);
+             
+             Debug.Log("[GPUTerrain] Entity created");
+             return gpuTerrain;
+         }
+
+         private static IHeightProvider SpawnLandscape()
+         {
+             string assetsPath = @"D:\Projects\2024\ProjectXYZ\Resources\";
+             
+             // Reuse same texture layers as Terrain
+             var layers = new List<Landscape.TextureLayer>
+             {
+                 new Landscape.TextureLayer
+                 {
+                     Diffuse = new Texture(Engine.Device, assetsPath + "Terrain/Terrain Textures/Sand_01/Sand_01_Dif.png"),
+                     Normals = new Texture(Engine.Device, assetsPath + "Terrain/Terrain Textures/Sand_01/Sand_01_Nor.png"),
+                     Tiling = new Vector2(8, 8),
+                 },
+                 new Landscape.TextureLayer
+                 {
+                     Diffuse = new Texture(Engine.Device, assetsPath + "Terrain/Terrain Textures/RockWall_01/RockWall_Dif.png"),
+                     Normals = new Texture(Engine.Device, assetsPath + "Terrain/Terrain Textures/RockWall_01/Rock_01_Nor.png"),
+                     Tiling = new Vector2(7, 7),
+                 },
+                 new Landscape.TextureLayer
+                 {
+                     Diffuse = new Texture(Engine.Device, assetsPath + "Terrain/Terrain Textures/Dirt/Dirt_01_Dif.png"),
+                     Normals = new Texture(Engine.Device, assetsPath + "Terrain/Terrain Textures/Dirt/Dirt_01_Nor.png"),
+                     Tiling = new Vector2(4, 4),
+                 },
+                 new Landscape.TextureLayer
+                 {
+                     Diffuse = new Texture(Engine.Device, assetsPath + "Terrain/Terrain Textures/Sand_Dirt/Sand_Dirt.png"),
+                     Normals = new Texture(Engine.Device, assetsPath + "Terrain/Terrain Textures/Sand_Dirt/Sand_Dirt_Nor.png"),
+                     Tiling = new Vector2(20, 30),
+                 },
+                 new Landscape.TextureLayer
+                 {
+                     Diffuse = new Texture(Engine.Device, assetsPath + "Terrain/Terrain Textures/Sandstone/Sandstone_Dif.png"),
+                     Normals = new Texture(Engine.Device, assetsPath + "Terrain/Terrain Textures/Sandstone/Sandstone_Nor.png"),
+                     Tiling = new Vector2(10, 10),
+                 },
+                 new Landscape.TextureLayer
+                 {
+                     Diffuse = new Texture(Engine.Device, assetsPath + "Terrain/Terrain Textures/Gras_01/Gras_01_Dif.png"),
+                     Normals = new Texture(Engine.Device, assetsPath + "Terrain/Terrain Textures/Gras_01/Gras_01_Nor.png"),
+                     Tiling = new Vector2(4, 4),
+                 },
+                 new Landscape.TextureLayer
+                 {
+                     Diffuse = new Texture(Engine.Device, assetsPath + "Terrain/Terrain Textures/Sand_02/Sand_02_Dif.png"),
+                     Normals = new Texture(Engine.Device, assetsPath + "Terrain/Terrain Textures/Sand_02/Sand_02_Nor.png"),
+                     Tiling = new Vector2(10, 10),
+                 },
+                 new Landscape.TextureLayer
+                 {
+                     Diffuse = new Texture(Engine.Device, assetsPath + "Terrain/Terrain Textures/Leafs/Leafs_01_Dif.png"),
+                     Normals = new Texture(Engine.Device, assetsPath + "Terrain/Terrain Textures/Leafs/Leafs_01_Nor.png"),
+                     Tiling = new Vector2(3, 3),
+                 },
+                 new Landscape.TextureLayer
+                 {
+                     Diffuse = new Texture(Engine.Device, assetsPath + "Terrain/Terrain Textures/RockWall_01/RockWall_Dif.png"),
+                     Normals = new Texture(Engine.Device, assetsPath + "Terrain/Terrain Textures/RockWall_01/Rock_01_Nor.png"),
+                     Tiling = new Vector2(20, 15),
+                 },
+                 new Landscape.TextureLayer
+                 {
+                     Diffuse = new Texture(Engine.Device, assetsPath + "Terrain/Terrain Textures/Dirt/Dirt_02_Dif.png"),
+                     Normals = new Texture(Engine.Device, assetsPath + "Terrain/Terrain Textures/Dirt/Dirt_01_Nor.png"),
+                     Tiling = new Vector2(15, 15),
+                 },
+                 new Landscape.TextureLayer
+                 {
+                     Diffuse = new Texture(Engine.Device, assetsPath + "Terrain/Terrain Textures/Raw_Dirt/Raw_Dirt_Dif.png"),
+                     Normals = new Texture(Engine.Device, assetsPath + "Terrain/Terrain Textures/Raw_Dirt/Raw_Dirt_Nor.png"),
+                     Tiling = new Vector2(4, 4),
+                 },
+                 new Landscape.TextureLayer
+                 {
+                     Diffuse = new Texture(Engine.Device, assetsPath + "Terrain/Terrain Textures/Moos/Moss_01_Dif.png"),
+                     Normals = new Texture(Engine.Device, assetsPath + "Terrain/Terrain Textures/Moos/Moss_01_Nor.png"),
+                     Tiling = new Vector2(4, 4),
+                 },
+                 new Landscape.TextureLayer
+                 {
+                     Diffuse = new Texture(Engine.Device, assetsPath + "Terrain/Terrain Textures/RockWall_01/RockWall_Dif.png"),
+                     Normals = new Texture(Engine.Device, assetsPath + "Terrain/Terrain Textures/RockWall_01/Rock_01_Nor.png"),
+                     Tiling = new Vector2(200, 200),
+                 },
+             };
+
+             var heightmap = new Texture(Engine.Device, assetsPath + "terrain.dds");
+             var heightField = Texture.ReadHeightField(assetsPath + "terrain.dds");
+             var landscapeMaterial = new Material(new Effect("landscape"));
+
+             var landscapeEntity = new Entity("Landscape");
+             var landscape = landscapeEntity.AddComponent<Landscape>();
+             landscape.Material = landscapeMaterial;
+             landscape.TerrainSize = new Vector2(1700, 1700);
+             landscape.Heightmap = heightmap;
+             landscape.HeightField = heightField;
+             landscape.MaxHeight = 600;
+             landscape.RingCount = 6;
+             landscape.GridResolution = 32;
+             landscape.Layers = layers;
+             
+             // Same position as terrain
+             landscapeEntity.Transform.Position = new Vector3(842.0983f - 842.0983f, 85.85109f - 39.8f, 841.4021f - 839.8109f);
+             
+             Debug.Log("[Landscape] Entity created");
+             return landscape;
+         }
+
+         private static void SpawnCharacters(int count, IHeightProvider terrain, Vector3 center, Mesh mesh, Texture texture, Material material = null)
          {
             // ===== SKINNED MESHES TEST =====
              // Spawn characters around the player (Render only, no Controller)
@@ -257,7 +494,7 @@ namespace Freefall
              Debug.Log($"[NPCs] Spawned {minionCount} minions");
          }
 
-         private static void SpawnLights(Vector3 center, Terrain terrain)
+         private static void SpawnLights(Vector3 center, IHeightProvider terrain)
          {
              // Test Point Lights — placed around player at terrain height + 5m
              float lightHeight = 5f;
@@ -289,7 +526,7 @@ namespace Freefall
              blueLight.Range = 30;
         }
 
-         private static void SpawnTrees(Terrain terrain, Vector3 center, float minSpacing, int variationCount)
+         private static void SpawnTrees(IHeightProvider terrain, Vector3 center, float minSpacing, int variationCount)
          {
             // ===== TREES (5 variations  100 instances = 500 total) =====
              // Test multi-draw batching: different meshes, same shader/PSO

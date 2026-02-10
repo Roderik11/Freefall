@@ -154,9 +154,9 @@ namespace Freefall.Graphics
 
 
 
-
         private int _drawCount = 0;
         private int _maxTransformSlot = 0;
+        internal bool _isGPUSourced = false;
         
         public InstanceBatch(BatchKey key, Material material)
         {
@@ -171,9 +171,77 @@ namespace Freefall.Graphics
             _uniqueMeshPartIds.Clear();
             SubBatchCount = 0;
             _maxTransformSlot = 0;
+            _isGPUSourced = false;
             foreach (var buf in _perInstanceBuffers.Values)
                 buf.Dirty = false;
         }
+
+        /// <summary>
+        /// Descriptor for a GPU-generated per-instance buffer channel.
+        /// </summary>
+        public struct GPUBufferBinding
+        {
+            public int ParamHash;
+            public int PushConstantSlot;
+            public int ElementStride;
+            public uint SrvIndex;
+        }
+
+        /// <summary>
+        /// Attach GPU-generated per-instance buffers (bypasses CPU staging/upload).
+        /// The provided SRV indices point at buffers filled by a compute shader.
+        /// descriptorsSRV/spheresSRV/subbatchIdsSRV are core culler infrastructure.
+        /// customBindings contains additional per-instance data channels (e.g. TerrainPatchData).
+        /// </summary>
+        public void AttachGPUData(
+            uint descriptorsSRV, uint spheresSRV, uint subbatchIdsSRV,
+            int instanceCount, int meshPartId,
+            ReadOnlySpan<GPUBufferBinding> customBindings = default)
+        {
+            _isGPUSourced = true;
+            _drawCount = instanceCount;
+            
+            // Ensure capacity is large enough for culler buffers
+            if (instanceCount > capacity)
+                ResizeBuffers(Math.Max(instanceCount, capacity * 2));
+            
+            // Register the mesh part so MeshRegistry has it
+            _uniqueMeshPartIds.Add(meshPartId);
+            SubBatchCount = _uniqueMeshPartIds.Count;
+            
+            int frameIndex = Engine.FrameIndex % FrameCount;
+            
+            // Core culler infrastructure buffers
+            EnsureGPUPerInstanceBuffer(DrawBucket.DescriptorsHash, -1, 12, 1, frameIndex, descriptorsSRV);
+            EnsureGPUPerInstanceBuffer(DrawBucket.BoundingSpheresHash, -1, 16, 1, frameIndex, spheresSRV);
+            EnsureGPUPerInstanceBuffer(DrawBucket.SubbatchIdsHash, -1, 4, 1, frameIndex, subbatchIdsSRV);
+            
+            // Custom per-instance data channels (caller provides hash, slot, stride)
+            foreach (ref readonly var binding in customBindings)
+            {
+                EnsureGPUPerInstanceBuffer(binding.ParamHash, binding.PushConstantSlot,
+                    binding.ElementStride, 1, frameIndex, binding.SrvIndex);
+            }
+        }
+
+        private void EnsureGPUPerInstanceBuffer(int hash, int pushConstantSlot, int elementStride, int elementsPerInstance, int frameIndex, uint srvIndex)
+        {
+            if (!_perInstanceBuffers.TryGetValue(hash, out var pib))
+            {
+                pib = new PerInstanceBuffer
+                {
+                    ParamHash = hash,
+                    PushConstantSlot = pushConstantSlot,
+                    ElementStride = elementStride,
+                    ElementsPerInstance = elementsPerInstance,
+                };
+                _perInstanceBuffers[hash] = pib;
+            }
+            // Override the SRV index for this frame with the GPU-generated buffer
+            pib.SRVIndices[frameIndex] = srvIndex;
+            pib.Dirty = false; // Don't upload CPU data
+        }
+
 
         public void MergeFromBucket(DrawBucket bucket)
         {
@@ -271,7 +339,7 @@ namespace Freefall.Graphics
 
         public void UploadInstanceData(GraphicsDevice device)
         {
-            if (_drawCount == 0) return;
+            if (_drawCount == 0 || _isGPUSourced) return;
             int frameIndex = Engine.FrameIndex % FrameCount;
 
             // All per-instance data (descriptors, bounding spheres, subbatch IDs,
@@ -343,7 +411,8 @@ namespace Freefall.Graphics
             if (count == 0) return;
 
             MeshRegistry.Upload(device);
-            SubBatchCount = MeshRegistry.Count;
+            if (!_isGPUSourced)
+                SubBatchCount = MeshRegistry.Count;
         }
 
         #region GPU Culler
@@ -495,35 +564,45 @@ namespace Freefall.Graphics
                 histogramCPUHandles[frameIndex],
                 histogramBuffers[frameIndex],
                 new Vortice.Mathematics.Int4(0, 0, 0, 0));
-            
 
-            
-            commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(null)));
+            // Barrier after clears: only the 3 cleared buffers need sync
+            commandList.ResourceBarrier(new[] {
+                new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(counterBuffers[frameIndex])),
+                new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(visibleIndicesBuffers[frameIndex])),
+                new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(histogramBuffers[frameIndex]))
+            });
 
-            // Pass 1: CSVisibility
+            // Pass 1: CSVisibility — writes visibilityFlags
             commandList.SetPipelineState(culler.VisibilityPSO);
             commandList.Dispatch((uint)((totalInstances + 255) / 256), 1, 1);
-            commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(null)));
+            // Only visibilityFlags was written; next pass (Histogram) reads it
+            commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(visibilityFlagsBuffers[frameIndex])));
 
-            // Pass 2: CSHistogram
+            // Pass 2: CSHistogram — reads visibilityFlags, writes histogram
             commandList.SetPipelineState(culler.HistogramPSO);
             commandList.Dispatch((uint)((totalInstances + 63) / 64), 1, 1);
-            commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(null)));
+            // Only histogram was written; next pass (PrefixSum) reads it
+            commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(histogramBuffers[frameIndex])));
 
-            // Pass 3: CSHistogramPrefixSum
+            // Pass 3: CSHistogramPrefixSum — reads histogram, writes counters
             commandList.SetPipelineState(culler.HistogramPrefixSumPSO);
             commandList.Dispatch(1, 1, 1);
-            commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(null)));
+            // Only counters was written; next pass (Scatter) reads it
+            commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(counterBuffers[frameIndex])));
 
-            // Pass 4: CSGlobalScatter
+            // Pass 4: CSGlobalScatter — reads visibilityFlags+counters, writes visibleIndices+counters
             commandList.SetPipelineState(culler.GlobalScatterPSO);
             commandList.Dispatch((uint)((totalInstances + 255) / 256), 1, 1);
-            commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(null)));
+            // visibleIndices and counters were written; next pass (CSMain) reads both
+            commandList.ResourceBarrier(new[] {
+                new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(visibleIndicesBuffers[frameIndex])),
+                new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(counterBuffers[frameIndex]))
+            });
 
-            // Pass 5: CSMain
+            // Pass 5: CSMain — reads histogram+counters, writes commands
             commandList.SetPipelineState(culler.MainPSO);
             commandList.Dispatch((uint)((MeshRegistry.Count + 63) / 64), 1, 1);
-            commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(null)));
+            // Commands buffer transitions to IndirectArgument in Draw(), no UAV barrier needed here
         }
 
         private void InitializeShadowCullerResources()
@@ -684,41 +763,170 @@ namespace Freefall.Graphics
                 shadowHistogramCPUHandles[frameIndex, cascadeIndex],
                 shadowHistogramBuffers[frameIndex, cascadeIndex],
                 new Vortice.Mathematics.Int4(0, 0, 0, 0));
-            
 
-            
-            commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(null)));
+            // Barrier after clears: only the 3 cleared buffers need sync
+            commandList.ResourceBarrier(new[] {
+                new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(shadowCounterBuffers[frameIndex, cascadeIndex])),
+                new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(shadowVisibleIndicesBuffers[frameIndex, cascadeIndex])),
+                new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(shadowHistogramBuffers[frameIndex, cascadeIndex]))
+            });
 
-            // Pass 1: CSVisibilityShadow (uses shadow cascade frustum)
+            // Pass 1: CSVisibilityShadow — writes visibilityFlags
             commandList.SetPipelineState(culler.VisibilityShadowPSO);
             commandList.Dispatch((uint)((totalInstances + 255) / 256), 1, 1);
-            commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(null)));
+            // Only visibilityFlags was written; next pass (Histogram) reads it
+            commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(shadowVisibilityBuffers[frameIndex, cascadeIndex])));
 
-            // Pass 2: CSHistogram  
+            // Pass 2: CSHistogram — reads visibilityFlags, writes histogram
             commandList.SetPipelineState(culler.HistogramPSO);
             commandList.Dispatch((uint)((totalInstances + 63) / 64), 1, 1);
-            commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(null)));
+            // Only histogram was written; next pass (PrefixSum) reads it
+            commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(shadowHistogramBuffers[frameIndex, cascadeIndex])));
 
-            // Pass 3: CSHistogramPrefixSum
+            // Pass 3: CSHistogramPrefixSum — reads histogram, writes counters
             commandList.SetPipelineState(culler.HistogramPrefixSumPSO);
             commandList.Dispatch(1, 1, 1);
-            commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(null)));
+            // Only counters was written; next pass (Scatter) reads it
+            commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(shadowCounterBuffers[frameIndex, cascadeIndex])));
 
-            // Pass 4: CSGlobalScatter
+            // Pass 4: CSGlobalScatter — reads visibilityFlags+counters, writes visibleIndices+counters
             commandList.SetPipelineState(culler.GlobalScatterPSO);
             commandList.Dispatch((uint)((totalInstances + 255) / 256), 1, 1);
-            commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(null)));
+            // visibleIndices and counters were written; next pass (CSMain) reads both
+            commandList.ResourceBarrier(new[] {
+                new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(shadowVisibleIndicesBuffers[frameIndex, cascadeIndex])),
+                new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(shadowCounterBuffers[frameIndex, cascadeIndex]))
+            });
 
-            // Pass 5: CSMain (generate commands)
+            // Pass 5: CSMain — reads histogram+counters, writes commands
             commandList.SetPipelineState(culler.MainPSO);
             commandList.Dispatch((uint)((MeshRegistry.Count + 63) / 64), 1, 1);
-            commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(null)));
+            // Commands buffer transitions to IndirectArgument in DrawShadow(), no UAV barrier needed here
         }
 
         /// <summary>
-        /// Draw shadow cascade using GPU-driven indirect commands.
-        /// Uses a dedicated shadow SceneConstants CBV to avoid overwriting the opaque pass's CBV.
+        /// Cull all 4 shadow cascades using a unified visibility pass.
+        /// CSVisibilityShadow4 tests all 4 cascade frustums per instance in one dispatch,
+        /// then runs Histogram→PrefixSum→Scatter→Main per cascade.
+        /// Saves 3 visibility dispatches + 3 barriers vs calling CullShadow() 4 times.
         /// </summary>
+        public void CullShadowAll(ID3D12GraphicsCommandList commandList, ulong shadowCascadeBufferAddress, GPUCuller? culler)
+        {
+            if (SubBatchCount == 0) return;
+            if (culler?.VisibilityShadow4PSO == null || culler?.MainPSO == null || culler?.HistogramPSO == null) return;
+
+            InitializeShadowCullerResources();
+
+            int frameIndex = Engine.FrameIndex % FrameCount;
+            var device = Engine.Device;
+            int totalInstances = _drawCount;
+
+            // Set shared compute state ONCE (not 4×)
+            commandList.SetComputeRootSignature(device.GlobalRootSignature);
+            _cachedSrvHeapArray ??= new[] { device.SrvHeap };
+            commandList.SetDescriptorHeaps(1, _cachedSrvHeapArray);
+            
+            // Bind shadow cascade planes cbuffer (slot 2 -> register b1)
+            commandList.SetComputeRootConstantBufferView(2, shadowCascadeBufferAddress);
+
+            // Set push constants shared across all passes
+            commandList.SetComputeRoot32BitConstant(0, MeshRegistry.SrvIndex, 0);
+            commandList.SetComputeRoot32BitConstant(0, TransformBuffer.Instance?.SrvIndex ?? 0, 10);
+            commandList.SetComputeRoot32BitConstant(0, (uint)totalInstances, 13);
+            commandList.SetComputeRoot32BitConstant(0, Material.MaterialsBufferIndex, 25);
+            commandList.SetComputeRoot32BitConstant(0, (uint)MeshRegistry.Count, 27);
+            commandList.SetComputeRoot32BitConstant(0, (uint)SubBatchCount, 7);
+
+            // Bind per-instance buffer SRV indices (shared across all cascades)
+            foreach (var (hash, pib) in _perInstanceBuffers)
+            {
+                if (!ComputeSlots.TryGetValue(hash, out int computeSlot)) continue;
+                uint srvIdx = pib.SRVIndices[frameIndex];
+                commandList.SetComputeRoot32BitConstant(0, srvIdx, (uint)computeSlot);
+            }
+
+            // === PHASE 1: Unified visibility pass (all 4 cascades in one dispatch) ===
+
+            // Set the 4 cascade visibility UAV indices via push constants
+            commandList.SetComputeRoot32BitConstant(0, shadowVisibilityUAVIndices[frameIndex, 0], 24); // ShadowVisFlags0Idx
+            commandList.SetComputeRoot32BitConstant(0, shadowVisibilityUAVIndices[frameIndex, 1], 28); // ShadowVisFlags1Idx
+            commandList.SetComputeRoot32BitConstant(0, shadowVisibilityUAVIndices[frameIndex, 2], 29); // ShadowVisFlags2Idx
+            commandList.SetComputeRoot32BitConstant(0, shadowVisibilityUAVIndices[frameIndex, 3], 31); // ShadowVisFlags3Idx
+
+            // Dispatch CSVisibilityShadow4 — tests all 4 frustums per instance
+            commandList.SetPipelineState(culler.VisibilityShadow4PSO);
+            commandList.Dispatch((uint)((totalInstances + 255) / 256), 1, 1);
+
+            // Barrier on all 4 visibility buffers before histogram reads them
+            commandList.ResourceBarrier(new[] {
+                new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(shadowVisibilityBuffers[frameIndex, 0])),
+                new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(shadowVisibilityBuffers[frameIndex, 1])),
+                new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(shadowVisibilityBuffers[frameIndex, 2])),
+                new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(shadowVisibilityBuffers[frameIndex, 3]))
+            });
+
+            // === PHASE 2: Per-cascade Histogram → PrefixSum → Scatter → Main ===
+            for (int c = 0; c < ShadowCascadeCount; c++)
+            {
+                // Clear per-cascade buffers
+                commandList.ClearUnorderedAccessViewUint(
+                    device.GetGpuHandle(shadowCounterUAVIndices[frameIndex, c]),
+                    shadowCounterCPUHandles[frameIndex, c],
+                    shadowCounterBuffers[frameIndex, c],
+                    new Vortice.Mathematics.Int4(0, 0, 0, 0));
+                
+                commandList.ClearUnorderedAccessViewUint(
+                    device.GetGpuHandle(shadowVisibleIndicesUAVIndices[frameIndex, c]),
+                    shadowVisibleIndicesCPUHandles[frameIndex, c],
+                    shadowVisibleIndicesBuffers[frameIndex, c],
+                    new Vortice.Mathematics.Int4(unchecked((int)0xFFFFFFFF), unchecked((int)0xFFFFFFFF), unchecked((int)0xFFFFFFFF), unchecked((int)0xFFFFFFFF)));
+                
+                commandList.ClearUnorderedAccessViewUint(
+                    device.GetGpuHandle(shadowHistogramUAVIndices[frameIndex, c]),
+                    shadowHistogramCPUHandles[frameIndex, c],
+                    shadowHistogramBuffers[frameIndex, c],
+                    new Vortice.Mathematics.Int4(0, 0, 0, 0));
+
+                // Barrier after clears
+                commandList.ResourceBarrier(new[] {
+                    new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(shadowCounterBuffers[frameIndex, c])),
+                    new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(shadowVisibleIndicesBuffers[frameIndex, c])),
+                    new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(shadowHistogramBuffers[frameIndex, c]))
+                });
+
+                // Rebind per-cascade buffer indices
+                commandList.SetComputeRoot32BitConstant(0, shadowCommandUAVIndices[frameIndex, c], 1);
+                commandList.SetComputeRoot32BitConstant(0, shadowVisibleIndicesUAVIndices[frameIndex, c], 5);
+                commandList.SetComputeRoot32BitConstant(0, shadowCounterUAVIndices[frameIndex, c], 6);
+                commandList.SetComputeRoot32BitConstant(0, shadowVisibleIndicesSRVIndices[frameIndex, c], 9);
+                commandList.SetComputeRoot32BitConstant(0, shadowVisibilityUAVIndices[frameIndex, c], 11); // VisibilityFlagsIdx
+                commandList.SetComputeRoot32BitConstant(0, shadowHistogramUAVIndices[frameIndex, c], 26);
+
+                // CSHistogram — reads visibilityFlags (already written by CSVisibilityShadow4)
+                commandList.SetPipelineState(culler.HistogramPSO);
+                commandList.Dispatch((uint)((totalInstances + 63) / 64), 1, 1);
+                commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(shadowHistogramBuffers[frameIndex, c])));
+
+                // CSHistogramPrefixSum
+                commandList.SetPipelineState(culler.HistogramPrefixSumPSO);
+                commandList.Dispatch(1, 1, 1);
+                commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(shadowCounterBuffers[frameIndex, c])));
+
+                // CSGlobalScatter
+                commandList.SetPipelineState(culler.GlobalScatterPSO);
+                commandList.Dispatch((uint)((totalInstances + 255) / 256), 1, 1);
+                commandList.ResourceBarrier(new[] {
+                    new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(shadowVisibleIndicesBuffers[frameIndex, c])),
+                    new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(shadowCounterBuffers[frameIndex, c]))
+                });
+
+                // CSMain — generate indirect commands
+                commandList.SetPipelineState(culler.MainPSO);
+                commandList.Dispatch((uint)((MeshRegistry.Count + 63) / 64), 1, 1);
+            }
+        }
+
+
         public void DrawShadow(ID3D12GraphicsCommandList commandList, int cascadeIndex, ulong shadowSceneCBVAddress)
         {
             int frameIndex = Engine.FrameIndex % FrameCount;
@@ -804,9 +1012,7 @@ namespace Freefall.Graphics
             int frameIndex = Engine.FrameIndex % FrameCount;
             if (SubBatchCount == 0) return;
             
-            if (Engine.FrameIndex % 60 == 0)
-                Debug.Log($"[Batch.Draw] Effect={Material?.Effect?.Name ?? "null"} DrawCount={_drawCount} SubBatches={SubBatchCount} Desc0={(_drawCount > 0 ? $"slot={_draws[0].TransformSlot},mat={_draws[0].MaterialId}" : "N/A")}");
-
+            
             var commandBuffer = gpuCommandBuffers[frameIndex];
             if (commandBuffer == null) return;
 

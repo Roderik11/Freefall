@@ -109,7 +109,10 @@ namespace Freefall
                     string vsyncStatus = Settings.VSync ? "ON" : "OFF";
                     string hizStatus = Settings.DisableHiZ ? "OFF" : "ON";
                     int occluded = CommandBuffer.Culler?.LastHiZOccludedCount ?? 0;
-                    _window.SetTitle($"{baseTitle} | FPS: {Time.FPS:0} | Draw: {CommandBuffer.LastDrawCallCount} | Batches: {CommandBuffer.LastBatchCount} | HiZ: {hizStatus} Occl: {occluded}");
+                    string computeInfo = Components.GPUTerrain.ComputeReady 
+                        ? $"GPUPatch: {Components.GPUTerrain.LastGPUPatchCount}" 
+                        : $"ComputeERR: {Components.GPUTerrain.ComputeError}";
+                    _window.SetTitle($"{baseTitle} | FPS: {Time.FPS:0} | Draw: {CommandBuffer.LastDrawCallCount} | Batches: {CommandBuffer.LastBatchCount} | HiZ: {hizStatus} Occl: {occluded} | {computeInfo}");
                     titleUpdateTimer = 0;
                 }
                 

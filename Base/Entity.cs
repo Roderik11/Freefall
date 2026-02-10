@@ -138,16 +138,24 @@ namespace Freefall.Base
 
         public void Draw()
         {
-            // Take snapshot for thread safety
-            T[] snapshot;
-            lock (_lock) { snapshot = List.ToArray(); }
+            if (!HasDraw) return;
             
-            if (HasDraw)
+            // Snapshot count under lock — list only grows, no mid-Draw removals,
+            // so index-based iteration is safe without copying the entire array.
+            int count;
+            lock (_lock) { count = List.Count; }
+            
+            if (IsParallel)
             {
-                if (IsParallel)
-                    Parallel.ForEach(snapshot, comp => ((IDraw)comp).Draw());
-                else
-                    foreach (var comp in snapshot) ((IDraw)comp).Draw();
+                // Parallel path still needs snapshot for safe partitioning
+                T[] snapshot;
+                lock (_lock) { snapshot = List.ToArray(); }
+                Parallel.ForEach(snapshot, comp => ((IDraw)comp).Draw());
+            }
+            else
+            {
+                for (int i = 0; i < count; i++)
+                    ((IDraw)List[i]).Draw();
             }
         }
 

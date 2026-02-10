@@ -31,7 +31,7 @@ namespace Freefall.Scripts
         private const float FallingTimeThreshold = 0.5f;
 
         // Terrain reference for height sampling
-        public Terrain Terrain;
+        public IHeightProvider Terrain;
         private float groundOffset = 0.05f;
         
         // Movement state

@@ -92,6 +92,27 @@ namespace Freefall.Graphics
             _parameters[name.GetHashCode()] = 0;
         }
 
+        /// <summary>
+        /// Merge variable offsets from another shader stage's reflection of the same cbuffer.
+        /// DXC optimizes out unused variables per-stage, so a variable used only in the DS
+        /// won't appear in the VS reflection. This ensures all stages' variables are registered.
+        /// </summary>
+        public void MergeVariables(ID3D12ShaderReflectionConstantBuffer reflectionBuffer)
+        {
+            var desc = reflectionBuffer.Description;
+            for (uint i = 0; i < desc.VariableCount; i++)
+            {
+                var variable = reflectionBuffer.GetVariableByIndex(i);
+                var variableDesc = variable.Description;
+                int hash = variableDesc.Name.GetHashCode();
+                if (!_parameters.ContainsKey(hash))
+                {
+                    _parameters[hash] = (int)variableDesc.StartOffset;
+                    Debug.Log($"[CBMerge] {Name}: merged var='{variableDesc.Name}' offset={variableDesc.StartOffset} from additional stage");
+                }
+            }
+        }
+
         public void SetParameter<T>(string name, T value) where T : unmanaged
         {
              SetParameter(name.GetHashCode(), value);

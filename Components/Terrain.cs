@@ -8,7 +8,7 @@ using Freefall.Base;
 
 namespace Freefall.Components
 {
-    public class Terrain : Freefall.Base.Component, IUpdate, IDraw
+    public class Terrain : Freefall.Base.Component, IUpdate, IDraw, IHeightProvider
     {
         public static bool Wireframe { get; set; } = false;
         
@@ -19,12 +19,7 @@ namespace Freefall.Components
             public Vector2 Tiling = Vector2.One;
         }
 
-        public enum PatchType
-        {
-            Default,
-            N, E, S, W,
-            NE, NW, SE, SW
-        }
+        // PatchType enum is now in Freefall.Graphics namespace (shared with Landscape)
 
         public class NodePayload
         {
