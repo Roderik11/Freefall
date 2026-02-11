@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="Freefall.Engine/Freefall.Engine.csproj" />
+  <Project Path="Freefall.Game/Freefall.Game.csproj" />
+</Solution>

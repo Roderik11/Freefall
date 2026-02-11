@@ -17,9 +17,12 @@ debug_shader.fx
 
 # Binary resources (textures, terrain data)
 *.dds
-!Resources/default_*.dds
+!Freefall.Engine/Resources/default_*.dds
 *.png
-Resources/Terrain/
+Freefall.Engine/Resources/Terrain/
+
+# Game project (excluded for now)
+Freefall.Game/
 
 # Antigravity agent
 .agent/
