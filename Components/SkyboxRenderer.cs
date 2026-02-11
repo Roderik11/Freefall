@@ -64,8 +64,9 @@ namespace Freefall.Components
                 if (TimeOfDay >= 24.0f) TimeOfDay -= 24.0f;
                 if (TimeOfDay < 0.0f) TimeOfDay += 24.0f;
 
-                CloudTime += (float)Time.Delta;
             }
+
+            CloudTime += (float)Time.Delta;
 
             // Update sun light
             if (UseProceduralSky && ControlSunLight && SunLight != null)

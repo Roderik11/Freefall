@@ -336,7 +336,7 @@ FragmentOutput PS_Procedural(VertexOutput input)
 
     output.Albedo = float4(skyColor, 1);
     output.Normal = float4(0, 1, 0, 1);
-    output.Data = float4(0, 0, 0, 1);
+    output.Data = float4(0, 0, 0, 0);
     output.Depth = float4(0, 0, 0, 0);
     output.fDepth = 1;
 

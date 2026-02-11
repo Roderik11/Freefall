@@ -301,6 +301,7 @@ namespace Freefall.Graphics
              var block = new MaterialBlock();
              block.SetTexture("AlbedoTex", Albedo);
              block.SetTexture("LightTex", LightBuffer);
+             block.SetTexture("DataTex", Data);
              
              DrawFullscreenQuad(list, matCompose, block);
              
