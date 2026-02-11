@@ -8,6 +8,8 @@ using Freefall.Assets;
 using Freefall.Graphics;
 using Freefall.Base;
 using Freefall.Components;
+using Vortice.XAudio2;
+using Vortice.Multimedia;
 
 namespace Freefall
 {
@@ -21,6 +23,10 @@ namespace Freefall
         public static GraphicsDevice Device { get; private set; }
         public static EngineSettings Settings { get; private set; }
         public static string RootDirectory { get; private set; }
+
+        public static IXAudio2 AudioDevice { get; private set; }
+        public static X3DAudio Audio3D { get; private set; }
+        private static IXAudio2MasteringVoice _masteringVoice;
         
         public static int TickCount { get; private set; }
         
@@ -83,9 +89,11 @@ namespace Freefall
             
             Input.Init(_window.Handle);
             
-            // Initialize Subsystems
-            // Audio.Initialize(Device); // Stub
-            // Physics.Initialize(); // Stub
+            // Initialize Audio
+            AudioDevice = XAudio2.XAudio2Create(ProcessorSpecifier.DefaultProcessor, true);
+            _masteringVoice = AudioDevice.CreateMasteringVoice();
+            Audio3D = new X3DAudio(Speakers.FrontLeft | Speakers.FrontRight);
+            Debug.Log("[Engine] XAudio2 + X3DAudio initialized");
         }
 
         public static void Run()
@@ -262,6 +270,8 @@ namespace Freefall
             StreamingManager.Instance?.Dispose();
             RenderView?.Dispose();
             Assets?.Dispose();
+            _masteringVoice?.Dispose();
+            AudioDevice?.Dispose();
             Device?.Dispose();
             _window?.Dispose();
         }

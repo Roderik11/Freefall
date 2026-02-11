@@ -58,7 +58,7 @@ namespace Freefall.Animation
 
                 if (timeElapsed > Clip.DurationSeconds)
                 {
-                    timeElapsed = 0;
+                    timeElapsed %= Clip.DurationSeconds;
                     ResetEvents();
                 }
             }

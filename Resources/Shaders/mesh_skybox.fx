@@ -331,8 +331,19 @@ FragmentOutput PS_Procedural(VertexOutput input)
     skyColor += float3(1.0, 0.9, 0.7) * sun;
 
     float clouds = GetClouds(viewDir);
-    float3 cloudColor = GetSkyColor(viewDir, sunDir) * 1.2 + 0.1;
-    skyColor = lerp(skyColor, cloudColor, clouds * 0.82);
+
+    // Bright white cloud base, tinted by sun/sky light
+    float sunDot = saturate(dot(viewDir, sunDir));
+    float3 cloudLit = float3(1.0, 0.98, 0.95);               // sunlit side
+    float3 cloudShaded = float3(0.7, 0.75, 0.85);             // shaded/ambient side
+    float3 cloudColor = lerp(cloudShaded, cloudLit, sunDot * 0.5 + 0.5);
+
+    // Sunset tint on clouds
+    float sunElevation = sunDir.y;
+    float sunsetAmount = saturate(1.0 - abs((sunElevation - (-0.025)) / 0.175));
+    cloudColor = lerp(cloudColor, float3(1.0, 0.7, 0.4), sunsetAmount * 0.5);
+
+    skyColor = lerp(skyColor, cloudColor, clouds * 0.95);
 
     output.Albedo = float4(skyColor, 1);
     output.Normal = float4(0, 1, 0, 1);

@@ -337,7 +337,7 @@ FragmentOutput PS(VertexOutput input)
 
     output.Albedo = color;
     output.Normals = float4(terrainNormal.xyz, 1); 
-    output.Data = float4(0, 1, 0, 0);
+    output.Data = float4(0, 1, 0, 1);
     output.Depth = input.Depth;
 
     return output;

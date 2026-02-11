@@ -27,6 +27,7 @@ namespace Freefall.Loaders
             public List<SceneObject> Objects { get; set; } = new List<SceneObject>();
             public List<SceneObject> Trees { get; set; } = new List<SceneObject>();
             public List<SceneLight> Lights { get; set; } = new List<SceneLight>();
+            public List<SceneAudioSource> AudioSources { get; set; } = new List<SceneAudioSource>();
         }
 
         [Serializable]
@@ -37,6 +38,22 @@ namespace Freefall.Loaders
             public string Color { get; set; } = "1;1;1";
             public float Intensity { get; set; } = 1;
             public float Range { get; set; } = 10;
+        }
+
+        [Serializable]
+        public class SceneAudioSource
+        {
+            public string Name { get; set; } = "AudioSource";
+            public string Position { get; set; } = "";
+            public string Rotation { get; set; } = "";
+            public string Scale { get; set; } = "";
+            public string ClipName { get; set; } = "";
+            public float Volume { get; set; } = 1;
+            public float Pitch { get; set; } = 1;
+            public float MinDistance { get; set; } = 0;
+            public float MaxDistance { get; set; } = 10;
+            public bool Loop { get; set; }
+            public bool PlayOnAwake { get; set; } = true;
         }
 
         [Serializable]
@@ -119,6 +136,32 @@ namespace Freefall.Loaders
                     pointLight.Intensity = light.Intensity;
                     pointLight.Range = light.Range;
                 }
+            }
+
+            // Load Audio Sources
+            foreach (var audio in scene.AudioSources)
+            {
+                if (string.IsNullOrEmpty(audio.ClipName)) continue;
+
+                var clipPath = Path.Combine(assetsDirectory, "Sounds", audio.ClipName + ".wav");
+                if (!File.Exists(clipPath))
+                {
+                    Debug.Log($"[SceneLoader] Audio clip not found: {clipPath}");
+                    continue;
+                }
+
+                var entity = new Entity(audio.Name);
+                entity.Transform.Position = StringToVector3(audio.Position);
+
+                var src = entity.AddComponent<AudioSource>();
+                src.AudioClip = Engine.Assets.Load<AudioClip>(clipPath);
+                src.Volume = audio.Volume;
+                src.Range = audio.MaxDistance;
+                src.MinDistance = audio.MinDistance;
+                src.Loop = audio.Loop;
+                src.PlayOnAwake = audio.PlayOnAwake;
+
+                Debug.Log($"[SceneLoader] Audio: {audio.Name} clip={audio.ClipName} pos={audio.Position} range={audio.MaxDistance}");
             }
 
             // Load Trees
@@ -212,7 +255,7 @@ namespace Freefall.Loaders
             {
                 var parallelOptions = new ParallelOptions
                 {
-                    MaxDegreeOfParallelism = Environment.ProcessorCount,
+                    MaxDegreeOfParallelism = Environment.ProcessorCount / 2,
                     CancellationToken = cancellationToken
                 };
 
@@ -284,7 +327,6 @@ namespace Freefall.Loaders
             foreach (var entry in parsedEntries)
             {
                 cancellationToken.ThrowIfCancellationRequested();
-
                 // Dispatch to main thread to Create Commited Resources + Entities
                 // Since we use CreateAsync, this will be very fast
                 var task = Engine.RunOnMainThreadAsync(() =>
@@ -393,7 +435,38 @@ namespace Freefall.Loaders
                 }
             }
 
-            progress?.Report($"Done — {created} entities, {lightCount} lights in scene.");
+            // Load Audio Sources
+            int audioCount = 0;
+            foreach (var audio in scene.AudioSources)
+            {
+                if (string.IsNullOrEmpty(audio.ClipName)) continue;
+
+                var clipPath = Path.Combine(assetsDirectory, "Sounds", audio.ClipName + ".wav");
+                if (!File.Exists(clipPath))
+                {
+                    Debug.Log($"[SceneLoader] Audio clip not found: {clipPath}");
+                    continue;
+                }
+
+                await Engine.RunOnMainThreadAsync(() =>
+                {
+                    var entity = new Entity(audio.Name);
+                    entity.Transform.Position = StringToVector3(audio.Position);
+
+                    var src = entity.AddComponent<AudioSource>();
+                    src.AudioClip = Engine.Assets.Load<AudioClip>(clipPath);
+                    src.Volume = audio.Volume;
+                    src.Range = audio.MaxDistance;
+                    src.MinDistance = audio.MinDistance;
+                    src.Loop = audio.Loop;
+                    src.PlayOnAwake = audio.PlayOnAwake;
+
+                    Debug.Log($"[SceneLoader] Audio: {audio.Name} clip={audio.ClipName} range={audio.MaxDistance}");
+                });
+                audioCount++;
+            }
+
+            progress?.Report($"Done — {created} entities, {lightCount} lights, {audioCount} audio sources in scene.");
         }
 
         private StaticMesh CreateStaticMesh(Mesh mesh, string meshPath, bool tree = false)

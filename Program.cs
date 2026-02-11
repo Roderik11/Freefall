@@ -100,12 +100,34 @@ namespace Freefall
              characterController.Terrain = heightProvider;
              characterController.Height = 1.8f;
 
+             // Footstep audio
+             var sfxWalk = Engine.Assets.Load<AudioClip>(@"D:\Projects\2024\ProjectXYZ\Resources\Sounds\footstep1.wav");
+             var sfxJump = Engine.Assets.Load<AudioClip>(@"D:\Projects\2024\ProjectXYZ\Resources\Sounds\jump.wav");
+             var sfxLand = Engine.Assets.Load<AudioClip>(@"D:\Projects\2024\ProjectXYZ\Resources\Sounds\landing.wav");
+
+             var playerAudio = playerEntity.AddComponent<AudioSource>();
+             playerAudio.AudioClip = sfxWalk;
+             playerAudio.Volume = 4f;
+             playerAudio.PlayOnAwake = false;
+
+             var animator = playerEntity.GetComponent<Animator>();
+             animator.OnAnimationEvent += (e) =>
+             {
+                 if (e == "footstep")
+                     playerAudio.Play(sfxWalk);
+                 else if (e == "jump")
+                     playerAudio.Play(sfxJump);
+                 else if (e == "land")
+                     playerAudio.Play(sfxLand);
+             };
+
              //SpawnLights(playerSpawn, heightProvider);
              //SpawnTrees(heightProvider, playerSpawn, 16f, 5);
              //SpawnCharacters(10, heightProvider, playerSpawn, paladinMesh, paladinTexture, paladinMat);
              
              // ===== CAMERA SETUP =====
              var cameraEntity = new Entity("Camera");
+             cameraEntity.AddComponent<AudioListener>();
              var camera = cameraEntity.AddComponent<Camera>();
              camera.FarPlane = 2048 * 8; // Match Apex
              

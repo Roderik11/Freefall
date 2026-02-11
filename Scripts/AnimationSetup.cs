@@ -48,8 +48,8 @@ namespace Freefall.Scripts
             // Add animation events
             walkAnim.Events.Add(new AnimationEvent { Name = "footstep", Time = 0.3f });
             walkAnim.Events.Add(new AnimationEvent { Name = "footstep", Time = 0.75f });
-            runAnim.Events.Add(new AnimationEvent { Name = "footstep", Time = 0.25f });
-            runAnim.Events.Add(new AnimationEvent { Name = "footstep", Time = 0.65f });
+            runAnim.Events.Add(new AnimationEvent { Name = "footstep", Time = 0.3f });
+            runAnim.Events.Add(new AnimationEvent { Name = "footstep", Time = 0.75f });
             jumpAnim.Events.Add(new AnimationEvent { Name = "jump", Time = 0.001f });
             landing.Events.Add(new AnimationEvent { Name = "land", Time = 0.001f });
 
