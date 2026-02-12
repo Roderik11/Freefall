@@ -17,8 +17,6 @@ namespace Freefall.Components
     /// </summary>
     public class GPUTerrain : Freefall.Base.Component, IUpdate, IDraw, IParallel, IHeightProvider
     {
-        // ───── Diagnostics ────────────────────────────────────────────────
-        public static int LastGPUPatchCount { get; set; }
         public static bool ComputeReady { get; set; }
         public static string ComputeError { get; set; } = "";
 
@@ -28,8 +26,7 @@ namespace Freefall.Components
         public Vector2 TerrainSize = new Vector2(1700, 1700);
         public float MaxHeight = 600;
         public float[,]? HeightField;
-        public float DetailBalance = 2.0f;
-        public float AdaptiveStrength = 4.0f;
+        public float PixelErrorThreshold = 2.0f;
         public int MaxDepth = 7;
         public int MaxPatches = 8192;
         public Texture?[] ControlMaps = new Texture?[4];
@@ -40,10 +37,11 @@ namespace Freefall.Components
         // ───── Internal State ─────────────────────────────────────────────
         private const int FrameCount = 3;
 
-        // Compute pipeline — two-pass restricted quadtree + one-time mip pyramid builder
+        // Compute pipeline — three-pass restricted quadtree + one-time mip pyramid builder
         private ID3D12PipelineState _buildMinMaxMipPSO = null!;
         private ID3D12PipelineState _markSplitsPSO = null!;
         private ID3D12PipelineState _emitLeavesPSO = null!;
+        private ID3D12PipelineState _buildDrawArgsPSO = null!;
         private bool _computeInitialized;
 
         // GPU output buffers — per-frame
@@ -52,8 +50,13 @@ namespace Freefall.Components
         private ID3D12Resource[] _subbatchIdBuffers = new ID3D12Resource[FrameCount];
         private ID3D12Resource[] _terrainDataBuffers = new ID3D12Resource[FrameCount];
         private ID3D12Resource[] _counterBuffers = new ID3D12Resource[FrameCount];
-        private ID3D12Resource[] _counterReadbackBuffers = new ID3D12Resource[FrameCount];
         private ID3D12Resource[] _splitFlagsBuffers = new ID3D12Resource[FrameCount];
+        private ID3D12Resource[] _indirectArgsBuffers = new ID3D12Resource[FrameCount];
+        private uint[] _indirectArgsUAVs = new uint[FrameCount];
+        
+        // Frustum + Hi-Z constant buffers per frame (for compute shader culling)
+        private ID3D12Resource[] _frustumConstantBuffers = new ID3D12Resource[FrameCount];
+        private Matrix4x4 _previousFrameViewProjection;
         
         // Height range mip pyramid (one-time, not per-frame)
         private ID3D12Resource _heightRangePyramid = null!;
@@ -62,8 +65,6 @@ namespace Freefall.Components
         private uint _heightRangePyramidSRV;
         private int _heightRangeMipCount;
         private bool _heightRangePyramidBuilt;
-        
-        private int _lastPatchCount = 0;
 
         // UAV indices (for compute write)
         private uint[] _descriptorUAVs = new uint[FrameCount];
@@ -96,6 +97,7 @@ namespace Freefall.Components
 
         private int _totalNodes;
         private bool[] _buffersInSRV = new bool[FrameCount]; // track per-frame state
+        private bool[] _indirectArgsInArgState = new bool[FrameCount]; // indirect args in IndirectArgument state
 
         // ───── Lifecycle ──────────────────────────────────────────────────
 
@@ -129,13 +131,6 @@ namespace Freefall.Components
 
             // Set identity transform
             TransformBuffer.Instance!.SetTransform(_transformSlot, Transform.WorldMatrix);
-
-            // Readback previous frame's patch count
-            int frameIndex = Engine.FrameIndex % FrameCount;
-            ReadbackPatchCount(frameIndex);
-            LastGPUPatchCount = _lastPatchCount;
-
-
         }
 
         public void Draw()
@@ -151,11 +146,6 @@ namespace Freefall.Components
             Material.SetParameter("TerrainSize", TerrainSize);
             Material.SetParameter("TerrainOrigin", new Vector2(Transform.Position.X, Transform.Position.Z));
 
-            // Standard CDLOD: compute LODRange0 on CPU, pass to vertex shader
-            float finestNodeDiag = MathF.Sqrt(TerrainSize.X * TerrainSize.X + TerrainSize.Y * TerrainSize.Y) * 0.5f / (1 << MaxDepth);
-            float lodRange0 = finestNodeDiag * DetailBalance;
-            Material.SetParameter("LODRange0", lodRange0);
-            Material.SetParameter("MaxLodDepth", (float)MaxDepth);
             Material.SetParameter("LayerTiling", _layerTiling);
 
             // Bind textures
@@ -171,28 +161,9 @@ namespace Freefall.Components
             // Enqueue compute dispatch as custom action (runs first in Execute, before batch processing)
             CommandBuffer.Enqueue(RenderPass.Opaque, (list) => self.DispatchQuadtreeEval(list, fi));
 
-            // Register GPU-sourced batch (uses readback patch count from previous frames)
-            if (_lastPatchCount > 0)
-            {
-                // Terrain-specific per-instance data binding
-                int terrainDataHash = "TerrainData".GetHashCode();
-                int pushSlot = Material?.Effect?.GetPushConstantSlot(terrainDataHash) ?? -1;
-                var customBindings = new InstanceBatch.GPUBufferBinding[]
-                {
-                    new() { ParamHash = terrainDataHash, PushConstantSlot = pushSlot, ElementStride = 32, SrvIndex = _terrainDataSRVs[fi] }
-                };
-
-                CommandBuffer.EnqueueGPUBatch(
-                    Material,
-                    _patchMesh,
-                    _meshPartId,
-                    _descriptorSRVs[fi],
-                    _sphereSRVs[fi],
-                    _subbatchIdSRVs[fi],
-                    _lastPatchCount,
-                    customBindings);
-            }
-
+            // Enqueue self-draw action: terrain draws itself via ExecuteIndirect
+            // This runs during the draw phase (after batches are drawn)
+            CommandBuffer.Enqueue(RenderPass.Opaque, (list) => self.DrawTerrain(list, fi));
         }
 
         // ───── Compute Pipeline ───────────────────────────────────────────
@@ -220,6 +191,11 @@ namespace Freefall.Components
             _emitLeavesPSO = device.CreateComputePipelineState(emitShader.Bytecode);
             emitShader.Dispose();
 
+            // Pass 3: Build DrawInstanced indirect args from counter
+            var buildDrawArgsShader = new Shader(source, "CSBuildDrawArgs", "cs_6_6");
+            _buildDrawArgsPSO = device.CreateComputePipelineState(buildDrawArgsShader.Bytecode);
+            buildDrawArgsShader.Dispose();
+
             // One-time: Build height range mip pyramid
             var buildMinMaxMipShader = new Shader(source, "CSBuildMinMaxMip", "cs_6_6");
             _buildMinMaxMipPSO = device.CreateComputePipelineState(buildMinMaxMipShader.Bytecode);
@@ -240,6 +216,11 @@ namespace Freefall.Components
             {
                 CreateFrameBuffers(device, i, incSize);
             }
+
+            // Create frustum constant buffers (for compute shader Hi-Z culling)
+            int frustumCBSize = Marshal.SizeOf<GPUCuller.FrustumConstants>();
+            for (int i = 0; i < FrameCount; i++)
+                _frustumConstantBuffers[i] = device.CreateUploadBuffer(frustumCBSize);
 
             // Create height range mip pyramid texture
             CreateHeightRangePyramid(device);
@@ -299,13 +280,22 @@ namespace Freefall.Components
                 _counterBuffers[i], null, rawUavDesc, cpuHandle);
             _counterCPUHandles[i] = cpuHandle;
 
-            // Readback buffer
-            _counterReadbackBuffers[i] = device.NativeDevice.CreateCommittedResource(
-                new HeapProperties(HeapType.Readback),
-                HeapFlags.None,
-                ResourceDescription.Buffer(4),
-                ResourceStates.CopyDest,
-                null);
+            // Indirect args buffer: 16 bytes for DrawInstancedArguments
+            _indirectArgsBuffers[i] = device.CreateDefaultBuffer(16);
+            _indirectArgsUAVs[i] = device.AllocateBindlessIndex();
+            var argsUavDesc = new UnorderedAccessViewDescription
+            {
+                Format = Format.R32_Typeless,
+                ViewDimension = UnorderedAccessViewDimension.Buffer,
+                Buffer = new BufferUnorderedAccessView
+                {
+                    FirstElement = 0,
+                    NumElements = 4,
+                    Flags = BufferUnorderedAccessViewFlags.Raw,
+                }
+            };
+            device.NativeDevice.CreateUnorderedAccessView(
+                _indirectArgsBuffers[i], null, argsUavDesc, device.GetCpuHandle(_indirectArgsUAVs[i]));
 
             // SplitFlags buffer: 1 uint per node for atomic writes
             uint splitFlagsSize = (uint)(_totalNodes * 4);
@@ -351,9 +341,20 @@ namespace Freefall.Components
                 _buffersInSRV[frameIndex] = false;
             }
 
+            // Transition indirect args back to UAV if it was used as IndirectArgument last frame
+            if (_indirectArgsInArgState[frameIndex])
+            {
+                commandList.ResourceBarrier(new ResourceBarrier(new ResourceTransitionBarrier(_indirectArgsBuffers[frameIndex], ResourceStates.IndirectArgument, ResourceStates.UnorderedAccess)));
+                _indirectArgsInArgState[frameIndex] = false;
+            }
+
             // Set compute root signature and descriptor heap
             commandList.SetComputeRootSignature(device.GlobalRootSignature);
             commandList.SetDescriptorHeaps(1, new[] { device.SrvHeap });
+
+            // ── Upload frustum + Hi-Z constants for compute shader culling ──
+            UploadFrustumConstants(frameIndex);
+            commandList.SetComputeRootConstantBufferView(1, _frustumConstantBuffers[frameIndex].GPUVirtualAddress);
 
             // Clear counter to zero
             commandList.ClearUnorderedAccessViewUint(
@@ -378,11 +379,13 @@ namespace Freefall.Components
             Vector3 rootCenter = new Vector3(TerrainSize.X * 0.5f, 0, TerrainSize.Y * 0.5f);
             Vector3 rootExtents = new Vector3(TerrainSize.X * 0.5f, MaxHeight, TerrainSize.Y * 0.5f);
 
-            // Standard CDLOD: compute LODRange0 = finestNodeDiag * DetailBalance
-            float finestNodeDiag = MathF.Sqrt(TerrainSize.X * TerrainSize.X + TerrainSize.Y * TerrainSize.Y) * 0.5f / (1 << MaxDepth);
-            float lodRange0 = finestNodeDiag * DetailBalance;
+            // Screen-space error: compute TanHalfFov and ScreenHeight
+            var camera = Camera.Main!;
+            float vFovRad = camera.FieldOfView * (MathF.PI / 180f);
+            float tanHalfFov = MathF.Tan(vFovRad * 0.5f);
+            float screenHeight = camera.Target?.Height ?? 1080f;
 
-            // Push constants (Indices[0..7] = 32 dwords) — shared by both passes
+            // Push constants (Indices[0..7] = 32 dwords) — shared by all passes
             // Indices[0]: UAV outputs
             commandList.SetComputeRoot32BitConstant(0, _descriptorUAVs[frameIndex], 0);     // Indices[0].x
             commandList.SetComputeRoot32BitConstant(0, _sphereUAVs[frameIndex], 1);          // Indices[0].y
@@ -397,7 +400,7 @@ namespace Freefall.Components
             
             // Indices[2]: more control params
             commandList.SetComputeRoot32BitConstant(0, (uint)_meshPartId, 8);                // Indices[2].x
-            commandList.SetComputeRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(lodRange0), 9);  // Indices[2].y = LODRange0
+            commandList.SetComputeRoot32BitConstant(0, 0u, 9);                                // Indices[2].y (unused, was LODRange0)
             commandList.SetComputeRoot32BitConstant(0, (uint)_totalNodes, 10);               // Indices[2].z
             commandList.SetComputeRoot32BitConstant(0, Heightmap?.BindlessIndex ?? 0u, 11);  // Indices[2].w = HeightTexIdx
 
@@ -425,14 +428,20 @@ namespace Freefall.Components
             commandList.SetComputeRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(TerrainSize.Y), 26);  // Indices[6].z
             commandList.SetComputeRoot32BitConstant(0, 0u, 27);                                              // Indices[6].w = unused
 
-            // Indices[7]: AdaptiveStrength
-            commandList.SetComputeRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(AdaptiveStrength), 28); // Indices[7].x
+            // Indices[7]: PixelErrorThreshold + ScreenHeight + TanHalfFov (slots 29-30 overwritten for mip build)
+            commandList.SetComputeRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(PixelErrorThreshold), 28); // Indices[7].x
+            commandList.SetComputeRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(screenHeight), 29);        // Indices[7].y
+            commandList.SetComputeRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(tanHalfFov), 30);          // Indices[7].z
 
             // ── One-time: Build height range mip pyramid ──
             if (!_heightRangePyramidBuilt)
             {
                 BuildHeightRangePyramid(commandList);
                 _heightRangePyramidBuilt = true;
+
+                // Mip build overwrites slots 29-30 — restore ScreenHeight/TanHalfFov
+                commandList.SetComputeRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(screenHeight), 29);
+                commandList.SetComputeRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(tanHalfFov), 30);
             }
 
             uint threadGroups = (uint)((_totalNodes + 255) / 256);
@@ -444,60 +453,142 @@ namespace Freefall.Components
             // UAV barrier — splitFlags must be visible to Pass 2
             commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(null)));
 
-            // ── Pass 2: Emit leaves using restriction-enforced split flags ──
+            // ── Pass 2: Emit leaves with inline frustum + Hi-Z culling ──
             commandList.SetPipelineState(_emitLeavesPSO);
             commandList.Dispatch(threadGroups, 1, 1);
 
-            // UAV barrier after compute — output buffers will be read by culler
+            // UAV barrier — counter and output buffers must be visible to Pass 3
             commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(null)));
 
-            // Transition output buffers from UAV to SRV for culler reads
+            // ── Pass 3: Build DrawInstanced indirect args from counter ──
+            // Set slot 29 (MipInputSRV) = mesh index count for CSBuildDrawArgs
+            commandList.SetComputeRoot32BitConstant(0, (uint)_patchMesh.IndexCount, 29);  // Indices[7].y = vertex count per instance
+            commandList.SetComputeRoot32BitConstant(0, _indirectArgsUAVs[frameIndex], 31); // Indices[7].w = IndirectArgsUAV
+            commandList.SetPipelineState(_buildDrawArgsPSO);
+            commandList.Dispatch(1, 1, 1);
+
+            // UAV barrier — indirect args must be visible before ExecuteIndirect
+            commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(null)));
+
+            // Transition output buffers from UAV to SRV for vertex shader reads
             commandList.ResourceBarrier(new ResourceBarrier(new ResourceTransitionBarrier(_descriptorBuffers[frameIndex], ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource)));
             commandList.ResourceBarrier(new ResourceBarrier(new ResourceTransitionBarrier(_sphereBuffers[frameIndex], ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource)));
             commandList.ResourceBarrier(new ResourceBarrier(new ResourceTransitionBarrier(_subbatchIdBuffers[frameIndex], ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource)));
             commandList.ResourceBarrier(new ResourceBarrier(new ResourceTransitionBarrier(_terrainDataBuffers[frameIndex], ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource)));
             _buffersInSRV[frameIndex] = true;
 
-            // Copy counter to readback
-            commandList.ResourceBarrier(new ResourceBarrier(
-                new ResourceTransitionBarrier(_counterBuffers[frameIndex],
-                    ResourceStates.UnorderedAccess, ResourceStates.CopySource)));
+            // Transition indirect args buffer for ExecuteIndirect
+            commandList.ResourceBarrier(new ResourceBarrier(new ResourceTransitionBarrier(_indirectArgsBuffers[frameIndex], ResourceStates.UnorderedAccess, ResourceStates.IndirectArgument)));
+            _indirectArgsInArgState[frameIndex] = true;
 
-            commandList.CopyResource(_counterReadbackBuffers[frameIndex], _counterBuffers[frameIndex]);
-
-            commandList.ResourceBarrier(new ResourceBarrier(
-                new ResourceTransitionBarrier(_counterBuffers[frameIndex],
-                    ResourceStates.CopySource, ResourceStates.UnorderedAccess)));
+            // Store VP for next frame's Hi-Z occlusion projection
+            _previousFrameViewProjection = Camera.Main.ViewProjection;
         }
 
         /// <summary>
-        /// Transitions output buffers back to UAV state after draw.
-        /// Called as a post-draw custom action.
+        /// Self-draw via ExecuteIndirect. Sets root constants, applies material PSO,
+        /// and calls ExecuteIndirect with the GPU-generated draw args.
         /// </summary>
-        internal void TransitionToUAV(ID3D12GraphicsCommandList commandList, int frameIndex)
+        private void DrawTerrain(ID3D12GraphicsCommandList commandList, int frameIndex)
         {
-            commandList.ResourceBarrier(new ResourceBarrier(new ResourceTransitionBarrier(_descriptorBuffers[frameIndex], ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess)));
-            commandList.ResourceBarrier(new ResourceBarrier(new ResourceTransitionBarrier(_sphereBuffers[frameIndex], ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess)));
-            commandList.ResourceBarrier(new ResourceBarrier(new ResourceTransitionBarrier(_subbatchIdBuffers[frameIndex], ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess)));
-            commandList.ResourceBarrier(new ResourceBarrier(new ResourceTransitionBarrier(_terrainDataBuffers[frameIndex], ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess)));
+            var device = Engine.Device;
+
+            // Apply material PSO and textures
+            Material.Apply(commandList, device);
+
+            // Set topology
+            commandList.IASetPrimitiveTopology(Vortice.Direct3D.PrimitiveTopology.TriangleList);
+
+            // Set descriptor heap (Material.Apply may have changed it)
+            commandList.SetDescriptorHeaps(1, new[] { device.SrvHeap });
+
+            // Set root constants for push constant slots used by the vertex shader
+            // Slot 1: TerrainPatchData SRV
+            commandList.SetGraphicsRoot32BitConstant(0, _terrainDataSRVs[frameIndex], 1);
+            // Slot 2: InstanceDescriptor SRV
+            commandList.SetGraphicsRoot32BitConstant(0, _descriptorSRVs[frameIndex], 2);
+
+            // Slot 7: Index buffer SRV
+            commandList.SetGraphicsRoot32BitConstant(0, _patchMesh.IndexBufferIndex, 7);
+            // Slot 8: BaseIndex (always 0 for terrain patch mesh)
+            commandList.SetGraphicsRoot32BitConstant(0, 0u, 8);
+            // Slot 9: Position buffer SRV
+            commandList.SetGraphicsRoot32BitConstant(0, _patchMesh.PosBufferIndex, 9);
+            // Slot 15: GlobalTransformBuffer SRV
+            commandList.SetGraphicsRoot32BitConstant(0, TransformBuffer.Instance!.SrvIndex, 15);
+            // Slot 16: Debug mode
+            commandList.SetGraphicsRoot32BitConstant(0, (uint)Engine.Settings.DebugVisualizationMode, 16);
+
+            // ExecuteIndirect with DrawInstancedSignature — args written by CSBuildDrawArgs
+            commandList.ExecuteIndirect(
+                device.DrawInstancedSignature,
+                1,
+                _indirectArgsBuffers[frameIndex],
+                0,
+                null,
+                0);
         }
 
-        private void ReadbackPatchCount(int frameIndex)
+        /// <summary>
+        /// Upload frustum planes + Hi-Z occlusion data to the per-frame constant buffer.
+        /// This is bound to compute root slot 1 (register b0) for inline culling.
+        /// </summary>
+        private void UploadFrustumConstants(int frameIndex)
         {
-            // Read from frame N-2 (enough latency for GPU completion)
-            int readbackFrame = (frameIndex + FrameCount - 2) % FrameCount;
-            var readback = _counterReadbackBuffers[readbackFrame];
-            if (readback == null) return;
+            var vpMatrix = Engine.Settings.FreezeFrustum
+                ? Engine.Settings.FrozenViewProjection
+                : Camera.Main!.ViewProjection;
+            var frustum = new Frustum(vpMatrix);
+            var planes = frustum.GetPlanesAsVector4();
+
+            // The compute shader works in terrain LOCAL space, but frustum planes
+            // are in WORLD space.  Transform planes to local space:
+            //   plane_local = (n, d + dot(n, terrainPos))
+            // because x_world = x_local + terrainPos  =>  n·x_local + (d + n·P) = 0
+            var terrainPos = Transform.Position;
+            for (int i = 0; i < planes.Length; i++)
+            {
+                var n = new Vector3(planes[i].X, planes[i].Y, planes[i].Z);
+                planes[i].W += Vector3.Dot(n, terrainPos);
+            }
+
+            var constants = new GPUCuller.FrustumConstants
+            {
+                Plane0 = planes[0],
+                Plane1 = planes[1],
+                Plane2 = planes[2],
+                Plane3 = planes[3],
+                Plane4 = planes[4],
+                Plane5 = planes[5],
+            };
+
+            // Hi-Z occlusion data — VP must also expect local-space input:
+            //   clip = x_local * Translate(terrainPos) * VP
+            var culler = CommandBuffer.Culler;
+            if (culler != null && culler.HiZPyramidSRV != 0 && culler.HiZReady && !Engine.Settings.DisableHiZ)
+            {
+                var occVP = Engine.Settings.FreezeFrustum
+                    ? Engine.Settings.FrozenViewProjection
+                    : _previousFrameViewProjection;
+                // Premultiply by the terrain's world translation so the matrix
+                // accepts local-space positions directly:
+                var localToWorld = Matrix4x4.CreateTranslation(terrainPos);
+                constants.OcclusionProjection = localToWorld * occVP;
+
+                constants.HiZSrvIdx = culler.HiZPyramidSRV;
+                constants.HiZWidth = culler.HiZWidth;
+                constants.HiZHeight = culler.HiZHeight;
+                constants.HiZMipCount = (uint)culler.HiZMipCount;
+                constants.NearPlane = Camera.Main!.NearPlane;
+            }
 
             unsafe
             {
                 void* pData;
-                readback.Map(0, null, &pData);
-                _lastPatchCount = *(int*)pData;
-                readback.Unmap(0);
+                _frustumConstantBuffers[frameIndex].Map(0, null, &pData);
+                *(GPUCuller.FrustumConstants*)pData = constants;
+                _frustumConstantBuffers[frameIndex].Unmap(0);
             }
-
-            _lastPatchCount = Math.Clamp(_lastPatchCount, 0, MaxPatches);
         }
 
         // ───── Height Range Mip Pyramid ───────────────────────────────────

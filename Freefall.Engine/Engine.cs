@@ -1,8 +1,8 @@
 using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Threading.Tasks;
 using System.IO;
-using System.Collections.Generic;
 using System.Numerics;
 using Freefall.Assets;
 using Freefall.Graphics;
@@ -16,7 +16,7 @@ namespace Freefall
     public static class Engine
     {
         private static Window _window;
-        public static RenderView RenderView { get; private set; } // Changed to public property
+        private static IntPtr _inputHandle;
         private static bool _isRunning;
 
         public static AssetManager Assets { get; private set; }
@@ -29,12 +29,15 @@ namespace Freefall
         private static IXAudio2MasteringVoice _masteringVoice;
         
         public static int TickCount { get; private set; }
+
+        // Snapshot list to avoid modification during iteration (Apex pattern)
+        private static readonly List<RenderView> _renderViews = new List<RenderView>();
         
         /// <summary>
         /// The current frame buffer index (0, 1, or 2). Uses swapchain's index for proper GPU synchronization.
         /// Falls back to TickCount % 3 before RenderView is initialized.
         /// </summary>
-        public static int FrameIndex => RenderView?.FrameIndex ?? (TickCount % 3);
+        public static int FrameIndex => RenderView.Primary?.FrameIndex ?? (TickCount % 3);
         
         public static bool Running => _isRunning;
 
@@ -82,12 +85,13 @@ namespace Freefall
             // Engine-internal default textures & materials
             Freefall.Assets.InternalAssets.Initialize(Device);
 
-            // Initialize Rendering Foundation
-            RenderView = new RenderView(_window, Device);
-            RenderView.Pipeline = new DeferredRenderer(); // Use Deferred
-            RenderView.Pipeline.Initialize(_window.Width, _window.Height);
+            // Initialize Rendering Foundation — view auto-registers in RenderView.All
+            var view = new RenderView(_window, Device);
+            view.Pipeline = new DeferredRenderer();
+            view.Pipeline.Initialize(_window.Width, _window.Height);
             
             Input.Init(_window.Handle);
+            _inputHandle = _window.Handle;
             
             // Initialize Audio
             AudioDevice = XAudio2.XAudio2Create(ProcessorSpecifier.DefaultProcessor, true);
@@ -96,6 +100,38 @@ namespace Freefall
             Debug.Log("[Engine] XAudio2 + X3DAudio initialized");
             
             // Initialize Physics
+            PhysicsWorld.Initialize();
+        }
+
+        /// <summary>
+        /// Initialize the engine with an external window handle (for editor mode).
+        /// The caller owns the window and is responsible for resize events.
+        /// </summary>
+        public static void Initialize(IntPtr handle, int width, int height)
+        {
+            Kernel32.timeBeginPeriod(1);
+            
+            RootDirectory = AppContext.BaseDirectory;
+
+            Device = new GraphicsDevice();
+            TransformBuffer.Initialize(Device);
+            var streaming = new StreamingManager(Device);
+            Assets = new AssetManager(Device);
+            Freefall.Assets.InternalAssets.Initialize(Device);
+
+            // Initialize Rendering Foundation — view auto-registers in RenderView.All
+            var view = new RenderView(handle, width, height, Device);
+            view.Pipeline = new DeferredRenderer();
+            view.Pipeline.Initialize(width, height);
+            
+            Input.Init(handle);
+            _inputHandle = handle;
+            
+            AudioDevice = XAudio2.XAudio2Create(ProcessorSpecifier.DefaultProcessor, true);
+            _masteringVoice = AudioDevice.CreateMasteringVoice();
+            Audio3D = new X3DAudio(Speakers.FrontLeft | Speakers.FrontRight);
+            Debug.Log("[Engine] Initialized (editor mode)");
+            
             PhysicsWorld.Initialize();
         }
 
@@ -108,9 +144,6 @@ namespace Freefall
             string baseTitle = _window.Title;
             while (_isRunning && _window.ProcessEvents())
             {
-                Time.Update();
-                Input.Update(_window.Handle);
-                
                 Tick();
 
                 // Update performance metrics in title bar every 0.1s for responsiveness
@@ -120,14 +153,10 @@ namespace Freefall
                     string vsyncStatus = Settings.VSync ? "ON" : "OFF";
                     string hizStatus = Settings.DisableHiZ ? "OFF" : "ON";
                     int occluded = CommandBuffer.Culler?.LastHiZOccludedCount ?? 0;
-                    string computeInfo = Components.GPUTerrain.ComputeReady 
-                        ? $"GPUPatch: {Components.GPUTerrain.LastGPUPatchCount}" 
-                        : $"ComputeERR: {Components.GPUTerrain.ComputeError}";
+                    string computeInfo = Components.GPUTerrain.ComputeReady ? "Compute: OK" : $"ComputeERR: {Components.GPUTerrain.ComputeError}";
                     _window.SetTitle($"{baseTitle} | FPS: {Time.FPS:0} | Draw: {CommandBuffer.LastDrawCallCount} | Batches: {CommandBuffer.LastBatchCount} | HiZ: {hizStatus} Occl: {occluded} | {computeInfo}");
                     titleUpdateTimer = 0;
                 }
-                
-                Input.ClearFrameCallbacks();
             }
             
             Shutdown();
@@ -136,6 +165,9 @@ namespace Freefall
         public static void Tick()
         {
             TickCount++;
+
+            Time.Update();
+            Input.Update(_inputHandle);
 
             // Release GPU buffers from previous batch resizes (deferred N frames for safety)
             Graphics.InstanceBatch.FlushDeferredDisposals();
@@ -149,8 +181,49 @@ namespace Freefall
             // Update Logic
             Update();
 
-            // Render Logic
-            Render();
+            // --- Process all deferred resizes before rendering (Apex pattern) ---
+            // Must sync GPU first — previous frames may still be using resources
+            bool anyResizePending = false;
+            foreach (var v in RenderView.All)
+            {
+                if (v.IsResizePending) { anyResizePending = true; break; }
+            }
+
+            if (anyResizePending)
+            {
+                RenderView.Primary?.WaitForGpu();
+                foreach (var v in RenderView.All)
+                    v.ProcessPendingResize();
+            }
+
+            // --- Apex multi-viewport render loop ---
+            Device.ResetTemporaryDescriptors();
+
+            _renderViews.Clear();
+            _renderViews.AddRange(RenderView.All);
+
+            foreach (var view in _renderViews)
+            {
+                if (!view.Enabled) continue;
+                if (!view.HasSwapChain) continue; // Headless views rendered manually (e.g. RenderGui)
+
+                if (view.OnRender != null)
+                {
+                    view.OnRender(view);
+                }
+                else
+                {
+                    view.Prepare();
+
+                    var cam = Camera.Main;
+                    if (cam != null && cam.Target == view)
+                        cam.Render(view.CommandList.Native);
+
+                    view.Present();
+                }
+            }
+
+            CommandBuffer.Clear();
             
             // Drain main-thread queue AFTER Present (GPU fence ensures no commands in flight,
             // so creating GPU resources like upload buffers and SRV descriptors is safe here).
@@ -171,6 +244,8 @@ namespace Freefall
                 if (System.Diagnostics.Stopwatch.GetTimestamp() - budgetStart >= budgetTicks)
                     break;
             }
+
+            Input.ClearFrameCallbacks();
         }
 
         private static void Update()
@@ -219,50 +294,15 @@ namespace Freefall
                 Debug.Log($"[Engine] Debug Viz: {modeNames[Settings.DebugVisualizationMode]}");
             }
             
-            // F9: Toggle Hi-Z occlusion culling
+            // F6: Toggle Hi-Z occlusion culling
             if (Input.IsKeyPressed(Keys.F6))
             {
                 Settings.DisableHiZ = !Settings.DisableHiZ;
                 Debug.Log($"[Engine] Hi-Z Occlusion {(Settings.DisableHiZ ? "DISABLED" : "ENABLED")}");
             }
+            
             // Entity logic (includes component Updates like Camera, CharacterController, etc.)
             EntityManager.Update();
-        }
-
-        private static void Render()
-        {
-            var sw = System.Diagnostics.Stopwatch.StartNew();
-            
-            // Reset per-frame descriptor allocations
-            Device.ResetTemporaryDescriptors();
-            
-            var prepareTime = System.Diagnostics.Stopwatch.StartNew();
-            RenderView.Prepare();
-            prepareTime.Stop();
-            
-            // Use the main camera if available
-            var cam = Camera.Main;
-            var renderTime = System.Diagnostics.Stopwatch.StartNew();
-            if (cam != null)
-            {
-                cam.Render(RenderView.CommandList.Native);
-            }
-            renderTime.Stop();
-            
-            var presentTime = System.Diagnostics.Stopwatch.StartNew();
-            RenderView.Present();
-            presentTime.Stop();
-
-            // Clear commands for next frame
-            CommandBuffer.Clear();
-            
-            sw.Stop();
-            
-            // Log every 60 frames
-            if (FrameIndex % 60 == 0)
-            {
-                Debug.Log($"[Render] Total: {sw.Elapsed.TotalMilliseconds:F2}ms | Prepare: {prepareTime.Elapsed.TotalMilliseconds:F2}ms | Camera.Render: {renderTime.Elapsed.TotalMilliseconds:F2}ms | Present: {presentTime.Elapsed.TotalMilliseconds:F2}ms");
-            }
         }
 
         public static void Shutdown()
@@ -276,7 +316,11 @@ namespace Freefall
             
             TransformBuffer.Instance?.Dispose();
             StreamingManager.Instance?.Dispose();
-            RenderView?.Dispose();
+
+            // Dispose all registered render views
+            for (int i = RenderView.All.Count - 1; i >= 0; i--)
+                RenderView.All[i].Dispose();
+
             Assets?.Dispose();
             _masteringVoice?.Dispose();
             AudioDevice?.Dispose();

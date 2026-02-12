@@ -223,7 +223,7 @@ PSOutput PS(VSOutput input)
     {
         Texture2D normalTex = ResourceDescriptorHeap[mat.NormalIdx];
         float3 texNormal = normalTex.Sample(Sampler, input.TexCoord).rgb * 2.0 - 1.0;
-        texNormal.xy *= 1.5; // Slightly boosted for visible surface detail
+        //texNormal.xy *= 1.5; // Slightly boosted for visible surface detail
         texNormal = normalize(texNormal);
         
         // Cotangent frame from screen-space derivatives

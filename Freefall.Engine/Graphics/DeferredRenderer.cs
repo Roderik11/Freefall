@@ -13,6 +13,12 @@ namespace Freefall.Graphics
     {
         public static DeferredRenderer Current { get; private set; } = null!;
 
+        /// <summary>
+        /// True for the main window's pipeline. False for headless editor viewport pipelines.
+        /// Controls whether this pipeline owns the global singleton and Hi-Z culler.
+        /// </summary>
+        public bool IsPrimary { get; set; } = true;
+
         public RenderTexture2D Albedo;
         public RenderTexture2D Normals;
         public RenderTexture2D Data;
@@ -34,11 +40,13 @@ namespace Freefall.Graphics
 
         public DeferredRenderer()
         {
-            Current = this;
         }
 
         public override void Initialize(int width, int height)
         {
+            if (IsPrimary)
+                Current = this;
+
             // Create render textures first
             CreateRenderTextures(width, height);
 
@@ -80,8 +88,9 @@ namespace Freefall.Graphics
             CreateRenderTextures(width, height);
             _isFirstFrame = true; // Resource states reset to Common/Texture
             
-            // Recreate Hi-Z pyramid for new dimensions
-            CommandBuffer.Culler?.CreateHiZPyramid(width, height);
+            // Only the primary pipeline owns the global Hi-Z pyramid
+            if (IsPrimary)
+                CommandBuffer.Culler?.CreateHiZPyramid(width, height);
         }
 
         public override void Clear(Camera camera)
@@ -176,7 +185,7 @@ namespace Freefall.Graphics
              list.ClearRenderTargetView(Normals.RtvHandle, new Color4(0,0,0,0));
              list.ClearRenderTargetView(Data.RtvHandle, new Color4(0,0,0,0));
              list.ClearRenderTargetView(DepthGBuffer.RtvHandle, new Color4(0,0,0,0));
-             list.ClearDepthStencilView(Depth.DsvHandle, ClearFlags.Depth, 1.0f, 0);
+             list.ClearDepthStencilView(Depth.DsvHandle, ClearFlags.Depth, 0.0f, 0); // Reverse depth: far=0
 
              // Viewport
              var vp = new Viewport(0, 0, Albedo.Native.Description.Width, Albedo.Native.Description.Height);

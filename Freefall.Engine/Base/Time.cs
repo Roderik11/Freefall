@@ -47,7 +47,7 @@ namespace Freefall.Base
         private static int _deltaHistoryIndex = 0;
         private static float _deltaSum = 0;
 
-        internal static void Initialize()
+        public static void Initialize()
         {
             _watch.Reset();
             _watch.Start();
@@ -62,7 +62,7 @@ namespace Freefall.Base
                 _deltaHistory[i] = Delta;
         }
 
-        internal static void Update()
+        public static void Update()
         {
             double currentTime = _watch.Elapsed.TotalSeconds;
             Delta = (float)(currentTime - _lastTime);

@@ -47,7 +47,20 @@ namespace Freefall.Assets
             foreach (var assembly in assemblies)
             {
                 if (assembly == null) continue;
-                foreach (var type in assembly.GetTypes())
+
+                Type[] types;
+                try
+                {
+                    types = assembly.GetTypes();
+                }
+                catch (ReflectionTypeLoadException ex)
+                {
+                    // Use the types that loaded successfully (skip nulls from failed loads)
+                    types = ex.Types.Where(t => t != null).ToArray()!;
+                    Debug.LogWarning("AssetManager", $"Partial type load for {assembly.GetName().Name}: {ex.LoaderExceptions.Length} failures");
+                }
+
+                foreach (var type in types)
                 {
                     var attr = type.GetCustomAttribute<AssetReaderAttribute>();
                     if (attr == null) continue;

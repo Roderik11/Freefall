@@ -109,8 +109,8 @@ float4 PS(VSOutput input) : SV_Target
     float3 normal = NormalTex.Sample(Sampler, uv).xyz;
     float depth = DepthTex.Sample(Sampler, uv).r;
     
-    // Skip sky pixels
-    if (depth >= 1.0f)
+    // Skip sky pixels — reverse depth: far=0
+    if (depth <= 0.0f)
         discard;
     
     // Reconstruct world position from depth (camera-relative, zero-translation)

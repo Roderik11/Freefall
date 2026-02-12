@@ -67,30 +67,9 @@ namespace Freefall.Assets.Importers
                 material = InternalAssets.DefaultMaterial;
             }
 
-            // Check for LOD mesh parts (parts with "_LOD_" in name)
-            var allLODs = new List<int>();
-            for (int i = 0; i < mesh.MeshParts.Count; i++)
-            {
-                if (mesh.MeshParts[i].Name.Contains("_LOD_"))
-                    allLODs.Add(i);
-            }
-
-            // If no LODs or all parts are LODs, just add all parts to base mesh
-            if (mesh.MeshParts.Count - allLODs.Count <= 0)
-            {
-                for (int i = 0; i < mesh.MeshParts.Count; i++)
-                {
-                    staticMesh.MeshParts.Add(new MeshElement
-                    {
-                        Mesh = mesh,
-                        Material = material,
-                        MeshPartIndex = i
-                    });
-                }
-                return staticMesh;
-            }
-
-            // Separate base mesh parts from LOD parts
+            // Classify mesh parts into base or LOD levels
+            // _LOD_0 / _LOD_00 = base mesh (highest quality)
+            // _LOD_01+ = lower quality LOD levels
             for (int i = 0; i < mesh.MeshParts.Count; i++)
             {
                 var part = mesh.MeshParts[i];
@@ -109,24 +88,33 @@ namespace Freefall.Assets.Importers
                 }
                 else
                 {
-                    // LOD mesh part - parse level from name
-                    // Example: "Tree_LOD_1" -> level 0 (LOD levels are 1-indexed in name, 0-indexed in array)
                     try
                     {
                         int endIndex = index + 6 < name.Length ? 2 : 1;
                         int lvl = Convert.ToInt32(name.Substring(index + 5, endIndex)) - 1;
-                        
-                        while (staticMesh.LODs.Count < lvl + 1)
-                            staticMesh.LODs.Add(new StaticMeshLOD { Mesh = mesh });
 
-                        staticMesh.LODs[lvl].MeshParts.Add(new MeshElement
+                        if (lvl < 0)
                         {
-                            Mesh = mesh,
-                            Material = material,
-                            MeshPartIndex = i
-                        });
-                        
-                        Debug.Log($"[StaticMeshImporter] Added LOD {lvl} part: {name}");
+                            // _LOD_0 / _LOD_00 → treat as base mesh part
+                            staticMesh.MeshParts.Add(new MeshElement
+                            {
+                                Mesh = mesh,
+                                Material = material,
+                                MeshPartIndex = i
+                            });
+                        }
+                        else
+                        {
+                            while (staticMesh.LODs.Count < lvl + 1)
+                                staticMesh.LODs.Add(new StaticMeshLOD { Mesh = mesh });
+
+                            staticMesh.LODs[lvl].MeshParts.Add(new MeshElement
+                            {
+                                Mesh = mesh,
+                                Material = material,
+                                MeshPartIndex = i
+                            });
+                        }
                     }
                     catch (Exception ex)
                     {

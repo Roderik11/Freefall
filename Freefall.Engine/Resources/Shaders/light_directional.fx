@@ -100,8 +100,8 @@ float4 PS(VSOutput input) : SV_Target
         return float4(gbufDepth, gbufDepth, gbufDepth, 1);
     }
     
-    // Skip pixels at max depth (sky)
-    if (depth >= 1.0f)
+    // Skip pixels at min depth (sky) — reverse depth: far=0
+    if (depth <= 0.0f)
         return float4(0, 0, 0, 0);
     
     // Reconstruct world position from depth
@@ -243,8 +243,9 @@ float4 PS(VSOutput input) : SV_Target
     float3 kd = (1.0 - F) * (1.0 - metal);
     float3 diffuse = kd * (albedo / 3.14159);
     
-    // Final radiance
-    float3 radiance = LightColor * LightIntensity * NdotL * shadowFactor;
+    // Pre-multiply by PI to compensate for energy-conserving Lambert (/PI in diffuse BRDF).
+    // Convention: LightIntensity=1 → full diffuse albedo brightness (standard in UE/Unity).
+    float3 radiance = LightColor * LightIntensity * 3.14159 * NdotL * shadowFactor;
     float3 lighting = (diffuse + spec) * radiance * ao;
     
     // Shadow wrap: bleed a small fraction of diffuse NdotL through shadows

@@ -177,6 +177,9 @@ namespace Freefall.Graphics
                             case "CullMode":
                                 state.CullMode = value;  // "None", "Front", "Back"
                                 break;
+                            case "DepthFunc":
+                                state.DepthFunc = value;  // "Less", "LessEqual", "Greater", "GreaterEqual", etc.
+                                break;
                         }
                     }
                 }
@@ -205,5 +208,8 @@ namespace Freefall.Graphics
         
         /// <summary>Cull mode: "None", "Front", "Back" (default: Back)</summary>
         public string CullMode { get; set; } = "Back";
+        
+        /// <summary>Depth comparison function: "Less", "LessEqual", "Greater", "GreaterEqual" (default: GreaterEqual for reverse depth)</summary>
+        public string DepthFunc { get; set; } = "GreaterEqual";
     }
 }

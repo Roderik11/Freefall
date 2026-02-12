@@ -1,5 +1,5 @@
 #include "common.fx"
-// @RenderState(RenderTargets=4, DepthWrite=false, DepthFunc=LessEqual, CullMode=None)
+// @RenderState(RenderTargets=4, DepthWrite=false, DepthFunc=GreaterEqual, CullMode=None)
 
 // Unified Push Constant Layout (Slots 2-15) - matches gbuffer.fx
 // Used by all batched geometry shaders (gbuffer, gbuffer_skinned, mesh_skybox)
@@ -311,7 +311,9 @@ VertexOutput VS(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_Insta
     float4 worldPosition = mul(float4(rawPos, 1), mat);
     float4 viewPosition = mul(worldPosition, View);
 
-    output.Position = mul(viewPosition, Projection).xyww;
+    // Reverse-Z: far plane = 0, so set z=0 to place skybox at max distance
+    float4 projPos = mul(viewPosition, Projection);
+    output.Position = float4(projPos.xy, 0.0, projPos.w);
     output.UV = rawPos.xyz * 2;
     output.ViewDir = rawPos.xyz;
 
@@ -349,7 +351,7 @@ FragmentOutput PS_Procedural(VertexOutput input)
     output.Normal = float4(0, 1, 0, 1);
     output.Data = float4(0, 0, 0, 0);
     output.Depth = float4(0, 0, 0, 0);
-    output.fDepth = 1;
+    output.fDepth = 0; // Reverse-Z: far plane = 0
 
     return output;
 }

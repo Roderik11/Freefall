@@ -10,14 +10,12 @@ struct TerrainPatchData
 	float2 padding;
 };
 
-// Standard InstanceBatch push constant layout (slots 2-15 set by command signature)
+// Standard InstanceBatch push constant layout (slots 2-15 set by CPU before ExecuteIndirect)
 #define DescriptorBufIdx GET_INDEX(2)
 #define Reserved0Idx GET_INDEX(3)
-#define SortedIndicesIdx GET_INDEX(4)
 #define IndexBufferIdx GET_INDEX(7)
 #define BaseIndex GET_INDEX(8)
 #define PosBufferIdx GET_INDEX(9)
-#define InstanceBaseOffset GET_INDEX(13)
 #define DebugMode GET_INDEX(16)
 
 // Per-instance buffer: TerrainPatchData (slot 1, via generic per-instance buffer system)
@@ -36,8 +34,7 @@ cbuffer terrain : register(b1)
     float MaxHeight;
     float _pad1;
     float2 TerrainSize;
-    float LODRange0;
-    float MaxLodDepth;
+    float2 TerrainOrigin;
 }
 
 cbuffer tiling : register(b2)
@@ -49,32 +46,11 @@ SamplerState sampData : register(s0); // WrappedAnisotropic
 SamplerState sampHeight : register(s1); // ClampedPoint2D
 SamplerState sampHeightFilter : register(s2); // ClampedBilinear2D
 
-// Standard CDLOD: LODRange[level] = LODRange0 * 2^level.
-// level 0 = finest (smallest range), level maxDepth = coarsest (largest).
-float ComputeLodRange(int level)
-{
-    if (level < 0) return 0.0;
-    return LODRange0 * (float)(1u << (uint)level);
-}
-
-// Standard CDLOD morph: ramp over the outer 30% of each LOD band.
-// Morphing starts at 70% of the way from low to high and completes at high.
-float GetMorphValue(float dist, float lodLevel)
-{
-    int lod = (int)lodLevel;
-    float low  = ComputeLodRange(lod);
-    float high = ComputeLodRange(lod + 1);
-
-    int nextLevel = lod + 1;
-    if (nextLevel > (int)MaxLodDepth) return 0.0;
-
-    float morphStart = lerp(low, high, 0.7);
-    return saturate((dist - morphStart) / (high - morphStart));
-}
-
-// CDLOD per-vertex morph: dual-sample fine/coarse heights and lerp.
-// Morphs XZ by subtracting the grid fraction scaled by morph factor.
-float3 MorphVertex(float3 pos, float2 rect_xy, float2 rect_size, float lodLevel, row_major matrix entityWorld, out float2 outHeightUV)
+// Edge-stitched vertex: snaps odd edge vertices to even positions on edges
+// adjacent to coarser neighbors. No morphing — hard LOD transition masked
+// by sub-pixel screen-space error threshold.
+// stitchMask bits: 0=S(-Z), 1=E(+X), 2=N(+Z), 3=W(-X)
+float3 StitchVertex(float3 pos, float2 rect_xy, float2 rect_size, uint stitchMask, row_major matrix entityWorld, out float2 outHeightUV)
 {
     const float gridRes = 32.0;
     const float invGridRes = 1.0 / gridRes;
@@ -82,52 +58,32 @@ float3 MorphVertex(float3 pos, float2 rect_xy, float2 rect_size, float lodLevel,
     // Grid pos in [0, gridRes]
     float2 gridPos = pos.xz + float2(16, 16);
 
-    // Fine UV → fine height → world pos → distance
-    float2 uvFine = gridPos * invGridRes;
-    uvFine.y = 1.0 - uvFine.y;
-    float2 heightUVFine = rect_xy + uvFine * rect_size;
+    // Snap odd edge vertices to even positions on stitched edges
+    // South edge: gridPos.y == 0
+    if ((stitchMask & 1u) && gridPos.y < 0.5)
+        gridPos.x = round(gridPos.x * 0.5) * 2.0;
+    // East edge: gridPos.x == 32
+    if ((stitchMask & 2u) && gridPos.x > 31.5)
+        gridPos.y = round(gridPos.y * 0.5) * 2.0;
+    // North edge: gridPos.y == 32
+    if ((stitchMask & 4u) && gridPos.y > 31.5)
+        gridPos.x = round(gridPos.x * 0.5) * 2.0;
+    // West edge: gridPos.x == 0
+    if ((stitchMask & 8u) && gridPos.x < 0.5)
+        gridPos.y = round(gridPos.y * 0.5) * 2.0;
+
+    // Compute height UV
+    float2 uv = gridPos * invGridRes;
+    uv.y = 1.0 - uv.y;
+    outHeightUV = rect_xy + uv * rect_size;
+
+    // Sample height
     Texture2D HeightTex = ResourceDescriptorHeap[HeightTexIdx];
-    float fineH = HeightTex.SampleLevel(sampHeightFilter, heightUVFine, 0).r * MaxHeight;
-
-    // Compute distance in world space
-    float2 terrainXZ = heightUVFine * TerrainSize;
-    float3 localPos = float3(terrainXZ.x, fineH, terrainXZ.y);
-    float3 worldPos = mul(float4(localPos, 1), entityWorld).xyz;
-    
-    float3 camForDist = CameraPos;
-    if (camForDist.y < MaxHeight) { camForDist.y = 0; worldPos.y = 0; }
-    float dist = distance(worldPos, camForDist);
-
-    // Per-vertex morph factor
-    float morph = GetMorphValue(dist, lodLevel);
-
-    // Compute grid fraction scaled by LOD level.
-    // At level 0 (finest), we snap every-other vertex (step=1 grid unit).
-    // At level N, each patch covers 2^N times the area with the same 32-vertex grid,
-    // so the morph step in grid-space is always 1 grid unit — but we need to identify
-    // which vertices are "odd" relative to the NEXT coarser level's grid.
-    // The grid positions that survive at the next coarser level are those divisible by 2.
-    // frac(gridPos * 0.5) gives 0.5 for odd-indexed verts, 0.0 for even.
-    float2 fracOffset = frac(gridPos * 0.5) * 2.0;
-
-    // Morph XZ: subtract fraction scaled by morph so odd verts slide to even neighbors
-    float2 morphedGrid = gridPos - fracOffset * morph;
-
-    // Coarse UV → coarse height
-    float2 uvCoarse = morphedGrid * invGridRes;
-    uvCoarse.y = 1.0 - uvCoarse.y;
-    float2 heightUVCoarse = rect_xy + uvCoarse * rect_size;
-    float coarseH = HeightTex.SampleLevel(sampHeightFilter, heightUVCoarse, 0).r * MaxHeight;
-
-    // Lerp height: smooth transition from fine to coarse
-    float finalH = lerp(fineH, coarseH, morph);
-
-    // Output morphed UV for texturing (lerp UV too for consistent normal/texture reads)
-    outHeightUV = lerp(heightUVFine, heightUVCoarse, morph);
+    float h = HeightTex.SampleLevel(sampHeightFilter, outHeightUV, 0).r * MaxHeight;
 
     float3 result;
-    result.xz = morphedGrid - float2(16, 16);
-    result.y = finalH;
+    result.xz = gridPos - float2(16, 16);
+    result.y = h;
     return result;
 }
 
@@ -138,7 +94,6 @@ struct VertexOutput
 	float2 UV2			: TEXCOORD1;
     float Depth			: TEXCOORD2;
 	float Level			: TEXCOORD3;
-	nointerpolation uint Flags : TEXCOORD4;
 };
 
 // Per-instance descriptor (matches C# InstanceDescriptor: 12 bytes)
@@ -178,12 +133,9 @@ VertexOutput VS(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_Insta
 {
 	VertexOutput output;
 
-	// Double-indirection: command signature → sorted index → original instance
-	StructuredBuffer<uint> sortedIndices = ResourceDescriptorHeap[SortedIndicesIdx];
-	uint dataPos = InstanceBaseOffset + instanceID;
-	uint packedIdx = sortedIndices[dataPos];
-	bool isOccluded = (packedIdx & 0x80000000u) != 0;
-	uint idx = packedIdx & 0x7FFFFFFFu;
+	// Direct access — terrain self-draws, no culler indirection needed.
+	// instanceID maps directly into the compute shader's append buffers.
+	uint idx = instanceID;
 
 	// Get entity transform from global buffer (single shared slot — typically identity)
 	StructuredBuffer<InstanceDescriptor> descriptors = ResourceDescriptorHeap[DescriptorBufIdx];
@@ -204,28 +156,24 @@ VertexOutput VS(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_Insta
     StructuredBuffer<float3> positions = ResourceDescriptorHeap[PosBufferIdx];
     float3 pos = positions[vertexID];
 
-    // CDLOD per-vertex morphing
+    // Edge-stitched vertex displacement (no morphing)
     float4 rect = patch.rect;
     float2 rectSize = float2(rect.z - rect.x, rect.w - rect.y);
     float2 heightUV;
-    float3 morphedPos = MorphVertex(pos, rect.xy, rectSize, patch.level.x, entityWorld, heightUV);
+    uint stitchMask = (uint)patch.level.y;
+    float3 stitchedPos = StitchVertex(pos, rect.xy, rectSize, stitchMask, entityWorld, heightUV);
 
-    float4 worldPosition = mul(float4(morphedPos, 1), world);
+    float4 worldPosition = mul(float4(stitchedPos, 1), world);
     worldPosition = mul(worldPosition, ViewProjection);
     
     output.Position = worldPosition;
-    
-    // X-ray mode: push occluded instances to near depth
-    if (isOccluded)
-        output.Position.z = 0.0;
-    
-    float2 uv = (morphedPos.xz + float2(16, 16)) * 0.03125;
+
+    float2 uv = (stitchedPos.xz + float2(16, 16)) * 0.03125;
     uv.y = 1 - uv.y;
     output.Depth = worldPosition.w;
     output.UV = uv;
     output.UV2 = heightUV;
 	output.Level = patch.level.x;
-	output.Flags = isOccluded ? 1u : 0u;
 	return output;
 }
 
@@ -308,35 +256,7 @@ FragmentOutput PS(VertexOutput input)
     terrainNormal.xz += normal.xz;
     terrainNormal = normalize(terrainNormal);
     
-    // X-Ray occlusion debug mode (mode 4)
-    bool isOccluded = input.Flags != 0;
-    if (DebugMode == 4)
-    {
-        if (isOccluded)
-        {
-            float hue = frac(float(input.Level * 2654435761u) * (1.0 / 4294967296.0));
-            float3 xrayColor = float3(
-                abs(hue * 6.0 - 3.0) - 1.0,
-                2.0 - abs(hue * 6.0 - 2.0),
-                2.0 - abs(hue * 6.0 - 4.0)
-            );
-            xrayColor = saturate(xrayColor);
-            
-            output.Albedo = float4(xrayColor * 0.7, 0.5);
-            output.Normals = float4(terrainNormal, 0.0);
-            output.Data = float4(1, 0, 0, 1);
-            output.Depth = 99999.0;
-        }
-        else
-        {
-            float luma = dot(color.rgb, float3(0.299, 0.587, 0.114));
-            output.Albedo = float4(lerp(float3(luma, luma, luma), color.rgb, 0.3), color.a);
-            output.Normals = float4(terrainNormal, 1.0);
-            output.Data = float4(0, 0, 0, 1);
-            output.Depth = input.Depth;
-        }
-        return output;
-    }
+
 
     output.Albedo = color;
     output.Normals = float4(terrainNormal.xyz, 1); 
@@ -356,10 +276,8 @@ ShadowVSOutput VS_Shadow(uint primitiveVertexID : SV_VertexID, uint instanceID :
 {
     ShadowVSOutput output;
 
-    StructuredBuffer<uint> sortedIndices = ResourceDescriptorHeap[SortedIndicesIdx];
-    uint dataPos = InstanceBaseOffset + instanceID;
-    uint packedIdx = sortedIndices[dataPos];
-    uint idx = packedIdx & 0x7FFFFFFFu;
+    // Direct access — terrain self-draws, no culler indirection needed.
+    uint idx = instanceID;
 
     StructuredBuffer<InstanceDescriptor> descriptors = ResourceDescriptorHeap[DescriptorBufIdx];
     StructuredBuffer<row_major matrix> globalTransforms = ResourceDescriptorHeap[GlobalTransformBufferIdx];
@@ -377,13 +295,14 @@ ShadowVSOutput VS_Shadow(uint primitiveVertexID : SV_VertexID, uint instanceID :
     StructuredBuffer<float3> positions = ResourceDescriptorHeap[PosBufferIdx];
     float3 pos = positions[vertexID];
 
-    // CDLOD per-vertex morphing (must match VS() for consistent shadow depth)
+    // Edge-stitched vertex displacement (must match VS() for consistent shadow depth)
     float4 rect = patch.rect;
     float2 rectSize = float2(rect.z - rect.x, rect.w - rect.y);
     float2 heightUV;
-    float3 morphedPos = MorphVertex(pos, rect.xy, rectSize, patch.level.x, entityWorld, heightUV);
+    uint stitchMask = (uint)patch.level.y;
+    float3 stitchedPos = StitchVertex(pos, rect.xy, rectSize, stitchMask, entityWorld, heightUV);
 
-    float4 worldPosition = mul(float4(morphedPos, 1), world);
+    float4 worldPosition = mul(float4(stitchedPos, 1), world);
     worldPosition = mul(worldPosition, ViewProjection);
 
     output.Position = worldPosition;

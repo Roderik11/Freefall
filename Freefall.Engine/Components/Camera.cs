@@ -29,11 +29,11 @@ namespace Freefall.Components
         public float AspectRatio { get; set; } = 16.0f / 9.0f;
         public float NearPlane { get; set; } = 0.1f;
         public float FarPlane { get; set; } = 2048f;
+        public float FoVFactor { get; private set; }
 
         public Camera() 
         {
             if (Main == null) Main = this;
-            if (Engine.RenderView != null) Target = Engine.RenderView;
         }
 
         public Camera(RenderView target) : this()
@@ -41,19 +41,20 @@ namespace Freefall.Components
             Target = target;
             if (Target != null)
             {
-                Target.OnResize += OnResize;
-                OnResize(Target.Width, Target.Height);
+                Target.OnResized += HandleTargetResize;
+                HandleTargetResize();
             }
         }
 
         protected override void Awake()
         {
-            if (Target == null && Engine.RenderView != null) Target = Engine.RenderView;
             if (Main == null) Main = this;
         }
 
-        private void OnResize(int width, int height)
+        private void HandleTargetResize()
         {
+            int width = Target.Width;
+            int height = Target.Height;
             if (height == 0) height = 1;
             AspectRatio = (float)width / height;
         }
@@ -80,9 +81,13 @@ namespace Freefall.Components
             // Create view matrix from Transform (like Apex line 53)
             View = Matrix4x4.CreateLookAtLeftHanded(position, position + forward, up);
             
-            // Create projection matrix
+            // Create reverse-Z projection matrix (near→1.0, far→0.0)
+            // Can't use CreatePerspectiveFieldOfViewLeftHanded — it validates near < far
             float vFOV = FieldOfView * (MathF.PI / 180f);
-            Projection = Matrix4x4.CreatePerspectiveFieldOfViewLeftHanded(vFOV, AspectRatio, NearPlane, FarPlane);
+            Projection = CreateReverseZPerspectiveLH(vFOV, AspectRatio, NearPlane, FarPlane);
+        
+            FoVFactor = (180f / MathF.PI) / FieldOfView;
+            FoVFactor *= FoVFactor; // squared to match squared size comparison
         }
         
         /// <summary>
@@ -113,13 +118,39 @@ namespace Freefall.Components
         }
         
         /// <summary>
-        /// Get a projection matrix with custom near/far planes.
-        /// Used for shadow cascade computation.
+        /// Get a standard-Z projection matrix with custom near/far planes.
+        /// Used for shadow cascade frustum computation — standard Z is correct here
+        /// since we only unproject NDC corners to get world-space frustum geometry.
         /// </summary>
         public Matrix4x4 GetProjectionMatrix(float nearPlane, float farPlane)
         {
             float vFOV = FieldOfView * (MathF.PI / 180f);
             return Matrix4x4.CreatePerspectiveFieldOfViewLeftHanded(vFOV, AspectRatio, nearPlane, farPlane);
+        }
+
+        /// <summary>
+        /// Build a left-handed perspective projection matrix with reverse-Z (near→1, far→0).
+        /// The .NET CreatePerspectiveFieldOfViewLeftHanded validates near &lt; far and rejects swapped values,
+        /// so we build the matrix manually.
+        /// </summary>
+        private static Matrix4x4 CreateReverseZPerspectiveLH(float fovY, float aspect, float near, float far)
+        {
+            float h = 1.0f / MathF.Tan(fovY * 0.5f);
+            float w = h / aspect;
+
+            // Standard LH perspective maps [near,far] → [0,1]:
+            //   M33 = far / (far - near),  M43 = -near * far / (far - near)
+            // Reverse-Z maps [near,far] → [1,0]:
+            //   M33 = near / (far - near)
+            //   M43 = far * near / (far - near)
+            // Values are positive so NDC z stays in [0,1] (required by D3D clip).
+            float range = far - near;
+            return new Matrix4x4(
+                w,    0,    0,    0,
+                0,    h,    0,    0,
+                0,    0,    near / range,  1,
+                0,    0,    far * near / range, 0
+            );
         }
 
         /// <summary>

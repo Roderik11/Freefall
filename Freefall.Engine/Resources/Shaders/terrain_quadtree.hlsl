@@ -1,7 +1,10 @@
-// GPU-Driven Quadtree Terrain — Restricted Quadtree (Two-Pass)
+// GPU-Driven Quadtree Terrain — Restricted Quadtree (Three-Pass)
 // Pass 1 (CSMarkSplits): Each thread evaluates its node, marks split flags, and forces
 //   spatial neighbors to split (restricted quadtree constraint: ≤1 level difference).
-// Pass 2 (CSEmitLeaves): Reads enforced split flags and emits visible leaf patches.
+// Pass 2 (CSEmitLeaves): Reads enforced split flags and emits visible leaf patches
+//   with inline Hi-Z occlusion culling.
+// Pass 3 (CSBuildDrawArgs): Single-thread pass that reads the append counter and writes
+//   DrawInstanced indirect arguments for ExecuteIndirect.
 
 // Must match Terrain.TerrainPatchData in C#
 struct TerrainPatchData
@@ -30,7 +33,7 @@ struct InstanceDescriptor
 //   Slot 6: TransformSlot
 //   Slot 7: MaterialId
 //   Slot 8: MeshPartId
-//   Slot 9: LODRange0 (as float bits) — standard CDLOD base range
+//   Slot 9: (unused, was LODRange0)
 //   Slot 10: TotalNodes
 //   Slot 11: HeightTexIdx
 //   Slot 12-14: CameraPos (float3)
@@ -43,13 +46,35 @@ struct InstanceDescriptor
 //   Slot 25: TerrainSize.x
 //   Slot 26: TerrainSize.y
 //   Slot 27: BuildMip (current mip level for CSBuildMinMaxMip)
-//   Slot 28: AdaptiveStrength (float bits) — how much roughness affects LOD range
-//   Slot 29: MipInputSRV (source mip for CSBuildMinMaxMip)
-//   Slot 30: MipOutputUAV (target mip for CSBuildMinMaxMip)
+//   Slot 28: PixelErrorThreshold (float bits) — max screen-space error before split
+//   Slot 29: ScreenHeight (float bits) / MipInputSRV (overwritten per-pass)
+//   Slot 30: TanHalfFov (float bits) / MipOutputUAV (overwritten per-pass)
+//   Slot 31: IndirectArgsUAV (target UAV for CSBuildDrawArgs output)
 
 cbuffer PushConstants : register(b3)
 {
     uint4 Indices[8];
+};
+
+// Frustum planes + Hi-Z occlusion parameters (root slot 1 -> register b0)
+// Shared layout with cull_instances.hlsl — same constant buffer is used by both.
+cbuffer FrustumPlanes : register(b0)
+{
+    float4 Plane0;
+    float4 Plane1;
+    float4 Plane2;
+    float4 Plane3;
+    float4 Plane4;
+    float4 Plane5;
+    // Hi-Z occlusion culling parameters
+    row_major float4x4 OcclusionProjection; // ViewProjection for sphere-to-screen
+    uint HiZSrvIdx;        // Bindless SRV index of Hi-Z pyramid (0 = disabled)
+    float2 HiZSize;        // Mip 0 dimensions
+    uint HiZMipCount;      // Number of mip levels in pyramid
+    float NearPlane;       // Camera near plane
+    uint CullStatsUAVIdx;  // UAV for cull stats (unused by terrain)
+    uint FrustumDebugMode; // Debug visualization mode
+    float _frustumPad1;
 };
 
 // Accessors for push constants
@@ -62,7 +87,6 @@ uint GetMaxDepth()              { return Indices[1].y; }
 uint GetTransformSlot()         { return Indices[1].z; }
 uint GetMaterialId()            { return Indices[1].w; }
 uint GetMeshPartId()            { return Indices[2].x; }
-float GetLODRange0()            { return asfloat(Indices[2].y); }
 uint GetTotalNodes()            { return Indices[2].z; }
 uint GetHeightTexIdx()          { return Indices[2].w; }
 uint GetMaxPatches()            { return Indices[5].y; }
@@ -71,9 +95,12 @@ float GetMaxHeight()            { return asfloat(Indices[5].w); }
 uint GetHeightRangeSRV()        { return Indices[6].x; }
 float2 GetTerrainSize()         { return float2(asfloat(Indices[6].y), asfloat(Indices[6].z)); }
 uint GetBuildMip()              { return Indices[6].w; }
-float GetAdaptiveStrength()     { return asfloat(Indices[7].x); }
+float GetPixelErrorThreshold()  { return asfloat(Indices[7].x); }
+float GetScreenHeight()         { return asfloat(Indices[7].y); }
+float GetTanHalfFov()           { return asfloat(Indices[7].z); }
 uint GetMipInputSRV()           { return Indices[7].y; }
 uint GetMipOutputUAV()          { return Indices[7].z; }
+uint GetIndirectArgsUAV()       { return Indices[7].w; }
 
 // We need to decode camera position and root center/extents from push constants.
 // Since float3 spans across uint4 boundaries, decode manually:
@@ -97,6 +124,75 @@ float3 DecodeRootExtents()
 
 // UAVs accessed via ResourceDescriptorHeap (bindless)
 // Output buffers are written via atomic append
+
+// ─────────────────────────────────────────────────────────────────────
+// Frustum + Hi-Z occlusion helpers (adapted from cull_instances.hlsl)
+// Frustum test: sphere vs 6 frustum planes.
+// ─────────────────────────────────────────────────────────────────────
+bool IsFrustumVisible(float3 center, float radius)
+{
+    float4 planes[6] = { Plane0, Plane1, Plane2, Plane3, Plane4, Plane5 };
+    for (uint i = 0; i < 6; i++)
+    {
+        float dist = dot(planes[i].xyz, center) + planes[i].w;
+        if (dist > radius)
+            return false;
+    }
+    return true;
+}
+
+// Hi-Z occlusion test: project bounding sphere, pick mip, sample depth pyramid.
+// Returns true if the sphere is FULLY behind solid geometry (should be culled).
+bool IsTerrainOccluded(float3 worldCenter, float worldRadius)
+{
+    if (HiZSrvIdx == 0) return false; // Hi-Z disabled
+
+    // Project sphere center to clip space using previous-frame VP
+    float4 clipCenter = mul(float4(worldCenter, 1.0), OcclusionProjection);
+    float3 ndc = clipCenter.xyz / clipCenter.w;
+    float2 uv = ndc.xy * float2(0.5, -0.5) + 0.5;
+
+    // Off-screen center — can't test, assume visible
+    if (any(uv < 0.0) || any(uv > 1.0)) return false;
+
+    Texture2D<float> hiZ = ResourceDescriptorHeap[HiZSrvIdx];
+
+    float w, h, levels;
+    hiZ.GetDimensions(0, w, h, levels);
+    float2 mip0Size = float2(w, h);
+
+    // Project sphere radius to screen pixels for mip selection
+    float projScale = OcclusionProjection._m11;
+    projScale = abs(projScale) < 0.001 ? 1.0 : projScale;
+    float projRadius = (worldRadius * projScale) / clipCenter.w;
+    float screenRadius = projRadius * mip0Size.y * 0.5;
+
+    // Pick mip where sphere covers ~2 texels (conservative)
+    float mipLevel = ceil(log2(max(screenRadius * 2.0, 1.0)));
+    mipLevel = min(mipLevel, levels - 1.0f);
+
+    uint mip = (uint)mipLevel;
+    float2 mipSize = max(float2(1,1), mip0Size / (float)(1u << mip));
+
+    // 4-tap sampling for stability
+    float2 texCoordFloat = uv * mipSize - 0.5;
+    int2 baseCoord = int2(texCoordFloat);
+    int2 maxCoord = int2(mipSize) - 1;
+
+    float d0 = hiZ.Load(int3(clamp(baseCoord,              int2(0,0), maxCoord), mip));
+    float d1 = hiZ.Load(int3(clamp(baseCoord + int2(1,0),  int2(0,0), maxCoord), mip));
+    float d2 = hiZ.Load(int3(clamp(baseCoord + int2(0,1),  int2(0,0), maxCoord), mip));
+    float d3 = hiZ.Load(int3(clamp(baseCoord + int2(1,1),  int2(0,0), maxCoord), mip));
+
+    // Conservative: take MAX depth of footprint (farthest view-space Z)
+    // View-space Z (Position.w) is NOT affected by reverse-Z — larger Z = farther.
+    float sampledDepth = max(max(d0, d1), max(d2, d3));
+
+    // Use sphere's nearest point to camera (clip.w - radius)
+    float sphereNearestDepth = clipCenter.w - worldRadius;
+    return sphereNearestDepth > sampledDepth; // sphere farther than farthest depth → occluded
+}
+
 
 // Compute the flat index where a given depth level starts in the complete quadtree.
 // Level L starts at (4^L - 1) / 3
@@ -183,42 +279,34 @@ float2 SampleHeightRange(uint depth, uint localIdx, uint maxDepth)
     return heightRange.Load(int3(ix, iz, mipLevel));
 }
 
-// Standard CDLOD split check with per-node bounding sphere.
-// Uses precomputed height range mip pyramid for tight bounding sphere distance test.
-// Formula: split if distance(camera, sphere_center) - sphere_radius < LODRange[level]
+// Screen-space error split check.
+// Geometric error = height range from mip pyramid (max error if this node isn't split).
+// Project geometric error to screen pixels; split if error exceeds threshold.
+// This naturally adapts to both distance AND terrain roughness in one metric.
 bool ShouldSplit(uint depth, uint localIdx, float3 nodeCenter, float3 nodeExtents,
-                 float3 cameraPos, uint maxDepth, float lodRange0)
+                 float3 cameraPos, uint maxDepth)
 {
-    // Standard CDLOD LOD range for this node's level
-    uint level = maxDepth - depth;
-    float range = lodRange0 * (float)(1u << level);
-
-    // Sample height range from precomputed mip pyramid
+    // Sample height range from precomputed mip pyramid (already in world units —
+    // CSBuildMinMaxMip multiplies by MaxHeight when building mip 0)
     float2 minmax = SampleHeightRange(depth, localIdx, maxDepth);
 
-    // Bounding sphere center uses actual height midpoint
+    // Geometric error: height variation in world units
+    float geometricError = minmax.y - minmax.x;
+
+    // Bounding sphere center uses actual height midpoint (world units)
     float3 sphereCenter = nodeCenter;
     sphereCenter.y = (minmax.x + minmax.y) * 0.5;
 
-    // Tight bounding sphere radius from XZ extent + height range
-    float xzHalfDiag = length(float2(nodeExtents.x, nodeExtents.z));
-    float heightHalfRange = (minmax.y - minmax.x) * 0.5;
-    float sphereRadius = sqrt(xzHalfDiag * xzHalfDiag + heightHalfRange * heightHalfRange);
+    // Distance from camera to node center
+    float dist = max(distance(cameraPos, sphereCenter), 0.001);
 
-    float3 cam = cameraPos;
-    // Flatten Y when camera is within terrain height range (ground-level view)
-    if (cam.y < minmax.y)
-    {
-        cam.y = sphereCenter.y;
-    }
+    // Project geometric error to screen pixels:
+    //   screenError = (geometricError × screenHeight) / (2 × dist × tan(fov/2))
+    float screenHeight = GetScreenHeight();
+    float tanHalfFov = GetTanHalfFov();
+    float screenError = (geometricError * screenHeight) / (2.0 * dist * tanHalfFov);
 
-    // Adaptive splitting: rough terrain splits at greater distances
-    float roughness = (minmax.y - minmax.x) / max(GetMaxHeight(), 0.001);
-    float adaptiveFactor = lerp(1.0, GetAdaptiveStrength(), saturate(roughness));
-    float effectiveRange = range / adaptiveFactor;
-
-    float dist = distance(cam, sphereCenter);
-    return (dist - sphereRadius) < effectiveRange;
+    return screenError > GetPixelErrorThreshold();
 }
 
 // Compute UV rect for a node using exact integer arithmetic — no FP accumulation.
@@ -333,7 +421,6 @@ void CSMarkSplits(uint3 dtid : SV_DispatchThreadID)
         return;
     
     uint maxDepth = GetMaxDepth();
-    float lodRange0 = GetLODRange0();
     float3 cameraPos = DecodeCameraPos();
     float3 rootCenter = DecodeRootCenter();
     float3 rootExtents = DecodeRootExtents();
@@ -350,8 +437,8 @@ void CSMarkSplits(uint3 dtid : SV_DispatchThreadID)
     float3 nodeCenter, nodeExtents;
     ComputeNodeBounds(depth, localIdx, rootCenter, rootExtents, nodeCenter, nodeExtents);
     
-    // Standard CDLOD split check (with bounding sphere)
-    if (!ShouldSplit(depth, localIdx, nodeCenter, nodeExtents, cameraPos, maxDepth, lodRange0))
+    // Screen-space error split check
+    if (!ShouldSplit(depth, localIdx, nodeCenter, nodeExtents, cameraPos, maxDepth))
         return;
     
     // Mark this node as split
@@ -432,6 +519,26 @@ void CSEmitLeaves(uint3 dtid : SV_DispatchThreadID)
     
     if (!iAmLeaf)
         return;
+
+    // Compute this node's bounds for frustum + Hi-Z tests
+    float3 nodeCenter, nodeExtents;
+    ComputeNodeBounds(depth, localIdx, rootCenter, rootExtents, nodeCenter, nodeExtents);
+
+    // Tight bounding sphere from height range mip pyramid
+    float2 minmax = SampleHeightRange(depth, localIdx, maxDepth);
+    float xzRadius = length(float2(nodeExtents.x, nodeExtents.z));
+    float heightHalfRange = (minmax.y - minmax.x) * 0.5;
+    float sphereRadius = sqrt(xzRadius * xzRadius + heightHalfRange * heightHalfRange);
+    float sphereY = (minmax.x + minmax.y) * 0.5;
+    float3 sphereCenter = float3(nodeCenter.x, sphereY, nodeCenter.z);
+
+    // Frustum cull: skip patches entirely outside the camera frustum
+    if (!IsFrustumVisible(sphereCenter, sphereRadius))
+        return;
+
+    // Hi-Z occlusion cull: skip patches fully behind solid geometry
+    if (IsTerrainOccluded(sphereCenter, sphereRadius))
+        return;
     
     // Atomic append to output — get slot index
     RWByteAddressBuffer counterBuffer = ResourceDescriptorHeap[GetCounterUAV()];
@@ -443,10 +550,6 @@ void CSEmitLeaves(uint3 dtid : SV_DispatchThreadID)
     if (patchIdx >= maxPatches)
         return;
     
-    // Compute this node's bounds for bounding sphere
-    float3 nodeCenter, nodeExtents;
-    ComputeNodeBounds(depth, localIdx, rootCenter, rootExtents, nodeCenter, nodeExtents);
-    
     // Write InstanceDescriptor
     RWStructuredBuffer<InstanceDescriptor> outDescriptors = ResourceDescriptorHeap[GetOutputDescriptorsUAV()];
     InstanceDescriptor desc;
@@ -455,25 +558,69 @@ void CSEmitLeaves(uint3 dtid : SV_DispatchThreadID)
     desc.CustomDataIdx = 0;
     outDescriptors[patchIdx] = desc;
     
-    // Write BoundingSphere — tight per-node bounds from precomputed height range mip pyramid
+    // Write BoundingSphere (already computed above for culling)
     RWStructuredBuffer<float4> outSpheres = ResourceDescriptorHeap[GetOutputSpheresUAV()];
-    float2 minmax = SampleHeightRange(depth, localIdx, maxDepth);
-    float xzRadius = length(float2(nodeExtents.x, nodeExtents.z));
-    float heightHalfRange = (minmax.y - minmax.x) * 0.5;
-    float sphereRadius = sqrt(xzRadius * xzRadius + heightHalfRange * heightHalfRange);
-    float sphereY = (minmax.x + minmax.y) * 0.5;
-    outSpheres[patchIdx] = float4(nodeCenter.x, sphereY, nodeCenter.z, sphereRadius);
+    outSpheres[patchIdx] = float4(sphereCenter, sphereRadius);
     
     // Write SubbatchId (all terrain patches use the same mesh)
     RWStructuredBuffer<uint> outSubbatchIds = ResourceDescriptorHeap[GetOutputSubbatchIdsUAV()];
     outSubbatchIds[patchIdx] = GetMeshPartId();
     
+    // ── Compute stitch mask ──
+    // Check each cardinal neighbor: if the neighbor at the same depth does NOT exist
+    // (parent wasn't split), the neighbor is coarser → set stitch bit.
+    // Bits: 0=S(-Z), 1=E(+X), 2=N(+Z), 3=W(-X)
+    uint ix, iz;
+    DecodeGridPos(depth, localIdx, ix, iz);
+    uint gridSize = 1u << depth;
+    uint stitchMask = 0;
+
+    if (depth > 0)
+    {
+        // South neighbor (iz - 1)
+        if (iz > 0)
+        {
+            uint nIdx = LevelStart(depth) + EncodeLocalIdx(depth, ix, iz - 1);
+            uint nParentLocal = (EncodeLocalIdx(depth, ix, iz - 1)) >> 2;
+            uint nParentFlat = LevelStart(depth - 1) + nParentLocal;
+            uint nParentSplit = splitFlags.Load(nParentFlat * 4);
+            if (nParentSplit == 0) stitchMask |= 1u;  // neighbor is coarser
+        }
+
+        // East neighbor (ix + 1)
+        if (ix + 1 < gridSize)
+        {
+            uint nParentLocal = (EncodeLocalIdx(depth, ix + 1, iz)) >> 2;
+            uint nParentFlat = LevelStart(depth - 1) + nParentLocal;
+            uint nParentSplit = splitFlags.Load(nParentFlat * 4);
+            if (nParentSplit == 0) stitchMask |= 2u;
+        }
+
+        // North neighbor (iz + 1)
+        if (iz + 1 < gridSize)
+        {
+            uint nParentLocal = (EncodeLocalIdx(depth, ix, iz + 1)) >> 2;
+            uint nParentFlat = LevelStart(depth - 1) + nParentLocal;
+            uint nParentSplit = splitFlags.Load(nParentFlat * 4);
+            if (nParentSplit == 0) stitchMask |= 4u;
+        }
+
+        // West neighbor (ix - 1)
+        if (ix > 0)
+        {
+            uint nParentLocal = (EncodeLocalIdx(depth, ix - 1, iz)) >> 2;
+            uint nParentFlat = LevelStart(depth - 1) + nParentLocal;
+            uint nParentSplit = splitFlags.Load(nParentFlat * 4);
+            if (nParentSplit == 0) stitchMask |= 8u;
+        }
+    }
+
     // Write TerrainPatchData
     RWStructuredBuffer<TerrainPatchData> outTerrainData = ResourceDescriptorHeap[GetOutputTerrainDataUAV()];
     TerrainPatchData patchData;
     patchData.Rect = ComputeRectExact(depth, localIdx);
-    // LOD level output (morph is computed per-vertex in the vertex shader via CDLOD)
-    patchData.Level = float2((float)(maxDepth - depth), 0);
+    // Level.x = LOD level (for debug), Level.y = stitch mask (4 bits)
+    patchData.Level = float2((float)(maxDepth - depth), (float)stitchMask);
     patchData.Padding = float2(0, 0);
     outTerrainData[patchIdx] = patchData;
 }
@@ -542,4 +689,30 @@ void CSBuildMinMaxMip(uint3 dtid : SV_DispatchThreadID)
         
         output[dtid.xy] = float2(hMin, hMax);
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Pass 3: Build DrawInstanced indirect arguments from counter
+// Single-thread dispatch (1,1,1). Reads the atomic counter and writes
+// a D3D12_DRAW_INSTANCED_ARGUMENTS struct for ExecuteIndirect.
+// ─────────────────────────────────────────────────────────────────────
+
+[numthreads(1, 1, 1)]
+void CSBuildDrawArgs(uint3 dtid : SV_DispatchThreadID)
+{
+    // Read the patch count from the atomic counter
+    RWByteAddressBuffer counterBuffer = ResourceDescriptorHeap[GetCounterUAV()];
+    uint patchCount = counterBuffer.Load(0);
+    
+    // Clamp to buffer capacity
+    patchCount = min(patchCount, GetMaxPatches());
+    
+    // Write DrawInstanced args: (VertexCountPerInstance, InstanceCount, StartVertex, StartInstance)
+    // VertexCountPerInstance = total index count of the terrain patch mesh.
+    // C# repurposes Indices[7].y (MipInputSRV) to pass the mesh index count before this dispatch.
+    RWByteAddressBuffer argsBuffer = ResourceDescriptorHeap[GetIndirectArgsUAV()];
+    argsBuffer.Store(0, GetMipInputSRV());   // VertexCountPerInstance (mesh index count from C#)
+    argsBuffer.Store(4, patchCount);         // InstanceCount = number of visible patches
+    argsBuffer.Store(8, 0u);                 // StartVertexLocation = 0
+    argsBuffer.Store(12, 0u);                // StartInstanceLocation = 0
 }

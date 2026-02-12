@@ -25,9 +25,9 @@ namespace Freefall.Assets
         static LODGroups()
         {
             // LOD ranges in world units (distance from camera)
-            Trees = new LODGroup("Trees", 50f, 100f, 200f, 400f, 800f);
-            LargeProps = new LODGroup("LargeProps", 32f, 64f, 128f, 256f);
-            SmallProps = new LODGroup("SmallProps", 32, 64, 128, 256, 512, 1024);
+            Trees = new LODGroup("Trees", .5f, .4f, .3f, .2f, .1f, .0f);
+            LargeProps = new LODGroup("LargeProps", .6f, .3f, .1f, .05f);
+            SmallProps = new LODGroup("SmallProps", .8f, .6f, .4f, .2f, .1f, .05f);
         }
     }
 }

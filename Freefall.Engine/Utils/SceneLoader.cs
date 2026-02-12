@@ -390,35 +390,36 @@ namespace Freefall.Loaders
                         if (!staticMeshLookup.TryGetValue(key, out var staticMesh))
                         {
                             staticMesh = new StaticMesh { Name = meshName, Mesh = mesh, LODGroup = LODGroups.LargeProps };
-                            // Populate StaticMesh Parts
-                            var allLODs = mesh.MeshParts.FindAll(m => m.Name.Contains("LOD_"));
-                            bool allAreLODs = (mesh.MeshParts.Count - allLODs.Count) <= 0;
-
-                             if (allAreLODs)
+                            // Classify mesh parts into base or LOD levels
+                            // _LOD_0 / _LOD_00 = base mesh (highest quality)
+                            // _LOD_01+ = lower quality LOD levels
+                            for (int p = 0; p < mesh.MeshParts.Count; p++)
                             {
-                                for (int p = 0; p < mesh.MeshParts.Count; p++)
-                                    staticMesh.MeshParts.Add(new MeshElement { Mesh = mesh, Material = material, MeshPartIndex = p });
-                            }
-                            else
-                            {
-                                for (int p = 0; p < mesh.MeshParts.Count; p++)
+                                var part = mesh.MeshParts[p];
+                                int index = part.Name.IndexOf("_LOD_");
+                                if (index < 0)
                                 {
-                                    var part = mesh.MeshParts[p];
-                                    int index = part.Name.IndexOf("_LOD_");
-                                    if (index < 0)
+                                    staticMesh.MeshParts.Add(new MeshElement { Mesh = mesh, Material = material, MeshPartIndex = p });
+                                }
+                                else
+                                {
+                                    int endIndex = index + 6 < part.Name.Length ? 2 : 1;
+                                    int lvl = Convert.ToInt32(part.Name.Substring(index + 5, endIndex)) - 1;
+                                    if (lvl < 0)
                                     {
+                                        // _LOD_0 / _LOD_00 → treat as base mesh part
                                         staticMesh.MeshParts.Add(new MeshElement { Mesh = mesh, Material = material, MeshPartIndex = p });
                                     }
                                     else
                                     {
-                                        int endIndex = index + 6 < part.Name.Length ? 2 : 1;
-                                        int lvl = Convert.ToInt32(part.Name.Substring(index + 5, endIndex)) - 1;
                                         while (staticMesh.LODs.Count < lvl + 1)
                                             staticMesh.LODs.Add(new StaticMeshLOD { Mesh = mesh });
                                         staticMesh.LODs[lvl].MeshParts.Add(new MeshElement { Mesh = mesh, Material = material, MeshPartIndex = p });
                                     }
                                 }
                             }
+
+
                             staticMeshLookup[key] = staticMesh;
                         }
 
@@ -507,26 +508,13 @@ namespace Freefall.Loaders
         private StaticMesh CreateStaticMesh(Mesh mesh, string meshPath, bool tree = false)
         {
             var staticMesh = new StaticMesh { Name = mesh.Name, Mesh = mesh, LODGroup = LODGroups.LargeProps };
-            var allLODs = mesh.MeshParts.FindAll((m) => m.Name.Contains("LOD_"));
             var material = DefaultMaterial;
 
-            if (mesh.MeshParts.Count - allLODs.Count <= 0)
-            {
-                for (int i = 0; i < mesh.MeshParts.Count; i++)
-                {
-                    staticMesh.MeshParts.Add(new MeshElement
-                    {
-                        Mesh = mesh,
-                        Material = material,
-                        MeshPartIndex = i
-                    });
-                }
-                return staticMesh;
-            }
-
+            // Classify mesh parts into base or LOD levels
+            // _LOD_0 / _LOD_00 = base mesh (highest quality)
+            // _LOD_01+ = lower quality LOD levels
             for (int i = 0; i < mesh.MeshParts.Count; i++)
             {
-                // ... [Same LOD logic preserved]
                 var part = mesh.MeshParts[i];
                 var name = part.Name;
                 int index = name.IndexOf("_LOD_");
@@ -538,8 +526,16 @@ namespace Freefall.Loaders
                 {
                     int endIndex = index + 6 < name.Length ? 2 : 1;
                     int lvl = Convert.ToInt32(name.Substring(index + 5, endIndex)) - 1;
-                    while (staticMesh.LODs.Count < lvl + 1) staticMesh.LODs.Add(new StaticMeshLOD { Mesh = mesh });
-                    staticMesh.LODs[lvl].MeshParts.Add(new MeshElement { Mesh = mesh, Material = material, MeshPartIndex = i });
+                    if (lvl < 0)
+                    {
+                        // _LOD_0 / _LOD_00 → treat as base mesh part
+                        staticMesh.MeshParts.Add(new MeshElement { Mesh = mesh, Material = material, MeshPartIndex = i });
+                    }
+                    else
+                    {
+                        while (staticMesh.LODs.Count < lvl + 1) staticMesh.LODs.Add(new StaticMeshLOD { Mesh = mesh });
+                        staticMesh.LODs[lvl].MeshParts.Add(new MeshElement { Mesh = mesh, Material = material, MeshPartIndex = i });
+                    }
                 }
             }
             return staticMesh;

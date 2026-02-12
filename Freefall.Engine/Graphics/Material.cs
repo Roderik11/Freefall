@@ -170,8 +170,14 @@ namespace Freefall.Graphics
             // Input Layout (Bindless = Empty)
             // We fetch vertices manually in VS using SV_VertexID
 
-            // Rasterizer State
-            var rasterizerDesc = RasterizerDescription.CullNone; // Debug: Disable culling
+            // Rasterizer State — use CullMode from shader metadata (FXParser defaults to "Back")
+            var cullMode = renderState.CullMode switch
+            {
+                "None" => CullMode.None,
+                "Front" => CullMode.Front,
+                _ => CullMode.Back
+            };
+            var rasterizerDesc = new RasterizerDescription(cullMode, FillMode.Solid);
 
             // Blend State - use shader metadata, fall back to Effect's property
             BlendDescription blendDesc = renderState.BlendMode switch
@@ -185,9 +191,21 @@ namespace Freefall.Graphics
                         : BlendDescription.Opaque
             };
 
-            // Depth Stencil State - use shader metadata
             DepthStencilDescription depthDesc;
             Format depthFormat;
+            
+            // Parse DepthFunc from shader metadata (default: GreaterEqual for reverse depth)
+            var parsedDepthFunc = renderState.DepthFunc switch
+            {
+                "Less" => ComparisonFunction.Less,
+                "LessEqual" => ComparisonFunction.LessEqual,
+                "Greater" => ComparisonFunction.Greater,
+                "GreaterEqual" => ComparisonFunction.GreaterEqual,
+                "Equal" => ComparisonFunction.Equal,
+                "Always" => ComparisonFunction.Always,
+                "Never" => ComparisonFunction.Never,
+                _ => ComparisonFunction.GreaterEqual // Reverse depth default
+            };
             
             if (!renderState.DepthTest && !renderState.DepthWrite)
             {
@@ -202,15 +220,21 @@ namespace Freefall.Graphics
                 {
                     DepthEnable = true,
                     DepthWriteMask = DepthWriteMask.Zero,
-                    DepthFunc = ComparisonFunction.LessEqual,
+                    DepthFunc = parsedDepthFunc,
                     StencilEnable = false
                 };
                 depthFormat = Format.D32_Float;
             }
             else
             {
-                // Full depth (standard geometry)
-                depthDesc = DepthStencilDescription.Default;
+                // Full depth (standard geometry) — reverse depth: GreaterEqual
+                depthDesc = new DepthStencilDescription
+                {
+                    DepthEnable = true,
+                    DepthWriteMask = DepthWriteMask.All,
+                    DepthFunc = parsedDepthFunc,
+                    StencilEnable = false
+                };
                 depthFormat = Format.D32_Float;
             }
 
@@ -253,7 +277,13 @@ namespace Freefall.Graphics
                 {
                     psoDesc.RenderTargetFormats = Array.Empty<Format>();
                     psoDesc.DepthStencilFormat = Format.D32_Float;
-                    psoDesc.DepthStencilState = DepthStencilDescription.Default;
+                    psoDesc.DepthStencilState = new DepthStencilDescription
+                    {
+                        DepthEnable = true,
+                        DepthWriteMask = DepthWriteMask.All,
+                        DepthFunc = ComparisonFunction.LessEqual, // Shadow maps use standard Z (orthographic)
+                        StencilEnable = false
+                    };
                     var shadowRaster = new RasterizerDescription(CullMode.None, FillMode.Solid);
                     shadowRaster.DepthBias = 4000;
                     shadowRaster.SlopeScaledDepthBias = 2.0f;

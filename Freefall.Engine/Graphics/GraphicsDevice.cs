@@ -44,8 +44,10 @@ namespace Freefall.Graphics
 
         private int _rtvDescriptorSize;
         private int _rtvDescriptorIndex;
+        private readonly Stack<int> _freeRtvIndices = new();
         private int _dsvDescriptorSize;
         private int _dsvDescriptorIndex;
+        private readonly Stack<int> _freeDsvIndices = new();
 
         public ID3D12Device NativeDevice => _device;
         public ID3D12CommandQueue CommandQueue => _commandQueue;
@@ -145,7 +147,7 @@ namespace Freefall.Graphics
                 new StaticSamplerDescription(ShaderVisibility.All, 0, 0) { Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Wrap, AddressV = TextureAddressMode.Wrap, AddressW = TextureAddressMode.Wrap },
                 new StaticSamplerDescription(ShaderVisibility.All, 1, 0) { Filter = Filter.MinMagMipPoint, AddressU = TextureAddressMode.Clamp, AddressV = TextureAddressMode.Clamp, AddressW = TextureAddressMode.Clamp },
                 new StaticSamplerDescription(ShaderVisibility.All, 2, 0) { Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Clamp, AddressV = TextureAddressMode.Clamp, AddressW = TextureAddressMode.Clamp },
-                new StaticSamplerDescription(ShaderVisibility.All, 3, 0) { Filter = Filter.ComparisonMinMagLinearMipPoint, AddressU = TextureAddressMode.Clamp, AddressV = TextureAddressMode.Clamp, AddressW = TextureAddressMode.Clamp, ComparisonFunction = ComparisonFunction.LessEqual }
+                new StaticSamplerDescription(ShaderVisibility.All, 3, 0) { Filter = Filter.ComparisonMinMagLinearMipPoint, AddressU = TextureAddressMode.Clamp, AddressV = TextureAddressMode.Clamp, AddressW = TextureAddressMode.Clamp, ComparisonFunction = ComparisonFunction.LessEqual } // Shadow maps use standard Z (orthographic)
             };
 
             // D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED = 0x400
@@ -264,18 +266,40 @@ namespace Freefall.Graphics
 
         public CpuDescriptorHandle AllocateRtv()
         {
-             if (_rtvDescriptorIndex >= 256) throw new InvalidOperationException("Out of RTV descriptors");
-             var handle = _rtvHeap.GetCPUDescriptorHandleForHeapStart() + (_rtvDescriptorIndex * _rtvDescriptorSize);
-             _rtvDescriptorIndex++;
-             return handle;
+             int index;
+             if (_freeRtvIndices.Count > 0)
+                 index = _freeRtvIndices.Pop();
+             else
+             {
+                 if (_rtvDescriptorIndex >= 256) throw new InvalidOperationException("Out of RTV descriptors");
+                 index = _rtvDescriptorIndex++;
+             }
+             return _rtvHeap.GetCPUDescriptorHandleForHeapStart() + (index * _rtvDescriptorSize);
+        }
+
+        public void FreeRtv(CpuDescriptorHandle handle)
+        {
+            int index = (int)(handle.Ptr - _rtvHeap.GetCPUDescriptorHandleForHeapStart().Ptr) / _rtvDescriptorSize;
+            _freeRtvIndices.Push(index);
         }
 
         public CpuDescriptorHandle AllocateDsv()
         {
-             if (_dsvDescriptorIndex >= 64) throw new InvalidOperationException("Out of DSV descriptors");
-             var handle = _dsvHeap.GetCPUDescriptorHandleForHeapStart() + (_dsvDescriptorIndex * _dsvDescriptorSize);
-             _dsvDescriptorIndex++;
-             return handle;
+             int index;
+             if (_freeDsvIndices.Count > 0)
+                 index = _freeDsvIndices.Pop();
+             else
+             {
+                 if (_dsvDescriptorIndex >= 64) throw new InvalidOperationException("Out of DSV descriptors");
+                 index = _dsvDescriptorIndex++;
+             }
+             return _dsvHeap.GetCPUDescriptorHandleForHeapStart() + (index * _dsvDescriptorSize);
+        }
+
+        public void FreeDsv(CpuDescriptorHandle handle)
+        {
+            int index = (int)(handle.Ptr - _dsvHeap.GetCPUDescriptorHandleForHeapStart().Ptr) / _dsvDescriptorSize;
+            _freeDsvIndices.Push(index);
         }
 
         public CpuDescriptorHandle AllocateSrv(out GpuDescriptorHandle gpuHandle)
@@ -488,7 +512,7 @@ namespace Freefall.Graphics
             }
         }
 
-        public ID3D12Resource CreateTexture2D(Format format, int width, int height, int arraySize = 1, int mipLevels = 1, ResourceFlags flags = ResourceFlags.None, ResourceStates initialState = ResourceStates.Common, Color4? clearValue = null)
+        public ID3D12Resource CreateTexture2D(Format format, int width, int height, int arraySize = 1, int mipLevels = 1, ResourceFlags flags = ResourceFlags.None, ResourceStates initialState = ResourceStates.Common, Color4? clearValue = null, float? depthClearValue = null)
         {
             var desc = ResourceDescription.Texture2D(format, (uint)width, (uint)height, (ushort)arraySize, (ushort)mipLevels, 1, 0, flags);
             
@@ -505,7 +529,8 @@ namespace Freefall.Graphics
                 else if (format == Format.R16_Typeless) clearFormat = Format.D16_UNorm;
                 else if (format == Format.R24G8_Typeless) clearFormat = Format.D24_UNorm_S8_UInt;
 
-                optimizedClearValue = new ClearValue(clearFormat, 1.0f, 0);
+                float clearDepth = depthClearValue ?? 0.0f; // Default: reverse-Z far plane
+                optimizedClearValue = new ClearValue(clearFormat, clearDepth, 0);
             }
 
             try

@@ -28,6 +28,19 @@ namespace Freefall.Components
             Params = new MaterialBlock();
         }
 
+        const float MinDrawSizeSq = 0.01f * 0.01f;
+
+        // TODO: only recompute when transform is dirty (adapt Apex's lazy transform updates)
+        private void UpdateBounds()
+        {
+            var mesh = StaticMesh.Mesh;
+            if (mesh == null) return;
+
+            mesh.BoundingBox.GetCorners(points, mesh.RootRotation * Transform.WorldMatrix);
+            _boundingBox = BoundingBox.CreateFromPoints(points);
+            _boundingSphere = BoundingSphere.CreateFromPoints(points);
+        }
+
         private IStaticMesh GetMesh()
         {
             if (StaticMesh == null) return null;
@@ -37,35 +50,34 @@ namespace Freefall.Components
             if (cam == null) return StaticMesh;
             if (StaticMesh.LODGroup == null) return StaticMesh;
 
-            var distSq = Vector3.DistanceSquared(Entity.Transform.Position, cam.Position);
-            var ranges = StaticMesh.LODGroup.Ranges;
+            UpdateBounds();
 
-            // ranges[0] = base mesh → LODs[0] transition
-            // ranges[1] = LODs[0] → LODs[1] transition, etc.
-            int lodLevel = -1; // -1 = base mesh (highest detail)
-            for (int i = 0; i < ranges.Count; i++)
+            var lodgroup = StaticMesh.LODGroup;
+
+            // Apex screen-size metric: projected solid angle of bounding sphere
+            float diameter = _boundingSphere.Radius;
+            float distanceSq = Vector3.DistanceSquared(Transform.Position, cam.Position);
+            float sizeSq = (diameter * diameter / MathF.Max(distanceSq, 0.001f)) * cam.FoVFactor;
+
+            int min = Math.Min(lodgroup.Ranges.Count, StaticMesh.LODs.Count);
+
+            for (int i = 0; i < min; i++)
             {
-                float r = ranges[i];
-                if (distSq >= r * r)
-                    lodLevel = i;
-                else
-                    break;
+                float t = lodgroup.Ranges[i];
+                if (sizeSq > t * t)
+                    return (i == 0) ? StaticMesh : StaticMesh.LODs[i - 1];
             }
 
-            if (lodLevel < 0)
-                return StaticMesh; // Closest: use base mesh
+            // no LODs, cull it early (note the squared threshold)
+            if (sizeSq < MinDrawSizeSq) return null;
 
-            // Clamp to available LODs
-            if (lodLevel >= StaticMesh.LODs.Count)
-                lodLevel = StaticMesh.LODs.Count - 1;
-
-            return StaticMesh.LODs[lodLevel];
+            return (min > 0) ? StaticMesh.LODs[min - 1] : StaticMesh;
         }
 
         // Draw method called by Renderer or System
         public void Draw()
         {
-             var lod = GetMesh();
+             IStaticMesh lod = GetMesh();
              if (lod == null || lod.Mesh == null) return;
 
              var mesh = lod.Mesh;

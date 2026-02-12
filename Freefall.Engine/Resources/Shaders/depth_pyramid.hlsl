@@ -41,3 +41,4 @@ void CSDownsample(uint3 id : SV_DispatchThreadID)
 
     outputMip[id.xy] = max(max(d0, d1), max(d2, d3));
 }
+

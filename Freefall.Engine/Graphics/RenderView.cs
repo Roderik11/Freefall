@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using Vortice.Direct3D12;
 using Vortice.DXGI;
 using Vortice.Mathematics;
@@ -10,7 +11,7 @@ namespace Freefall.Graphics
     public class RenderView : IDisposable
     {
         private const int FrameCount = 3;
-        private readonly Window _window;
+        private readonly IntPtr _handle;
         private readonly GraphicsDevice _graphicsDevice;
         
         private IDXGISwapChain3 _swapChain = null!;
@@ -35,27 +36,103 @@ namespace Freefall.Graphics
 
         // Command recording - Buffered per frame
         private CommandList[] _commandLists;
-        public CommandList CommandList => _commandLists[_frameIndex];
+        public CommandList CommandList => _commandLists?[_frameIndex];
         public RenderPipeline Pipeline { get; set; } = null!;
 
         private bool _tearingSupported;
         private IntPtr _frameLatencyWaitableObject;
 
-        public int Width => _window.Width;
-        public int Height => _window.Height;
+        public int Width { get; private set; }
+        public int Height { get; private set; }
         
+        /// <summary>
+        /// True when this RenderView owns a swapchain (main window).
+        /// False for headless editor viewports that render to offscreen textures.
+        /// </summary>
+        public bool HasSwapChain { get; private set; }
+
+        /// <summary>
+        /// Whether this view participates in the render loop.
+        /// </summary>
+        public bool Enabled { get; set; } = true;
+
+        /// <summary>
+        /// Optional custom render callback. When set, the render loop calls this
+        /// instead of the default camera→pipeline path (used for GUI-only windows).
+        /// </summary>
+        public Action<RenderView> OnRender;
+
+        /// <summary>
+        /// All registered RenderViews. Engine.Tick iterates this list (Apex pattern).
+        /// </summary>
+        public static List<RenderView> All { get; } = new List<RenderView>();
+
+        /// <summary>
+        /// The primary swapchain view (Apex: RenderView.First). Used for frame synchronization.
+        /// </summary>
+        public static RenderView Primary { get; private set; }
+
         // Cached array for SetDescriptorHeaps call
         private ID3D12DescriptorHeap[]? _srvHeapArray;
 
+        // --- Headless BackBuffer (Apex pattern: CreateBuffers non-swapchain path) ---
+        private RenderTexture2D _headlessBackBuffer;
+        private DepthTexture2D _headlessDepthBuffer;
+
+        /// <summary>
+        /// The BackBuffer texture for Squid rendering (headless views only).
+        /// </summary>
+        public RenderTexture2D BackBufferTexture => _headlessBackBuffer;
+
+        // Deferred resize (Apex pattern: Resize sets pending, Prepare processes)
+        private bool _resizePending;
+        private int _pendingWidth;
+        private int _pendingHeight;
+
+        /// <summary>
+        /// Create a RenderView from an engine Window.
+        /// </summary>
         public RenderView(Window window, GraphicsDevice graphicsDevice)
+            : this(window.Handle, window.Width, window.Height, graphicsDevice)
         {
-            _window = window;
+            window.OnResize += (w, h) => Resize(w, h); // Deferred — processed in Prepare()
+        }
+
+        /// <summary>
+        /// Create a RenderView from an external HWND (e.g. WinForms).
+        /// Call Resize() manually when the host window changes size.
+        /// </summary>
+        public RenderView(IntPtr handle, int width, int height, GraphicsDevice graphicsDevice)
+        {
+            _handle = handle;
             _graphicsDevice = graphicsDevice;
+            Width = width;
+            Height = height;
+            HasSwapChain = true;
             _renderTargets = new ID3D12Resource[FrameCount];
             _frameFenceValues = new long[FrameCount];
             _commandLists = new CommandList[FrameCount];
 
             Initialize();
+            All.Add(this);
+            if (Primary == null) Primary = this;
+        }
+
+        /// <summary>
+        /// Create a headless RenderView for editor viewports (Apex pattern).
+        /// Creates own BackBuffer + DepthBuffer. Pipeline blits Composite into BackBuffer.
+        /// Rendering happens on the main RenderView's command list.
+        /// </summary>
+        public RenderView(int width, int height, GraphicsDevice graphicsDevice)
+        {
+            _handle = IntPtr.Zero;
+            _graphicsDevice = graphicsDevice;
+            Width = Math.Max(1, width);
+            Height = Math.Max(1, height);
+            HasSwapChain = false;
+
+            CreateHeadlessBuffers();
+            All.Add(this);
         }
 
         private void Initialize()
@@ -70,8 +147,8 @@ namespace Freefall.Graphics
             SwapChainDescription1 swapChainDesc = new SwapChainDescription1
             {
                 BufferCount = FrameCount,
-                Width = (uint)_window.Width,
-                Height = (uint)_window.Height,
+                Width = (uint)Width,
+                Height = (uint)Height,
                 Format = Format.R8G8B8A8_UNorm,
                 BufferUsage = Usage.RenderTargetOutput,
                 SwapEffect = SwapEffect.FlipDiscard,
@@ -79,7 +156,7 @@ namespace Freefall.Graphics
                 Flags = swapFlags
             };
 
-            using (IDXGISwapChain1 swapChain = _graphicsDevice.Factory.CreateSwapChainForHwnd(_graphicsDevice.CommandQueue, _window.Handle, swapChainDesc))
+            using (IDXGISwapChain1 swapChain = _graphicsDevice.Factory.CreateSwapChainForHwnd(_graphicsDevice.CommandQueue, _handle, swapChainDesc))
             {
                 _swapChain = swapChain.QueryInterface<IDXGISwapChain3>();
                 _frameIndex = (int)_swapChain.CurrentBackBufferIndex;
@@ -114,14 +191,13 @@ namespace Freefall.Graphics
                 _commandLists[i] = new CommandList(_graphicsDevice);
             }
 
-            _window.OnResize += HandleResize;
         }
 
         private void CreateDepthStencil()
         {
-            var depthDesc = ResourceDescription.Texture2D(Format.D32_Float, (uint)_window.Width, (uint)_window.Height, 1, 1, 1, 0, ResourceFlags.AllowDepthStencil);
+            var depthDesc = ResourceDescription.Texture2D(Format.D32_Float, (uint)Width, (uint)Height, 1, 1, 1, 0, ResourceFlags.AllowDepthStencil);
             
-            var clearValue = new ClearValue(Format.D32_Float, 1.0f, 0);
+            var clearValue = new ClearValue(Format.D32_Float, 0.0f, 0); // Reverse depth: far=0
 
             _depthStencil = _graphicsDevice.NativeDevice.CreateCommittedResource(
                 new HeapProperties(HeapType.Default),
@@ -152,47 +228,128 @@ namespace Freefall.Graphics
             CreateDepthStencil();
         }
 
-        public event Action<int, int> OnResize;
+        public event Action OnResized;
 
-        private void HandleResize(int width, int height)
+        /// <summary>
+        /// Handle resize from either internal Window.OnResize or external call.
+        /// For swapchain views, resizes immediately. For headless views, this is also immediate.
+        /// </summary>
+        public void HandleResize(int width, int height)
         {
             if (width == 0 || height == 0) return;
 
-            WaitForGpu(); // Wait for ALL frames to complete before destroying resources
+            Width = width;
+            Height = height;
 
-            for (int i = 0; i < FrameCount; i++)
+            if (HasSwapChain)
             {
-                _renderTargets[i].Dispose();
-                // We should also ensure the command lists are closed or reset. 
-                // Since we waited for GPU, they are done executing.
-                // We don't necessarily need to dispose the command lists, just the backbuffers.
-                // But resetting them is good practice if we want to start fresh, 
-                // though the next Prepare() call handles that.
+                WaitForGpu(); // Wait for ALL frames to complete before destroying resources
+
+                for (int i = 0; i < FrameCount; i++)
+                {
+                    _renderTargets[i].Dispose();
+                }
+                _depthStencil?.Dispose();
+
+                SwapChainFlags flags = SwapChainFlags.FrameLatencyWaitableObject;
+                if (_tearingSupported) flags |= SwapChainFlags.AllowTearing;
+
+                _swapChain.ResizeBuffers(FrameCount, (uint)width, (uint)height, Format.R8G8B8A8_UNorm, flags);
+                _frameIndex = (int)_swapChain.CurrentBackBufferIndex;
+
+                CreateRenderTargets();
             }
-            _depthStencil?.Dispose();
-
-            SwapChainFlags flags = SwapChainFlags.FrameLatencyWaitableObject;
-            if (_tearingSupported) flags |= SwapChainFlags.AllowTearing;
-
-            _swapChain.ResizeBuffers(FrameCount, (uint)width, (uint)height, Format.R8G8B8A8_UNorm, flags);
-            _frameIndex = (int)_swapChain.CurrentBackBufferIndex;
-
-            CreateRenderTargets();
 
             // Resize pipeline resources (G-Buffers etc)
             Pipeline?.Resize(width, height);
             
-            OnResize?.Invoke(width, height);
+            OnResized?.Invoke();
         }
 
-        public CpuDescriptorHandle BackBufferTarget => _rtvHeap.GetCPUDescriptorHandleForHeapStart() + (_frameIndex * _rtvDescriptorSize);
-        public CpuDescriptorHandle DepthBufferTarget => _dsvHeap.GetCPUDescriptorHandleForHeapStart();
-        public ID3D12Resource CurrentBackBuffer => _renderTargets[_frameIndex];
+        /// <summary>
+        /// Deferred resize (Apex pattern). Just stores pending size.
+        /// Actual resize happens in ProcessPendingResize before rendering.
+        /// </summary>
+        public void Resize(int width, int height)
+        {
+            _pendingWidth = Math.Max(1, width);
+            _pendingHeight = Math.Max(1, height);
+            _resizePending = true;
+        }
+
+        /// <summary>
+        /// Whether a deferred resize is pending. Used by Engine.Tick to batch GPU sync.
+        /// </summary>
+        public bool IsResizePending => _resizePending;
+
+        /// <summary>
+        /// Process deferred resize at a GPU-safe point (Apex: inside Prepare).
+        /// For headless views, call this from the render loop before camera rendering.
+        /// </summary>
+        public void ProcessPendingResize()
+        {
+            if (!_resizePending) return;
+            _resizePending = false;
+
+            if (_pendingWidth == Width && _pendingHeight == Height) return;
+
+            Width = _pendingWidth;
+            Height = _pendingHeight;
+
+            if (HasSwapChain)
+            {
+                for (int i = 0; i < FrameCount; i++)
+                    _renderTargets[i].Dispose();
+                _depthStencil?.Dispose();
+
+                SwapChainFlags flags = SwapChainFlags.FrameLatencyWaitableObject;
+                if (_tearingSupported) flags |= SwapChainFlags.AllowTearing;
+
+                _swapChain.ResizeBuffers(FrameCount, (uint)Width, (uint)Height, Format.R8G8B8A8_UNorm, flags);
+                _frameIndex = (int)_swapChain.CurrentBackBufferIndex;
+
+                CreateRenderTargets();
+            }
+            else
+            {
+                _headlessBackBuffer?.Dispose();
+                _headlessDepthBuffer?.Dispose();
+                CreateHeadlessBuffers();
+            }
+
+            // Resize pipeline resources (G-Buffers etc)
+            Pipeline?.Resize(Width, Height);
+
+            OnResized?.Invoke();
+        }
+
+        /// <summary>
+        /// Create BackBuffer + DepthBuffer for headless views (Apex: CreateBuffers non-swapchain path).
+        /// </summary>
+        private void CreateHeadlessBuffers()
+        {
+            _headlessBackBuffer = new RenderTexture2D(_graphicsDevice, Width, Height, Format.R8G8B8A8_UNorm);
+            _headlessDepthBuffer = new DepthTexture2D(Width, Height, Format.D32_Float, false);
+        }
+
+        public CpuDescriptorHandle BackBufferTarget =>
+            HasSwapChain
+                ? _rtvHeap.GetCPUDescriptorHandleForHeapStart() + (_frameIndex * _rtvDescriptorSize)
+                : _headlessBackBuffer.RtvHandle;
+
+        public CpuDescriptorHandle DepthBufferTarget =>
+            HasSwapChain
+                ? _dsvHeap.GetCPUDescriptorHandleForHeapStart()
+                : _headlessDepthBuffer.DsvHandle;
+
+        public ID3D12Resource CurrentBackBuffer =>
+            HasSwapChain
+                ? _renderTargets[_frameIndex]
+                : _headlessBackBuffer.Native;
 
         public void Prepare()
         {
             // Wait for swap chain to signal it's ready for a new frame
-            // This provides frame pacing for BOTH VSync on and off, preventing burst-and-stall
             if (_frameLatencyWaitableObject != IntPtr.Zero)
             {
                 Kernel32.WaitForSingleObject(_frameLatencyWaitableObject, 1000);
@@ -265,7 +422,7 @@ namespace Freefall.Graphics
             }
         }
 
-        private void WaitForGpu()
+        internal void WaitForGpu()
         {
             // Schedule a Signal command in the queue
             _graphicsDevice.CommandQueue.Signal(_fence, (ulong)_fenceValue);
@@ -279,23 +436,33 @@ namespace Freefall.Graphics
 
         public void Dispose()
         {
-             WaitForGpu(); // Ensure GPU is done
-             
-             _window.OnResize -= OnResize;
-             
-             for (int i = 0; i < FrameCount; i++) _renderTargets[i]?.Dispose();
-             _depthStencil?.Dispose();
+             All.Remove(this);
 
-             // Dispose command lists
-             if (_commandLists != null)
+             if (HasSwapChain)
              {
-                 for(int i=0; i<_commandLists.Length; i++) _commandLists[i]?.Dispose();
+                 WaitForGpu(); // Ensure GPU is done
+                 
+                 for (int i = 0; i < FrameCount; i++) _renderTargets[i]?.Dispose();
+                 _depthStencil?.Dispose();
+
+                 // Dispose command lists
+                 if (_commandLists != null)
+                 {
+                     for(int i=0; i<_commandLists.Length; i++) _commandLists[i]?.Dispose();
+                 }
+
+                 _fence?.Dispose();
+                 _rtvHeap?.Dispose();
+                 _dsvHeap?.Dispose();
+                 _swapChain?.Dispose();
+             }
+             else
+             {
+                 _headlessBackBuffer?.Dispose();
+                 _headlessDepthBuffer?.Dispose();
              }
 
-             _fence?.Dispose();
-             _rtvHeap?.Dispose();
-             _dsvHeap?.Dispose();
-             _swapChain?.Dispose();
+             Pipeline?.Dispose();
         }
     }
 }

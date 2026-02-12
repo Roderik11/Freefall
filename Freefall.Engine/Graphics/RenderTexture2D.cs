@@ -34,6 +34,15 @@ namespace Freefall.Graphics
             BindlessIndex = index;
             device.CreateShaderResourceView(_resource, null, cpuSrv);
         }
+
+        public new void Dispose()
+        {
+            var device = Engine.Device;
+            device.FreeRtv(RtvHandle);
+            if (BindlessIndex != 0)
+                device.ReleaseBindlessIndex(BindlessIndex);
+            base.Dispose();
+        }
     }
 
     public class DepthTexture2D : Texture
@@ -90,6 +99,15 @@ namespace Freefall.Graphics
                 device.NativeDevice.CreateShaderResourceView(_resource, srvDesc, cpuHandle);
             }
         }
+
+        public new void Dispose()
+        {
+            var device = Engine.Device;
+            device.FreeDsv(DsvHandle);
+            if (BindlessIndex != 0)
+                device.ReleaseBindlessIndex(BindlessIndex);
+            base.Dispose();
+        }
     }
 
     public class DepthTextureArray2D : Texture
@@ -108,7 +126,7 @@ namespace Freefall.Graphics
             Slices = slices;
             
             var device = Engine.Device;
-            _resource = device.CreateTexture2D(Format.R32_Typeless, width, height, slices, 1, ResourceFlags.AllowDepthStencil, ResourceStates.DepthWrite); // Initial State?
+            _resource = device.CreateTexture2D(Format.R32_Typeless, width, height, slices, 1, ResourceFlags.AllowDepthStencil, ResourceStates.DepthWrite, depthClearValue: 1.0f); // Shadow maps use standard Z (clear to 1.0)
 
             // DSVs for each slice
             for(int i=0; i<slices; i++)

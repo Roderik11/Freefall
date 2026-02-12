@@ -10,6 +10,10 @@ namespace Freefall
         private static readonly HashSet<Keys> _keysDown = new HashSet<Keys>();
         private static readonly HashSet<Keys> _keysPressed = new HashSet<Keys>();
         private static readonly HashSet<Keys> _keysReleased = new HashSet<Keys>();
+
+        private static readonly HashSet<int> _mouseDown = new();
+        private static readonly HashSet<int> _mousePressed = new();
+        private static readonly HashSet<int> _mouseReleased = new();
         
         private static int _rawX;
         private static int _rawY;
@@ -21,6 +25,12 @@ namespace Freefall
         public static bool IsKeyDown(Keys key) => _keysDown.Contains(key);
         public static bool IsKeyPressed(Keys key) => _keysPressed.Contains(key);
         public static bool IsKeyReleased(Keys key) => _keysReleased.Contains(key);
+
+        /// <summary>Mouse button state. 0=Left, 1=Right, 2=Middle.</summary>
+        public static bool IsMouseDown(int button) => _mouseDown.Contains(button);
+        public static bool IsMousePressed(int button) => _mousePressed.Contains(button);
+        public static bool IsMouseReleased(int button) => _mouseReleased.Contains(button);
+        public static bool Shift => IsKeyDown(Keys.ShiftKey);
 
         public static void Init(IntPtr hWnd)
         {
@@ -87,12 +97,22 @@ namespace Freefall
             {
                 IsMouseLocked = !IsMouseLocked;
             }
+
+            // Mouse buttons: WM_LBUTTONDOWN/UP = 0x0201/0x0202, WM_RBUTTONDOWN/UP = 0x0204/0x0205, WM_MBUTTONDOWN/UP = 0x0207/0x0208
+            if (msg == 0x0201) { _mouseDown.Add(0); _mousePressed.Add(0); }
+            else if (msg == 0x0202) { _mouseDown.Remove(0); _mouseReleased.Add(0); }
+            else if (msg == 0x0204) { _mouseDown.Add(1); _mousePressed.Add(1); }
+            else if (msg == 0x0205) { _mouseDown.Remove(1); _mouseReleased.Add(1); }
+            else if (msg == 0x0207) { _mouseDown.Add(2); _mousePressed.Add(2); }
+            else if (msg == 0x0208) { _mouseDown.Remove(2); _mouseReleased.Add(2); }
         }
 
         public static void ClearFrameCallbacks()
         {
             _keysPressed.Clear();
             _keysReleased.Clear();
+            _mousePressed.Clear();
+            _mouseReleased.Clear();
         }
     }
 }

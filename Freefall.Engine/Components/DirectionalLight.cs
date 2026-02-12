@@ -314,7 +314,6 @@ namespace Freefall.Components
             float backExtension = zRange * MathF.Pow(3.5f, 3 - index);
             minZ -= backExtension;
             
-            // Build orthographic projection with fixed-size XY (sphere) and variable Z (depth)
             var lightProj = Matrix4x4.CreateOrthographicOffCenterLeftHanded(
                 -radius, radius, -radius, radius, minZ, maxZ);
             
