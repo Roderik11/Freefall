@@ -54,7 +54,6 @@ struct VertexOutput
 	float2 UV2			: TEXCOORD1;
     float Depth			: TEXCOORD2;
 	float Level			: TEXCOORD3;
-	nointerpolation uint Flags : TEXCOORD4;
 };
 
 // Per-instance descriptor (matches C# InstanceDescriptor: 12 bytes)
@@ -73,7 +72,6 @@ VertexOutput VS(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_Insta
 	StructuredBuffer<uint> sortedIndices = ResourceDescriptorHeap[SortedIndicesIdx];
 	uint dataPos = InstanceBaseOffset + instanceID;
 	uint packedIdx = sortedIndices[dataPos];
-	bool isOccluded = (packedIdx & 0x80000000u) != 0;
 	uint idx = packedIdx & 0x7FFFFFFFu;
 
 	// Transform from global buffer (standard path)
@@ -107,15 +105,10 @@ VertexOutput VS(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_Insta
     
     output.Position = worldPosition;
     
-    // X-ray mode: push occluded instances to near depth
-    if (isOccluded)
-        output.Position.z = 0.0;
-    
     output.Depth = worldPosition.w;
     output.UV = uv;
     output.UV2 = heightUV;
 	output.Level = patch.level.x;
-	output.Flags = isOccluded ? 1u : 0u;
 	return output;
 }
 
@@ -194,36 +187,6 @@ FragmentOutput PS(VertexOutput input)
     normal = normalize(normal);
 
     terrainNormal = blend_linear(terrainNormal, normal.xyz);
-    
-    // X-Ray occlusion debug mode (mode 4)
-    bool isOccluded = input.Flags != 0;
-    if (DebugMode == 4)
-    {
-        if (isOccluded)
-        {
-            float hue = frac(float(input.Level * 2654435761u) * (1.0 / 4294967296.0));
-            float3 xrayColor = float3(
-                abs(hue * 6.0 - 3.0) - 1.0,
-                2.0 - abs(hue * 6.0 - 2.0),
-                2.0 - abs(hue * 6.0 - 4.0)
-            );
-            xrayColor = saturate(xrayColor);
-            
-            output.Albedo = float4(xrayColor * 0.7, 0.5);
-            output.Normals = float4(terrainNormal, 0.0);
-            output.Data = float4(1, 0, 0, 1);
-            output.Depth = 99999.0;
-        }
-        else
-        {
-            float luma = dot(color.rgb, float3(0.299, 0.587, 0.114));
-            output.Albedo = float4(lerp(float3(luma, luma, luma), color.rgb, 0.3), color.a);
-            output.Normals = float4(terrainNormal, 1.0);
-            output.Data = float4(0, 0, 0, 1);
-            output.Depth = input.Depth;
-        }
-        return output;
-    }
 
     output.Albedo = color;
     output.Normals = float4(terrainNormal.xyz, 1); 

@@ -50,19 +50,18 @@ Freefall is a fully GPU-driven deferred renderer. The CPU submits unsorted draw 
 - **GPU-Driven Rendering** — Indirect draw calls with compute-based visibility culling and instance scatter
 - **Reverse-Z Depth Buffer** — Near→1, far→0 projection for improved floating-point precision; shadow maps remain standard-Z orthographic
 - **Deferred Shading** — GBuffer-based pipeline with directional and point light support
-- **Cascaded Shadow Maps** — 4-cascade PSSM with texel snapping, bounding-sphere stabilization, and Vogel disc filtering
+- **Cascaded Shadow Maps** — 4-cascade PSSM with texel snapping, bounding-sphere stabilization, Vogel disc filtering, and adaptive SDSM splits
 - **Hi-Z Occlusion Culling** — Hierarchical depth buffer for GPU-side occlusion tests
 - **Unified Per-Instance Buffers** — All per-instance data (transforms, materials, bounding spheres, terrain patches, bones, lights) flows through a single generic SoA channel system with auto-resize and push-constant binding
 - **Persistent Transform Buffer** — Pooled GPU transform slots with dirty-flag uploads
 - **Skeletal Animation** — GPU skinning via per-instance bone buffers (registered as generic SoA channels)
-- **Terrain** — Quadtree LOD with splatmap-based multi-texture blending, integrated into the standard InstanceBatch pipeline
-- **GPU Terrain** — Fully GPU-driven restricted quadtree with compute-based node evaluation, screen-space error LOD, edge stitching, and indirect rendering
+- **Terrain** — Fully GPU-driven restricted quadtree with compute-based node evaluation, screen-space error LOD, edge stitching, and indirect rendering
 - **LOD System** — Automatic LOD level selection for static meshes based on screen-space size
 - **Point Lights** — Deferred point lights via per-instance `StructuredBuffer`, rendered as sphere volumes with additive blending
 - **Bindless SM 6.6** — All resources accessed via `ResourceDescriptorHeap` and push constants; no Input Assembler
 - **Async Resource Streaming** — Two-phase loading (CPU parse → main-thread GPU upload) with time-budgeted work queue
 - **Shader System** — Custom FX parser with automatic render pass and pipeline state management
-- **Debug Visualization** — 10-mode diagnostic overlay: cascade colors, shadow factor, depth, normals, occlusion x-ray (F5 to cycle)
+- **Debug Visualization** — F5 cycles through: cascade colors, shadow factor, and linear depth (4 modes)
 - **Performance Profiling** — Per-phase CPU timing instrumentation (Prepare, Draw, Upload, Shadow, Opaque, Light, Compose)
 
 ## Project Structure

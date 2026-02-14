@@ -57,19 +57,14 @@ VSOutput VS(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_InstanceI
     // Get instance data position using InstanceBaseOffset + local instance ID
     uint dataPos = InstanceBaseOffset + instanceID;
     
-    // sortedIndices contains compacted original instanceIdx (with occlusion flag in high bit)
+    // sortedIndices contains compacted original instanceIdx
     uint packedIdx = sortedIndices[dataPos];
-    bool isOccluded = (packedIdx & 0x80000000u) != 0;
     uint idx = packedIdx & 0x7FFFFFFFu;
     
     // Double-indirect: use original instance index to look up per-instance data from descriptor
     InstanceDescriptor desc = descriptors[idx];
     uint slot = desc.TransformSlot;
     uint materialID = desc.MaterialId;
-    
-    // Re-pack occlusion flag into materialID high bit for PS
-    if (isOccluded)
-        materialID |= 0x80000000u;
     
     row_major matrix World = globalTransforms[slot];
     
@@ -81,11 +76,6 @@ VSOutput VS(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_InstanceI
     float4 worldPos = mul(float4(pos, 1.0f), World);
     output.WorldPos = worldPos;
     output.Position = mul(mul(worldPos, View), Projection);
-    
-    // X-ray mode: push occluded instances (high bit set) to near depth
-    // so they always pass the depth test and render on top
-    if (isOccluded)
-        output.Position.z = 0.0;
     
     output.Normal = mul(norm, (float3x3)World);
     output.TexCoord = uv;
@@ -162,10 +152,7 @@ PSOutput PS(VSOutput input)
 {
     PSOutput output;
     
-    // Unpack occlusion flag from materialID high bit (packed by CSGlobalScatter)
-    uint rawMaterialID = input.MaterialID;
-    bool isOccluded = (rawMaterialID & 0x80000000u) != 0;
-    uint materialID = rawMaterialID & 0x7FFFFFFFu;
+    uint materialID = input.MaterialID;
     
     // Material lookup via MaterialID indirection
     MaterialData mat = GET_MATERIAL(materialID);
@@ -173,38 +160,6 @@ PSOutput PS(VSOutput input)
     
     float4 color = albedoTex.Sample(Sampler, input.TexCoord);
     clip(color.a - 0.25f);
-    
-    // X-Ray occlusion debug mode (mode 4)
-    if (DebugMode == 4)
-    {
-        if (isOccluded)
-        {
-            // Color-code occluded instances using a hash of the transform slot
-            // Simple integer hash -> hue for distinct per-object colors
-            float hue = frac((float)(materialID * 2654435761u) * (1.0 / 4294967296.0));
-            float3 xrayColor = float3(
-                abs(hue * 6.0 - 3.0) - 1.0,
-                2.0 - abs(hue * 6.0 - 2.0),
-                2.0 - abs(hue * 6.0 - 4.0)
-            );
-            xrayColor = saturate(xrayColor);
-            
-            output.Albedo = float4(xrayColor * 0.7, 0.5);
-            output.Normal = float4(normalize(input.Normal), 0.0); // alpha=0 marks x-ray
-            output.Data = float4(1, 0, 0, 1); // x-ray flag in Data.r
-            output.Depth = 99999.0; // Push to far so it renders behind everything
-        }
-        else
-        {
-            // Visible instances: desaturate to make occluded pop
-            float luma = dot(color.rgb, float3(0.299, 0.587, 0.114));
-            output.Albedo = float4(lerp(float3(luma, luma, luma), color.rgb, 0.3), color.a);
-            output.Normal = float4(normalize(input.Normal), 1.0);
-            output.Data = float4(0, 0, 0, 1);
-            output.Depth = input.Depth;
-        }
-        return output;
-    }
     
     // PBR material properties — defaults for meshes without PBR textures
     float roughness = 0.65;

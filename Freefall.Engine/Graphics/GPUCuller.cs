@@ -145,7 +145,7 @@ namespace Freefall.Graphics
             public uint HiZMipCount;     // Number of mip levels in pyramid
             public float NearPlane;      // Camera near plane for depth margin calculation
             public uint CullStatsUAVIdx; // UAV index for cull stats (0 = disabled)
-            public uint DebugMode;       // Debug visualization mode (4 = x-ray occlusion)
+            public uint DebugMode;       // Debug visualization mode (unused by culler, kept for layout compatibility)
             public float _pad1;
         }
         

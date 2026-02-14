@@ -287,7 +287,7 @@ namespace Freefall.Graphics
                     constants.NearPlane = Camera.Main.NearPlane;
                 }
                 
-                // Debug visualization mode (x-ray occlusion = 4)
+                // Debug visualization mode
                 constants.DebugMode = (uint)Engine.Settings.DebugVisualizationMode;
                 
                 // Cull stats UAV (always set if culler is initialized)

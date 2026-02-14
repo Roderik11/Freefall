@@ -92,12 +92,13 @@ float4 PS(VSOutput input) : SV_Target
     float3 normal = NormalTex.Sample(Sampler, input.TexCoord).xyz;
     float depth = DepthTex.Sample(Sampler, input.TexCoord).r;
     
-    // Mode 3: Visualize GBuffer linear depth
+    // Mode 3: Visualize GBuffer linear depth (normalized to visible range)
     if (DebugVisualizationMode == 3)
     {
         Texture2D DepthGBuf = ResourceDescriptorHeap[DepthGBufIdx];
         float gbufDepth = DepthGBuf.Sample(Sampler, input.TexCoord).r;
-        return float4(gbufDepth, gbufDepth, gbufDepth, 1);
+        float normalized = saturate(gbufDepth / 500.0); // Map [0..500] to [0..1]
+        return float4(normalized, normalized, normalized, 1);
     }
     
     // Skip pixels at min depth (sky) — reverse depth: far=0

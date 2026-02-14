@@ -22,7 +22,7 @@ cbuffer FrustumPlanes : register(b0)
     uint HiZMipCount;      // Number of mip levels in pyramid
     float NearPlane;       // Camera near plane for depth margin calculation
     uint CullStatsUAVIdx;  // UAV index for cull stats buffer (0=disabled)
-    uint DebugMode;        // Debug visualization mode (4 = x-ray occlusion)
+    uint DebugMode;        // Debug visualization mode (unused by culler, kept for layout compatibility)
     float _pad1;
 };
 
@@ -298,22 +298,14 @@ void CSVisibility(uint3 dispatchThreadId : SV_DispatchThreadID)
     bool visible = IsVisible(worldCenter, worldRadius);
     
     // Hi-Z occlusion test (only for frustum-visible instances)
-    bool hiZOccluded = false;
     if (visible)
     {
-        hiZOccluded = IsOccluded(worldCenter, worldRadius);
-        // In x-ray mode (4), keep occluded instances in draw stream with flag 2
-        if (hiZOccluded && DebugMode != 4)
+        if (IsOccluded(worldCenter, worldRadius))
             visible = false;
     }
     
-    // Write visibility flag:
-    //   0 = frustum culled (never drawn)
-    //   1 = visible (passed frustum + Hi-Z)
-    //   2 = Hi-Z occluded but kept for x-ray debug visualization
-    uint flag = 0;
-    if (visible)
-        flag = hiZOccluded ? 2 : 1;
+    // Write visibility flag: 0 = culled, 1 = visible
+    uint flag = visible ? 1u : 0u;
     visibilityFlags[instanceIdx] = flag;
     
     // Update cull stats (atomic, across all threads)
@@ -322,7 +314,7 @@ void CSVisibility(uint3 dispatchThreadId : SV_DispatchThreadID)
         RWByteAddressBuffer stats = ResourceDescriptorHeap[CullStatsUAVIdx];
         if (flag == 1)
             stats.InterlockedAdd(0, 1);    // [0] = frustum+HiZ visible
-        else if (flag == 2 || (flag == 0 && IsVisible(worldCenter, worldRadius)))
+        else if (IsVisible(worldCenter, worldRadius))
             stats.InterlockedAdd(4, 1);    // [1] = passed frustum, failed Hi-Z
     }
 }
@@ -339,7 +331,7 @@ void CSHistogram(uint3 dispatchThreadId : SV_DispatchThreadID)
     if (instanceIdx >= TotalInstances)
         return;
     
-    // Read visibility flag from CSVisibility output (1=visible, 2=occluded-xray)
+    // Read visibility flag from CSVisibility output (1=visible)
     RWStructuredBuffer<uint> visibilityFlags = ResourceDescriptorHeap[VisibilityFlagsIdx];
     uint flag = visibilityFlags[instanceIdx];
     
@@ -510,11 +502,7 @@ void CSGlobalScatter(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupId
         uint outputIdx;
         InterlockedAdd(counters[meshPartId], 1, outputIdx);
         
-        uint packedIdx = instanceIdx;
-        if (flag == 2)
-            packedIdx |= 0x80000000u;
-        
-        visibleOut[outputIdx] = packedIdx;
+        visibleOut[outputIdx] = instanceIdx;
     }
 }
 
