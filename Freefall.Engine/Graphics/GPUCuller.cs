@@ -570,7 +570,6 @@ namespace Freefall.Graphics
             InstanceRange[] ranges,
             uint templateBufferSRV,
             uint outputBufferUAV,
-            uint boundingSpheresSRV,
             uint sortedIndicesInSRV,
             uint counterBufferUAV,
             int counterOffset,
@@ -629,7 +628,7 @@ namespace Freefall.Graphics
             // Push constants used by all passes
             commandList.SetComputeRoot32BitConstant(0, templateBufferSRV, 0);
             commandList.SetComputeRoot32BitConstant(0, outputBufferUAV, 1);
-            commandList.SetComputeRoot32BitConstant(0, boundingSpheresSRV, 2);
+            // Slot 2 (BoundingSpheresIdx) no longer used — culler reads from MeshRegistry
             commandList.SetComputeRoot32BitConstant(0, _rangeBufferSRVs[frameIndex], 3);
             commandList.SetComputeRoot32BitConstant(0, sortedIndicesInSRV, 4);
             commandList.SetComputeRoot32BitConstant(0, 0, 5);  // SortedIndicesOutIdx unused
@@ -668,7 +667,6 @@ namespace Freefall.Graphics
         /// <param name="cascadePlanes">Array of 4 cascade planes (each containing 6 frustum planes)</param>
         /// <param name="cascadeIndex">Which cascade to cull for (0-3)</param>
         /// <param name="totalInstances">Total instance count</param>
-        /// <param name="boundingSpheresSRV">SRV for bounding spheres</param>
         /// <param name="descriptorSRV">SRV for InstanceDescriptor buffer</param>
         /// <param name="transformBufferSRV">SRV for world matrices</param>
         /// <param name="visibilityFlagsUAV">UAV for output visibility flags</param>
@@ -677,7 +675,6 @@ namespace Freefall.Graphics
             Vector4[][] cascadePlanes,
             int cascadeIndex,
             int totalInstances,
-            uint boundingSpheresSRV,
             uint descriptorSRV,
             uint transformBufferSRV,
             uint visibilityFlagsUAV)
@@ -710,7 +707,7 @@ namespace Freefall.Graphics
             commandList.SetComputeRootConstantBufferView(2, _shadowCascadeBuffers[frameIndex].GPUVirtualAddress);
             
             // Set push constants for CSVisibilityShadow
-            commandList.SetComputeRoot32BitConstant(0, boundingSpheresSRV, 2);   // BoundingSpheresIdx
+            // Slot 2 (BoundingSpheresIdx) no longer used — culler reads from MeshRegistry
             commandList.SetComputeRoot32BitConstant(0, descriptorSRV, 4);    // DescriptorBufferIdx (Indices[1].x)
             commandList.SetComputeRoot32BitConstant(0, transformBufferSRV, 10);  // GlobalTransformsIdx (Indices[2].z)
             commandList.SetComputeRoot32BitConstant(0, visibilityFlagsUAV, 11);  // VisibilityFlagsIdx (Indices[2].w)

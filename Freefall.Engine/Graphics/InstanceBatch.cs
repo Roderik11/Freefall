@@ -94,7 +94,7 @@ namespace Freefall.Graphics
         private static readonly Dictionary<int, int> ComputeSlots = new()
         {
             { "Bones".GetHashCode(), 30 },              // Indices[7].z = BoneBufferIdx
-            { DrawBucket.BoundingSpheresHash, 2 },       // Indices[0].z = BoundingSpheresIdx
+            // BoundingSpheres removed — culler reads bounds from MeshRegistry
             { DrawBucket.DescriptorsHash, 4 },            // Indices[1].x = DescriptorBufferIdx
             { DrawBucket.SubbatchIdsHash, 23 },           // Indices[5].w = SubbatchIdsIdx
         };
@@ -122,6 +122,7 @@ namespace Freefall.Graphics
         // Visibility flags buffer (1=visible, 0=not)
         private ID3D12Resource[] visibilityFlagsBuffers = new ID3D12Resource[FrameCount];
         private uint[] visibilityFlagsUAVIndices = new uint[FrameCount];
+        private uint[] visibilityFlagsSRVIndices = new uint[FrameCount]; // SRV for reading previous frame's flags
         
         private const int MaxSubBatches = 4096;
         private bool _cullerInitialized = false;
@@ -190,11 +191,11 @@ namespace Freefall.Graphics
         /// <summary>
         /// Attach GPU-generated per-instance buffers (bypasses CPU staging/upload).
         /// The provided SRV indices point at buffers filled by a compute shader.
-        /// descriptorsSRV/spheresSRV/subbatchIdsSRV are core culler infrastructure.
+        /// descriptorsSRV/subbatchIdsSRV are core culler infrastructure.
         /// customBindings contains additional per-instance data channels (e.g. TerrainPatchData).
         /// </summary>
         public void AttachGPUData(
-            uint descriptorsSRV, uint spheresSRV, uint subbatchIdsSRV,
+            uint descriptorsSRV, uint subbatchIdsSRV,
             int instanceCount, int meshPartId,
             ReadOnlySpan<GPUBufferBinding> customBindings = default)
         {
@@ -211,9 +212,8 @@ namespace Freefall.Graphics
             
             int frameIndex = Engine.FrameIndex % FrameCount;
             
-            // Core culler infrastructure buffers
+            // Core culler infrastructure buffers (bounding spheres now come from MeshRegistry)
             EnsureGPUPerInstanceBuffer(DrawBucket.DescriptorsHash, -1, 12, 1, frameIndex, descriptorsSRV);
-            EnsureGPUPerInstanceBuffer(DrawBucket.BoundingSpheresHash, -1, 16, 1, frameIndex, spheresSRV);
             EnsureGPUPerInstanceBuffer(DrawBucket.SubbatchIdsHash, -1, 4, 1, frameIndex, subbatchIdsSRV);
             
             // Custom per-instance data channels (caller provides hash, slot, stride)
@@ -264,7 +264,7 @@ namespace Freefall.Graphics
             SubBatchCount = _uniqueMeshPartIds.Count;
             
             // Block-copy all pre-staged per-instance data from bucket (staged at Enqueue time)
-            // This includes core channels (Descriptors, BoundingSpheres, SubbatchIds) and
+            // This includes core channels (Descriptors, SubbatchIds) and
             // optional channels (TerrainPatchData, PointLightData, Bones, etc.)
             foreach (var (hash, staging) in bucket.PerInstanceData)
             {
@@ -480,6 +480,10 @@ namespace Freefall.Graphics
                 visibilityFlagsUAVIndices[i] = device.AllocateBindlessIndex();
                 device.CreateStructuredBufferUAV(visibilityFlagsBuffers[i], (uint)capacity, sizeof(uint), 
                     visibilityFlagsUAVIndices[i]);
+                // SRV for reading previous frame's visibility flags (feedback loop breaker)
+                visibilityFlagsSRVIndices[i] = device.AllocateBindlessIndex();
+                device.CreateStructuredBufferSRV(visibilityFlagsBuffers[i], (uint)capacity, sizeof(uint),
+                    visibilityFlagsSRVIndices[i]);
 
                 int histogramSize = MeshRegistry.MaxMeshParts * sizeof(uint);
                 histogramBuffers[i] = device.CreateDefaultBuffer(histogramSize);
@@ -524,6 +528,9 @@ namespace Freefall.Graphics
 
             commandList.SetComputeRoot32BitConstant(0, MeshRegistry.SrvIndex, 0);
             commandList.SetComputeRoot32BitConstant(0, gpuCommandUAVIndices[frameIndex], 1);
+            // Slot 2: previous frame's visibility flags SRV (feedback loop breaker)
+            int prevFrameIndex = (frameIndex + FrameCount - 1) % FrameCount;
+            commandList.SetComputeRoot32BitConstant(0, visibilityFlagsSRVIndices[prevFrameIndex], 2);
             
             commandList.SetComputeRoot32BitConstant(0, visibleIndicesUAVIndices[frameIndex], 5);
             commandList.SetComputeRoot32BitConstant(0, counterBufferUAVIndices[frameIndex], 6);
@@ -1084,7 +1091,8 @@ namespace Freefall.Graphics
                 counterBuffers[i] = null; counterBufferUAVIndices[i] = 0;
 
                 DeferDispose(visibilityFlagsBuffers[i], visibilityFlagsUAVIndices[i]);
-                visibilityFlagsBuffers[i] = null; visibilityFlagsUAVIndices[i] = 0;
+                DeferDispose(null, visibilityFlagsSRVIndices[i]);
+                visibilityFlagsBuffers[i] = null; visibilityFlagsUAVIndices[i] = 0; visibilityFlagsSRVIndices[i] = 0;
 
                 DeferDispose(histogramBuffers[i], histogramUAVIndices[i]);
                 histogramBuffers[i] = null; histogramUAVIndices[i] = 0;

@@ -153,6 +153,20 @@ namespace Freefall.Assets.Importers
                         }
                     }
 
+                    // Compute per-part bounding box from this part's vertices directly
+                    // (vertices are contiguous at [baseVertex, baseVertex+VertexCount) in the combined buffer)
+                    Vector3 partMin = new Vector3(float.MaxValue);
+                    Vector3 partMax = new Vector3(float.MinValue);
+                    for (int vi = baseVertex; vi < baseVertex + mesh.VertexCount; vi++)
+                    {
+                        partMin = Vector3.Min(partMin, positions[vi]);
+                        partMax = Vector3.Max(partMax, positions[vi]);
+                    }
+
+                    var partBB = new Vortice.Mathematics.BoundingBox(partMin, partMax);
+                    var partCenter = (partMin + partMax) * 0.5f;
+                    var partRadius = (partMax - partCenter).Length();
+
                     var part = new MeshPart
                     {
                         Name = mesh.Name ?? $"Part_{meshes.IndexOf(mesh)}",
@@ -160,6 +174,8 @@ namespace Freefall.Assets.Importers
                         BaseIndex = startIndex,
                         NumIndices = meshIndexCount,
                         BaseVertex = 0,
+                        BoundingBox = partBB,
+                        BoundingSphere = new Vector4(partCenter, partRadius),
                     };
                     parts.Add(part);
 

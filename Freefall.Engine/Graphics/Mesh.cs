@@ -28,6 +28,7 @@ namespace Freefall.Graphics
         public int BaseIndex;
         public int NumIndices;
         public BoundingBox BoundingBox;
+        public Vector4 BoundingSphere; // Local-space bounding sphere (center.xyz, radius)
     }
 
     public partial class Mesh : Asset, IDisposable
@@ -356,12 +357,12 @@ namespace Freefall.Graphics
         {
             GeneratePatchVertices(out var verts, out var norms, out var uvs);
             var mesh = new Mesh(device, verts, norms, uvs, indices);
-            mesh.MeshParts.Add(new MeshPart { NumIndices = indices.Length });
             // XZ: vertices span [-PatchOffset, +PatchOffset] = [-16, +16]
             // Y: 0 in mesh space; actual height range set by Terrain.Awake via SetPatchBounds()
             mesh.BoundingBox = new BoundingBox(
                 new Vector3(-PatchOffset, 0, -PatchOffset),
                 new Vector3(PatchOffset, 0, PatchOffset));
+            mesh.MeshParts.Add(new MeshPart { NumIndices = indices.Length, BoundingBox = mesh.BoundingBox, BoundingSphere = mesh.LocalBoundingSphere });
             return mesh;
         }
 
@@ -712,7 +713,7 @@ namespace Freefall.Graphics
             };
             var mesh = new Mesh(device, verts, norms, uvs, indices);
             mesh.BoundingBox = new BoundingBox(new Vector3(-s, -s, -s), new Vector3(s, s, s));
-            mesh.MeshParts.Add(new MeshPart { NumIndices = indices.Length });
+            mesh.MeshParts.Add(new MeshPart { NumIndices = indices.Length, BoundingBox = mesh.BoundingBox, BoundingSphere = mesh.LocalBoundingSphere });
             return mesh;
         }
         
@@ -755,7 +756,7 @@ namespace Freefall.Graphics
             }
             var mesh = new Mesh(device, verts, norms, uvs, indices);
             mesh.BoundingBox = new BoundingBox(new Vector3(-radius, -radius, -radius), new Vector3(radius, radius, radius));
-            mesh.MeshParts.Add(new MeshPart { NumIndices = indices.Length });
+            mesh.MeshParts.Add(new MeshPart { NumIndices = indices.Length, BoundingBox = mesh.BoundingBox, BoundingSphere = mesh.LocalBoundingSphere });
             return mesh;
         }
 
@@ -771,7 +772,7 @@ namespace Freefall.Graphics
             uint[] indices = { 0, 1, 2, 2, 1, 3 };
             var mesh = new Mesh(device, verts, norms, uvs, indices);
             mesh.BoundingBox = new BoundingBox(new Vector3(-size, -size, 0), new Vector3(size, size, 0));
-            mesh.MeshParts.Add(new MeshPart { NumIndices = indices.Length });
+            mesh.MeshParts.Add(new MeshPart { NumIndices = indices.Length, BoundingBox = mesh.BoundingBox, BoundingSphere = mesh.LocalBoundingSphere });
             return mesh;
         }
 

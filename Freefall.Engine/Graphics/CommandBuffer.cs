@@ -51,7 +51,7 @@ namespace Freefall.Graphics
     {
         // Well-known hash keys for core per-instance data channels
         public static readonly int DescriptorsHash = "Descriptors".GetHashCode();
-        public static readonly int BoundingSpheresHash = "BoundingSpheres".GetHashCode();
+        // Removed: BoundingSpheresHash — bounding spheres now live in MeshRegistry
         public static readonly int SubbatchIdsHash = "SubbatchIds".GetHashCode();
         
         public List<InstanceBatch.RawDraw> Draws = new();
@@ -107,7 +107,6 @@ namespace Freefall.Graphics
             };
 
             StageCore(DescriptorsHash, 12, descriptor);       // InstanceDescriptor: 12 bytes
-            StageCore(BoundingSpheresHash, 16, mesh.LocalBoundingSphere);        // Vector4: 16 bytes
             StageCore(SubbatchIdsHash, 4,  (uint)meshPartId);        // uint: 4 bytes
             UniqueMeshPartIds.Add(meshPartId);
             
@@ -334,7 +333,7 @@ namespace Freefall.Graphics
             /// </summary>
             public void EnsureGPUBatch(
                 BatchKey key, Material material, Mesh mesh, int meshPartId,
-                uint descriptorsSRV, uint spheresSRV, uint subbatchIdsSRV,
+                uint descriptorsSRV, uint subbatchIdsSRV,
                 int instanceCount, ReadOnlySpan<InstanceBatch.GPUBufferBinding> customBindings)
             {
                 if (!batches.TryGetValue(key, out var batch))
@@ -354,7 +353,7 @@ namespace Freefall.Graphics
 
                 // Attach GPU-generated buffers
                 batch.AttachGPUData(
-                    descriptorsSRV, spheresSRV, subbatchIdsSRV,
+                    descriptorsSRV, subbatchIdsSRV,
                     instanceCount, meshPartId, customBindings);
             }
 
@@ -570,7 +569,6 @@ namespace Freefall.Graphics
             Mesh mesh,
             int meshPartId,
             uint descriptorsSRV,
-            uint spheresSRV,
             uint subbatchIdsSRV,
             int instanceCount,
             ReadOnlySpan<InstanceBatch.GPUBufferBinding> customBindings = default)
@@ -579,7 +577,7 @@ namespace Freefall.Graphics
             var pass = current.passes[(int)RenderPass.Opaque];
 
             pass.EnsureGPUBatch(key, material, mesh, meshPartId,
-                descriptorsSRV, spheresSRV, subbatchIdsSRV, instanceCount, customBindings);
+                descriptorsSRV, subbatchIdsSRV, instanceCount, customBindings);
         }
 
 

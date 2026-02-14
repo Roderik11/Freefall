@@ -28,11 +28,12 @@ namespace Freefall.Graphics
             public uint VertexCount;
             public uint BoneWeightsBufferIdx;
             public uint NumBones;
+            // Local-space bounding sphere (center + radius) for GPU culling
+            public float BoundsCenterX;
+            public float BoundsCenterY;
+            public float BoundsCenterZ;
+            public float BoundsRadius;
             // Padding to match IndirectDrawCommand size (72 bytes = 18 uints)
-            public uint Reserved0;
-            public uint Reserved1;
-            public uint Reserved2;
-            public uint Reserved3;
             public uint Reserved4;
             public uint Reserved5;
             public uint Reserved6;
@@ -71,6 +72,7 @@ namespace Freefall.Graphics
                     throw new InvalidOperationException($"MeshRegistry exceeded max capacity of {MaxMeshParts}");
 
                 var part = mesh.MeshParts[partIndex];
+                var bounds = part.BoundingSphere;
                 var entry = new MeshPartEntry
                 {
                     PosBufferIdx = mesh.PosBufferIndex,
@@ -81,6 +83,10 @@ namespace Freefall.Graphics
                     VertexCount = (uint)part.NumIndices,
                     BoneWeightsBufferIdx = mesh.BoneWeightBufferIndex,
                     NumBones = (uint)(mesh.Bones?.Length ?? 0),
+                    BoundsCenterX = bounds.X,
+                    BoundsCenterY = bounds.Y,
+                    BoundsCenterZ = bounds.Z,
+                    BoundsRadius = bounds.W,
                 };
 
                 int id = _entries.Count;

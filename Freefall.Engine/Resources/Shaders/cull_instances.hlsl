@@ -42,8 +42,8 @@ cbuffer PushConstants : register(b3)
 // Root constant mappings
 #define MeshRegistryIdx       Indices[0].x   // SRV: global mesh/part registry (replaces templates)
 #define OutputBufferIdx       Indices[0].y   // UAV: output commands
-#define BoundingSpheresIdx    Indices[0].z   // SRV: per-instance bounding spheres
-#define InstanceRangesIdx     Indices[0].w   // SRV: per-subbatch (start, count, meshPartId)
+#define PrevVisibilityIdx     Indices[0].z   // SRV: previous frame's visibility flags (feedback loop breaker)
+#define _Unused0w             Indices[0].w   // (was InstanceRangesIdx, now unused)
 
 #define DescriptorBufferIdx   Indices[1].x   // SRV: per-instance InstanceDescriptor buffer (TransformSlot, MaterialId, CustomDataIdx)
 #define VisibleIndicesUAVIdx  Indices[1].y   // UAV: output visible indices (compacted)
@@ -102,11 +102,9 @@ struct MeshPartEntry
     uint VertexCount;
     uint BoneWeightsBufferIdx;
     uint NumBones;
+    // Local-space bounding sphere (center + radius) for GPU culling
+    float4 LocalBounds;  // xyz = center, w = radius
     // Reserved fields for padding to match IndirectDrawCommand size
-    uint Reserved0;
-    uint Reserved1;
-    uint Reserved2;
-    uint Reserved3;
     uint Reserved4;
     uint Reserved5;
     uint Reserved6;
@@ -259,10 +257,10 @@ void CSVisibility(uint3 dispatchThreadId : SV_DispatchThreadID)
 {
     uint instanceIdx = dispatchThreadId.x;
     
-    StructuredBuffer<InstanceRange> ranges = ResourceDescriptorHeap[InstanceRangesIdx];
-    StructuredBuffer<float4> spheres = ResourceDescriptorHeap[BoundingSpheresIdx];
     StructuredBuffer<InstanceDescriptor> descriptors = ResourceDescriptorHeap[DescriptorBufferIdx];
     StructuredBuffer<row_major float4x4> transforms = ResourceDescriptorHeap[GlobalTransformsIdx];
+    StructuredBuffer<MeshPartEntry> meshRegistry = ResourceDescriptorHeap[MeshRegistryIdx];
+    StructuredBuffer<uint> subbatchIds = ResourceDescriptorHeap[SubbatchIdsIdx];
     RWStructuredBuffer<uint> visibilityFlags = ResourceDescriptorHeap[VisibilityFlagsIdx];
     RWStructuredBuffer<uint> counters = ResourceDescriptorHeap[CounterBufferIdx];
     
@@ -273,13 +271,14 @@ void CSVisibility(uint3 dispatchThreadId : SV_DispatchThreadID)
         return;
     }
     
-    // Read subbatch directly from per-instance buffer (no loop needed)
-    StructuredBuffer<uint> subbatchIds = ResourceDescriptorHeap[SubbatchIdsIdx];
+    // subbatchIds stores meshPartId directly (set in CommandBuffer.Enqueue)
     uint subBatch = subbatchIds[instanceIdx];
     
     // Data is stored in add-order, instanceIdx == drawIdx (identity mapping)
     uint transformSlot = descriptors[instanceIdx].TransformSlot;
-    float4 localSphere = spheres[instanceIdx];
+    
+    // Look up local bounding sphere from mesh registry (persistent, not per-instance)
+    float4 localSphere = meshRegistry[subBatch].LocalBounds;
     
     // Transform sphere to world space
     row_major float4x4 world = transforms[transformSlot];
@@ -298,9 +297,13 @@ void CSVisibility(uint3 dispatchThreadId : SV_DispatchThreadID)
     bool visible = IsVisible(worldCenter, worldRadius);
     
     // Hi-Z occlusion test (only for frustum-visible instances)
+    // Small distance-proportional radius floor prevents false positives when
+    // per-part AABB centers fall in gaps of open geometry (fences, bridges).
     if (visible)
     {
-        if (IsOccluded(worldCenter, worldRadius))
+        float4 hiZClip = mul(float4(worldCenter, 1.0), OcclusionProjection);
+        float hiZRadius = max(worldRadius, hiZClip.w * 0.01);
+        if (IsOccluded(worldCenter, hiZRadius))
             visible = false;
     }
     
@@ -728,9 +731,10 @@ void CSVisibilityShadow(uint3 dispatchThreadId : SV_DispatchThreadID)
 {
     uint instanceIdx = dispatchThreadId.x;
     
-    StructuredBuffer<float4> spheres = ResourceDescriptorHeap[BoundingSpheresIdx];
     StructuredBuffer<InstanceDescriptor> descriptors = ResourceDescriptorHeap[DescriptorBufferIdx];
     StructuredBuffer<row_major float4x4> transforms = ResourceDescriptorHeap[GlobalTransformsIdx];
+    StructuredBuffer<MeshPartEntry> meshRegistry = ResourceDescriptorHeap[MeshRegistryIdx];
+    StructuredBuffer<uint> subbatchIds = ResourceDescriptorHeap[SubbatchIdsIdx];
     RWStructuredBuffer<uint> visibilityFlags = ResourceDescriptorHeap[VisibilityFlagsIdx];
     
     // Bounds check - write 0 for out-of-range
@@ -740,9 +744,10 @@ void CSVisibilityShadow(uint3 dispatchThreadId : SV_DispatchThreadID)
         return;
     }
     
-    // Get transform and bounding sphere
+    // Get transform and bounding sphere from mesh registry
     uint transformSlot = descriptors[instanceIdx].TransformSlot;
-    float4 localSphere = spheres[instanceIdx];
+    uint meshPartId = subbatchIds[instanceIdx];
+    float4 localSphere = meshRegistry[meshPartId].LocalBounds;
     
     // Transform sphere to world space
     row_major float4x4 world = transforms[transformSlot];
@@ -800,11 +805,13 @@ void CSVisibilityShadow4(uint3 dispatchThreadId : SV_DispatchThreadID)
     
     // Load instance data ONCE (instead of 4× in separate dispatches)
     StructuredBuffer<InstanceDescriptor> descriptors = ResourceDescriptorHeap[DescriptorBufferIdx];
-    StructuredBuffer<float4> spheres = ResourceDescriptorHeap[BoundingSpheresIdx];
     StructuredBuffer<row_major float4x4> transforms = ResourceDescriptorHeap[GlobalTransformsIdx];
+    StructuredBuffer<MeshPartEntry> meshRegistry = ResourceDescriptorHeap[MeshRegistryIdx];
+    StructuredBuffer<uint> subbatchIds = ResourceDescriptorHeap[SubbatchIdsIdx];
     
     uint transformSlot = descriptors[instanceIdx].TransformSlot;
-    float4 localSphere = spheres[instanceIdx];
+    uint meshPartId = subbatchIds[instanceIdx];
+    float4 localSphere = meshRegistry[meshPartId].LocalBounds;
     
     // Transform sphere to world space (done ONCE)
     row_major float4x4 world = transforms[transformSlot];
