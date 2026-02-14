@@ -30,7 +30,14 @@ namespace Freefall.Components
         public int MaxDepth = 7;
         public int MaxPatches = 8192;
         public Texture?[] ControlMaps = new Texture?[4];
-        public List<Terrain.TextureLayer>? Layers;
+        public List<TextureLayer>? Layers;
+
+        public class TextureLayer
+        {
+            public Texture Diffuse;
+            public Texture Normals;
+            public Vector2 Tiling = Vector2.One;
+        }
 
         private Vector4[] _layerTiling = new Vector4[32];
 

@@ -15,14 +15,12 @@ namespace Freefall.Graphics
 
         // Per-instance GPU data channels
         public static GPUBuffer<Matrix4x4> Transforms { get; private set; } = null!;
+        public static GPUBuffer<InstanceDescriptor> Descriptors { get; private set; } = null!;
+        public static GPUBuffer<Vector4> BoundingSpheres { get; private set; } = null!;
+        public static GPUBuffer<uint> MeshPartIds { get; private set; } = null!;
 
-        // Future channels (added as needed, no existing code changes required):
-        // public static GPUBuffer<BoundingSphere> Bounds { get; private set; }
-        // public static GPUBuffer<uint> MeshPartIds { get; private set; }
-        // public static GPUBuffer<uint> MaterialIds { get; private set; }
-        // public static GPUBuffer<uint> PSOIds { get; private set; }
-        // public static GPUBuffer<uint> Visibility { get; private set; }
-        // public static GPUBuffer<uint> BoneOffsets { get; private set; }
+        /// <summary>High-water mark: maximum slot index currently in use + 1.</summary>
+        public static int ActiveSlotCount => Slots.HighWaterMark;
 
         private static bool _initialized;
 
@@ -35,6 +33,9 @@ namespace Freefall.Graphics
 
             Slots = new RenderSlotAllocator();
             Transforms = new GPUBuffer<Matrix4x4>(device, initialCapacity);
+            Descriptors = new GPUBuffer<InstanceDescriptor>(device, initialCapacity);
+            BoundingSpheres = new GPUBuffer<Vector4>(device, initialCapacity);
+            MeshPartIds = new GPUBuffer<uint>(device, initialCapacity);
 
             _initialized = true;
             Debug.Log($"[SceneBuffers] Initialized (capacity: {initialCapacity})");
@@ -49,7 +50,9 @@ namespace Freefall.Graphics
             if (!_initialized) return;
 
             Transforms.Upload();
-            // Future: Bounds.Upload(); MaterialIds.Upload(); etc.
+            Descriptors.Upload();
+            BoundingSpheres.Upload();
+            MeshPartIds.Upload();
 
             GPUBuffer<Matrix4x4>.FlushDeferredDisposals();
         }
@@ -64,6 +67,9 @@ namespace Freefall.Graphics
             // Ensure all channels can hold this slot
             int needed = slot + 1;
             Transforms.EnsureCapacity(needed);
+            Descriptors.EnsureCapacity(needed);
+            BoundingSpheres.EnsureCapacity(needed);
+            MeshPartIds.EnsureCapacity(needed);
 
             return slot;
         }
@@ -75,19 +81,28 @@ namespace Freefall.Graphics
         {
             // Clear the data in each channel
             Transforms.Set(slot, Matrix4x4.Identity);
+            Descriptors.Set(slot, default);
+            BoundingSpheres.Set(slot, Vector4.Zero);
+            MeshPartIds.Set(slot, 0);
 
             Slots.Release(slot);
         }
 
-        /// <summary>
-        /// Bindless SRV index for the current frame's transform buffer.
-        /// Backward-compatible with existing shaders that read from the transform buffer.
-        /// </summary>
+        /// <summary>Bindless SRV index for the current frame's transform buffer.</summary>
         public static uint TransformSrvIndex => Transforms.SrvIndex;
+        /// <summary>Bindless SRV index for the current frame's descriptor buffer.</summary>
+        public static uint DescriptorSrvIndex => Descriptors.SrvIndex;
+        /// <summary>Bindless SRV index for the current frame's bounding sphere buffer.</summary>
+        public static uint BoundingSphereSrvIndex => BoundingSpheres.SrvIndex;
+        /// <summary>Bindless SRV index for the current frame's mesh part ID buffer.</summary>
+        public static uint MeshPartIdSrvIndex => MeshPartIds.SrvIndex;
 
         public static void Dispose()
         {
             Transforms?.Dispose();
+            Descriptors?.Dispose();
+            BoundingSpheres?.Dispose();
+            MeshPartIds?.Dispose();
             _initialized = false;
         }
     }

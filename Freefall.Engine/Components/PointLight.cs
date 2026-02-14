@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Numerics;
 using System.Runtime.InteropServices;
 using Vortice.Mathematics;
@@ -18,13 +18,12 @@ namespace Freefall.Components
         private static Material? _sharedMaterial;
 
         private MaterialBlock _params = new MaterialBlock();
-        private int _sceneSlot = -1;
 
         public BoundingSphere BoundingSphere { get; private set; }
         public BoundingBox BoundingBox { get; private set; }
 
         /// <summary>
-        /// Per-instance light data — matches HLSL PointLightData struct.
+        /// Per-instance light data ÔÇö matches HLSL PointLightData struct.
         /// Sent to GPU via the generic per-instance buffer system (same pattern as TerrainPatchData).
         /// </summary>
         [StructLayout(LayoutKind.Sequential, Pack = 16)]
@@ -51,35 +50,8 @@ namespace Freefall.Components
                 _sharedEffect = new Effect("light_point");
             }
             
-            // Create shared material — G-Buffer textures are set here (same for all point lights)
+            // Create shared material ÔÇö G-Buffer textures are set here (same for all point lights)
             _sharedMaterial ??= new Material(_sharedEffect);
-
-            _sceneSlot = SceneBuffers.AllocateSlot();
-            Entity.Transform.OnChanged += OnTransformChanged;
-        }
-
-        public override void Destroy()
-        {
-            if (Entity?.Transform != null)
-                Entity.Transform.OnChanged -= OnTransformChanged;
-
-            if (_sceneSlot >= 0)
-            {
-                SceneBuffers.ReleaseSlot(_sceneSlot);
-                _sceneSlot = -1;
-            }
-        }
-
-        private void OnTransformChanged()
-        {
-            var world = Entity.Transform.WorldMatrix;
-
-            var slot = Entity.Transform.TransformSlot;
-            if (slot >= 0)
-                TransformBuffer.Instance.SetTransform(slot, world);
-
-            if (_sceneSlot >= 0)
-                SceneBuffers.Transforms.Set(_sceneSlot, Matrix4x4.Transpose(world));
         }
 
         public void Draw()
@@ -92,6 +64,8 @@ namespace Freefall.Components
             UpdateBounds();
 
             var slot = Entity.Transform.TransformSlot;
+            if (slot >= 0)
+                TransformBuffer.Instance.SetTransform(slot, Entity.Transform.WorldMatrix);
 
             // Set G-Buffer textures on the shared Material (slots 17-20, same for all lights)
             if (DeferredRenderer.Current != null)
@@ -106,24 +80,24 @@ namespace Freefall.Components
             // CameraInverse, so reconstructed world positions are relative to camera.
             var camPos = Camera.Main?.Position ?? Vector3.Zero;
 
-            // Set per-instance light data via MaterialBlock → per-instance staging buffer
+            // Set per-instance light data via MaterialBlock ÔåÆ per-instance staging buffer
             // Same pattern as Terrain's TerrainPatchData
             _params.Clear();
             _params.SetParameter("LightData", new PointLightData
             {
                 Color = new Vector3(Color.R, Color.G, Color.B),
                 Intensity = Intensity,
-                Position = Entity.Transform.WorldPosition - camPos,
+                Position = Entity.Transform.Position - camPos,
                 Range = Range
             });
 
-            // Enqueue — pass is inferred from shader technique ("Light")
+            // Enqueue ÔÇö pass is inferred from shader technique ("Light")
             CommandBuffer.Enqueue(_sphereMesh, _sharedMaterial, _params, slot);
         }
 
         private void UpdateBounds()
         {
-            BoundingSphere = new BoundingSphere(Entity.Transform.WorldPosition, Range);
+            BoundingSphere = new BoundingSphere(Entity.Transform.Position, Range);
             BoundingBox = BoundingBox.CreateFromSphere(BoundingSphere);
         }
     }

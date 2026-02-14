@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Numerics;
 using System.Collections.Generic;
 using Freefall.Assets;
@@ -22,53 +22,15 @@ namespace Freefall.Components
         public BoundingSphere BoundingSphere => _boundingSphere;
 
         private Vector3[] points = new Vector3[8];
-        private int _sceneSlot = -1;
 
         public StaticMeshRenderer()
         {
             Params = new MaterialBlock();
         }
 
-        protected override void Awake()
-        {
-            // Allocate a SceneBuffers slot for future GPU-driven path
-            _sceneSlot = SceneBuffers.AllocateSlot();
-
-            // Subscribe to event-driven transform updates
-            Entity.Transform.OnChanged += OnTransformChanged;
-
-            // Push initial transform
-            OnTransformChanged();
-        }
-
-        public override void Destroy()
-        {
-            if (Entity?.Transform != null)
-                Entity.Transform.OnChanged -= OnTransformChanged;
-
-            if (_sceneSlot >= 0)
-            {
-                SceneBuffers.ReleaseSlot(_sceneSlot);
-                _sceneSlot = -1;
-            }
-        }
-
-        private void OnTransformChanged()
-        {
-            var world = Entity.Transform.WorldMatrix;
-
-            // Write to legacy TransformBuffer (current pipeline reads from this)
-            var slot = Entity.Transform.TransformSlot;
-            if (slot >= 0)
-                TransformBuffer.Instance.SetTransform(slot, world);
-
-            // Write to SceneBuffers (new pipeline — shaders will switch to this later)
-            if (_sceneSlot >= 0)
-                SceneBuffers.Transforms.Set(_sceneSlot, Matrix4x4.Transpose(world));
-        }
-
         const float MinDrawSizeSq = 0.01f * 0.01f;
 
+        // TODO: only recompute when transform is dirty (adapt Apex's lazy transform updates)
         private void UpdateBounds()
         {
             var mesh = StaticMesh.Mesh;
@@ -94,7 +56,7 @@ namespace Freefall.Components
 
             // Apex screen-size metric: projected solid angle of bounding sphere
             float diameter = _boundingSphere.Radius;
-            float distanceSq = Vector3.DistanceSquared(Transform.WorldPosition, cam.Position);
+            float distanceSq = Vector3.DistanceSquared(Transform.Position, cam.Position);
             float sizeSq = (diameter * diameter / MathF.Max(distanceSq, 0.001f)) * cam.FoVFactor;
 
             int min = Math.Min(lodgroup.Ranges.Count, StaticMesh.LODs.Count);
@@ -112,8 +74,7 @@ namespace Freefall.Components
             return (min > 0) ? StaticMesh.LODs[min - 1] : StaticMesh;
         }
 
-        // Draw still needed for LOD selection and CommandBuffer.Enqueue
-        // (removed per-frame SetTransform — now event-driven via OnChanged)
+        // Draw method called by Renderer or System
         public void Draw()
         {
              IStaticMesh lod = GetMesh();
@@ -122,6 +83,10 @@ namespace Freefall.Components
              var mesh = lod.Mesh;
              var elements = lod.MeshParts;
              var slot = Entity.Transform.TransformSlot;
+             
+             // Update TransformBuffer directly (GPU path)
+             if (slot >= 0)
+                 TransformBuffer.Instance.SetTransform(slot, Entity.Transform.WorldMatrix);
              
              // Like Apex: iterate through MeshParts and use element.Material
              if (elements != null && elements.Count > 0)

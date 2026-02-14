@@ -205,6 +205,7 @@ namespace Freefall.Components
                         batch.DrawShadow(commandList, i, shadowSceneCBVAddress);
                         batch.Material.SetPass(pass);
                     }
+
                 }
             }
             else
