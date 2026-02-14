@@ -20,7 +20,7 @@ namespace Freefall.Components
         Terrain
     }
 
-    public class RigidBody : Component, IUpdate
+    public class RigidBody : Component
     {
         private static Dictionary<int, TriangleMesh> _triMeshCache = new();
 
@@ -55,22 +55,25 @@ namespace Freefall.Components
             try
             {
                 CreateBody();
+
+                Transform.OnChanged += () =>
+                {
+                    if (IsStatic && _staticActor != null)
+                    {
+                        var matrix = Transform.Matrix;
+                        matrix.M11 = 1;
+                        matrix.M22 = 1;
+                        matrix.M33 = 1;
+
+                        _staticActor.GlobalPose = matrix;
+                        _staticActor.GlobalPosePosition = matrix.Translation;
+                        _staticActor.GlobalPoseQuat = Transform.Rotation;
+                    }
+                };
             }
             catch (Exception ex)
             {
                 Debug.Log($"[RigidBody] {Entity?.Name}: {ex.Message}");
-            }
-        }
-
-        public void Update()
-        {
-            if (Actor == null) return;
-
-            // Dynamic bodies: read pose from PhysX → Transform
-            if (!IsStatic && _dynamicActor != null && _dynamicActor.IsSleeping == false)
-            {
-                Transform.Position = _dynamicActor.GlobalPosePosition;
-                Transform.Rotation = _dynamicActor.GlobalPoseQuat;
             }
         }
 

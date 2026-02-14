@@ -37,6 +37,9 @@ namespace Freefall.Components
         public float DayIntensity = 1.0f;       // Sun intensity at noon
         public float NightIntensity = 0.1f;     // Ambient intensity at night
 
+        // Static ambient scale accessible by composition pass
+        public static float AmbientScale { get; private set; } = 1.0f;
+
         private float CloudTime = 0.0f;
 
 
@@ -72,9 +75,6 @@ namespace Freefall.Components
             if (UseProceduralSky && ControlSunLight && SunLight != null)
                 UpdateSunLight();
         }
-
-        // Static ambient scale accessible by composition pass
-        public static float AmbientScale { get; private set; } = 1.0f;
 
         private void UpdateSunLight()
         {
@@ -115,10 +115,6 @@ namespace Freefall.Components
         public void Draw()
         {
             var slot = Entity.Transform.TransformSlot;
-
-            // Update transform in the global buffer
-            if (slot >= 0)
-                TransformBuffer.Instance.SetTransform(slot, Entity.Transform.WorldMatrix);
 
             // Set sky parameters on the MaterialBlock
             Material.SetParameter("World", Entity.Transform.WorldMatrix);

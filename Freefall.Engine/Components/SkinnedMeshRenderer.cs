@@ -15,7 +15,7 @@ namespace Freefall.Components
     /// Renders skinned/animated meshes with bone transforms.
     /// Uses bindless instancing with a shared bone matrix buffer.
     /// </summary>
-    public class SkinnedMeshRenderer : Component, IDraw, IParallel
+    public class SkinnedMeshRenderer : Component, IDraw, IUpdate, IParallel
     {
         public Mesh? Mesh;
         public List<Material> Materials = new List<Material>();
@@ -29,34 +29,27 @@ namespace Freefall.Components
             animator = Entity?.GetComponent<Animator>();
         }
 
+        public void Update()
+        {
+            if(!Enabled) return;
+            if (Mesh?.Bones == null) return;
+            if (animator == null) return;
+
+            if (boneMatrices.Length != Mesh.Bones.Length)
+                Array.Resize(ref boneMatrices, Mesh.Bones.Length);
+
+            Transform.RootRotation = Mesh.RootRotation;
+
+            animator.GetPose(Mesh.Bones, boneMatrices);
+            Params.SetParameterArray("Bones", boneMatrices);
+        }
+
         public void Draw()
         {
             if(!Enabled) return;
-            if (Mesh?.Bones == null || Entity?.Transform == null) return;
             if (Materials == null || Materials.Count == 0) return;
 
-            // Calculate bone poses in Update (logic phase)
-            if (animator != null)
-            {
-                if (boneMatrices.Length != Mesh.Bones.Length)
-                    Array.Resize(ref boneMatrices, Mesh.Bones.Length);
-
-                animator.GetPose(Mesh.Bones, boneMatrices);
-                
-                // Store in MaterialBlock for batched upload during rendering
-                Params.SetParameterArray("Bones", boneMatrices);
-            }
-
             var slot = Entity.Transform.TransformSlot;
-            
-            // Update TransformBuffer with world matrix (apply root rotation if set)
-            if (slot >= 0)
-            {
-                var world = Entity.Transform.WorldMatrix;
-                if (!Mesh.RootRotation.IsIdentity)
-                    world = Mesh.RootRotation * world;
-                TransformBuffer.Instance.SetTransform(slot, world);
-            }
 
             for (int i = 0; i < Mesh.MeshParts.Count; i++)
             {

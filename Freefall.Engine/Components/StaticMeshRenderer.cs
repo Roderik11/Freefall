@@ -12,33 +12,36 @@ namespace Freefall.Components
     public class StaticMeshRenderer : Component, IDraw, IParallel
     {
         public StaticMesh StaticMesh;
-
         public MaterialBlock Params;
-
-        public BoundingBox _boundingBox;
-        public BoundingSphere _boundingSphere;
-        
-        public BoundingBox BoundingBox => _boundingBox;
-        public BoundingSphere BoundingSphere => _boundingSphere;
+        public BoundingSphere BoundingSphere;
 
         private Vector3[] points = new Vector3[8];
+
+        const float MinDrawSizeSq = 0.01f * 0.01f;
 
         public StaticMeshRenderer()
         {
             Params = new MaterialBlock();
         }
 
-        const float MinDrawSizeSq = 0.01f * 0.01f;
+        protected override void Awake()
+        {
+            OnTransformChanged();
+            Transform.OnChanged += OnTransformChanged;
+        }
 
-        // TODO: only recompute when transform is dirty (adapt Apex's lazy transform updates)
-        private void UpdateBounds()
+        public override void Destroy()
+        {
+            Transform.OnChanged -= OnTransformChanged;
+        }
+
+        void OnTransformChanged()
         {
             var mesh = StaticMesh.Mesh;
             if (mesh == null) return;
 
             mesh.BoundingBox.GetCorners(points, mesh.RootRotation * Transform.WorldMatrix);
-            _boundingBox = BoundingBox.CreateFromPoints(points);
-            _boundingSphere = BoundingSphere.CreateFromPoints(points);
+            BoundingSphere = BoundingSphere.CreateFromPoints(points);
         }
 
         private IStaticMesh GetMesh()
@@ -50,15 +53,10 @@ namespace Freefall.Components
             if (cam == null) return StaticMesh;
             if (StaticMesh.LODGroup == null) return StaticMesh;
 
-            UpdateBounds();
-
             var lodgroup = StaticMesh.LODGroup;
-
-            // Apex screen-size metric: projected solid angle of bounding sphere
-            float diameter = _boundingSphere.Radius;
+            float diameter = BoundingSphere.Radius;
             float distanceSq = Vector3.DistanceSquared(Transform.Position, cam.Position);
             float sizeSq = (diameter * diameter / MathF.Max(distanceSq, 0.001f)) * cam.FoVFactor;
-
             int min = Math.Min(lodgroup.Ranges.Count, StaticMesh.LODs.Count);
 
             for (int i = 0; i < min; i++)
@@ -84,16 +82,12 @@ namespace Freefall.Components
              var elements = lod.MeshParts;
              var slot = Entity.Transform.TransformSlot;
              
-             // Update TransformBuffer directly (GPU path)
-             if (slot >= 0)
-                 TransformBuffer.Instance.SetTransform(slot, Entity.Transform.WorldMatrix);
-             
-             // Like Apex: iterate through MeshParts and use element.Material
+             // iterate through MeshParts and use element.Material
              if (elements != null && elements.Count > 0)
              {
                  foreach (var element in elements)
                  {
-                     // Enqueue into all passes defined by the Effect (Spark pattern)
+                     // Enqueue into all passes defined by the Effect
                      if (element.Material != null)
                          CommandBuffer.Enqueue(mesh, element.MeshPartIndex, element.Material, Params, slot);
                  }

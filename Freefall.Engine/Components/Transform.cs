@@ -12,6 +12,7 @@ namespace Freefall.Components
         private int _depth;
         private Transform _parent;
         private bool _isDirty = true;
+        private bool _isFiringChanged;
         private Vector3 _position;
         private Quaternion _rotation = Quaternion.Identity;
         private Vector3 _scale = Vector3.One;
@@ -38,6 +39,8 @@ namespace Freefall.Components
         public int Count => Children.Count;
         public System.Collections.IEnumerator GetEnumerator() => Children.GetEnumerator();
 
+        public Matrix4x4 RootRotation = Matrix4x4.Identity;
+
         internal void SetDirty()
         {
             _isDirty = true;
@@ -45,7 +48,18 @@ namespace Freefall.Components
             for (int i = 0; i < Children.Count; i++)
                 Children[i].SetDirty();
 
-            OnChanged?.Invoke();
+            TransformBuffer.Instance!.SetTransform(TransformSlot, RootRotation * Matrix);
+
+            // Re-entrancy guard: if a subscriber modifies the transform
+            // inside OnChanged, the recursive SetDirty still propagates
+            // dirty flags and updates the GPU buffer, but we skip firing
+            // the event again to prevent stack overflow.
+            if (!_isFiringChanged)
+            {
+                _isFiringChanged = true;
+                try { OnChanged?.Invoke(); }
+                finally { _isFiringChanged = false; }
+            }
         }
 
         [System.ComponentModel.Browsable(false)]

@@ -76,6 +76,17 @@ namespace Freefall.Base
             _accumulator -= FixedTimestep;
             Scene.Simulate(FixedTimestep);
             Scene.FetchResults(true);
+
+            var activeActors = Scene.GetActors(ActorTypeFlag.RigidDynamic);
+            foreach (RigidDynamic actor in activeActors) 
+            {
+                var entity = actor.UserData as Entity;
+                if (entity != null)
+                {
+                    entity.Transform.Position = actor.GlobalPosePosition;
+                    entity.Transform.Rotation = actor.GlobalPoseQuat;
+                }
+            }
         }
 
         public static void Shutdown()

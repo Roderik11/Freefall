@@ -15,7 +15,7 @@ namespace Freefall.Components
     /// quadtree and produces per-patch data directly into InstanceBatch-compatible buffers.
     /// The compute dispatch runs as a custom action on the renderer's command list.
     /// </summary>
-    public class GPUTerrain : Freefall.Base.Component, IUpdate, IDraw, IParallel, IHeightProvider
+    public class GPUTerrain : Freefall.Base.Component, IDraw, IHeightProvider
     {
         public static bool ComputeReady { get; set; }
         public static string ComputeError { get; set; } = "";
@@ -114,6 +114,9 @@ namespace Freefall.Components
             _meshPartId = MeshRegistry.Register(_patchMesh, 0);
             _transformSlot = TransformBuffer.Instance!.AllocateSlot();
 
+            OnTransformChanged();
+            Entity.Transform.OnChanged += OnTransformChanged;
+
             if (Layers != null && Layers.Count > 0)
                 SetupLayerTiling();
 
@@ -132,11 +135,13 @@ namespace Freefall.Components
             ComputeReady = _computeInitialized;
         }
 
-        public void Update()
+        public override void Destroy()
         {
-            if (Camera.Main == null || !_computeInitialized) return;
+            Entity.Transform.OnChanged -= OnTransformChanged;
+        }
 
-            // Set identity transform
+        private void OnTransformChanged()
+        {
             TransformBuffer.Instance!.SetTransform(_transformSlot, Transform.WorldMatrix);
         }
 

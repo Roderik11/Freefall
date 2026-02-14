@@ -21,11 +21,6 @@ namespace Freefall.Components
 
             var slot = Entity.Transform.TransformSlot;
 
-            // Update TransformBuffer directly (GPU path)
-            if (slot >= 0)
-                TransformBuffer.Instance.SetTransform(slot, Entity.Transform.WorldMatrix);
-
-
             // Use per-part materials if available
             if (Materials.Count > 0)
             {
@@ -42,11 +37,6 @@ namespace Freefall.Components
                 for (int i = 0; i < Mesh.MeshParts.Count; i++)
                     CommandBuffer.Enqueue(Mesh, i, Material, Params, slot);
             }
-        }
-
-        public override void Destroy()
-        {
-             // Resource cleanup logic if component owns resources
         }
     }
 }
