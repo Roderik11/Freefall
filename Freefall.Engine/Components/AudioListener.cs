@@ -28,7 +28,7 @@ namespace Freefall.Components
 
         public void Update()
         {
-            var newpos = Transform.Position;
+            var newpos = Transform.WorldPosition;
             Listener.Velocity = Time.SmoothDelta > 0 ? (newpos - Listener.Position) / Time.SmoothDelta : Vector3.Zero;
             Listener.Position = newpos;
             Listener.OrientFront = Transform.Forward;

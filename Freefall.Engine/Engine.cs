@@ -77,6 +77,9 @@ namespace Freefall
             // Initialize persistent transform buffer for GPU-driven rendering
             TransformBuffer.Initialize(Device);
             
+            // Initialize SceneBuffers (new GPU-driven architecture)
+            SceneBuffers.Initialize(Device);
+            
             // Initialize streaming manager before assets (AssetManager creates default textures that need it)
             var streaming = new StreamingManager(Device);
             
@@ -108,6 +111,7 @@ namespace Freefall
 
             Device = new GraphicsDevice();
             TransformBuffer.Initialize(Device);
+            SceneBuffers.Initialize(Device);
             var streaming = new StreamingManager(Device);
             Assets = new AssetManager(Device);
             Freefall.Assets.InternalAssets.Initialize(Device);
@@ -146,6 +150,9 @@ namespace Freefall
 
             // Release GPU buffers from previous batch resizes (deferred N frames for safety)
             Graphics.InstanceBatch.FlushDeferredDisposals();
+
+            // Upload dirty SceneBuffers data to current frame's GPU buffers
+            SceneBuffers.UploadAll();
 
             // Flush pending entity additions before Update/Render
             Base.EntityManager.FlushPending();
@@ -290,6 +297,7 @@ namespace Freefall
             Kernel32.timeEndPeriod(1);
             
             TransformBuffer.Instance?.Dispose();
+            SceneBuffers.Dispose();
             StreamingManager.Instance?.Dispose();
 
             // Dispose all registered render views

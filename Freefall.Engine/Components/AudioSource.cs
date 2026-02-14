@@ -108,7 +108,7 @@ namespace Freefall.Components
 
             if (sourceVoice == null) return;
 
-            var newpos = Transform.Position;
+            var newpos = Transform.WorldPosition;
             emitter.Velocity = Time.SmoothDelta > 0 ? (newpos - emitter.Position) / Time.SmoothDelta : Vector3.Zero;
             emitter.Position = newpos;
             emitter.OrientFront = Transform.Forward;

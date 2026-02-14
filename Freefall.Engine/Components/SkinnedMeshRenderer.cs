@@ -23,19 +23,61 @@ namespace Freefall.Components
 
         private Animator? animator;
         private Matrix4x4[]? boneMatrices = new Matrix4x4[4];
+        private int _sceneSlot = -1;
         
         protected override void Awake()
         {
             animator = Entity?.GetComponent<Animator>();
+
+            // Allocate a SceneBuffers slot for future GPU-driven path
+            _sceneSlot = SceneBuffers.AllocateSlot();
+
+            // Subscribe to event-driven transform updates
+            if (Entity?.Transform != null)
+            {
+                Entity.Transform.OnChanged += OnTransformChanged;
+                OnTransformChanged();
+            }
         }
 
+        public override void Destroy()
+        {
+            if (Entity?.Transform != null)
+                Entity.Transform.OnChanged -= OnTransformChanged;
+
+            if (_sceneSlot >= 0)
+            {
+                SceneBuffers.ReleaseSlot(_sceneSlot);
+                _sceneSlot = -1;
+            }
+        }
+
+        private void OnTransformChanged()
+        {
+            if (Mesh == null || Entity?.Transform == null) return;
+
+            var world = Entity.Transform.WorldMatrix;
+            if (!Mesh.RootRotation.IsIdentity)
+                world = Mesh.RootRotation * world;
+
+            // Write to legacy TransformBuffer (current pipeline reads from this)
+            var slot = Entity.Transform.TransformSlot;
+            if (slot >= 0)
+                TransformBuffer.Instance.SetTransform(slot, world);
+
+            // Write to SceneBuffers (new pipeline)
+            if (_sceneSlot >= 0)
+                SceneBuffers.Transforms.Set(_sceneSlot, Matrix4x4.Transpose(world));
+        }
+
+        // Draw still needed for per-frame bone computation + CommandBuffer.Enqueue
         public void Draw()
         {
             if(!Enabled) return;
             if (Mesh?.Bones == null || Entity?.Transform == null) return;
             if (Materials == null || Materials.Count == 0) return;
 
-            // Calculate bone poses in Update (logic phase)
+            // Calculate bone poses (animated data — changes every frame)
             if (animator != null)
             {
                 if (boneMatrices.Length != Mesh.Bones.Length)
@@ -49,15 +91,6 @@ namespace Freefall.Components
 
             var slot = Entity.Transform.TransformSlot;
             
-            // Update TransformBuffer with world matrix (apply root rotation if set)
-            if (slot >= 0)
-            {
-                var world = Entity.Transform.WorldMatrix;
-                if (!Mesh.RootRotation.IsIdentity)
-                    world = Mesh.RootRotation * world;
-                TransformBuffer.Instance.SetTransform(slot, world);
-            }
-
             for (int i = 0; i < Mesh.MeshParts.Count; i++)
             {
                 if (!Mesh.MeshParts[i].Enabled) continue;

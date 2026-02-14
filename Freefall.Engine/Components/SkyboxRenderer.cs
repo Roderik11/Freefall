@@ -12,6 +12,7 @@ namespace Freefall.Components
         public Mesh Mesh;
         public Material Material;
         public MaterialBlock Params = new MaterialBlock();
+        private int _sceneSlot = -1;
 
         // Sky mode
         public bool UseProceduralSky = true;
@@ -48,6 +49,33 @@ namespace Freefall.Components
         {
             Mesh = Mesh.CreateCube(Engine.Device, 100.0f);
             Material = new Material(new Effect("mesh_skybox"));
+
+            _sceneSlot = SceneBuffers.AllocateSlot();
+            Entity.Transform.OnChanged += OnTransformChanged;
+        }
+
+        public override void Destroy()
+        {
+            if (Entity?.Transform != null)
+                Entity.Transform.OnChanged -= OnTransformChanged;
+
+            if (_sceneSlot >= 0)
+            {
+                SceneBuffers.ReleaseSlot(_sceneSlot);
+                _sceneSlot = -1;
+            }
+        }
+
+        private void OnTransformChanged()
+        {
+            var world = Entity.Transform.WorldMatrix;
+
+            var slot = Entity.Transform.TransformSlot;
+            if (slot >= 0)
+                TransformBuffer.Instance.SetTransform(slot, world);
+
+            if (_sceneSlot >= 0)
+                SceneBuffers.Transforms.Set(_sceneSlot, Matrix4x4.Transpose(world));
         }
 
         public void Update()
@@ -115,10 +143,6 @@ namespace Freefall.Components
         public void Draw()
         {
             var slot = Entity.Transform.TransformSlot;
-
-            // Update transform in the global buffer
-            if (slot >= 0)
-                TransformBuffer.Instance.SetTransform(slot, Entity.Transform.WorldMatrix);
 
             // Set sky parameters on the MaterialBlock
             Material.SetParameter("World", Entity.Transform.WorldMatrix);

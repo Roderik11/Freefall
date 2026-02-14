@@ -32,3 +32,6 @@ Freefall.Editor/
 
 # Backup files
 *.backup
+
+# Planning docs
+implementation_plan.md
