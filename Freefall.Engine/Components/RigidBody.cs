@@ -199,10 +199,10 @@ namespace Freefall.Components
 
                 case ShapeType.Terrain:
                 {
-                    var terrain = Entity?.GetComponent<GPUTerrain>();
+                    var terrain = Entity?.GetComponent<Terrain>();
                     if (terrain?.HeightField == null)
                     {
-                        Debug.Log("[RigidBody] No GPUTerrain HeightField found");
+                        Debug.Log("[RigidBody] No Terrain HeightField found");
                         return null;
                     }
 

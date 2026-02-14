@@ -15,7 +15,7 @@ namespace Freefall.Components
     /// quadtree and produces per-patch data directly into InstanceBatch-compatible buffers.
     /// The compute dispatch runs as a custom action on the renderer's command list.
     /// </summary>
-    public class GPUTerrain : Freefall.Base.Component, IDraw, IHeightProvider
+    public class Terrain : Freefall.Base.Component, IDraw, IHeightProvider
     {
         public static bool ComputeReady { get; set; }
         public static string ComputeError { get; set; } = "";
@@ -128,10 +128,10 @@ namespace Freefall.Components
             catch (Exception ex)
             {
                 ComputeError = ex.Message;
-                Debug.LogError("[GPUTerrain]", $"Failed to initialize compute: {ex.Message}");
+                Debug.LogError("[Terrain]", $"Failed to initialize compute: {ex.Message}");
             }
 
-            Debug.Log($"[GPUTerrain] MaxDepth={MaxDepth} TotalNodes={_totalNodes} MaxPatches={MaxPatches} ComputeInit={_computeInitialized}");
+            Debug.Log($"[Terrain] MaxDepth={MaxDepth} TotalNodes={_totalNodes} MaxPatches={MaxPatches} ComputeInit={_computeInitialized}");
             ComputeReady = _computeInitialized;
         }
 
@@ -187,7 +187,7 @@ namespace Freefall.Components
             string shaderPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Resources", "Shaders", "terrain_quadtree.hlsl");
             if (!File.Exists(shaderPath))
             {
-                Debug.LogError("[GPUTerrain]", $"Compute shader not found: {shaderPath}");
+                Debug.LogError("[Terrain]", $"Compute shader not found: {shaderPath}");
                 return;
             }
 
@@ -672,7 +672,7 @@ namespace Freefall.Components
             device.NativeDevice.CreateShaderResourceView(
                 _heightRangePyramid, fullSrvDesc, device.GetCpuHandle(_heightRangePyramidSRV));
 
-            Debug.Log($"[GPUTerrain] Height range pyramid: {pyramidSize}x{pyramidSize}, {_heightRangeMipCount} mips, SRV={_heightRangePyramidSRV}");
+            Debug.Log($"[Terrain] Height range pyramid: {pyramidSize}x{pyramidSize}, {_heightRangeMipCount} mips, SRV={_heightRangePyramidSRV}");
         }
 
         /// <summary>
