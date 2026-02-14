@@ -7,6 +7,7 @@ namespace Freefall
 {
     public static class Input
     {
+        private static IntPtr _hWnd;
         private static readonly HashSet<Keys> _keysDown = new HashSet<Keys>();
         private static readonly HashSet<Keys> _keysPressed = new HashSet<Keys>();
         private static readonly HashSet<Keys> _keysReleased = new HashSet<Keys>();
@@ -34,11 +35,13 @@ namespace Freefall
 
         public static void Init(IntPtr hWnd)
         {
+            _hWnd = hWnd;
             RawInputDevice.RegisterDevice(HidUsageAndPage.Mouse, RawInputDeviceFlags.None, hWnd);
         }
 
-        public static void Update(IntPtr hWnd)
+        public static void Update()
         {
+            var hWnd = _hWnd;
             // Accumulate raw delta into the public MouseDelta
             MouseDelta = new Vortice.Mathematics.Int2(_rawX, _rawY);
             MouseWheelDelta = _rawWheel;

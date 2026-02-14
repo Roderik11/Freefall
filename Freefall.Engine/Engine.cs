@@ -15,8 +15,6 @@ namespace Freefall
 {
     public static class Engine
     {
-        private static Window _window;
-        private static IntPtr _inputHandle;
         private static bool _isRunning;
 
         public static AssetManager Assets { get; private set; }
@@ -63,14 +61,17 @@ namespace Freefall
             Settings = new EngineSettings();
         }
 
-        public static void Initialize(string title, int width, int height)
+        /// <summary>
+        /// Initialize core engine systems (Device, Assets, Audio, Physics).
+        /// The caller is responsible for creating the Window, RenderView, and Input.
+        /// </summary>
+        public static void Initialize()
         {
             // Set high-resolution timer for smooth high-FPS gameplay
             Kernel32.timeBeginPeriod(1);
             
             RootDirectory = Directory.GetCurrentDirectory(); 
 
-            _window = new Window(title, width, height);
             Device = new GraphicsDevice();
             
             // Initialize persistent transform buffer for GPU-driven rendering
@@ -84,14 +85,6 @@ namespace Freefall
 
             // Engine-internal default textures & materials
             Freefall.Assets.InternalAssets.Initialize(Device);
-
-            // Initialize Rendering Foundation — view auto-registers in RenderView.All
-            var view = new RenderView(_window, Device);
-            view.Pipeline = new DeferredRenderer();
-            view.Pipeline.Initialize(_window.Width, _window.Height);
-            
-            Input.Init(_window.Handle);
-            _inputHandle = _window.Handle;
             
             // Initialize Audio
             AudioDevice = XAudio2.XAudio2Create(ProcessorSpecifier.DefaultProcessor, true);
@@ -125,7 +118,6 @@ namespace Freefall
             view.Pipeline.Initialize(width, height);
             
             Input.Init(handle);
-            _inputHandle = handle;
             
             AudioDevice = XAudio2.XAudio2Create(ProcessorSpecifier.DefaultProcessor, true);
             _masteringVoice = AudioDevice.CreateMasteringVoice();
@@ -135,31 +127,14 @@ namespace Freefall
             PhysicsWorld.Initialize();
         }
 
+        /// <summary>
+        /// Mark the engine as running and initialize timing.
+        /// The caller owns the message loop (Apex pattern).
+        /// </summary>
         public static void Run()
         {
             _isRunning = true;
             Time.Initialize();
-            
-            float titleUpdateTimer = 0;
-            string baseTitle = _window.Title;
-            while (_isRunning && _window.ProcessEvents())
-            {
-                Tick();
-
-                // Update performance metrics in title bar every 0.1s for responsiveness
-                titleUpdateTimer += (float)Time.Delta;
-                if (titleUpdateTimer >= 0.1f)
-                {
-                    string vsyncStatus = Settings.VSync ? "ON" : "OFF";
-                    string hizStatus = Settings.DisableHiZ ? "OFF" : "ON";
-                    int occluded = CommandBuffer.Culler?.LastHiZOccludedCount ?? 0;
-                    string computeInfo = Components.GPUTerrain.ComputeReady ? "Compute: OK" : $"ComputeERR: {Components.GPUTerrain.ComputeError}";
-                    _window.SetTitle($"{baseTitle} | FPS: {Time.FPS:0} | Draw: {CommandBuffer.LastDrawCallCount} | Batches: {CommandBuffer.LastBatchCount} | HiZ: {hizStatus} Occl: {occluded} | {computeInfo}");
-                    titleUpdateTimer = 0;
-                }
-            }
-            
-            Shutdown();
         }
 
         public static void Tick()
@@ -167,7 +142,7 @@ namespace Freefall
             TickCount++;
 
             Time.Update();
-            Input.Update(_inputHandle);
+            Input.Update();
 
             // Release GPU buffers from previous batch resizes (deferred N frames for safety)
             Graphics.InstanceBatch.FlushDeferredDisposals();
@@ -325,7 +300,6 @@ namespace Freefall
             _masteringVoice?.Dispose();
             AudioDevice?.Dispose();
             Device?.Dispose();
-            _window?.Dispose();
         }
     }
 

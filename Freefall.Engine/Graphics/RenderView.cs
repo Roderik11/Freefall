@@ -90,16 +90,7 @@ namespace Freefall.Graphics
         private int _pendingHeight;
 
         /// <summary>
-        /// Create a RenderView from an engine Window.
-        /// </summary>
-        public RenderView(Window window, GraphicsDevice graphicsDevice)
-            : this(window.Handle, window.Width, window.Height, graphicsDevice)
-        {
-            window.OnResize += (w, h) => Resize(w, h); // Deferred — processed in Prepare()
-        }
-
-        /// <summary>
-        /// Create a RenderView from an external HWND (e.g. WinForms).
+        /// Create a RenderView from an external HWND (e.g. WinForms RenderForm).
         /// Call Resize() manually when the host window changes size.
         /// </summary>
         public RenderView(IntPtr handle, int width, int height, GraphicsDevice graphicsDevice)

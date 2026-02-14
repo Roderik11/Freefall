@@ -24,6 +24,9 @@ Freefall.Engine/Resources/Terrain/
 # Game project (excluded for now)
 Freefall.Game/
 
+# Editor project
+Freefall.Editor/
+
 # Antigravity agent
 .agent/
 
