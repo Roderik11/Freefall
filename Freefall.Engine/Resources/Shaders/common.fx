@@ -86,11 +86,11 @@ float GetShadowFactor(in Texture2DArray tex, in SamplerComparisonState cmpSample
 	
     // Slope-scaled bias: surfaces at grazing angles need more bias
     float cosTheta = saturate(dot(normal, -lightDir));
-    float slopeBias = 0.05f * sqrt(1.0f - cosTheta * cosTheta) / max(cosTheta, 0.05f);
+    float slopeBias = 0.01f * sqrt(1.0f - cosTheta * cosTheta) / max(cosTheta, 0.05f);
 	
     // World-space bias scaled by zScale (projection._33) to get NDC bias
-    float bias = (0.05f + slopeBias) * zScale;
-    bias = min(bias, 0.01f);
+    float bias = (0.005f + slopeBias) * zScale;
+    bias = min(bias, 0.002f);
     
     float biasedDepth = depth - bias;
     

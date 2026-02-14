@@ -285,8 +285,8 @@ namespace Freefall.Graphics
                         StencilEnable = false
                     };
                     var shadowRaster = new RasterizerDescription(CullMode.None, FillMode.Solid);
-                    shadowRaster.DepthBias = 4000;
-                    shadowRaster.SlopeScaledDepthBias = 2.0f;
+                    shadowRaster.DepthBias = 1000;
+                    shadowRaster.SlopeScaledDepthBias = 1.0f;
                     shadowRaster.DepthBiasClamp = 0.0f;
                     psoDesc.RasterizerState = shadowRaster;
                 }
