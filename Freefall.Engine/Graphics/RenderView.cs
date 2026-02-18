@@ -62,6 +62,10 @@ namespace Freefall.Graphics
         /// </summary>
         public Action<RenderView> OnRender;
 
+        public Action<RenderView> OnAfterRender;
+
+        public event Action OnResized;
+
         /// <summary>
         /// All registered RenderViews. Engine.Tick iterates this list (Apex pattern).
         /// </summary>
@@ -219,7 +223,6 @@ namespace Freefall.Graphics
             CreateDepthStencil();
         }
 
-        public event Action OnResized;
 
         /// <summary>
         /// Handle resize from either internal Window.OnResize or external call.
@@ -375,6 +378,7 @@ namespace Freefall.Graphics
         public void Render(Camera camera)
         {
              Pipeline?.Render(camera, CommandList.Native);
+             OnAfterRender?.Invoke(this);
         }
 
         public void Present()

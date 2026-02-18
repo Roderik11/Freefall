@@ -101,7 +101,16 @@ namespace Freefall.Components
 
                 case ShapeType.StaticMesh:
                 {
-                    // Resolve mesh from StaticMesh asset
+                    // Fast path: use pre-cooked physics mesh from background loading
+                    if (StaticMesh?.CookedTriMesh != null)
+                    {
+                        return new TriangleMeshGeometry(StaticMesh.CookedTriMesh)
+                        {
+                            Scale = new MeshScale(scale, Quaternion.Identity)
+                        };
+                    }
+
+                    // Slow fallback: cook on demand (shouldn't happen during streaming)
                     var sm = StaticMesh?.Mesh ?? Mesh;
                     if (sm == null || sm.Positions == null || sm.CpuIndices == null)
                     {

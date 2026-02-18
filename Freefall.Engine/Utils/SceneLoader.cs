@@ -7,7 +7,6 @@ using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using Freefall.Assets;
-using static Freefall.Assets.InternalAssets;
 using Freefall.Base;
 using Freefall.Components;
 using Freefall.Graphics;
@@ -21,6 +20,7 @@ namespace Freefall.Loaders
         private Dictionary<string, string> meshLookup = new Dictionary<string, string>();
         private string assetsDirectory;
 
+        #region JSON Schema
 
         public class SceneExport
         {
@@ -66,6 +66,8 @@ namespace Freefall.Loaders
             public bool Collision { get; set; }
         }
 
+        #endregion
+
         public SceneLoader(string assetsDir)
         {
             assetsDirectory = assetsDir;
@@ -83,462 +85,234 @@ namespace Freefall.Loaders
             Debug.Log($"[SceneLoader] Found {meshLookup.Count} unique meshes in {assetsDirectory}");
         }
 
+        /// <summary>
+        /// Synchronous load — used by editor and small scenes.
+        /// </summary>
         public void Load(string path, int maxcount = int.MaxValue)
         {
             Thread.CurrentThread.CurrentCulture = System.Globalization.CultureInfo.InvariantCulture;
 
-            var text = File.ReadAllText(path);
-            var scene = JsonSerializer.Deserialize<SceneExport>(text, new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+            var scene = ParseJson(File.ReadAllText(path));
             if (scene == null) return;
 
-            // Load Objects
             int count = 0;
-            foreach (var obj in scene.Objects)
+            foreach (var obj in scene.Objects.Concat(scene.Trees))
             {
-                if (!staticMeshLookup.TryGetValue(obj.PrefabName, out var staticMesh))
-                {
-                    if (!meshLookup.TryGetValue(obj.PrefabName.ToLowerInvariant(), out var relativePath))
-                        continue;
+                var staticMesh = ResolveStaticMesh(obj.PrefabName);
+                if (staticMesh == null) continue;
 
-                    var fullPath = Path.Combine(assetsDirectory, relativePath.TrimStart('\\'));
-                    var mesh = Engine.Assets.Load<Mesh>(fullPath);
-                    staticMesh = CreateStaticMesh(mesh, fullPath);
-                    staticMeshLookup.Add(obj.PrefabName, staticMesh);
-                }
-
-                var entity = new Entity(obj.PrefabName);
-                var pos = StringToVector3(obj.Position);
-                var rot = StringToQuaternion(obj.Rotation) * Quaternion.CreateFromAxisAngle(Vector3.UnitY, (float)Math.PI);
-                var scale = StringToVector3(obj.Scale);
-                
-                entity.Transform.Position = pos;
-                entity.Transform.Rotation = rot;
-                entity.Transform.Scale = scale;
-
-                var renderer = entity.AddComponent<StaticMeshRenderer>();
-                renderer.StaticMesh = staticMesh;
-
-                if (obj.Collision)
-                {
-                    var body = entity.AddComponent<RigidBody>();
-                    body.StaticMesh = staticMesh;
-                    body.Type = ShapeType.StaticMesh;
-                    body.IsStatic = true;
-                }
-
-                count++;
-                if (count >= maxcount)
-                    break;
+                SpawnEntity(obj, staticMesh);
+                if (++count >= maxcount) break;
             }
 
-            // Load Lights
-            foreach (var light in scene.Lights)
-            {
-                if (string.Equals(light.Type, "Point", StringComparison.OrdinalIgnoreCase))
-                {
-                    var entity = new Entity("PointLight");
-                    entity.Transform.Position = StringToVector3(light.Position);
+            SpawnLights(scene.Lights);
+            SpawnAudio(scene.AudioSources);
+        }
 
-                    var pointLight = entity.AddComponent<PointLight>();
-                    pointLight.Color = StringToColor3(light.Color);
-                    pointLight.Intensity = light.Intensity;
-                    pointLight.Range = light.Range;
+        /// <summary>
+        /// Async load — loads all unique meshes in parallel via Assets.LoadAsync&lt;StaticMesh&gt;,
+        /// then spawns entities on the main thread in batches.
+        /// </summary>
+        public async Task LoadAsync(string path, IProgress<string> progress = null, CancellationToken cancellationToken = default)
+        {
+            progress?.Report($"Reading {Path.GetFileName(path)}...");
+            string text = await File.ReadAllTextAsync(path, cancellationToken).ConfigureAwait(false);
+
+            var scene = ParseJson(text);
+            if (scene == null) return;
+
+            // Merge Objects + Trees into a single list
+            var allItems = scene.Objects.Concat(scene.Trees)
+                .Where(o => meshLookup.ContainsKey(o.PrefabName.ToLowerInvariant()))
+                .ToList();
+
+            // Group by mesh path → only load each mesh once
+            var groups = allItems
+                .GroupBy(o => meshLookup[o.PrefabName.ToLowerInvariant()])
+                .ToList();
+
+            int totalMeshes = groups.Count;
+            int loaded = 0;
+
+            TextureLibrary.Initialize();
+
+            // ── Stream: load mesh → immediately spawn its instances in small batches ──
+            progress?.Report($"Loading {totalMeshes} unique meshes...");
+
+            int totalSpawned = 0;
+            int totalInstances = allItems.Count;
+            const int spawnBatchSize = 256;
+            var throttle = new SemaphoreSlim(2); // limit concurrent GPU resource creation
+
+            var loadTasks = groups.Select(async group =>
+            {
+                await throttle.WaitAsync(cancellationToken);
+                StaticMesh staticMesh;
+                try
+                {
+                    var fullPath = Path.Combine(assetsDirectory, group.Key.TrimStart('\\'));
+                    staticMesh = await Engine.Assets.LoadAsync<StaticMesh>(fullPath);
                 }
+                finally
+                {
+                    throttle.Release();
+                }
+
+                // Register for lookup
+                foreach (var obj in group)
+                {
+                    lock (staticMeshLookup)
+                        staticMeshLookup[obj.PrefabName] = staticMesh;
+                }
+
+                int current = Interlocked.Increment(ref loaded);
+                progress?.Report($"Loaded [{current}/{totalMeshes}] — spawning instances...");
+
+                // Immediately spawn this mesh's instances in small batches
+                var instances = group.ToList();
+                for (int i = 0; i < instances.Count; i += spawnBatchSize)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    int end = Math.Min(i + spawnBatchSize, instances.Count);
+                    var batch = instances.GetRange(i, end - i);
+                    var sm = staticMesh; // capture for closure
+
+                    await Engine.RunOnMainThreadAsync(() =>
+                    {
+                        foreach (var obj in batch)
+                            SpawnEntity(obj, sm);
+                    });
+
+                    int spawned = Interlocked.Add(ref totalSpawned, batch.Count);
+                    if (spawned % 100 < spawnBatchSize)
+                        progress?.Report($"Spawned {spawned}/{totalInstances} entities...");
+                }
+            }).ToList();
+
+            await Task.WhenAll(loadTasks);
+
+            // ── Lights (lightweight) ──
+            if (scene.Lights.Count > 0)
+            {
+                await Engine.RunOnMainThreadAsync(() => SpawnLights(scene.Lights));
             }
 
-            // Load Audio Sources
-            foreach (var audio in scene.AudioSources)
+            // ── Audio: pre-load clips on background thread, then spawn ──
+            if (scene.AudioSources.Count > 0)
+            {
+                // Pre-load all audio clips off the main thread
+                var audioClips = new Dictionary<string, AudioClip>();
+                await Task.Run(() =>
+                {
+                    foreach (var audio in scene.AudioSources)
+                    {
+                        if (string.IsNullOrEmpty(audio.ClipName) || audioClips.ContainsKey(audio.ClipName)) continue;
+                        var clipPath = Path.Combine(assetsDirectory, "Sounds", audio.ClipName + ".wav");
+                        if (!File.Exists(clipPath)) continue;
+                        audioClips[audio.ClipName] = Engine.Assets.Load<AudioClip>(clipPath);
+                    }
+                });
+
+                // Spawn audio entities with pre-loaded clips
+                await Engine.RunOnMainThreadAsync(() => SpawnAudio(scene.AudioSources, audioClips));
+            }
+
+            progress?.Report($"Done — {totalInstances} entities, {scene.Lights.Count} lights, {scene.AudioSources.Count} audio sources.");
+        }
+
+        #region Helpers
+
+        private SceneExport ParseJson(string text)
+        {
+            return JsonSerializer.Deserialize<SceneExport>(text, new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+        }
+
+        /// <summary>
+        /// Resolves prefab name → StaticMesh. Loads via AssetManager if not cached.
+        /// </summary>
+        private StaticMesh ResolveStaticMesh(string prefabName)
+        {
+            if (staticMeshLookup.TryGetValue(prefabName, out var cached))
+                return cached;
+
+            if (!meshLookup.TryGetValue(prefabName.ToLowerInvariant(), out var relativePath))
+                return null;
+
+            var fullPath = Path.Combine(assetsDirectory, relativePath.TrimStart('\\'));
+            var staticMesh = Engine.Assets.Load<StaticMesh>(fullPath);
+            staticMeshLookup[prefabName] = staticMesh;
+            return staticMesh;
+        }
+
+        private static void SpawnEntity(SceneObject obj, StaticMesh staticMesh)
+        {
+            var entity = new Entity(obj.PrefabName);
+            entity.Transform.Position = StringToVector3(obj.Position);
+            entity.Transform.Rotation = StringToQuaternion(obj.Rotation) * Quaternion.CreateFromAxisAngle(Vector3.UnitY, (float)Math.PI);
+            entity.Transform.Scale = StringToVector3(obj.Scale);
+
+            var renderer = entity.AddComponent<StaticMeshRenderer>();
+            renderer.StaticMesh = staticMesh;
+
+            if (obj.Collision)
+            {
+                var body = entity.AddComponent<RigidBody>();
+                body.StaticMesh = staticMesh;
+                body.Type = ShapeType.StaticMesh;
+                body.IsStatic = true;
+            }
+        }
+
+        private void SpawnLights(List<SceneLight> lights)
+        {
+            foreach (var light in lights)
+            {
+                if (!string.Equals(light.Type, "Point", StringComparison.OrdinalIgnoreCase)) continue;
+
+                var entity = new Entity("PointLight");
+                entity.Transform.Position = StringToVector3(light.Position);
+
+                var pointLight = entity.AddComponent<PointLight>();
+                pointLight.Color = StringToColor3(light.Color);
+                pointLight.Intensity = light.Intensity;
+                pointLight.Range = light.Range;
+            }
+        }
+
+        private void SpawnAudio(List<SceneAudioSource> audioSources, Dictionary<string, AudioClip> preloadedClips = null)
+        {
+            foreach (var audio in audioSources)
             {
                 if (string.IsNullOrEmpty(audio.ClipName)) continue;
 
-                var clipPath = Path.Combine(assetsDirectory, "Sounds", audio.ClipName + ".wav");
-                if (!File.Exists(clipPath))
+                AudioClip clip;
+                if (preloadedClips != null && preloadedClips.TryGetValue(audio.ClipName, out clip))
                 {
-                    Debug.Log($"[SceneLoader] Audio clip not found: {clipPath}");
-                    continue;
+                    // Use pre-loaded clip (async path)
+                }
+                else
+                {
+                    // Fallback: load synchronously (sync Load path)
+                    var clipPath = Path.Combine(assetsDirectory, "Sounds", audio.ClipName + ".wav");
+                    if (!File.Exists(clipPath))
+                    {
+                        Debug.Log($"[SceneLoader] Audio clip not found: {clipPath}");
+                        continue;
+                    }
+                    clip = Engine.Assets.Load<AudioClip>(clipPath);
                 }
 
                 var entity = new Entity(audio.Name);
                 entity.Transform.Position = StringToVector3(audio.Position);
 
                 var src = entity.AddComponent<AudioSource>();
-                src.AudioClip = Engine.Assets.Load<AudioClip>(clipPath);
+                src.AudioClip = clip;
                 src.Volume = audio.Volume;
                 src.Range = audio.MaxDistance;
                 src.MinDistance = audio.MinDistance;
                 src.Loop = audio.Loop;
                 src.PlayOnAwake = audio.PlayOnAwake;
-
-                Debug.Log($"[SceneLoader] Audio: {audio.Name} clip={audio.ClipName} pos={audio.Position} range={audio.MaxDistance}");
             }
-
-            // Load Trees
-            count = 0;
-            foreach (var data in scene.Trees)
-            {
-                if (!staticMeshLookup.TryGetValue(data.PrefabName, out var staticMesh))
-                {
-                    if (!meshLookup.TryGetValue(data.PrefabName.ToLowerInvariant(), out var relativePath))
-                        continue;
-
-                    var fullPath = Path.Combine(assetsDirectory, relativePath.TrimStart('\\'));
-                    var mesh = Engine.Assets.Load<Mesh>(fullPath);
-                    staticMesh = CreateStaticMesh(mesh, fullPath, false);
-                    staticMeshLookup.Add(data.PrefabName, staticMesh);
-                }
-
-                var entity = new Entity(data.PrefabName);
-                entity.Transform.Position = StringToVector3(data.Position);
-                entity.Transform.Rotation = StringToQuaternion(data.Rotation) * Quaternion.CreateFromAxisAngle(Vector3.UnitY, (float)Math.PI);
-                entity.Transform.Scale = StringToVector3(data.Scale);
-
-                var renderer = entity.AddComponent<StaticMeshRenderer>();
-                renderer.StaticMesh = staticMesh;
-
-                count++;
-                if (count >= maxcount)
-                    break;
-            }
-        }
-
-        public async Task LoadAsync(string path, IProgress<string> progress = null, CancellationToken cancellationToken = default)
-        {
-            progress?.Report($"Reading {Path.GetFileName(path)}...");
-            cancellationToken.ThrowIfCancellationRequested();
-
-            string text = await File.ReadAllTextAsync(path, cancellationToken).ConfigureAwait(false);
-
-            progress?.Report("Parsing JSON...");
-            var scene = JsonSerializer.Deserialize<SceneExport>(text, new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
-            if (scene == null) return;
-
-            // Collect all items with their mesh paths
-            var allItems = new List<(SceneObject obj, bool isTree)>();
-            foreach (var obj in scene.Objects)
-            {
-                if (!meshLookup.TryGetValue(obj.PrefabName.ToLowerInvariant(), out _)) continue;
-                allItems.Add((obj, false));
-            }
-            foreach (var data in scene.Trees)
-            {
-                if (!meshLookup.TryGetValue(data.PrefabName.ToLowerInvariant(), out _)) continue;
-                allItems.Add((data, true));
-            }
-
-            // Group objects by their mesh path for batch loading
-            var objectsByMesh = new Dictionary<string, List<(SceneObject obj, bool isTree)>>();
-            foreach (var (obj, isTree) in allItems)
-            {
-                var relativePath = meshLookup[obj.PrefabName.ToLowerInvariant()];
-                var fullPath = Path.Combine(assetsDirectory, relativePath.TrimStart('\\'));
-                if (!objectsByMesh.TryGetValue(fullPath, out var list))
-                {
-                    list = new List<(SceneObject, bool)>();
-                    objectsByMesh[fullPath] = list;
-                }
-                list.Add((obj, isTree));
-            }
-
-            int totalMeshes = objectsByMesh.Count;
-            int meshesParsed = 0;
-            int created = 0;
-
-            TextureLibrary.Initialize();
-            var wicLock = new object();
-
-            // ═══════════════════════════════════════════════════════════════════
-            // PHASE 1: CPU-only parsing on background threads
-            // ═══════════════════════════════════════════════════════════════════
-
-            var parsedEntries = new System.Collections.Concurrent.ConcurrentBag<(
-                string meshPath,
-                string meshName,
-                MeshData meshData,
-                Assets.CpuTextureData? albedo,
-                Assets.CpuTextureData? normal,
-                Assets.CpuTextureData? spec,
-                Assets.CpuTextureData? aoc,
-                List<(SceneObject obj, bool isTree)> instances
-            )>();
-
-            await Task.Run(() =>
-            {
-                var parallelOptions = new ParallelOptions
-                {
-                    MaxDegreeOfParallelism = Environment.ProcessorCount / 2,
-                    CancellationToken = cancellationToken
-                };
-
-                Parallel.ForEach(objectsByMesh, parallelOptions, (entry) =>
-                {
-                    var (fullPath, objects) = entry;
-                    Thread.CurrentThread.CurrentCulture = System.Globalization.CultureInfo.InvariantCulture;
-
-                    int currentMesh = Interlocked.Increment(ref meshesParsed);
-                    if (currentMesh % 10 == 0)
-                        progress?.Report($"[Phase 1] Parsing [{currentMesh}/{totalMeshes}]...");
-
-                    try
-                    {
-                        // Parse FBX → MeshData
-                        var importer = new Assets.Importers.MeshImporter();
-                        var meshData = importer.ParseRaw(fullPath);
-                        var meshName = Path.GetFileNameWithoutExtension(fullPath);
-
-                        // Parse textures
-                        Assets.CpuTextureData albedo = null;
-                        Assets.CpuTextureData normal = null;
-                        Assets.CpuTextureData spec = null;
-                        Assets.CpuTextureData aoc = null;
-
-                        var texturePath = Path.GetDirectoryName(fullPath) + @"\Textures\";
-                        if (Directory.Exists(texturePath))
-                        {
-                            foreach (var file in Directory.EnumerateFiles(texturePath))
-                            {
-                                if (file.EndsWith(".psd", StringComparison.OrdinalIgnoreCase)) continue;
-                                var name = Path.GetFileNameWithoutExtension(file);
-                                try
-                                {
-                                    var loadPath = TextureLibrary.ResolvePackedDDS(file) ?? file;
-                                    bool isDDS = loadPath.EndsWith(".dds", StringComparison.OrdinalIgnoreCase);
-
-                                    if (name.EndsWith("_Dif") || name.EndsWith("_diffuse") || name.EndsWith("_Diffuse"))
-                                    {
-                                        if (isDDS) albedo = Texture.ParseFromFile(Engine.Device, loadPath);
-                                        else lock (wicLock) { albedo = Texture.ParseFromFile(Engine.Device, loadPath); }
-                                    }
-                                    else if (name.EndsWith("_Nor") || name.EndsWith("_normal") || name.EndsWith("_Normal"))
-                                    {
-                                        if (isDDS) normal = Texture.ParseFromFile(Engine.Device, loadPath);
-                                        else lock (wicLock) { normal = Texture.ParseFromFile(Engine.Device, loadPath); }
-                                    }
-                                    else if (name.EndsWith("_Spec"))
-                                    {
-                                        if (isDDS) spec = Texture.ParseFromFile(Engine.Device, loadPath);
-                                        else lock (wicLock) { spec = Texture.ParseFromFile(Engine.Device, loadPath); }
-                                    }
-                                    else if (name.EndsWith("_Aoc"))
-                                    {
-                                        if (isDDS) aoc = Texture.ParseFromFile(Engine.Device, loadPath);
-                                        else lock (wicLock) { aoc = Texture.ParseFromFile(Engine.Device, loadPath); }
-                                    }
-                                }
-                                catch (Exception) { /* log */ }
-                            }
-                        }
-
-                        parsedEntries.Add((fullPath, meshName, meshData, albedo, normal, spec, aoc, objects));
-                    }
-                    catch (Exception ex)
-                    {
-                        Debug.Log($"[SceneLoader] Failed to parse {Path.GetFileNameWithoutExtension(fullPath)}: {ex.Message}");
-                    }
-                });
-            }, cancellationToken);
-
-            progress?.Report($"[Phase 1] Done. Streaming to GPU...");
-
-            // ═══════════════════════════════════════════════════════════════════
-            // PHASE 2: GPU Asset Creation (Main Thread - Non-Blocking)
-            // ═══════════════════════════════════════════════════════════════════
-
-            int uploaded = 0;
-            var createdTasks = new List<Task>();
-
-            foreach (var entry in parsedEntries)
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-                // Dispatch to main thread to Create Commited Resources + Entities
-                // Since we use CreateAsync, this will be very fast
-                var task = Engine.RunOnMainThreadAsync(() =>
-                {
-                    var (meshPath, meshName, meshData, albedoCpu, normalCpu, specCpu, aocCpu, instances) = entry;
-
-                    // 1. Create Mesh (Buffers created, upload queued)
-                    var mesh = Mesh.CreateAsync(Engine.Device, meshData);
-                    mesh.Name = meshName;
-                    mesh.RegisterMeshParts();
-
-                    // 2. Create Textures (Resources created, upload queued)
-                    Texture albedoTex = albedoCpu != null ? Texture.CreateAsync(Engine.Device, albedoCpu) : null;
-                    Texture normalTex = normalCpu != null ? Texture.CreateAsync(Engine.Device, normalCpu) : null;
-                    Texture specTex   = specCpu   != null ? Texture.CreateAsync(Engine.Device, specCpu)   : null;
-                    Texture aocTex    = aocCpu    != null ? Texture.CreateAsync(Engine.Device, aocCpu)    : null;
-
-                    // 3. Build Material
-                    Material material;
-                    if (albedoTex != null || normalTex != null || specTex != null || aocTex != null)
-                    {
-                        material = new Material(DefaultEffect);
-                        material.SetTexture("AlbedoTex", albedoTex ?? White);
-                        material.SetTexture("NormalTex", normalTex ?? FlatNormal);
-                        // _Spec → Roughness slot (shader inverts: roughness = 1 - spec)
-                        if (specTex != null) material.SetTexture("Roughness", specTex);
-                        if (aocTex  != null) material.SetTexture("AO", aocTex);
-                    }
-                    else
-                    {
-                        material = DefaultMaterial;
-                    }
-
-                    // 4. Create Entities
-                    foreach (var (obj, isTree) in instances)
-                    {
-                        var key = obj.PrefabName;
-
-                        if (!staticMeshLookup.TryGetValue(key, out var staticMesh))
-                        {
-                            staticMesh = new StaticMesh { Name = meshName, Mesh = mesh, LODGroup = LODGroups.LargeProps };
-                            // Classify mesh parts into base or LOD levels
-                            // _LOD_0 / _LOD_00 = base mesh (highest quality)
-                            // _LOD_01+ = lower quality LOD levels
-                            for (int p = 0; p < mesh.MeshParts.Count; p++)
-                            {
-                                var part = mesh.MeshParts[p];
-                                int index = part.Name.IndexOf("_LOD_");
-                                if (index < 0)
-                                {
-                                    staticMesh.MeshParts.Add(new MeshElement { Mesh = mesh, Material = material, MeshPartIndex = p });
-                                }
-                                else
-                                {
-                                    int endIndex = index + 6 < part.Name.Length ? 2 : 1;
-                                    int lvl = Convert.ToInt32(part.Name.Substring(index + 5, endIndex)) - 1;
-                                    if (lvl < 0)
-                                    {
-                                        // _LOD_0 / _LOD_00 → treat as base mesh part
-                                        staticMesh.MeshParts.Add(new MeshElement { Mesh = mesh, Material = material, MeshPartIndex = p });
-                                    }
-                                    else
-                                    {
-                                        while (staticMesh.LODs.Count < lvl + 1)
-                                            staticMesh.LODs.Add(new StaticMeshLOD { Mesh = mesh });
-                                        staticMesh.LODs[lvl].MeshParts.Add(new MeshElement { Mesh = mesh, Material = material, MeshPartIndex = p });
-                                    }
-                                }
-                            }
-
-
-                            staticMeshLookup[key] = staticMesh;
-                        }
-
-                        var entity = new Entity(key);
-                        entity.Transform.Position = StringToVector3(obj.Position);
-                        entity.Transform.Rotation = StringToQuaternion(obj.Rotation) * Quaternion.CreateFromAxisAngle(Vector3.UnitY, (float)Math.PI);
-                        entity.Transform.Scale = StringToVector3(obj.Scale);
-
-                        var renderer = entity.AddComponent<StaticMeshRenderer>();
-                        renderer.StaticMesh = staticMesh;
-
-                        if (obj.Collision)
-                        {
-                            var body = entity.AddComponent<RigidBody>();
-                            body.StaticMesh = staticMesh;
-                            body.Type = ShapeType.StaticMesh;
-                            body.IsStatic = true;
-                        }
-                        
-                        created++;
-                    }
-                    
-                    int cur = Interlocked.Increment(ref uploaded);
-                    if (cur % 50 == 0) 
-                        progress?.Report($"[Phase 2] Created {cur}/{parsedEntries.Count} mesh assets...");
-                });
-                createdTasks.Add(task);
-            }
-
-            await Task.WhenAll(createdTasks);
-
-            // Load Lights (lightweight — no mesh/texture loading needed)
-            int lightCount = 0;
-            foreach (var light in scene.Lights)
-            {
-                if (string.Equals(light.Type, "Point", StringComparison.OrdinalIgnoreCase))
-                {
-                    await Engine.RunOnMainThreadAsync(() =>
-                    {
-                        var entity = new Entity("PointLight");
-                        entity.Transform.Position = StringToVector3(light.Position);
-
-                        var pointLight = entity.AddComponent<PointLight>();
-                        pointLight.Color = StringToColor3(light.Color);
-                        pointLight.Intensity = light.Intensity;
-                        pointLight.Range = light.Range;
-                    });
-                    lightCount++;
-                }
-            }
-
-            // Load Audio Sources
-            int audioCount = 0;
-            foreach (var audio in scene.AudioSources)
-            {
-                if (string.IsNullOrEmpty(audio.ClipName)) continue;
-
-                var clipPath = Path.Combine(assetsDirectory, "Sounds", audio.ClipName + ".wav");
-                if (!File.Exists(clipPath))
-                {
-                    Debug.Log($"[SceneLoader] Audio clip not found: {clipPath}");
-                    continue;
-                }
-
-                await Engine.RunOnMainThreadAsync(() =>
-                {
-                    var entity = new Entity(audio.Name);
-                    entity.Transform.Position = StringToVector3(audio.Position);
-
-                    var src = entity.AddComponent<AudioSource>();
-                    src.AudioClip = Engine.Assets.Load<AudioClip>(clipPath);
-                    src.Volume = audio.Volume;
-                    src.Range = audio.MaxDistance;
-                    src.MinDistance = audio.MinDistance;
-                    src.Loop = audio.Loop;
-                    src.PlayOnAwake = audio.PlayOnAwake;
-
-                    Debug.Log($"[SceneLoader] Audio: {audio.Name} clip={audio.ClipName} range={audio.MaxDistance}");
-                });
-                audioCount++;
-            }
-
-            progress?.Report($"Done — {created} entities, {lightCount} lights, {audioCount} audio sources in scene.");
-        }
-
-        private StaticMesh CreateStaticMesh(Mesh mesh, string meshPath, bool tree = false)
-        {
-            var staticMesh = new StaticMesh { Name = mesh.Name, Mesh = mesh, LODGroup = LODGroups.LargeProps };
-            var material = DefaultMaterial;
-
-            // Classify mesh parts into base or LOD levels
-            // _LOD_0 / _LOD_00 = base mesh (highest quality)
-            // _LOD_01+ = lower quality LOD levels
-            for (int i = 0; i < mesh.MeshParts.Count; i++)
-            {
-                var part = mesh.MeshParts[i];
-                var name = part.Name;
-                int index = name.IndexOf("_LOD_");
-                if (index < 0)
-                {
-                    staticMesh.MeshParts.Add(new MeshElement { Mesh = mesh, Material = material, MeshPartIndex = i });
-                }
-                else
-                {
-                    int endIndex = index + 6 < name.Length ? 2 : 1;
-                    int lvl = Convert.ToInt32(name.Substring(index + 5, endIndex)) - 1;
-                    if (lvl < 0)
-                    {
-                        // _LOD_0 / _LOD_00 → treat as base mesh part
-                        staticMesh.MeshParts.Add(new MeshElement { Mesh = mesh, Material = material, MeshPartIndex = i });
-                    }
-                    else
-                    {
-                        while (staticMesh.LODs.Count < lvl + 1) staticMesh.LODs.Add(new StaticMeshLOD { Mesh = mesh });
-                        staticMesh.LODs[lvl].MeshParts.Add(new MeshElement { Mesh = mesh, Material = material, MeshPartIndex = i });
-                    }
-                }
-            }
-            return staticMesh;
         }
 
         private static Vector3 StringToVector3(string str)
@@ -571,5 +345,7 @@ namespace Freefall.Loaders
                 float.Parse(parts[3], System.Globalization.CultureInfo.InvariantCulture)
             );
         }
+
+        #endregion
     }
 }

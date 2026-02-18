@@ -19,7 +19,7 @@ namespace Freefall.Components
         // Procedural sky parameters
         public float TimeOfDay = 16f;         // 0-24 hours
         public float CloudCoverage = 0.5f;      // 0-1
-        public float CloudSpeed = 2.0f;         // Speed multiplier
+        public float CloudSpeed = 1.0f;         // Speed multiplier
         public float SunIntensity = 1.2f;       // Sun brightness multiplier
         public Vector3 SunDirection = new Vector3(0, 1, 0);
 

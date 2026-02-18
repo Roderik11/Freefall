@@ -35,8 +35,8 @@ namespace Freefall.Graphics
         {
             _instance = this;
             _device = device;
-            _uploadHeap = new UploadHeap(device, heapSize);
             _fence = device.NativeDevice.CreateFence(0, FenceFlags.None);
+            _uploadHeap = new UploadHeap(device, heapSize, _fence);
 
             _uploadThread = new Thread(UploadLoop)
             {
@@ -173,7 +173,7 @@ namespace Freefall.Graphics
                      {
                          uploadAction(cmdList, _uploadHeap);
                          processed++;
-                         if (processed > 20) break;
+                         if (processed > 64) break;
                      }
                      catch (Exception ex)
                      {
@@ -184,9 +184,18 @@ namespace Freefall.Graphics
                 if (processed > 0)
                 {
                     cmdList.Close();
-                    _device.CopyQueue.ExecuteCommandList(cmdList);
+                    
+                    // Submit through the device so _copyFence is signaled — 
+                    // this is what WaitForCopyQueue checks before rendering.
+                    // Without this, the render queue starts drawing before vertex data is copied.
+                    _device.CopyQueueSubmit(cmdList);
+                    
+                    // Also signal our private fence for UploadHeap ring buffer reclamation
                     long fenceValue = Interlocked.Increment(ref _nextFenceValue);
                     _device.CopyQueue.Signal(_fence, (ulong)fenceValue);
+                    
+                    // Record this batch's fence so the UploadHeap can reclaim space
+                    _uploadHeap.OnBatchSubmitted(fenceValue);
                     
                     foreach (var asset in _currentBatchAssets)
                     {

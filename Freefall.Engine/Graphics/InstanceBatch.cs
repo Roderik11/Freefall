@@ -163,7 +163,7 @@ namespace Freefall.Graphics
         {
             Key = key;
             Material = material;
-            ResizeBuffers(128);
+            ResizeBuffers(8192);
         }
 
         public void Clear()

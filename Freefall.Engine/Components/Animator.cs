@@ -6,6 +6,7 @@ using Freefall.Base;
 namespace Freefall.Components
 {
     public delegate void BoneTransformHandler(Bone bone, ref Matrix4x4 matrix);
+    public delegate void PostHierarchyHandler(Bone[] skeleton, Matrix4x4[] bones);
 
     /// <summary>
     /// Controls animation playback for skinned meshes using an animation state machine.
@@ -18,6 +19,9 @@ namespace Freefall.Components
 
         /// <summary>Event fired when a bone transform is calculated (for custom modifications).</summary>
         public event BoneTransformHandler OnBoneTransform;
+
+        /// <summary>Event fired after hierarchy multiplication — bones are in model space.</summary>
+        public event PostHierarchyHandler OnPostHierarchy;
 
         /// <summary>Event fired when an animation event occurs (e.g., footstep, jump).</summary>
         public Action<string> OnAnimationEvent;
@@ -77,6 +81,9 @@ namespace Freefall.Components
                 if (skeleton[i].Parent > -1)
                     bones[i] = bones[i] * bones[skeleton[i].Parent];
             }
+
+            // Post-hierarchy callback — bones are now in model space
+            OnPostHierarchy?.Invoke(skeleton, bones);
 
             // apply bone offset matrix (match Apex exactly)
             for (int i = 0; i < count; i++)

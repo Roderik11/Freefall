@@ -1,134 +1,129 @@
 using System;
 using System.IO;
 using Freefall.Graphics;
+using static Freefall.Assets.InternalAssets;
 
 namespace Freefall.Assets.Importers
 {
     /// <summary>
-    /// Imports model files as StaticMesh with auto-created MeshElements.
-    /// Searches for textures in the same directory or textures subfolder.
+    /// Imports a mesh file (.fbx, .dae, .obj) into a fully configured StaticMesh:
+    /// GPU buffers, textures (by convention), material, LODs, and pre-cooked physics.
+    /// Thread-safe — designed to be called from background threads via Assets.LoadAsync.
     /// </summary>
-    [AssetReader(".fbx", ".dae")]
+    [AssetReader(".fbx", ".dae", ".obj")]
     public class StaticMeshImporter : AssetReader<StaticMesh>
     {
         public override StaticMesh Import(string filepath)
         {
-            var mesh = Engine.Assets.Load<Mesh>(filepath);
-            var staticMesh = new StaticMesh { Mesh = mesh, LODGroup = LODGroups.LargeProps };
-            
-            // Try to find diffuse texture
-            var dir = Path.GetDirectoryName(filepath);
-            var baseName = Path.GetFileNameWithoutExtension(filepath);
-            var parentDir = new DirectoryInfo(dir).Name; // e.g. "Paladin" or "Oak_Trees"
-            
-            // Common texture naming patterns - expanded to cover real naming conventions
-            var searchPatterns = new[]
-            {
-                // Based on mesh name
-                Path.Combine(dir, "textures", $"{baseName}_diffuse.png"),
-                Path.Combine(dir, "textures", $"{baseName}_Dif.png"),
-                Path.Combine(dir, "Textures", $"{baseName}_diffuse.png"),
-                Path.Combine(dir, "Textures", $"{baseName}_Dif.png"),
-                // Based on parent directory name (e.g. "Paladin" -> "Paladin_diffuse.png")
-                Path.Combine(dir, "textures", $"{parentDir}_diffuse.png"),
-                Path.Combine(dir, "textures", $"{parentDir}_Dif.png"),
-                Path.Combine(dir, "Textures", $"{parentDir}_diffuse.png"),
-                Path.Combine(dir, "Textures", $"{parentDir}_Dif.png"),
-                // Oak trees have "Oak_Dif.png" in Textures folder
-                Path.Combine(dir, "Textures", "Oak_Dif.png"),
-            };
+            var meshName = Path.GetFileNameWithoutExtension(filepath);
 
-            Texture diffuseTexture = null;
-            foreach (var pattern in searchPatterns)
+            // ── 1. CPU: Parse FBX → MeshData ──
+            var importer = new MeshImporter();
+            var meshData = importer.ParseRaw(filepath);
+
+            // ── 2. GPU: Create mesh buffers + SRVs (thread-safe) ──
+            var mesh = Mesh.CreateAsync(Engine.Device, meshData);
+            mesh.Name = meshName;
+            mesh.RegisterMeshParts();
+
+            // ── 3. Discover + load textures by convention ──
+            var material = DiscoverMaterial(filepath);
+
+            // ── 4. Build StaticMesh with LODs ──
+            var staticMesh = new StaticMesh { Name = meshName, Mesh = mesh, LODGroup = LODGroups.LargeProps };
+            BuildMeshParts(staticMesh, mesh, material);
+
+            // ── 5. Cook physics mesh ──
+            staticMesh.CookPhysicsMesh();
+
+            return staticMesh;
+        }
+
+        /// <summary>
+        /// Discovers textures in {mesh_dir}/Textures/ using suffix convention (_Dif, _Nor, _Spec, _Aoc)
+        /// and builds a Material. Returns DefaultMaterial if no textures found.
+        /// </summary>
+        private static Material DiscoverMaterial(string meshPath)
+        {
+            var texturePath = Path.GetDirectoryName(meshPath) + @"\Textures\";
+            if (!Directory.Exists(texturePath))
+                return DefaultMaterial;
+
+            CpuTextureData albedo = null, normal = null, spec = null, aoc = null;
+
+            foreach (var file in Directory.EnumerateFiles(texturePath))
             {
-                if (File.Exists(pattern))
+                if (file.EndsWith(".psd", StringComparison.OrdinalIgnoreCase)) continue;
+                var name = Path.GetFileNameWithoutExtension(file);
+
+                try
                 {
-                    diffuseTexture = Engine.Assets.Load<Texture>(pattern);
-                    Debug.Log("StaticMeshImporter", $"Found texture: {pattern}");
-                    break;
+                    var loadPath = TextureLibrary.ResolvePackedDDS(file) ?? file;
+
+                    if (name.EndsWith("_Dif") || name.EndsWith("_diffuse") || name.EndsWith("_Diffuse"))
+                        albedo = Texture.ParseFromFile(Engine.Device, loadPath);
+                    else if (name.EndsWith("_Nor") || name.EndsWith("_normal") || name.EndsWith("_Normal"))
+                        normal = Texture.ParseFromFile(Engine.Device, loadPath);
+                    else if (name.EndsWith("_Spec"))
+                        spec = Texture.ParseFromFile(Engine.Device, loadPath);
+                    else if (name.EndsWith("_Aoc"))
+                        aoc = Texture.ParseFromFile(Engine.Device, loadPath);
                 }
+                catch { /* skip bad textures */ }
             }
 
-            if (diffuseTexture == null)
-            {
-                Debug.Log("StaticMeshImporter", $"No texture found for {baseName}, using white");
-            }
+            if (albedo == null && normal == null && spec == null && aoc == null)
+                return DefaultMaterial;
 
-            // Create material — use InternalAssets defaults, per-mesh only if texture found
-            Material material;
-            if (diffuseTexture != null)
-            {
-                material = new Material(InternalAssets.DefaultEffect);
-                material.SetTexture("AlbedoTex", diffuseTexture);
-                material.SetTexture("NormalTex", InternalAssets.FlatNormal);
-            }
-            else
-            {
-                material = InternalAssets.DefaultMaterial;
-            }
+            // Create GPU textures + enqueue uploads via StreamingManager
+            Texture albedoTex = albedo != null ? Texture.CreateAsync(Engine.Device, albedo) : null;
+            Texture normalTex = normal != null ? Texture.CreateAsync(Engine.Device, normal) : null;
+            Texture specTex   = spec   != null ? Texture.CreateAsync(Engine.Device, spec)   : null;
+            Texture aocTex    = aoc    != null ? Texture.CreateAsync(Engine.Device, aoc)    : null;
 
-            // Classify mesh parts into base or LOD levels
-            // _LOD_0 / _LOD_00 = base mesh (highest quality)
-            // _LOD_01+ = lower quality LOD levels
-            for (int i = 0; i < mesh.MeshParts.Count; i++)
-            {
-                var part = mesh.MeshParts[i];
-                var name = part.Name;
+            var material = new Material(DefaultEffect);
+            material.SetTexture("AlbedoTex", albedoTex ?? White);
+            material.SetTexture("NormalTex", normalTex ?? FlatNormal);
+            if (specTex != null) material.SetTexture("Roughness", specTex);
+            if (aocTex  != null) material.SetTexture("AO", aocTex);
 
-                int index = name.IndexOf("_LOD_");
-                if (index < 0)
+            return material;
+        }
+
+        /// <summary>
+        /// Splits mesh parts into base MeshParts and LOD levels based on _LOD_N suffix.
+        /// </summary>
+        private static void BuildMeshParts(StaticMesh staticMesh, Mesh mesh, Material material)
+        {
+            for (int p = 0; p < mesh.MeshParts.Count; p++)
+            {
+                var part = mesh.MeshParts[p];
+                int lodIndex = part.Name.IndexOf("_LOD_");
+
+                if (lodIndex < 0)
                 {
-                    // Base mesh part
-                    staticMesh.MeshParts.Add(new MeshElement
-                    {
-                        Mesh = mesh,
-                        Material = material,
-                        MeshPartIndex = i
-                    });
+                    // Base mesh part (no LOD suffix)
+                    staticMesh.MeshParts.Add(new MeshElement { Mesh = mesh, Material = material, MeshPartIndex = p });
                 }
                 else
                 {
-                    try
+                    // Parse LOD level from suffix
+                    int endIndex = lodIndex + 6 < part.Name.Length ? 2 : 1;
+                    int lvl = Convert.ToInt32(part.Name.Substring(lodIndex + 5, endIndex)) - 1;
+
+                    if (lvl < 0)
                     {
-                        int endIndex = index + 6 < name.Length ? 2 : 1;
-                        int lvl = Convert.ToInt32(name.Substring(index + 5, endIndex)) - 1;
-
-                        if (lvl < 0)
-                        {
-                            // _LOD_0 / _LOD_00 → treat as base mesh part
-                            staticMesh.MeshParts.Add(new MeshElement
-                            {
-                                Mesh = mesh,
-                                Material = material,
-                                MeshPartIndex = i
-                            });
-                        }
-                        else
-                        {
-                            while (staticMesh.LODs.Count < lvl + 1)
-                                staticMesh.LODs.Add(new StaticMeshLOD { Mesh = mesh });
-
-                            staticMesh.LODs[lvl].MeshParts.Add(new MeshElement
-                            {
-                                Mesh = mesh,
-                                Material = material,
-                                MeshPartIndex = i
-                            });
-                        }
+                        // _LOD_0 → base mesh
+                        staticMesh.MeshParts.Add(new MeshElement { Mesh = mesh, Material = material, MeshPartIndex = p });
                     }
-                    catch (Exception ex)
+                    else
                     {
-                        Debug.Log($"[StaticMeshImporter] Failed to parse LOD level from {name}: {ex.Message}");
+                        while (staticMesh.LODs.Count < lvl + 1)
+                            staticMesh.LODs.Add(new StaticMeshLOD { Mesh = mesh });
+                        staticMesh.LODs[lvl].MeshParts.Add(new MeshElement { Mesh = mesh, Material = material, MeshPartIndex = p });
                     }
                 }
             }
-
-            if (staticMesh.LODs.Count > 0)
-            {
-                Debug.Log($"[StaticMeshImporter] Loaded {baseName} with {staticMesh.LODs.Count} LOD levels");
-            }
-
-            return staticMesh;
         }
     }
 }

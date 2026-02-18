@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Reflection;
@@ -15,10 +16,8 @@ namespace Freefall.Assets
     public class AssetManager : IDisposable
     {
         private readonly GraphicsDevice _device;
-        private readonly Dictionary<string, Asset> _assets = new Dictionary<string, Asset>();
-        private readonly ReaderWriterLockSlim _cacheLock = new ReaderWriterLockSlim();
-        private readonly System.Collections.Concurrent.ConcurrentDictionary<string, object> _importLocks 
-            = new System.Collections.Concurrent.ConcurrentDictionary<string, object>();
+        private readonly ConcurrentDictionary<string, Asset> _assets = new ConcurrentDictionary<string, Asset>();
+        private readonly ConcurrentDictionary<string, object> _importLocks = new ConcurrentDictionary<string, object>();
         private static readonly Dictionary<Type, Dictionary<string, Type>> Importers = new Dictionary<Type, Dictionary<string, Type>>();
 
         public string BaseDirectory { get; set; }
@@ -96,13 +95,9 @@ namespace Freefall.Assets
             }
             string cacheKey = $"{typeof(T).Name}:{fullPath}";
 
-            _cacheLock.EnterReadLock();
-            try
-            {
-                if (_assets.TryGetValue(cacheKey, out var cached))
-                    return (T)cached;
-            }
-            finally { _cacheLock.ExitReadLock(); }
+            // Fast path: already cached
+            if (_assets.TryGetValue(cacheKey, out var cached))
+                return (T)cached;
 
             var assetType = typeof(T);
             var extension = Path.GetExtension(fullPath);
@@ -113,16 +108,13 @@ namespace Freefall.Assets
             if (!extensionMap.TryGetValue(extension, out var importerType))
                 throw new InvalidOperationException($"No importer for extension {extension} for asset type {assetType.Name}");
 
+            // Per-key lock prevents duplicate imports of the same asset
             var importLock = _importLocks.GetOrAdd(cacheKey, _ => new object());
             lock (importLock)
             {
-                _cacheLock.EnterReadLock();
-                try
-                {
-                    if (_assets.TryGetValue(cacheKey, out var cached2))
-                        return (T)cached2;
-                }
-                finally { _cacheLock.ExitReadLock(); }
+                // Double-check after acquiring lock
+                if (_assets.TryGetValue(cacheKey, out var cached2))
+                    return (T)cached2;
 
                 var importer = Activator.CreateInstance(importerType);
                 var importMethod = importerType.GetMethod("Import");
@@ -132,16 +124,10 @@ namespace Freefall.Assets
                 {
                     asset.Name = Path.GetFileNameWithoutExtension(path);
                     asset.AssetPath = path;
+                    _assets[cacheKey] = asset;
                 }
 
-                _cacheLock.EnterWriteLock();
-                try
-                {
-                    if (asset != null)
-                        _assets[cacheKey] = asset;
-                    return asset;
-                }
-                finally { _cacheLock.ExitWriteLock(); }
+                return asset;
             }
         }
         
@@ -170,7 +156,6 @@ namespace Freefall.Assets
                     disposable.Dispose();
             }
             _assets.Clear();
-            _cacheLock?.Dispose();
             Debug.Log("[AssetManager] Disposed all assets.");
         }
     }

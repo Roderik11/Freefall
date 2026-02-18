@@ -70,7 +70,7 @@ namespace Freefall
             // Set high-resolution timer for smooth high-FPS gameplay
             Kernel32.timeBeginPeriod(1);
             
-            RootDirectory = Directory.GetCurrentDirectory(); 
+            RootDirectory = AppContext.BaseDirectory;
 
             Device = new GraphicsDevice();
             
@@ -142,21 +142,30 @@ namespace Freefall
         {
             TickCount++;
 
+            var _tickSw = System.Diagnostics.Stopwatch.StartNew();
+
             Time.Update();
             Input.Update();
 
             // Release GPU buffers from previous batch resizes (deferred N frames for safety)
+            var _flushDisposeSw = System.Diagnostics.Stopwatch.StartNew();
             Graphics.InstanceBatch.FlushDeferredDisposals();
-
+            _flushDisposeSw.Stop();
 
             // Flush pending entity additions before Update/Render
+            var _flushPendingSw = System.Diagnostics.Stopwatch.StartNew();
             Base.EntityManager.FlushPending();
+            _flushPendingSw.Stop();
 
             // Physics (fixed-timestep)
+            var _physicsSw = System.Diagnostics.Stopwatch.StartNew();
             PhysicsWorld.Update((float)Time.Delta);
+            _physicsSw.Stop();
             
             // Update Logic
+            var _updateSw = System.Diagnostics.Stopwatch.StartNew();
             Update();
+            _updateSw.Stop();
 
             // --- Process all deferred resizes before rendering (Apex pattern) ---
             // Must sync GPU first — previous frames may still be using resources
@@ -179,6 +188,9 @@ namespace Freefall
             _renderViews.Clear();
             _renderViews.AddRange(RenderView.All);
 
+            var _renderSw = System.Diagnostics.Stopwatch.StartNew();
+            double _prepareTotalMs = 0, _camRenderTotalMs = 0, _presentTotalMs = 0;
+
             foreach (var view in _renderViews)
             {
                 if (!view.Enabled) continue;
@@ -190,21 +202,35 @@ namespace Freefall
                 }
                 else
                 {
+                    var _prepSw = System.Diagnostics.Stopwatch.StartNew();
                     view.Prepare();
+                    _prepSw.Stop();
+                    _prepareTotalMs += _prepSw.Elapsed.TotalMilliseconds;
 
+                    var _camSw = System.Diagnostics.Stopwatch.StartNew();
                     var cam = Camera.Main;
                     if (cam != null && cam.Target == view)
                         cam.Render(view.CommandList.Native);
 
+                    view.OnAfterRender?.Invoke(view);
+                    _camSw.Stop();
+                    _camRenderTotalMs += _camSw.Elapsed.TotalMilliseconds;
+
+                    var _presSw = System.Diagnostics.Stopwatch.StartNew();
                     view.Present();
+                    _presSw.Stop();
+                    _presentTotalMs += _presSw.Elapsed.TotalMilliseconds;
                 }
             }
+            _renderSw.Stop();
 
             CommandBuffer.Clear();
             
             // Drain main-thread queue AFTER Present (GPU fence ensures no commands in flight,
             // so creating GPU resources like upload buffers and SRV descriptors is safe here).
             // Time-budgeted: process items until 4ms spent to avoid frame hitches.
+            var _queueSw = System.Diagnostics.Stopwatch.StartNew();
+            int _queueItemCount = 0;
             var budgetStart = System.Diagnostics.Stopwatch.GetTimestamp();
             long budgetTicks = System.Diagnostics.Stopwatch.Frequency * 4 / 1000; // 4ms
             while (_mainThreadQueue.TryDequeue(out var work))
@@ -218,8 +244,25 @@ namespace Freefall
                 {
                     work.Tcs?.SetException(ex);
                 }
+                _queueItemCount++;
                 if (System.Diagnostics.Stopwatch.GetTimestamp() - budgetStart >= budgetTicks)
                     break;
+            }
+            _queueSw.Stop();
+
+            _tickSw.Stop();
+
+            // Log frame breakdown when total exceeds 5ms (stall detection)
+            if (_tickSw.Elapsed.TotalMilliseconds > 5)
+            {
+                Debug.Log($"[Tick STALL] {_tickSw.Elapsed.TotalMilliseconds:F1}ms | " +
+                    $"FlushDispose:{_flushDisposeSw.Elapsed.TotalMilliseconds:F1} " +
+                    $"FlushPending:{_flushPendingSw.Elapsed.TotalMilliseconds:F1} " +
+                    $"Physics:{_physicsSw.Elapsed.TotalMilliseconds:F1} " +
+                    $"Update:{_updateSw.Elapsed.TotalMilliseconds:F1} " +
+                    $"Render:{_renderSw.Elapsed.TotalMilliseconds:F1} " +
+                    $"(Prep:{_prepareTotalMs:F1} Cam:{_camRenderTotalMs:F1} Pres:{_presentTotalMs:F1}) " +
+                    $"Queue:{_queueSw.Elapsed.TotalMilliseconds:F1}({_queueItemCount}items)");
             }
 
             Input.ClearFrameCallbacks();

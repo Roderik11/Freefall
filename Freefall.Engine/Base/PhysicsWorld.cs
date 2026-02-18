@@ -89,6 +89,44 @@ namespace Freefall.Base
             }
         }
 
+        /// <summary>
+        /// Performs a raycast against the physics scene, returning the closest hit.
+        /// </summary>
+        public static bool Raycast(Vector3 origin, Vector3 direction, float maxDistance,
+                                   out Vector3 hitPosition, out Vector3 hitNormal)
+        {
+            hitPosition = origin;
+            hitNormal = Vector3.UnitY;
+
+            if (Scene == null) return false;
+
+            Vector3 pos = origin;
+            Vector3 nrm = Vector3.UnitY;
+            float closestDist = maxDistance;
+            bool found = false;
+
+            Scene.Raycast(origin, Vector3.Normalize(direction), maxDistance, 1,
+                (hits) =>
+                {
+                    if (hits != null && hits.Length > 0)
+                    {
+                        var hit = hits[0];
+                        pos = hit.Position;
+                        nrm = hit.Normal;
+                        found = true;
+                    }
+                    return true;
+                });
+
+            if (found)
+            {
+                hitPosition = pos;
+                hitNormal = nrm;
+            }
+
+            return found;
+        }
+
         public static void Shutdown()
         {
             Scene?.Dispose();
