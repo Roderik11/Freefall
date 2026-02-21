@@ -14,34 +14,7 @@ namespace Freefall.Graphics
         public uint MaterialId;      // index into MaterialsBuffer
         public uint CustomDataIdx;   // index into per-batch StructuredBuffer (future use, 0 for now)
     }
-    /// <summary>
-    /// Per-instance data for GPU-driven rendering.
-    /// Stored in a GPU buffer and used by culling compute shader.
-    /// </summary>
-    [StructLayout(LayoutKind.Sequential)]
-    public struct DrawInstance
-    {
-        /// <summary>Bindless index to position buffer (GET_INDEX(0))</summary>
-        public uint PosBufferIdx;
-        
-        /// <summary>Bindless index to instance/transform data (GET_INDEX(1))</summary>
-        public uint InstanceDataIdx;
-        
-        /// <summary>Bindless index to material data (GET_INDEX(2))</summary>
-        public uint MaterialIdx;
-        
-        /// <summary>Bindless index to bone matrices - 0 for static meshes (GET_INDEX(3))</summary>
-        public uint BoneBufferIdx;
-        
-        
-        /// <summary>Mesh draw arguments - copied to indirect buffer when visible</summary>
-        public uint IndexCount;
-        public uint StartIndexLocation;
-        public int BaseVertexLocation;
-        
-        /// <summary>PSO batch ID - used to route to correct indirect buffer</summary>
-        public uint BatchId;
-    }
+
 
     /// <summary>
     /// Indirect draw command for ExecuteIndirect with BINDLESS INDEX BUFFERS.

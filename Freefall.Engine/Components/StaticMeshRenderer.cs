@@ -11,18 +11,15 @@ namespace Freefall.Components
 {
     public class StaticMeshRenderer : Component, IDraw, IParallel
     {
-        public StaticMesh StaticMesh;
-        public MaterialBlock Params;
+        public StaticMesh? StaticMesh;
+        public MaterialBlock Params = new MaterialBlock();
         public BoundingSphere BoundingSphere;
 
         private Vector3[] points = new Vector3[8];
-
         const float MinDrawSizeSq = 0.01f * 0.01f;
 
-        public StaticMeshRenderer()
-        {
-            Params = new MaterialBlock();
-        }
+        private bool _boundsDirty = true;
+
 
         protected override void Awake()
         {
@@ -37,17 +34,18 @@ namespace Freefall.Components
 
         void OnTransformChanged()
         {
+            if (StaticMesh == null) return;
             var mesh = StaticMesh.Mesh;
-            if (mesh == null) return;
-
+            if (mesh == null) { _boundsDirty = true; return; }
             mesh.BoundingBox.GetCorners(points, mesh.RootRotation * Transform.WorldMatrix);
             BoundingSphere = BoundingSphere.CreateFromPoints(points);
+            _boundsDirty = false;
         }
 
-        private IStaticMesh GetMesh()
+        private IStaticMesh? GetMesh()
         {
             if (StaticMesh == null) return null;
-            if (StaticMesh.LODs.Count == 0) return StaticMesh;
+            if (StaticMesh.LODs == null || StaticMesh.LODs.Count == 0) return StaticMesh;
             
             var cam = Camera.Main;
             if (cam == null) return StaticMesh;
@@ -75,21 +73,34 @@ namespace Freefall.Components
         // Draw method called by Renderer or System
         public void Draw()
         {
+             // Lazy recompute: mesh wasn't loaded during Awake()
+             if (_boundsDirty) OnTransformChanged();
+
              IStaticMesh lod = GetMesh();
              if (lod == null || lod.Mesh == null) return;
 
              var mesh = lod.Mesh;
              var elements = lod.MeshParts;
-             var slot = Entity.Transform.TransformSlot;
+             var defaultMat = InternalAssets.DefaultMaterial;
              
-             // iterate through MeshParts and use element.Material
+             // If MeshParts is populated, use them
              if (elements != null && elements.Count > 0)
              {
                  foreach (var element in elements)
                  {
-                     // Enqueue into all passes defined by the Effect
-                     if (element.Material != null)
-                         CommandBuffer.Enqueue(mesh, element.MeshPartIndex, element.Material, Params, slot);
+                     var mat = element.Material ?? defaultMat;
+                     var partIdx = element.MeshPartIndex;
+                     if (mat != null && partIdx >= 0 && partIdx < mesh.MeshParts.Count)
+                         CommandBuffer.Enqueue(mesh, partIdx, mat, Params, Transform.TransformSlot);
+                 }
+             }
+             else if (mesh.MeshParts != null)
+             {
+                 // Fallback: render all mesh sub-parts with default material
+                 for (int i = 0; i < mesh.MeshParts.Count; i++)
+                 {
+                     if (defaultMat != null)
+                         CommandBuffer.Enqueue(mesh, i, defaultMat, Params, Transform.TransformSlot);
                  }
              }
         }

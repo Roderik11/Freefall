@@ -1,4 +1,5 @@
 using System;
+using System.Text.Json.Serialization;
 
 namespace Freefall.Assets
 {
@@ -6,6 +7,13 @@ namespace Freefall.Assets
     {
         public string Name { get; set; }
         public string AssetPath { get; set; }
+
+        /// <summary>
+        /// Sub-asset GUID assigned during import. Used by AssetFile
+        /// serialization to write asset references as GUID strings.
+        /// </summary>
+        [JsonIgnore]
+        public string Guid { get; set; }
         
         // Streaming State
         private long _readyFenceValue = long.MaxValue; // Default to 'never ready' until set? Or 0 if loaded synchronously?

@@ -2,27 +2,14 @@ using System;
 
 namespace Freefall.Assets
 {
+    // Backward compatibility aliases — will be removed once all code is migrated.
+    
     /// <summary>
-    /// Marks a class as an asset reader for specific file extensions.
-    /// Like Apex's AssetReaderAttribute.
+    /// Deprecated: Use AssetImporterAttribute instead.
     /// </summary>
     [AttributeUsage(AttributeTargets.Class)]
-    public class AssetReaderAttribute : Attribute
+    public class AssetReaderAttribute : AssetImporterAttribute
     {
-        public string[] Extensions { get; }
-
-        public AssetReaderAttribute(params string[] extensions)
-        {
-            Extensions = extensions;
-        }
-    }
-
-    /// <summary>
-    /// Base class for asset readers that import assets from files.
-    /// Like Apex's AssetReader<T>.
-    /// </summary>
-    public abstract class AssetReader<T> where T : Asset
-    {
-        public abstract T Import(string filepath);
+        public AssetReaderAttribute(params string[] extensions) : base(extensions) { }
     }
 }

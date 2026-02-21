@@ -8,10 +8,25 @@ namespace Freefall.Assets
     /// Engine-internal default textures and materials.
     /// Loads real DDS fallback textures so every MaterialData slot
     /// points at something valid. Mirrors Spark.InternalAssets.
+    ///
+    /// All internal assets have deterministic stable GUIDs so .asset files
+    /// can reference them (e.g. a Material .asset referencing DefaultEffect).
     /// </summary>
     public static class InternalAssets
     {
         private static readonly string ResourcesPath = Path.Combine(AppContext.BaseDirectory, "Resources");
+
+        // ── Stable GUIDs (hardcoded, never change) ──
+        public static class Guids
+        {
+            public const string White           = "00000000000000000000000000000001";
+            public const string FlatNormal      = "00000000000000000000000000000002";
+            public const string DefaultDiffuse  = "00000000000000000000000000000003";
+            public const string DefaultNormal   = "00000000000000000000000000000004";
+            public const string DefaultSpecular = "00000000000000000000000000000005";
+            public const string DefaultEffect   = "00000000000000000000000000000010";
+            public const string DefaultMaterial = "00000000000000000000000000000020";
+        }
 
         // --- Utility textures (procedural) ---
         public static Texture White { get; private set; }
@@ -34,6 +49,7 @@ namespace Freefall.Assets
             byte[] white = new byte[4 * 4 * 4];
             for (int i = 0; i < white.Length; i++) white[i] = 255;
             White = Texture.CreateFromData(device, 4, 4, white, Format.R8G8B8A8_UNorm);
+            White.Name = "White";
 
             // Flat normal map (tangent-space up: 128,128,255)
             byte[] normal = new byte[4 * 4 * 4];
@@ -45,17 +61,40 @@ namespace Freefall.Assets
                 normal[i + 3] = 255;
             }
             FlatNormal = Texture.CreateFromData(device, 4, 4, normal, Format.R8G8B8A8_UNorm);
+            FlatNormal.Name = "FlatNormal";
 
             // --- Default textures from DDS ---
             DefaultDiffuse  = new Texture(device, Path.Combine(ResourcesPath, "default_albedo_map.dds"));
+            DefaultDiffuse.Name = "DefaultDiffuse";
             DefaultNormal   = new Texture(device, Path.Combine(ResourcesPath, "default_normal_map.dds"));
+            DefaultNormal.Name = "DefaultNormal";
             DefaultSpecular = new Texture(device, Path.Combine(ResourcesPath, "default_specular_map.dds"));
+            DefaultSpecular.Name = "DefaultSpecular";
 
             // --- Default effect + material ---
             DefaultEffect = new Effect("gbuffer");
             DefaultMaterial = new Material(DefaultEffect);
+            DefaultMaterial.Name = "DefaultMaterial";
             DefaultMaterial.SetTexture("AlbedoTex", DefaultDiffuse);
             DefaultMaterial.SetTexture("NormalTex", DefaultNormal);
+        }
+
+        /// <summary>
+        /// Register all internal assets with stable GUIDs into the AssetManager.
+        /// Call after Initialize() and after AssetManager is created.
+        /// Makes internal assets discoverable via LoadByGuid&lt;T&gt;().
+        /// </summary>
+        public static void Register(AssetManager manager)
+        {
+            manager.RegisterAsset(Guids.White, White);
+            manager.RegisterAsset(Guids.FlatNormal, FlatNormal);
+            manager.RegisterAsset(Guids.DefaultDiffuse, DefaultDiffuse);
+            manager.RegisterAsset(Guids.DefaultNormal, DefaultNormal);
+            manager.RegisterAsset(Guids.DefaultSpecular, DefaultSpecular);
+            manager.RegisterAsset(Guids.DefaultEffect, DefaultEffect);
+            manager.RegisterAsset(Guids.DefaultMaterial, DefaultMaterial);
+
+            Debug.Log("[InternalAssets] Registered 7 internal assets with stable GUIDs");
         }
     }
 }

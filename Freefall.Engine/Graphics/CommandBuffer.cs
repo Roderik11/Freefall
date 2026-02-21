@@ -49,15 +49,6 @@ namespace Freefall.Graphics
     /// </summary>
     public class DrawBucket
     {
-        // Well-known hash keys for core per-instance data channels
-        public static readonly int DescriptorsHash = "Descriptors".GetHashCode();
-        // Removed: BoundingSpheresHash — bounding spheres now live in MeshRegistry
-        public static readonly int SubbatchIdsHash = "SubbatchIds".GetHashCode();
-        
-        public List<InstanceBatch.RawDraw> Draws = new();
-        public HashSet<int> UniqueMeshPartIds = new();
-        public Material? FirstMaterial;
-        
         /// <summary>
         /// Pre-staged per-instance data: hash → contiguous byte array (filled at Enqueue time).
         /// </summary>
@@ -66,14 +57,23 @@ namespace Freefall.Graphics
             public int PushConstantSlot;    // Graphics push constant slot (from shader)
             public int ElementStride;       // Bytes per element
             public int ElementsPerInstance; // Elements per instance (1 for scalar, N for array)
-            public byte[] Data = Array.Empty<byte>();
+            public byte[] Data = [];
             public int Count;               // Number of instances staged
             public int BytesPerInstance => ElementsPerInstance * ElementStride;
         }
+
+
+        // Well-known hash keys for core per-instance data channels
+        public static readonly int DescriptorsHash = "Descriptors".GetHashCode();
+        // Removed: BoundingSpheresHash — bounding spheres now live in MeshRegistry
+        public static readonly int SubbatchIdsHash = "SubbatchIds".GetHashCode();
         
-        public Dictionary<int, PerInstanceStaging> PerInstanceData = new();
-        
-        public int Count => Draws.Count;
+        public Material? FirstMaterial;
+        public HashSet<int> UniqueMeshPartIds = [];
+        public List<InstanceBatch.RawDraw> Draws = [];
+        public Dictionary<int, PerInstanceStaging> PerInstanceData = [];
+
+        public int Count => Draws.Count;        
         
         public void Add(Mesh mesh, int partIndex, Material material, MaterialBlock block, int transformSlot)
         {

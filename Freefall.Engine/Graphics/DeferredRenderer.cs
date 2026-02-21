@@ -102,6 +102,11 @@ namespace Freefall.Graphics
 
         public override void Render(Camera camera, ID3D12GraphicsCommandList list)
         {
+            // Set Current for duration of this render so DirectionalLight/other components
+            // can access G-buffer textures (essential for non-primary editor viewports)
+            var previousCurrent = Current;
+            Current = this;
+            
             var sw = System.Diagnostics.Stopwatch.StartNew();
 
             // Ensure Materials buffer is bound (creates SRV for bindless access)
@@ -136,6 +141,9 @@ namespace Freefall.Graphics
             {
                 Debug.Log($"[DeferredRenderer] Total: {sw.Elapsed.TotalMilliseconds:F2}ms | GBuffer: {gbufferTime.Elapsed.TotalMilliseconds:F2}ms | Light: {lightTime.Elapsed.TotalMilliseconds:F2}ms | Compose: {composeTime.Elapsed.TotalMilliseconds:F2}ms | Blit: {blitTime.Elapsed.TotalMilliseconds:F2}ms");
             }
+            
+            // Restore previous Current (stack-safe for nested viewports)
+            Current = previousCurrent;
         }
         
         private void Transition(ID3D12GraphicsCommandList list, ID3D12Resource res, ResourceStates before, ResourceStates after)
@@ -279,21 +287,14 @@ namespace Freefall.Graphics
              list.RSSetViewport(new Viewport(0, 0, LightBuffer.Native.Description.Width, LightBuffer.Native.Description.Height));
              list.RSSetScissorRect(new RectI(0, 0, (int)LightBuffer.Native.Description.Width, (int)LightBuffer.Native.Description.Height));
 
-             // Bind Inputs (GBuffer SRVs)
-             // Need Desciptor Table logic here? Or just SetGraphicsRootDescriptorTable if we have a RootSignature for Lights.
-             
              // Zero-translation CameraInverse: even though GBuffer depth was written with full View,
              // NDC = (worldPos - camPos) × R × P, so inverse(R × P) correctly gives camera-relative pos
              var cvp = Matrix4x4.CreateLookAtLeftHanded(Vector3.Zero, camera.Forward, camera.Up) * camera.Projection;
              Matrix4x4.Invert(cvp, out var cameraInverse);
              foreach (var pair in Effect.MasterEffects)
-             {
                  pair.Value.SetParameter("CameraInverse", cameraInverse);
-             }
              
-             CommandBuffer.Execute(RenderPass.Light, list, Engine.Device); // Draws DirectionalLight quads
-             // TODO: Light batching removed - will be reimplemented
-             // CommandBuffer.ExecuteLights(list, Engine.Device, Normals.BindlessIndex, Depth.BindlessIndex);
+             CommandBuffer.Execute(RenderPass.Light, list, Engine.Device);
 
              Transition(list, LightBuffer.Native, ResourceStates.RenderTarget, ResourceStates.PixelShaderResource);
         }

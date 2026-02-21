@@ -32,10 +32,10 @@ namespace Freefall.Components
                 ChannelRadius = Range,
                 ChannelCount = 1,
                 CurveDistanceScaler = 1,
-                Position = Vector3.Zero,
+                Position = Transform.WorldPosition,
+                OrientFront = Transform.Forward,
+                OrientTop = Transform.Up,
                 Velocity = Vector3.Zero,
-                OrientFront = Vector3.UnitZ,
-                OrientTop = Vector3.UnitY,
             };
         }
 
@@ -55,9 +55,7 @@ namespace Freefall.Components
 
             if (sourceVoice == null || currentFormat != clip.WaveFormat)
             {
-                if (sourceVoice != null)
-                    sourceVoice.BufferEnd -= SourceVoice_BufferEnd;
-
+                sourceVoice?.BufferEnd -= SourceVoice_BufferEnd;
                 sourceVoice?.DestroyVoice();
                 sourceVoice?.Dispose();
 

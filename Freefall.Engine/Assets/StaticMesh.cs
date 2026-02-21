@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Text.Json.Serialization;
 using System.Threading;
 using Freefall.Base;
 using Freefall.Graphics;
@@ -23,13 +24,14 @@ namespace Freefall.Assets
         public Mesh Mesh { get; set; }
         public List<MeshElement> MeshParts { get; set; } = new List<MeshElement>();
 
-        public LODGroup LODGroup = LODGroups.Trees;
+        public LODGroup LODGroup = LODGroups.LargeProps;
         public List<StaticMeshLOD> LODs = new List<StaticMeshLOD>();
 
         /// <summary>
         /// Pre-cooked PhysX triangle mesh. Populated on background thread during asset loading
         /// so that RigidBody.Awake() doesn't need to cook on the main thread.
         /// </summary>
+        [JsonIgnore]
         public TriangleMesh CookedTriMesh { get; set; }
 
         public StaticMesh()
@@ -50,13 +52,13 @@ namespace Freefall.Assets
             // Pick lowest LOD mesh parts for collision (fewer triangles)
             if (LODs?.Count > 0)
             {
-                var lowestLod = LODs[LODs.Count - 1];
+                var lowestLod = LODs[^1];
                 var lodIndices = new List<int>();
                 foreach (var part in lowestLod.MeshParts)
                 {
-                    var meshPart = Mesh.MeshParts[part.MeshPartIndex];
+                    var meshPart = lowestLod.Mesh.MeshParts[part.MeshPartIndex];
                     for (int i = 0; i < meshPart.NumIndices; i++)
-                        lodIndices.Add((int)Mesh.CpuIndices[meshPart.BaseIndex + i]);
+                        lodIndices.Add((int)lowestLod.Mesh.CpuIndices[meshPart.BaseIndex + i]);
                 }
                 triangles = lodIndices.ToArray();
             }

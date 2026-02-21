@@ -21,6 +21,7 @@ namespace Freefall
         public static GraphicsDevice Device { get; private set; }
         public static EngineSettings Settings { get; private set; }
         public static string RootDirectory { get; private set; }
+        public static FreefallProject Project { get; private set; }
 
         public static IXAudio2 AudioDevice { get; private set; }
         public static X3DAudio Audio3D { get; private set; }
@@ -85,6 +86,7 @@ namespace Freefall
 
             // Engine-internal default textures & materials
             Freefall.Assets.InternalAssets.Initialize(Device);
+            Freefall.Assets.InternalAssets.Register(Assets);
             
             // Initialize Audio
             AudioDevice = XAudio2.XAudio2Create(ProcessorSpecifier.DefaultProcessor, true);
@@ -111,7 +113,9 @@ namespace Freefall
 
             var streaming = new StreamingManager(Device);
             Assets = new AssetManager(Device);
+
             Freefall.Assets.InternalAssets.Initialize(Device);
+            Freefall.Assets.InternalAssets.Register(Assets);
 
             // Initialize Rendering Foundation — view auto-registers in RenderView.All
             var view = new RenderView(handle, width, height, Device);
@@ -126,6 +130,18 @@ namespace Freefall
             Debug.Log("[Engine] Initialized (editor mode)");
             
             PhysicsWorld.Initialize();
+        }
+
+        /// <summary>
+        /// Open a project at runtime. Initializes AssetDatabase and sets asset base directory.
+        /// Can be called after Initialize() — enables the landing-page-first workflow.
+        /// </summary>
+        public static void OpenProject(string path)
+        {
+            Project = FreefallProject.Open(path);
+            AssetDatabase.Initialize(Project);
+            Assets.BaseDirectory = Project.AssetsDirectory;
+            Debug.Log($"[Engine] Project opened: {Project.Name}");
         }
 
         /// <summary>
@@ -356,7 +372,7 @@ namespace Freefall
          public bool FreezeFrustum { get; set; } = false;                   // F3 - Freeze culling frustum
          public bool UseAdaptiveSplits { get; set; } = false;               // F4 - SDSM adaptive cascade splits
          public int  DebugVisualizationMode { get; set; } = 0;              // F5 - Debug viz (0-4)
-         public bool DisableHiZ { get; set; } = false;                      // F6 - Disable Hi-Z occlusion
+         public bool DisableHiZ { get; set; } = true;                       // F6 - Disable Hi-Z occlusion
          public System.Numerics.Matrix4x4 FrozenViewProjection { get; set; } // VP matrix when frustum frozen
     }
 }

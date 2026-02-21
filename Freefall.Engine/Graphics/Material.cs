@@ -1,6 +1,7 @@
 using System;
 using System.Numerics;
 using System.Collections.Generic;
+using Freefall.Assets;
 using Vortice.Direct3D12;
 using Vortice.Direct3D12.Shader;
 using Vortice.DXGI;
@@ -56,7 +57,7 @@ namespace Freefall.Graphics
         }
     }
 
-    public class Material : IDisposable
+    public class Material : Asset, IDisposable
     {
 
         
@@ -67,11 +68,17 @@ namespace Freefall.Graphics
         private Dictionary<string, ConstantBuffer> _constantBuffers = new();
         private Dictionary<string, Texture> _textures = new();
         
+        /// <summary>
+        /// Read-only access to texture bindings (slot name → Texture).
+        /// Used by MaterialSerializer for YAML serialization.
+        /// </summary>
+        public IReadOnlyDictionary<string, Texture> Textures => _textures;
+        
         // Material ID indirection system
         public int MaterialID { get; private set; }
         private static int _nextMaterialID = 0;
         private static List<MaterialData> _allMaterials = new();
-        private static readonly object _materialIdLock = new();
+        private static readonly Lock _materialIdLock = new();
         private static ID3D12Resource? _materialsBuffer;
         private static IntPtr _materialsBufferPtr;
         private static bool _materialsBufferDirty = true;
@@ -133,6 +140,12 @@ namespace Freefall.Graphics
         }
         
         private Dictionary<string, int> _textureSlots = new();
+
+        /// <summary>
+        /// Parameterless constructor for deferred asset stub creation.
+        /// Stubs only carry a GUID for later resolution — they are never used for rendering.
+        /// </summary>
+        public Material() { }
 
         public Material(Effect effect) : this(effect, Freefall.Engine.Device) { }
 

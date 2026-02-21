@@ -141,8 +141,8 @@ namespace Freefall.Loaders
 
             int totalSpawned = 0;
             int totalInstances = allItems.Count;
-            const int spawnBatchSize = 256;
-            var throttle = new SemaphoreSlim(2); // limit concurrent GPU resource creation
+            const int spawnBatchSize = 512;
+            var throttle = new SemaphoreSlim(1); // limit concurrent GPU resource creation
 
             var loadTasks = groups.Select(async group =>
             {

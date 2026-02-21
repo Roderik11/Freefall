@@ -28,7 +28,7 @@ namespace Freefall.Graphics
         // everything up to headAtSubmit is reclaimable.
         private readonly Queue<(long fenceValue, long headAtSubmit)> _pendingFences = new();
         
-        private readonly object _lock = new object();
+        private readonly Lock _lock = new();
 
         public ID3D12Resource Resource => _heap;
         public IntPtr BaseCpuPointer => _cpuPtr;

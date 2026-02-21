@@ -41,14 +41,12 @@ namespace Freefall.Components
 
         public void Update()
         {
-            Entity.Transform.Scale = Vector3.One * Range;
+            Transform.Scale = Vector3.One * Range;
         }
 
         public void Draw()
         {
             if (_sphereMesh == null || _sharedMaterial == null) return;
-
-            var slot = Entity.Transform.TransformSlot;
 
             // Set G-Buffer textures on the shared Material (slots 17-20, same for all lights)
             if (DeferredRenderer.Current != null)
@@ -64,20 +62,17 @@ namespace Freefall.Components
             var camPos = Camera.Main?.Position ?? Vector3.Zero;
 
             // Set per-instance light data via MaterialBlock per-instance staging buffer
-            // Same pattern as Terrain's TerrainPatchData
-            _params.Clear();
+            //_params.Clear();
             _params.SetParameter("LightData", new PointLightData
             {
                 Color = new Vector3(Color.R, Color.G, Color.B),
                 Intensity = Intensity,
-                Position = Entity.Transform.Position - camPos,
+                Position = Entity.Transform.WorldPosition - camPos,
                 Range = Range
             });
 
             // Enqueue pass is inferred from shader technique ("Light")
-            CommandBuffer.Enqueue(_sphereMesh, _sharedMaterial, _params, slot);
+            CommandBuffer.Enqueue(_sphereMesh, _sharedMaterial, _params, Transform.TransformSlot);
         }
-
-
     }
 }

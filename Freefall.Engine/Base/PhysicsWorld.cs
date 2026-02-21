@@ -1,5 +1,6 @@
 using System;
 using System.Numerics;
+using System.Runtime.CompilerServices;
 using PhysX;
 
 namespace Freefall.Base
@@ -78,13 +79,12 @@ namespace Freefall.Base
             Scene.FetchResults(true);
 
             var activeActors = Scene.GetActors(ActorTypeFlag.RigidDynamic);
-            foreach (RigidDynamic actor in activeActors) 
+            foreach (var actor in activeActors)
             {
-                var entity = actor.UserData as Entity;
-                if (entity != null)
+                if (actor is RigidDynamic dynamic && actor.UserData is Entity entity)
                 {
-                    entity.Transform.Position = actor.GlobalPosePosition;
-                    entity.Transform.Rotation = actor.GlobalPoseQuat;
+                    entity.Transform.Position = dynamic.GlobalPosePosition;
+                    entity.Transform.Rotation = dynamic.GlobalPoseQuat;
                 }
             }
         }

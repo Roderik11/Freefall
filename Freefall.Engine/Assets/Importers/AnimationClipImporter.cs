@@ -13,13 +13,13 @@ namespace Freefall.Assets.Importers
     /// Imports animation clips from DAE-anim files.
     /// Uses custom XML parsing like Apex (Assimp doesn't support .dae-anim extension).
     /// </summary>
-    [AssetReader(".dae-anim")]
-    public class AnimationClipImporter : AssetReader<AnimationClip>
+    [AssetImporter(".dae-anim")]
+    public class AnimationClipImporter : AssetImporter<AnimationClip>
     {
         // MATCH APEX: DAE animations are in cm, need 0.01 scale to match mesh
         public float Scale = 0.01f;
 
-        public override AnimationClip Import(string filename)
+        public override AnimationClip Load(string filename)
         {
             float scaleFactor = Scale;
             if (scaleFactor <= 0) scaleFactor = 1;

@@ -50,7 +50,7 @@ namespace Freefall.Graphics
         private static ID3D12Resource? _buffer;
         private static uint _srvIndex;
         private static bool _dirty = true;
-        private static readonly object _lock = new object();
+        private static readonly Lock _lock = new();
 
         public static uint SrvIndex => _srvIndex;
         public static int Count => _entries.Count;

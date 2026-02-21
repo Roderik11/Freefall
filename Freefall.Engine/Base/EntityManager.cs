@@ -6,9 +6,9 @@ namespace Freefall.Base
 {
     public static class EntityManager
     {
-        private static readonly List<Entity> _entities = new List<Entity>();
-        private static readonly List<Entity> _pendingAdditions = new List<Entity>();
-        private static readonly object _lock = new object();
+        private static readonly List<Entity> _entities = [];
+        private static readonly List<Entity> _pendingAdditions = [];
+        private static readonly Lock _lock = new();
 
         public static void AddEntity(Entity entity)
         {

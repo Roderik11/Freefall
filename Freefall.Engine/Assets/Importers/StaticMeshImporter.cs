@@ -10,10 +10,9 @@ namespace Freefall.Assets.Importers
     /// GPU buffers, textures (by convention), material, LODs, and pre-cooked physics.
     /// Thread-safe — designed to be called from background threads via Assets.LoadAsync.
     /// </summary>
-    [AssetReader(".fbx", ".dae", ".obj")]
-    public class StaticMeshImporter : AssetReader<StaticMesh>
+    public class StaticMeshImporter
     {
-        public override StaticMesh Import(string filepath)
+        public StaticMesh Load(string filepath)
         {
             var meshName = Path.GetFileNameWithoutExtension(filepath);
 

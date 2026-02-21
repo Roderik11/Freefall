@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Numerics;
+using Freefall.Assets;
 
 namespace Freefall.Graphics
 {
@@ -62,9 +63,9 @@ namespace Freefall.Graphics
         }
     }
 
-    public class Effect : IDisposable
+    public class Effect : Asset, IDisposable
     {
-        public string Name { get; }
+        public new string Name { get; }
         public List<EffectTechnique> Techniques { get; } = new List<EffectTechnique>();
         
         // Render state overrides (used when creating PSOs)

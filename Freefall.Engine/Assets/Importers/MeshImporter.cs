@@ -14,13 +14,12 @@ namespace Freefall.Assets.Importers
     /// Configuration matches Apex's import settings.
     /// Supports skeletal meshes with bone weights.
     /// </summary>
-    [AssetReader(".fbx", ".dae", ".obj")]
-    public class MeshImporter : AssetReader<Graphics.Mesh>
+    public class MeshImporter
     {
         private List<Bone> skeleton = new List<Bone>();
         private List<string> boneNames = new List<string>();
 
-        public override Graphics.Mesh Import(string filepath)
+        public Graphics.Mesh Load(string filepath)
         {
             var data = ParseRaw(filepath);
             var meshObj = new Graphics.Mesh(Engine.Device, data);

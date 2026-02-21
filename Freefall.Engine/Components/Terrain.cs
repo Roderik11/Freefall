@@ -95,7 +95,6 @@ namespace Freefall.Components
         // Mesh and registration
         private Mesh _patchMesh = null!;
         private int _meshPartId;
-        private int _transformSlot = -1;
 
         // Texture arrays
         private Texture? ControlMapsArray;
@@ -112,10 +111,6 @@ namespace Freefall.Components
         {
             _patchMesh = Mesh.CreatePatch(Engine.Device);
             _meshPartId = MeshRegistry.Register(_patchMesh, 0);
-            _transformSlot = TransformBuffer.Instance!.AllocateSlot();
-
-            OnTransformChanged();
-            Entity.Transform.OnChanged += OnTransformChanged;
 
             if (Layers != null && Layers.Count > 0)
                 SetupLayerTiling();
@@ -135,16 +130,6 @@ namespace Freefall.Components
             ComputeReady = _computeInitialized;
         }
 
-        public override void Destroy()
-        {
-            Entity.Transform.OnChanged -= OnTransformChanged;
-        }
-
-        private void OnTransformChanged()
-        {
-            TransformBuffer.Instance!.SetTransform(_transformSlot, Transform.WorldMatrix);
-        }
-
         public void Draw()
         {
             if (Camera.Main == null || !_computeInitialized) return;
@@ -156,7 +141,7 @@ namespace Freefall.Components
             Material.SetParameter("HeightTexel", Heightmap != null ? 1.0f / Heightmap.Native.Description.Width : 1.0f / 1024.0f);
             Material.SetParameter("MaxHeight", MaxHeight);
             Material.SetParameter("TerrainSize", TerrainSize);
-            Material.SetParameter("TerrainOrigin", new Vector2(Transform.Position.X, Transform.Position.Z));
+            Material.SetParameter("TerrainOrigin", new Vector2(Transform.WorldPosition.X, Transform.WorldPosition.Z));
 
             Material.SetParameter("LayerTiling", _layerTiling);
 
@@ -407,7 +392,7 @@ namespace Freefall.Components
             // Indices[1]: control params
             commandList.SetComputeRoot32BitConstant(0, _counterUAVs[frameIndex], 4);         // Indices[1].x
             commandList.SetComputeRoot32BitConstant(0, (uint)MaxDepth, 5);                   // Indices[1].y
-            commandList.SetComputeRoot32BitConstant(0, (uint)_transformSlot, 6);             // Indices[1].z
+            commandList.SetComputeRoot32BitConstant(0, (uint)Transform.TransformSlot, 6);    // Indices[1].z
             commandList.SetComputeRoot32BitConstant(0, (uint)(Material?.MaterialID ?? 0), 7);// Indices[1].w
             
             // Indices[2]: more control params
@@ -594,12 +579,18 @@ namespace Freefall.Components
                 constants.NearPlane = Camera.Main!.NearPlane;
             }
 
-            unsafe
+            try
             {
-                void* pData;
-                _frustumConstantBuffers[frameIndex].Map(0, null, &pData);
-                *(GPUCuller.FrustumConstants*)pData = constants;
-                _frustumConstantBuffers[frameIndex].Unmap(0);
+                unsafe
+                {
+                    void* pData;
+                    _frustumConstantBuffers[frameIndex].Map(0, null, &pData);
+                    *(GPUCuller.FrustumConstants*)pData = constants;
+                    _frustumConstantBuffers[frameIndex].Unmap(0);
+                }
+            }
+            catch (Exception ex)
+            {
             }
         }
 

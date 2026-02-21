@@ -4,10 +4,9 @@ using Vortice.XAudio2;
 
 namespace Freefall.Assets
 {
-    [AssetReader(".wav")]
-    public class AudioClipReader : AssetReader<AudioClip>
+    public class AudioClipReader
     {
-        public override AudioClip Import(string filepath)
+        public AudioClip Load(string filepath)
         {
             var audioClip = new AudioClip();
             var stream = new SoundStream(File.OpenRead(filepath));
