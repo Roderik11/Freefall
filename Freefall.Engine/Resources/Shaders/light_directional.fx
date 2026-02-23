@@ -142,7 +142,11 @@ float4 PS(VSOutput input) : SV_Target
     float2 shadowUV = float2(0,0);
     float sampledDepth = 0;
     
-    if (ShadowMapIdx > 0) // Only sample if shadow map is bound
+    // Beyond the last cascade far distance — no shadow (fully lit)
+    if (viewDepth > Cascades[3].y)
+        shadowFactor = 1.0f;
+    else if (ShadowMapIdx > 0) // Only sample if shadow map is bound
+
     {
         // Transform world position to light space for current cascade
         lightSpacePos = mul(worldPos, LightSpaces[cascadeIndex]);
