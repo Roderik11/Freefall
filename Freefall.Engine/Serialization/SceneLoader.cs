@@ -11,7 +11,8 @@ namespace Freefall.Serialization
 {
     /// <summary>
     /// Loads .scene YAML files in apex-style multi-document format.
-    /// Uses YAMLSerializer.DeserializeAll for parsing.
+    /// Two-phase loading: parse with deferred asset stubs, then resolve afterward.
+    /// This prevents nested LoadByGuid calls from corrupting the YAML parser state.
     /// </summary>
     public class SceneLoader
     {
@@ -38,7 +39,20 @@ namespace Freefall.Serialization
                 bytes = trimmed;
             }
 
-            var objects = _serializer.DeserializeAll(bytes);
+            // ── Phase 1: Parse with deferred asset loading ──
+            // Asset fields get stub objects (Guid set, nothing else).
+            // No LoadByGuid calls during parse = no parser corruption.
+            _serializer.DeferAssetLoading = true;
+            List<object> objects;
+            try
+            {
+                objects = _serializer.DeserializeAll(bytes);
+            }
+            finally
+            {
+                _serializer.DeferAssetLoading = false;
+            }
+
             var entities = new List<Entity>();
             Entity current = null;
 
@@ -53,7 +67,6 @@ namespace Freefall.Serialization
                 {
                     if (component is Transform t)
                     {
-                        // Transform already exists on entity — copy field values
                         CopyFields(t, current.Transform);
                     }
                     else
@@ -63,9 +76,55 @@ namespace Freefall.Serialization
                 }
             }
 
+            // ── Phase 2: Resolve deferred Asset stubs ──
+            // Now that parsing is done, resolve every Asset stub via LoadByGuid.
+            if (Engine.Assets != null)
+                ResolveAssetStubs(entities);
+
             Debug.Log($"[SceneLoader] Loaded {entities.Count} entities");
 
             return entities;
+        }
+
+        /// <summary>
+        /// Walk all components on all entities. For each Asset-typed field
+        /// that holds a stub (has Guid but not loaded), resolve via LoadByGuid.
+        /// </summary>
+        private static void ResolveAssetStubs(List<Entity> entities)
+        {
+            foreach (var entity in entities)
+            {
+                foreach (var component in entity.Components)
+                {
+                    var mapping = Reflector.GetMapping(component.GetType());
+                    foreach (var field in mapping)
+                    {
+                        if (!typeof(Asset).IsAssignableFrom(field.Type))
+                            continue;
+
+                        var stub = field.GetValue(component) as Asset;
+                        if (stub == null || string.IsNullOrEmpty(stub.Guid))
+                            continue;
+
+                        try
+                        {
+                            var loadMethod = typeof(AssetManager)
+                                .GetMethod("LoadByGuid")!
+                                .MakeGenericMethod(field.Type);
+                            var loaded = loadMethod.Invoke(
+                                Engine.Assets, new object[] { stub.Guid });
+                            if (loaded != null)
+                                field.SetValue(component, loaded);
+                        }
+                        catch (Exception ex)
+                        {
+                            Debug.LogWarning("SceneLoader",
+                                $"Stub resolve failed: {field.Type.Name} " +
+                                $"'{stub.Guid}' on {component.GetType().Name}: {ex.Message}");
+                        }
+                    }
+                }
+            }
         }
 
         private static void CopyFields(object source, object target)

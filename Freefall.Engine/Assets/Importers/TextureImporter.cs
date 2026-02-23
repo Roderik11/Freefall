@@ -1,6 +1,7 @@
 using System;
 using System.Diagnostics;
 using System.IO;
+using System.Linq;
 using Freefall.Assets.Packers;
 
 namespace Freefall.Assets.Importers
@@ -17,6 +18,7 @@ namespace Freefall.Assets.Importers
         BC4_UNORM,
         BC3_UNORM,
         BC1_UNORM,
+        BC1_UNORM_SRGB,
         R8G8B8A8_UNORM,
     }
 
@@ -37,11 +39,43 @@ namespace Freefall.Assets.Importers
         public bool GenerateMips = true;
         public bool sRGB = true;
 
+        // Suffixes that indicate linear (non-color) data maps
+        private static readonly string[] LinearSuffixes = {
+            "_Nor", "_Normal", "_Nrm",
+            "_Spec", "_Specular", "_SpecGloss",
+            "_Roughness", "_Rough",
+            "_Metal", "_Metallic", "_MetallicGloss",
+            "_AO", "_Aoc", "_Occlusion",
+            "_Depth", "_Height", "_Parallax",
+            "_Emissive", "_Emission",
+            "_DetailMask", "_DetailNormal", "_Mask",
+            "_BumpMap", "_Bump",
+            "_ShadowOffset", "_TranslucencyMap",
+        };
+
         public ImportResult Import(string filepath)
         {
             var result = new ImportResult();
             var name = Path.GetFileNameWithoutExtension(filepath);
-            var ddsBytes = ConvertToDds(filepath);
+            var ext = Path.GetExtension(filepath).ToLowerInvariant();
+
+            byte[] ddsBytes;
+
+            if (ext == ".dds")
+            {
+                // DDS files are already in the correct format — pass through as-is
+                // This preserves R16 heightmaps, splatmaps, etc.
+                ddsBytes = File.ReadAllBytes(filepath);
+            }
+            else
+            {
+                // Auto-detect: data maps (normals, roughness, etc.) should be linear, not sRGB
+                bool isLinearData = LinearSuffixes.Any(s =>
+                    name.EndsWith(s, StringComparison.OrdinalIgnoreCase));
+                sRGB = !isLinearData;
+
+                ddsBytes = ConvertToDds(filepath);
+            }
 
             result.Artifacts.Add(new ImportArtifact
             {
@@ -81,6 +115,18 @@ namespace Freefall.Assets.Importers
                 }
 
                 // Build texconv arguments
+                // When sRGB is enabled, use the _SRGB format variant so the DDS header
+                // tells the GPU to auto-linearize during sampling
+                if (sRGB)
+                {
+                    format = format switch
+                    {
+                        TextureFormat.BC7_UNORM => TextureFormat.BC7_UNORM_SRGB,
+                        TextureFormat.BC1_UNORM => TextureFormat.BC1_UNORM_SRGB,
+                        _ => format
+                    };
+                }
+
                 var args = $"-y -gpu 0 -f {format}";
 
                 if (GenerateMips)

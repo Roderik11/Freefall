@@ -24,13 +24,24 @@ namespace Freefall.Assets
             public const string DefaultDiffuse  = "00000000000000000000000000000003";
             public const string DefaultNormal   = "00000000000000000000000000000004";
             public const string DefaultSpecular = "00000000000000000000000000000005";
+            public const string Black           = "00000000000000000000000000000006";
+
+            public const string WhiteArray      = "00000000000000000000000000000007";
+            public const string FlatNormalArray = "00000000000000000000000000000008";
+            public const string BlackArray      = "00000000000000000000000000000009";
             public const string DefaultEffect   = "00000000000000000000000000000010";
+            public const string TerrainEffect   = "00000000000000000000000000000011";
             public const string DefaultMaterial = "00000000000000000000000000000020";
         }
 
         // --- Utility textures (procedural) ---
+        public static Texture Black { get; private set; }
         public static Texture White { get; private set; }
         public static Texture FlatNormal { get; private set; }
+
+        public static Texture BlackArray { get; private set; }
+        public static Texture WhiteArray { get; private set; }
+        public static Texture FlatNormalArray { get; private set; }
 
         // --- Default textures (loaded from DDS) ---
         public static Texture DefaultDiffuse { get; private set; }
@@ -39,6 +50,7 @@ namespace Freefall.Assets
 
         // --- Default effect + material ---
         public static Effect DefaultEffect { get; private set; }
+        public static Effect TerrainEffect { get; private set; }
         public static Material DefaultMaterial { get; private set; }
 
         public static void Initialize(GraphicsDevice device)
@@ -50,6 +62,15 @@ namespace Freefall.Assets
             for (int i = 0; i < white.Length; i++) white[i] = 255;
             White = Texture.CreateFromData(device, 4, 4, white, Format.R8G8B8A8_UNorm);
             White.Name = "White";
+
+            // Solid black
+            byte[] black = new byte[4 * 4 * 4];
+            for (int i = 0; i < black.Length; i += 4)
+            {
+                black[i] = 0; black[i + 1] = 0; black[i + 2] = 0; black[i + 3] = 255;
+            }
+            Black = Texture.CreateFromData(device, 4, 4, black, Format.R8G8B8A8_UNorm);
+            Black.Name = "Black";
 
             // Flat normal map (tangent-space up: 128,128,255)
             byte[] normal = new byte[4 * 4 * 4];
@@ -63,6 +84,14 @@ namespace Freefall.Assets
             FlatNormal = Texture.CreateFromData(device, 4, 4, normal, Format.R8G8B8A8_UNorm);
             FlatNormal.Name = "FlatNormal";
 
+            // Arrays
+            WhiteArray = Texture.CreateTexture2DArray(device, new[] { White });
+            WhiteArray.Name = "WhiteArray";
+            BlackArray = Texture.CreateTexture2DArray(device, new[] { Black });
+            BlackArray.Name = "BlackArray";
+            FlatNormalArray = Texture.CreateTexture2DArray(device, new[] { FlatNormal });
+            FlatNormalArray.Name = "FlatNormalArray";
+
             // --- Default textures from DDS ---
             DefaultDiffuse  = new Texture(device, Path.Combine(ResourcesPath, "default_albedo_map.dds"));
             DefaultDiffuse.Name = "DefaultDiffuse";
@@ -73,6 +102,7 @@ namespace Freefall.Assets
 
             // --- Default effect + material ---
             DefaultEffect = new Effect("gbuffer");
+            TerrainEffect = new Effect("gputerrain");
             DefaultMaterial = new Material(DefaultEffect);
             DefaultMaterial.Name = "DefaultMaterial";
             DefaultMaterial.SetTexture("AlbedoTex", DefaultDiffuse);
@@ -87,14 +117,18 @@ namespace Freefall.Assets
         public static void Register(AssetManager manager)
         {
             manager.RegisterAsset(Guids.White, White);
+            manager.RegisterAsset(Guids.Black, Black);
             manager.RegisterAsset(Guids.FlatNormal, FlatNormal);
+            manager.RegisterAsset(Guids.WhiteArray, WhiteArray);
+            manager.RegisterAsset(Guids.BlackArray, BlackArray);
+            manager.RegisterAsset(Guids.FlatNormalArray, FlatNormalArray);
+
             manager.RegisterAsset(Guids.DefaultDiffuse, DefaultDiffuse);
             manager.RegisterAsset(Guids.DefaultNormal, DefaultNormal);
             manager.RegisterAsset(Guids.DefaultSpecular, DefaultSpecular);
             manager.RegisterAsset(Guids.DefaultEffect, DefaultEffect);
+            manager.RegisterAsset(Guids.TerrainEffect, TerrainEffect);
             manager.RegisterAsset(Guids.DefaultMaterial, DefaultMaterial);
-
-            Debug.Log("[InternalAssets] Registered 7 internal assets with stable GUIDs");
         }
     }
 }

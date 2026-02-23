@@ -19,6 +19,7 @@ namespace Freefall.Base
         public Transform? Transform => Entity?.Transform;
 
         [DefaultValue(true)]
+        [Browsable(false)]
         public bool Enabled { get; set; } = true;
 
         internal void WakeUp()

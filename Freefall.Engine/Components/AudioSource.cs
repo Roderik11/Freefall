@@ -1,3 +1,4 @@
+using System;
 using Vortice.Multimedia;
 using Vortice.XAudio2;
 using System.Numerics;
@@ -52,15 +53,39 @@ namespace Freefall.Components
         private void Play(AudioClip clip, bool loop)
         {
             if (clip == null) return;
+            if (Engine.AudioDevice == null) return;
+
+            // Resolve deferred stub: has GUID but no audio data loaded yet
+            if (clip.WaveFormat == null && !string.IsNullOrEmpty(clip.Guid) && Engine.Assets != null)
+            {
+                var loaded = Engine.Assets.LoadByGuid<AudioClip>(clip.Guid);
+                if (loaded != null)
+                {
+                    AudioClip = loaded;
+                    clip = loaded;
+                }
+                else return;
+            }
+            if (clip.WaveFormat == null) return;
 
             if (sourceVoice == null || currentFormat != clip.WaveFormat)
             {
                 sourceVoice?.BufferEnd -= SourceVoice_BufferEnd;
                 sourceVoice?.DestroyVoice();
                 sourceVoice?.Dispose();
+                sourceVoice = null;
 
-                sourceVoice = Engine.AudioDevice.CreateSourceVoice(clip.WaveFormat, true);
-                if (loop) sourceVoice.BufferEnd += SourceVoice_BufferEnd;
+                if (clip.WaveFormat == null) return;
+
+                try
+                {
+                    sourceVoice = Engine.AudioDevice.CreateSourceVoice(clip.WaveFormat, true);
+                    if (loop) sourceVoice.BufferEnd += SourceVoice_BufferEnd;
+                }
+                catch
+                {
+                    return;
+                }
 
                 currentFormat = clip.WaveFormat;
             }

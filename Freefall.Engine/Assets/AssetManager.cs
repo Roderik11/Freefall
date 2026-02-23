@@ -227,6 +227,7 @@ namespace Freefall.Assets
             var assetType = typeof(T);
             T asset = null;
 
+
             // Load via cache-based loader if available
             if (Loaders.TryGetValue(assetType, out var loader))
             {
@@ -238,13 +239,17 @@ namespace Freefall.Assets
                         ? Path.GetFileNameWithoutExtension(sourcePath)
                         : guid;
 
+
                     asset = (T)loader.LoadFromCache(cachePath, name, this);
+
                 }
                 catch (Exception ex)
                 {
+
                     Debug.LogWarning("AssetManager", $"Failed to load GUID '{guid}': {ex.Message}");
                 }
             }
+
 
             if (asset != null)
             {

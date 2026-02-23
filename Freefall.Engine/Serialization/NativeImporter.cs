@@ -114,30 +114,25 @@ namespace Freefall.Serialization
         /// </summary>
         public static Asset LoadFromString(string yaml)
         {
-            Serializer.DeferAssetLoading = true;
-            try
+            // Peek at the type tag to find a custom serializer
+            var typeName = PeekTypeName(yaml);
+            if (typeName != null)
             {
-                // Peek at the type tag to find a custom serializer
-                var typeName = PeekTypeName(yaml);
-                if (typeName != null)
+                var type = ResolveAssetType(typeName);
+                if (type != null)
                 {
-                    var type = ResolveAssetType(typeName);
-                    if (type != null)
-                    {
-                        var customSerializer = FindSerializer(type);
-                        if (customSerializer != null)
-                            return customSerializer.Deserialize(yaml);
+                    var customSerializer = FindSerializer(type);
+                    if (customSerializer != null)
+                        return customSerializer.Deserialize(yaml);
 
-                        // No custom serializer — reformat !Tag YAML into wrapped format
-                        // that YAMLSerializer.Deserialize expects: "TypeName:\n  fields"
-                        var wrapped = ReformatTagYaml(yaml, type.Name);
-                        return Serializer.Deserialize(wrapped) as Asset;
-                    }
+                    // No custom serializer — reformat !Tag YAML into wrapped format
+                    // that YAMLSerializer.Deserialize expects: "TypeName:\n  fields"
+                    var wrapped = ReformatTagYaml(yaml, type.Name);
+                    return Serializer.Deserialize(wrapped) as Asset;
                 }
-
-                return Serializer.Deserialize(yaml) as Asset;
             }
-            finally { Serializer.DeferAssetLoading = false; }
+
+            return Serializer.Deserialize(yaml) as Asset;
         }
 
         /// <summary>

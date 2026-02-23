@@ -1,4 +1,3 @@
-using System;
 using System.IO;
 using Freefall.Assets;
 using Freefall.Assets.Packers;
@@ -31,21 +30,11 @@ namespace Freefall.Assets.Loaders
             using (var stream = File.OpenRead(cachePath))
                 ddsData = _packer.Read(stream);
 
-            // ParseDDS expects a file path — write bytes to temp for now.
-            // TODO: Add Texture.ParseDDSFromBytes(byte[]) to avoid temp file.
-            var tempPath = Path.Combine(Path.GetTempPath(), $"freefall_tex_{Guid.NewGuid():N}.dds");
-            try
-            {
-                File.WriteAllBytes(tempPath, ddsData.Bytes);
-                var cpuData = Texture.ParseFromFile(Engine.Device, tempPath);
-                var texture = Texture.CreateAsync(Engine.Device, cpuData);
-                texture.Name = name;
-                return texture;
-            }
-            finally
-            {
-                try { File.Delete(tempPath); } catch { }
-            }
+            var cpuData = Texture.ParseDDSFromBytes(ddsData.Bytes);
+            cpuData.Path = name;
+            var texture = Texture.CreateAsync(Engine.Device, cpuData);
+            texture.Name = name;
+            return texture;
         }
     }
 }

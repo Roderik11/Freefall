@@ -88,7 +88,7 @@ namespace Freefall.Assets.Serializers
                     var key = line.Substring(0, colonIdx).Trim();
                     var val = line.Substring(colonIdx + 1).Trim();
 
-                    if (key == "Effect")
+                    if (key == "Effect" || key == "EffectRef")
                         def.EffectRef = ParseRef(val);
                     else if (key != "Name" && key != "Textures" && key != "Parameters" && !string.IsNullOrEmpty(val))
                     {

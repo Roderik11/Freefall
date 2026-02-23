@@ -10,6 +10,8 @@ namespace Freefall.Base
         private static readonly List<Entity> _pendingAdditions = [];
         private static readonly Lock _lock = new();
 
+        public static IReadOnlyList<Entity> Entities => _entities;
+
         public static void AddEntity(Entity entity)
         {
             lock (_lock)

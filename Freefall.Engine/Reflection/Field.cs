@@ -38,7 +38,10 @@ namespace Freefall.Reflection
             if (_field != null)
                 CanWrite = !_field.IsInitOnly;
 
-            if (_field != null && (_field.IsInitOnly || _field.IsLiteral))
+            if (_field != null && (_field.IsInitOnly || _field.IsLiteral || _field.IsStatic))
+                Ignored = true;
+
+            if (_prop != null && (_prop.GetGetMethod(true)?.IsStatic == true))
                 Ignored = true;
 
             var nonserialized = GetAttribute<NonSerializedAttribute>();

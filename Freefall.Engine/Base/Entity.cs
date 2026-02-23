@@ -8,10 +8,12 @@ namespace Freefall.Base
     public class Entity
     {
         private readonly List<Component> _components = new List<Component>();
-        internal IReadOnlyList<Component> Components => _components;
+        public IReadOnlyList<Component> Components => _components;
 
         public string Name { get; set; } = "Entity";
         public Transform Transform { get; private set; }
+        public bool Hidden { get; set; }
+        public bool Expanded { get; set; }
 
         public Entity() : this("Entity") { }
 

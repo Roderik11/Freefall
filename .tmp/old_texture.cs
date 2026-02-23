@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.IO;
 using Vortice.Direct3D12;
@@ -17,7 +17,6 @@ namespace Freefall.Graphics
         public uint BindlessIndex { get; protected set; }
         public GpuDescriptorHandle SrvHandle { get; protected set; }
         public CpuDescriptorHandle SrvCpuHandle { get; protected set; }
-
 
         public Texture(GraphicsDevice device, string path)
         {
@@ -67,30 +66,9 @@ namespace Freefall.Graphics
              // Ensure all source textures have been uploaded before GPU-to-GPU copy
              StreamingManager.Instance?.Flush();
              
+             // Real implementation: Create Texture2DArray resource, copy slices.
              var first = textures[0];
-             var refDesc = first.Native.Description;
-
-             // Check if all textures share the same format
-             bool formatsMatch = true;
-             for (int i = 1; i < textures.Count; i++)
-             {
-                 if (textures[i].Native.Description.Format != refDesc.Format)
-                 {
-                     formatsMatch = false;
-                     break;
-                 }
-             }
-
-             if (formatsMatch)
-                 return CreateTexture2DArrayCopy(device, textures, refDesc);
-             else
-                 return CreateTexture2DArrayCompute(device, textures, refDesc);
-        }
-
-        /// <summary>Fast path: all textures share the same format. Direct GPU copy.</summary>
-        private static Texture CreateTexture2DArrayCopy(GraphicsDevice device, IList<Texture> textures, ResourceDescription refDesc)
-        {
-             var desc = refDesc;
+             var desc = first.Native.Description;
              desc.DepthOrArraySize = (ushort)textures.Count;
              
              var arr = new Texture();
@@ -110,12 +88,15 @@ namespace Freefall.Graphics
              };
              device.NativeDevice.CreateShaderResourceView(arr._resource, srvDesc, arr.SrvCpuHandle);
              
+             // Copy logic (GPU-to-GPU) on the direct queue (needs barriers)
+             // Source textures are now guaranteed uploaded by Flush() above.
              using (var cmd = device.NativeDevice.CreateCommandAllocator(CommandListType.Direct))
              using (var list = device.NativeDevice.CreateCommandList<ID3D12GraphicsCommandList>(0, CommandListType.Direct, cmd))
              {
                  for(int i=0; i<textures.Count; ++i)
                  {
                      var src = textures[i];
+                     // Common ÔåÆ CopySource (explicit transition)
                      list.ResourceBarrierTransition(src.Native, ResourceStates.Common, ResourceStates.CopySource);
                      
                      for(int mip=0; mip<desc.MipLevels; ++mip)
@@ -125,157 +106,14 @@ namespace Freefall.Graphics
                          list.CopyTextureRegion(dstLoc, 0, 0, 0, srcLoc, null);
                      }
                      
+                     // Back to Common so the texture remains usable
                      list.ResourceBarrierTransition(src.Native, ResourceStates.CopySource, ResourceStates.Common);
                  }
                  
                  list.ResourceBarrierTransition(arr.Native, ResourceStates.CopyDest, ResourceStates.PixelShaderResource);
                  list.Close();
-                 device.SubmitAndWait(list);
+                 device.SubmitAndWait(list); // Direct queue - barriers require direct command list
              }
-             arr.MarkReady();
-             return arr;
-        }
-
-        /// <summary>
-        /// Mixed-format path: source textures have different compression formats.
-        /// Creates an R8G8B8A8 array and uses a compute shader to sample each source
-        /// (GPU auto-decompresses any block format) and write to the array slice.
-        /// </summary>
-        private static Texture CreateTexture2DArrayCompute(GraphicsDevice device, IList<Texture> textures, ResourceDescription refDesc)
-        {
-             Debug.Log($"[Texture] CreateTexture2DArray: mixed formats detected, using compute copy for {textures.Count} textures");
-
-             int width = (int)refDesc.Width;
-             int height = (int)refDesc.Height;
-             int mipCount = refDesc.MipLevels;
-             int arraySize = textures.Count;
-
-             // Determine output format: use non-sRGB RGBA for UAV compatibility.
-             // The SRV will be created with the sRGB variant if any source is sRGB.
-             bool anySrgb = false;
-             for (int i = 0; i < textures.Count; i++)
-             {
-                 var fmt = textures[i].Native.Description.Format;
-                 if (fmt == Format.BC1_UNorm_SRgb || fmt == Format.BC7_UNorm_SRgb || 
-                     fmt == Format.R8G8B8A8_UNorm_SRgb || fmt == Format.B8G8R8A8_UNorm_SRgb)
-                     anySrgb = true;
-             }
-             var uavFormat = Format.R8G8B8A8_UNorm;
-             var srvFormat = anySrgb ? Format.R8G8B8A8_UNorm_SRgb : Format.R8G8B8A8_UNorm;
-
-             // Create the output texture array
-             var arrayDesc = ResourceDescription.Texture2D(uavFormat, (uint)width, (uint)height,
-                 (ushort)arraySize, (ushort)mipCount, 1, 0, ResourceFlags.AllowUnorderedAccess);
-
-             var arr = new Texture();
-             arr._resource = device.NativeDevice.CreateCommittedResource(
-                 new HeapProperties(HeapType.Default), HeapFlags.None, arrayDesc, ResourceStates.UnorderedAccess, null);
-
-             arr.BindlessIndex = device.AllocateBindlessIndex();
-             arr.SrvCpuHandle = device.GetCpuHandle(arr.BindlessIndex);
-             arr.SrvHandle = device.GetGpuHandle(arr.BindlessIndex);
-
-             var srvDesc = new ShaderResourceViewDescription
-             {
-                 Format = srvFormat,
-                 ViewDimension = ShaderResourceViewDimension.Texture2DArray,
-                 Shader4ComponentMapping = ShaderComponentMapping.Default,
-                 Texture2DArray = new Texture2DArrayShaderResourceView { MipLevels = (uint)mipCount, ArraySize = (uint)arraySize, FirstArraySlice = 0 }
-             };
-             device.NativeDevice.CreateShaderResourceView(arr._resource, srvDesc, arr.SrvCpuHandle);
-
-             // Compile compute shader inline — SM6.6 bindless, push constants at b3
-             var shaderSource = @"
-cbuffer PushConstants : register(b3) {
-    uint SliceIndex;
-    uint MipWidth;
-    uint MipHeight;
-    uint InputSrvIdx;
-    uint OutputUavIdx;
-};
-
-[numthreads(8, 8, 1)]
-void CSCopySlice(uint3 id : SV_DispatchThreadID) {
-    if (id.x >= MipWidth || id.y >= MipHeight) return;
-    Texture2D<float4> input = ResourceDescriptorHeap[InputSrvIdx];
-    RWTexture2DArray<float4> output = ResourceDescriptorHeap[OutputUavIdx];
-    output[uint3(id.xy, SliceIndex)] = input[id.xy];
-}
-";
-             var shader = new Shader(shaderSource, "CSCopySlice", "cs_6_6");
-             var pso = device.CreateComputePipelineState(shader.Bytecode);
-             shader.Dispose();
-
-             using (var cmd = device.NativeDevice.CreateCommandAllocator(CommandListType.Direct))
-             using (var list = device.NativeDevice.CreateCommandList<ID3D12GraphicsCommandList>(0, CommandListType.Direct, cmd))
-             {
-                 list.SetComputeRootSignature(device.GlobalRootSignature);
-                 list.SetDescriptorHeaps(1, new[] { device.SrvHeap });
-                 list.SetPipelineState(pso);
-
-                 for (int i = 0; i < textures.Count; i++)
-                 {
-                     var src = textures[i];
-
-                     // Transition source to SRV
-                     list.ResourceBarrierTransition(src.Native, ResourceStates.Common, ResourceStates.NonPixelShaderResource);
-
-                     int mw = width;
-                     int mh = height;
-                     for (int mip = 0; mip < mipCount; mip++)
-                     {
-                         // Allocate per-mip UAV for the target slice+mip
-                         var uavIdx = device.AllocateBindlessIndex();
-                         var uavDesc = new UnorderedAccessViewDescription
-                         {
-                             Format = uavFormat,
-                             ViewDimension = UnorderedAccessViewDimension.Texture2DArray,
-                             Texture2DArray = new Texture2DArrayUnorderedAccessView
-                             {
-                                 MipSlice = (uint)mip,
-                                 FirstArraySlice = (uint)i,
-                                 ArraySize = 1
-                             }
-                         };
-                         device.NativeDevice.CreateUnorderedAccessView(arr._resource, null, uavDesc, device.GetCpuHandle(uavIdx));
-
-                         // Per-mip SRV for source texture
-                         var srcSrvIdx = device.AllocateBindlessIndex();
-                         var srcSrvDesc = new ShaderResourceViewDescription
-                         {
-                             Format = src.Native.Description.Format,
-                             ViewDimension = ShaderResourceViewDimension.Texture2D,
-                             Shader4ComponentMapping = ShaderComponentMapping.Default,
-                             Texture2D = new Texture2DShaderResourceView { MostDetailedMip = (uint)mip, MipLevels = 1 }
-                         };
-                         device.NativeDevice.CreateShaderResourceView(src.Native, srcSrvDesc, device.GetCpuHandle(srcSrvIdx));
-
-                         // Push constants: use root constants
-                         list.SetComputeRoot32BitConstant(0, 0u, 0);            // SliceIndex = 0 (UAV view already targets slice i)
-                         list.SetComputeRoot32BitConstant(0, (uint)mw, 1);      // MipWidth
-                         list.SetComputeRoot32BitConstant(0, (uint)mh, 2);      // MipHeight
-                         list.SetComputeRoot32BitConstant(0, srcSrvIdx, 3);     // InputSrvIdx
-                         list.SetComputeRoot32BitConstant(0, uavIdx, 4);        // OutputUavIdx
-
-                         uint gx = (uint)((mw + 7) / 8);
-                         uint gy = (uint)((mh + 7) / 8);
-                         list.Dispatch(gx, gy, 1);
-
-                         list.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(null)));
-
-                         mw = Math.Max(1, mw / 2);
-                         mh = Math.Max(1, mh / 2);
-                     }
-
-                     list.ResourceBarrierTransition(src.Native, ResourceStates.NonPixelShaderResource, ResourceStates.Common);
-                 }
-
-                 list.ResourceBarrierTransition(arr._resource, ResourceStates.UnorderedAccess, ResourceStates.PixelShaderResource);
-                 list.Close();
-                 device.SubmitAndWait(list);
-             }
-
-             pso.Dispose();
              arr.MarkReady();
              return arr;
         }
@@ -302,7 +140,7 @@ void CSCopySlice(uint3 id : SV_DispatchThreadID) {
             // Detect format by bytes per pixel
             if (bytesPerPixel >= 4)
             {
-                // R32_Float or R8G8B8A8 — treat as float
+                // R32_Float or R8G8B8A8 ÔÇö treat as float
                 for (int y = 0; y < height && dataOffset + 3 < bytes.Length; y++)
                 {
                     for (int x = 0; x < width && dataOffset + 3 < bytes.Length; x++)
@@ -314,7 +152,7 @@ void CSCopySlice(uint3 id : SV_DispatchThreadID) {
             }
             else if (bytesPerPixel >= 2)
             {
-                // R16_Float (half-float) — convert via Half, matching Apex To16BitField
+                // R16_Float (half-float) ÔÇö convert via Half, matching Apex To16BitField
                 for (int y = 0; y < height && dataOffset + 1 < bytes.Length; y++)
                 {
                     for (int x = 0; x < width && dataOffset + 1 < bytes.Length; x++)
@@ -342,7 +180,7 @@ void CSCopySlice(uint3 id : SV_DispatchThreadID) {
             return field;
         }
 
-        public Texture() { }
+        protected Texture() { }
 
         public static Texture CreateAsync(GraphicsDevice device, CpuTextureData cpuData)
         {
@@ -508,20 +346,13 @@ void CSCopySlice(uint3 id : SV_DispatchThreadID) {
          private static Freefall.Assets.CpuTextureData ParseDDS(string filePath)
         {
             var bytes = File.ReadAllBytes(filePath);
-            var result = ParseDDSFromBytes(bytes);
-            result.Path = filePath;
-            return result;
-        }
-
-        public static Freefall.Assets.CpuTextureData ParseDDSFromBytes(byte[] bytes)
-        {
             unsafe
             {
                 fixed (byte* pBytes = bytes)
                 {
                     DDSTextureLoader.Parse((IntPtr)pBytes, bytes.Length, out var format, out int width, out int height, out int depth, out int mipLevels, out int arraySize, out bool isCubeMap, out IntPtr dataPtr, out int dataSize);
 
-                    // Build mip layouts
+                     // Build mip layouts
                     var mips = new Freefall.Assets.MipLayout[mipLevels];
                     bool compressed = IsCompressedStatic(format);
                     int offset = 0;
@@ -551,6 +382,7 @@ void CSCopySlice(uint3 id : SV_DispatchThreadID) {
 
                     return new Freefall.Assets.CpuTextureData
                     {
+                        Path = filePath,
                         PixelData = pixelData,
                         Width = width,
                         Height = height,

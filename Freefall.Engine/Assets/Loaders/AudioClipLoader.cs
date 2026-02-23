@@ -24,20 +24,12 @@ namespace Freefall.Assets.Loaders
             using (var stream = File.OpenRead(cachePath))
                 clipData = _packer.Read(stream);
 
-            // Write to temp file with correct extension for SoundStream parsing
-            var tempPath = Path.Combine(Path.GetTempPath(),
-                $"freefall_audio_{System.Guid.NewGuid():N}{clipData.Extension}");
-            try
+            var reader = new AudioClipReader();
+            using (var ms = new MemoryStream(clipData.Bytes))
             {
-                File.WriteAllBytes(tempPath, clipData.Bytes);
-                var reader = new AudioClipReader();
-                var clip = reader.Load(tempPath);
+                var clip = reader.Load(ms);
                 clip.Name = name;
                 return clip;
-            }
-            finally
-            {
-                try { File.Delete(tempPath); } catch { }
             }
         }
     }

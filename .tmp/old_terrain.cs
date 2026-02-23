@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Numerics;
@@ -20,7 +20,7 @@ namespace Freefall.Components
         public static bool ComputeReady { get; set; }
         public static string ComputeError { get; set; } = "";
 
-        // ───── Public Parameters ──────────────────────────────────────────
+        // ÔöÇÔöÇÔöÇÔöÇÔöÇ Public Parameters ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
         public Texture Heightmap = null!;
         public Material Material = null!;
         public Vector2 TerrainSize = new Vector2(1700, 1700);
@@ -41,17 +41,17 @@ namespace Freefall.Components
 
         private Vector4[] _layerTiling = new Vector4[32];
 
-        // ───── Internal State ─────────────────────────────────────────────
+        // ÔöÇÔöÇÔöÇÔöÇÔöÇ Internal State ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
         private const int FrameCount = 3;
 
-        // Compute pipeline — three-pass restricted quadtree + one-time mip pyramid builder
+        // Compute pipeline ÔÇö three-pass restricted quadtree + one-time mip pyramid builder
         private ID3D12PipelineState _buildMinMaxMipPSO = null!;
         private ID3D12PipelineState _markSplitsPSO = null!;
         private ID3D12PipelineState _emitLeavesPSO = null!;
         private ID3D12PipelineState _buildDrawArgsPSO = null!;
         private bool _computeInitialized;
 
-        // GPU output buffers — per-frame
+        // GPU output buffers ÔÇö per-frame
         private ID3D12Resource[] _descriptorBuffers = new ID3D12Resource[FrameCount];
         private ID3D12Resource[] _sphereBuffers = new ID3D12Resource[FrameCount];
         private ID3D12Resource[] _subbatchIdBuffers = new ID3D12Resource[FrameCount];
@@ -105,7 +105,7 @@ namespace Freefall.Components
         private bool[] _buffersInSRV = new bool[FrameCount]; // track per-frame state
         private bool[] _indirectArgsInArgState = new bool[FrameCount]; // indirect args in IndirectArgument state
 
-        // ───── Lifecycle ──────────────────────────────────────────────────
+        // ÔöÇÔöÇÔöÇÔöÇÔöÇ Lifecycle ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
 
         protected override void Awake()
         {
@@ -163,7 +163,7 @@ namespace Freefall.Components
             CommandBuffer.Enqueue(RenderPass.Opaque, (list) => self.DrawTerrain(list, fi));
         }
 
-        // ───── Compute Pipeline ───────────────────────────────────────────
+        // ÔöÇÔöÇÔöÇÔöÇÔöÇ Compute Pipeline ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
 
         private void InitializeCompute()
         {
@@ -349,7 +349,7 @@ namespace Freefall.Components
             commandList.SetComputeRootSignature(device.GlobalRootSignature);
             commandList.SetDescriptorHeaps(1, new[] { device.SrvHeap });
 
-            // ── Upload frustum + Hi-Z constants for compute shader culling ──
+            // ÔöÇÔöÇ Upload frustum + Hi-Z constants for compute shader culling ÔöÇÔöÇ
             UploadFrustumConstants(frameIndex);
             commandList.SetComputeRootConstantBufferView(1, _frustumConstantBuffers[frameIndex].GPUVirtualAddress);
 
@@ -382,7 +382,7 @@ namespace Freefall.Components
             float tanHalfFov = MathF.Tan(vFovRad * 0.5f);
             float screenHeight = camera.Target?.Height ?? 1080f;
 
-            // Push constants (Indices[0..7] = 32 dwords) — shared by all passes
+            // Push constants (Indices[0..7] = 32 dwords) ÔÇö shared by all passes
             // Indices[0]: UAV outputs
             commandList.SetComputeRoot32BitConstant(0, _descriptorUAVs[frameIndex], 0);     // Indices[0].x
             commandList.SetComputeRoot32BitConstant(0, _sphereUAVs[frameIndex], 1);          // Indices[0].y
@@ -430,41 +430,41 @@ namespace Freefall.Components
             commandList.SetComputeRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(screenHeight), 29);        // Indices[7].y
             commandList.SetComputeRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(tanHalfFov), 30);          // Indices[7].z
 
-            // ── One-time: Build height range mip pyramid ──
+            // ÔöÇÔöÇ One-time: Build height range mip pyramid ÔöÇÔöÇ
             if (!_heightRangePyramidBuilt)
             {
                 BuildHeightRangePyramid(commandList);
                 _heightRangePyramidBuilt = true;
 
-                // Mip build overwrites slots 29-30 — restore ScreenHeight/TanHalfFov
+                // Mip build overwrites slots 29-30 ÔÇö restore ScreenHeight/TanHalfFov
                 commandList.SetComputeRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(screenHeight), 29);
                 commandList.SetComputeRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(tanHalfFov), 30);
             }
 
             uint threadGroups = (uint)((_totalNodes + 255) / 256);
 
-            // ── Pass 1: Mark splits + enforce restricted quadtree ──
+            // ÔöÇÔöÇ Pass 1: Mark splits + enforce restricted quadtree ÔöÇÔöÇ
             commandList.SetPipelineState(_markSplitsPSO);
             commandList.Dispatch(threadGroups, 1, 1);
 
-            // UAV barrier — splitFlags must be visible to Pass 2
+            // UAV barrier ÔÇö splitFlags must be visible to Pass 2
             commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(null)));
 
-            // ── Pass 2: Emit leaves with inline frustum + Hi-Z culling ──
+            // ÔöÇÔöÇ Pass 2: Emit leaves with inline frustum + Hi-Z culling ÔöÇÔöÇ
             commandList.SetPipelineState(_emitLeavesPSO);
             commandList.Dispatch(threadGroups, 1, 1);
 
-            // UAV barrier — counter and output buffers must be visible to Pass 3
+            // UAV barrier ÔÇö counter and output buffers must be visible to Pass 3
             commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(null)));
 
-            // ── Pass 3: Build DrawInstanced indirect args from counter ──
+            // ÔöÇÔöÇ Pass 3: Build DrawInstanced indirect args from counter ÔöÇÔöÇ
             // Set slot 29 (MipInputSRV) = mesh index count for CSBuildDrawArgs
             commandList.SetComputeRoot32BitConstant(0, (uint)_patchMesh.IndexCount, 29);  // Indices[7].y = vertex count per instance
             commandList.SetComputeRoot32BitConstant(0, _indirectArgsUAVs[frameIndex], 31); // Indices[7].w = IndirectArgsUAV
             commandList.SetPipelineState(_buildDrawArgsPSO);
             commandList.Dispatch(1, 1, 1);
 
-            // UAV barrier — indirect args must be visible before ExecuteIndirect
+            // UAV barrier ÔÇö indirect args must be visible before ExecuteIndirect
             commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(null)));
 
             // Transition output buffers from UAV to SRV for vertex shader reads
@@ -516,7 +516,7 @@ namespace Freefall.Components
             // Slot 16: Debug mode
             commandList.SetGraphicsRoot32BitConstant(0, (uint)Engine.Settings.DebugVisualizationMode, 16);
 
-            // ExecuteIndirect with DrawInstancedSignature — args written by CSBuildDrawArgs
+            // ExecuteIndirect with DrawInstancedSignature ÔÇö args written by CSBuildDrawArgs
             commandList.ExecuteIndirect(
                 device.DrawInstancedSignature,
                 1,
@@ -541,7 +541,7 @@ namespace Freefall.Components
             // The compute shader works in terrain LOCAL space, but frustum planes
             // are in WORLD space.  Transform planes to local space:
             //   plane_local = (n, d + dot(n, terrainPos))
-            // because x_world = x_local + terrainPos  =>  n·x_local + (d + n·P) = 0
+            // because x_world = x_local + terrainPos  =>  n┬Àx_local + (d + n┬ÀP) = 0
             var terrainPos = Transform.Position;
             for (int i = 0; i < planes.Length; i++)
             {
@@ -559,7 +559,7 @@ namespace Freefall.Components
                 Plane5 = planes[5],
             };
 
-            // Hi-Z occlusion data — VP must also expect local-space input:
+            // Hi-Z occlusion data ÔÇö VP must also expect local-space input:
             //   clip = x_local * Translate(terrainPos) * VP
             var culler = CommandBuffer.Culler;
             if (culler != null && culler.HiZPyramidSRV != 0 && culler.HiZReady && !Engine.Settings.DisableHiZ)
@@ -594,7 +594,7 @@ namespace Freefall.Components
             }
         }
 
-        // ───── Height Range Mip Pyramid ───────────────────────────────────
+        // ÔöÇÔöÇÔöÇÔöÇÔöÇ Height Range Mip Pyramid ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
 
         /// <summary>
         /// Creates the RG32F mip pyramid texture and per-mip descriptors.
@@ -707,10 +707,10 @@ namespace Freefall.Components
                 h = Math.Max(1, h / 2);
             }
 
-            // All mips are now in NonPixelShaderResource — ready for SampleLevel in CSMarkSplits/CSEmitLeaves
+            // All mips are now in NonPixelShaderResource ÔÇö ready for SampleLevel in CSMarkSplits/CSEmitLeaves
         }
 
-        // ───── Helpers ────────────────────────────────────────────────────
+        // ÔöÇÔöÇÔöÇÔöÇÔöÇ Helpers ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
 
         private static int CalculateTotalNodes(int maxDepth)
         {
@@ -759,7 +759,7 @@ namespace Freefall.Components
                 ControlMapsArray = Texture.CreateTexture2DArray(device, controlList);
         }
 
-        // ───── IHeightProvider ────────────────────────────────────────────
+        // ÔöÇÔöÇÔöÇÔöÇÔöÇ IHeightProvider ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
 
         public float GetHeight(Vector3 position)
         {

@@ -291,7 +291,11 @@ namespace Freefall.Serialization
             var fullName = ExpandTypeName(typeName);
             var type = Reflector.GetType(fullName);
 
-            if (type == null) return null;
+            if (type == null)
+            {
+                Debug.LogWarning("YAMLSerializer", $"Deserialize: cannot resolve type '{typeName}' (expanded: '{fullName}')");
+                return null;
+            }
 
             var fields = Reflector.GetMapping(type);
             var instance = Activator.CreateInstance(type);
@@ -304,7 +308,7 @@ namespace Freefall.Serialization
 
         /// <summary>
         /// Deserialize a multi-document YAML stream (e.g. a .scene file).
-        /// Each --- document produces one deserialized object.
+        /// Splits by '---' document markers, then deserializes each block.
         /// </summary>
         public List<object> DeserializeAll(byte[] bytes)
         {
@@ -321,19 +325,20 @@ namespace Freefall.Serialization
                     {
                         try
                         {
-                            var obj = Deserialize(sb.ToString());
+                            // Prefix with document marker so VYaml sees a proper document
+                            var block = "---\n" + sb.ToString();
+                            var obj = Deserialize(block);
                             if (obj != null) results.Add(obj);
                         }
                         catch (Exception ex)
                         {
-                            if (results.Count < 5)
-                                Debug.Log($"[DeserializeAll] Error deserializing block:\n{sb}\nException: {ex}");
+                            Debug.LogWarning("YAMLSerializer", $"DeserializeAll doc #{results.Count}: {ex.GetType().Name}: {ex.Message}");
                         }
                         sb.Clear();
                     }
                     continue;
                 }
-                sb.AppendLine(line);
+                sb.Append(line).Append('\n');
             }
 
             // Flush last block
@@ -341,10 +346,14 @@ namespace Freefall.Serialization
             {
                 try
                 {
-                    var obj = Deserialize(sb.ToString());
+                    var block = "---\n" + sb.ToString();
+                    var obj = Deserialize(block);
                     if (obj != null) results.Add(obj);
                 }
-                catch { }
+                catch (Exception ex)
+                {
+                    Debug.LogWarning("YAMLSerializer", $"DeserializeAll final doc: {ex.GetType().Name}: {ex.Message}");
+                }
             }
 
             return results;
@@ -572,6 +581,7 @@ namespace Freefall.Serialization
                         Debug.LogWarning("YAMLSerializer", $"Failed to load {field.Type.Name} '{guidValue}': {ex.Message}");
                     }
                 }
+
                 return;
             }
 
@@ -627,16 +637,45 @@ namespace Freefall.Serialization
             {
                 if (parser.CurrentEventType == ParseEventType.MappingStart)
                 {
-                    // Untagged mapping — deserialize as the known element type
                     var deserialized = DeserializeNested(ref parser, eltype);
                     if (deserialized != null)
                         newlist!.Add(deserialized);
                 }
                 else if (parser.CurrentEventType == ParseEventType.Scalar)
                 {
+                    var scalarValue = parser.ReadScalarAsString();
+
+                    // Asset reference in a list (e.g. List<Texture> with bare GUIDs)
+                    if (typeof(Asset).IsAssignableFrom(eltype) && !string.IsNullOrEmpty(scalarValue))
+                    {
+                        bool isGuid = scalarValue.Length == 32 &&
+                            System.Text.RegularExpressions.Regex.IsMatch(scalarValue, "^[0-9a-fA-F]+$");
+
+                        if (isGuid)
+                        {
+                            if (DeferAssetLoading)
+                            {
+                                var stub = (Asset)Activator.CreateInstance(eltype);
+                                stub.Guid = scalarValue;
+                                newlist!.Add(stub);
+                            }
+                            else if (Engine.Assets != null)
+                            {
+                                try
+                                {
+                                    var loadMethod = typeof(AssetManager).GetMethod("LoadByGuid")!
+                                        .MakeGenericMethod(eltype);
+                                    var loaded = loadMethod.Invoke(Engine.Assets, new object[] { scalarValue });
+                                    if (loaded != null) newlist!.Add(loaded);
+                                }
+                                catch { }
+                            }
+                            continue;
+                        }
+                    }
+
                     // Polymorphic: scalar is a type name tag, followed by a mapping
-                    var elementTypeName = parser.ReadScalarAsString();
-                    var fullName = ExpandTypeName(elementTypeName);
+                    var fullName = ExpandTypeName(scalarValue);
                     var serializedType = Reflector.GetType(fullName);
 
                     if (serializedType != null && eltype.IsAssignableFrom(serializedType))

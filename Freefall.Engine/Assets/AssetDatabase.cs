@@ -681,5 +681,14 @@ namespace Freefall.Assets
                 basePath += Path.DirectorySeparatorChar;
             return fullPath.Substring(basePath.Length);
         }
+
+        /// <summary>
+        /// Get a thumbnail texture name for an asset.
+        /// Stub: returns InternalAssets.White for now.
+        /// </summary>
+        public static string GetThumbnail(Asset asset)
+        {
+            return InternalAssets.White?.Name ?? "";
+        }
     }
 }

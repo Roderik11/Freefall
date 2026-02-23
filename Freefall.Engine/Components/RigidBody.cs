@@ -208,7 +208,8 @@ namespace Freefall.Components
 
                 case ShapeType.Terrain:
                 {
-                    var terrain = Entity?.GetComponent<Terrain>();
+                    var terrainRenderer = Entity?.GetComponent<TerrainRenderer>();
+                    var terrain = terrainRenderer?.Terrain;
                     if (terrain?.HeightField == null)
                     {
                         Debug.Log("[RigidBody] No Terrain HeightField found");
