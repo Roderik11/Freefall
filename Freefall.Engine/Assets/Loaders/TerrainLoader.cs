@@ -1,17 +1,19 @@
 using System;
 using System.IO;
+using System.Linq;
 using System.Text;
 using Freefall.Assets.Packers;
+using Freefall.Base;
 using Freefall.Graphics;
 using Freefall.Serialization;
 
 namespace Freefall.Assets.Loaders
 {
     /// <summary>
-    /// Loads Terrain assets from cache (.asset files).
+    /// Loads Terrain assets from cache (.terrain / .asset files).
     /// Unpacks AssetDefinitionData (YAML), deserializes the Terrain definition,
     /// then resolves all GUID references (Heightmap, Layer textures, ControlMaps)
-    /// via AssetManager. Finally builds the CPU-side HeightField.
+    /// via AssetManager. Also loads pre-cooked PhysX HeightField if available.
     /// </summary>
     [AssetLoader(typeof(Terrain))]
     public class TerrainLoader : IAssetLoader
@@ -20,14 +22,14 @@ namespace Freefall.Assets.Loaders
 
         public Asset Load(string name, AssetManager manager)
         {
-            var cachePath = AssetDatabase.ResolveCachePath(name);
+            var cachePath = AssetDatabase.ResolveCachePath(name, "AssetDefinitionData");
             if (cachePath == null || !File.Exists(cachePath))
                 throw new FileNotFoundException($"Cache file not found for terrain '{name}'");
 
             return LoadFromCache(cachePath, name, manager);
         }
 
-        public Asset LoadFromCache(string cachePath, string name, AssetManager manager)
+        public Asset LoadFromCache(string cachePath, string name, AssetManager manager, string sourceGuid = null)
         {
             try
             {
@@ -37,7 +39,7 @@ namespace Freefall.Assets.Loaders
                 using (var stream = File.OpenRead(cachePath))
                     defData = _packer.Read(stream);
 
-                // Deserialize YAML → Terrain
+                // Deserialize YAML â†’ Terrain
                 var yaml = Encoding.UTF8.GetString(defData.YamlBytes);
                 Terrain terrain;
                 try
@@ -47,7 +49,7 @@ namespace Freefall.Assets.Loaders
                 catch (Exception ex)
                 {
                     throw new InvalidDataException(
-                        $"Failed to deserialize Terrain from cache: {name} — {ex.GetType().Name}: {ex.Message}", ex);
+                        $"Failed to deserialize Terrain from cache: {name} â€” {ex.GetType().Name}: {ex.Message}", ex);
                 }
 
                 if (terrain == null)
@@ -55,7 +57,7 @@ namespace Freefall.Assets.Loaders
 
                 terrain.Name = name;
 
-                // ── Resolve GUID references ──
+                // â”€â”€ Resolve GUID references â”€â”€
 
                 // Resolve Heightmap
                 if (terrain.Heightmap != null && !string.IsNullOrEmpty(terrain.Heightmap.Guid))
@@ -100,9 +102,13 @@ namespace Freefall.Assets.Loaders
                     }
                 }
 
+                // â”€â”€ Load pre-cooked PhysX HeightField â”€â”€
+                LoadCookedHeightField(terrain, name);
+
                 Debug.Log($"[TerrainLoader] '{name}' loaded: {terrain.Layers?.Count ?? 0} layers, " +
                           $"{terrain.ControlMaps?.Count ?? 0} controlmaps, " +
-                          $"HeightField={terrain.HeightField != null}");
+                          $"HeightField={terrain.HeightField != null}, " +
+                          $"CookedHeightField={terrain.CookedHeightField != null}");
 
                 return terrain;
             }
@@ -110,6 +116,42 @@ namespace Freefall.Assets.Loaders
             {
                 Debug.LogWarning("TerrainLoader", $"FAILED to load '{name}': {ex}");
                 return null;
+            }
+        }
+
+        /// <summary>
+        /// Find a CollisionMeshData subasset by type in the meta, load it, and create
+        /// a PhysX HeightField from the cooked bytes.
+        /// </summary>
+        private static void LoadCookedHeightField(Terrain terrain, string name)
+        {
+            try
+            {
+                var guid = AssetDatabase.ResolveGuidByName(name);
+                if (guid == null) return;
+
+                var meta = AssetDatabase.GetMeta(guid);
+                if (meta == null) return;
+
+                var collisionSub = meta.SubAssets.FirstOrDefault(
+                    s => s.Type == nameof(CollisionMeshData));
+                if (collisionSub == null) return;
+
+                var physxPath = AssetDatabase.ResolveCachePathByGuid(collisionSub.Guid);
+                if (physxPath == null || !File.Exists(physxPath)) return;
+
+                var packer = new CollisionMeshPacker();
+                using var stream = File.OpenRead(physxPath);
+                var cooked = packer.Read(stream);
+
+                var hf = PhysicsWorld.Physics.CreateHeightField(new MemoryStream(cooked.CookedBytes));
+                terrain.SetCookedHeightField(hf);
+
+                Debug.Log($"[TerrainLoader] Pre-cooked HeightField loaded for '{name}'");
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning("TerrainLoader", $"Failed to load cooked HeightField for '{name}': {ex.Message}");
             }
         }
     }

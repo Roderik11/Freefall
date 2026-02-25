@@ -37,7 +37,7 @@ namespace Freefall.Assets.Importers
             boneNames.Clear();
 
             // MATCH APEX EXACTLY: DAE files use 0.01 scale, FBX files use 1.0 scale
-            float scale = filepath.EndsWith(".dae", StringComparison.OrdinalIgnoreCase) ? 0.01f : 1f;
+            float scale = filepath.EndsWith(".dae", StringComparison.OrdinalIgnoreCase) ? 0.01f : 1f; // TEST: was 0.01f
 
             // MATCH APEX EXACTLY - no 'using' statement
             var importer = new AssimpContext();
@@ -315,6 +315,12 @@ namespace Freefall.Assets.Importers
             if (bones.TryGetValue(node.Name, out Assimp.Bone? value))
             {
                 newBone.OffsetMatrix = ToMatrix(value.OffsetMatrix);
+                // DIAG: Check raw Assimp OffsetMatrix vs processed
+                if (skeleton.Count <= 5)
+                {
+                    var raw = value.OffsetMatrix;
+                    Debug.Log($"  DIAG [{node.Name}] Raw Assimp Offset A4={raw.A4:F4} B4={raw.B4:F4} C4={raw.C4:F4} (BindPose.Pos={translate})");
+                }
             }
             else
             {

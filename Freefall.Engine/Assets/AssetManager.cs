@@ -174,22 +174,28 @@ namespace Freefall.Assets
                 // ── Primary path: cache-based loader ──
                 if (Loaders.TryGetValue(assetType, out var loader))
                 {
-                    var name = Path.GetFileNameWithoutExtension(path);
                     try
                     {
-                        asset = (T)loader.Load(name, this);
+                        asset = (T)loader.Load(path, this);
                     }
                     catch (FileNotFoundException)
                     {
                         // Cache miss — fall through to legacy importer
-                        Debug.Log("AssetManager", $"Cache miss for {assetType.Name} '{name}', trying legacy importer");
+                        Debug.Log("AssetManager", $"Cache miss for {assetType.Name} '{path}', trying legacy importer");
                     }
                 }
 
                 // ── Fallback: legacy source-file importer ──
                 if (asset == null)
                 {
-                    asset = LoadLegacy<T>(fullPath, assetType);
+                    try
+                    {
+                        asset = LoadLegacy<T>(fullPath, assetType);
+                    }
+                    catch (Exception ex)
+                    {
+                        Debug.LogWarning("AssetManager", $"Asset not found: {assetType.Name} '{path}' — {ex.Message}");
+                    }
                 }
 
                 if (asset != null)
@@ -240,7 +246,7 @@ namespace Freefall.Assets
                         : guid;
 
 
-                    asset = (T)loader.LoadFromCache(cachePath, name, this);
+                    asset = (T)loader.LoadFromCache(cachePath, name, this, guid);
 
                 }
                 catch (Exception ex)

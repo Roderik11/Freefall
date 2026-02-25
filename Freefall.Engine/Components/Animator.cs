@@ -25,8 +25,7 @@ namespace Freefall.Components
 
         /// <summary>Event fired when an animation event occurs (e.g., footstep, jump).</summary>
         public Action<string> OnAnimationEvent;
-        
-        private bool _debugPrinted = false;
+        private bool _diagDone;
 
         public void Update()
         {
@@ -56,17 +55,8 @@ namespace Freefall.Components
             for (int i = 0; i < count; i++)
                 BlendBone(skeleton[i], ref tempPose, out bones[i]);
             
-            // DEBUG: Print comparison once
-            if (!_debugPrinted && Animation?.Layers.Count > 0)
-            {
-                _debugPrinted = true;
-                Debug.Log("[Animator] Final bone matrix debug (bone 0 Hips):");
-                // After all processing, bones[0] should contain the final matrix
-                // Let's print what we compute for bone 0 now
-                Debug.Log($"  BindPose: Pos={skeleton[0].BindPose.Position}, Rot={skeleton[0].BindPose.Rotation}");
-                Debug.Log($"  OffsetMatrix row0: {skeleton[0].OffsetMatrix.M11}, {skeleton[0].OffsetMatrix.M12}, {skeleton[0].OffsetMatrix.M13}, {skeleton[0].OffsetMatrix.M14}");
-                Debug.Log($"  OffsetMatrix row3 (trans): {skeleton[0].OffsetMatrix.M41}, {skeleton[0].OffsetMatrix.M42}, {skeleton[0].OffsetMatrix.M43}, {skeleton[0].OffsetMatrix.M44}");
-            }
+            // DIAG: capture after blend, before hierarchy
+            Matrix4x4 diagAfterBlend = count > 1 ? bones[1] : default;
 
             // Apply custom bone transforms
             if (OnBoneTransform != null)
@@ -82,12 +72,43 @@ namespace Freefall.Components
                     bones[i] = bones[i] * bones[skeleton[i].Parent];
             }
 
+            // DIAG: capture after hierarchy, before offset
+            Matrix4x4 diagAfterHier = count > 1 ? bones[1] : default;
+
             // Post-hierarchy callback — bones are now in model space
             OnPostHierarchy?.Invoke(skeleton, bones);
 
             // apply bone offset matrix (match Apex exactly)
             for (int i = 0; i < count; i++)
                 bones[i] = Matrix4x4.Transpose(skeleton[i].OffsetMatrix * bones[i]);
+
+            // DIAG: Dump bone data at each stage
+            if (!_diagDone && count > 1 && Animation?.Layers.Count > 0)
+            {
+                _diagDone = true;
+                var lines = new System.Collections.Generic.List<string>();
+                lines.Add($"=== HIPS (bone[1] '{skeleton[1].Name}') ===");
+                lines.Add($"After BlendBone (S*R*T matrix):");
+                lines.Add($"  [{diagAfterBlend.M11:F4},{diagAfterBlend.M12:F4},{diagAfterBlend.M13:F4},{diagAfterBlend.M14:F4}]");
+                lines.Add($"  [{diagAfterBlend.M21:F4},{diagAfterBlend.M22:F4},{diagAfterBlend.M23:F4},{diagAfterBlend.M24:F4}]");
+                lines.Add($"  [{diagAfterBlend.M31:F4},{diagAfterBlend.M32:F4},{diagAfterBlend.M33:F4},{diagAfterBlend.M34:F4}]");
+                lines.Add($"  [{diagAfterBlend.M41:F4},{diagAfterBlend.M42:F4},{diagAfterBlend.M43:F4},{diagAfterBlend.M44:F4}]");
+                lines.Add($"After Hierarchy (bones[1] * bones[0]):");
+                lines.Add($"  [{diagAfterHier.M11:F4},{diagAfterHier.M12:F4},{diagAfterHier.M13:F4},{diagAfterHier.M14:F4}]");
+                lines.Add($"  [{diagAfterHier.M21:F4},{diagAfterHier.M22:F4},{diagAfterHier.M23:F4},{diagAfterHier.M24:F4}]");
+                lines.Add($"  [{diagAfterHier.M31:F4},{diagAfterHier.M32:F4},{diagAfterHier.M33:F4},{diagAfterHier.M34:F4}]");
+                lines.Add($"  [{diagAfterHier.M41:F4},{diagAfterHier.M42:F4},{diagAfterHier.M43:F4},{diagAfterHier.M44:F4}]");
+                lines.Add($"After Offset+Transpose (FINAL):");
+                var fm = bones[1];
+                lines.Add($"  [{fm.M11:F4},{fm.M12:F4},{fm.M13:F4},{fm.M14:F4}]");
+                lines.Add($"  [{fm.M21:F4},{fm.M22:F4},{fm.M23:F4},{fm.M24:F4}]");
+                lines.Add($"  [{fm.M31:F4},{fm.M32:F4},{fm.M33:F4},{fm.M34:F4}]");
+                lines.Add($"  [{fm.M41:F4},{fm.M42:F4},{fm.M43:F4},{fm.M44:F4}]");
+                var bp = skeleton[1].BindPose;
+                lines.Add($"BindPose: P=({bp.Position.X:F6},{bp.Position.Y:F6},{bp.Position.Z:F6})");
+                lines.Add($"ScaleFactor={skeleton[1].ScaleFactor:F6}");
+                System.IO.File.WriteAllLines(@"d:\Projects\2026\Freefall\.tmp\hips.txt", lines);
+            }
         }
 
         private void BlendBone(Bone bone, ref BonePose temp, out Matrix4x4 matrix)

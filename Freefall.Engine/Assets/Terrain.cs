@@ -26,6 +26,18 @@ namespace Freefall.Assets
         public float[,] HeightField { get; private set; }
 
         /// <summary>
+        /// Pre-cooked PhysX height field. Populated during asset loading from the
+        /// collision subasset so that RigidBody.Awake() doesn't need to cook on the main thread.
+        /// </summary>
+        [JsonIgnore]
+        public PhysX.HeightField CookedHeightField { get; private set; }
+
+        /// <summary>
+        /// Set the pre-cooked PhysX height field. Called by TerrainLoader.
+        /// </summary>
+        internal void SetCookedHeightField(PhysX.HeightField hf) => CookedHeightField = hf;
+
+        /// <summary>
         /// Builds the CPU-side height field from the current Heightmap texture.
         /// Must be called after Heightmap is assigned (e.g. during loading).
         /// </summary>

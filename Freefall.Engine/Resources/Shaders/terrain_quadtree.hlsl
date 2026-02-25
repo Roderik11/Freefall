@@ -536,8 +536,14 @@ void CSEmitLeaves(uint3 dtid : SV_DispatchThreadID)
     if (!IsFrustumVisible(sphereCenter, sphereRadius))
         return;
 
-    // Hi-Z occlusion cull: skip patches fully behind solid geometry
-    if (IsTerrainOccluded(sphereCenter, sphereRadius))
+    // Hi-Z occlusion cull: skip patches fully behind solid geometry.
+    // Apply a distance-proportional bias (same as cull_instances.hlsl CSVisibility) to
+    // compensate for camera movement between the previous-frame VP and the current frame.
+    // Without this, flat patches (small heightHalfRange) have almost no depth margin and
+    // get falsely occluded whenever the camera moves even slightly.
+    float4 sphereClip = mul(float4(sphereCenter, 1.0), OcclusionProjection);
+    float biasedRadius = max(sphereRadius, sphereClip.w * 0.01);
+    if (IsTerrainOccluded(sphereCenter, biasedRadius))
         return;
     
     // Atomic append to output — get slot index

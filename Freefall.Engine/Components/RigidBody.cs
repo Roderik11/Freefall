@@ -54,16 +54,22 @@ namespace Freefall.Components
         {
             try
             {
+                // Auto-resolve StaticMesh from sibling StaticMeshRenderer if not set
+                if (StaticMesh == null && Type == ShapeType.StaticMesh)
+                {
+                    var smr = Entity?.GetComponent<StaticMeshRenderer>();
+                    if (smr?.StaticMesh != null)
+                        StaticMesh = smr.StaticMesh;
+                }
+
                 CreateBody();
 
                 Transform.OnChanged += () =>
                 {
                     if (IsStatic && _staticActor != null)
                     {
-                        var matrix = Transform.Matrix;
-                        matrix.M11 = 1;
-                        matrix.M22 = 1;
-                        matrix.M33 = 1;
+                        var matrix = Matrix4x4.CreateFromQuaternion(Transform.Rotation)
+                                   * Matrix4x4.CreateTranslation(Transform.WorldPosition);
 
                         _staticActor.GlobalPose = matrix;
                         _staticActor.GlobalPosePosition = matrix.Translation;
@@ -101,71 +107,17 @@ namespace Freefall.Components
 
                 case ShapeType.StaticMesh:
                 {
-                    // Fast path: use pre-cooked physics mesh from background loading
-                    if (StaticMesh?.CookedTriMesh != null)
-                    {
-                        return new TriangleMeshGeometry(StaticMesh.CookedTriMesh)
-                        {
-                            Scale = new MeshScale(scale, Quaternion.Identity)
-                        };
-                    }
+                    // Use pre-cooked TriangleMesh if available, otherwise cook at runtime
+                    if (StaticMesh?.CookedTriMesh == null)
+                        StaticMesh?.CookPhysicsMesh();
 
-                    // Slow fallback: cook on demand (shouldn't happen during streaming)
-                    var sm = StaticMesh?.Mesh ?? Mesh;
-                    if (sm == null || sm.Positions == null || sm.CpuIndices == null)
+                    if (StaticMesh?.CookedTriMesh == null)
                     {
-                        Debug.Log("[RigidBody] StaticMesh cooking failed — no CPU vertex data retained");
+                        Debug.Log("[RigidBody] StaticMesh cooking failed — no geometry available");
                         return null;
                     }
 
-                    var smHash = sm.GetInstanceId();
-
-                    // Use lowest LOD indices for collision (Apex pattern) 
-                    // Dramatically fewer triangles for physics
-                    if (StaticMesh?.LODs?.Count > 0)
-                        smHash = smHash * 31 + StaticMesh.LODs.Count; // Unique cache key for LOD variant
-
-                    if (!_triMeshCache.TryGetValue(smHash, out var smTriMesh))
-                    {
-                        int[] triangles;
-
-                        // Pick lowest LOD mesh parts for collision
-                        if (StaticMesh?.LODs?.Count > 0)
-                        {
-                            var lowestLod = StaticMesh.LODs[StaticMesh.LODs.Count - 1];
-                            var lodIndices = new List<int>();
-                            foreach (var part in lowestLod.MeshParts)
-                            {
-                                var meshPart = sm.MeshParts[part.MeshPartIndex];
-                                for (int i = 0; i < meshPart.NumIndices; i++)
-                                    lodIndices.Add((int)sm.CpuIndices[meshPart.BaseIndex + i]);
-                            }
-                            triangles = lodIndices.ToArray();
-                        }
-                        else
-                        {
-                            triangles = Array.ConvertAll(sm.CpuIndices, i => (int)i);
-                        }
-
-                        var cooking = PhysicsWorld.Physics.CreateCooking();
-
-                        var desc = new TriangleMeshDesc()
-                        {
-                            Flags = (MeshFlag)0,
-                            Triangles = triangles,
-                            Points = sm.Positions
-                        };
-
-                        var stream = new MemoryStream();
-                        cooking.CookTriangleMesh(desc, stream);
-
-                        stream.Position = 0;
-                        smTriMesh = PhysicsWorld.Physics.CreateTriangleMesh(stream);
-
-                        _triMeshCache.Add(smHash, smTriMesh);
-                    }
-
-                    return new TriangleMeshGeometry(smTriMesh)
+                    return new TriangleMeshGeometry(StaticMesh.CookedTriMesh)
                     {
                         Scale = new MeshScale(scale, Quaternion.Identity)
                     };
@@ -210,7 +162,24 @@ namespace Freefall.Components
                 {
                     var terrainRenderer = Entity?.GetComponent<TerrainRenderer>();
                     var terrain = terrainRenderer?.Terrain;
-                    if (terrain?.HeightField == null)
+                    if (terrain == null)
+                    {
+                        Debug.Log("[RigidBody] No Terrain found");
+                        return null;
+                    }
+
+                    float fx = terrain.TerrainSize.X / ((terrain.HeightField?.GetLength(0) ?? 2) - 1);
+                    float fy = terrain.TerrainSize.Y / ((terrain.HeightField?.GetLength(1) ?? 2) - 1);
+
+                    // Fast path: use pre-cooked HeightField from import
+                    if (terrain.CookedHeightField != null)
+                    {
+                        return new HeightFieldGeometry(terrain.CookedHeightField, 0,
+                            terrain.MaxHeight / short.MaxValue, fx, fy);
+                    }
+
+                    // Slow fallback: cook on demand
+                    if (terrain.HeightField == null)
                     {
                         Debug.Log("[RigidBody] No Terrain HeightField found");
                         return null;
@@ -219,9 +188,6 @@ namespace Freefall.Components
                     var heightMap = terrain.HeightField;
                     int rows = heightMap.GetLength(0);
                     int cols = heightMap.GetLength(1);
-
-                    float fx = terrain.TerrainSize.X / (rows - 1);
-                    float fy = terrain.TerrainSize.Y / (cols - 1);
 
                     var samples = heightMap.ToSamples();
 
@@ -246,7 +212,7 @@ namespace Freefall.Components
             return null;
         }
 
-        private void CreateBody()
+        public void CreateBody()
         {
             var geometry = CreateGeometry();
             if (geometry == null) return;
@@ -260,9 +226,10 @@ namespace Freefall.Components
                 _dynamicActor = null;
             }
 
-            var matrix = Transform.WorldMatrix;
-            // Strip scale from pose matrix (PhysX uses scale via geometry, not pose)
-            matrix.M11 = 1; matrix.M22 = 1; matrix.M33 = 1;
+            // Build a clean pose from position + rotation (no scale).
+            // PhysX requires an orthonormal rotation — scale is applied via geometry.
+            var matrix = Matrix4x4.CreateFromQuaternion(Transform.Rotation)
+                       * Matrix4x4.CreateTranslation(Transform.WorldPosition);
 
             if (IsStatic)
             {

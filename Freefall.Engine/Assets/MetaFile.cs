@@ -74,5 +74,11 @@ namespace Freefall.Assets
         /// Asset type name (e.g. "MeshData", "AnimationClip", "DdsTextureData").
         /// </summary>
         public string Type { get; set; }
+
+        /// <summary>
+        /// If true, this subasset is internal and should not appear in the Asset Browser
+        /// or be discoverable via user-facing name lookups. Used for pre-cooked physics data etc.
+        /// </summary>
+        public bool Hidden { get; set; }
     }
 }

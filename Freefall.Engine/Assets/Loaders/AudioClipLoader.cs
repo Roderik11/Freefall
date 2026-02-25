@@ -16,7 +16,7 @@ namespace Freefall.Assets.Loaders
 
         public Asset Load(string name, AssetManager manager)
         {
-            var cachePath = AssetDatabase.ResolveCachePath(name);
+            var cachePath = AssetDatabase.ResolveCachePath(name, "AudioClipData");
             if (cachePath == null || !File.Exists(cachePath))
                 throw new FileNotFoundException($"Cache file not found for audio clip '{name}'");
 

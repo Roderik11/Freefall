@@ -40,32 +40,15 @@ namespace Freefall.Assets
 
         /// <summary>
         /// Cook the physics triangle mesh on the calling thread (background) and cache it.
-        /// Uses lowest LOD for fewer triangles. Thread-safe: each call creates its own Cooking instance.
+        /// Uses all LOD 0 indices for complete collision geometry.
+        /// Thread-safe: each call creates its own Cooking instance.
         /// </summary>
         public void CookPhysicsMesh()
         {
             if (Mesh == null || Mesh.Positions == null || Mesh.CpuIndices == null)
                 return;
 
-            int[] triangles;
-
-            // Pick lowest LOD mesh parts for collision (fewer triangles)
-            if (LODs?.Count > 0)
-            {
-                var lowestLod = LODs[^1];
-                var lodIndices = new List<int>();
-                foreach (var part in lowestLod.MeshParts)
-                {
-                    var meshPart = lowestLod.Mesh.MeshParts[part.MeshPartIndex];
-                    for (int i = 0; i < meshPart.NumIndices; i++)
-                        lodIndices.Add((int)lowestLod.Mesh.CpuIndices[meshPart.BaseIndex + i]);
-                }
-                triangles = lodIndices.ToArray();
-            }
-            else
-            {
-                triangles = Array.ConvertAll(Mesh.CpuIndices, i => (int)i);
-            }
+            var triangles = Array.ConvertAll(Mesh.CpuIndices, i => (int)i);
 
             var cooking = PhysicsWorld.Physics.CreateCooking();
             var desc = new TriangleMeshDesc()
@@ -101,5 +84,6 @@ namespace Freefall.Assets
         public Mesh Mesh;
         public Graphics.Material Material; // Removed default assignment for now to avoid accidental nulls if DefaultOpaque isn't ready
         public int MeshPartIndex;
+        public bool Collision;
     }
 }

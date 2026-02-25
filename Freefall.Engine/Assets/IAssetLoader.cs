@@ -40,7 +40,7 @@ namespace Freefall.Assets
         /// Load an asset directly from a resolved cache file path.
         /// Default implementation falls back to name-based Load.
         /// </summary>
-        Asset LoadFromCache(string cachePath, string name, AssetManager manager)
+        Asset LoadFromCache(string cachePath, string name, AssetManager manager, string sourceGuid = null)
             => Load(name, manager);
     }
 }

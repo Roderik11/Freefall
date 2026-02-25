@@ -32,6 +32,11 @@ namespace Freefall.Assets
         public string Name { get; set; }
         public string Type { get; set; }
         public object Data { get; set; }
+
+        /// <summary>
+        /// If true, this artifact is internal and won't be visible in the Asset Browser.
+        /// </summary>
+        public bool Hidden { get; set; }
     }
 
     /// <summary>

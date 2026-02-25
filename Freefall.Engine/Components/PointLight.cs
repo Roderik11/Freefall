@@ -62,7 +62,6 @@ namespace Freefall.Components
             var camPos = Camera.Main?.Position ?? Vector3.Zero;
 
             // Set per-instance light data via MaterialBlock per-instance staging buffer
-            //_params.Clear();
             _params.SetParameter("LightData", new PointLightData
             {
                 Color = new Vector3(Color.R, Color.G, Color.B),

@@ -134,7 +134,7 @@ namespace Freefall.Graphics
             // Bone weights?
             if (data.BoneWeights != null && data.BoneWeights.Length > 0)
             {
-                 // mesh.CreateBoneWeightBufferAsync(device);
+                mesh.CreateBoneWeightBuffer(device);
             }
 
             return mesh;
@@ -313,13 +313,17 @@ namespace Freefall.Graphics
         }
         public void BindPoseDifference(Mesh source)
         {
+            var diag = new System.Collections.Generic.List<string>();
             for (int i = 0; i < source.Bones.Length; i++)
             {
                 float len1 = source.Bones[i].BindPoseMatrix.Translation.Length();
                 float len2 = Bones[i].BindPoseMatrix.Translation.Length();
                 float scaleFactor = len2 / len1;
                 Bones[i].ScaleFactor = scaleFactor > 0 ? scaleFactor : 1;
+                if (i < 5)
+                    diag.Add($"[{i}] src='{source.Bones[i].Name}' dst='{Bones[i].Name}' len1={len1:F6} len2={len2:F6} sf={Bones[i].ScaleFactor:F6}");
             }
+            System.IO.File.WriteAllLines(@"d:\Projects\2026\Freefall\.tmp\bindpose.txt", diag);
         }
         public void Dispose() { _posBuffer?.Dispose(); _normBuffer?.Dispose(); _uvBuffer?.Dispose(); _indexBuffer?.Dispose(); }
 

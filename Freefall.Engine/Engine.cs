@@ -372,7 +372,7 @@ namespace Freefall
          public bool FreezeFrustum { get; set; } = false;                   // F3 - Freeze culling frustum
          public bool UseAdaptiveSplits { get; set; } = false;               // F4 - SDSM adaptive cascade splits
          public int  DebugVisualizationMode { get; set; } = 0;              // F5 - Debug viz (0-4)
-         public bool DisableHiZ { get; set; } = true;                       // F6 - Disable Hi-Z occlusion
+         public bool DisableHiZ { get; set; } = false;                       // F6 - Disable Hi-Z occlusion
          public System.Numerics.Matrix4x4 FrozenViewProjection { get; set; } // VP matrix when frustum frozen
     }
 }

@@ -28,8 +28,8 @@ namespace Freefall.Assets
         private static readonly Dictionary<string, MetaFile> _guidToMeta = new(StringComparer.OrdinalIgnoreCase);
         // Subasset GUID → source GUID (for reverse lookup)
         private static readonly Dictionary<string, string> _subAssetToSource = new(StringComparer.OrdinalIgnoreCase);
-        // Name → subasset GUID (for user-facing Load("name"))
-        private static readonly Dictionary<string, string> _nameToSubAssetGuid = new(StringComparer.OrdinalIgnoreCase);
+        // Name → subasset entries (for user-facing Load("name"), supports multiple types per name)
+        private static readonly Dictionary<string, List<SubAssetEntry>> _nameToSubAssets = new(StringComparer.OrdinalIgnoreCase);
         // Source GUID → cache type name (for simple assets where source GUID = cache key)
         private static readonly Dictionary<string, string> _sourceGuidCacheType = new(StringComparer.OrdinalIgnoreCase);
 
@@ -175,37 +175,64 @@ namespace Freefall.Assets
 
         public static MetaFile GetMeta(string guid)
         {
-            return _guidToMeta.TryGetValue(guid, out var meta) ? meta : null;
+            // Try as source GUID first
+            if (_guidToMeta.TryGetValue(guid, out var meta))
+                return meta;
+
+            // Try resolving subasset GUID → source GUID
+            if (_subAssetToSource.TryGetValue(guid, out var sourceGuid))
+                return _guidToMeta.TryGetValue(sourceGuid, out meta) ? meta : null;
+
+            return null;
         }
 
         /// <summary>
-        /// Resolve an asset name to its cache file path.
-        /// Handles both simple assets (source GUID = cache key) and compound subassets.
+        /// Resolve an asset name or relative path to its cache file path.
+        /// Tries: 1) exact relative path match, 2) subasset name lookup, 3) filename-only path scan.
         /// </summary>
-        internal static string ResolveCachePath(string name)
+        internal static string ResolveCachePath(string nameOrPath, string dataType = null)
         {
-            // Try subasset lookup first (compound assets)
-            if (_nameToSubAssetGuid.TryGetValue(name, out var subGuid))
+            var normalized = NormalizePath(nameOrPath);
+            var name = Path.GetFileNameWithoutExtension(nameOrPath);
+
+
+            // 1) Exact relative path match (unambiguous)
+            if (_pathToGuid.TryGetValue(normalized, out var pathGuid))
             {
-                if (_subAssetToSource.TryGetValue(subGuid, out var sourceGuid))
+                // Compound asset: find the subasset with matching data type
+                if (_guidToMeta.TryGetValue(pathGuid, out var meta) && meta.SubAssets.Count > 0)
                 {
-                    var meta = _guidToMeta[sourceGuid];
-                    var sub = meta.SubAssets.FirstOrDefault(s => s.Guid == subGuid);
+                    var sub = dataType != null
+                        ? meta.SubAssets.FirstOrDefault(s => s.Type.Equals(dataType, StringComparison.OrdinalIgnoreCase))
+                        : meta.SubAssets.FirstOrDefault(s => !s.Hidden);
                     if (sub != null)
                         return GetCachePath(sub.Guid, sub.Type);
                 }
+
+                // Simple asset: source GUID = cache key
+                if (_sourceGuidCacheType.TryGetValue(pathGuid, out var typeName))
+                    return GetCachePath(pathGuid, typeName);
             }
 
-            // Try simple asset lookup (source GUID = cache key)
-            // Name maps to a source path, which maps to a GUID
+            // 2) Subasset name lookup (for Load("assetName") pattern)
+            if (_nameToSubAssets.TryGetValue(name, out var entries))
+            {
+                var sub = dataType != null
+                    ? entries.FirstOrDefault(s => s.Type.Equals(dataType, StringComparison.OrdinalIgnoreCase))
+                    : entries[0];
+                if (sub != null)
+                    return GetCachePath(sub.Guid, sub.Type);
+            }
+
+            // 3) Filename-only scan for simple assets
             foreach (var kvp in _pathToGuid)
             {
                 var fileName = Path.GetFileNameWithoutExtension(kvp.Key);
                 if (fileName.Equals(name, StringComparison.OrdinalIgnoreCase))
                 {
                     var guid = kvp.Value;
-                    if (_sourceGuidCacheType.TryGetValue(guid, out var typeName))
-                        return GetCachePath(guid, typeName);
+                    if (_sourceGuidCacheType.TryGetValue(guid, out var tn))
+                        return GetCachePath(guid, tn);
                 }
             }
 
@@ -218,8 +245,8 @@ namespace Freefall.Assets
         public static string ResolveGuidByName(string name)
         {
             // Try subasset lookup first (compound assets)
-            if (_nameToSubAssetGuid.TryGetValue(name, out var subGuid))
-                return subGuid;
+            if (_nameToSubAssets.TryGetValue(name, out var entries) && entries.Count > 0)
+                return entries[0].Guid;
 
             // Try simple asset lookup — prefer .asset files over raw model files (.fbx, .dae, .obj)
             // because .asset files are StaticMesh definitions while raw model files produce .mesh cache
@@ -245,19 +272,37 @@ namespace Freefall.Assets
         /// <summary>
         /// Resolve a GUID directly to its cache file path.
         /// </summary>
-        internal static string ResolveCachePathByGuid(string guid)
+        internal static string ResolveCachePathByGuid(string guid, Type dataType = null)
         {
+            var dataTypeName = dataType?.Name;
             // Try as source GUID (simple asset)
             if (_sourceGuidCacheType.TryGetValue(guid, out var typeName))
-                return GetCachePath(guid, typeName);
+            {
+                if (dataTypeName == null || typeName.Equals(dataTypeName, StringComparison.OrdinalIgnoreCase))
+                    return GetCachePath(guid, typeName);
+            }
 
             // Try as subasset GUID
             if (_subAssetToSource.TryGetValue(guid, out var sourceGuid))
             {
                 var meta = _guidToMeta[sourceGuid];
                 var sub = meta.SubAssets.FirstOrDefault(s => s.Guid == guid);
-                if (sub != null)
+                if (sub != null && (dataTypeName == null || sub.Type.Equals(dataTypeName, StringComparison.OrdinalIgnoreCase)))
                     return GetCachePath(sub.Guid, sub.Type);
+            }
+
+            // Try as source GUID for a compound asset → find matching subasset
+            if (_guidToMeta.TryGetValue(guid, out var compoundMeta) && compoundMeta.SubAssets.Count > 0)
+            {
+                SubAssetEntry primary;
+                if (dataTypeName != null)
+                    primary = compoundMeta.SubAssets.FirstOrDefault(s => s.Type.Equals(dataTypeName, StringComparison.OrdinalIgnoreCase));
+                else
+                    primary = compoundMeta.SubAssets.FirstOrDefault(s => !s.Hidden)
+                           ?? compoundMeta.SubAssets[0];
+
+                if (primary != null)
+                    return GetCachePath(primary.Guid, primary.Type);
             }
 
             return null;
@@ -301,7 +346,7 @@ namespace Freefall.Assets
             _pathToGuid.Clear();
             _guidToMeta.Clear();
             _subAssetToSource.Clear();
-            _nameToSubAssetGuid.Clear();
+            _nameToSubAssets.Clear();
             _sourceGuidCacheType.Clear();
             _importableExtensions.Clear();
             _importersByExtension.Clear();
@@ -473,7 +518,12 @@ namespace Freefall.Assets
                 foreach (var sub in meta.SubAssets)
                 {
                     _subAssetToSource[sub.Guid] = meta.Guid;
-                    _nameToSubAssetGuid[sub.Name] = sub.Guid;
+                    if (!sub.Hidden)
+                    {
+                        if (!_nameToSubAssets.TryGetValue(sub.Name, out var list))
+                            _nameToSubAssets[sub.Name] = list = new List<SubAssetEntry>();
+                        list.Add(sub);
+                    }
                 }
             }
             else if (!string.IsNullOrEmpty(meta.MainAssetType))
@@ -495,6 +545,16 @@ namespace Freefall.Assets
                 var cachePath = GetCachePath(meta.Guid, meta.MainAssetType);
                 if (!File.Exists(cachePath))
                     return true;
+            }
+            else if (meta.SubAssets.Count > 0)
+            {
+                // Compound asset: check if any subasset cache file is missing
+                foreach (var sub in meta.SubAssets)
+                {
+                    var cachePath = GetCachePath(sub.Guid, sub.Type);
+                    if (!File.Exists(cachePath))
+                        return true;
+                }
             }
 
             // Check if source is newer than last import (with 2s tolerance for filesystem timestamp precision)
@@ -586,6 +646,7 @@ namespace Freefall.Assets
                             Guid = subGuid,
                             Name = artifact.Name,
                             Type = dataTypeName,
+                            Hidden = artifact.Hidden,
                         });
                     }
                 }

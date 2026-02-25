@@ -1,7 +1,9 @@
 using System;
 using System.IO;
+using System.Linq;
 using System.Text;
 using Freefall.Assets.Packers;
+using Freefall.Base;
 using Freefall.Graphics;
 using Freefall.Serialization;
 
@@ -11,7 +13,7 @@ namespace Freefall.Assets.Loaders
     /// Loads StaticMesh assets from cache (.asset files).
     /// Unpacks AssetDefinitionData (YAML), deserializes the StaticMesh definition,
     /// then resolves all GUID references (Mesh, Material, Texture) via AssetManager.
-    /// Finally cooks the physics mesh.
+    /// Loads pre-cooked PhysX TriangleMesh if available.
     /// </summary>
     [AssetLoader(typeof(StaticMesh))]
     public class StaticMeshLoader : IAssetLoader
@@ -20,29 +22,24 @@ namespace Freefall.Assets.Loaders
 
         public Asset Load(string name, AssetManager manager)
         {
-            var cachePath = AssetDatabase.ResolveCachePath(name);
+            var cachePath = AssetDatabase.ResolveCachePath(name, "AssetDefinitionData");
             if (cachePath == null || !File.Exists(cachePath))
                 throw new FileNotFoundException($"Cache file not found for static mesh '{name}'");
 
             return LoadFromCache(cachePath, name, manager);
         }
 
-        public Asset LoadFromCache(string cachePath, string name, AssetManager manager)
+        public Asset LoadFromCache(string cachePath, string name, AssetManager manager, string sourceGuid = null)
         {
             try
             {
                 Debug.Log($"[StaticMeshLoader] Loading '{name}' from {cachePath}");
-                Console.Out.Flush();
 
                 AssetDefinitionData defData;
                 using (var stream = File.OpenRead(cachePath))
                     defData = _packer.Read(stream);
 
-                // Deserialize YAML → StaticMesh
                 var yaml = Encoding.UTF8.GetString(defData.YamlBytes);
-                Debug.Log($"[StaticMeshLoader] Deserializing YAML for '{name}' ({yaml.Length} chars)");
-                Console.Out.Flush();
-
                 StaticMesh staticMesh;
                 try
                 {
@@ -51,7 +48,7 @@ namespace Freefall.Assets.Loaders
                 catch (Exception ex)
                 {
                     throw new InvalidDataException(
-                        $"Failed to deserialize StaticMesh from cache: {name} — {ex.GetType().Name}: {ex.Message}", ex);
+                        $"Failed to deserialize StaticMesh from cache: {name} - {ex.GetType().Name}: {ex.Message}", ex);
                 }
 
                 if (staticMesh == null)
@@ -64,19 +61,11 @@ namespace Freefall.Assets.Loaders
 
                 staticMesh.Name = name;
 
-                // ── Resolve GUID references ──
+                // -- Resolve GUID references --
 
-                // Resolve the main Mesh
                 if (staticMesh.Mesh != null && !string.IsNullOrEmpty(staticMesh.Mesh.Guid))
-                {
-                    Debug.Log($"[StaticMeshLoader] Resolving Mesh GUID '{staticMesh.Mesh.Guid}' for '{name}'");
-                    Console.Out.Flush();
                     staticMesh.Mesh = manager.LoadByGuid<Mesh>(staticMesh.Mesh.Guid);
-                    Debug.Log($"[StaticMeshLoader] Mesh resolved: {(staticMesh.Mesh != null ? "OK" : "NULL")}");
-                    Console.Out.Flush();
-                }
 
-                // Resolve MeshPart references
                 if (staticMesh.MeshParts != null)
                 {
                     foreach (var element in staticMesh.MeshParts)
@@ -91,10 +80,6 @@ namespace Freefall.Assets.Loaders
                     }
                 }
 
-                Debug.Log($"[StaticMeshLoader] MeshParts resolved for '{name}'");
-                Console.Out.Flush();
-
-                // Resolve LOD references
                 if (staticMesh.LODs != null)
                 {
                     foreach (var lod in staticMesh.LODs)
@@ -120,24 +105,55 @@ namespace Freefall.Assets.Loaders
                     }
                 }
 
-                Debug.Log($"[StaticMeshLoader] LODs resolved for '{name}'");
-                Console.Out.Flush();
-
-                // Register mesh parts for GPU draw
                 staticMesh.Mesh?.RegisterMeshParts();
 
-                Console.Out.Flush();
-
-                // TODO: re-enable once crash is resolved
-                // staticMesh.CookPhysicsMesh();
+                // -- Load pre-cooked PhysX TriangleMesh --
+                LoadCookedCollisionMesh(staticMesh, sourceGuid, name);
 
                 return staticMesh;
             }
             catch (Exception ex)
             {
                 Debug.LogWarning("StaticMeshLoader", $"FAILED to load '{name}': {ex}");
-                Console.Out.Flush();
                 return null;
+            }
+        }
+
+        /// <summary>
+        /// Load CollisionMeshData subasset directly via source GUID -> meta -> subasset GUID.
+        /// No name-based resolution needed.
+        /// </summary>
+        private static void LoadCookedCollisionMesh(StaticMesh staticMesh, string sourceGuid, string name)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(sourceGuid))
+                    return;
+
+                var meta = AssetDatabase.GetMeta(sourceGuid);
+                if (meta == null)
+                    return;
+
+                var collisionSub = meta.SubAssets.FirstOrDefault(
+                    s => s.Type == nameof(CollisionMeshData));
+                if (collisionSub == null)
+                    return;
+
+                var physxPath = AssetDatabase.ResolveCachePathByGuid(collisionSub.Guid);
+                if (physxPath == null || !File.Exists(physxPath))
+                    return;
+
+                var packer = new CollisionMeshPacker();
+                using var stream = File.OpenRead(physxPath);
+                var cooked = packer.Read(stream);
+
+                staticMesh.CookedTriMesh = PhysicsWorld.Physics.CreateTriangleMesh(
+                    new MemoryStream(cooked.CookedBytes));
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning("StaticMeshLoader",
+                    $"Failed to load cooked collision mesh for '{name}': {ex.Message}");
             }
         }
     }

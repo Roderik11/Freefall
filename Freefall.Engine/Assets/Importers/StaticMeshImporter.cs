@@ -1,128 +1,145 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
+using System.Text;
+using System.Text.RegularExpressions;
+using Freefall.Assets.Packers;
+using Freefall.Base;
 using Freefall.Graphics;
-using static Freefall.Assets.InternalAssets;
+using PhysX;
 
 namespace Freefall.Assets.Importers
 {
     /// <summary>
-    /// Imports a mesh file (.fbx, .dae, .obj) into a fully configured StaticMesh:
-    /// GPU buffers, textures (by convention), material, LODs, and pre-cooked physics.
-    /// Thread-safe — designed to be called from background threads via Assets.LoadAsync.
+    /// Imports .staticmesh files (YAML-serialized StaticMesh definitions).
+    /// Produces the StaticMesh definition artifact plus a hidden CollisionMeshData
+    /// subasset containing a pre-cooked PhysX TriangleMesh.
+    ///
+    /// Collision geometry is selected by MeshElement.Collision flags in the YAML.
+    /// Falls back to lowest LOD meshparts, then all meshparts if none are flagged.
     /// </summary>
-    public class StaticMeshImporter
+    [AssetImporter(".staticmesh")]
+    public class StaticMeshImporter : IImporter
     {
-        public StaticMesh Load(string filepath)
+        public ImportResult Import(string filepath)
         {
-            var meshName = Path.GetFileNameWithoutExtension(filepath);
+            var result = new ImportResult();
+            var name = Path.GetFileNameWithoutExtension(filepath);
+            var yaml = File.ReadAllText(filepath, Encoding.UTF8);
 
-            // ── 1. CPU: Parse FBX → MeshData ──
-            var importer = new MeshImporter();
-            var meshData = importer.ParseRaw(filepath);
+            // ── 1. Main artifact: StaticMesh definition (YAML) ──
+            result.Artifacts.Add(new ImportArtifact
+            {
+                Name = name,
+                Type = "StaticMesh",
+                Data = new AssetDefinitionData
+                {
+                    TypeName = "StaticMesh",
+                    YamlBytes = Encoding.UTF8.GetBytes(yaml)
+                }
+            });
 
-            // ── 2. GPU: Create mesh buffers + SRVs (thread-safe) ──
-            var mesh = Mesh.CreateAsync(Engine.Device, meshData);
-            mesh.Name = meshName;
-            mesh.RegisterMeshParts();
+            // ── 2. Cook PhysX collision mesh ──
+            try
+            {
+                var cookedBytes = CookCollisionMesh(yaml, name);
+                if (cookedBytes != null)
+                {
+                    result.Artifacts.Add(new ImportArtifact
+                    {
+                        Name = name,
+                        Type = nameof(CollisionMeshData),
+                        Data = new CollisionMeshData { CookedBytes = cookedBytes },
+                        Hidden = true
+                    });
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning("StaticMeshImporter",
+                    $"Failed to cook collision mesh for '{name}': {ex.Message}");
+            }
 
-            // ── 3. Discover + load textures by convention ──
-            var material = DiscoverMaterial(filepath);
-
-            // ── 4. Build StaticMesh with LODs ──
-            var staticMesh = new StaticMesh { Name = meshName, Mesh = mesh, LODGroup = LODGroups.LargeProps };
-            BuildMeshParts(staticMesh, mesh, material);
-
-            // ── 5. Cook physics mesh ──
-            staticMesh.CookPhysicsMesh();
-
-            return staticMesh;
+            return result;
         }
 
         /// <summary>
-        /// Discovers textures in {mesh_dir}/Textures/ using suffix convention (_Dif, _Nor, _Spec, _Aoc)
-        /// and builds a Material. Returns DefaultMaterial if no textures found.
+        /// Cook a PhysX TriangleMesh from the referenced mesh geometry,
+        /// using collision-flagged meshparts (or lowest LOD / all as fallback).
         /// </summary>
-        private static Material DiscoverMaterial(string meshPath)
+        private static byte[] CookCollisionMesh(string yaml, string name)
         {
-            var texturePath = Path.GetDirectoryName(meshPath) + @"\Textures\";
-            if (!Directory.Exists(texturePath))
-                return DefaultMaterial;
-
-            CpuTextureData albedo = null, normal = null, spec = null, aoc = null;
-
-            foreach (var file in Directory.EnumerateFiles(texturePath))
+            // Extract Mesh GUID from YAML
+            var meshGuid = ExtractGuid(yaml, "Mesh");
+            if (meshGuid == null)
             {
-                if (file.EndsWith(".psd", StringComparison.OrdinalIgnoreCase)) continue;
-                var name = Path.GetFileNameWithoutExtension(file);
-
-                try
-                {
-                    var loadPath = TextureLibrary.ResolvePackedDDS(file) ?? file;
-
-                    if (name.EndsWith("_Dif") || name.EndsWith("_diffuse") || name.EndsWith("_Diffuse"))
-                        albedo = Texture.ParseFromFile(Engine.Device, loadPath);
-                    else if (name.EndsWith("_Nor") || name.EndsWith("_normal") || name.EndsWith("_Normal"))
-                        normal = Texture.ParseFromFile(Engine.Device, loadPath);
-                    else if (name.EndsWith("_Spec"))
-                        spec = Texture.ParseFromFile(Engine.Device, loadPath);
-                    else if (name.EndsWith("_Aoc"))
-                        aoc = Texture.ParseFromFile(Engine.Device, loadPath);
-                }
-                catch { /* skip bad textures */ }
+                Debug.Log($"[StaticMeshImporter] No Mesh GUID found for '{name}', skipping collision cook");
+                return null;
             }
 
-            if (albedo == null && normal == null && spec == null && aoc == null)
-                return DefaultMaterial;
+            // Read the cached MeshData — must specifically request MeshData type,
+            // otherwise ResolveCachePathByGuid returns AssetDefinitionData (YAML, not binary)
+            var cachePath = AssetDatabase.ResolveCachePathByGuid(meshGuid, typeof(MeshData));
+            if (cachePath == null || !File.Exists(cachePath))
+            {
+                Debug.Log($"[StaticMeshImporter] MeshData cache not found for GUID '{meshGuid}', skipping collision cook");
+                return null;
+            }
 
-            // Create GPU textures + enqueue uploads via StreamingManager
-            Texture albedoTex = albedo != null ? Texture.CreateAsync(Engine.Device, albedo) : null;
-            Texture normalTex = normal != null ? Texture.CreateAsync(Engine.Device, normal) : null;
-            Texture specTex   = spec   != null ? Texture.CreateAsync(Engine.Device, spec)   : null;
-            Texture aocTex    = aoc    != null ? Texture.CreateAsync(Engine.Device, aoc)    : null;
+            MeshData meshData;
+            var packer = new MeshPacker();
+            using (var stream = File.OpenRead(cachePath))
+                meshData = packer.Read(stream);
 
-            var material = new Material(DefaultEffect);
-            material.SetTexture("AlbedoTex", albedoTex ?? White);
-            material.SetTexture("NormalTex", normalTex ?? FlatNormal);
-            if (specTex != null) material.SetTexture("Roughness", specTex);
-            if (aocTex  != null) material.SetTexture("AO", aocTex);
+            Debug.Log($"[StaticMeshImporter] '{name}' meshGuid={meshGuid} cachePath={cachePath} " +
+                $"verts={meshData.Positions?.Length ?? 0} idx={meshData.Indices?.Length ?? 0}" +
+                (meshData.Positions?.Length > 0 ? $" v[0]={meshData.Positions[0]}" : ""));
 
-            return material;
+            if (meshData.Positions == null || meshData.Indices == null || meshData.Positions.Length == 0)
+            {
+                Debug.Log($"[StaticMeshImporter] No geometry in cached MeshData for '{name}'");
+                return null;
+            }
+
+            // Select collision indices
+            var collisionIndices = GetCollisionIndices(yaml, meshData);
+            if (collisionIndices == null || collisionIndices.Length == 0)
+            {
+                Debug.Log($"[StaticMeshImporter] No collision indices for '{name}'");
+                return null;
+            }
+
+            // Cook PhysX TriangleMesh
+            var cooking = PhysicsWorld.Physics.CreateCooking();
+            var desc = new TriangleMeshDesc()
+            {
+                Flags = (MeshFlag)0,
+                Triangles = collisionIndices,
+                Points = meshData.Positions
+            };
+
+            var stream2 = new MemoryStream();
+            cooking.CookTriangleMesh(desc, stream2);
+
+            Debug.Log($"[StaticMeshImporter] Cooked collision mesh for '{name}': " +
+                      $"{meshData.Positions.Length} verts, {collisionIndices.Length / 3} tris, {stream2.Length} bytes");
+
+            return stream2.ToArray();
         }
 
         /// <summary>
-        /// Splits mesh parts into base MeshParts and LOD levels based on _LOD_N suffix.
+        /// Get collision indices — all mesh triangles.
+        /// PhysX builds an internal BVH, no need for part/LOD selection.
         /// </summary>
-        private static void BuildMeshParts(StaticMesh staticMesh, Mesh mesh, Material material)
+        private static int[] GetCollisionIndices(string yaml, MeshData meshData)
         {
-            for (int p = 0; p < mesh.MeshParts.Count; p++)
-            {
-                var part = mesh.MeshParts[p];
-                int lodIndex = part.Name.IndexOf("_LOD_");
+            return Array.ConvertAll(meshData.Indices, i => (int)i);
+        }
 
-                if (lodIndex < 0)
-                {
-                    // Base mesh part (no LOD suffix)
-                    staticMesh.MeshParts.Add(new MeshElement { Mesh = mesh, Material = material, MeshPartIndex = p });
-                }
-                else
-                {
-                    // Parse LOD level from suffix
-                    int endIndex = lodIndex + 6 < part.Name.Length ? 2 : 1;
-                    int lvl = Convert.ToInt32(part.Name.Substring(lodIndex + 5, endIndex)) - 1;
-
-                    if (lvl < 0)
-                    {
-                        // _LOD_0 → base mesh
-                        staticMesh.MeshParts.Add(new MeshElement { Mesh = mesh, Material = material, MeshPartIndex = p });
-                    }
-                    else
-                    {
-                        while (staticMesh.LODs.Count < lvl + 1)
-                            staticMesh.LODs.Add(new StaticMeshLOD { Mesh = mesh });
-                        staticMesh.LODs[lvl].MeshParts.Add(new MeshElement { Mesh = mesh, Material = material, MeshPartIndex = p });
-                    }
-                }
-            }
+        private static string ExtractGuid(string yaml, string key)
+        {
+            var match = Regex.Match(yaml, $@"{key}:\s*([0-9a-fA-F]{{32}})", RegexOptions.Multiline);
+            return match.Success ? match.Groups[1].Value : null;
         }
     }
 }

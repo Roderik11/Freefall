@@ -58,6 +58,10 @@ namespace Freefall.Animation
             writer.Write(BindPose.Scale.Y);
             writer.Write(BindPose.Scale.Z);
             writer.Write(Parent);
+            writer.Write(OffsetMatrix);
+            writer.Write(BindPoseMatrix);
+            writer.Write(Correction);
+            writer.Write(ScaleFactor);
         }
 
         public void Read(BinaryReader reader)
@@ -67,6 +71,10 @@ namespace Freefall.Animation
             BindPose.Rotation = new Quaternion(reader.ReadSingle(), reader.ReadSingle(), reader.ReadSingle(), reader.ReadSingle());
             BindPose.Scale = new Vector3(reader.ReadSingle(), reader.ReadSingle(), reader.ReadSingle());
             Parent = reader.ReadInt32();
+            OffsetMatrix = reader.ReadMatrix4x4();
+            BindPoseMatrix = reader.ReadMatrix4x4();
+            Correction = reader.ReadMatrix4x4();
+            ScaleFactor = reader.ReadSingle();
         }
     }
 

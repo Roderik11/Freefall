@@ -498,6 +498,7 @@ namespace Freefall.Components
 
             // Store VP for next frame's Hi-Z occlusion projection
             _previousFrameViewProjection = Camera.Main.ViewProjection;
+            _firstDispatch = false;
         }
 
         /// <summary>
@@ -580,7 +581,8 @@ namespace Freefall.Components
             // Hi-Z occlusion data — VP must also expect local-space input:
             //   clip = x_local * Translate(terrainPos) * VP
             var culler = CommandBuffer.Culler;
-            if (culler != null && culler.HiZPyramidSRV != 0 && culler.HiZReady && !Engine.Settings.DisableHiZ)
+            if (!_firstDispatch && culler != null && culler.HiZPyramidSRV != 0 && culler.HiZReady && !Engine.Settings.DisableHiZ)
+
             {
                 var occVP = Engine.Settings.FreezeFrustum
                     ? Engine.Settings.FrozenViewProjection

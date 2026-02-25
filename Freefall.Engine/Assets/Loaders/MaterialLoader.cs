@@ -10,7 +10,7 @@ namespace Freefall.Assets.Loaders
 {
     /// <summary>
     /// Loads Material assets from cache (.asset files).
-    /// Unpacks AssetDefinitionData (YAML) → MaterialDefinition,
+    /// Unpacks AssetDefinitionData (YAML) â†’ MaterialDefinition,
     /// then resolves Effect + Texture GUIDs into a live GPU Material.
     /// </summary>
     [AssetLoader(typeof(Material))]
@@ -20,20 +20,20 @@ namespace Freefall.Assets.Loaders
 
         public Asset Load(string name, AssetManager manager)
         {
-            var cachePath = AssetDatabase.ResolveCachePath(name);
+            var cachePath = AssetDatabase.ResolveCachePath(name, "AssetDefinitionData");
             if (cachePath == null || !File.Exists(cachePath))
                 throw new FileNotFoundException($"Cache file not found for material '{name}'");
 
             return LoadFromCache(cachePath, name, manager);
         }
 
-        public Asset LoadFromCache(string cachePath, string name, AssetManager manager)
+        public Asset LoadFromCache(string cachePath, string name, AssetManager manager, string sourceGuid = null)
         {
             AssetDefinitionData defData;
             using (var stream = File.OpenRead(cachePath))
                 defData = _packer.Read(stream);
 
-            // Deserialize YAML → MaterialDefinition
+            // Deserialize YAML â†’ MaterialDefinition
             var yaml = Encoding.UTF8.GetString(defData.YamlBytes);
             var def = NativeImporter.LoadFromString(yaml) as MaterialDefinition;
 

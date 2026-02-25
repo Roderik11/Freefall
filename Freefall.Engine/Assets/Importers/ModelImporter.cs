@@ -69,17 +69,16 @@ namespace Freefall.Assets.Importers
             }
 
             // ── Animations ──
-            if (scene.HasAnimations)
+            var animImporter = new AnimationClipImporter();
+            try
             {
-                foreach (var anim in scene.Animations)
+                var clip = animImporter.Load(filepath);
+                if (clip.Channels.Count > 0)
                 {
-                    var clip = ExtractAnimation(anim, scale);
-
-                    // Assimp often returns the root bone name (e.g. "Hips") as the animation name
-                    // for .dae files. Detect this and fall back to the source file name.
-                    var animName = anim.Name;
+                    var animName = clip.Name;
                     if (string.IsNullOrEmpty(animName) || _boneNames.Contains(animName))
                         animName = name;
+                    clip.Name = animName;
 
                     result.Artifacts.Add(new ImportArtifact
                     {
@@ -88,6 +87,10 @@ namespace Freefall.Assets.Importers
                         Data = clip
                     });
                 }
+            }
+            catch (Exception ex)
+            {
+                Debug.Log($"[ModelImporter] No animation data in '{name}': {ex.Message}");
             }
 
             Debug.Log($"[ModelImporter] '{name}': {result.Artifacts.Count} artifacts " +
@@ -469,6 +472,9 @@ namespace Freefall.Assets.Importers
 
             newBone.BindPoseMatrix = bind;
             newBone.BindPose = new BonePose { Position = t, Rotation = r, Scale = s };
+
+
+
             newBone.Parent = node.Parent != null ? _boneNames.IndexOf(node.Parent.Name) : -1;
             _skeleton.Add(newBone);
 

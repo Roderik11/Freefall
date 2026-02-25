@@ -81,6 +81,7 @@ namespace Freefall.Components
             // Create view matrix from Transform (like Apex line 53)
             View = Matrix4x4.CreateLookAtLeftHanded(position, position + forward, up);
             
+            
             // Create reverse-Z projection matrix (near→1.0, far→0.0)
             // Can't use CreatePerspectiveFieldOfViewLeftHanded — it validates near < far
             float vFOV = FieldOfView * (MathF.PI / 180f);
