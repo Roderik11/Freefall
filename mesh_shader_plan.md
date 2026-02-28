@@ -12,7 +12,7 @@ Engine is fully bindless (SM 6.6, DXC, `ResourceDescriptorHeap`), global root si
 > **PSO divergence:** Mesh shader passes use `MeshShaderPipelineStateDescription`, traditional passes use `GraphicsPipelineStateDescription`. Coexist in `Material.cs`, detected via `EffectPass.IsMeshShaderPass`.
 
 > [!IMPORTANT]
-> **No `InstanceBatch` integration yet.** Direct `DispatchMesh` only (like `GPUTerrain`'s pattern).
+> **No `InstanceBatch` integration yet.** Direct `DispatchMesh` only (like `TerrainRenderer`'s pattern).
 
 ---
 
