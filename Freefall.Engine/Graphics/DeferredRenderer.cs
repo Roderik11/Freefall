@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Numerics;
+using System.Runtime.InteropServices;
 using Freefall.Base;
 using Freefall.Components;
 using Vortice.Direct3D12;
@@ -11,13 +12,9 @@ namespace Freefall.Graphics
 {
     public class DeferredRenderer : RenderPipeline
     {
+        private const int FrameCount = 3;
+        
         public static DeferredRenderer Current { get; private set; } = null!;
-
-        /// <summary>
-        /// True for the main window's pipeline. False for headless editor viewport pipelines.
-        /// Controls whether this pipeline owns the global singleton and Hi-Z culler.
-        /// </summary>
-        public bool IsPrimary { get; set; } = true;
 
         public RenderTexture2D Albedo;
         public RenderTexture2D Normals;
@@ -27,16 +24,29 @@ namespace Freefall.Graphics
         
         public RenderTexture2D LightBuffer = null!;
         public RenderTexture2D Composite = null!;
+        public RenderTexture2D? CompositeSnapshot;
         public DepthTextureArray2D ShadowTextureArray = null!;
+        
+        /// <summary>Hi-Z depth pyramid, matched to this pipeline's depth buffer dimensions.</summary>
+        public HiZPyramid? HiZPyramid { get; private set; }
 
         private Material matClear = null!;
         private Material matCompose = null!;
         private Material matDirectionalLight = null!;
         
         private bool _isFirstFrame = true;
+        private bool _compositeSnapshotFirstFrame = true;
         
         // Cached array to avoid per-frame allocation
         private CpuDescriptorHandle[]? _cachedGBufferRtvHandles;
+        
+        // Frustum constant buffers (per-frame, uploaded once before batch loop)
+        private ID3D12Resource[]? _frustumConstantsBuffers;
+        private bool _frustumBuffersInitialized;
+        
+        // Previous frame's ViewProjection — Hi-Z depth is 1 frame behind,
+        // so occlusion must project using the VP that matches the depth data
+        private System.Numerics.Matrix4x4 _previousFrameViewProjection;
 
         public DeferredRenderer()
         {
@@ -44,8 +54,8 @@ namespace Freefall.Graphics
 
         public override void Initialize(int width, int height)
         {
-            if (IsPrimary)
-                Current = this;
+            // First renderer sets Current; Render() handles save/restore per viewport
+            Current ??= this;
 
             // Create render textures first
             CreateRenderTextures(width, height);
@@ -58,7 +68,9 @@ namespace Freefall.Graphics
             // Shadow Map Array (Cascades)
             ShadowTextureArray = new DepthTextureArray2D(2048, 2048, 4);
             
-            // Note: Hi-Z pyramid is created in CommandBuffer.InitializeCuller (called after renderer init)
+            // Hi-Z pyramid (matched to depth buffer size)
+            HiZPyramid = new HiZPyramid();
+            HiZPyramid.Create(Engine.Device, width, height);
         }
 
         private void CreateRenderTextures(int width, int height)
@@ -87,10 +99,14 @@ namespace Freefall.Graphics
 
             CreateRenderTextures(width, height);
             _isFirstFrame = true; // Resource states reset to Common/Texture
+            _compositeSnapshotFirstFrame = true;
+            CompositeSnapshot?.Dispose();
+            CompositeSnapshot = null;
             
-            // Only the primary pipeline owns the global Hi-Z pyramid
-            if (IsPrimary)
-                CommandBuffer.Culler?.CreateHiZPyramid(width, height);
+            // Recreate Hi-Z pyramid to match new depth buffer dimensions
+            HiZPyramid?.Dispose();
+            HiZPyramid = new HiZPyramid();
+            HiZPyramid.Create(Engine.Device, width, height);
         }
 
         public override void Clear(Camera camera)
@@ -98,6 +114,84 @@ namespace Freefall.Graphics
             // Clear Render Targets logic? 
             // In DX12, we Clear via CommandList
             // We'll rely on the beginning of Render frame to clear
+        }
+
+        private void EnsureFrustumBuffers(GraphicsDevice device)
+        {
+            if (_frustumBuffersInitialized) return;
+            
+            _frustumConstantsBuffers = new ID3D12Resource[FrameCount];
+            int bufferSize = 256; // Aligned to 256 for CBV
+            
+            for (int i = 0; i < FrameCount; i++)
+                _frustumConstantsBuffers[i] = device.CreateUploadBuffer(bufferSize);
+            
+            _frustumBuffersInitialized = true;
+        }
+        
+        /// <summary>
+        /// Upload frustum planes + Hi-Z parameters to a GPU constant buffer.
+        /// Returns the GPU virtual address for the constant buffer.
+        /// </summary>
+        private ulong UploadFrustumConstants(Camera camera, GraphicsDevice device)
+        {
+            EnsureFrustumBuffers(device);
+            
+            int frameIndex = Engine.FrameIndex % FrameCount;
+            
+            // Build frustum from camera (or frozen VP)
+            var vpMatrix = Engine.Settings.FreezeFrustum 
+                ? Engine.Settings.FrozenViewProjection 
+                : camera.ViewProjection;
+            var frustum = new Frustum(vpMatrix);
+            var frustumPlanes = frustum.GetPlanesAsVector4();
+            
+            var constants = new GPUCuller.FrustumConstants
+            {
+                Plane0 = frustumPlanes[0],
+                Plane1 = frustumPlanes[1],
+                Plane2 = frustumPlanes[2],
+                Plane3 = frustumPlanes[3],
+                Plane4 = frustumPlanes[4],
+                Plane5 = frustumPlanes[5],
+            };
+            
+            // Add Hi-Z occlusion data if available and pyramid has been generated
+            var culler = CommandBuffer.Culler;
+            if (culler != null && HiZPyramid != null && HiZPyramid.FullSRV != 0 
+                && HiZPyramid.Ready && !Engine.Settings.DisableHiZ)
+            {
+                // Hi-Z depth is from the previous frame, so project spheres
+                // using the previous frame's VP to match the depth data
+                constants.OcclusionProjection = Engine.Settings.FreezeFrustum
+                    ? Engine.Settings.FrozenViewProjection
+                    : _previousFrameViewProjection;
+                constants.HiZSrvIdx = HiZPyramid.FullSRV;
+                constants.HiZWidth = HiZPyramid.Width;
+                constants.HiZHeight = HiZPyramid.Height;
+                constants.HiZMipCount = (uint)HiZPyramid.MipCount;
+                constants.NearPlane = camera.NearPlane;
+            }
+            
+            // Debug visualization mode
+            constants.DebugMode = (uint)Engine.Settings.DebugVisualizationMode;
+            
+            // Cull stats UAV (always set if culler is initialized)
+            if (culler != null)
+                constants.CullStatsUAVIdx = culler.CullStatsUAV;
+            
+            // Store current VP for next frame's occlusion projection
+            _previousFrameViewProjection = camera.ViewProjection;
+            
+            unsafe
+            {
+                void* pData;
+                _frustumConstantsBuffers![frameIndex].Map(0, null, &pData);
+                *(GPUCuller.FrustumConstants*)pData = constants;
+                _frustumConstantsBuffers[frameIndex].Unmap(0);
+            }
+            
+            return _frustumConstantsBuffers![frameIndex].GPUVirtualAddress;
         }
 
         public override void Render(Camera camera, ID3D12GraphicsCommandList list)
@@ -127,7 +221,14 @@ namespace Freefall.Graphics
             Compose(camera, list);
             composeTime.Stop();
 
-            // 4. Blit to Backbuffer
+            // 4. Forward pass — renders directly to Composite with depth read.
+            //    Depth is already in PixelShaderResource after FillGBuffer.
+            //    Composite is still in RenderTarget from Compose.
+            var forwardTime = System.Diagnostics.Stopwatch.StartNew();
+            RenderForward(camera, list);
+            forwardTime.Stop();
+
+            // 5. Blit to Backbuffer
             var blitTime = System.Diagnostics.Stopwatch.StartNew();
             BlitToBackBuffer(camera, list);
             blitTime.Stop();
@@ -204,7 +305,8 @@ namespace Freefall.Graphics
 
              // 1. Opaque pass FIRST — builds InstanceBatch GPU buffers
              var opaqueTime = System.Diagnostics.Stopwatch.StartNew();
-             CommandBuffer.Execute(RenderPass.Opaque, list, Engine.Device);
+             ulong frustumGpuAddr = UploadFrustumConstants(camera, Engine.Device);
+             CommandBuffer.Execute(RenderPass.Opaque, list, Engine.Device, frustumGpuAddr);
              opaqueTime.Stop();
 
              // 2. Shadow pass — uses opaque batches (now built) for CullShadow/DrawShadow
@@ -241,6 +343,9 @@ namespace Freefall.Graphics
              CommandBuffer.Execute(RenderPass.Sky, list, Engine.Device);
              skyTime.Stop();
              
+             // 4. Transparent pass — renders after opaque+sky, can depth-test against both
+             CommandBuffer.Execute(RenderPass.Transparent, list, Engine.Device);
+             
              // Log every 60 frames
              if (Engine.FrameIndex % 60 == 0)
              {
@@ -259,7 +364,7 @@ namespace Freefall.Graphics
              // Linear depth cleared to 0 = no occluder, max() naturally keeps farthest geometry
              // Skip when frustum is frozen — frozen pyramid must match frozen VP for correct occlusion
              if (!Engine.Settings.FreezeFrustum)
-                 CommandBuffer.Culler?.GenerateHiZPyramid(list, DepthGBuffer.BindlessIndex);
+                 CommandBuffer.Culler?.GenerateHiZPyramid(list, DepthGBuffer.BindlessIndex, HiZPyramid);
              
              // SDSM: Analyze depth buffer for adaptive cascade splits
              // DepthGBuffer is still in NonPixelShaderResource — perfect for compute SRV reads
@@ -316,7 +421,45 @@ namespace Freefall.Graphics
              
              DrawFullscreenQuad(list, matCompose, block);
              
+             // NOTE: Composite stays in RenderTarget for the Forward pass
+        }
+
+        private void RenderForward(Camera camera, ID3D12GraphicsCommandList list)
+        {
+             // Snapshot the Composite buffer for forward-pass shaders to read
+             // (avoids read/write hazard — ocean writes to Composite while reading the snapshot)
+             if (CompositeSnapshot == null) 
+             {
+                 CompositeSnapshot = new RenderTexture2D(Engine.Device,
+                     (int)Composite.Native.Description.Width,
+                     (int)Composite.Native.Description.Height,
+                     Composite.Native.Description.Format);
+             }
+             Transition(list, Composite.Native, ResourceStates.RenderTarget, ResourceStates.CopySource);
+             Transition(list, CompositeSnapshot.Native, 
+                 _compositeSnapshotFirstFrame ? ResourceStates.Common : ResourceStates.PixelShaderResource, 
+                 ResourceStates.CopyDest);
+             list.CopyResource(CompositeSnapshot.Native, Composite.Native);
+             Transition(list, CompositeSnapshot.Native, ResourceStates.CopyDest, ResourceStates.PixelShaderResource);
+             Transition(list, Composite.Native, ResourceStates.CopySource, ResourceStates.RenderTarget);
+             _compositeSnapshotFirstFrame = false;
+
+             // Depth is in PixelShaderResource — forward objects can sample it via bindless SRV.
+             // Transition depth back to DepthWrite so forward objects can depth-test.
+             Transition(list, Depth.Native, ResourceStates.PixelShaderResource, ResourceStates.DepthWrite);
+
+             // Bind Composite as render target with depth testing
+             list.OMSetRenderTargets(Composite.RtvHandle, Depth.DsvHandle);
+             list.RSSetViewport(new Viewport(0, 0, Composite.Native.Description.Width, Composite.Native.Description.Height));
+             list.RSSetScissorRect(new RectI(0, 0, (int)Composite.Native.Description.Width, (int)Composite.Native.Description.Height));
+
+             // Execute forward pass draws (ocean, etc.)
+             CommandBuffer.Execute(RenderPass.Forward, list, Engine.Device);
+
+             // Transition Composite to PixelShaderResource for Blit
              Transition(list, Composite.Native, ResourceStates.RenderTarget, ResourceStates.PixelShaderResource);
+             // Depth stays in DepthWrite — will be transitioned at start of next frame
+             Transition(list, Depth.Native, ResourceStates.DepthWrite, ResourceStates.PixelShaderResource);
         }
         
         private void DrawFullscreenQuad(ID3D12GraphicsCommandList list, Material material, MaterialBlock? parameters = null)
@@ -347,6 +490,7 @@ namespace Freefall.Graphics
             Depth?.Dispose();
             LightBuffer?.Dispose();
             Composite?.Dispose();
+            CompositeSnapshot?.Dispose();
             ShadowTextureArray?.Dispose();
         }
     }

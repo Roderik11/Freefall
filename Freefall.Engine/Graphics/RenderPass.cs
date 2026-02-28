@@ -9,6 +9,7 @@ namespace Freefall.Graphics
         Transparent,
         Light,
         PostProcess,
+        Forward,
         Overlay,
         Debug
     }
