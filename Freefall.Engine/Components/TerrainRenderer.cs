@@ -25,6 +25,7 @@ namespace Freefall.Components
         // ───── Asset Reference ────────────────────────────────────────────
         public Terrain? Terrain;
         public Material? Material;
+        public Material? DecoratorMaterial = InternalAssets.DecoratorMaterial;
 
         // ───── Rendering Parameters ───────────────────────────────────────
         public float PixelErrorThreshold = 2.0f;
@@ -98,6 +99,26 @@ namespace Freefall.Components
         private bool[] _buffersInSRV = new bool[FrameCount]; // track per-frame state
         private bool[] _indirectArgsInArgState = new bool[FrameCount]; // indirect args in IndirectArgument state
 
+        // ───── Ground Coverage Decorator ──────────────────────────────────
+        private ID3D12Resource? _decoratorHeadersBuffer;
+        private ID3D12Resource? _decoratorSlotsBuffer;
+        private ID3D12Resource? _decoratorLODTableBuffer;
+        private uint _decoratorHeadersSRV;
+        private uint _decoratorSlotsSRV;
+        private uint _decoratorLODTableSRV;
+        private bool _decoratorBuffersBuilt;
+        private bool _decoratorDispatched;
+        private int _decoratorStructVersion = -1;
+        private int _decoratorValueVersion = -1;
+        private int _decoratorDispatchGroupsX;
+        private int _decoratorDispatchGroupsY;
+        private int _decoratorVirtualGridX;
+        private int _decoratorVirtualGridY;
+        private float _decoratorCellSize;
+        private float _decoratorTotalDensity;
+        private float _decoratorGridOriginX;
+        private float _decoratorGridOriginZ;
+
         // ───── Lifecycle ──────────────────────────────────────────────────
 
         protected override void Awake()
@@ -169,6 +190,49 @@ namespace Freefall.Components
 
             // Enqueue self-draw action: terrain draws itself via ExecuteIndirect
             CommandBuffer.Enqueue(RenderPass.Opaque, (list) => self.DrawTerrain(list, fi));
+
+            // Enqueue ground coverage decorator if configured
+            if (!_decoratorBuffersBuilt)
+            {
+                var msg = $"[TerrainRenderer] Decorator check: decos={Terrain.Decorations.Count} " +
+                    $"effect={DecoratorMaterial?.Effect != null} " +
+                    $"mesh0={Terrain.Decorations.FirstOrDefault()?.Mesh?.Name} " +
+                    $"mesh0.Mesh={Terrain.Decorations.FirstOrDefault()?.Mesh?.Mesh != null}";
+                Debug.Log(msg);
+                System.IO.File.AppendAllText(@"d:\Projects\2026\Freefall\.tmp\grass_diag.log", msg + "\n");
+            }
+
+            if (Terrain.Decorations.Count > 0 && DecoratorMaterial?.Effect != null)
+            {
+                // Structural hash: only mesh names and count (triggers buffer rebuild)
+                int structHash = Terrain.Decorations.Count;
+                foreach (var d in Terrain.Decorations)
+                    structHash = HashCode.Combine(structHash, d.Mesh?.Name);
+
+                // Value hash: density, scale, rotation, etc. (triggers data update only)
+                int valueHash = HashCode.Combine(Terrain.DecorationRadius);
+                foreach (var d in Terrain.Decorations)
+                {
+                    valueHash = HashCode.Combine(valueHash, d.Density, d.HeightRange, d.WidthRange,
+                        d.RootRotation, d.SlopeBias);
+                }
+
+                if (structHash != _decoratorStructVersion)
+                {
+                    // Full rebuild: create buffers + upload data
+                    BuildDecoratorBuffers();
+                    _decoratorStructVersion = structHash;
+                    _decoratorValueVersion = valueHash;
+                }
+                else if (valueHash != _decoratorValueVersion)
+                {
+                    // Value-only change: just update data in existing buffers
+                    UpdateDecoratorBufferData();
+                    _decoratorValueVersion = valueHash;
+                }
+
+                CommandBuffer.Enqueue(RenderPass.Opaque, (list) => self.DispatchDecorator(list, fi));
+            }
         }
 
         // ───── Compute Pipeline ───────────────────────────────────────────
@@ -838,6 +902,344 @@ namespace Freefall.Components
             height += (h3 - h1) * zf;
 
             return Transform.Position.Y + height * maxHeight;
+        }
+
+        // ───── Ground Coverage Decorator ──────────────────────────────────
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct ChannelHeader
+        {
+            public uint StartIndex;
+            public uint Count;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct DecoratorSlotGPU
+        {
+            public float Density;     // absolute density (instances/m²)
+            public float MinH, MaxH;
+            public float MinW, MaxW;
+            public uint LODCount;
+            public uint LODTableOffset;
+            // Precomputed root rotation matrix (CPU computes cos/sin, GPU reads directly)
+            public float Rot00, Rot01, Rot02;
+            public float Rot10, Rot11, Rot12;
+            public float Rot20, Rot21, Rot22;
+            public float SlopeBias;  // 0=upright, 1=fully slope-aligned
+            public uint ControlMapIndex;  // array slice in ControlMaps Texture2DArray
+            public uint ControlChannel;   // 0=R, 1=G, 2=B, 3=A
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct LODTableEntry
+        {
+            public uint MeshPartId;
+            public float MaxDistance;
+            public uint MaterialId;
+            public uint _pad;
+        }
+
+        /// <summary>
+        /// Builds GPU-side structured buffers from Terrain.Decorations.
+        /// Groups decorations by (ControlMapIndex, ControlChannel) into ChannelHeaders,
+        /// builds per-decoration DecoratorSlots with LOD table offsets,
+        /// and registers all LOD meshes in MeshRegistry.
+        /// </summary>
+        public void BuildDecoratorBuffers()
+        {
+            if (Terrain == null) return;
+            var decorations = Terrain.Decorations;
+            if (decorations.Count == 0) return;
+
+            var device = Engine.Device;
+
+            // Dispose old buffers if rebuilding
+            _decoratorHeadersBuffer?.Dispose();
+            _decoratorSlotsBuffer?.Dispose();
+            _decoratorLODTableBuffer?.Dispose();
+
+            // Flat list — all decorators go into a single header.
+            // Per-slot ControlMapIndex/ControlChannel fields handle per-slot gating in the shader.
+            var headers = new List<ChannelHeader>();
+            var slots = new List<DecoratorSlotGPU>();
+            var lodTable = new List<LODTableEntry>();
+
+            for (int i = 0; i < decorations.Count; i++)
+            {
+                var deco = decorations[i];
+                if (deco.Mesh == null) continue;
+                var mesh = deco.Mesh!;
+
+                // Register base mesh LOD0
+                uint lodTableOffset = (uint)lodTable.Count;
+                uint lodCount = 0;
+
+                // LOD0 = base mesh
+                if (mesh.Mesh != null)
+                {
+                    foreach (var part in mesh.MeshParts)
+                    {
+                        int partId = MeshRegistry.Register(mesh.Mesh, part.MeshPartIndex);
+                        uint matId = part.Material != null ? (uint)part.Material.MaterialID : 0;
+                        float maxDist = mesh.LODGroup?.Ranges?.Count > 0
+                            ? mesh.LODGroup.Ranges[0] * 1000f
+                            : 100f;
+                        lodTable.Add(new LODTableEntry { MeshPartId = (uint)partId, MaxDistance = maxDist, MaterialId = matId });
+                        lodCount++;
+                    }
+                }
+
+                // Additional LODs
+                for (int lod = 0; lod < mesh.LODs.Count; lod++)
+                {
+                    var lodMesh = mesh.LODs[lod];
+                    if (lodMesh.Mesh == null) continue;
+                    foreach (var part in lodMesh.MeshParts)
+                    {
+                        int partId = MeshRegistry.Register(lodMesh.Mesh, part.MeshPartIndex);
+                        uint matId = part.Material != null ? (uint)part.Material.MaterialID : 0;
+                        float maxDist = mesh.LODGroup?.Ranges != null && lod + 1 < mesh.LODGroup.Ranges.Count
+                            ? mesh.LODGroup.Ranges[lod + 1] * 1000f
+                            : 50f * (lod + 1);
+                        lodTable.Add(new LODTableEntry { MeshPartId = (uint)partId, MaxDistance = maxDist, MaterialId = matId });
+                        lodCount++;
+                    }
+                }
+
+                float degToRad = MathF.PI / 180f;
+                float rx = deco.RootRotation.X * degToRad;
+                float ry = deco.RootRotation.Y * degToRad;
+                float rz = deco.RootRotation.Z * degToRad;
+                float cx = MathF.Cos(rx), sx = MathF.Sin(rx);
+                float cy = MathF.Cos(ry), sy = MathF.Sin(ry);
+                float cz = MathF.Cos(rz), sz = MathF.Sin(rz);
+
+                slots.Add(new DecoratorSlotGPU
+                {
+                    Density = deco.Density,
+                    MinH = deco.HeightRange.X,
+                    MaxH = deco.HeightRange.Y,
+                    MinW = deco.WidthRange.X,
+                    MaxW = deco.WidthRange.Y,
+                    LODCount = lodCount,
+                    LODTableOffset = lodTableOffset,
+                    Rot00 = cy*cz,              Rot01 = cy*sz,              Rot02 = -sy,
+                    Rot10 = sx*sy*cz - cx*sz,   Rot11 = sx*sy*sz + cx*cz,   Rot12 = sx*cy,
+                    Rot20 = cx*sy*cz + sx*sz,   Rot21 = cx*sy*sz - sx*cz,   Rot22 = cx*cy,
+                    SlopeBias = deco.SlopeBias,
+                    ControlMapIndex = (uint)deco.ControlMapIndex,
+                    ControlChannel = (uint)deco.ControlChannel
+                });
+            }
+
+            // Single header covering all slots
+            headers.Add(new ChannelHeader
+            {
+                StartIndex = 0,
+                Count = (uint)slots.Count
+            });
+
+
+
+            // Cell size from SUM of all densities: the grid must accommodate all decorators
+            float sumDensity = 0;
+            foreach (var d in decorations)
+                sumDensity += d.Density;
+            sumDensity = MathF.Max(sumDensity, 1.0f);
+            _decoratorCellSize = 1.0f / MathF.Sqrt(sumDensity);
+            _decoratorTotalDensity = sumDensity;
+
+            // Store absolute densities — shader does weighted selection proportional to each
+
+            // Upload to GPU (creates new buffers + SRVs — only on structural changes)
+            UpdateOrCreateStructuredBuffer(device, headers, ref _decoratorHeadersBuffer, ref _decoratorHeadersSRV, "DecoratorHeaders");
+            UpdateOrCreateStructuredBuffer(device, slots, ref _decoratorSlotsBuffer, ref _decoratorSlotsSRV, "DecoratorSlots");
+            UpdateOrCreateStructuredBuffer(device, lodTable, ref _decoratorLODTableBuffer, ref _decoratorLODTableSRV, "DecoratorLODTable");
+
+            _decoratorBuffersBuilt = true;
+        }
+
+        /// <summary>
+        /// Updates slot data in existing GPU buffers without creating new resources.
+        /// Called when density, scale, rotation, or radius change (but decoration structure unchanged).
+        /// </summary>
+        private unsafe void UpdateDecoratorBufferData()
+        {
+            if (Terrain == null || _decoratorSlotsBuffer == null) return;
+
+            var decorations = Terrain.Decorations;
+            if (decorations.Count == 0) return;
+
+            // Rebuild slot data with current values
+            var slots = new List<DecoratorSlotGPU>();
+            foreach (var deco in decorations)
+            {
+                if (deco.Mesh == null) continue;
+                float degToRad = MathF.PI / 180f;
+
+                // LODCount and LODTableOffset can't change without structural rebuild,
+                // so find them from the existing buffer. For simplicity, just re-read.
+                // Since structural hash hasn't changed, these match.
+                uint lodCount = 0;
+                uint lodTableOffset = 0;
+                if (_decoratorSlotsBuffer != null && slots.Count == 0)
+                {
+                    // Read existing values from the mapped buffer
+                    void* pRead;
+                    _decoratorSlotsBuffer.Map(0, null, &pRead);
+                    var existing = new Span<DecoratorSlotGPU>(pRead, decorations.Count);
+                    for (int i = 0; i < decorations.Count && i < existing.Length; i++)
+                    {
+                        var existingSlot = existing[i];
+                        var d = decorations[i];
+                        if (d.Mesh == null) continue;
+                        float rx = d.RootRotation.X * degToRad;
+                        float ry = d.RootRotation.Y * degToRad;
+                        float rz = d.RootRotation.Z * degToRad;
+                        float cx = MathF.Cos(rx), sx = MathF.Sin(rx);
+                        float cy = MathF.Cos(ry), sy = MathF.Sin(ry);
+                        float cz = MathF.Cos(rz), sz = MathF.Sin(rz);
+
+
+
+                        slots.Add(new DecoratorSlotGPU
+                        {
+                            Density = d.Density,
+                            MinH = d.HeightRange.X,
+                            MaxH = d.HeightRange.Y,
+                            MinW = d.WidthRange.X,
+                            MaxW = d.WidthRange.Y,
+                            LODCount = existingSlot.LODCount,
+                            LODTableOffset = existingSlot.LODTableOffset,
+                            Rot00 = cy*cz,              Rot01 = cy*sz,              Rot02 = -sy,
+                            Rot10 = sx*sy*cz - cx*sz,   Rot11 = sx*sy*sz + cx*cz,   Rot12 = sx*cy,
+                            Rot20 = cx*sy*cz + sx*sz,   Rot21 = cx*sy*sz - sx*cz,   Rot22 = cx*cy,
+                            SlopeBias = d.SlopeBias,
+                            ControlMapIndex = (uint)d.ControlMapIndex,
+                            ControlChannel = (uint)d.ControlChannel
+                        });
+                    }
+                    _decoratorSlotsBuffer.Unmap(0);
+                    break; // Only need one pass
+                }
+            }
+
+            // Recalculate cell size from sum of densities
+            float sumDensity = 0;
+            foreach (var d in decorations)
+                sumDensity += d.Density;
+            sumDensity = MathF.Max(sumDensity, 1.0f);
+            _decoratorCellSize = 1.0f / MathF.Sqrt(sumDensity);
+            _decoratorTotalDensity = sumDensity;
+
+            // Absolute densities — no normalization needed
+
+            // Re-upload slot data to existing buffer via Map/Unmap
+            if (slots.Count > 0 && _decoratorSlotsBuffer != null)
+            {
+                void* pData;
+                _decoratorSlotsBuffer.Map(0, null, &pData);
+                var span = new Span<DecoratorSlotGPU>(pData, slots.Count);
+                for (int i = 0; i < slots.Count; i++)
+                    span[i] = slots[i];
+                _decoratorSlotsBuffer.Unmap(0);
+            }
+        }
+
+        private unsafe void UpdateOrCreateStructuredBuffer<T>(
+            GraphicsDevice device, List<T> data, ref ID3D12Resource? buffer, ref uint srvIndex, string name) where T : unmanaged
+        {
+            int stride = sizeof(T);
+            int count = Math.Max(1, data.Count);
+            int bufferSize = Math.Max(256, count * stride);
+
+            // Old buffer is intentionally NOT disposed — it may still be referenced by
+            // in-flight GPU work. These are tiny (~100 bytes each), so leaking is fine.
+            buffer = device.CreateUploadBuffer(bufferSize);
+            srvIndex = device.AllocateBindlessIndex();
+
+            var srvDesc = new ShaderResourceViewDescription
+            {
+                Format = Format.Unknown,
+                ViewDimension = ShaderResourceViewDimension.Buffer,
+                Shader4ComponentMapping = ShaderComponentMapping.Default,
+                Buffer = new BufferShaderResourceView
+                {
+                    FirstElement = 0,
+                    NumElements = (uint)count,
+                    StructureByteStride = (uint)stride,
+                    Flags = BufferShaderResourceViewFlags.None
+                }
+            };
+            device.NativeDevice.CreateShaderResourceView(buffer, srvDesc, device.GetCpuHandle(srvIndex));
+
+            // Upload data to the new buffer (safe — not in flight)
+            if (data.Count > 0)
+            {
+                void* pData;
+                buffer.Map(0, null, &pData);
+                var span = new Span<T>(pData, data.Count);
+                for (int i = 0; i < data.Count; i++)
+                    span[i] = data[i];
+                buffer.Unmap(0);
+            }
+
+            Debug.Log($"[TerrainRenderer] {name}: {data.Count} entries, SRV={srvIndex}");
+        }
+
+        private void DispatchDecorator(ID3D12GraphicsCommandList commandList, int frameIndex)
+        {
+            if (DecoratorMaterial?.Effect == null || Terrain == null) return;
+
+            var device = Engine.Device;
+            var camPos = Camera.Main!.Position;
+
+            // Dispatch covers a square patch of (2*range) per side, cells of _decoratorCellSize
+            float range = Terrain.DecorationRadius;
+            const int TILE_SIZE = 8;
+
+            // cellSize is always true to density
+            float cs = _decoratorCellSize;
+            int cellsPerSide = Math.Max(1, (int)MathF.Ceiling(2.0f * range / cs));
+            int groups = Math.Max(1, (cellsPerSide + TILE_SIZE - 1) / TILE_SIZE);
+
+            Debug.Log($"[Grass] density={1.0f/(cs*cs):F1}/m² cellSize={cs:F3} range={range:F0} groups={groups}x{groups}={groups*groups} controlMapsIdx={ControlMapsArray?.BindlessIndex ?? 0}");
+
+            // Bind control maps texture array for decorator placement
+            if (ControlMapsArray != null)
+                DecoratorMaterial.SetTexture("ControlMaps", ControlMapsArray);
+
+            // Apply decorator mesh shader PSO
+            DecoratorMaterial.Apply(commandList, device);
+
+            // Push constants
+            commandList.SetGraphicsRoot32BitConstant(0, _decoratorHeadersSRV, 0);
+            commandList.SetGraphicsRoot32BitConstant(0, _decoratorSlotsSRV, 1);
+            commandList.SetGraphicsRoot32BitConstant(0, _decoratorLODTableSRV, 2);
+            commandList.SetGraphicsRoot32BitConstant(0, MeshRegistry.SrvIndex, 3);
+            if (Terrain.Heightmap != null)
+                commandList.SetGraphicsRoot32BitConstant(0, Terrain.Heightmap.BindlessIndex, 4);
+            commandList.SetGraphicsRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(Terrain.TerrainSize.X), 5);
+            commandList.SetGraphicsRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(Terrain.TerrainSize.Y), 6);
+            commandList.SetGraphicsRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(Terrain.MaxHeight), 7);
+            commandList.SetGraphicsRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(camPos.X), 8);
+            commandList.SetGraphicsRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(camPos.Y), 9);
+            commandList.SetGraphicsRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(camPos.Z), 10);
+            commandList.SetGraphicsRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(Transform.WorldPosition.X), 11);
+            commandList.SetGraphicsRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(Transform.WorldPosition.Z), 12);
+            commandList.SetGraphicsRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(Transform.WorldPosition.Y), 13);
+            commandList.SetGraphicsRoot32BitConstant(0, Graphics.Material.MaterialsBufferIndex, 14);
+            // Slot 15: cell size (true to density, never capped)
+            commandList.SetGraphicsRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(cs), 15);
+            // Slot 16: decoration radius
+            commandList.SetGraphicsRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(range), 16);
+            // Slot 17: total density sum for weighted selection
+            commandList.SetGraphicsRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(_decoratorTotalDensity), 17);
+            // Slot 18: control maps texture array SRV
+            commandList.SetGraphicsRoot32BitConstant(0, ControlMapsArray?.BindlessIndex ?? 0u, 18);
+
+            using var commandList6 = commandList.QueryInterface<ID3D12GraphicsCommandList6>();
+            commandList6.DispatchMesh((uint)groups, (uint)groups, 1);
         }
     }
 }

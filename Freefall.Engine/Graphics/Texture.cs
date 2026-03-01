@@ -10,6 +10,7 @@ using Freefall.Assets;
 
 namespace Freefall.Graphics
 {
+    [AssetTypeAlias("DdsTextureData")]
     public class Texture : Asset, IDisposable
     {
         protected ID3D12Resource _resource;
@@ -128,7 +129,7 @@ namespace Freefall.Graphics
                      list.ResourceBarrierTransition(src.Native, ResourceStates.CopySource, ResourceStates.Common);
                  }
                  
-                 list.ResourceBarrierTransition(arr.Native, ResourceStates.CopyDest, ResourceStates.PixelShaderResource);
+                 list.ResourceBarrierTransition(arr.Native, ResourceStates.CopyDest, ResourceStates.AllShaderResource);
                  list.Close();
                  device.SubmitAndWait(list);
              }
@@ -270,7 +271,7 @@ void CSCopySlice(uint3 id : SV_DispatchThreadID) {
                      list.ResourceBarrierTransition(src.Native, ResourceStates.NonPixelShaderResource, ResourceStates.Common);
                  }
 
-                 list.ResourceBarrierTransition(arr._resource, ResourceStates.UnorderedAccess, ResourceStates.PixelShaderResource);
+                 list.ResourceBarrierTransition(arr._resource, ResourceStates.UnorderedAccess, ResourceStates.AllShaderResource);
                  list.Close();
                  device.SubmitAndWait(list);
              }
