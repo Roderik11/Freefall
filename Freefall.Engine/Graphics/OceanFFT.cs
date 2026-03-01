@@ -27,6 +27,7 @@ namespace Freefall.Graphics
         private ID3D12PipelineState? _verticalFFTPSO;
         private ID3D12PipelineState? _assembleMapsPSO;
         private ID3D12PipelineState? _downsamplePSO;
+        private ID3D12PipelineState? _noisePSO;
 
         // ── GPU Textures ──
         private ID3D12Resource? _initialSpectrumTex;  // Tex2DArray N×N×4, RGBA16F
@@ -44,6 +45,12 @@ namespace Freefall.Graphics
         public uint DisplacementSRV { get; private set; }
         /// <summary>Bindless SRV for slope Tex2DArray (dh/dx, dh/dz).</summary>
         public uint SlopeSRV { get; private set; }
+        /// <summary>Bindless SRV for noise texture (Perlin+Worley, RGBA).</summary>
+        public uint NoiseSRV { get; private set; }
+
+        private ID3D12Resource? _noiseTex;
+        private uint _noiseUAV;
+        private const int NoiseSize = 256;
 
         // Per-mip UAVs and SRVs for mipmap generation
         private uint[] _displacementMipUAVs = null!;
@@ -226,7 +233,13 @@ namespace Freefall.Graphics
             _downsamplePSO = _device.CreateComputePipelineState(mipShader.Bytecode);
             mipShader.Dispose();
 
-            Debug.Log("OceanFFT", "All compute shaders compiled (including mipgen)");
+            // Noise generation shader
+            string noiseSource = File.ReadAllText(Path.Combine(basePath, "ocean_noise.hlsl"));
+            var noiseShader = new Shader(noiseSource, "CSGenerateNoise", "cs_6_6");
+            _noisePSO = _device.CreateComputePipelineState(noiseShader.Bytecode);
+            noiseShader.Dispose();
+
+            Debug.Log("OceanFFT", "All compute shaders compiled");
         }
 
         private void CreateTextures()
@@ -488,6 +501,50 @@ namespace Freefall.Graphics
         }
 
         /// <summary>
+        /// Generate noise texture (one-time). Call once after Create().
+        /// </summary>
+        public void GenerateNoise(ID3D12GraphicsCommandList cmd)
+        {
+            if (_noiseTex != null) return; // already generated
+
+            // Create RGBA8 noise texture
+            _noiseTex = _device.CreateTexture2D(
+                Format.R8G8B8A8_UNorm, NoiseSize, NoiseSize, 1, 1,
+                ResourceFlags.AllowUnorderedAccess, ResourceStates.Common);
+
+            _noiseUAV = _device.AllocateBindlessIndex();
+            var uavDesc = new UnorderedAccessViewDescription
+            {
+                Format = Format.R8G8B8A8_UNorm,
+                ViewDimension = UnorderedAccessViewDimension.Texture2D,
+                Texture2D = new Texture2DUnorderedAccessView { MipSlice = 0 }
+            };
+            _device.NativeDevice.CreateUnorderedAccessView(_noiseTex, null, uavDesc, _device.GetCpuHandle(_noiseUAV));
+
+            NoiseSRV = _device.AllocateBindlessIndex();
+            var srvDesc = new ShaderResourceViewDescription
+            {
+                Format = Format.R8G8B8A8_UNorm,
+                ViewDimension = ShaderResourceViewDimension.Texture2D,
+                Shader4ComponentMapping = ShaderComponentMapping.Default,
+                Texture2D = new Texture2DShaderResourceView { MostDetailedMip = 0, MipLevels = 1 }
+            };
+            _device.NativeDevice.CreateShaderResourceView(_noiseTex, srvDesc, _device.GetCpuHandle(NoiseSRV));
+
+            // Dispatch noise generation
+            cmd.SetPipelineState(_noisePSO!);
+            cmd.SetComputeRootSignature(_device.GlobalRootSignature);
+            cmd.SetComputeRoot32BitConstant(0, _noiseUAV, 0);        // OutputIdx
+            cmd.SetComputeRoot32BitConstant(0, (uint)NoiseSize, 1);   // TexSize
+
+            uint groups = (uint)((NoiseSize + 7) / 8);
+            cmd.Dispatch(groups, groups, 1);
+
+            cmd.ResourceBarrierUnorderedAccessView(_noiseTex);
+            Debug.Log("OceanFFT", "Noise texture generated");
+        }
+
+        /// <summary>
         /// Per-frame update: evolve spectrum → FFT → assemble maps.
         /// </summary>
         public void Update(ID3D12GraphicsCommandList cmd, float frameTime, float deltaTime)
@@ -586,6 +643,8 @@ namespace Freefall.Graphics
             _verticalFFTPSO?.Dispose();
             _assembleMapsPSO?.Dispose();
             _downsamplePSO?.Dispose();
+            _noisePSO?.Dispose();
+            _noiseTex?.Dispose();
         }
     }
 }

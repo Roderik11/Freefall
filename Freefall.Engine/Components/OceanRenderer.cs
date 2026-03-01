@@ -76,11 +76,11 @@ namespace Freefall.Components
         // ── Simulation parameters (runtime-tweakable) ──
 
         [Category("Settings")]
-        [ValueRange(0.5f, 500f)]
+        [ValueRange(0.5f, 200f)]
         [Description(@"Water depth in meters.
          Affects wave dispersion and TMA spectral correction.
          Shallower water produces shorter, steeper waves")]
-        public float Depth = 10.0f;
+        public float Depth = 40.0f;
         
         [Category("Settings")]
         [ValueRange(0f, 1f)]
@@ -107,7 +107,7 @@ namespace Freefall.Components
         [Description(@"Jacobian threshold for foam generation.
          Lower values produce foam on gentler waves,
          higher values restrict foam to steep crests only")]
-        public float FoamBias = 0.5f;
+        public float FoamBias = 0.67f;
         
         [Category("Foam")]
         [ValueRange(0f, 0.1f)]
@@ -206,6 +206,8 @@ namespace Freefall.Components
             public float ShoreFadeDepth;
             public Vector3 ShallowColor;
             public float RefractionStrength;
+            public uint NoiseSRV;
+            public uint _pad3, _pad4, _pad5;
         }
 
         private const int GridSize = 128;
@@ -403,6 +405,7 @@ namespace Freefall.Components
             // Dispatch FFT compute before enqueueing draw
             CommandBuffer.Enqueue(RenderPass.Opaque, (cmd) =>
             {
+                _oceanFFT.GenerateNoise(cmd);
                 _oceanFFT.InitSpectrum(cmd);
                 _oceanFFT.Update(cmd, _waveTime, (float)Time.Delta);
             });
@@ -459,6 +462,7 @@ namespace Freefall.Components
                 ShoreFadeDepth = ShoreFadeDepth,
                 ShallowColor = new Vector3(ShallowColor.R, ShallowColor.G, ShallowColor.B),
                 RefractionStrength = RefractionStrength,
+                NoiseSRV = _oceanFFT.NoiseSRV,
             });
 
 
