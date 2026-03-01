@@ -81,8 +81,11 @@ namespace Freefall.Assets
     [Serializable]
     public class MeshElement
     {
+        [System.ComponentModel.Browsable(false)]
         public Mesh Mesh;
-        public Graphics.Material Material; // Removed default assignment for now to avoid accidental nulls if DefaultOpaque isn't ready
+        public Graphics.Material Material;
+
+        [Reflection.ValueSelect(typeof(Reflection.MeshPartProvider))]
         public int MeshPartIndex;
         public bool Collision;
     }

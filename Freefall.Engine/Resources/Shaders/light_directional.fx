@@ -210,7 +210,12 @@ float4 PS(VSOutput input) : SV_Target
     Texture2D AlbedoTex = ResourceDescriptorHeap[AlbedoTexIdx];
     Texture2D DataTex = ResourceDescriptorHeap[DataTexIdx];
     float3 albedo = AlbedoTex.Sample(Sampler, input.TexCoord).rgb;
-    float3 data = DataTex.Sample(Sampler, input.TexCoord).rgb;
+    float4 data = DataTex.Sample(Sampler, input.TexCoord);
+    
+    // Self-lit check: Data.a == 0 means pixel is already fully lit (e.g. ocean)
+    // Skip deferred lighting to avoid double-illumination
+    if (data.a < 0.01)
+        return float4(0, 0, 0, 0);
     
     float rough = max(data.r, 0.04);
     float metal = saturate(data.g);

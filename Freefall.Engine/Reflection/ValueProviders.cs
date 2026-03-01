@@ -25,4 +25,27 @@ namespace Freefall.Reflection
             Provider = Activator.CreateInstance(type) as IValuesProvider;
         }
     }
+
+    public class MeshPartProvider : IValuesProvider
+    {
+        public IList<ProviderValue> GetValues(object context)
+        {
+            var result = new List<ProviderValue>();
+            if (context is not Assets.MeshElement target) return result;
+
+            var mesh = target.Mesh;
+            if (mesh == null) return result;
+
+            for (int i = 0; i < mesh.MeshParts.Count; i++)
+            {
+                result.Add(new ProviderValue
+                {
+                    Name = mesh.MeshParts[i].Name,
+                    Value = i
+                });
+            }
+
+            return result;
+        }
+    }
 }

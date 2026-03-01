@@ -1,11 +1,14 @@
 using System;
 using System.Text.Json.Serialization;
+using System.ComponentModel;
 
 namespace Freefall.Assets
 {
     public abstract class Asset
     {
         public string Name { get; set; }
+        
+        [Browsable(false)]
         public string AssetPath { get; set; }
 
         /// <summary>
@@ -13,6 +16,8 @@ namespace Freefall.Assets
         /// serialization to write asset references as GUID strings.
         /// </summary>
         [JsonIgnore]
+        [ReadOnly(true)]
+        [Browsable(false)]
         public string Guid { get; set; }
         
         // Streaming State

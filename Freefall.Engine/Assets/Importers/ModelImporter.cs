@@ -19,6 +19,23 @@ namespace Freefall.Assets.Importers
     [AssetImporter(".fbx", ".dae", ".obj")]
     public class ModelImporter : IImporter
     {
+        bool ConvertUnits = true;
+        public bool Optimize = false;
+        public bool LeftHanded = true;
+        public bool FlipUVs = false;
+        public bool FlipWinding = true;
+        public bool CalculateTangents = true;
+        public bool PreTransform = false;
+
+        public bool ImportMesh = true;
+        public bool ImportSkeleton = true;
+        public bool ImportAnimations = true;
+
+
+        [ValueRange(0, 180)]
+        public float SmoothingAngle = 66f;
+        public float Scale = 1;
+
         private List<Bone> _skeleton = new();
         private List<string> _boneNames = new();
 
@@ -32,15 +49,16 @@ namespace Freefall.Assets.Importers
         /// </summary>
         public ImportResult Import(string filepath)
         {
-            var result = new ImportResult();
+            var result = new ImportResult { Compound = true };
             var scene = LoadScene(filepath, out float scale);
             var name = System.IO.Path.GetFileNameWithoutExtension(filepath);
 
             // Generate skeleton first (needed by both mesh and animation extraction)
-            GenerateSkeleton(scene);
+            if (ImportSkeleton || ImportMesh)
+                GenerateSkeleton(scene);
 
             // ── Mesh ──
-            if (scene.HasMeshes)
+            if (ImportMesh && scene.HasMeshes)
             {
                 var meshData = ExtractMeshData(scene, scale);
                 result.Artifacts.Add(new ImportArtifact
@@ -52,7 +70,7 @@ namespace Freefall.Assets.Importers
             }
 
             // ── Skeleton ──
-            if (_skeleton.Count > 0)
+            if (ImportSkeleton && _skeleton.Count > 0)
             {
                 var skeleton = new Skeleton
                 {
@@ -69,32 +87,35 @@ namespace Freefall.Assets.Importers
             }
 
             // ── Animations ──
-            var animImporter = new AnimationClipImporter();
-            try
+            if (ImportAnimations)
             {
-                var clip = animImporter.Load(filepath);
-                if (clip.Channels.Count > 0)
+                var animImporter = new AnimationClipImporter();
+                try
                 {
-                    var animName = clip.Name;
-                    if (string.IsNullOrEmpty(animName) || _boneNames.Contains(animName))
-                        animName = name;
-                    clip.Name = animName;
-
-                    result.Artifacts.Add(new ImportArtifact
+                    var clip = animImporter.Load(filepath);
+                    if (clip.Channels.Count > 0)
                     {
-                        Name = animName,
-                        Type = nameof(AnimationClip),
-                        Data = clip
-                    });
+                        var animName = clip.Name;
+                        if (string.IsNullOrEmpty(animName) || _boneNames.Contains(animName))
+                            animName = name;
+                        clip.Name = animName;
+
+                        result.Artifacts.Add(new ImportArtifact
+                        {
+                            Name = animName,
+                            Type = nameof(AnimationClip),
+                            Data = clip
+                        });
+                    }
                 }
-            }
-            catch (Exception ex)
-            {
-                Debug.Log($"[ModelImporter] No animation data in '{name}': {ex.Message}");
+                catch (Exception ex)
+                {
+                    Debug.Log($"[ModelImporter] No animation data in '{name}': {ex.Message}");
+                }
             }
 
             Debug.Log($"[ModelImporter] '{name}': {result.Artifacts.Count} artifacts " +
-                      $"({(scene.HasMeshes ? 1 : 0)} mesh, {scene.AnimationCount} animations, " +
+                      $"({(ImportMesh && scene.HasMeshes ? 1 : 0)} mesh, {scene.AnimationCount} animations, " +
                       $"{_skeleton.Count} bones)");
 
             return result;
@@ -140,27 +161,37 @@ namespace Freefall.Assets.Importers
             _validNodes.Clear();
             _bones.Clear();
 
-            // Match Apex: DAE uses 0.01 scale, FBX uses 1.0
-            scale = filepath.EndsWith(".dae", StringComparison.OrdinalIgnoreCase) ? 0.01f : 1f;
+            // Unit conversion: DAE defaults to 0.01, FBX to 1.0
+            // If Scale is explicitly set (non-1), use it directly. Otherwise use convention.
+            if (Scale != 1f)
+                scale = Scale;
+            else if (ConvertUnits && filepath.EndsWith(".dae", StringComparison.OrdinalIgnoreCase))
+                scale = 0.01f;
+            else
+                scale = Scale;
 
             var importer = new AssimpContext();
 
-            importer.SetConfig(new Assimp.Configs.NormalSmoothingAngleConfig(66f));
+            importer.SetConfig(new Assimp.Configs.NormalSmoothingAngleConfig(SmoothingAngle));
             importer.SetConfig(new Assimp.Configs.GlobalScaleConfig(scale));
             importer.SetConfig(new Assimp.Configs.KeepSceneHierarchyConfig(true));
 
-            var steps = PostProcessPreset.TargetRealTimeMaximumQuality;
-            steps |= PostProcessSteps.FlipWindingOrder;
-            steps |= PostProcessSteps.MakeLeftHanded;
-            steps |= PostProcessSteps.CalculateTangentSpace;
-            steps |= PostProcessSteps.GlobalScale;
+            // Build post-process steps from config fields
+            var steps = PostProcessSteps.Triangulate
+                      | PostProcessSteps.GenerateNormals
+                      | PostProcessSteps.GenerateUVCoords
+                      | PostProcessSteps.SortByPrimitiveType
+                      | PostProcessSteps.ImproveCacheLocality
+                      | PostProcessSteps.JoinIdenticalVertices
+                      | PostProcessSteps.ValidateDataStructure
+                      | PostProcessSteps.GlobalScale;
 
-            // Apex explicitly removes these
-            steps &= ~PostProcessSteps.FindInstances;
-            steps &= ~PostProcessSteps.FindDegenerates;
-            steps &= ~PostProcessSteps.SplitLargeMeshes;
-            steps &= ~PostProcessSteps.RemoveRedundantMaterials;
-            steps &= ~PostProcessSteps.OptimizeMeshes;
+            if (LeftHanded)         steps |= PostProcessSteps.MakeLeftHanded;
+            if (FlipWinding)        steps |= PostProcessSteps.FlipWindingOrder;
+            if (FlipUVs)            steps |= PostProcessSteps.FlipUVs;
+            if (CalculateTangents)  steps |= PostProcessSteps.CalculateTangentSpace;
+            if (Optimize)           steps |= PostProcessSteps.OptimizeMeshes | PostProcessSteps.OptimizeGraph;
+            if (PreTransform)       steps |= PostProcessSteps.PreTransformVertices;
 
             var scene = importer.ImportFile(filepath, steps);
 

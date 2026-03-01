@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Numerics;
 using System.Runtime.InteropServices;
 using Freefall.Components;
+using Vortice.Direct3D;
 using Vortice.Direct3D12;
 
 namespace Freefall.Graphics
@@ -158,11 +159,17 @@ namespace Freefall.Graphics
         private int _drawCount = 0;
         private int _maxTransformSlot = 0;
         internal bool _isGPUSourced = false;
-        
+
+        public PrimitiveTopology Topology { get; private set; }
+
         public InstanceBatch(BatchKey key, Material material)
         {
             Key = key;
             Material = material;
+            Topology = material.HasTessellation
+                        ? PrimitiveTopology.PatchListWith3ControlPoints
+                        : PrimitiveTopology.TriangleList;
+
             ResizeBuffers(8192);
         }
 
@@ -1022,6 +1029,9 @@ namespace Freefall.Graphics
             
             var commandBuffer = gpuCommandBuffers[frameIndex];
             if (commandBuffer == null) return;
+
+            // Set topology: tessellation shaders require patch topology
+            commandList.IASetPrimitiveTopology(Topology);
 
             // Bind per-instance buffer SRV indices to GRAPHICS push constants.
             // The command signature only writes slots 2-15 per draw.

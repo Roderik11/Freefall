@@ -1,4 +1,5 @@
 #include "common.fx"
+#include "sky_common.fx"
 // @RenderState(RenderTargets=1)
 
 // Standard push constant layout — MUST match gbuffer.fx exactly
@@ -138,12 +139,11 @@ float3 SampleNormal(OceanData ocean, float2 worldXZ, float normalStrength, float
     {
         float angle = BandAngles[i];
         float2 uv = RotateUV(worldXZ, angle) * tileScales[i];
-        float2 slope = slopeTex.SampleLevel(OceanSampler, float3(uv, i), 0).xy;
 
-        // Distance-based band fadeout: high-frequency bands alias at distance
-        // tileScales[i] is proportional to frequency — higher = finer detail = fades sooner
-        float bandFade = saturate(1.0 - camDist * tileScales[i] * 0.01);
-        slope *= bandFade;
+        // Distance-based mip selection: pick higher mip for high-frequency bands at distance
+        // tileScale ≈ 1/LengthScale, so dist*tileScale ≈ how many wave tiles fit in the distance
+        float mipLevel = log2(max(1.0, camDist * tileScales[i]));
+        float2 slope = slopeTex.SampleLevel(OceanSampler, float3(uv, i), mipLevel).xy;
 
         // Counter-rotate slopes back to world space
         float s, c;
@@ -392,11 +392,14 @@ PSOutput PS(DSOutput input)
     float F = 0.02 + (1.0 - 0.02) * numerator / (1.0 + 22.7 * pow(waterRough, 1.5));
     F = saturate(F);
 
-    // ── Environment reflection ──
-    // These dominate the ocean appearance via Fresnel — must be saturated blue
-    float3 skyColor = float3(0.25, 0.45, 0.75);
-    float3 horizonSkyColor = float3(0.5, 0.65, 0.85);
-    float3 reflectColor = lerp(skyColor, horizonSkyColor, pow(1.0 - saturate(N.y), 3.0));
+    // ── Environment reflection ── (uses actual procedural sky)
+    // Smooth the normal toward flat at distance to reduce reflection aliasing
+    // (simulates rough-surface reflection without pre-filtered cubemaps)
+    float reflSmooth = saturate(dist * 0.003);
+    float3 reflN = normalize(lerp(N, float3(0, 1, 0), reflSmooth));
+    float3 reflectDir = reflect(-V, reflN);
+    reflectDir.y = abs(reflectDir.y); // clamp below-horizon reflections upward
+    float3 reflectColor = GetSkyColor(reflectDir, -sunDir);
 
     // ── GGX sun specular (Beckmann-like for broader highlight) ──
     float3 halfDir = normalize(L + V);

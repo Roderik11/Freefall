@@ -580,8 +580,8 @@ namespace Freefall.Components
 
             // Hi-Z occlusion data — VP must also expect local-space input:
             //   clip = x_local * Translate(terrainPos) * VP
-            var culler = CommandBuffer.Culler;
-            if (!_firstDispatch && culler != null && culler.HiZPyramidSRV != 0 && culler.HiZReady && !Engine.Settings.DisableHiZ)
+            var pyramid = DeferredRenderer.Current?.HiZPyramid;
+            if (!_firstDispatch && pyramid != null && pyramid.FullSRV != 0 && pyramid.Ready && !Engine.Settings.DisableHiZ)
 
             {
                 var occVP = Engine.Settings.FreezeFrustum
@@ -592,10 +592,10 @@ namespace Freefall.Components
                 var localToWorld = Matrix4x4.CreateTranslation(terrainPos);
                 constants.OcclusionProjection = localToWorld * occVP;
 
-                constants.HiZSrvIdx = culler.HiZPyramidSRV;
-                constants.HiZWidth = culler.HiZWidth;
-                constants.HiZHeight = culler.HiZHeight;
-                constants.HiZMipCount = (uint)culler.HiZMipCount;
+                constants.HiZSrvIdx = pyramid.FullSRV;
+                constants.HiZWidth = pyramid.Width;
+                constants.HiZHeight = pyramid.Height;
+                constants.HiZMipCount = (uint)pyramid.MipCount;
                 constants.NearPlane = Camera.Main!.NearPlane;
             }
 

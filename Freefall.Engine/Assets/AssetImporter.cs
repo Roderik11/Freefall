@@ -25,6 +25,12 @@ namespace Freefall.Assets
     public class ImportResult
     {
         public List<ImportArtifact> Artifacts { get; } = new();
+
+        /// <summary>
+        /// If true, always register artifacts as SubAssets (compound path).
+        /// Used by ModelImporter so all subassets are independently browseable.
+        /// </summary>
+        public bool Compound { get; set; }
     }
 
     public class ImportArtifact
@@ -46,6 +52,15 @@ namespace Freefall.Assets
     public interface IImporter
     {
         ImportResult Import(string filepath);
+
+        /// <summary>
+        /// Returns the object the editor inspector should display when
+        /// this source file is selected.
+        /// Default: the importer itself (shows import settings).
+        /// Definition-based importers (e.g. MaterialImporter, StaticMeshImporter)
+        /// override to return the loaded asset so its properties are editable.
+        /// </summary>
+        object GetInspectionTarget(MetaFile meta) => this;
     }
 
     /// <summary>

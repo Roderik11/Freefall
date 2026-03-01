@@ -338,6 +338,24 @@ namespace Freefall.Assets
             return _importableExtensions.Contains(ext);
         }
 
+        /// <summary>
+        /// Instantiate the importer for a given source GUID.
+        /// Returns null if no importer is registered for the file's extension.
+        /// </summary>
+        public static IImporter GetImporter(string sourceGuid)
+        {
+            if (!_guidToPath.TryGetValue(sourceGuid, out var sourcePath))
+                return null;
+
+            var ext = Path.GetExtension(sourcePath);
+            if (string.IsNullOrEmpty(ext)) return null;
+
+            if (!_importersByExtension.TryGetValue(ext, out var importerType))
+                return null;
+
+            return Activator.CreateInstance(importerType) as IImporter;
+        }
+
         // ── Core Logic ──
 
         private static void Clear()
@@ -612,12 +630,13 @@ namespace Freefall.Assets
             }
 
             // Pack artifacts to Cache/
-            // Save existing subasset GUIDs so we can reuse them on reimport (preserves scene references)
+            // Save existing state so we can preserve GUIDs on reimport
             var oldSubAssets = new List<SubAssetEntry>(meta.SubAssets);
+            var oldMainAssetType = meta.MainAssetType;
             meta.SubAssets.Clear();
             meta.MainAssetType = null;
 
-            if (result.Artifacts.Count == 1)
+            if (result.Artifacts.Count == 1 && !result.Compound)
             {
                 // Simple asset: source GUID = cache key, no subassets
                 var artifact = result.Artifacts[0];
@@ -635,7 +654,15 @@ namespace Freefall.Assets
                 {
                     var dataTypeName = artifact.Data.GetType().Name;
                     var existing = oldSubAssets.Find(s => s.Name == artifact.Name && s.Type == dataTypeName);
-                    var subGuid = existing?.Guid ?? System.Guid.NewGuid().ToString("N");
+
+                    string subGuid;
+                    if (existing != null)
+                        subGuid = existing.Guid;                        // Compound→compound: reuse subasset GUID
+                    else if (oldMainAssetType == dataTypeName)
+                        subGuid = meta.Guid;                            // Simple→compound: reuse source GUID
+                    else
+                        subGuid = System.Guid.NewGuid().ToString("N");  // New artifact
+
                     var cachePath = GetCachePath(subGuid, dataTypeName);
                     Directory.CreateDirectory(Path.GetDirectoryName(cachePath));
 

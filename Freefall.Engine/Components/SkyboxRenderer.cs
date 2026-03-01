@@ -17,14 +17,21 @@ namespace Freefall.Components
         public bool UseProceduralSky = true;
 
         // Procedural sky parameters
+        [ValueRange(0f, 24f)]
         public float TimeOfDay = 16f;         // 0-24 hours
+        [ValueRange(0f, 1f)]
         public float CloudCoverage = 0.5f;      // 0-1
+        [ValueRange(0f, 10f)]
         public float CloudSpeed = 1.0f;         // Speed multiplier
+        [ValueRange(0f, 10f)]
         public float SunIntensity = 1.2f;       // Sun brightness multiplier
+
         public Vector3 SunDirection = new Vector3(0, 1, 0);
 
         // Star parameters
+        [ValueRange(0f, 1f)]
         public float StarDensity = 0.5f;        // 0-1, controls how many stars
+        [ValueRange(0f, 10f)]
         public float StarBrightness = 1.0f;     // Star intensity multiplier
 
         // Animation
@@ -34,7 +41,10 @@ namespace Freefall.Components
         // Sun light control
         public DirectionalLight SunLight;
         public bool ControlSunLight = true;     // Enable/disable automatic sun light control
+      
+        [ValueRange(0f, 10f)]
         public float DayIntensity = 1.0f;       // Sun intensity at noon
+        [ValueRange(0f, 10f)]
         public float NightIntensity = 0.1f;     // Ambient intensity at night
 
         // Static ambient scale accessible by composition pass

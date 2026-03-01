@@ -26,6 +26,7 @@ namespace Freefall.Graphics
         private ID3D12PipelineState? _horizontalFFTPSO;
         private ID3D12PipelineState? _verticalFFTPSO;
         private ID3D12PipelineState? _assembleMapsPSO;
+        private ID3D12PipelineState? _downsamplePSO;
 
         // ── GPU Textures ──
         private ID3D12Resource? _initialSpectrumTex;  // Tex2DArray N×N×4, RGBA16F
@@ -43,6 +44,13 @@ namespace Freefall.Graphics
         public uint DisplacementSRV { get; private set; }
         /// <summary>Bindless SRV for slope Tex2DArray (dh/dx, dh/dz).</summary>
         public uint SlopeSRV { get; private set; }
+
+        // Per-mip UAVs and SRVs for mipmap generation
+        private uint[] _displacementMipUAVs = null!;
+        private uint[] _displacementMipSRVs = null!;
+        private uint[] _slopeMipUAVs = null!;
+        private uint[] _slopeMipSRVs = null!;
+        private int _mipCount;
 
         // ── Spectrum parameters buffer ──
         private ID3D12Resource? _spectrumParamsBuffer;
@@ -212,7 +220,13 @@ namespace Freefall.Graphics
             _assembleMapsPSO = _device.CreateComputePipelineState(assembleShader.Bytecode);
             assembleShader.Dispose();
 
-            Debug.Log("OceanFFT", "All compute shaders compiled");
+            // Mipmap downsample shader
+            string mipSource = File.ReadAllText(Path.Combine(basePath, "ocean_mipgen.hlsl"));
+            var mipShader = new Shader(mipSource, "CSDownsample", "cs_6_6");
+            _downsamplePSO = _device.CreateComputePipelineState(mipShader.Bytecode);
+            mipShader.Dispose();
+
+            Debug.Log("OceanFFT", "All compute shaders compiled (including mipgen)");
         }
 
         private void CreateTextures()
@@ -257,6 +271,38 @@ namespace Freefall.Graphics
 
             SlopeSRV = _device.AllocateBindlessIndex();
             CreateTex2DArraySRV(_slopeTex, Format.R16G16_Float, _numBands, mipCount, SlopeSRV);
+
+            // Create per-mip UAVs and SRVs for downsample chain
+            _mipCount = mipCount;
+            _displacementMipUAVs = new uint[mipCount];
+            _displacementMipSRVs = new uint[mipCount];
+            _slopeMipUAVs = new uint[mipCount];
+            _slopeMipSRVs = new uint[mipCount];
+
+            // Mip 0 UAVs already exist (_displacementUAV, _slopeUAV)
+            _displacementMipUAVs[0] = _displacementUAV;
+            _slopeMipUAVs[0] = _slopeUAV;
+
+            // Create SRV for mip 0 (source for mip 1 generation)
+            _displacementMipSRVs[0] = _device.AllocateBindlessIndex();
+            CreateTex2DArrayMipSRV(_displacementTex, Format.R16G16B16A16_Float, _numBands, 0, _displacementMipSRVs[0]);
+            _slopeMipSRVs[0] = _device.AllocateBindlessIndex();
+            CreateTex2DArrayMipSRV(_slopeTex, Format.R16G16_Float, _numBands, 0, _slopeMipSRVs[0]);
+
+            for (int m = 1; m < mipCount; m++)
+            {
+                // UAV for writing to mip m
+                _displacementMipUAVs[m] = _device.AllocateBindlessIndex();
+                CreateTex2DArrayMipUAV(_displacementTex, Format.R16G16B16A16_Float, _numBands, m, _displacementMipUAVs[m]);
+                _slopeMipUAVs[m] = _device.AllocateBindlessIndex();
+                CreateTex2DArrayMipUAV(_slopeTex, Format.R16G16_Float, _numBands, m, _slopeMipUAVs[m]);
+
+                // SRV for reading from mip m (source for mip m+1)
+                _displacementMipSRVs[m] = _device.AllocateBindlessIndex();
+                CreateTex2DArrayMipSRV(_displacementTex, Format.R16G16B16A16_Float, _numBands, m, _displacementMipSRVs[m]);
+                _slopeMipSRVs[m] = _device.AllocateBindlessIndex();
+                CreateTex2DArrayMipSRV(_slopeTex, Format.R16G16_Float, _numBands, m, _slopeMipSRVs[m]);
+            }
         }
 
         private void CreateTex2DArrayUAV(ID3D12Resource tex, Format format, int arraySize, uint bindlessIdx)
@@ -286,6 +332,40 @@ namespace Freefall.Graphics
                 {
                     MostDetailedMip = 0,
                     MipLevels = (uint)mipLevels,
+                    FirstArraySlice = 0,
+                    ArraySize = (uint)arraySize
+                }
+            };
+            _device.NativeDevice.CreateShaderResourceView(tex, srvDesc, _device.GetCpuHandle(bindlessIdx));
+        }
+
+        private void CreateTex2DArrayMipUAV(ID3D12Resource tex, Format format, int arraySize, int mipLevel, uint bindlessIdx)
+        {
+            var uavDesc = new UnorderedAccessViewDescription
+            {
+                Format = format,
+                ViewDimension = UnorderedAccessViewDimension.Texture2DArray,
+                Texture2DArray = new Texture2DArrayUnorderedAccessView
+                {
+                    MipSlice = (uint)mipLevel,
+                    FirstArraySlice = 0,
+                    ArraySize = (uint)arraySize
+                }
+            };
+            _device.NativeDevice.CreateUnorderedAccessView(tex, null, uavDesc, _device.GetCpuHandle(bindlessIdx));
+        }
+
+        private void CreateTex2DArrayMipSRV(ID3D12Resource tex, Format format, int arraySize, int mipLevel, uint bindlessIdx)
+        {
+            var srvDesc = new ShaderResourceViewDescription
+            {
+                Format = format,
+                ViewDimension = ShaderResourceViewDimension.Texture2DArray,
+                Shader4ComponentMapping = ShaderComponentMapping.Default,
+                Texture2DArray = new Texture2DArrayShaderResourceView
+                {
+                    MostDetailedMip = (uint)mipLevel,
+                    MipLevels = 1,
                     FirstArraySlice = 0,
                     ArraySize = (uint)arraySize
                 }
@@ -444,9 +524,49 @@ namespace Freefall.Graphics
             SetPushConstants(cmd);
             cmd.Dispatch(groups8, groups8, 1);
 
-            // TODO: GenerateMips for displacement and slope textures
-            // D3D12 doesn't have auto mip generation — need a downsample compute pass
-            // For now, sample mip 0 only
+            cmd.ResourceBarrierUnorderedAccessView(_displacementTex!);
+            cmd.ResourceBarrierUnorderedAccessView(_slopeTex!);
+
+            // 5. Generate mip chain for displacement and slope textures
+            GenerateMips(cmd);
+        }
+
+        private void GenerateMips(ID3D12GraphicsCommandList cmd)
+        {
+            cmd.SetPipelineState(_downsamplePSO!);
+
+            int srcSize = N;
+            for (int mip = 1; mip < _mipCount; mip++)
+            {
+                int dstSize = srcSize / 2;
+                if (dstSize < 1) break;
+
+                uint groups = (uint)((dstSize + 7) / 8);
+
+                // Downsample displacement (RGBA16F) — read from UAV, write to UAV
+                cmd.SetComputeRootSignature(_device.GlobalRootSignature);
+                cmd.SetComputeRoot32BitConstant(0, _displacementMipUAVs[mip - 1], 0); // SrcMipIdx (UAV read)
+                cmd.SetComputeRoot32BitConstant(0, _displacementMipUAVs[mip], 1);      // DstMipIdx (UAV write)
+                cmd.SetComputeRoot32BitConstant(0, (uint)dstSize, 2);                  // MipTexelSize
+                cmd.SetComputeRoot32BitConstant(0, (uint)_numBands, 3);                // NumSlices
+                cmd.SetComputeRoot32BitConstant(0, 0u, 4);                             // IsRG16F = false
+                cmd.Dispatch(groups, groups, 1);
+
+                cmd.ResourceBarrierUnorderedAccessView(_displacementTex!);
+
+                // Downsample slope (RG16F) — read from UAV, write to UAV
+                cmd.SetComputeRootSignature(_device.GlobalRootSignature);
+                cmd.SetComputeRoot32BitConstant(0, _slopeMipUAVs[mip - 1], 0);         // SrcMipIdx (UAV read)
+                cmd.SetComputeRoot32BitConstant(0, _slopeMipUAVs[mip], 1);             // DstMipIdx (UAV write)
+                cmd.SetComputeRoot32BitConstant(0, (uint)dstSize, 2);                  // MipTexelSize
+                cmd.SetComputeRoot32BitConstant(0, (uint)_numBands, 3);                // NumSlices
+                cmd.SetComputeRoot32BitConstant(0, 1u, 4);                             // IsRG16F = true
+                cmd.Dispatch(groups, groups, 1);
+
+                cmd.ResourceBarrierUnorderedAccessView(_slopeTex!);
+
+                srcSize = dstSize;
+            }
         }
 
         public void Dispose()
@@ -465,6 +585,7 @@ namespace Freefall.Graphics
             _horizontalFFTPSO?.Dispose();
             _verticalFFTPSO?.Dispose();
             _assembleMapsPSO?.Dispose();
+            _downsamplePSO?.Dispose();
         }
     }
 }

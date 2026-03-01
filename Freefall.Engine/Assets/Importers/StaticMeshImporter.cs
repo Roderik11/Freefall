@@ -21,6 +21,14 @@ namespace Freefall.Assets.Importers
     [AssetImporter(".staticmesh")]
     public class StaticMeshImporter : IImporter
     {
+        /// <summary>
+        /// .staticmesh files ARE the asset definition — inspect the loaded StaticMesh, not the importer.
+        /// </summary>
+        public object GetInspectionTarget(MetaFile meta)
+        {
+            return Engine.Assets.LoadByGuid<StaticMesh>(meta.Guid);
+        }
+
         public ImportResult Import(string filepath)
         {
             var result = new ImportResult();

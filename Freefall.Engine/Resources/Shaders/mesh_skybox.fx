@@ -210,54 +210,7 @@ float3 GetStars(float3 viewDir, float nightFactor)
     return star * intensity;
 }
 
-float3 GetSkyColor(float3 viewDir, float3 sunDir)
-{
-    float horizon = abs(viewDir.y);
-
-    float3 dayZenith = float3(0.2, 0.5, 1.0);
-    float3 dayHorizon = float3(0.6, 0.8, 1.0);
-    float3 sunsetZenith = float3(0.4, 0.3, 0.6);
-    float3 sunsetHorizon = float3(1.0, 0.5, 0.3);
-    float3 nightZenith = float3(0.01, 0.01, 0.05);
-    float3 nightHorizon = float3(0.05, 0.05, 0.1);
-
-    float sunElevation = sunDir.y;
-
-    float dayFactor = saturate((sunElevation - 0.0) / 0.8);
-    dayFactor = pow(dayFactor, 0.7);
-
-    float sunsetFactor = 0.0;
-    if (sunElevation < 0.15 && sunElevation > -0.2)
-    {
-        sunsetFactor = 1.0 - abs((sunElevation - (-0.025)) / 0.175);
-        sunsetFactor = max(0.0, sunsetFactor);
-    }
-
-    float nightFactor = saturate((-sunElevation - 0.15) / 0.3);
-
-    float total = dayFactor + sunsetFactor + nightFactor;
-    if (total > 0.0)
-    {
-        dayFactor /= total;
-        sunsetFactor /= total;
-        nightFactor /= total;
-    }
-
-    float3 zenithColor = dayZenith * dayFactor + sunsetZenith * sunsetFactor + nightZenith * nightFactor;
-    float3 horizonColor = dayHorizon * dayFactor + sunsetHorizon * sunsetFactor + nightHorizon * nightFactor;
-
-    float3 skyColor = lerp(horizonColor, zenithColor, pow(horizon, 0.5));
-
-    float sunAngle = dot(viewDir, sunDir);
-    float horizonScatter = pow(1.0 - horizon, 3.0);
-    float sunScatter = pow(saturate(sunAngle), 3.0);
-    float scatter = (horizonScatter + sunScatter * 0.5) * saturate(dayFactor + sunsetFactor * 0.5);
-    skyColor += float3(1.0, 0.8, 0.6) * scatter * 0.3;
-
-    skyColor += GetStars(viewDir, nightFactor);
-
-    return skyColor;
-}
+#include "sky_common.fx"
 
 float GetSun(float3 viewDir, float3 sunDir)
 {
@@ -329,6 +282,11 @@ FragmentOutput PS_Procedural(VertexOutput input)
 
     float3 skyColor = GetSkyColor(viewDir, sunDir);
 
+    // Stars (not in shared GetSkyColor — ocean reflections don't need them)
+    float nightSunElev = sunDir.y;
+    float nightFactor = saturate((-nightSunElev - 0.15) / 0.3);
+    skyColor += GetStars(viewDir, nightFactor);
+
     float sun = GetSun(viewDir, sunDir) * SunIntensity;
     skyColor += float3(1.0, 0.9, 0.7) * sun;
 
@@ -341,8 +299,8 @@ FragmentOutput PS_Procedural(VertexOutput input)
     float3 cloudColor = lerp(cloudShaded, cloudLit, sunDot * 0.5 + 0.5);
 
     // Sunset tint on clouds
-    float sunElevation = sunDir.y;
-    float sunsetAmount = saturate(1.0 - abs((sunElevation - (-0.025)) / 0.175));
+    float cloudSunElev = sunDir.y;
+    float sunsetAmount = saturate(1.0 - abs((cloudSunElev - (-0.025)) / 0.175));
     cloudColor = lerp(cloudColor, float3(1.0, 0.7, 0.4), sunsetAmount * 0.5);
 
     skyColor = lerp(skyColor, cloudColor, clouds * 0.95);

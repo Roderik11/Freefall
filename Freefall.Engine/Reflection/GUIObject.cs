@@ -61,6 +61,8 @@ namespace Freefall.Reflection
 
         static readonly Dictionary<int, bool> expandedTable = new Dictionary<int, bool>();
 
+        public string Description => _field.GetAttribute<System.ComponentModel.DescriptionAttribute>()?.Description;
+
         public GUIProperty(Field field, params object[] targets)
         {
             this._field = field;

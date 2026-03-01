@@ -101,25 +101,7 @@ namespace Freefall.Graphics
         public ID3D12PipelineState? VisibilityShadow4PSO => _visibilityShadow4PSO;
         public ID3D12PipelineState? DownsamplePSO => _downsamplePSO;
         
-        // Hi-Z depth pyramid resources
-        private ID3D12Resource? _hiZPyramid;
-        public ID3D12Resource HiZTexture => _hiZPyramid;
-        private uint[] _hiZMipUAVs = Array.Empty<uint>();     // UAV per mip level
-        private CpuDescriptorHandle[] _hiZMipUAVCPU = Array.Empty<CpuDescriptorHandle>(); // CPU handles for UAV clears
-        private uint[] _hiZMipSRVs = Array.Empty<uint>();     // SRV per mip level (for reading previous mip)
-        private uint _hiZPyramidSRV;                          // Full-pyramid SRV (all mips)
-        private int _hiZMipCount;
-        private int _hiZWidth;
-        private int _hiZHeight;
-        private bool _hiZReady;  // True after pyramid has been generated at least once
-        
-        /// <summary>Bindless SRV index of the full Hi-Z pyramid (all mips). 0 if not created.</summary>
-        public uint HiZPyramidSRV => _hiZPyramidSRV;
-        public int HiZWidth => _hiZWidth;
-        public int HiZHeight => _hiZHeight;
-        public int HiZMipCount => _hiZMipCount;
-        /// <summary>True after the pyramid has been generated at least once (safe to use for occlusion).</summary>
-        public bool HiZReady => _hiZReady;
+        // Hi-Z pyramid resources are now owned by HiZPyramid (managed by DeferredRenderer)
         
         /// <summary>True after SDSM buffers are created and ready for dispatch.</summary>
         public bool SdsmReady => _sdsmInitialized;
@@ -813,121 +795,43 @@ namespace Freefall.Graphics
             commandList.ResourceBarrier(new ResourceBarrier(
                 new ResourceTransitionBarrier(sortedIndicesBuffer, ResourceStates.NonPixelShaderResource, ResourceStates.Common)));
         }
-
-        /// <summary>
-        /// Create the Hi-Z depth pyramid texture and per-mip descriptors.
-        /// Call once when the depth buffer dimensions are known (or on resize).
-        /// </summary>
-        public void CreateHiZPyramid(int depthWidth, int depthHeight)
-        {
-            if (!_initialized) return;
-            
-            // Dispose previous pyramid if resizing
-            _hiZPyramid?.Dispose();
-            _hiZReady = false;  // New pyramid needs to be generated before use
-            
-            // Hi-Z is half-res of depth buffer
-            _hiZWidth = depthWidth / 2;
-            _hiZHeight = depthHeight / 2;
-            
-            // Calculate mip count
-            _hiZMipCount = 1 + (int)Math.Floor(Math.Log2(Math.Max(_hiZWidth, _hiZHeight)));
-            
-            // Create texture: R32_Float with UAV support, full mip chain
-            _hiZPyramid = _device.CreateTexture2D(
-                Vortice.DXGI.Format.R32_Float,
-                _hiZWidth, _hiZHeight,
-                1, _hiZMipCount,
-                ResourceFlags.AllowUnorderedAccess,
-                ResourceStates.Common);
-            
-            // Allocate per-mip UAVs and SRVs
-            _hiZMipUAVs = new uint[_hiZMipCount];
-            _hiZMipUAVCPU = new CpuDescriptorHandle[_hiZMipCount];
-            _hiZMipSRVs = new uint[_hiZMipCount];
-            
-            for (int i = 0; i < _hiZMipCount; i++)
-            {
-                // UAV for writing this mip level
-                _hiZMipUAVs[i] = _device.AllocateBindlessIndex();
-                var uavDesc = new UnorderedAccessViewDescription
-                {
-                    Format = Vortice.DXGI.Format.R32_Float,
-                    ViewDimension = UnorderedAccessViewDimension.Texture2D,
-                    Texture2D = new Texture2DUnorderedAccessView { MipSlice = (uint)i }
-                };
-                _device.NativeDevice.CreateUnorderedAccessView(_hiZPyramid, null, uavDesc, _device.GetCpuHandle(_hiZMipUAVs[i]));
-                
-                // SRV for reading this mip level (used as input for next level's downsample)
-                _hiZMipSRVs[i] = _device.AllocateBindlessIndex();
-                var srvDesc = new ShaderResourceViewDescription
-                {
-                    Format = Vortice.DXGI.Format.R32_Float,
-                    ViewDimension = Vortice.Direct3D12.ShaderResourceViewDimension.Texture2D,
-                    Shader4ComponentMapping = ShaderComponentMapping.Default,
-                    Texture2D = new Texture2DShaderResourceView
-                    {
-                        MostDetailedMip = (uint)i,
-                        MipLevels = 1
-                    }
-                };
-                _device.NativeDevice.CreateShaderResourceView(_hiZPyramid, srvDesc, _device.GetCpuHandle(_hiZMipSRVs[i]));
-            }
-            
-            // Full-pyramid SRV (all mips, for CSVisibility to sample with Load at any mip)
-            _hiZPyramidSRV = _device.AllocateBindlessIndex();
-            var fullSrvDesc = new ShaderResourceViewDescription
-            {
-                Format = Vortice.DXGI.Format.R32_Float,
-                ViewDimension = Vortice.Direct3D12.ShaderResourceViewDimension.Texture2D,
-                Shader4ComponentMapping = ShaderComponentMapping.Default,
-                Texture2D = new Texture2DShaderResourceView
-                {
-                    MostDetailedMip = 0,
-                    MipLevels = (uint)_hiZMipCount
-                }
-            };
-            _device.NativeDevice.CreateShaderResourceView(_hiZPyramid, fullSrvDesc, _device.GetCpuHandle(_hiZPyramidSRV));
-            
-            Debug.Log("GPUCuller", $"Hi-Z pyramid created: {_hiZWidth}x{_hiZHeight}, {_hiZMipCount} mips, SRV={_hiZPyramidSRV}");
-        }
-        
         /// <summary>
         /// Generate the Hi-Z depth pyramid from the current depth buffer.
         /// Call after GBuffer pass, when depth is in PixelShaderResource state.
         /// </summary>
         /// <param name="commandList">Command list to record to</param>
         /// <param name="depthSrvIndex">Bindless SRV index of the source depth buffer (R32_Float view)</param>
-        public void GenerateHiZPyramid(ID3D12GraphicsCommandList commandList, uint depthSrvIndex)
+        /// <param name="pyramid">Hi-Z pyramid to write into (owned by DeferredRenderer)</param>
+        public void GenerateHiZPyramid(ID3D12GraphicsCommandList commandList, uint depthSrvIndex, HiZPyramid pyramid)
         {
-            if (_downsamplePSO == null || _hiZPyramid == null || _hiZMipCount == 0) return;
+            if (_downsamplePSO == null || pyramid?.Texture == null || pyramid.MipCount == 0) return;
             
-            bool firstGeneration = !_hiZReady;
-            _hiZReady = true;  // Pyramid will be valid after this dispatch
+            bool firstGeneration = !pyramid.Ready;
+            pyramid.Ready = true;  // Pyramid will be valid after this dispatch
             
             commandList.SetComputeRootSignature(_device.GlobalRootSignature);
             _cachedSrvHeapArray ??= new[] { _device.SrvHeap };
             commandList.SetDescriptorHeaps(1, _cachedSrvHeapArray);
             commandList.SetPipelineState(_downsamplePSO);
             
-            int w = _hiZWidth;
-            int h = _hiZHeight;
+            int w = pyramid.Width;
+            int h = pyramid.Height;
             
-            for (int mip = 0; mip < _hiZMipCount; mip++)
+            for (int mip = 0; mip < pyramid.MipCount; mip++)
             {
                 // Transition this mip to UAV for writing
                 // First generation: ALL mips start in Common (just created); subsequent: all mips in NonPixelShaderResource
                 var beforeState = firstGeneration ? ResourceStates.Common : ResourceStates.NonPixelShaderResource;
                 commandList.ResourceBarrier(new ResourceBarrier(
-                    new ResourceTransitionBarrier(_hiZPyramid,
+                    new ResourceTransitionBarrier(pyramid.Texture,
                         beforeState,
                         ResourceStates.UnorderedAccess,
                         (uint)mip)));
                 
                 // Set push constants: InputMipIdx, OutputMipIdx, OutputWidth, OutputHeight
-                uint inputSrv = mip == 0 ? depthSrvIndex : _hiZMipSRVs[mip - 1];
+                uint inputSrv = mip == 0 ? depthSrvIndex : pyramid.MipSRVs[mip - 1];
                 commandList.SetComputeRoot32BitConstant(0, inputSrv, 0);
-                commandList.SetComputeRoot32BitConstant(0, _hiZMipUAVs[mip], 1);
+                commandList.SetComputeRoot32BitConstant(0, pyramid.MipUAVs[mip], 1);
                 commandList.SetComputeRoot32BitConstant(0, (uint)w, 2);
                 commandList.SetComputeRoot32BitConstant(0, (uint)h, 3);
                 
@@ -938,7 +842,7 @@ namespace Freefall.Graphics
                 
                 // Transition this mip to SRV for reading by next level
                 commandList.ResourceBarrier(new ResourceBarrier(
-                    new ResourceTransitionBarrier(_hiZPyramid,
+                    new ResourceTransitionBarrier(pyramid.Texture,
                         ResourceStates.UnorderedAccess,
                         ResourceStates.NonPixelShaderResource,
                         (uint)mip)));
@@ -948,8 +852,6 @@ namespace Freefall.Graphics
                 h = Math.Max(1, h / 2);
             }
             
-            // Final transition: all subresources to PixelShaderResource | NonPixelShaderResource
-            // so CSVisibility can sample via Load
             // Note: individual mip subresources are already in NonPixelShaderResource from the loop above
         }
 
@@ -1095,7 +997,6 @@ namespace Freefall.Graphics
             _depthHistogramPSO?.Dispose();
             _computeSplitsPSO?.Dispose();
             _clearUAVHeap?.Dispose();
-            _hiZPyramid?.Dispose();
             _depthMinMaxBuffer?.Dispose();
             _depthHistogramBuffer?.Dispose();
             _depthSplitsBuffer?.Dispose();

@@ -231,35 +231,31 @@ namespace Freefall.Graphics
             /// </summary>
             public IReadOnlyList<InstanceBatch> AllBatches => allBatches;
             
-            // Shared frustum constant buffers (frame-level, uploaded once before batch loop)
+            // Shared frustum constant buffers for non-opaque passes (no Hi-Z)
             private static ID3D12Resource[]? _frustumConstantsBuffers;
             private static bool _frustumBuffersInitialized;
-            
-            // Previous frame's ViewProjection — Hi-Z depth is 1 frame behind,
-            // so occlusion must project using the VP that matches the depth data
-            private static Matrix4x4 _previousFrameViewProjection;
             
             private static void EnsureFrustumBuffers(GraphicsDevice device)
             {
                 if (_frustumBuffersInitialized) return;
                 
                 _frustumConstantsBuffers = new ID3D12Resource[FrameCount];
-                int bufferSize = 256; // 6 * 16 bytes = 96 bytes, aligned to 256 for CBV
+                int bufferSize = 256;
                 
                 for (int i = 0; i < FrameCount; i++)
-                {
                     _frustumConstantsBuffers[i] = device.CreateUploadBuffer(bufferSize);
-                }
                 _frustumBuffersInitialized = true;
             }
             
-            private static ulong UploadFrustumPlanes(GraphicsDevice device, Vector4[] frustumPlanes)
+            /// <summary>
+            /// Upload simple frustum planes (no Hi-Z) for non-opaque passes.
+            /// </summary>
+            private static ulong UploadSimpleFrustumPlanes(GraphicsDevice device, Vector4[] frustumPlanes)
             {
                 EnsureFrustumBuffers(device);
                 
                 int frameIndex = Engine.FrameIndex % FrameCount;
                 
-                // Build full frustum constants including Hi-Z parameters
                 var constants = new GPUCuller.FrustumConstants
                 {
                     Plane0 = frustumPlanes[0],
@@ -269,32 +265,6 @@ namespace Freefall.Graphics
                     Plane4 = frustumPlanes[4],
                     Plane5 = frustumPlanes[5],
                 };
-                
-                // Add Hi-Z occlusion data if available and pyramid has been generated
-                var culler = CommandBuffer.Culler;
-                if (culler != null && culler.HiZPyramidSRV != 0 && culler.HiZReady && !Engine.Settings.DisableHiZ)
-                {
-                    // Hi-Z depth is from the previous frame, so project spheres
-                    // using the previous frame's VP to match the depth data
-                    constants.OcclusionProjection = Engine.Settings.FreezeFrustum
-                        ? Engine.Settings.FrozenViewProjection
-                        : _previousFrameViewProjection;
-                    constants.HiZSrvIdx = culler.HiZPyramidSRV;
-                    constants.HiZWidth = culler.HiZWidth;
-                    constants.HiZHeight = culler.HiZHeight;
-                    constants.HiZMipCount = (uint)culler.HiZMipCount;
-                    constants.NearPlane = Camera.Main.NearPlane;
-                }
-                
-                // Debug visualization mode
-                constants.DebugMode = (uint)Engine.Settings.DebugVisualizationMode;
-                
-                // Cull stats UAV (always set if culler is initialized)
-                if (culler != null)
-                    constants.CullStatsUAVIdx = culler.CullStatsUAV;
-                
-                // Store current VP for next frame's occlusion projection
-                _previousFrameViewProjection = Camera.Main.ViewProjection;
                 
                 unsafe
                 {
@@ -357,7 +327,12 @@ namespace Freefall.Graphics
                     instanceCount, meshPartId, customBindings);
             }
 
-            public void Execute(ID3D12GraphicsCommandList commandList, GraphicsDevice device, RenderPass pass)
+            /// <summary>
+            /// Execute this pass: merge buckets, upload, build, cull, draw.
+            /// </summary>
+            /// <param name="frustumGpuAddr">GPU address of frustum constants. 
+            /// If 0, a simple frustum (no Hi-Z) is built internally.</param>
+            public void Execute(ID3D12GraphicsCommandList commandList, GraphicsDevice device, RenderPass pass, ulong frustumGpuAddr = 0)
             {
                 var totalSw = System.Diagnostics.Stopwatch.StartNew();
                                 
@@ -423,14 +398,17 @@ namespace Freefall.Graphics
                 var sortDrawCallsSw = System.Diagnostics.Stopwatch.StartNew();
                 bool usingGPUPath = Culler != null && pass == RenderPass.Opaque;
 
-                // 2. Build commands (each batch type handles its own path)
-                // Use frozen frustum if F3 was pressed, otherwise use current camera
-                var vpMatrix = Engine.Settings.FreezeFrustum 
-                    ? Engine.Settings.FrozenViewProjection 
-                    : Camera.Main.ViewProjection;
-                var frustum = new Frustum(vpMatrix);
-                var frustumPlanes = frustum.GetPlanesAsVector4();
-                ulong frustumBufferGPUAddress = UploadFrustumPlanes(device, frustumPlanes);
+                // 2. Build frustum if not provided externally
+                ulong frustumBufferGPUAddress = frustumGpuAddr;
+                if (frustumBufferGPUAddress == 0)
+                {
+                    var vpMatrix = Engine.Settings.FreezeFrustum 
+                        ? Engine.Settings.FrozenViewProjection 
+                        : Camera.Main.ViewProjection;
+                    var frustum = new Frustum(vpMatrix);
+                    var frustumPlanes = frustum.GetPlanesAsVector4();
+                    frustumBufferGPUAddress = UploadSimpleFrustumPlanes(device, frustumPlanes);
+                }
 
                 foreach (var batch in activeBatches)
                     batch.Material.SetPass(pass);
@@ -465,11 +443,6 @@ namespace Freefall.Graphics
                     // Apply Material (PSO)
                     applySw.Start();
                     batch.Material.Apply(commandList, device);
-                    // Set topology per-batch: tessellation shaders require patch topology
-                    var topology = batch.Material.HasTessellation
-                        ? Vortice.Direct3D.PrimitiveTopology.PatchListWith3ControlPoints
-                        : Vortice.Direct3D.PrimitiveTopology.TriangleList;
-                    commandList.IASetPrimitiveTopology(topology);
                     // Push constant slot 16: debug mode (not touched by command signature slots 2-15)
                     commandList.SetGraphicsRoot32BitConstant(0, (uint)Engine.Settings.DebugVisualizationMode, 16);
                     applySw.Stop();
@@ -481,7 +454,6 @@ namespace Freefall.Graphics
                 
                 foreach (var batch in activeBatches)
                     batch.ResetBufferState(commandList);
-                    
                     
                 totalSw.Stop();
                 
@@ -512,15 +484,6 @@ namespace Freefall.Graphics
             Culler = new GPUCuller(device);
             Culler.Initialize();
             Debug.Log("[CommandBuffer] GPU Culler initialized");
-            
-            // Create Hi-Z pyramid if renderer is already set up
-            var renderer = DeferredRenderer.Current;
-            if (renderer?.Depth != null)
-            {
-                int w = (int)renderer.Depth.Native.Description.Width;
-                int h = (int)renderer.Depth.Native.Description.Height;
-                Culler.CreateHiZPyramid(w, h);
-            }
         }
         
         /// <summary>
@@ -618,7 +581,7 @@ namespace Freefall.Graphics
             }
         }
 
-        public static void Execute(RenderPass pass, ID3D12GraphicsCommandList commandList, GraphicsDevice device)
+        public static void Execute(RenderPass pass, ID3D12GraphicsCommandList commandList, GraphicsDevice device, ulong frustumGpuAddr = 0)
         {
             // 1. Custom Actions (single-threaded submission, no concurrent modification possible)
             var queue = current.customQueues[pass];
@@ -627,7 +590,7 @@ namespace Freefall.Graphics
             queue.Clear();
 
             // 2. Batches
-            current.passes[(int)pass].Execute(commandList, device, pass);
+            current.passes[(int)pass].Execute(commandList, device, pass, frustumGpuAddr);
         }
 
         public static void Clear()

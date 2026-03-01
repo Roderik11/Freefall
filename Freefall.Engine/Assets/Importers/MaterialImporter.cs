@@ -1,6 +1,7 @@
 using System.IO;
 using System.Text;
 using Freefall.Assets.Packers;
+using Freefall.Graphics;
 
 namespace Freefall.Assets.Importers
 {
@@ -11,6 +12,13 @@ namespace Freefall.Assets.Importers
     [AssetImporter(".mat")]
     public class MaterialImporter : IImporter
     {
+        /// <summary>
+        /// .mat files ARE the asset definition — inspect the loaded Material, not the importer.
+        /// </summary>
+        public object GetInspectionTarget(MetaFile meta)
+        {
+            return Engine.Assets.LoadByGuid<Material>(meta.Guid);
+        }
         public ImportResult Import(string filepath)
         {
             var result = new ImportResult();
