@@ -19,8 +19,10 @@ namespace Freefall.Graphics
         public uint MetallicIdx;
         public uint EmissiveIdx;
         public uint AOIdx;
+        public uint DetailNormalIdx;
+        public uint DetailMaskIdx;
+        public uint DetailTilingPacked; // float reinterpreted as uint bits
         public uint Padding0;
-        public uint Padding1;
     }
     
     /// <summary>
@@ -273,42 +275,79 @@ namespace Freefall.Graphics
             {
                 var currentPass = firstTechnique.Passes[passIndex];
                 
-                var psoDesc = psoDescBase;
-                psoDesc.VertexShader = currentPass.VertexShader?.Bytecode ?? default;
-                psoDesc.PixelShader = currentPass.PixelShader?.Bytecode ?? default;
-                psoDesc.HullShader = currentPass.HullShader?.Bytecode ?? default;
-                psoDesc.DomainShader = currentPass.DomainShader?.Bytecode ?? default;
-                
-                // Tessellation requires Patch topology type in PSO
-                if (currentPass.HullShader != null)
-                    psoDesc.PrimitiveTopologyType = PrimitiveTopologyType.Patch;
-                
-                // Shadow pass: depth-only rendering (0 RTVs, D32 DSV, depth write enabled)
-                // Use the parsed RenderPass enum instead of string comparison (Apex pattern)
+                // Shadow pass overrides (shared by both traditional and mesh shader paths)
                 var passType = _subShaders[0].ShaderPasses[passIndex].RenderPass;
+                var passRtvFormats = rtvFormats;
+                var passDepthFormat = depthFormat;
+                var passDepthDesc = depthDesc;
+                var passRasterDesc = rasterizerDesc;
+                
                 if (passType == RenderPass.Shadow)
                 {
-                    psoDesc.RenderTargetFormats = Array.Empty<Format>();
-                    psoDesc.DepthStencilFormat = Format.D32_Float;
-                    psoDesc.DepthStencilState = new DepthStencilDescription
+                    passRtvFormats = Array.Empty<Format>();
+                    passDepthFormat = Format.D32_Float;
+                    passDepthDesc = new DepthStencilDescription
                     {
                         DepthEnable = true,
                         DepthWriteMask = DepthWriteMask.All,
-                        DepthFunc = ComparisonFunction.LessEqual, // Shadow maps use standard Z (orthographic)
+                        DepthFunc = ComparisonFunction.LessEqual,
                         StencilEnable = false
                     };
                     var shadowRaster = new RasterizerDescription(CullMode.None, FillMode.Solid);
                     shadowRaster.DepthBias = 1000;
                     shadowRaster.SlopeScaledDepthBias = 1.0f;
                     shadowRaster.DepthBiasClamp = 0.0f;
-                    psoDesc.RasterizerState = shadowRaster;
+                    passRasterDesc = shadowRaster;
                 }
                 
-                _passPipelineStates[passIndex] = new PipelineState(device, rootSignature, psoDesc);
-                
-                // Create wireframe PSO variant
-                psoDesc.RasterizerState = new RasterizerDescription(CullMode.None, FillMode.Wireframe);
-                _passWireframePSOs[passIndex] = new PipelineState(device, rootSignature, psoDesc);
+                if (currentPass.IsMeshShaderPass)
+                {
+                    // Mesh shader pipeline: AS → MS → PS (no vertex/geometry/tessellation shaders)
+                    var meshPsoDesc = new PipelineState.MeshShaderPSODescription
+                    {
+                        AmplificationShader = currentPass.AmplificationShader?.Bytecode ?? default,
+                        MeshShader = currentPass.MeshShader!.Bytecode,
+                        PixelShader = currentPass.PixelShader?.Bytecode ?? default,
+                        RasterizerState = passRasterDesc,
+                        BlendState = blendDesc,
+                        DepthStencilState = passDepthDesc,
+                        RenderTargetFormats = passRtvFormats,
+                        DepthStencilFormat = passDepthFormat,
+                        SampleDescription = new SampleDescription(1, 0),
+                        SampleMask = uint.MaxValue,
+                    };
+                    
+                    _passPipelineStates[passIndex] = new PipelineState(device, rootSignature, meshPsoDesc);
+                    
+                    // Wireframe variant for mesh shaders
+                    meshPsoDesc.RasterizerState = new RasterizerDescription(CullMode.None, FillMode.Wireframe);
+                    _passWireframePSOs[passIndex] = new PipelineState(device, rootSignature, meshPsoDesc);
+                }
+                else
+                {
+                    // Traditional pipeline: VS → [HS → DS →] [GS →] PS
+                    var psoDesc = psoDescBase;
+                    psoDesc.VertexShader = currentPass.VertexShader?.Bytecode ?? default;
+                    psoDesc.PixelShader = currentPass.PixelShader?.Bytecode ?? default;
+                    psoDesc.HullShader = currentPass.HullShader?.Bytecode ?? default;
+                    psoDesc.DomainShader = currentPass.DomainShader?.Bytecode ?? default;
+                    
+                    if (currentPass.HullShader != null)
+                        psoDesc.PrimitiveTopologyType = PrimitiveTopologyType.Patch;
+                    
+                    if (passType == RenderPass.Shadow)
+                    {
+                        psoDesc.RenderTargetFormats = passRtvFormats;
+                        psoDesc.DepthStencilFormat = passDepthFormat;
+                        psoDesc.DepthStencilState = passDepthDesc;
+                        psoDesc.RasterizerState = passRasterDesc;
+                    }
+                    
+                    _passPipelineStates[passIndex] = new PipelineState(device, rootSignature, psoDesc);
+                    
+                    psoDesc.RasterizerState = new RasterizerDescription(CullMode.None, FillMode.Wireframe);
+                    _passWireframePSOs[passIndex] = new PipelineState(device, rootSignature, psoDesc);
+                }
                 
                 // Reflection for constant buffers (from first pass for simplicity)
                 if (passIndex == 0)
@@ -317,6 +356,8 @@ namespace Freefall.Graphics
                     if (currentPass.PixelShader?.Reflection != null) CreateConstantBuffers(device, currentPass.PixelShader.Reflection);
                     if (currentPass.HullShader?.Reflection != null) CreateConstantBuffers(device, currentPass.HullShader.Reflection);
                     if (currentPass.DomainShader?.Reflection != null) CreateConstantBuffers(device, currentPass.DomainShader.Reflection);
+                    if (currentPass.MeshShader?.Reflection != null) CreateConstantBuffers(device, currentPass.MeshShader.Reflection);
+                    if (currentPass.AmplificationShader?.Reflection != null) CreateConstantBuffers(device, currentPass.AmplificationShader.Reflection);
                 }
             }
             
@@ -411,6 +452,21 @@ namespace Freefall.Graphics
         }
         
         /// <summary>
+        /// Set detail map tiling scale. Stored as float bits in MaterialData.
+        /// </summary>
+        public void SetDetailTiling(float tiling)
+        {
+            lock (_materialIdLock)
+            {
+                if (MaterialID < 0 || MaterialID >= _allMaterials.Count) return;
+                var data = _allMaterials[MaterialID];
+                data.DetailTilingPacked = BitConverter.SingleToUInt32Bits(tiling);
+                _allMaterials[MaterialID] = data;
+                _materialsBufferDirty = true;
+            }
+        }
+        
+        /// <summary>
         /// Update this material's data in the global MaterialsBuffer when textures change
         /// </summary>
         private void UpdateMaterialData(string name, uint bindlessIdx)
@@ -441,6 +497,12 @@ namespace Freefall.Graphics
                         break;
                     case "AO":
                         data.AOIdx = bindlessIdx;
+                        break;
+                    case "DetailNormal":
+                        data.DetailNormalIdx = bindlessIdx;
+                        break;
+                    case "DetailMask":
+                        data.DetailMaskIdx = bindlessIdx;
                         break;
                 }
                 _allMaterials[MaterialID] = data;

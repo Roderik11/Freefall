@@ -43,7 +43,7 @@ namespace Freefall.Components
         public bool ControlSunLight = true;     // Enable/disable automatic sun light control
       
         [ValueRange(0f, 10f)]
-        public float DayIntensity = 1.0f;       // Sun intensity at noon
+        public float DayIntensity = 3.14159f;       // Sun intensity at noon
         [ValueRange(0f, 10f)]
         public float NightIntensity = 0.1f;     // Ambient intensity at night
 

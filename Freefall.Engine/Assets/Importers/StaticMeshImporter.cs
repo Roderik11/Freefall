@@ -21,6 +21,7 @@ namespace Freefall.Assets.Importers
     [AssetImporter(".staticmesh")]
     public class StaticMeshImporter : IImporter
     {
+        public Type AssetType => typeof(StaticMesh);
         /// <summary>
         /// .staticmesh files ARE the asset definition — inspect the loaded StaticMesh, not the importer.
         /// </summary>

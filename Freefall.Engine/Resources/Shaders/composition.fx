@@ -59,9 +59,23 @@ float4 PS(VSOutput input) : SV_Target
     float hemi = normal.y * 0.5 + 0.5;               // remap [-1,1] → [0,1]
     float3 ambient = lerp(groundColor, skyColor, hemi) * ao * AmbientScale;
     
-    // Light buffer contains pre-lit PBR color (albedo already baked into diffuse term)
-    // Additive model: ambient*albedo + light; lerp with data.w for unlit bypass (skybox)
-    float3 finalColor = lerp(albedo.rgb, ambient * albedo.rgb + light.rgb, data.w);
+    // data.a flags: 0=unlit (skybox), >0=lit (0.5=vegetation, 1.0=standard PBR)
+    float isLit = step(0.1, data.a);
+    float3 finalColor = lerp(albedo.rgb, ambient * albedo.rgb + light.rgb, isLit);
+    
+    // ACES Filmic Tone Mapping (Narkowicz 2015 approximation)
+    // Compresses highlights, deepens shadows, adds warmth
+    float3 x = finalColor;
+    finalColor = (x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14);
+    finalColor = saturate(finalColor);
+    
+    // Vibrance boost: selectively saturate under-saturated pixels
+    // (already-vivid colors stay put, muted terrain/rock gets pushed)
+    float luma = dot(finalColor, float3(0.2126, 0.7152, 0.0722));
+    float currentSat = max(finalColor.r, max(finalColor.g, finalColor.b)) - min(finalColor.r, min(finalColor.g, finalColor.b));
+    float vibranceAmount = (1.0 - currentSat) * 0.15; // subtle vibrance on desaturated pixels
+    finalColor = lerp(float3(luma, luma, luma), finalColor, 1.0 + vibranceAmount);
+    finalColor = saturate(finalColor);
     
     // Final Gamma Correction (Linear -> sRGB)
     finalColor = pow(abs(finalColor), 1.0f / 2.2f);

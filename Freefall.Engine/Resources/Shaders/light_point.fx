@@ -131,21 +131,25 @@ float4 PS(VSOutput input) : SV_Target
     float3 L = toLight / dist;
     
     // N·L
-    float NdotL = max(dot(normal, L), 0.0);
+    float rawNdotL = dot(normal, L);
+    float NdotL = max(rawNdotL, 0.0);
     
-    if (NdotL <= 0.0)
+    // Vegetation flag: data.a = 0.5
+    Texture2D DataTex = ResourceDescriptorHeap[DataTexIdx];
+    float4 dataFull = DataTex.Sample(Sampler, uv);
+    bool isVegetation = (dataFull.a > 0.3 && dataFull.a < 0.7);
+    
+    if (NdotL <= 0.0 && !isVegetation)
         discard;
     
     // Attenuation: smooth falloff at range boundary
     float attenuation = saturate(1.0 - (dist / light.Range));
     attenuation *= attenuation; // Quadratic falloff
     
-    // Final lighting
-    // PBR lighting
+    // Read material data (already sampled for vegetation check)
     Texture2D AlbedoTex = ResourceDescriptorHeap[AlbedoTexIdx];
-    Texture2D DataTex = ResourceDescriptorHeap[DataTexIdx];
     float3 albedo = AlbedoTex.Sample(Sampler, uv).rgb;
-    float3 data = DataTex.Sample(Sampler, uv).rgb;
+    float3 data = dataFull.rgb;
     
     float rough = max(data.r, 0.04);
     float metal = saturate(data.g);
@@ -184,8 +188,21 @@ float4 PS(VSOutput input) : SV_Target
     float3 diffuse = kd * (albedo / 3.14159);
     
     // Final lighting with attenuation
-    float3 radiance = light.Color * light.Intensity * NdotL * attenuation;
-    float3 lighting = (diffuse + spec) * radiance * ao;
+    float3 lighting;
+    if (isVegetation)
+    {
+        float wrapNdotL = rawNdotL * 0.5 + 0.5;
+        float stdNdotL = max(rawNdotL, 0.0);
+        float sunFacing = saturate(rawNdotL * 2.0);
+        float vegNdotL = lerp(stdNdotL, wrapNdotL, sunFacing);
+        float3 radiance = light.Color * light.Intensity * vegNdotL * attenuation;
+        lighting = diffuse * radiance * ao;
+    }
+    else
+    {
+        float3 radiance = light.Color * light.Intensity * NdotL * attenuation;
+        lighting = (diffuse + spec) * radiance * ao;
+    }
     
     return float4(lighting, 1.0);
 }

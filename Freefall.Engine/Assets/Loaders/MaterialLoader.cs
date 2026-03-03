@@ -69,6 +69,16 @@ namespace Freefall.Assets.Loaders
                 else
                     Debug.LogWarning("MaterialLoader", $"Could not resolve texture '{texRef}' for slot '{slot}'");
             }
+            
+            // Handle DetailTiling parameter (stored as float bits in MaterialData)
+            if (def.Parameters.TryGetValue("DetailTiling", out var tilingStr))
+            {
+                if (float.TryParse(tilingStr, System.Globalization.NumberStyles.Float, 
+                    System.Globalization.CultureInfo.InvariantCulture, out float tiling))
+                {
+                    material.SetDetailTiling(tiling);
+                }
+            }
 
             return material;
         }

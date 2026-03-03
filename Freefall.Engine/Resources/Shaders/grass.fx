@@ -24,8 +24,9 @@
 #define MaterialsBufferIdx  GET_INDEX(14)
 #define CellSize            asfloat(GET_INDEX(15))
 #define DecoRadius          asfloat(GET_INDEX(16))
-#define TotalDensity        asfloat(GET_INDEX(17))
-#define ControlMapsIdx      GET_INDEX(18)
+#define WindTime            asfloat(GET_INDEX(17))
+#define DecoControlIdx      GET_INDEX(18)
+#define BakedAlbedoIdx      GET_INDEX(19)
 
 // ─── GPU structs ───────────────────────────────────────────────────────────
 
@@ -41,8 +42,10 @@ struct DecoratorSlot
     // Precomputed root rotation matrix (CPU-computed, zero GPU trig)
     float3x3 RootMat;
     float SlopeBias;
-    uint ControlMapIndex;   // array slice in ControlMaps Texture2DArray
-    uint ControlChannel;    // 0=R, 1=G, 2=B, 3=A
+    uint DecoMapSlice;      // slice in DecoMaps Texture2DArray (0xFFFFFFFF = none)
+    uint _pad0;             // was ControlChannel, now unused (always sample R)
+    uint Mode;              // 0=Mesh, 1=Billboard, 2=Cross
+    uint TextureIdx;        // bindless texture index (billboard/cross)
 };
 
 struct LODEntry { uint MeshPartId; float MaxDistance; uint MaterialId; uint _pad; };
@@ -63,6 +66,13 @@ struct MeshPartEntry
 #define MS_MAX_THREADS 128
 #define MAX_VERTS 256
 #define MAX_PRIMS 256
+
+#define MODE_MESH      0
+#define MODE_BILLBOARD 1
+#define MODE_CROSS     2
+
+#define BILLBOARD_VERTS 6
+#define CROSS_VERTS    12
 
 SamplerState HeightSampler : register(s0);
 SamplerState ClampSampler  : register(s2);  // linear clamp (matches gputerrain.fx sampHeightFilter)
@@ -88,14 +98,32 @@ float2 hash22(float2 p)
 struct ASPayload
 {
     float2 TileOrigin;
-    uint   InstanceCount;
-    uint   VertsPerInstance;
+    uint   ActiveCount;           // number of active decorators in this tile (0-8)
+    uint   GroupsPerDecorator;    // MS groups needed per decorator (worst-case across active)
+    uint   SlotIndices0;          // packed 4×8-bit slot indices (slots 0-3)
+    uint   SlotIndices1;          // packed 4×8-bit slot indices (slots 4-7)
+    uint   Weights0;              // packed 4×8-bit weights (decorators 0-3)
+    uint   Weights1;              // packed 4×8-bit weights (decorators 4-7)
+    uint   InstanceCounts0;       // packed 4×8-bit instance counts (decorators 0-3)
+    uint   InstanceCounts1;       // packed 4×8-bit instance counts (decorators 4-7)
 };
+
+// Pack/unpack helpers for 8-bit values in a uint
+uint Pack4x8(uint a, uint b, uint c, uint d)
+{
+    return (a & 0xFF) | ((b & 0xFF) << 8) | ((c & 0xFF) << 16) | ((d & 0xFF) << 24);
+}
+uint Unpack8(uint packed0, uint packed1, uint which)
+{
+    uint packed = which < 4 ? packed0 : packed1;
+    uint shift = (which % 4) * 8;
+    return (packed >> shift) & 0xFF;
+}
 
 groupshared ASPayload s_Payload;
 
 [numthreads(TILE_SIZE, TILE_SIZE, 1)]
-void AS(uint3 gid : SV_GroupID, uint gidx : SV_GroupIndex)
+void AS(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint gidx : SV_GroupIndex)
 {
     float3 camPos = float3(CamPosX, CamPosY, CamPosZ);
     float cs = CellSize;
@@ -113,37 +141,143 @@ void AS(uint3 gid : SV_GroupID, uint gidx : SV_GroupIndex)
     float tileDist = distance(float2(camPos.x, camPos.z), tileCenter);
     bool tileAlive = tileDist < (range + tileSize);
 
-    // Read vert count from first decoration's mesh
-    StructuredBuffer<ChannelHeader> headers = ResourceDescriptorHeap[ChannelHeadersIdx];
+    // Frustum culling: test tile AABB against 4 side frustum planes
+    // Extract planes from ViewProjection (row-major): plane = col ± col
+    if (tileAlive)
+    {
+        // Tile AABB: XZ from tileOrigin, Y from terrain bounds (generous range)
+        float minY = TerrainOriginZ;                   // terrain base
+        float maxY = TerrainOriginZ + MaxHeight + 2.0;  // terrain peak + grass height margin
+
+        float3 bboxMin = float3(tileOrigin.x, minY, tileOrigin.y);
+        float3 bboxMax = float3(tileOrigin.x + tileSize, maxY, tileOrigin.y + tileSize);
+
+        // Extract 4 frustum planes from ViewProjection
+        // With row-vector mul (mul(pos, VP)) and row_major, planes come from COLUMNS
+        float4 c0 = float4(ViewProjection[0][0], ViewProjection[1][0], ViewProjection[2][0], ViewProjection[3][0]);
+        float4 c1 = float4(ViewProjection[0][1], ViewProjection[1][1], ViewProjection[2][1], ViewProjection[3][1]);
+        float4 c3 = float4(ViewProjection[0][3], ViewProjection[1][3], ViewProjection[2][3], ViewProjection[3][3]);
+
+        float4 planes[4];
+        planes[0] = c3 + c0;  // left
+        planes[1] = c3 - c0;  // right
+        planes[2] = c3 + c1;  // bottom
+        planes[3] = c3 - c1;  // top
+
+        [unroll] for (uint pi = 0; pi < 4; pi++)
+        {
+            float4 p = planes[pi];
+            // Test the "most positive" corner of the AABB against the plane
+            float3 pv = float3(
+                p.x > 0 ? bboxMax.x : bboxMin.x,
+                p.y > 0 ? bboxMax.y : bboxMin.y,
+                p.z > 0 ? bboxMax.z : bboxMin.z
+            );
+            if (dot(p.xyz, pv) + p.w < 0)
+            {
+                tileAlive = false;
+                break;
+            }
+        }
+    }
+
+    // ── Thread 0: sample CONTROL once at tile center, build active list ──
     StructuredBuffer<DecoratorSlot> slots   = ResourceDescriptorHeap[DecoratorSlotsIdx];
     StructuredBuffer<LODEntry>      lodTbl  = ResourceDescriptorHeap[LODTableIdx];
     StructuredBuffer<MeshPartEntry> registry = ResourceDescriptorHeap[MeshRegistryIdx];
 
-    uint vpi = 3;
-    ChannelHeader asHdr = headers[0];
-    uint hdrCount = min(asHdr.Count, 32); // cap for safety
-    for (uint si = 0; si < hdrCount; si++)
-    {
-        DecoratorSlot s = slots[asHdr.StartIndex + si];
-        if (s.LODCount > 0 && s.LODCount <= 8)
-        {
-            uint vc = registry[lodTbl[s.LODTableOffset].MeshPartId].VertexCount;
-            vpi = max(vpi, vc);
-        }
-    }
-    vpi = clamp(vpi, 3, 128);
-
     if (gidx == 0)
     {
+        uint activeCount = 0;
+        uint activeSlots[8];
+        uint activeWeights[8];
+        uint activeCounts[8];
+        uint vpi = 3;
+
+        [unroll] for (uint k = 0; k < 8; k++)
+        {
+            activeSlots[k] = 255;
+            activeWeights[k] = 0;
+            activeCounts[k] = 0;
+        }
+
+        if (tileAlive && DecoControlIdx != 0)
+        {
+            // Tile center UV
+            float2 texelUV = float2(
+                (tileCenter.x - TerrainOriginX) / TerrainSizeX,
+                (tileCenter.y - TerrainOriginY) / TerrainSizeY
+            );
+
+            if (texelUV.x >= 0 && texelUV.x <= 1 && texelUV.y >= 0 && texelUV.y <= 1)
+            {
+                Texture2DArray<uint4> controlTex = ResourceDescriptorHeap[DecoControlIdx];
+                uint ctrlW, ctrlH, ctrlSlices;
+                controlTex.GetDimensions(ctrlW, ctrlH, ctrlSlices);
+
+                float2 ctrlUV = float2(texelUV.x, 1.0 - texelUV.y);
+                int2 texel = int2(ctrlUV * float2(ctrlW, ctrlH));
+
+                uint4 ctrl0 = controlTex.Load(int4(texel, 0, 0));
+                uint4 ctrl1 = controlTex.Load(int4(texel, 1, 0));
+
+                // Unpack CONTROL: up to 8 (slotIndex, weight) pairs
+                uint4 allCtrl[2] = { ctrl0, ctrl1 };
+                [unroll] for (uint ci = 0; ci < 8; ci++)
+                {
+                    uint packed = allCtrl[ci / 4][ci % 4];
+                    uint slotIdx = packed >> 8;
+                    uint weight  = packed & 0xFF;
+                    if (slotIdx == 255 || weight == 0) break;
+
+                    activeSlots[activeCount] = slotIdx;
+                    activeWeights[activeCount] = weight;
+
+                    // Instance count: density × tile area × weight/255, up to 255 (8-bit payload)
+                    // Can exceed 64 — multiple instances per cell at high density
+                    DecoratorSlot s = slots[slotIdx];
+                    float tileArea = tileSize * tileSize;
+                    uint maxInst = max(1u, min(255u, (uint)(s.Density * tileArea + 0.5)));
+                    activeCounts[activeCount] = max(1u, min(255u, (maxInst * weight + 127) / 255));
+
+                    // Vertex count for groupsPerDeco calculation
+                    if (s.Mode == MODE_BILLBOARD)
+                        vpi = max(vpi, BILLBOARD_VERTS);
+                    else if (s.Mode == MODE_CROSS)
+                        vpi = max(vpi, CROSS_VERTS);
+                    else if (s.LODCount > 0 && s.LODCount <= 8)
+                    {
+                        uint vc = registry[lodTbl[s.LODTableOffset].MeshPartId].VertexCount;
+                        vpi = max(vpi, vc);
+                    }
+                    activeCount++;
+                }
+            }
+        }
+        vpi = clamp(vpi, 3, 128);
+
+        // groupsPerDeco from max instance count across active decorators
+        uint maxCount = 0;
+        [unroll] for (uint mi = 0; mi < 8; mi++)
+            maxCount = max(maxCount, activeCounts[mi]);
+
+        uint ipg = max(1, min(MS_MAX_THREADS / vpi, MAX_VERTS / vpi));
+        uint groupsPerDeco = (maxCount + ipg - 1) / ipg;
+
         s_Payload.TileOrigin = tileOrigin;
-        s_Payload.InstanceCount = tileAlive ? CELLS_PER_TILE : 0;
-        s_Payload.VertsPerInstance = vpi;
+        s_Payload.ActiveCount = activeCount;
+        s_Payload.GroupsPerDecorator = groupsPerDeco;
+        s_Payload.SlotIndices0 = Pack4x8(activeSlots[0], activeSlots[1], activeSlots[2], activeSlots[3]);
+        s_Payload.SlotIndices1 = Pack4x8(activeSlots[4], activeSlots[5], activeSlots[6], activeSlots[7]);
+        s_Payload.Weights0 = Pack4x8(activeWeights[0], activeWeights[1], activeWeights[2], activeWeights[3]);
+        s_Payload.Weights1 = Pack4x8(activeWeights[4], activeWeights[5], activeWeights[6], activeWeights[7]);
+        s_Payload.InstanceCounts0 = Pack4x8(activeCounts[0], activeCounts[1], activeCounts[2], activeCounts[3]);
+        s_Payload.InstanceCounts1 = Pack4x8(activeCounts[4], activeCounts[5], activeCounts[6], activeCounts[7]);
     }
     GroupMemoryBarrierWithGroupSync();
 
-    uint ipg = max(1, min(MS_MAX_THREADS / vpi, MAX_VERTS / vpi));
-    uint msGroups = tileAlive ? ((CELLS_PER_TILE + ipg - 1) / ipg) : 0;
-    DispatchMesh(msGroups, 1, 1, s_Payload);
+    uint totalGroups = s_Payload.ActiveCount * s_Payload.GroupsPerDecorator;
+    DispatchMesh(totalGroups, 1, 1, s_Payload);
 }
 
 // ─── Mesh Shader ───────────────────────────────────────────────────────────
@@ -160,7 +294,11 @@ struct MSOutput
     float2 TexCoord : TEXCOORD0;
     float4 WorldPos : TEXCOORD1;
     float  Depth    : TEXCOORD2;
-    nointerpolation uint MaterialId : TEXCOORD3;
+    nointerpolation uint MaterialId      : TEXCOORD3;
+    nointerpolation uint TextureOverride  : TEXCOORD4;  // >0: use directly (billboard/cross)
+    float  HeightFrac : TEXCOORD5;  // 0=base, 1=top — for vertex AO
+    float2 TerrainUV  : TEXCOORD6;  // UV in terrain space for ground color sampling
+    nointerpolation float InstanceSeed : TEXCOORD7;  // per-instance hash for color variation
 };
 
 [outputtopology("triangle")]
@@ -172,12 +310,37 @@ void MS(
     out vertices MSOutput verts[MAX_VERTS],
     out indices uint3 tris[MAX_PRIMS])
 {
-    uint vertsPerInst = payload.VertsPerInstance;
+    // ── Decompose group index into decorator + cell group ──
+    uint groupsPerDeco = payload.GroupsPerDecorator;
+    uint decoIdx = gid.x / groupsPerDeco;          // which active decorator (0..ActiveCount-1)
+    uint groupInDeco = gid.x % groupsPerDeco;       // which cell group within that decorator
+
+    // Look up the actual slot index and instance count from the payload
+    uint slotIdx = Unpack8(payload.SlotIndices0, payload.SlotIndices1, decoIdx);
+    uint decoInstCount = Unpack8(payload.InstanceCounts0, payload.InstanceCounts1, decoIdx);
+
+    // Read slot data for this decorator
+    StructuredBuffer<DecoratorSlot> msSlots   = ResourceDescriptorHeap[DecoratorSlotsIdx];
+    StructuredBuffer<LODEntry>      msLodTbl  = ResourceDescriptorHeap[LODTableIdx];
+    StructuredBuffer<MeshPartEntry> msRegistry = ResourceDescriptorHeap[MeshRegistryIdx];
+    DecoratorSlot slot = msSlots[slotIdx];
+
+    // Determine exact vertex count for THIS decorator (not max across all)
+    uint vertsPerInst = 3;
+    if (slot.Mode == MODE_BILLBOARD)
+        vertsPerInst = BILLBOARD_VERTS;
+    else if (slot.Mode == MODE_CROSS)
+        vertsPerInst = CROSS_VERTS;
+    else if (slot.LODCount > 0 && slot.LODCount <= 8)
+        vertsPerInst = msRegistry[msLodTbl[slot.LODTableOffset].MeshPartId].VertexCount;
+    vertsPerInst = clamp(vertsPerInst, 3, 128);
+
     uint trisPerInst = vertsPerInst / 3;
     uint ipg = max(1, min(MS_MAX_THREADS / vertsPerInst, MAX_VERTS / vertsPerInst));
 
-    uint baseInstance = gid.x * ipg;
-    uint batchCount = min(ipg, payload.InstanceCount - min(baseInstance, payload.InstanceCount));
+    uint baseInstance = groupInDeco * ipg;
+    // Clamp to this decorator's instance count (weight-proportional, not full 64)
+    uint batchCount = min(ipg, decoInstCount - min(baseInstance, decoInstCount));
 
     uint totalVerts = batchCount * vertsPerInst;
     uint totalTris = batchCount * trisPerInst;
@@ -189,16 +352,18 @@ void MS(
     uint vertInInst = gtid % vertsPerInst;
     uint instanceIdx = baseInstance + instInBatch;
 
-    // ── Per-instance data (computed by every vertex thread — no barrier needed) ──
+    // ── Per-instance data ──
 
-    uint cellX = instanceIdx % TILE_SIZE;
-    uint cellZ = instanceIdx / TILE_SIZE;
-
+    // Fully random placement: hash instance index → position within tile.
+    // No cell grid = no grid artifacts.
+    float2 instanceSeed = float2(float(instanceIdx) * 0.7123 + float(slotIdx) * 3.917,
+                                  float(instanceIdx) * 1.3147 + float(slotIdx) * 7.213);
+    float2 rng = hash22(instanceSeed + payload.TileOrigin);  // [0,1] × [0,1]
     float cs = CellSize;
-    float wx = payload.TileOrigin.x + (cellX + 0.5) * cs;
-    float wz = payload.TileOrigin.y + (cellZ + 0.5) * cs;
-
-    float2 seed = float2(floor(wx / cs), floor(wz / cs));
+    float tileWorldSize = cs * TILE_SIZE;  // full tile extent
+    float wx = payload.TileOrigin.x + rng.x * tileWorldSize;
+    float wz = payload.TileOrigin.y + rng.y * tileWorldSize;
+    float2 seed = instanceSeed;  // keep for downstream hashes
 
     // Terrain bounds
     float2 texelUV = float2(
@@ -207,59 +372,58 @@ void MS(
     );
     bool alive = texelUV.x >= 0 && texelUV.x <= 1 && texelUV.y >= 0 && texelUV.y <= 1;
 
-    // Density-weighted slot selection with control map gating.
-    // Each slot's effective weight = density × controlMapWeight.
-    // Slots not painted at this location get zero weight → never picked.
-    StructuredBuffer<ChannelHeader> msHeaders = ResourceDescriptorHeap[ChannelHeadersIdx];
-    StructuredBuffer<DecoratorSlot> msSlots   = ResourceDescriptorHeap[DecoratorSlotsIdx];
-    StructuredBuffer<LODEntry>      msLodTbl  = ResourceDescriptorHeap[LODTableIdx];
-
-    ChannelHeader hdr = msHeaders[0];
-    if (hdr.Count == 0) alive = false;
-
-    uint slotIdx = 0;
-    DecoratorSlot slot = (DecoratorSlot)0;
-    if (alive)
+    // Per-cell CONTROL presence check: verify this decorator is active at this cell's position
+    // (AS sampled at tile center for dispatch; MS refines per-cell for smooth boundaries)
+    if (alive && DecoControlIdx != 0)
     {
-        // First pass: density only — control map does NOT affect spawning
-        float effectiveTotal = 0;
-        for (uint s = 0; s < hdr.Count && s < 32; s++)
-        {
-            DecoratorSlot candidate = msSlots[hdr.StartIndex + s];
-            effectiveTotal += candidate.Density;
-        }
+        Texture2DArray<uint4> controlTex = ResourceDescriptorHeap[DecoControlIdx];
+        uint ctrlW, ctrlH, ctrlSlices;
+        controlTex.GetDimensions(ctrlW, ctrlH, ctrlSlices);
+        float2 ctrlUV = float2(texelUV.x, 1.0 - texelUV.y);
+        int2 ctrlTexel = int2(ctrlUV * float2(ctrlW, ctrlH));
 
-        if (effectiveTotal < 0.01) alive = false;
+        uint4 ctrl0 = controlTex.Load(int4(ctrlTexel, 0, 0));
+        uint4 ctrl1 = controlTex.Load(int4(ctrlTexel, 1, 0));
 
-        // Second pass: density-weighted pick
-        if (alive)
+        bool found = false;
+        uint4 allCtrl[2] = { ctrl0, ctrl1 };
+        [unroll] for (uint ci = 0; ci < 8; ci++)
         {
-            float rnd = hash21(seed) * effectiveTotal;
-            float cumulative = 0;
-            uint picked = 0;
-            for (uint s2 = 0; s2 < hdr.Count && s2 < 32; s2++)
-            {
-                DecoratorSlot candidate = msSlots[hdr.StartIndex + s2];
-                cumulative += candidate.Density;
-                if (rnd < cumulative) { picked = s2; break; }
-                picked = s2;
-            }
-            slotIdx = hdr.StartIndex + picked;
-            slot = msSlots[slotIdx];
+            uint packed = allCtrl[ci / 4][ci % 4];
+            uint idx = packed >> 8;
+            if (idx == 255) break;
+            if (idx == slotIdx) { found = true; break; }
         }
+        if (!found) alive = false;
     }
 
     // Heightmap & position
     float3 camPos = float3(CamPosX, CamPosY, CamPosZ);
     float h = 0;
+    float3 terrainNormal = float3(0, 1, 0);
     if (alive)
     {
         Texture2D heightTex = ResourceDescriptorHeap[HeightmapIdx];
         h = heightTex.SampleLevel(HeightSampler, texelUV, 0).r;
+
+        // Terrain normal — match terrain.fx GetNormal() exactly
+        uint hmW, hmH;
+        heightTex.GetDimensions(hmW, hmH);
+        float texelStep = 1.0 / float(hmW);
+        float hL = heightTex.SampleLevel(HeightSampler, texelUV + float2(-texelStep, 0), 0).r;
+        float hR = heightTex.SampleLevel(HeightSampler, texelUV + float2( texelStep, 0), 0).r;
+        float hD = heightTex.SampleLevel(HeightSampler, texelUV + float2(0, -texelStep), 0).r;
+        float hU = heightTex.SampleLevel(HeightSampler, texelUV + float2(0,  texelStep), 0).r;
+        float texelWorldSize = TerrainSizeX * texelStep;
+        float heightScale = MaxHeight / texelWorldSize;
+        terrainNormal = normalize(float3(
+            (hL - hR) * heightScale,
+            1.0,
+            (hD - hU) * heightScale
+        ));
     }
 
-    float2 jitter = hash22(seed + 73.1) - 0.5;  // [-0.5, 0.5] keeps instance within cell
-    float3 instancePos = float3(wx + jitter.x * cs, TerrainOriginZ + h * MaxHeight, wz + jitter.y * cs);
+    float3 instancePos = float3(wx, TerrainOriginZ + h * MaxHeight, wz);
 
     if (alive && distance(instancePos, camPos) >= DecoRadius) alive = false;
 
@@ -277,23 +441,6 @@ void MS(
         if (lod >= slot.LODCount) alive = false;
     }
 
-    // Control map: scales instance size, smoothstep cull if too small
-    float ctrlScale = 1.0;
-    if (alive && ControlMapsIdx != 0)
-    {
-        Texture2DArray controlMaps = ResourceDescriptorHeap[ControlMapsIdx];
-        float2 ctrlUV = float2(texelUV.x, 1.0 - texelUV.y);
-        float4 ctrl = controlMaps.SampleLevel(HeightSampler, float3(ctrlUV, slot.ControlMapIndex), 0);
-        float4 mask = float4(
-            slot.ControlChannel == 0 ? 1 : 0,
-            slot.ControlChannel == 1 ? 1 : 0,
-            slot.ControlChannel == 2 ? 1 : 0,
-            slot.ControlChannel == 3 ? 1 : 0);
-        ctrlScale = dot(ctrl, mask);
-        ctrlScale = smoothstep(0.15, 0.5, ctrlScale);
-        if (ctrlScale < 0.01) alive = false;
-    }
-
     // Dead instance: degenerate triangle (clipped for free)
     if (!alive)
     {
@@ -309,31 +456,174 @@ void MS(
         return;
     }
 
-    // ── Transform (root rotation precomputed on CPU, only instance Y-rot on GPU) ──
+    // ── Per-instance scale & rotation ──
+
+    float scaleH = lerp(slot.MinH, slot.MaxH, hash21(seed + 33.7));
+    float scaleW = lerp(slot.MinW, slot.MaxW, hash21(seed.yx + 77.9));
+    
+    // Distance fade: smoothly shrink to zero in the last 25% of range
+    float fadeStart = DecoRadius * 0.75;
+    float fadeFactor = smoothstep(0.0, 1.0, (DecoRadius - camDist) / (DecoRadius - fadeStart));
+    scaleH *= fadeFactor;
+    scaleW *= fadeFactor;
+    float instanceRot = hash21(seed + 51.3) * 6.2831853;
+    float cosR = cos(instanceRot), sinR = sin(instanceRot);
+
+    // LOD entry (Mesh mode) or material from texture (Billboard/Cross)
+    uint materialId = 0;
+    if (slot.Mode == MODE_MESH)
+    {
+        LODEntry lodEntry = msLodTbl[slot.LODTableOffset + lod];
+        materialId = lodEntry.MaterialId;
+    }
+    else if (slot.LODCount > 0)
+    {
+        // Billboard/Cross: LODTable[0].MaterialId holds the billboard material
+        materialId = msLodTbl[slot.LODTableOffset].MaterialId;
+    }
+
+    // ── Billboard / Cross: procedural geometry ──
+
+    if (slot.Mode == MODE_BILLBOARD || slot.Mode == MODE_CROSS)
+    {
+        // Billboard: 1 quad (6 verts) — camera facing
+        // Cross: 2 quads (12 verts) — fixed 90° intersection
+        uint totalQuadVerts = (slot.Mode == MODE_BILLBOARD) ? BILLBOARD_VERTS : CROSS_VERTS;
+
+        if (vertInInst >= totalQuadVerts)
+        {
+            MSOutput o = (MSOutput)0;
+            o.Position = float4(0, 0, -1, 0);
+            verts[gtid] = o;
+            if (vertInInst % 3 == 0)
+            {
+                uint ti = instInBatch * trisPerInst + vertInInst / 3;
+                uint bv = instInBatch * vertsPerInst + vertInInst;
+                tris[ti] = uint3(bv, bv + 1, bv + 2);
+            }
+            return;
+        }
+
+        // Quad vertex layout (triangle list, 6 verts per quad):
+        // v0(0,0)  v1(1,0)  v2(1,1)  |  v3(0,0)  v4(1,1)  v5(0,1)
+        static const float2 quadUV[6] = {
+            float2(0,1), float2(1,1), float2(1,0),
+            float2(0,1), float2(1,0), float2(0,0)
+        };
+        // Local offsets: X = [-0.5..0.5] * width, Y = [0..1] * height
+        static const float2 quadPos[6] = {
+            float2(-0.5, 0.0), float2(0.5, 0.0), float2(0.5, 1.0),
+            float2(-0.5, 0.0), float2(0.5, 1.0), float2(-0.5, 1.0)
+        };
+
+        uint quadIdx = vertInInst / 6;    // which quad (0 or 1)
+        uint vertInQuad = vertInInst % 6;  // which vert in quad
+
+        float2 lp = quadPos[vertInQuad];
+        float2 uv = quadUV[vertInQuad];
+
+        float3 worldPos;
+        float3 worldNorm;
+
+        // Slope-aligned up vector: blend between vertical and terrain normal
+        float3 slopeUp = normalize(lerp(float3(0, 1, 0), terrainNormal, slot.SlopeBias));
+
+        if (slot.Mode == MODE_BILLBOARD)
+        {
+            // Camera-facing billboard
+            float3 toCamera = normalize(float3(camPos.x - instancePos.x, 0, camPos.z - instancePos.z));
+            float3 right = normalize(cross(slopeUp, toCamera));
+            worldPos = instancePos + right * lp.x * scaleW + slopeUp * lp.y * scaleH;
+            worldNorm = toCamera;
+        }
+        else // MODE_CROSS
+        {
+            // Two quads at 90° with instance Y-rotation
+            float3 right;
+            if (quadIdx == 0)
+                right = float3(cosR, 0, sinR);
+            else
+                right = float3(-sinR, 0, cosR);
+            // Re-orthogonalize right against slope up
+            right = normalize(right - slopeUp * dot(right, slopeUp));
+
+            worldPos = instancePos + right * lp.x * scaleW + slopeUp * lp.y * scaleH;
+            worldNorm = (quadIdx == 0)
+                ? float3(-sinR, 0, cosR)
+                : float3(-cosR, 0, -sinR);
+        }
+
+        // Wind sway: two overlapping sine waves for organic motion
+        // HeightFrac² keeps the base planted, tips sway most
+        float windInfluence = lp.y * lp.y;
+        float windWave1 = sin(WindTime * 2.1 + worldPos.x * 0.8 + worldPos.z * 0.6) * 0.12;
+        float windWave2 = sin(WindTime * 1.4 + worldPos.x * 0.5 - worldPos.z * 0.9) * 0.08;
+        worldPos.x += (windWave1 + windWave2) * windInfluence * scaleH;
+        worldPos.z += (windWave2 - windWave1 * 0.5) * windInfluence * scaleH;
+
+        MSOutput o;
+        float4 wp = float4(worldPos, 1.0);
+        o.WorldPos = wp;
+        o.Position = mul(wp, ViewProjection);
+        // Terrain normal + subtle per-instance perturbation (terrain normal dominates)
+        float2 noiseSeed = seed + float(slotIdx) * 7.3;
+        float3 normalJitter = float3(
+            hash21(noiseSeed + 11.1) - 0.5,
+            hash21(noiseSeed + 33.3) * 0.15,
+            hash21(noiseSeed + 22.2) - 0.5
+        ) * 0.8;
+        o.Normal = normalize(terrainNormal + normalJitter);
+        o.TexCoord = uv;
+        o.Depth = o.Position.w;
+        o.MaterialId = materialId;
+        o.TextureOverride = slot.TextureIdx;
+        o.HeightFrac = saturate(lp.y);  // 0 at base, 1 at top
+        o.TerrainUV = texelUV;
+        o.InstanceSeed = float(instanceIdx) / 64.0;
+        verts[gtid] = o;
+
+        if (vertInInst % 3 == 0)
+        {
+            uint ti = instInBatch * trisPerInst + vertInInst / 3;
+            uint bv = instInBatch * vertsPerInst + vertInInst;
+            tris[ti] = uint3(bv, bv + 1, bv + 2);
+        }
+        return;
+    }
+
+    // ── Mesh mode: existing registry-based geometry ──
 
     LODEntry lodEntry = msLodTbl[slot.LODTableOffset + lod];
     uint meshPartId = lodEntry.MeshPartId;
-    uint materialId = lodEntry.MaterialId;
-
-    float instanceScale = lerp(slot.MinH, slot.MaxH, hash21(seed + 33.7)) * ctrlScale;
-    float instanceRot = hash21(seed + 51.3) * 6.2831853;
 
     // Root rotation: read precomputed matrix from slot (zero trig)
     float3x3 rootMat = slot.RootMat;
 
     // Instance Y-rotation + scale (only 2 trig calls)
-    float cosR = cos(instanceRot), sinR = sin(instanceRot);
     float3x3 instanceMat = float3x3(
-        cosR * instanceScale, 0, sinR * instanceScale,
-        0, instanceScale, 0,
-        -sinR * instanceScale, 0, cosR * instanceScale
+        cosR * scaleH, 0, sinR * scaleH,
+        0, scaleH, 0,
+        -sinR * scaleH, 0, cosR * scaleH
     );
 
-    float3x3 finalMat = mul(rootMat, instanceMat);
+    // Slope alignment: rotate from (0,1,0) toward terrain normal based on SlopeBias
+    float3 slopeUp = normalize(lerp(float3(0, 1, 0), terrainNormal, slot.SlopeBias));
+    float3 axis = cross(float3(0, 1, 0), slopeUp);
+    float sinA = length(axis);
+    float cosA = dot(float3(0, 1, 0), slopeUp);
+    float3x3 slopeMat = float3x3(1,0,0, 0,1,0, 0,0,1); // identity default
+    if (sinA > 0.001) // only rotate if there's a meaningful slope
+    {
+        axis = axis / sinA; // normalize
+        float3x3 K = float3x3(0, -axis.z, axis.y, axis.z, 0, -axis.x, -axis.y, axis.x, 0);
+        float3x3 I = float3x3(1,0,0, 0,1,0, 0,0,1);
+        slopeMat = I + K * sinA + mul(K, K) * (1.0 - cosA);
+    }
+
+    float3x3 finalMat = mul(mul(rootMat, instanceMat), slopeMat);
 
     // ── Vertex fetch & transform ──
 
-    StructuredBuffer<MeshPartEntry> msRegistry = ResourceDescriptorHeap[MeshRegistryIdx];
     MeshPartEntry part = msRegistry[meshPartId];
 
     // If this mesh has fewer vertices than the payload's max, degenerate extra threads
@@ -364,14 +654,29 @@ void MS(
     float3 worldPos = mul(pos, finalMat) + instancePos;
     float3 worldNorm = normalize(mul(norm, finalMat));
 
+    // Wind sway for mesh decorators
+    float localY = mul(pos, rootMat).y;
+    float heightFrac = saturate(localY / max(scaleH, 0.01));
+    float windInfluence = heightFrac * heightFrac;
+    float windWave1 = sin(WindTime * 2.1 + worldPos.x * 0.8 + worldPos.z * 0.6) * 0.12;
+    float windWave2 = sin(WindTime * 1.4 + worldPos.x * 0.5 - worldPos.z * 0.9) * 0.08;
+    worldPos.x += (windWave1 + windWave2) * windInfluence * scaleH;
+    worldPos.z += (windWave2 - windWave1 * 0.5) * windInfluence * scaleH;
+
     MSOutput o;
     float4 wp = float4(worldPos, 1.0);
     o.WorldPos = wp;
     o.Position = mul(wp, ViewProjection);
+    // Full meshes keep geometric normals for proper 3D shading
     o.Normal = worldNorm;
     o.TexCoord = float2(uv.x, 1 - uv.y);
     o.Depth = o.Position.w;
     o.MaterialId = materialId;
+    o.TextureOverride = 0;
+    // Approximate height fraction from local-space Y after root rotation
+    o.HeightFrac = saturate(localY / max(scaleH, 0.01));
+    o.TerrainUV = texelUV;
+    o.InstanceSeed = hash21(seed + 99.1);
     verts[gtid] = o;
 
     if (vertInInst % 3 == 0)
@@ -395,28 +700,78 @@ struct PSOutput
 PSOutput PS(MSOutput input)
 {
     PSOutput output;
-    StructuredBuffer<MaterialData> materials = ResourceDescriptorHeap[MaterialsBufferIdx];
-    MaterialData mat = materials[input.MaterialId];
 
     float3 baseColor;
     float alpha = 1.0;
-    if (mat.AlbedoIdx > 0)
+
+    if (input.TextureOverride > 0)
     {
-        Texture2D albedoTex = ResourceDescriptorHeap[mat.AlbedoIdx];
-        float4 texColor = albedoTex.Sample(HeightSampler, input.TexCoord);
+        // Billboard/Cross: sample texture directly (no material indirection)
+        Texture2D texOverride = ResourceDescriptorHeap[input.TextureOverride];
+        float4 texColor = texOverride.Sample(HeightSampler, input.TexCoord);
         baseColor = texColor.rgb;
         alpha = texColor.a;
     }
     else
     {
-        baseColor = float3(0.15, 0.35, 0.08);
+        StructuredBuffer<MaterialData> materials = ResourceDescriptorHeap[MaterialsBufferIdx];
+        MaterialData mat = materials[input.MaterialId];
+
+        if (mat.AlbedoIdx > 0)
+        {
+            Texture2D albedoTex = ResourceDescriptorHeap[mat.AlbedoIdx];
+            float4 texColor = albedoTex.Sample(HeightSampler, input.TexCoord);
+            baseColor = texColor.rgb;
+            alpha = texColor.a;
+        }
+        else
+        {
+            baseColor = float3(0.15, 0.35, 0.08);
+        }
     }
 
-    clip(alpha - 0.5);
+    // Distance-based alpha clip: mipmaps average alpha down at distance.
+    // Lower the threshold to preserve coverage instead of eating the geometry.
+    float dist = length(input.WorldPos.xyz);
+    float alphaThreshold = lerp(0.5, 0.15, saturate((dist - 20.0) / 30.0));
+    clip(alpha - alphaThreshold);
 
-    output.Albedo = float4(baseColor, 1.0);
-    output.Normal = float4(normalize(input.Normal), 1.0);
-    output.Data = float4(0.9, 0.0, 1.0, 1.0);
+    // Sample baked terrain albedo for ground color blending
+    Texture2D BakedAlbedo = ResourceDescriptorHeap[BakedAlbedoIdx];
+    float3 groundColor = BakedAlbedo.SampleLevel(ClampSampler, input.TerrainUV, 0).rgb;
+
+    // Ground color blend: at base, shift toward terrain color
+    float aoFactor = pow(input.HeightFrac, 0.4);
+
+    // Per-instance brightness variation — only affects texture, not ground
+    float hashA = frac(input.InstanceSeed * 17.31);
+    float brightVar = 0.2 + 0.6 * hashA;
+
+    float3 variedBase = baseColor * brightVar;
+    float3 aoColor = lerp(groundColor * 0.75, variedBase, aoFactor);
+
+    output.Albedo = float4(aoColor, 1.0);
+
+    // Per-pixel normals: blend from terrain normal (base) to upward (tip)
+    // This creates natural top-bright / base-dark variation across each instance
+    float3 baseNorm = normalize(input.Normal);
+    float3 tipNorm = normalize(lerp(baseNorm, float3(0, 1, 0), 0.6));
+    float3 heightNorm = normalize(lerp(baseNorm, tipNorm, input.HeightFrac));
+    
+    // Alpha gradient micro-detail on top of the height blend
+    float dAlphaX = ddx(alpha);
+    float dAlphaY = ddy(alpha);
+    float bladeX = (input.TexCoord.x - 0.5) * 2.0;
+    float3 perturbedNormal = normalize(heightNorm + float3(
+        dAlphaX * 1.0 + bladeX * 0.2,
+        0,
+        dAlphaY * 1.0
+    ));
+    output.Normal = float4(perturbedNormal, 1.0);
+
+    // Data channel: R=roughness, G=metallic, B=ao, A=flags
+    // Flags: 0=unlit/skybox, 0.5=vegetation, 1.0=standard PBR
+    output.Data = float4(0.9, 0.0, 1.0, 0.5);
     output.Depth = input.Depth;
     return output;
 }
@@ -426,14 +781,23 @@ PSOutput PS(MSOutput input)
 
 void PS_Shadow(MSOutput input)
 {
-    StructuredBuffer<MaterialData> materials = ResourceDescriptorHeap[MaterialsBufferIdx];
-    MaterialData mat = materials[input.MaterialId];
-
-    if (mat.AlbedoIdx > 0)
+    if (input.TextureOverride > 0)
     {
-        Texture2D albedoTex = ResourceDescriptorHeap[mat.AlbedoIdx];
-        float alpha = albedoTex.Sample(HeightSampler, input.TexCoord).a;
+        Texture2D texOverride = ResourceDescriptorHeap[input.TextureOverride];
+        float alpha = texOverride.Sample(HeightSampler, input.TexCoord).a;
         clip(alpha - 0.25);
+    }
+    else
+    {
+        StructuredBuffer<MaterialData> materials = ResourceDescriptorHeap[MaterialsBufferIdx];
+        MaterialData mat = materials[input.MaterialId];
+
+        if (mat.AlbedoIdx > 0)
+        {
+            Texture2D albedoTex = ResourceDescriptorHeap[mat.AlbedoIdx];
+            float alpha = albedoTex.Sample(HeightSampler, input.TexCoord).a;
+            clip(alpha - 0.25);
+        }
     }
 }
 

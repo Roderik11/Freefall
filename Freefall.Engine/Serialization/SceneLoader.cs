@@ -108,11 +108,7 @@ namespace Freefall.Serialization
 
                         try
                         {
-                            var loadMethod = typeof(AssetManager)
-                                .GetMethod("LoadByGuid")!
-                                .MakeGenericMethod(field.Type);
-                            var loaded = loadMethod.Invoke(
-                                Engine.Assets, new object[] { stub.Guid });
+                            var loaded = Engine.Assets.LoadByGuid(stub.Guid, field.Type);
                             if (loaded != null)
                                 field.SetValue(component, loaded);
                         }

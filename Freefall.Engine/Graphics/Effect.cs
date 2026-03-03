@@ -13,7 +13,10 @@ namespace Freefall.Graphics
         public Shader? PixelShader { get; private set; }
         public Shader? HullShader { get; private set; }
         public Shader? DomainShader { get; private set; }
+        public Shader? MeshShader { get; private set; }
+        public Shader? AmplificationShader { get; private set; }
         public string? RasterizerStateName { get; private set; }
+        public bool IsMeshShaderPass => MeshShader != null;
 
         public EffectPass(string name, EffectPassDescription desc, string source)
         {
@@ -31,6 +34,12 @@ namespace Freefall.Graphics
 
             if (!string.IsNullOrEmpty(desc.DomainShaderEntry))
                 DomainShader = new Shader(source, desc.DomainShaderEntry, desc.DomainShaderProfile ?? "ds_6_0");
+
+            if (!string.IsNullOrEmpty(desc.MeshShaderEntry))
+                MeshShader = new Shader(source, desc.MeshShaderEntry, desc.MeshShaderProfile ?? "ms_6_5");
+
+            if (!string.IsNullOrEmpty(desc.AmplificationShaderEntry))
+                AmplificationShader = new Shader(source, desc.AmplificationShaderEntry, desc.AmplificationShaderProfile ?? "as_6_5");
         }
 
         public void Dispose()
@@ -39,6 +48,8 @@ namespace Freefall.Graphics
             PixelShader?.Dispose();
             HullShader?.Dispose();
             DomainShader?.Dispose();
+            MeshShader?.Dispose();
+            AmplificationShader?.Dispose();
         }
     }
 

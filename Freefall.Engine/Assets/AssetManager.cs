@@ -240,10 +240,7 @@ namespace Freefall.Assets
                 try
                 {
                     // Use the friendly name from AssetDatabase for display
-                    var sourcePath = AssetDatabase.GuidToPath(guid);
-                    var name = sourcePath != null
-                        ? Path.GetFileNameWithoutExtension(sourcePath)
-                        : guid;
+                    var name = AssetDatabase.ResolveFriendlyName(guid);
 
 
                     asset = (T)loader.LoadFromCache(cachePath, name, this, guid);
@@ -264,6 +261,19 @@ namespace Freefall.Assets
             }
 
             return asset;
+        }
+
+        /// <summary>
+        /// Non-generic LoadByGuid for runtime type resolution.
+        /// Calls LoadByGuid&lt;T&gt; via reflection with the provided assetType.
+        /// </summary>
+        private static MethodInfo _loadByGuidGeneric;
+
+        public Asset LoadByGuid(string guid, Type assetType)
+        {
+            _loadByGuidGeneric ??= typeof(AssetManager).GetMethod(nameof(LoadByGuid), new[] { typeof(string) });
+            var method = _loadByGuidGeneric!.MakeGenericMethod(assetType);
+            return method.Invoke(this, new object[] { guid }) as Asset;
         }
 
         /// <summary>

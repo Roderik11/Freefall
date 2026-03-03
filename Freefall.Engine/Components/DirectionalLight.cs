@@ -43,6 +43,12 @@ namespace Freefall.Components
         private ID3D12Resource[]? _shadowSceneConstantsBuffers;
         private IntPtr[]? _shadowSceneConstantsPtrs;
 
+        /// <summary>
+        /// Current shadow scene CBV address (set per cascade during shadow rendering).
+        /// Custom shadow actions can use this to rebind the light VP after Material.Apply.
+        /// </summary>
+        public static ulong CurrentShadowSceneCBV { get; set; }
+
         public DirectionalLight()
         {
             Material = new Material(new Effect("light_directional"));
@@ -183,7 +189,13 @@ namespace Freefall.Components
                         batch.DrawShadow(commandList, i, shadowSceneCBVAddress);
                         batch.Material.SetPass(pass);
                     }
+
+                    // Execute custom shadow actions (e.g. grass mesh shader dispatch)
+                    // Set shadow CBV so DispatchDecorator can rebind after Apply
+                    DirectionalLight.CurrentShadowSceneCBV = shadowSceneCBVAddress;
+                    CommandBuffer.ExecuteCustomActions(RenderPass.Shadow, commandList);
                 }
+                CommandBuffer.ClearCustomActions(RenderPass.Shadow);
             }
             else
             {

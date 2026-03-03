@@ -34,6 +34,7 @@ namespace Freefall.Assets.Importers
     [AssetImporter(".png", ".jpg", ".jpeg", ".tga", ".bmp", ".dds")]
     public class TextureImporter : IImporter
     {
+        public Type AssetType => typeof(Graphics.Texture);
         // ── Configurable import settings (editable in inspector) ──
         public TextureFormat Format = TextureFormat.BC7_UNORM;
         public bool GenerateMips = true;
@@ -51,6 +52,13 @@ namespace Freefall.Assets.Importers
             "_DetailMask", "_DetailNormal", "_Mask",
             "_BumpMap", "_Bump",
             "_ShadowOffset", "_TranslucencyMap",
+        };
+
+        // Suffixes that indicate normal maps — use BC5 (two high-quality channels)
+        private static readonly string[] NormalSuffixes = {
+            "_Nor", "_Normal", "_Nrm",
+            "_DetailNormal",
+            "_BumpMap", "_Bump",
         };
 
         public ImportResult Import(string filepath)
@@ -73,6 +81,12 @@ namespace Freefall.Assets.Importers
                 bool isLinearData = LinearSuffixes.Any(s =>
                     name.EndsWith(s, StringComparison.OrdinalIgnoreCase));
                 sRGB = !isLinearData;
+
+                // Normal maps → BC5_UNORM (two high-quality RG channels, Z reconstructed in shader)
+                bool isNormalMap = NormalSuffixes.Any(s =>
+                    name.EndsWith(s, StringComparison.OrdinalIgnoreCase));
+                if (isNormalMap)
+                    Format = TextureFormat.BC5_UNORM;
 
                 ddsBytes = ConvertToDds(filepath);
             }
@@ -104,13 +118,16 @@ namespace Freefall.Assets.Importers
 
             try
             {
-                // Auto-select format: BC1 for non-alpha, BC7 for alpha
+                // Auto-select format: BC5 is already set for normals, otherwise BC1/BC7
                 var format = Format;
-                if (format == TextureFormat.BC7_UNORM || format == TextureFormat.BC7_UNORM_SRGB)
+                if (format != TextureFormat.BC5_UNORM && format != TextureFormat.BC4_UNORM)
                 {
-                    if (!HasAlphaChannel(sourcePath))
+                    if (format == TextureFormat.BC7_UNORM || format == TextureFormat.BC7_UNORM_SRGB)
                     {
-                        format = TextureFormat.BC1_UNORM;
+                        if (!HasAlphaChannel(sourcePath))
+                        {
+                            format = TextureFormat.BC1_UNORM;
+                        }
                     }
                 }
 

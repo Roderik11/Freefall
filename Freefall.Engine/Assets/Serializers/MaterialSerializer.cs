@@ -92,8 +92,12 @@ namespace Freefall.Assets.Serializers
                         def.EffectRef = ParseRef(val);
                     else if (key != "Name" && key != "Textures" && key != "Parameters" && !string.IsNullOrEmpty(val))
                     {
-                        // Flat format: texture refs at top level (e.g. "Roughness: 82865390...")
-                        def.TextureRefs[key] = ParseRef(val);
+                        // DetailTiling is a numeric parameter, not a texture ref
+                        if (key == "DetailTiling")
+                            def.Parameters[key] = val;
+                        else
+                            // Flat format: texture refs at top level (e.g. "Roughness: 82865390...")
+                            def.TextureRefs[key] = ParseRef(val);
                     }
                 }
 

@@ -593,6 +593,25 @@ namespace Freefall.Graphics
             current.passes[(int)pass].Execute(commandList, device, pass, frustumGpuAddr);
         }
 
+        /// <summary>
+        /// Execute only the custom actions for a pass WITHOUT clearing. 
+        /// Use with ClearCustomActions after a loop.
+        /// </summary>
+        public static void ExecuteCustomActions(RenderPass pass, ID3D12GraphicsCommandList commandList)
+        {
+            var queue = current.customQueues[pass];
+            for (int i = 0; i < queue.Count; i++)
+                queue[i](commandList);
+        }
+
+        /// <summary>
+        /// Clear custom action queue for a render pass.
+        /// </summary>
+        public static void ClearCustomActions(RenderPass pass)
+        {
+            current.customQueues[pass].Clear();
+        }
+
         public static void Clear()
         {
             foreach (var pass in current.passes) pass.Clear();

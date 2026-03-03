@@ -174,25 +174,50 @@ PSOutput PS(VSOutput input)
     
     // Normal mapping via cotangent frame (no tangent buffer needed)
     float3 N = normalize(input.Normal);
+    
+    // Cotangent frame from screen-space derivatives (shared by base + detail normals)
+    float3 dp1 = ddx(input.WorldPos.xyz);
+    float3 dp2 = ddy(input.WorldPos.xyz);
+    float2 duv1 = ddx(input.TexCoord);
+    float2 duv2 = ddy(input.TexCoord);
+    
+    float3 dp2perp = cross(dp2, N);
+    float3 dp1perp = cross(N, dp1);
+    float3 T = dp2perp * duv1.x + dp1perp * duv2.x;
+    float3 B = dp2perp * duv1.y + dp1perp * duv2.y;
+    float invmax = rsqrt(max(dot(T, T), dot(B, B)));
+    float3x3 TBN = float3x3(T * invmax, B * invmax, N);
+    
     if (mat.NormalIdx != 0)
     {
         Texture2D normalTex = ResourceDescriptorHeap[mat.NormalIdx];
-        float3 texNormal = normalTex.Sample(Sampler, input.TexCoord).rgb * 2.0 - 1.0;
-        //texNormal.xy *= 1.5; // Slightly boosted for visible surface detail
-        texNormal = normalize(texNormal);
+        // Decode normal map: handle BC5 (2-channel, Z reconstructed) and OpenGL Y convention
+        float2 nXY = normalTex.Sample(Sampler, input.TexCoord).rg * 2.0 - 1.0;
+        nXY.y = -nXY.y; // Flip Y: OpenGL (Unity) → DirectX convention
+        float3 texNormal = float3(nXY, sqrt(max(0.001, 1.0 - dot(nXY, nXY))));
         
-        // Cotangent frame from screen-space derivatives
-        float3 dp1 = ddx(input.WorldPos.xyz);
-        float3 dp2 = ddy(input.WorldPos.xyz);
-        float2 duv1 = ddx(input.TexCoord);
-        float2 duv2 = ddy(input.TexCoord);
-        
-        float3 dp2perp = cross(dp2, N);
-        float3 dp1perp = cross(N, dp1);
-        float3 T = dp2perp * duv1.x + dp1perp * duv2.x;
-        float3 B = dp2perp * duv1.y + dp1perp * duv2.y;
-        float invmax = rsqrt(max(dot(T, T), dot(B, B)));
-        float3x3 TBN = float3x3(T * invmax, B * invmax, N);
+        // Blend detail normal if present (UDN blending in tangent space)
+        if (mat.DetailNormalIdx != 0)
+        {
+            // Distance fade: full detail within 20m, gone by 60m
+            float dist = length(input.WorldPos.xyz);
+            float detailFade = 1.0 - saturate((dist - 20.0) / 40.0);
+            
+            if (detailFade > 0.01)
+            {
+                float detailTiling = asfloat(mat.DetailTilingPacked);
+                if (detailTiling <= 0.0) detailTiling = 5.0;
+                
+                float2 detailUV = input.TexCoord * detailTiling;
+                Texture2D detailTex = ResourceDescriptorHeap[mat.DetailNormalIdx];
+                float2 dXY = detailTex.Sample(Sampler, detailUV).rg * 2.0 - 1.0;
+                dXY.y = -dXY.y;
+                
+                // UDN blend: add XY with strength, recompute Z
+                texNormal.xy += dXY * detailFade * 2.0;
+                texNormal.z = sqrt(max(0.001, 1.0 - dot(texNormal.xy, texNormal.xy)));
+            }
+        }
         
         N = normalize(mul(texNormal, TBN));
     }

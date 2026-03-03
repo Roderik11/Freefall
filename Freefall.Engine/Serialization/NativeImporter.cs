@@ -111,6 +111,8 @@ namespace Freefall.Serialization
 
         /// <summary>
         /// Load an Asset from a YAML string.
+        /// Asset references are left as GUID stubs — call the overload with
+        /// AssetManager to auto-resolve them.
         /// </summary>
         public static Asset LoadFromString(string yaml)
         {
@@ -133,6 +135,40 @@ namespace Freefall.Serialization
             }
 
             return Serializer.Deserialize(yaml) as Asset;
+        }
+
+        /// <summary>
+        /// Load an Asset from a YAML string and resolve all asset GUID references.
+        /// This is the preferred entry point for asset loaders.
+        /// </summary>
+        public static Asset LoadFromString(string yaml, AssetManager manager)
+        {
+            var result = Serializer.Deserialize(yaml, out var stubs) as Asset;
+
+            // Resolve stubs — each is an Asset field that was deserialized as a bare GUID.
+            if (manager != null)
+            {
+                foreach (var r in stubs)
+                {
+                    try
+                    {
+                        var loaded = manager.LoadByGuid(r.Guid, r.AssetType);
+                        if (loaded == null) continue;
+
+                        if (r.ListIndex >= 0 && r.Parent is System.Collections.IList list)
+                            list[r.ListIndex] = loaded;
+                        else if (r.Field != null)
+                            r.Field.SetValue(r.Parent, loaded);
+                    }
+                    catch (Exception ex)
+                    {
+                        Debug.LogWarning("NativeImporter",
+                            $"Failed to resolve {r.AssetType.Name} '{r.Guid}': {ex.Message}");
+                    }
+                }
+            }
+
+            return result;
         }
 
         /// <summary>

@@ -31,9 +31,11 @@ SamplerState ShadowClampSampler : register(s2); // Linear+Clamp for shadow map s
 SamplerComparisonState ShadowSampler : register(s3); // Comparison+Bilinear for PCF
 
 // PBR helpers
-float3 FresnelSchlick(float cosTheta, float3 F0)
+float3 FresnelSchlick(float cosTheta, float3 F0, float roughness)
 {
-    return F0 + (1.0 - F0) * pow(1.0 - cosTheta, 5.0);
+    // Roughness-attenuated Fresnel: rough surfaces don't get full grazing reflection
+    float3 F_max = max(float3(1.0 - roughness, 1.0 - roughness, 1.0 - roughness), F0);
+    return F0 + (F_max - F0) * pow(1.0 - cosTheta, 5.0);
 }
 
 // Compute normal offset for shadow receiver to prevent acne.
@@ -108,14 +110,19 @@ float4 PS(VSOutput input) : SV_Target
     // Reconstruct world position from depth
     float4 worldPos = posFromDepth(input.TexCoord, depth, CameraInverse);
     
-    // Compute NdotL early — surfaces facing away from the light receive no
-    // direct illumination, so skip shadow sampling entirely.  This prevents
-    // shadows from projecting *through* geometry (e.g. tree shadows on a
-    // cliff face that is turned away from the light).
-    float3 L = normalize(-LightDirection);
-    float NdotL = max(dot(normal, L), 0.0);
+    // Vegetation flag: data.a = 0.5
+    Texture2D DataTexEarly = ResourceDescriptorHeap[DataTexIdx];
+    float dataA = DataTexEarly.Sample(Sampler, input.TexCoord).a;
+    bool isVegetation = (dataA > 0.3 && dataA < 0.7);
     
-    if (NdotL <= 0.0 && DebugVisualizationMode == 0)
+    // Compute NdotL early — surfaces facing away from the light receive no
+    // direct illumination, so skip shadow sampling entirely.
+    float3 L = normalize(-LightDirection);
+    float rawNdotL = dot(normal, L);
+    float NdotL = max(rawNdotL, 0.0);
+    
+    // Vegetation needs wrap lighting for back-facing surfaces
+    if (NdotL <= 0.0 && !isVegetation && DebugVisualizationMode == 0)
         return float4(0, 0, 0, 0);
     
     // Calculate view-space depth for cascade selection
@@ -244,7 +251,7 @@ float4 PS(VSOutput input) : SV_Target
     
     // Fresnel (Schlick)
     float3 F0 = lerp(float3(0.04, 0.04, 0.04), albedo, metal);
-    float3 F = FresnelSchlick(VdotH, F0);
+    float3 F = FresnelSchlick(VdotH, F0, rough);
     
     // Specular BRDF
     float3 spec = (D * G) * F / max(4.0 * NdotL * NdotV, 1e-4);
@@ -255,8 +262,32 @@ float4 PS(VSOutput input) : SV_Target
     
     // Pre-multiply by PI to compensate for energy-conserving Lambert (/PI in diffuse BRDF).
     // Convention: LightIntensity=1 → full diffuse albedo brightness (standard in UE/Unity).
-    float3 radiance = LightColor * LightIntensity * 3.14159 * NdotL * shadowFactor;
-    float3 lighting = (diffuse + spec) * radiance * ao;
+    float3 lighting;
+    
+    if (isVegetation)
+    {
+        // Wrap lighting: smooth linear gradient, compressed range
+        // NdotL=-1→0.2, NdotL=0→0.5, NdotL=1→0.8
+        float wrap = saturate(rawNdotL * 0.3 + 0.5);
+        
+        // Attenuate self-shadowing: leaf-on-leaf shadows are noisy, keep them subtle
+        float vegShadow = lerp(1.0, shadowFactor, 0.85);
+        
+        float3 radiance = LightColor * LightIntensity * 3.14159 * wrap * vegShadow;
+        lighting = diffuse * radiance * ao;
+        
+        // SSS: backlit translucency — light passes THROUGH leaves
+        float translucency = NormalTex.Sample(Sampler, input.TexCoord).w;
+        translucency = max(translucency, 0.3); // moderate minimum for all foliage
+        float backlight = max(-rawNdotL, 0.0);
+        float3 sssColor = albedo * float3(1.0, 0.85, 0.6);
+        lighting += sssColor * LightColor * LightIntensity * backlight * translucency * 0.4;
+    }
+    else
+    {
+        float3 radiance = LightColor * LightIntensity * 3.14159 * NdotL * shadowFactor;
+        lighting = (diffuse + spec) * radiance * ao;
+    }
     
     // Shadow wrap: bleed a small fraction of diffuse NdotL through shadows
     // Gives cylindrical/rounded surfaces (tree trunks, pillars) visible shape in shadow

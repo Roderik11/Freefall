@@ -6,6 +6,8 @@ using Freefall.Graphics;
 
 namespace Freefall.Assets
 {
+    public enum DecoratorMode { Mesh, Billboard, Cross }
+
     /// <summary>
     /// Terrain asset — holds all resource data (heightmap, layers, splatmaps).
     /// GPU rendering logic and Material live on TerrainRenderer (Component).
@@ -20,6 +22,18 @@ namespace Freefall.Assets
 
         // ── Splatmaps (public for YAML serialization) ──
         public List<Texture> ControlMaps = new();
+
+        // ── Ground Coverage ──
+        public List<Decoration> Decorations = new();
+        public List<Texture> DecoMaps = new();
+        
+        [ValueRange(1, 20)]
+        public float DecorationDensity = 1.0f;
+
+        public float DecorationRadius = 100f;
+
+        [JsonIgnore] public int DecorationVersion { get; private set; }
+        public void InvalidateDecorations() => DecorationVersion++;
 
         // ── HeightField — built internally from Heightmap ──
         [JsonIgnore]
@@ -53,6 +67,41 @@ namespace Freefall.Assets
             public Texture Diffuse;
             public Texture Normals;
             public Vector2 Tiling = Vector2.One;
+        }
+
+        // ── Ground Coverage Decoration ──
+        /// <summary>
+        /// A single decoration entry. References a StaticMesh or Texture for rendering,
+        /// plus an optional DensityMap (grayscale) that controls placement density.
+        /// At runtime, all unique DensityMaps are packed into a Texture2DArray.
+        /// </summary>
+        [Serializable]
+        public class Decoration
+        {
+            public DecoratorMode Mode = DecoratorMode.Mesh;
+            public StaticMesh Mesh;       // Mesh mode: geometry + LODs + material
+            public Texture Texture;       // Billboard/Cross mode: alpha-tested texture
+
+            /// <summary>
+            /// Optional density map (grayscale). When set, auto-resolves to a DecoMaps array
+            /// slice at runtime. Without a density map, the decorator renders everywhere.
+            /// </summary>
+            public Texture DensityMap;
+
+            /// <summary>Instances per square meter.</summary>
+            [ValueRange(1, 20)]
+            public float Density = 2.0f;
+
+            public float Weight = 1.0f;
+            public Vector2 HeightRange = new(0.3f, 0.6f);
+            public Vector2 WidthRange = new(0.2f, 0.4f);
+
+            /// <summary>Root rotation applied to mesh vertices (euler degrees).</summary>
+            public Vector3 RootRotation = new(-90, 0, 0);
+
+            /// <summary>Blend factor for aligning to terrain slope (0=upright, 1=fully aligned).</summary>
+            [ValueRange(-1, 1)]
+            public float SlopeBias = 0.0f;
         }
     }
 }

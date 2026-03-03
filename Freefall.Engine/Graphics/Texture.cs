@@ -82,6 +82,10 @@ namespace Freefall.Graphics
                  }
              }
 
+             Debug.Log($"[Texture] CreateTexture2DArray: {textures.Count} textures, formatsMatch={formatsMatch}, refFormat={refDesc.Format}");
+             for (int i = 0; i < textures.Count; i++)
+                 Debug.Log($"  [{i}] {textures[i].Name}: {textures[i].Native.Description.Format}");
+
              if (formatsMatch)
                  return CreateTexture2DArrayCopy(device, textures, refDesc);
              else

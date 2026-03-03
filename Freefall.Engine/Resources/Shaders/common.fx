@@ -27,7 +27,10 @@ struct MaterialData
     uint MetallicIdx;
     uint EmissiveIdx;
     uint AOIdx;
-    uint2 Padding;
+    uint DetailNormalIdx;
+    uint DetailMaskIdx;
+    uint DetailTilingPacked; // float as bits: tiling scale
+    uint Padding0;
 };
 
 // Materials buffer index - slot 14 in push constants (bindless)

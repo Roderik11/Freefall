@@ -24,6 +24,10 @@ namespace Freefall.Graphics
         public string? HullShaderEntry { get; set; }
         public string? DomainShaderProfile { get; set; }
         public string? DomainShaderEntry { get; set; }
+        public string? MeshShaderProfile { get; set; }
+        public string? MeshShaderEntry { get; set; }
+        public string? AmplificationShaderProfile { get; set; }
+        public string? AmplificationShaderEntry { get; set; }
     }
 
     public static class FXParser
@@ -81,6 +85,8 @@ namespace Freefall.Graphics
                     ParseShader("GeometryShader", (p, e) => { pass.GeometryShaderProfile = p; pass.GeometryShaderEntry = e; });
                     ParseShader("HullShader", (p, e) => { pass.HullShaderProfile = p; pass.HullShaderEntry = e; });
                     ParseShader("DomainShader", (p, e) => { pass.DomainShaderProfile = p; pass.DomainShaderEntry = e; });
+                    ParseShader("MeshShader", (p, e) => { pass.MeshShaderProfile = p; pass.MeshShaderEntry = e; });
+                    ParseShader("AmplificationShader", (p, e) => { pass.AmplificationShaderProfile = p; pass.AmplificationShaderEntry = e; });
 
                     // RasterizerState
                     var rasterMatch = Regex.Match(passBody, @"SetRasterizerState\s*\(\s*(\w+)\s*\)");

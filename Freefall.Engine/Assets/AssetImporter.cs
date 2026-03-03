@@ -54,13 +54,31 @@ namespace Freefall.Assets
         ImportResult Import(string filepath);
 
         /// <summary>
+        /// If non-null, indicates the concrete Asset type this importer produces.
+        /// When set, GetInspectionTarget will load and return the actual asset
+        /// instead of the importer itself.
+        /// </summary>
+        Type AssetType => null;
+
+        /// <summary>
         /// Returns the object the editor inspector should display when
         /// this source file is selected.
-        /// Default: the importer itself (shows import settings).
-        /// Definition-based importers (e.g. MaterialImporter, StaticMeshImporter)
-        /// override to return the loaded asset so its properties are editable.
+        /// If AssetType is set, loads the actual asset for inspection.
+        /// Otherwise returns the importer itself.
         /// </summary>
-        object GetInspectionTarget(MetaFile meta) => this;
+        object GetInspectionTarget(MetaFile meta)
+        {
+            if (AssetType != null && meta != null && !string.IsNullOrEmpty(meta.Guid) && Engine.Assets != null)
+            {
+                try
+                {
+                    var asset = Engine.Assets.LoadByGuid(meta.Guid, AssetType);
+                    if (asset != null) return asset;
+                }
+                catch { }
+            }
+            return this;
+        }
     }
 
     /// <summary>

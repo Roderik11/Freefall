@@ -270,6 +270,28 @@ namespace Freefall.Assets
         }
 
         /// <summary>
+        /// Resolve a GUID to a human-readable name.
+        /// Checks: 1) source path (file name), 2) subasset Name, 3) falls back to GUID.
+        /// </summary>
+        public static string ResolveFriendlyName(string guid)
+        {
+            // Source GUID → source file name
+            if (_guidToPath.TryGetValue(guid, out var path))
+                return Path.GetFileNameWithoutExtension(path);
+
+            // Subasset GUID → subasset Name from meta
+            if (_subAssetToSource.TryGetValue(guid, out var sourceGuid) &&
+                _guidToMeta.TryGetValue(sourceGuid, out var meta))
+            {
+                var sub = meta.SubAssets.FirstOrDefault(s => s.Guid == guid);
+                if (sub != null)
+                    return sub.Name;
+            }
+
+            return guid;
+        }
+
+        /// <summary>
         /// Resolve a GUID directly to its cache file path.
         /// </summary>
         internal static string ResolveCachePathByGuid(string guid, Type dataType = null)

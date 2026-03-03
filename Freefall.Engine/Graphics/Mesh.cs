@@ -31,6 +31,7 @@ namespace Freefall.Graphics
         public Vector4 BoundingSphere; // Local-space bounding sphere (center.xyz, radius)
     }
 
+    [AssetTypeAlias("MeshData")]
     public partial class Mesh : Asset, IDisposable
     {
         private static volatile int _instanceCount;

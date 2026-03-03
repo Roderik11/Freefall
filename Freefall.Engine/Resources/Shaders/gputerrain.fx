@@ -247,20 +247,32 @@ FragmentOutput PS(VertexOutput input)
         }
     }
 	
-    normal = float4(normal.xzy, 1);
-    normal.xz = normal.xz * 2 - 1;
-    normal.xz *= 2.0; // Source splatmap normals are weak — boost detail
-    normal.xyz = normalize(normal.xyz);
+    // Decode BC5 normal: R=tangentX, G=tangentY, B=0 (dead in BC5)
+    // Swizzle to world space: X→X, Y→up (reconstructed), Z→Z
+    float2 nXZ = normal.rg * 2.0 - 1.0;
+    float nY = sqrt(max(0.001, 1.0 - dot(nXZ, nXZ)));
+    normal = float4(normalize(float3(nXZ.x, nY, nXZ.y)), 1);
 
     // UDN (Partial Derivative Addition): add splatmap detail perturbation to terrain slope
+    // Scale down: BC5 normals have full precision, raw addition is too strong
     terrainNormal.xz += normal.xz;
     terrainNormal = normalize(terrainNormal);
     
 
 
-    output.Albedo = color;
+    // Normalize: if splatmap weights don't sum to 1.0, colors will be dimmed/boosted
+    float totalWeight = 0;
+    for (int wi = 0; wi < 4; ++wi)
+    {
+        float4 w = ControlMaps.Sample(sampData, float3(uv, wi));
+        totalWeight += w.x + w.y + w.z + w.w;
+    }
+    if (totalWeight > 0.001)
+        color.rgb /= totalWeight;
+
+    output.Albedo = float4(color.rgb, 1.0);
     output.Normals = float4(terrainNormal.xyz, 1); 
-    output.Data = float4(0.85, 0.0, 1.0, 1.0); // roughness=0.85, metal=0, ao=1, lit=1
+    output.Data = float4(0.95, 0.0, 1.0, 1.0); // roughness=very matte, metal=0, ao=1, lit=PBR
     output.Depth = input.Depth;
 
     return output;

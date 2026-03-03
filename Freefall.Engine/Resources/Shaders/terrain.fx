@@ -188,9 +188,10 @@ FragmentOutput PS(VertexOutput input)
 
     terrainNormal = blend_linear(terrainNormal, normal.xyz);
 
-    output.Albedo = color;
+    output.Albedo = float4(color.rgb, 1.0);
     output.Normals = float4(terrainNormal.xyz, 1); 
-    output.Data = float4(0, 1, 0, 0);
+    // Hardcoded roughness — diffuse textures don't contain smoothness data
+    output.Data = float4(0.95, 0, 1.0, 1.0); // roughness=matte, metallic=0, ao=1, flags=PBR
     output.Depth = input.Depth;
 
     return output;

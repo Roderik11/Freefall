@@ -18,6 +18,7 @@ namespace Freefall.Assets.Importers
     [AssetImporter(".terrain")]
     public class TerrainImporter : IImporter
     {
+        public Type AssetType => typeof(Terrain);
         public ImportResult Import(string filepath)
         {
             var result = new ImportResult();

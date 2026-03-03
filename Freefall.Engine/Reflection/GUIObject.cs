@@ -32,6 +32,8 @@ namespace Freefall.Reflection
 
         public virtual int Index { get; }
 
+        public event Action OnValueChanged;
+
         public bool HasMixedValue
         {
             get
@@ -91,6 +93,8 @@ namespace Freefall.Reflection
         {
             for (int i = 0; i < targets.Length; i++)
                 _field.SetValue(targets[i], value);
+
+            OnValueChanged?.Invoke();
         }
 
         public K GetAttribute<K>() where K : Attribute

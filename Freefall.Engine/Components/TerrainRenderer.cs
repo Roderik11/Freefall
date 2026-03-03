@@ -92,6 +92,7 @@ namespace Freefall.Components
 
         // Texture arrays
         private Texture? ControlMapsArray;
+        private Texture? DecoMapsArray;
         private Texture? DiffuseMapsArray;
         private Texture? NormalMapsArray;
 
@@ -112,12 +113,25 @@ namespace Freefall.Components
         private int _decoratorValueVersion = -1;
         private int _decoratorDispatchGroupsX;
         private int _decoratorDispatchGroupsY;
-        private int _decoratorVirtualGridX;
-        private int _decoratorVirtualGridY;
-        private float _decoratorCellSize;
-        private float _decoratorTotalDensity;
-        private float _decoratorGridOriginX;
-        private float _decoratorGridOriginZ;
+
+
+
+        // ───── Decoration Control Prepass ─────────────────────────────────
+        private ID3D12PipelineState? _decoPrepassPSO;
+        private ID3D12Resource? _decoControlTex;     // RGBA16_UINT, 2 slices
+        private uint _decoControlUAV;
+        private uint _decoControlSRV;
+        private bool _decoControlDirty = true;
+
+        // ───── Baked Terrain Albedo ───────────────────────────────────────
+        private ID3D12PipelineState? _albedoBakePSO;
+        private ID3D12Resource? _bakedAlbedoTex;     // RGBA8, 256×256
+        private uint _bakedAlbedoUAV;
+        private uint _bakedAlbedoSRV;
+        private ID3D12Resource? _tilingBuffer;       // StructuredBuffer<float4>, 32 entries
+        private uint _tilingSRV;
+        private bool _bakedAlbedoDirty = true;
+        private const int BakedAlbedoSize = 256;
 
         // ───── Lifecycle ──────────────────────────────────────────────────
 
@@ -231,7 +245,8 @@ namespace Freefall.Components
                     _decoratorValueVersion = valueHash;
                 }
 
-                CommandBuffer.Enqueue(RenderPass.Opaque, (list) => self.DispatchDecorator(list, fi));
+                CommandBuffer.Enqueue(RenderPass.Opaque, (list) => self.DispatchDecorator(list, fi, RenderPass.Opaque));
+                CommandBuffer.Enqueue(RenderPass.Shadow, (list) => self.DispatchDecorator(list, fi, RenderPass.Shadow));
             }
         }
 
@@ -860,6 +875,20 @@ namespace Freefall.Components
                 ControlMapsArray = Texture.CreateTexture2DArray(device, controlList);
             else
                 ControlMapsArray = InternalAssets.BlackArray;
+
+            // Build DecoMapsArray from decorator density maps
+            var decoList = new List<Texture>();
+            if (Terrain?.DecoMaps != null)
+            {
+                foreach (var dm in Terrain.DecoMaps)
+                {
+                    if (dm != null && dm.Native != null) decoList.Add(dm);
+                }
+            }
+            if (decoList.Count > 0)
+                DecoMapsArray = Texture.CreateTexture2DArray(device, decoList);
+            else
+                DecoMapsArray = null;
         }
 
         // ───── IHeightProvider ────────────────────────────────────────────
@@ -926,8 +955,10 @@ namespace Freefall.Components
             public float Rot10, Rot11, Rot12;
             public float Rot20, Rot21, Rot22;
             public float SlopeBias;  // 0=upright, 1=fully slope-aligned
-            public uint ControlMapIndex;  // array slice in ControlMaps Texture2DArray
-            public uint ControlChannel;   // 0=R, 1=G, 2=B, 3=A
+            public uint DecoMapSlice;     // slice in DecoMaps Texture2DArray (0xFFFFFFFF = none)
+            public uint _pad0;            // unused (was ControlChannel)
+            public uint Mode;             // 0=Mesh, 1=Billboard, 2=Cross
+            public uint TextureIdx;       // bindless index (billboard/cross)
         }
 
         [StructLayout(LayoutKind.Sequential)]
@@ -941,8 +972,8 @@ namespace Freefall.Components
 
         /// <summary>
         /// Builds GPU-side structured buffers from Terrain.Decorations.
-        /// Groups decorations by (ControlMapIndex, ControlChannel) into ChannelHeaders,
-        /// builds per-decoration DecoratorSlots with LOD table offsets,
+        /// Collects unique DensityMaps into a DecoMapsArray, builds per-decoration
+        /// DecoratorSlots with LOD table offsets and auto-resolved DecoMap slices,
         /// and registers all LOD meshes in MeshRegistry.
         /// </summary>
         public void BuildDecoratorBuffers()
@@ -958,8 +989,23 @@ namespace Freefall.Components
             _decoratorSlotsBuffer?.Dispose();
             _decoratorLODTableBuffer?.Dispose();
 
+            // Collect unique density maps and build DecoMapsArray
+            var uniqueDensityMaps = new List<Texture>();
+            var densityMapToSlice = new Dictionary<Texture, uint>();
+            foreach (var deco in decorations)
+            {
+                if (deco.DensityMap != null && deco.DensityMap.Native != null && !densityMapToSlice.ContainsKey(deco.DensityMap))
+                {
+                    densityMapToSlice[deco.DensityMap] = (uint)uniqueDensityMaps.Count;
+                    uniqueDensityMaps.Add(deco.DensityMap);
+                }
+            }
+            if (uniqueDensityMaps.Count > 0)
+                DecoMapsArray = Texture.CreateTexture2DArray(device, uniqueDensityMaps);
+            else
+                DecoMapsArray = null;
+
             // Flat list — all decorators go into a single header.
-            // Per-slot ControlMapIndex/ControlChannel fields handle per-slot gating in the shader.
             var headers = new List<ChannelHeader>();
             var slots = new List<DecoratorSlotGPU>();
             var lodTable = new List<LODTableEntry>();
@@ -967,43 +1013,67 @@ namespace Freefall.Components
             for (int i = 0; i < decorations.Count; i++)
             {
                 var deco = decorations[i];
-                if (deco.Mesh == null) continue;
-                var mesh = deco.Mesh!;
+                var mode = deco.Mode;
 
-                // Register base mesh LOD0
+                // Mesh mode requires a StaticMesh
+                if (mode == DecoratorMode.Mesh && deco.Mesh == null) continue;
+                // Billboard/Cross mode requires a Texture
+                if (mode != DecoratorMode.Mesh && deco.Texture == null && deco.Mesh == null) continue;
+
                 uint lodTableOffset = (uint)lodTable.Count;
                 uint lodCount = 0;
+                uint textureIdx = 0;
 
-                // LOD0 = base mesh
-                if (mesh.Mesh != null)
+                if (mode == DecoratorMode.Mesh)
                 {
-                    foreach (var part in mesh.MeshParts)
+                    var mesh = deco.Mesh!;
+
+                    // LOD0 = base mesh
+                    if (mesh.Mesh != null)
                     {
-                        int partId = MeshRegistry.Register(mesh.Mesh, part.MeshPartIndex);
-                        uint matId = part.Material != null ? (uint)part.Material.MaterialID : 0;
-                        float maxDist = mesh.LODGroup?.Ranges?.Count > 0
-                            ? mesh.LODGroup.Ranges[0] * 1000f
-                            : 100f;
-                        lodTable.Add(new LODTableEntry { MeshPartId = (uint)partId, MaxDistance = maxDist, MaterialId = matId });
-                        lodCount++;
+                        foreach (var part in mesh.MeshParts)
+                        {
+                            int partId = MeshRegistry.Register(mesh.Mesh, part.MeshPartIndex);
+                            uint matId = part.Material != null ? (uint)part.Material.MaterialID : 0;
+                            float maxDist = mesh.LODGroup?.Ranges?.Count > 0
+                                ? mesh.LODGroup.Ranges[0] * 1000f
+                                : 100f;
+                            lodTable.Add(new LODTableEntry { MeshPartId = (uint)partId, MaxDistance = maxDist, MaterialId = matId });
+                            lodCount++;
+                        }
+                    }
+
+                    // Additional LODs
+                    for (int lod = 0; lod < mesh.LODs.Count; lod++)
+                    {
+                        var lodMesh = mesh.LODs[lod];
+                        if (lodMesh.Mesh == null) continue;
+                        foreach (var part in lodMesh.MeshParts)
+                        {
+                            int partId = MeshRegistry.Register(lodMesh.Mesh, part.MeshPartIndex);
+                            uint matId = part.Material != null ? (uint)part.Material.MaterialID : 0;
+                            float maxDist = mesh.LODGroup?.Ranges != null && lod + 1 < mesh.LODGroup.Ranges.Count
+                                ? mesh.LODGroup.Ranges[lod + 1] * 1000f
+                                : 50f * (lod + 1);
+                            lodTable.Add(new LODTableEntry { MeshPartId = (uint)partId, MaxDistance = maxDist, MaterialId = matId });
+                            lodCount++;
+                        }
                     }
                 }
-
-                // Additional LODs
-                for (int lod = 0; lod < mesh.LODs.Count; lod++)
+                else
                 {
-                    var lodMesh = mesh.LODs[lod];
-                    if (lodMesh.Mesh == null) continue;
-                    foreach (var part in lodMesh.MeshParts)
-                    {
-                        int partId = MeshRegistry.Register(lodMesh.Mesh, part.MeshPartIndex);
-                        uint matId = part.Material != null ? (uint)part.Material.MaterialID : 0;
-                        float maxDist = mesh.LODGroup?.Ranges != null && lod + 1 < mesh.LODGroup.Ranges.Count
-                            ? mesh.LODGroup.Ranges[lod + 1] * 1000f
-                            : 50f * (lod + 1);
-                        lodTable.Add(new LODTableEntry { MeshPartId = (uint)partId, MaxDistance = maxDist, MaterialId = matId });
-                        lodCount++;
-                    }
+                    // Billboard / Cross: use Texture's material or create a dummy LOD entry
+                    // The texture is bound via the material system (Option A)
+                    uint matId = 0;
+                    if (deco.Texture != null)
+                        textureIdx = (uint)deco.Texture.BindlessIndex;
+
+                    // If there's a mesh reference, use its material for the billboard texture
+                    if (deco.Mesh?.MeshParts?.Count > 0 && deco.Mesh.MeshParts[0].Material != null)
+                        matId = (uint)deco.Mesh.MeshParts[0].Material!.MaterialID;
+
+                    lodTable.Add(new LODTableEntry { MeshPartId = 0, MaxDistance = 200f, MaterialId = matId });
+                    lodCount = 1;
                 }
 
                 float degToRad = MathF.PI / 180f;
@@ -1016,7 +1086,7 @@ namespace Freefall.Components
 
                 slots.Add(new DecoratorSlotGPU
                 {
-                    Density = deco.Density,
+                    Density = deco.Density * Terrain.DecorationDensity,
                     MinH = deco.HeightRange.X,
                     MaxH = deco.HeightRange.Y,
                     MinW = deco.WidthRange.X,
@@ -1027,8 +1097,11 @@ namespace Freefall.Components
                     Rot10 = sx*sy*cz - cx*sz,   Rot11 = sx*sy*sz + cx*cz,   Rot12 = sx*cy,
                     Rot20 = cx*sy*cz + sx*sz,   Rot21 = cx*sy*sz - sx*cz,   Rot22 = cx*cy,
                     SlopeBias = deco.SlopeBias,
-                    ControlMapIndex = (uint)deco.ControlMapIndex,
-                    ControlChannel = (uint)deco.ControlChannel
+                    DecoMapSlice = deco.DensityMap != null && densityMapToSlice.TryGetValue(deco.DensityMap, out var slice)
+                        ? slice : 0xFFFFFFFF,
+                    _pad0 = 0,
+                    Mode = (uint)mode,
+                    TextureIdx = textureIdx
                 });
             }
 
@@ -1041,14 +1114,6 @@ namespace Freefall.Components
 
 
 
-            // Cell size from SUM of all densities: the grid must accommodate all decorators
-            float sumDensity = 0;
-            foreach (var d in decorations)
-                sumDensity += d.Density;
-            sumDensity = MathF.Max(sumDensity, 1.0f);
-            _decoratorCellSize = 1.0f / MathF.Sqrt(sumDensity);
-            _decoratorTotalDensity = sumDensity;
-
             // Store absolute densities — shader does weighted selection proportional to each
 
             // Upload to GPU (creates new buffers + SRVs — only on structural changes)
@@ -1057,6 +1122,215 @@ namespace Freefall.Components
             UpdateOrCreateStructuredBuffer(device, lodTable, ref _decoratorLODTableBuffer, ref _decoratorLODTableSRV, "DecoratorLODTable");
 
             _decoratorBuffersBuilt = true;
+            _decoControlDirty = true;  // trigger prepass rebuild
+        }
+
+        /// <summary>
+        /// Creates the decoration control texture (RGBA16_UINT, 2 slices) and dispatches
+        /// the prepass compute shader to build it from density maps.
+        /// </summary>
+        private void BuildDecorationControlTexture(ID3D12GraphicsCommandList cmd)
+        {
+            Debug.Log("[TerrainRenderer]", $"BuildDecorationControlTexture: dirty={_decoControlDirty} DecoMaps={DecoMapsArray != null} SlotsBuffer={_decoratorSlotsBuffer != null}");
+            if (!_decoControlDirty || DecoMapsArray == null || _decoratorSlotsBuffer == null)
+                return;
+
+            var device = Engine.Device;
+            var nativeDecoMaps = DecoMapsArray.Native;
+            var decoDesc = nativeDecoMaps.Description;
+            int width = (int)decoDesc.Width;
+            int height = (int)decoDesc.Height;
+
+            // Compile prepass PSO on first use
+            if (_decoPrepassPSO == null)
+            {
+                string basePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Resources", "Shaders");
+                string source = File.ReadAllText(Path.Combine(basePath, "decoration_prepass.hlsl"));
+                var shader = new Shader(source, "CSBuildDecoControl", "cs_6_6");
+                _decoPrepassPSO = device.CreateComputePipelineState(shader.Bytecode);
+                shader.Dispose();
+                Debug.Log("[TerrainRenderer]", "Decoration prepass compute shader compiled");
+            }
+
+            // Create or recreate control texture
+            _decoControlTex?.Dispose();
+            _decoControlTex = device.CreateTexture2D(
+                Format.R16G16B16A16_UInt, width, height, 2, 1,
+                ResourceFlags.AllowUnorderedAccess, ResourceStates.Common);
+
+            _decoControlUAV = device.AllocateBindlessIndex();
+            var uavDesc = new UnorderedAccessViewDescription
+            {
+                Format = Format.R16G16B16A16_UInt,
+                ViewDimension = UnorderedAccessViewDimension.Texture2DArray,
+                Texture2DArray = new Texture2DArrayUnorderedAccessView
+                {
+                    MipSlice = 0,
+                    FirstArraySlice = 0,
+                    ArraySize = 2
+                }
+            };
+            device.NativeDevice.CreateUnorderedAccessView(_decoControlTex, null, uavDesc, device.GetCpuHandle(_decoControlUAV));
+
+            _decoControlSRV = device.AllocateBindlessIndex();
+            var srvDesc = new ShaderResourceViewDescription
+            {
+                Format = Format.R16G16B16A16_UInt,
+                ViewDimension = ShaderResourceViewDimension.Texture2DArray,
+                Shader4ComponentMapping = ShaderComponentMapping.Default,
+                Texture2DArray = new Texture2DArrayShaderResourceView
+                {
+                    MostDetailedMip = 0,
+                    MipLevels = 1,
+                    FirstArraySlice = 0,
+                    ArraySize = 2
+                }
+            };
+            device.NativeDevice.CreateShaderResourceView(_decoControlTex, srvDesc, device.GetCpuHandle(_decoControlSRV));
+
+            // Dispatch compute: density maps SRV, slot buffer SRV, control UAV, slot count
+            cmd.SetPipelineState(_decoPrepassPSO);
+            cmd.SetComputeRootSignature(device.GlobalRootSignature);
+            cmd.SetComputeRoot32BitConstant(0, (uint)DecoMapsArray.BindlessIndex, 0);  // DecoMapsIdx
+            cmd.SetComputeRoot32BitConstant(0, _decoratorSlotsSRV, 1);                 // SlotsIdx
+            cmd.SetComputeRoot32BitConstant(0, _decoControlUAV, 2);                    // ControlUAVIdx
+
+            // Count valid slots (matching ChannelHeader.Count)
+            uint slotCount = 0;
+            if (Terrain?.Decorations != null)
+            {
+                foreach (var d in Terrain.Decorations)
+                {
+                    if (d.Mode == DecoratorMode.Mesh && d.Mesh == null) continue;
+                    if (d.Mode != DecoratorMode.Mesh && d.Texture == null && d.Mesh == null) continue;
+                    slotCount++;
+                }
+            }
+            cmd.SetComputeRoot32BitConstant(0, slotCount, 3);                          // SlotCount
+
+            uint gx = (uint)((width + 7) / 8);
+            uint gy = (uint)((height + 7) / 8);
+            cmd.Dispatch(gx, gy, 1);
+
+            cmd.ResourceBarrierUnorderedAccessView(_decoControlTex);
+
+            _decoControlDirty = false;
+            _bakedAlbedoDirty = true; // Rebuild albedo when control changes
+            Debug.Log("[TerrainRenderer]", $"Decoration control texture built: {width}x{height}, {slotCount} slots, DecoMapsIdx={DecoMapsArray?.BindlessIndex}, SlotsIdx={_decoratorSlotsSRV}, UAV={_decoControlUAV}, SRV={_decoControlSRV}");
+
+            // Log slot details for debugging
+            if (Terrain?.Decorations != null)
+            {
+                int idx = 0;
+                foreach (var d in Terrain.Decorations)
+                {
+                    if (d.Mode == DecoratorMode.Mesh && d.Mesh == null) continue;
+                    if (d.Mode != DecoratorMode.Mesh && d.Texture == null && d.Mesh == null) continue;
+                    var hasMap = d.DensityMap != null;
+                    Debug.Log("[TerrainRenderer]", $"  Slot {idx}: Mode={d.Mode} DensityMap={hasMap} Density={d.Density:F2}");
+                    idx++;
+                    if (idx > 10) { Debug.Log("[TerrainRenderer]", $"  ... and {(int)slotCount - 10} more"); break; }
+                }
+            }
+        }
+
+        /// <summary>
+        /// Bakes terrain splatmap layers into a single 256×256 albedo texture
+        /// for ground color blending in vegetation shaders.
+        /// </summary>
+        private unsafe void BakeTerrainAlbedo(ID3D12GraphicsCommandList cmd)
+        {
+            if (!_bakedAlbedoDirty) return;
+            if (ControlMapsArray == null || DiffuseMapsArray == null) return;
+
+            var device = Engine.Device;
+
+            // Compile bake PSO on first use
+            if (_albedoBakePSO == null)
+            {
+                string basePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Resources", "Shaders");
+                string source = File.ReadAllText(Path.Combine(basePath, "terrain_albedo_bake.hlsl"));
+                var shader = new Shader(source, "CSBakeTerrainAlbedo", "cs_6_6");
+                _albedoBakePSO = device.CreateComputePipelineState(shader.Bytecode);
+                shader.Dispose();
+                Debug.Log("[TerrainRenderer]", "Terrain albedo bake compute shader compiled");
+            }
+
+            // Upload tiling data as structured buffer
+            if (_tilingBuffer == null)
+            {
+                _tilingBuffer = device.CreateUploadBuffer(32 * 16); // 32 × float4
+                _tilingSRV = device.AllocateBindlessIndex();
+                var srvDesc = new ShaderResourceViewDescription
+                {
+                    Format = Format.Unknown,
+                    ViewDimension = ShaderResourceViewDimension.Buffer,
+                    Shader4ComponentMapping = ShaderComponentMapping.Default,
+                    Buffer = new BufferShaderResourceView
+                    {
+                        FirstElement = 0,
+                        NumElements = 32,
+                        StructureByteStride = 16,
+                        Flags = BufferShaderResourceViewFlags.None
+                    }
+                };
+                device.NativeDevice.CreateShaderResourceView(_tilingBuffer, srvDesc, device.GetCpuHandle(_tilingSRV));
+            }
+            // Update tiling data
+            void* tilingPtr;
+            _tilingBuffer.Map(0, null, &tilingPtr);
+            fixed (Vector4* src = _layerTiling)
+            {
+                Buffer.MemoryCopy(src, tilingPtr, 32 * 16, 32 * 16);
+            }
+            _tilingBuffer.Unmap(0);
+
+            // Create or recreate baked albedo texture
+            if (_bakedAlbedoTex == null)
+            {
+                _bakedAlbedoTex = device.CreateTexture2D(
+                    Format.R8G8B8A8_UNorm, BakedAlbedoSize, BakedAlbedoSize, 1, 1,
+                    ResourceFlags.AllowUnorderedAccess, ResourceStates.Common);
+
+                _bakedAlbedoUAV = device.AllocateBindlessIndex();
+                var uavDesc = new UnorderedAccessViewDescription
+                {
+                    Format = Format.R8G8B8A8_UNorm,
+                    ViewDimension = UnorderedAccessViewDimension.Texture2D,
+                    Texture2D = new Texture2DUnorderedAccessView { MipSlice = 0 }
+                };
+                device.NativeDevice.CreateUnorderedAccessView(_bakedAlbedoTex, null, uavDesc, device.GetCpuHandle(_bakedAlbedoUAV));
+
+                _bakedAlbedoSRV = device.AllocateBindlessIndex();
+                var srvDesc = new ShaderResourceViewDescription
+                {
+                    Format = Format.R8G8B8A8_UNorm,
+                    ViewDimension = ShaderResourceViewDimension.Texture2D,
+                    Shader4ComponentMapping = ShaderComponentMapping.Default,
+                    Texture2D = new Texture2DShaderResourceView
+                    {
+                        MostDetailedMip = 0,
+                        MipLevels = 1
+                    }
+                };
+                device.NativeDevice.CreateShaderResourceView(_bakedAlbedoTex, srvDesc, device.GetCpuHandle(_bakedAlbedoSRV));
+            }
+
+            // Dispatch compute
+            cmd.SetPipelineState(_albedoBakePSO);
+            cmd.SetComputeRootSignature(device.GlobalRootSignature);
+            cmd.SetComputeRoot32BitConstant(0, (uint)ControlMapsArray.BindlessIndex, 0); // ControlMapsIdx
+            cmd.SetComputeRoot32BitConstant(0, (uint)DiffuseMapsArray.BindlessIndex, 1); // DiffuseMapsIdx
+            cmd.SetComputeRoot32BitConstant(0, _bakedAlbedoUAV, 2);                      // OutputUAVIdx
+            cmd.SetComputeRoot32BitConstant(0, _tilingSRV, 3);                            // TilingBufIdx
+
+            uint groups = (uint)((BakedAlbedoSize + 7) / 8);
+            cmd.Dispatch(groups, groups, 1);
+
+            cmd.ResourceBarrierUnorderedAccessView(_bakedAlbedoTex);
+
+            _bakedAlbedoDirty = false;
+            Debug.Log("[TerrainRenderer]", $"Terrain albedo baked: {BakedAlbedoSize}x{BakedAlbedoSize}, ControlMaps={ControlMapsArray.BindlessIndex}, DiffuseMaps={DiffuseMapsArray.BindlessIndex}, SRV={_bakedAlbedoSRV}");
         }
 
         /// <summary>
@@ -1072,65 +1346,77 @@ namespace Freefall.Components
 
             // Rebuild slot data with current values
             var slots = new List<DecoratorSlotGPU>();
-            foreach (var deco in decorations)
+
+            // Read existing LOD/structural data from the current buffer
+            uint[] existingLodCounts = null;
+            uint[] existingLodOffsets = null;
+            uint[] existingDecoSlices = null;
+            uint[] existingTextureIdx = null;
+
+            if (_decoratorSlotsBuffer != null)
             {
-                if (deco.Mesh == null) continue;
-                float degToRad = MathF.PI / 180f;
-
-                // LODCount and LODTableOffset can't change without structural rebuild,
-                // so find them from the existing buffer. For simplicity, just re-read.
-                // Since structural hash hasn't changed, these match.
-                uint lodCount = 0;
-                uint lodTableOffset = 0;
-                if (_decoratorSlotsBuffer != null && slots.Count == 0)
+                void* pRead;
+                _decoratorSlotsBuffer.Map(0, null, &pRead);
+                // Count how many valid slots exist (matching the filter from BuildDecoratorBuffers)
+                int validCount = 0;
+                foreach (var d in decorations)
                 {
-                    // Read existing values from the mapped buffer
-                    void* pRead;
-                    _decoratorSlotsBuffer.Map(0, null, &pRead);
-                    var existing = new Span<DecoratorSlotGPU>(pRead, decorations.Count);
-                    for (int i = 0; i < decorations.Count && i < existing.Length; i++)
-                    {
-                        var existingSlot = existing[i];
-                        var d = decorations[i];
-                        if (d.Mesh == null) continue;
-                        float rx = d.RootRotation.X * degToRad;
-                        float ry = d.RootRotation.Y * degToRad;
-                        float rz = d.RootRotation.Z * degToRad;
-                        float cx = MathF.Cos(rx), sx = MathF.Sin(rx);
-                        float cy = MathF.Cos(ry), sy = MathF.Sin(ry);
-                        float cz = MathF.Cos(rz), sz = MathF.Sin(rz);
-
-
-
-                        slots.Add(new DecoratorSlotGPU
-                        {
-                            Density = d.Density,
-                            MinH = d.HeightRange.X,
-                            MaxH = d.HeightRange.Y,
-                            MinW = d.WidthRange.X,
-                            MaxW = d.WidthRange.Y,
-                            LODCount = existingSlot.LODCount,
-                            LODTableOffset = existingSlot.LODTableOffset,
-                            Rot00 = cy*cz,              Rot01 = cy*sz,              Rot02 = -sy,
-                            Rot10 = sx*sy*cz - cx*sz,   Rot11 = sx*sy*sz + cx*cz,   Rot12 = sx*cy,
-                            Rot20 = cx*sy*cz + sx*sz,   Rot21 = cx*sy*sz - sx*cz,   Rot22 = cx*cy,
-                            SlopeBias = d.SlopeBias,
-                            ControlMapIndex = (uint)d.ControlMapIndex,
-                            ControlChannel = (uint)d.ControlChannel
-                        });
-                    }
-                    _decoratorSlotsBuffer.Unmap(0);
-                    break; // Only need one pass
+                    if (d.Mode == DecoratorMode.Mesh && d.Mesh == null) continue;
+                    if (d.Mode != DecoratorMode.Mesh && d.Texture == null && d.Mesh == null) continue;
+                    validCount++;
                 }
+                var existing = new Span<DecoratorSlotGPU>(pRead, validCount);
+                existingLodCounts = new uint[validCount];
+                existingLodOffsets = new uint[validCount];
+                existingDecoSlices = new uint[validCount];
+                existingTextureIdx = new uint[validCount];
+                for (int i = 0; i < validCount; i++)
+                {
+                    existingLodCounts[i] = existing[i].LODCount;
+                    existingLodOffsets[i] = existing[i].LODTableOffset;
+                    existingDecoSlices[i] = existing[i].DecoMapSlice;
+                    existingTextureIdx[i] = existing[i].TextureIdx;
+                }
+                _decoratorSlotsBuffer.Unmap(0);
             }
 
-            // Recalculate cell size from sum of densities
-            float sumDensity = 0;
-            foreach (var d in decorations)
-                sumDensity += d.Density;
-            sumDensity = MathF.Max(sumDensity, 1.0f);
-            _decoratorCellSize = 1.0f / MathF.Sqrt(sumDensity);
-            _decoratorTotalDensity = sumDensity;
+            float degToRad = MathF.PI / 180f;
+            int slotIdx = 0;
+
+            foreach (var deco in decorations)
+            {
+                // Same filter as BuildDecoratorBuffers
+                if (deco.Mode == DecoratorMode.Mesh && deco.Mesh == null) continue;
+                if (deco.Mode != DecoratorMode.Mesh && deco.Texture == null && deco.Mesh == null) continue;
+
+                float rx = deco.RootRotation.X * degToRad;
+                float ry = deco.RootRotation.Y * degToRad;
+                float rz = deco.RootRotation.Z * degToRad;
+                float cx = MathF.Cos(rx), sx = MathF.Sin(rx);
+                float cy = MathF.Cos(ry), sy = MathF.Sin(ry);
+                float cz = MathF.Cos(rz), sz = MathF.Sin(rz);
+
+                slots.Add(new DecoratorSlotGPU
+                {
+                    Density = deco.Density * Terrain.DecorationDensity,
+                    MinH = deco.HeightRange.X,
+                    MaxH = deco.HeightRange.Y,
+                    MinW = deco.WidthRange.X,
+                    MaxW = deco.WidthRange.Y,
+                    LODCount = existingLodCounts != null && slotIdx < existingLodCounts.Length ? existingLodCounts[slotIdx] : 0,
+                    LODTableOffset = existingLodOffsets != null && slotIdx < existingLodOffsets.Length ? existingLodOffsets[slotIdx] : 0,
+                    Rot00 = cy*cz,              Rot01 = cy*sz,              Rot02 = -sy,
+                    Rot10 = sx*sy*cz - cx*sz,   Rot11 = sx*sy*sz + cx*cz,   Rot12 = sx*cy,
+                    Rot20 = cx*sy*cz + sx*sz,   Rot21 = cx*sy*sz - sx*cz,   Rot22 = cx*cy,
+                    SlopeBias = deco.SlopeBias,
+                    DecoMapSlice = existingDecoSlices != null && slotIdx < existingDecoSlices.Length ? existingDecoSlices[slotIdx] : 0xFFFFFFFF,
+                    _pad0 = 0,
+                    Mode = (uint)deco.Mode,
+                    TextureIdx = existingTextureIdx != null && slotIdx < existingTextureIdx.Length ? existingTextureIdx[slotIdx] : 0
+                });
+                slotIdx++;
+            }
+
 
             // Absolute densities — no normalization needed
 
@@ -1187,30 +1473,38 @@ namespace Freefall.Components
             Debug.Log($"[TerrainRenderer] {name}: {data.Count} entries, SRV={srvIndex}");
         }
 
-        private void DispatchDecorator(ID3D12GraphicsCommandList commandList, int frameIndex)
+        private void DispatchDecorator(ID3D12GraphicsCommandList commandList, int frameIndex, RenderPass pass = RenderPass.Opaque)
         {
             if (DecoratorMaterial?.Effect == null || Terrain == null) return;
+
+            // Build control texture on first frame or after decoration changes
+            BuildDecorationControlTexture(commandList);
+            // Bake terrain albedo for ground color blending in vegetation
+            BakeTerrainAlbedo(commandList);
 
             var device = Engine.Device;
             var camPos = Camera.Main!.Position;
 
-            // Dispatch covers a square patch of (2*range) per side, cells of _decoratorCellSize
             float range = Terrain.DecorationRadius;
             const int TILE_SIZE = 8;
 
-            // cellSize is always true to density
-            float cs = _decoratorCellSize;
-            int cellsPerSide = Math.Max(1, (int)MathF.Ceiling(2.0f * range / cs));
-            int groups = Math.Max(1, (cellsPerSide + TILE_SIZE - 1) / TILE_SIZE);
+            // Tile size = one CONTROL pixel; cell size = tile / 8
+            float controlWidth = _decoControlTex != null
+                ? _decoControlTex.Description.Width : 1024f;
+            float tileSize = Terrain.TerrainSize.X / controlWidth;
+            float cs = tileSize / TILE_SIZE;
+            int tilesPerSide = Math.Max(1, (int)MathF.Ceiling(2.0f * range / tileSize));
 
-            Debug.Log($"[Grass] density={1.0f/(cs*cs):F1}/m² cellSize={cs:F3} range={range:F0} groups={groups}x{groups}={groups*groups} controlMapsIdx={ControlMapsArray?.BindlessIndex ?? 0}");
+            Debug.Log($"[Grass] tileSize={tileSize:F3} cellSize={cs:F3} range={range:F0} tiles={tilesPerSide}x{tilesPerSide}={tilesPerSide*tilesPerSide} decoMapsIdx={DecoMapsArray?.BindlessIndex ?? 0}");
 
-            // Bind control maps texture array for decorator placement
-            if (ControlMapsArray != null)
-                DecoratorMaterial.SetTexture("ControlMaps", ControlMapsArray);
-
-            // Apply decorator mesh shader PSO
+            // Select correct PSO pass and apply
+            DecoratorMaterial.SetPass(pass);
             DecoratorMaterial.Apply(commandList, device);
+
+            // In shadow pass, Apply just overwrote slot 1 with camera CBV.
+            // Rebind the light's cascade VP so the mesh shader projects into shadow space.
+            if (pass == RenderPass.Shadow && DirectionalLight.CurrentShadowSceneCBV != 0)
+                commandList.SetGraphicsRootConstantBufferView(1, DirectionalLight.CurrentShadowSceneCBV);
 
             // Push constants
             commandList.SetGraphicsRoot32BitConstant(0, _decoratorHeadersSRV, 0);
@@ -1229,17 +1523,19 @@ namespace Freefall.Components
             commandList.SetGraphicsRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(Transform.WorldPosition.Z), 12);
             commandList.SetGraphicsRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(Transform.WorldPosition.Y), 13);
             commandList.SetGraphicsRoot32BitConstant(0, Graphics.Material.MaterialsBufferIndex, 14);
-            // Slot 15: cell size (true to density, never capped)
+            // Slot 15: cell size (tile / 8, locked to CONTROL resolution)
             commandList.SetGraphicsRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(cs), 15);
             // Slot 16: decoration radius
             commandList.SetGraphicsRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(range), 16);
-            // Slot 17: total density sum for weighted selection
-            commandList.SetGraphicsRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(_decoratorTotalDensity), 17);
-            // Slot 18: control maps texture array SRV
-            commandList.SetGraphicsRoot32BitConstant(0, ControlMapsArray?.BindlessIndex ?? 0u, 18);
+            // Slot 17: wind animation time
+            commandList.SetGraphicsRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(Base.Time.TotalTime), 17);
+            // Slot 18: decoration control texture SRV (from prepass compute)
+            commandList.SetGraphicsRoot32BitConstant(0, _decoControlSRV, 18);
+            // Slot 19: baked terrain albedo SRV (for ground color blending)
+            commandList.SetGraphicsRoot32BitConstant(0, _bakedAlbedoSRV, 19);
 
             using var commandList6 = commandList.QueryInterface<ID3D12GraphicsCommandList6>();
-            commandList6.DispatchMesh((uint)groups, (uint)groups, 1);
+            commandList6.DispatchMesh((uint)tilesPerSide, (uint)tilesPerSide, 1);
         }
     }
 }

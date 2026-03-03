@@ -30,6 +30,33 @@ namespace Freefall.Serialization
 
         private ArrayBufferWriter<byte> _bufferWriter;
 
+        // ── Deferred Asset Reference Collection ──
+        // Collected during deserialization; resolved in batch via ResolveDeferredReferences.
+
+        public struct DeferredAssetRef
+        {
+            public object Parent;     // object that owns the field/list
+            public Field Field;       // null for list elements
+            public int ListIndex;     // index in list (-1 for direct fields)
+            public string Guid;
+            public Type AssetType;
+        }
+
+        internal List<DeferredAssetRef> DeferredRefs { get; } = new();
+
+        /// <summary>
+        /// Deserialize YAML and return both the result object and any
+        /// deferred asset reference stubs that were collected.
+        /// </summary>
+        public object Deserialize(string yaml, out List<DeferredAssetRef> stubs)
+        {
+            DeferredRefs.Clear();
+            var result = Deserialize(yaml);
+            stubs = new List<DeferredAssetRef>(DeferredRefs);
+            DeferredRefs.Clear();
+            return result;
+        }
+
         static YAMLSerializer()
         {
             _converters.Add(typeof(int).FullName!, new IntYAMLConverter());
@@ -547,40 +574,23 @@ namespace Freefall.Serialization
                 if (string.IsNullOrEmpty(guidValue))
                     return;
 
-                if (DeferAssetLoading)
+                // Always create stub + collect deferred reference
+                try
                 {
-                    try
-                    {
-                        var stub = (Asset)Activator.CreateInstance(field.Type);
-                        stub.Guid = guidValue;
-                        field.SetValue(parent, stub);
-                    }
-                    catch { }
-                    return;
-                }
+                    var stub = (Asset)Activator.CreateInstance(field.Type);
+                    stub.Guid = guidValue;
+                    field.SetValue(parent, stub);
 
-                if (Engine.Assets != null)
-                {
-                    try
+                    DeferredRefs.Add(new DeferredAssetRef
                     {
-                        if (guidValue.Length == 32 && System.Text.RegularExpressions.Regex.IsMatch(guidValue, "^[0-9a-fA-F]+$"))
-                        {
-                            var loadMethod = typeof(AssetManager).GetMethod("LoadByGuid")!.MakeGenericMethod(field.Type);
-                            var asset = loadMethod.Invoke(Engine.Assets, new object[] { guidValue });
-                            if (asset != null) field.SetValue(parent, asset);
-                        }
-                        else
-                        {
-                            var loadMethod = typeof(AssetManager).GetMethod("Load")!.MakeGenericMethod(field.Type);
-                            var asset = loadMethod.Invoke(Engine.Assets, new object[] { guidValue });
-                            if (asset != null) field.SetValue(parent, asset);
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        Debug.LogWarning("YAMLSerializer", $"Failed to load {field.Type.Name} '{guidValue}': {ex.Message}");
-                    }
+                        Parent = parent,
+                        Field = field,
+                        ListIndex = -1,
+                        Guid = guidValue,
+                        AssetType = field.Type
+                    });
                 }
+                catch { }
 
                 return;
             }
@@ -653,23 +663,20 @@ namespace Freefall.Serialization
 
                         if (isGuid)
                         {
-                            if (DeferAssetLoading)
+                            // Always create stub + collect deferred reference
+                            var stub = (Asset)Activator.CreateInstance(eltype);
+                            stub.Guid = scalarValue;
+                            int idx = newlist!.Count;
+                            newlist.Add(stub);
+
+                            DeferredRefs.Add(new DeferredAssetRef
                             {
-                                var stub = (Asset)Activator.CreateInstance(eltype);
-                                stub.Guid = scalarValue;
-                                newlist!.Add(stub);
-                            }
-                            else if (Engine.Assets != null)
-                            {
-                                try
-                                {
-                                    var loadMethod = typeof(AssetManager).GetMethod("LoadByGuid")!
-                                        .MakeGenericMethod(eltype);
-                                    var loaded = loadMethod.Invoke(Engine.Assets, new object[] { scalarValue });
-                                    if (loaded != null) newlist!.Add(loaded);
-                                }
-                                catch { }
-                            }
+                                Parent = newlist,
+                                Field = null,
+                                ListIndex = idx,
+                                Guid = scalarValue,
+                                AssetType = eltype
+                            });
                             continue;
                         }
                     }
