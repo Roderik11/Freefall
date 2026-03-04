@@ -59,6 +59,15 @@ namespace Freefall.Components
         // VP matrices for current and previous frames
         private readonly Matrix4x4[] _shadowVPMatrices = new Matrix4x4[MaxCascades];
         private readonly Matrix4x4[] _prevShadowVPMatrices = new Matrix4x4[MaxCascades];
+        
+        // GPU-default cascade buffers for compute path (UAV + SRV)
+        private ID3D12Resource[]? _gpuCascadeBuffers;
+        private uint[]? _gpuCascadeBufferUavIndices;
+        private uint[]? _gpuCascadeBufferSrvIndices;
+        
+        // Track whether GPU cascade compute was used this frame
+        private bool _usedGpuCascadeCompute;
+        private uint _activeLightingCascadeSrv;  // SRV for lighting pass (0 = CPU path)
 
 
         /// <summary>
@@ -155,6 +164,11 @@ namespace Freefall.Components
             Params.SetParameter("CascadeCount", cc);
             Params.SetParameter("DebugVisualizationMode", Engine.Settings.DebugVisualizationMode);
             
+            // GPU-computed cascade data SRV (0 = use cbuffer, >0 = use StructuredBuffer)
+            // Use SetTextureIndex on the Material (not Params) because this is a push constant slot,
+            // not a cbuffer parameter. The Material.Apply flow resolves it via _bindlessIndices.
+            Material.SetTextureIndex("LightingCascadeSRV", _activeLightingCascadeSrv);
+            
             if (DeferredRenderer.Current != null)
             {
                 Params.SetTexture("ShadowMap", DeferredRenderer.Current.ShadowTextureArray);
@@ -184,91 +198,175 @@ namespace Freefall.Components
             float near = camera.NearPlane;
             const int numCascades = 4;
             
-            // Try adaptive splits from SDSM depth analysis (previous frame)
-            float[] activeSplits = CascadeSplits;
-            bool usingAdaptive = false;
-            if (Engine.Settings.UseAdaptiveSplits)
-            {
-                var adaptiveSplits = CommandBuffer.Culler?.ReadAdaptiveSplits();
-                if (adaptiveSplits != null)
-                {
-                    activeSplits = adaptiveSplits;
-                    usingAdaptive = true;
-                }
-            }
-            
-            // Use active splits (adaptive or fixed)
-            cascades[0] = new Vector4(near, activeSplits[0], 0, 0);
-            for (int i = 1; i < numCascades; i++)
-                cascades[i] = new Vector4(activeSplits[i - 1], activeSplits[i], 0, 0);
-
-            // Get cascade projection matrices
-            for (int i = 0; i < 4; i++)
-                cascadeProjectionMatrices[i] = camera.GetProjectionMatrix(cascades[i].X, cascades[i].Y);
-
-            // Set viewport for shadow map size
-            commandList.RSSetViewport(new Viewport(0, 0, shadowTex.Width, shadowTex.Height));
-            commandList.RSSetScissorRect(new RectI(0, 0, shadowTex.Width, shadowTex.Height));
-            
-            // Clear all cascades first
-            for (int i = 0; i < 4; i++)
-                commandList.ClearDepthStencilView(shadowTex.SliceDsvHandles[i], ClearFlags.Depth, 1.0f, 0);
-            
-            if (!CastShadows) return;
-            
-            // Draw each cascade using GPU-driven rendering
-            // Phase 1: Compute cascade matrices and frustum planes
-            for (int i = 0; i < CascadeCount; i++)
-                SetupCascade(i, camera, cameraPosition, shadowTex);
-            
-            // Phase 2: GPU-driven cull all cascades per batch (unified visibility pass)
+            // Check if GPU cascade compute is available and SDSM is active
             var culler = CommandBuffer.Culler;
-            var allBatches = CommandBuffer.GetAllBatches(RenderPass.Opaque);
-            int frameIndex = Engine.FrameIndex % FrameCount;
+            bool useGpuCascades = Engine.Settings.UseAdaptiveSplits 
+                && culler?.CascadeComputeReady == true;
             
-            if (culler != null && allBatches != null)
+            if (useGpuCascades)
             {
-                EnsureCascadeBuffer();
-                UploadCascadeBuffer(frameIndex);
-                uint cascadeSrv = _cascadeBufferSrvIndices![frameIndex];
-                uint vpOnlySrv = _vpOnlySrvIndices![frameIndex]; // TEMP
-                CurrentCascadeSrvIndex = cascadeSrv;
-                CurrentVPOnlySrvIndex = vpOnlySrv; // TEMP
+                // GPU path: cascade compute shader reads SDSM splits directly from GPU buffer.
+                // No CPU readback — all cascade data (matrices, planes, splits) computed on GPU.
+                EnsureGPUCascadeBuffer();
+                EnsureCascadeBuffer(); // cbuffer still needed for root sig bind (slot 2)
+                int frameIndex = Engine.FrameIndex % FrameCount;
                 
-                // Shadow Hi-Z SRV for occlusion culling (0 = disabled on first frame before pyramid is ready)
-                var shadowPyramid = DeferredRenderer.Current?.ShadowHiZPyramid;
-                uint shadowHiZSrv = (shadowPyramid?.Ready == true) ? shadowPyramid.FullSRV : 0;
+                uint cascadeUAV = _gpuCascadeBufferUavIndices![frameIndex];
+                uint cascadeSRV = _gpuCascadeBufferSrvIndices![frameIndex];
                 
-                // Cull all cascades for each batch using unified visibility pass
-                ulong cascadeCBAddr = _shadowCascadeCBs![frameIndex].GPUVirtualAddress;
-                foreach (var batch in allBatches)
+                // Transition GPU cascade buffer to UAV for compute write
+                commandList.ResourceBarrierTransition(_gpuCascadeBuffers![frameIndex],
+                    ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess);
+                
+                // Dispatch GPU cascade matrix computation
+                culler!.ComputeCascadeMatrices(
+                    commandList,
+                    camera,
+                    cameraPosition,
+                    Transform.Forward,
+                    shadowTex.Width,
+                    cascadeUAV,
+                    cascadeSRV);
+                
+                // Transition GPU cascade buffer back to SRV for culler/rendering
+                commandList.ResourceBarrierTransition(_gpuCascadeBuffers[frameIndex],
+                    ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource);
+                
+                // Set viewport for shadow map
+                commandList.RSSetViewport(new Viewport(0, 0, shadowTex.Width, shadowTex.Height));
+                commandList.RSSetScissorRect(new RectI(0, 0, shadowTex.Width, shadowTex.Height));
+                
+                // Clear all cascades
+                for (int i = 0; i < 4; i++)
+                    commandList.ClearDepthStencilView(shadowTex.SliceDsvHandles[i], ClearFlags.Depth, 1.0f, 0);
+                
+                if (!CastShadows) return;
+                
+                // GPU-driven cull using GPU-computed cascade buffer
+                // Culler reads planes from CascadeData structured buffer (not cbuffer)
+                var allBatches = CommandBuffer.GetAllBatches(RenderPass.Opaque);
+                if (allBatches != null)
                 {
-                    batch.CullShadowAll(commandList, cascadeSrv, cascadeCBAddr, shadowHiZSrv, culler);
-                }
-                
-                // Phase 3: True single-pass draw — 1 ExecuteIndirect per batch for all cascades
-                // Bind full-array DSV (all slices at once)
-                commandList.OMSetRenderTargets(0, (CpuDescriptorHandle[]?)null, false, shadowTex.FullArrayDsvHandle);
-                
-                foreach (var batch in allBatches)
-                {
-                    if (!batch.Material.HasPass(RenderPass.Shadow)) continue;
-                    batch.Material.SetPass(RenderPass.Shadow);
-                    batch.Material.Apply(commandList, Engine.Device, null);
+                    uint shadowHiZSrv = 0;
+                    var shadowPyramid = DeferredRenderer.Current?.ShadowHiZPyramid;
+                    if (shadowPyramid?.Ready == true) shadowHiZSrv = shadowPyramid.FullSRV;
                     
-                    batch.DrawShadowSinglePass(commandList, cascadeSrv);
+                    // cbuffer addr still bound for root sig requirement (culler ignores it now)
+                    ulong cascadeCBAddr = _shadowCascadeCBs![frameIndex].GPUVirtualAddress;
+                    CurrentCascadeSrvIndex = cascadeSRV;
+                    CurrentVPOnlySrvIndex = _vpOnlySrvIndices != null ? _vpOnlySrvIndices[frameIndex] : 0;
+                    
+                    foreach (var batch in allBatches)
+                        batch.CullShadowAll(commandList, cascadeSRV, cascadeCBAddr, shadowHiZSrv, culler);
+                    
+                    commandList.OMSetRenderTargets(0, (CpuDescriptorHandle[]?)null, false, shadowTex.FullArrayDsvHandle);
+                    
+                    foreach (var batch in allBatches)
+                    {
+                        if (!batch.Material.HasPass(RenderPass.Shadow)) continue;
+                        batch.Material.SetPass(RenderPass.Shadow);
+                        batch.Material.Apply(commandList, Engine.Device, null);
+                        batch.DrawShadowSinglePass(commandList, cascadeSRV);
+                    }
+                    
+                    CommandBuffer.ExecuteCustomActions(RenderPass.Shadow, commandList);
+                    CommandBuffer.ClearCustomActions(RenderPass.Shadow);
                 }
-
-                // Custom shadow actions (grass) — single-pass via AS/MS cascade expansion
-                // FullArrayDsvHandle is already bound from batch shadows above
-                CommandBuffer.ExecuteCustomActions(RenderPass.Shadow, commandList);
-                CommandBuffer.ClearCustomActions(RenderPass.Shadow);
+                
+                _usedGpuCascadeCompute = true;
+                _activeLightingCascadeSrv = culler.LightingCascadeSRV;
             }
             else
             {
-                // Fallback: CPU geometry submission
-                CommandBuffer.Execute(RenderPass.Shadow, commandList, Engine.Device);
-                CommandBuffer.Clear();
+                // CPU path: existing implementation
+                _usedGpuCascadeCompute = false;
+                _activeLightingCascadeSrv = 0;
+                
+                // Try adaptive splits from SDSM depth analysis (previous frame)
+                float[] activeSplits = CascadeSplits;
+                bool usingAdaptive = false;
+                if (Engine.Settings.UseAdaptiveSplits)
+                {
+                    var adaptiveSplits = CommandBuffer.Culler?.ReadAdaptiveSplits();
+                    if (adaptiveSplits != null)
+                    {
+                        activeSplits = adaptiveSplits;
+                        usingAdaptive = true;
+                    }
+                }
+                
+                // Use active splits (adaptive or fixed)
+                cascades[0] = new Vector4(near, activeSplits[0], 0, 0);
+                for (int i = 1; i < numCascades; i++)
+                    cascades[i] = new Vector4(activeSplits[i - 1], activeSplits[i], 0, 0);
+
+                // Get cascade projection matrices
+                for (int i = 0; i < 4; i++)
+                    cascadeProjectionMatrices[i] = camera.GetProjectionMatrix(cascades[i].X, cascades[i].Y);
+
+                // Set viewport for shadow map size
+                commandList.RSSetViewport(new Viewport(0, 0, shadowTex.Width, shadowTex.Height));
+                commandList.RSSetScissorRect(new RectI(0, 0, shadowTex.Width, shadowTex.Height));
+                
+                // Clear all cascades first
+                for (int i = 0; i < 4; i++)
+                    commandList.ClearDepthStencilView(shadowTex.SliceDsvHandles[i], ClearFlags.Depth, 1.0f, 0);
+                
+                if (!CastShadows) return;
+                
+                // Draw each cascade using GPU-driven rendering
+                // Phase 1: Compute cascade matrices and frustum planes
+                for (int i = 0; i < CascadeCount; i++)
+                    SetupCascade(i, camera, cameraPosition, shadowTex);
+                
+                // Phase 2: GPU-driven cull all cascades per batch (unified visibility pass)
+                var allBatches = CommandBuffer.GetAllBatches(RenderPass.Opaque);
+                int frameIndex = Engine.FrameIndex % FrameCount;
+                
+                if (culler != null && allBatches != null)
+                {
+                    EnsureCascadeBuffer();
+                    UploadCascadeBuffer(frameIndex);
+                    uint cascadeSrv = _cascadeBufferSrvIndices![frameIndex];
+                    uint vpOnlySrv = _vpOnlySrvIndices![frameIndex]; // TEMP
+                    CurrentCascadeSrvIndex = cascadeSrv;
+                    CurrentVPOnlySrvIndex = vpOnlySrv; // TEMP
+                    
+                    // Shadow Hi-Z SRV for occlusion culling (0 = disabled on first frame before pyramid is ready)
+                    var shadowPyramid = DeferredRenderer.Current?.ShadowHiZPyramid;
+                    uint shadowHiZSrv = (shadowPyramid?.Ready == true) ? shadowPyramid.FullSRV : 0;
+                    
+                    // Cull all cascades for each batch using unified visibility pass
+                    ulong cascadeCBAddr = _shadowCascadeCBs![frameIndex].GPUVirtualAddress;
+                    foreach (var batch in allBatches)
+                    {
+                        batch.CullShadowAll(commandList, cascadeSrv, cascadeCBAddr, shadowHiZSrv, culler);
+                    }
+                    
+                    // Phase 3: True single-pass draw — 1 ExecuteIndirect per batch for all cascades
+                    // Bind full-array DSV (all slices at once)
+                    commandList.OMSetRenderTargets(0, (CpuDescriptorHandle[]?)null, false, shadowTex.FullArrayDsvHandle);
+                    
+                    foreach (var batch in allBatches)
+                    {
+                        if (!batch.Material.HasPass(RenderPass.Shadow)) continue;
+                        batch.Material.SetPass(RenderPass.Shadow);
+                        batch.Material.Apply(commandList, Engine.Device, null);
+                        
+                        batch.DrawShadowSinglePass(commandList, cascadeSrv);
+                    }
+
+                    // Custom shadow actions (grass) — single-pass via AS/MS cascade expansion
+                    // FullArrayDsvHandle is already bound from batch shadows above
+                    CommandBuffer.ExecuteCustomActions(RenderPass.Shadow, commandList);
+                    CommandBuffer.ClearCustomActions(RenderPass.Shadow);
+                }
+                else
+                {
+                    // Fallback: CPU geometry submission
+                    CommandBuffer.Execute(RenderPass.Shadow, commandList, Engine.Device);
+                    CommandBuffer.Clear();
+                }
             }
         }
         
@@ -453,6 +551,36 @@ namespace Freefall.Components
                     _shadowCascadeCBs[i].Map(0, null, &pCB);
                     _shadowCascadeCBPtrs[i] = (IntPtr)pCB;
                 }
+            }
+        }
+        
+        private void EnsureGPUCascadeBuffer()
+        {
+            if (_gpuCascadeBuffers != null) return;
+            
+            int stride = Marshal.SizeOf<GPUCuller.CascadeData>();
+            int bufferSize = stride * MaxCascades;
+            var device = Engine.Device;
+            
+            _gpuCascadeBuffers = new ID3D12Resource[FrameCount];
+            _gpuCascadeBufferUavIndices = new uint[FrameCount];
+            _gpuCascadeBufferSrvIndices = new uint[FrameCount];
+            
+            for (int i = 0; i < FrameCount; i++)
+            {
+                // GPU-default buffer with UAV flag for compute writes
+                _gpuCascadeBuffers[i] = device.NativeDevice.CreateCommittedResource(
+                    new HeapProperties(HeapType.Default),
+                    HeapFlags.None,
+                    ResourceDescription.Buffer((ulong)bufferSize, ResourceFlags.AllowUnorderedAccess),
+                    ResourceStates.NonPixelShaderResource,
+                    null);
+                
+                _gpuCascadeBufferUavIndices[i] = device.AllocateBindlessIndex();
+                device.CreateStructuredBufferUAV(_gpuCascadeBuffers[i], (uint)MaxCascades, (uint)stride, _gpuCascadeBufferUavIndices[i]);
+                
+                _gpuCascadeBufferSrvIndices[i] = device.AllocateBindlessIndex();
+                device.CreateStructuredBufferSRV(_gpuCascadeBuffers[i], (uint)MaxCascades, (uint)stride, _gpuCascadeBufferSrvIndices[i]);
             }
         }
         

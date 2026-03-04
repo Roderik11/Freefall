@@ -249,17 +249,13 @@ bool IsOccluded(float3 worldCenter, float worldRadius)
 //-----------------------------------------------------------------------------
 bool IsVisibleShadow(float3 center, float radius, uint cascadeIndex)
 {
-    // Read planes from cbuffer (register b1)
-    float4 planes[6];
-    if (cascadeIndex == 0) { [unroll] for (uint j = 0; j < 6; j++) planes[j] = CascadePlane0[j]; }
-    else if (cascadeIndex == 1) { [unroll] for (uint j = 0; j < 6; j++) planes[j] = CascadePlane1[j]; }
-    else if (cascadeIndex == 2) { [unroll] for (uint j = 0; j < 6; j++) planes[j] = CascadePlane2[j]; }
-    else { [unroll] for (uint j = 0; j < 6; j++) planes[j] = CascadePlane3[j]; }
+    // Read planes from CascadeData structured buffer (GPU-computed, no CPU readback)
+    StructuredBuffer<CascadeData> cascades = ResourceDescriptorHeap[CascadeBufferSRVIdx];
     
     [unroll]
     for (uint i = 0; i < 6; i++)
     {
-        float dist = dot(planes[i].xyz, center) + planes[i].w;
+        float dist = dot(cascades[cascadeIndex].Planes[i].xyz, center) + cascades[cascadeIndex].Planes[i].w;
         if (dist > radius)
             return false;
     }

@@ -9,6 +9,8 @@
 #define DepthGBufIdx GET_INDEX(3)   // G-Buffer linear depth (R32_Float, for debug viz)
 #define AlbedoTexIdx GET_INDEX(4)   // G-Buffer albedo texture (for PBR)
 #define DataTexIdx GET_INDEX(5)     // G-Buffer data texture (roughness, metal, ao)
+#define LightingCascadeSRVIdx GET_INDEX(6)  // SRV: GPU-computed cascade data (0 = use cbuffer)
+
 
 // Light params from ObjectConstants (Slot 2, b1)
 cbuffer ObjectConstants : register(b1)
@@ -27,6 +29,30 @@ cbuffer ObjectConstants : register(b1)
     int DebugVisualizationMode;
     float2 _pad1;
 };
+
+// GPU-computed lighting cascade data (matches cascade_compute.hlsl output)
+struct LightingCascadeData {
+    row_major float4x4 VP;   // Camera-relative light VP
+    float4 Cascade;          // X=near, Y=far
+};
+
+// Dual-path cascade data access: when LightingCascadeSRVIdx > 0, read from GPU buffer;
+// otherwise fall back to cbuffer arrays above.
+float4x4 getLightSpace(int idx) {
+    if (LightingCascadeSRVIdx > 0) {
+        StructuredBuffer<LightingCascadeData> buf = ResourceDescriptorHeap[LightingCascadeSRVIdx];
+        return buf[idx].VP;
+    }
+    return LightSpaces[idx];
+}
+
+float4 getCascade(int idx) {
+    if (LightingCascadeSRVIdx > 0) {
+        StructuredBuffer<LightingCascadeData> buf = ResourceDescriptorHeap[LightingCascadeSRVIdx];
+        return buf[idx].Cascade;
+    }
+    return Cascades[idx];
+}
 
 SamplerState Sampler : register(s0);
 SamplerState ShadowClampSampler : register(s2); // Linear+Clamp for shadow map sampling (debug)
@@ -137,7 +163,7 @@ float4 PS(VSOutput input) : SV_Target
     int cascadeIndex = CascadeCount - 1;
     for (int i = 0; i < CascadeCount; i++)
     {
-        if (viewDepth < Cascades[i].y)
+        if (viewDepth < getCascade(i).y)
         {
             cascadeIndex = i;
             break;
@@ -151,13 +177,13 @@ float4 PS(VSOutput input) : SV_Target
     float sampledDepth = 0;
     
     // Beyond the last cascade far distance — no shadow (fully lit)
-    if (viewDepth > Cascades[CascadeCount - 1].y)
+    if (viewDepth > getCascade(CascadeCount - 1).y)
         shadowFactor = 1.0f;
     else if (ShadowMapIdx > 0) // Only sample if shadow map is bound
 
     {
         // Transform world position to light space for current cascade
-        lightSpacePos = mul(worldPos, LightSpaces[cascadeIndex]);
+        lightSpacePos = mul(worldPos, getLightSpace(cascadeIndex));
         lightSpacePos /= lightSpacePos.w;
         
         // Convert from [-1,1] to [0,1] UV space
@@ -168,30 +194,30 @@ float4 PS(VSOutput input) : SV_Target
         if (shadowUV.x >= 0.0f && shadowUV.x <= 1.0f && shadowUV.y >= 0.0f && shadowUV.y <= 1.0f)
         {
             sampledDepth = ShadowMap.SampleLevel(ShadowClampSampler, float3(shadowUV, cascadeIndex), 0).r;
-            float zScale = abs(LightSpaces[cascadeIndex]._33);
+            float zScale = abs(getLightSpace(cascadeIndex)._33);
             shadowFactor = GetShadowFactor(ShadowMap, ShadowSampler, shadowUV, lightSpacePos.z, cascadeIndex, normal, LightDirection, zScale, input.Position.xy);
             
             // Cascade blending: cross-fade near cascade boundaries to eliminate seams
             // Outgoing blend: fade toward next cascade at far edge
             if (cascadeIndex < CascadeCount - 1)
             {
-                float cascadeRange = Cascades[cascadeIndex].y - Cascades[cascadeIndex].x;
+                float cascadeRange = getCascade(cascadeIndex).y - getCascade(cascadeIndex).x;
                 float blendZone = cascadeRange * 0.1f;
-                float distToEdge = Cascades[cascadeIndex].y - viewDepth;
+                float distToEdge = getCascade(cascadeIndex).y - viewDepth;
                 
                 if (distToEdge < blendZone)
                 {
                     float blendFactor = distToEdge / blendZone; // 1 at start of zone, 0 at boundary
                     
                     int nextCascade = cascadeIndex + 1;
-                    float4 nextLSP = mul(worldPos, LightSpaces[nextCascade]);
+                    float4 nextLSP = mul(worldPos, getLightSpace(nextCascade));
                     nextLSP /= nextLSP.w;
                     float2 nextUV = nextLSP.xy * 0.5f + 0.5f;
                     nextUV.y = 1.0f - nextUV.y;
                     
                     if (nextUV.x >= 0.0f && nextUV.x <= 1.0f && nextUV.y >= 0.0f && nextUV.y <= 1.0f)
                     {
-                        float nextZScale = abs(LightSpaces[nextCascade]._33);
+                        float nextZScale = abs(getLightSpace(nextCascade)._33);
                         float nextShadow = GetShadowFactor(ShadowMap, ShadowSampler, nextUV, nextLSP.z, nextCascade, normal, LightDirection, nextZScale, input.Position.xy);
                         shadowFactor = lerp(nextShadow, shadowFactor, blendFactor);
                     }

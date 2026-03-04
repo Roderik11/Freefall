@@ -169,12 +169,18 @@ void CSComputeSplits(uint3 id : SV_DispatchThreadID)
             }
         }
         
-        // Convert bin back to depth
-        float depth = minDepth + (float(bin) / float(HISTOGRAM_BINS - 1)) * range;
+        // Sub-bin interpolation: instead of snapping to bin boundary,
+        // interpolate within the bin based on how far through it the target falls.
+        // This eliminates the quantization snapping from 256-bin discretization.
+        uint prevSum = (bin > 0) ? gs_prefixSum[bin - 1] : 0;
+        uint binCount = histogram[bin];
+        float fraction = (binCount > 0) ? float(target - prevSum) / float(binCount) : 0.5;
+        
+        float binDepth = minDepth + ((float(bin) + fraction) / float(HISTOGRAM_BINS)) * range;
         
         // Clamp: ensure cascade far >= near plane, and monotonically increasing
-        depth = max(depth, NearPlane + 0.1f);
-        splits[c] = depth;
+        binDepth = max(binDepth, NearPlane + 0.1f);
+        splits[c] = binDepth;
     }
     
     // Ensure last cascade covers everything

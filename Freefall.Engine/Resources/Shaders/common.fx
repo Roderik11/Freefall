@@ -102,8 +102,10 @@ float GetShadowFactor(in Texture2DArray tex, in SamplerComparisonState cmpSample
     float slopeBias = 0.01f * sqrt(1.0f - cosTheta * cosTheta) / max(cosTheta, 0.05f);
 	
     // World-space bias scaled by zScale (projection._33) to get NDC bias
+    // Per-cascade minimum ensures larger cascades (lower zScale) still get adequate bias
     float bias = (0.005f + slopeBias) * zScale;
-    bias = min(bias, 0.002f);
+    float minBias = 0.0005f;  // floor: prevents self-shadowing on terrain in wider cascades
+    bias = clamp(bias, minBias, 0.01f);
     
     float biasedDepth = depth - bias;
     

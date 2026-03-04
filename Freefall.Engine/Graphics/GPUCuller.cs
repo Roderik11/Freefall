@@ -2,6 +2,7 @@ using System;
 using System.IO;
 using System.Numerics;
 using System.Runtime.InteropServices;
+using Freefall.Components;
 using Vortice.Direct3D12;
 using Vortice.DXGI;
 
@@ -43,6 +44,9 @@ namespace Freefall.Graphics
         private ID3D12PipelineState? _depthHistogramPSO; // CSDepthHistogram - depth histogram
         private ID3D12PipelineState? _computeSplitsPSO;  // CSComputeSplits - percentile split computation
         
+        // GPU-driven cascade computation PSO
+        private ID3D12PipelineState? _cascadeComputePSO; // CSComputeCascadeMatrices - GPU cascade matrix computation
+        
         // Frustum constants buffer per frame (just planes)
         private ID3D12Resource[] _frustumConstantsBuffers = new ID3D12Resource[FrameCount];
         
@@ -67,10 +71,24 @@ namespace Freefall.Graphics
         private uint _depthHistogramUAV;
         private ID3D12Resource? _depthSplitsBuffer;           // 4 floats, GPU default
         private uint _depthSplitsUAV;
+        private uint _depthSplitsSRV;                         // SRV for cascade compute to read splits
         private ID3D12Resource[]? _depthSplitsReadbackBuffers; // Per-frame readback (HeapType.Readback)
         private IntPtr[]? _depthSplitsReadbackPtrs;           // Persistently mapped pointers
         private bool _sdsmInitialized;
         private int _sdsmValidFrames;                         // Frames since SDSM started producing data
+        
+        // GPU-driven cascade computation buffers
+        private bool _cascadeComputeInitialized;
+        private ID3D12Resource? _lightingCascadeBuffer;       // GPU default: LightingCascadeData[MaxCascades]
+        private uint _lightingCascadeUAV;                     // UAV for compute write
+        private uint _lightingCascadeSRV;                     // SRV for lighting pass read
+        private ID3D12Resource? _prevVPBuffer;                // Upload: previous frame VP matrices [MaxCascades]
+        private IntPtr _prevVPBufferPtr;                      // Persistently mapped
+        private uint _prevVPBufferSRV;                        // SRV for cascade compute read
+        private ID3D12Resource[]? _cascadeParamsCBs;          // Per-frame cbuffer for cascade compute params
+        private IntPtr[]? _cascadeParamsCBPtrs;               // Persistently mapped
+        private ID3D12Resource? _smoothedSplitsBuffer;        // GPU default: 4 floats, persists between frames
+        private uint _smoothedSplitsUAV;                      // UAV for cascade compute read/write
         
         private GraphicsDevice _device;
         private bool _initialized;
@@ -111,6 +129,12 @@ namespace Freefall.Graphics
         
         /// <summary>True after SDSM buffers are created and ready for dispatch.</summary>
         public bool SdsmReady => _sdsmInitialized;
+        
+        /// <summary>True after cascade compute PSO and buffers are ready.</summary>
+        public bool CascadeComputeReady => _cascadeComputeInitialized;
+        
+        /// <summary>SRV index for the GPU-computed lighting cascade data (for light_directional.fx).</summary>
+        public uint LightingCascadeSRV => _lightingCascadeSRV;
 
         /// <summary>
         /// Frustum planes uploaded to the compute shader.
@@ -189,6 +213,37 @@ namespace Freefall.Graphics
             public Vector4 C1P0, C1P1, C1P2, C1P3, C1P4, C1P5;
             public Vector4 C2P0, C2P1, C2P2, C2P3, C2P4, C2P5;
             public Vector4 C3P0, C3P1, C3P2, C3P3, C3P4, C3P5;
+        }
+
+        /// <summary>
+        /// Per-cascade lighting data for the light_directional pixel shader.
+        /// Must match LightingCascadeData struct in cascade_compute.hlsl and light_directional.fx.
+        /// </summary>
+        [StructLayout(LayoutKind.Sequential)]
+        public struct LightingCascadeData
+        {
+            public Matrix4x4 VP;       // Camera-relative light VP (64 bytes)
+            public Vector4 Cascade;    // X=near, Y=far (16 bytes)
+        }
+
+        /// <summary>
+        /// Parameters cbuffer for cascade compute shader (register b1).
+        /// Must match CascadeParams cbuffer in cascade_compute.hlsl.
+        /// </summary>
+        [StructLayout(LayoutKind.Sequential)]
+        public struct CascadeComputeParams
+        {
+            public Matrix4x4 CameraView;         // 64 bytes
+            public Matrix4x4 CameraProjection;   // 64 bytes
+            public Vector3 CameraPosition;        // 12 bytes
+            public float _pad0;                   // 4 bytes
+            public Vector3 CameraForward;          // 12 bytes
+            public float _pad1;                   // 4 bytes
+            public Vector3 CameraUp;               // 12 bytes
+            public float _pad2;                   // 4 bytes
+            public Vector3 LightForward;           // 12 bytes
+            public float _pad3;                   // 4 bytes
+            public Vector4 CascadeSplits;          // 16 bytes (unused for GPU path, splits come from buffer)
         }
 
         public GPUCuller(GraphicsDevice device)
@@ -361,6 +416,8 @@ namespace Freefall.Graphics
                     _depthSplitsBuffer = _device.CreateDefaultBuffer(4 * sizeof(float));
                     _depthSplitsUAV = _device.AllocateBindlessIndex();
                     _device.CreateStructuredBufferUAV(_depthSplitsBuffer, 4, sizeof(float), _depthSplitsUAV);
+                    _depthSplitsSRV = _device.AllocateBindlessIndex();
+                    _device.CreateStructuredBufferSRV(_depthSplitsBuffer, 4, sizeof(float), _depthSplitsSRV);
                     
                     // Readback buffers: one per frame, persistently mapped
                     _depthSplitsReadbackBuffers = new ID3D12Resource[FrameCount];
@@ -387,6 +444,71 @@ namespace Freefall.Graphics
                 else
                 {
                     Debug.LogWarning("GPUCuller", $"depth_analysis.hlsl not found: {analysisPath} — SDSM disabled");
+                }
+                
+                // GPU-driven cascade matrix computation (depends on SDSM being initialized)
+                if (_sdsmInitialized)
+                {
+                    string cascadePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Resources", "Shaders", "cascade_compute.hlsl");
+                    if (File.Exists(cascadePath))
+                    {
+                        string cascadeSource = File.ReadAllText(cascadePath);
+                        var cascadeShader = new Shader(cascadeSource, "CSComputeCascadeMatrices", "cs_6_6");
+                        _cascadeComputePSO = _device.CreateComputePipelineState(cascadeShader.Bytecode);
+                        cascadeShader.Dispose();
+                        
+                        int maxCascades = 8;
+                        int lightingStride = Marshal.SizeOf<LightingCascadeData>();
+                        int vpStride = Marshal.SizeOf<Matrix4x4>();
+                        
+                        // Lighting cascade output buffer (GPU default, compute writes)
+                        _lightingCascadeBuffer = _device.CreateDefaultBuffer(lightingStride * maxCascades);
+                        _lightingCascadeUAV = _device.AllocateBindlessIndex();
+                        _device.CreateStructuredBufferUAV(_lightingCascadeBuffer, (uint)maxCascades, (uint)lightingStride, _lightingCascadeUAV);
+                        _lightingCascadeSRV = _device.AllocateBindlessIndex();
+                        _device.CreateStructuredBufferSRV(_lightingCascadeBuffer, (uint)maxCascades, (uint)lightingStride, _lightingCascadeSRV);
+                        
+                        // Previous VP buffer (upload, persistently mapped)
+                        _prevVPBuffer = _device.CreateUploadBuffer(vpStride * maxCascades);
+                        _prevVPBufferSRV = _device.AllocateBindlessIndex();
+                        _device.CreateStructuredBufferSRV(_prevVPBuffer, (uint)maxCascades, (uint)vpStride, _prevVPBufferSRV);
+                        unsafe
+                        {
+                            void* pData;
+                            _prevVPBuffer.Map(0, null, &pData);
+                            _prevVPBufferPtr = (IntPtr)pData;
+                            // Initialize to identity matrices
+                            for (int m = 0; m < maxCascades; m++)
+                                ((Matrix4x4*)pData)[m] = Matrix4x4.Identity;
+                        }
+                        
+                        // Cascade compute params cbuffer (per-frame, 256-byte aligned)
+                        int paramsSize = (Marshal.SizeOf<CascadeComputeParams>() + 255) & ~255;
+                        _cascadeParamsCBs = new ID3D12Resource[FrameCount];
+                        _cascadeParamsCBPtrs = new IntPtr[FrameCount];
+                        for (int f = 0; f < FrameCount; f++)
+                        {
+                            _cascadeParamsCBs[f] = _device.CreateUploadBuffer(paramsSize);
+                            unsafe
+                            {
+                                void* pData;
+                                _cascadeParamsCBs[f].Map(0, null, &pData);
+                                _cascadeParamsCBPtrs[f] = (IntPtr)pData;
+                            }
+                        }
+                        
+                        // Smoothed splits buffer (GPU default, persistent between frames)
+                        _smoothedSplitsBuffer = _device.CreateDefaultBuffer(4 * sizeof(float));
+                        _smoothedSplitsUAV = _device.AllocateBindlessIndex();
+                        _device.CreateStructuredBufferUAV(_smoothedSplitsBuffer, 4, sizeof(float), _smoothedSplitsUAV);
+                        
+                        _cascadeComputeInitialized = true;
+                        Debug.Log("GPUCuller", "CSComputeCascadeMatrices initialized: GPU-driven cascade computation ready");
+                    }
+                    else
+                    {
+                        Debug.LogWarning("GPUCuller", $"cascade_compute.hlsl not found: {cascadePath} — GPU cascade compute disabled");
+                    }
                 }
                 
                 Debug.Log("GPUCuller", "Compute shaders compiled: CSClear + CSVisibility + CSHistogram + CSLocalScan + CSBlockScan + CSGlobalScatter + CSBitonicSort + CSSortIndirection + CSHistogramPrefixSum + CSMain + CSVisibilityShadow");
@@ -1198,6 +1320,98 @@ namespace Freefall.Graphics
             return new float[] { pSplits[0], pSplits[1], pSplits[2], pSplits[3] };
         }
 
+        /// <summary>
+        /// Dispatch GPU cascade matrix computation.
+        /// Reads splits from the SDSM splits buffer (previous frame) and computes all cascade data.
+        /// </summary>
+        public unsafe void ComputeCascadeMatrices(
+            ID3D12GraphicsCommandList commandList,
+            Camera camera,
+            Vector3 cameraPosition,
+            Vector3 lightForward,
+            int shadowMapResolution,
+            uint cascadeOutUAV,          // UAV for CascadeData structured buffer
+            uint cascadeOutSRV)          // SRV for CascadeData (will be read by culler)
+        {
+            if (!_cascadeComputeInitialized || _cascadeComputePSO == null) return;
+            
+            int frameIndex = Engine.FrameIndex % FrameCount;
+            
+            // Upload cascade compute params
+            var cameraView = Matrix4x4.CreateLookAtLeftHanded(Vector3.Zero, camera.Forward, camera.Up);
+            
+            var cbParams = new CascadeComputeParams
+            {
+                CameraView = cameraView,
+                CameraProjection = camera.Projection,
+                CameraPosition = cameraPosition,
+                CameraForward = camera.Forward,
+                CameraUp = camera.Up,
+                LightForward = lightForward,
+                CascadeSplits = Vector4.Zero  // Unused — splits come from GPU buffer
+            };
+            *(CascadeComputeParams*)_cascadeParamsCBPtrs![frameIndex] = cbParams;
+            
+            // Transition lighting cascade buffer to UAV for compute write
+            // (On first use it's Common, subsequent uses it's NonPixelShaderResource)
+            var lightingFromState = _sdsmValidFrames > 1 ? ResourceStates.NonPixelShaderResource : ResourceStates.Common;
+            commandList.ResourceBarrierTransition(_lightingCascadeBuffer!,
+                lightingFromState, ResourceStates.UnorderedAccess);
+            
+            // Transition splits buffer from CopySource (left by AnalyzeDepth) to SRV for reading
+            if (_sdsmValidFrames > 0)
+            {
+                commandList.ResourceBarrierTransition(_depthSplitsBuffer!,
+                    ResourceStates.CopySource, ResourceStates.NonPixelShaderResource);
+            }
+            
+            // Set compute state
+            commandList.SetComputeRootSignature(_device.GlobalRootSignature);
+            _cachedSrvHeapArray ??= new[] { _device.SrvHeap };
+            commandList.SetDescriptorHeaps(1, _cachedSrvHeapArray);
+            commandList.SetPipelineState(_cascadeComputePSO);
+            
+            // Bind params cbuffer (slot 2 → register b1)
+            commandList.SetComputeRootConstantBufferView(2, _cascadeParamsCBs![frameIndex].GPUVirtualAddress);
+            
+            // Push constants
+            commandList.SetComputeRoot32BitConstant(0, _depthSplitsSRV, 0);          // SplitsBufferIdx
+            commandList.SetComputeRoot32BitConstant(0, cascadeOutUAV, 1);             // CascadeOutUAVIdx
+            commandList.SetComputeRoot32BitConstant(0, _lightingCascadeUAV, 2);       // LightingOutUAVIdx
+            commandList.SetComputeRoot32BitConstant(0, (uint)shadowMapResolution, 3); // ShadowMapRes
+            
+            // NearPlane as float bits
+            uint nearAsUint;
+            float nearPlane = camera.NearPlane;
+            nearAsUint = *(uint*)&nearPlane;
+            commandList.SetComputeRoot32BitConstant(0, nearAsUint, 4);               // NearPlane
+            commandList.SetComputeRoot32BitConstant(0, 4u, 5);                        // CascadeCount
+            commandList.SetComputeRoot32BitConstant(0, _prevVPBufferSRV, 6);          // PrevVPBufferIdx
+            commandList.SetComputeRoot32BitConstant(0, _smoothedSplitsUAV, 7);         // SmoothedSplitsIdx
+            
+            // Dispatch: 1 thread group, 4 threads (one per cascade)
+            commandList.Dispatch(1, 1, 1);
+            
+            // UAV barriers for cascade and lighting outputs
+            commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(null)));
+            
+            // Transition splits buffer back to CopySource (AnalyzeDepth expects this state)
+            if (_sdsmValidFrames > 0)
+            {
+                commandList.ResourceBarrierTransition(_depthSplitsBuffer!,
+                    ResourceStates.NonPixelShaderResource, ResourceStates.CopySource);
+            }
+            
+            // Transition lighting cascade buffer to SRV for lighting pass
+            commandList.ResourceBarrierTransition(_lightingCascadeBuffer!,
+                ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource);
+            
+            // Copy current frame's shadow VPs to prevVP buffer for next frame
+            // The cascade compute wrote shadow VPs to cascadeOutUAV — we need to
+            // read them back. Since cascadeOutUAV is an upload buffer (writable from CPU),
+            // this is handled by DirectionalLight after the compute runs.
+        }
+
         public void Dispose()
         {
             _clearPSO?.Dispose();
@@ -1215,11 +1429,18 @@ namespace Freefall.Graphics
             _depthReducePSO?.Dispose();
             _depthHistogramPSO?.Dispose();
             _computeSplitsPSO?.Dispose();
+            _cascadeComputePSO?.Dispose();
             _clearUAVHeap?.Dispose();
             _depthMinMaxBuffer?.Dispose();
             _depthHistogramBuffer?.Dispose();
             _depthSplitsBuffer?.Dispose();
             _sdsmClearBuffer?.Dispose();
+            _lightingCascadeBuffer?.Dispose();
+            _prevVPBuffer?.Dispose();
+            
+            if (_cascadeParamsCBs != null)
+                for (int i = 0; i < FrameCount; i++)
+                    _cascadeParamsCBs[i]?.Dispose();
             
             if (_depthSplitsReadbackBuffers != null)
                 for (int i = 0; i < FrameCount; i++)
