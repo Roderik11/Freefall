@@ -19,6 +19,14 @@ namespace Freefall.Graphics
         public int Width { get; private set; }
         public int Height { get; private set; }
         public int MipCount { get; private set; }
+        public int SourceWidth { get; private set; }   // Full-res depth buffer width
+        public int SourceHeight { get; private set; }  // Full-res depth buffer height
+
+        // SPD atomic counter for last-group-standing synchronization
+        public ID3D12Resource? CounterBuffer { get; private set; }
+        public uint CounterUAV { get; private set; }
+        public CpuDescriptorHandle CounterCPUHandle { get; private set; }
+        private ID3D12DescriptorHeap? _counterCpuHeap;
         
         /// <summary>True after the pyramid has been generated at least once (safe to use for occlusion).</summary>
         public bool Ready { get; set; }
@@ -32,6 +40,10 @@ namespace Freefall.Graphics
             // Dispose previous pyramid if resizing
             Texture?.Dispose();
             Ready = false;  // New pyramid needs to be generated before use
+
+            // Store exact source dimensions (before integer division truncation)
+            SourceWidth = depthWidth;
+            SourceHeight = depthHeight;
 
             // Hi-Z is half-res of depth buffer (minimum 1 to avoid 0-size texture)
             Width = Math.Max(1, depthWidth / 2);
@@ -96,6 +108,30 @@ namespace Freefall.Graphics
             };
             device.NativeDevice.CreateShaderResourceView(Texture, fullSrvDesc, device.GetCpuHandle(FullSRV));
 
+            // SPD atomic counter buffer (single uint, cleared to 0 before each dispatch)
+            CounterBuffer?.Dispose();
+            _counterCpuHeap?.Dispose();
+            CounterBuffer = device.CreateDefaultBuffer(4); // 1 × uint
+            CounterUAV = device.AllocateBindlessIndex();
+            var counterUavDesc = new UnorderedAccessViewDescription
+            {
+                Format = Format.R32_Typeless,
+                ViewDimension = UnorderedAccessViewDimension.Buffer,
+                Buffer = new BufferUnorderedAccessView { NumElements = 1, Flags = BufferUnorderedAccessViewFlags.Raw }
+            };
+            device.NativeDevice.CreateUnorderedAccessView(CounterBuffer, null, counterUavDesc, device.GetCpuHandle(CounterUAV));
+
+            // CPU-side descriptor for ClearUnorderedAccessViewUint
+            var cpuHeapDesc = new DescriptorHeapDescription
+            {
+                Type = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView,
+                DescriptorCount = 1,
+                Flags = DescriptorHeapFlags.None
+            };
+            _counterCpuHeap = device.NativeDevice.CreateDescriptorHeap(cpuHeapDesc);
+            CounterCPUHandle = _counterCpuHeap.GetCPUDescriptorHandleForHeapStart();
+            device.NativeDevice.CreateUnorderedAccessView(CounterBuffer, null, counterUavDesc, CounterCPUHandle);
+
             Debug.Log("HiZPyramid", $"Created: {Width}x{Height}, {MipCount} mips, SRV={FullSRV}");
         }
 
@@ -103,6 +139,10 @@ namespace Freefall.Graphics
         {
             Texture?.Dispose();
             Texture = null;
+            CounterBuffer?.Dispose();
+            CounterBuffer = null;
+            _counterCpuHeap?.Dispose();
+            _counterCpuHeap = null;
         }
     }
 }

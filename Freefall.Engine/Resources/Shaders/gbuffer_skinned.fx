@@ -1,4 +1,4 @@
-#include "common.fx"
+﻿#include "common.fx"
 // @RenderState(RenderTargets=4)
 
 // Unified Push Constant Layout (Slots 2-15)
@@ -83,7 +83,7 @@ VSOutput VS(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_InstanceI
     float2 uv = uvs[vertexID];
     BoneWeight bw = boneWeights[vertexID];
     
-    // Bone matrices for this instance — indexed by arrival-order instance index
+    // Bone matrices for this instance â€” indexed by arrival-order instance index
     // (bone data is uploaded densely per-instance, not by TransformSlot)
     uint boneOffset = idx * NumBones;
     
@@ -131,69 +131,74 @@ struct PSOutput
     float  Depth : SV_Target3;
 };
 
-// Shadow pass - minimal output structure
+// Shadow pass - push constants for single-pass multi-cascade rendering
+#define ExpansionBufferIdx   GET_INDEX(20) // SRV: expansion buffer (cascadeIdx<<30 | instanceIdx)
+#define CascadeBufferSRVIdx  GET_INDEX(21) // SRV: StructuredBuffer<CascadeData>
+
+
+// Shadow pass
 struct ShadowVSOutput
 {
     float4 Position : SV_POSITION;
     float2 TexCoord : TEXCOORD0;
     nointerpolation uint MaterialID : TEXCOORD1;
+    nointerpolation uint RTIndex : SV_RenderTargetArrayIndex;
 };
 
 SamplerState Sampler : register(s0);
 
-// Shadow vertex shader - skinned, minimal output for depth-only rendering
+// Shadow vertex shader - skinned, single-pass multi-cascade via expansion buffer
 ShadowVSOutput VS_Shadow(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_InstanceID)
 {
     ShadowVSOutput output;
+    output.Position = float4(0, 0, 0, 1);
+    output.TexCoord = float2(0, 0);
+    output.MaterialID = 0;
+    output.RTIndex = 0;
+
+    // Read expansion entry: bits 30-31 = cascadeIdx, bits 0-29 = instance index
+    StructuredBuffer<uint> expansion = ResourceDescriptorHeap[ExpansionBufferIdx];
+    uint entry = expansion[InstanceBaseOffset + instanceID];
+    uint cascadeIdx = entry >> 30;
+    uint idx = entry & 0x3FFFFFFFu;
+    output.RTIndex = cascadeIdx;
 
     StructuredBuffer<row_major matrix> globalTransforms = ResourceDescriptorHeap[GlobalTransformBufferIdx];
-    StructuredBuffer<uint> sortedIndices = ResourceDescriptorHeap[SortedIndicesIdx];
     StructuredBuffer<BoneWeight> boneWeights = ResourceDescriptorHeap[BoneWeightsIdx];
     StructuredBuffer<row_major matrix> bones = ResourceDescriptorHeap[BonesIdx];
-    
+
     StructuredBuffer<uint> indices = ResourceDescriptorHeap[IndexBufferIdx];
     uint vertexID = indices[primitiveVertexID + BaseIndex];
-    
+
     StructuredBuffer<float3> positions = ResourceDescriptorHeap[PosBufferIdx];
     StructuredBuffer<float2> uvs = ResourceDescriptorHeap[UVBufferIdx];
-    
-    uint dataPos = InstanceBaseOffset + instanceID;
-    uint packedIdx = sortedIndices[dataPos];
-    uint idx = packedIdx & 0x7FFFFFFFu;
-    
-    // Double-indirect: use original instance index to look up per-instance data
+
     StructuredBuffer<InstanceDescriptor> descriptors = ResourceDescriptorHeap[DescriptorBufIdx];
     InstanceDescriptor desc = descriptors[idx];
-    uint slot = desc.TransformSlot;
-    row_major matrix World = globalTransforms[slot];
-    uint materialID = desc.MaterialId;
-    
+    row_major matrix World = globalTransforms[desc.TransformSlot];
+
     float3 pos = positions[vertexID];
-    float2 uv = uvs[vertexID];
     BoneWeight bw = boneWeights[vertexID];
-    
-    // Bone matrices for this instance — indexed by arrival-order instance index
-    // (bone data is uploaded densely per-instance, not by TransformSlot)
+
     uint boneOffset = idx * NumBones;
-    
     matrix bone0 = bones[boneOffset + (uint)bw.BoneIDs.x];
     matrix bone1 = bones[boneOffset + (uint)bw.BoneIDs.y];
     matrix bone2 = bones[boneOffset + (uint)bw.BoneIDs.z];
     matrix bone3 = bones[boneOffset + (uint)bw.BoneIDs.w];
-    
-    // Skinning transformation
+
     float4 skinned = float4(0, 0, 0, 0);
     skinned += mul(float4(pos, 1), bone0) * bw.Weights.x;
     skinned += mul(float4(pos, 1), bone1) * bw.Weights.y;
     skinned += mul(float4(pos, 1), bone2) * bw.Weights.z;
     skinned += mul(float4(pos, 1), bone3) * bw.Weights.w;
     pos = skinned.xyz;
-    
+
     float4 worldPos = mul(float4(pos, 1.0f), World);
-    output.Position = mul(mul(worldPos, View), Projection);
-    output.TexCoord = uv;
+    StructuredBuffer<CascadeData> cascadeData = ResourceDescriptorHeap[CascadeBufferSRVIdx];
+    output.Position = mul(worldPos, cascadeData[cascadeIdx].VP);
+    output.TexCoord = uvs[vertexID];
     output.TexCoord.y = 1 - output.TexCoord.y;
-    output.MaterialID = materialID;
+    output.MaterialID = desc.MaterialId;
     return output;
 }
 
@@ -219,13 +224,13 @@ PSOutput PS(VSOutput input)
     float4 color = albedoTex.Sample(Sampler, input.TexCoord);
     //clip(color.a - 0.25f);
     
-    // PBR material properties — defaults for meshes without PBR textures
+    // PBR material properties â€” defaults for meshes without PBR textures
     float roughness = 0.65;
     float metal = 0.0;
     float ao = 1.0;
     
     // Sample PBR textures if bound (index 0 = not bound)
-    // RoughnessIdx holds a specular map — invert to get roughness
+    // RoughnessIdx holds a specular map â€” invert to get roughness
     if (mat.RoughnessIdx != 0) { Texture2D rTex = ResourceDescriptorHeap[mat.RoughnessIdx]; roughness = 1.0 - rTex.Sample(Sampler, input.TexCoord).r; }
     if (mat.MetallicIdx  != 0) { Texture2D mTex = ResourceDescriptorHeap[mat.MetallicIdx];  metal     = mTex.Sample(Sampler, input.TexCoord).r; }
     if (mat.AOIdx        != 0) { Texture2D aTex = ResourceDescriptorHeap[mat.AOIdx];        ao        = aTex.Sample(Sampler, input.TexCoord).r; }

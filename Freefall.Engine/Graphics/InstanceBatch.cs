@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Numerics;
 using System.Runtime.InteropServices;
@@ -10,13 +10,13 @@ namespace Freefall.Graphics
 {
     /// <summary>
     /// GPU-driven instance batch. All command generation happens on the GPU.
-    /// Flow: unsorted draws → GPU frustum culling → cache-friendly grouping → indirect commands
+    /// Flow: unsorted draws â†’ GPU frustum culling â†’ cache-friendly grouping â†’ indirect commands
     /// </summary>
     public sealed class InstanceBatch : IDisposable
     {
         public const int FrameCount = 3;
 
-        // Deferred disposal queue — old GPU buffers kept alive until GPU is done with them
+        // Deferred disposal queue â€” old GPU buffers kept alive until GPU is done with them
         private static readonly List<(ID3D12Resource Resource, uint BindlessIndex, int FrameToDispose)> _deferredDisposals = new();
 
         /// <summary>
@@ -81,7 +81,7 @@ namespace Freefall.Graphics
             public int ElementStride; // bytes per element
             public bool Dirty;
             
-            // CPU staging buffer — filled during MergeFromBucket, uploaded in one MemoryCopy
+            // CPU staging buffer â€” filled during MergeFromBucket, uploaded in one MemoryCopy
             public byte[] StagingData = Array.Empty<byte>();
             public int StagingCapacity; // in slots (matches Capacity growth)
         }
@@ -90,12 +90,12 @@ namespace Freefall.Graphics
         private Dictionary<int, PerInstanceBuffer> _perInstanceBuffers = new();
         
         // Hardcoded compute push constant slots for per-instance buffers.
-        // These are core pipeline constants — compute layout is fixed in cull_instances.hlsl.
+        // These are core pipeline constants â€” compute layout is fixed in cull_instances.hlsl.
         // Graphics slots (from shader resource bindings) are separate and used in Draw/DrawShadow.
         private static readonly Dictionary<int, int> ComputeSlots = new()
         {
             { "Bones".GetHashCode(), 30 },              // Indices[7].z = BoneBufferIdx
-            // BoundingSpheres removed — culler reads bounds from MeshRegistry
+            // BoundingSpheres removed â€” culler reads bounds from MeshRegistry
             { DrawBucket.DescriptorsHash, 4 },            // Indices[1].x = DescriptorBufferIdx
             { DrawBucket.SubbatchIdsHash, 23 },           // Indices[5].w = SubbatchIdsIdx
         };
@@ -134,25 +134,34 @@ namespace Freefall.Graphics
         private uint[] histogramUAVIndices = new uint[FrameCount];
         private CpuDescriptorHandle[] histogramCPUHandles = new CpuDescriptorHandle[FrameCount];
         
-        // Shadow cascade buffers - separate culling pipeline per cascade (4 cascades)
-        private const int ShadowCascadeCount = 4;
-        private ID3D12Resource[,] shadowVisibilityBuffers = new ID3D12Resource[FrameCount, ShadowCascadeCount];
-        private uint[,] shadowVisibilityUAVIndices = new uint[FrameCount, ShadowCascadeCount];
-        private ID3D12Resource[,] shadowVisibleIndicesBuffers = new ID3D12Resource[FrameCount, ShadowCascadeCount];
-        private uint[,] shadowVisibleIndicesUAVIndices = new uint[FrameCount, ShadowCascadeCount];
-        private uint[,] shadowVisibleIndicesSRVIndices = new uint[FrameCount, ShadowCascadeCount];
+        // Shadow culling â€” union visibility + cascade mask (single-pass rendering)
 
-        private ID3D12Resource[,] shadowCommandBuffers = new ID3D12Resource[FrameCount, ShadowCascadeCount];
-        private uint[,] shadowCommandUAVIndices = new uint[FrameCount, ShadowCascadeCount];
-        private ID3D12Resource[,] shadowCounterBuffers = new ID3D12Resource[FrameCount, ShadowCascadeCount];
-        private uint[,] shadowCounterUAVIndices = new uint[FrameCount, ShadowCascadeCount];
-        private ID3D12Resource[,] shadowHistogramBuffers = new ID3D12Resource[FrameCount, ShadowCascadeCount];
-        private uint[,] shadowHistogramUAVIndices = new uint[FrameCount, ShadowCascadeCount];
+
+        private ID3D12Resource[] shadowCombinedVisBuffers = new ID3D12Resource[FrameCount];
+        private uint[] shadowCombinedVisUAVIndices = new uint[FrameCount];
+        private ID3D12Resource[] shadowCascadeMaskBuffers = new ID3D12Resource[FrameCount];
+        private uint[] shadowCascadeMaskUAVIndices = new uint[FrameCount];
+        private uint[] shadowCascadeMaskSRVIndices = new uint[FrameCount]; // For VS cascade early-out
+        private ID3D12Resource[] shadowVisibleIndicesBuffers = new ID3D12Resource[FrameCount];
+        private uint[] shadowVisibleIndicesUAVIndices = new uint[FrameCount];
+        private uint[] shadowVisibleIndicesSRVIndices = new uint[FrameCount];
+        private ID3D12Resource[] shadowCommandBuffers = new ID3D12Resource[FrameCount];
+        private uint[] shadowCommandUAVIndices = new uint[FrameCount];
+        private ID3D12Resource[] shadowCounterBuffers = new ID3D12Resource[FrameCount];
+        private uint[] shadowCounterUAVIndices = new uint[FrameCount];
+        private ID3D12Resource[] shadowHistogramBuffers = new ID3D12Resource[FrameCount];
+        private uint[] shadowHistogramUAVIndices = new uint[FrameCount];
         private bool _shadowCullerInitialized = false;
         private ID3D12DescriptorHeap? _shadowCpuHeap;
-        private CpuDescriptorHandle[,] shadowCounterCPUHandles = new CpuDescriptorHandle[FrameCount, ShadowCascadeCount];
-        private CpuDescriptorHandle[,] shadowVisibleIndicesCPUHandles = new CpuDescriptorHandle[FrameCount, ShadowCascadeCount];
-        private CpuDescriptorHandle[,] shadowHistogramCPUHandles = new CpuDescriptorHandle[FrameCount, ShadowCascadeCount];
+        private CpuDescriptorHandle[] shadowCounterCPUHandles = new CpuDescriptorHandle[FrameCount];
+        private CpuDescriptorHandle[] shadowVisibleIndicesCPUHandles = new CpuDescriptorHandle[FrameCount];
+        private CpuDescriptorHandle[] shadowHistogramCPUHandles = new CpuDescriptorHandle[FrameCount];
+
+        // Shadow cascade expansion buffer — stores (cascadeIdx<<30 | instanceIdx) per visible cascade
+        private ID3D12Resource[] shadowExpansionBuffers = new ID3D12Resource[FrameCount];
+        private uint[] shadowExpansionUAVIndices = new uint[FrameCount];
+        private uint[] shadowExpansionSRVIndices = new uint[FrameCount];
+        private CpuDescriptorHandle[] shadowExpansionCPUHandles = new CpuDescriptorHandle[FrameCount];
 
 
 
@@ -367,7 +376,7 @@ namespace Freefall.Graphics
                 // Ensure GPU buffer capacity
                 EnsurePerInstanceBuffer(pib, requiredSlots);
 
-                // Single MemoryCopy from pre-staged byte array — no iteration, no reflection
+                // Single MemoryCopy from pre-staged byte array â€” no iteration, no reflection
                 int bytesPerSlot = pib.ElementsPerInstance * pib.ElementStride;
                 int uploadBytes = requiredSlots * bytesPerSlot;
                 if (uploadBytes > pib.StagingData.Length)
@@ -389,7 +398,7 @@ namespace Freefall.Graphics
         {
             if (pib.Capacity >= requiredSlots) return;
 
-            // Defer disposal of old buffers — GPU may still be reading them from in-flight frames
+            // Defer disposal of old buffers â€” GPU may still be reading them from in-flight frames
             for (int i = 0; i < FrameCount; ++i)
             {
                 DeferDispose(pib.Buffers[i], pib.SRVIndices[i]);
@@ -538,6 +547,7 @@ namespace Freefall.Graphics
             // Slot 2: previous frame's visibility flags SRV (feedback loop breaker)
             int prevFrameIndex = (frameIndex + FrameCount - 1) % FrameCount;
             commandList.SetComputeRoot32BitConstant(0, visibilityFlagsSRVIndices[prevFrameIndex], 2);
+            commandList.SetComputeRoot32BitConstant(0, 1u, 3);  // InstanceMultiplier = 1 (shadow sets 4; must reset)
             
             commandList.SetComputeRoot32BitConstant(0, visibleIndicesUAVIndices[frameIndex], 5);
             commandList.SetComputeRoot32BitConstant(0, counterBufferUAVIndices[frameIndex], 6);
@@ -553,7 +563,7 @@ namespace Freefall.Graphics
 
 
             // Bind per-instance buffer SRV indices to COMPUTE push constants (hardcoded slots).
-            // Compute and graphics slot namespaces differ — can't reuse PushConstantSlot here.
+            // Compute and graphics slot namespaces differ â€” can't reuse PushConstantSlot here.
             foreach (var (hash, pib) in _perInstanceBuffers)
             {
                 if (!ComputeSlots.TryGetValue(hash, out int computeSlot)) continue;
@@ -586,25 +596,25 @@ namespace Freefall.Graphics
                 new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(histogramBuffers[frameIndex]))
             });
 
-            // Pass 1: CSVisibility — writes visibilityFlags
+            // Pass 1: CSVisibility â€” writes visibilityFlags
             commandList.SetPipelineState(culler.VisibilityPSO);
             commandList.Dispatch((uint)((totalInstances + 255) / 256), 1, 1);
             // Only visibilityFlags was written; next pass (Histogram) reads it
             commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(visibilityFlagsBuffers[frameIndex])));
 
-            // Pass 2: CSHistogram — reads visibilityFlags, writes histogram
+            // Pass 2: CSHistogram â€” reads visibilityFlags, writes histogram
             commandList.SetPipelineState(culler.HistogramPSO);
             commandList.Dispatch((uint)((totalInstances + 63) / 64), 1, 1);
             // Only histogram was written; next pass (PrefixSum) reads it
             commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(histogramBuffers[frameIndex])));
 
-            // Pass 3: CSHistogramPrefixSum — reads histogram, writes counters
+            // Pass 3: CSHistogramPrefixSum â€” reads histogram, writes counters
             commandList.SetPipelineState(culler.HistogramPrefixSumPSO);
             commandList.Dispatch(1, 1, 1);
             // Only counters was written; next pass (Scatter) reads it
             commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(counterBuffers[frameIndex])));
 
-            // Pass 4: CSGlobalScatter — reads visibilityFlags+counters, writes visibleIndices+counters
+            // Pass 4: CSGlobalScatter â€” reads visibilityFlags+counters, writes visibleIndices+counters
             commandList.SetPipelineState(culler.GlobalScatterPSO);
             commandList.Dispatch((uint)((totalInstances + 255) / 256), 1, 1);
             // visibleIndices and counters were written; next pass (CSMain) reads both
@@ -613,7 +623,7 @@ namespace Freefall.Graphics
                 new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(counterBuffers[frameIndex]))
             });
 
-            // Pass 5: CSMain — reads histogram+counters, writes commands
+            // Pass 5: CSMain â€” reads histogram+counters, writes commands
             commandList.SetPipelineState(culler.MainPSO);
             commandList.Dispatch((uint)((MeshRegistry.Count + 63) / 64), 1, 1);
             // Commands buffer transitions to IndirectArgument in Draw(), no UAV barrier needed here
@@ -630,8 +640,8 @@ namespace Freefall.Graphics
             int commandSize = MaxSubBatches * IndirectDrawSizes.IndirectCommandSize;
             int histogramSize = MeshRegistry.MaxMeshParts * sizeof(uint);
 
-            // CPU descriptor heap for ClearUnorderedAccessViewUint (4 buffers per frame per cascade)
-            int totalShadowDescriptors = FrameCount * ShadowCascadeCount * 3;
+            // CPU descriptor heap for ClearUnorderedAccessViewUint (4 buffers per frame: counter, visible indices, histogram, expansion)
+            int totalShadowDescriptors = FrameCount * 4;
             var cpuHeapDesc = new DescriptorHeapDescription
             {
                 Type = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView,
@@ -645,186 +655,104 @@ namespace Freefall.Graphics
 
             for (int f = 0; f < FrameCount; f++)
             {
-                for (int c = 0; c < ShadowCascadeCount; c++)
+                // Combined visibility flags (union of all cascades)
+                shadowCombinedVisBuffers[f] = device.CreateDefaultBuffer(instanceBufferSize);
+                shadowCombinedVisUAVIndices[f] = device.AllocateBindlessIndex();
+                device.CreateStructuredBufferUAV(shadowCombinedVisBuffers[f], (uint)capacity, sizeof(uint), shadowCombinedVisUAVIndices[f]);
+
+                // Cascade mask (4-bit per instance, for VS early-out)
+                shadowCascadeMaskBuffers[f] = device.CreateDefaultBuffer(instanceBufferSize);
+                shadowCascadeMaskUAVIndices[f] = device.AllocateBindlessIndex();
+                device.CreateStructuredBufferUAV(shadowCascadeMaskBuffers[f], (uint)capacity, sizeof(uint), shadowCascadeMaskUAVIndices[f]);
+                shadowCascadeMaskSRVIndices[f] = device.AllocateBindlessIndex();
+                device.CreateStructuredBufferSRV(shadowCascadeMaskBuffers[f], (uint)capacity, sizeof(uint), shadowCascadeMaskSRVIndices[f]);
+
+                // Visible indices output (ONE buffer, union-compacted)
+                shadowVisibleIndicesBuffers[f] = device.CreateDefaultBuffer(instanceBufferSize);
+                shadowVisibleIndicesUAVIndices[f] = device.AllocateBindlessIndex();
+                device.CreateStructuredBufferUAV(shadowVisibleIndicesBuffers[f], (uint)capacity, sizeof(uint), shadowVisibleIndicesUAVIndices[f]);
+                shadowVisibleIndicesSRVIndices[f] = device.AllocateBindlessIndex();
+                device.CreateStructuredBufferSRV(shadowVisibleIndicesBuffers[f], (uint)capacity, sizeof(uint), shadowVisibleIndicesSRVIndices[f]);
+
+                // CPU handle for visible indices clear
+                var visibleCpuHandle = _shadowCpuHeap.GetCPUDescriptorHandleForHeapStart() + (int)(descriptorIdx * handleIncrement);
+                var visibleUavDesc = new UnorderedAccessViewDescription
                 {
-                    // Visibility flags
-                    shadowVisibilityBuffers[f, c] = device.CreateDefaultBuffer(instanceBufferSize);
-                    shadowVisibilityUAVIndices[f, c] = device.AllocateBindlessIndex();
-                    device.CreateStructuredBufferUAV(shadowVisibilityBuffers[f, c], (uint)capacity, sizeof(uint), shadowVisibilityUAVIndices[f, c]);
+                    Format = Vortice.DXGI.Format.Unknown,
+                    ViewDimension = UnorderedAccessViewDimension.Buffer,
+                    Buffer = new BufferUnorderedAccessView { FirstElement = 0, NumElements = (uint)capacity, StructureByteStride = sizeof(uint) }
+                };
+                device.NativeDevice.CreateUnorderedAccessView(shadowVisibleIndicesBuffers[f], null, visibleUavDesc, visibleCpuHandle);
+                shadowVisibleIndicesCPUHandles[f] = visibleCpuHandle;
+                descriptorIdx++;
 
-                    // Visible indices output
-                    shadowVisibleIndicesBuffers[f, c] = device.CreateDefaultBuffer(instanceBufferSize);
-                    shadowVisibleIndicesUAVIndices[f, c] = device.AllocateBindlessIndex();
-                    device.CreateStructuredBufferUAV(shadowVisibleIndicesBuffers[f, c], (uint)capacity, sizeof(uint), shadowVisibleIndicesUAVIndices[f, c]);
-                    shadowVisibleIndicesSRVIndices[f, c] = device.AllocateBindlessIndex();
-                    device.CreateStructuredBufferSRV(shadowVisibleIndicesBuffers[f, c], (uint)capacity, sizeof(uint), shadowVisibleIndicesSRVIndices[f, c]);
+                // Indirect commands (ONE buffer)
+                shadowCommandBuffers[f] = device.CreateDefaultBuffer(commandSize);
+                shadowCommandUAVIndices[f] = device.AllocateBindlessIndex();
+                device.CreateStructuredBufferUAV(shadowCommandBuffers[f], MaxSubBatches, (uint)IndirectDrawSizes.IndirectCommandSize, shadowCommandUAVIndices[f]);
 
-                    // CPU handle for visible indices clear
-                    var visibleCpuHandle = _shadowCpuHeap.GetCPUDescriptorHandleForHeapStart() + (int)(descriptorIdx * handleIncrement);
-                    var visibleUavDesc = new UnorderedAccessViewDescription
-                    {
-                        Format = Vortice.DXGI.Format.Unknown,
-                        ViewDimension = UnorderedAccessViewDimension.Buffer,
-                        Buffer = new BufferUnorderedAccessView { FirstElement = 0, NumElements = (uint)capacity, StructureByteStride = sizeof(uint) }
-                    };
-                    device.NativeDevice.CreateUnorderedAccessView(shadowVisibleIndicesBuffers[f, c], null, visibleUavDesc, visibleCpuHandle);
-                    shadowVisibleIndicesCPUHandles[f, c] = visibleCpuHandle;
-                    descriptorIdx++;
+                // Counters (ONE buffer)
+                shadowCounterBuffers[f] = device.CreateDefaultBuffer(counterBufferSize);
+                shadowCounterUAVIndices[f] = device.AllocateBindlessIndex();
+                device.CreateStructuredBufferUAV(shadowCounterBuffers[f], MaxSubBatches, sizeof(uint), shadowCounterUAVIndices[f]);
 
+                // CPU handle for counter clear
+                var counterCpuHandle = _shadowCpuHeap.GetCPUDescriptorHandleForHeapStart() + (int)(descriptorIdx * handleIncrement);
+                var counterUavDesc = new UnorderedAccessViewDescription
+                {
+                    Format = Vortice.DXGI.Format.Unknown,
+                    ViewDimension = UnorderedAccessViewDimension.Buffer,
+                    Buffer = new BufferUnorderedAccessView { FirstElement = 0, NumElements = MaxSubBatches, StructureByteStride = sizeof(uint) }
+                };
+                device.NativeDevice.CreateUnorderedAccessView(shadowCounterBuffers[f], null, counterUavDesc, counterCpuHandle);
+                shadowCounterCPUHandles[f] = counterCpuHandle;
+                descriptorIdx++;
 
+                // Histogram (ONE buffer)
+                shadowHistogramBuffers[f] = device.CreateDefaultBuffer(histogramSize);
+                shadowHistogramUAVIndices[f] = device.AllocateBindlessIndex();
+                device.CreateStructuredBufferUAV(shadowHistogramBuffers[f], (uint)MeshRegistry.MaxMeshParts, sizeof(uint), shadowHistogramUAVIndices[f]);
 
-                    // Indirect commands
-                    shadowCommandBuffers[f, c] = device.CreateDefaultBuffer(commandSize);
-                    shadowCommandUAVIndices[f, c] = device.AllocateBindlessIndex();
-                    device.CreateStructuredBufferUAV(shadowCommandBuffers[f, c], MaxSubBatches, (uint)IndirectDrawSizes.IndirectCommandSize, shadowCommandUAVIndices[f, c]);
+                // CPU handle for histogram clear
+                var histogramCpuHandle = _shadowCpuHeap.GetCPUDescriptorHandleForHeapStart() + (int)(descriptorIdx * handleIncrement);
+                var histogramUavDesc = new UnorderedAccessViewDescription
+                {
+                    Format = Vortice.DXGI.Format.Unknown,
+                    ViewDimension = UnorderedAccessViewDimension.Buffer,
+                    Buffer = new BufferUnorderedAccessView { FirstElement = 0, NumElements = (uint)MeshRegistry.MaxMeshParts, StructureByteStride = sizeof(uint) }
+                };
+                device.NativeDevice.CreateUnorderedAccessView(shadowHistogramBuffers[f], null, histogramUavDesc, histogramCpuHandle);
+                shadowHistogramCPUHandles[f] = histogramCpuHandle;
+                descriptorIdx++;
 
-                    // Counters
-                    shadowCounterBuffers[f, c] = device.CreateDefaultBuffer(counterBufferSize);
-                    shadowCounterUAVIndices[f, c] = device.AllocateBindlessIndex();
-                    device.CreateStructuredBufferUAV(shadowCounterBuffers[f, c], MaxSubBatches, sizeof(uint), shadowCounterUAVIndices[f, c]);
+                // Expansion buffer (capacity × 4 = worst case when every instance is in all 4 cascades)
+                int expansionBufferSize = capacity * 4 * sizeof(uint);
+                shadowExpansionBuffers[f] = device.CreateDefaultBuffer(expansionBufferSize);
+                shadowExpansionUAVIndices[f] = device.AllocateBindlessIndex();
+                device.CreateStructuredBufferUAV(shadowExpansionBuffers[f], (uint)(capacity * 4), sizeof(uint), shadowExpansionUAVIndices[f]);
+                shadowExpansionSRVIndices[f] = device.AllocateBindlessIndex();
+                device.CreateStructuredBufferSRV(shadowExpansionBuffers[f], (uint)(capacity * 4), sizeof(uint), shadowExpansionSRVIndices[f]);
 
-                    // CPU handle for counter clear
-                    var counterCpuHandle = _shadowCpuHeap.GetCPUDescriptorHandleForHeapStart() + (int)(descriptorIdx * handleIncrement);
-                    var counterUavDesc = new UnorderedAccessViewDescription
-                    {
-                        Format = Vortice.DXGI.Format.Unknown,
-                        ViewDimension = UnorderedAccessViewDimension.Buffer,
-                        Buffer = new BufferUnorderedAccessView { FirstElement = 0, NumElements = MaxSubBatches, StructureByteStride = sizeof(uint) }
-                    };
-                    device.NativeDevice.CreateUnorderedAccessView(shadowCounterBuffers[f, c], null, counterUavDesc, counterCpuHandle);
-                    shadowCounterCPUHandles[f, c] = counterCpuHandle;
-                    descriptorIdx++;
-
-                    // Histogram
-                    shadowHistogramBuffers[f, c] = device.CreateDefaultBuffer(histogramSize);
-                    shadowHistogramUAVIndices[f, c] = device.AllocateBindlessIndex();
-                    device.CreateStructuredBufferUAV(shadowHistogramBuffers[f, c], (uint)MeshRegistry.MaxMeshParts, sizeof(uint), shadowHistogramUAVIndices[f, c]);
-
-                    // CPU handle for histogram clear
-                    var histogramCpuHandle = _shadowCpuHeap.GetCPUDescriptorHandleForHeapStart() + (int)(descriptorIdx * handleIncrement);
-                    var histogramUavDesc = new UnorderedAccessViewDescription
-                    {
-                        Format = Vortice.DXGI.Format.Unknown,
-                        ViewDimension = UnorderedAccessViewDimension.Buffer,
-                        Buffer = new BufferUnorderedAccessView { FirstElement = 0, NumElements = (uint)MeshRegistry.MaxMeshParts, StructureByteStride = sizeof(uint) }
-                    };
-                    device.NativeDevice.CreateUnorderedAccessView(shadowHistogramBuffers[f, c], null, histogramUavDesc, histogramCpuHandle);
-                    shadowHistogramCPUHandles[f, c] = histogramCpuHandle;
-                    descriptorIdx++;
-                }
+                // CPU handle for expansion clear
+                var expansionCpuHandle = _shadowCpuHeap.GetCPUDescriptorHandleForHeapStart() + (int)(descriptorIdx * handleIncrement);
+                var expansionUavDesc = new UnorderedAccessViewDescription
+                {
+                    Format = Vortice.DXGI.Format.Unknown,
+                    ViewDimension = UnorderedAccessViewDimension.Buffer,
+                    Buffer = new BufferUnorderedAccessView { FirstElement = 0, NumElements = (uint)(capacity * 4), StructureByteStride = sizeof(uint) }
+                };
+                device.NativeDevice.CreateUnorderedAccessView(shadowExpansionBuffers[f], null, expansionUavDesc, expansionCpuHandle);
+                shadowExpansionCPUHandles[f] = expansionCpuHandle;
+                descriptorIdx++;
             }
         }
 
         /// <summary>
-        /// Cull instances for a shadow cascade using GPU-driven pipeline.
+        /// Cull all shadow cascades in a single pass using union visibility.
+        /// CSVisibilityShadow4 writes combined visibility (union) + cascade mask.
+        /// Compaction pipeline runs ONCE on the union set. CSMain sets DrawInstanceCount × 4.
         /// </summary>
-        public void CullShadow(ID3D12GraphicsCommandList commandList, int cascadeIndex, ulong shadowCascadeBufferAddress, GPUCuller? culler)
-        {
-            if (SubBatchCount == 0 || cascadeIndex < 0 || cascadeIndex >= ShadowCascadeCount) return;
-            if (culler?.VisibilityShadowPSO == null || culler?.MainPSO == null || culler?.HistogramPSO == null) return;
-
-            InitializeShadowCullerResources();
-
-            int frameIndex = Engine.FrameIndex % FrameCount;
-            var device = Engine.Device;
-            int totalInstances = _drawCount;
-
-            commandList.SetComputeRootSignature(device.GlobalRootSignature);
-            _cachedSrvHeapArray ??= new[] { device.SrvHeap };
-            commandList.SetDescriptorHeaps(1, _cachedSrvHeapArray);
-            
-            // Bind shadow cascade planes cbuffer (slot 2 -> register b1)
-            commandList.SetComputeRootConstantBufferView(2, shadowCascadeBufferAddress);
-
-            // Set push constants for shadow culling (using shadow-specific buffers)
-            commandList.SetComputeRoot32BitConstant(0, MeshRegistry.SrvIndex, 0);
-            commandList.SetComputeRoot32BitConstant(0, shadowCommandUAVIndices[frameIndex, cascadeIndex], 1);
-            commandList.SetComputeRoot32BitConstant(0, shadowVisibleIndicesUAVIndices[frameIndex, cascadeIndex], 5);
-            commandList.SetComputeRoot32BitConstant(0, shadowCounterUAVIndices[frameIndex, cascadeIndex], 6);
-            commandList.SetComputeRoot32BitConstant(0, (uint)SubBatchCount, 7);
-            commandList.SetComputeRoot32BitConstant(0, shadowVisibleIndicesSRVIndices[frameIndex, cascadeIndex], 9);
-            commandList.SetComputeRoot32BitConstant(0, TransformBuffer.Instance?.SrvIndex ?? 0, 10);
-            commandList.SetComputeRoot32BitConstant(0, shadowVisibilityUAVIndices[frameIndex, cascadeIndex], 11);
-            commandList.SetComputeRoot32BitConstant(0, (uint)totalInstances, 13);
-            commandList.SetComputeRoot32BitConstant(0, Material.MaterialsBufferIndex, 25);
-            commandList.SetComputeRoot32BitConstant(0, shadowHistogramUAVIndices[frameIndex, cascadeIndex], 26);
-            commandList.SetComputeRoot32BitConstant(0, (uint)MeshRegistry.Count, 27);
-
-            // Bind per-instance buffer SRV indices to COMPUTE push constants (hardcoded slots).
-            foreach (var (hash, pib) in _perInstanceBuffers)
-            {
-                if (!ComputeSlots.TryGetValue(hash, out int computeSlot)) continue;
-                uint srvIdx = pib.SRVIndices[frameIndex];
-                commandList.SetComputeRoot32BitConstant(0, srvIdx, (uint)computeSlot);
-            }
-            commandList.SetComputeRoot32BitConstant(0, (uint)cascadeIndex, 31); // ShadowCascadeIdx
-
-            // Clear UAV buffers before dispatching (matching regular Cull pattern)
-            commandList.ClearUnorderedAccessViewUint(
-                device.GetGpuHandle(shadowCounterUAVIndices[frameIndex, cascadeIndex]),
-                shadowCounterCPUHandles[frameIndex, cascadeIndex],
-                shadowCounterBuffers[frameIndex, cascadeIndex],
-                new Vortice.Mathematics.Int4(0, 0, 0, 0));
-            
-            commandList.ClearUnorderedAccessViewUint(
-                device.GetGpuHandle(shadowVisibleIndicesUAVIndices[frameIndex, cascadeIndex]),
-                shadowVisibleIndicesCPUHandles[frameIndex, cascadeIndex],
-                shadowVisibleIndicesBuffers[frameIndex, cascadeIndex],
-                new Vortice.Mathematics.Int4(unchecked((int)0xFFFFFFFF), unchecked((int)0xFFFFFFFF), unchecked((int)0xFFFFFFFF), unchecked((int)0xFFFFFFFF)));
-            
-            commandList.ClearUnorderedAccessViewUint(
-                device.GetGpuHandle(shadowHistogramUAVIndices[frameIndex, cascadeIndex]),
-                shadowHistogramCPUHandles[frameIndex, cascadeIndex],
-                shadowHistogramBuffers[frameIndex, cascadeIndex],
-                new Vortice.Mathematics.Int4(0, 0, 0, 0));
-
-            // Barrier after clears: only the 3 cleared buffers need sync
-            commandList.ResourceBarrier(new[] {
-                new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(shadowCounterBuffers[frameIndex, cascadeIndex])),
-                new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(shadowVisibleIndicesBuffers[frameIndex, cascadeIndex])),
-                new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(shadowHistogramBuffers[frameIndex, cascadeIndex]))
-            });
-
-            // Pass 1: CSVisibilityShadow — writes visibilityFlags
-            commandList.SetPipelineState(culler.VisibilityShadowPSO);
-            commandList.Dispatch((uint)((totalInstances + 255) / 256), 1, 1);
-            // Only visibilityFlags was written; next pass (Histogram) reads it
-            commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(shadowVisibilityBuffers[frameIndex, cascadeIndex])));
-
-            // Pass 2: CSHistogram — reads visibilityFlags, writes histogram
-            commandList.SetPipelineState(culler.HistogramPSO);
-            commandList.Dispatch((uint)((totalInstances + 63) / 64), 1, 1);
-            // Only histogram was written; next pass (PrefixSum) reads it
-            commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(shadowHistogramBuffers[frameIndex, cascadeIndex])));
-
-            // Pass 3: CSHistogramPrefixSum — reads histogram, writes counters
-            commandList.SetPipelineState(culler.HistogramPrefixSumPSO);
-            commandList.Dispatch(1, 1, 1);
-            // Only counters was written; next pass (Scatter) reads it
-            commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(shadowCounterBuffers[frameIndex, cascadeIndex])));
-
-            // Pass 4: CSGlobalScatter — reads visibilityFlags+counters, writes visibleIndices+counters
-            commandList.SetPipelineState(culler.GlobalScatterPSO);
-            commandList.Dispatch((uint)((totalInstances + 255) / 256), 1, 1);
-            // visibleIndices and counters were written; next pass (CSMain) reads both
-            commandList.ResourceBarrier(new[] {
-                new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(shadowVisibleIndicesBuffers[frameIndex, cascadeIndex])),
-                new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(shadowCounterBuffers[frameIndex, cascadeIndex]))
-            });
-
-            // Pass 5: CSMain — reads histogram+counters, writes commands
-            commandList.SetPipelineState(culler.MainPSO);
-            commandList.Dispatch((uint)((MeshRegistry.Count + 63) / 64), 1, 1);
-            // Commands buffer transitions to IndirectArgument in DrawShadow(), no UAV barrier needed here
-        }
-
-        /// <summary>
-        /// Cull all 4 shadow cascades using a unified visibility pass.
-        /// CSVisibilityShadow4 tests all 4 cascade frustums per instance in one dispatch,
-        /// then runs Histogram→PrefixSum→Scatter→Main per cascade.
-        /// Saves 3 visibility dispatches + 3 barriers vs calling CullShadow() 4 times.
-        /// </summary>
-        public void CullShadowAll(ID3D12GraphicsCommandList commandList, ulong shadowCascadeBufferAddress, GPUCuller? culler)
+        public void CullShadowAll(ID3D12GraphicsCommandList commandList, uint cascadeBufferSrv, ulong cascadeBufferGpuAddress, uint shadowHiZSrv, GPUCuller? culler)
         {
             if (SubBatchCount == 0) return;
             if (culler?.VisibilityShadow4PSO == null || culler?.MainPSO == null || culler?.HistogramPSO == null) return;
@@ -834,171 +762,167 @@ namespace Freefall.Graphics
             int frameIndex = Engine.FrameIndex % FrameCount;
             var device = Engine.Device;
             int totalInstances = _drawCount;
+            
+            if (Engine.FrameIndex % 300 == 0)
+                Debug.Log("ShadowCull", $"batch={Material?.Name} drawCount={totalInstances} subBatches={SubBatchCount} perInstBufs={_perInstanceBuffers.Count}");
 
-            // Set shared compute state ONCE (not 4×)
             commandList.SetComputeRootSignature(device.GlobalRootSignature);
             _cachedSrvHeapArray ??= new[] { device.SrvHeap };
             commandList.SetDescriptorHeaps(1, _cachedSrvHeapArray);
             
-            // Bind shadow cascade planes cbuffer (slot 2 -> register b1)
-            commandList.SetComputeRootConstantBufferView(2, shadowCascadeBufferAddress);
+            // Root signature requires all CBV slots bound — bind cascade buffer at slot 2 (register b1)
+            // Shader reads cascade data via bindless SRV, but root signature still defines this CBV slot
+            commandList.SetComputeRootConstantBufferView(2, cascadeBufferGpuAddress);
 
-            // Set push constants shared across all passes
+            // Set push constants
             commandList.SetComputeRoot32BitConstant(0, MeshRegistry.SrvIndex, 0);
-            commandList.SetComputeRoot32BitConstant(0, TransformBuffer.Instance?.SrvIndex ?? 0, 10);
-            commandList.SetComputeRoot32BitConstant(0, (uint)totalInstances, 13);
-            commandList.SetComputeRoot32BitConstant(0, Material.MaterialsBufferIndex, 25);
-            commandList.SetComputeRoot32BitConstant(0, (uint)MeshRegistry.Count, 27);
+            commandList.SetComputeRoot32BitConstant(0, shadowCommandUAVIndices[frameIndex], 1);
+            commandList.SetComputeRoot32BitConstant(0, shadowHiZSrv, 2);                                 // ShadowHiZSrvIdx (Indices[0].z)
+            commandList.SetComputeRoot32BitConstant(0, 1u, 3);                                           // InstanceMultiplier = 1
+            commandList.SetComputeRoot32BitConstant(0, shadowVisibleIndicesUAVIndices[frameIndex], 5);
+            commandList.SetComputeRoot32BitConstant(0, shadowCounterUAVIndices[frameIndex], 6);
             commandList.SetComputeRoot32BitConstant(0, (uint)SubBatchCount, 7);
+            commandList.SetComputeRoot32BitConstant(0, shadowVisibleIndicesSRVIndices[frameIndex], 9);
+            commandList.SetComputeRoot32BitConstant(0, TransformBuffer.Instance?.SrvIndex ?? 0, 10);
+            commandList.SetComputeRoot32BitConstant(0, shadowCombinedVisUAVIndices[frameIndex], 11);  // VisibilityFlagsIdx = combined
+            commandList.SetComputeRoot32BitConstant(0, (uint)totalInstances, 13);
+            commandList.SetComputeRoot32BitConstant(0, shadowCombinedVisUAVIndices[frameIndex], 24);  // CombinedShadowVisIdx
+            commandList.SetComputeRoot32BitConstant(0, Material.MaterialsBufferIndex, 25);
+            commandList.SetComputeRoot32BitConstant(0, shadowHistogramUAVIndices[frameIndex], 26);
+            commandList.SetComputeRoot32BitConstant(0, (uint)MeshRegistry.Count, 27);
+            commandList.SetComputeRoot32BitConstant(0, shadowCascadeMaskUAVIndices[frameIndex], 28);  // CascadeMaskUAVIdx
+            commandList.SetComputeRoot32BitConstant(0, shadowExpansionUAVIndices[frameIndex], 29);    // ExpansionUAVIdx
+            commandList.SetComputeRoot32BitConstant(0, cascadeBufferSrv, 31);                         // CascadeBufferSRVIdx (Indices[7].w)
 
-            // Bind per-instance buffer SRV indices (shared across all cascades)
             foreach (var (hash, pib) in _perInstanceBuffers)
             {
                 if (!ComputeSlots.TryGetValue(hash, out int computeSlot)) continue;
-                uint srvIdx = pib.SRVIndices[frameIndex];
-                commandList.SetComputeRoot32BitConstant(0, srvIdx, (uint)computeSlot);
+                commandList.SetComputeRoot32BitConstant(0, pib.SRVIndices[frameIndex], (uint)computeSlot);
             }
 
-            // === PHASE 1: Unified visibility pass (all 4 cascades in one dispatch) ===
+            // Clear union buffers
+            commandList.ClearUnorderedAccessViewUint(
+                device.GetGpuHandle(shadowCounterUAVIndices[frameIndex]),
+                shadowCounterCPUHandles[frameIndex],
+                shadowCounterBuffers[frameIndex],
+                new Vortice.Mathematics.Int4(0, 0, 0, 0));
+            commandList.ClearUnorderedAccessViewUint(
+                device.GetGpuHandle(shadowVisibleIndicesUAVIndices[frameIndex]),
+                shadowVisibleIndicesCPUHandles[frameIndex],
+                shadowVisibleIndicesBuffers[frameIndex],
+                new Vortice.Mathematics.Int4(unchecked((int)0xFFFFFFFF), unchecked((int)0xFFFFFFFF), unchecked((int)0xFFFFFFFF), unchecked((int)0xFFFFFFFF)));
+            commandList.ClearUnorderedAccessViewUint(
+                device.GetGpuHandle(shadowHistogramUAVIndices[frameIndex]),
+                shadowHistogramCPUHandles[frameIndex],
+                shadowHistogramBuffers[frameIndex],
+                new Vortice.Mathematics.Int4(0, 0, 0, 0));
 
-            // Set the 4 cascade visibility UAV indices via push constants
-            commandList.SetComputeRoot32BitConstant(0, shadowVisibilityUAVIndices[frameIndex, 0], 24); // ShadowVisFlags0Idx
-            commandList.SetComputeRoot32BitConstant(0, shadowVisibilityUAVIndices[frameIndex, 1], 28); // ShadowVisFlags1Idx
-            commandList.SetComputeRoot32BitConstant(0, shadowVisibilityUAVIndices[frameIndex, 2], 29); // ShadowVisFlags2Idx
-            commandList.SetComputeRoot32BitConstant(0, shadowVisibilityUAVIndices[frameIndex, 3], 31); // ShadowVisFlags3Idx
+            commandList.ResourceBarrier(new[] {
+                new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(shadowCounterBuffers[frameIndex])),
+                new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(shadowVisibleIndicesBuffers[frameIndex])),
+                new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(shadowHistogramBuffers[frameIndex]))
+            });
 
-            // Dispatch CSVisibilityShadow4 — tests all 4 frustums per instance
+            // PHASE 1: Unified visibility (combined vis + cascade mask)
             commandList.SetPipelineState(culler.VisibilityShadow4PSO);
             commandList.Dispatch((uint)((totalInstances + 255) / 256), 1, 1);
 
-            // Barrier on all 4 visibility buffers before histogram reads them
             commandList.ResourceBarrier(new[] {
-                new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(shadowVisibilityBuffers[frameIndex, 0])),
-                new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(shadowVisibilityBuffers[frameIndex, 1])),
-                new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(shadowVisibilityBuffers[frameIndex, 2])),
-                new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(shadowVisibilityBuffers[frameIndex, 3]))
+                new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(shadowCombinedVisBuffers[frameIndex])),
+                new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(shadowCascadeMaskBuffers[frameIndex]))
             });
 
-            // === PHASE 2: Per-cascade Histogram → PrefixSum → Scatter → Main ===
-            for (int c = 0; c < ShadowCascadeCount; c++)
-            {
-                // Clear per-cascade buffers
-                commandList.ClearUnorderedAccessViewUint(
-                    device.GetGpuHandle(shadowCounterUAVIndices[frameIndex, c]),
-                    shadowCounterCPUHandles[frameIndex, c],
-                    shadowCounterBuffers[frameIndex, c],
-                    new Vortice.Mathematics.Int4(0, 0, 0, 0));
-                
-                commandList.ClearUnorderedAccessViewUint(
-                    device.GetGpuHandle(shadowVisibleIndicesUAVIndices[frameIndex, c]),
-                    shadowVisibleIndicesCPUHandles[frameIndex, c],
-                    shadowVisibleIndicesBuffers[frameIndex, c],
-                    new Vortice.Mathematics.Int4(unchecked((int)0xFFFFFFFF), unchecked((int)0xFFFFFFFF), unchecked((int)0xFFFFFFFF), unchecked((int)0xFFFFFFFF)));
-                
-                commandList.ClearUnorderedAccessViewUint(
-                    device.GetGpuHandle(shadowHistogramUAVIndices[frameIndex, c]),
-                    shadowHistogramCPUHandles[frameIndex, c],
-                    shadowHistogramBuffers[frameIndex, c],
-                    new Vortice.Mathematics.Int4(0, 0, 0, 0));
+            // PHASE 2: Single compaction pipeline (runs ONCE, not 4Ã—)
+            commandList.SetPipelineState(culler.HistogramPSO);
+            commandList.Dispatch((uint)((totalInstances + 63) / 64), 1, 1);
+            commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(shadowHistogramBuffers[frameIndex])));
 
-                // Barrier after clears
-                commandList.ResourceBarrier(new[] {
-                    new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(shadowCounterBuffers[frameIndex, c])),
-                    new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(shadowVisibleIndicesBuffers[frameIndex, c])),
-                    new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(shadowHistogramBuffers[frameIndex, c]))
-                });
+            commandList.SetPipelineState(culler.HistogramPrefixSumPSO);
+            commandList.Dispatch(1, 1, 1);
+            commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(shadowCounterBuffers[frameIndex])));
 
-                // Rebind per-cascade buffer indices
-                commandList.SetComputeRoot32BitConstant(0, shadowCommandUAVIndices[frameIndex, c], 1);
-                commandList.SetComputeRoot32BitConstant(0, shadowVisibleIndicesUAVIndices[frameIndex, c], 5);
-                commandList.SetComputeRoot32BitConstant(0, shadowCounterUAVIndices[frameIndex, c], 6);
-                commandList.SetComputeRoot32BitConstant(0, shadowVisibleIndicesSRVIndices[frameIndex, c], 9);
-                commandList.SetComputeRoot32BitConstant(0, shadowVisibilityUAVIndices[frameIndex, c], 11); // VisibilityFlagsIdx
-                commandList.SetComputeRoot32BitConstant(0, shadowHistogramUAVIndices[frameIndex, c], 26);
+            commandList.SetPipelineState(culler.GlobalScatterPSO);
+            commandList.Dispatch((uint)((totalInstances + 255) / 256), 1, 1);
+            commandList.ResourceBarrier(new[] {
+                new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(shadowVisibleIndicesBuffers[frameIndex])),
+                new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(shadowCounterBuffers[frameIndex]))
+            });
 
-                // CSHistogram — reads visibilityFlags (already written by CSVisibilityShadow4)
-                commandList.SetPipelineState(culler.HistogramPSO);
-                commandList.Dispatch((uint)((totalInstances + 63) / 64), 1, 1);
-                commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(shadowHistogramBuffers[frameIndex, c])));
+            // CSMain - generates commands with DrawInstanceCount x 1
+            commandList.SetPipelineState(culler.MainPSO);
+            commandList.Dispatch((uint)((MeshRegistry.Count + 63) / 64), 1, 1);
 
-                // CSHistogramPrefixSum
-                commandList.SetPipelineState(culler.HistogramPrefixSumPSO);
-                commandList.Dispatch(1, 1, 1);
-                commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(shadowCounterBuffers[frameIndex, c])));
+            commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(shadowCommandBuffers[frameIndex])));
 
-                // CSGlobalScatter
-                commandList.SetPipelineState(culler.GlobalScatterPSO);
-                commandList.Dispatch((uint)((totalInstances + 255) / 256), 1, 1);
-                commandList.ResourceBarrier(new[] {
-                    new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(shadowVisibleIndicesBuffers[frameIndex, c])),
-                    new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(shadowCounterBuffers[frameIndex, c]))
-                });
+            // PHASE 3: Cascade expansion - expand compacted instances by cascade mask
+            // Re-clear counters for atomic append tracking
+            commandList.ClearUnorderedAccessViewUint(
+                device.GetGpuHandle(shadowCounterUAVIndices[frameIndex]),
+                shadowCounterCPUHandles[frameIndex],
+                shadowCounterBuffers[frameIndex],
+                new Vortice.Mathematics.Int4(0, 0, 0, 0));
+            commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(shadowCounterBuffers[frameIndex])));
 
-                // CSMain — generate indirect commands
-                commandList.SetPipelineState(culler.MainPSO);
-                commandList.Dispatch((uint)((MeshRegistry.Count + 63) / 64), 1, 1);
-            }
+            // Dispatch CSExpandCascades: 2D dispatch (x = instance groups, y = mesh parts)
+            uint maxVisiblePerPart = (uint)((totalInstances + 255) / 256);
+            commandList.SetPipelineState(culler.ExpandCascadesPSO);
+            commandList.Dispatch(maxVisiblePerPart, (uint)MeshRegistry.Count, 1);
+
+            commandList.ResourceBarrier(new[] {
+                new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(shadowExpansionBuffers[frameIndex])),
+                new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(shadowCounterBuffers[frameIndex]))
+            });
+
+            // Patch indirect args with expanded counts and updated base offsets
+            commandList.SetPipelineState(culler.PatchExpandedPSO);
+            commandList.Dispatch((uint)((MeshRegistry.Count + 63) / 64), 1, 1);
+
+            commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(shadowCommandBuffers[frameIndex])));
         }
 
 
-        public void DrawShadow(ID3D12GraphicsCommandList commandList, int cascadeIndex, ulong shadowSceneCBVAddress)
+
+
+
+
+
+
+
+        /// <summary>
+        /// Single-pass shadow draw: 1 ExecuteIndirect for all cascades.
+        /// Material/PSO/descriptors must already be set by the caller.
+        /// Expansion buffer encodes (cascadeIdx, instanceIdx) — no cascade mask needed in VS.
+        /// </summary>
+        public void DrawShadowSinglePass(ID3D12GraphicsCommandList commandList, uint shadowVPSrv)
         {
             int frameIndex = Engine.FrameIndex % FrameCount;
-            if (!_shadowCullerInitialized || SubBatchCount == 0 || cascadeIndex < 0 || cascadeIndex >= ShadowCascadeCount)
-            {
-                if (Engine.FrameIndex % 60 == 0 && cascadeIndex == 0)
-                    Debug.Log($"[Shadow] DrawShadow SKIP: cullerInit={_shadowCullerInitialized}, subBatches={SubBatchCount}, cascade={cascadeIndex}");
-                return;
-            }
+            if (!_shadowCullerInitialized || SubBatchCount == 0) return;
 
-            var commandBuffer = shadowCommandBuffers[frameIndex, cascadeIndex];
-            if (commandBuffer == null)
-            {
-                if (Engine.FrameIndex % 60 == 0 && cascadeIndex == 0)
-                    Debug.Log($"[Shadow] DrawShadow SKIP: commandBuffer is null for frame={frameIndex}, cascade={cascadeIndex}");
-                return;
-            }
-            
-            // Skip if material doesn't have a Shadow pass
-            if (!Material.HasPass(RenderPass.Shadow))
-            {
-                if (Engine.FrameIndex % 60 == 0 && cascadeIndex == 0)
-                    Debug.Log($"[Shadow] DrawShadow SKIP: No Shadow pass on material");
-                return;
-            }
-            
-            if (Engine.FrameIndex % 60 == 0 && cascadeIndex == 0)
-                Debug.Log($"[Shadow] DrawShadow: subBatches={SubBatchCount}, cbvAddr=0x{shadowSceneCBVAddress:X}, frame={frameIndex}");
-            
-            // Use Material.Apply for full graphics state setup (PSO, root sig, descriptors,
-            // resource bindings, Materials buffer). Then override the SceneConstants CBV with our
-            // dedicated shadow buffer to prevent overwriting the camera matrices used by opaque pass.
-            Material.SetPass(RenderPass.Shadow);
-            Material.Apply(commandList, Engine.Device, null);
-            
-            // OVERRIDE: Rebind SceneConstants CBV (slot 1 = register b0) with shadow-specific
-            // buffer containing light View/Projection. Material.Apply just committed the camera's
-            // SceneConstants, but the shadow VS needs the light matrices.
-            commandList.SetGraphicsRootConstantBufferView(1, shadowSceneCBVAddress);
+            var commandBuffer = shadowCommandBuffers[frameIndex];
+            if (commandBuffer == null) return;
 
-            // Bind per-instance buffer SRV indices to GRAPHICS push constants (same as Draw).
+
+
+            // Bind per-instance buffer SRV indices (may use any slots including high ones)
             foreach (var (hash, pib) in _perInstanceBuffers)
             {
                 if (pib.PushConstantSlot < 0) continue;
-                uint srvIdx = pib.SRVIndices[frameIndex];
-                commandList.SetGraphicsRoot32BitConstant(0, srvIdx, (uint)pib.PushConstantSlot);
+                commandList.SetGraphicsRoot32BitConstant(0, pib.SRVIndices[frameIndex], (uint)pib.PushConstantSlot);
             }
 
-            // Transition buffers for reading
-            commandList.ResourceBarrier(new ResourceBarrier(
-                new ResourceTransitionBarrier(shadowVisibleIndicesBuffers[frameIndex, cascadeIndex],
-                    ResourceStates.UnorderedAccess,
-                    ResourceStates.NonPixelShaderResource)));
-            commandList.ResourceBarrier(new ResourceBarrier(
-                new ResourceTransitionBarrier(commandBuffer,
-                    ResourceStates.UnorderedAccess,
-                    ResourceStates.IndirectArgument)));
+            // Set expansion buffer + VP buffer
+            commandList.SetGraphicsRoot32BitConstant(0, shadowExpansionSRVIndices[frameIndex], 20); // ExpansionBufferIdx
+            commandList.SetGraphicsRoot32BitConstant(0, shadowVPSrv, 21);    // ShadowVPBufferIdx
 
+            // Transition buffers for reading
+            commandList.ResourceBarrier(new[] {
+                new ResourceBarrier(new ResourceTransitionBarrier(shadowExpansionBuffers[frameIndex],
+                    ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource)),
+                new ResourceBarrier(new ResourceTransitionBarrier(commandBuffer,
+                    ResourceStates.UnorderedAccess, ResourceStates.IndirectArgument))
+            });
+
+            // 1 ExecuteIndirect — commands have expanded DrawInstanceCount from CSPatchExpandedCounts
             commandList.ExecuteIndirect(
                 Engine.Device.BindlessCommandSignature,
                 (uint)SubBatchCount,
@@ -1008,18 +932,17 @@ namespace Freefall.Graphics
                 0
             );
 
-            // Transition back for next frame
-            commandList.ResourceBarrier(new ResourceBarrier(
-                new ResourceTransitionBarrier(commandBuffer,
-                    ResourceStates.IndirectArgument,
-                    ResourceStates.UnorderedAccess)));
-            commandList.ResourceBarrier(new ResourceBarrier(
-                new ResourceTransitionBarrier(shadowVisibleIndicesBuffers[frameIndex, cascadeIndex],
-                    ResourceStates.NonPixelShaderResource,
-                    ResourceStates.UnorderedAccess)));
+            // Transition back
+            commandList.ResourceBarrier(new[] {
+                new ResourceBarrier(new ResourceTransitionBarrier(commandBuffer,
+                    ResourceStates.IndirectArgument, ResourceStates.UnorderedAccess)),
+                new ResourceBarrier(new ResourceTransitionBarrier(shadowExpansionBuffers[frameIndex],
+                    ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess))
+            });
         }
 
         #endregion
+
 
         public void Draw(ID3D12GraphicsCommandList commandList, GraphicsDevice device)
         {
@@ -1112,31 +1035,34 @@ namespace Freefall.Graphics
             _cpuHeap = null;
             _cullerInitialized = false;
 
-            // Defer shadow cascade buffers too
+            // Defer shadow union buffers
             if (_shadowCullerInitialized)
             {
                 for (int f = 0; f < FrameCount; f++)
                 {
-                    for (int c = 0; c < ShadowCascadeCount; c++)
-                    {
-                        DeferDispose(shadowVisibilityBuffers[f, c], shadowVisibilityUAVIndices[f, c]);
-                        shadowVisibilityBuffers[f, c] = null; shadowVisibilityUAVIndices[f, c] = 0;
+                    DeferDispose(shadowCombinedVisBuffers[f], shadowCombinedVisUAVIndices[f]);
+                    shadowCombinedVisBuffers[f] = null; shadowCombinedVisUAVIndices[f] = 0;
 
-                        DeferDispose(shadowVisibleIndicesBuffers[f, c], shadowVisibleIndicesUAVIndices[f, c]);
-                        DeferDispose(null, shadowVisibleIndicesSRVIndices[f, c]);
-                        shadowVisibleIndicesBuffers[f, c] = null; shadowVisibleIndicesUAVIndices[f, c] = 0; shadowVisibleIndicesSRVIndices[f, c] = 0;
+                    DeferDispose(shadowCascadeMaskBuffers[f], shadowCascadeMaskUAVIndices[f]);
+                    DeferDispose(null, shadowCascadeMaskSRVIndices[f]);
+                    shadowCascadeMaskBuffers[f] = null; shadowCascadeMaskUAVIndices[f] = 0; shadowCascadeMaskSRVIndices[f] = 0;
 
+                    DeferDispose(shadowVisibleIndicesBuffers[f], shadowVisibleIndicesUAVIndices[f]);
+                    DeferDispose(null, shadowVisibleIndicesSRVIndices[f]);
+                    shadowVisibleIndicesBuffers[f] = null; shadowVisibleIndicesUAVIndices[f] = 0; shadowVisibleIndicesSRVIndices[f] = 0;
 
+                    DeferDispose(shadowCommandBuffers[f], shadowCommandUAVIndices[f]);
+                    shadowCommandBuffers[f] = null; shadowCommandUAVIndices[f] = 0;
 
-                        DeferDispose(shadowCommandBuffers[f, c], shadowCommandUAVIndices[f, c]);
-                        shadowCommandBuffers[f, c] = null; shadowCommandUAVIndices[f, c] = 0;
+                    DeferDispose(shadowCounterBuffers[f], shadowCounterUAVIndices[f]);
+                    shadowCounterBuffers[f] = null; shadowCounterUAVIndices[f] = 0;
 
-                        DeferDispose(shadowCounterBuffers[f, c], shadowCounterUAVIndices[f, c]);
-                        shadowCounterBuffers[f, c] = null; shadowCounterUAVIndices[f, c] = 0;
+                    DeferDispose(shadowHistogramBuffers[f], shadowHistogramUAVIndices[f]);
+                    shadowHistogramBuffers[f] = null; shadowHistogramUAVIndices[f] = 0;
 
-                        DeferDispose(shadowHistogramBuffers[f, c], shadowHistogramUAVIndices[f, c]);
-                        shadowHistogramBuffers[f, c] = null; shadowHistogramUAVIndices[f, c] = 0;
-                    }
+                    DeferDispose(shadowExpansionBuffers[f], shadowExpansionUAVIndices[f]);
+                    DeferDispose(null, shadowExpansionSRVIndices[f]);
+                    shadowExpansionBuffers[f] = null; shadowExpansionUAVIndices[f] = 0; shadowExpansionSRVIndices[f] = 0;
                 }
                 _shadowCullerInitialized = false;
                 _shadowCpuHeap?.Dispose();
@@ -1168,31 +1094,34 @@ namespace Freefall.Graphics
             _cpuHeap = null;
             _cullerInitialized = false;
             
-            // Dispose shadow cascade buffers
+            // Dispose shadow union buffers
             if (_shadowCullerInitialized)
             {
                 for (int f = 0; f < FrameCount; f++)
                 {
-                    for (int c = 0; c < ShadowCascadeCount; c++)
-                    {
-                        shadowVisibilityBuffers[f, c]?.Dispose();
-                        if (shadowVisibilityUAVIndices[f, c] != 0) Engine.Device.ReleaseBindlessIndex(shadowVisibilityUAVIndices[f, c]);
-                        
-                        shadowVisibleIndicesBuffers[f, c]?.Dispose();
-                        if (shadowVisibleIndicesUAVIndices[f, c] != 0) Engine.Device.ReleaseBindlessIndex(shadowVisibleIndicesUAVIndices[f, c]);
-                        if (shadowVisibleIndicesSRVIndices[f, c] != 0) Engine.Device.ReleaseBindlessIndex(shadowVisibleIndicesSRVIndices[f, c]);
-                        
+                    shadowCombinedVisBuffers[f]?.Dispose();
+                    if (shadowCombinedVisUAVIndices[f] != 0) Engine.Device.ReleaseBindlessIndex(shadowCombinedVisUAVIndices[f]);
 
-                        
-                        shadowCommandBuffers[f, c]?.Dispose();
-                        if (shadowCommandUAVIndices[f, c] != 0) Engine.Device.ReleaseBindlessIndex(shadowCommandUAVIndices[f, c]);
-                        
-                        shadowCounterBuffers[f, c]?.Dispose();
-                        if (shadowCounterUAVIndices[f, c] != 0) Engine.Device.ReleaseBindlessIndex(shadowCounterUAVIndices[f, c]);
-                        
-                        shadowHistogramBuffers[f, c]?.Dispose();  
-                        if (shadowHistogramUAVIndices[f, c] != 0) Engine.Device.ReleaseBindlessIndex(shadowHistogramUAVIndices[f, c]);
-                    }
+                    shadowCascadeMaskBuffers[f]?.Dispose();
+                    if (shadowCascadeMaskUAVIndices[f] != 0) Engine.Device.ReleaseBindlessIndex(shadowCascadeMaskUAVIndices[f]);
+                    if (shadowCascadeMaskSRVIndices[f] != 0) Engine.Device.ReleaseBindlessIndex(shadowCascadeMaskSRVIndices[f]);
+
+                    shadowVisibleIndicesBuffers[f]?.Dispose();
+                    if (shadowVisibleIndicesUAVIndices[f] != 0) Engine.Device.ReleaseBindlessIndex(shadowVisibleIndicesUAVIndices[f]);
+                    if (shadowVisibleIndicesSRVIndices[f] != 0) Engine.Device.ReleaseBindlessIndex(shadowVisibleIndicesSRVIndices[f]);
+
+                    shadowCommandBuffers[f]?.Dispose();
+                    if (shadowCommandUAVIndices[f] != 0) Engine.Device.ReleaseBindlessIndex(shadowCommandUAVIndices[f]);
+
+                    shadowCounterBuffers[f]?.Dispose();
+                    if (shadowCounterUAVIndices[f] != 0) Engine.Device.ReleaseBindlessIndex(shadowCounterUAVIndices[f]);
+
+                    shadowHistogramBuffers[f]?.Dispose();
+                    if (shadowHistogramUAVIndices[f] != 0) Engine.Device.ReleaseBindlessIndex(shadowHistogramUAVIndices[f]);
+
+                    shadowExpansionBuffers[f]?.Dispose();
+                    if (shadowExpansionUAVIndices[f] != 0) Engine.Device.ReleaseBindlessIndex(shadowExpansionUAVIndices[f]);
+                    if (shadowExpansionSRVIndices[f] != 0) Engine.Device.ReleaseBindlessIndex(shadowExpansionSRVIndices[f]);
                 }
                 _shadowCullerInitialized = false;
             }

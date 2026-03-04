@@ -126,6 +126,23 @@ namespace Freefall.Graphics
                 i++;
             }
         }
+
+        /// <summary>
+        /// Set active pass by name (for non-enum passes like "ShadowSinglePass")
+        /// </summary>
+        public void SetPass(string name)
+        {
+            int i = 0;
+            foreach (var p in GetPasses())
+            {
+                if (p.EffectPass.Name == name)
+                {
+                    Pass = i;
+                    return;
+                }
+                i++;
+            }
+        }
         
         public RenderPass GetPass(int index) => GetPasses()[index].RenderPass;
         

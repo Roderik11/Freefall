@@ -30,6 +30,9 @@ namespace Freefall.Graphics
         /// <summary>Hi-Z depth pyramid, matched to this pipeline's depth buffer dimensions.</summary>
         public HiZPyramid? HiZPyramid { get; private set; }
 
+        /// <summary>Shadow Hi-Z pyramid for occlusion culling shadow casters.</summary>
+        public ShadowHiZPyramid? ShadowHiZPyramid { get; private set; }
+
         private Material matClear = null!;
         private Material matCompose = null!;
         private Material matDirectionalLight = null!;
@@ -71,6 +74,10 @@ namespace Freefall.Graphics
             // Hi-Z pyramid (matched to depth buffer size)
             HiZPyramid = new HiZPyramid();
             HiZPyramid.Create(Engine.Device, width, height);
+            
+            // Shadow Hi-Z pyramid (matched to shadow map size)
+            ShadowHiZPyramid = new ShadowHiZPyramid();
+            ShadowHiZPyramid.Create(Engine.Device, 2048, 2048, Engine.Settings.ShadowCascadeCount);
         }
 
         private void CreateRenderTextures(int width, int height)
@@ -327,6 +334,21 @@ namespace Freefall.Graphics
                  // Transition shadow texture to shader resource for light pass sampling
                  list.ResourceBarrierTransition(ShadowTextureArray.Native, 
                      ResourceStates.DepthWrite, ResourceStates.PixelShaderResource);
+                 
+                 // Generate shadow Hi-Z pyramid from this frame's shadow depth
+                 if (ShadowHiZPyramid != null && CommandBuffer.Culler != null)
+                 {
+                     // Shadow texture is in PixelShaderResource — transition to NonPixelShaderResource for compute read
+                     list.ResourceBarrierTransition(ShadowTextureArray.Native,
+                         ResourceStates.PixelShaderResource, ResourceStates.NonPixelShaderResource);
+                     
+                     CommandBuffer.Culler.GenerateShadowHiZPyramid(
+                         list, ShadowTextureArray.BindlessIndex, ShadowHiZPyramid);
+                     
+                     // Transition back to PixelShaderResource for light pass sampling
+                     list.ResourceBarrierTransition(ShadowTextureArray.Native,
+                         ResourceStates.NonPixelShaderResource, ResourceStates.PixelShaderResource);
+                 }
                  
                  // Shadow pass changes render targets and viewport for depth rendering.
                  // Restore GBuffer state before Sky pass.

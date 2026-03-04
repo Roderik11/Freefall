@@ -2,7 +2,7 @@
 // @RenderState(DepthTest=false, DepthWrite=false, Blend=Additive)
 
 // Light Pass Push Constant Layout
-// Slots 0-3: Light-specific textures (procedural fullscreen quad, no vertex buffers)
+// Slots 0-5: Light-specific textures (procedural fullscreen quad, no vertex buffers)
 #define NormalTexIdx GET_INDEX(0)   // G-Buffer normal texture
 #define DepthTexIdx GET_INDEX(1)    // G-Buffer depth texture (hardware)
 #define ShadowMapIdx GET_INDEX(2)   // Shadow map texture array
@@ -18,12 +18,14 @@ cbuffer ObjectConstants : register(b1)
     float3 LightDirection;
     float _pad0;
     
-    // Shadow cascade data
-    row_major float4x4 LightSpaces[4];  // Light view-projection matrices per cascade
-    float4 Cascades[4];                  // X=near, Y=far for each cascade
+    // Shadow cascade data — arrays sized for MaxCascades (8), CascadeCount controls active count
+    // Camera-relative VP matrices (matches posFromDepth output space)
+    row_major float4x4 LightSpaces[8];
+    float4 Cascades[8];                  // X=near, Y=far for each cascade
     
-    int DebugVisualizationMode;          // 0=normal, 1=cascade colors, 2=shadow factor, 3=depth
-    float3 _pad1;
+    int CascadeCount;
+    int DebugVisualizationMode;
+    float2 _pad1;
 };
 
 SamplerState Sampler : register(s0);
@@ -132,9 +134,8 @@ float4 PS(VSOutput input) : SV_Target
     float viewDepth = dot(worldPos.xyz, float3(View._13, View._23, View._33));
     
     // Select cascade based on view depth
-    int cascadeIndex = 3;
-    [unroll]
-    for (int i = 0; i < 4; i++)
+    int cascadeIndex = CascadeCount - 1;
+    for (int i = 0; i < CascadeCount; i++)
     {
         if (viewDepth < Cascades[i].y)
         {
@@ -150,7 +151,7 @@ float4 PS(VSOutput input) : SV_Target
     float sampledDepth = 0;
     
     // Beyond the last cascade far distance — no shadow (fully lit)
-    if (viewDepth > Cascades[3].y)
+    if (viewDepth > Cascades[CascadeCount - 1].y)
         shadowFactor = 1.0f;
     else if (ShadowMapIdx > 0) // Only sample if shadow map is bound
 
@@ -172,7 +173,7 @@ float4 PS(VSOutput input) : SV_Target
             
             // Cascade blending: cross-fade near cascade boundaries to eliminate seams
             // Outgoing blend: fade toward next cascade at far edge
-            if (cascadeIndex < 3)
+            if (cascadeIndex < CascadeCount - 1)
             {
                 float cascadeRange = Cascades[cascadeIndex].y - Cascades[cascadeIndex].x;
                 float blendZone = cascadeRange * 0.1f;
@@ -199,6 +200,7 @@ float4 PS(VSOutput input) : SV_Target
 
         }
     }
+
     
     // Debug visualization modes
     if (DebugVisualizationMode == 1)

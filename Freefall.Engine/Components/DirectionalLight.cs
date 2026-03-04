@@ -26,28 +26,87 @@ namespace Freefall.Components
         private Material Material;
         private MaterialBlock Params;
 
-        // Shadow Cascades
-        private readonly Vector4[] cascades = new Vector4[4];
-        private readonly Matrix4x4[] cascadeProjectionMatrices = new Matrix4x4[4];
-        private readonly Matrix4x4[] lightSpace = new Matrix4x4[4];
+        internal const int MaxCascades = 8; // Support up to 8 cascades
+        
+        // Shadow Cascades — arrays sized to max capacity, active count from Engine.Settings
+        private readonly Vector4[] cascades = new Vector4[MaxCascades];
+        private readonly Matrix4x4[] cascadeProjectionMatrices = new Matrix4x4[MaxCascades];
+        private readonly Matrix4x4[] lightSpace = new Matrix4x4[MaxCascades];
         private readonly Vector3[] frustumCorners = new Vector3[8];
         
         // GPU-driven shadow rendering - frustum planes per cascade (6 planes each)
-        private readonly Vector4[][] cascadeFrustumPlanes = new Vector4[4][];
+        private readonly Vector4[][] cascadeFrustumPlanes = new Vector4[MaxCascades][];
         
-        // Shadow cascade constant buffer (uploaded once for all 4 cascades)
-        private ID3D12Resource[]? _shadowCascadeBuffers;
+        // Unified cascade structured buffer: StructuredBuffer<CascadeData>
+        // Holds planes + VP + PrevVP per cascade. All consumers (cull, terrain, grass) read from this.
+        private ID3D12Resource[]? _cascadeBuffers;
+        private IntPtr[]? _cascadeBufferPtrs;
+        private uint[]? _cascadeBufferSrvIndices;
+        // TEMP DEBUG: separate VP-only buffer to test if CascadeData struct offset issue
+        private ID3D12Resource[]? _vpOnlyBuffers;
+        private IntPtr[]? _vpOnlyPtrs;
+        private uint[]? _vpOnlySrvIndices;
         private const int FrameCount = 3;
+
+        // Shadow cascade planes cbuffer (register b1) — used by compute culler
+        private ID3D12Resource[]? _shadowCascadeCBs;
+        private IntPtr[]? _shadowCascadeCBPtrs;
 
         // Dedicated shadow SceneConstants buffer (prevents overwriting opaque pass CBV)
         private ID3D12Resource[]? _shadowSceneConstantsBuffers;
         private IntPtr[]? _shadowSceneConstantsPtrs;
+
+        // VP matrices for current and previous frames
+        private readonly Matrix4x4[] _shadowVPMatrices = new Matrix4x4[MaxCascades];
+        private readonly Matrix4x4[] _prevShadowVPMatrices = new Matrix4x4[MaxCascades];
+
 
         /// <summary>
         /// Current shadow scene CBV address (set per cascade during shadow rendering).
         /// Custom shadow actions can use this to rebind the light VP after Material.Apply.
         /// </summary>
         public static ulong CurrentShadowSceneCBV { get; set; }
+
+        /// <summary>
+        /// Current cascade index being rendered (for custom actions like grass).
+        /// </summary>
+        public static int CurrentShadowCascadeIndex { get; set; }
+
+        /// <summary>
+        /// Current shadow VP buffer SRV index (for custom actions).
+        /// </summary>
+        public static uint CurrentCascadeSrvIndex { get; set; }
+        
+        // TEMP DEBUG: VP-only buffer SRV for A/B testing
+        public static uint CurrentVPOnlySrvIndex { get; set; }
+
+        /// <summary>
+        /// Get frustum planes for the outermost shadow cascade (largest coverage).
+        /// Returns 6 Vector4 planes in absolute-world space. Valid during shadow pass.
+        /// </summary>
+        public static Vector4[]? GetOutermostCascadeFrustumPlanes()
+        {
+            if (_instance == null) return null;
+            int last = CascadeCount - 1;
+            return _instance.cascadeFrustumPlanes[last];
+        }
+
+        /// <summary>
+        /// Get frustum planes for all cascades. Returns cascadeFrustumPlanes[0..N-1],
+        /// each containing 6 Vector4 planes in absolute-world space.
+        /// </summary>
+        public static Vector4[][]? GetAllCascadeFrustumPlanes()
+        {
+            if (_instance == null) return null;
+            return _instance.cascadeFrustumPlanes;
+        }
+
+        /// <summary>
+        /// Number of active shadow cascades (from Engine.Settings).
+        /// </summary>
+        public static int CascadeCount => Engine.Settings.ShadowCascadeCount;
+
+        private static DirectionalLight? _instance;
 
         public DirectionalLight()
         {
@@ -56,6 +115,8 @@ namespace Freefall.Components
             
             for (int i = 0; i < 4; i++)
                 cascadeFrustumPlanes[i] = new Vector4[6];
+
+            _instance = this;
         }
 
         // Called by DeferredRenderer via CommandBuffer
@@ -87,9 +148,11 @@ namespace Freefall.Components
             Params.SetParameter("LightDirection", Transform.Forward);
             Params.SetParameter("LightIntensity", Intensity);
             
-            // Shadow parameters - use array variant
-            Params.SetParameterArray("LightSpaces", lightSpace);
-            Params.SetParameterArray("Cascades", cascades);
+            // Shadow parameters — camera-relative LightSpaces for lighting, Cascades for selection
+            int cc = CascadeCount;
+            Params.SetParameterArray("LightSpaces", lightSpace[..cc]);
+            Params.SetParameterArray("Cascades", cascades[..cc]);
+            Params.SetParameter("CascadeCount", cc);
             Params.SetParameter("DebugVisualizationMode", Engine.Settings.DebugVisualizationMode);
             
             if (DeferredRenderer.Current != null)
@@ -154,47 +217,51 @@ namespace Freefall.Components
             if (!CastShadows) return;
             
             // Draw each cascade using GPU-driven rendering
-            // Phase 1: Compute all 4 cascade matrices and frustum planes
-            for (int i = 0; i < 4; i++)
+            // Phase 1: Compute cascade matrices and frustum planes
+            for (int i = 0; i < CascadeCount; i++)
                 SetupCascade(i, camera, cameraPosition, shadowTex);
             
-            // Phase 2: GPU-driven cull all 4 cascades per batch (unified visibility pass)
+            // Phase 2: GPU-driven cull all cascades per batch (unified visibility pass)
             var culler = CommandBuffer.Culler;
             var allBatches = CommandBuffer.GetAllBatches(RenderPass.Opaque);
             int frameIndex = Engine.FrameIndex % FrameCount;
             
             if (culler != null && allBatches != null)
             {
-                EnsureShadowCascadeBuffer();
-                UploadShadowCascadePlanes(frameIndex);
-                ulong cascadeBufferAddress = _shadowCascadeBuffers![frameIndex].GPUVirtualAddress;
+                EnsureCascadeBuffer();
+                UploadCascadeBuffer(frameIndex);
+                uint cascadeSrv = _cascadeBufferSrvIndices![frameIndex];
+                uint vpOnlySrv = _vpOnlySrvIndices![frameIndex]; // TEMP
+                CurrentCascadeSrvIndex = cascadeSrv;
+                CurrentVPOnlySrvIndex = vpOnlySrv; // TEMP
                 
-                // Cull all 4 cascades for each batch using unified visibility pass
+                // Shadow Hi-Z SRV for occlusion culling (0 = disabled on first frame before pyramid is ready)
+                var shadowPyramid = DeferredRenderer.Current?.ShadowHiZPyramid;
+                uint shadowHiZSrv = (shadowPyramid?.Ready == true) ? shadowPyramid.FullSRV : 0;
+                
+                // Cull all cascades for each batch using unified visibility pass
+                ulong cascadeCBAddr = _shadowCascadeCBs![frameIndex].GPUVirtualAddress;
                 foreach (var batch in allBatches)
                 {
-                    batch.CullShadowAll(commandList, cascadeBufferAddress, culler);
+                    batch.CullShadowAll(commandList, cascadeSrv, cascadeCBAddr, shadowHiZSrv, culler);
                 }
                 
-                // Phase 3: Draw each cascade
-                for (int i = 0; i < 4; i++)
+                // Phase 3: True single-pass draw — 1 ExecuteIndirect per batch for all cascades
+                // Bind full-array DSV (all slices at once)
+                commandList.OMSetRenderTargets(0, (CpuDescriptorHandle[]?)null, false, shadowTex.FullArrayDsvHandle);
+                
+                foreach (var batch in allBatches)
                 {
-                    // Set render target to depth-only
-                    commandList.OMSetRenderTargets(0, (CpuDescriptorHandle[]?)null, false, shadowTex.SliceDsvHandles[i]);
+                    if (!batch.Material.HasPass(RenderPass.Shadow)) continue;
+                    batch.Material.SetPass(RenderPass.Shadow);
+                    batch.Material.Apply(commandList, Engine.Device, null);
                     
-                    ulong shadowSceneCBVAddress = _shadowSceneConstantsBuffers![frameIndex].GPUVirtualAddress + (ulong)(i * 512);
-                    foreach (var batch in allBatches)
-                    {
-                        var pass = batch.Material.GetPass(Material.Pass);
-                        batch.Material.SetPass(RenderPass.Shadow);
-                        batch.DrawShadow(commandList, i, shadowSceneCBVAddress);
-                        batch.Material.SetPass(pass);
-                    }
-
-                    // Execute custom shadow actions (e.g. grass mesh shader dispatch)
-                    // Set shadow CBV so DispatchDecorator can rebind after Apply
-                    DirectionalLight.CurrentShadowSceneCBV = shadowSceneCBVAddress;
-                    CommandBuffer.ExecuteCustomActions(RenderPass.Shadow, commandList);
+                    batch.DrawShadowSinglePass(commandList, cascadeSrv);
                 }
+
+                // Custom shadow actions (grass) — single-pass via AS/MS cascade expansion
+                // FullArrayDsvHandle is already bound from batch shadows above
+                CommandBuffer.ExecuteCustomActions(RenderPass.Shadow, commandList);
                 CommandBuffer.ClearCustomActions(RenderPass.Shadow);
             }
             else
@@ -330,29 +397,87 @@ namespace Freefall.Components
             EnsureShadowSceneConstantsBuffer();
             int frameIndex = Engine.FrameIndex % FrameCount;
             UploadShadowSceneConstants(frameIndex, index, shadowView, lightProj);
+            
+            // Store combined shadowVP for the single-pass structured buffer
+            _shadowVPMatrices[index] = shadowVP;
         }
                
-        private void EnsureShadowCascadeBuffer()
+        private void EnsureCascadeBuffer()
         {
-            if (_shadowCascadeBuffers != null) return;
+            if (_cascadeBuffers != null) return;
             
-            _shadowCascadeBuffers = new ID3D12Resource[FrameCount];
-            int bufferSize = (24 * 16 + 255) & ~255; // 24 float4s, 256-byte aligned
+            int stride = Marshal.SizeOf<GPUCuller.CascadeData>();
+            int bufferSize = stride * MaxCascades;
+            _cascadeBuffers = new ID3D12Resource[FrameCount];
+            _cascadeBufferPtrs = new IntPtr[FrameCount];
+            _cascadeBufferSrvIndices = new uint[FrameCount];
+            
+            // TEMP DEBUG: VP-only buffer
+            int vpStride = Marshal.SizeOf<Matrix4x4>();
+            _vpOnlyBuffers = new ID3D12Resource[FrameCount];
+            _vpOnlyPtrs = new IntPtr[FrameCount];
+            _vpOnlySrvIndices = new uint[FrameCount];
+            
+            var device = Engine.Device;
+            
+            // Shadow cascade planes cbuffer (register b1)
+            int cbSize = (Marshal.SizeOf<GPUCuller.ShadowCascadeConstants>() + 255) & ~255;
+            _shadowCascadeCBs = new ID3D12Resource[FrameCount];
+            _shadowCascadeCBPtrs = new IntPtr[FrameCount];
             
             for (int i = 0; i < FrameCount; i++)
-                _shadowCascadeBuffers[i] = Engine.Device.CreateUploadBuffer(bufferSize);
+            {
+                _cascadeBuffers[i] = device.CreateUploadBuffer(bufferSize);
+                _cascadeBufferSrvIndices[i] = device.AllocateBindlessIndex();
+                device.CreateStructuredBufferSRV(_cascadeBuffers[i], (uint)MaxCascades, (uint)stride, _cascadeBufferSrvIndices[i]);
+                
+                // TEMP: VP-only buffer (stride 64)
+                _vpOnlyBuffers[i] = device.CreateUploadBuffer(vpStride * MaxCascades);
+                _vpOnlySrvIndices[i] = device.AllocateBindlessIndex();
+                device.CreateStructuredBufferSRV(_vpOnlyBuffers[i], (uint)MaxCascades, (uint)vpStride, _vpOnlySrvIndices[i]);
+                
+                // Cascade planes cbuffer
+                _shadowCascadeCBs[i] = device.CreateUploadBuffer(cbSize);
+                
+                unsafe
+                {
+                    void* pData;
+                    _cascadeBuffers[i].Map(0, null, &pData);
+                    _cascadeBufferPtrs[i] = (IntPtr)pData;
+                    
+                    void* pVP;
+                    _vpOnlyBuffers[i].Map(0, null, &pVP);
+                    _vpOnlyPtrs[i] = (IntPtr)pVP;
+                    
+                    void* pCB;
+                    _shadowCascadeCBs[i].Map(0, null, &pCB);
+                    _shadowCascadeCBPtrs[i] = (IntPtr)pCB;
+                }
+            }
         }
         
-        private unsafe void UploadShadowCascadePlanes(int frameIndex)
+        private unsafe void UploadCascadeBuffer(int frameIndex)
         {
-            var constants = new GPUCuller.ShadowCascadeConstants();
-            for (int c = 0; c < 4; c++)
-                constants.SetCascadePlanes(c, cascadeFrustumPlanes[c]);
+            var dst = (GPUCuller.CascadeData*)_cascadeBufferPtrs![frameIndex];
+            var vpDst = (Matrix4x4*)_vpOnlyPtrs![frameIndex];
+            var cbDst = (Vector4*)_shadowCascadeCBPtrs![frameIndex];
+            for (int c = 0; c < CascadeCount; c++)
+            {
+                var data = new GPUCuller.CascadeData();
+                data.SetPlanes(cascadeFrustumPlanes[c]);
+                data.VP = _shadowVPMatrices[c];
+                data.PrevVP = _prevShadowVPMatrices[c];
+                data.SplitDistances = cascades[c]; // X=near, Y=far
+                dst[c] = data;
+                vpDst[c] = _shadowVPMatrices[c];
+                
+                // Write planes to cbuffer (6 Vector4s per cascade)
+                for (int p = 0; p < 6; p++)
+                    cbDst[c * 6 + p] = cascadeFrustumPlanes[c][p];
+            }
             
-            void* pData;
-            _shadowCascadeBuffers![frameIndex].Map(0, null, &pData);
-            *(GPUCuller.ShadowCascadeConstants*)pData = constants;
-            _shadowCascadeBuffers[frameIndex].Unmap(0);
+            // Swap current → previous for next frame
+            Array.Copy(_shadowVPMatrices, _prevShadowVPMatrices, CascadeCount);
         }
 
         private void EnsureShadowSceneConstantsBuffer()
@@ -363,8 +488,8 @@ namespace Freefall.Components
             // Aligned to 256 bytes = 512
             // SceneConstants: Time(4) + View(64) + Projection(64) + ViewProjection(64) + ViewInverse(64) + CameraInverse(64) = 324 bytes
             // Aligned to 256 bytes = 512.
-            // We need 4 slots, one for each cascade, so 512 * 4 = 2048 bytes.
-            int bufferSize = 512 * 4;
+            // We need CascadeCount slots, one for each cascade.
+            int bufferSize = 512 * MaxCascades;
             _shadowSceneConstantsBuffers = new ID3D12Resource[FrameCount];
             _shadowSceneConstantsPtrs = new IntPtr[FrameCount];
             
@@ -380,7 +505,7 @@ namespace Freefall.Components
             }
         }
 
-        private unsafe void UploadShadowSceneConstants(int frameIndex, int cascadeIndex, Matrix4x4 lightView, Matrix4x4 lightProj)
+         private unsafe void UploadShadowSceneConstants(int frameIndex, int cascadeIndex, Matrix4x4 lightView, Matrix4x4 lightProj)
         {
             // Layout matches SceneConstants cbuffer in common.fx (register b0):
             // float Time;                          offset 0,  size 4
@@ -404,5 +529,7 @@ namespace Freefall.Components
             *(Matrix4x4*)(ptr + 208) = viewInv;
             *(Matrix4x4*)(ptr + 272) = vpInv;
         }
+        
+
     }
 }

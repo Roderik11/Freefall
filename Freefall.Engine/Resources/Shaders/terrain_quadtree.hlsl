@@ -722,3 +722,184 @@ void CSBuildDrawArgs(uint3 dtid : SV_DispatchThreadID)
     argsBuffer.Store(8, 0u);                 // StartVertexLocation = 0
     argsBuffer.Store(12, 0u);                // StartInstanceLocation = 0
 }
+// ─────────────────────────────────────────────────────────────────────
+// Shadow cascade data (StructuredBuffer via push constant, shared with cull_instances.hlsl)
+// ─────────────────────────────────────────────────────────────────────
+struct CascadeData
+{
+    float4 Planes[6];           // frustum planes
+    row_major float4x4 VP;      // current frame VP
+    row_major float4x4 PrevVP;  // previous frame VP (for Hi-Z)
+    float4 SplitDistances;      // X=near, Y=far
+};
+
+#define CascadeBufferSRVIdx   Indices[7].w   // SRV: StructuredBuffer<CascadeData>
+
+// Shadow-specific push constant accessors
+uint GetCascadeIdxUAV()   { return Indices[2].y; } // Slot 9: cascadeIdx output UAV
+uint GetCascadeCount()    { return Indices[7].z; }  // Slot 30: number of active cascades
+
+// Test a bounding sphere against one cascade's 6 frustum planes
+bool IsCascadeVisible(float3 center, float radius, uint cascadeIdx)
+{
+    StructuredBuffer<CascadeData> cascades = ResourceDescriptorHeap[CascadeBufferSRVIdx];
+    CascadeData cascade = cascades[cascadeIdx];
+    [unroll]
+    for (uint i = 0; i < 6; i++)
+    {
+        float4 plane = cascade.Planes[i];
+        float dist = dot(plane.xyz, center) + plane.w;
+        if (dist > radius)
+            return false;
+    }
+    return true;
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Shadow Pass: Emit leaves with per-cascade frustum culling
+// For each leaf node, tests against each cascade's frustum individually.
+// Emits compact (patch, cascadeIdx) pairs — only entries that intersect
+// a cascade are written. Counter gives final instance count directly.
+// No Hi-Z culling for shadows.
+//
+// Additional push constants beyond normal CSEmitLeaves:
+//   Slot 9  (CascadeIdxUAV) = output cascadeIdx per entry (uint)
+//   Slot 30 (CascadeCount)  = number of active cascades
+// Cascade frustum planes bound at root slot 2 → register(b1).
+// ─────────────────────────────────────────────────────────────────────
+
+[numthreads(256, 1, 1)]
+void CSEmitLeavesShadow(uint3 dtid : SV_DispatchThreadID)
+{
+    uint nodeIndex = dtid.x;
+    uint totalNodes = GetTotalNodes();
+
+    if (nodeIndex >= totalNodes)
+        return;
+
+    uint maxDepth = GetMaxDepth();
+    float3 cameraPos = DecodeCameraPos();
+    float3 rootCenter = DecodeRootCenter();
+    float3 rootExtents = DecodeRootExtents();
+
+    // Decompose flat index into depth level and local index
+    uint localIdx;
+    uint depth = DecomposeIndex(nodeIndex, localIdx);
+
+    // Read split flags
+    RWByteAddressBuffer splitFlags = ResourceDescriptorHeap[GetSplitFlagsUAV()];
+    uint flatIdx = LevelStart(depth) + localIdx;
+    uint isSplit = splitFlags.Load(flatIdx * 4);
+
+    // A leaf is a node that is NOT split (and exists in the tree)
+    if (depth > 0)
+    {
+        uint parentLocal = localIdx >> 2;
+        uint parentFlat = LevelStart(depth - 1) + parentLocal;
+        uint parentSplit = splitFlags.Load(parentFlat * 4);
+        if (parentSplit == 0) return; // parent not split → this node doesn't exist
+    }
+
+    if (isSplit != 0 && depth < maxDepth)
+        return; // interior node, not a leaf
+
+    // Compute this node's bounds
+    float3 nodeCenter, nodeExtents;
+    ComputeNodeBounds(depth, localIdx, rootCenter, rootExtents, nodeCenter, nodeExtents);
+
+    // Tight bounding sphere from height range mip pyramid (already in world units)
+    float2 minmax = SampleHeightRange(depth, localIdx, maxDepth);
+    float xzRadius = length(float2(nodeExtents.x, nodeExtents.z));
+    float heightHalfRange = (minmax.y - minmax.x) * 0.5;
+    float sphereRadius = sqrt(xzRadius * xzRadius + heightHalfRange * heightHalfRange);
+    float sphereY = (minmax.x + minmax.y) * 0.5;
+    float3 sphereCenter = float3(nodeCenter.x, sphereY, nodeCenter.z);
+
+    // Test against each cascade frustum and emit per-cascade entries
+    // Planes are in terrain-local space (C# transforms them), sphere is also local
+    uint cascadeCount = GetCascadeCount();
+    uint maxPatches = GetMaxPatches();
+
+    RWByteAddressBuffer counterBuffer = ResourceDescriptorHeap[GetCounterUAV()];
+    RWStructuredBuffer<InstanceDescriptor> outDescriptors = ResourceDescriptorHeap[GetOutputDescriptorsUAV()];
+    RWStructuredBuffer<float4> outSpheres = ResourceDescriptorHeap[GetOutputSpheresUAV()];
+    RWStructuredBuffer<uint> outSubbatchIds = ResourceDescriptorHeap[GetOutputSubbatchIdsUAV()];
+    RWStructuredBuffer<TerrainPatchData> outTerrainData = ResourceDescriptorHeap[GetOutputTerrainDataUAV()];
+    RWStructuredBuffer<uint> outCascadeIdx = ResourceDescriptorHeap[GetCascadeIdxUAV()];
+
+    // Precompute shared patch data
+    uint transformSlot = GetTransformSlot();
+    uint materialId = GetMaterialId();
+    uint meshPartId = GetMeshPartId();
+
+    // Stitch mask (same as CSEmitLeaves)
+    uint ix, iz;
+    DecodeGridPos(depth, localIdx, ix, iz);
+    uint gridSize = 1u << depth;
+    uint stitchMask = 0;
+    if (depth > 0)
+    {
+        if (iz > 0)
+        {
+            uint nParentLocal = (EncodeLocalIdx(depth, ix, iz - 1)) >> 2;
+            uint nParentFlat = LevelStart(depth - 1) + nParentLocal;
+            if (splitFlags.Load(nParentFlat * 4) == 0) stitchMask |= 1u;
+        }
+        if (ix + 1 < gridSize)
+        {
+            uint nParentLocal = (EncodeLocalIdx(depth, ix + 1, iz)) >> 2;
+            uint nParentFlat = LevelStart(depth - 1) + nParentLocal;
+            if (splitFlags.Load(nParentFlat * 4) == 0) stitchMask |= 2u;
+        }
+        if (iz + 1 < gridSize)
+        {
+            uint nParentLocal = (EncodeLocalIdx(depth, ix, iz + 1)) >> 2;
+            uint nParentFlat = LevelStart(depth - 1) + nParentLocal;
+            if (splitFlags.Load(nParentFlat * 4) == 0) stitchMask |= 4u;
+        }
+        if (ix > 0)
+        {
+            uint nParentLocal = (EncodeLocalIdx(depth, ix - 1, iz)) >> 2;
+            uint nParentFlat = LevelStart(depth - 1) + nParentLocal;
+            if (splitFlags.Load(nParentFlat * 4) == 0) stitchMask |= 8u;
+        }
+    }
+
+    float4 patchRect = ComputeRectExact(depth, localIdx);
+
+    for (uint c = 0; c < cascadeCount; c++)
+    {
+        if (!IsCascadeVisible(sphereCenter, sphereRadius, c))
+            continue;
+
+        uint patchIdx;
+        counterBuffer.InterlockedAdd(0, 1, patchIdx);
+
+        if (patchIdx >= maxPatches)
+            return; // buffer full, stop entirely
+
+        // Write InstanceDescriptor
+        InstanceDescriptor desc;
+        desc.TransformSlot = transformSlot;
+        desc.MaterialId = materialId;
+        desc.CustomDataIdx = 0;
+        outDescriptors[patchIdx] = desc;
+
+        // Write BoundingSphere
+        outSpheres[patchIdx] = float4(sphereCenter, sphereRadius);
+
+        // Write SubbatchId
+        outSubbatchIds[patchIdx] = meshPartId;
+
+        // Write TerrainPatchData
+        TerrainPatchData patch;
+        patch.Rect = patchRect;
+        patch.Level = float2((float)depth, asfloat(stitchMask));
+        patch.Padding = float2(0, 0);
+        outTerrainData[patchIdx] = patch;
+
+        // Write cascade index for this entry
+        outCascadeIdx[patchIdx] = c;
+    }
+}
+

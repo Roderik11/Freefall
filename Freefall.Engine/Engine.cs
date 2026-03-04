@@ -374,5 +374,8 @@ namespace Freefall
          public int  DebugVisualizationMode { get; set; } = 0;              // F5 - Debug viz (0-4)
          public bool DisableHiZ { get; set; } = false;                       // F6 - Disable Hi-Z occlusion
          public System.Numerics.Matrix4x4 FrozenViewProjection { get; set; } // VP matrix when frustum frozen
+
+         [ValueRange(3, 8)]
+         public int  ShadowCascadeCount { get; set; } = 4;                   // Number of shadow cascades
     }
 }

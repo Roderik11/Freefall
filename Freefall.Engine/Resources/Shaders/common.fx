@@ -50,6 +50,16 @@ inline MaterialData GetMaterial(uint id)
 }
 #define GET_MATERIAL(id) GetMaterial(id)
 
+// Shadow cascade data — shared by all shadow-related shaders
+// Stride must match C# GPUCuller.CascadeData exactly (240 bytes)
+struct CascadeData
+{
+    float4 Planes[6];           // frustum planes (96 bytes)
+    row_major float4x4 VP;      // current frame VP (64 bytes)
+    row_major float4x4 PrevVP;  // previous frame VP for Hi-Z (64 bytes)
+    float4 SplitDistances;      // X=near, Y=far (16 bytes)
+};
+
 float3 FOG(float3 color, float depth)
 {
     float3 fogColor = float3(0.5f, 0.6f, 0.7f);

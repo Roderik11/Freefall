@@ -278,28 +278,43 @@ FragmentOutput PS(VertexOutput input)
     return output;
 }
 
-// Shadow pass: depth-only, apply height displacement
+// Shadow pass — single-pass multi-cascade via per-cascade compute culling.
+// CSEmitLeavesShadow emits compact (patch, cascadeIdx) pairs.
+// VS_Shadow reads cascadeIdx from a per-entry buffer. instanceID = patchIdx directly.
+
+
+// Push constants for shadow pass
+#define CascadeBufferSRVIdx  GET_INDEX(20) // SRV: StructuredBuffer<CascadeData>
+#define ShadowCascadeCount   GET_INDEX(21) // uint: number of cascades
+#define CascadeIdxBufIdx     GET_INDEX(22) // SRV: per-entry cascade index (uint)
+
 struct ShadowVSOutput
 {
     float4 Position : SV_POSITION;
+    nointerpolation uint RTIndex : SV_RenderTargetArrayIndex;
 };
 
 ShadowVSOutput VS_Shadow(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_InstanceID)
 {
     ShadowVSOutput output;
+    output.Position = float4(0, 0, 0, 1);
+    output.RTIndex = 0;
 
-    // Direct access — terrain self-draws, no culler indirection needed.
-    uint idx = instanceID;
+    uint patchIdx = instanceID; // direct 1:1 mapping
 
+    // Read cascade index from per-entry buffer
+    StructuredBuffer<uint> cascadeIndices = ResourceDescriptorHeap[CascadeIdxBufIdx];
+    uint cascadeIdx = cascadeIndices[patchIdx];
+
+    // Patch data lookup (same as opaque VS)
     StructuredBuffer<InstanceDescriptor> descriptors = ResourceDescriptorHeap[DescriptorBufIdx];
     StructuredBuffer<row_major matrix> globalTransforms = ResourceDescriptorHeap[GlobalTransformBufferIdx];
-    uint slot = descriptors[idx].TransformSlot;
+    uint slot = descriptors[patchIdx].TransformSlot;
     row_major matrix entityWorld = globalTransforms[slot];
 
     StructuredBuffer<TerrainPatchData> terrainData = ResourceDescriptorHeap[TerrainDataIdx];
-    TerrainPatchData patch = terrainData[idx];
+    TerrainPatchData patch = terrainData[patchIdx];
 
-    // Compute world from rect
     row_major matrix world = ComputePatchWorld(patch, entityWorld);
 
     StructuredBuffer<uint> indices = ResourceDescriptorHeap[IndexBufferIdx];
@@ -315,9 +330,11 @@ ShadowVSOutput VS_Shadow(uint primitiveVertexID : SV_VertexID, uint instanceID :
     float3 stitchedPos = StitchVertex(pos, rect.xy, rectSize, stitchMask, entityWorld, heightUV);
 
     float4 worldPosition = mul(float4(stitchedPos, 1), world);
-    worldPosition = mul(worldPosition, ViewProjection);
 
-    output.Position = worldPosition;
+    // Project using cascade-specific VP from cascade buffer
+    StructuredBuffer<CascadeData> cascades = ResourceDescriptorHeap[CascadeBufferSRVIdx];
+    output.Position = mul(worldPosition, cascades[cascadeIdx].VP);
+    output.RTIndex = cascadeIdx;
     return output;
 }
 
@@ -338,5 +355,9 @@ technique11 GPUTerrain
     pass Shadow
     {
         SetVertexShader(CompileShader(vs_6_6, VS_Shadow()));
+        SetPixelShader(CompileShader(ps_6_6, PS_Shadow()));
     }
 }
+
+// Minimal depth-only PS — required for SV_RenderTargetArrayIndex propagation
+void PS_Shadow(ShadowVSOutput input) { }

@@ -32,6 +32,8 @@ namespace Freefall.Assets
 
         public float DecorationRadius = 100f;
 
+        public bool DrawDetail = true;
+
         [JsonIgnore] public int DecorationVersion { get; private set; }
         public void InvalidateDecorations() => DecorationVersion++;
 

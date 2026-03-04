@@ -2,6 +2,7 @@ using System;
 using System.Numerics;
 using Vortice.Direct3D12;
 using Vortice.Mathematics;
+using Freefall.Components;
 
 namespace Freefall.Graphics
 {
@@ -14,7 +15,7 @@ namespace Freefall.Graphics
     {
         public const int FrameCount = 3;
         private const int MaxSubBatches = 4096;
-        private const int ShadowCascadeCount = 4;
+        private const int MaxShadowCascades = 4; // Array capacity; active count from Engine.Settings.ShadowCascadeCount
 
         private int _capacity;
         private bool _cullerInitialized;
@@ -47,20 +48,20 @@ namespace Freefall.Graphics
         private ID3D12DescriptorHeap? _cpuHeap;
 
         // Shadow cascade buffers
-        private ID3D12Resource[,] _shadowVisibilityBuffers = new ID3D12Resource[FrameCount, ShadowCascadeCount];
-        private uint[,] _shadowVisibilityUAVIndices = new uint[FrameCount, ShadowCascadeCount];
-        private ID3D12Resource[,] _shadowVisibleIndicesBuffers = new ID3D12Resource[FrameCount, ShadowCascadeCount];
-        private uint[,] _shadowVisibleIndicesUAVIndices = new uint[FrameCount, ShadowCascadeCount];
-        private uint[,] _shadowVisibleIndicesSRVIndices = new uint[FrameCount, ShadowCascadeCount];
-        private ID3D12Resource[,] _shadowCommandBuffers = new ID3D12Resource[FrameCount, ShadowCascadeCount];
-        private uint[,] _shadowCommandUAVIndices = new uint[FrameCount, ShadowCascadeCount];
-        private ID3D12Resource[,] _shadowCounterBuffers = new ID3D12Resource[FrameCount, ShadowCascadeCount];
-        private uint[,] _shadowCounterUAVIndices = new uint[FrameCount, ShadowCascadeCount];
-        private ID3D12Resource[,] _shadowHistogramBuffers = new ID3D12Resource[FrameCount, ShadowCascadeCount];
-        private uint[,] _shadowHistogramUAVIndices = new uint[FrameCount, ShadowCascadeCount];
-        private CpuDescriptorHandle[,] _shadowCounterCPUHandles = new CpuDescriptorHandle[FrameCount, ShadowCascadeCount];
-        private CpuDescriptorHandle[,] _shadowVisibleIndicesCPUHandles = new CpuDescriptorHandle[FrameCount, ShadowCascadeCount];
-        private CpuDescriptorHandle[,] _shadowHistogramCPUHandles = new CpuDescriptorHandle[FrameCount, ShadowCascadeCount];
+        private ID3D12Resource[,] _shadowVisibilityBuffers = new ID3D12Resource[FrameCount, MaxShadowCascades];
+        private uint[,] _shadowVisibilityUAVIndices = new uint[FrameCount, MaxShadowCascades];
+        private ID3D12Resource[,] _shadowVisibleIndicesBuffers = new ID3D12Resource[FrameCount, MaxShadowCascades];
+        private uint[,] _shadowVisibleIndicesUAVIndices = new uint[FrameCount, MaxShadowCascades];
+        private uint[,] _shadowVisibleIndicesSRVIndices = new uint[FrameCount, MaxShadowCascades];
+        private ID3D12Resource[,] _shadowCommandBuffers = new ID3D12Resource[FrameCount, MaxShadowCascades];
+        private uint[,] _shadowCommandUAVIndices = new uint[FrameCount, MaxShadowCascades];
+        private ID3D12Resource[,] _shadowCounterBuffers = new ID3D12Resource[FrameCount, MaxShadowCascades];
+        private uint[,] _shadowCounterUAVIndices = new uint[FrameCount, MaxShadowCascades];
+        private ID3D12Resource[,] _shadowHistogramBuffers = new ID3D12Resource[FrameCount, MaxShadowCascades];
+        private uint[,] _shadowHistogramUAVIndices = new uint[FrameCount, MaxShadowCascades];
+        private CpuDescriptorHandle[,] _shadowCounterCPUHandles = new CpuDescriptorHandle[FrameCount, MaxShadowCascades];
+        private CpuDescriptorHandle[,] _shadowVisibleIndicesCPUHandles = new CpuDescriptorHandle[FrameCount, MaxShadowCascades];
+        private CpuDescriptorHandle[,] _shadowHistogramCPUHandles = new CpuDescriptorHandle[FrameCount, MaxShadowCascades];
         private ID3D12DescriptorHeap? _shadowCpuHeap;
 
         // Cached array
@@ -190,6 +191,7 @@ namespace Freefall.Graphics
             commandList.SetComputeRoot32BitConstant(0, MeshRegistry.SrvIndex, 0);
             commandList.SetComputeRoot32BitConstant(0, _gpuCommandUAVIndices[f], 1);
             commandList.SetComputeRoot32BitConstant(0, SceneBuffers.BoundingSphereSrvIndex, 2);   // was per-instance buffer
+            commandList.SetComputeRoot32BitConstant(0, 1u, 3);  // InstanceMultiplier = 1 (shadow sets 4; must reset)
             commandList.SetComputeRoot32BitConstant(0, SceneBuffers.DescriptorSrvIndex, 4);        // was per-instance buffer
             commandList.SetComputeRoot32BitConstant(0, _visibleIndicesUAVIndices[f], 5);
             commandList.SetComputeRoot32BitConstant(0, _counterBufferUAVIndices[f], 6);
@@ -304,7 +306,7 @@ namespace Freefall.Graphics
             int commandSize = MaxSubBatches * IndirectDrawSizes.IndirectCommandSize;
             int histogramSize = MeshRegistry.MaxMeshParts * sizeof(uint);
 
-            int totalDescs = FrameCount * ShadowCascadeCount * 3;
+            int totalDescs = FrameCount * MaxShadowCascades * 3;
             var cpuHeapDesc = new DescriptorHeapDescription
             {
                 Type = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView,
@@ -318,7 +320,7 @@ namespace Freefall.Graphics
 
             for (int f = 0; f < FrameCount; f++)
             {
-                for (int c = 0; c < ShadowCascadeCount; c++)
+                for (int c = 0; c < MaxShadowCascades; c++)
                 {
                     // Visibility flags
                     _shadowVisibilityBuffers[f, c] = device.CreateDefaultBuffer(instanceBufSize);
@@ -390,9 +392,9 @@ namespace Freefall.Graphics
         }
 
         /// <summary>
-        /// Cull all 4 shadow cascades with unified visibility pass.
+        /// Cull all shadow cascades with unified visibility pass.
         /// </summary>
-        public void CullShadowAll(ID3D12GraphicsCommandList commandList, ulong shadowCascadeBufferAddress, GPUCuller? culler)
+        public void CullShadowAll(ID3D12GraphicsCommandList commandList, uint cascadeBufferSrv, GPUCuller? culler)
         {
             int totalInstances = SceneBuffers.ActiveSlotCount;
             int subBatchCount = MeshRegistry.Count;
@@ -408,7 +410,6 @@ namespace Freefall.Graphics
             commandList.SetComputeRootSignature(device.GlobalRootSignature);
             _cachedSrvHeapArray ??= new[] { device.SrvHeap };
             commandList.SetDescriptorHeaps(1, _cachedSrvHeapArray);
-            commandList.SetComputeRootConstantBufferView(2, shadowCascadeBufferAddress);
 
             // Push constants shared across all passes — SceneBuffers SRVs
             commandList.SetComputeRoot32BitConstant(0, MeshRegistry.SrvIndex, 0);
@@ -420,12 +421,11 @@ namespace Freefall.Graphics
             commandList.SetComputeRoot32BitConstant(0, SceneBuffers.MeshPartIdSrvIndex, 23);
             commandList.SetComputeRoot32BitConstant(0, Material.MaterialsBufferIndex, 25);
             commandList.SetComputeRoot32BitConstant(0, (uint)MeshRegistry.Count, 27);
+            commandList.SetComputeRoot32BitConstant(0, cascadeBufferSrv, 31);                         // CascadeBufferSRVIdx
 
             // Phase 1: Unified visibility (all 4 cascades)
-            commandList.SetComputeRoot32BitConstant(0, _shadowVisibilityUAVIndices[f, 0], 24);
-            commandList.SetComputeRoot32BitConstant(0, _shadowVisibilityUAVIndices[f, 1], 28);
-            commandList.SetComputeRoot32BitConstant(0, _shadowVisibilityUAVIndices[f, 2], 29);
-            commandList.SetComputeRoot32BitConstant(0, _shadowVisibilityUAVIndices[f, 3], 31);
+            commandList.SetComputeRoot32BitConstant(0, _shadowVisibilityUAVIndices[f, 0], 24);        // CombinedShadowVisIdx
+            commandList.SetComputeRoot32BitConstant(0, _shadowVisibilityUAVIndices[f, 0], 28);        // CascadeMaskUAVIdx
 
             commandList.SetPipelineState(culler.VisibilityShadow4PSO);
             commandList.Dispatch((uint)((totalInstances + 255) / 256), 1, 1);
@@ -438,7 +438,7 @@ namespace Freefall.Graphics
             });
 
             // Phase 2: Per-cascade Histogram → PrefixSum → Scatter → Main
-            for (int c = 0; c < ShadowCascadeCount; c++)
+            for (int c = 0; c < DirectionalLight.CascadeCount; c++)
             {
                 // Clear per-cascade buffers
                 commandList.ClearUnorderedAccessViewUint(
@@ -503,7 +503,7 @@ namespace Freefall.Graphics
         {
             int f = Engine.FrameIndex % FrameCount;
             int subBatchCount = MeshRegistry.Count;
-            if (!_shadowCullerInitialized || subBatchCount == 0 || cascadeIndex < 0 || cascadeIndex >= ShadowCascadeCount)
+            if (!_shadowCullerInitialized || subBatchCount == 0 || cascadeIndex < 0 || cascadeIndex >= DirectionalLight.CascadeCount)
                 return;
 
             var commandBuffer = _shadowCommandBuffers[f, cascadeIndex];
@@ -549,7 +549,7 @@ namespace Freefall.Graphics
             // Shadow culler
             for (int f = 0; f < FrameCount; f++)
             {
-                for (int c = 0; c < ShadowCascadeCount; c++)
+                for (int c = 0; c < MaxShadowCascades; c++)
                 {
                     _shadowVisibilityBuffers[f, c]?.Dispose();
                     _shadowVisibleIndicesBuffers[f, c]?.Dispose();

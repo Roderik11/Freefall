@@ -239,7 +239,7 @@ namespace Freefall.Graphics
             _noisePSO = _device.CreateComputePipelineState(noiseShader.Bytecode);
             noiseShader.Dispose();
 
-            Debug.Log("OceanFFT", "All compute shaders compiled");
+            //Debug.Log("OceanFFT", "All compute shaders compiled");
         }
 
         private void CreateTextures()
@@ -475,7 +475,8 @@ namespace Freefall.Graphics
         public void InitSpectrum(ID3D12GraphicsCommandList cmd)
         {
             if (!_initialized) return;
-
+            if(_spectrumInitialized) return;
+            
             UpdateConstants(0, 0);
 
             uint groups = (uint)((N + 7) / 8);
@@ -497,7 +498,7 @@ namespace Freefall.Graphics
             cmd.ResourceBarrierUnorderedAccessView(_initialSpectrumTex!);
 
             _spectrumInitialized = true;
-            Debug.Log("OceanFFT", "Spectrum initialized");
+            //Debug.Log("OceanFFT", "Spectrum initialized");
         }
 
         /// <summary>

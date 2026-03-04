@@ -93,49 +93,60 @@ struct PSOutput
     float  Depth : SV_Target3;
 };
 
+// Shadow pass - push constants for single-pass multi-cascade rendering
+#define ExpansionBufferIdx   GET_INDEX(20) // SRV: expansion buffer (cascadeIdx<<30 | instanceIdx)
+#define CascadeBufferSRVIdx  GET_INDEX(21) // SRV: StructuredBuffer<CascadeData>
+
+
 // Shadow pass - minimal output structure
 struct ShadowVSOutput
 {
     float4 Position : SV_POSITION;
     float2 TexCoord : TEXCOORD0;
     nointerpolation uint MaterialID : TEXCOORD1;
+    nointerpolation uint RTIndex : SV_RenderTargetArrayIndex;
 };
 
 SamplerState Sampler : register(s0);
 
-// Shadow vertex shader - minimal output for depth-only rendering
+// Shadow vertex shader - single-pass multi-cascade via expansion buffer
+// Each instanceID maps to exactly one (instance, cascade) pair from the expansion buffer.
+// No cascade mask check needed — expansion only contains visible pairs.
 ShadowVSOutput VS_Shadow(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_InstanceID)
 {
     ShadowVSOutput output;
+    output.Position = float4(0, 0, 0, 1);
+    output.TexCoord = float2(0, 0);
+    output.MaterialID = 0;
+    output.RTIndex = 0;
+
+    // Read expansion entry: bits 30-31 = cascadeIdx, bits 0-29 = instance index
+    StructuredBuffer<uint> expansion = ResourceDescriptorHeap[ExpansionBufferIdx];
+    uint entry = expansion[InstanceBaseOffset + instanceID];
+    uint cascadeIdx = entry >> 30;
+    uint idx = entry & 0x3FFFFFFFu;
+    output.RTIndex = cascadeIdx;
 
     StructuredBuffer<row_major matrix> globalTransforms = ResourceDescriptorHeap[GlobalTransformBufferIdx];
-    StructuredBuffer<uint> sortedIndices = ResourceDescriptorHeap[SortedIndicesIdx];
-    
     StructuredBuffer<uint> indices = ResourceDescriptorHeap[IndexBufferIdx];
     uint vertexID = indices[primitiveVertexID + BaseIndex];
-    
+
     StructuredBuffer<float3> positions = ResourceDescriptorHeap[PosBufferIdx];
     StructuredBuffer<float2> uvs = ResourceDescriptorHeap[UVBufferIdx];
-    
-    uint dataPos = InstanceBaseOffset + instanceID;
-    uint packedIdx = sortedIndices[dataPos];
-    uint idx = packedIdx & 0x7FFFFFFFu;
-    
-    // Double-indirect: use original instance index to look up per-instance data
+
     StructuredBuffer<InstanceDescriptor> descriptors = ResourceDescriptorHeap[DescriptorBufIdx];
     InstanceDescriptor desc = descriptors[idx];
-    uint slot = desc.TransformSlot;
-    row_major matrix World = globalTransforms[slot];
-    uint materialID = desc.MaterialId;
-    
+    row_major matrix World = globalTransforms[desc.TransformSlot];
+
     float3 pos = positions[vertexID];
-    float2 uv = uvs[vertexID];
-    
     float4 worldPos = mul(float4(pos, 1.0f), World);
-    output.Position = mul(mul(worldPos, View), Projection);
-    output.TexCoord = uv;
+
+    // Project using cascade-specific VP from shared CascadeData buffer
+    StructuredBuffer<CascadeData> cascades = ResourceDescriptorHeap[CascadeBufferSRVIdx];
+    output.Position = mul(worldPos, cascades[cascadeIdx].VP);
+    output.TexCoord = uvs[vertexID];
     output.TexCoord.y = 1 - output.TexCoord.y;
-    output.MaterialID = materialID;
+    output.MaterialID = desc.MaterialId;
     return output;
 }
 

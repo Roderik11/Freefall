@@ -54,6 +54,38 @@ namespace Freefall.Components
         private ID3D12Resource[] _splitFlagsBuffers = new ID3D12Resource[FrameCount];
         private ID3D12Resource[] _indirectArgsBuffers = new ID3D12Resource[FrameCount];
         private uint[] _indirectArgsUAVs = new uint[FrameCount];
+        private uint[] _indirectArgsSRVs = new uint[FrameCount];
+
+        // Shadow indirect args (16 bytes: 4 DrawInstanced uints)
+        private ID3D12Resource[] _shadowArgsBuffers = new ID3D12Resource[FrameCount];
+        private uint[] _shadowArgsUAVs = new uint[FrameCount];
+        private bool[] _shadowArgsInArgState = new bool[FrameCount];
+        private ID3D12PipelineState? _emitLeavesShadowPSO;
+
+        // Shadow emit output buffers (CSEmitLeavesShadow with per-cascade frustum culling)
+        private ID3D12Resource[] _shadowDescriptorBuffers = new ID3D12Resource[FrameCount];
+        private uint[] _shadowDescriptorUAVs = new uint[FrameCount];
+        private uint[] _shadowDescriptorSRVs = new uint[FrameCount];
+        private ID3D12Resource[] _shadowTerrainDataBuffers = new ID3D12Resource[FrameCount];
+        private uint[] _shadowTerrainDataUAVs = new uint[FrameCount];
+        private uint[] _shadowTerrainDataSRVs = new uint[FrameCount];
+        private ID3D12Resource[] _shadowSphereBuffers = new ID3D12Resource[FrameCount];
+        private uint[] _shadowSphereUAVs = new uint[FrameCount];
+        private ID3D12Resource[] _shadowSubbatchIdBuffers = new ID3D12Resource[FrameCount];
+        private uint[] _shadowSubbatchIdUAVs = new uint[FrameCount];
+        private ID3D12Resource[] _shadowCounterBuffers = new ID3D12Resource[FrameCount];
+        private uint[] _shadowCounterUAVs = new uint[FrameCount];
+        private CpuDescriptorHandle[] _shadowCounterCPUHandles = new CpuDescriptorHandle[FrameCount];
+        private ID3D12Resource[] _shadowCascadeIdxBuffers = new ID3D12Resource[FrameCount];
+        private uint[] _shadowCascadeIdxUAVs = new uint[FrameCount];
+        private uint[] _shadowCascadeIdxSRVs = new uint[FrameCount];
+        private bool[] _shadowBuffersInSRV = new bool[FrameCount];
+        private ID3D12Resource[] _shadowCascadeBuffers = new ID3D12Resource[FrameCount]; // StructuredBuffer<CascadeData> (local-space planes)
+        private IntPtr[] _shadowCascadeBufferPtrs = new IntPtr[FrameCount];
+        private uint[] _shadowCascadeBufferSrvs = new uint[FrameCount];
+        private ID3D12Resource? _shadowCounterReadback;
+        private ID3D12Resource? _shadowArgsReadback;
+        private int _shadowReadbackFrame = -1;
         
         // Frustum + Hi-Z constant buffers per frame (for compute shader culling)
         private ID3D12Resource[] _frustumConstantBuffers = new ID3D12Resource[FrameCount];
@@ -205,18 +237,11 @@ namespace Freefall.Components
             // Enqueue self-draw action: terrain draws itself via ExecuteIndirect
             CommandBuffer.Enqueue(RenderPass.Opaque, (list) => self.DrawTerrain(list, fi));
 
-            // Enqueue ground coverage decorator if configured
-            if (!_decoratorBuffersBuilt)
-            {
-                var msg = $"[TerrainRenderer] Decorator check: decos={Terrain.Decorations.Count} " +
-                    $"effect={DecoratorMaterial?.Effect != null} " +
-                    $"mesh0={Terrain.Decorations.FirstOrDefault()?.Mesh?.Name} " +
-                    $"mesh0.Mesh={Terrain.Decorations.FirstOrDefault()?.Mesh?.Mesh != null}";
-                Debug.Log(msg);
-                System.IO.File.AppendAllText(@"d:\Projects\2026\Freefall\.tmp\grass_diag.log", msg + "\n");
-            }
+            // Enqueue single-pass terrain shadow draw
+            CommandBuffer.Enqueue(RenderPass.Shadow, (list) => self.DrawTerrainShadow(list, fi));
 
-            if (Terrain.Decorations.Count > 0 && DecoratorMaterial?.Effect != null)
+            // Enqueue ground coverage decorator if configured
+            if (Terrain.DrawDetail && Terrain.Decorations.Count > 0 && DecoratorMaterial?.Effect != null)
             {
                 // Structural hash: only mesh names and count (triggers buffer rebuild)
                 int structHash = Terrain.Decorations.Count;
@@ -280,6 +305,11 @@ namespace Freefall.Components
             _buildDrawArgsPSO = device.CreateComputePipelineState(buildDrawArgsShader.Bytecode);
             buildDrawArgsShader.Dispose();
 
+            // Shadow: Per-cascade emit with frustum culling
+            var emitShadowShader = new Shader(source, "CSEmitLeavesShadow", "cs_6_6");
+            _emitLeavesShadowPSO = device.CreateComputePipelineState(emitShadowShader.Bytecode);
+            emitShadowShader.Dispose();
+
             // One-time: Build height range mip pyramid
             var buildMinMaxMipShader = new Shader(source, "CSBuildMinMaxMip", "cs_6_6");
             _buildMinMaxMipPSO = device.CreateComputePipelineState(buildMinMaxMipShader.Bytecode);
@@ -289,7 +319,7 @@ namespace Freefall.Components
             var cpuHeapDesc = new DescriptorHeapDescription
             {
                 Type = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView,
-                DescriptorCount = (uint)(FrameCount * 2), // counter + splitFlags per frame
+                DescriptorCount = (uint)(FrameCount * 3), // counter + splitFlags + shadowCounter per frame
                 Flags = DescriptorHeapFlags.None
             };
             _cpuHeap = device.NativeDevice.CreateDescriptorHeap(cpuHeapDesc);
@@ -303,8 +333,21 @@ namespace Freefall.Components
 
             // Create frustum constant buffers (for compute shader Hi-Z culling)
             int frustumCBSize = Marshal.SizeOf<GPUCuller.FrustumConstants>();
+            int cascadeDataSize = Marshal.SizeOf<GPUCuller.CascadeData>();
+            int cascadeBufferSize = cascadeDataSize * DirectionalLight.MaxCascades;
             for (int i = 0; i < FrameCount; i++)
+            {
                 _frustumConstantBuffers[i] = device.CreateUploadBuffer(frustumCBSize);
+                _shadowCascadeBuffers[i] = device.CreateUploadBuffer(cascadeBufferSize);
+                _shadowCascadeBufferSrvs[i] = device.AllocateBindlessIndex();
+                device.CreateStructuredBufferSRV(_shadowCascadeBuffers[i], (uint)DirectionalLight.MaxCascades, (uint)cascadeDataSize, _shadowCascadeBufferSrvs[i]);
+                unsafe
+                {
+                    void* pData;
+                    _shadowCascadeBuffers[i].Map(0, null, &pData);
+                    _shadowCascadeBufferPtrs[i] = (IntPtr)pData;
+                }
+            }
 
             // Create height range mip pyramid texture
             CreateHeightRangePyramid(device);
@@ -380,6 +423,78 @@ namespace Freefall.Components
             };
             device.NativeDevice.CreateUnorderedAccessView(
                 _indirectArgsBuffers[i], null, argsUavDesc, device.GetCpuHandle(_indirectArgsUAVs[i]));
+            _indirectArgsSRVs[i] = device.AllocateBindlessIndex();
+            var argsSrvDesc = new ShaderResourceViewDescription
+            {
+                Format = Format.R32_Typeless,
+                ViewDimension = Vortice.Direct3D12.ShaderResourceViewDimension.Buffer,
+                Shader4ComponentMapping = ShaderComponentMapping.Default,
+                Buffer = new BufferShaderResourceView
+                {
+                    FirstElement = 0,
+                    NumElements = 4,
+                    Flags = BufferShaderResourceViewFlags.Raw,
+                }
+            };
+            device.NativeDevice.CreateShaderResourceView(
+                _indirectArgsBuffers[i], argsSrvDesc, device.GetCpuHandle(_indirectArgsSRVs[i]));
+
+            // Shadow indirect args buffer: 16 bytes (4 DrawInstanced uints)
+            _shadowArgsBuffers[i] = device.CreateDefaultBuffer(16);
+            _shadowArgsUAVs[i] = device.AllocateBindlessIndex();
+            var shadowArgsUavDesc = new UnorderedAccessViewDescription
+            {
+                Format = Format.R32_Typeless,
+                ViewDimension = UnorderedAccessViewDimension.Buffer,
+                Buffer = new BufferUnorderedAccessView
+                {
+                    FirstElement = 0,
+                    NumElements = 4,
+                    Flags = BufferUnorderedAccessViewFlags.Raw,
+                }
+            };
+            device.NativeDevice.CreateUnorderedAccessView(
+                _shadowArgsBuffers[i], null, shadowArgsUavDesc, device.GetCpuHandle(_shadowArgsUAVs[i]));
+
+            // ── Shadow emit output buffers ──
+            // Sized for MaxPatches * MaxCascades entries (per-cascade compacted output)
+            int shadowCapacity = MaxPatches * DirectionalLight.CascadeCount;
+
+            _shadowDescriptorBuffers[i] = device.CreateDefaultBuffer(shadowCapacity * 12);
+            _shadowDescriptorUAVs[i] = device.AllocateBindlessIndex();
+            device.CreateStructuredBufferUAV(_shadowDescriptorBuffers[i], (uint)shadowCapacity, 12, _shadowDescriptorUAVs[i]);
+            _shadowDescriptorSRVs[i] = device.AllocateBindlessIndex();
+            device.CreateStructuredBufferSRV(_shadowDescriptorBuffers[i], (uint)shadowCapacity, 12, _shadowDescriptorSRVs[i]);
+
+            _shadowTerrainDataBuffers[i] = device.CreateDefaultBuffer(shadowCapacity * 32);
+            _shadowTerrainDataUAVs[i] = device.AllocateBindlessIndex();
+            device.CreateStructuredBufferUAV(_shadowTerrainDataBuffers[i], (uint)shadowCapacity, 32, _shadowTerrainDataUAVs[i]);
+            _shadowTerrainDataSRVs[i] = device.AllocateBindlessIndex();
+            device.CreateStructuredBufferSRV(_shadowTerrainDataBuffers[i], (uint)shadowCapacity, 32, _shadowTerrainDataSRVs[i]);
+
+            _shadowSphereBuffers[i] = device.CreateDefaultBuffer(shadowCapacity * 16);
+            _shadowSphereUAVs[i] = device.AllocateBindlessIndex();
+            device.CreateStructuredBufferUAV(_shadowSphereBuffers[i], (uint)shadowCapacity, 16, _shadowSphereUAVs[i]);
+
+            _shadowSubbatchIdBuffers[i] = device.CreateDefaultBuffer(shadowCapacity * 4);
+            _shadowSubbatchIdUAVs[i] = device.AllocateBindlessIndex();
+            device.CreateStructuredBufferUAV(_shadowSubbatchIdBuffers[i], (uint)shadowCapacity, 4, _shadowSubbatchIdUAVs[i]);
+
+            // CascadeIdx: uint per entry
+            _shadowCascadeIdxBuffers[i] = device.CreateDefaultBuffer(shadowCapacity * 4);
+            _shadowCascadeIdxUAVs[i] = device.AllocateBindlessIndex();
+            device.CreateStructuredBufferUAV(_shadowCascadeIdxBuffers[i], (uint)shadowCapacity, 4, _shadowCascadeIdxUAVs[i]);
+            _shadowCascadeIdxSRVs[i] = device.AllocateBindlessIndex();
+            device.CreateStructuredBufferSRV(_shadowCascadeIdxBuffers[i], (uint)shadowCapacity, 4, _shadowCascadeIdxSRVs[i]);
+
+            _shadowCounterBuffers[i] = device.CreateDefaultBuffer(4);
+            _shadowCounterUAVs[i] = device.AllocateBindlessIndex();
+            device.NativeDevice.CreateUnorderedAccessView(
+                _shadowCounterBuffers[i], null, rawUavDesc, device.GetCpuHandle(_shadowCounterUAVs[i]));
+            var shadowCounterCpuHandle = _cpuHeap.GetCPUDescriptorHandleForHeapStart() + ((int)((FrameCount * 2 + i) * incSize));
+            device.NativeDevice.CreateUnorderedAccessView(
+                _shadowCounterBuffers[i], null, rawUavDesc, shadowCounterCpuHandle);
+            _shadowCounterCPUHandles[i] = shadowCounterCpuHandle;
 
             // SplitFlags buffer: 1 uint per node for atomic writes
             uint splitFlagsSize = (uint)(_totalNodes * 4);
@@ -564,16 +679,16 @@ namespace Freefall.Components
             // UAV barrier — indirect args must be visible before ExecuteIndirect
             commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(null)));
 
+            // Transition indirect args buffer for ExecuteIndirect
+            commandList.ResourceBarrier(new ResourceBarrier(new ResourceTransitionBarrier(_indirectArgsBuffers[frameIndex], ResourceStates.UnorderedAccess, ResourceStates.IndirectArgument)));
+            _indirectArgsInArgState[frameIndex] = true;
+
             // Transition output buffers from UAV to SRV for vertex shader reads
             commandList.ResourceBarrier(new ResourceBarrier(new ResourceTransitionBarrier(_descriptorBuffers[frameIndex], ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource)));
             commandList.ResourceBarrier(new ResourceBarrier(new ResourceTransitionBarrier(_sphereBuffers[frameIndex], ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource)));
             commandList.ResourceBarrier(new ResourceBarrier(new ResourceTransitionBarrier(_subbatchIdBuffers[frameIndex], ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource)));
             commandList.ResourceBarrier(new ResourceBarrier(new ResourceTransitionBarrier(_terrainDataBuffers[frameIndex], ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource)));
             _buffersInSRV[frameIndex] = true;
-
-            // Transition indirect args buffer for ExecuteIndirect
-            commandList.ResourceBarrier(new ResourceBarrier(new ResourceTransitionBarrier(_indirectArgsBuffers[frameIndex], ResourceStates.UnorderedAccess, ResourceStates.IndirectArgument)));
-            _indirectArgsInArgState[frameIndex] = true;
 
             // Store VP for next frame's Hi-Z occlusion projection
             _previousFrameViewProjection = Camera.Main.ViewProjection;
@@ -588,7 +703,9 @@ namespace Freefall.Components
         {
             var device = Engine.Device;
 
-            // Apply material PSO and textures
+            // Apply material PSO and textures (explicitly set Opaque pass in case shadow changed it)
+            Material!.SetPass(RenderPass.Shadow); // reset to first pass — Opaque
+            Material!.SetPass(RenderPass.Opaque);
             Material!.Apply(commandList, device);
 
             // Set topology
@@ -619,6 +736,187 @@ namespace Freefall.Components
                 device.DrawInstancedSignature,
                 1,
                 _indirectArgsBuffers[frameIndex],
+                0,
+                null,
+                0);
+        }
+
+        /// <summary>
+        /// Single-pass shadow render: dispatches CSEmitLeavesShadow with per-cascade frustum
+        /// culling, builds draw args from compacted counter, then ExecuteIndirect.
+        /// VS_Shadow reads cascadeIdx from per-entry buffer — no instance expansion.
+        /// Called as a custom action during RenderPass.Shadow.
+        /// </summary>
+        private unsafe void DrawTerrainShadow(ID3D12GraphicsCommandList commandList, int frameIndex)
+        {
+            if (Material == null || !_computeInitialized) return;
+
+            var device = Engine.Device;
+            var allPlanes = DirectionalLight.GetAllCascadeFrustumPlanes();
+            if (allPlanes == null) return;
+            // Skip outermost cascade for terrain shadows (perf: outer cascade is most expensive)
+            int cascadeCount = Math.Max(1, DirectionalLight.CascadeCount - 1);
+
+            // ════════════════════════════════════════════════════════════════
+            // Phase 1: CSEmitLeavesShadow — per-cascade frustum culling
+            // ════════════════════════════════════════════════════════════════
+
+            // Upload local-space cascade planes to StructuredBuffer<CascadeData>
+            var terrainPos = Transform.Position;
+            GPUCuller.CascadeData* cascadePtr = (GPUCuller.CascadeData*)_shadowCascadeBufferPtrs[frameIndex];
+            for (int c = 0; c < cascadeCount; c++)
+            {
+                var localPlanes = new Vector4[6];
+                for (int p = 0; p < 6; p++)
+                {
+                    var plane = allPlanes[c][p];
+                    var n = new Vector3(plane.X, plane.Y, plane.Z);
+                    plane.W += Vector3.Dot(n, terrainPos);
+                    localPlanes[p] = plane;
+                }
+                cascadePtr[c] = default;
+                cascadePtr[c].SetPlanes(localPlanes);
+            }
+
+            // Transition shadow output buffers to UAV
+            if (_shadowBuffersInSRV[frameIndex])
+            {
+                commandList.ResourceBarrier(new ResourceBarrier(new ResourceTransitionBarrier(_shadowDescriptorBuffers[frameIndex], ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess)));
+                commandList.ResourceBarrier(new ResourceBarrier(new ResourceTransitionBarrier(_shadowTerrainDataBuffers[frameIndex], ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess)));
+                commandList.ResourceBarrier(new ResourceBarrier(new ResourceTransitionBarrier(_shadowCascadeIdxBuffers[frameIndex], ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess)));
+                _shadowBuffersInSRV[frameIndex] = false;
+            }
+
+            // Readback shadow args (while still in IndirectArgument state)
+            if (_shadowArgsInArgState[frameIndex] && _shadowArgsReadback != null)
+            {
+                commandList.ResourceBarrier(new ResourceBarrier(new ResourceTransitionBarrier(_shadowArgsBuffers[frameIndex], ResourceStates.IndirectArgument, ResourceStates.CopySource)));
+                commandList.CopyResource(_shadowArgsReadback, _shadowArgsBuffers[frameIndex]);
+                commandList.ResourceBarrier(new ResourceBarrier(new ResourceTransitionBarrier(_shadowArgsBuffers[frameIndex], ResourceStates.CopySource, ResourceStates.UnorderedAccess)));
+                _shadowArgsInArgState[frameIndex] = false;
+            }
+            // Transition shadow args to UAV if needed (no readback)
+            else if (_shadowArgsInArgState[frameIndex])
+            {
+                commandList.ResourceBarrier(new ResourceBarrier(new ResourceTransitionBarrier(_shadowArgsBuffers[frameIndex], ResourceStates.IndirectArgument, ResourceStates.UnorderedAccess)));
+                _shadowArgsInArgState[frameIndex] = false;
+            }
+
+            // Switch to compute pipeline
+            commandList.SetComputeRootSignature(device.GlobalRootSignature);
+            commandList.SetDescriptorHeaps(1, new[] { device.SrvHeap });
+
+            // Clear shadow counter
+            commandList.ClearUnorderedAccessViewUint(
+                device.GetGpuHandle(_shadowCounterUAVs[frameIndex]),
+                _shadowCounterCPUHandles[frameIndex],
+                _shadowCounterBuffers[frameIndex],
+                new Vortice.Mathematics.Int4(0, 0, 0, 0));
+
+            // Bind shadow output UAVs
+            commandList.SetComputeRoot32BitConstant(0, _shadowDescriptorUAVs[frameIndex], 0);  // OutputDescriptorsUAV
+            commandList.SetComputeRoot32BitConstant(0, _shadowSphereUAVs[frameIndex], 1);       // OutputSpheresUAV
+            commandList.SetComputeRoot32BitConstant(0, _shadowSubbatchIdUAVs[frameIndex], 2);   // OutputSubbatchIdsUAV
+            commandList.SetComputeRoot32BitConstant(0, _shadowTerrainDataUAVs[frameIndex], 3);  // OutputTerrainDataUAV
+            commandList.SetComputeRoot32BitConstant(0, _shadowCounterUAVs[frameIndex], 4);      // CounterUAV
+
+            // Quadtree constants
+            commandList.SetComputeRoot32BitConstant(0, (uint)MaxDepth, 5);
+            commandList.SetComputeRoot32BitConstant(0, (uint)Transform.TransformSlot, 6);
+            commandList.SetComputeRoot32BitConstant(0, (uint)(Material?.MaterialID ?? 0), 7);
+            commandList.SetComputeRoot32BitConstant(0, (uint)_meshPartId, 8);
+            commandList.SetComputeRoot32BitConstant(0, _shadowCascadeIdxUAVs[frameIndex], 9);   // CascadeIdxUAV (slot 9)
+            commandList.SetComputeRoot32BitConstant(0, (uint)_totalNodes, 10);
+            var htIdx = Terrain!.Heightmap?.BindlessIndex ?? 0u;
+            commandList.SetComputeRoot32BitConstant(0, htIdx, 11);
+
+            // Camera position in LOCAL space
+            var camPos = Camera.Main!.Position - Transform.Position;
+            commandList.SetComputeRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(camPos.X), 12);
+            commandList.SetComputeRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(camPos.Y), 13);
+            commandList.SetComputeRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(camPos.Z), 14);
+
+            var terrainSz = Terrain.TerrainSize;
+            commandList.SetComputeRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(terrainSz.X * 0.5f), 15);
+            commandList.SetComputeRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(0f), 16);
+            commandList.SetComputeRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(terrainSz.Y * 0.5f), 17);
+            commandList.SetComputeRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(terrainSz.X * 0.5f), 18);
+            commandList.SetComputeRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(Terrain.MaxHeight), 19);
+            commandList.SetComputeRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(terrainSz.Y * 0.5f), 20);
+
+            int shadowMaxPatches = MaxPatches * cascadeCount;
+            commandList.SetComputeRoot32BitConstant(0, (uint)shadowMaxPatches, 21);             // MaxPatches (shadow capacity)
+            commandList.SetComputeRoot32BitConstant(0, _splitFlagsUAVs[frameIndex], 22);
+            commandList.SetComputeRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(Terrain.MaxHeight), 23);
+            commandList.SetComputeRoot32BitConstant(0, _heightRangePyramidSRV, 24);
+
+            commandList.SetComputeRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(terrainSz.X), 25);
+            commandList.SetComputeRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(terrainSz.Y), 26);
+            commandList.SetComputeRoot32BitConstant(0, (uint)cascadeCount, 30);                 // CascadeCount (slot 30)
+
+            // Bind FrustumPlanes CB at root slot 1 (register b0) — required by root signature
+            // even though CSEmitLeavesShadow doesn't use it; uses cascade planes at slot 2 instead
+            commandList.SetComputeRootConstantBufferView(1, _frustumConstantBuffers[frameIndex].GPUVirtualAddress);
+
+            // Bind terrain-local cascade buffer via push constant (CascadeBufferSRVIdx, slot 31)
+            commandList.SetComputeRoot32BitConstant(0, _shadowCascadeBufferSrvs[frameIndex], 31);
+
+            // Dispatch CSEmitLeavesShadow
+            uint threadGroups = (uint)((_totalNodes + 255) / 256);
+            commandList.SetPipelineState(_emitLeavesShadowPSO!);
+            commandList.Dispatch(threadGroups, 1, 1);
+
+            // UAV barrier
+            commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(null)));
+
+            // Build draw args from shadow counter (reuse CSBuildDrawArgs)
+            commandList.SetComputeRoot32BitConstant(0, (uint)_patchMesh.IndexCount, 29);        // VertexCount
+            commandList.SetComputeRoot32BitConstant(0, _shadowArgsUAVs[frameIndex], 31);        // IndirectArgsUAV
+            commandList.SetPipelineState(_buildDrawArgsPSO);
+            commandList.Dispatch(1, 1, 1);
+
+            // UAV barrier
+            commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(null)));
+
+            // Transition shadow output to SRV for VS_Shadow
+            commandList.ResourceBarrier(new ResourceBarrier(new ResourceTransitionBarrier(_shadowDescriptorBuffers[frameIndex], ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource)));
+            commandList.ResourceBarrier(new ResourceBarrier(new ResourceTransitionBarrier(_shadowTerrainDataBuffers[frameIndex], ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource)));
+            commandList.ResourceBarrier(new ResourceBarrier(new ResourceTransitionBarrier(_shadowCascadeIdxBuffers[frameIndex], ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource)));
+            _shadowBuffersInSRV[frameIndex] = true;
+
+            // ════════════════════════════════════════════════════════════════
+            // Phase 2: Draw terrain shadows (graphics)
+            // ════════════════════════════════════════════════════════════════
+
+            Material.SetPass(RenderPass.Shadow);
+            Material.Apply(commandList, device);
+
+            commandList.IASetPrimitiveTopology(Vortice.Direct3D.PrimitiveTopology.TriangleList);
+            commandList.SetDescriptorHeaps(1, new[] { device.SrvHeap });
+
+            // Bind shadow patch data
+            commandList.SetGraphicsRoot32BitConstant(0, _shadowTerrainDataSRVs[frameIndex], 1);  // TerrainDataIdx
+            commandList.SetGraphicsRoot32BitConstant(0, _shadowDescriptorSRVs[frameIndex], 2);   // DescriptorBufIdx
+            commandList.SetGraphicsRoot32BitConstant(0, _patchMesh.IndexBufferIndex, 7);          // IndexBufferIdx
+            commandList.SetGraphicsRoot32BitConstant(0, 0u, 8);                                   // BaseIndex
+            commandList.SetGraphicsRoot32BitConstant(0, _patchMesh.PosBufferIndex, 9);            // PosBufferIdx
+            commandList.SetGraphicsRoot32BitConstant(0, TransformBuffer.Instance!.SrvIndex, 15);  // GlobalTransformBufferIdx
+
+            // Shadow-specific push constants
+            commandList.SetGraphicsRoot32BitConstant(0, DirectionalLight.CurrentCascadeSrvIndex, 20); // CascadeBufferSRVIdx
+            commandList.SetGraphicsRoot32BitConstant(0, (uint)cascadeCount, 21);                       // ShadowCascadeCount
+            commandList.SetGraphicsRoot32BitConstant(0, _shadowCascadeIdxSRVs[frameIndex], 22);        // CascadeIdxBufIdx
+
+            // Transition shadow args to IndirectArgument
+            commandList.ResourceBarrier(new ResourceBarrier(new ResourceTransitionBarrier(
+                _shadowArgsBuffers[frameIndex], ResourceStates.UnorderedAccess, ResourceStates.IndirectArgument)));
+            _shadowArgsInArgState[frameIndex] = true;
+
+            // ExecuteIndirect — instance count is compacted per-cascade count
+            commandList.ExecuteIndirect(
+                device.DrawInstancedSignature,
+                1,
+                _shadowArgsBuffers[frameIndex],
                 0,
                 null,
                 0);
@@ -762,7 +1060,7 @@ namespace Freefall.Components
             device.NativeDevice.CreateShaderResourceView(
                 _heightRangePyramid, fullSrvDesc, device.GetCpuHandle(_heightRangePyramidSRV));
 
-            Debug.Log($"[TerrainRenderer] Height range pyramid: {pyramidSize}x{pyramidSize}, {_heightRangeMipCount} mips, SRV={_heightRangePyramidSRV}");
+           // Debug.Log($"[TerrainRenderer] Height range pyramid: {pyramidSize}x{pyramidSize}, {_heightRangeMipCount} mips, SRV={_heightRangePyramidSRV}");
         }
 
         /// <summary>
@@ -1131,7 +1429,7 @@ namespace Freefall.Components
         /// </summary>
         private void BuildDecorationControlTexture(ID3D12GraphicsCommandList cmd)
         {
-            Debug.Log("[TerrainRenderer]", $"BuildDecorationControlTexture: dirty={_decoControlDirty} DecoMaps={DecoMapsArray != null} SlotsBuffer={_decoratorSlotsBuffer != null}");
+            //Debug.Log("[TerrainRenderer]", $"BuildDecorationControlTexture: dirty={_decoControlDirty} DecoMaps={DecoMapsArray != null} SlotsBuffer={_decoratorSlotsBuffer != null}");
             if (!_decoControlDirty || DecoMapsArray == null || _decoratorSlotsBuffer == null)
                 return;
 
@@ -1149,7 +1447,7 @@ namespace Freefall.Components
                 var shader = new Shader(source, "CSBuildDecoControl", "cs_6_6");
                 _decoPrepassPSO = device.CreateComputePipelineState(shader.Bytecode);
                 shader.Dispose();
-                Debug.Log("[TerrainRenderer]", "Decoration prepass compute shader compiled");
+                //Debug.Log("[TerrainRenderer]", "Decoration prepass compute shader compiled");
             }
 
             // Create or recreate control texture
@@ -1216,22 +1514,7 @@ namespace Freefall.Components
 
             _decoControlDirty = false;
             _bakedAlbedoDirty = true; // Rebuild albedo when control changes
-            Debug.Log("[TerrainRenderer]", $"Decoration control texture built: {width}x{height}, {slotCount} slots, DecoMapsIdx={DecoMapsArray?.BindlessIndex}, SlotsIdx={_decoratorSlotsSRV}, UAV={_decoControlUAV}, SRV={_decoControlSRV}");
-
-            // Log slot details for debugging
-            if (Terrain?.Decorations != null)
-            {
-                int idx = 0;
-                foreach (var d in Terrain.Decorations)
-                {
-                    if (d.Mode == DecoratorMode.Mesh && d.Mesh == null) continue;
-                    if (d.Mode != DecoratorMode.Mesh && d.Texture == null && d.Mesh == null) continue;
-                    var hasMap = d.DensityMap != null;
-                    Debug.Log("[TerrainRenderer]", $"  Slot {idx}: Mode={d.Mode} DensityMap={hasMap} Density={d.Density:F2}");
-                    idx++;
-                    if (idx > 10) { Debug.Log("[TerrainRenderer]", $"  ... and {(int)slotCount - 10} more"); break; }
-                }
-            }
+            //Debug.Log("[TerrainRenderer]", $"Decoration control texture built: {width}x{height}, {slotCount} slots, DecoMapsIdx={DecoMapsArray?.BindlessIndex}, SlotsIdx={_decoratorSlotsSRV}, UAV={_decoControlUAV}, SRV={_decoControlSRV}");
         }
 
         /// <summary>
@@ -1470,7 +1753,7 @@ namespace Freefall.Components
                 buffer.Unmap(0);
             }
 
-            Debug.Log($"[TerrainRenderer] {name}: {data.Count} entries, SRV={srvIndex}");
+            //Debug.Log($"[TerrainRenderer] {name}: {data.Count} entries, SRV={srvIndex}");
         }
 
         private void DispatchDecorator(ID3D12GraphicsCommandList commandList, int frameIndex, RenderPass pass = RenderPass.Opaque)
@@ -1495,16 +1778,11 @@ namespace Freefall.Components
             float cs = tileSize / TILE_SIZE;
             int tilesPerSide = Math.Max(1, (int)MathF.Ceiling(2.0f * range / tileSize));
 
-            Debug.Log($"[Grass] tileSize={tileSize:F3} cellSize={cs:F3} range={range:F0} tiles={tilesPerSide}x{tilesPerSide}={tilesPerSide*tilesPerSide} decoMapsIdx={DecoMapsArray?.BindlessIndex ?? 0}");
+            //Debug.Log($"[Grass] tileSize={tileSize:F3} cellSize={cs:F3} range={range:F0} tiles={tilesPerSide}x{tilesPerSide}={tilesPerSide*tilesPerSide} decoMapsIdx={DecoMapsArray?.BindlessIndex ?? 0}");
 
             // Select correct PSO pass and apply
             DecoratorMaterial.SetPass(pass);
             DecoratorMaterial.Apply(commandList, device);
-
-            // In shadow pass, Apply just overwrote slot 1 with camera CBV.
-            // Rebind the light's cascade VP so the mesh shader projects into shadow space.
-            if (pass == RenderPass.Shadow && DirectionalLight.CurrentShadowSceneCBV != 0)
-                commandList.SetGraphicsRootConstantBufferView(1, DirectionalLight.CurrentShadowSceneCBV);
 
             // Push constants
             commandList.SetGraphicsRoot32BitConstant(0, _decoratorHeadersSRV, 0);
@@ -1533,6 +1811,19 @@ namespace Freefall.Components
             commandList.SetGraphicsRoot32BitConstant(0, _decoControlSRV, 18);
             // Slot 19: baked terrain albedo SRV (for ground color blending)
             commandList.SetGraphicsRoot32BitConstant(0, _bakedAlbedoSRV, 19);
+
+            // Shadow single-pass: bind VP structured buffer and cascade count
+            if (pass == RenderPass.Shadow)
+            {
+                commandList.SetGraphicsRoot32BitConstant(0, DirectionalLight.CurrentCascadeSrvIndex, 20);
+                // Skip outermost cascade for grass — detail not visible at that distance
+                int grassShadowCascades = Math.Max(1, DirectionalLight.CascadeCount - 1);
+                commandList.SetGraphicsRoot32BitConstant(0, (uint)grassShadowCascades, 21);
+                // Shadow Hi-Z pyramid SRV for per-instance occlusion culling
+                var shadowPyramid = DeferredRenderer.Current?.ShadowHiZPyramid;
+                uint shadowHiZSrv = (shadowPyramid?.Ready == true) ? shadowPyramid.FullSRV : 0u;
+                commandList.SetGraphicsRoot32BitConstant(0, shadowHiZSrv, 22);
+            }
 
             using var commandList6 = commandList.QueryInterface<ID3D12GraphicsCommandList6>();
             commandList6.DispatchMesh((uint)tilesPerSide, (uint)tilesPerSide, 1);

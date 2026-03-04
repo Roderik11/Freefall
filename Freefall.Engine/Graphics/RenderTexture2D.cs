@@ -115,6 +115,12 @@ namespace Freefall.Graphics
         public List<CpuDescriptorHandle> SliceDsvHandles { get; private set; } = new List<CpuDescriptorHandle>();
         public CpuDescriptorHandle[] SliceDsvs => SliceDsvHandles.ToArray(); // Helper if needed
         
+        /// <summary>
+        /// DSV covering all slices at once. Used for single-pass shadow rendering
+        /// where VS routes geometry to slices via SV_RenderTargetArrayIndex.
+        /// </summary>
+        public CpuDescriptorHandle FullArrayDsvHandle { get; private set; }
+        
         public int Width { get; private set; }
         public int Height { get; private set; }
         public int Slices { get; private set; }
@@ -128,7 +134,7 @@ namespace Freefall.Graphics
             var device = Engine.Device;
             _resource = device.CreateTexture2D(Format.R32_Typeless, width, height, slices, 1, ResourceFlags.AllowDepthStencil, ResourceStates.DepthWrite, depthClearValue: 1.0f); // Shadow maps use standard Z (clear to 1.0)
 
-            // DSVs for each slice
+            // DSVs for each slice (used for clearing)
             for(int i=0; i<slices; i++)
             {
                 var dsv = device.AllocateDsv();
@@ -146,6 +152,20 @@ namespace Freefall.Graphics
                      }
                 }, dsv);
             }
+            
+            // Full-array DSV for single-pass shadow rendering
+            FullArrayDsvHandle = device.AllocateDsv();
+            device.NativeDevice.CreateDepthStencilView(_resource, new DepthStencilViewDescription
+            {
+                Format = Format.D32_Float,
+                ViewDimension = DepthStencilViewDimension.Texture2DArray,
+                Texture2DArray = new Texture2DArrayDepthStencilView
+                {
+                    ArraySize = (uint)slices,
+                    FirstArraySlice = 0,
+                    MipSlice = 0
+                }
+            }, FullArrayDsvHandle);
 
             // SRV for whole array
             var cpuHandle = device.AllocateSrvRange(1, out var gpuHandle, out uint index); // Simplified but correct index
