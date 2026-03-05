@@ -468,7 +468,7 @@ namespace Freefall.Graphics
                 
                 if (Engine.FrameIndex % 60 == 0 && isOpaque)
                 {
-                    Debug.Log($"[Pass.Execute] DrawCalls: {drawCallCount} | Batches: {activeBatches.Count} | Total: {totalSw.Elapsed.TotalMilliseconds:F2}ms | Batching: {batchingSw.Elapsed.TotalMilliseconds:F2}ms | BuildBuffers: {buildSw.Elapsed.TotalMilliseconds:F2}ms | Material.Apply: {applySw.Elapsed.TotalMilliseconds:F2}ms | DrawFast: {drawSw.Elapsed.TotalMilliseconds:F2}ms");
+                  //  Debug.Log($"[Pass.Execute] DrawCalls: {drawCallCount} | Batches: {activeBatches.Count} | Total: {totalSw.Elapsed.TotalMilliseconds:F2}ms | Batching: {batchingSw.Elapsed.TotalMilliseconds:F2}ms | BuildBuffers: {buildSw.Elapsed.TotalMilliseconds:F2}ms | Material.Apply: {applySw.Elapsed.TotalMilliseconds:F2}ms | DrawFast: {drawSw.Elapsed.TotalMilliseconds:F2}ms");
                 }
             }
         }

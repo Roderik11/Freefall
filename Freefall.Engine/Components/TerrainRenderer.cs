@@ -1283,6 +1283,8 @@ namespace Freefall.Components
             var decorations = Terrain.Decorations;
             if (decorations.Count == 0) return;
 
+            Debug.Log($"[TerrainRenderer]", $"Building decorator buffers for {decorations.Count} decorations");
+
             var device = Engine.Device;
 
             // Dispose old buffers if rebuilding
@@ -1432,9 +1434,10 @@ namespace Freefall.Components
         /// </summary>
         private void BuildDecorationControlTexture(ID3D12GraphicsCommandList cmd)
         {
-            //Debug.Log("[TerrainRenderer]", $"BuildDecorationControlTexture: dirty={_decoControlDirty} DecoMaps={DecoMapsArray != null} SlotsBuffer={_decoratorSlotsBuffer != null}");
             if (!_decoControlDirty || DecoMapsArray == null || _decoratorSlotsBuffer == null)
                 return;
+
+            Debug.Log("[TerrainRenderer]", $"BuildDecorationControlTexture: dirty={_decoControlDirty} DecoMaps={DecoMapsArray != null} SlotsBuffer={_decoratorSlotsBuffer != null}");
 
             var device = Engine.Device;
             var nativeDecoMaps = DecoMapsArray.Native;

@@ -265,7 +265,7 @@ namespace Freefall.Graphics
             // Log every 60 frames
             if (Engine.FrameIndex % 60 == 0)
             {
-                Debug.Log($"[DeferredRenderer] Total: {sw.Elapsed.TotalMilliseconds:F2}ms | GBuffer: {gbufferTime.Elapsed.TotalMilliseconds:F2}ms | Light: {lightTime.Elapsed.TotalMilliseconds:F2}ms | Compose: {composeTime.Elapsed.TotalMilliseconds:F2}ms | Blit: {blitTime.Elapsed.TotalMilliseconds:F2}ms");
+              //  Debug.Log($"[DeferredRenderer] Total: {sw.Elapsed.TotalMilliseconds:F2}ms | GBuffer: {gbufferTime.Elapsed.TotalMilliseconds:F2}ms | Light: {lightTime.Elapsed.TotalMilliseconds:F2}ms | Compose: {composeTime.Elapsed.TotalMilliseconds:F2}ms | Blit: {blitTime.Elapsed.TotalMilliseconds:F2}ms");
             }
             
             // Restore previous Current (stack-safe for nested viewports)
@@ -391,7 +391,7 @@ namespace Freefall.Graphics
              // Log every 60 frames
              if (Engine.FrameIndex % 60 == 0)
              {
-                 Debug.Log($"[FillGBuffer] Draw(): {drawTime.Elapsed.TotalMilliseconds:F2}ms | Upload: {uploadTime.Elapsed.TotalMilliseconds:F2}ms | Shadow: {shadowTime.Elapsed.TotalMilliseconds:F2}ms | Opaque: {opaqueTime.Elapsed.TotalMilliseconds:F2}ms | Sky: {skyTime.Elapsed.TotalMilliseconds:F2}ms");
+                 //Debug.Log($"[FillGBuffer] Draw(): {drawTime.Elapsed.TotalMilliseconds:F2}ms | Upload: {uploadTime.Elapsed.TotalMilliseconds:F2}ms | Shadow: {shadowTime.Elapsed.TotalMilliseconds:F2}ms | Opaque: {opaqueTime.Elapsed.TotalMilliseconds:F2}ms | Sky: {skyTime.Elapsed.TotalMilliseconds:F2}ms");
              }
 
              // End GBuffer

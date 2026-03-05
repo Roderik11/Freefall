@@ -374,32 +374,41 @@ void CSVisibility(uint3 dispatchThreadId : SV_DispatchThreadID)
     float maxScale = max(scale.x, max(scale.y, scale.z));
     float worldRadius = localSphere.w * maxScale;
     
-    // Frustum test
-    bool visible = IsVisible(worldCenter, worldRadius);
+    // Frustum test — save result for stats (avoid redundant re-evaluation)
+    bool frustumVisible = IsVisible(worldCenter, worldRadius);
+    bool hiZOccluded = false;
     
     // Hi-Z occlusion test (only for frustum-visible instances)
     // Small distance-proportional radius floor prevents false positives when
     // per-part AABB centers fall in gaps of open geometry (fences, bridges).
-    if (visible)
+    if (frustumVisible)
     {
         float4 hiZClip = mul(float4(worldCenter, 1.0), OcclusionProjection);
         float hiZRadius = max(worldRadius, hiZClip.w * 0.01);
-        if (IsOccluded(worldCenter, hiZRadius))
-            visible = false;
+        hiZOccluded = IsOccluded(worldCenter, hiZRadius);
     }
     
-    // Write visibility flag: 0 = culled, 1 = visible
-    uint flag = visible ? 1u : 0u;
-    visibilityFlags[instanceIdx] = flag;
+    bool visible = frustumVisible && !hiZOccluded;
     
-    // Update cull stats (atomic, across all threads)
+    // Write visibility flag: 0 = culled, 1 = visible
+    visibilityFlags[instanceIdx] = visible ? 1u : 0u;
+    
+    // Update cull stats — wave-aggregated to reduce atomic contention
     if (CullStatsUAVIdx != 0)
     {
         RWByteAddressBuffer stats = ResourceDescriptorHeap[CullStatsUAVIdx];
-        if (flag == 1)
-            stats.InterlockedAdd(0, 1);    // [0] = frustum+HiZ visible
-        else if (IsVisible(worldCenter, worldRadius))
-            stats.InterlockedAdd(4, 1);    // [1] = passed frustum, failed Hi-Z
+        
+        // Count matching threads in this wave, only lane 0 does the atomic
+        uint visibleCount = WaveActiveCountBits(visible);
+        uint occludedCount = WaveActiveCountBits(frustumVisible && hiZOccluded);
+        
+        if (WaveIsFirstLane())
+        {
+            if (visibleCount > 0)
+                stats.InterlockedAdd(0, visibleCount);    // [0] = frustum+HiZ visible
+            if (occludedCount > 0)
+                stats.InterlockedAdd(4, occludedCount);   // [1] = passed frustum, failed Hi-Z
+        }
     }
 }
 

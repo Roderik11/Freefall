@@ -269,17 +269,17 @@ namespace Freefall
             _tickSw.Stop();
 
             // Log frame breakdown when total exceeds 5ms (stall detection)
-            if (_tickSw.Elapsed.TotalMilliseconds > 5)
-            {
-                Debug.Log($"[Tick STALL] {_tickSw.Elapsed.TotalMilliseconds:F1}ms | " +
-                    $"FlushDispose:{_flushDisposeSw.Elapsed.TotalMilliseconds:F1} " +
-                    $"FlushPending:{_flushPendingSw.Elapsed.TotalMilliseconds:F1} " +
-                    $"Physics:{_physicsSw.Elapsed.TotalMilliseconds:F1} " +
-                    $"Update:{_updateSw.Elapsed.TotalMilliseconds:F1} " +
-                    $"Render:{_renderSw.Elapsed.TotalMilliseconds:F1} " +
-                    $"(Prep:{_prepareTotalMs:F1} Cam:{_camRenderTotalMs:F1} Pres:{_presentTotalMs:F1}) " +
-                    $"Queue:{_queueSw.Elapsed.TotalMilliseconds:F1}({_queueItemCount}items)");
-            }
+            //if (_tickSw.Elapsed.TotalMilliseconds > 5)
+            //{
+            //    Debug.Log($"[Tick STALL] {_tickSw.Elapsed.TotalMilliseconds:F1}ms | " +
+            //        $"FlushDispose:{_flushDisposeSw.Elapsed.TotalMilliseconds:F1} " +
+            //        $"FlushPending:{_flushPendingSw.Elapsed.TotalMilliseconds:F1} " +
+            //        $"Physics:{_physicsSw.Elapsed.TotalMilliseconds:F1} " +
+            //        $"Update:{_updateSw.Elapsed.TotalMilliseconds:F1} " +
+            //        $"Render:{_renderSw.Elapsed.TotalMilliseconds:F1} " +
+            //        $"(Prep:{_prepareTotalMs:F1} Cam:{_camRenderTotalMs:F1} Pres:{_presentTotalMs:F1}) " +
+            //        $"Queue:{_queueSw.Elapsed.TotalMilliseconds:F1}({_queueItemCount}items)");
+            //}
 
             Input.ClearFrameCallbacks();
         }

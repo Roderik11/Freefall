@@ -68,7 +68,7 @@ namespace Freefall.Base
             
             if (Engine.FrameIndex % 60 == 0) // Log every 60 frames
             {
-                Debug.Log($"[EntityManager.Update] {sw.Elapsed.TotalMilliseconds:F2}ms");
+               // Debug.Log($"[EntityManager.Update] {sw.Elapsed.TotalMilliseconds:F2}ms");
             }
         }
 
