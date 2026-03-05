@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using Vortice.Direct3D12;
 using Vortice.Direct3D12.Shader;
@@ -162,7 +163,8 @@ namespace Freefall.Graphics
             {
                 unsafe
                 {
-                    Marshal.Copy(_shadowBuffer, 0, _mappedDatas[frameIndex], _size);
+                    fixed (byte* src = _shadowBuffer)
+                        Unsafe.CopyBlock((void*)_mappedDatas[frameIndex], src, (uint)_size);
                 }
                 _isDirty[frameIndex] = false;
             }

@@ -349,23 +349,25 @@ namespace Freefall.Graphics
                  
                  CommandBuffer.Execute(RenderPass.ShadowMap, list, Engine.Device);
                  
-                 // Transition shadow texture to shader resource for light pass sampling
-                 list.ResourceBarrierTransition(ShadowTextureArray.Native, 
-                     ResourceStates.DepthWrite, ResourceStates.PixelShaderResource);
-                 
                  // Generate shadow Hi-Z pyramid from this frame's shadow depth
                  if (ShadowHiZPyramid != null && CommandBuffer.Culler != null)
                  {
-                     // Shadow texture is in PixelShaderResource — transition to NonPixelShaderResource for compute read
+                     // Merge barriers: skip intermediate PixelShaderResource state
                      list.ResourceBarrierTransition(ShadowTextureArray.Native,
-                         ResourceStates.PixelShaderResource, ResourceStates.NonPixelShaderResource);
+                         ResourceStates.DepthWrite, ResourceStates.NonPixelShaderResource);
                      
                      CommandBuffer.Culler.GenerateShadowHiZPyramid(
                          list, ShadowTextureArray.BindlessIndex, ShadowHiZPyramid);
                      
-                     // Transition back to PixelShaderResource for light pass sampling
+                     // Transition to PixelShaderResource for light pass sampling
                      list.ResourceBarrierTransition(ShadowTextureArray.Native,
                          ResourceStates.NonPixelShaderResource, ResourceStates.PixelShaderResource);
+                 }
+                 else
+                 {
+                     // No Hi-Z — transition directly to PixelShaderResource for light pass
+                     list.ResourceBarrierTransition(ShadowTextureArray.Native, 
+                         ResourceStates.DepthWrite, ResourceStates.PixelShaderResource);
                  }
                  
                  // Shadow pass changes render targets and viewport for depth rendering.
