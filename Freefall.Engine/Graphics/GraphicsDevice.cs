@@ -652,6 +652,35 @@ namespace Freefall.Graphics
         }
 
         /// <summary>
+        /// Create a non-shader-visible CPU descriptor handle for ClearUnorderedAccessViewUint.
+        /// Allocates a single-entry CPU descriptor heap and creates a matching UAV descriptor.
+        /// </summary>
+        public CpuDescriptorHandle AllocateClearHandle(ID3D12Resource resource, uint numElements, uint stride)
+        {
+            var heap = _device.CreateDescriptorHeap(new DescriptorHeapDescription
+            {
+                Type = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView,
+                DescriptorCount = 1,
+                Flags = DescriptorHeapFlags.None
+            });
+            var handle = heap.GetCPUDescriptorHandleForHeapStart();
+            var uavDesc = new UnorderedAccessViewDescription
+            {
+                Format = Format.Unknown,
+                ViewDimension = UnorderedAccessViewDimension.Buffer,
+                Buffer = new BufferUnorderedAccessView
+                {
+                    FirstElement = 0,
+                    NumElements = numElements,
+                    StructureByteStride = stride,
+                    Flags = BufferUnorderedAccessViewFlags.None
+                }
+            };
+            _device.CreateUnorderedAccessView(resource, null, uavDesc, handle);
+            return handle;
+        }
+        
+        /// <summary>
         /// Create a compute pipeline state from shader bytecode.
         /// Uses the global root signature.
         /// </summary>
