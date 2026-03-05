@@ -196,6 +196,24 @@ namespace Freefall.Graphics
     }
     
     /// <summary>
+    /// Parse compute shader kernel declarations from HLSL source.
+    /// Extracts #pragma kernel CSEntryPoint patterns (Unity convention).
+    /// </summary>
+    public static class KernelParser
+    {
+        public static List<string> ParseKernels(string content)
+        {
+            var kernels = new List<string>();
+            string pattern = @"#pragma\s+kernel\s+(\w+)";
+            foreach (Match match in Regex.Matches(content, pattern))
+            {
+                kernels.Add(match.Groups[1].Value);
+            }
+            return kernels;
+        }
+    }
+    
+    /// <summary>
     /// Render state configuration parsed from shader source.
     /// </summary>
     public class ShaderRenderState
