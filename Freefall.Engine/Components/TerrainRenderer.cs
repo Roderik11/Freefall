@@ -1317,10 +1317,10 @@ namespace Freefall.Components
 
             // Dispatch via ComputeShader
             _albedoBakeCS ??= new ComputeShader("terrain_albedo_bake.hlsl", "CSBakeTerrainAlbedo");
-            _albedoBakeCS.SetUint(0, (uint)ControlMapsArray.BindlessIndex);  // ControlMapsIdx
-            _albedoBakeCS.SetUint(1, (uint)DiffuseMapsArray.BindlessIndex);  // DiffuseMapsIdx
-            _albedoBakeCS.SetUint(2, _bakedAlbedoUAV);                       // OutputUAVIdx
-            _albedoBakeCS.SetUint(3, _tilingBuffer.SrvIndex);                 // TilingBufIdx
+            _albedoBakeCS.Set("ControlMaps", ControlMapsArray);      // Texture → BindlessIndex
+            _albedoBakeCS.Set("DiffuseMaps", DiffuseMapsArray);      // Texture → BindlessIndex
+            _albedoBakeCS.Set("OutputUAV", _bakedAlbedoUAV);         // uint (raw UAV index)
+            _albedoBakeCS.SetSRV("TilingBuf", _tilingBuffer);        // GraphicsBuffer → SrvIndex
 
             uint groups = (uint)((BakedAlbedoSize + 7) / 8);
             _albedoBakeCS.Dispatch(cmd, groups, groups);
