@@ -115,6 +115,8 @@ namespace Freefall.Components
                 pair.Value.SetParameter("ViewProjection", view * proj);
                 pair.Value.SetParameter("Time", time);
                 pair.Value.SetParameter("AmbientScale", SkyboxRenderer.AmbientScale);
+                float shadowRes = Graphics.DeferredRenderer.Current?.ShadowTextureArray?.Width ?? 2048f;
+                pair.Value.SetParameter("ShadowTexelSize", 1.0f / shadowRes);
             }
         }
         

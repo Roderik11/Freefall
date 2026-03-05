@@ -46,10 +46,12 @@ float4 PS(VSOutput input) : SV_Target
 
     Texture2D NormalTex = ResourceDescriptorHeap[NormalTexIdx];
 
-    float4 albedo = AlbedoTex.Sample(Sampler, input.TexCoord);
-    float4 light = LightTex.Sample(Sampler, input.TexCoord);
-    float4 data = DataTex.Sample(Sampler, input.TexCoord);
-    float3 normal = NormalTex.Sample(Sampler, input.TexCoord).xyz;
+    // Pixel-exact Load — 1:1 fullscreen pass, no filtering needed
+    int3 px = int3(input.Position.xy, 0);
+    float4 albedo = AlbedoTex.Load(px);
+    float4 light = LightTex.Load(px);
+    float4 data = DataTex.Load(px);
+    float3 normal = NormalTex.Load(px).xyz;
     
     // Hemisphere ambient: sky-facing surfaces get a cooler/brighter tint,
     // ground-facing get warmer/darker. Gives shape to fully shadowed objects.
@@ -82,7 +84,7 @@ float4 PS(VSOutput input) : SV_Target
     
     // Dithering — break up color banding in smooth gradients (sky)
     // Triangular-distribution noise: ±0.5/255 in sRGB space
-    float2 seed = input.TexCoord * float2(1920.0, 1080.0); // pixel coords
+    float2 seed = input.Position.xy; // SV_POSITION = pixel coords at any resolution
     float noise1 = frac(sin(dot(seed, float2(12.9898, 78.233))) * 43758.5453);
     float noise2 = frac(sin(dot(seed, float2(39.3468, 11.135))) * 23564.2365);
     float dither = (noise1 + noise2 - 1.0) / 255.0;

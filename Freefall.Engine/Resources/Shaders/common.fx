@@ -15,7 +15,9 @@ cbuffer SceneConstants : register(b0)
     row_major float4x4 ViewProjection;
     row_major float4x4 ViewInverse;
     row_major float4x4 CameraInverse; // ViewProjection inverse for depth reconstruction
+    row_major float4x4 CameraRelativeVP; // Zero-translation VP (inverse of CameraInverse)
     float AmbientScale;               // Day/night ambient multiplier (0.05 night → 1.0 day)
+    float ShadowTexelSize;             // 1.0 / shadowMapResolution (precomputed on CPU)
 }
 
 // Material data for bindless texture lookup via Material ID indirection
@@ -93,25 +95,30 @@ static const float SHADOW_DISK_RADIUS = 2.5f; // in texels
 
 float GetShadowFactor(in Texture2DArray tex, in SamplerComparisonState cmpSampler, in float2 uv, float depth, int sliceIndex, float3 normal, float3 lightDir, float zScale, float2 screenPos)
 {
-    float width, height, slices;
-    tex.GetDimensions(width, height, slices);
-    float texelSize = 1.0f / width;
+    // Precomputed on CPU — avoids per-pixel GetDimensions() and hardcoded resolution
+    float texelSize = ShadowTexelSize;
 	
-    // Slope-scaled bias: surfaces at grazing angles need more bias
+    // Slope-scaled bias: surfaces at grazing angles need more bias.
+    // NOTE: The hardware rasterizer already applies SlopeScaledDepthBias (3.0),
+    // so this shader-side bias should be minimal — just enough for PCF softening.
     float cosTheta = saturate(dot(normal, -lightDir));
-    float slopeBias = 0.01f * sqrt(1.0f - cosTheta * cosTheta) / max(cosTheta, 0.05f);
+    float slopeBias = 0.002f * sqrt(1.0f - cosTheta * cosTheta) / max(cosTheta, 0.05f);
 	
     // World-space bias scaled by zScale (projection._33) to get NDC bias
     // Per-cascade minimum ensures larger cascades (lower zScale) still get adequate bias
-    float bias = (0.005f + slopeBias) * zScale;
-    float minBias = 0.0005f;  // floor: prevents self-shadowing on terrain in wider cascades
-    bias = clamp(bias, minBias, 0.01f);
+    float bias = (0.001f + slopeBias) * zScale;
+    float minBias = 0.0001f;  // floor: prevents self-shadowing on terrain in wider cascades
+    bias = clamp(bias, minBias, 0.005f);
     
     float biasedDepth = depth - bias;
     
     // Per-pixel rotation from interleaved gradient noise
     float rotation = InterleavedGradientNoise(screenPos) * 6.2831853f; // 0..2π
-    float radius = SHADOW_DISK_RADIUS * texelSize;
+    // Per-cascade filter radius: near cascades use tighter filter to preserve
+    // thin shadow caster detail (grass blades), far cascades use wider filter
+    // for smoother large shadows.
+    float diskRadius = (sliceIndex <= 1) ? 1.2f : SHADOW_DISK_RADIUS;
+    float radius = diskRadius * texelSize;
     
     float result = 0.0f;
     [unroll]

@@ -754,8 +754,11 @@ namespace Freefall.Components
             var device = Engine.Device;
             var allPlanes = DirectionalLight.GetAllCascadeFrustumPlanes();
             if (allPlanes == null) return;
-            // Skip outermost cascade for terrain shadows (perf: outer cascade is most expensive)
-            int cascadeCount = Math.Max(1, DirectionalLight.CascadeCount - 1);
+            // With SDSM adaptive splits, all cascades may cover nearby geometry — use them all.
+            // With fixed splits, skip outermost cascade (perf: outer cascade is most expensive, least visible detail).
+            int cascadeCount = Engine.Settings.UseAdaptiveSplits
+                ? DirectionalLight.CascadeCount
+                : Math.Max(1, DirectionalLight.CascadeCount - 1);
 
             // ════════════════════════════════════════════════════════════════
             // Phase 1: CSEmitLeavesShadow — per-cascade frustum culling
@@ -1816,8 +1819,11 @@ namespace Freefall.Components
             if (pass == RenderPass.Shadow)
             {
                 commandList.SetGraphicsRoot32BitConstant(0, DirectionalLight.CurrentCascadeSrvIndex, 20);
-                // Skip outermost cascade for grass — detail not visible at that distance
-                int grassShadowCascades = Math.Max(1, DirectionalLight.CascadeCount - 1);
+                // With SDSM, all cascades may cover nearby geometry — use them all.
+                // With fixed splits, skip outermost cascade (grass detail not visible at that distance).
+                int grassShadowCascades = Engine.Settings.UseAdaptiveSplits
+                    ? DirectionalLight.CascadeCount
+                    : Math.Max(1, DirectionalLight.CascadeCount - 1);
                 commandList.SetGraphicsRoot32BitConstant(0, (uint)grassShadowCascades, 21);
                 // Shadow Hi-Z pyramid SRV for per-instance occlusion culling
                 var shadowPyramid = DeferredRenderer.Current?.ShadowHiZPyramid;

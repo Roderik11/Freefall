@@ -226,8 +226,9 @@ namespace Freefall.Reflection
 
             return hashcode;
         }
+        public GUIObject(params object[] objects) : this(false, objects) {  }
 
-        public GUIObject(params object[] objects)
+        public GUIObject(bool includeReadOnly, params object[] objects)
         {
             targets = objects;
 
@@ -260,7 +261,7 @@ namespace Freefall.Reflection
                 var field = allFields[name];
                 if (field.Ignored) continue;
                 if (!field.IsPublic) continue;
-                if (!field.CanWrite) continue;
+                if (!includeReadOnly && !field.CanWrite) continue;
 
                 if (!field.Browsable)
                 {

@@ -84,6 +84,54 @@ float4 ApplyNormalOffset(float4 worldPos, float3 normal, float3 lightDir, row_ma
     return worldPos + float4(normal * offsetScale, 0);
 }
 
+// ─── Screen-Space Contact Shadows ──────────────────────────────────────────
+// Ray-march toward the light using CameraRelativeVP for correct projection.
+// Uses the linear depth buffer for simple, distance-independent depth comparison.
+
+#define CONTACT_STEPS     24
+#define CONTACT_MAX_DIST  0.75  // world-space max ray length (meters) — short to avoid mist around large objects
+
+float ContactShadow(float3 worldPos, float3 lightDir, float2 screenPos, float linearDepth)
+{
+    // Skip distant pixels — contact shadows are a near-field effect
+    // Smooth fade between 80-100m to avoid visible cutoff line
+    if (linearDepth > 100.0) return 1.0;
+    float distanceFade = linearDepth > 80.0 ? (linearDepth - 80.0) / 20.0 : 0.0;
+    
+    Texture2D<float> linDepth = ResourceDescriptorHeap[DepthGBufIdx];
+    
+    float3 rayDir = normalize(-lightDir);
+    float3 viewFwd = float3(View._13, View._23, View._33);
+    
+    float dither = InterleavedGradientNoise(screenPos);
+    float stepSize = CONTACT_MAX_DIST / float(CONTACT_STEPS);
+    
+    for (int i = 0; i < CONTACT_STEPS; i++)
+    {
+        float t = (float(i) + 0.5 + dither) * stepSize;
+        float3 rayPos = worldPos + rayDir * t;
+        
+        // Project to screen using camera-relative VP
+        float4 clip = mul(float4(rayPos, 1.0), CameraRelativeVP);
+        if (clip.w <= 0.0) continue;
+        float2 uv = (clip.xy / clip.w) * float2(0.5, -0.5) + 0.5;
+        
+        if (any(uv < 0.0) || any(uv > 1.0)) break;
+        
+        // Compare ray's linear depth vs scene's linear depth
+        float sceneLinear = linDepth.SampleLevel(Sampler, uv, 0).r;
+        float rayLinear = dot(rayPos, viewFwd);
+        float penetration = rayLinear - sceneLinear;
+        
+        // Hit: ray clearly behind geometry (>15cm penetration, <30cm thickness)
+        // Higher min penetration avoids stippled "mist" from grazing-angle hits
+        if (penetration > 0.15 && penetration < 0.3)
+            return distanceFade; // 0.0 at close range, fades to 1.0 at 80-100m
+    }
+    
+    return 1.0;
+}
+
 struct VSOutput
 {
     float4 Position : SV_POSITION;
@@ -119,29 +167,24 @@ float4 PS(VSOutput input) : SV_Target
     Texture2D DepthTex = ResourceDescriptorHeap[DepthTexIdx];
     Texture2DArray ShadowMap = ResourceDescriptorHeap[ShadowMapIdx];
     
-    float3 normal = NormalTex.Sample(Sampler, input.TexCoord).xyz;
-    float depth = DepthTex.Sample(Sampler, input.TexCoord).r;
+    // Pixel-exact Load — 1:1 fullscreen pass, no filtering needed
+    int3 px = int3(input.Position.xy, 0);
+    float3 normal = NormalTex.Load(px).xyz;
+    float depth = DepthTex.Load(px).r;
     
-    // Mode 3: Visualize GBuffer linear depth (normalized to visible range)
-    if (DebugVisualizationMode == 3)
-    {
-        Texture2D DepthGBuf = ResourceDescriptorHeap[DepthGBufIdx];
-        float gbufDepth = DepthGBuf.Sample(Sampler, input.TexCoord).r;
-        float normalized = saturate(gbufDepth / 500.0); // Map [0..500] to [0..1]
-        return float4(normalized, normalized, normalized, 1);
-    }
     
+
     // Skip pixels at min depth (sky) — reverse depth: far=0
     if (depth <= 0.0f)
         return float4(0, 0, 0, 0);
     
-    // Reconstruct world position from depth
+    // Reconstruct world position from depth (needs UV coords, not pixel coords)
     float4 worldPos = posFromDepth(input.TexCoord, depth, CameraInverse);
     
-    // Vegetation flag: data.a = 0.5
-    Texture2D DataTexEarly = ResourceDescriptorHeap[DataTexIdx];
-    float dataA = DataTexEarly.Sample(Sampler, input.TexCoord).a;
-    bool isVegetation = (dataA > 0.3 && dataA < 0.7);
+    // Sample Data texture ONCE — used for vegetation flag AND PBR material below
+    Texture2D DataTex = ResourceDescriptorHeap[DataTexIdx];
+    float4 data = DataTex.Load(px);
+    bool isVegetation = (data.a > 0.3 && data.a < 0.7);
     
     // Compute NdotL early — surfaces facing away from the light receive no
     // direct illumination, so skip shadow sampling entirely.
@@ -227,7 +270,11 @@ float4 PS(VSOutput input) : SV_Target
         }
     }
 
-    
+    // Screen-space contact shadow: catch fine detail the cascade maps miss (WIP: needs blur/TAA)
+    // float contactShadow = ContactShadow(worldPos.xyz, LightDirection, input.Position.xy, viewDepth);
+    // shadowFactor = min(shadowFactor, contactShadow);
+    float contactShadow = 1.0; // disabled for now
+
     // Debug visualization modes
     if (DebugVisualizationMode == 1)
     {
@@ -240,12 +287,23 @@ float4 PS(VSOutput input) : SV_Target
         // Raw shadow factor as grayscale
         return float4(shadowFactor.xxx, 1);
     }
+    if (DebugVisualizationMode == 3)
+    {
+        // Contact shadow only (white = lit, black = shadowed)
+        return float4(contactShadow.xxx, 1);
+    }
+    if (DebugVisualizationMode == 4)
+    {
+        // Visualize linear depth buffer (DepthGBufIdx)
+        Texture2D<float> depthViz = ResourceDescriptorHeap[DepthGBufIdx];
+        float d = depthViz.Load(px).r;
+        float normalized = saturate(d / 100.0); // Map [0..100m] to [0..1]
+        return float4(normalized, normalized, normalized, 1);
+    }
     
-    // PBR lighting
+    // PBR lighting (data already sampled above)
     Texture2D AlbedoTex = ResourceDescriptorHeap[AlbedoTexIdx];
-    Texture2D DataTex = ResourceDescriptorHeap[DataTexIdx];
-    float3 albedo = AlbedoTex.Sample(Sampler, input.TexCoord).rgb;
-    float4 data = DataTex.Sample(Sampler, input.TexCoord);
+    float3 albedo = AlbedoTex.Load(px).rgb;
     
     // Self-lit check: Data.a == 0 means pixel is already fully lit (e.g. ocean)
     // Skip deferred lighting to avoid double-illumination

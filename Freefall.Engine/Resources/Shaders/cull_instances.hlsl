@@ -23,7 +23,7 @@ cbuffer FrustumPlanes : register(b0)
     float NearPlane;       // Camera near plane for depth margin calculation
     uint CullStatsUAVIdx;  // UAV index for cull stats buffer (0=disabled)
     uint DebugMode;        // Debug visualization mode (unused by culler, kept for layout compatibility)
-    float _pad1;
+    float ProjScale;       // Projection._m22 = cot(fovY/2) for sphere-to-screen size
 };
 
 // Shadow cascade data (StructuredBuffer via push constant — used by rendering shaders)
@@ -242,6 +242,7 @@ bool IsOccluded(float3 worldCenter, float worldRadius)
     float sphereNearestDepth = clipCenter.w - worldRadius;
     return sphereNearestDepth > sampledDepth;
 }
+
 
 //-----------------------------------------------------------------------------
 // Shadow cascade frustum culling helper
@@ -701,25 +702,73 @@ void CSBitonicSort(uint3 dispatchThreadId : SV_DispatchThreadID)
 }
 
 //-----------------------------------------------------------------------------
-// Pass 5a: CSHistogramPrefixSum - Prefix sum of histogram for StartInstance offsets
-// Runs once per MeshPartId slot (O(K) where K = registry size)
+// Pass 5a: CSHistogramPrefixSum - Parallel prefix sum of histogram
+// 3-phase scan: (1) serial chunk prefix, (2) Blelloch scan of partials,
+// (3) propagate block offsets. Supports up to MaxMeshParts (4096).
 // Input: histogram[k] = visible count for MeshPartId k
-// Output: counters[k] = exclusive prefix sum = StartInstance offset for MeshPartId k
+// Output: counters[k] = exclusive prefix sum = StartInstance offset
 //-----------------------------------------------------------------------------
-[numthreads(1, 1, 1)]
-void CSHistogramPrefixSum(uint3 dispatchThreadId : SV_DispatchThreadID)
+[numthreads(256, 1, 1)]
+void CSHistogramPrefixSum(uint3 groupThreadId : SV_GroupThreadID)
 {
+    uint tid = groupThreadId.x;
+    
     RWStructuredBuffer<uint> histogram = ResourceDescriptorHeap[HistogramIdx];
     RWStructuredBuffer<uint> counters = ResourceDescriptorHeap[CounterBufferIdx];
     
-    // Sequential prefix sum — reads directly from histogram buffer
-    // No groupshared size limit, supports up to MaxMeshParts (4096)
-    uint sum = 0;
-    for (uint i = 0; i < UniquePartCount; i++)
+    // Phase 1: Each thread serially prefix-sums its chunk
+    uint elemsPerThread = (UniquePartCount + 255) / 256;
+    uint myStart = tid * elemsPerThread;
+    uint myEnd = min(myStart + elemsPerThread, UniquePartCount);
+    
+    uint localSum = 0;
+    for (uint i = myStart; i < myEnd; i++)
     {
         uint count = histogram[i];
-        counters[i] = sum;  // Exclusive prefix sum -> StartInstance offset
-        sum += count;
+        counters[i] = localSum;
+        localSum += count;
+    }
+    
+    // Phase 2: Blelloch exclusive prefix sum of 256 partial sums
+    sharedData[tid] = localSum;
+    sharedData[tid + 256] = 0;
+    
+    uint offset = 1;
+    for (uint d = BLOCK_SIZE >> 1; d > 0; d >>= 1)
+    {
+        GroupMemoryBarrierWithGroupSync();
+        if (tid < d)
+        {
+            uint ai = offset * (2 * tid + 1) - 1;
+            uint bi = offset * (2 * tid + 2) - 1;
+            sharedData[bi] += sharedData[ai];
+        }
+        offset <<= 1;
+    }
+    
+    if (tid == 0) sharedData[BLOCK_SIZE - 1] = 0;
+    
+    for (uint d2 = 1; d2 < BLOCK_SIZE; d2 <<= 1)
+    {
+        offset >>= 1;
+        GroupMemoryBarrierWithGroupSync();
+        if (tid < d2)
+        {
+            uint ai = offset * (2 * tid + 1) - 1;
+            uint bi = offset * (2 * tid + 2) - 1;
+            uint t = sharedData[ai];
+            sharedData[ai] = sharedData[bi];
+            sharedData[bi] += t;
+        }
+    }
+    
+    GroupMemoryBarrierWithGroupSync();
+    
+    // Phase 3: Add block prefix to each element
+    uint blockPrefix = sharedData[tid];
+    for (uint j = myStart; j < myEnd; j++)
+    {
+        counters[j] += blockPrefix;
     }
 }
 

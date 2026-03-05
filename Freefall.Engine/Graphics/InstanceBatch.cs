@@ -541,6 +541,9 @@ namespace Freefall.Graphics
             _cachedSrvHeapArray ??= new[] { device.SrvHeap };
             commandList.SetDescriptorHeaps(1, _cachedSrvHeapArray);
             commandList.SetComputeRootConstantBufferView(1, frustumBufferGPUAddress);
+            // Root slot 2 (register b1) must also be bound — shader declares ShadowCascadePlanes cbuffer
+            // even though CSVisibility doesn't use it. Unbound CBV slots cause GPU faults on some drivers.
+            commandList.SetComputeRootConstantBufferView(2, frustumBufferGPUAddress);
 
             commandList.SetComputeRoot32BitConstant(0, MeshRegistry.SrvIndex, 0);
             commandList.SetComputeRoot32BitConstant(0, gpuCommandUAVIndices[frameIndex], 1);

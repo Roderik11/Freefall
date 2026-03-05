@@ -153,6 +153,7 @@ namespace Freefall.Components
             
             Params.Clear();
             Params.SetParameter("CameraInverse", cameraInverse);
+            Params.SetParameter("CameraVP", cvp);
             Params.SetParameter("LightColor", Color.ToVector3());
             Params.SetParameter("LightDirection", Transform.Forward);
             Params.SetParameter("LightIntensity", Intensity);

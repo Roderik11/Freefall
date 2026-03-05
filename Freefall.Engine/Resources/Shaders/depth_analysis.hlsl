@@ -106,14 +106,17 @@ void CSDepthHistogram(uint3 id : SV_DispatchThreadID, uint groupIndex : SV_Group
 }
 
 // ============================================================
-// Pass 3: CSComputeSplits — prefix sum histogram + percentile splits
-// Single thread group (1,1,1)
+// Pass 3: CSComputeSplits — parallel prefix sum + percentile splits
+// 256 threads: Hillis-Steele inclusive scan on histogram,
+// thread 0 does percentile search (4 cascades = trivial)
 // ============================================================
 groupshared uint gs_prefixSum[HISTOGRAM_BINS];
 
-[numthreads(1, 1, 1)]
-void CSComputeSplits(uint3 id : SV_DispatchThreadID)
+[numthreads(256, 1, 1)]
+void CSComputeSplits(uint3 groupThreadId : SV_GroupThreadID)
 {
+    uint tid = groupThreadId.x;
+    
     RWByteAddressBuffer minMaxBuf = ResourceDescriptorHeap[MinMaxUAVIdx];
     RWStructuredBuffer<uint> histogram = ResourceDescriptorHeap[HistogramUAVIdx];
     RWStructuredBuffer<float> splits = ResourceDescriptorHeap[SplitsUAVIdx];
@@ -122,74 +125,73 @@ void CSComputeSplits(uint3 id : SV_DispatchThreadID)
     float maxDepth = asfloat(minMaxBuf.Load(4));
     float range = maxDepth - minDepth;
     
-    // Handle edge cases
+    // Edge case: no valid depth data
     if (range <= 0.0001f || minDepth <= 0.0f)
     {
-        // Fallback: can't compute meaningful splits
-        // Write zeros to signal "no valid data"
-        splits[0] = 0;
-        splits[1] = 0;
-        splits[2] = 0;
-        splits[3] = 0;
+        if (tid < 4) splits[tid] = 0;
         return;
     }
     
-    // Compute total pixel count and prefix sum
-    uint total = 0;
-    for (uint i = 0; i < HISTOGRAM_BINS; i++)
+    // Load histogram into groupshared
+    gs_prefixSum[tid] = histogram[tid];
+    GroupMemoryBarrierWithGroupSync();
+    
+    // Hillis-Steele inclusive prefix sum (8 steps for 256 elements)
+    [unroll]
+    for (uint s = 1; s < HISTOGRAM_BINS; s <<= 1)
     {
-        total += histogram[i];
-        gs_prefixSum[i] = total;
+        uint val = (tid >= s) ? gs_prefixSum[tid - s] : 0;
+        GroupMemoryBarrierWithGroupSync();
+        gs_prefixSum[tid] += val;
+        GroupMemoryBarrierWithGroupSync();
     }
     
-    if (total == 0)
+    // Thread 0: percentile search on the inclusive prefix sum
+    if (tid == 0)
     {
-        splits[0] = 0;
-        splits[1] = 0;
-        splits[2] = 0;
-        splits[3] = 0;
-        return;
-    }
-    
-    // Find percentile boundaries: 25%, 50%, 75%, 100%
-    // Each cascade handles an equal fraction of visible pixels
-    float percentiles[4] = { 0.25f, 0.50f, 0.75f, 1.0f };
-    
-    for (uint c = 0; c < 4; c++)
-    {
-        uint target = (uint)(percentiles[c] * total);
-        uint bin = HISTOGRAM_BINS - 1; // default to last bin
+        uint total = gs_prefixSum[HISTOGRAM_BINS - 1];
         
-        for (uint b = 0; b < HISTOGRAM_BINS; b++)
+        if (total == 0)
         {
-            if (gs_prefixSum[b] >= target)
-            {
-                bin = b;
-                break;
-            }
+            splits[0] = 0; splits[1] = 0; splits[2] = 0; splits[3] = 0;
+            return;
         }
         
-        // Sub-bin interpolation: instead of snapping to bin boundary,
-        // interpolate within the bin based on how far through it the target falls.
-        // This eliminates the quantization snapping from 256-bin discretization.
-        uint prevSum = (bin > 0) ? gs_prefixSum[bin - 1] : 0;
-        uint binCount = histogram[bin];
-        float fraction = (binCount > 0) ? float(target - prevSum) / float(binCount) : 0.5;
+        // Near-biased percentile boundaries
+        float percentiles[4] = { 0.40f, 0.70f, 0.90f, 1.0f };
         
-        float binDepth = minDepth + ((float(bin) + fraction) / float(HISTOGRAM_BINS)) * range;
+        for (uint c = 0; c < 4; c++)
+        {
+            uint target = (uint)(percentiles[c] * total);
+            uint bin = HISTOGRAM_BINS - 1;
+            
+            for (uint b = 0; b < HISTOGRAM_BINS; b++)
+            {
+                if (gs_prefixSum[b] >= target)
+                {
+                    bin = b;
+                    break;
+                }
+            }
+            
+            // Sub-bin interpolation
+            uint prevSum = (bin > 0) ? gs_prefixSum[bin - 1] : 0;
+            uint binCount = gs_prefixSum[bin] - prevSum;
+            float fraction = (binCount > 0) ? float(target - prevSum) / float(binCount) : 0.5;
+            
+            float binDepth = minDepth + ((float(bin) + fraction) / float(HISTOGRAM_BINS)) * range;
+            binDepth = max(binDepth, NearPlane + 0.1f);
+            splits[c] = binDepth;
+        }
         
-        // Clamp: ensure cascade far >= near plane, and monotonically increasing
-        binDepth = max(binDepth, NearPlane + 0.1f);
-        splits[c] = binDepth;
-    }
-    
-    // Ensure last cascade covers everything
-    splits[3] = max(splits[3], maxDepth);
-    
-    // Ensure monotonically increasing
-    for (uint s = 1; s < 4; s++)
-    {
-        if (splits[s] <= splits[s - 1])
-            splits[s] = splits[s - 1] + 1.0f;
+        // Ensure last cascade covers everything
+        splits[3] = max(splits[3], maxDepth);
+        
+        // Ensure monotonically increasing
+        for (uint q = 1; q < 4; q++)
+        {
+            if (splits[q] <= splits[q - 1])
+                splits[q] = splits[q - 1] + 1.0f;
+        }
     }
 }

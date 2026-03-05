@@ -92,6 +92,8 @@ namespace Freefall.Graphics
         
         private GraphicsDevice _device;
         private bool _initialized;
+        public bool Initialized => _initialized;
+        public string? InitError { get; private set; }
         
         // Cull stats readback (2 uints: [0]=visible, [1]=hi-z occluded)
         private ID3D12Resource? _cullStatsBuffer;           // GPU default heap
@@ -158,7 +160,7 @@ namespace Freefall.Graphics
             public float NearPlane;      // Camera near plane for depth margin calculation
             public uint CullStatsUAVIdx; // UAV index for cull stats (0 = disabled)
             public uint DebugMode;       // Debug visualization mode (unused by culler, kept for layout compatibility)
-            public float _pad1;
+            public float ProjScale;      // Projection._m22 = cot(fovY/2) for sphere→screen size
         }
         
         /// <summary>
@@ -502,7 +504,10 @@ namespace Freefall.Graphics
                         _smoothedSplitsUAV = _device.AllocateBindlessIndex();
                         _device.CreateStructuredBufferUAV(_smoothedSplitsBuffer, 4, sizeof(float), _smoothedSplitsUAV);
                         
-                        _cascadeComputeInitialized = true;
+                        // DISABLED: GPU cascade compute produces incorrect VP matrices for lighting.
+                        // The CPU cascade path with SDSM GPU readback works correctly.
+                        // TODO: Debug lightVP computation in cascade_compute.hlsl
+                        // _cascadeComputeInitialized = true;
                         Debug.Log("GPUCuller", "CSComputeCascadeMatrices initialized: GPU-driven cascade computation ready");
                     }
                     else
@@ -620,6 +625,7 @@ namespace Freefall.Graphics
             }
             catch (Exception ex)
             {
+                InitError = ex.Message;
                 Debug.LogError("GPUCuller", $"Initialization failed: {ex.Message}");
             }
         }
@@ -948,7 +954,7 @@ namespace Freefall.Graphics
         /// <param name="pyramid">Hi-Z pyramid to write into (owned by DeferredRenderer)</param>
         public void GenerateHiZPyramid(ID3D12GraphicsCommandList commandList, uint depthSrvIndex, HiZPyramid pyramid)
         {
-            if (_downsamplePSO == null || pyramid?.Texture == null || pyramid.MipCount == 0) return;
+            if (_downsamplePerMipPSO == null || pyramid?.Texture == null || pyramid.MipCount == 0) return;
             
             bool firstGeneration = !pyramid.Ready;
             pyramid.Ready = true;  // Pyramid will be valid after this dispatch
@@ -956,129 +962,39 @@ namespace Freefall.Graphics
             commandList.SetComputeRootSignature(_device.GlobalRootSignature);
             _cachedSrvHeapArray ??= new[] { _device.SrvHeap };
             commandList.SetDescriptorHeaps(1, _cachedSrvHeapArray);
-            commandList.SetPipelineState(_downsamplePSO);
+            commandList.SetPipelineState(_downsamplePerMipPSO);
             
             int w = pyramid.Width;
             int h = pyramid.Height;
-            // Use exact source dimensions (not w*2 — avoids truncation for odd depth buffer sizes)
-            int sourceW = pyramid.SourceWidth;
-            int sourceH = pyramid.SourceHeight;
-            // Each group covers 64×64 source texels → 32×32 mip 0 texels
-            uint numGroupsX = ((uint)sourceW + 63) / 64;
-            uint numGroupsY = ((uint)sourceH + 63) / 64;
             
-            // Clear atomic counter to 0
-            if (pyramid.CounterBuffer != null)
+            for (int mip = 0; mip < pyramid.MipCount; mip++)
             {
-                if (firstGeneration)
-                {
-                    // First use: transition from Common to UAV
-                    commandList.ResourceBarrier(new ResourceBarrier(
-                        new ResourceTransitionBarrier(pyramid.CounterBuffer,
-                            ResourceStates.Common,
-                            ResourceStates.UnorderedAccess, 0)));
-                }
-                commandList.ClearUnorderedAccessViewUint(
-                    _device.GetGpuHandle(pyramid.CounterUAV),
-                    pyramid.CounterCPUHandle,
-                    pyramid.CounterBuffer,
-                    new Vortice.Mathematics.Int4(0, 0, 0, 0));
+                // Transition this mip to UAV for writing
+                var beforeState = firstGeneration ? ResourceStates.Common : ResourceStates.NonPixelShaderResource;
                 commandList.ResourceBarrier(new ResourceBarrier(
-                    new ResourceUnorderedAccessViewBarrier(pyramid.CounterBuffer)));
-            }
-            
-            // Transition only SPD mips (0 to spdMipCount-1) to UAV
-            int spdMipCount = Math.Min(pyramid.MipCount, 6); // SPD handles mips 0-5
-            var barriers = new ResourceBarrier[spdMipCount];
-            var beforeState = firstGeneration ? ResourceStates.Common : ResourceStates.NonPixelShaderResource;
-            for (int i = 0; i < spdMipCount; i++)
-            {
-                barriers[i] = new ResourceBarrier(
                     new ResourceTransitionBarrier(pyramid.Texture,
                         beforeState,
                         ResourceStates.UnorderedAccess,
-                        (uint)i));
-            }
-            commandList.ResourceBarrier(barriers);
-            
-            // Set push constants
-            // [0]: SourceSrvIdx, CounterUavIdx, SourceWidth, SourceHeight (full-res)
-            commandList.SetComputeRoot32BitConstant(0, depthSrvIndex, 0);
-            commandList.SetComputeRoot32BitConstant(0, pyramid.CounterUAV, 1);
-            commandList.SetComputeRoot32BitConstant(0, (uint)sourceW, 2);
-            commandList.SetComputeRoot32BitConstant(0, (uint)sourceH, 3);
-            // [1]: MipCount, NumGroupsX, NumGroupsY, Mip0UavIdx
-            commandList.SetComputeRoot32BitConstant(0, (uint)spdMipCount, 4);
-            commandList.SetComputeRoot32BitConstant(0, numGroupsX, 5);
-            commandList.SetComputeRoot32BitConstant(0, numGroupsY, 6);
-            commandList.SetComputeRoot32BitConstant(0, pyramid.MipUAVs[0], 7);
-            // [2-4]: Mip UAV indices 1-12
-            for (int i = 1; i < spdMipCount && i <= 12; i++)
-            {
-                int slot = 8 + (i - 1);  // slots 8..19
-                commandList.SetComputeRoot32BitConstant(0, pyramid.MipUAVs[i], (uint)slot);
-            }
-            
-            // Single dispatch — mips 0-5 in one pass
-            commandList.Dispatch(numGroupsX, numGroupsY, 1);
-            
-            // Transition SPD mips (0 to spdMipCount-1) to SRV
-            for (int i = 0; i < spdMipCount; i++)
-            {
-                barriers[i] = new ResourceBarrier(
+                        (uint)mip)));
+                
+                // Push constants: InputSrv, OutputUav, Width, Height
+                uint inputSrv = mip == 0 ? depthSrvIndex : pyramid.MipSRVs[mip - 1];
+                commandList.SetComputeRoot32BitConstant(0, inputSrv, 0);
+                commandList.SetComputeRoot32BitConstant(0, pyramid.MipUAVs[mip], 1);
+                commandList.SetComputeRoot32BitConstant(0, (uint)w, 2);
+                commandList.SetComputeRoot32BitConstant(0, (uint)h, 3);
+                
+                commandList.Dispatch(((uint)w + 7) / 8, ((uint)h + 7) / 8, 1);
+                
+                // Transition to SRV for next level
+                commandList.ResourceBarrier(new ResourceBarrier(
                     new ResourceTransitionBarrier(pyramid.Texture,
                         ResourceStates.UnorderedAccess,
                         ResourceStates.NonPixelShaderResource,
-                        (uint)i));
-            }
-            if (spdMipCount < pyramid.MipCount)
-            {
-                var spdBarriers = new ResourceBarrier[spdMipCount];
-                Array.Copy(barriers, spdBarriers, spdMipCount);
-                commandList.ResourceBarrier(spdBarriers);
-            }
-            else
-            {
-                commandList.ResourceBarrier(barriers);
-            }
-            
-            // === Mips 6+ via old per-mip approach ===
-            if (pyramid.MipCount > 6 && _downsamplePerMipPSO != null)
-            {
-                commandList.SetPipelineState(_downsamplePerMipPSO);
+                        (uint)mip)));
                 
-                int mw = pyramid.Width;
-                int mh = pyramid.Height;
-                // Skip to mip 5 dimensions (input for mip 6)
-                for (int skip = 0; skip < 5; skip++) { mw = Math.Max(1, mw / 2); mh = Math.Max(1, mh / 2); }
-                
-                for (int mip = 6; mip < pyramid.MipCount; mip++)
-                {
-                    mw = Math.Max(1, mw / 2);
-                    mh = Math.Max(1, mh / 2);
-                    
-                    // Transition this mip to UAV
-                    commandList.ResourceBarrier(new ResourceBarrier(
-                        new ResourceTransitionBarrier(pyramid.Texture,
-                            firstGeneration ? ResourceStates.Common : ResourceStates.NonPixelShaderResource,
-                            ResourceStates.UnorderedAccess,
-                            (uint)mip)));
-                    
-                    // Push constants: InputSrv, OutputUav, Width, Height
-                    commandList.SetComputeRoot32BitConstant(0, pyramid.MipSRVs[mip - 1], 0);
-                    commandList.SetComputeRoot32BitConstant(0, pyramid.MipUAVs[mip], 1);
-                    commandList.SetComputeRoot32BitConstant(0, (uint)mw, 2);
-                    commandList.SetComputeRoot32BitConstant(0, (uint)mh, 3);
-                    
-                    commandList.Dispatch(((uint)mw + 7) / 8, ((uint)mh + 7) / 8, 1);
-                    
-                    // Transition to SRV for next level's read
-                    commandList.ResourceBarrier(new ResourceBarrier(
-                        new ResourceTransitionBarrier(pyramid.Texture,
-                            ResourceStates.UnorderedAccess,
-                            ResourceStates.NonPixelShaderResource,
-                            (uint)mip)));
-                }
+                w = Math.Max(1, w / 2);
+                h = Math.Max(1, h / 2);
             }
         }
 

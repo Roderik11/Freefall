@@ -178,6 +178,7 @@ namespace Freefall.Graphics
                 constants.HiZHeight = HiZPyramid.Height;
                 constants.HiZMipCount = (uint)HiZPyramid.MipCount;
                 constants.NearPlane = camera.NearPlane;
+                constants.ProjScale = camera.Projection.M22; // cot(fovY/2) — correct for sphere→screen
             }
             
             // Debug visualization mode
@@ -189,7 +190,7 @@ namespace Freefall.Graphics
             
             // Store current VP for next frame's occlusion projection
             _previousFrameViewProjection = camera.ViewProjection;
-            
+
             unsafe
             {
                 void* pData;
@@ -419,7 +420,10 @@ namespace Freefall.Graphics
              var cvp = Matrix4x4.CreateLookAtLeftHanded(Vector3.Zero, camera.Forward, camera.Up) * camera.Projection;
              Matrix4x4.Invert(cvp, out var cameraInverse);
              foreach (var pair in Effect.MasterEffects)
+             {
                  pair.Value.SetParameter("CameraInverse", cameraInverse);
+                 pair.Value.SetParameter("CameraRelativeVP", cvp);
+             }
              
              CommandBuffer.Execute(RenderPass.Light, list, Engine.Device);
 

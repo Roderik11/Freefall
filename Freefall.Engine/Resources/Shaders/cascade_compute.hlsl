@@ -39,6 +39,15 @@ cbuffer CascadeParams : register(b1)
     float4 CascadeSplits;                   // X,Y,Z,W = split distances for cascades 0-3
 };
 
+// Output for culling pass (frustum planes, VP matrices, split distances)
+struct CascadeData
+{
+    float4 Planes[6];           // frustum planes
+    row_major float4x4 VP;      // current frame VP
+    row_major float4x4 PrevVP;  // previous frame VP (for Hi-Z)
+    float4 SplitDistances;      // X=near, Y=far
+};
+
 // Output for lighting pass (camera-relative VP + split distances)
 struct LightingCascadeData
 {

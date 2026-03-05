@@ -322,11 +322,11 @@ namespace Freefall
                 Debug.Log($"[Engine] Adaptive Splits {(Settings.UseAdaptiveSplits ? "Enabled" : "Disabled")}");
             }
             
-            // F5: Cycle debug visualization mode (0=off, 1=cascade colors, 2=shadow factor, 3=depth)
+            // F5: Cycle debug visualization mode
             if (Input.IsKeyPressed(Keys.F5))
             {
-                Settings.DebugVisualizationMode = (Settings.DebugVisualizationMode + 1) % 4;
-                string[] modeNames = { "Off", "Cascade Colors", "Shadow Factor", "GBuffer Depth" };
+                Settings.DebugVisualizationMode = (Settings.DebugVisualizationMode + 1) % 5;
+                string[] modeNames = { "Off", "Cascade Colors", "Shadow Factor", "Contact Shadow Only", "Linear Depth" };
                 Debug.Log($"[Engine] Debug Viz: {modeNames[Settings.DebugVisualizationMode]}");
             }
             
