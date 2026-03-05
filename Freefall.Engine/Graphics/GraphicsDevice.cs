@@ -679,6 +679,72 @@ namespace Freefall.Graphics
             _device.CreateUnorderedAccessView(resource, null, uavDesc, handle);
             return handle;
         }
+
+        /// <summary>
+        /// Create a raw R32_Typeless UAV descriptor at a bindless index.
+        /// </summary>
+        public void CreateRawBufferUAV(ID3D12Resource resource, uint numElements, uint bindlessIndex)
+        {
+            var uavDesc = new UnorderedAccessViewDescription
+            {
+                Format = Format.R32_Typeless,
+                ViewDimension = UnorderedAccessViewDimension.Buffer,
+                Buffer = new BufferUnorderedAccessView
+                {
+                    FirstElement = 0,
+                    NumElements = numElements,
+                    Flags = BufferUnorderedAccessViewFlags.Raw,
+                }
+            };
+            _device.CreateUnorderedAccessView(resource, null, uavDesc, GetCpuHandle(bindlessIndex));
+        }
+
+        /// <summary>
+        /// Create a raw R32_Typeless SRV descriptor at a bindless index.
+        /// </summary>
+        public void CreateRawBufferSRV(ID3D12Resource resource, uint numElements, uint bindlessIndex)
+        {
+            var srvDesc = new ShaderResourceViewDescription
+            {
+                Format = Format.R32_Typeless,
+                ViewDimension = Vortice.Direct3D12.ShaderResourceViewDimension.Buffer,
+                Shader4ComponentMapping = ShaderComponentMapping.Default,
+                Buffer = new BufferShaderResourceView
+                {
+                    FirstElement = 0,
+                    NumElements = numElements,
+                    Flags = BufferShaderResourceViewFlags.Raw,
+                }
+            };
+            _device.CreateShaderResourceView(resource, srvDesc, GetCpuHandle(bindlessIndex));
+        }
+
+        /// <summary>
+        /// Create a non-shader-visible CPU descriptor handle for ClearUnorderedAccessViewUint on a raw buffer.
+        /// </summary>
+        public CpuDescriptorHandle AllocateRawClearHandle(ID3D12Resource resource, uint numElements)
+        {
+            var heap = _device.CreateDescriptorHeap(new DescriptorHeapDescription
+            {
+                Type = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView,
+                DescriptorCount = 1,
+                Flags = DescriptorHeapFlags.None
+            });
+            var handle = heap.GetCPUDescriptorHandleForHeapStart();
+            var uavDesc = new UnorderedAccessViewDescription
+            {
+                Format = Format.R32_Typeless,
+                ViewDimension = UnorderedAccessViewDimension.Buffer,
+                Buffer = new BufferUnorderedAccessView
+                {
+                    FirstElement = 0,
+                    NumElements = numElements,
+                    Flags = BufferUnorderedAccessViewFlags.Raw,
+                }
+            };
+            _device.CreateUnorderedAccessView(resource, null, uavDesc, handle);
+            return handle;
+        }
         
         /// <summary>
         /// Create a compute pipeline state from shader bytecode.

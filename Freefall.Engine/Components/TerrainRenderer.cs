@@ -45,41 +45,26 @@ namespace Freefall.Components
         private bool _computeInitialized;
         private bool _firstDispatch = true; // skip Hi-Z on first frame (no valid _previousFrameViewProjection yet)
 
-        // GPU output buffers — per-frame
-        private ID3D12Resource[] _descriptorBuffers = new ID3D12Resource[FrameCount];
-        private ID3D12Resource[] _sphereBuffers = new ID3D12Resource[FrameCount];
-        private ID3D12Resource[] _subbatchIdBuffers = new ID3D12Resource[FrameCount];
-        private ID3D12Resource[] _terrainDataBuffers = new ID3D12Resource[FrameCount];
-        private ID3D12Resource[] _counterBuffers = new ID3D12Resource[FrameCount];
-        private ID3D12Resource[] _splitFlagsBuffers = new ID3D12Resource[FrameCount];
-        private ID3D12Resource[] _indirectArgsBuffers = new ID3D12Resource[FrameCount];
-        private uint[] _indirectArgsUAVs = new uint[FrameCount];
-        private uint[] _indirectArgsSRVs = new uint[FrameCount];
+        // GPU output buffers — per-frame (GraphicsBuffer with auto-managed SRV/UAV/state)
+        private GraphicsBuffer[] _descriptorBuffers = new GraphicsBuffer[FrameCount];
+        private GraphicsBuffer[] _sphereBuffers = new GraphicsBuffer[FrameCount];
+        private GraphicsBuffer[] _subbatchIdBuffers = new GraphicsBuffer[FrameCount];
+        private GraphicsBuffer[] _terrainDataBuffers = new GraphicsBuffer[FrameCount];
+        private GraphicsBuffer[] _counterBuffers = new GraphicsBuffer[FrameCount];
+        private GraphicsBuffer[] _splitFlagsBuffers = new GraphicsBuffer[FrameCount];
+        private GraphicsBuffer[] _indirectArgsBuffers = new GraphicsBuffer[FrameCount];
 
         // Shadow indirect args (16 bytes: 4 DrawInstanced uints)
-        private ID3D12Resource[] _shadowArgsBuffers = new ID3D12Resource[FrameCount];
-        private uint[] _shadowArgsUAVs = new uint[FrameCount];
-        private bool[] _shadowArgsInArgState = new bool[FrameCount];
+        private GraphicsBuffer[] _shadowArgsBuffers = new GraphicsBuffer[FrameCount];
         private ID3D12PipelineState? _emitLeavesShadowPSO;
 
         // Shadow emit output buffers (CSEmitLeavesShadow with per-cascade frustum culling)
-        private ID3D12Resource[] _shadowDescriptorBuffers = new ID3D12Resource[FrameCount];
-        private uint[] _shadowDescriptorUAVs = new uint[FrameCount];
-        private uint[] _shadowDescriptorSRVs = new uint[FrameCount];
-        private ID3D12Resource[] _shadowTerrainDataBuffers = new ID3D12Resource[FrameCount];
-        private uint[] _shadowTerrainDataUAVs = new uint[FrameCount];
-        private uint[] _shadowTerrainDataSRVs = new uint[FrameCount];
-        private ID3D12Resource[] _shadowSphereBuffers = new ID3D12Resource[FrameCount];
-        private uint[] _shadowSphereUAVs = new uint[FrameCount];
-        private ID3D12Resource[] _shadowSubbatchIdBuffers = new ID3D12Resource[FrameCount];
-        private uint[] _shadowSubbatchIdUAVs = new uint[FrameCount];
-        private ID3D12Resource[] _shadowCounterBuffers = new ID3D12Resource[FrameCount];
-        private uint[] _shadowCounterUAVs = new uint[FrameCount];
-        private CpuDescriptorHandle[] _shadowCounterCPUHandles = new CpuDescriptorHandle[FrameCount];
-        private ID3D12Resource[] _shadowCascadeIdxBuffers = new ID3D12Resource[FrameCount];
-        private uint[] _shadowCascadeIdxUAVs = new uint[FrameCount];
-        private uint[] _shadowCascadeIdxSRVs = new uint[FrameCount];
-        private bool[] _shadowBuffersInSRV = new bool[FrameCount];
+        private GraphicsBuffer[] _shadowDescriptorBuffers = new GraphicsBuffer[FrameCount];
+        private GraphicsBuffer[] _shadowTerrainDataBuffers = new GraphicsBuffer[FrameCount];
+        private GraphicsBuffer[] _shadowSphereBuffers = new GraphicsBuffer[FrameCount];
+        private GraphicsBuffer[] _shadowSubbatchIdBuffers = new GraphicsBuffer[FrameCount];
+        private GraphicsBuffer[] _shadowCounterBuffers = new GraphicsBuffer[FrameCount];
+        private GraphicsBuffer[] _shadowCascadeIdxBuffers = new GraphicsBuffer[FrameCount];
         private ID3D12Resource[] _shadowCascadeBuffers = new ID3D12Resource[FrameCount]; // StructuredBuffer<CascadeData> (local-space planes)
         private IntPtr[] _shadowCascadeBufferPtrs = new IntPtr[FrameCount];
         private uint[] _shadowCascadeBufferSrvs = new uint[FrameCount];
@@ -99,25 +84,6 @@ namespace Freefall.Components
         private int _heightRangeMipCount;
         private bool _heightRangePyramidBuilt;
 
-        // UAV indices (for compute write)
-        private uint[] _descriptorUAVs = new uint[FrameCount];
-        private uint[] _sphereUAVs = new uint[FrameCount];
-        private uint[] _subbatchIdUAVs = new uint[FrameCount];
-        private uint[] _terrainDataUAVs = new uint[FrameCount];
-        private uint[] _counterUAVs = new uint[FrameCount];
-        private uint[] _splitFlagsUAVs = new uint[FrameCount];
-
-        // SRV indices (for culler/draw read)
-        private uint[] _descriptorSRVs = new uint[FrameCount];
-        private uint[] _sphereSRVs = new uint[FrameCount];
-        private uint[] _subbatchIdSRVs = new uint[FrameCount];
-        private uint[] _terrainDataSRVs = new uint[FrameCount];
-
-        // CPU descriptor handles for UAV clears
-        private ID3D12DescriptorHeap _cpuHeap = null!;
-        private CpuDescriptorHandle[] _counterCPUHandles = new CpuDescriptorHandle[FrameCount];
-        private CpuDescriptorHandle[] _splitFlagsCPUHandles = new CpuDescriptorHandle[FrameCount];
-
         // Mesh and registration
         private Mesh _patchMesh = null!;
         private int _meshPartId;
@@ -129,8 +95,6 @@ namespace Freefall.Components
         private Texture? NormalMapsArray;
 
         private int _totalNodes;
-        private bool[] _buffersInSRV = new bool[FrameCount]; // track per-frame state
-        private bool[] _indirectArgsInArgState = new bool[FrameCount]; // indirect args in IndirectArgument state
 
         // ───── Ground Coverage Decorator ──────────────────────────────────
         private GraphicsBuffer? _decoratorHeadersBuffer;
@@ -311,20 +275,9 @@ namespace Freefall.Components
             _buildMinMaxMipPSO = device.CreateComputePipelineState(buildMinMaxMipShader.Bytecode);
             buildMinMaxMipShader.Dispose();
 
-            // CPU heap for UAV clears
-            var cpuHeapDesc = new DescriptorHeapDescription
-            {
-                Type = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView,
-                DescriptorCount = (uint)(FrameCount * 3), // counter + splitFlags + shadowCounter per frame
-                Flags = DescriptorHeapFlags.None
-            };
-            _cpuHeap = device.NativeDevice.CreateDescriptorHeap(cpuHeapDesc);
-            uint incSize = device.NativeDevice.GetDescriptorHandleIncrementSize(
-                DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView);
-
             for (int i = 0; i < FrameCount; i++)
             {
-                CreateFrameBuffers(device, i, incSize);
+                CreateFrameBuffers(i);
             }
 
             // Create frustum constant buffers (for compute shader Hi-Z culling)
@@ -351,171 +304,29 @@ namespace Freefall.Components
             _computeInitialized = true;
         }
 
-        private void CreateFrameBuffers(GraphicsDevice device, int i, uint incSize)
+        private void CreateFrameBuffers(int i)
         {
-            // InstanceDescriptor: 12 bytes
-            _descriptorBuffers[i] = device.CreateDefaultBuffer(MaxPatches * 12);
-            _descriptorUAVs[i] = device.AllocateBindlessIndex();
-            device.CreateStructuredBufferUAV(_descriptorBuffers[i], (uint)MaxPatches, 12, _descriptorUAVs[i]);
-            _descriptorSRVs[i] = device.AllocateBindlessIndex();
-            device.CreateStructuredBufferSRV(_descriptorBuffers[i], (uint)MaxPatches, 12, _descriptorSRVs[i]);
-
-            // BoundingSphere: 16 bytes
-            _sphereBuffers[i] = device.CreateDefaultBuffer(MaxPatches * 16);
-            _sphereUAVs[i] = device.AllocateBindlessIndex();
-            device.CreateStructuredBufferUAV(_sphereBuffers[i], (uint)MaxPatches, 16, _sphereUAVs[i]);
-            _sphereSRVs[i] = device.AllocateBindlessIndex();
-            device.CreateStructuredBufferSRV(_sphereBuffers[i], (uint)MaxPatches, 16, _sphereSRVs[i]);
-
-            // SubbatchId: 4 bytes
-            _subbatchIdBuffers[i] = device.CreateDefaultBuffer(MaxPatches * 4);
-            _subbatchIdUAVs[i] = device.AllocateBindlessIndex();
-            device.CreateStructuredBufferUAV(_subbatchIdBuffers[i], (uint)MaxPatches, 4, _subbatchIdUAVs[i]);
-            _subbatchIdSRVs[i] = device.AllocateBindlessIndex();
-            device.CreateStructuredBufferSRV(_subbatchIdBuffers[i], (uint)MaxPatches, 4, _subbatchIdSRVs[i]);
-
-            // TerrainPatchData: 32 bytes
-            _terrainDataBuffers[i] = device.CreateDefaultBuffer(MaxPatches * 32);
-            _terrainDataUAVs[i] = device.AllocateBindlessIndex();
-            device.CreateStructuredBufferUAV(_terrainDataBuffers[i], (uint)MaxPatches, 32, _terrainDataUAVs[i]);
-            _terrainDataSRVs[i] = device.AllocateBindlessIndex();
-            device.CreateStructuredBufferSRV(_terrainDataBuffers[i], (uint)MaxPatches, 32, _terrainDataSRVs[i]);
-
-            // Counter: raw uint for atomic append
-            _counterBuffers[i] = device.CreateDefaultBuffer(4);
-            _counterUAVs[i] = device.AllocateBindlessIndex();
-            var rawUavDesc = new UnorderedAccessViewDescription
-            {
-                Format = Format.R32_Typeless,
-                ViewDimension = UnorderedAccessViewDimension.Buffer,
-                Buffer = new BufferUnorderedAccessView
-                {
-                    FirstElement = 0,
-                    NumElements = 1,
-                    Flags = BufferUnorderedAccessViewFlags.Raw,
-                }
-            };
-            device.NativeDevice.CreateUnorderedAccessView(
-                _counterBuffers[i], null, rawUavDesc, device.GetCpuHandle(_counterUAVs[i]));
-
-            var cpuHandle = _cpuHeap.GetCPUDescriptorHandleForHeapStart() + ((int)(i * incSize));
-            device.NativeDevice.CreateUnorderedAccessView(
-                _counterBuffers[i], null, rawUavDesc, cpuHandle);
-            _counterCPUHandles[i] = cpuHandle;
-
-            // Indirect args buffer: 16 bytes for DrawInstancedArguments
-            _indirectArgsBuffers[i] = device.CreateDefaultBuffer(16);
-            _indirectArgsUAVs[i] = device.AllocateBindlessIndex();
-            var argsUavDesc = new UnorderedAccessViewDescription
-            {
-                Format = Format.R32_Typeless,
-                ViewDimension = UnorderedAccessViewDimension.Buffer,
-                Buffer = new BufferUnorderedAccessView
-                {
-                    FirstElement = 0,
-                    NumElements = 4,
-                    Flags = BufferUnorderedAccessViewFlags.Raw,
-                }
-            };
-            device.NativeDevice.CreateUnorderedAccessView(
-                _indirectArgsBuffers[i], null, argsUavDesc, device.GetCpuHandle(_indirectArgsUAVs[i]));
-            _indirectArgsSRVs[i] = device.AllocateBindlessIndex();
-            var argsSrvDesc = new ShaderResourceViewDescription
-            {
-                Format = Format.R32_Typeless,
-                ViewDimension = Vortice.Direct3D12.ShaderResourceViewDimension.Buffer,
-                Shader4ComponentMapping = ShaderComponentMapping.Default,
-                Buffer = new BufferShaderResourceView
-                {
-                    FirstElement = 0,
-                    NumElements = 4,
-                    Flags = BufferShaderResourceViewFlags.Raw,
-                }
-            };
-            device.NativeDevice.CreateShaderResourceView(
-                _indirectArgsBuffers[i], argsSrvDesc, device.GetCpuHandle(_indirectArgsSRVs[i]));
-
-            // Shadow indirect args buffer: 16 bytes (4 DrawInstanced uints)
-            _shadowArgsBuffers[i] = device.CreateDefaultBuffer(16);
-            _shadowArgsUAVs[i] = device.AllocateBindlessIndex();
-            var shadowArgsUavDesc = new UnorderedAccessViewDescription
-            {
-                Format = Format.R32_Typeless,
-                ViewDimension = UnorderedAccessViewDimension.Buffer,
-                Buffer = new BufferUnorderedAccessView
-                {
-                    FirstElement = 0,
-                    NumElements = 4,
-                    Flags = BufferUnorderedAccessViewFlags.Raw,
-                }
-            };
-            device.NativeDevice.CreateUnorderedAccessView(
-                _shadowArgsBuffers[i], null, shadowArgsUavDesc, device.GetCpuHandle(_shadowArgsUAVs[i]));
-
-            // ── Shadow emit output buffers ──
-            // Sized for MaxPatches * MaxCascades entries (per-cascade compacted output)
             int shadowCapacity = MaxPatches * DirectionalLight.CascadeCount;
 
-            _shadowDescriptorBuffers[i] = device.CreateDefaultBuffer(shadowCapacity * 12);
-            _shadowDescriptorUAVs[i] = device.AllocateBindlessIndex();
-            device.CreateStructuredBufferUAV(_shadowDescriptorBuffers[i], (uint)shadowCapacity, 12, _shadowDescriptorUAVs[i]);
-            _shadowDescriptorSRVs[i] = device.AllocateBindlessIndex();
-            device.CreateStructuredBufferSRV(_shadowDescriptorBuffers[i], (uint)shadowCapacity, 12, _shadowDescriptorSRVs[i]);
+            // Structured buffers with SRV + UAV
+            _descriptorBuffers[i] = GraphicsBuffer.CreateStructured(MaxPatches, 12, srv: true, uav: true);
+            _sphereBuffers[i] = GraphicsBuffer.CreateStructured(MaxPatches, 16, srv: true, uav: true);
+            _subbatchIdBuffers[i] = GraphicsBuffer.CreateStructured(MaxPatches, 4, srv: true, uav: true);
+            _terrainDataBuffers[i] = GraphicsBuffer.CreateStructured(MaxPatches, 32, srv: true, uav: true);
 
-            _shadowTerrainDataBuffers[i] = device.CreateDefaultBuffer(shadowCapacity * 32);
-            _shadowTerrainDataUAVs[i] = device.AllocateBindlessIndex();
-            device.CreateStructuredBufferUAV(_shadowTerrainDataBuffers[i], (uint)shadowCapacity, 32, _shadowTerrainDataUAVs[i]);
-            _shadowTerrainDataSRVs[i] = device.AllocateBindlessIndex();
-            device.CreateStructuredBufferSRV(_shadowTerrainDataBuffers[i], (uint)shadowCapacity, 32, _shadowTerrainDataSRVs[i]);
+            // Raw R32 buffers
+            _counterBuffers[i] = GraphicsBuffer.CreateRaw(1, uav: true, clearable: true);
+            _splitFlagsBuffers[i] = GraphicsBuffer.CreateRaw(_totalNodes, uav: true, clearable: true);
+            _indirectArgsBuffers[i] = GraphicsBuffer.CreateRaw(4, srv: true, uav: true);
+            _shadowArgsBuffers[i] = GraphicsBuffer.CreateRaw(4, uav: true);
 
-            _shadowSphereBuffers[i] = device.CreateDefaultBuffer(shadowCapacity * 16);
-            _shadowSphereUAVs[i] = device.AllocateBindlessIndex();
-            device.CreateStructuredBufferUAV(_shadowSphereBuffers[i], (uint)shadowCapacity, 16, _shadowSphereUAVs[i]);
-
-            _shadowSubbatchIdBuffers[i] = device.CreateDefaultBuffer(shadowCapacity * 4);
-            _shadowSubbatchIdUAVs[i] = device.AllocateBindlessIndex();
-            device.CreateStructuredBufferUAV(_shadowSubbatchIdBuffers[i], (uint)shadowCapacity, 4, _shadowSubbatchIdUAVs[i]);
-
-            // CascadeIdx: uint per entry
-            _shadowCascadeIdxBuffers[i] = device.CreateDefaultBuffer(shadowCapacity * 4);
-            _shadowCascadeIdxUAVs[i] = device.AllocateBindlessIndex();
-            device.CreateStructuredBufferUAV(_shadowCascadeIdxBuffers[i], (uint)shadowCapacity, 4, _shadowCascadeIdxUAVs[i]);
-            _shadowCascadeIdxSRVs[i] = device.AllocateBindlessIndex();
-            device.CreateStructuredBufferSRV(_shadowCascadeIdxBuffers[i], (uint)shadowCapacity, 4, _shadowCascadeIdxSRVs[i]);
-
-            _shadowCounterBuffers[i] = device.CreateDefaultBuffer(4);
-            _shadowCounterUAVs[i] = device.AllocateBindlessIndex();
-            device.NativeDevice.CreateUnorderedAccessView(
-                _shadowCounterBuffers[i], null, rawUavDesc, device.GetCpuHandle(_shadowCounterUAVs[i]));
-            var shadowCounterCpuHandle = _cpuHeap.GetCPUDescriptorHandleForHeapStart() + ((int)((FrameCount * 2 + i) * incSize));
-            device.NativeDevice.CreateUnorderedAccessView(
-                _shadowCounterBuffers[i], null, rawUavDesc, shadowCounterCpuHandle);
-            _shadowCounterCPUHandles[i] = shadowCounterCpuHandle;
-
-            // SplitFlags buffer: 1 uint per node for atomic writes
-            uint splitFlagsSize = (uint)(_totalNodes * 4);
-            _splitFlagsBuffers[i] = device.CreateDefaultBuffer((int)splitFlagsSize);
-            _splitFlagsUAVs[i] = device.AllocateBindlessIndex();
-            var splitFlagsUavDesc = new UnorderedAccessViewDescription
-            {
-                Format = Format.R32_Typeless,
-                ViewDimension = UnorderedAccessViewDimension.Buffer,
-                Buffer = new BufferUnorderedAccessView
-                {
-                    FirstElement = 0,
-                    NumElements = (uint)_totalNodes,
-                    Flags = BufferUnorderedAccessViewFlags.Raw,
-                }
-            };
-            device.NativeDevice.CreateUnorderedAccessView(
-                _splitFlagsBuffers[i], null, splitFlagsUavDesc, device.GetCpuHandle(_splitFlagsUAVs[i]));
-
-            // CPU handle for splitFlags clear
-            var splitFlagsCpuHandle = _cpuHeap.GetCPUDescriptorHandleForHeapStart() + ((int)((FrameCount + i) * incSize));
-            device.NativeDevice.CreateUnorderedAccessView(
-                _splitFlagsBuffers[i], null, splitFlagsUavDesc, splitFlagsCpuHandle);
-            _splitFlagsCPUHandles[i] = splitFlagsCpuHandle;
-
+            // Shadow structured buffers
+            _shadowDescriptorBuffers[i] = GraphicsBuffer.CreateStructured(shadowCapacity, 12, srv: true, uav: true);
+            _shadowTerrainDataBuffers[i] = GraphicsBuffer.CreateStructured(shadowCapacity, 32, srv: true, uav: true);
+            _shadowSphereBuffers[i] = GraphicsBuffer.CreateStructured(shadowCapacity, 16, uav: true);
+            _shadowSubbatchIdBuffers[i] = GraphicsBuffer.CreateStructured(shadowCapacity, 4, uav: true);
+            _shadowCascadeIdxBuffers[i] = GraphicsBuffer.CreateStructured(shadowCapacity, 4, srv: true, uav: true);
+            _shadowCounterBuffers[i] = GraphicsBuffer.CreateRaw(1, uav: true, clearable: true);
         }
 
         /// <summary>
@@ -526,22 +337,12 @@ namespace Freefall.Components
         {
             var device = Engine.Device;
 
-            // If buffers were left in SRV state from the previous frame, transition back to UAV
-            if (_buffersInSRV[frameIndex])
-            {
-                commandList.ResourceBarrier(new ResourceBarrier(new ResourceTransitionBarrier(_descriptorBuffers[frameIndex], ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess)));
-                commandList.ResourceBarrier(new ResourceBarrier(new ResourceTransitionBarrier(_sphereBuffers[frameIndex], ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess)));
-                commandList.ResourceBarrier(new ResourceBarrier(new ResourceTransitionBarrier(_subbatchIdBuffers[frameIndex], ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess)));
-                commandList.ResourceBarrier(new ResourceBarrier(new ResourceTransitionBarrier(_terrainDataBuffers[frameIndex], ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess)));
-                _buffersInSRV[frameIndex] = false;
-            }
-
-            // Transition indirect args back to UAV if it was used as IndirectArgument last frame
-            if (_indirectArgsInArgState[frameIndex])
-            {
-                commandList.ResourceBarrier(new ResourceBarrier(new ResourceTransitionBarrier(_indirectArgsBuffers[frameIndex], ResourceStates.IndirectArgument, ResourceStates.UnorderedAccess)));
-                _indirectArgsInArgState[frameIndex] = false;
-            }
+            // Transition buffers to UAV (no-op if already in UAV state)
+            _descriptorBuffers[frameIndex].Transition(commandList, ResourceStates.UnorderedAccess);
+            _sphereBuffers[frameIndex].Transition(commandList, ResourceStates.UnorderedAccess);
+            _subbatchIdBuffers[frameIndex].Transition(commandList, ResourceStates.UnorderedAccess);
+            _terrainDataBuffers[frameIndex].Transition(commandList, ResourceStates.UnorderedAccess);
+            _indirectArgsBuffers[frameIndex].Transition(commandList, ResourceStates.UnorderedAccess);
 
             // Set compute root signature and descriptor heap
             commandList.SetComputeRootSignature(device.GlobalRootSignature);
@@ -551,22 +352,10 @@ namespace Freefall.Components
             UploadFrustumConstants(frameIndex);
             commandList.SetComputeRootConstantBufferView(1, _frustumConstantBuffers[frameIndex].GPUVirtualAddress);
 
-            // Clear counter to zero
-            commandList.ClearUnorderedAccessViewUint(
-                device.GetGpuHandle(_counterUAVs[frameIndex]),
-                _counterCPUHandles[frameIndex],
-                _counterBuffers[frameIndex],
-                new Vortice.Mathematics.Int4(0, 0, 0, 0));
-
+            // Clear counter and splitFlags to zero
+            _counterBuffers[frameIndex].ClearUAV(commandList, new Vortice.Mathematics.Int4(0, 0, 0, 0));
             commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(null)));
-
-            // Clear splitFlags buffer to zero
-            commandList.ClearUnorderedAccessViewUint(
-                device.GetGpuHandle(_splitFlagsUAVs[frameIndex]),
-                _splitFlagsCPUHandles[frameIndex],
-                _splitFlagsBuffers[frameIndex],
-                new Vortice.Mathematics.Int4(0, 0, 0, 0));
-
+            _splitFlagsBuffers[frameIndex].ClearUAV(commandList, new Vortice.Mathematics.Int4(0, 0, 0, 0));
             commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(null)));
 
             // Compute root/extents (LOCAL SPACE)
@@ -585,13 +374,13 @@ namespace Freefall.Components
 
             // Push constants (Indices[0..7] = 32 dwords) — shared by all passes
             // Indices[0]: UAV outputs
-            commandList.SetComputeRoot32BitConstant(0, _descriptorUAVs[frameIndex], 0);     // Indices[0].x
-            commandList.SetComputeRoot32BitConstant(0, _sphereUAVs[frameIndex], 1);          // Indices[0].y
-            commandList.SetComputeRoot32BitConstant(0, _subbatchIdUAVs[frameIndex], 2);      // Indices[0].z
-            commandList.SetComputeRoot32BitConstant(0, _terrainDataUAVs[frameIndex], 3);     // Indices[0].w
+            commandList.SetComputeRoot32BitConstant(0, _descriptorBuffers[frameIndex].UavIndex, 0);     // Indices[0].x
+            commandList.SetComputeRoot32BitConstant(0, _sphereBuffers[frameIndex].UavIndex, 1);          // Indices[0].y
+            commandList.SetComputeRoot32BitConstant(0, _subbatchIdBuffers[frameIndex].UavIndex, 2);      // Indices[0].z
+            commandList.SetComputeRoot32BitConstant(0, _terrainDataBuffers[frameIndex].UavIndex, 3);     // Indices[0].w
             
             // Indices[1]: control params
-            commandList.SetComputeRoot32BitConstant(0, _counterUAVs[frameIndex], 4);         // Indices[1].x
+            commandList.SetComputeRoot32BitConstant(0, _counterBuffers[frameIndex].UavIndex, 4);         // Indices[1].x
             commandList.SetComputeRoot32BitConstant(0, (uint)MaxDepth, 5);                   // Indices[1].y
             commandList.SetComputeRoot32BitConstant(0, (uint)Transform.TransformSlot, 6);    // Indices[1].z
             commandList.SetComputeRoot32BitConstant(0, (uint)(Material?.MaterialID ?? 0), 7);// Indices[1].w
@@ -618,7 +407,7 @@ namespace Freefall.Components
             // Indices[5]: root extents z + max patches + splitFlags UAV + maxHeight
             commandList.SetComputeRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(rootExtents.Z), 20);  // Indices[5].x
             commandList.SetComputeRoot32BitConstant(0, (uint)MaxPatches, 21);                                // Indices[5].y
-            commandList.SetComputeRoot32BitConstant(0, _splitFlagsUAVs[frameIndex], 22);                    // Indices[5].z
+            commandList.SetComputeRoot32BitConstant(0, _splitFlagsBuffers[frameIndex].UavIndex, 22);         // Indices[5].z
             commandList.SetComputeRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(maxHeight), 23);     // Indices[5].w
 
             // Indices[6]: HeightRangeSRV + TerrainSize + (BuildMip unused at runtime)
@@ -668,7 +457,7 @@ namespace Freefall.Components
             // ── Pass 3: Build DrawInstanced indirect args from counter ──
             // Set slot 29 (MipInputSRV) = mesh index count for CSBuildDrawArgs
             commandList.SetComputeRoot32BitConstant(0, (uint)_patchMesh.IndexCount, 29);  // Indices[7].y = vertex count per instance
-            commandList.SetComputeRoot32BitConstant(0, _indirectArgsUAVs[frameIndex], 31); // Indices[7].w = IndirectArgsUAV
+            commandList.SetComputeRoot32BitConstant(0, _indirectArgsBuffers[frameIndex].UavIndex, 31); // Indices[7].w = IndirectArgsUAV
             commandList.SetPipelineState(_buildDrawArgsPSO);
             commandList.Dispatch(1, 1, 1);
 
@@ -676,15 +465,13 @@ namespace Freefall.Components
             commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(null)));
 
             // Transition indirect args buffer for ExecuteIndirect
-            commandList.ResourceBarrier(new ResourceBarrier(new ResourceTransitionBarrier(_indirectArgsBuffers[frameIndex], ResourceStates.UnorderedAccess, ResourceStates.IndirectArgument)));
-            _indirectArgsInArgState[frameIndex] = true;
+            _indirectArgsBuffers[frameIndex].Transition(commandList, ResourceStates.IndirectArgument);
 
             // Transition output buffers from UAV to SRV for vertex shader reads
-            commandList.ResourceBarrier(new ResourceBarrier(new ResourceTransitionBarrier(_descriptorBuffers[frameIndex], ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource)));
-            commandList.ResourceBarrier(new ResourceBarrier(new ResourceTransitionBarrier(_sphereBuffers[frameIndex], ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource)));
-            commandList.ResourceBarrier(new ResourceBarrier(new ResourceTransitionBarrier(_subbatchIdBuffers[frameIndex], ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource)));
-            commandList.ResourceBarrier(new ResourceBarrier(new ResourceTransitionBarrier(_terrainDataBuffers[frameIndex], ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource)));
-            _buffersInSRV[frameIndex] = true;
+            _descriptorBuffers[frameIndex].Transition(commandList, ResourceStates.NonPixelShaderResource);
+            _sphereBuffers[frameIndex].Transition(commandList, ResourceStates.NonPixelShaderResource);
+            _subbatchIdBuffers[frameIndex].Transition(commandList, ResourceStates.NonPixelShaderResource);
+            _terrainDataBuffers[frameIndex].Transition(commandList, ResourceStates.NonPixelShaderResource);
 
             // Store VP for next frame's Hi-Z occlusion projection
             _previousFrameViewProjection = Camera.Main.ViewProjection;
@@ -712,9 +499,9 @@ namespace Freefall.Components
 
             // Set root constants for push constant slots used by the vertex shader
             // Slot 1: TerrainPatchData SRV
-            commandList.SetGraphicsRoot32BitConstant(0, _terrainDataSRVs[frameIndex], 1);
+            commandList.SetGraphicsRoot32BitConstant(0, _terrainDataBuffers[frameIndex].SrvIndex, 1);
             // Slot 2: InstanceDescriptor SRV
-            commandList.SetGraphicsRoot32BitConstant(0, _descriptorSRVs[frameIndex], 2);
+            commandList.SetGraphicsRoot32BitConstant(0, _descriptorBuffers[frameIndex].SrvIndex, 2);
 
             // Slot 7: Index buffer SRV
             commandList.SetGraphicsRoot32BitConstant(0, _patchMesh.IndexBufferIndex, 7);
@@ -731,7 +518,7 @@ namespace Freefall.Components
             commandList.ExecuteIndirect(
                 device.DrawInstancedSignature,
                 1,
-                _indirectArgsBuffers[frameIndex],
+                _indirectArgsBuffers[frameIndex].Native,
                 0,
                 null,
                 0);
@@ -777,54 +564,39 @@ namespace Freefall.Components
                 cascadePtr[c].SetPlanes(localPlanes);
             }
 
-            // Transition shadow output buffers to UAV
-            if (_shadowBuffersInSRV[frameIndex])
-            {
-                commandList.ResourceBarrier(new ResourceBarrier(new ResourceTransitionBarrier(_shadowDescriptorBuffers[frameIndex], ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess)));
-                commandList.ResourceBarrier(new ResourceBarrier(new ResourceTransitionBarrier(_shadowTerrainDataBuffers[frameIndex], ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess)));
-                commandList.ResourceBarrier(new ResourceBarrier(new ResourceTransitionBarrier(_shadowCascadeIdxBuffers[frameIndex], ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess)));
-                _shadowBuffersInSRV[frameIndex] = false;
-            }
+            // Transition shadow output buffers to UAV (no-op if already in UAV)
+            _shadowDescriptorBuffers[frameIndex].Transition(commandList, ResourceStates.UnorderedAccess);
+            _shadowTerrainDataBuffers[frameIndex].Transition(commandList, ResourceStates.UnorderedAccess);
+            _shadowCascadeIdxBuffers[frameIndex].Transition(commandList, ResourceStates.UnorderedAccess);
 
-            // Readback shadow args (while still in IndirectArgument state)
-            if (_shadowArgsInArgState[frameIndex] && _shadowArgsReadback != null)
+            // Readback shadow args (transition through CopySource if needed)
+            if (_shadowArgsBuffers[frameIndex].CurrentState == ResourceStates.IndirectArgument && _shadowArgsReadback != null)
             {
-                commandList.ResourceBarrier(new ResourceBarrier(new ResourceTransitionBarrier(_shadowArgsBuffers[frameIndex], ResourceStates.IndirectArgument, ResourceStates.CopySource)));
-                commandList.CopyResource(_shadowArgsReadback, _shadowArgsBuffers[frameIndex]);
-                commandList.ResourceBarrier(new ResourceBarrier(new ResourceTransitionBarrier(_shadowArgsBuffers[frameIndex], ResourceStates.CopySource, ResourceStates.UnorderedAccess)));
-                _shadowArgsInArgState[frameIndex] = false;
+                _shadowArgsBuffers[frameIndex].Transition(commandList, ResourceStates.CopySource);
+                commandList.CopyResource(_shadowArgsReadback, _shadowArgsBuffers[frameIndex].Native);
             }
-            // Transition shadow args to UAV if needed (no readback)
-            else if (_shadowArgsInArgState[frameIndex])
-            {
-                commandList.ResourceBarrier(new ResourceBarrier(new ResourceTransitionBarrier(_shadowArgsBuffers[frameIndex], ResourceStates.IndirectArgument, ResourceStates.UnorderedAccess)));
-                _shadowArgsInArgState[frameIndex] = false;
-            }
+            _shadowArgsBuffers[frameIndex].Transition(commandList, ResourceStates.UnorderedAccess);
 
             // Switch to compute pipeline
             commandList.SetComputeRootSignature(device.GlobalRootSignature);
             commandList.SetDescriptorHeaps(1, new[] { device.SrvHeap });
 
             // Clear shadow counter
-            commandList.ClearUnorderedAccessViewUint(
-                device.GetGpuHandle(_shadowCounterUAVs[frameIndex]),
-                _shadowCounterCPUHandles[frameIndex],
-                _shadowCounterBuffers[frameIndex],
-                new Vortice.Mathematics.Int4(0, 0, 0, 0));
+            _shadowCounterBuffers[frameIndex].ClearUAV(commandList, new Vortice.Mathematics.Int4(0, 0, 0, 0));
 
             // Bind shadow output UAVs
-            commandList.SetComputeRoot32BitConstant(0, _shadowDescriptorUAVs[frameIndex], 0);  // OutputDescriptorsUAV
-            commandList.SetComputeRoot32BitConstant(0, _shadowSphereUAVs[frameIndex], 1);       // OutputSpheresUAV
-            commandList.SetComputeRoot32BitConstant(0, _shadowSubbatchIdUAVs[frameIndex], 2);   // OutputSubbatchIdsUAV
-            commandList.SetComputeRoot32BitConstant(0, _shadowTerrainDataUAVs[frameIndex], 3);  // OutputTerrainDataUAV
-            commandList.SetComputeRoot32BitConstant(0, _shadowCounterUAVs[frameIndex], 4);      // CounterUAV
+            commandList.SetComputeRoot32BitConstant(0, _shadowDescriptorBuffers[frameIndex].UavIndex, 0);  // OutputDescriptorsUAV
+            commandList.SetComputeRoot32BitConstant(0, _shadowSphereBuffers[frameIndex].UavIndex, 1);       // OutputSpheresUAV
+            commandList.SetComputeRoot32BitConstant(0, _shadowSubbatchIdBuffers[frameIndex].UavIndex, 2);   // OutputSubbatchIdsUAV
+            commandList.SetComputeRoot32BitConstant(0, _shadowTerrainDataBuffers[frameIndex].UavIndex, 3);  // OutputTerrainDataUAV
+            commandList.SetComputeRoot32BitConstant(0, _shadowCounterBuffers[frameIndex].UavIndex, 4);      // CounterUAV
 
             // Quadtree constants
             commandList.SetComputeRoot32BitConstant(0, (uint)MaxDepth, 5);
             commandList.SetComputeRoot32BitConstant(0, (uint)Transform.TransformSlot, 6);
             commandList.SetComputeRoot32BitConstant(0, (uint)(Material?.MaterialID ?? 0), 7);
             commandList.SetComputeRoot32BitConstant(0, (uint)_meshPartId, 8);
-            commandList.SetComputeRoot32BitConstant(0, _shadowCascadeIdxUAVs[frameIndex], 9);   // CascadeIdxUAV (slot 9)
+            commandList.SetComputeRoot32BitConstant(0, _shadowCascadeIdxBuffers[frameIndex].UavIndex, 9);   // CascadeIdxUAV (slot 9)
             commandList.SetComputeRoot32BitConstant(0, (uint)_totalNodes, 10);
             var htIdx = Terrain!.Heightmap?.BindlessIndex ?? 0u;
             commandList.SetComputeRoot32BitConstant(0, htIdx, 11);
@@ -845,7 +617,7 @@ namespace Freefall.Components
 
             int shadowMaxPatches = MaxPatches * cascadeCount;
             commandList.SetComputeRoot32BitConstant(0, (uint)shadowMaxPatches, 21);             // MaxPatches (shadow capacity)
-            commandList.SetComputeRoot32BitConstant(0, _splitFlagsUAVs[frameIndex], 22);
+            commandList.SetComputeRoot32BitConstant(0, _splitFlagsBuffers[frameIndex].UavIndex, 22);
             commandList.SetComputeRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(Terrain.MaxHeight), 23);
             commandList.SetComputeRoot32BitConstant(0, _heightRangePyramidSRV, 24);
 
@@ -870,7 +642,7 @@ namespace Freefall.Components
 
             // Build draw args from shadow counter (reuse CSBuildDrawArgs)
             commandList.SetComputeRoot32BitConstant(0, (uint)_patchMesh.IndexCount, 29);        // VertexCount
-            commandList.SetComputeRoot32BitConstant(0, _shadowArgsUAVs[frameIndex], 31);        // IndirectArgsUAV
+            commandList.SetComputeRoot32BitConstant(0, _shadowArgsBuffers[frameIndex].UavIndex, 31);        // IndirectArgsUAV
             commandList.SetPipelineState(_buildDrawArgsPSO);
             commandList.Dispatch(1, 1, 1);
 
@@ -878,10 +650,9 @@ namespace Freefall.Components
             commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(null)));
 
             // Transition shadow output to SRV for VS_Shadow
-            commandList.ResourceBarrier(new ResourceBarrier(new ResourceTransitionBarrier(_shadowDescriptorBuffers[frameIndex], ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource)));
-            commandList.ResourceBarrier(new ResourceBarrier(new ResourceTransitionBarrier(_shadowTerrainDataBuffers[frameIndex], ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource)));
-            commandList.ResourceBarrier(new ResourceBarrier(new ResourceTransitionBarrier(_shadowCascadeIdxBuffers[frameIndex], ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource)));
-            _shadowBuffersInSRV[frameIndex] = true;
+            _shadowDescriptorBuffers[frameIndex].Transition(commandList, ResourceStates.NonPixelShaderResource);
+            _shadowTerrainDataBuffers[frameIndex].Transition(commandList, ResourceStates.NonPixelShaderResource);
+            _shadowCascadeIdxBuffers[frameIndex].Transition(commandList, ResourceStates.NonPixelShaderResource);
 
             // ════════════════════════════════════════════════════════════════
             // Phase 2: Draw terrain shadows (graphics)
@@ -894,8 +665,8 @@ namespace Freefall.Components
             commandList.SetDescriptorHeaps(1, new[] { device.SrvHeap });
 
             // Bind shadow patch data
-            commandList.SetGraphicsRoot32BitConstant(0, _shadowTerrainDataSRVs[frameIndex], 1);  // TerrainDataIdx
-            commandList.SetGraphicsRoot32BitConstant(0, _shadowDescriptorSRVs[frameIndex], 2);   // DescriptorBufIdx
+            commandList.SetGraphicsRoot32BitConstant(0, _shadowTerrainDataBuffers[frameIndex].SrvIndex, 1);  // TerrainDataIdx
+            commandList.SetGraphicsRoot32BitConstant(0, _shadowDescriptorBuffers[frameIndex].SrvIndex, 2);   // DescriptorBufIdx
             commandList.SetGraphicsRoot32BitConstant(0, _patchMesh.IndexBufferIndex, 7);          // IndexBufferIdx
             commandList.SetGraphicsRoot32BitConstant(0, 0u, 8);                                   // BaseIndex
             commandList.SetGraphicsRoot32BitConstant(0, _patchMesh.PosBufferIndex, 9);            // PosBufferIdx
@@ -904,18 +675,16 @@ namespace Freefall.Components
             // Shadow-specific push constants
             commandList.SetGraphicsRoot32BitConstant(0, DirectionalLight.CurrentCascadeSrvIndex, 20); // CascadeBufferSRVIdx
             commandList.SetGraphicsRoot32BitConstant(0, (uint)cascadeCount, 21);                       // ShadowCascadeCount
-            commandList.SetGraphicsRoot32BitConstant(0, _shadowCascadeIdxSRVs[frameIndex], 22);        // CascadeIdxBufIdx
+            commandList.SetGraphicsRoot32BitConstant(0, _shadowCascadeIdxBuffers[frameIndex].SrvIndex, 22);        // CascadeIdxBufIdx
 
             // Transition shadow args to IndirectArgument
-            commandList.ResourceBarrier(new ResourceBarrier(new ResourceTransitionBarrier(
-                _shadowArgsBuffers[frameIndex], ResourceStates.UnorderedAccess, ResourceStates.IndirectArgument)));
-            _shadowArgsInArgState[frameIndex] = true;
+            _shadowArgsBuffers[frameIndex].Transition(commandList, ResourceStates.IndirectArgument);
 
             // ExecuteIndirect — instance count is compacted per-cascade count
             commandList.ExecuteIndirect(
                 device.DrawInstancedSignature,
                 1,
-                _shadowArgsBuffers[frameIndex],
+                _shadowArgsBuffers[frameIndex].Native,
                 0,
                 null,
                 0);

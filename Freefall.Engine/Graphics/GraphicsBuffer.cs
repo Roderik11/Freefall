@@ -138,6 +138,84 @@ namespace Freefall.Graphics
         }
 
         /// <summary>
+        /// Create a GPU-only (default heap) structured buffer with explicit stride (no generic type).
+        /// </summary>
+        public static GraphicsBuffer CreateStructured(
+            int count,
+            int stride,
+            bool srv = false,
+            bool uav = false,
+            ResourceStates initialState = ResourceStates.Common)
+        {
+            var device = Engine.Device;
+            int size = count * stride;
+
+            var resource = device.CreateDefaultBuffer(size);
+
+            uint srvIndex = 0;
+            if (srv)
+            {
+                srvIndex = device.AllocateBindlessIndex();
+                device.CreateStructuredBufferSRV(resource, (uint)count, (uint)stride, srvIndex);
+            }
+
+            uint uavIndex = 0;
+            CpuDescriptorHandle clearHandle = default;
+            bool hasClear = false;
+            if (uav)
+            {
+                uavIndex = device.AllocateBindlessIndex();
+                device.CreateStructuredBufferUAV(resource, (uint)count, (uint)stride, uavIndex);
+
+                clearHandle = device.AllocateClearHandle(resource, (uint)count, (uint)stride);
+                hasClear = true;
+            }
+
+            return new GraphicsBuffer(device, resource, count, stride, srvIndex, uavIndex, initialState, clearHandle, hasClear);
+        }
+
+        /// <summary>
+        /// Create a GPU-only (default heap) raw R32 buffer with optional SRV and/or UAV.
+        /// Used for counters, indirect args, and other raw uint buffers.
+        /// </summary>
+        public static GraphicsBuffer CreateRaw(
+            int elementCount,
+            bool srv = false,
+            bool uav = false,
+            bool clearable = false,
+            ResourceStates initialState = ResourceStates.Common)
+        {
+            var device = Engine.Device;
+            int size = elementCount * 4;
+
+            var resource = device.CreateDefaultBuffer(size);
+
+            uint srvIndex = 0;
+            if (srv)
+            {
+                srvIndex = device.AllocateBindlessIndex();
+                device.CreateRawBufferSRV(resource, (uint)elementCount, srvIndex);
+            }
+
+            uint uavIndex = 0;
+            CpuDescriptorHandle clearHandle = default;
+            bool hasClear = false;
+            if (uav)
+            {
+                uavIndex = device.AllocateBindlessIndex();
+                device.CreateRawBufferUAV(resource, (uint)elementCount, uavIndex);
+
+                if (clearable)
+                {
+                    clearHandle = device.AllocateRawClearHandle(resource, (uint)elementCount);
+                    hasClear = true;
+                }
+            }
+
+            return new GraphicsBuffer(device, resource, elementCount, 4, srvIndex, uavIndex, initialState, clearHandle, hasClear);
+        }
+
+        /// <summary>
         /// Create an upload heap structured buffer with SRV (for CPU→GPU data like constant arrays).
         /// </summary>
         public static GraphicsBuffer CreateUpload<T>(int count) where T : unmanaged
