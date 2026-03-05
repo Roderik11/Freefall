@@ -1257,10 +1257,10 @@ namespace Freefall.Components
 
             // Dispatch via ComputeShader
             _decoPrepassCS ??= new ComputeShader("decoration_prepass.hlsl", "CSBuildDecoControl");
-            _decoPrepassCS.SetUint(0, (uint)DecoMapsArray.BindlessIndex);  // DecoMapsIdx
-            _decoPrepassCS.SetUint(1, _decoratorSlotsBuffer!.SrvIndex);     // SlotsIdx
-            _decoPrepassCS.SetUint(2, _decoControlUAV);                    // ControlUAVIdx
-            _decoPrepassCS.SetUint(3, slotCount);                          // SlotCount
+            _decoPrepassCS.Set("DecoMaps", DecoMapsArray);              // Texture → BindlessIndex
+            _decoPrepassCS.SetSRV("Slots", _decoratorSlotsBuffer!);     // GraphicsBuffer → SrvIndex
+            _decoPrepassCS.Set("ControlUAV", _decoControlUAV);          // uint (raw UAV index)
+            _decoPrepassCS.Set("SlotCount", slotCount);                  // uint
             _decoPrepassCS.Dispatch(cmd, (uint)((width + 7) / 8), (uint)((height + 7) / 8));
 
             cmd.ResourceBarrierUnorderedAccessView(_decoControlTex);
