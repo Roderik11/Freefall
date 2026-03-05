@@ -1,5 +1,5 @@
 #include "common.fx"
-// @RenderState(DepthTest=false, DepthWrite=false, Blend=Additive)
+// @RenderState(DepthTest=false, DepthWrite=false, Blend=Additive, CullMode=None, RenderTargetFormat=R16G16B16A16_Float)
 
 // Per-instance light data — packed into a StructuredBuffer, same pattern as terrain's TerrainPatchData
 struct PointLightData

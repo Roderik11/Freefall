@@ -440,11 +440,25 @@ namespace Freefall.Graphics
                  pair.Value.SetParameter("CameraRelativeVP", cvp);
              }
              
+             // Execute custom Light actions (directional light compute dispatch writes to UAV)
+             CommandBuffer.ExecuteCustomActions(RenderPass.Light, list);
+             CommandBuffer.ClearCustomActions(RenderPass.Light);
+             
+             // Transition LightBuffer from UAV → RenderTarget for point light rasterized draws
+             list.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(LightBuffer.Native)));
+             Transition(list, LightBuffer.Native, ResourceStates.UnorderedAccess, ResourceStates.RenderTarget);
+             
+             // Bind LightBuffer as RTV (no depth) for additive point light rendering
+             var vp = new Viewport(0, 0, LightBuffer.Native.Description.Width, LightBuffer.Native.Description.Height);
+             list.OMSetRenderTargets(LightBuffer.RtvHandle);
+             list.RSSetViewport(vp);
+             list.RSSetScissorRect(new RectI(0, 0, (int)LightBuffer.Native.Description.Width, (int)LightBuffer.Native.Description.Height));
+             
+             // Execute batched point light draws (rasterized, additive blend)
              CommandBuffer.Execute(RenderPass.Light, list, Engine.Device);
              
-             // UAV barrier then transition to SRV for composition
-             list.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(LightBuffer.Native)));
-             Transition(list, LightBuffer.Native, ResourceStates.UnorderedAccess, ResourceStates.PixelShaderResource);
+             // Transition to SRV for composition
+             Transition(list, LightBuffer.Native, ResourceStates.RenderTarget, ResourceStates.PixelShaderResource);
         }
 
         private void Compose(Camera camera, ID3D12GraphicsCommandList list)

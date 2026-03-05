@@ -194,6 +194,13 @@ namespace Freefall.Graphics
                 3 => new[] { Format.R16G16B16A16_Float, Format.R16G16B16A16_SNorm, Format.R8G8B8A8_UNorm }, // GBuffer
                 _ => new[] { Format.R8G8B8A8_UNorm } // Standard single target
             };
+            
+            // Override render target format if specified in shader metadata
+            if (renderState.RenderTargetFormat != null && renderState.RenderTargetCount <= 1)
+            {
+                if (Enum.TryParse<Format>(renderState.RenderTargetFormat, true, out var rtFormat))
+                    rtvFormats = new[] { rtFormat };
+            }
             Debug.Log($"[Material] RTV Formats Count: {rtvFormats.Length}");
 
             // In bindless, we use the Global Root Signature from the device

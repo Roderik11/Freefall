@@ -186,6 +186,9 @@ namespace Freefall.Graphics
                             case "DepthFunc":
                                 state.DepthFunc = value;  // "Less", "LessEqual", "Greater", "GreaterEqual", etc.
                                 break;
+                            case "RenderTargetFormat":
+                                state.RenderTargetFormat = value;  // DXGI_FORMAT name, e.g. "R16G16B16A16_Float"
+                                break;
                         }
                     }
                 }
@@ -235,5 +238,8 @@ namespace Freefall.Graphics
         
         /// <summary>Depth comparison function: "Less", "LessEqual", "Greater", "GreaterEqual" (default: GreaterEqual for reverse depth)</summary>
         public string DepthFunc { get; set; } = "GreaterEqual";
+        
+        /// <summary>Single render target format override: "R16G16B16A16_Float" etc. Null = use default.</summary>
+        public string? RenderTargetFormat { get; set; }
     }
 }
