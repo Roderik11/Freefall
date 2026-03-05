@@ -144,10 +144,10 @@ namespace Freefall.Components
             _diagFrameCount++;
             var camera = Camera.Main;
             if (camera == null) return;
+            var renderer = DeferredRenderer.Current;
+            if (renderer == null) return;
 
-            // Set Shader Params
-            // Zero-translation CameraInverse: even though GBuffer depth was written with full View,
-            // NDC = (worldPos - camPos) × R × P, so inverse(R × P) correctly gives camera-relative pos
+            // Populate cbuffer params (same as before — Material.Apply commits them)
             var cvp = Matrix4x4.CreateLookAtLeftHanded(Vector3.Zero, camera.Forward, camera.Up) * camera.Projection;
             Matrix4x4.Invert(cvp, out var cameraInverse);
             
@@ -158,33 +158,56 @@ namespace Freefall.Components
             Params.SetParameter("LightDirection", Transform.Forward);
             Params.SetParameter("LightIntensity", Intensity);
             
-            // Shadow parameters — camera-relative LightSpaces for lighting, Cascades for selection
             int cc = CascadeCount;
             Params.SetParameterArray("LightSpaces", lightSpace[..cc]);
             Params.SetParameterArray("Cascades", cascades[..cc]);
             Params.SetParameter("CascadeCount", cc);
             Params.SetParameter("DebugVisualizationMode", Engine.Settings.DebugVisualizationMode);
             
-            // GPU-computed cascade data SRV (0 = use cbuffer, >0 = use StructuredBuffer)
-            // Use SetTextureIndex on the Material (not Params) because this is a push constant slot,
-            // not a cbuffer parameter. The Material.Apply flow resolves it via _bindlessIndices.
+            // Apply params to Material cbuffers (commits data but we won't use its graphics PSO)
             Material.SetTextureIndex("LightingCascadeSRV", _activeLightingCascadeSrv);
+            if (renderer.ShadowTextureArray != null)
+                Params.SetTexture("ShadowMap", renderer.ShadowTextureArray);
+            Params.SetTexture("NormalTex", renderer.Normals);
+            Params.SetTexture("DepthTex", renderer.Depth);
+            Params.SetTexture("DepthGBuf", renderer.DepthGBuffer);
+            Params.SetTexture("AlbedoTex", renderer.Albedo);
+            Params.SetTexture("DataTex", renderer.Data);
             
-            if (DeferredRenderer.Current != null)
-            {
-                Params.SetTexture("ShadowMap", DeferredRenderer.Current.ShadowTextureArray);
-                Params.SetTexture("NormalTex", DeferredRenderer.Current.Normals);
-                Params.SetTexture("DepthTex", DeferredRenderer.Current.Depth);
-                Params.SetTexture("DepthGBuf", DeferredRenderer.Current.DepthGBuffer);
-                Params.SetTexture("AlbedoTex", DeferredRenderer.Current.Albedo);
-                Params.SetTexture("DataTex", DeferredRenderer.Current.Data);
-            }
-                
-            // Render fullscreen quad procedurally (shader uses SV_VertexID)
+            // Commit cbuffer data via Material.Apply (populates ObjectConstants + SceneConstants)
             Material.Apply(commandList, Engine.Device, Params);
-
-            commandList.IASetPrimitiveTopology(Vortice.Direct3D.PrimitiveTopology.TriangleStrip);
-            commandList.DrawInstanced(4, 1, 0, 0);
+            
+            // Switch to compute pipeline
+            commandList.SetComputeRootSignature(Engine.Device.GlobalRootSignature);
+            commandList.SetDescriptorHeaps(1, new[] { Engine.Device.SrvHeap });
+            commandList.SetPipelineState(renderer.DirectionalLightComputePSO);
+            
+            // Push constants: 10 slots
+            var desc = renderer.LightBuffer.Native.Description;
+            commandList.SetComputeRoot32BitConstant(0, renderer.Normals.BindlessIndex, 0);
+            commandList.SetComputeRoot32BitConstant(0, renderer.Depth.BindlessIndex, 1);
+            commandList.SetComputeRoot32BitConstant(0, renderer.ShadowTextureArray?.BindlessIndex ?? 0u, 2);
+            commandList.SetComputeRoot32BitConstant(0, renderer.DepthGBuffer.BindlessIndex, 3);
+            commandList.SetComputeRoot32BitConstant(0, renderer.Albedo.BindlessIndex, 4);
+            commandList.SetComputeRoot32BitConstant(0, renderer.Data.BindlessIndex, 5);
+            commandList.SetComputeRoot32BitConstant(0, _activeLightingCascadeSrv, 6);
+            commandList.SetComputeRoot32BitConstant(0, renderer.LightBuffer.UavIndex, 7);
+            commandList.SetComputeRoot32BitConstant(0, (uint)desc.Width, 8);
+            commandList.SetComputeRoot32BitConstant(0, (uint)desc.Height, 9);
+            
+            // Bind cbuffers on compute root (Material.Apply committed them on graphics root)
+            foreach (var cb in Material.ConstantBuffers)
+            {
+                if (cb.Slot >= 0)
+                {
+                    cb.Commit();
+                    commandList.SetComputeRootConstantBufferView((uint)cb.Slot, cb.GpuAddress);
+                }
+            }
+            
+            uint groupsX = ((uint)desc.Width + 7) / 8;
+            uint groupsY = ((uint)desc.Height + 7) / 8;
+            commandList.Dispatch(groupsX, groupsY, 1);
         }
 
         private void DrawShadows(ID3D12GraphicsCommandList commandList)

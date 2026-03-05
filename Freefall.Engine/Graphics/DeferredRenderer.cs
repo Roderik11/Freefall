@@ -37,6 +37,7 @@ namespace Freefall.Graphics
         private Material matClear = null!;
         private Material matDirectionalLight = null!;
         private ID3D12PipelineState _compositionComputePSO = null!;
+        public ID3D12PipelineState DirectionalLightComputePSO { get; private set; } = null!;
         
         private bool _isFirstFrame = true;
         private bool _compositeSnapshotFirstFrame = true;
@@ -76,6 +77,14 @@ namespace Freefall.Graphics
             _compositionComputePSO = Engine.Device.CreateComputePipelineState(csShader.Bytecode);
             csShader.Dispose();
 
+            // Compile directional light compute shader
+            string lightCsPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Resources", "Shaders", "light_directional_cs.hlsl");
+            string lightCsSource = File.ReadAllText(lightCsPath);
+            string lightIncludeDir = Path.GetDirectoryName(lightCsPath)!;
+            var lightCsShader = new Shader(lightCsSource, "CSDirectionalLight", "cs_6_6", lightIncludeDir);
+            DirectionalLightComputePSO = Engine.Device.CreateComputePipelineState(lightCsShader.Bytecode);
+            lightCsShader.Dispose();
+
             // Shadow Map Array (Cascades)
             ShadowTextureArray = new DepthTextureArray2D(2048, 2048, 4);
             
@@ -98,7 +107,7 @@ namespace Freefall.Graphics
             // Depth Texture
             Depth = new DepthTexture2D(width, height, Format.D32_Float, true);
 
-            LightBuffer = new RenderTexture2D(Engine.Device, width, height, Format.R16G16B16A16_Float);
+            LightBuffer = new RenderTexture2D(Engine.Device, width, height, Format.R16G16B16A16_Float, randomWrite: true);
             Composite = new RenderTexture2D(Engine.Device, width, height, Format.R8G8B8A8_UNorm, randomWrite: true);
         }
 
@@ -417,11 +426,7 @@ namespace Freefall.Graphics
         private void FillLightBuffer(Camera camera, ID3D12GraphicsCommandList list)
         {
              var fromState = _isFirstFrame ? ResourceStates.Common : ResourceStates.PixelShaderResource;
-             Transition(list, LightBuffer.Native, fromState, ResourceStates.RenderTarget);
-             list.OMSetRenderTargets(LightBuffer.RtvHandle, null); 
-             list.ClearRenderTargetView(LightBuffer.RtvHandle, new Color4(0,0,0,0));
-             list.RSSetViewport(new Viewport(0, 0, LightBuffer.Native.Description.Width, LightBuffer.Native.Description.Height));
-             list.RSSetScissorRect(new RectI(0, 0, (int)LightBuffer.Native.Description.Width, (int)LightBuffer.Native.Description.Height));
+             Transition(list, LightBuffer.Native, fromState, ResourceStates.UnorderedAccess);
 
              // Zero-translation CameraInverse: even though GBuffer depth was written with full View,
              // NDC = (worldPos - camPos) × R × P, so inverse(R × P) correctly gives camera-relative pos
@@ -434,8 +439,10 @@ namespace Freefall.Graphics
              }
              
              CommandBuffer.Execute(RenderPass.Light, list, Engine.Device);
-
-             Transition(list, LightBuffer.Native, ResourceStates.RenderTarget, ResourceStates.PixelShaderResource);
+             
+             // UAV barrier then transition to SRV for composition
+             list.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(LightBuffer.Native)));
+             Transition(list, LightBuffer.Native, ResourceStates.UnorderedAccess, ResourceStates.PixelShaderResource);
         }
 
         private void Compose(Camera camera, ID3D12GraphicsCommandList list)
@@ -519,12 +526,6 @@ namespace Freefall.Graphics
              Transition(list, Depth.Native, ResourceStates.DepthWrite, ResourceStates.PixelShaderResource);
         }
         
-        private void DrawFullscreenQuad(ID3D12GraphicsCommandList list, Material material, MaterialBlock? parameters = null)
-        {
-            material.Apply(list, Engine.Device, parameters);
-            list.IASetPrimitiveTopology(Vortice.Direct3D.PrimitiveTopology.TriangleStrip);
-            list.DrawInstanced(4, 1, 0, 0);
-        }
 
         private void BlitToBackBuffer(Camera camera, ID3D12GraphicsCommandList list)
         {
