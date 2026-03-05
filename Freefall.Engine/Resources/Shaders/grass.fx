@@ -379,6 +379,7 @@ void MS(
 
     // Per-cell CONTROL presence check: verify this decorator is active at this cell's position
     // (AS sampled at tile center for dispatch; MS refines per-cell for smooth boundaries)
+    float cellWeight = 1.0;  // density weight for this cell (0-1), used for scale bias
     if (alive && DecoControlIdx != 0)
     {
         Texture2DArray<uint4> controlTex = ResourceDescriptorHeap[DecoControlIdx];
@@ -397,7 +398,7 @@ void MS(
             uint packed = allCtrl[ci / 4][ci % 4];
             uint idx = packed >> 8;
             if (idx == 255) break;
-            if (idx == slotIdx) { found = true; break; }
+            if (idx == slotIdx) { cellWeight = (packed & 0xFF) / 255.0; found = true; break; }
         }
         if (!found) alive = false;
     }
@@ -462,9 +463,12 @@ void MS(
     }
 
     // ── Per-instance scale & rotation ──
-
-    float scaleH = lerp(slot.MinH, slot.MaxH, hash21(seed + 33.7));
-    float scaleW = lerp(slot.MinW, slot.MaxW, hash21(seed.yx + 77.9));
+    // Density-biased: dense areas grow taller/wider, sparse areas are smaller
+    float densityBias = lerp(0.3, 1.0, cellWeight);  // weight 0→30% scale, weight 1→100%
+    float randH = hash21(seed + 33.7);
+    float randW = hash21(seed.yx + 77.9);
+    float scaleH = lerp(slot.MinH, slot.MaxH, randH * densityBias);
+    float scaleW = lerp(slot.MinW, slot.MaxW, randW * densityBias);
     
     // Distance fade: smoothly shrink to zero in the last 25% of range
     float fadeStart = DecoRadius * 0.75;
@@ -1118,6 +1122,7 @@ void MS_Shadow(
     bool alive = texelUV.x >= 0 && texelUV.x <= 1 && texelUV.y >= 0 && texelUV.y <= 1;
 
     // Per-cell control check
+    float cellWeight = 1.0;
     if (alive && DecoControlIdx != 0)
     {
         Texture2DArray<uint4> controlTex = ResourceDescriptorHeap[DecoControlIdx];
@@ -1136,7 +1141,7 @@ void MS_Shadow(
             uint packed = allCtrl[ci / 4][ci % 4];
             uint idx = packed >> 8;
             if (idx == 255) break;
-            if (idx == slotIdx) { found = true; break; }
+            if (idx == slotIdx) { cellWeight = (packed & 0xFF) / 255.0; found = true; break; }
         }
         if (!found) alive = false;
     }
@@ -1228,9 +1233,12 @@ void MS_Shadow(
         return;
     }
 
-    // Scale & rotation
-    float scaleH = lerp(slot.MinH, slot.MaxH, hash21(seed + 33.7));
-    float scaleW = lerp(slot.MinW, slot.MaxW, hash21(seed.yx + 77.9));
+    // Scale & rotation (density-biased, matching opaque MS)
+    float densityBias = lerp(0.3, 1.0, cellWeight);
+    float randH = hash21(seed + 33.7);
+    float randW = hash21(seed.yx + 77.9);
+    float scaleH = lerp(slot.MinH, slot.MaxH, randH * densityBias);
+    float scaleW = lerp(slot.MinW, slot.MaxW, randW * densityBias);
 
     // Distance fade
     float camDist = distance(instancePos, camPos);
