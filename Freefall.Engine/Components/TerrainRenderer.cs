@@ -133,12 +133,9 @@ namespace Freefall.Components
         private bool[] _indirectArgsInArgState = new bool[FrameCount]; // indirect args in IndirectArgument state
 
         // ───── Ground Coverage Decorator ──────────────────────────────────
-        private ID3D12Resource? _decoratorHeadersBuffer;
-        private ID3D12Resource? _decoratorSlotsBuffer;
-        private ID3D12Resource? _decoratorLODTableBuffer;
-        private uint _decoratorHeadersSRV;
-        private uint _decoratorSlotsSRV;
-        private uint _decoratorLODTableSRV;
+        private GraphicsBuffer? _decoratorHeadersBuffer;
+        private GraphicsBuffer? _decoratorSlotsBuffer;
+        private GraphicsBuffer? _decoratorLODTableBuffer;
         private bool _decoratorBuffersBuilt;
         private bool _decoratorDispatched;
         private int _decoratorStructVersion = -1;
@@ -1419,9 +1416,9 @@ namespace Freefall.Components
             // Store absolute densities — shader does weighted selection proportional to each
 
             // Upload to GPU (creates new buffers + SRVs — only on structural changes)
-            UpdateOrCreateStructuredBuffer(device, headers, ref _decoratorHeadersBuffer, ref _decoratorHeadersSRV, "DecoratorHeaders");
-            UpdateOrCreateStructuredBuffer(device, slots, ref _decoratorSlotsBuffer, ref _decoratorSlotsSRV, "DecoratorSlots");
-            UpdateOrCreateStructuredBuffer(device, lodTable, ref _decoratorLODTableBuffer, ref _decoratorLODTableSRV, "DecoratorLODTable");
+            _decoratorHeadersBuffer = CreateAndUpload(headers);
+            _decoratorSlotsBuffer = CreateAndUpload(slots);
+            _decoratorLODTableBuffer = CreateAndUpload(lodTable);
 
             _decoratorBuffersBuilt = true;
             _decoControlDirty = true;  // trigger prepass rebuild
@@ -1492,7 +1489,7 @@ namespace Freefall.Components
             // Dispatch via ComputeShader
             _decoPrepassCS ??= new ComputeShader("decoration_prepass.hlsl", "CSBuildDecoControl");
             _decoPrepassCS.SetUint(0, (uint)DecoMapsArray.BindlessIndex);  // DecoMapsIdx
-            _decoPrepassCS.SetUint(1, _decoratorSlotsSRV);                 // SlotsIdx
+            _decoPrepassCS.SetUint(1, _decoratorSlotsBuffer!.SrvIndex);     // SlotsIdx
             _decoPrepassCS.SetUint(2, _decoControlUAV);                    // ControlUAVIdx
             _decoPrepassCS.SetUint(3, slotCount);                          // SlotCount
             _decoPrepassCS.Dispatch(cmd, (uint)((width + 7) / 8), (uint)((height + 7) / 8));
@@ -1579,37 +1576,27 @@ namespace Freefall.Components
             var slots = new List<DecoratorSlotGPU>();
 
             // Read existing LOD/structural data from the current buffer
-            uint[] existingLodCounts = null;
-            uint[] existingLodOffsets = null;
-            uint[] existingDecoSlices = null;
-            uint[] existingTextureIdx = null;
-
-            if (_decoratorSlotsBuffer != null)
+            var pRead = _decoratorSlotsBuffer.Map<DecoratorSlotGPU>();
+            int validCount = 0;
+            foreach (var d in decorations)
             {
-                void* pRead;
-                _decoratorSlotsBuffer.Map(0, null, &pRead);
-                // Count how many valid slots exist (matching the filter from BuildDecoratorBuffers)
-                int validCount = 0;
-                foreach (var d in decorations)
-                {
-                    if (d.Mode == DecoratorMode.Mesh && d.Mesh == null) continue;
-                    if (d.Mode != DecoratorMode.Mesh && d.Texture == null && d.Mesh == null) continue;
-                    validCount++;
-                }
-                var existing = new Span<DecoratorSlotGPU>(pRead, validCount);
-                existingLodCounts = new uint[validCount];
-                existingLodOffsets = new uint[validCount];
-                existingDecoSlices = new uint[validCount];
-                existingTextureIdx = new uint[validCount];
-                for (int i = 0; i < validCount; i++)
-                {
-                    existingLodCounts[i] = existing[i].LODCount;
-                    existingLodOffsets[i] = existing[i].LODTableOffset;
-                    existingDecoSlices[i] = existing[i].DecoMapSlice;
-                    existingTextureIdx[i] = existing[i].TextureIdx;
-                }
-                _decoratorSlotsBuffer.Unmap(0);
+                if (d.Mode == DecoratorMode.Mesh && d.Mesh == null) continue;
+                if (d.Mode != DecoratorMode.Mesh && d.Texture == null && d.Mesh == null) continue;
+                validCount++;
             }
+            var existing = new Span<DecoratorSlotGPU>(pRead, validCount);
+            var existingLodCounts = new uint[validCount];
+            var existingLodOffsets = new uint[validCount];
+            var existingDecoSlices = new uint[validCount];
+            var existingTextureIdx = new uint[validCount];
+            for (int i = 0; i < validCount; i++)
+            {
+                existingLodCounts[i] = existing[i].LODCount;
+                existingLodOffsets[i] = existing[i].LODTableOffset;
+                existingDecoSlices[i] = existing[i].DecoMapSlice;
+                existingTextureIdx[i] = existing[i].TextureIdx;
+            }
+            _decoratorSlotsBuffer.Unmap();
 
             float degToRad = MathF.PI / 180f;
             int slotIdx = 0;
@@ -1634,74 +1621,41 @@ namespace Freefall.Components
                     MaxH = deco.HeightRange.Y,
                     MinW = deco.WidthRange.X,
                     MaxW = deco.WidthRange.Y,
-                    LODCount = existingLodCounts != null && slotIdx < existingLodCounts.Length ? existingLodCounts[slotIdx] : 0,
-                    LODTableOffset = existingLodOffsets != null && slotIdx < existingLodOffsets.Length ? existingLodOffsets[slotIdx] : 0,
+                    LODCount = slotIdx < existingLodCounts.Length ? existingLodCounts[slotIdx] : 0,
+                    LODTableOffset = slotIdx < existingLodOffsets.Length ? existingLodOffsets[slotIdx] : 0,
                     Rot00 = cy*cz,              Rot01 = cy*sz,              Rot02 = -sy,
                     Rot10 = sx*sy*cz - cx*sz,   Rot11 = sx*sy*sz + cx*cz,   Rot12 = sx*cy,
                     Rot20 = cx*sy*cz + sx*sz,   Rot21 = cx*sy*sz - sx*cz,   Rot22 = cx*cy,
                     SlopeBias = deco.SlopeBias,
-                    DecoMapSlice = existingDecoSlices != null && slotIdx < existingDecoSlices.Length ? existingDecoSlices[slotIdx] : 0xFFFFFFFF,
+                    DecoMapSlice = slotIdx < existingDecoSlices.Length ? existingDecoSlices[slotIdx] : 0xFFFFFFFF,
                     _pad0 = 0,
                     Mode = (uint)deco.Mode,
-                    TextureIdx = existingTextureIdx != null && slotIdx < existingTextureIdx.Length ? existingTextureIdx[slotIdx] : 0
+                    TextureIdx = slotIdx < existingTextureIdx.Length ? existingTextureIdx[slotIdx] : 0
                 });
                 slotIdx++;
             }
 
-
-            // Absolute densities — no normalization needed
-
-            // Re-upload slot data to existing buffer via Map/Unmap
-            if (slots.Count > 0 && _decoratorSlotsBuffer != null)
+            // Re-upload slot data
+            if (slots.Count > 0)
             {
-                void* pData;
-                _decoratorSlotsBuffer.Map(0, null, &pData);
-                var span = new Span<DecoratorSlotGPU>(pData, slots.Count);
-                for (int i = 0; i < slots.Count; i++)
-                    span[i] = slots[i];
-                _decoratorSlotsBuffer.Unmap(0);
+                var span = System.Runtime.InteropServices.CollectionsMarshal.AsSpan(slots);
+                _decoratorSlotsBuffer.Upload<DecoratorSlotGPU>(span);
             }
         }
 
-        private unsafe void UpdateOrCreateStructuredBuffer<T>(
-            GraphicsDevice device, List<T> data, ref ID3D12Resource? buffer, ref uint srvIndex, string name) where T : unmanaged
+        /// <summary>
+        /// Create an upload GraphicsBuffer from a list and upload the data.
+        /// </summary>
+        private static GraphicsBuffer CreateAndUpload<T>(List<T> data) where T : unmanaged
         {
-            int stride = sizeof(T);
             int count = Math.Max(1, data.Count);
-            int bufferSize = Math.Max(256, count * stride);
-
-            // Old buffer is intentionally NOT disposed — it may still be referenced by
-            // in-flight GPU work. These are tiny (~100 bytes each), so leaking is fine.
-            buffer = device.CreateUploadBuffer(bufferSize);
-            srvIndex = device.AllocateBindlessIndex();
-
-            var srvDesc = new ShaderResourceViewDescription
-            {
-                Format = Format.Unknown,
-                ViewDimension = ShaderResourceViewDimension.Buffer,
-                Shader4ComponentMapping = ShaderComponentMapping.Default,
-                Buffer = new BufferShaderResourceView
-                {
-                    FirstElement = 0,
-                    NumElements = (uint)count,
-                    StructureByteStride = (uint)stride,
-                    Flags = BufferShaderResourceViewFlags.None
-                }
-            };
-            device.NativeDevice.CreateShaderResourceView(buffer, srvDesc, device.GetCpuHandle(srvIndex));
-
-            // Upload data to the new buffer (safe — not in flight)
+            var buffer = GraphicsBuffer.CreateUpload<T>(count);
             if (data.Count > 0)
             {
-                void* pData;
-                buffer.Map(0, null, &pData);
-                var span = new Span<T>(pData, data.Count);
-                for (int i = 0; i < data.Count; i++)
-                    span[i] = data[i];
-                buffer.Unmap(0);
+                var span = System.Runtime.InteropServices.CollectionsMarshal.AsSpan(data);
+                buffer.Upload<T>(span);
             }
-
-            //Debug.Log($"[TerrainRenderer] {name}: {data.Count} entries, SRV={srvIndex}");
+            return buffer;
         }
 
         private void DispatchDecorator(ID3D12GraphicsCommandList commandList, int frameIndex, RenderPass pass = RenderPass.Opaque)
@@ -1733,9 +1687,9 @@ namespace Freefall.Components
             DecoratorMaterial.Apply(commandList, device);
 
             // Push constants
-            commandList.SetGraphicsRoot32BitConstant(0, _decoratorHeadersSRV, 0);
-            commandList.SetGraphicsRoot32BitConstant(0, _decoratorSlotsSRV, 1);
-            commandList.SetGraphicsRoot32BitConstant(0, _decoratorLODTableSRV, 2);
+            commandList.SetGraphicsRoot32BitConstant(0, _decoratorHeadersBuffer!.SrvIndex, 0);
+            commandList.SetGraphicsRoot32BitConstant(0, _decoratorSlotsBuffer!.SrvIndex, 1);
+            commandList.SetGraphicsRoot32BitConstant(0, _decoratorLODTableBuffer!.SrvIndex, 2);
             commandList.SetGraphicsRoot32BitConstant(0, MeshRegistry.SrvIndex, 3);
             if (Terrain.Heightmap != null)
                 commandList.SetGraphicsRoot32BitConstant(0, Terrain.Heightmap.BindlessIndex, 4);
