@@ -28,7 +28,7 @@ struct InstanceDescriptor
 #pragma kernel CSBuildDrawArgs
 #pragma kernel CSEmitLeavesShadow
 
-// Push constants (root parameter 0, register b3)
+// Push constants (root parameter 0, register b3) — bindless indices only
 cbuffer PushConstants : register(b3)
 {
     uint4 Indices[8];
@@ -36,59 +36,32 @@ cbuffer PushConstants : register(b3)
 
 #define GET_INDEX(i) Indices[i/4][i%4]
 
-// ── UAV outputs ──
+// ── Per-dispatch bindless indices (push constants) ──
 #define OutputDescriptorsUAVIdx  GET_INDEX(0)    // UAV: InstanceDescriptor buffer
 #define OutputSpheresUAVIdx     GET_INDEX(1)    // UAV: BoundingSphere buffer
 #define OutputSubbatchIdsUAVIdx GET_INDEX(2)    // UAV: subbatch ID buffer
 #define OutputTerrainDataUAVIdx GET_INDEX(3)    // UAV: TerrainPatchData buffer
-
-// ── Control params ──
 #define CounterUAVIdx           GET_INDEX(4)    // UAV: atomic counter
-#define MaxDepthIdx             GET_INDEX(5)    // uint: max quadtree depth
-#define TransformSlotIdx        GET_INDEX(6)    // uint: transform buffer slot
-#define MaterialIdIdx           GET_INDEX(7)    // uint: material ID
-#define MeshPartIdIdx           GET_INDEX(8)    // uint: mesh part ID
-// Slot 9: CascadeIdxUAV (shadow pass) / unused
-#define CascadeIdxUAVIdx        GET_INDEX(9)
-#define TotalNodesIdx           GET_INDEX(10)   // uint: total quadtree nodes
-#define HeightTexIdx            GET_INDEX(11)   // SRV: heightmap texture
+#define CascadeIdxUAVIdx        GET_INDEX(5)    // UAV: cascade index buffer (shadow)
+#define SplitFlagsUAVIdx        GET_INDEX(6)    // UAV: split flags buffer
+#define HeightRangeSRVIdx       GET_INDEX(7)    // SRV: height range mip pyramid
+#define BuildMipIdx             GET_INDEX(8)    // uint: current mip for CSBuildMinMaxMip
+#define MipInputSRVIdx          GET_INDEX(9)    // SRV: previous mip (CSBuildMinMaxMip)
+#define MipOutputUAVIdx         GET_INDEX(10)   // UAV: current mip output (CSBuildMinMaxMip)
+#define IndirectArgsUAVIdx      GET_INDEX(11)   // UAV: indirect draw args
+#define VertexCountIdx          GET_INDEX(12)   // uint: mesh index count (CSBuildDrawArgs)
+#define CascadeCountIdx         GET_INDEX(13)   // uint: number of cascades (shadow)
+#define CascadeBufferSRVIdx     GET_INDEX(14)   // SRV: StructuredBuffer<CascadeData> (shadow)
 
-// ── Camera/bounds (float bits) ──
-#define CameraPosXIdx           GET_INDEX(12)
-#define CameraPosYIdx           GET_INDEX(13)
-#define CameraPosZIdx           GET_INDEX(14)
-#define RootCenterXIdx          GET_INDEX(15)
-#define RootCenterYIdx          GET_INDEX(16)
-#define RootCenterZIdx          GET_INDEX(17)
-#define RootExtentsXIdx         GET_INDEX(18)
-#define RootExtentsYIdx         GET_INDEX(19)
-#define RootExtentsZIdx         GET_INDEX(20)
-
-// ── More control ──
-#define MaxPatchesIdx           GET_INDEX(21)   // uint: output buffer capacity
-#define SplitFlagsUAVIdx        GET_INDEX(22)   // UAV: split flags buffer
-#define MaxHeightIdx            GET_INDEX(23)   // float: terrain max height
-#define HeightRangeSRVIdx       GET_INDEX(24)   // SRV: height range mip pyramid
-#define TerrainSizeXIdx         GET_INDEX(25)   // float: terrain width
-#define TerrainSizeYIdx         GET_INDEX(26)   // float: terrain depth
-#define BuildMipIdx             GET_INDEX(27)   // uint: current mip for CSBuildMinMaxMip
-
-// ── Screen-space error / mip build ──
-#define PixelErrorThresholdIdx  GET_INDEX(28)   // float: max screen error
-#define ScreenHeightIdx         GET_INDEX(29)   // float / MipInputSRV (reused)
-#define TanHalfFovIdx           GET_INDEX(30)   // float / MipOutputUAV (reused) / CascadeCount
-#define IndirectArgsUAVIdx      GET_INDEX(31)   // UAV: indirect draw args
-
-// Frustum planes + Hi-Z occlusion parameters (root slot 1 -> register b0)
+// ── Frustum planes (root slot 1, register b0) ──
 cbuffer FrustumPlanes : register(b0)
 {
-    float4 Plane0;
-    float4 Plane1;
-    float4 Plane2;
-    float4 Plane3;
-    float4 Plane4;
-    float4 Plane5;
-    // Hi-Z occlusion culling parameters
+    float4 Planes[6];
+};
+
+// ── Hi-Z occlusion parameters (root slot 2, register b1) ──
+cbuffer HiZParams : register(b1)
+{
     row_major float4x4 OcclusionProjection;
     uint HiZSrvIdx;
     float2 HiZSize;
@@ -96,32 +69,22 @@ cbuffer FrustumPlanes : register(b0)
     float NearPlane;
     uint CullStatsUAVIdx;
     uint FrustumDebugMode;
-    float _frustumPad1;
+    float _hiZPad;
+};
+
+// ── Terrain parameters (root slot 3, register b2) ──
+cbuffer TerrainParams : register(b2)
+{
+    float3 CameraPos;      float MaxHeight;
+    float3 RootCenter;     uint  MaxDepth;
+    float3 RootExtents;    uint  TotalNodes;
+    float2 TerrainSize;    float PixelErrorThreshold;  float ScreenHeight;
+    float  TanHalfFov;     uint  TransformSlot;         uint  MaterialId;     uint  MeshPartId;
+    uint   MaxPatches;     uint  HeightTexIdx;           uint2 _terrainPad;
 };
 
 // Sampler for height texture reads
 SamplerState sampHeightCS : register(s2);
-
-// Decode camera position and root center/extents from push constants
-float3 DecodeCameraPos()
-{
-    return float3(asfloat(CameraPosXIdx), asfloat(CameraPosYIdx), asfloat(CameraPosZIdx));
-}
-
-float3 DecodeRootCenter()
-{
-    return float3(asfloat(RootCenterXIdx), asfloat(RootCenterYIdx), asfloat(RootCenterZIdx));
-}
-
-float3 DecodeRootExtents()
-{
-    return float3(asfloat(RootExtentsXIdx), asfloat(RootExtentsYIdx), asfloat(RootExtentsZIdx));
-}
-
-float2 GetTerrainSize()
-{
-    return float2(asfloat(TerrainSizeXIdx), asfloat(TerrainSizeYIdx));
-}
 
 // UAVs accessed via ResourceDescriptorHeap (bindless)
 // Output buffers are written via atomic append
@@ -132,10 +95,9 @@ float2 GetTerrainSize()
 // ─────────────────────────────────────────────────────────────────────
 bool IsFrustumVisible(float3 center, float radius)
 {
-    float4 planes[6] = { Plane0, Plane1, Plane2, Plane3, Plane4, Plane5 };
     for (uint i = 0; i < 6; i++)
     {
-        float dist = dot(planes[i].xyz, center) + planes[i].w;
+        float dist = dot(Planes[i].xyz, center) + Planes[i].w;
         if (dist > radius)
             return false;
     }
@@ -212,7 +174,7 @@ uint DecomposeIndex(uint flatIndex, out uint localIdx)
     uint levelSize = 1; // 4^0 = 1
     uint levelOffset = 0;
     
-    uint maxDepth = MaxDepthIdx;
+    uint maxDepth = MaxDepth;
     
     for (uint d = 0; d <= maxDepth; d++)
     {
@@ -303,11 +265,9 @@ bool ShouldSplit(uint depth, uint localIdx, float3 nodeCenter, float3 nodeExtent
 
     // Project geometric error to screen pixels:
     //   screenError = (geometricError × screenHeight) / (2 × dist × tan(fov/2))
-    float screenHeight = asfloat(ScreenHeightIdx);
-    float tanHalfFov = asfloat(TanHalfFovIdx);
-    float screenError = (geometricError * screenHeight) / (2.0 * dist * tanHalfFov);
+    float screenError = (geometricError * ScreenHeight) / (2.0 * dist * TanHalfFov);
 
-    return screenError > asfloat(PixelErrorThresholdIdx);
+    return screenError > PixelErrorThreshold;
 }
 
 // Compute UV rect for a node using exact integer arithmetic — no FP accumulation.
@@ -346,7 +306,7 @@ float4 ComputeRectExact(uint depth, uint localIdx)
 // Mark a node as split in the split flags buffer (atomic OR).
 void MarkSplit(uint depth, uint localIdx)
 {
-    if (depth > MaxDepthIdx) return;
+    if (depth > MaxDepth) return;
     
     uint flatIdx = LevelStart(depth) + localIdx;
     RWByteAddressBuffer splitFlags = ResourceDescriptorHeap[SplitFlagsUAVIdx];
@@ -416,22 +376,21 @@ void ForceNeighborExist(uint depth, int neighborIx, int neighborIz)
 void CSMarkSplits(uint3 dtid : SV_DispatchThreadID)
 {
     uint nodeIndex = dtid.x;
-    uint totalNodes = TotalNodesIdx;
     
-    if (nodeIndex >= totalNodes)
+    if (nodeIndex >= TotalNodes)
         return;
     
-    uint maxDepth = MaxDepthIdx;
-    float3 cameraPos = DecodeCameraPos();
-    float3 rootCenter = DecodeRootCenter();
-    float3 rootExtents = DecodeRootExtents();
+    uint maxDepth = MaxDepth;
+    float3 cameraPos = CameraPos;
+    float3 rootCenter = RootCenter;
+    float3 rootExtents = RootExtents;
     
     // Decompose flat index into depth level and local index
     uint localIdx;
     uint depth = DecomposeIndex(nodeIndex, localIdx);
     
     // Can't split at max depth
-    if (depth >= maxDepth)
+    if (depth >= MaxDepth)
         return;
     
     // Compute this node's bounds
@@ -476,15 +435,13 @@ void CSMarkSplits(uint3 dtid : SV_DispatchThreadID)
 void CSEmitLeaves(uint3 dtid : SV_DispatchThreadID)
 {
     uint nodeIndex = dtid.x;
-    uint totalNodes = TotalNodesIdx;
     
-    if (nodeIndex >= totalNodes)
+    if (nodeIndex >= TotalNodes)
         return;
     
-    uint maxDepth = MaxDepthIdx;
-    float3 rootCenter = DecodeRootCenter();
-    float3 rootExtents = DecodeRootExtents();
-    float maxHeight = rootExtents.y;
+    uint maxDepth = MaxDepth;
+    float3 rootCenter = RootCenter;
+    float3 rootExtents = RootExtents;
     
     // Decompose flat index into depth level and local index
     uint localIdx;
@@ -553,15 +510,15 @@ void CSEmitLeaves(uint3 dtid : SV_DispatchThreadID)
     counterBuffer.InterlockedAdd(0, 1, patchIdx);
     
     // Safety: don't write past buffer capacity
-    uint maxPatches = MaxPatchesIdx;
+    uint maxPatches = MaxPatches;
     if (patchIdx >= maxPatches)
         return;
     
     // Write InstanceDescriptor
     RWStructuredBuffer<InstanceDescriptor> outDescriptors = ResourceDescriptorHeap[OutputDescriptorsUAVIdx];
     InstanceDescriptor desc;
-    desc.TransformSlot = TransformSlotIdx;
-    desc.MaterialId = MaterialIdIdx;
+    desc.TransformSlot = TransformSlot;
+    desc.MaterialId = MaterialId;
     desc.CustomDataIdx = 0;
     outDescriptors[patchIdx] = desc;
     
@@ -571,7 +528,7 @@ void CSEmitLeaves(uint3 dtid : SV_DispatchThreadID)
     
     // Write SubbatchId (all terrain patches use the same mesh)
     RWStructuredBuffer<uint> outSubbatchIds = ResourceDescriptorHeap[OutputSubbatchIdsUAVIdx];
-    outSubbatchIds[patchIdx] = MeshPartIdIdx;
+    outSubbatchIds[patchIdx] = MeshPartId;
     
     // ── Compute stitch mask ──
     // Check each cardinal neighbor: if the neighbor at the same depth does NOT exist
@@ -643,7 +600,7 @@ void CSBuildMinMaxMip(uint3 dtid : SV_DispatchThreadID)
 {
     uint buildMip = BuildMipIdx;
     
-    RWTexture2D<float2> output = ResourceDescriptorHeap[TanHalfFovIdx];
+    RWTexture2D<float2> output = ResourceDescriptorHeap[MipOutputUAVIdx];
     
     // Get output dimensions
     uint outW, outH;
@@ -657,7 +614,7 @@ void CSBuildMinMaxMip(uint3 dtid : SV_DispatchThreadID)
         // Mip 0: sample from the source heightmap
         // Each output texel covers a region of the heightmap; sample a 4x4 grid
         Texture2D<float4> heightTex = ResourceDescriptorHeap[HeightTexIdx];
-        float maxH = asfloat(MaxHeightIdx);
+        float maxH = MaxHeight;
         
         float2 uvMin = float2(dtid.xy) / float2(outW, outH);
         float2 uvMax = float2(dtid.xy + 1) / float2(outW, outH);
@@ -683,7 +640,7 @@ void CSBuildMinMaxMip(uint3 dtid : SV_DispatchThreadID)
     else
     {
         // Mip N>0: downsample from previous mip (min of mins, max of maxes)
-        Texture2D<float2> input = ResourceDescriptorHeap[ScreenHeightIdx];
+        Texture2D<float2> input = ResourceDescriptorHeap[MipInputSRVIdx];
         
         uint2 srcBase = dtid.xy * 2;
         float2 a = input[srcBase + uint2(0, 0)];
@@ -712,13 +669,11 @@ void CSBuildDrawArgs(uint3 dtid : SV_DispatchThreadID)
     uint patchCount = counterBuffer.Load(0);
     
     // Clamp to buffer capacity
-    patchCount = min(patchCount, MaxPatchesIdx);
+    patchCount = min(patchCount, MaxPatches);
     
     // Write DrawInstanced args: (VertexCountPerInstance, InstanceCount, StartVertex, StartInstance)
-    // VertexCountPerInstance = total index count of the terrain patch mesh.
-    // C# repurposes Indices[7].y (MipInputSRV) to pass the mesh index count before this dispatch.
     RWByteAddressBuffer argsBuffer = ResourceDescriptorHeap[IndirectArgsUAVIdx];
-    argsBuffer.Store(0, ScreenHeightIdx);   // VertexCountPerInstance (mesh index count from C#)
+    argsBuffer.Store(0, VertexCountIdx);     // VertexCountPerInstance (mesh index count from C#)
     argsBuffer.Store(4, patchCount);         // InstanceCount = number of visible patches
     argsBuffer.Store(8, 0u);                 // StartVertexLocation = 0
     argsBuffer.Store(12, 0u);                // StartInstanceLocation = 0
@@ -734,9 +689,7 @@ struct CascadeData
     float4 SplitDistances;      // X=near, Y=far
 };
 
-#define CascadeBufferSRVIdx   Indices[7].w   // SRV: StructuredBuffer<CascadeData>
-
-// Shadow-specific: CascadeIdxUAVIdx = GET_INDEX(9), TanHalfFovIdx = GET_INDEX(30) reused as CascadeCount
+// Shadow-specific: CascadeIdxUAVIdx = GET_INDEX(5), CascadeCountIdx = GET_INDEX(13), CascadeBufferSRVIdx = GET_INDEX(14)
 
 // Test a bounding sphere against one cascade's 6 frustum planes
 bool IsCascadeVisible(float3 center, float radius, uint cascadeIdx)
@@ -771,15 +724,14 @@ bool IsCascadeVisible(float3 center, float radius, uint cascadeIdx)
 void CSEmitLeavesShadow(uint3 dtid : SV_DispatchThreadID)
 {
     uint nodeIndex = dtid.x;
-    uint totalNodes = TotalNodesIdx;
 
-    if (nodeIndex >= totalNodes)
+    if (nodeIndex >= TotalNodes)
         return;
 
-    uint maxDepth = MaxDepthIdx;
-    float3 cameraPos = DecodeCameraPos();
-    float3 rootCenter = DecodeRootCenter();
-    float3 rootExtents = DecodeRootExtents();
+    uint maxDepth = MaxDepth;
+    float3 cameraPos = CameraPos;
+    float3 rootCenter = RootCenter;
+    float3 rootExtents = RootExtents;
 
     // Decompose flat index into depth level and local index
     uint localIdx;
@@ -816,8 +768,8 @@ void CSEmitLeavesShadow(uint3 dtid : SV_DispatchThreadID)
 
     // Test against each cascade frustum and emit per-cascade entries
     // Planes are in terrain-local space (C# transforms them), sphere is also local
-    uint cascadeCount = TanHalfFovIdx;  // Slot 30 reused as CascadeCount in shadow pass
-    uint maxPatches = MaxPatchesIdx;
+    uint cascadeCount = CascadeCountIdx;
+    uint maxPatches = MaxPatches;
 
     RWByteAddressBuffer counterBuffer = ResourceDescriptorHeap[CounterUAVIdx];
     RWStructuredBuffer<InstanceDescriptor> outDescriptors = ResourceDescriptorHeap[OutputDescriptorsUAVIdx];
@@ -827,9 +779,9 @@ void CSEmitLeavesShadow(uint3 dtid : SV_DispatchThreadID)
     RWStructuredBuffer<uint> outCascadeIdx = ResourceDescriptorHeap[CascadeIdxUAVIdx];
 
     // Precompute shared patch data
-    uint transformSlot = TransformSlotIdx;
-    uint materialId = MaterialIdIdx;
-    uint meshPartId = MeshPartIdIdx;
+    uint transformSlot = TransformSlot;
+    uint materialId = MaterialId;
+    uint meshPartId = MeshPartId;
 
     // Stitch mask (same as CSEmitLeaves)
     uint ix, iz;

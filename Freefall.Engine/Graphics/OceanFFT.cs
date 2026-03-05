@@ -154,6 +154,8 @@ namespace Freefall.Graphics
         /// </summary>
         public unsafe void RequestSpectrumReinit(SpectrumParameters[] newSpectrums, uint[] newLengthScales)
         {
+            if (!_initialized) return;
+
             int specCount = _numBands * 2;
             for (int i = 0; i < specCount; i++)
                 _params.Spectrums[i] = newSpectrums[i];

@@ -222,7 +222,7 @@ namespace Freefall.Graphics
             if (kernel < 0 || kernel >= _kernels.Count)
                 throw new ArgumentOutOfRangeException(nameof(kernel));
 
-            // Set PSO for this kernel (root sig + descriptor heaps set by caller)
+            // Set PSO for this kernel (caller handles root sig + descriptor heaps + cbuffers)
             var k = _kernels[kernel];
             cmd.SetPipelineState(k.PSO);
 
@@ -324,10 +324,14 @@ namespace Freefall.Graphics
                 if (cbReflection.Description.Name == "PushConstants") continue;
 
                 var bindDesc = reflection.GetResourceBindingDescByName(cbReflection.Description.Name);
+
+                // Skip cbuffers at b0-b2 — these are externally managed by the caller
+                // (e.g. TerrainRenderer binds frustum planes, Hi-Z params, terrain params)
+                if (bindDesc.BindPoint <= 2) continue;
+
                 int rootSlot = bindDesc.BindPoint switch
                 {
-                    0 => 1,  // b0 → root slot 1
-                    1 => 2,  // b1 → root slot 2
+                    // b4 → root slot 4, etc. (extend as needed)
                     _ => -1
                 };
 

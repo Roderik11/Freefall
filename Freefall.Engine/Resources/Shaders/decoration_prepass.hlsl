@@ -15,7 +15,7 @@ ConstantBuffer<PushConstantsData> PushConstants : register(b3);
 #define DecoMapsIdx     GET_INDEX(0)   // SRV: density map Texture2DArray
 #define SlotsIdx        GET_INDEX(1)   // SRV: DecoratorSlot structured buffer
 #define ControlUAVIdx   GET_INDEX(2)   // UAV: output RWTexture2DArray<uint4>
-#define SlotCount       GET_INDEX(3)   // number of decorator slots
+#define SlotCountIdx    GET_INDEX(3)   // number of decorator slots
 
 // Must match DecoratorSlot in grass.fx
 struct DecoratorSlot
@@ -57,7 +57,7 @@ void CSBuildDecoControl(uint3 dtid : SV_DispatchThreadID)
         topWt[k] = 0;
     }
 
-    uint count = min(SlotCount, 32);
+    uint count = min(SlotCountIdx, 32);
     for (uint i = 0; i < count; i++)
     {
         DecoratorSlot s = slots[i];

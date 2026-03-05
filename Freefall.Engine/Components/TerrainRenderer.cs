@@ -68,9 +68,45 @@ namespace Freefall.Components
         private ID3D12Resource? _shadowArgsReadback;
         private int _shadowReadbackFrame = -1;
         
-        // Frustum + Hi-Z constant buffers per frame (for compute shader culling)
-        private ID3D12Resource[] _frustumConstantBuffers = new ID3D12Resource[FrameCount];
+        // Constant buffers per frame — split for b0 (frustum), b1 (Hi-Z), b2 (terrain params)
+        private ID3D12Resource[] _frustumPlaneBuffers = new ID3D12Resource[FrameCount]; // b0 = root slot 1
+        private ID3D12Resource[] _hizParamBuffers = new ID3D12Resource[FrameCount];     // b1 = root slot 2
+        private ID3D12Resource[] _terrainParamBuffers = new ID3D12Resource[FrameCount]; // b2 = root slot 3 (main pass)
+        private ID3D12Resource[] _shadowTerrainParamBuffers = new ID3D12Resource[FrameCount]; // b2 = root slot 3 (shadow pass)
         private Matrix4x4 _previousFrameViewProjection;
+
+        // Must match cbuffer FrustumPlanes : register(b0)
+        [StructLayout(LayoutKind.Sequential)]
+        private struct FrustumPlanesData
+        {
+            public Vector4 Plane0, Plane1, Plane2, Plane3, Plane4, Plane5;
+        }
+
+        // Must match cbuffer HiZParams : register(b1)
+        [StructLayout(LayoutKind.Sequential)]
+        private struct HiZParamsData
+        {
+            public Matrix4x4 OcclusionProjection;
+            public uint HiZSrvIdx;
+            public float HiZWidth, HiZHeight;
+            public uint HiZMipCount;
+            public float NearPlane;
+            public uint CullStatsUAVIdx;
+            public uint FrustumDebugMode;
+            public float Pad;
+        }
+
+        // Must match cbuffer TerrainParams : register(b2)
+        [StructLayout(LayoutKind.Sequential)]
+        private struct TerrainParamsData
+        {
+            public Vector3 CameraPos;  public float MaxHeight;
+            public Vector3 RootCenter; public uint  MaxDepth;
+            public Vector3 RootExtents;public uint  TotalNodes;
+            public Vector2 TerrainSize;public float PixelErrorThreshold; public float ScreenHeight;
+            public float TanHalfFov;   public uint  TransformSlot;       public uint  MaterialId; public uint MeshPartId;
+            public uint  MaxPatches;   public uint  HeightTexIdx;         public uint  Pad0, Pad1;
+        }
         
         // Height range mip pyramid (one-time, not per-frame)
         private ID3D12Resource _heightRangePyramid = null!;
@@ -249,13 +285,18 @@ namespace Freefall.Components
                 CreateFrameBuffers(i);
             }
 
-            // Create frustum constant buffers (for compute shader Hi-Z culling)
-            int frustumCBSize = Marshal.SizeOf<GPUCuller.FrustumConstants>();
+            // Create constant buffers: split into b0 (planes), b1 (Hi-Z), b2 (terrain params)
+            int planesCBSize = ((Marshal.SizeOf<FrustumPlanesData>() + 255) & ~255);
+            int hizCBSize = ((Marshal.SizeOf<HiZParamsData>() + 255) & ~255);
+            int terrainCBSize = ((Marshal.SizeOf<TerrainParamsData>() + 255) & ~255);
             int cascadeDataSize = Marshal.SizeOf<GPUCuller.CascadeData>();
             int cascadeBufferSize = cascadeDataSize * DirectionalLight.MaxCascades;
             for (int i = 0; i < FrameCount; i++)
             {
-                _frustumConstantBuffers[i] = device.CreateUploadBuffer(frustumCBSize);
+                _frustumPlaneBuffers[i] = device.CreateUploadBuffer(planesCBSize);
+                _hizParamBuffers[i] = device.CreateUploadBuffer(hizCBSize);
+                _terrainParamBuffers[i] = device.CreateUploadBuffer(terrainCBSize);
+                _shadowTerrainParamBuffers[i] = device.CreateUploadBuffer(terrainCBSize);
                 _shadowCascadeBuffers[i] = device.CreateUploadBuffer(cascadeBufferSize);
                 _shadowCascadeBufferSrvs[i] = device.AllocateBindlessIndex();
                 device.CreateStructuredBufferSRV(_shadowCascadeBuffers[i], (uint)DirectionalLight.MaxCascades, (uint)cascadeDataSize, _shadowCascadeBufferSrvs[i]);
@@ -314,11 +355,44 @@ namespace Freefall.Components
             _terrainDataBuffers[frameIndex].Transition(commandList, ResourceStates.UnorderedAccess);
             _indirectArgsBuffers[frameIndex].Transition(commandList, ResourceStates.UnorderedAccess);
 
-            // Upload frustum + Hi-Z constants
+            // Upload frustum + Hi-Z constants (b0, b1)
             UploadFrustumConstants(frameIndex);
-            commandList.SetComputeRootSignature(Engine.Device.GlobalRootSignature);
-            commandList.SetDescriptorHeaps(1, new[] { Engine.Device.SrvHeap });
-            commandList.SetComputeRootConstantBufferView(1, _frustumConstantBuffers[frameIndex].GPUVirtualAddress);
+
+            // Upload terrain params (b2)
+            var terrainSize = Terrain!.TerrainSize;
+            var maxHeight = Terrain.MaxHeight;
+            Vector3 cameraPos = Camera.Main!.Position - Transform.Position;
+            Vector3 rootCenter = new Vector3(terrainSize.X * 0.5f, 0, terrainSize.Y * 0.5f);
+            Vector3 rootExtents = new Vector3(terrainSize.X * 0.5f, maxHeight, terrainSize.Y * 0.5f);
+            var camera = Camera.Main!;
+            float vFovRad = camera.FieldOfView * (MathF.PI / 180f);
+
+            var terrainParams = new TerrainParamsData
+            {
+                CameraPos = cameraPos,
+                MaxHeight = maxHeight,
+                RootCenter = rootCenter,
+                MaxDepth = (uint)MaxDepth,
+                RootExtents = rootExtents,
+                TotalNodes = (uint)_totalNodes,
+                TerrainSize = terrainSize,
+                PixelErrorThreshold = PixelErrorThreshold,
+                ScreenHeight = camera.Target?.Height ?? 1080f,
+                TanHalfFov = MathF.Tan(vFovRad * 0.5f),
+                TransformSlot = (uint)Transform.TransformSlot,
+                MaterialId = (uint)(Material?.MaterialID ?? 0),
+                MeshPartId = (uint)_meshPartId,
+                MaxPatches = (uint)MaxPatches,
+                HeightTexIdx = Terrain?.Heightmap?.BindlessIndex ?? 0u,
+            };
+            UploadBuffer(_terrainParamBuffers[frameIndex], terrainParams);
+
+            // Bind root sig + descriptor heaps + all cbuffers once (before any compute operations)
+            commandList.SetComputeRootSignature(device.GlobalRootSignature);
+            commandList.SetDescriptorHeaps(1, new[] { device.SrvHeap });
+            commandList.SetComputeRootConstantBufferView(1, _frustumPlaneBuffers[frameIndex].GPUVirtualAddress);
+            commandList.SetComputeRootConstantBufferView(2, _hizParamBuffers[frameIndex].GPUVirtualAddress);
+            commandList.SetComputeRootConstantBufferView(3, _terrainParamBuffers[frameIndex].GPUVirtualAddress);
 
             // Clear counter and splitFlags
             _counterBuffers[frameIndex].ClearUAV(commandList, new Vortice.Mathematics.Int4(0, 0, 0, 0));
@@ -326,52 +400,17 @@ namespace Freefall.Components
             _splitFlagsBuffers[frameIndex].ClearUAV(commandList, new Vortice.Mathematics.Int4(0, 0, 0, 0));
             commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(null)));
 
-            // Compute root/extents (LOCAL SPACE)
-            var terrainSize = Terrain!.TerrainSize;
-            var maxHeight = Terrain.MaxHeight;
-            Vector3 cameraPos = Camera.Main!.Position - Transform.Position;
-            Vector3 rootCenter = new Vector3(terrainSize.X * 0.5f, 0, terrainSize.Y * 0.5f);
-            Vector3 rootExtents = new Vector3(terrainSize.X * 0.5f, maxHeight, terrainSize.Y * 0.5f);
-
-            // Screen-space error params
-            var camera = Camera.Main!;
-            float vFovRad = camera.FieldOfView * (MathF.PI / 180f);
-            float tanHalfFov = MathF.Tan(vFovRad * 0.5f);
-            float screenHeight = camera.Target?.Height ?? 1080f;
-
-            // Shared push constants — broadcast to ALL kernels
+            // Push constants — bindless indices only (slots 0-14)
             cs.Set("OutputDescriptorsUAV", _descriptorBuffers[frameIndex].UavIndex);
             cs.Set("OutputSpheresUAV", _sphereBuffers[frameIndex].UavIndex);
             cs.Set("OutputSubbatchIdsUAV", _subbatchIdBuffers[frameIndex].UavIndex);
             cs.Set("OutputTerrainDataUAV", _terrainDataBuffers[frameIndex].UavIndex);
             cs.Set("CounterUAV", _counterBuffers[frameIndex].UavIndex);
-            cs.Set("MaxDepth", (uint)MaxDepth);
-            cs.Set("TransformSlot", (uint)Transform.TransformSlot);
-            cs.Set("MaterialId", (uint)(Material?.MaterialID ?? 0));
-            cs.Set("MeshPartId", (uint)_meshPartId);
-            cs.Set("TotalNodes", (uint)_totalNodes);
-            cs.Set("HeightTex", Terrain?.Heightmap?.BindlessIndex ?? 0u);
-            cs.Set("CameraPosX", cameraPos.X);
-            cs.Set("CameraPosY", cameraPos.Y);
-            cs.Set("CameraPosZ", cameraPos.Z);
-            cs.Set("RootCenterX", rootCenter.X);
-            cs.Set("RootCenterY", rootCenter.Y);
-            cs.Set("RootCenterZ", rootCenter.Z);
-            cs.Set("RootExtentsX", rootExtents.X);
-            cs.Set("RootExtentsY", rootExtents.Y);
-            cs.Set("RootExtentsZ", rootExtents.Z);
-            cs.Set("MaxPatches", (uint)MaxPatches);
             cs.Set("SplitFlagsUAV", _splitFlagsBuffers[frameIndex].UavIndex);
-            cs.Set("MaxHeight", maxHeight);
             cs.Set("HeightRangeSRV", _heightRangePyramidSRV);
-            cs.Set("TerrainSizeX", terrainSize.X);
-            cs.Set("TerrainSizeY", terrainSize.Y);
-            cs.Set("PixelErrorThreshold", PixelErrorThreshold);
-            cs.Set("ScreenHeight", screenHeight);
-            cs.Set("TanHalfFov", tanHalfFov);
 
-            // Per-kernel overrides for CSBuildDrawArgs (repurposes slots 29, 31)
-            cs.Set(_kBuildDrawArgs, "ScreenHeight", (uint)_patchMesh.IndexCount);
+            // Per-kernel overrides for CSBuildDrawArgs
+            cs.Set(_kBuildDrawArgs, "VertexCount", (uint)_patchMesh.IndexCount);
             cs.Set(_kBuildDrawArgs, "IndirectArgsUAV", _indirectArgsBuffers[frameIndex].UavIndex);
 
             // ── One-time: Build height range mip pyramid ──
@@ -382,6 +421,13 @@ namespace Freefall.Components
 
                 BuildHeightRangePyramid(commandList);
                 _heightRangePyramidBuilt = true;
+
+                // Re-bind root sig + cbuffers (mip builder may have changed PSO state)
+                commandList.SetComputeRootSignature(device.GlobalRootSignature);
+                commandList.SetDescriptorHeaps(1, new[] { device.SrvHeap });
+                commandList.SetComputeRootConstantBufferView(1, _frustumPlaneBuffers[frameIndex].GPUVirtualAddress);
+                commandList.SetComputeRootConstantBufferView(2, _hizParamBuffers[frameIndex].GPUVirtualAddress);
+                commandList.SetComputeRootConstantBufferView(3, _terrainParamBuffers[frameIndex].GPUVirtualAddress);
             }
 
             uint threadGroups = (uint)((_totalNodes + 255) / 256);
@@ -522,47 +568,53 @@ namespace Freefall.Components
             int kShadow = _kEmitLeavesShadow;
             int kArgs = _kBuildDrawArgs;
 
+            // Upload shadow-specific TerrainParams (b2, root slot 3) — only MaxPatches differs
+            var terrainSz = Terrain.TerrainSize;
+            int shadowMaxPatches = MaxPatches * cascadeCount;
+            var camPos = Camera.Main!.Position - Transform.Position;
+            float vFovRad = Camera.Main!.FieldOfView * (MathF.PI / 180f);
+            var shadowTerrainParams = new TerrainParamsData
+            {
+                CameraPos = camPos,
+                MaxHeight = Terrain.MaxHeight,
+                RootCenter = new Vector3(terrainSz.X * 0.5f, 0, terrainSz.Y * 0.5f),
+                MaxDepth = (uint)MaxDepth,
+                RootExtents = new Vector3(terrainSz.X * 0.5f, Terrain.MaxHeight, terrainSz.Y * 0.5f),
+                TotalNodes = (uint)_totalNodes,
+                TerrainSize = terrainSz,
+                PixelErrorThreshold = PixelErrorThreshold,
+                ScreenHeight = Camera.Main.Target?.Height ?? 1080f,
+                TanHalfFov = MathF.Tan(vFovRad * 0.5f),
+                TransformSlot = (uint)Transform.TransformSlot,
+                MaterialId = (uint)(Material?.MaterialID ?? 0),
+                MeshPartId = (uint)_meshPartId,
+                MaxPatches = (uint)shadowMaxPatches,
+                HeightTexIdx = Terrain.Heightmap?.BindlessIndex ?? 0u,
+            };
+            UploadBuffer(_shadowTerrainParamBuffers[frameIndex], shadowTerrainParams);
+
             // Clear shadow counter
             commandList.SetComputeRootSignature(Engine.Device.GlobalRootSignature);
             commandList.SetDescriptorHeaps(1, new[] { Engine.Device.SrvHeap });
             _shadowCounterBuffers[frameIndex].ClearUAV(commandList, new Vortice.Mathematics.Int4(0, 0, 0, 0));
 
-            // Set per-kernel push constants for CSEmitLeavesShadow
+            // Bind cbuffers (b0, b1 already uploaded by main pass; b2 updated above)
+            commandList.SetComputeRootConstantBufferView(1, _frustumPlaneBuffers[frameIndex].GPUVirtualAddress);
+            commandList.SetComputeRootConstantBufferView(2, _hizParamBuffers[frameIndex].GPUVirtualAddress);
+            commandList.SetComputeRootConstantBufferView(3, _shadowTerrainParamBuffers[frameIndex].GPUVirtualAddress);
+
+            // Push constants — bindless indices only
             cs.Set(kShadow, "OutputDescriptorsUAV", _shadowDescriptorBuffers[frameIndex].UavIndex);
             cs.Set(kShadow, "OutputSpheresUAV", _shadowSphereBuffers[frameIndex].UavIndex);
             cs.Set(kShadow, "OutputSubbatchIdsUAV", _shadowSubbatchIdBuffers[frameIndex].UavIndex);
             cs.Set(kShadow, "OutputTerrainDataUAV", _shadowTerrainDataBuffers[frameIndex].UavIndex);
             cs.Set(kShadow, "CounterUAV", _shadowCounterBuffers[frameIndex].UavIndex);
-            cs.Set(kShadow, "MaxDepth", (uint)MaxDepth);
-            cs.Set(kShadow, "TransformSlot", (uint)Transform.TransformSlot);
-            cs.Set(kShadow, "MaterialId", (uint)(Material?.MaterialID ?? 0));
-            cs.Set(kShadow, "MeshPartId", (uint)_meshPartId);
             cs.Set(kShadow, "CascadeIdxUAV", _shadowCascadeIdxBuffers[frameIndex].UavIndex);
-            cs.Set(kShadow, "TotalNodes", (uint)_totalNodes);
-            cs.Set(kShadow, "HeightTex", Terrain!.Heightmap?.BindlessIndex ?? 0u);
-
-            var camPos = Camera.Main!.Position - Transform.Position;
-            cs.Set(kShadow, "CameraPosX", camPos.X);
-            cs.Set(kShadow, "CameraPosY", camPos.Y);
-            cs.Set(kShadow, "CameraPosZ", camPos.Z);
-
-            var terrainSz = Terrain.TerrainSize;
-            cs.Set(kShadow, "RootCenterX", terrainSz.X * 0.5f);
-            cs.Set(kShadow, "RootCenterY", 0f);
-            cs.Set(kShadow, "RootCenterZ", terrainSz.Y * 0.5f);
-            cs.Set(kShadow, "RootExtentsX", terrainSz.X * 0.5f);
-            cs.Set(kShadow, "RootExtentsY", Terrain.MaxHeight);
-            cs.Set(kShadow, "RootExtentsZ", terrainSz.Y * 0.5f);
-
-            int shadowMaxPatches = MaxPatches * cascadeCount;
-            cs.Set(kShadow, "MaxPatches", (uint)shadowMaxPatches);
             cs.Set(kShadow, "SplitFlagsUAV", _splitFlagsBuffers[frameIndex].UavIndex);
-            cs.Set(kShadow, "MaxHeight", Terrain.MaxHeight);
             cs.Set(kShadow, "HeightRangeSRV", _heightRangePyramidSRV);
-            cs.Set(kShadow, "TerrainSizeX", terrainSz.X);
-            cs.Set(kShadow, "TerrainSizeY", terrainSz.Y);
-            cs.Set(kShadow, "TanHalfFov", (uint)cascadeCount);  // Slot 30 reused as CascadeCount
-            cs.Set(kShadow, "IndirectArgsUAV", _shadowCascadeBufferSrvs[frameIndex]);  // Slot 31 reused
+            cs.Set(kShadow, "CascadeCount", (uint)cascadeCount);
+
+            cs.Set(kShadow, "CascadeBufferSRV", _shadowCascadeBufferSrvs[frameIndex]);
 
             // Dispatch CSEmitLeavesShadow
             uint threadGroups = (uint)((_totalNodes + 255) / 256);
@@ -572,7 +624,7 @@ namespace Freefall.Components
             commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(null)));
 
             // Build draw args from shadow counter (CSBuildDrawArgs with shadow-specific overrides)
-            cs.Set(kArgs, "ScreenHeight", (uint)_patchMesh.IndexCount);
+            cs.Set(kArgs, "VertexCount", (uint)_patchMesh.IndexCount);
             cs.Set(kArgs, "IndirectArgsUAV", _shadowArgsBuffers[frameIndex].UavIndex);
             cs.Set(kArgs, "CounterUAV", _shadowCounterBuffers[frameIndex].UavIndex);
             cs.Dispatch(kArgs, commandList, 1);
@@ -633,10 +685,7 @@ namespace Freefall.Components
             var frustum = new Frustum(vpMatrix);
             var planes = frustum.GetPlanesAsVector4();
 
-            // The compute shader works in terrain LOCAL space, but frustum planes
-            // are in WORLD space.  Transform planes to local space:
-            //   plane_local = (n, d + dot(n, terrainPos))
-            // because x_world = x_local + terrainPos  =>  n·x_local + (d + n·P) = 0
+            // Transform frustum planes from world → terrain local space
             var terrainPos = Transform.Position;
             for (int i = 0; i < planes.Length; i++)
             {
@@ -644,50 +693,39 @@ namespace Freefall.Components
                 planes[i].W += Vector3.Dot(n, terrainPos);
             }
 
-            var constants = new GPUCuller.FrustumConstants
+            // Upload FrustumPlanes (b0)
+            var frustumData = new FrustumPlanesData
             {
-                Plane0 = planes[0],
-                Plane1 = planes[1],
-                Plane2 = planes[2],
-                Plane3 = planes[3],
-                Plane4 = planes[4],
-                Plane5 = planes[5],
+                Plane0 = planes[0], Plane1 = planes[1], Plane2 = planes[2],
+                Plane3 = planes[3], Plane4 = planes[4], Plane5 = planes[5],
             };
+            UploadBuffer(_frustumPlaneBuffers[frameIndex], frustumData);
 
-            // Hi-Z occlusion data — VP must also expect local-space input:
-            //   clip = x_local * Translate(terrainPos) * VP
+            // Upload HiZParams (b1)
+            var hizData = new HiZParamsData();
             var pyramid = DeferredRenderer.Current?.HiZPyramid;
             if (!_firstDispatch && pyramid != null && pyramid.FullSRV != 0 && pyramid.Ready && !Engine.Settings.DisableHiZ)
-
             {
                 var occVP = Engine.Settings.FreezeFrustum
                     ? Engine.Settings.FrozenViewProjection
                     : _previousFrameViewProjection;
-                // Premultiply by the terrain's world translation so the matrix
-                // accepts local-space positions directly:
                 var localToWorld = Matrix4x4.CreateTranslation(terrainPos);
-                constants.OcclusionProjection = localToWorld * occVP;
+                hizData.OcclusionProjection = localToWorld * occVP;
+                hizData.HiZSrvIdx = pyramid.FullSRV;
+                hizData.HiZWidth = pyramid.Width;
+                hizData.HiZHeight = pyramid.Height;
+                hizData.HiZMipCount = (uint)pyramid.MipCount;
+                hizData.NearPlane = Camera.Main!.NearPlane;
+            }
+            UploadBuffer(_hizParamBuffers[frameIndex], hizData);
+        }
 
-                constants.HiZSrvIdx = pyramid.FullSRV;
-                constants.HiZWidth = pyramid.Width;
-                constants.HiZHeight = pyramid.Height;
-                constants.HiZMipCount = (uint)pyramid.MipCount;
-                constants.NearPlane = Camera.Main!.NearPlane;
-            }
-
-            try
-            {
-                unsafe
-                {
-                    void* pData;
-                    _frustumConstantBuffers[frameIndex].Map(0, null, &pData);
-                    *(GPUCuller.FrustumConstants*)pData = constants;
-                    _frustumConstantBuffers[frameIndex].Unmap(0);
-                }
-            }
-            catch (Exception ex)
-            {
-            }
+        private static unsafe void UploadBuffer<T>(ID3D12Resource buffer, T data) where T : unmanaged
+        {
+            void* pData;
+            buffer.Map(0, null, &pData);
+            *(T*)pData = data;
+            buffer.Unmap(0);
         }
 
         // ───── Height Range Mip Pyramid ───────────────────────────────────
@@ -785,8 +823,8 @@ namespace Freefall.Components
 
                 // Per-kernel push constants for this mip level
                 cs.Set(kMip, "BuildMip", (uint)mip);
-                cs.Set(kMip, "ScreenHeight", mip > 0 ? _heightRangeMipSRVs[mip - 1] : 0u);  // MipInputSRV
-                cs.Set(kMip, "TanHalfFov", _heightRangeMipUAVs[mip]);                         // MipOutputUAV
+                cs.Set(kMip, "MipInputSRV", mip > 0 ? _heightRangeMipSRVs[mip - 1] : 0u);
+                cs.Set(kMip, "MipOutputUAV", _heightRangeMipUAVs[mip]);
 
                 // Dispatch 8x8 threadgroups
                 uint groupsX = (uint)((w + 7) / 8);
