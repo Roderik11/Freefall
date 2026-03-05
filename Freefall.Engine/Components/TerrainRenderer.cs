@@ -149,19 +149,18 @@ namespace Freefall.Components
 
 
         // ───── Decoration Control Prepass ─────────────────────────────────
-        private ID3D12PipelineState? _decoPrepassPSO;
+        private ComputeShader? _decoPrepassCS;
         private ID3D12Resource? _decoControlTex;     // RGBA16_UINT, 2 slices
         private uint _decoControlUAV;
         private uint _decoControlSRV;
         private bool _decoControlDirty = true;
 
         // ───── Baked Terrain Albedo ───────────────────────────────────────
-        private ID3D12PipelineState? _albedoBakePSO;
+        private ComputeShader? _albedoBakeCS;
         private ID3D12Resource? _bakedAlbedoTex;     // RGBA8, 256×256
         private uint _bakedAlbedoUAV;
         private uint _bakedAlbedoSRV;
-        private ID3D12Resource? _tilingBuffer;       // StructuredBuffer<float4>, 32 entries
-        private uint _tilingSRV;
+        private GraphicsBuffer? _tilingBuffer;       // StructuredBuffer<float4>, 32 entries
         private bool _bakedAlbedoDirty = true;
         private const int BakedAlbedoSize = 256;
 
@@ -1437,24 +1436,10 @@ namespace Freefall.Components
             if (!_decoControlDirty || DecoMapsArray == null || _decoratorSlotsBuffer == null)
                 return;
 
-            Debug.Log("[TerrainRenderer]", $"BuildDecorationControlTexture: dirty={_decoControlDirty} DecoMaps={DecoMapsArray != null} SlotsBuffer={_decoratorSlotsBuffer != null}");
-
             var device = Engine.Device;
-            var nativeDecoMaps = DecoMapsArray.Native;
-            var decoDesc = nativeDecoMaps.Description;
+            var decoDesc = DecoMapsArray.Native.Description;
             int width = (int)decoDesc.Width;
             int height = (int)decoDesc.Height;
-
-            // Compile prepass PSO on first use
-            if (_decoPrepassPSO == null)
-            {
-                string basePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Resources", "Shaders");
-                string source = File.ReadAllText(Path.Combine(basePath, "decoration_prepass.hlsl"));
-                var shader = new Shader(source, "CSBuildDecoControl", "cs_6_6");
-                _decoPrepassPSO = device.CreateComputePipelineState(shader.Bytecode);
-                shader.Dispose();
-                //Debug.Log("[TerrainRenderer]", "Decoration prepass compute shader compiled");
-            }
 
             // Create or recreate control texture
             _decoControlTex?.Dispose();
@@ -1492,14 +1477,7 @@ namespace Freefall.Components
             };
             device.NativeDevice.CreateShaderResourceView(_decoControlTex, srvDesc, device.GetCpuHandle(_decoControlSRV));
 
-            // Dispatch compute: density maps SRV, slot buffer SRV, control UAV, slot count
-            cmd.SetPipelineState(_decoPrepassPSO);
-            cmd.SetComputeRootSignature(device.GlobalRootSignature);
-            cmd.SetComputeRoot32BitConstant(0, (uint)DecoMapsArray.BindlessIndex, 0);  // DecoMapsIdx
-            cmd.SetComputeRoot32BitConstant(0, _decoratorSlotsSRV, 1);                 // SlotsIdx
-            cmd.SetComputeRoot32BitConstant(0, _decoControlUAV, 2);                    // ControlUAVIdx
-
-            // Count valid slots (matching ChannelHeader.Count)
+            // Count valid slots
             uint slotCount = 0;
             if (Terrain?.Decorations != null)
             {
@@ -1510,69 +1488,35 @@ namespace Freefall.Components
                     slotCount++;
                 }
             }
-            cmd.SetComputeRoot32BitConstant(0, slotCount, 3);                          // SlotCount
 
-            uint gx = (uint)((width + 7) / 8);
-            uint gy = (uint)((height + 7) / 8);
-            cmd.Dispatch(gx, gy, 1);
+            // Dispatch via ComputeShader
+            _decoPrepassCS ??= new ComputeShader("decoration_prepass.hlsl", "CSBuildDecoControl");
+            _decoPrepassCS.SetUint(0, (uint)DecoMapsArray.BindlessIndex);  // DecoMapsIdx
+            _decoPrepassCS.SetUint(1, _decoratorSlotsSRV);                 // SlotsIdx
+            _decoPrepassCS.SetUint(2, _decoControlUAV);                    // ControlUAVIdx
+            _decoPrepassCS.SetUint(3, slotCount);                          // SlotCount
+            _decoPrepassCS.Dispatch(cmd, (uint)((width + 7) / 8), (uint)((height + 7) / 8));
 
             cmd.ResourceBarrierUnorderedAccessView(_decoControlTex);
 
             _decoControlDirty = false;
             _bakedAlbedoDirty = true; // Rebuild albedo when control changes
-            //Debug.Log("[TerrainRenderer]", $"Decoration control texture built: {width}x{height}, {slotCount} slots, DecoMapsIdx={DecoMapsArray?.BindlessIndex}, SlotsIdx={_decoratorSlotsSRV}, UAV={_decoControlUAV}, SRV={_decoControlSRV}");
         }
 
         /// <summary>
         /// Bakes terrain splatmap layers into a single 256×256 albedo texture
         /// for ground color blending in vegetation shaders.
         /// </summary>
-        private unsafe void BakeTerrainAlbedo(ID3D12GraphicsCommandList cmd)
+        private void BakeTerrainAlbedo(ID3D12GraphicsCommandList cmd)
         {
             if (!_bakedAlbedoDirty) return;
             if (ControlMapsArray == null || DiffuseMapsArray == null) return;
 
             var device = Engine.Device;
 
-            // Compile bake PSO on first use
-            if (_albedoBakePSO == null)
-            {
-                string basePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Resources", "Shaders");
-                string source = File.ReadAllText(Path.Combine(basePath, "terrain_albedo_bake.hlsl"));
-                var shader = new Shader(source, "CSBakeTerrainAlbedo", "cs_6_6");
-                _albedoBakePSO = device.CreateComputePipelineState(shader.Bytecode);
-                shader.Dispose();
-                Debug.Log("[TerrainRenderer]", "Terrain albedo bake compute shader compiled");
-            }
-
             // Upload tiling data as structured buffer
-            if (_tilingBuffer == null)
-            {
-                _tilingBuffer = device.CreateUploadBuffer(32 * 16); // 32 × float4
-                _tilingSRV = device.AllocateBindlessIndex();
-                var srvDesc = new ShaderResourceViewDescription
-                {
-                    Format = Format.Unknown,
-                    ViewDimension = ShaderResourceViewDimension.Buffer,
-                    Shader4ComponentMapping = ShaderComponentMapping.Default,
-                    Buffer = new BufferShaderResourceView
-                    {
-                        FirstElement = 0,
-                        NumElements = 32,
-                        StructureByteStride = 16,
-                        Flags = BufferShaderResourceViewFlags.None
-                    }
-                };
-                device.NativeDevice.CreateShaderResourceView(_tilingBuffer, srvDesc, device.GetCpuHandle(_tilingSRV));
-            }
-            // Update tiling data
-            void* tilingPtr;
-            _tilingBuffer.Map(0, null, &tilingPtr);
-            fixed (Vector4* src = _layerTiling)
-            {
-                Buffer.MemoryCopy(src, tilingPtr, 32 * 16, 32 * 16);
-            }
-            _tilingBuffer.Unmap(0);
+            _tilingBuffer ??= GraphicsBuffer.CreateUpload<Vector4>(32);
+            _tilingBuffer.Upload<Vector4>(_layerTiling.AsSpan());
 
             // Create or recreate baked albedo texture
             if (_bakedAlbedoTex == null)
@@ -1605,21 +1549,19 @@ namespace Freefall.Components
                 device.NativeDevice.CreateShaderResourceView(_bakedAlbedoTex, srvDesc, device.GetCpuHandle(_bakedAlbedoSRV));
             }
 
-            // Dispatch compute
-            cmd.SetPipelineState(_albedoBakePSO);
-            cmd.SetComputeRootSignature(device.GlobalRootSignature);
-            cmd.SetComputeRoot32BitConstant(0, (uint)ControlMapsArray.BindlessIndex, 0); // ControlMapsIdx
-            cmd.SetComputeRoot32BitConstant(0, (uint)DiffuseMapsArray.BindlessIndex, 1); // DiffuseMapsIdx
-            cmd.SetComputeRoot32BitConstant(0, _bakedAlbedoUAV, 2);                      // OutputUAVIdx
-            cmd.SetComputeRoot32BitConstant(0, _tilingSRV, 3);                            // TilingBufIdx
+            // Dispatch via ComputeShader
+            _albedoBakeCS ??= new ComputeShader("terrain_albedo_bake.hlsl", "CSBakeTerrainAlbedo");
+            _albedoBakeCS.SetUint(0, (uint)ControlMapsArray.BindlessIndex);  // ControlMapsIdx
+            _albedoBakeCS.SetUint(1, (uint)DiffuseMapsArray.BindlessIndex);  // DiffuseMapsIdx
+            _albedoBakeCS.SetUint(2, _bakedAlbedoUAV);                       // OutputUAVIdx
+            _albedoBakeCS.SetUint(3, _tilingBuffer.SrvIndex);                 // TilingBufIdx
 
             uint groups = (uint)((BakedAlbedoSize + 7) / 8);
-            cmd.Dispatch(groups, groups, 1);
+            _albedoBakeCS.Dispatch(cmd, groups, groups);
 
             cmd.ResourceBarrierUnorderedAccessView(_bakedAlbedoTex);
 
             _bakedAlbedoDirty = false;
-            Debug.Log("[TerrainRenderer]", $"Terrain albedo baked: {BakedAlbedoSize}x{BakedAlbedoSize}, ControlMaps={ControlMapsArray.BindlessIndex}, DiffuseMaps={DiffuseMapsArray.BindlessIndex}, SRV={_bakedAlbedoSRV}");
         }
 
         /// <summary>
