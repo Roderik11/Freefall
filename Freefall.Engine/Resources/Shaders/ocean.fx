@@ -55,8 +55,10 @@ struct OceanData
     float ShoreFadeDepth;   // linear depth range for PS soft intersection (meters)
     float3 ShallowColor;    // shallow water tint color
     float RefractionStrength; // how much normal distorts terrain show-through
-    uint NoiseSRV;            // bindless SRV for noise texture (Perlin+Worley)
-    uint _pad3, _pad4, _pad5;
+    uint NoiseSRV;              // bindless SRV for noise texture (Perlin+Worley)
+    float2 InvViewportSize;     // 1.0 / viewport dimensions (replaces GetDimensions)
+    float3 HorizonSkyColor;     // precomputed GetSkyColor at horizon direction
+    float _pad3;
 };
 
 // Tessellation params
@@ -131,49 +133,7 @@ float3 SampleDisplacement(OceanData ocean, float2 worldXZ, float depthAtten, flo
     return totalDisp * depthAtten;
 }
 
-float3 SampleNormal(OceanData ocean, float2 worldXZ, float normalStrength, float depthAtten)
-{
-    Texture2DArray<float2> slopeTex = ResourceDescriptorHeap[ocean.SlopeSRV];
-    StructuredBuffer<float> tileScales = ResourceDescriptorHeap[ocean.TileScalesSRV];
-    float2 totalSlope = 0;
-
-    [loop]
-    for (uint i = 0; i < ocean.NumBands; ++i)
-    {
-        float angle = BandAngles[i];
-        float2 uv = RotateUV(worldXZ, angle) * tileScales[i];
-
-        // Use hardware-computed mip level from screen-space UV derivatives
-        float2 slope = slopeTex.Sample(OceanSampler, float3(uv, i)).xy;
-
-        // Counter-rotate slopes back to world space
-        float s, c;
-        sincos(-angle, s, c);
-        slope = float2(slope.x * c - slope.y * s, slope.x * s + slope.y * c);
-
-        totalSlope += slope;
-    }
-
-    totalSlope *= normalStrength;
-    float3 normal = normalize(float3(-totalSlope.x, 1.0, -totalSlope.y));
-    return normalize(lerp(float3(0, 1, 0), normal, depthAtten));
-}
-
-float SampleFoam(OceanData ocean, float2 worldXZ)
-{
-    Texture2DArray<float4> dispTex = ResourceDescriptorHeap[ocean.DisplacementSRV];
-    StructuredBuffer<float> tileScales = ResourceDescriptorHeap[ocean.TileScalesSRV];
-    float totalFoam = 0;
-
-    [loop]
-    for (uint i = 0; i < ocean.NumBands; ++i)
-    {
-        float2 uv = RotateUV(worldXZ, BandAngles[i]) * tileScales[i];
-        totalFoam += dispTex.SampleLevel(OceanSampler, float3(uv, i), 0).a;
-    }
-
-    return saturate(totalFoam);
-}
+// SampleNormal + SampleFoam merged into PS loop below
 
 // ═══════════════════════════════════════════════════════════════════════
 // CONTROL POINT SHADER — pass world position through
@@ -351,8 +311,38 @@ PSOutput PS(DSOutput input)
     float3 V = normalize(camPos - worldPos);
     float dist = distance(worldPos, camPos);
 
-    // ── Per-pixel normal from FFT slope maps (hardware auto-mipped) ──
-    float3 N = SampleNormal(ocean, input.UndisplacedXZ.xy, 1.0, ocean.NormalAtten);
+    // ── Merged per-band sampling: slope + displacement in one loop ──
+    Texture2DArray<float4> dispTex = ResourceDescriptorHeap[ocean.DisplacementSRV];
+    Texture2DArray<float2> slopeTex = ResourceDescriptorHeap[ocean.SlopeSRV];
+    StructuredBuffer<float> tileScales = ResourceDescriptorHeap[ocean.TileScalesSRV];
+
+    float2 totalSlope = 0;
+    float totalFoam = 0;
+    float waveHeight = 0;
+    float2 worldXZ = input.UndisplacedXZ.xy;
+
+    [loop]
+    for (uint i = 0; i < ocean.NumBands; ++i)
+    {
+        float angle = BandAngles[i];
+        float scale = tileScales[i];
+        float2 uv = RotateUV(worldXZ, angle) * scale;
+
+        // Sample displacement (wave height + foam) and slope in one pass
+        float4 disp = dispTex.Sample(OceanSampler, float3(uv, i));
+        float2 slope = slopeTex.Sample(OceanSampler, float3(uv, i)).xy;
+
+        // Counter-rotate slopes back to world space
+        float s, c;
+        sincos(-angle, s, c);
+        totalSlope += float2(slope.x * c - slope.y * s, slope.x * s + slope.y * c);
+        totalFoam += disp.a;
+        waveHeight += disp.y;
+    }
+
+    // Build normal from accumulated slopes
+    float3 N = normalize(float3(-totalSlope.x, 1.0, -totalSlope.y));
+    N = normalize(lerp(float3(0, 1, 0), N, ocean.NormalAtten));
 
     float NdotV = saturate(dot(N, V));
 
@@ -360,56 +350,38 @@ PSOutput PS(DSOutput input)
     float3 sunDir = normalize(ocean.SunDirection);
     float3 L = normalize(-sunDir);
     float NdotL = saturate(dot(N, L));
+    float3 sunRadiance = ocean.SunColor * ocean.SunIntensity;
 
-    // ── Wave height for scatter/foam ──
-    Texture2DArray<float4> dispTex = ResourceDescriptorHeap[ocean.DisplacementSRV];
-    StructuredBuffer<float> tileScalesPS = ResourceDescriptorHeap[ocean.TileScalesSRV];
-    float waveHeight = 0;
-    [loop] for (uint b = 0; b < ocean.NumBands; ++b)
-        waveHeight += dispTex.Sample(OceanSampler, float3(input.UndisplacedXZ.xy * tileScalesPS[b], b)).y;
     float H = max(0.0, waveHeight);
 
     // ── Base color: dark deep ocean ──
     float depthBlend = saturate(dist / 4000.0);
     float3 baseColor = lerp(ocean.OceanColor, ocean.DeepColor, depthBlend);
 
-    // ── Subsurface scattering (from GarrettGunnell reference) ──
+    // ── Subsurface scattering ──
     float3 scatterColor = float3(0.016, 0.074, 0.16);
     float3 bubbleColor = float3(0.0, 0.02, 0.016);
 
-    // k1: wave-peak forward scatter
     float k1 = 0.3 * H * pow(saturate(dot(L, -V)), 4.0)
              * pow(0.5 - 0.5 * dot(L, N), 3.0);
-    // k2: view-dependent scatter
-    float k2 = 0.1 * pow(NdotV, 2.0);
-    // k3: shadow-side scatter
+    float k2 = 0.1 * NdotV * NdotV;
     float k3 = 0.08 * NdotL;
 
-    float3 scatter = (k1 + k2) * scatterColor * ocean.SunColor * ocean.SunIntensity
-                   + k3 * scatterColor * ocean.SunColor * ocean.SunIntensity
-                   + 0.02 * bubbleColor * ocean.SunColor * ocean.SunIntensity;
+    float3 scatter = ((k1 + k2) * scatterColor + k3 * scatterColor + 0.02 * bubbleColor) * sunRadiance;
 
-    // ── Fresnel (Schlick, F0 = 0.02 for water) ──
-    float waterRough = 0.075;
+    // ── Fresnel (Schlick, precomputed for F0=0.02, roughness=0.075) ──
     float base_f = 1.0 - NdotV;
-    float numerator = pow(base_f, 5.0 * exp(-2.69 * waterRough));
-    float F = 0.02 + (1.0 - 0.02) * numerator / (1.0 + 22.7 * pow(waterRough, 1.5));
-    F = saturate(F);
+    float F = saturate(0.02 + 0.668 * pow(base_f, 4.08));
 
     // ── Environment reflection ──
-    // At distance, per-pixel sky sampling creates noise at grazing angles
-    // because tiny view-vector differences map to different sky colors.
-    // Blend toward a single horizon sky color to calm this.
     float reflSmooth = saturate(dist * 0.003);
     float3 reflectDir = reflect(-V, N);
     reflectDir.y = abs(reflectDir.y);
     float3 skyRefl = GetSkyColor(reflectDir, -sunDir);
-    float3 horizonRefl = GetSkyColor(float3(0, 0.15, 1), -sunDir);
-    float3 reflectColor = lerp(skyRefl, horizonRefl, reflSmooth);
+    float3 reflectColor = lerp(skyRefl, ocean.HorizonSkyColor, reflSmooth);
 
-    // ── GGX sun specular ──
-    // Widen lobe at distance — tessellated geometry creates sub-pixel triangles
-    // that cause specular sparkle even with smooth mipped normals
+    // ── GGX sun specular (widen at distance to reduce tessellation sparkle) ──
+    float waterRough = 0.075;
     float distRough = lerp(waterRough, 0.6, reflSmooth);
     float3 halfDir = normalize(L + V);
     float NdotH = max(0.0001, dot(N, halfDir));
@@ -417,7 +389,7 @@ PSOutput PS(DSOutput input)
     float a2 = a * a;
     float dGGX = (NdotH * NdotH) * (a2 - 1.0) + 1.0;
     float D = a2 / max(3.14159 * dGGX * dGGX, 1e-4);
-    float3 specular = ocean.SunColor * ocean.SunIntensity * F * D * NdotL;
+    float3 specular = sunRadiance * F * D * NdotL;
     specular /= max(0.001, 4.0 * max(0.001, NdotL));
     specular *= NdotL;
 
@@ -425,60 +397,49 @@ PSOutput PS(DSOutput input)
     float3 color = (1.0 - F) * scatter + specular + F * reflectColor;
     color = max(0.0, color);
 
-    // ── Foam from FFT Jacobian (stored in displacement alpha) ──
-    float foam = SampleFoam(ocean, input.UndisplacedXZ.xy);
-    float3 foamColor = float3(0.6, 0.557, 0.492); // warm off-white foam
-    float3 foamLit = foamColor * (0.3 + 0.7 * NdotL) * ocean.SunColor * ocean.SunIntensity;
-    color = lerp(color, foamLit, saturate(foam));
+    // ── Foam from FFT Jacobian ──
+    float foam = saturate(totalFoam);
+    float3 foamColor = float3(0.6, 0.557, 0.492);
+    float3 foamLit = foamColor * (0.3 + 0.7 * NdotL) * sunRadiance;
+    color = lerp(color, foamLit, foam);
 
     // ── Atmospheric extinction / horizon haze ──
     float horizonFade = saturate(dist / 6000.0);
-    float3 hazeColor = float3(0.45, 0.55, 0.72); // steel blue haze
+    float3 hazeColor = float3(0.45, 0.55, 0.72);
     float hazeAmount = horizonFade * horizonFade * 0.85;
     color = lerp(color, hazeColor, hazeAmount);
 
-    // ── Shore pixel effects: shallow color, shore foam, terrain show-through ──
+    // ── Shore pixel effects ──
     if (ocean.DepthGBufferSRV != 0)
     {
         Texture2D<float> depthGB = ResourceDescriptorHeap[ocean.DepthGBufferSRV];
-        float2 screenUV = input.Position.xy;
-        uint dw, dh;
-        depthGB.GetDimensions(dw, dh);
-        screenUV /= float2(dw, dh);
+        float2 screenUV = input.Position.xy * ocean.InvViewportSize;
 
         float sceneLinearZ = depthGB.SampleLevel(OceanSampler, screenUV, 0);
         float oceanLinearZ = input.Depth;
 
-        // Shore proximity: 0 = at shore edge, 1 = deep water
         float depthDiff = (sceneLinearZ > 0) ? (sceneLinearZ - oceanLinearZ) : 1000.0;
         float shoreProximity = saturate(depthDiff / max(0.01, ocean.ShoreFadeDepth));
 
-        // ── Shore foam (compute first — foam blocks terrain visibility) ──
+        // ── Shore foam ──
         float shoreFoamAmount = 0;
         if (ocean.NoiseSRV != 0)
         {
             Texture2D<float4> noiseTex = ResourceDescriptorHeap[ocean.NoiseSRV];
             float t = ocean.WaveTime;
 
-            // Large-scale noise for foam SHAPE
             float2 shapeUV = worldPos.xz * 0.02 + float2(t * 0.008, t * 0.005);
-            float foamShape = noiseTex.Sample(OceanSampler, shapeUV).r;
+            float foamShape = noiseTex.SampleLevel(OceanSampler, shapeUV, 0).r;
+            float foamDetail = noiseTex.SampleLevel(OceanSampler, worldPos.xz * 0.15, 0).g;
 
-            // Fine noise for bubbly DETAIL
-            float foamDetail = noiseTex.Sample(OceanSampler, worldPos.xz * 0.15).g;
-
-            // More foam closer to shore
             float foamThresh = lerp(0.3, 0.9, shoreProximity);
             float shoreFoam = smoothstep(foamThresh, foamThresh + 0.1, foamShape);
             float foamMask = 1.0 - smoothstep(0, 0.5, shoreProximity);
-
-            // Thin edge foam at waterline
             float edgeFoam = (1.0 - smoothstep(0, 0.05, shoreProximity)) * (foamDetail * 0.3 + 0.7);
-
             shoreFoamAmount = saturate(shoreFoam * foamMask * (0.4 + 0.6 * foamDetail) + edgeFoam);
         }
 
-        // ── Terrain show-through: transparent shallow water ──
+        // ── Terrain show-through ──
         if (ocean.CompositeSRV != 0)
         {
             Texture2D<float4> compositeBuffer = ResourceDescriptorHeap[ocean.CompositeSRV];
@@ -486,16 +447,12 @@ PSOutput PS(DSOutput input)
             refrUV = saturate(refrUV);
             float3 terrainColor = compositeBuffer.SampleLevel(OceanSampler, refrUV, 0).rgb;
 
-            // Water absorption: deeper water absorbs more light and tints toward ShallowColor.
-            // Very shallow (shoreProximity≈0) = mostly clear, see unmodified seabed.
-            // Deeper (shoreProximity≈0.5-1) = more absorption/tinting.
-            float absorption = shoreProximity * shoreProximity; // quadratic = gentler near shore
+            float absorption = shoreProximity * shoreProximity;
             float3 tintedTerrain = lerp(terrainColor, terrainColor * ocean.ShallowColor, absorption);
 
-            // Terrain visibility: softer cubic transition, reduced where foam is present
             float terrainVisibility = (1.0 - shoreProximity);
-            terrainVisibility *= terrainVisibility; // quadratic falloff
-            terrainVisibility *= (1.0 - shoreFoamAmount); // foam is opaque, blocks seabed
+            terrainVisibility *= terrainVisibility;
+            terrainVisibility *= (1.0 - shoreFoamAmount);
             color = lerp(color, tintedTerrain, terrainVisibility);
         }
 
