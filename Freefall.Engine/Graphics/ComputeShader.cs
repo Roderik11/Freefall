@@ -11,6 +11,7 @@ namespace Freefall.Graphics
     /// A single ComputeShader can hold multiple kernels (entry points) from the same HLSL file.
     /// Push constant slot mappings are file-level (from #define XxxIdx GET_INDEX(N)).
     /// Each kernel has its own constant values array.
+    /// Use SetKernel to select the active kernel, then Set/Dispatch operate on it.
     /// </summary>
     public class ComputeShader : IDisposable
     {
@@ -42,8 +43,8 @@ namespace Freefall.Graphics
         private string? _basePath;
 
         /// <summary>
-        /// Create a multi-kernel compute shader from an HLSL file.
-        /// Use FindKernel to compile and get kernel indices, then Dispatch by index.
+        /// Create a compute shader from an HLSL file.
+        /// Kernels are auto-discovered from #pragma kernel directives.
         /// </summary>
         public ComputeShader(string filename)
         {
@@ -52,8 +53,8 @@ namespace Freefall.Graphics
         }
 
         /// <summary>
-        /// Create a single-kernel compute shader (backward-compatible).
-        /// The entry point is registered as kernel 0 automatically.
+        /// Create a single-kernel compute shader (convenience).
+        /// The entry point is used as fallback if no #pragma kernel directives exist.
         /// </summary>
         public ComputeShader(string filename, string entryPoint)
         {
@@ -80,6 +81,25 @@ namespace Freefall.Graphics
             throw new KeyNotFoundException($"[{_filename}] Kernel '{entryPoint}' not found. Declared kernels: {string.Join(", ", GetKernelNames())}");
         }
 
+        /// <summary>
+        /// Set the active kernel by name. All subsequent Set/Dispatch calls operate on this kernel.
+        /// </summary>
+        public void SetKernel(string entryPoint)
+        {
+            _activeKernel = FindKernel(entryPoint);
+        }
+
+        /// <summary>
+        /// Set the active kernel by index. All subsequent Set/Dispatch calls operate on this kernel.
+        /// </summary>
+        public void SetKernel(int kernel)
+        {
+            EnsureSourceLoaded();
+            if (kernel < 0 || kernel >= _kernels.Count)
+                throw new ArgumentOutOfRangeException(nameof(kernel));
+            _activeKernel = kernel;
+        }
+
         /// <summary>Get all compiled kernel names.</summary>
         public IEnumerable<string> GetKernelNames()
         {
@@ -88,90 +108,57 @@ namespace Freefall.Graphics
                 yield return k.Name;
         }
 
-        // ────────────── Named Push Constants (kernel-indexed) ──────────────
+        /// <summary>Get the PSO for a specific kernel (for manual pipeline binding).</summary>
+        public ID3D12PipelineState GetPSO(int kernel) => _kernels[kernel].PSO;
 
-        /// <summary>Set a uint push constant on a specific kernel.</summary>
-        public void Set(int kernel, string name, uint value)
+        // ────────────── Push Constants (operate on active kernel) ──────────────
+
+        /// <summary>Set a uint push constant by name on the active kernel.</summary>
+        public void Set(string name, uint value)
         {
             EnsureSourceLoaded();
             int slot = ResolveSlot(name);
-            if (slot >= 0) _kernels[kernel].Constants[slot] = value;
+            if (slot >= 0) _kernels[_activeKernel].Constants[slot] = value;
         }
 
-        /// <summary>Set a float push constant on a specific kernel.</summary>
-        public void Set(int kernel, string name, float value)
+        /// <summary>Set a float push constant by name on the active kernel.</summary>
+        public void Set(string name, float value)
         {
             EnsureSourceLoaded();
             int slot = ResolveSlot(name);
-            if (slot >= 0) _kernels[kernel].Constants[slot] = BitConverter.SingleToUInt32Bits(value);
+            if (slot >= 0) _kernels[_activeKernel].Constants[slot] = BitConverter.SingleToUInt32Bits(value);
         }
 
-        /// <summary>Set a Texture's bindless SRV index on a specific kernel.</summary>
-        public void Set(int kernel, string name, Texture texture)
+        /// <summary>Set a Texture's bindless SRV index on the active kernel.</summary>
+        public void Set(string name, Texture texture)
         {
             EnsureSourceLoaded();
             int slot = ResolveSlot(name);
-            if (slot >= 0) _kernels[kernel].Constants[slot] = texture.BindlessIndex;
+            if (slot >= 0) _kernels[_activeKernel].Constants[slot] = texture.BindlessIndex;
         }
 
-        /// <summary>Set a GraphicsBuffer's SRV index on a specific kernel.</summary>
-        public void SetSRV(int kernel, string name, GraphicsBuffer buffer)
+        /// <summary>Set a GraphicsBuffer's SRV index on the active kernel.</summary>
+        public void SetSRV(string name, GraphicsBuffer buffer)
         {
             EnsureSourceLoaded();
             int slot = ResolveSlot(name);
-            if (slot >= 0) _kernels[kernel].Constants[slot] = buffer.SrvIndex;
+            if (slot >= 0) _kernels[_activeKernel].Constants[slot] = buffer.SrvIndex;
         }
 
-        /// <summary>Set a GraphicsBuffer's UAV index on a specific kernel.</summary>
-        public void SetUAV(int kernel, string name, GraphicsBuffer buffer)
+        /// <summary>Set a GraphicsBuffer's UAV index on the active kernel.</summary>
+        public void SetUAV(string name, GraphicsBuffer buffer)
         {
             EnsureSourceLoaded();
             int slot = ResolveSlot(name);
-            if (slot >= 0) _kernels[kernel].Constants[slot] = buffer.UavIndex;
+            if (slot >= 0) _kernels[_activeKernel].Constants[slot] = buffer.UavIndex;
         }
 
-        // ────────────── Named Push Constants (default kernel, backward compat) ──────────────
+        // ────────────── Constant Buffer Parameters (shared across all kernels) ──────────────
 
-        /// <summary>Set a uint push constant on the default kernel (0).</summary>
-        public void Set(string name, uint value) => Set(EnsureDefaultKernel(), name, value);
-
-        /// <summary>Set a float push constant on the default kernel (0).</summary>
-        public void Set(string name, float value) => Set(EnsureDefaultKernel(), name, value);
-
-        /// <summary>Set a Texture's bindless SRV index on the default kernel (0).</summary>
-        public void Set(string name, Texture texture) => Set(EnsureDefaultKernel(), name, texture);
-
-        /// <summary>Set a GraphicsBuffer's SRV index on the default kernel (0).</summary>
-        public void SetSRV(string name, GraphicsBuffer buffer) => SetSRV(EnsureDefaultKernel(), name, buffer);
-
-        /// <summary>Set a GraphicsBuffer's UAV index on the default kernel (0).</summary>
-        public void SetUAV(string name, GraphicsBuffer buffer) => SetUAV(EnsureDefaultKernel(), name, buffer);
-
-        // ────────────── Raw Push Constants (slot-based, fallback) ──────────────
-
-        /// <summary>Set a uint push constant at the given slot on a specific kernel.</summary>
-        public void SetUint(int kernel, int slot, uint value)
-        {
-            EnsureSourceLoaded();
-            EnsureDefaultKernel();
-            _kernels[kernel].Constants[slot] = value;
-        }
-
-        /// <summary>Set a float push constant at the given slot on a specific kernel.</summary>
-        public void SetFloat(int kernel, int slot, float value)
-        {
-            EnsureSourceLoaded();
-            EnsureDefaultKernel();
-            _kernels[kernel].Constants[slot] = BitConverter.SingleToUInt32Bits(value);
-        }
-
-        // ────────────── Constant Buffer Parameters ──────────────
-
-        /// <summary>Set a constant buffer parameter by name (shared across all kernels).</summary>
+        /// <summary>Set a constant buffer parameter by name.</summary>
         public void SetParam<T>(string name, T value) where T : unmanaged
         {
             EnsureSourceLoaded();
-            EnsureDefaultKernel();
             foreach (var cb in _constantBuffers.Values)
                 cb.SetParameter(name, value);
         }
@@ -180,28 +167,40 @@ namespace Freefall.Graphics
         public void SetParamArray<T>(string name, T[] values) where T : unmanaged
         {
             EnsureSourceLoaded();
-            EnsureDefaultKernel();
             foreach (var cb in _constantBuffers.Values)
                 cb.SetParameterArray(name, values);
         }
 
-        // ────────────── Dispatch ──────────────
+        // ────────────── Dispatch (operates on active kernel) ──────────────
 
-        /// <summary>Dispatch a specific kernel by index.</summary>
-        public void Dispatch(ID3D12GraphicsCommandList cmd, int kernel, uint groupsX, uint groupsY = 1, uint groupsZ = 1)
+        /// <summary>
+        /// Prepare the compute pipeline. Binds root signature and descriptor heaps.
+        /// Call once before a sequence of SetKernel/Set/Dispatch calls.
+        /// External cbuffer bindings (e.g., frustum planes) should be done AFTER Begin.
+        /// </summary>
+        public void Begin(ID3D12GraphicsCommandList cmd)
         {
             EnsureSourceLoaded();
-            if (kernel < 0 || kernel >= _kernels.Count)
-                throw new ArgumentOutOfRangeException(nameof(kernel), $"Kernel index {kernel} out of range (0-{_kernels.Count - 1})");
-
             var device = Engine.Device;
-            var k = _kernels[kernel];
-
             cmd.SetComputeRootSignature(device.GlobalRootSignature);
             cmd.SetDescriptorHeaps(1, new[] { device.SrvHeap });
+        }
+
+        /// <summary>
+        /// Dispatch the active kernel. Sets PSO and pushes constants.
+        /// Call Begin() once before the first Dispatch in a sequence.
+        /// </summary>
+        public void Dispatch(ID3D12GraphicsCommandList cmd, uint groupsX, uint groupsY = 1, uint groupsZ = 1)
+        {
+            EnsureSourceLoaded();
+            if (_kernels.Count == 0)
+                throw new InvalidOperationException($"No kernels compiled for {_filename}.");
+
+            var k = _kernels[_activeKernel];
+
             cmd.SetPipelineState(k.PSO);
 
-            // Upload push constants for this kernel
+            // Upload push constants for the active kernel
             for (int i = 0; i < k.Constants.Length; i++)
             {
                 if (k.Constants[i] != 0)
@@ -220,15 +219,6 @@ namespace Freefall.Graphics
 
             cmd.Dispatch(groupsX, groupsY, groupsZ);
         }
-
-        /// <summary>Dispatch the default kernel (backward-compatible).</summary>
-        public void Dispatch(ID3D12GraphicsCommandList cmd, uint groupsX, uint groupsY = 1, uint groupsZ = 1)
-        {
-            Dispatch(cmd, EnsureDefaultKernel(), groupsX, groupsY, groupsZ);
-        }
-
-        /// <summary>Get the PSO for a specific kernel (for manual pipeline binding).</summary>
-        public ID3D12PipelineState GetPSO(int kernel) => _kernels[kernel].PSO;
 
         // ────────────── Internal ──────────────
 
@@ -290,14 +280,6 @@ namespace Freefall.Graphics
             });
 
             Debug.Log("[ComputeShader]", $"  Compiled kernel [{index}]: {entryPoint}");
-        }
-
-        private int EnsureDefaultKernel()
-        {
-            EnsureSourceLoaded();
-            if (_kernels.Count == 0)
-                throw new InvalidOperationException($"No kernels compiled for {_filename}. Use FindKernel() first or provide an entry point in the constructor.");
-            return 0;
         }
 
         private void DiscoverConstantBuffers(ID3D12ShaderReflection reflection)

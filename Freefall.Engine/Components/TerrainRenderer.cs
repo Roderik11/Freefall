@@ -37,11 +37,8 @@ namespace Freefall.Components
         // ───── Internal State ─────────────────────────────────────────────
         private const int FrameCount = 3;
 
-        // Compute pipeline — three-pass restricted quadtree + one-time mip pyramid builder
-        private ID3D12PipelineState _buildMinMaxMipPSO = null!;
-        private ID3D12PipelineState _markSplitsPSO = null!;
-        private ID3D12PipelineState _emitLeavesPSO = null!;
-        private ID3D12PipelineState _buildDrawArgsPSO = null!;
+        // Compute pipeline — restricted quadtree (auto-discovers all #pragma kernel entries)
+        private ComputeShader? _quadtreeCS;
         private bool _computeInitialized;
         private bool _firstDispatch = true; // skip Hi-Z on first frame (no valid _previousFrameViewProjection yet)
 
@@ -54,9 +51,7 @@ namespace Freefall.Components
         private GraphicsBuffer[] _splitFlagsBuffers = new GraphicsBuffer[FrameCount];
         private GraphicsBuffer[] _indirectArgsBuffers = new GraphicsBuffer[FrameCount];
 
-        // Shadow indirect args (16 bytes: 4 DrawInstanced uints)
         private GraphicsBuffer[] _shadowArgsBuffers = new GraphicsBuffer[FrameCount];
-        private ID3D12PipelineState? _emitLeavesShadowPSO;
 
         // Shadow emit output buffers (CSEmitLeavesShadow with per-cascade frustum culling)
         private GraphicsBuffer[] _shadowDescriptorBuffers = new GraphicsBuffer[FrameCount];
@@ -241,39 +236,7 @@ namespace Freefall.Components
         {
             var device = Engine.Device;
 
-            string shaderPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Resources", "Shaders", "terrain_quadtree.hlsl");
-            if (!File.Exists(shaderPath))
-            {
-                Debug.LogError("[TerrainRenderer]", $"Compute shader not found: {shaderPath}");
-                return;
-            }
-
-            string source = File.ReadAllText(shaderPath);
-
-            // Pass 1: Mark splits + enforce restricted quadtree
-            var markShader = new Shader(source, "CSMarkSplits", "cs_6_6");
-            _markSplitsPSO = device.CreateComputePipelineState(markShader.Bytecode);
-            markShader.Dispose();
-
-            // Pass 2: Emit leaves using restriction-enforced split flags
-            var emitShader = new Shader(source, "CSEmitLeaves", "cs_6_6");
-            _emitLeavesPSO = device.CreateComputePipelineState(emitShader.Bytecode);
-            emitShader.Dispose();
-
-            // Pass 3: Build DrawInstanced indirect args from counter
-            var buildDrawArgsShader = new Shader(source, "CSBuildDrawArgs", "cs_6_6");
-            _buildDrawArgsPSO = device.CreateComputePipelineState(buildDrawArgsShader.Bytecode);
-            buildDrawArgsShader.Dispose();
-
-            // Shadow: Per-cascade emit with frustum culling
-            var emitShadowShader = new Shader(source, "CSEmitLeavesShadow", "cs_6_6");
-            _emitLeavesShadowPSO = device.CreateComputePipelineState(emitShadowShader.Bytecode);
-            emitShadowShader.Dispose();
-
-            // One-time: Build height range mip pyramid
-            var buildMinMaxMipShader = new Shader(source, "CSBuildMinMaxMip", "cs_6_6");
-            _buildMinMaxMipPSO = device.CreateComputePipelineState(buildMinMaxMipShader.Bytecode);
-            buildMinMaxMipShader.Dispose();
+            _quadtreeCS = new ComputeShader("terrain_quadtree.hlsl");
 
             for (int i = 0; i < FrameCount; i++)
             {
@@ -336,23 +299,21 @@ namespace Freefall.Components
         private void DispatchQuadtreeEval(ID3D12GraphicsCommandList commandList, int frameIndex)
         {
             var device = Engine.Device;
+            var cs = _quadtreeCS!;
 
-            // Transition buffers to UAV (no-op if already in UAV state)
+            // Transition buffers to UAV
             _descriptorBuffers[frameIndex].Transition(commandList, ResourceStates.UnorderedAccess);
             _sphereBuffers[frameIndex].Transition(commandList, ResourceStates.UnorderedAccess);
             _subbatchIdBuffers[frameIndex].Transition(commandList, ResourceStates.UnorderedAccess);
             _terrainDataBuffers[frameIndex].Transition(commandList, ResourceStates.UnorderedAccess);
             _indirectArgsBuffers[frameIndex].Transition(commandList, ResourceStates.UnorderedAccess);
 
-            // Set compute root signature and descriptor heap
-            commandList.SetComputeRootSignature(device.GlobalRootSignature);
-            commandList.SetDescriptorHeaps(1, new[] { device.SrvHeap });
-
-            // ── Upload frustum + Hi-Z constants for compute shader culling ──
+            // Upload frustum + Hi-Z constants
             UploadFrustumConstants(frameIndex);
+            cs.Begin(commandList);  // Sets root sig + descriptor heaps once
             commandList.SetComputeRootConstantBufferView(1, _frustumConstantBuffers[frameIndex].GPUVirtualAddress);
 
-            // Clear counter and splitFlags to zero
+            // Clear counter and splitFlags
             _counterBuffers[frameIndex].ClearUAV(commandList, new Vortice.Mathematics.Int4(0, 0, 0, 0));
             commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(null)));
             _splitFlagsBuffers[frameIndex].ClearUAV(commandList, new Vortice.Mathematics.Int4(0, 0, 0, 0));
@@ -365,103 +326,91 @@ namespace Freefall.Components
             Vector3 rootCenter = new Vector3(terrainSize.X * 0.5f, 0, terrainSize.Y * 0.5f);
             Vector3 rootExtents = new Vector3(terrainSize.X * 0.5f, maxHeight, terrainSize.Y * 0.5f);
 
-
-            // Screen-space error: compute TanHalfFov and ScreenHeight
+            // Screen-space error params
             var camera = Camera.Main!;
             float vFovRad = camera.FieldOfView * (MathF.PI / 180f);
             float tanHalfFov = MathF.Tan(vFovRad * 0.5f);
             float screenHeight = camera.Target?.Height ?? 1080f;
 
-            // Push constants (Indices[0..7] = 32 dwords) — shared by all passes
-            // Indices[0]: UAV outputs
-            commandList.SetComputeRoot32BitConstant(0, _descriptorBuffers[frameIndex].UavIndex, 0);     // Indices[0].x
-            commandList.SetComputeRoot32BitConstant(0, _sphereBuffers[frameIndex].UavIndex, 1);          // Indices[0].y
-            commandList.SetComputeRoot32BitConstant(0, _subbatchIdBuffers[frameIndex].UavIndex, 2);      // Indices[0].z
-            commandList.SetComputeRoot32BitConstant(0, _terrainDataBuffers[frameIndex].UavIndex, 3);     // Indices[0].w
-            
-            // Indices[1]: control params
-            commandList.SetComputeRoot32BitConstant(0, _counterBuffers[frameIndex].UavIndex, 4);         // Indices[1].x
-            commandList.SetComputeRoot32BitConstant(0, (uint)MaxDepth, 5);                   // Indices[1].y
-            commandList.SetComputeRoot32BitConstant(0, (uint)Transform.TransformSlot, 6);    // Indices[1].z
-            commandList.SetComputeRoot32BitConstant(0, (uint)(Material?.MaterialID ?? 0), 7);// Indices[1].w
-            
-            // Indices[2]: more control params
-            commandList.SetComputeRoot32BitConstant(0, (uint)_meshPartId, 8);                // Indices[2].x
-            commandList.SetComputeRoot32BitConstant(0, 0u, 9);                                // Indices[2].y (unused, was LODRange0)
-            commandList.SetComputeRoot32BitConstant(0, (uint)_totalNodes, 10);               // Indices[2].z
-            var htIdx = Terrain?.Heightmap?.BindlessIndex ?? 0u;
-            commandList.SetComputeRoot32BitConstant(0, htIdx, 11);  // Indices[2].w = HeightTexIdx
+            // Set named push constants — shared by all passes
+            // We use SetKernel("CSMarkSplits") to set constants on kernal 0, which all passes read
+            cs.SetKernel("CSMarkSplits");
 
-            // Indices[3]: camera pos + root center x
-            commandList.SetComputeRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(cameraPos.X), 12);    // Indices[3].x
-            commandList.SetComputeRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(cameraPos.Y), 13);    // Indices[3].y
-            commandList.SetComputeRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(cameraPos.Z), 14);    // Indices[3].z
-            commandList.SetComputeRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(rootCenter.X), 15);   // Indices[3].w
+            // UAV outputs
+            cs.Set("OutputDescriptorsUAV", _descriptorBuffers[frameIndex].UavIndex);
+            cs.Set("OutputSpheresUAV", _sphereBuffers[frameIndex].UavIndex);
+            cs.Set("OutputSubbatchIdsUAV", _subbatchIdBuffers[frameIndex].UavIndex);
+            cs.Set("OutputTerrainDataUAV", _terrainDataBuffers[frameIndex].UavIndex);
 
-            // Indices[4]: root center yz + root extents xy
-            commandList.SetComputeRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(rootCenter.Y), 16);   // Indices[4].x
-            commandList.SetComputeRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(rootCenter.Z), 17);   // Indices[4].y
-            commandList.SetComputeRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(rootExtents.X), 18);  // Indices[4].z
-            commandList.SetComputeRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(rootExtents.Y), 19);  // Indices[4].w
+            // Control params
+            cs.Set("CounterUAV", _counterBuffers[frameIndex].UavIndex);
+            cs.Set("MaxDepth", (uint)MaxDepth);
+            cs.Set("TransformSlot", (uint)Transform.TransformSlot);
+            cs.Set("MaterialId", (uint)(Material?.MaterialID ?? 0));
+            cs.Set("MeshPartId", (uint)_meshPartId);
+            cs.Set("TotalNodes", (uint)_totalNodes);
+            cs.Set("HeightTex", Terrain?.Heightmap?.BindlessIndex ?? 0u);
 
-            // Indices[5]: root extents z + max patches + splitFlags UAV + maxHeight
-            commandList.SetComputeRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(rootExtents.Z), 20);  // Indices[5].x
-            commandList.SetComputeRoot32BitConstant(0, (uint)MaxPatches, 21);                                // Indices[5].y
-            commandList.SetComputeRoot32BitConstant(0, _splitFlagsBuffers[frameIndex].UavIndex, 22);         // Indices[5].z
-            commandList.SetComputeRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(maxHeight), 23);     // Indices[5].w
+            // Camera/bounds (float via uint bits)
+            cs.Set("CameraPosX", cameraPos.X);
+            cs.Set("CameraPosY", cameraPos.Y);
+            cs.Set("CameraPosZ", cameraPos.Z);
+            cs.Set("RootCenterX", rootCenter.X);
+            cs.Set("RootCenterY", rootCenter.Y);
+            cs.Set("RootCenterZ", rootCenter.Z);
+            cs.Set("RootExtentsX", rootExtents.X);
+            cs.Set("RootExtentsY", rootExtents.Y);
+            cs.Set("RootExtentsZ", rootExtents.Z);
 
-            // Indices[6]: HeightRangeSRV + TerrainSize + (BuildMip unused at runtime)
-            commandList.SetComputeRoot32BitConstant(0, _heightRangePyramidSRV, 24);                          // Indices[6].x
-            commandList.SetComputeRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(terrainSize.X), 25);  // Indices[6].y
-            commandList.SetComputeRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(terrainSize.Y), 26);  // Indices[6].z
-            commandList.SetComputeRoot32BitConstant(0, 0u, 27);                                              // Indices[6].w = unused
+            // More control
+            cs.Set("MaxPatches", (uint)MaxPatches);
+            cs.Set("SplitFlagsUAV", _splitFlagsBuffers[frameIndex].UavIndex);
+            cs.Set("MaxHeight", maxHeight);
+            cs.Set("HeightRangeSRV", _heightRangePyramidSRV);
+            cs.Set("TerrainSizeX", terrainSize.X);
+            cs.Set("TerrainSizeY", terrainSize.Y);
 
-            // Indices[7]: PixelErrorThreshold + ScreenHeight + TanHalfFov (slots 29-30 overwritten for mip build)
-            commandList.SetComputeRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(PixelErrorThreshold), 28); // Indices[7].x
-            commandList.SetComputeRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(screenHeight), 29);        // Indices[7].y
-            commandList.SetComputeRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(tanHalfFov), 30);          // Indices[7].z
+            // Screen-space error
+            cs.Set("PixelErrorThreshold", PixelErrorThreshold);
+            cs.Set("ScreenHeight", screenHeight);
+            cs.Set("TanHalfFov", tanHalfFov);
 
             // ── One-time: Build height range mip pyramid ──
             if (!_heightRangePyramidBuilt)
             {
-                // Ensure heightmap texel data is resident on GPU before CSBuildMinMaxMip reads it.
-                // Heightmap is async-uploaded via StreamingManager — BindlessIndex exists
-                // but GPU copy may not have completed yet on the first dispatch.
                 StreamingManager.Instance?.Flush();
                 Engine.Device.WaitForCopyQueue();
 
                 BuildHeightRangePyramid(commandList);
                 _heightRangePyramidBuilt = true;
 
-                // Mip build overwrites slots 29-30 — restore ScreenHeight/TanHalfFov
-                commandList.SetComputeRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(screenHeight), 29);
-                commandList.SetComputeRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(tanHalfFov), 30);
+                // Mip build overwrites slots 29-30 — restore
+                cs.Set("ScreenHeight", screenHeight);
+                cs.Set("TanHalfFov", tanHalfFov);
             }
 
             uint threadGroups = (uint)((_totalNodes + 255) / 256);
 
             // ── Pass 1: Mark splits + enforce restricted quadtree ──
-            commandList.SetPipelineState(_markSplitsPSO);
-            commandList.Dispatch(threadGroups, 1, 1);
+            cs.Dispatch(commandList, threadGroups);
 
-            // UAV barrier — splitFlags must be visible to Pass 2
+            // UAV barrier
             commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(null)));
 
             // ── Pass 2: Emit leaves with inline frustum + Hi-Z culling ──
-            commandList.SetPipelineState(_emitLeavesPSO);
-            commandList.Dispatch(threadGroups, 1, 1);
+            cs.SetKernel("CSEmitLeaves");
+            cs.Dispatch(commandList, threadGroups);
 
-            // UAV barrier — counter and output buffers must be visible to Pass 3
+            // UAV barrier
             commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(null)));
 
             // ── Pass 3: Build DrawInstanced indirect args from counter ──
-            // Set slot 29 (MipInputSRV) = mesh index count for CSBuildDrawArgs
-            commandList.SetComputeRoot32BitConstant(0, (uint)_patchMesh.IndexCount, 29);  // Indices[7].y = vertex count per instance
-            commandList.SetComputeRoot32BitConstant(0, _indirectArgsBuffers[frameIndex].UavIndex, 31); // Indices[7].w = IndirectArgsUAV
-            commandList.SetPipelineState(_buildDrawArgsPSO);
-            commandList.Dispatch(1, 1, 1);
+            cs.SetKernel("CSBuildDrawArgs");
+            cs.Set("ScreenHeight", (uint)_patchMesh.IndexCount);  // Repurposed: vertex count
+            cs.Set("IndirectArgsUAV", _indirectArgsBuffers[frameIndex].UavIndex);
+            cs.Dispatch(commandList, 1);
 
-            // UAV barrier — indirect args must be visible before ExecuteIndirect
+            // UAV barrier
             commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(null)));
 
             // Transition indirect args buffer for ExecuteIndirect
@@ -578,73 +527,73 @@ namespace Freefall.Components
             _shadowArgsBuffers[frameIndex].Transition(commandList, ResourceStates.UnorderedAccess);
 
             // Switch to compute pipeline
-            commandList.SetComputeRootSignature(device.GlobalRootSignature);
-            commandList.SetDescriptorHeaps(1, new[] { device.SrvHeap });
+            var cs = _quadtreeCS!;
+            cs.Begin(commandList);
 
             // Clear shadow counter
             _shadowCounterBuffers[frameIndex].ClearUAV(commandList, new Vortice.Mathematics.Int4(0, 0, 0, 0));
 
-            // Bind shadow output UAVs
-            commandList.SetComputeRoot32BitConstant(0, _shadowDescriptorBuffers[frameIndex].UavIndex, 0);  // OutputDescriptorsUAV
-            commandList.SetComputeRoot32BitConstant(0, _shadowSphereBuffers[frameIndex].UavIndex, 1);       // OutputSpheresUAV
-            commandList.SetComputeRoot32BitConstant(0, _shadowSubbatchIdBuffers[frameIndex].UavIndex, 2);   // OutputSubbatchIdsUAV
-            commandList.SetComputeRoot32BitConstant(0, _shadowTerrainDataBuffers[frameIndex].UavIndex, 3);  // OutputTerrainDataUAV
-            commandList.SetComputeRoot32BitConstant(0, _shadowCounterBuffers[frameIndex].UavIndex, 4);      // CounterUAV
+            // Set named push constants for CSEmitLeavesShadow
+            cs.SetKernel("CSEmitLeavesShadow");
+
+            // Shadow output UAVs
+            cs.Set("OutputDescriptorsUAV", _shadowDescriptorBuffers[frameIndex].UavIndex);
+            cs.Set("OutputSpheresUAV", _shadowSphereBuffers[frameIndex].UavIndex);
+            cs.Set("OutputSubbatchIdsUAV", _shadowSubbatchIdBuffers[frameIndex].UavIndex);
+            cs.Set("OutputTerrainDataUAV", _shadowTerrainDataBuffers[frameIndex].UavIndex);
+            cs.Set("CounterUAV", _shadowCounterBuffers[frameIndex].UavIndex);
 
             // Quadtree constants
-            commandList.SetComputeRoot32BitConstant(0, (uint)MaxDepth, 5);
-            commandList.SetComputeRoot32BitConstant(0, (uint)Transform.TransformSlot, 6);
-            commandList.SetComputeRoot32BitConstant(0, (uint)(Material?.MaterialID ?? 0), 7);
-            commandList.SetComputeRoot32BitConstant(0, (uint)_meshPartId, 8);
-            commandList.SetComputeRoot32BitConstant(0, _shadowCascadeIdxBuffers[frameIndex].UavIndex, 9);   // CascadeIdxUAV (slot 9)
-            commandList.SetComputeRoot32BitConstant(0, (uint)_totalNodes, 10);
-            var htIdx = Terrain!.Heightmap?.BindlessIndex ?? 0u;
-            commandList.SetComputeRoot32BitConstant(0, htIdx, 11);
+            cs.Set("MaxDepth", (uint)MaxDepth);
+            cs.Set("TransformSlot", (uint)Transform.TransformSlot);
+            cs.Set("MaterialId", (uint)(Material?.MaterialID ?? 0));
+            cs.Set("MeshPartId", (uint)_meshPartId);
+            cs.Set("CascadeIdxUAV", _shadowCascadeIdxBuffers[frameIndex].UavIndex);
+            cs.Set("TotalNodes", (uint)_totalNodes);
+            cs.Set("HeightTex", Terrain!.Heightmap?.BindlessIndex ?? 0u);
 
             // Camera position in LOCAL space
             var camPos = Camera.Main!.Position - Transform.Position;
-            commandList.SetComputeRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(camPos.X), 12);
-            commandList.SetComputeRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(camPos.Y), 13);
-            commandList.SetComputeRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(camPos.Z), 14);
+            cs.Set("CameraPosX", camPos.X);
+            cs.Set("CameraPosY", camPos.Y);
+            cs.Set("CameraPosZ", camPos.Z);
 
             var terrainSz = Terrain.TerrainSize;
-            commandList.SetComputeRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(terrainSz.X * 0.5f), 15);
-            commandList.SetComputeRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(0f), 16);
-            commandList.SetComputeRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(terrainSz.Y * 0.5f), 17);
-            commandList.SetComputeRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(terrainSz.X * 0.5f), 18);
-            commandList.SetComputeRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(Terrain.MaxHeight), 19);
-            commandList.SetComputeRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(terrainSz.Y * 0.5f), 20);
+            cs.Set("RootCenterX", terrainSz.X * 0.5f);
+            cs.Set("RootCenterY", 0f);
+            cs.Set("RootCenterZ", terrainSz.Y * 0.5f);
+            cs.Set("RootExtentsX", terrainSz.X * 0.5f);
+            cs.Set("RootExtentsY", Terrain.MaxHeight);
+            cs.Set("RootExtentsZ", terrainSz.Y * 0.5f);
 
             int shadowMaxPatches = MaxPatches * cascadeCount;
-            commandList.SetComputeRoot32BitConstant(0, (uint)shadowMaxPatches, 21);             // MaxPatches (shadow capacity)
-            commandList.SetComputeRoot32BitConstant(0, _splitFlagsBuffers[frameIndex].UavIndex, 22);
-            commandList.SetComputeRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(Terrain.MaxHeight), 23);
-            commandList.SetComputeRoot32BitConstant(0, _heightRangePyramidSRV, 24);
+            cs.Set("MaxPatches", (uint)shadowMaxPatches);
+            cs.Set("SplitFlagsUAV", _splitFlagsBuffers[frameIndex].UavIndex);
+            cs.Set("MaxHeight", Terrain.MaxHeight);
+            cs.Set("HeightRangeSRV", _heightRangePyramidSRV);
 
-            commandList.SetComputeRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(terrainSz.X), 25);
-            commandList.SetComputeRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(terrainSz.Y), 26);
-            commandList.SetComputeRoot32BitConstant(0, (uint)cascadeCount, 30);                 // CascadeCount (slot 30)
+            cs.Set("TerrainSizeX", terrainSz.X);
+            cs.Set("TerrainSizeY", terrainSz.Y);
+            cs.Set("TanHalfFov", (uint)cascadeCount);  // Slot 30 reused as CascadeCount
 
-            // Bind FrustumPlanes CB at root slot 1 (register b0) — required by root signature
-            // even though CSEmitLeavesShadow doesn't use it; uses cascade planes at slot 2 instead
+            // Bind FrustumPlanes CB at root slot 1 (required by root signature)
             commandList.SetComputeRootConstantBufferView(1, _frustumConstantBuffers[frameIndex].GPUVirtualAddress);
 
             // Bind terrain-local cascade buffer via push constant (CascadeBufferSRVIdx, slot 31)
-            commandList.SetComputeRoot32BitConstant(0, _shadowCascadeBufferSrvs[frameIndex], 31);
+            cs.Set("IndirectArgsUAV", _shadowCascadeBufferSrvs[frameIndex]);  // Slot 31 reused for CascadeBufferSRV
 
             // Dispatch CSEmitLeavesShadow
             uint threadGroups = (uint)((_totalNodes + 255) / 256);
-            commandList.SetPipelineState(_emitLeavesShadowPSO!);
-            commandList.Dispatch(threadGroups, 1, 1);
+            cs.Dispatch(commandList, threadGroups);
 
             // UAV barrier
             commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(null)));
 
             // Build draw args from shadow counter (reuse CSBuildDrawArgs)
-            commandList.SetComputeRoot32BitConstant(0, (uint)_patchMesh.IndexCount, 29);        // VertexCount
-            commandList.SetComputeRoot32BitConstant(0, _shadowArgsBuffers[frameIndex].UavIndex, 31);        // IndirectArgsUAV
-            commandList.SetPipelineState(_buildDrawArgsPSO);
-            commandList.Dispatch(1, 1, 1);
+            cs.SetKernel("CSBuildDrawArgs");
+            cs.Set("ScreenHeight", (uint)_patchMesh.IndexCount);  // Repurposed: vertex count
+            cs.Set("IndirectArgsUAV", _shadowArgsBuffers[frameIndex].UavIndex);
+            cs.Dispatch(commandList, 1);
 
             // UAV barrier
             commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(null)));
@@ -837,7 +786,8 @@ namespace Freefall.Components
         /// </summary>
         private void BuildHeightRangePyramid(ID3D12GraphicsCommandList commandList)
         {
-            commandList.SetPipelineState(_buildMinMaxMipPSO);
+            var cs = _quadtreeCS!;
+            cs.SetKernel("CSBuildMinMaxMip");
 
             int w = 1 << MaxDepth;
             int h = w;
@@ -852,14 +802,14 @@ namespace Freefall.Components
                         (uint)mip)));
 
                 // Push constants for this mip level
-                commandList.SetComputeRoot32BitConstant(0, (uint)mip, 27);               // BuildMip
-                commandList.SetComputeRoot32BitConstant(0, mip > 0 ? _heightRangeMipSRVs[mip - 1] : 0u, 29); // MipInputSRV
-                commandList.SetComputeRoot32BitConstant(0, _heightRangeMipUAVs[mip], 30); // MipOutputUAV
+                cs.Set("BuildMip", (uint)mip);
+                cs.Set("ScreenHeight", mip > 0 ? _heightRangeMipSRVs[mip - 1] : 0u);  // MipInputSRV (reused slot)
+                cs.Set("TanHalfFov", _heightRangeMipUAVs[mip]);                         // MipOutputUAV (reused slot)
 
                 // Dispatch 8x8 threadgroups
                 uint groupsX = (uint)((w + 7) / 8);
                 uint groupsY = (uint)((h + 7) / 8);
-                commandList.Dispatch(groupsX, groupsY, 1);
+                cs.Dispatch(commandList, groupsX, groupsY);
 
                 // Transition to SRV for the next mip to read
                 commandList.ResourceBarrier(new ResourceBarrier(
@@ -1257,6 +1207,7 @@ namespace Freefall.Components
 
             // Dispatch via ComputeShader
             _decoPrepassCS ??= new ComputeShader("decoration_prepass.hlsl");
+            _decoPrepassCS.Begin(cmd);
             _decoPrepassCS.Set("DecoMaps", DecoMapsArray);              // Texture → BindlessIndex
             _decoPrepassCS.SetSRV("Slots", _decoratorSlotsBuffer!);     // GraphicsBuffer → SrvIndex
             _decoPrepassCS.Set("ControlUAV", _decoControlUAV);          // uint (raw UAV index)
@@ -1317,6 +1268,7 @@ namespace Freefall.Components
 
             // Dispatch via ComputeShader
             _albedoBakeCS ??= new ComputeShader("terrain_albedo_bake.hlsl");
+            _albedoBakeCS.Begin(cmd);
             _albedoBakeCS.Set("ControlMaps", ControlMapsArray);      // Texture → BindlessIndex
             _albedoBakeCS.Set("DiffuseMaps", DiffuseMapsArray);      // Texture → BindlessIndex
             _albedoBakeCS.Set("OutputUAV", _bakedAlbedoUAV);         // uint (raw UAV index)
