@@ -4,6 +4,9 @@
 //
 // Uses push constants (b3) matching engine convention.
 
+#pragma kernel CSBakeTerrainAlbedo
+
+
 struct PushConstantsData { uint4 indices[8]; };
 #define GET_INDEX(i) PushConstants.indices[i/4][i%4]
 ConstantBuffer<PushConstantsData> PushConstants : register(b3);

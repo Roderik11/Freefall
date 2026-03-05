@@ -1256,7 +1256,7 @@ namespace Freefall.Components
             }
 
             // Dispatch via ComputeShader
-            _decoPrepassCS ??= new ComputeShader("decoration_prepass.hlsl", "CSBuildDecoControl");
+            _decoPrepassCS ??= new ComputeShader("decoration_prepass.hlsl");
             _decoPrepassCS.Set("DecoMaps", DecoMapsArray);              // Texture → BindlessIndex
             _decoPrepassCS.SetSRV("Slots", _decoratorSlotsBuffer!);     // GraphicsBuffer → SrvIndex
             _decoPrepassCS.Set("ControlUAV", _decoControlUAV);          // uint (raw UAV index)
@@ -1316,7 +1316,7 @@ namespace Freefall.Components
             }
 
             // Dispatch via ComputeShader
-            _albedoBakeCS ??= new ComputeShader("terrain_albedo_bake.hlsl", "CSBakeTerrainAlbedo");
+            _albedoBakeCS ??= new ComputeShader("terrain_albedo_bake.hlsl");
             _albedoBakeCS.Set("ControlMaps", ControlMapsArray);      // Texture → BindlessIndex
             _albedoBakeCS.Set("DiffuseMaps", DiffuseMapsArray);      // Texture → BindlessIndex
             _albedoBakeCS.Set("OutputUAV", _bakedAlbedoUAV);         // uint (raw UAV index)

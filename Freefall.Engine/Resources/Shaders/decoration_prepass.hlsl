@@ -5,6 +5,8 @@
 // finds the top 8 by weight, and packs (slotIndex, weight) into a 2-slice RGBA16_UINT texture.
 // Each channel: (slotIndex << 8) | weight. Unused slots: 0xFFFF.
 
+#pragma kernel CSBuildDecoControl
+
 // Inlined from common.fx (runtime Shader() compilation has no include path)
 struct PushConstantsData { uint4 indices[8]; };
 #define GET_INDEX(i) PushConstants.indices[i/4][i%4]
