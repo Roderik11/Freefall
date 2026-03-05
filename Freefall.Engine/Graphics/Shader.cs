@@ -13,14 +13,20 @@ namespace Freefall.Graphics
 
         public ID3D12ShaderReflection? Reflection { get; private set; }
 
-        public Shader(string source, string entryPoint, string profile)
+        public Shader(string source, string entryPoint, string profile, string? includeDir = null)
         {
-            _bytecode = Compile(source, entryPoint, profile);
+            _bytecode = Compile(source, entryPoint, profile, includeDir);
             Reflect();
         }
 
-        private byte[] Compile(string source, string entryPoint, string profile)
+        private byte[] Compile(string source, string entryPoint, string profile, string? includeDir = null)
         {
+            // Manually resolve #include directives (DxcCompiler.Compile(string) has no file context)
+            if (!string.IsNullOrEmpty(includeDir))
+            {
+                source = ResolveIncludes(source, includeDir);
+            }
+            
             // DXC requires a specific profile format like vs_6_6, ps_6_6
             string dxcProfile = profile;
             if (profile.Contains("_5_")) dxcProfile = profile.Replace("_5_0", "_6_6").Replace("_5_1", "_6_6");
@@ -31,18 +37,13 @@ namespace Freefall.Graphics
             else if (profile.Contains("_6_4")) dxcProfile = profile.Replace("_6_4", "_6_6");
             else if (profile.Contains("_6_5")) dxcProfile = profile.Replace("_6_5", "_6_6");
 
-            // Define arguments for DXC
-            // -E entryPoint
-            // -T profile
-            // -O3 optimization
             string[] args = new[]
             {
                 "-E", entryPoint,
                 "-T", dxcProfile,
                 "-O3",
-                "-HV", "2021", // Enable SM6.6 template syntax for ResourceDescriptorHeap
-                "-Zi", // Debug info
-                "-Qembed_debug" // Embed debug info
+                "-Zi",
+                "-Qembed_debug"
             };
 
             IDxcResult result = DxcCompiler.Compile(source, args);
@@ -77,6 +78,36 @@ namespace Freefall.Graphics
             {
                 Debug.LogWarning("Shader", $"Could not create shader reflection: {ex.Message}");
             }
+        }
+
+        /// <summary>
+        /// Manually resolve #include "filename" directives by inlining file contents.
+        /// DxcCompiler.Compile(string) has no file context, so includes must be pre-resolved.
+        /// </summary>
+        private static string ResolveIncludes(string source, string baseDir, System.Collections.Generic.HashSet<string>? visited = null)
+        {
+            visited ??= new System.Collections.Generic.HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            
+            return System.Text.RegularExpressions.Regex.Replace(source, 
+                @"^\s*#include\s+""([^""]+)""", 
+                match =>
+                {
+                    string filename = match.Groups[1].Value;
+                    string fullPath = System.IO.Path.Combine(baseDir, filename);
+                    
+                    if (!System.IO.File.Exists(fullPath))
+                    {
+                        Debug.LogWarning("Shader", $"Include file not found: {fullPath}");
+                        return $"// #include \"{filename}\" — NOT FOUND";
+                    }
+                    
+                    if (!visited.Add(fullPath))
+                        return $"// #include \"{filename}\" — already included (cycle)";
+                    
+                    string content = System.IO.File.ReadAllText(fullPath);
+                    return ResolveIncludes(content, System.IO.Path.GetDirectoryName(fullPath)!, visited);
+                },
+                System.Text.RegularExpressions.RegexOptions.Multiline);
         }
 
         public void Dispose()

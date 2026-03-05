@@ -8,13 +8,12 @@ namespace Freefall.Graphics
     public class RenderTexture2D : Texture
     {
         public CpuDescriptorHandle RtvHandle { get; private set; }
-        
-        // Stack logic removed for simplicity in initial port
+        public uint UavIndex { get; private set; }
         
         public RenderTexture2D(GraphicsDevice device, int width, int height, Format format, bool useMultiSampling = false, bool randomWrite = false)
         {
             ResourceFlags flags = ResourceFlags.AllowRenderTarget;
-            // if (randomWrite) flags |= ResourceFlags.AllowUnorderedAccess; // TODO: UAV support later
+            if (randomWrite) flags |= ResourceFlags.AllowUnorderedAccess;
 
             // Must start in Common state when no optimized clear value is provided
             _resource = device.CreateTexture2D(format, width, height, 1, 1, flags, ResourceStates.Common, null);
@@ -33,6 +32,19 @@ namespace Freefall.Graphics
             SrvCpuHandle = cpuSrv;
             BindlessIndex = index;
             device.CreateShaderResourceView(_resource, null, cpuSrv);
+            
+            // UAV for compute shader write access
+            if (randomWrite)
+            {
+                UavIndex = device.AllocateBindlessIndex();
+                var uavDesc = new UnorderedAccessViewDescription
+                {
+                    Format = format,
+                    ViewDimension = UnorderedAccessViewDimension.Texture2D,
+                    Texture2D = new Texture2DUnorderedAccessView { MipSlice = 0 }
+                };
+                device.NativeDevice.CreateUnorderedAccessView(_resource, null, uavDesc, device.GetCpuHandle(UavIndex));
+            }
         }
 
         public new void Dispose()

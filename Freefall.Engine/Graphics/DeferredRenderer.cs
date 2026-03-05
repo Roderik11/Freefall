@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Numerics;
 using System.Runtime.InteropServices;
 using Freefall.Base;
@@ -34,8 +35,8 @@ namespace Freefall.Graphics
         public ShadowHiZPyramid? ShadowHiZPyramid { get; private set; }
 
         private Material matClear = null!;
-        private Material matCompose = null!;
         private Material matDirectionalLight = null!;
+        private ID3D12PipelineState _compositionComputePSO = null!;
         
         private bool _isFirstFrame = true;
         private bool _compositeSnapshotFirstFrame = true;
@@ -65,8 +66,15 @@ namespace Freefall.Graphics
 
             // Create Materials
             matClear = new Material(new Effect("cleargbuffer"));
-            matCompose = new Material(new Effect("composition"));
             matDirectionalLight = new Material(new Effect("light_directional"));
+
+            // Compile composition compute shader
+            string compositionCsPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Resources", "Shaders", "composition_cs.hlsl");
+            string csSource = File.ReadAllText(compositionCsPath);
+            string includeDir = Path.GetDirectoryName(compositionCsPath)!;
+            var csShader = new Shader(csSource, "CSCompose", "cs_6_6", includeDir);
+            _compositionComputePSO = Engine.Device.CreateComputePipelineState(csShader.Bytecode);
+            csShader.Dispose();
 
             // Shadow Map Array (Cascades)
             ShadowTextureArray = new DepthTextureArray2D(2048, 2048, 4);
@@ -91,7 +99,7 @@ namespace Freefall.Graphics
             Depth = new DepthTexture2D(width, height, Format.D32_Float, true);
 
             LightBuffer = new RenderTexture2D(Engine.Device, width, height, Format.R16G16B16A16_Float);
-            Composite = new RenderTexture2D(Engine.Device, width, height, Format.R8G8B8A8_UNorm);
+            Composite = new RenderTexture2D(Engine.Device, width, height, Format.R8G8B8A8_UNorm, randomWrite: true);
         }
 
         public override void Resize(int width, int height)
@@ -432,22 +440,45 @@ namespace Freefall.Graphics
 
         private void Compose(Camera camera, ID3D12GraphicsCommandList list)
         {
-             var fromState = _isFirstFrame ? ResourceStates.Common : ResourceStates.PixelShaderResource;
-             Transition(list, Composite.Native, fromState, ResourceStates.RenderTarget);
-             list.OMSetRenderTargets(Composite.RtvHandle, null);
-             list.ClearRenderTargetView(Composite.RtvHandle, new Color4(1, 0, 1, 1)); // Magenta Debug
-             list.RSSetViewport(new Viewport(0, 0, Composite.Native.Description.Width, Composite.Native.Description.Height));
-             list.RSSetScissorRect(new RectI(0, 0, (int)Composite.Native.Description.Width, (int)Composite.Native.Description.Height));
-             
-             var block = new MaterialBlock();
-             block.SetTexture("AlbedoTex", Albedo);
-             block.SetTexture("LightTex", LightBuffer);
-             block.SetTexture("DataTex", Data);
-             block.SetTexture("NormalTex", Normals);
-             
-             DrawFullscreenQuad(list, matCompose, block);
-             
-             // NOTE: Composite stays in RenderTarget for the Forward pass
+            // Compute shader path — write directly to Composite UAV
+            var fromState = _isFirstFrame ? ResourceStates.Common : ResourceStates.PixelShaderResource;
+            Transition(list, Composite.Native, fromState, ResourceStates.UnorderedAccess);
+            
+            list.SetComputeRootSignature(Engine.Device.GlobalRootSignature);
+            list.SetDescriptorHeaps(1, new[] { Engine.Device.SrvHeap });
+            list.SetPipelineState(_compositionComputePSO);
+            
+            // Push constants: slot 0-3 = GBuffer SRVs, slot 4 = output UAV, slot 5-6 = dimensions
+            list.SetComputeRoot32BitConstant(0, Albedo.BindlessIndex, 0);
+            list.SetComputeRoot32BitConstant(0, LightBuffer.BindlessIndex, 1);
+            list.SetComputeRoot32BitConstant(0, Data.BindlessIndex, 2);
+            list.SetComputeRoot32BitConstant(0, Normals.BindlessIndex, 3);
+            list.SetComputeRoot32BitConstant(0, Composite.UavIndex, 4);
+            
+            var desc = Composite.Native.Description;
+            list.SetComputeRoot32BitConstant(0, (uint)desc.Width, 5);
+            list.SetComputeRoot32BitConstant(0, (uint)desc.Height, 6);
+            
+            // Bind SceneConstants cbuffer (AmbientScale etc.)
+            foreach (var cb in matDirectionalLight.ConstantBuffers)
+            {
+                if (cb.Slot == 1) // SceneConstants only
+                {
+                    matDirectionalLight.Effect!.GetMaterialBlock().Apply(cb);
+                    cb.Commit();
+                    list.SetComputeRootConstantBufferView((uint)cb.Slot, cb.GpuAddress);
+                }
+            }
+            
+            uint groupsX = ((uint)desc.Width + 7) / 8;
+            uint groupsY = ((uint)desc.Height + 7) / 8;
+            list.Dispatch(groupsX, groupsY, 1);
+            
+            // UAV barrier, then transition to RenderTarget for forward pass
+            list.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(Composite.Native)));
+            Transition(list, Composite.Native, ResourceStates.UnorderedAccess, ResourceStates.RenderTarget);
+            
+            // NOTE: Composite stays in RenderTarget for the Forward pass
         }
 
         private void RenderForward(Camera camera, ID3D12GraphicsCommandList list)

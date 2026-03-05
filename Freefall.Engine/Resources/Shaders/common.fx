@@ -180,8 +180,8 @@ float3 blend_linear(in float3 n1, in float3 n2)
 float3 blend_overlay(float4 n1, float4 n2)
 {
 	n1 = n1 * 4 - 2;
-	float4 a = n1 >= 0 ? -1 : 1;
-	float4 b = n1 >= 0 ? 1 : 0;
+	float4 a = select(n1 >= 0, (float4)-1, (float4)1);
+	float4 b = select(n1 >= 0, (float4)1, (float4)0);
 	n1 = 2 * a + n1;
 	n2 = n2 * a + b;
 	float3 r = (n1 * n2 - a).xyz;
