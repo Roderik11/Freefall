@@ -61,7 +61,7 @@ namespace Freefall.Graphics
             return 4; // Fallback
         }
 
-        public static Texture CreateTexture2DArray(GraphicsDevice device, IList<Texture> textures)
+        public static Texture CreateTexture2DArray(GraphicsDevice device, IList<Texture> textures, bool stripSrgb = false)
         {
              if (textures.Count == 0) return null;
              
@@ -82,21 +82,27 @@ namespace Freefall.Graphics
                  }
              }
 
-             Debug.Log($"[Texture] CreateTexture2DArray: {textures.Count} textures, formatsMatch={formatsMatch}, refFormat={refDesc.Format}");
-             for (int i = 0; i < textures.Count; i++)
-                 Debug.Log($"  [{i}] {textures[i].Name}: {textures[i].Native.Description.Format}");
+             Debug.Log($"[Texture] CreateTexture2DArray: {textures.Count} textures, formatsMatch={formatsMatch}, refFormat={refDesc.Format}, stripSrgb={stripSrgb}");
 
              if (formatsMatch)
-                 return CreateTexture2DArrayCopy(device, textures, refDesc);
+                 return CreateTexture2DArrayCopy(device, textures, refDesc, stripSrgb);
              else
                  return CreateTexture2DArrayCompute(device, textures, refDesc);
         }
 
         /// <summary>Fast path: all textures share the same format. Direct GPU copy.</summary>
-        private static Texture CreateTexture2DArrayCopy(GraphicsDevice device, IList<Texture> textures, ResourceDescription refDesc)
+        private static Texture CreateTexture2DArrayCopy(GraphicsDevice device, IList<Texture> textures, ResourceDescription refDesc, bool stripSrgb = false)
         {
              var desc = refDesc;
              desc.DepthOrArraySize = (ushort)textures.Count;
+
+             // For normal maps: create resource as typeless so we can bind a non-sRGB SRV
+             var srvFormat = desc.Format;
+             if (stripSrgb)
+             {
+                 desc.Format = ToTypeless(desc.Format);
+                 srvFormat = ToLinear(refDesc.Format);
+             }
              
              var arr = new Texture();
              arr._resource = device.NativeDevice.CreateCommittedResource(
@@ -108,10 +114,10 @@ namespace Freefall.Graphics
              
              var srvDesc = new ShaderResourceViewDescription
              {
-                 Format = desc.Format,
+                 Format = srvFormat,
                  ViewDimension = ShaderResourceViewDimension.Texture2DArray,
                  Shader4ComponentMapping = ShaderComponentMapping.Default,
-                 Texture2DArray = new Texture2DArrayShaderResourceView { MipLevels = desc.MipLevels, ArraySize = (uint)textures.Count, FirstArraySlice = 0 }
+                 Texture2DArray = new Texture2DArrayShaderResourceView { MipLevels = refDesc.MipLevels, ArraySize = (uint)textures.Count, FirstArraySlice = 0 }
              };
              device.NativeDevice.CreateShaderResourceView(arr._resource, srvDesc, arr.SrvCpuHandle);
              
@@ -605,6 +611,30 @@ void CSCopySlice(uint3 id : SV_DispatchThreadID) {
                 _ => false,
             };
         }
+
+        /// <summary>Convert an sRGB or typed format to its typeless equivalent for flexible SRV creation.</summary>
+        private static Format ToTypeless(Format fmt) => fmt switch
+        {
+            Format.BC1_UNorm or Format.BC1_UNorm_SRgb => Format.BC1_Typeless,
+            Format.BC2_UNorm or Format.BC2_UNorm_SRgb => Format.BC2_Typeless,
+            Format.BC3_UNorm or Format.BC3_UNorm_SRgb => Format.BC3_Typeless,
+            Format.BC7_UNorm or Format.BC7_UNorm_SRgb => Format.BC7_Typeless,
+            Format.R8G8B8A8_UNorm or Format.R8G8B8A8_UNorm_SRgb => Format.R8G8B8A8_Typeless,
+            Format.B8G8R8A8_UNorm or Format.B8G8R8A8_UNorm_SRgb => Format.B8G8R8A8_Typeless,
+            _ => fmt
+        };
+
+        /// <summary>Convert an sRGB format to its linear (non-sRGB) equivalent.</summary>
+        private static Format ToLinear(Format fmt) => fmt switch
+        {
+            Format.BC1_UNorm_SRgb => Format.BC1_UNorm,
+            Format.BC2_UNorm_SRgb => Format.BC2_UNorm,
+            Format.BC3_UNorm_SRgb => Format.BC3_UNorm,
+            Format.BC7_UNorm_SRgb => Format.BC7_UNorm,
+            Format.R8G8B8A8_UNorm_SRgb => Format.R8G8B8A8_UNorm,
+            Format.B8G8R8A8_UNorm_SRgb => Format.B8G8R8A8_UNorm,
+            _ => fmt
+        };
 
         public void Dispose()
         {

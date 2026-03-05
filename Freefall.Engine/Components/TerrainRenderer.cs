@@ -656,9 +656,9 @@ namespace Freefall.Components
             commandList.SetGraphicsRoot32BitConstant(0, TransformBuffer.Instance!.SrvIndex, 15);  // GlobalTransformBufferIdx
 
             // Shadow-specific push constants
-            commandList.SetGraphicsRoot32BitConstant(0, DirectionalLight.CurrentCascadeSrvIndex, 20); // CascadeBufferSRVIdx
-            commandList.SetGraphicsRoot32BitConstant(0, (uint)cascadeCount, 21);                       // ShadowCascadeCount
-            commandList.SetGraphicsRoot32BitConstant(0, _shadowCascadeIdxBuffers[frameIndex].SrvIndex, 22);        // CascadeIdxBufIdx
+            commandList.SetGraphicsRoot32BitConstant(0, DirectionalLight.CurrentCascadeSrvIndex, 23); // CascadeBufferSRVIdx
+            commandList.SetGraphicsRoot32BitConstant(0, (uint)cascadeCount, 24);                       // ShadowCascadeCount
+            commandList.SetGraphicsRoot32BitConstant(0, _shadowCascadeIdxBuffers[frameIndex].SrvIndex, 25);        // CascadeIdxBufIdx
 
             // Transition shadow args to IndirectArgument
             _shadowArgsBuffers[frameIndex].Transition(commandList, ResourceStates.IndirectArgument);
@@ -879,6 +879,7 @@ namespace Freefall.Components
                     if (layer.Diffuse != null && layer.Diffuse.Native != null) diffuseList.Add(layer.Diffuse);
                     if (layer.Normals != null && layer.Normals.Native != null) normalList.Add(layer.Normals);
                 }
+                Debug.Log($"[Terrain] SetupLayerTiling: {diffuseList.Count} diffuse, {normalList.Count} normals from {layers.Count} layers");
             }
 
             var device = Engine.Device;
@@ -891,9 +892,12 @@ namespace Freefall.Components
 
             // Normal Fallback
             if (normalList.Count > 0)
-                NormalMapsArray = Texture.CreateTexture2DArray(device, normalList);
+                NormalMapsArray = Texture.CreateTexture2DArray(device, normalList, stripSrgb: true);
             else
+            {
+                Debug.Log("[Terrain] Normals missing! Using flat normals.");
                 NormalMapsArray = InternalAssets.FlatNormalArray;
+            }
 
             // Build ControlMapsArray from splatmaps
             var controlList = new List<Texture>();
@@ -1465,8 +1469,11 @@ namespace Freefall.Components
                 // With fixed splits, skip outermost cascade (grass detail not visible at that distance).
                 int grassShadowCascades = Engine.Settings.UseAdaptiveSplits
                     ? DirectionalLight.CascadeCount
-                    : Math.Max(1, DirectionalLight.CascadeCount - 1);
+                    : Math.Max(1, DirectionalLight.CascadeCount - 2);
+
+                grassShadowCascades = Math.Max(1, DirectionalLight.CascadeCount - 1);
                 commandList.SetGraphicsRoot32BitConstant(0, (uint)grassShadowCascades, 21);
+                
                 // Shadow Hi-Z pyramid SRV for per-instance occlusion culling
                 var shadowPyramid = DeferredRenderer.Current?.ShadowHiZPyramid;
                 uint shadowHiZSrv = (shadowPyramid?.Ready == true) ? shadowPyramid.FullSRV : 0u;

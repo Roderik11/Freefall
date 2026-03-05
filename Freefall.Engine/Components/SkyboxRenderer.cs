@@ -107,19 +107,45 @@ namespace Freefall.Components
             // The shader already negates this (L = -LightDirection), so we pass the direction light is pointing (toward ground)
             SunLight.Entity.Transform.Rotation = Quaternion.CreateFromRotationMatrix(Matrix4x4.CreateWorld(Vector3.Zero, lightDir, Vector3.UnitY));
 
-            // intensity logic
-            float dayFactor = Math.Clamp((elevation - 0.0f) / 0.8f, 0.0f, 1.0f);
-            float intensity = MathHelper.Lerp(NightIntensity, DayIntensity, dayFactor);
+            // ── Three-state blend matching sky_common.fx GetSkyColor ──
+            // Day: non-linear ramp (same pow(0.7) as shader)
+            float dayFactor = MathF.Pow(Math.Clamp(elevation / 0.8f, 0.0f, 1.0f), 0.7f);
+
+            // Sunset: triangular peak centered at elevation ≈ -0.025
+            float sunsetFactor = 0.0f;
+            if (elevation < 0.15f && elevation > -0.2f)
+            {
+                sunsetFactor = 1.0f - MathF.Abs((elevation - (-0.025f)) / 0.175f);
+                sunsetFactor = MathF.Max(0.0f, sunsetFactor);
+            }
+
+            // Night: smooth onset below horizon
+            float nightFactor = Math.Clamp((-elevation - 0.15f) / 0.3f, 0.0f, 1.0f);
+
+            // Normalize weights (same as shader)
+            float total = dayFactor + sunsetFactor + nightFactor;
+            if (total > 0.0f)
+            {
+                dayFactor /= total;
+                sunsetFactor /= total;
+                nightFactor /= total;
+            }
+
+            // Blended intensity
+            const float sunsetIntensity = 1.5f; // warm glow between day and night
+            float intensity = dayFactor * DayIntensity
+                            + sunsetFactor * sunsetIntensity
+                            + nightFactor * NightIntensity;
             SunLight.Intensity = intensity * SunIntensity;
+
+            // Ambient tracks blended sky brightness
+            AmbientScale = dayFactor * 1.0f + sunsetFactor * 0.4f + nightFactor * 0.05f;
             
-            // Ambient tracks daylight ÔÇö min 0.05 at night, full 1.0 at day
-            AmbientScale = MathHelper.Lerp(0.05f, 1.0f, dayFactor);
-            
-            // Color logic (simple blend)
-            if (elevation > 0)
-                SunLight.Color = new Color3(1.0f, 0.95f, 0.85f);
-            else
-                SunLight.Color = new Color3(0.1f, 0.15f, 0.3f);
+            // Blended light color (day/sunset/night palettes matching shader)
+            SunLight.Color = new Color3(
+                dayFactor * 1.0f  + sunsetFactor * 1.0f + nightFactor * 0.1f,
+                dayFactor * 0.95f + sunsetFactor * 0.7f + nightFactor * 0.15f,
+                dayFactor * 0.85f + sunsetFactor * 0.4f + nightFactor * 0.3f);
         }
 
         public void Draw()

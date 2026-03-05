@@ -107,7 +107,7 @@ namespace Freefall.Components
         [Description(@"Jacobian threshold for foam generation.
          Lower values produce foam on gentler waves,
          higher values restrict foam to steep crests only")]
-        public float FoamBias = 0.67f;
+        public float FoamBias = 0.47f;
         
         [Category("Foam")]
         [ValueRange(0f, 0.1f)]

@@ -475,7 +475,7 @@ void MS(
     float fadeFactor = smoothstep(0.0, 1.0, (DecoRadius - camDist) / (DecoRadius - fadeStart));
     scaleH *= fadeFactor;
     scaleW *= fadeFactor;
-    float instanceRot = hash21(seed + 51.3) * 6.2831853;
+    float instanceRot = hash21(float2(wx * 7.3, wz * 31.7)) * 6.2831853;
     float cosR = cos(instanceRot), sinR = sin(instanceRot);
 
     // LOD entry (Mesh mode) or material from texture (Billboard/Cross)
@@ -608,11 +608,18 @@ void MS(
     // Root rotation: read precomputed matrix from slot (zero trig)
     float3x3 rootMat = slot.RootMat;
 
-    // Instance Y-rotation + non-uniform scale (W for XZ, H for Y)
-    float3x3 instanceMat = float3x3(
-        cosR * scaleW, 0, sinR * scaleW,
+    // Non-uniform scale (W for XZ, H for Y)
+    float3x3 scaleMat = float3x3(
+        scaleW, 0, 0,
         0, scaleH, 0,
-        -sinR * scaleW, 0, cosR * scaleW
+        0, 0, scaleW
+    );
+
+    // Per-instance Y rotation (around local up, after root correction)
+    float3x3 yRotMat = float3x3(
+        cosR, 0, sinR,
+        0, 1, 0,
+        -sinR, 0, cosR
     );
 
     // Slope alignment: rotate from (0,1,0) toward terrain normal based on SlopeBias
@@ -629,7 +636,8 @@ void MS(
         slopeMat = I + K * sinA + mul(K, K) * (1.0 - cosA);
     }
 
-    float3x3 finalMat = mul(mul(rootMat, instanceMat), slopeMat);
+    // Order: root correction → scale → Y rotation → slope alignment
+    float3x3 finalMat = mul(mul(mul(rootMat, scaleMat), yRotMat), slopeMat);
 
     // ── Vertex fetch & transform ──
 
@@ -710,19 +718,52 @@ PSOutput PS(MSOutput input)
 {
     PSOutput output;
 
+    // Distance from input.Depth (clip-space W == view-space Z for perspective)
+    float dist = input.Depth;
+
     float3 baseColor;
     float alpha = 1.0;
 
     if (input.TextureOverride > 0)
     {
-        // Billboard/Cross: sample texture directly (no material indirection)
+        // ── Billboard / Cross path ──────────────────────────────────────
         Texture2D texOverride = ResourceDescriptorHeap[input.TextureOverride];
         float4 texColor = texOverride.Sample(HeightSampler, input.TexCoord);
         baseColor = texColor.rgb;
         alpha = texColor.a;
+
+        // Distance-based alpha clip
+        float alphaThreshold = lerp(0.5, 0.15, saturate((dist - 20.0) / 30.0));
+        clip(alpha - alphaThreshold);
+
+        // Ground color fade: blend base toward baked terrain albedo
+        Texture2D BakedAlbedo = ResourceDescriptorHeap[BakedAlbedoIdx];
+        float3 groundColor = BakedAlbedo.SampleLevel(ClampSampler, input.TerrainUV, 0).rgb;
+        float aoFactor = saturate(input.HeightFrac / 0.15);
+
+        // Per-instance brightness variation (InstanceSeed is instanceIdx/64, can exceed 1.0)
+        float brightVar = 0.2 + 0.6 * frac(input.InstanceSeed * 17.31);
+        float3 variedBase = baseColor * brightVar;
+        output.Albedo = float4(lerp(groundColor * 0.75, variedBase, aoFactor), 1.0);
+
+        // Per-pixel normals: height blend + ddx/ddy micro-detail
+        float3 baseNorm = normalize(input.Normal);
+        float3 tipNorm = normalize(lerp(baseNorm, float3(0, 1, 0), 0.6));
+        float3 heightNorm = normalize(lerp(baseNorm, tipNorm, input.HeightFrac));
+
+        float dAlphaX = ddx(alpha);
+        float dAlphaY = ddy(alpha);
+        float bladeX = (input.TexCoord.x - 0.5) * 2.0;
+        float3 perturbedNormal = normalize(heightNorm + float3(
+            dAlphaX * 1.0 + bladeX * 0.2,
+            0,
+            dAlphaY * 1.0
+        ));
+        output.Normal = float4(perturbedNormal, 1.0);
     }
     else
     {
+        // ── Mesh path (stones, pebbles, bushes) ────────────────────────
         StructuredBuffer<MaterialData> materials = ResourceDescriptorHeap[MaterialsBufferIdx];
         MaterialData mat = materials[input.MaterialId];
 
@@ -737,46 +778,18 @@ PSOutput PS(MSOutput input)
         {
             baseColor = float3(0.15, 0.35, 0.08);
         }
+
+        // Distance-based alpha clip
+        float alphaThreshold = lerp(0.5, 0.15, saturate((dist - 20.0) / 30.0));
+        clip(alpha - alphaThreshold);
+
+        // No ground color fade — keep original mesh albedo
+        float brightVar = 0.2 + 0.6 * input.InstanceSeed;
+        output.Albedo = float4(baseColor * brightVar, 1.0);
+
+        // Mesh has real geometric normals — use directly, no ddx/ddy needed
+        output.Normal = float4(normalize(input.Normal), 1.0);
     }
-
-    // Distance-based alpha clip: mipmaps average alpha down at distance.
-    // Lower the threshold to preserve coverage instead of eating the geometry.
-    float dist = length(input.WorldPos.xyz);
-    float alphaThreshold = lerp(0.5, 0.15, saturate((dist - 20.0) / 30.0));
-    clip(alpha - alphaThreshold);
-
-    // Sample baked terrain albedo for ground color blending
-    Texture2D BakedAlbedo = ResourceDescriptorHeap[BakedAlbedoIdx];
-    float3 groundColor = BakedAlbedo.SampleLevel(ClampSampler, input.TerrainUV, 0).rgb;
-
-    // Ground color blend: at base, shift toward terrain color
-    float aoFactor = pow(input.HeightFrac, 0.4);
-
-    // Per-instance brightness variation — only affects texture, not ground
-    float hashA = frac(input.InstanceSeed * 17.31);
-    float brightVar = 0.2 + 0.6 * hashA;
-
-    float3 variedBase = baseColor * brightVar;
-    float3 aoColor = lerp(groundColor * 0.75, variedBase, aoFactor);
-
-    output.Albedo = float4(aoColor, 1.0);
-
-    // Per-pixel normals: blend from terrain normal (base) to upward (tip)
-    // This creates natural top-bright / base-dark variation across each instance
-    float3 baseNorm = normalize(input.Normal);
-    float3 tipNorm = normalize(lerp(baseNorm, float3(0, 1, 0), 0.6));
-    float3 heightNorm = normalize(lerp(baseNorm, tipNorm, input.HeightFrac));
-    
-    // Alpha gradient micro-detail on top of the height blend
-    float dAlphaX = ddx(alpha);
-    float dAlphaY = ddy(alpha);
-    float bladeX = (input.TexCoord.x - 0.5) * 2.0;
-    float3 perturbedNormal = normalize(heightNorm + float3(
-        dAlphaX * 1.0 + bladeX * 0.2,
-        0,
-        dAlphaY * 1.0
-    ));
-    output.Normal = float4(perturbedNormal, 1.0);
 
     // Data channel: R=roughness, G=metallic, B=ao, A=flags
     // Flags: 0=unlit/skybox, 0.5=vegetation, 1.0=standard PBR
@@ -1246,7 +1259,7 @@ void MS_Shadow(
     float fadeFactor = smoothstep(0.0, 1.0, (DecoRadius - camDist) / (DecoRadius - fadeStart));
     scaleH *= fadeFactor;
     scaleW *= fadeFactor;
-    float instanceRot = hash21(seed + 51.3) * 6.2831853;
+    float instanceRot = hash21(float2(wx * 7.3, wz * 31.7)) * 6.2831853;
     float cosR = cos(instanceRot), sinR = sin(instanceRot);
 
     uint materialId = 0;
@@ -1337,10 +1350,16 @@ void MS_Shadow(
     uint meshPartId = lodEntry.MeshPartId;
 
     float3x3 rootMat = slot.RootMat;
-    float3x3 instanceMat = float3x3(
-        cosR * scaleW, 0, sinR * scaleW,
+    float3x3 scaleMat = float3x3(
+        scaleW, 0, 0,
         0, scaleH, 0,
-        -sinR * scaleW, 0, cosR * scaleW
+        0, 0, scaleW
+    );
+
+    float3x3 yRotMat = float3x3(
+        cosR, 0, sinR,
+        0, 1, 0,
+        -sinR, 0, cosR
     );
 
     float3 slopeUp = normalize(lerp(float3(0, 1, 0), terrainNormal, slot.SlopeBias));
@@ -1356,7 +1375,7 @@ void MS_Shadow(
         slopeMat = I + K * sinA + mul(K, K) * (1.0 - cosA);
     }
 
-    float3x3 finalMat = mul(mul(rootMat, instanceMat), slopeMat);
+    float3x3 finalMat = mul(mul(mul(rootMat, scaleMat), yRotMat), slopeMat);
 
     MeshPartEntry part = msRegistry[meshPartId];
     if (vertInInst >= part.VertexCount)

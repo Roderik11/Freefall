@@ -247,20 +247,8 @@ FragmentOutput PS(VertexOutput input)
         }
     }
 	
-    // Decode BC5 normal: R=tangentX, G=tangentY, B=0 (dead in BC5)
-    // Swizzle to world space: X→X, Y→up (reconstructed), Z→Z
-    float2 nXZ = normal.rg * 2.0 - 1.0;
-    float nY = sqrt(max(0.001, 1.0 - dot(nXZ, nXZ)));
-    normal = float4(normalize(float3(nXZ.x, nY, nXZ.y)), 1);
-
-    // UDN (Partial Derivative Addition): add splatmap detail perturbation to terrain slope
-    // Scale down: BC5 normals have full precision, raw addition is too strong
-    terrainNormal.xz += normal.xz;
-    terrainNormal = normalize(terrainNormal);
-    
-
-
-    // Normalize: if splatmap weights don't sum to 1.0, colors will be dimmed/boosted
+    // Normalize splatmap weights: if they don't sum to 1.0, both color and normal
+    // accumulations will be biased. Compute totalWeight once for both.
     float totalWeight = 0;
     for (int wi = 0; wi < 4; ++wi)
     {
@@ -268,7 +256,20 @@ FragmentOutput PS(VertexOutput input)
         totalWeight += w.x + w.y + w.z + w.w;
     }
     if (totalWeight > 0.001)
+    {
         color.rgb /= totalWeight;
+        normal /= totalWeight;
+
+        // BC5_UNORM: R,G in [0,1], 0.5 = flat. Decode to signed tangent-space XY.
+        float2 nXY = normal.rg * 2.0 - 1.0;
+
+        // UDN (Partial Derivative Addition):
+        // For flat terrain: tangent X → world X, tangent Y → world Z
+        const float normalScale = 1.0;
+        terrainNormal.x += nXY.x * normalScale;
+        terrainNormal.z += nXY.y * normalScale;
+        terrainNormal = normalize(terrainNormal);
+    }
 
     output.Albedo = float4(color.rgb, 1.0);
     output.Normals = float4(terrainNormal.xyz, 1); 
@@ -284,9 +285,9 @@ FragmentOutput PS(VertexOutput input)
 
 
 // Push constants for shadow pass
-#define CascadeBufferSRVIdx  GET_INDEX(20) // SRV: StructuredBuffer<CascadeData>
-#define ShadowCascadeCount   GET_INDEX(21) // uint: number of cascades
-#define CascadeIdxBufIdx     GET_INDEX(22) // SRV: per-entry cascade index (uint)
+#define CascadeBufferSRVIdx  GET_INDEX(23) // SRV: StructuredBuffer<CascadeData>
+#define ShadowCascadeCount   GET_INDEX(24) // uint: number of cascades
+#define CascadeIdxBufIdx     GET_INDEX(25) // SRV: per-entry cascade index (uint)
 
 struct ShadowVSOutput
 {
