@@ -10,7 +10,7 @@ namespace Freefall.Graphics
     /// Generic triple-buffered GPU upload buffer with dirty-list tracking and persistent mapping.
     /// Each element type T gets its own SoA buffer. Used by SceneBuffers to compose per-instance data channels.
     /// </summary>
-    public unsafe class GPUBuffer<T> : IDisposable where T : unmanaged
+    public unsafe class StreamingBuffer<T> : IDisposable where T : unmanaged
     {
         private const int FrameCount = 3;
 
@@ -44,7 +44,7 @@ namespace Freefall.Graphics
         /// </summary>
         public int Capacity => _capacity;
 
-        public GPUBuffer(GraphicsDevice device, int initialCapacity = 1024)
+        public StreamingBuffer(GraphicsDevice device, int initialCapacity = 1024)
         {
             _device = device;
             _stride = sizeof(T);

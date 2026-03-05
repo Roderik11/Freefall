@@ -6,7 +6,7 @@ namespace Freefall.Graphics
     /// <summary>
     /// Thread-safe slot allocator for per-instance GPU data.
     /// Decoupled from specific buffer implementations — SceneBuffers uses this
-    /// to assign unique slots shared across all GPUBuffer<T> channels.
+    /// to assign unique slots shared across all StreamingBuffer<T> channels.
     /// </summary>
     public class RenderSlotAllocator
     {

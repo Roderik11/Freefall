@@ -6,14 +6,14 @@ namespace Freefall.Graphics
 {
     /// <summary>
     /// Global persistent GPU buffer for all entity transforms + per-instance materialIDs.
-    /// Thin wrapper around GPUBuffer&lt;T&gt; with a free-list slot allocator.
+    /// Thin wrapper around StreamingBuffer&lt;T&gt; with a free-list slot allocator.
     /// </summary>
     public class TransformBuffer : IDisposable
     {
         private const int InitialCapacity = 1024;
 
-        private GPUBuffer<Matrix4x4> _transforms;
-        private GPUBuffer<uint> _materials;
+        private StreamingBuffer<Matrix4x4> _transforms;
+        private StreamingBuffer<uint> _materials;
 
         // Slot allocation
         private readonly Stack<int> _freeSlots = new();
@@ -43,8 +43,8 @@ namespace Freefall.Graphics
 
         private TransformBuffer(GraphicsDevice device)
         {
-            _transforms = new GPUBuffer<Matrix4x4>(device, InitialCapacity);
-            _materials = new GPUBuffer<uint>(device, InitialCapacity);
+            _transforms = new StreamingBuffer<Matrix4x4>(device, InitialCapacity);
+            _materials = new StreamingBuffer<uint>(device, InitialCapacity);
         }
 
         /// <summary>
@@ -115,7 +115,7 @@ namespace Freefall.Graphics
         {
             _transforms.Upload();
             _materials.Upload();
-            GPUBuffer<Matrix4x4>.FlushDeferredDisposals();
+            StreamingBuffer<Matrix4x4>.FlushDeferredDisposals();
         }
 
         public void Dispose()

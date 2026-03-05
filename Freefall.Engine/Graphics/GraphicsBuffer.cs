@@ -8,7 +8,7 @@ namespace Freefall.Graphics
     /// <summary>
     /// General-purpose GPU buffer with auto-managed bindless descriptors and resource state tracking.
     /// Wraps a single ID3D12Resource (default or upload heap) with optional SRV and UAV.
-    /// For triple-buffered upload buffers with dirty tracking, use GPUBuffer&lt;T&gt; instead.
+    /// For triple-buffered upload buffers with dirty tracking, use StreamingBuffer&lt;T&gt; instead.
     /// </summary>
     public class GraphicsBuffer : IDisposable
     {

@@ -4,7 +4,7 @@ using System.Numerics;
 namespace Freefall.Graphics
 {
     /// <summary>
-    /// Composes multiple GPUBuffer&lt;T&gt; channels with a shared RenderSlotAllocator.
+    /// Composes multiple StreamingBuffer&lt;T&gt; channels with a shared RenderSlotAllocator.
     /// Each renderer gets one slot and writes to whichever channels it uses.
     /// Call UploadAll() once per frame before GPU dispatch.
     /// </summary>
@@ -14,10 +14,10 @@ namespace Freefall.Graphics
         public static RenderSlotAllocator Slots { get; private set; } = null!;
 
         // Per-instance GPU data channels
-        public static GPUBuffer<Matrix4x4> Transforms { get; private set; } = null!;
-        public static GPUBuffer<InstanceDescriptor> Descriptors { get; private set; } = null!;
-        public static GPUBuffer<Vector4> BoundingSpheres { get; private set; } = null!;
-        public static GPUBuffer<uint> MeshPartIds { get; private set; } = null!;
+        public static StreamingBuffer<Matrix4x4> Transforms { get; private set; } = null!;
+        public static StreamingBuffer<InstanceDescriptor> Descriptors { get; private set; } = null!;
+        public static StreamingBuffer<Vector4> BoundingSpheres { get; private set; } = null!;
+        public static StreamingBuffer<uint> MeshPartIds { get; private set; } = null!;
 
         /// <summary>High-water mark: maximum slot index currently in use + 1.</summary>
         public static int ActiveSlotCount => Slots.HighWaterMark;
@@ -32,10 +32,10 @@ namespace Freefall.Graphics
             if (_initialized) return;
 
             Slots = new RenderSlotAllocator();
-            Transforms = new GPUBuffer<Matrix4x4>(device, initialCapacity);
-            Descriptors = new GPUBuffer<InstanceDescriptor>(device, initialCapacity);
-            BoundingSpheres = new GPUBuffer<Vector4>(device, initialCapacity);
-            MeshPartIds = new GPUBuffer<uint>(device, initialCapacity);
+            Transforms = new StreamingBuffer<Matrix4x4>(device, initialCapacity);
+            Descriptors = new StreamingBuffer<InstanceDescriptor>(device, initialCapacity);
+            BoundingSpheres = new StreamingBuffer<Vector4>(device, initialCapacity);
+            MeshPartIds = new StreamingBuffer<uint>(device, initialCapacity);
 
             _initialized = true;
             Debug.Log($"[SceneBuffers] Initialized (capacity: {initialCapacity})");
@@ -54,7 +54,7 @@ namespace Freefall.Graphics
             BoundingSpheres.Upload();
             MeshPartIds.Upload();
 
-            GPUBuffer<Matrix4x4>.FlushDeferredDisposals();
+            StreamingBuffer<Matrix4x4>.FlushDeferredDisposals();
         }
 
         /// <summary>
