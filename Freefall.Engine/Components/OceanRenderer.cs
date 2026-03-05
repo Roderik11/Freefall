@@ -216,8 +216,8 @@ namespace Freefall.Components
         {
             _mesh = CreateOceanGrid(Engine.Device, GridSize);
             _material = new Material(new Effect("ocean"));
-            _sunLight = EntityManager.FindComponents<DirectionalLight>().FirstOrDefault()!;
-            _terrain = EntityManager.FindComponents<TerrainRenderer>().FirstOrDefault();
+            _sunLight = EntityManager.FindComponent<DirectionalLight>()!;
+            _terrain = EntityManager.FindComponent<TerrainRenderer>();
 
             // Build spectrum params from bands
             var spectrums = BuildSpectrumParams();
@@ -417,7 +417,7 @@ namespace Freefall.Components
 
             // Lazy terrain lookup (terrain may not exist at Awake time)
             if (_terrain == null)
-                _terrain = EntityManager.FindComponents<TerrainRenderer>().FirstOrDefault();
+                _terrain = EntityManager.FindComponent<TerrainRenderer>();
 
             // Sun light
             var sunDir = Vector3.UnitY;

@@ -604,23 +604,19 @@ namespace Freefall.Graphics
         
         public static uint BindMaterialsBuffer(ID3D12GraphicsCommandList commandList, GraphicsDevice device)
         {
-            // Take snapshot under lock to avoid racing with background Material creation
-            MaterialData[] snapshot;
             int materialCount;
             bool dirty;
+            bool needsRecreate;
             lock (_materialIdLock)
             {
                 materialCount = _allMaterials.Count;
                 dirty = _materialsBufferDirty;
-                snapshot = _allMaterials.ToArray();
+                needsRecreate = _materialsBuffer == null || materialCount > _materialsBufferCapacity;
             }
             
             if (materialCount == 0) return 0;
             
             int bufferSize = materialCount * System.Runtime.InteropServices.Marshal.SizeOf<MaterialData>();
-            
-            // Create or recreate buffer only if we need more capacity
-            bool needsRecreate = _materialsBuffer == null || materialCount > _materialsBufferCapacity;
             
             if (needsRecreate)
             {
@@ -661,17 +657,22 @@ namespace Freefall.Graphics
                 dirty = true;
             }
             
-            // Update buffer data if dirty
+            // Update buffer data only when dirty — zero-alloc via CollectionsMarshal.AsSpan
             if (dirty)
             {
-                unsafe
+                lock (_materialIdLock)
                 {
-                    fixed (MaterialData* src = snapshot)
+                    var span = System.Runtime.InteropServices.CollectionsMarshal.AsSpan(_allMaterials);
+                    var bytes = System.Runtime.InteropServices.MemoryMarshal.AsBytes(span);
+                    unsafe
                     {
-                        Buffer.MemoryCopy(src, (void*)_materialsBufferPtr, bufferSize, bufferSize);
+                        fixed (byte* src = bytes)
+                        {
+                            Buffer.MemoryCopy(src, (void*)_materialsBufferPtr, bufferSize, bufferSize);
+                        }
                     }
+                    _materialsBufferDirty = false;
                 }
-                lock (_materialIdLock) { _materialsBufferDirty = false; }
             }
             
             return _materialsBufferBindlessIndex;

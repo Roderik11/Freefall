@@ -72,22 +72,33 @@ namespace Freefall.Base
             }
         }
 
-        public static IEnumerable<T> FindComponents<T>() where T : Component
+        public static T? FindComponent<T>() where T : Component
         {
-            // Take snapshot under lock to avoid modification during iteration
-            List<Entity> snapshot;
             lock (_lock)
             {
-                snapshot = new List<Entity>(_entities);
-            }
-            
-            foreach (var entity in snapshot)
-            {
-                var component = entity.GetComponent<T>();
-                if (component != null)
+                foreach (var entity in _entities)
                 {
-                    yield return component;
+                    var component = entity.GetComponent<T>();
+                    if (component != null)
+                        return component;
                 }
+            }
+            return null;
+        }
+
+        public static IEnumerable<T> FindComponents<T>() where T : Component
+        {
+            // Return snapshot-free results — callers should not add/remove entities during enumeration
+            lock (_lock)
+            {
+                var results = new List<T>();
+                foreach (var entity in _entities)
+                {
+                    var component = entity.GetComponent<T>();
+                    if (component != null)
+                        results.Add(component);
+                }
+                return results;
             }
         }
     }
