@@ -368,7 +368,7 @@ void MS(
     float tileWorldSize = cs * TILE_SIZE;  // full tile extent
     float wx = payload.TileOrigin.x + rng.x * tileWorldSize;
     float wz = payload.TileOrigin.y + rng.y * tileWorldSize;
-    float2 seed = instanceSeed;  // keep for downstream hashes
+    float2 seed = instanceSeed + payload.TileOrigin * 0.0137;  // include tile position for unique scale/rotation per tile
 
     // Terrain bounds
     float2 texelUV = float2(
@@ -604,11 +604,11 @@ void MS(
     // Root rotation: read precomputed matrix from slot (zero trig)
     float3x3 rootMat = slot.RootMat;
 
-    // Instance Y-rotation + scale (only 2 trig calls)
+    // Instance Y-rotation + non-uniform scale (W for XZ, H for Y)
     float3x3 instanceMat = float3x3(
-        cosR * scaleH, 0, sinR * scaleH,
+        cosR * scaleW, 0, sinR * scaleW,
         0, scaleH, 0,
-        -sinR * scaleH, 0, cosR * scaleH
+        -sinR * scaleW, 0, cosR * scaleW
     );
 
     // Slope alignment: rotate from (0,1,0) toward terrain normal based on SlopeBias
@@ -1109,7 +1109,7 @@ void MS_Shadow(
     float tileWorldSize = cs * TILE_SIZE;
     float wx = payload.TileOrigin.x + rng.x * tileWorldSize;
     float wz = payload.TileOrigin.y + rng.y * tileWorldSize;
-    float2 seed = instanceSeed;
+    float2 seed = instanceSeed + payload.TileOrigin * 0.0137;  // include tile position for unique scale/rotation per tile
 
     float2 texelUV = float2(
         (wx - TerrainOriginX) / TerrainSizeX,
@@ -1330,9 +1330,9 @@ void MS_Shadow(
 
     float3x3 rootMat = slot.RootMat;
     float3x3 instanceMat = float3x3(
-        cosR * scaleH, 0, sinR * scaleH,
+        cosR * scaleW, 0, sinR * scaleW,
         0, scaleH, 0,
-        -sinR * scaleH, 0, cosR * scaleH
+        -sinR * scaleW, 0, cosR * scaleW
     );
 
     float3 slopeUp = normalize(lerp(float3(0, 1, 0), terrainNormal, slot.SlopeBias));
