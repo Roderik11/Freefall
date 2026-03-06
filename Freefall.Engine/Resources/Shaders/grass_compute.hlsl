@@ -1,41 +1,72 @@
-// Grass Placement Compute Shader
-// One thread per grid cell. Evaluates placement, culls, appends survivors.
-// Output consumed by DrawInstancedIndirect.
+// ═══════════════════════════════════════════════════════════════════════════
+// Grass/Decorator Compute Prepass
+//
+// Pipeline:
+//   0. CS_BakeTerrainNormals: heightmap → R16G16_SNORM normal map (one-time)
+//   1. CS_SpawnInstances:     single-pass: camera-centered grid → instance placement + cull → append
+//   2. CS_BuildDrawArgs:      reads append counter → writes DispatchMesh indirect args
+//
+// Output: StructuredBuffer<DecoInstance> consumed by the lean AS/MS in grass.fx
+// ═══════════════════════════════════════════════════════════════════════════
 
-// Inline push constants (can't #include from string-compiled shader)
+#pragma kernel CS_BakeTerrainNormals
+#pragma kernel CS_SpawnInstances
+#pragma kernel CS_BuildDrawArgs
+
+// Push constants (same layout as grass.fx common.fx)
 struct PushConstantsData { uint4 indices[8]; };
 ConstantBuffer<PushConstantsData> PushConstants : register(b3);
 #define GET_INDEX(i) PushConstants.indices[i/4][i%4]
 
-// Push constants layout (same root parameter 0 as grass.fx)
-#define ChannelHeadersIdx   GET_INDEX(0)
-#define DecoratorSlotsIdx   GET_INDEX(1)
-#define LODTableIdx         GET_INDEX(2)
-#define MeshRegistryIdx     GET_INDEX(3)
-#define HeightmapIdx        GET_INDEX(4)
-#define TerrainSizeX        asfloat(GET_INDEX(5))
-#define TerrainSizeY        asfloat(GET_INDEX(6))
-#define MaxHeight           asfloat(GET_INDEX(7))
-#define CamPosX             asfloat(GET_INDEX(8))
-#define CamPosY             asfloat(GET_INDEX(9))
-#define CamPosZ             asfloat(GET_INDEX(10))
-#define TerrainOriginX      asfloat(GET_INDEX(11))
-#define TerrainOriginY      asfloat(GET_INDEX(12))
-#define TerrainOriginZ      asfloat(GET_INDEX(13))
-#define MaterialsBufferIdx  GET_INDEX(14)
-#define CellSize            asfloat(GET_INDEX(15))
-#define DecoRadius          asfloat(GET_INDEX(16))
-#define TotalDensity        asfloat(GET_INDEX(17))
-#define ControlMapsIdx      GET_INDEX(18)
-#define FrustumPlanesIdx    GET_INDEX(19)
-// CS-specific slots
-#define GrassInstanceUAV    GET_INDEX(20)
-#define GrassCounterUAV     GET_INDEX(21)
-#define CellsPerSide        GET_INDEX(22)
+// ─── Push constant slots ───────────────────────────────────────────────────
+// All names must follow XxxIdx = GET_INDEX(N) for FXParser binding discovery
+#define DecoratorSlotsIdx   GET_INDEX(0)
+#define LODTableIdx         GET_INDEX(1)
+#define MeshRegistryIdx     GET_INDEX(2)
+#define HeightmapIdx        GET_INDEX(3)
+#define TerrainSizeXIdx     GET_INDEX(4)
+#define TerrainSizeYIdx     GET_INDEX(5)
+#define MaxHeightIdx        GET_INDEX(6)
+#define CamPosXIdx          GET_INDEX(7)
+#define CamPosYIdx          GET_INDEX(8)
+#define CamPosZIdx          GET_INDEX(9)
+#define TerrainOriginXIdx   GET_INDEX(10)
+#define TerrainOriginYIdx   GET_INDEX(11)
+#define TerrainOriginZIdx   GET_INDEX(12)
+#define DecoControlIdx      GET_INDEX(13)
+#define DecoRadiusIdx       GET_INDEX(14)
+#define TileSizeIdx         GET_INDEX(15)
+#define ControlWidthIdx     GET_INDEX(16)
+#define ControlHeightIdx    GET_INDEX(17)
+#define SlotCountIdx        GET_INDEX(18)
 
-// ─── GPU structs ───────────────────────────────────────────────────────────
+// CS-specific UAV/SRV slots
+#define BaseTileXIdx        GET_INDEX(19)   // int as uint: camera-centered grid base X
+#define BaseTileZIdx        GET_INDEX(20)   // int as uint: camera-centered grid base Z
+#define DecoInstanceIdx     GET_INDEX(21)
+#define InstanceCounterIdx  GET_INDEX(22)
+#define MaxInstancesIdx     GET_INDEX(23)
+#define DispatchArgsIdx     GET_INDEX(24)
+#define DecorationDensityIdx GET_INDEX(25)
+#define BakedNormalIdx      GET_INDEX(26)   // SRV for baked normal map
+#define BakedNormalUAVIdx   GET_INDEX(27)   // UAV for baked normal map
+#define DecoMapsIdx         GET_INDEX(28)   // SRV for density map Texture2DArray
 
-struct ChannelHeader { uint StartIndex; uint Count; };
+// Convenience accessors for float params
+#define TerrainSizeX        asfloat(TerrainSizeXIdx)
+#define TerrainSizeY        asfloat(TerrainSizeYIdx)
+#define MaxHeight           asfloat(MaxHeightIdx)
+#define CamPosX             asfloat(CamPosXIdx)
+#define CamPosY             asfloat(CamPosYIdx)
+#define CamPosZ             asfloat(CamPosZIdx)
+#define TerrainOriginX      asfloat(TerrainOriginXIdx)
+#define TerrainOriginY      asfloat(TerrainOriginYIdx)
+#define TerrainOriginZ      asfloat(TerrainOriginZIdx)
+#define DecoRadius          asfloat(DecoRadiusIdx)
+#define TileSize            asfloat(TileSizeIdx)
+#define DecorationDensity   asfloat(DecorationDensityIdx)
+
+// ─── GPU structs (must match grass.fx and TerrainRenderer.cs) ──────────────
 
 struct DecoratorSlot
 {
@@ -44,10 +75,15 @@ struct DecoratorSlot
     float MinW, MaxW;
     uint LODCount;
     uint LODTableOffset;
-    float3x3 RootMat;
+    // Root rotation: 9 floats instead of float3x3 to match C# struct packing
+    float Rot00, Rot01, Rot02;
+    float Rot10, Rot11, Rot12;
+    float Rot20, Rot21, Rot22;
     float SlopeBias;
-    uint ControlMapIndex;
-    uint ControlChannel;
+    uint DecoMapSlice;
+    uint _pad0;
+    uint Mode;
+    uint TextureIdx;
 };
 
 struct LODEntry { uint MeshPartId; float MaxDistance; uint MaterialId; uint _pad; };
@@ -61,17 +97,31 @@ struct MeshPartEntry
     uint Reserved4, Reserved5, Reserved6, Reserved7, Reserved8, Reserved9;
 };
 
-// Per-instance output — read by the VS (36 bytes)
-struct GrassInstance
+// Per-instance output — consumed by the lean MS in grass.fx
+struct DecoInstance
 {
     float3 Position;        // world-space base position
-    float  Scale;           // height scale
     float  Rotation;        // Y-axis rotation angle (radians)
-    float  Width;           // width scale
-    uint   MeshPartId;      // index into MeshRegistry
-    uint   MaterialId;      // material index
-    uint   DecoratorSlotIdx; // index into DecoratorSlots for RootMat lookup
-};
+    float3 TerrainNormal;   // pre-sampled from baked normal map
+    float  FadeFactor;      // distance fade [0-1]
+    float2 Scale;           // (width, height) after density + fade bias
+    float2 TerrainUV;       // for ground color sampling in PS
+    uint   SlotIdx;         // decorator slot index
+    uint   LOD;             // selected LOD index
+    float  InstanceSeed;    // for color variation in PS
+    uint   _pad;
+};  // 64 bytes — cache line aligned
+
+
+
+#define MODE_MESH      0
+#define MODE_BILLBOARD 1
+#define MODE_CROSS     2
+
+// ─── Samplers ──────────────────────────────────────────────────────────────
+
+SamplerState HeightSampler : register(s0);
+SamplerState ClampSampler  : register(s2);
 
 // ─── PCG Hash ──────────────────────────────────────────────────────────────
 
@@ -90,7 +140,6 @@ uint pcg2d(uint2 v)
     v.x ^= v.x >> 16u;
     v.y ^= v.y >> 16u;
     v.x += v.y * 1664525u;
-    v.y += v.x * 1664525u;
     return v.x ^ v.y;
 }
 
@@ -108,194 +157,256 @@ float2 hash22(float2 p)
     return float2(float(h0), float(h1)) / 4294967295.0;
 }
 
-// ─── Samplers ──────────────────────────────────────────────────────────────
-
-SamplerState HeightSampler : register(s0);
-SamplerState ClampSampler  : register(s2);
-
-// ─── CSPlacement ───────────────────────────────────────────────────────────
-// One thread per grid cell. Evaluates density, heightmap, control map,
-// frustum/distance cull, LOD. Survivors appended to output buffer.
+// ═══════════════════════════════════════════════════════════════════════════
+// Stage 0: CS_BakeTerrainNormals
+//
+// One-time prepass: heightmap → R16G16_SNORM normal map.
+// Dispatched once (or when heightmap changes).
+// Stores only XZ components; Y is reconstructed as sqrt(1 - x² - z²).
+// ═══════════════════════════════════════════════════════════════════════════
 
 [numthreads(8, 8, 1)]
-void CSPlacement(uint3 dtid : SV_DispatchThreadID)
+void CS_BakeTerrainNormals(uint3 dtid : SV_DispatchThreadID)
 {
-    uint cps = CellsPerSide;
-    uint cellX = dtid.x;
-    uint cellZ = dtid.y;
-    if (cellX >= cps || cellZ >= cps) return;
+    Texture2D heightTex = ResourceDescriptorHeap[HeightmapIdx];
+    RWTexture2D<float2> normalOut = ResourceDescriptorHeap[BakedNormalUAVIdx];
 
-    float cs = CellSize;
-    float range = DecoRadius;
-    float3 camPos = float3(CamPosX, CamPosY, CamPosZ);
+    uint hmW, hmH;
+    heightTex.GetDimensions(hmW, hmH);
+    if (dtid.x >= hmW || dtid.y >= hmH) return;
 
-    // World position — snap grid to cell boundaries for stable positions
-    float gridStartX = floor((camPos.x - range) / cs) * cs;
-    float gridStartZ = floor((camPos.z - range) / cs) * cs;
-    float wx = gridStartX + (cellX + 0.5) * cs;
-    float wz = gridStartZ + (cellZ + 0.5) * cs;
+    float2 uv = (float2(dtid.xy) + 0.5) / float2(hmW, hmH);
+    float texelStep = 1.0 / float(hmW);
 
-    // Seed based on integer cell coords (world-stable)
-    float2 seed = float2(floor(wx / cs), floor(wz / cs));
+    float hL = heightTex.SampleLevel(HeightSampler, uv + float2(-texelStep, 0), 0).r;
+    float hR = heightTex.SampleLevel(HeightSampler, uv + float2( texelStep, 0), 0).r;
+    float hD = heightTex.SampleLevel(HeightSampler, uv + float2(0, -texelStep), 0).r;
+    float hU = heightTex.SampleLevel(HeightSampler, uv + float2(0,  texelStep), 0).r;
 
-    // Terrain bounds check
-    float2 texelUV = float2(
-        (wx - TerrainOriginX) / TerrainSizeX,
-        (wz - TerrainOriginY) / TerrainSizeY
-    );
-    if (texelUV.x < 0 || texelUV.x > 1 || texelUV.y < 0 || texelUV.y > 1) return;
+    float texelWorldSize = TerrainSizeX * texelStep;
+    float heightScale = MaxHeight / texelWorldSize;
 
-    // Distance cull
-    float2 cellCenter = float2(wx, wz);
-    float tileDist = distance(float2(camPos.x, camPos.z), cellCenter);
-    if (tileDist >= range) return;
+    float3 n = normalize(float3(
+        (hL - hR) * heightScale,
+        1.0,
+        (hD - hU) * heightScale
+    ));
 
-    // Frustum cull (bounding sphere at ground level)
-    if (FrustumPlanesIdx != 0)
-    {
-        StructuredBuffer<float4> planes = ResourceDescriptorHeap[FrustumPlanesIdx];
-        float groundMid = TerrainOriginZ + MaxHeight * 0.5;
-        float verticalRadius = MaxHeight * 0.5;
-        float3 sphereCenter = float3(wx, groundMid, wz);
-        float sphereRadius = sqrt(cs * cs * 0.5 + verticalRadius * verticalRadius);
-
-        // Test 5 planes: skip far (distance handles it)
-        for (uint pi = 0; pi < 5; pi++)
-        {
-            float4 plane = planes[pi];
-            if (dot(plane.xyz, sphereCenter) + plane.w > sphereRadius) return;
-        }
-    }
-
-    // Load decorator data
-    StructuredBuffer<ChannelHeader> headers = ResourceDescriptorHeap[ChannelHeadersIdx];
-    StructuredBuffer<DecoratorSlot> slots   = ResourceDescriptorHeap[DecoratorSlotsIdx];
-    StructuredBuffer<LODEntry>      lodTbl  = ResourceDescriptorHeap[LODTableIdx];
-
-    ChannelHeader hdr = headers[0];
-    if (hdr.Count == 0) return;
-
-    // Independent per-decorator spawn
-    float cellArea = cs * cs;
-    uint winner = 0xFFFF;
-    float bestHash = 2.0;
-
-    for (uint s = 0; s < hdr.Count && s < 32; s++)
-    {
-        DecoratorSlot candidate = slots[hdr.StartIndex + s];
-        float threshold = candidate.Density * cellArea;
-        float h = hash21(seed + float2(s * 127.1, s * 311.7));
-        if (h < threshold && h < bestHash)
-        {
-            bestHash = h;
-            winner = s;
-        }
-    }
-    if (winner == 0xFFFF) return;
-
-    uint slotIdx = hdr.StartIndex + winner;
-    DecoratorSlot slot = slots[slotIdx];
-
-    // Heightmap sample
-    Texture2D heightmap = ResourceDescriptorHeap[HeightmapIdx];
-    float2 jitter = hash22(seed + 73.1) - 0.5;
-    float2 jitteredUV = float2(
-        (wx + jitter.x * cs - TerrainOriginX) / TerrainSizeX,
-        (wz + jitter.y * cs - TerrainOriginY) / TerrainSizeY
-    );
-    float h = heightmap.SampleLevel(ClampSampler, jitteredUV, 0).r * MaxHeight + TerrainOriginZ;
-
-    float3 instancePos = float3(wx + jitter.x * cs, h, wz + jitter.y * cs);
-
-    // Control map scale/cull
-    float ctrlScale = 1.0;
-    if (ControlMapsIdx != 0)
-    {
-        Texture2DArray controlMaps = ResourceDescriptorHeap[ControlMapsIdx];
-        float2 ctrlUV = float2(
-            (instancePos.x - TerrainOriginX) / TerrainSizeX,
-            1.0 - (instancePos.z - TerrainOriginY) / TerrainSizeY
-        );
-        float4 ctrlSample = controlMaps.SampleLevel(ClampSampler, float3(ctrlUV, slot.ControlMapIndex), 0);
-        float channels[4] = { ctrlSample.r, ctrlSample.g, ctrlSample.b, ctrlSample.a };
-        ctrlScale = channels[slot.ControlChannel];
-        ctrlScale = smoothstep(0.15, 0.5, ctrlScale);
-        if (ctrlScale < 0.01) return;
-    }
-
-    // Instance random scale and rotation
-    float instanceScale = lerp(slot.MinH, slot.MaxH, hash21(seed + 33.7)) * ctrlScale;
-    float instanceRot = hash21(seed + 51.3) * 6.2831853;
-    float instanceWidth = lerp(slot.MinW, slot.MaxW, hash21(seed + 77.9));
-
-    // LOD selection
-    float distToCamera = distance(instancePos, camPos);
-    uint meshPartId = 0;
-    uint materialId = 0;
-    bool lodFound = false;
-    for (uint li = 0; li < slot.LODCount && li < 4; li++)
-    {
-        LODEntry lod = lodTbl[slot.LODTableOffset + li];
-        if (distToCamera < lod.MaxDistance)
-        {
-            meshPartId = lod.MeshPartId;
-            materialId = lod.MaterialId;
-            lodFound = true;
-            break;
-        }
-    }
-    if (!lodFound) return;
-    
-    // Distance fade: smoothly shrink to zero in the last 25% of range
-    float fadeStart = range * 0.75;
-    float fadeFactor = smoothstep(0.0, 1.0, (range - distToCamera) / (range - fadeStart));
-    instanceScale *= fadeFactor;
-    instanceWidth *= fadeFactor;
-
-    // Append to output buffer
-    RWStructuredBuffer<GrassInstance> outBuffer = ResourceDescriptorHeap[GrassInstanceUAV];
-    RWByteAddressBuffer counter = ResourceDescriptorHeap[GrassCounterUAV];
-
-    uint idx;
-    counter.InterlockedAdd(0, 1, idx);
-
-    // Safety: don't overflow the buffer
-    if (idx >= cps * cps) return;
-
-    // Track actual max vertex count among survivors (offset 4 in counter buffer)
-    StructuredBuffer<MeshPartEntry> meshReg = ResourceDescriptorHeap[MeshRegistryIdx];
-    uint vertCount = meshReg[meshPartId].VertexCount;
-    uint dummy;
-    counter.InterlockedMax(4, vertCount, dummy);
-
-    GrassInstance gi;
-    gi.Position = instancePos;
-    gi.Scale = instanceScale;
-    gi.Rotation = instanceRot;
-    gi.Width = instanceWidth;
-    gi.MeshPartId = meshPartId;
-    gi.MaterialId = materialId;
-    gi.DecoratorSlotIdx = slotIdx;
-    outBuffer[idx] = gi;
+    // Store XZ in R16G16_SNORM; Y is reconstructed as sqrt(1 - x² - z²)
+    normalOut[dtid.xy] = float2(n.x, n.z);
 }
 
-// ─── CSBuildDrawArgs ───────────────────────────────────────────────────────
-// Single-thread: reads append counter + actual max vertex count, writes DrawInstancedIndirect args.
+// ═══════════════════════════════════════════════════════════════════════════
+// CS_SpawnInstances — Single-pass instance spawning
+//
+// Dispatch(N, N, 1) where N = cells per side around camera.
+// Each group = one cell. [8,8,1] = 64 threads cooperate per cell.
+// Thread 0 loads control data into groupshared; all threads read from there.
+// ═══════════════════════════════════════════════════════════════════════════
+
+groupshared uint gs_ctrl[8];
+groupshared bool gs_tileActive;
+
+[numthreads(8, 8, 1)]
+void CS_SpawnInstances(uint3 gid : SV_GroupID, uint3 gtid3 : SV_GroupThreadID)
+{
+    uint flatThread = gtid3.y * 8 + gtid3.x;  // 0..63
+
+    // Map group to world-space cell via base offset (camera-centered grid)
+    int cellX = asint(BaseTileXIdx) + int(gid.x);
+    int cellZ = asint(BaseTileZIdx) + int(gid.y);
+
+    // Get control texture dimensions directly (match gputerrain.fx approach)
+    Texture2DArray<uint4> controlTex = ResourceDescriptorHeap[DecoControlIdx];
+    uint ctrlW, ctrlH, ctrlSlices;
+    controlTex.GetDimensions(ctrlW, ctrlH, ctrlSlices);
+
+    // Control map texel — same Y-flip as gputerrain.fx debug overlay
+    int cx = cellX;
+    int cy = int(ctrlH) - 1 - cellZ;
+
+    // Check tile validity — no early return before the barrier
+    float ts = TileSize;
+    float tileWorldX = TerrainOriginX + (float(cellX) + 0.5) * ts;
+    float tileWorldZ = TerrainOriginY + (float(cellZ) + 0.5) * ts;
+    float3 camPos = float3(CamPosX, CamPosY, CamPosZ);
+    float dx2 = tileWorldX - camPos.x;
+    float dz2 = tileWorldZ - camPos.z;
+    float maxR = DecoRadius + ts;
+
+    bool tileValid = (cx >= 0 && cx < int(ctrlW) && cy >= 0 && cy < int(ctrlH))
+                  && (dx2 * dx2 + dz2 * dz2 <= maxR * maxR);
+
+    // ── Thread 0 reads BAKED control texture and populates groupshared ──
+    // The baked control texture (RGBA16_UINT, 2 slices) was built by decoration_prepass.hlsl.
+    // Each channel packs (slotIndex << 8) | weight. Up to 8 slots per texel.
+    StructuredBuffer<DecoratorSlot> slots = ResourceDescriptorHeap[DecoratorSlotsIdx];
+    if (flatThread == 0)
+    {
+        gs_tileActive = false;
+        [unroll] for (uint k = 0; k < 8; k++) gs_ctrl[k] = 0;
+
+        if (tileValid)
+        {
+            // Load baked control data (RGBA16_UINT is uncompressed — Load() is valid)
+            uint4 packed0 = controlTex.Load(int4(cx, cy, 0, 0));
+            uint4 packed1 = controlTex.Load(int4(cx, cy, 1, 0));
+
+            uint activeIdx = 0;
+            [unroll] for (uint ch = 0; ch < 8; ch++)
+            {
+                uint packed = (ch < 4) ? packed0[ch] : packed1[ch - 4];
+                uint slotIdx = packed >> 8;
+                uint weight  = packed & 0xFF;
+
+                if (slotIdx == 255 || weight == 0) continue;
+
+                // Filter: only billboard/cross modes for this pipeline
+                DecoratorSlot slot = slots[slotIdx];
+                if (slot.Mode == MODE_MESH) continue;
+
+                gs_ctrl[activeIdx] = packed;
+                activeIdx++;
+            }
+            gs_tileActive = (activeIdx > 0);
+        }
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    if (!gs_tileActive) return;
+
+    StructuredBuffer<LODEntry>      lodTbl = ResourceDescriptorHeap[LODTableIdx];
+
+    float range = DecoRadius;
+    float tileOriginX = TerrainOriginX + float(cellX) * ts;
+    float tileOriginZ = TerrainOriginY + float(cellZ) * ts;
+
+    RWStructuredBuffer<DecoInstance> outBuffer = ResourceDescriptorHeap[DecoInstanceIdx];
+    RWByteAddressBuffer instCounter = ResourceDescriptorHeap[InstanceCounterIdx];
+    uint maxInst = MaxInstancesIdx;
+
+    Texture2D heightTex = ResourceDescriptorHeap[HeightmapIdx];
+    Texture2D<float2> bakedNormals = ResourceDescriptorHeap[BakedNormalIdx];
+
+    // Iterate over collected decorators (from groupshared)
+    [unroll] for (uint ci = 0; ci < 8; ci++)
+    {
+        uint packed = gs_ctrl[ci];
+        uint slotIdx = packed >> 8;
+        uint weight  = packed & 0xFF;
+        if (slotIdx == 255 || weight == 0) break;
+
+        DecoratorSlot slot = slots[slotIdx];
+
+        // Skip mesh-mode decorators — rendered by separate VS/PS pipeline
+        if (slot.Mode == MODE_MESH) continue;
+
+        // Weight is 0-255 from density map; normalize to 0-1, then scale by max instances per tile
+        float normalizedWeight = float(weight) / 255.0;
+        uint decoInstCount = max(1u, min(64u, (uint)(normalizedWeight * 64.0 * slot.Density * DecorationDensity + 0.5)));
+
+        // Stride loop: 64 threads cooperate to spawn decoInstCount instances
+        for (uint instanceIdx = flatThread; instanceIdx < decoInstCount; instanceIdx += 64)
+        {
+            // Scatter beyond tile boundaries: overshoot scales with weight.
+            // At max weight: range = (1 + 2*1) = 3× tile size. Less weight → less overshoot.
+            float2 instanceSeed = float2(float(instanceIdx) * 0.7123 + float(slotIdx) * 3.917,
+                                          float(instanceIdx) * 1.3147 + float(slotIdx) * 7.213);
+            float2 tileOrig = float2(tileOriginX, tileOriginZ);
+            float2 rng = hash22(instanceSeed + tileOrig);
+            float overshoot = 0.f * normalizedWeight;
+            float wx = tileOrig.x + (rng.x * (1.0 + 2.0 * overshoot) - overshoot) * ts;
+            float wz = tileOrig.y + (rng.y * (1.0 + 2.0 * overshoot) - overshoot) * ts;
+
+            // Terrain UV
+            float2 texelUV = float2(
+                (wx - TerrainOriginX) / TerrainSizeX,
+                (wz - TerrainOriginY) / TerrainSizeY
+            );
+            if (texelUV.x < 0 || texelUV.x > 1 || texelUV.y < 0 || texelUV.y > 1) continue;
+
+            // ── Heightmap sample ──
+            float h = heightTex.SampleLevel(HeightSampler, texelUV, 0).r;
+            float3 instancePos = float3(wx, TerrainOriginZ + h * MaxHeight, wz);
+
+            // Distance cull
+            float camDist = distance(instancePos, camPos);
+            if (camDist >= range) continue;
+
+            // ── Terrain normal ──
+            float2 nxz = bakedNormals.SampleLevel(ClampSampler, texelUV, 0);
+            float ny = sqrt(max(0.0, 1.0 - nxz.x * nxz.x - nxz.y * nxz.y));
+            float3 terrainNormal = normalize(float3(nxz.x, ny, nxz.y));
+
+            // ── LOD selection ──
+            uint lod = 0;
+            // DIAGNOSTIC: skip LOD culling to test if all 8 slots render
+            //uint maxLod = min(slot.LODCount, 8u);
+            //for (uint il = 0; il < maxLod; il++)
+            //{
+            //    if (camDist > lodTbl[slot.LODTableOffset + il].MaxDistance)
+            //        lod = il + 1;
+            //}
+            //if (lod >= slot.LODCount) continue;
+
+            // ── Per-instance scale & rotation ──
+            float cellWeight = weight / 255.0;
+            float2 seed = instanceSeed + tileOrig * 0.0137;
+            float densityBias = lerp(0.3, 1.0, cellWeight);
+            float randH = hash21(seed + 33.7);
+            float randW = hash21(seed.yx + 77.9);
+            float scaleH = lerp(slot.MinH, slot.MaxH, randH * densityBias);
+            float scaleW = lerp(slot.MinW, slot.MaxW, randW * densityBias);
+
+            // Distance fade: smoothly shrink in the last 25% of range
+            float fadeStart = range * 0.75;
+            float fadeFactor = smoothstep(0.0, 1.0, (range - camDist) / (range - fadeStart));
+            scaleH *= fadeFactor;
+            scaleW *= fadeFactor;
+
+            float instanceRot = hash21(float2(wx * 7.3, wz * 31.7)) * 6.2831853;
+            float instanceSeedVal = hash21(seed + 99.1);
+
+            // ── Append to output ──
+            uint outIdx;
+            instCounter.InterlockedAdd(0, 1, outIdx);
+            if (outIdx >= maxInst) continue;
+
+            DecoInstance di;
+            di.Position = instancePos;
+            di.Rotation = instanceRot;
+            di.TerrainNormal = terrainNormal;
+            di.FadeFactor = fadeFactor;
+            di.Scale = float2(scaleW, scaleH);
+            di.TerrainUV = texelUV;
+            di.SlotIdx = slotIdx;
+            di.LOD = lod;
+            di.InstanceSeed = instanceSeedVal;
+            di._pad = 0;
+            outBuffer[outIdx] = di;
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Stage 3: CS_BuildDrawArgs
+//
+// Single-thread: reads instance counter, writes DispatchMesh indirect args.
+// ═══════════════════════════════════════════════════════════════════════════
 
 [numthreads(1, 1, 1)]
-void CSBuildDrawArgs(uint3 dtid : SV_DispatchThreadID)
+void CS_BuildDrawArgs(uint3 dtid : SV_DispatchThreadID)
 {
-    RWByteAddressBuffer counter = ResourceDescriptorHeap[GrassCounterUAV];
-    uint instanceCount = counter.Load(0);
-    uint maxVertexCount = counter.Load(4);  // actual max from InterlockedMax
+    RWByteAddressBuffer instCounter = ResourceDescriptorHeap[InstanceCounterIdx];
+    uint instanceCount = instCounter.Load(0);
+    instanceCount = min(instanceCount, MaxInstancesIdx);
 
-    // Clamp to buffer capacity
-    uint cps = CellsPerSide;
-    instanceCount = min(instanceCount, cps * cps);
+    // Write DispatchMesh indirect args: (groupsX, groupsY, groupsZ)
+    // Each MS group handles up to 16 instances (128 threads / 8 verts per instance)
+    uint groupsX = (instanceCount + 15) / 16;
 
-    RWByteAddressBuffer argsBuffer = ResourceDescriptorHeap[GET_INDEX(24)]; // DrawArgsUAV
-    argsBuffer.Store(0, maxVertexCount);      // VertexCountPerInstance (actual, not global max)
-    argsBuffer.Store(4, instanceCount);       // InstanceCount
-    argsBuffer.Store(8, 0u);                  // StartVertexLocation
-    argsBuffer.Store(12, 0u);                 // StartInstanceLocation
+    RWByteAddressBuffer argsBuffer = ResourceDescriptorHeap[DispatchArgsIdx];
+    argsBuffer.Store(0, groupsX);
+    argsBuffer.Store(4, 1u);
+    argsBuffer.Store(8, 1u);
 }

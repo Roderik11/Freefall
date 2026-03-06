@@ -325,8 +325,8 @@ namespace Freefall
             // F5: Cycle debug visualization mode
             if (Input.IsKeyPressed(Keys.F5))
             {
-                Settings.DebugVisualizationMode = (Settings.DebugVisualizationMode + 1) % 5;
-                string[] modeNames = { "Off", "Cascade Colors", "Shadow Factor", "Contact Shadow Only", "Linear Depth" };
+                Settings.DebugVisualizationMode = (Settings.DebugVisualizationMode + 1) % 6;
+                string[] modeNames = { "Off", "Cascade Colors", "Shadow Factor", "Contact Shadow Only", "Linear Depth", "Deco Control Map" };
                 Debug.Log($"[Engine] Debug Viz: {modeNames[Settings.DebugVisualizationMode]}");
             }
             

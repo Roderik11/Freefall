@@ -61,7 +61,7 @@ namespace Freefall.Graphics
             return 4; // Fallback
         }
 
-        public static Texture CreateTexture2DArray(GraphicsDevice device, IList<Texture> textures, bool stripSrgb = false)
+        public static Texture CreateTexture2DArray(GraphicsDevice device, IList<Texture> textures, bool stripSrgb = false, bool forceDecompress = false)
         {
              if (textures.Count == 0) return null;
              
@@ -82,9 +82,11 @@ namespace Freefall.Graphics
                  }
              }
 
-             Debug.Log($"[Texture] CreateTexture2DArray: {textures.Count} textures, formatsMatch={formatsMatch}, refFormat={refDesc.Format}, stripSrgb={stripSrgb}");
+             Debug.Log($"[Texture] CreateTexture2DArray: {textures.Count} textures, formatsMatch={formatsMatch}, refFormat={refDesc.Format}, stripSrgb={stripSrgb}, forceDecompress={forceDecompress}");
 
-             if (formatsMatch)
+             // forceDecompress: always use compute path to decompress BC formats to R8G8B8A8_UNorm
+             // (BC1 only has ~32 grayscale levels — far too lossy for density/control data)
+             if (formatsMatch && !forceDecompress)
                  return CreateTexture2DArrayCopy(device, textures, refDesc, stripSrgb);
              else
                  return CreateTexture2DArrayCompute(device, textures, refDesc);

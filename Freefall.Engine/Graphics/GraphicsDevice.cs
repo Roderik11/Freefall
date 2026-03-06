@@ -229,16 +229,33 @@ namespace Freefall.Graphics
             } catch (Exception ex) {
                 Debug.LogError("GraphicsDevice", $"Creating BindlessCommandSignature: {ex.Message}");
             }
+
+            // DispatchMesh command signature: 3 uints (groupsX, groupsY, groupsZ)
+            var argsDispatchMesh = new IndirectArgumentDescription[]
+            {
+                new IndirectArgumentDescription { Type = IndirectArgumentType.DispatchMesh }
+            };
+            int strideMesh = 3 * sizeof(uint); // 12 bytes
+            var descMesh = new CommandSignatureDescription(strideMesh, argsDispatchMesh);
+            try {
+                _dispatchMeshSignature = _device.CreateCommandSignature<ID3D12CommandSignature>(descMesh, null);
+                Debug.Log("GraphicsDevice", $"DispatchMesh command signature created ({strideMesh} byte stride)");
+            } catch (Exception ex) {
+                Debug.LogError("GraphicsDevice", $"Creating DispatchMeshSignature: {ex.Message}");
+            }
         }
 
         private ID3D12CommandSignature _drawInstancedSignature;
         private ID3D12CommandSignature _drawIndexedInstancedSignature;
         private ID3D12CommandSignature _bindlessCommandSignature = null!;
+        private ID3D12CommandSignature _dispatchMeshSignature;
 
         public ID3D12CommandSignature DrawInstancedSignature => _drawInstancedSignature;
         public ID3D12CommandSignature DrawIndexedInstancedSignature => _drawIndexedInstancedSignature;
         /// <summary>Bindless command signature with 14 root constants + DrawInstanced</summary>
         public ID3D12CommandSignature BindlessCommandSignature => _bindlessCommandSignature;
+        /// <summary>DispatchMesh indirect command signature (3 uints: X, Y, Z)</summary>
+        public ID3D12CommandSignature DispatchMeshSignature => _dispatchMeshSignature;
 
         public void Dispose()
         {
@@ -251,6 +268,7 @@ namespace Freefall.Graphics
             _drawInstancedSignature?.Dispose();
             _drawIndexedInstancedSignature?.Dispose();
             _bindlessCommandSignature?.Dispose();
+            _dispatchMeshSignature?.Dispose();
             _wicFactory?.Dispose();
             _copyFence?.Dispose();
             _copyQueue?.Dispose();

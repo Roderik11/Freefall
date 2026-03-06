@@ -139,7 +139,28 @@ namespace Freefall.Components
         private int _decoratorDispatchGroupsX;
         private int _decoratorDispatchGroupsY;
 
+        // ───── Compute Prepass (grass_compute.hlsl) ──────────────────────
+        private ComputeShader? _grassCS;
+        private int _kBakeNormals, _kSpawnInstances, _kBuildDecoDrawArgs;
+        private GraphicsBuffer? _decoInstanceBuffer;    // StructuredBuffer<DecoInstance> = 64 bytes
+        private GraphicsBuffer? _instanceCounterBuffer; // RWByteAddressBuffer (1 uint)
+        private GraphicsBuffer? _decoDispatchArgsBuffer; // RWByteAddressBuffer (3 uints for DispatchMeshIndirect)
+        private bool _decoBuffersCreated;
+        private bool _decoDispatchLogged;
+        private int _maxDecoInstances;
 
+        // ───── Debug Stats (read by editor SettingsControls) ─────────────
+        public static int LastInstanceCount { get; set; }
+        public static int LastMaxInstances { get; set; }
+        public static int LastDispatchN { get; set; }
+        private ID3D12Resource? _instanceCounterReadback;
+        private IntPtr _instanceCounterReadbackPtr;
+
+        // ───── Baked Terrain Normals (one-time) ──────────────────────────
+        private ID3D12Resource? _bakedNormalTex;        // R16G16_SNORM
+        private uint _bakedNormalUAV;
+        private uint _bakedNormalSRV;
+        private bool _bakedNormalsDirty = true;
 
         // ───── Decoration Control Prepass ─────────────────────────────────
         private ComputeShader? _decoPrepassCS;
@@ -499,6 +520,8 @@ namespace Freefall.Components
             commandList.SetGraphicsRoot32BitConstant(0, TransformBuffer.Instance!.SrvIndex, 15);
             // Slot 16: Debug mode
             commandList.SetGraphicsRoot32BitConstant(0, (uint)Engine.Settings.DebugVisualizationMode, 16);
+            // Slot 21: Deco control map SRV (for debug mode 5)
+            commandList.SetGraphicsRoot32BitConstant(0, _decoControlSRV, 21);
 
             // ExecuteIndirect with DrawInstancedSignature — args written by CSBuildDrawArgs
             commandList.ExecuteIndirect(
@@ -1128,7 +1151,7 @@ namespace Freefall.Components
 
                 slots.Add(new DecoratorSlotGPU
                 {
-                    Density = deco.Density * Terrain.DecorationDensity,
+                    Density = deco.Density,
                     MinH = deco.HeightRange.X,
                     MaxH = deco.HeightRange.Y,
                     MinW = deco.WidthRange.X,
@@ -1145,6 +1168,10 @@ namespace Freefall.Components
                     Mode = (uint)mode,
                     TextureIdx = textureIdx
                 });
+
+                bool hasDensityMap = deco.DensityMap != null && densityMapToSlice.ContainsKey(deco.DensityMap);
+                float logMaxDist = lodCount > 0 ? lodTable[^1].MaxDistance : 0;
+                Debug.Log($"[Deco] Slot {slots.Count - 1}: mode={mode} lodCount={lodCount} density={deco.Density} densityMap={hasDensityMap} slice={slots[^1].DecoMapSlice} maxDist={logMaxDist:F0}");
             }
 
             // Single header covering all slots
@@ -1240,6 +1267,10 @@ namespace Freefall.Components
             _decoPrepassCS.Dispatch(0, cmd, (uint)((width + 7) / 8), (uint)((height + 7) / 8));
 
             cmd.ResourceBarrierUnorderedAccessView(_decoControlTex);
+            // Transition from UAV → SRV so the spawn shader and terrain debug overlay can read correctly
+            cmd.ResourceBarrier(new ResourceBarrier(
+                new ResourceTransitionBarrier(_decoControlTex,
+                    ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource)));
 
             _decoControlDirty = false;
             _bakedAlbedoDirty = true; // Rebuild albedo when control changes
@@ -1405,83 +1436,283 @@ namespace Freefall.Components
             return buffer;
         }
 
+        /// <summary>
+        /// Creates GPU buffers for the compute prepass pipeline.
+        /// Called once; worst-case sizing based on control texture dimensions.
+        /// </summary>
+        private void CreateDecoBuffers()
+        {
+            if (_decoBuffersCreated) return;
+            if (_decoControlTex == null) return;
+
+            var decoDesc = _decoControlTex.Description;
+            int controlW = (int)decoDesc.Width;
+            int controlH = (int)decoDesc.Height;
+            int maxTiles = controlW * controlH;
+
+            // Worst-case instances: ~64 per tile max (64 threads/group)
+            // But realistically with density, far fewer. Use maxTiles * 8 as reasonable upper bound.
+            _maxDecoInstances = Math.Min(maxTiles * 8, 4 * 1024 * 1024); // cap at 4M
+
+            _decoInstanceBuffer = GraphicsBuffer.CreateStructured(_maxDecoInstances, 64, srv: true, uav: true); // 64 bytes per DecoInstance
+            _instanceCounterBuffer = GraphicsBuffer.CreateRaw(2, uav: true, clearable: true);
+            _decoDispatchArgsBuffer = GraphicsBuffer.CreateRaw(3, uav: true); // 3 uints for DispatchMesh indirect args
+
+            // Initialize compute shader and find kernels
+            _grassCS ??= new ComputeShader("grass_compute.hlsl");
+            _kBakeNormals     = _grassCS.FindKernel("CS_BakeTerrainNormals");
+            _kSpawnInstances  = _grassCS.FindKernel("CS_SpawnInstances");
+            _kBuildDecoDrawArgs = _grassCS.FindKernel("CS_BuildDrawArgs");
+
+            Debug.Log($"[TerrainRenderer] Deco buffers created: maxTiles={maxTiles} maxInstances={_maxDecoInstances} controlSize={controlW}x{controlH}");
+
+            // Readback buffer for instance counter (8 bytes for 2 uints)
+            _instanceCounterReadback = Engine.Device.NativeDevice.CreateCommittedResource(
+                new Vortice.Direct3D12.HeapProperties(Vortice.Direct3D12.HeapType.Readback),
+                Vortice.Direct3D12.HeapFlags.None,
+                Vortice.Direct3D12.ResourceDescription.Buffer(8),
+                Vortice.Direct3D12.ResourceStates.CopyDest,
+                null);
+            unsafe
+            {
+                void* pData;
+                _instanceCounterReadback.Map(0, null, &pData);
+                _instanceCounterReadbackPtr = (IntPtr)pData;
+            }
+
+            _decoBuffersCreated = true;
+        }
+
+        /// <summary>
+        /// One-time bake: heightmap → R16G16_SNORM terrain normal map.
+        /// Eliminates 5-tap normal computation per instance in the spawn kernel.
+        /// </summary>
+        private void BakeTerrainNormals(ID3D12GraphicsCommandList cmd)
+        {
+            if (!_bakedNormalsDirty) return;
+            if (Terrain?.Heightmap == null) return;
+
+            var device = Engine.Device;
+            var hmDesc = Terrain.Heightmap.Native.Description;
+            int hmW = (int)hmDesc.Width;
+            int hmH = (int)hmDesc.Height;
+
+            // Create normal map texture (R16G16_SNORM: stores XZ, Y reconstructed)
+            if (_bakedNormalTex == null)
+            {
+                _bakedNormalTex = device.CreateTexture2D(
+                    Format.R16G16_SNorm, hmW, hmH, 1, 1,
+                    ResourceFlags.AllowUnorderedAccess, ResourceStates.Common);
+
+                _bakedNormalUAV = device.AllocateBindlessIndex();
+                var uavDesc = new UnorderedAccessViewDescription
+                {
+                    Format = Format.R16G16_SNorm,
+                    ViewDimension = UnorderedAccessViewDimension.Texture2D,
+                    Texture2D = new Texture2DUnorderedAccessView { MipSlice = 0 }
+                };
+                device.NativeDevice.CreateUnorderedAccessView(_bakedNormalTex, null, uavDesc, device.GetCpuHandle(_bakedNormalUAV));
+
+                _bakedNormalSRV = device.AllocateBindlessIndex();
+                var srvDesc = new ShaderResourceViewDescription
+                {
+                    Format = Format.R16G16_SNorm,
+                    ViewDimension = ShaderResourceViewDimension.Texture2D,
+                    Shader4ComponentMapping = ShaderComponentMapping.Default,
+                    Texture2D = new Texture2DShaderResourceView
+                    {
+                        MostDetailedMip = 0,
+                        MipLevels = 1
+                    }
+                };
+                device.NativeDevice.CreateShaderResourceView(_bakedNormalTex, srvDesc, device.GetCpuHandle(_bakedNormalSRV));
+            }
+
+            // Dispatch CS_BakeTerrainNormals
+            CreateDecoBuffers(); // ensures _grassCS is initialized
+            cmd.SetComputeRootSignature(device.GlobalRootSignature);
+            cmd.SetDescriptorHeaps(1, new[] { device.SrvHeap });
+
+            _grassCS!.Set(_kBakeNormals, "Heightmap", Terrain.Heightmap.BindlessIndex);
+            _grassCS.Set(_kBakeNormals, "BakedNormalUAV", _bakedNormalUAV);
+            _grassCS.Set(_kBakeNormals, "TerrainSizeX", Terrain.TerrainSize.X);
+            _grassCS.Set(_kBakeNormals, "TerrainSizeY", Terrain.TerrainSize.Y);
+            _grassCS.Set(_kBakeNormals, "MaxHeight", Terrain.MaxHeight);
+
+            uint groupsX = (uint)((hmW + 7) / 8);
+            uint groupsY = (uint)((hmH + 7) / 8);
+            _grassCS.Dispatch(_kBakeNormals, cmd, groupsX, groupsY);
+
+            cmd.ResourceBarrierUnorderedAccessView(_bakedNormalTex);
+            _bakedNormalsDirty = false;
+            Debug.Log($"[TerrainRenderer] Terrain normals baked: {hmW}x{hmH}");
+        }
+
+        /// <summary>
+        /// Dispatches the compute prepass (3 stages) + lean AS/MS for decoration rendering.
+        /// </summary>
         private void DispatchDecorator(ID3D12GraphicsCommandList commandList, int frameIndex, RenderPass pass = RenderPass.Opaque)
         {
             if (DecoratorMaterial?.Effect == null || Terrain == null) return;
 
-            // Build control texture on first frame or after decoration changes
+            // One-time bakes
             BuildDecorationControlTexture(commandList);
-            // Bake terrain albedo for ground color blending in vegetation
             BakeTerrainAlbedo(commandList);
+            BakeTerrainNormals(commandList);
+            CreateDecoBuffers();
+
+            if (!_decoBuffersCreated || _decoControlTex == null) return;
 
             var device = Engine.Device;
             var camPos = Camera.Main!.Position;
+            var cs = _grassCS!;
 
             float range = Terrain.DecorationRadius;
-            const int TILE_SIZE = 8;
+            var decoDesc = _decoControlTex.Description;
+            int controlW = (int)decoDesc.Width;
+            int controlH = (int)decoDesc.Height;
+            float tileSize = Terrain.TerrainSize.X / controlW;
 
-            // Tile size = one CONTROL pixel; cell size = tile / 8
-            float controlWidth = _decoControlTex != null
-                ? _decoControlTex.Description.Width : 1024f;
-            float tileSize = Terrain.TerrainSize.X / controlWidth;
-            float cs = tileSize / TILE_SIZE;
-            int tilesPerSide = Math.Max(1, (int)MathF.Ceiling(2.0f * range / tileSize));
+            // One-shot diagnostic log
+            if (!_decoDispatchLogged)
+            {
+                _decoDispatchLogged = true;
+                float tileArea = tileSize * tileSize;
+                Debug.LogAlways($"[Grass] Control={controlW}x{controlH} tileSize={tileSize:F2}m tileArea={tileArea:F1}sqm radius={range:F0}m density={Terrain.DecorationDensity:F2}");
+                Debug.LogAlways($"[Grass] MaxInstances={_maxDecoInstances} DecoCount={Terrain.Decorations.Count} DecoControlSRV={_decoControlSRV}");
+                foreach (var deco in Terrain.Decorations)
+                {
+                    float instPerTile = deco.Density * Terrain.DecorationDensity * tileArea;
+                    Debug.LogAlways($"[Grass]   Slot: density={deco.Density:F2} instPerTile={instPerTile:F1} H=[{deco.HeightRange.X:F2},{deco.HeightRange.Y:F2}] W=[{deco.WidthRange.X:F2},{deco.WidthRange.Y:F2}] mode={deco.Mode}");
+                }
+            }
 
-            //Debug.Log($"[Grass] tileSize={tileSize:F3} cellSize={cs:F3} range={range:F0} tiles={tilesPerSide}x{tilesPerSide}={tilesPerSide*tilesPerSide} decoMapsIdx={DecoMapsArray?.BindlessIndex ?? 0}");
+            // ════════════════════════════════════════════════════════════════
+            // Phase 1: Compute Prepass (only on opaque pass — shadow reuses instances)
+            // ════════════════════════════════════════════════════════════════
 
-            // Select correct PSO pass and apply
+            if (pass == RenderPass.Opaque)
+            {
+                // Transition buffers to UAV
+                _decoInstanceBuffer!.Transition(commandList, ResourceStates.UnorderedAccess);
+                _instanceCounterBuffer!.Transition(commandList, ResourceStates.UnorderedAccess);
+                _decoDispatchArgsBuffer!.Transition(commandList, ResourceStates.UnorderedAccess);
+
+                // Clear instance counter
+                commandList.SetComputeRootSignature(device.GlobalRootSignature);
+                commandList.SetDescriptorHeaps(1, new[] { device.SrvHeap });
+                _instanceCounterBuffer.ClearUAV(commandList, new Vortice.Mathematics.Int4(0, 0, 0, 0));
+                commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(null)));
+
+                // ── Shared push constants ──
+                cs.Set("DecoratorSlots", _decoratorSlotsBuffer!.SrvIndex);
+                cs.Set("LODTable", _decoratorLODTableBuffer!.SrvIndex);
+                cs.Set("MeshRegistry", MeshRegistry.SrvIndex);
+                cs.Set("Heightmap", Terrain.Heightmap?.BindlessIndex ?? 0u);
+                cs.Set("TerrainSizeX", Terrain.TerrainSize.X);
+                cs.Set("TerrainSizeY", Terrain.TerrainSize.Y);
+                cs.Set("MaxHeight", Terrain.MaxHeight);
+                cs.Set("CamPosX", camPos.X);
+                cs.Set("CamPosY", camPos.Y);
+                cs.Set("CamPosZ", camPos.Z);
+                cs.Set("TerrainOriginX", Transform.WorldPosition.X);
+                cs.Set("TerrainOriginY", Transform.WorldPosition.Z);
+                cs.Set("TerrainOriginZ", Transform.WorldPosition.Y);
+                cs.Set("DecoControl", _decoControlSRV);
+                cs.Set("DecoRadius", range);
+                cs.Set("TileSize", tileSize);
+                cs.Set("ControlWidth", (uint)controlW);
+                cs.Set("ControlHeight", (uint)controlH);
+                cs.Set("SlotCount", (uint)Terrain.Decorations.Count);
+
+                // ── Camera-centered grid base tile ──
+                int camTileX = (int)MathF.Floor((camPos.X - Transform.WorldPosition.X) / tileSize);
+                int camTileZ = (int)MathF.Floor((camPos.Z - Transform.WorldPosition.Z) / tileSize);
+                int N = (int)MathF.Ceiling(2 * range / tileSize) + 1;
+                int baseTileX = camTileX - N / 2;
+                int baseTileZ = camTileZ - N / 2;
+
+                cs.Set(_kSpawnInstances, "BaseTileX", unchecked((uint)baseTileX));
+                cs.Set(_kSpawnInstances, "BaseTileZ", unchecked((uint)baseTileZ));
+                cs.SetUAV(_kSpawnInstances, "DecoInstance", _decoInstanceBuffer);
+                cs.SetUAV(_kSpawnInstances, "InstanceCounter", _instanceCounterBuffer);
+                cs.Set(_kSpawnInstances, "MaxInstances", (uint)_maxDecoInstances);
+                cs.Set(_kSpawnInstances, "DecorationDensity", Terrain.DecorationDensity);
+                cs.Set(_kSpawnInstances, "BakedNormal", _bakedNormalSRV);
+                cs.Set(_kSpawnInstances, "DecoMaps", DecoMapsArray?.BindlessIndex ?? 0u);
+
+                cs.SetUAV(_kBuildDecoDrawArgs, "InstanceCounter", _instanceCounterBuffer);
+                cs.SetUAV(_kBuildDecoDrawArgs, "DispatchArgs", _decoDispatchArgsBuffer);
+                cs.Set(_kBuildDecoDrawArgs, "MaxInstances", (uint)_maxDecoInstances);
+
+                // ── Stage 1: CS_SpawnInstances (single-pass, camera-centered grid) ──
+                LastDispatchN = N;
+                LastMaxInstances = _maxDecoInstances;
+                cs.Dispatch(_kSpawnInstances, commandList, (uint)N, (uint)N);
+                commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(null)));
+
+                // ── Stage 2: CS_BuildDrawArgs ──
+                cs.Dispatch(_kBuildDecoDrawArgs, commandList, 1);
+                commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(null)));
+
+                // Transition instance buffer to SRV for MS reads
+                _decoInstanceBuffer.Transition(commandList, ResourceStates.NonPixelShaderResource);
+                _decoDispatchArgsBuffer.Transition(commandList, ResourceStates.IndirectArgument);
+
+                // Readback instance counter for debug stats
+                if (_instanceCounterReadback != null)
+                {
+                    // Read previous frame's value first
+                    unsafe
+                    {
+                        uint* pData = (uint*)_instanceCounterReadbackPtr;
+                        LastInstanceCount = (int)pData[0];
+                    }
+
+                    // Copy this frame's counter to readback
+                    _instanceCounterBuffer.Transition(commandList, ResourceStates.CopySource);
+                    commandList.CopyResource(_instanceCounterReadback, _instanceCounterBuffer.Native);
+                    _instanceCounterBuffer.Transition(commandList, ResourceStates.UnorderedAccess);
+                }
+            }
+
+            // ════════════════════════════════════════════════════════════════
+            // Phase 2: Lean MS dispatch (reads pre-computed instances)
+            // ════════════════════════════════════════════════════════════════
+
             DecoratorMaterial.SetPass(pass);
             DecoratorMaterial.Apply(commandList, device);
 
-            // Push constants
-            commandList.SetGraphicsRoot32BitConstant(0, _decoratorHeadersBuffer!.SrvIndex, 0);
-            commandList.SetGraphicsRoot32BitConstant(0, _decoratorSlotsBuffer!.SrvIndex, 1);
-            commandList.SetGraphicsRoot32BitConstant(0, _decoratorLODTableBuffer!.SrvIndex, 2);
-            commandList.SetGraphicsRoot32BitConstant(0, MeshRegistry.SrvIndex, 3);
-            if (Terrain.Heightmap != null)
-                commandList.SetGraphicsRoot32BitConstant(0, Terrain.Heightmap.BindlessIndex, 4);
-            commandList.SetGraphicsRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(Terrain.TerrainSize.X), 5);
-            commandList.SetGraphicsRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(Terrain.TerrainSize.Y), 6);
-            commandList.SetGraphicsRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(Terrain.MaxHeight), 7);
+            // Push constants for the lean MS
+            commandList.SetGraphicsRoot32BitConstant(0, _decoratorSlotsBuffer!.SrvIndex, 0);  // DecoratorSlotsIdx
+            commandList.SetGraphicsRoot32BitConstant(0, _decoratorLODTableBuffer!.SrvIndex, 1); // LODTableIdx
+            commandList.SetGraphicsRoot32BitConstant(0, MeshRegistry.SrvIndex, 2);              // MeshRegistryIdx
+            commandList.SetGraphicsRoot32BitConstant(0, _decoInstanceBuffer!.SrvIndex, 3);      // DecoInstanceSRV
+            // InstanceCount — worst-case upper bound (AS will clamp based on actual count)
+            commandList.SetGraphicsRoot32BitConstant(0, (uint)_maxDecoInstances, 4);
+            commandList.SetGraphicsRoot32BitConstant(0, Graphics.Material.MaterialsBufferIndex, 5); // MaterialsBufferIdx
+            commandList.SetGraphicsRoot32BitConstant(0, _bakedAlbedoSRV, 6);                    // BakedAlbedoIdx
+            commandList.SetGraphicsRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(Base.Time.TotalTime), 7); // WindTime
             commandList.SetGraphicsRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(camPos.X), 8);
             commandList.SetGraphicsRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(camPos.Y), 9);
             commandList.SetGraphicsRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(camPos.Z), 10);
-            commandList.SetGraphicsRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(Transform.WorldPosition.X), 11);
-            commandList.SetGraphicsRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(Transform.WorldPosition.Z), 12);
-            commandList.SetGraphicsRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(Transform.WorldPosition.Y), 13);
-            commandList.SetGraphicsRoot32BitConstant(0, Graphics.Material.MaterialsBufferIndex, 14);
-            // Slot 15: cell size (tile / 8, locked to CONTROL resolution)
-            commandList.SetGraphicsRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(cs), 15);
-            // Slot 16: decoration radius
-            commandList.SetGraphicsRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(range), 16);
-            // Slot 17: wind animation time
-            commandList.SetGraphicsRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(Base.Time.TotalTime), 17);
-            // Slot 18: decoration control texture SRV (from prepass compute)
-            commandList.SetGraphicsRoot32BitConstant(0, _decoControlSRV, 18);
-            // Slot 19: baked terrain albedo SRV (for ground color blending)
-            commandList.SetGraphicsRoot32BitConstant(0, _bakedAlbedoSRV, 19);
 
-            // Shadow single-pass: bind VP structured buffer and cascade count
             if (pass == RenderPass.Shadow)
             {
-                commandList.SetGraphicsRoot32BitConstant(0, DirectionalLight.CurrentCascadeSrvIndex, 20);
-                // With SDSM, all cascades may cover nearby geometry — use them all.
-                // With fixed splits, skip outermost cascade (grass detail not visible at that distance).
-                int grassShadowCascades = Engine.Settings.UseAdaptiveSplits
-                    ? DirectionalLight.CascadeCount
-                    : Math.Max(1, DirectionalLight.CascadeCount - 2);
-
-                grassShadowCascades = Math.Max(1, DirectionalLight.CascadeCount - 1);
-                commandList.SetGraphicsRoot32BitConstant(0, (uint)grassShadowCascades, 21);
-                
-                // Shadow Hi-Z pyramid SRV for per-instance occlusion culling
-                var shadowPyramid = DeferredRenderer.Current?.ShadowHiZPyramid;
-                uint shadowHiZSrv = (shadowPyramid?.Ready == true) ? shadowPyramid.FullSRV : 0u;
-                commandList.SetGraphicsRoot32BitConstant(0, shadowHiZSrv, 22);
+                commandList.SetGraphicsRoot32BitConstant(0, DirectionalLight.CurrentCascadeSrvIndex, 11);
+                int grassShadowCascades = Math.Max(1, DirectionalLight.CascadeCount - 1);
+                commandList.SetGraphicsRoot32BitConstant(0, (uint)grassShadowCascades, 12);
             }
 
+            // ExecuteIndirect with DispatchMesh args written by CS_BuildDrawArgs
             using var commandList6 = commandList.QueryInterface<ID3D12GraphicsCommandList6>();
-            commandList6.DispatchMesh((uint)tilesPerSide, (uint)tilesPerSide, 1);
+            commandList6.ExecuteIndirect(
+                device.DispatchMeshSignature,
+                1,
+                _decoDispatchArgsBuffer!.Native,
+                0,
+                null,
+                0);
         }
     }
 }

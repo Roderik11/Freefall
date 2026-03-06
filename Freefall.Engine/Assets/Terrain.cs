@@ -27,8 +27,8 @@ namespace Freefall.Assets
         public List<Decoration> Decorations = new();
         public List<Texture> DecoMaps = new();
         
-        [ValueRange(1, 20)]
-        public float DecorationDensity = 1.0f;
+        [ValueRange(0.1f, 10)]
+        public float DecorationDensity = 0.1f;
 
         public float DecorationRadius = 100f;
 

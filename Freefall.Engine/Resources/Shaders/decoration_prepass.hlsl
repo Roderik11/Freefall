@@ -25,7 +25,9 @@ struct DecoratorSlot
     float MinW, MaxW;
     uint LODCount;
     uint LODTableOffset;
-    float3x3 RootMat;
+    float Rot00, Rot01, Rot02;
+    float Rot10, Rot11, Rot12;
+    float Rot20, Rot21, Rot22;
     float SlopeBias;
     uint DecoMapSlice;
     uint _pad0;
@@ -33,7 +35,8 @@ struct DecoratorSlot
     uint TextureIdx;
 };
 
-// No sampler needed — direct Load with thread IDs as texel coordinates
+// Sampler for density maps — block-compressed textures (BC1) don't support Load()
+SamplerState ClampSampler : register(s2);
 
 [numthreads(8, 8, 1)]
 void CSBuildDecoControl(uint3 dtid : SV_DispatchThreadID)
@@ -48,43 +51,39 @@ void CSBuildDecoControl(uint3 dtid : SV_DispatchThreadID)
 
     if (dtid.x >= dims.x || dtid.y >= dims.y) return;
 
-    // Top-8 selection: find slots with highest density map values
+    // Normalized UV for SampleLevel (texel center)
+    float2 uv = (float2(dtid.xy) + 0.5) / float2(dims);
+
+    // Simple first-8 collection (no sorting — diagnostic test)
     uint topIdx[8];
     uint topWt[8];
     [unroll] for (uint k = 0; k < 8; k++)
     {
-        topIdx[k] = 255;   // sentinel: empty
+        topIdx[k] = 255;
         topWt[k] = 0;
     }
-
+    uint topCount = 0;
     uint count = min(SlotCountIdx, 32);
     for (uint i = 0; i < count; i++)
     {
+        if (topCount >= 8) break;
+
         DecoratorSlot s = slots[i];
 
-        float val = 1.0;  // default: present everywhere (no density map = no spatial restriction)
+        float val = 0.0;
         if (s.DecoMapSlice != 0xFFFFFFFF)
-            val = decoMaps.Load(int4(dtid.xy, s.DecoMapSlice, 0)).r;
+            val = decoMaps.SampleLevel(ClampSampler, float3(uv, s.DecoMapSlice), 1).r;  // mip 1: smooth density edges
+        else
+            continue;
+
+        if (s.LODCount == 0) continue;
 
         uint weight = (uint)(val * 255.0 + 0.5);
         if (weight == 0) continue;
 
-        // Insertion sort into top-8 (descending by weight, lower index wins ties)
-        [unroll] for (uint j = 0; j < 8; j++)
-        {
-            if (weight > topWt[j] || (weight == topWt[j] && i < topIdx[j]))
-            {
-                // Shift down
-                [unroll] for (uint m = 7; m > j; m--)
-                {
-                    topIdx[m] = topIdx[m - 1];
-                    topWt[m] = topWt[m - 1];
-                }
-                topIdx[j] = i;
-                topWt[j] = weight;
-                break;
-            }
-        }
+        topIdx[topCount] = i;
+        topWt[topCount] = weight;
+        topCount++;
     }
 
     // Pack: (slotIndex << 8) | weight

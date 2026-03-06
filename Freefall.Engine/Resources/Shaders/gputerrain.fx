@@ -26,6 +26,7 @@ struct TerrainPatchData
 #define ControlMapsIdx GET_INDEX(18)
 #define DiffuseMapsIdx GET_INDEX(19)
 #define NormalMapsIdx GET_INDEX(20)
+#define DecoControlMapIdx GET_INDEX(21)  // Decoration control texture (Texture2DArray<uint4>)
 
 cbuffer terrain : register(b1)
 {
@@ -275,6 +276,45 @@ FragmentOutput PS(VertexOutput input)
     output.Normals = float4(terrainNormal.xyz, 1); 
     output.Data = float4(0.95, 0.0, 1.0, 1.0); // roughness=very matte, metal=0, ao=1, lit=PBR
     output.Depth = input.Depth;
+
+    // Debug mode 5: Decoration control map overlay
+    if (DebugMode == 5 && DecoControlMapIdx != 0)
+    {
+        Texture2DArray<uint4> decoCtrl = ResourceDescriptorHeap[DecoControlMapIdx];
+        uint dW, dH, dS;
+        decoCtrl.GetDimensions(dW, dH, dS);
+        float2 ctrlUV = float2(input.UV2.x, 1.0 - input.UV2.y);
+        int2 ctrlTexel = clamp(int2(ctrlUV * float2(dW, dH)), int2(0,0), int2(dW-1, dH-1));
+
+        uint4 s0 = decoCtrl.Load(int4(ctrlTexel, 0, 0));
+        uint4 s1 = decoCtrl.Load(int4(ctrlTexel, 1, 0));
+        uint maxWt = 0;
+        uint slotCount = 0;
+        uint4 slices[2] = { s0, s1 };
+        [unroll] for (uint k = 0; k < 8; k++)
+        {
+            uint packed = slices[k / 4][k % 4];
+            uint sIdx = packed >> 8;
+            uint wt = packed & 0xFF;
+            if (sIdx == 255) break;
+            maxWt = max(maxWt, wt);
+            slotCount++;
+        }
+
+        // Heatmap: black=0, red=low(1-30), yellow=mid(31-128), green=high(129-255)
+        float t = maxWt / 255.0;
+        float3 decoColor;
+        if (maxWt == 0)
+            decoColor = color.rgb * 0.2; // dark = no coverage
+        else if (t < 0.12)
+            decoColor = float3(0.8, 0.1, 0.1); // red = very low weight
+        else if (t < 0.5)
+            decoColor = lerp(float3(0.8, 0.1, 0.1), float3(0.9, 0.9, 0.1), (t - 0.12) / 0.38); // red→yellow
+        else
+            decoColor = lerp(float3(0.9, 0.9, 0.1), float3(0.1, 0.9, 0.1), (t - 0.5) / 0.5); // yellow→green
+
+        output.Albedo = float4(decoColor, 1.0);
+    }
 
     return output;
 }
