@@ -210,7 +210,7 @@ void MS(
         float3 toCamera = normalize(float3(camPos.x - di.Position.x, 0, camPos.z - di.Position.z));
         float3 right = normalize(cross(slopeUp, toCamera));
         worldPos = di.Position + right * lp.x * scaleW + slopeUp * lp.y * scaleH;
-        worldNorm = toCamera;
+        worldNorm = di.TerrainNormal;
     }
     else // MODE_CROSS — two perpendicular quads
     {
@@ -220,8 +220,7 @@ void MS(
         float3 right = float3(cR, 0, sR);
         right = normalize(right - slopeUp * dot(right, slopeUp));
         worldPos = di.Position + right * lp.x * scaleW + slopeUp * lp.y * scaleH;
-        float3 fwd = (quadIdx == 0) ? float3(-sinR, 0, cosR) : float3(-cosR, 0, -sinR);
-        worldNorm = fwd;
+        worldNorm = di.TerrainNormal;
     }
 
     // Wind
@@ -276,35 +275,25 @@ PSOutput PS(MSOutput input)
     {
         // ── Billboard / Cross path ──
         Texture2D texOverride = ResourceDescriptorHeap[input.TextureOverride];
-        float4 texColor = texOverride.Sample(HeightSampler, input.TexCoord);
+        float4 texColor = texOverride.Sample(ClampSampler, input.TexCoord);
         baseColor = texColor.rgb;
         alpha = texColor.a;
 
         // Distance-based alpha threshold: tight clip up close, loose at distance
-        // so mip-averaged alpha still passes at mid/far range
-        float alphaThreshold = lerp(0.4, 0.05, saturate(dist / 60.0));
-        clip(alpha - alphaThreshold);
+        //float alphaThreshold = lerp(0.25, 0.05, saturate(dist / 80.0));
+        clip(alpha - 0.15);
 
         // Ground color fade
         Texture2D BakedAlbedo = ResourceDescriptorHeap[BakedAlbedoIdx];
         float3 groundColor = BakedAlbedo.SampleLevel(ClampSampler, input.TerrainUV, 0).rgb;
-        float aoFactor = saturate(input.HeightFrac / 0.15);
+        float aoFactor = saturate(input.HeightFrac / 0.66);
 
-        float brightVar = 0.2 + 0.6 * frac(input.InstanceSeed * 17.31);
+        float brightVar = 0.2 + 0.8 * frac(input.InstanceSeed * 17.31);
         float3 variedBase = baseColor * brightVar;
-        output.Albedo = float4(lerp(groundColor * 0.75, variedBase, aoFactor), 1.0);
+        output.Albedo = float4(lerp(variedBase * 0.33, variedBase, aoFactor), 1.0);
 
-        // Per-pixel normals
-        float3 baseNorm = normalize(input.Normal);
-        float3 tipNorm = normalize(lerp(baseNorm, float3(0, 1, 0), 0.6));
-        float3 heightNorm = normalize(lerp(baseNorm, tipNorm, input.HeightFrac));
-        float dAlphaX = ddx(alpha);
-        float dAlphaY = ddy(alpha);
-        float bladeX = (input.TexCoord.x - 0.5) * 2.0;
-        float3 edgeNudge = float3(bladeX * 0.3, 0, 0);
-        float3 alphaGradNormal = float3(-dAlphaX * 0.5, 0, -dAlphaY * 0.5);
-        float3 finalNorm = normalize(heightNorm + edgeNudge + alphaGradNormal);
-        output.Normal = float4(finalNorm * 0.5 + 0.5, 0.0);
+        // Per-pixel normals — use terrain normal directly
+        output.Normal = float4(normalize(input.Normal), 1.0);
     }
     else
     {
@@ -315,7 +304,7 @@ PSOutput PS(MSOutput input)
         if (mat.AlbedoIdx > 0)
         {
             Texture2D albedoTex = ResourceDescriptorHeap[mat.AlbedoIdx];
-            float4 texColor = albedoTex.Sample(HeightSampler, input.TexCoord);
+            float4 texColor = albedoTex.Sample(ClampSampler, input.TexCoord);
             baseColor = texColor.rgb;
             alpha = texColor.a;
             clip(alpha - 0.25);
@@ -326,10 +315,10 @@ PSOutput PS(MSOutput input)
         }
 
         output.Albedo = float4(baseColor, 1.0);
-        output.Normal = float4(normalize(input.Normal) * 0.5 + 0.5, 0.0);
+        output.Normal = float4(normalize(input.Normal), 1.0);
     }
 
-    output.Data = float4(0.0, 1.0, 0.0, 0.0);   // roughness=1, metallic=0, vegetation
+    output.Data = float4(0.95, 0.0, 1.0, 0.5);   // roughness=matte, metallic=0, ao=1, vegetation lighting
     output.Depth = dist;
 
     return output;
@@ -365,6 +354,7 @@ struct ShadowMSOutput
 {
     float4 Position : SV_POSITION;
     float2 TexCoord : TEXCOORD0;
+    float  Depth    : TEXCOORD1;
     nointerpolation uint MaterialId      : TEXCOORD3;
     nointerpolation uint TextureOverride  : TEXCOORD4;
 };
@@ -478,6 +468,7 @@ void MS_Shadow(
     ShadowMSOutput o;
     o.Position = mul(float4(worldPos, 1.0), cascadeVP);
     o.TexCoord = uv;
+    o.Depth = o.Position.w;
     o.MaterialId = lodEntry.MaterialId;
     o.TextureOverride = slot.TextureIdx;
     verts[gtid] = o;
@@ -500,7 +491,7 @@ void PS_Shadow_SP(ShadowMSOutput input)
     {
         Texture2D texOverride = ResourceDescriptorHeap[input.TextureOverride];
         float alpha = texOverride.SampleLevel(HeightSampler, input.TexCoord, 0).a;
-        clip(alpha - 0.35);
+        clip(alpha - 0.15);
     }
     else
     {
@@ -511,7 +502,13 @@ void PS_Shadow_SP(ShadowMSOutput input)
         {
             Texture2D albedoTex = ResourceDescriptorHeap[mat.AlbedoIdx];
             float alpha = albedoTex.SampleLevel(HeightSampler, input.TexCoord, 0).a;
-            clip(alpha - 0.25);
+
+            // Distance-based alpha threshold: tight clip up close, loose at distance
+            // so mip-averaged alpha still passes at mid/far range
+            //float alphaThreshold = lerp(0.15, 0.015, saturate(input.Depth / 60.0));
+            //clip(alpha - alphaThreshold);
+
+            clip(alpha - 0.15);
         }
     }
 }

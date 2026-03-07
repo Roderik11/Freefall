@@ -51,6 +51,8 @@ ConstantBuffer<PushConstantsData> PushConstants : register(b3);
 #define BakedNormalIdx      GET_INDEX(26)   // SRV for baked normal map
 #define BakedNormalUAVIdx   GET_INDEX(27)   // UAV for baked normal map
 #define DecoMapsIdx         GET_INDEX(28)   // SRV for density map Texture2DArray
+#define CamFwdXIdx          GET_INDEX(29)   // Camera forward direction (normalized XZ)
+#define CamFwdZIdx          GET_INDEX(30)
 
 // Convenience accessors for float params
 #define TerrainSizeX        asfloat(TerrainSizeXIdx)
@@ -65,6 +67,8 @@ ConstantBuffer<PushConstantsData> PushConstants : register(b3);
 #define DecoRadius          asfloat(DecoRadiusIdx)
 #define TileSize            asfloat(TileSizeIdx)
 #define DecorationDensity   asfloat(DecorationDensityIdx)
+#define CamFwdX             asfloat(CamFwdXIdx)
+#define CamFwdZ             asfloat(CamFwdZIdx)
 
 // ─── GPU structs (must match grass.fx and TerrainRenderer.cs) ──────────────
 
@@ -237,6 +241,15 @@ void CS_SpawnInstances(uint3 gid : SV_GroupID, uint3 gtid3 : SV_GroupThreadID)
     bool tileValid = (cx >= 0 && cx < int(ctrlW) && cy >= 0 && cy < int(ctrlH))
                   && (dx2 * dx2 + dz2 * dz2 <= maxR * maxR);
 
+    // Half-space cull: reject tiles behind the camera.
+    // dot > -0.2 keeps ~100° behind-camera margin for scatter overshoot.
+    if (tileValid)
+    {
+        float len = sqrt(dx2 * dx2 + dz2 * dz2);
+        if (len > ts)   // skip tiles directly under the camera
+            tileValid = (dx2 * CamFwdX + dz2 * CamFwdZ) / len > -0.2;
+    }
+
     // ── Thread 0 reads BAKED control texture and populates groupshared ──
     // The baked control texture (RGBA16_UINT, 2 slices) was built by decoration_prepass.hlsl.
     // Each channel packs (slotIndex << 8) | weight. Up to 8 slots per texel.
@@ -314,7 +327,7 @@ void CS_SpawnInstances(uint3 gid : SV_GroupID, uint3 gtid3 : SV_GroupThreadID)
                                           float(instanceIdx) * 1.3147 + float(slotIdx) * 7.213);
             float2 tileOrig = float2(tileOriginX, tileOriginZ);
             float2 rng = hash22(instanceSeed + tileOrig);
-            float overshoot = 0.f * normalizedWeight;
+            float overshoot = 0;// 0.5f * normalizedWeight;
             float wx = tileOrig.x + (rng.x * (1.0 + 2.0 * overshoot) - overshoot) * ts;
             float wz = tileOrig.y + (rng.y * (1.0 + 2.0 * overshoot) - overshoot) * ts;
 
@@ -333,8 +346,8 @@ void CS_SpawnInstances(uint3 gid : SV_GroupID, uint3 gtid3 : SV_GroupThreadID)
             float camDist = distance(instancePos, camPos);
             if (camDist >= range) continue;
 
-            // ── Terrain normal ──
-            float2 nxz = bakedNormals.SampleLevel(ClampSampler, texelUV, 0);
+            // ── Terrain normal (R16G16_SNORM — already [-1,1]) ──
+            float2 nxz = bakedNormals.SampleLevel(ClampSampler, texelUV, 0).rg;
             float ny = sqrt(max(0.0, 1.0 - nxz.x * nxz.x - nxz.y * nxz.y));
             float3 terrainNormal = normalize(float3(nxz.x, ny, nxz.y));
 
@@ -359,7 +372,7 @@ void CS_SpawnInstances(uint3 gid : SV_GroupID, uint3 gtid3 : SV_GroupThreadID)
             float scaleW = lerp(slot.MinW, slot.MaxW, randW * densityBias);
 
             // Distance fade: smoothly shrink in the last 25% of range
-            float fadeStart = range * 0.75;
+            float fadeStart = range * 0.85;
             float fadeFactor = smoothstep(0.0, 1.0, (range - camDist) / (range - fadeStart));
             scaleH *= fadeFactor;
             scaleW *= fadeFactor;

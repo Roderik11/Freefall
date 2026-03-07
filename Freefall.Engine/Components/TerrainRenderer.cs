@@ -1641,6 +1641,13 @@ namespace Freefall.Components
                 cs.Set(_kSpawnInstances, "BakedNormal", _bakedNormalSRV);
                 cs.Set(_kSpawnInstances, "DecoMaps", DecoMapsArray?.BindlessIndex ?? 0u);
 
+                // Camera forward direction for half-space culling (normalized XZ)
+                var camFwd = Camera.Main?.Transform?.Forward ?? Vector3.UnitZ;
+                float fwdLen = MathF.Sqrt(camFwd.X * camFwd.X + camFwd.Z * camFwd.Z);
+                if (fwdLen > 0.001f) { camFwd.X /= fwdLen; camFwd.Z /= fwdLen; }
+                cs.Set(_kSpawnInstances, "CamFwdX", camFwd.X);
+                cs.Set(_kSpawnInstances, "CamFwdZ", camFwd.Z);
+
                 cs.SetUAV(_kBuildDecoDrawArgs, "InstanceCounter", _instanceCounterBuffer);
                 cs.SetUAV(_kBuildDecoDrawArgs, "DispatchArgs", _decoDispatchArgsBuffer);
                 cs.Set(_kBuildDecoDrawArgs, "MaxInstances", (uint)_maxDecoInstances);

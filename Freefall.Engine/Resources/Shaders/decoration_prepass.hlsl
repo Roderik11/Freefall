@@ -54,7 +54,7 @@ void CSBuildDecoControl(uint3 dtid : SV_DispatchThreadID)
     // Normalized UV for SampleLevel (texel center)
     float2 uv = (float2(dtid.xy) + 0.5) / float2(dims);
 
-    // Simple first-8 collection (no sorting — diagnostic test)
+    // Collect all valid slots, then keep top 8 sorted by weight (descending)
     uint topIdx[8];
     uint topWt[8];
     [unroll] for (uint k = 0; k < 8; k++)
@@ -66,8 +66,6 @@ void CSBuildDecoControl(uint3 dtid : SV_DispatchThreadID)
     uint count = min(SlotCountIdx, 32);
     for (uint i = 0; i < count; i++)
     {
-        if (topCount >= 8) break;
-
         DecoratorSlot s = slots[i];
 
         float val = 0.0;
@@ -81,9 +79,34 @@ void CSBuildDecoControl(uint3 dtid : SV_DispatchThreadID)
         uint weight = (uint)(val * 255.0 + 0.5);
         if (weight == 0) continue;
 
-        topIdx[topCount] = i;
-        topWt[topCount] = weight;
-        topCount++;
+        // Insertion sort: find position and shift down
+        uint pos = topCount < 8 ? topCount : 7;
+        if (topCount >= 8 && weight <= topWt[7])
+            continue;  // not heavy enough to make top 8
+
+        // Find insertion point (descending order)
+        [unroll] for (uint j = 0; j < 8; j++)
+        {
+            if (j < topCount && weight > topWt[j])
+            {
+                pos = j;
+                break;
+            }
+        }
+
+        // Shift entries down to make room
+        [unroll] for (uint j = 7; j > 0; j--)
+        {
+            if (j > pos)
+            {
+                topIdx[j] = topIdx[j - 1];
+                topWt[j]  = topWt[j - 1];
+            }
+        }
+
+        topIdx[pos] = i;
+        topWt[pos]  = weight;
+        if (topCount < 8) topCount++;
     }
 
     // Pack: (slotIndex << 8) | weight
