@@ -696,6 +696,8 @@ namespace Freefall.Components
                 0);
         }
 
+        private System.Numerics.Matrix4x4 FrozenViewProjection; // VP matrix when frustum frozen
+
         /// <summary>
         /// Upload frustum planes + Hi-Z occlusion data to the per-frame constant buffer.
         /// This is bound to compute root slot 1 (register b0) for inline culling.
@@ -703,7 +705,7 @@ namespace Freefall.Components
         private void UploadFrustumConstants(int frameIndex)
         {
             var vpMatrix = Engine.Settings.FreezeFrustum
-                ? Engine.Settings.FrozenViewProjection
+                ? FrozenViewProjection
                 : Camera.Main!.ViewProjection;
             var frustum = new Frustum(vpMatrix);
             var planes = frustum.GetPlanesAsVector4();
@@ -730,7 +732,7 @@ namespace Freefall.Components
             if (!_firstDispatch && pyramid != null && pyramid.FullSRV != 0 && pyramid.Ready && !Engine.Settings.DisableHiZ)
             {
                 var occVP = Engine.Settings.FreezeFrustum
-                    ? Engine.Settings.FrozenViewProjection
+                    ? FrozenViewProjection
                     : _previousFrameViewProjection;
                 var localToWorld = Matrix4x4.CreateTranslation(terrainPos);
                 hizData.OcclusionProjection = localToWorld * occVP;

@@ -377,7 +377,7 @@ PSOutput PS(DSOutput input)
     float reflSmooth = saturate(dist * 0.003);
     float3 reflectDir = reflect(-V, N);
     reflectDir.y = abs(reflectDir.y);
-    float3 skyRefl = GetSkyColor(reflectDir, -sunDir);
+    float3 skyRefl = GetSkyColor(reflectDir, FogSunDirection);
     float3 reflectColor = lerp(skyRefl, ocean.HorizonSkyColor, reflSmooth);
 
     // ── GGX sun specular (widen at distance to reduce tessellation sparkle) ──
@@ -405,7 +405,7 @@ PSOutput PS(DSOutput input)
 
     // ── Atmospheric extinction / horizon haze ──
     float horizonFade = saturate(dist / 6000.0);
-    float3 hazeColor = float3(0.45, 0.55, 0.72);
+    float3 hazeColor = GetSkyColor(float3(0, 0.01, 1), FogSunDirection);
     float hazeAmount = horizonFade * horizonFade * 0.85;
     color = lerp(color, hazeColor, hazeAmount);
 
@@ -463,7 +463,7 @@ PSOutput PS(DSOutput input)
     // ── Distance fog — matches deferred composition fog ──
     if (FogEnabled > 0)
     {
-        float3 fogColor = GetSkyColor(float3(0, 0.01, 1), -sunDir);
+        float3 fogColor = GetSkyColor(float3(0, 0.01, 1), FogSunDirection);
         color = FOG(color, dist, fogColor);
     }
 

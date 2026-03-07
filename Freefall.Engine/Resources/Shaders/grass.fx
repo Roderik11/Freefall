@@ -200,6 +200,8 @@ void MS(
 
     float2 lp = quadPos[vertInQuad];
     float2 uv = quadUV[vertInQuad];
+    // Random X-flip for visual variety (seed bit → 50% chance)
+    if (frac(di.InstanceSeed * 7.77) > 0.5) uv.x = 1.0 - uv.x;
     float3 worldPos, worldNorm;
 
     float3 slopeUp = normalize(lerp(float3(0, 1, 0), di.TerrainNormal, abs(slot.SlopeBias)));
@@ -286,11 +288,11 @@ PSOutput PS(MSOutput input)
         // Ground color fade
         Texture2D BakedAlbedo = ResourceDescriptorHeap[BakedAlbedoIdx];
         float3 groundColor = BakedAlbedo.SampleLevel(ClampSampler, input.TerrainUV, 0).rgb;
-        float aoFactor = saturate(input.HeightFrac / 0.66);
+        float aoFactor = saturate(input.HeightFrac / 0.33);
 
-        float brightVar = 0.2 + 0.8 * frac(input.InstanceSeed * 17.31);
+        float brightVar = 0.6 + 0.4 * frac(input.InstanceSeed * 17.31);
         float3 variedBase = baseColor * brightVar;
-        output.Albedo = float4(lerp(variedBase * 0.33, variedBase, aoFactor), 1.0);
+        output.Albedo = float4(lerp(groundColor, variedBase, aoFactor), 1.0);
 
         // Per-pixel normals — use terrain normal directly
         output.Normal = float4(normalize(input.Normal), 1.0);
@@ -440,6 +442,7 @@ void MS_Shadow(
 
     float2 lp = quadPos[vertInQuad];
     float2 uv = quadUV[vertInQuad];
+    if (frac(di.InstanceSeed * 7.77) > 0.5) uv.x = 1.0 - uv.x;
     float3 slopeUp = normalize(lerp(float3(0, 1, 0), di.TerrainNormal, abs(slot.SlopeBias)));
     float3 worldPos;
 

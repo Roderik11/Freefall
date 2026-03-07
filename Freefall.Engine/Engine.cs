@@ -325,9 +325,8 @@ namespace Freefall
             // F5: Cycle debug visualization mode
             if (Input.IsKeyPressed(Keys.F5))
             {
-                Settings.DebugVisualizationMode = (Settings.DebugVisualizationMode + 1) % 6;
-                string[] modeNames = { "Off", "Cascade Colors", "Shadow Factor", "Contact Shadow Only", "Linear Depth", "Deco Control Map" };
-                Debug.Log($"[Engine] Debug Viz: {modeNames[Settings.DebugVisualizationMode]}");
+                Settings.DebugVisualizationMode = (DebugVizMode)(((int)Settings.DebugVisualizationMode + 1) % 6);
+                Debug.Log($"[Engine] Debug Viz: {Settings.DebugVisualizationMode}");
             }
             
             // F6: Toggle Hi-Z occlusion culling
@@ -365,15 +364,25 @@ namespace Freefall
         }
     }
 
+    public enum DebugVizMode
+    {
+        Off = 0,
+        CascadeColors = 1,
+        ShadowFactor = 2,
+        ContactShadow = 3,
+        LinearDepth = 4,
+        DecoControlMap = 5
+    }
+
     public class EngineSettings
     {
          public bool VSync { get; set; } = true;                            // F1 - VSync
          public bool TerrainWireframe { get; set; } = false;                // F2 - Global wireframe
          public bool FreezeFrustum { get; set; } = false;                   // F3 - Freeze culling frustum
-         public bool UseAdaptiveSplits { get; set; } = true;               // F4 - SDSM adaptive cascade splits
-         public int  DebugVisualizationMode { get; set; } = 0;              // F5 - Debug viz (0-4)
-         public bool DisableHiZ { get; set; } = false;                       // F6 - Disable Hi-Z occlusion
-         public System.Numerics.Matrix4x4 FrozenViewProjection { get; set; } // VP matrix when frustum frozen
+         public bool UseAdaptiveSplits { get; set; } = true;                // F4 - SDSM adaptive cascade splits
+         public bool DisableHiZ { get; set; } = false;                      // F6 - Disable Hi-Z occlusion
+
+         public DebugVizMode DebugVisualizationMode { get; set; } = DebugVizMode.Off; // F5 - Debug viz
 
          [ValueRange(3, 8)]
          public int  ShadowCascadeCount { get; set; } = 4;                   // Number of shadow cascades
@@ -381,6 +390,9 @@ namespace Freefall
          public bool Fog { get; set; } = true;                               // Distance fog
 
          [ValueRange(0.0001f, 0.01f)]
-         public float FogDensity { get; set; } = 0.001f;                     // Fog density (exponential squared)
+         public float FogDensity { get; set; } = 0.0005f;                     // Fog density (exponential squared)
+  
+  
+         public System.Numerics.Matrix4x4 FrozenViewProjection { get; set; } // VP matrix when frustum frozen
     }
 }
