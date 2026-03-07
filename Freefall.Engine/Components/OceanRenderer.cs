@@ -70,8 +70,8 @@ namespace Freefall.Components
     public class OceanRenderer : Component, IDraw, IUpdate
     {
         // ── Visual parameters ──
-        public Color3 OceanColor = new Color3(0.006f, 0.035f, 0.055f);
-        public Color3 DeepColor = new Color3(0.003f, 0.012f, 0.03f);
+        public Color3 OceanColor = new Color3(0.002f, 0.012f, 0.022f);
+        public Color3 DeepColor = new Color3(0.001f, 0.004f, 0.012f);
 
         // ── Simulation parameters (runtime-tweakable) ──
 

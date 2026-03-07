@@ -359,8 +359,8 @@ PSOutput PS(DSOutput input)
     float3 baseColor = lerp(ocean.OceanColor, ocean.DeepColor, depthBlend);
 
     // ── Subsurface scattering ──
-    float3 scatterColor = float3(0.016, 0.074, 0.16);
-    float3 bubbleColor = float3(0.0, 0.02, 0.016);
+    float3 scatterColor = float3(0.006, 0.028, 0.06);
+    float3 bubbleColor = float3(0.0, 0.008, 0.006);
 
     float k1 = 0.3 * H * pow(saturate(dot(L, -V)), 4.0)
              * pow(0.5 - 0.5 * dot(L, N), 3.0);
@@ -378,7 +378,7 @@ PSOutput PS(DSOutput input)
     float3 reflectDir = reflect(-V, N);
     reflectDir.y = abs(reflectDir.y);
     float3 skyRefl = GetSkyColor(reflectDir, FogSunDirection);
-    float3 reflectColor = lerp(skyRefl, ocean.HorizonSkyColor, reflSmooth);
+    float3 reflectColor = lerp(skyRefl, ocean.HorizonSkyColor, reflSmooth) * 0.5;
 
     // ── GGX sun specular (widen at distance to reduce tessellation sparkle) ──
     float waterRough = 0.075;
@@ -399,7 +399,7 @@ PSOutput PS(DSOutput input)
 
     // ── Foam from FFT Jacobian ──
     float foam = saturate(totalFoam);
-    float3 foamColor = float3(0.6, 0.557, 0.492);
+    float3 foamColor = float3(0.35, 0.32, 0.28);
     float3 foamLit = foamColor * (0.3 + 0.7 * NdotL) * sunRadiance;
     color = lerp(color, foamLit, foam);
 
@@ -460,12 +460,8 @@ PSOutput PS(DSOutput input)
         color = lerp(color, foamLit, shoreFoamAmount);
     }
 
-    // ── Distance fog — matches deferred composition fog ──
-    if (FogEnabled > 0)
-    {
-        float3 fogColor = GetSkyColor(float3(0, 0.01, 1), FogSunDirection);
-        color = FOG(color, dist, fogColor);
-    }
+    // Note: ocean fog is handled by the horizon haze above (same sky-derived color).
+    // No separate FOG() call — that would double-fog the surface.
 
     // ── Tone mapping + gamma — match deferred composition pipeline ──
     // ACES Filmic (Narkowicz 2015)
