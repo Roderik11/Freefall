@@ -83,10 +83,12 @@ namespace Freefall.Assets
     {
         [System.ComponentModel.Browsable(false)]
         public Mesh Mesh;
+
         public Graphics.Material Material;
 
         [Reflection.ValueSelect(typeof(Reflection.MeshPartProvider))]
         public int MeshPartIndex;
+        
         public bool Collision;
     }
 }

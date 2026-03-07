@@ -460,6 +460,20 @@ PSOutput PS(DSOutput input)
         color = lerp(color, foamLit, shoreFoamAmount);
     }
 
+    // ── Distance fog — matches deferred composition fog ──
+    if (FogEnabled > 0)
+    {
+        float3 fogColor = GetSkyColor(float3(0, 0.01, 1), -sunDir);
+        color = FOG(color, dist, fogColor);
+    }
+
+    // ── Tone mapping + gamma — match deferred composition pipeline ──
+    // ACES Filmic (Narkowicz 2015)
+    float3 tm = color;
+    color = (tm * (2.51 * tm + 0.03)) / (tm * (2.43 * tm + 0.59) + 0.14);
+    color = saturate(color);
+    color = pow(abs(color), 1.0 / 2.2);
+
     output.Color = float4(color, 1.0);
 
     return output;

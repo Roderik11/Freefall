@@ -49,6 +49,7 @@ namespace Freefall.Components
 
         // Static ambient scale accessible by composition pass
         public static float AmbientScale { get; private set; } = 1.0f;
+        public static Vector3 CurrentSunDirection { get; private set; } = new Vector3(0, 1, 0);
 
         private float CloudTime = 0.0f;
 
@@ -140,6 +141,7 @@ namespace Freefall.Components
 
             // Ambient tracks blended sky brightness
             AmbientScale = dayFactor * 1.0f + sunsetFactor * 0.4f + nightFactor * 0.05f;
+            CurrentSunDirection = SunDirection;
             
             // Blended light color (day/sunset/night palettes matching shader)
             SunLight.Color = new Color3(

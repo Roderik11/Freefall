@@ -481,6 +481,7 @@ namespace Freefall.Graphics
             var desc = Composite.Native.Description;
             list.SetComputeRoot32BitConstant(0, (uint)desc.Width, 5);
             list.SetComputeRoot32BitConstant(0, (uint)desc.Height, 6);
+            list.SetComputeRoot32BitConstant(0, DepthGBuffer.BindlessIndex, 7);
             
             // Bind SceneConstants cbuffer (AmbientScale etc.)
             foreach (var cb in matDirectionalLight.ConstantBuffers)

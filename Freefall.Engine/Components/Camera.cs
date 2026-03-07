@@ -117,6 +117,9 @@ namespace Freefall.Components
                 pair.Value.SetParameter("AmbientScale", SkyboxRenderer.AmbientScale);
                 float shadowRes = Graphics.DeferredRenderer.Current?.ShadowTextureArray?.Width ?? 2048f;
                 pair.Value.SetParameter("ShadowTexelSize", 1.0f / shadowRes);
+                pair.Value.SetParameter("FogEnabled", Engine.Settings.Fog ? 1.0f : 0.0f);
+                pair.Value.SetParameter("FogDensity", Engine.Settings.FogDensity);
+                pair.Value.SetParameter("FogSunDirection", SkyboxRenderer.CurrentSunDirection);
             }
         }
         

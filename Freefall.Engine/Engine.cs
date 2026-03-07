@@ -377,5 +377,10 @@ namespace Freefall
 
          [ValueRange(3, 8)]
          public int  ShadowCascadeCount { get; set; } = 4;                   // Number of shadow cascades
+
+         public bool Fog { get; set; } = true;                               // Distance fog
+
+         [ValueRange(0.0001f, 0.01f)]
+         public float FogDensity { get; set; } = 0.001f;                     // Fog density (exponential squared)
     }
 }

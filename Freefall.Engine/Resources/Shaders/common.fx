@@ -18,6 +18,11 @@ cbuffer SceneConstants : register(b0)
     row_major float4x4 CameraRelativeVP; // Zero-translation VP (inverse of CameraInverse)
     float AmbientScale;               // Day/night ambient multiplier (0.05 night → 1.0 day)
     float ShadowTexelSize;             // 1.0 / shadowMapResolution (precomputed on CPU)
+    float FogEnabled;                  // 0 or 1 toggle
+    float FogDensity;                  // exponential squared density (e.g. 0.001)
+    float _fogPad0;
+    float3 FogSunDirection;            // sun direction for sky-based fog color
+    float _fogPad1;
 }
 
 // Material data for bindless texture lookup via Material ID indirection
@@ -62,15 +67,9 @@ struct CascadeData
     float4 SplitDistances;      // X=near, Y=far (16 bytes)
 };
 
-float3 FOG(float3 color, float depth)
+float3 FOG(float3 color, float depth, float3 fogColor)
 {
-    float3 fogColor = float3(0.5f, 0.6f, 0.7f);
-    //float fog = 1 - saturate((4000 - depth) / (4000 - 300)); // linear
-    float density = 0.001f;
-	//fog = 1 - 1 / pow(2, linDepth * density); // exponential
-    float fog = 1 - 1 / pow(2, pow(depth * density, 2)); // exponential squared
-    fog = depth > 10000 ? 0 : fog;
-	
+    float fog = 1 - 1 / pow(2, pow(depth * FogDensity, 2)); // exponential squared
     return lerp(color, fogColor, fog);
 }
 

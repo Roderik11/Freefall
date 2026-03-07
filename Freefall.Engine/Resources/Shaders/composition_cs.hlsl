@@ -1,4 +1,5 @@
 #include "common.fx"
+#include "sky_common.fx"
 
 // Composition Compute Shader — replaces composition.fx fullscreen quad
 // [numthreads(8, 8, 1)] = 64 threads per tile, standard for 2D image processing
@@ -11,6 +12,7 @@
 #define OutputUAVIdx    GET_INDEX(4)
 #define ScreenWidth     asuint(GET_INDEX(5))
 #define ScreenHeight    asuint(GET_INDEX(6))
+#define DepthGBufIdx    GET_INDEX(7)
 
 [numthreads(8, 8, 1)]
 void CSCompose(uint3 dispatchThreadId : SV_DispatchThreadID)
@@ -25,6 +27,7 @@ void CSCompose(uint3 dispatchThreadId : SV_DispatchThreadID)
     Texture2D LightTex = ResourceDescriptorHeap[LightTexIdx];
     Texture2D DataTex = ResourceDescriptorHeap[DataTexIdx];
     Texture2D NormalTex = ResourceDescriptorHeap[NormalTexIdx];
+    Texture2D DepthGBuf = ResourceDescriptorHeap[DepthGBufIdx];
     RWTexture2D<float4> Output = ResourceDescriptorHeap[OutputUAVIdx];
     
     int3 coord = int3(px, 0);
@@ -44,6 +47,14 @@ void CSCompose(uint3 dispatchThreadId : SV_DispatchThreadID)
     // data.a flags: 0=unlit (skybox), >0=lit (0.5=vegetation, 1.0=standard PBR)
     float isLit = step(0.1, data.a);
     float3 finalColor = lerp(albedo.rgb, ambient * albedo.rgb + light.rgb, isLit);
+    
+    // Distance fog — sky-derived color, applied in linear HDR before tonemapping
+    if (FogEnabled > 0 && isLit > 0)
+    {
+        float depth = DepthGBuf.Load(coord).r;
+        float3 fogColor = GetSkyColor(float3(0, 0.01, 1), FogSunDirection);
+        finalColor = FOG(finalColor, depth, fogColor);
+    }
     
     // ACES Filmic Tone Mapping (Narkowicz 2015 approximation)
     float3 x = finalColor;
