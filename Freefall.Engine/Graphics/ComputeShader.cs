@@ -376,7 +376,6 @@ namespace Freefall.Graphics
             if (_kernels.Count == 0 && shader.Reflection != null)
             {
                 DiscoverPushConstants(shader.Reflection);
-                DiscoverResourceTypes(shader.Reflection);
                 DiscoverConstantBuffers(shader.Reflection);
             }
 
@@ -393,6 +392,7 @@ namespace Freefall.Graphics
         /// <summary>
         /// Discover push constant slot→name mappings from cbuffer PushConstants reflection.
         /// Each variable's StartOffset / 4 = push constant slot index.
+        /// Also tags UAV resources by naming convention (field name contains "UAV").
         /// </summary>
         private void DiscoverPushConstants(ID3D12ShaderReflection reflection)
         {
@@ -413,40 +413,16 @@ namespace Freefall.Graphics
                     if (name.EndsWith("Idx"))
                         name = name.Substring(0, name.Length - 3);
 
-                    _resourceSlots[name.GetHashCode()] = slot;
-                    Debug.Log($"[ComputeShader] Push constant: '{name}' → slot {slot}");
+                    int hash = name.GetHashCode();
+                    _resourceSlots[hash] = slot;
+
+                    // Tag UAV resources by naming convention: if name contains "UAV", SetBuffer uses .UavIndex
+                    if (name.Contains("UAV", StringComparison.OrdinalIgnoreCase))
+                        _isUAV[hash] = true;
+
+                    Debug.Log($"[ComputeShader] Push constant: '{name}' → slot {slot}{(_isUAV.ContainsKey(hash) ? " (UAV)" : "")}");
                 }
                 break; // Only one PushConstants cbuffer
-            }
-        }
-
-        /// <summary>
-        /// Discover resource types (SRV vs UAV) from shader reflection's bound resources.
-        /// Used by SetBuffer to auto-resolve which index to use.
-        /// </summary>
-        private void DiscoverResourceTypes(ID3D12ShaderReflection reflection)
-        {
-            for (uint i = 0; i < reflection.Description.BoundResources; i++)
-            {
-                var desc = reflection.GetResourceBindingDescription(i);
-
-                bool isUav = desc.Type == ShaderInputType.UnorderedAccessViewRWTyped ||
-                             desc.Type == ShaderInputType.UnorderedAccessViewRWStructured ||
-                             desc.Type == ShaderInputType.UnorderedAccessViewRWByteAddress ||
-                             desc.Type == ShaderInputType.UnorderedAccessViewAppendStructured ||
-                             desc.Type == ShaderInputType.UnorderedAccessViewConsumeStructured ||
-                             desc.Type == ShaderInputType.UnorderedAccessViewRWStructuredWithCounter;
-
-                if (isUav)
-                {
-                    // Strip "Idx" suffix if present for name matching
-                    string name = desc.Name;
-                    if (name.EndsWith("Idx"))
-                        name = name.Substring(0, name.Length - 3);
-
-                    _isUAV[name.GetHashCode()] = true;
-                    Debug.Log($"[ComputeShader] Resource '{name}' is UAV");
-                }
             }
         }
 

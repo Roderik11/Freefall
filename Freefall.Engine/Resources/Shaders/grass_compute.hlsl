@@ -17,26 +17,26 @@
 // Push constants (root parameter 0, register b3) — bindless indices only
 cbuffer PushConstants : register(b3)
 {
-    uint DecoratorSlotsIdx;     // slot 0  — SRV
-    uint LODTableIdx;           // slot 1  — SRV
-    uint MeshRegistryIdx;       // slot 2  — SRV
-    uint HeightmapIdx;          // slot 3  — SRV
-    uint DecoControlIdx;        // slot 4  — SRV
-    uint BakedNormalIdx;        // slot 5  — SRV
-    uint BakedNormalUAVIdx;     // slot 6  — UAV (bake kernel)
-    uint DecoMapsIdx;           // slot 7  — SRV
-    uint DecoInstanceIdx;       // slot 8  — UAV (spawn kernel)
-    uint InstanceCounterIdx;    // slot 9  — UAV
-    uint DispatchArgsIdx;       // slot 10 — UAV (build args kernel)
-    uint MeshDecoInstanceIdx;   // slot 11 — UAV (spawn kernel)
-    uint SortedMeshInstanceIdx; // slot 12 — UAV (binning kernel)
-    uint MeshDrawArgsIdx;       // slot 13 — UAV (binning kernel)
-    uint MeshDrawCountIdx;      // slot 14 — UAV (binning kernel)
-    uint DrawSortedSRVIdx;      // slot 15 — SRV: → draw cmd slot 4
-    uint DrawSlotsSRVIdx;       // slot 16 — SRV: → draw cmd slot 5
-    uint DrawLODSRVIdx;         // slot 17 — SRV: → draw cmd slot 6
-    uint DrawMeshRegSRVIdx;     // slot 18 — SRV: → draw cmd slot 7
-    uint DrawMaterialsSRVIdx;   // slot 19 — SRV: → draw cmd slot 14
+    uint DecoratorSlotsIdx;         // slot 0  — SRV
+    uint LODTableIdx;               // slot 1  — SRV
+    uint MeshRegistryIdx;           // slot 2  — SRV
+    uint HeightmapIdx;              // slot 3  — SRV
+    uint DecoControlIdx;            // slot 4  — SRV
+    uint BakedNormalIdx;            // slot 5  — SRV
+    uint BakedNormalUAVIdx;         // slot 6  — UAV (bake kernel)
+    uint DecoMapsIdx;               // slot 7  — SRV
+    uint DecoInstanceUAVIdx;        // slot 8  — UAV (spawn kernel)
+    uint InstanceCounterUAVIdx;     // slot 9  — UAV
+    uint DispatchArgsUAVIdx;        // slot 10 — UAV (build args kernel)
+    uint MeshDecoInstanceUAVIdx;    // slot 11 — UAV (spawn), SRV (binning)
+    uint SortedMeshInstanceUAVIdx;  // slot 12 — UAV (binning kernel)
+    uint MeshDrawArgsUAVIdx;        // slot 13 — UAV (binning kernel)
+    uint MeshDrawCountUAVIdx;       // slot 14 — UAV (binning kernel)
+    uint DrawSortedSRVIdx;          // slot 15 — SRV: → draw cmd slot 4
+    uint DrawSlotsSRVIdx;           // slot 16 — SRV: → draw cmd slot 5
+    uint DrawLODSRVIdx;             // slot 17 — SRV: → draw cmd slot 6
+    uint DrawMeshRegSRVIdx;         // slot 18 — SRV: → draw cmd slot 7
+    uint DrawMaterialsSRVIdx;       // slot 19 — SRV: → draw cmd slot 14
 };
 
 // Hi-Z occlusion parameters (root slot 2 → register b1, shared with terrain_quadtree.hlsl)
@@ -351,8 +351,8 @@ void CS_SpawnInstances(uint3 gid : SV_GroupID, uint3 gtid3 : SV_GroupThreadID)
     float tileOriginX = TerrainOrigin.x + float(cellX) * ts;
     float tileOriginZ = TerrainOrigin.y + float(cellZ) * ts;
 
-    RWStructuredBuffer<DecoInstance> outBuffer = ResourceDescriptorHeap[DecoInstanceIdx];
-    RWByteAddressBuffer instCounter = ResourceDescriptorHeap[InstanceCounterIdx];
+    RWStructuredBuffer<DecoInstance> outBuffer = ResourceDescriptorHeap[DecoInstanceUAVIdx];
+    RWByteAddressBuffer instCounter = ResourceDescriptorHeap[InstanceCounterUAVIdx];
     uint maxInst = MaxInstances;
 
     Texture2D heightTex = ResourceDescriptorHeap[HeightmapIdx];
@@ -454,7 +454,7 @@ void CS_SpawnInstances(uint3 gid : SV_GroupID, uint3 gtid3 : SV_GroupThreadID)
                 uint outIdx;
                 instCounter.InterlockedAdd(4, 1, outIdx);
                 if (outIdx >= maxInst) continue;
-                RWStructuredBuffer<DecoInstance> meshBuffer = ResourceDescriptorHeap[MeshDecoInstanceIdx];
+                RWStructuredBuffer<DecoInstance> meshBuffer = ResourceDescriptorHeap[MeshDecoInstanceUAVIdx];
                 meshBuffer[outIdx] = di;
             }
             else
@@ -478,7 +478,7 @@ void CS_SpawnInstances(uint3 gid : SV_GroupID, uint3 gtid3 : SV_GroupThreadID)
 [numthreads(1, 1, 1)]
 void CS_BuildDrawArgs(uint3 dtid : SV_DispatchThreadID)
 {
-    RWByteAddressBuffer instCounter = ResourceDescriptorHeap[InstanceCounterIdx];
+    RWByteAddressBuffer instCounter = ResourceDescriptorHeap[InstanceCounterUAVIdx];
     uint instanceCount = instCounter.Load(0);
     instanceCount = min(instanceCount, MaxInstances);
 
@@ -486,7 +486,7 @@ void CS_BuildDrawArgs(uint3 dtid : SV_DispatchThreadID)
     // Each MS group handles up to 16 instances (128 threads / 8 verts per instance)
     uint groupsX = (instanceCount + 15) / 16;
 
-    RWByteAddressBuffer argsBuffer = ResourceDescriptorHeap[DispatchArgsIdx];
+    RWByteAddressBuffer argsBuffer = ResourceDescriptorHeap[DispatchArgsUAVIdx];
     argsBuffer.Store(0, groupsX);
     argsBuffer.Store(4, 1u);
     argsBuffer.Store(8, 1u);
@@ -510,12 +510,12 @@ void CS_BuildDrawArgs(uint3 dtid : SV_DispatchThreadID)
 //   [56..71] DrawInstancedArguments { VertexCount, InstanceCount, StartVertex, StartInstance }
 //
 // Push constants (reuses same register b3):
-//   MeshDecoInstanceIdx (31) = unsorted mesh instance SRV
+//   MeshDecoInstanceUAVIdx (11) = unsorted mesh instance (UAV in spawn, SRV in binning)
 //   Binning-specific slots set per-dispatch from C#:
-//     DispatchArgsIdx (24)   = reused: read mesh count from offset 12
-//     SortedMeshInstanceIdx  = new: UAV for sorted output
-//     MeshDrawArgsIdx        = new: UAV for bindless draw commands
-//     MeshDrawCountIdx       = new: UAV for draw count (1 uint)
+//     DispatchArgsUAVIdx (10)    = reused: read mesh count from offset 12
+//     SortedMeshInstanceUAVIdx   = UAV for sorted output
+//     MeshDrawArgsUAVIdx         = UAV for bindless draw commands
+//     MeshDrawCountUAVIdx        = UAV for draw count (1 uint)
 // ═══════════════════════════════════════════════════════════════════════════
 
 // Binning push constant slots (12-19) are named fields in cbuffer PushConstants above.
@@ -536,7 +536,7 @@ void CS_BinMeshInstances(uint gtid : SV_GroupThreadID)
     StructuredBuffer<MeshPartEntry> meshReg = ResourceDescriptorHeap[MeshRegistryIdx];
 
     // Read mesh instance count from argsBuffer offset 12 (written by CS_BuildDrawArgs)
-    RWByteAddressBuffer argsBuffer = ResourceDescriptorHeap[DispatchArgsIdx];
+    RWByteAddressBuffer argsBuffer = ResourceDescriptorHeap[DispatchArgsUAVIdx];
     if (gtid == 0)
     {
         gs_meshCount = argsBuffer.Load(12);
@@ -552,7 +552,7 @@ void CS_BinMeshInstances(uint gtid : SV_GroupThreadID)
     uint meshCount = gs_meshCount;
     if (meshCount == 0) return;
 
-    StructuredBuffer<DecoInstance> meshInstances = ResourceDescriptorHeap[MeshDecoInstanceIdx];
+    StructuredBuffer<DecoInstance> meshInstances = ResourceDescriptorHeap[MeshDecoInstanceUAVIdx];
 
     // Pass 1: Count instances per meshPartId
     // (single workgroup iterates all instances — fine for terrain decorator counts)
@@ -607,7 +607,7 @@ void CS_BinMeshInstances(uint gtid : SV_GroupThreadID)
     GroupMemoryBarrierWithGroupSync();
 
     // Pass 2: Scatter instances into sorted buffer
-    RWStructuredBuffer<DecoInstance> sortedBuffer = ResourceDescriptorHeap[SortedMeshInstanceIdx];
+    RWStructuredBuffer<DecoInstance> sortedBuffer = ResourceDescriptorHeap[SortedMeshInstanceUAVIdx];
 
     for (uint j = gtid; j < meshCount; j += 64)
     {
@@ -633,8 +633,8 @@ void CS_BinMeshInstances(uint gtid : SV_GroupThreadID)
     // BindlessCommandSignature: 14 root constants (56 bytes) + DrawInstancedArgs (16 bytes) = 72 bytes
     if (gtid == 0)
     {
-        RWByteAddressBuffer drawArgsBuffer = ResourceDescriptorHeap[MeshDrawArgsIdx];
-        RWByteAddressBuffer drawCountBuffer = ResourceDescriptorHeap[MeshDrawCountIdx];
+        RWByteAddressBuffer drawArgsBuffer = ResourceDescriptorHeap[MeshDrawArgsUAVIdx];
+        RWByteAddressBuffer drawCountBuffer = ResourceDescriptorHeap[MeshDrawCountUAVIdx];
 
         uint drawIdx = 0;
         for (uint t = 0; t < MAX_MESH_TYPES; t++)

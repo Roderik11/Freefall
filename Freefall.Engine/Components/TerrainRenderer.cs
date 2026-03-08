@@ -431,17 +431,17 @@ namespace Freefall.Components
             commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(null)));
 
             // Push constants — bindless indices only (slots 0-14)
-            cs.SetParam("OutputDescriptorsUAV", _descriptorBuffers[frameIndex].UavIndex);
-            cs.SetParam("OutputSpheresUAV", _sphereBuffers[frameIndex].UavIndex);
-            cs.SetParam("OutputSubbatchIdsUAV", _subbatchIdBuffers[frameIndex].UavIndex);
-            cs.SetParam("OutputTerrainDataUAV", _terrainDataBuffers[frameIndex].UavIndex);
-            cs.SetParam("CounterUAV", _counterBuffers[frameIndex].UavIndex);
-            cs.SetParam("SplitFlagsUAV", _splitFlagsBuffers[frameIndex].UavIndex);
-            cs.SetParam("HeightRangeSRV", _heightRangePyramidSRV);
+            cs.SetBuffer("OutputDescriptorsUAV", _descriptorBuffers[frameIndex]);
+            cs.SetBuffer("OutputSpheresUAV", _sphereBuffers[frameIndex]);
+            cs.SetBuffer("OutputSubbatchIdsUAV", _subbatchIdBuffers[frameIndex]);
+            cs.SetBuffer("OutputTerrainDataUAV", _terrainDataBuffers[frameIndex]);
+            cs.SetBuffer("CounterUAV", _counterBuffers[frameIndex]);
+            cs.SetBuffer("SplitFlagsUAV", _splitFlagsBuffers[frameIndex]);
+            cs.SetPushConstant("HeightRangeSRV", _heightRangePyramidSRV);
 
             // Per-kernel overrides for CSBuildDrawArgs
-            cs.SetParam(_kBuildDrawArgs, "VertexCount", (uint)_patchMesh.IndexCount);
-            cs.SetParam(_kBuildDrawArgs, "IndirectArgsUAV", _indirectArgsBuffers[frameIndex].UavIndex);
+            cs.SetPushConstant(_kBuildDrawArgs, "VertexCount", (uint)_patchMesh.IndexCount);
+            cs.SetBuffer(_kBuildDrawArgs, "IndirectArgsUAV", _indirectArgsBuffers[frameIndex]);
 
             // ── One-time: Build height range mip pyramid ──
             if (!_heightRangePyramidBuilt)
@@ -636,17 +636,16 @@ namespace Freefall.Components
             commandList.SetComputeRootConstantBufferView(3, _shadowTerrainParamBuffers[frameIndex].GPUVirtualAddress);
 
             // Push constants — bindless indices only
-            cs.SetParam(kShadow, "OutputDescriptorsUAV", _shadowDescriptorBuffers[frameIndex].UavIndex);
-            cs.SetParam(kShadow, "OutputSpheresUAV", _shadowSphereBuffers[frameIndex].UavIndex);
-            cs.SetParam(kShadow, "OutputSubbatchIdsUAV", _shadowSubbatchIdBuffers[frameIndex].UavIndex);
-            cs.SetParam(kShadow, "OutputTerrainDataUAV", _shadowTerrainDataBuffers[frameIndex].UavIndex);
-            cs.SetParam(kShadow, "CounterUAV", _shadowCounterBuffers[frameIndex].UavIndex);
-            cs.SetParam(kShadow, "CascadeIdxUAV", _shadowCascadeIdxBuffers[frameIndex].UavIndex);
-            cs.SetParam(kShadow, "SplitFlagsUAV", _splitFlagsBuffers[frameIndex].UavIndex);
-            cs.SetParam(kShadow, "HeightRangeSRV", _heightRangePyramidSRV);
-            cs.SetParam(kShadow, "CascadeCount", (uint)cascadeCount);
-
-            cs.SetParam(kShadow, "CascadeBufferSRV", _shadowCascadeBufferSrvs[frameIndex]);
+            cs.SetBuffer(kShadow, "OutputDescriptorsUAV", _shadowDescriptorBuffers[frameIndex]);
+            cs.SetBuffer(kShadow, "OutputSpheresUAV", _shadowSphereBuffers[frameIndex]);
+            cs.SetBuffer(kShadow, "OutputSubbatchIdsUAV", _shadowSubbatchIdBuffers[frameIndex]);
+            cs.SetBuffer(kShadow, "OutputTerrainDataUAV", _shadowTerrainDataBuffers[frameIndex]);
+            cs.SetBuffer(kShadow, "CounterUAV", _shadowCounterBuffers[frameIndex]);
+            cs.SetBuffer(kShadow, "CascadeIdxUAV", _shadowCascadeIdxBuffers[frameIndex]);
+            cs.SetBuffer(kShadow, "SplitFlagsUAV", _splitFlagsBuffers[frameIndex]);
+            cs.SetPushConstant(kShadow, "HeightRangeSRV", _heightRangePyramidSRV);
+            cs.SetPushConstant(kShadow, "CascadeCount", (uint)cascadeCount);
+            cs.SetPushConstant(kShadow, "CascadeBufferSRV", _shadowCascadeBufferSrvs[frameIndex]);
 
             // Dispatch CSEmitLeavesShadow
             uint threadGroups = (uint)((_totalNodes + 255) / 256);
@@ -656,9 +655,9 @@ namespace Freefall.Components
             commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(null)));
 
             // Build draw args from shadow counter (CSBuildDrawArgs with shadow-specific overrides)
-            cs.SetParam(kArgs, "VertexCount", (uint)_patchMesh.IndexCount);
-            cs.SetParam(kArgs, "IndirectArgsUAV", _shadowArgsBuffers[frameIndex].UavIndex);
-            cs.SetParam(kArgs, "CounterUAV", _shadowCounterBuffers[frameIndex].UavIndex);
+            cs.SetPushConstant(kArgs, "VertexCount", (uint)_patchMesh.IndexCount);
+            cs.SetBuffer(kArgs, "IndirectArgsUAV", _shadowArgsBuffers[frameIndex]);
+            cs.SetBuffer(kArgs, "CounterUAV", _shadowCounterBuffers[frameIndex]);
             cs.Dispatch(kArgs, commandList, 1);
 
             // UAV barrier
@@ -1280,10 +1279,10 @@ namespace Freefall.Components
             _decoPrepassCS ??= new ComputeShader("decoration_prepass.hlsl");
             cmd.SetComputeRootSignature(Engine.Device.GlobalRootSignature);
             cmd.SetDescriptorHeaps(1, new[] { Engine.Device.SrvHeap });
-            _decoPrepassCS.SetParam("DecoMaps", DecoMapsArray);              // Texture → BindlessIndex
-            _decoPrepassCS.SetSRV("Slots", _decoratorSlotsBuffer!);     // GraphicsBuffer → SrvIndex
-            _decoPrepassCS.SetParam("ControlUAV", _decoControlUAV);          // uint (raw UAV index)
-            _decoPrepassCS.SetParam("SlotCount", slotCount);                  // uint
+            _decoPrepassCS.SetTexture("DecoMaps", DecoMapsArray);             // Texture → BindlessIndex
+            _decoPrepassCS.SetBuffer("Slots", _decoratorSlotsBuffer!);        // GraphicsBuffer → auto SRV
+            _decoPrepassCS.SetPushConstant("ControlUAV", _decoControlUAV);   // uint (raw UAV index)
+            _decoPrepassCS.SetPushConstant("SlotCount", slotCount);           // uint
             _decoPrepassCS.Dispatch(0, cmd, (uint)((width + 7) / 8), (uint)((height + 7) / 8));
 
             cmd.ResourceBarrierUnorderedAccessView(_decoControlTex);
@@ -1346,10 +1345,10 @@ namespace Freefall.Components
             _albedoBakeCS ??= new ComputeShader("terrain_albedo_bake.hlsl");
             cmd.SetComputeRootSignature(Engine.Device.GlobalRootSignature);
             cmd.SetDescriptorHeaps(1, new[] { Engine.Device.SrvHeap });
-            _albedoBakeCS.SetParam("ControlMaps", ControlMapsArray);      // Texture → BindlessIndex
-            _albedoBakeCS.SetParam("DiffuseMaps", DiffuseMapsArray);      // Texture → BindlessIndex
-            _albedoBakeCS.SetParam("OutputUAV", _bakedAlbedoUAV);         // uint (raw UAV index)
-            _albedoBakeCS.SetSRV("TilingBuf", _tilingBuffer);        // GraphicsBuffer → SrvIndex
+            _albedoBakeCS.SetTexture("ControlMaps", ControlMapsArray);    // Texture → BindlessIndex
+            _albedoBakeCS.SetTexture("DiffuseMaps", DiffuseMapsArray);    // Texture → BindlessIndex
+            _albedoBakeCS.SetPushConstant("OutputUAV", _bakedAlbedoUAV); // uint (raw UAV index)
+            _albedoBakeCS.SetBuffer("TilingBuf", _tilingBuffer);         // GraphicsBuffer → auto SRV
 
             uint groups = (uint)((BakedAlbedoSize + 7) / 8);
             _albedoBakeCS.Dispatch(0, cmd, groups, groups);
@@ -1567,8 +1566,8 @@ namespace Freefall.Components
             cmd.SetComputeRootSignature(device.GlobalRootSignature);
             cmd.SetDescriptorHeaps(1, new[] { device.SrvHeap });
 
-            _grassCS!.SetParam(_kBakeNormals, "Heightmap", Terrain.Heightmap.BindlessIndex);
-            _grassCS.SetParam(_kBakeNormals, "BakedNormalUAV", _bakedNormalUAV);
+            _grassCS!.SetTexture(_kBakeNormals, "Heightmap", Terrain.Heightmap);
+            _grassCS.SetPushConstant(_kBakeNormals, "BakedNormalUAV", _bakedNormalUAV);
             _grassCS.SetParam("TerrainSize", new Vector2(Terrain.TerrainSize.X, Terrain.TerrainSize.Y));
             _grassCS.SetParam("MaxHeight", Terrain.MaxHeight);
             _grassCS.SetParam("HeightmapSize", new Vortice.Mathematics.UInt2((uint)hmW, (uint)hmH));
@@ -1629,13 +1628,13 @@ namespace Freefall.Components
                 commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(null)));
 
                 // ── Push constants: bindless resource indices only ──
-                cs.SetParam("DecoratorSlots", _decoratorSlotsBuffer!.SrvIndex);
-                cs.SetParam("LODTable", _decoratorLODTableBuffer!.SrvIndex);
-                cs.SetParam("MeshRegistry", MeshRegistry.SrvIndex);
-                cs.SetParam("Heightmap", Terrain.Heightmap?.BindlessIndex ?? 0u);
-                cs.SetParam("DecoControl", _decoControlSRV);
-                cs.SetParam("BakedNormal", _bakedNormalSRV);
-                cs.SetParam("DecoMaps", DecoMapsArray?.BindlessIndex ?? 0u);
+                cs.SetBuffer("DecoratorSlots", _decoratorSlotsBuffer!);
+                cs.SetBuffer("LODTable", _decoratorLODTableBuffer!);
+                cs.SetPushConstant("MeshRegistry", MeshRegistry.SrvIndex);
+                if (Terrain.Heightmap != null) cs.SetTexture("Heightmap", Terrain.Heightmap);
+                cs.SetPushConstant("DecoControl", _decoControlSRV);
+                cs.SetPushConstant("BakedNormal", _bakedNormalSRV);
+                if (DecoMapsArray != null) cs.SetTexture("DecoMaps", DecoMapsArray);
 
                 // ── cbuffer DecoParams ──
                 cs.SetParam("TerrainSize", new Vector2(Terrain.TerrainSize.X, Terrain.TerrainSize.Y));
@@ -1670,12 +1669,12 @@ namespace Freefall.Components
                 cs.SetParam("MaxInstances", (uint)_maxDecoInstances);
 
                 // ── Per-kernel push constants (resource indices only) ──
-                cs.SetUAV(_kSpawnInstances, "DecoInstance", _decoInstanceBuffer);
-                cs.SetUAV(_kSpawnInstances, "InstanceCounter", _instanceCounterBuffer);
-                cs.SetUAV(_kSpawnInstances, "MeshDecoInstance", _meshDecoInstanceBuffer);
+                cs.SetBuffer(_kSpawnInstances, "DecoInstanceUAV", _decoInstanceBuffer);
+                cs.SetBuffer(_kSpawnInstances, "InstanceCounterUAV", _instanceCounterBuffer);
+                cs.SetBuffer(_kSpawnInstances, "MeshDecoInstanceUAV", _meshDecoInstanceBuffer);
 
-                cs.SetUAV(_kBuildDecoDrawArgs, "InstanceCounter", _instanceCounterBuffer);
-                cs.SetUAV(_kBuildDecoDrawArgs, "DispatchArgs", _decoDispatchArgsBuffer);
+                cs.SetBuffer(_kBuildDecoDrawArgs, "InstanceCounterUAV", _instanceCounterBuffer);
+                cs.SetBuffer(_kBuildDecoDrawArgs, "DispatchArgsUAV", _decoDispatchArgsBuffer);
 
                 // ── Stage 1: CS_SpawnInstances (single-pass, camera-centered grid) ──
                 // Bind Hi-Z occlusion cbuffer (same _hizParamBuffers used by terrain quadtree)
@@ -1696,21 +1695,21 @@ namespace Freefall.Components
                 // Transition mesh instance buffer to SRV for binning reads
                 _meshDecoInstanceBuffer!.Transition(commandList, ResourceStates.NonPixelShaderResource);
                 // DispatchArgs is still UAV — binning reads mesh count from offset 12
-                cs.SetParam(_kBinMeshInstances, "DecoratorSlots", _decoratorSlotsBuffer!.SrvIndex);
-                cs.SetParam(_kBinMeshInstances, "LODTable", _decoratorLODTableBuffer!.SrvIndex);
-                cs.SetParam(_kBinMeshInstances, "MeshRegistry", MeshRegistry.SrvIndex);
-                cs.SetParam(_kBinMeshInstances, "MeshDecoInstance", _meshDecoInstanceBuffer!.SrvIndex);
-                cs.SetUAV(_kBinMeshInstances, "DispatchArgs", _decoDispatchArgsBuffer);
-                cs.SetUAV(_kBinMeshInstances, "SortedMeshInstance", _sortedMeshInstanceBuffer);
-                cs.SetUAV(_kBinMeshInstances, "MeshDrawArgs", _meshDrawArgsBuffer);
-                cs.SetUAV(_kBinMeshInstances, "MeshDrawCount", _meshDrawCountBuffer);
+                cs.SetBuffer(_kBinMeshInstances, "DecoratorSlots", _decoratorSlotsBuffer!);
+                cs.SetBuffer(_kBinMeshInstances, "LODTable", _decoratorLODTableBuffer!);
+                cs.SetPushConstant(_kBinMeshInstances, "MeshRegistry", MeshRegistry.SrvIndex);
+                cs.SetPushConstant(_kBinMeshInstances, "MeshDecoInstanceUAV", _meshDecoInstanceBuffer!.SrvIndex);
+                cs.SetBuffer(_kBinMeshInstances, "DispatchArgsUAV", _decoDispatchArgsBuffer);
+                cs.SetBuffer(_kBinMeshInstances, "SortedMeshInstanceUAV", _sortedMeshInstanceBuffer);
+                cs.SetBuffer(_kBinMeshInstances, "MeshDrawArgsUAV", _meshDrawArgsBuffer);
+                cs.SetBuffer(_kBinMeshInstances, "MeshDrawCountUAV", _meshDrawCountBuffer);
 
                 // SRV indices to embed in draw commands (read by binning kernel, written to each command)
-                cs.SetParam(_kBinMeshInstances, "DrawSortedSRV", _sortedMeshInstanceBuffer!.SrvIndex);
-                cs.SetParam(_kBinMeshInstances, "DrawSlotsSRV", _decoratorSlotsBuffer!.SrvIndex);
-                cs.SetParam(_kBinMeshInstances, "DrawLODSRV", _decoratorLODTableBuffer!.SrvIndex);
-                cs.SetParam(_kBinMeshInstances, "DrawMeshRegSRV", MeshRegistry.SrvIndex);
-                cs.SetParam(_kBinMeshInstances, "DrawMaterialsSRV", Graphics.Material.MaterialsBufferIndex);
+                cs.SetBuffer(_kBinMeshInstances, "DrawSortedSRV", _sortedMeshInstanceBuffer!);
+                cs.SetBuffer(_kBinMeshInstances, "DrawSlotsSRV", _decoratorSlotsBuffer!);
+                cs.SetBuffer(_kBinMeshInstances, "DrawLODSRV", _decoratorLODTableBuffer!);
+                cs.SetPushConstant(_kBinMeshInstances, "DrawMeshRegSRV", MeshRegistry.SrvIndex);
+                cs.SetPushConstant(_kBinMeshInstances, "DrawMaterialsSRV", Graphics.Material.MaterialsBufferIndex);
 
                 cs.Dispatch(_kBinMeshInstances, commandList, 1);
                 commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(null)));
