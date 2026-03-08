@@ -104,6 +104,15 @@ namespace Freefall.Assets
             /// <summary>Blend factor for aligning to terrain slope (0=upright, 1=fully aligned).</summary>
             [ValueRange(-1, 1)]
             public float SlopeBias = 0.0f;
+
+            /// <summary>Tint color for "healthy" instances (multiplicative). Alpha=0 means no tinting.</summary>
+            public Vector4 HealthyColor = new(1, 1, 1, 1);
+
+            /// <summary>Tint color for "dry" instances (multiplicative). Alpha=0 means no tinting.</summary>
+            public Vector4 DryColor = new(1, 1, 1, 1);
+
+            /// <summary>World-space noise frequency for healthy/dry blend. 0 = uniform healthy color.</summary>
+            public float NoiseSpread = 1.0f;
         }
     }
 }

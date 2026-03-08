@@ -17,7 +17,7 @@ ConstantBuffer<PushConstantsData> PushConstants : register(b3);
 #define ControlUAVIdx   GET_INDEX(2)   // UAV: output RWTexture2DArray<uint4>
 #define SlotCountIdx    GET_INDEX(3)   // number of decorator slots
 
-// Must match DecoratorSlot in grass.fx
+// Must match DecoratorSlot in grass.fx / grass_compute.hlsl
 struct DecoratorSlot
 {
     float Density;
@@ -33,6 +33,10 @@ struct DecoratorSlot
     uint _pad0;
     uint Mode;
     uint TextureIdx;
+    float3 HealthyColor;
+    float3 DryColor;
+    float NoiseSpread;
+    uint _colorPad;
 };
 
 // Sampler for density maps — block-compressed textures (BC1) don't support Load()

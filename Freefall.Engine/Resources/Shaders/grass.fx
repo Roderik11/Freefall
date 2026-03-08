@@ -39,6 +39,10 @@ struct DecoratorSlot
     uint _pad0;
     uint Mode;
     uint TextureIdx;
+    float3 HealthyColor;
+    float3 DryColor;
+    float NoiseSpread;
+    uint _colorPad;
 };
 
 struct LODEntry { uint MeshPartId; float MaxDistance; uint MaterialId; uint _pad; };
@@ -125,6 +129,7 @@ struct MSOutput
     float  HeightFrac : TEXCOORD5;
     float2 TerrainUV  : TEXCOORD6;
     nointerpolation float InstanceSeed : TEXCOORD7;
+    nointerpolation uint SlotIdx : TEXCOORD8;
 };
 
 [outputtopology("triangle")]
@@ -244,6 +249,7 @@ void MS(
     o.HeightFrac = saturate(lp.y);
     o.TerrainUV = di.TerrainUV;
     o.InstanceSeed = di.InstanceSeed;
+    o.SlotIdx = di.SlotIdx;
     verts[gtid] = o;
 
     if (vertInQuad < 2)
@@ -286,16 +292,19 @@ PSOutput PS(MSOutput input)
         clip(alpha - 0.15);
 
         // Ground color fade
-        Texture2D BakedAlbedo = ResourceDescriptorHeap[BakedAlbedoIdx];
-        float3 groundColor = BakedAlbedo.SampleLevel(ClampSampler, input.TerrainUV, 0).rgb;
+        //Texture2D BakedAlbedo = ResourceDescriptorHeap[BakedAlbedoIdx];
+        //float3 groundColor = BakedAlbedo.SampleLevel(ClampSampler, input.TerrainUV, 0).rgb;
         float aoFactor = saturate(input.HeightFrac / 0.33);
-
         float brightVar = 0.6 + 0.4 * frac(input.InstanceSeed * 17.31);
         float3 variedBase = baseColor * brightVar;
-        output.Albedo = float4(lerp(groundColor, variedBase, aoFactor), 1.0);
 
-        // Per-pixel normals — use terrain normal directly
-        output.Normal = float4(normalize(input.Normal), 1.0);
+        // Apply decorator color tint
+        StructuredBuffer<DecoratorSlot> psSlots = ResourceDescriptorHeap[DecoratorSlotsIdx];
+        DecoratorSlot psSlot = psSlots[input.SlotIdx];
+        variedBase *= psSlot.HealthyColor;
+
+        output.Albedo = float4(variedBase, 1.0);
+        output.Normal = float4(normalize(input.Normal), 1.0); // terrain normal
     }
     else
     {

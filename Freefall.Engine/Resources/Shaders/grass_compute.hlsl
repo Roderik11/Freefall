@@ -88,6 +88,10 @@ struct DecoratorSlot
     uint _pad0;
     uint Mode;
     uint TextureIdx;
+    float3 HealthyColor;
+    float3 DryColor;
+    float NoiseSpread;
+    uint _colorPad;
 };
 
 struct LODEntry { uint MeshPartId; float MaxDistance; uint MaterialId; uint _pad; };

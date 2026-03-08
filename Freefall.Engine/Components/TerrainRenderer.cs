@@ -1024,6 +1024,11 @@ namespace Freefall.Components
             public uint _pad0;            // unused (was ControlChannel)
             public uint Mode;             // 0=Mesh, 1=Billboard, 2=Cross
             public uint TextureIdx;       // bindless index (billboard/cross)
+            // Color tint (Unity detail prototype healthy/dry colors)
+            public Vector3 HealthyColor;
+            public Vector3 DryColor;
+            public float NoiseSpread;
+            public uint _colorPad;        // pad to 16-byte alignment
         }
 
         [StructLayout(LayoutKind.Sequential)]
@@ -1168,7 +1173,11 @@ namespace Freefall.Components
                         ? slice : 0xFFFFFFFF,
                     _pad0 = 0,
                     Mode = (uint)mode,
-                    TextureIdx = textureIdx
+                    TextureIdx = textureIdx,
+                    HealthyColor = new Vector3(deco.HealthyColor.X, deco.HealthyColor.Y, deco.HealthyColor.Z),
+                    DryColor = new Vector3(deco.DryColor.X, deco.DryColor.Y, deco.DryColor.Z),
+                    NoiseSpread = deco.NoiseSpread,
+                    _colorPad = 0
                 });
 
                 bool hasDensityMap = deco.DensityMap != null && densityMapToSlice.ContainsKey(deco.DensityMap);
@@ -1410,7 +1419,11 @@ namespace Freefall.Components
                     DecoMapSlice = slotIdx < existingDecoSlices.Length ? existingDecoSlices[slotIdx] : 0xFFFFFFFF,
                     _pad0 = 0,
                     Mode = (uint)deco.Mode,
-                    TextureIdx = slotIdx < existingTextureIdx.Length ? existingTextureIdx[slotIdx] : 0
+                    TextureIdx = slotIdx < existingTextureIdx.Length ? existingTextureIdx[slotIdx] : 0,
+                    HealthyColor = new Vector3(deco.HealthyColor.X, deco.HealthyColor.Y, deco.HealthyColor.Z),
+                    DryColor = new Vector3(deco.DryColor.X, deco.DryColor.Y, deco.DryColor.Z),
+                    NoiseSpread = deco.NoiseSpread,
+                    _colorPad = 0
                 });
                 slotIdx++;
             }
@@ -1454,7 +1467,7 @@ namespace Freefall.Components
 
             // Worst-case instances: ~64 per tile max (64 threads/group)
             // But realistically with density, far fewer. Use maxTiles * 8 as reasonable upper bound.
-            _maxDecoInstances = Math.Min(maxTiles * 8, 4 * 1024 * 1024); // cap at 4M
+            _maxDecoInstances = Math.Min(maxTiles * 8, 1024 * 1024); // cap at 1M
 
             _decoInstanceBuffer = GraphicsBuffer.CreateStructured(_maxDecoInstances, 64, srv: true, uav: true); // 64 bytes per DecoInstance
             _instanceCounterBuffer = GraphicsBuffer.CreateRaw(2, uav: true, clearable: true);
