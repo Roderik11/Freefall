@@ -45,9 +45,7 @@ bool IsCellOccluded(float3 worldCenter, float worldRadius)
     if (any(uv < 0.0) || any(uv > 1.0)) return false;
 
     Texture2D<float> hiZ = ResourceDescriptorHeap[HiZSrvIdx];
-    float w, h, levels;
-    hiZ.GetDimensions(0, w, h, levels);
-    float2 mip0Size = float2(w, h);
+    float2 mip0Size = HiZSize;
 
     float projScale = OcclusionProjection._m11;
     projScale = abs(projScale) < 0.001 ? 1.0 : projScale;
@@ -55,7 +53,7 @@ bool IsCellOccluded(float3 worldCenter, float worldRadius)
     float screenRadius = projRadius * mip0Size.y * 0.5;
 
     float mipLevel = ceil(log2(max(screenRadius * 2.0, 1.0)));
-    mipLevel = min(mipLevel, levels - 1.0f);
+    mipLevel = min(mipLevel, float(HiZMipCount) - 1.0f);
 
     uint mip = (uint)mipLevel;
     float2 mipSize = max(float2(1,1), mip0Size / (float)(1u << mip));
@@ -74,58 +72,39 @@ bool IsCellOccluded(float3 worldCenter, float worldRadius)
     return sphereNearestDepth > sampledDepth;
 }
 
-// ─── Push constant slots ───────────────────────────────────────────────────
-// All names must follow XxxIdx = GET_INDEX(N) for FXParser binding discovery
-#define DecoratorSlotsIdx   GET_INDEX(0)
-#define LODTableIdx         GET_INDEX(1)
-#define MeshRegistryIdx     GET_INDEX(2)
-#define HeightmapIdx        GET_INDEX(3)
-#define TerrainSizeXIdx     GET_INDEX(4)
-#define TerrainSizeYIdx     GET_INDEX(5)
-#define MaxHeightIdx        GET_INDEX(6)
-#define CamPosXIdx          GET_INDEX(7)
-#define CamPosYIdx          GET_INDEX(8)
-#define CamPosZIdx          GET_INDEX(9)
-#define TerrainOriginXIdx   GET_INDEX(10)
-#define TerrainOriginYIdx   GET_INDEX(11)
-#define TerrainOriginZIdx   GET_INDEX(12)
-#define DecoControlIdx      GET_INDEX(13)
-#define DecoRadiusIdx       GET_INDEX(14)
-#define TileSizeIdx         GET_INDEX(15)
-#define ControlWidthIdx     GET_INDEX(16)
-#define ControlHeightIdx    GET_INDEX(17)
-#define SlotCountIdx        GET_INDEX(18)
+// ─── Push constants: bindless resource indices ONLY ────────────────────────
+#define DecoratorSlotsIdx   GET_INDEX(0)    // SRV
+#define LODTableIdx         GET_INDEX(1)    // SRV
+#define MeshRegistryIdx     GET_INDEX(2)    // SRV
+#define HeightmapIdx        GET_INDEX(3)    // SRV
+#define DecoControlIdx      GET_INDEX(4)    // SRV
+#define BakedNormalIdx      GET_INDEX(5)    // SRV
+#define BakedNormalUAVIdx   GET_INDEX(6)    // UAV (bake kernel)
+#define DecoMapsIdx         GET_INDEX(7)    // SRV
+#define DecoInstanceIdx     GET_INDEX(8)    // UAV (spawn kernel)
+#define InstanceCounterIdx  GET_INDEX(9)    // UAV
+#define DispatchArgsIdx     GET_INDEX(10)   // UAV (build args kernel)
+#define MeshDecoInstanceIdx GET_INDEX(11)   // UAV (spawn kernel)
 
-// CS-specific UAV/SRV slots
-#define BaseTileXIdx        GET_INDEX(19)   // int as uint: camera-centered grid base X
-#define BaseTileZIdx        GET_INDEX(20)   // int as uint: camera-centered grid base Z
-#define DecoInstanceIdx     GET_INDEX(21)
-#define InstanceCounterIdx  GET_INDEX(22)
-#define MaxInstancesIdx     GET_INDEX(23)
-#define DispatchArgsIdx     GET_INDEX(24)
-#define DecorationDensityIdx GET_INDEX(25)
-#define BakedNormalIdx      GET_INDEX(26)   // SRV for baked normal map
-#define BakedNormalUAVIdx   GET_INDEX(27)   // UAV for baked normal map
-#define DecoMapsIdx         GET_INDEX(28)   // SRV for density map Texture2DArray
-#define CamFwdXIdx          GET_INDEX(29)   // Camera forward direction (normalized XZ)
-#define CamFwdZIdx          GET_INDEX(30)
-#define MeshDecoInstanceIdx GET_INDEX(31)   // UAV: mesh-mode instance output buffer
-
-// Convenience accessors for float params
-#define TerrainSizeX        asfloat(TerrainSizeXIdx)
-#define TerrainSizeY        asfloat(TerrainSizeYIdx)
-#define MaxHeight           asfloat(MaxHeightIdx)
-#define CamPosX             asfloat(CamPosXIdx)
-#define CamPosY             asfloat(CamPosYIdx)
-#define CamPosZ             asfloat(CamPosZIdx)
-#define TerrainOriginX      asfloat(TerrainOriginXIdx)
-#define TerrainOriginY      asfloat(TerrainOriginYIdx)
-#define TerrainOriginZ      asfloat(TerrainOriginZIdx)
-#define DecoRadius          asfloat(DecoRadiusIdx)
-#define TileSize            asfloat(TileSizeIdx)
-#define DecorationDensity   asfloat(DecorationDensityIdx)
-#define CamFwdX             asfloat(CamFwdXIdx)
-#define CamFwdZ             asfloat(CamFwdZIdx)
+// ─── Per-dispatch parameters ───────────────────────────────────────────────
+cbuffer DecoParams : register(b4)
+{
+    float2 TerrainSize;
+    float  MaxHeight;
+    float  DecoRadius;
+    float3 CamPos;
+    float  TileSize;
+    float3 TerrainOrigin;
+    float  DecorationDensity;
+    float2 CamFwd;
+    uint   ControlWidth;
+    uint   ControlHeight;
+    uint   SlotCount;
+    int    BaseTileX;
+    int    BaseTileZ;
+    uint   MaxInstances;
+    uint2  HeightmapSize;
+};
 
 // ─── GPU structs (must match grass.fx and TerrainRenderer.cs) ──────────────
 
@@ -236,8 +215,8 @@ void CS_BakeTerrainNormals(uint3 dtid : SV_DispatchThreadID)
     Texture2D heightTex = ResourceDescriptorHeap[HeightmapIdx];
     RWTexture2D<float2> normalOut = ResourceDescriptorHeap[BakedNormalUAVIdx];
 
-    uint hmW, hmH;
-    heightTex.GetDimensions(hmW, hmH);
+    uint hmW = HeightmapSize.x;
+    uint hmH = HeightmapSize.y;
     if (dtid.x >= hmW || dtid.y >= hmH) return;
 
     float2 uv = (float2(dtid.xy) + 0.5) / float2(hmW, hmH);
@@ -248,7 +227,7 @@ void CS_BakeTerrainNormals(uint3 dtid : SV_DispatchThreadID)
     float hD = heightTex.SampleLevel(HeightSampler, uv + float2(0, -texelStep), 0).r;
     float hU = heightTex.SampleLevel(HeightSampler, uv + float2(0,  texelStep), 0).r;
 
-    float texelWorldSize = TerrainSizeX * texelStep;
+    float texelWorldSize = TerrainSize.x * texelStep;
     float heightScale = MaxHeight / texelWorldSize;
 
     float3 n = normalize(float3(
@@ -278,28 +257,26 @@ void CS_SpawnInstances(uint3 gid : SV_GroupID, uint3 gtid3 : SV_GroupThreadID)
     uint flatThread = gtid3.y * 8 + gtid3.x;  // 0..63
 
     // Map group to world-space cell via base offset (camera-centered grid)
-    int cellX = asint(BaseTileXIdx) + int(gid.x);
-    int cellZ = asint(BaseTileZIdx) + int(gid.y);
+    int cellX = BaseTileX + int(gid.x);
+    int cellZ = BaseTileZ + int(gid.y);
 
-    // Get control texture dimensions directly (match gputerrain.fx approach)
+    // Control texture (dimensions from cbuffer)
     Texture2DArray<uint4> controlTex = ResourceDescriptorHeap[DecoControlIdx];
-    uint ctrlW, ctrlH, ctrlSlices;
-    controlTex.GetDimensions(ctrlW, ctrlH, ctrlSlices);
 
     // Control map texel — same Y-flip as gputerrain.fx debug overlay
     int cx = cellX;
-    int cy = int(ctrlH) - 1 - cellZ;
+    int cy = int(ControlHeight) - 1 - cellZ;
 
     // Check tile validity — no early return before the barrier
     float ts = TileSize;
-    float tileWorldX = TerrainOriginX + (float(cellX) + 0.5) * ts;
-    float tileWorldZ = TerrainOriginY + (float(cellZ) + 0.5) * ts;
-    float3 camPos = float3(CamPosX, CamPosY, CamPosZ);
+    float tileWorldX = TerrainOrigin.x + (float(cellX) + 0.5) * ts;
+    float tileWorldZ = TerrainOrigin.y + (float(cellZ) + 0.5) * ts;
+    float3 camPos = CamPos;
     float dx2 = tileWorldX - camPos.x;
     float dz2 = tileWorldZ - camPos.z;
     float maxR = DecoRadius + ts;
 
-    bool tileValid = (cx >= 0 && cx < int(ctrlW) && cy >= 0 && cy < int(ctrlH))
+    bool tileValid = (cx >= 0 && cx < int(ControlWidth) && cy >= 0 && cy < int(ControlHeight))
                   && (dx2 * dx2 + dz2 * dz2 <= maxR * maxR);
 
     // Half-space cull: reject tiles behind the camera.
@@ -308,7 +285,7 @@ void CS_SpawnInstances(uint3 gid : SV_GroupID, uint3 gtid3 : SV_GroupThreadID)
     {
         float len = sqrt(dx2 * dx2 + dz2 * dz2);
         if (len > ts)   // skip tiles directly under the camera
-            tileValid = (dx2 * CamFwdX + dz2 * CamFwdZ) / len > -0.2;
+            tileValid = (dx2 * CamFwd.x + dz2 * CamFwd.y) / len > -0.2;
     }
 
     // ── Thread 0 reads BAKED control texture and populates groupshared ──
@@ -325,8 +302,8 @@ void CS_SpawnInstances(uint3 gid : SV_GroupID, uint3 gtid3 : SV_GroupThreadID)
         {
             Texture2D heightTex2 = ResourceDescriptorHeap[HeightmapIdx];
             float2 cellUV = float2(
-                (tileWorldX - TerrainOriginX) / TerrainSizeX,
-                (tileWorldZ - TerrainOriginY) / TerrainSizeY
+                (tileWorldX - TerrainOrigin.x) / TerrainSize.x,
+                (tileWorldZ - TerrainOrigin.y) / TerrainSize.y
             );
             float h = heightTex2.SampleLevel(HeightSampler, cellUV, 2).r * MaxHeight;
             float3 sphereCenter = float3(tileWorldX, h, tileWorldZ);
@@ -365,18 +342,18 @@ void CS_SpawnInstances(uint3 gid : SV_GroupID, uint3 gtid3 : SV_GroupThreadID)
     StructuredBuffer<LODEntry>      lodTbl = ResourceDescriptorHeap[LODTableIdx];
 
     float range = DecoRadius;
-    float tileOriginX = TerrainOriginX + float(cellX) * ts;
-    float tileOriginZ = TerrainOriginY + float(cellZ) * ts;
+    float tileOriginX = TerrainOrigin.x + float(cellX) * ts;
+    float tileOriginZ = TerrainOrigin.y + float(cellZ) * ts;
 
     RWStructuredBuffer<DecoInstance> outBuffer = ResourceDescriptorHeap[DecoInstanceIdx];
     RWByteAddressBuffer instCounter = ResourceDescriptorHeap[InstanceCounterIdx];
-    uint maxInst = MaxInstancesIdx;
+    uint maxInst = MaxInstances;
 
     Texture2D heightTex = ResourceDescriptorHeap[HeightmapIdx];
     Texture2D<float2> bakedNormals = ResourceDescriptorHeap[BakedNormalIdx];
 
-    // Iterate over collected decorators (from groupshared)
-    [unroll] for (uint ci = 0; ci < 8; ci++)
+    // Iterate over collected decorators (dynamic loop — all threads share gs_ctrl, no divergence)
+    for (uint ci = 0; ci < 8; ci++)
     {
         uint packed = gs_ctrl[ci];
         uint slotIdx = packed >> 8;
@@ -386,8 +363,8 @@ void CS_SpawnInstances(uint3 gid : SV_GroupID, uint3 gtid3 : SV_GroupThreadID)
         DecoratorSlot slot = slots[slotIdx];
 
         // Weight is 0-255 from density map; normalize to 0-1, then scale by max instances per tile
-        float normalizedWeight = float(weight) / 255.0;
-        uint decoInstCount = max(1u, min(64u, (uint)(normalizedWeight * 64.0 * slot.Density * DecorationDensity + 0.5)));
+        float cellWeight = float(weight) / 255.0;
+        uint decoInstCount = max(1u, min(64u, (uint)(cellWeight * 64.0 * slot.Density * DecorationDensity + 0.5)));
 
         // Stride loop: 64 threads cooperate to spawn decoInstCount instances
         for (uint instanceIdx = flatThread; instanceIdx < decoInstCount; instanceIdx += 64)
@@ -404,18 +381,19 @@ void CS_SpawnInstances(uint3 gid : SV_GroupID, uint3 gtid3 : SV_GroupThreadID)
 
             // Terrain UV
             float2 texelUV = float2(
-                (wx - TerrainOriginX) / TerrainSizeX,
-                (wz - TerrainOriginY) / TerrainSizeY
+                (wx - TerrainOrigin.x) / TerrainSize.x,
+                (wz - TerrainOrigin.y) / TerrainSize.y
             );
             if (texelUV.x < 0 || texelUV.x > 1 || texelUV.y < 0 || texelUV.y > 1) continue;
 
             // ── Heightmap sample ──
             float h = heightTex.SampleLevel(HeightSampler, texelUV, 0).r;
-            float3 instancePos = float3(wx, TerrainOriginZ + h * MaxHeight, wz);
+            float3 instancePos = float3(wx, TerrainOrigin.z + h * MaxHeight, wz);
 
-            // Distance cull
-            float camDist = distance(instancePos, camPos);
-            if (camDist >= range) continue;
+            // Distance cull (squared — avoids sqrt for rejected instances)
+            float3 toCam = instancePos - camPos;
+            float camDistSq = dot(toCam, toCam);
+            if (camDistSq >= range * range) continue;
 
             // ── Terrain normal (R16G16_SNORM — already [-1,1]) ──
             float2 nxz = bakedNormals.SampleLevel(ClampSampler, texelUV, 0).rg;
@@ -434,7 +412,6 @@ void CS_SpawnInstances(uint3 gid : SV_GroupID, uint3 gtid3 : SV_GroupThreadID)
             //if (lod >= slot.LODCount) continue;
 
             // ── Per-instance scale & rotation ──
-            float cellWeight = weight / 255.0;
             float2 seed = instanceSeed + tileOrig * 0.0137;
             float densityBias = lerp(0.3, 1.0, cellWeight);
             float randH = hash21(seed + 33.7);
@@ -444,6 +421,7 @@ void CS_SpawnInstances(uint3 gid : SV_GroupID, uint3 gtid3 : SV_GroupThreadID)
 
             // Distance fade: smoothly shrink in the last 25% of range
             float fadeStart = range * 0.85;
+            float camDist = sqrt(camDistSq);
             float fadeFactor = smoothstep(0.0, 1.0, (range - camDist) / (range - fadeStart));
             scaleH *= fadeFactor;
             scaleW *= fadeFactor;
@@ -496,7 +474,7 @@ void CS_BuildDrawArgs(uint3 dtid : SV_DispatchThreadID)
 {
     RWByteAddressBuffer instCounter = ResourceDescriptorHeap[InstanceCounterIdx];
     uint instanceCount = instCounter.Load(0);
-    instanceCount = min(instanceCount, MaxInstancesIdx);
+    instanceCount = min(instanceCount, MaxInstances);
 
     // Write DispatchMesh indirect args: (groupsX, groupsY, groupsZ)
     // Each MS group handles up to 16 instances (128 threads / 8 verts per instance)
@@ -508,7 +486,7 @@ void CS_BuildDrawArgs(uint3 dtid : SV_DispatchThreadID)
     argsBuffer.Store(8, 1u);
     // Store mesh instance count at offset 12 for CS_BinMeshInstances
     uint meshCount = instCounter.Load(4);
-    meshCount = min(meshCount, MaxInstancesIdx);
+    meshCount = min(meshCount, MaxInstances);
     argsBuffer.Store(12, meshCount);
 }
 
@@ -535,19 +513,17 @@ void CS_BuildDrawArgs(uint3 dtid : SV_DispatchThreadID)
 // ═══════════════════════════════════════════════════════════════════════════
 
 // Additional push constant slots for binning (set per-dispatch)
-// Reuse existing slots that aren't needed during binning:
-// BaseTileX(19), BaseTileZ(20) are only used by CS_SpawnInstances
-#define SortedMeshInstanceIdx GET_INDEX(19)
-#define MeshDrawArgsIdx       GET_INDEX(20)
-#define MeshDrawCountIdx      GET_INDEX(22)  // reuse InstanceCounterIdx slot
+// Use slots 12+ which are free after the 12 resource indices (0-11)
+#define SortedMeshInstanceIdx GET_INDEX(12)
+#define MeshDrawArgsIdx       GET_INDEX(13)
+#define MeshDrawCountIdx      GET_INDEX(14)
 
 // SRV indices to embed in each draw command's root constants (slots 4-15 of grass_mesh.fx)
-// Reuse spawn-only slots for passing these into the binning kernel:
-#define DrawSortedSRVIdx      GET_INDEX(7)   // -> draw cmd slot 4: SortedInstancesIdx
-#define DrawSlotsSRVIdx       GET_INDEX(8)   // -> draw cmd slot 5: DecoratorSlotsIdx
-#define DrawLODSRVIdx         GET_INDEX(9)   // -> draw cmd slot 6: LODTableIdx
-#define DrawMeshRegSRVIdx     GET_INDEX(10)  // -> draw cmd slot 7: MeshRegistryIdx
-#define DrawMaterialsSRVIdx   GET_INDEX(11)  // -> draw cmd slot 14: MaterialsIdx
+#define DrawSortedSRVIdx      GET_INDEX(15)  // -> draw cmd slot 4: SortedInstancesIdx
+#define DrawSlotsSRVIdx       GET_INDEX(16)  // -> draw cmd slot 5: DecoratorSlotsIdx
+#define DrawLODSRVIdx         GET_INDEX(17)  // -> draw cmd slot 6: LODTableIdx
+#define DrawMeshRegSRVIdx     GET_INDEX(18)  // -> draw cmd slot 7: MeshRegistryIdx
+#define DrawMaterialsSRVIdx   GET_INDEX(19)  // -> draw cmd slot 14: MaterialsIdx
 
 #define MAX_MESH_TYPES 32
 

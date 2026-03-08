@@ -1569,9 +1569,9 @@ namespace Freefall.Components
 
             _grassCS!.Set(_kBakeNormals, "Heightmap", Terrain.Heightmap.BindlessIndex);
             _grassCS.Set(_kBakeNormals, "BakedNormalUAV", _bakedNormalUAV);
-            _grassCS.Set(_kBakeNormals, "TerrainSizeX", Terrain.TerrainSize.X);
-            _grassCS.Set(_kBakeNormals, "TerrainSizeY", Terrain.TerrainSize.Y);
-            _grassCS.Set(_kBakeNormals, "MaxHeight", Terrain.MaxHeight);
+            _grassCS.SetParam("TerrainSize", new Vector2(Terrain.TerrainSize.X, Terrain.TerrainSize.Y));
+            _grassCS.SetParam("MaxHeight", Terrain.MaxHeight);
+            _grassCS.SetParam("HeightmapSize", new Vortice.Mathematics.UInt2((uint)hmW, (uint)hmH));
 
             uint groupsX = (uint)((hmW + 7) / 8);
             uint groupsY = (uint)((hmH + 7) / 8);
@@ -1628,26 +1628,35 @@ namespace Freefall.Components
                 _instanceCounterBuffer.ClearUAV(commandList, new Vortice.Mathematics.Int4(0, 0, 0, 0));
                 commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(null)));
 
-                // ── Shared push constants ──
+                // ── Push constants: bindless resource indices only ──
                 cs.Set("DecoratorSlots", _decoratorSlotsBuffer!.SrvIndex);
                 cs.Set("LODTable", _decoratorLODTableBuffer!.SrvIndex);
                 cs.Set("MeshRegistry", MeshRegistry.SrvIndex);
                 cs.Set("Heightmap", Terrain.Heightmap?.BindlessIndex ?? 0u);
-                cs.Set("TerrainSizeX", Terrain.TerrainSize.X);
-                cs.Set("TerrainSizeY", Terrain.TerrainSize.Y);
-                cs.Set("MaxHeight", Terrain.MaxHeight);
-                cs.Set("CamPosX", camPos.X);
-                cs.Set("CamPosY", camPos.Y);
-                cs.Set("CamPosZ", camPos.Z);
-                cs.Set("TerrainOriginX", Transform.WorldPosition.X);
-                cs.Set("TerrainOriginY", Transform.WorldPosition.Z);
-                cs.Set("TerrainOriginZ", Transform.WorldPosition.Y);
                 cs.Set("DecoControl", _decoControlSRV);
-                cs.Set("DecoRadius", range);
-                cs.Set("TileSize", tileSize);
-                cs.Set("ControlWidth", (uint)controlW);
-                cs.Set("ControlHeight", (uint)controlH);
-                cs.Set("SlotCount", (uint)Terrain.Decorations.Count);
+                cs.Set("BakedNormal", _bakedNormalSRV);
+                cs.Set("DecoMaps", DecoMapsArray?.BindlessIndex ?? 0u);
+
+                // ── cbuffer DecoParams ──
+                cs.SetParam("TerrainSize", new Vector2(Terrain.TerrainSize.X, Terrain.TerrainSize.Y));
+                cs.SetParam("MaxHeight", Terrain.MaxHeight);
+                cs.SetParam("DecoRadius", range);
+                cs.SetParam("CamPos", camPos);
+                cs.SetParam("TileSize", tileSize);
+                cs.SetParam("TerrainOrigin", new Vector3(Transform.WorldPosition.X, Transform.WorldPosition.Z, Transform.WorldPosition.Y));
+                cs.SetParam("DecorationDensity", Terrain.DecorationDensity);
+
+                // Camera forward direction for half-space culling (normalized XZ)
+                var camFwd = Camera.Main?.Transform?.Forward ?? Vector3.UnitZ;
+                float fwdLen = MathF.Sqrt(camFwd.X * camFwd.X + camFwd.Z * camFwd.Z);
+                if (fwdLen > 0.001f) { camFwd.X /= fwdLen; camFwd.Z /= fwdLen; }
+                cs.SetParam("CamFwd", new Vector2(camFwd.X, camFwd.Z));
+
+                cs.SetParam("ControlWidth", (uint)controlW);
+                cs.SetParam("ControlHeight", (uint)controlH);
+                cs.SetParam("SlotCount", (uint)Terrain.Decorations.Count);
+                var hmDesc2 = Terrain.Heightmap!.Native.Description;
+                cs.SetParam("HeightmapSize", new Vortice.Mathematics.UInt2((uint)hmDesc2.Width, (uint)hmDesc2.Height));
 
                 // ── Camera-centered grid base tile ──
                 int camTileX = (int)MathF.Floor((camPos.X - Transform.WorldPosition.X) / tileSize);
@@ -1656,26 +1665,17 @@ namespace Freefall.Components
                 int baseTileX = camTileX - N / 2;
                 int baseTileZ = camTileZ - N / 2;
 
-                cs.Set(_kSpawnInstances, "BaseTileX", unchecked((uint)baseTileX));
-                cs.Set(_kSpawnInstances, "BaseTileZ", unchecked((uint)baseTileZ));
+                cs.SetParam("BaseTileX", baseTileX);
+                cs.SetParam("BaseTileZ", baseTileZ);
+                cs.SetParam("MaxInstances", (uint)_maxDecoInstances);
+
+                // ── Per-kernel push constants (resource indices only) ──
                 cs.SetUAV(_kSpawnInstances, "DecoInstance", _decoInstanceBuffer);
                 cs.SetUAV(_kSpawnInstances, "InstanceCounter", _instanceCounterBuffer);
-                cs.Set(_kSpawnInstances, "MaxInstances", (uint)_maxDecoInstances);
-                cs.Set(_kSpawnInstances, "DecorationDensity", Terrain.DecorationDensity);
-                cs.Set(_kSpawnInstances, "BakedNormal", _bakedNormalSRV);
-                cs.Set(_kSpawnInstances, "DecoMaps", DecoMapsArray?.BindlessIndex ?? 0u);
-
-                // Camera forward direction for half-space culling (normalized XZ)
-                var camFwd = Camera.Main?.Transform?.Forward ?? Vector3.UnitZ;
-                float fwdLen = MathF.Sqrt(camFwd.X * camFwd.X + camFwd.Z * camFwd.Z);
-                if (fwdLen > 0.001f) { camFwd.X /= fwdLen; camFwd.Z /= fwdLen; }
-                cs.Set(_kSpawnInstances, "CamFwdX", camFwd.X);
-                cs.Set(_kSpawnInstances, "CamFwdZ", camFwd.Z);
                 cs.SetUAV(_kSpawnInstances, "MeshDecoInstance", _meshDecoInstanceBuffer);
 
                 cs.SetUAV(_kBuildDecoDrawArgs, "InstanceCounter", _instanceCounterBuffer);
                 cs.SetUAV(_kBuildDecoDrawArgs, "DispatchArgs", _decoDispatchArgsBuffer);
-                cs.Set(_kBuildDecoDrawArgs, "MaxInstances", (uint)_maxDecoInstances);
 
                 // ── Stage 1: CS_SpawnInstances (single-pass, camera-centered grid) ──
                 // Bind Hi-Z occlusion cbuffer (same _hizParamBuffers used by terrain quadtree)

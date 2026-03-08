@@ -331,7 +331,7 @@ namespace Freefall.Graphics
 
                 int rootSlot = bindDesc.BindPoint switch
                 {
-                    // b4 → root slot 4, etc. (extend as needed)
+                    4 => 4,  // b4 → root slot 4 (TextureIndices / custom cbuffers)
                     _ => -1
                 };
 
