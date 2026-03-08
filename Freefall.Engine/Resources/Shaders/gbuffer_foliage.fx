@@ -122,9 +122,10 @@ PSOutput PS(VSOutput input, bool isFrontFace : SV_IsFrontFace)
     float alphaThreshold = lerp(0.5, 0.15, saturate((dist - 30.0) / 50.0));
     clip(color.a - alphaThreshold);
 
-    // Uniform upward normal for foliage — no backface flip needed
-    // Both sides of each leaf card should receive equal lighting
-    float3 N = float3(0, 1, 0);
+    // Use interpolated dome normal from VS — provides directional response
+    // while still being smoothed enough to avoid harsh self-shadowing
+    // No backface flip: both sides of each leaf card should receive equal lighting
+    float3 N = normalize(input.Normal);
 
     // Subsurface scattering hint: store translucency in albedo alpha
     // The directional light shader can use this for wrap lighting

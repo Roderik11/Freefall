@@ -45,8 +45,8 @@ namespace Freefall.Graphics
         private uint _spriteBufferBindlessIndex;
         private int _bufferCapacity;
 
-        // Scissor rect (pixel coords)
-        public RectI Scissor;
+        // Scissor rect (pixel coords) — initialized to max so soft clipping defaults to fully open
+        public RectI Scissor = new RectI(0, 0, int.MaxValue, int.MaxValue);
 
         // Line width in pixels
         public float LineWidth = 1;
@@ -199,8 +199,7 @@ namespace Freefall.Graphics
         /// </summary>
         public void Draw(int x, int y, int width, int height, RectF rect, Color4 color, uint textureIndex, int texWidth = 0, int texHeight = 0)
         {
-            // CPU-side scissor clipping
-            if (Scissor.Right > Scissor.Left && Scissor.Bottom > Scissor.Top)
+            // CPU-side scissor clipping (always applied, matching Apex behavior)
             {
                 float fx = rect.width / width;
                 float fy = rect.height / height;

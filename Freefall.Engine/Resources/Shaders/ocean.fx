@@ -328,8 +328,8 @@ PSOutput PS(DSOutput input)
         float scale = tileScales[i];
         float2 uv = RotateUV(worldXZ, angle) * scale;
 
-        // Sample displacement (wave height + foam) and slope in one pass
-        float4 disp = dispTex.Sample(OceanSampler, float3(uv, i));
+        // Displacement at mip 0 for crisp foam (alpha channel)
+        float4 disp = dispTex.SampleLevel(OceanSampler, float3(uv, i), 0);
         float2 slope = slopeTex.Sample(OceanSampler, float3(uv, i)).xy;
 
         // Counter-rotate slopes back to world space
@@ -398,8 +398,10 @@ PSOutput PS(DSOutput input)
     color = max(0.0, color);
 
     // ── Foam from FFT Jacobian ──
-    float foam = saturate(totalFoam);
-    float3 foamColor = float3(0.35, 0.32, 0.28);
+    // smoothstep softens the Jacobian transitions — without it, ACES tonemapping
+    // compresses the mid-range and makes the 512² foam texture look blocky.
+    float foam = smoothstep(0.0, 1.0, saturate(totalFoam));
+    float3 foamColor = float3(0.20, 0.18, 0.16); // scaled for HDR (PI intensity)
     float3 foamLit = foamColor * (0.3 + 0.7 * NdotL) * sunRadiance;
     color = lerp(color, foamLit, foam);
 
@@ -463,12 +465,12 @@ PSOutput PS(DSOutput input)
     // Note: ocean fog is handled by the horizon haze above (same sky-derived color).
     // No separate FOG() call — that would double-fog the surface.
 
-    // ── Tone mapping + gamma — match deferred composition pipeline ──
-    // ACES Filmic (Narkowicz 2015)
-    float3 tm = color;
-    color = (tm * (2.51 * tm + 0.03)) / (tm * (2.43 * tm + 0.59) + 0.14);
+    // ── Contrast + gamma ──
+    // No ACES — it crushes 512² foam gradients into blocky transitions.
+    // Simple contrast curve to deepen darks without crushing foam detail.
     color = saturate(color);
-    color = pow(abs(color), 1.0 / 2.2);
+    color = pow(color, 1.2);
+    color = pow(color, 1.0 / 2.2);
 
     output.Color = float4(color, 1.0);
 

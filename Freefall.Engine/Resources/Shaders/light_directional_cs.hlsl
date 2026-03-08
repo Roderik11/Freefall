@@ -304,7 +304,7 @@ void CSDirectionalLight(uint3 dispatchThreadId : SV_DispatchThreadID)
     
     if (isVegetation)
     {
-        float wrap = saturate(rawNdotL * 0.3 + 0.5);
+        float wrap = saturate(rawNdotL * 0.5 + 0.5);
         float vegShadow = lerp(1.0, shadowFactor, 0.85);
         
         float3 radiance = LightColor * LightIntensity * 3.14159 * wrap * vegShadow;

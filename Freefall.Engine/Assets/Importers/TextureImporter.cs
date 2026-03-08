@@ -35,10 +35,14 @@ namespace Freefall.Assets.Importers
     public class TextureImporter : IImporter
     {
         public Type AssetType => typeof(Graphics.Texture);
+       
         // ── Configurable import settings (editable in inspector) ──
         public TextureFormat Format = TextureFormat.BC7_UNORM;
         public bool GenerateMips = true;
         public bool sRGB = true;
+
+        public bool IsNormalMap = false;
+        public bool AlphaFromGrayscale = false;
 
         // Suffixes that indicate linear (non-color) data maps
         private static readonly string[] LinearSuffixes = {
