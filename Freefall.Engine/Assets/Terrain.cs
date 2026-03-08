@@ -91,9 +91,10 @@ namespace Freefall.Assets
             public Texture DensityMap;
 
             /// <summary>Instances per square meter.</summary>
-            [ValueRange(1, 20)]
-            public float Density = 2.0f;
+            [ValueRange(.1f, 10)]
+            public float Density = 1.0f;
 
+            [ValueRange(0f, 1f)]
             public float Weight = 1.0f;
             public Vector2 HeightRange = new(0.3f, 0.6f);
             public Vector2 WidthRange = new(0.2f, 0.4f);
@@ -112,6 +113,7 @@ namespace Freefall.Assets
             public Vector4 DryColor = new(1, 1, 1, 1);
 
             /// <summary>World-space noise frequency for healthy/dry blend. 0 = uniform healthy color.</summary>
+            [ValueRange(0f, 1f)]
             public float NoiseSpread = 1.0f;
         }
     }

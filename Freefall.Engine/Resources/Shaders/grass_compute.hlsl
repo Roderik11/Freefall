@@ -12,11 +12,67 @@
 #pragma kernel CS_BakeTerrainNormals
 #pragma kernel CS_SpawnInstances
 #pragma kernel CS_BuildDrawArgs
+#pragma kernel CS_BinMeshInstances
 
 // Push constants (same layout as grass.fx common.fx)
 struct PushConstantsData { uint4 indices[8]; };
 ConstantBuffer<PushConstantsData> PushConstants : register(b3);
 #define GET_INDEX(i) PushConstants.indices[i/4][i%4]
+
+// Hi-Z occlusion parameters (root slot 2 → register b1, shared with terrain_quadtree.hlsl)
+cbuffer HiZParams : register(b1)
+{
+    row_major float4x4 OcclusionProjection;
+    uint HiZSrvIdx;
+    float2 HiZSize;
+    uint HiZMipCount;
+    float NearPlane;
+    uint CullStatsUAVIdx;
+    uint FrustumDebugMode;
+    float _hiZPad;
+};
+
+// Hi-Z occlusion test: project bounding sphere, pick mip, sample depth pyramid.
+// Returns true if the sphere is FULLY behind solid geometry (should be culled).
+bool IsCellOccluded(float3 worldCenter, float worldRadius)
+{
+    if (HiZSrvIdx == 0) return false;
+
+    float4 clipCenter = mul(float4(worldCenter, 1.0), OcclusionProjection);
+    float3 ndc = clipCenter.xyz / clipCenter.w;
+    float2 uv = ndc.xy * float2(0.5, -0.5) + 0.5;
+
+    if (any(uv < 0.0) || any(uv > 1.0)) return false;
+
+    Texture2D<float> hiZ = ResourceDescriptorHeap[HiZSrvIdx];
+    float w, h, levels;
+    hiZ.GetDimensions(0, w, h, levels);
+    float2 mip0Size = float2(w, h);
+
+    float projScale = OcclusionProjection._m11;
+    projScale = abs(projScale) < 0.001 ? 1.0 : projScale;
+    float projRadius = (worldRadius * projScale) / clipCenter.w;
+    float screenRadius = projRadius * mip0Size.y * 0.5;
+
+    float mipLevel = ceil(log2(max(screenRadius * 2.0, 1.0)));
+    mipLevel = min(mipLevel, levels - 1.0f);
+
+    uint mip = (uint)mipLevel;
+    float2 mipSize = max(float2(1,1), mip0Size / (float)(1u << mip));
+
+    float2 texCoordFloat = uv * mipSize - 0.5;
+    int2 baseCoord = int2(texCoordFloat);
+    int2 maxCoord = int2(mipSize) - 1;
+
+    float d0 = hiZ.Load(int3(clamp(baseCoord,             int2(0,0), maxCoord), mip));
+    float d1 = hiZ.Load(int3(clamp(baseCoord + int2(1,0), int2(0,0), maxCoord), mip));
+    float d2 = hiZ.Load(int3(clamp(baseCoord + int2(0,1), int2(0,0), maxCoord), mip));
+    float d3 = hiZ.Load(int3(clamp(baseCoord + int2(1,1), int2(0,0), maxCoord), mip));
+
+    float sampledDepth = max(max(d0, d1), max(d2, d3));
+    float sphereNearestDepth = clipCenter.w - worldRadius;
+    return sphereNearestDepth > sampledDepth;
+}
 
 // ─── Push constant slots ───────────────────────────────────────────────────
 // All names must follow XxxIdx = GET_INDEX(N) for FXParser binding discovery
@@ -53,6 +109,7 @@ ConstantBuffer<PushConstantsData> PushConstants : register(b3);
 #define DecoMapsIdx         GET_INDEX(28)   // SRV for density map Texture2DArray
 #define CamFwdXIdx          GET_INDEX(29)   // Camera forward direction (normalized XZ)
 #define CamFwdZIdx          GET_INDEX(30)
+#define MeshDecoInstanceIdx GET_INDEX(31)   // UAV: mesh-mode instance output buffer
 
 // Convenience accessors for float params
 #define TerrainSizeX        asfloat(TerrainSizeXIdx)
@@ -263,6 +320,21 @@ void CS_SpawnInstances(uint3 gid : SV_GroupID, uint3 gtid3 : SV_GroupThreadID)
         gs_tileActive = false;
         [unroll] for (uint k = 0; k < 8; k++) gs_ctrl[k] = 0;
 
+        // Hi-Z occlusion cull (thread 0 only): skip cells fully behind solid geometry
+        if (tileValid && HiZSrvIdx != 0)
+        {
+            Texture2D heightTex2 = ResourceDescriptorHeap[HeightmapIdx];
+            float2 cellUV = float2(
+                (tileWorldX - TerrainOriginX) / TerrainSizeX,
+                (tileWorldZ - TerrainOriginY) / TerrainSizeY
+            );
+            float h = heightTex2.SampleLevel(HeightSampler, cellUV, 2).r * MaxHeight;
+            float3 sphereCenter = float3(tileWorldX, h, tileWorldZ);
+            float sphereRadius = ts * 0.707 + MaxHeight * 0.05;
+            if (IsCellOccluded(sphereCenter, sphereRadius))
+                tileValid = false;
+        }
+
         if (tileValid)
         {
             // Load baked control data (RGBA16_UINT is uncompressed — Load() is valid)
@@ -278,9 +350,7 @@ void CS_SpawnInstances(uint3 gid : SV_GroupID, uint3 gtid3 : SV_GroupThreadID)
 
                 if (slotIdx == 255 || weight == 0) continue;
 
-                // Filter: only billboard/cross modes for this pipeline
                 DecoratorSlot slot = slots[slotIdx];
-                if (slot.Mode == MODE_MESH) continue;
 
                 gs_ctrl[activeIdx] = packed;
                 activeIdx++;
@@ -314,9 +384,6 @@ void CS_SpawnInstances(uint3 gid : SV_GroupID, uint3 gtid3 : SV_GroupThreadID)
         if (slotIdx == 255 || weight == 0) break;
 
         DecoratorSlot slot = slots[slotIdx];
-
-        // Skip mesh-mode decorators — rendered by separate VS/PS pipeline
-        if (slot.Mode == MODE_MESH) continue;
 
         // Weight is 0-255 from density map; normalize to 0-1, then scale by max instances per tile
         float normalizedWeight = float(weight) / 255.0;
@@ -385,10 +452,6 @@ void CS_SpawnInstances(uint3 gid : SV_GroupID, uint3 gtid3 : SV_GroupThreadID)
             float instanceSeedVal = hash21(seed + 99.1);
 
             // ── Append to output ──
-            uint outIdx;
-            instCounter.InterlockedAdd(0, 1, outIdx);
-            if (outIdx >= maxInst) continue;
-
             DecoInstance di;
             di.Position = instancePos;
             di.Rotation = instanceRot;
@@ -400,7 +463,24 @@ void CS_SpawnInstances(uint3 gid : SV_GroupID, uint3 gtid3 : SV_GroupThreadID)
             di.LOD = lod;
             di.InstanceSeed = instanceSeedVal;
             di._pad = 0;
-            outBuffer[outIdx] = di;
+
+            if (slot.Mode == MODE_MESH)
+            {
+                // Mesh instances → separate buffer, counter at offset 4
+                uint outIdx;
+                instCounter.InterlockedAdd(4, 1, outIdx);
+                if (outIdx >= maxInst) continue;
+                RWStructuredBuffer<DecoInstance> meshBuffer = ResourceDescriptorHeap[MeshDecoInstanceIdx];
+                meshBuffer[outIdx] = di;
+            }
+            else
+            {
+                // Billboard/Cross → main buffer, counter at offset 0
+                uint outIdx;
+                instCounter.InterlockedAdd(0, 1, outIdx);
+                if (outIdx >= maxInst) continue;
+                outBuffer[outIdx] = di;
+            }
         }
     }
 }
@@ -426,4 +506,201 @@ void CS_BuildDrawArgs(uint3 dtid : SV_DispatchThreadID)
     argsBuffer.Store(0, groupsX);
     argsBuffer.Store(4, 1u);
     argsBuffer.Store(8, 1u);
+    // Store mesh instance count at offset 12 for CS_BinMeshInstances
+    uint meshCount = instCounter.Load(4);
+    meshCount = min(meshCount, MaxInstancesIdx);
+    argsBuffer.Store(12, meshCount);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Stage 4: CS_BinMeshInstances
+//
+// Groups mesh-mode instances by meshPartId, writes sorted instances and
+// builds per-mesh-type DrawInstanced indirect args for BindlessCommandSignature.
+//
+// Input:  unsorted MeshDecoInstance buffer + mesh instance count
+// Output: SortedMeshInstance buffer + BindlessDrawCommand args buffer + draw count
+//
+// BindlessCommandSignature command layout (72 bytes):
+//   [0..55]  14 uint root constants (slots 2-15 of push constants)
+//   [56..71] DrawInstancedArguments { VertexCount, InstanceCount, StartVertex, StartInstance }
+//
+// Push constants (reuses same register b3):
+//   MeshDecoInstanceIdx (31) = unsorted mesh instance SRV
+//   Binning-specific slots set per-dispatch from C#:
+//     DispatchArgsIdx (24)   = reused: read mesh count from offset 12
+//     SortedMeshInstanceIdx  = new: UAV for sorted output
+//     MeshDrawArgsIdx        = new: UAV for bindless draw commands
+//     MeshDrawCountIdx       = new: UAV for draw count (1 uint)
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Additional push constant slots for binning (set per-dispatch)
+// Reuse existing slots that aren't needed during binning:
+// BaseTileX(19), BaseTileZ(20) are only used by CS_SpawnInstances
+#define SortedMeshInstanceIdx GET_INDEX(19)
+#define MeshDrawArgsIdx       GET_INDEX(20)
+#define MeshDrawCountIdx      GET_INDEX(22)  // reuse InstanceCounterIdx slot
+
+// SRV indices to embed in each draw command's root constants (slots 4-15 of grass_mesh.fx)
+// Reuse spawn-only slots for passing these into the binning kernel:
+#define DrawSortedSRVIdx      GET_INDEX(7)   // -> draw cmd slot 4: SortedInstancesIdx
+#define DrawSlotsSRVIdx       GET_INDEX(8)   // -> draw cmd slot 5: DecoratorSlotsIdx
+#define DrawLODSRVIdx         GET_INDEX(9)   // -> draw cmd slot 6: LODTableIdx
+#define DrawMeshRegSRVIdx     GET_INDEX(10)  // -> draw cmd slot 7: MeshRegistryIdx
+#define DrawMaterialsSRVIdx   GET_INDEX(11)  // -> draw cmd slot 14: MaterialsIdx
+
+#define MAX_MESH_TYPES 32
+
+groupshared uint gs_typeCounts[MAX_MESH_TYPES];
+groupshared uint gs_typePartId[MAX_MESH_TYPES];
+groupshared uint gs_typeBaseOffset[MAX_MESH_TYPES];
+groupshared uint gs_numTypes;
+groupshared uint gs_meshCount;
+
+[numthreads(64, 1, 1)]
+void CS_BinMeshInstances(uint gtid : SV_GroupThreadID)
+{
+    StructuredBuffer<DecoratorSlot> slots = ResourceDescriptorHeap[DecoratorSlotsIdx];
+    StructuredBuffer<LODEntry> lodTbl = ResourceDescriptorHeap[LODTableIdx];
+    StructuredBuffer<MeshPartEntry> meshReg = ResourceDescriptorHeap[MeshRegistryIdx];
+
+    // Read mesh instance count from argsBuffer offset 12 (written by CS_BuildDrawArgs)
+    RWByteAddressBuffer argsBuffer = ResourceDescriptorHeap[DispatchArgsIdx];
+    if (gtid == 0)
+    {
+        gs_meshCount = argsBuffer.Load(12);
+        gs_numTypes = 0;
+        for (uint i = 0; i < MAX_MESH_TYPES; i++)
+        {
+            gs_typeCounts[i] = 0;
+            gs_typePartId[i] = 0xFFFFFFFF;
+        }
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    uint meshCount = gs_meshCount;
+    if (meshCount == 0) return;
+
+    StructuredBuffer<DecoInstance> meshInstances = ResourceDescriptorHeap[MeshDecoInstanceIdx];
+
+    // Pass 1: Count instances per meshPartId
+    // (single workgroup iterates all instances — fine for terrain decorator counts)
+    for (uint i = gtid; i < meshCount; i += 64)
+    {
+        DecoInstance di = meshInstances[i];
+        DecoratorSlot slot = slots[di.SlotIdx];
+        LODEntry lod = lodTbl[slot.LODTableOffset + di.LOD];
+        uint partId = lod.MeshPartId;
+
+        // Find or register this meshPartId
+        uint typeIdx = 0xFFFFFFFF;
+        for (uint t = 0; t < MAX_MESH_TYPES; t++)
+        {
+            uint expected = 0xFFFFFFFF;
+            // Try to claim this slot for our partId
+            InterlockedCompareExchange(gs_typePartId[t], expected, partId, expected);
+            if (expected == 0xFFFFFFFF || expected == partId)
+            {
+                // We either claimed it or it was already ours
+                if (gs_typePartId[t] == partId)
+                {
+                    typeIdx = t;
+                    break;
+                }
+            }
+        }
+
+        if (typeIdx < MAX_MESH_TYPES)
+        {
+            uint dummy;
+            InterlockedAdd(gs_typeCounts[typeIdx], 1, dummy);
+        }
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    // Count how many unique types and compute prefix sum (single thread)
+    if (gtid == 0)
+    {
+        uint numTypes = 0;
+        uint offset = 0;
+        for (uint t = 0; t < MAX_MESH_TYPES; t++)
+        {
+            if (gs_typePartId[t] == 0xFFFFFFFF) continue;
+            gs_typeBaseOffset[t] = offset;
+            offset += gs_typeCounts[t];
+            gs_typeCounts[t] = 0; // reset for pass 2 scatter
+            numTypes++;
+        }
+        gs_numTypes = numTypes;
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    // Pass 2: Scatter instances into sorted buffer
+    RWStructuredBuffer<DecoInstance> sortedBuffer = ResourceDescriptorHeap[SortedMeshInstanceIdx];
+
+    for (uint j = gtid; j < meshCount; j += 64)
+    {
+        DecoInstance di = meshInstances[j];
+        DecoratorSlot slot = slots[di.SlotIdx];
+        LODEntry lod = lodTbl[slot.LODTableOffset + di.LOD];
+        uint partId = lod.MeshPartId;
+
+        // Find type index
+        uint typeIdx = 0;
+        for (uint t = 0; t < MAX_MESH_TYPES; t++)
+        {
+            if (gs_typePartId[t] == partId) { typeIdx = t; break; }
+        }
+
+        uint localOffset;
+        InterlockedAdd(gs_typeCounts[typeIdx], 1, localOffset);
+        sortedBuffer[gs_typeBaseOffset[typeIdx] + localOffset] = di;
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    // Pass 3: Build per-type BindlessDrawCommand indirect args (single thread)
+    // BindlessCommandSignature: 14 root constants (56 bytes) + DrawInstancedArgs (16 bytes) = 72 bytes
+    if (gtid == 0)
+    {
+        RWByteAddressBuffer drawArgsBuffer = ResourceDescriptorHeap[MeshDrawArgsIdx];
+        RWByteAddressBuffer drawCountBuffer = ResourceDescriptorHeap[MeshDrawCountIdx];
+
+        uint drawIdx = 0;
+        for (uint t = 0; t < MAX_MESH_TYPES; t++)
+        {
+            if (gs_typePartId[t] == 0xFFFFFFFF) continue;
+
+            uint partId = gs_typePartId[t];
+            MeshPartEntry part = meshReg[partId];
+            uint baseOffset = gs_typeBaseOffset[t];
+            uint instanceCount = gs_typeCounts[t];
+
+            // Write 14 root constants (slots 2-15 of push constants)
+            // These map to grass_mesh.fx push constant layout
+            uint cmdOffset = drawIdx * 72;
+            drawArgsBuffer.Store(cmdOffset + 0,  partId);                // slot 2: MeshPartId
+            drawArgsBuffer.Store(cmdOffset + 4,  baseOffset);           // slot 3: InstanceBaseOffset
+            drawArgsBuffer.Store(cmdOffset + 8,  DrawSortedSRVIdx);     // slot 4: SortedInstancesIdx
+            drawArgsBuffer.Store(cmdOffset + 12, DrawSlotsSRVIdx);      // slot 5: DecoratorSlotsIdx
+            drawArgsBuffer.Store(cmdOffset + 16, DrawLODSRVIdx);        // slot 6: LODTableIdx
+            drawArgsBuffer.Store(cmdOffset + 20, DrawMeshRegSRVIdx);    // slot 7: MeshRegistryIdx
+            drawArgsBuffer.Store(cmdOffset + 24, 0u);                   // slot 8
+            drawArgsBuffer.Store(cmdOffset + 28, 0u);                   // slot 9
+            drawArgsBuffer.Store(cmdOffset + 32, 0u);                   // slot 10
+            drawArgsBuffer.Store(cmdOffset + 36, 0u);                   // slot 11
+            drawArgsBuffer.Store(cmdOffset + 40, 0u);                   // slot 12
+            drawArgsBuffer.Store(cmdOffset + 44, 0u);                   // slot 13
+            drawArgsBuffer.Store(cmdOffset + 48, DrawMaterialsSRVIdx);  // slot 14: MaterialsIdx
+            drawArgsBuffer.Store(cmdOffset + 52, 0u);                   // slot 15
+
+            // DrawInstancedArguments: { VertexCount, InstanceCount, StartVertex, StartInstance }
+            drawArgsBuffer.Store(cmdOffset + 56, part.VertexCount);  // VertexCountPerInstance (= numIndices)
+            drawArgsBuffer.Store(cmdOffset + 60, instanceCount);     // InstanceCount
+            drawArgsBuffer.Store(cmdOffset + 64, 0u);                // StartVertexLocation
+            drawArgsBuffer.Store(cmdOffset + 68, 0u);                // StartInstanceLocation
+
+            drawIdx++;
+        }
+        drawCountBuffer.Store(0, drawIdx);
+    }
 }

@@ -141,16 +141,25 @@ namespace Freefall.Components
 
         // ───── Compute Prepass (grass_compute.hlsl) ──────────────────────
         private ComputeShader? _grassCS;
-        private int _kBakeNormals, _kSpawnInstances, _kBuildDecoDrawArgs;
+        private int _kBakeNormals, _kSpawnInstances, _kBuildDecoDrawArgs, _kBinMeshInstances;
         private GraphicsBuffer? _decoInstanceBuffer;    // StructuredBuffer<DecoInstance> = 64 bytes
-        private GraphicsBuffer? _instanceCounterBuffer; // RWByteAddressBuffer (1 uint)
-        private GraphicsBuffer? _decoDispatchArgsBuffer; // RWByteAddressBuffer (3 uints for DispatchMeshIndirect)
+        private GraphicsBuffer? _instanceCounterBuffer; // RWByteAddressBuffer (2 uints: billboard count + mesh count)
+        private GraphicsBuffer? _decoDispatchArgsBuffer; // RWByteAddressBuffer (4 uints: 3 for DispatchMesh + 1 mesh count)
         private bool _decoBuffersCreated;
         private bool _decoDispatchLogged;
         private int _maxDecoInstances;
 
+        // ───── Mesh-Mode Decorators ──────────────────────────────────────────
+        private GraphicsBuffer? _meshDecoInstanceBuffer;    // unsorted mesh instances (DecoInstance, 64 bytes)
+        private GraphicsBuffer? _sortedMeshInstanceBuffer;  // sorted by mesh type (DecoInstance, 64 bytes)
+        private GraphicsBuffer? _meshDrawArgsBuffer;        // BindlessDrawCommand per mesh type (72 bytes × 32)
+        private GraphicsBuffer? _meshDrawCountBuffer;       // RWByteAddressBuffer (1 uint: draw count)
+        private Material? _meshDecoratorMaterial;           // grass_mesh.fx
+
         // ───── Debug Stats (read by editor SettingsControls) ─────────────
         public static int LastInstanceCount { get; set; }
+        public static int LastMeshInstanceCount { get; set; }
+        public static int LastMeshDrawCount { get; set; }
         public static int LastMaxInstances { get; set; }
         public static int LastDispatchN { get; set; }
         private ID3D12Resource? _instanceCounterReadback;
@@ -1470,22 +1479,32 @@ namespace Freefall.Components
             _maxDecoInstances = Math.Min(maxTiles * 8, 1024 * 1024); // cap at 1M
 
             _decoInstanceBuffer = GraphicsBuffer.CreateStructured(_maxDecoInstances, 64, srv: true, uav: true); // 64 bytes per DecoInstance
-            _instanceCounterBuffer = GraphicsBuffer.CreateRaw(2, uav: true, clearable: true);
-            _decoDispatchArgsBuffer = GraphicsBuffer.CreateRaw(3, uav: true); // 3 uints for DispatchMesh indirect args
+            _instanceCounterBuffer = GraphicsBuffer.CreateRaw(2, uav: true, clearable: true); // 2 uints: billboard + mesh counts
+            _decoDispatchArgsBuffer = GraphicsBuffer.CreateRaw(4, uav: true); // 4 uints: 3 DispatchMesh args + 1 mesh count
+
+            // Mesh-mode decorator buffers
+            _meshDecoInstanceBuffer = GraphicsBuffer.CreateStructured(_maxDecoInstances, 64, srv: true, uav: true);
+            _sortedMeshInstanceBuffer = GraphicsBuffer.CreateStructured(_maxDecoInstances, 64, srv: true, uav: true);
+            _meshDrawArgsBuffer = GraphicsBuffer.CreateRaw(32 * 18, uav: true); // 32 mesh types × 72 bytes = 32 × 18 uints
+            _meshDrawCountBuffer = GraphicsBuffer.CreateRaw(1, uav: true, clearable: true);
 
             // Initialize compute shader and find kernels
             _grassCS ??= new ComputeShader("grass_compute.hlsl");
-            _kBakeNormals     = _grassCS.FindKernel("CS_BakeTerrainNormals");
-            _kSpawnInstances  = _grassCS.FindKernel("CS_SpawnInstances");
+            _kBakeNormals       = _grassCS.FindKernel("CS_BakeTerrainNormals");
+            _kSpawnInstances    = _grassCS.FindKernel("CS_SpawnInstances");
             _kBuildDecoDrawArgs = _grassCS.FindKernel("CS_BuildDrawArgs");
+            _kBinMeshInstances  = _grassCS.FindKernel("CS_BinMeshInstances");
+
+            // Load mesh decorator material
+            _meshDecoratorMaterial ??= new Material(new Effect("grass_mesh"));
 
             Debug.Log($"[TerrainRenderer] Deco buffers created: maxTiles={maxTiles} maxInstances={_maxDecoInstances} controlSize={controlW}x{controlH}");
 
-            // Readback buffer for instance counter (8 bytes for 2 uints)
+            // Readback buffer for instance counter + mesh draw count (12 bytes for 3 uints)
             _instanceCounterReadback = Engine.Device.NativeDevice.CreateCommittedResource(
                 new Vortice.Direct3D12.HeapProperties(Vortice.Direct3D12.HeapType.Readback),
                 Vortice.Direct3D12.HeapFlags.None,
-                Vortice.Direct3D12.ResourceDescription.Buffer(8),
+                Vortice.Direct3D12.ResourceDescription.Buffer(12),
                 Vortice.Direct3D12.ResourceStates.CopyDest,
                 null);
             unsafe
@@ -1588,19 +1607,6 @@ namespace Freefall.Components
             int controlH = (int)decoDesc.Height;
             float tileSize = Terrain.TerrainSize.X / controlW;
 
-            // One-shot diagnostic log
-            if (!_decoDispatchLogged)
-            {
-                _decoDispatchLogged = true;
-                float tileArea = tileSize * tileSize;
-                Debug.LogAlways($"[Grass] Control={controlW}x{controlH} tileSize={tileSize:F2}m tileArea={tileArea:F1}sqm radius={range:F0}m density={Terrain.DecorationDensity:F2}");
-                Debug.LogAlways($"[Grass] MaxInstances={_maxDecoInstances} DecoCount={Terrain.Decorations.Count} DecoControlSRV={_decoControlSRV}");
-                foreach (var deco in Terrain.Decorations)
-                {
-                    float instPerTile = deco.Density * Terrain.DecorationDensity * tileArea;
-                    Debug.LogAlways($"[Grass]   Slot: density={deco.Density:F2} instPerTile={instPerTile:F1} H=[{deco.HeightRange.X:F2},{deco.HeightRange.Y:F2}] W=[{deco.WidthRange.X:F2},{deco.WidthRange.Y:F2}] mode={deco.Mode}");
-                }
-            }
 
             // ════════════════════════════════════════════════════════════════
             // Phase 1: Compute Prepass (only on opaque pass — shadow reuses instances)
@@ -1610,6 +1616,9 @@ namespace Freefall.Components
             {
                 // Transition buffers to UAV
                 _decoInstanceBuffer!.Transition(commandList, ResourceStates.UnorderedAccess);
+                _meshDecoInstanceBuffer!.Transition(commandList, ResourceStates.UnorderedAccess);
+                _sortedMeshInstanceBuffer!.Transition(commandList, ResourceStates.UnorderedAccess);
+                _meshDrawArgsBuffer!.Transition(commandList, ResourceStates.UnorderedAccess);
                 _instanceCounterBuffer!.Transition(commandList, ResourceStates.UnorderedAccess);
                 _decoDispatchArgsBuffer!.Transition(commandList, ResourceStates.UnorderedAccess);
 
@@ -1662,12 +1671,15 @@ namespace Freefall.Components
                 if (fwdLen > 0.001f) { camFwd.X /= fwdLen; camFwd.Z /= fwdLen; }
                 cs.Set(_kSpawnInstances, "CamFwdX", camFwd.X);
                 cs.Set(_kSpawnInstances, "CamFwdZ", camFwd.Z);
+                cs.SetUAV(_kSpawnInstances, "MeshDecoInstance", _meshDecoInstanceBuffer);
 
                 cs.SetUAV(_kBuildDecoDrawArgs, "InstanceCounter", _instanceCounterBuffer);
                 cs.SetUAV(_kBuildDecoDrawArgs, "DispatchArgs", _decoDispatchArgsBuffer);
                 cs.Set(_kBuildDecoDrawArgs, "MaxInstances", (uint)_maxDecoInstances);
 
                 // ── Stage 1: CS_SpawnInstances (single-pass, camera-centered grid) ──
+                // Bind Hi-Z occlusion cbuffer (same _hizParamBuffers used by terrain quadtree)
+                commandList.SetComputeRootConstantBufferView(2, _hizParamBuffers[frameIndex].GPUVirtualAddress);
                 LastDispatchN = N;
                 LastMaxInstances = _maxDecoInstances;
                 cs.Dispatch(_kSpawnInstances, commandList, (uint)N, (uint)N);
@@ -1677,24 +1689,55 @@ namespace Freefall.Components
                 cs.Dispatch(_kBuildDecoDrawArgs, commandList, 1);
                 commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(null)));
 
-                // Transition instance buffer to SRV for MS reads
+                // Transition billboard instance buffer to SRV for MS reads
                 _decoInstanceBuffer.Transition(commandList, ResourceStates.NonPixelShaderResource);
+
+                // ── Stage 3: CS_BinMeshInstances ──
+                // Transition mesh instance buffer to SRV for binning reads
+                _meshDecoInstanceBuffer!.Transition(commandList, ResourceStates.NonPixelShaderResource);
+                // DispatchArgs is still UAV — binning reads mesh count from offset 12
+                cs.Set(_kBinMeshInstances, "DecoratorSlots", _decoratorSlotsBuffer!.SrvIndex);
+                cs.Set(_kBinMeshInstances, "LODTable", _decoratorLODTableBuffer!.SrvIndex);
+                cs.Set(_kBinMeshInstances, "MeshRegistry", MeshRegistry.SrvIndex);
+                cs.Set(_kBinMeshInstances, "MeshDecoInstance", _meshDecoInstanceBuffer!.SrvIndex);
+                cs.SetUAV(_kBinMeshInstances, "DispatchArgs", _decoDispatchArgsBuffer);
+                cs.SetUAV(_kBinMeshInstances, "SortedMeshInstance", _sortedMeshInstanceBuffer);
+                cs.SetUAV(_kBinMeshInstances, "MeshDrawArgs", _meshDrawArgsBuffer);
+                cs.SetUAV(_kBinMeshInstances, "MeshDrawCount", _meshDrawCountBuffer);
+
+                // SRV indices to embed in draw commands (read by binning kernel, written to each command)
+                cs.Set(_kBinMeshInstances, "DrawSortedSRV", _sortedMeshInstanceBuffer!.SrvIndex);
+                cs.Set(_kBinMeshInstances, "DrawSlotsSRV", _decoratorSlotsBuffer!.SrvIndex);
+                cs.Set(_kBinMeshInstances, "DrawLODSRV", _decoratorLODTableBuffer!.SrvIndex);
+                cs.Set(_kBinMeshInstances, "DrawMeshRegSRV", MeshRegistry.SrvIndex);
+                cs.Set(_kBinMeshInstances, "DrawMaterialsSRV", Graphics.Material.MaterialsBufferIndex);
+
+                cs.Dispatch(_kBinMeshInstances, commandList, 1);
+                commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(null)));
+
+                // Transition all buffers for rendering
                 _decoDispatchArgsBuffer.Transition(commandList, ResourceStates.IndirectArgument);
+                _sortedMeshInstanceBuffer!.Transition(commandList, ResourceStates.NonPixelShaderResource);
+                _meshDrawArgsBuffer!.Transition(commandList, ResourceStates.IndirectArgument);
 
                 // Readback instance counter for debug stats
                 if (_instanceCounterReadback != null)
                 {
-                    // Read previous frame's value first
                     unsafe
                     {
                         uint* pData = (uint*)_instanceCounterReadbackPtr;
                         LastInstanceCount = (int)pData[0];
+                        LastMeshInstanceCount = (int)pData[1];
+                        LastMeshDrawCount = (int)pData[2];
                     }
 
-                    // Copy this frame's counter to readback
                     _instanceCounterBuffer.Transition(commandList, ResourceStates.CopySource);
-                    commandList.CopyResource(_instanceCounterReadback, _instanceCounterBuffer.Native);
+                    commandList.CopyBufferRegion(_instanceCounterReadback, 0, _instanceCounterBuffer.Native, 0, 8);
                     _instanceCounterBuffer.Transition(commandList, ResourceStates.UnorderedAccess);
+
+                    _meshDrawCountBuffer!.Transition(commandList, ResourceStates.CopySource);
+                    commandList.CopyBufferRegion(_instanceCounterReadback, 8, _meshDrawCountBuffer.Native, 0, 4);
+                    _meshDrawCountBuffer.Transition(commandList, ResourceStates.UnorderedAccess);
                 }
             }
 
@@ -1728,13 +1771,29 @@ namespace Freefall.Components
 
             // ExecuteIndirect with DispatchMesh args written by CS_BuildDrawArgs
             using var commandList6 = commandList.QueryInterface<ID3D12GraphicsCommandList6>();
-            commandList6.ExecuteIndirect(
-                device.DispatchMeshSignature,
-                1,
-                _decoDispatchArgsBuffer!.Native,
-                0,
-                null,
-                0);
+            commandList6.ExecuteIndirect(device.DispatchMeshSignature,1,_decoDispatchArgsBuffer!.Native, 0, null, 0);
+
+            // ════════════════════════════════════════════════════════════════
+            // Phase 3: Mesh-mode decorators via VS/PS + BindlessCommandSignature
+            // ════════════════════════════════════════════════════════════════
+
+            if (_meshDecoratorMaterial?.Effect != null && pass == RenderPass.Opaque)
+            {
+                _meshDecoratorMaterial.SetPass(pass);
+                _meshDecoratorMaterial.Apply(commandList, device);
+
+                // Push constants slots 0-1 are NOT overwritten by BindlessCommandSignature
+                // (it only writes slots 2-15). All slots 2-15 are embedded in each draw command
+                // by the binning kernel — no additional SetGraphicsRoot32BitConstant needed.
+
+                commandList.ExecuteIndirect(
+                    device.BindlessCommandSignature,
+                    32,  // max 32 mesh types
+                    _meshDrawArgsBuffer!.Native,
+                    0,
+                    _meshDrawCountBuffer!.Native,  // count buffer: actual number of draws
+                    0);
+            }
         }
     }
 }
