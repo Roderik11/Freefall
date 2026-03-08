@@ -7,15 +7,14 @@
 
 #pragma kernel CSBuildDecoControl
 
-// Inlined from common.fx (runtime Shader() compilation has no include path)
-struct PushConstantsData { uint4 indices[8]; };
-#define GET_INDEX(i) PushConstants.indices[i/4][i%4]
-ConstantBuffer<PushConstantsData> PushConstants : register(b3);
-
-#define DecoMapsIdx     GET_INDEX(0)   // SRV: density map Texture2DArray
-#define SlotsIdx        GET_INDEX(1)   // SRV: DecoratorSlot structured buffer
-#define ControlUAVIdx   GET_INDEX(2)   // UAV: output RWTexture2DArray<uint4>
-#define SlotCountIdx    GET_INDEX(3)   // number of decorator slots
+// Push constants (root parameter 0, register b3) — bindless indices only
+cbuffer PushConstants : register(b3)
+{
+    uint DecoMapsIdx;       // slot 0 — SRV: density map Texture2DArray
+    uint SlotsIdx;          // slot 1 — SRV: DecoratorSlot structured buffer
+    uint ControlUAVIdx;     // slot 2 — UAV: output RWTexture2DArray<uint4>
+    uint SlotCountIdx;      // slot 3 — number of decorator slots
+};
 
 // Must match DecoratorSlot in grass.fx / grass_compute.hlsl
 struct DecoratorSlot

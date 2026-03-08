@@ -31,27 +31,22 @@ struct InstanceDescriptor
 // Push constants (root parameter 0, register b3) — bindless indices only
 cbuffer PushConstants : register(b3)
 {
-    uint4 Indices[8];
+    uint OutputDescriptorsUAVIdx;   // slot 0  — UAV: InstanceDescriptor buffer
+    uint OutputSpheresUAVIdx;       // slot 1  — UAV: BoundingSphere buffer
+    uint OutputSubbatchIdsUAVIdx;   // slot 2  — UAV: subbatch ID buffer
+    uint OutputTerrainDataUAVIdx;   // slot 3  — UAV: TerrainPatchData buffer
+    uint CounterUAVIdx;             // slot 4  — UAV: atomic counter
+    uint CascadeIdxUAVIdx;          // slot 5  — UAV: cascade index buffer (shadow)
+    uint SplitFlagsUAVIdx;          // slot 6  — UAV: split flags buffer
+    uint HeightRangeSRVIdx;         // slot 7  — SRV: height range mip pyramid
+    uint BuildMipIdx;               // slot 8  — uint: current mip for CSBuildMinMaxMip
+    uint MipInputSRVIdx;            // slot 9  — SRV: previous mip (CSBuildMinMaxMip)
+    uint MipOutputUAVIdx;           // slot 10 — UAV: current mip output (CSBuildMinMaxMip)
+    uint IndirectArgsUAVIdx;        // slot 11 — UAV: indirect draw args
+    uint VertexCountIdx;            // slot 12 — uint: mesh index count (CSBuildDrawArgs)
+    uint CascadeCountIdx;           // slot 13 — uint: number of cascades (shadow)
+    uint CascadeBufferSRVIdx;       // slot 14 — SRV: StructuredBuffer<CascadeData> (shadow)
 };
-
-#define GET_INDEX(i) Indices[i/4][i%4]
-
-// ── Per-dispatch bindless indices (push constants) ──
-#define OutputDescriptorsUAVIdx  GET_INDEX(0)    // UAV: InstanceDescriptor buffer
-#define OutputSpheresUAVIdx     GET_INDEX(1)    // UAV: BoundingSphere buffer
-#define OutputSubbatchIdsUAVIdx GET_INDEX(2)    // UAV: subbatch ID buffer
-#define OutputTerrainDataUAVIdx GET_INDEX(3)    // UAV: TerrainPatchData buffer
-#define CounterUAVIdx           GET_INDEX(4)    // UAV: atomic counter
-#define CascadeIdxUAVIdx        GET_INDEX(5)    // UAV: cascade index buffer (shadow)
-#define SplitFlagsUAVIdx        GET_INDEX(6)    // UAV: split flags buffer
-#define HeightRangeSRVIdx       GET_INDEX(7)    // SRV: height range mip pyramid
-#define BuildMipIdx             GET_INDEX(8)    // uint: current mip for CSBuildMinMaxMip
-#define MipInputSRVIdx          GET_INDEX(9)    // SRV: previous mip (CSBuildMinMaxMip)
-#define MipOutputUAVIdx         GET_INDEX(10)   // UAV: current mip output (CSBuildMinMaxMip)
-#define IndirectArgsUAVIdx      GET_INDEX(11)   // UAV: indirect draw args
-#define VertexCountIdx          GET_INDEX(12)   // uint: mesh index count (CSBuildDrawArgs)
-#define CascadeCountIdx         GET_INDEX(13)   // uint: number of cascades (shadow)
-#define CascadeBufferSRVIdx     GET_INDEX(14)   // SRV: StructuredBuffer<CascadeData> (shadow)
 
 // ── Frustum planes (root slot 1, register b0) ──
 cbuffer FrustumPlanes : register(b0)

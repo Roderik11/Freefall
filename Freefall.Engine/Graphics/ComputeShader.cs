@@ -1,16 +1,16 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using Vortice.Direct3D;
 using Vortice.Direct3D12;
 using Vortice.Direct3D12.Shader;
 
 namespace Freefall.Graphics
 {
     /// <summary>
-    /// Compute pipeline with multi-kernel support and per-kernel push constant parameters.
-    /// Each kernel has its own parameter set (like EffectParameter / MaterialBlock).
-    /// Push constant slot mappings are file-level (from #define XxxIdx GET_INDEX(N)).
-    /// Use Set(kernel, name, value) to write per-kernel params, Dispatch(kernel, ...) to execute.
+    /// Compute pipeline with multi-kernel support and reflection-based resource binding.
+    /// Push constant slots are discovered from cbuffer PushConstants reflection.
+    /// Resource types (SRV/UAV) are resolved from shader reflection.
     /// </summary>
     public class ComputeShader : IDisposable
     {
@@ -31,9 +31,11 @@ namespace Freefall.Graphics
 
         private readonly List<Kernel> _kernels = new();
 
-        // File-level: named parameter → push constant slot (from FXParser.ParseResourceBindings)
+        // Push constant slot map: name hash → slot index (from cbuffer PushConstants reflection)
         private Dictionary<int, int> _resourceSlots = new();
-        private List<ShaderResourceBinding> _resourceBindings = new();
+
+        // Resource type map: name hash → true if UAV (from shader reflection BoundResources)
+        private Dictionary<int, bool> _isUAV = new();
 
         // Constant buffers discovered from shader reflection
         private Dictionary<string, ConstantBuffer> _constantBuffers = new();
@@ -94,53 +96,99 @@ namespace Freefall.Graphics
         /// <summary>Get the PSO for a specific kernel (for manual pipeline binding).</summary>
         public ID3D12PipelineState GetPSO(int kernel) => _kernels[kernel].PSO;
 
-        // ────────────── Unified SetParam (push constant → cbuffer fallback) ──────────────
+        // ────────────── SetPushConstant (raw uint to root constants) ──────────────
 
-        /// <summary>Set a uint value by name on a specific kernel. Tries push constants first, then cbuffer.</summary>
-        public void SetParam(int kernel, string name, uint value)
+        /// <summary>Set a raw uint push constant by name on a specific kernel.</summary>
+        public void SetPushConstant(int kernel, string name, uint value)
         {
             EnsureSourceLoaded();
-            int slot = ResolveSlot(name, silent: true);
+            int slot = ResolveSlot(name);
             if (slot >= 0) _kernels[kernel].Constants[slot] = value;
-            else SetCBParam(name, value);
         }
 
-        /// <summary>Set a float value by name on a specific kernel. Tries push constants first, then cbuffer.</summary>
-        public void SetParam(int kernel, string name, float value)
+        /// <summary>Set a raw uint push constant by name on ALL kernels.</summary>
+        public void SetPushConstant(string name, uint value)
         {
             EnsureSourceLoaded();
-            int slot = ResolveSlot(name, silent: true);
-            if (slot >= 0) _kernels[kernel].Constants[slot] = BitConverter.SingleToUInt32Bits(value);
-            else SetCBParam(name, value);
+            int slot = ResolveSlot(name);
+            if (slot >= 0)
+                for (int i = 0; i < _kernels.Count; i++)
+                    _kernels[i].Constants[slot] = value;
         }
 
-        /// <summary>Set a Texture's bindless SRV index on a specific kernel.</summary>
-        public void SetParam(int kernel, string name, Texture texture)
+        // ────────────── SetTexture (Texture → push constant with BindlessIndex) ──────────────
+
+        /// <summary>Set a Texture's bindless SRV index as push constant on a specific kernel.</summary>
+        public void SetTexture(int kernel, string name, Texture texture)
         {
             EnsureSourceLoaded();
             int slot = ResolveSlot(name);
             if (slot >= 0) _kernels[kernel].Constants[slot] = texture.BindlessIndex;
         }
 
-        /// <summary>Set a GraphicsBuffer's SRV index on a specific kernel.</summary>
-        public void SetSRV(int kernel, string name, GraphicsBuffer buffer)
+        /// <summary>Set a Texture's bindless SRV index as push constant on ALL kernels.</summary>
+        public void SetTexture(string name, Texture texture)
         {
             EnsureSourceLoaded();
             int slot = ResolveSlot(name);
-            if (slot >= 0) _kernels[kernel].Constants[slot] = buffer.SrvIndex;
+            if (slot >= 0)
+                for (int i = 0; i < _kernels.Count; i++)
+                    _kernels[i].Constants[slot] = texture.BindlessIndex;
         }
 
-        /// <summary>Set a GraphicsBuffer's UAV index on a specific kernel.</summary>
-        public void SetUAV(int kernel, string name, GraphicsBuffer buffer)
+        // ────────────── SetBuffer (GraphicsBuffer → push constant, SRV/UAV auto-resolved) ──────────────
+
+        /// <summary>Set a GraphicsBuffer as push constant on a specific kernel. SRV/UAV resolved from reflection.</summary>
+        public void SetBuffer(int kernel, string name, GraphicsBuffer buffer)
         {
             EnsureSourceLoaded();
             int slot = ResolveSlot(name);
-            if (slot >= 0) _kernels[kernel].Constants[slot] = buffer.UavIndex;
+            if (slot >= 0)
+            {
+                int hash = name.GetHashCode();
+                _kernels[kernel].Constants[slot] = _isUAV.TryGetValue(hash, out bool uav) && uav
+                    ? buffer.UavIndex
+                    : buffer.SrvIndex;
+            }
         }
 
-        // ────────────── SetParam on ALL kernels ──────────────
+        /// <summary>Set a GraphicsBuffer as push constant on ALL kernels. SRV/UAV resolved from reflection.</summary>
+        public void SetBuffer(string name, GraphicsBuffer buffer)
+        {
+            EnsureSourceLoaded();
+            int slot = ResolveSlot(name);
+            if (slot >= 0)
+            {
+                int hash = name.GetHashCode();
+                uint index = _isUAV.TryGetValue(hash, out bool uav) && uav
+                    ? buffer.UavIndex
+                    : buffer.SrvIndex;
+                for (int i = 0; i < _kernels.Count; i++)
+                    _kernels[i].Constants[slot] = index;
+            }
+        }
 
-        /// <summary>Set a uint value on ALL kernels. Tries push constants first, then cbuffer.</summary>
+        // ────────────── SetParam (cbuffer parameters) ──────────────
+
+        /// <summary>Set a typed cbuffer parameter by name (float, uint, Vector2, Vector3, etc.).</summary>
+        public void SetParam<T>(string name, T value) where T : unmanaged
+        {
+            EnsureSourceLoaded();
+            foreach (var cb in _constantBuffers.Values)
+                cb.SetParameter(name, value);
+        }
+
+        /// <summary>Set a cbuffer array parameter by name.</summary>
+        public void SetParam<T>(string name, T[] values) where T : unmanaged
+        {
+            EnsureSourceLoaded();
+            foreach (var cb in _constantBuffers.Values)
+                cb.SetParameterArray(name, values);
+        }
+
+        // ────────────── Legacy compatibility ──────────────
+
+        /// <summary>Set a uint value by name. Tries push constants first, then cbuffer.</summary>
         public void SetParam(string name, uint value)
         {
             EnsureSourceLoaded();
@@ -148,10 +196,12 @@ namespace Freefall.Graphics
             if (slot >= 0)
                 for (int i = 0; i < _kernels.Count; i++)
                     _kernels[i].Constants[slot] = value;
-            else SetCBParam(name, value);
+            else
+                foreach (var cb in _constantBuffers.Values)
+                    cb.SetParameter(name, value);
         }
 
-        /// <summary>Set a float value on ALL kernels. Tries push constants first, then cbuffer.</summary>
+        /// <summary>Set a float value by name. Tries push constants first, then cbuffer.</summary>
         public void SetParam(string name, float value)
         {
             EnsureSourceLoaded();
@@ -162,20 +212,62 @@ namespace Freefall.Graphics
                 for (int i = 0; i < _kernels.Count; i++)
                     _kernels[i].Constants[slot] = bits;
             }
-            else SetCBParam(name, value);
+            else
+                foreach (var cb in _constantBuffers.Values)
+                    cb.SetParameter(name, value);
         }
 
-        /// <summary>Set a Texture's bindless SRV index on ALL kernels.</summary>
+        /// <summary>Set a uint value by name on a specific kernel. Tries push constants first, then cbuffer.</summary>
+        public void SetParam(int kernel, string name, uint value)
+        {
+            EnsureSourceLoaded();
+            int slot = ResolveSlot(name, silent: true);
+            if (slot >= 0) _kernels[kernel].Constants[slot] = value;
+            else
+                foreach (var cb in _constantBuffers.Values)
+                    cb.SetParameter(name, value);
+        }
+
+        /// <summary>Set a float value by name on a specific kernel. Tries push constants first, then cbuffer.</summary>
+        public void SetParam(int kernel, string name, float value)
+        {
+            EnsureSourceLoaded();
+            int slot = ResolveSlot(name, silent: true);
+            if (slot >= 0) _kernels[kernel].Constants[slot] = BitConverter.SingleToUInt32Bits(value);
+            else
+                foreach (var cb in _constantBuffers.Values)
+                    cb.SetParameter(name, value);
+        }
+
+        /// <summary>Set a Texture's bindless SRV index. Legacy: routes to push constant.</summary>
         public void SetParam(string name, Texture texture)
+        {
+            SetTexture(name, texture);
+        }
+
+        /// <summary>Set a Texture's bindless SRV index on a specific kernel. Legacy: routes to push constant.</summary>
+        public void SetParam(int kernel, string name, Texture texture)
+        {
+            SetTexture(kernel, name, texture);
+        }
+
+        /// <summary>Set a GraphicsBuffer's SRV index on a specific kernel. Legacy: use SetBuffer instead.</summary>
+        public void SetSRV(int kernel, string name, GraphicsBuffer buffer)
         {
             EnsureSourceLoaded();
             int slot = ResolveSlot(name);
-            if (slot >= 0)
-                for (int i = 0; i < _kernels.Count; i++)
-                    _kernels[i].Constants[slot] = texture.BindlessIndex;
+            if (slot >= 0) _kernels[kernel].Constants[slot] = buffer.SrvIndex;
         }
 
-        /// <summary>Set a GraphicsBuffer's SRV index on ALL kernels.</summary>
+        /// <summary>Set a GraphicsBuffer's UAV index on a specific kernel. Legacy: use SetBuffer instead.</summary>
+        public void SetUAV(int kernel, string name, GraphicsBuffer buffer)
+        {
+            EnsureSourceLoaded();
+            int slot = ResolveSlot(name);
+            if (slot >= 0) _kernels[kernel].Constants[slot] = buffer.UavIndex;
+        }
+
+        /// <summary>Set a GraphicsBuffer's SRV index on ALL kernels. Legacy: use SetBuffer instead.</summary>
         public void SetSRV(string name, GraphicsBuffer buffer)
         {
             EnsureSourceLoaded();
@@ -185,7 +277,7 @@ namespace Freefall.Graphics
                     _kernels[i].Constants[slot] = buffer.SrvIndex;
         }
 
-        /// <summary>Set a GraphicsBuffer's UAV index on ALL kernels.</summary>
+        /// <summary>Set a GraphicsBuffer's UAV index on ALL kernels. Legacy: use SetBuffer instead.</summary>
         public void SetUAV(string name, GraphicsBuffer buffer)
         {
             EnsureSourceLoaded();
@@ -195,33 +287,11 @@ namespace Freefall.Graphics
                     _kernels[i].Constants[slot] = buffer.UavIndex;
         }
 
-        /// <summary>Set a typed value by name (vectors, structs, etc.). Targets cbuffers.</summary>
-        public void SetParam<T>(string name, T value) where T : unmanaged
-        {
-            EnsureSourceLoaded();
-            SetCBParam(name, value);
-        }
-
-        /// <summary>Set a constant buffer array parameter by name.</summary>
-        public void SetArray<T>(string name, T[] values) where T : unmanaged
-        {
-            EnsureSourceLoaded();
-            foreach (var cb in _constantBuffers.Values)
-                cb.SetParameterArray(name, values);
-        }
-
-        private void SetCBParam<T>(string name, T value) where T : unmanaged
-        {
-            foreach (var cb in _constantBuffers.Values)
-                cb.SetParameter(name, value);
-        }
-
-        // ────────────── Dispatch (explicit kernel index) ──────────────
+        // ────────────── Dispatch ──────────────
 
         /// <summary>
-        /// Dispatch a specific kernel. Binds root signature, descriptor heaps,
-        /// PSO, pushes ALL push constants from that kernel's parameter set,
-        /// binds constant buffers, and dispatches.
+        /// Dispatch a specific kernel. Binds PSO, pushes all push constants,
+        /// commits and binds constant buffers, then dispatches.
         /// </summary>
         public void Dispatch(int kernel, ID3D12GraphicsCommandList cmd, uint groupsX, uint groupsY = 1, uint groupsZ = 1)
         {
@@ -229,7 +299,6 @@ namespace Freefall.Graphics
             if (kernel < 0 || kernel >= _kernels.Count)
                 throw new ArgumentOutOfRangeException(nameof(kernel));
 
-            // Set PSO for this kernel (caller handles root sig + descriptor heaps + cbuffers)
             var k = _kernels[kernel];
             cmd.SetPipelineState(k.PSO);
 
@@ -259,7 +328,7 @@ namespace Freefall.Graphics
                 return slot;
 
             if (!silent)
-                Debug.LogAlways($"[ComputeShader] Warning: parameter '{name}' not found in {_filename}");
+                Debug.LogAlways($"[ComputeShader] Warning: push constant '{name}' not found in {_filename}");
             return -1;
         }
 
@@ -284,11 +353,6 @@ namespace Freefall.Graphics
             _basePath = Path.GetDirectoryName(fullPath);
             _cachedSource = File.ReadAllText(fullPath);
 
-            // Parse resource bindings (file-level: #define XxxIdx GET_INDEX(N))
-            _resourceBindings = FXParser.ParseResourceBindings(_cachedSource);
-            foreach (var binding in _resourceBindings)
-                _resourceSlots[binding.Name.GetHashCode()] = binding.Slot;
-
             // Discover and compile kernels from #pragma kernel directives
             var kernelNames = KernelParser.ParseKernels(_cachedSource);
 
@@ -308,9 +372,13 @@ namespace Freefall.Graphics
 
             var pso = device.CreateComputePipelineState(shader.Bytecode);
 
-            // Discover constant buffers from first kernel's reflection
+            // Discover bindings from first kernel's reflection
             if (_kernels.Count == 0 && shader.Reflection != null)
+            {
+                DiscoverPushConstants(shader.Reflection);
+                DiscoverResourceTypes(shader.Reflection);
                 DiscoverConstantBuffers(shader.Reflection);
+            }
 
             _kernels.Add(new Kernel
             {
@@ -322,6 +390,69 @@ namespace Freefall.Graphics
             shader.Dispose();
         }
 
+        /// <summary>
+        /// Discover push constant slot→name mappings from cbuffer PushConstants reflection.
+        /// Each variable's StartOffset / 4 = push constant slot index.
+        /// </summary>
+        private void DiscoverPushConstants(ID3D12ShaderReflection reflection)
+        {
+            for (uint i = 0; i < reflection.Description.ConstantBuffers; i++)
+            {
+                var cbReflection = reflection.GetConstantBufferByIndex(i);
+                if (cbReflection.Description.Name != "PushConstants") continue;
+
+                var desc = cbReflection.Description;
+                for (uint v = 0; v < desc.VariableCount; v++)
+                {
+                    var variable = cbReflection.GetVariableByIndex(v);
+                    var varDesc = variable.Description;
+                    int slot = (int)(varDesc.StartOffset / 4);
+
+                    // Strip "Idx" suffix for the semantic name (e.g. "HeightmapIdx" → "Heightmap")
+                    string name = varDesc.Name;
+                    if (name.EndsWith("Idx"))
+                        name = name.Substring(0, name.Length - 3);
+
+                    _resourceSlots[name.GetHashCode()] = slot;
+                    Debug.Log($"[ComputeShader] Push constant: '{name}' → slot {slot}");
+                }
+                break; // Only one PushConstants cbuffer
+            }
+        }
+
+        /// <summary>
+        /// Discover resource types (SRV vs UAV) from shader reflection's bound resources.
+        /// Used by SetBuffer to auto-resolve which index to use.
+        /// </summary>
+        private void DiscoverResourceTypes(ID3D12ShaderReflection reflection)
+        {
+            for (uint i = 0; i < reflection.Description.BoundResources; i++)
+            {
+                var desc = reflection.GetResourceBindingDescription(i);
+
+                bool isUav = desc.Type == ShaderInputType.UnorderedAccessViewRWTyped ||
+                             desc.Type == ShaderInputType.UnorderedAccessViewRWStructured ||
+                             desc.Type == ShaderInputType.UnorderedAccessViewRWByteAddress ||
+                             desc.Type == ShaderInputType.UnorderedAccessViewAppendStructured ||
+                             desc.Type == ShaderInputType.UnorderedAccessViewConsumeStructured ||
+                             desc.Type == ShaderInputType.UnorderedAccessViewRWStructuredWithCounter;
+
+                if (isUav)
+                {
+                    // Strip "Idx" suffix if present for name matching
+                    string name = desc.Name;
+                    if (name.EndsWith("Idx"))
+                        name = name.Substring(0, name.Length - 3);
+
+                    _isUAV[name.GetHashCode()] = true;
+                    Debug.Log($"[ComputeShader] Resource '{name}' is UAV");
+                }
+            }
+        }
+
+        /// <summary>
+        /// Discover and create constant buffers from reflection (excluding PushConstants and externally managed b0-b2).
+        /// </summary>
         private void DiscoverConstantBuffers(ID3D12ShaderReflection reflection)
         {
             var device = Engine.Device;
@@ -333,19 +464,17 @@ namespace Freefall.Graphics
 
                 var bindDesc = reflection.GetResourceBindingDescByName(cbReflection.Description.Name);
 
-                // Skip cbuffers at b0-b2 — these are externally managed by the caller
-                // (e.g. TerrainRenderer binds frustum planes, Hi-Z params, terrain params)
+                // Skip cbuffers at b0-b2 — externally managed by the caller
                 if (bindDesc.BindPoint <= 2) continue;
 
-                int rootSlot = bindDesc.BindPoint switch
-                {
-                    4 => 4,  // b4 → root slot 4 (TextureIndices / custom cbuffers)
-                    _ => -1
-                };
+                // Map register to root signature slot
+                int rootSlot = (int)bindDesc.BindPoint;
 
                 var cb = new ConstantBuffer(device, cbReflection);
                 cb.Slot = rootSlot;
                 _constantBuffers[cbReflection.Description.Name] = cb;
+
+                Debug.Log($"[ComputeShader] CBuffer '{cbReflection.Description.Name}' at b{bindDesc.BindPoint} → root slot {rootSlot}");
             }
         }
 

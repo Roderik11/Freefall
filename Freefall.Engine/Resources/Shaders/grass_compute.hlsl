@@ -14,10 +14,30 @@
 #pragma kernel CS_BuildDrawArgs
 #pragma kernel CS_BinMeshInstances
 
-// Push constants (same layout as grass.fx common.fx)
-struct PushConstantsData { uint4 indices[8]; };
-ConstantBuffer<PushConstantsData> PushConstants : register(b3);
-#define GET_INDEX(i) PushConstants.indices[i/4][i%4]
+// Push constants (root parameter 0, register b3) — bindless indices only
+cbuffer PushConstants : register(b3)
+{
+    uint DecoratorSlotsIdx;     // slot 0  — SRV
+    uint LODTableIdx;           // slot 1  — SRV
+    uint MeshRegistryIdx;       // slot 2  — SRV
+    uint HeightmapIdx;          // slot 3  — SRV
+    uint DecoControlIdx;        // slot 4  — SRV
+    uint BakedNormalIdx;        // slot 5  — SRV
+    uint BakedNormalUAVIdx;     // slot 6  — UAV (bake kernel)
+    uint DecoMapsIdx;           // slot 7  — SRV
+    uint DecoInstanceIdx;       // slot 8  — UAV (spawn kernel)
+    uint InstanceCounterIdx;    // slot 9  — UAV
+    uint DispatchArgsIdx;       // slot 10 — UAV (build args kernel)
+    uint MeshDecoInstanceIdx;   // slot 11 — UAV (spawn kernel)
+    uint SortedMeshInstanceIdx; // slot 12 — UAV (binning kernel)
+    uint MeshDrawArgsIdx;       // slot 13 — UAV (binning kernel)
+    uint MeshDrawCountIdx;      // slot 14 — UAV (binning kernel)
+    uint DrawSortedSRVIdx;      // slot 15 — SRV: → draw cmd slot 4
+    uint DrawSlotsSRVIdx;       // slot 16 — SRV: → draw cmd slot 5
+    uint DrawLODSRVIdx;         // slot 17 — SRV: → draw cmd slot 6
+    uint DrawMeshRegSRVIdx;     // slot 18 — SRV: → draw cmd slot 7
+    uint DrawMaterialsSRVIdx;   // slot 19 — SRV: → draw cmd slot 14
+};
 
 // Hi-Z occlusion parameters (root slot 2 → register b1, shared with terrain_quadtree.hlsl)
 cbuffer HiZParams : register(b1)
@@ -71,20 +91,6 @@ bool IsCellOccluded(float3 worldCenter, float worldRadius)
     float sphereNearestDepth = clipCenter.w - worldRadius;
     return sphereNearestDepth > sampledDepth;
 }
-
-// ─── Push constants: bindless resource indices ONLY ────────────────────────
-#define DecoratorSlotsIdx   GET_INDEX(0)    // SRV
-#define LODTableIdx         GET_INDEX(1)    // SRV
-#define MeshRegistryIdx     GET_INDEX(2)    // SRV
-#define HeightmapIdx        GET_INDEX(3)    // SRV
-#define DecoControlIdx      GET_INDEX(4)    // SRV
-#define BakedNormalIdx      GET_INDEX(5)    // SRV
-#define BakedNormalUAVIdx   GET_INDEX(6)    // UAV (bake kernel)
-#define DecoMapsIdx         GET_INDEX(7)    // SRV
-#define DecoInstanceIdx     GET_INDEX(8)    // UAV (spawn kernel)
-#define InstanceCounterIdx  GET_INDEX(9)    // UAV
-#define DispatchArgsIdx     GET_INDEX(10)   // UAV (build args kernel)
-#define MeshDecoInstanceIdx GET_INDEX(11)   // UAV (spawn kernel)
 
 // ─── Per-dispatch parameters ───────────────────────────────────────────────
 cbuffer DecoParams : register(b4)
@@ -512,18 +518,7 @@ void CS_BuildDrawArgs(uint3 dtid : SV_DispatchThreadID)
 //     MeshDrawCountIdx       = new: UAV for draw count (1 uint)
 // ═══════════════════════════════════════════════════════════════════════════
 
-// Additional push constant slots for binning (set per-dispatch)
-// Use slots 12+ which are free after the 12 resource indices (0-11)
-#define SortedMeshInstanceIdx GET_INDEX(12)
-#define MeshDrawArgsIdx       GET_INDEX(13)
-#define MeshDrawCountIdx      GET_INDEX(14)
-
-// SRV indices to embed in each draw command's root constants (slots 4-15 of grass_mesh.fx)
-#define DrawSortedSRVIdx      GET_INDEX(15)  // -> draw cmd slot 4: SortedInstancesIdx
-#define DrawSlotsSRVIdx       GET_INDEX(16)  // -> draw cmd slot 5: DecoratorSlotsIdx
-#define DrawLODSRVIdx         GET_INDEX(17)  // -> draw cmd slot 6: LODTableIdx
-#define DrawMeshRegSRVIdx     GET_INDEX(18)  // -> draw cmd slot 7: MeshRegistryIdx
-#define DrawMaterialsSRVIdx   GET_INDEX(19)  // -> draw cmd slot 14: MaterialsIdx
+// Binning push constant slots (12-19) are named fields in cbuffer PushConstants above.
 
 #define MAX_MESH_TYPES 32
 

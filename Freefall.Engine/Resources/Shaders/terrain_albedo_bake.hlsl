@@ -7,14 +7,14 @@
 #pragma kernel CSBakeTerrainAlbedo
 
 
-struct PushConstantsData { uint4 indices[8]; };
-#define GET_INDEX(i) PushConstants.indices[i/4][i%4]
-ConstantBuffer<PushConstantsData> PushConstants : register(b3);
-
-#define ControlMapsIdx  GET_INDEX(0)   // SRV: splatmap Texture2DArray
-#define DiffuseMapsIdx  GET_INDEX(1)   // SRV: diffuse layer Texture2DArray
-#define OutputUAVIdx    GET_INDEX(2)   // UAV: output RWTexture2D<float4>
-#define TilingBufIdx    GET_INDEX(3)   // SRV: StructuredBuffer<float4> (LayerTiling, 32 entries)
+// Push constants (root parameter 0, register b3) — bindless indices only
+cbuffer PushConstants : register(b3)
+{
+    uint ControlMapsIdx;    // slot 0 — SRV: splatmap Texture2DArray
+    uint DiffuseMapsIdx;    // slot 1 — SRV: diffuse layer Texture2DArray
+    uint OutputUAVIdx;      // slot 2 — UAV: output RWTexture2D<float4>
+    uint TilingBufIdx;      // slot 3 — SRV: StructuredBuffer<float4> (LayerTiling, 32 entries)
+};
 
 SamplerState sampData : register(s0);  // WrappedAnisotropic
 
