@@ -1,7 +1,32 @@
+cbuffer PushConstants : register(b3)
+{
+    uint _reserved0;
+    uint LightDataIdx;          // 1: Per-instance PointLightData buffer
+    uint DescriptorBufIdx;      // 2
+    uint _reserved3;
+    uint SortedIndicesIdx;      // 4
+    uint _reserved5;
+    uint _reserved6;
+    uint IndexBufferIdx;        // 7
+    uint BaseIndex;             // 8
+    uint PosBufferIdx;          // 9
+    uint _reserved10;
+    uint _reserved11;
+    uint _reserved12;
+    uint InstanceBaseOffset;    // 13
+    uint _reserved14;
+    uint GlobalTransformBufferIdx; // 15
+    uint _reserved16;
+    uint NormalTexIdx;           // 17: G-Buffer normals
+    uint DepthTexIdx;            // 18: G-Buffer depth
+    uint AlbedoTexIdx;           // 19: G-Buffer albedo
+    uint DataTexIdx;             // 20: G-Buffer data
+};
+
 #include "common.fx"
 // @RenderState(DepthTest=false, DepthWrite=false, Blend=Additive, CullMode=None, RenderTargetFormat=R16G16B16A16_Float)
 
-// Per-instance light data — packed into a StructuredBuffer, same pattern as terrain's TerrainPatchData
+// Per-instance light data — packed into a StructuredBuffer
 struct PointLightData
 {
     float3 Color;
@@ -9,24 +34,6 @@ struct PointLightData
     float3 Position; // camera-relative
     float Range;
 };
-
-// Standard InstanceBatch push constant layout (slots 2-15 set by command signature)
-#define DescriptorBufIdx GET_INDEX(2)
-#define Reserved0Idx GET_INDEX(3)
-#define SortedIndicesIdx GET_INDEX(4)
-#define IndexBufferIdx GET_INDEX(7)
-#define BaseIndex GET_INDEX(8)
-#define PosBufferIdx GET_INDEX(9)
-#define InstanceBaseOffset GET_INDEX(13)
-
-// Per-instance buffer: PointLightData (slot 1, same as terrain's TerrainDataIdx)
-#define LightDataIdx GET_INDEX(1)
-
-// G-Buffer textures (slots 17-20, set by Material.Apply, above command signature range)
-#define NormalTexIdx GET_INDEX(17)
-#define DepthTexIdx GET_INDEX(18)
-#define AlbedoTexIdx GET_INDEX(19)
-#define DataTexIdx GET_INDEX(20)
 
 // Per-instance descriptor (matches C# InstanceDescriptor: 12 bytes)
 struct InstanceDescriptor

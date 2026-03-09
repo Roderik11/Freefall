@@ -3,17 +3,12 @@
 // Sprites are read from a StructuredBuffer via SV_VertexID.
 // Each sprite carries its own texture index into the bindless heap.
 
-struct PushConstantsData
+cbuffer PushConstants : register(b3)
 {
-    uint4 indices[8]; // 32 uints tightly packed as 8 vectors of 4
+    uint SpriteBufferIdx;   // 0
+    float ScreenWidth;      // 1
+    float ScreenHeight;     // 2
 };
-ConstantBuffer<PushConstantsData> PushConstants : register(b3);
-#define GET_INDEX(i) PushConstants.indices[i/4][i%4]
-
-// Push constant slots
-#define SpriteBufferIdx GET_INDEX(0)
-#define ScreenWidth     asfloat(GET_INDEX(1))
-#define ScreenHeight    asfloat(GET_INDEX(2))
 
 struct Sprite
 {

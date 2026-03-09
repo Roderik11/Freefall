@@ -1,15 +1,16 @@
+cbuffer PushConstants : register(b3)
+{
+    uint NormalTexIdx;          // 0: G-Buffer normal texture
+    uint DepthTexIdx;           // 1: G-Buffer depth texture (hardware)
+    uint ShadowMapIdx;          // 2: Shadow map texture array
+    uint DepthGBufIdx;          // 3: G-Buffer linear depth (R32_Float, for debug viz)
+    uint AlbedoTexIdx;          // 4: G-Buffer albedo texture (for PBR)
+    uint DataTexIdx;            // 5: G-Buffer data texture (roughness, metal, ao)
+    uint LightingCascadeSRVIdx; // 6: SRV: GPU-computed cascade data (0 = use cbuffer)
+};
+
 #include "common.fx"
 // @RenderState(DepthTest=false, DepthWrite=false, Blend=Additive)
-
-// Light Pass Push Constant Layout
-// Slots 0-5: Light-specific textures (procedural fullscreen quad, no vertex buffers)
-#define NormalTexIdx GET_INDEX(0)   // G-Buffer normal texture
-#define DepthTexIdx GET_INDEX(1)    // G-Buffer depth texture (hardware)
-#define ShadowMapIdx GET_INDEX(2)   // Shadow map texture array
-#define DepthGBufIdx GET_INDEX(3)   // G-Buffer linear depth (R32_Float, for debug viz)
-#define AlbedoTexIdx GET_INDEX(4)   // G-Buffer albedo texture (for PBR)
-#define DataTexIdx GET_INDEX(5)     // G-Buffer data texture (roughness, metal, ao)
-#define LightingCascadeSRVIdx GET_INDEX(6)  // SRV: GPU-computed cascade data (0 = use cbuffer)
 
 
 // Light params from ObjectConstants (Slot 2, b1)

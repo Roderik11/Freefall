@@ -1,22 +1,54 @@
+cbuffer PushConstants : register(b3)
+{
+    // Slots 0-1: Reserved for light/composition passes
+    uint _reserved0;
+    uint _reserved1;
+    // Slots 2-13: Mesh draw data
+    uint DescriptorBufIdx;      // 2: StructuredBuffer<InstanceDescriptor> - per-instance descriptor
+    uint _reserved3;            // 3: Reserved (was MaterialIDsIdx)
+    uint SortedIndicesIdx;      // 4: StructuredBuffer<uint> - sorted draw order indices
+    uint BoneWeightsIdx;        // 5: Unused for static meshes (0)
+    uint BonesIdx;              // 6: Unused for static meshes (0)
+    uint IndexBufferIdx;        // 7: StructuredBuffer<uint> - mesh index buffer
+    uint BaseIndex;             // 8: Base index offset into index buffer
+    uint PosBufferIdx;          // 9: StructuredBuffer<float3> - vertex positions
+    uint NormBufferIdx;         // 10: StructuredBuffer<float3> - vertex normals
+    uint UVBufferIdx;           // 11: StructuredBuffer<float2> - vertex UVs
+    uint NumBones;              // 12: Number of bones (for skinned shaders)
+    uint InstanceBaseOffset;    // 13: Base offset for instance ID (per-command)
+    // Slots 14-15: Global bindless buffers
+    uint MaterialsIdx;          // 14: Index to materials buffer
+    uint GlobalTransformBufferIdx; // 15: Index to global TransformBuffer
+    // Slot 16: Debug
+    uint DebugMode;             // 16: Debug visualization mode
+    uint _reserved17;
+    uint _reserved18;
+    uint _reserved19;
+    // Slots 20-21: Shadow pass
+    uint ExpansionBufferIdx;    // 20: SRV: expansion buffer (cascadeIdx<<30 | instanceIdx)
+    uint CascadeBufferSRVIdx;   // 21: SRV: StructuredBuffer<CascadeData>
+};
+
 #include "common.fx"
 // @RenderState(RenderTargets=4)
 
-// Unified Push Constant Layout (Slots 2-11)
-// Used by all batched geometry shaders (gbuffer, gbuffer_skinned, mesh_skybox)
-// Slots 0-1: Reserved for light/composition passes (texture indices)
-#define DescriptorBufIdx GET_INDEX(2)   // StructuredBuffer<InstanceDescriptor> - per-instance descriptor
-#define Reserved0Idx GET_INDEX(3)        // Reserved (was MaterialIDsIdx)
-#define SortedIndicesIdx GET_INDEX(4)   // StructuredBuffer<uint> - sorted draw order indices
-#define BoneWeightsIdx GET_INDEX(5)     // Unused for static meshes (0)
-#define BonesIdx GET_INDEX(6)           // Unused for static meshes (0)
-#define IndexBufferIdx GET_INDEX(7)     // StructuredBuffer<uint> - mesh index buffer (BINDLESS!)
-#define BaseIndex GET_INDEX(8)          // Base index offset into index buffer for mesh parts
-#define PosBufferIdx GET_INDEX(9)       // StructuredBuffer<float3> - vertex positions
-#define NormBufferIdx GET_INDEX(10)     // StructuredBuffer<float3> - vertex normals
-#define UVBufferIdx GET_INDEX(11)       // StructuredBuffer<float2> - vertex UVs
-#define NumBones GET_INDEX(12)           // Number of bones (for skinned shaders)
-#define InstanceBaseOffset GET_INDEX(13) // Base offset for instance ID (per-command)
-#define DebugMode GET_INDEX(16)          // Debug visualization mode (set per-frame, not per-draw)
+// Per-instance descriptor (matches C# InstanceDescriptor: 12 bytes)
+struct InstanceDescriptor
+{
+    uint TransformSlot;
+    uint MaterialId;
+    uint CustomDataIdx;
+};
+
+// Helper to get material from instance's MaterialID (override common.fx version)
+inline MaterialData GetMaterial(uint id)
+{
+    StructuredBuffer<MaterialData> materials = ResourceDescriptorHeap[MaterialsIdx];
+    return materials[id];
+}
+#define GET_MATERIAL(id) GetMaterial(id)
+
+SamplerState Sampler : register(s0);
 
 struct VSOutput
 {
@@ -28,12 +60,12 @@ struct VSOutput
     float Depth : TEXCOORD3;
 };
 
-// Per-instance descriptor (matches C# InstanceDescriptor: 12 bytes)
-struct InstanceDescriptor
+struct PSOutput
 {
-    uint TransformSlot;
-    uint MaterialId;
-    uint CustomDataIdx;
+    float4 Albedo : SV_Target0;
+    float4 Normal : SV_Target1;
+    float4 Data : SV_Target2;
+    float  Depth : SV_Target3;
 };
 
 VSOutput VS(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_InstanceID)
@@ -85,19 +117,6 @@ VSOutput VS(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_InstanceI
     return output;
 }
 
-struct PSOutput
-{
-    float4 Albedo : SV_Target0;
-    float4 Normal : SV_Target1;
-    float4 Data : SV_Target2;
-    float  Depth : SV_Target3;
-};
-
-// Shadow pass - push constants for single-pass multi-cascade rendering
-#define ExpansionBufferIdx   GET_INDEX(20) // SRV: expansion buffer (cascadeIdx<<30 | instanceIdx)
-#define CascadeBufferSRVIdx  GET_INDEX(21) // SRV: StructuredBuffer<CascadeData>
-
-
 // Shadow pass - minimal output structure
 struct ShadowVSOutput
 {
@@ -106,8 +125,6 @@ struct ShadowVSOutput
     nointerpolation uint MaterialID : TEXCOORD1;
     nointerpolation uint RTIndex : SV_RenderTargetArrayIndex;
 };
-
-SamplerState Sampler : register(s0);
 
 // Shadow vertex shader - single-pass multi-cascade via expansion buffer
 // Each instanceID maps to exactly one (instance, cascade) pair from the expansion buffer.
@@ -254,4 +271,3 @@ technique11 GBuffer
         SetPixelShader(CompileShader(ps_6_6, PS_Shadow()));
     }
 }
-

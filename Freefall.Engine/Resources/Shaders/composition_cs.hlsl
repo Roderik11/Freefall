@@ -4,7 +4,6 @@
 #pragma kernel CSCompose
 
 // Named push constants for ComputeShader reflection
-#define PUSH_CONSTANTS_DEFINED
 cbuffer PushConstants : register(b3)
 {
     uint AlbedoTexIdx;

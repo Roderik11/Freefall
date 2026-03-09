@@ -4,23 +4,24 @@
 // AS does trivial grouping, MS expands billboard/cross quads from DecoInstance.
 // Mesh-mode decorators are rendered by a separate VS/PS pipeline.
 // ═══════════════════════════════════════════════════════════════════════════
-#include "common.fx"
+cbuffer PushConstants : register(b3)
+{
+    uint DecoratorSlotsIdx;     // 0
+    uint LODTableIdx;           // 1
+    uint MeshRegistryIdx;       // 2
+    uint DecoInstanceSRV;       // 3
+    uint InstanceCount;         // 4
+    uint MaterialsBufferIdx;    // 5
+    uint BakedAlbedoIdx;        // 6
+    uint _reserved7;            // 7: was WindTime (now in SceneConstants)
+    uint _reserved8;            // 8: was CamPosX
+    uint _reserved9;            // 9: was CamPosY
+    uint _reserved10;           // 10: was CamPosZ
+    uint CascadeBufferSRVIdx;   // 11: Shadow-only
+    uint ShadowCascadeCount;    // 12
+};
 
-// Push constant layout — must match TerrainRenderer.cs DispatchDecorator()
-#define DecoratorSlotsIdx   GET_INDEX(0)
-#define LODTableIdx         GET_INDEX(1)
-#define MeshRegistryIdx     GET_INDEX(2)
-#define DecoInstanceSRV     GET_INDEX(3)
-#define InstanceCount       GET_INDEX(4)
-#define MaterialsBufferIdx  GET_INDEX(5)
-#define BakedAlbedoIdx      GET_INDEX(6)
-#define WindTime            asfloat(GET_INDEX(7))
-#define CamPosX             asfloat(GET_INDEX(8))
-#define CamPosY             asfloat(GET_INDEX(9))
-#define CamPosZ             asfloat(GET_INDEX(10))
-// Shadow-only (set by C# when pass == Shadow)
-#define CascadeBufferSRVIdx GET_INDEX(11)
-#define ShadowCascadeCount  GET_INDEX(12)
+#include "common.fx"
 
 // ─── GPU structs ───────────────────────────────────────────────────────────
 
@@ -157,7 +158,7 @@ void MS(
     StructuredBuffer<DecoInstance>   instances = ResourceDescriptorHeap[DecoInstanceSRV];
     StructuredBuffer<DecoratorSlot> slots     = ResourceDescriptorHeap[DecoratorSlotsIdx];
     StructuredBuffer<LODEntry>      lodTbl    = ResourceDescriptorHeap[LODTableIdx];
-    float3 camPos = float3(CamPosX, CamPosY, CamPosZ);
+    float3 camPos = CamPos;
 
     // Degenerate output helper
     bool degenerate = (instInBatch >= batchCount || globalInst >= InstanceCount);
@@ -232,8 +233,8 @@ void MS(
 
     // Wind
     float windInfluence = lp.y * lp.y;
-    float windWave1 = sin(WindTime * 2.1 + worldPos.x * 0.8 + worldPos.z * 0.6) * 0.12;
-    float windWave2 = sin(WindTime * 1.4 + worldPos.x * 0.5 - worldPos.z * 0.9) * 0.08;
+    float windWave1 = sin(Time * 2.1 + worldPos.x * 0.8 + worldPos.z * 0.6) * 0.12;
+    float windWave2 = sin(Time * 1.4 + worldPos.x * 0.5 - worldPos.z * 0.9) * 0.08;
     worldPos.x += (windWave1 + windWave2) * windInfluence * scaleH;
     worldPos.z += (windWave2 - windWave1 * 0.5) * windInfluence * scaleH;
 
@@ -405,7 +406,7 @@ void MS_Shadow(
     StructuredBuffer<DecoInstance>   instances = ResourceDescriptorHeap[DecoInstanceSRV];
     StructuredBuffer<DecoratorSlot> slots     = ResourceDescriptorHeap[DecoratorSlotsIdx];
     StructuredBuffer<LODEntry>      lodTbl    = ResourceDescriptorHeap[LODTableIdx];
-    float3 camPos = float3(CamPosX, CamPosY, CamPosZ);
+    float3 camPos = CamPos;
 
     bool degenerate = (instInBatch >= batchCount || globalInst >= InstanceCount);
 
@@ -472,8 +473,8 @@ void MS_Shadow(
 
     // Wind
     float windInfluence = lp.y * lp.y;
-    float windWave1 = sin(WindTime * 2.1 + worldPos.x * 0.8 + worldPos.z * 0.6) * 0.12;
-    float windWave2 = sin(WindTime * 1.4 + worldPos.x * 0.5 - worldPos.z * 0.9) * 0.08;
+    float windWave1 = sin(Time * 2.1 + worldPos.x * 0.8 + worldPos.z * 0.6) * 0.12;
+    float windWave2 = sin(Time * 1.4 + worldPos.x * 0.5 - worldPos.z * 0.9) * 0.08;
     worldPos.x += (windWave1 + windWave2) * windInfluence * scaleH;
     worldPos.z += (windWave2 - windWave1 * 0.5) * windInfluence * scaleH;
 

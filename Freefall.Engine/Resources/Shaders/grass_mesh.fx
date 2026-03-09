@@ -2,19 +2,34 @@
 // Rendered via BindlessCommandSignature ExecuteIndirect (per-mesh-type batched draws)
 // @RenderState(RenderTargets=4)
 
+cbuffer PushConstants : register(b3)
+{
+    uint _reserved0;
+    uint _reserved1;
+    uint MeshPartIdIdx;         // 2: MeshPartEntry index in MeshRegistry
+    uint InstanceBaseIdx;       // 3: base offset in sorted instance buffer
+    uint SortedInstancesIdx;    // 4: SRV: sorted DecoInstance buffer
+    uint DecoratorSlotsIdx;     // 5: SRV: DecoratorSlot buffer
+    uint LODTableIdx;           // 6: SRV: LODEntry buffer
+    uint MeshRegistryIdx;       // 7: SRV: MeshPartEntry buffer
+    uint CascadeBufferSRVIdx;   // 8: SRV: CascadeData for shadow pass
+    uint _reserved9;
+    uint _reserved10;
+    uint _reserved11;
+    uint _reserved12;
+    uint _reserved13;
+    uint MaterialsIdx;          // 14: from common.fx
+    uint GlobalTransformBufferIdx; // 15
+};
+
 #include "common.fx"
 
-// ─── Push Constants ────────────────────────────────────────────────────────
-// Slots 2-3 are set per-draw by BindlessCommandSignature root constants:
-#define MeshPartIdIdx       GET_INDEX(2)    // uint: MeshPartEntry index in MeshRegistry
-#define InstanceBaseIdx     GET_INDEX(3)    // uint: base offset in sorted instance buffer
-
-// Slots 4+ are set once by C# before ExecuteIndirect:
-#define SortedInstancesIdx  GET_INDEX(4)    // SRV: sorted DecoInstance buffer
-#define DecoratorSlotsIdx   GET_INDEX(5)    // SRV: DecoratorSlot buffer
-#define LODTableIdx         GET_INDEX(6)    // SRV: LODEntry buffer
-#define MeshRegistryIdx     GET_INDEX(7)    // SRV: MeshPartEntry buffer
-// MaterialsIdx = GET_INDEX(14) from common.fx
+inline MaterialData GetMaterial(uint id)
+{
+    StructuredBuffer<MaterialData> materials = ResourceDescriptorHeap[MaterialsIdx];
+    return materials[id];
+}
+#define GET_MATERIAL(id) GetMaterial(id)
 
 // ─── GPU structs ───────────────────────────────────────────────────────────
 
@@ -222,9 +237,8 @@ PSOutput PS(VSOutput input)
     return output;
 }
 
-// ─── Shadow Pass ───────────────────────────────────────────────────────────
 
-#define CascadeBufferSRVIdx GET_INDEX(8)
+// Shadow structures
 
 struct ShadowVSOutput
 {

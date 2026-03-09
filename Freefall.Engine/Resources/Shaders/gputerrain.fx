@@ -1,3 +1,33 @@
+cbuffer PushConstants : register(b3)
+{
+    uint _reserved0;
+    uint TerrainDataIdx;        // 1: Per-instance TerrainPatchData buffer
+    uint DescriptorBufIdx;      // 2
+    uint _reserved3;
+    uint _reserved4;
+    uint _reserved5;
+    uint _reserved6;
+    uint IndexBufferIdx;        // 7
+    uint BaseIndex;             // 8
+    uint PosBufferIdx;          // 9
+    uint _reserved10;
+    uint _reserved11;
+    uint _reserved12;
+    uint _reserved13;
+    uint _reserved14;
+    uint GlobalTransformBufferIdx; // 15
+    uint DebugMode;             // 16
+    uint HeightTexIdx;          // 17
+    uint ControlMapsIdx;        // 18
+    uint DiffuseMapsIdx;        // 19
+    uint NormalMapsIdx;         // 20
+    uint DecoControlMapIdx;     // 21: Decoration control texture
+    uint _reserved22;
+    uint CascadeBufferSRVIdx;   // 23: SRV: StructuredBuffer<CascadeData>
+    uint ShadowCascadeCount;    // 24: uint: number of cascades
+    uint CascadeIdxBufIdx;      // 25: SRV: per-entry cascade index (uint)
+};
+
 #include "common.fx"
 // @RenderState(RenderTargets=4)
 
@@ -9,24 +39,6 @@ struct TerrainPatchData
 	float2 level;   // (lod, geomorphBlend)
 	float2 padding;
 };
-
-// Standard InstanceBatch push constant layout (slots 2-15 set by CPU before ExecuteIndirect)
-#define DescriptorBufIdx GET_INDEX(2)
-#define Reserved0Idx GET_INDEX(3)
-#define IndexBufferIdx GET_INDEX(7)
-#define BaseIndex GET_INDEX(8)
-#define PosBufferIdx GET_INDEX(9)
-#define DebugMode GET_INDEX(16)
-
-// Per-instance buffer: TerrainPatchData (slot 1, via generic per-instance buffer system)
-#define TerrainDataIdx GET_INDEX(1)
-
-// Terrain-specific texture indices (slots 17-20, set by Material.Apply, above command signature range)
-#define HeightTexIdx GET_INDEX(17)
-#define ControlMapsIdx GET_INDEX(18)
-#define DiffuseMapsIdx GET_INDEX(19)
-#define NormalMapsIdx GET_INDEX(20)
-#define DecoControlMapIdx GET_INDEX(21)  // Decoration control texture (Texture2DArray<uint4>)
 
 cbuffer terrain : register(b1)
 {
@@ -323,11 +335,6 @@ FragmentOutput PS(VertexOutput input)
 // CSEmitLeavesShadow emits compact (patch, cascadeIdx) pairs.
 // VS_Shadow reads cascadeIdx from a per-entry buffer. instanceID = patchIdx directly.
 
-
-// Push constants for shadow pass
-#define CascadeBufferSRVIdx  GET_INDEX(23) // SRV: StructuredBuffer<CascadeData>
-#define ShadowCascadeCount   GET_INDEX(24) // uint: number of cascades
-#define CascadeIdxBufIdx     GET_INDEX(25) // SRV: per-entry cascade index (uint)
 
 struct ShadowVSOutput
 {

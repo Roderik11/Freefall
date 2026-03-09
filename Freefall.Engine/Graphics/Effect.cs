@@ -137,12 +137,9 @@ namespace Freefall.Graphics
                 Techniques.Add(new EffectTechnique(td.Name, td, content));
             }
             
-            // Parse resource bindings from shader source (data-driven push constants)
-            ResourceBindings = FXParser.ParseResourceBindings(content);
-            
-            // Build hash→slot lookup for O(1) resolution at enqueue time
-            foreach (var binding in ResourceBindings)
-                _resourceSlots[binding.Name.GetHashCode()] = binding.Slot;
+            // Discover push constant slot mappings via shader reflection
+            // (same pattern as ComputeShader.DiscoverPushConstants)
+            DiscoverPushConstants();
             
             // Parse render state metadata from shader source (data-driven PSO creation)
             RenderState = FXParser.ParseRenderState(content);
@@ -169,6 +166,70 @@ namespace Freefall.Graphics
         /// </summary>
         public int GetPushConstantSlot(int nameHash)
             => _resourceSlots.TryGetValue(nameHash, out int slot) ? slot : -1;
+
+        /// <summary>
+        /// Discover push constant slot→name mappings from cbuffer PushConstants reflection.
+        /// Reflects on the first compiled shader in the first technique/pass.
+        /// Each variable's StartOffset / 4 = push constant slot index.
+        /// </summary>
+        private void DiscoverPushConstants()
+        {
+            // Find the first available shader reflection from compiled passes
+            Vortice.Direct3D12.Shader.ID3D12ShaderReflection? reflection = null;
+            foreach (var tech in Techniques)
+            {
+                foreach (var pass in tech.Passes)
+                {
+                    // Try VS first, then MS (mesh shader passes), then PS
+                    var shader = pass.VertexShader ?? pass.MeshShader ?? pass.PixelShader;
+                    if (shader?.Reflection != null)
+                    {
+                        reflection = shader.Reflection;
+                        break;
+                    }
+                }
+                if (reflection != null) break;
+            }
+
+            if (reflection == null)
+            {
+                Debug.Log($"[Effect] '{Name}' — no shader reflection available, push constants not discovered");
+                return;
+            }
+
+            for (uint i = 0; i < reflection.Description.ConstantBuffers; i++)
+            {
+                var cbReflection = reflection.GetConstantBufferByIndex(i);
+                if (cbReflection.Description.Name != "PushConstants") continue;
+
+                var desc = cbReflection.Description;
+                for (uint v = 0; v < desc.VariableCount; v++)
+                {
+                    var variable = cbReflection.GetVariableByIndex(v);
+                    var varDesc = variable.Description;
+                    int slot = (int)(varDesc.StartOffset / 4);
+
+                    // Skip reserved padding fields
+                    string rawName = varDesc.Name;
+                    if (rawName.StartsWith("_reserved") || rawName.StartsWith("_pad"))
+                        continue;
+
+                    // Strip "Idx" suffix for the semantic name (e.g. "HeightTexIdx" → "HeightTex")
+                    string name = rawName;
+                    if (name.EndsWith("Idx"))
+                        name = name.Substring(0, name.Length - 3);
+
+                    int hash = name.GetHashCode();
+                    _resourceSlots[hash] = slot;
+                    
+                    // Also populate ResourceBindings for backwards compatibility
+                    ResourceBindings.Add(new ShaderResourceBinding { Name = name, Slot = slot });
+
+                    Debug.Log($"[Effect] '{Name}' push constant: '{name}' → slot {slot}");
+                }
+                break; // Only one PushConstants cbuffer
+            }
+        }
 
         private string LoadWithIncludes(string path)
         {

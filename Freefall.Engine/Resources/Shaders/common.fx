@@ -1,14 +1,3 @@
-#ifndef PUSH_CONSTANTS_DEFINED
-struct PushConstantsData
-{
-    uint4 indices[8]; // 32 uints tightly packed as 8 vectors of 4
-};
-
-#define GET_INDEX(i) PushConstants.indices[i/4][i%4]
-
-ConstantBuffer<PushConstantsData> PushConstants : register(b3);
-#endif
-
 cbuffer SceneConstants : register(b0)
 {
     float Time;
@@ -25,6 +14,7 @@ cbuffer SceneConstants : register(b0)
     float _fogPad0;
     float3 FogSunDirection;            // sun direction for sky-based fog color
     float _fogPad1;
+    float3 CamPos;                     // camera world position
 }
 
 // Material data for bindless texture lookup via Material ID indirection
@@ -41,25 +31,6 @@ struct MaterialData
     uint DetailTilingPacked; // float as bits: tiling scale
     uint Padding0;
 };
-
-// Materials buffer index - slot 14 in push constants (bindless)
-// Slots 2-13 are used by mesh rendering, so Materials uses 14 to avoid collision
-// Global transform buffer for GPU-driven rendering - slot 15
-// All entity transforms are stored here, indexed by TransformSlot
-// These macros and helpers depend on GET_INDEX from the packed push constants path
-#ifndef PUSH_CONSTANTS_DEFINED
-#define MaterialsIdx GET_INDEX(14)
-#define GlobalTransformBufferIdx GET_INDEX(15)
-
-// Helper to get material from instance's MaterialID
-// Uses bindless access via ResourceDescriptorHeap
-inline MaterialData GetMaterial(uint id)
-{
-    StructuredBuffer<MaterialData> materials = ResourceDescriptorHeap[MaterialsIdx];
-    return materials[id];
-}
-#define GET_MATERIAL(id) GetMaterial(id)
-#endif
 
 // Shadow cascade data — shared by all shadow-related shaders
 // Stride must match C# GPUCuller.CascadeData exactly (240 bytes)

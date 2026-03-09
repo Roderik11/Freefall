@@ -1756,10 +1756,6 @@ namespace Freefall.Components
             commandList.SetGraphicsRoot32BitConstant(0, (uint)_maxDecoInstances, 4);
             commandList.SetGraphicsRoot32BitConstant(0, Graphics.Material.MaterialsBufferIndex, 5); // MaterialsBufferIdx
             commandList.SetGraphicsRoot32BitConstant(0, _bakedAlbedoSRV, 6);                    // BakedAlbedoIdx
-            commandList.SetGraphicsRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(Base.Time.TotalTime), 7); // WindTime
-            commandList.SetGraphicsRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(camPos.X), 8);
-            commandList.SetGraphicsRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(camPos.Y), 9);
-            commandList.SetGraphicsRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(camPos.Z), 10);
 
             if (pass == RenderPass.Shadow)
             {

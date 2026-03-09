@@ -1,3 +1,15 @@
+cbuffer PushConstants : register(b3)
+{
+    uint _reserved0;
+    uint _reserved1;
+    uint _reserved2;
+    uint _reserved3;
+    uint _reserved4;
+    uint _reserved5;
+    uint _reserved6;
+    uint IndexBufferIdx;        // 7
+};
+
 #include "common.fx"
 // @RenderState(RenderTargets=4, DepthTest=false, DepthWrite=false)
 
@@ -9,7 +21,7 @@ struct VSOutput
 VSOutput VS(uint vertexID : SV_VertexID)
 {
     VSOutput output;
-    StructuredBuffer<float3> positions = ResourceDescriptorHeap[GET_INDEX(7)];
+    StructuredBuffer<float3> positions = ResourceDescriptorHeap[IndexBufferIdx];
     output.Position = float4(positions[vertexID], 1.0f);
     return output;
 }

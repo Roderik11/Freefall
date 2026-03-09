@@ -1,23 +1,25 @@
+cbuffer PushConstants : register(b3)
+{
+    uint _reserved0;
+    uint _reserved1;
+    uint DescriptorBufIdx;      // 2
+    uint _reserved3;            // 3
+    uint SortedIndicesIdx;      // 4
+    uint BoneWeightsIdx;        // 5
+    uint BonesIdx;              // 6
+    uint IndexBufferIdx;        // 7
+    uint BaseIndex;             // 8
+    uint PosBufferIdx;          // 9
+    uint NormBufferIdx;         // 10
+    uint UVBufferIdx;           // 11
+    uint NumBones;              // 12
+    uint InstanceBaseOffset;    // 13
+    uint MaterialsIdx;          // 14
+    uint GlobalTransformBufferIdx; // 15
+};
+
 #include "common.fx"
 // @RenderState(RenderTargets=4, DepthWrite=false, DepthFunc=GreaterEqual, CullMode=None)
-
-// Unified Push Constant Layout (Slots 2-15) - matches gbuffer.fx
-// Used by all batched geometry shaders (gbuffer, gbuffer_skinned, mesh_skybox)
-// Slots 0-1: Reserved for light/composition passes (texture indices)
-#define DescriptorBufIdx GET_INDEX(2)    // StructuredBuffer<InstanceDescriptor> - per-instance descriptor
-#define Reserved0Idx GET_INDEX(3)         // Reserved (was MaterialIDsIdx)
-#define SortedIndicesIdx GET_INDEX(4)    // StructuredBuffer<uint> - sorted draw order indices
-#define BoneWeightsIdx GET_INDEX(5)      // Unused for skybox (0)
-#define BonesIdx GET_INDEX(6)            // Unused for skybox (0)
-#define IndexBufferIdx GET_INDEX(7)      // StructuredBuffer<uint> - mesh index buffer
-#define BaseIndex GET_INDEX(8)           // Base index offset into index buffer
-#define PosBufferIdx GET_INDEX(9)        // StructuredBuffer<float3> - vertex positions
-#define NormBufferIdx GET_INDEX(10)      // StructuredBuffer<float3> - vertex normals
-#define UVBufferIdx GET_INDEX(11)        // StructuredBuffer<float2> - vertex UVs
-#define NumBones GET_INDEX(12)           // Unused for skybox
-#define InstanceBaseOffset GET_INDEX(13) // Base offset for instance ID (per-command)
-#define MaterialsIdx GET_INDEX(14)       // Index to materials buffer
-#define GlobalTransformBufferIdx GET_INDEX(15) // Index to global TransformBuffer
 
 // SceneConstants (b0) from common.fx: Time, View, Projection, ViewProjection, ViewInverse
 

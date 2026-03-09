@@ -43,7 +43,7 @@ Freefall is a fully GPU-driven deferred renderer. The CPU submits unsorted draw 
 | **MeshRegistry** | Global GPU buffer of mesh metadata. Persistent `MeshPartID`s eliminate per-frame CPU grouping — the GPU looks up vertex/index info directly. |
 | **TransformBuffer** | Pooled persistent GPU transform slots with dirty-flag uploads. Entities hold a stable `TransformSlot` for their lifetime. |
 | **MaterialBlock** | Per-instance parameter overrides. Data is staged into contiguous byte arrays at enqueue time and uploaded as generic per-instance SoA buffers via push constants. |
-| **Material / Effect** | Data-driven PSO management. `@RenderState` annotations in shaders auto-configure blend, depth, raster state. `MasterEffects` pattern for global parameter broadcast. |
+| **Material / Effect** | Data-driven PSO management. `@RenderState` annotations in shaders auto-configure blend, depth, raster state. `MasterEffects` pattern for global parameter broadcast. Effect push constants discovered via shader reflection on named `cbuffer PushConstants`. |
 | **GPUCuller** | 6-pass compute pipeline: Clear → Visibility → Histogram → PrefixSum → Scatter → CommandGen. Shared between camera and shadow passes. |
 | **DeferredRenderer** | Orchestrates the G-Buffer, shadow atlas, light accumulation, and composition passes. |
 
@@ -62,7 +62,7 @@ Freefall is a fully GPU-driven deferred renderer. The CPU submits unsorted draw 
 - **Ocean** — FFT-based ocean with 4 spectrum bands, GPU tessellation, world-space shore displacement attenuation via terrain heightmap, PS shore effects (terrain show-through with refraction, animated foam, shallow water color), and distance-based normal band fadeout
 - **LOD System** — Automatic LOD level selection for static meshes based on screen-space size
 - **Point Lights** — Deferred point lights via per-instance `StructuredBuffer`, rendered as sphere volumes with additive blending
-- **Bindless SM 6.6** — All resources accessed via `ResourceDescriptorHeap` and push constants; no Input Assembler
+- **Bindless SM 6.6** — All resources accessed via `ResourceDescriptorHeap` and reflection-driven named push constants; no Input Assembler
 - **Debug Visualization** — F5 cycles through: cascade colors, shadow factor, and linear depth
 
 ### Physics
@@ -108,7 +108,7 @@ Freefall/
 │   │   ├── MeshRegistry.cs     # Global GPU mesh metadata buffer
 │   │   ├── TransformBuffer.cs  # Persistent pooled GPU transform slots
 │   │   ├── Material.cs         # Bindless material system with MaterialBlock overrides
-│   │   ├── Effect.cs           # Shader compilation, technique/pass management
+│   │   ├── Effect.cs           # Shader compilation, technique/pass management, push constant reflection
 │   │   ├── OceanFFT.cs         # GPU compute FFT for ocean displacement, slope, and foam
 │   │   └── ...                 # Mesh, Texture, ConstantBuffer, StreamingManager, etc.
 │   ├── Animation/              # Skeletal animation, clip playback, bone matrix management

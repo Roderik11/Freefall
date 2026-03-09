@@ -1,17 +1,26 @@
+cbuffer PushConstants : register(b3)
+{
+    uint _reserved0;
+    uint OceanDataIdx;           // 1
+    uint DescriptorBufIdx;       // 2
+    uint _reserved3;
+    uint SortedIndicesIdx;       // 4
+    uint _reserved5;
+    uint _reserved6;
+    uint IndexBufferIdx;         // 7
+    uint BaseIndex;              // 8
+    uint PosBufferIdx;           // 9
+    uint NormBufferIdx;          // 10
+    uint UVBufferIdx;            // 11
+    uint _reserved12;
+    uint InstanceBaseOffset;     // 13
+    uint _reserved14;
+    uint GlobalTransformBufferIdx; // 15
+};
+
 #include "common.fx"
 #include "sky_common.fx"
 // @RenderState(RenderTargets=1)
-
-// Standard push constant layout — MUST match gbuffer.fx exactly
-#define OceanDataIdx GET_INDEX(1)
-#define DescriptorBufIdx GET_INDEX(2)
-#define SortedIndicesIdx GET_INDEX(4)
-#define IndexBufferIdx GET_INDEX(7)
-#define BaseIndex GET_INDEX(8)
-#define PosBufferIdx GET_INDEX(9)
-#define NormBufferIdx GET_INDEX(10)
-#define UVBufferIdx GET_INDEX(11)
-#define InstanceBaseOffset GET_INDEX(13)
 
 struct InstanceDescriptor
 {

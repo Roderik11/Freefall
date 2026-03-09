@@ -120,6 +120,7 @@ namespace Freefall.Components
                 pair.Value.SetParameter("FogEnabled", Engine.Settings.Fog ? 1.0f : 0.0f);
                 pair.Value.SetParameter("FogDensity", Engine.Settings.FogDensity);
                 pair.Value.SetParameter("FogSunDirection", SkyboxRenderer.CurrentSunDirection);
+                pair.Value.SetParameter("CamPos", cameraPos);
             }
         }
         

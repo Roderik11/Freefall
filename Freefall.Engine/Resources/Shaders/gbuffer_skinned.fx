@@ -1,24 +1,38 @@
-﻿#include "common.fx"
+cbuffer PushConstants : register(b3)
+{
+    uint _reserved0;
+    uint _reserved1;
+    uint DescriptorBufIdx;      // 2
+    uint _reserved3;            // 3
+    uint SortedIndicesIdx;      // 4
+    uint BoneWeightsIdx;        // 5: StructuredBuffer<BoneWeight> - per-mesh bone weights
+    uint BonesIdx;              // 6: StructuredBuffer<matrix> - batched bone matrices
+    uint IndexBufferIdx;        // 7
+    uint BaseIndex;             // 8
+    uint PosBufferIdx;          // 9
+    uint NormBufferIdx;         // 10
+    uint UVBufferIdx;           // 11
+    uint NumBones;              // 12: Number of bones per skeleton
+    uint InstanceBaseOffset;    // 13
+    uint MaterialsIdx;          // 14
+    uint GlobalTransformBufferIdx; // 15
+    uint DebugMode;             // 16
+    uint _reserved17;
+    uint _reserved18;
+    uint _reserved19;
+    uint ExpansionBufferIdx;    // 20
+    uint CascadeBufferSRVIdx;   // 21
+};
+
+#include "common.fx"
 // @RenderState(RenderTargets=4)
 
-// Unified Push Constant Layout (Slots 2-15)
-// Used by all batched geometry shaders (gbuffer, gbuffer_skinned, mesh_skybox)
-// Slots 0-1: Reserved for light/composition passes (texture indices)
-#define DescriptorBufIdx GET_INDEX(2)       // StructuredBuffer<InstanceDescriptor> - per-instance descriptor
-#define Reserved0Idx GET_INDEX(3)            // Reserved (was MaterialIDsIdx)
-#define SortedIndicesIdx GET_INDEX(4)   // StructuredBuffer<uint> - sorted draw order indices
-#define BoneWeightsIdx GET_INDEX(5)     // StructuredBuffer<BoneWeight> - per-mesh bone weights
-#define BonesIdx GET_INDEX(6)           // StructuredBuffer<matrix> - batched bone matrices [inst0 bones][inst1 bones]...
-#define IndexBufferIdx GET_INDEX(7)     // StructuredBuffer<uint> - mesh index buffer (BINDLESS!)
-#define BaseIndex GET_INDEX(8)          // Base index offset into index buffer for mesh parts
-#define PosBufferIdx GET_INDEX(9)       // StructuredBuffer<float3> - vertex positions
-#define NormBufferIdx GET_INDEX(10)     // StructuredBuffer<float3> - vertex normals
-#define UVBufferIdx GET_INDEX(11)       // StructuredBuffer<float2> - vertex UVs
-#define NumBones GET_INDEX(12)          // Number of bones per skeleton (for bone offset calculation)
-#define InstanceBaseOffset GET_INDEX(13) // Base offset for instance ID (per-command)
-#define MaterialsIdx GET_INDEX(14)      // Index to materials buffer
-#define GlobalTransformBufferIdx GET_INDEX(15) // Index to global TransformBuffer
-#define DebugMode GET_INDEX(16)          // Debug visualization mode (set per-frame, not per-draw)
+inline MaterialData GetMaterial(uint id)
+{
+    StructuredBuffer<MaterialData> materials = ResourceDescriptorHeap[MaterialsIdx];
+    return materials[id];
+}
+#define GET_MATERIAL(id) GetMaterial(id)
 
 // Per-vertex bone weights (matches BoneWeight struct in Mesh.cs)
 struct BoneWeight
@@ -83,7 +97,7 @@ VSOutput VS(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_InstanceI
     float2 uv = uvs[vertexID];
     BoneWeight bw = boneWeights[vertexID];
     
-    // Bone matrices for this instance â€” indexed by arrival-order instance index
+    // Bone matrices for this instance — indexed by arrival-order instance index
     // (bone data is uploaded densely per-instance, not by TransformSlot)
     uint boneOffset = idx * NumBones;
     
@@ -130,10 +144,6 @@ struct PSOutput
     float4 Data : SV_Target2;
     float  Depth : SV_Target3;
 };
-
-// Shadow pass - push constants for single-pass multi-cascade rendering
-#define ExpansionBufferIdx   GET_INDEX(20) // SRV: expansion buffer (cascadeIdx<<30 | instanceIdx)
-#define CascadeBufferSRVIdx  GET_INDEX(21) // SRV: StructuredBuffer<CascadeData>
 
 
 // Shadow pass
@@ -224,13 +234,13 @@ PSOutput PS(VSOutput input)
     float4 color = albedoTex.Sample(Sampler, input.TexCoord);
     //clip(color.a - 0.25f);
     
-    // PBR material properties â€” defaults for meshes without PBR textures
+    // PBR material properties — defaults for meshes without PBR textures
     float roughness = 0.65;
     float metal = 0.0;
     float ao = 1.0;
     
     // Sample PBR textures if bound (index 0 = not bound)
-    // RoughnessIdx holds a specular map â€” invert to get roughness
+    // RoughnessIdx holds a specular map — invert to get roughness
     if (mat.RoughnessIdx != 0) { Texture2D rTex = ResourceDescriptorHeap[mat.RoughnessIdx]; roughness = 1.0 - rTex.Sample(Sampler, input.TexCoord).r; }
     if (mat.MetallicIdx  != 0) { Texture2D mTex = ResourceDescriptorHeap[mat.MetallicIdx];  metal     = mTex.Sample(Sampler, input.TexCoord).r; }
     if (mat.AOIdx        != 0) { Texture2D aTex = ResourceDescriptorHeap[mat.AOIdx];        ao        = aTex.Sample(Sampler, input.TexCoord).r; }

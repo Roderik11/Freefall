@@ -1,3 +1,29 @@
+cbuffer PushConstants : register(b3)
+{
+    uint _reserved0;
+    uint _reserved1;
+    uint DescriptorBufIdx;      // 2
+    uint _reserved3;            // 3
+    uint SortedIndicesIdx;      // 4
+    uint BoneWeightsIdx;        // 5
+    uint BonesIdx;              // 6
+    uint IndexBufferIdx;        // 7
+    uint BaseIndex;             // 8
+    uint PosBufferIdx;          // 9
+    uint NormBufferIdx;         // 10
+    uint UVBufferIdx;           // 11
+    uint NumBones;              // 12
+    uint InstanceBaseOffset;    // 13
+    uint MaterialsIdx;          // 14
+    uint GlobalTransformBufferIdx; // 15
+    uint DebugMode;             // 16
+    uint _reserved17;
+    uint _reserved18;
+    uint _reserved19;
+    uint ExpansionBufferIdx;    // 20
+    uint CascadeBufferSRVIdx;   // 21
+};
+
 #include "common.fx"
 // @RenderState(RenderTargets=4, CullMode=None)
 
@@ -9,20 +35,12 @@
 // - Wind flutter animation
 // - Distance-based alpha threshold
 
-// Unified Push Constant Layout (Slots 2-11) — MUST match gbuffer.fx exactly
-#define DescriptorBufIdx GET_INDEX(2)
-#define Reserved0Idx GET_INDEX(3)
-#define SortedIndicesIdx GET_INDEX(4)
-#define BoneWeightsIdx GET_INDEX(5)
-#define BonesIdx GET_INDEX(6)
-#define IndexBufferIdx GET_INDEX(7)
-#define BaseIndex GET_INDEX(8)
-#define PosBufferIdx GET_INDEX(9)
-#define NormBufferIdx GET_INDEX(10)
-#define UVBufferIdx GET_INDEX(11)
-#define NumBones GET_INDEX(12)
-#define InstanceBaseOffset GET_INDEX(13)
-#define DebugMode GET_INDEX(16)
+inline MaterialData GetMaterial(uint id)
+{
+    StructuredBuffer<MaterialData> materials = ResourceDescriptorHeap[MaterialsIdx];
+    return materials[id];
+}
+#define GET_MATERIAL(id) GetMaterial(id)
 
 struct InstanceDescriptor
 {
@@ -143,10 +161,6 @@ PSOutput PS(VSOutput input, bool isFrontFace : SV_IsFrontFace)
     output.Depth = input.Depth;
     return output;
 }
-
-// Shadow pass - push constants for single-pass multi-cascade rendering
-#define ExpansionBufferIdx   GET_INDEX(20) // SRV: expansion buffer (cascadeIdx<<30 | instanceIdx)
-#define CascadeBufferSRVIdx  GET_INDEX(21) // SRV: StructuredBuffer<CascadeData>
 
 
 // Shadow pass
