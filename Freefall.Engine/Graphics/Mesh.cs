@@ -598,5 +598,133 @@ namespace Freefall.Graphics
             return mesh;
         }
 
+        /// <summary>
+        /// Load an OBJ file from disk. Supports v/vn/vt/f (v/vt/vn format) and g groups as MeshParts.
+        /// Ported from Apex OBJReader.
+        /// </summary>
+        public static Mesh LoadOBJ(GraphicsDevice device, string path, float scale = 1f)
+        {
+            var culture = System.Globalization.CultureInfo.InvariantCulture;
+            string data = System.IO.File.ReadAllText(path);
+            string[] lines = data.Split(new[] { "\r\n", "\n" }, StringSplitOptions.RemoveEmptyEntries);
+
+            var positions = new List<Vector3>();
+            var normals = new List<Vector3>();
+            var uvs = new List<Vector2>();
+
+            var vertexList = new List<Vector3>();
+            var normalList = new List<Vector3>();
+            var uvList = new List<Vector2>();
+            var indexList = new List<uint>();
+
+            var parts = new List<MeshPart>();
+            var part = new MeshPart();
+            parts.Add(part);
+
+            int newVertices = 0;
+            int baseIndex = 0;
+            var hashMap = new Dictionary<string, int>();
+
+            var min = new Vector3(float.MaxValue);
+            var max = new Vector3(float.MinValue);
+
+            foreach (string line in lines)
+            {
+                if (line.Length == 0) continue;
+                string[] cl = line.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+
+                if (line.StartsWith("v "))
+                {
+                    var pos = new Vector3(
+                        float.Parse(cl[1], culture),
+                        float.Parse(cl[2], culture),
+                        float.Parse(cl[3], culture)) * scale;
+                    positions.Add(pos);
+                    min = Vector3.Min(min, pos);
+                    max = Vector3.Max(max, pos);
+                }
+                else if (line.StartsWith("vn "))
+                {
+                    normals.Add(new Vector3(
+                        float.Parse(cl[1], culture),
+                        float.Parse(cl[2], culture),
+                        float.Parse(cl[3], culture)));
+                }
+                else if (line.StartsWith("vt "))
+                {
+                    uvs.Add(new Vector2(
+                        float.Parse(cl[1], culture),
+                        float.Parse(cl[2], culture)));
+                }
+                else if (line.StartsWith("g "))
+                {
+                    baseIndex += part.NumIndices;
+                    part = new MeshPart { BaseIndex = baseIndex, Name = line.Substring(2) };
+                    parts.Add(part);
+                }
+                else if (line.StartsWith("f "))
+                {
+                    int num = cl.Length - 1;
+                    var vertHash = new List<string>(num);
+
+                    for (int i = 1; i < cl.Length; i++)
+                    {
+                        string[] tri = cl[i].Split('/');
+                        int pv = int.Parse(tri[0]) - 1;
+                        int pvt = tri.Length > 1 && tri[1].Length > 0 ? int.Parse(tri[1]) - 1 : 0;
+                        int pvn = tri.Length > 2 ? int.Parse(tri[2]) - 1 : 0;
+
+                        string hash = $"{pv}_{pvt}_{pvn}";
+                        vertHash.Add(hash);
+
+                        if (!hashMap.ContainsKey(hash))
+                        {
+                            hashMap[hash] = newVertices;
+                            vertexList.Add(positions[pv]);
+                            normalList.Add(pvn < normals.Count ? normals[pvn] : Vector3.UnitY);
+                            uvList.Add(pvt < uvs.Count ? uvs[pvt] : Vector2.Zero);
+                            newVertices++;
+                        }
+                    }
+
+                    if (num == 3)
+                    {
+                        indexList.Add((uint)hashMap[vertHash[2]]);
+                        indexList.Add((uint)hashMap[vertHash[0]]);
+                        indexList.Add((uint)hashMap[vertHash[1]]);
+                        part.NumIndices += 3;
+                    }
+                    else if (num == 4)
+                    {
+                        indexList.Add((uint)hashMap[vertHash[2]]);
+                        indexList.Add((uint)hashMap[vertHash[3]]);
+                        indexList.Add((uint)hashMap[vertHash[0]]);
+                        indexList.Add((uint)hashMap[vertHash[2]]);
+                        indexList.Add((uint)hashMap[vertHash[0]]);
+                        indexList.Add((uint)hashMap[vertHash[1]]);
+                        part.NumIndices += 6;
+                    }
+                    else if (num > 4)
+                    {
+                        for (int r = 0; r < num - 2; r++)
+                        {
+                            indexList.Add((uint)hashMap[vertHash[0]]);
+                            indexList.Add((uint)hashMap[vertHash[r + 1]]);
+                            indexList.Add((uint)hashMap[vertHash[r + 2]]);
+                            part.NumIndices += 3;
+                        }
+                    }
+                }
+            }
+
+            // Remove empty parts
+            parts.RemoveAll(p => p.NumIndices <= 0);
+
+            var mesh = new Mesh(device, vertexList.ToArray(), normalList.ToArray(), uvList.ToArray(), indexList.ToArray());
+            mesh.BoundingBox = new BoundingBox(min, max);
+            mesh.MeshParts.AddRange(parts);
+            return mesh;
+        }
+
     }
 }
