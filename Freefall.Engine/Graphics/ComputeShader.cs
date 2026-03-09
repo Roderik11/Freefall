@@ -368,7 +368,7 @@ namespace Freefall.Graphics
         private void CompileKernel(string entryPoint)
         {
             var device = Engine.Device;
-            var shader = new Shader(_cachedSource!, entryPoint, "cs_6_6");
+            var shader = new Shader(_cachedSource!, entryPoint, "cs_6_6", _basePath);
 
             var pso = device.CreateComputePipelineState(shader.Bytecode);
 

@@ -39,18 +39,15 @@ namespace Freefall.Components
         
         // Unified cascade structured buffer: StructuredBuffer<CascadeData>
         // Holds planes + VP + PrevVP per cascade. All consumers (cull, terrain, grass) read from this.
-        private ID3D12Resource[]? _cascadeBuffers;
-        private IntPtr[]? _cascadeBufferPtrs;
+        private GraphicsBuffer[]? _cascadeBuffers;
         private uint[]? _cascadeBufferSrvIndices;
         // TEMP DEBUG: separate VP-only buffer to test if CascadeData struct offset issue
-        private ID3D12Resource[]? _vpOnlyBuffers;
-        private IntPtr[]? _vpOnlyPtrs;
+        private GraphicsBuffer[]? _vpOnlyBuffers;
         private uint[]? _vpOnlySrvIndices;
         private const int FrameCount = 3;
 
         // Shadow cascade planes cbuffer (register b1) — used by compute culler
-        private ID3D12Resource[]? _shadowCascadeCBs;
-        private IntPtr[]? _shadowCascadeCBPtrs;
+        private GraphicsBuffer[]? _shadowCascadeCBs;
 
         // Dedicated shadow SceneConstants buffer (prevents overwriting opaque pass CBV)
         private ID3D12Resource[]? _shadowSceneConstantsBuffers;
@@ -61,9 +58,7 @@ namespace Freefall.Components
         private readonly Matrix4x4[] _prevShadowVPMatrices = new Matrix4x4[MaxCascades];
         
         // GPU-default cascade buffers for compute path (UAV + SRV)
-        private ID3D12Resource[]? _gpuCascadeBuffers;
-        private uint[]? _gpuCascadeBufferUavIndices;
-        private uint[]? _gpuCascadeBufferSrvIndices;
+        private GraphicsBuffer[]? _gpuCascadeBuffers;
         
         // Track whether GPU cascade compute was used this frame
         private bool _usedGpuCascadeCompute;
@@ -177,23 +172,23 @@ namespace Freefall.Components
             // Commit cbuffer data via Material.Apply (populates ObjectConstants + SceneConstants)
             Material.Apply(commandList, Engine.Device, Params);
             
-            // Switch to compute pipeline
+            // Switch to compute pipeline via ComputeShader
+            var lightCS = renderer.DirectionalLightCS;
             commandList.SetComputeRootSignature(Engine.Device.GlobalRootSignature);
             commandList.SetDescriptorHeaps(1, new[] { Engine.Device.SrvHeap });
-            commandList.SetPipelineState(renderer.DirectionalLightComputePSO);
             
-            // Push constants: 10 slots
+            // Push constants via ComputeShader reflection (10 slots)
             var desc = renderer.LightBuffer.Native.Description;
-            commandList.SetComputeRoot32BitConstant(0, renderer.Normals.BindlessIndex, 0);
-            commandList.SetComputeRoot32BitConstant(0, renderer.Depth.BindlessIndex, 1);
-            commandList.SetComputeRoot32BitConstant(0, renderer.ShadowTextureArray?.BindlessIndex ?? 0u, 2);
-            commandList.SetComputeRoot32BitConstant(0, renderer.DepthGBuffer.BindlessIndex, 3);
-            commandList.SetComputeRoot32BitConstant(0, renderer.Albedo.BindlessIndex, 4);
-            commandList.SetComputeRoot32BitConstant(0, renderer.Data.BindlessIndex, 5);
-            commandList.SetComputeRoot32BitConstant(0, _activeLightingCascadeSrv, 6);
-            commandList.SetComputeRoot32BitConstant(0, renderer.LightBuffer.UavIndex, 7);
-            commandList.SetComputeRoot32BitConstant(0, (uint)desc.Width, 8);
-            commandList.SetComputeRoot32BitConstant(0, (uint)desc.Height, 9);
+            lightCS.SetPushConstant("NormalTex", renderer.Normals.BindlessIndex);
+            lightCS.SetPushConstant("DepthTex", renderer.Depth.BindlessIndex);
+            lightCS.SetPushConstant("ShadowMap", renderer.ShadowTextureArray?.BindlessIndex ?? 0u);
+            lightCS.SetPushConstant("DepthGBuf", renderer.DepthGBuffer.BindlessIndex);
+            lightCS.SetPushConstant("AlbedoTex", renderer.Albedo.BindlessIndex);
+            lightCS.SetPushConstant("DataTex", renderer.Data.BindlessIndex);
+            lightCS.SetPushConstant("LightingCascadeSRV", _activeLightingCascadeSrv);
+            lightCS.SetPushConstant("OutputUAV", renderer.LightBuffer.UavIndex);
+            lightCS.SetPushConstant("ScreenWidth", (uint)desc.Width);
+            lightCS.SetPushConstant("ScreenHeight", (uint)desc.Height);
             
             // Bind cbuffers on compute root (Material.Apply committed them on graphics root)
             foreach (var cb in Material.ConstantBuffers)
@@ -207,7 +202,7 @@ namespace Freefall.Components
             
             uint groupsX = ((uint)desc.Width + 7) / 8;
             uint groupsY = ((uint)desc.Height + 7) / 8;
-            commandList.Dispatch(groupsX, groupsY, 1);
+            lightCS.Dispatch(0, commandList, groupsX, groupsY);
         }
 
         private void DrawShadows(ID3D12GraphicsCommandList commandList)
@@ -235,11 +230,11 @@ namespace Freefall.Components
                 EnsureCascadeBuffer(); // cbuffer still needed for root sig bind (slot 2)
                 int frameIndex = Engine.FrameIndex % FrameCount;
                 
-                uint cascadeUAV = _gpuCascadeBufferUavIndices![frameIndex];
-                uint cascadeSRV = _gpuCascadeBufferSrvIndices![frameIndex];
+                uint cascadeUAV = _gpuCascadeBuffers![frameIndex].UavIndex;
+                uint cascadeSRV = _gpuCascadeBuffers![frameIndex].SrvIndex;
                 
                 // Transition GPU cascade buffer to UAV for compute write
-                commandList.ResourceBarrierTransition(_gpuCascadeBuffers![frameIndex],
+                commandList.ResourceBarrierTransition(_gpuCascadeBuffers![frameIndex].Native,
                     ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess);
                 
                 // Dispatch GPU cascade matrix computation
@@ -253,7 +248,7 @@ namespace Freefall.Components
                     cascadeSRV);
                 
                 // Transition GPU cascade buffer back to SRV for culler/rendering
-                commandList.ResourceBarrierTransition(_gpuCascadeBuffers[frameIndex],
+                commandList.ResourceBarrierTransition(_gpuCascadeBuffers[frameIndex].Native,
                     ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource);
                 
                 // Set viewport for shadow map
@@ -276,7 +271,7 @@ namespace Freefall.Components
                     if (shadowPyramid?.Ready == true) shadowHiZSrv = shadowPyramid.FullSRV;
                     
                     // cbuffer addr still bound for root sig requirement (culler ignores it now)
-                    ulong cascadeCBAddr = _shadowCascadeCBs![frameIndex].GPUVirtualAddress;
+                    ulong cascadeCBAddr = _shadowCascadeCBs![frameIndex].Native.GPUVirtualAddress;
                     CurrentCascadeSrvIndex = cascadeSRV;
                     CurrentVPOnlySrvIndex = _vpOnlySrvIndices != null ? _vpOnlySrvIndices[frameIndex] : 0;
                     
@@ -361,7 +356,7 @@ namespace Freefall.Components
                     uint shadowHiZSrv = (shadowPyramid?.Ready == true) ? shadowPyramid.FullSRV : 0;
                     
                     // Cull all cascades for each batch using unified visibility pass
-                    ulong cascadeCBAddr = _shadowCascadeCBs![frameIndex].GPUVirtualAddress;
+                    ulong cascadeCBAddr = _shadowCascadeCBs![frameIndex].Native.GPUVirtualAddress;
                     foreach (var batch in allBatches)
                     {
                         batch.CullShadowAll(commandList, cascadeSrv, cascadeCBAddr, shadowHiZSrv, culler);
@@ -528,53 +523,23 @@ namespace Freefall.Components
         {
             if (_cascadeBuffers != null) return;
             
-            int stride = Marshal.SizeOf<GPUCuller.CascadeData>();
-            int bufferSize = stride * MaxCascades;
-            _cascadeBuffers = new ID3D12Resource[FrameCount];
-            _cascadeBufferPtrs = new IntPtr[FrameCount];
+            _cascadeBuffers = new GraphicsBuffer[FrameCount];
             _cascadeBufferSrvIndices = new uint[FrameCount];
             
-            // TEMP DEBUG: VP-only buffer
-            int vpStride = Marshal.SizeOf<Matrix4x4>();
-            _vpOnlyBuffers = new ID3D12Resource[FrameCount];
-            _vpOnlyPtrs = new IntPtr[FrameCount];
+            _vpOnlyBuffers = new GraphicsBuffer[FrameCount];
             _vpOnlySrvIndices = new uint[FrameCount];
             
-            var device = Engine.Device;
-            
-            // Shadow cascade planes cbuffer (register b1)
-            int cbSize = (Marshal.SizeOf<GPUCuller.ShadowCascadeConstants>() + 255) & ~255;
-            _shadowCascadeCBs = new ID3D12Resource[FrameCount];
-            _shadowCascadeCBPtrs = new IntPtr[FrameCount];
+            _shadowCascadeCBs = new GraphicsBuffer[FrameCount];
             
             for (int i = 0; i < FrameCount; i++)
             {
-                _cascadeBuffers[i] = device.CreateUploadBuffer(bufferSize);
-                _cascadeBufferSrvIndices[i] = device.AllocateBindlessIndex();
-                device.CreateStructuredBufferSRV(_cascadeBuffers[i], (uint)MaxCascades, (uint)stride, _cascadeBufferSrvIndices[i]);
+                _cascadeBuffers[i] = GraphicsBuffer.CreateUpload<GPUCuller.CascadeData>(MaxCascades, mapped: true);
+                _cascadeBufferSrvIndices[i] = _cascadeBuffers[i].SrvIndex;
                 
-                // TEMP: VP-only buffer (stride 64)
-                _vpOnlyBuffers[i] = device.CreateUploadBuffer(vpStride * MaxCascades);
-                _vpOnlySrvIndices[i] = device.AllocateBindlessIndex();
-                device.CreateStructuredBufferSRV(_vpOnlyBuffers[i], (uint)MaxCascades, (uint)vpStride, _vpOnlySrvIndices[i]);
+                _vpOnlyBuffers[i] = GraphicsBuffer.CreateUpload<Matrix4x4>(MaxCascades, mapped: true);
+                _vpOnlySrvIndices[i] = _vpOnlyBuffers[i].SrvIndex;
                 
-                // Cascade planes cbuffer
-                _shadowCascadeCBs[i] = device.CreateUploadBuffer(cbSize);
-                
-                unsafe
-                {
-                    void* pData;
-                    _cascadeBuffers[i].Map(0, null, &pData);
-                    _cascadeBufferPtrs[i] = (IntPtr)pData;
-                    
-                    void* pVP;
-                    _vpOnlyBuffers[i].Map(0, null, &pVP);
-                    _vpOnlyPtrs[i] = (IntPtr)pVP;
-                    
-                    void* pCB;
-                    _shadowCascadeCBs[i].Map(0, null, &pCB);
-                    _shadowCascadeCBPtrs[i] = (IntPtr)pCB;
-                }
+                _shadowCascadeCBs[i] = GraphicsBuffer.CreateConstantBuffer<GPUCuller.ShadowCascadeConstants>();
             }
         }
         
@@ -582,37 +547,21 @@ namespace Freefall.Components
         {
             if (_gpuCascadeBuffers != null) return;
             
-            int stride = Marshal.SizeOf<GPUCuller.CascadeData>();
-            int bufferSize = stride * MaxCascades;
-            var device = Engine.Device;
-            
-            _gpuCascadeBuffers = new ID3D12Resource[FrameCount];
-            _gpuCascadeBufferUavIndices = new uint[FrameCount];
-            _gpuCascadeBufferSrvIndices = new uint[FrameCount];
+            _gpuCascadeBuffers = new GraphicsBuffer[FrameCount];
             
             for (int i = 0; i < FrameCount; i++)
             {
-                // GPU-default buffer with UAV flag for compute writes
-                _gpuCascadeBuffers[i] = device.NativeDevice.CreateCommittedResource(
-                    new HeapProperties(HeapType.Default),
-                    HeapFlags.None,
-                    ResourceDescription.Buffer((ulong)bufferSize, ResourceFlags.AllowUnorderedAccess),
-                    ResourceStates.NonPixelShaderResource,
-                    null);
-                
-                _gpuCascadeBufferUavIndices[i] = device.AllocateBindlessIndex();
-                device.CreateStructuredBufferUAV(_gpuCascadeBuffers[i], (uint)MaxCascades, (uint)stride, _gpuCascadeBufferUavIndices[i]);
-                
-                _gpuCascadeBufferSrvIndices[i] = device.AllocateBindlessIndex();
-                device.CreateStructuredBufferSRV(_gpuCascadeBuffers[i], (uint)MaxCascades, (uint)stride, _gpuCascadeBufferSrvIndices[i]);
+                _gpuCascadeBuffers[i] = GraphicsBuffer.CreateStructured<GPUCuller.CascadeData>(
+                    MaxCascades, srv: true, uav: true,
+                    initialState: ResourceStates.NonPixelShaderResource);
             }
         }
         
         private unsafe void UploadCascadeBuffer(int frameIndex)
         {
-            var dst = (GPUCuller.CascadeData*)_cascadeBufferPtrs![frameIndex];
-            var vpDst = (Matrix4x4*)_vpOnlyPtrs![frameIndex];
-            var cbDst = (Vector4*)_shadowCascadeCBPtrs![frameIndex];
+            var dst = _cascadeBuffers![frameIndex].WritePtr<GPUCuller.CascadeData>();
+            var vpDst = _vpOnlyBuffers![frameIndex].WritePtr<Matrix4x4>();
+            var cbDst = _shadowCascadeCBs![frameIndex].WritePtr<Vector4>();
             for (int c = 0; c < CascadeCount; c++)
             {
                 var data = new GPUCuller.CascadeData();

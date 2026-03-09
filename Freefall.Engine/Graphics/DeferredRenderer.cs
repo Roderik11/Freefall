@@ -36,8 +36,10 @@ namespace Freefall.Graphics
 
         private Material matClear = null!;
         private Material matDirectionalLight = null!;
-        private ID3D12PipelineState _compositionComputePSO = null!;
-        public ID3D12PipelineState DirectionalLightComputePSO { get; private set; } = null!;
+        private ComputeShader _compositionCS = null!;
+        private int _kCompose;
+        public ComputeShader DirectionalLightCS { get; private set; } = null!;
+        private int _kDirectionalLight;
         
         private bool _isFirstFrame = true;
         private bool _compositeSnapshotFirstFrame = true;
@@ -46,7 +48,7 @@ namespace Freefall.Graphics
         private CpuDescriptorHandle[]? _cachedGBufferRtvHandles;
         
         // Frustum constant buffers (per-frame, uploaded once before batch loop)
-        private ID3D12Resource[]? _frustumConstantsBuffers;
+        private GraphicsBuffer[]? _frustumConstantsBuffers;
         private bool _frustumBuffersInitialized;
         
         // Previous frame's ViewProjection — Hi-Z depth is 1 frame behind,
@@ -70,20 +72,12 @@ namespace Freefall.Graphics
             matDirectionalLight = new Material(new Effect("light_directional"));
 
             // Compile composition compute shader
-            string compositionCsPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Resources", "Shaders", "composition_cs.hlsl");
-            string csSource = File.ReadAllText(compositionCsPath);
-            string includeDir = Path.GetDirectoryName(compositionCsPath)!;
-            var csShader = new Shader(csSource, "CSCompose", "cs_6_6", includeDir);
-            _compositionComputePSO = Engine.Device.CreateComputePipelineState(csShader.Bytecode);
-            csShader.Dispose();
+            _compositionCS = new ComputeShader("composition_cs.hlsl");
+            _kCompose = _compositionCS.FindKernel("CSCompose");
 
             // Compile directional light compute shader
-            string lightCsPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Resources", "Shaders", "light_directional_cs.hlsl");
-            string lightCsSource = File.ReadAllText(lightCsPath);
-            string lightIncludeDir = Path.GetDirectoryName(lightCsPath)!;
-            var lightCsShader = new Shader(lightCsSource, "CSDirectionalLight", "cs_6_6", lightIncludeDir);
-            DirectionalLightComputePSO = Engine.Device.CreateComputePipelineState(lightCsShader.Bytecode);
-            lightCsShader.Dispose();
+            DirectionalLightCS = new ComputeShader("light_directional_cs.hlsl");
+            _kDirectionalLight = DirectionalLightCS.FindKernel("CSDirectionalLight");
 
             // Shadow Map Array (Cascades)
             ShadowTextureArray = new DepthTextureArray2D(2048, 2048, 4);
@@ -144,11 +138,9 @@ namespace Freefall.Graphics
         {
             if (_frustumBuffersInitialized) return;
             
-            _frustumConstantsBuffers = new ID3D12Resource[FrameCount];
-            int bufferSize = 256; // Aligned to 256 for CBV
-            
+            _frustumConstantsBuffers = new GraphicsBuffer[FrameCount];
             for (int i = 0; i < FrameCount; i++)
-                _frustumConstantsBuffers[i] = device.CreateUploadBuffer(bufferSize);
+                _frustumConstantsBuffers[i] = GraphicsBuffer.CreateConstantBuffer<GPUCuller.FrustumConstants>();
             
             _frustumBuffersInitialized = true;
         }
@@ -210,13 +202,10 @@ namespace Freefall.Graphics
 
             unsafe
             {
-                void* pData;
-                _frustumConstantsBuffers![frameIndex].Map(0, null, &pData);
-                *(GPUCuller.FrustumConstants*)pData = constants;
-                _frustumConstantsBuffers[frameIndex].Unmap(0);
+                *_frustumConstantsBuffers![frameIndex].WritePtr<GPUCuller.FrustumConstants>() = constants;
             }
             
-            return _frustumConstantsBuffers![frameIndex].GPUVirtualAddress;
+            return _frustumConstantsBuffers![frameIndex].Native.GPUVirtualAddress;
         }
 
         public override void Render(Camera camera, ID3D12GraphicsCommandList list)
@@ -469,19 +458,18 @@ namespace Freefall.Graphics
             
             list.SetComputeRootSignature(Engine.Device.GlobalRootSignature);
             list.SetDescriptorHeaps(1, new[] { Engine.Device.SrvHeap });
-            list.SetPipelineState(_compositionComputePSO);
             
-            // Push constants: slot 0-3 = GBuffer SRVs, slot 4 = output UAV, slot 5-6 = dimensions
-            list.SetComputeRoot32BitConstant(0, Albedo.BindlessIndex, 0);
-            list.SetComputeRoot32BitConstant(0, LightBuffer.BindlessIndex, 1);
-            list.SetComputeRoot32BitConstant(0, Data.BindlessIndex, 2);
-            list.SetComputeRoot32BitConstant(0, Normals.BindlessIndex, 3);
-            list.SetComputeRoot32BitConstant(0, Composite.UavIndex, 4);
+            // Push constants via ComputeShader reflection
+            _compositionCS.SetPushConstant("AlbedoTex", Albedo.BindlessIndex);
+            _compositionCS.SetPushConstant("LightTex", LightBuffer.BindlessIndex);
+            _compositionCS.SetPushConstant("DataTex", Data.BindlessIndex);
+            _compositionCS.SetPushConstant("NormalTex", Normals.BindlessIndex);
+            _compositionCS.SetPushConstant("OutputUAV", Composite.UavIndex);
             
             var desc = Composite.Native.Description;
-            list.SetComputeRoot32BitConstant(0, (uint)desc.Width, 5);
-            list.SetComputeRoot32BitConstant(0, (uint)desc.Height, 6);
-            list.SetComputeRoot32BitConstant(0, DepthGBuffer.BindlessIndex, 7);
+            _compositionCS.SetPushConstant("ScreenWidth", (uint)desc.Width);
+            _compositionCS.SetPushConstant("ScreenHeight", (uint)desc.Height);
+            _compositionCS.SetPushConstant("DepthGBuf", DepthGBuffer.BindlessIndex);
             
             // Bind SceneConstants cbuffer (AmbientScale etc.)
             foreach (var cb in matDirectionalLight.ConstantBuffers)
@@ -496,7 +484,7 @@ namespace Freefall.Graphics
             
             uint groupsX = ((uint)desc.Width + 7) / 8;
             uint groupsY = ((uint)desc.Height + 7) / 8;
-            list.Dispatch(groupsX, groupsY, 1);
+            _compositionCS.Dispatch(_kCompose, list, groupsX, groupsY);
             
             // UAV barrier, then transition to RenderTarget for forward pass
             list.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(Composite.Native)));

@@ -1,19 +1,25 @@
-#include "common.fx"
-
 // Directional Light Compute Shader — replaces light_directional.fx fullscreen quad
 // [numthreads(8, 8, 1)] = 64 threads per tile
 
-// Push constants: GBuffer SRVs + shadow + output UAV + screen dims
-#define NormalTexIdx    GET_INDEX(0)
-#define DepthTexIdx     GET_INDEX(1)
-#define ShadowMapIdx    GET_INDEX(2)
-#define DepthGBufIdx    GET_INDEX(3)
-#define AlbedoTexIdx    GET_INDEX(4)
-#define DataTexIdx      GET_INDEX(5)
-#define LightingCascadeSRVIdx GET_INDEX(6)
-#define OutputUAVIdx    GET_INDEX(7)
-#define ScreenWidth     asuint(GET_INDEX(8))
-#define ScreenHeight    asuint(GET_INDEX(9))
+#pragma kernel CSDirectionalLight
+
+// Named push constants for ComputeShader reflection
+#define PUSH_CONSTANTS_DEFINED
+cbuffer PushConstants : register(b3)
+{
+    uint NormalTexIdx;
+    uint DepthTexIdx;
+    uint ShadowMapIdx;
+    uint DepthGBufIdx;
+    uint AlbedoTexIdx;
+    uint DataTexIdx;
+    uint LightingCascadeSRVIdx;
+    uint OutputUAVIdx;
+    uint ScreenWidthIdx;
+    uint ScreenHeightIdx;
+};
+
+#include "common.fx"
 
 // Light params from ObjectConstants (Slot 2, b1)
 cbuffer ObjectConstants : register(b1)
@@ -119,7 +125,7 @@ void CSDirectionalLight(uint3 dispatchThreadId : SV_DispatchThreadID)
     uint2 px = dispatchThreadId.xy;
     
     // Bounds check
-    if (px.x >= ScreenWidth || px.y >= ScreenHeight)
+    if (px.x >= ScreenWidthIdx || px.y >= ScreenHeightIdx)
         return;
     
     Texture2D NormalTex = ResourceDescriptorHeap[NormalTexIdx];
@@ -140,7 +146,7 @@ void CSDirectionalLight(uint3 dispatchThreadId : SV_DispatchThreadID)
     }
     
     // Reconstruct world position from depth — compute UV from pixel coords
-    float2 texCoord = (float2(px) + 0.5) / float2(ScreenWidth, ScreenHeight);
+    float2 texCoord = (float2(px) + 0.5) / float2(ScreenWidthIdx, ScreenHeightIdx);
     float4 worldPos = posFromDepth(texCoord, depth, CameraInverse);
     
     // Sample Data texture ONCE

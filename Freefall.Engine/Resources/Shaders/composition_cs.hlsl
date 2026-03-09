@@ -1,18 +1,24 @@
-#include "common.fx"
-#include "sky_common.fx"
-
 // Composition Compute Shader — replaces composition.fx fullscreen quad
 // [numthreads(8, 8, 1)] = 64 threads per tile, standard for 2D image processing
 
-// Push constants: input SRVs + output UAV + screen dimensions
-#define AlbedoTexIdx    GET_INDEX(0)
-#define LightTexIdx     GET_INDEX(1)
-#define DataTexIdx      GET_INDEX(2)
-#define NormalTexIdx    GET_INDEX(3)
-#define OutputUAVIdx    GET_INDEX(4)
-#define ScreenWidth     asuint(GET_INDEX(5))
-#define ScreenHeight    asuint(GET_INDEX(6))
-#define DepthGBufIdx    GET_INDEX(7)
+#pragma kernel CSCompose
+
+// Named push constants for ComputeShader reflection
+#define PUSH_CONSTANTS_DEFINED
+cbuffer PushConstants : register(b3)
+{
+    uint AlbedoTexIdx;
+    uint LightTexIdx;
+    uint DataTexIdx;
+    uint NormalTexIdx;
+    uint OutputUAVIdx;
+    uint ScreenWidthIdx;
+    uint ScreenHeightIdx;
+    uint DepthGBufIdx;
+};
+
+#include "common.fx"
+#include "sky_common.fx"
 
 [numthreads(8, 8, 1)]
 void CSCompose(uint3 dispatchThreadId : SV_DispatchThreadID)
@@ -20,7 +26,7 @@ void CSCompose(uint3 dispatchThreadId : SV_DispatchThreadID)
     uint2 px = dispatchThreadId.xy;
     
     // Bounds check — dispatch may overshoot texture dimensions
-    if (px.x >= ScreenWidth || px.y >= ScreenHeight)
+    if (px.x >= ScreenWidthIdx || px.y >= ScreenHeightIdx)
         return;
     
     Texture2D AlbedoTex = ResourceDescriptorHeap[AlbedoTexIdx];
