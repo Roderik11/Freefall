@@ -4,24 +4,26 @@
 //
 // Dispatch (1, 1, 1) — single thread group, 4 threads (one per cascade)
 
+#pragma kernel CSComputeCascadeMatrices
+
 // Note: this shader is compiled standalone by Shader.Compile() which has no
 // include handler. All types must be self-contained (no #include).
 
 cbuffer PushConstants : register(b3)
 {
-    uint4 Indices[8];
+    uint SplitsBufferIdx;       // slot 0  — SRV: StructuredBuffer<float> [4 splits]
+    uint CascadeOutUAVIdx;      // slot 1  — UAV: RWStructuredBuffer<CascadeData> [4]
+    uint LightingOutUAVIdx;     // slot 2  — UAV: RWStructuredBuffer<LightingCascadeData> [4]
+    uint PrevVPBufferIdx;       // slot 3  — SRV: previous frame VP matrices [4]
+    uint SmoothedSplitsIdx;     // slot 4  — UAV: RWStructuredBuffer<float> [4] smoothed splits
 };
 
-// Push constant slots
-#define SplitsBufferIdx    Indices[0].x   // SRV: StructuredBuffer<float> [4 splits]
-#define CascadeOutUAVIdx   Indices[0].y   // UAV: RWStructuredBuffer<CascadeData> [4]
-#define LightingOutUAVIdx  Indices[0].z   // UAV: RWStructuredBuffer<LightingCascadeData> [4]
-#define ShadowMapRes       Indices[0].w   // Shadow map resolution (e.g. 2048)
-
-#define NearPlane          asfloat(Indices[1].x)  // Camera near plane
-#define CascadeCount       Indices[1].y            // Number of active cascades (always 4)
-#define PrevVPBufferIdx    Indices[1].z            // SRV: previous frame VP matrices [4]
-#define SmoothedSplitsIdx  Indices[1].w            // UAV: RWStructuredBuffer<float> [4] smoothed splits
+cbuffer Params : register(b4)
+{
+    uint ShadowMapRes;          // Shadow map resolution (e.g. 2048)
+    float NearPlane;            // Camera near plane
+    uint CascadeCount;          // Number of active cascades (always 4)
+};
 
 // Camera parameters — passed as matrices in a cbuffer (register b1, slot 2)
 cbuffer CascadeParams : register(b1)

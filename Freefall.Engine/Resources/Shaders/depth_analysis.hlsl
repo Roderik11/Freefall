@@ -1,23 +1,30 @@
 // SDSM Depth Analysis
 // Pass 1: CSDepthReduce - parallel min/max reduction of linear depth buffer
 // Pass 2: CSDepthHistogram - histogram + percentile-based cascade split computation
+
+#pragma kernel CSDepthReduce
+#pragma kernel CSDepthHistogram
+#pragma kernel CSComputeSplits
+
 //
 // Input: DepthGBuffer (R32_Float, linear view-space depth, 0 = sky/empty)
 // Output: 4 cascade split distances in a small UAV buffer
 
 cbuffer PushConstants : register(b3)
 {
-    uint4 Indices[8];
+    uint DepthTexIdx;           // slot 0  — SRV: DepthGBuffer (R32_Float)
+    uint MinMaxUAVIdx;          // slot 1  — UAV: RWByteAddressBuffer [minAsUint, maxAsUint]
+    uint HistogramUAVIdx;       // slot 2  — UAV: RWStructuredBuffer<uint> [256 bins]
+    uint SplitsUAVIdx;          // slot 3  — UAV: RWStructuredBuffer<float> [4 splits]
 };
 
-#define DepthTexIdx     Indices[0].x   // SRV: DepthGBuffer (R32_Float)
-#define MinMaxUAVIdx    Indices[0].y   // UAV: RWByteAddressBuffer [minAsUint, maxAsUint]
-#define HistogramUAVIdx Indices[0].z   // UAV: RWStructuredBuffer<uint> [256 bins]
-#define SplitsUAVIdx    Indices[0].w   // UAV: RWStructuredBuffer<float> [4 splits]
-#define TexWidth        Indices[1].x   // Depth texture width
-#define TexHeight       Indices[1].y   // Depth texture height
-#define NearPlane       asfloat(Indices[1].z)  // Camera near plane
-#define FarPlane        asfloat(Indices[1].w)  // Max shadow distance (fallback far)
+cbuffer Params : register(b4)
+{
+    uint TexWidth;              // Depth texture width
+    uint TexHeight;             // Depth texture height
+    float NearPlane;            // Camera near plane
+    float FarPlane;             // Max shadow distance
+};
 
 // ============================================================
 // Pass 1: CSDepthReduce — find min/max depth across entire buffer

@@ -5,6 +5,7 @@ using System.Runtime.InteropServices;
 using Freefall.Components;
 using Vortice.Direct3D12;
 using Vortice.DXGI;
+using Vortice.Mathematics;
 
 namespace Freefall.Graphics
 {
@@ -19,76 +20,55 @@ namespace Freefall.Graphics
         private const int FrameCount = 3;
         private const int MaxSubBatches = 4096;
         
-        // Compute PSOs for GPU-driven rendering pipeline
-        private ID3D12PipelineState? _clearPSO;         // CSClear - counter/histogram initialization
-        private ID3D12PipelineState? _visibilityPSO;    // CSVisibility - write visibility flags
-        private ID3D12PipelineState? _histogramPSO;     // CSHistogram - count per MeshPartId
-        private ID3D12PipelineState? _histogramPrefixSumPSO;  // CSHistogramPrefixSum - prefix sum
-        private ID3D12PipelineState? _localScanPSO;     // CSLocalScan - local prefix sum per block
-        private ID3D12PipelineState? _blockScanPSO;     // CSBlockScan - scan block sums
-        private ID3D12PipelineState? _globalScatterPSO; // CSGlobalScatter - add prefix, scatter
-        private ID3D12PipelineState? _bitonicSortPSO;   // CSBitonicSort - sort for determinism
-        private ID3D12PipelineState? _sortIndirectionPSO; // CSSortIndirection - per-subbatch indirection sort
-        private ID3D12PipelineState? _mainPSO;          // CSMain - generate commands from histogram
-        private ID3D12PipelineState? _visibilityShadowPSO; // CSVisibilityShadow - shadow cascade culling
-        private ID3D12PipelineState? _visibilityShadow4PSO; // CSVisibilityShadow4 - unified multi-cascade culling
-        private ID3D12PipelineState? _expandCascadesPSO;  // CSExpandCascades - expand visible instances per cascade
-        private ID3D12PipelineState? _patchExpandedPSO;   // CSPatchExpandedCounts - patch indirect args after expansion
-        private ID3D12PipelineState? _downsamplePSO;    // CSSinglePassDownsample - SPD mips 0-5
-        private ID3D12PipelineState? _downsamplePerMipPSO; // CSDownsample - per-mip fallback for mips 6+
-        private ID3D12PipelineState? _shadowDownsamplePSO;    // CSSinglePassDownsampleShadow - shadow SPD
-        private ID3D12PipelineState? _shadowDownsamplePerMipPSO; // CSDownsampleShadow - shadow per-mip fallback
+        // Compute shaders (multi-kernel, reflection-based binding)
+        private ComputeShader? _cullShader;          // cull_instances.hlsl — culling pipeline
+        private ComputeShader? _pyramidShader;       // depth_pyramid.hlsl — Hi-Z pyramid
+        private ComputeShader? _depthAnalysisShader; // depth_analysis.hlsl — SDSM analysis
+        private ComputeShader? _cascadeShader;       // cascade_compute.hlsl — GPU cascade matrices
         
-        // SDSM depth analysis PSOs
-        private ID3D12PipelineState? _depthReducePSO;    // CSDepthReduce - min/max depth reduction
-        private ID3D12PipelineState? _depthHistogramPSO; // CSDepthHistogram - depth histogram
-        private ID3D12PipelineState? _computeSplitsPSO;  // CSComputeSplits - percentile split computation
+        // Cached kernel indices for cull_instances.hlsl
+        private int _clearKernel, _visibilityKernel, _histogramKernel, _histogramPrefixSumKernel;
+        private int _localScanKernel, _blockScanKernel, _globalScatterKernel;
+        private int _bitonicSortKernel, _sortIndirectionKernel, _mainKernel;
+        private int _visibilityShadowKernel, _visibilityShadow4Kernel;
+        private int _expandCascadesKernel, _patchExpandedKernel;
         
-        // GPU-driven cascade computation PSO
-        private ID3D12PipelineState? _cascadeComputePSO; // CSComputeCascadeMatrices - GPU cascade matrix computation
+        // Cached kernel indices for depth_pyramid.hlsl
+        private int _spdKernel, _perMipKernel, _shadowSpdKernel, _shadowPerMipKernel;
+        
+        // Cached kernel indices for depth_analysis.hlsl
+        private int _depthReduceKernel, _depthHistogramKernel, _computeSplitsKernel;
+        
+        // Cached kernel index for cascade_compute.hlsl
+        private int _cascadeComputeKernel;
+
         
         // Frustum constants buffer per frame (just planes)
         private ID3D12Resource[] _frustumConstantsBuffers = new ID3D12Resource[FrameCount];
         
         // Atomic counter buffer (one uint per sub-batch)
-        private ID3D12Resource[] _counterBuffers = new ID3D12Resource[FrameCount];
-        private uint[] _counterBufferUAVs = new uint[FrameCount];
-        private CpuDescriptorHandle[] _counterBufferCPUHandles = new CpuDescriptorHandle[FrameCount];
-        
-        // Non-shader-visible heap for ClearUAV CPU handles (D3D12 requirement)
-        private ID3D12DescriptorHeap? _clearUAVHeap;
+        private GraphicsBuffer[] _counterBuffers = new GraphicsBuffer[FrameCount];
         
         // Instance range buffer (StartInstance, InstanceCount per sub-batch)
-        private ID3D12Resource[] _rangeBuffers = new ID3D12Resource[FrameCount];
-        private uint[] _rangeBufferSRVs = new uint[FrameCount];
+        private GraphicsBuffer[] _rangeBuffers = new GraphicsBuffer[FrameCount];
         
 
         
         // SDSM depth analysis buffers
-        private ID3D12Resource? _depthMinMaxBuffer;           // 2 uints (min, max as float bits), GPU default
-        private uint _depthMinMaxUAV;
-        private ID3D12Resource? _depthHistogramBuffer;        // 256 uints, GPU default
-        private uint _depthHistogramUAV;
-        private ID3D12Resource? _depthSplitsBuffer;           // 4 floats, GPU default
-        private uint _depthSplitsUAV;
-        private uint _depthSplitsSRV;                         // SRV for cascade compute to read splits
-        private ID3D12Resource[]? _depthSplitsReadbackBuffers; // Per-frame readback (HeapType.Readback)
-        private IntPtr[]? _depthSplitsReadbackPtrs;           // Persistently mapped pointers
+        private GraphicsBuffer? _depthMinMaxBuffer;            // 2 uints (min, max as float bits)
+        private GraphicsBuffer? _depthMinMaxInitBuffer;        // Static upload buffer with init values {MAX_FLOAT, 0}
+        private GraphicsBuffer? _depthHistogramBuffer;         // 256 uints
+        private GraphicsBuffer? _depthSplitsBuffer;            // 4 floats (SRV + UAV)
+        private GraphicsBuffer[]? _depthSplitsReadbackBuffers;  // Per-frame readback
         private bool _sdsmInitialized;
-        private int _sdsmValidFrames;                         // Frames since SDSM started producing data
+        private int _sdsmValidFrames;                          // Frames since SDSM started producing data
         
         // GPU-driven cascade computation buffers
         private bool _cascadeComputeInitialized;
-        private ID3D12Resource? _lightingCascadeBuffer;       // GPU default: LightingCascadeData[MaxCascades]
-        private uint _lightingCascadeUAV;                     // UAV for compute write
-        private uint _lightingCascadeSRV;                     // SRV for lighting pass read
-        private ID3D12Resource? _prevVPBuffer;                // Upload: previous frame VP matrices [MaxCascades]
-        private IntPtr _prevVPBufferPtr;                      // Persistently mapped
-        private uint _prevVPBufferSRV;                        // SRV for cascade compute read
-        private ID3D12Resource[]? _cascadeParamsCBs;          // Per-frame cbuffer for cascade compute params
-        private IntPtr[]? _cascadeParamsCBPtrs;               // Persistently mapped
-        private ID3D12Resource? _smoothedSplitsBuffer;        // GPU default: 4 floats, persists between frames
-        private uint _smoothedSplitsUAV;                      // UAV for cascade compute read/write
+        private GraphicsBuffer? _lightingCascadeBuffer;        // LightingCascadeData[MaxCascades] (SRV + UAV)
+        private GraphicsBuffer? _prevVPBuffer;                // Upload: previous frame VP matrices [MaxCascades]
+        private GraphicsBuffer[]? _cascadeParamsCBs;          // Per-frame cbuffer for cascade compute params
+        private GraphicsBuffer? _smoothedSplitsBuffer;         // 4 floats, persists between frames (UAV)
         
         private GraphicsDevice _device;
         private bool _initialized;
@@ -96,11 +76,8 @@ namespace Freefall.Graphics
         public string? InitError { get; private set; }
         
         // Cull stats readback (2 uints: [0]=visible, [1]=hi-z occluded)
-        private ID3D12Resource? _cullStatsBuffer;           // GPU default heap
-        private uint _cullStatsUAV;
-        private ID3D12Resource[]? _cullStatsReadbackBuffers; // Per-frame readback
-        private IntPtr[]? _cullStatsReadbackPtrs;            // Persistently mapped
-        private CpuDescriptorHandle _cullStatsClearCPU;      // For ClearUAV
+        private GraphicsBuffer? _cullStatsBuffer;
+        private GraphicsBuffer[]? _cullStatsReadbackBuffers;  // Per-frame readback
         
         /// <summary>Number of instances that passed both frustum and Hi-Z tests (1 frame behind).</summary>
         public int LastVisibleCount { get; private set; }
@@ -110,24 +87,22 @@ namespace Freefall.Graphics
         // Cached array to avoid per-frame allocation
         private ID3D12DescriptorHeap[]? _cachedSrvHeapArray;
         
-        // Public PSO access for GPU-driven culling pipeline
-        public ID3D12PipelineState? VisibilityPSO => _visibilityPSO;
-        public ID3D12PipelineState? HistogramPSO => _histogramPSO;
-        public ID3D12PipelineState? HistogramPrefixSumPSO => _histogramPrefixSumPSO;
-        public ID3D12PipelineState? LocalScanPSO => _localScanPSO;
-        public ID3D12PipelineState? BlockScanPSO => _blockScanPSO;
-        public ID3D12PipelineState? GlobalScatterPSO => _globalScatterPSO;
-        public ID3D12PipelineState? BitonicSortPSO => _bitonicSortPSO;
-        public ID3D12PipelineState? SortIndirectionPSO => _sortIndirectionPSO;
-        public ID3D12PipelineState? MainPSO => _mainPSO;
-        public ID3D12PipelineState? ClearPSO => _clearPSO;
-        public ID3D12PipelineState? VisibilityShadowPSO => _visibilityShadowPSO;
-        public ID3D12PipelineState? VisibilityShadow4PSO => _visibilityShadow4PSO;
-        public ID3D12PipelineState? ExpandCascadesPSO => _expandCascadesPSO;
-        public ID3D12PipelineState? PatchExpandedPSO => _patchExpandedPSO;
-        public ID3D12PipelineState? DownsamplePSO => _downsamplePSO;
-        
-        // Hi-Z pyramid resources are now owned by HiZPyramid (managed by DeferredRenderer)
+        // Public PSO access for GPU-driven culling pipeline (callers use SetPipelineState directly)
+        public ID3D12PipelineState? VisibilityPSO => _cullShader?.GetPSO(_visibilityKernel);
+        public ID3D12PipelineState? HistogramPSO => _cullShader?.GetPSO(_histogramKernel);
+        public ID3D12PipelineState? HistogramPrefixSumPSO => _cullShader?.GetPSO(_histogramPrefixSumKernel);
+        public ID3D12PipelineState? LocalScanPSO => _cullShader?.GetPSO(_localScanKernel);
+        public ID3D12PipelineState? BlockScanPSO => _cullShader?.GetPSO(_blockScanKernel);
+        public ID3D12PipelineState? GlobalScatterPSO => _cullShader?.GetPSO(_globalScatterKernel);
+        public ID3D12PipelineState? BitonicSortPSO => _cullShader?.GetPSO(_bitonicSortKernel);
+        public ID3D12PipelineState? SortIndirectionPSO => _cullShader?.GetPSO(_sortIndirectionKernel);
+        public ID3D12PipelineState? MainPSO => _cullShader?.GetPSO(_mainKernel);
+        public ID3D12PipelineState? ClearPSO => _cullShader?.GetPSO(_clearKernel);
+        public ID3D12PipelineState? VisibilityShadowPSO => _cullShader?.GetPSO(_visibilityShadowKernel);
+        public ID3D12PipelineState? VisibilityShadow4PSO => _cullShader?.GetPSO(_visibilityShadow4Kernel);
+        public ID3D12PipelineState? ExpandCascadesPSO => _cullShader?.GetPSO(_expandCascadesKernel);
+        public ID3D12PipelineState? PatchExpandedPSO => _cullShader?.GetPSO(_patchExpandedKernel);
+        public ID3D12PipelineState? DownsamplePSO => _pyramidShader?.GetPSO(_spdKernel);
         
         /// <summary>True after SDSM buffers are created and ready for dispatch.</summary>
         public bool SdsmReady => _sdsmInitialized;
@@ -136,7 +111,7 @@ namespace Freefall.Graphics
         public bool CascadeComputeReady => _cascadeComputeInitialized;
         
         /// <summary>SRV index for the GPU-computed lighting cascade data (for light_directional.fx).</summary>
-        public uint LightingCascadeSRV => _lightingCascadeSRV;
+        public uint LightingCascadeSRV => _lightingCascadeBuffer?.SrvIndex ?? 0;
 
         /// <summary>
         /// Frustum planes uploaded to the compute shader.
@@ -263,257 +238,92 @@ namespace Freefall.Graphics
             
             try
             {
-                // Load and compile compute shader
-                string shaderPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Resources", "Shaders", "cull_instances.hlsl");
-                if (!File.Exists(shaderPath))
+                // Compile all GPU-driven rendering pipeline passes via ComputeShader
+                _cullShader = new ComputeShader("cull_instances.hlsl");
+                _clearKernel = _cullShader.FindKernel("CSClear");
+                _visibilityKernel = _cullShader.FindKernel("CSVisibility");
+                _histogramKernel = _cullShader.FindKernel("CSHistogram");
+                _histogramPrefixSumKernel = _cullShader.FindKernel("CSHistogramPrefixSum");
+                _localScanKernel = _cullShader.FindKernel("CSLocalScan");
+                _blockScanKernel = _cullShader.FindKernel("CSBlockScan");
+                _globalScatterKernel = _cullShader.FindKernel("CSGlobalScatter");
+                _bitonicSortKernel = _cullShader.FindKernel("CSBitonicSort");
+                _sortIndirectionKernel = _cullShader.FindKernel("CSSortIndirection");
+                _mainKernel = _cullShader.FindKernel("CSMain");
+                _visibilityShadowKernel = _cullShader.FindKernel("CSVisibilityShadow");
+                _visibilityShadow4Kernel = _cullShader.FindKernel("CSVisibilityShadow4");
+                _expandCascadesKernel = _cullShader.FindKernel("CSExpandCascades");
+                _patchExpandedKernel = _cullShader.FindKernel("CSPatchExpandedCounts");
+                
+                // Hi-Z depth pyramid downsampler
+                _pyramidShader = new ComputeShader("depth_pyramid.hlsl");
+                _spdKernel = _pyramidShader.FindKernel("CSSinglePassDownsample");
+                _perMipKernel = _pyramidShader.FindKernel("CSDownsample");
+                _shadowSpdKernel = _pyramidShader.FindKernel("CSSinglePassDownsampleShadow");
+                _shadowPerMipKernel = _pyramidShader.FindKernel("CSDownsampleShadow");
+                Debug.Log("GPUCuller", "depth_pyramid.hlsl compiled: 4 kernels");
+                
+                // SDSM depth analysis
+                _depthAnalysisShader = new ComputeShader("depth_analysis.hlsl");
+                _depthReduceKernel = _depthAnalysisShader.FindKernel("CSDepthReduce");
+                _depthHistogramKernel = _depthAnalysisShader.FindKernel("CSDepthHistogram");
+                _computeSplitsKernel = _depthAnalysisShader.FindKernel("CSComputeSplits");
+                
+                // Create SDSM GPU buffers
+                _depthMinMaxBuffer = GraphicsBuffer.CreateRaw(2, uav: true, clearable: true);
+                // Static upload buffer with init values: min=MAX_FLOAT (0x7F7FFFFF), max=0
+                _depthMinMaxInitBuffer = GraphicsBuffer.CreateUpload<uint>(2, mapped: true);
+                unsafe
                 {
-                    Debug.LogError("GPUCuller", $"Compute shader not found: {shaderPath}");
-                    return;
+                    var pInit = _depthMinMaxInitBuffer.WritePtr<uint>();
+                    pInit[0] = 0x7F7FFFFF;  // min = MAX_FLOAT
+                    pInit[1] = 0;           // max = 0
                 }
+                _depthHistogramBuffer = GraphicsBuffer.CreateStructured<uint>(256, uav: true);
+                _depthSplitsBuffer = GraphicsBuffer.CreateStructured<float>(4, srv: true, uav: true);
                 
-                string shaderSource = File.ReadAllText(shaderPath);
+                // Readback buffers: one per frame
+                _depthSplitsReadbackBuffers = new GraphicsBuffer[FrameCount];
+                for (int rb = 0; rb < FrameCount; rb++)
+                    _depthSplitsReadbackBuffers[rb] = GraphicsBuffer.CreateReadback<float>(4);
                 
-                // Compile all GPU-driven rendering pipeline passes
-                
-                // Pass 0: CSClear - zero counter buffer and histogram
-                var clearShader = new Shader(shaderSource, "CSClear", "cs_6_6");
-                _clearPSO = _device.CreateComputePipelineState(clearShader.Bytecode);
-                clearShader.Dispose();
-                
-                // Pass 1: CSVisibility - write visibility flags
-                var visibilityShader = new Shader(shaderSource, "CSVisibility", "cs_6_6");
-                _visibilityPSO = _device.CreateComputePipelineState(visibilityShader.Bytecode);
-                visibilityShader.Dispose();
-                
-                // Pass 1b: CSHistogram - count visible instances per MeshPartId
-                var histogramShader = new Shader(shaderSource, "CSHistogram", "cs_6_6");
-                _histogramPSO = _device.CreateComputePipelineState(histogramShader.Bytecode);
-                histogramShader.Dispose();
-                
-                // Pass 2: CSLocalScan - local prefix sum per block, output block sums
-                var localScanShader = new Shader(shaderSource, "CSLocalScan", "cs_6_6");
-                _localScanPSO = _device.CreateComputePipelineState(localScanShader.Bytecode);
-                localScanShader.Dispose();
-                
-                // Pass 3: CSBlockScan - scan the block sums
-                var blockScanShader = new Shader(shaderSource, "CSBlockScan", "cs_6_6");
-                _blockScanPSO = _device.CreateComputePipelineState(blockScanShader.Bytecode);
-                blockScanShader.Dispose();
-                
-                // Pass 4: CSGlobalScatter - add block prefix and scatter to output
-                var globalScatterShader = new Shader(shaderSource, "CSGlobalScatter", "cs_6_6");
-                _globalScatterPSO = _device.CreateComputePipelineState(globalScatterShader.Bytecode);
-                globalScatterShader.Dispose();
-                
-                // Pass 5: CSBitonicSort - sort for deterministic ordering
-                var bitonicSortShader = new Shader(shaderSource, "CSBitonicSort", "cs_6_6");
-                _bitonicSortPSO = _device.CreateComputePipelineState(bitonicSortShader.Bytecode);
-                bitonicSortShader.Dispose();
-                
-                // Pass 5b: CSSortIndirection - per-subbatch indirection sort
-                var sortIndirectionShader = new Shader(shaderSource, "CSSortIndirection", "cs_6_6");
-                _sortIndirectionPSO = _device.CreateComputePipelineState(sortIndirectionShader.Bytecode);
-                sortIndirectionShader.Dispose();
-                
-                // Pass 5c: CSHistogramPrefixSum - prefix sum of histogram for StartInstance offsets
-                var histogramPrefixSumShader = new Shader(shaderSource, "CSHistogramPrefixSum", "cs_6_6");
-                _histogramPrefixSumPSO = _device.CreateComputePipelineState(histogramPrefixSumShader.Bytecode);
-                histogramPrefixSumShader.Dispose();
-                
-                // Pass 6: CSMain - generate final indirect draw commands from histogram
-                var mainShader = new Shader(shaderSource, "CSMain", "cs_6_6");
-                _mainPSO = _device.CreateComputePipelineState(mainShader.Bytecode);
-                mainShader.Dispose();
-                
-                // Pass 7: CSVisibilityShadow - shadow cascade frustum culling
-                var visibilityShadowShader = new Shader(shaderSource, "CSVisibilityShadow", "cs_6_6");
-                _visibilityShadowPSO = _device.CreateComputePipelineState(visibilityShadowShader.Bytecode);
-                visibilityShadowShader.Dispose();
-                
-                // Pass 8: CSVisibilityShadow4 - unified multi-cascade visibility
-                var visShadow4Shader = new Shader(shaderSource, "CSVisibilityShadow4", "cs_6_6");
-                _visibilityShadow4PSO = _device.CreateComputePipelineState(visShadow4Shader.Bytecode);
-                visShadow4Shader.Dispose();
-                
-                // Pass 9: CSExpandCascades - expand visible instances per cascade
-                var expandShader = new Shader(shaderSource, "CSExpandCascades", "cs_6_6");
-                _expandCascadesPSO = _device.CreateComputePipelineState(expandShader.Bytecode);
-                expandShader.Dispose();
-                
-                // Pass 10: CSPatchExpandedCounts - patch indirect args after expansion
-                var patchShader = new Shader(shaderSource, "CSPatchExpandedCounts", "cs_6_6");
-                _patchExpandedPSO = _device.CreateComputePipelineState(patchShader.Bytecode);
-                patchShader.Dispose();
-                
-                // Hi-Z depth pyramid downsampler (separate shader file)
-                string pyramidPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Resources", "Shaders", "depth_pyramid.hlsl");
-                if (File.Exists(pyramidPath))
-                {
-                    string pyramidSource = File.ReadAllText(pyramidPath);
-                    var spdShader = new Shader(pyramidSource, "CSSinglePassDownsample", "cs_6_6");
-                    _downsamplePSO = _device.CreateComputePipelineState(spdShader.Bytecode);
-                    spdShader.Dispose();
-                    Debug.Log("GPUCuller", "CSSinglePassDownsample compiled for Hi-Z pyramid (mips 0-5)");
-                    
-                    var perMipShader = new Shader(pyramidSource, "CSDownsample", "cs_6_6");
-                    _downsamplePerMipPSO = _device.CreateComputePipelineState(perMipShader.Bytecode);
-                    perMipShader.Dispose();
-                    Debug.Log("GPUCuller", "CSDownsample compiled for Hi-Z pyramid (mips 6+)");
-                    
-                    var shadowSpdShader = new Shader(pyramidSource, "CSSinglePassDownsampleShadow", "cs_6_6");
-                    _shadowDownsamplePSO = _device.CreateComputePipelineState(shadowSpdShader.Bytecode);
-                    shadowSpdShader.Dispose();
-                    Debug.Log("GPUCuller", "CSSinglePassDownsampleShadow compiled");
-                    
-                    var shadowPerMipShader = new Shader(pyramidSource, "CSDownsampleShadow", "cs_6_6");
-                    _shadowDownsamplePerMipPSO = _device.CreateComputePipelineState(shadowPerMipShader.Bytecode);
-                    shadowPerMipShader.Dispose();
-                    Debug.Log("GPUCuller", "CSDownsampleShadow compiled");
-                }
-                else
-                {
-                    Debug.LogWarning("GPUCuller", $"depth_pyramid.hlsl not found: {pyramidPath} — Hi-Z disabled");
-                }
-                
-                // SDSM depth analysis shaders (separate file)
-                string analysisPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Resources", "Shaders", "depth_analysis.hlsl");
-                if (File.Exists(analysisPath))
-                {
-                    string analysisSource = File.ReadAllText(analysisPath);
-                    var reduceShader = new Shader(analysisSource, "CSDepthReduce", "cs_6_6");
-                    _depthReducePSO = _device.CreateComputePipelineState(reduceShader.Bytecode);
-                    reduceShader.Dispose();
-                    
-                    var histShader = new Shader(analysisSource, "CSDepthHistogram", "cs_6_6");
-                    _depthHistogramPSO = _device.CreateComputePipelineState(histShader.Bytecode);
-                    histShader.Dispose();
-                    
-                    var splitsShader = new Shader(analysisSource, "CSComputeSplits", "cs_6_6");
-                    _computeSplitsPSO = _device.CreateComputePipelineState(splitsShader.Bytecode);
-                    splitsShader.Dispose();
-                    
-                    // Create SDSM GPU buffers
-                    // MinMax buffer: 8 bytes (2 uints), raw byte address buffer
-                    _depthMinMaxBuffer = _device.CreateDefaultBuffer(8);
-                    _depthMinMaxUAV = _device.AllocateBindlessIndex();
-                    var minMaxUavDesc = new UnorderedAccessViewDescription
-                    {
-                        Format = Format.R32_Typeless,
-                        ViewDimension = UnorderedAccessViewDimension.Buffer,
-                        Buffer = new BufferUnorderedAccessView
-                        {
-                            FirstElement = 0,
-                            NumElements = 2,
-                            Flags = BufferUnorderedAccessViewFlags.Raw
-                        }
-                    };
-                    _device.NativeDevice.CreateUnorderedAccessView(_depthMinMaxBuffer, null, minMaxUavDesc, _device.GetCpuHandle(_depthMinMaxUAV));
-                    
-                    // Histogram buffer: 256 uints
-                    _depthHistogramBuffer = _device.CreateDefaultBuffer(256 * sizeof(uint));
-                    _depthHistogramUAV = _device.AllocateBindlessIndex();
-                    _device.CreateStructuredBufferUAV(_depthHistogramBuffer, 256, sizeof(uint), _depthHistogramUAV);
-                    
-                    // Splits buffer: 4 floats
-                    _depthSplitsBuffer = _device.CreateDefaultBuffer(4 * sizeof(float));
-                    _depthSplitsUAV = _device.AllocateBindlessIndex();
-                    _device.CreateStructuredBufferUAV(_depthSplitsBuffer, 4, sizeof(float), _depthSplitsUAV);
-                    _depthSplitsSRV = _device.AllocateBindlessIndex();
-                    _device.CreateStructuredBufferSRV(_depthSplitsBuffer, 4, sizeof(float), _depthSplitsSRV);
-                    
-                    // Readback buffers: one per frame, persistently mapped
-                    _depthSplitsReadbackBuffers = new ID3D12Resource[FrameCount];
-                    _depthSplitsReadbackPtrs = new IntPtr[FrameCount];
-                    for (int rb = 0; rb < FrameCount; rb++)
-                    {
-                        _depthSplitsReadbackBuffers[rb] = _device.NativeDevice.CreateCommittedResource(
-                            new HeapProperties(HeapType.Readback),
-                            HeapFlags.None,
-                            ResourceDescription.Buffer(4 * sizeof(float)),
-                            ResourceStates.CopyDest,
-                            null);
-                        unsafe
-                        {
-                            void* pData;
-                            _depthSplitsReadbackBuffers[rb].Map(0, null, &pData);
-                            _depthSplitsReadbackPtrs[rb] = (IntPtr)pData;
-                        }
-                    }
-                    
-                    _sdsmInitialized = true;
-                    Debug.Log("GPUCuller", "SDSM depth analysis initialized: CSDepthReduce + CSDepthHistogram + CSComputeSplits");
-                }
-                else
-                {
-                    Debug.LogWarning("GPUCuller", $"depth_analysis.hlsl not found: {analysisPath} — SDSM disabled");
-                }
+                _sdsmInitialized = true;
+                Debug.Log("GPUCuller", "SDSM depth analysis initialized via ComputeShader: 3 kernels");
                 
                 // GPU-driven cascade matrix computation (depends on SDSM being initialized)
                 if (_sdsmInitialized)
                 {
-                    string cascadePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Resources", "Shaders", "cascade_compute.hlsl");
-                    if (File.Exists(cascadePath))
+                    _cascadeShader = new ComputeShader("cascade_compute.hlsl");
+                    _cascadeComputeKernel = _cascadeShader.FindKernel("CSComputeCascadeMatrices");
+                    
+                    int maxCascades = 8;
+                    int lightingStride = Marshal.SizeOf<LightingCascadeData>();
+                    int vpStride = Marshal.SizeOf<Matrix4x4>();
+                    
+                    // Lighting cascade output buffer (GPU default, compute writes)
+                    _lightingCascadeBuffer = GraphicsBuffer.CreateStructured(maxCascades, lightingStride, srv: true, uav: true);
+                    
+                    // Previous VP buffer (upload with SRV, persistently mapped)
+                    _prevVPBuffer = GraphicsBuffer.CreateUpload<Matrix4x4>(maxCascades, mapped: true);
+                    unsafe
                     {
-                        string cascadeSource = File.ReadAllText(cascadePath);
-                        var cascadeShader = new Shader(cascadeSource, "CSComputeCascadeMatrices", "cs_6_6");
-                        _cascadeComputePSO = _device.CreateComputePipelineState(cascadeShader.Bytecode);
-                        cascadeShader.Dispose();
-                        
-                        int maxCascades = 8;
-                        int lightingStride = Marshal.SizeOf<LightingCascadeData>();
-                        int vpStride = Marshal.SizeOf<Matrix4x4>();
-                        
-                        // Lighting cascade output buffer (GPU default, compute writes)
-                        _lightingCascadeBuffer = _device.CreateDefaultBuffer(lightingStride * maxCascades);
-                        _lightingCascadeUAV = _device.AllocateBindlessIndex();
-                        _device.CreateStructuredBufferUAV(_lightingCascadeBuffer, (uint)maxCascades, (uint)lightingStride, _lightingCascadeUAV);
-                        _lightingCascadeSRV = _device.AllocateBindlessIndex();
-                        _device.CreateStructuredBufferSRV(_lightingCascadeBuffer, (uint)maxCascades, (uint)lightingStride, _lightingCascadeSRV);
-                        
-                        // Previous VP buffer (upload, persistently mapped)
-                        _prevVPBuffer = _device.CreateUploadBuffer(vpStride * maxCascades);
-                        _prevVPBufferSRV = _device.AllocateBindlessIndex();
-                        _device.CreateStructuredBufferSRV(_prevVPBuffer, (uint)maxCascades, (uint)vpStride, _prevVPBufferSRV);
-                        unsafe
-                        {
-                            void* pData;
-                            _prevVPBuffer.Map(0, null, &pData);
-                            _prevVPBufferPtr = (IntPtr)pData;
-                            // Initialize to identity matrices
-                            for (int m = 0; m < maxCascades; m++)
-                                ((Matrix4x4*)pData)[m] = Matrix4x4.Identity;
-                        }
-                        
-                        // Cascade compute params cbuffer (per-frame, 256-byte aligned)
-                        int paramsSize = (Marshal.SizeOf<CascadeComputeParams>() + 255) & ~255;
-                        _cascadeParamsCBs = new ID3D12Resource[FrameCount];
-                        _cascadeParamsCBPtrs = new IntPtr[FrameCount];
-                        for (int f = 0; f < FrameCount; f++)
-                        {
-                            _cascadeParamsCBs[f] = _device.CreateUploadBuffer(paramsSize);
-                            unsafe
-                            {
-                                void* pData;
-                                _cascadeParamsCBs[f].Map(0, null, &pData);
-                                _cascadeParamsCBPtrs[f] = (IntPtr)pData;
-                            }
-                        }
-                        
-                        // Smoothed splits buffer (GPU default, persistent between frames)
-                        _smoothedSplitsBuffer = _device.CreateDefaultBuffer(4 * sizeof(float));
-                        _smoothedSplitsUAV = _device.AllocateBindlessIndex();
-                        _device.CreateStructuredBufferUAV(_smoothedSplitsBuffer, 4, sizeof(float), _smoothedSplitsUAV);
-                        
-                        // DISABLED: GPU cascade compute produces incorrect VP matrices for lighting.
-                        // The CPU cascade path with SDSM GPU readback works correctly.
-                        // TODO: Debug lightVP computation in cascade_compute.hlsl
-                        // _cascadeComputeInitialized = true;
-                        Debug.Log("GPUCuller", "CSComputeCascadeMatrices initialized: GPU-driven cascade computation ready");
+                        // Initialize to identity matrices
+                        var pData = _prevVPBuffer.WritePtr<Matrix4x4>();
+                        for (int m = 0; m < maxCascades; m++)
+                            pData[m] = Matrix4x4.Identity;
                     }
-                    else
-                    {
-                        Debug.LogWarning("GPUCuller", $"cascade_compute.hlsl not found: {cascadePath} — GPU cascade compute disabled");
-                    }
+                    
+                    // Cascade compute params cbuffer (per-frame, 256-byte aligned)
+                    _cascadeParamsCBs = new GraphicsBuffer[FrameCount];
+                    for (int f = 0; f < FrameCount; f++)
+                        _cascadeParamsCBs[f] = GraphicsBuffer.CreateConstantBuffer<CascadeComputeParams>();
+                    
+                    // Smoothed splits buffer (GPU default, persistent between frames)
+                    _smoothedSplitsBuffer = GraphicsBuffer.CreateStructured<float>(4, uav: true);
+                    
+                    // DISABLED: GPU cascade compute produces incorrect VP matrices for lighting.
+                    // _cascadeComputeInitialized = true;
+                    Debug.Log("GPUCuller", "cascade_compute.hlsl compiled via ComputeShader: 1 kernel");
                 }
                 
                 Debug.Log("GPUCuller", "Compute shaders compiled: CSClear + CSVisibility + CSHistogram + CSLocalScan + CSBlockScan + CSGlobalScatter + CSBitonicSort + CSSortIndirection + CSHistogramPrefixSum + CSMain + CSVisibilityShadow");
@@ -525,100 +335,24 @@ namespace Freefall.Graphics
                 {
                     _frustumConstantsBuffers[i] = _device.CreateUploadBuffer(frustumConstantsSize);
                     
-                    // Counter buffer: one uint per sub-batch (GPU writable)
-                    _counterBuffers[i] = _device.CreateDefaultBuffer(MaxSubBatches * sizeof(uint));
-                    _counterBufferUAVs[i] = _device.AllocateBindlessIndex();
-                    _device.CreateStructuredBufferUAV(_counterBuffers[i], (uint)MaxSubBatches, sizeof(uint), _counterBufferUAVs[i]);
+                    // Counter buffer: one uint per sub-batch (GPU writable, clearable for ClearUAV)
+                    _counterBuffers[i] = GraphicsBuffer.CreateStructured<uint>(MaxSubBatches, uav: true);
                     
                     // Range buffer: StartInstance + InstanceCount per sub-batch (upload for CPU write)
                     int rangeStride = Marshal.SizeOf<InstanceRange>();
-                    _rangeBuffers[i] = _device.CreateUploadBuffer(MaxSubBatches * rangeStride);
-                    _rangeBufferSRVs[i] = _device.AllocateBindlessIndex();
-                    _device.CreateStructuredBufferSRV(_rangeBuffers[i], (uint)MaxSubBatches, (uint)rangeStride, _rangeBufferSRVs[i]);
+                    _rangeBuffers[i] = GraphicsBuffer.CreateUpload<InstanceRange>(MaxSubBatches);
                     
-                    
-                    Debug.Log("GPUCuller", $"Frame {i}: CounterBufferUAV={_counterBufferUAVs[i]}, RangeBufferSRV={_rangeBufferSRVs[i]}");
-                }
-                
-                // Create non-shader-visible heap for ClearUAV CPU handles
-                // D3D12 ClearUnorderedAccessViewUint requires CPU handle from non-shader-visible heap
-                var clearHeapDesc = new DescriptorHeapDescription
-                {
-                    Type = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView,
-                    DescriptorCount = FrameCount,
-                    Flags = DescriptorHeapFlags.None  // Non-shader-visible
-                };
-                _clearUAVHeap = _device.NativeDevice.CreateDescriptorHeap(clearHeapDesc);
-                
-                // Create UAV descriptors in non-shader-visible heap for ClearUAV
-                int uavDescriptorSize = (int)_device.NativeDevice.GetDescriptorHandleIncrementSize(DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView);
-                for (int i = 0; i < FrameCount; i++)
-                {
-                    var cpuHandle = _clearUAVHeap.GetCPUDescriptorHandleForHeapStart() + (i * uavDescriptorSize);
-                    // IMPORTANT: Use same format as shader-visible heap (structured buffer, not raw)
-                    // ClearUAV requires matching descriptor format to clear the correct memory layout
-                    var uavDesc = new UnorderedAccessViewDescription
-                    {
-                        Format = Vortice.DXGI.Format.Unknown, // Structured buffer uses Unknown format
-                        ViewDimension = UnorderedAccessViewDimension.Buffer,
-                        Buffer = new BufferUnorderedAccessView
-                        {
-                            FirstElement = 0,
-                            NumElements = (uint)MaxSubBatches,
-                            StructureByteStride = sizeof(uint), // Match structured buffer stride
-                            Flags = BufferUnorderedAccessViewFlags.None // Not raw
-                        }
-                    };
-                    _device.NativeDevice.CreateUnorderedAccessView(_counterBuffers[i], null, uavDesc, cpuHandle);
-                    _counterBufferCPUHandles[i] = cpuHandle;
+                    Debug.Log("GPUCuller", $"Frame {i}: CounterBufferUAV={_counterBuffers[i].UavIndex}, RangeBufferSRV={_rangeBuffers[i].SrvIndex}");
                 }
                 
                 // --- Cull stats buffer (2 uints: visible, hi-z occluded) ---
-                _cullStatsBuffer = _device.CreateDefaultBuffer(2 * sizeof(uint));
-                _cullStatsUAV = _device.AllocateBindlessIndex();
-                var statsUavDesc = new UnorderedAccessViewDescription
-                {
-                    Format = Format.R32_Typeless,
-                    ViewDimension = UnorderedAccessViewDimension.Buffer,
-                    Buffer = new BufferUnorderedAccessView
-                    {
-                        FirstElement = 0,
-                        NumElements = 2,
-                        Flags = BufferUnorderedAccessViewFlags.Raw
-                    }
-                };
-                _device.NativeDevice.CreateUnorderedAccessView(_cullStatsBuffer, null, statsUavDesc, _device.GetCpuHandle(_cullStatsUAV));
+                _cullStatsBuffer = GraphicsBuffer.CreateRaw(2, uav: true, clearable: true);
                 
-                // Non-shader-visible descriptor for ClearUAV
-                var statsClearHeapDesc = new DescriptorHeapDescription
-                {
-                    Type = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView,
-                    DescriptorCount = 1,
-                    Flags = DescriptorHeapFlags.None
-                };
-                var statsClearHeap = _device.NativeDevice.CreateDescriptorHeap(statsClearHeapDesc);
-                _cullStatsClearCPU = statsClearHeap.GetCPUDescriptorHandleForHeapStart();
-                _device.NativeDevice.CreateUnorderedAccessView(_cullStatsBuffer, null, statsUavDesc, _cullStatsClearCPU);
-                
-                // Readback buffers (per-frame, persistently mapped)
-                _cullStatsReadbackBuffers = new ID3D12Resource[FrameCount];
-                _cullStatsReadbackPtrs = new IntPtr[FrameCount];
+                // Readback buffers (per-frame)
+                _cullStatsReadbackBuffers = new GraphicsBuffer[FrameCount];
                 for (int rb = 0; rb < FrameCount; rb++)
-                {
-                    _cullStatsReadbackBuffers[rb] = _device.NativeDevice.CreateCommittedResource(
-                        new HeapProperties(HeapType.Readback),
-                        HeapFlags.None,
-                        ResourceDescription.Buffer(2 * sizeof(uint)),
-                        ResourceStates.CopyDest,
-                        null);
-                    unsafe
-                    {
-                        void* pData;
-                        _cullStatsReadbackBuffers[rb].Map(0, null, &pData);
-                        _cullStatsReadbackPtrs[rb] = (IntPtr)pData;
-                    }
-                }
-                Debug.Log("GPUCuller", $"Cull stats buffer created: UAV={_cullStatsUAV}");
+                    _cullStatsReadbackBuffers[rb] = GraphicsBuffer.CreateReadback<uint>(2);
+                Debug.Log("GPUCuller", $"Cull stats buffer created: UAV={_cullStatsBuffer.UavIndex}");
                 
                 _initialized = true;
                 Debug.Log("GPUCuller", "Initialized for GPU frustum culling");
@@ -640,21 +374,14 @@ namespace Freefall.Graphics
             
             int frameIndex = Engine.FrameIndex % FrameCount;
             
-            var gpuHandle = _device.SrvHeap.GetGPUDescriptorHandleForHeapStart() + 
-                (int)(_counterBufferUAVs[frameIndex] * _device.NativeDevice.GetDescriptorHandleIncrementSize(
-                    Vortice.Direct3D12.DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView));
-            commandList.ClearUnorderedAccessViewUint(
-                gpuHandle,
-                _counterBufferCPUHandles[frameIndex],
-                _counterBuffers[frameIndex],
-                new Vortice.Mathematics.Int4(0, 0, 0, 0));
+            _counterBuffers[frameIndex].ClearUAV(commandList, new Vortice.Mathematics.Int4(0, 0, 0, 0));
             
             // UAV barrier - ensure counters are zeroed before any CSCount runs
             commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(null)));
         }
         
         /// <summary>UAV index for cull stats buffer (passed in FrustumConstants).</summary>
-        public uint CullStatsUAV => _cullStatsUAV;
+        public uint CullStatsUAV => _cullStatsBuffer?.UavIndex ?? 0;
         
         /// <summary>
         /// Clear cull stats buffer and read back previous frame's results.
@@ -666,23 +393,18 @@ namespace Freefall.Graphics
             
             // Read back N-2 frame's stats (safely past GPU completion)
             int readbackFrame = (Engine.FrameIndex + 1) % FrameCount;
-            if (_cullStatsReadbackPtrs != null)
+            if (_cullStatsReadbackBuffers != null)
             {
                 unsafe
                 {
-                    uint* pStats = (uint*)_cullStatsReadbackPtrs[readbackFrame];
+                    uint* pStats = _cullStatsReadbackBuffers[readbackFrame].ReadPtr<uint>();
                     LastVisibleCount = (int)pStats[0];
                     LastHiZOccludedCount = (int)pStats[1];
                 }
             }
             
             // Clear stats buffer for this frame
-            var gpuHandle = _device.SrvHeap.GetGPUDescriptorHandleForHeapStart() + 
-                (int)(_cullStatsUAV * _device.NativeDevice.GetDescriptorHandleIncrementSize(
-                    DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView));
-            commandList.ClearUnorderedAccessViewUint(
-                gpuHandle, _cullStatsClearCPU, _cullStatsBuffer,
-                new Vortice.Mathematics.Int4(0, 0, 0, 0));
+            _cullStatsBuffer.ClearUAV(commandList, new Vortice.Mathematics.Int4(0, 0, 0, 0));
             
             commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(null)));
         }
@@ -699,236 +421,21 @@ namespace Freefall.Graphics
             
             // Transition stats buffer for copy source
             commandList.ResourceBarrier(new ResourceBarrier(
-                new ResourceTransitionBarrier(_cullStatsBuffer, 
+                new ResourceTransitionBarrier(_cullStatsBuffer.Native, 
                     ResourceStates.UnorderedAccess, ResourceStates.CopySource)));
             
-            commandList.CopyResource(_cullStatsReadbackBuffers[frameIndex], _cullStatsBuffer);
+            commandList.CopyResource(_cullStatsReadbackBuffers[frameIndex].Native, _cullStatsBuffer.Native);
             
             // Transition back to UAV for next frame
             commandList.ResourceBarrier(new ResourceBarrier(
-                new ResourceTransitionBarrier(_cullStatsBuffer, 
+                new ResourceTransitionBarrier(_cullStatsBuffer.Native, 
                     ResourceStates.CopySource, ResourceStates.UnorderedAccess)));
         }
 
-        /// <summary>
-        /// Dispatch frustum culling: two passes.
-        /// Pass 1: Per-instance frustum test (CSCount) - counts visible per sub-batch
-        /// Pass 2: Copy templates with culled counts (CSMain)
-        /// </summary>
-        public void DispatchCull(
-            ID3D12GraphicsCommandList commandList,
-            Vector4[] frustumPlanes,
-            int subBatchCount,
-            int totalInstances,
-            InstanceRange[] ranges,
-            uint templateBufferSRV,
-            uint outputBufferUAV,
-            uint sortedIndicesInSRV,
-            uint counterBufferUAV,
-            int counterOffset,
-            uint transformBufferSRV,      // World matrices for culling sphere transforms
-            uint descriptorSRV)            // InstanceDescriptor buffer for TransformSlot lookup
-        {
-            if (!_initialized || _visibilityPSO == null || _mainPSO == null || subBatchCount == 0) return;
-            
-            int frameIndex = Engine.FrameIndex % FrameCount;
-            
-            // Upload frustum planes
-            var frustumConstants = new FrustumConstants
-            {
-                Plane0 = frustumPlanes[0],
-                Plane1 = frustumPlanes[1],
-                Plane2 = frustumPlanes[2],
-                Plane3 = frustumPlanes[3],
-                Plane4 = frustumPlanes[4],
-                Plane5 = frustumPlanes[5]
-            };
-            
-            unsafe
-            {
-                void* pData;
-                _frustumConstantsBuffers[frameIndex].Map(0, null, &pData);
-                *(FrustumConstants*)pData = frustumConstants;
-                _frustumConstantsBuffers[frameIndex].Unmap(0);
-            }
-            
-            // Upload instance ranges
-            unsafe
-            {
-                void* pData;
-                _rangeBuffers[frameIndex].Map(0, null, &pData);
-                var span = new Span<InstanceRange>(pData, subBatchCount);
-                for (int i = 0; i < subBatchCount; i++)
-                    span[i] = ranges[i];
-                _rangeBuffers[frameIndex].Unmap(0);
-            }
-            
-            // No counter buffer transition needed - we write directly to output buffer
-            
-            // Set root signature and descriptor heap (shared by all passes)
-            commandList.SetComputeRootSignature(_device.GlobalRootSignature);
-            _cachedSrvHeapArray ??= new[] { _device.SrvHeap };
-            commandList.SetDescriptorHeaps(1, _cachedSrvHeapArray);
-            
-            // Bind frustum constant buffer (slot 1)
-            commandList.SetComputeRootConstantBufferView(1, _frustumConstantsBuffers[frameIndex].GPUVirtualAddress);
-            
-            // Three-pass approach with separate counter buffer:
-            // 1. CSClear - zero the counter buffer
-            // 2. CSCount - atomically increment counters[subBatch] for visible instances
-            // 3. CSMain - copy templates and set DrawInstanceCount from counters
-            
-            // Push constants used by all passes
-            commandList.SetComputeRoot32BitConstant(0, templateBufferSRV, 0);
-            commandList.SetComputeRoot32BitConstant(0, outputBufferUAV, 1);
-            // Slot 2 (BoundingSpheresIdx) no longer used — culler reads from MeshRegistry
-            commandList.SetComputeRoot32BitConstant(0, _rangeBufferSRVs[frameIndex], 3);
-            commandList.SetComputeRoot32BitConstant(0, sortedIndicesInSRV, 4);
-            commandList.SetComputeRoot32BitConstant(0, 0, 5);  // SortedIndicesOutIdx unused
-            commandList.SetComputeRoot32BitConstant(0, _counterBufferUAVs[frameIndex], 6);  // Counter buffer UAV
-            commandList.SetComputeRoot32BitConstant(0, (uint)subBatchCount, 7);
-            commandList.SetComputeRoot32BitConstant(0, (uint)counterOffset, 8);  // Counter offset for this batch
-            commandList.SetComputeRoot32BitConstant(0, 0, 9);  // Slot 9: unused (VisibleIndicesSRVIdx set elsewhere)
-            commandList.SetComputeRoot32BitConstant(0, transformBufferSRV, 10);  // Slot 10: CullTransformIdx for world-space sphere transform
-            commandList.SetComputeRoot32BitConstant(0, descriptorSRV, 11);   // Slot 11: DescriptorBufferIdx for order-independent output
-            
-            uint threadGroupsSubBatches = ((uint)subBatchCount + 63) / 64;
-            uint threadGroupsInstances = ((uint)totalInstances + 63) / 64;
-            
-            // NOTE: Counter buffer cleared by ClearCounterBuffer() before batch loop, not here
-            
-            // --- Pass 1: CSVisibility (write visibility flags and count visible) ---
-            commandList.SetPipelineState(_visibilityPSO);
-            commandList.Dispatch(threadGroupsInstances, 1, 1);
-            
-            // UAV barrier - ensure all atomic writes complete before CSMain reads
-            commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(null)));
-            
-            // --- Pass 3: CSMain (copy templates and read DrawInstanceCount from counters) ---
-            commandList.SetPipelineState(_mainPSO);
-            commandList.Dispatch(threadGroupsSubBatches, 1, 1);
-            
-            // UAV barrier to ensure all writes complete before graphics use
-            commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(null)));
-        }
-        
-        /// <summary>
-        /// Upload shadow cascade frustum planes and dispatch CSVisibilityShadow for a single cascade.
-        /// Call this once per cascade before the full culling pipeline.
-        /// </summary>
-        /// <param name="commandList">Command list to record to</param>
-        /// <param name="cascadePlanes">Array of cascade planes (each containing 6 frustum planes)</param>
-        /// <param name="cascadeIndex">Which cascade to cull for (0-3)</param>
-        /// <param name="totalInstances">Total instance count</param>
-        /// <param name="descriptorSRV">SRV for InstanceDescriptor buffer</param>
-        /// <param name="transformBufferSRV">SRV for world matrices</param>
-        /// <param name="visibilityFlagsUAV">UAV for output visibility flags</param>
-        public void DispatchShadowVisibility(
-            ID3D12GraphicsCommandList commandList,
-            uint cascadeBufferSrv,
-            int cascadeIndex,
-            int totalInstances,
-            uint descriptorSRV,
-            uint transformBufferSRV,
-            uint visibilityFlagsUAV)
-        {
-            if (!_initialized || _visibilityShadowPSO == null) return;
-            
-            // Set root signature and descriptor heap
-            commandList.SetComputeRootSignature(_device.GlobalRootSignature);
-            _cachedSrvHeapArray ??= new[] { _device.SrvHeap };
-            commandList.SetDescriptorHeaps(1, _cachedSrvHeapArray);
-            
-            // Set push constants for CSVisibilityShadow
-            commandList.SetComputeRoot32BitConstant(0, descriptorSRV, 4);    // DescriptorBufferIdx
-            commandList.SetComputeRoot32BitConstant(0, transformBufferSRV, 10);  // GlobalTransformsIdx
-            commandList.SetComputeRoot32BitConstant(0, visibilityFlagsUAV, 11);  // VisibilityFlagsIdx
-            commandList.SetComputeRoot32BitConstant(0, (uint)totalInstances, 13); // TotalInstances
-            commandList.SetComputeRoot32BitConstant(0, cascadeBufferSrv, 31);    // CascadeBufferSRVIdx
-            
-            // Dispatch CSVisibilityShadow
-            commandList.SetPipelineState(_visibilityShadowPSO);
-            uint threadGroups = ((uint)totalInstances + 255) / 256;
-            commandList.Dispatch(threadGroups, 1, 1);
-            
-            // UAV barrier
-            commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(null)));
-        }
-        
-        /// <summary>
-        /// Simple pass-through dispatch (no culling, for comparison/fallback).
-        /// </summary>
-        public void DispatchPassThrough(
-            ID3D12GraphicsCommandList commandList,
-            int subBatchCount,
-            uint templateBufferSRV,
-            uint outputBufferUAV)
-        {
-            if (!_initialized || _mainPSO == null || subBatchCount == 0) return;
-            
-            // Set compute PSO and root signature
-            commandList.SetPipelineState(_mainPSO);
-            commandList.SetComputeRootSignature(_device.GlobalRootSignature);
-            
-            // Bind descriptor heap
-            _cachedSrvHeapArray ??= new[] { _device.SrvHeap };
-            commandList.SetDescriptorHeaps(1, _cachedSrvHeapArray);
-            
-            // Push constants for buffer indices
-            // Indices[0] = (templateSRV, outputUAV, unused, unused)
-            commandList.SetComputeRoot32BitConstant(0, templateBufferSRV, 0);
-            commandList.SetComputeRoot32BitConstant(0, outputBufferUAV, 1);
-            commandList.SetComputeRoot32BitConstant(0, 0, 2);
-            commandList.SetComputeRoot32BitConstant(0, 0, 3);
-            
-            // Indices[1] = (unused, unused, counterUAV=0 for pass-through, subBatchCount)
-            commandList.SetComputeRoot32BitConstant(0, 0, 4);
-            commandList.SetComputeRoot32BitConstant(0, 0, 5);
-            commandList.SetComputeRoot32BitConstant(0, 0, 6); // CounterBufferIdx = 0 means pass-through (no culling)
-            commandList.SetComputeRoot32BitConstant(0, (uint)subBatchCount, 7);
-            
-            // Dispatch enough thread groups to cover all sub-batches
-            uint threadGroupsX = ((uint)subBatchCount + 63) / 64;
-            commandList.Dispatch(threadGroupsX, 1, 1);
-        }
+        // NOTE: DispatchCull, DispatchShadowVisibility, DispatchPassThrough,
+        // BeginCommandGeneration, EndCommandGeneration were removed (dead code).
+        // InstanceBatch and SceneCuller drive the culling pipeline directly.
 
-        /// <summary>
-        /// Prepare buffers for GPU command generation (transitions).
-        /// Call before dispatching sub-batches.
-        /// </summary>
-        public void BeginCommandGeneration(
-            ID3D12GraphicsCommandList commandList,
-            ID3D12Resource outputBuffer,
-            ID3D12Resource sortedIndicesBuffer,
-            bool isFirstUseOutput,
-            bool isFirstUseSortedIndices)
-        {
-            // Transition to UAV for compute write
-            // On first use, buffer is in Common state. On subsequent uses, it's in the state from EndCommandGeneration.
-            var outputSourceState = isFirstUseOutput ? ResourceStates.Common : ResourceStates.IndirectArgument;
-            var sortedSourceState = isFirstUseSortedIndices ? ResourceStates.Common : ResourceStates.NonPixelShaderResource;
-            
-            commandList.ResourceBarrier(new ResourceBarrier(
-                new ResourceTransitionBarrier(outputBuffer, outputSourceState, ResourceStates.UnorderedAccess)));
-            commandList.ResourceBarrier(new ResourceBarrier(
-                new ResourceTransitionBarrier(sortedIndicesBuffer, sortedSourceState, ResourceStates.UnorderedAccess)));
-        }
-
-        /// <summary>
-        /// Finish GPU command generation (transitions for graphics use).
-        /// Call after all sub-batch dispatches complete.
-        /// </summary>
-        public void EndCommandGeneration(
-            ID3D12GraphicsCommandList commandList,
-            ID3D12Resource outputBuffer,
-            ID3D12Resource sortedIndicesBuffer)
-        {
-            // Transition for graphics use
-            commandList.ResourceBarrier(new ResourceBarrier(
-                new ResourceTransitionBarrier(outputBuffer, ResourceStates.UnorderedAccess, ResourceStates.IndirectArgument)));
-            commandList.ResourceBarrier(new ResourceBarrier(
-                new ResourceTransitionBarrier(sortedIndicesBuffer, ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource)));
-        }
 
         /// <summary>
         /// Reset buffer state after ExecuteIndirect completes.
@@ -954,7 +461,7 @@ namespace Freefall.Graphics
         /// <param name="pyramid">Hi-Z pyramid to write into (owned by DeferredRenderer)</param>
         public void GenerateHiZPyramid(ID3D12GraphicsCommandList commandList, uint depthSrvIndex, HiZPyramid pyramid)
         {
-            if (_downsamplePerMipPSO == null || pyramid?.Texture == null || pyramid.MipCount == 0) return;
+            if (_pyramidShader == null || pyramid?.Texture == null || pyramid.MipCount == 0) return;
             
             bool firstGeneration = !pyramid.Ready;
             pyramid.Ready = true;  // Pyramid will be valid after this dispatch
@@ -962,7 +469,6 @@ namespace Freefall.Graphics
             commandList.SetComputeRootSignature(_device.GlobalRootSignature);
             _cachedSrvHeapArray ??= new[] { _device.SrvHeap };
             commandList.SetDescriptorHeaps(1, _cachedSrvHeapArray);
-            commandList.SetPipelineState(_downsamplePerMipPSO);
             
             int w = pyramid.Width;
             int h = pyramid.Height;
@@ -979,12 +485,13 @@ namespace Freefall.Graphics
                 
                 // Push constants: InputSrv, OutputUav, Width, Height
                 uint inputSrv = mip == 0 ? depthSrvIndex : pyramid.MipSRVs[mip - 1];
-                commandList.SetComputeRoot32BitConstant(0, inputSrv, 0);
-                commandList.SetComputeRoot32BitConstant(0, pyramid.MipUAVs[mip], 1);
-                commandList.SetComputeRoot32BitConstant(0, (uint)w, 2);
-                commandList.SetComputeRoot32BitConstant(0, (uint)h, 3);
+                var ps = _pyramidShader!;
+                ps.SetPushConstant(_perMipKernel, "SourceSrv", inputSrv);
+                ps.SetPushConstant(_perMipKernel, "CounterUAV", pyramid.MipUAVs[mip]);
+                ps.SetPushConstant(_perMipKernel, "SourceWidth", (uint)w);
+                ps.SetPushConstant(_perMipKernel, "SourceHeight", (uint)h);
                 
-                commandList.Dispatch(((uint)w + 7) / 8, ((uint)h + 7) / 8, 1);
+                ps.Dispatch(_perMipKernel, commandList, ((uint)w + 7) / 8, ((uint)h + 7) / 8, 1);
                 
                 // Transition to SRV for next level
                 commandList.ResourceBarrier(new ResourceBarrier(
@@ -1007,7 +514,7 @@ namespace Freefall.Graphics
             uint shadowArraySrvIndex,
             ShadowHiZPyramid pyramid)
         {
-            if (!_initialized || _shadowDownsamplePSO == null || pyramid?.Texture == null) return;
+            if (!_initialized || _pyramidShader == null || pyramid?.Texture == null) return;
 
             bool firstGeneration = !pyramid.Ready;
             pyramid.Ready = true;
@@ -1019,7 +526,6 @@ namespace Freefall.Graphics
             uint numGroupsY = ((uint)sourceH + 63) / 64;
 
             commandList.SetComputeRootSignature(_device.GlobalRootSignature);
-            commandList.SetPipelineState(_shadowDownsamplePSO);
 
             // Process each cascade slice
             for (int slice = 0; slice < pyramid.SliceCount; slice++)
@@ -1039,26 +545,22 @@ namespace Freefall.Graphics
                 }
                 commandList.ResourceBarrier(barriers);
 
-                // Push constants — same layout as camera SPD
-                commandList.SetComputeRoot32BitConstant(0, shadowArraySrvIndex, 0); // SourceSrvIdx (Texture2DArray)
-                commandList.SetComputeRoot32BitConstant(0, 0u, 1);                  // CounterUavIdx (unused)
-                commandList.SetComputeRoot32BitConstant(0, (uint)sourceW, 2);
-                commandList.SetComputeRoot32BitConstant(0, (uint)sourceH, 3);
-                commandList.SetComputeRoot32BitConstant(0, (uint)spdMipCount, 4);
-                commandList.SetComputeRoot32BitConstant(0, numGroupsX, 5);
-                commandList.SetComputeRoot32BitConstant(0, numGroupsY, 6);
-                // Mip 0 UAV
-                commandList.SetComputeRoot32BitConstant(0, pyramid.GetMipUAV(slice, 0), 7);
-                // Mip 1-5 UAVs
+                // Push constants via ComputeShader API
+                var ps = _pyramidShader!;
+                ps.SetPushConstant(_shadowSpdKernel, "SourceSrv", shadowArraySrvIndex);
+                ps.SetPushConstant(_shadowSpdKernel, "CounterUAV", 0u);
+                ps.SetPushConstant(_shadowSpdKernel, "SourceWidth", (uint)sourceW);
+                ps.SetPushConstant(_shadowSpdKernel, "SourceHeight", (uint)sourceH);
+                ps.SetParam(_shadowSpdKernel, "MipCount", (uint)spdMipCount);
+                ps.SetParam(_shadowSpdKernel, "NumGroupsX", numGroupsX);
+                ps.SetParam(_shadowSpdKernel, "NumGroupsY", numGroupsY);
+                // Mip UAVs
+                ps.SetPushConstant(_shadowSpdKernel, "Mip0UAV", pyramid.GetMipUAV(slice, 0));
                 for (int m = 1; m < spdMipCount && m <= 12; m++)
-                {
-                    int slot = 8 + (m - 1);
-                    commandList.SetComputeRoot32BitConstant(0, pyramid.GetMipUAV(slice, m), (uint)slot);
-                }
-                // SliceIndex at [5].x = slot 20
-                commandList.SetComputeRoot32BitConstant(0, (uint)slice, 20);
+                    ps.SetPushConstant(_shadowSpdKernel, $"Mip{m}UAV", pyramid.GetMipUAV(slice, m));
+                ps.SetPushConstant(_shadowSpdKernel, "SliceIndex", (uint)slice);
 
-                commandList.Dispatch(numGroupsX, numGroupsY, 1);
+                ps.Dispatch(_shadowSpdKernel, commandList, numGroupsX, numGroupsY, 1);
 
                 // Transition SPD mips back to SRV
                 for (int mip = 0; mip < spdMipCount; mip++)
@@ -1073,10 +575,8 @@ namespace Freefall.Graphics
                 commandList.ResourceBarrier(barriers);
 
                 // Mips 6+ via per-mip fallback
-                if (pyramid.MipCount > 6 && _shadowDownsamplePerMipPSO != null)
+                if (pyramid.MipCount > 6 && _pyramidShader != null)
                 {
-                    commandList.SetPipelineState(_shadowDownsamplePerMipPSO);
-
                     int mw = pyramid.Width;
                     int mh = pyramid.Height;
                     for (int skip = 0; skip < 5; skip++) { mw = Math.Max(1, mw / 2); mh = Math.Max(1, mh / 2); }
@@ -1092,22 +592,18 @@ namespace Freefall.Graphics
                                 firstGeneration ? ResourceStates.Common : ResourceStates.NonPixelShaderResource,
                                 ResourceStates.UnorderedAccess, sub)));
 
-                        commandList.SetComputeRoot32BitConstant(0, pyramid.GetMipSRV(slice, mip - 1), 0);
-                        commandList.SetComputeRoot32BitConstant(0, pyramid.GetMipUAV(slice, mip), 1);
-                        commandList.SetComputeRoot32BitConstant(0, (uint)mw, 2);
-                        commandList.SetComputeRoot32BitConstant(0, (uint)mh, 3);
+                        ps.SetPushConstant(_shadowPerMipKernel, "SourceSrv", pyramid.GetMipSRV(slice, mip - 1));
+                        ps.SetPushConstant(_shadowPerMipKernel, "CounterUAV", pyramid.GetMipUAV(slice, mip));
+                        ps.SetPushConstant(_shadowPerMipKernel, "SourceWidth", (uint)mw);
+                        ps.SetPushConstant(_shadowPerMipKernel, "SourceHeight", (uint)mh);
 
-                        commandList.Dispatch(((uint)mw + 7) / 8, ((uint)mh + 7) / 8, 1);
+                        ps.Dispatch(_shadowPerMipKernel, commandList, ((uint)mw + 7) / 8, ((uint)mh + 7) / 8, 1);
 
                         commandList.ResourceBarrier(new ResourceBarrier(
                             new ResourceTransitionBarrier(pyramid.Texture,
                                 ResourceStates.UnorderedAccess,
                                 ResourceStates.NonPixelShaderResource, sub)));
                     }
-
-                    // Restore SPD PSO for next slice
-                    if (slice < pyramid.SliceCount - 1)
-                        commandList.SetPipelineState(_shadowDownsamplePSO);
                 }
             }
         }
@@ -1118,7 +614,7 @@ namespace Freefall.Graphics
         /// </summary>
         public void AnalyzeDepth(ID3D12GraphicsCommandList commandList, uint depthSrvIndex, int texWidth, int texHeight, float nearPlane, float farPlane)
         {
-            if (!_sdsmInitialized || _depthReducePSO == null || _depthHistogramPSO == null || _computeSplitsPSO == null) return;
+            if (!_sdsmInitialized || _depthAnalysisShader == null) return;
             
             int frameIndex = Engine.FrameIndex % FrameCount;
             
@@ -1126,95 +622,67 @@ namespace Freefall.Graphics
             _cachedSrvHeapArray ??= new[] { _device.SrvHeap };
             commandList.SetDescriptorHeaps(1, _cachedSrvHeapArray);
             
-            // Create the persistent clear buffer (once)
-            unsafe
-            {
-                if (_sdsmClearBuffer == null)
-                {
-                    _sdsmClearBuffer = _device.CreateUploadBuffer(8 + 256 * sizeof(uint));
-                    void* pData;
-                    _sdsmClearBuffer.Map(0, null, &pData);
-                    uint* pUint = (uint*)pData;
-                    pUint[0] = 0x7F7FFFFF; // min = max float
-                    pUint[1] = 0;           // max = 0
-                    for (int i = 0; i < 256; i++)
-                        pUint[2 + i] = 0;   // histogram = all zeros
-                    _sdsmClearBuffer.Unmap(0);
-                }
-            }
-            
-            // Step 1: Transition buffers to CopyDest for clear copies
+            // Clear SDSM buffers
             var minMaxFrom = _sdsmValidFrames == 0 ? ResourceStates.Common : ResourceStates.CopySource;
             var histFrom = _sdsmValidFrames == 0 ? ResourceStates.Common : ResourceStates.UnorderedAccess;
             var splitsFrom = _sdsmValidFrames == 0 ? ResourceStates.Common : ResourceStates.CopySource;
             
-            commandList.ResourceBarrierTransition(_depthMinMaxBuffer!, minMaxFrom, ResourceStates.CopyDest);
-            commandList.ResourceBarrierTransition(_depthHistogramBuffer!, histFrom, ResourceStates.CopyDest);
-            commandList.ResourceBarrierTransition(_depthSplitsBuffer!, splitsFrom, ResourceStates.CopyDest);
+            // MinMax buffer needs two different values {MAX_FLOAT, 0} — can't use ClearUAV (fills all elements with first component)
+            commandList.ResourceBarrierTransition(_depthMinMaxBuffer!.Native, minMaxFrom, ResourceStates.CopyDest);
+            commandList.CopyBufferRegion(_depthMinMaxBuffer!.Native, 0, _depthMinMaxInitBuffer!.Native, 0, 8);
+            commandList.ResourceBarrierTransition(_depthMinMaxBuffer!.Native, ResourceStates.CopyDest, ResourceStates.UnorderedAccess);
             
-            // Step 2: Copy clear values from upload buffer
-            commandList.CopyBufferRegion(_depthMinMaxBuffer!, 0, _sdsmClearBuffer!, 0, 8);
-            commandList.CopyBufferRegion(_depthHistogramBuffer!, 0, _sdsmClearBuffer!, 8, 256 * sizeof(uint));
+            // Histogram: uniform zero clear — ClearUAV is perfect for this
+            if (histFrom != ResourceStates.UnorderedAccess)
+                commandList.ResourceBarrierTransition(_depthHistogramBuffer!.Native, histFrom, ResourceStates.UnorderedAccess);
+            _depthHistogramBuffer!.ClearUAV(commandList, new Int4(0, 0, 0, 0));
             
-            // Step 3: Transition to UAV for compute
-            commandList.ResourceBarrierTransition(_depthMinMaxBuffer!, ResourceStates.CopyDest, ResourceStates.UnorderedAccess);
-            commandList.ResourceBarrierTransition(_depthHistogramBuffer!, ResourceStates.CopyDest, ResourceStates.UnorderedAccess);
-            commandList.ResourceBarrierTransition(_depthSplitsBuffer!, ResourceStates.CopyDest, ResourceStates.UnorderedAccess);
+            commandList.ResourceBarrierTransition(_depthSplitsBuffer!.Native, splitsFrom, ResourceStates.UnorderedAccess);
+            commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(null)));
             
-            // Set push constants shared by all passes
-            commandList.SetComputeRoot32BitConstant(0, depthSrvIndex, 0);        // DepthTexIdx
-            commandList.SetComputeRoot32BitConstant(0, _depthMinMaxUAV, 1);      // MinMaxUAVIdx
-            commandList.SetComputeRoot32BitConstant(0, _depthHistogramUAV, 2);   // HistogramUAVIdx
-            commandList.SetComputeRoot32BitConstant(0, _depthSplitsUAV, 3);      // SplitsUAVIdx
-            commandList.SetComputeRoot32BitConstant(0, (uint)texWidth, 4);       // TexWidth
-            commandList.SetComputeRoot32BitConstant(0, (uint)texHeight, 5);      // TexHeight
-            
-            uint nearAsUint;
-            uint farAsUint;
-            unsafe
-            {
-                nearAsUint = *(uint*)&nearPlane;
-                farAsUint = *(uint*)&farPlane;
-            }
-            commandList.SetComputeRoot32BitConstant(0, nearAsUint, 6);           // NearPlane
-            commandList.SetComputeRoot32BitConstant(0, farAsUint, 7);            // FarPlane
+            // Set constants via ComputeShader API
+            var da = _depthAnalysisShader!;
+            // Push constants (resource indices)
+            da.SetPushConstant("DepthTex", depthSrvIndex);
+            da.SetBuffer("MinMaxUAV", _depthMinMaxBuffer!);
+            da.SetBuffer("HistogramUAV", _depthHistogramBuffer!);
+            da.SetBuffer("SplitsUAV", _depthSplitsBuffer!);
+            // Params cbuffer
+            da.SetParam("TexWidth", (uint)texWidth);
+            da.SetParam("TexHeight", (uint)texHeight);
+            da.SetParam("NearPlane", nearPlane);
+            da.SetParam("FarPlane", farPlane);
             
             uint groupsX = ((uint)texWidth + 15) / 16;
             uint groupsY = ((uint)texHeight + 15) / 16;
             
             // --- Pass 1: CSDepthReduce ---
-            commandList.SetPipelineState(_depthReducePSO);
-            commandList.Dispatch(groupsX, groupsY, 1);
+            da.Dispatch(_depthReduceKernel, commandList, groupsX, groupsY, 1);
             commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(null)));
             
             // --- Pass 2: CSDepthHistogram ---
-            commandList.SetPipelineState(_depthHistogramPSO);
-            commandList.Dispatch(groupsX, groupsY, 1);
+            da.Dispatch(_depthHistogramKernel, commandList, groupsX, groupsY, 1);
             commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(null)));
             
             // --- Pass 3: CSComputeSplits ---
-            commandList.SetPipelineState(_computeSplitsPSO);
-            commandList.Dispatch(1, 1, 1);
+            da.Dispatch(_computeSplitsKernel, commandList, 1, 1, 1);
             commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(null)));
             
             // Step 4: Transition splits + minmax to CopySource for readback
-            commandList.ResourceBarrierTransition(_depthSplitsBuffer!,
+            commandList.ResourceBarrierTransition(_depthSplitsBuffer!.Native,
                 ResourceStates.UnorderedAccess, ResourceStates.CopySource);
-            commandList.ResourceBarrierTransition(_depthMinMaxBuffer!,
+            commandList.ResourceBarrierTransition(_depthMinMaxBuffer!.Native,
                 ResourceStates.UnorderedAccess, ResourceStates.CopySource);
             // Histogram stays in UAV (next frame will transition it to CopyDest)
             
             // Step 5: Copy to readback buffer for this frame
             commandList.CopyBufferRegion(
-                _depthSplitsReadbackBuffers![frameIndex], 0,
-                _depthSplitsBuffer!, 0,
+                _depthSplitsReadbackBuffers![frameIndex].Native, 0,
+                _depthSplitsBuffer!.Native, 0,
                 4 * sizeof(float));
             
             _sdsmValidFrames++;
         }
-        
-        // Persistent upload buffer for clearing SDSM buffers
-        private ID3D12Resource? _sdsmClearBuffer;
         
         /// <summary>
         /// Read the adaptive cascade splits computed by the previous frame's depth analysis.
@@ -1222,12 +690,12 @@ namespace Freefall.Graphics
         /// </summary>
         public unsafe float[]? ReadAdaptiveSplits()
         {
-            if (!_sdsmInitialized || _depthSplitsReadbackPtrs == null || _sdsmValidFrames < 2)
+            if (!_sdsmInitialized || _depthSplitsReadbackBuffers == null || _sdsmValidFrames < 2)
                 return null;
             
             // Read from the PREVIOUS frame's readback buffer (guaranteed complete)
             int readFrame = (Engine.FrameIndex - 1 + FrameCount) % FrameCount;
-            float* pSplits = (float*)_depthSplitsReadbackPtrs[readFrame];
+            float* pSplits = _depthSplitsReadbackBuffers[readFrame].ReadPtr<float>();
             
             // Check for invalid data (zeros = no scene geometry)
             if (pSplits[0] <= 0)
@@ -1249,7 +717,7 @@ namespace Freefall.Graphics
             uint cascadeOutUAV,          // UAV for CascadeData structured buffer
             uint cascadeOutSRV)          // SRV for CascadeData (will be read by culler)
         {
-            if (!_cascadeComputeInitialized || _cascadeComputePSO == null) return;
+            if (!_cascadeComputeInitialized || _cascadeShader == null) return;
             
             int frameIndex = Engine.FrameIndex % FrameCount;
             
@@ -1266,18 +734,18 @@ namespace Freefall.Graphics
                 LightForward = lightForward,
                 CascadeSplits = Vector4.Zero  // Unused — splits come from GPU buffer
             };
-            *(CascadeComputeParams*)_cascadeParamsCBPtrs![frameIndex] = cbParams;
+            *_cascadeParamsCBs![frameIndex].WritePtr<CascadeComputeParams>() = cbParams;
             
             // Transition lighting cascade buffer to UAV for compute write
             // (On first use it's Common, subsequent uses it's NonPixelShaderResource)
             var lightingFromState = _sdsmValidFrames > 1 ? ResourceStates.NonPixelShaderResource : ResourceStates.Common;
-            commandList.ResourceBarrierTransition(_lightingCascadeBuffer!,
+            commandList.ResourceBarrierTransition(_lightingCascadeBuffer!.Native,
                 lightingFromState, ResourceStates.UnorderedAccess);
             
             // Transition splits buffer from CopySource (left by AnalyzeDepth) to SRV for reading
             if (_sdsmValidFrames > 0)
             {
-                commandList.ResourceBarrierTransition(_depthSplitsBuffer!,
+                commandList.ResourceBarrierTransition(_depthSplitsBuffer!.Native,
                     ResourceStates.CopySource, ResourceStates.NonPixelShaderResource);
             }
             
@@ -1285,28 +753,23 @@ namespace Freefall.Graphics
             commandList.SetComputeRootSignature(_device.GlobalRootSignature);
             _cachedSrvHeapArray ??= new[] { _device.SrvHeap };
             commandList.SetDescriptorHeaps(1, _cachedSrvHeapArray);
-            commandList.SetPipelineState(_cascadeComputePSO);
             
-            // Bind params cbuffer (slot 2 → register b1)
-            commandList.SetComputeRootConstantBufferView(2, _cascadeParamsCBs![frameIndex].GPUVirtualAddress);
+            // Bind params cbuffer (slot 2 → register b1, externally managed)
+            commandList.SetComputeRootConstantBufferView(2, _cascadeParamsCBs![frameIndex].Native.GPUVirtualAddress);
             
-            // Push constants
-            commandList.SetComputeRoot32BitConstant(0, _depthSplitsSRV, 0);          // SplitsBufferIdx
-            commandList.SetComputeRoot32BitConstant(0, cascadeOutUAV, 1);             // CascadeOutUAVIdx
-            commandList.SetComputeRoot32BitConstant(0, _lightingCascadeUAV, 2);       // LightingOutUAVIdx
-            commandList.SetComputeRoot32BitConstant(0, (uint)shadowMapResolution, 3); // ShadowMapRes
-            
-            // NearPlane as float bits
-            uint nearAsUint;
-            float nearPlane = camera.NearPlane;
-            nearAsUint = *(uint*)&nearPlane;
-            commandList.SetComputeRoot32BitConstant(0, nearAsUint, 4);               // NearPlane
-            commandList.SetComputeRoot32BitConstant(0, 4u, 5);                        // CascadeCount
-            commandList.SetComputeRoot32BitConstant(0, _prevVPBufferSRV, 6);          // PrevVPBufferIdx
-            commandList.SetComputeRoot32BitConstant(0, _smoothedSplitsUAV, 7);         // SmoothedSplitsIdx
+            // Push constants via ComputeShader API
+            var cs = _cascadeShader!;
+            cs.SetSRV(_cascadeComputeKernel, "SplitsBuffer", _depthSplitsBuffer!);
+            cs.SetPushConstant(_cascadeComputeKernel, "CascadeOutUAV", cascadeOutUAV);
+            cs.SetUAV(_cascadeComputeKernel, "LightingOutUAV", _lightingCascadeBuffer!);
+            cs.SetParam(_cascadeComputeKernel, "ShadowMapRes", (uint)shadowMapResolution);
+            cs.SetParam(_cascadeComputeKernel, "NearPlane", camera.NearPlane);
+            cs.SetParam(_cascadeComputeKernel, "CascadeCount", 4u);
+            cs.SetPushConstant(_cascadeComputeKernel, "PrevVPBuffer", _prevVPBuffer!.SrvIndex);
+            cs.SetUAV(_cascadeComputeKernel, "SmoothedSplits", _smoothedSplitsBuffer!);
             
             // Dispatch: 1 thread group, 4 threads (one per cascade)
-            commandList.Dispatch(1, 1, 1);
+            cs.Dispatch(_cascadeComputeKernel, commandList, 1, 1, 1);
             
             // UAV barriers for cascade and lighting outputs
             commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(null)));
@@ -1314,12 +777,12 @@ namespace Freefall.Graphics
             // Transition splits buffer back to CopySource (AnalyzeDepth expects this state)
             if (_sdsmValidFrames > 0)
             {
-                commandList.ResourceBarrierTransition(_depthSplitsBuffer!,
+                commandList.ResourceBarrierTransition(_depthSplitsBuffer!.Native,
                     ResourceStates.NonPixelShaderResource, ResourceStates.CopySource);
             }
             
             // Transition lighting cascade buffer to SRV for lighting pass
-            commandList.ResourceBarrierTransition(_lightingCascadeBuffer!,
+            commandList.ResourceBarrierTransition(_lightingCascadeBuffer!.Native,
                 ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource);
             
             // Copy current frame's shadow VPs to prevVP buffer for next frame
@@ -1330,27 +793,16 @@ namespace Freefall.Graphics
 
         public void Dispose()
         {
-            _clearPSO?.Dispose();
-            _visibilityPSO?.Dispose();
-            _visibilityShadowPSO?.Dispose();
-            _histogramPSO?.Dispose();
-            _histogramPrefixSumPSO?.Dispose();
-            _localScanPSO?.Dispose();
-            _blockScanPSO?.Dispose();
-            _globalScatterPSO?.Dispose();
-            _bitonicSortPSO?.Dispose();
-            _sortIndirectionPSO?.Dispose();
-            _mainPSO?.Dispose();
-            _downsamplePSO?.Dispose();
-            _depthReducePSO?.Dispose();
-            _depthHistogramPSO?.Dispose();
-            _computeSplitsPSO?.Dispose();
-            _cascadeComputePSO?.Dispose();
-            _clearUAVHeap?.Dispose();
+            _cullShader?.Dispose();
+            _pyramidShader?.Dispose();
+            _depthAnalysisShader?.Dispose();
+            _cascadeShader?.Dispose();
+            _cullStatsBuffer?.Dispose();
             _depthMinMaxBuffer?.Dispose();
+            _depthMinMaxInitBuffer?.Dispose();
             _depthHistogramBuffer?.Dispose();
             _depthSplitsBuffer?.Dispose();
-            _sdsmClearBuffer?.Dispose();
+
             _lightingCascadeBuffer?.Dispose();
             _prevVPBuffer?.Dispose();
             
@@ -1362,12 +814,15 @@ namespace Freefall.Graphics
                 for (int i = 0; i < FrameCount; i++)
                     _depthSplitsReadbackBuffers[i]?.Dispose();
             
+            if (_cullStatsReadbackBuffers != null)
+                for (int i = 0; i < FrameCount; i++)
+                    _cullStatsReadbackBuffers[i]?.Dispose();
+            
             for (int i = 0; i < FrameCount; i++)
             {
                 _frustumConstantsBuffers[i]?.Dispose();
                 _counterBuffers[i]?.Dispose();
                 _rangeBuffers[i]?.Dispose();
-
             }
         }
     }

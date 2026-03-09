@@ -6,6 +6,21 @@
 // 4. CSGlobalScatter - add block prefix, scatter to compacted output
 // 5. CSMain - generate indirect draw commands
 
+#pragma kernel CSVisibility
+#pragma kernel CSHistogram
+#pragma kernel CSLocalScan
+#pragma kernel CSBlockScan
+#pragma kernel CSGlobalScatter
+#pragma kernel CSSortIndirection
+#pragma kernel CSBitonicSort
+#pragma kernel CSHistogramPrefixSum
+#pragma kernel CSMain
+#pragma kernel CSClear
+#pragma kernel CSVisibilityShadow
+#pragma kernel CSVisibilityShadow4
+#pragma kernel CSExpandCascades
+#pragma kernel CSPatchExpandedCounts
+
 // Frustum planes + Hi-Z occlusion parameters (root slot 1 -> register b0)
 cbuffer FrustumPlanes : register(b0)
 {
@@ -35,8 +50,7 @@ struct CascadeData
     float4 SplitDistances;      // X=near, Y=far
 };
 
-#define CascadeBufferSRVIdx   Indices[7].w   // SRV: StructuredBuffer<CascadeData>
-#define ShadowHiZSrvIdx       Indices[0].z   // SRV: shadow Hi-Z pyramid (0=disabled)
+// CascadeBufferSRVIdx and ShadowHiZSrvIdx are aliased in cbuffer PushConstants below
 
 // Shadow cascade frustum planes (cbuffer — used by culler for frustum tests)
 cbuffer ShadowCascadePlanes : register(b1)
@@ -50,51 +64,65 @@ cbuffer ShadowCascadePlanes : register(b1)
 // Push constants for bindless buffer indices (root slot 0 -> register b3)
 cbuffer PushConstants : register(b3)
 {
-    uint4 Indices[8];
+    uint MeshRegistryIdx;           // slot 0  — SRV: global mesh/part registry
+    uint OutputBufferUAVIdx;        // slot 1  — UAV: output commands
+    uint PrevVisibilityIdx;         // slot 2  — SRV: previous visibility / shadow Hi-Z (aliased)
+    uint InstanceMultiplierIdx;     // slot 3  — DrawInstanceCount multiplier (1=normal, 4=shadow)
+    uint DescriptorBufferIdx;       // slot 4  — SRV: per-instance InstanceDescriptor buffer
+    uint VisibleIndicesUAVIdx;      // slot 5  — UAV: output visible indices (compacted)
+    uint CounterBufferUAVIdx;       // slot 6  — UAV: per-subbatch visible counts
+    uint SubBatchCountIdx;          // slot 7  — Total number of subbatches
+    uint CounterOffsetIdx;          // slot 8  — Offset into counter buffer
+    uint VisibleIndicesSRVIdx;      // slot 9  — SRV: visible indices for rendering
+    uint GlobalTransformsIdx;       // slot 10 — SRV: global transform buffer
+    uint VisibilityFlagsUAVIdx;     // slot 11 — UAV: visibility flags (1=visible, 0=not)
+    uint PrefixSumUAVIdx;           // slot 12 — UAV: prefix sum buffer
+    uint TotalInstancesIdx;         // slot 13 — Total instance count
+    uint BlockSumsUAVIdx;           // slot 14 — UAV: block sums for hierarchical scan
+    uint NumBlocksIdx;              // slot 15 — Number of blocks in scan
+    uint SubbatchStartIdx;          // slot 16 — Starting index of current subbatch
+    uint SubbatchCountIdx;          // slot 17 — Number of instances in current subbatch
+    uint _reserved18;               // slot 18 — unused
+    uint IndirectionUAVIdx;         // slot 19 — UAV: maps group-order -> draw-order index
+    uint SortSizeIdx;               // slot 20 — Block size for this merge step
+    uint SortStrideIdx;             // slot 21 — Stride within block
+    uint SortCountIdx;              // slot 22 — Total count to sort
+    uint SubbatchIdsIdx;            // slot 23 — SRV: per-instance subbatch index
+    uint CombinedShadowVisUAVIdx;   // slot 24 — UAV: combined shadow visibility
+    uint MaterialsBufferIdx;        // slot 25 — SRV: materials array buffer
+    uint HistogramUAVIdx;           // slot 26 — UAV: histogram buffer (count per MeshPartId)
+    uint UniquePartCountIdx;        // slot 27 — Max unique MeshPartIds in registry
+    uint CascadeMaskUAVIdx;         // slot 28 — UAV: per-instance 4-bit cascade mask
+    uint ExpansionUAVIdx;           // slot 29 — UAV: expansion buffer for (instanceIdx, cascadeIdx)
+    uint BoneBufferIdx;             // slot 30 — SRV: per-batch bone matrices (0=static)
+    uint CascadeBufferSRVIdx;       // slot 31 — SRV: StructuredBuffer<CascadeData> / shadow cascade idx (aliased)
 };
 
-// Root constant mappings
-#define MeshRegistryIdx       Indices[0].x   // SRV: global mesh/part registry (replaces templates)
-#define OutputBufferIdx       Indices[0].y   // UAV: output commands
-#define PrevVisibilityIdx     Indices[0].z   // SRV: previous frame's visibility flags (feedback loop breaker)
-#define InstanceMultiplier    Indices[0].w   // DrawInstanceCount multiplier (1=normal, 4=shadow single-pass)
-
-#define DescriptorBufferIdx   Indices[1].x   // SRV: per-instance InstanceDescriptor buffer (TransformSlot, MaterialId, CustomDataIdx)
-#define VisibleIndicesUAVIdx  Indices[1].y   // UAV: output visible indices (compacted)
-#define CounterBufferIdx      Indices[1].z   // UAV: per-subbatch visible counts
-#define SubBatchCount         Indices[1].w   // Total number of subbatches
-
-#define CounterOffset         Indices[2].x   // Offset into counter buffer
-#define VisibleIndicesSRVIdx  Indices[2].y   // SRV: visible indices for rendering
-#define GlobalTransformsIdx   Indices[2].z   // SRV: global transform buffer
-#define VisibilityFlagsIdx    Indices[2].w   // UAV: visibility flags (1=visible, 0=not)
-
-#define PrefixSumIdx          Indices[3].x   // UAV: prefix sum buffer
-#define TotalInstances        Indices[3].y   // Total instance count
-#define BlockSumsIdx          Indices[3].z   // UAV: block sums for hierarchical scan
-#define NumBlocks             Indices[3].w   // Number of blocks in scan
-
-#define IndirectionIdx        Indices[4].w   // UAV: maps group-order -> draw-order index (writable for sort)
-
-// Per-subbatch sort parameters (used during CSSortIndirection pass)
-#define SubbatchStart         Indices[4].x   // Starting index of current subbatch
-#define SubbatchCount         Indices[4].y   // Number of instances in current subbatch
-
-// Sort parameters (used during CSSortIndirection and CSBitonicSort passes)
-#define SortSize              Indices[5].x   // Block size for this merge step
-#define SortStride            Indices[5].y   // Stride within block
-#define SortCount             Indices[5].z   // Total count to sort (subbatch count or visible count)
-#define SubbatchIdsIdx        Indices[5].w   // SRV: per-instance subbatch index
-
-// Per-batch indices (set by CPU for each batch)
-#define CombinedShadowVisIdx  Indices[6].x   // UAV: combined shadow visibility (union of all 4 cascades)
-#define MaterialsBufferIdx    Indices[6].y   // SRV: materials array buffer
-#define HistogramIdx          Indices[6].z   // UAV: histogram buffer (count per MeshPartId)
-#define UniquePartCount       Indices[6].w   // Max unique MeshPartIds in registry
-#define CascadeMaskUAVIdx     Indices[7].x   // UAV: per-instance 4-bit cascade mask (CSVisibilityShadow4)
-#define ExpansionUAVIdx       Indices[7].y   // UAV: expansion buffer for (instanceIdx, cascadeIdx) pairs
-#define BoneBufferIdx         Indices[7].z   // SRV: per-batch bone matrices buffer (0 for static batches)
-#define ShadowCascadeIdx      Indices[7].w   // Shadow cascade index (0-3) / cascade 3 vis flags UAV
+// Convenience aliases for named push constants (matching old #define usage)
+#define OutputBufferIdx       OutputBufferUAVIdx
+#define InstanceMultiplier    InstanceMultiplierIdx
+#define VisibilityFlagsIdx    VisibilityFlagsUAVIdx
+#define CounterBufferIdx      CounterBufferUAVIdx
+#define SubBatchCount         SubBatchCountIdx
+#define CounterOffset         CounterOffsetIdx
+#define TotalInstances        TotalInstancesIdx
+#define PrefixSumIdx          PrefixSumUAVIdx
+#define BlockSumsIdx          BlockSumsUAVIdx
+#define NumBlocks             NumBlocksIdx
+#define IndirectionIdx        IndirectionUAVIdx
+#define SubbatchStart         SubbatchStartIdx
+#define SubbatchCount         SubbatchCountIdx
+#define SortSize              SortSizeIdx
+#define SortStride            SortStrideIdx
+#define SortCount             SortCountIdx
+#define HistogramIdx          HistogramUAVIdx
+#define UniquePartCount       UniquePartCountIdx
+#define VisibleIndicesUAVIdx  VisibleIndicesUAVIdx
+#define CombinedShadowVisIdx  CombinedShadowVisUAVIdx
+#define ExpansionUAVIdx       ExpansionUAVIdx
+#define CascadeMaskUAVIdx     CascadeMaskUAVIdx
+#define ShadowHiZSrvIdx       PrevVisibilityIdx
+#define ShadowCascadeIdx      CascadeBufferSRVIdx
 
 // Per-subbatch instance range (extended with MeshPartId)
 struct InstanceRange

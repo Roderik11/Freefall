@@ -1,6 +1,12 @@
 // ════════════════════════════════════════════════════════════════════════════
 // Single-Pass Hi-Z Depth Pyramid Generator (SPD)
 // ════════════════════════════════════════════════════════════════════════════
+
+#pragma kernel CSSinglePassDownsample
+#pragma kernel CSDownsample
+#pragma kernel CSSinglePassDownsampleShadow
+#pragma kernel CSDownsampleShadow
+
 //
 // Generates the full mip chain of a Hi-Z depth pyramid in a single dispatch.
 // Each thread group covers a 64x64 tile of the source and progressively
@@ -11,43 +17,58 @@
 // Sky/empty pixels (depth <= 0) are promoted to FLT_MAX so tiles
 // containing sky become un-occludable.
 //
-// Push constant layout (register b3, Indices[0..7]):
-//   [0].x = SourceSrvIdx    — GBuffer depth (Texture2D<float>)
-//   [0].y = CounterUavIdx   — RWByteAddressBuffer for atomic counter
-//   [0].z = SourceWidth     — Source mip 0 width
-//   [0].w = SourceHeight    — Source mip 0 height
-//   [1].x = MipCount        — Total mip levels in pyramid
-//   [1].y = NumGroupsX      — Dispatch grid width (for last-group logic)
-//   [1].z = NumGroupsY      — Dispatch grid height
-//   [1].w = Mip0UavIdx      — UAV for mip 0
-//   [2].xyzw = mip UAV indices 1-4
-//   [3].xyzw = mip UAV indices 5-8
-//   [4].xyzw = mip UAV indices 9-12
+// Push constant layout (register b3):
+//   Slots 0-6: SPD shared params
+//   Slots 7-19: Per-mip UAV indices (mip 0-12)
+//   Slot 20: SliceIndex (shadow variant)
+//
+// CSDownsample/CSDownsampleShadow reuse slots 0-3: InputSrv, OutputUav, Width, Height
 
 cbuffer PushConstants : register(b3)
 {
-    uint4 Indices[8];
+    uint SourceSrvIdx;          // slot 0  — SRV: source depth texture
+    uint CounterUAVIdx;         // slot 1  — UAV: atomic counter (SPD) / output UAV (per-mip)
+    uint Mip0UAVIdx;            // slot 2  — UAV for mip 0
+    uint Mip1UAVIdx;            // slot 3  — UAV for mip 1
+    uint Mip2UAVIdx;            // slot 4  — UAV for mip 2
+    uint Mip3UAVIdx;            // slot 5  — UAV for mip 3
+    uint Mip4UAVIdx;            // slot 6  — UAV for mip 4
+    uint Mip5UAVIdx;            // slot 7  — UAV for mip 5
+    uint Mip6UAVIdx;            // slot 8  — UAV for mip 6
+    uint Mip7UAVIdx;            // slot 9  — UAV for mip 7
+    uint Mip8UAVIdx;            // slot 10 — UAV for mip 8
+    uint Mip9UAVIdx;            // slot 11 — UAV for mip 9
+    uint Mip10UAVIdx;           // slot 12 — UAV for mip 10
+    uint Mip11UAVIdx;           // slot 13 — UAV for mip 11
+    uint Mip12UAVIdx;           // slot 14 — UAV for mip 12
+    uint SourceWidthIdx;        // slot 15 — Source mip 0 width (push constant: changes per-dispatch)
+    uint SourceHeightIdx;       // slot 16 — Source mip 0 height (push constant: changes per-dispatch)
+    uint SliceIndexIdx;         // slot 17 — Array slice for shadow variant (push constant: changes per-dispatch)
 };
 
-#define SourceSrvIdx   Indices[0].x
-#define CounterUavIdx  Indices[0].y
-#define SourceWidth    Indices[0].z
-#define SourceHeight   Indices[0].w
-#define MipCount       Indices[1].x
-#define NumGroupsX     Indices[1].y
-#define NumGroupsY     Indices[1].z
+cbuffer Params : register(b4)
+{
+    uint MipCount;              // Total mip levels in pyramid
+    uint NumGroupsX;            // Dispatch grid width (for last-group logic)
+    uint NumGroupsY;            // Dispatch grid height
+};
+
+// Aliases: push constant names → short names used throughout the shader
+#define SourceWidth  SourceWidthIdx
+#define SourceHeight SourceHeightIdx
+#define SliceIndex   SliceIndexIdx
 
 #define FLT_MAX 3.402823466e+38
 
-// Mip UAV indices packed into push constants
+// Mip UAV indices — local array lookup
 uint GetMipUavIdx(uint mip)
 {
-    // mip 0 is at [1].w, mips 1-4 at [2].xyzw, mips 5-8 at [3].xyzw, mips 9-12 at [4].xyzw
-    if (mip == 0) return Indices[1].w;
-    mip -= 1; // now 0-based for remaining mips
-    uint slot = 2 + (mip / 4);
-    uint comp = mip % 4;
-    return Indices[slot][comp];
+    uint uavs[13] = {
+        Mip0UAVIdx,  Mip1UAVIdx,  Mip2UAVIdx,  Mip3UAVIdx,
+        Mip4UAVIdx,  Mip5UAVIdx,  Mip6UAVIdx,  Mip7UAVIdx,
+        Mip8UAVIdx,  Mip9UAVIdx,  Mip10UAVIdx, Mip11UAVIdx, Mip12UAVIdx
+    };
+    return uavs[min(mip, 12)];
 }
 
 // ── Groupshared storage ────────────────────────────────────────────────────
@@ -316,11 +337,11 @@ void CSSinglePassDownsample(uint3 gid : SV_GroupID, uint gidx : SV_GroupIndex)
 [numthreads(8, 8, 1)]
 void CSDownsample(uint3 id : SV_DispatchThreadID)
 {
-    uint outW = Indices[0].z;
-    uint outH = Indices[0].w;
+    uint outW = SourceWidth;
+    uint outH = SourceHeight;
     if (id.x >= outW || id.y >= outH) return;
 
-    Texture2D<float> inputMip = ResourceDescriptorHeap[Indices[0].x];
+    Texture2D<float> inputMip = ResourceDescriptorHeap[SourceSrvIdx];
     uint2 srcCoord = id.xy * 2;
 
     float d0 = inputMip[srcCoord + uint2(0, 0)];
@@ -333,7 +354,7 @@ void CSDownsample(uint3 id : SV_DispatchThreadID)
     d2 = d2 <= 0 ? FLT_MAX : d2;
     d3 = d3 <= 0 ? FLT_MAX : d3;
 
-    RWTexture2D<float> outputMip = ResourceDescriptorHeap[Indices[0].y];
+    RWTexture2D<float> outputMip = ResourceDescriptorHeap[CounterUAVIdx];
     outputMip[id.xy] = max(max(d0, d1), max(d2, d3));
 }
 
@@ -343,11 +364,7 @@ void CSDownsample(uint3 id : SV_DispatchThreadID)
 // Shadow maps use standard Z: near=0, far=1.0, clear to 1.0.
 // max() reduction → farthest existing depth wins → only cull casters behind ALL existing geometry.
 //
-// Additional push constant:
-//   [5].x = SliceIndex — which array slice to read from source
-// ══════════════════════════════════════════════════════════════════════════
-
-#define SliceIndex Indices[5].x
+// SliceIndex — which array slice to read from source (slot 20)
 
 float LoadSourceShadow(uint2 coord)
 {
@@ -473,12 +490,12 @@ void CSSinglePassDownsampleShadow(uint3 gid : SV_GroupID, uint gidx : SV_GroupIn
 [numthreads(8, 8, 1)]
 void CSDownsampleShadow(uint3 id : SV_DispatchThreadID)
 {
-    uint outW = Indices[0].z;
-    uint outH = Indices[0].w;
+    uint outW = SourceWidth;
+    uint outH = SourceHeight;
     if (id.x >= outW || id.y >= outH) return;
 
     // Input is a single-slice SRV (Texture2DArray with ArraySize=1)
-    Texture2DArray<float> inputMip = ResourceDescriptorHeap[Indices[0].x];
+    Texture2DArray<float> inputMip = ResourceDescriptorHeap[SourceSrvIdx];
     uint2 srcCoord = id.xy * 2;
 
     float d0 = inputMip[uint3(srcCoord + uint2(0,0), 0)];
@@ -486,6 +503,6 @@ void CSDownsampleShadow(uint3 id : SV_DispatchThreadID)
     float d2 = inputMip[uint3(srcCoord + uint2(0,1), 0)];
     float d3 = inputMip[uint3(srcCoord + uint2(1,1), 0)];
 
-    RWTexture2D<float> outputMip = ResourceDescriptorHeap[Indices[0].y];
+    RWTexture2D<float> outputMip = ResourceDescriptorHeap[CounterUAVIdx];
     outputMip[id.xy] = max(max(d0, d1), max(d2, d3));
 }

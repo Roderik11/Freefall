@@ -40,6 +40,9 @@ namespace Freefall.Graphics
         /// <summary>Current resource state for transition tracking.</summary>
         public ResourceStates CurrentState => _currentState;
 
+        /// <summary>Persistently mapped pointer for readback buffers (IntPtr.Zero if not mapped).</summary>
+        public IntPtr MappedPtr { get; }
+
         private GraphicsBuffer(
             GraphicsDevice device,
             ID3D12Resource resource,
@@ -49,7 +52,8 @@ namespace Freefall.Graphics
             uint uavIndex,
             ResourceStates initialState,
             CpuDescriptorHandle clearCpuHandle,
-            bool hasClearHandle)
+            bool hasClearHandle,
+            IntPtr mappedPtr = default)
         {
             _device = device;
             _resource = resource;
@@ -60,6 +64,7 @@ namespace Freefall.Graphics
             _currentState = initialState;
             _clearCpuHandle = clearCpuHandle;
             _hasClearHandle = hasClearHandle;
+            MappedPtr = mappedPtr;
         }
 
         // ────────────── State Management ──────────────
@@ -217,8 +222,9 @@ namespace Freefall.Graphics
 
         /// <summary>
         /// Create an upload heap structured buffer with SRV (for CPU→GPU data like constant arrays).
+        /// When mapped=true, the buffer is persistently mapped — use WritePtr for writes.
         /// </summary>
-        public static GraphicsBuffer CreateUpload<T>(int count) where T : unmanaged
+        public static unsafe GraphicsBuffer CreateUpload<T>(int count, bool mapped = false) where T : unmanaged
         {
             var device = Engine.Device;
             int stride = Unsafe.SizeOf<T>();
@@ -229,8 +235,82 @@ namespace Freefall.Graphics
             uint srvIndex = device.AllocateBindlessIndex();
             device.CreateStructuredBufferSRV(resource, (uint)count, (uint)stride, srvIndex);
 
+            IntPtr mappedPtr = default;
+            if (mapped)
+            {
+                void* pData;
+                resource.Map(0, null, &pData);
+                mappedPtr = (IntPtr)pData;
+            }
+
             return new GraphicsBuffer(device, resource, count, stride, srvIndex, 0,
-                ResourceStates.GenericRead, default, false);
+                ResourceStates.GenericRead, default, false, mappedPtr);
+        }
+
+        /// <summary>
+        /// Create a persistently mapped upload heap buffer for use as a root constant buffer.
+        /// Bind via Native.GPUVirtualAddress with SetComputeRootConstantBufferView.
+        /// Write via WritePtr, no Map/Unmap needed.
+        /// </summary>
+        public static unsafe GraphicsBuffer CreateConstantBuffer<T>() where T : unmanaged
+        {
+            var device = Engine.Device;
+            int stride = Unsafe.SizeOf<T>();
+            int size = (stride + 255) & ~255;  // 256-byte aligned for CBV
+
+            var resource = device.CreateUploadBuffer(size);
+
+            // Persistently map — upload CBs stay mapped for their lifetime
+            void* pData;
+            resource.Map(0, null, &pData);
+
+            return new GraphicsBuffer(device, resource, 1, stride, 0, 0,
+                ResourceStates.GenericRead, default, false, (IntPtr)pData);
+        }
+
+        /// <summary>
+        /// Get a typed write pointer to persistently mapped upload data (constant buffers, etc).
+        /// </summary>
+        public unsafe T* WritePtr<T>() where T : unmanaged
+        {
+            if (MappedPtr == IntPtr.Zero)
+                throw new InvalidOperationException("Buffer is not persistently mapped.");
+            return (T*)MappedPtr;
+        }
+
+        /// <summary>
+        /// Create a readback heap buffer, persistently mapped for CPU reads.
+        /// Use CopyBufferRegion to copy GPU results into this buffer, then read via ReadPtr.
+        /// </summary>
+        public static unsafe GraphicsBuffer CreateReadback<T>(int count) where T : unmanaged
+        {
+            var device = Engine.Device;
+            int stride = Unsafe.SizeOf<T>();
+            int size = count * stride;
+
+            var resource = device.NativeDevice.CreateCommittedResource(
+                new HeapProperties(HeapType.Readback),
+                HeapFlags.None,
+                ResourceDescription.Buffer((ulong)size),
+                ResourceStates.CopyDest,
+                null);
+
+            // Persistently map — readback buffers stay mapped for their lifetime
+            void* pData;
+            resource.Map(0, null, &pData);
+
+            return new GraphicsBuffer(device, resource, count, stride, 0, 0,
+                ResourceStates.CopyDest, default, false, (IntPtr)pData);
+        }
+
+        /// <summary>
+        /// Get a typed read pointer to the persistently mapped readback data.
+        /// </summary>
+        public unsafe T* ReadPtr<T>() where T : unmanaged
+        {
+            if (MappedPtr == IntPtr.Zero)
+                throw new InvalidOperationException("Buffer is not mapped for readback.");
+            return (T*)MappedPtr;
         }
 
         /// <summary>
