@@ -495,6 +495,108 @@ namespace Freefall.Graphics
             return mesh;
         }
 
+        /// <summary>
+        /// Create a cylinder along the Y axis from y=0 to y=height.
+        /// </summary>
+        public static Mesh CreateCylinder(GraphicsDevice device, float radius, float height, int slices)
+        {
+            int vertCount = (slices + 1) * 2;
+            var verts = new Vector3[vertCount];
+            var norms = new Vector3[vertCount];
+            var uvs = new Vector2[vertCount];
+
+            for (int i = 0; i <= slices; i++)
+            {
+                float theta = 2 * MathF.PI * i / slices;
+                float x = MathF.Cos(theta) * radius;
+                float z = MathF.Sin(theta) * radius;
+                var normal = Vector3.Normalize(new Vector3(x, 0, z));
+
+                // Bottom ring
+                verts[i] = new Vector3(x, 0, z);
+                norms[i] = normal;
+                uvs[i] = new Vector2((float)i / slices, 0);
+
+                // Top ring
+                verts[i + slices + 1] = new Vector3(x, height, z);
+                norms[i + slices + 1] = normal;
+                uvs[i + slices + 1] = new Vector2((float)i / slices, 1);
+            }
+
+            var indices = new uint[slices * 6];
+            int ii = 0;
+            for (int i = 0; i < slices; i++)
+            {
+                uint bl = (uint)i;
+                uint br = (uint)(i + 1);
+                uint tl = (uint)(i + slices + 1);
+                uint tr = (uint)(i + slices + 2);
+                indices[ii++] = bl; indices[ii++] = tl; indices[ii++] = br;
+                indices[ii++] = br; indices[ii++] = tl; indices[ii++] = tr;
+            }
+
+            var mesh = new Mesh(device, verts, norms, uvs, indices);
+            mesh.BoundingBox = new BoundingBox(new Vector3(-radius, 0, -radius), new Vector3(radius, height, radius));
+            mesh.MeshParts.Add(new MeshPart { NumIndices = indices.Length, BoundingBox = mesh.BoundingBox, BoundingSphere = mesh.LocalBoundingSphere });
+            return mesh;
+        }
+
+        /// <summary>
+        /// Create a cone along the Y axis from y=0 (base) to y=height (tip).
+        /// </summary>
+        public static Mesh CreateCone(GraphicsDevice device, float radius, float height, int slices)
+        {
+            // Vertices: base ring + tip + base center
+            int vertCount = slices + 2;
+            var verts = new Vector3[vertCount];
+            var norms = new Vector3[vertCount];
+            var uvs = new Vector2[vertCount];
+
+            // Slope normal factor
+            float slopeLen = MathF.Sqrt(radius * radius + height * height);
+            float ny = radius / slopeLen;
+            float nr = height / slopeLen;
+
+            for (int i = 0; i < slices; i++)
+            {
+                float theta = 2 * MathF.PI * i / slices;
+                float x = MathF.Cos(theta);
+                float z = MathF.Sin(theta);
+                verts[i] = new Vector3(x * radius, 0, z * radius);
+                norms[i] = Vector3.Normalize(new Vector3(x * nr, ny, z * nr));
+                uvs[i] = new Vector2((float)i / slices, 0);
+            }
+
+            // Tip vertex
+            verts[slices] = new Vector3(0, height, 0);
+            norms[slices] = Vector3.UnitY;
+            uvs[slices] = new Vector2(0.5f, 1);
+
+            // Base center
+            verts[slices + 1] = Vector3.Zero;
+            norms[slices + 1] = -Vector3.UnitY;
+            uvs[slices + 1] = new Vector2(0.5f, 0);
+
+            // Side triangles + base triangles
+            var indices = new uint[slices * 6];
+            int ii = 0;
+            uint tipIdx = (uint)slices;
+            uint centerIdx = (uint)(slices + 1);
+            for (int i = 0; i < slices; i++)
+            {
+                uint cur = (uint)i;
+                uint next = (uint)((i + 1) % slices);
+                // Side
+                indices[ii++] = cur; indices[ii++] = tipIdx; indices[ii++] = next;
+                // Base
+                indices[ii++] = next; indices[ii++] = centerIdx; indices[ii++] = cur;
+            }
+
+            var mesh = new Mesh(device, verts, norms, uvs, indices);
+            mesh.BoundingBox = new BoundingBox(new Vector3(-radius, 0, -radius), new Vector3(radius, height, radius));
+            mesh.MeshParts.Add(new MeshPart { NumIndices = indices.Length, BoundingBox = mesh.BoundingBox, BoundingSphere = mesh.LocalBoundingSphere });
+            return mesh;
+        }
 
     }
 }

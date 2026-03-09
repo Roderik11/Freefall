@@ -50,6 +50,7 @@ namespace Freefall.Graphics
         private int _pickRequestX = -1;
         private int _pickRequestY = -1;
         private bool _pickResultReady;
+        private bool _pickCopyPending;
         
         // Cached array to avoid per-frame allocation
         private CpuDescriptorHandle[]? _cachedGBufferRtvHandles;
@@ -405,25 +406,15 @@ namespace Freefall.Graphics
              Transition(list, Normals.Native, ResourceStates.RenderTarget, ResourceStates.PixelShaderResource);
              Transition(list, Data.Native, ResourceStates.RenderTarget, ResourceStates.PixelShaderResource);
 
-             // Entity ID readback: copy 1x1 pixel from EntityIdBuffer to readback buffer
-             if (_pickRequestX >= 0 && _entityIdReadback != null)
+             // Entity ID readback: promote pending copy from previous frame (GPU has finished it by now)
+             if (_pickCopyPending)
              {
-                 Transition(list, EntityIdBuffer.Native, ResourceStates.RenderTarget, ResourceStates.CopySource);
-                 var src = new TextureCopyLocation(EntityIdBuffer.Native, 0);
-                 var dst = new TextureCopyLocation(_entityIdReadback.Native, new PlacedSubresourceFootPrint
-                 {
-                     Offset = 0,
-                     Footprint = new SubresourceFootPrint(Format.R32_Float, 1, 1, 1, 256)
-                 });
-                 list.CopyTextureRegion(dst, 0, 0, 0, src, new Vortice.Mathematics.Box(_pickRequestX, _pickRequestY, 0, _pickRequestX + 1, _pickRequestY + 1, 1));
-                 Transition(list, EntityIdBuffer.Native, ResourceStates.CopySource, ResourceStates.PixelShaderResource);
                  _pickResultReady = true;
-                 _pickRequestX = -1;
+                 _pickCopyPending = false;
              }
-             else
-             {
-                 Transition(list, EntityIdBuffer.Native, ResourceStates.RenderTarget, ResourceStates.PixelShaderResource);
-             }
+
+             // EntityIdBuffer stays in RenderTarget — Forward pass will also write to it.
+             // Transition happens in RenderForward after all draws + readback.
              
              // DepthGBuffer: transition to NonPixelShaderResource for Hi-Z compute pass
              Transition(list, DepthGBuffer.Native, ResourceStates.RenderTarget, ResourceStates.NonPixelShaderResource);
@@ -554,13 +545,34 @@ namespace Freefall.Graphics
              // Transition depth back to DepthWrite so forward objects can depth-test.
              Transition(list, Depth.Native, ResourceStates.PixelShaderResource, ResourceStates.DepthWrite);
 
-             // Bind Composite as render target with depth testing
-             list.OMSetRenderTargets(Composite.RtvHandle, Depth.DsvHandle);
+             // Bind Composite + EntityIdBuffer as render targets (gizmo shader writes entity ID to RT1)
+             // EntityIdBuffer is still in RenderTarget state from FillGBuffer.
+             list.OMSetRenderTargets(new[] { Composite.RtvHandle, EntityIdBuffer.RtvHandle }, Depth.DsvHandle);
              list.RSSetViewport(new Viewport(0, 0, Composite.Native.Description.Width, Composite.Native.Description.Height));
              list.RSSetScissorRect(new RectI(0, 0, (int)Composite.Native.Description.Width, (int)Composite.Native.Description.Height));
 
-             // Execute forward pass draws (ocean, etc.)
+             // Execute forward pass draws (ocean, gizmos, etc.)
              CommandBuffer.Execute(RenderPass.Forward, list, Engine.Device);
+
+             // Entity ID readback: copy 1x1 pixel after both Opaque + Forward have written
+             if (_pickRequestX >= 0 && _entityIdReadback != null)
+             {
+                 Transition(list, EntityIdBuffer.Native, ResourceStates.RenderTarget, ResourceStates.CopySource);
+                 var src = new TextureCopyLocation(EntityIdBuffer.Native, 0);
+                 var dst = new TextureCopyLocation(_entityIdReadback.Native, new PlacedSubresourceFootPrint
+                 {
+                     Offset = 0,
+                     Footprint = new SubresourceFootPrint(Format.R32_Float, 1, 1, 1, 256)
+                 });
+                 list.CopyTextureRegion(dst, 0, 0, 0, src, new Vortice.Mathematics.Box(_pickRequestX, _pickRequestY, 0, _pickRequestX + 1, _pickRequestY + 1, 1));
+                 Transition(list, EntityIdBuffer.Native, ResourceStates.CopySource, ResourceStates.PixelShaderResource);
+                 _pickCopyPending = true;
+                 _pickRequestX = -1;
+             }
+             else
+             {
+                 Transition(list, EntityIdBuffer.Native, ResourceStates.RenderTarget, ResourceStates.PixelShaderResource);
+             }
 
              // Transition Composite to PixelShaderResource for Blit
              Transition(list, Composite.Native, ResourceStates.RenderTarget, ResourceStates.PixelShaderResource);
