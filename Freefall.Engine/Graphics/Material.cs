@@ -23,6 +23,16 @@ namespace Freefall.Graphics
         public uint DetailMaskIdx;
         public uint DetailTilingPacked; // float reinterpreted as uint bits
         public uint Padding0;
+
+        /// <summary>
+        /// Texture slot names derived from this struct's fields (strips "Idx" suffix).
+        /// E.g. "AlbedoIdx" → "Albedo", "NormalIdx" → "Normal", etc.
+        /// </summary>
+        public static readonly string[] TextureSlotNames =
+            typeof(MaterialData).GetFields()
+                .Where(f => f.Name.EndsWith("Idx"))
+                .Select(f => f.Name[..^3])
+                .ToArray();
     }
     
     /// <summary>
