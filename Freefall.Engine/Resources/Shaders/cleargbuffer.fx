@@ -11,7 +11,7 @@ cbuffer PushConstants : register(b3)
 };
 
 #include "common.fx"
-// @RenderState(RenderTargets=4, DepthTest=false, DepthWrite=false)
+// @RenderState(RenderTargets=5, DepthTest=false, DepthWrite=false)
 
 struct VSOutput
 {
@@ -32,6 +32,7 @@ struct PSOutput
     float4 Normal : SV_Target1;
     float4 Data : SV_Target2;
     float4 Depth : SV_Target3;
+    float  EntityId : SV_Target4;
 };
 
 PSOutput PS(VSOutput input)
@@ -41,6 +42,7 @@ PSOutput PS(VSOutput input)
     output.Normal = float4(0,0,0,0);
     output.Data = float4(0,0,0,0);
     output.Depth = float4(0,0,0,0);
+    output.EntityId = 0.0;
     return output;
 }
 

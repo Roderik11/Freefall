@@ -25,7 +25,7 @@ cbuffer PushConstants : register(b3)
 };
 
 #include "common.fx"
-// @RenderState(RenderTargets=4)
+// @RenderState(RenderTargets=5)
 
 inline MaterialData GetMaterial(uint id)
 {
@@ -49,6 +49,7 @@ struct VSOutput
     float4 WorldPos : TEXCOORD1;
     nointerpolation uint MaterialID : TEXCOORD2;
     float Depth : TEXCOORD3;
+    nointerpolation uint TransformSlot : TEXCOORD4;
 };
 
 // Per-instance descriptor (matches C# InstanceDescriptor: 12 bytes)
@@ -134,6 +135,7 @@ VSOutput VS(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_InstanceI
     output.TexCoord.y = 1 - output.TexCoord.y;
     output.MaterialID = materialID;
     output.Depth = output.Position.w; // View-space Z (linear)
+    output.TransformSlot = slot;
     return output;
 }
 
@@ -143,6 +145,7 @@ struct PSOutput
     float4 Normal : SV_Target1;
     float4 Data : SV_Target2;
     float  Depth : SV_Target3;
+    float  EntityId : SV_Target4;
 };
 
 
@@ -272,6 +275,7 @@ PSOutput PS(VSOutput input)
     output.Normal = float4(N, 1.0f);
     output.Data = float4(saturate(roughness), saturate(metal), saturate(ao), 1.0);
     output.Depth = input.Depth;
+    output.EntityId = asfloat(input.TransformSlot);
     return output;
 }
 

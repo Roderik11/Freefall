@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Numerics;
 
@@ -19,6 +20,9 @@ namespace Freefall.Graphics
         private readonly Stack<int> _freeSlots = new();
         private int _nextSlot = 0;
         private int _activeSlots = 0;
+        
+        // Reverse lookup: slot → Entity (for mouse picking)
+        private readonly ConcurrentDictionary<int, Base.Entity> _slotToEntity = new();
 
         // Singleton instance
         public static TransformBuffer Instance { get; private set; } = null!;
@@ -78,6 +82,7 @@ namespace Freefall.Graphics
             _freeSlots.Push(slot);
             _activeSlots--;
             _transforms.Set(slot, Matrix4x4.Identity);
+            _slotToEntity.TryRemove(slot, out _);
         }
 
         /// <summary>
@@ -96,6 +101,22 @@ namespace Freefall.Graphics
         {
             if (slot < 0 || slot >= _nextSlot) return;
             _materials.Set(slot, materialId);
+        }
+
+        /// <summary>
+        /// Register an entity for a slot (for mouse picking reverse lookup).
+        /// </summary>
+        public void RegisterEntity(int slot, Base.Entity entity)
+        {
+            if (slot >= 0) _slotToEntity[slot] = entity;
+        }
+
+        /// <summary>
+        /// Get the entity at a given TransformSlot, or null if not found.
+        /// </summary>
+        public Base.Entity? GetEntityBySlot(int slot)
+        {
+            return _slotToEntity.GetValueOrDefault(slot);
         }
 
         /// <summary>

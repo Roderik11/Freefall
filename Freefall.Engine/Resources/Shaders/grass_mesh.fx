@@ -98,6 +98,7 @@ struct PSOutput
     float4 Normal : SV_Target1;
     float4 Data : SV_Target2;
     float  Depth : SV_Target3;
+    uint   EntityId : SV_Target4;
 };
 
 SamplerState Sampler : register(s0);
@@ -233,6 +234,7 @@ PSOutput PS(VSOutput input)
     output.Normal = float4(N, 1.0);
     output.Data = float4(0.85, 0.0, 1.0, 0.5); // roughness, metallic, ao, vegetation lighting flag
     output.Depth = input.Depth;
+    output.EntityId = 0;
 
     return output;
 }

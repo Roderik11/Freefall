@@ -270,6 +270,7 @@ struct PSOutput
     float4 Normal : SV_Target1;
     float4 Data   : SV_Target2;
     float  Depth  : SV_Target3;
+    uint   EntityId : SV_Target4;
 };
 
 PSOutput PS(MSOutput input)
@@ -332,6 +333,7 @@ PSOutput PS(MSOutput input)
 
     output.Data = float4(0.95, 0.0, 1.0, 0.5);   // roughness=matte, metallic=0, ao=1, vegetation lighting
     output.Depth = dist;
+    output.EntityId = 0;
 
     return output;
 }

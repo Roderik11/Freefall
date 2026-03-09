@@ -21,6 +21,7 @@ namespace Freefall.Graphics
         public RenderTexture2D Normals;
         public RenderTexture2D Data;
         public RenderTexture2D DepthGBuffer;  // Linear view-space depth (R32_Float), cleared to 0
+        public RenderTexture2D EntityIdBuffer; // Per-pixel entity ID (R32_UInt) for mouse picking
         public DepthTexture2D Depth;
         
         public RenderTexture2D LightBuffer = null!;
@@ -43,6 +44,12 @@ namespace Freefall.Graphics
         
         private bool _isFirstFrame = true;
         private bool _compositeSnapshotFirstFrame = true;
+        
+        // Readback staging for entity ID picking (1x1 pixel)
+        private GraphicsBuffer? _entityIdReadback;
+        private int _pickRequestX = -1;
+        private int _pickRequestY = -1;
+        private bool _pickResultReady;
         
         // Cached array to avoid per-frame allocation
         private CpuDescriptorHandle[]? _cachedGBufferRtvHandles;
@@ -97,6 +104,12 @@ namespace Freefall.Graphics
             Normals = new RenderTexture2D(Engine.Device, width, height, Format.R16G16B16A16_SNorm);
             Data = new RenderTexture2D(Engine.Device, width, height, Format.R8G8B8A8_UNorm);
             DepthGBuffer = new RenderTexture2D(Engine.Device, width, height, Format.R32_Float);
+            EntityIdBuffer = new RenderTexture2D(Engine.Device, width, height, Format.R32_Float);
+            
+            // 1x1 readback buffer for entity ID picking
+            _entityIdReadback?.Dispose();
+            _entityIdReadback = GraphicsBuffer.CreateReadback<uint>(1);
+            _cachedGBufferRtvHandles = null; // force re-creation
             
             // Depth Texture
             Depth = new DepthTexture2D(width, height, Format.D32_Float, true);
@@ -111,6 +124,7 @@ namespace Freefall.Graphics
             Normals?.Dispose();
             Data?.Dispose();
             DepthGBuffer?.Dispose();
+            EntityIdBuffer?.Dispose();
             Depth?.Dispose();
             LightBuffer?.Dispose();
             Composite?.Dispose();
@@ -277,6 +291,7 @@ namespace Freefall.Graphics
              Transition(list, Normals.Native, fromState, ResourceStates.RenderTarget);
              Transition(list, Data.Native, fromState, ResourceStates.RenderTarget);
              Transition(list, DepthGBuffer.Native, fromState, ResourceStates.RenderTarget);
+             Transition(list, EntityIdBuffer.Native, fromState, ResourceStates.RenderTarget);
              Transition(list, Depth.Native, depthFromState, ResourceStates.DepthWrite);
 
              // Set shader parameters globally on all effects (Apex pattern)
@@ -296,18 +311,20 @@ namespace Freefall.Graphics
 
              // === GBuffer Draw ===
              // Cache GBuffer RTV handles to avoid per-frame allocation
-             _cachedGBufferRtvHandles ??= new[] { Albedo.RtvHandle, Normals.RtvHandle, Data.RtvHandle, DepthGBuffer.RtvHandle };
+             _cachedGBufferRtvHandles ??= new CpuDescriptorHandle[5];
              // Update handles in case resize created new resources
              _cachedGBufferRtvHandles[0] = Albedo.RtvHandle;
              _cachedGBufferRtvHandles[1] = Normals.RtvHandle;
              _cachedGBufferRtvHandles[2] = Data.RtvHandle;
              _cachedGBufferRtvHandles[3] = DepthGBuffer.RtvHandle;
+             _cachedGBufferRtvHandles[4] = EntityIdBuffer.RtvHandle;
              list.OMSetRenderTargets(_cachedGBufferRtvHandles, Depth.DsvHandle);
              
              list.ClearRenderTargetView(Albedo.RtvHandle, new Color4(0,0,0,0));
              list.ClearRenderTargetView(Normals.RtvHandle, new Color4(0,0,0,0));
              list.ClearRenderTargetView(Data.RtvHandle, new Color4(0,0,0,0));
              list.ClearRenderTargetView(DepthGBuffer.RtvHandle, new Color4(0,0,0,0));
+             list.ClearRenderTargetView(EntityIdBuffer.RtvHandle, new Color4(0,0,0,0));
              list.ClearDepthStencilView(Depth.DsvHandle, ClearFlags.Depth, 0.0f, 0); // Reverse depth: far=0
 
              // Viewport
@@ -387,6 +404,26 @@ namespace Freefall.Graphics
              Transition(list, Albedo.Native, ResourceStates.RenderTarget, ResourceStates.PixelShaderResource);
              Transition(list, Normals.Native, ResourceStates.RenderTarget, ResourceStates.PixelShaderResource);
              Transition(list, Data.Native, ResourceStates.RenderTarget, ResourceStates.PixelShaderResource);
+
+             // Entity ID readback: copy 1x1 pixel from EntityIdBuffer to readback buffer
+             if (_pickRequestX >= 0 && _entityIdReadback != null)
+             {
+                 Transition(list, EntityIdBuffer.Native, ResourceStates.RenderTarget, ResourceStates.CopySource);
+                 var src = new TextureCopyLocation(EntityIdBuffer.Native, 0);
+                 var dst = new TextureCopyLocation(_entityIdReadback.Native, new PlacedSubresourceFootPrint
+                 {
+                     Offset = 0,
+                     Footprint = new SubresourceFootPrint(Format.R32_Float, 1, 1, 1, 256)
+                 });
+                 list.CopyTextureRegion(dst, 0, 0, 0, src, new Vortice.Mathematics.Box(_pickRequestX, _pickRequestY, 0, _pickRequestX + 1, _pickRequestY + 1, 1));
+                 Transition(list, EntityIdBuffer.Native, ResourceStates.CopySource, ResourceStates.PixelShaderResource);
+                 _pickResultReady = true;
+                 _pickRequestX = -1;
+             }
+             else
+             {
+                 Transition(list, EntityIdBuffer.Native, ResourceStates.RenderTarget, ResourceStates.PixelShaderResource);
+             }
              
              // DepthGBuffer: transition to NonPixelShaderResource for Hi-Z compute pass
              Transition(list, DepthGBuffer.Native, ResourceStates.RenderTarget, ResourceStates.NonPixelShaderResource);
@@ -545,16 +582,47 @@ namespace Freefall.Graphics
              Transition(list, backBuffer, ResourceStates.CopyDest, ResourceStates.RenderTarget);
         }
 
+        /// <summary>
+        /// Request entity ID readback at the specified pixel coordinate.
+        /// Result is available next frame via GetPickedEntityId.
+        /// </summary>
+        public void RequestPick(int x, int y)
+        {
+            _pickRequestX = x;
+            _pickRequestY = y;
+            _pickResultReady = false;
+        }
+
+        /// <summary>
+        /// Whether a pick result is ready to read.
+        /// </summary>
+        public bool HasPickResult => _pickResultReady;
+
+        /// <summary>
+        /// Read the picked entity's TransformSlot from the readback buffer.
+        /// Returns 0 if no entity (sky/grass), the TransformSlot otherwise.
+        /// Call after HasPickResult is true.
+        /// </summary>
+        public unsafe uint GetPickedEntityId()
+        {
+            if (!_pickResultReady || _entityIdReadback == null) return 0;
+            _pickResultReady = false;
+            return *_entityIdReadback.ReadPtr<uint>();
+        }
+
         public override void Dispose()
         {
             Albedo?.Dispose();
             Normals?.Dispose();
             Data?.Dispose();
+            DepthGBuffer?.Dispose();
+            EntityIdBuffer?.Dispose();
             Depth?.Dispose();
             LightBuffer?.Dispose();
             Composite?.Dispose();
             CompositeSnapshot?.Dispose();
             ShadowTextureArray?.Dispose();
+            _entityIdReadback?.Dispose();
         }
     }
 }

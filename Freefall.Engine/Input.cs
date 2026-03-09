@@ -20,6 +20,7 @@ namespace Freefall
         private static int _rawY;
         private static int _rawWheel;
         public static Vortice.Mathematics.Int2 MouseDelta { get; private set; }
+        public static Vortice.Mathematics.Int2 MousePosition { get; private set; }
         public static int MouseWheelDelta { get; private set; }
         public static bool IsMouseLocked { get; set; } = false;
 
@@ -102,12 +103,19 @@ namespace Freefall
             }
 
             // Mouse buttons: WM_LBUTTONDOWN/UP = 0x0201/0x0202, WM_RBUTTONDOWN/UP = 0x0204/0x0205, WM_MBUTTONDOWN/UP = 0x0207/0x0208
-            if (msg == 0x0201) { _mouseDown.Add(0); _mousePressed.Add(0); }
+            if (msg == 0x0201) { _mouseDown.Add(0); _mousePressed.Add(0); UpdateMousePos(lParam); }
             else if (msg == 0x0202) { _mouseDown.Remove(0); _mouseReleased.Add(0); }
-            else if (msg == 0x0204) { _mouseDown.Add(1); _mousePressed.Add(1); }
+            else if (msg == 0x0204) { _mouseDown.Add(1); _mousePressed.Add(1); UpdateMousePos(lParam); }
             else if (msg == 0x0205) { _mouseDown.Remove(1); _mouseReleased.Add(1); }
-            else if (msg == 0x0207) { _mouseDown.Add(2); _mousePressed.Add(2); }
+            else if (msg == 0x0207) { _mouseDown.Add(2); _mousePressed.Add(2); UpdateMousePos(lParam); }
             else if (msg == 0x0208) { _mouseDown.Remove(2); _mouseReleased.Add(2); }
+            else if (msg == 0x0200) { UpdateMousePos(lParam); } // WM_MOUSEMOVE
+        }
+
+        private static void UpdateMousePos(IntPtr lParam)
+        {
+            int xy = lParam.ToInt32();
+            MousePosition = new Vortice.Mathematics.Int2((short)(xy & 0xFFFF), (short)((xy >> 16) & 0xFFFF));
         }
 
         public static void ClearFrameCallbacks()

@@ -29,7 +29,7 @@ cbuffer PushConstants : register(b3)
 };
 
 #include "common.fx"
-// @RenderState(RenderTargets=4)
+// @RenderState(RenderTargets=5)
 
 // TerrainPatchData: per-instance data written by terrain_quadtree.hlsl compute shader.
 // World transform is computed from patch rect — no per-patch TransformSlot needed.
@@ -107,6 +107,7 @@ struct VertexOutput
 	float2 UV2			: TEXCOORD1;
     float Depth			: TEXCOORD2;
 	float Level			: TEXCOORD3;
+	nointerpolation uint TransformSlot : TEXCOORD4;
 };
 
 // Per-instance descriptor (matches C# InstanceDescriptor: 12 bytes)
@@ -187,6 +188,7 @@ VertexOutput VS(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_Insta
     output.UV = uv;
     output.UV2 = heightUV;
 	output.Level = patch.level.x;
+	output.TransformSlot = slot;
 	return output;
 }
 
@@ -196,6 +198,7 @@ struct FragmentOutput
 	float4 Normals		: SV_TARGET1;
 	float4 Data			: SV_TARGET2;
 	float  Depth		: SV_TARGET3;
+	float  EntityId		: SV_TARGET4;
 };
 
 float3 GetNormal(float2 uv)
@@ -328,6 +331,7 @@ FragmentOutput PS(VertexOutput input)
         output.Albedo = float4(decoColor, 1.0);
     }
 
+    output.EntityId = asfloat(input.TransformSlot);
     return output;
 }
 

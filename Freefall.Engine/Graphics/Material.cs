@@ -200,6 +200,7 @@ namespace Freefall.Graphics
             // Determine Render Target count and formats from shader metadata
             Format[] rtvFormats = renderState.RenderTargetCount switch
             {
+                5 => new[] { Format.R16G16B16A16_Float, Format.R16G16B16A16_SNorm, Format.R8G8B8A8_UNorm, Format.R32_Float, Format.R32_Float }, // GBuffer + Depth + EntityId
                 4 => new[] { Format.R16G16B16A16_Float, Format.R16G16B16A16_SNorm, Format.R8G8B8A8_UNorm, Format.R32_Float }, // GBuffer + Depth
                 3 => new[] { Format.R16G16B16A16_Float, Format.R16G16B16A16_SNorm, Format.R8G8B8A8_UNorm }, // GBuffer
                 _ => new[] { Format.R8G8B8A8_UNorm } // Standard single target
@@ -211,7 +212,7 @@ namespace Freefall.Graphics
                 if (Enum.TryParse<Format>(renderState.RenderTargetFormat, true, out var rtFormat))
                     rtvFormats = new[] { rtFormat };
             }
-            Debug.Log($"[Material] RTV Formats Count: {rtvFormats.Length}");
+
 
             // In bindless, we use the Global Root Signature from the device
             var rootSignature = device.GlobalRootSignature;

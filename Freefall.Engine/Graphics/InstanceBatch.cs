@@ -766,9 +766,6 @@ namespace Freefall.Graphics
             var device = Engine.Device;
             int totalInstances = _drawCount;
             
-            if (Engine.FrameIndex % 300 == 0)
-                Debug.Log("ShadowCull", $"batch={Material?.Name} drawCount={totalInstances} subBatches={SubBatchCount} perInstBufs={_perInstanceBuffers.Count}");
-
             commandList.SetComputeRootSignature(device.GlobalRootSignature);
             _cachedSrvHeapArray ??= new[] { device.SrvHeap };
             commandList.SetDescriptorHeaps(1, _cachedSrvHeapArray);

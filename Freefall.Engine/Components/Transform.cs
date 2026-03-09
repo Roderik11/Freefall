@@ -158,7 +158,10 @@ namespace Freefall.Components
             get
             {
                 if (_transformSlot < 0 && TransformBuffer.Instance != null)
+                {
                     _transformSlot = TransformBuffer.Instance.AllocateSlot();
+                    TransformBuffer.Instance.RegisterEntity(_transformSlot, Entity);
+                }
                 return _transformSlot;
             }
         }

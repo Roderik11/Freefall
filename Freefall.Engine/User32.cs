@@ -383,7 +383,7 @@ namespace Freefall
 
     #region Structures
     [StructLayout(LayoutKind.Sequential)]
-    public struct Message
+    public struct NativeMessage
     {
         public IntPtr Hwnd;
         public uint Value;
@@ -452,12 +452,12 @@ namespace Freefall
         public static extern IntPtr LoadIcon(IntPtr hInstance, string lpIconName);
 
         [DllImport(LibraryName, CharSet = CharSet.Unicode)]
-        public static extern int GetMessage(out Message lpMsg, IntPtr hWnd, uint wMsgFilterMin, uint wMsgFilterMax);
+        public static extern int GetMessage(out NativeMessage lpMsg, IntPtr hWnd, uint wMsgFilterMin, uint wMsgFilterMax);
 
         [return: MarshalAs(UnmanagedType.Bool)]
         [DllImport(LibraryName, CharSet = CharSet.Unicode, EntryPoint = "PeekMessageW")]
         public static extern bool PeekMessage(
-            out Message lpMsg,
+            out NativeMessage lpMsg,
             IntPtr hWnd,
             uint wMsgFilterMin,
             uint wMsgFilterMax,
@@ -469,10 +469,10 @@ namespace Freefall
 
         [return: MarshalAs(UnmanagedType.Bool)]
         [DllImport(LibraryName, ExactSpelling = true)]
-        public static extern bool TranslateMessage([In] ref Message lpMsg);
+        public static extern bool TranslateMessage([In] ref NativeMessage lpMsg);
 
         [DllImport(LibraryName, CharSet = CharSet.Unicode)]
-        public static extern IntPtr DispatchMessage([In] ref Message lpmsg);
+        public static extern IntPtr DispatchMessage([In] ref NativeMessage lpmsg);
 
         [DllImport(LibraryName, ExactSpelling = true)]
         public static extern int GetSystemMetrics(SystemMetrics smIndex);
