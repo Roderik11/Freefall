@@ -105,9 +105,9 @@ namespace Freefall.Graphics
             Normals = new RenderTexture2D(Engine.Device, width, height, Format.R16G16B16A16_SNorm);
             Data = new RenderTexture2D(Engine.Device, width, height, Format.R8G8B8A8_UNorm);
             DepthGBuffer = new RenderTexture2D(Engine.Device, width, height, Format.R32_Float);
-            EntityIdBuffer = new RenderTexture2D(Engine.Device, width, height, Format.R32_Float);
+            EntityIdBuffer = new RenderTexture2D(Engine.Device, width, height, Format.R32_UInt);
             
-            // 1x1 readback buffer for entity ID picking
+            // 1x1 readback buffer for packed entity ID picking (1 x uint32: 24-bit entity + 8-bit meshpart)
             _entityIdReadback?.Dispose();
             _entityIdReadback = GraphicsBuffer.CreateReadback<uint>(1);
             _cachedGBufferRtvHandles = null; // force re-creation
@@ -562,7 +562,7 @@ namespace Freefall.Graphics
                  var dst = new TextureCopyLocation(_entityIdReadback.Native, new PlacedSubresourceFootPrint
                  {
                      Offset = 0,
-                     Footprint = new SubresourceFootPrint(Format.R32_Float, 1, 1, 1, 256)
+                     Footprint = new SubresourceFootPrint(Format.R32_UInt, 1, 1, 1, 256)
                  });
                  list.CopyTextureRegion(dst, 0, 0, 0, src, new Vortice.Mathematics.Box(_pickRequestX, _pickRequestY, 0, _pickRequestX + 1, _pickRequestY + 1, 1));
                  Transition(list, EntityIdBuffer.Native, ResourceStates.CopySource, ResourceStates.PixelShaderResource);
@@ -613,14 +613,21 @@ namespace Freefall.Graphics
         /// <summary>
         /// Read the picked entity's TransformSlot from the readback buffer.
         /// Returns 0 if no entity (sky/grass), the TransformSlot otherwise.
-        /// Call after HasPickResult is true.
+        /// Call after HasPickResult is true. Also populates PickedMeshPartId.
         /// </summary>
         public unsafe uint GetPickedEntityId()
         {
             if (!_pickResultReady || _entityIdReadback == null) return 0;
             _pickResultReady = false;
-            return *_entityIdReadback.ReadPtr<uint>();
+            uint packed = *_entityIdReadback.ReadPtr<uint>();
+            PickedMeshPartId = packed & 0xFF;        // lower 8 bits = meshpart
+            return packed >> 8;                       // upper 24 bits = entity ID
         }
+
+        /// <summary>
+        /// MeshPart index from the last pick result. Set by GetPickedEntityId.
+        /// </summary>
+        public uint PickedMeshPartId { get; private set; }
 
         public override void Dispose()
         {

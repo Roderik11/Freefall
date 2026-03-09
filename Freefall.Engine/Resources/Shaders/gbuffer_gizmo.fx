@@ -25,12 +25,7 @@ cbuffer PushConstants : register(b3)
 
 #include "common.fx"
 
-struct InstanceDescriptor
-{
-    uint TransformSlot;
-    uint MaterialId;
-    uint CustomDataIdx;
-};
+
 
 SamplerState Sampler : register(s0);
 
@@ -39,6 +34,7 @@ struct VSOutput
     float4 Position : SV_POSITION;
     nointerpolation uint TransformSlot : TEXCOORD0;
     nointerpolation uint MaterialID : TEXCOORD1;
+    nointerpolation uint MeshPartId : TEXCOORD2;
 };
 
 VSOutput VS(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_InstanceID)
@@ -64,13 +60,14 @@ VSOutput VS(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_InstanceI
     output.Position = mul(mul(worldPos, View), Projection);
     output.TransformSlot = desc.TransformSlot;
     output.MaterialID = desc.MaterialId;
+    output.MeshPartId = desc.CustomDataIdx;
     return output;
 }
 
 struct PSOutput
 {
     float4 Color : SV_Target0;      // Composite buffer
-    float  EntityId : SV_Target1;   // EntityIdBuffer for picking
+    uint   EntityId : SV_Target1;   // EntityIdBuffer (R32_UInt): packed 24-bit entityId + 8-bit meshPartId
 };
 
 PSOutput PS(VSOutput input)
@@ -83,7 +80,7 @@ PSOutput PS(VSOutput input)
     float3 color = albedoTex.Sample(Sampler, float2(0.5, 0.5)).rgb;
 
     output.Color = float4(color, 1.0);
-    output.EntityId = asfloat(input.TransformSlot);
+    output.EntityId = (input.TransformSlot << 8u) | (input.MeshPartId & 0xFFu);
     return output;
 }
 

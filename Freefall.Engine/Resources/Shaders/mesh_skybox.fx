@@ -226,13 +226,7 @@ VertexOutput VS(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_Insta
 {
     VertexOutput output;
 
-    // Per-instance descriptor (matches C# InstanceDescriptor: 12 bytes)
-    struct InstanceDescriptor
-    {
-        uint TransformSlot;
-        uint MaterialId;
-        uint CustomDataIdx;
-    };
+
 
     // Bindless index buffer - primitiveVertexID is 0 to N-1, add BaseIndex to offset into correct mesh part
     StructuredBuffer<uint> indices = ResourceDescriptorHeap[IndexBufferIdx];

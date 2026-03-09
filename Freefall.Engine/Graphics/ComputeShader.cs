@@ -420,7 +420,7 @@ namespace Freefall.Graphics
                     if (name.Contains("UAV", StringComparison.OrdinalIgnoreCase))
                         _isUAV[hash] = true;
 
-                    Debug.Log($"[ComputeShader] Push constant: '{name}' → slot {slot}{(_isUAV.ContainsKey(hash) ? " (UAV)" : "")}");
+                    //Debug.Log($"[ComputeShader] Push constant: '{name}' → slot {slot}{(_isUAV.ContainsKey(hash) ? " (UAV)" : "")}");
                 }
                 break; // Only one PushConstants cbuffer
             }
@@ -450,7 +450,7 @@ namespace Freefall.Graphics
                 cb.Slot = rootSlot;
                 _constantBuffers[cbReflection.Description.Name] = cb;
 
-                Debug.Log($"[ComputeShader] CBuffer '{cbReflection.Description.Name}' at b{bindDesc.BindPoint} → root slot {rootSlot}");
+                //Debug.Log($"[ComputeShader] CBuffer '{cbReflection.Description.Name}' at b{bindDesc.BindPoint} → root slot {rootSlot}");
             }
         }
 

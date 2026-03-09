@@ -42,12 +42,7 @@ inline MaterialData GetMaterial(uint id)
 }
 #define GET_MATERIAL(id) GetMaterial(id)
 
-struct InstanceDescriptor
-{
-    uint TransformSlot;
-    uint MaterialId;
-    uint CustomDataIdx;
-};
+
 
 struct VSOutput
 {
@@ -58,6 +53,7 @@ struct VSOutput
     nointerpolation uint MaterialID : TEXCOORD2;
     float Depth : TEXCOORD3;
     nointerpolation uint TransformSlot : TEXCOORD4;
+    nointerpolation uint MeshPartIdx : TEXCOORD5;
 };
 
 // Wind animation helpers
@@ -115,6 +111,7 @@ VSOutput VS(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_InstanceI
     output.MaterialID = desc.MaterialId;
     output.Depth = output.Position.w;
     output.TransformSlot = desc.TransformSlot;
+    output.MeshPartIdx = desc.MeshPartIdx;
     return output;
 }
 
@@ -124,7 +121,7 @@ struct PSOutput
     float4 Normal : SV_Target1;
     float4 Data : SV_Target2;
     float  Depth : SV_Target3;
-    float  EntityId : SV_Target4;
+    uint   EntityId : SV_Target4;
 };
 
 SamplerState Sampler : register(s0);
@@ -162,7 +159,7 @@ PSOutput PS(VSOutput input, bool isFrontFace : SV_IsFrontFace)
     output.Normal = float4(N, translucency); // store translucency in normal.w
     output.Data = float4(0.7, 0.0, 1.0, 0.5); // roughness=0.7, metal=0, ao=1, flag=vegetation
     output.Depth = input.Depth;
-    output.EntityId = asfloat(input.TransformSlot);
+    output.EntityId = (input.TransformSlot << 8u) | (input.MeshPartIdx & 0xFFu);
     return output;
 }
 

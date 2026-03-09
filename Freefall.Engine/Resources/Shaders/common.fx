@@ -42,6 +42,16 @@ struct CascadeData
     float4 SplitDistances;      // X=near, Y=far (16 bytes)
 };
 
+// Per-instance descriptor (matches C# InstanceDescriptor: 16 bytes)
+// Single source of truth — do NOT redeclare in individual shaders.
+struct InstanceDescriptor
+{
+    uint TransformSlot;   // index into GlobalTransformBuffer
+    uint MaterialId;      // index into MaterialsBuffer
+    uint CustomDataIdx;   // index into per-batch StructuredBuffer
+    uint MeshPartIdx;     // meshpart index within the mesh (for GPU picking)
+};
+
 float3 FOG(float3 color, float depth, float3 fogColor)
 {
     float fog = 1 - 1 / pow(2, pow(depth * FogDensity, 2)); // exponential squared

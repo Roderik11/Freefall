@@ -13,6 +13,7 @@ namespace Freefall.Graphics
         public uint TransformSlot;   // index into GlobalTransformBuffer
         public uint MaterialId;      // index into MaterialsBuffer
         public uint CustomDataIdx;   // index into per-batch StructuredBuffer (future use, 0 for now)
+        public uint MeshPartIdx;     // meshpart index within the mesh (for GPU picking)
     }
 
 

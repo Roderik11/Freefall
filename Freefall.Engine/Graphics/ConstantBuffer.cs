@@ -179,7 +179,7 @@ namespace Freefall.Graphics
                 string typeName = varType.Description.Name;
                 uint elements = varType.Description.ElementCount;
                 _parameterList.Add(EffectParameter.Create(variableDesc.Name, typeName, (int)variableDesc.StartOffset, (int)variableDesc.Size, elements, this));
-                Debug.Log($"[CBReflect] {Name}: var='{variableDesc.Name}' offset={variableDesc.StartOffset} size={variableDesc.Size} hash={variableDesc.Name.GetHashCode()}");
+                //Debug.Log($"[CBReflect] {Name}: var='{variableDesc.Name}' offset={variableDesc.StartOffset} size={variableDesc.Size} hash={variableDesc.Name.GetHashCode()}");
             }
         }
 
@@ -230,7 +230,7 @@ namespace Freefall.Graphics
                     string typeName = varType.Description.Name;
                     uint elements = varType.Description.ElementCount;
                     _parameterList.Add(EffectParameter.Create(variableDesc.Name, typeName, (int)variableDesc.StartOffset, (int)variableDesc.Size, elements, this));
-                    Debug.Log($"[CBMerge] {Name}: merged var='{variableDesc.Name}' offset={variableDesc.StartOffset} from additional stage");
+                    //Debug.Log($"[CBMerge] {Name}: merged var='{variableDesc.Name}' offset={variableDesc.StartOffset} from additional stage");
                 }
             }
         }

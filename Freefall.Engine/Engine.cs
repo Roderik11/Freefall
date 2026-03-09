@@ -286,22 +286,43 @@ namespace Freefall
 
         private static void Update()
         {
-            // F1: Toggle VSync
-            if (Input.IsKeyPressed(Keys.F1))
+            // F5: Toggle adaptive shadow cascade splits (SDSM)
+            if (Input.IsKeyPressed(Keys.F5))
+            {
+                Settings.UseAdaptiveSplits = !Settings.UseAdaptiveSplits;
+                Debug.Log($"[Engine] Adaptive Splits {(Settings.UseAdaptiveSplits ? "Enabled" : "Disabled")}");
+            }
+            
+            // F6: Cycle debug visualization mode
+            if (Input.IsKeyPressed(Keys.F6))
+            {
+                Settings.DebugVisualizationMode = (DebugVizMode)(((int)Settings.DebugVisualizationMode + 1) % 6);
+                Debug.Log($"[Engine] Debug Viz: {Settings.DebugVisualizationMode}");
+            }
+            
+            // F7: Toggle Hi-Z occlusion culling
+            if (Input.IsKeyPressed(Keys.F7))
+            {
+                Settings.DisableHiZ = !Settings.DisableHiZ;
+                Debug.Log($"[Engine] Hi-Z Occlusion {(Settings.DisableHiZ ? "DISABLED" : "ENABLED")}");
+            }
+
+            // F8: Toggle wireframe mode
+            if (Input.IsKeyPressed(Keys.F8))
+            {
+                Settings.TerrainWireframe = !Settings.TerrainWireframe;
+                Debug.Log($"[Engine] Wireframe {(Settings.TerrainWireframe ? "Enabled" : "Disabled")}");
+            }
+
+            // F9: Toggle VSync
+            if (Input.IsKeyPressed(Keys.F9))
             {
                 Settings.VSync = !Settings.VSync;
                 Debug.Log($"[Engine] VSync {(Settings.VSync ? "Enabled" : "Disabled")}");
             }
             
-            // F2: Toggle wireframe mode
-            if (Input.IsKeyPressed(Keys.F2))
-            {
-                Settings.TerrainWireframe = !Settings.TerrainWireframe;
-                Debug.Log($"[Engine] Wireframe {(Settings.TerrainWireframe ? "Enabled" : "Disabled")}");
-            }
-            
-            // F3: Toggle Frustum Freeze - freezes culling frustum for debug visualization
-            if (Input.IsKeyPressed(Keys.F3))
+            // F10: Toggle Frustum Freeze - freezes culling frustum for debug visualization
+            if (Input.IsKeyPressed(Keys.F10))
             {
                 Settings.FreezeFrustum = !Settings.FreezeFrustum;
                 if (Settings.FreezeFrustum && Camera.Main != null)
@@ -313,27 +334,6 @@ namespace Freefall
                 {
                     Debug.Log("[Engine] Frustum UNFROZEN - culling follows camera");
                 }
-            }
-            
-            // F4: Toggle adaptive shadow cascade splits (SDSM)
-            if (Input.IsKeyPressed(Keys.F4))
-            {
-                Settings.UseAdaptiveSplits = !Settings.UseAdaptiveSplits;
-                Debug.Log($"[Engine] Adaptive Splits {(Settings.UseAdaptiveSplits ? "Enabled" : "Disabled")}");
-            }
-            
-            // F5: Cycle debug visualization mode
-            if (Input.IsKeyPressed(Keys.F5))
-            {
-                Settings.DebugVisualizationMode = (DebugVizMode)(((int)Settings.DebugVisualizationMode + 1) % 6);
-                Debug.Log($"[Engine] Debug Viz: {Settings.DebugVisualizationMode}");
-            }
-            
-            // F6: Toggle Hi-Z occlusion culling
-            if (Input.IsKeyPressed(Keys.F6))
-            {
-                Settings.DisableHiZ = !Settings.DisableHiZ;
-                Debug.Log($"[Engine] Hi-Z Occlusion {(Settings.DisableHiZ ? "DISABLED" : "ENABLED")}");
             }
             
             // Entity logic (includes component Updates like Camera, CharacterController, etc.)

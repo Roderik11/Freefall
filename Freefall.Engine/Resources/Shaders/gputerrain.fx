@@ -110,13 +110,7 @@ struct VertexOutput
 	nointerpolation uint TransformSlot : TEXCOORD4;
 };
 
-// Per-instance descriptor (matches C# InstanceDescriptor: 12 bytes)
-struct InstanceDescriptor
-{
-    uint TransformSlot;
-    uint MaterialId;
-    uint CustomDataIdx;
-};
+
 
 // Compute world matrix from patch rect (no per-patch TransformSlot overhead).
 // The single shared TransformSlot holds the terrain entity's world matrix (typically identity).
@@ -198,7 +192,7 @@ struct FragmentOutput
 	float4 Normals		: SV_TARGET1;
 	float4 Data			: SV_TARGET2;
 	float  Depth		: SV_TARGET3;
-	float  EntityId		: SV_TARGET4;
+	uint   EntityId		: SV_TARGET4;
 };
 
 float3 GetNormal(float2 uv)
@@ -331,7 +325,7 @@ FragmentOutput PS(VertexOutput input)
         output.Albedo = float4(decoColor, 1.0);
     }
 
-    output.EntityId = asfloat(input.TransformSlot);
+    output.EntityId = (input.TransformSlot << 8u);
     return output;
 }
 

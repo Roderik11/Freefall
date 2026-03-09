@@ -50,15 +50,10 @@ struct VSOutput
     nointerpolation uint MaterialID : TEXCOORD2;
     float Depth : TEXCOORD3;
     nointerpolation uint TransformSlot : TEXCOORD4;
+    nointerpolation uint MeshPartIdx : TEXCOORD5;
 };
 
-// Per-instance descriptor (matches C# InstanceDescriptor: 12 bytes)
-struct InstanceDescriptor
-{
-    uint TransformSlot;
-    uint MaterialId;
-    uint CustomDataIdx;
-};
+
 
 VSOutput VS(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_InstanceID)
 {
@@ -136,6 +131,7 @@ VSOutput VS(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_InstanceI
     output.MaterialID = materialID;
     output.Depth = output.Position.w; // View-space Z (linear)
     output.TransformSlot = slot;
+    output.MeshPartIdx = desc.MeshPartIdx;
     return output;
 }
 
@@ -145,7 +141,7 @@ struct PSOutput
     float4 Normal : SV_Target1;
     float4 Data : SV_Target2;
     float  Depth : SV_Target3;
-    float  EntityId : SV_Target4;
+    uint   EntityId : SV_Target4;
 };
 
 
@@ -275,7 +271,7 @@ PSOutput PS(VSOutput input)
     output.Normal = float4(N, 1.0f);
     output.Data = float4(saturate(roughness), saturate(metal), saturate(ao), 1.0);
     output.Depth = input.Depth;
-    output.EntityId = asfloat(input.TransformSlot);
+    output.EntityId = (input.TransformSlot << 8u) | (input.MeshPartIdx & 0xFFu);
     return output;
 }
 

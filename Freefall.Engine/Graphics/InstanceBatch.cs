@@ -229,7 +229,7 @@ namespace Freefall.Graphics
             int frameIndex = Engine.FrameIndex % FrameCount;
             
             // Core culler infrastructure buffers (bounding spheres now come from MeshRegistry)
-            EnsureGPUPerInstanceBuffer(DrawBucket.DescriptorsHash, -1, 12, 1, frameIndex, descriptorsSRV);
+            EnsureGPUPerInstanceBuffer(DrawBucket.DescriptorsHash, -1, 16, 1, frameIndex, descriptorsSRV);
             EnsureGPUPerInstanceBuffer(DrawBucket.SubbatchIdsHash, -1, 4, 1, frameIndex, subbatchIdsSRV);
             
             // Custom per-instance data channels (caller provides hash, slot, stride)

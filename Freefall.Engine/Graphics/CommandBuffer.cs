@@ -103,10 +103,11 @@ namespace Freefall.Graphics
             {
                 TransformSlot = (uint)transformSlot,
                 MaterialId = (uint)material.MaterialID,
-                CustomDataIdx = 0
+                CustomDataIdx = 0,
+                MeshPartIdx = (uint)partIndex
             };
 
-            StageCore(DescriptorsHash, 12, descriptor);       // InstanceDescriptor: 12 bytes
+            StageCore(DescriptorsHash, 16, descriptor);       // InstanceDescriptor: 16 bytes
             StageCore(SubbatchIdsHash, 4,  (uint)meshPartId);        // uint: 4 bytes
             UniqueMeshPartIds.Add(meshPartId);
             

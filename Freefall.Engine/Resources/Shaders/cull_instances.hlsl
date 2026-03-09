@@ -161,6 +161,7 @@ struct InstanceDescriptor
     uint TransformSlot;
     uint MaterialId;
     uint CustomDataIdx;
+    uint MeshPartIdx;
 };
 
 // Must match C# IndirectDrawCommand exactly (72 bytes = 18 uints)

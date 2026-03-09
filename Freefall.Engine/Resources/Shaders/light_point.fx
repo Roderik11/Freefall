@@ -35,13 +35,7 @@ struct PointLightData
     float Range;
 };
 
-// Per-instance descriptor (matches C# InstanceDescriptor: 12 bytes)
-struct InstanceDescriptor
-{
-    uint TransformSlot;
-    uint MaterialId;
-    uint CustomDataIdx;
-};
+
 
 SamplerState Sampler : register(s0);
 

@@ -349,7 +349,7 @@ namespace Freefall.Components
             int shadowCapacity = MaxPatches * DirectionalLight.CascadeCount;
 
             // Structured buffers with SRV + UAV
-            _descriptorBuffers[i] = GraphicsBuffer.CreateStructured(MaxPatches, 12, srv: true, uav: true);
+            _descriptorBuffers[i] = GraphicsBuffer.CreateStructured(MaxPatches, 16, srv: true, uav: true);
             _sphereBuffers[i] = GraphicsBuffer.CreateStructured(MaxPatches, 16, srv: true, uav: true);
             _subbatchIdBuffers[i] = GraphicsBuffer.CreateStructured(MaxPatches, 4, srv: true, uav: true);
             _terrainDataBuffers[i] = GraphicsBuffer.CreateStructured(MaxPatches, 32, srv: true, uav: true);
@@ -361,7 +361,7 @@ namespace Freefall.Components
             _shadowArgsBuffers[i] = GraphicsBuffer.CreateRaw(4, uav: true);
 
             // Shadow structured buffers
-            _shadowDescriptorBuffers[i] = GraphicsBuffer.CreateStructured(shadowCapacity, 12, srv: true, uav: true);
+            _shadowDescriptorBuffers[i] = GraphicsBuffer.CreateStructured(shadowCapacity, 16, srv: true, uav: true);
             _shadowTerrainDataBuffers[i] = GraphicsBuffer.CreateStructured(shadowCapacity, 32, srv: true, uav: true);
             _shadowSphereBuffers[i] = GraphicsBuffer.CreateStructured(shadowCapacity, 16, uav: true);
             _shadowSubbatchIdBuffers[i] = GraphicsBuffer.CreateStructured(shadowCapacity, 4, uav: true);

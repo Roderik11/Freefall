@@ -22,12 +22,7 @@ cbuffer PushConstants : register(b3)
 #include "sky_common.fx"
 // @RenderState(RenderTargets=1)
 
-struct InstanceDescriptor
-{
-    uint TransformSlot;
-    uint MaterialId;
-    uint Padding;
-};
+
 
 struct OceanData
 {
