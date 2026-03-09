@@ -612,7 +612,7 @@ namespace Freefall.Graphics
         /// Dispatch SDSM depth analysis compute shaders.
         /// Call after Hi-Z generation, when DepthGBuffer is in NonPixelShaderResource state.
         /// </summary>
-        public void AnalyzeDepth(ID3D12GraphicsCommandList commandList, uint depthSrvIndex, int texWidth, int texHeight, float nearPlane, float farPlane)
+        public void AnalyzeDepth(ID3D12GraphicsCommandList commandList, uint depthSrvIndex, int texWidth, int texHeight, float nearPlane)
         {
             if (!_sdsmInitialized || _depthAnalysisShader == null) return;
             
@@ -651,7 +651,6 @@ namespace Freefall.Graphics
             da.SetParam("TexWidth", (uint)texWidth);
             da.SetParam("TexHeight", (uint)texHeight);
             da.SetParam("NearPlane", nearPlane);
-            da.SetParam("FarPlane", farPlane);
             
             uint groupsX = ((uint)texWidth + 15) / 16;
             uint groupsY = ((uint)texHeight + 15) / 16;

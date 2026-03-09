@@ -2,21 +2,22 @@
 // Generates mip chain for Texture2DArray (displacement + slope textures)
 // SM 6.6 bindless, push constants at b3
 
-struct PushConstantsData { uint4 indices[8]; };
-#define GET_INDEX(i) PushConstants.indices[i/4][i%4]
-ConstantBuffer<PushConstantsData> PushConstants : register(b3);
+#pragma kernel CSDownsample
 
-#define SrcMipIdx   GET_INDEX(0)   // UAV: source mip level
-#define DstMipIdx   GET_INDEX(1)   // UAV: destination mip level
-#define MipTexelSize GET_INDEX(2)  // destination mip width (uint)
-#define NumSlices   GET_INDEX(3)   // number of array slices (uint)
-#define IsRG16F     GET_INDEX(4)   // 0 = RGBA16F, 1 = RG16F
+cbuffer PushConstants : register(b3)
+{
+    uint SrcMipIdx;       // UAV: source mip level
+    uint DstMipIdx;       // UAV: destination mip level
+    uint MipTexelSizeIdx; // destination mip width (uint)
+    uint NumSlicesIdx;    // number of array slices (uint)
+    uint IsRG16FIdx;      // 0 = RGBA16F, 1 = RG16F
+};
 
 [numthreads(8, 8, 1)]
 void CSDownsample(uint3 dtid : SV_DispatchThreadID)
 {
-    uint dstSize = MipTexelSize;
-    uint sliceCount = NumSlices;
+    uint dstSize = MipTexelSizeIdx;
+    uint sliceCount = NumSlicesIdx;
     
     if (dtid.x >= dstSize || dtid.y >= dstSize)
         return;
@@ -31,7 +32,7 @@ void CSDownsample(uint3 dtid : SV_DispatchThreadID)
         uint3 s01 = uint3(srcBase + uint2(0, 1), slice);
         uint3 s11 = uint3(srcBase + uint2(1, 1), slice);
 
-        if (IsRG16F != 0)
+        if (IsRG16FIdx != 0)
         {
             RWTexture2DArray<float2> srcTex = ResourceDescriptorHeap[SrcMipIdx];
             RWTexture2DArray<float2> dstTex = ResourceDescriptorHeap[DstMipIdx];

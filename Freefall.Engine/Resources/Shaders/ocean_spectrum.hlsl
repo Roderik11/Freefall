@@ -1,17 +1,19 @@
 // ocean_spectrum.hlsl — JONSWAP spectrum initialization + time evolution
 // SM 6.6 bindless, push constants at b3
 
+#pragma kernel CSInitSpectrum
+#pragma kernel CSPackConjugate
+#pragma kernel CSEvolveSpectrum
+
 #define PI 3.14159265358979323846
 
-struct PushConstantsData { uint4 indices[8]; };
-#define GET_INDEX(i) PushConstants.indices[i/4][i%4]
-ConstantBuffer<PushConstantsData> PushConstants : register(b3);
-
-// Push constant layout for ocean compute
-#define InitialSpectrumIdx  GET_INDEX(0)  // RWTexture2DArray<float4> — H0 packed (rg=H0, ba=H0conj)
-#define SpectrumIdx         GET_INDEX(1)  // RWTexture2DArray<float4> — evolved displacement+slope spectra (8 slices)
-#define SpectrumParamsIdx   GET_INDEX(2)  // StructuredBuffer<SpectrumParameters> — 8 entries (dual per band)
-#define OceanConstantsIdx   GET_INDEX(3)  // StructuredBuffer<OceanConstants> — global params
+cbuffer PushConstants : register(b3)
+{
+    uint InitialSpectrumIdx;   // RWTexture2DArray<float4> — H0 packed (rg=H0, ba=H0conj)
+    uint SpectrumIdx;          // RWTexture2DArray<float4> — evolved displacement+slope spectra
+    uint SpectrumParamsIdx;    // StructuredBuffer<SpectrumParameters> — 8 entries (dual per band)
+    uint OceanConstantsIdx;    // StructuredBuffer<OceanConstants> — global params
+};
 
 struct SpectrumParameters
 {

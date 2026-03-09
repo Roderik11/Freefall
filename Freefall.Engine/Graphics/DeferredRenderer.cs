@@ -415,7 +415,7 @@ namespace Freefall.Graphics
                  int depthWidth = (int)DepthGBuffer.Native.Description.Width;
                  int depthHeight = (int)DepthGBuffer.Native.Description.Height;
                  CommandBuffer.Culler.AnalyzeDepth(list, DepthGBuffer.BindlessIndex,
-                     depthWidth, depthHeight, camera.NearPlane, camera.FarPlane);
+                     depthWidth, depthHeight, camera.NearPlane);
              }
              
              // Transition GBuffer depth to PixelShaderResource for light pass sampling

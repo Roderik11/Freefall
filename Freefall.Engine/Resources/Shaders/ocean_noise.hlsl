@@ -6,12 +6,13 @@
 //   B = Perlin-Worley blend (combined organic + cellular)
 //   A = High-freq Perlin FBM (edge breakup)
 
-struct PushConstantsData { uint4 indices[8]; };
-#define GET_INDEX(i) PushConstants.indices[i/4][i%4]
-ConstantBuffer<PushConstantsData> PushConstants : register(b3);
+#pragma kernel CSGenerateNoise
 
-#define OutputIdx GET_INDEX(0)
-#define TexSize   GET_INDEX(1)
+cbuffer PushConstants : register(b3)
+{
+    uint OutputIdx;
+    uint TexSizeIdx;
+};
 
 // ═══════════════════════════════════════════════════
 // Hash functions
@@ -113,7 +114,7 @@ float worleyFBM(float2 p, float basePeriod, int octaves)
 void CSGenerateNoise(uint3 dtid : SV_DispatchThreadID)
 {
     RWTexture2D<float4> output = ResourceDescriptorHeap[OutputIdx];
-    uint size = TexSize;
+    uint size = TexSizeIdx;
     if (dtid.x >= size || dtid.y >= size) return;
     
     float2 uv = (float2(dtid.xy) + 0.5) / float(size);

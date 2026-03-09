@@ -23,7 +23,6 @@ cbuffer Params : register(b4)
     uint TexWidth;              // Depth texture width
     uint TexHeight;             // Depth texture height
     float NearPlane;            // Camera near plane
-    float FarPlane;             // Max shadow distance
 };
 
 // ============================================================
@@ -69,7 +68,7 @@ void CSDepthReduce(uint3 id : SV_DispatchThreadID, uint groupIndex : SV_GroupInd
 }
 
 // ============================================================
-// Pass 2: CSDepthHistogram — bin depths + compute percentile splits
+// Pass 2: CSDepthHistogram — bin depths into 256-bin histogram
 // ============================================================
 #define HISTOGRAM_BINS 256
 
@@ -87,7 +86,6 @@ void CSDepthHistogram(uint3 id : SV_DispatchThreadID, uint groupIndex : SV_Group
     RWByteAddressBuffer minMaxBuf = ResourceDescriptorHeap[MinMaxUAVIdx];
     float minDepth = asfloat(minMaxBuf.Load(0));
     float maxDepth = asfloat(minMaxBuf.Load(4));
-    
     float range = maxDepth - minDepth;
     
     if (id.x < TexWidth && id.y < TexHeight && range > 0.0001f)

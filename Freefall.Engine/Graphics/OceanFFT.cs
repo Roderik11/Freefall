@@ -1,5 +1,4 @@
 using System;
-using System.IO;
 using System.Numerics;
 using System.Runtime.InteropServices;
 using Vortice.Direct3D12;
@@ -9,31 +8,32 @@ namespace Freefall.Graphics
 {
     /// <summary>
     /// GPU-driven FFT ocean simulation (Tessendorf).
-    /// Manages spectrum textures, compute PSOs, and per-frame dispatches.
+    /// Uses ComputeShader + GraphicsBuffer abstractions for compute dispatch.
     /// Produces displacement + slope Tex2DArrays sampled by ocean.fx.
     /// </summary>
     public class OceanFFT : IDisposable
     {
         public const int N = 512;
-        private const int LOG_N = 9;
         private int _numBands;
         public int NumBands => _numBands;
 
-        // ── Compute PSOs ──
-        private ID3D12PipelineState? _initSpectrumPSO;
-        private ID3D12PipelineState? _packConjugatePSO;
-        private ID3D12PipelineState? _evolveSpectrumPSO;
-        private ID3D12PipelineState? _horizontalFFTPSO;
-        private ID3D12PipelineState? _verticalFFTPSO;
-        private ID3D12PipelineState? _assembleMapsPSO;
-        private ID3D12PipelineState? _downsamplePSO;
-        private ID3D12PipelineState? _noisePSO;
+        // ── Compute shaders (multi-kernel, reflection-based binding) ──
+        private ComputeShader? _spectrumShader;   // ocean_spectrum.hlsl
+        private ComputeShader? _fftShader;        // ocean_fft.hlsl
+        private ComputeShader? _mipShader;        // ocean_mipgen.hlsl
+        private ComputeShader? _noiseShader;      // ocean_noise.hlsl
 
-        // ── GPU Textures ──
-        private ID3D12Resource? _initialSpectrumTex;  // Tex2DArray N×N×4, RGBA16F
-        private ID3D12Resource? _spectrumTex;          // Tex2DArray N×N×8, RGBA16F
-        private ID3D12Resource? _displacementTex;      // Tex2DArray N×N×4, RGBA16F (xyz + foam)
-        private ID3D12Resource? _slopeTex;             // Tex2DArray N×N×4, RG16F
+        // Cached kernel indices
+        private int _kInitSpectrum, _kPackConjugate, _kEvolveSpectrum;
+        private int _kHorizontalFFT, _kVerticalFFT, _kAssembleMaps;
+        private int _kDownsample;
+        private int _kGenerateNoise;
+
+        // ── GPU Textures (raw — no Texture factory for Tex2DArray with per-mip UAVs) ──
+        private ID3D12Resource? _initialSpectrumTex;  // Tex2DArray N×N×bands, RGBA16F
+        private ID3D12Resource? _spectrumTex;          // Tex2DArray N×N×bands*2, RGBA16F
+        private ID3D12Resource? _displacementTex;      // Tex2DArray N×N×bands, RGBA16F (xyz + foam)
+        private ID3D12Resource? _slopeTex;             // Tex2DArray N×N×bands, RG16F
 
         // ── Bindless descriptor indices ──
         private uint _initialSpectrumUAV;
@@ -54,27 +54,20 @@ namespace Freefall.Graphics
 
         // Per-mip UAVs and SRVs for mipmap generation
         private uint[] _displacementMipUAVs = null!;
-        private uint[] _displacementMipSRVs = null!;
         private uint[] _slopeMipUAVs = null!;
-        private uint[] _slopeMipSRVs = null!;
         private int _mipCount;
 
-        // ── Spectrum parameters buffer ──
-        private ID3D12Resource? _spectrumParamsBuffer;
-        private uint _spectrumParamsSRV;
+        // ── Buffers (GraphicsBuffer abstractions) ──
+        private GraphicsBuffer? _spectrumParamsBuffer;  // Upload, mapped
+        private GraphicsBuffer? _lengthScalesBuffer;    // Upload, mapped
+        private GraphicsBuffer? _constantsBuffer;       // Upload, mapped (SRV for HLSL StructuredBuffer)
 
-        // ── Length scales buffer (variable-length, one uint per band) ──
-        private ID3D12Resource? _lengthScalesBuffer;
-        private uint _lengthScalesSRV;
-
-        // ── Constants buffer ──
-        private ID3D12Resource? _constantsBuffer;
-        private uint _constantsSRV;
-        private IntPtr _constantsPtr;
-
-        private GraphicsDevice _device;
+        private GraphicsDevice _device = null!;
         private bool _initialized;
         private bool _spectrumInitialized;
+
+        // Cached descriptor heap array for compute dispatches
+        private ID3D12DescriptorHeap[]? _cachedSrvHeapArray;
 
         [StructLayout(LayoutKind.Sequential)]
         public struct SpectrumParameters
@@ -163,20 +156,10 @@ namespace Freefall.Graphics
                 _params.LengthScales[i] = newLengthScales[i];
 
             // Re-upload spectrum params
-            void* pSpec;
-            _spectrumParamsBuffer.Map(0, null, &pSpec);
-            var specSpan = new Span<SpectrumParameters>(pSpec, specCount);
-            for (int i = 0; i < specCount; i++)
-                specSpan[i] = newSpectrums[i];
-            _spectrumParamsBuffer.Unmap(0);
+            _spectrumParamsBuffer!.Upload<SpectrumParameters>(newSpectrums.AsSpan(0, specCount));
 
             // Re-upload length scales
-            void* pLS;
-            _lengthScalesBuffer.Map(0, null, &pLS);
-            var lsSpan = new Span<uint>(pLS, _numBands);
-            for (int i = 0; i < _numBands; i++)
-                lsSpan[i] = newLengthScales[i];
-            _lengthScalesBuffer.Unmap(0);
+            _lengthScalesBuffer!.Upload<uint>(newLengthScales.AsSpan(0, _numBands));
 
             _spectrumInitialized = false;
         }
@@ -199,49 +182,25 @@ namespace Freefall.Graphics
 
         private void CompileShaders()
         {
-            string basePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Resources", "Shaders");
+            // Spectrum shader: CSInitSpectrum, CSPackConjugate, CSEvolveSpectrum
+            _spectrumShader = new ComputeShader("ocean_spectrum.hlsl");
+            _kInitSpectrum = _spectrumShader.FindKernel("CSInitSpectrum");
+            _kPackConjugate = _spectrumShader.FindKernel("CSPackConjugate");
+            _kEvolveSpectrum = _spectrumShader.FindKernel("CSEvolveSpectrum");
 
-            // Spectrum shaders
-            string spectrumSource = File.ReadAllText(Path.Combine(basePath, "ocean_spectrum.hlsl"));
-            var initShader = new Shader(spectrumSource, "CSInitSpectrum", "cs_6_6");
-            _initSpectrumPSO = _device.CreateComputePipelineState(initShader.Bytecode);
-            initShader.Dispose();
+            // FFT shader: CSHorizontalFFT, CSVerticalFFT, CSAssembleMaps
+            _fftShader = new ComputeShader("ocean_fft.hlsl");
+            _kHorizontalFFT = _fftShader.FindKernel("CSHorizontalFFT");
+            _kVerticalFFT = _fftShader.FindKernel("CSVerticalFFT");
+            _kAssembleMaps = _fftShader.FindKernel("CSAssembleMaps");
 
-            var conjugateShader = new Shader(spectrumSource, "CSPackConjugate", "cs_6_6");
-            _packConjugatePSO = _device.CreateComputePipelineState(conjugateShader.Bytecode);
-            conjugateShader.Dispose();
-
-            var evolveShader = new Shader(spectrumSource, "CSEvolveSpectrum", "cs_6_6");
-            _evolveSpectrumPSO = _device.CreateComputePipelineState(evolveShader.Bytecode);
-            evolveShader.Dispose();
-
-            // FFT shaders
-            string fftSource = File.ReadAllText(Path.Combine(basePath, "ocean_fft.hlsl"));
-            var hfftShader = new Shader(fftSource, "CSHorizontalFFT", "cs_6_6");
-            _horizontalFFTPSO = _device.CreateComputePipelineState(hfftShader.Bytecode);
-            hfftShader.Dispose();
-
-            var vfftShader = new Shader(fftSource, "CSVerticalFFT", "cs_6_6");
-            _verticalFFTPSO = _device.CreateComputePipelineState(vfftShader.Bytecode);
-            vfftShader.Dispose();
-
-            var assembleShader = new Shader(fftSource, "CSAssembleMaps", "cs_6_6");
-            _assembleMapsPSO = _device.CreateComputePipelineState(assembleShader.Bytecode);
-            assembleShader.Dispose();
-
-            // Mipmap downsample shader
-            string mipSource = File.ReadAllText(Path.Combine(basePath, "ocean_mipgen.hlsl"));
-            var mipShader = new Shader(mipSource, "CSDownsample", "cs_6_6");
-            _downsamplePSO = _device.CreateComputePipelineState(mipShader.Bytecode);
-            mipShader.Dispose();
+            // Mip downsample shader
+            _mipShader = new ComputeShader("ocean_mipgen.hlsl");
+            _kDownsample = _mipShader.FindKernel("CSDownsample");
 
             // Noise generation shader
-            string noiseSource = File.ReadAllText(Path.Combine(basePath, "ocean_noise.hlsl"));
-            var noiseShader = new Shader(noiseSource, "CSGenerateNoise", "cs_6_6");
-            _noisePSO = _device.CreateComputePipelineState(noiseShader.Bytecode);
-            noiseShader.Dispose();
-
-            //Debug.Log("OceanFFT", "All compute shaders compiled");
+            _noiseShader = new ComputeShader("ocean_noise.hlsl");
+            _kGenerateNoise = _noiseShader.FindKernel("CSGenerateNoise");
         }
 
         private void CreateTextures()
@@ -287,36 +246,21 @@ namespace Freefall.Graphics
             SlopeSRV = _device.AllocateBindlessIndex();
             CreateTex2DArraySRV(_slopeTex, Format.R16G16_Float, _numBands, mipCount, SlopeSRV);
 
-            // Create per-mip UAVs and SRVs for downsample chain
+            // Create per-mip UAVs for downsample chain
             _mipCount = mipCount;
             _displacementMipUAVs = new uint[mipCount];
-            _displacementMipSRVs = new uint[mipCount];
             _slopeMipUAVs = new uint[mipCount];
-            _slopeMipSRVs = new uint[mipCount];
 
-            // Mip 0 UAVs already exist (_displacementUAV, _slopeUAV)
+            // Mip 0 UAVs already exist
             _displacementMipUAVs[0] = _displacementUAV;
             _slopeMipUAVs[0] = _slopeUAV;
 
-            // Create SRV for mip 0 (source for mip 1 generation)
-            _displacementMipSRVs[0] = _device.AllocateBindlessIndex();
-            CreateTex2DArrayMipSRV(_displacementTex, Format.R16G16B16A16_Float, _numBands, 0, _displacementMipSRVs[0]);
-            _slopeMipSRVs[0] = _device.AllocateBindlessIndex();
-            CreateTex2DArrayMipSRV(_slopeTex, Format.R16G16_Float, _numBands, 0, _slopeMipSRVs[0]);
-
             for (int m = 1; m < mipCount; m++)
             {
-                // UAV for writing to mip m
                 _displacementMipUAVs[m] = _device.AllocateBindlessIndex();
                 CreateTex2DArrayMipUAV(_displacementTex, Format.R16G16B16A16_Float, _numBands, m, _displacementMipUAVs[m]);
                 _slopeMipUAVs[m] = _device.AllocateBindlessIndex();
                 CreateTex2DArrayMipUAV(_slopeTex, Format.R16G16_Float, _numBands, m, _slopeMipUAVs[m]);
-
-                // SRV for reading from mip m (source for mip m+1)
-                _displacementMipSRVs[m] = _device.AllocateBindlessIndex();
-                CreateTex2DArrayMipSRV(_displacementTex, Format.R16G16B16A16_Float, _numBands, m, _displacementMipSRVs[m]);
-                _slopeMipSRVs[m] = _device.AllocateBindlessIndex();
-                CreateTex2DArrayMipSRV(_slopeTex, Format.R16G16_Float, _numBands, m, _slopeMipSRVs[m]);
             }
         }
 
@@ -370,66 +314,25 @@ namespace Freefall.Graphics
             _device.NativeDevice.CreateUnorderedAccessView(tex, null, uavDesc, _device.GetCpuHandle(bindlessIdx));
         }
 
-        private void CreateTex2DArrayMipSRV(ID3D12Resource tex, Format format, int arraySize, int mipLevel, uint bindlessIdx)
-        {
-            var srvDesc = new ShaderResourceViewDescription
-            {
-                Format = format,
-                ViewDimension = ShaderResourceViewDimension.Texture2DArray,
-                Shader4ComponentMapping = ShaderComponentMapping.Default,
-                Texture2DArray = new Texture2DArrayShaderResourceView
-                {
-                    MostDetailedMip = (uint)mipLevel,
-                    MipLevels = 1,
-                    FirstArraySlice = 0,
-                    ArraySize = (uint)arraySize
-                }
-            };
-            _device.NativeDevice.CreateShaderResourceView(tex, srvDesc, _device.GetCpuHandle(bindlessIdx));
-        }
-
         private unsafe void CreateBuffers()
         {
             int specCount = _numBands * 2;
 
-            // Spectrum parameters: numBands*2 × SpectrumParameters
-            int specSize = Marshal.SizeOf<SpectrumParameters>() * specCount;
-            _spectrumParamsBuffer = _device.CreateUploadBuffer(specSize);
-            _spectrumParamsSRV = _device.AllocateBindlessIndex();
-            _device.CreateStructuredBufferSRV(_spectrumParamsBuffer, (uint)specCount, (uint)Marshal.SizeOf<SpectrumParameters>(), _spectrumParamsSRV);
-
-            // Upload spectrum params
-            void* pSpec;
-            _spectrumParamsBuffer.Map(0, null, &pSpec);
-            var specSpan = new Span<SpectrumParameters>(pSpec, specCount);
+            // Spectrum parameters: upload buffer with SRV, mapped for fast re-upload
+            _spectrumParamsBuffer = GraphicsBuffer.CreateUpload<SpectrumParameters>(specCount, mapped: true);
+            var pSpec = _spectrumParamsBuffer.WritePtr<SpectrumParameters>();
             for (int i = 0; i < specCount; i++)
-                specSpan[i] = _params.Spectrums[i];
-            _spectrumParamsBuffer.Unmap(0);
+                pSpec[i] = _params.Spectrums[i];
 
-            // Length scales buffer: one uint per band
-            int lsSize = sizeof(uint) * _numBands;
-            lsSize = Math.Max(lsSize, 16); // D3D12 minimum buffer size
-            _lengthScalesBuffer = _device.CreateUploadBuffer(lsSize);
-            _lengthScalesSRV = _device.AllocateBindlessIndex();
-            _device.CreateStructuredBufferSRV(_lengthScalesBuffer, (uint)_numBands, (uint)sizeof(uint), _lengthScalesSRV);
-
-            void* pLS;
-            _lengthScalesBuffer.Map(0, null, &pLS);
-            var lsSpan = new Span<uint>(pLS, _numBands);
+            // Length scales: upload buffer with SRV, mapped
+            int lsCount = Math.Max(_numBands, 4); // D3D12 minimum buffer size guard
+            _lengthScalesBuffer = GraphicsBuffer.CreateUpload<uint>(lsCount, mapped: true);
+            var pLS = _lengthScalesBuffer.WritePtr<uint>();
             for (int i = 0; i < _numBands; i++)
-                lsSpan[i] = _params.LengthScales[i];
-            _lengthScalesBuffer.Unmap(0);
+                pLS[i] = _params.LengthScales[i];
 
-            // Constants buffer: single OceanConstants struct
-            int constSize = (Marshal.SizeOf<OceanConstants>() + 255) & ~255; // 256-byte aligned
-            _constantsBuffer = _device.CreateUploadBuffer(constSize);
-            _constantsSRV = _device.AllocateBindlessIndex();
-            _device.CreateStructuredBufferSRV(_constantsBuffer, 1, (uint)Marshal.SizeOf<OceanConstants>(), _constantsSRV);
-
-            // Persistently map
-            void* pConst;
-            _constantsBuffer.Map(0, null, &pConst);
-            _constantsPtr = (IntPtr)pConst;
+            // Constants: upload buffer with SRV (HLSL reads as StructuredBuffer<OceanConstants>)
+            _constantsBuffer = GraphicsBuffer.CreateUpload<OceanConstants>(1, mapped: true);
         }
 
         private unsafe void UpdateConstants(float frameTime, float deltaTime)
@@ -451,24 +354,30 @@ namespace Freefall.Graphics
                 FoamThreshold = _params.FoamThreshold,
                 FoamAdd = _params.FoamAdd,
                 NumBands = (uint)_numBands,
-                LengthScalesSRV = _lengthScalesSRV,
+                LengthScalesSRV = _lengthScalesBuffer!.SrvIndex,
             };
-            *(OceanConstants*)_constantsPtr = constants;
+            *_constantsBuffer!.WritePtr<OceanConstants>() = constants;
         }
 
         /// <summary>
-        /// Set compute root signature + push constants for ocean compute dispatches.
-        /// Must be called before every compute dispatch.
+        /// Bind shared push constants across spectrum and FFT shaders.
+        /// Call once before a series of dispatches.
         /// </summary>
-        private void SetPushConstants(ID3D12GraphicsCommandList cmd)
+        private void BindSharedPushConstants()
         {
-            cmd.SetComputeRootSignature(_device.GlobalRootSignature);
-            cmd.SetComputeRoot32BitConstant(0, _initialSpectrumUAV, 0);
-            cmd.SetComputeRoot32BitConstant(0, _spectrumUAV, 1);
-            cmd.SetComputeRoot32BitConstant(0, _spectrumParamsSRV, 2);
-            cmd.SetComputeRoot32BitConstant(0, _constantsSRV, 3);
-            cmd.SetComputeRoot32BitConstant(0, _displacementUAV, 4);
-            cmd.SetComputeRoot32BitConstant(0, _slopeUAV, 5);
+            // Spectrum shader: all 3 kernels share the same 4 push constants
+            _spectrumShader!.SetPushConstant("InitialSpectrum", _initialSpectrumUAV);
+            _spectrumShader.SetPushConstant("Spectrum", _spectrumUAV);
+            _spectrumShader.SetPushConstant("SpectrumParams", _spectrumParamsBuffer!.SrvIndex);
+            _spectrumShader.SetPushConstant("OceanConstants", _constantsBuffer!.SrvIndex);
+
+            // FFT shader: 6 push constants (4 shared + displacement + slope)
+            _fftShader!.SetPushConstant("InitialSpectrum", _initialSpectrumUAV);
+            _fftShader.SetPushConstant("Spectrum", _spectrumUAV);
+            _fftShader.SetPushConstant("SpectrumParams", _spectrumParamsBuffer.SrvIndex);
+            _fftShader.SetPushConstant("OceanConstants", _constantsBuffer.SrvIndex);
+            _fftShader.SetPushConstant("Displacement", _displacementUAV);
+            _fftShader.SetPushConstant("Slope", _slopeUAV);
         }
 
         /// <summary>
@@ -477,30 +386,26 @@ namespace Freefall.Graphics
         public void InitSpectrum(ID3D12GraphicsCommandList cmd)
         {
             if (!_initialized) return;
-            if(_spectrumInitialized) return;
-            
+            if (_spectrumInitialized) return;
+
             UpdateConstants(0, 0);
+            BindSharedPushConstants();
 
             uint groups = (uint)((N + 7) / 8);
 
-            // CSInitSpectrum
-            cmd.SetPipelineState(_initSpectrumPSO!);
-            SetPushConstants(cmd);
-            cmd.Dispatch(groups, groups, 1);
+            cmd.SetComputeRootSignature(_device.GlobalRootSignature);
+            _cachedSrvHeapArray ??= new[] { _device.SrvHeap };
+            cmd.SetDescriptorHeaps(1, _cachedSrvHeapArray);
 
-            // UAV barrier
+            // CSInitSpectrum
+            _spectrumShader!.Dispatch(_kInitSpectrum, cmd, groups, groups);
             cmd.ResourceBarrierUnorderedAccessView(_initialSpectrumTex!);
 
             // CSPackConjugate
-            cmd.SetPipelineState(_packConjugatePSO!);
-            SetPushConstants(cmd);
-            cmd.Dispatch(groups, groups, 1);
-
-            // UAV barrier
+            _spectrumShader.Dispatch(_kPackConjugate, cmd, groups, groups);
             cmd.ResourceBarrierUnorderedAccessView(_initialSpectrumTex!);
 
             _spectrumInitialized = true;
-            //Debug.Log("OceanFFT", "Spectrum initialized");
         }
 
         /// <summary>
@@ -534,14 +439,16 @@ namespace Freefall.Graphics
             };
             _device.NativeDevice.CreateShaderResourceView(_noiseTex, srvDesc, _device.GetCpuHandle(NoiseSRV));
 
-            // Dispatch noise generation
-            cmd.SetPipelineState(_noisePSO!);
+            // Dispatch noise generation via ComputeShader
             cmd.SetComputeRootSignature(_device.GlobalRootSignature);
-            cmd.SetComputeRoot32BitConstant(0, _noiseUAV, 0);        // OutputIdx
-            cmd.SetComputeRoot32BitConstant(0, (uint)NoiseSize, 1);   // TexSize
+            _cachedSrvHeapArray ??= new[] { _device.SrvHeap };
+            cmd.SetDescriptorHeaps(1, _cachedSrvHeapArray);
+
+            _noiseShader!.SetPushConstant("Output", _noiseUAV);
+            _noiseShader.SetPushConstant("TexSize", (uint)NoiseSize);
 
             uint groups = (uint)((NoiseSize + 7) / 8);
-            cmd.Dispatch(groups, groups, 1);
+            _noiseShader.Dispatch(_kGenerateNoise, cmd, groups, groups);
 
             cmd.ResourceBarrierUnorderedAccessView(_noiseTex);
             Debug.Log("OceanFFT", "Noise texture generated");
@@ -555,35 +462,28 @@ namespace Freefall.Graphics
             if (!_initialized || !_spectrumInitialized) return;
 
             UpdateConstants(frameTime, deltaTime);
+            BindSharedPushConstants();
+
+            cmd.SetComputeRootSignature(_device.GlobalRootSignature);
+            _cachedSrvHeapArray ??= new[] { _device.SrvHeap };
+            cmd.SetDescriptorHeaps(1, _cachedSrvHeapArray);
 
             uint groups8 = (uint)((N + 7) / 8);
 
             // 1. Evolve spectrum
-            cmd.SetPipelineState(_evolveSpectrumPSO!);
-            SetPushConstants(cmd);
-            cmd.Dispatch(groups8, groups8, 1);
-
+            _spectrumShader!.Dispatch(_kEvolveSpectrum, cmd, groups8, groups8);
             cmd.ResourceBarrierUnorderedAccessView(_spectrumTex!);
 
             // 2. Horizontal FFT (N rows, SIZE threads each)
-            cmd.SetPipelineState(_horizontalFFTPSO!);
-            SetPushConstants(cmd);
-            cmd.Dispatch(1, (uint)N, 1);
-
+            _fftShader!.Dispatch(_kHorizontalFFT, cmd, 1, (uint)N);
             cmd.ResourceBarrierUnorderedAccessView(_spectrumTex!);
 
             // 3. Vertical FFT (N columns, SIZE threads each)
-            cmd.SetPipelineState(_verticalFFTPSO!);
-            SetPushConstants(cmd);
-            cmd.Dispatch(1, (uint)N, 1);
-
+            _fftShader.Dispatch(_kVerticalFFT, cmd, 1, (uint)N);
             cmd.ResourceBarrierUnorderedAccessView(_spectrumTex!);
 
             // 4. Assemble displacement + slope maps
-            cmd.SetPipelineState(_assembleMapsPSO!);
-            SetPushConstants(cmd);
-            cmd.Dispatch(groups8, groups8, 1);
-
+            _fftShader.Dispatch(_kAssembleMaps, cmd, groups8, groups8);
             cmd.ResourceBarrierUnorderedAccessView(_displacementTex!);
             cmd.ResourceBarrierUnorderedAccessView(_slopeTex!);
 
@@ -593,8 +493,6 @@ namespace Freefall.Graphics
 
         private void GenerateMips(ID3D12GraphicsCommandList cmd)
         {
-            cmd.SetPipelineState(_downsamplePSO!);
-
             int srcSize = N;
             for (int mip = 1; mip < _mipCount; mip++)
             {
@@ -603,26 +501,22 @@ namespace Freefall.Graphics
 
                 uint groups = (uint)((dstSize + 7) / 8);
 
-                // Downsample displacement (RGBA16F) — read from UAV, write to UAV
-                cmd.SetComputeRootSignature(_device.GlobalRootSignature);
-                cmd.SetComputeRoot32BitConstant(0, _displacementMipUAVs[mip - 1], 0); // SrcMipIdx (UAV read)
-                cmd.SetComputeRoot32BitConstant(0, _displacementMipUAVs[mip], 1);      // DstMipIdx (UAV write)
-                cmd.SetComputeRoot32BitConstant(0, (uint)dstSize, 2);                  // MipTexelSize
-                cmd.SetComputeRoot32BitConstant(0, (uint)_numBands, 3);                // NumSlices
-                cmd.SetComputeRoot32BitConstant(0, 0u, 4);                             // IsRG16F = false
-                cmd.Dispatch(groups, groups, 1);
-
+                // Downsample displacement (RGBA16F)
+                _mipShader!.SetPushConstant(_kDownsample, "SrcMip", _displacementMipUAVs[mip - 1]);
+                _mipShader.SetPushConstant(_kDownsample, "DstMip", _displacementMipUAVs[mip]);
+                _mipShader.SetPushConstant(_kDownsample, "MipTexelSize", (uint)dstSize);
+                _mipShader.SetPushConstant(_kDownsample, "NumSlices", (uint)_numBands);
+                _mipShader.SetPushConstant(_kDownsample, "IsRG16F", 0u);
+                _mipShader.Dispatch(_kDownsample, cmd, groups, groups);
                 cmd.ResourceBarrierUnorderedAccessView(_displacementTex!);
 
-                // Downsample slope (RG16F) — read from UAV, write to UAV
-                cmd.SetComputeRootSignature(_device.GlobalRootSignature);
-                cmd.SetComputeRoot32BitConstant(0, _slopeMipUAVs[mip - 1], 0);         // SrcMipIdx (UAV read)
-                cmd.SetComputeRoot32BitConstant(0, _slopeMipUAVs[mip], 1);             // DstMipIdx (UAV write)
-                cmd.SetComputeRoot32BitConstant(0, (uint)dstSize, 2);                  // MipTexelSize
-                cmd.SetComputeRoot32BitConstant(0, (uint)_numBands, 3);                // NumSlices
-                cmd.SetComputeRoot32BitConstant(0, 1u, 4);                             // IsRG16F = true
-                cmd.Dispatch(groups, groups, 1);
-
+                // Downsample slope (RG16F)
+                _mipShader.SetPushConstant(_kDownsample, "SrcMip", _slopeMipUAVs[mip - 1]);
+                _mipShader.SetPushConstant(_kDownsample, "DstMip", _slopeMipUAVs[mip]);
+                _mipShader.SetPushConstant(_kDownsample, "MipTexelSize", (uint)dstSize);
+                _mipShader.SetPushConstant(_kDownsample, "NumSlices", (uint)_numBands);
+                _mipShader.SetPushConstant(_kDownsample, "IsRG16F", 1u);
+                _mipShader.Dispatch(_kDownsample, cmd, groups, groups);
                 cmd.ResourceBarrierUnorderedAccessView(_slopeTex!);
 
                 srcSize = dstSize;
@@ -635,19 +529,16 @@ namespace Freefall.Graphics
             _spectrumTex?.Dispose();
             _displacementTex?.Dispose();
             _slopeTex?.Dispose();
+            _noiseTex?.Dispose();
+
             _spectrumParamsBuffer?.Dispose();
             _lengthScalesBuffer?.Dispose();
             _constantsBuffer?.Dispose();
 
-            _initSpectrumPSO?.Dispose();
-            _packConjugatePSO?.Dispose();
-            _evolveSpectrumPSO?.Dispose();
-            _horizontalFFTPSO?.Dispose();
-            _verticalFFTPSO?.Dispose();
-            _assembleMapsPSO?.Dispose();
-            _downsamplePSO?.Dispose();
-            _noisePSO?.Dispose();
-            _noiseTex?.Dispose();
+            _spectrumShader?.Dispose();
+            _fftShader?.Dispose();
+            _mipShader?.Dispose();
+            _noiseShader?.Dispose();
         }
     }
 }

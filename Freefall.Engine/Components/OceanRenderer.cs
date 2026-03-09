@@ -167,8 +167,7 @@ namespace Freefall.Components
         private TerrainRenderer? _terrain;
 
         // GPU buffer for tile scales (1/lengthScale per band)
-        private ID3D12Resource? _tileScalesBuffer;
-        private uint _tileScalesSRV;
+        private GraphicsBuffer? _tileScalesBuffer;
 
         [StructLayout(LayoutKind.Sequential, Pack = 16)]
         public struct OceanData
@@ -251,28 +250,19 @@ namespace Freefall.Components
         private unsafe void CreateTileScalesBuffer()
         {
             int count = Bands.Count;
-            int bufSize = Math.Max(sizeof(float) * count, 16);
-            _tileScalesBuffer = Engine.Device.CreateUploadBuffer(bufSize);
-            _tileScalesSRV = Engine.Device.AllocateBindlessIndex();
-            Engine.Device.CreateStructuredBufferSRV(_tileScalesBuffer, (uint)count, (uint)sizeof(float), _tileScalesSRV);
-
-            void* ptr;
-            _tileScalesBuffer.Map(0, null, &ptr);
-            var span = new Span<float>(ptr, count);
+            _tileScalesBuffer = GraphicsBuffer.CreateUpload<float>(count, mapped: true);
+            var pData = _tileScalesBuffer.WritePtr<float>();
             for (int i = 0; i < count; i++)
-                span[i] = 1.0f / Bands[i].LengthScale;
-            _tileScalesBuffer.Unmap(0);
+                pData[i] = 1.0f / Bands[i].LengthScale;
         }
 
         private unsafe void UpdateTileScalesBuffer()
         {
+            if (_tileScalesBuffer == null) return;
             int count = Bands.Count;
-            void* ptr;
-            _tileScalesBuffer.Map(0, null, &ptr);
-            var span = new Span<float>(ptr, count);
+            var pData = _tileScalesBuffer.WritePtr<float>();
             for (int i = 0; i < count; i++)
-                span[i] = 1.0f / Bands[i].LengthScale;
-            _tileScalesBuffer.Unmap(0);
+                pData[i] = 1.0f / Bands[i].LengthScale;
         }
 
         private uint[] BuildLengthScales()
@@ -447,7 +437,7 @@ namespace Freefall.Components
                 DisplacementSRV = _oceanFFT.DisplacementSRV,
                 SlopeSRV = _oceanFFT.SlopeSRV,
                 NumBands = (uint)Bands.Count,
-                TileScalesSRV = _tileScalesSRV,
+                TileScalesSRV = _tileScalesBuffer?.SrvIndex ?? 0,
                 DisplacementAtten = 1.0f,
                 NormalAtten = 1.0f,
                 HeightmapSRV = _terrain?.Terrain?.Heightmap?.BindlessIndex ?? 0,

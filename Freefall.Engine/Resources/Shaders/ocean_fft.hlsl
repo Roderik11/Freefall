@@ -1,21 +1,23 @@
 // ocean_fft.hlsl — LDS-based Stockham butterfly FFT + map assembly
 // SM 6.6 bindless, push constants at b3
 
+#pragma kernel CSHorizontalFFT
+#pragma kernel CSVerticalFFT
+#pragma kernel CSAssembleMaps
+
 #define PI 3.14159265358979323846
 #define SIZE 512
 #define LOG_SIZE 9
 
-struct PushConstantsData { uint4 indices[8]; };
-#define GET_INDEX(i) PushConstants.indices[i/4][i%4]
-ConstantBuffer<PushConstantsData> PushConstants : register(b3);
-
-// Push constant layout — shared with ocean_spectrum.hlsl
-#define InitialSpectrumIdx  GET_INDEX(0)
-#define SpectrumIdx         GET_INDEX(1)
-#define SpectrumParamsIdx   GET_INDEX(2)
-#define OceanConstantsIdx   GET_INDEX(3)
-#define DisplacementIdx     GET_INDEX(4)  // RWTexture2DArray<float4> — output displacement + foam
-#define SlopeIdx            GET_INDEX(5)  // RWTexture2DArray<float2> — output slopes
+cbuffer PushConstants : register(b3)
+{
+    uint InitialSpectrumIdx;   // RWTexture2DArray<float4> — H0
+    uint SpectrumIdx;          // RWTexture2DArray<float4> — evolved spectrum
+    uint SpectrumParamsIdx;    // (unused here, shared layout with spectrum)
+    uint OceanConstantsIdx;    // StructuredBuffer<OceanConstants>
+    uint DisplacementIdx;      // RWTexture2DArray<float4> — output displacement + foam
+    uint SlopeIdx;             // RWTexture2DArray<float2> — output slopes
+};
 
 struct OceanConstants
 {
