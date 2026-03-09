@@ -317,6 +317,57 @@ namespace Freefall.Graphics
                 var passDepthDesc = depthDesc;
                 var passRasterDesc = rasterizerDesc;
                 
+                // Per-pass render state override (from SetRenderState() in pass block)
+                var passRS = currentPass.RenderState;
+                if (passRS != null)
+                {
+                    // Resolve RT formats for this pass
+                    passRtvFormats = passRS.RenderTargetCount switch
+                    {
+                        5 => new[] { Format.R16G16B16A16_Float, Format.R16G16B16A16_SNorm, Format.R8G8B8A8_UNorm, Format.R32_Float, Format.R32_Float },
+                        4 => new[] { Format.R16G16B16A16_Float, Format.R16G16B16A16_SNorm, Format.R8G8B8A8_UNorm, Format.R32_Float },
+                        3 => new[] { Format.R16G16B16A16_Float, Format.R16G16B16A16_SNorm, Format.R8G8B8A8_UNorm },
+                        2 => new[] { Format.R16G16B16A16_Float, Format.R32_Float }, // Composite + EntityId
+                        _ => new[] { Format.R8G8B8A8_UNorm }
+                    };
+                    
+                    // Override render target format if specified
+                    if (passRS.RenderTargetFormat != null && passRS.RenderTargetCount <= 1)
+                    {
+                        if (Enum.TryParse<Format>(passRS.RenderTargetFormat, true, out var rtFormat))
+                            passRtvFormats = new[] { rtFormat };
+                    }
+                    
+                    // Resolve depth stencil for this pass
+                    if (!passRS.DepthTest && !passRS.DepthWrite)
+                    {
+                        passDepthDesc = DepthStencilDescription.None;
+                        passDepthFormat = Format.Unknown;
+                    }
+                    else if (!passRS.DepthWrite)
+                    {
+                        passDepthDesc = new DepthStencilDescription
+                        {
+                            DepthEnable = true,
+                            DepthWriteMask = DepthWriteMask.Zero,
+                            DepthFunc = parsedDepthFunc,
+                            StencilEnable = false
+                        };
+                        passDepthFormat = Format.D32_Float;
+                    }
+                    else
+                    {
+                        passDepthDesc = new DepthStencilDescription
+                        {
+                            DepthEnable = true,
+                            DepthWriteMask = DepthWriteMask.All,
+                            DepthFunc = parsedDepthFunc,
+                            StencilEnable = false
+                        };
+                        passDepthFormat = Format.D32_Float;
+                    }
+                }
+
                 if (passType == RenderPass.Shadow)
                 {
                     passRtvFormats = Array.Empty<Format>();
@@ -370,13 +421,11 @@ namespace Freefall.Graphics
                     if (currentPass.HullShader != null)
                         psoDesc.PrimitiveTopologyType = PrimitiveTopologyType.Patch;
                     
-                    if (passType == RenderPass.Shadow)
-                    {
-                        psoDesc.RenderTargetFormats = passRtvFormats;
-                        psoDesc.DepthStencilFormat = passDepthFormat;
-                        psoDesc.DepthStencilState = passDepthDesc;
-                        psoDesc.RasterizerState = passRasterDesc;
-                    }
+                    // Apply per-pass render state overrides (from SetRenderState() or Shadow defaults)
+                    psoDesc.RenderTargetFormats = passRtvFormats;
+                    psoDesc.DepthStencilFormat = passDepthFormat;
+                    psoDesc.DepthStencilState = passDepthDesc;
+                    psoDesc.RasterizerState = passRasterDesc;
                     
                     _passPipelineStates[passIndex] = new PipelineState(device, rootSignature, psoDesc);
                     

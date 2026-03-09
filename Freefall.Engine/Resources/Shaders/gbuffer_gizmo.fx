@@ -1,7 +1,6 @@
 // Gizmo shader — Forward pass, unlit flat color, always on top.
 // No depth testing so gizmos always render above scene geometry.
 // Outputs entity ID to RT1 for mouse picking.
-// @RenderState(RenderTargets=2, DepthTest=false, DepthWrite=false)
 
 cbuffer PushConstants : register(b3)
 {
@@ -92,6 +91,7 @@ technique11 GBuffer
 {
     pass Forward
     {
+        SetRenderState(RenderTargets=2, DepthTest=false, DepthWrite=false);
         SetVertexShader(CompileShader(vs_6_6, VS()));
         SetPixelShader(CompileShader(ps_6_6, PS()));
     }

@@ -28,6 +28,11 @@ namespace Freefall.Graphics
         public string? MeshShaderEntry { get; set; }
         public string? AmplificationShaderProfile { get; set; }
         public string? AmplificationShaderEntry { get; set; }
+        
+        // Per-pass render state overrides (null = use global @RenderState default)
+        public int? RenderTargetCount { get; set; }
+        public bool? DepthTest { get; set; }
+        public bool? DepthWrite { get; set; }
     }
 
     public static class FXParser
@@ -93,6 +98,27 @@ namespace Freefall.Graphics
                     if (rasterMatch.Success)
                     {
                         pass.RasterizerState = rasterMatch.Groups[1].Value.Trim();
+                    }
+
+                    // Per-pass render state: SetRenderState(Key=Value, ...)
+                    var renderStateMatch = Regex.Match(passBody, @"SetRenderState\s*\(([^)]+)\)");
+                    if (renderStateMatch.Success)
+                    {
+                        foreach (var pair in renderStateMatch.Groups[1].Value.Split(','))
+                        {
+                            var kv = pair.Split('=');
+                            if (kv.Length == 2)
+                            {
+                                string key = kv[0].Trim();
+                                string value = kv[1].Trim();
+                                switch (key)
+                                {
+                                    case "RenderTargets": pass.RenderTargetCount = int.Parse(value); break;
+                                    case "DepthTest": pass.DepthTest = bool.Parse(value); break;
+                                    case "DepthWrite": pass.DepthWrite = bool.Parse(value); break;
+                                }
+                            }
+                        }
                     }
 
                     technique.Passes.Add(pass);

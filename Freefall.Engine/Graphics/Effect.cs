@@ -16,12 +16,23 @@ namespace Freefall.Graphics
         public Shader? MeshShader { get; private set; }
         public Shader? AmplificationShader { get; private set; }
         public string? RasterizerStateName { get; private set; }
+        /// <summary>Per-pass render state override. Null = use global Effect.RenderState.</summary>
+        public ShaderRenderState? RenderState { get; private set; }
         public bool IsMeshShaderPass => MeshShader != null;
 
         public EffectPass(string name, EffectPassDescription desc, string source)
         {
             Name = name;
             RasterizerStateName = desc.RasterizerState;
+
+            // Build per-pass render state override if any fields were specified
+            if (desc.RenderTargetCount.HasValue || desc.DepthTest.HasValue || desc.DepthWrite.HasValue)
+            {
+                RenderState = new ShaderRenderState();
+                if (desc.RenderTargetCount.HasValue) RenderState.RenderTargetCount = desc.RenderTargetCount.Value;
+                if (desc.DepthTest.HasValue) RenderState.DepthTest = desc.DepthTest.Value;
+                if (desc.DepthWrite.HasValue) RenderState.DepthWrite = desc.DepthWrite.Value;
+            }
 
             if (!string.IsNullOrEmpty(desc.VertexShaderEntry))
                 VertexShader = new Shader(source, desc.VertexShaderEntry, desc.VertexShaderProfile ?? "vs_6_0");
@@ -225,7 +236,7 @@ namespace Freefall.Graphics
                     // Also populate ResourceBindings for backwards compatibility
                     ResourceBindings.Add(new ShaderResourceBinding { Name = name, Slot = slot });
 
-                    Debug.Log($"[Effect] '{Name}' push constant: '{name}' → slot {slot}");
+                    //Debug.Log($"[Effect] '{Name}' push constant: '{name}' → slot {slot}");
                 }
                 break; // Only one PushConstants cbuffer
             }
