@@ -99,10 +99,6 @@ float4 PS(VSOutput input) : SV_Target
     float3 viewZ = float3(View[0][2], View[1][2], View[2][2]);
     float gridLinearDepth = dot(hitPointRel, viewZ);
 
-    // DEBUG: uncomment to visualize depths
-    //float3 sceneColor0 = CompositeTex.Load(int3(input.Position.xy, 0)).rgb;
-    //return float4(depth / 500.0, gridLinearDepth / 500.0, 0, 1);
-
     if (depth > 0 && gridLinearDepth > depth)
         discard;
 

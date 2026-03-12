@@ -185,19 +185,29 @@ namespace Freefall.Graphics
         /// </summary>
         private void DiscoverPushConstants()
         {
-            // Find the first available shader reflection from compiled passes
+            // Find shader reflection that has a PushConstants cbuffer.
+            // Must check ALL stages — some shaders only declare PushConstants in PS.
             Vortice.Direct3D12.Shader.ID3D12ShaderReflection? reflection = null;
             foreach (var tech in Techniques)
             {
                 foreach (var pass in tech.Passes)
                 {
-                    // Try VS first, then MS (mesh shader passes), then PS
-                    var shader = pass.VertexShader ?? pass.MeshShader ?? pass.PixelShader;
-                    if (shader?.Reflection != null)
+                    var candidates = new[] { pass.VertexShader, pass.MeshShader, pass.PixelShader };
+                    foreach (var shader in candidates)
                     {
-                        reflection = shader.Reflection;
-                        break;
+                        if (shader?.Reflection == null) continue;
+                        for (uint i = 0; i < shader.Reflection.Description.ConstantBuffers; i++)
+                        {
+                            var cb = shader.Reflection.GetConstantBufferByIndex(i);
+                            if (cb.Description.Name == "PushConstants")
+                            {
+                                reflection = shader.Reflection;
+                                break;
+                            }
+                        }
+                        if (reflection != null) break;
                     }
+                    if (reflection != null) break;
                 }
                 if (reflection != null) break;
             }
