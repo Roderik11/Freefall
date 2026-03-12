@@ -275,17 +275,12 @@ namespace Freefall
 
             _tickSw.Stop();
 
-            // Log frame breakdown when total exceeds 5ms (stall detection)
-            //if (_tickSw.Elapsed.TotalMilliseconds > 5)
+            // Per-frame timing (uncomment for profiling)
+            //if (Engine.FrameIndex % 60 == 0)
             //{
-            //    Debug.Log($"[Tick STALL] {_tickSw.Elapsed.TotalMilliseconds:F1}ms | " +
-            //        $"FlushDispose:{_flushDisposeSw.Elapsed.TotalMilliseconds:F1} " +
-            //        $"FlushPending:{_flushPendingSw.Elapsed.TotalMilliseconds:F1} " +
-            //        $"Physics:{_physicsSw.Elapsed.TotalMilliseconds:F1} " +
-            //        $"Update:{_updateSw.Elapsed.TotalMilliseconds:F1} " +
+            //    Console.Error.WriteLine($"[Tick] {_tickSw.Elapsed.TotalMilliseconds:F1}ms | " +
             //        $"Render:{_renderSw.Elapsed.TotalMilliseconds:F1} " +
-            //        $"(Prep:{_prepareTotalMs:F1} Cam:{_camRenderTotalMs:F1} Pres:{_presentTotalMs:F1}) " +
-            //        $"Queue:{_queueSw.Elapsed.TotalMilliseconds:F1}({_queueItemCount}items)");
+            //        $"(Prep:{_prepareTotalMs:F1} Cam:{_camRenderTotalMs:F1} Pres:{_presentTotalMs:F1})");
             //}
 
             Input.ClearFrameCallbacks();

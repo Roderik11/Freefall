@@ -161,7 +161,7 @@ namespace Freefall.Graphics
             // This reduces the "burst-and-stall" pattern from Investigation 316
             using (var swapChain2 = _swapChain.QueryInterface<IDXGISwapChain2>())
             {
-                swapChain2.MaximumFrameLatency = 2; // Optimal for smooth triple buffering
+                swapChain2.MaximumFrameLatency = FrameCount; // Match buffer count for full pipeline overlap
             }
             _frameLatencyWaitableObject = _swapChain.FrameLatencyWaitableObject;
 
