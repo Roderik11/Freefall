@@ -132,6 +132,20 @@ namespace Freefall.Reflection
             return new GUIPropertyElement(_field, list.Count - 1, targets) { Depth = Depth + 1 };
         }
 
+        /// <summary>
+        /// Add an element of a specific concrete type (for polymorphic lists with abstract base types).
+        /// </summary>
+        public GUIPropertyElement AddElement(Type concreteType)
+        {
+            if (!IsList) return null;
+
+            var list = GetValue() as IList;
+            var obj = Activator.CreateInstance(concreteType);
+            list.Add(obj);
+
+            return new GUIPropertyElement(_field, list.Count - 1, targets) { Depth = Depth + 1 };
+        }
+
         public int GetArrayLength()
         {
             var value = GetValue();
@@ -146,7 +160,21 @@ namespace Freefall.Reflection
         protected readonly Type elementType;
 
         public override string Name { get { return $"Element {elementIndex}"; } }
-        public override Type Type { get { return elementType; } }
+
+        /// <summary>
+        /// Returns the concrete runtime type of the list element, not the generic List&lt;T&gt; argument.
+        /// This ensures the inspector shows fields for the actual subclass (e.g. ImportHeightLayer, not HeightLayer).
+        /// </summary>
+        public override Type Type
+        {
+            get
+            {
+                var list = _field.GetValue(targets[0]) as System.Collections.IList;
+                if (list != null && elementIndex < list.Count && list[elementIndex] != null)
+                    return list[elementIndex].GetType();
+                return elementType;
+            }
+        }
 
         public override int Index => elementIndex;
              

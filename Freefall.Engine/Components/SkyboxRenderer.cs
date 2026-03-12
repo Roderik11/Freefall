@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Numerics;
 using Freefall.Graphics;
@@ -9,43 +9,43 @@ namespace Freefall.Components
 {
     public class SkyboxRenderer : Component, IUpdate, IDraw
     {
-        public Mesh Mesh;
-        public Material Material;
-        public MaterialBlock Params = new MaterialBlock();
+        private Mesh Mesh;
+        private Material Material;
+        private MaterialBlock Params = new MaterialBlock();
 
-        // Sky mode
-        public bool UseProceduralSky = true;
+        public bool AnimateTimeOfDay = false;
 
-        // Procedural sky parameters
         [ValueRange(0f, 24f)]
         public float TimeOfDay = 16f;         // 0-24 hours
+  
+        [ValueRange(0.1f, 1f)]
+        public float TimeOfDaySpeed = 0.1f; // Hours per second (tweak for testing)
+
         [ValueRange(0f, 1f)]
         public float CloudCoverage = 0.5f;      // 0-1
+
         [ValueRange(0f, 10f)]
         public float CloudSpeed = 1.0f;         // Speed multiplier
+
         [ValueRange(0f, 10f)]
         public float SunIntensity = 1.2f;       // Sun brightness multiplier
 
-        public Vector3 SunDirection = new Vector3(0, 1, 0);
+        [ValueRange(0f, 10f)]
+        public float DayIntensity = 3.14159f;       // Sun intensity at noon
 
-        // Star parameters
+        [ValueRange(0f, 10f)]
+        public float NightIntensity = 0.1f;     // Ambient intensity at night
+
         [ValueRange(0f, 1f)]
         public float StarDensity = 0.5f;        // 0-1, controls how many stars
+
         [ValueRange(0f, 10f)]
         public float StarBrightness = 1.0f;     // Star intensity multiplier
 
-        // Animation
-        public bool AnimateTimeOfDay = false;
-        public float TimeOfDaySpeed = 0.1f; // Hours per second (tweak for testing)
-
-        // Sun light control
         public DirectionalLight SunLight;
-        public bool ControlSunLight = true;     // Enable/disable automatic sun light control
-      
-        [ValueRange(0f, 10f)]
-        public float DayIntensity = 3.14159f;       // Sun intensity at noon
-        [ValueRange(0f, 10f)]
-        public float NightIntensity = 0.1f;     // Ambient intensity at night
+
+        public Vector3 SunDirection = new Vector3(0, 1, 0);
+
 
         // Static ambient scale accessible by composition pass
         public static float AmbientScale { get; private set; } = 1.0f;
@@ -72,7 +72,7 @@ namespace Freefall.Components
             Entity.Transform.Position = Camera.Main.Position;
 
             // Animate time of day if enabled
-            if (UseProceduralSky && AnimateTimeOfDay)
+            if (AnimateTimeOfDay)
             {
                 TimeOfDay += (float)Time.Delta * TimeOfDaySpeed;
                 if (TimeOfDay >= 24.0f) TimeOfDay -= 24.0f;
@@ -82,13 +82,13 @@ namespace Freefall.Components
 
             CloudTime += (float)Time.Delta * CloudSpeed;
 
-            // Update sun light
-            if (UseProceduralSky && ControlSunLight && SunLight != null)
-                UpdateSunLight();
+            UpdateSunLight();
         }
 
         private void UpdateSunLight()
         {
+            if (SunLight == null) return;
+
             // Calculate sun angle (0 at sunrise, PI at sunset)
             float sunAngle = (TimeOfDay / 24.0f) * MathF.PI * 2.0f - MathF.PI * 0.5f;
 
@@ -106,7 +106,7 @@ namespace Freefall.Components
             // Set directional light rotation using CreateWorld
             // Transform.Forward is what DirectionalLight uses as LightDirection
             // The shader already negates this (L = -LightDirection), so we pass the direction light is pointing (toward ground)
-            SunLight.Entity.Transform.Rotation = Quaternion.CreateFromRotationMatrix(Matrix4x4.CreateWorld(Vector3.Zero, lightDir, Vector3.UnitY));
+            SunLight.Transform.Rotation = Quaternion.CreateFromRotationMatrix(Matrix4x4.CreateWorld(Vector3.Zero, lightDir, Vector3.UnitY));
 
             // ── Three-state blend matching sky_common.fx GetSkyColor ──
             // Day: non-linear ramp (same pow(0.7) as shader)
@@ -152,22 +152,20 @@ namespace Freefall.Components
 
         public void Draw()
         {
+            if (Material == null || Mesh == null) return;
+
             var slot = Entity.Transform.TransformSlot;
 
             // Set sky parameters on the MaterialBlock
             Material.SetParameter("World", Entity.Transform.WorldMatrix);
-
-            if (UseProceduralSky)
-            {
-                Material.SetParameter("SunDirection", SunDirection);
-                Material.SetParameter("TimeOfDay", TimeOfDay);
-                Material.SetParameter("CloudCoverage", CloudCoverage);
-                Material.SetParameter("CloudTime", CloudTime);
-                Material.SetParameter("CloudSpeed", CloudSpeed);
-                Material.SetParameter("SunIntensity", SunIntensity);
-                Material.SetParameter("StarDensity", StarDensity);
-                Material.SetParameter("StarBrightness", StarBrightness);
-            }
+            Material.SetParameter("SunDirection", SunDirection);
+            Material.SetParameter("TimeOfDay", TimeOfDay);
+            Material.SetParameter("CloudCoverage", CloudCoverage);
+            Material.SetParameter("CloudTime", CloudTime);
+            Material.SetParameter("CloudSpeed", CloudSpeed);
+            Material.SetParameter("SunIntensity", SunIntensity);
+            Material.SetParameter("StarDensity", StarDensity);
+            Material.SetParameter("StarBrightness", StarBrightness);
 
             CommandBuffer.Enqueue(Mesh, Material, Params, slot);
         }

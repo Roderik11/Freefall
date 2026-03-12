@@ -187,6 +187,10 @@ namespace Freefall.Components
         private bool _bakedAlbedoDirty = true;
         private const int BakedAlbedoSize = 256;
 
+        // ───── Height Bake (GPU layer compositor) ─────────────────────────
+        private TerrainBaker _heightBaker;
+        private bool _heightBakeDirty = true;
+
         // ───── Lifecycle ──────────────────────────────────────────────────
 
         protected override void Awake()
@@ -229,6 +233,18 @@ namespace Freefall.Components
             if (material == null || material.Effect == null) return;
 
             int frameIndex = Engine.FrameIndex % FrameCount;
+
+            // GPU height layer bake (runs before any heightmap access)
+            if (_heightBakeDirty && Terrain.HeightLayers.Count > 0)
+            {
+                _heightBaker ??= new TerrainBaker();
+                CommandBuffer.Enqueue(RenderPass.Opaque, (list) =>
+                {
+                    _heightBaker.Bake(Terrain, list);
+                    _heightBakeDirty = false;
+                    _heightRangePyramidBuilt = false; // force rebuild with new heights
+                });
+            }
 
             // Set shared material params
             material.SetParameter("CameraPos", Camera.Main.Position);

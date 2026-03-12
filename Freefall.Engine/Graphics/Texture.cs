@@ -357,6 +357,21 @@ void CSCopySlice(uint3 id : SV_DispatchThreadID) {
 
         public Texture() { }
 
+        /// <summary>
+        /// Wrap an existing D3D12 resource + SRV into a Texture. Used by GPU bake pipelines
+        /// that create their own resources and need a Texture wrapper for the rendering pipeline.
+        /// </summary>
+        public static Texture WrapNative(ID3D12Resource resource, uint srvIndex)
+        {
+            var tex = new Texture();
+            tex._resource = resource;
+            tex.BindlessIndex = srvIndex;
+            tex.SrvCpuHandle = Engine.Device.GetCpuHandle(srvIndex);
+            tex.SrvHandle = Engine.Device.GetGpuHandle(srvIndex);
+            tex.MarkReady();
+            return tex;
+        }
+
         public static Texture CreateAsync(GraphicsDevice device, CpuTextureData cpuData)
         {
             var texture = new Texture();

@@ -8,8 +8,8 @@ namespace Freefall.Graphics
         Sky,
         Transparent,
         Light,
-        PostProcess,
         Forward,
+        PostProcess,
         Overlay,
         Debug
     }

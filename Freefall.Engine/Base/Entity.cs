@@ -1,19 +1,41 @@
 using System;
 using System.Collections.Generic;
+using System.Reflection;
 using System.Threading.Tasks;
 using Freefall.Components;
 
 namespace Freefall.Base
 {
-    public class Entity
+    public class Entity : IUniqueId
     {
+        private static readonly Dictionary<Type, Type> _cacheTypes = new();
         private readonly List<Component> _components = new List<Component>();
         public IReadOnlyList<Component> Components => _components;
 
+        private static Type GetCacheType(Type componentType)
+        {
+            if (!_cacheTypes.TryGetValue(componentType, out var cacheType))
+            {
+                cacheType = typeof(ComponentCache<>).MakeGenericType(componentType);
+                _cacheTypes[componentType] = cacheType;
+            }
+            return cacheType;
+        }
+
+        public int Id { get; } = IDGenerator.GetId();
+
+        public ulong UID { get; set; } = IDGenerator.GetUID();
         public string Name { get; set; } = "Entity";
         public Transform Transform { get; private set; }
+        [Reflection.DontSerialize]
         public bool Hidden { get; set; }
+        [Reflection.DontSerialize]
         public bool Expanded { get; set; }
+        [Reflection.DontSerialize]
+        public EntityFlags Flags { get; set; }
+
+        public bool DontDestroy => (Flags & EntityFlags.DontDestroy) != 0;
+        public bool HideAndDontSave => (Flags & EntityFlags.HideAndDontSave) != 0;
 
         public Entity() : this("Entity") { }
 
@@ -65,12 +87,32 @@ namespace Freefall.Base
             }
 
             // Invoke ComponentCache<T>.Add(this, component) via reflection
-            var componentType = component.GetType();
-            var cacheType = typeof(ComponentCache<>).MakeGenericType(componentType);
-            var addMethod = cacheType.GetMethod("Add", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static);
+            var cacheType = GetCacheType(component.GetType());
+            var addMethod = cacheType.GetMethod("Add", BindingFlags.Public | BindingFlags.Static);
             addMethod?.Invoke(null, [this, component]);
 
             return component;
+        }
+
+        /// <summary>
+        /// Destroy this entity: call Destroy() on all components,
+        /// unregister from ComponentCaches, remove from EntityManager.
+        /// </summary>
+        public void Destroy()
+        {
+            foreach (var component in _components)
+                component.Destroy();
+
+            // Unregister each component from its ComponentCache<T>
+            foreach (var component in _components)
+            {
+                var cacheType = GetCacheType(component.GetType());
+                var removeMethod = cacheType.GetMethod("Remove", BindingFlags.Public | BindingFlags.Static, [typeof(Entity)]);
+                removeMethod?.Invoke(null, [this]);
+            }
+
+            _components.Clear();
+            EntityManager.RemoveEntity(this);
         }
     }
 }

@@ -1,16 +1,17 @@
 using System;
 using System.ComponentModel;
 using Freefall.Components;
+using Freefall.Reflection;
 
 namespace Freefall.Base
 {
-    public abstract class Component : IInstanceId
+    public abstract class Component : IInstanceId, IUniqueId
     {
         private bool _awake;
 
-        private static volatile int _instanceCount;
-        private readonly int _instanceId = Interlocked.Increment(ref _instanceCount);
-        public int GetInstanceId() => _instanceId;
+        public int Id { get; } = IDGenerator.GetId();
+
+        public ulong UID { get; set; } = IDGenerator.GetUID();
 
         [Browsable(false)]
         public Entity? Entity { get; internal set; }

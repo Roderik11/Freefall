@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Text;
 using Freefall.Assets;
 using Freefall.Base;
@@ -11,8 +12,10 @@ namespace Freefall.Serialization
 {
     /// <summary>
     /// Loads .scene YAML files in apex-style multi-document format.
-    /// Two-phase loading: parse with deferred asset stubs, then resolve afterward.
-    /// This prevents nested LoadByGuid calls from corrupting the YAML parser state.
+    /// Three-phase loading:
+    ///   1. Parse YAML with deferred asset stubs (no LoadByGuid during parse)
+    ///   2. Build UID lookup tables and resolve entity/component references
+    ///   3. Resolve asset stubs via LoadByGuid
     /// </summary>
     public class SceneLoader
     {
@@ -41,8 +44,11 @@ namespace Freefall.Serialization
 
             // ── Phase 1: Parse with deferred asset loading ──
             // Asset fields get stub objects (Guid set, nothing else).
+            // Entity/Component ref fields collect UIDs into DeferredUniqueIdRefs.
             // No LoadByGuid calls during parse = no parser corruption.
             _serializer.DeferAssetLoading = true;
+            _serializer.DeferredUniqueIdRefs.Clear();
+
             List<object> objects;
             try
             {
@@ -76,12 +82,53 @@ namespace Freefall.Serialization
                 }
             }
 
-            // ── Phase 2: Resolve deferred Asset stubs ──
+            // ── Phase 2: Build UID table and resolve IUniqueId references ──
+            var uidLookup = new Dictionary<ulong, IUniqueId>();
+
+            foreach (var entity in entities)
+            {
+                if (entity.UID != 0)
+                    uidLookup.TryAdd(entity.UID, entity);
+
+                foreach (var component in entity.Components)
+                {
+                    if (component.UID != 0)
+                        uidLookup.TryAdd(component.UID, component);
+                }
+            }
+
+            // Resolve deferred IUniqueId refs (entities + components)
+            foreach (var deferred in _serializer.DeferredUniqueIdRefs)
+            {
+                if (uidLookup.TryGetValue(deferred.UID, out var resolved))
+                {
+                    try
+                    {
+                        deferred.Field.SetValue(deferred.Parent, resolved);
+                    }
+                    catch (Exception ex)
+                    {
+                        Debug.LogWarning("SceneLoader",
+                            $"UID ref resolve failed: UID {deferred.UID} on " +
+                            $"{deferred.Parent.GetType().Name}.{deferred.Field.Name}: {ex.Message}");
+                    }
+                }
+                else
+                {
+                    Debug.LogWarning("SceneLoader",
+                        $"UID ref not found: UID {deferred.UID} for " +
+                        $"{deferred.Parent.GetType().Name}.{deferred.Field.Name}");
+                }
+            }
+
+            _serializer.DeferredUniqueIdRefs.Clear();
+
+            // ── Phase 3: Resolve deferred Asset stubs ──
             // Now that parsing is done, resolve every Asset stub via LoadByGuid.
             if (Engine.Assets != null)
                 ResolveAssetStubs(entities);
 
-            Debug.Log($"[SceneLoader] Loaded {entities.Count} entities");
+            Debug.Log($"[SceneLoader] Loaded {entities.Count} entities ({uidLookup.Count} UIDs resolved)");
 
             return entities;
         }

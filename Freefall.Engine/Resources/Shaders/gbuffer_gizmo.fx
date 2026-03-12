@@ -60,7 +60,7 @@ VSOutput VS(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_InstanceI
     output.Position = mul(mul(worldPos, View), Projection);
     output.TransformSlot = desc.TransformSlot;
     output.MaterialID = desc.MaterialId;
-    output.MeshPartId = desc.CustomDataIdx;
+    output.MeshPartId = desc.MeshPartIdx;
     return output;
 }
 

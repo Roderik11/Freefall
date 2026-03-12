@@ -5,6 +5,7 @@ using System.ComponentModel;
 using System.Numerics;
 using System.Text;
 using Freefall.Assets;
+using Freefall.Base;
 using Freefall.Reflection;
 using LiteYaml;
 using LiteYaml.Emitter;
@@ -42,7 +43,15 @@ namespace Freefall.Serialization
             public Type AssetType;
         }
 
+        public struct DeferredUniqueIdRef
+        {
+            public object Parent;
+            public Field Field;
+            public ulong UID;
+        }
+
         internal List<DeferredAssetRef> DeferredRefs { get; } = new();
+        internal List<DeferredUniqueIdRef> DeferredUniqueIdRefs { get; } = new();
 
         /// <summary>
         /// Deserialize YAML and return both the result object and any
@@ -69,6 +78,8 @@ namespace Freefall.Serialization
             _converters.Add(typeof(Vector4).FullName!, new Vector4YAMLConverter());
             _converters.Add(typeof(Quaternion).FullName!, new QuaternionYAMLConverter());
             _converters.Add(typeof(Vortice.Mathematics.Color3).FullName!, new Color3YAMLConverter());
+            _converters.Add(typeof(ulong).FullName!, new ULongYAMLConverter());
+            _converters.Add(typeof(uint).FullName!, new UIntYAMLConverter());
         }
 
         /// <summary>
@@ -158,6 +169,18 @@ namespace Freefall.Serialization
 
             var valueType = value.GetType();
 
+            // ── IUniqueId reference → UID ──
+            if (typeof(IUniqueId).IsAssignableFrom(field.Type))
+            {
+                if (value is IUniqueId component)
+                {
+                    emitter.WriteString(field.Name);
+                    var bytes = Encoding.UTF8.GetBytes(component.UID.ToString());
+                    emitter.WriteScalar(bytes);
+                }
+                return;
+            }
+
             // ── Asset reference → GUID ──
             if (typeof(Asset).IsAssignableFrom(field.Type))
             {
@@ -219,6 +242,20 @@ namespace Freefall.Serialization
 
             var eltype = GetElementType(field.Type);
             if (eltype == null) return;
+
+            // ── IUniqueId reference → UID ──
+            if (typeof(IUniqueId).IsAssignableFrom(eltype))
+            {
+                emitter.WriteString(field.Name);
+                emitter.BeginSequence();
+                for (int i = 0; i < list.Count; i++)
+                {
+                    var item = list[i] as IUniqueId;
+                    emitter.WriteString(item?.UID.ToString() ?? "");
+                }
+                emitter.EndSequence();
+                return;
+            }
 
             // List of assets → list of GUIDs
             if (typeof(Asset).IsAssignableFrom(eltype))
@@ -335,55 +372,96 @@ namespace Freefall.Serialization
 
         /// <summary>
         /// Deserialize a multi-document YAML stream (e.g. a .scene file).
-        /// Splits by '---' document markers, then deserializes each block.
+        /// Single-pass parsing using LiteYaml's native multi-document support.
         /// </summary>
         public List<object> DeserializeAll(byte[] bytes)
         {
-            var text = Encoding.UTF8.GetString(bytes).TrimStart('\uFEFF');
-            var results = new List<object>();
-            var sb = new StringBuilder();
-
-            foreach (var rawLine in text.Split('\n'))
+            // Strip BOM if present
+            if (bytes.Length >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF)
             {
-                var line = rawLine.TrimEnd('\r');
-                if (line.StartsWith("---"))
+                var trimmed = new byte[bytes.Length - 3];
+                Array.Copy(bytes, 3, trimmed, 0, trimmed.Length);
+                bytes = trimmed;
+            }
+
+            var parser = YamlParser.FromBytes(bytes);
+            var results = new List<object>();
+
+            while (!parser.End)
+            {
+                // Skip to the next document start
+                if (parser.CurrentEventType == ParseEventType.StreamStart)
                 {
-                    if (sb.Length > 0)
+                    parser.Read();
+                    continue;
+                }
+
+                if (parser.CurrentEventType == ParseEventType.StreamEnd)
+                    break;
+
+                if (parser.CurrentEventType == ParseEventType.DocumentStart)
+                {
+                    parser.Read(); // consume DocumentStart
+
+                    if (parser.CurrentEventType == ParseEventType.MappingStart)
                     {
                         try
                         {
-                            // Prefix with document marker so VYaml sees a proper document
-                            var block = "---\n" + sb.ToString();
-                            var obj = Deserialize(block);
-                            if (obj != null) results.Add(obj);
+                            parser.Read(); // consume MappingStart
+                            var typeName = parser.ReadScalarAsString();
+                            var fullName = ExpandTypeName(typeName);
+                            var type = Reflector.GetType(fullName);
+
+                            if (type == null)
+                            {
+                                Debug.LogWarning("YAMLSerializer",
+                                    $"DeserializeAll: cannot resolve type '{typeName}' (expanded: '{fullName}')");
+                                // Skip rest of this document
+                                SkipToDocumentEnd(ref parser);
+                                continue;
+                            }
+
+                            var fields = Reflector.GetMapping(type);
+                            var instance = Activator.CreateInstance(type);
+
+                            while (parser.CurrentEventType != ParseEventType.MappingEnd && !parser.End)
+                                ReadNext(ref parser, instance, fields);
+
+                            if (parser.CurrentEventType == ParseEventType.MappingEnd)
+                                parser.Read(); // consume MappingEnd
+
+                            results.Add(instance);
                         }
                         catch (Exception ex)
                         {
-                            Debug.LogWarning("YAMLSerializer", $"DeserializeAll doc #{results.Count}: {ex.GetType().Name}: {ex.Message}");
+                            Debug.LogWarning("YAMLSerializer",
+                                $"DeserializeAll doc #{results.Count}: {ex.GetType().Name}: {ex.Message}");
+                            SkipToDocumentEnd(ref parser);
                         }
-                        sb.Clear();
+                    }
+                    else
+                    {
+                        // Empty document or unexpected structure, skip
+                        SkipToDocumentEnd(ref parser);
                     }
                     continue;
                 }
-                sb.Append(line).Append('\n');
-            }
 
-            // Flush last block
-            if (sb.Length > 0)
-            {
-                try
-                {
-                    var block = "---\n" + sb.ToString();
-                    var obj = Deserialize(block);
-                    if (obj != null) results.Add(obj);
-                }
-                catch (Exception ex)
-                {
-                    Debug.LogWarning("YAMLSerializer", $"DeserializeAll final doc: {ex.GetType().Name}: {ex.Message}");
-                }
+                // Skip anything else (DocumentEnd, etc.)
+                parser.Read();
             }
 
             return results;
+        }
+
+        private static void SkipToDocumentEnd(ref YamlParser parser)
+        {
+            while (!parser.End &&
+                   parser.CurrentEventType != ParseEventType.DocumentStart &&
+                   parser.CurrentEventType != ParseEventType.StreamEnd)
+            {
+                parser.Read();
+            }
         }
 
         private object DeserializeNested(ref YamlParser parser, Type type)
@@ -401,7 +479,8 @@ namespace Freefall.Serialization
             }
 
             var fields = Reflector.GetMapping(type);
-            var value = Activator.CreateInstance(type);
+            // Defer instantiation — type may be abstract, resolved by type discriminator below
+            object value = type.IsAbstract || type.IsInterface ? null : Activator.CreateInstance(type);
 
             while (parser.CurrentEventType != ParseEventType.MappingEnd)
             {
@@ -442,6 +521,9 @@ namespace Freefall.Serialization
                         continue;
                     }
 
+                    // Lazy instantiation for non-discriminated concrete types
+                    value ??= Activator.CreateInstance(type);
+
                     // Regular field name — process value using ReadNode logic
                     if (key != null && fields.TryGetValue(key, out var field))
                     {
@@ -455,6 +537,7 @@ namespace Freefall.Serialization
                 }
 
                 // Fallback
+                value ??= Activator.CreateInstance(type);
                 ReadNext(ref parser, value, fields);
             }
 
@@ -543,6 +626,29 @@ namespace Freefall.Serialization
                 return;
             }
 
+            // ── IUniqueId reference (Entity/Component) → deferred UID ──
+            if (typeof(IUniqueId).IsAssignableFrom(field.Type))
+            {
+                if (parser.CurrentEventType == ParseEventType.Scalar)
+                {
+                    var uidStr = parser.ReadScalarAsString();
+                    if (ulong.TryParse(uidStr, out var uid) && uid != 0)
+                    {
+                        DeferredUniqueIdRefs.Add(new DeferredUniqueIdRef
+                        {
+                            Parent = parent,
+                            Field = field,
+                            UID = uid,
+                        });
+                    }
+                }
+                else
+                {
+                    parser.SkipCurrentNode();
+                }
+                return;
+            }
+
             // ── Asset reference (GUID string or {guid: xxx}) ──
             if (typeof(Asset).IsAssignableFrom(field.Type))
             {
@@ -620,15 +726,30 @@ namespace Freefall.Serialization
             if (_converters.TryGetValue(eltype.FullName!, out var conv))
             {
                 parser.Read(); // SequenceStart
-                var list = (field.GetValue(parent) ?? Activator.CreateInstance(type)) as IList;
 
+                // Arrays don't support IList.Clear()/Add(), use temp list
+                var temp = new List<object>();
                 while (parser.CurrentEventType != ParseEventType.SequenceEnd)
                 {
-                    var value = conv.Read(ref parser);
-                    list!.Add(value);
+                    temp.Add(conv.Read(ref parser));
                 }
 
-                field.SetValue(parent, list);
+                parser.Read(); // consume SequenceEnd
+
+                if (field.Type.IsArray)
+                {
+                    var arr = Array.CreateInstance(eltype, temp.Count);
+                    for (int i = 0; i < temp.Count; i++)
+                        arr.SetValue(Convert.ChangeType(temp[i], eltype), i);
+                    field.SetValue(parent, arr);
+                }
+                else
+                {
+                    var list = (field.GetValue(parent) ?? Activator.CreateInstance(type)) as IList;
+                    list!.Clear();
+                    foreach (var v in temp) list.Add(v);
+                    field.SetValue(parent, list);
+                }
                 return;
             }
 
@@ -640,6 +761,7 @@ namespace Freefall.Serialization
             }
 
             var newlist = (field.GetValue(parent) ?? Activator.CreateInstance(type)) as IList;
+            newlist!.Clear();
 
             parser.Read(); // consume SequenceStart
 

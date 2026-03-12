@@ -79,12 +79,19 @@ namespace Freefall.Graphics
         private bool _isFullscreenPass = false; // Skip wireframe for post-process passes
         private Dictionary<string, ConstantBuffer> _constantBuffers = new();
         private Dictionary<string, Texture> _textures = new();
+        private List<TextureEffectParameter> _textureParameters = new();
         
         /// <summary>
         /// Read-only access to texture bindings (slot name → Texture).
         /// Used by MaterialSerializer for YAML serialization.
         /// </summary>
         public IReadOnlyDictionary<string, Texture> Textures => _textures;
+        
+        /// <summary>
+        /// Texture parameters for inspector binding. Each maps to a MaterialData slot
+        /// and writes back through SetTexture() when applied.
+        /// </summary>
+        public IReadOnlyList<TextureEffectParameter> TextureParameters => _textureParameters;
         
         // Material ID indirection system
         public int MaterialID { get; private set; }
@@ -193,6 +200,18 @@ namespace Freefall.Graphics
                 MaterialID = _nextMaterialID++;
                 _allMaterials.Add(new MaterialData()); // Will be populated by SetTexture
                 _materialsBufferDirty = true;
+            }
+            
+            // Create texture parameters for each MaterialData slot
+            foreach (var slotName in MaterialData.TextureSlotNames)
+            {
+                _textures.TryGetValue(slotName, out var tex);
+                _textureParameters.Add(new TextureEffectParameter
+                {
+                    Name = slotName,
+                    Material = this,
+                    Value = tex
+                });
             }
             
             var renderState = effect.RenderState;
@@ -526,6 +545,12 @@ namespace Freefall.Graphics
             if (texture == null) return;
             _textures[name] = texture;
             UpdateMaterialData(name, texture.BindlessIndex);
+            
+            // Keep TextureEffectParameter in sync (for inspector display)
+            foreach (var tp in _textureParameters)
+            {
+                if (tp.Name == name) { tp.Value = texture; break; }
+            }
         }
 
         private Dictionary<string, uint> _bindlessIndices = new();

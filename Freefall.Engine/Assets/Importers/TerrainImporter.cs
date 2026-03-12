@@ -119,13 +119,17 @@ namespace Freefall.Assets.Importers
         }
 
         /// <summary>
-        /// Extract the Heightmap GUID from the terrain YAML.
-        /// Looks for a line like "Heightmap: abc123def456" (the GUID value).
+        /// Extract the heightmap source GUID from the terrain YAML.
+        /// Looks for ImportHeightLayer Source first, then falls back to legacy "Heightmap:" field.
         /// </summary>
         private static string ExtractHeightmapGuid(string yaml)
         {
-            // Match "Heightmap: <guid>" where guid is a hex string
-            var match = Regex.Match(yaml, @"Heightmap:\s*([0-9a-fA-F]{32})", RegexOptions.Multiline);
+            // Primary: Source inside ImportHeightLayer
+            var match = Regex.Match(yaml, @"ImportHeightLayer:.*?Source:\s*([0-9a-fA-F]{32})", RegexOptions.Singleline);
+            if (match.Success) return match.Groups[1].Value;
+
+            // Fallback: legacy Heightmap field
+            match = Regex.Match(yaml, @"Heightmap:\s*([0-9a-fA-F]{32})", RegexOptions.Multiline);
             return match.Success ? match.Groups[1].Value : null;
         }
     }

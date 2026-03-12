@@ -372,7 +372,6 @@ namespace Freefall.Graphics
             cmd.SetScissorRect(new RectI(0, 0, Width, Height));
 
             cmd.ClearRenderTargetView(BackBufferTarget, new Color4(0.39f, 0.58f, 0.93f, 1.0f));
-            // cmd.ClearDepthStencilView(DepthBufferTarget, ClearFlags.Depth, 1.0f, 0); // Need to expose this in CommandList if not already
         }
         
         public void Render(Camera camera)

@@ -117,6 +117,29 @@ namespace Freefall.Graphics
         protected override void Commit() => ConstantBuffer.SetParameter(Name, Value);
     }
 
+    /// <summary>
+    /// EffectParameter for texture slots. Setting Value calls Material.SetTexture()
+    /// to update the bindless MaterialData buffer on the GPU.
+    /// </summary>
+    public class TextureEffectParameter
+    {
+        public string Name { get; set; }
+        public Material Material { get; set; }
+
+        private Texture _value;
+
+        public Texture Value
+        {
+            get => _value;
+            set
+            {
+                if (_value == value) return;
+                _value = value;
+                Material?.SetTexture(Name, value);
+            }
+        }
+    }
+
     public class ConstantBuffer : IDisposable
     {
         private ID3D12Resource[] _buffers;

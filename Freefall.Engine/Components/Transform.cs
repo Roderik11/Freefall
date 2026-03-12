@@ -167,6 +167,15 @@ namespace Freefall.Components
         }
         private int _transformSlot = -1;
 
+        public override void Destroy()
+        {
+            if (_transformSlot >= 0 && TransformBuffer.Instance != null)
+            {
+                TransformBuffer.Instance.ReleaseSlot(_transformSlot);
+                _transformSlot = -1;
+            }
+        }
+
         public void Set(Vector3 position, Quaternion rotation)
         {
             Position = position;

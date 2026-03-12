@@ -168,4 +168,25 @@ namespace Freefall.Serialization
             emitter.EndSequence();
         }
     }
+
+    public class ULongYAMLConverter : IYAMLConverter
+    {
+        public object Read(ref YamlParser parser)
+        {
+            var str = parser.ReadScalarAsString();
+            return ulong.TryParse(str, out var v) ? v : 0UL;
+        }
+
+        public void Write(object value, ref Utf8YamlEmitter emitter)
+        {
+            var bytes = System.Text.Encoding.UTF8.GetBytes(((ulong)value).ToString());
+            emitter.WriteScalar(bytes);
+        }
+    }
+
+    public class UIntYAMLConverter : IYAMLConverter
+    {
+        public object Read(ref YamlParser parser) => (uint)parser.ReadScalarAsInt32();
+        public void Write(object value, ref Utf8YamlEmitter emitter) => emitter.WriteInt32((int)(uint)value);
+    }
 }

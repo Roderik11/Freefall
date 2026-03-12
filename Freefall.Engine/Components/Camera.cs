@@ -166,6 +166,38 @@ namespace Freefall.Components
         public Matrix4x4 ViewProjection => View * Projection;
 
         /// <summary>
+        /// Build a world-space ray from the current mouse position through the camera.
+        /// Uses Input.MousePosition and Target viewport dimensions.
+        /// </summary>
+        public Ray MouseRay()
+        {
+            int vpW = Target?.Width ?? 1;
+            int vpH = Target?.Height ?? 1;
+
+            // Mouse position (screen-space, relative to window)
+            var mp = Input.MousePosition;
+
+            // Convert to NDC: x ∈ [-1,1], y ∈ [-1,1] (Y flipped: top=-1 in clip space)
+            float ndcX = (2f * mp.X / vpW) - 1f;
+            float ndcY = 1f - (2f * mp.Y / vpH);
+
+            // Unproject near and far points through inverse ViewProjection
+            var vp = View * Projection;
+            Matrix4x4.Invert(vp, out var vpInv);
+
+            var nearNdc = new Vector3(ndcX, ndcY, 1f);   // Reverse-Z: near = 1
+            var farNdc  = new Vector3(ndcX, ndcY, 0f);   // Reverse-Z: far  = 0
+
+            var nearW = Vector4.Transform(new Vector4(nearNdc, 1f), vpInv);
+            var farW  = Vector4.Transform(new Vector4(farNdc, 1f), vpInv);
+
+            var near = new Vector3(nearW.X, nearW.Y, nearW.Z) / nearW.W;
+            var far  = new Vector3(farW.X, farW.Y, farW.Z) / farW.W;
+
+            return new Ray(near, Vector3.Normalize(far - near));
+        }
+
+        /// <summary>
         /// Get frustum planes for GPU culling.
         /// Returns 6 planes as Vector4 (xyz=normal, w=distance).
         /// </summary>

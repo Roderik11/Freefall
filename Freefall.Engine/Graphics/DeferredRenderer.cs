@@ -266,11 +266,11 @@ namespace Freefall.Graphics
             
             sw.Stop();
             
-            // Log every 60 frames
-            if (Engine.FrameIndex % 60 == 0)
-            {
-              //  Debug.Log($"[DeferredRenderer] Total: {sw.Elapsed.TotalMilliseconds:F2}ms | GBuffer: {gbufferTime.Elapsed.TotalMilliseconds:F2}ms | Light: {lightTime.Elapsed.TotalMilliseconds:F2}ms | Compose: {composeTime.Elapsed.TotalMilliseconds:F2}ms | Blit: {blitTime.Elapsed.TotalMilliseconds:F2}ms");
-            }
+            // Per-pass timing (uncomment for profiling)
+            //if (Engine.FrameIndex % 60 == 0)
+            //{
+            //  Debug.Log($"[DeferredRenderer] Total: {sw.Elapsed.TotalMilliseconds:F2}ms | GBuffer: {gbufferTime.Elapsed.TotalMilliseconds:F2}ms | Light: {lightTime.Elapsed.TotalMilliseconds:F2}ms | Compose: {composeTime.Elapsed.TotalMilliseconds:F2}ms | Fwd: {forwardTime.Elapsed.TotalMilliseconds:F2}ms | Blit: {blitTime.Elapsed.TotalMilliseconds:F2}ms");
+            //}
             
             // Restore previous Current (stack-safe for nested viewports)
             Current = previousCurrent;
@@ -292,7 +292,7 @@ namespace Freefall.Graphics
              Transition(list, Normals.Native, fromState, ResourceStates.RenderTarget);
              Transition(list, Data.Native, fromState, ResourceStates.RenderTarget);
              Transition(list, DepthGBuffer.Native, fromState, ResourceStates.RenderTarget);
-             Transition(list, EntityIdBuffer.Native, fromState, ResourceStates.RenderTarget);
+             if (Engine.IsEditor) Transition(list, EntityIdBuffer.Native, fromState, ResourceStates.RenderTarget);
              Transition(list, Depth.Native, depthFromState, ResourceStates.DepthWrite);
 
              // Set shader parameters globally on all effects (Apex pattern)
@@ -312,20 +312,31 @@ namespace Freefall.Graphics
 
              // === GBuffer Draw ===
              // Cache GBuffer RTV handles to avoid per-frame allocation
-             _cachedGBufferRtvHandles ??= new CpuDescriptorHandle[5];
-             // Update handles in case resize created new resources
-             _cachedGBufferRtvHandles[0] = Albedo.RtvHandle;
-             _cachedGBufferRtvHandles[1] = Normals.RtvHandle;
-             _cachedGBufferRtvHandles[2] = Data.RtvHandle;
-             _cachedGBufferRtvHandles[3] = DepthGBuffer.RtvHandle;
-             _cachedGBufferRtvHandles[4] = EntityIdBuffer.RtvHandle;
-             list.OMSetRenderTargets(_cachedGBufferRtvHandles, Depth.DsvHandle);
+             if (Engine.IsEditor)
+             {
+                 _cachedGBufferRtvHandles ??= new CpuDescriptorHandle[5];
+                 _cachedGBufferRtvHandles[0] = Albedo.RtvHandle;
+                 _cachedGBufferRtvHandles[1] = Normals.RtvHandle;
+                 _cachedGBufferRtvHandles[2] = Data.RtvHandle;
+                 _cachedGBufferRtvHandles[3] = DepthGBuffer.RtvHandle;
+                 _cachedGBufferRtvHandles[4] = EntityIdBuffer.RtvHandle;
+                 list.OMSetRenderTargets(_cachedGBufferRtvHandles, Depth.DsvHandle);
+             }
+             else
+             {
+                 _cachedGBufferRtvHandles ??= new CpuDescriptorHandle[4];
+                 _cachedGBufferRtvHandles[0] = Albedo.RtvHandle;
+                 _cachedGBufferRtvHandles[1] = Normals.RtvHandle;
+                 _cachedGBufferRtvHandles[2] = Data.RtvHandle;
+                 _cachedGBufferRtvHandles[3] = DepthGBuffer.RtvHandle;
+                 list.OMSetRenderTargets(_cachedGBufferRtvHandles, Depth.DsvHandle);
+             }
              
              list.ClearRenderTargetView(Albedo.RtvHandle, new Color4(0,0,0,0));
              list.ClearRenderTargetView(Normals.RtvHandle, new Color4(0,0,0,0));
              list.ClearRenderTargetView(Data.RtvHandle, new Color4(0,0,0,0));
              list.ClearRenderTargetView(DepthGBuffer.RtvHandle, new Color4(0,0,0,0));
-             list.ClearRenderTargetView(EntityIdBuffer.RtvHandle, new Color4(0,0,0,0));
+             if (Engine.IsEditor) list.ClearRenderTargetView(EntityIdBuffer.RtvHandle, new Color4(0,0,0,0));
              list.ClearDepthStencilView(Depth.DsvHandle, ClearFlags.Depth, 0.0f, 0); // Reverse depth: far=0
 
              // Viewport
@@ -545,39 +556,67 @@ namespace Freefall.Graphics
              // Transition depth back to DepthWrite so forward objects can depth-test.
              Transition(list, Depth.Native, ResourceStates.PixelShaderResource, ResourceStates.DepthWrite);
 
-             // Bind Composite + EntityIdBuffer as render targets (gizmo shader writes entity ID to RT1)
-             // EntityIdBuffer is still in RenderTarget state from FillGBuffer.
-             list.OMSetRenderTargets(new[] { Composite.RtvHandle, EntityIdBuffer.RtvHandle }, Depth.DsvHandle);
+             // Bind render targets for forward pass
+             if (Engine.IsEditor)
+                 list.OMSetRenderTargets(new[] { Composite.RtvHandle, EntityIdBuffer.RtvHandle }, Depth.DsvHandle);
+             else
+                 list.OMSetRenderTargets(Composite.RtvHandle, Depth.DsvHandle);
              list.RSSetViewport(new Viewport(0, 0, Composite.Native.Description.Width, Composite.Native.Description.Height));
              list.RSSetScissorRect(new RectI(0, 0, (int)Composite.Native.Description.Width, (int)Composite.Native.Description.Height));
 
              // Execute forward pass draws (ocean, gizmos, etc.)
              CommandBuffer.Execute(RenderPass.Forward, list, Engine.Device);
 
-             // Entity ID readback: copy 1x1 pixel after both Opaque + Forward have written
-             if (_pickRequestX >= 0 && _entityIdReadback != null)
+             // Entity ID readback (editor only)
+             if (Engine.IsEditor)
              {
-                 Transition(list, EntityIdBuffer.Native, ResourceStates.RenderTarget, ResourceStates.CopySource);
-                 var src = new TextureCopyLocation(EntityIdBuffer.Native, 0);
-                 var dst = new TextureCopyLocation(_entityIdReadback.Native, new PlacedSubresourceFootPrint
+                 // Restore Composite + EntityIdBuffer for entity ID readback
+                 list.OMSetRenderTargets(new[] { Composite.RtvHandle, EntityIdBuffer.RtvHandle }, Depth.DsvHandle);
+
+                 if (_pickRequestX >= 0 && _entityIdReadback != null)
                  {
-                     Offset = 0,
-                     Footprint = new SubresourceFootPrint(Format.R32_UInt, 1, 1, 1, 256)
-                 });
-                 list.CopyTextureRegion(dst, 0, 0, 0, src, new Vortice.Mathematics.Box(_pickRequestX, _pickRequestY, 0, _pickRequestX + 1, _pickRequestY + 1, 1));
-                 Transition(list, EntityIdBuffer.Native, ResourceStates.CopySource, ResourceStates.PixelShaderResource);
-                 _pickCopyPending = true;
-                 _pickRequestX = -1;
-             }
-             else
-             {
-                 Transition(list, EntityIdBuffer.Native, ResourceStates.RenderTarget, ResourceStates.PixelShaderResource);
+                     Transition(list, EntityIdBuffer.Native, ResourceStates.RenderTarget, ResourceStates.CopySource);
+                     var src = new TextureCopyLocation(EntityIdBuffer.Native, 0);
+                     var dst = new TextureCopyLocation(_entityIdReadback.Native, new PlacedSubresourceFootPrint
+                     {
+                         Offset = 0,
+                         Footprint = new SubresourceFootPrint(Format.R32_UInt, 1, 1, 1, 256)
+                     });
+                     list.CopyTextureRegion(dst, 0, 0, 0, src, new Vortice.Mathematics.Box(_pickRequestX, _pickRequestY, 0, _pickRequestX + 1, _pickRequestY + 1, 1));
+                     Transition(list, EntityIdBuffer.Native, ResourceStates.CopySource, ResourceStates.PixelShaderResource);
+                     _pickCopyPending = true;
+                     _pickRequestX = -1;
+                 }
+                 else
+                 {
+                     Transition(list, EntityIdBuffer.Native, ResourceStates.RenderTarget, ResourceStates.PixelShaderResource);
+                 }
              }
 
              // Transition Composite to PixelShaderResource for Blit
              Transition(list, Composite.Native, ResourceStates.RenderTarget, ResourceStates.PixelShaderResource);
-             // Depth stays in DepthWrite — will be transitioned at start of next frame
+             // Depth for PostProcess reads
              Transition(list, Depth.Native, ResourceStates.DepthWrite, ResourceStates.PixelShaderResource);
+
+             // PostProcess pass — only do expensive snapshot copy + transitions if commands are queued
+             if (CommandBuffer.HasPendingCommands(RenderPass.PostProcess))
+             {
+                 // Snapshot composite for PostProcess manual blending
+                 Transition(list, Composite.Native, ResourceStates.PixelShaderResource, ResourceStates.CopySource);
+                 Transition(list, CompositeSnapshot.Native, ResourceStates.PixelShaderResource, ResourceStates.CopyDest);
+                 list.CopyResource(CompositeSnapshot.Native, Composite.Native);
+                 Transition(list, CompositeSnapshot.Native, ResourceStates.CopyDest, ResourceStates.PixelShaderResource);
+                 Transition(list, Composite.Native, ResourceStates.CopySource, ResourceStates.RenderTarget);
+
+                 // PostProcess reads CompositeSnapshot + Depth, writes to Composite
+                 list.OMSetRenderTargets(Composite.RtvHandle);
+                 list.RSSetViewport(new Viewport(0, 0, Composite.Native.Description.Width, Composite.Native.Description.Height));
+                 list.RSSetScissorRect(new RectI(0, 0, (int)Composite.Native.Description.Width, (int)Composite.Native.Description.Height));
+                 CommandBuffer.Execute(RenderPass.PostProcess, list, Engine.Device);
+
+                 // Transition Composite back to PixelShaderResource for Blit
+                 Transition(list, Composite.Native, ResourceStates.RenderTarget, ResourceStates.PixelShaderResource);
+             }
         }
         
 

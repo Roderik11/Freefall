@@ -14,8 +14,55 @@ namespace Freefall.Assets
     /// </summary>
     public class Terrain : Asset
     {
-        // ── Public resource data ──
-        public Texture Heightmap;
+        // ── Height data ──
+
+        /// <summary>
+        /// Resolution of the baked heightmap (power of 2). Configurable per-terrain.
+        /// </summary>
+        public int HeightmapResolution = 1024;
+
+        /// <summary>
+        /// Non-destructive height layer stack. Composited bottom-to-top via GPU bake.
+        /// </summary>
+        public List<HeightLayer> HeightLayers = new();
+
+        /// <summary>
+        /// GPU-baked heightmap texture (runtime only, regenerated from HeightLayers).
+        /// </summary>
+        [Reflection.DontSerialize]
+        [JsonIgnore]
+        public Texture BakedHeightmap;
+
+        /// <summary>
+        /// Stamp groups — decal-like height placements grouped by brush texture.
+        /// Baked after HeightLayers, one GPU pass per group.
+        /// </summary>
+        public List<StampGroup> StampGroups = new();
+
+        /// <summary>
+        /// The final heightmap: baked result if available, otherwise the first ImportHeightLayer source.
+        /// All consumers (renderer, physics, decorators) should read this.
+        /// </summary>
+        [Reflection.DontSerialize]
+        [JsonIgnore]
+        public Texture Heightmap
+        {
+            get
+            {
+                if (BakedHeightmap != null) return BakedHeightmap;
+
+                // Fallback: first enabled ImportHeightLayer source
+                foreach (var layer in HeightLayers)
+                {
+                    if (layer is ImportHeightLayer import && import.Enabled && import.Source != null)
+                        return import.Source;
+                }
+
+                return null;
+            }
+        }
+
+        // ── Terrain dimensions ──
         public Vector2 TerrainSize = new(1700, 1700);
         public float MaxHeight = 600;
         public List<TextureLayer> Layers;

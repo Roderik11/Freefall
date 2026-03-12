@@ -6,7 +6,12 @@ namespace Freefall.Base
 {
     public interface IInstanceId
     {
-        int GetInstanceId();
+        int Id { get; }
+    }
+
+    public interface IUniqueId
+    {
+        ulong UID { get; set; }
     }
 
     public class ComponentSet<T> where T : IInstanceId
@@ -38,7 +43,7 @@ namespace Freefall.Base
         {
             if (item == null) return false;
 
-            var index = item.GetInstanceId();
+            var index = item.Id;
             if (indices.TryGetValue(index, out _))
                 return false;
 
@@ -57,7 +62,7 @@ namespace Freefall.Base
         {
             if (item == null) return false;
 
-            var index = item.GetInstanceId();
+            var index = item.Id;
 
             if (indices.TryGetValue(index, out int id))
             {
@@ -80,7 +85,7 @@ namespace Freefall.Base
         {
             if (item == null) return false;
 
-            return indices.ContainsKey(item.GetInstanceId());
+            return indices.ContainsKey(item.Id);
         }
 
         void FastRemove(int index)
@@ -91,8 +96,8 @@ namespace Freefall.Base
             var a = list[index];
             var b = list[last];
 
-            indices[b.GetInstanceId()] = index;
-            indices.Remove(a.GetInstanceId());
+            indices[b.Id] = index;
+            indices.Remove(a.Id);
 
             list[index] = b;
             list[last] = a;

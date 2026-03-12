@@ -47,6 +47,9 @@ namespace Freefall.Reflection
             var nonserialized = GetAttribute<NonSerializedAttribute>();
             if (nonserialized != null) Ignored = true;
 
+            var dontSerialize = GetAttribute<DontSerializeAttribute>();
+            if (dontSerialize != null) Ignored = true;
+
             var browsable = GetAttribute<BrowsableAttribute>();
             if (browsable != null) Browsable = browsable.Browsable;
 

@@ -40,6 +40,12 @@ namespace Freefall
         
         public static bool Running => _isRunning;
 
+        /// <summary>
+        /// True when running inside the editor, false for standalone game.
+        /// Controls whether terrain loads editable layer data or just the pre-baked result.
+        /// </summary>
+        public static bool IsEditor { get; private set; }
+
         // Main-thread work queue for marshaling from background threads
         private sealed class WorkItem
         {
@@ -128,6 +134,7 @@ namespace Freefall
             _masteringVoice = AudioDevice.CreateMasteringVoice();
             Audio3D = new X3DAudio(Speakers.FrontLeft | Speakers.FrontRight);
             Debug.Log("[Engine] Initialized (editor mode)");
+            IsEditor = true;
             
             PhysicsWorld.Initialize();
         }

@@ -31,6 +31,28 @@ namespace Freefall.Base
         }
 
         /// <summary>
+        /// Remove all entities except those flagged DontDestroyOnLoad.
+        /// Call before loading a new scene.
+        /// </summary>
+        public static void ClearScene()
+        {
+            lock (_lock)
+            {
+                for (int i = _entities.Count - 1; i >= 0; i--)
+                {
+                    if (!_entities[i].DontDestroy)
+                        _entities[i].Destroy();
+                }
+
+                for (int i = _pendingAdditions.Count - 1; i >= 0; i--)
+                {
+                    if (!_pendingAdditions[i].DontDestroy)
+                        _pendingAdditions[i].Destroy();
+                }
+            }
+        }
+
+        /// <summary>
         /// Flush pending entity additions to the main list.
         /// Call this at a safe point between frames (before Update/Render).
         /// Calls Awake on all components of newly added entities.
