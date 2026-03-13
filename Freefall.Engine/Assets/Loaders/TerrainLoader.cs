@@ -221,7 +221,7 @@ namespace Freefall.Assets.Loaders
             {
                 if (layer is PaintHeightLayer paint && paint.ControlMap != null)
                 {
-                    var pixels = renderer.Baker.ReadbackControlMap();
+                    var pixels = renderer.Baker.ReadbackControlMap(TerrainBaker.ControlMapTarget.Height, 0);
                     if (pixels != null)
                     {
                         SaveDdsSubasset(paint.ControlMap.Guid, pixels);

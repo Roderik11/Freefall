@@ -203,37 +203,71 @@ namespace Freefall.Components
 
         /// <summary>
         /// Enqueues a brush stroke to be dispatched on the render thread.
-        /// Finds or creates the PaintHeightLayer automatically.
         /// Points are in terrain UV space [0..1].
         /// </summary>
         public void EnqueueBrushStroke(Vector2[] strokePoints, int pointCount,
                                        TerrainBaker.BrushMode mode, float strength,
                                        float radius, float falloff,
-                                       float targetHeight = 0)
+                                       float targetHeight = 0,
+                                       TerrainBaker.ControlMapTarget target = TerrainBaker.ControlMapTarget.Height,
+                                       int layerIndex = 0)
         {
             if (Terrain == null || pointCount == 0) return;
 
-            // Find or create PaintHeightLayer
-            var paintLayer = Terrain.HeightLayers.OfType<PaintHeightLayer>().FirstOrDefault();
-            if (paintLayer == null)
+            // Resolve target: determine the Action<Texture> setter
+            Action<Texture> setControlMap = null;
+            switch (target)
             {
-                paintLayer = new PaintHeightLayer();
-                Terrain.HeightLayers.Add(paintLayer);
+                case TerrainBaker.ControlMapTarget.Height:
+                {
+                    var paintLayer = Terrain.HeightLayers.OfType<PaintHeightLayer>().FirstOrDefault();
+                    if (paintLayer == null)
+                    {
+                        paintLayer = new PaintHeightLayer();
+                        Terrain.HeightLayers.Add(paintLayer);
+                    }
+                    var layer = paintLayer;
+                    setControlMap = tex => layer.ControlMap = tex;
+                    break;
+                }
+                case TerrainBaker.ControlMapTarget.Splatmap:
+                    if (Terrain.Layers != null && layerIndex >= 0 && layerIndex < Terrain.Layers.Count)
+                    {
+                        var layer = Terrain.Layers[layerIndex];
+                        setControlMap = tex => layer.ControlMap = tex;
+                    }
+                    break;
+                case TerrainBaker.ControlMapTarget.Density:
+                    if (Terrain.Decorations != null && layerIndex >= 0 && layerIndex < Terrain.Decorations.Count)
+                    {
+                        var deco = Terrain.Decorations[layerIndex];
+                        setControlMap = tex => deco.ControlMap = tex;
+                    }
+                    break;
             }
+
+            if (setControlMap == null) return;
 
             // Capture references for the lambda
             var terrain = Terrain;
             var baker = Baker;
             var pts = strokePoints;
             int count = pointCount;
+            var tgt = target;
+            int idx = layerIndex;
+            var setter = setControlMap;
+            bool isHeightTarget = target == TerrainBaker.ControlMapTarget.Height;
 
             CommandBuffer.Enqueue(RenderPass.Opaque, (list) =>
             {
-                baker.PaintBrush(terrain, paintLayer, list,
+                baker.PaintBrush(terrain, tgt, idx, setter, list,
                                  pts, count, mode, strength,
                                  radius, falloff, targetHeight);
-                _heightBakeDirty = true;
-                _heightRangePyramidBuilt = false;
+                if (isHeightTarget)
+                {
+                    _heightBakeDirty = true;
+                    _heightRangePyramidBuilt = false;
+                }
             });
         }
 
@@ -290,7 +324,10 @@ namespace Freefall.Components
                 {
                     if (layer is PaintHeightLayer paint && paint.PendingControlMapBytes != null)
                     {
-                        _heightBaker.UploadControlMap(paint.PendingControlMapBytes, Terrain.HeightmapResolution, paint);
+                        var p = paint; // capture for lambda
+                        _heightBaker.UploadControlMap(TerrainBaker.ControlMapTarget.Height, 0,
+                            paint.PendingControlMapBytes, Terrain.HeightmapResolution,
+                            tex => p.ControlMap = tex);
                         paint.PendingControlMapBytes = null; // consumed
                     }
                 }

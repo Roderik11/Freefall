@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Numerics;
 using System.Runtime.InteropServices;
 
@@ -41,6 +42,9 @@ namespace Freefall.Assets
 
         /// <summary>Brush mode for CS_PaintBrush dispatch.</summary>
         public enum BrushMode : uint { Raise = 0, Lower = 1, Flatten = 2, Smooth = 3 }
+
+        /// <summary>Which ControlMap category to paint.</summary>
+        public enum ControlMapTarget { Height, Splatmap, Density }
 
         /// <summary>GPU struct matching HLSL StampData. Must be 32 bytes (8-float aligned).</summary>
         [StructLayout(LayoutKind.Sequential)]
@@ -214,21 +218,26 @@ namespace Freefall.Assets
             _currentResolution = resolution;
         }
 
-        // ── Brush Painting ────────────────────────────────────────────────
+        // ── Brush Painting (Multi-Target) ────────────────────────────────
 
-        // ControlMap UAV resources (R16_Float, created on first brush stroke)
-        private ID3D12Resource _controlMapTexture;
-        private uint _controlMapUAV;
-        private uint _controlMapSRV;
-        private int _controlMapResolution;
-        private bool _controlMapNeedsInitialClear = true;
+        /// <summary>GPU state for a single ControlMap target.</summary>
+        private struct ControlMapGPU
+        {
+            public ID3D12Resource Texture;
+            public uint UAV, SRV;
+            public int Resolution;
+            public bool NeedsInitialClear;
+        }
+
+        private readonly Dictionary<(ControlMapTarget, int), ControlMapGPU> _controlMaps = new();
 
         /// <summary>
-        /// Dispatches a brush stroke on the PaintHeightLayer's ControlMap.
-        /// Points are in terrain UV space [0..1]. Creates the ControlMap if needed.
-        /// Must be called on the render thread with an active command list.
+        /// Dispatches a brush stroke on any ControlMap target.
+        /// setControlMap is called to wire the resulting Texture back to the owner.
+        /// Points are in terrain UV space [0..1].
         /// </summary>
-        public void PaintBrush(Terrain terrain, PaintHeightLayer layer,
+        public void PaintBrush(Terrain terrain, ControlMapTarget target, int layerIndex,
+                               Action<Texture> setControlMap,
                                ID3D12GraphicsCommandList cmd,
                                Vector2[] strokePoints, int pointCount,
                                BrushMode mode, float strength,
@@ -239,7 +248,8 @@ namespace Freefall.Assets
 
             EnsureInitialized();
             int res = terrain.HeightmapResolution;
-            EnsureControlMap(layer, res);
+            var key = (target, layerIndex);
+            var gpu = EnsureControlMap(key, res, setControlMap);
 
             var device = Engine.Device;
             cmd.SetComputeRootSignature(device.GlobalRootSignature);
@@ -248,13 +258,13 @@ namespace Freefall.Assets
             uint groups = (uint)((res + 7) / 8);
 
             // Clear on first use
-            if (_controlMapNeedsInitialClear)
+            if (gpu.NeedsInitialClear)
             {
-                Debug.Log("[TerrainBaker] Clearing ControlMap (first use)");
-                _cs.SetPushConstant(_kernelClearDelta, "Output", _controlMapUAV);
+                _cs.SetPushConstant(_kernelClearDelta, "Output", gpu.UAV);
                 _cs.Dispatch(_kernelClearDelta, cmd, groups, groups);
-                cmd.ResourceBarrierUnorderedAccessView(_controlMapTexture);
-                _controlMapNeedsInitialClear = false;
+                cmd.ResourceBarrierUnorderedAccessView(gpu.Texture);
+                gpu.NeedsInitialClear = false;
+                _controlMaps[key] = gpu;
             }
 
             // Upload stroke points
@@ -272,90 +282,89 @@ namespace Freefall.Assets
             // Normalize target height
             float normalizedTarget = targetHeight / terrain.MaxHeight;
 
-            Debug.Log($"[TerrainBaker] PaintBrush: mode={mode} pts={pointCount} uvR={uvRadius:F4} str={strength} controlMapUAV={_controlMapUAV} heightSRV={_heightSRV}");
-
-            // Push constants (reusing existing PushConstants layout)
+            // Push constants
             _cs.SetPushConstant(_kernelPaintBrush, "Source", _heightSRV);  // Current baked heightmap for flatten/smooth
-            _cs.SetPushConstant(_kernelPaintBrush, "Output", _controlMapUAV);   // ControlMap UAV
+            _cs.SetPushConstant(_kernelPaintBrush, "Output", gpu.UAV);
             _cs.SetBuffer(_kernelPaintBrush, "StampBuf", _strokeBuffer);
             _cs.SetPushConstant(_kernelPaintBrush, "BlendMode", (uint)mode);
             _cs.SetParam(_kernelPaintBrush, "Opacity", strength);
             _cs.SetPushConstant(_kernelPaintBrush, "StampCount", (uint)pointCount);
 
-            // BrushParams cbuffer
             _cs.SetParam(_kernelPaintBrush, "BrushRadius", uvRadius);
             _cs.SetParam(_kernelPaintBrush, "BrushFalloff", falloff);
             _cs.SetParam(_kernelPaintBrush, "BrushTargetHeight", normalizedTarget);
 
             _cs.Dispatch(_kernelPaintBrush, cmd, groups, groups);
-            cmd.ResourceBarrierUnorderedAccessView(_controlMapTexture);
+            cmd.ResourceBarrierUnorderedAccessView(gpu.Texture);
         }
 
         /// <summary>
-        /// Clears the ControlMap to zero (removes all paint edits).
+        /// Clears a specific ControlMap to zero.
         /// </summary>
-        public void ClearControlMap(Terrain terrain, PaintHeightLayer layer, ID3D12GraphicsCommandList cmd)
+        public void ClearControlMap(ControlMapTarget target, int layerIndex, ID3D12GraphicsCommandList cmd, int resolution)
         {
-            if (_controlMapTexture == null) return;
+            if (!_controlMaps.TryGetValue((target, layerIndex), out var gpu)) return;
 
             EnsureInitialized();
             var device = Engine.Device;
             cmd.SetComputeRootSignature(device.GlobalRootSignature);
             cmd.SetDescriptorHeaps(1, new[] { device.SrvHeap });
 
-            int res = terrain.HeightmapResolution;
-            uint groups = (uint)((res + 7) / 8);
+            uint groups = (uint)((resolution + 7) / 8);
 
-            _cs.SetPushConstant(_kernelClearDelta, "Output", _controlMapUAV);
+            _cs.SetPushConstant(_kernelClearDelta, "Output", gpu.UAV);
             _cs.Dispatch(_kernelClearDelta, cmd, groups, groups);
-            cmd.ResourceBarrierUnorderedAccessView(_controlMapTexture);
+            cmd.ResourceBarrierUnorderedAccessView(gpu.Texture);
         }
 
         /// <summary>
-        /// Ensures a ControlMap R16_Float texture exists for the paint layer.
-        /// Creates the GPU resource + UAV/SRV on first call.
+        /// Ensures a ControlMap R16_Float GPU texture exists for the given key.
+        /// Creates the resource + UAV/SRV on first call.
         /// </summary>
-        private void EnsureControlMap(PaintHeightLayer layer, int resolution)
+        private ControlMapGPU EnsureControlMap((ControlMapTarget, int) key, int resolution, Action<Texture> setControlMap)
         {
-            if (_controlMapTexture != null && _controlMapResolution == resolution)
+            if (_controlMaps.TryGetValue(key, out var existing) && existing.Resolution == resolution)
             {
-                // Already created — just make sure layer has the reference
-                if (layer.ControlMap == null || layer.ControlMap.BindlessIndex != _controlMapSRV)
-                    layer.ControlMap = Texture.WrapNative(_controlMapTexture, _controlMapSRV);
-                return;
+                setControlMap?.Invoke(Texture.WrapNative(existing.Texture, existing.SRV));
+                return existing;
             }
 
-            _controlMapTexture?.Release();
+            existing.Texture?.Release();
 
             var device = Engine.Device;
-            _controlMapTexture = device.CreateTexture2D(
+            var gpu = new ControlMapGPU
+            {
+                Resolution = resolution,
+                NeedsInitialClear = true
+            };
+
+            gpu.Texture = device.CreateTexture2D(
                 Format.R16_Float, resolution, resolution, 1, 1,
                 ResourceFlags.AllowUnorderedAccess, ResourceStates.Common);
 
-            _controlMapUAV = device.AllocateBindlessIndex();
-            var uavDesc = new UnorderedAccessViewDescription
-            {
-                Format = Format.R16_Float,
-                ViewDimension = UnorderedAccessViewDimension.Texture2D,
-                Texture2D = new Texture2DUnorderedAccessView { MipSlice = 0 }
-            };
-            device.NativeDevice.CreateUnorderedAccessView(_controlMapTexture, null, uavDesc, device.GetCpuHandle(_controlMapUAV));
+            gpu.UAV = device.AllocateBindlessIndex();
+            device.NativeDevice.CreateUnorderedAccessView(gpu.Texture, null,
+                new UnorderedAccessViewDescription
+                {
+                    Format = Format.R16_Float,
+                    ViewDimension = UnorderedAccessViewDimension.Texture2D,
+                    Texture2D = new Texture2DUnorderedAccessView { MipSlice = 0 }
+                }, device.GetCpuHandle(gpu.UAV));
 
-            _controlMapSRV = device.AllocateBindlessIndex();
-            var srvDesc = new ShaderResourceViewDescription
-            {
-                Format = Format.R16_Float,
-                ViewDimension = ShaderResourceViewDimension.Texture2D,
-                Shader4ComponentMapping = ShaderComponentMapping.Default,
-                Texture2D = new Texture2DShaderResourceView { MostDetailedMip = 0, MipLevels = 1 }
-            };
-            device.NativeDevice.CreateShaderResourceView(_controlMapTexture, srvDesc, device.GetCpuHandle(_controlMapSRV));
+            gpu.SRV = device.AllocateBindlessIndex();
+            device.NativeDevice.CreateShaderResourceView(gpu.Texture,
+                new ShaderResourceViewDescription
+                {
+                    Format = Format.R16_Float,
+                    ViewDimension = ShaderResourceViewDimension.Texture2D,
+                    Shader4ComponentMapping = ShaderComponentMapping.Default,
+                    Texture2D = new Texture2DShaderResourceView { MostDetailedMip = 0, MipLevels = 1 }
+                }, device.GetCpuHandle(gpu.SRV));
 
-            _controlMapResolution = resolution;
-            layer.ControlMap = Texture.WrapNative(_controlMapTexture, _controlMapSRV);
+            _controlMaps[key] = gpu;
+            setControlMap?.Invoke(Texture.WrapNative(gpu.Texture, gpu.SRV));
 
-            // Clear the new texture
-            // Note: Cleared on next Bake since we might not have a cmd list here
+            return gpu;
         }
 
         private void EnsureStrokeBuffer(int requiredCount)
@@ -370,22 +379,20 @@ namespace Freefall.Assets
         // ── ControlMap Persistence ─────────────────────────────────────────
 
         /// <summary>
-        /// Reads back the ControlMap GPU texture to CPU memory as raw pixel bytes.
-        /// Returns null if no ControlMap has been created yet.
-        /// This is a synchronous GPU operation — call from the main thread only.
+        /// Reads back a specific ControlMap GPU texture to CPU memory as raw pixel bytes.
+        /// Returns null if the target doesn't exist.
         /// </summary>
-        public byte[] ReadbackControlMap()
+        public byte[] ReadbackControlMap(ControlMapTarget target, int layerIndex)
         {
-            if (_controlMapTexture == null || _controlMapResolution == 0)
+            if (!_controlMaps.TryGetValue((target, layerIndex), out var gpu) || gpu.Texture == null)
                 return null;
 
             var device = Engine.Device;
-            int res = _controlMapResolution;
+            int res = gpu.Resolution;
             int bytesPerPixel = 2; // R16_Float = 2 bytes
             int rowPitch = (res * bytesPerPixel + 255) & ~255; // 256-byte aligned
             int totalBytes = rowPitch * res;
 
-            // Create a readback heap resource
             var readbackResource = device.NativeDevice.CreateCommittedResource(
                 new HeapProperties(HeapType.Readback),
                 HeapFlags.None,
@@ -393,19 +400,16 @@ namespace Freefall.Assets
                 ResourceStates.CopyDest,
                 null);
 
-            // Create a Direct command allocator + list for barriers + copy
             var allocator = device.NativeDevice.CreateCommandAllocator(CommandListType.Direct);
             var cmdList = device.NativeDevice.CreateCommandList<ID3D12GraphicsCommandList>(
                 0, CommandListType.Direct, allocator, null);
 
             try
             {
-                // Transition control map texture to CopySource
-                cmdList.ResourceBarrierTransition(_controlMapTexture,
+                cmdList.ResourceBarrierTransition(gpu.Texture,
                     ResourceStates.Common, ResourceStates.CopySource);
 
-                // Copy texture to readback buffer
-                var src = new TextureCopyLocation(_controlMapTexture, 0);
+                var src = new TextureCopyLocation(gpu.Texture, 0);
                 var dst = new TextureCopyLocation(readbackResource, new PlacedSubresourceFootPrint
                 {
                     Offset = 0,
@@ -413,31 +417,24 @@ namespace Freefall.Assets
                 });
                 cmdList.CopyTextureRegion(dst, 0, 0, 0, src);
 
-                // Transition back to Common (UAV-compatible)
-                cmdList.ResourceBarrierTransition(_controlMapTexture,
+                cmdList.ResourceBarrierTransition(gpu.Texture,
                     ResourceStates.CopySource, ResourceStates.Common);
 
-                // Close, submit, and GPU-wait
                 cmdList.Close();
                 device.SubmitAndWait(cmdList);
 
-                // Read from the mapped readback buffer
                 unsafe
                 {
                     void* pData;
                     readbackResource.Map(0, null, &pData);
 
-                    // Copy rows, stripping alignment padding
                     int srcRowBytes = res * bytesPerPixel;
                     byte[] pixels = new byte[srcRowBytes * res];
                     var srcPtr = (byte*)pData;
                     for (int y = 0; y < res; y++)
-                    {
                         Marshal.Copy((IntPtr)(srcPtr + y * rowPitch), pixels, y * srcRowBytes, srcRowBytes);
-                    }
 
                     readbackResource.Unmap(0);
-
                     return pixels;
                 }
             }
@@ -450,27 +447,24 @@ namespace Freefall.Assets
         }
 
         /// <summary>
-        /// Uploads ControlMap pixel data (raw bytes from cache) to the GPU
-        /// and wires up the SRV so the bake shader can read it.
-        /// Creates the ControlMap texture if needed.
+        /// Uploads ControlMap pixel data (raw bytes from cache) to a specific target.
+        /// Creates the GPU texture if needed.
         /// </summary>
-        public void UploadControlMap(byte[] pixels, int resolution, PaintHeightLayer layer)
+        public void UploadControlMap(ControlMapTarget target, int layerIndex, byte[] pixels, int resolution, Action<Texture> setControlMap)
         {
             if (pixels == null || pixels.Length == 0) return;
 
             int res = resolution;
-            int bpp = 2; // R16_Float = 2 bytes per pixel
-
-            // Create the ControlMap GPU texture (UAV + SRV)
-            EnsureControlMap(layer, res);
-            _controlMapNeedsInitialClear = false; // we're uploading saved data, no clear needed
+            var key = (target, layerIndex);
+            var gpu = EnsureControlMap(key, res, setControlMap);
+            gpu.NeedsInitialClear = false;
+            _controlMaps[key] = gpu;
 
             var device = Engine.Device;
-            int bytesPerPixel = 2; // R16_Float
-            int rowPitch = (res * bytesPerPixel + 255) & ~255; // 256-byte aligned
+            int bytesPerPixel = 2;
+            int rowPitch = (res * bytesPerPixel + 255) & ~255;
             int totalBytes = rowPitch * res;
 
-            // Create upload heap resource
             var uploadResource = device.NativeDevice.CreateCommittedResource(
                 new HeapProperties(HeapType.Upload),
                 HeapFlags.None,
@@ -478,14 +472,12 @@ namespace Freefall.Assets
                 ResourceStates.GenericRead,
                 null);
 
-            // Create a Direct command allocator + list for barriers + copy
             var allocator = device.NativeDevice.CreateCommandAllocator(CommandListType.Direct);
             var cmdList = device.NativeDevice.CreateCommandList<ID3D12GraphicsCommandList>(
                 0, CommandListType.Direct, allocator, null);
 
             try
             {
-                // Fill upload buffer (with row pitch alignment padding)
                 unsafe
                 {
                     void* pData;
@@ -494,15 +486,12 @@ namespace Freefall.Assets
                     int srcRowBytes = res * bytesPerPixel;
                     var dstPtr = (byte*)pData;
                     for (int y = 0; y < res; y++)
-                    {
                         Marshal.Copy(pixels, y * srcRowBytes, (IntPtr)(dstPtr + y * rowPitch), srcRowBytes);
-                    }
 
                     uploadResource.Unmap(0);
                 }
 
-                // GPU copy: upload buffer → control map texture
-                cmdList.ResourceBarrierTransition(_controlMapTexture,
+                cmdList.ResourceBarrierTransition(gpu.Texture,
                     ResourceStates.Common, ResourceStates.CopyDest);
 
                 var src = new TextureCopyLocation(uploadResource, new PlacedSubresourceFootPrint
@@ -510,18 +499,16 @@ namespace Freefall.Assets
                     Offset = 0,
                     Footprint = new SubresourceFootPrint(Format.R16_Float, (uint)res, (uint)res, 1, (uint)rowPitch)
                 });
-                var dst = new TextureCopyLocation(_controlMapTexture, 0);
+                var dst = new TextureCopyLocation(gpu.Texture, 0);
                 cmdList.CopyTextureRegion(dst, 0, 0, 0, src);
 
-                // Transition back to Common (UAV-compatible)
-                cmdList.ResourceBarrierTransition(_controlMapTexture,
+                cmdList.ResourceBarrierTransition(gpu.Texture,
                     ResourceStates.CopyDest, ResourceStates.Common);
 
-                // Close, submit, and GPU-wait
                 cmdList.Close();
                 device.SubmitAndWait(cmdList);
 
-                Debug.Log($"[TerrainBaker] Uploaded ControlMap: {res}x{res} ({pixels.Length} bytes)");
+                Debug.Log($"[TerrainBaker] Uploaded ControlMap {target}[{layerIndex}]: {res}x{res} ({pixels.Length} bytes)");
             }
             finally
             {
@@ -534,7 +521,9 @@ namespace Freefall.Assets
         public void Dispose()
         {
             _heightTexture?.Release();
-            _controlMapTexture?.Release();
+            foreach (var gpu in _controlMaps.Values)
+                gpu.Texture?.Release();
+            _controlMaps.Clear();
             _stampBuffer?.Dispose();
             _strokeBuffer?.Dispose();
             _cs?.Dispose();
