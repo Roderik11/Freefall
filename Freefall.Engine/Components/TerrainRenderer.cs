@@ -372,10 +372,17 @@ namespace Freefall.Components
 
         private void LazyInitTextures()
         {
-            if (_texturesInitialized) return;
-            if (Terrain?.Layers == null || Terrain.Layers.Count == 0) return;
-            SetupLayerTiling();
-            _texturesInitialized = true;
+            if (_textureArraysDirty || !_texturesInitialized)
+            {
+                if (Terrain?.Layers == null || Terrain.Layers.Count == 0)
+                {
+                    if (!_texturesInitialized) return; // no layers yet on first init — skip
+                    // Layers removed — clear to fallbacks
+                }
+                SetupLayerTiling();
+                _texturesInitialized = true;
+                _textureArraysDirty = false;
+            }
         }
 
         public void Draw()
@@ -383,13 +390,6 @@ namespace Freefall.Components
             if (Camera.Main == null || Terrain == null || !_computeInitialized) return;
 
             LazyInitTextures();
-
-            // Rebuild texture arrays if layers changed
-            if (_textureArraysDirty)
-            {
-                SetupLayerTiling();
-                _textureArraysDirty = false;
-            }
 
             var material = Material;
             var heightmap = Terrain.Heightmap;
