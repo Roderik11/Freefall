@@ -13,7 +13,7 @@ namespace Freefall.Assets.Loaders
     /// Unpacks AssetDefinitionData (YAML) â†’ MaterialDefinition,
     /// then resolves Effect + Texture GUIDs into a live GPU Material.
     /// </summary>
-    [AssetLoader(typeof(Material))]
+    [AssetLoader(typeof(Material), ".mat")]
     public class MaterialLoader : IAssetLoader
     {
         private readonly AssetDefinitionPacker _packer = new();

@@ -100,58 +100,15 @@ bool IsFrustumVisible(float3 center, float radius)
     return true;
 }
 
-// Hi-Z occlusion test: project bounding sphere, pick mip, sample depth pyramid.
-// Returns true if the sphere is FULLY behind solid geometry (should be culled).
+// Hi-Z occlusion test for terrain patches.
+// DISABLED: Terrain is the primary scene occluder — it should not self-occlude.
+// Previous-frame Hi-Z causes temporal instability (checkerboard flicker) because
+// culled patches never write depth, creating an alternating visible/culled cycle.
+// Frustum culling + height-range CDLOD splits are sufficient for terrain LOD.
 bool IsTerrainOccluded(float3 worldCenter, float worldRadius)
 {
-    if (HiZSrvIdx == 0) return false; // Hi-Z disabled
-
-    // Project sphere center to clip space using previous-frame VP
-    float4 clipCenter = mul(float4(worldCenter, 1.0), OcclusionProjection);
-    float3 ndc = clipCenter.xyz / clipCenter.w;
-    float2 uv = ndc.xy * float2(0.5, -0.5) + 0.5;
-
-    // Off-screen center — can't test, assume visible
-    if (any(uv < 0.0) || any(uv > 1.0)) return false;
-
-    Texture2D<float> hiZ = ResourceDescriptorHeap[HiZSrvIdx];
-
-    float w, h, levels;
-    hiZ.GetDimensions(0, w, h, levels);
-    float2 mip0Size = float2(w, h);
-
-    // Project sphere radius to screen pixels for mip selection
-    float projScale = OcclusionProjection._m11;
-    projScale = abs(projScale) < 0.001 ? 1.0 : projScale;
-    float projRadius = (worldRadius * projScale) / clipCenter.w;
-    float screenRadius = projRadius * mip0Size.y * 0.5;
-
-    // Pick mip where sphere covers ~2 texels (conservative)
-    float mipLevel = ceil(log2(max(screenRadius * 2.0, 1.0)));
-    mipLevel = min(mipLevel, levels - 1.0f);
-
-    uint mip = (uint)mipLevel;
-    float2 mipSize = max(float2(1,1), mip0Size / (float)(1u << mip));
-
-    // 4-tap sampling for stability
-    float2 texCoordFloat = uv * mipSize - 0.5;
-    int2 baseCoord = int2(texCoordFloat);
-    int2 maxCoord = int2(mipSize) - 1;
-
-    float d0 = hiZ.Load(int3(clamp(baseCoord,              int2(0,0), maxCoord), mip));
-    float d1 = hiZ.Load(int3(clamp(baseCoord + int2(1,0),  int2(0,0), maxCoord), mip));
-    float d2 = hiZ.Load(int3(clamp(baseCoord + int2(0,1),  int2(0,0), maxCoord), mip));
-    float d3 = hiZ.Load(int3(clamp(baseCoord + int2(1,1),  int2(0,0), maxCoord), mip));
-
-    // Conservative: take MAX depth of footprint (farthest view-space Z)
-    // View-space Z (Position.w) is NOT affected by reverse-Z — larger Z = farther.
-    float sampledDepth = max(max(d0, d1), max(d2, d3));
-
-    // Use sphere's nearest point to camera (clip.w - radius)
-    float sphereNearestDepth = clipCenter.w - worldRadius;
-    return sphereNearestDepth > sampledDepth; // sphere farther than farthest depth → occluded
+    return false;
 }
-
 
 // Compute the flat index where a given depth level starts in the complete quadtree.
 // Level L starts at (4^L - 1) / 3

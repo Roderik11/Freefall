@@ -15,7 +15,7 @@ namespace Freefall.Assets.Loaders
     /// then resolves all GUID references (Mesh, Material, Texture) via AssetManager.
     /// Loads pre-cooked PhysX TriangleMesh if available.
     /// </summary>
-    [AssetLoader(typeof(StaticMesh))]
+    [AssetLoader(typeof(StaticMesh), ".staticmesh")]
     public class StaticMeshLoader : IAssetLoader
     {
         private readonly AssetDefinitionPacker _packer = new();

@@ -15,7 +15,7 @@ namespace Freefall.Assets.Loaders
     ///       resolves GUID references, loads PhysX HeightField and ControlMap subassets.
     /// Save: writes YAML + reads back all ControlMap GPU data to cache.
     /// </summary>
-    [AssetLoader(typeof(Terrain))]
+    [AssetLoader(typeof(Terrain), ".terrain")]
     public class TerrainLoader : IAssetLoader
     {
         private readonly AssetDefinitionPacker _packer = new();
@@ -193,7 +193,13 @@ namespace Freefall.Assets.Loaders
             if (string.IsNullOrEmpty(guid)) return null;
 
             var cachePath = AssetDatabase.ResolveCachePathByGuid(guid);
-            if (cachePath == null || !File.Exists(cachePath)) return null;
+            if (cachePath == null || !File.Exists(cachePath))
+            {
+                // Fallback: match SaveDdsSubasset's fallback path
+                var cacheDir = AssetDatabase.Project.CacheDirectory;
+                cachePath = Path.Combine(cacheDir, $"{guid}.dds");
+            }
+            if (!File.Exists(cachePath)) return null;
 
             try
             {
@@ -240,12 +246,14 @@ namespace Freefall.Assets.Loaders
 
             try
             {
-                // 1. Save YAML definition
+                // 1. Save all ControlMap data (GPU readback → cache)
+                //    This also assigns GUIDs to new GPU-only ControlMaps.
+                //    Must happen BEFORE YAML save so the GUIDs are serialized.
+                SaveControlMaps(terrain);
+
+                // 2. Save YAML definition (now includes ControlMap GUIDs)
                 NativeImporter.Save(savePath, terrain);
                 Debug.Log($"[TerrainLoader] YAML saved: {savePath}");
-
-                // 2. Save all ControlMap data (GPU readback → cache)
-                SaveControlMaps(terrain);
             }
             catch (Exception ex)
             {
@@ -267,6 +275,10 @@ namespace Freefall.Assets.Loaders
             {
                 if (layer is PaintHeightLayer paint && paint.ControlMap != null)
                 {
+                    // Ensure the ControlMap has a GUID (may be a new GPU-only texture)
+                    if (string.IsNullOrEmpty(paint.ControlMap.Guid))
+                        paint.ControlMap.Guid = System.Guid.NewGuid().ToString("N");
+
                     var pixels = baker.ReadbackControlMap(TerrainBaker.ControlMapTarget.Height, 0);
                     if (pixels != null)
                     {
@@ -289,7 +301,7 @@ namespace Freefall.Assets.Loaders
                     {
                         // Ensure the ControlMap has a GUID (may be a new GPU-only texture)
                         if (string.IsNullOrEmpty(layer.ControlMap.Guid))
-                            layer.ControlMap.Guid = System.Guid.NewGuid().ToString();
+                        layer.ControlMap.Guid = System.Guid.NewGuid().ToString("N");
 
                         SaveDdsSubasset(layer.ControlMap.Guid, pixels);
                         Debug.Log($"[TerrainLoader] TextureLayer[{i}] ControlMap saved ({pixels.Length} bytes)");
@@ -309,7 +321,7 @@ namespace Freefall.Assets.Loaders
                     if (pixels != null)
                     {
                         if (string.IsNullOrEmpty(deco.ControlMap.Guid))
-                            deco.ControlMap.Guid = System.Guid.NewGuid().ToString();
+                            deco.ControlMap.Guid = System.Guid.NewGuid().ToString("N");
 
                         SaveDdsSubasset(deco.ControlMap.Guid, pixels);
                         Debug.Log($"[TerrainLoader] Decoration[{i}] ControlMap saved ({pixels.Length} bytes)");

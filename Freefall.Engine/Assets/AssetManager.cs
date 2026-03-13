@@ -26,6 +26,7 @@ namespace Freefall.Assets
 
         // Asset type → loader instance (discovered from [AssetLoader] attribute)
         private static readonly Dictionary<Type, IAssetLoader> Loaders = [];
+        private static readonly Dictionary<Type, string> FileExtensions = [];
 
         // Legacy: Asset type → (extension → importer type) for fallback
         private static readonly Dictionary<Type, Dictionary<string, Type>> Importers = [];
@@ -71,6 +72,22 @@ namespace Freefall.Assets
         }
 
         /// <summary>
+        /// Find a cached asset by GUID, searching across all type prefixes.
+        /// Returns null if not found in the in-memory cache.
+        /// </summary>
+        public Asset FindByGuid(string guid)
+        {
+            if (string.IsNullOrEmpty(guid)) return null;
+            string suffix = $":guid:{guid}";
+            foreach (var kvp in _assets)
+            {
+                if (kvp.Key.EndsWith(suffix) && kvp.Value is Asset a)
+                    return a;
+            }
+            return null;
+        }
+
+        /// <summary>
         /// Discover all IAssetLoader implementations marked with [AssetLoader].
         /// </summary>
         private static void DiscoverLoaders()
@@ -99,10 +116,20 @@ namespace Freefall.Assets
                     if (!Loaders.ContainsKey(attr.AssetType))
                     {
                         Loaders[attr.AssetType] = (IAssetLoader)Activator.CreateInstance(type);
+                        FileExtensions[attr.AssetType] = attr.FileExtension;
                     }
                 }
             }
             Debug.Log($"[AssetManager] Discovered {Loaders.Count} asset loaders");
+        }
+
+        /// <summary>
+        /// Get the native file extension for an asset type (from AssetLoaderAttribute).
+        /// Returns ".asset" if no loader is registered.
+        /// </summary>
+        public static string GetFileExtension(Type assetType)
+        {
+            return FileExtensions.TryGetValue(assetType, out var ext) ? ext : ".asset";
         }
 
         /// <summary>

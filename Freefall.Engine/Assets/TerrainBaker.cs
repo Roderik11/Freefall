@@ -116,6 +116,12 @@ namespace Freefall.Assets
                 DispatchStampGroup(cmd, group, groups);
             }
 
+            // Transition heightmap from UAV back to Common so it can be
+            // implicitly promoted to SRV by the height-range pyramid builder
+            cmd.ResourceBarrier(new ResourceBarrier(
+                new ResourceTransitionBarrier(_heightTexture,
+                    ResourceStates.UnorderedAccess, ResourceStates.Common)));
+
             // Wrap the baked texture for the rendering pipeline
             terrain.BakedHeightmap = Texture.WrapNative(_heightTexture, _heightSRV);
         }

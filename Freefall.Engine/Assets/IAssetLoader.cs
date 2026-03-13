@@ -10,10 +10,12 @@ namespace Freefall.Assets
     public class AssetLoaderAttribute : Attribute
     {
         public Type AssetType { get; }
+        public string FileExtension { get; }
 
-        public AssetLoaderAttribute(Type assetType)
+        public AssetLoaderAttribute(Type assetType, string fileExtension = ".asset")
         {
             AssetType = assetType;
+            FileExtension = fileExtension.StartsWith(".") ? fileExtension : "." + fileExtension;
         }
     }
 
