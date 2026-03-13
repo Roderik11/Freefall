@@ -209,19 +209,12 @@ namespace Freefall.Assets.Loaders
         {
             if (string.IsNullOrEmpty(terrain.Guid)) return;
 
-            // Find the active TerrainRenderer that owns this terrain
-            var renderer = EntityManager.Entities
-                .Select(e => e.GetComponent<Freefall.Components.TerrainRenderer>())
-                .FirstOrDefault(tr => tr?.Terrain == terrain);
-
-            if (renderer?.Baker == null) return;
-
             // Save PaintHeightLayer ControlMaps
             foreach (var layer in terrain.HeightLayers)
             {
                 if (layer is PaintHeightLayer paint && paint.ControlMap != null)
                 {
-                    var pixels = renderer.Baker.ReadbackControlMap(TerrainBaker.ControlMapTarget.Height, 0);
+                    var pixels = TerrainBaker.Instance.ReadbackControlMap(TerrainBaker.ControlMapTarget.Height, 0);
                     if (pixels != null)
                     {
                         SaveDdsSubasset(paint.ControlMap.Guid, pixels);
@@ -230,8 +223,8 @@ namespace Freefall.Assets.Loaders
                 }
             }
 
-            // TODO: Save TextureLayer ControlMaps (splatmaps) — once painting is implemented
-            // TODO: Save Decoration ControlMaps (density maps) — once painting is implemented
+            // TODO: Save TextureLayer ControlMaps (splatmaps)
+            // TODO: Save Decoration ControlMaps (density maps)
         }
 
         /// <summary>

@@ -192,11 +192,7 @@ namespace Freefall.Components
         private const int BakedAlbedoSize = 256;
 
         // ───── Height Bake (GPU layer compositor) ─────────────────────────
-        private TerrainBaker _heightBaker;
         private bool _heightBakeDirty = true;
-
-        /// <summary>Exposes the height baker for brush operations.</summary>
-        public TerrainBaker Baker => _heightBaker ??= new TerrainBaker();
 
         /// <summary>Marks the baked heightmap as dirty, triggering a rebake next frame.</summary>
         public void MarkHeightDirty() => _heightBakeDirty = true;
@@ -250,7 +246,7 @@ namespace Freefall.Components
 
             // Capture references for the lambda
             var terrain = Terrain;
-            var baker = Baker;
+            var baker = TerrainBaker.Instance;
             var pts = strokePoints;
             int count = pointCount;
             var tgt = target;
@@ -315,7 +311,7 @@ namespace Freefall.Components
             if (setControlMap == null) return;
 
             var terrain = Terrain;
-            var baker = Baker;
+            var baker = TerrainBaker.Instance;
             var src = sourceTexture;
             int ch = channelIndex;
             var tgt = target;
@@ -380,7 +376,7 @@ namespace Freefall.Components
             // GPU height layer bake (runs before any heightmap access)
             if (_heightBakeDirty && Terrain.HeightLayers.Count > 0)
             {
-                _heightBaker ??= new TerrainBaker();
+                var baker = TerrainBaker.Instance;
 
                 // Upload any pending ControlMap data loaded from cache
                 foreach (var layer in Terrain.HeightLayers)
@@ -388,7 +384,7 @@ namespace Freefall.Components
                     if (layer is PaintHeightLayer paint && paint.PendingControlMapBytes != null)
                     {
                         var p = paint; // capture for lambda
-                        _heightBaker.UploadControlMap(TerrainBaker.ControlMapTarget.Height, 0,
+                        baker.UploadControlMap(TerrainBaker.ControlMapTarget.Height, 0,
                             paint.PendingControlMapBytes, Terrain.HeightmapResolution,
                             tex => p.ControlMap = tex);
                         paint.PendingControlMapBytes = null; // consumed
@@ -397,7 +393,7 @@ namespace Freefall.Components
 
                 CommandBuffer.Enqueue(RenderPass.Opaque, (list) =>
                 {
-                    _heightBaker.Bake(Terrain, list);
+                    baker.Bake(Terrain, list);
                     _heightBakeDirty = false;
                     _heightRangePyramidBuilt = false; // force rebuild with new heights
                 });

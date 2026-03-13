@@ -17,6 +17,9 @@ namespace Freefall.Assets
     /// </summary>
     public class TerrainBaker : IDisposable
     {
+        /// <summary>Engine-wide singleton — one compute shader, shared buffers.</summary>
+        public static TerrainBaker Instance { get; } = new();
+
         private ComputeShader _cs;
         private int _kernelClear;
         private int _kernelImport;
