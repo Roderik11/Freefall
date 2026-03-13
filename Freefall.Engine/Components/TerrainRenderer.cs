@@ -199,6 +199,17 @@ namespace Freefall.Components
         public void MarkHeightDirty() => _heightBakeDirty = true;
         public void MarkSplatDirty() => _splatPackDirty = true;
 
+        /// <summary>Forces full rebuild of all texture arrays + height bake + splat pack next frame.</summary>
+        public void MarkLayersDirty()
+        {
+            _heightBakeDirty = true;
+            _splatPackDirty = true;
+            _bakedAlbedoDirty = true;
+            _textureArraysDirty = true;
+        }
+
+        private bool _textureArraysDirty;
+
         /// <summary>
         /// Enqueues a brush stroke to be dispatched on the render thread.
         /// Points are in terrain UV space [0..1].
@@ -372,6 +383,13 @@ namespace Freefall.Components
             if (Camera.Main == null || Terrain == null || !_computeInitialized) return;
 
             LazyInitTextures();
+
+            // Rebuild texture arrays if layers changed
+            if (_textureArraysDirty)
+            {
+                SetupLayerTiling();
+                _textureArraysDirty = false;
+            }
 
             var material = Material;
             var heightmap = Terrain.Heightmap;

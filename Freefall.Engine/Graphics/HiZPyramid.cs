@@ -132,7 +132,7 @@ namespace Freefall.Graphics
             CounterCPUHandle = _counterCpuHeap.GetCPUDescriptorHandleForHeapStart();
             device.NativeDevice.CreateUnorderedAccessView(CounterBuffer, null, counterUavDesc, CounterCPUHandle);
 
-            Debug.Log("HiZPyramid", $"Created: {Width}x{Height}, {MipCount} mips, SRV={FullSRV}");
+            //Debug.Log("HiZPyramid", $"Created: {Width}x{Height}, {MipCount} mips, SRV={FullSRV}");
         }
 
         public void Dispose()
