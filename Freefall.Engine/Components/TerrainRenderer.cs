@@ -405,6 +405,44 @@ namespace Freefall.Components
                 });
             }
 
+            // Upload any pending splatmap/density ControlMap data loaded from cache
+            if (Terrain?.Layers != null)
+            {
+                var baker2 = TerrainBaker.Instance;
+                for (int i = 0; i < Terrain.Layers.Count; i++)
+                {
+                    var layer = Terrain.Layers[i];
+                    if (layer.PendingControlMapBytes != null)
+                    {
+                        var l = layer;
+                        int idx = i;
+                        baker2.UploadControlMap(TerrainBaker.ControlMapTarget.Splatmap, idx,
+                            layer.PendingControlMapBytes, Terrain.HeightmapResolution,
+                            tex => l.ControlMap = tex);
+                        layer.PendingControlMapBytes = null;
+                        _splatPackDirty = true;
+                    }
+                }
+            }
+
+            if (Terrain?.Decorations != null)
+            {
+                var baker2 = TerrainBaker.Instance;
+                for (int i = 0; i < Terrain.Decorations.Count; i++)
+                {
+                    var deco = Terrain.Decorations[i];
+                    if (deco.PendingControlMapBytes != null)
+                    {
+                        var d = deco;
+                        int idx = i;
+                        baker2.UploadControlMap(TerrainBaker.ControlMapTarget.Density, idx,
+                            deco.PendingControlMapBytes, Terrain.HeightmapResolution,
+                            tex => d.ControlMap = tex);
+                        deco.PendingControlMapBytes = null;
+                    }
+                }
+            }
+
             // GPU splatmap packing — pack per-layer R16 ControlMaps into RGBA slices
             if (_splatPackDirty && Terrain?.Layers != null && Terrain.Layers.Count > 0)
             {

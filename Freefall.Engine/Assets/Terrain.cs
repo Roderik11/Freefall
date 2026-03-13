@@ -126,6 +126,11 @@ namespace Freefall.Assets
 
             /// <summary>Splatmap controlling where this layer paints (R16, hidden subasset).</summary>
             public Texture ControlMap;
+
+            /// <summary>Staging: raw R16 bytes loaded from cache, consumed by GPU upload.</summary>
+            [Reflection.DontSerialize]
+            [JsonIgnore]
+            public byte[] PendingControlMapBytes;
         }
 
         // ── Ground Coverage Decoration ──
@@ -147,6 +152,11 @@ namespace Freefall.Assets
             /// </summary>
             [FormerlySerializedAs("DensityMap")]
             public Texture ControlMap;
+
+            /// <summary>Staging: raw R16 bytes loaded from cache, consumed by GPU upload.</summary>
+            [Reflection.DontSerialize]
+            [JsonIgnore]
+            public byte[] PendingControlMapBytes;
 
             /// <summary>Instances per square meter.</summary>
             [ValueRange(.1f, 10)]

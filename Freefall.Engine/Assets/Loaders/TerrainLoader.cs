@@ -136,19 +136,50 @@ namespace Freefall.Assets.Loaders
         /// </summary>
         private void LoadControlMaps(Terrain terrain)
         {
-            // PaintHeightLayer ControlMaps need GPU upload staging
-            // The Texture itself is already resolved by NativeImporter via GUID deferred refs,
-            // but we need raw bytes for the GPU upload path
+            // PaintHeightLayer ControlMaps
             foreach (var layer in terrain.HeightLayers)
             {
                 if (layer is PaintHeightLayer paint && paint.ControlMap != null)
                 {
-                    // Load the DDS bytes from the subasset cache file
                     var bytes = LoadDdsBytes(paint.ControlMap.Guid);
                     if (bytes != null)
                     {
                         paint.PendingControlMapBytes = bytes;
                         Debug.Log($"[TerrainLoader] PaintHeightLayer ControlMap loaded: {bytes.Length} bytes");
+                    }
+                }
+            }
+
+            // TextureLayer ControlMaps (splatmaps)
+            if (terrain.Layers != null)
+            {
+                for (int i = 0; i < terrain.Layers.Count; i++)
+                {
+                    var layer = terrain.Layers[i];
+                    if (layer.ControlMap == null || string.IsNullOrEmpty(layer.ControlMap.Guid)) continue;
+
+                    var bytes = LoadDdsBytes(layer.ControlMap.Guid);
+                    if (bytes != null)
+                    {
+                        layer.PendingControlMapBytes = bytes;
+                        Debug.Log($"[TerrainLoader] TextureLayer[{i}] ControlMap loaded: {bytes.Length} bytes");
+                    }
+                }
+            }
+
+            // Decoration ControlMaps (density maps)
+            if (terrain.Decorations != null)
+            {
+                for (int i = 0; i < terrain.Decorations.Count; i++)
+                {
+                    var deco = terrain.Decorations[i];
+                    if (deco.ControlMap == null || string.IsNullOrEmpty(deco.ControlMap.Guid)) continue;
+
+                    var bytes = LoadDdsBytes(deco.ControlMap.Guid);
+                    if (bytes != null)
+                    {
+                        deco.PendingControlMapBytes = bytes;
+                        Debug.Log($"[TerrainLoader] Decoration[{i}] ControlMap loaded: {bytes.Length} bytes");
                     }
                 }
             }
@@ -208,13 +239,14 @@ namespace Freefall.Assets.Loaders
         private void SaveControlMaps(Terrain terrain)
         {
             if (string.IsNullOrEmpty(terrain.Guid)) return;
+            var baker = TerrainBaker.Instance;
 
             // Save PaintHeightLayer ControlMaps
             foreach (var layer in terrain.HeightLayers)
             {
                 if (layer is PaintHeightLayer paint && paint.ControlMap != null)
                 {
-                    var pixels = TerrainBaker.Instance.ReadbackControlMap(TerrainBaker.ControlMapTarget.Height, 0);
+                    var pixels = baker.ReadbackControlMap(TerrainBaker.ControlMapTarget.Height, 0);
                     if (pixels != null)
                     {
                         SaveDdsSubasset(paint.ControlMap.Guid, pixels);
@@ -223,8 +255,46 @@ namespace Freefall.Assets.Loaders
                 }
             }
 
-            // TODO: Save TextureLayer ControlMaps (splatmaps)
-            // TODO: Save Decoration ControlMaps (density maps)
+            // Save TextureLayer ControlMaps (splatmaps)
+            if (terrain.Layers != null)
+            {
+                for (int i = 0; i < terrain.Layers.Count; i++)
+                {
+                    var layer = terrain.Layers[i];
+                    if (layer.ControlMap == null) continue;
+
+                    var pixels = baker.ReadbackControlMap(TerrainBaker.ControlMapTarget.Splatmap, i);
+                    if (pixels != null)
+                    {
+                        // Ensure the ControlMap has a GUID (may be a new GPU-only texture)
+                        if (string.IsNullOrEmpty(layer.ControlMap.Guid))
+                            layer.ControlMap.Guid = System.Guid.NewGuid().ToString();
+
+                        SaveDdsSubasset(layer.ControlMap.Guid, pixels);
+                        Debug.Log($"[TerrainLoader] TextureLayer[{i}] ControlMap saved ({pixels.Length} bytes)");
+                    }
+                }
+            }
+
+            // Save Decoration ControlMaps (density maps)
+            if (terrain.Decorations != null)
+            {
+                for (int i = 0; i < terrain.Decorations.Count; i++)
+                {
+                    var deco = terrain.Decorations[i];
+                    if (deco.ControlMap == null) continue;
+
+                    var pixels = baker.ReadbackControlMap(TerrainBaker.ControlMapTarget.Density, i);
+                    if (pixels != null)
+                    {
+                        if (string.IsNullOrEmpty(deco.ControlMap.Guid))
+                            deco.ControlMap.Guid = System.Guid.NewGuid().ToString();
+
+                        SaveDdsSubasset(deco.ControlMap.Guid, pixels);
+                        Debug.Log($"[TerrainLoader] Decoration[{i}] ControlMap saved ({pixels.Length} bytes)");
+                    }
+                }
+            }
         }
 
         /// <summary>
