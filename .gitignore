@@ -39,3 +39,9 @@ implementation_plan.md
 mesh_shader_groundcoverage.md
 *.md
 !README.md
+
+# Node.js (editor command server)
+node_modules/
+package.json
+package-lock.json
+ws_client.js
