@@ -232,39 +232,37 @@ FragmentOutput PS(VertexOutput input)
     Texture2DArray DiffuseMaps = ResourceDescriptorHeap[DiffuseMapsIdx];
     Texture2DArray NormalMaps = ResourceDescriptorHeap[NormalMapsIdx];
 
-    for (int i = 0; i < 4; ++i)
+    // ControlMaps: ceil(layerCount/4) RGBA slices, each channel = one layer weight
+    uint cmW, cmH, sliceCount;
+    ControlMaps.GetDimensions(cmW, cmH, sliceCount);
+
+    float totalWeight = 0;
+    for (uint i = 0; i < sliceCount; ++i)
     {
-        int startIndex = i * 4;
-        
+        uint startIndex = i * 4;
         float4 weights = ControlMaps.Sample(sampData, float3(uv, i));
 
-        for (int j = 0; j < 4; ++j)
+        for (uint j = 0; j < 4; ++j)
         {
             float weight = weights[j];
-            
             if (weight <= 0)
                 continue;
 
-            int layer = startIndex + j;
+            totalWeight += weight;
+
+            uint layer = startIndex + j;
             float2 texuv = uv * LayerTiling[layer].xy;
             float3 layerUV = float3(texuv, layer);
-            
+
             float4 c = DiffuseMaps.Sample(sampData, layerUV);
             float4 n = NormalMaps.Sample(sampData, layerUV);
-            
+
             color += c * weight;
             normal += n * weight;
         }
     }
-	
-    // Normalize splatmap weights: if they don't sum to 1.0, both color and normal
-    // accumulations will be biased. Compute totalWeight once for both.
-    float totalWeight = 0;
-    for (int wi = 0; wi < 4; ++wi)
-    {
-        float4 w = ControlMaps.Sample(sampData, float3(uv, wi));
-        totalWeight += w.x + w.y + w.z + w.w;
-    }
+
+    // Normalize splatmap weights
     if (totalWeight > 0.001)
     {
         color.rgb /= totalWeight;
@@ -274,7 +272,6 @@ FragmentOutput PS(VertexOutput input)
         float2 nXY = normal.rg * 2.0 - 1.0;
 
         // UDN (Partial Derivative Addition):
-        // For flat terrain: tangent X → world X, tangent Y → world Z
         const float normalScale = 1.0;
         terrainNormal.x += nXY.x * normalScale;
         terrainNormal.z += nXY.y * normalScale;

@@ -125,7 +125,7 @@ namespace Freefall.Assets
     public enum ErosionMode { Hydraulic, Thermal, Both }
 
     /// <summary>
-    /// Hand-painted height layer. A GPU R16_Float texture (DeltaMap) is painted
+    /// Hand-painted height layer. A GPU R16_Float texture (ControlMap) is painted
     /// by compute shader brush operations. The baker composites it with other layers.
     /// BlendMode is typically Add (positive = raise, negative = lower).
     /// </summary>
@@ -133,17 +133,18 @@ namespace Freefall.Assets
     public class PaintHeightLayer : HeightLayer
     {
         /// <summary>
-        /// GPU R16_Float delta texture painted by the brush compute shader.
+        /// GPU R16_Float control map texture painted by the brush compute shader.
         /// Created on first brush stroke; composited during bake.
+        /// Hidden subasset — GUID stored in YAML, data in cache.
         /// </summary>
-        public Texture DeltaMap;
+        public Texture ControlMap;
 
         /// <summary>
         /// CPU-side pixel data loaded from cache, awaiting GPU upload.
-        /// TerrainRenderer checks this on first bake and calls TerrainBaker.UploadDeltaMap().
+        /// TerrainRenderer checks this on first bake and calls TerrainBaker.UploadControlMap().
         /// </summary>
         [NonSerialized]
-        public DeltaMapData PendingDeltaMapData;
+        public byte[] PendingControlMapBytes;
 
         public PaintHeightLayer()
         {

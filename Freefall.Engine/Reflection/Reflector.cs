@@ -98,6 +98,15 @@ namespace Freefall.Reflection
 
             var mapping = new Mapping();
             mapping.AddRange(fields);
+
+            // Register field-level aliases for backward-compatible deserialization
+            foreach (var field in fields)
+            {
+                var aliases = field.GetCustomAttributes(typeof(FormerlySerializedAsAttribute), false);
+                foreach (FormerlySerializedAsAttribute alias in aliases)
+                    mapping.AddAlias(alias.Name, field);
+            }
+
             _mappingCache[type] = mapping;
 
             return mapping;

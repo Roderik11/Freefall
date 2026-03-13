@@ -2,7 +2,9 @@ using System;
 using System.Collections.Generic;
 using System.Numerics;
 using System.Text.Json.Serialization;
+using Freefall.Base;
 using Freefall.Graphics;
+using Freefall.Reflection;
 
 namespace Freefall.Assets
 {
@@ -67,8 +69,14 @@ namespace Freefall.Assets
         public float MaxHeight = 600;
         public List<TextureLayer> Layers;
 
-        // ── Splatmaps (public for YAML serialization) ──
-        public List<Texture> ControlMaps = new();
+        /// <summary>
+        /// Migration only: catches the old flat ControlMaps list during deserialization.
+        /// Used directly by TerrainRenderer for RGBA-packed GPU splatmap array.
+        /// Will be replaced by per-layer R16 ControlMaps after channel-split migration.
+        /// </summary>
+        [FormerlySerializedAs("ControlMaps")]
+        [DontSerialize]
+        public List<Texture> _legacyControlMaps;
 
         // ── Ground Coverage ──
         public List<Decoration> Decorations = new();
@@ -115,13 +123,16 @@ namespace Freefall.Assets
             public Texture Diffuse;
             public Texture Normals;
             public Vector2 Tiling = Vector2.One;
+
+            /// <summary>Splatmap controlling where this layer paints (R16, hidden subasset).</summary>
+            public Texture ControlMap;
         }
 
         // ── Ground Coverage Decoration ──
         /// <summary>
         /// A single decoration entry. References a StaticMesh or Texture for rendering,
-        /// plus an optional DensityMap (grayscale) that controls placement density.
-        /// At runtime, all unique DensityMaps are packed into a Texture2DArray.
+        /// plus an optional ControlMap (grayscale) that controls placement density.
+        /// At runtime, all unique ControlMaps are packed into a Texture2DArray.
         /// </summary>
         [Serializable]
         public class Decoration
@@ -131,10 +142,11 @@ namespace Freefall.Assets
             public Texture Texture;       // Billboard/Cross mode: alpha-tested texture
 
             /// <summary>
-            /// Optional density map (grayscale). When set, auto-resolves to a DecoMaps array
-            /// slice at runtime. Without a density map, the decorator renders everywhere.
+            /// Controls placement density (R16, hidden subasset).
+            /// Without a control map, the decorator renders everywhere.
             /// </summary>
-            public Texture DensityMap;
+            [FormerlySerializedAs("DensityMap")]
+            public Texture ControlMap;
 
             /// <summary>Instances per square meter.</summary>
             [ValueRange(.1f, 10)]

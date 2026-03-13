@@ -285,13 +285,13 @@ namespace Freefall.Components
             {
                 _heightBaker ??= new TerrainBaker();
 
-                // Upload any pending DeltaMap data loaded from cache
+                // Upload any pending ControlMap data loaded from cache
                 foreach (var layer in Terrain.HeightLayers)
                 {
-                    if (layer is PaintHeightLayer paint && paint.PendingDeltaMapData != null)
+                    if (layer is PaintHeightLayer paint && paint.PendingControlMapBytes != null)
                     {
-                        _heightBaker.UploadDeltaMap(paint.PendingDeltaMapData, paint);
-                        paint.PendingDeltaMapData = null; // consumed
+                        _heightBaker.UploadControlMap(paint.PendingControlMapBytes, Terrain.HeightmapResolution, paint);
+                        paint.PendingControlMapBytes = null; // consumed
                     }
                 }
 
@@ -1005,14 +1005,29 @@ namespace Freefall.Components
                 NormalMapsArray = InternalAssets.FlatNormalArray;
             }
 
-            // Build ControlMapsArray from splatmaps
+            // Build ControlMapsArray for GPU splatmap sampling
+            // The GPU expects ceil(layerCount/4) RGBA slices, each channel = one layer weight.
+            // Legacy path: old RGBA splatmaps are already packed correctly.
+            // New path: per-layer R16 ControlMaps need packing into RGBA slices (TODO: compute blit).
             var controlList = new List<Texture>();
-            if (Terrain?.ControlMaps != null)
+
+            // Check if we have legacy pre-packed RGBA splatmaps (from migration)
+            if (Terrain?._legacyControlMaps != null && Terrain._legacyControlMaps.Count > 0)
             {
-                var controlMaps = Terrain.ControlMaps;
-                for (int i = 0; i < controlMaps.Count; i++)
+                foreach (var splatmap in Terrain._legacyControlMaps)
                 {
-                    if (controlMaps[i] != null && controlMaps[i]!.Native != null) controlList.Add(controlMaps[i]!);
+                    if (splatmap?.Native != null)
+                        controlList.Add(splatmap);
+                }
+            }
+            else if (Terrain?.Layers != null)
+            {
+                // Per-layer R16 ControlMaps — collect for packing into RGBA slices
+                // For now, pass them directly (works if they're already RGBA from old import)
+                foreach (var layer in Terrain.Layers)
+                {
+                    if (layer.ControlMap != null && layer.ControlMap.Native != null)
+                        controlList.Add(layer.ControlMap);
                 }
             }
             
@@ -1022,7 +1037,7 @@ namespace Freefall.Components
             else
                 ControlMapsArray = InternalAssets.BlackArray;
 
-            // DecoMapsArray is built by BuildDecoratorBuffers() from per-Decoration DensityMaps
+            // DecoMapsArray is built by BuildDecoratorBuffers() from per-Decoration ControlMaps
         }
 
         // ───── IHeightProvider ────────────────────────────────────────────
@@ -1111,7 +1126,7 @@ namespace Freefall.Components
 
         /// <summary>
         /// Builds GPU-side structured buffers from Terrain.Decorations.
-        /// Collects unique DensityMaps into a DecoMapsArray, builds per-decoration
+        /// Collects unique ControlMaps into a DecoMapsArray, builds per-decoration
         /// DecoratorSlots with LOD table offsets and auto-resolved DecoMap slices,
         /// and registers all LOD meshes in MeshRegistry.
         /// </summary>
@@ -1130,19 +1145,19 @@ namespace Freefall.Components
             _decoratorSlotsBuffer?.Dispose();
             _decoratorLODTableBuffer?.Dispose();
 
-            // Collect unique density maps and build DecoMapsArray
-            var uniqueDensityMaps = new List<Texture>();
-            var densityMapToSlice = new Dictionary<Texture, uint>();
+            // Collect unique control maps and build DecoMapsArray
+            var uniqueControlMaps = new List<Texture>();
+            var controlMapToSlice = new Dictionary<Texture, uint>();
             foreach (var deco in decorations)
             {
-                if (deco.DensityMap != null && deco.DensityMap.Native != null && !densityMapToSlice.ContainsKey(deco.DensityMap))
+                if (deco.ControlMap != null && deco.ControlMap.Native != null && !controlMapToSlice.ContainsKey(deco.ControlMap))
                 {
-                    densityMapToSlice[deco.DensityMap] = (uint)uniqueDensityMaps.Count;
-                    uniqueDensityMaps.Add(deco.DensityMap);
+                    controlMapToSlice[deco.ControlMap] = (uint)uniqueControlMaps.Count;
+                    uniqueControlMaps.Add(deco.ControlMap);
                 }
             }
-            if (uniqueDensityMaps.Count > 0)
-                DecoMapsArray = Texture.CreateTexture2DArray(device, uniqueDensityMaps);
+            if (uniqueControlMaps.Count > 0)
+                DecoMapsArray = Texture.CreateTexture2DArray(device, uniqueControlMaps);
             else
                 DecoMapsArray = null;
 
@@ -1238,7 +1253,7 @@ namespace Freefall.Components
                     Rot10 = sx*sy*cz - cx*sz,   Rot11 = sx*sy*sz + cx*cz,   Rot12 = sx*cy,
                     Rot20 = cx*sy*cz + sx*sz,   Rot21 = cx*sy*sz - sx*cz,   Rot22 = cx*cy,
                     SlopeBias = deco.SlopeBias,
-                    DecoMapSlice = deco.DensityMap != null && densityMapToSlice.TryGetValue(deco.DensityMap, out var slice)
+                    DecoMapSlice = deco.ControlMap != null && controlMapToSlice.TryGetValue(deco.ControlMap, out var slice)
                         ? slice : 0xFFFFFFFF,
                     _pad0 = 0,
                     Mode = (uint)mode,
@@ -1249,9 +1264,9 @@ namespace Freefall.Components
                     _colorPad = 0
                 });
 
-                bool hasDensityMap = deco.DensityMap != null && densityMapToSlice.ContainsKey(deco.DensityMap);
+                bool hasControlMap = deco.ControlMap != null && controlMapToSlice.ContainsKey(deco.ControlMap);
                 float logMaxDist = lodCount > 0 ? lodTable[^1].MaxDistance : 0;
-                Debug.Log($"[Deco] Slot {slots.Count - 1}: mode={mode} lodCount={lodCount} density={deco.Density} densityMap={hasDensityMap} slice={slots[^1].DecoMapSlice} maxDist={logMaxDist:F0}");
+                Debug.Log($"[Deco] Slot {slots.Count - 1}: mode={mode} lodCount={lodCount} density={deco.Density} controlMap={hasControlMap} slice={slots[^1].DecoMapSlice} maxDist={logMaxDist:F0}");
             }
 
             // Single header covering all slots

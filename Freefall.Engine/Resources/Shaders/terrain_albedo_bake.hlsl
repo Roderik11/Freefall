@@ -37,19 +37,22 @@ void CSBakeTerrainAlbedo(uint3 dtid : SV_DispatchThreadID)
 
     float4 color = float4(0, 0, 0, 0);
 
-    // Mirror terrain.fx PS splatmap blending
-    for (int i = 0; i < 4; ++i)
+    // ControlMaps: ceil(layerCount/4) RGBA slices
+    uint cmW, cmH, sliceCount;
+    ControlMaps.GetDimensions(cmW, cmH, sliceCount);
+
+    for (uint i = 0; i < sliceCount; ++i)
     {
-        int startIndex = i * 4;
+        uint startIndex = i * 4;
         float4 weights = ControlMaps.SampleLevel(sampData, float3(uv, i), 0);
 
-        for (int j = 0; j < 4; ++j)
+        for (uint j = 0; j < 4; ++j)
         {
             float weight = weights[j];
             if (weight <= 0)
                 continue;
 
-            int layer = startIndex + j;
+            uint layer = startIndex + j;
             float2 texuv = uv * Tiling[layer].xy;
             // Sample at high mip for averaged color (no tiling detail)
             float4 c = DiffuseMaps.SampleLevel(sampData, float3(texuv, layer), 4.0);

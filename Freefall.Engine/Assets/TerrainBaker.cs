@@ -1,7 +1,7 @@
 using System;
 using System.Numerics;
 using System.Runtime.InteropServices;
-using Freefall.Assets.Packers;
+
 using Freefall.Base;
 using Freefall.Graphics;
 using Vortice.Direct3D12;
@@ -123,10 +123,10 @@ namespace Freefall.Assets
 
         private void DispatchPaint(ID3D12GraphicsCommandList cmd, PaintHeightLayer layer, int resolution, uint groups)
         {
-            if (layer.DeltaMap == null || layer.DeltaMap.BindlessIndex == 0) return;
+            if (layer.ControlMap == null || layer.ControlMap.BindlessIndex == 0) return;
 
-            Debug.Log($"[TerrainBaker] DispatchPaint: DeltaMap SRV={layer.DeltaMap.BindlessIndex} BlendMode={layer.BlendMode}");
-            _cs.SetPushConstant(_kernelImport, "Source", layer.DeltaMap.BindlessIndex);
+            Debug.Log($"[TerrainBaker] DispatchPaint: ControlMap SRV={layer.ControlMap.BindlessIndex} BlendMode={layer.BlendMode}");
+            _cs.SetPushConstant(_kernelImport, "Source", layer.ControlMap.BindlessIndex);
             _cs.SetPushConstant(_kernelImport, "Output", _heightUAV);
             _cs.SetPushConstant(_kernelImport, "BlendMode", (uint)layer.BlendMode);
             _cs.SetParam(_kernelImport, "Opacity", layer.Opacity);
@@ -216,16 +216,16 @@ namespace Freefall.Assets
 
         // ── Brush Painting ────────────────────────────────────────────────
 
-        // DeltaMap UAV resources (R16_Float, created on first brush stroke)
-        private ID3D12Resource _deltaTexture;
-        private uint _deltaUAV;
-        private uint _deltaSRV;
-        private int _deltaResolution;
-        private bool _deltaNeedsInitialClear = true;
+        // ControlMap UAV resources (R16_Float, created on first brush stroke)
+        private ID3D12Resource _controlMapTexture;
+        private uint _controlMapUAV;
+        private uint _controlMapSRV;
+        private int _controlMapResolution;
+        private bool _controlMapNeedsInitialClear = true;
 
         /// <summary>
-        /// Dispatches a brush stroke on the PaintHeightLayer's DeltaMap.
-        /// Points are in terrain UV space [0..1]. Creates the DeltaMap if needed.
+        /// Dispatches a brush stroke on the PaintHeightLayer's ControlMap.
+        /// Points are in terrain UV space [0..1]. Creates the ControlMap if needed.
         /// Must be called on the render thread with an active command list.
         /// </summary>
         public void PaintBrush(Terrain terrain, PaintHeightLayer layer,
@@ -239,7 +239,7 @@ namespace Freefall.Assets
 
             EnsureInitialized();
             int res = terrain.HeightmapResolution;
-            EnsureDeltaMap(layer, res);
+            EnsureControlMap(layer, res);
 
             var device = Engine.Device;
             cmd.SetComputeRootSignature(device.GlobalRootSignature);
@@ -248,13 +248,13 @@ namespace Freefall.Assets
             uint groups = (uint)((res + 7) / 8);
 
             // Clear on first use
-            if (_deltaNeedsInitialClear)
+            if (_controlMapNeedsInitialClear)
             {
-                Debug.Log("[TerrainBaker] Clearing DeltaMap (first use)");
-                _cs.SetPushConstant(_kernelClearDelta, "Output", _deltaUAV);
+                Debug.Log("[TerrainBaker] Clearing ControlMap (first use)");
+                _cs.SetPushConstant(_kernelClearDelta, "Output", _controlMapUAV);
                 _cs.Dispatch(_kernelClearDelta, cmd, groups, groups);
-                cmd.ResourceBarrierUnorderedAccessView(_deltaTexture);
-                _deltaNeedsInitialClear = false;
+                cmd.ResourceBarrierUnorderedAccessView(_controlMapTexture);
+                _controlMapNeedsInitialClear = false;
             }
 
             // Upload stroke points
@@ -272,11 +272,11 @@ namespace Freefall.Assets
             // Normalize target height
             float normalizedTarget = targetHeight / terrain.MaxHeight;
 
-            Debug.Log($"[TerrainBaker] PaintBrush: mode={mode} pts={pointCount} uvR={uvRadius:F4} str={strength} deltaUAV={_deltaUAV} heightSRV={_heightSRV}");
+            Debug.Log($"[TerrainBaker] PaintBrush: mode={mode} pts={pointCount} uvR={uvRadius:F4} str={strength} controlMapUAV={_controlMapUAV} heightSRV={_heightSRV}");
 
             // Push constants (reusing existing PushConstants layout)
             _cs.SetPushConstant(_kernelPaintBrush, "Source", _heightSRV);  // Current baked heightmap for flatten/smooth
-            _cs.SetPushConstant(_kernelPaintBrush, "Output", _deltaUAV);   // DeltaMap UAV
+            _cs.SetPushConstant(_kernelPaintBrush, "Output", _controlMapUAV);   // ControlMap UAV
             _cs.SetBuffer(_kernelPaintBrush, "StampBuf", _strokeBuffer);
             _cs.SetPushConstant(_kernelPaintBrush, "BlendMode", (uint)mode);
             _cs.SetParam(_kernelPaintBrush, "Opacity", strength);
@@ -288,15 +288,15 @@ namespace Freefall.Assets
             _cs.SetParam(_kernelPaintBrush, "BrushTargetHeight", normalizedTarget);
 
             _cs.Dispatch(_kernelPaintBrush, cmd, groups, groups);
-            cmd.ResourceBarrierUnorderedAccessView(_deltaTexture);
+            cmd.ResourceBarrierUnorderedAccessView(_controlMapTexture);
         }
 
         /// <summary>
-        /// Clears the DeltaMap to zero (removes all paint edits).
+        /// Clears the ControlMap to zero (removes all paint edits).
         /// </summary>
-        public void ClearDeltaMap(Terrain terrain, PaintHeightLayer layer, ID3D12GraphicsCommandList cmd)
+        public void ClearControlMap(Terrain terrain, PaintHeightLayer layer, ID3D12GraphicsCommandList cmd)
         {
-            if (_deltaTexture == null) return;
+            if (_controlMapTexture == null) return;
 
             EnsureInitialized();
             var device = Engine.Device;
@@ -306,53 +306,53 @@ namespace Freefall.Assets
             int res = terrain.HeightmapResolution;
             uint groups = (uint)((res + 7) / 8);
 
-            _cs.SetPushConstant(_kernelClearDelta, "Output", _deltaUAV);
+            _cs.SetPushConstant(_kernelClearDelta, "Output", _controlMapUAV);
             _cs.Dispatch(_kernelClearDelta, cmd, groups, groups);
-            cmd.ResourceBarrierUnorderedAccessView(_deltaTexture);
+            cmd.ResourceBarrierUnorderedAccessView(_controlMapTexture);
         }
 
         /// <summary>
-        /// Ensures a DeltaMap R16_Float texture exists for the paint layer.
-        /// Creates UAV + SRV and assigns to the layer.
+        /// Ensures a ControlMap R16_Float texture exists for the paint layer.
+        /// Creates the GPU resource + UAV/SRV on first call.
         /// </summary>
-        private void EnsureDeltaMap(PaintHeightLayer layer, int resolution)
+        private void EnsureControlMap(PaintHeightLayer layer, int resolution)
         {
-            if (_deltaTexture != null && _deltaResolution == resolution)
+            if (_controlMapTexture != null && _controlMapResolution == resolution)
             {
                 // Already created — just make sure layer has the reference
-                if (layer.DeltaMap == null || layer.DeltaMap.BindlessIndex != _deltaSRV)
-                    layer.DeltaMap = Texture.WrapNative(_deltaTexture, _deltaSRV);
+                if (layer.ControlMap == null || layer.ControlMap.BindlessIndex != _controlMapSRV)
+                    layer.ControlMap = Texture.WrapNative(_controlMapTexture, _controlMapSRV);
                 return;
             }
 
-            _deltaTexture?.Release();
+            _controlMapTexture?.Release();
 
             var device = Engine.Device;
-            _deltaTexture = device.CreateTexture2D(
-                Format.R32_Float, resolution, resolution, 1, 1,
+            _controlMapTexture = device.CreateTexture2D(
+                Format.R16_Float, resolution, resolution, 1, 1,
                 ResourceFlags.AllowUnorderedAccess, ResourceStates.Common);
 
-            _deltaUAV = device.AllocateBindlessIndex();
+            _controlMapUAV = device.AllocateBindlessIndex();
             var uavDesc = new UnorderedAccessViewDescription
             {
-                Format = Format.R32_Float,
+                Format = Format.R16_Float,
                 ViewDimension = UnorderedAccessViewDimension.Texture2D,
                 Texture2D = new Texture2DUnorderedAccessView { MipSlice = 0 }
             };
-            device.NativeDevice.CreateUnorderedAccessView(_deltaTexture, null, uavDesc, device.GetCpuHandle(_deltaUAV));
+            device.NativeDevice.CreateUnorderedAccessView(_controlMapTexture, null, uavDesc, device.GetCpuHandle(_controlMapUAV));
 
-            _deltaSRV = device.AllocateBindlessIndex();
+            _controlMapSRV = device.AllocateBindlessIndex();
             var srvDesc = new ShaderResourceViewDescription
             {
-                Format = Format.R32_Float,
+                Format = Format.R16_Float,
                 ViewDimension = ShaderResourceViewDimension.Texture2D,
                 Shader4ComponentMapping = ShaderComponentMapping.Default,
                 Texture2D = new Texture2DShaderResourceView { MostDetailedMip = 0, MipLevels = 1 }
             };
-            device.NativeDevice.CreateShaderResourceView(_deltaTexture, srvDesc, device.GetCpuHandle(_deltaSRV));
+            device.NativeDevice.CreateShaderResourceView(_controlMapTexture, srvDesc, device.GetCpuHandle(_controlMapSRV));
 
-            _deltaResolution = resolution;
-            layer.DeltaMap = Texture.WrapNative(_deltaTexture, _deltaSRV);
+            _controlMapResolution = resolution;
+            layer.ControlMap = Texture.WrapNative(_controlMapTexture, _controlMapSRV);
 
             // Clear the new texture
             // Note: Cleared on next Bake since we might not have a cmd list here
@@ -367,21 +367,21 @@ namespace Freefall.Assets
             _strokeBuffer = GraphicsBuffer.CreateUpload<Vector2>(_strokeBufferCapacity, mapped: true);
         }
 
-        // ── DeltaMap Persistence ─────────────────────────────────────────
+        // ── ControlMap Persistence ─────────────────────────────────────────
 
         /// <summary>
-        /// Reads back the DeltaMap GPU texture to CPU memory.
-        /// Returns null if no DeltaMap has been created yet.
+        /// Reads back the ControlMap GPU texture to CPU memory as raw pixel bytes.
+        /// Returns null if no ControlMap has been created yet.
         /// This is a synchronous GPU operation — call from the main thread only.
         /// </summary>
-        public DeltaMapData ReadbackDeltaMap()
+        public byte[] ReadbackControlMap()
         {
-            if (_deltaTexture == null || _deltaResolution == 0)
+            if (_controlMapTexture == null || _controlMapResolution == 0)
                 return null;
 
             var device = Engine.Device;
-            int res = _deltaResolution;
-            int bytesPerPixel = 4; // R32_Float = 4 bytes
+            int res = _controlMapResolution;
+            int bytesPerPixel = 2; // R16_Float = 2 bytes
             int rowPitch = (res * bytesPerPixel + 255) & ~255; // 256-byte aligned
             int totalBytes = rowPitch * res;
 
@@ -400,21 +400,21 @@ namespace Freefall.Assets
 
             try
             {
-                // Transition delta texture to CopySource
-                cmdList.ResourceBarrierTransition(_deltaTexture,
+                // Transition control map texture to CopySource
+                cmdList.ResourceBarrierTransition(_controlMapTexture,
                     ResourceStates.Common, ResourceStates.CopySource);
 
                 // Copy texture to readback buffer
-                var src = new TextureCopyLocation(_deltaTexture, 0);
+                var src = new TextureCopyLocation(_controlMapTexture, 0);
                 var dst = new TextureCopyLocation(readbackResource, new PlacedSubresourceFootPrint
                 {
                     Offset = 0,
-                    Footprint = new SubresourceFootPrint(Format.R32_Float, (uint)res, (uint)res, 1, (uint)rowPitch)
+                    Footprint = new SubresourceFootPrint(Format.R16_Float, (uint)res, (uint)res, 1, (uint)rowPitch)
                 });
                 cmdList.CopyTextureRegion(dst, 0, 0, 0, src);
 
                 // Transition back to Common (UAV-compatible)
-                cmdList.ResourceBarrierTransition(_deltaTexture,
+                cmdList.ResourceBarrierTransition(_controlMapTexture,
                     ResourceStates.CopySource, ResourceStates.Common);
 
                 // Close, submit, and GPU-wait
@@ -438,12 +438,7 @@ namespace Freefall.Assets
 
                     readbackResource.Unmap(0);
 
-                    return new DeltaMapData
-                    {
-                        Width = res,
-                        Height = res,
-                        Pixels = pixels
-                    };
+                    return pixels;
                 }
             }
             finally
@@ -455,23 +450,23 @@ namespace Freefall.Assets
         }
 
         /// <summary>
-        /// Uploads DeltaMap pixel data (from a saved DeltaMapData) to the GPU
-        /// and assigns it to the given PaintHeightLayer.
-        /// Creates the DeltaMap texture if needed.
+        /// Uploads ControlMap pixel data (raw bytes from cache) to the GPU
+        /// and wires up the SRV so the bake shader can read it.
+        /// Creates the ControlMap texture if needed.
         /// </summary>
-        public void UploadDeltaMap(DeltaMapData data, PaintHeightLayer layer)
+        public void UploadControlMap(byte[] pixels, int resolution, PaintHeightLayer layer)
         {
-            if (data == null || data.Pixels == null || data.Width == 0) return;
+            if (pixels == null || pixels.Length == 0) return;
 
-            EnsureInitialized();
-            int res = data.Width;
+            int res = resolution;
+            int bpp = 2; // R16_Float = 2 bytes per pixel
 
-            // Create the DeltaMap GPU texture (UAV + SRV)
-            EnsureDeltaMap(layer, res);
-            _deltaNeedsInitialClear = false; // we're uploading saved data, no clear needed
+            // Create the ControlMap GPU texture (UAV + SRV)
+            EnsureControlMap(layer, res);
+            _controlMapNeedsInitialClear = false; // we're uploading saved data, no clear needed
 
             var device = Engine.Device;
-            int bytesPerPixel = 4; // R32_Float
+            int bytesPerPixel = 2; // R16_Float
             int rowPitch = (res * bytesPerPixel + 255) & ~255; // 256-byte aligned
             int totalBytes = rowPitch * res;
 
@@ -500,33 +495,33 @@ namespace Freefall.Assets
                     var dstPtr = (byte*)pData;
                     for (int y = 0; y < res; y++)
                     {
-                        Marshal.Copy(data.Pixels, y * srcRowBytes, (IntPtr)(dstPtr + y * rowPitch), srcRowBytes);
+                        Marshal.Copy(pixels, y * srcRowBytes, (IntPtr)(dstPtr + y * rowPitch), srcRowBytes);
                     }
 
                     uploadResource.Unmap(0);
                 }
 
-                // GPU copy: upload buffer → delta texture
-                cmdList.ResourceBarrierTransition(_deltaTexture,
+                // GPU copy: upload buffer → control map texture
+                cmdList.ResourceBarrierTransition(_controlMapTexture,
                     ResourceStates.Common, ResourceStates.CopyDest);
 
                 var src = new TextureCopyLocation(uploadResource, new PlacedSubresourceFootPrint
                 {
                     Offset = 0,
-                    Footprint = new SubresourceFootPrint(Format.R32_Float, (uint)res, (uint)res, 1, (uint)rowPitch)
+                    Footprint = new SubresourceFootPrint(Format.R16_Float, (uint)res, (uint)res, 1, (uint)rowPitch)
                 });
-                var dst = new TextureCopyLocation(_deltaTexture, 0);
+                var dst = new TextureCopyLocation(_controlMapTexture, 0);
                 cmdList.CopyTextureRegion(dst, 0, 0, 0, src);
 
                 // Transition back to Common (UAV-compatible)
-                cmdList.ResourceBarrierTransition(_deltaTexture,
+                cmdList.ResourceBarrierTransition(_controlMapTexture,
                     ResourceStates.CopyDest, ResourceStates.Common);
 
                 // Close, submit, and GPU-wait
                 cmdList.Close();
                 device.SubmitAndWait(cmdList);
 
-                Debug.Log($"[TerrainBaker] Uploaded DeltaMap: {res}x{res} ({data.Pixels.Length} bytes)");
+                Debug.Log($"[TerrainBaker] Uploaded ControlMap: {res}x{res} ({pixels.Length} bytes)");
             }
             finally
             {
@@ -539,7 +534,7 @@ namespace Freefall.Assets
         public void Dispose()
         {
             _heightTexture?.Release();
-            _deltaTexture?.Release();
+            _controlMapTexture?.Release();
             _stampBuffer?.Dispose();
             _strokeBuffer?.Dispose();
             _cs?.Dispose();

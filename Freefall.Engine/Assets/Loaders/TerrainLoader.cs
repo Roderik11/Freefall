@@ -12,13 +12,14 @@ namespace Freefall.Assets.Loaders
     /// <summary>
     /// Loads and saves Terrain assets.
     /// Load: unpacks AssetDefinitionData (YAML) from cache, deserializes Terrain,
-    ///       resolves GUID references, loads PhysX HeightField and DeltaMap subassets.
-    /// Save: writes YAML + reads back DeltaMap GPU data to cache.
+    ///       resolves GUID references, loads PhysX HeightField and ControlMap subassets.
+    /// Save: writes YAML + reads back all ControlMap GPU data to cache.
     /// </summary>
     [AssetLoader(typeof(Terrain))]
     public class TerrainLoader : IAssetLoader
     {
         private readonly AssetDefinitionPacker _packer = new();
+        private readonly DdsTexturePacker _ddsPacker = new();
 
         public Asset Load(string name, AssetManager manager)
         {
@@ -76,11 +77,10 @@ namespace Freefall.Assets.Loaders
                 // Load pre-cooked PhysX HeightField
                 LoadCookedHeightField(terrain, sourceGuid);
 
-                // Load persisted DeltaMap data (painted terrain)
-                LoadDeltaMaps(terrain, sourceGuid);
+                // Load persisted ControlMap data (painted height)
+                LoadControlMaps(terrain);
 
                 Debug.Log($"[TerrainLoader] '{name}' loaded: {terrain.Layers?.Count ?? 0} layers, " +
-                          $"{terrain.ControlMaps?.Count ?? 0} controlmaps, " +
                           $"{terrain.Decorations?.Count ?? 0} decorations, " +
                           $"HeightField={terrain.HeightField != null}, " +
                           $"CookedHeightField={terrain.CookedHeightField != null}");
@@ -130,47 +130,57 @@ namespace Freefall.Assets.Loaders
         }
 
         /// <summary>
-        /// Loads persisted DeltaMap data from the cache and populates PendingDeltaMapData
-        /// on the terrain's PaintHeightLayer. GPU upload happens later in TerrainRenderer.
+        /// Loads persisted ControlMap data for PaintHeightLayers.
+        /// The ControlMap texture is resolved via normal GUID-based loading (it's a DDS subasset).
+        /// This method handles the PendingControlMapBytes staging for GPU upload.
         /// </summary>
-        private static void LoadDeltaMaps(Terrain terrain, string guid)
+        private void LoadControlMaps(Terrain terrain)
         {
-            try
+            // PaintHeightLayer ControlMaps need GPU upload staging
+            // The Texture itself is already resolved by NativeImporter via GUID deferred refs,
+            // but we need raw bytes for the GPU upload path
+            foreach (var layer in terrain.HeightLayers)
             {
-                if (string.IsNullOrEmpty(guid)) return;
-
-                var cacheDir = AssetDatabase.Project?.CacheDirectory;
-                if (string.IsNullOrEmpty(cacheDir)) return;
-
-                var deltaPath = Path.Combine(cacheDir, $"{guid}.deltamap");
-                if (!File.Exists(deltaPath)) return;
-
-                var packer = new DeltaMapPacker();
-                DeltaMapData data;
-                using (var stream = File.OpenRead(deltaPath))
-                    data = packer.Read(stream);
-
-                // Assign to the first PaintHeightLayer found
-                foreach (var layer in terrain.HeightLayers)
+                if (layer is PaintHeightLayer paint && paint.ControlMap != null)
                 {
-                    if (layer is PaintHeightLayer paint)
+                    // Load the DDS bytes from the subasset cache file
+                    var bytes = LoadDdsBytes(paint.ControlMap.Guid);
+                    if (bytes != null)
                     {
-                        paint.PendingDeltaMapData = data;
-                        Debug.Log($"[TerrainLoader] DeltaMap loaded: {data.Width}x{data.Height} ({data.Pixels.Length} bytes)");
-                        return;
+                        paint.PendingControlMapBytes = bytes;
+                        Debug.Log($"[TerrainLoader] PaintHeightLayer ControlMap loaded: {bytes.Length} bytes");
                     }
                 }
             }
+        }
+
+        /// <summary>
+        /// Reads raw DDS bytes from a subasset cache file by GUID.
+        /// </summary>
+        private byte[] LoadDdsBytes(string guid)
+        {
+            if (string.IsNullOrEmpty(guid)) return null;
+
+            var cachePath = AssetDatabase.ResolveCachePathByGuid(guid);
+            if (cachePath == null || !File.Exists(cachePath)) return null;
+
+            try
+            {
+                using var stream = File.OpenRead(cachePath);
+                var data = _ddsPacker.Read(stream);
+                return data?.Bytes;
+            }
             catch (Exception ex)
             {
-                Debug.LogWarning("TerrainLoader", $"Failed to load DeltaMap '{guid}': {ex.Message}");
+                Debug.LogWarning("TerrainLoader", $"Failed to load DDS subasset '{guid}': {ex.Message}");
+                return null;
             }
         }
 
         // ── Save ──
 
         /// <summary>
-        /// Save terrain YAML + DeltaMap GPU data to cache.
+        /// Save terrain YAML + all ControlMap GPU textures to cache.
         /// </summary>
         public void Save(Asset asset, string savePath)
         {
@@ -182,8 +192,8 @@ namespace Freefall.Assets.Loaders
                 NativeImporter.Save(savePath, terrain);
                 Debug.Log($"[TerrainLoader] YAML saved: {savePath}");
 
-                // 2. Save DeltaMap data (GPU readback → cache)
-                SaveDeltaMaps(terrain);
+                // 2. Save all ControlMap data (GPU readback → cache)
+                SaveControlMaps(terrain);
             }
             catch (Exception ex)
             {
@@ -192,9 +202,10 @@ namespace Freefall.Assets.Loaders
         }
 
         /// <summary>
-        /// Finds the active TerrainBaker, reads back DeltaMap from GPU, packs to cache.
+        /// Finds the active TerrainBaker, reads back all ControlMaps from GPU, packs to cache.
+        /// Handles: PaintHeightLayer ControlMaps, TextureLayer ControlMaps, Decoration ControlMaps.
         /// </summary>
-        private static void SaveDeltaMaps(Terrain terrain)
+        private void SaveControlMaps(Terrain terrain)
         {
             if (string.IsNullOrEmpty(terrain.Guid)) return;
 
@@ -205,17 +216,41 @@ namespace Freefall.Assets.Loaders
 
             if (renderer?.Baker == null) return;
 
-            var deltaData = renderer.Baker.ReadbackDeltaMap();
-            if (deltaData == null) return;
+            // Save PaintHeightLayer ControlMaps
+            foreach (var layer in terrain.HeightLayers)
+            {
+                if (layer is PaintHeightLayer paint && paint.ControlMap != null)
+                {
+                    var pixels = renderer.Baker.ReadbackControlMap();
+                    if (pixels != null)
+                    {
+                        SaveDdsSubasset(paint.ControlMap.Guid, pixels);
+                        Debug.Log($"[TerrainLoader] PaintHeightLayer ControlMap saved ({pixels.Length} bytes)");
+                    }
+                }
+            }
 
-            var cacheDir = AssetDatabase.Project.CacheDirectory;
-            var deltaPath = Path.Combine(cacheDir, $"{terrain.Guid}.deltamap");
+            // TODO: Save TextureLayer ControlMaps (splatmaps) — once painting is implemented
+            // TODO: Save Decoration ControlMaps (density maps) — once painting is implemented
+        }
 
-            var packer = new DeltaMapPacker();
-            using (var stream = File.Create(deltaPath))
-                packer.Write(stream, deltaData);
+        /// <summary>
+        /// Writes raw pixel bytes as a DDS subasset to the cache.
+        /// </summary>
+        private void SaveDdsSubasset(string guid, byte[] pixels)
+        {
+            if (string.IsNullOrEmpty(guid) || pixels == null) return;
 
-            Debug.Log($"[TerrainLoader] DeltaMap saved: {deltaPath} ({deltaData.Width}x{deltaData.Height})");
+            var cachePath = AssetDatabase.ResolveCachePathByGuid(guid);
+            if (cachePath == null)
+            {
+                // Create a cache path for this subasset
+                var cacheDir = AssetDatabase.Project.CacheDirectory;
+                cachePath = Path.Combine(cacheDir, $"{guid}.dds");
+            }
+
+            using var stream = File.Create(cachePath);
+            _ddsPacker.Write(stream, new DdsTextureData(pixels));
         }
     }
 }

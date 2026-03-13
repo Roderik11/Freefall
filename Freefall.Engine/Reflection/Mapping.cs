@@ -29,6 +29,15 @@ namespace Freefall.Reflection
                 _fields.Add(field);
         }
 
+        /// <summary>
+        /// Register an alias name that maps to an existing field.
+        /// Used for backward-compatible deserialization when a field has been renamed.
+        /// </summary>
+        public void AddAlias(string oldName, Field field)
+        {
+            _cache.TryAdd(oldName, field);
+        }
+
         public void AddRange(IEnumerable<Field> collection)
         {
             foreach (var field in collection)
