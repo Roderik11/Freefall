@@ -199,7 +199,28 @@ namespace Freefall.Assets.Loaders
             {
                 using var stream = File.OpenRead(cachePath);
                 var data = _ddsPacker.Read(stream);
-                return data?.Bytes;
+                if (data?.Bytes == null || data.Bytes.Length == 0) return null;
+
+                var bytes = data.Bytes;
+
+                // Check if bytes start with DDS magic ("DDS " = 0x20534444).
+                // If so, strip the DDS header to get raw pixel data.
+                if (bytes.Length > 128 && BitConverter.ToInt32(bytes, 0) == 0x20534444)
+                {
+                    int headerSize = 128;
+                    // Check for DX10 extended header
+                    if (bytes.Length > 148 && BitConverter.ToInt32(bytes, 84) == 0x30315844)
+                        headerSize = 148;
+
+                    int pixelDataLen = bytes.Length - headerSize;
+                    Debug.Log($"[TerrainLoader] LoadDdsBytes '{guid}': stripped {headerSize}-byte DDS header, {pixelDataLen} pixel bytes");
+                    var pixels = new byte[pixelDataLen];
+                    Array.Copy(bytes, headerSize, pixels, 0, pixelDataLen);
+                    return pixels;
+                }
+
+                Debug.Log($"[TerrainLoader] LoadDdsBytes '{guid}': {bytes.Length} raw bytes (no DDS header)");
+                return bytes;
             }
             catch (Exception ex)
             {

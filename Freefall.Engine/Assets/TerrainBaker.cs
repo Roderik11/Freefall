@@ -492,11 +492,61 @@ namespace Freefall.Assets
         {
             if (pixels == null || pixels.Length == 0) return;
 
-            int res = resolution;
+            // Strip DDS header if present ("DDS " magic = 0x20534444)
+            int offset = 0;
+            if (pixels.Length > 128 && BitConverter.ToInt32(pixels, 0) == 0x20534444)
+            {
+                offset = 128;
+                // Check for DX10 extended header
+                if (pixels.Length > 148 && BitConverter.ToInt32(pixels, 84) == 0x30315844)
+                    offset = 148;
+            }
+
+            int pixelDataLen = pixels.Length - offset;
+
+            // Detect source format: try R16 (2 bpp) first, then R32 (4 bpp)
+            int srcBpp = 2;
+            int srcRes = (int)Math.Sqrt(pixelDataLen / 2);
+            if (srcRes * srcRes * 2 != pixelDataLen)
+            {
+                srcBpp = 4;
+                srcRes = (int)Math.Sqrt(pixelDataLen / 4);
+            }
+
+            if (srcRes * srcRes * srcBpp != pixelDataLen)
+            {
+                Debug.LogWarning("TerrainBaker", $"UploadControlMap {target}[{layerIndex}]: cannot determine resolution from {pixelDataLen} pixel bytes (offset={offset}). Skipping.");
+                return;
+            }
+
+            // Use the actual data resolution for the GPU texture
+            int res = srcRes;
             var key = (target, layerIndex);
             var gpu = EnsureControlMap(key, res, setControlMap);
             gpu.NeedsInitialClear = false;
             _controlMaps[key] = gpu;
+
+            // Convert R32 → R16 if needed
+            byte[] uploadPixels;
+            if (srcBpp == 4)
+            {
+                Debug.Log($"[TerrainBaker] Converting R32→R16 for {target}[{layerIndex}] ({srcRes}x{srcRes})");
+                uploadPixels = new byte[res * res * 2];
+                for (int i = 0; i < res * res; i++)
+                {
+                    float val = BitConverter.ToSingle(pixels, offset + i * 4);
+                    var half = (Half)val;
+                    var halfBytes = BitConverter.GetBytes(half);
+                    uploadPixels[i * 2] = halfBytes[0];
+                    uploadPixels[i * 2 + 1] = halfBytes[1];
+                }
+                offset = 0;
+            }
+            else
+            {
+                uploadPixels = pixels;
+                // offset stays as-is (may be non-zero if DDS header was stripped)
+            }
 
             var device = Engine.Device;
             int bytesPerPixel = 2;
@@ -524,7 +574,7 @@ namespace Freefall.Assets
                     int srcRowBytes = res * bytesPerPixel;
                     var dstPtr = (byte*)pData;
                     for (int y = 0; y < res; y++)
-                        Marshal.Copy(pixels, y * srcRowBytes, (IntPtr)(dstPtr + y * rowPitch), srcRowBytes);
+                        Marshal.Copy(uploadPixels, offset + y * srcRowBytes, (IntPtr)(dstPtr + y * rowPitch), srcRowBytes);
 
                     uploadResource.Unmap(0);
                 }

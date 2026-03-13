@@ -428,6 +428,7 @@ namespace Freefall.Components
                     baker.Bake(Terrain, list);
                     _heightBakeDirty = false;
                     _heightRangePyramidBuilt = false; // force rebuild with new heights
+                    _bakedAlbedoDirty = true; // re-bake albedo with new terrain shape
                 });
             }
 

@@ -446,10 +446,41 @@ void CSCopySlice(uint3 id : SV_DispatchThreadID) {
 
             using var decoder = factory.CreateDecoderFromFileName(filePath);
             using var frame = decoder.GetFrame(0);
+
+            // Detect 16-bit grayscale source — preserve as R16_UNorm
+            var srcFormat = frame.PixelFormat;
+            bool is16BitGray = (srcFormat == PixelFormat.Format16bppGray);
+
+            if (is16BitGray)
+            {
+                int width = frame.Size.Width;
+                int height = frame.Size.Height;
+
+                // Read raw 16-bit grayscale data (2 bytes per pixel)
+                byte[] pixelData = new byte[width * height * 2];
+                frame.CopyPixels((uint)(width * 2), pixelData);
+
+                Debug.Log($"[Texture] ParseFromFile: 16-bit grayscale {width}x{height} from {Path.GetFileName(filePath)}");
+
+                return new Freefall.Assets.CpuTextureData
+                {
+                    Path = filePath,
+                    PixelData = pixelData,
+                    Width = width,
+                    Height = height,
+                    MipLevels = 1, // no mip chain for heightmaps
+                    ArraySize = 1,
+                    Format = Format.R16_UNorm,
+                    IsCompressed = false,
+                    Mips = new Freefall.Assets.MipLayout[] { new Freefall.Assets.MipLayout { Width = width, Height = height, RowPitch = width * 2, NumRows = height } }
+                };
+            }
+
             using var converter = factory.CreateFormatConverter();
 
             converter.Initialize(frame, PixelFormat.Format32bppRGBA, BitmapDitherType.None, null, 0, BitmapPaletteType.Custom);
 
+            {
             int width = converter.Size.Width;
             int height = converter.Size.Height;
             int mipLevels = 1 + (int)Math.Floor(Math.Log2(Math.Max(width, height)));
@@ -532,6 +563,7 @@ void CSCopySlice(uint3 id : SV_DispatchThreadID) {
                 IsCompressed = false,
                 Mips = mips
             };
+            }
         }
         
          private static Freefall.Assets.CpuTextureData ParseDDS(string filePath)
