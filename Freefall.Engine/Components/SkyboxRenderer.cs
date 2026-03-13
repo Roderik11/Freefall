@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Numerics;
 using Freefall.Graphics;
 using Freefall.Base;
+using Freefall.Assets;
 using Vortice.Mathematics;
 
 namespace Freefall.Components
@@ -10,7 +11,7 @@ namespace Freefall.Components
     public class SkyboxRenderer : Component, IUpdate, IDraw
     {
         private Mesh Mesh;
-        private Material Material;
+        private Material Material = InternalAssets.SkyboxMaterial;
         private MaterialBlock Params = new MaterialBlock();
 
         public bool AnimateTimeOfDay = false;
@@ -61,7 +62,6 @@ namespace Freefall.Components
         protected override void Awake()
         {
             Mesh = Mesh.CreateCube(Engine.Device, 100.0f);
-            Material = new Material(new Effect("mesh_skybox"));
         }
 
         public void Update()

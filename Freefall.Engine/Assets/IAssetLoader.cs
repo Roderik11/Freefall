@@ -42,5 +42,11 @@ namespace Freefall.Assets
         /// </summary>
         Asset LoadFromCache(string cachePath, string name, AssetManager manager, string sourceGuid = null)
             => Load(name, manager);
+
+        /// <summary>
+        /// Save an asset's runtime-generated data to disk (YAML + cache subassets).
+        /// Default: no-op. Override for types with runtime data (e.g. Terrain DeltaMaps).
+        /// </summary>
+        void Save(Asset asset, string savePath) { }
     }
 }

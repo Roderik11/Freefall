@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Numerics;
+using Freefall.Assets.Packers;
 using Freefall.Graphics;
 
 namespace Freefall.Assets
@@ -124,19 +125,25 @@ namespace Freefall.Assets
     public enum ErosionMode { Hydraulic, Thermal, Both }
 
     /// <summary>
-    /// Hand-painted height delta layer. References an internal R32_Float delta texture
-    /// stored in the .terrain asset. The editor brush tool paints into this texture.
-    /// BlendMode controls how the delta is applied (typically Add).
+    /// Hand-painted height layer. A GPU R16_Float texture (DeltaMap) is painted
+    /// by compute shader brush operations. The baker composites it with other layers.
+    /// BlendMode is typically Add (positive = raise, negative = lower).
     /// </summary>
     [Serializable]
     public class PaintHeightLayer : HeightLayer
     {
         /// <summary>
-        /// The delta heightmap painted by the editor brush tool.
-        /// Stored as an internal R32_Float texture in the .terrain asset.
-        /// Positive values raise terrain, negative values lower it.
+        /// GPU R16_Float delta texture painted by the brush compute shader.
+        /// Created on first brush stroke; composited during bake.
         /// </summary>
         public Texture DeltaMap;
+
+        /// <summary>
+        /// CPU-side pixel data loaded from cache, awaiting GPU upload.
+        /// TerrainRenderer checks this on first bake and calls TerrainBaker.UploadDeltaMap().
+        /// </summary>
+        [NonSerialized]
+        public DeltaMapData PendingDeltaMapData;
 
         public PaintHeightLayer()
         {

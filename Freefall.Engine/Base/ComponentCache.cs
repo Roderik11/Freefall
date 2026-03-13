@@ -18,6 +18,8 @@ namespace Freefall.Base
         internal static readonly ComponentSet<IUpdate> UpdateList = new();
         internal static readonly ComponentSet<IDraw> DrawList = new();
 
+        internal static readonly List<T> WakeupList = [];
+
         private static readonly Dictionary<int, int> Indices = [];
         private static readonly Lock _lock = new ();
 
@@ -102,6 +104,7 @@ namespace Freefall.Base
                 Indices.Add(hash, List.Count);
                 component.Entity = entity;
                 List.Add(component);
+                WakeupList.Add(component);
 
                 return component;
             }
@@ -109,6 +112,14 @@ namespace Freefall.Base
 
         public void Update()
         {
+            if (WakeupList.Count > 0)
+            {
+                foreach (var component in WakeupList)
+                    component.WakeUp();
+                
+                WakeupList.Clear();
+            }
+
             if (!HasUpdate) return;
 
             if (HasUpdate)

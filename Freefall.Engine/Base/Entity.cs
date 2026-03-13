@@ -6,7 +6,7 @@ using Freefall.Components;
 
 namespace Freefall.Base
 {
-    public class Entity : IUniqueId
+    public class Entity : IUniqueId, IIndex
     {
         private static readonly Dictionary<Type, Type> _cacheTypes = new();
         private readonly List<Component> _components = new List<Component>();
@@ -94,11 +94,36 @@ namespace Freefall.Base
             return component;
         }
 
+        public Component AddComponent(Type type)
+        {
+            MethodInfo info1 = typeof(Entity).GetMethod("AddComponent", new Type[] { });
+            MethodInfo info2 = info1.MakeGenericMethod(type);
+            return info2.Invoke(this, null) as Component;
+        }
+        
         /// <summary>
         /// Destroy this entity: call Destroy() on all components,
         /// unregister from ComponentCaches, remove from EntityManager.
         /// </summary>
         public void Destroy()
+        {
+            foreach (var component in _components)
+                component.Destroy();
+
+            // Unregister each component from its ComponentCache<T>
+            foreach (var component in _components)
+            {
+                var cacheType = GetCacheType(component.GetType());
+                var removeMethod = cacheType.GetMethod("Remove", BindingFlags.Public | BindingFlags.Static, [typeof(Entity)]);
+                removeMethod?.Invoke(null, [this]);
+            }
+
+            _components.Clear();
+
+            EntityManager.RemoveEntity(this);
+        }
+
+        internal void DestroyImmediatly()
         {
             foreach (var component in _components)
                 component.Destroy();

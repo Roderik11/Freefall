@@ -10,10 +10,10 @@ using Freefall.Serialization;
 namespace Freefall.Assets.Loaders
 {
     /// <summary>
-    /// Loads Terrain assets from cache (.terrain / .asset files).
-    /// Unpacks AssetDefinitionData (YAML), deserializes the Terrain definition,
-    /// then resolves all GUID references via the generic deferred resolver.
-    /// Also loads pre-cooked PhysX HeightField if available.
+    /// Loads and saves Terrain assets.
+    /// Load: unpacks AssetDefinitionData (YAML) from cache, deserializes Terrain,
+    ///       resolves GUID references, loads PhysX HeightField and DeltaMap subassets.
+    /// Save: writes YAML + reads back DeltaMap GPU data to cache.
     /// </summary>
     [AssetLoader(typeof(Terrain))]
     public class TerrainLoader : IAssetLoader
@@ -76,6 +76,9 @@ namespace Freefall.Assets.Loaders
                 // Load pre-cooked PhysX HeightField
                 LoadCookedHeightField(terrain, sourceGuid);
 
+                // Load persisted DeltaMap data (painted terrain)
+                LoadDeltaMaps(terrain, sourceGuid);
+
                 Debug.Log($"[TerrainLoader] '{name}' loaded: {terrain.Layers?.Count ?? 0} layers, " +
                           $"{terrain.ControlMaps?.Count ?? 0} controlmaps, " +
                           $"{terrain.Decorations?.Count ?? 0} decorations, " +
@@ -124,6 +127,95 @@ namespace Freefall.Assets.Loaders
             {
                 Debug.LogWarning("TerrainLoader", $"Failed to load cooked HeightField '{guid}': {ex.Message}");
             }
+        }
+
+        /// <summary>
+        /// Loads persisted DeltaMap data from the cache and populates PendingDeltaMapData
+        /// on the terrain's PaintHeightLayer. GPU upload happens later in TerrainRenderer.
+        /// </summary>
+        private static void LoadDeltaMaps(Terrain terrain, string guid)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(guid)) return;
+
+                var cacheDir = AssetDatabase.Project?.CacheDirectory;
+                if (string.IsNullOrEmpty(cacheDir)) return;
+
+                var deltaPath = Path.Combine(cacheDir, $"{guid}.deltamap");
+                if (!File.Exists(deltaPath)) return;
+
+                var packer = new DeltaMapPacker();
+                DeltaMapData data;
+                using (var stream = File.OpenRead(deltaPath))
+                    data = packer.Read(stream);
+
+                // Assign to the first PaintHeightLayer found
+                foreach (var layer in terrain.HeightLayers)
+                {
+                    if (layer is PaintHeightLayer paint)
+                    {
+                        paint.PendingDeltaMapData = data;
+                        Debug.Log($"[TerrainLoader] DeltaMap loaded: {data.Width}x{data.Height} ({data.Pixels.Length} bytes)");
+                        return;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning("TerrainLoader", $"Failed to load DeltaMap '{guid}': {ex.Message}");
+            }
+        }
+
+        // ── Save ──
+
+        /// <summary>
+        /// Save terrain YAML + DeltaMap GPU data to cache.
+        /// </summary>
+        public void Save(Asset asset, string savePath)
+        {
+            if (asset is not Terrain terrain) return;
+
+            try
+            {
+                // 1. Save YAML definition
+                NativeImporter.Save(savePath, terrain);
+                Debug.Log($"[TerrainLoader] YAML saved: {savePath}");
+
+                // 2. Save DeltaMap data (GPU readback → cache)
+                SaveDeltaMaps(terrain);
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning("TerrainLoader", $"Failed to save terrain: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Finds the active TerrainBaker, reads back DeltaMap from GPU, packs to cache.
+        /// </summary>
+        private static void SaveDeltaMaps(Terrain terrain)
+        {
+            if (string.IsNullOrEmpty(terrain.Guid)) return;
+
+            // Find the active TerrainRenderer that owns this terrain
+            var renderer = EntityManager.Entities
+                .Select(e => e.GetComponent<Freefall.Components.TerrainRenderer>())
+                .FirstOrDefault(tr => tr?.Terrain == terrain);
+
+            if (renderer?.Baker == null) return;
+
+            var deltaData = renderer.Baker.ReadbackDeltaMap();
+            if (deltaData == null) return;
+
+            var cacheDir = AssetDatabase.Project.CacheDirectory;
+            var deltaPath = Path.Combine(cacheDir, $"{terrain.Guid}.deltamap");
+
+            var packer = new DeltaMapPacker();
+            using (var stream = File.Create(deltaPath))
+                packer.Write(stream, deltaData);
+
+            Debug.Log($"[TerrainLoader] DeltaMap saved: {deltaPath} ({deltaData.Width}x{deltaData.Height})");
         }
     }
 }

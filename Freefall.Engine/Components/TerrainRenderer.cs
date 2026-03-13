@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Numerics;
 using System.Runtime.InteropServices;
+using System.ComponentModel;
 using Vortice.Direct3D12;
 using Vortice.DXGI;
 using Freefall.Assets;
@@ -24,7 +25,10 @@ namespace Freefall.Components
 
         // ───── Asset Reference ────────────────────────────────────────────
         public Terrain? Terrain;
-        public Material? Material;
+
+        [Browsable(false)]
+        public Material? Material = InternalAssets.TerrainMaterial;
+        [Browsable(false)]
         public Material? DecoratorMaterial = InternalAssets.DecoratorMaterial;
 
         // ───── Rendering Parameters ───────────────────────────────────────
@@ -191,6 +195,48 @@ namespace Freefall.Components
         private TerrainBaker _heightBaker;
         private bool _heightBakeDirty = true;
 
+        /// <summary>Exposes the height baker for brush operations.</summary>
+        public TerrainBaker Baker => _heightBaker ??= new TerrainBaker();
+
+        /// <summary>Marks the baked heightmap as dirty, triggering a rebake next frame.</summary>
+        public void MarkHeightDirty() => _heightBakeDirty = true;
+
+        /// <summary>
+        /// Enqueues a brush stroke to be dispatched on the render thread.
+        /// Finds or creates the PaintHeightLayer automatically.
+        /// Points are in terrain UV space [0..1].
+        /// </summary>
+        public void EnqueueBrushStroke(Vector2[] strokePoints, int pointCount,
+                                       TerrainBaker.BrushMode mode, float strength,
+                                       float radius, float falloff,
+                                       float targetHeight = 0)
+        {
+            if (Terrain == null || pointCount == 0) return;
+
+            // Find or create PaintHeightLayer
+            var paintLayer = Terrain.HeightLayers.OfType<PaintHeightLayer>().FirstOrDefault();
+            if (paintLayer == null)
+            {
+                paintLayer = new PaintHeightLayer();
+                Terrain.HeightLayers.Add(paintLayer);
+            }
+
+            // Capture references for the lambda
+            var terrain = Terrain;
+            var baker = Baker;
+            var pts = strokePoints;
+            int count = pointCount;
+
+            CommandBuffer.Enqueue(RenderPass.Opaque, (list) =>
+            {
+                baker.PaintBrush(terrain, paintLayer, list,
+                                 pts, count, mode, strength,
+                                 radius, falloff, targetHeight);
+                _heightBakeDirty = true;
+                _heightRangePyramidBuilt = false;
+            });
+        }
+
         // ───── Lifecycle ──────────────────────────────────────────────────
 
         protected override void Awake()
@@ -238,6 +284,17 @@ namespace Freefall.Components
             if (_heightBakeDirty && Terrain.HeightLayers.Count > 0)
             {
                 _heightBaker ??= new TerrainBaker();
+
+                // Upload any pending DeltaMap data loaded from cache
+                foreach (var layer in Terrain.HeightLayers)
+                {
+                    if (layer is PaintHeightLayer paint && paint.PendingDeltaMapData != null)
+                    {
+                        _heightBaker.UploadDeltaMap(paint.PendingDeltaMapData, paint);
+                        paint.PendingDeltaMapData = null; // consumed
+                    }
+                }
+
                 CommandBuffer.Enqueue(RenderPass.Opaque, (list) =>
                 {
                     _heightBaker.Bake(Terrain, list);
@@ -965,19 +1022,7 @@ namespace Freefall.Components
             else
                 ControlMapsArray = InternalAssets.BlackArray;
 
-            // Build DecoMapsArray from decorator density maps
-            var decoList = new List<Texture>();
-            if (Terrain?.DecoMaps != null)
-            {
-                foreach (var dm in Terrain.DecoMaps)
-                {
-                    if (dm != null && dm.Native != null) decoList.Add(dm);
-                }
-            }
-            if (decoList.Count > 0)
-                DecoMapsArray = Texture.CreateTexture2DArray(device, decoList);
-            else
-                DecoMapsArray = null;
+            // DecoMapsArray is built by BuildDecoratorBuffers() from per-Decoration DensityMaps
         }
 
         // ───── IHeightProvider ────────────────────────────────────────────

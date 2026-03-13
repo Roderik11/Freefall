@@ -72,7 +72,6 @@ namespace Freefall.Assets
 
         // ── Ground Coverage ──
         public List<Decoration> Decorations = new();
-        public List<Texture> DecoMaps = new();
         
         [ValueRange(0.1f, 10)]
         public float DecorationDensity = 0.1f;

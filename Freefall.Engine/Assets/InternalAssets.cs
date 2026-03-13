@@ -19,6 +19,7 @@ namespace Freefall.Assets
         // ── Stable GUIDs (hardcoded, never change) ──
         public static class Guids
         {
+            // textures
             public const string White           = "00000000000000000000000000000001";
             public const string FlatNormal      = "00000000000000000000000000000002";
             public const string DefaultDiffuse  = "00000000000000000000000000000003";
@@ -26,15 +27,28 @@ namespace Freefall.Assets
             public const string DefaultSpecular = "00000000000000000000000000000005";
             public const string Black           = "00000000000000000000000000000006";
 
+            // texture arrays
             public const string WhiteArray      = "00000000000000000000000000000007";
             public const string FlatNormalArray = "00000000000000000000000000000008";
             public const string BlackArray      = "00000000000000000000000000000009";
+            
+            // effects
             public const string DefaultEffect   = "00000000000000000000000000000010";
             public const string TerrainEffect   = "00000000000000000000000000000011";
             public const string DecoratorEffect  = "00000000000000000000000000000012";
             public const string FoliageEffect    = "00000000000000000000000000000013";
             public const string TrunkEffect      = "00000000000000000000000000000014";
+            public const string SkyboxEffect     = "00000000000000000000000000000015";
+
+
+            // materials
             public const string DefaultMaterial = "00000000000000000000000000000020";
+            public const string TerrainMaterial = "00000000000000000000000000000021";
+            public const string DecoratorMaterial = "00000000000000000000000000000022";
+            public const string FoliageMaterial = "00000000000000000000000000000023";
+            public const string TrunkMaterial = "00000000000000000000000000000024";
+            public const string SkyboxMaterial = "00000000000000000000000000000025";
+
         }
 
         // --- Utility textures (procedural) ---
@@ -57,8 +71,14 @@ namespace Freefall.Assets
         public static Effect DecoratorEffect { get; private set; }
         public static Effect FoliageEffect { get; private set; }
         public static Effect TrunkEffect { get; private set; }
+        public static Effect SkyboxEffect { get; private set; }
+
         public static Material DefaultMaterial { get; private set; }
+        public static Material TerrainMaterial { get; private set; }
         public static Material DecoratorMaterial { get; private set; }
+        public static Material FoliageMaterial { get; private set; }
+        public static Material TrunkMaterial { get; private set; }
+        public static Material SkyboxMaterial { get; private set; }
 
         public static void Initialize(GraphicsDevice device)
         {
@@ -113,12 +133,22 @@ namespace Freefall.Assets
             DecoratorEffect = new Effect("grass");
             FoliageEffect = new Effect("gbuffer_foliage");
             TrunkEffect = new Effect("gbuffer_trunk");
+            SkyboxEffect = new Effect("mesh_skybox");
+
             DefaultMaterial = new Material(DefaultEffect);
             DefaultMaterial.Name = "DefaultMaterial";
             DefaultMaterial.SetTexture("AlbedoTex", DefaultDiffuse);
             DefaultMaterial.SetTexture("NormalTex", DefaultNormal);
             DecoratorMaterial = new Material(DecoratorEffect);
             DecoratorMaterial.Name = "DecoratorMaterial";
+            TerrainMaterial = new Material(TerrainEffect);
+            TerrainMaterial.Name = "TerrainMaterial";
+            FoliageMaterial = new Material(FoliageEffect);
+            FoliageMaterial.Name = "FoliageMaterial";
+            TrunkMaterial = new Material(TrunkEffect);
+            TrunkMaterial.Name = "TrunkMaterial";
+            SkyboxMaterial = new Material(SkyboxEffect);
+            SkyboxMaterial.Name = "SkyboxMaterial";
         }
 
         /// <summary>
@@ -138,12 +168,20 @@ namespace Freefall.Assets
             manager.RegisterAsset(Guids.DefaultDiffuse, DefaultDiffuse);
             manager.RegisterAsset(Guids.DefaultNormal, DefaultNormal);
             manager.RegisterAsset(Guids.DefaultSpecular, DefaultSpecular);
+
             manager.RegisterAsset(Guids.DefaultEffect, DefaultEffect);
             manager.RegisterAsset(Guids.TerrainEffect, TerrainEffect);
             manager.RegisterAsset(Guids.DecoratorEffect, DecoratorEffect);
             manager.RegisterAsset(Guids.FoliageEffect, FoliageEffect);
             manager.RegisterAsset(Guids.TrunkEffect, TrunkEffect);
+            manager.RegisterAsset(Guids.SkyboxEffect, SkyboxEffect);
+
             manager.RegisterAsset(Guids.DefaultMaterial, DefaultMaterial);
+            manager.RegisterAsset(Guids.DecoratorMaterial, DecoratorMaterial);
+            manager.RegisterAsset(Guids.TerrainMaterial, TerrainMaterial);
+            manager.RegisterAsset(Guids.FoliageMaterial, FoliageMaterial);
+            manager.RegisterAsset(Guids.TrunkMaterial, TrunkMaterial);
+            manager.RegisterAsset(Guids.SkyboxMaterial, SkyboxMaterial);
         }
     }
 }

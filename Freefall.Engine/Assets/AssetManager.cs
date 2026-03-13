@@ -295,6 +295,26 @@ namespace Freefall.Assets
             return (T)importMethod.Invoke(importer, [fullPath]);
         }
 
+        /// <summary>
+        /// Save an asset via the type-specific IAssetLoader.Save() method.
+        /// Falls back to NativeImporter.Save() for types without a dedicated saver.
+        /// </summary>
+        public void SaveAsset(Asset asset, string savePath)
+        {
+            if (asset == null || string.IsNullOrEmpty(savePath)) return;
+
+            var assetType = asset.GetType();
+            if (Loaders.TryGetValue(assetType, out var loader))
+            {
+                loader.Save(asset, savePath);
+            }
+            else
+            {
+                // Fallback: YAML-only save
+                Freefall.Serialization.NativeImporter.Save(savePath, asset);
+            }
+        }
+
         public Task<T> LoadAsync<T>(string path) where T : Asset
         {
              // For now, wrap synchronous load.

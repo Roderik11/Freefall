@@ -176,9 +176,9 @@ namespace Freefall
             _flushDisposeSw.Stop();
 
             // Flush pending entity additions before Update/Render
-            var _flushPendingSw = System.Diagnostics.Stopwatch.StartNew();
-            Base.EntityManager.FlushPending();
-            _flushPendingSw.Stop();
+            //var _flushPendingSw = System.Diagnostics.Stopwatch.StartNew();
+            //Base.EntityManager.FlushPending();
+            //_flushPendingSw.Stop();
 
             // Physics (fixed-timestep)
             var _physicsSw = System.Diagnostics.Stopwatch.StartNew();
