@@ -209,6 +209,7 @@ namespace Freefall.Components
         }
 
         private bool _textureArraysDirty;
+        private List<Texture> _pendingPackedSlices;
 
         /// <summary>
         /// Enqueues a brush stroke to be dispatched on the render thread.
@@ -468,6 +469,21 @@ namespace Freefall.Components
                 }
             }
 
+            // GPU splatmap packing — deferred: process pending packed slices from last frame
+            if (_pendingPackedSlices != null)
+            {
+                try
+                {
+                    ControlMapsArray = Texture.CreateTexture2DArray(Engine.Device, _pendingPackedSlices);
+                    _bakedAlbedoDirty = true;
+                }
+                catch (Exception ex)
+                {
+                    Debug.LogError("[TerrainRenderer]", $"ControlMapsArray creation failed: {ex.Message}");
+                }
+                _pendingPackedSlices = null;
+            }
+
             // GPU splatmap packing — pack per-layer R16 ControlMaps into RGBA slices
             if (_splatPackDirty && Terrain?.Layers != null && Terrain.Layers.Count > 0)
             {
@@ -488,15 +504,13 @@ namespace Freefall.Components
                 {
                     int res = Terrain.HeightmapResolution;
                     var indices = srvIndices;
+                    var renderer = this;
                     CommandBuffer.Enqueue(RenderPass.Opaque, (list) =>
                     {
                         var packedSlices = TerrainBaker.Instance.PackControlMaps(list, indices, res);
                         if (packedSlices.Count > 0)
-                        {
-                            ControlMapsArray = Texture.CreateTexture2DArray(Engine.Device, packedSlices);
-                            _bakedAlbedoDirty = true;
-                        }
-                        _splatPackDirty = false;
+                            renderer._pendingPackedSlices = packedSlices;
+                        renderer._splatPackDirty = false;
                     });
                 }
                 else
