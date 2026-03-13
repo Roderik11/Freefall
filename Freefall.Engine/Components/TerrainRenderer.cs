@@ -271,6 +271,69 @@ namespace Freefall.Components
             });
         }
 
+        /// <summary>
+        /// Enqueues a channel import from a source texture into a ControlMap.
+        /// channelIndex: 0=R, 1=G, 2=B, 3=A
+        /// </summary>
+        public void EnqueueImportChannel(Texture sourceTexture, int channelIndex,
+                                         TerrainBaker.ControlMapTarget target, int layerIndex)
+        {
+            if (Terrain == null || sourceTexture == null) return;
+
+            // Resolve setter
+            Action<Texture> setControlMap = null;
+            switch (target)
+            {
+                case TerrainBaker.ControlMapTarget.Height:
+                {
+                    var paintLayer = Terrain.HeightLayers.OfType<PaintHeightLayer>().FirstOrDefault();
+                    if (paintLayer == null)
+                    {
+                        paintLayer = new PaintHeightLayer();
+                        Terrain.HeightLayers.Add(paintLayer);
+                    }
+                    var layer = paintLayer;
+                    setControlMap = tex => layer.ControlMap = tex;
+                    break;
+                }
+                case TerrainBaker.ControlMapTarget.Splatmap:
+                    if (Terrain.Layers != null && layerIndex >= 0 && layerIndex < Terrain.Layers.Count)
+                    {
+                        var layer = Terrain.Layers[layerIndex];
+                        setControlMap = tex => layer.ControlMap = tex;
+                    }
+                    break;
+                case TerrainBaker.ControlMapTarget.Density:
+                    if (Terrain.Decorations != null && layerIndex >= 0 && layerIndex < Terrain.Decorations.Count)
+                    {
+                        var deco = Terrain.Decorations[layerIndex];
+                        setControlMap = tex => deco.ControlMap = tex;
+                    }
+                    break;
+            }
+
+            if (setControlMap == null) return;
+
+            var terrain = Terrain;
+            var baker = Baker;
+            var src = sourceTexture;
+            int ch = channelIndex;
+            var tgt = target;
+            int idx = layerIndex;
+            var setter = setControlMap;
+            bool isHeightTarget = target == TerrainBaker.ControlMapTarget.Height;
+
+            CommandBuffer.Enqueue(RenderPass.Opaque, (list) =>
+            {
+                baker.ImportChannel(terrain, tgt, idx, setter, list, src, ch);
+                if (isHeightTarget)
+                {
+                    _heightBakeDirty = true;
+                    _heightRangePyramidBuilt = false;
+                }
+            });
+        }
+
         // ───── Lifecycle ──────────────────────────────────────────────────
 
         protected override void Awake()

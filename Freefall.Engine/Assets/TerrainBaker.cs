@@ -23,6 +23,7 @@ namespace Freefall.Assets
         private int _kernelStampGroup;
         private int _kernelPaintBrush;
         private int _kernelClearDelta;
+        private int _kernelImportChannel;
 
         // GPU resources for the baked heightmap
         private ID3D12Resource _heightTexture;
@@ -67,6 +68,7 @@ namespace Freefall.Assets
             _kernelStampGroup = _cs.FindKernel("CS_StampGroup");
             _kernelPaintBrush = _cs.FindKernel("CS_PaintBrush");
             _kernelClearDelta = _cs.FindKernel("CS_ClearDelta");
+            _kernelImportChannel = _cs.FindKernel("CS_ImportChannel");
             _initialized = true;
         }
 
@@ -314,6 +316,37 @@ namespace Freefall.Assets
 
             _cs.SetPushConstant(_kernelClearDelta, "Output", gpu.UAV);
             _cs.Dispatch(_kernelClearDelta, cmd, groups, groups);
+            cmd.ResourceBarrierUnorderedAccessView(gpu.Texture);
+        }
+
+        /// <summary>
+        /// Imports a single channel from a source texture into a ControlMap.
+        /// channelIndex: 0=R, 1=G, 2=B, 3=A
+        /// </summary>
+        public void ImportChannel(Terrain terrain, ControlMapTarget target, int layerIndex,
+                                  Action<Texture> setControlMap,
+                                  ID3D12GraphicsCommandList cmd,
+                                  Texture sourceTexture, int channelIndex)
+        {
+            if (sourceTexture == null || sourceTexture.BindlessIndex == 0) return;
+
+            EnsureInitialized();
+            int res = terrain.HeightmapResolution;
+            var key = (target, layerIndex);
+            var gpu = EnsureControlMap(key, res, setControlMap);
+            gpu.NeedsInitialClear = false;
+            _controlMaps[key] = gpu;
+
+            var device = Engine.Device;
+            cmd.SetComputeRootSignature(device.GlobalRootSignature);
+            cmd.SetDescriptorHeaps(1, new[] { device.SrvHeap });
+
+            uint groups = (uint)((res + 7) / 8);
+
+            _cs.SetPushConstant(_kernelImportChannel, "Source", sourceTexture.BindlessIndex);
+            _cs.SetPushConstant(_kernelImportChannel, "Output", gpu.UAV);
+            _cs.SetPushConstant(_kernelImportChannel, "BlendMode", (uint)channelIndex);
+            _cs.Dispatch(_kernelImportChannel, cmd, groups, groups);
             cmd.ResourceBarrierUnorderedAccessView(gpu.Texture);
         }
 

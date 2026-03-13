@@ -11,6 +11,7 @@
 #pragma kernel CS_Clear
 #pragma kernel CS_PaintBrush
 #pragma kernel CS_ClearDelta
+#pragma kernel CS_ImportChannel
 
 // Push constants (root parameter 0, register b3) — bindless indices + params
 cbuffer PushConstants : register(b3)
@@ -245,4 +246,23 @@ void CS_ClearDelta(uint3 dtid : SV_DispatchThreadID)
     DeltaMap.GetDimensions(w, h);
     if (dtid.x >= w || dtid.y >= h) return;
     DeltaMap[dtid.xy] = 0;
+}
+
+// ── CS_ImportChannel: Extract a single channel from a source texture ──
+// SourceIdx → any texture, OutputIdx → R16 UAV
+// BlendMode repurposed as channel index: 0=R, 1=G, 2=B, 3=A
+[numthreads(8, 8, 1)]
+void CS_ImportChannel(uint3 dtid : SV_DispatchThreadID)
+{
+    RWTexture2D<float> Output = ResourceDescriptorHeap[OutputIdx];
+    uint w, h;
+    Output.GetDimensions(w, h);
+    if (dtid.x >= w || dtid.y >= h) return;
+
+    Texture2D Source = ResourceDescriptorHeap[SourceIdx];
+    float2 uv = (float2(dtid.xy) + 0.5) / float2(w, h);
+    float4 sample = Source.SampleLevel(sampLinear, uv, 0);
+
+    float value = sample[BlendMode]; // BlendMode = channel index (0-3)
+    Output[dtid.xy] = value;
 }
