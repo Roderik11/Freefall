@@ -61,6 +61,16 @@ namespace Freefall.Assets
         }
 
         /// <summary>
+        /// Non-generic register for dynamic asset type creation.
+        /// </summary>
+        public void RegisterAsset(Type assetType, string guid, Asset asset)
+        {
+            asset.Guid = guid;
+            string cacheKey = $"{assetType.Name}:guid:{guid}";
+            _assets[cacheKey] = asset;
+        }
+
+        /// <summary>
         /// Discover all IAssetLoader implementations marked with [AssetLoader].
         /// </summary>
         private static void DiscoverLoaders()
