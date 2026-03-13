@@ -27,6 +27,7 @@ namespace Freefall.Assets
         private int _kernelPaintBrush;
         private int _kernelClearDelta;
         private int _kernelImportChannel;
+        private int _kernelPackChannels;
 
         // GPU resources for the baked heightmap
         private ID3D12Resource _heightTexture;
@@ -72,6 +73,7 @@ namespace Freefall.Assets
             _kernelPaintBrush = _cs.FindKernel("CS_PaintBrush");
             _kernelClearDelta = _cs.FindKernel("CS_ClearDelta");
             _kernelImportChannel = _cs.FindKernel("CS_ImportChannel");
+            _kernelPackChannels = _cs.FindKernel("CS_PackChannels");
             _initialized = true;
         }
 
@@ -554,6 +556,88 @@ namespace Freefall.Assets
             }
         }
 
+        // ── RGBA Packing ─────────────────────────────────────────────
+
+        private GraphicsBuffer _packIndexBuffer;
+
+        /// <summary>
+        /// Packs per-layer R16 ControlMaps into ceil(N/4) RGBA slices for the shader.
+        /// layers: SRV bindless indices of the R16 ControlMaps (0 = no data for that layer).
+        /// Returns a list of packed RGBA textures suitable for Texture.CreateTexture2DArray.
+        /// </summary>
+        public List<Texture> PackControlMaps(ID3D12GraphicsCommandList cmd, uint[] layerSrvIndices, int resolution)
+        {
+            if (layerSrvIndices == null || layerSrvIndices.Length == 0)
+                return new List<Texture>();
+
+            EnsureInitialized();
+            var device = Engine.Device;
+            cmd.SetComputeRootSignature(device.GlobalRootSignature);
+            cmd.SetDescriptorHeaps(1, new[] { device.SrvHeap });
+
+            int layerCount = layerSrvIndices.Length;
+            int sliceCount = (layerCount + 3) / 4;
+            uint groups = (uint)((resolution + 7) / 8);
+
+            // Ensure index buffer (4 uint per slice)
+            if (_packIndexBuffer == null || _packIndexBuffer.ElementCount < 4)
+            {
+                _packIndexBuffer?.Dispose();
+                _packIndexBuffer = GraphicsBuffer.CreateUpload<uint>(4, mapped: true);
+            }
+
+            var result = new List<Texture>(sliceCount);
+
+            for (int slice = 0; slice < sliceCount; slice++)
+            {
+                // Create RGBA texture for this slice
+                var rgbaTexture = device.CreateTexture2D(
+                    Format.R8G8B8A8_UNorm, resolution, resolution, 1, 1,
+                    ResourceFlags.AllowUnorderedAccess, ResourceStates.Common);
+
+                uint uav = device.AllocateBindlessIndex();
+                device.NativeDevice.CreateUnorderedAccessView(rgbaTexture, null,
+                    new UnorderedAccessViewDescription
+                    {
+                        Format = Format.R8G8B8A8_UNorm,
+                        ViewDimension = UnorderedAccessViewDimension.Texture2D,
+                        Texture2D = new Texture2DUnorderedAccessView { MipSlice = 0 }
+                    }, device.GetCpuHandle(uav));
+
+                uint srv = device.AllocateBindlessIndex();
+                device.NativeDevice.CreateShaderResourceView(rgbaTexture,
+                    new ShaderResourceViewDescription
+                    {
+                        Format = Format.R8G8B8A8_UNorm,
+                        ViewDimension = ShaderResourceViewDimension.Texture2D,
+                        Shader4ComponentMapping = ShaderComponentMapping.Default,
+                        Texture2D = new Texture2DShaderResourceView { MostDetailedMip = 0, MipLevels = 1 }
+                    }, device.GetCpuHandle(srv));
+
+                // Upload source indices for this slice
+                int channelCount = Math.Min(4, layerCount - slice * 4);
+                unsafe
+                {
+                    var ptr = _packIndexBuffer.WritePtr<uint>();
+                    for (int c = 0; c < 4; c++)
+                    {
+                        int layerIdx = slice * 4 + c;
+                        ptr[c] = layerIdx < layerCount ? layerSrvIndices[layerIdx] : 0;
+                    }
+                }
+
+                _cs.SetPushConstant(_kernelPackChannels, "Output", uav);
+                _cs.SetBuffer(_kernelPackChannels, "StampBuf", _packIndexBuffer);
+                _cs.SetPushConstant(_kernelPackChannels, "BlendMode", (uint)channelCount);
+                _cs.Dispatch(_kernelPackChannels, cmd, groups, groups);
+                cmd.ResourceBarrierUnorderedAccessView(rgbaTexture);
+
+                result.Add(Texture.WrapNative(rgbaTexture, srv));
+            }
+
+            return result;
+        }
+
         public void Dispose()
         {
             _heightTexture?.Release();
@@ -562,6 +646,7 @@ namespace Freefall.Assets
             _controlMaps.Clear();
             _stampBuffer?.Dispose();
             _strokeBuffer?.Dispose();
+            _packIndexBuffer?.Dispose();
             _cs?.Dispose();
         }
     }

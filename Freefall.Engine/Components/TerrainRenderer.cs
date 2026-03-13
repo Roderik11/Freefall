@@ -193,9 +193,11 @@ namespace Freefall.Components
 
         // ───── Height Bake (GPU layer compositor) ─────────────────────────
         private bool _heightBakeDirty = true;
+        private bool _splatPackDirty = true;
 
         /// <summary>Marks the baked heightmap as dirty, triggering a rebake next frame.</summary>
         public void MarkHeightDirty() => _heightBakeDirty = true;
+        public void MarkSplatDirty() => _splatPackDirty = true;
 
         /// <summary>
         /// Enqueues a brush stroke to be dispatched on the render thread.
@@ -264,6 +266,8 @@ namespace Freefall.Components
                     _heightBakeDirty = true;
                     _heightRangePyramidBuilt = false;
                 }
+                if (tgt == TerrainBaker.ControlMapTarget.Splatmap)
+                    _splatPackDirty = true;
             });
         }
 
@@ -327,6 +331,8 @@ namespace Freefall.Components
                     _heightBakeDirty = true;
                     _heightRangePyramidBuilt = false;
                 }
+                if (tgt == TerrainBaker.ControlMapTarget.Splatmap)
+                    _splatPackDirty = true;
             });
         }
 
@@ -397,6 +403,43 @@ namespace Freefall.Components
                     _heightBakeDirty = false;
                     _heightRangePyramidBuilt = false; // force rebuild with new heights
                 });
+            }
+
+            // GPU splatmap packing — pack per-layer R16 ControlMaps into RGBA slices
+            if (_splatPackDirty && Terrain?.Layers != null && Terrain.Layers.Count > 0)
+            {
+                // Check if any layer has a ControlMap with a valid GPU resource
+                var srvIndices = new uint[Terrain.Layers.Count];
+                bool hasAny = false;
+                for (int i = 0; i < Terrain.Layers.Count; i++)
+                {
+                    var cm = Terrain.Layers[i].ControlMap;
+                    if (cm != null && cm.BindlessIndex != 0)
+                    {
+                        srvIndices[i] = cm.BindlessIndex;
+                        hasAny = true;
+                    }
+                }
+
+                if (hasAny)
+                {
+                    int res = Terrain.HeightmapResolution;
+                    var indices = srvIndices;
+                    CommandBuffer.Enqueue(RenderPass.Opaque, (list) =>
+                    {
+                        var packedSlices = TerrainBaker.Instance.PackControlMaps(list, indices, res);
+                        if (packedSlices.Count > 0)
+                        {
+                            ControlMapsArray = Texture.CreateTexture2DArray(Engine.Device, packedSlices);
+                            _bakedAlbedoDirty = true;
+                        }
+                        _splatPackDirty = false;
+                    });
+                }
+                else
+                {
+                    _splatPackDirty = false;
+                }
             }
 
             // Set shared material params
@@ -1104,34 +1147,26 @@ namespace Freefall.Components
             // Build ControlMapsArray for GPU splatmap sampling
             // The GPU expects ceil(layerCount/4) RGBA slices, each channel = one layer weight.
             // Legacy path: old RGBA splatmaps are already packed correctly.
-            // New path: per-layer R16 ControlMaps need packing into RGBA slices (TODO: compute blit).
-            var controlList = new List<Texture>();
-
-            // Check if we have legacy pre-packed RGBA splatmaps (from migration)
+            // New path: per-layer R16 ControlMaps are packed by CS_PackChannels in Draw().
             if (Terrain?._legacyControlMaps != null && Terrain._legacyControlMaps.Count > 0)
             {
+                var controlList = new List<Texture>();
                 foreach (var splatmap in Terrain._legacyControlMaps)
                 {
                     if (splatmap?.Native != null)
                         controlList.Add(splatmap);
                 }
+                if (controlList.Count > 0)
+                    ControlMapsArray = Texture.CreateTexture2DArray(device, controlList);
+                else
+                    ControlMapsArray = InternalAssets.BlackArray;
             }
-            else if (Terrain?.Layers != null)
-            {
-                // Per-layer R16 ControlMaps — collect for packing into RGBA slices
-                // For now, pass them directly (works if they're already RGBA from old import)
-                foreach (var layer in Terrain.Layers)
-                {
-                    if (layer.ControlMap != null && layer.ControlMap.Native != null)
-                        controlList.Add(layer.ControlMap);
-                }
-            }
-            
-            // Control Fallback
-            if (controlList.Count > 0)
-                ControlMapsArray = Texture.CreateTexture2DArray(device, controlList);
             else
+            {
+                // Per-layer R16 ControlMaps — pack lazily in Draw()
+                _splatPackDirty = true;
                 ControlMapsArray = InternalAssets.BlackArray;
+            }
 
             // DecoMapsArray is built by BuildDecoratorBuffers() from per-Decoration ControlMaps
         }

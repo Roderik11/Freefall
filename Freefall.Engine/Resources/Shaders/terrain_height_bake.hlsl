@@ -12,6 +12,7 @@
 #pragma kernel CS_PaintBrush
 #pragma kernel CS_ClearDelta
 #pragma kernel CS_ImportChannel
+#pragma kernel CS_PackChannels
 
 // Push constants (root parameter 0, register b3) — bindless indices + params
 cbuffer PushConstants : register(b3)
@@ -265,4 +266,34 @@ void CS_ImportChannel(uint3 dtid : SV_DispatchThreadID)
 
     float value = sample[BlendMode]; // BlendMode = channel index (0-3)
     Output[dtid.xy] = value;
+}
+
+// ── CS_PackChannels: Pack up to 4 R16 sources into one RGBA pixel ──
+// StampBufIdx → StructuredBuffer<uint> with up to 4 source SRV bindless indices
+// OutputIdx → UAV: RWTexture2D<float4>
+// BlendMode → number of valid channels (1-4)
+[numthreads(8, 8, 1)]
+void CS_PackChannels(uint3 dtid : SV_DispatchThreadID)
+{
+    RWTexture2D<float4> Output = ResourceDescriptorHeap[OutputIdx];
+    uint w, h;
+    Output.GetDimensions(w, h);
+    if (dtid.x >= w || dtid.y >= h) return;
+
+    StructuredBuffer<uint> SourceIndices = ResourceDescriptorHeap[StampBufIdx];
+    float2 uv = (float2(dtid.xy) + 0.5) / float2(w, h);
+    float4 packed = float4(0, 0, 0, 0);
+
+    uint channelCount = BlendMode;
+    for (uint c = 0; c < channelCount && c < 4; c++)
+    {
+        uint srcIdx = SourceIndices[c];
+        if (srcIdx != 0)
+        {
+            Texture2D<float> Src = ResourceDescriptorHeap[srcIdx];
+            packed[c] = Src.SampleLevel(sampLinear, uv, 0);
+        }
+    }
+
+    Output[dtid.xy] = packed;
 }
