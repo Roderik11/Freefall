@@ -379,9 +379,17 @@ namespace Freefall.Components
                     if (!_texturesInitialized) return; // no layers yet on first init — skip
                     // Layers removed — clear to fallbacks
                 }
-                SetupLayerTiling();
-                _texturesInitialized = true;
-                _textureArraysDirty = false;
+                try
+                {
+                    SetupLayerTiling();
+                    _texturesInitialized = true;
+                    _textureArraysDirty = false;
+                }
+                catch (Exception ex)
+                {
+                    Debug.LogError("[TerrainRenderer]", $"SetupLayerTiling failed: {ex.Message}");
+                    // Keep _textureArraysDirty=true so we retry next frame
+                }
             }
         }
 
