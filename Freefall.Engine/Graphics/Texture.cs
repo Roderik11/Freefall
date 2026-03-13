@@ -71,22 +71,23 @@ namespace Freefall.Graphics
              var first = textures[0];
              var refDesc = first.Native.Description;
 
-             // Check if all textures share the same format
+             // Check if all textures share the same format AND dimensions
              bool formatsMatch = true;
+             bool dimsMatch = true;
              for (int i = 1; i < textures.Count; i++)
              {
-                 if (textures[i].Native.Description.Format != refDesc.Format)
-                 {
+                 var d = textures[i].Native.Description;
+                 if (d.Format != refDesc.Format)
                      formatsMatch = false;
-                     break;
-                 }
+                 if (d.Width != refDesc.Width || d.Height != refDesc.Height)
+                     dimsMatch = false;
              }
 
-             Debug.Log($"[Texture] CreateTexture2DArray: {textures.Count} textures, formatsMatch={formatsMatch}, refFormat={refDesc.Format}, stripSrgb={stripSrgb}, forceDecompress={forceDecompress}");
+             Debug.Log($"[Texture] CreateTexture2DArray: {textures.Count} textures, formatsMatch={formatsMatch}, dimsMatch={dimsMatch}, refFormat={refDesc.Format}, refSize={refDesc.Width}x{refDesc.Height}, stripSrgb={stripSrgb}, forceDecompress={forceDecompress}");
 
              // forceDecompress: always use compute path to decompress BC formats to R8G8B8A8_UNorm
              // (BC1 only has ~32 grayscale levels — far too lossy for density/control data)
-             if (formatsMatch && !forceDecompress)
+             if (formatsMatch && dimsMatch && !forceDecompress)
                  return CreateTexture2DArrayCopy(device, textures, refDesc, stripSrgb);
              else
                  return CreateTexture2DArrayCompute(device, textures, refDesc);

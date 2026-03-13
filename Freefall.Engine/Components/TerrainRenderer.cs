@@ -383,13 +383,12 @@ namespace Freefall.Components
                 {
                     SetupLayerTiling();
                     _texturesInitialized = true;
-                    _textureArraysDirty = false;
                 }
                 catch (Exception ex)
                 {
                     Debug.LogError("[TerrainRenderer]", $"SetupLayerTiling failed: {ex.Message}");
-                    // Keep _textureArraysDirty=true so we retry next frame
                 }
+                _textureArraysDirty = false; // always clear — MarkLayersDirty() re-sets if needed
             }
         }
 
