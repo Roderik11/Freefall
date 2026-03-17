@@ -32,9 +32,10 @@ namespace Freefall.Components
         public Material? DecoratorMaterial = InternalAssets.DecoratorMaterial;
 
         // ───── Rendering Parameters ───────────────────────────────────────
-        public float PixelErrorThreshold = 2.0f;
+        private float PixelErrorThreshold = 128.0f;
         public int MaxDepth = 7;
-        public int MaxPatches = 8192;
+        private int MaxPatches = 32768;
+        private const int MinPatches = 32768;
 
         private Vector4[] _layerTiling = new Vector4[32];
 
@@ -194,6 +195,7 @@ namespace Freefall.Components
         // ───── Height Bake (GPU layer compositor) ─────────────────────────
         private bool _heightBakeDirty = true;
         private bool _splatPackDirty = true;
+        private bool _needHeightFieldReadback;
 
         /// <summary>Marks the baked heightmap as dirty, triggering a rebake next frame.</summary>
         public void MarkHeightDirty() => _heightBakeDirty = true;
@@ -216,7 +218,7 @@ namespace Freefall.Components
         /// Points are in terrain UV space [0..1].
         /// </summary>
         public void EnqueueBrushStroke(Vector2[] strokePoints, int pointCount,
-                                       TerrainBaker.BrushMode mode, float strength,
+                                       uint mode, float strength,
                                        float radius, float falloff,
                                        float targetHeight = 0,
                                        TerrainBaker.ControlMapTarget target = TerrainBaker.ControlMapTarget.Height,
@@ -270,9 +272,84 @@ namespace Freefall.Components
 
             CommandBuffer.Enqueue(RenderPass.Opaque, (list) =>
             {
+                Debug.Log($"[TerrainRenderer] Brush lambda executing: target={tgt} layer={idx} mode={mode} pts={count}");
                 baker.PaintBrush(terrain, tgt, idx, setter, list,
                                  pts, count, mode, strength,
                                  radius, falloff, targetHeight);
+                if (isHeightTarget)
+                {
+                    _heightBakeDirty = true;
+                    _heightRangePyramidBuilt = false;
+                }
+                if (tgt == TerrainBaker.ControlMapTarget.Splatmap)
+                    _splatPackDirty = true;
+            });
+        }
+
+        /// <summary>
+        /// GPU-only brush: enqueues a compute raycast against the baked heightmap
+        /// followed by painting at the hit UV. No CPU heightfield involvement.
+        /// </summary>
+        public void EnqueueBrushRaycastAndPaint(Vector3 rayOrigin, Vector3 rayDir,
+                                                 uint mode, float strength,
+                                                 float radius, float falloff,
+                                                 float targetHeight = 0,
+                                                 TerrainBaker.ControlMapTarget target = TerrainBaker.ControlMapTarget.Height,
+                                                 int layerIndex = 0)
+        {
+            if (Terrain == null) return;
+
+            // Resolve the ControlMap setter (same pattern as EnqueueBrushStroke)
+            Action<Texture> setControlMap = null;
+            switch (target)
+            {
+                case TerrainBaker.ControlMapTarget.Height:
+                {
+                    var paintLayer = Terrain.HeightLayers.OfType<PaintHeightLayer>().FirstOrDefault();
+                    if (paintLayer == null)
+                    {
+                        paintLayer = new PaintHeightLayer();
+                        Terrain.HeightLayers.Add(paintLayer);
+                    }
+                    var layer = paintLayer;
+                    setControlMap = tex => layer.ControlMap = tex;
+                    break;
+                }
+                case TerrainBaker.ControlMapTarget.Splatmap:
+                    if (Terrain.Layers != null && layerIndex >= 0 && layerIndex < Terrain.Layers.Count)
+                    {
+                        var layer = Terrain.Layers[layerIndex];
+                        setControlMap = tex => layer.ControlMap = tex;
+                    }
+                    break;
+                case TerrainBaker.ControlMapTarget.Density:
+                    if (Terrain.Decorations != null && layerIndex >= 0 && layerIndex < Terrain.Decorations.Count)
+                    {
+                        var deco = Terrain.Decorations[layerIndex];
+                        setControlMap = tex => deco.ControlMap = tex;
+                    }
+                    break;
+            }
+
+            if (setControlMap == null) return;
+
+            // Capture for lambda
+            var terrain = Terrain;
+            var baker = TerrainBaker.Instance;
+            var origin = Transform?.Position ?? Vector3.Zero;
+            var size = terrain.TerrainSize;
+            var maxH = terrain.MaxHeight;
+            var setter = setControlMap;
+            var tgt = target;
+            int idx = layerIndex;
+            bool isHeightTarget = target == TerrainBaker.ControlMapTarget.Height;
+
+            CommandBuffer.Enqueue(RenderPass.Opaque, (list) =>
+            {
+                baker.BrushRaycastAndPaint(terrain, tgt, idx, setter, list,
+                    rayOrigin, rayDir, origin, size, maxH,
+                    mode, strength, radius, falloff, targetHeight);
+
                 if (isHeightTarget)
                 {
                     _heightBakeDirty = true;
@@ -429,7 +506,17 @@ namespace Freefall.Components
                     _heightBakeDirty = false;
                     _heightRangePyramidBuilt = false; // force rebuild with new heights
                     _bakedAlbedoDirty = true; // re-bake albedo with new terrain shape
+                    _needHeightFieldReadback = true; // trigger CPU-side heightfield rebuild next frame
                 });
+            }
+
+            // Debounced CPU heightfield readback — only when baking has settled (not during active painting)
+            if (_needHeightFieldReadback && !_heightBakeDirty)
+            {
+                _needHeightFieldReadback = false;
+                var heights = TerrainBaker.Instance.ReadbackHeightmap();
+                if (heights != null && Terrain != null)
+                    Terrain.SetHeightField(heights);
             }
 
             // Upload any pending splatmap/density ControlMap data loaded from cache
@@ -702,7 +789,7 @@ namespace Freefall.Components
                 TransformSlot = (uint)Transform.TransformSlot,
                 MaterialId = (uint)(Material?.MaterialID ?? 0),
                 MeshPartId = (uint)_meshPartId,
-                MaxPatches = (uint)MaxPatches,
+                MaxPatches = (uint)Math.Max(MaxPatches, MinPatches),
                 HeightTexIdx = Terrain?.Heightmap?.BindlessIndex ?? 0u,
             };
             UploadBuffer(_terrainParamBuffers[frameIndex], terrainParams);
@@ -738,6 +825,9 @@ namespace Freefall.Components
             {
                 StreamingManager.Instance?.Flush();
                 Engine.Device.WaitForCopyQueue();
+
+                var hmIdx = Terrain?.Heightmap?.BindlessIndex ?? 0u;
+                Debug.Log($"[TerrainRenderer] Pyramid build in QuadtreeEval: HeightTexIdx={terrainParams.HeightTexIdx} HM.Idx={hmIdx} BakedHM={Terrain?.BakedHeightmap != null}");
 
                 BuildHeightRangePyramid(commandList);
                 _heightRangePyramidBuilt = true;

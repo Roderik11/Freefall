@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Text;
 using Freefall.Components;
@@ -15,6 +15,7 @@ namespace Freefall.Base
     {
         public static readonly Type Type = typeof(T);
         internal static readonly List<T> List = [];
+        public static IReadOnlyList<T> All => List;
         internal static readonly ComponentSet<IUpdate> UpdateList = new();
         internal static readonly ComponentSet<IDraw> DrawList = new();
 
@@ -33,15 +34,14 @@ namespace Freefall.Base
             bool hasDraw = typeof(IDraw).IsAssignableFrom(Type);
             bool isParallel = typeof(IParallel).IsAssignableFrom(Type);
 
-            if (hasUpdate || hasDraw)
+            // Always register — even pure-data components (no IUpdate/IDraw)
+            // need the wakeup step so their Awake() fires.
+            ScriptExecution.Add(new ComponentCache<T>
             {
-                ScriptExecution.Add(new ComponentCache<T>
-                {
-                    IsParallel = isParallel,
-                    HasUpdate = hasUpdate,
-                    HasDraw = hasDraw
-                });
-            }
+                IsParallel = isParallel,
+                HasUpdate = hasUpdate,
+                HasDraw = hasDraw
+            });
         }
 
         static void FastRemove(int index)

@@ -13,6 +13,7 @@
 #pragma kernel CS_ClearDelta
 #pragma kernel CS_ImportChannel
 #pragma kernel CS_PackChannels
+#pragma kernel CS_BrushRaycast
 
 // Push constants (root parameter 0, register b3) — bindless indices + params
 cbuffer PushConstants : register(b3)
@@ -26,6 +27,19 @@ cbuffer PushConstants : register(b3)
     float BrushRadius;    // slot 6 — UV-space radius (brush only)
     float BrushFalloff;   // slot 7 — falloff exponent (brush only)
     float BrushTargetHeight; // slot 8 — normalized target height for flatten (brush only)
+
+    // Raycast params (only used by CS_BrushRaycast)
+    float RayOriginX;     // slot 9
+    float RayOriginY;     // slot 10
+    float RayOriginZ;     // slot 11
+    float RayDirX;        // slot 12
+    float RayDirY;        // slot 13
+    float RayDirZ;        // slot 14
+    float TerrainOriginX; // slot 15
+    float TerrainOriginZ; // slot 16
+    float TerrainSizeX;   // slot 17
+    float TerrainSizeZ;   // slot 18
+    float TerrainMaxHeight; // slot 19
 };
 
 SamplerState sampLinear : register(s0);
@@ -210,14 +224,18 @@ void CS_PaintBrush(uint3 dtid : SV_DispatchThreadID)
 
         case 2: // Flatten
         {
-            // Read current baked height at this pixel
             Texture2D<float> BakedHeight = ResourceDescriptorHeap[SourceIdx];
             float2 sampleUV = (float2(dtid.xy) + 0.5) / float2(w, h);
             float currentHeight = BakedHeight.SampleLevel(sampLinear, sampleUV, 0);
-            float totalHeight = currentHeight + currentDelta;
 
-            // Lerp delta toward (target - base) so total approaches target
-            float desiredDelta = BrushTargetHeight - currentHeight;
+            // Target = total height at brush center
+            float2 centerUV = StrokePoints[0];
+            float centerBase = BakedHeight.SampleLevel(sampLinear, centerUV, 0);
+            uint2 centerTexel = uint2(centerUV * float2(w, h));
+            float centerDelta = DeltaMap[centerTexel];
+            float targetH = centerBase + centerDelta;
+
+            float desiredDelta = targetH - currentHeight;
             DeltaMap[dtid.xy] = lerp(currentDelta, desiredDelta, weight);
             break;
         }
@@ -296,4 +314,108 @@ void CS_PackChannels(uint3 dtid : SV_DispatchThreadID)
     }
 
     Output[dtid.xy] = packed;
+}
+
+// ── CS_BrushRaycast: GPU ray march against baked heightmap ──
+// Single-thread dispatch [1,1,1]. Marches a ray against the heightmap SRV,
+// converts hit to terrain UV, writes to stroke buffer for CS_PaintBrush.
+//
+// Push constants:
+//   SourceIdx    → SRV: baked heightmap
+//   StampBufIdx  → UAV: RWStructuredBuffer<float2> stroke buffer (raycast result)
+//   Slots 9-19   → ray origin/dir, terrain transform
+[numthreads(1, 1, 1)]
+void CS_BrushRaycast(uint3 dtid : SV_DispatchThreadID)
+{
+    Texture2D<float> Heightmap = ResourceDescriptorHeap[SourceIdx];
+    RWStructuredBuffer<float2> StrokeBuf = ResourceDescriptorHeap[StampBufIdx];
+
+    float3 rayOrigin = float3(RayOriginX, RayOriginY, RayOriginZ);
+    float3 rayDir    = float3(RayDirX, RayDirY, RayDirZ);
+    float2 terrainSize = float2(TerrainSizeX, TerrainSizeZ);
+    float maxHeight = TerrainMaxHeight;
+
+    // Terrain AABB: (TerrainOriginX, 0, TerrainOriginZ) to (TerrainOriginX + SizeX, MaxHeight, TerrainOriginZ + SizeZ)
+    float3 aabbMin = float3(TerrainOriginX, 0, TerrainOriginZ);
+    float3 aabbMax = float3(TerrainOriginX + terrainSize.x, maxHeight, TerrainOriginZ + terrainSize.y);
+
+    // Default: miss
+    StrokeBuf[0] = float2(-1, -1);
+
+    // Ray-AABB intersection (slab method)
+    float3 invDir = 1.0 / rayDir;
+    float3 t0 = (aabbMin - rayOrigin) * invDir;
+    float3 t1 = (aabbMax - rayOrigin) * invDir;
+
+    float3 tmin3 = min(t0, t1);
+    float3 tmax3 = max(t0, t1);
+
+    float tEnter = max(max(tmin3.x, tmin3.y), tmin3.z);
+    float tExit  = min(min(tmax3.x, tmax3.y), tmax3.z);
+
+    // No intersection with AABB at all
+    if (tEnter > tExit || tExit < 0) return;
+
+    // Clamp to forward direction
+    tEnter = max(tEnter, 0);
+
+    // Step size: proportional to terrain texel size for precision
+    uint hW, hH;
+    Heightmap.GetDimensions(hW, hH);
+    float texelWorld = max(terrainSize.x / (float)hW, terrainSize.y / (float)hH);
+    float stepSize = texelWorld; // one texel per step
+
+    int maxSteps = min((int)((tExit - tEnter) / stepSize) + 1, 2048);
+
+    float prevT = tEnter;
+    float3 prevP = rayOrigin + rayDir * tEnter;
+    float2 prevUV = (prevP.xz - aabbMin.xz) / terrainSize;
+    float prevH = Heightmap.SampleLevel(sampLinear, saturate(prevUV), 0);
+    float prevDelta = prevP.y - prevH * maxHeight;
+
+    for (int i = 1; i <= maxSteps; i++)
+    {
+        float t = tEnter + i * stepSize;
+        if (t > tExit) t = tExit;
+
+        float3 p = rayOrigin + rayDir * t;
+        float2 uv = (p.xz - aabbMin.xz) / terrainSize;
+
+        // Clamp UV for safety
+        uv = saturate(uv);
+
+        float h = Heightmap.SampleLevel(sampLinear, uv, 0);
+        float terrainY = h * maxHeight;
+        float delta = p.y - terrainY;
+
+        // Sign change: ray crossed the terrain surface
+        if (delta < 0 && prevDelta >= 0)
+        {
+            // Binary refine between prevT and t
+            float lo = prevT;
+            float hi = t;
+            for (int j = 0; j < 16; j++)
+            {
+                float mid = (lo + hi) * 0.5;
+                float3 mp = rayOrigin + rayDir * mid;
+                float2 muv = saturate((mp.xz - aabbMin.xz) / terrainSize);
+                float mh = Heightmap.SampleLevel(sampLinear, muv, 0);
+                if (mp.y - mh * maxHeight < 0)
+                    hi = mid;
+                else
+                    lo = mid;
+            }
+
+            // Final hit position → UV
+            float3 hitPos = rayOrigin + rayDir * ((lo + hi) * 0.5);
+            float2 hitUV = (hitPos.xz - aabbMin.xz) / terrainSize;
+            StrokeBuf[0] = hitUV;
+            return;
+        }
+
+        prevT = t;
+        prevDelta = delta;
+
+        if (t >= tExit) break;
+    }
 }

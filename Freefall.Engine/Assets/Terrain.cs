@@ -1,10 +1,13 @@
 using System;
 using System.Collections.Generic;
 using System.Numerics;
+using System.Runtime.InteropServices;
 using System.Text.Json.Serialization;
+using System.ComponentModel;
 using Freefall.Base;
 using Freefall.Graphics;
 using Freefall.Reflection;
+using Vortice.DXGI;
 
 namespace Freefall.Assets
 {
@@ -16,8 +19,6 @@ namespace Freefall.Assets
     /// </summary>
     public class Terrain : Asset
     {
-        // ── Height data ──
-
         /// <summary>
         /// Resolution of the baked heightmap (power of 2). Configurable per-terrain.
         /// </summary>
@@ -116,6 +117,12 @@ namespace Freefall.Assets
             HeightField = Texture.ReadHeightField(heightmapPath);
         }
 
+        /// <summary>
+        /// Sets the CPU-side height field directly from readback data.
+        /// Called by TerrainRenderer after GPU heightmap readback.
+        /// </summary>
+        internal void SetHeightField(float[,] heights) => HeightField = heights;
+
         // ── Texture Layer ──
         [Serializable]
         public class TextureLayer
@@ -125,6 +132,8 @@ namespace Freefall.Assets
             public Vector2 Tiling = Vector2.One;
 
             /// <summary>Splatmap controlling where this layer paints (R16, hidden subasset).</summary>
+            /// 
+            [Browsable(false)]
             public Texture ControlMap;
 
             /// <summary>Staging: raw R16 bytes loaded from cache, consumed by GPU upload.</summary>
@@ -151,6 +160,7 @@ namespace Freefall.Assets
             /// Without a control map, the decorator renders everywhere.
             /// </summary>
             [FormerlySerializedAs("DensityMap")]
+            [Browsable(false)]
             public Texture ControlMap;
 
             /// <summary>Staging: raw R16 bytes loaded from cache, consumed by GPU upload.</summary>

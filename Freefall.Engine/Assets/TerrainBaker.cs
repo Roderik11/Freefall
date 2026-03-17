@@ -28,6 +28,7 @@ namespace Freefall.Assets
         private int _kernelClearDelta;
         private int _kernelImportChannel;
         private int _kernelPackChannels;
+        private int _kernelBrushRaycast;
 
         // GPU resources for the baked heightmap
         private ID3D12Resource _heightTexture;
@@ -43,10 +44,10 @@ namespace Freefall.Assets
         private GraphicsBuffer _strokeBuffer;
         private int _strokeBufferCapacity;
 
-        private bool _initialized;
+        // GPU raycast result buffer — written by CS_BrushRaycast, read by CS_PaintBrush
+        private GraphicsBuffer _raycastResultBuffer;
 
-        /// <summary>Brush mode for CS_PaintBrush dispatch.</summary>
-        public enum BrushMode : uint { Raise = 0, Lower = 1, Flatten = 2, Smooth = 3 }
+        private bool _initialized;
 
         /// <summary>Which ControlMap category to paint.</summary>
         public enum ControlMapTarget { Height, Splatmap, Density }
@@ -74,6 +75,7 @@ namespace Freefall.Assets
             _kernelClearDelta = _cs.FindKernel("CS_ClearDelta");
             _kernelImportChannel = _cs.FindKernel("CS_ImportChannel");
             _kernelPackChannels = _cs.FindKernel("CS_PackChannels");
+            _kernelBrushRaycast = _cs.FindKernel("CS_BrushRaycast");
             _initialized = true;
         }
 
@@ -142,7 +144,7 @@ namespace Freefall.Assets
         {
             if (layer.ControlMap == null || layer.ControlMap.BindlessIndex == 0) return;
 
-            Debug.Log($"[TerrainBaker] DispatchPaint: ControlMap SRV={layer.ControlMap.BindlessIndex} BlendMode={layer.BlendMode}");
+
             _cs.SetPushConstant(_kernelImport, "Source", layer.ControlMap.BindlessIndex);
             _cs.SetPushConstant(_kernelImport, "Output", _heightUAV);
             _cs.SetPushConstant(_kernelImport, "BlendMode", (uint)layer.BlendMode);
@@ -253,7 +255,7 @@ namespace Freefall.Assets
                                Action<Texture> setControlMap,
                                ID3D12GraphicsCommandList cmd,
                                Vector2[] strokePoints, int pointCount,
-                               BrushMode mode, float strength,
+                               uint mode, float strength,
                                float radius, float falloff,
                                float targetHeight = 0)
         {
@@ -299,10 +301,87 @@ namespace Freefall.Assets
             _cs.SetPushConstant(_kernelPaintBrush, "Source", _heightSRV);  // Current baked heightmap for flatten/smooth
             _cs.SetPushConstant(_kernelPaintBrush, "Output", gpu.UAV);
             _cs.SetBuffer(_kernelPaintBrush, "StampBuf", _strokeBuffer);
-            _cs.SetPushConstant(_kernelPaintBrush, "BlendMode", (uint)mode);
+            _cs.SetPushConstant(_kernelPaintBrush, "BlendMode", mode);
             _cs.SetParam(_kernelPaintBrush, "Opacity", strength);
             _cs.SetPushConstant(_kernelPaintBrush, "StampCount", (uint)pointCount);
 
+            _cs.SetParam(_kernelPaintBrush, "BrushRadius", uvRadius);
+            _cs.SetParam(_kernelPaintBrush, "BrushFalloff", falloff);
+            _cs.SetParam(_kernelPaintBrush, "BrushTargetHeight", normalizedTarget);
+
+            _cs.Dispatch(_kernelPaintBrush, cmd, groups, groups);
+            cmd.ResourceBarrierUnorderedAccessView(gpu.Texture);
+        }
+
+        /// <summary>
+        /// GPU-only brush: dispatches CS_BrushRaycast (ray march against heightmap)
+        /// then chains CS_PaintBrush (paints at the hit UV). Zero CPU readback.
+        /// </summary>
+        public void BrushRaycastAndPaint(Terrain terrain, ControlMapTarget target, int layerIndex,
+                                         Action<Texture> setControlMap,
+                                         ID3D12GraphicsCommandList cmd,
+                                         Vector3 rayOrigin, Vector3 rayDir,
+                                         Vector3 terrainOrigin, Vector2 terrainSize, float maxHeight,
+                                         uint mode, float strength,
+                                         float radius, float falloff,
+                                         float targetHeight = 0)
+        {
+            EnsureInitialized();
+            Debug.Log($"[BrushRaycast] heightSRV={_heightSRV}, ray={rayOrigin}/{rayDir}, " +
+                      $"terrainOrig={terrainOrigin}, size={terrainSize}, maxH={maxHeight}, " +
+                      $"mode={mode}, str={strength}, rad={radius}");
+            int res = terrain.HeightmapResolution;
+            var key = (target, layerIndex);
+            var gpu = EnsureControlMap(key, res, setControlMap);
+
+            var device = Engine.Device;
+            cmd.SetComputeRootSignature(device.GlobalRootSignature);
+            cmd.SetDescriptorHeaps(1, new[] { device.SrvHeap });
+
+            // Clear on first use
+            uint groups = (uint)((res + 7) / 8);
+            if (gpu.NeedsInitialClear)
+            {
+                _cs.SetPushConstant(_kernelClearDelta, "Output", gpu.UAV);
+                _cs.Dispatch(_kernelClearDelta, cmd, groups, groups);
+                cmd.ResourceBarrierUnorderedAccessView(gpu.Texture);
+                gpu.NeedsInitialClear = false;
+                _controlMaps[key] = gpu;
+            }
+
+            // ── Phase 1: GPU Raycast ──
+            // Create/reuse raycast result buffer (1 float2, SRV+UAV on GPU default heap)
+            if (_raycastResultBuffer == null)
+                _raycastResultBuffer = GraphicsBuffer.CreateStructured<Vector2>(1, srv: true, uav: true);
+
+            _cs.SetPushConstant(_kernelBrushRaycast, "Source", _heightSRV);
+            _cs.SetUAV(_kernelBrushRaycast, "StampBuf", _raycastResultBuffer);
+            _cs.SetParam(_kernelBrushRaycast, "RayOriginX", rayOrigin.X);
+            _cs.SetParam(_kernelBrushRaycast, "RayOriginY", rayOrigin.Y);
+            _cs.SetParam(_kernelBrushRaycast, "RayOriginZ", rayOrigin.Z);
+            _cs.SetParam(_kernelBrushRaycast, "RayDirX", rayDir.X);
+            _cs.SetParam(_kernelBrushRaycast, "RayDirY", rayDir.Y);
+            _cs.SetParam(_kernelBrushRaycast, "RayDirZ", rayDir.Z);
+            _cs.SetParam(_kernelBrushRaycast, "TerrainOriginX", terrainOrigin.X);
+            _cs.SetParam(_kernelBrushRaycast, "TerrainOriginZ", terrainOrigin.Z);
+            _cs.SetParam(_kernelBrushRaycast, "TerrainSizeX", terrainSize.X);
+            _cs.SetParam(_kernelBrushRaycast, "TerrainSizeZ", terrainSize.Y);
+            _cs.SetParam(_kernelBrushRaycast, "TerrainMaxHeight", maxHeight);
+
+            _cs.Dispatch(_kernelBrushRaycast, cmd, 1, 1, 1);
+            _raycastResultBuffer.UAVBarrier(cmd);
+
+            // ── Phase 2: Paint at hit UV ──
+            // Convert world radius to UV radius
+            float uvRadius = radius / Math.Max(terrainSize.X, terrainSize.Y);
+            float normalizedTarget = targetHeight / maxHeight;
+
+            _cs.SetPushConstant(_kernelPaintBrush, "Source", _heightSRV);
+            _cs.SetPushConstant(_kernelPaintBrush, "Output", gpu.UAV);
+            _cs.SetSRV(_kernelPaintBrush, "StampBuf", _raycastResultBuffer);
+            _cs.SetPushConstant(_kernelPaintBrush, "BlendMode", mode);
+            _cs.SetParam(_kernelPaintBrush, "Opacity", strength);
+            _cs.SetPushConstant(_kernelPaintBrush, "StampCount", 1u);
             _cs.SetParam(_kernelPaintBrush, "BrushRadius", uvRadius);
             _cs.SetParam(_kernelPaintBrush, "BrushFalloff", falloff);
             _cs.SetParam(_kernelPaintBrush, "BrushTargetHeight", normalizedTarget);
@@ -418,6 +497,80 @@ namespace Freefall.Assets
             _strokeBuffer?.Dispose();
             _strokeBufferCapacity = Math.Max(requiredCount, 64);
             _strokeBuffer = GraphicsBuffer.CreateUpload<Vector2>(_strokeBufferCapacity, mapped: true);
+        }
+
+        /// <summary>
+        /// Reads back the baked R32_Float heightmap into a CPU float[,] array.
+        /// Values are normalized [0..1] — caller multiplies by MaxHeight.
+        /// Returns null if no heightmap has been baked.
+        /// </summary>
+        public float[,] ReadbackHeightmap()
+        {
+            if (_heightTexture == null || _currentResolution == 0)
+                return null;
+
+            var device = Engine.Device;
+            int res = _currentResolution;
+            int bytesPerPixel = 4; // R32_Float
+            int rowPitch = (res * bytesPerPixel + 255) & ~255; // 256-byte aligned
+            int totalBytes = rowPitch * res;
+
+            var readbackResource = device.NativeDevice.CreateCommittedResource(
+                new HeapProperties(HeapType.Readback),
+                HeapFlags.None,
+                ResourceDescription.Buffer((ulong)totalBytes),
+                ResourceStates.CopyDest,
+                null);
+
+            var allocator = device.NativeDevice.CreateCommandAllocator(CommandListType.Direct);
+            var cmdList = device.NativeDevice.CreateCommandList<ID3D12GraphicsCommandList>(
+                0, CommandListType.Direct, allocator, null);
+
+            try
+            {
+                cmdList.ResourceBarrierTransition(_heightTexture,
+                    ResourceStates.Common, ResourceStates.CopySource);
+
+                var src = new TextureCopyLocation(_heightTexture, 0);
+                var dst = new TextureCopyLocation(readbackResource, new PlacedSubresourceFootPrint
+                {
+                    Offset = 0,
+                    Footprint = new SubresourceFootPrint(Format.R32_Float, (uint)res, (uint)res, 1, (uint)rowPitch)
+                });
+                cmdList.CopyTextureRegion(dst, 0, 0, 0, src);
+
+                cmdList.ResourceBarrierTransition(_heightTexture,
+                    ResourceStates.CopySource, ResourceStates.Common);
+
+                cmdList.Close();
+                device.SubmitAndWait(cmdList);
+
+                var heights = new float[res, res];
+                unsafe
+                {
+                    void* pData;
+                    readbackResource.Map(0, null, &pData);
+
+                    var srcPtr = (byte*)pData;
+                    for (int y = 0; y < res; y++)
+                    {
+                        var rowPtr = (float*)(srcPtr + y * rowPitch);
+                        for (int x = 0; x < res; x++)
+                            heights[x, y] = rowPtr[x];
+                    }
+
+                    readbackResource.Unmap(0);
+                }
+
+                Debug.Log($"[TerrainBaker] HeightField readback: {res}x{res}");
+                return heights;
+            }
+            finally
+            {
+                cmdList.Dispose();
+                allocator.Dispose();
+                readbackResource.Dispose();
+            }
         }
 
         // ── ControlMap Persistence ─────────────────────────────────────────

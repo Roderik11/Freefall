@@ -372,11 +372,13 @@ namespace Freefall.Graphics
 
             var pso = device.CreateComputePipelineState(shader.Bytecode);
 
-            // Discover bindings from first kernel's reflection
-            if (_kernels.Count == 0 && shader.Reflection != null)
+            // Merge push constant slots from every kernel's reflection,
+            // since HLSL optimizes out unused cbuffer members per entry point
+            if (shader.Reflection != null)
             {
                 DiscoverPushConstants(shader.Reflection);
-                DiscoverConstantBuffers(shader.Reflection);
+                if (_kernels.Count == 0)
+                    DiscoverConstantBuffers(shader.Reflection);
             }
 
             _kernels.Add(new Kernel

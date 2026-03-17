@@ -26,7 +26,12 @@ namespace Freefall.Assets.Loaders
             if (cachePath == null || !File.Exists(cachePath))
                 throw new FileNotFoundException($"Cache file not found for static mesh '{name}'");
 
-            return LoadFromCache(cachePath, name, manager);
+            // Resolve source GUID so LoadCookedCollisionMesh can find the
+            // pre-cooked PhysX TriangleMesh subasset from the meta file.
+            var sourceGuid = AssetDatabase.ResolveGuidByName(
+                Path.GetFileNameWithoutExtension(name));
+
+            return LoadFromCache(cachePath, name, manager, sourceGuid);
         }
 
         public Asset LoadFromCache(string cachePath, string name, AssetManager manager, string sourceGuid = null)

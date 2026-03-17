@@ -248,25 +248,25 @@ namespace Freefall.Assets
             if (_nameToSubAssets.TryGetValue(name, out var entries) && entries.Count > 0)
                 return entries[0].Guid;
 
-            // Try simple asset lookup — prefer .asset files over raw model files (.fbx, .dae, .obj)
-            // because .asset files are StaticMesh definitions while raw model files produce .mesh cache
-            string assetFileGuid = null;
+            // Try simple asset lookup — prefer simple assets (source GUID = cache key, e.g. .staticmesh)
+            // over compound source files (.fbx, .dae) that produce multiple subassets
+            string preferredGuid = null;
             string fallback = null;
             foreach (var kvp in _pathToGuid)
             {
                 var fileName = Path.GetFileNameWithoutExtension(kvp.Key);
                 if (fileName.Equals(name, StringComparison.OrdinalIgnoreCase))
                 {
-                    // Strongly prefer .asset source files
-                    if (kvp.Key.EndsWith(".asset", StringComparison.OrdinalIgnoreCase))
+                    // Prefer simple assets — they are the final definition, not a raw source
+                    if (_sourceGuidCacheType.ContainsKey(kvp.Value))
                     {
-                        assetFileGuid = kvp.Value;
+                        preferredGuid = kvp.Value;
                     }
                     fallback ??= kvp.Value;
                 }
             }
 
-            return assetFileGuid ?? fallback;
+            return preferredGuid ?? fallback;
         }
 
         /// <summary>
@@ -358,6 +358,15 @@ namespace Freefall.Assets
         {
             var ext = extension.StartsWith(".") ? extension : "." + extension;
             return _importableExtensions.Contains(ext);
+        }
+
+        /// <summary>
+        /// Get all importable extensions and their importer type names.
+        /// </summary>
+        public static IEnumerable<(string extension, string importerType)> GetImportableExtensions()
+        {
+            foreach (var kvp in _importersByExtension)
+                yield return (kvp.Key, kvp.Value.Name);
         }
 
         /// <summary>

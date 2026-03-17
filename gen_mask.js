@@ -144,49 +144,100 @@ writePNG16(path.join(outDir, 'heightmap.png'), W, H, (x, y) => {
     ));
 });
 
-// GRASS — 8-bit is fine for splatmaps
+// === Build heightmap array and compute slope ===
+console.log('Building heightmap array for slope analysis...');
+const heightData = new Float32Array(W * H);
+for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+        const nx = x / W, ny = y / H;
+        const base = fbm(nx * 3 + 0.5, ny * 3 + 0.5, 6) * 0.5 + 0.5;
+        const dx2 = nx - 0.55, dy2 = ny - 0.55;
+        const dist = Math.sqrt(dx2*dx2 + dy2*dy2);
+        let peak = Math.max(0, 1 - dist * 4);
+        peak = peak * peak * peak;
+        const ridge = Math.max(0, 1 - Math.abs(ny - 0.35 - nx * 0.4) * 12);
+        const ridgeNoise = fbm(nx * 15 + 7, ny * 15 + 7, 3) * 0.5 + 0.5;
+        const hills2 = fbm(nx * 5 + 3, ny * 5 + 3, 4) * 0.5 + 0.5;
+        const detail = fbm(nx * 25, ny * 25, 4) * 0.5 + 0.5;
+        const valley = fbm(nx * 4 + 50, ny * 4 + 50, 3) * 0.5 + 0.5;
+        const valleyMask = Math.max(0, valley - 0.55) * 3;
+        heightData[y * W + x] = Math.min(1, Math.max(0,
+            base * 0.25 + peak * 0.45 + ridge * ridgeNoise * 0.12 +
+            hills2 * 0.1 + detail * 0.03 - valleyMask * 0.05
+        ));
+    }
+}
+
+// Compute slope via central differences (normalized 0..1)
+const slopeData = new Float32Array(W * H);
+let maxSlope = 0;
+for (let y = 1; y < H - 1; y++) {
+    for (let x = 1; x < W - 1; x++) {
+        const dhdx = (heightData[y * W + x + 1] - heightData[y * W + x - 1]) * 0.5;
+        const dhdy = (heightData[(y + 1) * W + x] - heightData[(y - 1) * W + x]) * 0.5;
+        const slope = Math.sqrt(dhdx * dhdx + dhdy * dhdy) * W; // scale by resolution
+        slopeData[y * W + x] = slope;
+        if (slope > maxSlope) maxSlope = slope;
+    }
+}
+// Normalize slope to 0..1
+if (maxSlope > 0) {
+    for (let i = 0; i < slopeData.length; i++) slopeData[i] /= maxSlope;
+}
+console.log(`  Max slope: ${maxSlope.toFixed(3)}`);
+
+// Helper: smooth step
+function smoothstep(edge0, edge1, x) {
+    const t = Math.max(0, Math.min(1, (x - edge0) / (edge1 - edge0)));
+    return t * t * (3 - 2 * t);
+}
+
+// GRASS — gentle slopes at low-to-mid heights
 writePNG8(path.join(outDir, 'grass_mask.png'), W, H, (x, y) => {
+    const h = heightData[y * W + x];
+    const s = slopeData[y * W + x];
     const nx = x / W, ny = y / H;
-    const noise = fbm(nx * 4 + 0.5, ny * 4 + 0.5, 4) * 0.5 + 0.5;
-    return 0.7 + noise * 0.3;
+    const noise = fbm(nx * 8 + 0.5, ny * 8 + 0.5, 3) * 0.15;
+    // Grass likes: gentle slopes (s < 0.3), low-to-mid elevation (h < 0.6)
+    const slopeFactor = 1.0 - smoothstep(0.15, 0.45, s);
+    const heightFactor = 1.0 - smoothstep(0.45, 0.75, h);
+    return Math.min(1, Math.max(0, slopeFactor * heightFactor * 0.95 + noise));
 });
 
-// ROCK — peaks + ridges
+// ROCK — steep slopes and high peaks
 writePNG8(path.join(outDir, 'rock_mask.png'), W, H, (x, y) => {
+    const h = heightData[y * W + x];
+    const s = slopeData[y * W + x];
     const nx = x / W, ny = y / H;
-    const dx = nx - 0.55, dy = ny - 0.55;
-    const dist = Math.sqrt(dx*dx + dy*dy);
-    let peak = Math.max(0, 1 - dist * 3.5);
-    peak = peak * peak;
-    const noise = fbm(nx * 8 + 10, ny * 8 + 10, 5) * 0.5 + 0.5;
-    const ridge = Math.max(0, 1 - Math.abs(ny - 0.35 - nx * 0.4) * 8);
-    return Math.min(1, (peak * 0.8 + ridge * 0.4) * noise * 2);
+    const noise = fbm(nx * 12 + 10, ny * 12 + 10, 3) * 0.1;
+    // Rock likes: steep slopes (s > 0.25) OR very high elevation (h > 0.7)
+    const slopeFactor = smoothstep(0.2, 0.5, s);
+    const peakFactor = smoothstep(0.6, 0.85, h);
+    return Math.min(1, Math.max(0, Math.max(slopeFactor * 0.9, peakFactor * 0.7) + noise));
 });
 
-// DIRT — transitional patches
+// DIRT — moderate slopes, mid elevation transitions
 writePNG8(path.join(outDir, 'dirt_mask.png'), W, H, (x, y) => {
+    const h = heightData[y * W + x];
+    const s = slopeData[y * W + x];
     const nx = x / W, ny = y / H;
-    const dx = nx - 0.5, dy = ny - 0.5;
-    const dist = Math.sqrt(dx*dx + dy*dy);
-    let ring = Math.max(0, 1 - Math.abs(dist - 0.25) * 6);
-    const noise1 = fbm(nx * 6 + 20, ny * 6 + 20, 4) * 0.5 + 0.5;
-    const noise2 = fbm(nx * 12 + 30, ny * 12 + 30, 3) * 0.5 + 0.5;
-    let result = ring * noise1 * 1.4 + noise2 * 0.2;
-    const streak = fbm(nx * 2 + ny * 8 + 5, ny * 2 - nx * 3 + 5, 3) * 0.5 + 0.5;
-    result += streak * 0.15;
-    return Math.min(1, Math.max(0, result));
+    const noise = fbm(nx * 6 + 20, ny * 6 + 20, 3) * 0.15;
+    // Dirt: moderate slopes (0.1..0.4), mid heights (0.2..0.6)
+    const slopeFactor = smoothstep(0.08, 0.2, s) * (1.0 - smoothstep(0.4, 0.6, s));
+    const heightFactor = smoothstep(0.15, 0.3, h) * (1.0 - smoothstep(0.55, 0.7, h));
+    return Math.min(1, Math.max(0, slopeFactor * 0.6 + heightFactor * 0.4 + noise));
 });
 
-// SAND — edges + low areas
+// SAND — low elevation, gentle slopes (valleys, flats)
 writePNG8(path.join(outDir, 'sand_mask.png'), W, H, (x, y) => {
+    const h = heightData[y * W + x];
+    const s = slopeData[y * W + x];
     const nx = x / W, ny = y / H;
-    const edgeDist = Math.min(nx, ny, 1 - nx, 1 - ny);
-    let edge = Math.max(0, 1 - edgeDist * 5);
-    edge = edge * edge;
-    const noise = fbm(nx * 5 + 40, ny * 5 + 40, 4) * 0.5 + 0.5;
-    const lowArea = Math.max(0, 1 - Math.sqrt((nx - 0.1)**2 + (ny - 0.1)**2) * 2.5);
-    const lowArea2 = Math.max(0, 1 - Math.sqrt((nx - 0.9)**2 + (ny - 0.9)**2) * 2.5);
-    return Math.min(1, (edge * 0.7 + lowArea * 0.5 + lowArea2 * 0.3) * (noise * 0.5 + 0.5));
+    const noise = fbm(nx * 5 + 40, ny * 5 + 40, 3) * 0.1;
+    // Sand: low areas (h < 0.2), gentle slopes
+    const heightFactor = 1.0 - smoothstep(0.08, 0.25, h);
+    const slopeFactor = 1.0 - smoothstep(0.1, 0.3, s);
+    return Math.min(1, Math.max(0, heightFactor * slopeFactor * 0.9 + noise));
 });
 
 console.log('Done!');

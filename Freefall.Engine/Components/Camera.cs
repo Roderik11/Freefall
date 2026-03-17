@@ -147,15 +147,14 @@ namespace Freefall.Components
 
             // Standard LH perspective maps [near,far] → [0,1]:
             //   M33 = far / (far - near),  M43 = -near * far / (far - near)
-            // Reverse-Z maps [near,far] → [1,0]:
-            //   M33 = near / (far - near)
+            // Reverse-Z swaps near↔far in the standard formula:
+            //   M33 = near / (near - far)   [negative]
             //   M43 = far * near / (far - near)
-            // Values are positive so NDC z stays in [0,1] (required by D3D clip).
             float range = far - near;
             return new Matrix4x4(
                 w,    0,    0,    0,
                 0,    h,    0,    0,
-                0,    0,    near / range,  1,
+                0,    0,    near / (near - far),  1,
                 0,    0,    far * near / range, 0
             );
         }

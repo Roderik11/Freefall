@@ -1,8 +1,8 @@
+using Freefall.Graphics;
 using System;
 using System.Collections.Generic;
+using System.ComponentModel;
 using System.Numerics;
-using Freefall.Assets.Packers;
-using Freefall.Graphics;
 
 namespace Freefall.Assets
 {
@@ -21,6 +21,7 @@ namespace Freefall.Assets
     public abstract class HeightLayer
     {
         public bool Enabled = true;
+        [ValueRange(0f, 1f)]
         public float Opacity = 1.0f;
         public HeightBlendMode BlendMode = HeightBlendMode.Set;
     }
@@ -137,6 +138,7 @@ namespace Freefall.Assets
         /// Created on first brush stroke; composited during bake.
         /// Hidden subasset — GUID stored in YAML, data in cache.
         /// </summary>
+        [Browsable(false)]
         public Texture ControlMap;
 
         /// <summary>
@@ -165,15 +167,19 @@ namespace Freefall.Assets
         public Vector2 Position = new(0.5f, 0.5f);
 
         /// <summary>Stamp radius in terrain-space UV [0..1]</summary>
+        [ValueRange(0f, 1f)]
         public float Radius = 0.1f;
 
         /// <summary>Stamp height strength</summary>
+        [ValueRange(0f, 1f)]
         public float Strength = 1.0f;
 
         /// <summary>Falloff exponent (1 = linear, 2 = smooth)</summary>
+        [ValueRange(1f, 2f)]
         public float Falloff = 2.0f;
 
         /// <summary>Rotation in degrees</summary>
+        [ValueRange(0f, 360f)]
         public float Rotation = 0;
     }
 
@@ -188,6 +194,7 @@ namespace Freefall.Assets
         public string Name = "Stamp Group";
         public Texture Brush;
         public HeightBlendMode BlendMode = HeightBlendMode.Add;
+        [ValueRange(0f, 1f)]
         public float Opacity = 1.0f;
         public bool Enabled = true;
         public List<StampInstance> Instances = new();
