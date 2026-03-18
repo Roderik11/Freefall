@@ -122,22 +122,5 @@ namespace Freefall.Base
 
             EntityManager.RemoveEntity(this);
         }
-
-        internal void DestroyImmediatly()
-        {
-            foreach (var component in _components)
-                component.Destroy();
-
-            // Unregister each component from its ComponentCache<T>
-            foreach (var component in _components)
-            {
-                var cacheType = GetCacheType(component.GetType());
-                var removeMethod = cacheType.GetMethod("Remove", BindingFlags.Public | BindingFlags.Static, [typeof(Entity)]);
-                removeMethod?.Invoke(null, [this]);
-            }
-
-            _components.Clear();
-            EntityManager.RemoveEntity(this);
-        }
     }
 }

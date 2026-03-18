@@ -28,7 +28,7 @@ namespace Freefall.Components
         private RigidStatic? _staticActor;
         private RigidDynamic? _dynamicActor;
         private Shape? _shape;
-
+        private Action<Message>? _onTerrainLoaded;
         public Actor? Actor => (Actor?)_staticActor ?? _dynamicActor;
 
         public StaticMesh? StaticMesh { get; set; }
@@ -63,6 +63,17 @@ namespace Freefall.Components
                 }
 
                 CreateBody();
+
+                // If terrain body wasn't created (data not loaded yet), retry when terrain is ready
+                if (Actor == null && Type == ShapeType.Terrain)
+                {
+                    MessageDispatcher.AddListener("TerrainLoaded", _onTerrainLoaded = _ =>
+                    {
+                        CreateBody();
+                        MessageDispatcher.RemoveListener("TerrainLoaded", _onTerrainLoaded);
+                        _onTerrainLoaded = null;
+                    });
+                }
 
                 Transform.OnChanged += () =>
                 {
@@ -174,6 +185,7 @@ namespace Freefall.Components
                     // Fast path: use pre-cooked HeightField from import
                     if (terrain.CookedHeightField != null)
                     {
+                        Debug.Log($"[RigidBody] Using CookedHeightField: MaxHeight={terrain.MaxHeight}, scale={terrain.MaxHeight / short.MaxValue}, fx={fx}, fy={fy}");
                         return new HeightFieldGeometry(terrain.CookedHeightField, 0,
                             terrain.MaxHeight / short.MaxValue, fx, fy);
                     }
@@ -188,6 +200,8 @@ namespace Freefall.Components
                     var heightMap = terrain.HeightField;
                     int rows = heightMap.GetLength(0);
                     int cols = heightMap.GetLength(1);
+
+                    Debug.Log($"[RigidBody] Cooking HeightField on demand: {rows}x{cols}, MaxHeight={terrain.MaxHeight}, fx={fx}, fy={fy}");
 
                     var samples = heightMap.ToSamples();
 

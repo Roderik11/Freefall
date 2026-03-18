@@ -13,7 +13,7 @@ namespace Freefall.Assets
     /// <summary>
     /// GPU-based height layer + stamp compositor. Iterates HeightLayers bottom-to-top,
     /// then applies StampGroups (one dispatch per group with batched instances).
-    /// Output: R32_Float heightmap at configurable resolution.
+    /// Output: R16_Float heightmap at configurable resolution.
     /// </summary>
     public class TerrainBaker : IDisposable
     {
@@ -204,13 +204,13 @@ namespace Freefall.Assets
 
             var device = Engine.Device;
             _heightTexture = device.CreateTexture2D(
-                Format.R32_Float, resolution, resolution, 1, 1,
+                Format.R16_Float, resolution, resolution, 1, 1,
                 ResourceFlags.AllowUnorderedAccess, ResourceStates.Common);
 
             _heightUAV = device.AllocateBindlessIndex();
             var uavDesc = new UnorderedAccessViewDescription
             {
-                Format = Format.R32_Float,
+                Format = Format.R16_Float,
                 ViewDimension = UnorderedAccessViewDimension.Texture2D,
                 Texture2D = new Texture2DUnorderedAccessView { MipSlice = 0 }
             };
@@ -219,7 +219,7 @@ namespace Freefall.Assets
             _heightSRV = device.AllocateBindlessIndex();
             var srvDesc = new ShaderResourceViewDescription
             {
-                Format = Format.R32_Float,
+                Format = Format.R16_Float,
                 ViewDimension = ShaderResourceViewDimension.Texture2D,
                 Shader4ComponentMapping = ShaderComponentMapping.Default,
                 Texture2D = new Texture2DShaderResourceView
@@ -441,7 +441,8 @@ namespace Freefall.Assets
         }
 
         /// <summary>
-        /// Ensures a ControlMap R16_Float GPU texture exists for the given key.
+        /// Ensures a ControlMap GPU texture exists for the given key.
+        /// Format: R8_UNorm for Splatmap/Density, R16_Float for Height.
         /// Creates the resource + UAV/SRV on first call.
         /// </summary>
         private ControlMapGPU EnsureControlMap((ControlMapTarget, int) key, int resolution, Action<Texture> setControlMap)
@@ -461,15 +462,21 @@ namespace Freefall.Assets
                 NeedsInitialClear = true
             };
 
+            // Height painted layers need R16_Float for signed additive data.
+            // Splatmaps and density maps are 0..1 — R8_UNorm is sufficient.
+            var format = key.Item1 == ControlMapTarget.Height
+                ? Format.R16_Float
+                : Format.R8_UNorm;
+
             gpu.Texture = device.CreateTexture2D(
-                Format.R16_Float, resolution, resolution, 1, 1,
+                format, resolution, resolution, 1, 1,
                 ResourceFlags.AllowUnorderedAccess, ResourceStates.Common);
 
             gpu.UAV = device.AllocateBindlessIndex();
             device.NativeDevice.CreateUnorderedAccessView(gpu.Texture, null,
                 new UnorderedAccessViewDescription
                 {
-                    Format = Format.R16_Float,
+                    Format = format,
                     ViewDimension = UnorderedAccessViewDimension.Texture2D,
                     Texture2D = new Texture2DUnorderedAccessView { MipSlice = 0 }
                 }, device.GetCpuHandle(gpu.UAV));
@@ -478,7 +485,7 @@ namespace Freefall.Assets
             device.NativeDevice.CreateShaderResourceView(gpu.Texture,
                 new ShaderResourceViewDescription
                 {
-                    Format = Format.R16_Float,
+                    Format = format,
                     ViewDimension = ShaderResourceViewDimension.Texture2D,
                     Shader4ComponentMapping = ShaderComponentMapping.Default,
                     Texture2D = new Texture2DShaderResourceView { MostDetailedMip = 0, MipLevels = 1 }
@@ -500,7 +507,76 @@ namespace Freefall.Assets
         }
 
         /// <summary>
-        /// Reads back the baked R32_Float heightmap into a CPU float[,] array.
+        /// Uploads pre-saved R16_Float baked heightmap bytes directly to the GPU texture.
+        /// Used at load time when the baked heightmap was persisted to cache.
+        /// </summary>
+        public Texture UploadBakedHeightmap(byte[] pixels, int resolution)
+        {
+            if (pixels == null || pixels.Length == 0) return null;
+
+            EnsureTexture(resolution);
+
+            var device = Engine.Device;
+            int bytesPerPixel = 2; // R16_Float
+            int rowPitch = (resolution * bytesPerPixel + 255) & ~255;
+            int totalBytes = rowPitch * resolution;
+
+            var uploadResource = device.NativeDevice.CreateCommittedResource(
+                new HeapProperties(HeapType.Upload),
+                HeapFlags.None,
+                ResourceDescription.Buffer((ulong)totalBytes),
+                ResourceStates.GenericRead,
+                null);
+
+            var allocator = device.NativeDevice.CreateCommandAllocator(CommandListType.Direct);
+            var cmdList = device.NativeDevice.CreateCommandList<ID3D12GraphicsCommandList>(
+                0, CommandListType.Direct, allocator, null);
+
+            try
+            {
+                unsafe
+                {
+                    void* pData;
+                    uploadResource.Map(0, null, &pData);
+
+                    int srcRowBytes = resolution * bytesPerPixel;
+                    var dstPtr = (byte*)pData;
+                    for (int y = 0; y < resolution; y++)
+                        Marshal.Copy(pixels, y * srcRowBytes, (IntPtr)(dstPtr + y * rowPitch), srcRowBytes);
+
+                    uploadResource.Unmap(0);
+                }
+
+                cmdList.ResourceBarrierTransition(_heightTexture,
+                    ResourceStates.Common, ResourceStates.CopyDest);
+
+                var src = new TextureCopyLocation(uploadResource, new PlacedSubresourceFootPrint
+                {
+                    Offset = 0,
+                    Footprint = new SubresourceFootPrint(Format.R16_Float, (uint)resolution, (uint)resolution, 1, (uint)rowPitch)
+                });
+                var dst = new TextureCopyLocation(_heightTexture, 0);
+                cmdList.CopyTextureRegion(dst, 0, 0, 0, src);
+
+                cmdList.ResourceBarrierTransition(_heightTexture,
+                    ResourceStates.CopyDest, ResourceStates.Common);
+
+                cmdList.Close();
+                device.SubmitAndWait(cmdList);
+
+                Debug.Log($"[TerrainBaker] Uploaded baked heightmap from cache: {resolution}x{resolution} ({pixels.Length} bytes)");
+                return Texture.WrapNative(_heightTexture, _heightSRV);
+            }
+            finally
+            {
+                cmdList.Dispose();
+                allocator.Dispose();
+                uploadResource.Dispose();
+            }
+        }
+
+        /// <summary>
+        /// Reads back the baked R16_Float heightmap into a CPU float[,] array.
         /// Values are normalized [0..1] — caller multiplies by MaxHeight.
         /// Returns null if no heightmap has been baked.
         /// </summary>
@@ -511,7 +587,7 @@ namespace Freefall.Assets
 
             var device = Engine.Device;
             int res = _currentResolution;
-            int bytesPerPixel = 4; // R32_Float
+            int bytesPerPixel = 2; // R16_Float
             int rowPitch = (res * bytesPerPixel + 255) & ~255; // 256-byte aligned
             int totalBytes = rowPitch * res;
 
@@ -535,7 +611,7 @@ namespace Freefall.Assets
                 var dst = new TextureCopyLocation(readbackResource, new PlacedSubresourceFootPrint
                 {
                     Offset = 0,
-                    Footprint = new SubresourceFootPrint(Format.R32_Float, (uint)res, (uint)res, 1, (uint)rowPitch)
+                    Footprint = new SubresourceFootPrint(Format.R16_Float, (uint)res, (uint)res, 1, (uint)rowPitch)
                 });
                 cmdList.CopyTextureRegion(dst, 0, 0, 0, src);
 
@@ -554,9 +630,12 @@ namespace Freefall.Assets
                     var srcPtr = (byte*)pData;
                     for (int y = 0; y < res; y++)
                     {
-                        var rowPtr = (float*)(srcPtr + y * rowPitch);
+                        var rowStart = (byte*)(srcPtr + y * rowPitch);
                         for (int x = 0; x < res; x++)
-                            heights[x, y] = rowPtr[x];
+                        {
+                            Half h = *(Half*)(rowStart + x * 2);
+                            heights[x, y] = (float)h;
+                        }
                     }
 
                     readbackResource.Unmap(0);
@@ -573,10 +652,82 @@ namespace Freefall.Assets
             }
         }
 
+        /// <summary>
+        /// Reads back the baked heightmap as raw R16_Float bytes for DDS persistence.
+        /// Returns null if no heightmap has been baked.
+        /// </summary>
+        public byte[] ReadbackBakedHeightmapBytes()
+        {
+            if (_heightTexture == null || _currentResolution == 0)
+                return null;
+
+            var device = Engine.Device;
+            int res = _currentResolution;
+            int bytesPerPixel = 2; // R16_Float
+            int rowPitch = (res * bytesPerPixel + 255) & ~255;
+            int totalBytes = rowPitch * res;
+
+            var readbackResource = device.NativeDevice.CreateCommittedResource(
+                new HeapProperties(HeapType.Readback),
+                HeapFlags.None,
+                ResourceDescription.Buffer((ulong)totalBytes),
+                ResourceStates.CopyDest,
+                null);
+
+            var allocator = device.NativeDevice.CreateCommandAllocator(CommandListType.Direct);
+            var cmdList = device.NativeDevice.CreateCommandList<ID3D12GraphicsCommandList>(
+                0, CommandListType.Direct, allocator, null);
+
+            try
+            {
+                cmdList.ResourceBarrierTransition(_heightTexture,
+                    ResourceStates.Common, ResourceStates.CopySource);
+
+                var src = new TextureCopyLocation(_heightTexture, 0);
+                var dst = new TextureCopyLocation(readbackResource, new PlacedSubresourceFootPrint
+                {
+                    Offset = 0,
+                    Footprint = new SubresourceFootPrint(Format.R16_Float, (uint)res, (uint)res, 1, (uint)rowPitch)
+                });
+                cmdList.CopyTextureRegion(dst, 0, 0, 0, src);
+
+                cmdList.ResourceBarrierTransition(_heightTexture,
+                    ResourceStates.CopySource, ResourceStates.Common);
+
+                cmdList.Close();
+                device.SubmitAndWait(cmdList);
+
+                int srcRowBytes = res * bytesPerPixel;
+                byte[] pixels = new byte[srcRowBytes * res];
+                unsafe
+                {
+                    void* pData;
+                    readbackResource.Map(0, null, &pData);
+                    var srcPtr = (byte*)pData;
+                    for (int y = 0; y < res; y++)
+                        Marshal.Copy((IntPtr)(srcPtr + y * rowPitch), pixels, y * srcRowBytes, srcRowBytes);
+                    readbackResource.Unmap(0);
+                }
+
+                Debug.Log($"[TerrainBaker] Baked heightmap bytes readback: {res}x{res}, {pixels.Length} bytes");
+                return pixels;
+            }
+            finally
+            {
+                cmdList.Dispose();
+                allocator.Dispose();
+                readbackResource.Dispose();
+            }
+        }
+
+        /// <summary>Resolution of the current baked heightmap texture, or 0 if none.</summary>
+        public int BakedResolution => _currentResolution;
+
         // ── ControlMap Persistence ─────────────────────────────────────────
 
         /// <summary>
         /// Reads back a specific ControlMap GPU texture to CPU memory as raw pixel bytes.
+        /// Returns R8 (1 bpp) for Splatmap/Density, R16 (2 bpp) for Height.
         /// Returns null if the target doesn't exist.
         /// </summary>
         public byte[] ReadbackControlMap(ControlMapTarget target, int layerIndex)
@@ -586,7 +737,8 @@ namespace Freefall.Assets
 
             var device = Engine.Device;
             int res = gpu.Resolution;
-            int bytesPerPixel = 2; // R16_Float = 2 bytes
+            var format = target == ControlMapTarget.Height ? Format.R16_Float : Format.R8_UNorm;
+            int bytesPerPixel = target == ControlMapTarget.Height ? 2 : 1;
             int rowPitch = (res * bytesPerPixel + 255) & ~255; // 256-byte aligned
             int totalBytes = rowPitch * res;
 
@@ -610,7 +762,7 @@ namespace Freefall.Assets
                 var dst = new TextureCopyLocation(readbackResource, new PlacedSubresourceFootPrint
                 {
                     Offset = 0,
-                    Footprint = new SubresourceFootPrint(Format.R16_Float, (uint)res, (uint)res, 1, (uint)rowPitch)
+                    Footprint = new SubresourceFootPrint(format, (uint)res, (uint)res, 1, (uint)rowPitch)
                 });
                 cmdList.CopyTextureRegion(dst, 0, 0, 0, src);
 
@@ -645,6 +797,7 @@ namespace Freefall.Assets
 
         /// <summary>
         /// Uploads ControlMap pixel data (raw bytes from cache) to a specific target.
+        /// Handles format conversion: source may be R8/R16/R32, target is R8 (splatmap/density) or R16 (height).
         /// Creates the GPU texture if needed.
         /// </summary>
         public void UploadControlMap(ControlMapTarget target, int layerIndex, byte[] pixels, int resolution, Action<Texture> setControlMap)
@@ -663,13 +816,18 @@ namespace Freefall.Assets
 
             int pixelDataLen = pixels.Length - offset;
 
-            // Detect source format: try R16 (2 bpp) first, then R32 (4 bpp)
-            int srcBpp = 2;
-            int srcRes = (int)Math.Sqrt(pixelDataLen / 2);
-            if (srcRes * srcRes * 2 != pixelDataLen)
+            // Detect source format: try R8 (1 bpp), then R16 (2 bpp), then R32 (4 bpp)
+            int srcBpp = 1;
+            int srcRes = (int)Math.Sqrt(pixelDataLen);
+            if (srcRes * srcRes != pixelDataLen)
             {
-                srcBpp = 4;
-                srcRes = (int)Math.Sqrt(pixelDataLen / 4);
+                srcBpp = 2;
+                srcRes = (int)Math.Sqrt(pixelDataLen / 2);
+                if (srcRes * srcRes * 2 != pixelDataLen)
+                {
+                    srcBpp = 4;
+                    srcRes = (int)Math.Sqrt(pixelDataLen / 4);
+                }
             }
 
             if (srcRes * srcRes * srcBpp != pixelDataLen)
@@ -678,37 +836,55 @@ namespace Freefall.Assets
                 return;
             }
 
-            // Use the actual data resolution for the GPU texture
+            // Determine destination format
+            int dstBpp = target == ControlMapTarget.Height ? 2 : 1;
+            var dstFormat = target == ControlMapTarget.Height ? Format.R16_Float : Format.R8_UNorm;
+
             int res = srcRes;
             var key = (target, layerIndex);
             var gpu = EnsureControlMap(key, res, setControlMap);
             gpu.NeedsInitialClear = false;
             _controlMaps[key] = gpu;
 
-            // Convert R32 → R16 if needed
+            // Convert source data to destination format if needed
             byte[] uploadPixels;
-            if (srcBpp == 4)
+            if (srcBpp == dstBpp)
             {
-                Debug.Log($"[TerrainBaker] Converting R32→R16 for {target}[{layerIndex}] ({srcRes}x{srcRes})");
-                uploadPixels = new byte[res * res * 2];
-                for (int i = 0; i < res * res; i++)
-                {
-                    float val = BitConverter.ToSingle(pixels, offset + i * 4);
-                    var half = (Half)val;
-                    var halfBytes = BitConverter.GetBytes(half);
-                    uploadPixels[i * 2] = halfBytes[0];
-                    uploadPixels[i * 2 + 1] = halfBytes[1];
-                }
-                offset = 0;
+                uploadPixels = pixels;
+                // offset stays as-is
             }
             else
             {
-                uploadPixels = pixels;
-                // offset stays as-is (may be non-zero if DDS header was stripped)
+                Debug.Log($"[TerrainBaker] Converting {srcBpp}bpp→{dstBpp}bpp for {target}[{layerIndex}] ({srcRes}x{srcRes})");
+                uploadPixels = new byte[res * res * dstBpp];
+                for (int i = 0; i < res * res; i++)
+                {
+                    // Read source as float
+                    float val;
+                    if (srcBpp == 4)
+                        val = BitConverter.ToSingle(pixels, offset + i * 4);
+                    else if (srcBpp == 2)
+                        val = (float)BitConverter.ToHalf(pixels, offset + i * 2);
+                    else
+                        val = pixels[offset + i] / 255.0f;
+
+                    // Write to destination format
+                    if (dstBpp == 2)
+                    {
+                        var halfBytes = BitConverter.GetBytes((Half)val);
+                        uploadPixels[i * 2] = halfBytes[0];
+                        uploadPixels[i * 2 + 1] = halfBytes[1];
+                    }
+                    else
+                    {
+                        uploadPixels[i] = (byte)Math.Clamp(val * 255.0f + 0.5f, 0, 255);
+                    }
+                }
+                offset = 0;
             }
 
             var device = Engine.Device;
-            int bytesPerPixel = 2;
+            int bytesPerPixel = dstBpp;
             int rowPitch = (res * bytesPerPixel + 255) & ~255;
             int totalBytes = rowPitch * res;
 
@@ -744,7 +920,7 @@ namespace Freefall.Assets
                 var src = new TextureCopyLocation(uploadResource, new PlacedSubresourceFootPrint
                 {
                     Offset = 0,
-                    Footprint = new SubresourceFootPrint(Format.R16_Float, (uint)res, (uint)res, 1, (uint)rowPitch)
+                    Footprint = new SubresourceFootPrint(dstFormat, (uint)res, (uint)res, 1, (uint)rowPitch)
                 });
                 var dst = new TextureCopyLocation(gpu.Texture, 0);
                 cmdList.CopyTextureRegion(dst, 0, 0, 0, src);
@@ -755,7 +931,7 @@ namespace Freefall.Assets
                 cmdList.Close();
                 device.SubmitAndWait(cmdList);
 
-                Debug.Log($"[TerrainBaker] Uploaded ControlMap {target}[{layerIndex}]: {res}x{res} ({pixels.Length} bytes)");
+                Debug.Log($"[TerrainBaker] Uploaded ControlMap {target}[{layerIndex}]: {res}x{res} {dstFormat} ({pixels.Length} bytes, src={srcBpp}bpp)");
             }
             finally
             {

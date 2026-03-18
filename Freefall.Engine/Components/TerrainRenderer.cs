@@ -482,6 +482,24 @@ namespace Freefall.Components
 
             int frameIndex = Engine.FrameIndex % FrameCount;
 
+            // Upload saved baked heightmap from cache (skips GPU compositor if present)
+            if (Terrain.PendingBakedHeightmapBytes != null)
+            {
+                var baker = TerrainBaker.Instance;
+                var bytes = Terrain.PendingBakedHeightmapBytes;
+                Terrain.PendingBakedHeightmapBytes = null; // consumed
+
+                var tex = baker.UploadBakedHeightmap(bytes, Terrain.HeightmapResolution);
+                if (tex != null)
+                {
+                    Terrain.BakedHeightmap = tex;
+                    _heightBakeDirty = false;
+                    _heightRangePyramidBuilt = false;
+                    _bakedAlbedoDirty = true;
+                    _needHeightFieldReadback = true;
+                }
+            }
+
             // GPU height layer bake (runs before any heightmap access)
             if (_heightBakeDirty && Terrain.HeightLayers.Count > 0)
             {

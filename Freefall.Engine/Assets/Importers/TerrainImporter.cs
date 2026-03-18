@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Linq;
 using System.Text;
 using System.Text.RegularExpressions;
 using Freefall.Assets.Packers;
@@ -14,6 +15,7 @@ namespace Freefall.Assets.Importers
     /// Produces two artifacts:
     /// 1. The terrain definition (AssetDefinitionData) — same as AssetFileImporter
     /// 2. A hidden CollisionMeshData subasset containing a pre-cooked PhysX HeightField
+    ///    cooked from the saved baked heightmap DDS.
     /// </summary>
     [AssetImporter(".terrain")]
     public class TerrainImporter : IImporter
@@ -37,10 +39,10 @@ namespace Freefall.Assets.Importers
                 }
             });
 
-            // ── 2. Cook PhysX HeightField ──
+            // ── 2. Cook PhysX HeightField from saved baked heightmap ──
             try
             {
-                var cookedBytes = CookHeightField(filepath, yaml);
+                var cookedBytes = CookHeightField(yaml);
                 if (cookedBytes != null)
                 {
                     result.Artifacts.Add(new ImportArtifact
@@ -61,75 +63,104 @@ namespace Freefall.Assets.Importers
         }
 
         /// <summary>
-        /// Reads the heightmap from the source texture, cooks a PhysX HeightField,
-        /// and returns the cooked bytes. Returns null if heightmap not found.
+        /// Reads the saved baked heightmap DDS from cache, converts R16_Float to float[,],
+        /// and cooks a PhysX HeightField. Returns null if no baked heightmap found.
         /// </summary>
-        private static byte[] CookHeightField(string terrainFilePath, string yaml)
+        private static byte[] CookHeightField(string yaml)
         {
-            // Find the heightmap source file path.
-            // The YAML contains a Heightmap GUID reference. Resolve it to the source file.
-            var heightmapGuid = ExtractHeightmapGuid(yaml);
-            if (string.IsNullOrEmpty(heightmapGuid))
+            // Extract the BakedHeightmapRef GUID from the terrain YAML
+            var bakedGuid = ExtractBakedHeightmapGuid(yaml);
+            if (string.IsNullOrEmpty(bakedGuid))
             {
-                Debug.LogWarning("TerrainImporter", "No Heightmap GUID found in terrain YAML");
+                Debug.Log("[TerrainImporter] No BakedHeightmapRef found — skipping HeightField cook (terrain needs editor save first)");
                 return null;
             }
 
-            var sourcePath = AssetDatabase.GuidToPath(heightmapGuid);
-            if (string.IsNullOrEmpty(sourcePath))
+            // Load the baked heightmap DDS bytes from cache
+            var cachePath = AssetDatabase.ResolveCachePathByGuid(bakedGuid);
+            if (cachePath == null || !File.Exists(cachePath))
             {
-                Debug.LogWarning("TerrainImporter", $"Cannot resolve Heightmap GUID '{heightmapGuid}' to source path");
+                // Fallback path
+                var cacheDir = AssetDatabase.Project?.CacheDirectory;
+                if (cacheDir != null)
+                    cachePath = Path.Combine(cacheDir, $"{bakedGuid}.dds");
+            }
+
+            if (cachePath == null || !File.Exists(cachePath))
+            {
+                Debug.LogWarning("TerrainImporter", $"Baked heightmap cache not found for GUID '{bakedGuid}'");
                 return null;
             }
 
-            var fullPath = Path.Combine(AssetDatabase.Project.AssetsDirectory, sourcePath);
-            if (!File.Exists(fullPath))
+            // Read the DDS file
+            byte[] rawBytes;
+            var packer = new DdsTexturePacker();
+            using (var stream = File.OpenRead(cachePath))
             {
-                Debug.LogWarning("TerrainImporter", $"Heightmap source file not found: {fullPath}");
+                var dds = packer.Read(stream);
+                rawBytes = dds?.Bytes;
+            }
+
+            if (rawBytes == null || rawBytes.Length == 0)
+            {
+                Debug.LogWarning("TerrainImporter", "Baked heightmap DDS is empty");
                 return null;
             }
 
-            // Read height field from the source texture (DDS)
-            var heightField = Texture.ReadHeightField(fullPath);
-            if (heightField == null)
+            // Strip DDS header if present
+            int offset = 0;
+            if (rawBytes.Length > 128 && BitConverter.ToInt32(rawBytes, 0) == 0x20534444)
             {
-                Debug.LogWarning("TerrainImporter", "Failed to read height field from heightmap texture");
+                offset = 128;
+                if (rawBytes.Length > 148 && BitConverter.ToInt32(rawBytes, 84) == 0x30315844)
+                    offset = 148;
+            }
+
+            int pixelDataLen = rawBytes.Length - offset;
+
+            // Parse the R16_Float data into float[,]
+            // R16_Float = 2 bytes per pixel
+            int resolution = (int)Math.Sqrt(pixelDataLen / 2);
+            if (resolution * resolution * 2 != pixelDataLen)
+            {
+                Debug.LogWarning("TerrainImporter", $"Baked heightmap pixel data size {pixelDataLen} doesn't match R16 square texture");
                 return null;
             }
 
-            int rows = heightField.GetLength(0);
-            int cols = heightField.GetLength(1);
+            var heightField = new float[resolution, resolution];
+            for (int y = 0; y < resolution; y++)
+            {
+                for (int x = 0; x < resolution; x++)
+                {
+                    int idx = offset + (y * resolution + x) * 2;
+                    Half h = BitConverter.ToHalf(rawBytes, idx);
+                    heightField[x, y] = (float)h;
+                }
+            }
 
+            // Cook PhysX HeightField
             var samples = heightField.ToSamples();
-
             var heightFieldDesc = new HeightFieldDesc()
             {
-                NumberOfRows = rows,
-                NumberOfColumns = cols,
+                NumberOfRows = resolution,
+                NumberOfColumns = resolution,
                 Samples = samples,
             };
 
             var cooking = PhysicsWorld.Physics.CreateCooking();
-            var stream = new MemoryStream();
-            cooking.CookHeightField(heightFieldDesc, stream);
+            var stream2 = new MemoryStream();
+            cooking.CookHeightField(heightFieldDesc, stream2);
 
-            Debug.Log($"[TerrainImporter] Cooked HeightField: {rows}x{cols}, {stream.Length} bytes");
-
-            return stream.ToArray();
+            Debug.Log($"[TerrainImporter] Cooked HeightField from baked heightmap: {resolution}x{resolution}, {stream2.Length} bytes");
+            return stream2.ToArray();
         }
 
         /// <summary>
-        /// Extract the heightmap source GUID from the terrain YAML.
-        /// Looks for ImportHeightLayer Source first, then falls back to legacy "Heightmap:" field.
+        /// Extract the BakedHeightmapRef GUID from the terrain YAML.
         /// </summary>
-        private static string ExtractHeightmapGuid(string yaml)
+        private static string ExtractBakedHeightmapGuid(string yaml)
         {
-            // Primary: Source inside ImportHeightLayer
-            var match = Regex.Match(yaml, @"ImportHeightLayer:.*?Source:\s*([0-9a-fA-F]{32})", RegexOptions.Singleline);
-            if (match.Success) return match.Groups[1].Value;
-
-            // Fallback: legacy Heightmap field
-            match = Regex.Match(yaml, @"Heightmap:\s*([0-9a-fA-F]{32})", RegexOptions.Multiline);
+            var match = Regex.Match(yaml, @"BakedHeightmapRef:\s*([0-9a-fA-F]{32})", RegexOptions.Multiline);
             return match.Success ? match.Groups[1].Value : null;
         }
     }

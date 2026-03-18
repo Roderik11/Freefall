@@ -37,6 +37,21 @@ namespace Freefall.Assets
         public Texture BakedHeightmap;
 
         /// <summary>
+        /// Serialized GUID reference to the saved baked heightmap DDS subasset.
+        /// TerrainLoader loads this on startup so the game doesn't need to rebake.
+        /// </summary>
+        [Browsable(false)]
+        public Texture BakedHeightmapRef;
+
+        /// <summary>
+        /// Pending baked heightmap bytes loaded from cache, awaiting GPU upload.
+        /// Consumed by TerrainRenderer on the next Draw frame.
+        /// </summary>
+        [Reflection.DontSerialize]
+        [JsonIgnore]
+        internal byte[] PendingBakedHeightmapBytes;
+
+        /// <summary>
         /// Stamp groups — decal-like height placements grouped by brush texture.
         /// Baked after HeightLayers, one GPU pass per group.
         /// </summary>
@@ -131,7 +146,7 @@ namespace Freefall.Assets
             public Texture Normals;
             public Vector2 Tiling = Vector2.One;
 
-            /// <summary>Splatmap controlling where this layer paints (R16, hidden subasset).</summary>
+            /// <summary>Splatmap controlling where this layer paints (R8, hidden subasset).</summary>
             /// 
             [Browsable(false)]
             public Texture ControlMap;
@@ -156,7 +171,7 @@ namespace Freefall.Assets
             public Texture Texture;       // Billboard/Cross mode: alpha-tested texture
 
             /// <summary>
-            /// Controls placement density (R16, hidden subasset).
+            /// Controls placement density (R8, hidden subasset).
             /// Without a control map, the decorator renders everywhere.
             /// </summary>
             [FormerlySerializedAs("DensityMap")]

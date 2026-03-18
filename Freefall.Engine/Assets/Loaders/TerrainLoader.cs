@@ -6,6 +6,7 @@ using Freefall.Assets.Packers;
 using Freefall.Base;
 using Freefall.Graphics;
 using Freefall.Serialization;
+using PhysX;
 
 namespace Freefall.Assets.Loaders
 {
@@ -77,13 +78,18 @@ namespace Freefall.Assets.Loaders
                 // Load pre-cooked PhysX HeightField
                 LoadCookedHeightField(terrain, sourceGuid);
 
-                // Load persisted ControlMap data (painted height)
+                // Load persisted baked heightmap (R16_Float DDS)
+                LoadBakedHeightmap(terrain);
+
+                // Load persisted ControlMap data (painted height, splatmaps, density)
                 LoadControlMaps(terrain);
 
                 Debug.Log($"[TerrainLoader] '{name}' loaded: {terrain.Layers?.Count ?? 0} layers, " +
                           $"{terrain.Decorations?.Count ?? 0} decorations, " +
                           $"HeightField={terrain.HeightField != null}, " +
                           $"CookedHeightField={terrain.CookedHeightField != null}");
+
+                MessageDispatcher.Send("TerrainLoaded", terrain);
 
                 return terrain;
             }
@@ -126,6 +132,42 @@ namespace Freefall.Assets.Loaders
             catch (Exception ex)
             {
                 Debug.LogWarning("TerrainLoader", $"Failed to load cooked HeightField '{guid}': {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Loads the saved baked heightmap DDS into PendingBakedHeightmapBytes for GPU upload.
+        /// Also builds the CPU-side HeightField immediately so GetHeight() works before first render.
+        /// </summary>
+        private void LoadBakedHeightmap(Terrain terrain)
+        {
+            if (terrain.BakedHeightmapRef == null || string.IsNullOrEmpty(terrain.BakedHeightmapRef.Guid))
+                return;
+
+            var bytes = LoadDdsBytes(terrain.BakedHeightmapRef.Guid);
+            if (bytes == null) return;
+
+            terrain.PendingBakedHeightmapBytes = bytes;
+
+            // Build CPU HeightField from R16_Float bytes so GetHeight() works immediately
+            int pixelDataLen = bytes.Length;
+            int resolution = (int)Math.Sqrt(pixelDataLen / 2);
+            if (resolution * resolution * 2 == pixelDataLen)
+            {
+                var heights = new float[resolution, resolution];
+                for (int y = 0; y < resolution; y++)
+                    for (int x = 0; x < resolution; x++)
+                    {
+                        int idx = (y * resolution + x) * 2;
+                        Half h = BitConverter.ToHalf(bytes, idx);
+                        heights[x, y] = (float)h;
+                    }
+                terrain.SetHeightField(heights);
+                Debug.Log($"[TerrainLoader] Baked heightmap loaded + CPU HeightField built: {resolution}x{resolution}");
+            }
+            else
+            {
+                Debug.Log($"[TerrainLoader] Baked heightmap loaded: {bytes.Length} bytes (CPU HeightField deferred)");
             }
         }
 
@@ -246,12 +288,15 @@ namespace Freefall.Assets.Loaders
 
             try
             {
-                // 1. Save all ControlMap data (GPU readback → cache)
+                // 1. Save baked heightmap (GPU readback → cache)
+                SaveBakedHeightmap(terrain);
+
+                // 2. Save all ControlMap data (GPU readback → cache)
                 //    This also assigns GUIDs to new GPU-only ControlMaps.
                 //    Must happen BEFORE YAML save so the GUIDs are serialized.
                 SaveControlMaps(terrain);
 
-                // 2. Save YAML definition (now includes ControlMap GUIDs)
+                // 3. Save YAML definition (now includes ControlMap + BakedHeightmapRef GUIDs)
                 NativeImporter.Save(savePath, terrain);
                 Debug.Log($"[TerrainLoader] YAML saved: {savePath}");
             }
@@ -259,6 +304,107 @@ namespace Freefall.Assets.Loaders
             {
                 Debug.LogWarning("TerrainLoader", $"Failed to save terrain: {ex.Message}");
             }
+        }
+
+        /// <summary>
+        /// Reads back baked heightmap from GPU, saves as DDS subasset,
+        /// and cooks + saves the PhysX HeightField as a CollisionMeshData subasset.
+        /// </summary>
+        private void SaveBakedHeightmap(Terrain terrain)
+        {
+            var baker = TerrainBaker.Instance;
+            if (baker == null) return;
+
+            var bytes = baker.ReadbackBakedHeightmapBytes();
+            if (bytes == null || bytes.Length == 0) return;
+
+            int resolution = baker.BakedResolution;
+
+            // Ensure the BakedHeightmapRef has a GUID
+            if (terrain.BakedHeightmapRef == null)
+                terrain.BakedHeightmapRef = new Texture();
+            if (string.IsNullOrEmpty(terrain.BakedHeightmapRef.Guid))
+                terrain.BakedHeightmapRef.Guid = System.Guid.NewGuid().ToString("N");
+
+            // Save baked heightmap DDS
+            SaveDdsSubasset(terrain.BakedHeightmapRef.Guid, bytes);
+            Debug.Log($"[TerrainLoader] Baked heightmap saved: {bytes.Length} bytes, res={resolution}");
+
+            // Cook PhysX HeightField from the R16_Float bytes
+            try
+            {
+                var heights = new float[resolution, resolution];
+                for (int y = 0; y < resolution; y++)
+                    for (int x = 0; x < resolution; x++)
+                    {
+                        int idx = (y * resolution + x) * 2;
+                        Half h = BitConverter.ToHalf(bytes, idx);
+                        heights[x, y] = (float)h;
+                    }
+
+                var samples = heights.ToSamples();
+                var hfDesc = new HeightFieldDesc
+                {
+                    NumberOfRows = resolution,
+                    NumberOfColumns = resolution,
+                    Samples = samples,
+                };
+                var cooking = PhysicsWorld.Physics.CreateCooking();
+                var cookedStream = new MemoryStream();
+                cooking.CookHeightField(hfDesc, cookedStream);
+                var cookedBytes = cookedStream.ToArray();
+
+                // Save as CollisionMeshData subasset
+                SaveCollisionSubasset(terrain, cookedBytes);
+
+                Debug.Log($"[TerrainLoader] PhysX HeightField cooked + saved: {resolution}x{resolution}, {cookedBytes.Length} bytes");
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning("TerrainLoader", $"Failed to cook/save PhysX HeightField: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Saves cooked PhysX bytes to the collision subasset in cache.
+        /// Uses AssetDatabase.AddOrUpdateSubAsset to find or create the entry.
+        /// </summary>
+        private void SaveCollisionSubasset(Terrain terrain, byte[] cookedBytes)
+        {
+            if (string.IsNullOrEmpty(terrain.Guid)) return;
+
+            // Find existing or create new CollisionMeshData subasset
+            var meta = AssetDatabase.GetMeta(terrain.Guid);
+            if (meta == null) return;
+
+            var collisionSub = meta.SubAssets.FirstOrDefault(
+                s => s.Type == nameof(CollisionMeshData));
+
+            string subGuid;
+            if (collisionSub != null)
+            {
+                subGuid = collisionSub.Guid;
+            }
+            else
+            {
+                subGuid = AssetDatabase.AddOrUpdateSubAsset(
+                    terrain.Guid, nameof(CollisionMeshData), terrain.Name, hidden: true);
+                if (subGuid == null) return;
+            }
+
+            // Write cooked bytes to cache
+            var cachePath = AssetDatabase.ResolveCachePathByGuid(subGuid);
+            if (cachePath == null)
+            {
+                var cacheDir = AssetDatabase.Project.CacheDirectory;
+                var bucket = subGuid[..2];
+                cachePath = Path.Combine(cacheDir, bucket, $"{subGuid}.physx");
+                Directory.CreateDirectory(Path.GetDirectoryName(cachePath));
+            }
+
+            var packer = new CollisionMeshPacker();
+            using var stream = File.Create(cachePath);
+            packer.Write(stream, new CollisionMeshData { CookedBytes = cookedBytes });
         }
 
         /// <summary>

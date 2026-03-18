@@ -26,12 +26,7 @@ namespace Freefall.Assets.Loaders
             if (cachePath == null || !File.Exists(cachePath))
                 throw new FileNotFoundException($"Cache file not found for static mesh '{name}'");
 
-            // Resolve source GUID so LoadCookedCollisionMesh can find the
-            // pre-cooked PhysX TriangleMesh subasset from the meta file.
-            var sourceGuid = AssetDatabase.ResolveGuidByName(
-                Path.GetFileNameWithoutExtension(name));
-
-            return LoadFromCache(cachePath, name, manager, sourceGuid);
+            return LoadFromCache(cachePath, name, manager);
         }
 
         public Asset LoadFromCache(string cachePath, string name, AssetManager manager, string sourceGuid = null)
@@ -113,7 +108,7 @@ namespace Freefall.Assets.Loaders
                 staticMesh.Mesh?.RegisterMeshParts();
 
                 // -- Load pre-cooked PhysX TriangleMesh --
-                LoadCookedCollisionMesh(staticMesh, sourceGuid, name);
+                LoadCookedCollisionMesh(staticMesh, name);
 
                 return staticMesh;
             }
@@ -125,31 +120,19 @@ namespace Freefall.Assets.Loaders
         }
 
         /// <summary>
-        /// Load CollisionMeshData subasset directly via source GUID -> meta -> subasset GUID.
-        /// No name-based resolution needed.
+        /// Load pre-cooked CollisionMeshData via cache lookup.
+        /// The .staticmesh importer produces both AssetDefinitionData and CollisionMeshData
+        /// artifacts with the same name — ResolveCachePath resolves by (name, type).
         /// </summary>
-        private static void LoadCookedCollisionMesh(StaticMesh staticMesh, string sourceGuid, string name)
+        private static void LoadCookedCollisionMesh(StaticMesh staticMesh, string name)
         {
             try
             {
-                if (string.IsNullOrEmpty(sourceGuid))
-                    return;
-
-                var meta = AssetDatabase.GetMeta(sourceGuid);
-                if (meta == null)
-                    return;
-
-                var collisionSub = meta.SubAssets.FirstOrDefault(
-                    s => s.Type == nameof(CollisionMeshData));
-                if (collisionSub == null)
-                    return;
-
-                var physxPath = AssetDatabase.ResolveCachePathByGuid(collisionSub.Guid);
-                if (physxPath == null || !File.Exists(physxPath))
-                    return;
+                var cachePath = AssetDatabase.ResolveCachePath(name, nameof(CollisionMeshData));
+                if (cachePath == null || !File.Exists(cachePath)) return;
 
                 var packer = new CollisionMeshPacker();
-                using var stream = File.OpenRead(physxPath);
+                using var stream = File.OpenRead(cachePath);
                 var cooked = packer.Read(stream);
 
                 staticMesh.CookedTriMesh = PhysicsWorld.Physics.CreateTriangleMesh(

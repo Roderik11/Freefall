@@ -45,3 +45,4 @@ node_modules/
 package.json
 package-lock.json
 ws_client.js
+*.js

@@ -28,7 +28,7 @@ namespace Freefall.Assets
         public List<StaticMeshLOD> LODs = new List<StaticMeshLOD>();
 
         /// <summary>
-        /// Pre-cooked PhysX triangle mesh. Populated on background thread during asset loading
+        /// Pre-cooked PhysX triangle mesh. Populated during asset loading
         /// so that RigidBody.Awake() doesn't need to cook on the main thread.
         /// </summary>
         [JsonIgnore]

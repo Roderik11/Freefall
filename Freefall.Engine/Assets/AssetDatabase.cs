@@ -351,6 +351,39 @@ namespace Freefall.Assets
         public static IEnumerable<MetaFile> GetAllMeta() => _guidToMeta.Values;
 
         /// <summary>
+        /// Adds or updates a subasset entry on a source asset's meta, writes the meta file,
+        /// and registers the subasset for runtime lookup.
+        /// Returns the subasset GUID (reused if already exists, new if created).
+        /// </summary>
+        public static string AddOrUpdateSubAsset(string sourceGuid, string type, string name, bool hidden = false)
+        {
+            if (!_guidToMeta.TryGetValue(sourceGuid, out var meta))
+                return null;
+
+            var existing = meta.SubAssets.FirstOrDefault(
+                s => s.Type == type && s.Name == name);
+
+            if (existing != null)
+                return existing.Guid;
+
+            var subGuid = System.Guid.NewGuid().ToString("N");
+            var entry = new SubAssetEntry
+            {
+                Guid = subGuid,
+                Name = name,
+                Type = type,
+                Hidden = hidden
+            };
+            meta.SubAssets.Add(entry);
+            WriteMetaFile(meta);
+
+            // Register for runtime lookup
+            _subAssetToSource[subGuid] = sourceGuid;
+
+            return subGuid;
+        }
+
+        /// <summary>
         /// Check if a file extension has a registered importer.
         /// Used by editor UI to filter displayable assets.
         /// </summary>
@@ -567,12 +600,9 @@ namespace Freefall.Assets
                 foreach (var sub in meta.SubAssets)
                 {
                     _subAssetToSource[sub.Guid] = meta.Guid;
-                    if (!sub.Hidden)
-                    {
-                        if (!_nameToSubAssets.TryGetValue(sub.Name, out var list))
-                            _nameToSubAssets[sub.Name] = list = new List<SubAssetEntry>();
-                        list.Add(sub);
-                    }
+                    if (!_nameToSubAssets.TryGetValue(sub.Name, out var list))
+                        _nameToSubAssets[sub.Name] = list = new List<SubAssetEntry>();
+                    list.Add(sub);
                 }
             }
             else if (!string.IsNullOrEmpty(meta.MainAssetType))
