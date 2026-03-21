@@ -108,12 +108,12 @@ namespace Freefall.Assets
         /// Apply this prefab's components to an existing entity.
         /// Used during scene loading: the entity already has UID + Transform from the scene file,
         /// so we only add the components defined in the prefab (MeshRenderer, RigidBody, etc.).
+        /// For multi-entity prefabs, child entities are re-parented to the target.
         /// </summary>
         public void ApplyTo(Entity target)
         {
             if (SourceYaml == null || SourceYaml.Length == 0) return;
 
-            // Parse the prefab YAML in a temporary context — don't register entities
             var loader = new SceneLoader();
             var prefabEntities = loader.LoadFromBytes(SourceYaml);
 
@@ -127,12 +127,22 @@ namespace Freefall.Assets
                 target.AddComponent(component);
             }
 
+            // Re-parent child entities: any entity whose Transform.Parent was the root
+            // gets re-parented to the target's Transform
+            for (int i = 1; i < prefabEntities.Count; i++)
+            {
+                var child = prefabEntities[i];
+                if (child.Transform.Parent == root.Transform)
+                    child.Transform.Parent = target.Transform;
+
+                child.Prefab = this;
+            }
+
             // Tag it
             target.Prefab = this;
 
-            // Clean up: destroy the temporary prefab entities (they auto-registered in EntityManager)
-            foreach (var e in prefabEntities)
-                EntityManager.RemoveEntity(e);
+            // Only remove the temporary root entity (children stay alive and registered)
+            EntityManager.RemoveEntity(root);
         }
     }
 }

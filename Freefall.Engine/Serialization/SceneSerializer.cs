@@ -27,6 +27,10 @@ namespace Freefall.Serialization
             {
                 if (entity.HideAndDontSave) continue;
 
+                // Skip child entities of prefab instances — they're reconstructed on load
+                if (entity.IsPrefabInstance && entity.Transform.Parent != null)
+                    continue;
+
                 emitter.SetTag("---");
                 _yaml.Serialize(entity, ref emitter);
 
