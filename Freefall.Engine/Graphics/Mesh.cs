@@ -27,27 +27,17 @@ namespace Freefall.Graphics
         public int BaseVertex;
         public int BaseIndex;
         public int NumIndices;
+        public int MaterialSlot;  // Index into MeshRenderer.Materials[]
         public BoundingBox BoundingBox;
         public Vector4 BoundingSphere; // Local-space bounding sphere (center.xyz, radius)
     }
 
     /// <summary>
     /// A single LOD level, referencing a subset of MeshParts by index.
-    /// MaterialSlots maps each part to a LOD0 material slot for stable overrides.
     /// </summary>
     public class MeshLOD
     {
         public int[] MeshPartIndices;
-
-        /// <summary>
-        /// Maps each part in this LOD to a LOD0 material slot index.
-        /// MaterialSlots[i] = the LOD0 slot that MeshPartIndices[i] corresponds to.
-        /// Used by MeshRenderer to apply MaterialOverrides consistently across LODs.
-        /// For LOD0, this is identity (slot[i] = i). For lower LODs, maps back to
-        /// the equivalent LOD0 part by name (stripping LOD suffix).
-        /// null = identity mapping (assume 1:1 correspondence).
-        /// </summary>
-        public int[] MaterialSlots;
     }
 
     [AssetTypeAlias("MeshData")]

@@ -8,30 +8,15 @@ using Vortice.Mathematics;
 
 namespace Freefall.Components
 {
-    /// <summary>
-    /// Per-MeshPart material override. Sparse — only the exceptions.
-    /// </summary>
-    [Serializable]
-    public class MaterialOverride
-    {
-        //[Reflection.ValueSelect(typeof(Reflection.MeshPartProvider))]
-        public int MeshPartIndex;
-        public Material Material;
-    }
-
     public class MeshRenderer : Component, IDraw, IParallel
     {
         public Mesh? Mesh { get; set; }
 
         /// <summary>
-        /// Default material applied to all MeshParts.
+        /// Material array indexed by MeshPart.MaterialSlot.
+        /// Slot 0 is the default. Additional slots for multi-material meshes.
         /// </summary>
-        public Material? Material { get; set; }
-
-        /// <summary>
-        /// Sparse per-MeshPart material overrides. Only exceptions to the default.
-        /// </summary>
-        public List<MaterialOverride> MaterialOverrides { get; set; } = new List<MaterialOverride>();
+        public List<Material> Materials { get; set; } = new List<Material>();
 
         public MaterialBlock Params = new MaterialBlock();
         public BoundingSphere BoundingSphere;
@@ -93,20 +78,16 @@ namespace Freefall.Components
         }
 
         /// <summary>
-        /// Resolve material for a given MeshPart index.
-        /// Checks sparse overrides first, falls back to default Material.
+        /// Resolve material for a MeshPart by its MaterialSlot.
         /// </summary>
-        private Material? GetMaterial(int meshPartIndex)
+        private Material? GetMaterial(int materialSlot)
         {
-            if (MaterialOverrides != null && MaterialOverrides.Count > 0)
-            {
-                for (int i = 0; i < MaterialOverrides.Count; i++)
-                {
-                    if (MaterialOverrides[i].MeshPartIndex == meshPartIndex)
-                        return MaterialOverrides[i].Material;
-                }
-            }
-            return Material;
+            if (Materials != null && materialSlot >= 0 && materialSlot < Materials.Count)
+                return Materials[materialSlot];
+            // Fallback to slot 0 (default material)
+            if (Materials != null && Materials.Count > 0)
+                return Materials[0];
+            return null;
         }
 
         public void Draw()
@@ -119,21 +100,14 @@ namespace Freefall.Components
 
             if (lod >= 0 && Mesh.LODs[lod].MeshPartIndices != null)
             {
-                // LOD-selected parts — resolve material via LOD0 absolute index
-                var lodData = Mesh.LODs[lod];
-                var lod0Data = Mesh.LODs[0];
-                var indices = lodData.MeshPartIndices;
+                // LOD-selected parts
+                var indices = Mesh.LODs[lod].MeshPartIndices;
                 for (int i = 0; i < indices.Length; i++)
                 {
                     int partIdx = indices[i];
-                    // MaterialSlots maps this LOD's part → LOD0 slot position
-                    int slot0 = (lodData.MaterialSlots != null && i < lodData.MaterialSlots.Length)
-                        ? lodData.MaterialSlots[i] : i;
-                    // Resolve slot position → LOD0 absolute MeshPart index (for override lookup)
-                    int overrideKey = (lod0Data.MeshPartIndices != null && slot0 < lod0Data.MeshPartIndices.Length)
-                        ? lod0Data.MeshPartIndices[slot0] : partIdx;
-                    var mat = GetMaterial(overrideKey);
-                    if (mat != null && partIdx < Mesh.MeshParts.Count)
+                    if (partIdx >= Mesh.MeshParts.Count) continue;
+                    var mat = GetMaterial(Mesh.MeshParts[partIdx].MaterialSlot);
+                    if (mat != null)
                         CommandBuffer.Enqueue(Mesh, partIdx, mat, Params, slot);
                 }
             }
@@ -142,7 +116,7 @@ namespace Freefall.Components
                 // No LODs — render all parts
                 for (int i = 0; i < Mesh.MeshParts.Count; i++)
                 {
-                    var mat = GetMaterial(i);
+                    var mat = GetMaterial(Mesh.MeshParts[i].MaterialSlot);
                     if (mat != null)
                         CommandBuffer.Enqueue(Mesh, i, mat, Params, slot);
                 }

@@ -17,7 +17,7 @@ namespace Freefall.Graphics
     [AssetPacker(".mesh")]
     public class MeshPacker : AssetPacker<MeshData>
     {
-        public override int Version => 4;
+        public override int Version => 5;
 
         public override void Pack(BinaryWriter w, MeshData data)
         {
@@ -44,6 +44,7 @@ namespace Freefall.Graphics
                     w.Write(part.BaseVertex);
                     w.Write(part.BaseIndex);
                     w.Write(part.NumIndices);
+                    w.Write(part.MaterialSlot);
                     w.Write(part.BoundingBox.Min);
                     w.Write(part.BoundingBox.Max);
                     w.Write(part.BoundingSphere);
@@ -81,12 +82,6 @@ namespace Freefall.Graphics
                     w.Write(indices.Length);
                     foreach (var idx in indices)
                         w.Write(idx);
-
-                    // MaterialSlots (v4+)
-                    var slots = lod.MaterialSlots ?? System.Array.Empty<int>();
-                    w.Write(slots.Length);
-                    foreach (var s in slots)
-                        w.Write(s);
                 }
             }
         }
@@ -117,6 +112,7 @@ namespace Freefall.Graphics
                     BaseVertex = r.ReadInt32(),
                     BaseIndex = r.ReadInt32(),
                     NumIndices = r.ReadInt32(),
+                    MaterialSlot = version >= 5 ? r.ReadInt32() : 0,
                     BoundingBox = new BoundingBox(r.ReadVector3(), r.ReadVector3()),
                     BoundingSphere = r.ReadVector4()
                 };
@@ -161,18 +157,13 @@ namespace Freefall.Graphics
                     for (int j = 0; j < indexCount; j++)
                         partIndices[j] = r.ReadInt32();
 
-                    int[] materialSlots = null;
-                    if (version >= 4)
+                    // Skip v4 MaterialSlots (removed in v5)
+                    if (version == 4)
                     {
                         int slotCount = r.ReadInt32();
-                        if (slotCount > 0)
-                        {
-                            materialSlots = new int[slotCount];
-                            for (int j = 0; j < slotCount; j++)
-                                materialSlots[j] = r.ReadInt32();
-                        }
+                        for (int j = 0; j < slotCount; j++) r.ReadInt32();
                     }
-                    data.LODs.Add(new MeshLOD { MeshPartIndices = partIndices, MaterialSlots = materialSlots });
+                    data.LODs.Add(new MeshLOD { MeshPartIndices = partIndices });
                 }
             }
 

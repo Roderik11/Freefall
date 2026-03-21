@@ -481,39 +481,28 @@ namespace Freefall.Assets.Importers
             }
             if (lodGroups.Count <= 1) return new List<MeshLOD>();
 
-            var result = new List<MeshLOD>();
-            Dictionary<string, int> lod0SlotByBaseName = null;
+            // Assign MaterialSlot to each MeshPart by base name grouping.
+            // Parts with same base name (LOD suffix stripped) get the same slot.
+            var slotByBaseName = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+            int nextSlot = 0;
 
             foreach (var kvp in lodGroups)
             {
-                var indices = kvp.Value.ToArray();
-                var lod = new MeshLOD { MeshPartIndices = indices };
-
-                if (lod0SlotByBaseName == null)
+                foreach (var partIdx in kvp.Value)
                 {
-                    // LOD0: identity mapping, build base name → slot lookup
-                    lod0SlotByBaseName = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
-                    lod.MaterialSlots = new int[indices.Length];
-                    for (int i = 0; i < indices.Length; i++)
+                    var baseName = StripLODSuffix(parts[partIdx].Name);
+                    if (!slotByBaseName.TryGetValue(baseName, out var slot))
                     {
-                        lod.MaterialSlots[i] = i;
-                        var baseName = StripLODSuffix(parts[indices[i]].Name);
-                        lod0SlotByBaseName.TryAdd(baseName, i);
+                        slot = nextSlot++;
+                        slotByBaseName[baseName] = slot;
                     }
+                    parts[partIdx].MaterialSlot = slot;
                 }
-                else
-                {
-                    // Lower LODs: match by base name back to LOD0 slots
-                    lod.MaterialSlots = new int[indices.Length];
-                    for (int i = 0; i < indices.Length; i++)
-                    {
-                        var baseName = StripLODSuffix(parts[indices[i]].Name);
-                        lod.MaterialSlots[i] = lod0SlotByBaseName.TryGetValue(baseName, out var slot) ? slot : i;
-                    }
-                }
-
-                result.Add(lod);
             }
+
+            var result = new List<MeshLOD>();
+            foreach (var kvp in lodGroups)
+                result.Add(new MeshLOD { MeshPartIndices = kvp.Value.ToArray() });
             return result;
         }
 
