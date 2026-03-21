@@ -195,7 +195,7 @@ namespace Freefall.Serialization
                     continue;
                 }
 
-                // List of [Serializable] objects — recurse into each element
+                // List of Asset references — resolve each element
                 if (typeof(IList).IsAssignableFrom(field.Type))
                 {
                     var list = field.GetValue(obj) as IList;
@@ -206,6 +206,28 @@ namespace Freefall.Serialization
                         : field.Type.IsGenericType
                             ? field.Type.GetGenericArguments()[0]
                             : null;
+
+                    if (elType != null && typeof(Asset).IsAssignableFrom(elType))
+                    {
+                        for (int i = 0; i < list.Count; i++)
+                        {
+                            var stub = list[i] as Asset;
+                            if (stub == null || string.IsNullOrEmpty(stub.Guid)) continue;
+                            try
+                            {
+                                var loaded = Engine.Assets.LoadByGuid(stub.Guid, elType);
+                                if (loaded != null)
+                                    list[i] = loaded;
+                            }
+                            catch (Exception ex)
+                            {
+                                Debug.LogWarning("SceneLoader",
+                                    $"List stub resolve failed: {elType.Name} " +
+                                    $"'{stub.Guid}' on {context}.{field.Name}[{i}]: {ex.Message}");
+                            }
+                        }
+                        continue;
+                    }
 
                     if (elType != null && Reflector.GetAttribute<SerializableAttribute>(elType) != null)
                     {
