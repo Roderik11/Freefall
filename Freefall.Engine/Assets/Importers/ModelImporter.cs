@@ -510,7 +510,7 @@ namespace Freefall.Assets.Importers
         /// Strip LOD suffix/prefix from a mesh part name to get the base surface name.
         /// "Castle_Wall_LOD0" → "Castle_Wall", "LOD_1_Wall" → "Wall"
         /// </summary>
-        private static string StripLODSuffix(string name)
+        public static string StripLODSuffix(string name)
         {
             if (string.IsNullOrEmpty(name)) return name;
 
