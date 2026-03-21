@@ -27,6 +27,16 @@ namespace Freefall.Base
         public ulong UID { get; set; } = IDGenerator.GetUID();
         public string Name { get; set; } = "Entity";
         public Transform Transform { get; private set; }
+
+        /// <summary>
+        /// Source prefab this entity was instantiated from. 
+        /// null if the entity was created directly (not from a prefab).
+        /// Used by SceneSerializer to emit compact PrefabInstance documents.
+        /// </summary>
+        public Assets.Prefab Prefab { get; set; }
+
+        public bool IsPrefabInstance => Prefab != null;
+
         [Reflection.DontSerialize]
         public bool Hidden { get; set; }
         [Reflection.DontSerialize]

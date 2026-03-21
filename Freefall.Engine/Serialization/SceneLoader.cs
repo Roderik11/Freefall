@@ -129,7 +129,21 @@ namespace Freefall.Serialization
             if (Engine.Assets != null)
                 ResolveAssetStubs(entities);
 
-            Debug.Log($"[SceneLoader] Loaded {entities.Count} entities ({uidLookup.Count} UIDs resolved)");
+            // ── Phase 4: Hydrate prefab instances ──
+            // Entities saved as prefab references only have Entity + Transform in the scene file.
+            // Now that Prefab asset stubs are resolved, apply the prefab's components.
+            int prefabCount = 0;
+            foreach (var entity in entities)
+            {
+                if (entity.Prefab != null)
+                {
+                    entity.Prefab.ApplyTo(entity);
+                    prefabCount++;
+                }
+            }
+
+            Debug.Log($"[SceneLoader] Loaded {entities.Count} entities " +
+                      $"({prefabCount} prefab instances, {uidLookup.Count} UIDs resolved)");
 
             return entities;
         }

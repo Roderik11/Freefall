@@ -7,7 +7,8 @@ namespace Freefall.Serialization
 {
     /// <summary>
     /// Serializes entities and their components to .scene YAML files.
-    /// Thin wrapper — delegates all field serialization to YAMLSerializer.
+    /// Prefab instances emit only Entity (with Prefab GUID) + Transform;
+    /// non-prefab entities emit full inline component data.
     /// </summary>
     public class SceneSerializer
     {
@@ -29,10 +30,21 @@ namespace Freefall.Serialization
                 emitter.SetTag("---");
                 _yaml.Serialize(entity, ref emitter);
 
-                foreach (var component in entity.Components)
+                if (entity.IsPrefabInstance)
                 {
+                    // Prefab instance: only emit Transform (position/rotation/scale).
+                    // All other components come from the prefab on load.
                     emitter.SetTag("---");
-                    _yaml.Serialize(component, ref emitter);
+                    _yaml.Serialize(entity.Transform, ref emitter);
+                }
+                else
+                {
+                    // Inline entity: emit all components
+                    foreach (var component in entity.Components)
+                    {
+                        emitter.SetTag("---");
+                        _yaml.Serialize(component, ref emitter);
+                    }
                 }
             }
 

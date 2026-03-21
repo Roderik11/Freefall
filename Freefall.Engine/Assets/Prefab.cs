@@ -55,6 +55,10 @@ namespace Freefall.Assets
                 return null;
             }
 
+            // Tag all entities as instances of this prefab
+            foreach (var e in entities)
+                e.Prefab = this;
+
             Debug.Log($"[Prefab] Instantiated '{Name}': {entities.Count} entities");
             return entities[0]; // root entity
         }
@@ -98,6 +102,37 @@ namespace Freefall.Assets
         {
             if (SourceYaml == null) return string.Empty;
             return Encoding.UTF8.GetString(SourceYaml);
+        }
+
+        /// <summary>
+        /// Apply this prefab's components to an existing entity.
+        /// Used during scene loading: the entity already has UID + Transform from the scene file,
+        /// so we only add the components defined in the prefab (MeshRenderer, RigidBody, etc.).
+        /// </summary>
+        public void ApplyTo(Entity target)
+        {
+            if (SourceYaml == null || SourceYaml.Length == 0) return;
+
+            // Parse the prefab YAML in a temporary context — don't register entities
+            var loader = new SceneLoader();
+            var prefabEntities = loader.LoadFromBytes(SourceYaml);
+
+            if (prefabEntities.Count == 0) return;
+
+            // Copy non-Transform components from the prefab's root entity to the target
+            var root = prefabEntities[0];
+            foreach (var component in root.Components)
+            {
+                if (component is Components.Transform) continue;
+                target.AddComponent(component);
+            }
+
+            // Tag it
+            target.Prefab = this;
+
+            // Clean up: destroy the temporary prefab entities (they auto-registered in EntityManager)
+            foreach (var e in prefabEntities)
+                EntityManager.RemoveEntity(e);
         }
     }
 }
