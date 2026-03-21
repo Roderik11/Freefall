@@ -480,10 +480,73 @@ namespace Freefall.Assets.Importers
                 }
             }
             if (lodGroups.Count <= 1) return new List<MeshLOD>();
+
             var result = new List<MeshLOD>();
+            Dictionary<string, int> lod0SlotByBaseName = null;
+
             foreach (var kvp in lodGroups)
-                result.Add(new MeshLOD { MeshPartIndices = kvp.Value.ToArray() });
+            {
+                var indices = kvp.Value.ToArray();
+                var lod = new MeshLOD { MeshPartIndices = indices };
+
+                if (lod0SlotByBaseName == null)
+                {
+                    // LOD0: identity mapping, build base name → slot lookup
+                    lod0SlotByBaseName = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+                    lod.MaterialSlots = new int[indices.Length];
+                    for (int i = 0; i < indices.Length; i++)
+                    {
+                        lod.MaterialSlots[i] = i;
+                        var baseName = StripLODSuffix(parts[indices[i]].Name);
+                        lod0SlotByBaseName.TryAdd(baseName, i);
+                    }
+                }
+                else
+                {
+                    // Lower LODs: match by base name back to LOD0 slots
+                    lod.MaterialSlots = new int[indices.Length];
+                    for (int i = 0; i < indices.Length; i++)
+                    {
+                        var baseName = StripLODSuffix(parts[indices[i]].Name);
+                        lod.MaterialSlots[i] = lod0SlotByBaseName.TryGetValue(baseName, out var slot) ? slot : i;
+                    }
+                }
+
+                result.Add(lod);
+            }
             return result;
+        }
+
+        /// <summary>
+        /// Strip LOD suffix/prefix from a mesh part name to get the base surface name.
+        /// "Castle_Wall_LOD0" → "Castle_Wall", "LOD_1_Wall" → "Wall"
+        /// </summary>
+        private static string StripLODSuffix(string name)
+        {
+            if (string.IsNullOrEmpty(name)) return name;
+
+            // Strip "_LODN" suffix
+            var upper = name.ToUpperInvariant();
+            int idx = upper.LastIndexOf("_LOD");
+            if (idx >= 0)
+            {
+                int end = idx + 4;
+                while (end < upper.Length && char.IsDigit(upper[end])) end++;
+                // Only strip if it's at the end or followed by non-alpha (like " [material]")
+                if (end >= upper.Length || !char.IsLetter(upper[end]))
+                    return name.Substring(0, idx);
+            }
+
+            // Strip "LOD_N_" prefix
+            if (upper.StartsWith("LOD_") && upper.Length >= 5)
+            {
+                int end = 4;
+                while (end < upper.Length && char.IsDigit(upper[end])) end++;
+                if (end > 4 && end < upper.Length && upper[end] == '_')
+                    return name.Substring(end + 1);
+            }
+
+            return name;
         }
 
         private static BoneWeight[] BuildBoneWeights(List<Dictionary<int, float>> weightMap)

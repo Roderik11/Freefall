@@ -119,16 +119,16 @@ namespace Freefall.Components
 
             if (lod >= 0 && Mesh.LODs[lod].MeshPartIndices != null)
             {
-                // LOD-selected parts
-                // Material overrides reference LOD0 part indices; map to equivalent slot in current LOD
-                var indices = Mesh.LODs[lod].MeshPartIndices;
-                var lod0Indices = Mesh.LODs[0].MeshPartIndices;
+                // LOD-selected parts — use MaterialSlots for override lookup
+                var lodData = Mesh.LODs[lod];
+                var indices = lodData.MeshPartIndices;
                 for (int i = 0; i < indices.Length; i++)
                 {
                     int partIdx = indices[i];
-                    // Map: override targets LOD0 part → find same slot position in current LOD
-                    int lod0PartIdx = (lod0Indices != null && i < lod0Indices.Length) ? lod0Indices[i] : partIdx;
-                    var mat = GetMaterial(lod0PartIdx);
+                    // MaterialSlots maps this LOD's part to a LOD0 material slot
+                    int materialSlot = (lodData.MaterialSlots != null && i < lodData.MaterialSlots.Length)
+                        ? lodData.MaterialSlots[i] : i;
+                    var mat = GetMaterial(materialSlot);
                     if (mat != null && partIdx < Mesh.MeshParts.Count)
                         CommandBuffer.Enqueue(Mesh, partIdx, mat, Params, slot);
                 }
