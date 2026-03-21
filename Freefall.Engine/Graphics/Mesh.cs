@@ -57,6 +57,7 @@ namespace Freefall.Graphics
         /// Higher values keep high-detail LODs visible longer.
         /// Multiplied with global Engine.Settings.LODScale.
         /// </summary>
+        [ValueRange(0.1f, 10.0f)]
         public float LODBias { get; set; } = 1.0f;
         
         // Buffers
