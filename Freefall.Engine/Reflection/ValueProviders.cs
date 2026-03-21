@@ -1,3 +1,5 @@
+using Freefall.Components;
+using Freefall.Graphics;
 using System;
 using System.Collections.Generic;
 
@@ -31,9 +33,11 @@ namespace Freefall.Reflection
         public IList<ProviderValue> GetValues(object context)
         {
             var result = new List<ProviderValue>();
-            if (context is not Assets.MeshElement target) return result;
+            Mesh mesh = null;
 
-            var mesh = target.Mesh;
+            if (context is Assets.MeshElement target)
+                mesh = target.Mesh;
+
             if (mesh == null) return result;
 
             for (int i = 0; i < mesh.MeshParts.Count; i++)

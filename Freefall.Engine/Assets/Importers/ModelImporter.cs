@@ -433,11 +433,34 @@ namespace Freefall.Assets.Importers
             if (string.IsNullOrEmpty(name)) return -1;
             // Strip material suffix: "SM_Tower_LOD0 [Stone]" → "SM_Tower_LOD0"
             int bracket = name.IndexOf(" [");
-            var baseName = bracket >= 0 ? name.AsSpan(0, bracket) : name.AsSpan();
-            int idx = baseName.LastIndexOf("_LOD", StringComparison.OrdinalIgnoreCase);
-            if (idx < 0) return -1;
-            var suffix = baseName.Slice(idx + 4);
-            return suffix.Length > 0 && int.TryParse(suffix, out int level) ? level : -1;
+            var baseName = bracket >= 0 ? name.Substring(0, bracket) : name;
+
+            // Search for "_LOD" or "LOD_" anywhere in the name (case-insensitive)
+            var upper = baseName.ToUpperInvariant();
+
+            // Pattern: "_LOD" followed by digit(s) — e.g. Wall_LOD0, SM_House_LOD1_Part
+            int idx = upper.IndexOf("_LOD");
+            if (idx >= 0)
+            {
+                int start = idx + 4;
+                int end = start;
+                while (end < upper.Length && char.IsDigit(upper[end])) end++;
+                if (end > start && int.TryParse(upper.AsSpan(start, end - start), out int level))
+                    return level;
+            }
+
+            // Pattern: "LOD_" followed by digit(s) — e.g. LOD_0_Wall, LOD_1
+            idx = upper.IndexOf("LOD_");
+            if (idx >= 0)
+            {
+                int start = idx + 4;
+                int end = start;
+                while (end < upper.Length && char.IsDigit(upper[end])) end++;
+                if (end > start && int.TryParse(upper.AsSpan(start, end - start), out int level))
+                    return level;
+            }
+
+            return -1;
         }
 
         private static List<MeshLOD> DiscoverLODsFromConfig(List<MeshPart> parts, List<MeshPartConfig> configs)

@@ -14,7 +14,7 @@ namespace Freefall.Components
     [Serializable]
     public class MaterialOverride
     {
-        [Reflection.ValueSelect(typeof(Reflection.MeshPartProvider))]
+        //[Reflection.ValueSelect(typeof(Reflection.MeshPartProvider))]
         public int MeshPartIndex;
         public Material Material;
     }
