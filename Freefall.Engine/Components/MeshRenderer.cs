@@ -117,30 +117,36 @@ namespace Freefall.Components
             if (_boundsDirty) OnTransformChanged();
 
             var slot = Transform.TransformSlot;
-            int lod = GetActiveLOD();
 
-            if (lod >= 0 && Mesh.LODs[lod].MeshPartIndices != null)
+            // When using sparse overrides without a default Material,
+            // iterate all parts — overrides control visibility directly.
+            bool useSparseMode = Material == null && Materials != null && Materials.Count > 0;
+
+            if (!useSparseMode)
             {
-                // LOD-selected parts
-                var indices = Mesh.LODs[lod].MeshPartIndices;
-                for (int i = 0; i < indices.Length; i++)
+                int lod = GetActiveLOD();
+                if (lod >= 0 && Mesh.LODs[lod].MeshPartIndices != null)
                 {
-                    int partIdx = indices[i];
-                    if (partIdx >= Mesh.MeshParts.Count) continue;
-                    var mat = GetMaterial(Mesh.MeshParts[partIdx].MaterialSlot);
-                    if (mat != null)
-                        CommandBuffer.Enqueue(Mesh, partIdx, mat, Params, slot);
+                    // LOD-selected parts
+                    var indices = Mesh.LODs[lod].MeshPartIndices;
+                    for (int i = 0; i < indices.Length; i++)
+                    {
+                        int partIdx = indices[i];
+                        if (partIdx >= Mesh.MeshParts.Count) continue;
+                        var mat = GetMaterial(Mesh.MeshParts[partIdx].MaterialSlot);
+                        if (mat != null)
+                            CommandBuffer.Enqueue(Mesh, partIdx, mat, Params, slot);
+                    }
+                    return;
                 }
             }
-            else
+
+            // No LODs or sparse override mode — render all parts
+            for (int i = 0; i < Mesh.MeshParts.Count; i++)
             {
-                // No LODs — render all parts
-                for (int i = 0; i < Mesh.MeshParts.Count; i++)
-                {
-                    var mat = GetMaterial(Mesh.MeshParts[i].MaterialSlot);
-                    if (mat != null)
-                        CommandBuffer.Enqueue(Mesh, i, mat, Params, slot);
-                }
+                var mat = GetMaterial(Mesh.MeshParts[i].MaterialSlot);
+                if (mat != null)
+                    CommandBuffer.Enqueue(Mesh, i, mat, Params, slot);
             }
         }
     }
