@@ -131,14 +131,20 @@ namespace Freefall.Serialization
 
             // ── Phase 4: Hydrate prefab instances ──
             // Entities saved as prefab references only have Entity + Transform in the scene file.
-            // Now that Prefab asset stubs are resolved, apply the prefab's components.
+            // ResolveAssetStubs only walks component fields — resolve Entity.Prefab explicitly.
             int prefabCount = 0;
             foreach (var entity in entities)
             {
-                if (entity.Prefab != null)
+                if (entity.Prefab != null && !string.IsNullOrEmpty(entity.Prefab.Guid))
                 {
-                    entity.Prefab.ApplyTo(entity);
-                    prefabCount++;
+                    // Resolve the stub → fully loaded Prefab with SourceYaml
+                    var loaded = Engine.Assets?.LoadByGuid(entity.Prefab.Guid, typeof(Assets.Prefab)) as Assets.Prefab;
+                    if (loaded != null)
+                    {
+                        entity.Prefab = loaded;
+                        loaded.ApplyTo(entity);
+                        prefabCount++;
+                    }
                 }
             }
 
