@@ -390,6 +390,15 @@ namespace Freefall.Assets.Importers
             if (data.LODs.Count > 1)
                 Debug.Log("ModelImporter", $"Discovered {data.LODs.Count} LOD levels");
 
+            // Ensure every part has a unique MaterialSlot.
+            // DiscoverLODsFromConfig assigns slots for LOD meshes.
+            // For non-LOD meshes (or parts excluded from LODs), assign sequential slots.
+            if (data.LODs.Count == 0)
+            {
+                for (int i = 0; i < parts.Count; i++)
+                    parts[i].MaterialSlot = i;
+            }
+
             // Skeleton data
             if (_skeleton.Count > 0)
             {
