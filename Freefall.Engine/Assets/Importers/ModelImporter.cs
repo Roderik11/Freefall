@@ -391,12 +391,26 @@ namespace Freefall.Assets.Importers
                 Debug.Log("ModelImporter", $"Discovered {data.LODs.Count} LOD levels");
 
             // Ensure every part has a unique MaterialSlot.
-            // DiscoverLODsFromConfig assigns slots for LOD meshes.
-            // For non-LOD meshes (or parts excluded from LODs), assign sequential slots.
-            if (data.LODs.Count == 0)
+            // DiscoverLODsFromConfig assigns slots for LOD-participating parts.
+            // Assign sequential slots to any remaining parts (e.g., tiles in a mixed FBX).
+            int maxAssigned = -1;
+            foreach (var p in parts)
+                maxAssigned = Math.Max(maxAssigned, p.MaterialSlot);
+
+            int nextUnusedSlot = maxAssigned + 1;
+            // Parts with MaterialSlot = 0 that weren't the first LOD-assigned part need unique slots
+            var lodAssigned = new HashSet<int>();
+            if (data.LODs.Count > 0)
             {
-                for (int i = 0; i < parts.Count; i++)
-                    parts[i].MaterialSlot = i;
+                foreach (var lod in data.LODs)
+                    if (lod.MeshPartIndices != null)
+                        foreach (var idx in lod.MeshPartIndices)
+                            lodAssigned.Add(idx);
+            }
+            for (int i = 0; i < parts.Count; i++)
+            {
+                if (!lodAssigned.Contains(i))
+                    parts[i].MaterialSlot = nextUnusedSlot++;
             }
 
             // Skeleton data
