@@ -123,7 +123,6 @@ namespace Freefall.Components
             {
                 // LOD-selected parts
                 var indices = Mesh.LODs[lod].MeshPartIndices;
-                var lodSet = new HashSet<int>(indices);
 
                 for (int i = 0; i < indices.Length; i++)
                 {
@@ -135,11 +134,18 @@ namespace Freefall.Components
                 }
 
                 // Also render non-LOD parts that have material overrides
+                // (e.g., tiles in a mixed FBX). Skip parts in ANY LOD group.
                 if (Materials != null && Materials.Count > 0)
                 {
+                    var allLodParts = new HashSet<int>();
+                    foreach (var lodLevel in Mesh.LODs)
+                        if (lodLevel.MeshPartIndices != null)
+                            foreach (var idx in lodLevel.MeshPartIndices)
+                                allLodParts.Add(idx);
+
                     for (int i = 0; i < Mesh.MeshParts.Count; i++)
                     {
-                        if (lodSet.Contains(i)) continue; // already handled above
+                        if (allLodParts.Contains(i)) continue;
                         var mat = GetMaterial(Mesh.MeshParts[i].MaterialSlot);
                         if (mat != null)
                             CommandBuffer.Enqueue(Mesh, i, mat, Params, slot);
