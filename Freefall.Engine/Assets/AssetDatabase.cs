@@ -300,7 +300,7 @@ namespace Freefall.Assets
         /// <summary>
         /// Resolve a GUID directly to its cache file path.
         /// </summary>
-        internal static string ResolveCachePathByGuid(string guid, Type dataType = null)
+        public static string ResolveCachePathByGuid(string guid, Type dataType = null)
         {
             var dataTypeName = dataType?.Name;
             // Try as source GUID (simple asset)
