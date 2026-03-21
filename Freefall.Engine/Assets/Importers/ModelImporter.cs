@@ -40,7 +40,7 @@ namespace Freefall.Assets.Importers
         public bool FlipUVs = false;
         public bool FlipWinding = true;
         public bool CalculateTangents = true;
-        public bool PreTransform = false;
+        public bool PreTransform = true;
 
         public bool ImportMesh = true;
         public bool ImportSkeleton = true;
