@@ -231,9 +231,7 @@ namespace Freefall.Assets.Importers
             var weightMap = new List<Dictionary<int, float>>();
             int vertexOffset = 0;
 
-            // Match Apex: reverse mesh order (MeshImporter also reverses)
-            var meshes = new List<Assimp.Mesh>(scene.Meshes);
-            meshes.Reverse();
+            var meshes = scene.Meshes;
 
             int startIndex = 0;
             var parts = new List<MeshPart>();
@@ -385,14 +383,7 @@ namespace Freefall.Assets.Importers
                 parts[i].Enabled = Parts[i].Render;
             }
 
-            // Sort by LOD ascending for readability
-            var sorted = Enumerable.Range(0, parts.Count)
-                .OrderBy(i => Parts[i].LODMin)
-                .ThenBy(i => Parts[i].Name)
-                .ToList();
-            data.Parts = sorted.Select(i => parts[i]).ToList();
-            Parts = sorted.Select(i => Parts[i]).ToList();
-            parts = data.Parts;
+            data.Parts = parts;
 
             // ── LOD Discovery (config-driven) ──
             data.LODs = DiscoverLODsFromConfig(parts, Parts);
