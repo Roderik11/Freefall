@@ -1,6 +1,8 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Numerics;
+using System.ComponentModel;
 using Assimp;
 using Freefall.Animation;
 using Freefall.Graphics;
@@ -11,6 +13,19 @@ using QuaternionKey = Freefall.Animation.QuaternionKey;
 
 namespace Freefall.Assets.Importers
 {
+    [Serializable]
+    public class MeshPartConfig
+    {
+        [ReadOnly(true)]
+        public string Name = string.Empty;
+        public bool Render = true;
+        public bool Collision = false;
+        public int LODMin = -1;
+        public int LODMax = -1;
+
+        public override string ToString() => Name;
+    }
+
     /// <summary>
     /// Unified model importer for FBX, DAE, OBJ files.
     /// Produces all artifacts from a single source: mesh data, skeleton, and animations.
@@ -35,6 +50,8 @@ namespace Freefall.Assets.Importers
         [ValueRange(0, 180)]
         public float SmoothingAngle = 66f;
         public float Scale = 1;
+
+        public List<MeshPartConfig> Parts = new();
 
         private List<Bone> _skeleton = new();
         private List<string> _boneNames = new();
@@ -221,6 +238,10 @@ namespace Freefall.Assets.Importers
             int startIndex = 0;
             var parts = new List<MeshPart>();
 
+            // Map Assimp mesh indices to their parent node names (has LOD suffix)
+            var meshNodeNames = new Dictionary<int, string>();
+            BuildMeshNodeMap(scene.RootNode, meshNodeNames);
+
             foreach (var mesh in meshes)
             {
                 int meshIndexCount = 0;
@@ -287,9 +308,22 @@ namespace Freefall.Assets.Importers
                 var partCenter = (partMin + partMax) * 0.5f;
                 var partRadius = (partMax - partCenter).Length();
 
+                // Use node name (what Blender shows) → fallback to mesh name → fallback to index
+                int origIdx = scene.Meshes.IndexOf(mesh);
+                string nodeName = meshNodeNames.GetValueOrDefault(origIdx);
+                string partName = nodeName ?? mesh.Name ?? $"Part_{meshes.IndexOf(mesh)}";
+
+                // Disambiguate sub-meshes under the same node by appending material name
+                if (nodeName != null && mesh.MaterialIndex >= 0 && mesh.MaterialIndex < scene.MaterialCount)
+                {
+                    var matName = scene.Materials[mesh.MaterialIndex].Name;
+                    if (!string.IsNullOrEmpty(matName))
+                        partName = $"{nodeName} [{matName}]";
+                }
+
                 parts.Add(new MeshPart
                 {
-                    Name = mesh.Name ?? $"Part_{meshes.IndexOf(mesh)}",
+                    Name = partName,
                     Enabled = true,
                     BaseIndex = startIndex,
                     NumIndices = meshIndexCount,
@@ -321,6 +355,50 @@ namespace Freefall.Assets.Importers
                 BoundingBox = new Vortice.Mathematics.BoundingBox(min, max),
             };
 
+            // ── Sync Part Config ──
+            var configByName = new Dictionary<string, MeshPartConfig>();
+            foreach (var cfg in Parts)
+                if (!string.IsNullOrEmpty(cfg.Name))
+                    configByName[cfg.Name] = cfg;
+
+            Parts.Clear();
+            for (int i = 0; i < parts.Count; i++)
+            {
+                var part = parts[i];
+                if (configByName.TryGetValue(part.Name, out var existing))
+                {
+                    Parts.Add(existing);
+                }
+                else
+                {
+                    bool isCollision = IsCollisionPart(part.Name);
+                    int autoLOD = isCollision ? -1 : ParseLODLevel(part.Name);
+                    Parts.Add(new MeshPartConfig
+                    {
+                        Name = part.Name,
+                        Render = !isCollision,
+                        Collision = isCollision,
+                        LODMin = autoLOD,
+                        LODMax = autoLOD,
+                    });
+                }
+                parts[i].Enabled = Parts[i].Render;
+            }
+
+            // Sort by LOD ascending for readability
+            var sorted = Enumerable.Range(0, parts.Count)
+                .OrderBy(i => Parts[i].LODMin)
+                .ThenBy(i => Parts[i].Name)
+                .ToList();
+            data.Parts = sorted.Select(i => parts[i]).ToList();
+            Parts = sorted.Select(i => Parts[i]).ToList();
+            parts = data.Parts;
+
+            // ── LOD Discovery (config-driven) ──
+            data.LODs = DiscoverLODsFromConfig(parts, Parts);
+            if (data.LODs.Count > 1)
+                Debug.Log("ModelImporter", $"Discovered {data.LODs.Count} LOD levels");
+
             // Skeleton data
             if (_skeleton.Count > 0)
             {
@@ -330,6 +408,68 @@ namespace Freefall.Assets.Importers
             }
 
             return data;
+        }
+
+        // ══════════════════════════════════════════════════════════════
+        // Part Config Helpers
+        // ══════════════════════════════════════════════════════════════
+
+        private static void BuildMeshNodeMap(Node node, Dictionary<int, string> map)
+        {
+            if (node.HasMeshes)
+                foreach (var meshIdx in node.MeshIndices)
+                    if (!map.ContainsKey(meshIdx))
+                        map[meshIdx] = node.Name;
+
+            if (node.HasChildren)
+                foreach (var child in node.Children)
+                    BuildMeshNodeMap(child, map);
+        }
+
+        private static bool IsCollisionPart(string name)
+        {
+            if (string.IsNullOrEmpty(name)) return false;
+            if (name.Contains("UCX", StringComparison.OrdinalIgnoreCase)) return true;
+            if (name.Contains("UBX", StringComparison.OrdinalIgnoreCase)) return true;
+            if (name.Contains("UCP", StringComparison.OrdinalIgnoreCase)) return true;
+            if (name.Contains("USP", StringComparison.OrdinalIgnoreCase)) return true;
+            if (name.Contains("ConvexHull", StringComparison.OrdinalIgnoreCase)) return true;
+            return false;
+        }
+
+        private static int ParseLODLevel(string name)
+        {
+            if (string.IsNullOrEmpty(name)) return -1;
+            // Strip material suffix: "SM_Tower_LOD0 [Stone]" → "SM_Tower_LOD0"
+            int bracket = name.IndexOf(" [");
+            var baseName = bracket >= 0 ? name.AsSpan(0, bracket) : name.AsSpan();
+            int idx = baseName.LastIndexOf("_LOD", StringComparison.OrdinalIgnoreCase);
+            if (idx < 0) return -1;
+            var suffix = baseName.Slice(idx + 4);
+            return suffix.Length > 0 && int.TryParse(suffix, out int level) ? level : -1;
+        }
+
+        private static List<MeshLOD> DiscoverLODsFromConfig(List<MeshPart> parts, List<MeshPartConfig> configs)
+        {
+            var lodGroups = new SortedDictionary<int, List<int>>();
+            for (int i = 0; i < parts.Count && i < configs.Count; i++)
+            {
+                int lodMin = configs[i].LODMin;
+                int lodMax = configs[i].LODMax;
+                if (lodMin < 0) continue;
+                if (lodMax < lodMin) lodMax = lodMin;
+                for (int lod = lodMin; lod <= lodMax; lod++)
+                {
+                    if (!lodGroups.ContainsKey(lod))
+                        lodGroups[lod] = new List<int>();
+                    lodGroups[lod].Add(i);
+                }
+            }
+            if (lodGroups.Count <= 1) return new List<MeshLOD>();
+            var result = new List<MeshLOD>();
+            foreach (var kvp in lodGroups)
+                result.Add(new MeshLOD { MeshPartIndices = kvp.Value.ToArray() });
+            return result;
         }
 
         private static BoneWeight[] BuildBoneWeights(List<Dictionary<int, float>> weightMap)

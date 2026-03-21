@@ -17,7 +17,7 @@ namespace Freefall.Graphics
     [AssetPacker(".mesh")]
     public class MeshPacker : AssetPacker<MeshData>
     {
-        public override int Version => 1;
+        public override int Version => 3;
 
         public override void Pack(BinaryWriter w, MeshData data)
         {
@@ -40,6 +40,7 @@ namespace Freefall.Graphics
                 foreach (var part in data.Parts)
                 {
                     w.Write(part.Name ?? string.Empty);
+                    w.Write(part.Enabled);
                     w.Write(part.BaseVertex);
                     w.Write(part.BaseIndex);
                     w.Write(part.NumIndices);
@@ -69,6 +70,19 @@ namespace Freefall.Graphics
                     }
                 }
             }
+
+            // LODs (v2+)
+            w.Write(data.LODs?.Count ?? 0);
+            if (data.LODs != null)
+            {
+                foreach (var lod in data.LODs)
+                {
+                    var indices = lod.MeshPartIndices ?? System.Array.Empty<int>();
+                    w.Write(indices.Length);
+                    foreach (var idx in indices)
+                        w.Write(idx);
+                }
+            }
         }
 
         public override MeshData Unpack(BinaryReader r, int version)
@@ -93,6 +107,7 @@ namespace Freefall.Graphics
                 var part = new MeshPart
                 {
                     Name = r.ReadString(),
+                    Enabled = version >= 3 ? r.ReadBoolean() : true,
                     BaseVertex = r.ReadInt32(),
                     BaseIndex = r.ReadInt32(),
                     NumIndices = r.ReadInt32(),
@@ -126,6 +141,20 @@ namespace Freefall.Graphics
                             Weights = r.ReadVector4()
                         };
                     }
+                }
+            }
+
+            // LODs (v2+)
+            if (version >= 2)
+            {
+                int lodCount = r.ReadInt32();
+                for (int i = 0; i < lodCount; i++)
+                {
+                    int indexCount = r.ReadInt32();
+                    var partIndices = new int[indexCount];
+                    for (int j = 0; j < indexCount; j++)
+                        partIndices[j] = r.ReadInt32();
+                    data.LODs.Add(new MeshLOD { MeshPartIndices = partIndices });
                 }
             }
 

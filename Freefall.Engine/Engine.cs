@@ -393,6 +393,14 @@ namespace Freefall
 
          [ValueRange(0.0001f, 0.01f)]
          public float FogDensity { get; set; } = 0.0005f;                     // Fog density (exponential squared)
+
+         /// <summary>
+         /// Global LOD distance scale. Default 1.0.
+         /// Higher = LODs stay high-detail longer (quality). Lower = transition sooner (performance).
+         /// Multiplied with per-mesh Mesh.LODBias.
+         /// </summary>
+         [ValueRange(0.1f, 20.0f)]
+         public float LODScale { get; set; } = 1.0f;
   
   
          public System.Numerics.Matrix4x4 FrozenViewProjection { get; set; } // VP matrix when frustum frozen

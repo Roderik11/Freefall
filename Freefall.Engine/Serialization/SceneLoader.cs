@@ -1,4 +1,5 @@
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -136,34 +137,62 @@ namespace Freefall.Serialization
         /// <summary>
         /// Walk all components on all entities. For each Asset-typed field
         /// that holds a stub (has Guid but not loaded), resolve via LoadByGuid.
+        /// Also recurses into List fields of [Serializable] elements.
         /// </summary>
         private static void ResolveAssetStubs(List<Entity> entities)
         {
             foreach (var entity in entities)
             {
                 foreach (var component in entity.Components)
+                    ResolveObjectStubs(component, component.GetType().Name);
+            }
+        }
+
+        private static void ResolveObjectStubs(object obj, string context)
+        {
+            var mapping = Reflector.GetMapping(obj.GetType());
+            foreach (var field in mapping)
+            {
+                // Direct Asset field
+                if (typeof(Asset).IsAssignableFrom(field.Type))
                 {
-                    var mapping = Reflector.GetMapping(component.GetType());
-                    foreach (var field in mapping)
+                    var stub = field.GetValue(obj) as Asset;
+                    if (stub == null || string.IsNullOrEmpty(stub.Guid))
+                        continue;
+
+                    try
                     {
-                        if (!typeof(Asset).IsAssignableFrom(field.Type))
-                            continue;
+                        var loaded = Engine.Assets.LoadByGuid(stub.Guid, field.Type);
+                        if (loaded != null)
+                            field.SetValue(obj, loaded);
+                    }
+                    catch (Exception ex)
+                    {
+                        Debug.LogWarning("SceneLoader",
+                            $"Stub resolve failed: {field.Type.Name} " +
+                            $"'{stub.Guid}' on {context}: {ex.Message}");
+                    }
+                    continue;
+                }
 
-                        var stub = field.GetValue(component) as Asset;
-                        if (stub == null || string.IsNullOrEmpty(stub.Guid))
-                            continue;
+                // List of [Serializable] objects — recurse into each element
+                if (typeof(IList).IsAssignableFrom(field.Type))
+                {
+                    var list = field.GetValue(obj) as IList;
+                    if (list == null || list.Count == 0) continue;
 
-                        try
+                    var elType = field.Type.IsArray
+                        ? field.Type.GetElementType()
+                        : field.Type.IsGenericType
+                            ? field.Type.GetGenericArguments()[0]
+                            : null;
+
+                    if (elType != null && Reflector.GetAttribute<SerializableAttribute>(elType) != null)
+                    {
+                        for (int i = 0; i < list.Count; i++)
                         {
-                            var loaded = Engine.Assets.LoadByGuid(stub.Guid, field.Type);
-                            if (loaded != null)
-                                field.SetValue(component, loaded);
-                        }
-                        catch (Exception ex)
-                        {
-                            Debug.LogWarning("SceneLoader",
-                                $"Stub resolve failed: {field.Type.Name} " +
-                                $"'{stub.Guid}' on {component.GetType().Name}: {ex.Message}");
+                            if (list[i] != null)
+                                ResolveObjectStubs(list[i], $"{context}.{field.Name}[{i}]");
                         }
                     }
                 }

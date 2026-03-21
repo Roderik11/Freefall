@@ -52,6 +52,12 @@ namespace Freefall.Assets
             DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
         };
 
+        private static readonly JsonSerializerOptions _importerJsonOptions = new()
+        {
+            WriteIndented = false,
+            IncludeFields = true,
+        };
+
         /// <summary>
         /// Initialize the asset database for a project.
         /// Scans Assets/ for source files, loads/creates meta files in Library/.
@@ -417,7 +423,21 @@ namespace Freefall.Assets
             if (!_importersByExtension.TryGetValue(ext, out var importerType))
                 return null;
 
-            return Activator.CreateInstance(importerType) as IImporter;
+            var importer = (IImporter)Activator.CreateInstance(importerType);
+
+            // Restore saved settings if available
+            var meta = GetMeta(sourceGuid);
+            if (meta != null && !string.IsNullOrEmpty(meta.ImporterSettings))
+            {
+                try
+                {
+                    var restored = System.Text.Json.JsonSerializer.Deserialize(meta.ImporterSettings, importerType, _importerJsonOptions) as IImporter;
+                    if (restored != null) importer = restored;
+                }
+                catch { }
+            }
+
+            return importer;
         }
 
         // ── Core Logic ──
@@ -674,6 +694,17 @@ namespace Freefall.Assets
 
             var importer = (IImporter)Activator.CreateInstance(importerType);
 
+            // Restore saved importer settings (preserves user overrides across reimports)
+            if (!string.IsNullOrEmpty(meta.ImporterSettings))
+            {
+                try
+                {
+                    var restored = System.Text.Json.JsonSerializer.Deserialize(meta.ImporterSettings, importerType, _importerJsonOptions) as IImporter;
+                    if (restored != null) importer = restored;
+                }
+                catch { /* ignore deserialization errors — use fresh defaults */ }
+            }
+
             Debug.Log($"[AssetDatabase] Importing: {meta.SourcePath}");
 
             // Run import
@@ -743,6 +774,11 @@ namespace Freefall.Assets
             meta.ImporterType = importerType.FullName;
             meta.LastImported = DateTime.UtcNow;
             meta.FileSize = new FileInfo(sourcePath).Length;
+
+            // Serialize importer state (includes auto-populated Parts list, user overrides, etc.)
+            try { meta.ImporterSettings = System.Text.Json.JsonSerializer.Serialize(importer, importerType, _importerJsonOptions); }
+            catch { meta.ImporterSettings = null; }
+
             WriteMetaFile(meta);
 
             // Re-register subassets for lookup

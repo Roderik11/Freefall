@@ -21,5 +21,8 @@ namespace Freefall.Graphics
         // Skeleton
         public Bone[] Bones;
         public BoneWeight[] BoneWeights;
+
+        // LOD grouping (populated by ModelImporter when sub-meshes have LOD naming)
+        public List<MeshLOD> LODs = new List<MeshLOD>();
     }
 }

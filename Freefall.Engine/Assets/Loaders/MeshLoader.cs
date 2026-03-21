@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using System.IO;
 using Freefall.Assets;
 using Freefall.Graphics;
@@ -31,7 +32,23 @@ namespace Freefall.Assets.Loaders
             if (meshData.Positions?.Length > 0)
                 Debug.Log($"[MeshLoader] '{name}' Vert[0]={meshData.Positions[0]} Vert[1]={meshData.Positions[1]} BBox={meshData.BoundingBox.Min}..{meshData.BoundingBox.Max}");
             // Match Apex MeshReader: sort parts alphabetically by name
+            // Build remap table so LOD indices stay correct after reorder
+            var originalOrder = new List<MeshPart>(meshData.Parts);
             meshData.Parts.Sort((a, b) => a.Name.CompareTo(b.Name));
+
+            if (meshData.LODs.Count > 0)
+            {
+                // Build old→new index map
+                var remap = new int[originalOrder.Count];
+                for (int i = 0; i < originalOrder.Count; i++)
+                    remap[i] = meshData.Parts.IndexOf(originalOrder[i]);
+
+                foreach (var lod in meshData.LODs)
+                {
+                    for (int i = 0; i < lod.MeshPartIndices.Length; i++)
+                        lod.MeshPartIndices[i] = remap[lod.MeshPartIndices[i]];
+                }
+            }
 
             var mesh = Mesh.CreateAsync(Engine.Device, meshData);
             mesh.Name = name;

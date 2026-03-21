@@ -22,7 +22,6 @@ namespace Freefall.Components
 
     public class RigidBody : Component
     {
-        private static Dictionary<int, TriangleMesh> _triMeshCache = new();
 
         private bool _isStatic;
         private RigidStatic? _staticActor;
@@ -60,6 +59,14 @@ namespace Freefall.Components
                     var smr = Entity?.GetComponent<StaticMeshRenderer>();
                     if (smr?.StaticMesh != null)
                         StaticMesh = smr.StaticMesh;
+                }
+
+                // Auto-resolve Mesh from sibling MeshRenderer if not set
+                if (Mesh == null && Type == ShapeType.Mesh)
+                {
+                    var mr = Entity?.GetComponent<MeshRenderer>();
+                    if (mr?.Mesh != null)
+                        Mesh = mr.Mesh;
                 }
 
                 CreateBody();
@@ -136,34 +143,17 @@ namespace Freefall.Components
 
                 case ShapeType.Mesh:
                 {
-                    if (Mesh == null || Mesh.Positions == null || Mesh.CpuIndices == null)
+                    // Same pattern as StaticMesh: use pre-cooked, or cook on demand
+                    if (Mesh?.CookedTriMesh == null)
+                        Mesh?.CookPhysicsMesh();
+
+                    if (Mesh?.CookedTriMesh == null)
                     {
-                        Debug.Log("[RigidBody] Mesh cooking failed — no CPU vertex data retained");
+                        Debug.Log("[RigidBody] Mesh cooking failed — no geometry available");
                         return null;
                     }
 
-                    var hash = Mesh.GetInstanceId();
-                    if (!_triMeshCache.TryGetValue(hash, out var triangleMesh))
-                    {
-                        var cooking = PhysicsWorld.Physics.CreateCooking();
-
-                        var triangleMeshDesc = new TriangleMeshDesc()
-                        {
-                            Flags = (MeshFlag)0,
-                            Triangles = Array.ConvertAll(Mesh.CpuIndices, i => (int)i),
-                            Points = Mesh.Positions
-                        };
-
-                        var stream = new MemoryStream();
-                        cooking.CookTriangleMesh(triangleMeshDesc, stream);
-
-                        stream.Position = 0;
-                        triangleMesh = PhysicsWorld.Physics.CreateTriangleMesh(stream);
-
-                        _triMeshCache.Add(hash, triangleMesh);
-                    }
-
-                    return new TriangleMeshGeometry(triangleMesh)
+                    return new TriangleMeshGeometry(Mesh.CookedTriMesh)
                     {
                         Scale = new MeshScale(scale, Quaternion.Identity)
                     };

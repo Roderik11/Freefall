@@ -31,6 +31,14 @@ namespace Freefall.Graphics
         public Vector4 BoundingSphere; // Local-space bounding sphere (center.xyz, radius)
     }
 
+    /// <summary>
+    /// A single LOD level, referencing a subset of MeshParts by index.
+    /// </summary>
+    public class MeshLOD
+    {
+        public int[] MeshPartIndices;
+    }
+
     [AssetTypeAlias("MeshData")]
     public partial class Mesh : Asset, IDisposable
     {
@@ -39,6 +47,17 @@ namespace Freefall.Graphics
         public int GetInstanceId() => _instanceId;
         
         public List<MeshPart> MeshParts { get; set; } = new List<MeshPart>();
+
+        // LOD chain: each MeshLOD references a subset of MeshParts by index.
+        // Populated by ModelImporter when sub-meshes have LOD naming conventions.
+        public List<MeshLOD> LODs { get; set; } = new List<MeshLOD>();
+
+        /// <summary>
+        /// Per-mesh LOD distance bias. Default 1.0.
+        /// Higher values keep high-detail LODs visible longer.
+        /// Multiplied with global Engine.Settings.LODScale.
+        /// </summary>
+        public float LODBias { get; set; } = 1.0f;
         
         // Buffers
         private ID3D12Resource _posBuffer = null!;
@@ -84,6 +103,39 @@ namespace Freefall.Graphics
         private ID3D12Resource? _boneWeightBuffer;
         public uint BoneWeightBufferIndex { get; private set; }
 
+        /// <summary>
+        /// Pre-cooked PhysX triangle mesh. Populated during asset loading
+        /// so that RigidBody.Awake() doesn't need to cook on the main thread.
+        /// </summary>
+        [System.Text.Json.Serialization.JsonIgnore]
+        public PhysX.TriangleMesh? CookedTriMesh { get; set; }
+
+        /// <summary>
+        /// Cook the physics triangle mesh on the calling thread (background) and cache it.
+        /// Thread-safe: each call creates its own Cooking instance.
+        /// </summary>
+        public void CookPhysicsMesh()
+        {
+            if (Positions == null || CpuIndices == null)
+                return;
+
+            var triangles = System.Array.ConvertAll(CpuIndices, i => (int)i);
+
+            var cooking = Freefall.Base.PhysicsWorld.Physics.CreateCooking();
+            var desc = new PhysX.TriangleMeshDesc()
+            {
+                Flags = (PhysX.MeshFlag)0,
+                Triangles = triangles,
+                Points = Positions
+            };
+
+            var stream = new System.IO.MemoryStream();
+            cooking.CookTriangleMesh(desc, stream);
+
+            stream.Position = 0;
+            CookedTriMesh = Freefall.Base.PhysicsWorld.Physics.CreateTriangleMesh(stream);
+        }
+
         private int[]? _meshPartIds;
 
         public Mesh() { }
@@ -99,6 +151,8 @@ namespace Freefall.Graphics
             CreateBuffers(device, data.Positions, data.Normals, data.UVs, data.Indices);
             MeshParts.AddRange(data.Parts);
             BoundingBox = data.BoundingBox;
+            if (data.LODs != null && data.LODs.Count > 0)
+                LODs.AddRange(data.LODs);
             
             if (data.Bones != null)
                 Bones = data.Bones;
@@ -119,6 +173,8 @@ namespace Freefall.Graphics
             mesh.BoundingBox = data.BoundingBox;
             mesh.Bones = data.Bones;
             mesh.BoneWeights = data.BoneWeights;
+            if (data.LODs != null && data.LODs.Count > 0)
+                mesh.LODs.AddRange(data.LODs);
             
             // For meshes, because they are structured buffers, we still create the Committed Resource on Main Thread
             // But we skip the *Upload* part here?
