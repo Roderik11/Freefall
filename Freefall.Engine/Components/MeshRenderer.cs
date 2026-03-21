@@ -8,15 +8,32 @@ using Vortice.Mathematics;
 
 namespace Freefall.Components
 {
+    /// <summary>
+    /// Sparse per-slot material override. Only specified slots get a material;
+    /// unspecified slots fall back to the default Material, or null (invisible).
+    /// </summary>
+    [Serializable]
+    public class MaterialOverride
+    {
+        public int MaterialSlot;
+        public Material Material;
+    }
+
     public class MeshRenderer : Component, IDraw, IParallel
     {
         public Mesh? Mesh { get; set; }
 
         /// <summary>
-        /// Material array indexed by MeshPart.MaterialSlot.
-        /// Slot 0 is the default. Additional slots for multi-material meshes.
+        /// Default material applied to all MeshParts (unless overridden).
         /// </summary>
-        public List<Material> Materials { get; set; } = new List<Material>();
+        public Material? Material { get; set; }
+
+        /// <summary>
+        /// Sparse per-slot material overrides. Only the slots that differ
+        /// from the default need entries. MeshParts whose slot has no override
+        /// and no default Material are invisible.
+        /// </summary>
+        public List<MaterialOverride> Materials { get; set; } = new List<MaterialOverride>();
 
         public MaterialBlock Params = new MaterialBlock();
         public BoundingSphere BoundingSphere;
@@ -79,15 +96,19 @@ namespace Freefall.Components
 
         /// <summary>
         /// Resolve material for a MeshPart by its MaterialSlot.
+        /// Checks sparse overrides first, falls back to default Material.
         /// </summary>
         private Material? GetMaterial(int materialSlot)
         {
-            if (Materials != null && materialSlot >= 0 && materialSlot < Materials.Count)
-                return Materials[materialSlot];
-            // Fallback to slot 0 (default material)
-            if (Materials != null && Materials.Count > 0)
-                return Materials[0];
-            return null;
+            if (Materials != null)
+            {
+                for (int i = 0; i < Materials.Count; i++)
+                {
+                    if (Materials[i].MaterialSlot == materialSlot)
+                        return Materials[i].Material;
+                }
+            }
+            return Material;
         }
 
         public void Draw()
