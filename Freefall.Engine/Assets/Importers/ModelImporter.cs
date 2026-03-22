@@ -34,13 +34,19 @@ namespace Freefall.Assets.Importers
     [AssetImporter(".fbx", ".dae", ".obj")]
     public class ModelImporter : IImporter
     {
+        /// <summary>
+        /// When set, newly created ModelImporter instances will use these settings
+        /// instead of class defaults. Set by UnityImporterWindow before bulk import.
+        /// </summary>
+        public static ModelImporter OverrideSettings;
+
         bool ConvertUnits = true;
         public bool Optimize = false;
         public bool LeftHanded = true;
         public bool FlipUVs = false;
         public bool FlipWinding = true;
         public bool CalculateTangents = true;
-        public bool PreTransform = true;
+        public bool PreTransform = false;
 
         public bool ImportMesh = true;
         public bool ImportSkeleton = true;
@@ -66,6 +72,16 @@ namespace Freefall.Assets.Importers
         /// </summary>
         public ImportResult Import(string filepath)
         {
+            // Apply override settings if set (from UnityImporterWindow)
+            if (OverrideSettings != null)
+            {
+                PreTransform = OverrideSettings.PreTransform;
+                FlipUVs = OverrideSettings.FlipUVs;
+                FlipWinding = OverrideSettings.FlipWinding;
+                CalculateTangents = OverrideSettings.CalculateTangents;
+                LeftHanded = OverrideSettings.LeftHanded;
+            }
+
             var result = new ImportResult { Compound = true };
             var scene = LoadScene(filepath, out float scale);
             var name = System.IO.Path.GetFileNameWithoutExtension(filepath);

@@ -21,21 +21,21 @@ namespace Freefall.Components
 
     public class MeshRenderer : Component, IDraw, IParallel
     {
-        public Mesh? Mesh { get; set; }
+        public Mesh? Mesh;
 
         /// <summary>
         /// Default material applied to all MeshParts (unless overridden).
         /// </summary>
-        public Material? Material { get; set; }
+        public Material? Material;
 
         /// <summary>
         /// Sparse per-slot material overrides. Only the slots that differ
         /// from the default need entries. MeshParts whose slot has no override
         /// and no default Material are invisible.
         /// </summary>
-        public List<MaterialOverride> Materials { get; set; } = new List<MaterialOverride>();
+        public List<MaterialOverride> Materials = [];
 
-        public MaterialBlock Params = new MaterialBlock();
+        public MaterialBlock Params = new();
         public BoundingSphere BoundingSphere;
 
         private bool _boundsDirty = true;
