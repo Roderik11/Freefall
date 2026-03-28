@@ -1,8 +1,9 @@
 // terrain_height_bake.hlsl — Composites terrain HeightLayers and StampGroups
 // into a final R32_Float heightmap.
 //
-// HeightLayers: dispatched per-layer (CS_ImportLayer)
+// HeightLayers: dispatched per-layer (CS_ImportLayer, CS_NoiseLayer)
 // StampGroups: dispatched per-group with a StructuredBuffer of instances (CS_StampGroup)
+// Erosion: multi-pass iterative simulation (CS_ErosionInit, CS_ErosionStep)
 //
 // Uses push constants (b3) matching engine convention.
 
@@ -14,6 +15,9 @@
 #pragma kernel CS_ImportChannel
 #pragma kernel CS_PackChannels
 #pragma kernel CS_BrushRaycast
+#pragma kernel CS_NoiseLayer
+#pragma kernel CS_ErosionInit
+#pragma kernel CS_ErosionStep
 
 // Push constants (root parameter 0, register b3) — bindless indices + params
 cbuffer PushConstants : register(b3)
@@ -40,6 +44,38 @@ cbuffer PushConstants : register(b3)
     float TerrainSizeX;   // slot 17
     float TerrainSizeZ;   // slot 18
     float TerrainMaxHeight; // slot 19
+    uint FlipV;             // slot 20 — flip V of stroke points for splatmap targets
+
+    // ── Noise layer params (CS_NoiseLayer) ──
+    uint NoiseType;       // slot 21 — 0=Simplex, 1=Perlin, 2=Ridged, 3=Billow
+    uint Octaves;         // slot 22 — number of fBm octaves
+    float Frequency;      // slot 23 — base frequency
+    float Amplitude;      // slot 24 — output amplitude scale
+    float Lacunarity;     // slot 25 — per-octave frequency multiplier
+    float Persistence;    // slot 26 — per-octave amplitude decay
+    float OffsetX;        // slot 27 — world-space noise offset X
+    float OffsetY;        // slot 28 — world-space noise offset Y
+    uint NoiseSeed;       // slot 29 — seed for noise permutation
+    uint ErosionMode;     // slot 30 — 0=Hydraulic, 1=Thermal, 2=Both (reused as NoiseLUTIdx for CS_NoiseLayer)
+
+    // ── Noise terrace + mask params (CS_NoiseLayer only) ──
+    uint TerraceSteps;    // slot 31 — 0=disabled, N = number of terrace shelves
+    float TerraceSmoothness; // slot 32 — 0=sharp, 1=fully rounded transitions
+    float MaskCenterX;    // slot 33 — UV-space mask center X
+    float MaskCenterY;    // slot 34 — UV-space mask center Y
+    float MaskRadius;     // slot 35 — UV-space radius, 0=disabled (full terrain)
+    float MaskFalloff;    // slot 36 — mask edge falloff exponent
+
+    // ── Erosion params (CS_ErosionStep, reuses slots 23-28 since never concurrent) ──
+    // RainRate      → slot 23 (Frequency)
+    // SedimentCap   → slot 24 (Amplitude)
+    // DepositionRate→ slot 25 (Lacunarity)
+    // DissolutionRate→slot 26 (Persistence)
+    // Evaporation   → slot 27 (OffsetX)
+    // TalusAngle    → slot 28 (OffsetY)
+    // ThermalRate   → slot 6  (BrushRadius)
+    // Erosion aux UAVs: WaterIdx=slot 2 (StampBufIdx), SedimentIdx=slot 5 (StampCount)
+    // PingPong source SRV: SourceIdx=slot 0
 };
 
 SamplerState sampLinear : register(s0);
@@ -64,6 +100,8 @@ float Blend(float prev, float value, uint mode, float opacity)
         case 1: return prev + value;                   // Add
         case 2: return max(prev, value);               // Max
         case 3: return lerp(prev, value, opacity);     // Lerp
+        case 4: return min(prev, value);               // Min
+        case 5: return lerp(prev, BrushTargetHeight, opacity); // Flatten toward target
         default: return value;
     }
 }
@@ -189,13 +227,18 @@ void CS_PaintBrush(uint3 dtid : SV_DispatchThreadID)
 
     if (pointCount == 1)
     {
-        minDist = length(uv - StrokePoints[0]);
+        float2 sp = StrokePoints[0];
+        if (FlipV) sp.y = 1.0 - sp.y;
+        minDist = length(uv - sp);
     }
     else
     {
         for (uint i = 0; i < pointCount - 1; i++)
         {
-            float d = DistToSegment(uv, StrokePoints[i], StrokePoints[i + 1]);
+            float2 a = StrokePoints[i];
+            float2 b = StrokePoints[i + 1];
+            if (FlipV) { a.y = 1.0 - a.y; b.y = 1.0 - b.y; }
+            float d = DistToSegment(uv, a, b);
             minDist = min(minDist, d);
         }
     }
@@ -215,11 +258,17 @@ void CS_PaintBrush(uint3 dtid : SV_DispatchThreadID)
     switch (BlendMode)
     {
         case 0: // Raise
-            DeltaMap[dtid.xy] = currentDelta + weight;
+            if (FlipV) // Splatmap: stamp max — falloff defines gradient, strength = peak
+                DeltaMap[dtid.xy] = max(currentDelta, weight);
+            else
+                DeltaMap[dtid.xy] = currentDelta + weight;
             break;
 
         case 1: // Lower
-            DeltaMap[dtid.xy] = currentDelta - weight;
+            if (FlipV) // Splatmap/Density: subtractive erase, clamped to 0
+                DeltaMap[dtid.xy] = max(0.0, currentDelta - weight);
+            else
+                DeltaMap[dtid.xy] = currentDelta - weight;
             break;
 
         case 2: // Flatten
@@ -288,14 +337,14 @@ void CS_ImportChannel(uint3 dtid : SV_DispatchThreadID)
 
 // ── CS_PackChannels: Pack up to 4 R16 sources into one RGBA pixel ──
 // StampBufIdx → StructuredBuffer<uint> with up to 4 source SRV bindless indices
-// OutputIdx → UAV: RWTexture2D<float4>
+// OutputIdx → UAV: RWTexture2DArray<float4> (single-slice view)
 // BlendMode → number of valid channels (1-4)
 [numthreads(8, 8, 1)]
 void CS_PackChannels(uint3 dtid : SV_DispatchThreadID)
 {
-    RWTexture2D<float4> Output = ResourceDescriptorHeap[OutputIdx];
-    uint w, h;
-    Output.GetDimensions(w, h);
+    RWTexture2DArray<float4> Output = ResourceDescriptorHeap[OutputIdx];
+    uint w, h, slices;
+    Output.GetDimensions(w, h, slices);
     if (dtid.x >= w || dtid.y >= h) return;
 
     StructuredBuffer<uint> SourceIndices = ResourceDescriptorHeap[StampBufIdx];
@@ -313,7 +362,7 @@ void CS_PackChannels(uint3 dtid : SV_DispatchThreadID)
         }
     }
 
-    Output[dtid.xy] = packed;
+    Output[uint3(dtid.xy, 0)] = packed;
 }
 
 // ── CS_BrushRaycast: GPU ray march against baked heightmap ──
@@ -418,4 +467,292 @@ void CS_BrushRaycast(uint3 dtid : SV_DispatchThreadID)
 
         if (t >= tExit) break;
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CS_NoiseLayer — Texture-based fBm noise height generation
+// Uses a pre-baked tileable noise LUT instead of GPU math noise to avoid
+// precision artifacts (staircase/banding) on various GPU architectures.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// NoiseLUTIdx reuses ErosionMode slot (30) — noise and erosion kernels never run concurrently
+#define NoiseLUTIdx ErosionMode
+
+// Sample the tileable noise LUT (R16G16_Float) at a given position.
+// R and G hold two independent noise fields for per-octave decorrelation.
+float sampleNoiseLUT(Texture2D<float2> lut, float2 p, uint octave)
+{
+    float2 s = lut.SampleLevel(sampLinear, p, 0);
+    return (octave & 1) ? s.g : s.r;
+}
+
+// ── fBm accumulation with type-specific strategies ──
+// Each noise type has a distinct accumulation to produce visually different terrain:
+//   Simplex/Perlin: Standard fBm — smooth rolling hills
+//   Ridged: Musgrave's ridged multifractal — sharp mountain ridges
+//   Billow: Abs-folded fBm — puffy dome-like terrain
+float fbmNoise(Texture2D<float2> lut, float2 p, uint type, uint octaves,
+               float lacunarity, float persistence, float seed)
+{
+    // Seed-based initial rotation to make different seeds produce different patterns
+    float seedAngle = seed * 1.9635;
+    float cs = cos(seedAngle), sn = sin(seedAngle);
+    float2x2 seedRot = float2x2(cs, -sn, sn, cs);
+    p = mul(seedRot, p);
+
+    // Per-octave UV transform helper
+    #define OCTAVE_UV(i, freq) \
+        float angle##i = 0.5 + (i) * 1.37; \
+        float c##i = cos(angle##i), s##i = sin(angle##i); \
+        float2 rp = float2(c##i * p.x - s##i * p.y, s##i * p.x + c##i * p.y) * (freq); \
+        rp += float2((i) * 7.31, (i) * 11.17)
+
+    float value = 0.0;
+    float amp = 1.0;
+    float freq = 1.0;
+    float maxAmp = 0.0;
+
+    if (type <= 1) // Simplex / Perlin — standard fBm
+    {
+        for (uint i = 0; i < octaves && i < 12; i++)
+        {
+            OCTAVE_UV(i, freq);
+            value += amp * sampleNoiseLUT(lut, rp, i);
+            maxAmp += amp;
+            amp *= persistence;
+            freq *= lacunarity;
+        }
+        return value / maxAmp;
+    }
+    else if (type == 2) // Ridged multifractal
+    {
+        float weight = 1.0;
+        const float offset = 1.0; // ridge offset
+        const float gain = 2.0;   // sharpness
+
+        for (uint i = 0; i < octaves && i < 12; i++)
+        {
+            OCTAVE_UV(i, freq);
+            float n = sampleNoiseLUT(lut, rp, i);
+            // Fold: create sharp ridges where noise crosses 0.5
+            float signal = offset - abs(n * 2.0 - 1.0);
+            signal *= signal; // sharpen ridges
+            signal *= weight; // detail concentrates in valleys
+            value += signal * amp;
+            maxAmp += amp;
+            // Next octave weight depends on current signal
+            weight = saturate(signal * gain);
+            amp *= persistence;
+            freq *= lacunarity;
+        }
+        return value / maxAmp;
+    }
+    else // Billow (type == 3) — abs-folded gives dome shapes
+    {
+        for (uint i = 0; i < octaves && i < 12; i++)
+        {
+            OCTAVE_UV(i, freq);
+            float n = sampleNoiseLUT(lut, rp, i);
+            // Abs fold: creates rounded dome/pillow shapes
+            float signal = abs(n * 2.0 - 1.0);
+            value += amp * signal;
+            maxAmp += amp;
+            amp *= persistence;
+            freq *= lacunarity;
+        }
+        return value / maxAmp;
+    }
+
+    #undef OCTAVE_UV
+}
+
+[numthreads(8, 8, 1)]
+void CS_NoiseLayer(uint3 dtid : SV_DispatchThreadID)
+{
+    RWTexture2D<float> Output = ResourceDescriptorHeap[OutputIdx];
+    uint w, h;
+    Output.GetDimensions(w, h);
+    if (dtid.x >= w || dtid.y >= h) return;
+
+    Texture2D<float2> NoiseLUT = ResourceDescriptorHeap[NoiseLUTIdx];
+
+    float2 uv = (float2(dtid.xy) + 0.5) / float2(w, h);
+    float2 p = (uv + float2(OffsetX, OffsetY)) * Frequency;
+
+    float noise = fbmNoise(NoiseLUT, p, NoiseType, Octaves, Lacunarity, Persistence, (float)NoiseSeed);
+
+    // ── Terracing post-process ──
+    if (TerraceSteps > 0)
+    {
+        float steps = (float)TerraceSteps;
+        float quantized = floor(noise * steps) / steps;
+        float frac_part = frac(noise * steps);
+        // Smooth-step between shelves for natural-looking ledges
+        float smooth_frac = smoothstep(0.0, 1.0, frac_part) / steps;
+        noise = lerp(quantized, quantized + smooth_frac, TerraceSmoothness);
+    }
+
+    float value = noise * Amplitude;
+
+    // ── Spatial mask (radial falloff) ──
+    if (MaskRadius > 0.0)
+    {
+        float2 delta = uv - float2(MaskCenterX, MaskCenterY);
+        float dist = length(delta);
+        float mask = 1.0 - saturate(pow(dist / MaskRadius, MaskFalloff));
+        value *= mask;
+    }
+
+    float prev = Output[dtid.xy];
+    Output[dtid.xy] = Blend(prev, value, BlendMode, Opacity);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CS_ErosionInit / CS_ErosionStep — Grid-based hydraulic + thermal erosion
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Slot reuse (erosion kernels):
+//   SourceIdx    (0)  → SRV: current baked heightmap
+//   OutputIdx    (1)  → UAV: erosion working height
+//   StampBufIdx  (2)  → UAV: water map (R32_Float)
+//   StampCount   (5)  → UAV: sediment map (R32_Float)
+//   Frequency    (23) → RainRate
+//   Amplitude    (24) → SedimentCapacity
+//   Lacunarity   (25) → DepositionRate
+//   Persistence  (26) → DissolutionRate
+//   OffsetX      (27) → Evaporation
+//   OffsetY      (28) → TalusAngle
+//   BrushRadius  (6)  → ThermalRate
+//   ErosionMode  (30) → 0=Hydraulic, 1=Thermal, 2=Both
+//   NoiseSeed    (29) → Seed for rain variation
+
+// Aliases for erosion readability
+#define RainRate     Frequency
+#define SedimentCap  Amplitude
+#define DepositRate  Lacunarity
+#define DissolveRate Persistence
+#define Evaporation  OffsetX
+#define TalusAngleDeg OffsetY
+#define ThermalRate  BrushRadius
+#define WaterIdx     StampBufIdx
+#define SedimentIdx  StampCount
+
+// ── CS_ErosionInit: Copy input heightmap to working buffer, clear aux maps ──
+[numthreads(8, 8, 1)]
+void CS_ErosionInit(uint3 dtid : SV_DispatchThreadID)
+{
+    RWTexture2D<float> Height   = ResourceDescriptorHeap[OutputIdx];
+    RWTexture2D<float> Water    = ResourceDescriptorHeap[WaterIdx];
+    RWTexture2D<float> Sediment = ResourceDescriptorHeap[SedimentIdx];
+
+    uint w, h;
+    Height.GetDimensions(w, h);
+    if (dtid.x >= w || dtid.y >= h) return;
+
+    // Copy current accumulated height into erosion working buffer
+    Texture2D<float> Source = ResourceDescriptorHeap[SourceIdx];
+    float2 uv = (float2(dtid.xy) + 0.5) / float2(w, h);
+    Height[dtid.xy] = Source.SampleLevel(sampLinear, uv, 0);
+
+    Water[dtid.xy] = 0;
+    Sediment[dtid.xy] = 0;
+}
+
+// ── CS_ErosionStep: One iteration of hydraulic + thermal erosion ──
+[numthreads(8, 8, 1)]
+void CS_ErosionStep(uint3 dtid : SV_DispatchThreadID)
+{
+    RWTexture2D<float> Height   = ResourceDescriptorHeap[OutputIdx];
+    RWTexture2D<float> Water    = ResourceDescriptorHeap[WaterIdx];
+    RWTexture2D<float> Sediment = ResourceDescriptorHeap[SedimentIdx];
+
+    uint w, h;
+    Height.GetDimensions(w, h);
+    if (dtid.x >= w || dtid.y >= h) return;
+
+    int2 coord = int2(dtid.xy);
+    float myH = Height[coord];
+    float myW = Water[coord];
+    float myS = Sediment[coord];
+
+    // ── Hydraulic erosion (mode 0 or 2) ──
+    if (ErosionMode == 0 || ErosionMode == 2)
+    {
+        // Rain with spatial variation
+        float2 hashP = float2(coord) * 0.1 + float2((float)NoiseSeed * 0.37, (float)NoiseSeed * 0.71);
+        float rainVar = frac(sin(dot(hashP, float2(127.1, 311.7))) * 43758.5453);
+        myW += RainRate * (0.5 + rainVar);
+
+        // 4-neighbor heights
+        float hL = (coord.x > 0)         ? Height[coord + int2(-1,  0)] : myH;
+        float hR = (coord.x < (int)w - 1) ? Height[coord + int2( 1,  0)] : myH;
+        float hD = (coord.y > 0)         ? Height[coord + int2( 0, -1)] : myH;
+        float hU = (coord.y < (int)h - 1) ? Height[coord + int2( 0,  1)] : myH;
+
+        // Height difference with average neighbor
+        float avgNeighborH = (hL + hR + hD + hU) * 0.25;
+        float deltaH = (myH + myW) - avgNeighborH;
+
+        if (deltaH > 0)
+        {
+            // Flowing out: dissolve terrain
+            float erosion = min(deltaH, DissolveRate) * myW;
+            myH -= erosion;
+            myS += erosion;
+
+            // Outflow reduces local water
+            float outflow = min(myW, deltaH * 0.25);
+            myW -= outflow;
+        }
+        else
+        {
+            // Valley: deposit sediment
+            float deposit = min(myS, DepositRate * -deltaH);
+            myH += deposit;
+            myS -= deposit;
+        }
+
+        // Sediment capacity check
+        float capacity = SedimentCap * myW * max(0.01, abs(deltaH));
+        if (myS > capacity)
+        {
+            float excess = (myS - capacity) * DepositRate;
+            myH += excess;
+            myS -= excess;
+        }
+
+        // Evaporate
+        myW *= (1.0 - Evaporation);
+    }
+
+    // ── Thermal erosion (mode 1 or 2) ──
+    if (ErosionMode == 1 || ErosionMode == 2)
+    {
+        // Talus threshold: tan(angle) / resolution
+        float talusRad = TalusAngleDeg * 3.14159265 / 180.0;
+        float talusThreshold = tan(talusRad) / (float)w;
+
+        float hL = (coord.x > 0)         ? Height[coord + int2(-1,  0)] : myH;
+        float hR = (coord.x < (int)w - 1) ? Height[coord + int2( 1,  0)] : myH;
+        float hD = (coord.y > 0)         ? Height[coord + int2( 0, -1)] : myH;
+        float hU = (coord.y < (int)h - 1) ? Height[coord + int2( 0,  1)] : myH;
+
+        float dL = myH - hL - talusThreshold;
+        float dR = myH - hR - talusThreshold;
+        float dD = myH - hD - talusThreshold;
+        float dU = myH - hU - talusThreshold;
+
+        float totalExcess = max(0, dL) + max(0, dR) + max(0, dD) + max(0, dU);
+
+        if (totalExcess > 0)
+        {
+            float transfer = totalExcess * ThermalRate * 0.25;
+            myH -= transfer;
+        }
+    }
+
+    // Write back
+    Height[coord] = myH;
+    Water[coord] = max(0, myW);
+    Sediment[coord] = max(0, myS);
 }

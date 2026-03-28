@@ -6,6 +6,10 @@ namespace Freefall.Reflection
 {
     public class GUIProperty
     {
+        public GUIObject Parent { protected set; get; }
+
+        public event Action OnValueChanged;
+
         protected readonly object[] targets;
         protected readonly Field _field;
         protected int hashcode = 0;
@@ -32,7 +36,11 @@ namespace Freefall.Reflection
 
         public virtual int Index { get; }
 
-        public event Action OnValueChanged;
+        void ValueChanged()
+        {
+            OnValueChanged?.Invoke();
+            Parent?.ValueChanged(this);
+        }
 
         public bool HasMixedValue
         {
@@ -71,6 +79,13 @@ namespace Freefall.Reflection
             this.targets = targets;
         }
 
+        public GUIProperty(GUIObject parent, Field field, params object[] targets)
+        {
+            this.Parent = parent;
+            this._field = field;
+            this.targets = targets;
+        }
+
         public virtual int GetCode()
         {
             if (hashcode == 0)
@@ -94,7 +109,7 @@ namespace Freefall.Reflection
             for (int i = 0; i < targets.Length; i++)
                 _field.SetValue(targets[i], value);
 
-            OnValueChanged?.Invoke();
+            ValueChanged();
         }
 
         public K GetAttribute<K>() where K : Attribute
@@ -104,7 +119,7 @@ namespace Freefall.Reflection
 
         public GUIPropertyElement GetArrayElementAtIndex(int index)
         {
-            return new GUIPropertyElement(_field, index, targets) { Depth = Depth + 1 };
+            return new GUIPropertyElement(Parent, _field, index, targets) { Depth = Depth + 1 };
         }
 
         public void RemoveElementAtIndex(int index)
@@ -121,6 +136,12 @@ namespace Freefall.Reflection
             var elementType = _field.Type.GetGenericArguments()[0];
             var list = GetValue() as IList;
 
+            if (list == null)
+            {
+                list = (IList)Activator.CreateInstance(_field.Type);
+                SetValue(list);
+            }
+
             if (typeof(Assets.Asset).IsAssignableFrom(elementType))
                 list.Add(null);
             else
@@ -129,7 +150,7 @@ namespace Freefall.Reflection
                 list.Add(obj);
             }
 
-            return new GUIPropertyElement(_field, list.Count - 1, targets) { Depth = Depth + 1 };
+            return new GUIPropertyElement(Parent, _field, list.Count - 1, targets) { Depth = Depth + 1 };
         }
 
         /// <summary>
@@ -143,7 +164,7 @@ namespace Freefall.Reflection
             var obj = Activator.CreateInstance(concreteType);
             list.Add(obj);
 
-            return new GUIPropertyElement(_field, list.Count - 1, targets) { Depth = Depth + 1 };
+            return new GUIPropertyElement(Parent, _field, list.Count - 1, targets) { Depth = Depth + 1 };
         }
 
         public int GetArrayLength()
@@ -178,11 +199,13 @@ namespace Freefall.Reflection
 
         public override int Index => elementIndex;
              
-        public GUIPropertyElement(Field field, int index, params object[] targets) : base(field, targets)
+        public GUIPropertyElement(GUIObject parent, Field field, int index, params object[] targets) : base(parent, field, targets)
         {
             elementIndex = index;
             elementType = _field.Type.GetGenericArguments()[0];
         }
+
+        public GUIPropertyElement(Field field, int index, params object[] targets) : this(null, field, index, targets) { }
 
         public override int GetCode()
         {
@@ -225,13 +248,15 @@ namespace Freefall.Reflection
         
         private List<string> fieldNames = new List<string>();
 
+        public GUIObject Parent { private set; get; }
+        public event Action<GUIProperty> OnValueChanged;
+
         public string Name { get; private set; }
         public Type Type { get; private set; }
         public object Target => targets[0];
 
         public int Depth;
         public int Index;
-
 
         public bool Expanded
         {
@@ -254,10 +279,16 @@ namespace Freefall.Reflection
 
             return hashcode;
         }
-        public GUIObject(params object[] objects) : this(false, objects) {  }
 
-        public GUIObject(bool includeReadOnly, params object[] objects)
+        public GUIObject(params object[] objects) : this(null, false, objects) {  }
+
+        public GUIObject(bool includeReadOnly, params object[] objects) : this(null, includeReadOnly, objects) { }  
+
+        public GUIObject(GUIObject parent, params object[] objects) : this(parent, false, objects) { }
+
+        public GUIObject(GUIObject parent, bool includeReadOnly, params object[] objects)
         {
+            Parent = parent;
             targets = objects;
 
             HashSet<string> hash = new HashSet<string>();
@@ -293,12 +324,18 @@ namespace Freefall.Reflection
 
                 if (!field.Browsable)
                 {
-                    hiddenFields.Add(name, new GUIProperty(field, targets));
+                    hiddenFields.Add(name, new GUIProperty(this, field, targets));
                     continue;
                 }
 
-                properties.Add(name, new GUIProperty(field, targets));
+                properties.Add(name, new GUIProperty(this, field, targets));
             }
+        }
+
+        internal void ValueChanged(GUIProperty property)
+        {
+            OnValueChanged?.Invoke(property);
+            Parent?.ValueChanged(property);
         }
 
         private void Reflect(Type type)

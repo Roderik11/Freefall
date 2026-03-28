@@ -14,6 +14,7 @@ using Vortice.Mathematics;
 
 namespace Freefall.Loaders
 {
+    [Obsolete("Use Freefall.Serialization.EntitySerializer instead")]
     public class SceneLoader
     {
         public Dictionary<string, StaticMesh> staticMeshLookup = new Dictionary<string, StaticMesh>();

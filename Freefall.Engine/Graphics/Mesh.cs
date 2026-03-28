@@ -54,12 +54,45 @@ namespace Freefall.Graphics
         public List<MeshLOD> LODs { get; set; } = new List<MeshLOD>();
 
         /// <summary>
+        /// Indices of MeshParts not belonging to any LOD level.
+        /// Drawn alongside the active LOD. Null if empty or no LODs.
+        /// </summary>
+        public int[]? NonLodPartIndices { get; set; }
+
+        /// <summary>
         /// Per-mesh LOD distance bias. Default 1.0.
         /// Higher values keep high-detail LODs visible longer.
         /// Multiplied with global Engine.Settings.LODScale.
         /// </summary>
         [ValueRange(0.1f, 10.0f)]
         public float LODBias { get; set; } = 1.0f;
+
+        /// <summary>
+        /// Compute NonLodPartIndices from LODs and MeshParts.
+        /// Call after both LODs and MeshParts are populated.
+        /// </summary>
+        public void ComputeNonLodPartIndices()
+        {
+            if (LODs.Count == 0 || MeshParts.Count == 0)
+            {
+                NonLodPartIndices = null;
+                return;
+            }
+
+            var inLod = new bool[MeshParts.Count];
+            foreach (var lod in LODs)
+                if (lod.MeshPartIndices != null)
+                    foreach (var idx in lod.MeshPartIndices)
+                        if (idx < inLod.Length)
+                            inLod[idx] = true;
+
+            var nonLod = new List<int>();
+            for (int i = 0; i < inLod.Length; i++)
+                if (!inLod[i] && MeshParts[i].Enabled)
+                    nonLod.Add(i);
+
+            NonLodPartIndices = nonLod.Count > 0 ? nonLod.ToArray() : null;
+        }
         
         // Buffers
         private ID3D12Resource _posBuffer = null!;
@@ -155,6 +188,7 @@ namespace Freefall.Graphics
             BoundingBox = data.BoundingBox;
             if (data.LODs != null && data.LODs.Count > 0)
                 LODs.AddRange(data.LODs);
+            ComputeNonLodPartIndices();
             
             if (data.Bones != null)
                 Bones = data.Bones;
@@ -177,6 +211,7 @@ namespace Freefall.Graphics
             mesh.BoneWeights = data.BoneWeights;
             if (data.LODs != null && data.LODs.Count > 0)
                 mesh.LODs.AddRange(data.LODs);
+            mesh.ComputeNonLodPartIndices();
             
             // For meshes, because they are structured buffers, we still create the Committed Resource on Main Thread
             // But we skip the *Upload* part here?

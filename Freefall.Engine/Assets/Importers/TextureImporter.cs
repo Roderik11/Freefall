@@ -31,7 +31,7 @@ namespace Freefall.Assets.Importers
     ///   GenerateMips – generate full mipmap chain
     ///   sRGB         – treat source as sRGB color data
     /// </summary>
-    [AssetImporter(".png", ".jpg", ".jpeg", ".tga", ".bmp", ".dds")]
+    [AssetImporter(".png", ".jpg", ".jpeg", ".tga", ".bmp", ".dds", ".psd")]
     public class TextureImporter : IImporter
     {
         public Type AssetType => typeof(Graphics.Texture);
@@ -81,18 +81,43 @@ namespace Freefall.Assets.Importers
             }
             else
             {
-                // Auto-detect: data maps (normals, roughness, etc.) should be linear, not sRGB
-                bool isLinearData = LinearSuffixes.Any(s =>
-                    name.EndsWith(s, StringComparison.OrdinalIgnoreCase));
-                sRGB = !isLinearData;
+                // PSD: decode to temp BMP first (texconv destroys alpha on PSDs)
+                string inputPath = filepath;
+                string tempBmp = null;
 
-                // Normal maps → BC5_UNORM (two high-quality RG channels, Z reconstructed in shader)
-                bool isNormalMap = NormalSuffixes.Any(s =>
-                    name.EndsWith(s, StringComparison.OrdinalIgnoreCase));
-                if (isNormalMap)
-                    Format = TextureFormat.BC5_UNORM;
+                if (ext == ".psd")
+                {
+                    tempBmp = PsdReader.ConvertToTempBmp(filepath);
+                    if (tempBmp == null)
+                        throw new Exception($"Failed to decode PSD: {Path.GetFileName(filepath)}");
+                    // Check alpha on the ORIGINAL PSD, not the temp BMP
+                    // (HasAlphaChannel returns false for .bmp files)
+                    if (PsdReader.HasAlpha(filepath))
+                        Format = TextureFormat.BC7_UNORM;
+                    inputPath = tempBmp;
+                }
 
-                ddsBytes = ConvertToDds(filepath);
+                try
+                {
+                    // Auto-detect: data maps (normals, roughness, etc.) should be linear, not sRGB
+                    bool isLinearData = LinearSuffixes.Any(s =>
+                        name.EndsWith(s, StringComparison.OrdinalIgnoreCase));
+                    sRGB = !isLinearData;
+
+                    // Normal maps → BC5_UNORM (two high-quality RG channels, Z reconstructed in shader)
+                    bool isNormalMap = NormalSuffixes.Any(s =>
+                        name.EndsWith(s, StringComparison.OrdinalIgnoreCase));
+                    if (isNormalMap)
+                        Format = TextureFormat.BC5_UNORM;
+
+                    ddsBytes = ConvertToDds(inputPath);
+                }
+                finally
+                {
+                    // Cleanup temp BMP
+                    if (tempBmp != null)
+                        try { File.Delete(tempBmp); } catch { }
+                }
             }
 
             result.Artifacts.Add(new ImportArtifact
@@ -204,6 +229,10 @@ namespace Freefall.Assets.Importers
             // Formats that never have alpha
             if (ext == ".jpg" || ext == ".jpeg" || ext == ".bmp")
                 return false;
+
+            // PSD: quick header check (reads channel count)
+            if (ext == ".psd")
+                return PsdReader.HasAlpha(path);
 
             // PNG: read IHDR chunk to check color type
             if (ext == ".png")

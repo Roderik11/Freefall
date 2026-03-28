@@ -28,6 +28,7 @@ namespace Freefall.Components
 
         [Browsable(false)]
         public Material? Material = InternalAssets.TerrainMaterial;
+
         [Browsable(false)]
         public Material? DecoratorMaterial = InternalAssets.DecoratorMaterial;
 
@@ -127,7 +128,6 @@ namespace Freefall.Components
 
         // Texture arrays
         private Texture? ControlMapsArray;
-        private Texture? DecoMapsArray;
         private Texture? DiffuseMapsArray;
         private Texture? NormalMapsArray;
 
@@ -139,8 +139,7 @@ namespace Freefall.Components
         private GraphicsBuffer? _decoratorLODTableBuffer;
         private bool _decoratorBuffersBuilt;
         private bool _decoratorDispatched;
-        private int _decoratorStructVersion = -1;
-        private int _decoratorValueVersion = -1;
+
         private int _decoratorDispatchGroupsX;
         private int _decoratorDispatchGroupsY;
 
@@ -181,7 +180,6 @@ namespace Freefall.Components
         private ID3D12Resource? _decoControlTex;     // RGBA16_UINT, 2 slices
         private uint _decoControlUAV;
         private uint _decoControlSRV;
-        private bool _decoControlDirty = true;
 
         // ───── Baked Terrain Albedo ───────────────────────────────────────
         private ComputeShader? _albedoBakeCS;
@@ -189,29 +187,31 @@ namespace Freefall.Components
         private uint _bakedAlbedoUAV;
         private uint _bakedAlbedoSRV;
         private GraphicsBuffer? _tilingBuffer;       // StructuredBuffer<float4>, 32 entries
-        private bool _bakedAlbedoDirty = true;
         private const int BakedAlbedoSize = 256;
 
+        // ───── Procedural Auto-Mask Buffer ────────────────────────────────
+        // Must match LayerAutoMask in gputerrain.fx (32 bytes per entry)
+        [StructLayout(LayoutKind.Sequential)]
+        private struct LayerAutoMaskGPU
+        {
+            public float HeightMin, HeightMax;       // normalized 0..1
+            public float SlopeMin, SlopeMax;         // degrees
+            public float HeightBlend, SlopeBlend;    // blend widths
+            public float ProceduralWeight;           // 0 = paint only
+            public float _pad;
+        }
+        private GraphicsBuffer? _layerAutoMaskBuffer; // StructuredBuffer<LayerAutoMaskGPU>, 32 entries
+
         // ───── Height Bake (GPU layer compositor) ─────────────────────────
-        private bool _heightBakeDirty = true;
-        private bool _splatPackDirty = true;
         private bool _needHeightFieldReadback;
 
-        /// <summary>Marks the baked heightmap as dirty, triggering a rebake next frame.</summary>
-        public void MarkHeightDirty() => _heightBakeDirty = true;
-        public void MarkSplatDirty() => _splatPackDirty = true;
-
-        /// <summary>Forces full rebuild of all texture arrays + height bake + splat pack next frame.</summary>
-        public void MarkLayersDirty()
-        {
-            _heightBakeDirty = true;
-            _splatPackDirty = true;
-            _bakedAlbedoDirty = true;
-            _textureArraysDirty = true;
-        }
-
-        private bool _textureArraysDirty;
-        private List<Texture> _pendingPackedSlices;
+        // ───── Cached Packed Splatmap Array ────────────────────────────────
+        private ID3D12Resource _packedControlArray;
+        private Texture _packedControlTexture;     // stable wrapper for ControlMapsArray
+        private uint _packedControlSRV;
+        private uint[] _packedSliceUAVs;            // per-slice UAVs for direct packing
+        private int _packedArrayResolution;
+        private int _packedSliceCount;
 
         /// <summary>
         /// Enqueues a brush stroke to be dispatched on the render thread.
@@ -272,17 +272,16 @@ namespace Freefall.Components
 
             CommandBuffer.Enqueue(RenderPass.Opaque, (list) =>
             {
-                Debug.Log($"[TerrainRenderer] Brush lambda executing: target={tgt} layer={idx} mode={mode} pts={count}");
                 baker.PaintBrush(terrain, tgt, idx, setter, list,
                                  pts, count, mode, strength,
                                  radius, falloff, targetHeight);
                 if (isHeightTarget)
                 {
-                    _heightBakeDirty = true;
+                    terrain.MarkForUpdate(TerrainDirtyFlags.HeightBake | TerrainDirtyFlags.AlbedoBake);
                     _heightRangePyramidBuilt = false;
                 }
                 if (tgt == TerrainBaker.ControlMapTarget.Splatmap)
-                    _splatPackDirty = true;
+                    terrain.MarkForUpdate(TerrainDirtyFlags.SplatPack | TerrainDirtyFlags.AlbedoBake);
             });
         }
 
@@ -342,7 +341,6 @@ namespace Freefall.Components
             var setter = setControlMap;
             var tgt = target;
             int idx = layerIndex;
-            bool isHeightTarget = target == TerrainBaker.ControlMapTarget.Height;
 
             CommandBuffer.Enqueue(RenderPass.Opaque, (list) =>
             {
@@ -350,13 +348,19 @@ namespace Freefall.Components
                     rayOrigin, rayDir, origin, size, maxH,
                     mode, strength, radius, falloff, targetHeight);
 
-                if (isHeightTarget)
+                switch(tgt)
                 {
-                    _heightBakeDirty = true;
-                    _heightRangePyramidBuilt = false;
+                    case TerrainBaker.ControlMapTarget.Height:
+                        terrain.MarkForUpdate(TerrainDirtyFlags.HeightBake | TerrainDirtyFlags.AlbedoBake);
+                        _heightRangePyramidBuilt = false;
+                        break;
+                    case TerrainBaker.ControlMapTarget.Splatmap:
+                    terrain.MarkForUpdate(TerrainDirtyFlags.SplatPack | TerrainDirtyFlags.AlbedoBake);
+                        break;
+                    case TerrainBaker.ControlMapTarget.Density:
+                    terrain.MarkForUpdate(TerrainDirtyFlags.DecoPrepass | TerrainDirtyFlags.DecoParams);
+                        break;
                 }
-                if (tgt == TerrainBaker.ControlMapTarget.Splatmap)
-                    _splatPackDirty = true;
             });
         }
 
@@ -417,11 +421,11 @@ namespace Freefall.Components
                 baker.ImportChannel(terrain, tgt, idx, setter, list, src, ch);
                 if (isHeightTarget)
                 {
-                    _heightBakeDirty = true;
+                    terrain.MarkForUpdate(TerrainDirtyFlags.HeightBake | TerrainDirtyFlags.AlbedoBake);
                     _heightRangePyramidBuilt = false;
                 }
                 if (tgt == TerrainBaker.ControlMapTarget.Splatmap)
-                    _splatPackDirty = true;
+                    terrain.MarkForUpdate(TerrainDirtyFlags.SplatPack | TerrainDirtyFlags.AlbedoBake);
             });
         }
 
@@ -446,35 +450,28 @@ namespace Freefall.Components
             ComputeReady = _computeInitialized;
         }
 
-        private bool _texturesInitialized;
-
-        private void LazyInitTextures()
-        {
-            if (_textureArraysDirty || !_texturesInitialized)
-            {
-                if (Terrain?.Layers == null || Terrain.Layers.Count == 0)
-                {
-                    if (!_texturesInitialized) return; // no layers yet on first init — skip
-                    // Layers removed — clear to fallbacks
-                }
-                try
-                {
-                    SetupLayerTiling();
-                    _texturesInitialized = true;
-                }
-                catch (Exception ex)
-                {
-                    Debug.LogError("[TerrainRenderer]", $"SetupLayerTiling failed: {ex.Message}");
-                }
-                _textureArraysDirty = false; // always clear — MarkLayersDirty() re-sets if needed
-            }
-        }
+        private bool _textureArraysInitialized;
 
         public void Draw()
         {
             if (Camera.Main == null || Terrain == null || !_computeInitialized) return;
 
-            LazyInitTextures();
+            // ── Consume dirty flags from Terrain ──
+            if (Terrain.ConsumeFlags(TerrainDirtyFlags.TextureArrays) || !_textureArraysInitialized)
+            {
+                try
+                {
+                    RebuildTextureArrays();
+                    _textureArraysInitialized = true;
+                }
+                catch (Exception ex)
+                {
+                    Debug.LogError("[TerrainRenderer]", $"RebuildTextureArrays failed: {ex.Message}");
+                }
+            }
+
+            if (Terrain.ConsumeFlags(TerrainDirtyFlags.LayerParams))
+                UpdateLayerParams();
 
             var material = Material;
             var heightmap = Terrain.Heightmap;
@@ -493,15 +490,15 @@ namespace Freefall.Components
                 if (tex != null)
                 {
                     Terrain.BakedHeightmap = tex;
-                    _heightBakeDirty = false;
+                    Terrain.ConsumeFlags(TerrainDirtyFlags.HeightBake); // loaded from cache, skip bake
                     _heightRangePyramidBuilt = false;
-                    _bakedAlbedoDirty = true;
+                    Terrain.MarkForUpdate(TerrainDirtyFlags.AlbedoBake);
                     _needHeightFieldReadback = true;
                 }
             }
 
             // GPU height layer bake (runs before any heightmap access)
-            if (_heightBakeDirty && Terrain.HeightLayers.Count > 0)
+            if (Terrain.ConsumeFlags(TerrainDirtyFlags.HeightBake) && Terrain.HeightLayers.Count > 0)
             {
                 var baker = TerrainBaker.Instance;
 
@@ -518,18 +515,20 @@ namespace Freefall.Components
                     }
                 }
 
+                var renderer = this;
                 CommandBuffer.Enqueue(RenderPass.Opaque, (list) =>
                 {
                     baker.Bake(Terrain, list);
-                    _heightBakeDirty = false;
                     _heightRangePyramidBuilt = false; // force rebuild with new heights
-                    _bakedAlbedoDirty = true; // re-bake albedo with new terrain shape
+                    Terrain.MarkForUpdate(TerrainDirtyFlags.AlbedoBake); // re-bake albedo with new terrain shape
                     _needHeightFieldReadback = true; // trigger CPU-side heightfield rebuild next frame
+                    renderer._bakedNormalsDirty = true; // normals depend on height
+                    renderer.BakeTerrainNormals(list);
                 });
             }
 
             // Debounced CPU heightfield readback — only when baking has settled (not during active painting)
-            if (_needHeightFieldReadback && !_heightBakeDirty)
+            if (_needHeightFieldReadback && !Terrain.NeedsUpdate(TerrainDirtyFlags.HeightBake))
             {
                 _needHeightFieldReadback = false;
                 var heights = TerrainBaker.Instance.ReadbackHeightmap();
@@ -552,7 +551,7 @@ namespace Freefall.Components
                             layer.PendingControlMapBytes, Terrain.HeightmapResolution,
                             tex => l.ControlMap = tex);
                         layer.PendingControlMapBytes = null;
-                        _splatPackDirty = true;
+                        Terrain.MarkForUpdate(TerrainDirtyFlags.SplatPack);
                     }
                 }
             }
@@ -575,24 +574,16 @@ namespace Freefall.Components
                 }
             }
 
-            // GPU splatmap packing — deferred: process pending packed slices from last frame
-            if (_pendingPackedSlices != null)
+            // GPU splatmap packing — pack per-layer R16 ControlMaps directly into cached array
+            if (Terrain.ConsumeFlags(TerrainDirtyFlags.SplatPack) && Terrain?.Layers != null && Terrain.Layers.Count > 0)
             {
-                try
+                // Ensure texture arrays are built
+                if (!_textureArraysInitialized)
                 {
-                    ControlMapsArray = Texture.CreateTexture2DArray(Engine.Device, _pendingPackedSlices);
-                    _bakedAlbedoDirty = true;
+                    try { RebuildTextureArrays(); _textureArraysInitialized = true; }
+                    catch (Exception ex) { Debug.LogError("[TerrainRenderer]", $"RebuildTextureArrays failed: {ex.Message}"); }
                 }
-                catch (Exception ex)
-                {
-                    Debug.LogError("[TerrainRenderer]", $"ControlMapsArray creation failed: {ex.Message}");
-                }
-                _pendingPackedSlices = null;
-            }
 
-            // GPU splatmap packing — pack per-layer R16 ControlMaps into RGBA slices
-            if (_splatPackDirty && Terrain?.Layers != null && Terrain.Layers.Count > 0)
-            {
                 // Check if any layer has a ControlMap with a valid GPU resource
                 var srvIndices = new uint[Terrain.Layers.Count];
                 bool hasAny = false;
@@ -609,19 +600,32 @@ namespace Freefall.Components
                 if (hasAny)
                 {
                     int res = Terrain.HeightmapResolution;
+                    int layerCount = Terrain.Layers.Count;
+                    int sliceCount = (layerCount + 3) / 4;
+
+                    // Ensure packed array exists at correct resolution/slice count
+                    EnsurePackedControlArray(res, sliceCount);
+                    ControlMapsArray = _packedControlTexture;
+
                     var indices = srvIndices;
+                    var sliceUAVs = _packedSliceUAVs;
+                    var packedArray = _packedControlArray;
                     var renderer = this;
                     CommandBuffer.Enqueue(RenderPass.Opaque, (list) =>
                     {
-                        var packedSlices = TerrainBaker.Instance.PackControlMaps(list, indices, res);
-                        if (packedSlices.Count > 0)
-                            renderer._pendingPackedSlices = packedSlices;
-                        renderer._splatPackDirty = false;
+                        // Transition to UAV for packing
+                        list.ResourceBarrierTransition(packedArray,
+                            ResourceStates.Common, ResourceStates.UnorderedAccess);
+
+                        TerrainBaker.Instance.PackControlMaps(list, indices, sliceUAVs, res);
+
+                        // UAV barrier then back to common for shader reads
+                        list.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(packedArray)));
+                        list.ResourceBarrierTransition(packedArray,
+                            ResourceStates.UnorderedAccess, ResourceStates.Common);
+
+                        renderer.Terrain?.MarkForUpdate(TerrainDirtyFlags.AlbedoBake);
                     });
-                }
-                else
-                {
-                    _splatPackDirty = false;
                 }
             }
 
@@ -631,7 +635,6 @@ namespace Freefall.Components
             material.SetParameter("MaxHeight", Terrain.MaxHeight);
             material.SetParameter("TerrainSize", Terrain.TerrainSize);
             material.SetParameter("TerrainOrigin", new Vector2(Transform.WorldPosition.X, Transform.WorldPosition.Z));
-
             material.SetParameter("LayerTiling", _layerTiling);
 
             // Bind textures — texture arrays MUST be valid Texture2DArray resources.
@@ -643,6 +646,7 @@ namespace Freefall.Components
             if (ControlMapsArray != null) material.SetTexture("ControlMaps", ControlMapsArray);
             if (DiffuseMapsArray != null) material.SetTexture("DiffuseMaps", DiffuseMapsArray);
             if (NormalMapsArray != null) material.SetTexture("NormalMaps", NormalMapsArray);
+            if (_layerAutoMaskBuffer != null) material.SetTextureIndex("AutoMaskBuf", _layerAutoMaskBuffer.SrvIndex);
 
             // Capture values for lambda closure
             int fi = frameIndex;
@@ -657,39 +661,82 @@ namespace Freefall.Components
             // Enqueue single-pass terrain shadow draw
             CommandBuffer.Enqueue(RenderPass.Shadow, (list) => self.DrawTerrainShadow(list, fi));
 
-            // Enqueue ground coverage decorator if configured
+            // Decoration pipeline — CPU-side setup
             if (Terrain.DrawDetail && Terrain.Decorations.Count > 0 && DecoratorMaterial?.Effect != null)
             {
-                // Structural hash: only mesh names and count (triggers buffer rebuild)
-                int structHash = Terrain.Decorations.Count;
-                foreach (var d in Terrain.Decorations)
-                    structHash = HashCode.Combine(structHash, d.Mesh?.Name);
+                if (Terrain.ConsumeFlags(TerrainDirtyFlags.DecoStructure))
+                    RebuildDecoSlots();
+                else if (Terrain.ConsumeFlags(TerrainDirtyFlags.DecoParams))
+                    UpdateDecoSlots();
 
-                // Value hash: density, scale, rotation, etc. (triggers data update only)
-                int valueHash = HashCode.Combine(Terrain.DecorationRadius);
-                foreach (var d in Terrain.Decorations)
-                {
-                    valueHash = HashCode.Combine(valueHash, d.Density, d.HeightRange, d.WidthRange,
-                        d.RootRotation, d.SlopeBias);
-                }
-
-                if (structHash != _decoratorStructVersion)
-                {
-                    // Full rebuild: create buffers + upload data
-                    BuildDecoratorBuffers();
-                    _decoratorStructVersion = structHash;
-                    _decoratorValueVersion = valueHash;
-                }
-                else if (valueHash != _decoratorValueVersion)
-                {
-                    // Value-only change: just update data in existing buffers
-                    UpdateDecoratorBufferData();
-                    _decoratorValueVersion = valueHash;
-                }
+                EnsureDecoRenderBuffers();
 
                 CommandBuffer.Enqueue(RenderPass.Opaque, (list) => self.DispatchDecorator(list, fi, RenderPass.Opaque));
                 CommandBuffer.Enqueue(RenderPass.Shadow, (list) => self.DispatchDecorator(list, fi, RenderPass.Shadow));
             }
+        }
+
+        /// <summary>
+        /// Ensures the packed RGBA Texture2DArray exists at the right resolution/slice count.
+        /// Only recreates when the configuration changes (layer count or resolution).
+        /// </summary>
+        private void EnsurePackedControlArray(int resolution, int sliceCount)
+        {
+            if (_packedControlArray != null && _packedArrayResolution == resolution && _packedSliceCount == sliceCount)
+                return;
+
+            // Release old resources
+            _packedControlArray?.Release();
+
+            var device = Engine.Device;
+
+            // Create Texture2DArray: RGBA8, resolution × resolution, sliceCount array slices
+            var desc = ResourceDescription.Texture2D(
+                Format.R8G8B8A8_UNorm, (uint)resolution, (uint)resolution,
+                (ushort)sliceCount, 1, 1, 0, ResourceFlags.AllowUnorderedAccess);
+
+            _packedControlArray = device.NativeDevice.CreateCommittedResource(
+                new HeapProperties(HeapType.Default), HeapFlags.None, desc, ResourceStates.Common, null);
+
+            // Create SRV over full array
+            _packedControlSRV = device.AllocateBindlessIndex();
+            device.NativeDevice.CreateShaderResourceView(_packedControlArray,
+                new ShaderResourceViewDescription
+                {
+                    Format = Format.R8G8B8A8_UNorm,
+                    ViewDimension = ShaderResourceViewDimension.Texture2DArray,
+                    Shader4ComponentMapping = ShaderComponentMapping.Default,
+                    Texture2DArray = new Texture2DArrayShaderResourceView
+                    {
+                        MipLevels = 1,
+                        ArraySize = (uint)sliceCount,
+                        FirstArraySlice = 0
+                    }
+                }, device.GetCpuHandle(_packedControlSRV));
+
+            // Create per-slice UAVs for compute packing
+            _packedSliceUAVs = new uint[sliceCount];
+            for (int i = 0; i < sliceCount; i++)
+            {
+                _packedSliceUAVs[i] = device.AllocateBindlessIndex();
+                device.NativeDevice.CreateUnorderedAccessView(_packedControlArray, null,
+                    new UnorderedAccessViewDescription
+                    {
+                        Format = Format.R8G8B8A8_UNorm,
+                        ViewDimension = UnorderedAccessViewDimension.Texture2DArray,
+                        Texture2DArray = new Texture2DArrayUnorderedAccessView
+                        {
+                            MipSlice = 0,
+                            FirstArraySlice = (uint)i,
+                            ArraySize = 1
+                        }
+                    }, device.GetCpuHandle(_packedSliceUAVs[i]));
+            }
+
+            // Create stable Texture wrapper (never replaced unless array is recreated)
+            _packedControlTexture = Texture.WrapNative(_packedControlArray, _packedControlSRV);
+            _packedArrayResolution = resolution;
+            _packedSliceCount = sliceCount;
         }
 
         // ───── Compute Pipeline ───────────────────────────────────────────
@@ -1290,12 +1337,16 @@ namespace Freefall.Components
             return total;
         }
 
-        private void SetupLayerTiling()
+        /// <summary>
+        /// Lightweight: re-upload tiling and auto-mask buffers from layer properties.
+        /// No GPU allocations — just Map/memcpy/Unmap on existing upload buffers.
+        /// Called when LayerParams flag is consumed.
+        /// </summary>
+        private void UpdateLayerParams()
         {
             var terrainSize = Terrain?.TerrainSize ?? Vector2.One;
             var layers = Terrain?.Layers;
-            var diffuseList = new List<Texture>();
-            var normalList = new List<Texture>();
+            var autoMaskData = new LayerAutoMaskGPU[32];
 
             if (layers != null)
             {
@@ -1307,14 +1358,50 @@ namespace Freefall.Components
                     else
                         _layerTiling[i] = Vector4.One;
 
+                    autoMaskData[i] = new LayerAutoMaskGPU
+                    {
+                        HeightMin = layer.HeightRange.X,
+                        HeightMax = layer.HeightRange.Y,
+                        SlopeMin = layer.SlopeRange.X,
+                        SlopeMax = layer.SlopeRange.Y,
+                        HeightBlend = layer.HeightBlend,
+                        SlopeBlend = layer.SlopeBlend,
+                        ProceduralWeight = layer.ProceduralWeight,
+                    };
+                }
+            }
+
+            _layerAutoMaskBuffer ??= GraphicsBuffer.CreateUpload<LayerAutoMaskGPU>(32);
+            _layerAutoMaskBuffer.Upload<LayerAutoMaskGPU>(autoMaskData.AsSpan());
+        }
+
+        /// <summary>
+        /// Heavy: rebuild DiffuseMapsArray, NormalMapsArray, ControlMapsArray.
+        /// Only called when TextureArrays flag is consumed (layer add/remove/texture swap).
+        /// Also re-uploads tiling/automask since layer order may have changed.
+        /// </summary>
+        private void RebuildTextureArrays()
+        {
+            var layers = Terrain?.Layers;
+            var diffuseList = new List<Texture>();
+            var normalList = new List<Texture>();
+
+            if (layers != null)
+            {
+                for (int i = 0; i < layers.Count; i++)
+                {
+                    var layer = layers[i];
                     if (layer.Diffuse != null && layer.Diffuse.Native != null) diffuseList.Add(layer.Diffuse);
                     if (layer.Normals != null && layer.Normals.Native != null) normalList.Add(layer.Normals);
                 }
-                Debug.Log($"[Terrain] SetupLayerTiling: {diffuseList.Count} diffuse, {normalList.Count} normals from {layers.Count} layers");
+                Debug.Log($"[Terrain] RebuildTextureArrays: {diffuseList.Count} diffuse, {normalList.Count} normals from {layers.Count} layers");
             }
 
+            // Also refresh tiling/automask since layer order may have changed
+            UpdateLayerParams();
+
             var device = Engine.Device;
-            
+
             // Diffuse Fallback
             if (diffuseList.Count > 0)
                 DiffuseMapsArray = Texture.CreateTexture2DArray(device, diffuseList);
@@ -1331,9 +1418,6 @@ namespace Freefall.Components
             }
 
             // Build ControlMapsArray for GPU splatmap sampling
-            // The GPU expects ceil(layerCount/4) RGBA slices, each channel = one layer weight.
-            // Legacy path: old RGBA splatmaps are already packed correctly.
-            // New path: per-layer R16 ControlMaps are packed by CS_PackChannels in Draw().
             if (Terrain?._legacyControlMaps != null && Terrain._legacyControlMaps.Count > 0)
             {
                 var controlList = new List<Texture>();
@@ -1350,11 +1434,9 @@ namespace Freefall.Components
             else
             {
                 // Per-layer R16 ControlMaps — pack lazily in Draw()
-                _splatPackDirty = true;
+                Terrain.MarkForUpdate(TerrainDirtyFlags.SplatPack);
                 ControlMapsArray = InternalAssets.BlackArray;
             }
-
-            // DecoMapsArray is built by BuildDecoratorBuffers() from per-Decoration ControlMaps
         }
 
         // ───── IHeightProvider ────────────────────────────────────────────
@@ -1442,12 +1524,10 @@ namespace Freefall.Components
         }
 
         /// <summary>
-        /// Builds GPU-side structured buffers from Terrain.Decorations.
-        /// Collects unique ControlMaps into a DecoMapsArray, builds per-decoration
-        /// DecoratorSlots with LOD table offsets and auto-resolved DecoMap slices,
-        /// and registers all LOD meshes in MeshRegistry.
+        /// Rebuilds all decoration GPU slot/header/LOD buffers from Terrain.Decorations.
+        /// Triggered on structural changes (add/remove decorations, mesh assignment, etc).
         /// </summary>
-        public void BuildDecoratorBuffers()
+        public void RebuildDecoSlots()
         {
             if (Terrain == null) return;
             var decorations = Terrain.Decorations;
@@ -1461,22 +1541,6 @@ namespace Freefall.Components
             _decoratorHeadersBuffer?.Dispose();
             _decoratorSlotsBuffer?.Dispose();
             _decoratorLODTableBuffer?.Dispose();
-
-            // Collect unique control maps and build DecoMapsArray
-            var uniqueControlMaps = new List<Texture>();
-            var controlMapToSlice = new Dictionary<Texture, uint>();
-            foreach (var deco in decorations)
-            {
-                if (deco.ControlMap != null && deco.ControlMap.Native != null && !controlMapToSlice.ContainsKey(deco.ControlMap))
-                {
-                    controlMapToSlice[deco.ControlMap] = (uint)uniqueControlMaps.Count;
-                    uniqueControlMaps.Add(deco.ControlMap);
-                }
-            }
-            if (uniqueControlMaps.Count > 0)
-                DecoMapsArray = Texture.CreateTexture2DArray(device, uniqueControlMaps);
-            else
-                DecoMapsArray = null;
 
             // Flat list — all decorators go into a single header.
             var headers = new List<ChannelHeader>();
@@ -1570,8 +1634,7 @@ namespace Freefall.Components
                     Rot10 = sx*sy*cz - cx*sz,   Rot11 = sx*sy*sz + cx*cz,   Rot12 = sx*cy,
                     Rot20 = cx*sy*cz + sx*sz,   Rot21 = cx*sy*sz - sx*cz,   Rot22 = cx*cy,
                     SlopeBias = deco.SlopeBias,
-                    DecoMapSlice = deco.ControlMap != null && controlMapToSlice.TryGetValue(deco.ControlMap, out var slice)
-                        ? slice : 0xFFFFFFFF,
+                    DecoMapSlice = deco.ControlMap != null ? (uint)deco.ControlMap.BindlessIndex : 0,
                     _pad0 = 0,
                     Mode = (uint)mode,
                     TextureIdx = textureIdx,
@@ -1581,7 +1644,7 @@ namespace Freefall.Components
                     _colorPad = 0
                 });
 
-                bool hasControlMap = deco.ControlMap != null && controlMapToSlice.ContainsKey(deco.ControlMap);
+                bool hasControlMap = deco.ControlMap != null && deco.ControlMap.BindlessIndex != 0;
                 float logMaxDist = lodCount > 0 ? lodTable[^1].MaxDistance : 0;
                 Debug.Log($"[Deco] Slot {slots.Count - 1}: mode={mode} lodCount={lodCount} density={deco.Density} controlMap={hasControlMap} slice={slots[^1].DecoMapSlice} maxDist={logMaxDist:F0}");
             }
@@ -1603,58 +1666,62 @@ namespace Freefall.Components
             _decoratorLODTableBuffer = CreateAndUpload(lodTable);
 
             _decoratorBuffersBuilt = true;
-            _decoControlDirty = true;  // trigger prepass rebuild
+            Terrain.MarkForUpdate(TerrainDirtyFlags.DecoPrepass);  // trigger control prepass rebuild
         }
 
         /// <summary>
-        /// Creates the decoration control texture (RGBA16_UINT, 2 slices) and dispatches
-        /// the prepass compute shader to build it from density maps.
+        /// Dispatches the decoration prepass compute shader: reads per-slot density
+        /// maps via bindless SRV, builds the baked RGBA16_UINT control texture.
+        /// Control texture is cached — only recreated when resolution changes.
         /// </summary>
-        private void BuildDecorationControlTexture(ID3D12GraphicsCommandList cmd)
+        private void DispatchDecoControlPrepass(ID3D12GraphicsCommandList cmd)
         {
-            if (!_decoControlDirty || DecoMapsArray == null || _decoratorSlotsBuffer == null)
+            if (!Terrain.ConsumeFlags(TerrainDirtyFlags.DecoPrepass) || _decoratorSlotsBuffer == null)
                 return;
 
             var device = Engine.Device;
-            var decoDesc = DecoMapsArray.Native.Description;
-            int width = (int)decoDesc.Width;
-            int height = (int)decoDesc.Height;
+            int resolution = Terrain.HeightmapResolution;
 
-            // Create or recreate control texture
-            _decoControlTex?.Dispose();
-            _decoControlTex = device.CreateTexture2D(
-                Format.R16G16B16A16_UInt, width, height, 2, 1,
-                ResourceFlags.AllowUnorderedAccess, ResourceStates.Common);
-
-            _decoControlUAV = device.AllocateBindlessIndex();
-            var uavDesc = new UnorderedAccessViewDescription
+            // Create or recreate control texture only when resolution changes
+            bool freshTexture = false;
+            if (_decoControlTex == null || (int)_decoControlTex.Description.Width != resolution)
             {
-                Format = Format.R16G16B16A16_UInt,
-                ViewDimension = UnorderedAccessViewDimension.Texture2DArray,
-                Texture2DArray = new Texture2DArrayUnorderedAccessView
-                {
-                    MipSlice = 0,
-                    FirstArraySlice = 0,
-                    ArraySize = 2
-                }
-            };
-            device.NativeDevice.CreateUnorderedAccessView(_decoControlTex, null, uavDesc, device.GetCpuHandle(_decoControlUAV));
+                freshTexture = true;
+                _decoControlTex?.Dispose();
+                _decoControlTex = device.CreateTexture2D(
+                    Format.R16G16B16A16_UInt, resolution, resolution, 2, 1,
+                    ResourceFlags.AllowUnorderedAccess, ResourceStates.Common);
 
-            _decoControlSRV = device.AllocateBindlessIndex();
-            var srvDesc = new ShaderResourceViewDescription
-            {
-                Format = Format.R16G16B16A16_UInt,
-                ViewDimension = ShaderResourceViewDimension.Texture2DArray,
-                Shader4ComponentMapping = ShaderComponentMapping.Default,
-                Texture2DArray = new Texture2DArrayShaderResourceView
+                _decoControlUAV = device.AllocateBindlessIndex();
+                var uavDesc = new UnorderedAccessViewDescription
                 {
-                    MostDetailedMip = 0,
-                    MipLevels = 1,
-                    FirstArraySlice = 0,
-                    ArraySize = 2
-                }
-            };
-            device.NativeDevice.CreateShaderResourceView(_decoControlTex, srvDesc, device.GetCpuHandle(_decoControlSRV));
+                    Format = Format.R16G16B16A16_UInt,
+                    ViewDimension = UnorderedAccessViewDimension.Texture2DArray,
+                    Texture2DArray = new Texture2DArrayUnorderedAccessView
+                    {
+                        MipSlice = 0,
+                        FirstArraySlice = 0,
+                        ArraySize = 2
+                    }
+                };
+                device.NativeDevice.CreateUnorderedAccessView(_decoControlTex, null, uavDesc, device.GetCpuHandle(_decoControlUAV));
+
+                _decoControlSRV = device.AllocateBindlessIndex();
+                var srvDesc = new ShaderResourceViewDescription
+                {
+                    Format = Format.R16G16B16A16_UInt,
+                    ViewDimension = ShaderResourceViewDimension.Texture2DArray,
+                    Shader4ComponentMapping = ShaderComponentMapping.Default,
+                    Texture2DArray = new Texture2DArrayShaderResourceView
+                    {
+                        MostDetailedMip = 0,
+                        MipLevels = 1,
+                        FirstArraySlice = 0,
+                        ArraySize = 2
+                    }
+                };
+                device.NativeDevice.CreateShaderResourceView(_decoControlTex, srvDesc, device.GetCpuHandle(_decoControlSRV));
+            }
 
             // Count valid slots
             uint slotCount = 0;
@@ -1668,15 +1735,27 @@ namespace Freefall.Components
                 }
             }
 
-            // Dispatch via ComputeShader
+            // Dispatch prepass — reads per-slot density maps via bindless SRV
             _decoPrepassCS ??= new ComputeShader("decoration_prepass.hlsl");
             cmd.SetComputeRootSignature(Engine.Device.GlobalRootSignature);
             cmd.SetDescriptorHeaps(1, new[] { Engine.Device.SrvHeap });
-            _decoPrepassCS.SetTexture("DecoMaps", DecoMapsArray);             // Texture → BindlessIndex
-            _decoPrepassCS.SetBuffer("Slots", _decoratorSlotsBuffer!);        // GraphicsBuffer → auto SRV
-            _decoPrepassCS.SetPushConstant("ControlUAV", _decoControlUAV);   // uint (raw UAV index)
-            _decoPrepassCS.SetPushConstant("SlotCount", slotCount);           // uint
-            _decoPrepassCS.Dispatch(0, cmd, (uint)((width + 7) / 8), (uint)((height + 7) / 8));
+
+            // Transition control texture back to UAV for writing
+            // Fresh textures start in Common (implicit promotion to UAV).
+            // Re-dispatches need explicit SRV → UAV transition.
+            if (!freshTexture)
+            {
+                cmd.ResourceBarrier(new ResourceBarrier(
+                    new ResourceTransitionBarrier(_decoControlTex,
+                        ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess)));
+            }
+
+            _decoPrepassCS.SetBuffer("Slots", _decoratorSlotsBuffer!);
+            _decoPrepassCS.SetPushConstant("ControlUAV", _decoControlUAV);
+            _decoPrepassCS.SetPushConstant("SlotCount", slotCount);
+            _decoPrepassCS.SetPushConstant("Resolution", (uint)resolution);
+            _decoPrepassCS.Dispatch(0, cmd, (uint)((resolution + 7) / 8), (uint)((resolution + 7) / 8));
+
 
             cmd.ResourceBarrierUnorderedAccessView(_decoControlTex);
             // Transition from UAV → SRV so the spawn shader and terrain debug overlay can read correctly
@@ -1684,8 +1763,6 @@ namespace Freefall.Components
                 new ResourceTransitionBarrier(_decoControlTex,
                     ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource)));
 
-            _decoControlDirty = false;
-            _bakedAlbedoDirty = true; // Rebuild albedo when control changes
         }
 
         /// <summary>
@@ -1694,7 +1771,9 @@ namespace Freefall.Components
         /// </summary>
         private void BakeTerrainAlbedo(ID3D12GraphicsCommandList cmd)
         {
-            if (!_bakedAlbedoDirty) return;
+            return;
+
+            if (!Terrain.ConsumeFlags(TerrainDirtyFlags.AlbedoBake)) return;
             if (ControlMapsArray == null || DiffuseMapsArray == null) return;
 
             var device = Engine.Device;
@@ -1743,19 +1822,31 @@ namespace Freefall.Components
             _albedoBakeCS.SetPushConstant("OutputUAV", _bakedAlbedoUAV); // uint (raw UAV index)
             _albedoBakeCS.SetBuffer("TilingBuf", _tilingBuffer);         // GraphicsBuffer → auto SRV
 
+            // Procedural masking params (slope/height auto-mask)
+            if (Terrain?.Heightmap != null)
+                _albedoBakeCS.SetTexture("HeightTex", Terrain.Heightmap);
+            if (_layerAutoMaskBuffer != null)
+                _albedoBakeCS.SetBuffer("AutoMaskBuf", _layerAutoMaskBuffer);
+            _albedoBakeCS.SetParam("MaxHeight", Terrain?.MaxHeight ?? 600f);
+            var heightmap2 = Terrain?.Heightmap;
+            _albedoBakeCS.SetParam("HeightTexel", heightmap2 != null ? 1.0f / heightmap2.Native.Description.Width : 1.0f / 1024.0f);
+            _albedoBakeCS.SetParam("TerrainSizeX", Terrain?.TerrainSize.X ?? 1700f);
+            _albedoBakeCS.SetParam("TerrainSizeZ", Terrain?.TerrainSize.Y ?? 1700f);
+
             uint groups = (uint)((BakedAlbedoSize + 7) / 8);
             _albedoBakeCS.Dispatch(0, cmd, groups, groups);
 
             cmd.ResourceBarrierUnorderedAccessView(_bakedAlbedoTex);
 
-            _bakedAlbedoDirty = false;
+            // AlbedoBake flag already consumed in the guard above
         }
 
         /// <summary>
-        /// Updates slot data in existing GPU buffers without creating new resources.
-        /// Called when density, scale, rotation, or radius change (but decoration structure unchanged).
+        /// Updates per-slot parameter data (density, scale, rotation, colors)
+        /// without rebuilding structural data (LOD tables, mesh registrations).
+        /// Triggered on value-only changes like density/scale sliders.
         /// </summary>
-        private unsafe void UpdateDecoratorBufferData()
+        private unsafe void UpdateDecoSlots()
         {
             if (Terrain == null || _decoratorSlotsBuffer == null) return;
 
@@ -1817,7 +1908,7 @@ namespace Freefall.Components
                     Rot10 = sx*sy*cz - cx*sz,   Rot11 = sx*sy*sz + cx*cz,   Rot12 = sx*cy,
                     Rot20 = cx*sy*cz + sx*sz,   Rot21 = cx*sy*sz - sx*cz,   Rot22 = cx*cy,
                     SlopeBias = deco.SlopeBias,
-                    DecoMapSlice = slotIdx < existingDecoSlices.Length ? existingDecoSlices[slotIdx] : 0xFFFFFFFF,
+                    DecoMapSlice = deco.ControlMap != null ? (uint)deco.ControlMap.BindlessIndex : 0,
                     _pad0 = 0,
                     Mode = (uint)deco.Mode,
                     TextureIdx = slotIdx < existingTextureIdx.Length ? existingTextureIdx[slotIdx] : 0,
@@ -1853,18 +1944,16 @@ namespace Freefall.Components
         }
 
         /// <summary>
-        /// Creates GPU buffers for the compute prepass pipeline.
-        /// Called once; worst-case sizing based on control texture dimensions.
+        /// One-time init: creates render-side GPU buffers (instance buffer, counters,
+        /// dispatch args) and initializes the compute shader + kernel indices.
+        /// Sized from HeightmapResolution. Idempotent — only runs once.
         /// </summary>
-        private void CreateDecoBuffers()
+        private void EnsureDecoRenderBuffers()
         {
             if (_decoBuffersCreated) return;
-            if (_decoControlTex == null) return;
 
-            var decoDesc = _decoControlTex.Description;
-            int controlW = (int)decoDesc.Width;
-            int controlH = (int)decoDesc.Height;
-            int maxTiles = controlW * controlH;
+            int resolution = Terrain?.HeightmapResolution ?? 256;
+            int maxTiles = resolution * resolution;
 
             // Worst-case instances: ~64 per tile max (64 threads/group)
             // But realistically with density, far fewer. Use maxTiles * 8 as reasonable upper bound.
@@ -1890,7 +1979,7 @@ namespace Freefall.Components
             // Load mesh decorator material
             _meshDecoratorMaterial ??= new Material(new Effect("grass_mesh"));
 
-            Debug.Log($"[TerrainRenderer] Deco buffers created: maxTiles={maxTiles} maxInstances={_maxDecoInstances} controlSize={controlW}x{controlH}");
+            Debug.Log($"[TerrainRenderer] Deco buffers created: maxTiles={maxTiles} maxInstances={_maxDecoInstances} resolution={resolution}");
 
             // Readback buffer for instance counter + mesh draw count (12 bytes for 3 uints)
             _instanceCounterReadback = Engine.Device.NativeDevice.CreateCommittedResource(
@@ -1955,7 +2044,9 @@ namespace Freefall.Components
             }
 
             // Dispatch CS_BakeTerrainNormals
-            CreateDecoBuffers(); // ensures _grassCS is initialized
+            // Ensure compute shader is initialized (independent of deco buffers)
+            _grassCS ??= new ComputeShader("grass_compute.hlsl");
+            if (_kBakeNormals == 0) _kBakeNormals = _grassCS.FindKernel("CS_BakeTerrainNormals");
             cmd.SetComputeRootSignature(device.GlobalRootSignature);
             cmd.SetDescriptorHeaps(1, new[] { device.SrvHeap });
 
@@ -1981,22 +2072,18 @@ namespace Freefall.Components
         {
             if (DecoratorMaterial?.Effect == null || Terrain == null) return;
 
-            // One-time bakes
-            BuildDecorationControlTexture(commandList);
-            BakeTerrainAlbedo(commandList);
-            BakeTerrainNormals(commandList);
-            CreateDecoBuffers();
+            // GPU prepass: build baked control texture from density maps
+            DispatchDecoControlPrepass(commandList);
 
-            if (!_decoBuffersCreated || _decoControlTex == null) return;
+            if (!_decoBuffersCreated) return;
 
             var device = Engine.Device;
             var camPos = Camera.Main!.Position;
             var cs = _grassCS!;
 
             float range = Terrain.DecorationRadius;
-            var decoDesc = _decoControlTex.Description;
-            int controlW = (int)decoDesc.Width;
-            int controlH = (int)decoDesc.Height;
+            int controlW = _decoControlTex != null ? (int)_decoControlTex.Description.Width : Terrain.HeightmapResolution;
+            int controlH = _decoControlTex != null ? (int)_decoControlTex.Description.Height : Terrain.HeightmapResolution;
             float tileSize = Terrain.TerrainSize.X / controlW;
 
 
@@ -2027,7 +2114,6 @@ namespace Freefall.Components
                 if (Terrain.Heightmap != null) cs.SetTexture("Heightmap", Terrain.Heightmap);
                 cs.SetPushConstant("DecoControl", _decoControlSRV);
                 cs.SetPushConstant("BakedNormal", _bakedNormalSRV);
-                if (DecoMapsArray != null) cs.SetTexture("DecoMaps", DecoMapsArray);
 
                 // ── cbuffer DecoParams ──
                 cs.SetParam("TerrainSize", new Vector2(Terrain.TerrainSize.X, Terrain.TerrainSize.Y));

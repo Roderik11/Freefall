@@ -31,7 +31,7 @@ namespace Freefall.Base
         /// <summary>
         /// Source prefab this entity was instantiated from. 
         /// null if the entity was created directly (not from a prefab).
-        /// Used by SceneSerializer to emit compact PrefabInstance documents.
+        /// Used by EntitySerializer to emit compact PrefabInstance documents.
         /// </summary>
         public Assets.Prefab Prefab { get; set; }
 
@@ -109,6 +109,23 @@ namespace Freefall.Base
             MethodInfo info1 = typeof(Entity).GetMethod("AddComponent", new Type[] { });
             MethodInfo info2 = info1.MakeGenericMethod(type);
             return info2.Invoke(this, null) as Component;
+        }
+
+        /// <summary>
+        /// Remove a specific component from this entity.
+        /// Calls Destroy() on the component and unregisters from ComponentCache.
+        /// Cannot remove Transform.
+        /// </summary>
+        public void RemoveComponent(Component component)
+        {
+            if (component is Transform) return; // never remove Transform
+            if (!_components.Remove(component)) return;
+
+            component.Destroy();
+
+            var cacheType = GetCacheType(component.GetType());
+            var removeMethod = cacheType.GetMethod("Remove", BindingFlags.Public | BindingFlags.Static, [typeof(Entity)]);
+            removeMethod?.Invoke(null, [this]);
         }
         
         /// <summary>

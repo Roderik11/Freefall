@@ -40,7 +40,7 @@ namespace Freefall.Assets.Importers
         /// </summary>
         public static ModelImporter OverrideSettings;
 
-        bool ConvertUnits = true;
+        public bool ConvertUnits = true;
         public bool Optimize = false;
         public bool LeftHanded = true;
         public bool FlipUVs = false;
@@ -75,6 +75,8 @@ namespace Freefall.Assets.Importers
             // Apply override settings if set (from UnityImporterWindow)
             if (OverrideSettings != null)
             {
+                ConvertUnits = OverrideSettings.ConvertUnits;
+                Optimize = OverrideSettings.Optimize;
                 PreTransform = OverrideSettings.PreTransform;
                 FlipUVs = OverrideSettings.FlipUVs;
                 FlipWinding = OverrideSettings.FlipWinding;
@@ -256,6 +258,15 @@ namespace Freefall.Assets.Importers
             var meshNodeNames = new Dictionary<int, string>();
             BuildMeshNodeMap(scene.RootNode, meshNodeNames);
 
+            // Count meshes per node — only disambiguate names when a node has multiple
+            var nodeMeshCounts = new Dictionary<string, int>();
+            foreach (var kvp in meshNodeNames)
+            {
+                if (!nodeMeshCounts.ContainsKey(kvp.Value))
+                    nodeMeshCounts[kvp.Value] = 0;
+                nodeMeshCounts[kvp.Value]++;
+            }
+
             foreach (var mesh in meshes)
             {
                 int meshIndexCount = 0;
@@ -328,11 +339,15 @@ namespace Freefall.Assets.Importers
                 string partName = nodeName ?? mesh.Name ?? $"Part_{meshes.IndexOf(mesh)}";
 
                 // Disambiguate sub-meshes under the same node by appending material name
+                // Only needed when a node has multiple meshes (multiple materials)
                 if (nodeName != null && mesh.MaterialIndex >= 0 && mesh.MaterialIndex < scene.MaterialCount)
                 {
-                    var matName = scene.Materials[mesh.MaterialIndex].Name;
-                    if (!string.IsNullOrEmpty(matName))
-                        partName = $"{nodeName} [{matName}]";
+                    if (nodeMeshCounts.GetValueOrDefault(nodeName) > 1)
+                    {
+                        var matName = scene.Materials[mesh.MaterialIndex].Name;
+                        if (!string.IsNullOrEmpty(matName))
+                            partName = $"{nodeName} [{matName}]";
+                    }
                 }
 
                 parts.Add(new MeshPart
@@ -399,7 +414,22 @@ namespace Freefall.Assets.Importers
                 parts[i].Enabled = Parts[i].Render;
             }
 
+            // Re-apply collision detection for parts restored from saved config.
+            // Catches new patterns (e.g. _Coll) added after the original import.
+            for (int i = 0; i < parts.Count && i < Parts.Count; i++)
+            {
+                if (!Parts[i].Collision && IsCollisionPart(parts[i].Name))
+                {
+                    Parts[i].Collision = true;
+                    Parts[i].Render = false;
+                    parts[i].Enabled = false;
+                }
+            }
+
             data.Parts = parts;
+
+            // Auto-assign LOD0 to base parts that have LOD-suffixed siblings
+            AutoAssignLOD0ToBaseParts(parts, Parts);
 
             // ── LOD Discovery (config-driven) ──
             data.LODs = DiscoverLODsFromConfig(parts, Parts);
@@ -459,11 +489,15 @@ namespace Freefall.Assets.Importers
         private static bool IsCollisionPart(string name)
         {
             if (string.IsNullOrEmpty(name)) return false;
+            // Unreal conventions
             if (name.Contains("UCX", StringComparison.OrdinalIgnoreCase)) return true;
             if (name.Contains("UBX", StringComparison.OrdinalIgnoreCase)) return true;
             if (name.Contains("UCP", StringComparison.OrdinalIgnoreCase)) return true;
             if (name.Contains("USP", StringComparison.OrdinalIgnoreCase)) return true;
             if (name.Contains("ConvexHull", StringComparison.OrdinalIgnoreCase)) return true;
+            // Common suffixes
+            if (name.EndsWith("_Coll", StringComparison.OrdinalIgnoreCase)) return true;
+            if (name.EndsWith("_Collision", StringComparison.OrdinalIgnoreCase)) return true;
             return false;
         }
 
@@ -518,6 +552,37 @@ namespace Freefall.Assets.Importers
                     lodGroups[lod].Add(i);
                 }
             }
+
+            // If LOD groups start at 1+ (no explicit LOD0), synthesize LOD0
+            // from non-LOD base parts whose stripped name matches a LOD part.
+            if (lodGroups.Count > 0 && !lodGroups.ContainsKey(0))
+            {
+                // Collect base names present in any LOD group
+                var lodBaseNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                foreach (var kvp in lodGroups)
+                    foreach (var idx in kvp.Value)
+                        lodBaseNames.Add(StripLODSuffix(parts[idx].Name));
+
+                var lod0 = new List<int>();
+                for (int i = 0; i < parts.Count && i < configs.Count; i++)
+                {
+                    if (configs[i].LODMin >= 0) continue;  // already in a LOD group
+                    if (configs[i].Collision) continue;
+                    if (!configs[i].Render) continue;
+
+                    var baseName = StripLODSuffix(parts[i].Name);
+                    // baseName == parts[i].Name means no LOD suffix (it's a base part)
+                    if (baseName == parts[i].Name && lodBaseNames.Contains(baseName))
+                        lod0.Add(i);
+                }
+
+                if (lod0.Count > 0)
+                {
+                    lodGroups[0] = lod0;
+                    Debug.Log("ModelImporter", $"Synthesized LOD0 from {lod0.Count} base parts");
+                }
+            }
+
             if (lodGroups.Count <= 1) return new List<MeshLOD>();
 
             // Assign MaterialSlot to each MeshPart by base name grouping.
@@ -546,6 +611,41 @@ namespace Freefall.Assets.Importers
         }
 
         /// <summary>
+        /// Auto-assign LOD0 to base parts (no LOD suffix) that have LOD-suffixed siblings.
+        /// E.g., "Chapel_Wall_Out" becomes LOD0 when "Chapel_Wall_Out_LOD_01" exists.
+        /// </summary>
+        private static void AutoAssignLOD0ToBaseParts(List<MeshPart> parts, List<MeshPartConfig> configs)
+        {
+            // Collect base names that have at least one LOD-suffixed part
+            var lodBaseNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            for (int i = 0; i < parts.Count && i < configs.Count; i++)
+            {
+                if (configs[i].LODMin >= 0)
+                {
+                    var baseName = StripLODSuffix(parts[i].Name);
+                    if (baseName != parts[i].Name) // had a LOD suffix that was stripped
+                        lodBaseNames.Add(baseName);
+                }
+            }
+
+            if (lodBaseNames.Count == 0) return;
+
+            // Any non-LOD, non-collision part whose name matches a LOD base name → LOD0
+            for (int i = 0; i < parts.Count && i < configs.Count; i++)
+            {
+                if (configs[i].LODMin >= 0) continue;
+                if (configs[i].Collision) continue;
+
+                var baseName = StripLODSuffix(parts[i].Name);
+                if (baseName == parts[i].Name && lodBaseNames.Contains(baseName))
+                {
+                    configs[i].LODMin = 0;
+                    configs[i].LODMax = 0;
+                }
+            }
+        }
+
+        /// <summary>
         /// Strip LOD suffix/prefix from a mesh part name to get the base surface name.
         /// "Castle_Wall_LOD0" → "Castle_Wall", "LOD_1_Wall" → "Wall"
         /// </summary>
@@ -553,16 +653,18 @@ namespace Freefall.Assets.Importers
         {
             if (string.IsNullOrEmpty(name)) return name;
 
-            // Strip "_LODN" suffix
+            // Strip "_LODN" or "_LOD_N" portion but keep any trailing content (e.g. " [MaterialName]")
             var upper = name.ToUpperInvariant();
             int idx = upper.LastIndexOf("_LOD");
             if (idx >= 0)
             {
                 int end = idx + 4;
+                // Skip optional underscore separator: _LOD_01 vs _LOD01
+                if (end < upper.Length && upper[end] == '_') end++;
                 while (end < upper.Length && char.IsDigit(upper[end])) end++;
                 // Only strip if it's at the end or followed by non-alpha (like " [material]")
                 if (end >= upper.Length || !char.IsLetter(upper[end]))
-                    return name.Substring(0, idx);
+                    return name.Substring(0, idx) + name.Substring(end);
             }
 
             // Strip "LOD_N_" prefix

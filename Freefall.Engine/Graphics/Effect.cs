@@ -87,7 +87,6 @@ namespace Freefall.Graphics
 
     public class Effect : Asset, IDisposable
     {
-        public new string Name { get; }
         public List<EffectTechnique> Techniques { get; } = new List<EffectTechnique>();
         
         // Render state overrides (used when creating PSOs)

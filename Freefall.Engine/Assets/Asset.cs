@@ -19,12 +19,29 @@ namespace Freefall.Assets
         [ReadOnly(true)]
         [Browsable(false)]
         public string Guid { get; set; }
-        
-        // Streaming State
-        private long _readyFenceValue = long.MaxValue; // Default to 'never ready' until set? Or 0 if loaded synchronously?
-        
-        // If loaded synchronously (old path), this should be 0 (always ready).
-        // If async, it starts at MaxValue, then gets set to a real fence value.
+
+        // ── Dirty Tracking ──
+
+        /// <summary>
+        /// True if this asset has been modified since last save.
+        /// Set automatically by the inspector when properties change.
+        /// </summary>
+        [JsonIgnore]
+        [Browsable(false)]
+        public bool IsDirty { get; private set; }
+
+        /// <summary>
+        /// Mark this asset as modified. Called by the inspector on property changes.
+        /// </summary>
+        public virtual void MarkDirty() => IsDirty = true;
+
+        /// <summary>
+        /// Clear the dirty flag. Called after saving.
+        /// </summary>
+        public void ClearDirty() => IsDirty = false;
+
+        // ── Streaming State ──
+        private long _readyFenceValue = long.MaxValue;
         
         public bool IsReady(long completedFence)
         {
@@ -36,7 +53,6 @@ namespace Freefall.Assets
             _readyFenceValue = fenceValue;
         }
 
-        // Helper for synchronous loading legacy support
         public void MarkReady()
         {
             _readyFenceValue = 0;
@@ -44,8 +60,6 @@ namespace Freefall.Assets
         
         public Asset()
         {
-             // By default, assume ready (legacy compat). 
-             // Async loaders must explicitly set SetReadyFence(long.MaxValue) or similar at start.
              _readyFenceValue = 0;
         }
     }

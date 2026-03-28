@@ -12,15 +12,61 @@ using Freefall.Reflection;
 namespace Freefall.Serialization
 {
     /// <summary>
-    /// Loads .scene YAML files in apex-style multi-document format.
+    /// Unified serializer/deserializer for entities and their components.
+    /// Handles both scene files and in-memory round-trips (prefab instantiation, duplication).
     /// Three-phase loading:
     ///   1. Parse YAML with deferred asset stubs (no LoadByGuid during parse)
     ///   2. Build UID lookup tables and resolve entity/component references
     ///   3. Resolve asset stubs via LoadByGuid
     /// </summary>
-    public class SceneLoader
+    public class EntitySerializer
     {
-        private readonly YAMLSerializer _serializer = new();
+        private readonly YAMLSerializer _yaml = new();
+
+        // ── Save ──────────────────────────────────────────────────
+
+        public void Save(string path, IEnumerable<Entity> entities)
+        {
+            File.WriteAllText(path, SaveToString(entities), Encoding.UTF8);
+        }
+
+        public string SaveToString(IEnumerable<Entity> entities)
+        {
+            var emitter = _yaml.Begin();
+
+            foreach (var entity in entities)
+            {
+                if (entity.HideAndDontSave) continue;
+
+                // Skip child entities of prefab instances — they're reconstructed on load
+                if (entity.IsPrefabInstance && entity.Transform.Parent != null)
+                    continue;
+
+                emitter.SetTag("---");
+                _yaml.Serialize(entity, ref emitter);
+
+                if (entity.IsPrefabInstance)
+                {
+                    // Prefab instance: only emit Transform (position/rotation/scale).
+                    // All other components come from the prefab on load.
+                    emitter.SetTag("---");
+                    _yaml.Serialize(entity.Transform, ref emitter);
+                }
+                else
+                {
+                    // Inline entity: emit all components
+                    foreach (var component in entity.Components)
+                    {
+                        emitter.SetTag("---");
+                        _yaml.Serialize(component, ref emitter);
+                    }
+                }
+            }
+
+            return _yaml.ToString(emitter);
+        }
+
+        // ── Load ──────────────────────────────────────────────────
 
         public List<Entity> Load(string path)
         {
@@ -33,7 +79,7 @@ namespace Freefall.Serialization
             return LoadFromBytes(Encoding.UTF8.GetBytes(yaml));
         }
 
-        public List<Entity> LoadFromBytes(byte[] bytes)
+        public List<Entity> LoadFromBytes(byte[] bytes, bool skipPrefabHydration = false)
         {
             // Strip BOM if present
             if (bytes.Length >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF)
@@ -47,17 +93,17 @@ namespace Freefall.Serialization
             // Asset fields get stub objects (Guid set, nothing else).
             // Entity/Component ref fields collect UIDs into DeferredUniqueIdRefs.
             // No LoadByGuid calls during parse = no parser corruption.
-            _serializer.DeferAssetLoading = true;
-            _serializer.DeferredUniqueIdRefs.Clear();
+            _yaml.DeferAssetLoading = true;
+            _yaml.DeferredUniqueIdRefs.Clear();
 
             List<object> objects;
             try
             {
-                objects = _serializer.DeserializeAll(bytes);
+                objects = _yaml.DeserializeAll(bytes);
             }
             finally
             {
-                _serializer.DeferAssetLoading = false;
+                _yaml.DeferAssetLoading = false;
             }
 
             var entities = new List<Entity>();
@@ -99,7 +145,7 @@ namespace Freefall.Serialization
             }
 
             // Resolve deferred IUniqueId refs (entities + components)
-            foreach (var deferred in _serializer.DeferredUniqueIdRefs)
+            foreach (var deferred in _yaml.DeferredUniqueIdRefs)
             {
                 if (uidLookup.TryGetValue(deferred.UID, out var resolved))
                 {
@@ -109,20 +155,20 @@ namespace Freefall.Serialization
                     }
                     catch (Exception ex)
                     {
-                        Debug.LogWarning("SceneLoader",
+                        Debug.LogWarning("EntitySerializer",
                             $"UID ref resolve failed: UID {deferred.UID} on " +
                             $"{deferred.Parent.GetType().Name}.{deferred.Field.Name}: {ex.Message}");
                     }
                 }
                 else
                 {
-                    Debug.LogWarning("SceneLoader",
+                    Debug.LogWarning("EntitySerializer",
                         $"UID ref not found: UID {deferred.UID} for " +
                         $"{deferred.Parent.GetType().Name}.{deferred.Field.Name}");
                 }
             }
 
-            _serializer.DeferredUniqueIdRefs.Clear();
+            _yaml.DeferredUniqueIdRefs.Clear();
 
             // ── Phase 3: Resolve deferred Asset stubs ──
             // Now that parsing is done, resolve every Asset stub via LoadByGuid.
@@ -132,27 +178,33 @@ namespace Freefall.Serialization
             // ── Phase 4: Hydrate prefab instances ──
             // Entities saved as prefab references only have Entity + Transform in the scene file.
             // ResolveAssetStubs only walks component fields — resolve Entity.Prefab explicitly.
+            // Skipped when called from Prefab.ApplyTo to prevent infinite recursion.
             int prefabCount = 0;
-            foreach (var entity in entities)
+            if (!skipPrefabHydration)
             {
-                if (entity.Prefab != null && !string.IsNullOrEmpty(entity.Prefab.Guid))
+                foreach (var entity in entities)
                 {
-                    // Resolve the stub → fully loaded Prefab with SourceYaml
-                    var loaded = Engine.Assets?.LoadByGuid(entity.Prefab.Guid, typeof(Assets.Prefab)) as Assets.Prefab;
-                    if (loaded != null)
+                    if (entity.Prefab != null && !string.IsNullOrEmpty(entity.Prefab.Guid))
                     {
-                        entity.Prefab = loaded;
-                        loaded.ApplyTo(entity);
-                        prefabCount++;
+                        // Resolve the stub → fully loaded Prefab with SourceYaml
+                        var loaded = Engine.Assets?.LoadByGuid(entity.Prefab.Guid, typeof(Prefab)) as Prefab;
+                        if (loaded != null)
+                        {
+                            entity.Prefab = loaded;
+                            loaded.ApplyTo(entity);
+                            prefabCount++;
+                        }
                     }
                 }
             }
 
-            Debug.Log($"[SceneLoader] Loaded {entities.Count} entities " +
+            Debug.Log($"[EntitySerializer] Loaded {entities.Count} entities " +
                       $"({prefabCount} prefab instances, {uidLookup.Count} UIDs resolved)");
 
             return entities;
         }
+
+        // ── Asset stub resolution ─────────────────────────────────
 
         /// <summary>
         /// Walk all components on all entities. For each Asset-typed field
@@ -188,7 +240,7 @@ namespace Freefall.Serialization
                     }
                     catch (Exception ex)
                     {
-                        Debug.LogWarning("SceneLoader",
+                        Debug.LogWarning("EntitySerializer",
                             $"Stub resolve failed: {field.Type.Name} " +
                             $"'{stub.Guid}' on {context}: {ex.Message}");
                     }
@@ -221,7 +273,7 @@ namespace Freefall.Serialization
                             }
                             catch (Exception ex)
                             {
-                                Debug.LogWarning("SceneLoader",
+                                Debug.LogWarning("EntitySerializer",
                                     $"List stub resolve failed: {elType.Name} " +
                                     $"'{stub.Guid}' on {context}.{field.Name}[{i}]: {ex.Message}");
                             }

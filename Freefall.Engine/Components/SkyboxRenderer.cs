@@ -62,6 +62,7 @@ namespace Freefall.Components
         protected override void Awake()
         {
             Mesh = Mesh.CreateCube(Engine.Device, 100.0f);
+            SunLight ??= EntityManager.FindComponent<DirectionalLight>();
         }
 
         public void Update()
@@ -69,7 +70,7 @@ namespace Freefall.Components
             if (Camera.Main == null) return;
             
             // Move with camera to simulate infinite distance
-            Entity.Transform.Position = Camera.Main.Position;
+            Transform.Position = Camera.Main.Position;
 
             // Animate time of day if enabled
             if (AnimateTimeOfDay)

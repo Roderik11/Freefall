@@ -71,8 +71,6 @@ namespace Freefall.Graphics
 
     public class Material : Asset, IDisposable
     {
-
-        
         // Per-pass PSOs (Apex pattern for multi-pass rendering like shadow maps)
         private Dictionary<int, PipelineState> _passPipelineStates = new();
         private Dictionary<int, PipelineState> _passWireframePSOs = new();
@@ -107,7 +105,23 @@ namespace Freefall.Graphics
         
         public PipelineState PipelineState => _passPipelineStates.TryGetValue(Pass, out var pso) ? pso : _passPipelineStates[0];
         public IEnumerable<ConstantBuffer> ConstantBuffers => _constantBuffers.Values;
-        public Effect? Effect { get; private set; }
+        private Effect _effect;
+        public Effect Effect
+        {
+            get => _effect;
+            set
+            {
+                // During construction or plain assignment: just set reference
+                if (_passPipelineStates.Count == 0)
+                {
+                    _effect = value;
+                    return;
+                }
+                // Live swap: rebuild PSOs
+                if (value != null && value != _effect)
+                    SetEffect(value);
+            }
+        }
         
         // Pass/Technique selection (Apex pattern)
         public int Pass { get; set; } = 0;
@@ -187,20 +201,61 @@ namespace Freefall.Graphics
 
         public Material(Effect effect, GraphicsDevice device)
         {
+            // Assign unique MaterialID (only once per Material lifetime)
+            lock (_materialIdLock)
+            {
+                MaterialID = _nextMaterialID++;
+                _allMaterials.Add(new MaterialData());
+                _materialsBufferDirty = true;
+            }
+
+            InitFromEffect(effect, device);
+        }
+
+        /// <summary>
+        /// Change the Effect on an existing material at runtime.
+        /// Disposes old PSOs/CBs and rebuilds with the new Effect.
+        /// Preserves existing texture bindings.
+        /// </summary>
+        public void SetEffect(Effect effect)
+        {
+            if (effect == null || effect == Effect) return;
+
+            // Dispose old GPU state
+            foreach (var cb in _constantBuffers.Values)
+                cb.Dispose();
+            _constantBuffers.Clear();
+            _passPipelineStates.Clear();
+            _passWireframePSOs.Clear();
+            _subShaders.Clear();
+            _textureParameters.Clear();
+            _textureSlots.Clear();
+            _bindlessIndices.Clear();
+
+            // Preserve existing textures — they'll be re-bound after init
+            var savedTextures = new Dictionary<string, Texture>(_textures);
+            _textures.Clear();
+
+            InitFromEffect(effect, Freefall.Engine.Device);
+
+            // Re-apply saved textures
+            foreach (var (slot, tex) in savedTextures)
+                SetTexture(slot, tex);
+
+            Debug.Log($"[Material] Switched '{Name}' to effect '{effect.Name}'");
+        }
+
+        /// <summary>
+        /// Core initialization: build PSOs, SubShaders, CBs from an Effect.
+        /// </summary>
+        private void InitFromEffect(Effect effect, GraphicsDevice device)
+        {
             Debug.Log($"[Material] Creating Material for Effect: {effect.Name}");
             Effect = effect;
             
             // Populate SubShaders from Effect techniques (Apex pattern)
             foreach (var technique in effect.Techniques)
                 _subShaders.Add(new SubShader(technique));
-            
-            // Assign unique MaterialID and register in global materials list (thread-safe)
-            lock (_materialIdLock)
-            {
-                MaterialID = _nextMaterialID++;
-                _allMaterials.Add(new MaterialData()); // Will be populated by SetTexture
-                _materialsBufferDirty = true;
-            }
             
             // Create texture parameters for each MaterialData slot
             foreach (var slotName in MaterialData.TextureSlotNames)

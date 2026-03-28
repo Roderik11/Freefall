@@ -22,7 +22,7 @@ cbuffer PushConstants : register(b3)
     uint DiffuseMapsIdx;        // 19
     uint NormalMapsIdx;         // 20
     uint DecoControlMapIdx;     // 21: Decoration control texture
-    uint _reserved22;
+    uint AutoMaskBufIdx;        // 22: StructuredBuffer<LayerAutoMask> for procedural slope/height masking
     uint CascadeBufferSRVIdx;   // 23: SRV: StructuredBuffer<CascadeData>
     uint ShadowCascadeCount;    // 24: uint: number of cascades
     uint CascadeIdxBufIdx;      // 25: SRV: per-entry cascade index (uint)
@@ -30,6 +30,16 @@ cbuffer PushConstants : register(b3)
 
 #include "common.fx"
 // @RenderState(RenderTargets=5)
+
+// Per-layer procedural auto-mask parameters (uploaded from TextureLayer C# properties)
+struct LayerAutoMask
+{
+    float HeightMin, HeightMax;     // normalized 0..1 of MaxHeight
+    float SlopeMin, SlopeMax;       // degrees (0=flat, 90=cliff)
+    float HeightBlend, SlopeBlend;  // blend widths (normalized / degrees)
+    float ProceduralWeight;         // 0=paint only, 1=full procedural
+    float _pad;
+};
 
 // TerrainPatchData: per-instance data written by terrain_quadtree.hlsl compute shader.
 // World transform is computed from patch rect — no per-patch TransformSlot needed.
@@ -222,8 +232,18 @@ FragmentOutput PS(VertexOutput input)
 
     float3 terrainNormal = GetNormal(input.UV2);
 
+    // Slope angle in degrees for procedural masking
+    float slopeDeg = acos(saturate(terrainNormal.y)) * (180.0 / 3.14159265);
+
+    // Normalized height [0..1] for procedural masking
+    Texture2D HeightTex = ResourceDescriptorHeap[HeightTexIdx];
+    float heightNorm = HeightTex.SampleLevel(sampHeightFilter, input.UV2, 0).r;
+
+    // Load auto-mask buffer (may be null/0 if no layers have procedural enabled)
+    StructuredBuffer<LayerAutoMask> AutoMaskBuf = ResourceDescriptorHeap[AutoMaskBufIdx];
+
     float4 color = float4(0, 0, 0, 0);
-    float4 normal = float4(0, 0, 0, 0);
+    float4 normal = float4(0.5, 0.5, 0, 0); // flat normal default (BC5 midpoint)
 	
     float2 uv = input.UV2;
     uv.y = 1 - uv.y;
@@ -236,7 +256,10 @@ FragmentOutput PS(VertexOutput input)
     uint cmW, cmH, sliceCount;
     ControlMaps.GetDimensions(cmW, cmH, sliceCount);
 
-    float totalWeight = 0;
+    // Layered compositing: each layer lerps over what's below it.
+    // Layer 0 at weight 1.0 = full base. Layer 1 at weight 1.0 = fully covers layer 0.
+    // Partial weight = partial blend with what's beneath.
+    bool hasAnyLayer = false;
     for (uint i = 0; i < sliceCount; ++i)
     {
         uint startIndex = i * 4;
@@ -245,29 +268,39 @@ FragmentOutput PS(VertexOutput input)
         for (uint j = 0; j < 4; ++j)
         {
             float weight = weights[j];
+
+            uint layer = startIndex + j;
+
+            // Procedural slope/height auto-mask: max(painted, procedural)
+            LayerAutoMask mask = AutoMaskBuf[layer];
+            if (mask.ProceduralWeight > 0)
+            {
+                float pmask = 1;
+                pmask *= smoothstep(mask.SlopeMin - mask.SlopeBlend, mask.SlopeMin, slopeDeg);
+                pmask *= smoothstep(mask.SlopeMax + mask.SlopeBlend, mask.SlopeMax, slopeDeg);
+                pmask *= smoothstep(mask.HeightMin - mask.HeightBlend, mask.HeightMin, heightNorm);
+                pmask *= smoothstep(mask.HeightMax + mask.HeightBlend, mask.HeightMax, heightNorm);
+                weight = max(weight, pmask * mask.ProceduralWeight);
+            }
+
             if (weight <= 0)
                 continue;
 
-            totalWeight += weight;
+            hasAnyLayer = true;
 
-            uint layer = startIndex + j;
             float2 texuv = uv * LayerTiling[layer].xy;
             float3 layerUV = float3(texuv, layer);
 
             float4 c = DiffuseMaps.Sample(sampData, layerUV);
             float4 n = NormalMaps.Sample(sampData, layerUV);
 
-            color += c * weight;
-            normal += n * weight;
+            color = lerp(color, c, weight);
+            normal = lerp(normal, n, weight);
         }
     }
 
-    // Normalize splatmap weights
-    if (totalWeight > 0.001)
+    if (hasAnyLayer)
     {
-        color.rgb /= totalWeight;
-        normal /= totalWeight;
-
         // BC5_UNORM: R,G in [0,1], 0.5 = flat. Decode to signed tangent-space XY.
         float2 nXY = normal.rg * 2.0 - 1.0;
 

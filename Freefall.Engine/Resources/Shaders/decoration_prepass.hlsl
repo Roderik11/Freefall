@@ -1,7 +1,7 @@
 // decoration_prepass.hlsl — Build decoration control texture from per-slot density maps
 // SM 6.6 bindless, push constants at b3
 //
-// Iterates all decoration slots, reads each slot's density map (via DecoMapSlice),
+// Iterates all decoration slots, reads each slot's density map via bindless SRV,
 // finds the top 8 by weight, and packs (slotIndex, weight) into a 2-slice RGBA16_UINT texture.
 // Each channel: (slotIndex << 8) | weight. Unused slots: 0xFFFF.
 
@@ -10,10 +10,10 @@
 // Push constants (root parameter 0, register b3) — bindless indices only
 cbuffer PushConstants : register(b3)
 {
-    uint DecoMapsIdx;       // slot 0 — SRV: density map Texture2DArray
-    uint SlotsIdx;          // slot 1 — SRV: DecoratorSlot structured buffer
-    uint ControlUAVIdx;     // slot 2 — UAV: output RWTexture2DArray<uint4>
-    uint SlotCountIdx;      // slot 3 — number of decorator slots
+    uint SlotsIdx;          // slot 0 — SRV: DecoratorSlot structured buffer
+    uint ControlUAVIdx;     // slot 1 — UAV: output RWTexture2DArray<uint4>
+    uint SlotCountIdx;      // slot 2 — number of decorator slots
+    uint ResolutionIdx;     // slot 3 — control texture width/height
 };
 
 // Must match DecoratorSlot in grass.fx / grass_compute.hlsl
@@ -28,7 +28,7 @@ struct DecoratorSlot
     float Rot10, Rot11, Rot12;
     float Rot20, Rot21, Rot22;
     float SlopeBias;
-    uint DecoMapSlice;
+    uint DecoMapSlice;      // bindless SRV index (0 = no map)
     uint _pad0;
     uint Mode;
     uint TextureIdx;
@@ -38,24 +38,20 @@ struct DecoratorSlot
     uint _colorPad;
 };
 
-// Sampler for density maps — block-compressed textures (BC1) don't support Load()
+// Sampler for density maps
 SamplerState ClampSampler : register(s2);
 
 [numthreads(8, 8, 1)]
 void CSBuildDecoControl(uint3 dtid : SV_DispatchThreadID)
 {
     RWTexture2DArray<uint4> controlTex = ResourceDescriptorHeap[ControlUAVIdx];
-    Texture2DArray decoMaps = ResourceDescriptorHeap[DecoMapsIdx];
     StructuredBuffer<DecoratorSlot> slots = ResourceDescriptorHeap[SlotsIdx];
 
-    uint2 dims;
-    uint slices;
-    decoMaps.GetDimensions(dims.x, dims.y, slices);
-
-    if (dtid.x >= dims.x || dtid.y >= dims.y) return;
+    uint resolution = ResolutionIdx;
+    if (dtid.x >= resolution || dtid.y >= resolution) return;
 
     // Normalized UV for SampleLevel (texel center)
-    float2 uv = (float2(dtid.xy) + 0.5) / float2(dims);
+    float2 uv = (float2(dtid.xy) + 0.5) / float2(resolution, resolution);
 
     // Collect all valid slots, then keep top 8 sorted by weight (descending)
     uint topIdx[8];
@@ -72,8 +68,11 @@ void CSBuildDecoControl(uint3 dtid : SV_DispatchThreadID)
         DecoratorSlot s = slots[i];
 
         float val = 0.0;
-        if (s.DecoMapSlice != 0xFFFFFFFF)
-            val = decoMaps.SampleLevel(ClampSampler, float3(uv, s.DecoMapSlice), 1).r;  // mip 1: smooth density edges
+        if (s.DecoMapSlice != 0)
+        {
+            Texture2D<float> densityMap = ResourceDescriptorHeap[s.DecoMapSlice];
+            val = densityMap.SampleLevel(ClampSampler, uv, 0).r;
+        }
         else
             continue;
 

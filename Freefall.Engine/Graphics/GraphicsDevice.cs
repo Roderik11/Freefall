@@ -135,7 +135,7 @@ namespace Freefall.Graphics
         {
             var rootParameters = new RootParameter1[]
             {
-                new RootParameter1(new RootConstants(3, 0, 32), ShaderVisibility.All), // Slot 0: Push Constants (mapped to b3) (32 dwords = 8 * uint4)
+                new RootParameter1(new RootConstants(3, 0, 40), ShaderVisibility.All), // Slot 0: Push Constants (mapped to b3) (40 dwords)
                 new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.All), // Slot 1: Scene Constants (b0)
                 new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(1, 0), ShaderVisibility.All), // Slot 2: Object/Terrain Constants (b1)
                 new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(2, 0), ShaderVisibility.All), // Slot 3: Tiling Constants (b2)

@@ -28,11 +28,15 @@ namespace Freefall
 
         public static void ClearLog() => lines.Clear();
 
-        static void Append(string message, StackTrace stackTrace) => lines.Add(new LogEntry
+        static void Append(string message, StackTrace stackTrace)
         {
-            StackTrace = stackTrace,
-            Message = message
-        });
+            Console.WriteLine(message);
+            lines.Add(new LogEntry
+            {
+                StackTrace = stackTrace,
+                Message = message
+            });
+        }
 
 
 

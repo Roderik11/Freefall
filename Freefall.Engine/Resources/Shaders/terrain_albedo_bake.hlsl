@@ -14,9 +14,26 @@ cbuffer PushConstants : register(b3)
     uint DiffuseMapsIdx;    // slot 1 — SRV: diffuse layer Texture2DArray
     uint OutputUAVIdx;      // slot 2 — UAV: output RWTexture2D<float4>
     uint TilingBufIdx;      // slot 3 — SRV: StructuredBuffer<float4> (LayerTiling, 32 entries)
+    uint HeightTexIdx;      // slot 4 — SRV: baked heightmap for procedural masking
+    uint AutoMaskBufIdx;    // slot 5 — SRV: StructuredBuffer<LayerAutoMask>
+    float MaxHeight;        // slot 6 — terrain max height
+    float HeightTexel;      // slot 7 — 1.0 / heightmap resolution
+    float TerrainSizeX;     // slot 8 — terrain world X dimension
+    float TerrainSizeZ;     // slot 9 — terrain world Z dimension
+};
+
+// Must match gputerrain.fx
+struct LayerAutoMask
+{
+    float HeightMin, HeightMax;
+    float SlopeMin, SlopeMax;
+    float HeightBlend, SlopeBlend;
+    float ProceduralWeight;
+    float _pad;
 };
 
 SamplerState sampData : register(s0);  // WrappedAnisotropic
+SamplerState sampHeightFilter : register(s2);  // ClampedBilinear2D
 
 [numthreads(8, 8, 1)]
 void CSBakeTerrainAlbedo(uint3 dtid : SV_DispatchThreadID)
@@ -34,6 +51,27 @@ void CSBakeTerrainAlbedo(uint3 dtid : SV_DispatchThreadID)
     Texture2DArray ControlMaps = ResourceDescriptorHeap[ControlMapsIdx];
     Texture2DArray DiffuseMaps = ResourceDescriptorHeap[DiffuseMapsIdx];
     StructuredBuffer<float4> Tiling = ResourceDescriptorHeap[TilingBufIdx];
+    StructuredBuffer<LayerAutoMask> AutoMaskBuf = ResourceDescriptorHeap[AutoMaskBufIdx];
+
+    // Compute terrain normal from heightmap for slope masking
+    Texture2D HeightTex = ResourceDescriptorHeap[HeightTexIdx];
+    float heightNorm = HeightTex.SampleLevel(sampHeightFilter, uv, 0).r;
+
+    float4 hSamples;
+    hSamples[0] = HeightTex.SampleLevel(sampHeightFilter, uv + float2(0, -HeightTexel), 0).r;
+    hSamples[1] = HeightTex.SampleLevel(sampHeightFilter, uv + float2(-HeightTexel, 0), 0).r;
+    hSamples[2] = HeightTex.SampleLevel(sampHeightFilter, uv + float2(HeightTexel, 0), 0).r;
+    hSamples[3] = HeightTex.SampleLevel(sampHeightFilter, uv + float2(0, HeightTexel), 0).r;
+
+    float texelWorldSize = TerrainSizeX * HeightTexel;
+    float hScale = MaxHeight / texelWorldSize;
+    float3 terrainNormal;
+    terrainNormal.z = (hSamples[0] - hSamples[3]) * hScale;
+    terrainNormal.x = (hSamples[1] - hSamples[2]) * hScale;
+    terrainNormal.y = 1.0;
+    terrainNormal = normalize(terrainNormal);
+
+    float slopeDeg = acos(saturate(terrainNormal.y)) * (180.0 / 3.14159265);
 
     float4 color = float4(0, 0, 0, 0);
 
@@ -49,14 +87,28 @@ void CSBakeTerrainAlbedo(uint3 dtid : SV_DispatchThreadID)
         for (uint j = 0; j < 4; ++j)
         {
             float weight = weights[j];
+
+            uint layer = startIndex + j;
+
+            // Procedural slope/height auto-mask: max(painted, procedural)
+            LayerAutoMask mask = AutoMaskBuf[layer];
+            if (mask.ProceduralWeight > 0)
+            {
+                float pmask = 1;
+                pmask *= smoothstep(mask.SlopeMin - mask.SlopeBlend, mask.SlopeMin, slopeDeg);
+                pmask *= smoothstep(mask.SlopeMax + mask.SlopeBlend, mask.SlopeMax, slopeDeg);
+                pmask *= smoothstep(mask.HeightMin - mask.HeightBlend, mask.HeightMin, heightNorm);
+                pmask *= smoothstep(mask.HeightMax + mask.HeightBlend, mask.HeightMax, heightNorm);
+                weight = max(weight, pmask * mask.ProceduralWeight);
+            }
+
             if (weight <= 0)
                 continue;
 
-            uint layer = startIndex + j;
             float2 texuv = uv * Tiling[layer].xy;
             // Sample at high mip for averaged color (no tiling detail)
             float4 c = DiffuseMaps.SampleLevel(sampData, float3(texuv, layer), 4.0);
-            color += c * weight;
+            color = lerp(color, c, weight);
         }
     }
 

@@ -23,13 +23,15 @@ namespace Freefall.Graphics
             public Vector2 Size;         // pixel size (width, height)
             public Color4 Color;         // tint RGBA
             public Vector4 UVs;          // minU, minV, maxU, maxV
-            public uint TextureIndex;    // SRV heap index (bindless)
-            public uint Type;            // 0 = Quad, 1 = Line
+            public uint TextureIndex;    // SRV heap index (bindless) — for Type=2: index into SlugGlyphData buffer
+            public uint Type;            // 0 = Quad, 1 = Line, 2 = SlugGlyph
             public Vector2 EndPosition;  // For lines: pixel coords of end point
         }
 
         private const int InitialCapacity = 2048;
-        private const int SpriteStride = 64; // sizeof(SpriteData) = 64 bytes
+        private const int SpriteStride = 64;     // sizeof(SpriteData) = 64 bytes
+        private const int GlyphStride = 48;     // sizeof(SlugGlyphData) = 48 bytes
+        private const int InitialGlyphCapacity = 512;
 
         private readonly GraphicsDevice _device;
         private ID3D12PipelineState _pipelineState = null!;
@@ -45,6 +47,14 @@ namespace Freefall.Graphics
         private uint _spriteBufferBindlessIndex;
         private int _bufferCapacity;
 
+        // Slug glyph indirection buffer
+        private SlugGlyphData[] _glyphData;
+        private int _glyphCount;
+        private ID3D12Resource _glyphBuffer = null!;
+        private IntPtr _glyphBufferPtr;
+        private uint _glyphBufferBindlessIndex;
+        private int _glyphBufferCapacity;
+
         // Scissor rect (pixel coords) — initialized to max so soft clipping defaults to fully open
         public RectI Scissor = new RectI(0, 0, int.MaxValue, int.MaxValue);
 
@@ -56,9 +66,12 @@ namespace Freefall.Graphics
             _device = device;
             _sprites = new SpriteData[InitialCapacity];
             _bufferCapacity = InitialCapacity;
+            _glyphData = new SlugGlyphData[InitialGlyphCapacity];
+            _glyphBufferCapacity = InitialGlyphCapacity;
 
             CreatePipelineState();
             CreateSpriteBuffer(InitialCapacity);
+            CreateGlyphBuffer(InitialGlyphCapacity);
             CreateWhiteTexture();
         }
 
@@ -105,10 +118,10 @@ namespace Freefall.Graphics
                 SourceBlend = Blend.SourceAlpha,
                 DestinationBlend = Blend.InverseSourceAlpha,
                 BlendOperation = BlendOperation.Add,
-                SourceBlendAlpha = Blend.Zero,
-                DestinationBlendAlpha = Blend.Zero,
+                SourceBlendAlpha = Blend.One,
+                DestinationBlendAlpha = Blend.InverseSourceAlpha,
                 BlendOperationAlpha = BlendOperation.Add,
-                RenderTargetWriteMask = ColorWriteEnable.Red | ColorWriteEnable.Green | ColorWriteEnable.Blue
+                RenderTargetWriteMask = ColorWriteEnable.All
             };
             return desc;
         }
@@ -192,6 +205,7 @@ namespace Freefall.Graphics
         public void Begin()
         {
             _spriteCount = 0;
+            _glyphCount = 0;
         }
 
         /// <summary>
@@ -264,6 +278,53 @@ namespace Freefall.Graphics
         }
 
         /// <summary>
+        /// Draw a Slug glyph (Type=2 sprite with indirection to glyph data).
+        /// </summary>
+        public void DrawSlugGlyph(int x, int y, int width, int height,
+            float emX0, float emY0, float emX1, float emY1,
+            Color4 color, SlugGlyphData glyphData)
+        {
+            // CPU-side scissor clipping (same as quad path)
+            {
+                float fx = (emX1 - emX0) / width;
+                float fy = (emY1 - emY0) / height;
+
+                int diff;
+
+                diff = Math.Max(Scissor.Left - x, 0);
+                x += diff; width -= diff; emX0 += diff * fx;
+
+                diff = Math.Max(x + width - Scissor.Right, 0);
+                width -= diff; emX1 -= diff * fx;
+
+                diff = Math.Max(Scissor.Top - y, 0);
+                y += diff; height -= diff; emY0 += diff * fy;
+
+                diff = Math.Max(y + height - Scissor.Bottom, 0);
+                height -= diff; emY1 -= diff * fy;
+
+                if (width < 1 || height < 1) return;
+            }
+
+            EnsureGlyphCapacity();
+            EnsureCapacity();
+
+            // Write glyph data to the indirection buffer
+            int glyphIdx = _glyphCount++;
+            _glyphData[glyphIdx] = glyphData;
+
+            // Write a Type=2 sprite that references the glyph data
+            ref var sprite = ref _sprites[_spriteCount++];
+            sprite.Position = new Vector2(x, y);
+            sprite.Size = new Vector2(width, height);
+            sprite.Color = color;
+            sprite.UVs = new Vector4(emX0, emY0, emX1, emY1);  // em-space bounds (interpolated by rasterizer)
+            sprite.TextureIndex = (uint)glyphIdx;               // index into SlugGlyphData buffer
+            sprite.Type = 2;
+            sprite.EndPosition = default;
+        }
+
+        /// <summary>
         /// Flush all sprites to the GPU and draw them. Call after all Draw/DrawLine calls.
         /// </summary>
         public void End(ID3D12GraphicsCommandList commandList, int screenWidth, int screenHeight)
@@ -280,11 +341,24 @@ namespace Freefall.Graphics
                 }
             }
 
+            // Upload glyph data to GPU (if any Type=2 sprites exist)
+            if (_glyphCount > 0)
+            {
+                unsafe
+                {
+                    fixed (SlugGlyphData* src = _glyphData)
+                    {
+                        int bytes = _glyphCount * GlyphStride;
+                        Buffer.MemoryCopy(src, (void*)_glyphBufferPtr, _glyphBufferCapacity * GlyphStride, bytes);
+                    }
+                }
+            }
+
             // Set pipeline state
             commandList.SetPipelineState(_pipelineState);
             commandList.SetGraphicsRootSignature(_device.GlobalRootSignature);
 
-            // Push constants: sprite buffer index, screen width, screen height
+            // Push constants: sprite buffer index, screen width, screen height, glyph buffer index
             commandList.SetGraphicsRoot32BitConstant(0, _spriteBufferBindlessIndex, 0);
 
             unsafe
@@ -294,6 +368,8 @@ namespace Freefall.Graphics
                 commandList.SetGraphicsRoot32BitConstant(0, *(uint*)&w, 1);
                 commandList.SetGraphicsRoot32BitConstant(0, *(uint*)&h, 2);
             }
+
+            commandList.SetGraphicsRoot32BitConstant(0, _glyphBufferBindlessIndex, 3);
 
             // Set topology and draw
             commandList.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
@@ -312,10 +388,53 @@ namespace Freefall.Graphics
             }
         }
 
+        private void EnsureGlyphCapacity()
+        {
+            if (_glyphCount >= _glyphData.Length)
+            {
+                int newCapacity = _glyphData.Length * 2;
+                Array.Resize(ref _glyphData, newCapacity);
+
+                if (newCapacity > _glyphBufferCapacity)
+                    CreateGlyphBuffer(newCapacity);
+            }
+        }
+
+        private void CreateGlyphBuffer(int capacity)
+        {
+            _glyphBuffer?.Dispose();
+
+            int bufferSize = capacity * GlyphStride;
+            _glyphBuffer = _device.NativeDevice.CreateCommittedResource(
+                new HeapProperties(HeapType.Upload),
+                HeapFlags.None,
+                ResourceDescription.Buffer((ulong)bufferSize),
+                ResourceStates.GenericRead);
+
+            unsafe
+            {
+                void* ptr;
+                _glyphBuffer.Map(0, null, &ptr);
+                _glyphBufferPtr = (IntPtr)ptr;
+            }
+
+            if (_glyphBufferBindlessIndex == 0)
+                _glyphBufferBindlessIndex = _device.AllocateBindlessIndex();
+
+            _device.CreateStructuredBufferSRV(
+                _glyphBuffer,
+                (uint)capacity,
+                GlyphStride,
+                _glyphBufferBindlessIndex);
+
+            _glyphBufferCapacity = capacity;
+        }
+
         public void Dispose()
         {
             _pipelineState?.Dispose();
             _spriteBuffer?.Dispose();
+            _glyphBuffer?.Dispose();
         }
     }
 
@@ -336,5 +455,27 @@ namespace Freefall.Graphics
             xMax = x + width;
             yMax = y + height;
         }
+    }
+
+    /// <summary>
+    /// Per-glyph data for Slug text rendering.
+    /// Uploaded to a StructuredBuffer and accessed via indirection from Type=2 sprites.
+    /// Must match the HLSL SlugGlyphData struct layout exactly.
+    /// </summary>
+    [StructLayout(LayoutKind.Sequential)]
+    public struct SlugGlyphData
+    {
+        public uint CurveTextureIndex;  // Bindless SRV: font's curve texture (RGBA16F)
+        public uint BandTextureIndex;   // Bindless SRV: font's band texture (RG32F)
+        public int  GlyphLocX;          // Band texture origin X for this glyph
+        public int  GlyphLocY;          // Band texture origin Y for this glyph
+        public int  BandMaxX;           // Max horizontal band index (bandCount - 1)
+        public int  BandMaxY;           // Max vertical band index (bandCount - 1)
+        public float BandScaleX;        // Em-to-band-index scale X
+        public float BandScaleY;        // Em-to-band-index scale Y
+        public float BandOffsetX;       // Em-to-band-index offset X
+        public float BandOffsetY;       // Em-to-band-index offset Y
+        public float PixelsPerEmX;      // CPU-computed: pixels per em-unit in X
+        public float PixelsPerEmY;      // CPU-computed: pixels per em-unit in Y
     }
 }

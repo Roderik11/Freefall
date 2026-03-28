@@ -82,5 +82,25 @@ namespace Freefall.Assets.Loaders
 
             return material;
         }
+
+        /// <summary>
+        /// Save a Material to its source .mat file as YAML, then re-import
+        /// so the binary cache (.asset) stays in sync.
+        /// </summary>
+        public void Save(Asset asset, string savePath)
+        {
+            var serializer = new MaterialSerializer();
+            var yaml = serializer.Serialize(asset);
+            File.WriteAllText(savePath, yaml, Encoding.UTF8);
+            Debug.Log($"[MaterialLoader] Saved: {savePath}");
+
+            // Re-import to update the binary cache
+            var assetsDir = Engine.Project?.AssetsDirectory;
+            if (!string.IsNullOrEmpty(assetsDir) && savePath.StartsWith(assetsDir))
+            {
+                var relativePath = Path.GetRelativePath(assetsDir, savePath).Replace('\\', '/');
+                AssetDatabase.ImportAssetByPath(relativePath);
+            }
+        }
     }
 }

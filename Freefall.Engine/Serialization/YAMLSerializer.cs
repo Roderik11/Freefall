@@ -572,8 +572,18 @@ namespace Freefall.Serialization
 
         private void ReadNode(ref YamlParser parser, object parent, Mapping fields)
         {
+            // Empty mapping: { } — nothing to read
+            if (parser.CurrentEventType == ParseEventType.MappingEnd)
+            {
+                parser.Read();
+                return;
+            }
+
             if (parser.CurrentEventType != ParseEventType.Scalar)
-                throw new InvalidOperationException($"Expected scalar field name, got {parser.CurrentEventType}");
+            {
+                parser.SkipCurrentNode();
+                return;
+            }
 
             var key = parser.ReadScalarAsString();
 

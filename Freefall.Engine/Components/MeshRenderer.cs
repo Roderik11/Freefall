@@ -25,6 +25,7 @@ namespace Freefall.Components
 
         /// <summary>
         /// Default material applied to all MeshParts (unless overridden).
+        /// When null, only explicit MaterialOverrides render (mixed-mesh mode).
         /// </summary>
         public Material? Material;
 
@@ -34,6 +35,13 @@ namespace Freefall.Components
         /// and no default Material are invisible.
         /// </summary>
         public List<MaterialOverride> Materials = [];
+
+        /// <summary>
+        /// When set, overrides ALL material routing (Material + Materials).
+        /// Used for placement ghost mode. Not serialized.
+        /// </summary>
+        [NonSerialized]
+        public Material? ReplacementMaterial;
 
         public MaterialBlock Params = new();
         public BoundingSphere BoundingSphere;
@@ -81,7 +89,7 @@ namespace Freefall.Components
             sizeSq *= Engine.Settings.LODScale * Mesh.LODBias;
 
             // Use SmallProps LODGroup ranges as thresholds
-            var ranges = LODGroups.SmallProps.Ranges;
+            var ranges = LODGroups.LargeProps.Ranges;
             int lodCount = Mesh.LODs.Count;
 
             for (int i = 0; i < Math.Min(ranges.Count, lodCount); i++)
@@ -97,6 +105,7 @@ namespace Freefall.Components
         /// <summary>
         /// Resolve material for a MeshPart by its MaterialSlot.
         /// Checks sparse overrides first, falls back to default Material.
+        /// When Material is null, unmatched slots are invisible (mixed-mesh mode).
         /// </summary>
         private Material? GetMaterial(int materialSlot)
         {
@@ -105,10 +114,11 @@ namespace Freefall.Components
                 for (int i = 0; i < Materials.Count; i++)
                 {
                     if (Materials[i].MaterialSlot == materialSlot)
-                        return Materials[i].Material;
+                        return ReplacementMaterial ?? Materials[i].Material;
                 }
             }
-            return Material;
+
+            return Material != null ? ReplacementMaterial ?? Material : null;
         }
 
         public void Draw()
@@ -121,9 +131,8 @@ namespace Freefall.Components
 
             if (lod >= 0 && Mesh.LODs[lod].MeshPartIndices != null)
             {
-                // LOD-selected parts
+                // Draw active LOD parts
                 var indices = Mesh.LODs[lod].MeshPartIndices;
-
                 for (int i = 0; i < indices.Length; i++)
                 {
                     int partIdx = indices[i];
@@ -133,22 +142,15 @@ namespace Freefall.Components
                         CommandBuffer.Enqueue(Mesh, partIdx, mat, Params, slot);
                 }
 
-                // Also render non-LOD parts that have material overrides
-                // (e.g., tiles in a mixed FBX). Skip parts in ANY LOD group.
-                if (Materials != null && Materials.Count > 0)
+                // Draw truly non-LOD parts (precomputed, zero alloc)
+                if (Mesh.NonLodPartIndices != null)
                 {
-                    var allLodParts = new HashSet<int>();
-                    foreach (var lodLevel in Mesh.LODs)
-                        if (lodLevel.MeshPartIndices != null)
-                            foreach (var idx in lodLevel.MeshPartIndices)
-                                allLodParts.Add(idx);
-
-                    for (int i = 0; i < Mesh.MeshParts.Count; i++)
+                    for (int i = 0; i < Mesh.NonLodPartIndices.Length; i++)
                     {
-                        if (allLodParts.Contains(i)) continue;
-                        var mat = GetMaterial(Mesh.MeshParts[i].MaterialSlot);
+                        int partIdx = Mesh.NonLodPartIndices[i];
+                        var mat = GetMaterial(Mesh.MeshParts[partIdx].MaterialSlot);
                         if (mat != null)
-                            CommandBuffer.Enqueue(Mesh, i, mat, Params, slot);
+                            CommandBuffer.Enqueue(Mesh, partIdx, mat, Params, slot);
                     }
                 }
             }

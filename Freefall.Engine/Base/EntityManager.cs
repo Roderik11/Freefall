@@ -29,6 +29,18 @@ namespace Freefall.Base
         }
 
         /// <summary>
+        /// O(1) entity lookup by Id.
+        /// </summary>
+        public static Entity GetEntity(int id)
+        {
+            lock (_lock)
+            {
+                _entities.TryGetValue(id, out var entity);
+                return entity;
+            }
+        }
+
+        /// <summary>
         /// Remove all entities except those flagged DontDestroyOnLoad.
         /// Call before loading a new scene.
         /// </summary>

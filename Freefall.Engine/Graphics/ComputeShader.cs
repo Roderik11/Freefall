@@ -19,7 +19,7 @@ namespace Freefall.Graphics
         private bool _disposed;
         private bool _compiled;
 
-        private const int MaxPushConstants = 32;
+        private const int MaxPushConstants = 40;
 
         // Per-kernel data
         private struct Kernel

@@ -29,6 +29,9 @@ namespace Freefall.Assets
         private int _kernelImportChannel;
         private int _kernelPackChannels;
         private int _kernelBrushRaycast;
+        private int _kernelNoiseLayer;
+        private int _kernelErosionInit;
+        private int _kernelErosionStep;
 
         // GPU resources for the baked heightmap
         private ID3D12Resource _heightTexture;
@@ -46,6 +49,19 @@ namespace Freefall.Assets
 
         // GPU raycast result buffer — written by CS_BrushRaycast, read by CS_PaintBrush
         private GraphicsBuffer _raycastResultBuffer;
+
+        // Shared erosion auxiliary textures (reused across all ErosionHeightLayers)
+        private ID3D12Resource _erosionHeightTex;  // R32_Float working height
+        private uint _erosionHeightUAV, _erosionHeightSRV;
+        private ID3D12Resource _erosionWaterTex;    // R32_Float water map
+        private uint _erosionWaterUAV;
+        private ID3D12Resource _erosionSedimentTex; // R32_Float sediment map
+        private uint _erosionSedimentUAV;
+        private int _erosionTexResolution;
+
+        // Pre-baked tileable noise LUT (256x256, RGBA8, 2 independent noise channels)
+        private ID3D12Resource _noiseLUTTex;
+        private uint _noiseLUTSRV;
 
         private bool _initialized;
 
@@ -76,6 +92,9 @@ namespace Freefall.Assets
             _kernelImportChannel = _cs.FindKernel("CS_ImportChannel");
             _kernelPackChannels = _cs.FindKernel("CS_PackChannels");
             _kernelBrushRaycast = _cs.FindKernel("CS_BrushRaycast");
+            _kernelNoiseLayer = _cs.FindKernel("CS_NoiseLayer");
+            _kernelErosionInit = _cs.FindKernel("CS_ErosionInit");
+            _kernelErosionStep = _cs.FindKernel("CS_ErosionStep");
             _initialized = true;
         }
 
@@ -109,6 +128,10 @@ namespace Freefall.Assets
                     DispatchImport(cmd, import, groups);
                 else if (layer is PaintHeightLayer paint)
                     DispatchPaint(cmd, paint, res, groups);
+                else if (layer is NoiseHeightLayer noise)
+                    DispatchNoise(cmd, noise, groups);
+                else if (layer is ErosionHeightLayer erosion)
+                    DispatchErosion(cmd, erosion, res, groups);
             }
 
             // Phase 3: Stamp groups (after layers)
@@ -186,6 +209,341 @@ namespace Freefall.Assets
             cmd.ResourceBarrierUnorderedAccessView(_heightTexture);
         }
 
+        private void DispatchNoise(ID3D12GraphicsCommandList cmd, NoiseHeightLayer layer, uint groups)
+        {
+            EnsureNoiseLUT();
+
+            _cs.SetPushConstant(_kernelNoiseLayer, "Output", _heightUAV);
+            _cs.SetPushConstant(_kernelNoiseLayer, "BlendMode", (uint)layer.BlendMode);
+            _cs.SetParam(_kernelNoiseLayer, "Opacity", layer.Opacity);
+            _cs.SetPushConstant(_kernelNoiseLayer, "NoiseType", (uint)layer.Type);
+            _cs.SetPushConstant(_kernelNoiseLayer, "Octaves", (uint)layer.Octaves);
+            _cs.SetParam(_kernelNoiseLayer, "Frequency", layer.Frequency);
+            _cs.SetParam(_kernelNoiseLayer, "Amplitude", layer.Amplitude);
+            _cs.SetParam(_kernelNoiseLayer, "Lacunarity", layer.Lacunarity);
+            _cs.SetParam(_kernelNoiseLayer, "Persistence", layer.Persistence);
+            _cs.SetParam(_kernelNoiseLayer, "OffsetX", layer.Offset.X);
+            _cs.SetParam(_kernelNoiseLayer, "OffsetY", layer.Offset.Y);
+            _cs.SetPushConstant(_kernelNoiseLayer, "NoiseSeed", (uint)layer.Seed);
+            // Bind noise LUT SRV via the ErosionMode slot (aliased as NoiseLUTIdx in shader)
+            _cs.SetPushConstant(_kernelNoiseLayer, "ErosionMode", _noiseLUTSRV);
+            // Terrace params
+            _cs.SetPushConstant(_kernelNoiseLayer, "TerraceSteps", (uint)layer.TerraceSteps);
+            _cs.SetParam(_kernelNoiseLayer, "TerraceSmoothness", layer.TerraceSmoothness);
+            // Spatial mask params
+            _cs.SetParam(_kernelNoiseLayer, "MaskCenterX", layer.MaskCenter.X);
+            _cs.SetParam(_kernelNoiseLayer, "MaskCenterY", layer.MaskCenter.Y);
+            _cs.SetParam(_kernelNoiseLayer, "MaskRadius", layer.MaskRadius);
+            _cs.SetParam(_kernelNoiseLayer, "MaskFalloff", layer.MaskFalloff);
+            _cs.Dispatch(_kernelNoiseLayer, cmd, groups, groups);
+            cmd.ResourceBarrierUnorderedAccessView(_heightTexture);
+        }
+
+        private void DispatchErosion(ID3D12GraphicsCommandList cmd, ErosionHeightLayer layer, int resolution, uint groups)
+        {
+            EnsureErosionTextures(resolution);
+
+            // Phase 1: Init — copy current baked height into working buffer, clear water/sediment
+            _cs.SetPushConstant(_kernelErosionInit, "Source", _heightSRV);
+            _cs.SetPushConstant(_kernelErosionInit, "Output", _erosionHeightUAV);
+            _cs.SetPushConstant(_kernelErosionInit, "StampBuf", _erosionWaterUAV);     // WaterIdx
+            _cs.SetPushConstant(_kernelErosionInit, "StampCount", _erosionSedimentUAV); // SedimentIdx
+            _cs.Dispatch(_kernelErosionInit, cmd, groups, groups);
+            cmd.ResourceBarrierUnorderedAccessView(_erosionHeightTex);
+            cmd.ResourceBarrierUnorderedAccessView(_erosionWaterTex);
+            cmd.ResourceBarrierUnorderedAccessView(_erosionSedimentTex);
+
+            // Phase 2: Iterative erosion steps
+            _cs.SetPushConstant(_kernelErosionStep, "Output", _erosionHeightUAV);
+            _cs.SetPushConstant(_kernelErosionStep, "StampBuf", _erosionWaterUAV);
+            _cs.SetPushConstant(_kernelErosionStep, "StampCount", _erosionSedimentUAV);
+            _cs.SetPushConstant(_kernelErosionStep, "ErosionMode", (uint)layer.Mode);
+            _cs.SetPushConstant(_kernelErosionStep, "NoiseSeed", (uint)layer.Seed);
+
+            // Erosion params (aliased onto noise float slots)
+            _cs.SetParam(_kernelErosionStep, "Frequency", layer.RainRate);           // RainRate
+            _cs.SetParam(_kernelErosionStep, "Amplitude", layer.SedimentCapacity);   // SedimentCap
+            _cs.SetParam(_kernelErosionStep, "Lacunarity", layer.DepositionRate);    // DepositRate
+            _cs.SetParam(_kernelErosionStep, "Persistence", layer.DissolutionRate);  // DissolveRate
+            _cs.SetParam(_kernelErosionStep, "OffsetX", layer.Evaporation);          // Evaporation
+            _cs.SetParam(_kernelErosionStep, "OffsetY", layer.TalusAngle);           // TalusAngleDeg
+            _cs.SetParam(_kernelErosionStep, "BrushRadius", layer.ThermalRate);      // ThermalRate
+
+            for (int i = 0; i < layer.Iterations; i++)
+            {
+                _cs.Dispatch(_kernelErosionStep, cmd, groups, groups);
+                cmd.ResourceBarrierUnorderedAccessView(_erosionHeightTex);
+                cmd.ResourceBarrierUnorderedAccessView(_erosionWaterTex);
+                cmd.ResourceBarrierUnorderedAccessView(_erosionSedimentTex);
+            }
+
+            // Phase 3: Blend eroded result back into main heightmap
+            // Re-use CS_ImportLayer to composite erosionHeight → _heightTexture
+            _cs.SetPushConstant(_kernelImport, "Source", _erosionHeightSRV);
+            _cs.SetPushConstant(_kernelImport, "Output", _heightUAV);
+            _cs.SetPushConstant(_kernelImport, "BlendMode", (uint)layer.BlendMode);
+            _cs.SetParam(_kernelImport, "Opacity", layer.Opacity);
+            _cs.Dispatch(_kernelImport, cmd, groups, groups);
+            cmd.ResourceBarrierUnorderedAccessView(_heightTexture);
+        }
+
+        private void EnsureErosionTextures(int resolution)
+        {
+            if (_erosionHeightTex != null && _erosionTexResolution == resolution)
+                return;
+
+            // Release old
+            _erosionHeightTex?.Release();
+            _erosionWaterTex?.Release();
+            _erosionSedimentTex?.Release();
+
+            var device = Engine.Device;
+            _erosionTexResolution = resolution;
+
+            // Working height (R32_Float for full precision during simulation)
+            _erosionHeightTex = device.CreateTexture2D(
+                Format.R32_Float, resolution, resolution, 1, 1,
+                ResourceFlags.AllowUnorderedAccess, ResourceStates.Common);
+
+            _erosionHeightUAV = device.AllocateBindlessIndex();
+            device.NativeDevice.CreateUnorderedAccessView(_erosionHeightTex, null,
+                new UnorderedAccessViewDescription
+                {
+                    Format = Format.R32_Float,
+                    ViewDimension = UnorderedAccessViewDimension.Texture2D,
+                    Texture2D = new Texture2DUnorderedAccessView { MipSlice = 0 }
+                }, device.GetCpuHandle(_erosionHeightUAV));
+
+            _erosionHeightSRV = device.AllocateBindlessIndex();
+            device.NativeDevice.CreateShaderResourceView(_erosionHeightTex,
+                new ShaderResourceViewDescription
+                {
+                    Format = Format.R32_Float,
+                    ViewDimension = ShaderResourceViewDimension.Texture2D,
+                    Shader4ComponentMapping = ShaderComponentMapping.Default,
+                    Texture2D = new Texture2DShaderResourceView { MostDetailedMip = 0, MipLevels = 1 }
+                }, device.GetCpuHandle(_erosionHeightSRV));
+
+            // Water map
+            _erosionWaterTex = device.CreateTexture2D(
+                Format.R32_Float, resolution, resolution, 1, 1,
+                ResourceFlags.AllowUnorderedAccess, ResourceStates.Common);
+
+            _erosionWaterUAV = device.AllocateBindlessIndex();
+            device.NativeDevice.CreateUnorderedAccessView(_erosionWaterTex, null,
+                new UnorderedAccessViewDescription
+                {
+                    Format = Format.R32_Float,
+                    ViewDimension = UnorderedAccessViewDimension.Texture2D,
+                    Texture2D = new Texture2DUnorderedAccessView { MipSlice = 0 }
+                }, device.GetCpuHandle(_erosionWaterUAV));
+
+            // Sediment map
+            _erosionSedimentTex = device.CreateTexture2D(
+                Format.R32_Float, resolution, resolution, 1, 1,
+                ResourceFlags.AllowUnorderedAccess, ResourceStates.Common);
+
+            _erosionSedimentUAV = device.AllocateBindlessIndex();
+            device.NativeDevice.CreateUnorderedAccessView(_erosionSedimentTex, null,
+                new UnorderedAccessViewDescription
+                {
+                    Format = Format.R32_Float,
+                    ViewDimension = UnorderedAccessViewDimension.Texture2D,
+                    Texture2D = new Texture2DUnorderedAccessView { MipSlice = 0 }
+                }, device.GetCpuHandle(_erosionSedimentUAV));
+        }
+
+        // ── Noise LUT generation ──────────────────────────────────────────
+
+        private const int NoiseLUTSize = 256;
+        // Noise tiling period in cells — small for many texels per cell (smooth interpolation).
+        // Per-octave UV rotation in the shader breaks visible tiling.
+        private const int NoiseLUTPeriod = 16;
+
+        private void EnsureNoiseLUT()
+        {
+            if (_noiseLUTTex != null) return;
+
+            var device = Engine.Device;
+
+            // Generate CPU-side tileable Perlin noise as R16G16_Float (2 independent channels)
+            var pixels = new Half[NoiseLUTSize * NoiseLUTSize * 2]; // RG16F = 2 halfs per texel
+            GenerateTileableNoise(pixels, NoiseLUTSize, NoiseLUTPeriod, seed1: 0, seed2: 137);
+
+            // Create GPU texture (R16G16_Float — 4 bytes per texel)
+            _noiseLUTTex = device.CreateTexture2D(
+                Format.R16G16_Float, NoiseLUTSize, NoiseLUTSize, 1, 1,
+                ResourceFlags.None, ResourceStates.Common);
+
+            // Create SRV
+            _noiseLUTSRV = device.AllocateBindlessIndex();
+            device.NativeDevice.CreateShaderResourceView(_noiseLUTTex,
+                new ShaderResourceViewDescription
+                {
+                    Format = Format.R16G16_Float,
+                    ViewDimension = ShaderResourceViewDimension.Texture2D,
+                    Shader4ComponentMapping = ShaderComponentMapping.Default,
+                    Texture2D = new Texture2DShaderResourceView { MostDetailedMip = 0, MipLevels = 1 }
+                }, device.GetCpuHandle(_noiseLUTSRV));
+
+            // Upload pixel data (R16G16_Float = 4 bytes per texel)
+            int bytesPerPixel = 4;
+            int rowPitch = (NoiseLUTSize * bytesPerPixel + 255) & ~255; // 256-byte aligned
+            int totalBytes = rowPitch * NoiseLUTSize;
+
+            var uploadResource = device.NativeDevice.CreateCommittedResource(
+                new HeapProperties(HeapType.Upload),
+                HeapFlags.None,
+                ResourceDescription.Buffer((ulong)totalBytes),
+                ResourceStates.GenericRead,
+                null);
+
+            var allocator = device.NativeDevice.CreateCommandAllocator(CommandListType.Direct);
+            var cmdList = device.NativeDevice.CreateCommandList<ID3D12GraphicsCommandList>(
+                0, CommandListType.Direct, allocator, null);
+
+            try
+            {
+                unsafe
+                {
+                    void* pData;
+                    uploadResource.Map(0, null, &pData);
+                    int srcRowBytes = NoiseLUTSize * bytesPerPixel;
+                    var dstPtr = (byte*)pData;
+                    fixed (Half* srcBase = pixels)
+                    {
+                        var srcBytePtr = (byte*)srcBase;
+                        for (int y = 0; y < NoiseLUTSize; y++)
+                            Buffer.MemoryCopy(srcBytePtr + y * srcRowBytes,
+                                dstPtr + y * rowPitch, srcRowBytes, srcRowBytes);
+                    }
+                    uploadResource.Unmap(0);
+                }
+
+                cmdList.ResourceBarrierTransition(_noiseLUTTex,
+                    ResourceStates.Common, ResourceStates.CopyDest);
+
+                var src = new TextureCopyLocation(uploadResource, new PlacedSubresourceFootPrint
+                {
+                    Offset = 0,
+                    Footprint = new SubresourceFootPrint(Format.R16G16_Float,
+                        (uint)NoiseLUTSize, (uint)NoiseLUTSize, 1, (uint)rowPitch)
+                });
+                var dst = new TextureCopyLocation(_noiseLUTTex, 0);
+                cmdList.CopyTextureRegion(dst, 0, 0, 0, src);
+
+                cmdList.ResourceBarrierTransition(_noiseLUTTex,
+                    ResourceStates.CopyDest, ResourceStates.Common);
+
+                cmdList.Close();
+                device.SubmitAndWait(cmdList);
+
+                Debug.Log($"[TerrainBaker] Noise LUT uploaded: {NoiseLUTSize}x{NoiseLUTSize} R16G16_Float (period={NoiseLUTPeriod})");
+            }
+            finally
+            {
+                cmdList.Dispose();
+                allocator.Dispose();
+                uploadResource.Dispose();
+            }
+        }
+
+        /// <summary>
+        /// Generates tileable 2D Perlin noise into a Half[] buffer (R16G16 layout).
+        /// Channel R = noise with seed1, channel G = noise with seed2.
+        /// </summary>
+        private static void GenerateTileableNoise(Half[] pixels, int size, int period, int seed1, int seed2)
+        {
+            var perm1 = BuildPermutation(seed1);
+            var perm2 = BuildPermutation(seed2);
+
+            // 12 gradient directions (classic Perlin)
+            ReadOnlySpan<(float, float)> grads = stackalloc (float, float)[]
+            {
+                ( 1, 0), (-1, 0), ( 0, 1), ( 0,-1),
+                ( 1, 1), (-1, 1), ( 1,-1), (-1,-1),
+                ( 0.7071f, 0.7071f), (-0.7071f, 0.7071f),
+                ( 0.7071f,-0.7071f), (-0.7071f,-0.7071f),
+            };
+
+            for (int y = 0; y < size; y++)
+            {
+                for (int x = 0; x < size; x++)
+                {
+                    float fx = (float)x / size;
+                    float fy = (float)y / size;
+
+                    float n1 = TileablePerlin(fx, fy, period, perm1, grads);
+                    float n2 = TileablePerlin(fx, fy, period, perm2, grads);
+
+                    int idx = (y * size + x) * 2; // 2 half-floats per texel
+                    pixels[idx + 0] = (Half)n1;
+                    pixels[idx + 1] = (Half)n2;
+                }
+            }
+        }
+
+        private static int[] BuildPermutation(int seed)
+        {
+            var rng = new Random(seed);
+            var p = new int[512];
+            var base256 = new int[256];
+            for (int i = 0; i < 256; i++) base256[i] = i;
+            // Fisher-Yates shuffle
+            for (int i = 255; i > 0; i--)
+            {
+                int j = rng.Next(i + 1);
+                (base256[i], base256[j]) = (base256[j], base256[i]);
+            }
+            for (int i = 0; i < 512; i++) p[i] = base256[i & 255];
+            return p;
+        }
+
+        /// <summary>
+        /// Tileable Perlin noise: wraps integer coordinates modulo <paramref name="period"/>.
+        /// Input (fx,fy) should be in [0,1), scaled by period internally.
+        /// </summary>
+        private static float TileablePerlin(float fx, float fy, int period,
+            int[] perm, ReadOnlySpan<(float, float)> grads)
+        {
+            // Scale to noise-space grid [0, period)
+            float px = fx * period;
+            float py = fy * period;
+
+            int ix = (int)MathF.Floor(px);
+            int iy = (int)MathF.Floor(py);
+            float dx = px - ix;
+            float dy = py - iy;
+
+            // Wrap for tiling
+            int ix0 = ix % period;
+            int iy0 = iy % period;
+            int ix1 = (ix + 1) % period;
+            int iy1 = (iy + 1) % period;
+
+            // Gradient indices via permutation table
+            int gi00 = perm[perm[ix0] + iy0] % 12;
+            int gi10 = perm[perm[ix1] + iy0] % 12;
+            int gi01 = perm[perm[ix0] + iy1] % 12;
+            int gi11 = perm[perm[ix1] + iy1] % 12;
+
+            // Dot products
+            float n00 = grads[gi00].Item1 * dx       + grads[gi00].Item2 * dy;
+            float n10 = grads[gi10].Item1 * (dx - 1) + grads[gi10].Item2 * dy;
+            float n01 = grads[gi01].Item1 * dx        + grads[gi01].Item2 * (dy - 1);
+            float n11 = grads[gi11].Item1 * (dx - 1) + grads[gi11].Item2 * (dy - 1);
+
+            // Quintic interpolation (C2 continuous)
+            float u = dx * dx * dx * (dx * (dx * 6f - 15f) + 10f);
+            float v = dy * dy * dy * (dy * (dy * 6f - 15f) + 10f);
+
+            float nx0 = n00 + u * (n10 - n00);
+            float nx1 = n01 + u * (n11 - n01);
+            float result = nx0 + v * (nx1 - nx0);
+
+            return result * 0.5f + 0.5f; // map [-1,1] → [0,1]
+        }
+
         private void EnsureStampBuffer(int requiredCount)
         {
             if (_stampBuffer != null && _stampBufferCapacity >= requiredCount) return;
@@ -242,6 +600,8 @@ namespace Freefall.Assets
             public uint UAV, SRV;
             public int Resolution;
             public bool NeedsInitialClear;
+            /// <summary>Cached Texture wrapper — avoids WrapNative allocation per call.</summary>
+            public Texture Wrapper;
         }
 
         private readonly Dictionary<(ControlMapTarget, int), ControlMapGPU> _controlMaps = new();
@@ -308,6 +668,7 @@ namespace Freefall.Assets
             _cs.SetParam(_kernelPaintBrush, "BrushRadius", uvRadius);
             _cs.SetParam(_kernelPaintBrush, "BrushFalloff", falloff);
             _cs.SetParam(_kernelPaintBrush, "BrushTargetHeight", normalizedTarget);
+            _cs.SetPushConstant(_kernelPaintBrush, "FlipV", target != ControlMapTarget.Height ? 1u : 0u);
 
             _cs.Dispatch(_kernelPaintBrush, cmd, groups, groups);
             cmd.ResourceBarrierUnorderedAccessView(gpu.Texture);
@@ -327,9 +688,9 @@ namespace Freefall.Assets
                                          float targetHeight = 0)
         {
             EnsureInitialized();
-            Debug.Log($"[BrushRaycast] heightSRV={_heightSRV}, ray={rayOrigin}/{rayDir}, " +
-                      $"terrainOrig={terrainOrigin}, size={terrainSize}, maxH={maxHeight}, " +
-                      $"mode={mode}, str={strength}, rad={radius}");
+            //Debug.Log($"[BrushRaycast] heightSRV={_heightSRV}, ray={rayOrigin}/{rayDir}, " +
+            //          $"terrainOrig={terrainOrigin}, size={terrainSize}, maxH={maxHeight}, " +
+            //          $"mode={mode}, str={strength}, rad={radius}");
             int res = terrain.HeightmapResolution;
             var key = (target, layerIndex);
             var gpu = EnsureControlMap(key, res, setControlMap);
@@ -385,6 +746,7 @@ namespace Freefall.Assets
             _cs.SetParam(_kernelPaintBrush, "BrushRadius", uvRadius);
             _cs.SetParam(_kernelPaintBrush, "BrushFalloff", falloff);
             _cs.SetParam(_kernelPaintBrush, "BrushTargetHeight", normalizedTarget);
+            _cs.SetPushConstant(_kernelPaintBrush, "FlipV", target != ControlMapTarget.Height ? 1u : 0u);
 
             _cs.Dispatch(_kernelPaintBrush, cmd, groups, groups);
             cmd.ResourceBarrierUnorderedAccessView(gpu.Texture);
@@ -449,7 +811,8 @@ namespace Freefall.Assets
         {
             if (_controlMaps.TryGetValue(key, out var existing) && existing.Resolution == resolution)
             {
-                setControlMap?.Invoke(Texture.WrapNative(existing.Texture, existing.SRV));
+                // Reuse cached wrapper — no allocation
+                setControlMap?.Invoke(existing.Wrapper);
                 return existing;
             }
 
@@ -491,8 +854,10 @@ namespace Freefall.Assets
                     Texture2D = new Texture2DShaderResourceView { MostDetailedMip = 0, MipLevels = 1 }
                 }, device.GetCpuHandle(gpu.SRV));
 
+            // Create and cache the wrapper once
+            gpu.Wrapper = Texture.WrapNative(gpu.Texture, gpu.SRV);
             _controlMaps[key] = gpu;
-            setControlMap?.Invoke(Texture.WrapNative(gpu.Texture, gpu.SRV));
+            setControlMap?.Invoke(gpu.Wrapper);
 
             return gpu;
         }
@@ -946,14 +1311,13 @@ namespace Freefall.Assets
         private GraphicsBuffer _packIndexBuffer;
 
         /// <summary>
-        /// Packs per-layer R16 ControlMaps into ceil(N/4) RGBA slices for the shader.
-        /// layers: SRV bindless indices of the R16 ControlMaps (0 = no data for that layer).
-        /// Returns a list of packed RGBA textures suitable for Texture.CreateTexture2DArray.
+        /// Packs per-layer R16 ControlMaps directly into caller-owned Texture2DArray slices.
+        /// sliceUAVs: per-slice UAV bindless indices (created by caller for each array slice).
+        /// Stateless: no GPU resources are created or cached here.
         /// </summary>
-        public List<Texture> PackControlMaps(ID3D12GraphicsCommandList cmd, uint[] layerSrvIndices, int resolution)
+        public void PackControlMaps(ID3D12GraphicsCommandList cmd, uint[] layerSrvIndices, uint[] sliceUAVs, int resolution)
         {
-            if (layerSrvIndices == null || layerSrvIndices.Length == 0)
-                return new List<Texture>();
+            if (layerSrvIndices == null || layerSrvIndices.Length == 0 || sliceUAVs == null) return;
 
             EnsureInitialized();
             var device = Engine.Device;
@@ -971,34 +1335,8 @@ namespace Freefall.Assets
                 _packIndexBuffer = GraphicsBuffer.CreateUpload<uint>(4, mapped: true);
             }
 
-            var result = new List<Texture>(sliceCount);
-
-            for (int slice = 0; slice < sliceCount; slice++)
+            for (int slice = 0; slice < sliceCount && slice < sliceUAVs.Length; slice++)
             {
-                // Create RGBA texture for this slice
-                var rgbaTexture = device.CreateTexture2D(
-                    Format.R8G8B8A8_UNorm, resolution, resolution, 1, 1,
-                    ResourceFlags.AllowUnorderedAccess, ResourceStates.Common);
-
-                uint uav = device.AllocateBindlessIndex();
-                device.NativeDevice.CreateUnorderedAccessView(rgbaTexture, null,
-                    new UnorderedAccessViewDescription
-                    {
-                        Format = Format.R8G8B8A8_UNorm,
-                        ViewDimension = UnorderedAccessViewDimension.Texture2D,
-                        Texture2D = new Texture2DUnorderedAccessView { MipSlice = 0 }
-                    }, device.GetCpuHandle(uav));
-
-                uint srv = device.AllocateBindlessIndex();
-                device.NativeDevice.CreateShaderResourceView(rgbaTexture,
-                    new ShaderResourceViewDescription
-                    {
-                        Format = Format.R8G8B8A8_UNorm,
-                        ViewDimension = ShaderResourceViewDimension.Texture2D,
-                        Shader4ComponentMapping = ShaderComponentMapping.Default,
-                        Texture2D = new Texture2DShaderResourceView { MostDetailedMip = 0, MipLevels = 1 }
-                    }, device.GetCpuHandle(srv));
-
                 // Upload source indices for this slice
                 int channelCount = Math.Min(4, layerCount - slice * 4);
                 unsafe
@@ -1011,16 +1349,11 @@ namespace Freefall.Assets
                     }
                 }
 
-                _cs.SetPushConstant(_kernelPackChannels, "Output", uav);
+                _cs.SetPushConstant(_kernelPackChannels, "Output", sliceUAVs[slice]);
                 _cs.SetBuffer(_kernelPackChannels, "StampBuf", _packIndexBuffer);
                 _cs.SetPushConstant(_kernelPackChannels, "BlendMode", (uint)channelCount);
                 _cs.Dispatch(_kernelPackChannels, cmd, groups, groups);
-                cmd.ResourceBarrierUnorderedAccessView(rgbaTexture);
-
-                result.Add(Texture.WrapNative(rgbaTexture, srv));
             }
-
-            return result;
         }
 
         public void Dispose()
@@ -1032,6 +1365,9 @@ namespace Freefall.Assets
             _stampBuffer?.Dispose();
             _strokeBuffer?.Dispose();
             _packIndexBuffer?.Dispose();
+            _erosionHeightTex?.Release();
+            _erosionWaterTex?.Release();
+            _erosionSedimentTex?.Release();
             _cs?.Dispose();
         }
     }

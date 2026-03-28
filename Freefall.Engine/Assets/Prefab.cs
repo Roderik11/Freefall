@@ -1,7 +1,10 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Text;
 using Freefall.Base;
+using Freefall.Components;
+using Freefall.Reflection;
 using Freefall.Serialization;
 
 namespace Freefall.Assets
@@ -17,7 +20,7 @@ namespace Freefall.Assets
         /// Raw YAML source for the prefab. Stored so we can re-parse 
         /// on each Instantiate() call to get fresh instances with new UIDs.
         /// </summary>
-        internal byte[] SourceYaml { get; set; }
+        public byte[] SourceYaml { get; set; }
 
         /// <summary>
         /// Name of the root entity in this prefab (for display/debugging).
@@ -46,8 +49,8 @@ namespace Freefall.Assets
             //   - Deserializes entities (Entity constructor auto-generates fresh UIDs + registers)
             //   - Resolves UID cross-references within the prefab
             //   - Resolves asset references via LoadByGuid
-            var loader = new SceneLoader();
-            var entities = loader.LoadFromBytes(SourceYaml);
+            var serializer = new EntitySerializer();
+            var entities = serializer.LoadFromBytes(SourceYaml);
 
             if (entities.Count == 0)
             {
@@ -72,17 +75,8 @@ namespace Freefall.Assets
             if (entities == null || entities.Count == 0)
                 return null;
 
-            var serializer = new YAMLSerializer();
-            var emitter = serializer.Begin();
-
-            foreach (var entity in entities)
-            {
-                serializer.Serialize(entity, ref emitter);
-                foreach (var component in entity.Components)
-                    serializer.Serialize(component, ref emitter);
-            }
-
-            var yaml = serializer.ToString(in emitter);
+            var serializer = new EntitySerializer();
+            var yaml = serializer.SaveToString(entities);
 
             var prefab = new Prefab
             {
@@ -114,8 +108,8 @@ namespace Freefall.Assets
         {
             if (SourceYaml == null || SourceYaml.Length == 0) return;
 
-            var loader = new SceneLoader();
-            var prefabEntities = loader.LoadFromBytes(SourceYaml);
+            var serializer = new EntitySerializer();
+            var prefabEntities = serializer.LoadFromBytes(SourceYaml, skipPrefabHydration: true);
 
             if (prefabEntities.Count == 0) return;
 
@@ -123,7 +117,7 @@ namespace Freefall.Assets
             var root = prefabEntities[0];
             foreach (var component in root.Components)
             {
-                if (component is Components.Transform) continue;
+                if (component is Transform) continue;
                 target.AddComponent(component);
             }
 
@@ -143,6 +137,155 @@ namespace Freefall.Assets
 
             // Only remove the temporary root entity (children stay alive and registered)
             EntityManager.RemoveEntity(root);
+        }
+
+        /// <summary>
+        /// Capture an instance's current state back into this prefab's source YAML,
+        /// then propagate the changes to all other instances.
+        /// Flow: instance → prefab asset → all other instances.
+        /// Transform is reset to identity in the saved prefab.
+        /// Returns the number of other instances updated.
+        /// </summary>
+        public int UpdateFromInstance(Entity source)
+        {
+            // Temporarily zero out transform for serialization
+            var savedPos = source.Transform.Position;
+            var savedRot = source.Transform.Rotation;
+            var savedScale = source.Transform.Scale;
+            var savedParent = source.Transform.Parent;
+
+            source.Transform.Position = System.Numerics.Vector3.Zero;
+            source.Transform.Rotation = System.Numerics.Quaternion.Identity;
+            source.Transform.Scale = System.Numerics.Vector3.One;
+            source.Transform.Parent = null;
+
+            // Serialize to YAML
+            var serializer = new EntitySerializer();
+            var yaml = serializer.SaveToString(new List<Entity> { source });
+
+            // Restore transform
+            source.Transform.Position = savedPos;
+            source.Transform.Rotation = savedRot;
+            source.Transform.Scale = savedScale;
+            source.Transform.Parent = savedParent;
+
+            // Update the prefab asset
+            SourceYaml = Encoding.UTF8.GetBytes(yaml);
+            RootEntityName = source.Name;
+            MarkDirty();
+
+            Debug.Log($"[Prefab] Updated prefab '{Name}' from instance '{source.Name}'");
+
+            // Propagate to all other instances
+            return UpdateAllInstances();
+        }
+
+        /// <summary>
+        /// Delta-update a single live entity from prefab source.
+        /// Uses a pre-deserialized template to avoid redundant YAML parsing.
+        /// Matches components by type: copies fields for existing, adds new, removes orphaned.
+        /// Preserves Transform (position, rotation, scale).
+        /// </summary>
+        public void UpdateInstance(Entity target, Entity template)
+        {
+            // Build type → component map from template (skip Transform)
+            var templateComponents = new Dictionary<Type, Component>();
+            foreach (var comp in template.Components)
+            {
+                if (comp is Transform) continue;
+                templateComponents[comp.GetType()] = comp;
+            }
+
+            // Walk target's non-Transform components
+            var toRemove = new List<Component>();
+            var matchedTypes = new HashSet<Type>();
+
+            foreach (var comp in target.Components)
+            {
+                if (comp is Transform) continue;
+                var type = comp.GetType();
+
+                if (templateComponents.TryGetValue(type, out var templateComp))
+                {
+                    // Type exists in both — delta copy fields
+                    CopyFields(templateComp, comp);
+                    matchedTypes.Add(type);
+                }
+                else
+                {
+                    // Orphaned: exists in target but not in template
+                    toRemove.Add(comp);
+                }
+            }
+
+            // Remove orphaned components
+            foreach (var comp in toRemove)
+                target.RemoveComponent(comp);
+
+            // Add new components (in template but not in target)
+            foreach (var (type, templateComp) in templateComponents)
+            {
+                if (matchedTypes.Contains(type)) continue;
+                target.AddComponent(templateComp);
+            }
+
+            // Ensure prefab link
+            target.Prefab = this;
+        }
+
+        /// <summary>
+        /// Update all live instances of this prefab in the scene.
+        /// Deserializes YAML once and reuses the template for all instances.
+        /// Returns the number of entities updated.
+        /// </summary>
+        public int UpdateAllInstances()
+        {
+            if (SourceYaml == null || SourceYaml.Length == 0) return 0;
+
+            // Deserialize once
+            var serializer = new EntitySerializer();
+            var templateEntities = serializer.LoadFromBytes(SourceYaml, skipPrefabHydration: true);
+            if (templateEntities.Count == 0) return 0;
+
+            var template = templateEntities[0];
+
+            // Find all instances
+            var instances = EntityManager.Entities
+                .Where(e => e.Prefab == this)
+                .ToList();
+
+            foreach (var instance in instances)
+                UpdateInstance(instance, template);
+
+            // Clean up temporary template entities
+            foreach (var te in templateEntities)
+                EntityManager.RemoveEntity(te);
+
+            Debug.Log($"[Prefab] Updated {instances.Count} instances of '{Name}'");
+            return instances.Count;
+        }
+
+        /// <summary>
+        /// Copy serializable fields from source component to target component (same type).
+        /// Uses Reflector.GetMapping for field discovery, skips DontSerialize/Ignored fields.
+        /// </summary>
+        private static void CopyFields(Component source, Component target)
+        {
+            var mapping = Reflector.GetMapping(source.GetType());
+
+            foreach (var field in mapping)
+            {
+                if (field.Ignored) continue;
+                if (!field.CanWrite) continue;
+                if (field.Name == "Entity") continue; // don't overwrite entity backref
+
+                try
+                {
+                    var value = field.GetValue(source);
+                    field.SetValue(target, value);
+                }
+                catch { /* skip fields that fail to copy */ }
+            }
         }
     }
 }

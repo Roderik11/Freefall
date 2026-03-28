@@ -197,6 +197,30 @@ namespace Freefall.Components
         }
 
         /// <summary>
+        /// Reconstruct world position from a viewport pixel and its linear view-space depth.
+        /// Uses the same zero-translation inverse VP pattern as the light pass.
+        /// </summary>
+        public Vector3 UnprojectPixel(int pixelX, int pixelY, float linearDepth, int vpWidth, int vpHeight)
+        {
+            // Pixel -> NDC (same as MouseRay)
+            float ndcX = (2f * pixelX / vpWidth) - 1f;
+            float ndcY = 1f - (2f * pixelY / vpHeight);
+
+            // Zero-translation camera-relative VP (matches FillLightBuffer pattern)
+            var cvp = Matrix4x4.CreateLookAtLeftHanded(Vector3.Zero, Forward, Up) * Projection;
+            Matrix4x4.Invert(cvp, out var cvpInv);
+
+            // Unproject NDC point at z=1 (reverse-Z near) to get camera-relative ray direction
+            var clipPoint = new Vector4(ndcX, ndcY, 1f, 1f);
+            var viewDir = Vector4.Transform(clipPoint, cvpInv);
+            var dir = new Vector3(viewDir.X, viewDir.Y, viewDir.Z) / viewDir.W;
+
+            // Scale by linear depth / length to get camera-relative position, then add camera world pos
+            float scale = linearDepth / dir.Length();
+            return Position + dir * scale;
+        }
+
+        /// <summary>
         /// Get frustum planes for GPU culling.
         /// Returns 6 planes as Vector4 (xyz=normal, w=distance).
         /// </summary>

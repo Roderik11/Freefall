@@ -45,12 +45,18 @@ namespace Freefall.Graphics
         private bool _isFirstFrame = true;
         private bool _compositeSnapshotFirstFrame = true;
         
-        // Readback staging for entity ID picking (1x1 pixel)
+        // Readback staging for picking (1x1 pixel each)
         private GraphicsBuffer? _entityIdReadback;
+        private GraphicsBuffer? _depthReadback;
+        private GraphicsBuffer? _normalReadback;
         private int _pickRequestX = -1;
         private int _pickRequestY = -1;
         private bool _pickResultReady;
         private bool _pickCopyPending;
+        
+        // Saved pick coordinates for world position reconstruction
+        private int _readbackPixelX;
+        private int _readbackPixelY;
         
         // Cached array to avoid per-frame allocation
         private CpuDescriptorHandle[]? _cachedGBufferRtvHandles;
@@ -107,9 +113,13 @@ namespace Freefall.Graphics
             DepthGBuffer = new RenderTexture2D(Engine.Device, width, height, Format.R32_Float);
             EntityIdBuffer = new RenderTexture2D(Engine.Device, width, height, Format.R32_UInt);
             
-            // 1x1 readback buffer for packed entity ID picking (1 x uint32: 24-bit entity + 8-bit meshpart)
+            // 1x1 readback buffers for picking
             _entityIdReadback?.Dispose();
             _entityIdReadback = GraphicsBuffer.CreateReadback<uint>(1);
+            _depthReadback?.Dispose();
+            _depthReadback = GraphicsBuffer.CreateReadback<float>(1);
+            _normalReadback?.Dispose();
+            _normalReadback = GraphicsBuffer.CreateReadback<ulong>(1); // 4 × int16 = 8 bytes
             _cachedGBufferRtvHandles = null; // force re-creation
             
             // Depth Texture
@@ -552,25 +562,45 @@ namespace Freefall.Graphics
              // Execute forward pass draws (ocean, gizmos, etc.)
              CommandBuffer.Execute(RenderPass.Forward, list, Engine.Device);
 
-             // Entity ID readback
-             if (_pickRequestX >= 0 && _entityIdReadback != null)
-             {
-                 Transition(list, EntityIdBuffer.Native, ResourceStates.RenderTarget, ResourceStates.CopySource);
-                 var src = new TextureCopyLocation(EntityIdBuffer.Native, 0);
-                 var dst = new TextureCopyLocation(_entityIdReadback.Native, new PlacedSubresourceFootPrint
-                 {
-                     Offset = 0,
-                     Footprint = new SubresourceFootPrint(Format.R32_UInt, 1, 1, 1, 256)
-                 });
-                 list.CopyTextureRegion(dst, 0, 0, 0, src, new Vortice.Mathematics.Box(_pickRequestX, _pickRequestY, 0, _pickRequestX + 1, _pickRequestY + 1, 1));
-                 Transition(list, EntityIdBuffer.Native, ResourceStates.CopySource, ResourceStates.PixelShaderResource);
-                 _pickCopyPending = true;
-                 _pickRequestX = -1;
-             }
-             else
-             {
-                 Transition(list, EntityIdBuffer.Native, ResourceStates.RenderTarget, ResourceStates.PixelShaderResource);
-             }
+             // Pick readback: entity ID + depth + normal
+              if (_pickRequestX >= 0 && _entityIdReadback != null)
+              {
+                  var pickBox = new Vortice.Mathematics.Box(_pickRequestX, _pickRequestY, 0, _pickRequestX + 1, _pickRequestY + 1, 1);
+
+                  // Entity ID (RenderTarget -> CopySource -> PixelShaderResource)
+                  Transition(list, EntityIdBuffer.Native, ResourceStates.RenderTarget, ResourceStates.CopySource);
+                  list.CopyTextureRegion(
+                      new TextureCopyLocation(_entityIdReadback.Native, new PlacedSubresourceFootPrint { Offset = 0, Footprint = new SubresourceFootPrint(Format.R32_UInt, 1, 1, 1, 256) }),
+                      0, 0, 0,
+                      new TextureCopyLocation(EntityIdBuffer.Native, 0), pickBox);
+                  Transition(list, EntityIdBuffer.Native, ResourceStates.CopySource, ResourceStates.PixelShaderResource);
+
+                  // Depth (PixelShaderResource -> CopySource -> PixelShaderResource)
+                  Transition(list, DepthGBuffer.Native, ResourceStates.PixelShaderResource, ResourceStates.CopySource);
+                  list.CopyTextureRegion(
+                      new TextureCopyLocation(_depthReadback!.Native, new PlacedSubresourceFootPrint { Offset = 0, Footprint = new SubresourceFootPrint(Format.R32_Float, 1, 1, 1, 256) }),
+                      0, 0, 0,
+                      new TextureCopyLocation(DepthGBuffer.Native, 0), pickBox);
+                  Transition(list, DepthGBuffer.Native, ResourceStates.CopySource, ResourceStates.PixelShaderResource);
+
+                  // Normal (PixelShaderResource -> CopySource -> PixelShaderResource)
+                  Transition(list, Normals.Native, ResourceStates.PixelShaderResource, ResourceStates.CopySource);
+                  list.CopyTextureRegion(
+                      new TextureCopyLocation(_normalReadback!.Native, new PlacedSubresourceFootPrint { Offset = 0, Footprint = new SubresourceFootPrint(Format.R16G16B16A16_SNorm, 1, 1, 1, 256) }),
+                      0, 0, 0,
+                      new TextureCopyLocation(Normals.Native, 0), pickBox);
+                  Transition(list, Normals.Native, ResourceStates.CopySource, ResourceStates.PixelShaderResource);
+
+                  _readbackPixelX = _pickRequestX;
+                  _readbackPixelY = _pickRequestY;
+                  _pickCopyPending = true;
+                  _pickRequestX = -1;
+              }
+              else
+              {
+                  Transition(list, EntityIdBuffer.Native, ResourceStates.RenderTarget, ResourceStates.PixelShaderResource);
+              }
+
 
              // Transition Composite to PixelShaderResource for Blit
              Transition(list, Composite.Native, ResourceStates.RenderTarget, ResourceStates.PixelShaderResource);
@@ -624,6 +654,21 @@ namespace Freefall.Graphics
         }
 
         /// <summary>
+        /// Promote a pending pick copy to a ready result.
+        /// Call from OnUpdate before checking HasPickResult to eliminate the
+        /// 1-frame delay caused by promote normally running at render start.
+        /// Safe to call even if no copy is pending.
+        /// </summary>
+        public void TryPromotePickResult()
+        {
+            if (_pickCopyPending)
+            {
+                _pickResultReady = true;
+                _pickCopyPending = false;
+            }
+        }
+
+        /// <summary>
         /// Whether a pick result is ready to read.
         /// </summary>
         public bool HasPickResult => _pickResultReady;
@@ -637,15 +682,45 @@ namespace Freefall.Graphics
         {
             if (!_pickResultReady || _entityIdReadback == null) return 0;
             _pickResultReady = false;
+
             uint packed = *_entityIdReadback.ReadPtr<uint>();
             PickedMeshPartId = packed & 0xFF;        // lower 8 bits = meshpart
+
+            // Read depth (linear view-space)
+            PickedDepth = _depthReadback != null ? *_depthReadback.ReadPtr<float>() : 0f;
+
+            // Read normal (SNorm16 × 4 → float)
+            if (_normalReadback != null)
+            {
+                short* nPtr = (short*)_normalReadback.ReadPtr<ulong>();
+                PickedNormal = new Vector3(
+                    nPtr[0] / 32767f,
+                    nPtr[1] / 32767f,
+                    nPtr[2] / 32767f);
+            }
+            else
+            {
+                PickedNormal = Vector3.UnitY;
+            }
+
+            PickedPixelX = _readbackPixelX;
+            PickedPixelY = _readbackPixelY;
+
             return packed >> 8;                       // upper 24 bits = entity ID
         }
 
-        /// <summary>
-        /// MeshPart index from the last pick result. Set by GetPickedEntityId.
-        /// </summary>
+        /// <summary>MeshPart index from the last pick result.</summary>
         public uint PickedMeshPartId { get; private set; }
+
+        /// <summary>Linear view-space depth at the picked pixel. 0 = sky/empty.</summary>
+        public float PickedDepth { get; private set; }
+
+        /// <summary>World-space surface normal at the picked pixel.</summary>
+        public Vector3 PickedNormal { get; private set; }
+
+        /// <summary>Pixel coordinates of the last pick (viewport-local).</summary>
+        public int PickedPixelX { get; private set; }
+        public int PickedPixelY { get; private set; }
 
         public override void Dispose()
         {
@@ -660,6 +735,8 @@ namespace Freefall.Graphics
             CompositeSnapshot?.Dispose();
             ShadowTextureArray?.Dispose();
             _entityIdReadback?.Dispose();
+            _depthReadback?.Dispose();
+            _normalReadback?.Dispose();
         }
     }
 }

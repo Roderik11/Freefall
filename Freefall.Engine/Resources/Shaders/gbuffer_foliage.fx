@@ -137,8 +137,9 @@ PSOutput PS(VSOutput input, bool isFrontFace : SV_IsFrontFace)
     
     // Distance-based alpha threshold — preserve coverage at distance
     float dist = length(input.WorldPos.xyz);
-    float alphaThreshold = lerp(0.5, 0.15, saturate((dist - 30.0) / 50.0));
-    clip(color.a - alphaThreshold);
+   // float alphaThreshold = lerp(0.5, 0.15, saturate((dist - 30.0) / 50.0));
+   // clip(color.a - alphaThreshold);
+    clip(color.a - 0.15f);
 
     // Use interpolated dome normal from VS — provides directional response
     // while still being smoothed enough to avoid harsh self-shadowing
