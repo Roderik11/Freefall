@@ -154,6 +154,11 @@ namespace Freefall.Assets
             var savedScale = source.Transform.Scale;
             var savedParent = source.Transform.Parent;
 
+            // Temporarily clear prefab reference so SaveToString emits ALL components
+            // (otherwise it only emits Transform for prefab instances)
+            var savedPrefab = source.Prefab;
+            source.Prefab = null;
+
             source.Transform.Position = System.Numerics.Vector3.Zero;
             source.Transform.Rotation = System.Numerics.Quaternion.Identity;
             source.Transform.Scale = System.Numerics.Vector3.One;
@@ -163,11 +168,12 @@ namespace Freefall.Assets
             var serializer = new EntitySerializer();
             var yaml = serializer.SaveToString(new List<Entity> { source });
 
-            // Restore transform
+            // Restore transform and prefab reference
             source.Transform.Position = savedPos;
             source.Transform.Rotation = savedRot;
             source.Transform.Scale = savedScale;
             source.Transform.Parent = savedParent;
+            source.Prefab = savedPrefab;
 
             // Update the prefab asset
             SourceYaml = Encoding.UTF8.GetBytes(yaml);
@@ -268,6 +274,8 @@ namespace Freefall.Assets
         /// <summary>
         /// Copy serializable fields from source component to target component (same type).
         /// Uses Reflector.GetMapping for field discovery, skips DontSerialize/Ignored fields.
+        /// Only copies fields from the concrete type — Component base fields (Entity, UID, Id, etc.)
+        /// are infrastructure and must not be overwritten.
         /// </summary>
         private static void CopyFields(Component source, Component target)
         {
@@ -277,7 +285,7 @@ namespace Freefall.Assets
             {
                 if (field.Ignored) continue;
                 if (!field.CanWrite) continue;
-                if (field.Name == "Entity") continue; // don't overwrite entity backref
+                if (field.DeclaringType == typeof(Component)) continue;
 
                 try
                 {

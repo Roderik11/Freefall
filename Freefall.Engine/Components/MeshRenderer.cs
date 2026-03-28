@@ -44,6 +44,7 @@ namespace Freefall.Components
         public Material? ReplacementMaterial;
 
         public MaterialBlock Params = new();
+        [NonSerialized]
         public BoundingSphere BoundingSphere;
 
         private bool _boundsDirty = true;

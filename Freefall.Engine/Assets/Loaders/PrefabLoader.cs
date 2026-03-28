@@ -39,5 +39,30 @@ namespace Freefall.Assets.Loaders
             prefab.MarkReady();
             return prefab;
         }
+
+        /// <summary>
+        /// Save a Prefab's SourceYaml back to its source .prefab file,
+        /// then re-import so the binary cache stays in sync.
+        /// </summary>
+        public void Save(Asset asset, string savePath)
+        {
+            var prefab = (Prefab)asset;
+            if (prefab.SourceYaml == null || prefab.SourceYaml.Length == 0)
+            {
+                Debug.LogWarning("PrefabLoader", $"Cannot save prefab '{prefab.Name}': no SourceYaml");
+                return;
+            }
+
+            File.WriteAllBytes(savePath, prefab.SourceYaml);
+            Debug.Log($"[PrefabLoader] Saved: {savePath}");
+
+            // Re-import to update the binary cache
+            var assetsDir = Engine.Project?.AssetsDirectory;
+            if (!string.IsNullOrEmpty(assetsDir) && savePath.StartsWith(assetsDir))
+            {
+                var relativePath = Path.GetRelativePath(assetsDir, savePath).Replace('\\', '/');
+                AssetDatabase.ImportAssetByPath(relativePath);
+            }
+        }
     }
 }

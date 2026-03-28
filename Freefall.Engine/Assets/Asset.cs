@@ -33,7 +33,11 @@ namespace Freefall.Assets
         /// <summary>
         /// Mark this asset as modified. Called by the inspector on property changes.
         /// </summary>
-        public virtual void MarkDirty() => IsDirty = true;
+        public virtual void MarkDirty()
+        {
+            IsDirty = true;
+            Freefall.Base.MessageDispatcher.Send("AssetDirty", this);
+        }
 
         /// <summary>
         /// Clear the dirty flag. Called after saving.
