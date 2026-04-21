@@ -50,18 +50,18 @@ namespace Freefall.Assets.Importers
                 if (string.IsNullOrEmpty(line)) continue;
 
                 // !Tag format: "!StaticMesh"
-                if (line.StartsWith("!"))
-                    return line.Substring(1).Trim();
-                if (line.Contains("!"))
+                if (line.StartsWith('!'))
+                    return line[1..].Trim();
+                if (line.Contains('!'))
                 {
                     var idx = line.IndexOf('!');
-                    var rest = line.Substring(idx + 1).Trim();
+                    var rest = line[(idx + 1)..].Trim();
                     if (rest.Length > 0) return rest;
                 }
 
                 // Wrapper format: "StaticMesh:" (first non-empty line ending with :)
-                if (line.EndsWith(":") && !line.Contains(" "))
-                    return line.Substring(0, line.Length - 1);
+                if (line.EndsWith(':') && !line.Contains(' '))
+                    return line[..^1];
 
                 break; // Only check the first meaningful line
             }

@@ -16,8 +16,7 @@
 #pragma kernel CS_PackChannels
 #pragma kernel CS_BrushRaycast
 #pragma kernel CS_NoiseLayer
-#pragma kernel CS_ErosionInit
-#pragma kernel CS_ErosionStep
+#pragma kernel CS_ErosionFilter
 
 // Push constants (root parameter 0, register b3) — bindless indices + params
 cbuffer PushConstants : register(b3)
@@ -608,151 +607,232 @@ void CS_NoiseLayer(uint3 dtid : SV_DispatchThreadID)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// CS_ErosionInit / CS_ErosionStep — Grid-based hydraulic + thermal erosion
+// CS_ErosionFilter — Single-pass noise-based erosion filter
 // ═══════════════════════════════════════════════════════════════════════════
 //
-// Slot reuse (erosion kernels):
-//   SourceIdx    (0)  → SRV: current baked heightmap
-//   OutputIdx    (1)  → UAV: erosion working height
-//   StampBufIdx  (2)  → UAV: water map (R32_Float)
-//   StampCount   (5)  → UAV: sediment map (R32_Float)
-//   Frequency    (23) → RainRate
-//   Amplitude    (24) → SedimentCapacity
-//   Lacunarity   (25) → DepositionRate
-//   Persistence  (26) → DissolutionRate
-//   OffsetX      (27) → Evaporation
-//   OffsetY      (28) → TalusAngle
-//   BrushRadius  (6)  → ThermalRate
-//   ErosionMode  (30) → 0=Hydraulic, 1=Thermal, 2=Both
-//   NoiseSeed    (29) → Seed for rain variation
+// Ported from "Advanced Terrain Erosion Filter" by Rune Skovbo Johansen
+// (https://www.shadertoy.com/view/wXcfWn) — MPL-2.0 licensed.
+//
+// Uses Phacelle Noise to generate gradient-aligned gullies that produce
+// crisp branching patterns in a single dispatch (no iterative simulation).
+//
+// Slot reuse (erosion filter kernels, never concurrent with noise/stamps):
+//   SourceIdx          (0)  → SRV: current baked heightmap
+//   OutputIdx          (1)  → UAV: output heightmap
+//   BrushRadius        (6)  → EF Scale
+//   BrushFalloff       (7)  → EF AssumedSlopeValue
+//   BrushTargetHeight  (8)  → EF AssumedSlopeAmount
+//   Frequency          (23) → EF Strength
+//   Amplitude          (24) → EF GullyWeight
+//   Lacunarity         (25) → EF Detail
+//   Persistence        (26) → EF Lacunarity
+//   OffsetX            (27) → EF Gain
+//   OffsetY            (28) → EF CellScale
+//   NoiseSeed          (29) → EF Octaves (uint)
+//   ErosionMode        (30) → EF Normalization (asfloat)
+//   TerraceSteps       (31) → EF RidgeRounding (asfloat)
+//   TerraceSmoothness  (32) → EF CreaseRounding
+//   MaskCenterX        (33) → EF RoundingInputMult
+//   MaskCenterY        (34) → EF RoundingOctaveMult
+//   MaskRadius         (35) → EF OnsetInput
+//   MaskFalloff        (36) → EF OnsetOctave
 
-// Aliases for erosion readability
-#define RainRate     Frequency
-#define SedimentCap  Amplitude
-#define DepositRate  Lacunarity
-#define DissolveRate Persistence
-#define Evaporation  OffsetX
-#define TalusAngleDeg OffsetY
-#define ThermalRate  BrushRadius
-#define WaterIdx     StampBufIdx
-#define SedimentIdx  StampCount
+// Aliases for readability
+#define EFScale           BrushRadius
+#define EFAssumedVal      BrushFalloff
+#define EFAssumedAmt      BrushTargetHeight
+#define EFStrength        Frequency
+#define EFGullyWeight     Amplitude
+#define EFDetail          Lacunarity
+#define EFLacunarity      Persistence
+#define EFGain            OffsetX
+#define EFCellScale       OffsetY
+#define EFOctaves         NoiseSeed
+#define EFNormalization   asfloat(ErosionMode)
+#define EFRidgeRounding   asfloat(TerraceSteps)
+#define EFCreaseRounding  TerraceSmoothness
+#define EFRoundInputMul   MaskCenterX
+#define EFRoundOctMul     MaskCenterY
+#define EFOnsetInput      MaskRadius
+#define EFOnsetOctave     MaskFalloff
 
-// ── CS_ErosionInit: Copy input heightmap to working buffer, clear aux maps ──
-[numthreads(8, 8, 1)]
-void CS_ErosionInit(uint3 dtid : SV_DispatchThreadID)
-{
-    RWTexture2D<float> Height   = ResourceDescriptorHeap[OutputIdx];
-    RWTexture2D<float> Water    = ResourceDescriptorHeap[WaterIdx];
-    RWTexture2D<float> Sediment = ResourceDescriptorHeap[SedimentIdx];
+#define EF_TAU 6.28318530717959
 
-    uint w, h;
-    Height.GetDimensions(w, h);
-    if (dtid.x >= w || dtid.y >= h) return;
-
-    // Copy current accumulated height into erosion working buffer
-    Texture2D<float> Source = ResourceDescriptorHeap[SourceIdx];
-    float2 uv = (float2(dtid.xy) + 0.5) / float2(w, h);
-    Height[dtid.xy] = Source.SampleLevel(sampLinear, uv, 0);
-
-    Water[dtid.xy] = 0;
-    Sediment[dtid.xy] = 0;
+// ── Hash function (algebraic, no texture lookups) ──
+float2 ef_hash(float2 x) {
+    const float2 k = float2(0.3183099, 0.3678794);
+    x = x * k + k.yx;
+    return -1.0 + 2.0 * frac(16.0 * k * frac(x.x * x.y * (x.x + x.y)));
 }
 
-// ── CS_ErosionStep: One iteration of hydraulic + thermal erosion ──
-[numthreads(8, 8, 1)]
-void CS_ErosionStep(uint3 dtid : SV_DispatchThreadID)
-{
-    RWTexture2D<float> Height   = ResourceDescriptorHeap[OutputIdx];
-    RWTexture2D<float> Water    = ResourceDescriptorHeap[WaterIdx];
-    RWTexture2D<float> Sediment = ResourceDescriptorHeap[SedimentIdx];
+// ── Phacelle Noise: directional stripe noise aligned with input vector ──
+// Produces cosine/sine wave pairs blended across Worley-like cells.
+// Copyright (c) 2025 Rune Skovbo Johansen — MPL-2.0
+float4 EF_PhacelleNoise(float2 p, float2 normDir, float freq, float offset, float normalization) {
+    float2 sideDir = normDir.yx * float2(-1.0, 1.0) * freq * EF_TAU;
+    offset *= EF_TAU;
 
+    float2 pInt = floor(p);
+    float2 pFrac = frac(p);
+    float2 phaseDir = 0;
+    float weightSum = 0;
+
+    [unroll]
+    for (int i = -1; i <= 2; i++) {
+        [unroll]
+        for (int j = -1; j <= 2; j++) {
+            float2 gridOffset = float2(i, j);
+            float2 gridPoint = pInt + gridOffset;
+            float2 randomOffset = ef_hash(gridPoint) * 0.5;
+            float2 vectorFromCellPoint = pFrac - gridOffset - randomOffset;
+
+            float sqrDist = dot(vectorFromCellPoint, vectorFromCellPoint);
+            float weight = exp(-sqrDist * 2.0);
+            weight = max(0.0, weight - 0.01111);
+            weightSum += weight;
+
+            float waveInput = dot(vectorFromCellPoint, sideDir) + offset;
+            phaseDir += float2(cos(waveInput), sin(waveInput)) * weight;
+        }
+    }
+
+    float2 interpolated = phaseDir / weightSum;
+    float magnitude = sqrt(dot(interpolated, interpolated));
+    magnitude = max(1.0 - normalization, magnitude);
+    return float4(interpolated / magnitude, sideDir);
+}
+
+// ── Helper functions ──
+
+float ef_pow_inv(float t, float power) {
+    return 1.0 - pow(1.0 - saturate(t), power);
+}
+
+float ef_ease_out(float t) {
+    float v = 1.0 - saturate(t);
+    return 1.0 - v * v;
+}
+
+float ef_smooth_start(float t, float smoothing) {
+    if (t >= smoothing)
+        return t - 0.5 * smoothing;
+    return 0.5 * t * t / smoothing;
+}
+
+float2 ef_safe_normalize(float2 n) {
+    float l = length(n);
+    return (abs(l) > 1e-10) ? (n / l) : n;
+}
+
+// ── Advanced Terrain Erosion Filter ──
+// Copyright (c) 2025 Rune Skovbo Johansen — MPL-2.0
+//
+// Returns float4(heightDelta, slopeDelta.xy, magnitude).
+float4 EF_ErosionFilter(
+    float2 p, float3 heightAndSlope, float fadeTarget,
+    float strength, float gullyWeight, float detail,
+    float4 rounding, float2 onset, float2 assumedSlope,
+    float scale, uint octaves, float lacunarity,
+    float gain, float cellScale, float normalization
+) {
+    strength *= scale;
+    fadeTarget = clamp(fadeTarget, -1.0, 1.0);
+
+    float3 inputHeightAndSlope = heightAndSlope;
+    float freq = 1.0 / (scale * cellScale);
+    float slopeLength = max(length(heightAndSlope.yz), 1e-10);
+    float magnitude = 0.0;
+    float roundingMult = 1.0;
+
+    float roundingForInput = lerp(rounding.y, rounding.x, saturate(fadeTarget + 0.5)) * rounding.z;
+    float combiMask = ef_ease_out(ef_smooth_start(slopeLength * onset.x, roundingForInput * onset.x));
+
+    // Gully slope: mix of actual slope and assumed slope
+    float2 gullySlope = lerp(heightAndSlope.yz,
+        heightAndSlope.yz / slopeLength * assumedSlope.x, assumedSlope.y);
+
+    for (uint i = 0; i < octaves && i < 8; i++) {
+        float4 phacelle = EF_PhacelleNoise(p * freq, ef_safe_normalize(gullySlope),
+            cellScale, 0.25, normalization);
+        phacelle.zw *= -freq;
+        float sloping = abs(phacelle.y);
+
+        // Add normalized slope for gully direction (straight gullies technique)
+        gullySlope += sign(phacelle.y) * phacelle.zw * strength * gullyWeight;
+
+        // Gullies: height offset (x) and derivative (yz)
+        float3 gullies = float3(phacelle.x, phacelle.y * phacelle.zw);
+        // Fade towards fadeTarget based on combiMask
+        float3 fadedGullies = lerp(float3(fadeTarget, 0, 0), gullies * gullyWeight, combiMask);
+        heightAndSlope += fadedGullies * strength;
+        magnitude += strength;
+
+        // Update fadeTarget for next octave (stacked fading)
+        fadeTarget = fadedGullies.x;
+
+        // Update mask with this octave's ridge/crease contribution
+        float roundingForOctave = lerp(rounding.y, rounding.x,
+            saturate(phacelle.x + 0.5)) * roundingMult;
+        float newMask = ef_ease_out(ef_smooth_start(sloping * onset.y,
+            roundingForOctave * onset.y));
+        combiMask = ef_pow_inv(combiMask, detail) * newMask;
+
+        // Prepare next octave
+        strength *= gain;
+        freq *= lacunarity;
+        roundingMult *= rounding.w;
+    }
+
+    float3 heightAndSlopeDelta = heightAndSlope - inputHeightAndSlope;
+    return float4(heightAndSlopeDelta, magnitude);
+}
+
+// ── CS_ErosionFilter: Single-dispatch erosion filter applied to baked heightmap ──
+[numthreads(8, 8, 1)]
+void CS_ErosionFilter(uint3 dtid : SV_DispatchThreadID)
+{
+    RWTexture2D<float> Output = ResourceDescriptorHeap[OutputIdx];
     uint w, h;
-    Height.GetDimensions(w, h);
+    Output.GetDimensions(w, h);
     if (dtid.x >= w || dtid.y >= h) return;
 
-    int2 coord = int2(dtid.xy);
-    float myH = Height[coord];
-    float myW = Water[coord];
-    float myS = Sediment[coord];
+    Texture2D<float> Source = ResourceDescriptorHeap[SourceIdx];
+    float2 uv = (float2(dtid.xy) + 0.5) / float2(w, h);
+    float2 texel = 1.0 / float2(w, h);
 
-    // ── Hydraulic erosion (mode 0 or 2) ──
-    if (ErosionMode == 0 || ErosionMode == 2)
-    {
-        // Rain with spatial variation
-        float2 hashP = float2(coord) * 0.1 + float2((float)NoiseSeed * 0.37, (float)NoiseSeed * 0.71);
-        float rainVar = frac(sin(dot(hashP, float2(127.1, 311.7))) * 43758.5453);
-        myW += RainRate * (0.5 + rainVar);
+    // Sample height and compute gradient via finite differences
+    float hC = Source.SampleLevel(sampLinear, uv, 0);
+    float hL = Source.SampleLevel(sampLinear, uv - float2(texel.x, 0), 0);
+    float hR = Source.SampleLevel(sampLinear, uv + float2(texel.x, 0), 0);
+    float hD = Source.SampleLevel(sampLinear, uv - float2(0, texel.y), 0);
+    float hU = Source.SampleLevel(sampLinear, uv + float2(0, texel.y), 0);
+    float2 gradient = float2(hR - hL, hU - hD) * 0.5 / texel;
 
-        // 4-neighbor heights
-        float hL = (coord.x > 0)         ? Height[coord + int2(-1,  0)] : myH;
-        float hR = (coord.x < (int)w - 1) ? Height[coord + int2( 1,  0)] : myH;
-        float hD = (coord.y > 0)         ? Height[coord + int2( 0, -1)] : myH;
-        float hU = (coord.y < (int)h - 1) ? Height[coord + int2( 0,  1)] : myH;
+    // heightAndSlope: (height, dh/dx, dh/dy)
+    float3 heightAndSlope = float3(hC, gradient);
 
-        // Height difference with average neighbor
-        float avgNeighborH = (hL + hR + hD + hU) * 0.25;
-        float deltaH = (myH + myW) - avgNeighborH;
+    // Fade target: map height [0,1] → [-1,1] (valleys→peaks)
+    float fadeTarget = clamp(hC * 2.0 - 1.0, -1.0, 1.0);
 
-        if (deltaH > 0)
-        {
-            // Flowing out: dissolve terrain
-            float erosion = min(deltaH, DissolveRate) * myW;
-            myH -= erosion;
-            myS += erosion;
+    // Rounding: (ridgeRounding, creaseRounding, inputMult, octaveMult)
+    float4 rounding = float4(EFRidgeRounding, EFCreaseRounding, EFRoundInputMul, EFRoundOctMul);
+    float2 onset = float2(EFOnsetInput, EFOnsetOctave);
+    float2 assumedSlope = float2(EFAssumedVal, EFAssumedAmt);
 
-            // Outflow reduces local water
-            float outflow = min(myW, deltaH * 0.25);
-            myW -= outflow;
-        }
-        else
-        {
-            // Valley: deposit sediment
-            float deposit = min(myS, DepositRate * -deltaH);
-            myH += deposit;
-            myS -= deposit;
-        }
+    // Run the erosion filter
+    float4 erosion = EF_ErosionFilter(
+        uv, heightAndSlope, fadeTarget,
+        EFStrength, EFGullyWeight, EFDetail,
+        rounding, onset, assumedSlope,
+        EFScale, EFOctaves, EFLacunarity,
+        EFGain, EFCellScale, EFNormalization
+    );
 
-        // Sediment capacity check
-        float capacity = SedimentCap * myW * max(0.01, abs(deltaH));
-        if (myS > capacity)
-        {
-            float excess = (myS - capacity) * DepositRate;
-            myH += excess;
-            myS -= excess;
-        }
+    // erosion.x = height delta, erosion.w = magnitude
+    // Offset to preserve peaks/valleys: raise valleys, lower peaks
+    float offset = -fadeTarget * erosion.w;
+    float eroded = hC + erosion.x + offset;
 
-        // Evaporate
-        myW *= (1.0 - Evaporation);
-    }
-
-    // ── Thermal erosion (mode 1 or 2) ──
-    if (ErosionMode == 1 || ErosionMode == 2)
-    {
-        // Talus threshold: tan(angle) / resolution
-        float talusRad = TalusAngleDeg * 3.14159265 / 180.0;
-        float talusThreshold = tan(talusRad) / (float)w;
-
-        float hL = (coord.x > 0)         ? Height[coord + int2(-1,  0)] : myH;
-        float hR = (coord.x < (int)w - 1) ? Height[coord + int2( 1,  0)] : myH;
-        float hD = (coord.y > 0)         ? Height[coord + int2( 0, -1)] : myH;
-        float hU = (coord.y < (int)h - 1) ? Height[coord + int2( 0,  1)] : myH;
-
-        float dL = myH - hL - talusThreshold;
-        float dR = myH - hR - talusThreshold;
-        float dD = myH - hD - talusThreshold;
-        float dU = myH - hU - talusThreshold;
-
-        float totalExcess = max(0, dL) + max(0, dR) + max(0, dD) + max(0, dU);
-
-        if (totalExcess > 0)
-        {
-            float transfer = totalExcess * ThermalRate * 0.25;
-            myH -= transfer;
-        }
-    }
-
-    // Write back
-    Height[coord] = myH;
-    Water[coord] = max(0, myW);
-    Sediment[coord] = max(0, myS);
+    float prev = Output[dtid.xy];
+    Output[dtid.xy] = Blend(prev, eroded, BlendMode, Opacity);
 }

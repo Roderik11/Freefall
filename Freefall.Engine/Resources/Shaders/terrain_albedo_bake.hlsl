@@ -92,14 +92,17 @@ void CSBakeTerrainAlbedo(uint3 dtid : SV_DispatchThreadID)
 
             // Procedural slope/height auto-mask: max(painted, procedural)
             LayerAutoMask mask = AutoMaskBuf[layer];
-            if (mask.ProceduralWeight > 0)
+            if (mask.ProceduralWeight != 0)
             {
                 float pmask = 1;
                 pmask *= smoothstep(mask.SlopeMin - mask.SlopeBlend, mask.SlopeMin, slopeDeg);
                 pmask *= smoothstep(mask.SlopeMax + mask.SlopeBlend, mask.SlopeMax, slopeDeg);
                 pmask *= smoothstep(mask.HeightMin - mask.HeightBlend, mask.HeightMin, heightNorm);
                 pmask *= smoothstep(mask.HeightMax + mask.HeightBlend, mask.HeightMax, heightNorm);
-                weight = max(weight, pmask * mask.ProceduralWeight);
+                if (mask.ProceduralWeight > 0)
+                    weight = max(weight, pmask * mask.ProceduralWeight);
+                else
+                    weight = pmask * abs(mask.ProceduralWeight) * (1.0 - weight);
             }
 
             if (weight <= 0)

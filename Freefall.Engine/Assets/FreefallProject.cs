@@ -18,6 +18,7 @@ namespace Freefall.Assets
         public string AssetsDirectory => Path.Combine(RootDirectory, "Assets");
         public string LibraryDirectory => Path.Combine(RootDirectory, "Library");
         public string CacheDirectory => Path.Combine(RootDirectory, "Cache");
+        public string ToolsDirectory => Path.Combine(RootDirectory, "Tools");
 
         /// <summary>
         /// Opens a project from a .ffproject file or a directory containing one.

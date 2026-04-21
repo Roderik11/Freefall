@@ -47,8 +47,8 @@ namespace Freefall.Assets
         // ── Combinations ──
         /// <summary>Height change → rebake heightmap + albedo (slope/height masks shift).</summary>
         HeightAll      = HeightBake | AlbedoBake,
-        /// <summary>Splat layer visuals changed → repack + rebake albedo.</summary>
-        SplatAll       = LayerParams | AlbedoBake,
+        /// <summary>Splat layer visuals changed → repack + rebake albedo + refresh decorators.</summary>
+        SplatAll       = LayerParams | AlbedoBake | DecoPrepass,
         /// <summary>Full decorator rebuild.</summary>
         DecoAll        = DecoStructure | DecoParams | DecoPrepass,
         /// <summary>Everything.</summary>
@@ -222,6 +222,10 @@ namespace Freefall.Assets
         [Serializable]
         public class TextureLayer
         {
+            /// <summary>Stable unique ID for this layer. Used by Decoration.SourceLayerIds
+            /// and ExclusionLayerIds to survive layer reordering.</summary>
+            public ulong LayerId = IDGenerator.GetUID();
+
             [DirtyFlag(TerrainDirtyFlags.TextureArrays | TerrainDirtyFlags.AlbedoBake)]
             public Texture Diffuse;
 
@@ -261,10 +265,11 @@ namespace Freefall.Assets
             [ValueRange(0f, 30f)]
             public float SlopeBlend = 5.0f;
 
-            /// <summary>Procedural auto-mask strength. 0=paint only, 1=full procedural.
-            /// Final weight = max(painted, procedural * this).</summary>
+            /// <summary>Procedural auto-mask blend.
+            /// Positive: max(paint, procedural * weight) — paint adds.
+            /// Negative: procedural * |weight| * (1 - paint) — paint erases.</summary>
             [DirtyFlag(TerrainDirtyFlags.SplatAll)]
-            [ValueRange(0f, 1f)]
+            [ValueRange(-1f, 1f)]
             public float ProceduralWeight = 0.0f;
         }
 
@@ -286,8 +291,29 @@ namespace Freefall.Assets
             [DirtyFlag(TerrainDirtyFlags.DecoStructure)]
             public Texture Texture;       // Billboard/Cross mode: alpha-tested texture
 
+            // ── Layer-Driven Placement ────────────────────────────────
+
+            /// <summary>
+            /// TextureLayer IDs that drive this decorator's density.
+            /// The effective weight is max(layerWeight[i]) for all referenced layers.
+            /// Empty = standalone mode (uses own ControlMap instead).
+            /// </summary>
+            [DirtyFlag(TerrainDirtyFlags.DecoStructure)]
+            public LayerMask SourceLayerIds = new();
+
+            /// <summary>
+            /// TextureLayer IDs that suppress this decorator's density.
+            /// Effective weight *= (1 - max(layerWeight[i])) for all referenced layers.
+            /// Empty = no exclusion.
+            /// </summary>
+            [DirtyFlag(TerrainDirtyFlags.DecoStructure)]
+            public LayerMask ExclusionLayerIds = new();
+
+            // ── Standalone Fallback ──────────────────────────────────
+
             /// <summary>
             /// Controls placement density (R8, hidden subasset).
+            /// Only used when SourceLayerIds is empty (standalone mode).
             /// Without a control map, the decorator renders everywhere.
             /// </summary>
             [FormerlySerializedAs("DensityMap")]
@@ -299,9 +325,20 @@ namespace Freefall.Assets
             [JsonIgnore]
             public byte[] PendingControlMapBytes;
 
+            // ── Procedural Blend ──────────────────────────────────────
+
+            /// <summary>Blend between painted density and layer-driven procedural.
+            /// Positive: max(paint, procedural * blend) — paint adds on top.
+            /// Negative: procedural * |blend| * (1 - paint) — paint erases.</summary>
+            [DirtyFlag(TerrainDirtyFlags.DecoPrepass | TerrainDirtyFlags.DecoParams)]
+            [ValueRange(-1f, 1f)]
+            public float ProceduralBlend = 1.0f;
+
+            // ── Rendering Parameters ─────────────────────────────────
+
             /// <summary>Instances per square meter.</summary>
             [DirtyFlag(TerrainDirtyFlags.DecoParams)]
-            [ValueRange(.1f, 10)]
+            [ValueRange(.01f, 4)]
             public float Density = 1.0f;
 
             [DirtyFlag(TerrainDirtyFlags.DecoParams)]
@@ -335,6 +372,11 @@ namespace Freefall.Assets
             [DirtyFlag(TerrainDirtyFlags.DecoParams)]
             [ValueRange(0f, 1f)]
             public float NoiseSpread = 1.0f;
+
+            /// <summary>True if this decorator is driven by texture layer weights.</summary>
+            [Reflection.DontSerialize]
+            [JsonIgnore]
+            public bool IsLayerDriven => SourceLayerIds.Count > 0;
         }
     }
 }

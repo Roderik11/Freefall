@@ -127,13 +127,14 @@ struct DecoratorSlot
     float Rot20, Rot21, Rot22;
     float SlopeBias;
     uint DecoMapSlice;
-    uint _pad0;
+    uint SourceLayerMask;
     uint Mode;
     uint TextureIdx;
     float3 HealthyColor;
     float3 DryColor;
     float NoiseSpread;
-    uint _colorPad;
+    uint ExclusionLayerMask;
+    float ProceduralBlend;
 };
 
 struct LODEntry { uint MeshPartId; float MaxDistance; uint MaterialId; uint _pad; };
@@ -370,20 +371,22 @@ void CS_SpawnInstances(uint3 gid : SV_GroupID, uint3 gtid3 : SV_GroupThreadID)
 
         // Weight is 0-255 from density map; normalize to 0-1, then scale by max instances per tile
         float cellWeight = float(weight) / 255.0;
-        uint decoInstCount = max(1u, min(64u, (uint)(cellWeight * 64.0 * slot.Density * DecorationDensity + 0.5)));
+        cellWeight = cellWeight * cellWeight * cellWeight; // aggressive power curve: crush low weights
+        uint decoInstCount = min(64u, (uint)(cellWeight * 64.0 * slot.Density * DecorationDensity + 0.5));
+        if (decoInstCount == 0) continue;
 
         // Stride loop: 64 threads cooperate to spawn decoInstCount instances
         for (uint instanceIdx = flatThread; instanceIdx < decoInstCount; instanceIdx += 64)
         {
-            // Scatter beyond tile boundaries: overshoot scales with weight.
-            // At max weight: range = (1 + 2*1) = 3× tile size. Less weight → less overshoot.
-            float2 instanceSeed = float2(float(instanceIdx) * 0.7123 + float(slotIdx) * 3.917,
-                                          float(instanceIdx) * 1.3147 + float(slotIdx) * 7.213);
+            // Per-instance jitter: seed from integer cell coords to avoid float hash correlation
+            uint cellSeed = pcg(uint(cellX) * 1664525u ^ uint(cellZ) * 1013904223u);
+            uint instSeed = pcg(cellSeed + instanceIdx * 747796405u + slotIdx * 2891336453u);
+            float rngX = float(instSeed) / 4294967295.0;
+            float rngY = float(pcg(instSeed)) / 4294967295.0;
             float2 tileOrig = float2(tileOriginX, tileOriginZ);
-            float2 rng = hash22(instanceSeed + tileOrig);
             float overshoot = 0;// 0.5f * normalizedWeight;
-            float wx = tileOrig.x + (rng.x * (1.0 + 2.0 * overshoot) - overshoot) * ts;
-            float wz = tileOrig.y + (rng.y * (1.0 + 2.0 * overshoot) - overshoot) * ts;
+            float wx = tileOrig.x + (rngX * (1.0 + 2.0 * overshoot) - overshoot) * ts;
+            float wz = tileOrig.y + (rngY * (1.0 + 2.0 * overshoot) - overshoot) * ts;
 
             // Terrain UV
             float2 texelUV = float2(
@@ -418,10 +421,10 @@ void CS_SpawnInstances(uint3 gid : SV_GroupID, uint3 gtid3 : SV_GroupThreadID)
             //if (lod >= slot.LODCount) continue;
 
             // ── Per-instance scale & rotation ──
-            float2 seed = instanceSeed + tileOrig * 0.0137;
+            uint scaleSeed = pcg(instSeed + 337u);
             float densityBias = lerp(0.3, 1.0, cellWeight);
-            float randH = hash21(seed + 33.7);
-            float randW = hash21(seed.yx + 77.9);
+            float randH = float(scaleSeed) / 4294967295.0;
+            float randW = float(pcg(scaleSeed + 779u)) / 4294967295.0;
             float scaleH = lerp(slot.MinH, slot.MaxH, randH * densityBias);
             float scaleW = lerp(slot.MinW, slot.MaxW, randW * densityBias);
 
@@ -432,8 +435,8 @@ void CS_SpawnInstances(uint3 gid : SV_GroupID, uint3 gtid3 : SV_GroupThreadID)
             scaleH *= fadeFactor;
             scaleW *= fadeFactor;
 
-            float instanceRot = hash21(float2(wx * 7.3, wz * 31.7)) * 6.2831853;
-            float instanceSeedVal = hash21(seed + 99.1);
+            float instanceRot = float(pcg(instSeed + 731u)) / 4294967295.0 * 6.2831853;
+            float instanceSeedVal = float(pcg(instSeed + 991u)) / 4294967295.0;
 
             // ── Append to output ──
             DecoInstance di;

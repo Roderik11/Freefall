@@ -412,6 +412,23 @@ namespace Freefall.Graphics
                             passRtvFormats = new[] { rtFormat };
                     }
                     
+                    // Per-pass DepthFunc override (e.g. preview shaders use LessEqual vs reverse depth)
+                    var passDepthFunc = parsedDepthFunc;
+                    if (passRS.DepthFunc != null)
+                    {
+                        passDepthFunc = passRS.DepthFunc switch
+                        {
+                            "Less" => ComparisonFunction.Less,
+                            "LessEqual" => ComparisonFunction.LessEqual,
+                            "Greater" => ComparisonFunction.Greater,
+                            "GreaterEqual" => ComparisonFunction.GreaterEqual,
+                            "Equal" => ComparisonFunction.Equal,
+                            "Always" => ComparisonFunction.Always,
+                            "Never" => ComparisonFunction.Never,
+                            _ => parsedDepthFunc
+                        };
+                    }
+
                     // Resolve depth stencil for this pass
                     if (!passRS.DepthTest && !passRS.DepthWrite)
                     {
@@ -424,7 +441,7 @@ namespace Freefall.Graphics
                         {
                             DepthEnable = true,
                             DepthWriteMask = DepthWriteMask.Zero,
-                            DepthFunc = parsedDepthFunc,
+                            DepthFunc = passDepthFunc,
                             StencilEnable = false
                         };
                         passDepthFormat = Format.D32_Float;
@@ -435,7 +452,7 @@ namespace Freefall.Graphics
                         {
                             DepthEnable = true,
                             DepthWriteMask = DepthWriteMask.All,
-                            DepthFunc = parsedDepthFunc,
+                            DepthFunc = passDepthFunc,
                             StencilEnable = false
                         };
                         passDepthFormat = Format.D32_Float;
@@ -551,6 +568,7 @@ namespace Freefall.Graphics
                     {
                         "SceneConstants" => 1,
                         "ObjectConstants" => 2,
+                        "PreviewConstants" => 2,
                         "terrain" => 2,
                         "landscape" => 2,
                         "tiling" => 3,
@@ -688,7 +706,7 @@ namespace Freefall.Graphics
 
             // Bind Pipeline - use selected pass's PSO, wireframe variant if enabled
             var pso = _passPipelineStates.TryGetValue(Pass, out var selectedPso) ? selectedPso : _passPipelineStates[0];
-            if (Engine.Settings.TerrainWireframe && !_isFullscreenPass && _passWireframePSOs.TryGetValue(Pass, out var wireframePso))
+            if (Engine.Settings.Wireframe && !_isFullscreenPass && _passWireframePSOs.TryGetValue(Pass, out var wireframePso))
             {
                 pso = wireframePso;
             }

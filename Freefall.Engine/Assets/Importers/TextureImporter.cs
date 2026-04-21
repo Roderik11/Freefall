@@ -38,9 +38,9 @@ namespace Freefall.Assets.Importers
        
         // ── Configurable import settings (editable in inspector) ──
         public TextureFormat Format = TextureFormat.BC7_UNORM;
-        public bool GenerateMips = true;
-        public bool sRGB = true;
 
+        public bool sRGB = true;
+        public bool GenerateMips = true;
         public bool IsNormalMap = false;
         public bool AlphaFromGrayscale = false;
 
@@ -130,6 +130,8 @@ namespace Freefall.Assets.Importers
             return result;
         }
 
+//        public object GetInspectionTarget(MetaFile meta) => this;
+
         private byte[] ConvertToDds(string sourcePath)
         {
             // Resolve texconv.exe next to the running executable
@@ -176,7 +178,7 @@ namespace Freefall.Assets.Importers
                 var args = $"-y -gpu 0 -f {format}";
 
                 if (GenerateMips)
-                    args += " -m 0"; // full mip chain
+                    args += " -m 0 -sepalpha"; // full mip chain; filter RGB/A independently
 
                 if (sRGB)
                     args += " -srgbi -srgbo";

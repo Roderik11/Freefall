@@ -30,8 +30,7 @@ namespace Freefall.Assets
         private int _kernelPackChannels;
         private int _kernelBrushRaycast;
         private int _kernelNoiseLayer;
-        private int _kernelErosionInit;
-        private int _kernelErosionStep;
+        private int _kernelErosionFilter;
 
         // GPU resources for the baked heightmap
         private ID3D12Resource _heightTexture;
@@ -50,14 +49,7 @@ namespace Freefall.Assets
         // GPU raycast result buffer — written by CS_BrushRaycast, read by CS_PaintBrush
         private GraphicsBuffer _raycastResultBuffer;
 
-        // Shared erosion auxiliary textures (reused across all ErosionHeightLayers)
-        private ID3D12Resource _erosionHeightTex;  // R32_Float working height
-        private uint _erosionHeightUAV, _erosionHeightSRV;
-        private ID3D12Resource _erosionWaterTex;    // R32_Float water map
-        private uint _erosionWaterUAV;
-        private ID3D12Resource _erosionSedimentTex; // R32_Float sediment map
-        private uint _erosionSedimentUAV;
-        private int _erosionTexResolution;
+
 
         // Pre-baked tileable noise LUT (256x256, RGBA8, 2 independent noise channels)
         private ID3D12Resource _noiseLUTTex;
@@ -93,8 +85,7 @@ namespace Freefall.Assets
             _kernelPackChannels = _cs.FindKernel("CS_PackChannels");
             _kernelBrushRaycast = _cs.FindKernel("CS_BrushRaycast");
             _kernelNoiseLayer = _cs.FindKernel("CS_NoiseLayer");
-            _kernelErosionInit = _cs.FindKernel("CS_ErosionInit");
-            _kernelErosionStep = _cs.FindKernel("CS_ErosionStep");
+            _kernelErosionFilter = _cs.FindKernel("CS_ErosionFilter");
             _initialized = true;
         }
 
@@ -241,116 +232,45 @@ namespace Freefall.Assets
 
         private void DispatchErosion(ID3D12GraphicsCommandList cmd, ErosionHeightLayer layer, int resolution, uint groups)
         {
-            EnsureErosionTextures(resolution);
+            // Single-dispatch erosion filter — read accumulated height, write eroded result directly
+            var k = _kernelErosionFilter;
 
-            // Phase 1: Init — copy current baked height into working buffer, clear water/sediment
-            _cs.SetPushConstant(_kernelErosionInit, "Source", _heightSRV);
-            _cs.SetPushConstant(_kernelErosionInit, "Output", _erosionHeightUAV);
-            _cs.SetPushConstant(_kernelErosionInit, "StampBuf", _erosionWaterUAV);     // WaterIdx
-            _cs.SetPushConstant(_kernelErosionInit, "StampCount", _erosionSedimentUAV); // SedimentIdx
-            _cs.Dispatch(_kernelErosionInit, cmd, groups, groups);
-            cmd.ResourceBarrierUnorderedAccessView(_erosionHeightTex);
-            cmd.ResourceBarrierUnorderedAccessView(_erosionWaterTex);
-            cmd.ResourceBarrierUnorderedAccessView(_erosionSedimentTex);
+            _cs.SetPushConstant(k, "Source", _heightSRV);
+            _cs.SetPushConstant(k, "Output", _heightUAV);
+            _cs.SetPushConstant(k, "BlendMode", (uint)layer.BlendMode);
+            _cs.SetParam(k, "Opacity", layer.Opacity);
 
-            // Phase 2: Iterative erosion steps
-            _cs.SetPushConstant(_kernelErosionStep, "Output", _erosionHeightUAV);
-            _cs.SetPushConstant(_kernelErosionStep, "StampBuf", _erosionWaterUAV);
-            _cs.SetPushConstant(_kernelErosionStep, "StampCount", _erosionSedimentUAV);
-            _cs.SetPushConstant(_kernelErosionStep, "ErosionMode", (uint)layer.Mode);
-            _cs.SetPushConstant(_kernelErosionStep, "NoiseSeed", (uint)layer.Seed);
+            // Core erosion params (aliased onto existing push constant slots)
+            _cs.SetParam(k, "BrushRadius", layer.Scale);           // EFScale
+            _cs.SetParam(k, "Frequency", layer.Strength);          // EFStrength
+            _cs.SetParam(k, "Amplitude", layer.GullyWeight);       // EFGullyWeight
+            _cs.SetParam(k, "Lacunarity", layer.Detail);           // EFDetail
+            _cs.SetParam(k, "Persistence", layer.Lacunarity);      // EFLacunarity
+            _cs.SetParam(k, "OffsetX", layer.Gain);                // EFGain
+            _cs.SetParam(k, "OffsetY", layer.CellScale);           // EFCellScale
+            _cs.SetPushConstant(k, "NoiseSeed", (uint)layer.Octaves); // EFOctaves
 
-            // Erosion params (aliased onto noise float slots)
-            _cs.SetParam(_kernelErosionStep, "Frequency", layer.RainRate);           // RainRate
-            _cs.SetParam(_kernelErosionStep, "Amplitude", layer.SedimentCapacity);   // SedimentCap
-            _cs.SetParam(_kernelErosionStep, "Lacunarity", layer.DepositionRate);    // DepositRate
-            _cs.SetParam(_kernelErosionStep, "Persistence", layer.DissolutionRate);  // DissolveRate
-            _cs.SetParam(_kernelErosionStep, "OffsetX", layer.Evaporation);          // Evaporation
-            _cs.SetParam(_kernelErosionStep, "OffsetY", layer.TalusAngle);           // TalusAngleDeg
-            _cs.SetParam(_kernelErosionStep, "BrushRadius", layer.ThermalRate);      // ThermalRate
-
-            for (int i = 0; i < layer.Iterations; i++)
+            // Float values sent through uint slots — reinterpret bits
+            unsafe
             {
-                _cs.Dispatch(_kernelErosionStep, cmd, groups, groups);
-                cmd.ResourceBarrierUnorderedAccessView(_erosionHeightTex);
-                cmd.ResourceBarrierUnorderedAccessView(_erosionWaterTex);
-                cmd.ResourceBarrierUnorderedAccessView(_erosionSedimentTex);
+                float normVal = layer.Normalization;
+                float ridgeVal = layer.RidgeRounding;
+                _cs.SetPushConstant(k, "ErosionMode", *(uint*)&normVal);    // EFNormalization
+                _cs.SetPushConstant(k, "TerraceSteps", *(uint*)&ridgeVal);  // EFRidgeRounding
             }
 
-            // Phase 3: Blend eroded result back into main heightmap
-            // Re-use CS_ImportLayer to composite erosionHeight → _heightTexture
-            _cs.SetPushConstant(_kernelImport, "Source", _erosionHeightSRV);
-            _cs.SetPushConstant(_kernelImport, "Output", _heightUAV);
-            _cs.SetPushConstant(_kernelImport, "BlendMode", (uint)layer.BlendMode);
-            _cs.SetParam(_kernelImport, "Opacity", layer.Opacity);
-            _cs.Dispatch(_kernelImport, cmd, groups, groups);
+            _cs.SetParam(k, "TerraceSmoothness", layer.CreaseRounding);  // EFCreaseRounding
+            _cs.SetParam(k, "MaskCenterX", 0.1f);                        // EFRoundInputMul
+            _cs.SetParam(k, "MaskCenterY", 2.0f);                        // EFRoundOctMul (= lacunarity)
+            _cs.SetParam(k, "MaskRadius", layer.SlopeOnset);             // EFOnsetInput
+            _cs.SetParam(k, "MaskFalloff", layer.SlopeOnset);            // EFOnsetOctave
+
+            // Assumed slope override
+            _cs.SetParam(k, "BrushFalloff", layer.AssumedSlope);         // EFAssumedVal
+            _cs.SetParam(k, "BrushTargetHeight", layer.AssumedSlopeAmount); // EFAssumedAmt
+
+            _cs.Dispatch(k, cmd, groups, groups);
             cmd.ResourceBarrierUnorderedAccessView(_heightTexture);
-        }
-
-        private void EnsureErosionTextures(int resolution)
-        {
-            if (_erosionHeightTex != null && _erosionTexResolution == resolution)
-                return;
-
-            // Release old
-            _erosionHeightTex?.Release();
-            _erosionWaterTex?.Release();
-            _erosionSedimentTex?.Release();
-
-            var device = Engine.Device;
-            _erosionTexResolution = resolution;
-
-            // Working height (R32_Float for full precision during simulation)
-            _erosionHeightTex = device.CreateTexture2D(
-                Format.R32_Float, resolution, resolution, 1, 1,
-                ResourceFlags.AllowUnorderedAccess, ResourceStates.Common);
-
-            _erosionHeightUAV = device.AllocateBindlessIndex();
-            device.NativeDevice.CreateUnorderedAccessView(_erosionHeightTex, null,
-                new UnorderedAccessViewDescription
-                {
-                    Format = Format.R32_Float,
-                    ViewDimension = UnorderedAccessViewDimension.Texture2D,
-                    Texture2D = new Texture2DUnorderedAccessView { MipSlice = 0 }
-                }, device.GetCpuHandle(_erosionHeightUAV));
-
-            _erosionHeightSRV = device.AllocateBindlessIndex();
-            device.NativeDevice.CreateShaderResourceView(_erosionHeightTex,
-                new ShaderResourceViewDescription
-                {
-                    Format = Format.R32_Float,
-                    ViewDimension = ShaderResourceViewDimension.Texture2D,
-                    Shader4ComponentMapping = ShaderComponentMapping.Default,
-                    Texture2D = new Texture2DShaderResourceView { MostDetailedMip = 0, MipLevels = 1 }
-                }, device.GetCpuHandle(_erosionHeightSRV));
-
-            // Water map
-            _erosionWaterTex = device.CreateTexture2D(
-                Format.R32_Float, resolution, resolution, 1, 1,
-                ResourceFlags.AllowUnorderedAccess, ResourceStates.Common);
-
-            _erosionWaterUAV = device.AllocateBindlessIndex();
-            device.NativeDevice.CreateUnorderedAccessView(_erosionWaterTex, null,
-                new UnorderedAccessViewDescription
-                {
-                    Format = Format.R32_Float,
-                    ViewDimension = UnorderedAccessViewDimension.Texture2D,
-                    Texture2D = new Texture2DUnorderedAccessView { MipSlice = 0 }
-                }, device.GetCpuHandle(_erosionWaterUAV));
-
-            // Sediment map
-            _erosionSedimentTex = device.CreateTexture2D(
-                Format.R32_Float, resolution, resolution, 1, 1,
-                ResourceFlags.AllowUnorderedAccess, ResourceStates.Common);
-
-            _erosionSedimentUAV = device.AllocateBindlessIndex();
-            device.NativeDevice.CreateUnorderedAccessView(_erosionSedimentTex, null,
-                new UnorderedAccessViewDescription
-                {
-                    Format = Format.R32_Float,
-                    ViewDimension = UnorderedAccessViewDimension.Texture2D,
-                    Texture2D = new Texture2DUnorderedAccessView { MipSlice = 0 }
-                }, device.GetCpuHandle(_erosionSedimentUAV));
         }
 
         // ── Noise LUT generation ──────────────────────────────────────────
@@ -1365,9 +1285,7 @@ namespace Freefall.Assets
             _stampBuffer?.Dispose();
             _strokeBuffer?.Dispose();
             _packIndexBuffer?.Dispose();
-            _erosionHeightTex?.Release();
-            _erosionWaterTex?.Release();
-            _erosionSedimentTex?.Release();
+
             _cs?.Dispose();
         }
     }

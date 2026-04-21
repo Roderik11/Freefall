@@ -53,4 +53,8 @@ namespace Freefall.Reflection
         IEnumerator IEnumerable.GetEnumerator()
             => GetEnumerator();
     }
+
+    public class Mapping<T> : Mapping where T : Attribute
+    {
+    }
 }

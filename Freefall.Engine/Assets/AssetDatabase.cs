@@ -409,13 +409,22 @@ namespace Freefall.Assets
         }
 
         /// <summary>
-        /// Instantiate the importer for a given source GUID.
+        /// Instantiate the importer for a given GUID.
+        /// Accepts both source GUIDs and sub-asset GUIDs (resolves to source automatically).
         /// Returns null if no importer is registered for the file's extension.
         /// </summary>
-        public static IImporter GetImporter(string sourceGuid)
+        public static IImporter GetImporter(string guid)
         {
-            if (!_guidToPath.TryGetValue(sourceGuid, out var sourcePath))
-                return null;
+            // Try as source GUID first, then resolve sub-asset → source
+            if (!_guidToPath.TryGetValue(guid, out var sourcePath))
+            {
+                if (_subAssetToSource.TryGetValue(guid, out var sourceGuid))
+                    _guidToPath.TryGetValue(sourceGuid, out sourcePath);
+
+                if (sourcePath == null) return null;
+                guid = sourceGuid;
+            }
+            var sourceGuidResolved = guid;
 
             var ext = Path.GetExtension(sourcePath);
             if (string.IsNullOrEmpty(ext)) return null;
@@ -426,7 +435,7 @@ namespace Freefall.Assets
             var importer = (IImporter)Activator.CreateInstance(importerType);
 
             // Restore saved settings if available
-            var meta = GetMeta(sourceGuid);
+            var meta = GetMeta(sourceGuidResolved);
             if (meta != null && !string.IsNullOrEmpty(meta.ImporterSettings))
             {
                 try
@@ -526,7 +535,7 @@ namespace Freefall.Assets
 
         /// <summary>
         /// Scan Assets/ for source files, load existing .meta files from Library/,
-        /// create new .meta for untracked assets, remove orphaned .meta files.
+        /// create new .meta for untracked assets, detect renamed files, remove orphaned .meta files.
         /// </summary>
         public static void ScanAndSync()
         {
@@ -559,8 +568,9 @@ namespace Freefall.Assets
                 }
             }
 
-            // 3. Match existing metas to source files, register or clean up
+            // 3. Match existing metas to source files, register or collect orphans
             var matchedPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var orphanedMetas = new List<MetaFile>();
 
             foreach (var meta in existingMetas.Values)
             {
@@ -573,23 +583,86 @@ namespace Freefall.Assets
                 }
                 else
                 {
-                    // Source deleted — remove orphaned .meta
-                    var bucket = meta.Guid[..2];
-                    var metaPath = Path.Combine(libraryDir, bucket, $"{meta.Guid}.meta");
-                    if (File.Exists(metaPath))
-                    {
-                        File.Delete(metaPath);
-                        Debug.Log($"[AssetDatabase] Removed orphan: {meta.SourcePath}");
-                    }
+                    orphanedMetas.Add(meta);
                 }
             }
 
-            // 4. Create .meta for new (untracked) source files
+            // 4. Collect untracked source files (potential rename targets)
+            var untrackedFiles = new Dictionary<string, FileInfo>(StringComparer.OrdinalIgnoreCase);
             foreach (var (path, fileInfo) in sourceFiles)
             {
-                if (matchedPaths.Contains(path))
-                    continue;
+                if (!matchedPaths.Contains(path))
+                    untrackedFiles[path] = fileInfo;
+            }
 
+            // 5. Try to match orphaned metas to untracked files (external rename detection)
+            //    Match by: same parent folder + same extension + same file size
+            foreach (var meta in orphanedMetas.ToList())
+            {
+                var oldDir = Path.GetDirectoryName(NormalizePath(meta.SourcePath)) ?? "";
+                var oldExt = Path.GetExtension(meta.SourcePath);
+
+                MetaFile bestMatch = null;
+                string bestPath = null;
+                int bestDistance = int.MaxValue;
+
+                foreach (var (candidatePath, candidateInfo) in untrackedFiles)
+                {
+                    var candidateDir = Path.GetDirectoryName(candidatePath) ?? "";
+                    var candidateExt = candidateInfo.Extension;
+
+                    // Must be same folder and same extension
+                    if (!oldDir.Equals(candidateDir, StringComparison.OrdinalIgnoreCase))
+                        continue;
+                    if (!oldExt.Equals(candidateExt, StringComparison.OrdinalIgnoreCase))
+                        continue;
+
+                    // Prefer same file size (strong signal for rename vs replace)
+                    if (meta.FileSize > 0 && candidateInfo.Length != meta.FileSize)
+                        continue;
+
+                    // Pick closest name (simple character distance for tie-breaking)
+                    var oldName = Path.GetFileNameWithoutExtension(meta.SourcePath);
+                    var newName = Path.GetFileNameWithoutExtension(candidatePath);
+                    int dist = Math.Abs(oldName.Length - newName.Length);
+                    if (dist < bestDistance)
+                    {
+                        bestDistance = dist;
+                        bestPath = candidatePath;
+                    }
+                }
+
+                if (bestPath != null)
+                {
+                    // Adopt: update meta's SourcePath to the renamed file
+                    var oldPath = meta.SourcePath;
+                    meta.SourcePath = bestPath;
+                    meta.LastImported = DateTime.MinValue; // Force reimport
+                    WriteMetaFile(meta);
+                    RegisterMeta(meta);
+                    matchedPaths.Add(bestPath);
+                    untrackedFiles.Remove(bestPath);
+                    orphanedMetas.Remove(meta);
+
+                    Debug.Log($"[AssetDatabase] Detected rename: {oldPath} → {bestPath} (GUID preserved)");
+                }
+            }
+
+            // 6. Delete truly orphaned metas (source was deleted, not renamed)
+            foreach (var meta in orphanedMetas)
+            {
+                var bucket = meta.Guid[..2];
+                var metaPath = Path.Combine(libraryDir, bucket, $"{meta.Guid}.meta");
+                if (File.Exists(metaPath))
+                {
+                    File.Delete(metaPath);
+                    Debug.Log($"[AssetDatabase] Removed orphan: {meta.SourcePath}");
+                }
+            }
+
+            // 7. Create .meta for remaining untracked source files
+            foreach (var (path, fileInfo) in untrackedFiles)
+            {
                 var guid = System.Guid.NewGuid().ToString("N");
                 var meta = new MetaFile
                 {
@@ -605,6 +678,72 @@ namespace Freefall.Assets
 
                 Debug.Log($"[AssetDatabase] Tracking new asset: {path}");
             }
+        }
+
+        /// <summary>
+        /// Rename an asset's source file on disk and update all internal lookups.
+        /// The GUID is preserved, so all scene references remain valid.
+        /// Returns true on success.
+        /// </summary>
+        public static bool RenameAsset(string guid, string newName)
+        {
+            if (string.IsNullOrEmpty(guid) || string.IsNullOrEmpty(newName))
+                return false;
+
+            if (!_guidToMeta.TryGetValue(guid, out var meta))
+                return false;
+
+            var assetsDir = Project.AssetsDirectory;
+            var oldRelative = meta.SourcePath;
+            var oldFull = Path.Combine(assetsDir, oldRelative);
+
+            if (!File.Exists(oldFull))
+            {
+                Debug.LogWarning("AssetDatabase", $"Cannot rename: source file not found: {oldRelative}");
+                return false;
+            }
+
+            var ext = Path.GetExtension(oldRelative);
+            var dir = Path.GetDirectoryName(oldRelative) ?? "";
+            var newRelative = Path.Combine(dir, newName + ext);
+            var newFull = Path.Combine(assetsDir, newRelative);
+
+            // Don't overwrite existing files
+            if (File.Exists(newFull))
+            {
+                Debug.LogWarning("AssetDatabase", $"Cannot rename: file already exists: {newRelative}");
+                return false;
+            }
+
+            try
+            {
+                File.Move(oldFull, newFull);
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning("AssetDatabase", $"Rename failed: {ex.Message}");
+                return false;
+            }
+
+            // Update internal lookups
+            var oldNormalized = NormalizePath(oldRelative);
+            var newNormalized = NormalizePath(newRelative);
+
+            _pathToGuid.Remove(oldNormalized);
+            _pathToGuid[newNormalized] = guid;
+            _guidToPath[guid] = newRelative;
+
+            // Update meta file
+            meta.SourcePath = newRelative;
+            WriteMetaFile(meta);
+
+            // Update name on any loaded asset instance
+            var loadedAsset = Engine.Assets?.FindByGuid(guid);
+            if (loadedAsset != null)
+                loadedAsset.Name = newName;
+
+            Debug.Log($"[AssetDatabase] Renamed: {oldRelative} → {newRelative}");
+            return true;
         }
 
         private static void RegisterMeta(MetaFile meta)

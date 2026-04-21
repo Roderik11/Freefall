@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using System.Numerics;
 using System.ComponentModel;
@@ -31,7 +32,7 @@ namespace Freefall.Assets.Importers
     /// Produces all artifacts from a single source: mesh data, skeleton, and animations.
     /// Replaces MeshImporter and AnimationClipImporter for standard model files.
     /// </summary>
-    [AssetImporter(".fbx", ".dae", ".obj")]
+    [AssetImporter(".fbx", ".dae", ".obj", ".x")]
     public class ModelImporter : IImporter
     {
         /// <summary>
@@ -75,6 +76,7 @@ namespace Freefall.Assets.Importers
             // Apply override settings if set (from UnityImporterWindow)
             if (OverrideSettings != null)
             {
+                Scale = OverrideSettings.Scale;
                 ConvertUnits = OverrideSettings.ConvertUnits;
                 Optimize = OverrideSettings.Optimize;
                 PreTransform = OverrideSettings.PreTransform;
@@ -156,6 +158,8 @@ namespace Freefall.Assets.Importers
             return result;
         }
 
+        public object GetInspectionTarget(MetaFile meta) => this;
+
         /// <summary>
         /// Parse mesh data only (CPU arrays, no GPU). Thread-safe.
         /// Used by StaticMeshImporter and other callers that only need the mesh.
@@ -196,45 +200,139 @@ namespace Freefall.Assets.Importers
             _validNodes.Clear();
             _bones.Clear();
 
-            // Unit conversion: DAE defaults to 0.01, FBX to 1.0
-            // If Scale is explicitly set (non-1), use it directly. Otherwise use convention.
-            if (Scale != 1f)
-                scale = Scale;
-            else if (ConvertUnits && filepath.EndsWith(".dae", StringComparison.OrdinalIgnoreCase))
-                scale = 0.01f;
-            else
-                scale = Scale;
+            // ASCII FBX 6.1.0 is not supported by Assimp — auto-convert to binary
+            string tempBinaryFbx = null;
+            if (IsAsciiFbx(filepath))
+            {
+                tempBinaryFbx = ConvertAsciiFbx(filepath);
+                filepath = tempBinaryFbx;
+            }
 
-            var importer = new AssimpContext();
+            try
+            {
+                // Unit conversion: DAE defaults to 0.01, FBX to 1.0
+                // If Scale is explicitly set (non-1), use it directly. Otherwise use convention.
+                if (Scale != 1f)
+                    scale = Scale;
+                else if (ConvertUnits && filepath.EndsWith(".dae", StringComparison.OrdinalIgnoreCase))
+                    scale = 0.01f;
+                else
+                    scale = Scale;
 
-            importer.SetConfig(new Assimp.Configs.NormalSmoothingAngleConfig(SmoothingAngle));
-            importer.SetConfig(new Assimp.Configs.GlobalScaleConfig(scale));
-            importer.SetConfig(new Assimp.Configs.KeepSceneHierarchyConfig(true));
+                var importer = new AssimpContext();
 
-            // Build post-process steps from config fields
-            var steps = PostProcessSteps.Triangulate
-                      | PostProcessSteps.GenerateNormals
-                      | PostProcessSteps.GenerateUVCoords
-                      | PostProcessSteps.SortByPrimitiveType
-                      | PostProcessSteps.ImproveCacheLocality
-                      | PostProcessSteps.JoinIdenticalVertices
-                      | PostProcessSteps.ValidateDataStructure
-                      | PostProcessSteps.GlobalScale;
+                importer.SetConfig(new Assimp.Configs.NormalSmoothingAngleConfig(SmoothingAngle));
+                importer.SetConfig(new Assimp.Configs.GlobalScaleConfig(scale));
+                importer.SetConfig(new Assimp.Configs.KeepSceneHierarchyConfig(true));
 
-            if (LeftHanded)         steps |= PostProcessSteps.MakeLeftHanded;
-            if (FlipWinding)        steps |= PostProcessSteps.FlipWindingOrder;
-            if (FlipUVs)            steps |= PostProcessSteps.FlipUVs;
-            if (CalculateTangents)  steps |= PostProcessSteps.CalculateTangentSpace;
-            if (Optimize)           steps |= PostProcessSteps.OptimizeMeshes | PostProcessSteps.OptimizeGraph;
-            if (PreTransform)       steps |= PostProcessSteps.PreTransformVertices;
+                // Build post-process steps from config fields
+                var steps = PostProcessSteps.Triangulate
+                          | PostProcessSteps.GenerateNormals
+                          | PostProcessSteps.GenerateUVCoords
+                          | PostProcessSteps.SortByPrimitiveType
+                          | PostProcessSteps.ImproveCacheLocality
+                          | PostProcessSteps.JoinIdenticalVertices
+                          | PostProcessSteps.ValidateDataStructure
+                          | PostProcessSteps.GlobalScale;
 
-            var scene = importer.ImportFile(filepath, steps);
+                if (LeftHanded)         steps |= PostProcessSteps.MakeLeftHanded;
+                if (FlipWinding)        steps |= PostProcessSteps.FlipWindingOrder;
+                if (FlipUVs)            steps |= PostProcessSteps.FlipUVs;
+                if (CalculateTangents)  steps |= PostProcessSteps.CalculateTangentSpace;
+                if (Optimize)           steps |= PostProcessSteps.OptimizeMeshes | PostProcessSteps.OptimizeGraph;
+                if (PreTransform)       steps |= PostProcessSteps.PreTransformVertices;
 
-            if (scene == null)
-                throw new Exception($"Failed to load model from {filepath}");
+                var scene = importer.ImportFile(filepath, steps);
 
-            return scene;
+                if (scene == null)
+                    throw new Exception($"Failed to load model from {filepath}");
+
+                // Temp debug: dump node hierarchy transforms
+                //var fname = System.IO.Path.GetFileNameWithoutExtension(filepath);
+                //DumpNodeHierarchy(scene.RootNode, fname, 0);
+
+                return scene;
+            }
+            finally
+            {
+                // Clean up temp binary FBX
+                if (tempBinaryFbx != null)
+                    try { File.Delete(tempBinaryFbx); } catch { }
+            }
         }
+
+        /// <summary>
+        /// Detect ASCII FBX format by checking the file header.
+        /// ASCII FBX starts with "; FBX" or ";FBX", binary starts with "Kaydara FBX Binary".
+        /// </summary>
+        private static bool IsAsciiFbx(string filepath)
+        {
+            if (!filepath.EndsWith(".fbx", StringComparison.OrdinalIgnoreCase))
+                return false;
+
+            try
+            {
+                using var fs = File.OpenRead(filepath);
+                var header = new byte[20];
+                if (fs.Read(header, 0, header.Length) < 5) return false;
+
+                // ASCII: starts with ";FBX" or "; FBX"
+                // Binary: starts with "Kaydara FBX Binary"
+                return header[0] == (byte)';';
+            }
+            catch { return false; }
+        }
+
+        /// <summary>
+        /// Convert an ASCII FBX file to binary FBX using FbxConverter.exe.
+        /// Resolved next to the running executable, same as texconv.exe.
+        /// Returns the path to the temporary binary FBX file.
+        /// </summary>
+        private static string ConvertAsciiFbx(string sourcePath)
+        {
+            var exeDir = AppDomain.CurrentDomain.BaseDirectory;
+            var converterPath = System.IO.Path.Combine(exeDir, "FbxConverter.exe");
+
+            if (!File.Exists(converterPath))
+                throw new FileNotFoundException(
+                    $"FbxConverter.exe not found at '{converterPath}'. " +
+                    "Copy the Autodesk FBX Converter to the editor output directory.");
+
+            // Write to a temp file so we don't modify the original
+            var tempPath = System.IO.Path.Combine(
+                System.IO.Path.GetTempPath(),
+                $"freefall_fbx_{Guid.NewGuid():N}.fbx");
+
+            var args = $"\"{sourcePath}\" \"{tempPath}\" /f /v";
+
+            var psi = new ProcessStartInfo(converterPath)
+            {
+                Arguments = args,
+                CreateNoWindow = true,
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+            };
+
+            using var process = Process.Start(psi);
+            var stdout = process.StandardOutput.ReadToEnd();
+            var stderr = process.StandardError.ReadToEnd();
+            process.WaitForExit();
+
+            if (process.ExitCode != 0 || !File.Exists(tempPath))
+            {
+                // Clean up on failure
+                try { if (File.Exists(tempPath)) File.Delete(tempPath); } catch { }
+                throw new Exception(
+                    $"FbxConverter failed (exit {process.ExitCode}):\n{stderr}\n{stdout}");
+            }
+
+            var srcName = System.IO.Path.GetFileName(sourcePath);
+            Debug.Log("ModelImporter", $"Converted ASCII FBX → binary: {srcName}");
+
+            return tempPath;
+        }
+
 
         // ══════════════════════════════════════════════════════════════
         // Mesh Extraction (ported from MeshImporter.ParseRaw)
@@ -484,6 +582,68 @@ namespace Freefall.Assets.Importers
             if (node.HasChildren)
                 foreach (var child in node.Children)
                     BuildMeshNodeMap(child, map);
+        }
+
+        private static readonly object _dumpLock = new();
+        private static void DumpNodeHierarchy(Node node, string file, int depth)
+        {
+            var lines = new List<string>();
+            CollectNodeHierarchy(node, file, depth, lines);
+            lock (_dumpLock)
+            {
+                var dumpPath = @"d:\Projects\2026\Freefall\.tmp\fbx_nodes.txt";
+                Directory.CreateDirectory(Path.GetDirectoryName(dumpPath)!);
+                File.AppendAllLines(dumpPath, lines);
+            }
+        }
+
+        private static void CollectNodeHierarchy(Node node, string file, int depth, List<string> lines)
+        {
+            var indent = new string(' ', depth * 2);
+            var t = node.Transform;
+            bool isIdentity = t.A1 == 1 && t.B2 == 1 && t.C3 == 1 && t.D4 == 1 &&
+                              t.A2 == 0 && t.A3 == 0 && t.A4 == 0 &&
+                              t.B1 == 0 && t.B3 == 0 && t.B4 == 0 &&
+                              t.C1 == 0 && t.C2 == 0 && t.C4 == 0 &&
+                              t.D1 == 0 && t.D2 == 0 && t.D3 == 0;
+            var meshStr = node.HasMeshes ? $" [meshes: {string.Join(",", node.MeshIndices)}]" : "";
+            if (!isIdentity)
+            {
+                lines.Add($"[FBX] {file}: {indent}{node.Name}{meshStr} T=[{t.A4:F4},{t.B4:F4},{t.C4:F4}] S=[{t.A1:F4},{t.B2:F4},{t.C3:F4}] R=[{t.A2:F4},{t.A3:F4},{t.B1:F4},{t.B3:F4},{t.C1:F4},{t.C2:F4}]");
+            }
+            else
+            {
+                lines.Add($"[FBX] {file}: {indent}{node.Name}{meshStr} (identity)");
+            }
+            if (node.HasChildren)
+                foreach (var child in node.Children)
+                    CollectNodeHierarchy(child, file, depth + 1, lines);
+        }
+
+        /// <summary>
+        /// Build a map of Assimp mesh index → accumulated world transform.
+        /// This bakes the FBX node hierarchy transforms into each mesh's coordinate space.
+        /// </summary>
+        private static void BuildMeshTransformMap(Node node, Matrix4x4 parentTransform, Dictionary<int, Matrix4x4> map)
+        {
+            // Convert Assimp's Matrix4x4 to System.Numerics.Matrix4x4
+            var at = node.Transform;
+            var localTransform = new Matrix4x4(
+                at.A1, at.B1, at.C1, at.D1,
+                at.A2, at.B2, at.C2, at.D2,
+                at.A3, at.B3, at.C3, at.D3,
+                at.A4, at.B4, at.C4, at.D4);
+
+            var worldTransform = localTransform * parentTransform;
+
+            if (node.HasMeshes)
+                foreach (var meshIdx in node.MeshIndices)
+                    if (!map.ContainsKey(meshIdx))
+                        map[meshIdx] = worldTransform;
+
+            if (node.HasChildren)
+                foreach (var child in node.Children)
+                    BuildMeshTransformMap(child, worldTransform, map);
         }
 
         private static bool IsCollisionPart(string name)

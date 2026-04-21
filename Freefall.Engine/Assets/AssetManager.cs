@@ -88,6 +88,19 @@ namespace Freefall.Assets
         }
 
         /// <summary>
+        /// Evict a cached asset by its GUID so the next load picks up fresh data
+        /// from the updated cache file. Call after saving/reimporting an asset.
+        /// </summary>
+        public void EvictByGuid(string guid)
+        {
+            if (string.IsNullOrEmpty(guid)) return;
+            string suffix = $":guid:{guid}";
+            var keysToRemove = _assets.Keys.Where(k => k.EndsWith(suffix)).ToList();
+            foreach (var key in keysToRemove)
+                _assets.TryRemove(key, out _);
+        }
+
+        /// <summary>
         /// Discover all IAssetLoader implementations marked with [AssetLoader].
         /// </summary>
         private static void DiscoverLoaders()

@@ -45,13 +45,14 @@ struct DecoratorSlot
     float Rot20, Rot21, Rot22;
     float SlopeBias;
     uint DecoMapSlice;
-    uint _pad0;
+    uint SourceLayerMask;
     uint Mode;
     uint TextureIdx;
     float3 HealthyColor;
     float3 DryColor;
     float NoiseSpread;
-    uint _colorPad;
+    uint ExclusionLayerMask;
+    float ProceduralBlend;
 };
 
 struct LODEntry { uint MeshPartId; float MaxDistance; uint MaterialId; uint _pad; };

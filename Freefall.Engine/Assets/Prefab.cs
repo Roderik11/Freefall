@@ -60,7 +60,10 @@ namespace Freefall.Assets
 
             // Tag all entities as instances of this prefab
             foreach (var e in entities)
+            {
                 e.Prefab = this;
+                break;
+            }
 
             Debug.Log($"[Prefab] Instantiated '{Name}': {entities.Count} entities");
             return entities[0]; // root entity
@@ -128,8 +131,6 @@ namespace Freefall.Assets
                 var child = prefabEntities[i];
                 if (child.Transform.Parent == root.Transform)
                     child.Transform.Parent = target.Transform;
-
-                child.Prefab = this;
             }
 
             // Tag it
@@ -148,7 +149,11 @@ namespace Freefall.Assets
         /// </summary>
         public int UpdateFromInstance(Entity source)
         {
-            // Temporarily zero out transform for serialization
+            // Collect the full hierarchy: root + all descendants (depth-first)
+            var hierarchy = new List<Entity>();
+            CollectHierarchy(source, hierarchy);
+
+            // Temporarily zero out root transform for serialization
             var savedPos = source.Transform.Position;
             var savedRot = source.Transform.Rotation;
             var savedScale = source.Transform.Scale;
@@ -164,9 +169,9 @@ namespace Freefall.Assets
             source.Transform.Scale = System.Numerics.Vector3.One;
             source.Transform.Parent = null;
 
-            // Serialize to YAML
+            // Serialize the entire hierarchy to YAML
             var serializer = new EntitySerializer();
-            var yaml = serializer.SaveToString(new List<Entity> { source });
+            var yaml = serializer.SaveToString(hierarchy);
 
             // Restore transform and prefab reference
             source.Transform.Position = savedPos;
@@ -178,9 +183,10 @@ namespace Freefall.Assets
             // Update the prefab asset
             SourceYaml = Encoding.UTF8.GetBytes(yaml);
             RootEntityName = source.Name;
+            EntityCount = hierarchy.Count;
             MarkDirty();
 
-            Debug.Log($"[Prefab] Updated prefab '{Name}' from instance '{source.Name}'");
+            Debug.Log($"[Prefab] Updated prefab '{Name}' from instance '{source.Name}' ({hierarchy.Count} entities)");
 
             // Propagate to all other instances
             return UpdateAllInstances();
@@ -264,8 +270,10 @@ namespace Freefall.Assets
                 UpdateInstance(instance, template);
 
             // Clean up temporary template entities
-            foreach (var te in templateEntities)
-                EntityManager.RemoveEntity(te);
+            // Must use Destroy() — not just RemoveEntity — to unregister
+            // components from ComponentCaches (MeshRenderer, etc.)
+            for (int i = templateEntities.Count - 1; i >= 0; i--)
+                templateEntities[i].Destroy();
 
             Debug.Log($"[Prefab] Updated {instances.Count} instances of '{Name}'");
             return instances.Count;
@@ -293,6 +301,21 @@ namespace Freefall.Assets
                     field.SetValue(target, value);
                 }
                 catch { /* skip fields that fail to copy */ }
+            }
+        }
+        /// <summary>
+        /// Collect an entity and all its descendants depth-first.
+        /// Used by UpdateFromInstance to serialize the full prefab hierarchy.
+        /// </summary>
+        private static void CollectHierarchy(Entity entity, List<Entity> result)
+        {
+            result.Add(entity);
+            int childCount = entity.Transform.GetChildCount();
+            for (int i = 0; i < childCount; i++)
+            {
+                var child = entity.Transform.GetChild(i);
+                if (child?.Entity != null)
+                    CollectHierarchy(child.Entity, result);
             }
         }
     }

@@ -33,6 +33,7 @@ namespace Freefall.Graphics
         public int? RenderTargetCount { get; set; }
         public bool? DepthTest { get; set; }
         public bool? DepthWrite { get; set; }
+        public string? DepthFunc { get; set; }
     }
 
     public static class FXParser
@@ -116,6 +117,7 @@ namespace Freefall.Graphics
                                     case "RenderTargets": pass.RenderTargetCount = int.Parse(value); break;
                                     case "DepthTest": pass.DepthTest = bool.Parse(value); break;
                                     case "DepthWrite": pass.DepthWrite = bool.Parse(value); break;
+                                    case "DepthFunc": pass.DepthFunc = value; break;
                                 }
                             }
                         }

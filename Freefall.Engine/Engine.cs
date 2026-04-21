@@ -217,7 +217,7 @@ namespace Freefall
             foreach (var view in _renderViews)
             {
                 if (!view.Enabled) continue;
-                if (!view.HasSwapChain) continue; // Headless views rendered manually (e.g. RenderGui)
+                if (!view.HasSwapChain) continue; // Headless views rendered inside primary view's OnRender
 
                 if (view.OnRender != null)
                 {
@@ -312,8 +312,8 @@ namespace Freefall
             // F8: Toggle wireframe mode
             if (Input.IsKeyPressed(Keys.F8))
             {
-                Settings.TerrainWireframe = !Settings.TerrainWireframe;
-                Debug.Log($"[Engine] Wireframe {(Settings.TerrainWireframe ? "Enabled" : "Disabled")}");
+                Settings.Wireframe = !Settings.Wireframe;
+                Debug.Log($"[Engine] Wireframe {(Settings.Wireframe ? "Enabled" : "Disabled")}");
             }
 
             // F9: Toggle VSync
@@ -379,7 +379,7 @@ namespace Freefall
     public class EngineSettings
     {
          public bool VSync { get; set; } = true;                            // F1 - VSync
-         public bool TerrainWireframe { get; set; } = false;                // F2 - Global wireframe
+         public bool Wireframe { get; set; } = false;                // F2 - Global wireframe
          public bool FreezeFrustum { get; set; } = false;                   // F3 - Freeze culling frustum
          public bool UseAdaptiveSplits { get; set; } = true;                // F4 - SDSM adaptive cascade splits
          public bool DisableHiZ { get; set; } = false;                      // F6 - Disable Hi-Z occlusion

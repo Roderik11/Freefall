@@ -144,5 +144,22 @@ namespace Freefall.Assets.Loaders
                     $"Failed to load cooked collision mesh for '{name}': {ex.Message}");
             }
         }
+        /// <summary>
+        /// Save a StaticMesh to its source .staticmesh file as YAML, then re-import
+        /// so the binary cache (.asset) stays in sync.
+        /// </summary>
+        public void Save(Asset asset, string savePath)
+        {
+            NativeImporter.Save(savePath, asset);
+            Debug.Log($"[StaticMeshLoader] Saved: {savePath}");
+
+            // Re-import to update the binary cache
+            var assetsDir = Engine.Project?.AssetsDirectory;
+            if (!string.IsNullOrEmpty(assetsDir) && savePath.StartsWith(assetsDir))
+            {
+                var relativePath = Path.GetRelativePath(assetsDir, savePath).Replace('\\', '/');
+                AssetDatabase.ImportAssetByPath(relativePath);
+            }
+        }
     }
 }

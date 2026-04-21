@@ -119,65 +119,87 @@ namespace Freefall.Assets
     public enum NoiseType { Simplex, Perlin, Ridged, Billow }
 
     /// <summary>
-    /// GPU erosion simulation layer. Reads height produced by layers below,
-    /// runs iterative hydraulic and/or thermal erosion, writes eroded result.
-    /// Heavy compute — cached after first bake, re-runs only when parameters change.
+    /// Noise-based erosion filter layer. Applies the runevision Advanced Terrain
+    /// Erosion Filter on top of the accumulated height from layers below.
+    /// Single GPU dispatch — produces crisp branching gullies via Phacelle noise.
     /// </summary>
     [Serializable]
     public class ErosionHeightLayer : HeightLayer
     {
+        /// <summary>Overall horizontal + vertical scale of erosion features.</summary>
         [DirtyFlag(HeightAll)]
-        public ErosionMode Mode = ErosionMode.Hydraulic;
+        [ValueRange(0.01f, 1f)]
+        public float Scale = 0.15f;
 
-        /// <summary>Number of simulation iterations. More = deeper erosion, slower bake.</summary>
+        /// <summary>Erosion magnitude. Higher = deeper gullies and sharper ridges.</summary>
         [DirtyFlag(HeightAll)]
-        [ValueRange(1, 500)]
-        public int Iterations = 100;
+        [ValueRange(0.01f, 1f)]
+        public float Strength = 0.22f;
 
-        // ── Hydraulic erosion ──
-
-        /// <summary>Rain amount per iteration (water deposited).</summary>
-        [DirtyFlag(HeightAll)]
-        [ValueRange(0f, 0.1f)]
-        public float RainRate = 0.01f;
-
-        /// <summary>Max sediment a unit of water can carry.</summary>
+        /// <summary>Gully visibility weight. 0 = sharp peaks only, 1 = full gullies.</summary>
         [DirtyFlag(HeightAll)]
         [ValueRange(0f, 1f)]
-        public float SedimentCapacity = 0.1f;
+        public float GullyWeight = 0.5f;
 
-        /// <summary>Fraction of sediment deposited when water slows.</summary>
+        /// <summary>Detail level. Lower values restrict fine gullies to steep slopes.</summary>
+        [DirtyFlag(HeightAll)]
+        [ValueRange(0.1f, 5f)]
+        public float Detail = 1.5f;
+
+        /// <summary>Number of gully octaves. More = finer branching detail.</summary>
+        [DirtyFlag(HeightAll)]
+        [ValueRange(1, 8)]
+        public int Octaves = 5;
+
+        /// <summary>Frequency multiplier per octave.</summary>
+        [DirtyFlag(HeightAll)]
+        [ValueRange(1.5f, 4f)]
+        public float Lacunarity = 2.0f;
+
+        /// <summary>Amplitude decay per octave.</summary>
+        [DirtyFlag(HeightAll)]
+        [ValueRange(0.1f, 1f)]
+        public float Gain = 0.5f;
+
+        // ── Edge rounding ──
+
+        /// <summary>Rounding of ridges (mountain crests). 0 = sharp, higher = softer.</summary>
+        [DirtyFlag(HeightAll)]
+        [ValueRange(0f, 2f)]
+        public float RidgeRounding = 0.1f;
+
+        /// <summary>Rounding of creases (valley bottoms). 0 = sharp V-shaped, higher = smoother.</summary>
+        [DirtyFlag(HeightAll)]
+        [ValueRange(0f, 2f)]
+        public float CreaseRounding = 0f;
+
+        // ── Advanced ──
+
+        /// <summary>Phacelle cell size relative to stripe width. ~0.7 is a good default.</summary>
+        [DirtyFlag(HeightAll)]
+        [ValueRange(0.3f, 1.5f)]
+        public float CellScale = 0.7f;
+
+        /// <summary>Normalization of gully magnitudes. Higher = more consistent ridges, risk of loop artifacts.</summary>
         [DirtyFlag(HeightAll)]
         [ValueRange(0f, 1f)]
-        public float DepositionRate = 0.3f;
+        public float Normalization = 0.5f;
 
-        /// <summary>Fraction of terrain dissolved per step.</summary>
+        /// <summary>Slope onset threshold — how quickly erosion ramps up with slope.</summary>
         [DirtyFlag(HeightAll)]
-        [ValueRange(0f, 0.1f)]
-        public float DissolutionRate = 0.01f;
+        [ValueRange(0.1f, 5f)]
+        public float SlopeOnset = 1.25f;
 
-        /// <summary>Water evaporation rate per iteration.</summary>
+        /// <summary>Assumed slope magnitude for gully directions (overrides actual gradient).</summary>
         [DirtyFlag(HeightAll)]
-        [ValueRange(0f, 1f)]
-        public float Evaporation = 0.05f;
+        [ValueRange(0f, 2f)]
+        public float AssumedSlope = 0.7f;
 
-        // ── Thermal erosion ──
-
-        /// <summary>Maximum stable slope angle in degrees. Steeper slopes collapse.</summary>
-        [DirtyFlag(HeightAll)]
-        [ValueRange(0f, 90f)]
-        public float TalusAngle = 40f;
-
-        /// <summary>Fraction of excess material moved per thermal iteration.</summary>
+        /// <summary>Amount to use assumed slope vs actual gradient. 0 = actual, 1 = fully assumed.</summary>
         [DirtyFlag(HeightAll)]
         [ValueRange(0f, 1f)]
-        public float ThermalRate = 0.5f;
-
-        [DirtyFlag(HeightAll)]
-        public int Seed = 0;
+        public float AssumedSlopeAmount = 1.0f;
     }
-
-    public enum ErosionMode { Hydraulic, Thermal, Both }
 
     /// <summary>
     /// Hand-painted height layer. A GPU R16_Float texture (ControlMap) is painted

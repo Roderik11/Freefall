@@ -13,6 +13,7 @@ namespace Freefall.Assets.Importers
     public class MaterialImporter : IImporter
     {
         public Type AssetType => typeof(Graphics.Material);
+
         /// <summary>
         /// .mat files ARE the asset definition — inspect the loaded Material, not the importer.
         /// </summary>
@@ -20,6 +21,7 @@ namespace Freefall.Assets.Importers
         {
             return Engine.Assets.LoadByGuid<Material>(meta.Guid);
         }
+        
         public ImportResult Import(string filepath)
         {
             var result = new ImportResult();

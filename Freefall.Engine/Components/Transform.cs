@@ -132,7 +132,7 @@ namespace Freefall.Components
                 if (_parent != null && Matrix4x4.Invert(_parent.Matrix, out var inverse))
                     m *= inverse;
 
-                Matrix4x4.Decompose(m, out _, out _rotation, out _position);
+                Matrix4x4.Decompose(m, out _scale, out _rotation, out _position);
 
                 SetDirty();
             }
@@ -212,6 +212,20 @@ namespace Freefall.Components
             if (right != 0) _position += s * right;
 
             SetDirty();
+        }
+
+        public void SetParent(Transform parent, bool keepWorld = false)
+        {
+            if (keepWorld)
+            {
+                Matrix4x4 world = Matrix;
+                Parent = parent;
+                Matrix = world;
+            }
+            else
+            {
+                Parent = parent;
+            }
         }
 
         public void SetRotation(float pitch, float yaw, float roll)

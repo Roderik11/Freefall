@@ -20,6 +20,7 @@ namespace Freefall.Graphics
         Center
     }
 
+    [Serializable]
     public class MeshPart
     {
         public string Name = string.Empty;
@@ -109,10 +110,10 @@ namespace Freefall.Graphics
         private int _indexCount;
 
         // Bindless Indices
-        public uint PosBufferIndex { get; private set; }
-        public uint NormBufferIndex { get; private set; }
-        public uint UVBufferIndex { get; private set; }
-        public uint IndexBufferIndex { get; private set; }
+        public uint PosBufferIndex { get; internal set; }
+        public uint NormBufferIndex { get; internal set; }
+        public uint UVBufferIndex { get; internal set; }
+        public uint IndexBufferIndex { get; internal set; }
         
         public BoundingBox BoundingBox { get; set; }
         
@@ -353,7 +354,7 @@ namespace Freefall.Graphics
         }
 
         // Methods related to MeshRegistry, BoneWeights, Draw() etc. preserved...
-        public int GetMeshPartId(int partIndex) { if (_meshPartIds == null) return -1; return _meshPartIds[partIndex]; }
+        public int GetMeshPartId(int partIndex) { if (_meshPartIds == null) return -1; return _meshPartIds.Length > partIndex ? _meshPartIds[partIndex] : -1; }
         public void RegisterMeshParts() { if (MeshParts.Count == 0) return; _meshPartIds = new int[MeshParts.Count]; for (int i = 0; i < MeshParts.Count; i++) _meshPartIds[i] = MeshRegistry.Register(this, i); }
         
         public int IndexCount => _indexCount;

@@ -26,12 +26,13 @@ namespace Freefall.Graphics
             RasterizerStateName = desc.RasterizerState;
 
             // Build per-pass render state override if any fields were specified
-            if (desc.RenderTargetCount.HasValue || desc.DepthTest.HasValue || desc.DepthWrite.HasValue)
+            if (desc.RenderTargetCount.HasValue || desc.DepthTest.HasValue || desc.DepthWrite.HasValue || desc.DepthFunc != null)
             {
                 RenderState = new ShaderRenderState();
                 if (desc.RenderTargetCount.HasValue) RenderState.RenderTargetCount = desc.RenderTargetCount.Value;
                 if (desc.DepthTest.HasValue) RenderState.DepthTest = desc.DepthTest.Value;
                 if (desc.DepthWrite.HasValue) RenderState.DepthWrite = desc.DepthWrite.Value;
+                if (desc.DepthFunc != null) RenderState.DepthFunc = desc.DepthFunc;
             }
 
             if (!string.IsNullOrEmpty(desc.VertexShaderEntry))

@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Numerics;
 using System.Collections.Generic;
 using Freefall.Assets;
@@ -53,7 +53,7 @@ namespace Freefall.Components
 
             var lodgroup = StaticMesh.LODGroup;
             float diameter = BoundingSphere.Radius;
-            float distanceSq = Vector3.DistanceSquared(Transform.Position, cam.Position);
+            float distanceSq = Vector3.DistanceSquared(Transform.WorldPosition, cam.Position);
             float sizeSq = (diameter * diameter / MathF.Max(distanceSq, 0.001f)) * cam.FoVFactor;
             int min = Math.Min(lodgroup.Ranges.Count, StaticMesh.LODs.Count);
 
@@ -73,13 +73,16 @@ namespace Freefall.Components
         // Draw method called by Renderer or System
         public void Draw()
         {
+
+            if (!Enabled) return;
              // Lazy recompute: mesh wasn't loaded during Awake()
              if (_boundsDirty) OnTransformChanged();
 
              IStaticMesh lod = GetMesh();
-             if (lod == null || lod.Mesh == null) return;
+             if (lod == null) return;
 
-             var mesh = lod.Mesh;
+             var mesh = lod.Mesh ?? StaticMesh.Mesh;
+             if (mesh == null) return;
              var elements = lod.MeshParts;
              var defaultMat = InternalAssets.DefaultMaterial;
              

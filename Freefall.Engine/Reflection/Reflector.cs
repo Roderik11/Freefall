@@ -61,6 +61,19 @@ namespace Freefall.Reflection
             }
         }
 
+        public static Mapping<T> GetMapping<T>(Type type) where T : Attribute
+        {
+            var mapping = GetMapping(type);
+            var typedMapping = new Mapping<T>();
+            foreach (var field in mapping)
+            {
+                if (field.GetAttribute<T>() != null)
+                    typedMapping.Add(field);
+            }
+
+            return typedMapping;
+        }
+
         /// <summary>
         /// Get the ordered field mapping for a type. Fields are ordered base-class first.
         /// Results are cached.

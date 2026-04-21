@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Numerics;
 using System.Runtime.InteropServices;
 using Vortice.Mathematics;
@@ -7,11 +7,24 @@ using Freefall.Graphics;
 
 namespace Freefall.Components
 {
-    public class PointLight : Component, IDraw, IUpdate
+    public class PointLight : Component, IDraw, IUpdate, ISceneGizmo
     {
         public Color3 Color = new Color3(1, 1, 1);
         public float Intensity = 1;
         public float Range = 10;
+
+        public void DrawGizmos(GizmoContext ctx)
+        {
+            // Static visualization: 3-axis wire sphere
+            ctx.Color = new Color4(1f, 0.9f, 0.3f, 1f);
+            //ctx.LineWidth = 0.02f;
+            ctx.DrawWireSphere(Vector3.Zero, Range);
+
+            // Interactive handle: drag circle edge to change range
+            ctx.Color = new Color4(1f, 0.7f, 0.1f, 1f);
+            ctx.LineWidth = 2f;
+            Range = ctx.RadiusHandle(Vector3.Zero, Range);
+        }
 
         private static Mesh? _sphereMesh;
         private static Effect? _sharedEffect;

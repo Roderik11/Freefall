@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Reflection;
 using System.Threading.Tasks;
+using System.Xml.Serialization;
 using Freefall.Components;
 
 namespace Freefall.Base
@@ -36,6 +37,25 @@ namespace Freefall.Base
         public Assets.Prefab Prefab { get; set; }
 
         public bool IsPrefabInstance => Prefab != null;
+
+        /// <summary>
+        /// True if any ancestor of this entity is a prefab instance root.
+        /// Used to skip prefab children during scene saves — they're reconstructed on load.
+        /// </summary>
+        public bool IsChildOfPrefabInstance
+        {
+            get
+            {
+                var parent = Transform.Parent;
+                while (parent != null)
+                {
+                    if (parent.Entity.IsPrefabInstance)
+                        return true;
+                    parent = parent.Parent;
+                }
+                return false;
+            }
+        }
 
         [Reflection.DontSerialize]
         public bool Hidden { get; set; }
@@ -134,6 +154,14 @@ namespace Freefall.Base
         /// </summary>
         public void Destroy()
         {
+            var childCount = Transform.Count;
+
+            for (int i = childCount - 1; i >= 0; i--)
+            {
+                var child = Transform.GetChild(i);
+                child?.Entity?.Destroy();
+            }
+
             foreach (var component in _components)
                 component.Destroy();
 
@@ -146,6 +174,7 @@ namespace Freefall.Base
             }
 
             _components.Clear();
+            Transform.Parent = null;
 
             EntityManager.RemoveEntity(this);
         }

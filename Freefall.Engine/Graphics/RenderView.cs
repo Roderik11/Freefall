@@ -223,7 +223,6 @@ namespace Freefall.Graphics
             CreateDepthStencil();
         }
 
-
         /// <summary>
         /// Handle resize from either internal Window.OnResize or external call.
         /// For swapchain views, resizes immediately. For headless views, this is also immediate.
@@ -309,6 +308,7 @@ namespace Freefall.Graphics
                 _headlessBackBuffer?.Dispose();
                 _headlessDepthBuffer?.Dispose();
                 CreateHeadlessBuffers();
+                _headlessBackBufferState = ResourceStates.Common; // New resource starts in Common
             }
 
             // Resize pipeline resources (G-Buffers etc)
@@ -403,6 +403,58 @@ namespace Freefall.Graphics
             _fenceValue++;
 
             _frameIndex = (int)_swapChain.CurrentBackBufferIndex;
+        }
+
+        // --- Headless render support (Apex pattern) ---
+        private ResourceStates _headlessBackBufferState = ResourceStates.Common;
+
+        /// <summary>
+        /// Prepare a headless view for rendering. Uses the primary view's command list.
+        /// Sets render target, viewport, scissor, and clears.
+        /// Call from OnRender callback before drawing.
+        /// </summary>
+        public void PrepareHeadless(ID3D12GraphicsCommandList cmd)
+        {
+            if (HasSwapChain || _headlessBackBuffer == null) return;
+
+            // Transition backbuffer to RenderTarget
+            if (_headlessBackBufferState != ResourceStates.RenderTarget)
+            {
+                cmd.ResourceBarrierTransition(
+                    _headlessBackBuffer.Native,
+                    _headlessBackBufferState, ResourceStates.RenderTarget);
+                _headlessBackBufferState = ResourceStates.RenderTarget;
+            }
+
+            // Set descriptor heaps for bindless access
+            cmd.SetDescriptorHeaps(1, new[] { _graphicsDevice.SrvHeap });
+
+            // Bind RT + depth, set viewport, clear
+            cmd.OMSetRenderTargets(_headlessBackBuffer.RtvHandle, _headlessDepthBuffer.DsvHandle);
+            cmd.RSSetViewport(new Viewport(0, 0, Width, Height, 0.0f, 1.0f));
+            cmd.RSSetScissorRect(new RectI(0, 0, Width, Height));
+            cmd.ClearRenderTargetView(_headlessBackBuffer.RtvHandle, new Color4(0.18f, 0.18f, 0.22f, 1.0f));
+            cmd.ClearDepthStencilView(_headlessDepthBuffer.DsvHandle, ClearFlags.Depth, 1.0f, 0);
+
+            // Set global root signature for bindless access
+            cmd.SetGraphicsRootSignature(_graphicsDevice.GlobalRootSignature);
+        }
+
+        /// <summary>
+        /// Finish headless rendering. Transitions backbuffer back to readable state.
+        /// Call from OnRender callback after all drawing.
+        /// </summary>
+        public void FinishHeadless(ID3D12GraphicsCommandList cmd)
+        {
+            if (HasSwapChain || _headlessBackBuffer == null) return;
+
+            if (_headlessBackBufferState != ResourceStates.Common)
+            {
+                cmd.ResourceBarrierTransition(
+                    _headlessBackBuffer.Native,
+                    _headlessBackBufferState, ResourceStates.Common);
+                _headlessBackBufferState = ResourceStates.Common;
+            }
         }
 
         private void SyncFrame(int index)

@@ -11,12 +11,13 @@ namespace Freefall.Assets.Importers
 {
     /// <summary>
     /// Imports animation clips from DAE-anim files.
-    /// Uses custom XML parsing like Apex (Assimp doesn't support .dae-anim extension).
     /// </summary>
     public class AnimationClipImporter : AssetImporter<AnimationClip>
     {
         // MATCH APEX: DAE animations are in cm, need 0.01 scale to match mesh
         public float Scale = 0.01f;
+
+        public object GetInspectionTarget(MetaFile meta) => this;
 
         public override AnimationClip Load(string filename)
         {
@@ -110,10 +111,7 @@ namespace Freefall.Assets.Importers
             return result;
         }
 
-        string ExtractNodeIdFromTarget(string target)
-        {
-            return target.Substring(0, target.IndexOf('/'));
-        }
+        string ExtractNodeIdFromTarget(string target) => target[..target.IndexOf('/')];
     }
 
     /// <summary>

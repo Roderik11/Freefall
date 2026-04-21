@@ -168,10 +168,10 @@ ShadowVSOutput VS_Shadow(uint primitiveVertexID : SV_VertexID, uint instanceID :
 // Shadow pixel shader - alpha test only, depth written by hardware
 void PS_Shadow(ShadowVSOutput input)
 {
-    MaterialData mat = GET_MATERIAL(input.MaterialID);
-    Texture2D albedoTex = ResourceDescriptorHeap[mat.AlbedoIdx];
-    float alpha = albedoTex.Sample(Sampler, input.TexCoord).a;
-    clip(alpha - 0.25f);
+    //MaterialData mat = GET_MATERIAL(input.MaterialID);
+    //Texture2D albedoTex = ResourceDescriptorHeap[mat.AlbedoIdx];
+    //float alpha = albedoTex.Sample(Sampler, input.TexCoord).a;
+    //clip(alpha - 0.25f);
 }
 
 PSOutput PS(VSOutput input)
@@ -185,7 +185,7 @@ PSOutput PS(VSOutput input)
     Texture2D albedoTex = ResourceDescriptorHeap[mat.AlbedoIdx];
     
     float4 color = albedoTex.Sample(Sampler, input.TexCoord);
-    clip(color.a - 0.25f);
+    //clip(color.a - 0.25f);
     
     // PBR material properties — defaults for meshes without PBR textures
     float roughness = 0.65;
@@ -211,6 +211,12 @@ PSOutput PS(VSOutput input)
     float3 dp1perp = cross(N, dp1);
     float3 T = dp2perp * duv1.x + dp1perp * duv2.x;
     float3 B = dp2perp * duv1.y + dp1perp * duv2.y;
+    
+    // Fix TBN handedness for mirrored geometry (negative-scale transforms)
+    // Without this, mirrored instances get inverted normal map lighting
+    float handedness = dot(cross(T, B), N) < 0.0 ? -1.0 : 1.0;
+    T *= handedness;
+    
     float invmax = rsqrt(max(dot(T, T), dot(B, B)));
     float3x3 TBN = float3x3(T * invmax, B * invmax, N);
     
@@ -223,32 +229,32 @@ PSOutput PS(VSOutput input)
         float3 texNormal = float3(nXY, sqrt(max(0.001, 1.0 - dot(nXY, nXY))));
         
         // Blend detail normal if present (UDN blending in tangent space)
-        if (mat.DetailNormalIdx != 0)
-        {
-            // Distance fade: full detail within 20m, gone by 60m
-            float dist = length(input.WorldPos.xyz);
-            float detailFade = 1.0 - saturate((dist - 20.0) / 40.0);
+        //if (mat.DetailNormalIdx != 0)
+        //{
+        //    // Distance fade: full detail within 20m, gone by 60m
+        //    float dist = length(input.WorldPos.xyz);
+        //    float detailFade = 1.0 - saturate((dist - 20.0) / 40.0);
             
-            if (detailFade > 0.01)
-            {
-                float detailTiling = asfloat(mat.DetailTilingPacked);
-                if (detailTiling <= 0.0) detailTiling = 5.0;
+        //    if (detailFade > 0.01)
+        //    {
+        //        float detailTiling = asfloat(mat.DetailTilingPacked);
+        //        if (detailTiling <= 0.0) detailTiling = 5.0;
                 
-                float2 detailUV = input.TexCoord * detailTiling;
-                Texture2D detailTex = ResourceDescriptorHeap[mat.DetailNormalIdx];
-                float2 dXY = detailTex.Sample(Sampler, detailUV).rg * 2.0 - 1.0;
-                dXY.y = -dXY.y;
+        //        float2 detailUV = input.TexCoord * detailTiling;
+        //        Texture2D detailTex = ResourceDescriptorHeap[mat.DetailNormalIdx];
+        //        float2 dXY = detailTex.Sample(Sampler, detailUV).rg * 2.0 - 1.0;
+        //        dXY.y = -dXY.y;
                 
-                // UDN blend: add XY with strength, recompute Z
-                texNormal.xy += dXY * detailFade * 2.0;
-                texNormal.z = sqrt(max(0.001, 1.0 - dot(texNormal.xy, texNormal.xy)));
-            }
-        }
+        //        // UDN blend: add XY with strength, recompute Z
+        //        texNormal.xy += dXY * detailFade * 2.0;
+        //        texNormal.z = sqrt(max(0.001, 1.0 - dot(texNormal.xy, texNormal.xy)));
+        //    }
+        //}
         
         N = normalize(mul(texNormal, TBN));
     }
     
-    output.Albedo = color;
+    output.Albedo = float4(color.rgb, 1.0);
     output.Normal = float4(N, 1.0f);
     output.Data = float4(saturate(roughness), saturate(metal), saturate(ao), 1.0);
     output.Depth = input.Depth;

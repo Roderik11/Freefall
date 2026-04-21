@@ -180,6 +180,7 @@ namespace Freefall.Components
         private ID3D12Resource? _decoControlTex;     // RGBA16_UINT, 2 slices
         private uint _decoControlUAV;
         private uint _decoControlSRV;
+        private GraphicsBuffer? _layerCtrlSrvBuffer; // StructuredBuffer<uint> of per-layer ControlMap SRVs
 
         // ───── Baked Terrain Albedo ───────────────────────────────────────
         private ComputeShader? _albedoBakeCS;
@@ -1503,15 +1504,18 @@ namespace Freefall.Components
             public float Rot10, Rot11, Rot12;
             public float Rot20, Rot21, Rot22;
             public float SlopeBias;  // 0=upright, 1=fully slope-aligned
-            public uint DecoMapSlice;     // slice in DecoMaps Texture2DArray (0xFFFFFFFF = none)
-            public uint _pad0;            // unused (was ControlChannel)
+            public uint DecoMapSlice;     // bindless SRV for standalone density map (0 = none)
+            // Layer-driven placement masks (resolved from stable LayerIds at upload time)
+            // Bit N = layer at index N in Terrain.Layers list
+            public uint SourceLayerMask;      // which layers drive density (0 = standalone)
             public uint Mode;             // 0=Mesh, 1=Billboard, 2=Cross
             public uint TextureIdx;       // bindless index (billboard/cross)
             // Color tint (Unity detail prototype healthy/dry colors)
             public Vector3 HealthyColor;
             public Vector3 DryColor;
             public float NoiseSpread;
-            public uint _colorPad;        // pad to 16-byte alignment
+            public uint ExclusionLayerMask;
+            public float ProceduralBlend;
         }
 
         [StructLayout(LayoutKind.Sequential)]
@@ -1526,6 +1530,7 @@ namespace Freefall.Components
         /// <summary>
         /// Rebuilds all decoration GPU slot/header/LOD buffers from Terrain.Decorations.
         /// Triggered on structural changes (add/remove decorations, mesh assignment, etc).
+        /// Resolves stable LayerIds to runtime bitmasks for the GPU prepass.
         /// </summary>
         public void RebuildDecoSlots()
         {
@@ -1541,6 +1546,14 @@ namespace Freefall.Components
             _decoratorHeadersBuffer?.Dispose();
             _decoratorSlotsBuffer?.Dispose();
             _decoratorLODTableBuffer?.Dispose();
+
+            // Build LayerId → list index lookup for bitmask resolution
+            var layerIdToIndex = new Dictionary<ulong, int>();
+            if (Terrain.Layers != null)
+            {
+                for (int i = 0; i < Terrain.Layers.Count && i < 32; i++)
+                    layerIdToIndex[Terrain.Layers[i].LayerId] = i;
+            }
 
             // Flat list — all decorators go into a single header.
             var headers = new List<ChannelHeader>();
@@ -1600,7 +1613,6 @@ namespace Freefall.Components
                 else
                 {
                     // Billboard / Cross: use Texture's material or create a dummy LOD entry
-                    // The texture is bound via the material system (Option A)
                     uint matId = 0;
                     if (deco.Texture != null)
                         textureIdx = (uint)deco.Texture.BindlessIndex;
@@ -1612,6 +1624,10 @@ namespace Freefall.Components
                     lodTable.Add(new LODTableEntry { MeshPartId = 0, MaxDistance = 200f, MaterialId = matId });
                     lodCount = 1;
                 }
+
+                // Resolve stable LayerIds → runtime bitmasks
+                uint srcMask = ResolveLayerMask(deco.SourceLayerIds, layerIdToIndex);
+                uint exclMask = ResolveLayerMask(deco.ExclusionLayerIds, layerIdToIndex);
 
                 float degToRad = MathF.PI / 180f;
                 float rx = deco.RootRotation.X * degToRad;
@@ -1635,18 +1651,20 @@ namespace Freefall.Components
                     Rot20 = cx*sy*cz + sx*sz,   Rot21 = cx*sy*sz - sx*cz,   Rot22 = cx*cy,
                     SlopeBias = deco.SlopeBias,
                     DecoMapSlice = deco.ControlMap != null ? (uint)deco.ControlMap.BindlessIndex : 0,
-                    _pad0 = 0,
+                    SourceLayerMask = srcMask,
                     Mode = (uint)mode,
                     TextureIdx = textureIdx,
                     HealthyColor = new Vector3(deco.HealthyColor.X, deco.HealthyColor.Y, deco.HealthyColor.Z),
                     DryColor = new Vector3(deco.DryColor.X, deco.DryColor.Y, deco.DryColor.Z),
                     NoiseSpread = deco.NoiseSpread,
-                    _colorPad = 0
+                    ExclusionLayerMask = exclMask,
+                    ProceduralBlend = deco.ProceduralBlend,
                 });
 
-                bool hasControlMap = deco.ControlMap != null && deco.ControlMap.BindlessIndex != 0;
+                string srcDesc = srcMask != 0 ? $"layers=0x{srcMask:X}" : "standalone";
+                string exclDesc = exclMask != 0 ? $" excl=0x{exclMask:X}" : "";
                 float logMaxDist = lodCount > 0 ? lodTable[^1].MaxDistance : 0;
-                Debug.Log($"[Deco] Slot {slots.Count - 1}: mode={mode} lodCount={lodCount} density={deco.Density} controlMap={hasControlMap} slice={slots[^1].DecoMapSlice} maxDist={logMaxDist:F0}");
+                Debug.Log($"[Deco] Slot {slots.Count - 1}: mode={mode} lodCount={lodCount} density={deco.Density} {srcDesc}{exclDesc} maxDist={logMaxDist:F0}");
             }
 
             // Single header covering all slots
@@ -1655,10 +1673,6 @@ namespace Freefall.Components
                 StartIndex = 0,
                 Count = (uint)slots.Count
             });
-
-
-
-            // Store absolute densities — shader does weighted selection proportional to each
 
             // Upload to GPU (creates new buffers + SRVs — only on structural changes)
             _decoratorHeadersBuffer = CreateAndUpload(headers);
@@ -1670,9 +1684,25 @@ namespace Freefall.Components
         }
 
         /// <summary>
-        /// Dispatches the decoration prepass compute shader: reads per-slot density
-        /// maps via bindless SRV, builds the baked RGBA16_UINT control texture.
-        /// Control texture is cached — only recreated when resolution changes.
+        /// Resolves a list of stable TextureLayer UIDs to a uint bitmask
+        /// using the current layer ordering. Unknown IDs are silently skipped.
+        /// </summary>
+        private static uint ResolveLayerMask(List<ulong> layerIds, Dictionary<ulong, int> lookup)
+        {
+            if (layerIds == null || layerIds.Count == 0) return 0;
+            uint mask = 0;
+            foreach (var id in layerIds)
+            {
+                if (lookup.TryGetValue(id, out int idx))
+                    mask |= 1u << idx;
+            }
+            return mask;
+        }
+
+        /// <summary>
+        /// Dispatches the decoration prepass compute shader: computes per-texel decoration
+        /// weights from layer splatmaps (layer-driven) or density maps (standalone),
+        /// applies exclusion masks, and packs top-8 into RGBA16_UINT control texture.
         /// </summary>
         private void DispatchDecoControlPrepass(ID3D12GraphicsCommandList cmd)
         {
@@ -1735,7 +1765,7 @@ namespace Freefall.Components
                 }
             }
 
-            // Dispatch prepass — reads per-slot density maps via bindless SRV
+            // Dispatch prepass
             _decoPrepassCS ??= new ComputeShader("decoration_prepass.hlsl");
             cmd.SetComputeRootSignature(Engine.Device.GlobalRootSignature);
             cmd.SetDescriptorHeaps(1, new[] { Engine.Device.SrvHeap });
@@ -1750,12 +1780,30 @@ namespace Freefall.Components
                         ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess)));
             }
 
+            // Heightmap SRV for slope/height computation
+            var heightmap = Terrain?.Heightmap;
+            uint heightSrv = heightmap != null ? (uint)heightmap.BindlessIndex : 0;
+
+            // Packed ControlMapArray SRV — same texture the surface shader samples
+            int layerCount = Terrain?.Layers?.Count ?? 0;
+            uint controlMapsSrv = ControlMapsArray != null ? (uint)ControlMapsArray.BindlessIndex : 0;
+
             _decoPrepassCS.SetBuffer("Slots", _decoratorSlotsBuffer!);
             _decoPrepassCS.SetPushConstant("ControlUAV", _decoControlUAV);
             _decoPrepassCS.SetPushConstant("SlotCount", slotCount);
             _decoPrepassCS.SetPushConstant("Resolution", (uint)resolution);
-            _decoPrepassCS.Dispatch(0, cmd, (uint)((resolution + 7) / 8), (uint)((resolution + 7) / 8));
+            _decoPrepassCS.SetPushConstant("HeightTex", heightSrv);
+            _decoPrepassCS.SetPushConstant("AutoMaskBuf", _layerAutoMaskBuffer?.SrvIndex ?? 0);
+            _decoPrepassCS.SetPushConstant("LayerCount", (uint)layerCount);
+            _decoPrepassCS.SetPushConstant("ControlMaps", controlMapsSrv);
 
+            // Pass float values as raw uint bits (reinterpreted with asfloat on GPU)
+            float maxH = Terrain?.MaxHeight ?? 600f;
+            float sizeX = Terrain?.TerrainSize.X ?? 1700f;
+            _decoPrepassCS.SetPushConstant("MaxHeight", BitConverter.SingleToUInt32Bits(maxH));
+            _decoPrepassCS.SetPushConstant("TerrainSizeX", BitConverter.SingleToUInt32Bits(sizeX));
+
+            _decoPrepassCS.Dispatch(0, cmd, (uint)((resolution + 7) / 8), (uint)((resolution + 7) / 8));
 
             cmd.ResourceBarrierUnorderedAccessView(_decoControlTex);
             // Transition from UAV → SRV so the spawn shader and terrain debug overlay can read correctly
@@ -1870,12 +1918,16 @@ namespace Freefall.Components
             var existingLodOffsets = new uint[validCount];
             var existingDecoSlices = new uint[validCount];
             var existingTextureIdx = new uint[validCount];
+            var existingSrcMask = new uint[validCount];
+            var existingExclMask = new uint[validCount];
             for (int i = 0; i < validCount; i++)
             {
                 existingLodCounts[i] = existing[i].LODCount;
                 existingLodOffsets[i] = existing[i].LODTableOffset;
                 existingDecoSlices[i] = existing[i].DecoMapSlice;
                 existingTextureIdx[i] = existing[i].TextureIdx;
+                existingSrcMask[i] = existing[i].SourceLayerMask;
+                existingExclMask[i] = existing[i].ExclusionLayerMask;
             }
             _decoratorSlotsBuffer.Unmap();
 
@@ -1909,13 +1961,14 @@ namespace Freefall.Components
                     Rot20 = cx*sy*cz + sx*sz,   Rot21 = cx*sy*sz - sx*cz,   Rot22 = cx*cy,
                     SlopeBias = deco.SlopeBias,
                     DecoMapSlice = deco.ControlMap != null ? (uint)deco.ControlMap.BindlessIndex : 0,
-                    _pad0 = 0,
+                    SourceLayerMask = slotIdx < existingSrcMask.Length ? existingSrcMask[slotIdx] : 0,
                     Mode = (uint)deco.Mode,
                     TextureIdx = slotIdx < existingTextureIdx.Length ? existingTextureIdx[slotIdx] : 0,
                     HealthyColor = new Vector3(deco.HealthyColor.X, deco.HealthyColor.Y, deco.HealthyColor.Z),
                     DryColor = new Vector3(deco.DryColor.X, deco.DryColor.Y, deco.DryColor.Z),
                     NoiseSpread = deco.NoiseSpread,
-                    _colorPad = 0
+                    ExclusionLayerMask = slotIdx < existingExclMask.Length ? existingExclMask[slotIdx] : 0,
+                    ProceduralBlend = deco.ProceduralBlend,
                 });
                 slotIdx++;
             }

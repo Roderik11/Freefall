@@ -65,12 +65,6 @@ namespace Freefall.Graphics
             
             lock (_lock)
             {
-                if (_idMap.TryGetValue(key, out int existingId))
-                    return existingId;
-
-                if (_entries.Count >= MaxMeshParts)
-                    throw new InvalidOperationException($"MeshRegistry exceeded max capacity of {MaxMeshParts}");
-
                 var part = mesh.MeshParts[partIndex];
                 var bounds = part.BoundingSphere;
                 var entry = new MeshPartEntry
@@ -89,11 +83,22 @@ namespace Freefall.Graphics
                     BoundsRadius = bounds.W,
                 };
 
+                if (_idMap.TryGetValue(key, out int existingId))
+                {
+                    // Refresh the entry — dynamic meshes (gizmos) change
+                    // NumIndices/buffer indices every frame.
+                    _entries[existingId] = entry;
+                    _dirty = true;
+                    return existingId;
+                }
+
+                if (_entries.Count >= MaxMeshParts)
+                    throw new InvalidOperationException($"MeshRegistry exceeded max capacity of {MaxMeshParts}");
+
                 int id = _entries.Count;
                 _entries.Add(entry);
                 _idMap[key] = id;
                 _dirty = true;
-
 
                 if (Engine.FrameIndex < 10)
                     Debug.Log("MeshRegistry", $"Registered mesh {mesh.Name} part {partIndex} as ID {id}");

@@ -39,7 +39,7 @@ namespace Freefall.Serialization
                 if (entity.HideAndDontSave) continue;
 
                 // Skip child entities of prefab instances — they're reconstructed on load
-                if (entity.IsPrefabInstance && entity.Transform.Parent != null)
+                if (entity.IsChildOfPrefabInstance)
                     continue;
 
                 emitter.SetTag("---");
@@ -121,6 +121,19 @@ namespace Freefall.Serialization
                     if (component is Transform t)
                     {
                         CopyFields(t, current.Transform);
+
+                        // Retarget deferred UID refs from temp Transform to entity's real Transform.
+                        // Without this, Phase 2 would set Parent on the discarded temp object.
+                        var deferredRefs = _yaml.DeferredUniqueIdRefs;
+                        for (int i = 0; i < deferredRefs.Count; i++)
+                        {
+                            if (ReferenceEquals(deferredRefs[i].Parent, t))
+                            {
+                                var fixup = deferredRefs[i];
+                                fixup.Parent = current.Transform;
+                                deferredRefs[i] = fixup;
+                            }
+                        }
                     }
                     else
                     {
@@ -299,6 +312,8 @@ namespace Freefall.Serialization
             foreach (var field in mapping)
             {
                 if (!field.CanWrite) continue;
+                // Never overwrite Entity backref — it's set by AddComponent
+                if (field.Name == "Entity") continue;
                 var value = field.GetValue(source);
                 if (value != null)
                     field.SetValue(target, value);

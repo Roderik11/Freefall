@@ -124,6 +124,7 @@ namespace Freefall.Components
 
         public void Draw()
         {
+            if (!Enabled) return;
             if (Mesh == null) return;
             if (_boundsDirty) OnTransformChanged();
 
