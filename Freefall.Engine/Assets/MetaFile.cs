@@ -53,6 +53,13 @@ namespace Freefall.Assets
         /// Null for compound assets that use SubAssets instead.
         /// </summary>
         public string MainAssetType { get; set; }
+
+        /// <summary>
+        /// For simple assets, the semantic asset type name (e.g. "PCGGraph", "Material")
+        /// when it differs from MainAssetType (which stores the packer type like "AssetDefinitionData").
+        /// Used by the asset browser for editor dispatch and display.
+        /// </summary>
+        public string MainSemanticType { get; set; }
     }
 
     /// <summary>
@@ -71,9 +78,18 @@ namespace Freefall.Assets
         public string Name { get; set; }
 
         /// <summary>
-        /// Asset type name (e.g. "MeshData", "AnimationClip", "DdsTextureData").
+        /// Packer data type name (e.g. "MeshData", "AssetDefinitionData", "PrefabData").
+        /// Used for cache path resolution.
         /// </summary>
         public string Type { get; set; }
+
+        /// <summary>
+        /// Semantic asset type when it differs from the data type
+        /// (e.g. "Material" when Type is "AssetDefinitionData").
+        /// Used for browser display and drag-drop type resolution.
+        /// Null when Type already matches the asset type.
+        /// </summary>
+        public string AssetType { get; set; }
 
         /// <summary>
         /// If true, this subasset is internal and should not appear in the Asset Browser

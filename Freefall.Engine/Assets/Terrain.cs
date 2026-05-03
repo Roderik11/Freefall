@@ -286,7 +286,7 @@ namespace Freefall.Assets
             public DecoratorMode Mode = DecoratorMode.Mesh;
 
             [DirtyFlag(TerrainDirtyFlags.DecoStructure)]
-            public StaticMesh Mesh;       // Mesh mode: geometry + LODs + material
+            public Mesh Mesh;       // Mesh mode: geometry + LODs + material
 
             [DirtyFlag(TerrainDirtyFlags.DecoStructure)]
             public Texture Texture;       // Billboard/Cross mode: alpha-tested texture

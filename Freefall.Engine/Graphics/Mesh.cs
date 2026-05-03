@@ -199,6 +199,7 @@ namespace Freefall.Graphics
                 BoneWeights = data.BoneWeights;
                 CreateBoneWeightBuffer(device);
             }
+
             MarkReady();
         }
 
@@ -231,6 +232,7 @@ namespace Freefall.Graphics
             {
                 mesh.CreateBoneWeightBuffer(device);
             }
+
 
             return mesh;
         }
@@ -420,7 +422,29 @@ namespace Freefall.Graphics
             }
             System.IO.File.WriteAllLines(@"d:\Projects\2026\Freefall\.tmp\bindpose.txt", diag);
         }
-        public void Dispose() { _posBuffer?.Dispose(); _normBuffer?.Dispose(); _uvBuffer?.Dispose(); _indexBuffer?.Dispose(); }
+        public void Dispose()
+        {
+            var device = Engine.Device;
+
+            // Free MeshRegistry slots so they can be reused
+            MeshRegistry.Unregister(this);
+
+            _posBuffer?.Dispose();
+            _normBuffer?.Dispose();
+            _uvBuffer?.Dispose();
+            _indexBuffer?.Dispose();
+            _boneWeightBuffer?.Dispose();
+
+            // Release bindless descriptor slots
+            if (device != null)
+            {
+                if (PosBufferIndex > 0) device.ReleaseBindlessIndex(PosBufferIndex);
+                if (NormBufferIndex > 0) device.ReleaseBindlessIndex(NormBufferIndex);
+                if (UVBufferIndex > 0) device.ReleaseBindlessIndex(UVBufferIndex);
+                if (IndexBufferIndex > 0) device.ReleaseBindlessIndex(IndexBufferIndex);
+                if (BoneWeightBufferIndex > 0) device.ReleaseBindlessIndex(BoneWeightBufferIndex);
+            }
+        }
 
         // ============================================================
         // Terrain Patch Meshes — ported from Apex Mesh.Grid.cs

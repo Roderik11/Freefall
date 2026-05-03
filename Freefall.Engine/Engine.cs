@@ -4,6 +4,7 @@ using System.Collections.Generic;
 using System.Threading.Tasks;
 using System.IO;
 using System.Numerics;
+using System.Runtime.InteropServices;
 using Freefall.Assets;
 using Freefall.Graphics;
 using Freefall.Base;
@@ -79,6 +80,7 @@ namespace Freefall
             
             RootDirectory = AppContext.BaseDirectory;
 
+            LoadPixGpuCapturer();
             Device = new GraphicsDevice();
             
             // Initialize persistent transform buffer for GPU-driven rendering
@@ -114,6 +116,7 @@ namespace Freefall
             
             RootDirectory = AppContext.BaseDirectory;
 
+            LoadPixGpuCapturer();
             Device = new GraphicsDevice();
             TransformBuffer.Initialize(Device);
 
@@ -342,6 +345,41 @@ namespace Freefall
             EntityManager.Update();
         }
 
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr LoadLibraryW([MarshalAs(UnmanagedType.LPWStr)] string lpFileName);
+
+        /// <summary>
+        /// Load WinPixGpuCapturer.dll so PIX can attach to the running process.
+        /// Must be called before any D3D12 API calls.
+        /// </summary>
+        private static void LoadPixGpuCapturer()
+        {
+#if DEBUG
+            // Find latest PIX install
+            var pixDir = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
+                "Microsoft PIX");
+            
+            if (!Directory.Exists(pixDir)) return;
+            
+            // PIX installs into versioned subdirectories (e.g. "2401.08.002")
+            var latest = Directory.GetDirectories(pixDir)
+                .OrderByDescending(d => d)
+                .FirstOrDefault();
+            
+            if (latest == null) return;
+            
+            var dllPath = Path.Combine(latest, "WinPixGpuCapturer.dll");
+            if (!File.Exists(dllPath)) return;
+            
+            var handle = LoadLibraryW(dllPath);
+            if (handle != IntPtr.Zero)
+                Debug.Log("[Engine]", $"PIX GPU Capturer loaded from {dllPath}");
+            else
+                Debug.LogWarning("[Engine]", $"Failed to load PIX GPU Capturer: {Marshal.GetLastWin32Error()}");
+#endif
+        }
+
         public static void Shutdown()
         {
             _isRunning = false;
@@ -382,6 +420,9 @@ namespace Freefall
          public bool Wireframe { get; set; } = false;                // F2 - Global wireframe
          public bool FreezeFrustum { get; set; } = false;                   // F3 - Freeze culling frustum
          public bool UseAdaptiveSplits { get; set; } = true;                // F4 - SDSM adaptive cascade splits
+
+         [ValueRange(50f, 1000f)]
+         public float MaxShadowDistance { get; set; } = 300f;                 // SDSM max depth for split analysis
          public bool DisableHiZ { get; set; } = false;                      // F6 - Disable Hi-Z occlusion
 
          public DebugVizMode DebugVisualizationMode { get; set; } = DebugVizMode.Off; // F5 - Debug viz
@@ -401,8 +442,17 @@ namespace Freefall
          /// </summary>
          [ValueRange(0.1f, 20.0f)]
          public float LODScale { get; set; } = 1.0f;
-  
-  
+
+         // Screen-Space Shadows (Bend Studio technique)
+         [ValueRange(0.001f, 0.2f)]
+         public float SSSSurfaceThickness { get; set; } = 0.05f;
+
+         [ValueRange(0.005f, 0.1f)]
+         public float SSSBilinearThreshold { get; set; } = 0.02f;
+
+         [ValueRange(1f, 8f)]
+         public float SSSShadowContrast { get; set; } = 4.0f;
+
          public System.Numerics.Matrix4x4 FrozenViewProjection { get; set; } // VP matrix when frustum frozen
     }
 }

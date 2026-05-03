@@ -17,6 +17,7 @@ namespace Freefall.Graphics
         private readonly Thread _uploadThread;
         private readonly CancellationTokenSource _cts = new();
         private readonly AutoResetEvent _workAvailable = new(false);
+        private volatile bool _processing;
 
         private ID3D12Fence _fence;
         private long _nextFenceValue = 1;
@@ -133,6 +134,15 @@ namespace Freefall.Graphics
         private void RecordBufferUpload<T>(ID3D12GraphicsCommandList cmdList, UploadHeap heap, ID3D12Resource targetBuffer, T[] data) where T : unmanaged
         {
             int size = data.Length * System.Runtime.InteropServices.Marshal.SizeOf<T>();
+
+            // Validate: data must fit in the target buffer
+            var targetSize = targetBuffer.Description.Width;
+            if ((ulong)size > targetSize)
+            {
+                Debug.LogError("StreamingManager", $"Buffer upload size mismatch: data={size} bytes, target={targetSize} bytes — skipping");
+                return;
+            }
+
             long offset = heap.Allocate(size, 256); // 256 byte alignment for buffer copies preferred
 
             unsafe
@@ -151,9 +161,18 @@ namespace Freefall.Graphics
 
         private void UploadLoop()
         {
-            var allocator = _device.NativeDevice.CreateCommandAllocator(CommandListType.Copy);
-            var cmdList = _device.NativeDevice.CreateCommandList<ID3D12GraphicsCommandList>(0, CommandListType.Copy, allocator);
+            // Double-buffered allocators: alternate each batch so the GPU has time
+            // to finish with one allocator while we record into the other.
+            // D3D12 requires GPU to be done with an allocator before Reset().
+            var allocators = new ID3D12CommandAllocator[2];
+            var fences = new long[2]; // fence value of last submission per allocator
+            for (int i = 0; i < 2; i++)
+                allocators[i] = _device.NativeDevice.CreateCommandAllocator(CommandListType.Copy);
+
+            var cmdList = _device.NativeDevice.CreateCommandList<ID3D12GraphicsCommandList>(0, CommandListType.Copy, allocators[0]);
             cmdList.Close();
+
+            int currentSlot = 0;
 
             while (!_cts.IsCancellationRequested)
             {
@@ -161,49 +180,75 @@ namespace Freefall.Graphics
                 if (_cts.IsCancellationRequested) break;
 
                 if (_pendingUploads.IsEmpty) continue;
+                if (_device.IsDeviceLost) continue;
 
-                allocator.Reset();
-                cmdList.Reset(allocator, null);
-                _currentBatchAssets.Clear();
-                
-                int processed = 0;
-                while (_pendingUploads.TryDequeue(out var uploadAction))
+                _processing = true;
+                try
                 {
-                     try 
-                     {
-                         uploadAction(cmdList, _uploadHeap);
-                         processed++;
-                         if (processed > 64) break;
-                     }
-                     catch (Exception ex)
-                     {
-                         Debug.LogError("StreamingManager", $"Upload failed: {ex.Message}");
-                     }
-                }
-
-                if (processed > 0)
-                {
-                    cmdList.Close();
-                    
-                    // Submit through the device so _copyFence is signaled — 
-                    // this is what WaitForCopyQueue checks before rendering.
-                    // Without this, the render queue starts drawing before vertex data is copied.
-                    _device.CopyQueueSubmit(cmdList);
-                    
-                    // Also signal our private fence for UploadHeap ring buffer reclamation
-                    long fenceValue = Interlocked.Increment(ref _nextFenceValue);
-                    _device.CopyQueue.Signal(_fence, (ulong)fenceValue);
-                    
-                    // Record this batch's fence so the UploadHeap can reclaim space
-                    _uploadHeap.OnBatchSubmitted(fenceValue);
-                    
-                    foreach (var asset in _currentBatchAssets)
+                    // Wait for THIS slot's previous batch (if any) to complete
+                    long prevFence = fences[currentSlot];
+                    if (prevFence > 0)
                     {
-                        asset.SetReadyFence(fenceValue);
+                        while ((long)_fence.CompletedValue < prevFence)
+                        {
+                            if (_fence.CompletedValue == ulong.MaxValue) { _device.IsDeviceLost = true; break; }
+                            Thread.Sleep(1);
+                        }
+                        if (_device.IsDeviceLost) continue;
                     }
+
+                    allocators[currentSlot].Reset();
+                    cmdList.Reset(allocators[currentSlot], null);
+                    _currentBatchAssets.Clear();
+                    
+                    int processed = 0;
+                    while (_pendingUploads.TryDequeue(out var uploadAction))
+                    {
+                         try 
+                         {
+                             uploadAction(cmdList, _uploadHeap);
+                             processed++;
+                             if (processed > 64) break;
+                         }
+                         catch (Exception ex)
+                         {
+                             Debug.LogError("StreamingManager", $"Upload failed: {ex.Message}");
+                         }
+                    }
+
+                    if (processed > 0)
+                    {
+                        cmdList.Close();
+                        
+                        // Submit through the device so _copyFence is signaled — 
+                        // this is what WaitForCopyQueue checks before rendering.
+                        // Without this, the render queue starts drawing before vertex data is copied.
+                        _device.CopyQueueSubmit(cmdList);
+                        
+                        // Also signal our private fence for UploadHeap ring buffer reclamation
+                        long fenceValue = Interlocked.Increment(ref _nextFenceValue);
+                        _device.CopyQueue.Signal(_fence, (ulong)fenceValue);
+                        fences[currentSlot] = fenceValue;
+                        
+                        // Record this batch's fence so the UploadHeap can reclaim space
+                        _uploadHeap.OnBatchSubmitted(fenceValue);
+                        
+                        foreach (var asset in _currentBatchAssets)
+                        {
+                            asset.SetReadyFence(fenceValue);
+                        }
+                    }
+
+                    // Alternate to the other allocator
+                    currentSlot = 1 - currentSlot;
+                }
+                finally
+                {
+                    _processing = false;
                 }
             }
-            allocator.Dispose();
+            allocators[0].Dispose();
+            allocators[1].Dispose();
             cmdList.Dispose();
         }
 
@@ -220,20 +265,40 @@ namespace Freefall.Graphics
         /// </summary>
         public void Flush()
         {
-            // Wait until the upload thread has drained the queue
-            while (!_pendingUploads.IsEmpty)
+            // Wait until the upload thread has drained the queue AND finished its current batch
+            int drainTimeout = 30000;
+            while (!_pendingUploads.IsEmpty || _processing)
             {
+                if (_device.IsDeviceLost) break;
                 _workAvailable.Set(); // Wake the upload thread in case it's sleeping
                 Thread.Sleep(1);
+                if (--drainTimeout <= 0)
+                {
+                    Debug.LogWarning("StreamingManager", $"Flush drain timed out (pending={!_pendingUploads.IsEmpty}, processing={_processing})");
+                    break;
+                }
             }
             // Wait for the last GPU fence to complete
             long lastSubmitted = Interlocked.Read(ref _nextFenceValue) - 1;
             if (lastSubmitted > 0)
             {
+                int timeout = 5000; // 5s safety timeout
                 while ((long)_fence.CompletedValue < lastSubmitted)
+                {
+                    // DEVICE_REMOVED makes CompletedValue return UINT64_MAX
+                    if (_fence.CompletedValue == ulong.MaxValue)
+                    {
+                        Debug.LogWarning("StreamingManager", "GPU device lost during Flush — aborting wait");
+                        return;
+                    }
+                    if (--timeout <= 0)
+                    {
+                        Debug.LogWarning("StreamingManager", $"Flush timed out (fence {_fence.CompletedValue} < {lastSubmitted})");
+                        return;
+                    }
                     Thread.Sleep(1);
+                }
             }
-            Debug.Log($"[StreamingManager] Flush complete. {BytesUploaded / (1024 * 1024)}MB uploaded total.");
         }
 
         public void Dispose()

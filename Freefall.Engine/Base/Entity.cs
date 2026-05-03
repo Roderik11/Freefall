@@ -69,11 +69,19 @@ namespace Freefall.Base
 
         public Entity() : this("Entity") { }
 
-        public Entity(string name)
+        public Entity(string name) : this(name, register: true) { }
+
+        /// <summary>
+        /// Internal constructor. When register is false, the entity is NOT added
+        /// to EntityManager — used by importers to build temp entities for
+        /// serialization without polluting the live scene.
+        /// </summary>
+        public Entity(string name, bool register)
         {
             Name = name;
             Transform = AddComponent<Transform>();
-            EntityManager.AddEntity(this);
+            if (register)
+                EntityManager.AddEntity(this);
         }
 
         public T AddComponent<T>() where T : Component, new()

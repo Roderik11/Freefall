@@ -192,6 +192,11 @@ namespace Freefall.Graphics
             // Spin-wait with short sleeps (we're on the upload thread, not main thread)
             while ((long)_fence.CompletedValue < fv)
             {
+                if (_fence.CompletedValue == ulong.MaxValue)
+                {
+                    _device.IsDeviceLost = true;
+                    return;
+                }
                 Thread.Sleep(1);
             }
         }

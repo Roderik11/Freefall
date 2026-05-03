@@ -159,16 +159,49 @@ namespace Freefall.Components
                 }
             }
 
+            bool newPoint = false;
+            int deletePoint = -1;
+
             // Draw interactive handles on each control point
             ctx.Color = new Color4(1f, 0.6f, 0.1f, 1f); // Orange
             ctx.LineWidth = 2f;
             for (int i = 0; i < Points.Count; i++)
             {
-                var newPos = ctx.FreeMoveHandle(Points[i]);
+                var newPos = ctx.FreeMoveHandle(Points[i], out var clicked);
+                if(clicked && Input.Shift)
+                {
+                    // append a new point after this one
+                    newPoint = true;
+                    break;
+                }
+
+                if (clicked && Input.Control)
+                {
+                    // delete this point
+                    deletePoint = i;
+                    break;
+                }
+
                 if (ctx.Changed)
                 {
                     Points[i] = newPos;
+                    MessageDispatcher.Send(EngineMsg.SplineChanged, this);
                 }
+            }
+
+            if(newPoint)
+            {
+                // Insert a new point halfway between the last two
+                int insertIndex = Points.Count - 1;
+                Vector3 newPointPos = (Points[insertIndex] + Points[Math.Max(0, insertIndex - 1)]) * 0.5f;
+                Points.Insert(insertIndex, newPointPos);
+                MessageDispatcher.Send(EngineMsg.SplineChanged, this);
+            }
+
+            if(deletePoint != -1)
+            {
+                Points.RemoveAt(deletePoint);
+                MessageDispatcher.Send(EngineMsg.SplineChanged, this);
             }
 
             // Draw tangent indicators at control points

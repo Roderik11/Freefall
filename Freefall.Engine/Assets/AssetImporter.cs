@@ -12,6 +12,13 @@ namespace Freefall.Assets
     {
         public string[] Extensions { get; }
 
+        /// <summary>
+        /// Import order: lower values import first. Assets at the same priority
+        /// may import in parallel. Use to ensure leaf assets (textures)
+        /// exist before compound assets (models) that reference them.
+        /// </summary>
+        public int ImportPriority { get; set; }
+
         public AssetImporterAttribute(params string[] extensions)
         {
             Extensions = extensions;
@@ -58,6 +65,7 @@ namespace Freefall.Assets
         /// When set, GetInspectionTarget will load and return the actual asset
         /// instead of the importer itself.
         /// </summary>
+        [System.Text.Json.Serialization.JsonIgnore]
         Type AssetType => null;
 
         /// <summary>
@@ -79,6 +87,16 @@ namespace Freefall.Assets
             }
             return this;
         }
+    }
+
+    /// <summary>
+    /// Optional second-pass interface for importers that need to emit additional artifacts
+    /// after the first pass has been packed and assigned GUIDs.
+    /// Used by ModelImporter to emit Prefab sub-assets that reference Mesh GUIDs.
+    /// </summary>
+    public interface IPostImporter
+    {
+        List<ImportArtifact> PostImport(string filepath, IReadOnlyList<SubAssetEntry> subAssets);
     }
 
     /// <summary>

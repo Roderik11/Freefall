@@ -6,6 +6,8 @@ using Freefall.Graph;
 using System.Numerics;
 using Freefall.Base;
 using Freefall.Assets;
+using Freefall.Components;
+using Freefall.Graphics;
 
 namespace Freefall.PCG
 {
@@ -15,6 +17,7 @@ namespace Freefall.PCG
         public Vector3[] extents;
         public Quaternion[] rotation;
         public float[] density;
+        public string[] tags;
 
         public int Count => position != null ? position.Length : 0;
 
@@ -28,7 +31,8 @@ namespace Freefall.PCG
                 position = Array.Empty<Vector3>(),
                 extents = Array.Empty<Vector3>(),
                 rotation = Array.Empty<Quaternion>(),
-                density = Array.Empty<float>()
+                density = Array.Empty<float>(),
+                tags = Array.Empty<string>()
             };
         }
 
@@ -42,7 +46,8 @@ namespace Freefall.PCG
                 position = (Vector3[])position.Clone(),
                 extents = (Vector3[])extents.Clone(),
                 rotation = (Quaternion[])rotation.Clone(),
-                density = (float[])density.Clone()
+                density = (float[])density.Clone(),
+                tags = tags != null ? (string[])tags.Clone() : Array.Empty<string>()
             };
         }
 
@@ -64,7 +69,8 @@ namespace Freefall.PCG
                 position = new Vector3[indices.Count],
                 extents = new Vector3[indices.Count],
                 rotation = new Quaternion[indices.Count],
-                density = new float[indices.Count]
+                density = new float[indices.Count],
+                tags = new string[indices.Count]
             };
 
             for (int i = 0; i < indices.Count; i++)
@@ -74,6 +80,8 @@ namespace Freefall.PCG
                 result.extents[i] = extents[src];
                 result.rotation[i] = rotation[src];
                 result.density[i] = density[src];
+                if (tags != null && src < tags.Length)
+                    result.tags[i] = tags[src];
             }
 
             return result;
@@ -93,7 +101,8 @@ namespace Freefall.PCG
                 position = new Vector3[total],
                 extents = new Vector3[total],
                 rotation = new Quaternion[total],
-                density = new float[total]
+                density = new float[total],
+                tags = new string[total]
             };
 
             if (countA > 0)
@@ -102,6 +111,7 @@ namespace Freefall.PCG
                 Array.Copy(a.extents, 0, result.extents, 0, countA);
                 Array.Copy(a.rotation, 0, result.rotation, 0, countA);
                 Array.Copy(a.density, 0, result.density, 0, countA);
+                if (a.tags != null) Array.Copy(a.tags, 0, result.tags, 0, Math.Min(a.tags.Length, countA));
             }
 
             if (countB > 0)
@@ -110,6 +120,7 @@ namespace Freefall.PCG
                 Array.Copy(b.extents, 0, result.extents, countA, countB);
                 Array.Copy(b.rotation, 0, result.rotation, countA, countB);
                 Array.Copy(b.density, 0, result.density, countA, countB);
+                if (b.tags != null) Array.Copy(b.tags, 0, result.tags, countA, Math.Min(b.tags.Length, countB));
             }
 
             return result;
@@ -178,6 +189,69 @@ namespace Freefall.PCG
 
         [Output]
         public SamplePointSet Output;
+
+        public override void Process()
+        {
+            var points = GetInputValue<SamplePointSet>("Input");
+            if (points == null || points.Count == 0)
+            {
+                SetOutput("Output", SamplePointSet.Empty());
+                return;
+            }
+
+            var result = points.Clone();
+            var rng = CreateRandom();
+
+            for (int i = 0; i < result.Count; i++)
+            {
+                // Offset
+                var offset = Lerp(OffsetMin, OffsetMax, (float)rng.NextDouble());
+                if (AbsoluteOffset)
+                {
+                    result.position[i] += offset;
+                }
+                else
+                {
+                    // Local: rotate offset by the sample's existing orientation
+                    result.position[i] += Vector3.Transform(offset, result.rotation[i]);
+                }
+
+                // Rotation
+                var rot = Quaternion.Slerp(RotationMin, RotationMax, (float)rng.NextDouble());
+                if (AbsoluteRotation)
+                {
+                    result.rotation[i] = rot;
+                }
+                else
+                {
+                    result.rotation[i] = Quaternion.Normalize(result.rotation[i] * rot);
+                }
+
+                // Scale (stored in extents)
+                var scale = Lerp(ScaleMin, ScaleMax, (float)rng.NextDouble());
+                if (AbsoluteScale)
+                {
+                    result.extents[i] = scale;
+                }
+                else
+                {
+                    result.extents[i] = new Vector3(
+                        result.extents[i].X * scale.X,
+                        result.extents[i].Y * scale.Y,
+                        result.extents[i].Z * scale.Z);
+                }
+            }
+
+            SetOutput("Output", result);
+        }
+
+        private static Vector3 Lerp(Vector3 a, Vector3 b, float t)
+        {
+            return new Vector3(
+                a.X + (b.X - a.X) * t,
+                a.Y + (b.Y - a.Y) * t,
+                a.Z + (b.Z - a.Z) * t);
+        }
     }
 
     [Category("Noise")]
@@ -281,19 +355,19 @@ namespace Freefall.PCG
     }
 
     [Category("Spawn")]
-    public class SpawnStaticMesh : Node
+    public class SpawnMesh : Node
     {
         [Serializable]
-        public class StaticMeshElement
+        public class MeshElement
         {
-            public StaticMesh Mesh;
+            public Mesh Mesh;
             public float Weight = 1;
         }
 
         [Input]
         public SamplePointSet Input;
 
-        public List<StaticMeshElement> Meshes = new List<StaticMeshElement>();
+        public List<MeshElement> Meshes = new List<MeshElement>();
     }
 
     [Category("Spawn")]
@@ -310,6 +384,58 @@ namespace Freefall.PCG
         public SamplePointSet Input;
 
         public List<PrefabElement> Entities = new List<PrefabElement>();
+
+        /// <summary>
+        /// Parent entity for spawned instances. Set by PCGComponent before execution.
+        /// </summary>
+        [Browsable(false)]
+        public Entity SpawnParent;
+
+        public override void Process()
+        {
+            var points = GetInputValue<SamplePointSet>("Input");
+            if (points == null || points.Count == 0) return;
+            if (Entities == null || Entities.Count == 0) return;
+
+            // Compute total weight
+            float totalWeight = 0;
+            foreach (var e in Entities)
+            {
+                if (e.Prefab != null) totalWeight += e.Weight;
+            }
+            if (totalWeight <= 0) return;
+
+            var rng = CreateRandom();
+            var parent = SpawnParent ?? new Entity("PCG_Spawned");
+
+            for (int i = 0; i < points.Count; i++)
+            {
+                var prefab = PickWeighted(rng, totalWeight);
+                if (prefab == null) continue;
+
+                var instance = prefab.Instantiate();
+                if (instance == null) continue;
+
+                instance.Transform.Parent = parent.Transform;
+                instance.Transform.Position = points.position[i];
+                instance.Transform.Rotation = points.rotation[i];
+            }
+
+            Debug.Log($"[SpawnPrefab] Spawned {points.Count} instances under '{parent.Name}'");
+        }
+
+        private Prefab PickWeighted(Random rng, float totalWeight)
+        {
+            float roll = (float)rng.NextDouble() * totalWeight;
+            float cumulative = 0;
+            foreach (var e in Entities)
+            {
+                if (e.Prefab == null) continue;
+                cumulative += e.Weight;
+                if (roll <= cumulative) return e.Prefab;
+            }
+            return Entities[Entities.Count - 1].Prefab;
+        }
     }
 
     [Category("Filter")]

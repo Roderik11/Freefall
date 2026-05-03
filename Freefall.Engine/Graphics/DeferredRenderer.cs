@@ -35,12 +35,21 @@ namespace Freefall.Graphics
         /// <summary>Shadow Hi-Z pyramid for occlusion culling shadow casters.</summary>
         public ShadowHiZPyramid? ShadowHiZPyramid { get; private set; }
 
+        /// <summary>Screen-space shadow pass (Bend Studio technique).</summary>
+        public ScreenSpaceShadows? ScreenSpaceShadows { get; private set; }
+
         private Material matClear = null!;
         private Material matDirectionalLight = null!;
         private ComputeShader _compositionCS = null!;
         private int _kCompose;
         public ComputeShader DirectionalLightCS { get; private set; } = null!;
         private int _kDirectionalLight;
+        
+        // Point light compute shader (tiled culling + PBR)
+        private ComputeShader _pointLightCS = null!;
+        private int _kPointLight;
+        private GraphicsBuffer[]? _pointLightBuffers; // per-frame upload StructuredBuffer<PointLightData>
+        private const int MaxPointLights = 256;
         
         private bool _isFirstFrame = true;
         private bool _compositeSnapshotFirstFrame = true;
@@ -93,6 +102,15 @@ namespace Freefall.Graphics
             DirectionalLightCS = new ComputeShader("light_directional_cs.hlsl");
             _kDirectionalLight = DirectionalLightCS.FindKernel("CSDirectionalLight");
 
+            // Compile point light compute shader
+            _pointLightCS = new ComputeShader("light_point_cs.hlsl");
+            _kPointLight = _pointLightCS.FindKernel("CSPointLight");
+            
+            // Per-frame upload buffers for point light data
+            _pointLightBuffers = new GraphicsBuffer[FrameCount];
+            for (int i = 0; i < FrameCount; i++)
+                _pointLightBuffers[i] = GraphicsBuffer.CreateUpload<Components.PointLight.PointLightData>(MaxPointLights, mapped: true);
+
             // Shadow Map Array (Cascades)
             ShadowTextureArray = new DepthTextureArray2D(2048, 2048, 4);
             
@@ -103,6 +121,9 @@ namespace Freefall.Graphics
             // Shadow Hi-Z pyramid (matched to shadow map size)
             ShadowHiZPyramid = new ShadowHiZPyramid();
             ShadowHiZPyramid.Create(Engine.Device, 2048, 2048, Engine.Settings.ShadowCascadeCount);
+            
+            // Screen-space shadows
+            ScreenSpaceShadows = new ScreenSpaceShadows();
         }
 
         private void CreateRenderTextures(int width, int height)
@@ -242,6 +263,8 @@ namespace Freefall.Graphics
             
             var sw = System.Diagnostics.Stopwatch.StartNew();
 
+            PixMarker.Begin(list, "Frame");
+
             // Ensure Materials buffer is bound (creates SRV for bindless access)
             Material.BindMaterialsBuffer(list, Engine.Device);
 
@@ -271,6 +294,8 @@ namespace Freefall.Graphics
             var blitTime = System.Diagnostics.Stopwatch.StartNew();
             BlitToBackBuffer(camera, list);
             blitTime.Stop();
+
+            PixMarker.End(list); // Frame
             
             _isFirstFrame = false;
             
@@ -294,6 +319,7 @@ namespace Freefall.Graphics
 
         private void FillGBuffer(Camera camera, ID3D12GraphicsCommandList list)
         {
+             PixMarker.Begin(list, "GBuffer");
              // First frame: textures start in Common state; subsequent frames: PixelShaderResource
              var fromState = _isFirstFrame ? ResourceStates.Common : ResourceStates.PixelShaderResource;
              var depthFromState = _isFirstFrame ? ResourceStates.Common : ResourceStates.PixelShaderResource;
@@ -346,8 +372,10 @@ namespace Freefall.Graphics
 
              // 1. Opaque pass FIRST — builds InstanceBatch GPU buffers
              var opaqueTime = System.Diagnostics.Stopwatch.StartNew();
+             PixMarker.Begin(list, "Opaque");
              ulong frustumGpuAddr = UploadFrustumConstants(camera, Engine.Device);
              CommandBuffer.Execute(RenderPass.Opaque, list, Engine.Device, frustumGpuAddr);
+             PixMarker.End(list); // Opaque
              opaqueTime.Stop();
 
              // 2. Shadow pass — uses opaque batches (now built) for CullShadow/DrawShadow
@@ -355,6 +383,7 @@ namespace Freefall.Graphics
              var shadowTime = System.Diagnostics.Stopwatch.StartNew();
              if (ShadowTextureArray != null)
              {
+                 PixMarker.Begin(list, "Shadows");
                  // Transition shadow texture to DepthWrite for rendering
                  var shadowFrom = _isFirstFrame ? ResourceStates.DepthWrite : ResourceStates.PixelShaderResource;
                  if (shadowFrom != ResourceStates.DepthWrite)
@@ -368,6 +397,7 @@ namespace Freefall.Graphics
                  // Generate shadow Hi-Z pyramid from this frame's shadow depth
                  if (ShadowHiZPyramid != null && CommandBuffer.Culler != null)
                  {
+                     PixMarker.Begin(list, "Shadow Hi-Z");
                      // Merge barriers: skip intermediate PixelShaderResource state
                      list.ResourceBarrierTransition(ShadowTextureArray.Native,
                          ResourceStates.DepthWrite, ResourceStates.NonPixelShaderResource);
@@ -378,6 +408,7 @@ namespace Freefall.Graphics
                      // Transition to PixelShaderResource for light pass sampling
                      list.ResourceBarrierTransition(ShadowTextureArray.Native,
                          ResourceStates.NonPixelShaderResource, ResourceStates.PixelShaderResource);
+                     PixMarker.End(list); // Shadow Hi-Z
                  }
                  else
                  {
@@ -393,16 +424,21 @@ namespace Freefall.Graphics
                  list.OMSetRenderTargets(_cachedGBufferRtvHandles, Depth.DsvHandle);
                  list.RSSetViewport(vp);
                  list.RSSetScissorRect(scissor);
+                 PixMarker.End(list); // Shadows
              }
              shadowTime.Stop();
              
              // 3. Sky pass
              var skyTime = System.Diagnostics.Stopwatch.StartNew();
+             PixMarker.Begin(list, "Sky");
              CommandBuffer.Execute(RenderPass.Sky, list, Engine.Device);
+             PixMarker.End(list); // Sky
              skyTime.Stop();
              
              // 4. Transparent pass — renders after opaque+sky, can depth-test against both
+             PixMarker.Begin(list, "Transparent");
              CommandBuffer.Execute(RenderPass.Transparent, list, Engine.Device);
+             PixMarker.End(list); // Transparent
              
              // Log every 60 frames
              if (Engine.FrameIndex % 60 == 0)
@@ -432,27 +468,51 @@ namespace Freefall.Graphics
              // Linear depth cleared to 0 = no occluder, max() naturally keeps farthest geometry
              // Skip when frustum is frozen — frozen pyramid must match frozen VP for correct occlusion
              if (!Engine.Settings.FreezeFrustum)
+             {
+                 PixMarker.Begin(list, "Hi-Z Pyramid");
                  CommandBuffer.Culler?.GenerateHiZPyramid(list, DepthGBuffer.BindlessIndex, HiZPyramid);
+                 PixMarker.End(list); // Hi-Z Pyramid
+             }
              
              // SDSM: Analyze depth buffer for adaptive cascade splits
              // DepthGBuffer is still in NonPixelShaderResource — perfect for compute SRV reads
              if (CommandBuffer.Culler?.SdsmReady == true)
              {
+                 PixMarker.Begin(list, "SDSM Depth Analysis");
                  int depthWidth = (int)DepthGBuffer.Native.Description.Width;
                  int depthHeight = (int)DepthGBuffer.Native.Description.Height;
                  CommandBuffer.Culler.AnalyzeDepth(list, DepthGBuffer.BindlessIndex,
-                     depthWidth, depthHeight, camera.NearPlane);
+                     depthWidth, depthHeight, camera.NearPlane, Engine.Settings.MaxShadowDistance);
+                 PixMarker.End(list); // SDSM Depth Analysis
              }
              
              // Transition GBuffer depth to PixelShaderResource for light pass sampling
              Transition(list, DepthGBuffer.Native, ResourceStates.NonPixelShaderResource, ResourceStates.PixelShaderResource);
              
-             // Hardware depth to PixelShaderResource for light pass
-             Transition(list, Depth.Native, ResourceStates.DepthWrite, ResourceStates.PixelShaderResource);
+             // Screen-space shadows: uses hardware depth in compute-readable state
+             if (ScreenSpaceShadows != null)
+             {
+                 Transition(list, Depth.Native, ResourceStates.DepthWrite, ResourceStates.NonPixelShaderResource);
+                 PixMarker.Begin(list, "Screen-Space Shadows");
+                 var cvp = Matrix4x4.CreateLookAtLeftHanded(Vector3.Zero, camera.Forward, camera.Up) * camera.Projection;
+                 var lightDir = -Components.DirectionalLight.GetLightDirection();
+                 int dw = (int)Depth.Native.Description.Width;
+                 int dh = (int)Depth.Native.Description.Height;
+                 ScreenSpaceShadows.Execute(list, Depth.BindlessIndex, dw, dh, lightDir, cvp);
+                 PixMarker.End(list);
+                 Transition(list, Depth.Native, ResourceStates.NonPixelShaderResource, ResourceStates.PixelShaderResource);
+             }
+             else
+             {
+                 // Hardware depth to PixelShaderResource for light pass
+                 Transition(list, Depth.Native, ResourceStates.DepthWrite, ResourceStates.PixelShaderResource);
+             }
+             PixMarker.End(list); // GBuffer
         }
 
         private void FillLightBuffer(Camera camera, ID3D12GraphicsCommandList list)
         {
+             PixMarker.Begin(list, "Lighting");
              var fromState = _isFirstFrame ? ResourceStates.Common : ResourceStates.PixelShaderResource;
              Transition(list, LightBuffer.Native, fromState, ResourceStates.UnorderedAccess);
 
@@ -467,28 +527,83 @@ namespace Freefall.Graphics
              }
              
              // Execute custom Light actions (directional light compute dispatch writes to UAV)
+             PixMarker.Begin(list, "Directional Light");
              CommandBuffer.ExecuteCustomActions(RenderPass.Light, list);
              CommandBuffer.ClearCustomActions(RenderPass.Light);
+             PixMarker.End(list); // Directional Light
              
-             // Transition LightBuffer from UAV → RenderTarget for point light rasterized draws
+             // UAV barrier between directional and point light dispatches
              list.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(LightBuffer.Native)));
-             Transition(list, LightBuffer.Native, ResourceStates.UnorderedAccess, ResourceStates.RenderTarget);
              
-             // Bind LightBuffer as RTV (no depth) for additive point light rendering
-             var vp = new Viewport(0, 0, LightBuffer.Native.Description.Width, LightBuffer.Native.Description.Height);
-             list.OMSetRenderTargets(LightBuffer.RtvHandle);
-             list.RSSetViewport(vp);
-             list.RSSetScissorRect(new RectI(0, 0, (int)LightBuffer.Native.Description.Width, (int)LightBuffer.Native.Description.Height));
+             // Point light compute dispatch (tiled culling, writes additively to same UAV)
+             PixMarker.Begin(list, "Point Lights");
+             DispatchPointLights(camera, list);
+             PixMarker.End(list); // Point Lights
              
-             // Execute batched point light draws (rasterized, additive blend)
-             CommandBuffer.Execute(RenderPass.Light, list, Engine.Device);
+             // UAV barrier, then transition to SRV for composition
+             list.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(LightBuffer.Native)));
+             Transition(list, LightBuffer.Native, ResourceStates.UnorderedAccess, ResourceStates.PixelShaderResource);
+             PixMarker.End(list); // Lighting
+        }
+
+        private unsafe void DispatchPointLights(Camera camera, ID3D12GraphicsCommandList list)
+        {
+             var lights = Base.ComponentCache<Components.PointLight>.All;
+             if (lights.Count == 0) return;
+
+             var camPos = camera.Position;
+             int frameIdx = Engine.FrameIndex % FrameCount;
+             int count = Math.Min(lights.Count, MaxPointLights);
+
+             // Upload light data to per-frame structured buffer
+             var dst = _pointLightBuffers![frameIdx].WritePtr<Components.PointLight.PointLightData>();
+             for (int i = 0; i < count; i++)
+             {
+                 var pl = lights[i];
+                 dst[i] = new Components.PointLight.PointLightData
+                 {
+                     Color = new Vector3(pl.Color.R, pl.Color.G, pl.Color.B),
+                     Intensity = pl.Intensity,
+                     Position = pl.Entity.Transform.WorldPosition - camPos,
+                     Range = pl.Range
+                 };
+             }
+
+             // Set push constants
+             var desc = LightBuffer.Native.Description;
+             _pointLightCS.SetPushConstant("NormalTex", Normals.BindlessIndex);
+             _pointLightCS.SetPushConstant("DepthTex", Depth.BindlessIndex);
+             _pointLightCS.SetPushConstant("AlbedoTex", Albedo.BindlessIndex);
+             _pointLightCS.SetPushConstant("DataTex", Data.BindlessIndex);
+             _pointLightCS.SetPushConstant("OutputUAV", LightBuffer.UavIndex);
+             _pointLightCS.SetPushConstant("LightData", _pointLightBuffers[frameIdx].SrvIndex);
+             _pointLightCS.SetPushConstant("LightCount", (uint)count);
+             _pointLightCS.SetPushConstant("ScreenWidth", (uint)desc.Width);
+             _pointLightCS.SetPushConstant("ScreenHeight", (uint)desc.Height);
+
+             // Bind root signature, descriptor heap, and SceneConstants cbuffer (b0)
+             list.SetComputeRootSignature(Engine.Device.GlobalRootSignature);
+             list.SetDescriptorHeaps(1, new[] { Engine.Device.SrvHeap });
              
-             // Transition to SRV for composition
-             Transition(list, LightBuffer.Native, ResourceStates.RenderTarget, ResourceStates.PixelShaderResource);
+             // Bind SceneConstants (b0) for CameraInverse — reuse from matDirectionalLight
+             foreach (var cb in matDirectionalLight.ConstantBuffers)
+             {
+                 if (cb.Slot >= 0)
+                 {
+                     matDirectionalLight.Effect!.GetMaterialBlock().Apply(cb);
+                     cb.Commit();
+                     list.SetComputeRootConstantBufferView((uint)cb.Slot, cb.GpuAddress);
+                 }
+             }
+
+             uint groupsX = ((uint)desc.Width + 7) / 8;
+             uint groupsY = ((uint)desc.Height + 7) / 8;
+             _pointLightCS.Dispatch(_kPointLight, list, groupsX, groupsY);
         }
 
         private void Compose(Camera camera, ID3D12GraphicsCommandList list)
         {
+            PixMarker.Begin(list, "Composition");
             // Compute shader path — write directly to Composite UAV
             var fromState = _isFirstFrame ? ResourceStates.Common : ResourceStates.PixelShaderResource;
             Transition(list, Composite.Native, fromState, ResourceStates.UnorderedAccess);
@@ -528,10 +643,12 @@ namespace Freefall.Graphics
             Transition(list, Composite.Native, ResourceStates.UnorderedAccess, ResourceStates.RenderTarget);
             
             // NOTE: Composite stays in RenderTarget for the Forward pass
+            PixMarker.End(list); // Composition
         }
 
         private void RenderForward(Camera camera, ID3D12GraphicsCommandList list)
         {
+             PixMarker.Begin(list, "Forward");
              // Snapshot the Composite buffer for forward-pass shaders to read
              // (avoids read/write hazard — ocean writes to Composite while reading the snapshot)
              if (CompositeSnapshot == null) 
@@ -560,7 +677,9 @@ namespace Freefall.Graphics
              list.RSSetScissorRect(new RectI(0, 0, (int)Composite.Native.Description.Width, (int)Composite.Native.Description.Height));
 
              // Execute forward pass draws (ocean, gizmos, etc.)
+             PixMarker.Begin(list, "Forward Draws");
              CommandBuffer.Execute(RenderPass.Forward, list, Engine.Device);
+             PixMarker.End(list); // Forward Draws
 
              // Pick readback: entity ID + depth + normal
               if (_pickRequestX >= 0 && _entityIdReadback != null)
@@ -621,16 +740,20 @@ namespace Freefall.Graphics
                  list.OMSetRenderTargets(Composite.RtvHandle);
                  list.RSSetViewport(new Viewport(0, 0, Composite.Native.Description.Width, Composite.Native.Description.Height));
                  list.RSSetScissorRect(new RectI(0, 0, (int)Composite.Native.Description.Width, (int)Composite.Native.Description.Height));
+                 PixMarker.Begin(list, "PostProcess");
                  CommandBuffer.Execute(RenderPass.PostProcess, list, Engine.Device);
+                 PixMarker.End(list); // PostProcess
 
                  // Transition Composite back to PixelShaderResource for Blit
                  Transition(list, Composite.Native, ResourceStates.RenderTarget, ResourceStates.PixelShaderResource);
              }
+             PixMarker.End(list); // Forward
         }
         
 
         private void BlitToBackBuffer(Camera camera, ID3D12GraphicsCommandList list)
         {
+             PixMarker.Begin(list, "Blit");
              var backBuffer = camera.Target.CurrentBackBuffer;
              
              Transition(list, Composite.Native, ResourceStates.PixelShaderResource, ResourceStates.CopySource);
@@ -640,6 +763,7 @@ namespace Freefall.Graphics
              
              Transition(list, Composite.Native, ResourceStates.CopySource, ResourceStates.PixelShaderResource);
              Transition(list, backBuffer, ResourceStates.CopyDest, ResourceStates.RenderTarget);
+             PixMarker.End(list); // Blit
         }
 
         /// <summary>
@@ -734,9 +858,13 @@ namespace Freefall.Graphics
             Composite?.Dispose();
             CompositeSnapshot?.Dispose();
             ShadowTextureArray?.Dispose();
+            ScreenSpaceShadows?.Dispose();
             _entityIdReadback?.Dispose();
             _depthReadback?.Dispose();
             _normalReadback?.Dispose();
+            _pointLightCS?.Dispose();
+            if (_pointLightBuffers != null)
+                foreach (var b in _pointLightBuffers) b?.Dispose();
         }
     }
 }

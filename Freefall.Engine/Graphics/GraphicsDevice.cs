@@ -57,6 +57,19 @@ namespace Freefall.Graphics
         public ID3D12DescriptorHeap SrvHeap => _srvHeap;
         public ID3D12RootSignature GlobalRootSignature => _globalRootSignature;
 
+        /// <summary>
+        /// Set to true when a DEVICE_REMOVED is detected (via fence returning UINT64_MAX).
+        /// Once lost, no GPU operations will succeed until the device is recreated.
+        /// </summary>
+        public volatile bool IsDeviceLost;
+
+        /// <summary>
+        /// When true, ReleaseBindlessIndex calls are silently ignored.
+        /// Set during batch eviction to prevent descriptor reuse conflicts.
+        /// </summary>
+        [ThreadStatic]
+        public static bool SuppressBindlessRelease;
+
         public GraphicsDevice()
         {
             Initialize();
@@ -380,6 +393,8 @@ namespace Freefall.Graphics
 
         public void ReleaseBindlessIndex(uint index)
         {
+            if (SuppressBindlessRelease) return; // Intentional leak during batch eviction
+
             lock (_bindlessLock)
             {
                 _freeBindlessIndices.Push(index);
@@ -424,8 +439,31 @@ namespace Freefall.Graphics
                 _commandQueue.ExecuteCommandList(commandList);
                 _commandQueue.Signal(fence, 1);
             }
-            // Wait outside the lock so the main render thread can still submit work
-            while (fence.CompletedValue < 1) { Thread.SpinWait(100); }
+            // Use event-based wait instead of spin-polling — yields CPU to GPU driver
+            if (fence.CompletedValue < 1)
+            {
+                if (fence.CompletedValue == ulong.MaxValue) { IsDeviceLost = true; }
+                else
+                {
+                    using var waitEvent = new AutoResetEvent(false);
+                    fence.SetEventOnCompletion(1, waitEvent.SafeWaitHandle.DangerousGetHandle());
+                    waitEvent.WaitOne(5000);
+                    if (fence.CompletedValue == ulong.MaxValue) IsDeviceLost = true;
+                }
+            }
+
+            // Proactively check for delayed TDR — the fence can signal success
+            // but the device may already be dead (TDR detection is asynchronous).
+            if (!IsDeviceLost)
+            {
+                var hr = _device.DeviceRemovedReason;
+                if (hr.Failure)
+                {
+                    IsDeviceLost = true;
+                    Debug.LogWarning("GraphicsDevice", $"Delayed device removal detected after SubmitAndWait: 0x{hr.Code:X8}");
+                }
+            }
+
             fence.Dispose();
         }
 
@@ -444,7 +482,11 @@ namespace Freefall.Graphics
                 _copyQueue.Signal(_copyFence, (ulong)targetValue);
             }
             // CPU-wait for the copy to complete
-            while (_copyFence.CompletedValue < (ulong)targetValue) { Thread.SpinWait(100); }
+            while (_copyFence.CompletedValue < (ulong)targetValue)
+            {
+                if (_copyFence.CompletedValue == ulong.MaxValue) { IsDeviceLost = true; break; }
+                Thread.Sleep(1);
+            }
         }
 
         /// <summary>
@@ -473,7 +515,11 @@ namespace Freefall.Graphics
             // Drain outside the lock so other threads can still submit
             if (shouldDrain)
             {
-                while (_copyFence.CompletedValue < (ulong)targetValue) { Thread.SpinWait(100); }
+                while (_copyFence.CompletedValue < (ulong)targetValue)
+                {
+                    if (_copyFence.CompletedValue == ulong.MaxValue) { IsDeviceLost = true; break; }
+                    Thread.Sleep(1); // Yield CPU to GPU driver
+                }
             }
 
             return targetValue;

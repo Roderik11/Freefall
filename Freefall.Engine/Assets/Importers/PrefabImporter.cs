@@ -7,7 +7,7 @@ namespace Freefall.Assets.Importers
     /// Reads the YAML bytes and produces a PrefabData artifact
     /// that gets packed into Library/ via PrefabPacker.
     /// </summary>
-    [AssetImporter(".prefab")]
+    [AssetImporter(".prefab", ImportPriority = 3)]
     public class PrefabImporter : IImporter
     {
         public Type AssetType => typeof(Prefab);

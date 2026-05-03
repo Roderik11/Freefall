@@ -17,7 +17,7 @@ namespace Freefall.Assets.Importers
     /// 2. A hidden CollisionMeshData subasset containing a pre-cooked PhysX HeightField
     ///    cooked from the saved baked heightmap DDS.
     /// </summary>
-    [AssetImporter(".terrain")]
+    [AssetImporter(".terrain", ImportPriority = 4)]
     public class TerrainImporter : IImporter
     {
         public Type AssetType => typeof(Terrain);

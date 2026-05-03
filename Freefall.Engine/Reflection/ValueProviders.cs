@@ -35,8 +35,8 @@ namespace Freefall.Reflection
             var result = new List<ProviderValue>();
             Mesh mesh = null;
 
-            if (context is Assets.MeshElement target)
-                mesh = target.Mesh;
+            if (context is Components.MeshRenderer renderer)
+                mesh = renderer.Mesh;
 
             if (mesh == null) return result;
 

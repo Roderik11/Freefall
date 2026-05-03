@@ -5,11 +5,12 @@ using Freefall.Assets;
 using Vortice.Direct3D12;
 using Vortice.Direct3D12.Shader;
 using Vortice.DXGI;
+using Vortice.Mathematics;
 
 namespace Freefall.Graphics
 {
     /// <summary>
-    /// Material texture indices for bindless lookup - matches HLSL MaterialData layout
+    /// Material texture indices + scalar properties for bindless lookup — matches HLSL MaterialData (64 bytes)
     /// </summary>
     public struct MaterialData
     {
@@ -21,8 +22,10 @@ namespace Freefall.Graphics
         public uint AOIdx;
         public uint DetailNormalIdx;
         public uint DetailMaskIdx;
-        public uint DetailTilingPacked; // float reinterpreted as uint bits
-        public uint Padding0;
+        public Vector2 DetailTiling;
+        public Vector2 DetailOffset;
+        public Vector3 EmissiveColor;
+        public float EmissiveIntensity;
 
         /// <summary>
         /// Texture slot names derived from this struct's fields (strips "Idx" suffix).
@@ -34,6 +37,75 @@ namespace Freefall.Graphics
                 .Select(f => f.Name[..^3])
                 .ToArray();
     }
+
+    /// <summary>
+    /// Base class for material scalar properties exposed in the inspector.
+    /// Same pattern as TextureEffectParameter — the inspector reads the Value property.
+    /// </summary>
+    public abstract class MaterialProperty
+    {
+        public string Name { get; set; }
+        public Material Material { get; set; }
+        public abstract Type ValueType { get; }
+
+        /// <summary>
+        /// Parse a string value and set this property. Used by MaterialLoader.
+        /// </summary>
+        public abstract bool TryParseAndSet(string text);
+
+        /// <summary>
+        /// Format this property's current value as a YAML-compatible string.
+        /// Returns null if the value is at its default.
+        /// </summary>
+        public abstract string FormatValue();
+    }
+
+    /// <summary>
+    /// Typed material property. Setter calls back to Material to update MaterialData on GPU.
+    /// </summary>
+    public class MaterialProperty<T> : MaterialProperty where T : struct
+    {
+        private T _value;
+        private T _defaultValue;
+        private Action<Material, T> _apply;
+
+        public override Type ValueType => typeof(T);
+
+        public T Value
+        {
+            get => _value;
+            set
+            {
+                _value = value;
+                _apply?.Invoke(Material, value);
+            }
+        }
+
+        public MaterialProperty(string name, Material mat, T defaultValue, Action<Material, T> apply)
+        {
+            Name = name;
+            Material = mat;
+            _value = defaultValue;
+            _defaultValue = defaultValue;
+            _apply = apply;
+        }
+
+        public override bool TryParseAndSet(string text)
+        {
+            if (!Serialization.YAMLConverterHelper.TryParse<T>(text, out var result))
+                return false;
+            Value = result;
+            return true;
+        }
+
+        public override string FormatValue()
+        {
+            if (EqualityComparer<T>.Default.Equals(_value, _defaultValue))
+                return null;
+            return Serialization.YAMLConverterHelper.Format(_value);
+        }
+    }
+
     
     /// <summary>
     /// Maps a shader pass to a RenderPass enum (Apex pattern)
@@ -78,6 +150,7 @@ namespace Freefall.Graphics
         private Dictionary<string, ConstantBuffer> _constantBuffers = new();
         private Dictionary<string, Texture> _textures = new();
         private List<TextureEffectParameter> _textureParameters = new();
+        private List<MaterialProperty> _materialProperties = new();
         
         /// <summary>
         /// Read-only access to texture bindings (slot name → Texture).
@@ -90,6 +163,11 @@ namespace Freefall.Graphics
         /// and writes back through SetTexture() when applied.
         /// </summary>
         public IReadOnlyList<TextureEffectParameter> TextureParameters => _textureParameters;
+        
+        /// <summary>
+        /// Scalar material properties for inspector binding. Each writes to MaterialData on change.
+        /// </summary>
+        public IReadOnlyList<MaterialProperty> MaterialProperties => _materialProperties;
         
         // Material ID indirection system
         public int MaterialID { get; private set; }
@@ -205,11 +283,29 @@ namespace Freefall.Graphics
             lock (_materialIdLock)
             {
                 MaterialID = _nextMaterialID++;
-                _allMaterials.Add(new MaterialData());
+                _allMaterials.Add(new MaterialData
+                {
+                    EmissiveColor = Vector3.One,
+                    EmissiveIntensity = 1.0f,
+                });
                 _materialsBufferDirty = true;
             }
-
+            
+            InitMaterialProperties();
             InitFromEffect(effect, device);
+        }
+        
+        private void InitMaterialProperties()
+        {
+            _materialProperties.Clear();
+            _materialProperties.Add(new MaterialProperty<Color3>("EmissiveColor", this, new Color3(),
+                (m, v) => m.UpdateMaterialScalar((ref MaterialData d) => d.EmissiveColor = v.ToVector3())));
+            _materialProperties.Add(new MaterialProperty<float>("EmissiveIntensity", this, 1.0f,
+                (m, v) => m.UpdateMaterialScalar((ref MaterialData d) => d.EmissiveIntensity = v)));
+            _materialProperties.Add(new MaterialProperty<Vector2>("DetailTiling", this, Vector2.Zero,
+                (m, v) => m.UpdateMaterialScalar((ref MaterialData d) => d.DetailTiling = v)));
+            _materialProperties.Add(new MaterialProperty<Vector2>("DetailOffset", this, Vector2.Zero,
+                (m, v) => m.UpdateMaterialScalar((ref MaterialData d) => d.DetailOffset = v)));
         }
 
         /// <summary>
@@ -242,7 +338,7 @@ namespace Freefall.Graphics
             foreach (var (slot, tex) in savedTextures)
                 SetTexture(slot, tex);
 
-            Debug.Log($"[Material] Switched '{Name}' to effect '{effect.Name}'");
+            //Debug.Log($"[Material] Switched '{Name}' to effect '{effect.Name}'");
         }
 
         /// <summary>
@@ -250,7 +346,7 @@ namespace Freefall.Graphics
         /// </summary>
         private void InitFromEffect(Effect effect, GraphicsDevice device)
         {
-            Debug.Log($"[Material] Creating Material for Effect: {effect.Name}");
+            //Debug.Log($"[Material] Creating Material for Effect: {effect.Name}");
             Effect = effect;
             
             // Populate SubShaders from Effect techniques (Apex pattern)
@@ -634,15 +730,42 @@ namespace Freefall.Graphics
         }
         
         /// <summary>
-        /// Set detail map tiling scale. Stored as float bits in MaterialData.
+        /// Set detail map tiling scale (uniform).
         /// </summary>
         public void SetDetailTiling(float tiling)
+        {
+            var v = new Vector2(tiling, tiling);
+            UpdateMaterialScalar((ref MaterialData d) => d.DetailTiling = v);
+        }
+        
+        /// <summary>
+        /// Set emissive color tint.
+        /// </summary>
+        public void SetEmissiveColor(Vector3 color)
+        {
+            UpdateMaterialScalar((ref MaterialData d) => d.EmissiveColor = color);
+        }
+        
+        /// <summary>
+        /// Set emissive intensity multiplier.
+        /// </summary>
+        public void SetEmissiveIntensity(float intensity)
+        {
+            UpdateMaterialScalar((ref MaterialData d) => d.EmissiveIntensity = intensity);
+        }
+        
+        private delegate void MaterialDataMutator(ref MaterialData data);
+        
+        /// <summary>
+        /// Generic helper to mutate a single field in this material's MaterialData entry.
+        /// </summary>
+        private void UpdateMaterialScalar(MaterialDataMutator mutator)
         {
             lock (_materialIdLock)
             {
                 if (MaterialID < 0 || MaterialID >= _allMaterials.Count) return;
                 var data = _allMaterials[MaterialID];
-                data.DetailTilingPacked = BitConverter.SingleToUInt32Bits(tiling);
+                mutator(ref data);
                 _allMaterials[MaterialID] = data;
                 _materialsBufferDirty = true;
             }
@@ -705,11 +828,12 @@ namespace Freefall.Graphics
             block?.Apply(this);
 
             // Bind Pipeline - use selected pass's PSO, wireframe variant if enabled
-            var pso = _passPipelineStates.TryGetValue(Pass, out var selectedPso) ? selectedPso : _passPipelineStates[0];
+            var pso = _passPipelineStates.TryGetValue(Pass, out var selectedPso) ? selectedPso : _passPipelineStates.GetValueOrDefault(0);
             if (Engine.Settings.Wireframe && !_isFullscreenPass && _passWireframePSOs.TryGetValue(Pass, out var wireframePso))
             {
                 pso = wireframePso;
             }
+            if (pso?.Native == null) return; // Device lost — PSO wasn't created
             commandList.SetPipelineState(pso.Native);
             commandList.SetGraphicsRootSignature(device.GlobalRootSignature);
 

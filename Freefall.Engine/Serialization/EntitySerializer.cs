@@ -121,7 +121,7 @@ namespace Freefall.Serialization
                     if (component is Transform t)
                     {
                         CopyFields(t, current.Transform);
-
+                      
                         // Retarget deferred UID refs from temp Transform to entity's real Transform.
                         // Without this, Phase 2 would set Parent on the discarded temp object.
                         var deferredRefs = _yaml.DeferredUniqueIdRefs;

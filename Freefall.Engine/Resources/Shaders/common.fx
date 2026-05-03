@@ -18,6 +18,7 @@ cbuffer SceneConstants : register(b0)
 }
 
 // Material data for bindless texture lookup via Material ID indirection
+// 64 bytes — matches C# MaterialData layout exactly
 struct MaterialData
 {
     uint AlbedoIdx;
@@ -28,8 +29,10 @@ struct MaterialData
     uint AOIdx;
     uint DetailNormalIdx;
     uint DetailMaskIdx;
-    uint DetailTilingPacked; // float as bits: tiling scale
-    uint Padding0;
+    float2 DetailTiling;
+    float2 DetailOffset;
+    float3 EmissiveColor;
+    float EmissiveIntensity;
 };
 
 // Shadow cascade data — shared by all shadow-related shaders

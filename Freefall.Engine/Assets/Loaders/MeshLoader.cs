@@ -29,8 +29,6 @@ namespace Freefall.Assets.Loaders
             using (var stream = File.OpenRead(cachePath))
                 meshData = _packer.Read(stream);
 
-            if (meshData.Positions?.Length > 0)
-                Debug.Log($"[MeshLoader] '{name}' Vert[0]={meshData.Positions[0]} Vert[1]={meshData.Positions[1]} BBox={meshData.BoundingBox.Min}..{meshData.BoundingBox.Max}");
             // Match Apex MeshReader: sort parts alphabetically by name
             // Build remap table so LOD indices stay correct after reorder
             var originalOrder = new List<MeshPart>(meshData.Parts);

@@ -42,11 +42,12 @@ namespace Freefall.Graphics
             public uint Reserved9;
         }
 
-        public const int MaxMeshParts = 4096;
+        public const int MaxMeshParts = 65536;
         public const int EntrySize = 72; // 18 uints
 
         private static readonly Dictionary<(int meshId, int partIndex), int> _idMap = new();
         private static readonly List<MeshPartEntry> _entries = new();
+        private static readonly Stack<int> _freeSlots = new();
         private static ID3D12Resource? _buffer;
         private static uint _srvIndex;
         private static bool _dirty = true;
@@ -92,18 +93,55 @@ namespace Freefall.Graphics
                     return existingId;
                 }
 
+                if (_freeSlots.Count > 0)
+                {
+                    int id = _freeSlots.Pop();
+                    _entries[id] = entry;
+                    _idMap[key] = id;
+                    _dirty = true;
+                    return id;
+                }
+
                 if (_entries.Count >= MaxMeshParts)
                     throw new InvalidOperationException($"MeshRegistry exceeded max capacity of {MaxMeshParts}");
 
-                int id = _entries.Count;
+                int newId = _entries.Count;
                 _entries.Add(entry);
-                _idMap[key] = id;
+                _idMap[key] = newId;
                 _dirty = true;
 
                 if (Engine.FrameIndex < 10)
-                    Debug.Log("MeshRegistry", $"Registered mesh {mesh.Name} part {partIndex} as ID {id}");
+                    Debug.Log("MeshRegistry", $"Registered mesh {mesh.Name} part {partIndex} as ID {newId}");
 
-                return id;
+                return newId;
+            }
+        }
+
+        /// <summary>
+        /// Unregister all parts of a mesh, freeing their registry slots for reuse.
+        /// Call from Mesh.Dispose().
+        /// </summary>
+        public static void Unregister(Mesh mesh)
+        {
+            lock (_lock)
+            {
+                int meshId = mesh.GetInstanceId();
+                var keysToRemove = new List<(int, int)>();
+                foreach (var kv in _idMap)
+                {
+                    if (kv.Key.meshId == meshId)
+                    {
+                        keysToRemove.Add(kv.Key);
+                        _freeSlots.Push(kv.Value);
+                        // Zero out the entry so GPU doesn't reference stale data
+                        _entries[kv.Value] = default;
+                    }
+                }
+                foreach (var key in keysToRemove)
+                    _idMap.Remove(key);
+
+                if (keysToRemove.Count > 0)
+                    _dirty = true;
             }
         }
 
@@ -169,6 +207,7 @@ namespace Freefall.Graphics
         {
             _entries.Clear();
             _idMap.Clear();
+            _freeSlots.Clear();
             _dirty = true;
         }
 

@@ -23,7 +23,7 @@ namespace Freefall.Graphics
             }
             catch (Exception ex)
             {
-                Debug.Log($"[PipelineState] PSO Creation FAILED!");
+                Debug.Log($"[PipelineState] PSO Creation FAILED! HRESULT: 0x{ex.HResult:X8}");
                 Debug.Log($"  VS Bytecode: {description.VertexShader.Length} bytes");
                 Debug.Log($"  PS Bytecode: {description.PixelShader.Length} bytes");
                 Debug.Log($"  RTV Count: {description.RenderTargetFormats.Length}");
@@ -32,7 +32,25 @@ namespace Freefall.Graphics
                 Debug.Log($"  DSV Format: {description.DepthStencilFormat}");
                 Debug.Log($"  PrimitiveTopology: {description.PrimitiveTopologyType}");
                 Debug.Log($"  SampleMask: {description.SampleMask}");
-                throw;
+
+                // PSO failure might be the first sign of device removal —
+                // fences won't detect it until something is submitted
+                if (!device.IsDeviceLost)
+                {
+                    try
+                    {
+                        var reason = device.NativeDevice.DeviceRemovedReason;
+                        if (reason.Failure)
+                        {
+                            Debug.LogWarning("PipelineState", $"Device removed detected: 0x{reason.Code:X8}");
+                            device.IsDeviceLost = true;
+                        }
+                    }
+                    catch { device.IsDeviceLost = true; }
+                }
+
+                if (!device.IsDeviceLost) throw;
+                // Device is dead — swallow and leave _pipelineState null
             }
         }
         /// <summary>
@@ -96,7 +114,7 @@ namespace Freefall.Graphics
                 Debug.Log($"  PS Bytecode: {desc.PixelShader.Length} bytes");
                 Debug.Log($"  RTV Count: {desc.RenderTargetFormats.Length}");
                 Debug.Log($"  DSV Format: {desc.DepthStencilFormat}");
-                throw;
+                if (!device.IsDeviceLost) throw;
             }
         }
 

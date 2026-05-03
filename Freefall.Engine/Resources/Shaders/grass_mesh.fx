@@ -231,7 +231,7 @@ PSOutput PS(VSOutput input)
         N = normalize(mul(texNormal, TBN));
     }
 
-    output.Albedo = float4(baseColor, 1.0);
+    output.Albedo = float4(baseColor, 0);
     output.Normal = float4(N, 1.0);
     output.Data = float4(0.85, 0.0, 1.0, 0.5); // roughness, metallic, ao, vegetation lighting flag
     output.Depth = input.Depth;

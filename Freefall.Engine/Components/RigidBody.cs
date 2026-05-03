@@ -16,7 +16,6 @@ namespace Freefall.Components
         Sphere,
         Capsule,
         Mesh,
-        StaticMesh,
         Terrain
     }
 
@@ -30,7 +29,6 @@ namespace Freefall.Components
         private Action<Message>? _onTerrainLoaded;
         public Actor? Actor => (Actor?)_staticActor ?? _dynamicActor;
 
-        public StaticMesh? StaticMesh { get; set; }
         public Graphics.Mesh? Mesh { get; set; }
         public ShapeType Type { get; set; } = ShapeType.Box;
         public float Mass { get; set; } = 10f;
@@ -51,16 +49,11 @@ namespace Freefall.Components
 
         protected override void Awake()
         {
+            if (Engine.IsEditor)
+                return;
+
             try
             {
-                // Auto-resolve StaticMesh from sibling StaticMeshRenderer if not set
-                if (StaticMesh == null && Type == ShapeType.StaticMesh)
-                {
-                    var smr = Entity?.GetComponent<StaticMeshRenderer>();
-                    if (smr?.StaticMesh != null)
-                        StaticMesh = smr.StaticMesh;
-                }
-
                 // Auto-resolve Mesh from sibling MeshRenderer if not set
                 if (Mesh == null && Type == ShapeType.Mesh)
                 {
@@ -86,12 +79,14 @@ namespace Freefall.Components
                 {
                     if (IsStatic && _staticActor != null)
                     {
-                        var matrix = Matrix4x4.CreateFromQuaternion(Transform.Rotation)
-                                   * Matrix4x4.CreateTranslation(Transform.WorldPosition);
+                        Transform.Matrix.Deconstruct(out var scale, out var rotation, out var translation);
+
+                        var matrix = Matrix4x4.CreateFromQuaternion(rotation)
+                                   * Matrix4x4.CreateTranslation(translation);
 
                         _staticActor.GlobalPose = matrix;
-                        _staticActor.GlobalPosePosition = matrix.Translation;
-                        _staticActor.GlobalPoseQuat = Transform.Rotation;
+                        _staticActor.GlobalPosePosition = translation;
+                        _staticActor.GlobalPoseQuat = rotation;
                     }
                 };
             }
@@ -100,6 +95,8 @@ namespace Freefall.Components
                 Debug.Log($"[RigidBody] {Entity?.Name}: {ex.Message}");
             }
         }
+
+        static Dictionary<string, TriangleMesh> cookedMeshes = [];
 
         private PhysX.Geometry? CreateGeometry()
         {
@@ -123,29 +120,23 @@ namespace Freefall.Components
                 case ShapeType.Capsule:
                     return new CapsuleGeometry(extents.Y, extents.X);
 
-                case ShapeType.StaticMesh:
-                {
-                    // Use pre-cooked TriangleMesh if available, otherwise cook at runtime
-                    if (StaticMesh?.CookedTriMesh == null)
-                        StaticMesh?.CookPhysicsMesh();
-
-                    if (StaticMesh?.CookedTriMesh == null)
-                    {
-                        Debug.Log("[RigidBody] StaticMesh cooking failed — no geometry available");
-                        return null;
-                    }
-
-                    return new TriangleMeshGeometry(StaticMesh.CookedTriMesh)
-                    {
-                        Scale = new MeshScale(scale, Quaternion.Identity)
-                    };
-                }
-
                 case ShapeType.Mesh:
                 {
-                    // Same pattern as StaticMesh: use pre-cooked, or cook on demand
+                    // need to cook meshes on import
                     if (Mesh?.CookedTriMesh == null)
-                        Mesh?.CookPhysicsMesh();
+                    {
+                            if (!cookedMeshes.TryGetValue(Mesh.Guid, out var triMesh))
+                            {
+                                Mesh?.CookPhysicsMesh();
+                                if (Mesh?.CookedTriMesh != null)
+                                {
+                                    cookedMeshes[Mesh.Guid] = Mesh.CookedTriMesh;
+                                    triMesh = Mesh.CookedTriMesh;
+                                }
+                            }
+                            
+                            Mesh?.CookedTriMesh = triMesh;
+                        }
 
                     if (Mesh?.CookedTriMesh == null)
                     {
@@ -230,18 +221,20 @@ namespace Freefall.Components
                 _dynamicActor = null;
             }
 
+            Transform.Matrix.Deconstruct(out var scale, out var rotation, out var translation);
+
             // Build a clean pose from position + rotation (no scale).
             // PhysX requires an orthonormal rotation — scale is applied via geometry.
-            var matrix = Matrix4x4.CreateFromQuaternion(Transform.Rotation)
-                       * Matrix4x4.CreateTranslation(Transform.WorldPosition);
+            var matrix = Matrix4x4.CreateFromQuaternion(rotation)
+                       * Matrix4x4.CreateTranslation(translation);
 
             if (IsStatic)
             {
                 _staticActor = PhysicsWorld.Physics.CreateRigidStatic();
                 _staticActor.UserData = Entity;
                 _staticActor.GlobalPose = matrix;
-                _staticActor.GlobalPosePosition = matrix.Translation;
-                _staticActor.GlobalPoseQuat = Transform.Rotation;
+                _staticActor.GlobalPosePosition = translation;
+                _staticActor.GlobalPoseQuat = rotation;
                 _staticActor.Flags &= ~ActorFlag.Visualization;
                 _staticActor.Flags |= ActorFlag.DisableGravity;
 

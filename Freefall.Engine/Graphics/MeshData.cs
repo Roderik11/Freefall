@@ -24,5 +24,12 @@ namespace Freefall.Graphics
 
         // LOD grouping (populated by ModelImporter when sub-meshes have LOD naming)
         public List<MeshLOD> LODs = new List<MeshLOD>();
+
+        /// <summary>
+        /// Material name per MaterialSlot. Populated from FBX material assignments.
+        /// Used at asset creation time to resolve DefaultMaterials for MeshRenderer auto-init.
+        /// Index = MaterialSlot, Value = material name from FBX.
+        /// </summary>
+        public string[] MaterialNames;
     }
 }

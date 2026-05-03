@@ -20,6 +20,7 @@
 #pragma kernel CSVisibilityShadow4
 #pragma kernel CSExpandCascades
 #pragma kernel CSPatchExpandedCounts
+#pragma kernel CSCompactCommands
 
 // Frustum planes + Hi-Z occlusion parameters (root slot 1 -> register b0)
 cbuffer FrustumPlanes : register(b0)
@@ -82,7 +83,7 @@ cbuffer PushConstants : register(b3)
     uint NumBlocksIdx;              // slot 15 — Number of blocks in scan
     uint SubbatchStartIdx;          // slot 16 — Starting index of current subbatch
     uint SubbatchCountIdx;          // slot 17 — Number of instances in current subbatch
-    uint _reserved18;               // slot 18 — unused
+    uint DrawCountUAVIdx;            // slot 18 — UAV: non-empty draw command count for ExecuteIndirect
     uint IndirectionUAVIdx;         // slot 19 — UAV: maps group-order -> draw-order index
     uint SortSizeIdx;               // slot 20 — Block size for this merge step
     uint SortStrideIdx;             // slot 21 — Stride within block
@@ -812,8 +813,12 @@ void CSHistogramPrefixSum(uint3 groupThreadId : SV_GroupThreadID)
 
 //-----------------------------------------------------------------------------
 // Pass 5b: CSMain - Generate final indirect draw commands from MeshRegistry
-// Fully GPU-driven: iterates over MeshRegistry, reads counts from histogram
-// Generates one command per MeshPartId with non-zero visible count
+// Fully GPU-driven: iterates over MeshRegistry, reads counts from histogram.
+// Two modes:
+//   DrawCountUAVIdx != 0: Packs non-empty commands to front via atomic append
+//                         for count-buffer-driven ExecuteIndirect (opaque path).
+//   DrawCountUAVIdx == 0: Fixed-index writes at commands[meshPartId] with zeroed
+//                         empty commands (shadow path — downstream passes read by index).
 //-----------------------------------------------------------------------------
 [numthreads(64, 1, 1)]
 void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
@@ -828,12 +833,17 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
     
     uint visibleCount = histogram[meshPartId];
     
+    RWStructuredBuffer<IndirectDrawCommand> output = ResourceDescriptorHeap[OutputBufferIdx];
+    
     // Skip MeshPartIds with no visible instances
     if (visibleCount == 0)
     {
-        RWStructuredBuffer<IndirectDrawCommand> output = ResourceDescriptorHeap[OutputBufferIdx];
-        IndirectDrawCommand emptyCmd = (IndirectDrawCommand)0;
-        output[meshPartId] = emptyCmd;
+        // Fixed-index mode: write zeroed command (shadow pipeline reads by index)
+        if (DrawCountUAVIdx == 0)
+        {
+            IndirectDrawCommand emptyCmd = (IndirectDrawCommand)0;
+            output[meshPartId] = emptyCmd;
+        }
         return;
     }
     
@@ -845,7 +855,19 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
     StructuredBuffer<MeshPartEntry> meshRegistry = ResourceDescriptorHeap[MeshRegistryIdx];
     MeshPartEntry entry = meshRegistry[meshPartId];
     
-    RWStructuredBuffer<IndirectDrawCommand> output = ResourceDescriptorHeap[OutputBufferIdx];
+    // Determine output slot
+    uint outputSlot;
+    if (DrawCountUAVIdx != 0)
+    {
+        // Atomic append: pack non-empty commands at the front of the buffer
+        RWStructuredBuffer<uint> drawCount = ResourceDescriptorHeap[DrawCountUAVIdx];
+        InterlockedAdd(drawCount[0], 1, outputSlot);
+    }
+    else
+    {
+        // Fixed-index: shadow pipeline reads commands[meshPartId]
+        outputSlot = meshPartId;
+    }
     
     IndirectDrawCommand cmd;
     cmd.DescriptorBufIdx = DescriptorBufferIdx;
@@ -867,7 +889,7 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
     cmd.StartVertexLocation = 0;
     cmd.StartInstanceLocation = 0;
     
-    output[meshPartId] = cmd;
+    output[outputSlot] = cmd;
 }
 
 //-----------------------------------------------------------------------------
@@ -1097,4 +1119,33 @@ void CSPatchExpandedCounts(uint3 dispatchThreadId : SV_DispatchThreadID)
     
     // Patch DrawInstanceCount with actual expanded count
     commands[meshPartId].DrawInstanceCount = counters[meshPartId];
+}
+
+//-----------------------------------------------------------------------------
+// CSCompactCommands: Pack non-empty draw commands from source to destination.
+// Runs AFTER CSPatchExpandedCounts (shadow pipeline). Reads commands from
+// OutputBufferIdx (source), atomically appends non-empty ones to a SEPARATE
+// destination buffer (VisibleIndicesSRVIdx repurposed as dest UAV for this pass),
+// and writes total count to DrawCountUAV for ExecuteIndirect's count buffer.
+// Must use separate source/dest to avoid read-write race conditions.
+//-----------------------------------------------------------------------------
+[numthreads(64, 1, 1)]
+void CSCompactCommands(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    uint meshPartId = dispatchThreadId.x;
+    if (meshPartId >= UniquePartCount)
+        return;
+    
+    RWStructuredBuffer<IndirectDrawCommand> source = ResourceDescriptorHeap[OutputBufferIdx];
+    
+    IndirectDrawCommand cmd = source[meshPartId];
+    if (cmd.DrawInstanceCount == 0)
+        return;
+    
+    RWStructuredBuffer<uint> drawCount = ResourceDescriptorHeap[DrawCountUAVIdx];
+    uint slot;
+    InterlockedAdd(drawCount[0], 1, slot);
+    
+    RWStructuredBuffer<IndirectDrawCommand> dest = ResourceDescriptorHeap[VisibleIndicesSRVIdx];
+    dest[slot] = cmd;
 }

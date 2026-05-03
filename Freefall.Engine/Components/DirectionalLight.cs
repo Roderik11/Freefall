@@ -20,8 +20,6 @@ namespace Freefall.Components
         /// Cascade 0: near..Splits[0], Cascade 1: Splits[0]..Splits[1], etc.
         /// </summary>
         public float[] CascadeSplits = { 16f, 64f, 128, 512 };
-        
-
 
         private Material Material;
         private MaterialBlock Params;
@@ -112,6 +110,11 @@ namespace Freefall.Components
 
         private static DirectionalLight? _instance;
 
+        /// <summary>
+        /// Get the current directional light's forward direction.
+        /// </summary>
+        public static Vector3 GetLightDirection() => _instance?.Transform.Forward ?? Vector3.UnitY;
+
         public DirectionalLight()
         {
             Material = new Material(new Effect("light_directional"));
@@ -189,6 +192,7 @@ namespace Freefall.Components
             lightCS.SetPushConstant("OutputUAV", renderer.LightBuffer.UavIndex);
             lightCS.SetPushConstant("ScreenWidth", (uint)desc.Width);
             lightCS.SetPushConstant("ScreenHeight", (uint)desc.Height);
+            lightCS.SetPushConstant("SSSTex", renderer.ScreenSpaceShadows?.OutputSrvIndex ?? 0u);
             
             // Bind cbuffers on compute root (Material.Apply committed them on graphics root)
             foreach (var cb in Material.ConstantBuffers)
@@ -219,8 +223,11 @@ namespace Freefall.Components
             
             // Check if GPU cascade compute is available and SDSM is active
             var culler = CommandBuffer.Culler;
-            bool useGpuCascades = Engine.Settings.UseAdaptiveSplits 
-                && culler?.CascadeComputeReady == true;
+            // TEMP: force CPU path to isolate GPU cascade compute bug
+            // SDSM splits still used via ReadAdaptiveSplits() in CPU path below
+            bool useGpuCascades = false;
+            // bool useGpuCascades = Engine.Settings.UseAdaptiveSplits 
+            //     && culler?.CascadeComputeReady == true;
             
             if (useGpuCascades)
             {
@@ -435,6 +442,9 @@ namespace Freefall.Components
             radius = MathF.Ceiling(radius * 16.0f) / 16.0f;
             
             float texelSize = (radius * 2.0f) / shadowTex.Width;
+            
+            //if (Engine.FrameIndex % 60 == 0)
+            //    Debug.Log($"[SDSM] Cascade {index}: radius={radius:F1}, texelSize={texelSize:F4}, range={cascades[index].X:F1}-{cascades[index].Y:F1}");
             
             // Texel snapping: snap the frustum center to the shadow map's texel grid
             // so it stays fixed in the world as the camera moves, eliminating shimmer.

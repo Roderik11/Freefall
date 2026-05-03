@@ -213,19 +213,18 @@ void CSComputeCascadeMatrices(uint3 id : SV_DispatchThreadID)
     StructuredBuffer<float> splitsBuffer = ResourceDescriptorHeap[SplitsBufferIdx];
     float rawSplit = splitsBuffer[cascadeIdx];
     
-    // Temporal smoothing: blend raw SDSM splits with previous smoothed values
-    // Read previous smoothed value, blend, write back
+    // Temporal smoothing: DISABLED — cross-thread race between cascadeIdx and cascadeIdx-1
+    // causes mismatched near/far boundaries → shadow artifacts on cascades 2-3.
+    // TODO: fix by using a double-buffered approach (read prev frame, write current)
     RWStructuredBuffer<float> smoothedSplits = ResourceDescriptorHeap[SmoothedSplitsIdx];
-    float prev = smoothedSplits[cascadeIdx];
-    
-    // On first frame (prev=0), use raw value directly; otherwise blend
-    // 0.05 = ~20 frames to 63% convergence = visible but responsive smoothing
-    float smoothed = (prev > 0.001) ? lerp(prev, rawSplit, 0.05) : rawSplit;
+    // float prev = smoothedSplits[cascadeIdx];
+    // float smoothed = (prev > 0.001) ? lerp(prev, rawSplit, 0.05) : rawSplit;
+    float smoothed = rawSplit;
     smoothedSplits[cascadeIdx] = smoothed;
     
-    // For splitNear, read the raw SDSM split for (cascadeIdx-1) and apply same
-    // smoothing ratio as the previous frame would have. This avoids cross-thread
-    // dependency — each cascade independently reads its own near boundary.
+    // float rawNear = splitsBuffer[cascadeIdx - 1];
+    // float prevNear = smoothedSplits[cascadeIdx - 1];
+    // splitNear = (prevNear > 0.001) ? lerp(prevNear, rawNear, 0.05) : rawNear;
     float splitFar = smoothed;
     float splitNear;
     if (cascadeIdx == 0)
@@ -234,12 +233,7 @@ void CSComputeCascadeMatrices(uint3 id : SV_DispatchThreadID)
     }
     else
     {
-        // Use the smoothed value we wrote for the previous cascade
-        // Since all 4 threads are in the same wave, the write above for cascadeIdx-1
-        // is NOT yet visible. Use the raw value for near instead.
-        float rawNear = splitsBuffer[cascadeIdx - 1];
-        float prevNear = smoothedSplits[cascadeIdx - 1];
-        splitNear = (prevNear > 0.001) ? lerp(prevNear, rawNear, 0.05) : rawNear;
+        splitNear = splitsBuffer[cascadeIdx - 1];
     }
     
     // Build cascade projection matrix (same fov/aspect as camera, different near/far)

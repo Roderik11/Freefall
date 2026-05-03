@@ -338,6 +338,11 @@ namespace Freefall.Graphics
         {
             void* ptr;
             _resource.Map(0, null, &ptr);
+            if (ptr == null)
+            {
+                Debug.LogWarning("GraphicsBuffer", "Map returned null pointer (device lost?)");
+                return;
+            }
             data.CopyTo(new Span<T>(ptr, data.Length));
             _resource.Unmap(0);
         }

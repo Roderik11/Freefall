@@ -16,6 +16,7 @@ cbuffer PushConstants : register(b3)
     uint OutputUAVIdx;
     uint ScreenWidthIdx;
     uint ScreenHeightIdx;
+    uint SSSTexIdx;
 };
 
 #include "common.fx"
@@ -228,10 +229,14 @@ void CSDirectionalLight(uint3 dispatchThreadId : SV_DispatchThreadID)
         }
     }
 
-    // Contact shadow (disabled for now)
-    // float contactShadow = ContactShadow(worldPos.xyz, LightDirection, float2(px), viewDepth);
-    // shadowFactor = min(shadowFactor, contactShadow);
-    float contactShadow = 1.0;
+    // Screen-space shadows
+    float sssShadow = 1.0;
+    if (SSSTexIdx > 0)
+    {
+        Texture2D<float> sssTex = ResourceDescriptorHeap[SSSTexIdx];
+        sssShadow = sssTex.Load(coord).r;
+        shadowFactor = min(shadowFactor, sssShadow);
+    }
 
     // Debug visualization modes
     if (DebugVisualizationMode == 1)
@@ -247,7 +252,7 @@ void CSDirectionalLight(uint3 dispatchThreadId : SV_DispatchThreadID)
     }
     if (DebugVisualizationMode == 3)
     {
-        Output[px] = float4(contactShadow.xxx, 1);
+        Output[px] = float4(sssShadow.xxx, 1);
         return;
     }
     if (DebugVisualizationMode == 4)

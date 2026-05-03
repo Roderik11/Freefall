@@ -14,6 +14,7 @@ namespace Freefall.Assets
     /// serialized as a flat list, identical to the .scene YAML format.
     /// Instantiation clones via serialize/deserialize with fresh UIDs.
     /// </summary>
+    [AssetTypeAlias("PrefabData")]
     public class Prefab : Asset
     {
         /// <summary>
@@ -70,29 +71,6 @@ namespace Freefall.Assets
         }
 
         /// <summary>
-        /// Create a Prefab asset from a list of entities (e.g., from scene selection).
-        /// Serializes the entities to YAML using the same format as .scene files.
-        /// </summary>
-        public static Prefab CreateFromEntities(List<Entity> entities, string name = null)
-        {
-            if (entities == null || entities.Count == 0)
-                return null;
-
-            var serializer = new EntitySerializer();
-            var yaml = serializer.SaveToString(entities);
-
-            var prefab = new Prefab
-            {
-                SourceYaml = Encoding.UTF8.GetBytes(yaml),
-                RootEntityName = entities[0].Name ?? "Unnamed",
-                EntityCount = entities.Count,
-                Name = name ?? entities[0].Name ?? "Prefab",
-            };
-
-            return prefab;
-        }
-
-        /// <summary>
         /// Get the YAML source as a string (for saving to .prefab file).
         /// </summary>
         public string ToYaml()
@@ -138,6 +116,53 @@ namespace Freefall.Assets
 
             // Only remove the temporary root entity (children stay alive and registered)
             EntityManager.RemoveEntity(root);
+        }
+
+        public static Prefab Create(Entity source)
+        {
+            // Collect the full hierarchy: root + all descendants (depth-first)
+            var hierarchy = new List<Entity>();
+            CollectHierarchy(source, hierarchy);
+
+            // Temporarily zero out root transform for serialization
+            var savedPos = source.Transform.Position;
+            var savedRot = source.Transform.Rotation;
+            var savedScale = source.Transform.Scale;
+            var savedParent = source.Transform.Parent;
+
+            // Temporarily clear prefab reference so SaveToString emits ALL components
+            // (otherwise it only emits Transform for prefab instances)
+            var savedPrefab = source.Prefab;
+            source.Prefab = null;
+
+            source.Transform.Position = System.Numerics.Vector3.Zero;
+            source.Transform.Rotation = System.Numerics.Quaternion.Identity;
+            source.Transform.Scale = System.Numerics.Vector3.One;
+            source.Transform.Parent = null;
+
+            // Serialize the entire hierarchy to YAML
+            var serializer = new EntitySerializer();
+            var yaml = serializer.SaveToString(hierarchy);
+
+            // Restore transform and prefab reference
+            source.Transform.Position = savedPos;
+            source.Transform.Rotation = savedRot;
+            source.Transform.Scale = savedScale;
+            source.Transform.Parent = savedParent;
+            source.Prefab = savedPrefab;
+
+            var prefab = new Prefab
+            {
+                Name = source.Name,
+                SourceYaml = Encoding.UTF8.GetBytes(yaml),
+                RootEntityName = source.Name,
+                EntityCount = hierarchy.Count
+            };
+            prefab.MarkDirty();
+
+            Debug.Log($"[Prefab] Updated created '{prefab.Name}' ({hierarchy.Count} entities)");
+
+            return prefab;
         }
 
         /// <summary>

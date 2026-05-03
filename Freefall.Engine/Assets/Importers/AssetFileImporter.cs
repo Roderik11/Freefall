@@ -9,7 +9,7 @@ namespace Freefall.Assets.Importers
     /// Reads the raw YAML and stores it as-is for caching — no deserialization
     /// during import to avoid issues with types that need runtime resources.
     /// </summary>
-    [AssetImporter(".asset")]
+    [AssetImporter(".asset", ImportPriority = 10)]
     public class AssetFileImporter : IImporter
     {
         public ImportResult Import(string filepath)

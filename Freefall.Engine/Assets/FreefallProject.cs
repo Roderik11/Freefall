@@ -18,6 +18,7 @@ namespace Freefall.Assets
         public string AssetsDirectory => Path.Combine(RootDirectory, "Assets");
         public string LibraryDirectory => Path.Combine(RootDirectory, "Library");
         public string CacheDirectory => Path.Combine(RootDirectory, "Cache");
+        public string ThumbnailsDirectory => Path.Combine(RootDirectory, "Thumbnails");
         public string ToolsDirectory => Path.Combine(RootDirectory, "Tools");
 
         /// <summary>
@@ -57,6 +58,7 @@ namespace Freefall.Assets
             Directory.CreateDirectory(project.AssetsDirectory);
             Directory.CreateDirectory(project.LibraryDirectory);
             Directory.CreateDirectory(project.CacheDirectory);
+            Directory.CreateDirectory(project.ThumbnailsDirectory);
 
             Debug.Log($"[Project] Opened '{project.Name}' at {rootDir}");
             return project;
@@ -79,6 +81,7 @@ namespace Freefall.Assets
             Directory.CreateDirectory(project.AssetsDirectory);
             Directory.CreateDirectory(project.LibraryDirectory);
             Directory.CreateDirectory(project.CacheDirectory);
+            Directory.CreateDirectory(project.ThumbnailsDirectory);
 
             // Write .ffproject file
             var projectFile = Path.Combine(directory, $"{name}.ffproject");

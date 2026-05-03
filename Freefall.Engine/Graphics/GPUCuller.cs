@@ -31,7 +31,7 @@ namespace Freefall.Graphics
         private int _localScanKernel, _blockScanKernel, _globalScatterKernel;
         private int _bitonicSortKernel, _sortIndirectionKernel, _mainKernel;
         private int _visibilityShadowKernel, _visibilityShadow4Kernel;
-        private int _expandCascadesKernel, _patchExpandedKernel;
+        private int _expandCascadesKernel, _patchExpandedKernel, _compactCommandsKernel;
         
         // Cached kernel indices for depth_pyramid.hlsl
         private int _spdKernel, _perMipKernel, _shadowSpdKernel, _shadowPerMipKernel;
@@ -102,6 +102,7 @@ namespace Freefall.Graphics
         public ID3D12PipelineState? VisibilityShadow4PSO => _cullShader?.GetPSO(_visibilityShadow4Kernel);
         public ID3D12PipelineState? ExpandCascadesPSO => _cullShader?.GetPSO(_expandCascadesKernel);
         public ID3D12PipelineState? PatchExpandedPSO => _cullShader?.GetPSO(_patchExpandedKernel);
+        public ID3D12PipelineState? CompactCommandsPSO => _cullShader?.GetPSO(_compactCommandsKernel);
         public ID3D12PipelineState? DownsamplePSO => _pyramidShader?.GetPSO(_spdKernel);
         
         /// <summary>True after SDSM buffers are created and ready for dispatch.</summary>
@@ -254,6 +255,7 @@ namespace Freefall.Graphics
                 _visibilityShadow4Kernel = _cullShader.FindKernel("CSVisibilityShadow4");
                 _expandCascadesKernel = _cullShader.FindKernel("CSExpandCascades");
                 _patchExpandedKernel = _cullShader.FindKernel("CSPatchExpandedCounts");
+                _compactCommandsKernel = _cullShader.FindKernel("CSCompactCommands");
                 
                 // Hi-Z depth pyramid downsampler
                 _pyramidShader = new ComputeShader("depth_pyramid.hlsl");
@@ -612,7 +614,7 @@ namespace Freefall.Graphics
         /// Dispatch SDSM depth analysis compute shaders.
         /// Call after Hi-Z generation, when DepthGBuffer is in NonPixelShaderResource state.
         /// </summary>
-        public void AnalyzeDepth(ID3D12GraphicsCommandList commandList, uint depthSrvIndex, int texWidth, int texHeight, float nearPlane)
+        public void AnalyzeDepth(ID3D12GraphicsCommandList commandList, uint depthSrvIndex, int texWidth, int texHeight, float nearPlane, float maxShadowDistance)
         {
             if (!_sdsmInitialized || _depthAnalysisShader == null) return;
             
@@ -651,6 +653,7 @@ namespace Freefall.Graphics
             da.SetParam("TexWidth", (uint)texWidth);
             da.SetParam("TexHeight", (uint)texHeight);
             da.SetParam("NearPlane", nearPlane);
+            da.SetParam("MaxShadowDistance", maxShadowDistance);
             
             uint groupsX = ((uint)texWidth + 15) / 16;
             uint groupsY = ((uint)texHeight + 15) / 16;

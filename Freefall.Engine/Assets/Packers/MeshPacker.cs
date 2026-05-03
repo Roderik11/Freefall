@@ -17,7 +17,7 @@ namespace Freefall.Graphics
     [AssetPacker(".mesh")]
     public class MeshPacker : AssetPacker<MeshData>
     {
-        public override int Version => 5;
+        public override int Version => 6;
 
         public override void Pack(BinaryWriter w, MeshData data)
         {
@@ -83,6 +83,14 @@ namespace Freefall.Graphics
                     foreach (var idx in indices)
                         w.Write(idx);
                 }
+            }
+
+            // MaterialNames (v6+)
+            w.Write(data.MaterialNames?.Length ?? 0);
+            if (data.MaterialNames != null)
+            {
+                foreach (var name in data.MaterialNames)
+                    w.Write(name ?? string.Empty);
             }
         }
 
@@ -164,6 +172,18 @@ namespace Freefall.Graphics
                         for (int j = 0; j < slotCount; j++) r.ReadInt32();
                     }
                     data.LODs.Add(new MeshLOD { MeshPartIndices = partIndices });
+                }
+            }
+
+            // MaterialNames (v6+)
+            if (version >= 6)
+            {
+                int matCount = r.ReadInt32();
+                if (matCount > 0)
+                {
+                    data.MaterialNames = new string[matCount];
+                    for (int i = 0; i < matCount; i++)
+                        data.MaterialNames[i] = r.ReadString();
                 }
             }
 

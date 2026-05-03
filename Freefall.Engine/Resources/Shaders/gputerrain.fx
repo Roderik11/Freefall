@@ -314,7 +314,7 @@ FragmentOutput PS(VertexOutput input)
         terrainNormal = normalize(terrainNormal);
     }
 
-    output.Albedo = float4(color.rgb, 1.0);
+    output.Albedo = float4(color.rgb, 0);
     output.Normals = float4(terrainNormal.xyz, 1); 
     output.Data = float4(0.95, 0.0, 1.0, 1.0); // roughness=very matte, metal=0, ao=1, lit=PBR
     output.Depth = input.Depth;
@@ -355,7 +355,7 @@ FragmentOutput PS(VertexOutput input)
         else
             decoColor = lerp(float3(0.9, 0.9, 0.1), float3(0.1, 0.9, 0.1), (t - 0.5) / 0.5); // yellow→green
 
-        output.Albedo = float4(decoColor, 1.0);
+        output.Albedo = float4(decoColor, 0);
     }
 
     output.EntityId = (input.TransformSlot << 8u);

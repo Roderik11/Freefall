@@ -52,7 +52,15 @@ namespace Freefall.Graphics
             var device = Engine.Device;
             device.FreeRtv(RtvHandle);
             if (BindlessIndex != 0)
+            {
                 device.ReleaseBindlessIndex(BindlessIndex);
+                BindlessIndex = 0; // Prevent double-release in base.Dispose()
+            }
+            if (UavIndex != 0)
+            {
+                device.ReleaseBindlessIndex(UavIndex);
+                UavIndex = 0;
+            }
             base.Dispose();
         }
     }
@@ -117,7 +125,10 @@ namespace Freefall.Graphics
             var device = Engine.Device;
             device.FreeDsv(DsvHandle);
             if (BindlessIndex != 0)
+            {
                 device.ReleaseBindlessIndex(BindlessIndex);
+                BindlessIndex = 0; // Prevent double-release in base.Dispose()
+            }
             base.Dispose();
         }
     }

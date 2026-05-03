@@ -9,7 +9,7 @@ namespace Freefall.Assets.Importers
     /// Imports .mat files (YAML-serialized Material definitions).
     /// Simple pass-through: reads the YAML and stores it as AssetDefinitionData.
     /// </summary>
-    [AssetImporter(".mat")]
+    [AssetImporter(".mat", ImportPriority = 1)]
     public class MaterialImporter : IImporter
     {
         public Type AssetType => typeof(Graphics.Material);

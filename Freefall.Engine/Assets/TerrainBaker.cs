@@ -1228,7 +1228,7 @@ namespace Freefall.Assets
 
         // ── RGBA Packing ─────────────────────────────────────────────
 
-        private GraphicsBuffer _packIndexBuffer;
+        private GraphicsBuffer[] _packIndexBuffers;
 
         /// <summary>
         /// Packs per-layer R16 ControlMaps directly into caller-owned Texture2DArray slices.
@@ -1248,20 +1248,26 @@ namespace Freefall.Assets
             int sliceCount = (layerCount + 3) / 4;
             uint groups = (uint)((resolution + 7) / 8);
 
-            // Ensure index buffer (4 uint per slice)
-            if (_packIndexBuffer == null || _packIndexBuffer.ElementCount < 4)
+            // Use one buffer per slice to avoid GPU race on Upload heap memory.
+            // All dispatches are recorded on the same command list — the GPU sees
+            // the final CPU-written state of a mapped Upload buffer, so a single
+            // buffer rewritten between dispatches causes all slices to read the
+            // last-written data.
+            if (_packIndexBuffers == null || _packIndexBuffers.Length < sliceCount)
             {
-                _packIndexBuffer?.Dispose();
-                _packIndexBuffer = GraphicsBuffer.CreateUpload<uint>(4, mapped: true);
+                if (_packIndexBuffers != null)
+                    foreach (var buf in _packIndexBuffers) buf?.Dispose();
+                _packIndexBuffers = new GraphicsBuffer[sliceCount];
+                for (int i = 0; i < sliceCount; i++)
+                    _packIndexBuffers[i] = GraphicsBuffer.CreateUpload<uint>(4, mapped: true);
             }
 
             for (int slice = 0; slice < sliceCount && slice < sliceUAVs.Length; slice++)
             {
-                // Upload source indices for this slice
                 int channelCount = Math.Min(4, layerCount - slice * 4);
                 unsafe
                 {
-                    var ptr = _packIndexBuffer.WritePtr<uint>();
+                    var ptr = _packIndexBuffers[slice].WritePtr<uint>();
                     for (int c = 0; c < 4; c++)
                     {
                         int layerIdx = slice * 4 + c;
@@ -1270,7 +1276,7 @@ namespace Freefall.Assets
                 }
 
                 _cs.SetPushConstant(_kernelPackChannels, "Output", sliceUAVs[slice]);
-                _cs.SetBuffer(_kernelPackChannels, "StampBuf", _packIndexBuffer);
+                _cs.SetBuffer(_kernelPackChannels, "StampBuf", _packIndexBuffers[slice]);
                 _cs.SetPushConstant(_kernelPackChannels, "BlendMode", (uint)channelCount);
                 _cs.Dispatch(_kernelPackChannels, cmd, groups, groups);
             }
@@ -1284,7 +1290,8 @@ namespace Freefall.Assets
             _controlMaps.Clear();
             _stampBuffer?.Dispose();
             _strokeBuffer?.Dispose();
-            _packIndexBuffer?.Dispose();
+            if (_packIndexBuffers != null)
+                foreach (var buf in _packIndexBuffers) buf?.Dispose();
 
             _cs?.Dispose();
         }

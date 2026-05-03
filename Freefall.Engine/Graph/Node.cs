@@ -35,7 +35,7 @@ namespace Freefall.Graph
 
         public Port GetPort(string name)
         {
-            int hash = name.GetHashCode();
+            int hash = Port.StableHash(name);
             HashedPorts.TryGetValue(hash, out var port);
             return port;
         }
@@ -125,6 +125,10 @@ namespace Freefall.Graph
         public void CreatePorts(NodeGraph graph)
         {
             Graph = graph;
+            Ports.Clear();
+            Inputs.Clear();
+            Outputs.Clear();
+            HashedPorts.Clear();
 
             var inputs = Reflector.GetMapping<InputAttribute>(GetType());
 

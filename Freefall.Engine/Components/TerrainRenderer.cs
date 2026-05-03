@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Numerics;
 using System.Runtime.InteropServices;
 using System.ComponentModel;
@@ -468,6 +469,7 @@ namespace Freefall.Components
                 catch (Exception ex)
                 {
                     Debug.LogError("[TerrainRenderer]", $"RebuildTextureArrays failed: {ex.Message}");
+                    if (Engine.Device.IsDeviceLost) return;
                 }
             }
 
@@ -1578,34 +1580,34 @@ namespace Freefall.Components
                 {
                     var mesh = deco.Mesh!;
 
-                    // LOD0 = base mesh
-                    if (mesh.Mesh != null)
+                    // Determine LOD0 part indices
+                    int[] lod0Indices;
+                    if (mesh.LODs.Count > 0 && mesh.LODs[0].MeshPartIndices != null)
+                        lod0Indices = mesh.LODs[0].MeshPartIndices;
+                    else
+                        lod0Indices = Enumerable.Range(0, mesh.MeshParts.Count).ToArray();
+
+                    // LOD0 parts
+                    foreach (var partIdx in lod0Indices)
                     {
-                        foreach (var part in mesh.MeshParts)
-                        {
-                            int partId = MeshRegistry.Register(mesh.Mesh, part.MeshPartIndex);
-                            uint matId = part.Material != null ? (uint)part.Material.MaterialID : 0;
-                            float maxDist = mesh.LODGroup?.Ranges?.Count > 0
-                                ? mesh.LODGroup.Ranges[0] * 1000f
-                                : 100f;
-                            lodTable.Add(new LODTableEntry { MeshPartId = (uint)partId, MaxDistance = maxDist, MaterialId = matId });
-                            lodCount++;
-                        }
+                        if (partIdx >= mesh.MeshParts.Count) continue;
+                        int partId = MeshRegistry.Register(mesh, partIdx);
+                        float maxDist = 100f;
+                        lodTable.Add(new LODTableEntry { MeshPartId = (uint)partId, MaxDistance = maxDist, MaterialId = 0 });
+                        lodCount++;
                     }
 
-                    // Additional LODs
-                    for (int lod = 0; lod < mesh.LODs.Count; lod++)
+                    // Additional LOD levels
+                    for (int lod = 1; lod < mesh.LODs.Count; lod++)
                     {
-                        var lodMesh = mesh.LODs[lod];
-                        if (lodMesh.Mesh == null) continue;
-                        foreach (var part in lodMesh.MeshParts)
+                        var lodLevel = mesh.LODs[lod];
+                        if (lodLevel.MeshPartIndices == null) continue;
+                        foreach (var partIdx in lodLevel.MeshPartIndices)
                         {
-                            int partId = MeshRegistry.Register(lodMesh.Mesh, part.MeshPartIndex);
-                            uint matId = part.Material != null ? (uint)part.Material.MaterialID : 0;
-                            float maxDist = mesh.LODGroup?.Ranges != null && lod + 1 < mesh.LODGroup.Ranges.Count
-                                ? mesh.LODGroup.Ranges[lod + 1] * 1000f
-                                : 50f * (lod + 1);
-                            lodTable.Add(new LODTableEntry { MeshPartId = (uint)partId, MaxDistance = maxDist, MaterialId = matId });
+                            if (partIdx >= mesh.MeshParts.Count) continue;
+                            int partId = MeshRegistry.Register(mesh, partIdx);
+                            float maxDist = 50f * (lod + 1);
+                            lodTable.Add(new LODTableEntry { MeshPartId = (uint)partId, MaxDistance = maxDist, MaterialId = 0 });
                             lodCount++;
                         }
                     }
@@ -1616,10 +1618,6 @@ namespace Freefall.Components
                     uint matId = 0;
                     if (deco.Texture != null)
                         textureIdx = (uint)deco.Texture.BindlessIndex;
-
-                    // If there's a mesh reference, use its material for the billboard texture
-                    if (deco.Mesh?.MeshParts?.Count > 0 && deco.Mesh.MeshParts[0].Material != null)
-                        matId = (uint)deco.Mesh.MeshParts[0].Material!.MaterialID;
 
                     lodTable.Add(new LODTableEntry { MeshPartId = 0, MaxDistance = 200f, MaterialId = matId });
                     lodCount = 1;

@@ -73,15 +73,6 @@ VSOutput VS(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_InstanceI
     StructuredBuffer<row_major matrix> globalTransforms = ResourceDescriptorHeap[GlobalTransformBufferIdx];
     StructuredBuffer<uint> sortedIndices = ResourceDescriptorHeap[SortedIndicesIdx];
     
-    // Bindless index buffer - primitiveVertexID is 0 to N-1, add BaseIndex to offset into correct mesh part
-    StructuredBuffer<uint> indices = ResourceDescriptorHeap[IndexBufferIdx];
-    uint vertexID = indices[primitiveVertexID + BaseIndex];
-    
-    // Mesh data buffers - use resolved vertexID
-    StructuredBuffer<float3> positions = ResourceDescriptorHeap[PosBufferIdx];
-    StructuredBuffer<float3> normals = ResourceDescriptorHeap[NormBufferIdx];
-    StructuredBuffer<float2> uvs = ResourceDescriptorHeap[UVBufferIdx];
-    
     // Get instance data position using InstanceBaseOffset + local instance ID
     uint dataPos = InstanceBaseOffset + instanceID;
     
@@ -96,6 +87,30 @@ VSOutput VS(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_InstanceI
     
     row_major matrix World = globalTransforms[slot];
     
+    // Negative-scale fix: detect mirrored transforms via 3x3 determinant.
+    // Negative determinant means odd number of axis flips — triangle winding is reversed.
+    // Swap vertices 1↔2 within each triangle to restore correct winding for the rasterizer.
+    float3x3 W3 = (float3x3)World;
+    float det = determinant(W3);
+    
+    uint fetchID = primitiveVertexID;
+    if (det < 0.0f)
+    {
+        uint triLocal = primitiveVertexID % 3;
+        uint triBase = primitiveVertexID - triLocal;
+        // Remap {0,1,2} → {0,2,1} to flip winding
+        fetchID = triBase + (triLocal == 1u ? 2u : (triLocal == 2u ? 1u : 0u));
+    }
+    
+    // Bindless index buffer - fetchID is 0 to N-1, add BaseIndex to offset into correct mesh part
+    StructuredBuffer<uint> indices = ResourceDescriptorHeap[IndexBufferIdx];
+    uint vertexID = indices[fetchID + BaseIndex];
+    
+    // Mesh data buffers - use resolved vertexID
+    StructuredBuffer<float3> positions = ResourceDescriptorHeap[PosBufferIdx];
+    StructuredBuffer<float3> normals = ResourceDescriptorHeap[NormBufferIdx];
+    StructuredBuffer<float2> uvs = ResourceDescriptorHeap[UVBufferIdx];
+    
     float3 pos = positions[vertexID];
     float3 norm = normals[vertexID];
     float2 uv = uvs[vertexID];
@@ -105,7 +120,7 @@ VSOutput VS(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_InstanceI
     output.WorldPos = worldPos;
     output.Position = mul(mul(worldPos, View), Projection);
     
-    output.Normal = mul(norm, (float3x3)World);
+    output.Normal = mul(norm, W3);
     output.TexCoord = uv;
     output.TexCoord.y = 1 - output.TexCoord.y;
     output.MaterialID = materialID;
@@ -198,6 +213,16 @@ PSOutput PS(VSOutput input)
     if (mat.MetallicIdx  != 0) { Texture2D mTex = ResourceDescriptorHeap[mat.MetallicIdx];  metal     = mTex.Sample(Sampler, input.TexCoord).r; }
     if (mat.AOIdx        != 0) { Texture2D aTex = ResourceDescriptorHeap[mat.AOIdx];        ao        = aTex.Sample(Sampler, input.TexCoord).r; }
     
+    // Emissive: sample texture, apply tint/intensity, blend into albedo
+    float emissiveMask = 0;
+    if (mat.EmissiveIdx != 0)
+    {
+        Texture2D eTex = ResourceDescriptorHeap[mat.EmissiveIdx];
+        float3 emissive = eTex.Sample(Sampler, input.TexCoord).rgb * mat.EmissiveColor * mat.EmissiveIntensity;
+        emissiveMask = max(emissive.r, max(emissive.g, emissive.b));
+        color.rgb = lerp(color.rgb, emissive, saturate(emissiveMask));
+    }
+    
     // Normal mapping via cotangent frame (no tangent buffer needed)
     float3 N = normalize(input.Normal);
     
@@ -254,7 +279,7 @@ PSOutput PS(VSOutput input)
         N = normalize(mul(texNormal, TBN));
     }
     
-    output.Albedo = float4(color.rgb, 1.0);
+    output.Albedo = float4(color.rgb, emissiveMask);
     output.Normal = float4(N, 1.0f);
     output.Data = float4(saturate(roughness), saturate(metal), saturate(ao), 1.0);
     output.Depth = input.Depth;

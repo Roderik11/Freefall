@@ -1,12 +1,18 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.IO;
 using System.Linq;
 using System.Numerics;
 using System.ComponentModel;
+using System.Text;
 using Assimp;
 using Freefall.Animation;
+using Freefall.Assets.Packers;
+using Freefall.Base;
+using Freefall.Components;
 using Freefall.Graphics;
+using Freefall.Serialization;
 using Matrix4x4 = System.Numerics.Matrix4x4;
 using Bone = Freefall.Animation.Bone;
 using VectorKey = Freefall.Animation.VectorKey;
@@ -32,8 +38,8 @@ namespace Freefall.Assets.Importers
     /// Produces all artifacts from a single source: mesh data, skeleton, and animations.
     /// Replaces MeshImporter and AnimationClipImporter for standard model files.
     /// </summary>
-    [AssetImporter(".fbx", ".dae", ".obj", ".x")]
-    public class ModelImporter : IImporter
+    [AssetImporter(".fbx", ".dae", ".obj", ".x", ImportPriority = 2)]
+    public class ModelImporter : IImporter, IPostImporter
     {
         /// <summary>
         /// When set, newly created ModelImporter instances will use these settings
@@ -52,6 +58,7 @@ namespace Freefall.Assets.Importers
         public bool ImportMesh = true;
         public bool ImportSkeleton = true;
         public bool ImportAnimations = true;
+        public bool CreateMaterials = true;
 
 
         [ValueRange(0, 180)]
@@ -67,6 +74,13 @@ namespace Freefall.Assets.Importers
         private Dictionary<string, Node> _nodes = new();
         private Dictionary<string, bool> _validNodes = new();
         private Dictionary<string, Assimp.Bone> _bones = new();
+        private string _currentFilePath;
+
+        // Transient per-group data for PostImport (not serialized)
+        [NonSerialized] private Dictionary<string, (Vector3 pos, System.Numerics.Quaternion rot, Vector3 scale)> _groupTransforms = new();
+        [NonSerialized] private Dictionary<string, string[]> _groupMaterialNames = new();
+
+        private bool isDAE;
 
         /// <summary>
         /// Full import: produce all artifacts (mesh + animations) from a source file.
@@ -87,6 +101,7 @@ namespace Freefall.Assets.Importers
             }
 
             var result = new ImportResult { Compound = true };
+            _currentFilePath = filepath;
             var scene = LoadScene(filepath, out float scale);
             var name = System.IO.Path.GetFileNameWithoutExtension(filepath);
 
@@ -97,13 +112,16 @@ namespace Freefall.Assets.Importers
             // ── Mesh ──
             if (ImportMesh && scene.HasMeshes)
             {
-                var meshData = ExtractMeshData(scene, scale);
-                result.Artifacts.Add(new ImportArtifact
+                var groups = ExtractMeshDataPerNode(scene, scale);
+                foreach (var (groupName, meshData) in groups)
                 {
-                    Name = name,
-                    Type = nameof(MeshData),
-                    Data = meshData
-                });
+                    result.Artifacts.Add(new ImportArtifact
+                    {
+                        Name = groupName,
+                        Type = nameof(MeshData),
+                        Data = meshData
+                    });
+                }
             }
 
             // ── Skeleton ──
@@ -151,6 +169,12 @@ namespace Freefall.Assets.Importers
                 }
             }
 
+            // ── Materials ──
+            if (CreateMaterials && ImportMesh && scene.HasMeshes)
+            {
+                ExtractMaterials(scene, filepath, result);
+            }
+
             Debug.Log($"[ModelImporter] '{name}': {result.Artifacts.Count} artifacts " +
                       $"({(ImportMesh && scene.HasMeshes ? 1 : 0)} mesh, {scene.AnimationCount} animations, " +
                       $"{_skeleton.Count} bones)");
@@ -160,33 +184,121 @@ namespace Freefall.Assets.Importers
 
         public object GetInspectionTarget(MetaFile meta) => this;
 
+        // ══════════════════════════════════════════════════════════════
+        // Post-Import: Prefab Generation
+        // ══════════════════════════════════════════════════════════════
+
+        /// <summary>
+        /// Called after Import() artifacts have been packed and assigned GUIDs.
+        /// Generates a Prefab sub-asset per MeshData artifact, wiring Mesh GUID
+        /// and material references into MeshRenderer via EntitySerializer.
+        /// </summary>
+        public List<ImportArtifact> PostImport(string filepath, IReadOnlyList<SubAssetEntry> subAssets)
+        {
+            var prefabs = new List<ImportArtifact>();
+
+            // Build lookup: material name → GUID from sub-assets + AssetDatabase
+            var materialLookup = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var sub in subAssets)
+            {
+                if (sub.Type == nameof(AssetDefinitionData))
+                    materialLookup[sub.Name] = sub.Guid;
+            }
+
+            foreach (var sub in subAssets)
+            {
+                if (sub.Type != nameof(MeshData)) continue;
+
+                var meshGuid = sub.Guid;
+                var meshName = sub.Name;
+
+                // Create temp entity (not registered with EntityManager)
+                var entity = new Entity(meshName, register: false);
+
+                // Apply node transform if captured during extraction
+                if (_groupTransforms.TryGetValue(meshName, out var xform))
+                {
+                    entity.Transform.Position = xform.pos;
+                    entity.Transform.Rotation = xform.rot;
+                    entity.Transform.Scale = xform.scale;
+                  //  Debug.Log("ModelImporter", $"GroupTransform '{meshName}': rot=({xform.rot.X:F4}, {xform.rot.Y:F4}, {xform.rot.Z:F4}, {xform.rot.W:F4}) scale=({xform.scale.X:F4}, {xform.scale.Y:F4}, {xform.scale.Z:F4})");
+                }
+
+                // Build MeshRenderer with mesh stub + materials
+                var renderer = new MeshRenderer();
+                renderer.Mesh = new Graphics.Mesh { Guid = meshGuid };
+
+                // Resolve materials per slot
+                if (_groupMaterialNames.TryGetValue(meshName, out var matNames) && matNames != null)
+                {
+                    for (int i = 0; i < matNames.Length; i++)
+                    {
+                        var matName = matNames[i];
+                        if (string.IsNullOrEmpty(matName)) continue;
+
+                        string matGuid = null;
+                        // Check sub-assets first, then AssetDatabase
+                        if (!materialLookup.TryGetValue(matName, out matGuid))
+                        {
+                            // Resolve by name, but verify it's actually a material
+                            var candidateGuid = AssetDatabase.ResolveGuidByName(matName);
+                            if (candidateGuid != null && IsMaterialGuid(candidateGuid))
+                                matGuid = candidateGuid;
+                        }
+
+                        matGuid ??= InternalAssets.Guids.DefaultMaterial;
+
+                        renderer.Materials.Add(new MaterialOverride
+                        {
+                            MaterialSlot = i,
+                            Material = new Graphics.Material { Guid = matGuid }
+                        });
+                    }
+                }
+
+
+                entity.AddComponent(renderer);
+
+                // Serialize via EntitySerializer
+                var serializer = new EntitySerializer();
+                var yaml = serializer.SaveToString(new List<Entity> { entity });
+
+                prefabs.Add(new ImportArtifact
+                {
+                    Name = meshName,
+                    Type = nameof(PrefabData),
+                    Data = new PrefabData { Yaml = Encoding.UTF8.GetBytes(yaml) }
+                });
+            }
+
+            if (prefabs.Count > 0)
+                Debug.Log("ModelImporter", $"Created {prefabs.Count} prefab sub-asset(s)");
+
+            return prefabs;
+        }
+
         /// <summary>
         /// Parse mesh data only (CPU arrays, no GPU). Thread-safe.
-        /// Used by StaticMeshImporter and other callers that only need the mesh.
+        /// Returns only the first node group for backwards compatibility.
+        /// Use ParseMeshes() to get all groups.
         /// </summary>
         public MeshData ParseMesh(string filepath)
         {
-            var scene = LoadScene(filepath, out float scale);
-            GenerateSkeleton(scene);
-            return ExtractMeshData(scene, scale);
+            var groups = ParseMeshes(filepath);
+            return groups.Count > 0 ? groups[0].data : new MeshData();
         }
 
         /// <summary>
-        /// Parse animations only from a model file.
+        /// Parse all mesh data groups from a model file. One group per node base name.
         /// </summary>
-        public List<AnimationClip> ParseAnimations(string filepath)
+        public List<(string name, MeshData data)> ParseMeshes(string filepath)
         {
+            _currentFilePath = filepath;
             var scene = LoadScene(filepath, out float scale);
             GenerateSkeleton(scene);
-
-            var clips = new List<AnimationClip>();
-            if (scene.HasAnimations)
-            {
-                foreach (var anim in scene.Animations)
-                    clips.Add(ExtractAnimation(anim, scale));
-            }
-            return clips;
+            return ExtractMeshDataPerNode(scene, scale);
         }
+
 
         // ══════════════════════════════════════════════════════════════
         // Scene Loading
@@ -210,14 +322,10 @@ namespace Freefall.Assets.Importers
 
             try
             {
+                isDAE = filepath.ToLowerInvariant().EndsWith(".dae");
                 // Unit conversion: DAE defaults to 0.01, FBX to 1.0
                 // If Scale is explicitly set (non-1), use it directly. Otherwise use convention.
-                if (Scale != 1f)
-                    scale = Scale;
-                else if (ConvertUnits && filepath.EndsWith(".dae", StringComparison.OrdinalIgnoreCase))
-                    scale = 0.01f;
-                else
-                    scale = Scale;
+                scale = isDAE ? Scale * 0.01f :  Scale;
 
                 var importer = new AssimpContext();
 
@@ -338,25 +446,27 @@ namespace Freefall.Assets.Importers
         // Mesh Extraction (ported from MeshImporter.ParseRaw)
         // ══════════════════════════════════════════════════════════════
 
-        private MeshData ExtractMeshData(Scene scene, float scale)
+        private List<(string name, MeshData data)> ExtractMeshDataPerNode(Scene scene, float scale)
         {
+            // ── Phase 1: Build flat part list (identical to old ExtractMeshData) ──
             var positions = new List<Vector3>();
             var normals = new List<Vector3>();
             var uvs = new List<Vector2>();
             var indices = new List<uint>();
             var weightMap = new List<Dictionary<int, float>>();
             int vertexOffset = 0;
-
             var meshes = scene.Meshes;
-
             int startIndex = 0;
             var parts = new List<MeshPart>();
+            var partMaterialNames = new List<string>();
 
-            // Map Assimp mesh indices to their parent node names (has LOD suffix)
             var meshNodeNames = new Dictionary<int, string>();
             BuildMeshNodeMap(scene.RootNode, meshNodeNames);
 
-            // Count meshes per node — only disambiguate names when a node has multiple
+            // Build world transform map for each node (for prefab generation)
+            var nodeWorldTransforms = new Dictionary<string, Matrix4x4>();
+            BuildNodeWorldTransforms(scene.RootNode, Matrix4x4.Identity, nodeWorldTransforms);
+
             var nodeMeshCounts = new Dictionary<string, int>();
             foreach (var kvp in meshNodeNames)
             {
@@ -376,10 +486,19 @@ namespace Freefall.Assets.Importers
                     var norm = mesh.Normals[i];
                     var uv = mesh.HasTextureCoords(0) ? mesh.TextureCoordinateChannels[0][i] : new Vector3D(0, 0, 0);
 
-                    positions.Add(new Vector3(pos.X, pos.Y, pos.Z));
-                    normals.Add(new Vector3(norm.X, norm.Y, norm.Z));
-                    uvs.Add(new Vector2(uv.X, uv.Y));
+                    if (isDAE)
+                    {
+                        positions.Add(new Vector3(pos.X, pos.Y, pos.Z));
+                        normals.Add(new Vector3(norm.X, norm.Y, norm.Z));
+                    }
+                    else
+                    {
+                        positions.Add(new Vector3(-pos.X, pos.Y, -pos.Z));
+                        normals.Add(new Vector3(-norm.X, norm.Y, -norm.Z));
+                    }
 
+
+                    uvs.Add(new Vector2(uv.X, uv.Y));
                     weightMap.Add(new Dictionary<int, float>());
                 }
 
@@ -394,7 +513,6 @@ namespace Freefall.Assets.Importers
                     }
                 }
 
-                // Extract bone weights
                 if (_skeleton.Count > 0 && mesh.HasBones)
                 {
                     foreach (Assimp.Bone bone in mesh.Bones)
@@ -403,22 +521,18 @@ namespace Freefall.Assets.Importers
                         {
                             int boneIndex = _boneNames.IndexOf(bone.Name);
                             if (boneIndex < 0) continue;
-
                             foreach (Assimp.VertexWeight vw in bone.VertexWeights)
                             {
                                 int vertexId = baseVertex + (int)vw.VertexID;
                                 if (vertexId < weightMap.Count &&
                                     weightMap[vertexId].Count < 4 &&
                                     !weightMap[vertexId].ContainsKey(boneIndex))
-                                {
                                     weightMap[vertexId].Add(boneIndex, vw.Weight);
-                                }
                             }
                         }
                     }
                 }
 
-                // Per-part bounding box
                 Vector3 partMin = new Vector3(float.MaxValue);
                 Vector3 partMax = new Vector3(float.MinValue);
                 for (int vi = baseVertex; vi < baseVertex + mesh.VertexCount; vi++)
@@ -426,23 +540,20 @@ namespace Freefall.Assets.Importers
                     partMin = Vector3.Min(partMin, positions[vi]);
                     partMax = Vector3.Max(partMax, positions[vi]);
                 }
-
                 var partBB = new Vortice.Mathematics.BoundingBox(partMin, partMax);
                 var partCenter = (partMin + partMax) * 0.5f;
                 var partRadius = (partMax - partCenter).Length();
 
-                // Use node name (what Blender shows) → fallback to mesh name → fallback to index
                 int origIdx = scene.Meshes.IndexOf(mesh);
                 string nodeName = meshNodeNames.GetValueOrDefault(origIdx);
                 string partName = nodeName ?? mesh.Name ?? $"Part_{meshes.IndexOf(mesh)}";
 
-                // Disambiguate sub-meshes under the same node by appending material name
-                // Only needed when a node has multiple meshes (multiple materials)
-                if (nodeName != null && mesh.MaterialIndex >= 0 && mesh.MaterialIndex < scene.MaterialCount)
+                string matName = null;
+                if (mesh.MaterialIndex >= 0 && mesh.MaterialIndex < scene.MaterialCount)
                 {
-                    if (nodeMeshCounts.GetValueOrDefault(nodeName) > 1)
+                    matName = scene.Materials[mesh.MaterialIndex].Name;
+                    if (nodeName != null && nodeMeshCounts.GetValueOrDefault(nodeName) > 1)
                     {
-                        var matName = scene.Materials[mesh.MaterialIndex].Name;
                         if (!string.IsNullOrEmpty(matName))
                             partName = $"{nodeName} [{matName}]";
                     }
@@ -458,31 +569,12 @@ namespace Freefall.Assets.Importers
                     BoundingBox = partBB,
                     BoundingSphere = new Vector4(partCenter, partRadius),
                 });
-
+                partMaterialNames.Add(matName);
                 vertexOffset += mesh.VertexCount;
                 startIndex += meshIndexCount;
             }
 
-            // Global bounding box
-            Vector3 min = new Vector3(float.MaxValue);
-            Vector3 max = new Vector3(float.MinValue);
-            foreach (var pos in positions)
-            {
-                min = Vector3.Min(min, pos);
-                max = Vector3.Max(max, pos);
-            }
-
-            var data = new MeshData
-            {
-                Positions = positions.ToArray(),
-                Normals = normals.ToArray(),
-                UVs = uvs.ToArray(),
-                Indices = indices.ToArray(),
-                Parts = parts,
-                BoundingBox = new Vortice.Mathematics.BoundingBox(min, max),
-            };
-
-            // ── Sync Part Config ──
+            // ── Phase 2: Sync Part Configs ──
             var configByName = new Dictionary<string, MeshPartConfig>();
             foreach (var cfg in Parts)
                 if (!string.IsNullOrEmpty(cfg.Name))
@@ -512,8 +604,6 @@ namespace Freefall.Assets.Importers
                 parts[i].Enabled = Parts[i].Render;
             }
 
-            // Re-apply collision detection for parts restored from saved config.
-            // Catches new patterns (e.g. _Coll) added after the original import.
             for (int i = 0; i < parts.Count && i < Parts.Count; i++)
             {
                 if (!Parts[i].Collision && IsCollisionPart(parts[i].Name))
@@ -524,48 +614,350 @@ namespace Freefall.Assets.Importers
                 }
             }
 
-            data.Parts = parts;
-
-            // Auto-assign LOD0 to base parts that have LOD-suffixed siblings
             AutoAssignLOD0ToBaseParts(parts, Parts);
 
-            // ── LOD Discovery (config-driven) ──
-            data.LODs = DiscoverLODsFromConfig(parts, Parts);
-            if (data.LODs.Count > 1)
-                Debug.Log("ModelImporter", $"Discovered {data.LODs.Count} LOD levels");
+            // ── Phase 3: Group parts by node base name ──
+            var fileName = _currentFilePath != null
+                ? System.IO.Path.GetFileNameWithoutExtension(_currentFilePath)
+                : "mesh";
 
-            // Ensure every part has a unique MaterialSlot.
-            // DiscoverLODsFromConfig assigns slots for LOD-participating parts.
-            // Assign sequential slots to any remaining parts (e.g., tiles in a mixed FBX).
-            int maxAssigned = -1;
-            foreach (var p in parts)
-                maxAssigned = Math.Max(maxAssigned, p.MaterialSlot);
+            var groupOrder = new List<string>();
+            var groupPartIndices = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
 
-            int nextUnusedSlot = maxAssigned + 1;
-            // Parts with MaterialSlot = 0 that weren't the first LOD-assigned part need unique slots
-            var lodAssigned = new HashSet<int>();
-            if (data.LODs.Count > 0)
+            for (int i = 0; i < parts.Count; i++)
             {
-                foreach (var lod in data.LODs)
+                string rawName = parts[i].Name;
+                int bracket = rawName.IndexOf(" [");
+                string cleanName = bracket >= 0 ? rawName.Substring(0, bracket) : rawName;
+                string groupKey = StripLODSuffix(cleanName);
+
+                if (string.IsNullOrEmpty(groupKey))
+                    groupKey = fileName;
+
+
+                if (!groupPartIndices.TryGetValue(groupKey, out var list))
+                {
+                    list = new List<int>();
+                    groupPartIndices[groupKey] = list;
+                    groupOrder.Add(groupKey);
+                }
+                list.Add(i);
+            }
+
+            // Single group: use file name, skip split (identical to old single-mesh path)
+            if (groupOrder.Count <= 1)
+            {
+                groupOrder.Clear();
+                groupOrder.Add(fileName);
+                groupPartIndices.Clear();
+                groupPartIndices[fileName] = Enumerable.Range(0, parts.Count).ToList();
+            }
+
+            // ── Phase 4: Build MeshData per group ──
+            var result = new List<(string name, MeshData data)>();
+            var posArr = positions.ToArray();
+            var normArr = normals.ToArray();
+            var uvArr = uvs.ToArray();
+            var idxArr = indices.ToArray();
+
+            foreach (var groupName in groupOrder)
+            {
+                var pIndices = groupPartIndices[groupName];
+                var gParts = new List<MeshPart>();
+                var gConfigs = new List<MeshPartConfig>();
+                var gPos = new List<Vector3>();
+                var gNorm = new List<Vector3>();
+                var gUV = new List<Vector2>();
+                var gIdx = new List<uint>();
+                var gWeights = new List<Dictionary<int, float>>();
+                var gMatNames = new List<string>();
+
+                foreach (var pi in pIndices)
+                {
+                    var srcPart = parts[pi];
+
+                    // Find vertex range used by this part's indices
+                    int minV = int.MaxValue, maxV = int.MinValue;
+                    for (int ii = srcPart.BaseIndex; ii < srcPart.BaseIndex + srcPart.NumIndices; ii++)
+                    {
+                        int v = (int)idxArr[ii];
+                        minV = Math.Min(minV, v);
+                        maxV = Math.Max(maxV, v);
+                    }
+                    if (minV > maxV) continue;
+
+                    int localBase = gPos.Count;
+
+                    // Copy vertex data for this part's range
+                    for (int v = minV; v <= maxV; v++)
+                    {
+                        gPos.Add(posArr[v]);
+                        gNorm.Add(normArr[v]);
+                        gUV.Add(uvArr[v]);
+                        gWeights.Add(v < weightMap.Count ? weightMap[v] : new Dictionary<int, float>());
+                    }
+
+                    // Copy and rebase indices
+                    int localBaseIdx = gIdx.Count;
+                    for (int ii = srcPart.BaseIndex; ii < srcPart.BaseIndex + srcPart.NumIndices; ii++)
+                        gIdx.Add((uint)((int)idxArr[ii] - minV + localBase));
+
+                    // Recompute bounding info
+                    Vector3 pMin = new(float.MaxValue), pMax = new(float.MinValue);
+                    for (int v = localBase; v < localBase + (maxV - minV + 1); v++)
+                    {
+                        pMin = Vector3.Min(pMin, gPos[v]);
+                        pMax = Vector3.Max(pMax, gPos[v]);
+                    }
+                    var center = (pMin + pMax) * 0.5f;
+
+                    gParts.Add(new MeshPart
+                    {
+                        Name = srcPart.Name,
+                        Enabled = srcPart.Enabled,
+                        BaseIndex = localBaseIdx,
+                        NumIndices = srcPart.NumIndices,
+                        BaseVertex = 0,
+                        BoundingBox = new Vortice.Mathematics.BoundingBox(pMin, pMax),
+                        BoundingSphere = new Vector4(center, (pMax - center).Length()),
+                    });
+                    gConfigs.Add(Parts[pi]);
+                    gMatNames.Add(partMaterialNames[pi]);
+                }
+
+                if (gParts.Count == 0) continue;
+
+                // Per-group LOD discovery
+                AutoAssignLOD0ToBaseParts(gParts, gConfigs);
+                var lods = DiscoverLODsFromConfig(gParts, gConfigs);
+
+                // Material slot assignment: LOD parts keep their slots,
+                // non-LOD parts get sequential slots after the last LOD slot.
+                var lodAssigned = new HashSet<int>();
+                foreach (var lod in lods)
                     if (lod.MeshPartIndices != null)
                         foreach (var idx in lod.MeshPartIndices)
                             lodAssigned.Add(idx);
-            }
-            for (int i = 0; i < parts.Count; i++)
-            {
-                if (!lodAssigned.Contains(i))
-                    parts[i].MaterialSlot = nextUnusedSlot++;
+
+                // Only consider LOD-assigned slots (not struct default 0)
+                int maxSlot = -1;
+                foreach (var idx in lodAssigned)
+                    maxSlot = Math.Max(maxSlot, gParts[idx].MaterialSlot);
+                int nextSlot = maxSlot + 1;
+
+                for (int i = 0; i < gParts.Count; i++)
+                    if (!lodAssigned.Contains(i))
+                        gParts[i].MaterialSlot = nextSlot++;
+
+                // Build MaterialNames keyed by MaterialSlot
+                int slotCount = 0;
+                foreach (var p in gParts) slotCount = Math.Max(slotCount, p.MaterialSlot + 1);
+                var matNames = new string[slotCount];
+                for (int i = 0; i < gParts.Count; i++)
+                {
+                    int slot = gParts[i].MaterialSlot;
+                    if (slot >= 0 && slot < matNames.Length && matNames[slot] == null)
+                        matNames[slot] = gMatNames[i];
+                }
+
+
+                // Global bounding box (must be after vertex correction)
+                Vector3 gMin = new(float.MaxValue), gMax = new(float.MinValue);
+                foreach (var pos in gPos) { gMin = Vector3.Min(gMin, pos); gMax = Vector3.Max(gMax, pos); }
+
+                var data = new MeshData
+                {
+                    Positions = gPos.ToArray(),
+                    Normals = gNorm.ToArray(),
+                    UVs = gUV.ToArray(),
+                    Indices = gIdx.ToArray(),
+                    Parts = gParts,
+                    BoundingBox = new Vortice.Mathematics.BoundingBox(gMin, gMax),
+                    LODs = lods,
+                    MaterialNames = matNames,
+                };
+
+                if (_skeleton.Count > 0)
+                {
+                    data.Bones = _skeleton.ToArray();
+                    data.BoneWeights = BuildBoneWeights(gWeights);
+                }
+
+               // if (lods.Count > 1)
+               //     Debug.Log("ModelImporter", $"Group '{groupName}': {lods.Count} LOD levels");
+
+                result.Add((groupName, data));
+
+                // Store per-group data for PostImport prefab generation
+                _groupMaterialNames[groupName] = matNames;
+
+                // Find the first mesh index in this group's parts to get its node name → world transform
+                if (pIndices.Count > 0)
+                {
+                    int firstMeshIdx = -1;
+                    for (int mi = 0; mi < meshes.Count; mi++)
+                    {
+                        if (meshNodeNames.TryGetValue(mi, out var nn) &&
+                            StripLODSuffix(nn).Equals(groupName, StringComparison.OrdinalIgnoreCase))
+                        {
+                            firstMeshIdx = mi;
+                            break;
+                        }
+                    }
+
+                    if (firstMeshIdx >= 0 && meshNodeNames.TryGetValue(firstMeshIdx, out var nodeName2) &&
+                        nodeWorldTransforms.TryGetValue(nodeName2, out var worldMatrix))
+                    {
+                        Matrix4x4.Decompose(worldMatrix, out var s, out var r, out var t);
+                        // Rotation is identity — vertex data now matches Unity's convention.
+                        _groupTransforms[groupName] = (Vector3.Zero, System.Numerics.Quaternion.Identity, s);
+                    }
+                }
             }
 
-            // Skeleton data
-            if (_skeleton.Count > 0)
+            //Debug.Log("ModelImporter", $"{result.Count} mesh group(s): " +
+            //    string.Join(", ", result.Select(r => $"{r.name}({r.data.Parts.Count}p)")));
+
+            return result;
+        }
+
+        // ══════════════════════════════════════════════════════════════
+        // Material Extraction
+        // ══════════════════════════════════════════════════════════════
+
+        // Assimp TextureType → Freefall material slot name
+        private static readonly Dictionary<TextureType, string> AssimpSlotMap = new()
+        {
+            { TextureType.Diffuse,           "Albedo" },
+            { TextureType.Normals,           "Normal" },
+            { TextureType.Roughness,         "Roughness" },
+            { TextureType.Metalness,         "Metallic" },
+            { TextureType.Emissive,          "Emissive" },
+            { TextureType.AmbientOcclusion,  "AO" },
+            { TextureType.Height,            "HeightTex" },
+        };
+
+        /// <summary>
+        /// Check whether a GUID points to a material-compatible asset
+        /// (standalone .mat or AssetDefinitionData sub-asset).
+        /// </summary>
+        private static bool IsMaterialGuid(string guid)
+        {
+            var meta = AssetDatabase.GetMeta(guid);
+            if (meta == null) return false;
+
+            // Check if it's a sub-asset of type AssetDefinitionData
+            var sub = meta.SubAssets?.Find(s => s.Guid == guid);
+            if (sub != null)
+                return sub.Type == nameof(AssetDefinitionData);
+
+            // Standalone .mat asset
+            return meta.MainAssetType == nameof(AssetDefinitionData);
+        }
+
+        /// <summary>
+        /// Parse animations only from a model file.
+        /// </summary>
+        public List<AnimationClip> ExtractAnimations(Scene scene, string filepath, ImportResult result, float scale)
+        {
+            var clips = new List<AnimationClip>();
+            if (scene.HasAnimations)
             {
-                data.Bones = _skeleton.ToArray();
-                data.BoneWeights = BuildBoneWeights(weightMap);
-                Debug.Log("ModelImporter", $"Mesh: {_skeleton.Count} bones, {data.BoneWeights.Length} vertex weights");
+                foreach (var anim in scene.Animations)
+                    clips.Add(ExtractAnimation(anim, scale));
+            }
+            return clips;
+        }
+
+        /// <summary>
+        /// Extract Assimp materials and emit MaterialDefinition artifacts.
+        /// Skips materials that already exist in AssetDatabase.
+        /// </summary>
+        private void ExtractMaterials(Scene scene, string filepath, ImportResult result)
+        {
+            if (!scene.HasMaterials) return;
+
+            var fbxDir = Path.GetDirectoryName(filepath) ?? "";
+            int created = 0;
+
+            foreach (var assimpMat in scene.Materials)
+            {
+                var matName = assimpMat.Name;
+                if (string.IsNullOrWhiteSpace(matName) || matName == "DefaultMaterial")
+                    continue;
+
+                // Skip if an asset with this name already exists in AssetDatabase
+                var existingGuid = AssetDatabase.ResolveGuidByName(matName);
+                if (existingGuid != null)
+                {
+                    Debug.Log("ModelImporter", $"Material '{matName}': existing asset found, skipping");
+                    continue;
+                }
+
+                // Build YAML MaterialDefinition
+                var sb = new System.Text.StringBuilder();
+                sb.AppendLine("!Material");
+                sb.AppendLine($"Effect: {InternalAssets.Guids.DefaultEffect}");
+                sb.AppendLine("Textures:");
+
+                bool hasTextures = false;
+                foreach (var (texType, slotName) in AssimpSlotMap)
+                {
+                    if (assimpMat.GetMaterialTexture(texType, 0, out var texSlot))
+                    {
+                        var texPath = texSlot.FilePath;
+                        if (string.IsNullOrEmpty(texPath)) continue;
+
+                        // Resolve texture GUID
+                        string texGuid = ResolveTextureGuid(texPath, fbxDir);
+                        if (texGuid != null)
+                        {
+                            sb.AppendLine($"  {slotName}: {texGuid}");
+                            hasTextures = true;
+                        }
+                        else
+                        {
+                            Debug.Log("ModelImporter", $"Material '{matName}': texture not found for {slotName}: '{texPath}'");
+                        }
+                    }
+                }
+
+                if (!hasTextures)
+                {
+                    Debug.Log("ModelImporter", $"Material '{matName}': no textures resolved, skipping");
+                    continue;
+                }
+
+                var yaml = sb.ToString();
+                result.Artifacts.Add(new ImportArtifact
+                {
+                    Name = matName,
+                    Type = "Material",
+                    Data = new AssetDefinitionData
+                    {
+                        TypeName = "Material",
+                        YamlBytes = System.Text.Encoding.UTF8.GetBytes(yaml)
+                    }
+                });
+                created++;
             }
 
-            return data;
+            if (created > 0)
+                Debug.Log("ModelImporter", $"Created {created} material sub-asset(s)");
+        }
+
+        /// <summary>
+        /// Resolve an Assimp texture file path to an AssetDatabase GUID.
+        /// Searches AssetDatabase by filename (textures are unique per asset pack).
+        /// </summary>
+        private static string ResolveTextureGuid(string texPath, string fbxDir)
+        {
+            // Handle embedded textures (Assimp uses "*N" notation)
+            if (texPath.StartsWith("*")) return null;
+
+            // Search by filename (without extension) — AssetDatabase tracks all imported textures
+            var fileName = Path.GetFileNameWithoutExtension(texPath);
+            return AssetDatabase.ResolveGuidByName(fileName);
         }
 
         // ══════════════════════════════════════════════════════════════
@@ -582,6 +974,24 @@ namespace Freefall.Assets.Importers
             if (node.HasChildren)
                 foreach (var child in node.Children)
                     BuildMeshNodeMap(child, map);
+        }
+
+        private static void BuildNodeWorldTransforms(Node node, Matrix4x4 parentWorld, Dictionary<string, Matrix4x4> result)
+        {
+            // Assimp Matrix4x4 is row-major; System.Numerics is column-major → transpose
+            var m = node.Transform;
+            var local = new Matrix4x4(
+                m.A1, m.B1, m.C1, m.D1,
+                m.A2, m.B2, m.C2, m.D2,
+                m.A3, m.B3, m.C3, m.D3,
+                m.A4, m.B4, m.C4, m.D4
+            );
+            var world = local * parentWorld;
+            result[node.Name] = world;
+
+            if (node.HasChildren)
+                foreach (var child in node.Children)
+                    BuildNodeWorldTransforms(child, world, result);
         }
 
         private static readonly object _dumpLock = new();
@@ -739,7 +1149,7 @@ namespace Freefall.Assets.Importers
                 if (lod0.Count > 0)
                 {
                     lodGroups[0] = lod0;
-                    Debug.Log("ModelImporter", $"Synthesized LOD0 from {lod0.Count} base parts");
+                    //Debug.Log("ModelImporter", $"Synthesized LOD0 from {lod0.Count} base parts");
                 }
             }
 
@@ -812,6 +1222,10 @@ namespace Freefall.Assets.Importers
         public static string StripLODSuffix(string name)
         {
             if (string.IsNullOrEmpty(name)) return name;
+
+            // NOTE: Do NOT strip trailing ".NNN" (Blender disambiguation suffixes like ".001", ".002").
+            // These differentiate distinct meshes (Plane.001 vs Plane.002 = different geometry).
+            // LOD grouping still works: SM_Roof_LOD1.001 → strip _LOD1 → SM_Roof.001 matches SM_Roof.001.
 
             // Strip "_LODN" or "_LOD_N" portion but keep any trailing content (e.g. " [MaterialName]")
             var upper = name.ToUpperInvariant();
@@ -926,7 +1340,7 @@ namespace Freefall.Assets.Importers
                 clip.AddChannel(channel);
             }
 
-            Debug.Log("ModelImporter", $"Animation '{clip.Name}': {clip.DurationSeconds:F2}s, {clip.Channels.Count} channels");
+            //Debug.Log("ModelImporter", $"Animation '{clip.Name}': {clip.DurationSeconds:F2}s, {clip.Channels.Count} channels");
             return clip;
         }
 
@@ -949,12 +1363,12 @@ namespace Freefall.Assets.Importers
             if (_skeleton.Count > 0)
             {
                 Debug.Log("ModelImporter", $"Skeleton: {_skeleton.Count} bones");
-                for (int i = 0; i < Math.Min(5, _skeleton.Count); i++)
-                {
-                    var bone = _skeleton[i];
-                    string parentName = bone.Parent >= 0 ? _skeleton[bone.Parent].Name : "ROOT";
-                    Debug.Log($"  [{i}] {bone.Name} → {parentName}");
-                }
+                //for (int i = 0; i < Math.Min(5, _skeleton.Count); i++)
+                //{
+                //    var bone = _skeleton[i];
+                //    string parentName = bone.Parent >= 0 ? _skeleton[bone.Parent].Name : "ROOT";
+                //    Debug.Log($"  [{i}] {bone.Name} → {parentName}");
+                //}
             }
         }
 

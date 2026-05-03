@@ -1,6 +1,7 @@
+using Freefall.Base;
+using System;
 using System.Collections;
 using System.Collections.Generic;
-using System;
 
 namespace Freefall.Reflection
 {
@@ -255,6 +256,8 @@ namespace Freefall.Reflection
         public Type Type { get; private set; }
         public object Target => targets[0];
 
+        public IEnumerable Targets => targets;
+
         public int Depth;
         public int Index;
 
@@ -280,13 +283,21 @@ namespace Freefall.Reflection
             return hashcode;
         }
 
-        public GUIObject(params object[] objects) : this(null, false, objects) {  }
+        public GUIObject(object[] objects) : this(null, false, objects) {  }
 
-        public GUIObject(bool includeReadOnly, params object[] objects) : this(null, includeReadOnly, objects) { }  
+        public GUIObject(object objects) : this(null, false, [objects]) { }
 
-        public GUIObject(GUIObject parent, params object[] objects) : this(parent, false, objects) { }
+        public GUIObject(bool includeReadOnly, object[] objects) : this(null, includeReadOnly, objects) { }
 
-        public GUIObject(GUIObject parent, bool includeReadOnly, params object[] objects)
+        public GUIObject(bool includeReadOnly, object objects) : this(null, includeReadOnly, [objects]) { }
+
+        public GUIObject(GUIObject parent, object[] objects) : this(parent, false, objects) { }
+
+        public GUIObject(GUIObject parent, object objects) : this(parent, false, [objects]) { }
+
+        public GUIObject(GUIObject parent, bool includeReadOnly, object objects) : this(parent, includeReadOnly, [objects]) { }
+
+        public GUIObject(GUIObject parent, bool includeReadOnly, object[] objects)
         {
             Parent = parent;
             targets = objects;

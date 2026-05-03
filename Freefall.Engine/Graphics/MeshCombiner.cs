@@ -36,7 +36,7 @@ namespace Freefall.Graphics
         }
 
         /// <summary>
-        /// Merge all StaticMeshRenderer children of 'root' into combined geometry.
+        /// Merge all MeshRenderer children of 'root' into combined geometry.
         /// One MeshPart per unique Material reference.
         /// </summary>
         public static MergeResult Combine(Entity root, MergeOptions options = null)
@@ -49,12 +49,12 @@ namespace Freefall.Graphics
 
             Matrix4x4.Invert(root.Transform.WorldMatrix, out var rootInverse);
 
-            // 2. Determine max LOD count
-            int maxLodCount = 0;
+            // 2. Determine max LOD count across all child meshes
+            int maxLodCount = 1;
             foreach (var (entity, renderer) in children)
             {
-                if (renderer.StaticMesh == null) continue;
-                int lods = 1 + (renderer.StaticMesh.LODs?.Count ?? 0);
+                if (renderer.Mesh == null) continue;
+                int lods = Math.Max(1, renderer.Mesh.LODs.Count);
                 maxLodCount = Math.Max(maxLodCount, lods);
             }
 
@@ -73,43 +73,35 @@ namespace Freefall.Graphics
 
                 foreach (var (entity, renderer) in children)
                 {
-                    var staticMesh = renderer.StaticMesh;
-                    if (staticMesh?.Mesh == null) continue;
+                    var mesh = renderer.Mesh;
+                    if (mesh == null) continue;
 
-                    var lodMesh = GetLODMesh(staticMesh, lod, options);
-                    if (lodMesh == null) continue;
+                    // Determine which MeshPart indices to use for this LOD level
+                    int[] partIndices = GetLodPartIndices(mesh, lod, options);
+                    if (partIndices == null || partIndices.Length == 0) continue;
 
-                    var elements = lodMesh.MeshParts;
-                    if (elements == null || elements.Count == 0) continue;
+                    // Read MeshData (cached per mesh GUID)
+                    var meshData = GetMeshData(mesh, meshDataCache);
+                    if (meshData == null) continue;
 
                     var relativeTransform = entity.Transform.WorldMatrix * rootInverse;
                     Matrix4x4.Invert(relativeTransform, out var inv);
                     var normalMatrix = Matrix4x4.Transpose(inv);
 
-                    foreach (var element in elements)
+                    foreach (var partIdx in partIndices)
                     {
-                        if (element.Material == null) continue;
+                        if (partIdx >= mesh.MeshParts.Count) continue;
+                        var part = mesh.MeshParts[partIdx];
 
-                        // Resolve which Mesh object this element uses
-                        var mesh = element.Mesh ?? lodMesh.Mesh ?? staticMesh.Mesh;
-                        if (mesh == null) continue;
-
-                        // Read MeshData (cached per mesh GUID) — only for vertex/index buffers
-                        var meshData = GetMeshData(mesh, meshDataCache);
-                        if (meshData == null) continue;
-
-                        int partIndex = element.MeshPartIndex;
-                        if (partIndex < 0 || partIndex >= mesh.MeshParts.Count)
-                            continue;
-
-                        // Use LIVE MeshPart for offsets — cache parts can be in different order
-                        var part = mesh.MeshParts[partIndex];
+                        // Resolve material using MeshRenderer's logic
+                        var mat = ResolveMaterial(renderer, part.MaterialSlot);
+                        if (mat == null) continue;
 
                         // Get or create accumulator for THIS material
-                        if (!accumulators.TryGetValue(element.Material, out var acc))
+                        if (!accumulators.TryGetValue(mat, out var acc))
                         {
-                            acc = new MergeAccumulator { Material = element.Material };
-                            accumulators[element.Material] = acc;
+                            acc = new MergeAccumulator { Material = mat };
+                            accumulators[mat] = acc;
                         }
 
                         AppendPartGeometry(acc, meshData, part, relativeTransform, normalMatrix);
@@ -130,71 +122,53 @@ namespace Freefall.Graphics
         }
 
         /// <summary>
-        /// Create an in-memory StaticMesh from a MergeResult.
+        /// Create an in-memory Mesh + material list from a MergeResult.
         /// </summary>
-        public static StaticMesh CreateStaticMesh(GraphicsDevice device, MergeResult result)
+        public static (Mesh mesh, List<MaterialOverride> materials) CreateMergedMesh(
+            GraphicsDevice device, MergeResult result)
         {
             if (result == null || result.MeshDataPerLOD.Count == 0)
-                return null;
+                return (null, null);
 
             var lod0Data = result.MeshDataPerLOD[0];
             if (lod0Data.Positions == null || lod0Data.Positions.Length == 0)
-                return null;
+                return (null, null);
 
-            var staticMesh = new StaticMesh { Name = "Merged" };
-            staticMesh.Mesh = new Mesh(device, lod0Data);
+            // Build LOD0 mesh
+            var mesh = new Mesh(device, lod0Data);
 
-            // MeshElement[i] → MeshPart[i] + Material[i]. Direct 1:1.
+            // Build material overrides from LOD0 materials
             var lod0Mats = result.MaterialsPerLOD[0];
+            var materials = new List<MaterialOverride>();
             for (int i = 0; i < lod0Data.Parts.Count; i++)
             {
-                staticMesh.MeshParts.Add(new MeshElement
+                materials.Add(new MaterialOverride
                 {
-                    Mesh = staticMesh.Mesh,
+                    MaterialSlot = lod0Data.Parts[i].MaterialSlot,
                     Material = i < lod0Mats.Count ? lod0Mats[i] : InternalAssets.DefaultMaterial,
-                    MeshPartIndex = i,
                 });
             }
 
-            // LODs — each gets its own Mesh + its own material list
-            for (int lod = 1; lod < result.MeshDataPerLOD.Count; lod++)
-            {
-                var lodData = result.MeshDataPerLOD[lod];
-                if (lodData.Positions == null || lodData.Positions.Length == 0) continue;
+            // TODO: LOD merging — for now, merged meshes have LOD0 only.
+            // Per-mesh LODs would require building additional MeshLOD entries
+            // from result.MeshDataPerLOD[1..N], which means appending their
+            // vertex/index data to the same Mesh buffer. This is non-trivial
+            // and rarely needed (merge is typically for static scenery).
 
-                var lodMesh = new Mesh(device, lodData);
-                var lodEntry = new StaticMeshLOD { Mesh = lodMesh };
-                var lodMats = result.MaterialsPerLOD[lod];
-
-                for (int i = 0; i < lodData.Parts.Count; i++)
-                {
-                    lodEntry.MeshParts.Add(new MeshElement
-                    {
-                        Mesh = lodMesh,
-                        Material = i < lodMats.Count ? lodMats[i] : InternalAssets.DefaultMaterial,
-                        MeshPartIndex = i,
-                    });
-                }
-
-                staticMesh.LODs.Add(lodEntry);
-            }
-
-            staticMesh.LODGroup = LODGroups.LargeProps;
-            staticMesh.Mesh.RegisterMeshParts();
-            staticMesh.MarkReady();
-            return staticMesh;
+            mesh.RegisterMeshParts();
+            return (mesh, materials);
         }
 
         // ─── Helpers ───────────────────────────────────────────────
 
-        private static List<(Entity entity, StaticMeshRenderer renderer)> CollectRenderers(Entity root)
+        private static List<(Entity entity, MeshRenderer renderer)> CollectRenderers(Entity root)
         {
-            var result = new List<(Entity, StaticMeshRenderer)>();
+            var result = new List<(Entity, MeshRenderer)>();
             void Walk(Entity e, bool isRoot)
             {
                 if (!isRoot)
                 {
-                    var r = e.GetComponent<StaticMeshRenderer>();
+                    var r = e.GetComponent<MeshRenderer>();
                     if (r != null) result.Add((e, r));
                 }
                 for (int i = 0; i < e.Transform.GetChildCount(); i++)
@@ -208,18 +182,47 @@ namespace Freefall.Graphics
             return result;
         }
 
-        private static IStaticMesh GetLODMesh(StaticMesh sm, int lodLevel, MergeOptions options)
+        /// <summary>
+        /// Get the MeshPart indices for a given LOD level from a Mesh.
+        /// Handles fallback when a mesh has fewer LOD levels than requested.
+        /// </summary>
+        private static int[] GetLodPartIndices(Mesh mesh, int lodLevel, MergeOptions options)
         {
-            int available = 1 + (sm.LODs?.Count ?? 0);
+            if (mesh.LODs.Count == 0)
+            {
+                // No LODs — return all parts for LOD0, or based on strategy
+                if (lodLevel == 0 || options.NoLodHandling == NoLodStrategy.IncludeInAll)
+                    return Enumerable.Range(0, mesh.MeshParts.Count).ToArray();
+                return null;
+            }
 
-            if (lodLevel == 0) return sm;
-            if (lodLevel < available) return sm.LODs[lodLevel - 1];
+            if (lodLevel < mesh.LODs.Count)
+                return mesh.LODs[lodLevel].MeshPartIndices;
 
-            // Source doesn't have this LOD
+            // Source doesn't have this LOD level
             if (options.NoLodHandling == NoLodStrategy.IncludeInAll)
-                return sm.LODs?.Count > 0 ? sm.LODs[^1] : sm;
+                return mesh.LODs[^1].MeshPartIndices; // Use lowest available LOD
 
             return null;
+        }
+
+        /// <summary>
+        /// Resolve material for a MeshPart slot using MeshRenderer's override chain.
+        /// </summary>
+        private static Material ResolveMaterial(MeshRenderer renderer, int materialSlot)
+        {
+            // Check sparse overrides first
+            if (renderer.Materials != null)
+            {
+                for (int i = 0; i < renderer.Materials.Count; i++)
+                {
+                    if (renderer.Materials[i].MaterialSlot == materialSlot)
+                        return renderer.Materials[i].Material;
+                }
+            }
+
+            // Fall back to default Material
+            return renderer.Material;
         }
 
         private static MeshData GetMeshData(Mesh mesh, Dictionary<string, MeshData> cache)

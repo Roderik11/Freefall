@@ -306,7 +306,7 @@ PSOutput PS(MSOutput input)
         DecoratorSlot psSlot = psSlots[input.SlotIdx];
         variedBase *= psSlot.HealthyColor;
 
-        output.Albedo = float4(variedBase, 1.0);
+        output.Albedo = float4(variedBase, 0);
         output.Normal = float4(normalize(input.Normal), 1.0); // terrain normal
     }
     else
@@ -328,7 +328,7 @@ PSOutput PS(MSOutput input)
             baseColor = float3(0.5, 0.5, 0.5);
         }
 
-        output.Albedo = float4(baseColor, 1.0);
+        output.Albedo = float4(baseColor, 0);
         output.Normal = float4(normalize(input.Normal), 1.0);
     }
 

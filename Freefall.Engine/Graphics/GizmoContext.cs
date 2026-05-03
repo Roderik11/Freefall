@@ -149,7 +149,7 @@ namespace Freefall.Graphics
         /// Draggable point handle on the camera-facing plane.
         /// Like Unity's Handles.FreeMoveHandle.
         /// </summary>
-        public Vector3 FreeMoveHandle(Vector3 position, float size = 8f)
+        public Vector3 FreeMoveHandle(Vector3 position, out bool clicked, float size = 8f)
         {
             int id = AllocateHandleId();
             var worldPos = LocalToWorld(position);
@@ -165,11 +165,15 @@ namespace Freefall.Graphics
             PopHandleBucket();
             Color = savedColor;
 
+            clicked = false;
+
             // Drag interaction
             if (isHot && MouseDown && Camera != null)
             {
                 if (!_dragStates.TryGetValue(id, out var state) || !state.Initialized)
                 {
+                    clicked = true;
+
                     state = new DragState
                     {
                         DragPlane = new Plane(Camera.Forward, -Vector3.Dot(Camera.Forward, worldPos)),

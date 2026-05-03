@@ -34,6 +34,7 @@ namespace Freefall.Assets.Importers
     [AssetImporter(".png", ".jpg", ".jpeg", ".tga", ".bmp", ".dds", ".psd")]
     public class TextureImporter : IImporter
     {
+        [System.Text.Json.Serialization.JsonIgnore]
         public Type AssetType => typeof(Graphics.Texture);
        
         // ── Configurable import settings (editable in inspector) ──
@@ -44,13 +45,20 @@ namespace Freefall.Assets.Importers
         public bool IsNormalMap = false;
         public bool AlphaFromGrayscale = false;
 
+        /// <summary>
+        /// Set when the user manually saves settings. Prevents auto-detection
+        /// from overwriting the configured Format/sRGB/IsNormalMap on reimport.
+        /// </summary>
+        [System.Text.Json.Serialization.JsonInclude]
+        public bool UserConfigured = false;
+
         // Suffixes that indicate linear (non-color) data maps
         private static readonly string[] LinearSuffixes = {
-            "_Nor", "_Normal", "_Nrm",
+            "_Nor", "Normal", "Norm", "Nrm",
             "_Spec", "_Specular", "_SpecGloss",
             "_Roughness", "_Rough",
             "_Metal", "_Metallic", "_MetallicGloss",
-            "_AO", "_Aoc", "_Occlusion",
+            "AO", "Aoc", "Occlusion",
             "_Depth", "_Height", "_Parallax",
             "_Emissive", "_Emission",
             "_DetailMask", "_DetailNormal", "_Mask",
@@ -60,7 +68,7 @@ namespace Freefall.Assets.Importers
 
         // Suffixes that indicate normal maps — use BC5 (two high-quality channels)
         private static readonly string[] NormalSuffixes = {
-            "_Nor", "_Normal", "_Nrm",
+            "_Nor", "Normal","Norm", "Nrm",
             "_DetailNormal",
             "_BumpMap", "_Bump",
         };
@@ -99,16 +107,23 @@ namespace Freefall.Assets.Importers
 
                 try
                 {
-                    // Auto-detect: data maps (normals, roughness, etc.) should be linear, not sRGB
-                    bool isLinearData = LinearSuffixes.Any(s =>
-                        name.EndsWith(s, StringComparison.OrdinalIgnoreCase));
-                    sRGB = !isLinearData;
+                    // Only auto-detect if the user hasn't manually configured settings
+                    if (!UserConfigured)
+                    {
+                        // Auto-detect: data maps (normals, roughness, etc.) should be linear, not sRGB
+                        bool isLinearData = LinearSuffixes.Any(s =>
+                            name.EndsWith(s, StringComparison.OrdinalIgnoreCase));
+                        sRGB = !isLinearData;
 
-                    // Normal maps → BC5_UNORM (two high-quality RG channels, Z reconstructed in shader)
-                    bool isNormalMap = NormalSuffixes.Any(s =>
-                        name.EndsWith(s, StringComparison.OrdinalIgnoreCase));
-                    if (isNormalMap)
-                        Format = TextureFormat.BC5_UNORM;
+                        // Normal maps → BC5_UNORM (two high-quality RG channels, Z reconstructed in shader)
+                        bool isNormalMap = NormalSuffixes.Any(s =>
+                            name.EndsWith(s, StringComparison.OrdinalIgnoreCase));
+                        if (isNormalMap)
+                        {
+                            Format = TextureFormat.BC5_UNORM;
+                            IsNormalMap = true;
+                        }
+                    }
 
                     ddsBytes = ConvertToDds(inputPath);
                 }
@@ -149,16 +164,16 @@ namespace Freefall.Assets.Importers
 
             try
             {
+                bool hasAlpha = HasAlphaChannel(sourcePath);
+
                 // Auto-select format: BC5 is already set for normals, otherwise BC1/BC7
                 var format = Format;
                 if (format != TextureFormat.BC5_UNORM && format != TextureFormat.BC4_UNORM)
                 {
                     if (format == TextureFormat.BC7_UNORM || format == TextureFormat.BC7_UNORM_SRGB)
                     {
-                        if (!HasAlphaChannel(sourcePath))
-                        {
+                        if (!hasAlpha)
                             format = TextureFormat.BC1_UNORM;
-                        }
                     }
                 }
 
@@ -178,7 +193,15 @@ namespace Freefall.Assets.Importers
                 var args = $"-y -gpu 0 -f {format}";
 
                 if (GenerateMips)
-                    args += " -m 0 -sepalpha"; // full mip chain; filter RGB/A independently
+                    args += " -m 0";
+
+                // WIC composites transparent PNG pixels against white during decode,
+                // causing white fringing at alpha edges. -pmalpha fixes this by
+                // multiplying RGB×A, so transparent pixels stay black (0,0,0,0).
+                // For alpha-clip shaders this is safe: where α≈1 RGB is unchanged,
+                // where α<threshold the pixel is discarded anyway.
+                if (hasAlpha)
+                    args += " -pmalpha";
 
                 if (sRGB)
                     args += " -srgbi -srgbo";

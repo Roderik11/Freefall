@@ -40,7 +40,25 @@ namespace Freefall.Graph
         {
             Node = node;
             Field = field;
-            FieldHash = field.Name.GetHashCode();
+            FieldHash = StableHash(field.Name);
+        }
+
+        /// <summary>
+        /// Deterministic string hash (FNV-1a). Unlike string.GetHashCode(),
+        /// this produces the same value across process runs.
+        /// </summary>
+        internal static int StableHash(string s)
+        {
+            unchecked
+            {
+                int hash = (int)2166136261;
+                foreach (char c in s)
+                {
+                    hash ^= c;
+                    hash *= 16777619;
+                }
+                return hash;
+            }
         }
     }
 }

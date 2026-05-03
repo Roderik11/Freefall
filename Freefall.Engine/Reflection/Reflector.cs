@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Reflection;
 using System.Linq;
@@ -13,19 +14,19 @@ namespace Freefall.Reflection
     public static class Reflector
     {
         // Assembly registry for cross-assembly type resolution
-        private static readonly Dictionary<string, Assembly> _assemblies = new();
+        private static readonly ConcurrentDictionary<string, Assembly> _assemblies = new();
 
         // Type → ordered field mapping (base-class fields first)
-        private static readonly Dictionary<Type, Mapping> _mappingCache = new();
+        private static readonly ConcurrentDictionary<Type, Mapping> _mappingCache = new();
 
         // Type name → Type (for deserialization)
-        private static readonly Dictionary<string, Type> _typeCache = new();
+        private static readonly ConcurrentDictionary<string, Type> _typeCache = new();
 
         // FormerlySerializedAs lookups (old name → current type)
-        private static readonly Dictionary<string, Type> _formerNames = new();
+        private static readonly ConcurrentDictionary<string, Type> _formerNames = new();
 
         // Subtype cache (base → all derived types across registered assemblies)
-        private static readonly Dictionary<Type, List<Type>> _typesByBase = new();
+        private static readonly ConcurrentDictionary<Type, List<Type>> _typesByBase = new();
 
         /// <summary>
         /// Initialize with the engine assembly. Call once at startup.

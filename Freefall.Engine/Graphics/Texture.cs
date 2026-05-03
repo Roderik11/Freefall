@@ -159,9 +159,17 @@ namespace Freefall.Graphics
         {
              Debug.Log($"[Texture] CreateTexture2DArray: mixed formats detected, using compute copy for {textures.Count} textures");
 
+             // Use the largest dimensions and mip count across all sources
              int width = (int)refDesc.Width;
              int height = (int)refDesc.Height;
              int mipCount = refDesc.MipLevels;
+             for (int i = 1; i < textures.Count; i++)
+             {
+                 var d = textures[i].Native.Description;
+                 if ((int)d.Width > width) width = (int)d.Width;
+                 if ((int)d.Height > height) height = (int)d.Height;
+                 if (d.MipLevels > mipCount) mipCount = d.MipLevels;
+             }
              int arraySize = textures.Count;
 
              // Determine output format: use non-sRGB RGBA for UAV compatibility.
@@ -199,7 +207,11 @@ namespace Freefall.Graphics
              device.NativeDevice.CreateShaderResourceView(arr._resource, srvDesc, arr.SrvCpuHandle);
 
              // Compile compute shader inline — SM6.6 bindless, push constants at b3
+             // Uses SampleLevel with normalized UVs so smaller sources are bilinearly
+             // upscaled to fill the output array slice (no out-of-bounds black texels).
              var shaderSource = @"
+SamplerState sLinear : register(s0);  // static sampler 0: linear wrap
+
 cbuffer PushConstants : register(b3) {
     uint SliceIndex;
     uint MipWidth;
@@ -213,12 +225,15 @@ void CSCopySlice(uint3 id : SV_DispatchThreadID) {
     if (id.x >= MipWidth || id.y >= MipHeight) return;
     Texture2D<float4> input = ResourceDescriptorHeap[InputSrvIdx];
     RWTexture2DArray<float4> output = ResourceDescriptorHeap[OutputUavIdx];
-    output[uint3(id.xy, SliceIndex)] = input[id.xy];
+    float2 uv = (float2(id.xy) + 0.5) / float2(MipWidth, MipHeight);
+    output[uint3(id.xy, SliceIndex)] = input.SampleLevel(sLinear, uv, 0);
 }
 ";
              var shader = new Shader(shaderSource, "CSCopySlice", "cs_6_6");
              var pso = device.CreateComputePipelineState(shader.Bytecode);
              shader.Dispose();
+
+             var tempDescriptors = new List<uint>();
 
              using (var cmd = device.NativeDevice.CreateCommandAllocator(CommandListType.Direct))
              using (var list = device.NativeDevice.CreateCommandList<ID3D12GraphicsCommandList>(0, CommandListType.Direct, cmd))
@@ -230,6 +245,8 @@ void CSCopySlice(uint3 id : SV_DispatchThreadID) {
                  for (int i = 0; i < textures.Count; i++)
                  {
                      var src = textures[i];
+                     var srcDesc = src.Native.Description;
+                     int srcMips = srcDesc.MipLevels;
 
                      // Transition source to SRV
                      list.ResourceBarrierTransition(src.Native, ResourceStates.Common, ResourceStates.NonPixelShaderResource);
@@ -240,6 +257,7 @@ void CSCopySlice(uint3 id : SV_DispatchThreadID) {
                      {
                          // Allocate per-mip UAV for the target slice+mip
                          var uavIdx = device.AllocateBindlessIndex();
+                         tempDescriptors.Add(uavIdx);
                          var uavDesc = new UnorderedAccessViewDescription
                          {
                              Format = uavFormat,
@@ -253,14 +271,16 @@ void CSCopySlice(uint3 id : SV_DispatchThreadID) {
                          };
                          device.NativeDevice.CreateUnorderedAccessView(arr._resource, null, uavDesc, device.GetCpuHandle(uavIdx));
 
-                         // Per-mip SRV for source texture
+                         // Per-mip SRV for source — use mip 0 with all mips visible so
+                         // SampleLevel can filter correctly at the source's native resolution
                          var srcSrvIdx = device.AllocateBindlessIndex();
+                         tempDescriptors.Add(srcSrvIdx);
                          var srcSrvDesc = new ShaderResourceViewDescription
                          {
-                             Format = src.Native.Description.Format,
+                             Format = srcDesc.Format,
                              ViewDimension = ShaderResourceViewDimension.Texture2D,
                              Shader4ComponentMapping = ShaderComponentMapping.Default,
-                             Texture2D = new Texture2DShaderResourceView { MostDetailedMip = (uint)mip, MipLevels = 1 }
+                             Texture2D = new Texture2DShaderResourceView { MostDetailedMip = 0, MipLevels = (uint)srcMips }
                          };
                          device.NativeDevice.CreateShaderResourceView(src.Native, srcSrvDesc, device.GetCpuHandle(srcSrvIdx));
 
@@ -288,6 +308,10 @@ void CSCopySlice(uint3 id : SV_DispatchThreadID) {
                  list.Close();
                  device.SubmitAndWait(list);
              }
+
+             // Release temporary per-mip descriptors after GPU work completes
+             foreach (var idx in tempDescriptors)
+                 device.ReleaseBindlessIndex(idx);
 
              pso.Dispose();
              arr.MarkReady();

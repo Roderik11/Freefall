@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Numerics;
 using System.Runtime.InteropServices;
@@ -133,6 +133,11 @@ namespace Freefall.Graphics
         private ID3D12Resource[] histogramBuffers = new ID3D12Resource[FrameCount];
         private uint[] histogramUAVIndices = new uint[FrameCount];
         private CpuDescriptorHandle[] histogramCPUHandles = new CpuDescriptorHandle[FrameCount];
+        
+        // Draw count buffer for ExecuteIndirect count parameter (atomically incremented by CSMain)
+        private ID3D12Resource[] drawCountBuffers = new ID3D12Resource[FrameCount];
+        private uint[] drawCountUAVIndices = new uint[FrameCount];
+        private CpuDescriptorHandle[] drawCountCPUHandles = new CpuDescriptorHandle[FrameCount];
         
         // Shadow culling â€” union visibility + cascade mask (single-pass rendering)
 
@@ -445,7 +450,7 @@ namespace Freefall.Graphics
             var cpuHeapDesc = new DescriptorHeapDescription
             {
                 Type = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView,
-                DescriptorCount = FrameCount * 3,
+                DescriptorCount = FrameCount * 4, // counter, visibleIndices, histogram, drawCount
                 Flags = DescriptorHeapFlags.None
             };
             _cpuHeap = device.NativeDevice.CreateDescriptorHeap(cpuHeapDesc);
@@ -523,6 +528,28 @@ namespace Freefall.Graphics
                 device.NativeDevice.CreateUnorderedAccessView(histogramBuffers[i], null, histogramUavDesc, histogramCpuHandle);
                 histogramCPUHandles[i] = histogramCpuHandle;
                 
+                // Draw count buffer for ExecuteIndirect count parameter
+                drawCountBuffers[i] = device.CreateDefaultBuffer(sizeof(uint));
+                drawCountUAVIndices[i] = device.AllocateBindlessIndex();
+                var drawCountUavDesc = new UnorderedAccessViewDescription
+                {
+                    Format = Vortice.DXGI.Format.Unknown,
+                    ViewDimension = UnorderedAccessViewDimension.Buffer,
+                    Buffer = new BufferUnorderedAccessView
+                    {
+                        FirstElement = 0,
+                        NumElements = 1,
+                        StructureByteStride = sizeof(uint),
+                        Flags = BufferUnorderedAccessViewFlags.None
+                    }
+                };
+                device.NativeDevice.CreateUnorderedAccessView(
+                    drawCountBuffers[i], null, drawCountUavDesc, device.GetCpuHandle(drawCountUAVIndices[i]));
+                
+                var drawCountCpuHandle = _cpuHeap.GetCPUDescriptorHandleForHeapStart() + ((int)((3 * FrameCount + i) * handleIncrementSize));
+                device.NativeDevice.CreateUnorderedAccessView(drawCountBuffers[i], null, drawCountUavDesc, drawCountCpuHandle);
+                drawCountCPUHandles[i] = drawCountCpuHandle;
+                
             }
         }
 
@@ -563,6 +590,7 @@ namespace Freefall.Graphics
             commandList.SetComputeRoot32BitConstant(0, Material.MaterialsBufferIndex, 25);
             commandList.SetComputeRoot32BitConstant(0, histogramUAVIndices[frameIndex], 26);
             commandList.SetComputeRoot32BitConstant(0, (uint)MeshRegistry.Count, 27);
+            commandList.SetComputeRoot32BitConstant(0, drawCountUAVIndices[frameIndex], 18); // DrawCountUAVIdx
 
 
             // Bind per-instance buffer SRV indices to COMPUTE push constants (hardcoded slots).
@@ -591,12 +619,19 @@ namespace Freefall.Graphics
                 histogramCPUHandles[frameIndex],
                 histogramBuffers[frameIndex],
                 new Vortice.Mathematics.Int4(0, 0, 0, 0));
+            
+            // Clear draw count buffer (CSMain atomically increments this)
+            commandList.ClearUnorderedAccessViewUint(
+                device.GetGpuHandle(drawCountUAVIndices[frameIndex]),
+                drawCountCPUHandles[frameIndex],
+                drawCountBuffers[frameIndex],
+                new Vortice.Mathematics.Int4(0, 0, 0, 0));
 
-            // Barrier after clears: only the 3 cleared buffers need sync
             commandList.ResourceBarrier(new[] {
                 new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(counterBuffers[frameIndex])),
                 new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(visibleIndicesBuffers[frameIndex])),
-                new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(histogramBuffers[frameIndex]))
+                new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(histogramBuffers[frameIndex])),
+                new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(drawCountBuffers[frameIndex]))
             });
 
             // Pass 1: CSVisibility â€” writes visibilityFlags
@@ -793,6 +828,7 @@ namespace Freefall.Graphics
             commandList.SetComputeRoot32BitConstant(0, shadowCascadeMaskUAVIndices[frameIndex], 28);  // CascadeMaskUAVIdx
             commandList.SetComputeRoot32BitConstant(0, shadowExpansionUAVIndices[frameIndex], 29);    // ExpansionUAVIdx
             commandList.SetComputeRoot32BitConstant(0, cascadeBufferSrv, 31);                         // CascadeBufferSRVIdx (Indices[7].w)
+            commandList.SetComputeRoot32BitConstant(0, 0u, 18);                                       // DrawCountUAVIdx = 0 → fixed-index mode (shadow needs it)
 
             foreach (var (hash, pib) in _perInstanceBuffers)
             {
@@ -878,6 +914,25 @@ namespace Freefall.Graphics
             commandList.Dispatch((uint)((MeshRegistry.Count + 63) / 64), 1, 1);
 
             commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(shadowCommandBuffers[frameIndex])));
+
+            // PHASE 4: Compact non-empty commands from shadow buffer to opaque buffer (separate src/dest avoids race)
+            // CSCompactCommands reads OutputBufferIdx (shadow), writes VisibleIndicesSRVIdx (opaque, repurposed as dest)
+            commandList.ClearUnorderedAccessViewUint(
+                device.GetGpuHandle(drawCountUAVIndices[frameIndex]),
+                drawCountCPUHandles[frameIndex],
+                drawCountBuffers[frameIndex],
+                new Vortice.Mathematics.Int4(0, 0, 0, 0));
+            commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(drawCountBuffers[frameIndex])));
+
+            commandList.SetComputeRoot32BitConstant(0, drawCountUAVIndices[frameIndex], 18); // DrawCountUAVIdx
+            commandList.SetComputeRoot32BitConstant(0, gpuCommandUAVIndices[frameIndex], 9);  // dest = opaque command buffer
+            commandList.SetPipelineState(culler.CompactCommandsPSO);
+            commandList.Dispatch((uint)((MeshRegistry.Count + 63) / 64), 1, 1);
+
+            commandList.ResourceBarrier(new[] {
+                new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(gpuCommandBuffers[frameIndex])),
+                new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(drawCountBuffers[frameIndex]))
+            });
         }
 
 
@@ -898,7 +953,8 @@ namespace Freefall.Graphics
             int frameIndex = Engine.FrameIndex % FrameCount;
             if (!_shadowCullerInitialized || SubBatchCount == 0) return;
 
-            var commandBuffer = shadowCommandBuffers[frameIndex];
+            // After CSCompactCommands, packed commands are in gpuCommandBuffers
+            var commandBuffer = gpuCommandBuffers[frameIndex];
             if (commandBuffer == null) return;
 
 
@@ -915,30 +971,63 @@ namespace Freefall.Graphics
             commandList.SetGraphicsRoot32BitConstant(0, shadowVPSrv, 21);    // ShadowVPBufferIdx
 
             // Transition buffers for reading
-            commandList.ResourceBarrier(new[] {
-                new ResourceBarrier(new ResourceTransitionBarrier(shadowExpansionBuffers[frameIndex],
-                    ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource)),
-                new ResourceBarrier(new ResourceTransitionBarrier(commandBuffer,
-                    ResourceStates.UnorderedAccess, ResourceStates.IndirectArgument))
-            });
+            var countBuffer = drawCountBuffers[frameIndex];
 
-            // 1 ExecuteIndirect — commands have expanded DrawInstanceCount from CSPatchExpandedCounts
-            commandList.ExecuteIndirect(
-                Engine.Device.BindlessCommandSignature,
-                (uint)SubBatchCount,
-                commandBuffer,
-                0,
-                null,
-                0
-            );
+            if (countBuffer != null)
+            {
+                commandList.ResourceBarrier(new[] {
+                    new ResourceBarrier(new ResourceTransitionBarrier(shadowExpansionBuffers[frameIndex],
+                        ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource)),
+                    new ResourceBarrier(new ResourceTransitionBarrier(commandBuffer,
+                        ResourceStates.UnorderedAccess, ResourceStates.IndirectArgument)),
+                    new ResourceBarrier(new ResourceTransitionBarrier(countBuffer,
+                        ResourceStates.UnorderedAccess, ResourceStates.IndirectArgument))
+                });
 
-            // Transition back
-            commandList.ResourceBarrier(new[] {
-                new ResourceBarrier(new ResourceTransitionBarrier(commandBuffer,
-                    ResourceStates.IndirectArgument, ResourceStates.UnorderedAccess)),
-                new ResourceBarrier(new ResourceTransitionBarrier(shadowExpansionBuffers[frameIndex],
-                    ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess))
-            });
+                commandList.ExecuteIndirect(
+                    Engine.Device.BindlessCommandSignature,
+                    (uint)SubBatchCount,
+                    commandBuffer,
+                    0,
+                    countBuffer,
+                    0
+                );
+
+                commandList.ResourceBarrier(new[] {
+                    new ResourceBarrier(new ResourceTransitionBarrier(commandBuffer,
+                        ResourceStates.IndirectArgument, ResourceStates.UnorderedAccess)),
+                    new ResourceBarrier(new ResourceTransitionBarrier(countBuffer,
+                        ResourceStates.IndirectArgument, ResourceStates.UnorderedAccess)),
+                    new ResourceBarrier(new ResourceTransitionBarrier(shadowExpansionBuffers[frameIndex],
+                        ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess))
+                });
+            }
+            else
+            {
+                // Fallback: no count buffer
+                commandList.ResourceBarrier(new[] {
+                    new ResourceBarrier(new ResourceTransitionBarrier(shadowExpansionBuffers[frameIndex],
+                        ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource)),
+                    new ResourceBarrier(new ResourceTransitionBarrier(commandBuffer,
+                        ResourceStates.UnorderedAccess, ResourceStates.IndirectArgument))
+                });
+
+                commandList.ExecuteIndirect(
+                    Engine.Device.BindlessCommandSignature,
+                    (uint)SubBatchCount,
+                    commandBuffer,
+                    0,
+                    null,
+                    0
+                );
+
+                commandList.ResourceBarrier(new[] {
+                    new ResourceBarrier(new ResourceTransitionBarrier(commandBuffer,
+                        ResourceStates.IndirectArgument, ResourceStates.UnorderedAccess)),
+                    new ResourceBarrier(new ResourceTransitionBarrier(shadowExpansionBuffers[frameIndex],
+                        ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess))
+                });
+            }
         }
 
         #endregion
@@ -972,25 +1061,54 @@ namespace Freefall.Graphics
                     ResourceStates.UnorderedAccess,
                     ResourceStates.NonPixelShaderResource)));
 
-            
-            commandList.ResourceBarrier(new ResourceBarrier(
-                new ResourceTransitionBarrier(commandBuffer,
-                    ResourceStates.UnorderedAccess,
-                    ResourceStates.IndirectArgument)));
+            var countBuffer = drawCountBuffers[frameIndex];
 
-            commandList.ExecuteIndirect(
-                Engine.Device.BindlessCommandSignature,
-                (uint)SubBatchCount,
-                commandBuffer,
-                0,
-                null,
-                0
-            );
+            if (countBuffer != null)
+            {
+                commandList.ResourceBarrier(new[] {
+                    new ResourceBarrier(new ResourceTransitionBarrier(commandBuffer,
+                        ResourceStates.UnorderedAccess, ResourceStates.IndirectArgument)),
+                    new ResourceBarrier(new ResourceTransitionBarrier(countBuffer,
+                        ResourceStates.UnorderedAccess, ResourceStates.IndirectArgument))
+                });
 
-            commandList.ResourceBarrier(new ResourceBarrier(
-                new ResourceTransitionBarrier(commandBuffer,
-                    ResourceStates.IndirectArgument,
-                    ResourceStates.UnorderedAccess)));
+                commandList.ExecuteIndirect(
+                    Engine.Device.BindlessCommandSignature,
+                    (uint)SubBatchCount,
+                    commandBuffer,
+                    0,
+                    countBuffer,
+                    0
+                );
+
+                commandList.ResourceBarrier(new[] {
+                    new ResourceBarrier(new ResourceTransitionBarrier(commandBuffer,
+                        ResourceStates.IndirectArgument, ResourceStates.UnorderedAccess)),
+                    new ResourceBarrier(new ResourceTransitionBarrier(countBuffer,
+                        ResourceStates.IndirectArgument, ResourceStates.UnorderedAccess))
+                });
+            }
+            else
+            {
+                // Fallback: no count buffer (after resize, before next Cull())
+                commandList.ResourceBarrier(new ResourceBarrier(
+                    new ResourceTransitionBarrier(commandBuffer,
+                        ResourceStates.UnorderedAccess, ResourceStates.IndirectArgument)));
+
+                commandList.ExecuteIndirect(
+                    Engine.Device.BindlessCommandSignature,
+                    (uint)SubBatchCount,
+                    commandBuffer,
+                    0,
+                    null,
+                    0
+                );
+
+                commandList.ResourceBarrier(new ResourceBarrier(
+                    new ResourceTransitionBarrier(commandBuffer,
+                        ResourceStates.IndirectArgument, ResourceStates.UnorderedAccess)));
+            }
+
             commandList.ResourceBarrier(new ResourceBarrier(
                 new ResourceTransitionBarrier(visibleIndicesBuffers[frameIndex],
                     ResourceStates.NonPixelShaderResource,
@@ -1029,6 +1147,9 @@ namespace Freefall.Graphics
 
                 DeferDispose(histogramBuffers[i], histogramUAVIndices[i]);
                 histogramBuffers[i] = null; histogramUAVIndices[i] = 0;
+
+                DeferDispose(drawCountBuffers[i], drawCountUAVIndices[i]);
+                drawCountBuffers[i] = null; drawCountUAVIndices[i] = 0;
             }
 
             _cpuHeap?.Dispose();
@@ -1084,10 +1205,14 @@ namespace Freefall.Graphics
                 counterBuffers[i]?.Dispose();
                 if (counterBufferUAVIndices[i] != 0) Engine.Device.ReleaseBindlessIndex(counterBufferUAVIndices[i]);
 
+                drawCountBuffers[i]?.Dispose();
+                if (drawCountUAVIndices[i] != 0) Engine.Device.ReleaseBindlessIndex(drawCountUAVIndices[i]);
+
                 visibleIndicesUAVIndices[i] = 0;
                 visibleIndicesSRVIndices[i] = 0;
                 gpuCommandUAVIndices[i] = 0;
                 counterBufferUAVIndices[i] = 0;
+                drawCountUAVIndices[i] = 0;
             }
 
             _cpuHeap?.Dispose();

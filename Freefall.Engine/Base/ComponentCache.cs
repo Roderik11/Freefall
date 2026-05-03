@@ -113,22 +113,25 @@ namespace Freefall.Base
 
         public void Update()
         {
-            if (WakeupList.Count > 0)
+            lock (_lock)
             {
-                foreach (var component in WakeupList)
-                    component.WakeUp();
-                
-                WakeupList.Clear();
-            }
+                if (WakeupList.Count > 0)
+                {
+                    foreach (var component in WakeupList)
+                        component.WakeUp();
 
-            if (!HasUpdate) return;
+                    WakeupList.Clear();
+                }
 
-            if (HasUpdate)
-            {
-                if (IsParallel)
-                    Parallel.ForEach(UpdateList.Collection, comp => comp.Update());
-                else
-                    foreach (var comp in UpdateList.Collection) comp.Update();
+                if (!HasUpdate) return;
+
+                if (HasUpdate)
+                {
+                    if (IsParallel)
+                        Parallel.ForEach(UpdateList.Collection, comp => comp.Update());
+                    else
+                        foreach (var comp in UpdateList.Collection) comp.Update();
+                }
             }
         }
 

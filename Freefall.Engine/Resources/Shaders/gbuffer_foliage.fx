@@ -139,7 +139,7 @@ PSOutput PS(VSOutput input, bool isFrontFace : SV_IsFrontFace)
     float dist = length(input.WorldPos.xyz);
    // float alphaThreshold = lerp(0.5, 0.15, saturate((dist - 30.0) / 50.0));
    // clip(color.a - alphaThreshold);
-    clip(color.a - 0.15f);
+    clip(color.a - 0.5f);
 
     // Use interpolated dome normal from VS — provides directional response
     // while still being smoothed enough to avoid harsh self-shadowing
@@ -156,7 +156,7 @@ PSOutput PS(VSOutput input, bool isFrontFace : SV_IsFrontFace)
         translucency = tTex.Sample(Sampler, input.TexCoord).r;
     }
 
-    output.Albedo = float4(color.rgb, 1.0);
+    output.Albedo = float4(color.rgb, 0);
     output.Normal = float4(N, translucency); // store translucency in normal.w
     output.Data = float4(0.7, 0.0, 1.0, 0.5); // roughness=0.7, metal=0, ao=1, flag=vegetation
     output.Depth = input.Depth;
@@ -219,7 +219,7 @@ void PS_Shadow(ShadowVSOutput input)
     MaterialData mat = GET_MATERIAL(input.MaterialID);
     Texture2D albedoTex = ResourceDescriptorHeap[mat.AlbedoIdx];
     float alpha = albedoTex.Sample(Sampler, input.TexCoord).a;
-    clip(alpha - 0.25f);
+    clip(alpha - 0.5f);
 }
 
 technique11 GBuffer

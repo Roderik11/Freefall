@@ -48,6 +48,7 @@ namespace Freefall.Components
         public BoundingSphere BoundingSphere;
 
         private bool _boundsDirty = true;
+        private Mesh? _boundsMesh; // tracks which mesh instance bounds were computed from
 
         protected override void Awake()
         {
@@ -67,6 +68,7 @@ namespace Freefall.Components
             var corners = new Vector3[8];
             Mesh.BoundingBox.GetCorners(corners, Mesh.RootRotation * Transform.WorldMatrix);
             BoundingSphere = BoundingSphere.CreateFromPoints(corners);
+            _boundsMesh = Mesh;
             _boundsDirty = false;
         }
 
@@ -82,7 +84,7 @@ namespace Freefall.Components
             var cam = Camera.Main;
             if (cam == null) return 0;
 
-            float distanceSq = Vector3.DistanceSquared(Transform.Position, cam.Position);
+            float distanceSq = Vector3.DistanceSquared(BoundingSphere.Center, cam.Position);
             if (distanceSq < 0.001f) return 0;
 
             float diameter = BoundingSphere.Radius;
@@ -126,6 +128,10 @@ namespace Freefall.Components
         {
             if (!Enabled) return;
             if (Mesh == null) return;
+
+            // Re-dirty bounds when the mesh reference changes (stub → loaded)
+            if (Mesh != _boundsMesh) _boundsDirty = true;
+
             if (_boundsDirty) OnTransformChanged();
 
             var slot = Transform.TransformSlot;

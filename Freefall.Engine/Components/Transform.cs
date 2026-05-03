@@ -27,7 +27,7 @@ namespace Freefall.Components
         /// </summary>
         public event Action OnChanged;
 
-        public int Depth => _depth;
+        public int Depth => _parent != null ? _parent.Depth + 1 : 0;
         public int GetChildCount() => Children.Count;
         public Transform GetChild(int i) => Children.Count > i ? Children[i] : null;
         public bool IsDirty => _isDirty ? true : (_parent != null ? _parent.IsDirty : false);
@@ -72,7 +72,6 @@ namespace Freefall.Components
                 _parent?.Children.Remove(this);
                 _parent = value;
                 _parent?.Children.Add(this);
-                _depth = _parent != null ? _parent.Depth + 1 : 0;
                 SetDirty();
             }
         }

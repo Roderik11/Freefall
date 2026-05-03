@@ -51,7 +51,10 @@ void CSCompose(uint3 dispatchThreadId : SV_DispatchThreadID)
     
     // data.a flags: 0=unlit (skybox), >0=lit (0.5=vegetation, 1.0=standard PBR)
     float isLit = step(0.1, data.a);
-    float3 finalColor = lerp(albedo.rgb, ambient * albedo.rgb + light.rgb, isLit);
+    float emissiveMask = albedo.a;
+    float3 pbrLit = ambient * albedo.rgb + light.rgb;
+    float3 emissiveGlow = albedo.rgb * 2.0; // self-illumination (HDR boost)
+    float3 finalColor = lerp(albedo.rgb, lerp(pbrLit, emissiveGlow, emissiveMask), isLit);
     
     // Distance fog — sky-derived color, applied in linear HDR before tonemapping
     if (FogEnabled > 0 && isLit > 0)

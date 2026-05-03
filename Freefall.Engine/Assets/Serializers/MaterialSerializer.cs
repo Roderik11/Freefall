@@ -1,7 +1,6 @@
 using System;
 using System.Collections.Generic;
-using System.Globalization;
-using System.Numerics;
+using System.Linq;
 using System.Text;
 using Freefall.Assets;
 using Freefall.Graphics;
@@ -51,6 +50,17 @@ namespace Freefall.Assets.Serializers
                         sb.AppendLine($"  {slot}: {texture.Name}");
                 }
             }
+            // Material properties (emissive color, intensity, detail tiling, etc.)
+            if (mat.MaterialProperties.Count > 0)
+            {
+                sb.AppendLine("Parameters:");
+                foreach (var prop in mat.MaterialProperties)
+                {
+                    var formatted = prop.FormatValue();
+                    if (formatted != null)
+                        sb.AppendLine($"  {prop.Name}: {formatted}");
+                }
+            }
 
             return sb.ToString();
         }
@@ -92,12 +102,11 @@ namespace Freefall.Assets.Serializers
                         def.EffectRef = ParseRef(val);
                     else if (key != "Name" && key != "Textures" && key != "Parameters" && !string.IsNullOrEmpty(val))
                     {
-                        // DetailTiling is a numeric parameter, not a texture ref
-                        if (key == "DetailTiling")
-                            def.Parameters[key] = val;
+                        // 32-char hex = GUID texture reference; anything else = scalar parameter
+                        if (val.Length == 32 && val.All(c => "0123456789abcdefABCDEF".Contains(c)))
+                            def.TextureRefs[key] = val;
                         else
-                            // Flat format: texture refs at top level (e.g. "Roughness: 82865390...")
-                            def.TextureRefs[key] = ParseRef(val);
+                            def.Parameters[key] = val;
                     }
                 }
 

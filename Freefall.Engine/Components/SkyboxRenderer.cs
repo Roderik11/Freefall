@@ -8,6 +8,14 @@ using Vortice.Mathematics;
 
 namespace Freefall.Components
 {
+    // TODO: Sky shader is ~1ms on RTX 4080 — excessive for a flat-dome sky.
+    // Root cause: mesh_skybox.fx GetClouds() computes all noise procedurally per pixel:
+    //   - fbm(8 octaves) + fbm(4) + worley(27 iterations) + fbm(3) + fbm(3) + domain warp fbm(3)x2
+    //   - Total: ~24 octaves of sin()-based noise + 27-iter Worley per sky pixel at full res
+    // Fix: Replace procedural noise with precomputed 3D noise textures (128³ Perlin-Worley + 32³ detail).
+    //   - Single texture fetch vs 100+ trig ops per pixel
+    //   - Budget freed up could support volumetric ray-marched clouds (32-64 steps at quarter-res)
+    //     with proper volumetric lighting, god rays, and camera parallax — still under 1ms.
     public class SkyboxRenderer : Component, IUpdate, IDraw
     {
         private Mesh Mesh;
@@ -42,6 +50,9 @@ namespace Freefall.Components
 
         [ValueRange(0f, 10f)]
         public float StarBrightness = 1.0f;     // Star intensity multiplier
+
+        [ValueRange(0f, 360f)]
+        public float SunAzimuthAngle = 30.0f;    // Compass heading for sunrise in degrees (0=+X, 90=+Z, 180=-X, 270=-Z)
 
         public DirectionalLight SunLight;
 
@@ -93,13 +104,15 @@ namespace Freefall.Components
             // Calculate sun angle (0 at sunrise, PI at sunset)
             float sunAngle = (TimeOfDay / 24.0f) * MathF.PI * 2.0f - MathF.PI * 0.5f;
 
-            // Calculate sun direction - pure XY arc (no Z component)
+            // Calculate sun direction - rotated around Y by SunAzimuthAngle
             float elevation = MathF.Sin(sunAngle);
-            float azimuth = MathF.Cos(sunAngle);
-            SunDirection = new Vector3(azimuth, elevation, 0.0f); 
+            float horizontal = MathF.Cos(sunAngle);
+            float azimuthRad = SunAzimuthAngle * (MathF.PI / 180.0f);
+            SunDirection = new Vector3(horizontal * MathF.Cos(azimuthRad), elevation, horizontal * MathF.Sin(azimuthRad));
 
             // Clamp light direction to prevent it from shining from below ground
-            Vector3 lightDirection = new Vector3(azimuth, MathF.Max(0.1f, elevation), 0.0f);
+            float clampedElevation = MathF.Max(0.1f, elevation);
+            Vector3 lightDirection = new Vector3(horizontal * MathF.Cos(azimuthRad), clampedElevation, horizontal * MathF.Sin(azimuthRad));
 
             // Light should point FROM the sun (opposite of sun direction)
             Vector3 lightDir = Vector3.Normalize(lightDirection);

@@ -9,7 +9,7 @@ namespace Freefall.Assets.Loaders
     /// Unpacks PrefabData (raw YAML bytes) and stores them on the Prefab
     /// for re-parsing on each Instantiate() call.
     /// </summary>
-    [AssetLoader(typeof(Prefab))]
+    [AssetLoader(typeof(Prefab), ".prefab")]
     public class PrefabLoader : IAssetLoader
     {
         private readonly PrefabPacker _packer = new();
@@ -56,12 +56,13 @@ namespace Freefall.Assets.Loaders
             File.WriteAllBytes(savePath, prefab.SourceYaml);
             Debug.Log($"[PrefabLoader] Saved: {savePath}");
 
-            // Re-import to update the binary cache
+            // Re-import to update the binary cache (may fail for newly created files)
             var assetsDir = Engine.Project?.AssetsDirectory;
             if (!string.IsNullOrEmpty(assetsDir) && savePath.StartsWith(assetsDir))
             {
                 var relativePath = Path.GetRelativePath(assetsDir, savePath).Replace('\\', '/');
-                AssetDatabase.ImportAssetByPath(relativePath);
+                try { AssetDatabase.ImportAssetByPath(relativePath); }
+                catch { /* File not yet tracked — caller will Refresh + Import */ }
             }
         }
     }

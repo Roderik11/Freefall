@@ -343,6 +343,8 @@ namespace Freefall.Graphics
 
         public void Prepare()
         {
+            if (_graphicsDevice.IsDeviceLost) return;
+
             // Wait for swap chain to signal it's ready for a new frame
             if (_frameLatencyWaitableObject != IntPtr.Zero)
             {
@@ -463,8 +465,18 @@ namespace Freefall.Graphics
             // If the fence value is 0, this frame has never been used, so no need to wait.
             if (fenceValue != 0 && _fence.CompletedValue < fenceValue)
             {
+                // Use UINT64_MAX as device-lost sentinel (DEVICE_REMOVED returns this)
+                if (_fence.CompletedValue == ulong.MaxValue)
+                {
+                    _graphicsDevice.IsDeviceLost = true;
+                    return;
+                }
                 _fence.SetEventOnCompletion(fenceValue, _fenceEvent);
-                Kernel32.WaitForSingleObject(_fenceEvent, -1);
+                uint result = Kernel32.WaitForSingleObject(_fenceEvent, 5000);
+                if (result != 0) // WAIT_OBJECT_0 = 0
+                {
+                    _graphicsDevice.IsDeviceLost = true;
+                }
             }
         }
 

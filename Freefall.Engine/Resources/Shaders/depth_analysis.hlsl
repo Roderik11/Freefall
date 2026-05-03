@@ -23,6 +23,7 @@ cbuffer Params : register(b4)
     uint TexWidth;              // Depth texture width
     uint TexHeight;             // Depth texture height
     float NearPlane;            // Camera near plane
+    float MaxShadowDistance;    // Ignore pixels beyond this depth
 };
 
 // ============================================================
@@ -47,8 +48,8 @@ void CSDepthReduce(uint3 id : SV_DispatchThreadID, uint groupIndex : SV_GroupInd
         Texture2D<float> depthTex = ResourceDescriptorHeap[DepthTexIdx];
         float depth = depthTex[id.xy];
         
-        // Skip sky/empty pixels (depth <= 0)
-        if (depth > 0.0f)
+        // Skip sky/empty pixels (depth <= 0) and distant pixels beyond shadow range
+        if (depth > 0.0f && depth <= MaxShadowDistance)
         {
             uint depthAsUint = asuint(depth);
             InterlockedMin(gs_min, depthAsUint);
@@ -93,7 +94,7 @@ void CSDepthHistogram(uint3 id : SV_DispatchThreadID, uint groupIndex : SV_Group
         Texture2D<float> depthTex = ResourceDescriptorHeap[DepthTexIdx];
         float depth = depthTex[id.xy];
         
-        if (depth > 0.0f)
+        if (depth > 0.0f && depth <= MaxShadowDistance)
         {
             float normalized = saturate((depth - minDepth) / range);
             uint bin = min((uint)(normalized * (HISTOGRAM_BINS - 1)), HISTOGRAM_BINS - 1);

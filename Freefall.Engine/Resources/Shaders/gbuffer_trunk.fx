@@ -68,11 +68,6 @@ VSOutput VS(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_InstanceI
     StructuredBuffer<InstanceDescriptor> descriptors = ResourceDescriptorHeap[DescriptorBufIdx];
     StructuredBuffer<row_major matrix> globalTransforms = ResourceDescriptorHeap[GlobalTransformBufferIdx];
     StructuredBuffer<uint> sortedIndices = ResourceDescriptorHeap[SortedIndicesIdx];
-    StructuredBuffer<uint> indices = ResourceDescriptorHeap[IndexBufferIdx];
-    uint vertexID = indices[primitiveVertexID + BaseIndex];
-    StructuredBuffer<float3> positions = ResourceDescriptorHeap[PosBufferIdx];
-    StructuredBuffer<float3> normals = ResourceDescriptorHeap[NormBufferIdx];
-    StructuredBuffer<float2> uvs = ResourceDescriptorHeap[UVBufferIdx];
 
     uint dataPos = InstanceBaseOffset + instanceID;
     uint packedIdx = sortedIndices[dataPos];
@@ -80,6 +75,24 @@ VSOutput VS(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_InstanceI
 
     InstanceDescriptor desc = descriptors[idx];
     row_major matrix World = globalTransforms[desc.TransformSlot];
+
+    // Negative-scale winding fix (see gbuffer.fx)
+    float3x3 W3 = (float3x3)World;
+    float det = determinant(W3);
+    
+    uint fetchID = primitiveVertexID;
+    if (det < 0.0f)
+    {
+        uint triLocal = primitiveVertexID % 3;
+        uint triBase = primitiveVertexID - triLocal;
+        fetchID = triBase + (triLocal == 1u ? 2u : (triLocal == 2u ? 1u : 0u));
+    }
+
+    StructuredBuffer<uint> indices = ResourceDescriptorHeap[IndexBufferIdx];
+    uint vertexID = indices[fetchID + BaseIndex];
+    StructuredBuffer<float3> positions = ResourceDescriptorHeap[PosBufferIdx];
+    StructuredBuffer<float3> normals = ResourceDescriptorHeap[NormBufferIdx];
+    StructuredBuffer<float2> uvs = ResourceDescriptorHeap[UVBufferIdx];
 
     float3 pos = positions[vertexID];
     float3 norm = normals[vertexID];
@@ -93,7 +106,7 @@ VSOutput VS(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_InstanceI
     
     output.WorldPos = worldPos;
     output.Position = mul(mul(worldPos, View), Projection);
-    output.Normal = mul(norm, (float3x3)World);
+    output.Normal = mul(norm, W3);
     output.TexCoord = uv;
     output.TexCoord.y = 1 - output.TexCoord.y;
     output.MaterialID = desc.MaterialId;
@@ -132,6 +145,16 @@ PSOutput PS(VSOutput input)
     if (mat.MetallicIdx  != 0) { Texture2D mTex = ResourceDescriptorHeap[mat.MetallicIdx];  metal     = mTex.Sample(Sampler, input.TexCoord).r; }
     if (mat.AOIdx        != 0) { Texture2D aTex = ResourceDescriptorHeap[mat.AOIdx];        ao        = aTex.Sample(Sampler, input.TexCoord).r; }
 
+    // Emissive: sample texture, apply tint/intensity, blend into albedo
+    float emissiveMask = 0;
+    if (mat.EmissiveIdx != 0)
+    {
+        Texture2D eTex = ResourceDescriptorHeap[mat.EmissiveIdx];
+        float3 emissive = eTex.Sample(Sampler, input.TexCoord).rgb * mat.EmissiveColor * mat.EmissiveIntensity;
+        emissiveMask = max(emissive.r, max(emissive.g, emissive.b));
+        color.rgb = lerp(color.rgb, emissive, saturate(emissiveMask));
+    }
+
     float3 N = normalize(input.Normal);
     
     float3 dp1 = ddx(input.WorldPos.xyz);
@@ -158,7 +181,7 @@ PSOutput PS(VSOutput input)
             float detailFade = 1.0 - saturate((dist - 20.0) / 40.0);
             if (detailFade > 0.01)
             {
-                float detailTiling = asfloat(mat.DetailTilingPacked);
+                float detailTiling = mat.DetailTiling.x;
                 if (detailTiling <= 0.0) detailTiling = 5.0;
                 float2 detailUV = input.TexCoord * detailTiling;
                 Texture2D detailTex = ResourceDescriptorHeap[mat.DetailNormalIdx];
@@ -178,7 +201,7 @@ PSOutput PS(VSOutput input)
         N = normalize(mul(texNormal, TBN));
     }
 
-    output.Albedo = color;
+    output.Albedo = float4(color.rgb, emissiveMask);
     output.Normal = float4(N, 1.0f);
     output.Data = float4(saturate(roughness), saturate(metal), saturate(ao), 1.0);
     output.Depth = input.Depth;

@@ -26,6 +26,7 @@ namespace Freefall.Assets
             public const string DefaultNormal   = "00000000000000000000000000000004";
             public const string DefaultSpecular = "00000000000000000000000000000005";
             public const string Black           = "00000000000000000000000000000006";
+            public const string Gray            = "000000000000000000000000000000026";
 
             // texture arrays
             public const string WhiteArray      = "00000000000000000000000000000007";
@@ -54,6 +55,7 @@ namespace Freefall.Assets
         // --- Utility textures (procedural) ---
         public static Texture Black { get; private set; }
         public static Texture White { get; private set; }
+        public static Texture Gray { get; private set; }
         public static Texture FlatNormal { get; private set; }
 
         public static Texture BlackArray { get; private set; }
@@ -98,6 +100,15 @@ namespace Freefall.Assets
             }
             Black = Texture.CreateFromData(device, 4, 4, black, Format.R8G8B8A8_UNorm);
             Black.Name = "Black";
+
+            // Gray
+            byte[] gray = new byte[4 * 4 * 4];
+            for (int i = 0; i < gray.Length; i += 4)
+            {
+                gray[i] = 128; gray[i + 1] = 128; gray[i + 2] = 128; gray[i + 3] = 255;
+            }
+            Gray = Texture.CreateFromData(device, 4, 4, gray, Format.R8G8B8A8_UNorm);
+            Gray.Name = "Gray";
 
             // Flat normal map (tangent-space up: 128,128,255)
             byte[] normal = new byte[4 * 4 * 4];
@@ -160,6 +171,7 @@ namespace Freefall.Assets
         {
             manager.RegisterAsset(Guids.White, White);
             manager.RegisterAsset(Guids.Black, Black);
+            manager.RegisterAsset(Guids.Gray, Gray);
             manager.RegisterAsset(Guids.FlatNormal, FlatNormal);
             manager.RegisterAsset(Guids.WhiteArray, WhiteArray);
             manager.RegisterAsset(Guids.BlackArray, BlackArray);

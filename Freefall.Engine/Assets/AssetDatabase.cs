@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -21,17 +22,17 @@ namespace Freefall.Assets
         public static FreefallProject Project { get; private set; }
 
         // Source GUID → relative source path
-        private static readonly Dictionary<string, string> _guidToPath = new(StringComparer.OrdinalIgnoreCase);
+        private static readonly ConcurrentDictionary<string, string> _guidToPath = new(StringComparer.OrdinalIgnoreCase);
         // Relative source path → source GUID
-        private static readonly Dictionary<string, string> _pathToGuid = new(StringComparer.OrdinalIgnoreCase);
+        private static readonly ConcurrentDictionary<string, string> _pathToGuid = new(StringComparer.OrdinalIgnoreCase);
         // Source GUID → full meta data
-        private static readonly Dictionary<string, MetaFile> _guidToMeta = new(StringComparer.OrdinalIgnoreCase);
+        private static readonly ConcurrentDictionary<string, MetaFile> _guidToMeta = new(StringComparer.OrdinalIgnoreCase);
         // Subasset GUID → source GUID (for reverse lookup)
-        private static readonly Dictionary<string, string> _subAssetToSource = new(StringComparer.OrdinalIgnoreCase);
+        private static readonly ConcurrentDictionary<string, string> _subAssetToSource = new(StringComparer.OrdinalIgnoreCase);
         // Name → subasset entries (for user-facing Load("name"), supports multiple types per name)
-        private static readonly Dictionary<string, List<SubAssetEntry>> _nameToSubAssets = new(StringComparer.OrdinalIgnoreCase);
+        private static readonly ConcurrentDictionary<string, List<SubAssetEntry>> _nameToSubAssets = new(StringComparer.OrdinalIgnoreCase);
         // Source GUID → cache type name (for simple assets where source GUID = cache key)
-        private static readonly Dictionary<string, string> _sourceGuidCacheType = new(StringComparer.OrdinalIgnoreCase);
+        private static readonly ConcurrentDictionary<string, string> _sourceGuidCacheType = new(StringComparer.OrdinalIgnoreCase);
 
         // Known importable extensions (discovered from AssetImporter attributes)
         private static readonly HashSet<string> _importableExtensions = new(StringComparer.OrdinalIgnoreCase);
@@ -39,11 +40,24 @@ namespace Freefall.Assets
         // Extension → IImporter type (discovered at init)
         private static readonly Dictionary<string, Type> _importersByExtension = new(StringComparer.OrdinalIgnoreCase);
 
+        // Extension → import priority (from AssetImporterAttribute.ImportPriority)
+        private static readonly Dictionary<string, int> _importerPriority = new(StringComparer.OrdinalIgnoreCase);
+
         // Artifact type name → packer instance (discovered at init)
         private static readonly Dictionary<string, object> _packers = new(StringComparer.OrdinalIgnoreCase);
 
         // Artifact type name → cache file extension (discovered from AssetPackerAttribute)
         private static readonly Dictionary<string, string> _cacheExtensions = new(StringComparer.OrdinalIgnoreCase);
+
+        // ── Thumbnail tracking ──
+        // GUID → thumbnail file path (absolute). Populated by ScanThumbnails().
+        private static readonly ConcurrentDictionary<string, string> _guidToThumb = new(StringComparer.OrdinalIgnoreCase);
+        // GUID → loaded Texture for Squid display. Populated lazily by GetThumbnail().
+        private static readonly ConcurrentDictionary<string, Graphics.Texture> _thumbTextures = new(StringComparer.OrdinalIgnoreCase);
+        // Asset type → thumbnail generator instance (discovered from ThumbnailGeneratorAttribute)
+        private static readonly Dictionary<Type, IThumbnailGenerator> _thumbGenerators = new();
+        // Data type name → runtime Type (reverse of AssetTypeAliasAttribute, built during discovery)
+        private static readonly Dictionary<string, Type> _typeAliases = new(StringComparer.OrdinalIgnoreCase);
 
         private static readonly JsonSerializerOptions _jsonOptions = new()
         {
@@ -69,8 +83,10 @@ namespace Freefall.Assets
             DiscoverImporters();
             DiscoverPackers();
             ScanAndSync();
+            ScanThumbnails();
+            CleanOrphanedThumbnails();
             Debug.Log($"[AssetDatabase] Initialized: {_guidToMeta.Count} assets tracked, " +
-                      $"{_importersByExtension.Count} importers, {_packers.Count} packers");
+                      $"{_importersByExtension.Count} importers, {_packers.Count} packers, {_guidToThumb.Count} thumbnails");
         }
 
         /// <summary>
@@ -86,17 +102,16 @@ namespace Freefall.Assets
         /// </summary>
         public static void ImportAll()
         {
-            int imported = 0;
-            foreach (var meta in _guidToMeta.Values.ToList())
-            {
-                if (NeedsReimport(meta))
-                {
-                    ImportAsset(meta);
-                    imported++;
-                }
-            }
-            if (imported > 0)
-                Debug.Log($"[AssetDatabase] Imported {imported} assets");
+            var dirtyMetas = _guidToMeta.Values
+                .Where(m => NeedsReimport(m))
+                .OrderBy(m => GetImportPriority(m))
+                .ToList();
+
+            foreach (var meta in dirtyMetas)
+                ImportAsset(meta);
+
+            if (dirtyMetas.Count > 0)
+                Debug.Log($"[AssetDatabase] Imported {dirtyMetas.Count} assets");
         }
 
         /// <summary>
@@ -108,7 +123,10 @@ namespace Freefall.Assets
             Action<string> progress = null,
             System.Threading.CancellationToken ct = default)
         {
-            var dirtyMetas = _guidToMeta.Values.Where(m => NeedsReimport(m)).ToList();
+            var dirtyMetas = _guidToMeta.Values
+                .Where(m => NeedsReimport(m))
+                .OrderBy(m => GetImportPriority(m))
+                .ToList();
             if (dirtyMetas.Count == 0)
             {
                 return;
@@ -126,30 +144,34 @@ namespace Freefall.Assets
                     MaxDegreeOfParallelism = Environment.ProcessorCount,
                     CancellationToken = ct
                 };
-                System.Threading.Tasks.Parallel.ForEach(dirtyMetas, options, meta =>
+
+                // Process each priority group sequentially, assets within a group in parallel
+                var groups = dirtyMetas.GroupBy(m => GetImportPriority(m)).OrderBy(g => g.Key);
+                foreach (var group in groups)
                 {
-                    var current = System.Threading.Interlocked.Increment(ref done);
-                    // Throttle progress to avoid flooding the UI thread
-                    long now = Environment.TickCount64;
-                    long last = System.Threading.Interlocked.Read(ref lastReportTicks);
-                    if (now - last > 250 && System.Threading.Interlocked.CompareExchange(ref lastReportTicks, now, last) == last)
+                    System.Threading.Tasks.Parallel.ForEach(group, options, meta =>
                     {
-                        progress?.Invoke($"[{current}/{dirtyMetas.Count}] {meta.SourcePath}");
-                    }
-                    try
-                    {
-                        ImportAsset(meta);
-                    }
-                    catch (OperationCanceledException) { throw; }
-                    catch (Exception ex)
-                    {
-                        Debug.LogWarning("AssetDatabase", $"Unhandled import error: {meta.SourcePath} — {ex.Message}");
-                        // Stamp so we don't retry next launch
-                        meta.LastImported = DateTime.UtcNow;
-                        WriteMetaFile(meta);
-                        System.Threading.Interlocked.Increment(ref failed);
-                    }
-                });
+                        var current = System.Threading.Interlocked.Increment(ref done);
+                        long now = Environment.TickCount64;
+                        long last = System.Threading.Interlocked.Read(ref lastReportTicks);
+                        if (now - last > 250 && System.Threading.Interlocked.CompareExchange(ref lastReportTicks, now, last) == last)
+                        {
+                            progress?.Invoke($"[{current}/{dirtyMetas.Count}] {meta.SourcePath}");
+                        }
+                        try
+                        {
+                            ImportAsset(meta);
+                        }
+                        catch (OperationCanceledException) { throw; }
+                        catch (Exception ex)
+                        {
+                            Debug.LogWarning("AssetDatabase", $"Unhandled import error: {meta.SourcePath} — {ex.Message}");
+                            meta.LastImported = DateTime.UtcNow;
+                            WriteMetaFile(meta);
+                            System.Threading.Interlocked.Increment(ref failed);
+                        }
+                    });
+                }
                 progress?.Invoke($"Done — {done - failed} imported, {failed} failed.");
             }, ct);
         }
@@ -206,13 +228,19 @@ namespace Freefall.Assets
             if (_pathToGuid.TryGetValue(normalized, out var pathGuid))
             {
                 // Compound asset: find the subasset with matching data type
-                if (_guidToMeta.TryGetValue(pathGuid, out var meta) && meta.SubAssets.Count > 0)
+                if (_guidToMeta.TryGetValue(pathGuid, out var meta))
                 {
-                    var sub = dataType != null
-                        ? meta.SubAssets.FirstOrDefault(s => s.Type.Equals(dataType, StringComparison.OrdinalIgnoreCase))
-                        : meta.SubAssets.FirstOrDefault(s => !s.Hidden);
-                    if (sub != null)
-                        return GetCachePath(sub.Guid, sub.Type);
+                    lock (meta)
+                    {
+                        if (meta.SubAssets.Count > 0)
+                        {
+                            var sub = dataType != null
+                                ? meta.SubAssets.FirstOrDefault(s => s.Type.Equals(dataType, StringComparison.OrdinalIgnoreCase))
+                                : meta.SubAssets.FirstOrDefault(s => !s.Hidden);
+                            if (sub != null)
+                                return GetCachePath(sub.Guid, sub.Type);
+                        }
+                    }
                 }
 
                 // Simple asset: source GUID = cache key
@@ -223,11 +251,14 @@ namespace Freefall.Assets
             // 2) Subasset name lookup (for Load("assetName") pattern)
             if (_nameToSubAssets.TryGetValue(name, out var entries))
             {
-                var sub = dataType != null
-                    ? entries.FirstOrDefault(s => s.Type.Equals(dataType, StringComparison.OrdinalIgnoreCase))
-                    : entries[0];
-                if (sub != null)
-                    return GetCachePath(sub.Guid, sub.Type);
+                lock (entries)
+                {
+                    var sub = dataType != null
+                        ? entries.FirstOrDefault(s => s.Type.Equals(dataType, StringComparison.OrdinalIgnoreCase))
+                        : entries.Count > 0 ? entries[0] : null;
+                    if (sub != null)
+                        return GetCachePath(sub.Guid, sub.Type);
+                }
             }
 
             // 3) Filename-only scan for simple assets
@@ -251,8 +282,14 @@ namespace Freefall.Assets
         public static string ResolveGuidByName(string name)
         {
             // Try subasset lookup first (compound assets)
-            if (_nameToSubAssets.TryGetValue(name, out var entries) && entries.Count > 0)
-                return entries[0].Guid;
+            if (_nameToSubAssets.TryGetValue(name, out var entries))
+            {
+                lock (entries)
+                {
+                    if (entries.Count > 0)
+                        return entries[0].Guid;
+                }
+            }
 
             // Try simple asset lookup — prefer simple assets (source GUID = cache key, e.g. .staticmesh)
             // over compound source files (.fbx, .dae) that produce multiple subassets
@@ -276,6 +313,48 @@ namespace Freefall.Assets
         }
 
         /// <summary>
+        /// Resolve a friendly name to its source GUID (for simple assets) or subasset GUID.
+        /// </summary>
+        public static string FindGuidByName(string name, string type)
+        {
+            // Try simple asset lookup — prefer simple assets (source GUID = cache key, e.g. .asset)
+            // over compound source files (.fbx, .dae) that produce multiple subassets
+            string preferredGuid = null;
+            string fallback = null;
+            foreach (var kvp in _pathToGuid)
+            {
+                var fileName = Path.GetFileNameWithoutExtension(kvp.Key);
+                if (fileName.Equals(name, StringComparison.OrdinalIgnoreCase))
+                {
+                    // Prefer simple assets — they are the final definition, not a raw source
+                    if (_sourceGuidCacheType.ContainsKey(kvp.Value))
+                    {
+                        preferredGuid = kvp.Value;
+                    }
+                    fallback ??= kvp.Value;
+                }
+            }
+
+            return preferredGuid ?? fallback;
+        }
+
+        /// <summary>
+        /// Resolve a friendly name to a subasset GUID, filtered by type.
+        /// </summary>
+        public static string ResolveGuidByName(string name, string type)
+        {
+            if (_nameToSubAssets.TryGetValue(name, out var entries))
+            {
+                lock (entries)
+                {
+                    var match = entries.FirstOrDefault(e => e.Type.Equals(type, StringComparison.OrdinalIgnoreCase));
+                    if (match != null) return match.Guid;
+                }
+            }
+            return null;
+        }
+
+        /// <summary>
         /// Resolve a GUID to a human-readable name.
         /// Checks: 1) source path (file name), 2) subasset Name, 3) falls back to GUID.
         /// </summary>
@@ -289,9 +368,12 @@ namespace Freefall.Assets
             if (_subAssetToSource.TryGetValue(guid, out var sourceGuid) &&
                 _guidToMeta.TryGetValue(sourceGuid, out var meta))
             {
-                var sub = meta.SubAssets.FirstOrDefault(s => s.Guid == guid);
-                if (sub != null)
-                    return sub.Name;
+                lock (meta)
+                {
+                    var sub = meta.SubAssets.FirstOrDefault(s => s.Guid == guid);
+                    if (sub != null)
+                        return sub.Name;
+                }
             }
 
             return guid;
@@ -313,24 +395,35 @@ namespace Freefall.Assets
             // Try as subasset GUID
             if (_subAssetToSource.TryGetValue(guid, out var sourceGuid))
             {
-                var meta = _guidToMeta[sourceGuid];
-                var sub = meta.SubAssets.FirstOrDefault(s => s.Guid == guid);
-                if (sub != null && (dataTypeName == null || sub.Type.Equals(dataTypeName, StringComparison.OrdinalIgnoreCase)))
-                    return GetCachePath(sub.Guid, sub.Type);
+                if (_guidToMeta.TryGetValue(sourceGuid, out var meta))
+                {
+                    lock (meta)
+                    {
+                        var sub = meta.SubAssets.FirstOrDefault(s => s.Guid == guid);
+                        if (sub != null && (dataTypeName == null || sub.Type.Equals(dataTypeName, StringComparison.OrdinalIgnoreCase)))
+                            return GetCachePath(sub.Guid, sub.Type);
+                    }
+                }
             }
 
             // Try as source GUID for a compound asset → find matching subasset
-            if (_guidToMeta.TryGetValue(guid, out var compoundMeta) && compoundMeta.SubAssets.Count > 0)
+            if (_guidToMeta.TryGetValue(guid, out var compoundMeta))
             {
-                SubAssetEntry primary;
-                if (dataTypeName != null)
-                    primary = compoundMeta.SubAssets.FirstOrDefault(s => s.Type.Equals(dataTypeName, StringComparison.OrdinalIgnoreCase));
-                else
-                    primary = compoundMeta.SubAssets.FirstOrDefault(s => !s.Hidden)
-                           ?? compoundMeta.SubAssets[0];
+                lock (compoundMeta)
+                {
+                    if (compoundMeta.SubAssets.Count > 0)
+                    {
+                        SubAssetEntry primary;
+                        if (dataTypeName != null)
+                            primary = compoundMeta.SubAssets.FirstOrDefault(s => s.Type.Equals(dataTypeName, StringComparison.OrdinalIgnoreCase));
+                        else
+                            primary = compoundMeta.SubAssets.FirstOrDefault(s => !s.Hidden)
+                                   ?? compoundMeta.SubAssets[0];
 
-                if (primary != null)
-                    return GetCachePath(primary.Guid, primary.Type);
+                        if (primary != null)
+                            return GetCachePath(primary.Guid, primary.Type);
+                    }
+                }
             }
 
             return null;
@@ -366,21 +459,25 @@ namespace Freefall.Assets
             if (!_guidToMeta.TryGetValue(sourceGuid, out var meta))
                 return null;
 
-            var existing = meta.SubAssets.FirstOrDefault(
-                s => s.Type == type && s.Name == name);
-
-            if (existing != null)
-                return existing.Guid;
-
-            var subGuid = System.Guid.NewGuid().ToString("N");
-            var entry = new SubAssetEntry
+            string subGuid;
+            lock (meta)
             {
-                Guid = subGuid,
-                Name = name,
-                Type = type,
-                Hidden = hidden
-            };
-            meta.SubAssets.Add(entry);
+                var existing = meta.SubAssets.FirstOrDefault(
+                    s => s.Type == type && s.Name == name);
+
+                if (existing != null)
+                    return existing.Guid;
+
+                subGuid = System.Guid.NewGuid().ToString("N");
+                var entry = new SubAssetEntry
+                {
+                    Guid = subGuid,
+                    Name = name,
+                    Type = type,
+                    Hidden = hidden
+                };
+                meta.SubAssets.Add(entry);
+            }
             WriteMetaFile(meta);
 
             // Register for runtime lookup
@@ -449,6 +546,38 @@ namespace Freefall.Assets
             return importer;
         }
 
+        /// <summary>
+        /// Save modified importer settings to the meta file and reimport the asset.
+        /// Used by the inspector "Apply & Reimport" button.
+        /// </summary>
+        public static void SaveImporterAndReimport(string guid, IImporter importer)
+        {
+            // Resolve to source GUID (in case we got a sub-asset GUID)
+            if (_subAssetToSource.TryGetValue(guid, out var sourceGuid))
+                guid = sourceGuid;
+
+            if (!_guidToMeta.TryGetValue(guid, out var meta))
+            {
+                Debug.LogWarning("AssetDatabase", $"Cannot save importer settings: unknown GUID {guid}");
+                return;
+            }
+
+            // Serialize current importer state to the meta file
+            var importerType = importer.GetType();
+            try { meta.ImporterSettings = System.Text.Json.JsonSerializer.Serialize(importer, importerType, _importerJsonOptions); }
+            catch (Exception ex)
+            {
+                Debug.LogWarning("AssetDatabase", $"Failed to serialize importer settings: {ex.Message}");
+                return;
+            }
+
+            WriteMetaFile(meta);
+            Debug.Log($"[AssetDatabase] Saved importer settings for {meta.SourcePath}");
+
+            // Reimport with the new settings
+            ImportAsset(meta);
+        }
+
         // ── Core Logic ──
 
         private static void Clear()
@@ -461,7 +590,13 @@ namespace Freefall.Assets
             _sourceGuidCacheType.Clear();
             _importableExtensions.Clear();
             _importersByExtension.Clear();
+            _importerPriority.Clear();
             _packers.Clear();
+            _guidToThumb.Clear();
+            _thumbTextures.Clear();
+
+            _thumbGenerators.Clear();
+            _typeAliases.Clear();
         }
 
         /// <summary>
@@ -491,7 +626,8 @@ namespace Freefall.Assets
                             if (!_importersByExtension.ContainsKey(normalized) ||
                                 !typeof(IImporter).IsAssignableFrom(_importersByExtension[normalized]))
                             {
-                                _importersByExtension[normalized] = type;
+                            _importersByExtension[normalized] = type;
+                                _importerPriority[normalized] = attr.ImportPriority;
                             }
                         }
                     }
@@ -729,7 +865,7 @@ namespace Freefall.Assets
             var oldNormalized = NormalizePath(oldRelative);
             var newNormalized = NormalizePath(newRelative);
 
-            _pathToGuid.Remove(oldNormalized);
+            _pathToGuid.TryRemove(oldNormalized, out _);
             _pathToGuid[newNormalized] = guid;
             _guidToPath[guid] = newRelative;
 
@@ -753,21 +889,21 @@ namespace Freefall.Assets
             _pathToGuid[normalized] = meta.Guid;
             _guidToMeta[meta.Guid] = meta;
 
-            if (meta.SubAssets.Count > 0)
+            lock (meta)
             {
-                // Compound asset: register subasset GUIDs
-                foreach (var sub in meta.SubAssets)
+                if (meta.SubAssets.Count > 0)
                 {
-                    _subAssetToSource[sub.Guid] = meta.Guid;
-                    if (!_nameToSubAssets.TryGetValue(sub.Name, out var list))
-                        _nameToSubAssets[sub.Name] = list = new List<SubAssetEntry>();
-                    list.Add(sub);
+                    foreach (var sub in meta.SubAssets)
+                    {
+                        _subAssetToSource[sub.Guid] = meta.Guid;
+                        var list = _nameToSubAssets.GetOrAdd(sub.Name, _ => new List<SubAssetEntry>());
+                        lock (list) { list.Add(sub); }
+                    }
                 }
-            }
-            else if (!string.IsNullOrEmpty(meta.MainAssetType))
-            {
-                // Simple asset: source GUID IS the cache key
-                _sourceGuidCacheType[meta.Guid] = meta.MainAssetType;
+                else if (!string.IsNullOrEmpty(meta.MainAssetType))
+                {
+                    _sourceGuidCacheType[meta.Guid] = meta.MainAssetType;
+                }
             }
         }
 
@@ -810,6 +946,16 @@ namespace Freefall.Assets
                 return true;
 
             return false;
+        }
+
+        /// <summary>
+        /// Import priority from AssetImporterAttribute. Lower = earlier.
+        /// Falls back to int.MaxValue for unknown extensions.
+        /// </summary>
+        private static int GetImportPriority(MetaFile meta)
+        {
+            var ext = Path.GetExtension(meta.SourcePath);
+            return _importerPriority.TryGetValue(ext, out var priority) ? priority : int.MaxValue;
         }
 
         private static void ImportAsset(MetaFile meta)
@@ -862,10 +1008,15 @@ namespace Freefall.Assets
 
             // Pack artifacts to Cache/
             // Save existing state so we can preserve GUIDs on reimport
-            var oldSubAssets = new List<SubAssetEntry>(meta.SubAssets);
-            var oldMainAssetType = meta.MainAssetType;
-            meta.SubAssets.Clear();
-            meta.MainAssetType = null;
+            List<SubAssetEntry> oldSubAssets;
+            string oldMainAssetType;
+            lock (meta)
+            {
+                oldSubAssets = new List<SubAssetEntry>(meta.SubAssets);
+                oldMainAssetType = meta.MainAssetType;
+                meta.SubAssets.Clear();
+                meta.MainAssetType = null;
+            }
 
             if (result.Artifacts.Count == 1 && !result.Compound)
             {
@@ -876,6 +1027,13 @@ namespace Freefall.Assets
                 Directory.CreateDirectory(Path.GetDirectoryName(cachePath));
                 PackArtifact(artifact, cachePath);
                 meta.MainAssetType = dataTypeName;
+
+                // Store semantic type when it differs from packer type
+                // (e.g. artifact.Type = "PCGGraph" but dataTypeName = "AssetDefinitionData")
+                if (!string.IsNullOrEmpty(artifact.Type) && artifact.Type != dataTypeName)
+                    meta.MainSemanticType = artifact.Type;
+                else
+                    meta.MainSemanticType = null;
             }
             else
             {
@@ -899,13 +1057,62 @@ namespace Freefall.Assets
 
                     if (PackArtifact(artifact, cachePath))
                     {
-                        meta.SubAssets.Add(new SubAssetEntry
+                        lock (meta)
                         {
-                            Guid = subGuid,
-                            Name = artifact.Name,
-                            Type = dataTypeName,
-                            Hidden = artifact.Hidden,
-                        });
+                            meta.SubAssets.Add(new SubAssetEntry
+                            {
+                                Guid = subGuid,
+                                Name = artifact.Name,
+                                Type = dataTypeName,
+                                AssetType = artifact.Type != dataTypeName ? artifact.Type : null,
+                                Hidden = artifact.Hidden,
+                            });
+                        }
+                    }
+                }
+            }
+
+            // ── Post-import: emit additional artifacts that reference first-pass GUIDs ──
+            if (importer is IPostImporter postImporter)
+            {
+                List<ImportArtifact> extras = null;
+                List<SubAssetEntry> subAssetSnapshot;
+                lock (meta) { subAssetSnapshot = new List<SubAssetEntry>(meta.SubAssets); }
+
+                try
+                {
+                    extras = postImporter.PostImport(sourcePath, subAssetSnapshot);
+                }
+                catch (Exception ex)
+                {
+                    Debug.LogWarning("AssetDatabase", $"PostImport failed: {meta.SourcePath} — {ex.Message}");
+                }
+
+                if (extras != null)
+                {
+                    foreach (var artifact in extras)
+                    {
+                        var dataTypeName = artifact.Data.GetType().Name;
+                        var existing = oldSubAssets.Find(s => s.Name == artifact.Name && s.Type == dataTypeName);
+                        var subGuid = existing?.Guid ?? System.Guid.NewGuid().ToString("N");
+
+                        var cachePath = GetCachePath(subGuid, dataTypeName);
+                        Directory.CreateDirectory(Path.GetDirectoryName(cachePath));
+
+                        if (PackArtifact(artifact, cachePath))
+                        {
+                            lock (meta)
+                            {
+                                meta.SubAssets.Add(new SubAssetEntry
+                                {
+                                    Guid = subGuid,
+                                    Name = artifact.Name,
+                                    Type = dataTypeName,
+                                    AssetType = artifact.Type != dataTypeName ? artifact.Type : null,
+                                    Hidden = artifact.Hidden,
+                                });
+                            }
+                        }
                     }
                 }
             }
@@ -916,7 +1123,7 @@ namespace Freefall.Assets
 
             // Serialize importer state (includes auto-populated Parts list, user overrides, etc.)
             try { meta.ImporterSettings = System.Text.Json.JsonSerializer.Serialize(importer, importerType, _importerJsonOptions); }
-            catch { meta.ImporterSettings = null; }
+            catch (Exception ex) { Debug.LogWarning("AssetDatabase", $"Failed to serialize importer settings for {meta.SourcePath}: {ex.Message}"); meta.ImporterSettings = null; }
 
             WriteMetaFile(meta);
 
@@ -1007,12 +1214,377 @@ namespace Freefall.Assets
         }
 
         /// <summary>
+        /// Callback invoked when a thumbnail texture is loaded for the first time.
+        /// The Editor hooks this to inject the texture into SquidRenderer.
+        /// </summary>
+        public static Action<string, Graphics.Texture> OnThumbnailLoaded;
+
+        /// <summary>
+        /// Get a thumbnail texture name for an asset by GUID.
+        /// Lazy-loads the thumbnail PNG from disk on first access.
+        /// Returns InternalAssets.White name if no thumbnail exists.
+        /// </summary>
+        public static string GetThumbnail(string guid)
+        {
+            var fallback = InternalAssets.Gray?.Name ?? "";
+
+            if (string.IsNullOrEmpty(guid))
+                return fallback;
+
+            // Already loaded?
+            if (_thumbTextures.TryGetValue(guid, out var tex))
+                return tex?.Name ?? fallback;
+            // Thumbnail file exists?
+            if (!_guidToThumb.TryGetValue(guid, out var thumbPath) || !File.Exists(thumbPath))
+                return fallback;
+
+            // Lazy load the PNG into a GPU texture
+            try
+            {
+                var texture = Graphics.Texture.LoadFromFile(Engine.Device, thumbPath);
+                if (texture != null)
+                {
+                    texture.Name = $"thumb_{guid}";
+                    _thumbTextures[guid] = texture;
+                    OnThumbnailLoaded?.Invoke(texture.Name, texture);
+                    return texture.Name;
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning("AssetDatabase", $"Failed to load thumbnail: {thumbPath} — {ex.Message}");
+            }
+
+            return fallback;
+        }
+
+        /// <summary>
         /// Get a thumbnail texture name for an asset.
-        /// Stub: returns InternalAssets.White for now.
+        /// Convenience overload that extracts the GUID from the asset.
         /// </summary>
         public static string GetThumbnail(Asset asset)
         {
-            return InternalAssets.White?.Name ?? "";
+            return GetThumbnail(asset?.Guid);
+        }
+
+        // ── Thumbnail Management ──
+
+        /// <summary>
+        /// Compute the thumbnail file path for a GUID: Thumbnails/{guid[..2]}/{guid}.png
+        /// </summary>
+        public static string GetThumbnailPath(string guid)
+        {
+            if (Project == null || string.IsNullOrEmpty(guid)) return null;
+            var bucket = guid[..2];
+            return Path.Combine(Project.ThumbnailsDirectory, bucket, $"{guid}.png");
+        }
+
+        /// <summary>
+        /// Check if a thumbnail exists for the given GUID.
+        /// </summary>
+        public static bool HasThumbnail(string guid)
+        {
+            return _guidToThumb.ContainsKey(guid);
+        }
+
+        /// <summary>
+        /// Register a thumbnail after generation.
+        /// </summary>
+        public static void RegisterThumbnail(string guid, string path)
+        {
+            _guidToThumb[guid] = path;
+        }
+
+        /// <summary>
+        /// Mark a thumbnail as permanently failed. Writes a .fail marker file to disk
+        /// so it survives restarts and is never retried.
+        /// </summary>
+        public static void MarkThumbnailFailed(string guid)
+        {
+            _guidToThumb[guid] = "FAILED";
+            if (Project != null)
+            {
+                var thumbPath = GetThumbnailPath(guid);
+                if (thumbPath != null)
+                {
+                    var failPath = Path.ChangeExtension(thumbPath, ".fail");
+                    try
+                    {
+                        Directory.CreateDirectory(Path.GetDirectoryName(failPath)!);
+                        File.WriteAllBytes(failPath, Array.Empty<byte>());
+                    }
+                    catch { /* best effort */ }
+                }
+            }
+        }
+
+        /// <summary>
+        /// Scan the Thumbnails/ directory and populate _guidToThumb.
+        /// </summary>
+        private static void ScanThumbnails()
+        {
+            if (Project == null) return;
+            var thumbDir = Project.ThumbnailsDirectory;
+            if (!Directory.Exists(thumbDir)) return;
+
+            foreach (var file in Directory.EnumerateFiles(thumbDir, "*.png", SearchOption.AllDirectories))
+            {
+                var name = Path.GetFileNameWithoutExtension(file);
+                _guidToThumb[name] = file;
+            }
+
+            // Also scan .fail markers — assets that will never produce a thumbnail
+            foreach (var file in Directory.EnumerateFiles(thumbDir, "*.fail", SearchOption.AllDirectories))
+            {
+                var name = Path.GetFileNameWithoutExtension(file);
+                _guidToThumb.TryAdd(name, "FAILED");
+            }
+        }
+
+        /// <summary>
+        /// Delete thumbnails whose GUID no longer maps to a tracked asset.
+        /// </summary>
+        private static void CleanOrphanedThumbnails()
+        {
+            if (Project == null) return;
+            var thumbDir = Project.ThumbnailsDirectory;
+            if (!Directory.Exists(thumbDir)) return;
+
+            int removed = 0;
+            foreach (var file in Directory.EnumerateFiles(thumbDir, "*.png", SearchOption.AllDirectories))
+            {
+                var guid = Path.GetFileNameWithoutExtension(file);
+                // Check if this GUID is a known source or subasset
+                if (!_guidToMeta.ContainsKey(guid) && !_subAssetToSource.ContainsKey(guid))
+                {
+                    try
+                    {
+                        File.Delete(file);
+                        _guidToThumb.TryRemove(guid, out _);
+                        removed++;
+                    }
+                    catch { }
+                }
+            }
+
+            if (removed > 0)
+                Debug.Log($"[AssetDatabase] Cleaned {removed} orphaned thumbnails");
+        }
+
+        /// <summary>
+        /// Resolve a data type name (from meta files) to a runtime Type.
+        /// Uses the reverse alias map built during DiscoverThumbnailGenerators.
+        /// </summary>
+        private static Type ResolveAssetType(string dataTypeName)
+        {
+            if (string.IsNullOrEmpty(dataTypeName)) return null;
+            return _typeAliases.TryGetValue(dataTypeName, out var type) ? type : null;
+        }
+
+        /// <summary>
+        /// Get all tracked GUIDs that are missing thumbnails and have a registered generator.
+        /// Returns (guid, resolvedType) pairs.
+        /// </summary>
+        public static List<(string guid, Type assetType)> GetMissingThumbnails()
+        {
+            var missing = new List<(string guid, Type assetType)>();
+
+            foreach (var meta in _guidToMeta.Values)
+            {
+                // Simple asset: source GUID is the cache key
+                if (meta.MainAssetType != null)
+                {
+                    if (!_guidToThumb.ContainsKey(meta.Guid))
+                    {
+                        var type = ResolveAssetType(meta.MainAssetType);
+                        if (type != null)
+                            missing.Add((meta.Guid, type));
+                    }
+                    continue;
+                }
+
+                // Compound asset: check each subasset
+                lock (meta)
+                {
+                    foreach (var sub in meta.SubAssets)
+                    {
+                        if (sub.Hidden) continue;
+                        if (!_guidToThumb.ContainsKey(sub.Guid))
+                        {
+                            var type = ResolveAssetType(sub.AssetType ?? sub.Type);
+                            if (type != null)
+                                missing.Add((sub.Guid, type));
+                        }
+                    }
+                }
+            }
+
+            return missing;
+        }
+
+        /// <summary>
+        /// Discover IThumbnailGenerator implementations marked with [ThumbnailGenerator].
+        /// Also builds the reverse type alias map from AssetTypeAliasAttribute.
+        /// Must be called after both Engine and Editor assemblies are loaded.
+        /// </summary>
+        public static void DiscoverThumbnailGenerators()
+        {
+            _thumbGenerators.Clear();
+            _typeAliases.Clear();
+
+            var assemblies = new[] { Assembly.GetExecutingAssembly(), Assembly.GetEntryAssembly() };
+
+            // Build reverse alias map: data type name string → runtime Type
+            // e.g. "MeshData" → typeof(Mesh), "PrefabData" → typeof(Prefab)
+            foreach (var assembly in assemblies)
+            {
+                if (assembly == null) continue;
+                try
+                {
+                    foreach (var type in assembly.GetTypes())
+                    {
+                        if (!typeof(Asset).IsAssignableFrom(type)) continue;
+                        _typeAliases[type.Name] = type;
+
+                        var aliases = type.GetCustomAttributes<AssetTypeAliasAttribute>();
+                        foreach (var alias in aliases)
+                            _typeAliases[alias.Alias] = type;
+                    }
+                }
+                catch (System.Reflection.ReflectionTypeLoadException) { }
+            }
+
+            // Discover thumbnail generator implementations.
+            // Cache instances so one class with multiple [ThumbnailGenerator] attributes
+            // only gets instantiated once.
+            var instances = new Dictionary<Type, IThumbnailGenerator>();
+            foreach (var assembly in assemblies)
+            {
+                if (assembly == null) continue;
+                try
+                {
+                    foreach (var type in assembly.GetTypes())
+                    {
+                        if (type.IsAbstract || type.IsInterface) continue;
+                        if (!typeof(IThumbnailGenerator).IsAssignableFrom(type)) continue;
+
+                        var attrs = type.GetCustomAttributes<ThumbnailGeneratorAttribute>();
+                        foreach (var attr in attrs)
+                        {
+                            if (_thumbGenerators.ContainsKey(attr.AssetType)) continue;
+
+                            if (!instances.TryGetValue(type, out var instance))
+                            {
+                                instance = (IThumbnailGenerator)Activator.CreateInstance(type);
+                                instances[type] = instance;
+                            }
+                            _thumbGenerators[attr.AssetType] = instance;
+                        }
+                    }
+                }
+                catch (System.Reflection.ReflectionTypeLoadException) { }
+            }
+
+            Debug.Log($"[AssetDatabase] Discovered {_thumbGenerators.Count} thumbnail generators, {_typeAliases.Count} type aliases");
+        }
+
+        /// <summary>
+        /// Generate thumbnails for all tracked assets that don't have one yet.
+        /// Creates a shared GPU rendering context for the batch.
+        /// Must be called on the main thread (uses GPU).
+        /// </summary>
+        public static void GenerateMissingThumbnails(Action<string> progress = null,
+            Func<IDisposable> rendererFactory = null)
+        {
+            if (_thumbGenerators.Count == 0)
+                DiscoverThumbnailGenerators();
+
+            var missing = GetMissingThumbnails();
+            if (missing.Count == 0) return;
+
+            // Flush streaming uploads so meshes have valid GPU buffers
+            Graphics.StreamingManager.Instance?.Flush();
+
+            progress?.Invoke($"Generating {missing.Count} thumbnails...");
+
+            // Snapshot cache: preserve lightweight/shared assets (Effects, Materials).
+            // Meshes and Textures must be evicted after each thumb to stay within
+            // MeshRegistry capacity (4096 slots). We use EvictForThumbnails which
+            // frees GPU buffers and MeshRegistry slots but does NOT release bindless
+            // descriptor indices — recycling those mid-batch causes DEVICE_REMOVED.
+            var cacheSnapshot = new HashSet<string>();
+            foreach (var key in Engine.Assets.GetCachedKeys())
+            {
+                var asset = Engine.Assets.TryGet(key);
+                if (asset is Graphics.Mesh || asset is Graphics.Texture) continue;
+                cacheSnapshot.Add(key);
+            }
+
+            // Create the shared rendering context for this batch
+            using var renderer = rendererFactory?.Invoke();
+
+            int generated = 0;
+            int skipped = 0;
+            int index = 0;
+
+            foreach (var (guid, assetType) in missing)
+            {
+                index++;
+
+                if (!_thumbGenerators.TryGetValue(assetType, out var generator))
+                {
+                    skipped++;
+                    continue;
+                }
+
+                // Abort if GPU is dead (DEVICE_REMOVED from a prior thumbnail)
+                if (Engine.Device.IsDeviceLost)
+                {
+                    Debug.LogWarning("AssetDatabase", $"GPU device lost before thumbnail #{index} — aborting");
+                    break;
+                }
+
+                try
+                {
+                    progress?.Invoke($"Thumbnail {generated + skipped + 1}/{missing.Count}: {assetType.Name}");
+                    if (generator.Generate(guid, Engine.Assets, renderer))
+                    {
+                        generated++;
+                        Debug.Log($"[Thumb] OK #{index}: {guid}");
+                    }
+                    else
+                    {
+                        Debug.Log($"[Thumb] SKIP #{index} (no result): {guid}");
+                        MarkThumbnailFailed(guid);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Debug.LogWarning("AssetDatabase", $"Thumbnail #{index} failed for {guid} ({assetType.Name}): {ex.Message}");
+                    MarkThumbnailFailed(guid);
+                }
+
+                if (Engine.Device.IsDeviceLost)
+                {
+                    Debug.LogWarning("AssetDatabase", $"GPU device lost AFTER Generate #{index} ({guid})");
+                    break;
+                }
+
+                // Evict after each thumbnail to stay within MeshRegistry capacity.
+                // Flush copy queue first so no pending uploads target buffers we're about to free.
+                Graphics.StreamingManager.Instance?.Flush();
+
+                if (Engine.Device.IsDeviceLost)
+                {
+                    Debug.LogWarning("AssetDatabase", $"GPU device lost AFTER Flush #{index} ({guid})");
+                    break;
+                }
+
+                Engine.Assets.EvictAllExcept(cacheSnapshot, leakBindlessIndices: true);
+            }
+
+            if (generated > 0)
+                Debug.Log($"[AssetDatabase] Generated {generated} thumbnails ({skipped} skipped, no generator)");
         }
     }
 }

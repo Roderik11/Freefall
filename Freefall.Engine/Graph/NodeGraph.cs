@@ -4,12 +4,14 @@ using System.Linq;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using Freefall.Assets;
 using Freefall.Base;
 
 namespace Freefall.Graph
 {
 
-    public class NodeGraph //: IOnDeserialize
+    [Serializable]
+    public class NodeGraph : Asset
     {
         public List<Node> Nodes = new List<Node>();
         public List<Connection> Connections = new List<Connection>();
@@ -183,6 +185,8 @@ namespace Freefall.Graph
 
             foreach (var connection in Connections)
             {
+                if (connection.PortA == null || connection.PortB == null) continue;
+
                 // Determine which node is the source (output) and which is the sink (input)
                 int sourceID, sinkID;
                 if (connection.PortA.Type == Port.InOut.Output)
@@ -233,23 +237,37 @@ namespace Freefall.Graph
             return h1 ^ (h2 + unchecked((int)0x9e3779b9) + (h1 << 6) + (h1 >> 2));
         }
 
-        //public void OnDeserialize(JSON json)
-        //{
-        //    int max = 0;
-        //    foreach (var node in Nodes)
-        //    {
-        //        node.CreatePorts(this);
-        //        hashedNodes.Add(node.ID, node);
-        //        max = Math.Max(max, node.ID);
-        //    }
+        /// <summary>
+        /// Rebuild runtime state after deserialization.
+        /// Recreates ports, hashed node lookup, and connection port references.
+        /// Must be called after loading from YAML.
+        /// </summary>
+        public void RebuildAfterLoad()
+        {
+            hashedNodes.Clear();
 
-        //    nodeIDcounter = max;
+            int max = 0;
+            foreach (var node in Nodes)
+            {
+                node.CreatePorts(this);
+                hashedNodes[node.ID] = node;
+                max = Math.Max(max, node.ID);
+            }
 
-        //    foreach(var connection in Connections)
-        //    {
-        //        connection.PortA = hashedNodes[connection.FromNodeID].GetPort(connection.FromFieldHash);
-        //        connection.PortB = hashedNodes[connection.ToNodeID].GetPort(connection.ToFieldHash);
-        //    }
-        //}
+            nodeIDcounter = max;
+
+            foreach (var connection in Connections)
+            {
+                if (hashedNodes.TryGetValue(connection.FromNodeID, out var fromNode))
+                    connection.PortA = fromNode.GetPort(connection.FromFieldHash);
+                if (hashedNodes.TryGetValue(connection.ToNodeID, out var toNode))
+                    connection.PortB = toNode.GetPort(connection.ToFieldHash);
+            }
+
+            // Prune connections with unresolvable ports (e.g. stale hashes from old format)
+            int removed = Connections.RemoveAll(c => c.PortA == null || c.PortB == null);
+            if (removed > 0)
+                Debug.Log($"[Graph] RebuildAfterLoad: pruned {removed} stale connection(s)");
+        }
     }
 }

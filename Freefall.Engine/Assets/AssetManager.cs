@@ -97,7 +97,46 @@ namespace Freefall.Assets
             string suffix = $":guid:{guid}";
             var keysToRemove = _assets.Keys.Where(k => k.EndsWith(suffix)).ToList();
             foreach (var key in keysToRemove)
-                _assets.TryRemove(key, out _);
+            {
+                if (_assets.TryRemove(key, out var asset) && asset is IDisposable disposable)
+                    disposable.Dispose();
+            }
+        }
+
+        /// <summary>
+        /// Snapshot all current cache keys. Used to diff before/after a batch operation.
+        /// </summary>
+        public HashSet<string> GetCachedKeys() => new(_assets.Keys);
+
+        /// <summary>
+        /// Peek at a cached asset without loading it. Returns null if not cached.
+        /// </summary>
+        public object TryGet(string key) => _assets.TryGetValue(key, out var val) ? val : null;
+
+        /// <summary>
+        /// Evict all cache entries whose keys are NOT in the provided set.
+        /// Disposes IDisposable assets. When leakBindlessIndices is true,
+        /// GPU buffers are freed but bindless descriptor indices are intentionally
+        /// leaked to prevent descriptor reuse conflicts during batch operations.
+        /// </summary>
+        public void EvictAllExcept(HashSet<string> keysToKeep, bool leakBindlessIndices = false)
+        {
+            if (leakBindlessIndices)
+                Graphics.GraphicsDevice.SuppressBindlessRelease = true;
+
+            try
+            {
+                foreach (var key in _assets.Keys)
+                {
+                    if (keysToKeep.Contains(key)) continue;
+                    if (_assets.TryRemove(key, out var asset) && asset is IDisposable disposable)
+                        disposable.Dispose();
+                }
+            }
+            finally
+            {
+                Graphics.GraphicsDevice.SuppressBindlessRelease = false;
+            }
         }
 
         /// <summary>
@@ -134,6 +173,22 @@ namespace Freefall.Assets
                 }
             }
             Debug.Log($"[AssetManager] Discovered {Loaders.Count} asset loaders");
+        }
+
+        /// <summary>
+        /// Find a loader for the given type, walking up the inheritance chain.
+        /// e.g. PCGGraph → NodeGraph → Asset → null.
+        /// </summary>
+        private static IAssetLoader FindLoader(Type assetType)
+        {
+            var type = assetType;
+            while (type != null && type != typeof(object))
+            {
+                if (Loaders.TryGetValue(type, out var loader))
+                    return loader;
+                type = type.BaseType;
+            }
+            return null;
         }
 
         /// <summary>
@@ -222,7 +277,8 @@ namespace Freefall.Assets
                 T asset = null;
 
                 // ── Primary path: cache-based loader ──
-                if (Loaders.TryGetValue(assetType, out var loader))
+                var loader = FindLoader(assetType);
+                if (loader != null)
                 {
                     try
                     {
@@ -285,7 +341,8 @@ namespace Freefall.Assets
 
 
             // Load via cache-based loader if available
-            if (Loaders.TryGetValue(assetType, out var loader))
+            var loader = FindLoader(assetType);
+            if (loader != null)
             {
                 try
                 {
@@ -354,7 +411,8 @@ namespace Freefall.Assets
             if (asset == null || string.IsNullOrEmpty(savePath)) return;
 
             var assetType = asset.GetType();
-            if (Loaders.TryGetValue(assetType, out var loader))
+            var loader = FindLoader(assetType);
+            if (loader != null)
             {
                 loader.Save(asset, savePath);
             }

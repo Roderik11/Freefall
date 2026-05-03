@@ -363,7 +363,6 @@ PSOutput PS(DSOutput input)
     float3 baseColor = lerp(ocean.OceanColor, ocean.DeepColor, depthBlend);
 
     // ── Subsurface scattering ──
-    float3 scatterColor = float3(0.006, 0.028, 0.06);
     float3 bubbleColor = float3(0.0, 0.008, 0.006);
 
     float k1 = 0.3 * H * pow(saturate(dot(L, -V)), 4.0)
@@ -371,7 +370,7 @@ PSOutput PS(DSOutput input)
     float k2 = 0.1 * NdotV * NdotV;
     float k3 = 0.08 * NdotL;
 
-    float3 scatter = ((k1 + k2) * scatterColor + k3 * scatterColor + 0.02 * bubbleColor) * sunRadiance;
+    float3 scatter = ((k1 + k2) * baseColor + k3 * baseColor + 0.02 * bubbleColor) * sunRadiance;
 
     // ── Fresnel (Schlick, precomputed for F0=0.02, roughness=0.075) ──
     float base_f = 1.0 - NdotV;
@@ -405,7 +404,7 @@ PSOutput PS(DSOutput input)
     // smoothstep softens the Jacobian transitions — without it, ACES tonemapping
     // compresses the mid-range and makes the 512² foam texture look blocky.
     float foam = smoothstep(0.0, 1.0, saturate(totalFoam));
-    float3 foamColor = float3(0.20, 0.18, 0.16); // scaled for HDR (PI intensity)
+    float3 foamColor = float3(0.70, 0.68, 0.65);
     float3 foamLit = foamColor * (0.3 + 0.7 * NdotL) * sunRadiance;
     color = lerp(color, foamLit, foam);
 
