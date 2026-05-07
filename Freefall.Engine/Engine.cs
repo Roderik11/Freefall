@@ -459,7 +459,10 @@ namespace Freefall
 
          public bool UseSSDMPyramid { get; set; } = true;
 
-         [ValueRange(0f, 500f)]
+         public bool UseSSDMLobel { get; set; } = true;
+
+
+        [ValueRange(0f, 500f)]
          public float SSDMHeightScale { get; set; } = 1f;
 
          [ValueRange(1f, 128f)]

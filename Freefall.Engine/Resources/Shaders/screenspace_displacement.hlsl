@@ -11,6 +11,7 @@
 #pragma kernel CSBuildMip
 #pragma kernel CSRefine
 #pragma kernel CSDisplaceDepth
+#pragma kernel CSLobelDescend
 
 SamplerState BilinearClamp : register(s2);
 
@@ -158,4 +159,61 @@ void CSDisplaceDepth(uint3 dtid : SV_DispatchThreadID)
     // Sample depth at the source position (bilinear for smooth result)
     float srcDepth = depthIn.SampleLevel(BilinearClamp, sourceUV, 0);
     depthOut[dtid.xy] = srcDepth;
+}
+
+// ============================================================
+// Lobel Descend — Original SSDM level-by-level descent [Lobel 2008]
+//
+// Called once per mip level, from coarsest to finest.
+// At each level: read seed from previous B level, sample A at
+// that position, subtract displacement to get new source estimate.
+// Lobel's 4-corner sampling = bilinear SampleLevel on modern GPUs.
+//
+// PrevBMipIdx = SRV of previous (coarser) B level (0 at coarsest).
+// SrcMipIdx   = SRV of pyramid A (full chain).
+// DstMipIdx   = UAV of pyramid B at current level.
+// MipCount    = current mip level being processed.
+// ============================================================
+[numthreads(8, 8, 1)]
+void CSLobelDescend(uint3 dtid : SV_DispatchThreadID)
+{
+    if (dtid.x >= DstWidth || dtid.y >= DstHeight)
+        return;
+
+    Texture2D<float2> pyramidA = ResourceDescriptorHeap[SrcMipIdx];
+    RWTexture2D<float2> dstB = ResourceDescriptorHeap[DstMipIdx];
+
+    float2 invSize = 1.0 / float2(DstWidth, DstHeight);
+    float2 myUV = (float2(dtid.xy) + 0.5) * invSize;
+    int currentMip = (int)MipCount; // repurposed: current mip level
+
+    // Early-out for zero displacement
+    float2 myDisp = pyramidA.SampleLevel(BilinearClamp, myUV, float(currentMip));
+    if (all(myDisp == 0))
+    {
+        dstB[dtid.xy] = float2(0, 0);
+        return;
+    }
+
+    // Seed: previous B level (coarser), or myUV at coarsest
+    float2 seed = myUV;
+    if (PrevBMipIdx != 0)
+    {
+        Texture2D<float2> prevB = ResourceDescriptorHeap[PrevBMipIdx];
+        seed = prevB.SampleLevel(BilinearClamp, myUV, 0);
+        if (all(seed == 0)) seed = myUV; // sentinel = identity
+    }
+
+    // Sample displacement at myUV from the coarsest mip — smooth, no folds
+    int coarseMip = (int)MipCount - 1;
+    float2 source = myUV - pyramidA.SampleLevel(BilinearClamp, myUV, float(coarseMip));
+
+    // Descend through finer mips, refining the source estimate
+    for (int mip = coarseMip - 1; mip >= 0; mip--)
+    {
+        float2 disp = pyramidA.SampleLevel(BilinearClamp, source, float(mip));
+        source = myUV - disp;
+    }
+
+    dstB[dtid.xy] = source;
 }
