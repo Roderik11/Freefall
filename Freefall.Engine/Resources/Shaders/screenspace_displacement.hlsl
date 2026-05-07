@@ -45,7 +45,8 @@ void CSDisplace(uint3 dtid : SV_DispatchThreadID)
     float2 disp = src.Load(int3(dtid.xy, 0));
     float2 invSize = 1.0 / float2(DstWidth, DstHeight);
     float2 myUV = (float2(dtid.xy) + 0.5) * invSize;
-    dst[dtid.xy] = myUV - disp * HeightScale;
+    // Store (0,0) sentinel for zero displacement to avoid half-precision UV jitter
+    dst[dtid.xy] = all(disp == 0) ? float2(0, 0) : myUV - disp * HeightScale;
 }
 
 // ============================================================
@@ -105,6 +106,14 @@ void CSRefine(uint3 dtid : SV_DispatchThreadID)
 
     float2 invSize = 1.0 / float2(DstWidth, DstHeight);
     float2 myUV = (float2(dtid.xy) + 0.5) * invSize;
+
+    // Early-out: pixels with zero displacement (meshes, sky) → sentinel (0,0).
+    float2 myDisp = pyramidA.Load(int3(dtid.xy, 0));
+    if (all(myDisp == 0))
+    {
+        dstB[dtid.xy] = float2(0, 0);
+        return;
+    }
 
     // Seed from coarsest mip (smooth displacement, no fold-over)
     int coarseMip = min((int)MipCount - 1, 7);

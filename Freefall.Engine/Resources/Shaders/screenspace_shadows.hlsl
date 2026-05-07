@@ -17,7 +17,7 @@
 
 cbuffer PushConstants : register(b3)
 {
-    uint DepthTexIdx;       // Hardware depth buffer SRV (reverse-Z: near=1, far=0)
+    uint DepthTexIdx;       // GBuffer linear depth SRV (0=sky/clear, positive=geometry)
     uint OutputUAVIdx;      // Output R8_UNORM shadow texture UAV
     uint WaveOffsetXIdx;    // Per-dispatch wave offset X (reinterpret as float)
     uint WaveOffsetYIdx;    // Per-dispatch wave offset Y (reinterpret as float)
@@ -38,7 +38,7 @@ cbuffer Params : register(b4)
     float  NearDepthValue;      // Depth buffer near plane value (1 for reverse-Z)
     uint   TexWidth;            // Depth texture width
     uint   TexHeight;           // Depth texture height
-    uint   _pad0;
+    float  NearPlane;           // Camera near plane distance (for linear→reverse-Z conversion)
 };
 
 // ============================================================
@@ -49,7 +49,11 @@ float ReadDepth(int2 coord)
     if (any(coord < 0) || coord.x >= (int)TexWidth || coord.y >= (int)TexHeight)
         return FarDepthValue;
     Texture2D<float> depthTex = ResourceDescriptorHeap[DepthTexIdx];
-    return depthTex.Load(int3(coord, 0));
+    float linearDepth = depthTex.Load(int3(coord, 0));
+    // Convert linear depth (world units) to pseudo-reverse-Z [1,0]
+    // so the rest of the algorithm works unchanged.
+    if (linearDepth <= 0) return FarDepthValue; // sky/clear
+    return NearPlane / linearDepth;
 }
 
 // ============================================================

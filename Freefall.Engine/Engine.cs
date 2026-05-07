@@ -455,17 +455,16 @@ namespace Freefall
          public float SSSShadowContrast { get; set; } = 2.0f;
 
          // Screen-Space Displacement Mapping (SSDM)
+         public bool EnableSSDM { get; set; } = true;
+
+         public bool UseSSDMPyramid { get; set; } = true;
+
          [ValueRange(0f, 500f)]
          public float SSDMHeightScale { get; set; } = 1f;
-
-         public bool UseSSDMPyramid { get; set; } = false;
-
-         [ValueRange(4f, 60f)]
-         public float SSDMMaxSearch { get; set; } = 32f;
 
          [ValueRange(1f, 128f)]
          public float PixelErrorThreshold { get; set; } = 128.0f;
 
-        public System.Numerics.Matrix4x4 FrozenViewProjection { get; set; } // VP matrix when frustum frozen
+         public System.Numerics.Matrix4x4 FrozenViewProjection { get; set; } // VP matrix when frustum frozen
     }
 }

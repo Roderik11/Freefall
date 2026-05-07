@@ -113,7 +113,7 @@ float3 StitchVertex(float3 pos, float2 rect_xy, float2 rect_size, uint stitchMas
 
 struct VertexOutput
 {
-	linear noperspective centroid float4 Position : SV_POSITION;
+	float4 Position : SV_POSITION;
 	float2 UV			: TEXCOORD0;
 	float2 UV2			: TEXCOORD1;
     float Depth			: TEXCOORD2;
@@ -207,7 +207,6 @@ struct FragmentOutput
 	float  Depth		: SV_TARGET3;
 	uint   EntityId		: SV_TARGET4;
 	float2 Displacement	: SV_TARGET5;
-	float  HWDepth		: SV_DepthGreaterEqual;
 };
 
 float3 GetNormal(float2 uv)
@@ -422,12 +421,6 @@ FragmentOutput PS(VertexOutput input)
 
     output.EntityId = (input.TransformSlot << 8u);
     output.Displacement = dispVector;
-    // HW depth: displace toward camera for view-independent SSS depth bias.
-    // Moving toward the camera always changes clip-Z consistently, regardless
-    // of view angle. Perspective division handles distance scaling naturally.
-    float3 toCamera = normalize(CameraPos - input.WorldPos);
-    float4 clipDepthDisp = mul(float4(input.WorldPos + toCamera * worldHeight, 1), ViewProjection);
-    output.HWDepth = clipDepthDisp.z / clipDepthDisp.w;
     return output;
 }
 

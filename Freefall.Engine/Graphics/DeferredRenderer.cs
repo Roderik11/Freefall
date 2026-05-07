@@ -504,7 +504,7 @@ namespace Freefall.Graphics
              // Screen-space displacement mapping: uses height buffer + depth buffer.
              // Produces displaced depth (GBuffer depth remapped through B buffer).
              // Must run BEFORE SSS so shadows see the displaced surface.
-             if (ScreenSpaceDisplacement != null)
+             if (ScreenSpaceDisplacement != null && Engine.Settings.EnableSSDM)
              {
                  PixMarker.Begin(list, "Screen-Space Displacement");
                  int sdw = (int)HeightBuffer.Native.Description.Width;
@@ -515,27 +515,24 @@ namespace Freefall.Graphics
                  PixMarker.End(list);
              }
 
-             // Transition GBuffer depth to PixelShaderResource for light pass sampling
-             Transition(list, DepthGBuffer.Native, ResourceStates.NonPixelShaderResource, ResourceStates.PixelShaderResource);
-             
-             // Screen-space shadows: ray-march against hardware depth (includes heightmap bias via SV_DepthGreaterEqual)
+             // Screen-space shadows: ray-march against GBuffer linear depth (includes heightmap bias)
+             // Must execute before DepthGBuffer transitions to PixelShaderResource (SSS is compute)
              if (ScreenSpaceShadows != null)
              {
-                 Transition(list, Depth.Native, ResourceStates.DepthWrite, ResourceStates.NonPixelShaderResource);
                  PixMarker.Begin(list, "Screen-Space Shadows");
                  var cvp = Matrix4x4.CreateLookAtLeftHanded(Vector3.Zero, camera.Forward, camera.Up) * camera.Projection;
                  var lightDir = -Components.DirectionalLight.GetLightDirection();
-                 int dw = (int)Depth.Native.Description.Width;
-                 int dh = (int)Depth.Native.Description.Height;
-                 ScreenSpaceShadows.Execute(list, Depth.BindlessIndex, dw, dh, lightDir, cvp);
+                 int dw = (int)DepthGBuffer.Native.Description.Width;
+                 int dh = (int)DepthGBuffer.Native.Description.Height;
+                 ScreenSpaceShadows.Execute(list, DepthGBuffer.BindlessIndex, dw, dh, lightDir, cvp, camera.NearPlane);
                  PixMarker.End(list);
-                 Transition(list, Depth.Native, ResourceStates.NonPixelShaderResource, ResourceStates.PixelShaderResource);
              }
-             else
-             {
-                 // Hardware depth to PixelShaderResource for light pass
-                 Transition(list, Depth.Native, ResourceStates.DepthWrite, ResourceStates.PixelShaderResource);
-             }
+
+             // Transition GBuffer depth to PixelShaderResource for light pass sampling
+             Transition(list, DepthGBuffer.Native, ResourceStates.NonPixelShaderResource, ResourceStates.PixelShaderResource);
+
+             // Hardware depth to PixelShaderResource for light pass
+             Transition(list, Depth.Native, ResourceStates.DepthWrite, ResourceStates.PixelShaderResource);
              
              PixMarker.End(list); // GBuffer
         }

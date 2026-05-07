@@ -37,7 +37,8 @@ namespace Freefall.Graphics
             uint depthSrvIndex,
             int texWidth, int texHeight,
             Vector3 lightDirection,
-            Matrix4x4 viewProjection)
+            Matrix4x4 viewProjection,
+            float nearPlane)
         {
             EnsureOutputTexture(texWidth, texHeight);
 
@@ -77,6 +78,7 @@ namespace Freefall.Graphics
             _shader.SetParam("NearDepthValue", 1f);   // Reverse-Z: near=1
             _shader.SetParam("TexWidth", (uint)texWidth);
             _shader.SetParam("TexHeight", (uint)texHeight);
+            _shader.SetParam("NearPlane", nearPlane);
 
             for (int i = 0; i < dispatches.DispatchCount; i++)
             {
