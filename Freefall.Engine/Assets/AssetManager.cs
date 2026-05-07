@@ -177,7 +177,6 @@ namespace Freefall.Assets
 
         /// <summary>
         /// Find a loader for the given type, walking up the inheritance chain.
-        /// e.g. PCGGraph → NodeGraph → Asset → null.
         /// </summary>
         private static IAssetLoader FindLoader(Type assetType)
         {
@@ -421,6 +420,8 @@ namespace Freefall.Assets
                 // Fallback: YAML-only save
                 Freefall.Serialization.NativeImporter.Save(savePath, asset);
             }
+
+            asset.ClearDirty();
         }
 
         public Task<T> LoadAsync<T>(string path) where T : Asset

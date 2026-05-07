@@ -379,7 +379,7 @@ namespace Freefall.Graphics
             _counterBuffers[frameIndex].ClearUAV(commandList, new Vortice.Mathematics.Int4(0, 0, 0, 0));
             
             // UAV barrier - ensure counters are zeroed before any CSCount runs
-            commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(null)));
+            commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(_counterBuffers[frameIndex].Native)));
         }
         
         /// <summary>UAV index for cull stats buffer (passed in FrustumConstants).</summary>
@@ -408,7 +408,7 @@ namespace Freefall.Graphics
             // Clear stats buffer for this frame
             _cullStatsBuffer.ClearUAV(commandList, new Vortice.Mathematics.Int4(0, 0, 0, 0));
             
-            commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(null)));
+            commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(_cullStatsBuffer.Native)));
         }
         
         /// <summary>
@@ -449,10 +449,12 @@ namespace Freefall.Graphics
             ID3D12Resource sortedIndicesBuffer)
         {
             // Transition back to Common for next frame's BeginCommandGeneration
-            commandList.ResourceBarrier(new ResourceBarrier(
-                new ResourceTransitionBarrier(outputBuffer, ResourceStates.IndirectArgument, ResourceStates.Common)));
-            commandList.ResourceBarrier(new ResourceBarrier(
-                new ResourceTransitionBarrier(sortedIndicesBuffer, ResourceStates.NonPixelShaderResource, ResourceStates.Common)));
+            commandList.ResourceBarrier(new[] {
+                new ResourceBarrier(
+                    new ResourceTransitionBarrier(outputBuffer, ResourceStates.IndirectArgument, ResourceStates.Common)),
+                new ResourceBarrier(
+                    new ResourceTransitionBarrier(sortedIndicesBuffer, ResourceStates.NonPixelShaderResource, ResourceStates.Common))
+            });
         }
         /// <summary>
         /// Generate the Hi-Z depth pyramid from the current depth buffer.
@@ -472,38 +474,103 @@ namespace Freefall.Graphics
             _cachedSrvHeapArray ??= new[] { _device.SrvHeap };
             commandList.SetDescriptorHeaps(1, _cachedSrvHeapArray);
             
-            int w = pyramid.Width;
-            int h = pyramid.Height;
+            int spdMipCount = Math.Min(pyramid.MipCount, 6);
+            uint numGroupsX = ((uint)pyramid.SourceWidth + 63) / 64;
+            uint numGroupsY = ((uint)pyramid.SourceHeight + 63) / 64;
             
-            for (int mip = 0; mip < pyramid.MipCount; mip++)
+            // --- SPD path: mips 0 through min(5, MipCount-1) in a single dispatch ---
+            
+            // Batch transition: all SPD mips to UAV + counter buffer on first frame
+            var beforeState = firstGeneration ? ResourceStates.Common : ResourceStates.NonPixelShaderResource;
+            int barrierCount = firstGeneration ? spdMipCount + 1 : spdMipCount;
+            var spdBarriers = new ResourceBarrier[barrierCount];
+            for (int mip = 0; mip < spdMipCount; mip++)
             {
-                // Transition this mip to UAV for writing
-                var beforeState = firstGeneration ? ResourceStates.Common : ResourceStates.NonPixelShaderResource;
-                commandList.ResourceBarrier(new ResourceBarrier(
+                spdBarriers[mip] = new ResourceBarrier(
                     new ResourceTransitionBarrier(pyramid.Texture,
                         beforeState,
                         ResourceStates.UnorderedAccess,
-                        (uint)mip)));
-                
-                // Push constants: InputSrv, OutputUav, Width, Height
-                uint inputSrv = mip == 0 ? depthSrvIndex : pyramid.MipSRVs[mip - 1];
-                var ps = _pyramidShader!;
-                ps.SetPushConstant(_perMipKernel, "SourceSrv", inputSrv);
-                ps.SetPushConstant(_perMipKernel, "CounterUAV", pyramid.MipUAVs[mip]);
-                ps.SetPushConstant(_perMipKernel, "SourceWidth", (uint)w);
-                ps.SetPushConstant(_perMipKernel, "SourceHeight", (uint)h);
-                
-                ps.Dispatch(_perMipKernel, commandList, ((uint)w + 7) / 8, ((uint)h + 7) / 8, 1);
-                
-                // Transition to SRV for next level
-                commandList.ResourceBarrier(new ResourceBarrier(
+                        (uint)mip));
+            }
+            // Counter buffer: Common → UAV only on first generation (stays in UAV afterwards)
+            if (firstGeneration)
+            {
+                spdBarriers[spdMipCount] = new ResourceBarrier(
+                    new ResourceTransitionBarrier(pyramid.CounterBuffer!,
+                        ResourceStates.Common,
+                        ResourceStates.UnorderedAccess));
+            }
+            commandList.ResourceBarrier(spdBarriers);
+            
+            // Clear SPD atomic counter
+            commandList.ClearUnorderedAccessViewUint(
+                _device.GetGpuHandle(pyramid.CounterUAV),
+                pyramid.CounterCPUHandle,
+                pyramid.CounterBuffer!,
+                new Vortice.Mathematics.Int4(0, 0, 0, 0));
+            commandList.ResourceBarrier(new ResourceBarrier(
+                new ResourceUnorderedAccessViewBarrier(pyramid.CounterBuffer!)));
+            
+            // Set push constants for SPD kernel
+            var ps = _pyramidShader!;
+            ps.SetPushConstant(_spdKernel, "SourceSrv", depthSrvIndex);
+            ps.SetPushConstant(_spdKernel, "CounterUAV", pyramid.CounterUAV);
+            ps.SetPushConstant(_spdKernel, "SourceWidth", (uint)pyramid.SourceWidth);
+            ps.SetPushConstant(_spdKernel, "SourceHeight", (uint)pyramid.SourceHeight);
+            ps.SetParam(_spdKernel, "MipCount", (uint)spdMipCount);
+            ps.SetParam(_spdKernel, "NumGroupsX", numGroupsX);
+            ps.SetParam(_spdKernel, "NumGroupsY", numGroupsY);
+            
+            // Bind per-mip UAVs
+            ps.SetPushConstant(_spdKernel, "Mip0UAV", pyramid.MipUAVs[0]);
+            for (int m = 1; m < spdMipCount && m <= 12; m++)
+                ps.SetPushConstant(_spdKernel, $"Mip{m}UAV", pyramid.MipUAVs[m]);
+            
+            ps.Dispatch(_spdKernel, commandList, numGroupsX, numGroupsY, 1);
+            
+            // Batch transition: all SPD mips back to SRV
+            var spdBarriersBack = new ResourceBarrier[spdMipCount];
+            for (int mip = 0; mip < spdMipCount; mip++)
+            {
+                spdBarriersBack[mip] = new ResourceBarrier(
                     new ResourceTransitionBarrier(pyramid.Texture,
                         ResourceStates.UnorderedAccess,
                         ResourceStates.NonPixelShaderResource,
-                        (uint)mip)));
+                        (uint)mip));
+            }
+            commandList.ResourceBarrier(spdBarriersBack);
+            
+            // --- Per-mip fallback for mips 6+ (tiny dispatches, negligible cost) ---
+            if (pyramid.MipCount > 6)
+            {
+                int mw = pyramid.Width;
+                int mh = pyramid.Height;
+                for (int skip = 0; skip < 5; skip++) { mw = Math.Max(1, mw / 2); mh = Math.Max(1, mh / 2); }
                 
-                w = Math.Max(1, w / 2);
-                h = Math.Max(1, h / 2);
+                for (int mip = 6; mip < pyramid.MipCount; mip++)
+                {
+                    mw = Math.Max(1, mw / 2);
+                    mh = Math.Max(1, mh / 2);
+                    
+                    commandList.ResourceBarrier(new ResourceBarrier(
+                        new ResourceTransitionBarrier(pyramid.Texture,
+                            firstGeneration ? ResourceStates.Common : ResourceStates.NonPixelShaderResource,
+                            ResourceStates.UnorderedAccess,
+                            (uint)mip)));
+                    
+                    ps.SetPushConstant(_perMipKernel, "SourceSrv", pyramid.MipSRVs[mip - 1]);
+                    ps.SetPushConstant(_perMipKernel, "CounterUAV", pyramid.MipUAVs[mip]);
+                    ps.SetPushConstant(_perMipKernel, "SourceWidth", (uint)mw);
+                    ps.SetPushConstant(_perMipKernel, "SourceHeight", (uint)mh);
+                    
+                    ps.Dispatch(_perMipKernel, commandList, ((uint)mw + 7) / 8, ((uint)mh + 7) / 8, 1);
+                    
+                    commandList.ResourceBarrier(new ResourceBarrier(
+                        new ResourceTransitionBarrier(pyramid.Texture,
+                            ResourceStates.UnorderedAccess,
+                            ResourceStates.NonPixelShaderResource,
+                            (uint)mip)));
+                }
             }
         }
 
@@ -640,7 +707,11 @@ namespace Freefall.Graphics
             _depthHistogramBuffer!.ClearUAV(commandList, new Int4(0, 0, 0, 0));
             
             commandList.ResourceBarrierTransition(_depthSplitsBuffer!.Native, splitsFrom, ResourceStates.UnorderedAccess);
-            commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(null)));
+            commandList.ResourceBarrier(new[] {
+                new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(_depthMinMaxBuffer!.Native)),
+                new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(_depthHistogramBuffer!.Native)),
+                new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(_depthSplitsBuffer!.Native))
+            });
             
             // Set constants via ComputeShader API
             var da = _depthAnalysisShader!;
@@ -660,21 +731,25 @@ namespace Freefall.Graphics
             
             // --- Pass 1: CSDepthReduce ---
             da.Dispatch(_depthReduceKernel, commandList, groupsX, groupsY, 1);
-            commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(null)));
+            commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(_depthMinMaxBuffer!.Native)));
             
             // --- Pass 2: CSDepthHistogram ---
             da.Dispatch(_depthHistogramKernel, commandList, groupsX, groupsY, 1);
-            commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(null)));
+            commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(_depthHistogramBuffer!.Native)));
             
             // --- Pass 3: CSComputeSplits ---
             da.Dispatch(_computeSplitsKernel, commandList, 1, 1, 1);
-            commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(null)));
+            commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(_depthSplitsBuffer!.Native)));
             
-            // Step 4: Transition splits + minmax to CopySource for readback
-            commandList.ResourceBarrierTransition(_depthSplitsBuffer!.Native,
-                ResourceStates.UnorderedAccess, ResourceStates.CopySource);
-            commandList.ResourceBarrierTransition(_depthMinMaxBuffer!.Native,
-                ResourceStates.UnorderedAccess, ResourceStates.CopySource);
+            // Step 4: Transition splits + minmax to CopySource for readback (batched)
+            commandList.ResourceBarrier(new[] {
+                new ResourceBarrier(
+                    new ResourceTransitionBarrier(_depthSplitsBuffer!.Native,
+                        ResourceStates.UnorderedAccess, ResourceStates.CopySource)),
+                new ResourceBarrier(
+                    new ResourceTransitionBarrier(_depthMinMaxBuffer!.Native,
+                        ResourceStates.UnorderedAccess, ResourceStates.CopySource))
+            });
             // Histogram stays in UAV (next frame will transition it to CopyDest)
             
             // Step 5: Copy to readback buffer for this frame

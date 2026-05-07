@@ -25,7 +25,7 @@ cbuffer PushConstants : register(b3)
 };
 
 #include "common.fx"
-// @RenderState(RenderTargets=5)
+// @RenderState(RenderTargets=6)
 
 inline MaterialData GetMaterial(uint id)
 {
@@ -154,6 +154,7 @@ struct PSOutput
     float4 Data : SV_Target2;
     float  Depth : SV_Target3;
     uint   EntityId : SV_Target4;
+    float2 Displacement : SV_Target5;
 };
 
 
@@ -294,6 +295,8 @@ PSOutput PS(VSOutput input)
     output.Data = float4(saturate(roughness), saturate(metal), saturate(ao), 1.0);
     output.Depth = input.Depth;
     output.EntityId = (input.TransformSlot << 8u) | (input.MeshPartIdx & 0xFFu);
+    output.Displacement = float2(0, 0);
+    
     return output;
 }
 

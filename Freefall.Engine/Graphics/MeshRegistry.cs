@@ -34,7 +34,7 @@ namespace Freefall.Graphics
             public float BoundsCenterZ;
             public float BoundsRadius;
             // Padding to match IndirectDrawCommand size (72 bytes = 18 uints)
-            public uint Reserved4;
+            public uint TanBufferIdx;
             public uint Reserved5;
             public uint Reserved6;
             public uint Reserved7;
@@ -82,6 +82,7 @@ namespace Freefall.Graphics
                     BoundsCenterY = bounds.Y,
                     BoundsCenterZ = bounds.Z,
                     BoundsRadius = bounds.W,
+                    TanBufferIdx = mesh.TanBufferIndex,
                 };
 
                 if (_idMap.TryGetValue(key, out int existingId))

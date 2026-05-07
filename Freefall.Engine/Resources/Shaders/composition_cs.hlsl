@@ -16,6 +16,12 @@ cbuffer PushConstants : register(b3)
     uint DepthGBufIdx;
 };
 
+cbuffer Params : register(b4)
+{
+    uint SSDMTexIdx;
+    uint3 _compPad;
+};
+
 #include "common.fx"
 #include "sky_common.fx"
 
@@ -36,10 +42,22 @@ void CSCompose(uint3 dispatchThreadId : SV_DispatchThreadID)
     RWTexture2D<float4> Output = ResourceDescriptorHeap[OutputUAVIdx];
     
     int3 coord = int3(px, 0);
-    float4 albedo = AlbedoTex.Load(coord);
+    int3 displaced_coord = coord;
+
+    // Apply SSDM displacement to GBuffer reads
+    if (SSDMTexIdx != 0)
+    {
+        Texture2D<float2> SSDMTex = ResourceDescriptorHeap[SSDMTexIdx];
+        float2 ssdmVal = SSDMTex.Load(coord);
+        float2 myUV = (float2(px) + 0.5) / float2(ScreenWidthIdx, ScreenHeightIdx);
+        float2 offset_px = (ssdmVal - myUV) * float2(ScreenWidthIdx, ScreenHeightIdx);
+        displaced_coord = int3(clamp(int2(px) + int2(round(offset_px)), int2(0,0), int2(ScreenWidthIdx-1, ScreenHeightIdx-1)), 0);
+    }
+
+    float4 albedo = AlbedoTex.Load(displaced_coord);
     float4 light = LightTex.Load(coord);
-    float4 data = DataTex.Load(coord);
-    float3 normal = NormalTex.Load(coord).xyz;
+    float4 data = DataTex.Load(displaced_coord);
+    float3 normal = NormalTex.Load(displaced_coord).xyz;
     
     // Hemisphere ambient: sky-facing surfaces get a cooler/brighter tint,
     // ground-facing get warmer/darker. Gives shape to fully shadowed objects.

@@ -79,15 +79,16 @@ cbuffer PushConstants : register(b3)
 
 SamplerState sampLinear : register(s0);
 
-// Per-stamp instance data (matches C# StampInstanceGPU)
+// Per-stamp instance data (matches C# StampDataGPU)
 struct StampData
 {
     float2 Position;       // terrain-space UV [0..1]
     float Radius;          // UV-space radius
     float Strength;        // height multiplier
-    float Falloff;         // falloff exponent
+    float Falloff;         // plateau fraction before fade begins
     float Rotation;        // degrees
-    float2 _pad;
+    uint BrushIdx;         // bindless SRV index for this stamp's brush texture
+    uint BlendMode;        // 0=Set, 1=Add, 2=Max, 3=Lerp, 4=Min
 };
 
 float Blend(float prev, float value, uint mode, float opacity)
@@ -133,7 +134,9 @@ void CS_ImportLayer(uint3 dtid : SV_DispatchThreadID)
     Output[dtid.xy] = Blend(prev, src, BlendMode, Opacity);
 }
 
-// ── CS_StampGroup: Apply all stamps in a group (batched per brush texture) ──
+// ── CS_StampGroup: Apply all stamps, each with its own brush and blend mode ──
+// Per-stamp blend via target+lerp: compute what the ideal height should be,
+// then blend toward it using falloff as spatial weight.
 [numthreads(8, 8, 1)]
 void CS_StampGroup(uint3 dtid : SV_DispatchThreadID)
 {
@@ -142,12 +145,11 @@ void CS_StampGroup(uint3 dtid : SV_DispatchThreadID)
     Output.GetDimensions(w, h);
     if (dtid.x >= w || dtid.y >= h) return;
 
-    Texture2D<float> Brush = ResourceDescriptorHeap[SourceIdx];
     StructuredBuffer<StampData> Stamps = ResourceDescriptorHeap[StampBufIdx];
 
     float2 uv = (float2(dtid.xy) + 0.5) / float2(w, h);
-    float prev = Output[dtid.xy];
-    float accumulated = 0;
+    float result = Output[dtid.xy];
+    bool changed = false;
 
     for (uint i = 0; i < StampCount; i++)
     {
@@ -155,12 +157,11 @@ void CS_StampGroup(uint3 dtid : SV_DispatchThreadID)
         float2 delta = uv - s.Position;
         float dist = length(delta);
 
-        // Outside stamp radius — skip
         if (dist > s.Radius) continue;
 
-        // Falloff: 1 at center, 0 at edge
-        float t = saturate(1.0 - dist / s.Radius);
-        float falloff = pow(t, s.Falloff);
+        // Falloff: full strength inside s.Falloff fraction, smooth ramp to 0 at edge
+        float t = dist / s.Radius;
+        float w_falloff = 1.0 - smoothstep(s.Falloff, 1.0, t);
 
         // Rotate delta into brush UV space
         float rad = s.Rotation * 3.14159265 / 180.0;
@@ -171,15 +172,29 @@ void CS_StampGroup(uint3 dtid : SV_DispatchThreadID)
            -delta.x * sinR + delta.y * cosR
         );
 
-        // Sample brush at local UV
+        // Sample per-stamp brush texture
         float2 brushUV = (rotDelta / s.Radius) * 0.5 + 0.5;
-        float brushValue = Brush.SampleLevel(sampLinear, brushUV, 0);
+        Texture2D<float> Brush = ResourceDescriptorHeap[s.BrushIdx];
+        float bv = Brush.SampleLevel(sampLinear, brushUV, 0) * s.Strength;
 
-        accumulated += brushValue * s.Strength * falloff;
+        // Compute target value for this blend mode, then lerp by falloff
+        float target;
+        switch (s.BlendMode)
+        {
+            case 0:  target = bv; break;                 // Set
+            case 1:  target = result + bv; break;        // Add
+            case 2:  target = max(result, bv); break;    // Max
+            case 3:  target = bv; break;                 // Lerp (same as Set for stamps)
+            case 4:  target = min(result, bv); break;    // Min
+            default: target = result + bv; break;        // fallback: Add
+        }
+
+        result = lerp(result, target, w_falloff);
+        changed = true;
     }
 
-    if (accumulated != 0)
-        Output[dtid.xy] = Blend(prev, accumulated, BlendMode, Opacity);
+    if (changed)
+        Output[dtid.xy] = result;
 }
 
 // ── CS_PaintBrush: Stroke-based terrain painting ──

@@ -301,7 +301,7 @@ namespace Freefall
             // F6: Cycle debug visualization mode
             if (Input.IsKeyPressed(Keys.F6))
             {
-                Settings.DebugVisualizationMode = (DebugVizMode)(((int)Settings.DebugVisualizationMode + 1) % 6);
+                Settings.DebugVisualizationMode = (DebugVizMode)(((int)Settings.DebugVisualizationMode + 1) % 7);
                 Debug.Log($"[Engine] Debug Viz: {Settings.DebugVisualizationMode}");
             }
             
@@ -411,7 +411,8 @@ namespace Freefall
         ShadowFactor = 2,
         ContactShadow = 3,
         LinearDepth = 4,
-        DecoControlMap = 5
+        DecoControlMap = 5,
+        HeightMap = 6
     }
 
     public class EngineSettings
@@ -445,14 +446,26 @@ namespace Freefall
 
          // Screen-Space Shadows (Bend Studio technique)
          [ValueRange(0.001f, 0.2f)]
-         public float SSSSurfaceThickness { get; set; } = 0.05f;
+         public float SSSSurfaceThickness { get; set; } = 0.005f;
 
          [ValueRange(0.005f, 0.1f)]
          public float SSSBilinearThreshold { get; set; } = 0.02f;
 
          [ValueRange(1f, 8f)]
-         public float SSSShadowContrast { get; set; } = 4.0f;
+         public float SSSShadowContrast { get; set; } = 2.0f;
 
-         public System.Numerics.Matrix4x4 FrozenViewProjection { get; set; } // VP matrix when frustum frozen
+         // Screen-Space Displacement Mapping (SSDM)
+         [ValueRange(0f, 500f)]
+         public float SSDMHeightScale { get; set; } = 1f;
+
+         public bool UseSSDMPyramid { get; set; } = false;
+
+         [ValueRange(4f, 60f)]
+         public float SSDMMaxSearch { get; set; } = 32f;
+
+         [ValueRange(1f, 128f)]
+         public float PixelErrorThreshold { get; set; } = 128.0f;
+
+        public System.Numerics.Matrix4x4 FrozenViewProjection { get; set; } // VP matrix when frustum frozen
     }
 }

@@ -22,6 +22,7 @@ namespace Freefall.Graphics
         public RenderTexture2D Data;
         public RenderTexture2D DepthGBuffer;  // Linear view-space depth (R32_Float), cleared to 0
         public RenderTexture2D EntityIdBuffer; // Per-pixel entity ID (R32_UInt) for mouse picking
+        public RenderTexture2D HeightBuffer;   // Per-pixel displacement vectors for SSDM (RG16_Float)
         public DepthTexture2D Depth;
         
         public RenderTexture2D LightBuffer = null!;
@@ -37,6 +38,9 @@ namespace Freefall.Graphics
 
         /// <summary>Screen-space shadow pass (Bend Studio technique).</summary>
         public ScreenSpaceShadows? ScreenSpaceShadows { get; private set; }
+
+        /// <summary>Screen-space displacement mapping (wavefront cooperative march).</summary>
+        public ScreenSpaceDisplacement? ScreenSpaceDisplacement { get; private set; }
 
         private Material matClear = null!;
         private Material matDirectionalLight = null!;
@@ -124,6 +128,9 @@ namespace Freefall.Graphics
             
             // Screen-space shadows
             ScreenSpaceShadows = new ScreenSpaceShadows();
+            
+            // Screen-space displacement
+            ScreenSpaceDisplacement = new ScreenSpaceDisplacement();
         }
 
         private void CreateRenderTextures(int width, int height)
@@ -133,6 +140,7 @@ namespace Freefall.Graphics
             Data = new RenderTexture2D(Engine.Device, width, height, Format.R8G8B8A8_UNorm);
             DepthGBuffer = new RenderTexture2D(Engine.Device, width, height, Format.R32_Float);
             EntityIdBuffer = new RenderTexture2D(Engine.Device, width, height, Format.R32_UInt);
+            HeightBuffer = new RenderTexture2D(Engine.Device, width, height, Format.R16G16_Float);
             
             // 1x1 readback buffers for picking
             _entityIdReadback?.Dispose();
@@ -157,6 +165,7 @@ namespace Freefall.Graphics
             Data?.Dispose();
             DepthGBuffer?.Dispose();
             EntityIdBuffer?.Dispose();
+            HeightBuffer?.Dispose();
             Depth?.Dispose();
             LightBuffer?.Dispose();
             Composite?.Dispose();
@@ -329,6 +338,7 @@ namespace Freefall.Graphics
              Transition(list, Data.Native, fromState, ResourceStates.RenderTarget);
              Transition(list, DepthGBuffer.Native, fromState, ResourceStates.RenderTarget);
              Transition(list, EntityIdBuffer.Native, fromState, ResourceStates.RenderTarget);
+             Transition(list, HeightBuffer.Native, fromState, ResourceStates.RenderTarget);
              Transition(list, Depth.Native, depthFromState, ResourceStates.DepthWrite);
 
              // Set shader parameters globally on all effects (Apex pattern)
@@ -348,12 +358,13 @@ namespace Freefall.Graphics
 
              // === GBuffer Draw ===
              // Cache GBuffer RTV handles to avoid per-frame allocation
-             _cachedGBufferRtvHandles ??= new CpuDescriptorHandle[5];
+             _cachedGBufferRtvHandles ??= new CpuDescriptorHandle[6];
              _cachedGBufferRtvHandles[0] = Albedo.RtvHandle;
              _cachedGBufferRtvHandles[1] = Normals.RtvHandle;
              _cachedGBufferRtvHandles[2] = Data.RtvHandle;
              _cachedGBufferRtvHandles[3] = DepthGBuffer.RtvHandle;
              _cachedGBufferRtvHandles[4] = EntityIdBuffer.RtvHandle;
+             _cachedGBufferRtvHandles[5] = HeightBuffer.RtvHandle;
              list.OMSetRenderTargets(_cachedGBufferRtvHandles, Depth.DsvHandle);
              
              list.ClearRenderTargetView(Albedo.RtvHandle, new Color4(0,0,0,0));
@@ -361,6 +372,7 @@ namespace Freefall.Graphics
              list.ClearRenderTargetView(Data.RtvHandle, new Color4(0,0,0,0));
              list.ClearRenderTargetView(DepthGBuffer.RtvHandle, new Color4(0,0,0,0));
              list.ClearRenderTargetView(EntityIdBuffer.RtvHandle, new Color4(0,0,0,0));
+             list.ClearRenderTargetView(HeightBuffer.RtvHandle, new Color4(0,0,0,0));
              list.ClearDepthStencilView(Depth.DsvHandle, ClearFlags.Depth, 0.0f, 0); // Reverse depth: far=0
 
              // Viewport
@@ -464,6 +476,9 @@ namespace Freefall.Graphics
              // DepthGBuffer: transition to NonPixelShaderResource for Hi-Z compute pass
              Transition(list, DepthGBuffer.Native, ResourceStates.RenderTarget, ResourceStates.NonPixelShaderResource);
              
+             // HeightBuffer: transition to SRV for displacement compute pass
+             Transition(list, HeightBuffer.Native, ResourceStates.RenderTarget, ResourceStates.NonPixelShaderResource);
+             
              // Generate Hi-Z depth pyramid from LINEAR GBuffer depth (not hardware depth)
              // Linear depth cleared to 0 = no occluder, max() naturally keeps farthest geometry
              // Skip when frustum is frozen — frozen pyramid must match frozen VP for correct occlusion
@@ -486,10 +501,24 @@ namespace Freefall.Graphics
                  PixMarker.End(list); // SDSM Depth Analysis
              }
              
+             // Screen-space displacement mapping: uses height buffer + depth buffer.
+             // Produces displaced depth (GBuffer depth remapped through B buffer).
+             // Must run BEFORE SSS so shadows see the displaced surface.
+             if (ScreenSpaceDisplacement != null)
+             {
+                 PixMarker.Begin(list, "Screen-Space Displacement");
+                 int sdw = (int)HeightBuffer.Native.Description.Width;
+                 int sdh = (int)HeightBuffer.Native.Description.Height;
+                 var scvp = Matrix4x4.CreateLookAtLeftHanded(Vector3.Zero, camera.Forward, camera.Up) * camera.Projection;
+                 ScreenSpaceDisplacement.Execute(list, HeightBuffer.BindlessIndex, 
+                     DepthGBuffer.BindlessIndex, sdw, sdh, scvp);
+                 PixMarker.End(list);
+             }
+
              // Transition GBuffer depth to PixelShaderResource for light pass sampling
              Transition(list, DepthGBuffer.Native, ResourceStates.NonPixelShaderResource, ResourceStates.PixelShaderResource);
              
-             // Screen-space shadows: uses hardware depth in compute-readable state
+             // Screen-space shadows: ray-march against hardware depth (includes heightmap bias via SV_DepthGreaterEqual)
              if (ScreenSpaceShadows != null)
              {
                  Transition(list, Depth.Native, ResourceStates.DepthWrite, ResourceStates.NonPixelShaderResource);
@@ -507,6 +536,7 @@ namespace Freefall.Graphics
                  // Hardware depth to PixelShaderResource for light pass
                  Transition(list, Depth.Native, ResourceStates.DepthWrite, ResourceStates.PixelShaderResource);
              }
+             
              PixMarker.End(list); // GBuffer
         }
 
@@ -623,6 +653,9 @@ namespace Freefall.Graphics
             _compositionCS.SetPushConstant("ScreenHeight", (uint)desc.Height);
             _compositionCS.SetPushConstant("DepthGBuf", DepthGBuffer.BindlessIndex);
             
+            // Pass SSDM displacement texture to composition for ambient parallax
+            _compositionCS.SetParam("SSDMTexIdx", ScreenSpaceDisplacement?.OutputSrvIndex ?? 0u);
+
             // Bind SceneConstants cbuffer (AmbientScale etc.)
             foreach (var cb in matDirectionalLight.ConstantBuffers)
             {
@@ -853,12 +886,14 @@ namespace Freefall.Graphics
             Data?.Dispose();
             DepthGBuffer?.Dispose();
             EntityIdBuffer?.Dispose();
+            HeightBuffer?.Dispose();
             Depth?.Dispose();
             LightBuffer?.Dispose();
             Composite?.Dispose();
             CompositeSnapshot?.Dispose();
             ShadowTextureArray?.Dispose();
             ScreenSpaceShadows?.Dispose();
+            ScreenSpaceDisplacement?.Dispose();
             _entityIdReadback?.Dispose();
             _depthReadback?.Dispose();
             _normalReadback?.Dispose();

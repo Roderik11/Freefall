@@ -17,6 +17,7 @@ cbuffer PushConstants : register(b3)
     uint ScreenWidthIdx;
     uint ScreenHeightIdx;
     uint SSSTexIdx;
+    uint SSDMTexIdx;
 };
 
 #include "common.fx"
@@ -133,7 +134,25 @@ void CSDirectionalLight(uint3 dispatchThreadId : SV_DispatchThreadID)
     Texture2DArray ShadowMap = ResourceDescriptorHeap[ShadowMapIdx];
     
     int3 coord = int3(px, 0);
-    float3 normal = NormalTex.Load(coord).xyz;
+    int3 displaced_coord = coord;
+
+    // Apply screen-space displacement if available
+    if (SSDMTexIdx != 0)
+    {
+        Texture2D<float2> SSDMTex = ResourceDescriptorHeap[SSDMTexIdx];
+        float2 ssdmVal = SSDMTex.Load(coord);
+        // Simple mode: ssdmVal = UV offset (inverse)
+        // Pyramid mode: ssdmVal = absolute source UV
+        // Detect pyramid: if value is near a valid UV (0..1), treat as absolute
+        // For simplicity, use the value as source UV and compute offset:
+        float2 myUV = (float2(px) + 0.5) / float2(ScreenWidthIdx, ScreenHeightIdx);
+        float2 offset_px = (ssdmVal - myUV) * float2(ScreenWidthIdx, ScreenHeightIdx);
+        displaced_coord = int3(clamp(int2(px) + int2(round(offset_px)), int2(0,0), int2(ScreenWidthIdx-1, ScreenHeightIdx-1)), 0);
+    }
+
+    // Sample GBuffer at displaced coordinates for parallax effect
+    // Depth is always read at the original pixel (depth buffer is authoritative)
+    float3 normal = NormalTex.Load(displaced_coord).xyz;
     float depth = DepthTex.Load(coord).r;
     
     RWTexture2D<float4> Output = ResourceDescriptorHeap[OutputUAVIdx];
@@ -149,9 +168,9 @@ void CSDirectionalLight(uint3 dispatchThreadId : SV_DispatchThreadID)
     float2 texCoord = (float2(px) + 0.5) / float2(ScreenWidthIdx, ScreenHeightIdx);
     float4 worldPos = posFromDepth(texCoord, depth, CameraInverse);
     
-    // Sample Data texture ONCE
+    // Sample Data texture at displaced coords
     Texture2D DataTex = ResourceDescriptorHeap[DataTexIdx];
-    float4 data = DataTex.Load(coord);
+    float4 data = DataTex.Load(displaced_coord);
     bool isVegetation = (data.a > 0.3 && data.a < 0.7);
     
     // Compute NdotL
@@ -234,7 +253,7 @@ void CSDirectionalLight(uint3 dispatchThreadId : SV_DispatchThreadID)
     if (SSSTexIdx > 0)
     {
         Texture2D<float> sssTex = ResourceDescriptorHeap[SSSTexIdx];
-        sssShadow = sssTex.Load(coord).r;
+        sssShadow = sssTex.Load(displaced_coord).r;
         shadowFactor = min(shadowFactor, sssShadow);
     }
 
@@ -266,7 +285,7 @@ void CSDirectionalLight(uint3 dispatchThreadId : SV_DispatchThreadID)
     
     // PBR lighting
     Texture2D AlbedoTex = ResourceDescriptorHeap[AlbedoTexIdx];
-    float3 albedo = AlbedoTex.Load(coord).rgb;
+    float3 albedo = AlbedoTex.Load(displaced_coord).rgb;
     
     if (data.a < 0.01)
     {

@@ -13,6 +13,7 @@ namespace Freefall.Graphics
     {
         public Vector3[] Positions;
         public Vector3[] Normals;
+        public Vector4[] Tangents;  // XYZ = tangent direction, W = bitangent sign (±1)
         public Vector2[] UVs;
         public uint[] Indices;
         public List<MeshPart> Parts = new List<MeshPart>();

@@ -26,10 +26,11 @@ cbuffer PushConstants : register(b3)
     uint CascadeBufferSRVIdx;   // 23: SRV: StructuredBuffer<CascadeData>
     uint ShadowCascadeCount;    // 24: uint: number of cascades
     uint CascadeIdxBufIdx;      // 25: SRV: per-entry cascade index (uint)
+    uint HeightMapsIdx;         // 26: Texture2DArray for per-layer height maps (SSDM)
 };
 
 #include "common.fx"
-// @RenderState(RenderTargets=5)
+// @RenderState(RenderTargets=6)
 
 // Per-layer procedural auto-mask parameters (uploaded from TextureLayer C# properties)
 struct LayerAutoMask
@@ -112,12 +113,13 @@ float3 StitchVertex(float3 pos, float2 rect_xy, float2 rect_size, uint stitchMas
 
 struct VertexOutput
 {
-	float4 Position		: SV_POSITION;
+	linear noperspective centroid float4 Position : SV_POSITION;
 	float2 UV			: TEXCOORD0;
 	float2 UV2			: TEXCOORD1;
     float Depth			: TEXCOORD2;
 	float Level			: TEXCOORD3;
 	nointerpolation uint TransformSlot : TEXCOORD4;
+	float3 WorldPos		: TEXCOORD5;
 };
 
 
@@ -182,6 +184,7 @@ VertexOutput VS(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_Insta
     float3 stitchedPos = StitchVertex(pos, rect.xy, rectSize, stitchMask, entityWorld, heightUV);
 
     float4 worldPosition = mul(float4(stitchedPos, 1), world);
+    output.WorldPos = worldPosition.xyz;
     worldPosition = mul(worldPosition, ViewProjection);
     
     output.Position = worldPosition;
@@ -203,6 +206,8 @@ struct FragmentOutput
 	float4 Data			: SV_TARGET2;
 	float  Depth		: SV_TARGET3;
 	uint   EntityId		: SV_TARGET4;
+	float2 Displacement	: SV_TARGET5;
+	float  HWDepth		: SV_DepthGreaterEqual;
 };
 
 float3 GetNormal(float2 uv)
@@ -231,6 +236,7 @@ FragmentOutput PS(VertexOutput input)
     FragmentOutput output;
 
     float3 terrainNormal = GetNormal(input.UV2);
+    float3 faceNormal = terrainNormal;
 
     // Slope angle in degrees for procedural masking
     float slopeDeg = acos(saturate(terrainNormal.y)) * (180.0 / 3.14159265);
@@ -260,6 +266,8 @@ FragmentOutput PS(VertexOutput input)
     // Layer 0 at weight 1.0 = full base. Layer 1 at weight 1.0 = fully covers layer 0.
     // Partial weight = partial blend with what's beneath.
     bool hasAnyLayer = false;
+    float blendedHeight = 0;
+    bool hasExplicitHeight = false;
     for (uint i = 0; i < sliceCount; ++i)
     {
         uint startIndex = i * 4;
@@ -299,9 +307,20 @@ FragmentOutput PS(VertexOutput input)
 
             color = lerp(color, c, weight);
             normal = lerp(normal, n, weight);
+
+            // Blend explicit height using same visual weight
+            if (HeightMapsIdx != 0 && LayerTiling[layer].z > 0.5)
+            {
+                Texture2DArray HeightMaps = ResourceDescriptorHeap[HeightMapsIdx];
+                float h = HeightMaps.Sample(sampData, float3(texuv, layer)).r;
+                h *= LayerTiling[layer].w; // per-layer height scale
+                blendedHeight = lerp(blendedHeight, h, weight);
+                hasExplicitHeight = true;
+            }
         }
     }
 
+    // Normal map blending and height derivation
     if (hasAnyLayer)
     {
         // BC5_UNORM: R,G in [0,1], 0.5 = flat. Decode to signed tangent-space XY.
@@ -312,12 +331,21 @@ FragmentOutput PS(VertexOutput input)
         terrainNormal.x += nXY.x * normalScale;
         terrainNormal.z += nXY.y * normalScale;
         terrainNormal = normalize(terrainNormal);
+
+        // Fallback: derive height from normal when no explicit height maps contributed
+        if (!hasExplicitHeight)
+        {
+            float nZ = sqrt(saturate(1.0 - dot(nXY, nXY)));
+            blendedHeight = 1.0 - nZ;
+        }
     }
 
     output.Albedo = float4(color.rgb, 0);
     output.Normals = float4(terrainNormal.xyz, 1); 
     output.Data = float4(0.95, 0.0, 1.0, 1.0); // roughness=very matte, metal=0, ao=1, lit=PBR
-    output.Depth = input.Depth;
+    // Write height-offset depth: view-independent bias for consistent SSS shadows.
+    float depthHeight = blendedHeight * 0.05;
+    output.Depth = input.Depth - depthHeight;
 
     // Debug mode 5: Decoration control map overlay
     if (DebugMode == 5 && DecoControlMapIdx != 0)
@@ -358,7 +386,48 @@ FragmentOutput PS(VertexOutput input)
         output.Albedo = float4(decoColor, 0);
     }
 
+    // Debug mode 6: Height map visualization (SSDM)
+    if (DebugMode == 6)
+    {
+        if (HeightMapsIdx == 0)
+            output.Albedo = float4(1, 0, 0, 0); // Red = no height array bound
+        else
+            output.Albedo = float4(blendedHeight, blendedHeight, blendedHeight, 0);
+    }
+
+    // SSDM (Lobel 2008): displacement = projected_normal * height
+    // faceNormal gives clean displacement direction for terrain.
+    // Smooth the height for displacement using ddx/ddy to prevent fold-over:
+    // average with neighbors reduces sharp gradients at cobblestone edges.
+    float hx = ddx(blendedHeight);
+    float hy = ddy(blendedHeight);
+    float smoothHeight = blendedHeight - 0.5 * (abs(hx) + abs(hy));
+    smoothHeight = max(smoothHeight, 0);
+    float worldHeight = smoothHeight * 0.05;
+
+    float4 clipPos = mul(float4(input.WorldPos, 1), ViewProjection);
+    float4 clipDisp = mul(float4(input.WorldPos + faceNormal * worldHeight, 1), ViewProjection);
+    float2 ndcPos = clipPos.xy / clipPos.w;
+    float2 ndcDisp = clipDisp.xy / clipDisp.w;
+    float2 dispVector = (ndcDisp - ndcPos) * float2(0.5, -0.5);
+
+    // Fade displacement at screen edges so the inversion never needs off-screen sources.
+    // Margin is proportional to displacement magnitude — large displacements fade earlier.
+    float2 screenUV = ndcPos * float2(0.5, -0.5) + 0.5;
+    float dispMag = length(dispVector);
+    float margin = max(dispMag * 2.0, 0.01); // fade zone = 2x displacement size
+    float edgeFade = saturate(min(min(screenUV.x, 1.0 - screenUV.x),
+                                  min(screenUV.y, 1.0 - screenUV.y)) / margin);
+    dispVector *= edgeFade;
+
     output.EntityId = (input.TransformSlot << 8u);
+    output.Displacement = dispVector;
+    // HW depth: displace toward camera for view-independent SSS depth bias.
+    // Moving toward the camera always changes clip-Z consistently, regardless
+    // of view angle. Perspective division handles distance scaling naturally.
+    float3 toCamera = normalize(CameraPos - input.WorldPos);
+    float4 clipDepthDisp = mul(float4(input.WorldPos + toCamera * worldHeight, 1), ViewProjection);
+    output.HWDepth = clipDepthDisp.z / clipDepthDisp.w;
     return output;
 }
 

@@ -370,6 +370,7 @@ namespace Freefall.Graphics
             // Determine Render Target count and formats from shader metadata
             Format[] rtvFormats = renderState.RenderTargetCount switch
             {
+                6 => new[] { Format.R16G16B16A16_Float, Format.R16G16B16A16_SNorm, Format.R8G8B8A8_UNorm, Format.R32_Float, Format.R32_Float, Format.R16G16_Float }, // GBuffer + Depth + EntityId + Displacement
                 5 => new[] { Format.R16G16B16A16_Float, Format.R16G16B16A16_SNorm, Format.R8G8B8A8_UNorm, Format.R32_Float, Format.R32_Float }, // GBuffer + Depth + EntityId
                 4 => new[] { Format.R16G16B16A16_Float, Format.R16G16B16A16_SNorm, Format.R8G8B8A8_UNorm, Format.R32_Float }, // GBuffer + Depth
                 3 => new[] { Format.R16G16B16A16_Float, Format.R16G16B16A16_SNorm, Format.R8G8B8A8_UNorm }, // GBuffer
@@ -494,6 +495,7 @@ namespace Freefall.Graphics
                     // Resolve RT formats for this pass
                     passRtvFormats = passRS.RenderTargetCount switch
                     {
+                        6 => new[] { Format.R16G16B16A16_Float, Format.R16G16B16A16_SNorm, Format.R8G8B8A8_UNorm, Format.R32_Float, Format.R32_Float, Format.R16G16_Float },
                         5 => new[] { Format.R16G16B16A16_Float, Format.R16G16B16A16_SNorm, Format.R8G8B8A8_UNorm, Format.R32_Float, Format.R32_Float },
                         4 => new[] { Format.R16G16B16A16_Float, Format.R16G16B16A16_SNorm, Format.R8G8B8A8_UNorm, Format.R32_Float },
                         3 => new[] { Format.R16G16B16A16_Float, Format.R16G16B16A16_SNorm, Format.R8G8B8A8_UNorm },

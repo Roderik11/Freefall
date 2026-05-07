@@ -34,7 +34,6 @@ namespace Freefall.Components
         public Material? DecoratorMaterial = InternalAssets.DecoratorMaterial;
 
         // ───── Rendering Parameters ───────────────────────────────────────
-        private float PixelErrorThreshold = 128.0f;
         public int MaxDepth = 7;
         private int MaxPatches = 32768;
         private const int MinPatches = 32768;
@@ -131,6 +130,7 @@ namespace Freefall.Components
         private Texture? ControlMapsArray;
         private Texture? DiffuseMapsArray;
         private Texture? NormalMapsArray;
+        private Texture? HeightMapsArray;
 
         private int _totalNodes;
 
@@ -649,6 +649,7 @@ namespace Freefall.Components
             if (ControlMapsArray != null) material.SetTexture("ControlMaps", ControlMapsArray);
             if (DiffuseMapsArray != null) material.SetTexture("DiffuseMaps", DiffuseMapsArray);
             if (NormalMapsArray != null) material.SetTexture("NormalMaps", NormalMapsArray);
+            if (HeightMapsArray != null) material.SetTexture("HeightMaps", HeightMapsArray);
             if (_layerAutoMaskBuffer != null) material.SetTextureIndex("AutoMaskBuf", _layerAutoMaskBuffer.SrvIndex);
 
             // Capture values for lambda closure
@@ -851,7 +852,7 @@ namespace Freefall.Components
                 RootExtents = rootExtents,
                 TotalNodes = (uint)_totalNodes,
                 TerrainSize = terrainSize,
-                PixelErrorThreshold = PixelErrorThreshold,
+                PixelErrorThreshold = Engine.Settings.PixelErrorThreshold,
                 ScreenHeight = camera.Target?.Height ?? 1080f,
                 TanHalfFov = MathF.Tan(vFovRad * 0.5f),
                 TransformSlot = (uint)Transform.TransformSlot,
@@ -979,6 +980,8 @@ namespace Freefall.Components
             commandList.SetGraphicsRoot32BitConstant(0, (uint)Engine.Settings.DebugVisualizationMode, 16);
             // Slot 21: Deco control map SRV (for debug mode 5)
             commandList.SetGraphicsRoot32BitConstant(0, _decoControlSRV, 21);
+            // Slot 26: HeightMapsArray SRV (SSDM per-layer displacement)
+            commandList.SetGraphicsRoot32BitConstant(0, (uint)(HeightMapsArray?.BindlessIndex ?? 0), 26);
 
             // ExecuteIndirect with DrawInstancedSignature — args written by CSBuildDrawArgs
             commandList.ExecuteIndirect(
@@ -1062,7 +1065,7 @@ namespace Freefall.Components
                 RootExtents = new Vector3(terrainSz.X * 0.5f, Terrain.MaxHeight, terrainSz.Y * 0.5f),
                 TotalNodes = (uint)_totalNodes,
                 TerrainSize = terrainSz,
-                PixelErrorThreshold = PixelErrorThreshold,
+                PixelErrorThreshold = Engine.Settings.PixelErrorThreshold,
                 ScreenHeight = Camera.Main.Target?.Height ?? 1080f,
                 TanHalfFov = MathF.Tan(vFovRad * 0.5f),
                 TransformSlot = (uint)Transform.TransformSlot,
@@ -1356,10 +1359,11 @@ namespace Freefall.Components
                 for (int i = 0; i < layers.Count && i < _layerTiling.Length; i++)
                 {
                     var layer = layers[i];
+                    float hasHeight = (layer.Height?.Native != null) ? 1.0f : 0.0f;
                     if (layer.Tiling.X != 0 && layer.Tiling.Y != 0)
-                        _layerTiling[i] = new Vector4(terrainSize.X / layer.Tiling.X, terrainSize.Y / layer.Tiling.Y, 0, 0);
+                        _layerTiling[i] = new Vector4(terrainSize.X / layer.Tiling.X, terrainSize.Y / layer.Tiling.Y, hasHeight, layer.HeightScale);
                     else
-                        _layerTiling[i] = Vector4.One;
+                        _layerTiling[i] = new Vector4(1, 1, hasHeight, layer.HeightScale);
 
                     autoMaskData[i] = new LayerAutoMaskGPU
                     {
@@ -1388,6 +1392,7 @@ namespace Freefall.Components
             var layers = Terrain?.Layers;
             var diffuseList = new List<Texture>();
             var normalList = new List<Texture>();
+            var heightList = new List<Texture>();
 
             if (layers != null)
             {
@@ -1396,8 +1401,10 @@ namespace Freefall.Components
                     var layer = layers[i];
                     if (layer.Diffuse != null && layer.Diffuse.Native != null) diffuseList.Add(layer.Diffuse);
                     if (layer.Normals != null && layer.Normals.Native != null) normalList.Add(layer.Normals);
+                    if (layer.Height != null && layer.Height.Native != null)
+                        heightList.Add(layer.Height);
                 }
-                Debug.Log($"[Terrain] RebuildTextureArrays: {diffuseList.Count} diffuse, {normalList.Count} normals from {layers.Count} layers");
+                Debug.Log($"[Terrain] RebuildTextureArrays: {diffuseList.Count} diffuse, {normalList.Count} normals, {heightList.Count} heights from {layers.Count} layers");
             }
 
             // Also refresh tiling/automask since layer order may have changed
@@ -1419,6 +1426,12 @@ namespace Freefall.Components
                 Debug.Log("[Terrain] Normals missing! Using flat normals.");
                 NormalMapsArray = InternalAssets.FlatNormalArray;
             }
+
+            // Height Fallback (SSDM per-layer displacement heights)
+            if (heightList.Count > 0)
+                HeightMapsArray = Texture.CreateTexture2DArray(device, heightList, stripSrgb: true);
+            else
+                HeightMapsArray = null; // no height data = no displacement
 
             // Build ControlMapsArray for GPU splatmap sampling
             if (Terrain?._legacyControlMaps != null && Terrain._legacyControlMaps.Count > 0)

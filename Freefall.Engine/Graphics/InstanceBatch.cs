@@ -1056,16 +1056,14 @@ namespace Freefall.Graphics
                 commandList.SetGraphicsRoot32BitConstant(0, srvIdx, (uint)pib.PushConstantSlot);
             }
 
-            commandList.ResourceBarrier(new ResourceBarrier(
-                new ResourceTransitionBarrier(visibleIndicesBuffers[frameIndex],
-                    ResourceStates.UnorderedAccess,
-                    ResourceStates.NonPixelShaderResource)));
-
             var countBuffer = drawCountBuffers[frameIndex];
 
             if (countBuffer != null)
             {
+                // Batch all pre-draw transitions
                 commandList.ResourceBarrier(new[] {
+                    new ResourceBarrier(new ResourceTransitionBarrier(visibleIndicesBuffers[frameIndex],
+                        ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource)),
                     new ResourceBarrier(new ResourceTransitionBarrier(commandBuffer,
                         ResourceStates.UnorderedAccess, ResourceStates.IndirectArgument)),
                     new ResourceBarrier(new ResourceTransitionBarrier(countBuffer,
@@ -1081,19 +1079,25 @@ namespace Freefall.Graphics
                     0
                 );
 
+                // Batch all post-draw transitions
                 commandList.ResourceBarrier(new[] {
                     new ResourceBarrier(new ResourceTransitionBarrier(commandBuffer,
                         ResourceStates.IndirectArgument, ResourceStates.UnorderedAccess)),
                     new ResourceBarrier(new ResourceTransitionBarrier(countBuffer,
-                        ResourceStates.IndirectArgument, ResourceStates.UnorderedAccess))
+                        ResourceStates.IndirectArgument, ResourceStates.UnorderedAccess)),
+                    new ResourceBarrier(new ResourceTransitionBarrier(visibleIndicesBuffers[frameIndex],
+                        ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess))
                 });
             }
             else
             {
                 // Fallback: no count buffer (after resize, before next Cull())
-                commandList.ResourceBarrier(new ResourceBarrier(
-                    new ResourceTransitionBarrier(commandBuffer,
-                        ResourceStates.UnorderedAccess, ResourceStates.IndirectArgument)));
+                commandList.ResourceBarrier(new[] {
+                    new ResourceBarrier(new ResourceTransitionBarrier(visibleIndicesBuffers[frameIndex],
+                        ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource)),
+                    new ResourceBarrier(new ResourceTransitionBarrier(commandBuffer,
+                        ResourceStates.UnorderedAccess, ResourceStates.IndirectArgument))
+                });
 
                 commandList.ExecuteIndirect(
                     Engine.Device.BindlessCommandSignature,
@@ -1104,15 +1108,13 @@ namespace Freefall.Graphics
                     0
                 );
 
-                commandList.ResourceBarrier(new ResourceBarrier(
-                    new ResourceTransitionBarrier(commandBuffer,
-                        ResourceStates.IndirectArgument, ResourceStates.UnorderedAccess)));
+                commandList.ResourceBarrier(new[] {
+                    new ResourceBarrier(new ResourceTransitionBarrier(commandBuffer,
+                        ResourceStates.IndirectArgument, ResourceStates.UnorderedAccess)),
+                    new ResourceBarrier(new ResourceTransitionBarrier(visibleIndicesBuffers[frameIndex],
+                        ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess))
+                });
             }
-
-            commandList.ResourceBarrier(new ResourceBarrier(
-                new ResourceTransitionBarrier(visibleIndicesBuffers[frameIndex],
-                    ResourceStates.NonPixelShaderResource,
-                    ResourceStates.UnorderedAccess)));
 
         }
 

@@ -73,8 +73,8 @@ namespace Freefall.Graphics
             _shader.SetParam("SurfaceThickness", Engine.Settings.SSSSurfaceThickness);
             _shader.SetParam("BilinearThreshold", Engine.Settings.SSSBilinearThreshold);
             _shader.SetParam("ShadowContrast", Engine.Settings.SSSShadowContrast);
-            _shader.SetParam("FarDepthValue", 0f);   // Reverse-Z
-            _shader.SetParam("NearDepthValue", 1f);   // Reverse-Z
+            _shader.SetParam("FarDepthValue", 0f);   // Reverse-Z: far=0
+            _shader.SetParam("NearDepthValue", 1f);   // Reverse-Z: near=1
             _shader.SetParam("TexWidth", (uint)texWidth);
             _shader.SetParam("TexHeight", (uint)texHeight);
 

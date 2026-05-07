@@ -17,7 +17,7 @@ namespace Freefall.Graphics
     [AssetPacker(".mesh")]
     public class MeshPacker : AssetPacker<MeshData>
     {
-        public override int Version => 6;
+        public override int Version => 7;
 
         public override void Pack(BinaryWriter w, MeshData data)
         {
@@ -25,6 +25,7 @@ namespace Freefall.Graphics
             w.WriteArray(data.Positions);
             w.WriteArray(data.Normals);
             w.WriteArray(data.UVs);
+            w.WriteArray(data.Tangents);
 
             // Indices
             w.WriteArray(data.Indices);
@@ -102,6 +103,12 @@ namespace Freefall.Graphics
             data.Positions = r.ReadVector3Array();
             data.Normals = r.ReadVector3Array();
             data.UVs = r.ReadVector2Array();
+            
+            // Tangents (v7+)
+            if (version >= 7)
+                data.Tangents = r.ReadVector4Array();
+            else
+                data.Tangents = null;
 
             // Indices
             data.Indices = r.ReadUInt32Array();

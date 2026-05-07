@@ -230,49 +230,60 @@ namespace Freefall.Assets
         }
     }
 
-    // ── Stamps (decal-like height placements, grouped by brush texture) ──
+    // ── Stamps (decal-like height placements) ──
 
     /// <summary>
-    /// A single stamp placement — position, radius, strength, falloff, rotation.
-    /// Lightweight: no texture reference (owned by the parent StampGroup).
+    /// A single stamp placement — self-contained with brush, blend mode, and all parameters.
+    /// The baker groups stamps by (Brush, BlendMode, Opacity) at dispatch time.
     /// </summary>
     [Serializable]
-    public class StampInstance
+    public class Stamp
     {
-        /// <summary>Terrain-space UV position [0..1]</summary>
-        public Vector2 Position = new(0.5f, 0.5f);
+        public bool Enabled = true;
+
+        [DirtyFlag(HeightAll)]
+        public Texture Brush;
+
+        [DirtyFlag(HeightAll)]
+        public HeightBlendMode BlendMode = HeightBlendMode.Add;
 
         /// <summary>Stamp radius in terrain-space UV [0..1]</summary>
-        [ValueRange(0f, 1f)]
-        public float Radius = 0.1f;
+        [DirtyFlag(HeightAll)]
+        [ValueRange(0f, 2f)]
+        public float Radius = 0.5f;
 
         /// <summary>Stamp height strength</summary>
+        [DirtyFlag(HeightAll)]
         [ValueRange(0f, 1f)]
-        public float Strength = 1.0f;
+        public float Strength = 0.5f;
 
-        /// <summary>Falloff exponent (1 = linear, 2 = smooth)</summary>
-        [ValueRange(1f, 2f)]
-        public float Falloff = 2.0f;
+        /// <summary>Terrain-space UV position [0..1]</summary>
+        [DirtyFlag(HeightAll)]
+        [Browsable(false)]
+        public Vector2 Position = new(0.5f, 0.5f);
+
+        [ValueRange(0f, 1f)]
+        public float PositionX
+        {
+            get => Position.X;
+            set => Position = new Vector2(value, Position.Y);
+        }
+
+        [ValueRange(0f, 1f)]
+        public float PositionY
+        {
+            get => Position.Y;
+            set => Position = new Vector2(Position.X, value);
+        }
 
         /// <summary>Rotation in degrees</summary>
+        [DirtyFlag(HeightAll)]
         [ValueRange(0f, 360f)]
         public float Rotation = 0;
-    }
 
-    /// <summary>
-    /// A group of stamp instances sharing the same brush texture and blend mode.
-    /// Each click in the editor appends a StampInstance to the active group.
-    /// GPU bake dispatches one pass per group with a StructuredBuffer of instances.
-    /// </summary>
-    [Serializable]
-    public class StampGroup
-    {
-        public string Name = "Stamp Group";
-        public Texture Brush;
-        public HeightBlendMode BlendMode = HeightBlendMode.Add;
+        /// <summary>Fraction of radius at full strength before falloff begins (0 = fully soft, 1 = no fade)</summary>
+        [DirtyFlag(HeightAll)]
         [ValueRange(0f, 1f)]
-        public float Opacity = 1.0f;
-        public bool Enabled = true;
-        public List<StampInstance> Instances = new();
+        public float Falloff = 0.5f;
     }
 }

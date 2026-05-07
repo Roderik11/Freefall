@@ -133,10 +133,11 @@ namespace Freefall.Assets
         internal byte[] PendingBakedHeightmapBytes;
 
         /// <summary>
-        /// Stamp groups — decal-like height placements grouped by brush texture.
-        /// Baked after HeightLayers, one GPU pass per group.
+        /// Stamps — decal-like height placements. Each stamp is self-contained.
+        /// The baker groups stamps by (Brush, BlendMode, Opacity) at dispatch time.
         /// </summary>
-        public List<StampGroup> StampGroups = [];
+        [FormerlySerializedAs("StampGroups")]
+        public List<Stamp> Stamps = [];
 
         /// <summary>
         /// The final heightmap: baked result if available, otherwise the first ImportHeightLayer source.
@@ -231,6 +232,14 @@ namespace Freefall.Assets
 
             [DirtyFlag(TerrainDirtyFlags.TextureArrays | TerrainDirtyFlags.AlbedoBake)]
             public Texture Normals;
+
+            [DirtyFlag(TerrainDirtyFlags.TextureArrays)]
+            public Texture Height;
+
+            /// <summary>Per-layer displacement height scale (multiplied with global SSDM scale).</summary>
+            [DirtyFlag(TerrainDirtyFlags.LayerParams)]
+            [ValueRange(0f, 5f)]
+            public float HeightScale = 1.0f;
 
             [DirtyFlag(TerrainDirtyFlags.SplatAll)]
             public Vector2 Tiling = Vector2.One;

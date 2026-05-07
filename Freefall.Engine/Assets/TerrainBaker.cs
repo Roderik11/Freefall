@@ -12,7 +12,7 @@ namespace Freefall.Assets
 {
     /// <summary>
     /// GPU-based height layer + stamp compositor. Iterates HeightLayers bottom-to-top,
-    /// then applies StampGroups (one dispatch per group with batched instances).
+    /// then applies Stamps (grouped by brush at dispatch time).
     /// Output: R16_Float heightmap at configurable resolution.
     /// </summary>
     public class TerrainBaker : IDisposable
@@ -60,7 +60,7 @@ namespace Freefall.Assets
         /// <summary>Which ControlMap category to paint.</summary>
         public enum ControlMapTarget { Height, Splatmap, Density }
 
-        /// <summary>GPU struct matching HLSL StampData. Must be 32 bytes (8-float aligned).</summary>
+        /// <summary>GPU struct matching HLSL StampData. 32 bytes.</summary>
         [StructLayout(LayoutKind.Sequential)]
         private struct StampDataGPU
         {
@@ -69,7 +69,8 @@ namespace Freefall.Assets
             public float Strength;
             public float Falloff;
             public float Rotation;
-            public Vector2 _pad;
+            public uint BrushIdx;
+            public uint BlendMode;
         }
 
         private void EnsureInitialized()
@@ -90,11 +91,11 @@ namespace Freefall.Assets
         }
 
         /// <summary>
-        /// Bake all HeightLayers + StampGroups into the terrain's BakedHeightmap.
+        /// Bake all HeightLayers + Stamps into the terrain's BakedHeightmap.
         /// </summary>
         public void Bake(Terrain terrain, ID3D12GraphicsCommandList cmd)
         {
-            if (terrain.HeightLayers.Count == 0 && terrain.StampGroups.Count == 0) return;
+            if (terrain.HeightLayers.Count == 0 && terrain.Stamps.Count == 0) return;
 
             EnsureInitialized();
             EnsureTexture(terrain.HeightmapResolution);
@@ -125,12 +126,8 @@ namespace Freefall.Assets
                     DispatchErosion(cmd, erosion, res, groups);
             }
 
-            // Phase 3: Stamp groups (after layers)
-            foreach (var group in terrain.StampGroups)
-            {
-                if (!group.Enabled || group.Instances.Count == 0 || group.Brush == null) continue;
-                DispatchStampGroup(cmd, group, groups);
-            }
+            // Phase 3: Stamps (after layers)
+            DispatchStamps(cmd, terrain.Stamps, groups);
 
             // Transition heightmap from UAV back to Common so it can be
             // implicitly promoted to SRV by the height-range pyramid builder
@@ -167,34 +164,46 @@ namespace Freefall.Assets
             cmd.ResourceBarrierUnorderedAccessView(_heightTexture);
         }
 
-        private void DispatchStampGroup(ID3D12GraphicsCommandList cmd, StampGroup group, uint groups)
+        /// <summary>
+        /// Dispatches all stamps in a single compute pass.
+        /// Each stamp carries its own brush index and blend mode in the structured buffer.
+        /// </summary>
+        private void DispatchStamps(ID3D12GraphicsCommandList cmd, List<Stamp> stamps, uint groups)
         {
-            int count = group.Instances.Count;
-            EnsureStampBuffer(count);
+            // Collect enabled stamps with valid brushes
+            int count = 0;
+            foreach (var s in stamps)
+            {
+                if (s.Enabled && s.Brush != null)
+                    count++;
+            }
+            if (count == 0) return;
 
-            // Upload stamp instances
+            // Upload all stamp data in one pass
+            EnsureStampBuffer(count);
             unsafe
             {
                 var dst = _stampBuffer.WritePtr<StampDataGPU>();
-                for (int i = 0; i < count; i++)
+                int idx = 0;
+                foreach (var s in stamps)
                 {
-                    var s = group.Instances[i];
-                    dst[i] = new StampDataGPU
+                    if (!s.Enabled || s.Brush == null) continue;
+                    dst[idx++] = new StampDataGPU
                     {
                         Position = s.Position,
                         Radius = s.Radius,
                         Strength = s.Strength,
                         Falloff = s.Falloff,
                         Rotation = s.Rotation,
+                        BrushIdx = s.Brush.BindlessIndex,
+                        BlendMode = (uint)s.BlendMode,
                     };
                 }
             }
 
-            _cs.SetPushConstant(_kernelStampGroup, "Source", group.Brush.BindlessIndex);
+            // Single dispatch — blend mode is per-stamp in the buffer
             _cs.SetPushConstant(_kernelStampGroup, "Output", _heightUAV);
             _cs.SetBuffer(_kernelStampGroup, "StampBuf", _stampBuffer);
-            _cs.SetPushConstant(_kernelStampGroup, "BlendMode", (uint)group.BlendMode);
-            _cs.SetParam(_kernelStampGroup, "Opacity", group.Opacity);
             _cs.SetPushConstant(_kernelStampGroup, "StampCount", (uint)count);
             _cs.Dispatch(_kernelStampGroup, cmd, groups, groups);
             cmd.ResourceBarrierUnorderedAccessView(_heightTexture);

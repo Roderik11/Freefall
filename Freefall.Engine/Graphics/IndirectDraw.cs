@@ -27,7 +27,7 @@ namespace Freefall.Graphics
     {
         // Root constants matching slots 2-15 in push constant buffer
         public uint DescriptorBufferIdx;    // Slot 2: Index to InstanceDescriptor structured buffer
-        public uint Reserved0;              // Slot 3: Reserved (was MaterialIdBufferIdx)
+        public uint TanBufferIdx;           // Slot 3: Index to tangent buffer (float4 per vertex)
         public uint SortedIndicesBufferIdx; // Slot 4: Index to sorted indices buffer
         public uint BoneWeightsBufferIdx;   // Slot 5: Index to bone weights buffer (0 for static)
         public uint BonesBufferIdx;         // Slot 6: Index to bones buffer (0 for static)

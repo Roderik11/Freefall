@@ -52,6 +52,13 @@ namespace Freefall
                 foreach (var v in arr) w.Write(v);
         }
 
+        public static void WriteArray(this BinaryWriter w, Vector4[] arr)
+        {
+            w.Write(arr?.Length ?? 0);
+            if (arr != null)
+                foreach (var v in arr) w.Write(v);
+        }
+
         // ── Read ──
 
         public static Vector2 ReadVector2(this BinaryReader r)
@@ -100,6 +107,15 @@ namespace Freefall
             var arr = new uint[count];
             for (int i = 0; i < count; i++)
                 arr[i] = r.ReadUInt32();
+            return arr;
+        }
+
+        public static Vector4[] ReadVector4Array(this BinaryReader r)
+        {
+            int count = r.ReadInt32();
+            var arr = new Vector4[count];
+            for (int i = 0; i < count; i++)
+                arr[i] = r.ReadVector4();
             return arr;
         }
     }

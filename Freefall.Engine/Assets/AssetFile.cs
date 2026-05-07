@@ -16,6 +16,7 @@ namespace Freefall.Assets
         public static void Save(string path, Asset asset)
         {
             NativeImporter.Save(path, asset);
+            asset.ClearDirty();
         }
 
         /// <summary>

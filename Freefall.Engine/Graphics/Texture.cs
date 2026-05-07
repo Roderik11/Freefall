@@ -90,7 +90,7 @@ namespace Freefall.Graphics
              if (formatsMatch && dimsMatch && !forceDecompress)
                  return CreateTexture2DArrayCopy(device, textures, refDesc, stripSrgb);
              else
-                 return CreateTexture2DArrayCompute(device, textures, refDesc);
+                 return CreateTexture2DArrayCompute(device, textures, refDesc, stripSrgb);
         }
 
         /// <summary>Fast path: all textures share the same format. Direct GPU copy.</summary>
@@ -155,7 +155,7 @@ namespace Freefall.Graphics
         /// Creates an R8G8B8A8 array and uses a compute shader to sample each source
         /// (GPU auto-decompresses any block format) and write to the array slice.
         /// </summary>
-        private static Texture CreateTexture2DArrayCompute(GraphicsDevice device, IList<Texture> textures, ResourceDescription refDesc)
+        private static Texture CreateTexture2DArrayCompute(GraphicsDevice device, IList<Texture> textures, ResourceDescription refDesc, bool stripSrgb = false)
         {
              Debug.Log($"[Texture] CreateTexture2DArray: mixed formats detected, using compute copy for {textures.Count} textures");
 
@@ -173,14 +173,18 @@ namespace Freefall.Graphics
              int arraySize = textures.Count;
 
              // Determine output format: use non-sRGB RGBA for UAV compatibility.
-             // The SRV will be created with the sRGB variant if any source is sRGB.
+             // The SRV will be created with the sRGB variant if any source is sRGB,
+             // unless stripSrgb is set (e.g. for heightmaps that should always be linear).
              bool anySrgb = false;
-             for (int i = 0; i < textures.Count; i++)
+             if (!stripSrgb)
              {
-                 var fmt = textures[i].Native.Description.Format;
-                 if (fmt == Format.BC1_UNorm_SRgb || fmt == Format.BC7_UNorm_SRgb || 
-                     fmt == Format.R8G8B8A8_UNorm_SRgb || fmt == Format.B8G8R8A8_UNorm_SRgb)
-                     anySrgb = true;
+                 for (int i = 0; i < textures.Count; i++)
+                 {
+                     var fmt = textures[i].Native.Description.Format;
+                     if (fmt == Format.BC1_UNorm_SRgb || fmt == Format.BC7_UNorm_SRgb || 
+                         fmt == Format.R8G8B8A8_UNorm_SRgb || fmt == Format.B8G8R8A8_UNorm_SRgb)
+                         anySrgb = true;
+                 }
              }
              var uavFormat = Format.R8G8B8A8_UNorm;
              var srvFormat = anySrgb ? Format.R8G8B8A8_UNorm_SRgb : Format.R8G8B8A8_UNorm;
@@ -277,7 +281,7 @@ void CSCopySlice(uint3 id : SV_DispatchThreadID) {
                          tempDescriptors.Add(srcSrvIdx);
                          var srcSrvDesc = new ShaderResourceViewDescription
                          {
-                             Format = srcDesc.Format,
+                             Format = stripSrgb ? ToLinear(srcDesc.Format) : srcDesc.Format,
                              ViewDimension = ShaderResourceViewDimension.Texture2D,
                              Shader4ComponentMapping = ShaderComponentMapping.Default,
                              Texture2D = new Texture2DShaderResourceView { MostDetailedMip = 0, MipLevels = (uint)srcMips }

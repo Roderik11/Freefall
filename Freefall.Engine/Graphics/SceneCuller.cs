@@ -269,26 +269,30 @@ namespace Freefall.Graphics
             var commandBuffer = _gpuCommandBuffers[f];
             if (commandBuffer == null) return;
 
-            // Transition for reading
-            commandList.ResourceBarrier(new ResourceBarrier(
-                new ResourceTransitionBarrier(_visibleIndicesBuffers[f],
-                    ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource)));
-            commandList.ResourceBarrier(new ResourceBarrier(
-                new ResourceTransitionBarrier(commandBuffer,
-                    ResourceStates.UnorderedAccess, ResourceStates.IndirectArgument)));
+            // Transition for reading (batched)
+            commandList.ResourceBarrier(new[] {
+                new ResourceBarrier(
+                    new ResourceTransitionBarrier(_visibleIndicesBuffers[f],
+                        ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource)),
+                new ResourceBarrier(
+                    new ResourceTransitionBarrier(commandBuffer,
+                        ResourceStates.UnorderedAccess, ResourceStates.IndirectArgument))
+            });
 
             commandList.ExecuteIndirect(
                 Engine.Device.BindlessCommandSignature,
                 (uint)subBatchCount,
                 commandBuffer, 0, null, 0);
 
-            // Transition back
-            commandList.ResourceBarrier(new ResourceBarrier(
-                new ResourceTransitionBarrier(commandBuffer,
-                    ResourceStates.IndirectArgument, ResourceStates.UnorderedAccess)));
-            commandList.ResourceBarrier(new ResourceBarrier(
-                new ResourceTransitionBarrier(_visibleIndicesBuffers[f],
-                    ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess)));
+            // Transition back (batched)
+            commandList.ResourceBarrier(new[] {
+                new ResourceBarrier(
+                    new ResourceTransitionBarrier(commandBuffer,
+                        ResourceStates.IndirectArgument, ResourceStates.UnorderedAccess)),
+                new ResourceBarrier(
+                    new ResourceTransitionBarrier(_visibleIndicesBuffers[f],
+                        ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess))
+            });
         }
 
         #endregion
@@ -509,26 +513,30 @@ namespace Freefall.Graphics
             var commandBuffer = _shadowCommandBuffers[f, cascadeIndex];
             if (commandBuffer == null) return;
 
-            // Transition for reading
-            commandList.ResourceBarrier(new ResourceBarrier(
-                new ResourceTransitionBarrier(_shadowVisibleIndicesBuffers[f, cascadeIndex],
-                    ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource)));
-            commandList.ResourceBarrier(new ResourceBarrier(
-                new ResourceTransitionBarrier(commandBuffer,
-                    ResourceStates.UnorderedAccess, ResourceStates.IndirectArgument)));
+            // Transition for reading (batched)
+            commandList.ResourceBarrier(new[] {
+                new ResourceBarrier(
+                    new ResourceTransitionBarrier(_shadowVisibleIndicesBuffers[f, cascadeIndex],
+                        ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource)),
+                new ResourceBarrier(
+                    new ResourceTransitionBarrier(commandBuffer,
+                        ResourceStates.UnorderedAccess, ResourceStates.IndirectArgument))
+            });
 
             commandList.ExecuteIndirect(
                 Engine.Device.BindlessCommandSignature,
                 (uint)subBatchCount,
                 commandBuffer, 0, null, 0);
 
-            // Transition back
-            commandList.ResourceBarrier(new ResourceBarrier(
-                new ResourceTransitionBarrier(commandBuffer,
-                    ResourceStates.IndirectArgument, ResourceStates.UnorderedAccess)));
-            commandList.ResourceBarrier(new ResourceBarrier(
-                new ResourceTransitionBarrier(_shadowVisibleIndicesBuffers[f, cascadeIndex],
-                    ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess)));
+            // Transition back (batched)
+            commandList.ResourceBarrier(new[] {
+                new ResourceBarrier(
+                    new ResourceTransitionBarrier(commandBuffer,
+                        ResourceStates.IndirectArgument, ResourceStates.UnorderedAccess)),
+                new ResourceBarrier(
+                    new ResourceTransitionBarrier(_shadowVisibleIndicesBuffers[f, cascadeIndex],
+                        ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess))
+            });
         }
 
         #endregion

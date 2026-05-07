@@ -44,6 +44,7 @@ namespace Freefall.Assets.Importers
         public bool GenerateMips = true;
         public bool IsNormalMap = false;
         public bool AlphaFromGrayscale = false;
+        public bool PremultiplyAlpha = false;
 
         /// <summary>
         /// Set when the user manually saves settings. Prevents auto-detection
@@ -54,7 +55,7 @@ namespace Freefall.Assets.Importers
 
         // Suffixes that indicate linear (non-color) data maps
         private static readonly string[] LinearSuffixes = {
-            "_Nor", "Normal", "Norm", "Nrm",
+            "_Nor", "Normal", "Norm", "Nrm", "_N",
             "_Spec", "_Specular", "_SpecGloss",
             "_Roughness", "_Rough",
             "_Metal", "_Metallic", "_MetallicGloss",
@@ -68,7 +69,7 @@ namespace Freefall.Assets.Importers
 
         // Suffixes that indicate normal maps — use BC5 (two high-quality channels)
         private static readonly string[] NormalSuffixes = {
-            "_Nor", "Normal","Norm", "Nrm",
+            "_Nor", "Normal","Norm", "Nrm", "_N",
             "_DetailNormal",
             "_BumpMap", "_Bump",
         };
@@ -195,12 +196,12 @@ namespace Freefall.Assets.Importers
                 if (GenerateMips)
                     args += " -m 0";
 
-                // WIC composites transparent PNG pixels against white during decode,
-                // causing white fringing at alpha edges. -pmalpha fixes this by
-                // multiplying RGB×A, so transparent pixels stay black (0,0,0,0).
-                // For alpha-clip shaders this is safe: where α≈1 RGB is unchanged,
-                // where α<threshold the pixel is discarded anyway.
-                if (hasAlpha)
+                // Premultiplied alpha: multiplies RGB×A so transparent pixels stay
+                // black (0,0,0,0), fixing white fringing at alpha edges.
+                // Off by default — enable per-texture for alpha-clip materials
+                // (leaves, grass) where fringing is visible. Enabling this on
+                // textures with empty or packed alpha will produce black RGB.
+                if (PremultiplyAlpha && hasAlpha)
                     args += " -pmalpha";
 
                 if (sRGB)

@@ -102,6 +102,7 @@ namespace Freefall.Graphics
         private VertexBufferView _normView;
         private ID3D12Resource _uvBuffer = null!;
         private VertexBufferView _uvView;
+        private ID3D12Resource? _tanBuffer;
 
         private int _vertexCount;
         private ID3D12Resource _indexBuffer = null!;
@@ -113,6 +114,7 @@ namespace Freefall.Graphics
         public uint PosBufferIndex { get; internal set; }
         public uint NormBufferIndex { get; internal set; }
         public uint UVBufferIndex { get; internal set; }
+        public uint TanBufferIndex { get; internal set; }
         public uint IndexBufferIndex { get; internal set; }
         
         public BoundingBox BoundingBox { get; set; }
@@ -178,13 +180,13 @@ namespace Freefall.Graphics
 
         public Mesh(GraphicsDevice device, Vector3[] positions, Vector3[] normals, Vector2[] uvs, uint[] indices)
         {
-            CreateBuffers(device, positions, normals, uvs, indices);
+            CreateBuffers(device, positions, normals, null, uvs, indices);
             MarkReady();
         }
 
         public Mesh(GraphicsDevice device, MeshData data)
         {
-            CreateBuffers(device, data.Positions, data.Normals, data.UVs, data.Indices);
+            CreateBuffers(device, data.Positions, data.Normals, data.Tangents, data.UVs, data.Indices);
             MeshParts.AddRange(data.Parts);
             BoundingBox = data.BoundingBox;
             if (data.LODs != null && data.LODs.Count > 0)
@@ -225,7 +227,7 @@ namespace Freefall.Graphics
             // i.e., "Quick call to CreateCommittedResource".
             // So we can reuse CreateBuffers but we need to CHANGE it to NOT do the CopyQueueWait.
             
-            mesh.CreateBuffersAsync(device, data.Positions, data.Normals, data.UVs, data.Indices);
+            mesh.CreateBuffersAsync(device, data.Positions, data.Normals, data.Tangents, data.UVs, data.Indices);
             
             // Bone weights?
             if (data.BoneWeights != null && data.BoneWeights.Length > 0)
@@ -237,7 +239,7 @@ namespace Freefall.Graphics
             return mesh;
         }
 
-        private void CreateBuffers(GraphicsDevice device, Vector3[] positions, Vector3[] normals, Vector2[] uvs, uint[] indices)
+        private void CreateBuffers(GraphicsDevice device, Vector3[] positions, Vector3[] normals, Vector4[] tangents, Vector2[] uvs, uint[] indices)
         {
             // Legacy Synchronous Path
              _vertexCount = positions.Length;
@@ -264,6 +266,14 @@ namespace Freefall.Graphics
             UVBufferIndex = device.AllocateBindlessIndex();
             CreateStructuredBufferSRV(device, _uvBuffer, (uint)uvs.Length, 8, UVBufferIndex);
 
+            // Tangent buffer (float4, 16 bytes per vertex)
+            if (tangents != null && tangents.Length > 0)
+            {
+                _tanBuffer = CreateBuffer(device, tangents);
+                TanBufferIndex = device.AllocateBindlessIndex();
+                CreateStructuredBufferSRV(device, _tanBuffer, (uint)tangents.Length, 16, TanBufferIndex);
+            }
+
             if (indices != null)
             {
                 _indexCount = indices.Length;
@@ -275,7 +285,7 @@ namespace Freefall.Graphics
             }
         }
         
-        private void CreateBuffersAsync(GraphicsDevice device, Vector3[] positions, Vector3[] normals, Vector2[] uvs, uint[] indices)
+        private void CreateBuffersAsync(GraphicsDevice device, Vector3[] positions, Vector3[] normals, Vector4[] tangents, Vector2[] uvs, uint[] indices)
         {
             // 1. Create GPU Resources (Fast, no upload)
             _vertexCount = positions.Length;
@@ -300,6 +310,15 @@ namespace Freefall.Graphics
 
             UVBufferIndex = device.AllocateBindlessIndex();
             CreateStructuredBufferSRV(device, _uvBuffer, (uint)uvs.Length, 8, UVBufferIndex);
+
+            // Tangent buffer (float4, 16 bytes per vertex)
+            if (tangents != null && tangents.Length > 0)
+            {
+                _tanBuffer = device.CreateDefaultBuffer(tangents.Length * 16, ResourceFlags.None);
+                TanBufferIndex = device.AllocateBindlessIndex();
+                CreateStructuredBufferSRV(device, _tanBuffer, (uint)tangents.Length, 16, TanBufferIndex);
+                StreamingManager.Instance.EnqueueBufferUpload(_tanBuffer, tangents);
+            }
             
             // 3. Queue Uploads
             StreamingManager.Instance.EnqueueBufferUpload(_posBuffer, positions);
@@ -420,7 +439,6 @@ namespace Freefall.Graphics
                 if (i < 5)
                     diag.Add($"[{i}] src='{source.Bones[i].Name}' dst='{Bones[i].Name}' len1={len1:F6} len2={len2:F6} sf={Bones[i].ScaleFactor:F6}");
             }
-            System.IO.File.WriteAllLines(@"d:\Projects\2026\Freefall\.tmp\bindpose.txt", diag);
         }
         public void Dispose()
         {
@@ -434,6 +452,7 @@ namespace Freefall.Graphics
             _uvBuffer?.Dispose();
             _indexBuffer?.Dispose();
             _boneWeightBuffer?.Dispose();
+            _tanBuffer?.Dispose();
 
             // Release bindless descriptor slots
             if (device != null)
@@ -443,6 +462,7 @@ namespace Freefall.Graphics
                 if (UVBufferIndex > 0) device.ReleaseBindlessIndex(UVBufferIndex);
                 if (IndexBufferIndex > 0) device.ReleaseBindlessIndex(IndexBufferIndex);
                 if (BoneWeightBufferIndex > 0) device.ReleaseBindlessIndex(BoneWeightBufferIndex);
+                if (TanBufferIndex > 0) device.ReleaseBindlessIndex(TanBufferIndex);
             }
         }
 
