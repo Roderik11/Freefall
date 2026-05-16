@@ -61,6 +61,12 @@ namespace Freefall.Reflection
             }
         }
 
+        public bool GetAttribute<K>(out K attribute) where K : Attribute
+        {
+            attribute = _field.GetAttribute<K>();
+            return attribute != null;
+        }
+
         public bool IsList => typeof(IList).IsAssignableFrom(Type);
         public bool IsDictionary => typeof(IDictionary).IsAssignableFrom(Type);
 

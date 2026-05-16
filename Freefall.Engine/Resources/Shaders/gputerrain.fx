@@ -266,7 +266,7 @@ FragmentOutput PS(VertexOutput input)
     // Partial weight = partial blend with what's beneath.
     bool hasAnyLayer = false;
     float blendedHeight = 0;
-    bool hasExplicitHeight = false;
+    
     for (uint i = 0; i < sliceCount; ++i)
     {
         uint startIndex = i * 4;
@@ -314,7 +314,6 @@ FragmentOutput PS(VertexOutput input)
                 float h = HeightMaps.Sample(sampData, float3(texuv, layer)).r;
                 h *= LayerTiling[layer].w; // per-layer height scale
                 blendedHeight = lerp(blendedHeight, h, weight);
-                hasExplicitHeight = true;
             }
         }
     }
@@ -330,13 +329,6 @@ FragmentOutput PS(VertexOutput input)
         terrainNormal.x += nXY.x * normalScale;
         terrainNormal.z += nXY.y * normalScale;
         terrainNormal = normalize(terrainNormal);
-
-        // Fallback: derive height from normal when no explicit height maps contributed
-        if (!hasExplicitHeight)
-        {
-            float nZ = sqrt(saturate(1.0 - dot(nXY, nXY)));
-            blendedHeight = 1.0 - nZ;
-        }
     }
 
     output.Albedo = float4(color.rgb, 0);
@@ -394,15 +386,15 @@ FragmentOutput PS(VertexOutput input)
             output.Albedo = float4(blendedHeight, blendedHeight, blendedHeight, 0);
     }
 
-    // SSDM (Lobel 2008): displacement = projected_normal * height
+    // SSDM: displacement = projected_normal * height
     // faceNormal gives clean displacement direction for terrain.
     // Smooth the height for displacement using ddx/ddy to prevent fold-over:
-    // average with neighbors reduces sharp gradients at cobblestone edges.
-    float hx = ddx(blendedHeight);
-    float hy = ddy(blendedHeight);
-    float smoothHeight = blendedHeight - 0.5 * (abs(hx) + abs(hy));
-    smoothHeight = max(smoothHeight, 0);
-    float worldHeight = smoothHeight * 0.05;
+    // average with neighbors reduces sharp gradients at  edges.
+    //float hx = ddx(blendedHeight);
+    //float hy = ddy(blendedHeight);
+    //float smoothHeight = blendedHeight - 0.5 * (abs(hx) + abs(hy));
+    //smoothHeight = max(smoothHeight, 0);
+    float worldHeight = blendedHeight * 0.05;
 
     float4 clipPos = mul(float4(input.WorldPos, 1), ViewProjection);
     float4 clipDisp = mul(float4(input.WorldPos + faceNormal * worldHeight, 1), ViewProjection);

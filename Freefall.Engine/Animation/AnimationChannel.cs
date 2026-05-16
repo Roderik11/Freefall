@@ -38,7 +38,7 @@ namespace Freefall.Animation
 
         public Vector3 GetValue(float time)
         {
-            if (Count < 1) return Vector3.One;
+            if (Count < 1) return Vector3.Zero;
             if (Count == 1) return this[0].Value;
 
             int index = GetKeyframe(time);
@@ -91,7 +91,7 @@ namespace Freefall.Animation
                 if (frameTime == time) return i;
                 if (frameTime > time) return i < 2 ? 0 : i - 1;
             }
-            return 0;
+            return Count - 1;
         }
     }
 
@@ -164,7 +164,7 @@ namespace Freefall.Animation
                 if (frameTime == time) return i;
                 if (frameTime > time) return i < 2 ? 0 : i - 1;
             }
-            return 0;
+            return Count - 1;
         }
     }
 

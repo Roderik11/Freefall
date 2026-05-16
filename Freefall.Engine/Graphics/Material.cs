@@ -141,6 +141,7 @@ namespace Freefall.Graphics
         }
     }
 
+    [CreateAsset("Material")]
     public class Material : Asset, IDisposable
     {
         // Per-pass PSOs (Apex pattern for multi-pass rendering like shadow maps)
@@ -499,7 +500,7 @@ namespace Freefall.Graphics
                         5 => new[] { Format.R16G16B16A16_Float, Format.R16G16B16A16_SNorm, Format.R8G8B8A8_UNorm, Format.R32_Float, Format.R32_Float },
                         4 => new[] { Format.R16G16B16A16_Float, Format.R16G16B16A16_SNorm, Format.R8G8B8A8_UNorm, Format.R32_Float },
                         3 => new[] { Format.R16G16B16A16_Float, Format.R16G16B16A16_SNorm, Format.R8G8B8A8_UNorm },
-                        2 => new[] { Format.R16G16B16A16_Float, Format.R32_Float }, // Composite + EntityId
+                        2 => new[] { Format.R8G8B8A8_UNorm, Format.R32_Float }, // Composite + EntityId (Forward pass)
                         _ => new[] { Format.R8G8B8A8_UNorm }
                     };
                     
@@ -557,6 +558,18 @@ namespace Freefall.Graphics
                     }
                 }
 
+                // Per-pass blend state override
+                var passBlendDesc = blendDesc;
+                if (passRS != null && passRS.BlendMode != "Opaque")
+                {
+                    passBlendDesc = passRS.BlendMode switch
+                    {
+                        "Additive" => new BlendDescription(Blend.One, Blend.One),
+                        "AlphaBlend" => BlendDescription.AlphaBlend,
+                        _ => blendDesc
+                    };
+                }
+
                 if (passType == RenderPass.Shadow)
                 {
                     passRtvFormats = Array.Empty<Format>();
@@ -584,7 +597,7 @@ namespace Freefall.Graphics
                         MeshShader = currentPass.MeshShader!.Bytecode,
                         PixelShader = currentPass.PixelShader?.Bytecode ?? default,
                         RasterizerState = passRasterDesc,
-                        BlendState = blendDesc,
+                        BlendState = passBlendDesc,
                         DepthStencilState = passDepthDesc,
                         RenderTargetFormats = passRtvFormats,
                         DepthStencilFormat = passDepthFormat,
@@ -615,6 +628,7 @@ namespace Freefall.Graphics
                     psoDesc.DepthStencilFormat = passDepthFormat;
                     psoDesc.DepthStencilState = passDepthDesc;
                     psoDesc.RasterizerState = passRasterDesc;
+                    psoDesc.BlendState = passBlendDesc;
                     
                     _passPipelineStates[passIndex] = new PipelineState(device, rootSignature, psoDesc);
                     

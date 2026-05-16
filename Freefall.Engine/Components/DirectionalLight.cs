@@ -9,6 +9,7 @@ using Freefall.Base;
 
 namespace Freefall.Components
 {
+    [Icon("icon_dirlight.png")]
     public class DirectionalLight : Component, IDraw
     {
         public Color3 Color = new Color3(1, 1, 1);
@@ -126,6 +127,32 @@ namespace Freefall.Components
             _instance = this;
         }
 
+        public override void Destroy()
+        {
+            if (_cascadeBuffers != null)
+                for (int i = 0; i < FrameCount; i++)
+                    _cascadeBuffers[i]?.Dispose();
+
+            if (_vpOnlyBuffers != null)
+                for (int i = 0; i < FrameCount; i++)
+                    _vpOnlyBuffers[i]?.Dispose();
+
+            if (_shadowCascadeCBs != null)
+                for (int i = 0; i < FrameCount; i++)
+                    _shadowCascadeCBs[i]?.Dispose();
+
+            if (_gpuCascadeBuffers != null)
+                for (int i = 0; i < FrameCount; i++)
+                    _gpuCascadeBuffers[i]?.Dispose();
+
+            if (_shadowSceneConstantsBuffers != null)
+                for (int i = 0; i < FrameCount; i++)
+                    _shadowSceneConstantsBuffers[i]?.Release();
+
+            if (_instance == this)
+                _instance = null;
+        }
+
         // Called by DeferredRenderer via CommandBuffer
         public void Draw()
         {
@@ -134,6 +161,25 @@ namespace Freefall.Components
                 CommandBuffer.Enqueue(RenderPass.ShadowMap, DrawShadows);
             
             CommandBuffer.Enqueue(RenderPass.Light, DrawLight);
+        }
+
+        /// <summary>
+        /// Broadcast light parameters to all MasterEffects so forward-rendered shaders
+        /// (transparent, glass) can read them from ObjectConstants without coupling.
+        /// Called once per frame during DrawLight, after cascade setup is complete.
+        /// </summary>
+        private void BroadcastLightParams()
+        {
+            int cc = CascadeCount;
+            foreach (var pair in Effect.MasterEffects)
+            {
+                pair.Value.SetParameter("LightColor", Color.ToVector3());
+                pair.Value.SetParameter("LightDirection", Transform.Forward);
+                pair.Value.SetParameter("LightIntensity", Intensity);
+                pair.Value.SetParameterArray("LightSpaces", lightSpace[..cc]);
+                pair.Value.SetParameterArray("Cascades", cascades[..cc]);
+                pair.Value.SetParameter("CascadeCount", cc);
+            }
         }
 
         private static int _diagFrameCount = 0;
@@ -161,6 +207,10 @@ namespace Freefall.Components
             Params.SetParameterArray("Cascades", cascades[..cc]);
             Params.SetParameter("CascadeCount", cc);
             Params.SetParameter("DebugVisualizationMode", Engine.Settings.DebugVisualizationMode);
+            
+            // Broadcast light params to all effects so forward transparent shaders
+            // can access them via ObjectConstants without explicit coupling
+            BroadcastLightParams();
             
             // Apply params to Material cbuffers (commits data but we won't use its graphics PSO)
             Material.SetTextureIndex("LightingCascadeSRV", _activeLightingCascadeSrv);

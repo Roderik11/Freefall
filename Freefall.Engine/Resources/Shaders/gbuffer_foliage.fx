@@ -97,7 +97,7 @@ VSOutput VS(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_InstanceI
     
     // Wind flutter — scale by height above ground (local Y)
     float windWeight = saturate(length(pos.xyz) * 0.3); // higher vertices move more
-    worldPos.xyz += WindDisplacement(worldPos.xyz, windWeight * 1.15);
+    worldPos.xyz += WindDisplacement(worldPos.xyz, windWeight * 0.15);
     
     output.WorldPos = worldPos;
     output.Position = mul(mul(worldPos, View), Projection);

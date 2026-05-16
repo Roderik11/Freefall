@@ -4,6 +4,7 @@ using Freefall.Base;
 
 namespace Freefall.Components
 {
+    [Icon("icon_listener.png")]
     public class AudioListener : Component, IUpdate
     {
         public Listener Listener { get; private set; }

@@ -19,6 +19,7 @@ namespace Freefall.Components
     /// The compute dispatch runs as a custom action on the renderer's command list.
     /// Resource data (heightmap, material, layers, splatmaps) lives in the Terrain asset.
     /// </summary>
+    [Icon("icon_terrain.png")]
     public class TerrainRenderer : Freefall.Base.Component, IDraw, IHeightProvider
     {
         public static bool ComputeReady { get; set; }
@@ -42,6 +43,11 @@ namespace Freefall.Components
 
         // ───── Internal State ─────────────────────────────────────────────
         private const int FrameCount = 3;
+
+        // Per-instance baker — owns all GPU bake resources for this terrain
+        private TerrainBaker _baker;
+        /// <summary>Expose the baker for save/readback operations (TerrainLoader).</summary>
+        public TerrainBaker Baker => _baker;
 
         // Compute pipeline — restricted quadtree (auto-discovers all #pragma kernel entries)
         private ComputeShader? _quadtreeCS;
@@ -264,7 +270,7 @@ namespace Freefall.Components
 
             // Capture references for the lambda
             var terrain = Terrain;
-            var baker = TerrainBaker.Instance;
+            var baker = _baker;
             var pts = strokePoints;
             int count = pointCount;
             var tgt = target;
@@ -336,7 +342,7 @@ namespace Freefall.Components
 
             // Capture for lambda
             var terrain = Terrain;
-            var baker = TerrainBaker.Instance;
+            var baker = _baker;
             var origin = Transform?.Position ?? Vector3.Zero;
             var size = terrain.TerrainSize;
             var maxH = terrain.MaxHeight;
@@ -410,7 +416,7 @@ namespace Freefall.Components
             if (setControlMap == null) return;
 
             var terrain = Terrain;
-            var baker = TerrainBaker.Instance;
+            var baker = _baker;
             var src = sourceTexture;
             int ch = channelIndex;
             var tgt = target;
@@ -439,6 +445,7 @@ namespace Freefall.Components
             // Called before YAML properties are applied, but MaxDepth defaults to 7
             // and CreateHeightRangePyramid doesn't read the heightmap —
             // BuildHeightRangePyramid is deferred to the first DispatchQuadtreeEval.
+            _baker = new TerrainBaker();
             _patchMesh = Mesh.CreatePatch(Engine.Device);
             _meshPartId = MeshRegistry.Register(_patchMesh, 0);
             _totalNodes = CalculateTotalNodes(MaxDepth);
@@ -450,6 +457,126 @@ namespace Freefall.Components
             }
             Debug.Log($"[TerrainRenderer] Awake: MaxDepth={MaxDepth} TotalNodes={_totalNodes} MaxPatches={MaxPatches} ComputeInit={_computeInitialized}");
             ComputeReady = _computeInitialized;
+        }
+
+        public override void Destroy()
+        {
+            Debug.Log($"[TerrainRenderer] Destroy: UID={UID} Entity={Entity?.Name} _computeInitialized={_computeInitialized}");
+            _computeInitialized = false;
+            var device = Engine.Device;
+
+            // ── Per-frame GraphicsBuffer arrays ──
+            for (int i = 0; i < FrameCount; i++)
+            {
+                _descriptorBuffers[i]?.Dispose();
+                _sphereBuffers[i]?.Dispose();
+                _subbatchIdBuffers[i]?.Dispose();
+                _terrainDataBuffers[i]?.Dispose();
+                _counterBuffers[i]?.Dispose();
+                _splitFlagsBuffers[i]?.Dispose();
+                _indirectArgsBuffers[i]?.Dispose();
+                _shadowArgsBuffers[i]?.Dispose();
+
+                _shadowDescriptorBuffers[i]?.Dispose();
+                _shadowTerrainDataBuffers[i]?.Dispose();
+                _shadowSphereBuffers[i]?.Dispose();
+                _shadowSubbatchIdBuffers[i]?.Dispose();
+                _shadowCounterBuffers[i]?.Dispose();
+                _shadowCascadeIdxBuffers[i]?.Dispose();
+            }
+
+            // ── Per-frame ID3D12Resource constant buffers + shadow cascade ──
+            for (int i = 0; i < FrameCount; i++)
+            {
+                _frustumPlaneBuffers[i]?.Release();
+                _frustumPlaneBuffers[i] = null;
+                _hizParamBuffers[i]?.Release();
+                _hizParamBuffers[i] = null;
+                _terrainParamBuffers[i]?.Release();
+                _terrainParamBuffers[i] = null;
+                _shadowTerrainParamBuffers[i]?.Release();
+                _shadowTerrainParamBuffers[i] = null;
+                _shadowCascadeBuffers[i]?.Release();
+                _shadowCascadeBuffers[i] = null;
+
+                if (_shadowCascadeBufferSrvs[i] != 0)
+                    device?.ReleaseBindlessIndex(_shadowCascadeBufferSrvs[i]);
+                _shadowCascadeBufferSrvs[i] = 0;
+            }
+
+            // ── Readback buffers ──
+            _shadowCounterReadback?.Release();
+            _shadowArgsReadback?.Release();
+            _instanceCounterReadback?.Release();
+
+            // ── Height range mip pyramid ──
+            _heightRangePyramid?.Release();
+            if (_heightRangeMipUAVs != null)
+                foreach (var idx in _heightRangeMipUAVs)
+                    if (idx != 0) device?.ReleaseBindlessIndex(idx);
+            if (_heightRangeMipSRVs != null)
+                foreach (var idx in _heightRangeMipSRVs)
+                    if (idx != 0) device?.ReleaseBindlessIndex(idx);
+            if (_heightRangePyramidSRV != 0)
+                device?.ReleaseBindlessIndex(_heightRangePyramidSRV);
+
+            // ── Baked normals ──
+            _bakedNormalTex?.Release();
+            if (_bakedNormalUAV != 0) device?.ReleaseBindlessIndex(_bakedNormalUAV);
+            if (_bakedNormalSRV != 0) device?.ReleaseBindlessIndex(_bakedNormalSRV);
+
+            // ── Decoration control prepass ──
+            _decoControlTex?.Release();
+            if (_decoControlUAV != 0) device?.ReleaseBindlessIndex(_decoControlUAV);
+            if (_decoControlSRV != 0) device?.ReleaseBindlessIndex(_decoControlSRV);
+            _layerCtrlSrvBuffer?.Dispose();
+
+            // ── Baked albedo ──
+            _bakedAlbedoTex?.Release();
+            if (_bakedAlbedoUAV != 0) device?.ReleaseBindlessIndex(_bakedAlbedoUAV);
+            if (_bakedAlbedoSRV != 0) device?.ReleaseBindlessIndex(_bakedAlbedoSRV);
+            _tilingBuffer?.Dispose();
+
+            // ── Packed control array ──
+            _packedControlArray?.Release();
+            if (_packedControlSRV != 0) device?.ReleaseBindlessIndex(_packedControlSRV);
+            if (_packedSliceUAVs != null)
+                foreach (var idx in _packedSliceUAVs)
+                    if (idx != 0) device?.ReleaseBindlessIndex(idx);
+
+            // ── Decorator buffers ──
+            _decoratorHeadersBuffer?.Dispose();
+            _decoratorSlotsBuffer?.Dispose();
+            _decoratorLODTableBuffer?.Dispose();
+
+            // ── Deco compute buffers ──
+            _decoInstanceBuffer?.Dispose();
+            _instanceCounterBuffer?.Dispose();
+            _decoDispatchArgsBuffer?.Dispose();
+
+            // ── Mesh-mode decorator buffers ──
+            _meshDecoInstanceBuffer?.Dispose();
+            _sortedMeshInstanceBuffer?.Dispose();
+            _meshDrawArgsBuffer?.Dispose();
+            _meshDrawCountBuffer?.Dispose();
+
+            // ── Auto-mask buffer ──
+            _layerAutoMaskBuffer?.Dispose();
+
+            // ── Compute shaders ──
+            _quadtreeCS?.Dispose();
+            _grassCS?.Dispose();
+            _decoPrepassCS?.Dispose();
+            _albedoBakeCS?.Dispose();
+
+            // ── Patch mesh ──
+            _patchMesh?.Dispose();
+
+            // ── Baker: release scratch buffers (stamp, stroke, raycast, pack) ──
+            // Height texture and control maps are NOT released — they're owned by the
+            // cached Terrain asset and persist for reuse on next scene load.
+            _baker?.Dispose();
+            _baker = null;
         }
 
         private bool _textureArraysInitialized;
@@ -485,7 +612,7 @@ namespace Freefall.Components
             // Upload saved baked heightmap from cache (skips GPU compositor if present)
             if (Terrain.PendingBakedHeightmapBytes != null)
             {
-                var baker = TerrainBaker.Instance;
+                var baker = _baker;
                 var bytes = Terrain.PendingBakedHeightmapBytes;
                 Terrain.PendingBakedHeightmapBytes = null; // consumed
 
@@ -503,7 +630,7 @@ namespace Freefall.Components
             // GPU height layer bake (runs before any heightmap access)
             if (Terrain.ConsumeFlags(TerrainDirtyFlags.HeightBake) && Terrain.HeightLayers.Count > 0)
             {
-                var baker = TerrainBaker.Instance;
+                var baker = _baker;
 
                 // Upload any pending ControlMap data loaded from cache
                 foreach (var layer in Terrain.HeightLayers)
@@ -534,7 +661,7 @@ namespace Freefall.Components
             if (_needHeightFieldReadback && !Terrain.NeedsUpdate(TerrainDirtyFlags.HeightBake))
             {
                 _needHeightFieldReadback = false;
-                var heights = TerrainBaker.Instance.ReadbackHeightmap();
+                var heights = _baker.ReadbackHeightmap();
                 if (heights != null && Terrain != null)
                     Terrain.SetHeightField(heights);
             }
@@ -542,7 +669,7 @@ namespace Freefall.Components
             // Upload any pending splatmap/density ControlMap data loaded from cache
             if (Terrain?.Layers != null)
             {
-                var baker2 = TerrainBaker.Instance;
+                var baker2 = _baker;
                 for (int i = 0; i < Terrain.Layers.Count; i++)
                 {
                     var layer = Terrain.Layers[i];
@@ -561,7 +688,7 @@ namespace Freefall.Components
 
             if (Terrain?.Decorations != null)
             {
-                var baker2 = TerrainBaker.Instance;
+                var baker2 = _baker;
                 for (int i = 0; i < Terrain.Decorations.Count; i++)
                 {
                     var deco = Terrain.Decorations[i];
@@ -620,7 +747,7 @@ namespace Freefall.Components
                         list.ResourceBarrierTransition(packedArray,
                             ResourceStates.Common, ResourceStates.UnorderedAccess);
 
-                        TerrainBaker.Instance.PackControlMaps(list, indices, sliceUAVs, res);
+                        _baker.PackControlMaps(list, indices, sliceUAVs, res);
 
                         // UAV barrier then back to common for shader reads
                         list.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(packedArray)));
@@ -634,7 +761,7 @@ namespace Freefall.Components
 
             // Set shared material params
             material.SetParameter("CameraPos", Camera.Main.Position);
-            material.SetParameter("HeightTexel", heightmap != null ? 1.0f / heightmap.Native.Description.Width : 1.0f / 1024.0f);
+            material.SetParameter("HeightTexel", 1.0f / (heightmap != null ? Terrain.HeightmapResolution : 1024));
             material.SetParameter("MaxHeight", Terrain.MaxHeight);
             material.SetParameter("TerrainSize", Terrain.TerrainSize);
             material.SetParameter("TerrainOrigin", new Vector2(Transform.WorldPosition.X, Transform.WorldPosition.Z));
@@ -668,7 +795,7 @@ namespace Freefall.Components
             // Decoration pipeline — CPU-side setup
             if (Terrain.DrawDetail && Terrain.Decorations.Count > 0 && DecoratorMaterial?.Effect != null)
             {
-                if (Terrain.ConsumeFlags(TerrainDirtyFlags.DecoStructure))
+                if (Terrain.ConsumeFlags(TerrainDirtyFlags.DecoStructure) || _decoratorSlotsBuffer == null)
                     RebuildDecoSlots();
                 else if (Terrain.ConsumeFlags(TerrainDirtyFlags.DecoParams))
                     UpdateDecoSlots();
@@ -821,6 +948,8 @@ namespace Freefall.Components
         /// </summary>
         private void DispatchQuadtreeEval(ID3D12GraphicsCommandList commandList, int frameIndex)
         {
+            if (!_computeInitialized) return; // Destroyed between enqueue and execute
+
             var device = Engine.Device;
             var cs = _quadtreeCS!;
 
@@ -949,6 +1078,8 @@ namespace Freefall.Components
         /// </summary>
         private void DrawTerrain(ID3D12GraphicsCommandList commandList, int frameIndex)
         {
+            if (!_computeInitialized) return; // Destroyed between enqueue and execute
+
             var device = Engine.Device;
 
             // Apply material PSO and textures (explicitly set Opaque pass in case shadow changed it)
@@ -1183,6 +1314,11 @@ namespace Freefall.Components
                 Plane0 = planes[0], Plane1 = planes[1], Plane2 = planes[2],
                 Plane3 = planes[3], Plane4 = planes[4], Plane5 = planes[5],
             };
+            if (_frustumPlaneBuffers[frameIndex] == null)
+            {
+                Debug.LogError("[TerrainRenderer]", $"UploadFrustumConstants: null buffer! frameIndex={frameIndex} _computeInitialized={_computeInitialized} Entity={Entity?.Name} UID={UID}");
+                return;
+            }
             UploadBuffer(_frustumPlaneBuffers[frameIndex], frustumData);
 
             // Upload HiZParams (b1)
@@ -2134,12 +2270,14 @@ namespace Freefall.Components
         /// </summary>
         private void DispatchDecorator(ID3D12GraphicsCommandList commandList, int frameIndex, RenderPass pass = RenderPass.Opaque)
         {
+            if (!_computeInitialized) return; // Destroyed between enqueue and execute
             if (DecoratorMaterial?.Effect == null || Terrain == null) return;
 
             // GPU prepass: build baked control texture from density maps
             DispatchDecoControlPrepass(commandList);
 
             if (!_decoBuffersCreated) return;
+            if (_decoratorSlotsBuffer == null || _decoratorLODTableBuffer == null) return;
 
             var device = Engine.Device;
             var camPos = Camera.Main!.Position;
@@ -2303,7 +2441,7 @@ namespace Freefall.Components
             if (pass == RenderPass.Shadow)
             {
                 commandList.SetGraphicsRoot32BitConstant(0, DirectionalLight.CurrentCascadeSrvIndex, 11);
-                int grassShadowCascades = Math.Max(1, DirectionalLight.CascadeCount - 1);
+                int grassShadowCascades = 2;// Math.Max(1, DirectionalLight.CascadeCount - 1);
                 commandList.SetGraphicsRoot32BitConstant(0, (uint)grassShadowCascades, 12);
             }
 

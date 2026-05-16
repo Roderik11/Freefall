@@ -5,8 +5,8 @@ using Vortice.DXGI;
 namespace Freefall.Graphics
 {
     /// <summary>
-    /// Mip pyramid for SSDM displacement vectors (RG16_Float).
-    /// Two instances needed: Pyramid A (displacement vectors) and Pyramid B (refined offsets).
+    /// Mip pyramid for SSDM displacement vectors.
+    /// Two instances needed: Pyramid A (displacement vectors) and Pyramid B (source UVs).
     /// </summary>
     public class DisplacementPyramid : IDisposable
     {
@@ -20,7 +20,7 @@ namespace Freefall.Graphics
 
         private const int MaxMips = 4; // level 0 (full res) + 3 coarse levels
 
-        public void Create(GraphicsDevice device, int width, int height)
+        public void Create(GraphicsDevice device, int width, int height, Format format = Format.R16G16_Float)
         {
             Texture?.Dispose();
 
@@ -29,11 +29,13 @@ namespace Freefall.Graphics
             MipCount = Math.Min(MaxMips, 1 + (int)Math.Floor(Math.Log2(Math.Max(width, height))));
 
             Texture = device.CreateTexture2D(
-                Format.R16G16_Float,
+                format,
                 Width, Height,
                 1, MipCount,
                 ResourceFlags.AllowUnorderedAccess,
                 ResourceStates.Common);
+
+            var fmt = format;
 
             MipUAVs = new uint[MipCount];
             MipSRVs = new uint[MipCount];
@@ -43,7 +45,7 @@ namespace Freefall.Graphics
                 MipUAVs[i] = device.AllocateBindlessIndex();
                 var uavDesc = new UnorderedAccessViewDescription
                 {
-                    Format = Format.R16G16_Float,
+                    Format = fmt,
                     ViewDimension = UnorderedAccessViewDimension.Texture2D,
                     Texture2D = new Texture2DUnorderedAccessView { MipSlice = (uint)i }
                 };
@@ -52,7 +54,7 @@ namespace Freefall.Graphics
                 MipSRVs[i] = device.AllocateBindlessIndex();
                 var srvDesc = new ShaderResourceViewDescription
                 {
-                    Format = Format.R16G16_Float,
+                    Format = fmt,
                     ViewDimension = ShaderResourceViewDimension.Texture2D,
                     Shader4ComponentMapping = ShaderComponentMapping.Default,
                     Texture2D = new Texture2DShaderResourceView
@@ -68,7 +70,7 @@ namespace Freefall.Graphics
             FullChainSrv = device.AllocateBindlessIndex();
             var fullSrvDesc = new ShaderResourceViewDescription
             {
-                Format = Format.R16G16_Float,
+                Format = fmt,
                 ViewDimension = ShaderResourceViewDimension.Texture2D,
                 Shader4ComponentMapping = ShaderComponentMapping.Default,
                 Texture2D = new Texture2DShaderResourceView

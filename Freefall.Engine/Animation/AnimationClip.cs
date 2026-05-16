@@ -17,6 +17,9 @@ namespace Freefall.Animation
         /// <summary>Animation events triggered at specific times.</summary>
         public List<AnimationEvent> Events = new List<AnimationEvent>();
 
+        /// <summary>The skeleton this clip was imported from (for retargeting).</summary>
+        public Skeleton Skeleton { get; set; }
+
         /// <summary>Duration in ticks.</summary>
         public float Duration;
 
@@ -28,6 +31,9 @@ namespace Freefall.Animation
 
         public float DurationSecondsInverse => 1f / DurationSeconds;
 
+        // Lazy-built lookup: bone name hash → channel index
+        private Dictionary<int, int> _channelLookup;
+
         public AnimationClip()
         {
             Channels = new ReadOnlyCollection<AnimationChannel>(_channels);
@@ -36,11 +42,22 @@ namespace Freefall.Animation
         public void AddChannel(AnimationChannel channel)
         {
             _channels.Add(channel);
+            _channelLookup = null; // invalidate cache
         }
 
         public void RemoveChannel(AnimationChannel channel)
         {
             _channels.Remove(channel);
+            _channelLookup = null;
+        }
+
+        private void EnsureChannelLookup()
+        {
+            if (_channelLookup != null) return;
+
+            _channelLookup = new Dictionary<int, int>(_channels.Count);
+            for (int i = 0; i < _channels.Count; i++)
+                _channelLookup[_channels[i].Hash] = i;
         }
 
         /// <summary>
@@ -51,19 +68,12 @@ namespace Freefall.Animation
             if (time < DurationSeconds)
                 time = (time * TicksPerSecond) % Duration;
             else
-                time = DurationSeconds;
+                time = Duration;
 
-            int channelCount = Channels.Count;
-            for (int i = 0; i < channelCount; i++)
-            {
-                if (Channels[i].Hash == bone.Hash)
-                {
-                    Channels[i].GetBoneTransform(bone, time, ref result);
-                    return;
-                }
-            }
-            // DEBUG: Bone didn't match any channel - this will cause issues
-            //Debug.LogWarning("AnimationClip", $"Bone '{bone.Name}' (hash {bone.Hash}) has no matching channel!");
+            EnsureChannelLookup();
+
+            if (_channelLookup.TryGetValue(bone.Hash, out int channelIndex))
+                _channels[channelIndex].GetBoneTransform(bone, time, ref result);
         }
     }
 

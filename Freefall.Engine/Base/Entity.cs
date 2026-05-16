@@ -110,6 +110,52 @@ namespace Freefall.Base
             return ComponentCache<T>.Get(this);
         }
 
+        public T? GetComponentInParents<T>() where T : Component
+        {
+            var current = this;
+            while (current != null)
+            {
+                var component = current.GetComponent<T>();
+                if (component != null)
+                    return component;
+                current = current.Transform.Parent?.Entity;
+            }
+            return null;
+        }
+
+        public List<T> GetComponents<T>() where T : Component
+        {
+            // foreach subclass of T, get components of that type and add to list
+            var list = new List<T>();
+            foreach(var component in  _components)
+            {
+                if (component is T t)
+                    list.Add(t);
+            }
+            return list;
+        }
+
+        public List<T> GetComponentsInChildren<T>() where T : Component
+        {
+            // foreach subclass of T, get components of that type and add to list
+            var list = GetComponents<T>();
+            foreach (Transform child in Transform)
+                child.Entity.GetComponentsInChildren(list);
+            return list;
+        }
+
+        private void GetComponentsInChildren<T>(List<T> list) where T : Component
+        {
+            foreach (var component in _components)
+            {
+                if (component is T t)
+                    list.Add(t);
+            }
+
+            foreach (Transform child in Transform)
+                child.Entity.GetComponentsInChildren(list);
+        }
+
         /// <summary>
         /// Non-generic AddComponent for runtime deserialization.
         /// Uses reflection to call ComponentCache&lt;T&gt;.Add with the actual component type.

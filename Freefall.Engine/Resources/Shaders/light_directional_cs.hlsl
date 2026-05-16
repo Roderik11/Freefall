@@ -151,9 +151,8 @@ void CSDirectionalLight(uint3 dispatchThreadId : SV_DispatchThreadID)
     }
 
     // Sample GBuffer at displaced coordinates for parallax effect
-    // Depth is always read at the original pixel (depth buffer is authoritative)
     float3 normal = NormalTex.Load(displaced_coord).xyz;
-    float depth = DepthTex.Load(coord).r;
+    float depth = DepthTex.Load(displaced_coord).r;
     
     RWTexture2D<float4> Output = ResourceDescriptorHeap[OutputUAVIdx];
     

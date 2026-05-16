@@ -2,11 +2,15 @@ using System;
 
 namespace Freefall
 {
+    [AttributeUsage(AttributeTargets.Class)]
+    public sealed class UpdateInEditorAttribute : Attribute { }
+
     /// <summary>
     /// Constrains a numeric field to a [min, max] range in the inspector.
     /// Ported from Apex/Spark.
     /// </summary>
-    public class ValueRangeAttribute : Attribute
+    [AttributeUsage(AttributeTargets.Field | AttributeTargets.Property)]
+    public sealed class ValueRangeAttribute : Attribute
     {
         public float Min;
         public float Max;
@@ -24,5 +28,24 @@ namespace Freefall
             Max = max;
             Step = step;
         }
+    }
+
+    [AttributeUsage(AttributeTargets.Field | AttributeTargets.Property)]
+    public sealed class FilePathAttribute(string filter, string title) : Attribute
+    {
+        public string Filter = filter;
+        public string Title = title;
+    }
+
+    [AttributeUsage(AttributeTargets.All)]
+    public sealed class IconAttribute(string name) : Attribute
+    {
+        public string Name = name;
+    }
+
+    [AttributeUsage(AttributeTargets.Class)]
+    public sealed class CreateAssetAttribute(string caption) : Attribute
+    {
+        public string Caption = caption;
     }
 }

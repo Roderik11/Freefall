@@ -35,9 +35,6 @@ namespace Freefall.Animation
         
         /// <summary>Optional correction matrix for retargeting.</summary>
         public Matrix4x4 Correction = Matrix4x4.Identity;
-        
-        /// <summary>Scale factor for bone translations.</summary>
-        public float ScaleFactor = 1;
 
         /// <summary>Parent bone index (-1 for root).</summary>
         public int Parent;
@@ -61,7 +58,7 @@ namespace Freefall.Animation
             writer.Write(OffsetMatrix);
             writer.Write(BindPoseMatrix);
             writer.Write(Correction);
-            writer.Write(ScaleFactor);
+            writer.Write(1f); // ScaleFactor (deprecated, kept for binary compat)
         }
 
         public void Read(BinaryReader reader)
@@ -74,7 +71,7 @@ namespace Freefall.Animation
             OffsetMatrix = reader.ReadMatrix4x4();
             BindPoseMatrix = reader.ReadMatrix4x4();
             Correction = reader.ReadMatrix4x4();
-            ScaleFactor = reader.ReadSingle();
+            reader.ReadSingle(); // ScaleFactor (deprecated, read and discard)
         }
     }
 

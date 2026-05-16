@@ -11,7 +11,7 @@ namespace Freefall.Graph
 {
 
     [Serializable]
-    public class NodeGraph : Asset
+    public class NodeGraph : Asset, IRebuildAfterLoad
     {
         public List<Node> Nodes = new List<Node>();
         public List<Connection> Connections = new List<Connection>();

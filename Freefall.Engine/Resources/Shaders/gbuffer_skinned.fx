@@ -267,25 +267,51 @@ PSOutput PS(VSOutput input)
         color.rgb = lerp(color.rgb, emissive, saturate(emissiveMask));
     }
     
+    
     // Normal mapping via cotangent frame (no tangent buffer needed)
     float3 N = normalize(input.Normal);
+    float3 faceNormal = N;
+    
+    // Cotangent frame from screen-space derivatives (shared by base + detail normals)
+    float3 dp1 = ddx(input.WorldPos.xyz);
+    float3 dp2 = ddy(input.WorldPos.xyz);
+    float2 duv1 = ddx(input.TexCoord);
+    float2 duv2 = ddy(input.TexCoord);
+    
+    float3 dp2perp = cross(dp2, N);
+    float3 dp1perp = cross(N, dp1);
+    float3 T = dp2perp * duv1.x + dp1perp * duv2.x;
+    float3 B = dp2perp * duv1.y + dp1perp * duv2.y;
+    
+    // Fix TBN handedness for mirrored geometry (negative-scale transforms)
+    // Without this, mirrored instances get inverted normal map lighting
+    float handedness = dot(cross(T, B), N) < 0.0 ? -1.0 : 1.0;
+    T *= handedness;
+    
+    float invmax = rsqrt(max(dot(T, T), dot(B, B)));
+    float3x3 TBN = float3x3(T * invmax, B * invmax, N);
+    
     if (mat.NormalIdx != 0)
     {
         Texture2D normalTex = ResourceDescriptorHeap[mat.NormalIdx];
-        float3 texNormal = normalTex.Sample(Sampler, input.TexCoord).rgb * 2.0 - 1.0;
+        //float3 texNormal = normalTex.Sample(Sampler, input.TexCoord).rgb * 2.0 - 1.0;
+        
+        float2 nXY = normalTex.Sample(Sampler, input.TexCoord).rg * 2.0 - 1.0;
+        nXY.y = -nXY.y; // Flip Y: OpenGL (Unity) → DirectX convention
+        float3 texNormal = float3(nXY, sqrt(max(0.001, 1.0 - dot(nXY, nXY))));
         
         // Cotangent frame from screen-space derivatives
-        float3 dp1 = ddx(input.WorldPos.xyz);
-        float3 dp2 = ddy(input.WorldPos.xyz);
-        float2 duv1 = ddx(input.TexCoord);
-        float2 duv2 = ddy(input.TexCoord);
+        //float3 dp1 = ddx(input.WorldPos.xyz);
+        //float3 dp2 = ddy(input.WorldPos.xyz);
+        //float2 duv1 = ddx(input.TexCoord);
+        //float2 duv2 = ddy(input.TexCoord);
         
-        float3 dp2perp = cross(dp2, N);
-        float3 dp1perp = cross(N, dp1);
-        float3 T = dp2perp * duv1.x + dp1perp * duv2.x;
-        float3 B = dp2perp * duv1.y + dp1perp * duv2.y;
-        float invmax = rsqrt(max(dot(T, T), dot(B, B)));
-        float3x3 TBN = float3x3(T * invmax, B * invmax, N);
+        //float3 dp2perp = cross(dp2, N);
+        //float3 dp1perp = cross(N, dp1);
+        //float3 T = dp2perp * duv1.x + dp1perp * duv2.x;
+        //float3 B = dp2perp * duv1.y + dp1perp * duv2.y;
+        //float invmax = rsqrt(max(dot(T, T), dot(B, B)));
+        //float3x3 TBN = float3x3(T * invmax, B * invmax, N);
         
         N = normalize(mul(texNormal, TBN));
     }

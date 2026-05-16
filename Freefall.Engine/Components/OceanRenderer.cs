@@ -20,6 +20,7 @@ namespace Freefall.Components
     /// Each band has 2 spectrum layers (primary + secondary) with Vector2 params.
     /// </summary>
     [Serializable]
+    [UpdateInEditor]
     public class SpectrumBand
     {
         [Description(@"FFT domain size in meters.
@@ -67,6 +68,7 @@ namespace Freefall.Components
     /// Component: ocean surface with FFT wave simulation.
     /// Wave displacement and normals come from GPU-computed FFT textures.
     /// </summary>
+    [Icon("icon_ocean.png")]
     public class OceanRenderer : Component, IDraw, IUpdate
     {
         // ── Visual parameters ──
@@ -245,6 +247,13 @@ namespace Freefall.Components
 
             // Create tile scales buffer for the render shader
             CreateTileScalesBuffer();
+        }
+
+        public override void Destroy()
+        {
+            _tileScalesBuffer?.Dispose();
+            _oceanFFT?.Dispose();
+            _mesh?.Dispose();
         }
 
         private unsafe void CreateTileScalesBuffer()

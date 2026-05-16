@@ -18,7 +18,6 @@ namespace Freefall.Graphics
         private int _buildMipKernel;
         private int _refineKernel;
         private int _displaceDepthKernel;
-        private int _lobelDescendKernel;
 
         // Pyramids (reuse existing DisplacementPyramid class)
         private DisplacementPyramid _pyramidA = new();
@@ -50,7 +49,6 @@ namespace Freefall.Graphics
             _buildMipKernel = _shader.FindKernel("CSBuildMip");
             _refineKernel = _shader.FindKernel("CSRefine");
             _displaceDepthKernel = _shader.FindKernel("CSDisplaceDepth");
-            _lobelDescendKernel = _shader.FindKernel("CSLobelDescend");
         }
 
         public void Execute(
@@ -153,11 +151,8 @@ namespace Freefall.Graphics
                 prevSrv = _pyramidA.MipSRVs[mip];
             }
 
-            // Phase 2: Inversion — either Newton or Lobel descent
-            if (Engine.Settings.UseSSDMLobel)
-                ExecuteLobelDescent(cmd, beforeState, texWidth, texHeight);
-            else
-                ExecuteNewtonRefine(cmd, beforeState, texWidth, texHeight);
+            // Phase 2: Hierarchical Newton inversion
+            ExecuteNewtonRefine(cmd, beforeState, texWidth, texHeight);
 
             OutputSrvIndex = _pyramidB.MipSRVs[0];
 
@@ -187,31 +182,7 @@ namespace Freefall.Graphics
                     ResourceStates.NonPixelShaderResource, 0)));
         }
 
-        private void ExecuteLobelDescent(ID3D12GraphicsCommandList cmd,
-            ResourceStates beforeState, int texWidth, int texHeight)
-        {
-            // For now: single-pass Lobel — seed from coarsest, refine at each level in one kernel.
-            // This matches the Newton pipeline dispatch (single B[0] write) so we can isolate
-            // whether the multi-dispatch is the issue.
-            cmd.ResourceBarrier(new ResourceBarrier(
-                new ResourceTransitionBarrier(_pyramidB.Texture!,
-                    beforeState, ResourceStates.UnorderedAccess, 0)));
 
-            _shader.SetPushConstant(_lobelDescendKernel, "SrcMip", _pyramidA.FullChainSrv);
-            _shader.SetPushConstant(_lobelDescendKernel, "DstMip", _pyramidB.MipUAVs[0]);
-            _shader.SetPushConstant(_lobelDescendKernel, "PrevBMip", 0u); // no previous, use myUV
-            _shader.SetParam("DstWidth", (uint)texWidth);
-            _shader.SetParam("DstHeight", (uint)texHeight);
-            _shader.SetParam("MipCount", (uint)(_pyramidA.MipCount - 1)); // coarsest mip level
-
-            _shader.Dispatch(_lobelDescendKernel, cmd,
-                (uint)((texWidth + 7) / 8), (uint)((texHeight + 7) / 8));
-
-            cmd.ResourceBarrier(new ResourceBarrier(
-                new ResourceTransitionBarrier(_pyramidB.Texture!,
-                    ResourceStates.UnorderedAccess,
-                    ResourceStates.NonPixelShaderResource, 0)));
-        }
 
         private void EnsureResources(int width, int height)
         {
@@ -225,14 +196,14 @@ namespace Freefall.Graphics
             // Simple output texture
             _simpleOutput?.Dispose();
             _simpleOutput = device.CreateTexture2D(
-                Format.R16G16_Float, width, height, 1, 1,
+                Format.R32G32_Float, width, height, 1, 1,
                 ResourceFlags.AllowUnorderedAccess, ResourceStates.Common);
 
             _simpleOutputUav = device.AllocateBindlessIndex();
             device.NativeDevice.CreateUnorderedAccessView(_simpleOutput, null,
                 new UnorderedAccessViewDescription
                 {
-                    Format = Format.R16G16_Float,
+                    Format = Format.R32G32_Float,
                     ViewDimension = UnorderedAccessViewDimension.Texture2D,
                     Texture2D = new Texture2DUnorderedAccessView { MipSlice = 0 }
                 }, device.GetCpuHandle(_simpleOutputUav));
@@ -241,7 +212,7 @@ namespace Freefall.Graphics
             device.NativeDevice.CreateShaderResourceView(_simpleOutput,
                 new ShaderResourceViewDescription
                 {
-                    Format = Format.R16G16_Float,
+                    Format = Format.R32G32_Float,
                     ViewDimension = ShaderResourceViewDimension.Texture2D,
                     Shader4ComponentMapping = ShaderComponentMapping.Default,
                     Texture2D = new Texture2DShaderResourceView { MostDetailedMip = 0, MipLevels = 1 }
@@ -274,7 +245,7 @@ namespace Freefall.Graphics
 
             // Pyramids
             _pyramidA.Create(device, width, height);
-            _pyramidB.Create(device, width, height);
+            _pyramidB.Create(device, width, height, Format.R32G32_Float);
 
             _firstFrame = true;
             _displacedDepthFirstFrame = true;

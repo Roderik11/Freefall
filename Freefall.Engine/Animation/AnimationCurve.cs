@@ -6,6 +6,7 @@ namespace Freefall.Animation
     /// <summary>
     /// A curve that can animate a parameter over the duration of an animation state.
     /// </summary>
+    [Serializable]
     public class AnimationCurve
     {
         public string TargetParameter;

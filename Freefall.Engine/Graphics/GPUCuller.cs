@@ -32,6 +32,7 @@ namespace Freefall.Graphics
         private int _bitonicSortKernel, _sortIndirectionKernel, _mainKernel;
         private int _visibilityShadowKernel, _visibilityShadow4Kernel;
         private int _expandCascadesKernel, _patchExpandedKernel, _compactCommandsKernel;
+        private int _computeDepthKeysKernel, _bitonicSortPairsKernel, _writeSortedIndicesKernel;
         
         // Cached kernel indices for depth_pyramid.hlsl
         private int _spdKernel, _perMipKernel, _shadowSpdKernel, _shadowPerMipKernel;
@@ -103,6 +104,9 @@ namespace Freefall.Graphics
         public ID3D12PipelineState? ExpandCascadesPSO => _cullShader?.GetPSO(_expandCascadesKernel);
         public ID3D12PipelineState? PatchExpandedPSO => _cullShader?.GetPSO(_patchExpandedKernel);
         public ID3D12PipelineState? CompactCommandsPSO => _cullShader?.GetPSO(_compactCommandsKernel);
+        public ID3D12PipelineState? ComputeDepthKeysPSO => _cullShader?.GetPSO(_computeDepthKeysKernel);
+        public ID3D12PipelineState? BitonicSortPairsPSO => _cullShader?.GetPSO(_bitonicSortPairsKernel);
+        public ID3D12PipelineState? WriteSortedIndicesPSO => _cullShader?.GetPSO(_writeSortedIndicesKernel);
         public ID3D12PipelineState? DownsamplePSO => _pyramidShader?.GetPSO(_spdKernel);
         
         /// <summary>True after SDSM buffers are created and ready for dispatch.</summary>
@@ -137,6 +141,9 @@ namespace Freefall.Graphics
             public uint CullStatsUAVIdx; // UAV index for cull stats (0 = disabled)
             public uint DebugMode;       // Debug visualization mode (unused by culler, kept for layout compatibility)
             public float ProjScale;      // Projection._m22 = cot(fovY/2) for sphere→screen size
+            // Depth sorting parameters
+            public Vector3 CameraPosition; // Camera world position for distance computation
+            public uint SortDirection;     // 0 = front-to-back (opaque), 1 = back-to-front (transparent)
         }
         
         /// <summary>
@@ -256,6 +263,9 @@ namespace Freefall.Graphics
                 _expandCascadesKernel = _cullShader.FindKernel("CSExpandCascades");
                 _patchExpandedKernel = _cullShader.FindKernel("CSPatchExpandedCounts");
                 _compactCommandsKernel = _cullShader.FindKernel("CSCompactCommands");
+                _computeDepthKeysKernel = _cullShader.FindKernel("CSComputeDepthKeys");
+                _bitonicSortPairsKernel = _cullShader.FindKernel("CSBitonicSortPairs");
+                _writeSortedIndicesKernel = _cullShader.FindKernel("CSWriteSortedIndices");
                 
                 // Hi-Z depth pyramid downsampler
                 _pyramidShader = new ComputeShader("depth_pyramid.hlsl");

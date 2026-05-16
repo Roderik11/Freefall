@@ -7,6 +7,7 @@ using Freefall.Base;
 
 namespace Freefall.Components
 {
+    [Icon("icon_audio.png")]
     public class AudioSource : Component, IUpdate
     {
         public AudioClip AudioClip;
@@ -114,6 +115,8 @@ namespace Freefall.Components
 
         public override void Destroy()
         {
+            if (sourceVoice != null)
+                sourceVoice.BufferEnd -= SourceVoice_BufferEnd;
             sourceVoice?.DestroyVoice();
             sourceVoice?.Dispose();
         }

@@ -8,6 +8,7 @@ namespace Freefall.PCG
     /// Extends NodeGraph with the asset type alias for the import pipeline.
     /// Referenced by PCGComponent.
     /// </summary>
+    [CreateAsset("PCG Graph")]
     [AssetTypeAlias("PCGGraphData")]
     public class PCGGraph : NodeGraph
     {

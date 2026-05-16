@@ -26,13 +26,14 @@ namespace Freefall.Graphics
             RasterizerStateName = desc.RasterizerState;
 
             // Build per-pass render state override if any fields were specified
-            if (desc.RenderTargetCount.HasValue || desc.DepthTest.HasValue || desc.DepthWrite.HasValue || desc.DepthFunc != null)
+            if (desc.RenderTargetCount.HasValue || desc.DepthTest.HasValue || desc.DepthWrite.HasValue || desc.DepthFunc != null || desc.BlendMode != null)
             {
                 RenderState = new ShaderRenderState();
                 if (desc.RenderTargetCount.HasValue) RenderState.RenderTargetCount = desc.RenderTargetCount.Value;
                 if (desc.DepthTest.HasValue) RenderState.DepthTest = desc.DepthTest.Value;
                 if (desc.DepthWrite.HasValue) RenderState.DepthWrite = desc.DepthWrite.Value;
                 if (desc.DepthFunc != null) RenderState.DepthFunc = desc.DepthFunc;
+                if (desc.BlendMode != null) RenderState.BlendMode = desc.BlendMode;
             }
 
             if (!string.IsNullOrEmpty(desc.VertexShaderEntry))
@@ -165,6 +166,14 @@ namespace Freefall.Graphics
         public void SetParameter<T>(string name, T value) where T : unmanaged
         {
             _materialBlock.SetParameter(name, value);
+        }
+        
+        /// <summary>
+        /// Set array parameter on this effect's MaterialBlock (will be applied during render)
+        /// </summary>
+        public void SetParameterArray<T>(string name, T[] value) where T : unmanaged
+        {
+            _materialBlock.SetParameterArray(name, value);
         }
         
         /// <summary>

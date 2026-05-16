@@ -191,9 +191,9 @@ float4 PS(VSOutput input) : SV_Target0
 
 // ────────────── Technique ──────────────
 
-technique11 Transparent
+technique11 Particles
 {
-    pass P0
+    pass Transparent
     {
         SetVertexShader(CompileShader(vs_6_6, VS()));
         SetPixelShader(CompileShader(ps_6_6, PS()));

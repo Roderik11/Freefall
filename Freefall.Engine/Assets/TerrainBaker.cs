@@ -17,20 +17,23 @@ namespace Freefall.Assets
     /// </summary>
     public class TerrainBaker : IDisposable
     {
-        /// <summary>Engine-wide singleton — one compute shader, shared buffers.</summary>
-        public static TerrainBaker Instance { get; } = new();
+        // ── Static: shared compute shaders + noise LUT (initialized once) ──
+        private static ComputeShader _cs;
+        private static int _kernelClear;
+        private static int _kernelImport;
+        private static int _kernelStampGroup;
+        private static int _kernelPaintBrush;
+        private static int _kernelClearDelta;
+        private static int _kernelImportChannel;
+        private static int _kernelPackChannels;
+        private static int _kernelBrushRaycast;
+        private static int _kernelNoiseLayer;
+        private static int _kernelErosionFilter;
+        private static ID3D12Resource _noiseLUTTex;
+        private static uint _noiseLUTSRV;
+        private static bool _initialized;
 
-        private ComputeShader _cs;
-        private int _kernelClear;
-        private int _kernelImport;
-        private int _kernelStampGroup;
-        private int _kernelPaintBrush;
-        private int _kernelClearDelta;
-        private int _kernelImportChannel;
-        private int _kernelPackChannels;
-        private int _kernelBrushRaycast;
-        private int _kernelNoiseLayer;
-        private int _kernelErosionFilter;
+        // ── Instance: per-terrain GPU resources ──
 
         // GPU resources for the baked heightmap
         private ID3D12Resource _heightTexture;
@@ -49,14 +52,6 @@ namespace Freefall.Assets
         // GPU raycast result buffer — written by CS_BrushRaycast, read by CS_PaintBrush
         private GraphicsBuffer _raycastResultBuffer;
 
-
-
-        // Pre-baked tileable noise LUT (256x256, RGBA8, 2 independent noise channels)
-        private ID3D12Resource _noiseLUTTex;
-        private uint _noiseLUTSRV;
-
-        private bool _initialized;
-
         /// <summary>Which ControlMap category to paint.</summary>
         public enum ControlMapTarget { Height, Splatmap, Density }
 
@@ -73,7 +68,7 @@ namespace Freefall.Assets
             public uint BlendMode;
         }
 
-        private void EnsureInitialized()
+        private static void EnsureInitialized()
         {
             if (_initialized) return;
             _cs = new ComputeShader("terrain_height_bake.hlsl");
@@ -289,7 +284,7 @@ namespace Freefall.Assets
         // Per-octave UV rotation in the shader breaks visible tiling.
         private const int NoiseLUTPeriod = 16;
 
-        private void EnsureNoiseLUT()
+        private static void EnsureNoiseLUT()
         {
             if (_noiseLUTTex != null) return;
 
@@ -1291,18 +1286,21 @@ namespace Freefall.Assets
             }
         }
 
+        /// <summary>
+        /// Release all per-instance GPU resources.
+        /// Static compute shader and noise LUT are shared and live for the process lifetime.
+        /// </summary>
         public void Dispose()
         {
-            _heightTexture?.Release();
-            foreach (var gpu in _controlMaps.Values)
-                gpu.Texture?.Release();
-            _controlMaps.Clear();
+            // Only dispose internal scratch buffers. The height texture and control maps
+            // are outputs owned by the Terrain asset — they persist in the AssetManager cache.
+            _raycastResultBuffer?.Dispose();
+            _raycastResultBuffer = null;
+
             _stampBuffer?.Dispose();
             _strokeBuffer?.Dispose();
             if (_packIndexBuffers != null)
                 foreach (var buf in _packIndexBuffers) buf?.Dispose();
-
-            _cs?.Dispose();
         }
     }
 }

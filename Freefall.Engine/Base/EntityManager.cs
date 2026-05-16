@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using Freefall.Assets;
 using Freefall.Graphics;
 
 namespace Freefall.Base
@@ -48,10 +49,13 @@ namespace Freefall.Base
         {
             lock (_lock)
             {
-                for (int i = _entities.Count - 1; i >= 0; i--)
+                CommandBuffer.Clear();
+                var list = new List<Entity>(_entities.Collection);
+                for (int i = list.Count - 1; i >= 0; i--)
                 {
-                    if (!_entities[i].DontDestroy)
-                        _entities[i].Destroy();
+                    if (list[i] == null) continue;
+                    if (!list[i].DontDestroy)
+                        list[i].Destroy();
                 }
             }
         }

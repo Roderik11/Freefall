@@ -1,6 +1,8 @@
+using System;
 using System.IO;
 using System.Text;
 using Freefall.Assets.Packers;
+using Freefall.Reflection;
 
 namespace Freefall.Assets.Importers
 {
@@ -12,6 +14,26 @@ namespace Freefall.Assets.Importers
     [AssetImporter(".asset", ImportPriority = 10)]
     public class AssetFileImporter : IImporter
     {
+        public object GetInspectionTarget(MetaFile meta)
+        {
+            if (meta == null || string.IsNullOrEmpty(meta.Guid)) return this;
+
+            // Resolve concrete type from the semantic type stored in meta
+            var typeName = meta.MainSemanticType;
+            if (string.IsNullOrEmpty(typeName)) return this;
+
+            var assetType = Reflector.FindTypeBySimpleName(typeName);
+            if (assetType == null || !typeof(Asset).IsAssignableFrom(assetType)) return this;
+
+            try
+            {
+                var asset = Engine.Assets.LoadByGuid(meta.Guid, assetType);
+                if (asset != null) return asset;
+            }
+            catch { }
+
+            return this;
+        }
         public ImportResult Import(string filepath)
         {
             var result = new ImportResult();

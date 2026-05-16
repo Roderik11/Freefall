@@ -6,8 +6,9 @@ namespace Freefall.Assets.Loaders
 {
     /// <summary>
     /// Loads AnimationClip assets from cache (.anim files).
-    /// Unpacks via AnimationClipPacker â€” the unpacked AnimationClip
+    /// Unpacks via AnimationClipPacker — the unpacked AnimationClip
     /// is already the runtime type, so no further conversion needed.
+    /// Resolves sibling Skeleton sub-asset for retargeting.
     /// </summary>
     [AssetLoader(typeof(AnimationClip))]
     public class AnimationClipLoader : IAssetLoader
@@ -20,19 +21,28 @@ namespace Freefall.Assets.Loaders
             if (cachePath == null || !File.Exists(cachePath))
                 throw new FileNotFoundException($"Cache file not found for animation clip '{name}'");
 
+            // Extract GUID from cache path (format: .../XX/{guid}.anim)
+            var guid = System.IO.Path.GetFileNameWithoutExtension(cachePath);
+
+            return LoadFromCache(cachePath, name, manager, guid);
+        }
+
+        public Asset LoadFromCache(string cachePath, string name, AssetManager manager, string sourceGuid = null)
+        {
             AnimationClip clip;
             using (var stream = File.OpenRead(cachePath))
                 clip = _packer.Read(stream);
 
             clip.Name = name;
-            if (clip.Channels?.Count > 0)
+
+            // Resolve sibling Skeleton from the same source file
+            if (!string.IsNullOrEmpty(sourceGuid))
             {
-                var ch = clip.Channels[0];
-                if (ch.Scale?.Count > 0)
-                    Debug.Log($"[AnimClipLoader] '{System.IO.Path.GetFileNameWithoutExtension(name)}' Ch0 Scale[0]={ch.Scale[0].Value}");
-                if (ch.Position?.Count > 0)
-                    Debug.Log($"[AnimClipLoader] '{System.IO.Path.GetFileNameWithoutExtension(name)}' Ch0 Pos[0]={ch.Position[0].Value}");
+                var skelEntry = AssetDatabase.FindSiblingSubAsset(sourceGuid, nameof(Skeleton));
+                if (skelEntry != null)
+                    clip.Skeleton = manager.LoadByGuid<Skeleton>(skelEntry.Guid);
             }
+
             return clip;
         }
     }

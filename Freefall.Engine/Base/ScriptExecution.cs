@@ -17,9 +17,13 @@ namespace Freefall.Base
         public static void Update()
         {
             for (int i = 0; i < list.Count; i++)
-            {
+                list[i].Early();
+
+            for (int i = 0; i < list.Count; i++)
+                list[i].Awake();
+
+            for (int i = 0; i < list.Count; i++)
                 list[i].Update();
-            }
         }
 
         public static void Draw()

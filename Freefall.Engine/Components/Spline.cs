@@ -12,6 +12,7 @@ namespace Freefall.Components
     /// Control points are in local space. Evaluate with GetPoint(t) / GetTangent(t).
     /// Supports open and closed loops.
     /// </summary>
+    [Icon("icon_spline.png")]
     public class Spline : Component, ISceneGizmo
     {
         /// <summary>Local-space control points.</summary>

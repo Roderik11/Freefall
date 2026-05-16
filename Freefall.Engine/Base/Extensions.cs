@@ -7,6 +7,16 @@ namespace Freefall
 {
     public static class Extensions
     {
+        public static float NextFloat(this Random random)
+        {
+            return (float)random.NextDouble();
+        }
+
+        public static float NextFloat(this Random random, float min, float max)
+        {
+            return min + (float)random.NextDouble() * (max - min);
+        }
+
         public static Vector3[] Transform(this Vector3[] points, Matrix4x4 transform)
         {
             for (int i = 0; i < points.Length; i++)

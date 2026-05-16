@@ -6,7 +6,7 @@ namespace Freefall.Animation
 {
     /// <summary>
     /// Manages a group of animation states and transitions between them.
-    /// Supports masking for partial body animation.
+    /// All mutable playback state lives in AnimationPlayback.
     /// </summary>
     [Serializable]
     public class AnimationLayer
@@ -17,69 +17,131 @@ namespace Freefall.Animation
         public List<AnimationState> States = new List<AnimationState>();
         public List<AnimationTransition> Transitions = new List<AnimationTransition>();
 
-        public bool InTransition { get; private set; }
-        public AnimationState CurrentState { get; private set; }
-        public AnimationTransition CurrentTransition { get; private set; }
+        /// <summary>Index in the parent Animation's Layers list. Set during RebuildAfterLoad.</summary>
+        public int Index;
 
-        private AnimationState returnToState;
-        private float transitionTime;
+        // --- Playback accessors ---
 
-        public int GetStateCount() => InTransition ? 2 : 1;
-
-        public AnimationState GetState(int index)
+        private AnimationState GetCurrentState(AnimationPlayback pb)
         {
-            if (InTransition)
+            int id = (int)pb.Get(PK.Layer(Index, PK.Current), -1);
+            if (id < 0 && States.Count > 0)
             {
-                if (index == 0)
-                    return CurrentTransition.Source;
-                return CurrentTransition.Target;
+                // Initialize to first state
+                SetCurrentState(pb, States[0]);
+                return States[0];
             }
-
-            if (CurrentState == null && States.Count > 0)
-                CurrentState = States[0];
-
-            return CurrentState;
+            return FindStateById(id);
         }
 
-        public void Update(Animator animator)
+        private void SetCurrentState(AnimationPlayback pb, AnimationState state)
+            => pb.Set(PK.Layer(Index, PK.Current), state?.ID ?? -1);
+
+        private bool GetInTransition(AnimationPlayback pb)
+            => pb.GetBool(PK.Layer(Index, PK.InTransition));
+
+        private void SetInTransition(AnimationPlayback pb, bool value)
+            => pb.Set(PK.Layer(Index, PK.InTransition), value ? 1 : 0);
+
+        private float GetTransitionTime(AnimationPlayback pb)
+            => pb.Get(PK.Layer(Index, PK.TransTime));
+
+        private void SetTransitionTime(AnimationPlayback pb, float value)
+            => pb.Set(PK.Layer(Index, PK.TransTime), value);
+
+        private float GetTransitionDuration(AnimationPlayback pb)
+            => pb.Get(PK.Layer(Index, PK.TransDuration), 0.2f);
+
+        private void SetTransitionDuration(AnimationPlayback pb, float value)
+            => pb.Set(PK.Layer(Index, PK.TransDuration), value);
+
+        private AnimationState GetTransSource(AnimationPlayback pb)
+            => FindStateById((int)pb.Get(PK.Layer(Index, PK.TransSource), -1));
+
+        private void SetTransSource(AnimationPlayback pb, AnimationState state)
+            => pb.Set(PK.Layer(Index, PK.TransSource), state?.ID ?? -1);
+
+        private AnimationState GetTransTarget(AnimationPlayback pb)
+            => FindStateById((int)pb.Get(PK.Layer(Index, PK.TransTarget), -1));
+
+        private void SetTransTarget(AnimationPlayback pb, AnimationState state)
+            => pb.Set(PK.Layer(Index, PK.TransTarget), state?.ID ?? -1);
+
+        private AnimationState GetReturnToState(AnimationPlayback pb)
+            => FindStateById((int)pb.Get(PK.Layer(Index, PK.ReturnTo), -1));
+
+        private void SetReturnToState(AnimationPlayback pb, AnimationState state)
+            => pb.Set(PK.Layer(Index, PK.ReturnTo), state?.ID ?? -1);
+
+        private AnimationState FindStateById(int id)
         {
-            if (CurrentState == null && States.Count > 0)
-                CurrentState = States[0];
+            if (id < 0) return null;
+            foreach (var s in States)
+                if (s.ID == id) return s;
+            return null;
+        }
 
-            if (InTransition)
+        // --- Public API ---
+
+        public int GetStateCount(AnimationPlayback pb) => GetInTransition(pb) ? 2 : 1;
+
+        public AnimationState GetState(int index, AnimationPlayback pb)
+        {
+            if (GetInTransition(pb))
             {
-                transitionTime += Base.Time.SmoothDelta;
+                if (index == 0)
+                    return GetTransSource(pb);
+                return GetTransTarget(pb);
+            }
 
-                if (transitionTime > CurrentTransition.Duration)
+            return GetCurrentState(pb);
+        }
+
+        public void Update(Animator animator, AnimationPlayback pb)
+        {
+            var currentState = GetCurrentState(pb);
+
+            if (GetInTransition(pb))
+            {
+                float transitionTime = GetTransitionTime(pb) + Base.Time.SmoothDelta;
+                float duration = GetTransitionDuration(pb);
+
+                if (transitionTime > duration)
                 {
-                    if (CurrentState != null)
+                    if (currentState != null)
                     {
-                        CurrentState.Weight = 1;
-                        CurrentState.Update(animator, false);
+                        currentState.SetWeight(pb, 1);
+                        currentState.Update(animator, pb, false);
                     }
 
-                    InTransition = false;
-                    CurrentTransition = null;
+                    SetInTransition(pb, false);
                     return;
                 }
 
-                CurrentTransition.Target.Weight = Math.Clamp(transitionTime / CurrentTransition.Duration, 0, 1);
-                CurrentTransition.Source.Weight = 1;
+                SetTransitionTime(pb, transitionTime);
 
-                CurrentTransition.Source.Update(animator, false);
-                CurrentTransition.Target.Update(animator, true);
+                var source = GetTransSource(pb);
+                var target = GetTransTarget(pb);
+
+                if (target != null)
+                    target.SetWeight(pb, Math.Clamp(transitionTime / duration, 0, 1));
+                if (source != null)
+                    source.SetWeight(pb, 1);
+
+                source?.Update(animator, pb, false);
+                target?.Update(animator, pb, true);
             }
             else
             {
                 foreach (AnimationTransition transition in Transitions)
                 {
-                    if (transition.Source != CurrentState)
+                    if (transition.Source != currentState)
                         continue;
 
                     bool allConditionsMet = true;
 
                     if (transition.Conditions.Count == 0)
-                        allConditionsMet = CurrentState.TimeNormalized >= .8f;
+                        allConditionsMet = currentState.GetTimeNormalized(pb) >= .8f;
 
                     foreach (AnimationCondition condition in transition.Conditions)
                     {
@@ -87,17 +149,19 @@ namespace Freefall.Animation
                         {
                             allConditionsMet = false;
 
-                            if (CurrentState.TimeElapsed > CurrentState.Clip.DurationSeconds * condition.AutoThreshold)
+                            if (currentState.GetTimeElapsed(pb) > currentState.Clip.DurationSeconds * condition.AutoThreshold)
                             {
-                                InTransition = true;
-                                transitionTime = 0;
+                                SetInTransition(pb, true);
+                                SetTransitionTime(pb, 0);
+                                SetTransitionDuration(pb, transition.Duration);
 
-                                CurrentTransition = transition;
-                                CurrentTransition.Target = returnToState;
+                                var returnTo = GetReturnToState(pb);
+                                SetTransSource(pb, currentState);
+                                SetTransTarget(pb, returnTo);
 
-                                CurrentState = returnToState;
-                                returnToState = null;
-                                Update(animator);
+                                SetCurrentState(pb, returnTo);
+                                SetReturnToState(pb, null);
+                                Update(animator, pb);
                                 return;
                             }
                         }
@@ -110,23 +174,31 @@ namespace Freefall.Animation
 
                     if (allConditionsMet)
                     {
-                        InTransition = true;
-                        transitionTime = 0;
+                        SetInTransition(pb, true);
+                        SetTransitionTime(pb, 0);
+                        SetTransitionDuration(pb, transition.Duration);
+                        SetTransSource(pb, currentState);
+                        SetTransTarget(pb, transition.Target);
+                        SetReturnToState(pb, currentState);
 
-                        CurrentTransition = transition;
-                        returnToState = CurrentState;
+                        // Consume trigger parameters
+                        foreach (var cond in transition.Conditions)
+                        {
+                            if (!string.IsNullOrEmpty(cond.Parameter))
+                                animator.ConsumeTrigger(cond.Parameter);
+                        }
 
-                        CurrentState = transition.Target;
-                        CurrentState.SetTimeElapsed(0);
-                        Update(animator);
+                        SetCurrentState(pb, transition.Target);
+                        transition.Target.SetTimeElapsed(pb, 0);
+                        Update(animator, pb);
                         return;
                     }
                 }
 
-                if (CurrentState != null)
+                if (currentState != null)
                 {
-                    CurrentState.Weight = 1;
-                    CurrentState.Update(animator);
+                    currentState.SetWeight(pb, 1);
+                    currentState.Update(animator, pb);
                 }
             }
         }

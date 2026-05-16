@@ -15,6 +15,7 @@ namespace Freefall.Components
     /// Renders skinned/animated meshes with bone transforms.
     /// Uses bindless instancing with a shared bone matrix buffer.
     /// </summary>
+    [Icon("icon_skinnedmesh.png")]
     public class SkinnedMeshRenderer : Component, IDraw, IUpdate, IParallel
     {
         public Mesh? Mesh;
@@ -41,12 +42,14 @@ namespace Freefall.Components
             Transform.RootRotation = Mesh.RootRotation;
 
             animator.GetPose(Mesh.Bones, boneMatrices);
+
             Params.SetParameterArray("Bones", boneMatrices);
         }
 
         public void Draw()
         {
             if(!Enabled) return;
+            if (Mesh== null) return;
             if (Materials == null || Materials.Count == 0) return;
 
             var slot = Entity.Transform.TransformSlot;
@@ -55,7 +58,8 @@ namespace Freefall.Components
             {
                 if (!Mesh.MeshParts[i].Enabled) continue;
                 var material = i < Materials.Count ? Materials[i] : Materials[0];
-                CommandBuffer.Enqueue(Mesh, i, material, Params, slot);
+                if(material != null)
+                    CommandBuffer.Enqueue(Mesh, i, material, Params, slot);
             }
         }
     }

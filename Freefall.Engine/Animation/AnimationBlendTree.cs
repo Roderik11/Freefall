@@ -8,48 +8,55 @@ namespace Freefall.Animation
     /// <summary>
     /// Blend Tree using 2D Cartesian Gradient Blending (Freeform Directional).
     /// Blends multiple animations based on two parameters (e.g., movement direction).
+    /// All mutable state (weights) lives in AnimationPlayback.
     /// </summary>
+    [Serializable]
     public class AnimationBlendTree : AnimationState
     {
         public List<BlendLayer> Layers = new List<BlendLayer>();
         public string ParameterA;
         public string ParameterB;
-        public AnimationState MainLayer;
 
-        public override void Update(Animator animator, bool fireEvents = true)
+        public override AnimationClip GetDominantClip() => _cachedDominantClip;
+        private AnimationClip _cachedDominantClip;
+
+        public override void Update(Animator animator, AnimationPlayback pb, bool fireEvents = true)
         {
-            UpdateWeights(animator);
+            UpdateWeights(animator, pb);
 
             float maxWeight = 0;
             BlendLayer maxLayer = null;
 
             // Find anim with highest weight
-            foreach (var layer in Layers)
+            for (int i = 0; i < Layers.Count; i++)
             {
-                if (layer.Animation.Weight > maxWeight)
+                float w = pb.Get(PK.BlendWeight(ID, i));
+                if (w > maxWeight)
                 {
-                    maxWeight = layer.Animation.Weight;
-                    maxLayer = layer;
-                    MainLayer = layer.Animation;
+                    maxWeight = w;
+                    maxLayer = Layers[i];
+                    _cachedDominantClip = maxLayer.Animation.Clip;
                 }
             }
 
             if (maxLayer == null) return;
 
             // Update that anim
-            maxLayer.Animation.Update(animator, fireEvents);
+            maxLayer.Animation.Update(animator, pb, fireEvents);
 
             // Synchronize all active anims
+            float maxTimeNorm = maxLayer.Animation.GetTimeNormalized(pb);
             foreach (var layer in Layers)
             {
-                if (layer.Animation.Weight <= 0) continue;
+                float w = layer.Animation.GetWeight(pb);
+                if (w <= 0) continue;
                 if (layer == maxLayer) continue;
 
-                layer.Animation.SetTimeNormalized(maxLayer.Animation.TimeNormalized);
+                layer.Animation.SetTimeNormalized(pb, maxTimeNorm);
             }
         }
 
-        void UpdateWeights(Animator animator)
+        void UpdateWeights(Animator animator, AnimationPlayback pb)
         {
             float valueA = animator.GetParam(ParameterA);
             float valueB = animator.GetParam(ParameterB);
@@ -57,11 +64,14 @@ namespace Freefall.Animation
 
             float total_weight = 0.0f;
             int count = Layers.Count;
-            float[] weights = new float[count];
+
+            // Use stackalloc for small counts, fallback for large
+            Span<float> normalizedWeights = count <= 32
+                ? stackalloc float[count]
+                : new float[count];
 
             for (int i = 0; i < count; ++i)
             {
-                // Calc vec i -> sample
                 Vector2 point_i = Layers[i].Values;
                 Vector2 vec_is = input - point_i;
 
@@ -72,11 +82,9 @@ namespace Freefall.Animation
                     if (j == i)
                         continue;
 
-                    // Calc vec i -> j
                     Vector2 point_j = Layers[j].Values;
                     Vector2 vec_ij = point_j - point_i;
 
-                    // Calc Weight
                     float lensq_ij = Vector2.Dot(vec_ij, vec_ij);
                     float new_weight = Vector2.Dot(vec_is, vec_ij) / lensq_ij;
                     if (lensq_ij == 0)
@@ -86,30 +94,63 @@ namespace Freefall.Animation
                     weight = Math.Min(weight, new_weight);
                 }
 
-                weights[i] = weight;
+                normalizedWeights[i] = weight;
                 total_weight += weight;
             }
 
-            int maxWeightIndex = -1;
-            float maxWeightValue = 0;
+            // Normalize and store in playback
             float total = total_weight > 0 ? 1f / total_weight : 0;
 
             for (int i = 0; i < count; ++i)
             {
-                weights[i] = weights[i] * total;
+                float w = normalizedWeights[i] * total;
+                pb.Set(PK.BlendWeight(ID, i), w);
+                Layers[i].Animation.SetWeight(pb, w);
+            }
+        }
 
-                if (weights[i] >= maxWeightValue)
+        /// <summary>
+        /// Weighted average blend. Reads per-child weights from playback.
+        /// </summary>
+        internal override void BlendBone(Bone bone, ref BonePose blendPose, ref BonePose temp, AnimationPlayback pb)
+        {
+            float treeWeight = GetWeight(pb);
+            if (treeWeight <= 0) return;
+
+            int count = Layers.Count;
+            BonePose treePose = default;
+            float cumWeight = 0;
+
+            for (int i = 0; i < count; i++)
+            {
+                float w = pb.Get(PK.BlendWeight(ID, i));
+                if (w <= 0) continue;
+
+                var child = Layers[i].Animation;
+                if (child.Clip == null) continue;
+
+                child.Clip.GetBonePose(bone, child.GetTimeElapsed(pb), ref temp);
+
+                if (cumWeight == 0)
                 {
-                    maxWeightValue = weights[i];
-                    maxWeightIndex = i;
+                    treePose = temp;
                 }
+                else
+                {
+                    float factor = w / (cumWeight + w);
+                    treePose.Position = Vector3.Lerp(treePose.Position, temp.Position, factor);
+                    treePose.Scale = Vector3.Lerp(treePose.Scale, temp.Scale, factor);
+                    treePose.Rotation = Quaternion.Slerp(treePose.Rotation, temp.Rotation, factor);
+                }
+
+                cumWeight += w;
             }
 
-            if (maxWeightIndex > -1)
-                weights[maxWeightIndex] = 1;
+            if (cumWeight <= 0) return;
 
-            for (int i = 0; i < count; ++i)
-                Layers[i].Animation.Weight = weights[i] * Weight;
+            blendPose.Position = Vector3.Lerp(blendPose.Position, treePose.Position, treeWeight);
+            blendPose.Scale = Vector3.Lerp(blendPose.Scale, treePose.Scale, treeWeight);
+            blendPose.Rotation = Quaternion.Slerp(blendPose.Rotation, treePose.Rotation, treeWeight);
         }
 
         public override int GetStateCount()
@@ -122,9 +163,10 @@ namespace Freefall.Animation
             return Layers[index].Animation;
         }
 
+        [Serializable]
         public class BlendLayer
         {
-            public AnimationState Animation;
+            public AnimationState Animation = new AnimationState();
             public Vector2 Values;
         }
     }

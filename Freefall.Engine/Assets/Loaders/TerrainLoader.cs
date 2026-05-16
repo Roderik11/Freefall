@@ -4,6 +4,7 @@ using System.Linq;
 using System.Text;
 using Freefall.Assets.Packers;
 using Freefall.Base;
+using Freefall.Components;
 using Freefall.Graphics;
 using Freefall.Serialization;
 using PhysX;
@@ -312,7 +313,8 @@ namespace Freefall.Assets.Loaders
         /// </summary>
         private void SaveBakedHeightmap(Terrain terrain)
         {
-            var baker = TerrainBaker.Instance;
+            var baker = ComponentCache<TerrainRenderer>.All
+                .FirstOrDefault(r => r.Terrain == terrain)?.Baker;
             if (baker == null) return;
 
             var bytes = baker.ReadbackBakedHeightmapBytes();
@@ -414,7 +416,8 @@ namespace Freefall.Assets.Loaders
         private void SaveControlMaps(Terrain terrain)
         {
             if (string.IsNullOrEmpty(terrain.Guid)) return;
-            var baker = TerrainBaker.Instance;
+            var baker = ComponentCache<TerrainRenderer>.All
+                .FirstOrDefault(r => r.Terrain == terrain)?.Baker;
 
             // Save PaintHeightLayer ControlMaps
             foreach (var layer in terrain.HeightLayers)

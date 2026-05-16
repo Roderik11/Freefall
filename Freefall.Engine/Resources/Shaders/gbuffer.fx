@@ -226,6 +226,7 @@ PSOutput PS(VSOutput input)
     
     // Normal mapping via cotangent frame (no tangent buffer needed)
     float3 N = normalize(input.Normal);
+    float3 faceNormal = N;
     
     // Cotangent frame from screen-space derivatives (shared by base + detail normals)
     float3 dp1 = ddx(input.WorldPos.xyz);
@@ -253,7 +254,6 @@ PSOutput PS(VSOutput input)
         float2 nXY = normalTex.Sample(Sampler, input.TexCoord).rg * 2.0 - 1.0;
         nXY.y = -nXY.y; // Flip Y: OpenGL (Unity) → DirectX convention
         float3 texNormal = float3(nXY, sqrt(max(0.001, 1.0 - dot(nXY, nXY))));
-        
         // Blend detail normal if present (UDN blending in tangent space)
         //if (mat.DetailNormalIdx != 0)
         //{
@@ -280,12 +280,45 @@ PSOutput PS(VSOutput input)
         N = normalize(mul(texNormal, TBN));
     }
     
+    float depth = input.Depth;
+    float2 displacement = float2(0, 0);
+    
+    // Blend explicit height using same visual weight
+    if (mat.DetailMaskIdx != 0)
+    {
+        Texture2D heightMap = ResourceDescriptorHeap[mat.DetailMaskIdx];
+        float height = heightMap.Sample(Sampler, input.TexCoord).r;
+        
+        float uvRate = length(ddy(input.TexCoord));
+        float worldRate = length(ddy(input.WorldPos));
+        float uvPerMeter = uvRate / max(worldRate, 0.001);
+        float dispScale = 0.01 / uvPerMeter;
+        
+        depth = input.Depth - height * dispScale;
+
+        float4 clipPos = mul(float4(input.WorldPos), ViewProjection);
+        float4 clipDisp = mul(float4(input.WorldPos + faceNormal * height * dispScale, 1), ViewProjection);
+        float2 ndcPos = clipPos.xy / clipPos.w;
+        float2 ndcDisp = clipDisp.xy / clipDisp.w;
+        displacement = (ndcDisp - ndcPos) * float2(0.5, -0.5);
+        
+        // Fade displacement at screen edges so the inversion never needs off-screen sources.
+        // Margin is proportional to displacement magnitude — large displacements fade earlier.
+        float2 screenUV = ndcPos * float2(0.5, -0.5) + 0.5;
+        float dispMag = length(displacement);
+        float margin = dispMag * 1.0;
+        float edgeFade = saturate(min(min(screenUV.x, 1.0 - screenUV.x),
+                                  min(screenUV.y, 1.0 - screenUV.y)) / margin);
+        displacement *= edgeFade;
+        //depth *= edgeFade;
+    }
+    
     output.Albedo = float4(color.rgb, emissiveMask);
     output.Normal = float4(N, 1.0f);
     output.Data = float4(saturate(roughness), saturate(metal), saturate(ao), 1.0);
-    output.Depth = input.Depth;
+    output.Depth = depth;
+    output.Displacement = displacement;
     output.EntityId = (input.TransformSlot << 8u) | (input.MeshPartIdx & 0xFFu);
-    output.Displacement = float2(0, 0);
 
     return output;
 }

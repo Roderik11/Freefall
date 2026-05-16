@@ -21,6 +21,7 @@ namespace Freefall.Components
     /// CPU only uploads emitter configuration per frame.
     /// Uses dead-list + alive-list (ping-pong) pool management.
     /// </summary>
+    [Icon("icon_particle.png")]
     public class ParticleEmitter : Component, IDraw, IUpdate
     {
         // ── Emission ──
@@ -231,6 +232,7 @@ namespace Freefall.Components
             _drawArgs?.Dispose();
             _emitterParamsCB?.Dispose();
             _computeShader?.Dispose();
+            _emitCountUpload?.Release();
         }
 
         // ────────────── Update ──────────────

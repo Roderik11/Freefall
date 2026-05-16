@@ -252,6 +252,10 @@ namespace Freefall.Graphics
             if (culler != null)
                 constants.CullStatsUAVIdx = culler.CullStatsUAV;
             
+            // Camera position + sort direction for GPU depth sorting (opaque = front-to-back)
+            constants.CameraPosition = camera.Position;
+            constants.SortDirection = 0; // Front-to-back for opaque
+            
             // Store current VP for next frame's occlusion projection
             _previousFrameViewProjection = camera.ViewProjection;
 
@@ -706,7 +710,7 @@ namespace Freefall.Graphics
              list.RSSetViewport(new Viewport(0, 0, Composite.Native.Description.Width, Composite.Native.Description.Height));
              list.RSSetScissorRect(new RectI(0, 0, (int)Composite.Native.Description.Width, (int)Composite.Native.Description.Height));
 
-             // Execute forward pass draws (ocean, gizmos, etc.)
+             // Execute forward pass draws (ocean, gizmos, transparent, etc.)
              PixMarker.Begin(list, "Forward Draws");
              CommandBuffer.Execute(RenderPass.Forward, list, Engine.Device);
              PixMarker.End(list); // Forward Draws

@@ -16,6 +16,9 @@
 #pragma kernel CSHistogramPrefixSum
 #pragma kernel CSMain
 #pragma kernel CSClear
+#pragma kernel CSComputeDepthKeys
+#pragma kernel CSBitonicSortPairs
+#pragma kernel CSWriteSortedIndices
 #pragma kernel CSVisibilityShadow
 #pragma kernel CSVisibilityShadow4
 #pragma kernel CSExpandCascades
@@ -40,6 +43,9 @@ cbuffer FrustumPlanes : register(b0)
     uint CullStatsUAVIdx;  // UAV index for cull stats buffer (0=disabled)
     uint DebugMode;        // Debug visualization mode (unused by culler, kept for layout compatibility)
     float ProjScale;       // Projection._m22 = cot(fovY/2) for sphere-to-screen size
+    // Depth sorting parameters
+    float3 CameraPosition; // Camera world position for distance computation
+    uint SortDirection;    // 0 = front-to-back (opaque), 1 = back-to-front (transparent)
 };
 
 // Shadow cascade data (StructuredBuffer via push constant — used by rendering shaders)
@@ -97,6 +103,7 @@ cbuffer PushConstants : register(b3)
     uint ExpansionUAVIdx;           // slot 29 — UAV: expansion buffer for (instanceIdx, cascadeIdx)
     uint BoneBufferIdx;             // slot 30 — SRV: per-batch bone matrices (0=static)
     uint CascadeBufferSRVIdx;       // slot 31 — SRV: StructuredBuffer<CascadeData> / shadow cascade idx (aliased)
+    uint SortKeysUAVIdx;            // slot 32 — UAV: depth sort keys buffer (uint2 per entry)
 };
 
 // Convenience aliases for named push constants (matching old #define usage)
@@ -230,22 +237,26 @@ bool IsOccluded(float3 worldCenter, float worldRadius)
     hiZ.GetDimensions(0, w, h, levels);
     float2 mip0Size = float2(w, h);
     
-    // Project sphere radius to screen pixels for mip selection
-    // Fix: Include projection scale (cot(fov/2) == _m11) for correct screen size
-    float projScale = OcclusionProjection._m11; 
-    // Protect against zero projection
-    projScale = abs(projScale) < 0.001 ? 1.0 : projScale;
+    // Project sphere radius to screen pixels for mip selection.
+    // For standard perspective, _m00 * mip0Size.x == _m11 * mip0Size.y,
+    // so vertical-only calculation is sufficient.
+    float projScale = abs(OcclusionProjection._m11);
+    projScale = projScale < 0.001 ? 1.0 : projScale;
+    float screenRadius = (worldRadius * projScale / clipCenter.w) * mip0Size.y * 0.5;
     
-    float projRadius = (worldRadius * projScale) / clipCenter.w;
-    float screenRadius = projRadius * mip0Size.y * 0.5;
-    
-    // Pick mip level where the sphere covers ~2 texels (more conservative than 1)
-    // This ensures we sample a mip where the object is significant
-    float mipLevel = ceil(log2(max(screenRadius * 2.0, 1.0)));
+    // Pick mip where the sphere covers ~1 texel, then add +1 to widen
+    // the 4-tap footprint beyond the sphere. This prevents false occlusion
+    // when a nearby occluder fills the sphere's footprint but the object
+    // extends beyond it (common with large terrain patches behind buildings).
+    float mipLevel = ceil(log2(max(screenRadius * 2, 1.0)));
     mipLevel = min(mipLevel, levels - 1.0f);
     
     uint mip = (uint)mipLevel;
-    float2 mipSize = max(float2(1,1), mip0Size / (float)(1u << mip));
+    // Must query actual GPU mip dimensions — mip0 / 2^mip diverges from
+    // the GPU's floor(prev/2) chain on NPOT textures, causing right-side bias.
+    float mipW, mipH, unused;
+    hiZ.GetDimensions(mip, mipW, mipH, unused);
+    float2 mipSize = float2(mipW, mipH);
     
     // 4-tap sampling for stability
     // Sample the 2x2 neighborhood around the center to catch edges
@@ -1148,4 +1159,125 @@ void CSCompactCommands(uint3 dispatchThreadId : SV_DispatchThreadID)
     
     RWStructuredBuffer<IndirectDrawCommand> dest = ResourceDescriptorHeap[VisibleIndicesSRVIdx];
     dest[slot] = cmd;
+}
+
+//-----------------------------------------------------------------------------
+// GPU Depth Sorting: Sort visible instances by camera distance
+// Runs AFTER CSGlobalScatter, BEFORE CSMain.
+// Three-pass pipeline:
+//   1. CSComputeDepthKeys: Pack (compositeKey, instanceIdx) into uint2 buffer
+//      compositeKey = (meshPartId << 20) | (quantizedDistance & 0xFFFFF)
+//   2. CSBitonicSortPairs: Bitonic sort on uint2 by .x key (ascending)
+//   3. CSWriteSortedIndices: Unpack sorted .y values back to visibleIndices
+//
+// Sort direction is baked into the key:
+//   front-to-back (opaque):      distBits >> 12 (ascending = nearest first)
+//   back-to-front (transparent): ~(distBits >> 12) (ascending = farthest first)
+//
+// The meshPartId in the upper bits preserves subbatch grouping automatically.
+//-----------------------------------------------------------------------------
+
+[numthreads(256, 1, 1)]
+void CSComputeDepthKeys(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    uint idx = dispatchThreadId.x;
+    
+    RWStructuredBuffer<uint> visibleIndices = ResourceDescriptorHeap[VisibleIndicesUAVIdx];
+    RWStructuredBuffer<uint2> sortKeys = ResourceDescriptorHeap[SortKeysUAVIdx];
+    
+    if (idx >= TotalInstances)
+    {
+        sortKeys[idx] = uint2(0xFFFFFFFF, 0xFFFFFFFF);
+        return;
+    }
+    
+    uint instanceIdx = visibleIndices[idx];
+    
+    // Padding entries (0xFFFFFFFF) sort to end
+    if (instanceIdx == 0xFFFFFFFF)
+    {
+        sortKeys[idx] = uint2(0xFFFFFFFF, 0xFFFFFFFF);
+        return;
+    }
+    
+    StructuredBuffer<InstanceDescriptor> descriptors = ResourceDescriptorHeap[DescriptorBufferIdx];
+    StructuredBuffer<row_major float4x4> transforms = ResourceDescriptorHeap[GlobalTransformsIdx];
+    StructuredBuffer<uint> subbatchIds = ResourceDescriptorHeap[SubbatchIdsIdx];
+    
+    uint transformSlot = descriptors[instanceIdx].TransformSlot;
+    row_major float4x4 world = transforms[transformSlot];
+    
+    // Extract world position from translation row
+    float3 worldPos = float3(world[3][0], world[3][1], world[3][2]);
+    float dist = distance(worldPos, CameraPosition);
+    
+    // asuint(float) sorts correctly for positive floats (IEEE 754)
+    // Top 20 bits give ~1mm precision at 1m, ~2m at 2km — plenty for draw ordering
+    uint distBits = asuint(dist);
+    uint distQuantized = distBits >> 12;
+    
+    // Back-to-front: invert distance bits so ascending sort = farthest first
+    if (SortDirection == 1)
+        distQuantized = (~distQuantized) & 0xFFFFF;
+    
+    uint meshPartId = subbatchIds[instanceIdx];
+    
+    // Composite key: meshPartId in upper 12 bits, distance in lower 20 bits
+    uint compositeKey = (meshPartId << 20) | (distQuantized & 0xFFFFF);
+    sortKeys[idx] = uint2(compositeKey, instanceIdx);
+}
+
+//-----------------------------------------------------------------------------
+// CSBitonicSortPairs: Sort uint2 entries by .x key (ascending)
+// Called multiple times with different SortSize/SortStride for full sort.
+// SortSize = outer block size (determines ascending/descending direction)
+// SortStride = current comparison stride (determines pair spacing)
+//-----------------------------------------------------------------------------
+[numthreads(256, 1, 1)]
+void CSBitonicSortPairs(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    uint idx = dispatchThreadId.x;
+    
+    RWStructuredBuffer<uint2> data = ResourceDescriptorHeap[SortKeysUAVIdx];
+    
+    uint halfSize = SortStride;
+    uint pairBlock = halfSize * 2; // Local pair block size (NOT SortSize)
+    
+    // Calculate pair indices: pairs are spaced by halfSize within blocks of pairBlock
+    uint blockIdx = idx / halfSize;
+    uint offsetInBlock = idx % halfSize;
+    
+    uint leftIdx = blockIdx * pairBlock + offsetInBlock;
+    uint rightIdx = leftIdx + halfSize;
+    
+    if (rightIdx >= SortCount)
+        return;
+    
+    // Direction based on OUTER block size (SortSize), not local pair block
+    bool ascending = ((leftIdx / SortSize) % 2) == 0;
+    
+    uint2 left = data[leftIdx];
+    uint2 right = data[rightIdx];
+    
+    if ((left.x > right.x) == ascending)
+    {
+        data[leftIdx] = right;
+        data[rightIdx] = left;
+    }
+}
+
+//-----------------------------------------------------------------------------
+// CSWriteSortedIndices: Write sorted instance indices back to visibleIndices
+//-----------------------------------------------------------------------------
+[numthreads(256, 1, 1)]
+void CSWriteSortedIndices(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    uint idx = dispatchThreadId.x;
+    if (idx >= TotalInstances)
+        return;
+    
+    RWStructuredBuffer<uint2> sortKeys = ResourceDescriptorHeap[SortKeysUAVIdx];
+    RWStructuredBuffer<uint> visibleIndices = ResourceDescriptorHeap[VisibleIndicesUAVIdx];
+    
+    visibleIndices[idx] = sortKeys[idx].y;
 }

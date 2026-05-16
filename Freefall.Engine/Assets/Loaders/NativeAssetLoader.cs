@@ -1,18 +1,18 @@
 using System.IO;
 using System.Text;
 using Freefall.Assets.Packers;
-using Freefall.Graph;
 using Freefall.Serialization;
 
 namespace Freefall.Assets.Loaders
 {
     /// <summary>
-    /// Loads NodeGraph-derived assets (PCGGraph, etc.) from cache.
-    /// Unpacks AssetDefinitionData (YAML) → NodeGraph, then rebuilds
-    /// runtime state (ports, connection refs).
+    /// General-purpose loader for YAML-serialized .asset files.
+    /// Handles any Asset type (NodeGraph, Animation, etc.).
+    /// If the loaded asset implements IRebuildAfterLoad, calls
+    /// RebuildAfterLoad() to resolve runtime references.
     /// </summary>
-    [AssetLoader(typeof(NodeGraph), ".asset")]
-    public class NodeGraphLoader : IAssetLoader
+    [AssetLoader(typeof(Asset), ".asset")]
+    public class NativeAssetLoader : IAssetLoader
     {
         private readonly AssetDefinitionPacker _packer = new();
 
@@ -20,7 +20,7 @@ namespace Freefall.Assets.Loaders
         {
             var cachePath = AssetDatabase.ResolveCachePath(name, "AssetDefinitionData");
             if (cachePath == null || !File.Exists(cachePath))
-                throw new FileNotFoundException($"Cache file not found for graph '{name}'");
+                throw new FileNotFoundException($"Cache file not found for asset '{name}'");
 
             return LoadFromCache(cachePath, name, manager);
         }
@@ -32,23 +32,25 @@ namespace Freefall.Assets.Loaders
                 defData = _packer.Read(stream);
 
             var yaml = Encoding.UTF8.GetString(defData.YamlBytes);
-            var graph = NativeImporter.LoadFromString(yaml, manager) as NodeGraph;
+            var asset = NativeImporter.LoadFromString(yaml, manager);
 
-            if (graph == null)
-                throw new InvalidDataException($"Failed to deserialize NodeGraph from cache: {name}");
+            if (asset == null)
+                throw new InvalidDataException($"Failed to deserialize asset from cache: {name}");
 
-            graph.Name = name;
-            graph.RebuildAfterLoad();
-            graph.MarkReady();
+            asset.Name = name;
 
-            return graph;
+            if (asset is IRebuildAfterLoad rebuildable)
+                rebuildable.RebuildAfterLoad();
+
+            asset.MarkReady();
+            return asset;
         }
 
         public void Save(Asset asset, string savePath)
         {
             var yaml = NativeImporter.SaveToString(asset);
             File.WriteAllText(savePath, yaml, Encoding.UTF8);
-            Debug.Log($"[NodeGraphLoader] Saved: {savePath}");
+            Debug.Log($"[NativeAssetLoader] Saved: {savePath}");
         }
     }
 }

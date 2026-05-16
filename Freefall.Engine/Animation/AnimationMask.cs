@@ -11,9 +11,24 @@ namespace Freefall.Animation
     {
         public List<string> Bones = new List<string>();
 
+        // Runtime lookup cache
+        private HashSet<string> _boneSet;
+
+        private void EnsureSet()
+        {
+            if (_boneSet != null && _boneSet.Count == Bones.Count) return;
+            _boneSet = new HashSet<string>(Bones);
+        }
+
         public bool Contains(string name)
         {
-            return Bones.Contains(name);
+            EnsureSet();
+            return _boneSet.Contains(name);
         }
+
+        /// <summary>
+        /// Invalidates the lookup cache. Call after modifying the Bones list at runtime.
+        /// </summary>
+        public void InvalidateCache() => _boneSet = null;
     }
 }

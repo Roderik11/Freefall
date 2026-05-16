@@ -68,6 +68,8 @@ namespace Freefall.Graphics
         [ValueRange(0.1f, 10.0f)]
         public float LODBias { get; set; } = 1.0f;
 
+        public bool IsDynamic { get; set; }
+
         /// <summary>
         /// Compute NonLodPartIndices from LODs and MeshParts.
         /// Call after both LODs and MeshParts are populated.
@@ -134,7 +136,12 @@ namespace Freefall.Graphics
         }
 
         // Skeleton / Animation
-        public Bone[]? Bones { get; set; }
+        /// <summary>The skeleton asset this mesh was imported with (for retargeting).</summary>
+        public Animation.Skeleton Skeleton { get; set; }
+
+        /// <summary>Bone data. Prefers Skeleton asset, falls back to inline MeshPacker data.</summary>
+        public Bone[]? Bones => Skeleton?.Bones;
+
         public BoneWeight[]? BoneWeights { get; set; }
         public Matrix4x4 RootRotation { get; set; } = Matrix4x4.Identity;
         
@@ -193,8 +200,8 @@ namespace Freefall.Graphics
                 LODs.AddRange(data.LODs);
             ComputeNonLodPartIndices();
             
-            if (data.Bones != null)
-                Bones = data.Bones;
+            //if (data.Bones != null)
+            //    Bones = data.Bones;
             
             if (data.BoneWeights != null && data.BoneWeights.Length > 0)
             {
@@ -211,7 +218,6 @@ namespace Freefall.Graphics
             var mesh = new Mesh();
             mesh.MeshParts.AddRange(data.Parts);
             mesh.BoundingBox = data.BoundingBox;
-            mesh.Bones = data.Bones;
             mesh.BoneWeights = data.BoneWeights;
             if (data.LODs != null && data.LODs.Count > 0)
                 mesh.LODs.AddRange(data.LODs);
@@ -427,19 +433,7 @@ namespace Freefall.Graphics
             CreateStructuredBufferSRV(device, _boneWeightBuffer, (uint)BoneWeights.Length,
                 (uint)System.Runtime.InteropServices.Marshal.SizeOf<BoneWeight>(), BoneWeightBufferIndex);
         }
-        public void BindPoseDifference(Mesh source)
-        {
-            var diag = new System.Collections.Generic.List<string>();
-            for (int i = 0; i < source.Bones.Length; i++)
-            {
-                float len1 = source.Bones[i].BindPoseMatrix.Translation.Length();
-                float len2 = Bones[i].BindPoseMatrix.Translation.Length();
-                float scaleFactor = len2 / len1;
-                Bones[i].ScaleFactor = scaleFactor > 0 ? scaleFactor : 1;
-                if (i < 5)
-                    diag.Add($"[{i}] src='{source.Bones[i].Name}' dst='{Bones[i].Name}' len1={len1:F6} len2={len2:F6} sf={Bones[i].ScaleFactor:F6}");
-            }
-        }
+
         public void Dispose()
         {
             var device = Engine.Device;

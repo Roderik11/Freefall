@@ -16,6 +16,8 @@ namespace Freefall.Components
     //   - Single texture fetch vs 100+ trig ops per pixel
     //   - Budget freed up could support volumetric ray-marched clouds (32-64 steps at quarter-res)
     //     with proper volumetric lighting, god rays, and camera parallax — still under 1ms.
+    [Icon("icon_sky.png")]
+    [UpdateInEditor]
     public class SkyboxRenderer : Component, IUpdate, IDraw
     {
         private Mesh Mesh;
@@ -74,6 +76,11 @@ namespace Freefall.Components
         {
             Mesh = Mesh.CreateCube(Engine.Device, 100.0f);
             SunLight ??= EntityManager.FindComponent<DirectionalLight>();
+        }
+
+        public override void Destroy()
+        {
+            Mesh?.Dispose();
         }
 
         public void Update()

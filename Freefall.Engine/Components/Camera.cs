@@ -6,10 +6,13 @@ using Freefall.Base;
 
 namespace Freefall.Components
 {
+    [Icon("icon_camera.png")]
+    [UpdateInEditor]
     public class Camera : Component, IUpdate
     {
+        public static Camera Main { get; private set; }
+
         public RenderView Target;
-        public static Camera Main { get; set; }
 
         public Matrix4x4 View { get; private set; }
         public Matrix4x4 Projection { get; private set; }
@@ -46,9 +49,24 @@ namespace Freefall.Components
             }
         }
 
+        public void Activate()
+        {
+            Main = this;
+        }
+
+            
         protected override void Awake()
         {
             if (Main == null) Main = this;
+        }
+
+        public override void Destroy()
+        {
+            if (Target != null)
+                Target.OnResized -= HandleTargetResize;
+
+            if (Main == this)
+                Main = null;
         }
 
         private void HandleTargetResize()

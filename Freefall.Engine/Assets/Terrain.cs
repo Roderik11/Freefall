@@ -59,6 +59,7 @@ namespace Freefall.Assets
     /// Terrain asset — holds all resource data (heightmap, layers, splatmaps).
     /// GPU rendering logic and Material live on TerrainRenderer (Component).
     /// </summary>
+    [CreateAsset("Terrain")]
     public class Terrain : Asset
     {
         // ── Dirty Flags (thread-safe: render-thread lambdas set, main-thread Draw consumes) ──

@@ -19,6 +19,8 @@ namespace Freefall.Components
         public Material Material;
     }
 
+
+    [Icon("icon_mesh.png")]
     public class MeshRenderer : Component, IDraw, IParallel
     {
         public Mesh? Mesh;

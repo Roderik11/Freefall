@@ -34,6 +34,7 @@ namespace Freefall.Graphics
         public bool? DepthTest { get; set; }
         public bool? DepthWrite { get; set; }
         public string? DepthFunc { get; set; }
+        public string? BlendMode { get; set; }
     }
 
     public static class FXParser
@@ -118,6 +119,7 @@ namespace Freefall.Graphics
                                     case "DepthTest": pass.DepthTest = bool.Parse(value); break;
                                     case "DepthWrite": pass.DepthWrite = bool.Parse(value); break;
                                     case "DepthFunc": pass.DepthFunc = value; break;
+                                    case "Blend": pass.BlendMode = value; break;
                                 }
                             }
                         }

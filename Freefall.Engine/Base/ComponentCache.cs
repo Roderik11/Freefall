@@ -8,6 +8,8 @@ namespace Freefall.Base
 {
     public interface IComponentCache
     {
+        void Early();
+        void Awake();
         void Update();
         void Draw();
     }
@@ -53,8 +55,8 @@ namespace Freefall.Base
             var a = List[index];
             var b = List[last];
 
-            Indices[b.Entity.GetHashCode()] = index;
-            Indices.Remove(a.Entity.GetHashCode());
+            Indices[b.Entity.Id] = index;
+            Indices.Remove(a.Entity.Id);
 
             List[index] = b;
             List[last] = a;
@@ -69,7 +71,7 @@ namespace Freefall.Base
         {
             lock (_lock)
             {
-                if (Indices.TryGetValue(entity.GetHashCode(), out int result))
+                if (Indices.TryGetValue(entity.Id, out int result))
                     return List[result];
 
                 return null;
@@ -80,7 +82,7 @@ namespace Freefall.Base
         {
             lock (_lock)
             {
-                if (!Indices.TryGetValue(entity.GetHashCode(), out int result))
+                if (!Indices.TryGetValue(entity.Id, out int result))
                     return false;
 
                 FastRemove(result);
@@ -92,8 +94,8 @@ namespace Freefall.Base
         {
             lock (_lock)
             {
-                int hash = entity.GetHashCode();
-                if (Indices.TryGetValue(hash, out int result))
+                int id = entity.Id;
+                if (Indices.TryGetValue(id, out int result))
                     return List[result];
 
                 if (component is IUpdate update)
@@ -102,7 +104,7 @@ namespace Freefall.Base
                 if (component is IDraw draw)
                     DrawList.Add(draw);
 
-                Indices.Add(hash, List.Count);
+                Indices.Add(id, List.Count);
                 component.Entity = entity;
                 List.Add(component);
                 WakeupList.Add(component);
@@ -111,7 +113,19 @@ namespace Freefall.Base
             }
         }
 
-        public void Update()
+        public void Early()
+        {
+            lock (_lock)
+            {
+                if (WakeupList.Count > 0)
+                {
+                    foreach (var component in WakeupList)
+                        component.EarlyBird();
+                }
+            }
+        }
+
+        public void Awake()
         {
             lock (_lock)
             {
@@ -122,16 +136,19 @@ namespace Freefall.Base
 
                     WakeupList.Clear();
                 }
+            }
+        }
 
-                if (!HasUpdate) return;
+        public void Update()
+        {
+            if (!HasUpdate) return;
 
-                if (HasUpdate)
-                {
-                    if (IsParallel)
-                        Parallel.ForEach(UpdateList.Collection, comp => comp.Update());
-                    else
-                        foreach (var comp in UpdateList.Collection) comp.Update();
-                }
+            lock (_lock)
+            {
+                if (IsParallel)
+                    Parallel.ForEach(UpdateList.Collection, comp => comp.Update());
+                else
+                    foreach (var comp in UpdateList.Collection) comp.Update();
             }
         }
 

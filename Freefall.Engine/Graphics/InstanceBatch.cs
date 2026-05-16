@@ -168,6 +168,9 @@ namespace Freefall.Graphics
         private uint[] shadowExpansionSRVIndices = new uint[FrameCount];
         private CpuDescriptorHandle[] shadowExpansionCPUHandles = new CpuDescriptorHandle[FrameCount];
 
+        // Depth sort keys buffer — uint2 per instance: (compositeKey, instanceIdx)
+        private ID3D12Resource[] sortKeysBuffers = new ID3D12Resource[FrameCount];
+        private uint[] sortKeysUAVIndices = new uint[FrameCount];
 
 
         private int _drawCount = 0;
@@ -550,6 +553,14 @@ namespace Freefall.Graphics
                 device.NativeDevice.CreateUnorderedAccessView(drawCountBuffers[i], null, drawCountUavDesc, drawCountCpuHandle);
                 drawCountCPUHandles[i] = drawCountCpuHandle;
                 
+                // Depth sort keys buffer: uint2 per entry (8 bytes) for GPU distance sorting
+                // Bitonic sort needs power-of-2 count, so round up to avoid OOB writes
+                int sortKeysCap = 1;
+                while (sortKeysCap < capacity) sortKeysCap <<= 1;
+                int sortKeysSize = sortKeysCap * 8; // sizeof(uint2) = 8
+                sortKeysBuffers[i] = device.CreateDefaultBuffer(sortKeysSize);
+                sortKeysUAVIndices[i] = device.AllocateBindlessIndex();
+                device.CreateStructuredBufferUAV(sortKeysBuffers[i], (uint)sortKeysCap, 8, sortKeysUAVIndices[i]);
             }
         }
 
@@ -652,16 +663,58 @@ namespace Freefall.Graphics
             // Only counters was written; next pass (Scatter) reads it
             commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(counterBuffers[frameIndex])));
 
-            // Pass 4: CSGlobalScatter â€” reads visibilityFlags+counters, writes visibleIndices+counters
+            // Pass 4: CSGlobalScatter — reads visibilityFlags+counters, writes visibleIndices+counters
             commandList.SetPipelineState(culler.GlobalScatterPSO);
             commandList.Dispatch((uint)((totalInstances + 255) / 256), 1, 1);
-            // visibleIndices and counters were written; next pass (CSMain) reads both
+            // visibleIndices and counters were written; depth sort reads visibleIndices next
             commandList.ResourceBarrier(new[] {
                 new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(visibleIndicesBuffers[frameIndex])),
                 new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(counterBuffers[frameIndex]))
             });
 
-            // Pass 5: CSMain â€” reads histogram+counters, writes commands
+            // Pass 4b: GPU Depth Sort — sort visibleIndices by camera distance
+            // Preserves MeshPartId grouping via composite key (meshPartId << 20 | distBits)
+            if (!Engine.Settings.DisableDepthSort
+                && culler.ComputeDepthKeysPSO != null && culler.BitonicSortPairsPSO != null && culler.WriteSortedIndicesPSO != null)
+            {
+                // Round up to next power of 2 for bitonic sort
+                uint sortN = 1;
+                while (sortN < (uint)totalInstances) sortN <<= 1;
+                
+                // Bind sort keys buffer
+                commandList.SetComputeRoot32BitConstant(0, sortKeysUAVIndices[frameIndex], 32);
+                
+                // Pass 4b.1: CSComputeDepthKeys — pack (compositeKey, instanceIdx) into sort buffer
+                // Dispatch for sortN entries (not totalInstances) so the entire power-of-2 range
+                // is initialized. Entries >= TotalInstances get 0xFFFFFFFF padding keys.
+                commandList.SetPipelineState(culler.ComputeDepthKeysPSO);
+                commandList.Dispatch((sortN + 255) / 256, 1, 1);
+                commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(sortKeysBuffers[frameIndex])));
+                
+                // Pass 4b.2: CSBitonicSortPairs — full bitonic sort on uint2 entries by .x key
+                commandList.SetPipelineState(culler.BitonicSortPairsPSO);
+                commandList.SetComputeRoot32BitConstant(0, sortN, 22); // SortCount = padded count
+                
+                for (uint blockSize = 2; blockSize <= sortN; blockSize <<= 1)
+                {
+                    for (uint stride = blockSize >> 1; stride > 0; stride >>= 1)
+                    {
+                        commandList.SetComputeRoot32BitConstant(0, blockSize, 20); // SortSize
+                        commandList.SetComputeRoot32BitConstant(0, stride, 21);    // SortStride
+                        
+                        uint threadCount = sortN / 2;
+                        commandList.Dispatch((threadCount + 255) / 256, 1, 1);
+                        commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(sortKeysBuffers[frameIndex])));
+                    }
+                }
+                
+                // Pass 4b.3: CSWriteSortedIndices — unpack sorted indices back to visibleIndices
+                commandList.SetPipelineState(culler.WriteSortedIndicesPSO);
+                commandList.Dispatch((uint)((totalInstances + 255) / 256), 1, 1);
+                commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(visibleIndicesBuffers[frameIndex])));
+            }
+
+            // Pass 5: CSMain — reads histogram+counters, writes commands
             commandList.SetPipelineState(culler.MainPSO);
             commandList.Dispatch((uint)((MeshRegistry.Count + 63) / 64), 1, 1);
             // Commands buffer transitions to IndirectArgument in Draw(), no UAV barrier needed here
@@ -1152,6 +1205,9 @@ namespace Freefall.Graphics
 
                 DeferDispose(drawCountBuffers[i], drawCountUAVIndices[i]);
                 drawCountBuffers[i] = null; drawCountUAVIndices[i] = 0;
+
+                DeferDispose(sortKeysBuffers[i], sortKeysUAVIndices[i]);
+                sortKeysBuffers[i] = null; sortKeysUAVIndices[i] = 0;
             }
 
             _cpuHeap?.Dispose();
@@ -1210,11 +1266,15 @@ namespace Freefall.Graphics
                 drawCountBuffers[i]?.Dispose();
                 if (drawCountUAVIndices[i] != 0) Engine.Device.ReleaseBindlessIndex(drawCountUAVIndices[i]);
 
+                sortKeysBuffers[i]?.Dispose();
+                if (sortKeysUAVIndices[i] != 0) Engine.Device.ReleaseBindlessIndex(sortKeysUAVIndices[i]);
+
                 visibleIndicesUAVIndices[i] = 0;
                 visibleIndicesSRVIndices[i] = 0;
                 gpuCommandUAVIndices[i] = 0;
                 counterBufferUAVIndices[i] = 0;
                 drawCountUAVIndices[i] = 0;
+                sortKeysUAVIndices[i] = 0;
             }
 
             _cpuHeap?.Dispose();

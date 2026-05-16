@@ -4,7 +4,6 @@ namespace Freefall.Base
 {
     public static class IDGenerator
     {
-        private static int _idCounter;
         private static readonly RandomNumberGenerator _rng = RandomNumberGenerator.Create();
 
         /// <summary>
@@ -12,7 +11,9 @@ namespace Freefall.Base
         /// </summary>
         public static int GetId()
         {
-            return Interlocked.Increment(ref _idCounter);
+            Span<byte> bytes = stackalloc byte[4];
+            _rng.GetBytes(bytes);
+            return BitConverter.ToInt32(bytes);
         }
 
         /// <summary>

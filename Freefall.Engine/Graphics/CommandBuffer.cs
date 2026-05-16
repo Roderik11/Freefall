@@ -251,7 +251,7 @@ namespace Freefall.Graphics
             /// <summary>
             /// Upload simple frustum planes (no Hi-Z) for non-opaque passes.
             /// </summary>
-            private static ulong UploadSimpleFrustumPlanes(GraphicsDevice device, Vector4[] frustumPlanes)
+            private static ulong UploadSimpleFrustumPlanes(GraphicsDevice device, Vector4[] frustumPlanes, Vector3 cameraPosition, uint sortDirection)
             {
                 EnsureFrustumBuffers(device);
                 
@@ -265,6 +265,8 @@ namespace Freefall.Graphics
                     Plane3 = frustumPlanes[3],
                     Plane4 = frustumPlanes[4],
                     Plane5 = frustumPlanes[5],
+                    CameraPosition = cameraPosition,
+                    SortDirection = sortDirection,
                 };
                 
                 unsafe
@@ -408,7 +410,9 @@ namespace Freefall.Graphics
                         : Camera.Main.ViewProjection;
                     var frustum = new Frustum(vpMatrix);
                     var frustumPlanes = frustum.GetPlanesAsVector4();
-                    frustumBufferGPUAddress = UploadSimpleFrustumPlanes(device, frustumPlanes);
+                    // Sort direction: 0 = front-to-back (opaque), 1 = back-to-front (transparent/forward)
+                    uint sortDir = (pass == RenderPass.Forward) ? 1u : 0u;
+                    frustumBufferGPUAddress = UploadSimpleFrustumPlanes(device, frustumPlanes, Camera.Main.Position, sortDir);
                 }
 
                 foreach (var batch in activeBatches)
@@ -446,6 +450,19 @@ namespace Freefall.Graphics
                     batch.Material.Apply(commandList, device);
                     // Push constant slot 16: debug mode (not touched by command signature slots 2-15)
                     commandList.SetGraphicsRoot32BitConstant(0, (uint)Engine.Settings.DebugVisualizationMode, 16);
+                    
+                    // Forward pass: set slots 0-1 for transparent shaders (shadow map + composite snapshot)
+                    // These are 'reserved' in opaque/sky shaders and harmless to overwrite.
+                    // Custom actions (ocean) run before batches and set their own root state.
+                    if (pass == RenderPass.Forward)
+                    {
+                        var renderer = DeferredRenderer.Current;
+                        if (renderer != null)
+                        {
+                            commandList.SetGraphicsRoot32BitConstant(0, renderer.ShadowTextureArray?.BindlessIndex ?? 0u, 0);
+                            commandList.SetGraphicsRoot32BitConstant(0, renderer.CompositeSnapshot?.BindlessIndex ?? 0u, 1);
+                        }
+                    }
                     applySw.Stop();
                     
                     drawSw.Start();

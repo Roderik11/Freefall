@@ -40,6 +40,9 @@ namespace Freefall.Assets
             public const string FoliageEffect    = "00000000000000000000000000000013";
             public const string TrunkEffect      = "00000000000000000000000000000014";
             public const string SkyboxEffect     = "00000000000000000000000000000015";
+            public const string TransparentEffect   = "00000000000000000000000000000016";
+            public const string SkinnedEffect = "00000000000000000000000000000017";
+
 
 
             // materials
@@ -74,6 +77,9 @@ namespace Freefall.Assets
         public static Effect FoliageEffect { get; private set; }
         public static Effect TrunkEffect { get; private set; }
         public static Effect SkyboxEffect { get; private set; }
+        public static Effect TransparentEffect { get; private set; }
+        public static Effect SkinnedEffect { get; private set; }
+
 
         public static Material DefaultMaterial { get; private set; }
         public static Material TerrainMaterial { get; private set; }
@@ -145,6 +151,8 @@ namespace Freefall.Assets
             FoliageEffect = new Effect("gbuffer_foliage");
             TrunkEffect = new Effect("gbuffer_trunk");
             SkyboxEffect = new Effect("mesh_skybox");
+            TransparentEffect = new Effect("gbuffer_transparent");
+            SkinnedEffect = new Effect("gbuffer_skinned");
 
             DefaultMaterial = new Material(DefaultEffect);
             DefaultMaterial.Name = "DefaultMaterial";
@@ -187,6 +195,8 @@ namespace Freefall.Assets
             manager.RegisterAsset(Guids.FoliageEffect, FoliageEffect);
             manager.RegisterAsset(Guids.TrunkEffect, TrunkEffect);
             manager.RegisterAsset(Guids.SkyboxEffect, SkyboxEffect);
+            manager.RegisterAsset(Guids.TransparentEffect, TransparentEffect);
+            manager.RegisterAsset(Guids.SkinnedEffect, SkinnedEffect);
 
             manager.RegisterAsset(Guids.DefaultMaterial, DefaultMaterial);
             manager.RegisterAsset(Guids.DecoratorMaterial, DecoratorMaterial);

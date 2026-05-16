@@ -581,11 +581,21 @@ namespace Freefall.Graphics
         // ── Rendering State ──
         // ════════════════════════
 
+        // Line gizmo buckets (billboard quads, no depth test)
         private readonly Dictionary<uint, ColorBucket> _buckets = new();
         private readonly Dictionary<uint, DynamicMesh> _dynamicMeshes = new();
         private readonly Dictionary<uint, Material> _materialCache = new();
         private Effect _effect;
         private bool _initialized;
+
+        // Mesh gizmo buckets (solid triangles, depth test + alpha blend)
+        private readonly Dictionary<uint, ColorBucket> _meshBuckets = new();
+        private readonly Dictionary<uint, DynamicMesh> _meshDynamicMeshes = new();
+        private readonly Dictionary<uint, Material> _meshMaterialCache = new();
+        private Effect _meshEffect;
+
+        // Deferred draw list for pre-built GPU meshes (enqueued during Flush)
+        private readonly List<(Mesh mesh, int part, Material material)> _deferredMeshDraws = new();
 
         // Single DynamicMesh for all handle geometry (multiple MeshParts)
         private DynamicMesh _handleMesh;
@@ -640,6 +650,31 @@ namespace Freefall.Graphics
             DrawCircle(center, Vector3.UnitY, radius, segments);
             DrawCircle(center, Vector3.UnitX, radius, segments);
             DrawCircle(center, Vector3.UnitZ, radius, segments);
+        }
+
+        // 2 half-spheres + 2 circles at the "equator" to connect them
+        public void DrawCapsule(Vector3 center, float height, float radius, int segments = 16)
+        {
+            Vector3 top = center + Vector3.UnitY * (height * 0.5f - radius);
+            Vector3 bottom = center - Vector3.UnitY * (height * 0.5f - radius);
+            DrawHemisphere(top, Vector3.UnitY, radius, segments);
+            DrawHemisphere(bottom, -Vector3.UnitY, radius, segments);
+            DrawCircle(top, Vector3.UnitY, radius, segments);
+            DrawCircle(bottom, Vector3.UnitY, radius, segments);
+        }
+
+        public void DrawHemisphere(Vector3 center, Vector3 normal, float radius, int segments = 16)
+        {
+            normal = Vector3.Normalize(normal);
+            Vector3 tangent = GetPerpendicular(normal);
+            Vector3 bitangent = Vector3.Cross(normal, tangent);
+            for (int i = 0; i <= segments; i++)
+            {
+                float v = (float)i / segments * (MathF.PI / 2f);
+                float r = MathF.Cos(v) * radius;
+                float y = MathF.Sin(v) * radius;
+                DrawCircle(center + normal * y, normal, r, segments);
+            }
         }
 
         /// <summary>Draw a circle in the plane defined by center and normal.</summary>
@@ -698,6 +733,78 @@ namespace Freefall.Graphics
             }
         }
 
+        // ══════════════════════════════════
+        // ── Mesh Drawing (no billboards) ──
+        // ══════════════════════════════════
+
+        /// <summary>
+        /// Draw a pre-built triangle mesh directly. No billboard expansion —
+        /// positions and indices are pushed straight into the mesh bucket.
+        /// Uses depth-tested, alpha-blended shader for proper scene integration.
+        /// Much faster than DrawLine per-edge for large meshes (e.g. navmesh overlays).
+        /// Positions are in world space (Matrix is NOT applied).
+        /// For persistent meshes that don't change, prefer EnqueueMesh() instead.
+        /// </summary>
+        public void DrawMesh(Vector3[] positions, int[] indices)
+        {
+            if (positions == null || indices == null || positions.Length == 0 || indices.Length == 0)
+                return;
+
+            var bucket = GetMeshBucket();
+            uint baseIdx = (uint)bucket.Positions.Count;
+            var normal = Vector3.UnitY; // flat normal for unlit gizmo
+
+            for (int i = 0; i < positions.Length; i++)
+            {
+                bucket.Positions.Add(positions[i]);
+                bucket.Normals.Add(normal);
+                bucket.UVs.Add(Vector2.Zero);
+            }
+
+            for (int i = 0; i < indices.Length; i++)
+                bucket.Indices.Add(baseIdx + (uint)indices[i]);
+        }
+
+        /// <summary>
+        /// Enqueue a pre-built GPU Mesh for rendering with the depth-tested gizmo shader.
+        /// The mesh is rendered during Flush — zero per-frame CPU vertex work.
+        /// Build the Mesh once (e.g. on bake), create a Material with the mesh gizmo effect,
+        /// then call this each frame in DrawGizmos.
+        /// </summary>
+        public void EnqueueMesh(Mesh mesh, int meshPart, Material material)
+        {
+            if (mesh == null || material == null) return;
+            _deferredMeshDraws.Add((mesh, meshPart, material));
+        }
+
+        /// <summary>
+        /// Draw a pre-built triangle mesh as wireframe edges.
+        /// Each triangle emits 3 billboard line-quads — still faster than
+        /// calling DrawLine() N×3 times because it skips Matrix transforms.
+        /// For very large meshes (>10k tris) prefer DrawMesh() with solid fill.
+        /// Positions are in world space (Matrix is NOT applied).
+        /// </summary>
+        public void DrawWireframeMesh(Vector3[] positions, int[] indices)
+        {
+            if (positions == null || indices == null || positions.Length == 0 || indices.Length == 0)
+                return;
+
+            for (int i = 0; i < indices.Length; i += 3)
+            {
+                if (i + 2 >= indices.Length) break;
+                int i0 = indices[i];
+                int i1 = indices[i + 1];
+                int i2 = indices[i + 2];
+
+                if (i0 >= positions.Length || i1 >= positions.Length || i2 >= positions.Length)
+                    continue;
+
+                EmitLineQuad(positions[i0], positions[i1]);
+                EmitLineQuad(positions[i1], positions[i2]);
+                EmitLineQuad(positions[i2], positions[i0]);
+            }
+        }
+
         // ═══════════════════
         // ── Lifecycle ──
         // ═══════════════════
@@ -707,6 +814,11 @@ namespace Freefall.Graphics
         {
             foreach (var bucket in _buckets.Values)
                 bucket.Clear();
+
+            foreach (var bucket in _meshBuckets.Values)
+                bucket.Clear();
+
+            _deferredMeshDraws.Clear();
 
             // Fully remove handle buckets — they are recreated by DrawGizmos each frame.
             // Just clearing contents would leave stale entries whose MeshParts persist
@@ -726,38 +838,57 @@ namespace Freefall.Graphics
             TransformBuffer.Instance.SetTransform(gizmoSlot, Matrix4x4.Identity);
 
             // Zero out ALL existing proxy meshes so stale upload-heap data cannot render.
-            // Re-register with MeshRegistry so the GPU culler sees VertexCount=0
-            // for meshes that won't receive new data this frame.
-            foreach (var dynMesh in _dynamicMeshes.Values)
+            void ZeroMeshes(Dictionary<uint, DynamicMesh> meshes)
             {
-                if (dynMesh.ProxyMesh != null && dynMesh.ProxyMesh.MeshParts.Count > 0)
+                foreach (var dynMesh in meshes.Values)
                 {
-                    dynMesh.ProxyMesh.MeshParts[0].NumIndices = 0;
-                    dynMesh.ProxyMesh.RegisterMeshParts(); // Push NumIndices=0 to MeshRegistry
+                    if (dynMesh.ProxyMesh != null && dynMesh.ProxyMesh.MeshParts.Count > 0)
+                    {
+                        dynMesh.ProxyMesh.MeshParts[0].NumIndices = 0;
+                        dynMesh.ProxyMesh.RegisterMeshParts();
+                    }
                 }
             }
+            ZeroMeshes(_dynamicMeshes);
+            ZeroMeshes(_meshDynamicMeshes);
 
-            // 1. Flush static gizmo geometry (per-color, MeshPart 0)
-            foreach (var (colorKey, bucket) in _buckets)
+            // 1. Flush line gizmo geometry (no depth test, always on top)
+            FlushBuckets(_buckets, _dynamicMeshes, GetOrCreateMaterial, gizmoSlot);
+
+            // 2. Flush mesh gizmo geometry (depth test + alpha blend)
+            FlushBuckets(_meshBuckets, _meshDynamicMeshes, GetOrCreateMeshMaterial, gizmoSlot);
+
+            // 3. Flush deferred pre-built GPU meshes
+            foreach (var (mesh, part, material) in _deferredMeshDraws)
+                CommandBuffer.Enqueue(mesh, part, material, new MaterialBlock(), gizmoSlot);
+
+            // 4. Flush handle geometry (all handles merged into one mesh, each as a separate MeshPart)
+            FlushHandles(gizmoSlot);
+        }
+
+        private void FlushBuckets(
+            Dictionary<uint, ColorBucket> buckets,
+            Dictionary<uint, DynamicMesh> meshes,
+            Func<uint, Material> getMaterial,
+            int gizmoSlot)
+        {
+            foreach (var (colorKey, bucket) in buckets)
             {
                 if (bucket.Positions.Count == 0) continue;
 
-                if (!_dynamicMeshes.TryGetValue(colorKey, out var dynMesh))
+                if (!meshes.TryGetValue(colorKey, out var dynMesh))
                 {
                     dynMesh = new DynamicMesh();
-                    _dynamicMeshes[colorKey] = dynMesh;
+                    meshes[colorKey] = dynMesh;
                 }
 
                 dynMesh.EnsureCreated(Engine.Device, bucket.Positions.Count, bucket.Indices.Count);
                 dynMesh.Upload(bucket.Positions, bucket.Normals, bucket.UVs, bucket.Indices);
-                dynMesh.ProxyMesh.RegisterMeshParts(); // Push real NumIndices to MeshRegistry
+                dynMesh.ProxyMesh.RegisterMeshParts();
 
-                var material = GetOrCreateMaterial(colorKey);
+                var material = getMaterial(colorKey);
                 CommandBuffer.Enqueue(dynMesh.ProxyMesh, 0, material, new MaterialBlock(), gizmoSlot);
             }
-
-            // 2. Flush handle geometry (all handles merged into one mesh, each as a separate MeshPart)
-            FlushHandles(gizmoSlot);
         }
 
         private void FlushHandles(int gizmoSlot)
@@ -842,6 +973,16 @@ namespace Freefall.Graphics
             _initialized = true;
 
             _effect = new Effect("gbuffer_gizmo");
+            _meshEffect = new Effect("gbuffer_gizmo_mesh");
+        }
+
+        /// <summary>
+        /// The depth-tested, alpha-blended Effect for mesh gizmos.
+        /// Use this to create Materials for EnqueueMesh().
+        /// </summary>
+        public Effect MeshEffect
+        {
+            get { EnsureInitialized(); return _meshEffect; }
         }
 
         private uint PackColor(Color4 color)
@@ -876,6 +1017,30 @@ namespace Freefall.Graphics
             return mat;
         }
 
+        private Material GetOrCreateMeshMaterial(uint colorKey)
+        {
+            if (_meshMaterialCache.TryGetValue(colorKey, out var mat))
+                return mat;
+
+            byte r = (byte)((colorKey >> 24) & 0xFF);
+            byte g = (byte)((colorKey >> 16) & 0xFF);
+            byte b = (byte)((colorKey >> 8) & 0xFF);
+            byte a = (byte)(colorKey & 0xFF);
+
+            byte[] data = new byte[4 * 4 * 4];
+            for (int i = 0; i < data.Length; i += 4)
+            {
+                data[i] = r; data[i + 1] = g; data[i + 2] = b; data[i + 3] = a;
+            }
+
+            var tex = Texture.CreateFromData(Engine.Device, 4, 4, data, Format.R8G8B8A8_UNorm);
+            mat = new Material(_meshEffect);
+            mat.SetTexture("AlbedoTex", tex);
+            _meshMaterialCache[colorKey] = mat;
+
+            return mat;
+        }
+
         private ColorBucket GetBucket()
         {
             uint key = PackColor(Color);
@@ -883,6 +1048,17 @@ namespace Freefall.Graphics
             {
                 bucket = new ColorBucket();
                 _buckets[key] = bucket;
+            }
+            return bucket;
+        }
+
+        private ColorBucket GetMeshBucket()
+        {
+            uint key = PackColor(Color);
+            if (!_meshBuckets.TryGetValue(key, out var bucket))
+            {
+                bucket = new ColorBucket();
+                _meshBuckets[key] = bucket;
             }
             return bucket;
         }

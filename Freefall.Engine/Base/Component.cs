@@ -8,6 +8,7 @@ namespace Freefall.Base
     public abstract class Component : IInstanceId, IUniqueId
     {
         private bool _awake;
+        private bool _early;
 
         public int Id { get; } = IDGenerator.GetId();
 
@@ -30,7 +31,19 @@ namespace Freefall.Base
             Awake();
         }
 
+        internal void EarlyBird()
+        {
+            if (_early) return;
+            _early = true;
+            Early();
+        }
+
+        protected virtual void Early() { }
+
         protected virtual void Awake() { }
+
         public virtual void Destroy() { }
+
+        public virtual void OnMemberChanged() { }
     }
 }

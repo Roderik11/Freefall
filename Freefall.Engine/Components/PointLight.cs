@@ -7,6 +7,7 @@ using Freefall.Graphics;
 
 namespace Freefall.Components
 {
+    [Icon("icon_pointlight.png")]
     public class PointLight : Component, /* IDraw, */ ISceneGizmo
     {
         public Color3 Color = new Color3(1, 1, 1);

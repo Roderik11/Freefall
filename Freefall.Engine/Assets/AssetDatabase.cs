@@ -215,6 +215,32 @@ namespace Freefall.Assets
         }
 
         /// <summary>
+        /// Find a sibling sub-asset of a given type from the same source file.
+        /// Used by loaders to resolve related assets (e.g., Mesh → Skeleton from the same model).
+        /// </summary>
+        public static SubAssetEntry FindSiblingSubAsset(string subAssetGuid, string siblingType)
+        {
+            // Resolve to source GUID
+            string sourceGuid = subAssetGuid;
+            if (_subAssetToSource.TryGetValue(subAssetGuid, out var resolved))
+                sourceGuid = resolved;
+
+            if (!_guidToMeta.TryGetValue(sourceGuid, out var meta))
+                return null;
+
+            lock (meta)
+            {
+                foreach (var sub in meta.SubAssets)
+                {
+                    if (sub.Type == siblingType || sub.AssetType == siblingType)
+                        return sub;
+                }
+            }
+
+            return null;
+        }
+
+        /// <summary>
         /// Resolve an asset name or relative path to its cache file path.
         /// Tries: 1) exact relative path match, 2) subasset name lookup, 3) filename-only path scan.
         /// </summary>

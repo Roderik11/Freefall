@@ -10,27 +10,16 @@ using Freefall.Assets;
 
 namespace Freefall.Components
 {
-    public enum ShapeType
-    {
-        Box,
-        Sphere,
-        Capsule,
-        Mesh,
-        Terrain
-    }
-
+    [Icon("icon_rigidbody.png")]
     public class RigidBody : Component
     {
-
-        private bool _isStatic;
+        private bool _isStatic = true;
         private RigidStatic? _staticActor;
         private RigidDynamic? _dynamicActor;
-        private Shape? _shape;
         private Action<Message>? _onTerrainLoaded;
+
         public Actor? Actor => (Actor?)_staticActor ?? _dynamicActor;
 
-        public Graphics.Mesh? Mesh { get; set; }
-        public ShapeType Type { get; set; } = ShapeType.Box;
         public float Mass { get; set; } = 10f;
 
         public bool IsStatic
@@ -43,7 +32,7 @@ namespace Freefall.Components
 
                 // Recreate actor if already alive
                 if (_staticActor != null || _dynamicActor != null)
-                    CreateBody();
+                    CreateActor();
             }
         }
 
@@ -54,163 +43,46 @@ namespace Freefall.Components
 
             try
             {
-                // Auto-resolve Mesh from sibling MeshRenderer if not set
-                if (Mesh == null && Type == ShapeType.Mesh)
-                {
-                    var mr = Entity?.GetComponent<MeshRenderer>();
-                    if (mr?.Mesh != null)
-                        Mesh = mr.Mesh;
-                }
+                CreateActor();
 
-                CreateBody();
-
-                // If terrain body wasn't created (data not loaded yet), retry when terrain is ready
-                if (Actor == null && Type == ShapeType.Terrain)
-                {
-                    MessageDispatcher.AddListener("TerrainLoaded", _onTerrainLoaded = _ =>
-                    {
-                        CreateBody();
-                        MessageDispatcher.RemoveListener("TerrainLoaded", _onTerrainLoaded);
-                        _onTerrainLoaded = null;
-                    });
-                }
-
-                Transform.OnChanged += () =>
-                {
-                    if (IsStatic && _staticActor != null)
-                    {
-                        Transform.Matrix.Deconstruct(out var scale, out var rotation, out var translation);
-
-                        var matrix = Matrix4x4.CreateFromQuaternion(rotation)
-                                   * Matrix4x4.CreateTranslation(translation);
-
-                        _staticActor.GlobalPose = matrix;
-                        _staticActor.GlobalPosePosition = translation;
-                        _staticActor.GlobalPoseQuat = rotation;
-                    }
-                };
-            }
+                //// If terrain body wasn't created (data not loaded yet), retry when terrain is ready
+                //if (Actor == null && Type == ShapeType.Terrain)
+                //{
+                //    MessageDispatcher.AddListener("TerrainLoaded", _onTerrainLoaded = _ =>
+                //    {
+                //        CreateBody();
+                //        MessageDispatcher.RemoveListener("TerrainLoaded", _onTerrainLoaded);
+                //        _onTerrainLoaded = null;
+                //    });
+                //}
+                Transform.OnChanged += OnTransformChanged;
+            }   
             catch (Exception ex)
             {
                 Debug.Log($"[RigidBody] {Entity?.Name}: {ex.Message}");
             }
         }
 
-        static Dictionary<string, TriangleMesh> cookedMeshes = [];
-
-        private PhysX.Geometry? CreateGeometry()
+        private void OnTransformChanged()
         {
-            BoundingBox bb = new BoundingBox();
-
-            if (Mesh != null)
-                bb = Mesh.BoundingBox;
-
-            Vector3 scale = Transform?.Scale ?? Vector3.One;
-            Vector3 extents = bb.Size * scale;
-
-            switch (Type)
+            if (IsStatic && Actor != null)
             {
-                case ShapeType.Box:
-                    return new BoxGeometry(extents * 2f);
+                Transform.Matrix.Deconstruct(out var scale, out var rotation, out var translation);
 
-                case ShapeType.Sphere:
-                    float radius = Math.Max(Math.Max(extents.X, extents.Y), extents.Z) - 0.05f;
-                    return new SphereGeometry(Math.Max(radius, 0.01f));
+                var matrix = Matrix4x4.CreateFromQuaternion(rotation)
+                           * Matrix4x4.CreateTranslation(translation);
 
-                case ShapeType.Capsule:
-                    return new CapsuleGeometry(extents.Y, extents.X);
-
-                case ShapeType.Mesh:
-                {
-                    // need to cook meshes on import
-                    if (Mesh?.CookedTriMesh == null)
-                    {
-                            if (!cookedMeshes.TryGetValue(Mesh.Guid, out var triMesh))
-                            {
-                                Mesh?.CookPhysicsMesh();
-                                if (Mesh?.CookedTriMesh != null)
-                                {
-                                    cookedMeshes[Mesh.Guid] = Mesh.CookedTriMesh;
-                                    triMesh = Mesh.CookedTriMesh;
-                                }
-                            }
-                            
-                            Mesh?.CookedTriMesh = triMesh;
-                        }
-
-                    if (Mesh?.CookedTriMesh == null)
-                    {
-                        Debug.Log("[RigidBody] Mesh cooking failed — no geometry available");
-                        return null;
-                    }
-
-                    return new TriangleMeshGeometry(Mesh.CookedTriMesh)
-                    {
-                        Scale = new MeshScale(scale, Quaternion.Identity)
-                    };
-                }
-
-                case ShapeType.Terrain:
-                {
-                    var terrainRenderer = Entity?.GetComponent<TerrainRenderer>();
-                    var terrain = terrainRenderer?.Terrain;
-                    if (terrain == null)
-                    {
-                        Debug.Log("[RigidBody] No Terrain found");
-                        return null;
-                    }
-
-                    float fx = terrain.TerrainSize.X / ((terrain.HeightField?.GetLength(0) ?? 2) - 1);
-                    float fy = terrain.TerrainSize.Y / ((terrain.HeightField?.GetLength(1) ?? 2) - 1);
-
-                    // Fast path: use pre-cooked HeightField from import
-                    if (terrain.CookedHeightField != null)
-                    {
-                        Debug.Log($"[RigidBody] Using CookedHeightField: MaxHeight={terrain.MaxHeight}, scale={terrain.MaxHeight / short.MaxValue}, fx={fx}, fy={fy}");
-                        return new HeightFieldGeometry(terrain.CookedHeightField, 0,
-                            terrain.MaxHeight / short.MaxValue, fx, fy);
-                    }
-
-                    // Slow fallback: cook on demand
-                    if (terrain.HeightField == null)
-                    {
-                        Debug.Log("[RigidBody] No Terrain HeightField found");
-                        return null;
-                    }
-
-                    var heightMap = terrain.HeightField;
-                    int rows = heightMap.GetLength(0);
-                    int cols = heightMap.GetLength(1);
-
-                    Debug.Log($"[RigidBody] Cooking HeightField on demand: {rows}x{cols}, MaxHeight={terrain.MaxHeight}, fx={fx}, fy={fy}");
-
-                    var samples = heightMap.ToSamples();
-
-                    var heightFieldDesc = new HeightFieldDesc()
-                    {
-                        NumberOfRows = rows,
-                        NumberOfColumns = cols,
-                        Samples = samples,
-                    };
-
-                    var cooking = PhysicsWorld.Physics.CreateCooking();
-                    var stream = new MemoryStream();
-                    bool cookResult = cooking.CookHeightField(heightFieldDesc, stream);
-
-                    stream.Position = 0;
-                    HeightField heightField = PhysicsWorld.Physics.CreateHeightField(stream);
-
-                    return new HeightFieldGeometry(heightField, 0, terrain.MaxHeight / short.MaxValue, fx, fy);
-                }
+                _staticActor?.GlobalPose = matrix;
+                _staticActor?.GlobalPosePosition = translation;
+                _staticActor?.GlobalPoseQuat = rotation;
             }
-
-            return null;
         }
 
-        public void CreateBody()
+        public void CreateActor()
         {
-            var geometry = CreateGeometry();
-            if (geometry == null) return;
+            var colliders = Entity.GetComponentsInChildren<Collider>();
+            if(colliders.Count == 0)
+                return;
 
             // Remove old actor
             if (Actor != null)
@@ -228,6 +100,8 @@ namespace Freefall.Components
             var matrix = Matrix4x4.CreateFromQuaternion(rotation)
                        * Matrix4x4.CreateTranslation(translation);
 
+            RigidActor actor = null;
+
             if (IsStatic)
             {
                 _staticActor = PhysicsWorld.Physics.CreateRigidStatic();
@@ -237,8 +111,7 @@ namespace Freefall.Components
                 _staticActor.GlobalPoseQuat = rotation;
                 _staticActor.Flags &= ~ActorFlag.Visualization;
                 _staticActor.Flags |= ActorFlag.DisableGravity;
-
-                _shape = RigidActorExt.CreateExclusiveShape(_staticActor, geometry, PhysicsWorld.DefaultMaterial);
+                actor = _staticActor;
             }
             else
             {
@@ -248,15 +121,19 @@ namespace Freefall.Components
                 _dynamicActor.AngularDamping = 1f;
                 _dynamicActor.LinearDamping = 0.1f;
                 _dynamicActor.SetMassAndUpdateInertia(Mass);
-
-                _shape = RigidActorExt.CreateExclusiveShape(_dynamicActor, geometry, PhysicsWorld.DefaultMaterial);
+                actor = _dynamicActor;
             }
+
+            foreach (var collider in colliders)
+                collider.CreateShape(Entity, actor);
 
             PhysicsWorld.Scene.AddActor(Actor!);
         }
 
         public override void Destroy()
         {
+            Transform.OnChanged -= OnTransformChanged;
+
             if (Actor != null)
             {
                 PhysicsWorld.Scene.RemoveActor(Actor);

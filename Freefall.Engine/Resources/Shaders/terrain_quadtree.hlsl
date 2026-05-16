@@ -120,18 +120,23 @@ bool IsTerrainOccluded(float3 worldCenter, float worldRadius)
     hiZ.GetDimensions(0, w, h, levels);
     float2 mip0Size = float2(w, h);
 
-    // Project sphere radius to screen pixels for mip selection
-    float projScale = OcclusionProjection._m11;
-    projScale = abs(projScale) < 0.001 ? 1.0 : projScale;
-    float projRadius = (worldRadius * projScale) / clipCenter.w;
-    float screenRadius = projRadius * mip0Size.y * 0.5;
+    // Project sphere radius to screen pixels for mip selection.
+    // For standard perspective, _m00 * mip0Size.x == _m11 * mip0Size.y,
+    // so vertical-only calculation is sufficient.
+    float projScale = abs(OcclusionProjection._m11);
+    projScale = projScale < 0.001 ? 1.0 : projScale;
+    float screenRadius = (worldRadius * projScale / clipCenter.w) * mip0Size.y * 0.5;
 
-    // Pick mip where sphere covers ~2 texels (conservative)
-    float mipLevel = ceil(log2(max(screenRadius * 2.0, 1.0)));
+    // Pick mip where the sphere covers ~1 texel, then add +1 to widen
+    // the 4-tap footprint beyond the sphere. Prevents false occlusion
+    // when a nearby occluder fills the sphere's footprint.
+    float mipLevel = ceil(log2(max(screenRadius * 2, 1.0)));
     mipLevel = min(mipLevel, levels - 1.0f);
 
     uint mip = (uint)mipLevel;
-    float2 mipSize = max(float2(1,1), mip0Size / (float)(1u << mip));
+    float mipW, mipH, unused;
+    hiZ.GetDimensions(mip, mipW, mipH, unused);
+    float2 mipSize = float2(mipW, mipH);
 
     // 4-tap sampling for stability
     float2 texCoordFloat = uv * mipSize - 0.5;

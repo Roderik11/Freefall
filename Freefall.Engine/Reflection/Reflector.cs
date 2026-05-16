@@ -16,6 +16,15 @@ namespace Freefall.Reflection
         // Assembly registry for cross-assembly type resolution
         private static readonly ConcurrentDictionary<string, Assembly> _assemblies = new();
 
+        /// <summary>Diagnostic: names of all registered assemblies.</summary>
+        public static string[] GetRegisteredAssemblyNames()
+        {
+            var names = new List<string>();
+            foreach (var a in _assemblies.Values)
+                names.Add(a.GetName().Name ?? "?");
+            return names.ToArray();
+        }
+
         // Type → ordered field mapping (base-class fields first)
         private static readonly ConcurrentDictionary<Type, Mapping> _mappingCache = new();
 
@@ -47,10 +56,14 @@ namespace Freefall.Reflection
         /// </summary>
         public static void RegisterAssemblies(params Assembly[] assemblies)
         {
+            bool added = false;
+
             foreach (var assembly in assemblies)
             {
                 if (!_assemblies.TryAdd(assembly.FullName!, assembly))
                     continue;
+
+                added = true;
 
                 // Scan for renamed types
                 foreach (var type in assembly.GetTypes())
@@ -60,6 +73,43 @@ namespace Freefall.Reflection
                         _formerNames.TryAdd(att.Name, type);
                 }
             }
+
+            // New assembly means cached subtype queries are stale
+            if (added)
+                _typesByBase.Clear();
+        }
+
+        /// <summary>
+        /// Unregister an assembly and invalidate all caches that may reference its types.
+        /// Used by ScriptCompiler before hot-reloading a new script assembly.
+        /// </summary>
+        public static void UnregisterAssembly(Assembly assembly)
+        {
+            _assemblies.TryRemove(assembly.FullName!, out _);
+
+            // Remove types from this assembly from all caches
+            var assemblyTypes = new HashSet<Type>(assembly.GetTypes());
+
+            // Clear type name → Type cache entries pointing to this assembly
+            foreach (var kvp in _typeCache)
+            {
+                if (assemblyTypes.Contains(kvp.Value))
+                    _typeCache.TryRemove(kvp.Key, out _);
+            }
+
+            // Clear FormerlySerializedAs entries
+            foreach (var kvp in _formerNames)
+            {
+                if (assemblyTypes.Contains(kvp.Value))
+                    _formerNames.TryRemove(kvp.Key, out _);
+            }
+
+            // Clear mapping cache for types from this assembly
+            foreach (var type in assemblyTypes)
+                _mappingCache.TryRemove(type, out _);
+
+            // Invalidate subtype cache entirely — could contain stale derived types
+            _typesByBase.Clear();
         }
 
         public static Mapping<T> GetMapping<T>(Type type) where T : Attribute
@@ -205,7 +255,16 @@ namespace Freefall.Reflection
 
             foreach (var assembly in _assemblies.Values)
             {
-                foreach (var type in assembly.GetTypes())
+                Type[] types;
+                try { types = assembly.GetTypes(); }
+                catch (System.Reflection.ReflectionTypeLoadException ex)
+                {
+                    // Some types couldn't load (e.g. missing deps in script ALC).
+                    // Use whatever did load.
+                    types = ex.Types.Where(t => t != null).ToArray()!;
+                }
+
+                foreach (var type in types)
                 {
                     if (baseType.IsInterface && baseType.IsAssignableFrom(type))
                         result.Add(type);

@@ -67,16 +67,21 @@ bool IsCellOccluded(float3 worldCenter, float worldRadius)
     Texture2D<float> hiZ = ResourceDescriptorHeap[HiZSrvIdx];
     float2 mip0Size = HiZSize;
 
-    float projScale = OcclusionProjection._m11;
-    projScale = abs(projScale) < 0.001 ? 1.0 : projScale;
-    float projRadius = (worldRadius * projScale) / clipCenter.w;
-    float screenRadius = projRadius * mip0Size.y * 0.5;
+    // Project sphere radius to screen pixels for mip selection.
+    // For standard perspective, _m00 * mip0Size.x == _m11 * mip0Size.y,
+    // so vertical-only calculation is sufficient.
+    float projScale = abs(OcclusionProjection._m11);
+    projScale = projScale < 0.001 ? 1.0 : projScale;
+    float screenRadius = (worldRadius * projScale / clipCenter.w) * mip0Size.y * 0.5;
 
-    float mipLevel = ceil(log2(max(screenRadius * 2.0, 1.0)));
+    // Conservative +1 mip bias to widen the 4-tap footprint
+    float mipLevel = ceil(log2(max(screenRadius*2, 1.0)));
     mipLevel = min(mipLevel, float(HiZMipCount) - 1.0f);
 
     uint mip = (uint)mipLevel;
-    float2 mipSize = max(float2(1,1), mip0Size / (float)(1u << mip));
+    float mipW, mipH, unused;
+    hiZ.GetDimensions(mip, mipW, mipH, unused);
+    float2 mipSize = float2(mipW, mipH);
 
     float2 texCoordFloat = uv * mipSize - 0.5;
     int2 baseCoord = int2(texCoordFloat);
@@ -313,7 +318,7 @@ void CS_SpawnInstances(uint3 gid : SV_GroupID, uint3 gtid3 : SV_GroupThreadID)
                 (tileWorldZ - TerrainOrigin.y) / TerrainSize.y
             );
             float h = heightTex2.SampleLevel(HeightSampler, cellUV, 2).r * MaxHeight;
-            float3 sphereCenter = float3(tileWorldX, h, tileWorldZ);
+            float3 sphereCenter = float3(tileWorldX, TerrainOrigin.z + h, tileWorldZ);
             float sphereRadius = ts * 0.707 + MaxHeight * 0.05;
             if (IsCellOccluded(sphereCenter, sphereRadius))
                 tileValid = false;

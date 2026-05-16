@@ -47,6 +47,11 @@ namespace Freefall
         /// </summary>
         public static bool IsEditor { get; private set; }
 
+        public static void SetPlaymode(bool playmode)
+        {
+            IsEditor = !playmode;
+        }
+
         // Main-thread work queue for marshaling from background threads
         private sealed class WorkItem
         {
@@ -186,6 +191,7 @@ namespace Freefall
             // Physics (fixed-timestep)
             var _physicsSw = System.Diagnostics.Stopwatch.StartNew();
             PhysicsWorld.Update((float)Time.Delta);
+            NavMeshWorld.Update((float)Time.Delta);
             _physicsSw.Stop();
             
             // Update Logic
@@ -354,6 +360,8 @@ namespace Freefall
         /// </summary>
         private static void LoadPixGpuCapturer()
         {
+            return;
+
 #if DEBUG
             // Find latest PIX install
             var pixDir = Path.Combine(
@@ -385,6 +393,7 @@ namespace Freefall
             _isRunning = false;
             
             PhysicsWorld.Shutdown();
+            NavMeshWorld.Shutdown();
             
             // Restore timer resolution
             Kernel32.timeEndPeriod(1);
@@ -425,6 +434,7 @@ namespace Freefall
          [ValueRange(50f, 1000f)]
          public float MaxShadowDistance { get; set; } = 300f;                 // SDSM max depth for split analysis
          public bool DisableHiZ { get; set; } = false;                      // F6 - Disable Hi-Z occlusion
+         public bool DisableDepthSort { get; set; } = true;                  // GPU doesn't order instances within a draw call — sort has no visual effect
 
          public DebugVizMode DebugVisualizationMode { get; set; } = DebugVizMode.Off; // F5 - Debug viz
 
@@ -459,10 +469,10 @@ namespace Freefall
 
          public bool UseSSDMPyramid { get; set; } = true;
 
-         public bool UseSSDMLobel { get; set; } = true;
+         public bool UseSSDMLobel { get; set; } = false;
 
 
-        [ValueRange(0f, 500f)]
+         [ValueRange(0f, 30f)]
          public float SSDMHeightScale { get; set; } = 1f;
 
          [ValueRange(1f, 128f)]

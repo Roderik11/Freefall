@@ -32,6 +32,7 @@ namespace Freefall.Base
 
         public static PhysX.Physics Physics { get; private set; }
         public static Scene Scene { get; private set; }
+        public static ControllerManager ControllerManager { get; private set; }
         public static PhysX.Material DefaultMaterial { get; private set; }
 
         public static void Initialize()
@@ -61,6 +62,7 @@ namespace Freefall.Base
             };
 
             Scene = Physics.CreateScene(sceneDesc);
+            ControllerManager = Scene.CreateControllerManager();
 
             // Default physics material: staticFriction, dynamicFriction, restitution
             DefaultMaterial = Physics.CreateMaterial(0.7f, 0.7f, 0.1f);
@@ -87,6 +89,11 @@ namespace Freefall.Base
                     entity.Transform.Rotation = dynamic.GlobalPoseQuat;
                 }
             }
+        }
+
+        public static void Flush()
+        {
+            Scene.FlushSimulation(false);
         }
 
         /// <summary>
