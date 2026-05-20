@@ -5,6 +5,8 @@ using Freefall.Graphics;
 using Freefall.Base;
 using Freefall.Assets;
 using Vortice.Mathematics;
+using Vortice.Direct3D12;
+using Vortice.DXGI;
 
 namespace Freefall.Components
 {
@@ -53,6 +55,43 @@ namespace Freefall.Components
         [ValueRange(0f, 10f)]
         public float StarBrightness = 1.0f;     // Star intensity multiplier
 
+        // ── Atmosphere scattering parameters ──
+        public Color3 SkyTintColor = new Color3(0.5f, 0.7f, 1.0f);       // Overall sky color multiplier
+        public Color3 HazeColor = new Color3(0.8f, 0.85f, 0.9f);         // Colored haze at horizon
+
+        [ValueRange(0f, 2f)]
+        public float HazeIntensity = 0.3f;              // Horizon haze strength
+
+        [ValueRange(0f, 1f)]
+        public float HazeHeight = 0.15f;                // How high haze reaches (viewDir.y)
+
+        public Color3 SunsetTintColor = new Color3(1.0f, 0.5f, 0.2f);   // Warm color near horizon at sunset
+
+        [ValueRange(0f, 2f)]
+        public float SunsetTintIntensity = 0.8f;        // Sunset color strength
+
+        [ValueRange(0.5f, 3f)]
+        public float AtmosphereDensity = 1.0f;          // Global atmosphere thickness
+
+        [ValueRange(0f, 1f)]
+        public float MieScattering = 0.02f;             // Mie haze/glow strength (sun halo)
+
+        [ValueRange(0f, 0.99f)]
+        public float MieAnisotropy = 0.76f;             // HG anisotropy — higher = tighter sun glow
+
+        public Color3 NightSkyColor = new Color3(0.01f, 0.01f, 0.04f);   // Zenith color at night
+        public Color3 NightHorizonColor = new Color3(0.03f, 0.04f, 0.08f); // Horizon glow at night
+
+        // ── Cloud lighting parameters ──
+        [ValueRange(0f, 3f)]
+        public float CloudBrightness = 1.0f;        // Overall cloud brightness
+
+        public Color3 CloudShadowColor = new Color3(0.35f, 0.4f, 0.55f);   // Cloud shade side
+        public Color3 CloudSunlitColor = new Color3(1.0f, 0.98f, 0.95f);   // Sun-facing cloud tops
+
+        [ValueRange(500f, 5000f)]
+        public float CloudAltitude = 1800.0f;       // Cloud layer height in world units
+
         [ValueRange(0f, 360f)]
         public float SunAzimuthAngle = 30.0f;    // Compass heading for sunrise in degrees (0=+X, 90=+Z, 180=-X, 270=-Z)
 
@@ -65,7 +104,24 @@ namespace Freefall.Components
         public static float AmbientScale { get; private set; } = 1.0f;
         public static Vector3 CurrentSunDirection { get; private set; } = new Vector3(0, 1, 0);
 
+        // Static atmosphere accessors for Camera.SetShaderParams()
+        public static Vector3 CurrentSkyTintColor { get; private set; } = new Vector3(0.5f, 0.7f, 1.0f);
+        public static Vector3 CurrentHazeColor { get; private set; } = new Vector3(0.8f, 0.85f, 0.9f);
+        public static float CurrentHazeIntensity { get; private set; } = 0.3f;
+        public static float CurrentHazeHeight { get; private set; } = 0.15f;
+        public static Vector3 CurrentSunsetTintColor { get; private set; } = new Vector3(1.0f, 0.5f, 0.2f);
+        public static float CurrentSunsetTintIntensity { get; private set; } = 0.8f;
+        public static float CurrentAtmosphereDensity { get; private set; } = 1.0f;
+        public static float CurrentMieScattering { get; private set; } = 0.02f;
+        public static float CurrentMieAnisotropy { get; private set; } = 0.76f;
+        public static Vector3 CurrentNightSkyColor { get; private set; } = new Vector3(0.01f, 0.01f, 0.04f);
+        public static Vector3 CurrentNightHorizonColor { get; private set; } = new Vector3(0.03f, 0.04f, 0.08f);
+
         private float CloudTime = 0.0f;
+
+        // Cloud noise LUT — generated once at startup via compute shader
+        private static RenderTexture3D? _cloudNoiseLUT;
+        private static bool _noiseGenerated;
 
 
         public SkyboxRenderer()
@@ -76,11 +132,45 @@ namespace Freefall.Components
         {
             Mesh = Mesh.CreateCube(Engine.Device, 100.0f);
             SunLight ??= EntityManager.FindComponent<DirectionalLight>();
+            GenerateCloudNoiseLUT();
         }
 
         public override void Destroy()
         {
             Mesh?.Dispose();
+        }
+
+        private void GenerateCloudNoiseLUT()
+        {
+            if (_noiseGenerated) return;
+            _noiseGenerated = true;
+
+            const int size = 128;
+            var device = Engine.Device;
+
+            _cloudNoiseLUT = new RenderTexture3D(device, size, size, size, Format.R8G8B8A8_UNorm);
+
+            var shader = new ComputeShader("cloud_noise_gen.hlsl", "CSGenNoise");
+            int kernel = shader.FindKernel("CSGenNoise");
+
+            shader.SetPushConstant(kernel, "OutputUAV", _cloudNoiseLUT.UavIndex);
+            shader.SetPushConstant(kernel, "VolumeSize", (uint)size);
+
+            // Dispatch: 128/4 = 32 groups per axis
+            var allocator = device.NativeDevice.CreateCommandAllocator(CommandListType.Direct);
+            var cmd = device.NativeDevice.CreateCommandList<ID3D12GraphicsCommandList>(0, CommandListType.Direct, allocator);
+            cmd.SetComputeRootSignature(device.GlobalRootSignature);
+            cmd.SetDescriptorHeaps(1, new[] { device.SrvHeap });
+
+            shader.Dispatch(kernel, cmd, (uint)(size / 4), (uint)(size / 4), (uint)(size / 4));
+
+            cmd.Close();
+            device.SubmitAndWait(cmd);
+            cmd.Dispose();
+            allocator.Dispose();
+            shader.Dispose();
+
+            Debug.Log("SkyboxRenderer", $"Cloud noise LUT generated: {size}x{size}x{size} RGBA8");
         }
 
         public void Update()
@@ -163,6 +253,19 @@ namespace Freefall.Components
             // Ambient tracks blended sky brightness
             AmbientScale = dayFactor * 1.0f + sunsetFactor * 0.4f + nightFactor * 0.05f;
             CurrentSunDirection = SunDirection;
+
+            // Sync atmosphere params to static accessors
+            CurrentSkyTintColor = new Vector3(SkyTintColor.R, SkyTintColor.G, SkyTintColor.B);
+            CurrentHazeColor = new Vector3(HazeColor.R, HazeColor.G, HazeColor.B);
+            CurrentHazeIntensity = HazeIntensity;
+            CurrentHazeHeight = HazeHeight;
+            CurrentSunsetTintColor = new Vector3(SunsetTintColor.R, SunsetTintColor.G, SunsetTintColor.B);
+            CurrentSunsetTintIntensity = SunsetTintIntensity;
+            CurrentAtmosphereDensity = AtmosphereDensity;
+            CurrentMieScattering = MieScattering;
+            CurrentMieAnisotropy = MieAnisotropy;
+            CurrentNightSkyColor = new Vector3(NightSkyColor.R, NightSkyColor.G, NightSkyColor.B);
+            CurrentNightHorizonColor = new Vector3(NightHorizonColor.R, NightHorizonColor.G, NightHorizonColor.B);
             
             // Blended light color (day/sunset/night palettes matching shader)
             SunLight.Color = new Color3(
@@ -187,6 +290,11 @@ namespace Freefall.Components
             Material.SetParameter("SunIntensity", SunIntensity);
             Material.SetParameter("StarDensity", StarDensity);
             Material.SetParameter("StarBrightness", StarBrightness);
+            Material.SetParameter("CloudBrightness", CloudBrightness);
+            Material.SetParameter("CloudShadowColor", new Vector3(CloudShadowColor.R, CloudShadowColor.G, CloudShadowColor.B));
+            Material.SetParameter("CloudAltitude", CloudAltitude);
+            Material.SetParameter("CloudSunlitColor", new Vector3(CloudSunlitColor.R, CloudSunlitColor.G, CloudSunlitColor.B));
+            Material.SetParameter("CloudNoiseLUTIdx", _cloudNoiseLUT?.BindlessIndex ?? 0u);
 
             CommandBuffer.Enqueue(Mesh, Material, Params, slot);
         }

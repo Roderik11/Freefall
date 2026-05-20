@@ -15,6 +15,21 @@ cbuffer SceneConstants : register(b0)
     float3 FogSunDirection;            // sun direction for sky-based fog color
     float _fogPad1;
     float3 CamPos;                     // camera world position
+    float _camPad;
+
+    // ── Atmosphere scattering parameters (set by SkyboxRenderer) ──
+    float3 SkyTintColor;               // overall sky color multiplier
+    float AtmosphereDensity;           // global atmosphere thickness
+    float3 HazeColor;                  // colored haze at horizon
+    float HazeIntensity;               // horizon haze strength (0–2)
+    float3 SunsetTintColor;            // warm color near horizon at sunset
+    float SunsetTintIntensity;         // sunset color strength (0–2)
+    float3 NightSkyColor;              // zenith color at night
+    float HazeHeight;                  // how high haze reaches in viewDir.y (0–1)
+    float3 NightHorizonColor;          // horizon glow at night
+    float MieScattering;               // Mie (haze/glow) strength (0–1)
+    float MieAnisotropy;               // Henyey-Greenstein g (0–0.99)
+    float3 _atmoPad;                   // explicit padding to 16-byte row
 }
 
 // Material data for bindless texture lookup via Material ID indirection

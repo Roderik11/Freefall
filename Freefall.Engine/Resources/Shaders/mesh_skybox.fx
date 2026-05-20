@@ -34,9 +34,15 @@ cbuffer ObjectConstants : register(b1)
     float SunIntensity;
     float StarDensity;
     float StarBrightness;
+    float CloudBrightness;       // overall cloud brightness (0-3)
+    float _cloudPad0;
+    float3 CloudShadowColor;     // color of cloud shade side
+    float CloudAltitude;         // cloud layer height in world units
+    float3 CloudSunlitColor;     // color of sun-facing cloud tops
+    uint CloudNoiseLUTIdx;       // bindless index for 3D noise texture
 }
 
-
+SamplerState linearWrap : register(s0); // Linear filter, wrap addressing (3D noise LUT)
 
 struct VertexOutput
 {
@@ -55,12 +61,7 @@ struct FragmentOutput
 };
 
 // ────────────────────────────────────────────────
-// Noise functions
-float hash(float n)
-{
-    return frac(sin(n) * 43758.5453123);
-}
-
+// Noise utility (used by GetStars)
 float hash13(float3 p3)
 {
     p3 = frac(p3 * 0.1031);
@@ -68,113 +69,64 @@ float hash13(float3 p3)
     return frac((p3.x + p3.y) * p3.z);
 }
 
-float noise(float3 x)
-{
-    float3 p = floor(x);
-    float3 f = frac(x);
-    f = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
-
-    float n = p.x + p.y * 57.0 + 113.0 * p.z;
-    return lerp(
-        lerp(lerp(hash(n + 0.0), hash(n + 1.0), f.x),
-             lerp(hash(n + 57.0), hash(n + 58.0), f.x), f.y),
-        lerp(lerp(hash(n + 113.0), hash(n + 114.0), f.x),
-             lerp(hash(n + 170.0), hash(n + 171.0), f.x), f.y), f.z);
-}
-
-float fbm(float3 p, int octaves)
-{
-    float value = 0.0;
-    float amplitude = 0.5;
-    float frequency = 1.0;
-
-    for (int i = 0; i < octaves; i++)
-    {
-        value += amplitude * noise(p * frequency);
-        frequency *= 2.0;
-        amplitude *= 0.5;
-    }
-    return value;
-}
-
-float worley(float3 p)
-{
-    float3 id = floor(p);
-    float3 fd = frac(p);
-
-    float minDist = 1.0;
-
-    for (int z = -1; z <= 1; z++)
-        for (int y = -1; y <= 1; y++)
-            for (int x = -1; x <= 1; x++)
-            {
-                float3 offset = float3(x, y, z);
-                float3 cellId = id + offset;
-                float3 cellPoint = float3(
-                    hash13(cellId),
-                    hash13(cellId + 100.0),
-                    hash13(cellId + 200.0)
-                );
-
-                float3 diff = offset + cellPoint - fd;
-                float dist = length(diff);
-                minDist = min(minDist, dist);
-            }
-
-    return minDist;
-}
-
-float2 CloudDomainWarp(float2 p, float t)
-{
-    float wx = fbm(float3(p * 0.25, t * 0.02), 3) - 0.5;
-    float wz = fbm(float3(p * 0.25 + 19.1, t * 0.02 + 7.3), 3) - 0.5;
-    return float2(wx, wz);
-}
-
 // ────────────────────────────────────────────────
-// Main cloud function
+// Main cloud function — LUT-based Nubis-style clouds
+//
+// LUT channels (from cloud_noise_gen.hlsl):
+//   R: Perlin FBM     (smooth connected shapes)
+//   G: Worley FBM     (low-freq billowy erosion)
+//   B: Worley FBM     (high-freq detail erosion)
+//   A: Perlin-Worley  (pre-combined cloud shape)
+//
 float GetClouds(float3 viewDir)
 {
     if (viewDir.y <= 0.001)
         return 0.0;
 
-    const float cloudHeight = 1800.0;
-    float t = cloudHeight / viewDir.y;
+    float t = CloudAltitude / viewDir.y;
     float2 cloudPos = viewDir.xz * t;
-    float2 uv = cloudPos * 0.0006;
+    float2 uv = cloudPos * 0.00035;
 
-    float2 wind = float2(CloudTime * CloudSpeed * 0.015, CloudTime * CloudSpeed * 0.008);
+    float2 wind = float2(CloudTime * CloudSpeed * 0.01, CloudTime * CloudSpeed * 0.005);
     uv += wind;
 
-    float2 warp = CloudDomainWarp(uv, CloudTime) * 0.35;
-    float2 p = uv + warp;
+    Texture3D<float4> noiseLUT = ResourceDescriptorHeap[CloudNoiseLUTIdx];
+    float timeZ = CloudTime * 0.005;
 
-    float coverageEvolve = (fbm(float3(p * 0.12, CloudTime * 0.005) + 200.0, 3) - 0.5) * 0.25;
-    float coverage = saturate(CloudCoverage + coverageEvolve);
+    // Mip level based on viewing angle — blur out detail near the horizon
+    // to hide tiling and create natural atmospheric softening
+    float mip = saturate(1.0 - viewDir.y * 5.0) * 3.0;  // 0 at zenith, up to 3 at horizon
 
-    float c = fbm(float3(p * 2.0, CloudTime * 0.02), 8);
-    c = smoothstep(1.0 - coverage, 1.0, c);
+    // ── Base shape: multi-scale Perlin-Worley (A channel) ──
+    float baseShape = 0;
+    baseShape += noiseLUT.SampleLevel(linearWrap, float3(uv * 0.25,        timeZ        ), mip    ).a * 0.625;
+    baseShape += noiseLUT.SampleLevel(linearWrap, float3(uv * 0.5 + 0.37,  timeZ * 0.7  ), mip    ).a * 0.25;
+    baseShape += noiseLUT.SampleLevel(linearWrap, float3(uv * 1.0 + 0.71,  timeZ * 1.3  ), mip * 0.5).a * 0.125;
 
-    float fineDetail = fbm(float3(p * 8.0, CloudTime * 0.05), 4) * 0.5;
-    c = c * (0.6 + fineDetail * 0.4);
+    // ── Coverage threshold ──
+    float coverageNoise = noiseLUT.SampleLevel(linearWrap, float3(uv * 0.06, timeZ * 0.15), 0).r;
+    float coverage = saturate(CloudCoverage + (coverageNoise - 0.5) * 0.3);
 
-    float worleyNoise = worley(float3(p * 4.0, CloudTime * 0.03));
-    c = c * (0.7 + worleyNoise * 0.3);
+    // Remap: only the brightest noise survives as clouds
+    float cloudDensity = remap(baseShape, 1.0 - coverage, 1.0, 0.0, 1.0);
 
-    float turbulence = fbm(float3(p * 12.0, CloudTime * 0.06), 3);
-    float edgeDetail = pow(c, 0.5) * turbulence * 0.4;
-    c = saturate(c + edgeDetail);
+    // ── Detail erosion: Worley carves billowy edges ──
+    // Use higher mip near horizon to blur out repetition
+    float4 detailSample = noiseLUT.SampleLevel(linearWrap, float3(uv * 2.0 + 1.13, timeZ * 1.5), mip);
+    float detailFBM = detailSample.g * 0.625 + detailSample.b * 0.375;
 
-    float microDetail = noise(float3(p * 32.0, CloudTime * 0.12)) * 0.15;
-    c = saturate(c + microDetail * c);
+    // Key fix: erosion strength scales with (1 - density)
+    // Thick cloud cores resist erosion; only thin edges get carved
+    float erodeStrength = detailFBM * 0.2 * (1.0 - cloudDensity * 0.7);
+    float eroded = remap(cloudDensity, erodeStrength, 1.0, 0.0, 1.0);
 
-    c = smoothstep(0.08, 0.92, c);
-    float thickness = fbm(float3(p * 1.5, CloudTime * 0.015) + 100.0, 3);
-    c *= (0.7 + thickness * 0.3);
+    // Softer smoothstep for fuller cloud bodies
+    eroded = smoothstep(0.0, 0.45, eroded);
 
-    c *= smoothstep(0.0, 0.28, viewDir.y);
+    // Horizon fade
+    eroded *= smoothstep(0.0, 0.22, viewDir.y);
 
-    return c;
+    return saturate(eroded);
 }
 
 float3 GetStars(float3 viewDir, float nightFactor)
@@ -286,20 +238,48 @@ FragmentOutput PS_Procedural(VertexOutput input)
     float sun = GetSun(viewDir, sunDir) * SunIntensity;
     skyColor += float3(1.0, 0.9, 0.7) * sun;
 
-    float clouds = GetClouds(viewDir);
+    float density = GetClouds(viewDir);
 
-    // Bright white cloud base, tinted by sun/sky light
-    float sunDot = saturate(dot(viewDir, sunDir));
-    float3 cloudLit = float3(1.0, 0.98, 0.95);               // sunlit side
-    float3 cloudShaded = float3(0.7, 0.75, 0.85);             // shaded/ambient side
-    float3 cloudColor = lerp(cloudShaded, cloudLit, sunDot * 0.5 + 0.5);
+    if (density > 0.001)
+    {
+        // ── Opacity via Beer-Lambert ──
+        float absorption = 1.0 - exp(-density * 4.5);
 
-    // Sunset tint on clouds
-    float cloudSunElev = sunDir.y;
-    float sunsetAmount = saturate(1.0 - abs((cloudSunElev - (-0.025)) / 0.175));
-    cloudColor = lerp(cloudColor, float3(1.0, 0.7, 0.4), sunsetAmount * 0.5);
+        // ── Core shading: density drives the shadow-sunlit gradient ──
+        // This is the key: the cloud shape detail IS the shading detail.
+        // Thin edges transmit light (bright), thick cores self-shadow (dark).
+        float transmittance = exp(-density * 3.0);  // 1.0 at edges, ~0.05 at dense cores
 
-    skyColor = lerp(skyColor, cloudColor, clouds * 0.95);
+        // ── Directional sun shading ──
+        float sunDot = saturate(dot(viewDir, sunDir));
+        float sunGradient = sunDot * 0.5 + 0.5;  // 0.5 (shade side) to 1.0 (sun facing)
+
+        // Combine: transmittance provides detail, sunGradient provides directionality
+        float shadeFactor = lerp(transmittance * 0.7, transmittance, sunGradient);
+
+        // Map from shadow color to sunlit color
+        float3 cloudColor = lerp(CloudShadowColor, CloudSunlitColor, shadeFactor);
+
+        // ── Silver lining: bright rim where thin cloud faces sun ──
+        float edgeMask = smoothstep(0.0, 0.2, density) * smoothstep(0.5, 0.15, density);
+        float silverLining = edgeMask * pow(sunDot, 2.0) * 0.4;
+        cloudColor += float3(1.0, 1.0, 0.95) * silverLining;
+
+        // ── Powder/backlit glow ──
+        float powder = (1.0 - transmittance) * transmittance * 2.0;  // peaks at medium density
+        cloudColor += float3(1.0, 0.9, 0.7) * powder * pow(sunDot, 3.0) * 0.3;
+
+        // ── Sunset tint ──
+        float cloudSunElev = sunDir.y;
+        float sunsetAmount = saturate(1.0 - abs((cloudSunElev - (-0.025)) / 0.175));
+        cloudColor = lerp(cloudColor, float3(1.0, 0.6, 0.3), sunsetAmount * 0.5);
+
+        // ── Apply brightness ──
+        cloudColor *= CloudBrightness * 1.3;
+
+        // Blend into sky
+        skyColor = lerp(skyColor, cloudColor, absorption);
+    }
 
     output.Albedo = float4(skyColor, 1);
     output.Normal = float4(0, 1, 0, 1);

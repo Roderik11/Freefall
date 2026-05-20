@@ -42,6 +42,9 @@ namespace Freefall.Graphics
         /// <summary>Screen-space displacement mapping (wavefront cooperative march).</summary>
         public ScreenSpaceDisplacement? ScreenSpaceDisplacement { get; private set; }
 
+        /// <summary>SMAA 1x anti-aliasing (Jimenez et al. 2012).</summary>
+        public SMAA? Smaa { get; private set; }
+
         private Material matClear = null!;
         private Material matDirectionalLight = null!;
         private ComputeShader _compositionCS = null!;
@@ -131,6 +134,9 @@ namespace Freefall.Graphics
             
             // Screen-space displacement
             ScreenSpaceDisplacement = new ScreenSpaceDisplacement();
+
+            // SMAA anti-aliasing
+            Smaa = new SMAA();
         }
 
         private void CreateRenderTextures(int width, int height)
@@ -303,7 +309,16 @@ namespace Freefall.Graphics
             RenderForward(camera, list);
             forwardTime.Stop();
 
-            // 5. Blit to Backbuffer
+            // 5. SMAA Anti-Aliasing (optional)
+            if (Smaa != null && Engine.Settings.EnableSMAA)
+            {
+                PixMarker.Begin(list, "SMAA");
+                var desc = Composite.Native.Description;
+                Smaa.Execute(list, Composite.Native, Composite.BindlessIndex, (int)desc.Width, (int)desc.Height);
+                PixMarker.End(list);
+            }
+
+            // 6. Blit to Backbuffer
             var blitTime = System.Diagnostics.Stopwatch.StartNew();
             BlitToBackBuffer(camera, list);
             blitTime.Stop();
@@ -789,13 +804,17 @@ namespace Freefall.Graphics
         {
              PixMarker.Begin(list, "Blit");
              var backBuffer = camera.Target.CurrentBackBuffer;
-             
-             Transition(list, Composite.Native, ResourceStates.PixelShaderResource, ResourceStates.CopySource);
+
+             // If SMAA is active, blit from its output; otherwise from Composite
+             bool useSmaa = Smaa != null && Engine.Settings.EnableSMAA && Smaa.BlitSource != null;
+             var blitSource = useSmaa ? Smaa!.BlitSource! : Composite.Native;
+
+             Transition(list, blitSource, ResourceStates.PixelShaderResource, ResourceStates.CopySource);
              Transition(list, backBuffer, ResourceStates.RenderTarget, ResourceStates.CopyDest);
              
-             list.CopyResource(backBuffer, Composite.Native);
+             list.CopyResource(backBuffer, blitSource);
              
-             Transition(list, Composite.Native, ResourceStates.CopySource, ResourceStates.PixelShaderResource);
+             Transition(list, blitSource, ResourceStates.CopySource, ResourceStates.PixelShaderResource);
              Transition(list, backBuffer, ResourceStates.CopyDest, ResourceStates.RenderTarget);
              PixMarker.End(list); // Blit
         }
@@ -895,6 +914,7 @@ namespace Freefall.Graphics
             ShadowTextureArray?.Dispose();
             ScreenSpaceShadows?.Dispose();
             ScreenSpaceDisplacement?.Dispose();
+            Smaa?.Dispose();
             _entityIdReadback?.Dispose();
             _depthReadback?.Dispose();
             _normalReadback?.Dispose();

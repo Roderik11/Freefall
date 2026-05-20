@@ -139,6 +139,19 @@ namespace Freefall.Components
                 pair.Value.SetParameter("FogDensity", Engine.Settings.FogDensity);
                 pair.Value.SetParameter("FogSunDirection", SkyboxRenderer.CurrentSunDirection);
                 pair.Value.SetParameter("CamPos", cameraPos);
+
+                // Atmosphere scattering parameters
+                pair.Value.SetParameter("SkyTintColor", SkyboxRenderer.CurrentSkyTintColor);
+                pair.Value.SetParameter("AtmosphereDensity", SkyboxRenderer.CurrentAtmosphereDensity);
+                pair.Value.SetParameter("HazeColor", SkyboxRenderer.CurrentHazeColor);
+                pair.Value.SetParameter("HazeIntensity", SkyboxRenderer.CurrentHazeIntensity);
+                pair.Value.SetParameter("SunsetTintColor", SkyboxRenderer.CurrentSunsetTintColor);
+                pair.Value.SetParameter("SunsetTintIntensity", SkyboxRenderer.CurrentSunsetTintIntensity);
+                pair.Value.SetParameter("NightSkyColor", SkyboxRenderer.CurrentNightSkyColor);
+                pair.Value.SetParameter("HazeHeight", SkyboxRenderer.CurrentHazeHeight);
+                pair.Value.SetParameter("NightHorizonColor", SkyboxRenderer.CurrentNightHorizonColor);
+                pair.Value.SetParameter("MieScattering", SkyboxRenderer.CurrentMieScattering);
+                pair.Value.SetParameter("MieAnisotropy", SkyboxRenderer.CurrentMieAnisotropy);
             }
         }
         

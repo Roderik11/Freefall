@@ -1,19 +1,31 @@
 // ────────────────────────────────────────────────
-// Shared procedural sky color functions
-// Used by both mesh_skybox.fx and ocean.fx
+// Shared procedural sky color: Rayleigh + Mie scattering with artist overrides
+// Used by mesh_skybox.fx, composition_cs.hlsl, ocean.fx, gbuffer_transparent.fx
+//
+// Requires: SceneConstants (b0) from common.fx for atmosphere parameters
 // ────────────────────────────────────────────────
+
+// Rayleigh phase function: (3/16π)(1 + cos²θ)
+float RayleighPhase(float cosTheta)
+{
+    return (3.0 / (16.0 * 3.14159265)) * (1.0 + cosTheta * cosTheta);
+}
+
+// Henyey-Greenstein phase function for Mie scattering
+float HGPhase(float cosTheta, float g)
+{
+    float g2 = g * g;
+    float denom = 1.0 + g2 - 2.0 * g * cosTheta;
+    return (1.0 - g2) / (4.0 * 3.14159265 * pow(abs(denom), 1.5));
+}
 
 float3 GetSkyColor(float3 viewDir, float3 sunDir)
 {
-    float horizon = abs(viewDir.y);
+    float cosTheta = dot(viewDir, sunDir);
+    float viewY = viewDir.y;
+    float horizon = abs(viewY);
 
-    float3 dayZenith = float3(0.2, 0.5, 1.0);
-    float3 dayHorizon = float3(0.6, 0.8, 1.0);
-    float3 sunsetZenith = float3(0.4, 0.3, 0.6);
-    float3 sunsetHorizon = float3(1.0, 0.5, 0.3);
-    float3 nightZenith = float3(0.01, 0.01, 0.05);
-    float3 nightHorizon = float3(0.05, 0.05, 0.1);
-
+    // ── Sun elevation blend factors (same structure as before for lighting sync) ──
     float sunElevation = sunDir.y;
 
     float dayFactor = saturate((sunElevation - 0.0) / 0.8);
@@ -36,16 +48,46 @@ float3 GetSkyColor(float3 viewDir, float3 sunDir)
         nightFactor /= total;
     }
 
-    float3 zenithColor = dayZenith * dayFactor + sunsetZenith * sunsetFactor + nightZenith * nightFactor;
-    float3 horizonColor = dayHorizon * dayFactor + sunsetHorizon * sunsetFactor + nightHorizon * nightFactor;
+    // ── Day sky: scattering-shaped gradient ──
+    // Zenith = deep tinted sky, horizon = brighter/whiter from longer scatter path
+    // Rayleigh phase modulates hue based on sun angle
+    float rayleighMod = RayleighPhase(cosTheta) * 2.0; // ~0.12 at 90°, ~0.36 at 0°
+    float3 zenithColor = SkyTintColor * (0.55 + rayleighMod * 0.3) * AtmosphereDensity;
+    float3 horizonWhite = lerp(SkyTintColor, float3(0.85, 0.88, 0.95), 0.55) * AtmosphereDensity;
 
-    float3 skyColor = lerp(horizonColor, zenithColor, pow(horizon, 0.5));
+    float gradientPow = pow(horizon, 0.45);
+    float3 dayColor = lerp(horizonWhite, zenithColor, gradientPow);
 
-    float sunAngle = dot(viewDir, sunDir);
-    float horizonScatter = pow(1.0 - horizon, 3.0);
-    float sunScatter = pow(saturate(sunAngle), 3.0);
-    float scatter = (horizonScatter + sunScatter * 0.5) * saturate(dayFactor + sunsetFactor * 0.5);
-    skyColor += float3(1.0, 0.8, 0.6) * scatter * 0.3;
+    // ── Mie scattering: sun halo / forward scatter glow ──
+    float mie = HGPhase(cosTheta, MieAnisotropy) * MieScattering;
+    dayColor += float3(1.0, 0.95, 0.85) * mie * 3.0;
 
-    return skyColor;
+    // ── Horizon haze: colored atmospheric haze at low angles ──
+    float horizonMask = 1.0 - smoothstep(0.0, HazeHeight, horizon);
+    horizonMask *= horizonMask; // softer falloff
+    float3 haze = HazeColor * horizonMask * HazeIntensity;
+    dayColor += haze;
+
+    // ── Sunset/sunrise tint injection ──
+    // Warm colors near horizon during sunset, modulated by sun proximity
+    float sunProximity = pow(saturate(cosTheta * 0.5 + 0.5), 2.0);
+    float horizonWarm = pow(1.0 - saturate(abs(viewY) / 0.3), 2.0);
+    float3 sunsetTint = SunsetTintColor * SunsetTintIntensity * sunProximity * horizonWarm;
+
+    // ── Night sky ──
+    float nightAltitude = saturate(abs(viewY));
+    float3 nightColor = lerp(NightHorizonColor, NightSkyColor, pow(nightAltitude, 0.5));
+
+    // ── Blend day/sunset/night using the same factors as SkyboxRenderer.UpdateSunLight() ──
+    float3 skyColor = dayColor * dayFactor
+                    + (dayColor + sunsetTint) * sunsetFactor
+                    + nightColor * nightFactor;
+
+    // ── Sun-scattered warm glow (shared across all phases except deep night) ──
+    float horizonScatter = pow(1.0 - saturate(abs(viewY)), 3.0);
+    float sunScatter = pow(saturate(cosTheta), 5.0);
+    float scatterWeight = (horizonScatter + sunScatter * 0.5) * saturate(dayFactor + sunsetFactor * 0.5);
+    skyColor += float3(1.0, 0.8, 0.6) * scatterWeight * 0.15;
+
+    return max(skyColor, 0.0);
 }

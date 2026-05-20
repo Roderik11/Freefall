@@ -66,8 +66,8 @@ void CSCompose(uint3 dispatchThreadId : SV_DispatchThreadID)
     // Hemisphere ambient: sky-facing surfaces get a cooler/brighter tint,
     // ground-facing get warmer/darker. Gives shape to fully shadowed objects.
     float ao = data.b;
-    float3 skyColor    = float3(0.25, 0.28, 0.35);  // cool sky bounce
-    float3 groundColor = float3(0.12, 0.11, 0.10);  // warm ground bounce
+    float3 skyColor    = GetSkyColor(float3(0, 1, 0), FogSunDirection) * 0.45;  // sky bounce from atmosphere
+    float3 groundColor = float3(0.12, 0.11, 0.10);  // warm ground bounce (terrain-dependent)
     float hemi = normal.y * 0.5 + 0.5;               // remap [-1,1] -> [0,1]
     float3 ambient = lerp(groundColor, skyColor, hemi) * ao * AmbientScale;
     

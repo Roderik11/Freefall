@@ -464,6 +464,9 @@ namespace Freefall
          [ValueRange(1f, 8f)]
          public float SSSShadowContrast { get; set; } = 2.0f;
 
+         // Anti-Aliasing
+         public bool EnableSMAA { get; set; } = false;
+
          // Screen-Space Displacement Mapping (SSDM)
          public bool EnableSSDM { get; set; } = true;
 

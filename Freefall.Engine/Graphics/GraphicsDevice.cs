@@ -616,6 +616,29 @@ namespace Freefall.Graphics
             }
         }
 
+        public ID3D12Resource CreateTexture3D(Format format, int width, int height, int depth, int mipLevels = 1, ResourceFlags flags = ResourceFlags.None, ResourceStates initialState = ResourceStates.Common)
+        {
+            var desc = new ResourceDescription
+            {
+                Dimension = ResourceDimension.Texture3D,
+                Width = (ulong)width,
+                Height = (uint)height,
+                DepthOrArraySize = (ushort)depth,
+                MipLevels = (ushort)mipLevels,
+                Format = format,
+                SampleDescription = new SampleDescription(1, 0),
+                Layout = TextureLayout.Unknown,
+                Flags = flags
+            };
+
+            return _device.CreateCommittedResource(
+                new HeapProperties(HeapType.Default),
+                HeapFlags.None,
+                desc,
+                initialState,
+                null);
+        }
+
         public void CreateRenderTargetView(ID3D12Resource resource, RenderTargetViewDescription? desc, CpuDescriptorHandle handle)
         {
             _device.CreateRenderTargetView(resource, desc, handle);

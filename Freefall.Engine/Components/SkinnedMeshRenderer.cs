@@ -40,7 +40,7 @@ namespace Freefall.Components
                 Array.Resize(ref boneMatrices, Mesh.Bones.Length);
 
             Transform.RootRotation = Mesh.RootRotation;
-
+           
             animator.GetPose(Mesh.Bones, boneMatrices);
 
             Params.SetParameterArray("Bones", boneMatrices);
