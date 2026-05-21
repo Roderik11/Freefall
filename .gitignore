@@ -48,3 +48,6 @@ ws_client.js
 *.js
 ssdm_paper_draft.docx
 dotnet-tools.json
+
+# Scripts (local dev tools)
+Scripts/
