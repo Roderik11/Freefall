@@ -21,6 +21,7 @@ struct InstanceDescriptor
     uint MaterialId;
     uint CustomDataIdx;
     uint MeshPartIdx;
+    uint BoneBufferIdx;
 };
 
 #pragma kernel CSMarkSplits
@@ -517,6 +518,7 @@ void CSEmitLeaves(uint3 dtid : SV_DispatchThreadID)
     desc.MaterialId = MaterialId;
     desc.CustomDataIdx = 0;
     desc.MeshPartIdx = 0;
+    desc.BoneBufferIdx = 0;
     outDescriptors[patchIdx] = desc;
     
     // Write BoundingSphere (already computed above for culling)
@@ -832,6 +834,7 @@ void CSEmitLeavesShadow(uint3 dtid : SV_DispatchThreadID)
         desc.MaterialId = materialId;
         desc.CustomDataIdx = 0;
         desc.MeshPartIdx = 0;
+        desc.BoneBufferIdx = 0;
         outDescriptors[patchIdx] = desc;
 
         // Write BoundingSphere

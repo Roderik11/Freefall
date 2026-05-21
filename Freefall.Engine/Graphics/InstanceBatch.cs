@@ -91,11 +91,11 @@ namespace Freefall.Graphics
         
         // Hardcoded compute push constant slots for per-instance buffers.
         // These are core pipeline constants â€” compute layout is fixed in cull_instances.hlsl.
-        // Graphics slots (from shader resource bindings) are separate and used in Draw/DrawShadow.
+        // Graphics slots (from shader resource bindings) are separate 
         private static readonly Dictionary<int, int> ComputeSlots = new()
         {
-            { "Bones".GetHashCode(), 30 },              // Indices[7].z = BoneBufferIdx
             // BoundingSpheres removed â€” culler reads bounds from MeshRegistry
+            // Bones removed â€” bone data is now per-instance via InstanceDescriptor.BoneBufferIdx
             { DrawBucket.DescriptorsHash, 4 },            // Indices[1].x = DescriptorBufferIdx
             { DrawBucket.SubbatchIdsHash, 23 },           // Indices[5].w = SubbatchIdsIdx
         };
@@ -1019,6 +1019,16 @@ namespace Freefall.Graphics
                 commandList.SetGraphicsRoot32BitConstant(0, pib.SRVIndices[frameIndex], (uint)pib.PushConstantSlot);
             }
 
+            // Per-batch graphics constants (slots 4-8)
+            // These were previously per-draw via command signature, now set once before ExecuteIndirect.
+            var descriptorPib = _perInstanceBuffers.GetValueOrDefault(DrawBucket.DescriptorsHash);
+            if (descriptorPib != null)
+                commandList.SetGraphicsRoot32BitConstant(0, descriptorPib.SRVIndices[frameIndex], 4); // DescriptorBufIdx
+            commandList.SetGraphicsRoot32BitConstant(0, visibleIndicesSRVIndices[frameIndex], 5);     // SortedIndicesIdx
+            commandList.SetGraphicsRoot32BitConstant(0, MeshRegistry.SrvIndex, 6);                   // MeshRegistryIdx
+            commandList.SetGraphicsRoot32BitConstant(0, Material.MaterialsBufferIndex, 7);            // MaterialsIdx
+            commandList.SetGraphicsRoot32BitConstant(0, TransformBuffer.Instance?.SrvIndex ?? 0, 8);  // GlobalTransformBufIdx
+
             // Set expansion buffer + VP buffer
             commandList.SetGraphicsRoot32BitConstant(0, shadowExpansionSRVIndices[frameIndex], 20); // ExpansionBufferIdx
             commandList.SetGraphicsRoot32BitConstant(0, shadowVPSrv, 21);    // ShadowVPBufferIdx
@@ -1098,16 +1108,24 @@ namespace Freefall.Graphics
             // Set topology: tessellation shaders require patch topology
             commandList.IASetPrimitiveTopology(Topology);
 
-            // Bind per-instance buffer SRV indices to GRAPHICS push constants.
-            // The command signature only writes slots 2-15 per draw.
-            // Per-instance buffers (e.g. TerrainPatchData at slot 1) use slots outside
-            // the command signature range and must be set explicitly.
+            // The command signature only writes slots 2-3 per draw (MeshPartId + InstanceBaseOffset).
+            // Per-instance buffers (e.g. TerrainPatchData at slot 1) use custom slots
+            // and must be set explicitly before ExecuteIndirect.
             foreach (var (hash, pib) in _perInstanceBuffers)
             {
                 if (pib.PushConstantSlot < 0) continue;
                 uint srvIdx = pib.SRVIndices[frameIndex];
                 commandList.SetGraphicsRoot32BitConstant(0, srvIdx, (uint)pib.PushConstantSlot);
             }
+
+            // Per-batch graphics constants (slots 4-8)
+            var descriptorPib = _perInstanceBuffers.GetValueOrDefault(DrawBucket.DescriptorsHash);
+            if (descriptorPib != null)
+                commandList.SetGraphicsRoot32BitConstant(0, descriptorPib.SRVIndices[frameIndex], 4);
+            commandList.SetGraphicsRoot32BitConstant(0, visibleIndicesSRVIndices[frameIndex], 5);
+            commandList.SetGraphicsRoot32BitConstant(0, MeshRegistry.SrvIndex, 6);
+            commandList.SetGraphicsRoot32BitConstant(0, Material.MaterialsBufferIndex, 7);
+            commandList.SetGraphicsRoot32BitConstant(0, TransformBuffer.Instance?.SrvIndex ?? 0, 8);
 
             var countBuffer = drawCountBuffers[frameIndex];
 

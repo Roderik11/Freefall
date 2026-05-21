@@ -1,50 +1,24 @@
-﻿using System;
-using System.Numerics;
-using System.Collections.Generic;
-using System.Runtime.InteropServices;
-using Freefall.Assets;
 using Freefall.Base;
 using Freefall.Graphics;
-using Freefall.Animation;
-using Vortice.Direct3D12;
-using Vortice.Mathematics;
 
 namespace Freefall.Components
 {
     /// <summary>
     /// Renders skinned/animated meshes with bone transforms.
-    /// Uses bindless instancing with a shared bone matrix buffer.
+    /// Bone buffer is set by the parent Animator — no per-SMR bone staging.
     /// </summary>
     [Icon("icon_skinnedmesh.png")]
-    public class SkinnedMeshRenderer : Component, IDraw, IUpdate, IParallel
+    public class SkinnedMeshRenderer : Component, IDraw
     {
         public Mesh? Mesh;
         public List<Material> Materials = new List<Material>();
         public MaterialBlock Params = new MaterialBlock();
 
-        private Animator? animator;
-        private Matrix4x4[]? boneMatrices = new Matrix4x4[4];
-        
-        protected override void Awake()
-        {
-            animator = Entity?.GetComponent<Animator>();
-        }
-
-        public void Update()
-        {
-            if(!Enabled) return;
-            if (Mesh?.Bones == null) return;
-            if (animator == null) return;
-
-            if (boneMatrices.Length != Mesh.Bones.Length)
-                Array.Resize(ref boneMatrices, Mesh.Bones.Length);
-
-            Transform.RootRotation = Mesh.RootRotation;
-           
-            animator.GetPose(Mesh.Bones, boneMatrices);
-
-            Params.SetParameterArray("Bones", boneMatrices);
-        }
+        /// <summary>
+        /// Per-Animator bone buffer SRV index. Set by Animator.Update() each frame.
+        /// 0 = no bones (fallback to bind pose).
+        /// </summary>
+        internal uint BoneBufferIdx;
 
         public void Draw()
         {
@@ -52,14 +26,14 @@ namespace Freefall.Components
             if (Mesh== null) return;
             if (Materials == null || Materials.Count == 0) return;
 
-            var slot = Entity.Transform.TransformSlot;
+            var slot = Transform.TransformSlot;
 
             for (int i = 0; i < Mesh.MeshParts.Count; i++)
             {
                 if (!Mesh.MeshParts[i].Enabled) continue;
                 var material = i < Materials.Count ? Materials[i] : Materials[0];
                 if(material != null)
-                    CommandBuffer.Enqueue(Mesh, i, material, Params, slot);
+                    CommandBuffer.Enqueue(Mesh, i, material, Params, slot, BoneBufferIdx);
             }
         }
     }

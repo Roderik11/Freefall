@@ -57,14 +57,7 @@ struct DecoratorSlot
 
 struct LODEntry { uint MeshPartId; float MaxDistance; uint MaterialId; uint _pad; };
 
-struct MeshPartEntry
-{
-    uint PosBufferIdx, NormBufferIdx, UVBufferIdx, IndexBufferIdx;
-    uint BaseIndex, VertexCount;
-    uint BoneWeightsBufferIdx, NumBones;
-    float BoundsCenterX, BoundsCenterY, BoundsCenterZ, BoundsRadius;
-    uint Reserved4, Reserved5, Reserved6, Reserved7, Reserved8, Reserved9;
-};
+// MeshPartEntry defined in common.fx
 
 struct DecoInstance
 {

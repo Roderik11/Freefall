@@ -110,6 +110,20 @@ namespace Freefall.Base
             return ComponentCache<T>.Get(this);
         }
 
+        public T? GetComponentInChildren<T>() where T : Component
+        {
+            var component = GetComponent<T>();
+            if (component != null)
+                return component;
+            foreach (Transform child in Transform)
+            {
+                var childComponent = child.Entity?.GetComponentInChildren<T>();
+                if (childComponent != null)
+                    return childComponent;
+            }
+            return null;
+        }
+
         public T? GetComponentInParents<T>() where T : Component
         {
             var current = this;

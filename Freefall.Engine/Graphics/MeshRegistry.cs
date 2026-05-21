@@ -15,7 +15,7 @@ namespace Freefall.Graphics
     {
         /// <summary>
         /// Per mesh/part metadata. Must match shader MeshPartEntry exactly.
-        /// 72 bytes = 18 uints, same size as IndirectDrawCommand for easy GPU access.
+        /// 72 bytes = 18 uints.
         /// </summary>
         [StructLayout(LayoutKind.Sequential)]
         public struct MeshPartEntry
@@ -27,13 +27,13 @@ namespace Freefall.Graphics
             public uint BaseIndex;
             public uint VertexCount;
             public uint BoneWeightsBufferIdx;
-            public uint NumBones;
+            public uint Reserved3;
             // Local-space bounding sphere (center + radius) for GPU culling
             public float BoundsCenterX;
             public float BoundsCenterY;
             public float BoundsCenterZ;
             public float BoundsRadius;
-            // Padding to match IndirectDrawCommand size (72 bytes = 18 uints)
+            // Reserved fields for 72-byte struct alignment
             public uint TanBufferIdx;
             public uint Reserved5;
             public uint Reserved6;
@@ -77,7 +77,7 @@ namespace Freefall.Graphics
                     BaseIndex = (uint)part.BaseIndex,
                     VertexCount = (uint)part.NumIndices,
                     BoneWeightsBufferIdx = mesh.BoneWeightBufferIndex,
-                    NumBones = (uint)(mesh.Bones?.Length ?? 0),
+                    Reserved3 = 0,
                     BoundsCenterX = bounds.X,
                     BoundsCenterY = bounds.Y,
                     BoundsCenterZ = bounds.Z,

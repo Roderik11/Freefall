@@ -39,8 +39,6 @@ namespace Freefall.Components
         public int Count => Children.Count;
         public System.Collections.IEnumerator GetEnumerator() => Children.GetEnumerator();
 
-        public Matrix4x4 RootRotation = Matrix4x4.Identity;
-
         internal void SetDirty()
         {
             _isDirty = true;
@@ -48,7 +46,7 @@ namespace Freefall.Components
             for (int i = 0; i < Children.Count; i++)
                 Children[i].SetDirty();
 
-            TransformBuffer.Instance!.SetTransform(TransformSlot, RootRotation * Matrix);
+            TransformBuffer.Instance!.SetTransform(TransformSlot, Matrix);
 
             // Re-entrancy guard: if a subscriber modifies the transform
             // inside OnChanged, the recursive SetDirty still propagates

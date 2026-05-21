@@ -101,7 +101,7 @@ cbuffer PushConstants : register(b3)
     uint UniquePartCountIdx;        // slot 27 — Max unique MeshPartIds in registry
     uint CascadeMaskUAVIdx;         // slot 28 — UAV: per-instance 4-bit cascade mask
     uint ExpansionUAVIdx;           // slot 29 — UAV: expansion buffer for (instanceIdx, cascadeIdx)
-    uint BoneBufferIdx;             // slot 30 — SRV: per-batch bone matrices (0=static)
+    uint Reserved30;                // slot 30 — (was per-batch bone buffer, now per-instance)
     uint CascadeBufferSRVIdx;       // slot 31 — SRV: StructuredBuffer<CascadeData> / shadow cascade idx (aliased)
     uint SortKeysUAVIdx;            // slot 32 — UAV: depth sort keys buffer (uint2 per entry)
 };
@@ -151,10 +151,10 @@ struct MeshPartEntry
     uint BaseIndex;
     uint VertexCount;
     uint BoneWeightsBufferIdx;
-    uint NumBones;
+    uint Reserved3;
     // Local-space bounding sphere (center + radius) for GPU culling
     float4 LocalBounds;  // xyz = center, w = radius
-    // Reserved fields for padding to match IndirectDrawCommand size
+    // Reserved fields for padding to match C# layout
     uint Reserved4;
     uint Reserved5;
     uint Reserved6;
@@ -163,32 +163,23 @@ struct MeshPartEntry
     uint Reserved9;
 };
 
-// Per-instance descriptor (matches C# InstanceDescriptor exactly: 12 bytes = 3 uints)
+// Per-instance descriptor (matches C# InstanceDescriptor exactly: 20 bytes = 5 uints)
 struct InstanceDescriptor
 {
     uint TransformSlot;
     uint MaterialId;
     uint CustomDataIdx;
     uint MeshPartIdx;
+    uint BoneBufferIdx;
 };
 
-// Must match C# IndirectDrawCommand exactly (72 bytes = 18 uints)
+// Must match C# IndirectDrawCommand exactly (24 bytes = 6 uints)
 struct IndirectDrawCommand
 {
-    uint DescriptorBufIdx;
-    uint Reserved0;
-    uint SortedIndicesBufIdx;
-    uint BoneWeightsBufIdx;
-    uint BonesBufIdx;
-    uint IndexBufIdx;
-    uint BaseIndex;
-    uint PosBufIdx;
-    uint NormBufIdx;
-    uint UVBufIdx;
-    uint NumBones;
-    uint InstanceBaseOffset;
-    uint MaterialsIdx;
-    uint GlobalTransformBufIdx;
+    // Root constants (slots 2-3, written by command signature)
+    uint MeshPartId;            // Index into MeshRegistry
+    uint InstanceBaseOffset;    // Base offset in sorted indices
+    // D3D12_DRAW_INSTANCED_ARGUMENTS
     uint VertexCountPerInstance;
     uint DrawInstanceCount;
     uint StartVertexLocation;
@@ -881,20 +872,8 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
     }
     
     IndirectDrawCommand cmd;
-    cmd.DescriptorBufIdx = DescriptorBufferIdx;
-    cmd.Reserved0 = 0;
-    cmd.SortedIndicesBufIdx = VisibleIndicesSRVIdx;
-    cmd.BoneWeightsBufIdx = entry.BoneWeightsBufferIdx;
-    cmd.BonesBufIdx = BoneBufferIdx;
-    cmd.IndexBufIdx = entry.IndexBufferIdx;
-    cmd.BaseIndex = entry.BaseIndex;
-    cmd.PosBufIdx = entry.PosBufferIdx;
-    cmd.NormBufIdx = entry.NormBufferIdx;
-    cmd.UVBufIdx = entry.UVBufferIdx;
-    cmd.NumBones = entry.NumBones;
+    cmd.MeshPartId = meshPartId;
     cmd.InstanceBaseOffset = baseOffset;
-    cmd.MaterialsIdx = MaterialsBufferIdx;
-    cmd.GlobalTransformBufIdx = GlobalTransformsIdx;
     cmd.VertexCountPerInstance = entry.VertexCount;
     cmd.DrawInstanceCount = visibleCount * max(1u, InstanceMultiplier);
     cmd.StartVertexLocation = 0;
@@ -964,7 +943,7 @@ void CSVisibilityShadow(uint3 dispatchThreadId : SV_DispatchThreadID)
     
     // For skinned meshes (BoneBufferIdx != 0), the bounding sphere is static (bind pose)
     // and doesn't account for animation. Inflate it to prevent culling when limbs move outside.
-    if (BoneBufferIdx != 0)
+    if (descriptors[instanceIdx].BoneBufferIdx != 0)
     {
         worldRadius *= 1.5;
     }
@@ -1023,7 +1002,7 @@ void CSVisibilityShadow4(uint3 dispatchThreadId : SV_DispatchThreadID)
     float worldRadius = localSphere.w * maxScale;
     
     // Inflate for skinned meshes (same as CSVisibilityShadow)
-    if (BoneBufferIdx != 0)
+    if (descriptors[instanceIdx].BoneBufferIdx != 0)
         worldRadius *= 1.5;
     
     // Test all cascade frustums + shadow Hi-Z occlusion

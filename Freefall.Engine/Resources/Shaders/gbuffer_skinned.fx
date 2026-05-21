@@ -1,25 +1,31 @@
 cbuffer PushConstants : register(b3)
 {
+    // Slots 0-1: Reserved for light/composition passes
     uint _reserved0;
     uint _reserved1;
-    uint DescriptorBufIdx;      // 2
-    uint _reserved3;            // 3
-    uint SortedIndicesIdx;      // 4
-    uint BoneWeightsIdx;        // 5: StructuredBuffer<BoneWeight> - per-mesh bone weights
-    uint BonesIdx;              // 6: StructuredBuffer<matrix> - batched bone matrices
-    uint IndexBufferIdx;        // 7
-    uint BaseIndex;             // 8
-    uint PosBufferIdx;          // 9
-    uint NormBufferIdx;         // 10
-    uint UVBufferIdx;           // 11
-    uint NumBones;              // 12: Number of bones per skeleton
-    uint InstanceBaseOffset;    // 13
-    uint MaterialsIdx;          // 14
-    uint GlobalTransformBufferIdx; // 15
-    uint DebugMode;             // 16
+    // Slots 2-3: PER-DRAW (command signature writes these)
+    uint MeshPartId;                // 2: Index into MeshRegistry
+    uint InstanceBaseOffset;        // 3: Base offset for instance ID (per-command)
+    // Slots 4-8: PER-BATCH (set before ExecuteIndirect)
+    uint DescriptorBufIdx;          // 4: StructuredBuffer<InstanceDescriptor>
+    uint SortedIndicesIdx;          // 5: StructuredBuffer<uint> - sorted draw order indices
+    uint MeshRegistryIdx;           // 6: StructuredBuffer<MeshPartEntry>
+    uint MaterialsIdx;              // 7: Index to materials buffer
+    uint GlobalTransformBufferIdx;  // 8: Index to global TransformBuffer
+    // Slots 9-15: Reserved
+    uint _reserved9;
+    uint _reserved10;
+    uint _reserved11;
+    uint _reserved12;
+    uint _reserved13;
+    uint _reserved14;
+    uint _reserved15;
+    // Slot 16: Debug
+    uint DebugMode;             // 16: Debug visualization mode
     uint _reserved17;
     uint _reserved18;
     uint _reserved19;
+    // Slots 20-21: Shadow pass
     uint ExpansionBufferIdx;    // 20
     uint CascadeBufferSRVIdx;   // 21
 };
@@ -59,12 +65,10 @@ VSOutput VS(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_InstanceI
 {
     VSOutput output;
 
-    // Instance data buffers - descriptor contains TransformSlot + MaterialId
+    // Instance data buffers - descriptor contains TransformSlot + MaterialId + BoneBufferIdx
     StructuredBuffer<InstanceDescriptor> descriptors = ResourceDescriptorHeap[DescriptorBufIdx];
     StructuredBuffer<row_major matrix> globalTransforms = ResourceDescriptorHeap[GlobalTransformBufferIdx];
     StructuredBuffer<uint> sortedIndices = ResourceDescriptorHeap[SortedIndicesIdx];
-    StructuredBuffer<BoneWeight> boneWeights = ResourceDescriptorHeap[BoneWeightsIdx];
-    StructuredBuffer<row_major matrix> bones = ResourceDescriptorHeap[BonesIdx];
     
     // Get instance data position using InstanceBaseOffset + local instance ID
     uint dataPos = InstanceBaseOffset + instanceID;
@@ -91,28 +95,34 @@ VSOutput VS(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_InstanceI
         fetchID = triBase + (triLocal == 1u ? 2u : (triLocal == 2u ? 1u : 0u));
     }
     
+    // Look up mesh buffer indices from MeshRegistry
+    StructuredBuffer<MeshPartEntry> meshRegistry = ResourceDescriptorHeap[MeshRegistryIdx];
+    MeshPartEntry part = meshRegistry[MeshPartId];
+    
     // Bindless index buffer - fetchID is 0 to N-1, add BaseIndex to offset into correct mesh part
-    StructuredBuffer<uint> indices = ResourceDescriptorHeap[IndexBufferIdx];
-    uint vertexID = indices[fetchID + BaseIndex];
+    StructuredBuffer<uint> indices = ResourceDescriptorHeap[part.IndexBufferIdx];
+    uint vertexID = indices[fetchID + part.BaseIndex];
     
     // Mesh data buffers - use resolved vertexID
-    StructuredBuffer<float3> positions = ResourceDescriptorHeap[PosBufferIdx];
-    StructuredBuffer<float3> normals = ResourceDescriptorHeap[NormBufferIdx];
-    StructuredBuffer<float2> uvs = ResourceDescriptorHeap[UVBufferIdx];
+    StructuredBuffer<float3> positions = ResourceDescriptorHeap[part.PosBufferIdx];
+    StructuredBuffer<float3> normals = ResourceDescriptorHeap[part.NormBufferIdx];
+    StructuredBuffer<float2> uvs = ResourceDescriptorHeap[part.UVBufferIdx];
+    
+    // Per-Animator bone buffer — loaded from per-instance descriptor (shared across SMRs)
+    StructuredBuffer<BoneWeight> boneWeights = ResourceDescriptorHeap[part.BoneWeightsBufferIdx];
+    StructuredBuffer<row_major matrix> bones = ResourceDescriptorHeap[desc.BoneBufferIdx];
     
     float3 pos = positions[vertexID];
     float3 norm = normals[vertexID];
     float2 uv = uvs[vertexID];
     BoneWeight bw = boneWeights[vertexID];
     
-    // Bone matrices for this instance — indexed by arrival-order instance index
-    // (bone data is uploaded densely per-instance, not by TransformSlot)
-    uint boneOffset = idx * NumBones;
-    
-    matrix bone0 = bones[boneOffset + (uint)bw.BoneIDs.x];
-    matrix bone1 = bones[boneOffset + (uint)bw.BoneIDs.y];
-    matrix bone2 = bones[boneOffset + (uint)bw.BoneIDs.z];
-    matrix bone3 = bones[boneOffset + (uint)bw.BoneIDs.w];
+    // Bone matrices — direct index, no offset!
+    // Each Animator owns its own buffer, bones start at index 0.
+    matrix bone0 = bones[(uint)bw.BoneIDs.x];
+    matrix bone1 = bones[(uint)bw.BoneIDs.y];
+    matrix bone2 = bones[(uint)bw.BoneIDs.z];
+    matrix bone3 = bones[(uint)bw.BoneIDs.w];
     
     // Skinning transformation
     float4 skinned = float4(0, 0, 0, 0);
@@ -186,27 +196,33 @@ ShadowVSOutput VS_Shadow(uint primitiveVertexID : SV_VertexID, uint instanceID :
     output.RTIndex = cascadeIdx;
 
     StructuredBuffer<row_major matrix> globalTransforms = ResourceDescriptorHeap[GlobalTransformBufferIdx];
-    StructuredBuffer<BoneWeight> boneWeights = ResourceDescriptorHeap[BoneWeightsIdx];
-    StructuredBuffer<row_major matrix> bones = ResourceDescriptorHeap[BonesIdx];
-
-    StructuredBuffer<uint> indices = ResourceDescriptorHeap[IndexBufferIdx];
-    uint vertexID = indices[primitiveVertexID + BaseIndex];
-
-    StructuredBuffer<float3> positions = ResourceDescriptorHeap[PosBufferIdx];
-    StructuredBuffer<float2> uvs = ResourceDescriptorHeap[UVBufferIdx];
-
+    
+    // Look up mesh buffer indices from MeshRegistry
+    StructuredBuffer<MeshPartEntry> meshRegistry = ResourceDescriptorHeap[MeshRegistryIdx];
+    MeshPartEntry part = meshRegistry[MeshPartId];
+    
+    // Per-Animator bone buffer from per-instance descriptor
     StructuredBuffer<InstanceDescriptor> descriptors = ResourceDescriptorHeap[DescriptorBufIdx];
     InstanceDescriptor desc = descriptors[idx];
+    StructuredBuffer<BoneWeight> boneWeights = ResourceDescriptorHeap[part.BoneWeightsBufferIdx];
+    StructuredBuffer<row_major matrix> bones = ResourceDescriptorHeap[desc.BoneBufferIdx];
+    
     row_major matrix World = globalTransforms[desc.TransformSlot];
+
+    StructuredBuffer<uint> indices = ResourceDescriptorHeap[part.IndexBufferIdx];
+    uint vertexID = indices[primitiveVertexID + part.BaseIndex];
+
+    StructuredBuffer<float3> positions = ResourceDescriptorHeap[part.PosBufferIdx];
+    StructuredBuffer<float2> uvs = ResourceDescriptorHeap[part.UVBufferIdx];
 
     float3 pos = positions[vertexID];
     BoneWeight bw = boneWeights[vertexID];
 
-    uint boneOffset = idx * NumBones;
-    matrix bone0 = bones[boneOffset + (uint)bw.BoneIDs.x];
-    matrix bone1 = bones[boneOffset + (uint)bw.BoneIDs.y];
-    matrix bone2 = bones[boneOffset + (uint)bw.BoneIDs.z];
-    matrix bone3 = bones[boneOffset + (uint)bw.BoneIDs.w];
+    // Direct bone index — no offset
+    matrix bone0 = bones[(uint)bw.BoneIDs.x];
+    matrix bone1 = bones[(uint)bw.BoneIDs.y];
+    matrix bone2 = bones[(uint)bw.BoneIDs.z];
+    matrix bone3 = bones[(uint)bw.BoneIDs.w];
 
     float4 skinned = float4(0, 0, 0, 0);
     skinned += mul(float4(pos, 1), bone0) * bw.Weights.x;

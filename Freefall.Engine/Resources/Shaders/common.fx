@@ -60,7 +60,7 @@ struct CascadeData
     float4 SplitDistances;      // X=near, Y=far (16 bytes)
 };
 
-// Per-instance descriptor (matches C# InstanceDescriptor: 16 bytes)
+// Per-instance descriptor (matches C# InstanceDescriptor: 20 bytes)
 // Single source of truth — do NOT redeclare in individual shaders.
 struct InstanceDescriptor
 {
@@ -68,6 +68,28 @@ struct InstanceDescriptor
     uint MaterialId;      // index into MaterialsBuffer
     uint CustomDataIdx;   // index into per-batch StructuredBuffer
     uint MeshPartIdx;     // meshpart index within the mesh (for GPU picking)
+    uint BoneBufferIdx;   // per-Animator bone buffer SRV (0 = static mesh)
+};
+
+// Per mesh/part metadata (matches C# MeshPartEntry: 72 bytes = 18 uints)
+// Single source of truth — VS looks up buffer indices from MeshRegistry using MeshPartId.
+struct MeshPartEntry
+{
+    uint PosBufferIdx;
+    uint NormBufferIdx;
+    uint UVBufferIdx;
+    uint IndexBufferIdx;
+    uint BaseIndex;
+    uint VertexCount;
+    uint BoneWeightsBufferIdx;
+    uint Reserved3;
+    float4 LocalBounds;        // center.xyz + radius.w
+    uint TanBufferIdx;
+    uint Reserved5;
+    uint Reserved6;
+    uint Reserved7;
+    uint Reserved8;
+    uint Reserved9;
 };
 
 float3 FOG(float3 color, float depth, float3 fogColor)

@@ -218,13 +218,14 @@ namespace Freefall.Graphics
                  Debug.LogError("GraphicsDevice", $"Creating DrawIndexedInstancedSignature: {ex.Message}");
             }
 
-            // Bindless command signature: 14 root constants + DrawInstanced
-            // Used by GPU-driven indirect rendering with per-draw buffer indices
+            // Bindless command signature: 2 root constants + DrawInstanced
+            // Per-draw: MeshPartId (slot 2) + InstanceBaseOffset (slot 3)
+            // VS looks up mesh buffer indices from MeshRegistry using MeshPartId
             var constantArg = new IndirectArgumentDescription();
             constantArg.Type = IndirectArgumentType.Constant;
             constantArg.Constant.RootParameterIndex = 0;           // Root parameter 0 (push constants)
             constantArg.Constant.DestOffsetIn32BitValues = 2;      // Start at slot 2
-            constantArg.Constant.Num32BitValuesToSet = 14;         // 14 slots (2-15)
+            constantArg.Constant.Num32BitValuesToSet = 2;          // 2 slots (2-3): MeshPartId + InstanceBaseOffset
             
             var bindlessArgs = new IndirectArgumentDescription[]
             {
@@ -232,8 +233,8 @@ namespace Freefall.Graphics
                 new IndirectArgumentDescription { Type = IndirectArgumentType.Draw }
             };
             
-            // Stride = 14 constants (56 bytes) + DrawInstancedArguments (16 bytes) = 72 bytes
-            int bindlessStride = 14 * sizeof(uint) + System.Runtime.InteropServices.Marshal.SizeOf<DrawInstancedArguments>();
+            // Stride = 2 constants (8 bytes) + DrawInstancedArguments (16 bytes) = 24 bytes
+            int bindlessStride = 2 * sizeof(uint) + System.Runtime.InteropServices.Marshal.SizeOf<DrawInstancedArguments>();
             var bindlessDesc = new CommandSignatureDescription(bindlessStride, bindlessArgs);
             
             try {

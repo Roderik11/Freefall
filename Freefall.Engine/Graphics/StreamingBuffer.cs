@@ -40,6 +40,11 @@ namespace Freefall.Graphics
         public uint SrvIndex => _srvIndices[Engine.FrameIndex % FrameCount];
 
         /// <summary>
+        /// Frame index of last BulkWrite/Upload. Used to avoid redundant writes within a frame.
+        /// </summary>
+        public int LastWriteFrame = -1;
+
+        /// <summary>
         /// Current capacity in number of elements.
         /// </summary>
         public int Capacity => _capacity;
@@ -110,6 +115,20 @@ namespace Freefall.Graphics
                 dirty.Clear();
                 _anyDirty[frame] = false;
             }
+        }
+
+        /// <summary>
+        /// Write all elements directly to current frame's mapped buffer.
+        /// Use for data that's fully rewritten every frame (e.g. bone matrices).
+        /// Bypasses dirty tracking — cheaper than N × Set() calls.
+        /// </summary>
+        public void BulkWrite(ReadOnlySpan<T> data)
+        {
+            EnsureCapacity(data.Length);
+            int frame = Engine.FrameIndex % FrameCount;
+            T* dst = _mapped[frame];
+            fixed (T* src = data)
+                System.Buffer.MemoryCopy(src, dst, _capacity * _stride, data.Length * _stride);
         }
 
         /// <summary>

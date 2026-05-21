@@ -12,24 +12,25 @@ cbuffer PushConstants : register(b3)
     // Slots 0-1: Forward lighting data
     uint ShadowMapIdx;          // 0: Shadow cascade array SRV
     uint CompositeSRVIdx;       // 1: CompositeSnapshot SRV for refraction
-    // Slots 2-13: Mesh draw data (matches gbuffer.fx exactly)
-    uint DescriptorBufIdx;      // 2
-    uint _reserved3;            // 3
-    uint SortedIndicesIdx;      // 4
-    uint BoneWeightsIdx;        // 5
-    uint BonesIdx;              // 6
-    uint IndexBufferIdx;        // 7
-    uint BaseIndex;             // 8
-    uint PosBufferIdx;          // 9
-    uint NormBufferIdx;         // 10
-    uint UVBufferIdx;           // 11
-    uint NumBones;              // 12
-    uint InstanceBaseOffset;    // 13
-    // Slots 14-15: Global bindless buffers
-    uint MaterialsIdx;          // 14
-    uint GlobalTransformBufferIdx; // 15
+    // Slots 2-3: PER-DRAW (command signature writes these)
+    uint MeshPartId;                // 2: Index into MeshRegistry
+    uint InstanceBaseOffset;        // 3: Base offset for instance ID (per-command)
+    // Slots 4-8: PER-BATCH (set before ExecuteIndirect)
+    uint DescriptorBufIdx;          // 4: StructuredBuffer<InstanceDescriptor>
+    uint SortedIndicesIdx;          // 5: StructuredBuffer<uint> - sorted draw order indices
+    uint MeshRegistryIdx;           // 6: StructuredBuffer<MeshPartEntry>
+    uint MaterialsIdx;              // 7: Index to materials buffer
+    uint GlobalTransformBufferIdx;  // 8: Index to global TransformBuffer
+    // Slots 9-15: Reserved
+    uint _reserved9;
+    uint _reserved10;
+    uint _reserved11;
+    uint _reserved12;
+    uint _reserved13;
+    uint _reserved14;
+    uint _reserved15;
     // Slot 16: Debug
-    uint DebugMode;             // 16
+    uint DebugMode;             // 16: Debug visualization mode
 };
 
 #include "common.fx"
@@ -115,12 +116,16 @@ VSOutput VS(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_InstanceI
         fetchID = triBase + (triLocal == 1u ? 2u : (triLocal == 2u ? 1u : 0u));
     }
 
-    StructuredBuffer<uint> indices = ResourceDescriptorHeap[IndexBufferIdx];
-    uint vertexID = indices[fetchID + BaseIndex];
+    // Look up mesh buffer indices from MeshRegistry
+    StructuredBuffer<MeshPartEntry> meshRegistry = ResourceDescriptorHeap[MeshRegistryIdx];
+    MeshPartEntry part = meshRegistry[MeshPartId];
 
-    StructuredBuffer<float3> positions = ResourceDescriptorHeap[PosBufferIdx];
-    StructuredBuffer<float3> normals = ResourceDescriptorHeap[NormBufferIdx];
-    StructuredBuffer<float2> uvs = ResourceDescriptorHeap[UVBufferIdx];
+    StructuredBuffer<uint> indices = ResourceDescriptorHeap[part.IndexBufferIdx];
+    uint vertexID = indices[fetchID + part.BaseIndex];
+
+    StructuredBuffer<float3> positions = ResourceDescriptorHeap[part.PosBufferIdx];
+    StructuredBuffer<float3> normals = ResourceDescriptorHeap[part.NormBufferIdx];
+    StructuredBuffer<float2> uvs = ResourceDescriptorHeap[part.UVBufferIdx];
 
     float3 pos = positions[vertexID];
     float3 norm = normals[vertexID];

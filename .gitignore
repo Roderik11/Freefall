@@ -46,3 +46,5 @@ package.json
 package-lock.json
 ws_client.js
 *.js
+ssdm_paper_draft.docx
+dotnet-tools.json

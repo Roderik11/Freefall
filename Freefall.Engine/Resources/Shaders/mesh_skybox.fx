@@ -1,21 +1,17 @@
 cbuffer PushConstants : register(b3)
 {
+    // Slots 0-1: Reserved for light/composition passes
     uint _reserved0;
     uint _reserved1;
-    uint DescriptorBufIdx;      // 2
-    uint _reserved3;            // 3
-    uint SortedIndicesIdx;      // 4
-    uint BoneWeightsIdx;        // 5
-    uint BonesIdx;              // 6
-    uint IndexBufferIdx;        // 7
-    uint BaseIndex;             // 8
-    uint PosBufferIdx;          // 9
-    uint NormBufferIdx;         // 10
-    uint UVBufferIdx;           // 11
-    uint NumBones;              // 12
-    uint InstanceBaseOffset;    // 13
-    uint MaterialsIdx;          // 14
-    uint GlobalTransformBufferIdx; // 15
+    // Slots 2-3: PER-DRAW (command signature writes these)
+    uint MeshPartId;                // 2: Index into MeshRegistry
+    uint InstanceBaseOffset;        // 3: Base offset for instance ID (per-command)
+    // Slots 4-8: PER-BATCH (set before ExecuteIndirect)
+    uint DescriptorBufIdx;          // 4: StructuredBuffer<InstanceDescriptor>
+    uint SortedIndicesIdx;          // 5: StructuredBuffer<uint> - sorted draw order indices
+    uint MeshRegistryIdx;           // 6: StructuredBuffer<MeshPartEntry>
+    uint MaterialsIdx;              // 7: Index to materials buffer
+    uint GlobalTransformBufferIdx;  // 8: Index to global TransformBuffer
 };
 
 #include "common.fx"
@@ -178,13 +174,15 @@ VertexOutput VS(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_Insta
 {
     VertexOutput output;
 
-
+    // Look up mesh buffer indices from MeshRegistry
+    StructuredBuffer<MeshPartEntry> meshRegistry = ResourceDescriptorHeap[MeshRegistryIdx];
+    MeshPartEntry part = meshRegistry[MeshPartId];
 
     // Bindless index buffer - primitiveVertexID is 0 to N-1, add BaseIndex to offset into correct mesh part
-    StructuredBuffer<uint> indices = ResourceDescriptorHeap[IndexBufferIdx];
-    uint vertexID = indices[primitiveVertexID + BaseIndex];
+    StructuredBuffer<uint> indices = ResourceDescriptorHeap[part.IndexBufferIdx];
+    uint vertexID = indices[primitiveVertexID + part.BaseIndex];
 
-    StructuredBuffer<float3> positions = ResourceDescriptorHeap[PosBufferIdx];
+    StructuredBuffer<float3> positions = ResourceDescriptorHeap[part.PosBufferIdx];
     StructuredBuffer<row_major matrix> globalTransforms = ResourceDescriptorHeap[GlobalTransformBufferIdx];
     StructuredBuffer<uint> sortedIndices = ResourceDescriptorHeap[SortedIndicesIdx];
     StructuredBuffer<InstanceDescriptor> descriptors = ResourceDescriptorHeap[DescriptorBufIdx];

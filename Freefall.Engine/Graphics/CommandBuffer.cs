@@ -41,6 +41,10 @@ namespace Freefall.Graphics
         /// Transform slot in global TransformBuffer. -1 means use MaterialBlock["World"] fallback.
         /// </summary>
         public int TransformSlot;
+        /// <summary>
+        /// Per-Animator bone buffer SRV index (0 = static mesh).
+        /// </summary>
+        public uint BoneBufferIdx;
     }
 
     /// <summary>
@@ -75,7 +79,7 @@ namespace Freefall.Graphics
 
         public int Count => Draws.Count;        
         
-        public void Add(Mesh mesh, int partIndex, Material material, MaterialBlock block, int transformSlot)
+        public void Add(Mesh mesh, int partIndex, Material material, MaterialBlock block, int transformSlot, uint boneBufferIdx = 0)
         {
             // Get or register MeshPartId (done during parallel Enqueue!)
             int meshPartId = mesh.GetMeshPartId(partIndex);
@@ -104,10 +108,11 @@ namespace Freefall.Graphics
                 TransformSlot = (uint)transformSlot,
                 MaterialId = (uint)material.MaterialID,
                 CustomDataIdx = 0,
-                MeshPartIdx = (uint)partIndex
+                MeshPartIdx = (uint)partIndex,
+                BoneBufferIdx = boneBufferIdx
             };
 
-            StageCore(DescriptorsHash, 16, descriptor);       // InstanceDescriptor: 16 bytes
+            StageCore(DescriptorsHash, 20, descriptor);       // InstanceDescriptor: 20 bytes (5 uints)
             StageCore(SubbatchIdsHash, 4,  (uint)meshPartId);        // uint: 4 bytes
             UniqueMeshPartIds.Add(meshPartId);
             
@@ -297,7 +302,7 @@ namespace Freefall.Graphics
                     bucket = new DrawBucket();
                     buckets[drawCall.Key] = bucket;
                 }
-                bucket.Add(drawCall.Mesh, drawCall.MeshPartIndex, drawCall.Material, drawCall.MaterialBlock, drawCall.TransformSlot);
+                bucket.Add(drawCall.Mesh, drawCall.MeshPartIndex, drawCall.Material, drawCall.MaterialBlock, drawCall.TransformSlot, drawCall.BoneBufferIdx);
             }
 
             /// <summary>
@@ -574,7 +579,7 @@ namespace Freefall.Graphics
         /// <summary>
         /// Enqueue draw call into all applicable RenderPasses based on the Material's Effect passes.
         /// </summary>
-        public static void Enqueue(Mesh mesh, int meshPartIndex, Material material, MaterialBlock materialBlock, int transformSlot = -1)
+        public static void Enqueue(Mesh mesh, int meshPartIndex, Material material, MaterialBlock materialBlock, int transformSlot = -1, uint boneBufferIdx = 0)
         {
             var key = new BatchKey(material.Effect);
             var drawCall = new DrawCall 
@@ -584,7 +589,8 @@ namespace Freefall.Graphics
                 MeshPartIndex = meshPartIndex,
                 Material = material,
                 MaterialBlock = materialBlock,
-                TransformSlot = transformSlot
+                TransformSlot = transformSlot,
+                BoneBufferIdx = boneBufferIdx
             };
             
             // Iterate all passes defined in the Effect and enqueue to each
@@ -599,12 +605,12 @@ namespace Freefall.Graphics
         /// <summary>
         /// Enqueue all mesh parts into all applicable RenderPasses based on the Material's Effect passes.
         /// </summary>
-        public static void Enqueue(Mesh mesh, Material material, MaterialBlock materialBlock, int transformSlot = -1)
+        public static void Enqueue(Mesh mesh, Material material, MaterialBlock materialBlock, int transformSlot = -1, uint boneBufferIdx = 0)
         {
             for (int i = 0; i < mesh.MeshParts.Count; i++)
             {
                 if (mesh.MeshParts[i].Enabled)
-                    Enqueue(mesh, i, material, materialBlock, transformSlot);
+                    Enqueue(mesh, i, material, materialBlock, transformSlot, boneBufferIdx);
             }
         }
 

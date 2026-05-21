@@ -1,4 +1,24 @@
+cbuffer PushConstants : register(b3)
+{
+    // Slots 0-1: Reserved for light/composition passes
+    uint _reserved0;
+    uint _reserved1;
+    // Slots 2-3: PER-DRAW (command signature writes these)
+    uint MeshPartId;                // 2: Index into MeshRegistry
+    uint _reserved3;
+    // Slots 4-8: PER-BATCH
+    uint _reserved4;
+    uint _reserved5;
+    uint MeshRegistryIdx;           // 6: StructuredBuffer<MeshPartEntry>
+    uint MaterialsIdx;              // 7: Index to materials buffer
+    uint _reserved8;
+};
+
 #include "common.fx"
+
+// Bindless texture indices — set per-material, not from push constants
+#define AlbedoIdx PushConstants.indices[0]
+#define NormalIdx PushConstants.indices[1]
 
 struct VSOutput
 {
@@ -7,22 +27,19 @@ struct VSOutput
     float2 UV : TEXCOORD0;
 };
 
-// Bindless indices from PushConstants (Slot 0)
-#define AlbedoIdx PushConstants.indices[0]
-#define NormalIdx PushConstants.indices[1]
-#define PosBufferIdx PushConstants.indices[7]
-#define NormBufferIdx PushConstants.indices[8]
-#define UVBufferIdx PushConstants.indices[9]
-
 row_major matrix World : register(b1); // ObjectConstants bound to Slot 2
 
 VSOutput VS(uint vertexID : SV_VertexID)
 {
     VSOutput output;
 
-    StructuredBuffer<float3> positions = ResourceDescriptorHeap[PosBufferIdx];
-    StructuredBuffer<float3> normals = ResourceDescriptorHeap[NormBufferIdx];
-    StructuredBuffer<float2> uvs = ResourceDescriptorHeap[UVBufferIdx];
+    // Look up mesh buffer indices from MeshRegistry
+    StructuredBuffer<MeshPartEntry> meshRegistry = ResourceDescriptorHeap[MeshRegistryIdx];
+    MeshPartEntry part = meshRegistry[MeshPartId];
+
+    StructuredBuffer<float3> positions = ResourceDescriptorHeap[part.PosBufferIdx];
+    StructuredBuffer<float3> normals = ResourceDescriptorHeap[part.NormBufferIdx];
+    StructuredBuffer<float2> uvs = ResourceDescriptorHeap[part.UVBufferIdx];
 
     float3 pos = positions[vertexID];
     float3 norm = normals[vertexID];
