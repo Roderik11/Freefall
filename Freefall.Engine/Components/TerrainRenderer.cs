@@ -1300,7 +1300,7 @@ namespace Freefall.Components
             var frustum = new Frustum(vpMatrix);
             var planes = frustum.GetPlanesAsVector4();
 
-            // Transform frustum planes from world → terrain local space
+            // Transform frustum planes from world to terrain local space
             var terrainPos = Transform.Position;
             for (int i = 0; i < planes.Length; i++)
             {

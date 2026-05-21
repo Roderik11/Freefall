@@ -52,10 +52,13 @@ namespace Freefall.Graphics
         public ComputeShader DirectionalLightCS { get; private set; } = null!;
         private int _kDirectionalLight;
         
-        // Point light compute shader (tiled culling + PBR)
+        // Point light compute shader (Hi-Z pre-cull + tiled culling + PBR)
         private ComputeShader _pointLightCS = null!;
+        private int _kCullLights;
         private int _kPointLight;
         private GraphicsBuffer[]? _pointLightBuffers; // per-frame upload StructuredBuffer<PointLightData>
+        private GraphicsBuffer? _visibleLightIndices;  // UAV: compacted visible light indices
+        private GraphicsBuffer? _visibleLightCount;    // UAV: atomic counter (RWByteAddressBuffer)
         private const int MaxPointLights = 256;
         
         private bool _isFirstFrame = true;
@@ -111,12 +114,17 @@ namespace Freefall.Graphics
 
             // Compile point light compute shader
             _pointLightCS = new ComputeShader("light_point_cs.hlsl");
+            _kCullLights = _pointLightCS.FindKernel("CSCullLights");
             _kPointLight = _pointLightCS.FindKernel("CSPointLight");
             
             // Per-frame upload buffers for point light data
             _pointLightBuffers = new GraphicsBuffer[FrameCount];
             for (int i = 0; i < FrameCount; i++)
                 _pointLightBuffers[i] = GraphicsBuffer.CreateUpload<Components.PointLight.PointLightData>(MaxPointLights, mapped: true);
+            
+            // Phase 0 output buffers for light culling
+            _visibleLightIndices = GraphicsBuffer.CreateStructured<uint>(MaxPointLights, uav: true);
+            _visibleLightCount = GraphicsBuffer.CreateRaw(1, uav: true, clearable: true);
 
             // Shadow Map Array (Cascades)
             ShadowTextureArray = new DepthTextureArray2D(2048, 2048, 4);
@@ -615,7 +623,7 @@ namespace Freefall.Graphics
                  };
              }
 
-             // Set push constants
+             // Push constants shared by both kernels
              var desc = LightBuffer.Native.Description;
              _pointLightCS.SetPushConstant("NormalTex", Normals.BindlessIndex);
              _pointLightCS.SetPushConstant("DepthTex", Depth.BindlessIndex);
@@ -627,11 +635,18 @@ namespace Freefall.Graphics
              _pointLightCS.SetPushConstant("ScreenWidth", (uint)desc.Width);
              _pointLightCS.SetPushConstant("ScreenHeight", (uint)desc.Height);
 
+             // Hi-Z + visible light buffer push constants
+             uint hiZSrv = (HiZPyramid != null && HiZPyramid.Ready && !Engine.Settings.DisableHiZ)
+                 ? HiZPyramid.FullSRV : 0u;
+             _pointLightCS.SetPushConstant("HiZTex", hiZSrv);
+             _pointLightCS.SetPushConstant("VisibleLightUAV", _visibleLightIndices!.UavIndex);
+             _pointLightCS.SetPushConstant("VisibleLightCountUAV", _visibleLightCount!.UavIndex);
+
              // Bind root signature, descriptor heap, and SceneConstants cbuffer (b0)
              list.SetComputeRootSignature(Engine.Device.GlobalRootSignature);
              list.SetDescriptorHeaps(1, new[] { Engine.Device.SrvHeap });
              
-             // Bind SceneConstants (b0) for CameraInverse — reuse from matDirectionalLight
+             // Bind SceneConstants (b0) for CameraInverse + CameraRelativeVP
              foreach (var cb in matDirectionalLight.ConstantBuffers)
              {
                  if (cb.Slot >= 0)
@@ -642,6 +657,21 @@ namespace Freefall.Graphics
                  }
              }
 
+             // Phase 0: Cull lights (frustum + Hi-Z)
+             _visibleLightCount!.ClearUAV(list, new Vortice.Mathematics.Int4(0, 0, 0, 0));
+             list.ResourceBarrier(new ResourceBarrier(
+                 new ResourceUnorderedAccessViewBarrier(_visibleLightCount.Native)));
+
+             uint cullGroups = ((uint)count + 63) / 64;
+             _pointLightCS.Dispatch(_kCullLights, list, cullGroups);
+
+             // Barrier: Phase 0 writes must complete before Phase 1 reads
+             list.ResourceBarrier(new[] {
+                 new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(_visibleLightIndices!.Native)),
+                 new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(_visibleLightCount.Native))
+             });
+
+             // Phase 1+2: Tiled culling + PBR lighting
              uint groupsX = ((uint)desc.Width + 7) / 8;
              uint groupsY = ((uint)desc.Height + 7) / 8;
              _pointLightCS.Dispatch(_kPointLight, list, groupsX, groupsY);
@@ -921,6 +951,8 @@ namespace Freefall.Graphics
             _pointLightCS?.Dispose();
             if (_pointLightBuffers != null)
                 foreach (var b in _pointLightBuffers) b?.Dispose();
+            _visibleLightIndices?.Dispose();
+            _visibleLightCount?.Dispose();
         }
     }
 }

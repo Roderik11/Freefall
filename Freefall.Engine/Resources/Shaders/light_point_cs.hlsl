@@ -1,12 +1,14 @@
-// Point Light Compute Shader — tiled culling + PBR lighting
-// [numthreads(8, 8, 1)] = 64 threads per tile
+// Point Light Compute Shader — Hi-Z pre-cull + tiled culling + PBR lighting
 //
+// Phase 0 (CSCullLights): Per-light frustum + Hi-Z occlusion test.
+//          Outputs a compacted list of visible light indices.
 // Phase 1: Tile builds 4 frustum planes from its screen-space bounds.
-//          All 64 threads cooperatively test lights against the tile frustum,
-//          building a compact per-tile light list in groupshared memory.
+//          All 64 threads cooperatively test visible lights against the tile
+//          frustum, building a compact per-tile light list in groupshared memory.
 // Phase 2: Each thread loads its pixel's G-buffer and loops only over
 //          the tile's accepted lights.
 
+#pragma kernel CSCullLights
 #pragma kernel CSPointLight
 
 cbuffer PushConstants : register(b3)
@@ -20,6 +22,9 @@ cbuffer PushConstants : register(b3)
     uint LightCountIdx;     // raw uint — number of active lights
     uint ScreenWidthIdx;
     uint ScreenHeightIdx;
+    uint HiZTexIdx;         // Hi-Z pyramid SRV (0 = disabled)
+    uint VisibleLightUAVIdx;  // UAV: compacted visible light indices
+    uint VisibleLightCountUAVIdx; // UAV: atomic counter (RWByteAddressBuffer)
 };
 
 #include "common.fx"
@@ -98,6 +103,105 @@ bool SphereFrustumTest(float3 center, float radius, float4 planes[4])
     return true;
 }
 
+// ── Phase 0: Per-light frustum + Hi-Z cull ────────────────────────────────
+// One thread per light. Outputs compacted visible light index list.
+[numthreads(64, 1, 1)]
+void CSCullLights(uint3 dtid : SV_DispatchThreadID)
+{
+    uint li = dtid.x;
+    if (li >= LightCountIdx) return;
+
+    StructuredBuffer<PointLightData> lightData = ResourceDescriptorHeap[LightDataIdx];
+    PointLightData light = lightData[li];
+
+    // ── View frustum test ──
+    // Extract 6 planes from CameraRelativeVP (row-major, mul(v, M) convention)
+    // Column j = float4(M[0][j], M[1][j], M[2][j], M[3][j])
+    float4x4 vp = CameraRelativeVP;
+    float4 col0 = float4(vp[0][0], vp[1][0], vp[2][0], vp[3][0]);
+    float4 col1 = float4(vp[0][1], vp[1][1], vp[2][1], vp[3][1]);
+    float4 col2 = float4(vp[0][2], vp[1][2], vp[2][2], vp[3][2]);
+    float4 col3 = float4(vp[0][3], vp[1][3], vp[2][3], vp[3][3]);
+
+    float4 frustumPlanes[6];
+    frustumPlanes[0] = col3 + col0; // left
+    frustumPlanes[1] = col3 - col0; // right
+    frustumPlanes[2] = col3 + col1; // bottom
+    frustumPlanes[3] = col3 - col1; // top
+    frustumPlanes[4] = col2;        // near
+    frustumPlanes[5] = col3 - col2; // far
+
+    [unroll]
+    for (uint p = 0; p < 6; p++)
+    {
+        float len = length(frustumPlanes[p].xyz);
+        if (len > 0) frustumPlanes[p] /= len;
+    }
+
+    [unroll]
+    for (uint f = 0; f < 6; f++)
+    {
+        if (dot(frustumPlanes[f].xyz, light.Position) + frustumPlanes[f].w < -light.Range)
+            return;
+    }
+
+    // ── Hi-Z occlusion test ──
+    if (HiZTexIdx != 0)
+    {
+        float4 clipCenter = mul(float4(light.Position, 1.0), CameraRelativeVP);
+
+        // Only test if center is in front of the camera
+        if (clipCenter.w > 0)
+        {
+            float3 ndc = clipCenter.xyz / clipCenter.w;
+            float2 uv = ndc.xy * float2(0.5, -0.5) + 0.5;
+
+            // Only test if center projects on screen
+            if (all(uv >= 0.0) && all(uv <= 1.0))
+            {
+                Texture2D<float> hiZ = ResourceDescriptorHeap[HiZTexIdx];
+                float w, h, levels;
+                hiZ.GetDimensions(0, w, h, levels);
+
+                float projScale = max(abs(CameraRelativeVP._m11), 0.001);
+                float screenRadius = (light.Range * projScale / clipCenter.w) * h * 0.5;
+
+                float mipLevel = ceil(log2(max(screenRadius * 2.0, 1.0)));
+                mipLevel = min(mipLevel, levels - 1.0);
+                uint mip = (uint)mipLevel;
+
+                float mipW, mipH, unused;
+                hiZ.GetDimensions(mip, mipW, mipH, unused);
+                float2 mipSize = float2(mipW, mipH);
+
+                float2 texCoordFloat = uv * mipSize - 0.5;
+                int2 baseCoord = int2(texCoordFloat);
+                int2 maxCoord = int2(mipSize) - 1;
+
+                float d0 = hiZ.Load(int3(clamp(baseCoord,             int2(0,0), maxCoord), mip));
+                float d1 = hiZ.Load(int3(clamp(baseCoord + int2(1,0), int2(0,0), maxCoord), mip));
+                float d2 = hiZ.Load(int3(clamp(baseCoord + int2(0,1), int2(0,0), maxCoord), mip));
+                float d3 = hiZ.Load(int3(clamp(baseCoord + int2(1,1), int2(0,0), maxCoord), mip));
+
+                float sampledDepth = max(max(d0, d1), max(d2, d3));
+                float sphereNearestDepth = clipCenter.w - light.Range;
+
+                if (sphereNearestDepth > sampledDepth)
+                    return; // fully occluded
+            }
+        }
+    }
+
+    // ── Survived — append to visible list ──
+    RWByteAddressBuffer countBuf = ResourceDescriptorHeap[VisibleLightCountUAVIdx];
+    RWStructuredBuffer<uint> visibleOut = ResourceDescriptorHeap[VisibleLightUAVIdx];
+
+    uint slot;
+    countBuf.InterlockedAdd(0, 1, slot);
+    if (slot < 256)
+        visibleOut[slot] = li;
+}
+
 // ── Main kernel ───────────────────────────────────────────────────────────
 [numthreads(TILE_SIZE, TILE_SIZE, 1)]
 void CSPointLight(
@@ -107,7 +211,11 @@ void CSPointLight(
 {
     uint2 px = dispatchThreadId.xy;
     float2 screenSize = float2(ScreenWidthIdx, ScreenHeightIdx);
-    uint lightCount = LightCountIdx;
+
+    // Read visible light count from Phase 0 output
+    RWByteAddressBuffer countBuf = ResourceDescriptorHeap[VisibleLightCountUAVIdx];
+    uint lightCount = countBuf.Load(0);
+    lightCount = min(lightCount, 256);
 
     // ── Phase 1: Tile-level light culling ─────────────────────────────────
     if (groupIndex == 0)
@@ -117,28 +225,24 @@ void CSPointLight(
 
     if (lightCount > 0)
     {
-        // Build tile frustum planes (all threads compute the same result,
-        // but it's cheaper than branching + LDS broadcast for 4 planes)
-        // Planes are in VIEW SPACE — light positions need to be transformed.
-        // Actually, CameraInverse maps NDC→camera-relative world space.
-        // Our light positions are already camera-relative world space.
-        // So we build planes in camera-relative world space using CameraInverse.
         float4 tilePlanes[4];
         BuildTileFrustumPlanes(groupId.xy, screenSize, CameraInverse, tilePlanes);
 
-        // Each thread tests a subset of lights (round-robin)
+        // Read from the compacted visible light list
         StructuredBuffer<PointLightData> lightData = ResourceDescriptorHeap[LightDataIdx];
+        RWStructuredBuffer<uint> visibleIndices = ResourceDescriptorHeap[VisibleLightUAVIdx];
 
-        for (uint li = groupIndex; li < lightCount; li += (TILE_SIZE * TILE_SIZE))
+        for (uint vi = groupIndex; vi < lightCount; vi += (TILE_SIZE * TILE_SIZE))
         {
-            PointLightData light = lightData[li];
+            uint lightIdx = visibleIndices[vi];
+            PointLightData light = lightData[lightIdx];
 
             if (SphereFrustumTest(light.Position, light.Range, tilePlanes))
             {
                 uint slot;
                 InterlockedAdd(g_TileLightCount, 1, slot);
                 if (slot < MAX_LIGHTS_PER_TILE)
-                    g_TileLightIndices[slot] = li;
+                    g_TileLightIndices[slot] = lightIdx;
             }
         }
     }
