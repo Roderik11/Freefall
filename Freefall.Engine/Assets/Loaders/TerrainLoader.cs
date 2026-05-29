@@ -64,6 +64,9 @@ namespace Freefall.Assets.Loaders
 
                 terrain.Name = name;
 
+                // Migrate old power-of-2 resolutions to power-of-2+1
+                terrain.MigrateResolution();
+
                 // Build CPU-side height field from the resolved Heightmap texture
                 if (terrain.Heightmap != null && !string.IsNullOrEmpty(terrain.Heightmap.Guid))
                 {

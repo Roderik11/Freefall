@@ -616,14 +616,26 @@ namespace Freefall.Components
                 var bytes = Terrain.PendingBakedHeightmapBytes;
                 Terrain.PendingBakedHeightmapBytes = null; // consumed
 
-                var tex = baker.UploadBakedHeightmap(bytes, Terrain.HeightmapResolution);
-                if (tex != null)
+                int expectedRes = Terrain.EffectiveHeightmapResolution;
+                int cachedRes = (int)Math.Sqrt(bytes.Length / 2); // R16_Float = 2 bpp
+
+                if (cachedRes == expectedRes)
                 {
-                    Terrain.BakedHeightmap = tex;
-                    Terrain.ConsumeFlags(TerrainDirtyFlags.HeightBake); // loaded from cache, skip bake
-                    _heightRangePyramidBuilt = false;
-                    Terrain.MarkForUpdate(TerrainDirtyFlags.AlbedoBake);
-                    _needHeightFieldReadback = true;
+                    var tex = baker.UploadBakedHeightmap(bytes, expectedRes);
+                    if (tex != null)
+                    {
+                        Terrain.BakedHeightmap = tex;
+                        Terrain.ConsumeFlags(TerrainDirtyFlags.HeightBake); // loaded from cache, skip bake
+                        _heightRangePyramidBuilt = false;
+                        Terrain.MarkForUpdate(TerrainDirtyFlags.AlbedoBake);
+                        _needHeightFieldReadback = true;
+                    }
+                }
+                else
+                {
+                    // Resolution mismatch (migration from power-of-2) — discard cache, force rebake
+                    Debug.Log($"[TerrainRenderer] Cached heightmap {cachedRes}x{cachedRes} != expected {expectedRes}x{expectedRes}, forcing rebake");
+                    Terrain.MarkForUpdate(TerrainDirtyFlags.HeightBake);
                 }
             }
 
@@ -639,7 +651,7 @@ namespace Freefall.Components
                     {
                         var p = paint; // capture for lambda
                         baker.UploadControlMap(TerrainBaker.ControlMapTarget.Height, 0,
-                            paint.PendingControlMapBytes, Terrain.HeightmapResolution,
+                            paint.PendingControlMapBytes, Terrain.EffectiveHeightmapResolution,
                             tex => p.ControlMap = tex);
                         paint.PendingControlMapBytes = null; // consumed
                     }
@@ -678,7 +690,7 @@ namespace Freefall.Components
                         var l = layer;
                         int idx = i;
                         baker2.UploadControlMap(TerrainBaker.ControlMapTarget.Splatmap, idx,
-                            layer.PendingControlMapBytes, Terrain.HeightmapResolution,
+                            layer.PendingControlMapBytes, Terrain.EffectiveSplatmapResolution,
                             tex => l.ControlMap = tex);
                         layer.PendingControlMapBytes = null;
                         Terrain.MarkForUpdate(TerrainDirtyFlags.SplatPack);
@@ -697,7 +709,7 @@ namespace Freefall.Components
                         var d = deco;
                         int idx = i;
                         baker2.UploadControlMap(TerrainBaker.ControlMapTarget.Density, idx,
-                            deco.PendingControlMapBytes, Terrain.HeightmapResolution,
+                            deco.PendingControlMapBytes, Terrain.EffectiveDecorationMapResolution,
                             tex => d.ControlMap = tex);
                         deco.PendingControlMapBytes = null;
                     }
@@ -729,7 +741,7 @@ namespace Freefall.Components
 
                 if (hasAny)
                 {
-                    int res = Terrain.HeightmapResolution;
+                    int res = Terrain.EffectiveSplatmapResolution;
                     int layerCount = Terrain.Layers.Count;
                     int sliceCount = (layerCount + 3) / 4;
 
@@ -761,7 +773,7 @@ namespace Freefall.Components
 
             // Set shared material params
             material.SetParameter("CameraPos", Camera.Main.Position);
-            material.SetParameter("HeightTexel", 1.0f / (heightmap != null ? Terrain.HeightmapResolution : 1024));
+            material.SetParameter("HeightTexel", 1.0f / (heightmap != null ? Terrain.EffectiveHeightmapResolution : 1024));
             material.SetParameter("MaxHeight", Terrain.MaxHeight);
             material.SetParameter("TerrainSize", Terrain.TerrainSize);
             material.SetParameter("TerrainOrigin", new Vector2(Transform.WorldPosition.X, Transform.WorldPosition.Z));
@@ -1857,7 +1869,7 @@ namespace Freefall.Components
                 return;
 
             var device = Engine.Device;
-            int resolution = Terrain.HeightmapResolution;
+            int resolution = Terrain.EffectiveDecorationMapResolution;
 
             // Create or recreate control texture only when resolution changes
             bool freshTexture = false;
@@ -2152,7 +2164,7 @@ namespace Freefall.Components
         {
             if (_decoBuffersCreated) return;
 
-            int resolution = Terrain?.HeightmapResolution ?? 256;
+            int resolution = Terrain?.EffectiveDecorationMapResolution ?? 256;
             int maxTiles = resolution * resolution;
 
             // Worst-case instances: ~64 per tile max (64 threads/group)
@@ -2284,8 +2296,8 @@ namespace Freefall.Components
             var cs = _grassCS!;
 
             float range = Terrain.DecorationRadius;
-            int controlW = _decoControlTex != null ? (int)_decoControlTex.Description.Width : Terrain.HeightmapResolution;
-            int controlH = _decoControlTex != null ? (int)_decoControlTex.Description.Height : Terrain.HeightmapResolution;
+            int controlW = _decoControlTex != null ? (int)_decoControlTex.Description.Width : Terrain.EffectiveDecorationMapResolution;
+            int controlH = _decoControlTex != null ? (int)_decoControlTex.Description.Height : Terrain.EffectiveDecorationMapResolution;
             float tileSize = Terrain.TerrainSize.X / controlW;
 
 

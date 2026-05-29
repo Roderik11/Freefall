@@ -127,6 +127,7 @@ namespace Freefall.Animation
 
             if (Clip != null)
             {
+                temp = bone.BindPose;
                 Clip.GetBonePose(bone, GetTimeElapsed(pb), ref temp);
                 blendPose.Position = Vector3.Lerp(blendPose.Position, temp.Position, weight);
                 blendPose.Scale = Vector3.Lerp(blendPose.Scale, temp.Scale, weight);

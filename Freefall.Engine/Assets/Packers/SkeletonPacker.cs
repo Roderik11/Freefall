@@ -12,7 +12,7 @@ namespace Freefall.Animation
     [AssetPacker(".skel")]
     public class SkeletonPacker : AssetPacker<Skeleton>
     {
-        public override int Version => 2;
+        public override int Version => 3;
 
         public override void Pack(BinaryWriter w, Skeleton skeleton)
         {
@@ -20,6 +20,8 @@ namespace Freefall.Animation
 
             foreach (var bone in skeleton.Bones)
                 bone.Write(w);
+
+            w.Write(skeleton.FlipXZ);
         }
 
         public override Skeleton Unpack(BinaryReader r, int version)
@@ -36,7 +38,8 @@ namespace Freefall.Animation
                 names[i] = bone.Name;
             }
 
-            return new Skeleton { Bones = bones, BoneNames = names };
+            bool flipXZ = version >= 3 && r.BaseStream.Position < r.BaseStream.Length && r.ReadBoolean();
+            return new Skeleton { Bones = bones, BoneNames = names, FlipXZ = flipXZ };
         }
     }
 }

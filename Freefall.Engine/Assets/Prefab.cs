@@ -50,7 +50,7 @@ namespace Freefall.Assets
             //   - Deserializes entities (Entity constructor auto-generates fresh UIDs + registers)
             //   - Resolves UID cross-references within the prefab
             //   - Resolves asset references via LoadByGuid
-            var serializer = new EntitySerializer();
+            var serializer = new EntitySerializer { DuplicateMode = true };
             var entities = serializer.LoadFromBytes(SourceYaml);
 
             if (entities.Count == 0)
@@ -89,7 +89,7 @@ namespace Freefall.Assets
         {
             if (SourceYaml == null || SourceYaml.Length == 0) return;
 
-            var serializer = new EntitySerializer();
+            var serializer = new EntitySerializer { DuplicateMode = true };
             var prefabEntities = serializer.LoadFromBytes(SourceYaml, skipPrefabHydration: true);
 
             if (prefabEntities.Count == 0) return;
@@ -280,7 +280,7 @@ namespace Freefall.Assets
             if (SourceYaml == null || SourceYaml.Length == 0) return 0;
 
             // Deserialize once
-            var serializer = new EntitySerializer();
+            var serializer = new EntitySerializer { DuplicateMode = true };
             var templateEntities = serializer.LoadFromBytes(SourceYaml, skipPrefabHydration: true);
             if (templateEntities.Count == 0) return 0;
 

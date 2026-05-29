@@ -11,6 +11,28 @@ using Vortice.DXGI;
 
 namespace Freefall.Assets
 {
+    /// <summary>Power-of-2+1 heightmap resolutions for edge-vertex alignment.</summary>
+    public enum HeightmapResolution
+    {
+        _129  = 129,
+        _257  = 257,
+        _513  = 513,
+        _1025 = 1025,
+        _2049 = 2049,
+        _4097 = 4097,
+    }
+
+    /// <summary>Power-of-2 control map resolutions. Inherit = use heightmap resolution.</summary>
+    public enum ControlMapResolution
+    {
+        Inherit = 0,
+        _256  = 256,
+        _512  = 512,
+        _1024 = 1024,
+        _2048 = 2048,
+        _4096 = 4096,
+    }
+
     public enum DecoratorMode { Mesh, Billboard, Cross }
 
     /// <summary>
@@ -102,9 +124,47 @@ namespace Freefall.Assets
         }
 
         /// <summary>
-        /// Resolution of the baked heightmap (power of 2). Configurable per-terrain.
+        /// Resolution of the baked heightmap (power-of-2+1). Configurable per-terrain.
         /// </summary>
-        public int HeightmapResolution = 1024;
+        public HeightmapResolution HeightmapResolution = HeightmapResolution._1025;
+
+        /// <summary>Resolution of splatmap control maps. Inherit = use heightmap resolution.</summary>
+        public ControlMapResolution SplatmapResolution = ControlMapResolution.Inherit;
+
+        /// <summary>Resolution of decoration density maps. Inherit = use heightmap resolution.</summary>
+        public ControlMapResolution DecorationMapResolution = ControlMapResolution.Inherit;
+
+        /// <summary>Effective heightmap resolution as int.</summary>
+        [Reflection.DontSerialize]
+        [JsonIgnore]
+        public int EffectiveHeightmapResolution => (int)HeightmapResolution;
+
+        /// <summary>Effective splatmap resolution (falls back to heightmap).</summary>
+        [Reflection.DontSerialize]
+        [JsonIgnore]
+        public int EffectiveSplatmapResolution =>
+            SplatmapResolution != ControlMapResolution.Inherit ? (int)SplatmapResolution : (int)HeightmapResolution;
+
+        /// <summary>Effective decoration map resolution (falls back to heightmap).</summary>
+        [Reflection.DontSerialize]
+        [JsonIgnore]
+        public int EffectiveDecorationMapResolution =>
+            DecorationMapResolution != ControlMapResolution.Inherit ? (int)DecorationMapResolution : (int)HeightmapResolution;
+
+        /// <summary>Migrate old power-of-2 heightmap resolution to nearest power-of-2+1.</summary>
+        internal void MigrateResolution()
+        {
+            int raw = (int)HeightmapResolution;
+            if (raw > 1 && !Enum.IsDefined(typeof(HeightmapResolution), HeightmapResolution))
+            {
+                // Snap to next power-of-2+1: e.g. 1024 → 1025, 512 → 513
+                int po2 = 1;
+                while (po2 < raw) po2 <<= 1;
+                var migrated = (HeightmapResolution)(po2 + 1);
+                Debug.Log($"[Terrain] Migrating HeightmapResolution {raw} → {(int)migrated}");
+                HeightmapResolution = migrated;
+            }
+        }
 
         /// <summary>
         /// Non-destructive height layer stack. Composited bottom-to-top via GPU bake.

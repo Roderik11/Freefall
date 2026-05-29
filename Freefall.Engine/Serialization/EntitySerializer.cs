@@ -22,6 +22,7 @@ namespace Freefall.Serialization
     public class EntitySerializer
     {
         private readonly YAMLSerializer _yaml = new();
+        public bool DuplicateMode { get; set; } = false;
 
         // ── Save ──────────────────────────────────────────────────
 
@@ -95,6 +96,8 @@ namespace Freefall.Serialization
             // No LoadByGuid calls during parse = no parser corruption.
             _yaml.DeferAssetLoading = true;
             _yaml.DeferredUniqueIdRefs.Clear();
+            _yaml.DuplicateMode = DuplicateMode;
+            _yaml.DuplicateUidMap.Clear();
 
             List<object> objects;
             try
@@ -104,6 +107,7 @@ namespace Freefall.Serialization
             finally
             {
                 _yaml.DeferAssetLoading = false;
+                _yaml.DuplicateMode = false;
             }
 
             var entities = new List<Entity>();
@@ -134,6 +138,24 @@ namespace Freefall.Serialization
                                 deferredRefs[i] = fixup;
                             }
                         }
+
+                        // Retarget DuplicateUidMap mapping from temp Transform to entity's real Transform
+                        if (DuplicateMode)
+                        {
+                            ulong oldTransformUid = 0;
+                            foreach (var kvp in _yaml.DuplicateUidMap)
+                            {
+                                if (kvp.Value == t.UID)
+                                {
+                                    oldTransformUid = kvp.Key;
+                                    break;
+                                }
+                            }
+                            if (oldTransformUid != 0)
+                            {
+                                _yaml.DuplicateUidMap[oldTransformUid] = current.Transform.UID;
+                            }
+                        }
                     }
                     else
                     {
@@ -160,7 +182,13 @@ namespace Freefall.Serialization
             // Resolve deferred IUniqueId refs (entities + components)
             foreach (var deferred in _yaml.DeferredUniqueIdRefs)
             {
-                if (uidLookup.TryGetValue(deferred.UID, out var resolved))
+                ulong targetUid = deferred.UID;
+                if (DuplicateMode && _yaml.DuplicateUidMap.TryGetValue(targetUid, out var newUid))
+                {
+                    targetUid = newUid;
+                }
+
+                if (uidLookup.TryGetValue(targetUid, out var resolved))
                 {
                     try
                     {
@@ -169,14 +197,14 @@ namespace Freefall.Serialization
                     catch (Exception ex)
                     {
                         Debug.LogWarning("EntitySerializer",
-                            $"UID ref resolve failed: UID {deferred.UID} on " +
+                            $"UID ref resolve failed: UID {targetUid} (original: {deferred.UID}) on " +
                             $"{deferred.Parent.GetType().Name}.{deferred.Field.Name}: {ex.Message}");
                     }
                 }
                 else
                 {
                     Debug.LogWarning("EntitySerializer",
-                        $"UID ref not found: UID {deferred.UID} for " +
+                        $"UID ref not found: UID {targetUid} (original: {deferred.UID}) for " +
                         $"{deferred.Parent.GetType().Name}.{deferred.Field.Name}");
                 }
             }

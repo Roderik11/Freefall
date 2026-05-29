@@ -81,6 +81,7 @@ namespace Freefall.Assets.Importers
         [NonSerialized] private Dictionary<string, string[]> _groupMaterialNames = new();
 
         private bool isDAE;
+        private float _daeUnitScale = 1f;
 
         /// <summary>
         /// Full import: produce all artifacts (mesh + animations) from a source file.
@@ -104,6 +105,17 @@ namespace Freefall.Assets.Importers
             _currentFilePath = filepath;
             var scene = LoadScene(filepath, out float scale);
             var name = System.IO.Path.GetFileNameWithoutExtension(filepath);
+
+            // DAE unit scale: Assimp applies unit conversion to node transforms
+            // but NOT to mesh vertices. Extract the scale from the root node
+            // so we can apply it to vertices (for correct bounding spheres).
+            _daeUnitScale = 1f;
+            if (isDAE)
+            {
+                var rootMat = ToMatrix(scene.RootNode.Transform);
+                Matrix4x4.Decompose(rootMat, out var rs, out _, out _);
+                _daeUnitScale = rs.X; // e.g. 0.01 for cm→m
+            }
 
             // Generate skeleton first (needed by both mesh and animation extraction)
             if (ImportSkeleton || ImportMesh)
@@ -131,8 +143,10 @@ namespace Freefall.Assets.Importers
                 {
                     Name = name,
                     Bones = _skeleton.ToArray(),
-                    BoneNames = _boneNames.ToArray()
+                    BoneNames = _boneNames.ToArray(),
+                    FlipXZ = !isDAE
                 };
+
                 result.Artifacts.Add(new ImportArtifact
                 {
                     Name = name,
@@ -142,18 +156,18 @@ namespace Freefall.Assets.Importers
             }
 
             // ── Animations ──
-            if (ImportAnimations)
+            if (ImportAnimations && scene.HasAnimations)
             {
-                var animImporter = new AnimationClipImporter();
-                try
+                foreach (var anim in scene.Animations)
                 {
-                    var clip = animImporter.Load(filepath);
+                    var clip = ExtractAnimation(anim, scale);
                     if (clip.Channels.Count > 0)
                     {
                         var animName = clip.Name;
                         if (string.IsNullOrEmpty(animName) || _boneNames.Contains(animName))
                             animName = name;
                         clip.Name = animName;
+
 
                         result.Artifacts.Add(new ImportArtifact
                         {
@@ -162,10 +176,6 @@ namespace Freefall.Assets.Importers
                             Data = clip
                         });
                     }
-                }
-                catch (Exception ex)
-                {
-                    Debug.Log($"[ModelImporter] No animation data in '{name}': {ex.Message}");
                 }
             }
 
@@ -323,9 +333,7 @@ namespace Freefall.Assets.Importers
             try
             {
                 isDAE = filepath.ToLowerInvariant().EndsWith(".dae");
-                // Unit conversion: DAE defaults to 0.01, FBX to 1.0
-                // If Scale is explicitly set (non-1), use it directly. Otherwise use convention.
-                scale = isDAE ? Scale * 0.01f :  Scale;
+                scale = Scale;
 
                 var importer = new AssimpContext();
 
@@ -488,7 +496,7 @@ namespace Freefall.Assets.Importers
 
                     if (isDAE)
                     {
-                        positions.Add(new Vector3(pos.X, pos.Y, pos.Z));
+                        positions.Add(new Vector3(pos.X, pos.Y, pos.Z) * _daeUnitScale);
                         normals.Add(new Vector3(norm.X, norm.Y, norm.Z));
                     }
                     else
@@ -786,6 +794,7 @@ namespace Freefall.Assets.Importers
                // if (lods.Count > 1)
                //     Debug.Log("ModelImporter", $"Group '{groupName}': {lods.Count} LOD levels");
 
+
                 result.Add((groupName, data));
 
                 // Store per-group data for PostImport prefab generation
@@ -856,9 +865,9 @@ namespace Freefall.Assets.Importers
         }
 
         /// <summary>
-        /// Parse animations only from a model file.
+        /// Parse animations only from an Assimp scene.
         /// </summary>
-        public List<AnimationClip> ExtractAnimations(Scene scene, string filepath, ImportResult result, float scale)
+        public List<AnimationClip> ExtractAnimations(Scene scene, float scale)
         {
             var clips = new List<AnimationClip>();
             if (scene.HasAnimations)
@@ -1298,11 +1307,8 @@ namespace Freefall.Assets.Importers
                     var posKeys = new List<VectorKey>(nodeChannel.PositionKeyCount);
                     foreach (var key in nodeChannel.PositionKeys)
                     {
-                        posKeys.Add(new VectorKey
-                        {
-                            Time = (float)key.Time,
-                            Value = new Vector3(key.Value.X, key.Value.Y, key.Value.Z) * scale
-                        });
+                        var p = new Vector3(key.Value.X, key.Value.Y, key.Value.Z) * scale;
+                        posKeys.Add(new VectorKey { Time = (float)key.Time, Value = p });
                     }
                     channel.Position = new VectorKeys(posKeys);
                 }
@@ -1313,11 +1319,8 @@ namespace Freefall.Assets.Importers
                     var rotKeys = new List<QuaternionKey>(nodeChannel.RotationKeyCount);
                     foreach (var key in nodeChannel.RotationKeys)
                     {
-                        rotKeys.Add(new QuaternionKey
-                        {
-                            Time = (float)key.Time,
-                            Value = new System.Numerics.Quaternion(key.Value.X, key.Value.Y, key.Value.Z, key.Value.W)
-                        });
+                        var q = new System.Numerics.Quaternion(key.Value.X, key.Value.Y, key.Value.Z, key.Value.W);
+                        rotKeys.Add(new QuaternionKey { Time = (float)key.Time, Value = q });
                     }
                     channel.Rotation = new QuaternionKeys(rotKeys);
                 }
@@ -1340,7 +1343,6 @@ namespace Freefall.Assets.Importers
                 clip.AddChannel(channel);
             }
 
-            //Debug.Log("ModelImporter", $"Animation '{clip.Name}': {clip.DurationSeconds:F2}s, {clip.Channels.Count} channels");
             return clip;
         }
 
@@ -1360,16 +1362,6 @@ namespace Freefall.Assets.Importers
             ValidateBones(scene);
             FlattenHierarchy(scene.RootNode);
 
-            if (_skeleton.Count > 0)
-            {
-                Debug.Log("ModelImporter", $"Skeleton: {_skeleton.Count} bones");
-                //for (int i = 0; i < Math.Min(5, _skeleton.Count); i++)
-                //{
-                //    var bone = _skeleton[i];
-                //    string parentName = bone.Parent >= 0 ? _skeleton[bone.Parent].Name : "ROOT";
-                //    Debug.Log($"  [{i}] {bone.Name} → {parentName}");
-                //}
-            }
         }
 
         private void FindBones(Node node)
@@ -1422,16 +1414,27 @@ namespace Freefall.Assets.Importers
             Matrix4x4 bind = ToMatrix(node.Transform);
             Matrix4x4.Decompose(bind, out var s, out var r, out var t);
 
+
             newBone.BindPoseMatrix = bind;
             newBone.BindPose = new BonePose { Position = t, Rotation = r, Scale = s };
-
-
 
             newBone.Parent = node.Parent != null ? _boneNames.IndexOf(node.Parent.Name) : -1;
             _skeleton.Add(newBone);
 
             if (_bones.TryGetValue(node.Name, out Assimp.Bone? value))
-                newBone.OffsetMatrix = ToMatrix(value.OffsetMatrix);
+            {
+                var om = ToMatrix(value.OffsetMatrix);
+                // Compensate for DAE vertex unit scaling: OM_new = S(1/unit) * OM
+                // so that: vertex_m * OM_new = vertex_cm * OM (skinning unchanged)
+                if (isDAE && MathF.Abs(_daeUnitScale) > 1e-6f)
+                {
+                    float inv = 1f / _daeUnitScale;
+                    om.M11 *= inv; om.M12 *= inv; om.M13 *= inv; om.M14 *= inv;
+                    om.M21 *= inv; om.M22 *= inv; om.M23 *= inv; om.M24 *= inv;
+                    om.M31 *= inv; om.M32 *= inv; om.M33 *= inv; om.M34 *= inv;
+                }
+                newBone.OffsetMatrix = om;
+            }
             else
                 newBone.OffsetMatrix = Matrix4x4.Identity;
 
@@ -1452,6 +1455,20 @@ namespace Freefall.Assets.Importers
                 m.D1, m.D2, m.D3, m.D4
             );
             return Matrix4x4.Transpose(result);
+        }
+
+        /// <summary>
+        /// Conjugate a matrix by the -X/-Z flip: F * M * F where F = diag(-1,1,-1,1).
+        /// Makes skeleton/animation data consistent with FBX mesh vertex flip.
+        /// </summary>
+        private static Matrix4x4 FlipXZ(Matrix4x4 m)
+        {
+            return new Matrix4x4(
+                 m.M11, -m.M12,  m.M13, -m.M14,
+                -m.M21,  m.M22, -m.M23,  m.M24,
+                 m.M31, -m.M32,  m.M33, -m.M34,
+                -m.M41,  m.M42, -m.M43,  m.M44
+            );
         }
     }
 }

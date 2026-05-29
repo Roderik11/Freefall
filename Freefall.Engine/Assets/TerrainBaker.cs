@@ -93,13 +93,13 @@ namespace Freefall.Assets
             if (terrain.HeightLayers.Count == 0 && terrain.Stamps.Count == 0) return;
 
             EnsureInitialized();
-            EnsureTexture(terrain.HeightmapResolution);
+            EnsureTexture(terrain.EffectiveHeightmapResolution);
 
             var device = Engine.Device;
             cmd.SetComputeRootSignature(device.GlobalRootSignature);
             cmd.SetDescriptorHeaps(1, new[] { device.SrvHeap });
 
-            int res = terrain.HeightmapResolution;
+            int res = terrain.EffectiveHeightmapResolution;
             uint groups = (uint)((res + 7) / 8);
 
             // Phase 1: Clear
@@ -546,7 +546,7 @@ namespace Freefall.Assets
             if (pointCount == 0 || strokePoints == null) return;
 
             EnsureInitialized();
-            int res = terrain.HeightmapResolution;
+            int res = ResolveControlMapResolution(terrain, target);
             var key = (target, layerIndex);
             var gpu = EnsureControlMap(key, res, setControlMap);
 
@@ -615,7 +615,7 @@ namespace Freefall.Assets
             //Debug.Log($"[BrushRaycast] heightSRV={_heightSRV}, ray={rayOrigin}/{rayDir}, " +
             //          $"terrainOrig={terrainOrigin}, size={terrainSize}, maxH={maxHeight}, " +
             //          $"mode={mode}, str={strength}, rad={radius}");
-            int res = terrain.HeightmapResolution;
+            int res = ResolveControlMapResolution(terrain, target);
             var key = (target, layerIndex);
             var gpu = EnsureControlMap(key, res, setControlMap);
 
@@ -707,7 +707,7 @@ namespace Freefall.Assets
             if (sourceTexture == null || sourceTexture.BindlessIndex == 0) return;
 
             EnsureInitialized();
-            int res = terrain.HeightmapResolution;
+            int res = ResolveControlMapResolution(terrain, target);
             var key = (target, layerIndex);
             var gpu = EnsureControlMap(key, res, setControlMap);
             gpu.NeedsInitialClear = false;
@@ -725,6 +725,14 @@ namespace Freefall.Assets
             _cs.Dispatch(_kernelImportChannel, cmd, groups, groups);
             cmd.ResourceBarrierUnorderedAccessView(gpu.Texture);
         }
+
+        /// <summary>Returns the correct resolution for the given control map target.</summary>
+        private static int ResolveControlMapResolution(Terrain terrain, ControlMapTarget target) => target switch
+        {
+            ControlMapTarget.Splatmap => terrain.EffectiveSplatmapResolution,
+            ControlMapTarget.Density  => terrain.EffectiveDecorationMapResolution,
+            _                         => terrain.EffectiveHeightmapResolution,
+        };
 
         /// <summary>
         /// Ensures a ControlMap GPU texture exists for the given key.

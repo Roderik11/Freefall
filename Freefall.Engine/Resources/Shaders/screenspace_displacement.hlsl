@@ -90,12 +90,9 @@ void CSBuildMip(uint3 dtid : SV_DispatchThreadID)
 
 
 // ============================================================
-// Refine — Coarse-seeded Newton inversion
-//
-// For each pixel (destination), find which source pixel's
-// forward displacement maps to this destination.
-// Uses coarsest mip for initial estimate (smooth, no folds),
-// then refines with damped Newton iterations at full res.
+// Hierarchical Newton inversion: seed from identity, then ascend
+// through the mip pyramid from coarsest to finest resolution.
+// Each iteration refines the source estimate with finer displacement detail.
 // ============================================================
 [numthreads(8, 8, 1)]
 void CSRefine(uint3 dtid : SV_DispatchThreadID)

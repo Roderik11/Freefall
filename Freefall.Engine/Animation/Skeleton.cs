@@ -16,6 +16,9 @@ namespace Freefall.Animation
         /// <summary>Bone names in order, for fast lookup.</summary>
         public string[] BoneNames { get; set; } = [];
 
+        /// <summary>True when mesh vertices have -X/-Z flip (FBX). Animator conjugates bone matrices to match.</summary>
+        public bool FlipXZ { get; set; }
+
         /// <summary>Find a bone index by name. Returns -1 if not found.</summary>
         public int FindBone(string name)
         {

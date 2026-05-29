@@ -129,6 +129,7 @@ namespace Freefall.Animation
                 var child = Layers[i].Animation;
                 if (child.Clip == null) continue;
 
+                temp = bone.BindPose;
                 child.Clip.GetBonePose(bone, child.GetTimeElapsed(pb), ref temp);
 
                 if (cumWeight == 0)

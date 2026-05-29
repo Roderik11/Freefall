@@ -135,7 +135,7 @@ namespace Freefall.Components
                 // Pose + upload (only once per unique Skeleton per frame)
                 if (entry.Buffer.LastWriteFrame != Engine.FrameIndex)
                 {
-                    GetPose(bones, entry.StagingMatrices);
+                    GetPose(bones, entry.StagingMatrices, skeleton.FlipXZ);
                     entry.Buffer.BulkWrite(entry.StagingMatrices);
                     entry.Buffer.LastWriteFrame = Engine.FrameIndex;
                 }
@@ -202,7 +202,7 @@ namespace Freefall.Components
 
         // --- Pose computation ---
 
-        public void GetPose(Bone[] skeleton, Matrix4x4[] bones)
+        public void GetPose(Bone[] skeleton, Matrix4x4[] bones, bool flipXZ = false)
         {
             int count = skeleton.Length;
 
@@ -225,7 +225,25 @@ namespace Freefall.Components
             OnPostHierarchy?.Invoke(skeleton, bones);
 
             for (int i = 0; i < count; i++)
-                bones[i] = Matrix4x4.Transpose(skeleton[i].OffsetMatrix * bones[i]);
+            {
+                var m = skeleton[i].OffsetMatrix * bones[i];
+                if (flipXZ) m = ConjugateFlipXZ(m);
+                bones[i] = Matrix4x4.Transpose(m);
+            }
+        }
+
+        /// <summary>
+        /// Conjugate a matrix by F = diag(-1,1,-1,1): F * M * F.
+        /// Converts bone matrices from Assimp LH space to match -X/-Z flipped mesh vertices.
+        /// </summary>
+        private static Matrix4x4 ConjugateFlipXZ(Matrix4x4 m)
+        {
+            return new Matrix4x4(
+                 m.M11, -m.M12,  m.M13, -m.M14,
+                -m.M21,  m.M22, -m.M23,  m.M24,
+                 m.M31, -m.M32,  m.M33, -m.M34,
+                -m.M41,  m.M42, -m.M43,  m.M44
+            );
         }
 
         private void BlendBone(int boneIndex, Bone bone, ref BonePose temp, out Matrix4x4 matrix)

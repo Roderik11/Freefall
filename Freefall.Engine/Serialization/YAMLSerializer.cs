@@ -26,6 +26,8 @@ namespace Freefall.Serialization
         /// Used during cache file deserialization to prevent recursive loading.
         /// </summary>
         public bool DeferAssetLoading { get; set; }
+        public bool DuplicateMode { get; set; }
+        public Dictionary<ulong, ulong> DuplicateUidMap { get; } = new();
         private static readonly Dictionary<string, IYAMLConverter> _converters = new();
         internal static Dictionary<string, IYAMLConverter> Converters => _converters;
 
@@ -618,7 +620,18 @@ namespace Freefall.Serialization
             // ── Converter (primitives, vectors, etc.) ──
             if (_converters.TryGetValue(field.Type.FullName!, out var converter))
             {
-                field.SetValue(parent, converter.Read(ref parser));
+                if (DuplicateMode && field.Name == "UID" && parent is IUniqueId uniqueObj)
+                {
+                    var oldUidValue = converter.Read(ref parser);
+                    if (oldUidValue is ulong oldUid && oldUid != 0)
+                    {
+                        DuplicateUidMap[oldUid] = uniqueObj.UID;
+                    }
+                }
+                else
+                {
+                    field.SetValue(parent, converter.Read(ref parser));
+                }
                 return;
             }
 
