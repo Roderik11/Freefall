@@ -14,7 +14,12 @@ namespace Freefall.PCG
         EvenSpacing,
 
         /// <summary>Walk control point edges directly, subdividing by Spacing.</summary>
-        PerEdge
+        PerEdge,
+
+        /// <summary>
+        /// Sample points within the spline's 2D area (requires closed spline).
+        /// </summary>
+        Area
     }
 
     /// <summary>
@@ -55,11 +60,154 @@ namespace Freefall.PCG
             {
                 SamplingMode.EvenSpacing => SampleEvenSpacing(Spline),
                 SamplingMode.PerEdge => SamplePerEdge(Spline),
+                SamplingMode.Area => SampleArea(Spline),
                 _ => SamplePointSet.Empty()
             };
 
             SetOutput("Output", result);
             Debug.Log($"[SplineSampler] Produced {result.Count} samples (mode={Mode}, spacing={Spacing}m)");
+        }
+
+
+        /// <summary>
+        /// Sample points within the spline's 2D area. Only valid for closed splines.
+        /// </summary>
+        /// <param name="spline"></param>
+        /// <returns></returns>
+        private SamplePointSet SampleArea(Spline spline)
+        {
+            if (!spline.Closed)
+            {
+                Debug.LogWarning("[SplineSampler] Area sampling requires a closed spline.");
+                return SamplePointSet.Empty();
+            }
+
+            var pts = spline.Points;
+            int n = pts.Count;
+
+            // AABB of control points in XZ
+            float minX = float.MaxValue, minZ = float.MaxValue;
+            float maxX = float.MinValue, maxZ = float.MinValue;
+            for (int i = 0; i < n; i++)
+            {
+                var p = pts[i];
+                if (p.X < minX) minX = p.X;
+                if (p.X > maxX) maxX = p.X;
+                if (p.Z < minZ) minZ = p.Z;
+                if (p.Z > maxZ) maxZ = p.Z;
+            }
+
+            float r = Spacing;
+            float cellSize = r / MathF.Sqrt(2f);
+            int gridW = Math.Max(1, (int)MathF.Ceiling((maxX - minX) / cellSize));
+            int gridH = Math.Max(1, (int)MathF.Ceiling((maxZ - minZ) / cellSize));
+            int[] grid = new int[gridW * gridH];
+            Array.Fill(grid, -1);
+
+            var rng = CreateRandom();
+            var accepted = new List<Vector3>();
+            var active = new List<int>();
+            const int k = 30;
+
+            // Seed: try center of AABB first, fall back to random attempts
+            var seed2D = new Vector2((minX + maxX) * 0.5f, (minZ + maxZ) * 0.5f);
+            if (!PointInPolygonXZ(seed2D.X, seed2D.Y, pts, n))
+            {
+                seed2D = default;
+                for (int attempt = 0; attempt < 100; attempt++)
+                {
+                    float sx = minX + (float)rng.NextDouble() * (maxX - minX);
+                    float sz = minZ + (float)rng.NextDouble() * (maxZ - minZ);
+                    if (PointInPolygonXZ(sx, sz, pts, n))
+                    {
+                        seed2D = new Vector2(sx, sz);
+                        break;
+                    }
+                }
+                if (seed2D == default) return SamplePointSet.Empty();
+            }
+
+            accepted.Add(new Vector3(seed2D.X, 0, seed2D.Y));
+            active.Add(0);
+            int gx = (int)((seed2D.X - minX) / cellSize);
+            int gz = (int)((seed2D.Y - minZ) / cellSize);
+            if (gx >= 0 && gx < gridW && gz >= 0 && gz < gridH)
+                grid[gz * gridW + gx] = 0;
+
+            while (active.Count > 0)
+            {
+                int idx = rng.Next(active.Count);
+                var current = accepted[active[idx]];
+                bool found = false;
+
+                for (int j = 0; j < k; j++)
+                {
+                    float angle = (float)(rng.NextDouble() * Math.PI * 2);
+                    float dist = r + (float)rng.NextDouble() * r;
+                    float cx = current.X + MathF.Cos(angle) * dist;
+                    float cz = current.Z + MathF.Sin(angle) * dist;
+
+                    if (cx < minX || cx > maxX || cz < minZ || cz > maxZ)
+                        continue;
+
+                    int ci = (int)((cx - minX) / cellSize);
+                    int cj = (int)((cz - minZ) / cellSize);
+                    if (ci < 0 || ci >= gridW || cj < 0 || cj >= gridH)
+                        continue;
+
+                    // Check neighbors in 5x5 grid window
+                    bool tooClose = false;
+                    int i0 = Math.Max(0, ci - 2), i1 = Math.Min(gridW - 1, ci + 2);
+                    int j0 = Math.Max(0, cj - 2), j1 = Math.Min(gridH - 1, cj + 2);
+                    for (int ni = i0; ni <= i1 && !tooClose; ni++)
+                    {
+                        for (int nj = j0; nj <= j1 && !tooClose; nj++)
+                        {
+                            int si = grid[nj * gridW + ni];
+                            if (si < 0) continue;
+                            var s = accepted[si];
+                            float dx = cx - s.X;
+                            float dz = cz - s.Z;
+                            if (dx * dx + dz * dz < r * r)
+                                tooClose = true;
+                        }
+                    }
+
+                    if (tooClose) continue;
+                    if (!PointInPolygonXZ(cx, cz, pts, n)) continue;
+
+                    int newIdx = accepted.Count;
+                    accepted.Add(new Vector3(cx, 0, cz));
+                    active.Add(newIdx);
+                    grid[cj * gridW + ci] = newIdx;
+                    found = true;
+                }
+
+                if (!found)
+                    active.RemoveAt(idx);
+            }
+
+            var rotations = new List<Quaternion>(accepted.Count);
+            for (int i = 0; i < accepted.Count; i++)
+                rotations.Add(Quaternion.Identity);
+
+            return BuildResult(accepted, rotations);
+        }
+
+        /// <summary>
+        /// Ray-cast point-in-polygon test on the XZ plane.
+        /// </summary>
+        private static bool PointInPolygonXZ(float px, float pz, IList<Vector3> polygon, int count)
+        {
+            bool inside = false;
+            for (int i = 0, j = count - 1; i < count; j = i++)
+            {
+                float iz = polygon[i].Z, jz = polygon[j].Z;
+                if ((iz > pz) != (jz > pz) &&
+                    px < (polygon[j].X - polygon[i].X) * (pz - iz) / (jz - iz) + polygon[i].X)
+                    inside = !inside;
+            }
+            return inside;
         }
 
         /// <summary>
@@ -129,12 +277,18 @@ namespace Freefall.PCG
         private static SamplePointSet BuildResult(List<Vector3> positions, List<Quaternion> rotations)
         {
             int count = positions.Count;
+            var density = new float[count];
+            Array.Fill(density, 1f);
+
+            var extents = new Vector3[count];
+            Array.Fill(extents, Vector3.One);
+
             return new SamplePointSet
             {
                 position = positions.ToArray(),
-                extents = new Vector3[count],
+                extents = extents,
                 rotation = rotations.ToArray(),
-                density = new float[count],
+                density = density,
                 tags = new string[count]
             };
         }

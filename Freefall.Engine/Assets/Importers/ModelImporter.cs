@@ -1091,10 +1091,10 @@ namespace Freefall.Assets.Importers
             var upper = baseName.ToUpperInvariant();
 
             // Pattern: "_LOD" followed by digit(s) — e.g. Wall_LOD0, SM_House_LOD1_Part
-            int idx = upper.IndexOf("_LOD");
+            int idx = upper.IndexOf("LOD");
             if (idx >= 0)
             {
-                int start = idx + 4;
+                int start = idx + 3;
                 int end = start;
                 while (end < upper.Length && char.IsDigit(upper[end])) end++;
                 if (end > start && int.TryParse(upper.AsSpan(start, end - start), out int level))
@@ -1238,10 +1238,10 @@ namespace Freefall.Assets.Importers
 
             // Strip "_LODN" or "_LOD_N" portion but keep any trailing content (e.g. " [MaterialName]")
             var upper = name.ToUpperInvariant();
-            int idx = upper.LastIndexOf("_LOD");
+            int idx = upper.LastIndexOf("LOD");
             if (idx >= 0)
             {
-                int end = idx + 4;
+                int end = idx + 3;
                 // Skip optional underscore separator: _LOD_01 vs _LOD01
                 if (end < upper.Length && upper[end] == '_') end++;
                 while (end < upper.Length && char.IsDigit(upper[end])) end++;

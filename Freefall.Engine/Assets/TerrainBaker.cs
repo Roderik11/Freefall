@@ -4,6 +4,7 @@ using System.Numerics;
 using System.Runtime.InteropServices;
 
 using Freefall.Base;
+using Freefall.Components;
 using Freefall.Graphics;
 using Vortice.Direct3D12;
 using Vortice.DXGI;
@@ -29,6 +30,7 @@ namespace Freefall.Assets
         private static int _kernelBrushRaycast;
         private static int _kernelNoiseLayer;
         private static int _kernelErosionFilter;
+        private static int _kernelInfluenceLayer;
         private static ID3D12Resource _noiseLUTTex;
         private static uint _noiseLUTSRV;
         private static bool _initialized;
@@ -68,6 +70,98 @@ namespace Freefall.Assets
             public uint BlendMode;
         }
 
+        /// <summary>GPU struct matching HLSL HeightStampDescriptor. 44 bytes (11 x uint/float).</summary>
+        [StructLayout(LayoutKind.Sequential)]
+        private struct HeightStampDescriptorGPU
+        {
+            public Vector2 Center;           // terrain UV center (radial)
+            public float Radius;             // UV-space inner radius
+            public float Falloff;            // UV-space falloff width
+            public float TargetHeight;       // normalized [0..1]
+            public uint InvertShape;         // 0 = flatten toward, 1 = push away
+            public uint SplinePointOffset;   // into spline point buffer (0xFFFFFFFF = radial)
+            public uint SplinePointCount;    // 0 = radial, high bit = closed area
+            public float NoiseFreq;          // edge noise frequency (0 = disabled)
+            public float NoiseAmp;           // edge noise amplitude in UV space
+            public uint NoiseSeed;
+        }
+
+        /// <summary>GPU struct matching HLSL StampSplinePoint. 16 bytes.</summary>
+        [StructLayout(LayoutKind.Sequential)]
+        private struct StampSplinePointGPU
+        {
+            public Vector2 UV;       // terrain UV position
+            public float Height;     // normalized [0..1]
+            public float HalfWidth;  // UV-space half-width
+        }
+
+        /// <summary>GPU struct matching HLSL SplatStampDescriptor. 48 bytes.</summary>
+        [StructLayout(LayoutKind.Sequential)]
+        private struct SplatStampDescriptorGPU
+        {
+            public Vector2 Center;
+            public float Radius;
+            public float Falloff;
+            public uint SplinePointOffset;
+            public uint SplinePointCount;
+            public float NoiseFreq;
+            public float NoiseAmp;
+            public uint NoiseSeed;
+            public uint TargetLayer;
+            public float Strength;
+            public uint _pad;
+        }
+
+        /// <summary>GPU struct matching HLSL DecoStampDescriptor. 48 bytes.</summary>
+        [StructLayout(LayoutKind.Sequential)]
+        private struct DecoStampDescriptorGPU
+        {
+            public Vector2 Center;
+            public float Radius;
+            public float Falloff;
+            public uint SplinePointOffset;
+            public uint SplinePointCount;
+            public float NoiseFreq;
+            public float NoiseAmp;
+            public uint NoiseSeed;
+            public float Density;
+            public uint _pad0;
+            public uint _pad1;
+        }
+
+        // ── HeightStamp buffers (reused across bakes) ──
+        private GraphicsBuffer _heightStampBuffer;
+        private int _heightStampBufferCapacity;
+        private GraphicsBuffer _heightStampSplineBuffer;
+        private int _heightStampSplineCapacity;
+
+        // ── SplatStamp / DecoStamp overlay ──
+        private static ComputeShader _overlayCS;
+        private static int _kernelSplatStamp;
+        private static int _kernelDecoStamp;
+        private static int _kernelProceduralMask;
+        private static bool _overlayInitialized;
+
+        private GraphicsBuffer _splatStampBuffer;
+        private int _splatStampBufferCapacity;
+        private GraphicsBuffer _splatStampSplineBuffer;
+        private int _splatStampSplineCapacity;
+
+        private GraphicsBuffer _decoStampBuffer;
+        private int _decoStampBufferCapacity;
+        private GraphicsBuffer _decoStampSplineBuffer;
+        private int _decoStampSplineCapacity;
+
+        private static void EnsureOverlayInitialized()
+        {
+            if (_overlayInitialized) return;
+            _overlayCS = new ComputeShader("terrain_stamp_overlay.hlsl");
+            _kernelProceduralMask = _overlayCS.FindKernel("CS_ProceduralMask");
+            _kernelSplatStamp = _overlayCS.FindKernel("CS_SplatStamp");
+            _kernelDecoStamp = _overlayCS.FindKernel("CS_DecoStamp");
+            _overlayInitialized = true;
+        }
+
         private static void EnsureInitialized()
         {
             if (_initialized) return;
@@ -82,6 +176,7 @@ namespace Freefall.Assets
             _kernelBrushRaycast = _cs.FindKernel("CS_BrushRaycast");
             _kernelNoiseLayer = _cs.FindKernel("CS_NoiseLayer");
             _kernelErosionFilter = _cs.FindKernel("CS_ErosionFilter");
+            _kernelInfluenceLayer = _cs.FindKernel("CS_InfluenceLayer");
             _initialized = true;
         }
 
@@ -90,7 +185,9 @@ namespace Freefall.Assets
         /// </summary>
         public void Bake(Terrain terrain, ID3D12GraphicsCommandList cmd)
         {
-            if (terrain.HeightLayers.Count == 0 && terrain.Stamps.Count == 0) return;
+            var heightStamps = ComponentCache<HeightStamp>.All;
+            bool hasStamps = heightStamps.Count > 0;
+            if (terrain.HeightLayers.Count == 0 && terrain.Stamps.Count == 0 && !hasStamps) return;
 
             EnsureInitialized();
             EnsureTexture(terrain.EffectiveHeightmapResolution);
@@ -123,6 +220,10 @@ namespace Freefall.Assets
 
             // Phase 3: Stamps (after layers)
             DispatchStamps(cmd, terrain.Stamps, groups);
+
+            // Phase 4: Height stamps (roads, rivers, buildings — after all layers + stamps)
+            if (hasStamps)
+                DispatchHeightStamps(cmd, terrain, heightStamps, groups);
 
             // Transition heightmap from UAV back to Common so it can be
             // implicitly promoted to SRV by the height-range pyramid builder
@@ -486,13 +587,13 @@ namespace Freefall.Assets
 
             var device = Engine.Device;
             _heightTexture = device.CreateTexture2D(
-                Format.R16_Float, resolution, resolution, 1, 1,
+                Format.R16_UNorm, resolution, resolution, 1, 1,
                 ResourceFlags.AllowUnorderedAccess, ResourceStates.Common);
 
             _heightUAV = device.AllocateBindlessIndex();
             var uavDesc = new UnorderedAccessViewDescription
             {
-                Format = Format.R16_Float,
+                Format = Format.R16_UNorm,
                 ViewDimension = UnorderedAccessViewDimension.Texture2D,
                 Texture2D = new Texture2DUnorderedAccessView { MipSlice = 0 }
             };
@@ -501,7 +602,7 @@ namespace Freefall.Assets
             _heightSRV = device.AllocateBindlessIndex();
             var srvDesc = new ShaderResourceViewDescription
             {
-                Format = Format.R16_Float,
+                Format = Format.R16_UNorm,
                 ViewDimension = ShaderResourceViewDimension.Texture2D,
                 Shader4ComponentMapping = ShaderComponentMapping.Default,
                 Texture2D = new Texture2DShaderResourceView
@@ -804,7 +905,7 @@ namespace Freefall.Assets
         }
 
         /// <summary>
-        /// Uploads pre-saved R16_Float baked heightmap bytes directly to the GPU texture.
+        /// Uploads pre-saved R16_UNorm baked heightmap bytes directly to the GPU texture.
         /// Used at load time when the baked heightmap was persisted to cache.
         /// </summary>
         public Texture UploadBakedHeightmap(byte[] pixels, int resolution)
@@ -814,7 +915,7 @@ namespace Freefall.Assets
             EnsureTexture(resolution);
 
             var device = Engine.Device;
-            int bytesPerPixel = 2; // R16_Float
+            int bytesPerPixel = 2; // R16_UNorm
             int rowPitch = (resolution * bytesPerPixel + 255) & ~255;
             int totalBytes = rowPitch * resolution;
 
@@ -850,7 +951,7 @@ namespace Freefall.Assets
                 var src = new TextureCopyLocation(uploadResource, new PlacedSubresourceFootPrint
                 {
                     Offset = 0,
-                    Footprint = new SubresourceFootPrint(Format.R16_Float, (uint)resolution, (uint)resolution, 1, (uint)rowPitch)
+                    Footprint = new SubresourceFootPrint(Format.R16_UNorm, (uint)resolution, (uint)resolution, 1, (uint)rowPitch)
                 });
                 var dst = new TextureCopyLocation(_heightTexture, 0);
                 cmdList.CopyTextureRegion(dst, 0, 0, 0, src);
@@ -873,7 +974,7 @@ namespace Freefall.Assets
         }
 
         /// <summary>
-        /// Reads back the baked R16_Float heightmap into a CPU float[,] array.
+        /// Reads back the baked R16_UNorm heightmap into a CPU float[,] array.
         /// Values are normalized [0..1] — caller multiplies by MaxHeight.
         /// Returns null if no heightmap has been baked.
         /// </summary>
@@ -884,7 +985,7 @@ namespace Freefall.Assets
 
             var device = Engine.Device;
             int res = _currentResolution;
-            int bytesPerPixel = 2; // R16_Float
+            int bytesPerPixel = 2; // R16_UNorm
             int rowPitch = (res * bytesPerPixel + 255) & ~255; // 256-byte aligned
             int totalBytes = rowPitch * res;
 
@@ -908,7 +1009,7 @@ namespace Freefall.Assets
                 var dst = new TextureCopyLocation(readbackResource, new PlacedSubresourceFootPrint
                 {
                     Offset = 0,
-                    Footprint = new SubresourceFootPrint(Format.R16_Float, (uint)res, (uint)res, 1, (uint)rowPitch)
+                    Footprint = new SubresourceFootPrint(Format.R16_UNorm, (uint)res, (uint)res, 1, (uint)rowPitch)
                 });
                 cmdList.CopyTextureRegion(dst, 0, 0, 0, src);
 
@@ -930,8 +1031,8 @@ namespace Freefall.Assets
                         var rowStart = (byte*)(srcPtr + y * rowPitch);
                         for (int x = 0; x < res; x++)
                         {
-                            Half h = *(Half*)(rowStart + x * 2);
-                            heights[x, y] = (float)h;
+                            ushort raw = *(ushort*)(rowStart + x * 2);
+                            heights[x, y] = raw / 65535.0f;
                         }
                     }
 
@@ -950,7 +1051,7 @@ namespace Freefall.Assets
         }
 
         /// <summary>
-        /// Reads back the baked heightmap as raw R16_Float bytes for DDS persistence.
+        /// Reads back the baked heightmap as raw R16_UNorm bytes for DDS persistence.
         /// Returns null if no heightmap has been baked.
         /// </summary>
         public byte[] ReadbackBakedHeightmapBytes()
@@ -960,7 +1061,7 @@ namespace Freefall.Assets
 
             var device = Engine.Device;
             int res = _currentResolution;
-            int bytesPerPixel = 2; // R16_Float
+            int bytesPerPixel = 2; // R16_UNorm
             int rowPitch = (res * bytesPerPixel + 255) & ~255;
             int totalBytes = rowPitch * res;
 
@@ -984,7 +1085,7 @@ namespace Freefall.Assets
                 var dst = new TextureCopyLocation(readbackResource, new PlacedSubresourceFootPrint
                 {
                     Offset = 0,
-                    Footprint = new SubresourceFootPrint(Format.R16_Float, (uint)res, (uint)res, 1, (uint)rowPitch)
+                    Footprint = new SubresourceFootPrint(Format.R16_UNorm, (uint)res, (uint)res, 1, (uint)rowPitch)
                 });
                 cmdList.CopyTextureRegion(dst, 0, 0, 0, src);
 
@@ -1307,8 +1408,499 @@ namespace Freefall.Assets
 
             _stampBuffer?.Dispose();
             _strokeBuffer?.Dispose();
+            _heightStampBuffer?.Dispose();
+            _heightStampSplineBuffer?.Dispose();
+            _splatStampBuffer?.Dispose();
+            _splatStampSplineBuffer?.Dispose();
+            _decoStampBuffer?.Dispose();
+            _decoStampSplineBuffer?.Dispose();
             if (_packIndexBuffers != null)
                 foreach (var buf in _packIndexBuffers) buf?.Dispose();
+        }
+
+        // ── Height Stamp Dispatch ──────────────────────────────────────
+
+        /// <summary>
+        /// Collects all HeightStamp components, builds GPU buffers,
+        /// and dispatches CS_InfluenceLayer.
+        /// </summary>
+        private void DispatchHeightStamps(ID3D12GraphicsCommandList cmd, Terrain terrain,
+            IReadOnlyList<HeightStamp> stamps, uint groups)
+        {
+            if (stamps.Count == 0) return;
+
+            // Collect active stamps and sort by priority
+            var active = new List<HeightStamp>();
+            foreach (var stamp in stamps)
+            {
+                if (stamp.Entity == null) continue;
+                active.Add(stamp);
+            }
+
+            if (active.Count == 0) return;
+            active.Sort((a, b) => a.Priority.CompareTo(b.Priority));
+
+            // Build descriptors and spline points
+            var descriptors = new List<HeightStampDescriptorGPU>();
+            var splinePoints = new List<StampSplinePointGPU>();
+
+            var terrainSize = terrain.TerrainSize;
+            float maxHeight = terrain.MaxHeight;
+            var terrainRenderer = ComponentCache<TerrainRenderer>.All.Count > 0
+                ? ComponentCache<TerrainRenderer>.All[0] : null;
+            var terrainOrigin = terrainRenderer?.Transform?.WorldPosition ?? Vector3.Zero;
+
+            foreach (var stamp in active)
+            {
+                var desc = new HeightStampDescriptorGPU();
+
+                desc.InvertShape = stamp.InvertShape ? 1u : 0u;
+
+                // Falloff in UV space
+                desc.Falloff = stamp.Falloff / Math.Max(terrainSize.X, terrainSize.Y);
+
+                // Edge noise
+                if (stamp.EnableNoise)
+                {
+                    desc.NoiseFreq = stamp.NoiseFrequency;
+                    desc.NoiseAmp = stamp.NoiseAmplitude / Math.Max(terrainSize.X, terrainSize.Y);
+                    desc.NoiseSeed = (uint)stamp.NoiseSeed;
+                }
+
+                if (stamp.IsSplineMode)
+                {
+                    var spline = stamp.GetSpline();
+                    if (spline == null || spline.Points.Count < 2)
+                        continue;
+
+                    desc.SplinePointOffset = (uint)splinePoints.Count;
+
+                    int sampleCount = Math.Max(spline.TotalSegments, spline.Points.Count * 4);
+                    float uvRadius = stamp.Radius / Math.Max(terrainSize.X, terrainSize.Y);
+
+                    for (int i = 0; i <= sampleCount; i++)
+                    {
+                        float t = (float)i / sampleCount;
+                        var worldPos = spline.GetWorldPoint(t);
+
+                        float u = (worldPos.X - terrainOrigin.X) / terrainSize.X;
+                        float v = (worldPos.Z - terrainOrigin.Z) / terrainSize.Y;
+                        float normalizedH = (worldPos.Y + stamp.HeightOffset) / maxHeight;
+
+                        splinePoints.Add(new StampSplinePointGPU
+                        {
+                            UV = new Vector2(u, v),
+                            Height = normalizedH,
+                            HalfWidth = uvRadius,
+                        });
+                    }
+
+                    uint pointCount = (uint)(sampleCount + 1);
+                    if (spline.Closed)
+                        pointCount |= 0x80000000;
+
+                    desc.SplinePointCount = pointCount;
+                    desc.Radius = uvRadius;
+                    desc.TargetHeight = 0;
+                    desc.Center = Vector2.Zero;
+                }
+                else
+                {
+                    // Radial mode
+                    var center = stamp.Transform?.WorldPosition ?? Vector3.Zero;
+                    float u = (center.X - terrainOrigin.X) / terrainSize.X;
+                    float v = (center.Z - terrainOrigin.Z) / terrainSize.Y;
+                    desc.Center = new Vector2(u, v);
+                    desc.Radius = stamp.Radius / Math.Max(terrainSize.X, terrainSize.Y);
+                    desc.TargetHeight = (center.Y + stamp.HeightOffset) / maxHeight;
+                    desc.SplinePointOffset = 0xFFFFFFFF;
+                    desc.SplinePointCount = 0;
+                }
+
+                descriptors.Add(desc);
+            }
+
+            if (descriptors.Count == 0) return;
+
+            // Upload stamp descriptors
+            EnsureHeightStampBuffer(descriptors.Count);
+            unsafe
+            {
+                var dst = _heightStampBuffer.WritePtr<HeightStampDescriptorGPU>();
+                for (int i = 0; i < descriptors.Count; i++)
+                    dst[i] = descriptors[i];
+            }
+
+            // Upload spline points
+            if (splinePoints.Count > 0)
+            {
+                EnsureHeightStampSplineBuffer(splinePoints.Count);
+                unsafe
+                {
+                    var dst = _heightStampSplineBuffer.WritePtr<StampSplinePointGPU>();
+                    for (int i = 0; i < splinePoints.Count; i++)
+                        dst[i] = splinePoints[i];
+                }
+            }
+
+            // Dispatch CS_InfluenceLayer
+            var k = _kernelInfluenceLayer;
+            _cs.SetPushConstant(k, "Output", _heightUAV);
+            _cs.SetBuffer(k, "StampBuf", _heightStampBuffer);
+            _cs.SetPushConstant(k, "StampCount", (uint)descriptors.Count);
+
+            if (splinePoints.Count > 0 && _heightStampSplineBuffer != null)
+                _cs.SetPushConstant(k, "BrushRadius", _heightStampSplineBuffer.SrvIndex);
+            else
+                _cs.SetPushConstant(k, "BrushRadius", 0u);
+
+            _cs.Dispatch(k, cmd, groups, groups);
+            cmd.ResourceBarrierUnorderedAccessView(_heightTexture);
+        }
+
+        private void EnsureHeightStampBuffer(int count)
+        {
+            if (_heightStampBuffer != null && _heightStampBufferCapacity >= count) return;
+            _heightStampBuffer?.Dispose();
+            _heightStampBufferCapacity = Math.Max(count, 16);
+            _heightStampBuffer = GraphicsBuffer.CreateUpload<HeightStampDescriptorGPU>(_heightStampBufferCapacity, mapped: true);
+        }
+
+        private void EnsureHeightStampSplineBuffer(int count)
+        {
+            if (_heightStampSplineBuffer != null && _heightStampSplineCapacity >= count) return;
+            _heightStampSplineBuffer?.Dispose();
+            _heightStampSplineCapacity = Math.Max(count, 128);
+            _heightStampSplineBuffer = GraphicsBuffer.CreateUpload<StampSplinePointGPU>(_heightStampSplineCapacity, mapped: true);
+        }
+
+        // ── Procedural Auto-Mask Dispatch ──────────────────────────────
+
+        /// <summary>
+        /// Evaluates height/slope auto-mask per texel and writes procedural weights
+        /// into the packed ControlMapArray. Must be called AFTER PackControlMaps
+        /// (or after clearing) and BEFORE CS_SplatStamp.
+        /// </summary>
+        public void DispatchProceduralMask(
+            ID3D12GraphicsCommandList cmd,
+            Terrain terrain,
+            uint heightmapSRV,
+            GraphicsBuffer autoMaskBuffer,
+            uint controlArrayUAV,
+            int resolution,
+            int sliceCount)
+        {
+            EnsureOverlayInitialized();
+
+            var terrainSize = terrain.TerrainSize;
+            float maxHeight = terrain.MaxHeight;
+            float heightTexel = 1f / terrain.EffectiveHeightmapResolution;
+            float heightScale = maxHeight / (terrainSize.X * heightTexel);
+
+            var k = _kernelProceduralMask;
+            var device = Engine.Device;
+            cmd.SetComputeRootSignature(device.GlobalRootSignature);
+            cmd.SetDescriptorHeaps(1, new[] { device.SrvHeap });
+
+            _overlayCS.SetPushConstant(k, "Output", controlArrayUAV);
+            _overlayCS.SetPushConstant(k, "HeightTex", heightmapSRV);
+            _overlayCS.SetBuffer(k, "AutoMaskBuf", autoMaskBuffer);
+            _overlayCS.SetPushConstant(k, "HeightScale", BitConverter.SingleToUInt32Bits(heightScale));
+            _overlayCS.SetPushConstant(k, "StampCount", (uint)terrain.Layers.Count); // reused as LayerCount
+            _overlayCS.SetPushConstant(k, "Resolution", (uint)resolution);
+            _overlayCS.SetPushConstant(k, "SliceCount", (uint)sliceCount);
+            _overlayCS.SetPushConstant(k, "HeightTexel", BitConverter.SingleToUInt32Bits(heightTexel));
+
+            uint groups = (uint)((resolution + 7) / 8);
+            _overlayCS.Dispatch(k, cmd, groups, groups);
+        }
+
+        // ── Splat Stamp Dispatch ──────────────────────────────────────
+
+        /// <summary>
+        /// Collects all SplatStamp components and dispatches CS_SplatStamp
+        /// to overlay splat weights onto the packed ControlMapArray.
+        /// Must be called AFTER PackControlMaps on the same command list.
+        /// </summary>
+        public void DispatchSplatStamps(
+            ID3D12GraphicsCommandList cmd,
+            Terrain terrain,
+            IReadOnlyList<SplatStamp> stamps,
+            Vector3 terrainOrigin,
+            uint controlArrayUAV,
+            int resolution,
+            int sliceCount)
+        {
+            if (stamps.Count == 0) return;
+            EnsureOverlayInitialized();
+
+            var terrainSize = terrain.TerrainSize;
+
+            var descriptors = new List<SplatStampDescriptorGPU>();
+            var splinePoints = new List<StampSplinePointGPU>();
+
+            foreach (var stamp in stamps)
+            {
+                var desc = new SplatStampDescriptorGPU();
+                desc.TargetLayer = (uint)Math.Max(0, stamp.SplatLayerIndex);
+                desc.Strength = stamp.Strength;
+                desc.Falloff = stamp.Falloff / Math.Max(terrainSize.X, terrainSize.Y);
+
+                if (stamp.EnableNoise)
+                {
+                    desc.NoiseFreq = stamp.NoiseFrequency;
+                    desc.NoiseAmp = stamp.NoiseAmplitude / Math.Max(terrainSize.X, terrainSize.Y);
+                    desc.NoiseSeed = (uint)stamp.NoiseSeed;
+                }
+
+                if (stamp.IsSplineMode)
+                {
+                    BuildSplinePoints(stamp, terrain, terrainOrigin, terrainSize, 0f,
+                        splinePoints, ref desc.SplinePointOffset, ref desc.SplinePointCount,
+                        ref desc.Radius, ref desc.Center);
+                }
+                else
+                {
+                    BuildRadialCenter(stamp, terrainOrigin, terrainSize,
+                        ref desc.Radius, ref desc.Center, ref desc.SplinePointOffset, ref desc.SplinePointCount);
+                }
+
+                descriptors.Add(desc);
+            }
+
+            if (descriptors.Count == 0) return;
+
+            // Upload
+            EnsureSplatStampBuffer(descriptors.Count);
+            unsafe
+            {
+                var dst = _splatStampBuffer.WritePtr<SplatStampDescriptorGPU>();
+                for (int i = 0; i < descriptors.Count; i++)
+                    dst[i] = descriptors[i];
+            }
+
+            if (splinePoints.Count > 0)
+            {
+                EnsureSplatStampSplineBuffer(splinePoints.Count);
+                unsafe
+                {
+                    var dst = _splatStampSplineBuffer.WritePtr<StampSplinePointGPU>();
+                    for (int i = 0; i < splinePoints.Count; i++)
+                        dst[i] = splinePoints[i];
+                }
+            }
+
+            // Dispatch
+            var device = Engine.Device;
+            cmd.SetComputeRootSignature(device.GlobalRootSignature);
+            cmd.SetDescriptorHeaps(1, new[] { device.SrvHeap });
+
+            Debug.Log($"[SplatStamp] Dispatching {descriptors.Count} stamps, res={resolution}, slices={sliceCount}, uav={controlArrayUAV}, splines={splinePoints.Count}");
+
+            var k = _kernelSplatStamp;
+            _overlayCS.SetBuffer(k, "StampBuf", _splatStampBuffer);
+            _overlayCS.SetPushConstant(k, "Output", controlArrayUAV);
+            _overlayCS.SetPushConstant(k, "StampCount", (uint)descriptors.Count);
+            _overlayCS.SetPushConstant(k, "Resolution", (uint)resolution);
+            _overlayCS.SetPushConstant(k, "SliceCount", (uint)sliceCount);
+
+            if (splinePoints.Count > 0 && _splatStampSplineBuffer != null)
+                _overlayCS.SetPushConstant(k, "BrushRadius", _splatStampSplineBuffer.SrvIndex);
+            else
+                _overlayCS.SetPushConstant(k, "BrushRadius", 0u);
+
+            uint groups = (uint)((resolution + 7) / 8);
+            _overlayCS.Dispatch(k, cmd, groups, groups);
+        }
+
+        // ── Deco Stamp Dispatch ──────────────────────────────────────
+
+        /// <summary>
+        /// Collects all DecoStamp components and dispatches CS_DecoStamp
+        /// to modulate decoration control weights.
+        /// Must be called AFTER DispatchDecoControlPrepass on the same command list.
+        /// </summary>
+        public void DispatchDecoStamps(
+            ID3D12GraphicsCommandList cmd,
+            Terrain terrain,
+            IReadOnlyList<DecoStamp> stamps,
+            Vector3 terrainOrigin,
+            uint decoControlUAV,
+            int resolution)
+        {
+            if (stamps.Count == 0) return;
+            EnsureOverlayInitialized();
+
+            var terrainSize = terrain.TerrainSize;
+
+            var descriptors = new List<DecoStampDescriptorGPU>();
+            var splinePoints = new List<StampSplinePointGPU>();
+
+            foreach (var stamp in stamps)
+            {
+                var desc = new DecoStampDescriptorGPU();
+                desc.Density = stamp.Density;
+                desc.Falloff = stamp.Falloff / Math.Max(terrainSize.X, terrainSize.Y);
+
+                if (stamp.EnableNoise)
+                {
+                    desc.NoiseFreq = stamp.NoiseFrequency;
+                    desc.NoiseAmp = stamp.NoiseAmplitude / Math.Max(terrainSize.X, terrainSize.Y);
+                    desc.NoiseSeed = (uint)stamp.NoiseSeed;
+                }
+
+                if (stamp.IsSplineMode)
+                {
+                    BuildSplinePoints(stamp, terrain, terrainOrigin, terrainSize, 0f,
+                        splinePoints, ref desc.SplinePointOffset, ref desc.SplinePointCount,
+                        ref desc.Radius, ref desc.Center);
+                }
+                else
+                {
+                    BuildRadialCenter(stamp, terrainOrigin, terrainSize,
+                        ref desc.Radius, ref desc.Center, ref desc.SplinePointOffset, ref desc.SplinePointCount);
+                }
+
+                descriptors.Add(desc);
+            }
+
+            if (descriptors.Count == 0) return;
+
+            // Upload
+            EnsureDecoStampBuffer(descriptors.Count);
+            unsafe
+            {
+                var dst = _decoStampBuffer.WritePtr<DecoStampDescriptorGPU>();
+                for (int i = 0; i < descriptors.Count; i++)
+                    dst[i] = descriptors[i];
+            }
+
+            if (splinePoints.Count > 0)
+            {
+                EnsureDecoStampSplineBuffer(splinePoints.Count);
+                unsafe
+                {
+                    var dst = _decoStampSplineBuffer.WritePtr<StampSplinePointGPU>();
+                    for (int i = 0; i < splinePoints.Count; i++)
+                        dst[i] = splinePoints[i];
+                }
+            }
+
+            // Dispatch
+            var device = Engine.Device;
+            cmd.SetComputeRootSignature(device.GlobalRootSignature);
+            cmd.SetDescriptorHeaps(1, new[] { device.SrvHeap });
+
+            var k = _kernelDecoStamp;
+            _overlayCS.SetBuffer(k, "StampBuf", _decoStampBuffer);
+            _overlayCS.SetPushConstant(k, "Output", decoControlUAV);
+            _overlayCS.SetPushConstant(k, "StampCount", (uint)descriptors.Count);
+            _overlayCS.SetPushConstant(k, "Resolution", (uint)resolution);
+
+            if (splinePoints.Count > 0 && _decoStampSplineBuffer != null)
+                _overlayCS.SetPushConstant(k, "BrushRadius", _decoStampSplineBuffer.SrvIndex);
+            else
+                _overlayCS.SetPushConstant(k, "BrushRadius", 0u);
+
+            uint groups = (uint)((resolution + 7) / 8);
+            _overlayCS.Dispatch(k, cmd, groups, groups);
+        }
+
+        // ── Shared spline/radial helpers ─────────────────────────────
+
+        private static void BuildSplinePoints(
+            TerrainStamp stamp, Terrain terrain,
+            Vector3 terrainOrigin, Vector2 terrainSize,
+            float heightOffset,
+            List<StampSplinePointGPU> splinePoints,
+            ref uint splinePointOffset, ref uint splinePointCount,
+            ref float radius, ref Vector2 center)
+        {
+            var spline = stamp.GetSpline();
+            if (spline == null || spline.Points.Count < 2)
+            {
+                splinePointOffset = 0xFFFFFFFF;
+                splinePointCount = 0;
+                return;
+            }
+
+            float maxHeight = terrain.MaxHeight;
+            splinePointOffset = (uint)splinePoints.Count;
+            float uvRadius = stamp.Radius / Math.Max(terrainSize.X, terrainSize.Y);
+
+            int sampleCount = Math.Max(spline.TotalSegments, spline.Points.Count * 4);
+            for (int i = 0; i <= sampleCount; i++)
+            {
+                float t = (float)i / sampleCount;
+                var worldPos = spline.GetWorldPoint(t);
+
+                float u = (worldPos.X - terrainOrigin.X) / terrainSize.X;
+                float v = (worldPos.Z - terrainOrigin.Z) / terrainSize.Y;
+                float normalizedH = (worldPos.Y + heightOffset) / maxHeight;
+
+                splinePoints.Add(new StampSplinePointGPU
+                {
+                    UV = new Vector2(u, v),
+                    Height = normalizedH,
+                    HalfWidth = uvRadius,
+                });
+            }
+
+            uint ptCount = (uint)(sampleCount + 1);
+            if (spline.Closed) ptCount |= 0x80000000;
+
+            splinePointCount = ptCount;
+            radius = uvRadius;
+            center = Vector2.Zero;
+        }
+
+        private static void BuildRadialCenter(
+            TerrainStamp stamp,
+            Vector3 terrainOrigin, Vector2 terrainSize,
+            ref float radius, ref Vector2 center,
+            ref uint splinePointOffset, ref uint splinePointCount)
+        {
+            var pos = stamp.Transform?.WorldPosition ?? Vector3.Zero;
+            float u = (pos.X - terrainOrigin.X) / terrainSize.X;
+            float v = (pos.Z - terrainOrigin.Z) / terrainSize.Y;
+            center = new Vector2(u, v);
+            radius = stamp.Radius / Math.Max(terrainSize.X, terrainSize.Y);
+            splinePointOffset = 0xFFFFFFFF;
+            splinePointCount = 0;
+        }
+
+        // ── Buffer helpers ───────────────────────────────────────────
+
+        private void EnsureSplatStampBuffer(int count)
+        {
+            if (_splatStampBuffer != null && _splatStampBufferCapacity >= count) return;
+            _splatStampBuffer?.Dispose();
+            _splatStampBufferCapacity = Math.Max(count, 16);
+            _splatStampBuffer = GraphicsBuffer.CreateUpload<SplatStampDescriptorGPU>(_splatStampBufferCapacity, mapped: true);
+        }
+
+        private void EnsureSplatStampSplineBuffer(int count)
+        {
+            if (_splatStampSplineBuffer != null && _splatStampSplineCapacity >= count) return;
+            _splatStampSplineBuffer?.Dispose();
+            _splatStampSplineCapacity = Math.Max(count, 128);
+            _splatStampSplineBuffer = GraphicsBuffer.CreateUpload<StampSplinePointGPU>(_splatStampSplineCapacity, mapped: true);
+        }
+
+        private void EnsureDecoStampBuffer(int count)
+        {
+            if (_decoStampBuffer != null && _decoStampBufferCapacity >= count) return;
+            _decoStampBuffer?.Dispose();
+            _decoStampBufferCapacity = Math.Max(count, 16);
+            _decoStampBuffer = GraphicsBuffer.CreateUpload<DecoStampDescriptorGPU>(_decoStampBufferCapacity, mapped: true);
+        }
+
+        private void EnsureDecoStampSplineBuffer(int count)
+        {
+            if (_decoStampSplineBuffer != null && _decoStampSplineCapacity >= count) return;
+            _decoStampSplineBuffer?.Dispose();
+            _decoStampSplineCapacity = Math.Max(count, 128);
+            _decoStampSplineBuffer = GraphicsBuffer.CreateUpload<StampSplinePointGPU>(_decoStampSplineCapacity, mapped: true);
         }
     }
 }

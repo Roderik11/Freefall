@@ -79,10 +79,10 @@ namespace Freefall.Assets.Loaders
                     }
                 }
 
-                // Load pre-cooked PhysX HeightField
-                LoadCookedHeightField(terrain, sourceGuid);
+                // Pre-cooked PhysX cache skipped — always cook from CPU HeightField at play time
+                // LoadCookedHeightField(terrain, sourceGuid);
 
-                // Load persisted baked heightmap (R16_Float DDS)
+                // Load persisted baked heightmap (R16_UNorm DDS)
                 LoadBakedHeightmap(terrain);
 
                 // Load persisted ControlMap data (painted height, splatmaps, density)
@@ -128,10 +128,12 @@ namespace Freefall.Assets.Loaders
                 using var stream = File.OpenRead(physxPath);
                 var cooked = packer.Read(stream);
 
+                Debug.Log($"[TerrainLoader] Cooked bytes loaded: {cooked.CookedBytes.Length} bytes from {physxPath}");
+
                 var hf = PhysicsWorld.Physics.CreateHeightField(new MemoryStream(cooked.CookedBytes));
                 terrain.SetCookedHeightField(hf);
 
-                Debug.Log($"[TerrainLoader] Pre-cooked HeightField loaded: {guid}");
+                Debug.Log($"[TerrainLoader] Pre-cooked HeightField loaded: {guid}, {cooked.CookedBytes.Length} cooked bytes");
             }
             catch (Exception ex)
             {
@@ -153,7 +155,7 @@ namespace Freefall.Assets.Loaders
 
             terrain.PendingBakedHeightmapBytes = bytes;
 
-            // Build CPU HeightField from R16_Float bytes so GetHeight() works immediately
+            // Build CPU HeightField from R16_UNorm bytes so GetHeight() works immediately
             int pixelDataLen = bytes.Length;
             int resolution = (int)Math.Sqrt(pixelDataLen / 2);
             if (resolution * resolution * 2 == pixelDataLen)
@@ -163,8 +165,8 @@ namespace Freefall.Assets.Loaders
                     for (int x = 0; x < resolution; x++)
                     {
                         int idx = (y * resolution + x) * 2;
-                        Half h = BitConverter.ToHalf(bytes, idx);
-                        heights[x, y] = (float)h;
+                        ushort raw = BitConverter.ToUInt16(bytes, idx);
+                        heights[x, y] = raw / 65535.0f;
                     }
                 terrain.SetHeightField(heights);
                 Debug.Log($"[TerrainLoader] Baked heightmap loaded + CPU HeightField built: {resolution}x{resolution}");
@@ -335,23 +337,35 @@ namespace Freefall.Assets.Loaders
             SaveDdsSubasset(terrain.BakedHeightmapRef.Guid, bytes);
             Debug.Log($"[TerrainLoader] Baked heightmap saved: {bytes.Length} bytes, res={resolution}");
 
-            // Cook PhysX HeightField from the R16_Float bytes
+            // Cook PhysX HeightField from the CPU HeightField (always in sync after readback)
             try
             {
-                var heights = new float[resolution, resolution];
-                for (int y = 0; y < resolution; y++)
-                    for (int x = 0; x < resolution; x++)
-                    {
-                        int idx = (y * resolution + x) * 2;
-                        Half h = BitConverter.ToHalf(bytes, idx);
-                        heights[x, y] = (float)h;
-                    }
+                var heightMap = terrain.HeightField;
+                if (heightMap == null)
+                {
+                    Debug.LogWarning("TerrainLoader", "No CPU HeightField available for PhysX cooking");
+                    return;
+                }
 
-                var samples = heights.ToSamples();
+                int rows = heightMap.GetLength(0);
+                int cols = heightMap.GetLength(1);
+
+                // Diagnostic: check height range
+                float hMin = float.MaxValue, hMax = float.MinValue;
+                for (int i = 0; i < rows; i++)
+                    for (int j = 0; j < cols; j++)
+                    {
+                        float h = heightMap[i, j];
+                        if (h < hMin) hMin = h;
+                        if (h > hMax) hMax = h;
+                    }
+                Debug.Log($"[TerrainLoader] HeightField at save: {rows}x{cols}, range=[{hMin:F6}..{hMax:F6}]");
+
+                var samples = heightMap.ToSamples();
                 var hfDesc = new HeightFieldDesc
                 {
-                    NumberOfRows = resolution,
-                    NumberOfColumns = resolution,
+                    NumberOfRows = rows,
+                    NumberOfColumns = cols,
                     Samples = samples,
                 };
                 var cooking = PhysicsWorld.Physics.CreateCooking();
@@ -359,10 +373,15 @@ namespace Freefall.Assets.Loaders
                 cooking.CookHeightField(hfDesc, cookedStream);
                 var cookedBytes = cookedStream.ToArray();
 
+                // Update in-memory CookedHeightField so collider stays in sync
+                cookedStream.Position = 0;
+                var hf = PhysicsWorld.Physics.CreateHeightField(cookedStream);
+                terrain.SetCookedHeightField(hf);
+
                 // Save as CollisionMeshData subasset
                 SaveCollisionSubasset(terrain, cookedBytes);
 
-                Debug.Log($"[TerrainLoader] PhysX HeightField cooked + saved: {resolution}x{resolution}, {cookedBytes.Length} bytes");
+                Debug.Log($"[TerrainLoader] PhysX HeightField cooked + saved: {rows}x{cols}, {cookedBytes.Length} bytes");
             }
             catch (Exception ex)
             {

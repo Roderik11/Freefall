@@ -243,7 +243,7 @@ namespace Freefall.Components
             lightCS.SetPushConstant("ScreenWidth", (uint)desc.Width);
             lightCS.SetPushConstant("ScreenHeight", (uint)desc.Height);
             lightCS.SetPushConstant("SSSTex", renderer.ScreenSpaceShadows?.OutputSrvIndex ?? 0u);
-            lightCS.SetPushConstant("SSDMTex", renderer.ScreenSpaceDisplacement?.OutputSrvIndex ?? 0u);
+            lightCS.SetPushConstant("SSDMTex", Engine.Settings.EnableSSDM ? (renderer.ScreenSpaceDisplacement?.OutputSrvIndex ?? 0u) : 0u);
             
             // Bind cbuffers on compute root (Material.Apply committed them on graphics root)
             foreach (var cb in Material.ConstantBuffers)

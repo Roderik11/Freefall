@@ -700,7 +700,7 @@ namespace Freefall.Graphics
             _compositionCS.SetPushConstant("DepthGBuf", DepthGBuffer.BindlessIndex);
             
             // Pass SSDM displacement texture to composition for ambient parallax
-            _compositionCS.SetParam("SSDMTexIdx", ScreenSpaceDisplacement?.OutputSrvIndex ?? 0u);
+            _compositionCS.SetParam("SSDMTexIdx", Engine.Settings.EnableSSDM ? (ScreenSpaceDisplacement?.OutputSrvIndex ?? 0u) : 0u);
 
             // Bind SceneConstants cbuffer (AmbientScale etc.)
             foreach (var cb in matDirectionalLight.ConstantBuffers)

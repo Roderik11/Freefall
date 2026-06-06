@@ -43,6 +43,7 @@ inline MaterialData GetMaterial(uint id)
 #define GET_MATERIAL(id) GetMaterial(id)
 
 SamplerState Sampler : register(s0);
+SamplerState TrilinearSampler : register(s4);  // displacement/height maps — no aniso
 
 struct VSOutput
 {
@@ -297,7 +298,7 @@ PSOutput PS(VSOutput input)
     if (mat.DetailMaskIdx != 0)
     {
         Texture2D heightMap = ResourceDescriptorHeap[mat.DetailMaskIdx];
-        float height = heightMap.Sample(Sampler, input.TexCoord).r;
+        float height = heightMap.Sample(TrilinearSampler, input.TexCoord).r;
         
         float uvRate = length(ddy(input.TexCoord));
         float worldRate = length(ddy(input.WorldPos));
@@ -325,6 +326,11 @@ PSOutput PS(VSOutput input)
     
     output.Albedo = float4(color.rgb, emissiveMask);
     output.Normal = float4(N, 1.0f);
+    // Geometric specular anti-aliasing (Kaplanyan 2016 / Tokuyoshi 2019)
+    float3 dNdx = ddx(N), dNdy = ddy(N);
+    float normalVariance = max(dot(dNdx, dNdx), dot(dNdy, dNdy));
+    roughness = sqrt(saturate(roughness * roughness + min(2.0 * normalVariance, 0.18)));
+
     output.Data = float4(saturate(roughness), saturate(metal), saturate(ao), 1.0);
     output.Depth = depth;
     output.Displacement = displacement;

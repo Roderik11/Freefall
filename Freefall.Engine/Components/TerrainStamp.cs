@@ -1,6 +1,6 @@
 using System;
-using System.Collections.Generic;
 using System.Numerics;
+using System.Security.Cryptography;
 using Freefall.Base;
 using Freefall.Graphics;
 using Vortice.Mathematics;
@@ -8,84 +8,78 @@ using Vortice.Mathematics;
 namespace Freefall.Components
 {
     /// <summary>
-    /// Influence modes — what effect this influence has on the terrain.
+    /// Abstract base for terrain stamp components (HeightStamp, SplatStamp, DecoStamp).
+    /// Provides shape definition (radial or spline corridor/area), edge noise,
+    /// priority ordering, and gizmo visualization.
     /// </summary>
-    [Flags]
-    public enum TerrainInfluenceMode
+    public abstract class TerrainStamp : Component, ISceneGizmo
     {
-        None = 0,
-        /// <summary>Flatten terrain height to match the influence shape.</summary>
-        FlattenHeight = 1 << 0,
-        /// <summary>Paint a specific splat layer within the influence zone.</summary>
-        PaintSplat = 1 << 1,
-        /// <summary>Suppress decorations within the influence zone.</summary>
-        SuppressDecorations = 1 << 2,
-    }
-
-    /// <summary>
-    /// Non-destructive terrain influence. Attach to an entity to modify terrain
-    /// height, splatmap, and/or decorations within the influence footprint.
-    /// 
-    /// Two shape modes:
-    /// - Radial: uses entity position + Radius (for buildings, trees, etc.)
-    /// - Spline: follows a sibling Spline component + Width (for roads, trails)
-    /// 
-    /// The TerrainRenderer queries all TerrainInfluence instances during its
-    /// GPU bake passes to apply non-destructive modifications.
-    /// </summary>
-    public class TerrainInfluence : Component, ISceneGizmo
-    {
-        // ── Influence Mode ──
-
-        /// <summary>What effects to apply.</summary>
-        public TerrainInfluenceMode Mode = TerrainInfluenceMode.FlattenHeight
-                                          | TerrainInfluenceMode.SuppressDecorations;
-
         // ── Shape ──
 
         /// <summary>
-        /// Radius for radial influence (when no Spline is present).
-        /// Width for spline-based influence (half-width on each side of the path).
+        /// Radius for radial stamps (when no Spline is present).
+        /// Width for spline-based stamps (half-width on each side of the path).
         /// </summary>
-        [ValueRange(0.1f, 200f)]
-        public float Radius = 10f;
+        [ValueRange(0.1f, 20f)]
+        public float Radius = 4f;
 
         /// <summary>Falloff distance (blend from full effect to none). World units.</summary>
-        [ValueRange(0f, 50f)]
+        [ValueRange(0f, 20f)]
         public float Falloff = 3f;
 
-        // ── Height Flatten ──
+        // ── Edge Noise (organic edge breakup) ──
 
-        /// <summary>
-        /// Height offset from the entity/spline position.
-        /// For spline mode, this offsets the flattened height from the spline point's Y.
-        /// </summary>
-        public float HeightOffset = 0f;
+        /// <summary>Enable noise displacement on the falloff boundary for organic edges.</summary>
+        public bool EnableNoise = false;
 
-        // ── Splat Paint ──
+        /// <summary>Noise frequency relative to influence radius (bumps per radius).</summary>
+        [ValueRange(0.5f, 20f)]
+        public float NoiseFrequency = 3f;
 
-        /// <summary>Layer index to paint within the influence zone.</summary>
-        public int SplatLayerIndex = 0;
+        /// <summary>Noise amplitude in world units (how far edges displace).</summary>
+        [ValueRange(0f, 20f)]
+        public float NoiseAmplitude = 2f;
 
-        /// <summary>Paint strength (0-1) at full influence.</summary>
-        [ValueRange(0f, 1f)]
-        public float SplatStrength = 1f;
+        /// <summary>Noise seed for variation between stamps.</summary>
+        public int NoiseSeed = RandomNumberGenerator.GetInt32(int.MaxValue);
 
-        // ── Decoration Suppression ──
+        // ── Priority ──
 
-        /// <summary>Decoration suppression strength (0-1) at full influence.</summary>
-        [ValueRange(0f, 1f)]
-        public float DecoSuppression = 1f;
+        /// <summary>Evaluation priority. Higher values are applied later (overwrite lower).</summary>
+        public int Priority = 0;
 
         // ═══════════════════════════════════════════
-        // ── Runtime: Shape Query API ──
+        // ── Runtime ──
         // ═══════════════════════════════════════════
+
+        protected override void Awake()
+        {
+            Transform?.OnChanged += Transform_OnChanged;
+        }
+
+        public override void Destroy()
+        {
+            Transform?.OnChanged -= Transform_OnChanged;
+        }
+
+        private void Transform_OnChanged()
+        {
+            MessageDispatcher.Send(EngineMsg.StampChanged, this);
+        }
+
+        public override void OnMemberChanged()
+        {
+            _splineResolved = false;
+            MessageDispatcher.Send(EngineMsg.StampChanged, this);
+        }
+
+        // ── Spline resolution ──
 
         /// <summary>Cached sibling spline (resolved lazily).</summary>
         private Spline _cachedSpline;
         private bool _splineResolved;
 
-        /// <summary>True if this influence follows a spline path.</summary>
+        /// <summary>True if this stamp follows a spline path.</summary>
         public bool IsSplineMode
         {
             get
@@ -109,47 +103,29 @@ namespace Freefall.Components
             _cachedSpline = Entity?.GetComponent<Spline>();
         }
 
+        // ── Shape query API ──
+
         /// <summary>
-        /// Compute the influence weight at a world-space position.
-        /// Returns 0..1 where 1 = full effect, 0 = outside influence.
+        /// Compute the stamp weight at a world-space position.
+        /// Returns 0..1 where 1 = full effect, 0 = outside stamp.
         /// </summary>
         public float GetWeight(Vector3 worldPos)
         {
             float distance = GetDistance(worldPos);
             if (distance >= Radius + Falloff) return 0f;
             if (distance <= Radius) return 1f;
-            // Smooth falloff
             float t = (distance - Radius) / Math.Max(Falloff, 0.001f);
             return 1f - SmoothStep(t);
         }
 
         /// <summary>
-        /// Get the target height at a world-space position.
-        /// For radial mode, this is entity.Y + HeightOffset.
-        /// For spline mode, this is spline's interpolated Y at nearest point + HeightOffset.
-        /// </summary>
-        public float GetTargetHeight(Vector3 worldPos)
-        {
-            if (IsSplineMode)
-            {
-                float nearestT = FindNearestT(worldPos, 32);
-                var splinePoint = _cachedSpline.GetWorldPoint(nearestT);
-                return splinePoint.Y + HeightOffset;
-            }
-            return (Transform?.WorldPosition.Y ?? 0f) + HeightOffset;
-        }
-
-        /// <summary>
-        /// Get the minimum distance from worldPos to the influence shape.
+        /// Get the minimum distance from worldPos to the stamp shape.
         /// </summary>
         public float GetDistance(Vector3 worldPos)
         {
             if (IsSplineMode)
-            {
                 return GetDistanceToSpline(worldPos);
-            }
 
-            // Radial: distance from entity center (XZ plane)
             var center = Transform?.WorldPosition ?? Vector3.Zero;
             float dx = worldPos.X - center.X;
             float dz = worldPos.Z - center.Z;
@@ -157,8 +133,7 @@ namespace Freefall.Components
         }
 
         /// <summary>
-        /// Get world-space AABB covering the full influence zone.
-        /// Used for coarse culling before per-pixel evaluation.
+        /// Get world-space AABB covering the full stamp zone.
         /// </summary>
         public BoundingBox GetWorldBounds()
         {
@@ -166,7 +141,6 @@ namespace Freefall.Components
 
             if (IsSplineMode)
             {
-                // Walk the spline and expand bounds
                 var min = new Vector3(float.MaxValue);
                 var max = new Vector3(float.MinValue);
                 int samples = Math.Max(8, _cachedSpline.TotalSegments);
@@ -180,7 +154,6 @@ namespace Freefall.Components
                 return new BoundingBox(min, max);
             }
 
-            // Radial
             var center = Transform?.WorldPosition ?? Vector3.Zero;
             return new BoundingBox(
                 center - new Vector3(extent, extent * 2f, extent),
@@ -189,9 +162,24 @@ namespace Freefall.Components
 
         // ── Spline helpers ──
 
+        /// <summary>
+        /// Get the target height at a world-space position.
+        /// For radial mode, this is entity.Y + heightOffset.
+        /// For spline mode, this is the spline's interpolated Y at nearest point + heightOffset.
+        /// </summary>
+        protected float GetTargetHeight(Vector3 worldPos, float heightOffset)
+        {
+            if (IsSplineMode)
+            {
+                float nearestT = FindNearestT(worldPos, 32);
+                var splinePoint = _cachedSpline.GetWorldPoint(nearestT);
+                return splinePoint.Y + heightOffset;
+            }
+            return (Transform?.WorldPosition.Y ?? 0f) + heightOffset;
+        }
+
         private float GetDistanceToSpline(Vector3 worldPos)
         {
-            // Find minimum XZ distance to spline by sampling
             float nearestT = FindNearestT(worldPos, 64);
             var nearestPoint = _cachedSpline.GetWorldPoint(nearestT);
             float dx = worldPos.X - nearestPoint.X;
@@ -199,13 +187,11 @@ namespace Freefall.Components
             return MathF.Sqrt(dx * dx + dz * dz);
         }
 
-        /// <summary>Find the parameter t that gives the nearest spline point (XZ distance).</summary>
         private float FindNearestT(Vector3 worldPos, int samples)
         {
             float bestT = 0f;
             float bestDist = float.MaxValue;
 
-            // Coarse pass
             for (int i = 0; i <= samples; i++)
             {
                 float t = (float)i / samples;
@@ -220,7 +206,6 @@ namespace Freefall.Components
                 }
             }
 
-            // Refine with binary search
             float step = 1f / samples;
             for (int iter = 0; iter < 4; iter++)
             {
@@ -253,44 +238,38 @@ namespace Freefall.Components
         public void DrawGizmos(GizmoContext ctx)
         {
             if (IsSplineMode)
-                DrawSplineInfluence(ctx);
+                DrawSplineGizmo(ctx);
             else
-                DrawRadialInfluence(ctx);
+                DrawRadialGizmo(ctx);
         }
 
-        private void DrawRadialInfluence(GizmoContext ctx)
+        private void DrawRadialGizmo(GizmoContext ctx)
         {
-            // Inner radius (full effect)
-            ctx.Color = new Color4(0.3f, 0.9f, 0.3f, 1f);
+            ctx.Color = GizmoColor;
             ctx.LineWidth = 1.5f;
             ctx.DrawCircle(Vector3.Zero, Vector3.UnitY, Radius, 48);
 
-            // Outer radius (falloff edge)
             if (Falloff > 0.01f)
             {
-                ctx.Color = new Color4(0.3f, 0.9f, 0.3f, 0.5f);
+                ctx.Color = new Color4(GizmoColor.R, GizmoColor.G, GizmoColor.B, 0.5f);
                 ctx.LineWidth = 1f;
                 ctx.DrawCircle(Vector3.Zero, Vector3.UnitY, Radius + Falloff, 48);
             }
 
-            // Radius handle
-            ctx.Color = new Color4(0.3f, 1f, 0.3f, 1f);
+            ctx.Color = new Color4(GizmoColor.R, GizmoColor.G, GizmoColor.B, 1f);
             Radius = ctx.RadiusHandle(Vector3.Zero, Radius);
         }
 
-        private void DrawSplineInfluence(GizmoContext ctx)
+        private void DrawSplineGizmo(GizmoContext ctx)
         {
             var spline = _cachedSpline;
             if (spline == null || spline.Points.Count < 2) return;
 
-            // Draw left and right offset curves showing the influence corridor
             int samples = spline.TotalSegments;
             var savedMatrix = ctx.Matrix;
-
-            // We draw in world space for spline influence
             ctx.Matrix = Matrix4x4.Identity;
 
-            ctx.Color = new Color4(0.3f, 0.9f, 0.3f, 1f);
+            ctx.Color = GizmoColor;
             ctx.LineWidth = 1.5f;
 
             Vector3 prevLeft = Vector3.Zero, prevRight = Vector3.Zero;
@@ -303,7 +282,6 @@ namespace Freefall.Components
                 var point = spline.GetWorldPoint(t);
                 var tangent = spline.GetTangent(t);
 
-                // Transform tangent to world space rotation
                 if (Transform != null)
                 {
                     var rotMatrix = Matrix4x4.CreateFromQuaternion(Transform.Rotation);
@@ -311,7 +289,6 @@ namespace Freefall.Components
                 }
                 tangent = Vector3.Normalize(tangent);
 
-                // Perpendicular in XZ plane
                 var perp = Vector3.Normalize(new Vector3(-tangent.Z, 0, tangent.X));
 
                 var left = point + perp * Radius;
@@ -319,13 +296,12 @@ namespace Freefall.Components
 
                 if (i > 0)
                 {
-                    ctx.Color = new Color4(0.3f, 0.9f, 0.3f, 1f);
+                    ctx.Color = GizmoColor;
                     ctx.LineWidth = 1.5f;
                     ctx.DrawLine(prevLeft, left);
                     ctx.DrawLine(prevRight, right);
                 }
 
-                // Outer falloff edges
                 if (hasFalloff)
                 {
                     var outerLeft = point + perp * (Radius + Falloff);
@@ -333,7 +309,7 @@ namespace Freefall.Components
 
                     if (i > 0)
                     {
-                        ctx.Color = new Color4(0.3f, 0.9f, 0.3f, 0.4f);
+                        ctx.Color = new Color4(GizmoColor.R, GizmoColor.G, GizmoColor.B, 0.4f);
                         ctx.LineWidth = 1f;
                         ctx.DrawLine(prevOuterLeft, outerLeft);
                         ctx.DrawLine(prevOuterRight, outerRight);
@@ -347,8 +323,8 @@ namespace Freefall.Components
                 prevRight = right;
             }
 
-            // Draw cross-hatches at each control point
-            ctx.Color = new Color4(0.3f, 0.9f, 0.3f, 0.6f);
+            // Cross-hatches at control points
+            ctx.Color = new Color4(GizmoColor.R, GizmoColor.G, GizmoColor.B, 0.6f);
             ctx.LineWidth = 1f;
             for (int i = 0; i < spline.Points.Count; i++)
             {
@@ -369,5 +345,8 @@ namespace Freefall.Components
 
             ctx.Matrix = savedMatrix;
         }
+
+        /// <summary>Override in subclasses for distinct gizmo colors.</summary>
+        protected virtual Color4 GizmoColor => new Color4(0.3f, 0.9f, 0.3f, 1f);
     }
 }

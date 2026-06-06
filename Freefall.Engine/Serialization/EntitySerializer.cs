@@ -37,7 +37,7 @@ namespace Freefall.Serialization
 
             foreach (var entity in entities)
             {
-                if (entity.HideAndDontSave) continue;
+                if (entity.DontSave) continue;
 
                 // Skip child entities of prefab instances — they're reconstructed on load
                 if (entity.IsChildOfPrefabInstance)

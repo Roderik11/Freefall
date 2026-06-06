@@ -172,22 +172,13 @@ namespace Freefall.Graphics
              }
              int arraySize = textures.Count;
 
-             // Determine output format: use non-sRGB RGBA for UAV compatibility.
-             // The SRV will be created with the sRGB variant if any source is sRGB,
-             // unless stripSrgb is set (e.g. for heightmaps that should always be linear).
-             bool anySrgb = false;
-             if (!stripSrgb)
-             {
-                 for (int i = 0; i < textures.Count; i++)
-                 {
-                     var fmt = textures[i].Native.Description.Format;
-                     if (fmt == Format.BC1_UNorm_SRgb || fmt == Format.BC7_UNorm_SRgb || 
-                         fmt == Format.R8G8B8A8_UNorm_SRgb || fmt == Format.B8G8R8A8_UNorm_SRgb)
-                         anySrgb = true;
-                 }
-             }
+             // Output format: always R8G8B8A8_UNorm (linear).
+             // The compute shader samples sources through their native SRVs, which
+             // auto-decode sRGB→linear if the source format is *_SRgb. The decoded
+             // linear values are written to the UAV. The array SRV must NOT apply
+             // sRGB decode again — that would cause double gamma correction (too dark).
              var uavFormat = Format.R8G8B8A8_UNorm;
-             var srvFormat = anySrgb ? Format.R8G8B8A8_UNorm_SRgb : Format.R8G8B8A8_UNorm;
+             var srvFormat = Format.R8G8B8A8_UNorm;
 
              // Create the output texture array
              var arrayDesc = ResourceDescription.Texture2D(uavFormat, (uint)width, (uint)height,

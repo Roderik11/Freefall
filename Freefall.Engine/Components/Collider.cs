@@ -252,18 +252,6 @@ namespace Freefall.Components
                 return null;
             }
 
-            float fx = terrain.TerrainSize.X / ((terrain.HeightField?.GetLength(0) ?? 2) - 1);
-            float fy = terrain.TerrainSize.Y / ((terrain.HeightField?.GetLength(1) ?? 2) - 1);
-
-            // Fast path: use pre-cooked HeightField from import
-            if (terrain.CookedHeightField != null)
-            {
-                Debug.Log($"[RigidBody] Using CookedHeightField: MaxHeight={terrain.MaxHeight}, scale={terrain.MaxHeight / short.MaxValue}, fx={fx}, fy={fy}");
-                return new HeightFieldGeometry(terrain.CookedHeightField, 0,
-                    terrain.MaxHeight / short.MaxValue, fx, fy);
-            }
-
-            // Slow fallback: cook on demand
             if (terrain.HeightField == null)
             {
                 Debug.Log("[RigidBody] No Terrain HeightField found");
@@ -274,7 +262,10 @@ namespace Freefall.Components
             int rows = heightMap.GetLength(0);
             int cols = heightMap.GetLength(1);
 
-            Debug.Log($"[RigidBody] Cooking HeightField on demand: {rows}x{cols}, MaxHeight={terrain.MaxHeight}, fx={fx}, fy={fy}");
+            float fx = terrain.TerrainSize.X / (rows - 1);
+            float fy = terrain.TerrainSize.Y / (cols - 1);
+
+            Debug.Log($"[RigidBody] Cooking HeightField: {rows}x{cols}, MaxHeight={terrain.MaxHeight}, fx={fx}, fy={fy}");
             var samples = heightMap.ToSamples();
 
             var heightFieldDesc = new HeightFieldDesc()
@@ -286,7 +277,7 @@ namespace Freefall.Components
 
             var cooking = PhysicsWorld.Physics.CreateCooking();
             var stream = new MemoryStream();
-            bool cookResult = cooking.CookHeightField(heightFieldDesc, stream);
+            cooking.CookHeightField(heightFieldDesc, stream);
 
             stream.Position = 0;
             HeightField heightField = PhysicsWorld.Physics.CreateHeightField(stream);

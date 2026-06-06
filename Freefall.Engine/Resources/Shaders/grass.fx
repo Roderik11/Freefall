@@ -123,6 +123,7 @@ struct MSOutput
     float2 TerrainUV  : TEXCOORD6;
     nointerpolation float InstanceSeed : TEXCOORD7;
     nointerpolation uint SlotIdx : TEXCOORD8;
+    nointerpolation float FadeFactor : TEXCOORD9;
 };
 
 [outputtopology("triangle")]
@@ -243,6 +244,7 @@ void MS(
     o.TerrainUV = di.TerrainUV;
     o.InstanceSeed = di.InstanceSeed;
     o.SlotIdx = di.SlotIdx;
+    o.FadeFactor = di.FadeFactor;
     verts[gtid] = o;
 
     if (vertInQuad < 2)
@@ -263,6 +265,7 @@ struct PSOutput
     float4 Data   : SV_Target2;
     float  Depth  : SV_Target3;
     uint   EntityId : SV_Target4;
+    float2 Displacement : SV_Target5;    
 };
 
 PSOutput PS(MSOutput input)
@@ -281,9 +284,10 @@ PSOutput PS(MSOutput input)
         baseColor = texColor.rgb;
         alpha = texColor.a;
 
-        // Distance-based alpha threshold: tight clip up close, loose at distance
-        //float alphaThreshold = lerp(0.25, 0.05, saturate(dist / 80.0));
-        clip(alpha - 0.15);
+        // Distance-based alpha threshold: tight clip up close, aggressive at distance
+        // to eliminate sub-pixel green scatter from mipmapped grass textures
+        float alphaThreshold = lerp(0.33, 0.8, 1.0 - input.FadeFactor);
+        clip(alpha - alphaThreshold);
 
         // Ground color fade
         //Texture2D BakedAlbedo = ResourceDescriptorHeap[BakedAlbedoIdx];
@@ -312,7 +316,7 @@ PSOutput PS(MSOutput input)
             float4 texColor = albedoTex.Sample(ClampSampler, input.TexCoord);
             baseColor = texColor.rgb;
             alpha = texColor.a;
-            clip(alpha - 0.25);
+            clip(alpha - 0.33);
         }
         else
         {
@@ -326,6 +330,7 @@ PSOutput PS(MSOutput input)
     output.Data = float4(0.95, 0.0, 1.0, 0.5);   // roughness=matte, metallic=0, ao=1, vegetation lighting
     output.Depth = dist;
     output.EntityId = 0;
+    output.Displacement = float2(0, 0);
 
     return output;
 }
@@ -498,7 +503,7 @@ void PS_Shadow_SP(ShadowMSOutput input)
     {
         Texture2D texOverride = ResourceDescriptorHeap[input.TextureOverride];
         float alpha = texOverride.SampleLevel(HeightSampler, input.TexCoord, 0).a;
-        clip(alpha - 0.15);
+        clip(alpha - 0.33);
     }
     else
     {
@@ -515,7 +520,7 @@ void PS_Shadow_SP(ShadowMSOutput input)
             //float alphaThreshold = lerp(0.15, 0.015, saturate(input.Depth / 60.0));
             //clip(alpha - alphaThreshold);
 
-            clip(alpha - 0.15);
+            clip(alpha - 0.33);
         }
     }
 }

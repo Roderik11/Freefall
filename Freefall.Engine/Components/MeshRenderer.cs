@@ -1,7 +1,6 @@
 using System;
 using System.Numerics;
 using System.Collections.Generic;
-using Freefall.Assets;
 using Freefall.Graphics;
 using Freefall.Base;
 using Vortice.Mathematics;
@@ -76,12 +75,11 @@ namespace Freefall.Components
 
         /// <summary>
         /// Select active LOD index based on screen-relative size.
-        /// Uses LODGroup threshold ranges, matching StaticMeshRenderer behavior.
         /// Returns -1 if no LOD chain (use all MeshParts).
         /// </summary>
-        private int GetActiveLOD()
+        private int GetActiveLOD(out bool tooSmall)
         {
-            if (Mesh == null || Mesh.LODs.Count == 0) return -1;
+            tooSmall = true;
 
             var cam = Camera.Main;
             if (cam == null) return 0;
@@ -93,13 +91,16 @@ namespace Freefall.Components
             float sizeSq = (diameter * diameter / MathF.Max(distanceSq, 0.001f)) * cam.FoVFactor;
             sizeSq *= Engine.Settings.LODScale * Mesh.LODBias;
 
-            // Use SmallProps LODGroup ranges as thresholds
-            var ranges = LODGroups.LargeProps.Ranges;
+            tooSmall = sizeSq < 0.00001f;
+
             int lodCount = Mesh.LODs.Count;
 
-            for (int i = 0; i < Math.Min(ranges.Count, lodCount); i++)
+            if (lodCount == 0) return -1;
+
+            // Geometric progression: each LOD transition at half the screen size of the previous.
+            for (int i = 0; i < lodCount - 1; i++)
             {
-                float t = ranges[i];
+                float t = MathF.Pow(0.5f, i + 1);
                 if (sizeSq > t * t)
                     return i;
             }
@@ -137,7 +138,10 @@ namespace Freefall.Components
             if (_boundsDirty) OnTransformChanged();
 
             var slot = Transform.TransformSlot;
-            int lod = GetActiveLOD();
+            int lod = GetActiveLOD(out bool tooSmall);
+
+            if (tooSmall)
+                return;
 
             if (lod >= 0 && Mesh.LODs[lod].MeshPartIndices != null)
             {

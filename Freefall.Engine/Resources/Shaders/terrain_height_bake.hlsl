@@ -1,5 +1,5 @@
 // terrain_height_bake.hlsl — Composites terrain HeightLayers and StampGroups
-// into a final R32_Float heightmap.
+// into a final R16_UNorm heightmap.
 //
 // HeightLayers: dispatched per-layer (CS_ImportLayer, CS_NoiseLayer)
 // StampGroups: dispatched per-group with a StructuredBuffer of instances (CS_StampGroup)
@@ -17,6 +17,7 @@
 #pragma kernel CS_BrushRaycast
 #pragma kernel CS_NoiseLayer
 #pragma kernel CS_ErosionFilter
+#pragma kernel CS_InfluenceLayer
 
 // Push constants (root parameter 0, register b3) — bindless indices + params
 cbuffer PushConstants : register(b3)
@@ -850,4 +851,81 @@ void CS_ErosionFilter(uint3 dtid : SV_DispatchThreadID)
 
     float prev = Output[dtid.xy];
     Output[dtid.xy] = Blend(prev, eroded, BlendMode, Opacity);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CS_InfluenceLayer — Applies terrain influences (roads, rivers, buildings)
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Push constant slot reuse (influence kernel, never concurrent with paint/erosion):
+//   OutputIdx     (1)  → UAV: output heightmap
+//   StampBufIdx   (2)  → SRV: StructuredBuffer<InfluenceDescriptor>
+//   StampCount    (5)  → number of influence descriptors
+//   BrushRadius   (6)  → SRV: StructuredBuffer<InfluenceSplinePoint> (spline data)
+//   NOTE: BrushRadius is repurposed as a uint (bindless index) via asuint/asfloat.
+//         The kernel reads it as SplineBufIdx below.
+
+// Alias push constant slots for readability
+#define StampDescBufIdx  StampBufIdx
+#define StampDescCount   StampCount
+#define SplineBufIdx     asuint(BrushRadius)
+
+#include "terrain_stamp_common.hlsli"
+
+// Per-stamp descriptor (matches C# HeightStampDescriptorGPU, 44 bytes)
+struct HeightStampDescriptor
+{
+    float2 Center;             // terrain UV center (radial mode)
+    float  Radius;             // UV-space inner radius
+    float  Falloff;            // UV-space falloff width
+    float  TargetHeight;       // normalized target height [0..1]
+    uint   InvertShape;        // 0 = flatten toward, 1 = push away
+    uint   SplinePointOffset;  // offset into spline point buffer (0xFFFFFFFF = radial)
+    uint   SplinePointCount;   // number of spline points (0 = radial, high bit = closed area)
+    float  NoiseFreq;          // edge noise frequency (0 = disabled)
+    float  NoiseAmp;           // edge noise amplitude in UV space
+    uint   NoiseSeed;          // noise seed
+};
+
+[numthreads(8, 8, 1)]
+void CS_InfluenceLayer(uint3 dtid : SV_DispatchThreadID)
+{
+    RWTexture2D<float> Output = ResourceDescriptorHeap[OutputIdx];
+    uint w, h;
+    Output.GetDimensions(w, h);
+    if (dtid.x >= w || dtid.y >= h) return;
+
+    StructuredBuffer<HeightStampDescriptor> Stamps = ResourceDescriptorHeap[StampDescBufIdx];
+    StructuredBuffer<StampSplinePoint> SplinePoints = ResourceDescriptorHeap[SplineBufIdx];
+
+    float2 uv = (float2(dtid.xy) + 0.5) / float2(w, h);
+    float currentHeight = Output[dtid.xy];
+    bool modified = false;
+
+    for (uint i = 0; i < StampDescCount; i++)
+    {
+        HeightStampDescriptor stamp = Stamps[i];
+
+        float nearestH, nearestHalfW;
+        float weight = EvaluateStampWeight(
+            uv, stamp.Center, stamp.Radius, stamp.Falloff,
+            stamp.SplinePointOffset, stamp.SplinePointCount,
+            stamp.NoiseFreq, stamp.NoiseAmp, stamp.NoiseSeed,
+            SplinePoints, nearestH, nearestHalfW);
+
+        if (weight <= 0) continue;
+
+        // Spline mode: use interpolated height from nearest spline point
+        float targetH = (stamp.SplinePointCount > 0 && stamp.SplinePointOffset != 0xFFFFFFFF)
+            ? nearestH : stamp.TargetHeight;
+
+        // Apply height: always flatten, optionally invert displacement
+        float delta = targetH - currentHeight;
+        if (stamp.InvertShape) delta = -delta;
+        currentHeight += delta * weight;
+        modified = true;
+    }
+
+    if (modified)
+        Output[dtid.xy] = currentHeight;
 }

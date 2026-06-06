@@ -70,7 +70,7 @@ namespace Freefall.Assets
         /// <summary>Height change → rebake heightmap + albedo (slope/height masks shift).</summary>
         HeightAll      = HeightBake | AlbedoBake,
         /// <summary>Splat layer visuals changed → repack + rebake albedo + refresh decorators.</summary>
-        SplatAll       = LayerParams | AlbedoBake | DecoPrepass,
+        SplatAll       = LayerParams | AlbedoBake | DecoPrepass | SplatPack,
         /// <summary>Full decorator rebuild.</summary>
         DecoAll        = DecoStructure | DecoParams | DecoPrepass,
         /// <summary>Everything.</summary>

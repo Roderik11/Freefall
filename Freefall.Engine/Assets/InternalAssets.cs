@@ -42,6 +42,7 @@ namespace Freefall.Assets
             public const string SkyboxEffect     = "00000000000000000000000000000015";
             public const string TransparentEffect   = "00000000000000000000000000000016";
             public const string SkinnedEffect = "00000000000000000000000000000017";
+            public const string CrossmeshEffect = "00000000000000000000000000000018";
 
 
 
@@ -52,6 +53,7 @@ namespace Freefall.Assets
             public const string FoliageMaterial = "00000000000000000000000000000023";
             public const string TrunkMaterial = "00000000000000000000000000000024";
             public const string SkyboxMaterial = "00000000000000000000000000000025";
+            public const string CrossmeshMaterial = "00000000000000000000000000000027";
 
         }
 
@@ -79,6 +81,7 @@ namespace Freefall.Assets
         public static Effect SkyboxEffect { get; private set; }
         public static Effect TransparentEffect { get; private set; }
         public static Effect SkinnedEffect { get; private set; }
+        public static Effect CrossmeshEffect { get; private set; }
 
 
         public static Material DefaultMaterial { get; private set; }
@@ -87,6 +90,7 @@ namespace Freefall.Assets
         public static Material FoliageMaterial { get; private set; }
         public static Material TrunkMaterial { get; private set; }
         public static Material SkyboxMaterial { get; private set; }
+        public static Material CrossmeshMaterial { get; private set; }
 
         public static void Initialize(GraphicsDevice device)
         {
@@ -153,6 +157,7 @@ namespace Freefall.Assets
             SkyboxEffect = new Effect("mesh_skybox");
             TransparentEffect = new Effect("gbuffer_transparent");
             SkinnedEffect = new Effect("gbuffer_skinned");
+            CrossmeshEffect = new Effect("gbuffer_crossmesh");
 
             DefaultMaterial = new Material(DefaultEffect);
             DefaultMaterial.Name = "DefaultMaterial";
@@ -168,6 +173,9 @@ namespace Freefall.Assets
             TrunkMaterial.Name = "TrunkMaterial";
             SkyboxMaterial = new Material(SkyboxEffect);
             SkyboxMaterial.Name = "SkyboxMaterial";
+            CrossmeshMaterial = new Material(CrossmeshEffect);
+            CrossmeshMaterial.Name = "CrossmeshMaterial";
+
         }
 
         /// <summary>
@@ -197,6 +205,7 @@ namespace Freefall.Assets
             manager.RegisterAsset(Guids.SkyboxEffect, SkyboxEffect);
             manager.RegisterAsset(Guids.TransparentEffect, TransparentEffect);
             manager.RegisterAsset(Guids.SkinnedEffect, SkinnedEffect);
+            manager.RegisterAsset(Guids.CrossmeshEffect, CrossmeshEffect);
 
             manager.RegisterAsset(Guids.DefaultMaterial, DefaultMaterial);
             manager.RegisterAsset(Guids.DecoratorMaterial, DecoratorMaterial);
@@ -204,6 +213,7 @@ namespace Freefall.Assets
             manager.RegisterAsset(Guids.FoliageMaterial, FoliageMaterial);
             manager.RegisterAsset(Guids.TrunkMaterial, TrunkMaterial);
             manager.RegisterAsset(Guids.SkyboxMaterial, SkyboxMaterial);
+            manager.RegisterAsset(Guids.CrossmeshMaterial, CrossmeshMaterial);
         }
     }
 }

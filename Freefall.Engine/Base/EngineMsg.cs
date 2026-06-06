@@ -8,5 +8,6 @@ namespace Freefall.Base
         public const string SplineChanged = "SplineChanged";
         public const string GraphChanged = "GraphChanged";
         public const string PCGExecuted = "PCGExecuted";
+        public const string StampChanged = "StampChanged";
     }
 }

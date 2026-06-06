@@ -69,6 +69,7 @@ cbuffer tiling : register(b2)
 SamplerState sampData : register(s0); // WrappedAnisotropic
 SamplerState sampHeight : register(s1); // ClampedPoint2D
 SamplerState sampHeightFilter : register(s2); // ClampedBilinear2D
+SamplerState sampTrilinear : register(s4); // WrappedTrilinear — displacement/height maps
 
 // Edge-stitched vertex: snaps odd edge vertices to even positions on edges
 // adjacent to coarser neighbors. No morphing — hard LOD transition masked
@@ -237,14 +238,7 @@ FragmentOutput PS(VertexOutput input)
     float3 terrainNormal = GetNormal(input.UV2);
     float3 faceNormal = terrainNormal;
 
-    // Slope angle in degrees for procedural masking
-    float slopeDeg = acos(saturate(terrainNormal.y)) * (180.0 / 3.14159265);
-
-    // Normalized height [0..1] for procedural masking
-    Texture2D HeightTex = ResourceDescriptorHeap[HeightTexIdx];
-    float heightNorm = HeightTex.SampleLevel(sampHeightFilter, input.UV2, 0).r;
-
-    // Load auto-mask buffer (may be null/0 if no layers have procedural enabled)
+    // Load auto-mask buffer (kept for debug mode)
     StructuredBuffer<LayerAutoMask> AutoMaskBuf = ResourceDescriptorHeap[AutoMaskBufIdx];
 
     float4 color = float4(0, 0, 0, 0);
@@ -261,60 +255,106 @@ FragmentOutput PS(VertexOutput input)
     uint cmW, cmH, sliceCount;
     ControlMaps.GetDimensions(cmW, cmH, sliceCount);
 
-    // Layered compositing: each layer lerps over what's below it.
-    // Layer 0 at weight 1.0 = full base. Layer 1 at weight 1.0 = fully covers layer 0.
-    // Partial weight = partial blend with what's beneath.
+    // Height-based texture blending with back-to-front masking.
+    // Later layers mask earlier layers (matching sequential lerp priority),
+    // then height maps add micro-detail at transitions between similar-weight layers.
+    const float blendDepth = 0.2;
+
     bool hasAnyLayer = false;
     float blendedHeight = 0;
-    
-    for (uint i = 0; i < sliceCount; ++i)
-    {
-        uint startIndex = i * 4;
-        float4 weights = ControlMaps.Sample(sampData, float3(uv, i));
 
+    // Read all slice weights
+    uint clampedSlices = min(sliceCount, 8u);
+    float4 sliceWeights[8];
+    for (uint s = 0; s < clampedSlices; s++)
+        sliceWeights[s] = ControlMaps.Sample(sampData, float3(uv, s));
+
+    // Back-to-front: later layers mask earlier layers (same priority as sequential lerp)
+    // effective[i] = raw[i] * product(1 - raw[k]) for all k > i
+    float remaining = 1.0;
+    for (int si = (int)clampedSlices - 1; si >= 0; si--)
+    {
+        for (int ci = 3; ci >= 0; ci--)
+        {
+            float w = sliceWeights[si][ci];
+            sliceWeights[si][ci] = w * remaining;
+            remaining *= saturate(1.0 - w);
+        }
+    }
+
+    // Find max(effectiveWeight * (1 + heightVal))
+    float maxCombined = -1;
+    for (uint i = 0; i < clampedSlices; ++i)
+    {
         for (uint j = 0; j < 4; ++j)
         {
-            float weight = weights[j];
+            float ew = sliceWeights[i][j];
+            if (ew <= 0) continue;
 
-            uint layer = startIndex + j;
-
-            // Procedural slope/height auto-mask: max(painted, procedural)
-            LayerAutoMask mask = AutoMaskBuf[layer];
-            if (mask.ProceduralWeight != 0)
-            {
-                float pmask = 1;
-                pmask *= smoothstep(mask.SlopeMin - mask.SlopeBlend, mask.SlopeMin, slopeDeg);
-                pmask *= smoothstep(mask.SlopeMax + mask.SlopeBlend, mask.SlopeMax, slopeDeg);
-                pmask *= smoothstep(mask.HeightMin - mask.HeightBlend, mask.HeightMin, heightNorm);
-                pmask *= smoothstep(mask.HeightMax + mask.HeightBlend, mask.HeightMax, heightNorm);
-                if (mask.ProceduralWeight > 0)
-                    weight = max(weight, pmask * mask.ProceduralWeight);
-                else
-                    weight = pmask * abs(mask.ProceduralWeight) * (1.0 - weight);
-            }
-
-            if (weight <= 0)
-                continue;
-
-            hasAnyLayer = true;
-
-            float2 texuv = uv * LayerTiling[layer].xy;
-            float3 layerUV = float3(texuv, layer);
-
-            float4 c = DiffuseMaps.Sample(sampData, layerUV);
-            float4 n = NormalMaps.Sample(sampData, layerUV);
-
-            color = lerp(color, c, weight);
-            normal = lerp(normal, n, weight);
-
-            // Blend explicit height using same visual weight
+            uint layer = i * 4 + j;
+            float heightVal = 0;
             if (HeightMapsIdx != 0 && LayerTiling[layer].z > 0.5)
             {
                 Texture2DArray HeightMaps = ResourceDescriptorHeap[HeightMapsIdx];
-                float h = HeightMaps.Sample(sampData, float3(texuv, layer)).r;
-                h *= LayerTiling[layer].w; // per-layer height scale
-                blendedHeight = lerp(blendedHeight, h, weight);
+                float2 texuv = uv * LayerTiling[layer].xy;
+                heightVal = HeightMaps.Sample(sampTrilinear, float3(texuv, layer)).r;
             }
+            maxCombined = max(maxCombined, ew + ew * heightVal);
+        }
+    }
+
+    // Blend using height-weighted factors
+    if (maxCombined > 0)
+    {
+        hasAnyLayer = true;
+        float threshold = maxCombined - blendDepth;
+
+        float4 blendedColor = 0;
+        float4 blendedNormal = 0;
+        float totalBlend = 0;
+
+        for (uint i2 = 0; i2 < clampedSlices; ++i2)
+        {
+            for (uint j2 = 0; j2 < 4; ++j2)
+            {
+                float ew = sliceWeights[i2][j2];
+                if (ew <= 0) continue;
+
+                uint layer = i2 * 4 + j2;
+                float2 texuv = uv * LayerTiling[layer].xy;
+                float3 layerUV = float3(texuv, layer);
+
+                float heightVal = 0;
+                if (HeightMapsIdx != 0 && LayerTiling[layer].z > 0.5)
+                {
+                    Texture2DArray HeightMaps = ResourceDescriptorHeap[HeightMapsIdx];
+                    heightVal = HeightMaps.Sample(sampTrilinear, layerUV).r;
+                }
+
+                float bf = max(ew + ew * heightVal - threshold, 0);
+                if (bf <= 0) continue;
+
+                float4 c = DiffuseMaps.Sample(sampData, layerUV);
+                float4 n = NormalMaps.Sample(sampData, layerUV);
+
+                blendedColor += c * bf;
+                blendedNormal += n * bf;
+                totalBlend += bf;
+
+                // SSDM displacement: sequential lerp using effective weight
+                if (HeightMapsIdx != 0 && LayerTiling[layer].z > 0.5)
+                {
+                    float h = heightVal * LayerTiling[layer].w;
+                    blendedHeight = lerp(blendedHeight, h, ew);
+                }
+            }
+        }
+
+        if (totalBlend > 0)
+        {
+            float invTotal = 1.0 / totalBlend;
+            color = blendedColor * invTotal;
+            normal = blendedNormal * invTotal;
         }
     }
 

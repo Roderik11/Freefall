@@ -1533,18 +1533,12 @@ namespace Freefall.Assets
 
             progress?.Invoke($"Generating {missing.Count} thumbnails...");
 
-            // Snapshot cache: preserve lightweight/shared assets (Effects, Materials).
-            // Meshes and Textures must be evicted after each thumb to stay within
-            // MeshRegistry capacity (4096 slots). We use EvictForThumbnails which
-            // frees GPU buffers and MeshRegistry slots but does NOT release bindless
-            // descriptor indices — recycling those mid-batch causes DEVICE_REMOVED.
-            var cacheSnapshot = new HashSet<string>();
-            foreach (var key in Engine.Assets.GetCachedKeys())
-            {
-                var asset = Engine.Assets.TryGet(key);
-                if (asset is Graphics.Mesh || asset is Graphics.Texture) continue;
-                cacheSnapshot.Add(key);
-            }
+            // Snapshot cache: preserve ALL pre-existing assets. EvictAllExcept will only
+            // remove entries loaded DURING the thumbnail batch (e.g. meshes loaded by
+            // PrefabThumbnailGenerator). This is critical during live editing — the old
+            // code excluded Meshes/Textures from the snapshot, which disposed GPU buffers
+            // still referenced by live scene entities, causing DEVICE_REMOVED.
+            var cacheSnapshot = Engine.Assets.GetCachedKeys();
 
             // Create the shared rendering context for this batch
             using var renderer = rendererFactory?.Invoke();

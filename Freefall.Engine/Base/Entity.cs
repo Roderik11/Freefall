@@ -56,16 +56,38 @@ namespace Freefall.Base
                 return false;
             }
         }
-
-        [Reflection.DontSerialize]
-        public bool Hidden { get; set; }
+       
         [Reflection.DontSerialize]
         public bool Expanded { get; set; }
+
         [Reflection.DontSerialize]
         public EntityFlags Flags { get; set; }
 
         public bool DontDestroy => (Flags & EntityFlags.DontDestroy) != 0;
-        public bool HideAndDontSave => (Flags & EntityFlags.HideAndDontSave) != 0;
+
+        public bool DontSave
+        {
+            get
+            {
+                if ((Flags & EntityFlags.DontSave) != 0)
+                    return true;
+
+                return Transform.Parent?.Entity?.DontSave ?? false;
+            }
+        }
+            
+        [Reflection.DontSerialize]
+        public bool HideInHierarchy
+        {
+            get => (Flags & EntityFlags.HideInHierarchy) != 0;
+            set
+            {
+                if (value)
+                    Flags |= EntityFlags.HideInHierarchy;
+                else
+                    Flags &= ~EntityFlags.HideInHierarchy;
+            }
+        }
 
         public Entity() : this("Entity") { }
 

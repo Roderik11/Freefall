@@ -7,6 +7,8 @@ namespace Freefall.Base
     {
         None = 0,
         DontDestroy = 1,
-        HideAndDontSave = 2
+        DontSave = 2,
+        HideInHierarchy = 4,
+        HideAndDontSave = DontSave | HideInHierarchy
     }
 }

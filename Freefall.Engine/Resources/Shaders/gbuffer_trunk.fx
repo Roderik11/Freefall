@@ -31,7 +31,7 @@ cbuffer PushConstants : register(b3)
 };
 
 #include "common.fx"
-// @RenderState(RenderTargets=5)
+// @RenderState(RenderTargets=6)
 
 // Trunk/Branch GBuffer shader — based on gbuffer.fx with:
 // - Wind sway animation (low-frequency, large-scale)
@@ -133,6 +133,7 @@ struct PSOutput
     float4 Data : SV_Target2;
     float  Depth : SV_Target3;
     uint   EntityId : SV_Target4;
+    float2 Displacement : SV_Target5;    
 };
 
 SamplerState Sampler : register(s0);
@@ -171,10 +172,17 @@ PSOutput PS(VSOutput input)
     float3 dp2 = ddy(input.WorldPos.xyz);
     float2 duv1 = ddx(input.TexCoord);
     float2 duv2 = ddy(input.TexCoord);
+    
     float3 dp2perp = cross(dp2, N);
     float3 dp1perp = cross(N, dp1);
     float3 T = dp2perp * duv1.x + dp1perp * duv2.x;
     float3 B = dp2perp * duv1.y + dp1perp * duv2.y;
+    
+    // Fix TBN handedness for mirrored geometry (negative-scale transforms)
+    // Without this, mirrored instances get inverted normal map lighting
+    float handedness = dot(cross(T, B), N) < 0.0 ? -1.0 : 1.0;
+    T *= handedness;
+    
     float invmax = rsqrt(max(dot(T, T), dot(B, B)));
     float3x3 TBN = float3x3(T * invmax, B * invmax, N);
     
@@ -213,8 +221,14 @@ PSOutput PS(VSOutput input)
 
     output.Albedo = float4(color.rgb, emissiveMask);
     output.Normal = float4(N, 1.0f);
+    // Geometric specular anti-aliasing (Kaplanyan 2016 / Tokuyoshi 2019)
+    float3 dNdx = ddx(N), dNdy = ddy(N);
+    float normalVariance = max(dot(dNdx, dNdx), dot(dNdy, dNdy));
+    roughness = sqrt(saturate(roughness * roughness + min(2.0 * normalVariance, 0.18)));
+
     output.Data = float4(saturate(roughness), saturate(metal), saturate(ao), 1.0);
     output.Depth = input.Depth;
+    output.Displacement = float2(0,0);
     output.EntityId = (input.TransformSlot << 8u) | (input.MeshPartIdx & 0xFFu);
     return output;
 }

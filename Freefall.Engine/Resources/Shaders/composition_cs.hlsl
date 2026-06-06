@@ -52,7 +52,7 @@ void CSCompose(uint3 dispatchThreadId : SV_DispatchThreadID)
         // (0,0) sentinel = no displacement (avoids half-precision UV jitter)
         if (any(ssdmVal != 0))
         {
-            float2 myUV = (float2(px)) / float2(ScreenWidthIdx, ScreenHeightIdx);
+            float2 myUV = (float2(px) + 0.5) / float2(ScreenWidthIdx, ScreenHeightIdx);
             float2 offset_px = (ssdmVal - myUV) * float2(ScreenWidthIdx, ScreenHeightIdx);
             displaced_coord = int3(clamp(int2(px) + int2(round(offset_px)), int2(0,0), int2(ScreenWidthIdx-1, ScreenHeightIdx-1)), 0);
         }
@@ -102,7 +102,7 @@ void CSCompose(uint3 dispatchThreadId : SV_DispatchThreadID)
     finalColor = pow(abs(finalColor), 1.0f / 2.2f);
     
     // Dithering — break up color banding in smooth gradients (sky)
-    float2 seed = float2(px);
+    float2 seed = float2(px) + float2(frac(Time * 0.1), frac(Time * 0.31));
     float noise1 = frac(sin(dot(seed, float2(12.9898, 78.233))) * 43758.5453);
     float noise2 = frac(sin(dot(seed, float2(39.3468, 11.135))) * 23564.2365);
     float dither = (noise1 + noise2 - 1.0) / 255.0;

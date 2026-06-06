@@ -334,6 +334,11 @@ PSOutput PS(VSOutput input)
     
     output.Albedo = float4(color.rgb, emissiveMask);
     output.Normal = float4(N, 1.0f);
+    // Geometric specular anti-aliasing (Kaplanyan 2016 / Tokuyoshi 2019)
+    float3 dNdx = ddx(N), dNdy = ddy(N);
+    float normalVariance = max(dot(dNdx, dNdx), dot(dNdy, dNdy));
+    roughness = sqrt(saturate(roughness * roughness + min(2.0 * normalVariance, 0.18)));
+
     output.Data = float4(saturate(roughness), saturate(metal), saturate(ao), 1.0);
     output.Depth = input.Depth;
     output.EntityId = (input.TransformSlot << 8u) | (input.MeshPartIdx & 0xFFu);

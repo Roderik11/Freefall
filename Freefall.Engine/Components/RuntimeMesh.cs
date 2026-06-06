@@ -66,7 +66,7 @@ namespace Freefall.Components
 
         /// <summary>UV tiling scale. Higher = more texture repeats.</summary>
         [DefaultValue(1f)]
-        [ValueRange(0.01f, 20f)]
+        [ValueRange(0.01f, 3f)]
         public float UVScale = 1f;
 
 

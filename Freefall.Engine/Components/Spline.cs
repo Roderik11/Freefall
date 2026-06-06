@@ -29,6 +29,7 @@ namespace Freefall.Components
 
         /// <summary>Catmull-Rom tension. 0.5 = standard, 0 = loose, 1 = tight.</summary>
         [System.ComponentModel.DefaultValue(0.5f)]
+        [ValueRange(0.001f, 2f)]
         public float Tension = 0.5f;
 
         /// <summary>Number of line segments per span for gizmo drawing.</summary>

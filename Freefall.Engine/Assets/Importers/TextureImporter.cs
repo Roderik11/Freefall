@@ -20,6 +20,8 @@ namespace Freefall.Assets.Importers
         BC1_UNORM,
         BC1_UNORM_SRGB,
         R8G8B8A8_UNORM,
+        R8_UNORM,
+        R16_UNORM,
     }
 
     /// <summary>
@@ -31,7 +33,7 @@ namespace Freefall.Assets.Importers
     ///   GenerateMips – generate full mipmap chain
     ///   sRGB         – treat source as sRGB color data
     /// </summary>
-    [AssetImporter(".png", ".jpg", ".jpeg", ".tga", ".bmp", ".dds", ".psd")]
+    [AssetImporter(".png", ".jpg", ".jpeg", ".tga", ".bmp", ".dds", ".psd", ".tif")]
     public class TextureImporter : IImporter
     {
         [System.Text.Json.Serialization.JsonIgnore]
@@ -45,6 +47,8 @@ namespace Freefall.Assets.Importers
         public bool IsNormalMap = false;
         public bool AlphaFromGrayscale = false;
         public bool PremultiplyAlpha = false;
+        public bool PreserveAlphaCoverage = false;
+        public float AlphaCoverageThreshold = 0.2f;
 
         /// <summary>
         /// Set when the user manually saves settings. Prevents auto-detection
@@ -169,7 +173,8 @@ namespace Freefall.Assets.Importers
 
                 // Auto-select format: BC5 is already set for normals, otherwise BC1/BC7
                 var format = Format;
-                if (format != TextureFormat.BC5_UNORM && format != TextureFormat.BC4_UNORM)
+                if (format != TextureFormat.BC5_UNORM && format != TextureFormat.BC4_UNORM
+                    && format != TextureFormat.R8_UNORM && format != TextureFormat.R16_UNORM)
                 {
                     if (format == TextureFormat.BC7_UNORM || format == TextureFormat.BC7_UNORM_SRGB)
                     {
@@ -203,6 +208,9 @@ namespace Freefall.Assets.Importers
                 // textures with empty or packed alpha will produce black RGB.
                 if (PremultiplyAlpha && hasAlpha)
                     args += " -pmalpha";
+
+                if (PreserveAlphaCoverage)
+                    args += $" -keepcoverage {AlphaCoverageThreshold.ToString(System.Globalization.CultureInfo.InvariantCulture)}";
 
                 if (sRGB)
                     args += " -srgbi -srgbo";

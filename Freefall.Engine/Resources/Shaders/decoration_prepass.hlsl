@@ -97,9 +97,7 @@ void CSBuildDecoControl(uint3 dtid : SV_DispatchThreadID)
     n = normalize(n);
     float slopeDeg = acos(saturate(n.y)) * (180.0 / 3.14159265);
 
-    // ── Sample layer weights from the SAME packed ControlMapArray the surface shader uses ──
-    // This guarantees decoration weights exactly match the visual terrain splatmap result.
-    StructuredBuffer<LayerAutoMask> autoMaskBuf = ResourceDescriptorHeap[AutoMaskBufIdx];
+    // ── Sample layer weights from the packed ControlMapArray (already contains procedural + stamps) ──
     Texture2DArray ControlMaps = ResourceDescriptorHeap[ControlMapsIdx];
 
     uint cmW, cmH, sliceCount;
@@ -108,14 +106,12 @@ void CSBuildDecoControl(uint3 dtid : SV_DispatchThreadID)
     uint layerCount = LayerCountIdx;
     uint clampedLayerCount = min(layerCount, 32);
 
-    // Compute raw per-layer weights — identical to gputerrain.fx PS
+    // Compute raw per-layer weights — ControlMaps already has final weights
     float rawWeight[32];
     float effectiveWeight[32];
 
     for (uint si = 0; si < sliceCount; si++)
     {
-        // Packed array was written by CS_PackChannels using dtid-based UV (no flip).
-        // Prepass also uses dtid-based UV, so sample with uv (not flipped).
         float4 weights = ControlMaps.SampleLevel(ClampSampler, float3(uv, si), 0);
 
         for (uint sj = 0; sj < 4; sj++)
@@ -123,24 +119,7 @@ void CSBuildDecoControl(uint3 dtid : SV_DispatchThreadID)
             uint layerIdx = si * 4 + sj;
             if (layerIdx >= clampedLayerCount) break;
 
-            float weight = weights[sj];
-
-            // Procedural auto-mask: max(painted, procedural) — same as gputerrain.fx lines 276-283
-            LayerAutoMask mask = autoMaskBuf[layerIdx];
-            if (mask.ProceduralWeight != 0)
-            {
-                float pmask = 1;
-                pmask *= smoothstep(mask.SlopeMin - mask.SlopeBlend, mask.SlopeMin, slopeDeg);
-                pmask *= smoothstep(mask.SlopeMax + mask.SlopeBlend, mask.SlopeMax, slopeDeg);
-                pmask *= smoothstep(mask.HeightMin - mask.HeightBlend, mask.HeightMin, heightNorm);
-                pmask *= smoothstep(mask.HeightMax + mask.HeightBlend, mask.HeightMax, heightNorm);
-                if (mask.ProceduralWeight > 0)
-                    weight = max(weight, pmask * mask.ProceduralWeight);
-                else
-                    weight = pmask * abs(mask.ProceduralWeight) * (1.0 - weight);
-            }
-
-            rawWeight[layerIdx] = weight;
+            rawWeight[layerIdx] = weights[sj];
             effectiveWeight[layerIdx] = 0;
         }
     }

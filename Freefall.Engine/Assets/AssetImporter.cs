@@ -1,3 +1,4 @@
+using Freefall.Reflection;
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -66,6 +67,7 @@ namespace Freefall.Assets
         /// instead of the importer itself.
         /// </summary>
         [System.Text.Json.Serialization.JsonIgnore]
+        [DontSerialize]
         Type AssetType => null;
 
         /// <summary>

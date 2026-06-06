@@ -157,10 +157,11 @@ namespace Freefall.Graphics
 
             var staticSamplers = new StaticSamplerDescription[]
             {
-                new StaticSamplerDescription(ShaderVisibility.All, 0, 0) { Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Wrap, AddressV = TextureAddressMode.Wrap, AddressW = TextureAddressMode.Wrap },
+                new StaticSamplerDescription(ShaderVisibility.All, 0, 0) { Filter = Filter.Anisotropic, MaxAnisotropy = 16, AddressU = TextureAddressMode.Wrap, AddressV = TextureAddressMode.Wrap, AddressW = TextureAddressMode.Wrap },
                 new StaticSamplerDescription(ShaderVisibility.All, 1, 0) { Filter = Filter.MinMagMipPoint, AddressU = TextureAddressMode.Clamp, AddressV = TextureAddressMode.Clamp, AddressW = TextureAddressMode.Clamp },
                 new StaticSamplerDescription(ShaderVisibility.All, 2, 0) { Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Clamp, AddressV = TextureAddressMode.Clamp, AddressW = TextureAddressMode.Clamp },
-                new StaticSamplerDescription(ShaderVisibility.All, 3, 0) { Filter = Filter.ComparisonMinMagLinearMipPoint, AddressU = TextureAddressMode.Clamp, AddressV = TextureAddressMode.Clamp, AddressW = TextureAddressMode.Clamp, ComparisonFunction = ComparisonFunction.LessEqual } // Shadow maps use standard Z (orthographic)
+                new StaticSamplerDescription(ShaderVisibility.All, 3, 0) { Filter = Filter.ComparisonMinMagLinearMipPoint, AddressU = TextureAddressMode.Clamp, AddressV = TextureAddressMode.Clamp, AddressW = TextureAddressMode.Clamp, ComparisonFunction = ComparisonFunction.LessEqual }, // Shadow maps use standard Z (orthographic)
+                new StaticSamplerDescription(ShaderVisibility.All, 4, 0) { Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Wrap, AddressV = TextureAddressMode.Wrap, AddressW = TextureAddressMode.Wrap }, // Trilinear wrap for displacement/height maps
             };
 
             // D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED = 0x400

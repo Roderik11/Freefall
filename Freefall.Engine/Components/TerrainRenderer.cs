@@ -218,6 +218,7 @@ namespace Freefall.Components
         private Texture _packedControlTexture;     // stable wrapper for ControlMapsArray
         private uint _packedControlSRV;
         private uint[] _packedSliceUAVs;            // per-slice UAVs for direct packing
+        private uint _packedControlArrayUAV;        // full-array UAV for stamp overlay
         private int _packedArrayResolution;
         private int _packedSliceCount;
 
@@ -457,6 +458,9 @@ namespace Freefall.Components
             }
             Debug.Log($"[TerrainRenderer] Awake: MaxDepth={MaxDepth} TotalNodes={_totalNodes} MaxPatches={MaxPatches} ComputeInit={_computeInitialized}");
             ComputeReady = _computeInitialized;
+
+            MessageDispatcher.AddListener(EngineMsg.StampChanged, OnStampChanged);
+            MessageDispatcher.AddListener(EngineMsg.SplineChanged, OnSplineChanged);
         }
 
         public override void Destroy()
@@ -543,6 +547,7 @@ namespace Freefall.Components
             if (_packedSliceUAVs != null)
                 foreach (var idx in _packedSliceUAVs)
                     if (idx != 0) device?.ReleaseBindlessIndex(idx);
+            if (_packedControlArrayUAV != 0) device?.ReleaseBindlessIndex(_packedControlArrayUAV);
 
             // ── Decorator buffers ──
             _decoratorHeadersBuffer?.Dispose();
@@ -577,6 +582,9 @@ namespace Freefall.Components
             // cached Terrain asset and persist for reuse on next scene load.
             _baker?.Dispose();
             _baker = null;
+
+            MessageDispatcher.RemoveListener(EngineMsg.StampChanged, OnStampChanged);
+            MessageDispatcher.RemoveListener(EngineMsg.SplineChanged, OnSplineChanged);
         }
 
         private bool _textureArraysInitialized;
@@ -604,7 +612,6 @@ namespace Freefall.Components
                 UpdateLayerParams();
 
             var material = Material;
-            var heightmap = Terrain.Heightmap;
             if (material == null || material.Effect == null) return;
 
             int frameIndex = Engine.FrameIndex % FrameCount;
@@ -617,7 +624,7 @@ namespace Freefall.Components
                 Terrain.PendingBakedHeightmapBytes = null; // consumed
 
                 int expectedRes = Terrain.EffectiveHeightmapResolution;
-                int cachedRes = (int)Math.Sqrt(bytes.Length / 2); // R16_Float = 2 bpp
+                int cachedRes = (int)Math.Sqrt(bytes.Length / 2); // R16_UNorm = 2 bpp
 
                 if (cachedRes == expectedRes)
                 {
@@ -640,7 +647,9 @@ namespace Freefall.Components
             }
 
             // GPU height layer bake (runs before any heightmap access)
-            if (Terrain.ConsumeFlags(TerrainDirtyFlags.HeightBake) && Terrain.HeightLayers.Count > 0)
+            bool hasHeightWork = Terrain.HeightLayers.Count > 0 || Terrain.Stamps.Count > 0
+                                 || ComponentCache<HeightStamp>.All.Count > 0;
+            if (Terrain.ConsumeFlags(TerrainDirtyFlags.HeightBake) && hasHeightWork)
             {
                 var baker = _baker;
 
@@ -668,6 +677,9 @@ namespace Freefall.Components
                     renderer.BakeTerrainNormals(list);
                 });
             }
+
+            // Capture heightmap AFTER cache upload / bake — BakedHeightmap may have just been set above
+            var heightmap = Terrain.Heightmap;
 
             // Debounced CPU heightfield readback — only when baking has settled (not during active painting)
             if (_needHeightFieldReadback && !Terrain.NeedsUpdate(TerrainDirtyFlags.HeightBake))
@@ -739,7 +751,8 @@ namespace Freefall.Components
                     }
                 }
 
-                if (hasAny)
+                bool hasSplatStamps = ComponentCache<SplatStamp>.All.Count > 0;
+
                 {
                     int res = Terrain.EffectiveSplatmapResolution;
                     int layerCount = Terrain.Layers.Count;
@@ -753,16 +766,40 @@ namespace Freefall.Components
                     var sliceUAVs = _packedSliceUAVs;
                     var packedArray = _packedControlArray;
                     var renderer = this;
+                    var arrayUAV = _packedControlArrayUAV;
+                    var splatStamps = ComponentCache<SplatStamp>.All;
+                    var terrainOrigin = Transform?.WorldPosition ?? Vector3.Zero;
+                    uint hmSRV = heightmap != null ? (uint)heightmap.BindlessIndex : 0;
+                    var autoMaskBuf = _layerAutoMaskBuffer;
                     CommandBuffer.Enqueue(RenderPass.Opaque, (list) =>
                     {
                         // Transition to UAV for packing
                         list.ResourceBarrierTransition(packedArray,
                             ResourceStates.Common, ResourceStates.UnorderedAccess);
 
-                        _baker.PackControlMaps(list, indices, sliceUAVs, res);
+                        // 1. Pack painted ControlMaps (zeros for unpainted layers)
+                        if (hasAny)
+                            _baker.PackControlMaps(list, indices, sliceUAVs, res);
 
-                        // UAV barrier then back to common for shader reads
                         list.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(packedArray)));
+
+                        // 2. Procedural auto-mask overlay (height/slope → max with painted)
+                        if (hmSRV != 0 && autoMaskBuf != null && renderer.Terrain != null)
+                        {
+                            _baker.DispatchProceduralMask(list, renderer.Terrain,
+                                hmSRV, autoMaskBuf, arrayUAV, res, sliceCount);
+                            list.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(packedArray)));
+                        }
+
+                        // 3. Splat stamp overlay (non-destructive, after procedural)
+                        if (splatStamps.Count > 0 && renderer.Terrain != null)
+                        {
+                            _baker.DispatchSplatStamps(list, renderer.Terrain, splatStamps,
+                                terrainOrigin, arrayUAV, res, sliceCount);
+                            list.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(packedArray)));
+                        }
+
+                        // Back to common for shader reads
                         list.ResourceBarrierTransition(packedArray,
                             ResourceStates.UnorderedAccess, ResourceStates.Common);
 
@@ -875,6 +912,21 @@ namespace Freefall.Components
                         }
                     }, device.GetCpuHandle(_packedSliceUAVs[i]));
             }
+
+            // Full-array UAV for stamp overlay (covers all slices)
+            _packedControlArrayUAV = device.AllocateBindlessIndex();
+            device.NativeDevice.CreateUnorderedAccessView(_packedControlArray, null,
+                new UnorderedAccessViewDescription
+                {
+                    Format = Format.R8G8B8A8_UNorm,
+                    ViewDimension = UnorderedAccessViewDimension.Texture2DArray,
+                    Texture2DArray = new Texture2DArrayUnorderedAccessView
+                    {
+                        MipSlice = 0,
+                        FirstArraySlice = 0,
+                        ArraySize = (uint)sliceCount
+                    }
+                }, device.GetCpuHandle(_packedControlArrayUAV));
 
             // Create stable Texture wrapper (never replaced unless array is recreated)
             _packedControlTexture = Texture.WrapNative(_packedControlArray, _packedControlSRV);
@@ -1965,6 +2017,17 @@ namespace Freefall.Components
             _decoPrepassCS.Dispatch(0, cmd, (uint)((resolution + 7) / 8), (uint)((resolution + 7) / 8));
 
             cmd.ResourceBarrierUnorderedAccessView(_decoControlTex);
+
+            // DecoStamp overlay (still in UAV state)
+            var decoStamps = ComponentCache<DecoStamp>.All;
+            if (decoStamps.Count > 0 && Terrain != null)
+            {
+                var terrainOrigin = Transform?.WorldPosition ?? Vector3.Zero;
+                _baker.DispatchDecoStamps(cmd, Terrain, decoStamps,
+                    terrainOrigin, _decoControlUAV, resolution);
+                cmd.ResourceBarrierUnorderedAccessView(_decoControlTex);
+            }
+
             // Transition from UAV → SRV so the spawn shader and terrain debug overlay can read correctly
             cmd.ResourceBarrier(new ResourceBarrier(
                 new ResourceTransitionBarrier(_decoControlTex,
@@ -2482,6 +2545,28 @@ namespace Freefall.Components
                     _meshDrawCountBuffer!.Native,  // count buffer: actual number of draws
                     0);
             }
+        }
+
+        // ── Terrain Stamp message handlers ─────────────────────────
+
+        private void OnStampChanged(Message msg)
+        {
+            Terrain?.MarkForUpdate(
+                TerrainDirtyFlags.HeightBake |
+                TerrainDirtyFlags.SplatPack |
+                TerrainDirtyFlags.AlbedoBake |
+                TerrainDirtyFlags.DecoPrepass);
+        }
+
+        private void OnSplineChanged(Message msg)
+        {
+            // Rebake if the changed spline has any sibling stamp component
+            if (msg.Data is Spline spline && spline.Entity?.GetComponent<TerrainStamp>() != null)
+                Terrain?.MarkForUpdate(
+                    TerrainDirtyFlags.HeightBake |
+                    TerrainDirtyFlags.SplatPack |
+                    TerrainDirtyFlags.AlbedoBake |
+                    TerrainDirtyFlags.DecoPrepass);
         }
     }
 }

@@ -27,8 +27,7 @@ namespace Freefall.Components
         /// Child entity that holds all spawned output.
         /// Destroyed and recreated on each Execute() call.
         /// </summary>
-        [System.ComponentModel.Browsable(false)]
-        public Entity OutputEntity { get; private set; }
+        private Entity? OutputEntity;
 
         /// <summary>
         /// Execute the PCG graph: destroy previous output, inject context, run graph.
@@ -47,6 +46,7 @@ namespace Freefall.Components
             // 2. Create output container
             OutputEntity = new Entity("PCG_Output");
             OutputEntity.Transform.Parent = Transform;
+            OutputEntity.Flags |= EntityFlags.DontSave;
 
             // 3. Inject context into nodes that need it
             InjectContext();
@@ -65,8 +65,7 @@ namespace Freefall.Components
         /// </summary>
         public void DestroyOutput()
         {
-            if (OutputEntity == null) return;
-            DestroyHierarchy(OutputEntity);
+            OutputEntity?.Destroy();
             OutputEntity = null;
         }
 
@@ -116,7 +115,7 @@ namespace Freefall.Components
         /// </summary>
         private void InjectContext()
         {
-            Spline spline = FindInDescendants<Spline>(Entity);
+            Spline spline = Entity.GetComponentInChildren<Spline>();
 
             foreach (var node in Graph.Nodes)
             {
@@ -125,43 +124,10 @@ namespace Freefall.Components
 
                 if (node is SpawnPrefab spawner)
                     spawner.SpawnParent = OutputEntity;
+
+                if (node is TerrainProjection projection)
+                    projection.WorldMatrix = Transform?.Matrix ?? System.Numerics.Matrix4x4.Identity;
             }
-        }
-
-        private static T FindInDescendants<T>(Entity entity) where T : Component
-        {
-            foreach (var comp in entity.Components)
-            {
-                if (comp is T found) return found;
-            }
-
-            int childCount = entity.Transform.GetChildCount();
-            for (int i = 0; i < childCount; i++)
-            {
-                var child = entity.Transform.GetChild(i);
-                if (child?.Entity == null) continue;
-                var result = FindInDescendants<T>(child.Entity);
-                if (result != null) return result;
-            }
-
-            return null;
-        }
-
-        private static void DestroyHierarchy(Entity entity)
-        {
-            var children = new List<Entity>();
-            int childCount = entity.Transform.GetChildCount();
-            for (int i = 0; i < childCount; i++)
-            {
-                var child = entity.Transform.GetChild(i);
-                if (child?.Entity != null)
-                    children.Add(child.Entity);
-            }
-
-            foreach (var child in children)
-                DestroyHierarchy(child);
-
-            entity.Destroy();
         }
     }
 }
