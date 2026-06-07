@@ -234,16 +234,17 @@ namespace Freefall.Components
             var desc = renderer.LightBuffer.Native.Description;
             lightCS.SetPushConstant("NormalTex", renderer.Normals.BindlessIndex);
             lightCS.SetPushConstant("DepthTex", renderer.Depth.BindlessIndex);
-            lightCS.SetPushConstant("ShadowMap", renderer.ShadowTextureArray?.BindlessIndex ?? 0u);
+            lightCS.SetPushConstant("ShadowMap", Engine.Settings.EnableShadows ? (renderer.ShadowTextureArray?.BindlessIndex ?? 0u) : 0u);
             lightCS.SetPushConstant("DepthGBuf", renderer.DepthGBuffer.BindlessIndex);
             lightCS.SetPushConstant("AlbedoTex", renderer.Albedo.BindlessIndex);
             lightCS.SetPushConstant("DataTex", renderer.Data.BindlessIndex);
-            lightCS.SetPushConstant("LightingCascadeSRV", _activeLightingCascadeSrv);
+            lightCS.SetPushConstant("LightingCascadeSRV", Engine.Settings.EnableShadows ? _activeLightingCascadeSrv : 0u);
             lightCS.SetPushConstant("OutputUAV", renderer.LightBuffer.UavIndex);
             lightCS.SetPushConstant("ScreenWidth", (uint)desc.Width);
             lightCS.SetPushConstant("ScreenHeight", (uint)desc.Height);
-            lightCS.SetPushConstant("SSSTex", renderer.ScreenSpaceShadows?.OutputSrvIndex ?? 0u);
+            lightCS.SetPushConstant("SSSTex", Engine.Settings.EnableScreenSpaceShadows ? (renderer.ScreenSpaceShadows?.OutputSrvIndex ?? 0u) : 0u);
             lightCS.SetPushConstant("SSDMTex", Engine.Settings.EnableSSDM ? (renderer.ScreenSpaceDisplacement?.OutputSrvIndex ?? 0u) : 0u);
+            lightCS.SetPushConstant("GITex", Engine.Settings.EnableRadianceCascades ? (renderer.RadianceCascades?.GIBufferSrvIndex ?? 0u) : 0u);
             
             // Bind cbuffers on compute root (Material.Apply committed them on graphics root)
             foreach (var cb in Material.ConstantBuffers)

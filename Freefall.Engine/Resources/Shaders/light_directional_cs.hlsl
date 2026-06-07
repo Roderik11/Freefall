@@ -18,6 +18,7 @@ cbuffer PushConstants : register(b3)
     uint ScreenHeightIdx;
     uint SSSTexIdx;
     uint SSDMTexIdx;
+    uint GITexIdx;
 };
 
 #include "common.fx"
@@ -353,6 +354,14 @@ void CSDirectionalLight(uint3 dispatchThreadId : SV_DispatchThreadID)
     
     // Shadow wrap
     lighting += diffuse * LightColor * LightIntensity * NdotL * (1.0 - shadowFactor) * 0.12 * ao;
+    
+    // Radiance Cascades GI — indirect diffuse contribution
+    if (GITexIdx > 0)
+    {
+        Texture2D<float4> GITex = ResourceDescriptorHeap[GITexIdx];
+        float3 gi = GITex.Load(displaced_coord).rgb;
+        lighting += kd * albedo * gi * ao;
+    }
     
     Output[px] = float4(lighting, 1.0f);
 }

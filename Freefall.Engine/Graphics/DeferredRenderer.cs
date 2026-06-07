@@ -45,8 +45,13 @@ namespace Freefall.Graphics
         /// <summary>SMAA 1x anti-aliasing (Jimenez et al. 2012).</summary>
         public SMAA? Smaa { get; private set; }
 
+        /// <summary>Sparse 3D Radiance Cascades (world-space GI).</summary>
+        public RadianceCascades? RadianceCascades { get; private set; }
+
         private Material matClear = null!;
         private Material matDirectionalLight = null!;
+        /// <summary>Directional light material — used by RC to borrow SceneConstants binding.</summary>
+        internal Material DirectionalLightMaterial => matDirectionalLight;
         private ComputeShader _compositionCS = null!;
         private int _kCompose;
         public ComputeShader DirectionalLightCS { get; private set; } = null!;
@@ -143,6 +148,10 @@ namespace Freefall.Graphics
             // Screen-space displacement
             ScreenSpaceDisplacement = new ScreenSpaceDisplacement();
 
+            // Radiance Cascades GI
+            RadianceCascades = new RadianceCascades();
+            RadianceCascades.Initialize(width, height);
+
             // SMAA anti-aliasing
             Smaa = new SMAA();
         }
@@ -194,6 +203,9 @@ namespace Freefall.Graphics
             HiZPyramid?.Dispose();
             HiZPyramid = new HiZPyramid();
             HiZPyramid.Create(Engine.Device, width, height);
+
+            // Resize RC GI buffer
+            RadianceCascades?.Resize(width, height);
         }
 
         public override void Clear(Camera camera)
@@ -544,7 +556,7 @@ namespace Freefall.Graphics
 
              // Screen-space shadows: ray-march against GBuffer linear depth (includes heightmap bias)
              // Must execute before DepthGBuffer transitions to PixelShaderResource (SSS is compute)
-             if (ScreenSpaceShadows != null)
+             if (ScreenSpaceShadows != null && Engine.Settings.EnableScreenSpaceShadows)
              {
                  PixMarker.Begin(list, "Screen-Space Shadows");
                  var cvp = Matrix4x4.CreateLookAtLeftHanded(Vector3.Zero, camera.Forward, camera.Up) * camera.Projection;
@@ -554,6 +566,7 @@ namespace Freefall.Graphics
                  ScreenSpaceShadows.Execute(list, DepthGBuffer.BindlessIndex, dw, dh, lightDir, cvp, camera.NearPlane);
                  PixMarker.End(list);
              }
+
 
              // Transition GBuffer depth to PixelShaderResource for light pass sampling
              Transition(list, DepthGBuffer.Native, ResourceStates.NonPixelShaderResource, ResourceStates.PixelShaderResource);
@@ -567,8 +580,6 @@ namespace Freefall.Graphics
         private void FillLightBuffer(Camera camera, ID3D12GraphicsCommandList list)
         {
              PixMarker.Begin(list, "Lighting");
-             var fromState = _isFirstFrame ? ResourceStates.Common : ResourceStates.PixelShaderResource;
-             Transition(list, LightBuffer.Native, fromState, ResourceStates.UnorderedAccess);
 
              // Zero-translation CameraInverse: even though GBuffer depth was written with full View,
              // NDC = (worldPos - camPos) × R × P, so inverse(R × P) correctly gives camera-relative pos
@@ -580,6 +591,18 @@ namespace Freefall.Graphics
                  pair.Value.SetParameter("CameraRelativeVP", cvp);
              }
              
+             
+             // Radiance Cascades GI — runs while LightBuffer is still in SRV state
+             // so it can read last frame's lighting for bounce radiance estimation.
+             if (RadianceCascades != null && Engine.Settings.EnableRadianceCascades)
+             {
+                 RadianceCascades.Execute(list, camera, this);
+             }
+
+             // NOW transition LightBuffer to UAV for directional light (after RC has read it as SRV)
+             var fromState = _isFirstFrame ? ResourceStates.Common : ResourceStates.PixelShaderResource;
+             Transition(list, LightBuffer.Native, fromState, ResourceStates.UnorderedAccess);
+
              // Execute custom Light actions (directional light compute dispatch writes to UAV)
              PixMarker.Begin(list, "Directional Light");
              CommandBuffer.ExecuteCustomActions(RenderPass.Light, list);
@@ -944,6 +967,7 @@ namespace Freefall.Graphics
             ShadowTextureArray?.Dispose();
             ScreenSpaceShadows?.Dispose();
             ScreenSpaceDisplacement?.Dispose();
+            RadianceCascades?.Dispose();
             Smaa?.Dispose();
             _entityIdReadback?.Dispose();
             _depthReadback?.Dispose();

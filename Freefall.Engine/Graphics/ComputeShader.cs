@@ -295,6 +295,16 @@ namespace Freefall.Graphics
         /// </summary>
         public void Dispatch(int kernel, ID3D12GraphicsCommandList cmd, uint groupsX, uint groupsY = 1, uint groupsZ = 1)
         {
+            BindKernel(kernel, cmd);
+            cmd.Dispatch(groupsX, groupsY, groupsZ);
+        }
+
+        /// <summary>
+        /// Bind a kernel's PSO, push constants, and constant buffers without dispatching.
+        /// Use before ExecuteIndirect for compute indirect dispatch.
+        /// </summary>
+        public void BindKernel(int kernel, ID3D12GraphicsCommandList cmd)
+        {
             EnsureSourceLoaded();
             if (kernel < 0 || kernel >= _kernels.Count)
                 throw new ArgumentOutOfRangeException(nameof(kernel));
@@ -315,8 +325,6 @@ namespace Freefall.Graphics
                     cmd.SetComputeRootConstantBufferView((uint)cb.Slot, cb.GpuAddress);
                 }
             }
-
-            cmd.Dispatch(groupsX, groupsY, groupsZ);
         }
 
         // ────────────── Slot Resolution ──────────────

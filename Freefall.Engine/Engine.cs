@@ -307,7 +307,7 @@ namespace Freefall
             // F6: Cycle debug visualization mode
             if (Input.IsKeyPressed(Keys.F6))
             {
-                Settings.DebugVisualizationMode = (DebugVizMode)(((int)Settings.DebugVisualizationMode + 1) % 7);
+                Settings.DebugVisualizationMode = (DebugVizMode)(((int)Settings.DebugVisualizationMode + 1) % 8);
                 Debug.Log($"[Engine] Debug Viz: {Settings.DebugVisualizationMode}");
             }
             
@@ -421,7 +421,8 @@ namespace Freefall
         ContactShadow = 3,
         LinearDepth = 4,
         DecoControlMap = 5,
-        HeightMap = 6
+        HeightMap = 6,
+        RCDebug = 7
     }
 
     public class EngineSettings
@@ -437,6 +438,7 @@ namespace Freefall
          public bool DisableDepthSort { get; set; } = true;                  // GPU doesn't order instances within a draw call — sort has no visual effect
 
          public DebugVizMode DebugVisualizationMode { get; set; } = DebugVizMode.Off; // F5 - Debug viz
+         public int RCDebugSubMode { get; set; } = 1; // 0=off, 1=tile lookup, 2=per-level radiance, 3=constant bypass, 4=raw pool readback
 
          [ValueRange(3, 8)]
          public int  ShadowCascadeCount { get; set; } = 4;                   // Number of shadow cascades
@@ -464,6 +466,9 @@ namespace Freefall
          [ValueRange(1f, 8f)]
          public float SSSShadowContrast { get; set; } = 2.0f;
 
+         public bool EnableShadows { get; set; } = true;
+         public bool EnableScreenSpaceShadows { get; set; } = true;
+
          // Anti-Aliasing
          public bool EnableSMAA { get; set; } = false;
 
@@ -480,6 +485,12 @@ namespace Freefall
 
          [ValueRange(1f, 128f)]
          public float PixelErrorThreshold { get; set; } = 128.0f;
+
+         // Radiance Cascades (Sparse 3D GI)
+         public bool EnableRadianceCascades { get; set; } = false;
+
+         [ValueRange(0f, 5f)]
+         public float RCIntensity { get; set; } = 1.0f;
 
          public System.Numerics.Matrix4x4 FrozenViewProjection { get; set; } // VP matrix when frustum frozen
     }
