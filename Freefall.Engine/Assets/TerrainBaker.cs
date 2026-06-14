@@ -70,7 +70,7 @@ namespace Freefall.Assets
             public uint BlendMode;
         }
 
-        /// <summary>GPU struct matching HLSL HeightStampDescriptor. 44 bytes (11 x uint/float).</summary>
+        /// <summary>GPU struct matching HLSL HeightStampDescriptor. 64 bytes (16 x uint/float).</summary>
         [StructLayout(LayoutKind.Sequential)]
         private struct HeightStampDescriptorGPU
         {
@@ -84,6 +84,11 @@ namespace Freefall.Assets
             public float NoiseFreq;          // edge noise frequency (0 = disabled)
             public float NoiseAmp;           // edge noise amplitude in UV space
             public uint NoiseSeed;
+            public uint HeightmapIdx;        // bindless SRV index (0 = no heightmap)
+            public float HeightmapStrength;  // normalized strength (worldStrength / maxHeight)
+            public float RotationSin;        // sin(entity Y rotation)
+            public float RotationCos;        // cos(entity Y rotation)
+            public float _pad0;              // pad to 64 bytes
         }
 
         /// <summary>GPU struct matching HLSL StampSplinePoint. 16 bytes.</summary>
@@ -1515,6 +1520,20 @@ namespace Freefall.Assets
                     desc.TargetHeight = (center.Y + stamp.HeightOffset) / maxHeight;
                     desc.SplinePointOffset = 0xFFFFFFFF;
                     desc.SplinePointCount = 0;
+                }
+
+                // Heightmap (optional)
+                if (stamp.Heightmap != null)
+                {
+                    desc.HeightmapIdx = stamp.Heightmap.BindlessIndex;
+                    desc.HeightmapStrength = stamp.Strength / maxHeight;
+
+                    // Extract Y rotation from entity transform
+                    var rot = stamp.Transform?.Rotation ?? Quaternion.Identity;
+                    float yaw = MathF.Atan2(2f * (rot.W * rot.Y + rot.X * rot.Z),
+                                            1f - 2f * (rot.Y * rot.Y + rot.Z * rot.Z));
+                    desc.RotationSin = MathF.Sin(yaw);
+                    desc.RotationCos = MathF.Cos(yaw);
                 }
 
                 descriptors.Add(desc);

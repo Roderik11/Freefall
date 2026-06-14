@@ -8,7 +8,11 @@
 #pragma kernel CSTrace1
 #pragma kernel CSTrace2
 #pragma kernel CSTrace3
+#pragma kernel CSMerge0
+#pragma kernel CSMerge1
+#pragma kernel CSMerge2
 #pragma kernel CSShade
+#pragma kernel CSComposeGI
 
 // ─────────────────────── Push Constants ───────────────────────
 
@@ -47,6 +51,10 @@ cbuffer PushConstants : register(b3)
     uint CurLevelIdx;
     uint IndArgsIdx;
     uint RCDebugModeIdx; // 0=off, 1=tile lookup, 2=radiance per level
+    uint DataTexIdx;     // GBuffer data (roughness, metalness, AO)
+    uint LightBufUavIdx; // LightBuffer UAV for GI composition
+    uint PrevGIIdx;      // Previous frame GI (SRV) for temporal blend
+    uint HiZTexIdx;      // Hi-Z depth pyramid (all mips) for coarse-level traces
 };
 
 #include "common.fx"
@@ -57,9 +65,9 @@ SamplerState LinearSampler : register(s0);
 
 #define CASCADE_COUNT     4
 #define BASE_OCT_RES      4
-#define BASE_GRID_SIZE    0.5
-#define BASE_INTERVAL     0.5
-#define TRACE_STEPS       48
+#define BASE_GRID_SIZE    0.25
+#define BASE_INTERVAL     0.25
+#define TRACE_STEPS_BASE  16     // L0 steps; doubles per level
 #define TILE_SCREEN_SIZE  8.0
 #define SHADE_OCT_RES     6      // hemisphere integral resolution (6×6 = 36 dirs)
 #define HASH_EMPTY        0xFFFFFFFF
@@ -69,8 +77,8 @@ SamplerState LinearSampler : register(s0);
 // Per-level max tiles (must match C# MaxTilesPerLevel)
 uint MaxTilesForLevel(uint level)
 {
-    // L0: 65536, L1: 16384, L2: 4096, L3: 1024
-    return 65536u >> (level * 2);
+    // L0: 262144, L1: 65536, L2: 16384, L3: 4096
+    return 262144u >> (level * 2);
 }
 
 // ─────────────────────── Per-Level Helpers ───────────────────────
@@ -128,9 +136,11 @@ struct HashEntry
 
 uint PackKey(int3 gridCoord)
 {
-    return (asuint(gridCoord.x) & 0x3FF)
-         | ((asuint(gridCoord.y) & 0x3FF) << 10)
-         | ((asuint(gridCoord.z) & 0x3FF) << 20);
+    // Bias into unsigned range: -512..+511 → 0..1023
+    uint3 biased = uint3(gridCoord + int3(512, 512, 512));
+    return (biased.x & 0x3FF)
+         | ((biased.y & 0x3FF) << 10)
+         | ((biased.z & 0x3FF) << 20);
 }
 
 uint HashSlot(uint key)
@@ -287,7 +297,7 @@ void ReadTileInterval(RWByteAddressBuffer pool, uint tileIdx, uint dirIdx,
 
 // ─────────────────────── Screen-Space Ray March ───────────────────────
 
-void TraceInterval(float3 worldOrigin, float3 worldDir, float maxDist,
+void TraceInterval(float3 worldOrigin, float3 worldDir, float maxDist, uint level,
                    out float3 hitRadiance, out float hitTransmittance)
 {
     hitRadiance = float3(0, 0, 0);
@@ -296,14 +306,12 @@ void TraceInterval(float3 worldOrigin, float3 worldDir, float maxDist,
     Texture2D<float> depthBuf = ResourceDescriptorHeap[DepthGBufIdx];
     float3 viewFwd = float3(View._13, View._23, View._33);
     
-    float stepSize = maxDist / float(TRACE_STEPS);
-    
-    // Get depth buffer dimensions for Load
-    uint dbW, dbH;
-    depthBuf.GetDimensions(dbW, dbH);
+    // Scale steps per level: L0=16, L1=32, L2=64, L3=128
+    uint traceSteps = TRACE_STEPS_BASE << level;
+    float stepSize = maxDist / float(traceSteps);
     
     [loop]
-    for (int i = 0; i < TRACE_STEPS; i++)
+    for (uint i = 0; i < traceSteps; i++)
     {
         float t = (float(i) + 0.5) * stepSize;
         float3 rayPos = worldOrigin + worldDir * t;
@@ -315,9 +323,7 @@ void TraceInterval(float3 worldOrigin, float3 worldDir, float maxDist,
         
         if (any(uv < 0.0) || any(uv > 1.0)) continue;
         
-        int2 depthCoord = int2(uv * float2(dbW, dbH));
-        float sceneDepth = depthBuf.Load(int3(depthCoord, 0)).r;
-        
+        float sceneDepth = depthBuf.SampleLevel(LinearSampler, uv, 0).r;
         if (sceneDepth <= 0.0) continue;
         
         float rayDepth = dot(rayPos, viewFwd);
@@ -325,13 +331,21 @@ void TraceInterval(float3 worldOrigin, float3 worldDir, float maxDist,
         
         if (penetration > -stepSize * 1.5 && penetration < stepSize * 3.0)
         {
+            // Skip self-intersection: first 4 steps check grazing angle
+            if (i < 4)
+            {
+                Texture2D normalTex = ResourceDescriptorHeap[NormalTexIdx];
+                float3 hitNormal = normalTex.SampleLevel(LinearSampler, uv, 0).xyz;
+                if (abs(dot(hitNormal, worldDir)) < 0.15) continue;
+            }
+            
             Texture2D albedoTex = ResourceDescriptorHeap[AlbedoTexIdx];
             float4 albedoData = albedoTex.SampleLevel(LinearSampler, uv, 0);
             
             Texture2D lightTex = ResourceDescriptorHeap[LightTexIdx];
             float3 surfaceLight = lightTex.SampleLevel(LinearSampler, uv, 0).rgb;
             
-            hitRadiance = albedoData.rgb * surfaceLight * (1.0 / PI) + albedoData.rgb * albedoData.a;
+            hitRadiance = surfaceLight * (1.0 / PI) + albedoData.rgb * albedoData.a;
             hitTransmittance = 0.0;
             return;
         }
@@ -342,6 +356,14 @@ void TraceInterval(float3 worldOrigin, float3 worldDir, float maxDist,
 
 // ─────────────────────── CSMark ───────────────────────
 // Insert tiles at ALL cascade levels for each visible pixel
+
+// Max distance from camera for each cascade level.
+// Screen-space tile size stays roughly constant across distances.
+float LevelMaxDist(uint level)
+{
+    // L0: 16m, L1: 32m, L2: 64m, L3: unlimited
+    return BASE_GRID_SIZE * float(1u << level) * 64.0;
+}
 
 [numthreads(8, 8, 1)]
 void CSMark(uint3 dtid : SV_DispatchThreadID)
@@ -362,15 +384,11 @@ void CSMark(uint3 dtid : SV_DispatchThreadID)
     Texture2D NormalTex = ResourceDescriptorHeap[NormalTexIdx];
     float3 normal = NormalTex.Load(int3(dtid.xy, 0)).xyz;
     
-    // Insert tile at every cascade level — with distance culling
-    // Near-field levels (L0) don't need tiles for distant surfaces
+    // Insert tile at each cascade level within its distance limit
     [unroll]
     for (uint level = 0; level < CASCADE_COUNT; level++)
     {
-        // Only mark tiles within useful range: intervalEnd × 32
-        float maxRange = GetIntervalRange(level).y;
-        float markRadius = maxRange * 32.0;
-        if (distFromCam > markRadius) continue;
+        if (distFromCam > LevelMaxDist(level)) continue;
         
         float gridSize = GridSizeForLevel(level);
         int3 gridCoord = int3(floor(absWorldPos / gridSize));
@@ -422,10 +440,17 @@ void TraceLevel(uint level, uint2 octXY, uint tileIdx)
     // Direction from 2D octahedral coords
     float3 dir = GetDirection(octXY.x, octXY.y, octRes);
     
-    // Trace this level's interval only
+    // Self-intersection bias: skip the first half grid-cell along the ray direction.
+    // This pushes the trace start past the probe's own surface without depending
+    // on screen-space normal sampling (which causes per-frame jitter).
+    float gridSize = GridSizeForLevel(level);
+    float bias = gridSize * 0.5;
+    
+    // Trace this level's interval: bias shifts the origin forward but we
+    // keep the end point at range.y to avoid gaps between cascade levels.
     float2 range = GetIntervalRange(level);
-    float3 rayOrigin = origin + dir * range.x;
-    float maxDist = range.y - range.x;
+    float3 rayOrigin = origin + dir * (range.x + bias);
+    float maxDist = max(0.0, range.y - range.x - bias);
     
     float3 hitRadiance;
     float hitTransmittance;
@@ -438,7 +463,7 @@ void TraceLevel(uint level, uint2 octXY, uint tileIdx)
     }
     else
     {
-        TraceInterval(rayOrigin, dir, maxDist, hitRadiance, hitTransmittance);
+        TraceInterval(rayOrigin, dir, maxDist, level, hitRadiance, hitTransmittance);
     }
     
     // Store interval (radiance + transmittance)
@@ -474,6 +499,134 @@ void CSTrace3(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
     TraceLevel(3, gtid.xy, gid.x);
 }
 
+// ─────────────────────── Cascade Merge ───────────────────────
+// Merges source level (N+1) into target level (N) with spatial + angular interpolation.
+// Run top-down: L3→L2, L2→L1, L1→L0.
+// After merge, L0 contains full radiance from all cascade levels.
+
+void MergeLevel(uint targetLevel, uint2 octXY, uint tileIdx)
+{
+    uint targetOctRes = OctResForLevel(targetLevel);
+    if (octXY.x >= targetOctRes || octXY.y >= targetOctRes) return;
+    
+    uint targetDirsPerTile = targetOctRes * targetOctRes;
+    uint dirIdx = octXY.y * targetOctRes + octXY.x;
+    
+    // Read own (target) interval
+    RWByteAddressBuffer targetPool = ResourceDescriptorHeap[GetTPoolIdx(targetLevel)];
+    float3 myRad;
+    float myTrans;
+    ReadTileInterval(targetPool, tileIdx, dirIdx, targetDirsPerTile, myRad, myTrans);
+    
+    // If target is fully opaque, higher levels can't contribute
+    if (myTrans < 0.001) return;
+    
+    // Read target probe position (absolute world space)
+    StructuredBuffer<float4> targetInfo = ResourceDescriptorHeap[GetTInfoIdx(targetLevel)];
+    float3 probePos = targetInfo[tileIdx].xyz;
+    
+    // Source level
+    uint srcLevel = targetLevel + 1;
+    uint srcOctRes = OctResForLevel(srcLevel);
+    uint srcDirsPerTile = srcOctRes * srcOctRes;
+    float srcGridSize = GridSizeForLevel(srcLevel);
+    
+    // Map probe position to source grid for spatial interpolation
+    float3 srcCellPos = probePos / srcGridSize - 0.5;
+    int3 srcBase = int3(floor(srcCellPos));
+    float3 srcFrac = srcCellPos - float3(srcBase);
+    
+    // Map direction to source octahedral grid for angular interpolation
+    float3 dir = GetDirection(octXY.x, octXY.y, targetOctRes);
+    float2 octUV = OctEncode(dir);
+    float2 srcDirPos = octUV * float(srcOctRes) - 0.5;
+    int2 srcDirBase = int2(floor(srcDirPos));
+    float2 srcDirFrac = srcDirPos - float2(srcDirBase);
+    
+    StructuredBuffer<HashEntry> srcEntries = ResourceDescriptorHeap[GetHEntriesIdx(srcLevel)];
+    RWByteAddressBuffer srcPool = ResourceDescriptorHeap[GetTPoolIdx(srcLevel)];
+    
+    float3 interpRad = 0;
+    float interpTrans = 0;
+    float totalWeight = 0;
+    
+    // 8 spatial neighbors at source level
+    [unroll]
+    for (uint s = 0; s < 8; s++)
+    {
+        int3 srcOffset = int3(s & 1, (s >> 1) & 1, (s >> 2) & 1);
+        int3 srcCoord = srcBase + srcOffset;
+        uint srcKey = PackKey(srcCoord);
+        uint srcTileIdx = HashMapLookup(srcEntries, HCapMaskIdx, srcKey);
+        if (srcTileIdx == POOL_INVALID) continue;
+        
+        float3 sw = float3(
+            (s & 1) ? srcFrac.x : (1.0 - srcFrac.x),
+            ((s >> 1) & 1) ? srcFrac.y : (1.0 - srcFrac.y),
+            ((s >> 2) & 1) ? srcFrac.z : (1.0 - srcFrac.z)
+        );
+        float spatialWeight = sw.x * sw.y * sw.z;
+        
+        // 4 angular neighbors (bilinear in octahedral space)
+        [unroll]
+        for (uint a = 0; a < 4; a++)
+        {
+            int2 angOffset = int2(a & 1, (a >> 1) & 1);
+            int2 angCoord = clamp(srcDirBase + angOffset, int2(0, 0),
+                                  int2(srcOctRes - 1, srcOctRes - 1));
+            uint srcDirIdx = angCoord.y * srcOctRes + angCoord.x;
+            
+            float2 aw = float2(
+                (a & 1) ? srcDirFrac.x : (1.0 - srcDirFrac.x),
+                ((a >> 1) & 1) ? srcDirFrac.y : (1.0 - srcDirFrac.y)
+            );
+            float angularWeight = aw.x * aw.y;
+            
+            float3 sRad;
+            float sTrans;
+            ReadTileInterval(srcPool, srcTileIdx, srcDirIdx, srcDirsPerTile, sRad, sTrans);
+            
+            float w = spatialWeight * angularWeight;
+            interpRad += sRad * w;
+            interpTrans += sTrans * w;
+            totalWeight += w;
+        }
+    }
+    
+    if (totalWeight > 0.001)
+    {
+        interpRad /= totalWeight;
+        interpTrans /= totalWeight;
+        
+        // Front-to-back compose: target interval first, then source (farther)
+        float3 newRad = myRad + myTrans * interpRad;
+        float newTrans = myTrans * interpTrans;
+        
+        WriteTileInterval(targetPool, tileIdx, dirIdx, targetDirsPerTile, newRad, newTrans);
+    }
+}
+
+// Merge L1→L0: target octRes=4, thread group 4×4
+[numthreads(4, 4, 1)]
+void CSMerge0(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
+{
+    MergeLevel(0, gtid.xy, gid.x);
+}
+
+// Merge L2→L1: target octRes=8, thread group 8×8
+[numthreads(8, 8, 1)]
+void CSMerge1(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
+{
+    MergeLevel(1, gtid.xy, gid.x);
+}
+
+// Merge L3→L2: target octRes=16, thread group 16×16
+[numthreads(16, 16, 1)]
+void CSMerge2(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
+{
+    MergeLevel(2, gtid.xy, gid.x);
+}
+
 // ─────────────────────── CSShade ───────────────────────
 // Merge all cascade levels front-to-back, cosine-weighted hemisphere integral
 
@@ -499,117 +652,153 @@ void CSShade(uint3 dtid : SV_DispatchThreadID)
     Texture2D NormalTex = ResourceDescriptorHeap[NormalTexIdx];
     float3 normal = NormalTex.Load(int3(dtid.xy, 0)).xyz;
     
-    // Phase 1: Look up 8 surrounding tile indices at all levels for trilinear interpolation
-    // Each level has 8 corner tiles and 3 interpolation weights
-    uint tileCorners[CASCADE_COUNT][8];  // [level][corner]
-    float3 lerpWeights[CASCADE_COUNT];    // trilinear weights per level
+    // Phase 1: Find finest available cascade level with valid tiles
+    uint shadeLevel = CASCADE_COUNT; // sentinel = none found
+    uint tileCorners[8];
+    float3 lerpW;
     
-    [unroll]
+    [loop]
     for (uint lvl = 0; lvl < CASCADE_COUNT; lvl++)
     {
         float gridSize = GridSizeForLevel(lvl);
-        float3 cellPos = absWorldPos / gridSize - 0.5; // shift so interpolation is centered on cell centers
+        float3 cellPos = absWorldPos / gridSize - 0.5;
         int3 baseCoord = int3(floor(cellPos));
-        float3 frac3 = cellPos - float3(baseCoord);
-        lerpWeights[lvl] = frac3;
+        float3 w = cellPos - float3(baseCoord);
         
         StructuredBuffer<HashEntry> entries = ResourceDescriptorHeap[GetHEntriesIdx(lvl)];
         
-        // 8 corner lookups (2×2×2)
+        bool anyValid = false;
+        uint corners[8];
         [unroll]
         for (uint c = 0; c < 8; c++)
         {
-            int3 offset = int3(c & 1, (c >> 1) & 1, (c >> 2) & 1);
-            int3 coord = baseCoord + offset;
+            int3 coord = baseCoord + int3(c & 1, (c >> 1) & 1, (c >> 2) & 1);
             uint key = PackKey(coord);
-            tileCorners[lvl][c] = HashMapLookup(entries, HCapMaskIdx, key);
+            corners[c] = HashMapLookup(entries, HCapMaskIdx, key);
+            if (corners[c] != POOL_INVALID) anyValid = true;
         }
+        
+        if (anyValid)
+        {
+            shadeLevel = lvl;
+            lerpW = w;
+            [unroll] for (uint cc = 0; cc < 8; cc++) tileCorners[cc] = corners[cc];
+            break;
+        }
+    }
+    
+    if (shadeLevel >= CASCADE_COUNT)
+    {
+        GIOutput[dtid.xy] = float4(0, 0, 0, 0);
+        return;
     }
     
     // ─── Debug: tile lookup visualization ───
     if (RCDebugModeIdx == 1)
     {
-        float3 debugColor = 0;
-        float3 levelColors[4] = {
-            float3(1, 0, 0), float3(0, 1, 0), float3(0, 0, 1), float3(1, 1, 0)
-        };
+        uint found = 0;
         [unroll]
-        for (uint d = 0; d < CASCADE_COUNT; d++)
-        {
-            uint found = 0;
-            [unroll]
-            for (uint cc = 0; cc < 8; cc++)
-                if (tileCorners[d][cc] != POOL_INVALID) found++;
-            if (found > 0)
-                debugColor += levelColors[d] * (float(found) / 8.0);
-        }
-        GIOutput[dtid.xy] = float4(debugColor, 1.0);
+        for (uint cc = 0; cc < 8; cc++)
+            if (tileCorners[cc] != POOL_INVALID) found++;
+        // Encode level in color: L0=green, L1=cyan, L2=blue, L3=magenta
+        float3 levelColor = float3(0, 1, 0);
+        if (shadeLevel == 1) levelColor = float3(0, 1, 1);
+        else if (shadeLevel == 2) levelColor = float3(0, 0, 1);
+        else if (shadeLevel == 3) levelColor = float3(1, 0, 1);
+        GIOutput[dtid.xy] = float4(levelColor * (found / 8.0), 1.0);
         return;
     }
     
-    // ─── Debug modes 2-4 use single-tile lookup (first corner) ───
-    // (Keep existing debug modes working with minimal changes)
-    if (RCDebugModeIdx >= 2 && RCDebugModeIdx <= 4)
+    // ─── Debug: raw radiance in normal direction (mode 2) ───
+    if (RCDebugModeIdx == 2)
     {
-        uint tileIdx[CASCADE_COUNT];
-        [unroll]
-        for (uint dd = 0; dd < CASCADE_COUNT; dd++)
-            tileIdx[dd] = tileCorners[dd][0];
-        
-        if (RCDebugModeIdx == 2)
+        if (tileCorners[0] != POOL_INVALID)
         {
-            float3 levelColors2[4] = {
-                float3(1, 0, 0), float3(0, 1, 0), float3(0, 0, 1), float3(1, 1, 0)
-            };
-            float3 debugColor2 = 0;
-            [unroll]
-            for (uint level2 = 0; level2 < CASCADE_COUNT; level2++)
-            {
-                if (tileIdx[level2] == POOL_INVALID) continue;
-                uint octRes2 = OctResForLevel(level2);
-                float2 octUV2 = OctEncode(normal);
-                uint ix2 = clamp(uint(octUV2.x * float(octRes2)), 0, octRes2 - 1);
-                uint iy2 = clamp(uint(octUV2.y * float(octRes2)), 0, octRes2 - 1);
-                uint dirIdx2 = iy2 * octRes2 + ix2;
-                uint dirsPerTile2 = octRes2 * octRes2;
-                float3 iRad; float iTrans;
-                RWByteAddressBuffer pool2 = ResourceDescriptorHeap[GetTPoolIdx(level2)];
-                ReadTileInterval(pool2, tileIdx[level2], dirIdx2, dirsPerTile2, iRad, iTrans);
-                float lum2 = dot(iRad, float3(0.299, 0.587, 0.114));
-                debugColor2 += levelColors2[level2] * saturate(lum2);
-            }
-            GIOutput[dtid.xy] = float4(debugColor2, 1.0);
-            return;
+            uint octResDbg = OctResForLevel(shadeLevel);
+            float2 octUV = OctEncode(normal);
+            uint ix = clamp(uint(octUV.x * float(octResDbg)), 0, octResDbg - 1);
+            uint iy = clamp(uint(octUV.y * float(octResDbg)), 0, octResDbg - 1);
+            uint dirIdx = iy * octResDbg + ix;
+            uint dirsPerTile = octResDbg * octResDbg;
+            float3 iRad; float iTrans;
+            RWByteAddressBuffer pool = ResourceDescriptorHeap[GetTPoolIdx(shadeLevel)];
+            ReadTileInterval(pool, tileCorners[0], dirIdx, dirsPerTile, iRad, iTrans);
+            GIOutput[dtid.xy] = float4(iRad, 1.0);
         }
-        
-        if (RCDebugModeIdx == 4)
-        {
-            float3 totalRad4 = 0;
-            uint totalHits4 = 0;
-            [unroll]
-            for (uint lv4 = 0; lv4 < CASCADE_COUNT; lv4++)
-            {
-                if (tileIdx[lv4] == POOL_INVALID) continue;
-                uint octRes4 = OctResForLevel(lv4);
-                uint dpt4 = octRes4 * octRes4;
-                RWByteAddressBuffer pool4 = ResourceDescriptorHeap[GetTPoolIdx(lv4)];
-                for (uint d4 = 0; d4 < min(dpt4, 64u); d4++)
-                {
-                    float3 iR4; float iT4;
-                    ReadTileInterval(pool4, tileIdx[lv4], d4, dpt4, iR4, iT4);
-                    if (iT4 < 0.5) { totalRad4 += iR4; totalHits4++; }
-                }
-            }
-            if (totalHits4 > 0)
-                GIOutput[dtid.xy] = float4(totalRad4 / float(totalHits4), 1.0);
-            else
-                GIOutput[dtid.xy] = float4(0, 0, 0, 1);
-            return;
-        }
+        else
+            GIOutput[dtid.xy] = float4(0, 0, 0, 1);
+        return;
     }
     
-    // Phase 2: Hemisphere integral with trilinear-interpolated probe data
+    // ─── Debug: per-level radiance in normal dir (mode 4) ───
+    if (RCDebugModeIdx == 4)
+    {
+        StructuredBuffer<HashEntry> entries2 = ResourceDescriptorHeap[GetHEntriesIdx(2)];
+        StructuredBuffer<HashEntry> entries3 = ResourceDescriptorHeap[GetHEntriesIdx(3)];
+        
+        float gridSize2 = GridSizeForLevel(2);
+        int3 coord2 = int3(floor(absWorldPos / gridSize2));
+        uint key2 = PackKey(coord2);
+        uint tile2 = HashMapLookup(entries2, HCapMaskIdx, key2);
+        
+        float gridSize3 = GridSizeForLevel(3);
+        int3 coord3 = int3(floor(absWorldPos / gridSize3));
+        uint key3 = PackKey(coord3);
+        uint tile3 = HashMapLookup(entries3, HCapMaskIdx, key3);
+        
+        float l0trans = 0;
+        float l2sum = 0;
+        float l3sum = 0;
+        
+        if (tileCorners[0] != POOL_INVALID)
+        {
+            uint octRes0 = OctResForLevel(shadeLevel);
+            float2 octUV = OctEncode(normal);
+            uint ix = clamp(uint(octUV.x * float(octRes0)), 0, octRes0 - 1);
+            uint iy = clamp(uint(octUV.y * float(octRes0)), 0, octRes0 - 1);
+            uint dirIdx = iy * octRes0 + ix;
+            float3 r; float t;
+            RWByteAddressBuffer pool = ResourceDescriptorHeap[GetTPoolIdx(shadeLevel)];
+            ReadTileInterval(pool, tileCorners[0], dirIdx, octRes0 * octRes0, r, t);
+            l0trans = t;
+        }
+        
+        if (tile2 != POOL_INVALID)
+        {
+            uint octRes2 = OctResForLevel(2);
+            uint dirs2 = octRes2 * octRes2;
+            RWByteAddressBuffer pool2 = ResourceDescriptorHeap[GetTPoolIdx(2)];
+            for (uint d = 0; d < dirs2; d++)
+            {
+                float3 r; float t;
+                ReadTileInterval(pool2, tile2, d, dirs2, r, t);
+                l2sum += dot(r, float3(0.333, 0.333, 0.333));
+            }
+        }
+        
+        if (tile3 != POOL_INVALID)
+        {
+            uint octRes3 = OctResForLevel(3);
+            uint dirs3 = octRes3 * octRes3;
+            RWByteAddressBuffer pool3 = ResourceDescriptorHeap[GetTPoolIdx(3)];
+            for (uint d = 0; d < min(dirs3, 256u); d++)
+            {
+                float3 r; float t;
+                ReadTileInterval(pool3, tile3, d, dirs3, r, t);
+                l3sum += dot(r, float3(0.333, 0.333, 0.333));
+            }
+        }
+        
+        GIOutput[dtid.xy] = float4(l0trans, l2sum, l3sum, 1.0);
+        return;
+    }
+    
+    // Phase 2: Hemisphere integral using finest available level
     float3 irradiance = 0;
+    
+    uint octRes = OctResForLevel(shadeLevel);
+    uint dirsPerTile = octRes * octRes;
+    RWByteAddressBuffer pool = ResourceDescriptorHeap[GetTPoolIdx(shadeLevel)];
     
     [loop]
     for (uint dy = 0; dy < SHADE_OCT_RES; dy++)
@@ -621,63 +810,38 @@ void CSShade(uint3 dtid : SV_DispatchThreadID)
             float NdotD = saturate(dot(normal, dir));
             if (NdotD <= 0.0) continue;
             
-            // Merge intervals front-to-back across cascade levels
-            // For each level, trilinearly interpolate between 8 surrounding tiles
-            float3 L = float3(0, 0, 0);
-            float beta = 1.0;
+            // Map query direction to the shade level's octahedral grid
+            float2 octUV = OctEncode(dir);
+            uint ix = clamp(uint(octUV.x * float(octRes)), 0, octRes - 1);
+            uint iy = clamp(uint(octUV.y * float(octRes)), 0, octRes - 1);
+            uint dirIdx = iy * octRes + ix;
+            
+            // Trilinear interpolation over 8 surrounding tiles
+            float3 interpRad = 0;
+            float totalWeight = 0;
             
             [unroll]
-            for (uint level = 0; level < CASCADE_COUNT; level++)
+            for (uint c = 0; c < 8; c++)
             {
-                uint octRes = OctResForLevel(level);
-                float2 octUV = OctEncode(dir);
-                uint ix = clamp(uint(octUV.x * float(octRes)), 0, octRes - 1);
-                uint iy = clamp(uint(octUV.y * float(octRes)), 0, octRes - 1);
-                uint dirIdx = iy * octRes + ix;
-                uint dirsPerTile = octRes * octRes;
+                if (tileCorners[c] == POOL_INVALID) continue;
                 
-                RWByteAddressBuffer pool = ResourceDescriptorHeap[GetTPoolIdx(level)];
-                float3 w = lerpWeights[level];
+                float3 cw = float3(
+                    (c & 1) ? lerpW.x : (1.0 - lerpW.x),
+                    ((c >> 1) & 1) ? lerpW.y : (1.0 - lerpW.y),
+                    ((c >> 2) & 1) ? lerpW.z : (1.0 - lerpW.z)
+                );
+                float cornerWeight = cw.x * cw.y * cw.z;
                 
-                // Trilinear interpolation over 8 corner tiles
-                float3 interpRad = 0;
-                float interpTrans = 0;
-                float totalWeight = 0;
+                float3 cRad;
+                float cTrans;
+                ReadTileInterval(pool, tileCorners[c], dirIdx, dirsPerTile, cRad, cTrans);
                 
-                [unroll]
-                for (uint c = 0; c < 8; c++)
-                {
-                    if (tileCorners[level][c] == POOL_INVALID) continue;
-                    
-                    float3 cw = float3(
-                        (c & 1) ? w.x : (1.0 - w.x),
-                        ((c >> 1) & 1) ? w.y : (1.0 - w.y),
-                        ((c >> 2) & 1) ? w.z : (1.0 - w.z)
-                    );
-                    float cornerWeight = cw.x * cw.y * cw.z;
-                    
-                    float3 cRad;
-                    float cTrans;
-                    ReadTileInterval(pool, tileCorners[level][c], dirIdx, dirsPerTile,
-                                   cRad, cTrans);
-                    
-                    interpRad += cRad * cornerWeight;
-                    interpTrans += cTrans * cornerWeight;
-                    totalWeight += cornerWeight;
-                }
-                
-                if (totalWeight > 0.001)
-                {
-                    interpRad /= totalWeight;
-                    interpTrans /= totalWeight;
-                    
-                    L += beta * interpRad;
-                    beta *= interpTrans;
-                    if (beta < 0.001) break;
-                }
+                interpRad += cRad * cornerWeight;
+                totalWeight += cornerWeight;
             }
             
-            irradiance += L * NdotD;
+            if (totalWeight > 0.001)
+                irradiance += (interpRad / totalWeight) * NdotD;
         }
     }
     
@@ -686,4 +850,33 @@ void CSShade(uint3 dtid : SV_DispatchThreadID)
     
     float intensity = asfloat(RCIntensityIdx);
     GIOutput[dtid.xy] = float4(irradiance * intensity, 1.0);
+}
+
+// ─────────────────────── CSComposeGI ───────────────────────
+// Applies GI to LightBuffer as a separate pass.
+// Runs AFTER all direct lighting, so the trace next frame reads direct-only.
+
+[numthreads(8, 8, 1)]
+void CSComposeGI(uint3 dtid : SV_DispatchThreadID)
+{
+    if (dtid.x >= ScreenWIdx || dtid.y >= ScreenHIdx) return;
+    
+    Texture2D<float4> giTex = ResourceDescriptorHeap[GIOutputIdx];
+    float3 gi = giTex.Load(int3(dtid.xy, 0)).rgb;
+    
+    if (dot(gi, gi) < 0.0001) return; // skip if no GI
+    
+    Texture2D<float4> albedoTex = ResourceDescriptorHeap[AlbedoTexIdx];
+    float3 albedo = albedoTex.Load(int3(dtid.xy, 0)).rgb;
+    
+    Texture2D<float4> dataTex = ResourceDescriptorHeap[DataTexIdx];
+    float4 data = dataTex.Load(int3(dtid.xy, 0));
+    float metal = saturate(data.g);
+    float ao = saturate(data.b);
+    
+    float3 kd = (1.0 - metal); // simplified diffuse (no Fresnel for indirect)
+    
+    RWTexture2D<float4> lightBuf = ResourceDescriptorHeap[LightBufUavIdx];
+    float3 existing = lightBuf[dtid.xy].rgb;
+    lightBuf[dtid.xy] = float4(existing + kd * albedo * gi * ao, 1.0);
 }

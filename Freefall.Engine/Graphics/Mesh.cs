@@ -549,10 +549,19 @@ namespace Freefall.Graphics
                 -Vector3.UnitX, -Vector3.UnitX, -Vector3.UnitX, -Vector3.UnitX,
                  Vector3.UnitX,  Vector3.UnitX,  Vector3.UnitX,  Vector3.UnitX,
             };
-            Vector2 z = Vector2.Zero;
             Vector2[] uvs = {
-                z, z, z, z,  z, z, z, z,  z, z, z, z,
-                z, z, z, z,  z, z, z, z,  z, z, z, z,
+                // Front face
+                new(0,0), new(1,0), new(0,1), new(1,1),
+                // Back face
+                new(0,0), new(1,0), new(0,1), new(1,1),
+                // Top face
+                new(0,0), new(1,0), new(0,1), new(1,1),
+                // Bottom face
+                new(0,0), new(1,0), new(0,1), new(1,1),
+                // Left face
+                new(0,0), new(1,0), new(0,1), new(1,1),
+                // Right face
+                new(0,0), new(1,0), new(0,1), new(1,1),
             };
             uint[] indices = {
                 0,1,2, 2,1,3,     // Front
@@ -601,8 +610,8 @@ namespace Freefall.Graphics
                     uint b = a + 1;
                     uint c = (uint)((stack + 1) * (slices + 1) + slice);
                     uint d = c + 1;
-                    indices[ii++] = a; indices[ii++] = c; indices[ii++] = b;
-                    indices[ii++] = b; indices[ii++] = c; indices[ii++] = d;
+                    indices[ii++] = a; indices[ii++] = b; indices[ii++] = c;
+                    indices[ii++] = b; indices[ii++] = d; indices[ii++] = c;
                 }
             }
             var mesh = new Mesh(device, verts, norms, uvs, indices);

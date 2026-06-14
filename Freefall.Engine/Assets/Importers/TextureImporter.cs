@@ -46,6 +46,7 @@ namespace Freefall.Assets.Importers
         public bool GenerateMips = true;
         public bool IsNormalMap = false;
         public bool AlphaFromGrayscale = false;
+        public bool IgnoreAlpha = false;
         public bool PremultiplyAlpha = false;
         public bool PreserveAlphaCoverage = false;
         public float AlphaCoverageThreshold = 0.2f;
@@ -169,7 +170,7 @@ namespace Freefall.Assets.Importers
 
             try
             {
-                bool hasAlpha = HasAlphaChannel(sourcePath);
+                bool hasAlpha = !IgnoreAlpha && HasAlphaChannel(sourcePath);
 
                 // Auto-select format: BC5 is already set for normals, otherwise BC1/BC7
                 var format = Format;
@@ -178,7 +179,7 @@ namespace Freefall.Assets.Importers
                 {
                     if (format == TextureFormat.BC7_UNORM || format == TextureFormat.BC7_UNORM_SRGB)
                     {
-                        if (!hasAlpha)
+                        if (!hasAlpha && !IgnoreAlpha)
                             format = TextureFormat.BC1_UNORM;
                     }
                 }
@@ -214,6 +215,10 @@ namespace Freefall.Assets.Importers
 
                 if (sRGB)
                     args += " -srgbi -srgbo";
+
+                // Force alpha to 1.0 — strips alpha data so mips don't bleed black
+                if (IgnoreAlpha)
+                    args += " -swizzle rgb1";
 
                 args += $" -o \"{tempDir}\" \"{sourcePath}\"";
 

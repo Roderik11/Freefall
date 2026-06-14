@@ -237,7 +237,14 @@ namespace Freefall.Base
             var removeMethod = cacheType.GetMethod("Remove", BindingFlags.Public | BindingFlags.Static, [typeof(Entity)]);
             removeMethod?.Invoke(null, [this]);
         }
-        
+
+        public void RemoveComponent<T>() where T : Component
+        {
+            var component = GetComponent<T>();
+            if (component != null)
+                RemoveComponent(component);
+        }
+
         /// <summary>
         /// Destroy this entity: call Destroy() on all components,
         /// unregister from ComponentCaches, remove from EntityManager.

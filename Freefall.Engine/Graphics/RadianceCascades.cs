@@ -17,14 +17,14 @@ namespace Freefall.Graphics
         private const int CascadeCount = 4;
         private const int BaseOctRes = 4;
         private const int BaseGridSize = 1; // 0.5 represented as shift
-        private const int HashMapCapacity = 1 << 18; // 256K per level
+        private const int HashMapCapacity = 1 << 19; // 512K per level
 
-        // Per-level max tiles (sized so each pool is ~8MB)
-        // L0: 16 dirs × 8B = 128B/tile → 65K tiles = 8MB
-        // L1: 64 dirs × 8B = 512B/tile → 16K tiles = 8MB
-        // L2: 256 dirs × 8B = 2KB/tile  → 4K tiles  = 8MB
-        // L3: 1024 dirs × 8B = 8KB/tile → 1K tiles  = 8MB
-        private static readonly int[] MaxTilesPerLevel = { 1 << 16, 1 << 14, 1 << 12, 1 << 10 };
+        // Per-level max tiles
+        // L0: 16 dirs × 8B = 128B/tile → 262K tiles = 33MB
+        // L1: 64 dirs × 8B = 512B/tile → 65K tiles  = 33MB
+        // L2: 256 dirs × 8B = 2KB/tile  → 16K tiles  = 33MB
+        // L3: 1024 dirs × 8B = 8KB/tile → 4K tiles   = 33MB
+        private static readonly int[] MaxTilesPerLevel = { 1 << 18, 1 << 16, 1 << 14, 1 << 12 };
 
         // Per-level directions: (BaseOctRes << level)^2
         private static int DirsForLevel(int level)
@@ -44,15 +44,18 @@ namespace Freefall.Graphics
 
         // Screen-res output
         private RenderTexture2D _giBuffer;
+        private RenderTexture2D _prevGIBuffer; // Previous frame's GI for temporal smoothing
 
         // Compute shader + kernels
         private ComputeShader _shader;
-        private int _kMark, _kShade, _kPrepareIndirect;
+        private int _kMark, _kShade, _kPrepareIndirect, _kComposeGI;
         private int[] _kTrace = new int[CascadeCount];
+        private int[] _kMerge = new int[CascadeCount - 1]; // CSMerge0, CSMerge1, CSMerge2
 
         // State
         private int _width, _height;
         private bool _firstFrame = true;
+        private bool _prevGIFirstFrame = true;
 
         // Public API
         public uint GIBufferSrvIndex => _giBuffer?.BindlessIndex ?? 0;
@@ -66,7 +69,11 @@ namespace Freefall.Graphics
             _kTrace[1] = _shader.FindKernel("CSTrace1");
             _kTrace[2] = _shader.FindKernel("CSTrace2");
             _kTrace[3] = _shader.FindKernel("CSTrace3");
+            _kMerge[0] = _shader.FindKernel("CSMerge0");
+            _kMerge[1] = _shader.FindKernel("CSMerge1");
+            _kMerge[2] = _shader.FindKernel("CSMerge2");
             _kShade = _shader.FindKernel("CSShade");
+            _kComposeGI = _shader.FindKernel("CSComposeGI");
         }
 
         public void Initialize(int width, int height)
@@ -82,6 +89,7 @@ namespace Freefall.Graphics
             }
 
             _giBuffer = new RenderTexture2D(Engine.Device, width, height, Format.R16G16B16A16_Float, randomWrite: true);
+            _prevGIBuffer = new RenderTexture2D(Engine.Device, width, height, Format.R16G16B16A16_Float, randomWrite: true);
             _width = width;
             _height = height;
         }
@@ -90,9 +98,12 @@ namespace Freefall.Graphics
         {
             _giBuffer?.Dispose();
             _giBuffer = new RenderTexture2D(Engine.Device, width, height, Format.R16G16B16A16_Float, randomWrite: true);
+            _prevGIBuffer?.Dispose();
+            _prevGIBuffer = new RenderTexture2D(Engine.Device, width, height, Format.R16G16B16A16_Float, randomWrite: true);
             _width = width;
             _height = height;
             _firstFrame = true;
+            _prevGIFirstFrame = true;
         }
 
         /// <summary>
@@ -143,11 +154,16 @@ namespace Freefall.Graphics
             _shader.SetPushConstant("DepthGBuf", renderer.DepthGBuffer.BindlessIndex);
             _shader.SetPushConstant("NormalTex", renderer.Normals.BindlessIndex);
             _shader.SetPushConstant("AlbedoTex", renderer.Albedo.BindlessIndex);
-            _shader.SetPushConstant("LightTex", renderer.LightBuffer.BindlessIndex);
+            _shader.SetPushConstant("LightTex", renderer.LightBuffer.BindlessIndex); // Read with GI feedback for multi-bounce
             _shader.SetPushConstant("GIOutput", _giBuffer.UavIndex);
             _shader.SetPushConstant("RCIntensity", BitConverter.SingleToUInt32Bits(Engine.Settings.RCIntensity));
             _shader.SetPushConstant("CurLevel", 0u);
             _shader.SetPushConstant("IndArgs", _indirectArgs[0].UavIndex);
+            
+            // Hi-Z depth pyramid for coarse-level traces (0 = not available)
+            uint hiZSrv = (renderer.HiZPyramid != null && renderer.HiZPyramid.Ready)
+                ? renderer.HiZPyramid.FullSRV : 0u;
+            _shader.SetPushConstant("HiZTex", hiZSrv);
 
             uint groupsX = ((uint)desc.Width + 7) / 8;
             uint groupsY = ((uint)desc.Height + 7) / 8;
@@ -211,7 +227,39 @@ namespace Freefall.Graphics
             // UAV barrier after all traces
             cmd.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(null)));
 
-            // 6. CSShade — For the shade pass, swap hash map entries to SRV indices
+            // 6. CSMerge — top-down cascade merge: L3→L2, L2→L1, L1→L0
+            // Each merge reads source level (N+1) and writes target level (N)
+            PixMarker.Begin(cmd, "RC Merge");
+            for (int i = CascadeCount - 2; i >= 0; i--) // i=2 (L3→L2), i=1 (L2→L1), i=0 (L1→L0)
+            {
+                // Merge uses the hash map entries as SRV for source level lookup
+                _shader.SetPushConstant(_kMerge[i], "HEntries0", _hashMaps[0].EntriesSrvIndex);
+                _shader.SetPushConstant(_kMerge[i], "HEntries1", _hashMaps[1].EntriesSrvIndex);
+                _shader.SetPushConstant(_kMerge[i], "HEntries2", _hashMaps[2].EntriesSrvIndex);
+                _shader.SetPushConstant(_kMerge[i], "HEntries3", _hashMaps[3].EntriesSrvIndex);
+
+                // Transition indirect args for target level
+                _indirectArgs[i].Transition(cmd, ResourceStates.IndirectArgument);
+
+                _shader.BindKernel(_kMerge[i], cmd);
+                BindSceneConstants(cmd, renderer);
+
+                cmd.ExecuteIndirect(
+                    Engine.Device.DispatchSignature,
+                    1,
+                    _indirectArgs[i].Native,
+                    0,
+                    null,
+                    0);
+
+                _indirectArgs[i].Transition(cmd, ResourceStates.UnorderedAccess);
+
+                // UAV barrier between merge passes
+                cmd.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(null)));
+            }
+            PixMarker.End(cmd);
+
+            // 7. CSShade — For the shade pass, swap hash map entries to SRV indices
             _shader.SetPushConstant(_kShade, "HEntries0", _hashMaps[0].EntriesSrvIndex);
             _shader.SetPushConstant(_kShade, "HEntries1", _hashMaps[1].EntriesSrvIndex);
             _shader.SetPushConstant(_kShade, "HEntries2", _hashMaps[2].EntriesSrvIndex);
@@ -222,14 +270,24 @@ namespace Freefall.Graphics
             if (Engine.Settings.DebugVisualizationMode == DebugVizMode.RCDebug)
                 rcDebug = (uint)Engine.Settings.RCDebugSubMode;
             _shader.SetPushConstant(_kShade, "RCDebugMode", rcDebug);
+            _shader.SetPushConstant(_kShade, "PrevGI", _prevGIBuffer.BindlessIndex);
 
             PixMarker.Begin(cmd, "RC Shade");
             _shader.Dispatch(_kShade, cmd, groupsX, groupsY);
             PixMarker.End(cmd);
 
-            // Transition GI buffer to SRV for composition
+            // Copy GI → prevGI for next frame's temporal blend
             cmd.ResourceBarrierTransition(_giBuffer.Native,
-                ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource);
+                ResourceStates.UnorderedAccess, ResourceStates.CopySource);
+            var prevState = _prevGIFirstFrame ? ResourceStates.Common : ResourceStates.NonPixelShaderResource;
+            _prevGIFirstFrame = false;
+            cmd.ResourceBarrierTransition(_prevGIBuffer.Native,
+                prevState, ResourceStates.CopyDest);
+            cmd.CopyResource(_prevGIBuffer.Native, _giBuffer.Native);
+            cmd.ResourceBarrierTransition(_prevGIBuffer.Native,
+                ResourceStates.CopyDest, ResourceStates.NonPixelShaderResource);
+            cmd.ResourceBarrierTransition(_giBuffer.Native,
+                ResourceStates.CopySource, ResourceStates.NonPixelShaderResource);
         }
 
         /// <summary>
@@ -252,6 +310,37 @@ namespace Freefall.Graphics
             }
         }
 
+        /// <summary>
+        /// Compose GI into LightBuffer. Called AFTER all direct lighting passes.
+        /// Separated from directional light shader to break GI feedback loop.
+        /// </summary>
+        public void ComposeGI(ID3D12GraphicsCommandList cmd, DeferredRenderer renderer)
+        {
+            if (_giBuffer == null) return;
+
+            var desc = _giBuffer.Native.Description;
+            uint groupsX = ((uint)desc.Width + 7) / 8;
+            uint groupsY = ((uint)desc.Height + 7) / 8;
+
+            // GI buffer is in NonPixelShaderResource state from Execute(), need SRV for read
+            // LightBuffer is in UAV state from the lighting passes
+
+            _shader.SetPushConstant(_kComposeGI, "GIOutput", _giBuffer.BindlessIndex); // SRV read
+            _shader.SetPushConstant(_kComposeGI, "AlbedoTex", renderer.Albedo.BindlessIndex);
+            _shader.SetPushConstant(_kComposeGI, "DataTex", renderer.Data.BindlessIndex);
+            _shader.SetPushConstant(_kComposeGI, "LightBufUav", renderer.LightBuffer.UavIndex);
+            _shader.SetPushConstant(_kComposeGI, "ScreenW", (uint)desc.Width);
+            _shader.SetPushConstant(_kComposeGI, "ScreenH", (uint)desc.Height);
+
+            cmd.SetComputeRootSignature(Engine.Device.GlobalRootSignature);
+            cmd.SetDescriptorHeaps(1, new[] { Engine.Device.SrvHeap });
+            BindSceneConstants(cmd, renderer);
+
+            PixMarker.Begin(cmd, "RC ComposeGI");
+            _shader.Dispatch(_kComposeGI, cmd, groupsX, groupsY);
+            PixMarker.End(cmd);
+        }
+
         public void Dispose()
         {
             for (int i = 0; i < CascadeCount; i++)
@@ -262,6 +351,7 @@ namespace Freefall.Graphics
                 _indirectArgs[i]?.Dispose();
             }
             _giBuffer?.Dispose();
+            _prevGIBuffer?.Dispose();
             _shader?.Dispose();
         }
     }

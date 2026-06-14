@@ -244,7 +244,7 @@ namespace Freefall.Components
             lightCS.SetPushConstant("ScreenHeight", (uint)desc.Height);
             lightCS.SetPushConstant("SSSTex", Engine.Settings.EnableScreenSpaceShadows ? (renderer.ScreenSpaceShadows?.OutputSrvIndex ?? 0u) : 0u);
             lightCS.SetPushConstant("SSDMTex", Engine.Settings.EnableSSDM ? (renderer.ScreenSpaceDisplacement?.OutputSrvIndex ?? 0u) : 0u);
-            lightCS.SetPushConstant("GITex", Engine.Settings.EnableRadianceCascades ? (renderer.RadianceCascades?.GIBufferSrvIndex ?? 0u) : 0u);
+            lightCS.SetPushConstant("GITex", 0u); // GI composed in separate CSComposeGI pass
             
             // Bind cbuffers on compute root (Material.Apply committed them on graphics root)
             foreach (var cb in Material.ConstantBuffers)

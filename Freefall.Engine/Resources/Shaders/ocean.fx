@@ -418,18 +418,29 @@ PSOutput PS(DSOutput input)
     color = max(0.0, color);
 
     // ── Foam from FFT Jacobian ──
-    // smoothstep softens the Jacobian transitions — without it, ACES tonemapping
-    // compresses the mid-range and makes the 512² foam texture look blocky.
-    float foam = smoothstep(0.0, 1.0, saturate(totalFoam));
+    // Use noise to dissolve hard 512² texel grid edges
+    float foamRaw = saturate(totalFoam);
+    float foamThreshold = 0.0;
+    if (ocean.NoiseSRV != 0)
+    {
+        Texture2D<float4> noiseTex = ResourceDescriptorHeap[ocean.NoiseSRV];
+        // Two octaves of noise at different scales for organic breakup
+        float n1 = noiseTex.SampleLevel(OceanSampler, worldXZ * 0.08, 0).r;
+        float n2 = noiseTex.SampleLevel(OceanSampler, worldXZ * 0.25, 0).g;
+        foamThreshold = lerp(0.15, 0.45, n1 * 0.7 + n2 * 0.3);
+    }
+    float foam = smoothstep(foamThreshold, foamThreshold + 0.35, foamRaw);
+    // Fade foam at distance to hide low-res grid
+    foam *= saturate(1.0 - dist / 3000.0);
     float3 foamColor = float3(0.70, 0.68, 0.65);
     float3 foamLit = foamColor * (0.3 + 0.7 * NdotL) * sunRadiance;
     color = lerp(color, foamLit, foam);
 
-    // ── Atmospheric extinction / horizon haze ──
-    float horizonFade = saturate(dist / 6000.0);
-    float3 hazeColor = GetSkyColor(float3(0, 0.01, 1), FogSunDirection);
-    float hazeAmount = horizonFade * horizonFade * 0.85;
-    color = lerp(color, hazeColor, hazeAmount);
+    // ── Atmospheric extinction — shared aerial perspective ──
+    if (FogEnabled > 0)
+    {
+        color = ApplyAerialPerspective(color, worldPos, camPos, FogSunDirection);
+    }
 
     // ── Shore pixel effects ──
     if (ocean.DepthGBufferSRV != 0)
@@ -482,15 +493,10 @@ PSOutput PS(DSOutput input)
         color = lerp(color, foamLit, shoreFoamAmount);
     }
 
-    // Note: ocean fog is handled by the horizon haze above (same sky-derived color).
-    // No separate FOG() call — that would double-fog the surface.
+    // Fog is handled by ApplyAerialPerspective above — same function as all other shaders.
 
-    // ── Contrast + gamma ──
-    // No ACES — it crushes 512² foam gradients into blocky transitions.
-    // Simple contrast curve to deepen darks without crushing foam detail.
-    color = saturate(color);
-    color = pow(color, 1.2);
-    color = pow(color, 1.0 / 2.2);
+    // HDR output — no tonemapping/gamma here.
+    // The finalize pass applies ACES + gamma to the entire Composite.
 
     output.Color = float4(color, 1.0);
 

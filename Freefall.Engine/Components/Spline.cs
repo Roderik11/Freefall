@@ -161,8 +161,8 @@ namespace Freefall.Components
                 }
             }
 
-            bool newPoint = false;
             int deletePoint = -1;
+            int insertPoint = -1;
 
             // Draw interactive handles on each control point
             ctx.Color = new Color4(1f, 0.6f, 0.1f, 1f); // Orange
@@ -173,7 +173,7 @@ namespace Freefall.Components
                 if(clicked && Input.Shift)
                 {
                     // append a new point after this one
-                    newPoint = true;
+                    insertPoint = i;
                     break;
                 }
 
@@ -191,12 +191,11 @@ namespace Freefall.Components
                 }
             }
 
-            if(newPoint)
+            if(insertPoint != -1)
             {
                 // Insert a new point halfway between the last two
-                int insertIndex = Points.Count - 1;
-                Vector3 newPointPos = (Points[insertIndex] + Points[Math.Max(0, insertIndex - 1)]) * 0.5f;
-                Points.Insert(insertIndex, newPointPos);
+                Vector3 newPointPos = (Points[insertPoint] + Points[Math.Max(0, insertPoint - 1)]) * 0.5f;
+                Points.Insert(insertPoint, newPointPos);
                 MessageDispatcher.Send(EngineMsg.SplineChanged, this);
             }
 

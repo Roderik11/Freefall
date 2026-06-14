@@ -475,6 +475,11 @@ namespace Freefall.Assets.Importers
             var nodeWorldTransforms = new Dictionary<string, Matrix4x4>();
             BuildNodeWorldTransforms(scene.RootNode, Matrix4x4.Identity, nodeWorldTransforms);
 
+            // Build mesh-to-world-transform map for skinned mesh vertex baking
+            var meshWorldTransforms = new Dictionary<int, Matrix4x4>();
+            if (_skeleton.Count > 0)
+                BuildMeshTransformMap(scene.RootNode, Matrix4x4.Identity, meshWorldTransforms);
+
             var nodeMeshCounts = new Dictionary<string, int>();
             foreach (var kvp in meshNodeNames)
             {
@@ -483,10 +488,17 @@ namespace Freefall.Assets.Importers
                 nodeMeshCounts[kvp.Value]++;
             }
 
-            foreach (var mesh in meshes)
+            for (int meshIdx = 0; meshIdx < meshes.Count; meshIdx++)
             {
+                var mesh = meshes[meshIdx];
                 int meshIndexCount = 0;
                 int baseVertex = positions.Count;
+
+                // For skinned FBX meshes, bake node world transform into vertices
+                // so all parts share the same coordinate space (matching OffsetMatrix expectations).
+                // Without this, each part's vertices are in its own node-local space.
+                bool bakeNodeTransform = meshWorldTransforms.TryGetValue(meshIdx, out var meshWorldXform) && !isDAE && _skeleton.Count > 0;                            ;
+                if (!bakeNodeTransform) meshWorldXform = Matrix4x4.Identity;
 
                 for (int i = 0; i < mesh.VertexCount; i++)
                 {
@@ -501,8 +513,17 @@ namespace Freefall.Assets.Importers
                     }
                     else
                     {
-                        positions.Add(new Vector3(-pos.X, pos.Y, -pos.Z));
-                        normals.Add(new Vector3(-norm.X, norm.Y, -norm.Z));
+                        var p = new Vector3(pos.X, pos.Y, pos.Z);
+                        var n = new Vector3(norm.X, norm.Y, norm.Z);
+
+                        if (bakeNodeTransform)
+                        {
+                            p = Vector3.Transform(p, meshWorldXform);
+                            n = Vector3.Normalize(Vector3.TransformNormal(n, meshWorldXform));
+                        }
+
+                        positions.Add(new Vector3(-p.X, p.Y, -p.Z));
+                        normals.Add(new Vector3(-n.X, n.Y, -n.Z));
                     }
 
 
@@ -528,12 +549,15 @@ namespace Freefall.Assets.Importers
                         if (bone.HasVertexWeights)
                         {
                             int boneIndex = _boneNames.IndexOf(bone.Name);
-                            if (boneIndex < 0) continue;
+                            if (boneIndex < 0)
+                            {
+                                Debug.Log($"[ModelImporter] WARNING: mesh bone '{bone.Name}' not found in skeleton ({bone.VertexWeightCount} weights dropped)");
+                                continue;
+                            }
                             foreach (Assimp.VertexWeight vw in bone.VertexWeights)
                             {
                                 int vertexId = baseVertex + (int)vw.VertexID;
                                 if (vertexId < weightMap.Count &&
-                                    weightMap[vertexId].Count < 4 &&
                                     !weightMap[vertexId].ContainsKey(boneIndex))
                                     weightMap[vertexId].Add(boneIndex, vw.Weight);
                             }
@@ -552,9 +576,8 @@ namespace Freefall.Assets.Importers
                 var partCenter = (partMin + partMax) * 0.5f;
                 var partRadius = (partMax - partCenter).Length();
 
-                int origIdx = scene.Meshes.IndexOf(mesh);
-                string nodeName = meshNodeNames.GetValueOrDefault(origIdx);
-                string partName = nodeName ?? mesh.Name ?? $"Part_{meshes.IndexOf(mesh)}";
+                string nodeName = meshNodeNames.GetValueOrDefault(meshIdx);
+                string partName = nodeName ?? mesh.Name ?? $"Part_{meshIdx}";
 
                 string matName = null;
                 if (mesh.MaterialIndex >= 0 && mesh.MaterialIndex < scene.MaterialCount)
@@ -800,8 +823,15 @@ namespace Freefall.Assets.Importers
                 // Store per-group data for PostImport prefab generation
                 _groupMaterialNames[groupName] = matNames;
 
-                // Find the first mesh index in this group's parts to get its node name → world transform
-                if (pIndices.Count > 0)
+                // For skinned meshes, force identity — skinning pipeline handles positioning
+                // via OffsetMatrix * bonePose. Node transforms would double-apply the
+                // FBX geometric correction (scale 100, rot -90x).
+                bool isSkinned = _skeleton.Count > 0 && data.BoneWeights != null;
+                if (isSkinned)
+                {
+                    _groupTransforms[groupName] = (Vector3.Zero, System.Numerics.Quaternion.Identity, Vector3.One);
+                }
+                else if (pIndices.Count > 0)
                 {
                     int firstMeshIdx = -1;
                     for (int mi = 0; mi < meshes.Count; mi++)
@@ -818,7 +848,6 @@ namespace Freefall.Assets.Importers
                         nodeWorldTransforms.TryGetValue(nodeName2, out var worldMatrix))
                     {
                         Matrix4x4.Decompose(worldMatrix, out var s, out var r, out var t);
-                        // Rotation is identity — vertex data now matches Unity's convention.
                         _groupTransforms[groupName] = (Vector3.Zero, System.Numerics.Quaternion.Identity, s);
                     }
                 }
@@ -1265,22 +1294,38 @@ namespace Freefall.Assets.Importers
         private static BoneWeight[] BuildBoneWeights(List<Dictionary<int, float>> weightMap)
         {
             var boneWeights = new BoneWeight[weightMap.Count];
+            // Reusable scratch list to sort by weight descending
+            var sorted = new List<KeyValuePair<int, float>>(8);
+
             for (int i = 0; i < weightMap.Count; i++)
             {
                 BoneWeight weight = BoneWeight.Default;
-                int j = 0;
-                foreach (var pair in weightMap[i])
+                var map = weightMap[i];
+                if (map.Count == 0)
                 {
-                    if (j >= 4) break;
-                    switch (j)
-                    {
-                        case 0: weight.BoneIDs.X = pair.Key; weight.Weights.X = pair.Value; break;
-                        case 1: weight.BoneIDs.Y = pair.Key; weight.Weights.Y = pair.Value; break;
-                        case 2: weight.BoneIDs.Z = pair.Key; weight.Weights.Z = pair.Value; break;
-                        case 3: weight.BoneIDs.W = pair.Key; weight.Weights.W = pair.Value; break;
-                    }
-                    j++;
+                    boneWeights[i] = weight;
+                    continue;
                 }
+
+                // Sort by weight descending, keep strongest 4
+                sorted.Clear();
+                sorted.AddRange(map);
+                sorted.Sort((a, b) => b.Value.CompareTo(a.Value));
+
+                int count = Math.Min(sorted.Count, 4);
+                if (count >= 1) { weight.BoneIDs.X = sorted[0].Key; weight.Weights.X = sorted[0].Value; }
+                if (count >= 2) { weight.BoneIDs.Y = sorted[1].Key; weight.Weights.Y = sorted[1].Value; }
+                if (count >= 3) { weight.BoneIDs.Z = sorted[2].Key; weight.Weights.Z = sorted[2].Value; }
+                if (count >= 4) { weight.BoneIDs.W = sorted[3].Key; weight.Weights.W = sorted[3].Value; }
+
+                // Normalize weights to sum to 1.0
+                float sum = weight.Weights.X + weight.Weights.Y + weight.Weights.Z + weight.Weights.W;
+                if (sum > 0 && MathF.Abs(sum - 1f) > 1e-6f)
+                {
+                    float inv = 1f / sum;
+                    weight.Weights *= inv;
+                }
+
                 boneWeights[i] = weight;
             }
             return boneWeights;
@@ -1361,7 +1406,47 @@ namespace Freefall.Assets.Importers
             FindBones(scene.RootNode);
             ValidateBones(scene);
             FlattenHierarchy(scene.RootNode);
+            CorrectOffsetMatrices();
 
+        }
+
+        /// <summary>
+        /// Assimp may inject structural nodes ($AssimpFbx$_GeometricScaling, _PreRotation, etc.)
+        /// that carry transforms not accounted for in the original FBX bone OffsetMatrix.
+        /// For each skinning bone, verify that OffsetMatrix * bindWorld ≈ Identity.
+        /// If not, recompute OffsetMatrix = Inv(bindWorld) from the hierarchy.
+        /// </summary>
+        private void CorrectOffsetMatrices()
+        {
+            // Build bind world matrices from hierarchy
+            var worldMatrices = new Matrix4x4[_skeleton.Count];
+            for (int i = 0; i < _skeleton.Count; i++)
+            {
+                worldMatrices[i] = _skeleton[i].BindPoseMatrix;
+                if (_skeleton[i].Parent >= 0)
+                    worldMatrices[i] = worldMatrices[i] * worldMatrices[_skeleton[i].Parent];
+            }
+
+            for (int i = 0; i < _skeleton.Count; i++)
+            {
+                if (_skeleton[i].OffsetMatrix == Matrix4x4.Identity)
+                    continue; // structural node, no offset to correct
+
+                var product = _skeleton[i].OffsetMatrix * worldMatrices[i];
+
+                // Check if offset * bindWorld ≈ Identity (diagonal ≈ 1, off-diagonal ≈ 0)
+                float diagError = MathF.Abs(product.M11 - 1) + MathF.Abs(product.M22 - 1)
+                                + MathF.Abs(product.M33 - 1) + MathF.Abs(product.M44 - 1);
+                float offDiag = MathF.Abs(product.M12) + MathF.Abs(product.M13)
+                              + MathF.Abs(product.M21) + MathF.Abs(product.M23)
+                              + MathF.Abs(product.M31) + MathF.Abs(product.M32);
+
+                if (diagError + offDiag > 0.1f)
+                {
+                    if (Matrix4x4.Invert(worldMatrices[i], out var corrected))
+                        _skeleton[i].OffsetMatrix = corrected;
+                }
+            }
         }
 
         private void FindBones(Node node)

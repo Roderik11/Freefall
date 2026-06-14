@@ -290,15 +290,19 @@ PSOutput PS(VSOutput input)
     }
 
     // ── Combine lighting ──
+    // Separate diffuse and specular: for transparent surfaces, specular is added
+    // separately with Reinhard rolloff to prevent GGX peaks (500+ for smooth glass)
+    // from dominating the alpha-blended output.
     float3 radiance = LightColor * LightIntensity * 3.14159 * NdotL * shadowFactor;
-    float3 lighting = (diffuse + spec) * radiance * ao;
+    float3 diffuseLighting = diffuse * radiance * ao;
+    float3 specLighting = spec * radiance;
 
     // Hemisphere ambient
     float hemi = N.y * 0.5 + 0.5;
     float3 skyCol = float3(0.25, 0.28, 0.35);
     float3 gndCol = float3(0.12, 0.11, 0.10);
     float3 ambient = lerp(gndCol, skyCol, hemi) * ao * AmbientScale;
-    lighting += ambient * color.rgb;
+    float3 lighting = diffuseLighting + ambient * color.rgb;
 
     // Emissive adds directly to lighting (self-illumination)
     lighting += emissive * (1 - alpha);
@@ -335,16 +339,8 @@ PSOutput PS(VSOutput input)
     if (hasRefraction)
     {
         // Refraction path: alpha controls glass opacity.
-        // alpha=0 → fully transparent (show scene behind), alpha=1 → fully opaque (show lit surface)
-        // The composite snapshot is already tonemapped+gamma'd, so we apply the same to the glass
-        // lighting before mixing.
+        // Both glassLit and refracted are now linear HDR — finalize handles tonemapping.
         float3 glassLit = lighting;
-        
-        // Tonemapping + gamma on the glass lighting component only
-        float3 x = glassLit;
-        glassLit = (x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14);
-        glassLit = saturate(glassLit);
-        glassLit = pow(abs(glassLit), 1.0 / 2.2);
         
         // Tint scene-behind by glass color
         float3 tintedScene = refracted * lerp(float3(1,1,1), color.rgb, 0.3);
@@ -355,23 +351,22 @@ PSOutput PS(VSOutput input)
         // Fresnel reflection on top (increases opacity at glancing angles)
         finalColor = lerp(finalColor, envReflect, glassFresnel * 0.5);
         
-        // Specular highlights always on top
-        float3 specTM = spec * radiance;
-        specTM = (specTM * (2.51 * specTM + 0.03)) / (specTM * (2.43 * specTM + 0.59) + 0.14);
-        finalColor += saturate(specTM);
+        // Specular highlights always on top — Reinhard rolloff prevents HDR blowout
+        finalColor += specLighting / (1.0 + specLighting);
         
-        // Fog
+        // Aerial perspective fog — use input.Depth (linear view-space Z) for distance
         if (FogEnabled > 0)
         {
-            float3 fogColor = GetSkyColor(float3(0, 0.01, 1), FogSunDirection);
-            finalColor = FOG(finalColor, input.Depth, fogColor);
+            float fogDist = input.Depth;
+            float fogFactor = saturate(1.0 - exp(-pow(fogDist * FogDensity, 2.0)));
+            float3 viewDir = normalize(input.WorldPos.xyz);
+            float3 inscatter = GetSkyColor(float3(viewDir.x, max(viewDir.y, 0.01), viewDir.z), FogSunDirection);
+            finalColor = lerp(finalColor, inscatter, fogFactor);
         }
         
         // Output alpha for multi-layer transparency:
         // The internal lerp already mixed refracted scene with glass lighting using alpha.
         // Output alpha controls how much this pixel overwrites previously-drawn transparent layers.
-        // At alpha=0.5: this glass overwrites 50% of the RT (which may contain earlier transparent draws).
-        // Fresnel increases opacity at glancing angles.
        // finalAlpha = saturate(alpha + glassFresnel * 0.3);
         finalAlpha = saturate(alpha);
     }
@@ -379,20 +374,17 @@ PSOutput PS(VSOutput input)
     {
         // Fallback: no composite snapshot available, use alpha blending
         finalColor = lerp(envReflect, lighting, 1.0 - glassFresnel);
-        finalColor += spec * radiance;
+        finalColor += specLighting / (1.0 + specLighting);
         
-        // Fog
+        // Aerial perspective fog — use input.Depth (linear view-space Z) for distance
         if (FogEnabled > 0)
         {
-            float3 fogColor = GetSkyColor(float3(0, 0.01, 1), FogSunDirection);
-            finalColor = FOG(finalColor, input.Depth, fogColor);
+            float fogDist = input.Depth;
+            float fogFactor = saturate(1.0 - exp(-pow(fogDist * FogDensity, 2.0)));
+            float3 viewDir = normalize(input.WorldPos.xyz);
+            float3 inscatter = GetSkyColor(float3(viewDir.x, max(viewDir.y, 0.01), viewDir.z), FogSunDirection);
+            finalColor = lerp(finalColor, inscatter, fogFactor);
         }
-        
-        // Tonemapping + gamma
-        float3 x = finalColor;
-        finalColor = (x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14);
-        finalColor = saturate(finalColor);
-        finalColor = pow(abs(finalColor), 1.0 / 2.2);
         
         finalAlpha = alpha;
     }

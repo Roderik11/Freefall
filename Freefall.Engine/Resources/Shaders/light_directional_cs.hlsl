@@ -178,11 +178,7 @@ void CSDirectionalLight(uint3 dispatchThreadId : SV_DispatchThreadID)
     float rawNdotL = dot(normal, L);
     float NdotL = max(rawNdotL, 0.0);
     
-    if (NdotL <= 0.0 && !isVegetation && DebugVisualizationMode == 0)
-    {
-        Output[px] = float4(0, 0, 0, 0);
-        return;
-    }
+    // Note: removed NdotL early-exit that was skipping GI for surfaces facing away from sun
     
     // View-space depth for cascade selection
     float viewDepth = dot(worldPos.xyz, float3(View._13, View._23, View._33));
@@ -355,13 +351,8 @@ void CSDirectionalLight(uint3 dispatchThreadId : SV_DispatchThreadID)
     // Shadow wrap
     lighting += diffuse * LightColor * LightIntensity * NdotL * (1.0 - shadowFactor) * 0.12 * ao;
     
-    // Radiance Cascades GI — indirect diffuse contribution
-    if (GITexIdx > 0)
-    {
-        Texture2D<float4> GITex = ResourceDescriptorHeap[GITexIdx];
-        float3 gi = GITex.Load(displaced_coord).rgb;
-        lighting += kd * albedo * gi * ao;
-    }
+    // Note: GI composition moved to separate pass (CSComposeGI in radiance_cascades.hlsl)
+    // so RC trace can read direct-light-only without feedback loop
     
     Output[px] = float4(lighting, 1.0f);
 }

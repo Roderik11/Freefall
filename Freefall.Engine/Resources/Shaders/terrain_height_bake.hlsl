@@ -872,7 +872,7 @@ void CS_ErosionFilter(uint3 dtid : SV_DispatchThreadID)
 
 #include "terrain_stamp_common.hlsli"
 
-// Per-stamp descriptor (matches C# HeightStampDescriptorGPU, 44 bytes)
+// Per-stamp descriptor (matches C# HeightStampDescriptorGPU, 64 bytes)
 struct HeightStampDescriptor
 {
     float2 Center;             // terrain UV center (radial mode)
@@ -885,6 +885,11 @@ struct HeightStampDescriptor
     float  NoiseFreq;          // edge noise frequency (0 = disabled)
     float  NoiseAmp;           // edge noise amplitude in UV space
     uint   NoiseSeed;          // noise seed
+    uint   HeightmapIdx;       // bindless SRV index (0 = no heightmap)
+    float  HeightmapStrength;  // normalized strength (worldStrength / maxHeight)
+    float  RotationSin;        // sin(entity Y rotation)
+    float  RotationCos;        // cos(entity Y rotation)
+    float  _pad0;
 };
 
 [numthreads(8, 8, 1)]
@@ -918,6 +923,27 @@ void CS_InfluenceLayer(uint3 dtid : SV_DispatchThreadID)
         // Spline mode: use interpolated height from nearest spline point
         float targetH = (stamp.SplinePointCount > 0 && stamp.SplinePointOffset != 0xFFFFFFFF)
             ? nearestH : stamp.TargetHeight;
+
+        // Heightmap: add spatially-varying height from texture
+        if (stamp.HeightmapIdx != 0)
+        {
+            // Compute local UV within stamp footprint
+            float2 localDelta = uv - stamp.Center;
+
+            // Apply inverse rotation
+            float2 rotLocal = float2(
+                localDelta.x * stamp.RotationCos + localDelta.y * stamp.RotationSin,
+               -localDelta.x * stamp.RotationSin + localDelta.y * stamp.RotationCos
+            );
+
+            // Map from [-extent, +extent] to [0, 1] for heightmap sampling
+            float extent = stamp.Radius + stamp.Falloff;
+            float2 hmUV = rotLocal / extent * 0.5 + 0.5;
+
+            Texture2D<float> Heightmap = ResourceDescriptorHeap[stamp.HeightmapIdx];
+            float hmValue = Heightmap.SampleLevel(sampLinear, hmUV, 0);
+            targetH += hmValue * stamp.HeightmapStrength;
+        }
 
         // Apply height: always flatten, optionally invert displacement
         float delta = targetH - currentHeight;

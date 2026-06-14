@@ -78,35 +78,27 @@ void CSCompose(uint3 dispatchThreadId : SV_DispatchThreadID)
     float3 emissiveGlow = albedo.rgb * 2.0; // self-illumination (HDR boost)
     float3 finalColor = lerp(albedo.rgb, lerp(pbrLit, emissiveGlow, emissiveMask), isLit);
     
-    // Distance fog — sky-derived color, applied in linear HDR before tonemapping
+    // Aerial perspective — sky-derived per-pixel fog color
     if (FogEnabled > 0 && isLit > 0)
     {
-        float depth = DepthGBuf.Load(coord).r;
-        float3 fogColor = GetSkyColor(float3(0, 0.01, 1), FogSunDirection);
-        finalColor = FOG(finalColor, depth, fogColor);
+        float linearDepth = DepthGBuf.Load(coord).r;
+
+        // View direction from screen position (for per-pixel sky color)
+        float2 uv = (float2(px) + 0.5) / float2(ScreenWidthIdx, ScreenHeightIdx);
+        float2 ndc = float2(uv.x * 2.0 - 1.0, -(uv.y * 2.0 - 1.0));
+        float4 farClip = mul(float4(ndc, 0, 1), CameraInverse); // reverse-Z: 0 = far
+        float3 viewDir = normalize(farClip.xyz / farClip.w);
+
+        // Exponential-squared extinction using linear depth as distance
+        float fogFactor = 1.0 - exp(-pow(linearDepth * FogDensity, 2.0));
+        fogFactor = saturate(fogFactor);
+
+        // Inscatter: sky color along view ray (warm toward sun, cool away)
+        float3 inscatter = GetSkyColor(float3(viewDir.x, max(viewDir.y, 0.01), viewDir.z), FogSunDirection);
+
+        finalColor = lerp(finalColor, inscatter, fogFactor);
     }
     
-    // ACES Filmic Tone Mapping (Narkowicz 2015 approximation)
-    float3 x = finalColor;
-    finalColor = (x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14);
-    finalColor = saturate(finalColor);
-    
-    // Vibrance boost: selectively saturate under-saturated pixels
-    float luma = dot(finalColor, float3(0.2126, 0.7152, 0.0722));
-    float currentSat = max(finalColor.r, max(finalColor.g, finalColor.b)) - min(finalColor.r, min(finalColor.g, finalColor.b));
-    float vibranceAmount = (1.0 - currentSat) * 0.15;
-    finalColor = lerp(float3(luma, luma, luma), finalColor, 1.0 + vibranceAmount);
-    finalColor = saturate(finalColor);
-    
-    // Final Gamma Correction (Linear -> sRGB)
-    finalColor = pow(abs(finalColor), 1.0f / 2.2f);
-    
-    // Dithering — break up color banding in smooth gradients (sky)
-    float2 seed = float2(px) + float2(frac(Time * 0.1), frac(Time * 0.31));
-    float noise1 = frac(sin(dot(seed, float2(12.9898, 78.233))) * 43758.5453);
-    float noise2 = frac(sin(dot(seed, float2(39.3468, 11.135))) * 23564.2365);
-    float dither = (noise1 + noise2 - 1.0) / 255.0;
-    finalColor += dither;
-    
+    // Output HDR linear — tonemapping deferred to finalize pass
     Output[px] = float4(finalColor, 1.0f);
 }

@@ -91,3 +91,27 @@ float3 GetSkyColor(float3 viewDir, float3 sunDir)
 
     return max(skyColor, 0.0);
 }
+
+// ────────────────────────────────────────────────
+// Unified aerial perspective: distance fog with per-pixel sky-derived color.
+// Replaces both FOG() and ocean's hardcoded haze.
+//
+// Uses exponential-squared extinction with FogDensity from SceneConstants,
+// and GetSkyColor() for the inscatter color along the view ray.
+// Result: looking toward the sun → warm/golden fog, away → cool/blue.
+// ────────────────────────────────────────────────
+float3 ApplyAerialPerspective(float3 color, float3 worldPos, float3 camPos, float3 sunDir)
+{
+    float3 toSurface = worldPos - camPos;
+    float dist = length(toSurface);
+    float3 viewDir = toSurface / max(dist, 0.001);
+
+    // Exponential-squared extinction (matches old FOG() math)
+    float fogFactor = 1.0 - exp(-pow(dist * FogDensity, 2.0));
+    fogFactor = saturate(fogFactor);
+
+    // Inscatter: sky color along the view ray (clamp y to avoid underground sampling)
+    float3 inscatter = GetSkyColor(float3(viewDir.x, max(viewDir.y, 0.01), viewDir.z), sunDir);
+
+    return lerp(color, inscatter, fogFactor);
+}

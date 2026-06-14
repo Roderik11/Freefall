@@ -486,6 +486,21 @@ namespace Freefall
          [ValueRange(1f, 128f)]
          public float PixelErrorThreshold { get; set; } = 128.0f;
 
+         // Bloom
+         public bool EnableBloom { get; set; } = true;
+
+         [ValueRange(0f, 5f)]
+         public float BloomThreshold { get; set; } = 2.0f;
+
+         [ValueRange(0f, 1f)]
+         public float BloomSoftKnee { get; set; } = 0.3f;
+
+         [ValueRange(0f, 2f)]
+         public float BloomIntensity { get; set; } = 0.25f;
+
+         [ValueRange(0.5f, 3f)]
+         public float BloomRadius { get; set; } = 1.0f;
+
          // Radiance Cascades (Sparse 3D GI)
          public bool EnableRadianceCascades { get; set; } = false;
 

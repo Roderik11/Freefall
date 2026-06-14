@@ -26,7 +26,8 @@ namespace Freefall.Graphics
         public DepthTexture2D Depth;
         
         public RenderTexture2D LightBuffer = null!;
-        public RenderTexture2D Composite = null!;
+        public RenderTexture2D Composite = null!;     // HDR intermediate (R16G16B16A16_Float)
+        public RenderTexture2D LdrOutput = null!;     // Final tonemapped output (R8G8B8A8_UNorm)
         public RenderTexture2D? CompositeSnapshot;
         public DepthTextureArray2D ShadowTextureArray = null!;
         
@@ -48,6 +49,9 @@ namespace Freefall.Graphics
         /// <summary>Sparse 3D Radiance Cascades (world-space GI).</summary>
         public RadianceCascades? RadianceCascades { get; private set; }
 
+        /// <summary>HDR Bloom (COD-style dual-filter pyramid).</summary>
+        public BloomPyramid? BloomPyramid { get; private set; }
+
         private Material matClear = null!;
         private Material matDirectionalLight = null!;
         /// <summary>Directional light material — used by RC to borrow SceneConstants binding.</summary>
@@ -68,6 +72,16 @@ namespace Freefall.Graphics
         
         private bool _isFirstFrame = true;
         private bool _compositeSnapshotFirstFrame = true;
+        
+        // Bloom compute shader and kernel indices
+        private ComputeShader _bloomCS = null!;
+        private int _kBloomThreshold;
+        private int _kBloomDownsample;
+        private int _kBloomUpsample;
+        
+        // Finalize compute shader (HDR → LDR: bloom + tonemap + gamma)
+        private ComputeShader _finalizeCS = null!;
+        private int _kFinalize;
         
         // Readback staging for picking (1x1 pixel each)
         private GraphicsBuffer? _entityIdReadback;
@@ -154,6 +168,18 @@ namespace Freefall.Graphics
 
             // SMAA anti-aliasing
             Smaa = new SMAA();
+
+            // Bloom pyramid
+            BloomPyramid = new BloomPyramid();
+            BloomPyramid.Create(Engine.Device, width, height);
+            _bloomCS = new ComputeShader("bloom_cs.hlsl");
+            _kBloomThreshold = _bloomCS.FindKernel("CSBloomThreshold");
+            _kBloomDownsample = _bloomCS.FindKernel("CSBloomDownsample");
+            _kBloomUpsample = _bloomCS.FindKernel("CSBloomUpsample");
+
+            // Finalize pass (HDR → LDR)
+            _finalizeCS = new ComputeShader("finalize_cs.hlsl");
+            _kFinalize = _finalizeCS.FindKernel("CSFinalize");
         }
 
         private void CreateRenderTextures(int width, int height)
@@ -178,7 +204,8 @@ namespace Freefall.Graphics
             Depth = new DepthTexture2D(width, height, Format.D32_Float, true);
 
             LightBuffer = new RenderTexture2D(Engine.Device, width, height, Format.R16G16B16A16_Float, randomWrite: true);
-            Composite = new RenderTexture2D(Engine.Device, width, height, Format.R8G8B8A8_UNorm, randomWrite: true);
+            Composite = new RenderTexture2D(Engine.Device, width, height, Format.R16G16B16A16_Float, randomWrite: true);
+            LdrOutput = new RenderTexture2D(Engine.Device, width, height, Format.R8G8B8A8_UNorm, randomWrite: true);
         }
 
         public override void Resize(int width, int height)
@@ -192,6 +219,7 @@ namespace Freefall.Graphics
             Depth?.Dispose();
             LightBuffer?.Dispose();
             Composite?.Dispose();
+            LdrOutput?.Dispose();
 
             CreateRenderTextures(width, height);
             _isFirstFrame = true; // Resource states reset to Common/Texture
@@ -206,6 +234,11 @@ namespace Freefall.Graphics
 
             // Resize RC GI buffer
             RadianceCascades?.Resize(width, height);
+
+            // Resize bloom pyramid
+            BloomPyramid?.Dispose();
+            BloomPyramid = new BloomPyramid();
+            BloomPyramid.Create(Engine.Device, width, height);
         }
 
         public override void Clear(Camera camera)
@@ -317,28 +350,47 @@ namespace Freefall.Graphics
             FillLightBuffer(camera, list);
             lightTime.Stop();
 
-            // 3. Composition
+            // 3. Composition (HDR — no tonemapping)
             var composeTime = System.Diagnostics.Stopwatch.StartNew();
             Compose(camera, list);
             composeTime.Stop();
 
-            // 4. Forward pass — renders directly to Composite with depth read.
+            // 4. Forward pass — renders directly to HDR Composite with depth read.
             //    Depth is already in PixelShaderResource after FillGBuffer.
             //    Composite is still in RenderTarget from Compose.
             var forwardTime = System.Diagnostics.Stopwatch.StartNew();
             RenderForward(camera, list);
             forwardTime.Stop();
 
-            // 5. SMAA Anti-Aliasing (optional)
+            // 5. Bloom (reads HDR Composite — now includes both deferred + forward)
+            if (BloomPyramid != null && Engine.Settings.EnableBloom)
+            {
+                // Transition depth to NonPixelShaderResource for bloom sky mask
+                Transition(list, Depth.Native, ResourceStates.PixelShaderResource, ResourceStates.NonPixelShaderResource);
+                
+                PixMarker.Begin(list, "Bloom");
+                DispatchBloom(list);
+                PixMarker.End(list);
+                
+                // Restore depth state for next frame
+                Transition(list, Depth.Native, ResourceStates.NonPixelShaderResource, ResourceStates.PixelShaderResource);
+            }
+
+            // 6. Finalize (HDR → LDR: bloom + tonemap + gamma + dither)
+            PixMarker.Begin(list, "Finalize");
+            Finalize(list);
+            PixMarker.End(list);
+
+            // 7. SMAA Anti-Aliasing (optional, on LDR output)
             if (Smaa != null && Engine.Settings.EnableSMAA)
             {
                 PixMarker.Begin(list, "SMAA");
-                var desc = Composite.Native.Description;
-                Smaa.Execute(list, Composite.Native, Composite.BindlessIndex, (int)desc.Width, (int)desc.Height);
+                var desc = LdrOutput.Native.Description;
+                Smaa.Execute(list, LdrOutput.Native, LdrOutput.BindlessIndex, (int)desc.Width, (int)desc.Height);
                 PixMarker.End(list);
             }
 
-            // 6. Blit to Backbuffer
+            // 8. Blit to Backbuffer
             var blitTime = System.Diagnostics.Stopwatch.StartNew();
             BlitToBackBuffer(camera, list);
             blitTime.Stop();
@@ -617,8 +669,16 @@ namespace Freefall.Graphics
              DispatchPointLights(camera, list);
              PixMarker.End(list); // Point Lights
              
-             // UAV barrier, then transition to SRV for composition
+             // UAV barrier, then compose GI into LightBuffer
              list.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(LightBuffer.Native)));
+             
+             // GI composition — adds indirect diffuse to LightBuffer AFTER all direct lighting
+             if (RadianceCascades != null && Engine.Settings.EnableRadianceCascades)
+             {
+                 RadianceCascades.ComposeGI(list, this);
+                 list.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(LightBuffer.Native)));
+             }
+             
              Transition(list, LightBuffer.Native, ResourceStates.UnorderedAccess, ResourceStates.PixelShaderResource);
              PixMarker.End(list); // Lighting
         }
@@ -704,7 +764,7 @@ namespace Freefall.Graphics
         {
             PixMarker.Begin(list, "Composition");
             // Compute shader path — write directly to Composite UAV
-            var fromState = _isFirstFrame ? ResourceStates.Common : ResourceStates.PixelShaderResource;
+            var fromState = _isFirstFrame ? ResourceStates.Common : ResourceStates.NonPixelShaderResource;
             Transition(list, Composite.Native, fromState, ResourceStates.UnorderedAccess);
             
             list.SetComputeRootSignature(Engine.Device.GlobalRootSignature);
@@ -746,6 +806,138 @@ namespace Freefall.Graphics
             
             // NOTE: Composite stays in RenderTarget for the Forward pass
             PixMarker.End(list); // Composition
+        }
+
+        /// <summary>
+        /// Execute bloom: threshold → downsample chain → upsample chain.
+        /// Composite (HDR) is in NonPixelShaderResource when this is called.
+        /// BloomPyramid texture starts in Common (first frame) or NonPixelShaderResource.
+        /// </summary>
+        private void DispatchBloom(ID3D12GraphicsCommandList list)
+        {
+            var bloom = BloomPyramid!;
+            var settings = Engine.Settings;
+
+            list.SetComputeRootSignature(Engine.Device.GlobalRootSignature);
+            list.SetDescriptorHeaps(1, new[] { Engine.Device.SrvHeap });
+
+            // Transition entire bloom texture to UAV for writing.
+            // All mips are in the same state: Common (first frame) or NonPixelShaderResource (subsequent).
+            var bloomFrom = _isFirstFrame ? ResourceStates.Common : ResourceStates.NonPixelShaderResource;
+            Transition(list, bloom.Texture!, bloomFrom, ResourceStates.UnorderedAccess);
+
+            // --- Pass 1: Threshold (full-res HDR Composite → half-res mip 0) ---
+            var compDesc = Composite.Native.Description;
+            _bloomCS.SetPushConstant(_kBloomThreshold, "InputSrv", Composite.BindlessIndex);
+            _bloomCS.SetPushConstant(_kBloomThreshold, "OutputUAV", bloom.MipUAVs[0]);
+            _bloomCS.SetPushConstant(_kBloomThreshold, "OutputWidth", (uint)compDesc.Width);
+            _bloomCS.SetPushConstant(_kBloomThreshold, "OutputHeight", (uint)compDesc.Height);
+            _bloomCS.SetPushConstant(_kBloomThreshold, "Param0Bits", BitConverter.SingleToUInt32Bits(settings.BloomThreshold));
+            _bloomCS.SetPushConstant(_kBloomThreshold, "Param1Bits", BitConverter.SingleToUInt32Bits(settings.BloomSoftKnee));
+            _bloomCS.SetPushConstant(_kBloomThreshold, "DepthSrv", Depth.BindlessIndex);
+
+            uint threshX = ((uint)bloom.Width + 7) / 8;
+            uint threshY = ((uint)bloom.Height + 7) / 8;
+            _bloomCS.Dispatch(_kBloomThreshold, list, threshX, threshY);
+
+            // UAV barrier after threshold write
+            list.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(bloom.Texture!)));
+
+            // --- Pass 2: Downsample chain (mip 0 → mip 1 → ... → mip N-1) ---
+            // After threshold: all mips in UAV. Source mip transitions to SRV per-iteration.
+            for (int i = 1; i < bloom.MipCount; i++)
+            {
+                int srcW = Math.Max(1, bloom.Width >> (i - 1));
+                int srcH = Math.Max(1, bloom.Height >> (i - 1));
+                int dstW = Math.Max(1, bloom.Width >> i);
+                int dstH = Math.Max(1, bloom.Height >> i);
+
+                // Per-subresource: source mip → SRV, dest mip stays UAV
+                list.ResourceBarrier(new ResourceBarrier(
+                    new ResourceTransitionBarrier(bloom.Texture!, ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource, (uint)(i - 1))));
+
+                _bloomCS.SetPushConstant(_kBloomDownsample, "InputSrv", bloom.MipSRVs[i - 1]);
+                _bloomCS.SetPushConstant(_kBloomDownsample, "OutputUAV", bloom.MipUAVs[i]);
+                _bloomCS.SetPushConstant(_kBloomDownsample, "OutputWidth", (uint)dstW);
+                _bloomCS.SetPushConstant(_kBloomDownsample, "OutputHeight", (uint)dstH);
+                _bloomCS.SetPushConstant(_kBloomDownsample, "Param0Bits", BitConverter.SingleToUInt32Bits(1.0f / srcW));
+                _bloomCS.SetPushConstant(_kBloomDownsample, "Param1Bits", BitConverter.SingleToUInt32Bits(1.0f / srcH));
+
+                uint downX = ((uint)dstW + 7) / 8;
+                uint downY = ((uint)dstH + 7) / 8;
+                _bloomCS.Dispatch(_kBloomDownsample, list, downX, downY);
+
+                list.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(bloom.Texture!)));
+            }
+            // State after downsample: mips 0..N-2 = SRV, mip N-1 = UAV
+
+            // --- Pass 3: Upsample chain (mip N-1 → mip N-2 → ... → mip 0) ---
+            for (int i = bloom.MipCount - 2; i >= 0; i--)
+            {
+                int srcW = Math.Max(1, bloom.Width >> (i + 1));
+                int srcH = Math.Max(1, bloom.Height >> (i + 1));
+                int dstW = Math.Max(1, bloom.Width >> i);
+                int dstH = Math.Max(1, bloom.Height >> i);
+
+                // Per-subresource: source mip[i+1] → SRV, dest mip[i] → UAV
+                list.ResourceBarrier(new ResourceBarrier[] {
+                    new ResourceBarrier(new ResourceTransitionBarrier(bloom.Texture!, ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource, (uint)(i + 1))),
+                    new ResourceBarrier(new ResourceTransitionBarrier(bloom.Texture!, ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess, (uint)i)),
+                });
+
+                _bloomCS.SetPushConstant(_kBloomUpsample, "InputSrv", bloom.MipSRVs[i + 1]);
+                _bloomCS.SetPushConstant(_kBloomUpsample, "OutputUAV", bloom.MipUAVs[i]);
+                _bloomCS.SetPushConstant(_kBloomUpsample, "OutputWidth", (uint)dstW);
+                _bloomCS.SetPushConstant(_kBloomUpsample, "OutputHeight", (uint)dstH);
+                _bloomCS.SetPushConstant(_kBloomUpsample, "Param0Bits", BitConverter.SingleToUInt32Bits(1.0f / srcW));
+                _bloomCS.SetPushConstant(_kBloomUpsample, "Param1Bits", BitConverter.SingleToUInt32Bits(1.0f / srcH));
+                _bloomCS.SetPushConstant(_kBloomUpsample, "Param2Bits", BitConverter.SingleToUInt32Bits(settings.BloomRadius));
+
+                uint upX = ((uint)dstW + 7) / 8;
+                uint upY = ((uint)dstH + 7) / 8;
+                _bloomCS.Dispatch(_kBloomUpsample, list, upX, upY);
+
+                list.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(bloom.Texture!)));
+            }
+            // State after upsample: mip 0 = UAV, mips 1..N-1 = SRV
+
+            // Transition mip 0 to SRV for finalize to sample
+            list.ResourceBarrier(new ResourceBarrier(
+                new ResourceTransitionBarrier(bloom.Texture!, ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource, 0)));
+        }
+
+        /// <summary>
+        /// Finalize pass: reads HDR Composite + bloom, applies tonemapping, writes LDR output.
+        /// Composite is in NonPixelShaderResource when this is called (after forward/post-process).
+        /// </summary>
+        private void Finalize(ID3D12GraphicsCommandList list)
+        {
+            list.SetComputeRootSignature(Engine.Device.GlobalRootSignature);
+            list.SetDescriptorHeaps(1, new[] { Engine.Device.SrvHeap });
+
+            // Transition LdrOutput to UAV for writing
+            var ldrFrom = _isFirstFrame ? ResourceStates.Common : ResourceStates.PixelShaderResource;
+            Transition(list, LdrOutput.Native, ldrFrom, ResourceStates.UnorderedAccess);
+
+            var desc = Composite.Native.Description;
+            _finalizeCS.SetPushConstant(_kFinalize, "InputSrv", Composite.BindlessIndex);
+            _finalizeCS.SetPushConstant(_kFinalize, "OutputUAV", LdrOutput.UavIndex);
+            _finalizeCS.SetPushConstant(_kFinalize, "ScreenWidth", (uint)desc.Width);
+            _finalizeCS.SetPushConstant(_kFinalize, "ScreenHeight", (uint)desc.Height);
+
+            // Bloom params (push constants — packed as uint)
+            bool bloomActive = BloomPyramid != null && Engine.Settings.EnableBloom && BloomPyramid.MipCount > 0;
+            _finalizeCS.SetPushConstant(_kFinalize, "BloomTex", bloomActive ? BloomPyramid!.MipSRVs[0] : 0u);
+            _finalizeCS.SetPushConstant(_kFinalize, "BloomIntBits", BitConverter.SingleToUInt32Bits(bloomActive ? Engine.Settings.BloomIntensity : 0f));
+            _finalizeCS.SetPushConstant(_kFinalize, "TimeBits", BitConverter.SingleToUInt32Bits(Time.TotalTime));
+
+            uint groupsX = ((uint)desc.Width + 7) / 8;
+            uint groupsY = ((uint)desc.Height + 7) / 8;
+            _finalizeCS.Dispatch(_kFinalize, list, groupsX, groupsY);
+
+            // UAV barrier, then transition to PixelShaderResource for SMAA/Blit
+            list.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(LdrOutput.Native)));
+            Transition(list, LdrOutput.Native, ResourceStates.UnorderedAccess, ResourceStates.PixelShaderResource);
         }
 
         private void RenderForward(Camera camera, ID3D12GraphicsCommandList list)
@@ -823,8 +1015,8 @@ namespace Freefall.Graphics
               }
 
 
-             // Transition Composite to PixelShaderResource for Blit
-             Transition(list, Composite.Native, ResourceStates.RenderTarget, ResourceStates.PixelShaderResource);
+             // Transition Composite to NonPixelShaderResource for compute reads (bloom + finalize)
+             Transition(list, Composite.Native, ResourceStates.RenderTarget, ResourceStates.NonPixelShaderResource);
              // Depth for PostProcess reads
              Transition(list, Depth.Native, ResourceStates.DepthWrite, ResourceStates.PixelShaderResource);
 
@@ -832,7 +1024,7 @@ namespace Freefall.Graphics
              if (CommandBuffer.HasPendingCommands(RenderPass.PostProcess))
              {
                  // Snapshot composite for PostProcess manual blending
-                 Transition(list, Composite.Native, ResourceStates.PixelShaderResource, ResourceStates.CopySource);
+                 Transition(list, Composite.Native, ResourceStates.NonPixelShaderResource, ResourceStates.CopySource);
                  Transition(list, CompositeSnapshot.Native, ResourceStates.PixelShaderResource, ResourceStates.CopyDest);
                  list.CopyResource(CompositeSnapshot.Native, Composite.Native);
                  Transition(list, CompositeSnapshot.Native, ResourceStates.CopyDest, ResourceStates.PixelShaderResource);
@@ -846,8 +1038,8 @@ namespace Freefall.Graphics
                  CommandBuffer.Execute(RenderPass.PostProcess, list, Engine.Device);
                  PixMarker.End(list); // PostProcess
 
-                 // Transition Composite back to PixelShaderResource for Blit
-                 Transition(list, Composite.Native, ResourceStates.RenderTarget, ResourceStates.PixelShaderResource);
+                 // Transition Composite back to NonPixelShaderResource for compute reads
+                 Transition(list, Composite.Native, ResourceStates.RenderTarget, ResourceStates.NonPixelShaderResource);
              }
              PixMarker.End(list); // Forward
         }
@@ -858,9 +1050,9 @@ namespace Freefall.Graphics
              PixMarker.Begin(list, "Blit");
              var backBuffer = camera.Target.CurrentBackBuffer;
 
-             // If SMAA is active, blit from its output; otherwise from Composite
+             // If SMAA is active, blit from its output; otherwise from LdrOutput
              bool useSmaa = Smaa != null && Engine.Settings.EnableSMAA && Smaa.BlitSource != null;
-             var blitSource = useSmaa ? Smaa!.BlitSource! : Composite.Native;
+             var blitSource = useSmaa ? Smaa!.BlitSource! : LdrOutput.Native;
 
              Transition(list, blitSource, ResourceStates.PixelShaderResource, ResourceStates.CopySource);
              Transition(list, backBuffer, ResourceStates.RenderTarget, ResourceStates.CopyDest);
@@ -969,6 +1161,10 @@ namespace Freefall.Graphics
             ScreenSpaceDisplacement?.Dispose();
             RadianceCascades?.Dispose();
             Smaa?.Dispose();
+            BloomPyramid?.Dispose();
+            _bloomCS?.Dispose();
+            LdrOutput?.Dispose();
+            _finalizeCS?.Dispose();
             _entityIdReadback?.Dispose();
             _depthReadback?.Dispose();
             _normalReadback?.Dispose();

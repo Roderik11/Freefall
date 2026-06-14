@@ -44,8 +44,6 @@ namespace Freefall.Assets
             public const string SkinnedEffect = "00000000000000000000000000000017";
             public const string CrossmeshEffect = "00000000000000000000000000000018";
 
-
-
             // materials
             public const string DefaultMaterial = "00000000000000000000000000000020";
             public const string TerrainMaterial = "00000000000000000000000000000021";
@@ -54,6 +52,10 @@ namespace Freefall.Assets
             public const string TrunkMaterial = "00000000000000000000000000000024";
             public const string SkyboxMaterial = "00000000000000000000000000000025";
             public const string CrossmeshMaterial = "00000000000000000000000000000027";
+
+            // meshes
+            public const string SphereMesh = "000000000000000000000000000001000";
+            public const string CubeMesh = "000000000000000000000000000001001";
 
         }
 
@@ -83,6 +85,7 @@ namespace Freefall.Assets
         public static Effect SkinnedEffect { get; private set; }
         public static Effect CrossmeshEffect { get; private set; }
 
+        // Default materials mirror the default effects, with basic textures assigned where appropriate.
 
         public static Material DefaultMaterial { get; private set; }
         public static Material TerrainMaterial { get; private set; }
@@ -91,6 +94,12 @@ namespace Freefall.Assets
         public static Material TrunkMaterial { get; private set; }
         public static Material SkyboxMaterial { get; private set; }
         public static Material CrossmeshMaterial { get; private set; }
+
+
+        // default meshes
+
+        public static Mesh SphereMesh { get; private set; }
+        public static Mesh CubeMesh { get; private set; }
 
         public static void Initialize(GraphicsDevice device)
         {
@@ -175,7 +184,15 @@ namespace Freefall.Assets
             SkyboxMaterial.Name = "SkyboxMaterial";
             CrossmeshMaterial = new Material(CrossmeshEffect);
             CrossmeshMaterial.Name = "CrossmeshMaterial";
+           
 
+            SphereMesh = Mesh.CreateSphere(device, 0.5f, 16, 16);
+            SphereMesh.Name = "SphereMesh";
+            SphereMesh.Guid = Guids.SphereMesh;
+
+            CubeMesh = Mesh.CreateCube(device, 1.0f);
+            CubeMesh.Name = "CubeMesh";
+            CubeMesh.Guid = Guids.CubeMesh;
         }
 
         /// <summary>
@@ -214,6 +231,9 @@ namespace Freefall.Assets
             manager.RegisterAsset(Guids.TrunkMaterial, TrunkMaterial);
             manager.RegisterAsset(Guids.SkyboxMaterial, SkyboxMaterial);
             manager.RegisterAsset(Guids.CrossmeshMaterial, CrossmeshMaterial);
+
+            manager.RegisterAsset(Guids.SphereMesh, SphereMesh);
+            manager.RegisterAsset(Guids.CubeMesh, CubeMesh);
         }
     }
 }
