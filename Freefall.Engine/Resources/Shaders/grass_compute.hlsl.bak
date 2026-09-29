@@ -14,8 +14,6 @@
 #pragma kernel CS_BuildDrawArgs
 #pragma kernel CS_BinMeshInstances
 
-#include "decoration_noise.hlsli"   // DecoHeightFactor (shared with decoration_prepass)
-
 // Push constants (root parameter 0, register b3) — bindless indices only
 cbuffer PushConstants : register(b3)
 {
@@ -145,8 +143,6 @@ struct DecoratorSlot
     float ClusterScale;         // world size of density clumps in m (0 = off)
     float ClusterAmount;        // 0 = uniform, 1 = full clumps + bare gaps
     uint AlphaClip;             // mesh mode: 1 = alpha-test albedo (foliage), 0 = opaque (rocks, pebbles)
-    float HeightNoiseScale;     // world size of short vs. lush patches in m (0 = off)
-    float HeightNoiseAmount;    // 0 = none, 1 = 0.4x .. 1.4x height
 };
 
 struct LODEntry { uint MeshPartId; float MaxDistance; uint MaterialId; uint _pad; };
@@ -440,11 +436,6 @@ void CS_SpawnInstances(uint3 gid : SV_GroupID, uint3 gtid3 : SV_GroupThreadID)
             float randW = float(pcg(scaleSeed + 779u)) / 4294967295.0;
             float scaleH = lerp(slot.MinH, slot.MaxH, randH * densityBias);
             float scaleW = lerp(slot.MinW, slot.MaxW, randW * densityBias);
-
-            // Patch-scale height variation, independent of density (lush hollows vs. short grazed patches).
-            // Density already couples to height via densityBias (clump fringes stay short).
-            if (slot.HeightNoiseScale > 0 && slot.HeightNoiseAmount > 0)
-                scaleH *= DecoHeightFactor(texelUV * TerrainSize, slot.HeightNoiseScale, saturate(slot.HeightNoiseAmount), slotIdx);
 
             // Distance fade: smoothly shrink in the last 25% of range
             float fadeStart = range * 0.85;

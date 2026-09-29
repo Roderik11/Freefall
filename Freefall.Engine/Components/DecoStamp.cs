@@ -7,12 +7,14 @@ namespace Freefall.Components
     /// Non-destructive decoration stamp. Controls decoration density
     /// within the stamp zone (suppress or boost).
     /// </summary>
+    [Icon("icon_decostamp.png")]
     public class DecoStamp : TerrainStamp
     {
         /// <summary>
         /// Decoration density multiplier within the stamp zone.
         /// 0 = fully suppress, 1 = no change, >1 = boost density.
         /// </summary>
+        [System.ComponentModel.Category("Decoration")]
         [ValueRange(0f, 2f)]
         public float Density = 0f;
 

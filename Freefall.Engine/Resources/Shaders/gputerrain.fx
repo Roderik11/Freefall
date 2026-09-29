@@ -220,8 +220,9 @@ float3 GetNormal(float2 uv)
     h[2] = HeightTex.SampleLevel(sampHeightFilter, uv + float2(HeightTexel, 0), 0).r;
     h[3] = HeightTex.SampleLevel(sampHeightFilter, uv + float2(0, HeightTexel), 0).r;
 	
+    // Central difference spans two texels (h[1]-h[2], h[0]-h[3])
     float texelWorldSize = TerrainSize.x * HeightTexel;
-    float heightScale = MaxHeight / texelWorldSize;
+    float heightScale = MaxHeight / (2.0 * texelWorldSize);
     
 	float3 n;
 	n.z = (h[0] - h[3]) * heightScale;

@@ -215,6 +215,31 @@ namespace Freefall.Assets
         }
 
         /// <summary>
+        /// Data type name recorded in the meta for a source or sub-asset GUID (e.g. "Texture", "Mesh"), or null.
+        /// </summary>
+        public static string GetAssetTypeName(string guid)
+        {
+            var meta = GetMeta(guid);
+            if (meta == null) return null;
+
+            if (string.Equals(meta.Guid, guid, StringComparison.OrdinalIgnoreCase) && meta.MainAssetType != null)
+                return meta.MainAssetType;
+
+            lock (meta)
+            {
+                foreach (var sub in meta.SubAssets)
+                    if (string.Equals(sub.Guid, guid, StringComparison.OrdinalIgnoreCase))
+                        return sub.AssetType ?? sub.Type;
+            }
+            return null;
+        }
+
+        /// <summary>
+        /// Runtime asset type for a GUID, resolved from the meta without loading anything. Null if unknown.
+        /// </summary>
+        public static Type GetAssetType(string guid) => ResolveAssetType(GetAssetTypeName(guid));
+
+        /// <summary>
         /// Find a sibling sub-asset of a given type from the same source file.
         /// Used by loaders to resolve related assets (e.g., Mesh → Skeleton from the same model).
         /// </summary>
@@ -622,7 +647,8 @@ namespace Freefall.Assets
             _thumbTextures.Clear();
 
             _thumbGenerators.Clear();
-            _typeAliases.Clear();
+            lock (_typeAliases)
+                _typeAliases.Clear();
         }
 
         /// <summary>
@@ -1404,7 +1430,42 @@ namespace Freefall.Assets
         private static Type ResolveAssetType(string dataTypeName)
         {
             if (string.IsNullOrEmpty(dataTypeName)) return null;
-            return _typeAliases.TryGetValue(dataTypeName, out var type) ? type : null;
+            if (_typeAliases.Count == 0)
+                BuildTypeAliases();
+            lock (_typeAliases)
+                return _typeAliases.TryGetValue(dataTypeName, out var type) ? type : null;
+        }
+
+        /// <summary>
+        /// Build the reverse alias map: data type name string → runtime Type
+        /// (e.g. "MeshData" → typeof(Mesh), "PrefabData" → typeof(Prefab)).
+        /// Called by DiscoverThumbnailGenerators, and lazily by ResolveAssetType so
+        /// type lookups also work where thumbnails are never generated (game builds).
+        /// </summary>
+        private static void BuildTypeAliases()
+        {
+            lock (_typeAliases)
+            {
+                _typeAliases.Clear();
+
+                foreach (var assembly in new[] { Assembly.GetExecutingAssembly(), Assembly.GetEntryAssembly() })
+                {
+                    if (assembly == null) continue;
+                    try
+                    {
+                        foreach (var type in assembly.GetTypes())
+                        {
+                            if (!typeof(Asset).IsAssignableFrom(type)) continue;
+                            _typeAliases[type.Name] = type;
+
+                            var aliases = type.GetCustomAttributes<AssetTypeAliasAttribute>();
+                            foreach (var alias in aliases)
+                                _typeAliases[alias.Alias] = type;
+                        }
+                    }
+                    catch (System.Reflection.ReflectionTypeLoadException) { }
+                }
+            }
         }
 
         /// <summary>
@@ -1456,29 +1517,9 @@ namespace Freefall.Assets
         public static void DiscoverThumbnailGenerators()
         {
             _thumbGenerators.Clear();
-            _typeAliases.Clear();
+            BuildTypeAliases();
 
             var assemblies = new[] { Assembly.GetExecutingAssembly(), Assembly.GetEntryAssembly() };
-
-            // Build reverse alias map: data type name string → runtime Type
-            // e.g. "MeshData" → typeof(Mesh), "PrefabData" → typeof(Prefab)
-            foreach (var assembly in assemblies)
-            {
-                if (assembly == null) continue;
-                try
-                {
-                    foreach (var type in assembly.GetTypes())
-                    {
-                        if (!typeof(Asset).IsAssignableFrom(type)) continue;
-                        _typeAliases[type.Name] = type;
-
-                        var aliases = type.GetCustomAttributes<AssetTypeAliasAttribute>();
-                        foreach (var alias in aliases)
-                            _typeAliases[alias.Alias] = type;
-                    }
-                }
-                catch (System.Reflection.ReflectionTypeLoadException) { }
-            }
 
             // Discover thumbnail generator implementations.
             // Cache instances so one class with multiple [ThumbnailGenerator] attributes

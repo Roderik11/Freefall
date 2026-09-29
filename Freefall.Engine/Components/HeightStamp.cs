@@ -11,11 +11,13 @@ namespace Freefall.Components
     /// scaled by Strength, with rotation from the entity transform.
     /// InvertShape negates the displacement for trenches/riverbeds.
     /// </summary>
+    [Icon("icon_heightstamp.png")]
     public class HeightStamp : TerrainStamp
     {
         /// <summary>
         /// Height offset from the entity/spline position (world units).
         /// </summary>
+        [System.ComponentModel.Category("Height")]
         public float HeightOffset = 0f;
 
         /// <summary>

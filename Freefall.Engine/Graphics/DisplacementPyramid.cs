@@ -5,8 +5,9 @@ using Vortice.DXGI;
 namespace Freefall.Graphics
 {
     /// <summary>
-    /// Mip pyramid for SSDM displacement vectors.
-    /// Two instances needed: Pyramid A (displacement vectors) and Pyramid B (source UVs).
+    /// Mip pyramid for SSDM displacement vectors (Pyramid A).
+    /// CSRefine samples all levels via FullChainSrv; the inversion output
+    /// itself is a plain single-mip texture owned by ScreenSpaceDisplacement.
     /// </summary>
     public class DisplacementPyramid : IDisposable
     {

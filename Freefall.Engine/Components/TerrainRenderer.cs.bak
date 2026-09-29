@@ -1768,9 +1768,6 @@ namespace Freefall.Components
             public float ProceduralBlend;
             public float ClusterScale;    // world size of density clumps (m), 0 = off
             public float ClusterAmount;   // 0 = uniform, 1 = full clumps with bare gaps
-            public uint AlphaClip;        // mesh mode: 1 = alpha-test albedo, 0 = opaque material
-            public float HeightNoiseScale;  // world size of short vs. lush patches (m), 0 = off
-            public float HeightNoiseAmount; // 0 = none, 1 = 0.4x .. 1.4x height
         }
 
         [StructLayout(LayoutKind.Sequential)]
@@ -1913,9 +1910,6 @@ namespace Freefall.Components
                     ProceduralBlend = deco.ProceduralBlend,
                     ClusterScale = deco.ClusterScale,
                     ClusterAmount = deco.ClusterAmount,
-                    AlphaClip = deco.Material?.Effect?.Name == "gbuffer" ? 0u : 1u,
-                    HeightNoiseScale = deco.HeightNoiseScale,
-                    HeightNoiseAmount = deco.HeightNoiseAmount,
                 });
 
                 string srcDesc = srcMask != 0 ? $"layers=0x{srcMask:X}" : "standalone";
@@ -2239,9 +2233,6 @@ namespace Freefall.Components
                     ProceduralBlend = deco.ProceduralBlend,
                     ClusterScale = deco.ClusterScale,
                     ClusterAmount = deco.ClusterAmount,
-                    AlphaClip = deco.Material?.Effect?.Name == "gbuffer" ? 0u : 1u,
-                    HeightNoiseScale = deco.HeightNoiseScale,
-                    HeightNoiseAmount = deco.HeightNoiseAmount,
                 });
                 slotIdx++;
             }
@@ -2545,11 +2536,8 @@ namespace Freefall.Components
 
                     _meshDrawCountBuffer!.Transition(commandList, ResourceStates.CopySource);
                     commandList.CopyBufferRegion(_instanceCounterReadback, 8, _meshDrawCountBuffer.Native, 0, 4);
+                    _meshDrawCountBuffer.Transition(commandList, ResourceStates.UnorderedAccess);
                 }
-
-                // The mesh-mode ExecuteIndirect reads its draw count from this buffer, so it must be in
-                // IndirectArgument state (it was left in UnorderedAccess: no mesh decorator ever drew).
-                _meshDrawCountBuffer!.Transition(commandList, ResourceStates.IndirectArgument);
             }
 
             // ════════════════════════════════════════════════════════════════
@@ -2594,17 +2582,13 @@ namespace Freefall.Components
                 // by the binning kernel — no additional SetGraphicsRoot32BitConstant needed.
 
                 commandList.ExecuteIndirect(
-                    device.MeshDecoCommandSignature, // 72-byte commands from CS_BinMeshInstances
+                    device.BindlessCommandSignature,
                     32,  // max 32 mesh types
                     _meshDrawArgsBuffer!.Native,
                     0,
                     _meshDrawCountBuffer!.Native,  // count buffer: actual number of draws
                     0);
             }
-
-            // Back to UAV for next frame's binning pass (written by CS_BinMeshInstances)
-            if (pass == RenderPass.Opaque)
-                _meshDrawCountBuffer!.Transition(commandList, ResourceStates.UnorderedAccess);
         }
 
         // ── Terrain Stamp message handlers ─────────────────────────

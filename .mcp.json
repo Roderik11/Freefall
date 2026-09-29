@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "freefall": {
+      "type": "stdio",
+      "command": "${LOCALAPPDATA}/Freefall/McpBridge/FreefallMcp.exe",
+      "args": []
+    }
+  }
+}

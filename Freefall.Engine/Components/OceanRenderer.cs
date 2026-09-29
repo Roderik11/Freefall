@@ -71,39 +71,33 @@ namespace Freefall.Components
     [Icon("icon_ocean.png")]
     public class OceanRenderer : Component, IDraw, IUpdate
     {
-        // ── Visual parameters ──
+        [Category("Color")]
         public Color3 OceanColor = new Color3(0.002f, 0.012f, 0.022f);
         public Color3 DeepColor = new Color3(0.001f, 0.004f, 0.012f);
 
-        // ── Simulation parameters (runtime-tweakable) ──
-
-        [Category("Settings")]
+        [Category("Simulation")]
         [ValueRange(0.5f, 200f)]
         [Description(@"Water depth in meters.
          Affects wave dispersion and TMA spectral correction.
          Shallower water produces shorter, steeper waves")]
         public float Depth = 40.0f;
         
-        [Category("Settings")]
         [ValueRange(0f, 1f)]
         [Description(@"Horizontal displacement scale (Lambda).
          Higher values push wave crests apart,
          creating sharper peaks but risking self-intersection artifacts")]
         public float Choppiness = 1.0f;
         
-        [Category("Settings")]
         [ValueRange(0f, 5f)]
         [Description(@"Time multiplier for wave animation speed.
          1.0 = real-time")]
         public float WaveSpeed = 1.0f;
         
-        [Category("Settings")]
         [ValueRange(10f, 1000f)]
         [Description(@"Period in seconds before the wave pattern repeats.
          Higher values delay visible looping")]
         public float RepeatTime = 200.0f;
 
-        // ── Foam parameters ──
         [Category("Foam")]
         [ValueRange(0f, 2f)]
         [Description(@"Jacobian threshold for foam generation.
@@ -111,20 +105,17 @@ namespace Freefall.Components
          higher values restrict foam to steep crests only")]
         public float FoamBias = 0.47f;
         
-        [Category("Foam")]
         [ValueRange(0f, 0.1f)]
         [Description(@"Exponential decay rate per frame.
          Controls how quickly foam fades after forming.
          Lower values make foam linger longer")]
         public float FoamDecayRate = 0.0175f;
         
-        [Category("Foam")]
         [ValueRange(0f, 1f)]
         [Description(@"Minimum Jacobian deviation required before any foam is added.
          Acts as a noise gate to suppress faint foam")]
         public float FoamThreshold = 0.1f;
         
-        [Category("Foam")]
         [ValueRange(0f, 1f)]
         [Description(@"Amount of foam injected per frame when the Jacobian exceeds the threshold.
          Higher values create thicker, more opaque foam")]
@@ -136,28 +127,24 @@ namespace Freefall.Components
          Shallower water than this will have progressively calmer waves")]
         public float ShoreDepth = 35f;
 
-        [Category("Shore")]
         [ValueRange(0f, 0.5f)]
         [Description(@"Minimum wave displacement at the shoreline.
          0 = completely flat at shore, higher = more residual ripple")]
         public float ShoreMinWave = 0.1f;
 
-        [Category("Shore")]
         public Color3 ShallowColor = new Color3(0.4f, 0.75f, 0.7f);
 
-        [Category("Shore")]
         [ValueRange(1f, 30f)]
         [Description(@"Linear depth range in meters for PS shore effects.
          Controls how wide the soft intersection and shallow color zones are")]
         public float ShoreFadeDepth = 8f;
 
-        [Category("Shore")]
         [ValueRange(0f, 0.1f)]
         [Description(@"Refraction distortion strength for terrain show-through.
          How much the wave normal bends the view of the seabed")]
         public float RefractionStrength = 0.02f;
 
-        // ── Spectrum bands (editable) ──
+        [Category("Spectrum")]
         public List<SpectrumBand> Bands = CreateDefaultBands();
 
         private Mesh _mesh = null!;

@@ -263,18 +263,7 @@ namespace Freefall.Components
         }
 
         /// <summary>
-        /// Compute retargeted rotations using the world-space offset method.
-        /// (upf-gti / sketchpunk algorithm)
-        ///
-        /// For each mapped target bone i (source bone j):
-        ///   srcLocal = Inv(srcAnimModel[srcParent]) * srcAnimModel[j]
-        ///   trgLocal = Inv(bindTrgWorldParent) * bindSrcWorldParent * srcLocal * Inv(bindSrcWorld) * bindTrgWorld
-        ///
-        /// This works by:
-        ///   1. srcWorldRot = bindSrcWorldParent * srcLocal  (hybrid: bind parents + anim bone)
-        ///   2. offsetWorld = srcWorldRot * Inv(bindSrcWorld)  (world-space offset from bind)
-        ///   3. trgWorldRot = offsetWorld * bindTrgWorld  (apply offset to target bind)
-        ///   4. trgLocal = Inv(bindTrgWorldParent) * trgWorldRot  (back to local)
+        /// Compute retargeted rotations via BoneMap (world-space offset method).
         /// </summary>
         private void ComputeRetargetedRotations(Bone[] skeleton)
         {
@@ -286,48 +275,7 @@ namespace Freefall.Components
                 _retargetedModelRot = new Quaternion[count];
             }
 
-            var srcBones = _boneMap.Source.Bones;
-
-            for (int i = 0; i < count; i++)
-            {
-                int dstParentIdx = skeleton[i].Parent;
-                var parentModel = dstParentIdx >= 0
-                    ? _retargetedModelRot[dstParentIdx]
-                    : Quaternion.Identity;
-
-                int srcIdx = _boneMap.TargetToSource[i];
-                if (srcIdx >= 0)
-                {
-                    // Extract source animated local rotation
-                    int srcParentIdx = srcBones[srcIdx].Parent;
-                    var srcParentModel = srcParentIdx >= 0
-                        ? _srcAnimModelRot[srcParentIdx]
-                        : Quaternion.Identity;
-                    var srcLocal = Quaternion.Inverse(srcParentModel) * _srcAnimModelRot[srcIdx];
-
-                    // Bind world rotations (source uses actual bind = T-pose,
-                    // target uses T-pose auxiliary = DstTPoseModelRot)
-                    var bindSrcWorldParent = srcParentIdx >= 0
-                        ? _boneMap.SrcBindModelRot[srcParentIdx]
-                        : Quaternion.Identity;
-                    var invBindSrcWorld = Quaternion.Inverse(_boneMap.SrcBindModelRot[srcIdx]);
-                    var bindTrgWorld = _boneMap.DstTPoseModelRot[i];
-                    var invBindTrgWorldParent = dstParentIdx >= 0
-                        ? Quaternion.Inverse(_boneMap.DstTPoseModelRot[dstParentIdx])
-                        : Quaternion.Identity;
-
-                    // World-space offset retargeting
-                    _retargetedLocalRot[i] = Quaternion.Normalize(
-                        invBindTrgWorldParent * bindSrcWorldParent * srcLocal * invBindSrcWorld * bindTrgWorld);
-                    _retargetedModelRot[i] = Quaternion.Normalize(
-                        parentModel * _retargetedLocalRot[i]);
-                }
-                else
-                {
-                    _retargetedLocalRot[i] = skeleton[i].BindPose.Rotation;
-                    _retargetedModelRot[i] = parentModel * skeleton[i].BindPose.Rotation;
-                }
-            }
+            _boneMap.Retarget(_srcAnimModelRot, _retargetedLocalRot, _retargetedModelRot);
 
             // One-time debug: trace arm bone directions
             if (!_debugLogged)
@@ -340,8 +288,8 @@ namespace Freefall.Components
                     int srcIdx2 = _boneMap.TargetToSource[i];
                     if (srcIdx2 < 0) continue;
 
-                    var srcBoneDir = BoneMap.GetBoneDirectionPublic(_boneMap.Source, srcIdx2);
-                    var dstBoneDir = BoneMap.GetBoneDirectionPublic(_boneMap.Target, i);
+                    var srcBoneDir = _boneMap.SrcBoneDir[i];
+                    var dstBoneDir = _boneMap.DstBoneDir[i];
 
                     // Where does the source bone point during animation?
                     var srcDelta2 = _srcAnimModelRot[srcIdx2] *
@@ -472,8 +420,11 @@ namespace Freefall.Components
                 // Position: transfer root delta, keep bind for all others
                 if (sourceBoneIndex == _boneMap.SourceRoot)
                 {
+                    // Root delta goes through source-parent space → model space →
+                    // height scale → target-parent space (handles unit/axis mismatch)
                     var srcDelta = blendPose.Position - sourceBone.BindPose.Position;
-                    blendPose.Position = bone.BindPose.Position + srcDelta * _boneMap.PositionScale;
+                    blendPose.Position = bone.BindPose.Position
+                        + Vector3.TransformNormal(srcDelta, _boneMap.RootDeltaTransform);
                 }
                 else
                 {

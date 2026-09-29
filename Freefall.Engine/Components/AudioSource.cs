@@ -10,13 +10,15 @@ namespace Freefall.Components
     [Icon("icon_audio.png")]
     public class AudioSource : Component, IUpdate
     {
+        [System.ComponentModel.Category("Playback")]
         public AudioClip AudioClip;
         public float Volume = 1;
-        public float Range = 10;
-        public float MinDistance = 0;
-
         public bool Loop;
         public bool PlayOnAwake;
+
+        [System.ComponentModel.Category("Spatial")]
+        public float Range = 10;
+        public float MinDistance = 0;
 
         private Emitter emitter;
         private IXAudio2SourceVoice sourceVoice;

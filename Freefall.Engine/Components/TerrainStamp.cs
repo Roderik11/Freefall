@@ -4,6 +4,7 @@ using System.Security.Cryptography;
 using Freefall.Base;
 using Freefall.Graphics;
 using Vortice.Mathematics;
+using Category = System.ComponentModel.CategoryAttribute;
 
 namespace Freefall.Components
 {
@@ -14,12 +15,11 @@ namespace Freefall.Components
     /// </summary>
     public abstract class TerrainStamp : Component, ISceneGizmo
     {
-        // ── Shape ──
-
         /// <summary>
         /// Radius for radial stamps (when no Spline is present).
         /// Width for spline-based stamps (half-width on each side of the path).
         /// </summary>
+        [Category("Shape")]
         [ValueRange(0.1f, 200f)]
         public float Radius = 4f;
 
@@ -27,9 +27,11 @@ namespace Freefall.Components
         [ValueRange(0f, 200f)]
         public float Falloff = 3f;
 
-        // ── Edge Noise (organic edge breakup) ──
+        /// <summary>Evaluation priority. Higher values are applied later (overwrite lower).</summary>
+        public int Priority = 0;
 
         /// <summary>Enable noise displacement on the falloff boundary for organic edges.</summary>
+        [Category("Edge Noise")]
         public bool EnableNoise = false;
 
         /// <summary>Noise frequency relative to influence radius (bumps per radius).</summary>
@@ -42,11 +44,6 @@ namespace Freefall.Components
 
         /// <summary>Noise seed for variation between stamps.</summary>
         public int NoiseSeed = RandomNumberGenerator.GetInt32(99999);
-
-        // ── Priority ──
-
-        /// <summary>Evaluation priority. Higher values are applied later (overwrite lower).</summary>
-        public int Priority = 0;
 
         // ═══════════════════════════════════════════
         // ── Runtime ──
@@ -180,11 +177,31 @@ namespace Freefall.Components
 
         private float GetDistanceToSpline(Vector3 worldPos)
         {
+            // Closed splines are filled areas on the GPU (terrain_stamp_overlay / height bake): match that here
+            if (_cachedSpline.Closed && IsInsideClosedSpline(worldPos))
+                return 0f;
+
             float nearestT = FindNearestT(worldPos, 64);
             var nearestPoint = _cachedSpline.GetWorldPoint(nearestT);
             float dx = worldPos.X - nearestPoint.X;
             float dz = worldPos.Z - nearestPoint.Z;
             return MathF.Sqrt(dx * dx + dz * dz);
+        }
+
+        private bool IsInsideClosedSpline(Vector3 worldPos)
+        {
+            const int samples = 64;
+            bool inside = false;
+            var prev = _cachedSpline.GetWorldPoint(1f);
+            for (int i = 0; i < samples; i++)
+            {
+                var cur = _cachedSpline.GetWorldPoint((float)i / samples);
+                if ((cur.Z > worldPos.Z) != (prev.Z > worldPos.Z) &&
+                    worldPos.X < (prev.X - cur.X) * (worldPos.Z - cur.Z) / (prev.Z - cur.Z) + cur.X)
+                    inside = !inside;
+                prev = cur;
+            }
+            return inside;
         }
 
         private float FindNearestT(Vector3 worldPos, int samples)

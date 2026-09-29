@@ -60,6 +60,8 @@ struct VSOutput
     float Depth : TEXCOORD3;
     nointerpolation uint TransformSlot : TEXCOORD4;
     nointerpolation uint MeshPartIdx : TEXCOORD5;
+    float CanopyAO : TEXCOORD6;     // 0 = deep inside / under the canopy, 1 = outer sunlit shell
+    float3 DomeNormal : TEXCOORD7;  // original look (mostly up) — used for materials that have a normal map
 };
 
 // Wind animation helpers
@@ -113,10 +115,24 @@ VSOutput VS(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_InstanceI
     output.WorldPos = worldPos;
     output.Position = mul(mul(worldPos, View), Projection);
     
-    // Canopy shape: mostly upward with subtle outward dome from tree origin
+    // Original canopy normal: mostly upward with a subtle outward dome from the tree origin. Kept for foliage whose
+    // material has a normal map (Sweetgum, beech): those trees were authored against this look.
     float3 treeOrigin = float3(World._41, World._42, World._43);
-    float3 outward = normalize(worldPos.xyz - treeOrigin);
-    output.Normal = normalize(lerp(float3(0, 1, 0), outward, 0.25));
+    output.DomeNormal = normalize(lerp(float3(0, 1, 0), normalize(worldPos.xyz - treeOrigin), 0.25));
+
+    // Fake-volume canopy for foliage WITHOUT a normal map (e.g. Aquarius shrubs): normals point out of the leaf
+    // part's bounding sphere, biased up — the dome lit them like flat ground, so they read as flat, bright blobs.
+    float3 canopyCenterLocal = part.LocalBounds.xyz;
+    float canopyRadius = max(part.LocalBounds.w, 0.01);
+    float3 canopyCenter = mul(float4(canopyCenterLocal, 1.0f), World).xyz;
+    float3 outward = normalize(worldPos.xyz - canopyCenter + float3(0, 1e-4, 0));
+    output.Normal = normalize(lerp(float3(0, 1, 0), outward, 0.6));
+
+    // Fake canopy self-occlusion: leaves deep inside and on the underside get less light
+    float3 rel = (pos - canopyCenterLocal) / canopyRadius;              // -1..1 inside the bounding sphere
+    float shell = smoothstep(0.15, 0.9, length(rel));                   // 0 core → 1 outer shell
+    float top = saturate(rel.y * 0.5 + 0.5);                            // 0 bottom → 1 top
+    output.CanopyAO = shell * lerp(0.55, 1.0, top);
     output.TexCoord = uv;
     output.TexCoord.y = 1 - output.TexCoord.y;
     output.MaterialID = desc.MaterialId;
@@ -156,7 +172,9 @@ PSOutput PS(VSOutput input, bool isFrontFace : SV_IsFrontFace)
     // Use interpolated dome normal from VS — provides directional response
     // while still being smoothed enough to avoid harsh self-shadowing
     // No backface flip: both sides of each leaf card should receive equal lighting
-    float3 N = normalize(input.Normal);
+    // Fake canopy volume only when the material has no normal map; normal-mapped foliage keeps the original shading
+    bool fakeVolume = mat.NormalIdx == 0;
+    float3 N = normalize(fakeVolume ? input.Normal : input.DomeNormal);
 
     // Subsurface scattering hint: store translucency in albedo alpha
     // The directional light shader can use this for wrap lighting
@@ -168,9 +186,11 @@ PSOutput PS(VSOutput input, bool isFrontFace : SV_IsFrontFace)
         translucency = tTex.Sample(Sampler, input.TexCoord).r;
     }
 
-    output.Albedo = float4(color.rgb, 0);
+    // Canopy occlusion darkens interior leaves (direct light too, via albedo) and feeds the ambient AO channel
+    float canopyAO = fakeVolume ? lerp(0.35, 1.0, saturate(input.CanopyAO)) : 1.0;
+    output.Albedo = float4(color.rgb * lerp(0.6, 1.0, canopyAO), 0);
     output.Normal = float4(N, translucency); // store translucency in normal.w
-    output.Data = float4(0.7, 0.0, 1.0, 0.5); // roughness=0.7, metal=0, ao=1, flag=vegetation
+    output.Data = float4(0.7, 0.0, canopyAO, 0.5); // roughness=0.7, metal=0, ao=canopy occlusion, flag=vegetation
     output.Depth = input.Depth;
     output.Displacement = float2(0,0);
     output.EntityId = (input.TransformSlot << 8u) | (input.MeshPartIdx & 0xFFu);

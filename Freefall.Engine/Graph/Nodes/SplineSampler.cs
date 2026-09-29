@@ -26,7 +26,8 @@ namespace Freefall.PCG
     /// Samples points along a Spline component, producing a SamplePointSet
     /// with position and rotation (aligned to edge tangent, Y-up).
     /// 
-    /// EvenSpacing: uses Catmull-Rom evaluation at fixed arc-length intervals.
+    /// EvenSpacing: uses Catmull-Rom evaluation at fixed arc-length intervals (arc-length table, so
+    ///              dense control points don't concentrate samples).
     /// PerEdge: walks each control point pair as a straight segment, subdividing
     ///          by Spacing. Best for polygon-like splines (e.g., Watabou walls).
     /// </summary>
@@ -44,6 +45,19 @@ namespace Freefall.PCG
         /// <summary>Distance between samples in meters.</summary>
         [ValueRange(0.5f, 50f)]
         public float Spacing = 5f;
+
+        /// <summary>
+        /// PerEdge / EvenSpacing on a closed spline: move each sample this far toward the polygon interior
+        /// (negative = outward), independent of winding. E.g. props on a sidewalk just inside a curb.
+        /// </summary>
+        [ValueRange(-20f, 20f)]
+        public float EdgeInset = 0f;
+
+        /// <summary>
+        /// PerEdge / EvenSpacing on a closed spline: turn samples so their local +X points out of the polygon
+        /// (by default +X is the right-hand side of travel, which flips with winding). E.g. lantern arms over the street.
+        /// </summary>
+        public bool OrientOutward = false;
 
         [Output]
         public SamplePointSet Output;
@@ -63,6 +77,9 @@ namespace Freefall.PCG
                 SamplingMode.Area => SampleArea(Spline),
                 _ => SamplePointSet.Empty()
             };
+
+            if ((EdgeInset != 0f || OrientOutward) && Mode != SamplingMode.Area && Spline.Closed)
+                ApplyEdgeFrame(result, Spline);
 
             SetOutput("Output", result);
             Debug.Log($"[SplineSampler] Produced {result.Count} samples (mode={Mode}, spacing={Spacing}m)");
@@ -215,19 +232,42 @@ namespace Freefall.PCG
         /// </summary>
         private SamplePointSet SampleEvenSpacing(Spline spline)
         {
-            float totalLength = spline.GetLength(256);
+            // Spline t is uniform per span, not per metre: short spans (dense control points) would get as many
+            // samples as long ones. Build an arc-length table and invert it so samples are evenly spaced in distance.
+            int steps = Math.Max(64, spline.SpanCount * 32);
+            var ts = new float[steps + 1];
+            var dist = new float[steps + 1];
+            Vector3 prev = spline.GetPoint(0f);
+            for (int i = 1; i <= steps; i++)
+            {
+                ts[i] = (float)i / steps;
+                Vector3 curr = spline.GetPoint(ts[i]);
+                dist[i] = dist[i - 1] + Vector3.Distance(prev, curr);
+                prev = curr;
+            }
+
+            float totalLength = dist[steps];
             if (totalLength < 0.01f) return SamplePointSet.Empty();
 
-            int count = Math.Max(1, (int)(totalLength / Spacing));
-            var positions = new List<Vector3>();
-            var rotations = new List<Quaternion>();
+            int intervals = Math.Max(1, (int)MathF.Round(totalLength / Spacing));
+            float actualSpacing = totalLength / intervals;
+            // Closed: the end coincides with the start, so skip it. Open: include both ends.
+            int count = spline.Closed ? intervals : intervals + 1;
 
+            var positions = new List<Vector3>(count);
+            var rotations = new List<Quaternion>(count);
+
+            int seg = 0;
             for (int i = 0; i < count; i++)
             {
-                float t = (float)i / count;
+                float s = Math.Min(i * actualSpacing, totalLength);
+                while (seg < steps - 1 && dist[seg + 1] < s) seg++;
+                float segLen = dist[seg + 1] - dist[seg];
+                float f = segLen > 1e-5f ? (s - dist[seg]) / segLen : 0f;
+                float t = ts[seg] + (ts[seg + 1] - ts[seg]) * f;
+
                 positions.Add(spline.GetPoint(t));
-                var tangent = spline.GetTangent(t);
-                rotations.Add(LookRotation(tangent, Vector3.UnitY));
+                rotations.Add(LookRotation(spline.GetTangent(t), Vector3.UnitY));
             }
 
             return BuildResult(positions, rotations);
@@ -272,6 +312,36 @@ namespace Freefall.PCG
             }
 
             return BuildResult(positions, rotations);
+        }
+
+        /// <summary>
+        /// Shift samples perpendicular to their edge direction toward the polygon interior (EdgeInset), and
+        /// optionally turn them so local +X faces outward (OrientOutward).
+        /// </summary>
+        private void ApplyEdgeFrame(SamplePointSet set, Spline spline)
+        {
+            // Signed area in XZ (shoelace, x→right, z→up): > 0 = counter-clockwise = interior on the left
+            float area = 0;
+            var pts = spline.Points;
+            for (int i = 0; i < pts.Count; i++)
+            {
+                var a = pts[i];
+                var b = pts[(i + 1) % pts.Count];
+                area += a.X * b.Z - b.X * a.Z;
+            }
+            float side = area > 0 ? 1f : -1f;
+
+            for (int i = 0; i < set.Count; i++)
+            {
+                var fwd = Vector3.Transform(Vector3.UnitZ, set.rotation[i]);
+                // Left of the travel direction in XZ (z-up 2D convention): (-fwd.Z, fwd.X)
+                var left = Vector3.Normalize(new Vector3(-fwd.Z, 0, fwd.X));
+                set.position[i] += left * (EdgeInset * side);
+
+                // Local +X is the right of travel = outward only for counter-clockwise polygons
+                if (OrientOutward && side < 0)
+                    set.rotation[i] = Quaternion.Normalize(set.rotation[i] * Quaternion.CreateFromAxisAngle(Vector3.UnitY, MathF.PI));
+            }
         }
 
         private static SamplePointSet BuildResult(List<Vector3> positions, List<Quaternion> rotations)

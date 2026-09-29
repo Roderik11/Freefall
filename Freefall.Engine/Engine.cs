@@ -5,6 +5,7 @@ using System.Threading.Tasks;
 using System.IO;
 using System.Numerics;
 using System.Runtime.InteropServices;
+using Category = System.ComponentModel.CategoryAttribute;
 using Freefall.Assets;
 using Freefall.Graphics;
 using Freefall.Base;
@@ -181,6 +182,7 @@ namespace Freefall
             // Release GPU buffers from previous batch resizes (deferred N frames for safety)
             var _flushDisposeSw = System.Diagnostics.Stopwatch.StartNew();
             Graphics.InstanceBatch.FlushDeferredDisposals();
+            Device?.FlushFrameDeferredDisposals();
             _flushDisposeSw.Stop();
 
             // Flush pending entity additions before Update/Render
@@ -199,7 +201,7 @@ namespace Freefall
             Update();
             _updateSw.Stop();
 
-            // --- Process all deferred resizes before rendering (Apex pattern) ---
+            // --- Process all deferred resizes before rendering ---
             // Must sync GPU first — previous frames may still be using resources
             bool anyResizePending = false;
             foreach (var v in RenderView.All)
@@ -213,6 +215,11 @@ namespace Freefall
                 foreach (var v in RenderView.All)
                     v.ProcessPendingResize();
             }
+
+            // A removed device makes every later Map fail (null pointer): report the reason (+ DRED) once, up front,
+            // instead of dying with an NRE somewhere in the renderer.
+            if (!Device.IsDeviceLost && Device.NativeDevice.DeviceRemovedReason.Failure)
+                Device.LogDeviceRemoved("Engine.Tick");
 
             // --- Apex multi-viewport render loop ---
             Device.ResetTemporaryDescriptors();
@@ -427,26 +434,15 @@ namespace Freefall
 
     public class EngineSettings
     {
+         [Category("Display")]
          public bool VSync { get; set; } = true;                            // F1 - VSync
-         public bool Wireframe { get; set; } = false;                // F2 - Global wireframe
+         public bool Wireframe { get; set; } = false;                       // F2 - Global wireframe
+         public bool EnableSMAA { get; set; } = false;                      // Anti-aliasing
+
+         [Category("Culling")]
          public bool FreezeFrustum { get; set; } = false;                   // F3 - Freeze culling frustum
-         public bool UseAdaptiveSplits { get; set; } = true;                // F4 - SDSM adaptive cascade splits
-
-         [ValueRange(50f, 1000f)]
-         public float MaxShadowDistance { get; set; } = 300f;                 // SDSM max depth for split analysis
          public bool DisableHiZ { get; set; } = false;                      // F6 - Disable Hi-Z occlusion
-         public bool DisableDepthSort { get; set; } = true;                  // GPU doesn't order instances within a draw call — sort has no visual effect
-
-         public DebugVizMode DebugVisualizationMode { get; set; } = DebugVizMode.Off; // F5 - Debug viz
-         public int RCDebugSubMode { get; set; } = 1; // 0=off, 1=tile lookup, 2=per-level radiance, 3=constant bypass, 4=raw pool readback
-
-         [ValueRange(3, 8)]
-         public int  ShadowCascadeCount { get; set; } = 4;                   // Number of shadow cascades
-
-         public bool Fog { get; set; } = true;                               // Distance fog
-
-         [ValueRange(0.0001f, 0.01f)]
-         public float FogDensity { get; set; } = 0.0005f;                     // Fog density (exponential squared)
+         public bool DisableDepthSort { get; set; } = true;                 // GPU doesn't order instances within a draw call — sort has no visual effect
 
          /// <summary>
          /// Global LOD distance scale. Default 1.0.
@@ -456,7 +452,19 @@ namespace Freefall
          [ValueRange(0.1f, 20.0f)]
          public float LODScale { get; set; } = 1.0f;
 
-         // Screen-Space Shadows (Bend Studio technique)
+         [Category("Shadows")]
+         public bool EnableShadows { get; set; } = true;
+         public bool UseAdaptiveSplits { get; set; } = true;                // F4 - SDSM adaptive cascade splits
+
+         [ValueRange(3, 8)]
+         public int ShadowCascadeCount { get; set; } = 4;                   // Number of shadow cascades
+
+         [ValueRange(50f, 1000f)]
+         public float MaxShadowDistance { get; set; } = 300f;               // SDSM max depth for split analysis
+
+         [Category("Screen-Space Shadows")]                                 // Bend Studio technique
+         public bool EnableScreenSpaceShadows { get; set; } = true;
+
          [ValueRange(0.001f, 0.2f)]
          public float SSSSurfaceThickness { get; set; } = 0.005f;
 
@@ -466,19 +474,9 @@ namespace Freefall
          [ValueRange(1f, 8f)]
          public float SSSShadowContrast { get; set; } = 2.0f;
 
-         public bool EnableShadows { get; set; } = true;
-         public bool EnableScreenSpaceShadows { get; set; } = true;
-
-         // Anti-Aliasing
-         public bool EnableSMAA { get; set; } = false;
-
-         // Screen-Space Displacement Mapping (SSDM)
+         [Category("Displacement")]                                         // Screen-Space Displacement Mapping (SSDM)
          public bool EnableSSDM { get; set; } = true;
-
          public bool UseSSDMPyramid { get; set; } = true;
-
-         public bool UseSSDMLobel { get; set; } = false;
-
 
          [ValueRange(0f, 30f)]
          public float SSDMHeightScale { get; set; } = 1f;
@@ -486,7 +484,13 @@ namespace Freefall
          [ValueRange(1f, 128f)]
          public float PixelErrorThreshold { get; set; } = 128.0f;
 
-         // Bloom
+         [Category("Fog")]
+         public bool Fog { get; set; } = true;                              // Distance fog
+
+         [ValueRange(0.0001f, 0.01f)]
+         public float FogDensity { get; set; } = 0.0005f;                   // Fog density (exponential squared)
+
+         [Category("Bloom")]
          public bool EnableBloom { get; set; } = true;
 
          [ValueRange(0f, 5f)]
@@ -501,11 +505,15 @@ namespace Freefall
          [ValueRange(0.5f, 3f)]
          public float BloomRadius { get; set; } = 1.0f;
 
-         // Radiance Cascades (Sparse 3D GI)
+         [Category("Radiance Cascades")]                                    // Sparse 3D GI
          public bool EnableRadianceCascades { get; set; } = false;
 
          [ValueRange(0f, 5f)]
          public float RCIntensity { get; set; } = 1.0f;
+
+         [Category("Debug")]
+         public DebugVizMode DebugVisualizationMode { get; set; } = DebugVizMode.Off; // F5 - Debug viz
+         public int RCDebugSubMode { get; set; } = 1;                       // 0=off, 1=tile lookup, 2=per-level radiance, 3=constant bypass, 4=raw pool readback
 
          public System.Numerics.Matrix4x4 FrozenViewProjection { get; set; } // VP matrix when frustum frozen
     }

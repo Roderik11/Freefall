@@ -50,6 +50,7 @@ namespace Freefall.Components
 
         private bool _boundsDirty = true;
         private Mesh? _boundsMesh; // tracks which mesh instance bounds were computed from
+        private Vector3[] _boundsCorners = new Vector3[8];
 
         protected override void Awake()
         {
@@ -66,9 +67,8 @@ namespace Freefall.Components
         {
             if (Mesh == null) { _boundsDirty = true; return; }
 
-            var corners = new Vector3[8];
-            Mesh.BoundingBox.GetCorners(corners, Mesh.RootRotation * Transform.WorldMatrix);
-            BoundingSphere = BoundingSphere.CreateFromPoints(corners);
+            Mesh.BoundingBox.GetCorners(_boundsCorners, Mesh.RootRotation * Transform.WorldMatrix);
+            BoundingSphere = BoundingSphere.CreateFromPoints(_boundsCorners);
             _boundsMesh = Mesh;
             _boundsDirty = false;
         }

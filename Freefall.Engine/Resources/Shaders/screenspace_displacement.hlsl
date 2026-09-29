@@ -69,6 +69,11 @@ void CSScaleA(uint3 dtid : SV_DispatchThreadID)
 
 // ============================================================
 // Build A mip chain (average 2x2 blocks, no scaling)
+// Sentinel zeros are deliberately included in the average: the
+// resulting falloff at region boundaries keeps the coarse field
+// smooth, so neighboring CSRefine seeds stay coherent and a
+// conservative undershoot (recoverable) is preferred over a
+// full-magnitude overshoot into sentinel territory (not).
 // ============================================================
 [numthreads(8, 8, 1)]
 void CSBuildMip(uint3 dtid : SV_DispatchThreadID)
@@ -117,24 +122,31 @@ void CSRefine(uint3 dtid : SV_DispatchThreadID)
     // Hierarchical Newton inversion: seed from identity, then ascend
     // through the mip pyramid from coarsest to finest resolution.
     // Each iteration refines the source estimate with finer displacement detail.
+    // Damped steps (gentle at coarse mips, firmer at fine mips) keep the
+    // search in the right basin. No early exit: a small error at a coarse
+    // mip says nothing about the detail still waiting in the finer levels.
     float2 source = myUV;
-    float maxExtent = max(DstWidth, DstHeight);
-    float maxExtentSqd = maxExtent * maxExtent;
-    // Step schedule: gentle at coarse mips (careful basin search),
-    // aggressive at fine mips (precise snap once in the right basin).
     [unroll]
     for (int i = 3; i >= 0; i--)
     {
         float2 d_at_source = pyramidA.SampleLevel(BilinearClamp, source, i);
         float2 error = myUV - (source + d_at_source);
+        source += error * (0.5 / (1.0 + i));
+    }
 
-        float errorSq = dot(error, error) * maxExtentSqd;
-        float step = 0.5 / (1.0 + i);
+    // Final full-strength snap at mip 0: the damped ladder ends at step 0.5,
+    // which leaves half the residual. Take the full step only when it
+    // actually reduces the error — near fold-over or basin boundaries the
+    // full step can overshoot, so keep the damped result there.
+    {
+        float2 d0 = pyramidA.SampleLevel(BilinearClamp, source, 0);
+        float2 error = myUV - (source + d0);
+        float2 snapped = source + error;
 
-        if (errorSq < step * step)
-            break;
-
-        source += error * step;
+        float2 dSnap = pyramidA.SampleLevel(BilinearClamp, snapped, 0);
+        float2 errSnap = myUV - (snapped + dSnap);
+        if (dot(errSnap, errSnap) < dot(error, error))
+            source = snapped;
     }
 
     dstB[dtid.xy] = source;

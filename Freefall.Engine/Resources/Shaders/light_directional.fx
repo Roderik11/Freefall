@@ -366,7 +366,9 @@ float4 PS(VSOutput input) : SV_Target
         // SSS: backlit translucency — light passes THROUGH leaves
         float translucency = NormalTex.Sample(Sampler, input.TexCoord).w;
         translucency = max(translucency, 0.3); // moderate minimum for all foliage
-        float backlight = max(-rawNdotL, 0.0);
+        // Light only passes through a leaf the sun actually reaches: without the shadow term the shadowed far side of
+        // a bush glowed candle-orange (a second light from the opposite side once canopy normals point outward).
+        float backlight = max(-rawNdotL, 0.0) * shadowFactor;
         float3 sssColor = albedo * float3(1.0, 0.85, 0.6);
         lighting += sssColor * LightColor * LightIntensity * backlight * translucency * 0.4;
     }

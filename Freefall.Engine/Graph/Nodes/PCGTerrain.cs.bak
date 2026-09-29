@@ -26,7 +26,7 @@ namespace Freefall.PCG
         /// <summary>
         /// Local-to-world matrix. Injected by PCGComponent before execution.
         /// </summary>
-        [Browsable(false)] [Freefall.Reflection.DontSerialize]
+        [Browsable(false)]
         public Matrix4x4 WorldMatrix { get; set; } = Matrix4x4.Identity;
 
         [Output]
@@ -129,7 +129,7 @@ namespace Freefall.PCG
         public float MaxHeight = float.MaxValue;
 
         /// <summary>Local-to-world matrix of the PCG entity. Injected by PCGComponent.</summary>
-        [Browsable(false)] [Freefall.Reflection.DontSerialize]
+        [Browsable(false)]
         public Matrix4x4 WorldMatrix { get; set; } = Matrix4x4.Identity;
 
         [Output]
@@ -161,7 +161,7 @@ namespace Freefall.PCG
     public class ExcludeStamps : Node, IWorldSpaceNode
     {
         /// <summary>Local-to-world matrix of the PCG entity. Injected by PCGComponent.</summary>
-        [Browsable(false)] [Freefall.Reflection.DontSerialize]
+        [Browsable(false)]
         public Matrix4x4 WorldMatrix { get; set; } = Matrix4x4.Identity;
 
         [Input]

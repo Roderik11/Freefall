@@ -315,7 +315,7 @@ namespace Freefall.PCG
         public SamplePointSet Input;
 
         /// <summary>Local-to-world matrix of the PCG entity. Injected by PCGComponent.</summary>
-        [Browsable(false)] [Freefall.Reflection.DontSerialize]
+        [Browsable(false)]
         public Matrix4x4 WorldMatrix { get; set; } = Matrix4x4.Identity;
 
         /// <summary>Extra clearance around each obstacle footprint, in meters.</summary>

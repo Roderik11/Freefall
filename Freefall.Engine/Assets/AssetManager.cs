@@ -338,6 +338,12 @@ namespace Freefall.Assets
             var assetType = typeof(T);
             T asset = null;
 
+            // The cache path resolves by GUID alone, so a caller probing the wrong type (e.g. LoadByGuid<Mesh>
+            // on a prefab GUID) would hand another type's cache file to this loader, which then reads garbage
+            // or runs past the end of the stream. Reject unrelated types up front using the type in the meta.
+            var recordedType = AssetDatabase.GetAssetType(guid);
+            if (recordedType != null && !assetType.IsAssignableFrom(recordedType) && !recordedType.IsAssignableFrom(assetType))
+                return null;
 
             // Load via cache-based loader if available
             var loader = FindLoader(assetType);

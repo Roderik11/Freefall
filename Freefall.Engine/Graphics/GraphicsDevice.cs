@@ -75,6 +75,85 @@ namespace Freefall.Graphics
             Initialize();
         }
 
+        public bool DredEnabled { get; private set; }
+        private bool _deviceRemovedLogged;
+
+        /// <summary>
+        /// Log the device-removed reason once, plus the DRED page-fault allocations and the last breadcrumbs of each
+        /// command list when DRED is enabled. Written to stdout too, since the process usually dies right after.
+        /// </summary>
+        public unsafe void LogDeviceRemoved(string where)
+        {
+            if (_deviceRemovedLogged) return;
+            _deviceRemovedLogged = true;
+            IsDeviceLost = true;
+
+            var sb = new System.Text.StringBuilder();
+            sb.AppendLine($"[DeviceRemoved] detected in {where}: reason 0x{_device.DeviceRemovedReason.Code:X8}");
+            if (DredEnabled)
+            {
+                try
+                {
+                    using var dred = _device.QueryInterface<ID3D12DeviceRemovedExtendedData>();
+                    if (dred.GetPageFaultAllocationOutput(out var pf).Success)
+                    {
+                        sb.AppendLine($"  PageFaultVA 0x{pf.PageFaultVA:X}");
+                        for (var n = pf.HeadExistingAllocationNode; n != null; n = n.Next)
+                            sb.AppendLine($"  existing alloc: {n.AllocationType} '{n.ObjectName}'");
+                        for (var n = pf.HeadRecentFreedAllocationNode; n != null; n = n.Next)
+                            sb.AppendLine($"  freed alloc:    {n.AllocationType} '{n.ObjectName}'");
+                    }
+                    using var dred1 = _device.QueryInterfaceOrNull<ID3D12DeviceRemovedExtendedData1>();
+                    if (dred1 != null && dred1.GetAutoBreadcrumbsOutput1(out var bc1).Success)
+                    {
+                        // Breadcrumb contexts carry the PIX marker names (SetBreadcrumbContextEnablement), so the report
+                        // names the render pass the GPU was stuck in, not just the op type.
+                        int nodes = 0;
+                        for (var n = bc1.HeadAutoBreadcrumbNode; n != null; n = n.Next, nodes++)
+                            sb.AppendLine($"  node {nodes}: list '{n.CommandListDebugName}' queue '{n.CommandQueueDebugName}' {(n.LastBreadcrumbValue ?? 0)}/{n.BreadcrumbCount}");
+                        sb.AppendLine($"  {nodes} breadcrumb nodes");
+                        using (var dred2 = _device.QueryInterfaceOrNull<ID3D12DeviceRemovedExtendedData2>())
+                            if (dred2 != null) sb.AppendLine($"  DRED device state: {dred2.DeviceState}");
+                        for (var n = bc1.HeadAutoBreadcrumbNode; n != null; n = n.Next)
+                        {
+                            uint done = (uint)(n.LastBreadcrumbValue ?? 0);
+                            if (done >= n.BreadcrumbCount) continue; // this list finished
+                            var contexts = new System.Collections.Generic.SortedDictionary<uint, string>();
+                            if (n.BreadcrumbContexts != null)
+                                foreach (var c in n.BreadcrumbContexts) contexts[c.BreadcrumbIndex] = c.ContextString;
+                            sb.AppendLine($"  list '{n.CommandListDebugName ?? "(unnamed)"}': completed {done}/{n.BreadcrumbCount} ops");
+                            // Open PIX regions at the stuck op: replay Begin/End events up to it
+                            var open = new System.Collections.Generic.List<string>();
+                            for (uint i = 0; i < Math.Min(done + 1, n.BreadcrumbCount); i++)
+                            {
+                                var op = n.CommandHistory[i];
+                                if (op.ToString() == "BeginEvent") open.Add(contexts.TryGetValue(i, out var s) ? s : "?");
+                                else if (op.ToString() == "EndEvent" && open.Count > 0) open.RemoveAt(open.Count - 1);
+                            }
+                            sb.AppendLine($"    in: {string.Join(" > ", open)}");
+                            for (uint i = (uint)Math.Max(0, (int)done - 6); i < Math.Min(n.BreadcrumbCount, done + 3); i++)
+                                sb.AppendLine($"    {(i == done ? ">>" : "  ")} {i}: {n.CommandHistory[i]}{(contexts.TryGetValue(i, out var ctx) ? $" '{ctx}'" : "")}");
+                        }
+                    }
+                    else if (dred.GetAutoBreadcrumbsOutput(out var bc).Success)
+                    {
+                        for (var n = bc.HeadAutoBreadcrumbNode; n != null; n = n.Next)
+                        {
+                            uint done = (uint)(n.LastBreadcrumbValue ?? 0);
+                            if (done >= n.BreadcrumbCount) continue; // this list finished
+                            sb.AppendLine($"  list '{n.CommandListDebugName ?? "(unnamed)"}': completed {done}/{n.BreadcrumbCount} ops");
+                            for (uint i = (uint)Math.Max(0, (int)done - 3); i < Math.Min(n.BreadcrumbCount, done + 3); i++)
+                                sb.AppendLine($"    {(i == done ? ">>" : "  ")} {i}: {n.CommandHistory[i]}");
+                        }
+                    }
+                }
+                catch (Exception ex) { sb.AppendLine($"  DRED query failed: {ex.Message}"); }
+            }
+            var text = sb.ToString();
+            Console.WriteLine(text);
+            Debug.LogError("GraphicsDevice", text);
+        }
+
         private void Initialize()
         {
             // D3D12 Debug Layer — disabled during scene loading (validation overhead causes TDR)
@@ -84,6 +163,18 @@ namespace Freefall.Graphics
             //     debug.Dispose();
             // }
             
+            // DRED (opt-in: FREEFALL_DRED=1): records auto-breadcrumbs + page-fault allocations so a device removal
+            // can be traced to the faulting resource / command list (see LogDeviceRemoved). Must precede device creation.
+            DredEnabled = Environment.GetEnvironmentVariable("FREEFALL_DRED") == "1";
+            if (DredEnabled && D3D12GetDebugInterface(out ID3D12DeviceRemovedExtendedDataSettings? dred).Success && dred != null)
+            {
+                dred.SetAutoBreadcrumbsEnablement(DredEnablement.ForcedOn);
+                dred.SetPageFaultEnablement(DredEnablement.ForcedOn);
+                using (var dred1 = dred.QueryInterfaceOrNull<ID3D12DeviceRemovedExtendedDataSettings1>())
+                    dred1?.SetBreadcrumbContextEnablement(DredEnablement.ForcedOn); // record PIX marker names
+                dred.Dispose();
+            }
+
             _factory = DXGI.CreateDXGIFactory1<IDXGIFactory5>();
             _device = D3D12CreateDevice<ID3D12Device>(null, FeatureLevel.Level_11_0);
 
@@ -245,6 +336,28 @@ namespace Freefall.Graphics
                 Debug.LogError("GraphicsDevice", $"Creating BindlessCommandSignature: {ex.Message}");
             }
 
+            // Mesh-mode terrain decorators: 14 root constants (slots 2-15, see CS_BinMeshInstances) + DrawInstanced.
+            // They used BindlessCommandSignature after it shrank to 2 constants / 24 bytes, so the 72-byte commands
+            // were read as garbage draw args (descriptor indices as vertex/instance counts) and slots 4-15 were
+            // never set — nothing rendered, and it is a GPU-hang hazard as soon as a mesh decorator exists.
+            var meshDecoConstants = new IndirectArgumentDescription();
+            meshDecoConstants.Type = IndirectArgumentType.Constant;
+            meshDecoConstants.Constant.RootParameterIndex = 0;
+            meshDecoConstants.Constant.DestOffsetIn32BitValues = 2;
+            meshDecoConstants.Constant.Num32BitValuesToSet = 14;
+            var meshDecoArgs = new IndirectArgumentDescription[]
+            {
+                meshDecoConstants,
+                new IndirectArgumentDescription { Type = IndirectArgumentType.Draw }
+            };
+            int meshDecoStride = 14 * sizeof(uint) + System.Runtime.InteropServices.Marshal.SizeOf<DrawInstancedArguments>(); // 72
+            try {
+                _meshDecoCommandSignature = _device.CreateCommandSignature<ID3D12CommandSignature>(
+                    new CommandSignatureDescription(meshDecoStride, meshDecoArgs), _globalRootSignature);
+            } catch (Exception ex) {
+                Debug.LogError("GraphicsDevice", $"Creating MeshDecoCommandSignature: {ex.Message}");
+            }
+
             // DispatchMesh command signature: 3 uints (groupsX, groupsY, groupsZ)
             var argsDispatchMesh = new IndirectArgumentDescription[]
             {
@@ -277,6 +390,7 @@ namespace Freefall.Graphics
         private ID3D12CommandSignature _drawInstancedSignature;
         private ID3D12CommandSignature _drawIndexedInstancedSignature;
         private ID3D12CommandSignature _bindlessCommandSignature = null!;
+        private ID3D12CommandSignature _meshDecoCommandSignature = null!;
         private ID3D12CommandSignature _dispatchMeshSignature;
         private ID3D12CommandSignature _dispatchSignature;
 
@@ -284,6 +398,8 @@ namespace Freefall.Graphics
         public ID3D12CommandSignature DrawIndexedInstancedSignature => _drawIndexedInstancedSignature;
         /// <summary>Bindless command signature with 14 root constants + DrawInstanced</summary>
         public ID3D12CommandSignature BindlessCommandSignature => _bindlessCommandSignature;
+        /// <summary>14 root constants (slots 2-15) + DrawInstanced, 72-byte stride — mesh-mode terrain decorators.</summary>
+        public ID3D12CommandSignature MeshDecoCommandSignature => _meshDecoCommandSignature;
         /// <summary>DispatchMesh indirect command signature (3 uints: X, Y, Z)</summary>
         public ID3D12CommandSignature DispatchMeshSignature => _dispatchMeshSignature;
         /// <summary>Compute Dispatch indirect command signature (3 uints: X, Y, Z)</summary>
@@ -300,6 +416,7 @@ namespace Freefall.Graphics
             _drawInstancedSignature?.Dispose();
             _drawIndexedInstancedSignature?.Dispose();
             _bindlessCommandSignature?.Dispose();
+            _meshDecoCommandSignature?.Dispose();
             _dispatchMeshSignature?.Dispose();
             _dispatchSignature?.Dispose();
             _wicFactory?.Dispose();
@@ -497,8 +614,10 @@ namespace Freefall.Graphics
             long targetValue;
             lock (_copyFenceLock)
             {
-                targetValue = ++_copyFenceValue;
+                // Execute before claiming the fence value: if it throws, no value is left that is never signaled
+                // (WaitForCopyQueue would make the direct queue wait on it forever).
                 _copyQueue.ExecuteCommandList(commandList);
+                targetValue = ++_copyFenceValue;
                 _copyQueue.Signal(_copyFence, (ulong)targetValue);
             }
             // CPU-wait for the copy to complete
@@ -525,8 +644,8 @@ namespace Freefall.Graphics
 
             lock (_copyFenceLock)
             {
+                _copyQueue.ExecuteCommandList(commandList); // before claiming the value, see CopyQueueSubmitAndWait
                 targetValue = ++_copyFenceValue;
-                _copyQueue.ExecuteCommandList(commandList);
                 _copyQueue.Signal(_copyFence, (ulong)targetValue);
                 shouldDrain = (++_pendingCopies >= MaxPendingCopies);
                 if (shouldDrain) _pendingCopies = 0;
@@ -572,6 +691,44 @@ namespace Freefall.Graphics
                     {
                         _deferredDisposals[i].buffer.Dispose();
                         _deferredDisposals.RemoveAt(i);
+                    }
+                }
+            }
+        }
+
+        // ── Frame-deferred disposal of arbitrary GPU-owning objects ──
+        // The renderer keeps RenderView.FrameCount frames in flight, so a resource referenced by the
+        // command list recorded last frame must outlive that many Present()s. Anything a component
+        // Destroy() would otherwise dispose immediately (structured buffers, compute PSOs, upload
+        // buffers) goes through here instead. Flushed once per tick from Engine.Run.
+
+        private const int DeferredDisposeFrames = 3 + 1;
+        private readonly List<(IDisposable resource, int tickToDispose)> _frameDeferredDisposals = new();
+
+        /// <summary>
+        /// Dispose <paramref name="resource"/> once every frame currently in flight has finished.
+        /// Safe to call from Update/Destroy on the main thread; pass null to no-op.
+        /// </summary>
+        public void DeferDispose(IDisposable? resource)
+        {
+            if (resource == null) return;
+            lock (_deferredDisposalLock)
+                _frameDeferredDisposals.Add((resource, Engine.TickCount + DeferredDisposeFrames));
+        }
+
+        /// <summary>Release frame-deferred resources whose grace period has elapsed. Called once per tick.</summary>
+        public void FlushFrameDeferredDisposals()
+        {
+            lock (_deferredDisposalLock)
+            {
+                int now = Engine.TickCount;
+                for (int i = _frameDeferredDisposals.Count - 1; i >= 0; i--)
+                {
+                    if (now >= _frameDeferredDisposals[i].tickToDispose)
+                    {
+                        try { _frameDeferredDisposals[i].resource.Dispose(); }
+                        catch (Exception ex) { Debug.LogWarning("GraphicsDevice", $"Deferred dispose failed: {ex.Message}"); }
+                        _frameDeferredDisposals.RemoveAt(i);
                     }
                 }
             }

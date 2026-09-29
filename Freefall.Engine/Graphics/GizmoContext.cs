@@ -454,7 +454,11 @@ namespace Freefall.Graphics
                 }
                 else if (vertexCount > _vertexCapacity || indexCount > _indexCapacity)
                 {
-                    Dispose();
+                    // Frames still in flight read the old buffers through the old descriptors: retire both
+                    // (DeferDispose) and give the grown buffers fresh bindless slots. Disposing immediately and
+                    // rewriting the SRVs in place removed the device when selecting a long spline stamp (big
+                    // gizmo), which then surfaced as a failed Map (NRE) in unrelated per-frame uploads.
+                    Retire(device);
                     _vertexCapacity = Math.Max(_vertexCapacity * 2, vertexCount);
                     _indexCapacity = Math.Max(_indexCapacity * 2, indexCount);
                     needsRebuild = true;
@@ -566,6 +570,38 @@ namespace Freefall.Graphics
                     Buffer = new BufferShaderResourceView { FirstElement = 0, NumElements = numElements, StructureByteStride = stride }
                 };
                 device.NativeDevice.CreateShaderResourceView(resource, srvDesc, device.GetCpuHandle(bindlessIndex));
+            }
+
+            private void Retire(GraphicsDevice device)
+            {
+                device.DeferDispose(_posBuffer); _posBuffer = null;
+                device.DeferDispose(_normBuffer); _normBuffer = null;
+                device.DeferDispose(_uvBuffer); _uvBuffer = null;
+                device.DeferDispose(_indexBuffer); _indexBuffer = null;
+
+                device.DeferDispose(new BindlessSlots(device, PosBindless, NormBindless, UVBindless, IndexBindless));
+                PosBindless = NormBindless = UVBindless = IndexBindless = 0;
+
+                // RebuildProxy makes a new Mesh, so the old proxy's MeshRegistry entries would leak (~20 ids per
+                // selection). Sub-batch ids are registry ids and the culler holds only MaxSubBatches (4096) of them.
+                if (ProxyMesh != null)
+                    device.DeferDispose(new RegistryEntries(ProxyMesh));
+            }
+
+            /// <summary>Unregisters a retired proxy mesh once frames that may still draw it have finished.</summary>
+            private sealed class RegistryEntries(Mesh mesh) : IDisposable
+            {
+                public void Dispose() => MeshRegistry.Unregister(mesh);
+            }
+
+            /// <summary>Returns bindless slots to the device once DeferDispose's grace period has elapsed.</summary>
+            private sealed class BindlessSlots(GraphicsDevice device, params uint[] slots) : IDisposable
+            {
+                public void Dispose()
+                {
+                    foreach (var slot in slots)
+                        if (slot != 0) device.ReleaseBindlessIndex(slot);
+                }
             }
 
             public void Dispose()

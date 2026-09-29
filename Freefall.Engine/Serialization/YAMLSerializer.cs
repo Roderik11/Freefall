@@ -186,7 +186,9 @@ namespace Freefall.Serialization
             // ── Asset reference → GUID ──
             if (typeof(Asset).IsAssignableFrom(field.Type))
             {
-                if (value is Asset asset && !string.IsNullOrEmpty(asset.Guid))
+                // Runtime-generated meshes (RuntimeMesh, NavMesh debug) have a GUID but no asset file: writing them
+                // only produced "Cannot resolve GUID" warnings on load. Their generators rebuild them anyway.
+                if (value is Asset asset && !string.IsNullOrEmpty(asset.Guid) && value is not Freefall.Graphics.Mesh { IsDynamic: true })
                 {
                     emitter.WriteString(field.Name);
                     emitter.WriteString(asset.Guid);

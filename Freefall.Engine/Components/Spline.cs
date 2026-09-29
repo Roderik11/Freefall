@@ -40,8 +40,67 @@ namespace Freefall.Components
         /// <summary>Number of spans (segments between control points).</summary>
         public int SpanCount => Closed ? Points.Count : Math.Max(0, Points.Count - 1);
 
+        /// <summary>Inspector / command-server edits (Points, Closed, Tension) must reach stamps, RuntimeMesh and PCG.</summary>
+        public override void OnMemberChanged() => MessageDispatcher.Send(EngineMsg.SplineChanged, this);
+
         /// <summary>Total number of evaluable points (spans * resolution).</summary>
         public int TotalSegments => SpanCount * Resolution;
+
+        /// <summary>
+        /// Moves the entity's pivot to the XZ centre and average height of the control points (a Flat RuntimeMesh
+        /// keeps its height — it is built at entity Y) without moving anything in the world: the control points and
+        /// the entity's hand-made children are compensated. Makes splines authored far from their pivot (e.g. entity at
+        /// the origin, world coordinates in the points) movable and rotatable by their transform.
+        /// Returns the world-space distance the pivot moved (0 if it was already within <paramref name="tolerance"/>).
+        /// </summary>
+        public float CenterPivot(float tolerance = 0.01f)
+        {
+            var t = Transform;
+            if (t == null || Points.Count == 0) return 0f;
+
+            var world = t.Matrix;
+            float minX = float.MaxValue, maxX = float.MinValue, minZ = float.MaxValue, maxZ = float.MinValue, sumY = 0f;
+            foreach (var p in Points)
+            {
+                var w = Vector3.Transform(p, world);
+                minX = MathF.Min(minX, w.X); maxX = MathF.Max(maxX, w.X);
+                minZ = MathF.Min(minZ, w.Z); maxZ = MathF.Max(maxZ, w.Z);
+                sumY += w.Y;
+            }
+
+            // A Flat RuntimeMesh is built at entity Y, so its pivot height is meaningful; everything else reads the
+            // (compensated) world points, so the pivot also goes to their average height — not buried under terrain.
+            var runtimeMesh = Entity?.GetComponent<RuntimeMesh>();
+            bool keepHeight = runtimeMesh != null && runtimeMesh.HeightMode == RuntimeMeshHeightMode.Flat;
+
+            var oldPivot = world.Translation;
+            var shift = new Vector3((minX + maxX) * 0.5f - oldPivot.X,
+                                    keepHeight ? 0f : sumY / Points.Count - oldPivot.Y,
+                                    (minZ + maxZ) * 0.5f - oldPivot.Z);
+            if (shift.Length() < tolerance) return 0f;
+
+            // The same shift expressed in this entity's local frame (rotation/scale) and in its parent's frame.
+            if (!Matrix4x4.Invert(world, out var worldInv)) return 0f;
+            var localShift = Vector3.TransformNormal(shift, worldInv);
+            var parentShift = shift;
+            if (t.Parent != null && Matrix4x4.Invert(t.Parent.Matrix, out var parentInv))
+                parentShift = Vector3.TransformNormal(shift, parentInv);
+
+            for (int i = 0; i < Points.Count; i++)
+                Points[i] -= localShift;
+
+            // Keep hand-made children in place; generated output (PCG, DontSave) is rebuilt from the spline anyway.
+            for (int i = 0; i < t.GetChildCount(); i++)
+            {
+                var child = t.GetChild(i);
+                if (child?.Entity != null && (child.Entity.Flags & EntityFlags.DontSave) == 0)
+                    child.Position -= localShift;
+            }
+
+            t.Position += parentShift;
+            OnMemberChanged();
+            return shift.Length();
+        }
 
         // ═══════════════════════════
         // ── Evaluation API ──

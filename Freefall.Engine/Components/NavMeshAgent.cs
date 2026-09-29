@@ -6,6 +6,7 @@ using Freefall.Base;
 using Freefall.Reflection;
 
 using Component = Freefall.Base.Component;
+using Category = System.ComponentModel.CategoryAttribute;
 
 namespace Freefall.Components
 {
@@ -13,11 +14,17 @@ namespace Freefall.Components
     /// Steers an entity along the navmesh toward a destination.
     /// Uses DtCrowd for local avoidance between agents.
     /// </summary>
-    [Icon("icon_collider.png")]
+    [Icon("icon_nav_agent.png")]
     public class NavMeshAgent : Component, IUpdate
     {
-        // ── Configuration ──
+        [Category("Agent")]
+        [ValueRange(0.1f, 2f)]
+        public float Radius = 0.35f;
 
+        [ValueRange(0.5f, 5f)]
+        public float Height = 2.0f;
+
+        [Category("Movement")]
         public bool DriveTransform = false;
 
         [ValueRange(0.5f, 20f)]
@@ -27,21 +34,14 @@ namespace Freefall.Components
         [ValueRange(30f, 720f)]
         public float AngularSpeed = 360f;
 
-        [ValueRange(0.1f, 2f)]
-        public float Radius = 0.35f;
-
-        [ValueRange(0.5f, 5f)]
-        public float Height = 2.0f;
+        [ValueRange(1f, 50f)]
+        public float Acceleration = 8f;
 
         [ValueRange(0.1f, 5f)]
         public float StoppingDistance = 0.5f;
 
-        [ValueRange(1f, 50f)]
-        public float Acceleration = 8f;
-
-        // ── State ──
-
-        [DontSerialize] 
+        [Category("State")]
+        [DontSerialize]
         public bool HasPath { get; private set; }
 
         [DontSerialize] 

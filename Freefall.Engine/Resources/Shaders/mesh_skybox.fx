@@ -36,6 +36,12 @@ cbuffer ObjectConstants : register(b1)
     float CloudAltitude;         // cloud layer height in world units
     float3 CloudSunlitColor;     // color of sun-facing cloud tops
     uint CloudNoiseLUTIdx;       // bindless index for 3D noise texture
+    float3 CloudSunsetTintColor; // warm tint mixed into clouds at sunset/sunrise
+    float CloudNightBrightness;  // cloud brightness at night (0-3)
+    float3 CloudNightColor;      // moonlit cloud color at night
+    float CloudAltitudeFrom;     // altitude of the previous preset while a transition runs
+    float CloudAltitudeBlend;    // 0 = show CloudAltitudeFrom, 1 = show CloudAltitude (cross-fade weight)
+    float3 _cloudPad1;
 }
 
 SamplerState linearWrap : register(s0); // Linear filter, wrap addressing (3D noise LUT)
@@ -74,16 +80,19 @@ float hash13(float3 p3)
 //   B: Worley FBM     (high-freq detail erosion)
 //   A: Perlin-Worley  (pre-combined cloud shape)
 //
-float GetClouds(float3 viewDir)
+float GetCloudsAt(float3 viewDir, float altitude)
 {
     if (viewDir.y <= 0.001)
         return 0.0;
 
-    float t = CloudAltitude / viewDir.y;
+    float t = altitude / viewDir.y;
     float2 cloudPos = viewDir.xz * t;
     float2 uv = cloudPos * 0.00035;
 
-    float2 wind = float2(CloudTime * CloudSpeed * 0.01, CloudTime * CloudSpeed * 0.005);
+    // CloudTime is already the integral of CloudSpeed over time (SkyboxRenderer.Update), so it must
+    // NOT be scaled by CloudSpeed again here: that rescales the whole history whenever the speed
+    // changes and makes the clouds scrub forward/backward while a preset lerps.
+    float2 wind = float2(CloudTime * 0.01, CloudTime * 0.005);
     uv += wind;
 
     Texture3D<float4> noiseLUT = ResourceDescriptorHeap[CloudNoiseLUTIdx];
@@ -103,8 +112,16 @@ float GetClouds(float3 viewDir)
     float coverageNoise = noiseLUT.SampleLevel(linearWrap, float3(uv * 0.06, timeZ * 0.15), 0).r;
     float coverage = saturate(CloudCoverage + (coverageNoise - 0.5) * 0.3);
 
-    // Remap: only the brightest noise survives as clouds
-    float cloudDensity = remap(baseShape, 1.0 - coverage, 1.0, 0.0, 1.0);
+    // Remap: only noise above the threshold survives as clouds, density = how far above it.
+    // The octave-averaged Perlin-Worley shape (cloud_noise_gen: (perlin - 0.4*worley)/(1 - 0.4*worley)) only spans
+    // ~0.15..0.62 (median ~0.37), so the original threshold (1 - coverage) left coverage 0..~0.5 dead (no clouds).
+    // Above 0.62 the original mapping is kept exactly (presets are tuned there: Clear Day 0.62, Overcast 0.97);
+    // below it the threshold walks linearly from 0.5 (coverage 0: the noise practically never exceeds it) to 0.38, so
+    // low coverages give gradually more clouds instead of a dead zone.
+    // Keep the (base - T) / (1 - T) density scale: normalising density to 0..1 pushed cores to CloudShadowColor
+    // (near black in Clear Day) and turned fair-weather clouds into dark grey slabs.
+    float threshold = min(1.0 - coverage, 0.5 - 0.1935 * coverage);
+    float cloudDensity = remap(baseShape, threshold, 1.0, 0.0, 1.0);
 
     // ── Detail erosion: Worley carves billowy edges ──
     // Use higher mip near horizon to blur out repetition
@@ -228,15 +245,23 @@ FragmentOutput PS_Procedural(VertexOutput input)
 
     float3 skyColor = GetSkyColor(viewDir, sunDir);
 
+    float dayFactor, sunsetFactor, nightFactor;
+    GetDayNightFactors(sunDir.y, dayFactor, sunsetFactor, nightFactor);
+
     // Stars (not in shared GetSkyColor — ocean reflections don't need them)
-    float nightSunElev = sunDir.y;
-    float nightFactor = saturate((-nightSunElev - 0.15) / 0.3);
     skyColor += GetStars(viewDir, nightFactor);
 
     float sun = GetSun(viewDir, sunDir) * SunIntensity;
     skyColor += float3(1.0, 0.9, 0.7) * sun;
 
-    float density = GetClouds(viewDir);
+    // Altitude scales the projected noise, so lerping it zooms the whole pattern. While a preset
+    // transition runs we instead cross-fade the density of the old and new cloud layers.
+    float density = GetCloudsAt(viewDir, CloudAltitude);
+    if (CloudAltitudeBlend < 0.999)
+    {
+        float densityFrom = GetCloudsAt(viewDir, CloudAltitudeFrom);
+        density = lerp(densityFrom, density, smoothstep(0.0, 1.0, saturate(CloudAltitudeBlend)));
+    }
 
     if (density > 0.001)
     {
@@ -249,31 +274,36 @@ FragmentOutput PS_Procedural(VertexOutput input)
         float transmittance = exp(-density * 3.0);  // 1.0 at edges, ~0.05 at dense cores
 
         // ── Directional sun shading ──
-        float sunDot = saturate(dot(viewDir, sunDir));
+        // At night the "sun" is below the horizon; the moon sits opposite, so flip the
+        // light direction as the night weight rises to keep a faint directional shading.
+        float3 cloudLightDir = normalize(lerp(sunDir, -sunDir, nightFactor));
+        float sunDot = saturate(dot(viewDir, cloudLightDir));
         float sunGradient = sunDot * 0.5 + 0.5;  // 0.5 (shade side) to 1.0 (sun facing)
 
         // Combine: transmittance provides detail, sunGradient provides directionality
         float shadeFactor = lerp(transmittance * 0.7, transmittance, sunGradient);
 
-        // Map from shadow color to sunlit color
-        float3 cloudColor = lerp(CloudShadowColor, CloudSunlitColor, shadeFactor);
+        // ── Day palette: shadow → sunlit, plus silver lining and backlit powder glow ──
+        float3 dayCloud = lerp(CloudShadowColor, CloudSunlitColor, shadeFactor);
 
-        // ── Silver lining: bright rim where thin cloud faces sun ──
         float edgeMask = smoothstep(0.0, 0.2, density) * smoothstep(0.5, 0.15, density);
         float silverLining = edgeMask * pow(sunDot, 2.0) * 0.4;
-        cloudColor += float3(1.0, 1.0, 0.95) * silverLining;
+        dayCloud += float3(1.0, 1.0, 0.95) * silverLining;
 
-        // ── Powder/backlit glow ──
         float powder = (1.0 - transmittance) * transmittance * 2.0;  // peaks at medium density
-        cloudColor += float3(1.0, 0.9, 0.7) * powder * pow(sunDot, 3.0) * 0.3;
+        dayCloud += float3(1.0, 0.9, 0.7) * powder * pow(sunDot, 3.0) * 0.3;
+        dayCloud *= CloudBrightness * 1.3;
 
-        // ── Sunset tint ──
-        float cloudSunElev = sunDir.y;
-        float sunsetAmount = saturate(1.0 - abs((cloudSunElev - (-0.025)) / 0.175));
-        cloudColor = lerp(cloudColor, float3(1.0, 0.6, 0.3), sunsetAmount * 0.5);
+        // ── Sunset palette: day shading pulled toward the warm tint ──
+        float3 sunsetCloud = lerp(dayCloud, CloudSunsetTintColor * CloudBrightness * 1.3, 0.5);
 
-        // ── Apply brightness ──
-        cloudColor *= CloudBrightness * 1.3;
+        // ── Night palette: dim moonlit gradient, no silver lining ──
+        float3 nightCloud = lerp(CloudNightColor * 0.5, CloudNightColor, shadeFactor) * CloudNightBrightness;
+
+        // ── Blend palettes with the same day/sunset/night weights as the sky ──
+        float3 cloudColor = dayCloud * dayFactor
+                          + sunsetCloud * sunsetFactor
+                          + nightCloud * nightFactor;
 
         // Blend into sky
         skyColor = lerp(skyColor, cloudColor, absorption);

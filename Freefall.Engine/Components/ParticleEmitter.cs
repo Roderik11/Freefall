@@ -16,6 +16,46 @@ namespace Freefall.Components
         Transparent   // Renders to GBuffer in transparent pass
     }
 
+    /// <summary>Where particles are spawned, relative to the emitter transform.</summary>
+    public enum EmissionShape
+    {
+        Point,       // Single point at the emitter origin
+        Sphere,      // Inside (or on the surface of) a sphere of ShapeRadius
+        Hemisphere,  // Upper half of a sphere (local +Y)
+        Circle,      // Flat disc in the local XZ plane
+        Box,         // Box of ShapeExtents (half sizes)
+        Cone         // Disc of ShapeRadius; velocity fans outward by ConeAngle
+    }
+
+    /// <summary>How the initial velocity direction is chosen.</summary>
+    public enum EmitDirectionMode
+    {
+        Directional, // EmitDirection (local space) with random cone spread of SpreadAngle
+        Radial,      // Outward from the emitter origin through the spawn position
+        Random       // Uniformly random direction
+    }
+
+    /// <summary>How particle quads are oriented.</summary>
+    public enum ParticleBillboardMode
+    {
+        CameraFacing,      // Classic billboard, always faces the camera
+        VelocityStretched  // Quad's up axis follows velocity, length grows with speed (rain, sparks)
+    }
+
+    /// <summary>What particles collide against.</summary>
+    public enum ParticleCollisionMode
+    {
+        None,
+        Plane,   // Infinite horizontal plane at PlaneHeight (world Y)
+        Depth    // Screen-space collision against the depth GBuffer (opaque geometry)
+    }
+
+    public enum ParticleCollisionResponse
+    {
+        Kill,    // Particle dies on contact
+        Bounce   // Reflect velocity around the surface normal, scaled by Bounciness
+    }
+
     /// <summary>
     /// GPU-driven particle emitter. All simulation happens on the GPU via compute shaders.
     /// CPU only uploads emitter configuration per frame.
@@ -32,7 +72,7 @@ namespace Freefall.Components
 
         [Category("Emission")]
         [Description("Particles emitted per second")]
-        [ValueRange(0f, 1000f)]
+        [ValueRange(0f, 20000f)]
         public float EmitRate = 100f;
 
         [Category("Emission")]
@@ -40,26 +80,112 @@ namespace Freefall.Components
         [ValueRange(0.1f, 30f)]
         public float Lifetime = 2.0f;
 
+        [Category("Emission")]
+        [Description("Random lifetime variation (0 = exact, 1 = 0..2x lifetime)")]
+        [ValueRange(0f, 1f)]
+        public float LifetimeRandomness = 0.2f;
+
+        // ── Shape ──
+
+        [Category("Shape")]
+        [Description("Volume particles are spawned in (local to the emitter transform)")]
+        public EmissionShape Shape = EmissionShape.Point;
+
+        [Category("Shape")]
+        [Description("Radius for Sphere / Hemisphere / Circle / Cone shapes")]
+        [ValueRange(0f, 100f)]
+        public float ShapeRadius = 1.0f;
+
+        [Category("Shape")]
+        [Description("Half-extents for the Box shape")]
+        public Vector3 ShapeExtents = new(1, 1, 1);
+
+        [Category("Shape")]
+        [Description("Cone shape only: angle (degrees) the velocity fans outward from the local up axis")]
+        [ValueRange(0f, 89f)]
+        public float ConeAngle = 25f;
+
+        [Category("Shape")]
+        [Description("Spawn only on the surface/edge of the shape instead of filling its volume")]
+        public bool EmitFromShell = false;
+
         // ── Motion ──
 
         [Category("Motion")]
-        [Description("Initial emission velocity (world space)")]
-        public Vector3 EmitVelocity = new(0, 2, 0);
+        [Description("How the initial velocity direction is chosen")]
+        public EmitDirectionMode DirectionMode = EmitDirectionMode.Directional;
 
         [Category("Motion")]
-        [Description("Random velocity variation (0 = uniform, 1 = full spread)")]
-        [ValueRange(0f, 2f)]
-        public float VelocityRandomness = 0.5f;
+        [Description("Base emission direction in emitter-local space (Directional mode)")]
+        public Vector3 EmitDirection = new(0, 1, 0);
+
+        [Category("Motion")]
+        [Description("Random cone half-angle (degrees) around the emission direction. 0 = exact, 180 = any direction")]
+        [ValueRange(0f, 180f)]
+        public float SpreadAngle = 15f;
+
+        [Category("Motion")]
+        [Description("Min/max initial speed (m/s), randomized per particle")]
+        public Vector2 SpeedRange = new(1.5f, 2.5f);
 
         [Category("Motion")]
         [Description("Gravity force applied each frame")]
         public Vector3 Gravity = new(0, -9.81f, 0);
 
+        [Category("Motion")]
+        [Description("Air resistance. Pulls velocity toward Wind; with gravity this yields a terminal velocity")]
+        [ValueRange(0f, 20f)]
+        public float Drag = 0f;
+
+        [Category("Motion")]
+        [Description("Air velocity (world space). Only has an effect when Drag > 0")]
+        public Vector3 Wind = Vector3.Zero;
+
+        // ── Collision ──
+
+        [Category("Collision")]
+        [Description("What particles collide against")]
+        public ParticleCollisionMode CollisionMode = ParticleCollisionMode.None;
+
+        [Category("Collision")]
+        [Description("What happens on contact")]
+        public ParticleCollisionResponse CollisionResponse = ParticleCollisionResponse.Kill;
+
+        [Category("Collision")]
+        [Description("Plane mode: world-space Y of the collision plane")]
+        public float PlaneHeight = 0f;
+
+        [Category("Collision")]
+        [Description("Depth mode: how far behind a surface (meters) still counts as a hit")]
+        [ValueRange(0.01f, 5f)]
+        public float CollisionThickness = 0.5f;
+
+        [Category("Collision")]
+        [Description("Bounce: velocity kept after impact (0 = stop, 1 = perfect bounce)")]
+        [ValueRange(0f, 1f)]
+        public float Bounciness = 0.3f;
+
         // ── Appearance ──
 
         [Category("Appearance")]
-        [Description("Min/max particle size (randomized on emit, interpolated over lifetime)")]
-        public Vector2 SizeRange = new(0.1f, 0.5f);
+        [Description("Particle size at birth (meters)")]
+        [ValueRange(0f, 20f)]
+        public float StartSize = 0.3f;
+
+        [Category("Appearance")]
+        [Description("Particle size at death (meters)")]
+        [ValueRange(0f, 20f)]
+        public float EndSize = 0.3f;
+
+        [Category("Appearance")]
+        [Description("Random size variation applied to both start and end (0 = exact, 1 = 0..2x)")]
+        [ValueRange(0f, 1f)]
+        public float SizeRandomness = 0.3f;
+
+        [Category("Appearance")]
+        [Description("Quad height / width. 1 = square")]
+        [ValueRange(0.05f, 20f)]
+        public float Aspect = 1f;
 
         [Category("Appearance")]
         [Description("RGBA color at birth")]
@@ -102,6 +228,15 @@ namespace Freefall.Components
         public ParticleRenderMode RenderMode = ParticleRenderMode.Forward;
 
         [Category("Rendering")]
+        [Description("Quad orientation")]
+        public ParticleBillboardMode BillboardMode = ParticleBillboardMode.CameraFacing;
+
+        [Category("Rendering")]
+        [Description("VelocityStretched: extra quad length per m/s of speed (meters)")]
+        [ValueRange(0f, 1f)]
+        public float StretchFactor = 0.05f;
+
+        [Category("Rendering")]
         [Description("Fade particles near opaque surfaces")]
         public bool SoftParticles = true;
 
@@ -109,6 +244,17 @@ namespace Freefall.Components
         [Description("Depth range for soft particle fade (meters)")]
         [ValueRange(0.01f, 10f)]
         public float SoftRange = 0.5f;
+
+        // ── Runtime overrides (not serialized, not shown) ──
+        // Set by systems like EnvironmentController so the authored EmitRate / Wind stay intact in the scene file.
+
+        /// <summary>Multiplier on EmitRate applied at runtime. 0 stops emission without touching EmitRate.</summary>
+        [Freefall.Reflection.DontSerialize, System.ComponentModel.Browsable(false)]
+        public float EmitRateScale = 1f;
+
+        /// <summary>When set, replaces Wind for the simulation without overwriting the authored value.</summary>
+        [Freefall.Reflection.DontSerialize, System.ComponentModel.Browsable(false)]
+        public Vector3? WindOverride;
 
         // ── GPU Buffers ──
         private GraphicsBuffer? _particleCore;
@@ -164,18 +310,44 @@ namespace Freefall.Components
         {
             public Vector3 EmitterPosition;
             public float DeltaTime;
-            public Vector3 EmitVelocity;
-            public float VelocityRandomness;
+            public Vector3 EmitDirection;      // local-space, normalized
+            public float SpreadCos;            // cos(SpreadAngle)
             public Vector3 Gravity;
             public float LifetimeParam;
-            public Vector2 SizeRange;
+            public Vector2 SizeStartEnd;
             public float RotationRange;
             public uint RandomSeed;
             public Vector4 ColorStart;
             public Vector4 ColorEnd;
             public float FlipbookFrameCount;
             public float FlipbookAnimSpeed;
-            public Vector2 _pad;
+            public Vector2 SpeedRange;
+            // Shape
+            public Vector3 ShapeExtents;
+            public float ShapeRadius;
+            public uint Shape;
+            public uint DirectionMode;
+            public uint EmitFromShell;
+            public float ConeTan;              // tan(ConeAngle)
+            // Emitter rotation basis (world-space axes), w unused
+            public Vector4 AxisX;
+            public Vector4 AxisY;
+            public Vector4 AxisZ;
+            // Forces
+            public Vector3 Wind;
+            public float Drag;
+            public float LifetimeRandomness;
+            public float SizeRandomness;
+            public uint CollisionMode;
+            public uint CollisionResponse;
+            public float PlaneHeight;
+            public float CollisionThickness;
+            public float Bounciness;
+            public uint DepthTexIdx;
+            public uint NormalTexIdx;
+            public Vector3 _pad;
+            // Camera (row-major, matches HLSL row_major float4x4)
+            public Matrix4x4 ViewProjection;
         }
 
         // ────────────── Lifecycle ──────────────
@@ -223,16 +395,27 @@ namespace Freefall.Components
 
         public override void Destroy()
         {
-            _particleCore?.Dispose();
-            _particleVisual?.Dispose();
-            _deadList?.Dispose();
-            _aliveListA?.Dispose();
-            _aliveListB?.Dispose();
-            _counters?.Dispose();
-            _drawArgs?.Dispose();
-            _emitterParamsCB?.Dispose();
-            _computeShader?.Dispose();
-            _emitCountUpload?.Release();
+            // The command list recorded last frame (compute dispatches, the CopyBufferRegion for the
+            // emit count, the ExecuteIndirect draw) still references every one of these. Disposing
+            // them here crashed the editor with a device removal when an emitter entity was deleted,
+            // so hand them to the device to release after the in-flight frames complete.
+            var device = Engine.Device;
+            device.DeferDispose(_particleCore);
+            device.DeferDispose(_particleVisual);
+            device.DeferDispose(_deadList);
+            device.DeferDispose(_aliveListA);
+            device.DeferDispose(_aliveListB);
+            device.DeferDispose(_counters);
+            device.DeferDispose(_drawArgs);
+            device.DeferDispose(_emitterParamsCB);
+            device.DeferDispose(_computeShader);
+            device.DeferDispose(_emitCountUpload);
+
+            _particleCore = null; _particleVisual = null; _deadList = null;
+            _aliveListA = null; _aliveListB = null; _counters = null;
+            _drawArgs = null; _emitterParamsCB = null; _computeShader = null;
+            _emitCountUpload = null;
+            _initialized = false;
         }
 
         // ────────────── Update ──────────────
@@ -242,11 +425,18 @@ namespace Freefall.Components
             if (_computeShader == null || _emitterParamsCB == null) return;
 
             // Accumulate emit count
-            _emitAccumulator += EmitRate * (float)Time.Delta;
+            _emitAccumulator += EmitRate * MathF.Max(0f, EmitRateScale) * (float)Time.Delta;
             uint emitThisFrame = (uint)_emitAccumulator;
             _emitAccumulator -= emitThisFrame;
 
             // Upload emitter parameters
+            var dir = EmitDirection.LengthSquared() > 1e-8f ? Vector3.Normalize(EmitDirection) : Vector3.UnitY;
+            float spread = Math.Clamp(SpreadAngle, 0f, 180f) * (MathF.PI / 180f);
+            float cone = Math.Clamp(ConeAngle, 0f, 89f) * (MathF.PI / 180f);
+            var speed = new Vector2(Math.Min(SpeedRange.X, SpeedRange.Y), Math.Max(SpeedRange.X, SpeedRange.Y));
+            // NOTE: DeferredRenderer.Current is only valid during Render, not here in Update.
+            // The depth / normal texture indices are patched into the cbuffer in DispatchCompute.
+            bool depthCollision = CollisionMode == ParticleCollisionMode.Depth && Camera.Main != null;
             unsafe
             {
                 var p = _emitterParamsCB.WritePtr<EmitterParams>();
@@ -254,11 +444,11 @@ namespace Freefall.Components
                 {
                     EmitterPosition = Transform.WorldPosition,
                     DeltaTime = (float)Time.Delta,
-                    EmitVelocity = EmitVelocity,
-                    VelocityRandomness = VelocityRandomness,
+                    EmitDirection = dir,
+                    SpreadCos = MathF.Cos(spread),
                     Gravity = Gravity,
                     LifetimeParam = Lifetime,
-                    SizeRange = SizeRange,
+                    SizeStartEnd = new Vector2(StartSize, EndSize),
                     RotationRange = RotationRange,
                     RandomSeed = pcg_hash(++_frameCounter),
                     ColorStart = ColorStart,
@@ -267,6 +457,31 @@ namespace Freefall.Components
                         ? FlipbookFrameCount
                         : FlipbookColumns * FlipbookRows,
                     FlipbookAnimSpeed = FlipbookAnimSpeed,
+                    SpeedRange = speed,
+                    ShapeExtents = Vector3.Abs(ShapeExtents),
+                    ShapeRadius = MathF.Abs(ShapeRadius),
+                    Shape = (uint)Shape,
+                    DirectionMode = (uint)DirectionMode,
+                    EmitFromShell = EmitFromShell ? 1u : 0u,
+                    ConeTan = MathF.Tan(cone),
+                    AxisX = new Vector4(Transform.Right, 0),
+                    AxisY = new Vector4(Transform.Up, 0),
+                    AxisZ = new Vector4(Transform.Forward, 0),
+                    Wind = WindOverride ?? Wind,
+                    Drag = MathF.Max(0f, Drag),
+                    LifetimeRandomness = Math.Clamp(LifetimeRandomness, 0f, 1f),
+                    SizeRandomness = Math.Clamp(SizeRandomness, 0f, 1f),
+                    CollisionMode = depthCollision || CollisionMode == ParticleCollisionMode.Plane ? (uint)CollisionMode : 0u,
+                    CollisionResponse = (uint)CollisionResponse,
+                    PlaneHeight = PlaneHeight,
+                    CollisionThickness = MathF.Max(0.01f, CollisionThickness),
+                    Bounciness = Math.Clamp(Bounciness, 0f, 1f),
+                    // Cached from the previous frame's DispatchCompute (DeferredRenderer.Current
+                    // is null here). Must be written every frame: the GPU may still be executing
+                    // last frame's compute when this upload buffer is rewritten.
+                    DepthTexIdx = depthCollision ? _depthTexIdx : 0u,
+                    NormalTexIdx = depthCollision ? _normalTexIdx : 0u,
+                    ViewProjection = depthCollision ? Camera.Main!.ViewProjection : Matrix4x4.Identity,
                 };
             }
 
@@ -287,6 +502,7 @@ namespace Freefall.Components
 
         public void Draw()
         {
+           
             if (_computeShader == null || _drawMaterial == null) return;
             if (_particleCore == null || _drawArgs == null) return;
 
@@ -294,16 +510,17 @@ namespace Freefall.Components
             var aliveRead = _readFromA ? _aliveListA! : _aliveListB!;
             var aliveWrite = _readFromA ? _aliveListB! : _aliveListA!;
 
-            // Enqueue compute dispatch (Opaque pass — runs earliest)
-            CommandBuffer.Enqueue(RenderPass.Opaque, (cmd) =>
-            {
-                DispatchCompute(cmd, aliveRead, aliveWrite);
-            });
-
-            // Enqueue draw (Forward or Transparent pass)
+            // Both compute and draw go in the same pass, compute first (custom actions run in
+            // enqueue order). Running compute here rather than in Opaque guarantees the depth /
+            // normal GBuffers are already resolved and readable for depth collision.
             var drawPass = RenderMode == ParticleRenderMode.Forward
                 ? RenderPass.Forward
                 : RenderPass.Transparent;
+
+            CommandBuffer.Enqueue(drawPass, (cmd) =>
+            {
+                DispatchCompute(cmd, aliveRead, aliveWrite);
+            });
 
             // Capture references for the closure
             var drawAliveList = aliveWrite; // draw reads the list that was just written
@@ -325,6 +542,53 @@ namespace Freefall.Components
 
             cmd.SetComputeRootSignature(device.GlobalRootSignature);
             cmd.SetDescriptorHeaps(1, _cachedHeapArray);
+
+            // Depth collision: DeferredRenderer.Current is only valid during Render, so the
+            // GBuffer indices are resolved here, cached for next frame's Update, and patched
+            // into the mapped cbuffer for this frame.
+            bool depthBarriers = false;
+            var renderer = DeferredRenderer.Current;
+            if (CollisionMode == ParticleCollisionMode.Depth && renderer != null)
+            {
+                _depthTexIdx = renderer.DepthGBuffer?.BindlessIndex ?? 0u;
+                _normalTexIdx = renderer.Normals?.BindlessIndex ?? 0u;
+                unsafe
+                {
+                    var p = _emitterParamsCB!.WritePtr<EmitterParams>();
+                    p->DepthTexIdx = _depthTexIdx;
+                    p->NormalTexIdx = _normalTexIdx;
+                }
+
+                // In the Transparent pass the GBuffer targets are still bound as render targets
+                // (the pass runs inside FillGBuffer). Make them readable for the compute reads,
+                // then hand them back before the draw.
+                depthBarriers = RenderMode == ParticleRenderMode.Transparent
+                    && renderer.DepthGBuffer != null && renderer.Normals != null;
+                if (depthBarriers)
+                {
+                    cmd.ResourceBarrierTransition(renderer.DepthGBuffer!.Native, ResourceStates.RenderTarget, ResourceStates.NonPixelShaderResource);
+                    cmd.ResourceBarrierTransition(renderer.Normals!.Native, ResourceStates.RenderTarget, ResourceStates.NonPixelShaderResource);
+                }
+            }
+
+            try
+            {
+                DispatchKernels(cmd, aliveRead, aliveWrite);
+            }
+            finally
+            {
+                if (depthBarriers)
+                {
+                    cmd.ResourceBarrierTransition(renderer!.DepthGBuffer!.Native, ResourceStates.NonPixelShaderResource, ResourceStates.RenderTarget);
+                    cmd.ResourceBarrierTransition(renderer.Normals!.Native, ResourceStates.NonPixelShaderResource, ResourceStates.RenderTarget);
+                }
+            }
+        }
+
+        private uint _depthTexIdx, _normalTexIdx;
+
+        private void DispatchKernels(ID3D12GraphicsCommandList cmd, GraphicsBuffer aliveRead, GraphicsBuffer aliveWrite)
+        {
 
             // Bind emitter params cbuffer at root slot 2 (register b1)
             cmd.SetComputeRootConstantBufferView(2, _emitterParamsCB!.Native.GPUVirtualAddress);
@@ -467,6 +731,11 @@ namespace Freefall.Components
             // Flipbook atlas layout
             cmd.SetGraphicsRoot32BitConstant(0, (uint)Math.Max(1, FlipbookColumns), 11);
             cmd.SetGraphicsRoot32BitConstant(0, (uint)Math.Max(1, FlipbookRows), 12);
+
+            // Billboard orientation
+            cmd.SetGraphicsRoot32BitConstant(0, (uint)BillboardMode, 13);
+            cmd.SetGraphicsRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(MathF.Max(0f, StretchFactor)), 14);
+            cmd.SetGraphicsRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(MathF.Max(0.01f, Aspect)), 15);
 
             // Topology — triangle list for the 6-vertex quads
             cmd.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);

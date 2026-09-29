@@ -88,6 +88,14 @@ namespace Freefall.Animation
             if (pairs.Count < MinRequiredBones)
                 return null;
 
+            // Twist hints: hands and fingers roll about axes that are nearly
+            // collinear with their parent bones, so the generic parent-direction
+            // twist constraint is noise there. Use the palm axis (index knuckle →
+            // pinky knuckle) as the anatomical roll reference instead.
+            var twistHints = new List<BoneMap.TwistHint>();
+            AddHandTwistHints(twistHints, srcMapping, dstMapping, left: true);
+            AddHandTwistHints(twistHints, srcMapping, dstMapping, left: false);
+
             // Log the mapping
             var log = new System.Text.StringBuilder();
             log.Append($"[HumanoidTemplate] Mapping {source.Name} → {target.Name}: {pairs.Count} paired bones");
@@ -105,7 +113,56 @@ namespace Freefall.Animation
             }
             Freefall.Debug.Log(log.ToString());
 
-            return BoneMap.Create(source, target, pairs.ToArray(), srcRoot, dstRoot);
+            return BoneMap.Create(source, target, pairs.ToArray(), srcRoot, dstRoot,
+                twistHints.ToArray());
+        }
+
+        /// <summary>Hand and finger bones per side, in HumanoidBone order.</summary>
+        private static readonly HumanoidBone[] LeftHandBones =
+        {
+            HumanoidBone.LeftHand,
+            HumanoidBone.LeftThumbProximal, HumanoidBone.LeftThumbIntermediate, HumanoidBone.LeftThumbDistal,
+            HumanoidBone.LeftIndexProximal, HumanoidBone.LeftIndexIntermediate, HumanoidBone.LeftIndexDistal,
+            HumanoidBone.LeftMiddleProximal, HumanoidBone.LeftMiddleIntermediate, HumanoidBone.LeftMiddleDistal,
+            HumanoidBone.LeftRingProximal, HumanoidBone.LeftRingIntermediate, HumanoidBone.LeftRingDistal,
+            HumanoidBone.LeftLittleProximal, HumanoidBone.LeftLittleIntermediate, HumanoidBone.LeftLittleDistal,
+        };
+
+        private static readonly HumanoidBone[] RightHandBones =
+        {
+            HumanoidBone.RightHand,
+            HumanoidBone.RightThumbProximal, HumanoidBone.RightThumbIntermediate, HumanoidBone.RightThumbDistal,
+            HumanoidBone.RightIndexProximal, HumanoidBone.RightIndexIntermediate, HumanoidBone.RightIndexDistal,
+            HumanoidBone.RightMiddleProximal, HumanoidBone.RightMiddleIntermediate, HumanoidBone.RightMiddleDistal,
+            HumanoidBone.RightRingProximal, HumanoidBone.RightRingIntermediate, HumanoidBone.RightRingDistal,
+            HumanoidBone.RightLittleProximal, HumanoidBone.RightLittleIntermediate, HumanoidBone.RightLittleDistal,
+        };
+
+        /// <summary>
+        /// Add palm-axis twist hints (index knuckle → pinky knuckle) for the hand
+        /// and all finger bones of one side, when both rigs have the knuckles mapped.
+        /// </summary>
+        private static void AddHandTwistHints(List<BoneMap.TwistHint> hints,
+            Dictionary<HumanoidBone, int> srcMapping, Dictionary<HumanoidBone, int> dstMapping, bool left)
+        {
+            var indexBone = left ? HumanoidBone.LeftIndexProximal : HumanoidBone.RightIndexProximal;
+            var littleBone = left ? HumanoidBone.LeftLittleProximal : HumanoidBone.RightLittleProximal;
+
+            if (!srcMapping.TryGetValue(indexBone, out int srcFrom)) return;
+            if (!srcMapping.TryGetValue(littleBone, out int srcTo)) return;
+            if (!dstMapping.TryGetValue(indexBone, out int dstFrom)) return;
+            if (!dstMapping.TryGetValue(littleBone, out int dstTo)) return;
+
+            foreach (var bone in left ? LeftHandBones : RightHandBones)
+            {
+                if (srcMapping.ContainsKey(bone) && dstMapping.TryGetValue(bone, out int targetIdx))
+                    hints.Add(new BoneMap.TwistHint
+                    {
+                        TargetBone = targetIdx,
+                        SrcFrom = srcFrom, SrcTo = srcTo,
+                        DstFrom = dstFrom, DstTo = dstTo,
+                    });
+            }
         }
 
         /// <summary>

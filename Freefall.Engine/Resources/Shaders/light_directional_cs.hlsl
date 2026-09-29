@@ -338,7 +338,8 @@ void CSDirectionalLight(uint3 dispatchThreadId : SV_DispatchThreadID)
         // SSS translucency — use Load instead of Sample for compute
         float translucency = NormalTex.Load(coord).w;
         translucency = max(translucency, 0.3);
-        float backlight = max(-rawNdotL, 0.0);
+        // Only light that reaches the leaf can pass through it (see light_directional.fx)
+        float backlight = max(-rawNdotL, 0.0) * shadowFactor;
         float3 sssColor = albedo * float3(1.0, 0.85, 0.6);
         lighting += sssColor * LightColor * LightIntensity * backlight * translucency * 0.4;
     }

@@ -1,0 +1,46 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Stdio MCP bridge for the Freefall editor. Claude Code (or any MCP client) launches this process,
+    so the connection exists even while the editor is closed. It proxies tools to the editor's
+    HTTP MCP endpoint (localhost:21721/mcp), serves a cached tool list while the editor is down,
+    and adds editor_launch. See Program.cs.
+  -->
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>FreefallMcp</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.Hosting" Version="10.0.12" />
+    <PackageReference Include="ModelContextProtocol" Version="2.2.0" />
+    <PackageReference Include="System.Management" Version="10.0.12" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Lets the installed copy find the editor exe without an explicit editor path argument -->
+    <AssemblyMetadata Include="RepoRoot" Value="$([System.IO.Path]::GetFullPath('$(MSBuildProjectDirectory)\..\..'))" />
+  </ItemGroup>
+
+  <!--
+    .mcp.json runs the bridge from %LOCALAPPDATA%\Freefall\McpBridge, not from bin/, so a running bridge never
+    locks the build output. If the installed copy is in use (Claude Code running), the copy only warns;
+    restart the MCP client to pick up the new build.
+  -->
+  <PropertyGroup>
+    <McpBridgeInstallDir>$(LOCALAPPDATA)\Freefall\McpBridge\</McpBridgeInstallDir>
+  </PropertyGroup>
+
+  <Target Name="InstallMcpBridge" AfterTargets="Build" Condition="'$(LOCALAPPDATA)' != ''">
+    <ItemGroup>
+      <_McpBridgeFiles Include="$(OutDir)**\*" />
+    </ItemGroup>
+    <Copy SourceFiles="@(_McpBridgeFiles)" DestinationFiles="@(_McpBridgeFiles->'$(McpBridgeInstallDir)%(RecursiveDir)%(Filename)%(Extension)')"
+          SkipUnchangedFiles="true" Retries="0" ContinueOnError="WarnAndContinue" />
+  </Target>
+
+</Project>

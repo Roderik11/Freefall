@@ -7,9 +7,11 @@ namespace Freefall.Components
     /// Non-destructive splat stamp. Paints or removes a terrain splat layer
     /// within the stamp zone.
     /// </summary>
+    [Icon("icon_splatstamp.png")]
     public class SplatStamp : TerrainStamp
     {
         /// <summary>Terrain layer index to paint.</summary>
+        [System.ComponentModel.Category("Splat")]
         public int SplatLayerIndex = 0;
 
         /// <summary>Paint strength (0-1) at full weight.</summary>

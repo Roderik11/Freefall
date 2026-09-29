@@ -19,26 +19,21 @@ float HGPhase(float cosTheta, float g)
     return (1.0 - g2) / (4.0 * 3.14159265 * pow(abs(denom), 1.5));
 }
 
-float3 GetSkyColor(float3 viewDir, float3 sunDir)
+// Day / sunset / night weights for a sun elevation (sunDir.y). Normalized, sum to 1.
+// Must match SkyboxRenderer.ComputeDayNightFactors() on the CPU (drives light intensity/color).
+void GetDayNightFactors(float sunElevation, out float dayFactor, out float sunsetFactor, out float nightFactor)
 {
-    float cosTheta = dot(viewDir, sunDir);
-    float viewY = viewDir.y;
-    float horizon = abs(viewY);
-
-    // ── Sun elevation blend factors (same structure as before for lighting sync) ──
-    float sunElevation = sunDir.y;
-
-    float dayFactor = saturate((sunElevation - 0.0) / 0.8);
+    dayFactor = saturate((sunElevation - 0.0) / 0.8);
     dayFactor = pow(dayFactor, 0.7);
 
-    float sunsetFactor = 0.0;
+    sunsetFactor = 0.0;
     if (sunElevation < 0.15 && sunElevation > -0.2)
     {
         sunsetFactor = 1.0 - abs((sunElevation - (-0.025)) / 0.175);
         sunsetFactor = max(0.0, sunsetFactor);
     }
 
-    float nightFactor = saturate((-sunElevation - 0.15) / 0.3);
+    nightFactor = saturate((-sunElevation - 0.15) / 0.3);
 
     float total = dayFactor + sunsetFactor + nightFactor;
     if (total > 0.0)
@@ -47,6 +42,17 @@ float3 GetSkyColor(float3 viewDir, float3 sunDir)
         sunsetFactor /= total;
         nightFactor /= total;
     }
+}
+
+float3 GetSkyColor(float3 viewDir, float3 sunDir)
+{
+    float cosTheta = dot(viewDir, sunDir);
+    float viewY = viewDir.y;
+    float horizon = abs(viewY);
+
+    // ── Sun elevation blend factors (same structure as before for lighting sync) ──
+    float dayFactor, sunsetFactor, nightFactor;
+    GetDayNightFactors(sunDir.y, dayFactor, sunsetFactor, nightFactor);
 
     // ── Day sky: scattering-shaped gradient ──
     // Zenith = deep tinted sky, horizon = brighter/whiter from longer scatter path

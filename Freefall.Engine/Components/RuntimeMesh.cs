@@ -5,6 +5,7 @@ using Freefall.Base;
 using Freefall.Graphics;
 using Vortice.Mathematics;
 using DefaultValue = System.ComponentModel.DefaultValueAttribute;
+using Category = System.ComponentModel.CategoryAttribute;
 
 namespace Freefall.Components
 {
@@ -24,6 +25,7 @@ namespace Freefall.Components
     /// Open spline: strip extruded along spline with UVs following the curve.
     /// Regenerates on wake and when the spline changes.
     /// </summary>
+    [Icon("icon_runtime_mesh.png")]
     public class RuntimeMesh : Component
     {
         // ═══════════════════════════
@@ -32,6 +34,7 @@ namespace Freefall.Components
         private Spline Spline;
 
         /// <summary>Half-width of the generated strip (open spline only).</summary>
+        [Category("Shape")]
         [DefaultValue(2f)]
         [ValueRange(0.1f, 50f)]
         public float Width = 2f;
@@ -50,7 +53,26 @@ namespace Freefall.Components
         [ValueRange(2, 32)]
         public int Smoothness = 8;
 
+        /// <summary>UV tiling scale. Higher = more texture repeats.</summary>
+        [DefaultValue(1f)]
+        [ValueRange(0.01f, 3f)]
+        public float UVScale = 1f;
+
+        /// <summary>
+        /// Open spline with Height: length (m) over which the slab tapers down to ground level at the start,
+        /// so a road meets open ground flush instead of with a step. 0 = full height with a closed end face.
+        /// </summary>
+        [DefaultValue(0f)]
+        [ValueRange(0f, 20f)]
+        public float StartRamp = 0f;
+
+        /// <summary>Same as StartRamp, for the end of the spline.</summary>
+        [DefaultValue(0f)]
+        [ValueRange(0f, 20f)]
+        public float EndRamp = 0f;
+
         /// <summary>Enable raised curbs along the sides (open spline only).</summary>
+        [Category("Curbs")]
         [DefaultValue(false)]
         public bool EnableCurbs = false;
 
@@ -63,11 +85,6 @@ namespace Freefall.Components
         [DefaultValue(0.2f)]
         [ValueRange(0.05f, 2f)]
         public float CurbWidth = 0.2f;
-
-        /// <summary>UV tiling scale. Higher = more texture repeats.</summary>
-        [DefaultValue(1f)]
-        [ValueRange(0.01f, 3f)]
-        public float UVScale = 1f;
 
 
         // ═══════════════════════════
@@ -84,11 +101,13 @@ namespace Freefall.Components
             _renderer = Entity.GetComponent<MeshRenderer>();
             Generate();
             MessageDispatcher.AddListener(EngineMsg.SplineChanged, OnSplineChanged);
+            MessageDispatcher.AddListener(EngineMsg.TerrainHeightsChanged, OnTerrainHeightsChanged);
         }
 
         public override void Destroy()
         {
             MessageDispatcher.RemoveListener(EngineMsg.SplineChanged, OnSplineChanged);
+            MessageDispatcher.RemoveListener(EngineMsg.TerrainHeightsChanged, OnTerrainHeightsChanged);
             _retiring?.Dispose();
             _retiring = null;
             if (_generatedMesh != null)
@@ -105,6 +124,14 @@ namespace Freefall.Components
             if (msg.Data is not Spline spline) return;
             if (spline != Spline) return;
             Generate();
+        }
+
+        // Surface mode samples the CPU HeightField once; it can be stale at load (cached bake that no longer
+        // matches the scene's stamps) until the GPU bake is read back, so rebuild whenever it is replaced.
+        private void OnTerrainHeightsChanged(Message msg)
+        {
+            if (HeightMode == RuntimeMeshHeightMode.Surface)
+                Generate();
         }
 
         public override void OnMemberChanged()
@@ -186,19 +213,38 @@ namespace Freefall.Components
             for (int i = 1; i < samples; i++)
                 arcLengths[i] = arcLengths[i - 1] + Vector3.Distance(points[i], points[i - 1]);
 
-            // ── Main surface: 2 verts per sample ──
-            // MeshPart 0: surface
+            // ── Per-sample slab height (Height, tapered by Start/EndRamp) ──
+            bool extruded = Height > 0.001f;
+            float totalArc = arcLengths[samples - 1];
+            var heights = new float[samples];
+            for (int i = 0; i < samples; i++)
+                heights[i] = extruded ? SlabHeightAt(arcLengths[i], totalArc) : 0f;
+
             var verts = new List<Vector3>();
             var norms = new List<Vector3>();
             var uvs = new List<Vector2>();
             var indices = new List<uint>();
 
+            // ── Main surface: 2 verts per sample (MeshPart 0) ──
+            // Extruded: the slab top (the only visible upward face). Flat: the strip itself.
             for (int i = 0; i < samples; i++)
             {
+                // Tilt the normal with the ramp slope so ramps shade correctly
                 var up = Vector3.UnitY;
+                if (extruded)
+                {
+                    int a = Math.Max(0, i - 1), b = Math.Min(samples - 1, i + 1);
+                    float ds = arcLengths[b] - arcLengths[a];
+                    if (ds > 1e-4f)
+                    {
+                        var fwd = Vector3.Normalize(new Vector3(tangents[i].X, 0, tangents[i].Z));
+                        up = Vector3.Normalize(Vector3.UnitY - fwd * ((heights[b] - heights[a]) / ds));
+                    }
+                }
 
-                verts.Add(leftPositions[i]);
-                verts.Add(rightPositions[i]);
+                var lift = Vector3.UnitY * heights[i];
+                verts.Add(leftPositions[i] + lift);
+                verts.Add(rightPositions[i] + lift);
                 norms.Add(up);
                 norms.Add(up);
 
@@ -221,25 +267,23 @@ namespace Freefall.Components
 
             int surfaceIndexCount = indices.Count;
 
-            // ── Walls (if Height > 0) ──
-            if (Height > 0.001f)
+            // ── Side walls + end caps (if Height > 0) ──
+            if (extruded)
             {
-                // Add top verts (duplicate strip shifted up by Height)
                 int wallBase = verts.Count;
                 for (int i = 0; i < samples; i++)
                 {
                     var right = rights[i];
-                    var leftTop = leftPositions[i] + Vector3.UnitY * Height;
-                    var rightTop = rightPositions[i] + Vector3.UnitY * Height;
+                    var lift = Vector3.UnitY * heights[i];
 
                     // Left wall: faces outward (-right)
                     float wu = arcLengths[i] * UVScale;
                     verts.Add(leftPositions[i]); norms.Add(-right); uvs.Add(new Vector2(wu, 0));
-                    verts.Add(leftTop); norms.Add(-right); uvs.Add(new Vector2(wu, Height * UVScale));
+                    verts.Add(leftPositions[i] + lift); norms.Add(-right); uvs.Add(new Vector2(wu, heights[i] * UVScale));
 
                     // Right wall: faces outward (+right)
                     verts.Add(rightPositions[i]); norms.Add(right); uvs.Add(new Vector2(wu, 0));
-                    verts.Add(rightTop); norms.Add(right); uvs.Add(new Vector2(wu, Height * UVScale));
+                    verts.Add(rightPositions[i] + lift); norms.Add(right); uvs.Add(new Vector2(wu, heights[i] * UVScale));
                 }
 
                 // Left wall tris
@@ -264,26 +308,32 @@ namespace Freefall.Components
                     indices.Add(rb0); indices.Add(rt1); indices.Add(rb1);
                 }
 
-                // Top face
-                int topBase = verts.Count;
-                for (int i = 0; i < samples; i++)
-                {
-                    var leftTop = leftPositions[i] + Vector3.UnitY * Height;
-                    var rightTop = rightPositions[i] + Vector3.UnitY * Height;
+                // End caps close the slab at both ends (with a ramp they shrink to a sliver)
+                AddEndCap(0, -1f);
+                AddEndCap(samples - 1, 1f);
 
-                    float bu = arcLengths[i] * UVScale;
-                    verts.Add(leftTop); norms.Add(Vector3.UnitY); uvs.Add(new Vector2(bu, 0));
-                    verts.Add(rightTop); norms.Add(Vector3.UnitY); uvs.Add(new Vector2(bu, Width * UVScale));
-                }
-
-                for (int i = 0; i < samples - 1; i++)
+                void AddEndCap(int i, float dir)
                 {
-                    uint bl = (uint)(topBase + i * 2);
-                    uint br = bl + 1;
-                    uint tl = (uint)(topBase + (i + 1) * 2);
-                    uint tr = tl + 1;
-                    indices.Add(bl); indices.Add(br); indices.Add(tl);
-                    indices.Add(br); indices.Add(tr); indices.Add(tl);
+                    var fwd = Vector3.Normalize(new Vector3(tangents[i].X, 0, tangents[i].Z)) * dir;
+                    var lift = Vector3.UnitY * heights[i];
+                    uint c = (uint)verts.Count;
+                    verts.Add(leftPositions[i]); verts.Add(rightPositions[i]);
+                    verts.Add(leftPositions[i] + lift); verts.Add(rightPositions[i] + lift);
+                    for (int k = 0; k < 4; k++) norms.Add(fwd);
+                    uvs.Add(new Vector2(0, 0)); uvs.Add(new Vector2(Width * UVScale, 0));
+                    uvs.Add(new Vector2(0, heights[i] * UVScale)); uvs.Add(new Vector2(Width * UVScale, heights[i] * UVScale));
+                    // Front faces have cross(v1-v0, v2-v0) along the normal (same as the surface strip)
+                    var n = Vector3.Cross(verts[(int)c + 1] - verts[(int)c], verts[(int)c + 2] - verts[(int)c]);
+                    if (Vector3.Dot(n, fwd) > 0)
+                    {
+                        indices.Add(c); indices.Add(c + 1); indices.Add(c + 2);
+                        indices.Add(c + 1); indices.Add(c + 3); indices.Add(c + 2);
+                    }
+                    else
+                    {
+                        indices.Add(c); indices.Add(c + 2); indices.Add(c + 1);
+                        indices.Add(c + 1); indices.Add(c + 2); indices.Add(c + 3);
+                    }
                 }
             }
 
@@ -402,6 +452,24 @@ namespace Freefall.Components
             }
         }
 
+        /// <summary>Lowest slab height at a ramped end: just above the ground so the tip doesn't z-fight it.</summary>
+        private const float RampTipHeight = 0.01f;
+
+        /// <summary>Slab height at arc length s: Height, eased down to RampTipHeight within Start/EndRamp of the ends.</summary>
+        private float SlabHeightAt(float s, float totalArc)
+        {
+            float f = 1f;
+            if (StartRamp > 0.001f) f = Math.Min(f, SmoothStep(s / StartRamp));
+            if (EndRamp > 0.001f) f = Math.Min(f, SmoothStep((totalArc - s) / EndRamp));
+            return RampTipHeight + (Height - RampTipHeight) * f;
+
+            static float SmoothStep(float x)
+            {
+                x = Math.Clamp(x, 0f, 1f);
+                return x * x * (3f - 2f * x);
+            }
+        }
+
         // ═══════════════════════════════════════════
         // ── Closed Spline: Polygon Fill ──
         // ═══════════════════════════════════════════
@@ -465,20 +533,31 @@ namespace Freefall.Components
                     yValues[i] = heights[i];
             }
 
-            // ── Top surface ──
+            // ── Base surface ──
+            // With extrusion this is the underside (faces -Y; the top face is emitted with the walls below).
+            // Without extrusion it is the only face, so it must face +Y or the fill is invisible from above.
+            bool flatOnly = Height <= 0.001f;
             for (int i = 0; i < n; i++)
             {
                 verts.Add(new Vector3(polygon2D[i].X, yValues[i], polygon2D[i].Y));
-                norms.Add(-Vector3.UnitY);
+                norms.Add(flatOnly ? Vector3.UnitY : -Vector3.UnitY);
                 uvs.Add(polygon2D[i] * UVScale);
             }
 
-            // Top triangles (reversed winding for +Y facing)
             for (int i = 0; i < triangles.Count / 3; i++)
             {
-                indices.Add((uint)triangles[i * 3 + 0]);
-                indices.Add((uint)triangles[i * 3 + 1]);
-                indices.Add((uint)triangles[i * 3 + 2]);
+                if (flatOnly)
+                {
+                    indices.Add((uint)triangles[i * 3 + 2]);
+                    indices.Add((uint)triangles[i * 3 + 1]);
+                    indices.Add((uint)triangles[i * 3 + 0]);
+                }
+                else
+                {
+                    indices.Add((uint)triangles[i * 3 + 0]);
+                    indices.Add((uint)triangles[i * 3 + 1]);
+                    indices.Add((uint)triangles[i * 3 + 2]);
+                }
             }
 
             int surfaceIndexCount = indices.Count;

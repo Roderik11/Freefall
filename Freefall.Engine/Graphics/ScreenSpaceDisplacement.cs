@@ -19,14 +19,15 @@ namespace Freefall.Graphics
         private int _refineKernel;
         private int _displaceDepthKernel;
 
-        // Pyramids (reuse existing DisplacementPyramid class)
+        // Pyramid A: displacement vector mip chain, sampled at all levels by CSRefine
         private DisplacementPyramid _pyramidA = new();
-        private DisplacementPyramid _pyramidB = new();
 
-        // Simple mode output (single texture, no mips)
-        private ID3D12Resource? _simpleOutput;
-        private uint _simpleOutputUav;
-        private uint _simpleOutputSrv;
+        // Inversion output (source UVs, single mip, R32G32 for absolute UV precision).
+        // Written by CSDisplace in simple mode, CSRefine in pyramid mode.
+        private ID3D12Resource? _output;
+        private uint _outputUav;
+        private uint _outputSrv;
+        private bool _outputFirstFrame = true;
 
         // Displaced depth output
         private ID3D12Resource? _displacedDepth;
@@ -35,7 +36,6 @@ namespace Freefall.Graphics
         private bool _displacedDepthFirstFrame = true;
 
         private int _width, _height;
-        private bool _firstFrame = true;
         private bool _pyramidFirstFrame = true;
 
         public uint OutputSrvIndex { get; private set; }
@@ -74,12 +74,10 @@ namespace Freefall.Graphics
         private void ExecuteSimple(ID3D12GraphicsCommandList cmd,
             uint displacementSrvIndex, uint depthSrvIndex, int texWidth, int texHeight)
         {
-            var from = _firstFrame ? ResourceStates.Common : ResourceStates.NonPixelShaderResource;
-            cmd.ResourceBarrierTransition(_simpleOutput!, from, ResourceStates.UnorderedAccess);
-            _firstFrame = false;
+            TransitionOutputToUav(cmd);
 
             _shader.SetPushConstant(_displaceKernel, "SrcMip", displacementSrvIndex);
-            _shader.SetPushConstant(_displaceKernel, "DstMip", _simpleOutputUav);
+            _shader.SetPushConstant(_displaceKernel, "DstMip", _outputUav);
             _shader.SetParam("DstWidth", (uint)texWidth);
             _shader.SetParam("DstHeight", (uint)texHeight);
             _shader.SetParam("HeightScale", Engine.Settings.SSDMHeightScale);
@@ -88,10 +86,10 @@ namespace Freefall.Graphics
             uint gy = (uint)((texHeight + 7) / 8);
             _shader.Dispatch(_displaceKernel, cmd, gx, gy);
 
-            cmd.ResourceBarrierTransition(_simpleOutput!,
+            cmd.ResourceBarrierTransition(_output!,
                 ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource);
 
-            OutputSrvIndex = _simpleOutputSrv;
+            OutputSrvIndex = _outputSrv;
 
             // Displace depth for simple mode too
             DispatchDisplaceDepth(cmd, depthSrvIndex, texWidth, texHeight);
@@ -152,23 +150,21 @@ namespace Freefall.Graphics
             }
 
             // Phase 2: Hierarchical Newton inversion
-            ExecuteNewtonRefine(cmd, beforeState, texWidth, texHeight);
+            ExecuteNewtonRefine(cmd, texWidth, texHeight);
 
-            OutputSrvIndex = _pyramidB.MipSRVs[0];
+            OutputSrvIndex = _outputSrv;
 
             // Phase 3: Displace depth buffer using B map
             DispatchDisplaceDepth(cmd, depthSrvIndex, texWidth, texHeight);
         }
 
         private void ExecuteNewtonRefine(ID3D12GraphicsCommandList cmd,
-            ResourceStates beforeState, int texWidth, int texHeight)
+            int texWidth, int texHeight)
         {
-            cmd.ResourceBarrier(new ResourceBarrier(
-                new ResourceTransitionBarrier(_pyramidB.Texture!,
-                    beforeState, ResourceStates.UnorderedAccess, 0)));
+            TransitionOutputToUav(cmd);
 
             _shader.SetPushConstant(_refineKernel, "SrcMip", _pyramidA.FullChainSrv);
-            _shader.SetPushConstant(_refineKernel, "DstMip", _pyramidB.MipUAVs[0]);
+            _shader.SetPushConstant(_refineKernel, "DstMip", _outputUav);
             _shader.SetParam("DstWidth", (uint)texWidth);
             _shader.SetParam("DstHeight", (uint)texHeight);
             _shader.SetParam("MipCount", (uint)_pyramidA.MipCount);
@@ -176,47 +172,54 @@ namespace Freefall.Graphics
             _shader.Dispatch(_refineKernel, cmd,
                 (uint)((texWidth + 7) / 8), (uint)((texHeight + 7) / 8));
 
-            cmd.ResourceBarrier(new ResourceBarrier(
-                new ResourceTransitionBarrier(_pyramidB.Texture!,
-                    ResourceStates.UnorderedAccess,
-                    ResourceStates.NonPixelShaderResource, 0)));
+            cmd.ResourceBarrierTransition(_output!,
+                ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource);
         }
 
-
+        /// <summary>
+        /// Transition the shared output texture to UAV, tracking its state
+        /// across both modes (it always parks in NonPixelShaderResource).
+        /// </summary>
+        private void TransitionOutputToUav(ID3D12GraphicsCommandList cmd)
+        {
+            var from = _outputFirstFrame ? ResourceStates.Common : ResourceStates.NonPixelShaderResource;
+            _outputFirstFrame = false;
+            cmd.ResourceBarrierTransition(_output!, from, ResourceStates.UnorderedAccess);
+        }
 
         private void EnsureResources(int width, int height)
         {
-            if (_simpleOutput != null && _width == width && _height == height)
+            if (_output != null && _width == width && _height == height)
                 return;
 
             _width = width;
             _height = height;
             var device = Engine.Device;
 
-            // Simple output texture
-            _simpleOutput?.Dispose();
-            _simpleOutput = device.CreateTexture2D(
+            // Inversion output texture
+            _output?.Dispose();
+            _output = device.CreateTexture2D(
                 Format.R32G32_Float, width, height, 1, 1,
                 ResourceFlags.AllowUnorderedAccess, ResourceStates.Common);
 
-            _simpleOutputUav = device.AllocateBindlessIndex();
-            device.NativeDevice.CreateUnorderedAccessView(_simpleOutput, null,
+            _outputUav = device.AllocateBindlessIndex();
+            device.NativeDevice.CreateUnorderedAccessView(_output, null,
                 new UnorderedAccessViewDescription
                 {
                     Format = Format.R32G32_Float,
                     ViewDimension = UnorderedAccessViewDimension.Texture2D,
                     Texture2D = new Texture2DUnorderedAccessView { MipSlice = 0 }
-                }, device.GetCpuHandle(_simpleOutputUav));
+                }, device.GetCpuHandle(_outputUav));
 
-            _simpleOutputSrv = device.AllocateBindlessIndex();
-            device.NativeDevice.CreateShaderResourceView(_simpleOutput,
+            _outputSrv = device.AllocateBindlessIndex();
+            device.NativeDevice.CreateShaderResourceView(_output,
                 new ShaderResourceViewDescription
                 {
                     Format = Format.R32G32_Float,
                     ViewDimension = ShaderResourceViewDimension.Texture2D,
                     Shader4ComponentMapping = ShaderComponentMapping.Default,
                     Texture2D = new Texture2DShaderResourceView { MostDetailedMip = 0, MipLevels = 1 }
-                }, device.GetCpuHandle(_simpleOutputSrv));
+                }, device.GetCpuHandle(_outputSrv));
 
             // Displaced depth texture (R32_Float, same resolution)
             _displacedDepth?.Dispose();
@@ -243,11 +246,12 @@ namespace Freefall.Graphics
                     Texture2D = new Texture2DShaderResourceView { MostDetailedMip = 0, MipLevels = 1 }
                 }, device.GetCpuHandle(_displacedDepthSrv));
 
-            // Pyramids
+            // Pyramid A (displacement vectors)
             _pyramidA.Create(device, width, height);
-            _pyramidB.Create(device, width, height, Format.R32G32_Float);
 
-            _firstFrame = true;
+            // All resources recreated in Common — reset state tracking
+            _outputFirstFrame = true;
+            _pyramidFirstFrame = true;
             _displacedDepthFirstFrame = true;
         }
 
@@ -280,10 +284,9 @@ namespace Freefall.Graphics
 
         public void Dispose()
         {
-            _simpleOutput?.Dispose();
+            _output?.Dispose();
             _displacedDepth?.Dispose();
             _pyramidA.Dispose();
-            _pyramidB.Dispose();
             _shader?.Dispose();
         }
     }

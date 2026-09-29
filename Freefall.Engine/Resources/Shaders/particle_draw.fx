@@ -47,7 +47,13 @@ cbuffer PushConstants : register(b3)
     float ColorEndA;           // DWORD 10
     uint FlipbookColsVal;      // DWORD 11  columns in flipbook atlas
     uint FlipbookRowsVal;      // DWORD 12  rows in flipbook atlas
+    uint BillboardModeVal;     // DWORD 13  0 = camera facing, 1 = velocity stretched
+    float StretchFactorVal;    // DWORD 14  extra length per m/s (velocity stretched)
+    float AspectVal;           // DWORD 15  quad height / width
 };
+
+#define BILLBOARD_CAMERA   0
+#define BILLBOARD_VELOCITY 1
 
 // ────────────── Samplers ──────────────
 
@@ -132,19 +138,47 @@ VSOutput VS(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
     }
     output.TexCoord = uv;
 
-    // Apply rotation
-    float cosR = cos(vis.Rotation);
-    float sinR = sin(vis.Rotation);
-    float2 rotated = float2(
-        corner.x * cosR - corner.y * sinR,
-        corner.x * sinR + corner.y * cosR
-    );
+    float3 worldPos;
 
-    // Billboard: extract camera right and up from View matrix
-    float3 right = float3(View._11, View._21, View._31);
-    float3 up    = float3(View._12, View._22, View._32);
+    [branch]
+    if (BillboardModeVal == BILLBOARD_VELOCITY)
+    {
+        // Velocity-stretched: quad up axis follows the velocity, right axis is
+        // perpendicular to both velocity and the view direction so the streak
+        // always presents its face to the camera.
+        float3 toCam = normalize(CamPos - core.Position);
 
-    float3 worldPos = core.Position + (rotated.x * right + rotated.y * up) * size;
+        float speed = length(core.Velocity);
+        float3 vdir = speed > 1e-4 ? core.Velocity / speed : float3(View._12, View._22, View._32);
+
+        float3 right = cross(vdir, toCam);
+        float rl = length(right);
+        // Velocity pointing straight at the camera: fall back to the camera right vector
+        right = rl > 1e-4 ? right / rl : float3(View._11, View._21, View._31);
+
+        float width  = size;
+        float height = size * AspectVal + speed * StretchFactorVal;
+
+        // No rotation in this mode — orientation is fully defined by velocity
+        worldPos = core.Position + right * (corner.x * width) + vdir * (corner.y * height);
+    }
+    else
+    {
+        // Apply rotation
+        float cosR = cos(vis.Rotation);
+        float sinR = sin(vis.Rotation);
+        float2 scaled = float2(corner.x, corner.y * AspectVal);
+        float2 rotated = float2(
+            scaled.x * cosR - scaled.y * sinR,
+            scaled.x * sinR + scaled.y * cosR
+        );
+
+        // Billboard: extract camera right and up from View matrix
+        float3 right = float3(View._11, View._21, View._31);
+        float3 up    = float3(View._12, View._22, View._32);
+
+        worldPos = core.Position + (rotated.x * right + rotated.y * up) * size;
+    }
 
     // Transform to clip space
     output.Position = mul(float4(worldPos, 1.0), ViewProjection);

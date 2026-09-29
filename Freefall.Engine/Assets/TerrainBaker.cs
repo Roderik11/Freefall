@@ -1614,7 +1614,7 @@ namespace Freefall.Assets
             var terrainSize = terrain.TerrainSize;
             float maxHeight = terrain.MaxHeight;
             float heightTexel = 1f / terrain.EffectiveHeightmapResolution;
-            float heightScale = maxHeight / (terrainSize.X * heightTexel);
+            float heightScale = maxHeight / (2f * terrainSize.X * heightTexel); // central difference spans two texels
 
             var k = _kernelProceduralMask;
             var device = Engine.Device;

@@ -356,7 +356,12 @@ namespace Freefall.Assets
             public DecoratorMode Mode = DecoratorMode.Mesh;
 
             [DirtyFlag(TerrainDirtyFlags.DecoStructure)]
-            public Mesh Mesh;       // Mesh mode: geometry + LODs + material
+            public Mesh Mesh;       // Mesh mode: geometry + LODs
+
+            /// <summary>Mesh mode: material to render the mesh with (meshes don't carry one; prefabs do).
+            /// Without it mesh decorators rendered with material 0.</summary>
+            [DirtyFlag(TerrainDirtyFlags.DecoStructure)]
+            public Material Material;
 
             [DirtyFlag(TerrainDirtyFlags.DecoStructure)]
             public Texture Texture;       // Billboard/Cross mode: alpha-tested texture
@@ -403,6 +408,30 @@ namespace Freefall.Assets
             [DirtyFlag(TerrainDirtyFlags.DecoPrepass | TerrainDirtyFlags.DecoParams)]
             [ValueRange(-1f, 1f)]
             public float ProceduralBlend = 1.0f;
+
+            // ── Clustering ────────────────────────────────────────────
+
+            /// <summary>World size (m) of the density clumps this decorator grows in. 0 = uniform coverage.
+            /// Real meadows are patchy: clover in drifts, grass tufts in clumps, flowers in scattered pockets.</summary>
+            [DirtyFlag(TerrainDirtyFlags.DecoPrepass | TerrainDirtyFlags.DecoParams)]
+            [ValueRange(0f, 100f)]
+            public float ClusterScale = 0f;
+
+            /// <summary>How strongly the clumps modulate density: 0 = uniform, 1 = dense clumps with bare gaps between.</summary>
+            [DirtyFlag(TerrainDirtyFlags.DecoPrepass | TerrainDirtyFlags.DecoParams)]
+            [ValueRange(0f, 1f)]
+            public float ClusterAmount = 0.7f;
+
+            /// <summary>World size (m) of short vs. lush patches, independent of the clumps. 0 = off.
+            /// Density already shortens plants at clump fringes; this varies height across whole areas.</summary>
+            [DirtyFlag(TerrainDirtyFlags.DecoParams)]
+            [ValueRange(0f, 200f)]
+            public float HeightNoiseScale = 0f;
+
+            /// <summary>Height variation strength: 0 = none, 1 = 0.4x (short patches) .. 1.4x (lush patches).</summary>
+            [DirtyFlag(TerrainDirtyFlags.DecoParams)]
+            [ValueRange(0f, 1f)]
+            public float HeightNoiseAmount = 0.5f;
 
             // ── Rendering Parameters ─────────────────────────────────
 

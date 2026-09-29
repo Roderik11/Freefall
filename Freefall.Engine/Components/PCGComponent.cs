@@ -14,6 +14,7 @@ namespace Freefall.Components
     /// 
     /// Live editing: listens for SplineChanged and GraphChanged messages to auto-regenerate.
     /// </summary>
+    [Icon("icon_pcg.png")]
     public class PCGComponent : Component
     {
         /// <summary>PCGGraph asset to execute.</summary>
@@ -29,6 +30,9 @@ namespace Freefall.Components
         /// </summary>
         private Entity? OutputEntity;
 
+        /// <summary>Diagnostics: total Execute() calls across all PCG components (editor debug stats).</summary>
+        public static int ExecuteCount;
+
         /// <summary>
         /// Execute the PCG graph: destroy previous output, inject context, run graph.
         /// </summary>
@@ -39,6 +43,8 @@ namespace Freefall.Components
                 Debug.Log("[PCG] No graph to execute.");
                 return;
             }
+
+            ExecuteCount++;
 
             // 1. Destroy previous output
             DestroyOutput();
@@ -73,6 +79,7 @@ namespace Freefall.Components
         {
             MessageDispatcher.RemoveListener(EngineMsg.SplineChanged, OnSplineChanged);
             MessageDispatcher.RemoveListener(EngineMsg.GraphChanged, OnGraphChanged);
+            MessageDispatcher.RemoveListener(EngineMsg.TerrainHeightsChanged, OnTerrainHeightsChanged);
             DestroyOutput();
             base.Destroy();
         }
@@ -81,9 +88,26 @@ namespace Freefall.Components
         {
             MessageDispatcher.AddListener(EngineMsg.SplineChanged, OnSplineChanged);
             MessageDispatcher.AddListener(EngineMsg.GraphChanged, OnGraphChanged);
+            MessageDispatcher.AddListener(EngineMsg.TerrainHeightsChanged, OnTerrainHeightsChanged);
 
             if (ExecuteOnAwake && Graph != null)
                 Execute();
+        }
+
+        /// <summary>Inspector / command-server edits (Graph, ExecuteOnAwake) re-run the graph.</summary>
+        public override void OnMemberChanged()
+        {
+            if (Graph != null) Execute();
+            else DestroyOutput();
+        }
+
+        // TerrainProjection samples the CPU HeightField, which can be stale at load until the GPU bake is read
+        // back (see RuntimeMesh). Re-run so projected output lands on the real surface.
+        private void OnTerrainHeightsChanged(Message msg)
+        {
+            if (Graph == null || OutputEntity == null) return;
+            foreach (var node in Graph.Nodes)
+                if (node is TerrainProjection) { Execute(); return; }
         }
 
         private void OnSplineChanged(Message msg)
@@ -125,8 +149,15 @@ namespace Freefall.Components
                 if (node is SpawnPrefab spawner)
                     spawner.SpawnParent = OutputEntity;
 
-                if (node is TerrainProjection projection)
-                    projection.WorldMatrix = Transform?.Matrix ?? System.Numerics.Matrix4x4.Identity;
+                if (node is ExcludeObstacles exclude)
+                    exclude.IgnoreRoot = OutputEntity;
+
+                if (node is ExcludeStamps excludeStamps)
+                    excludeStamps.IgnoreEntity = Entity;
+
+                // Points are local to this entity; nodes testing them against world data need the transform.
+                if (node is IWorldSpaceNode worldNode)
+                    worldNode.WorldMatrix = Transform?.Matrix ?? System.Numerics.Matrix4x4.Identity;
             }
         }
     }

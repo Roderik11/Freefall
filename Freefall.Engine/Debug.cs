@@ -28,8 +28,14 @@ namespace Freefall
 
         public static void ClearLog() => lines.Clear();
 
+        private const int MaxLines = 5000;
+
         static void Append(string message, StackTrace stackTrace)
         {
+            // Per-frame warnings would otherwise grow the log without bound: drop exact repeats of the last line
+            if (lines.Count > 0 && lines[^1].Message == message) return;
+            if (lines.Count >= MaxLines) lines.RemoveRange(0, MaxLines / 10);
+
             Console.WriteLine(message);
             lines.Add(new LogEntry
             {
@@ -178,20 +184,30 @@ namespace Freefall
             OnLog?.Invoke(text, st);
         }
 
-        [Conditional("DEBUG")]
+        // Warnings and errors are kept in Release builds: the editor console (and console_log over MCP) is the
+        // only place they surface when running the Release editor. Plain Log stays DEBUG-only (chatty + stack capture).
         public static void LogWarning(string text, string message = null)
         {
-            var st = new StackTrace(1, true);
+            var st = CaptureStack();
             Append(message != null ? $"{text}: {message}" : text, st);
             OnLog?.Invoke(text, st);
         }
 
-        [Conditional("DEBUG")]
         public static void LogError(string text, string message = null)
         {
-            var st = new StackTrace(1, true);
+            var st = CaptureStack();
             Append(message != null ? $"{text}: {message}" : text, st);
             OnLog?.Invoke(text, st);
+        }
+
+        // File/line stack capture is expensive; only pay for it in DEBUG builds
+        private static StackTrace CaptureStack()
+        {
+#if DEBUG
+            return new StackTrace(2, true);
+#else
+            return null;
+#endif
         }
 
         public static void LogAlways(string text)

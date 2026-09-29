@@ -17,7 +17,7 @@ namespace Freefall.Components
     /// Collects scene geometry and bakes a NavMesh asset.
     /// Attach to any entity in the scene.
     /// </summary>
-    [Icon("icon_collider.png")]
+    [Icon("icon_nav_mesh.png")]
     public class NavMeshSurface : Component, ISceneGizmo
     {
         /// <summary>Reference to the baked NavMesh asset.</summary>

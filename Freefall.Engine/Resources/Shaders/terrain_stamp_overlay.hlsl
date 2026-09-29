@@ -19,7 +19,7 @@ cbuffer PushConstants : register(b3)
     uint OutputIdx;         // slot 1 — UAV: RWTexture2DArray<float4> (splat) or RWTexture2DArray<uint4> (deco)
     uint HeightTexIdx;      // slot 2 — SRV: heightmap (ProceduralMask)
     uint AutoMaskBufIdx;    // slot 3 — SRV: StructuredBuffer<LayerAutoMask> (ProceduralMask)
-    uint HeightScaleIdx;    // slot 4 — float bits: MaxHeight / (TerrainSize.x * HeightTexel)
+    uint HeightScaleIdx;    // slot 4 — float bits: MaxHeight / (2 * TerrainSize.x * HeightTexel)
     uint StampCount;        // slot 5 — stamp count (SplatStamp/DecoStamp) or LayerCount (ProceduralMask)
     float BrushRadius;      // slot 6 — repurposed as SplineBufSrvIdx via asuint
     uint Resolution;        // slot 7
@@ -72,7 +72,8 @@ void CS_ProceduralMask(uint3 dtid : SV_DispatchThreadID)
     h[2] = HeightTex.SampleLevel(sampHeightFilter, heightUV + float2(HeightTexel, 0), 0).r;
     h[3] = HeightTex.SampleLevel(sampHeightFilter, heightUV + float2(0, HeightTexel), 0).r;
 
-    // HeightScale = MaxHeight / (TerrainSize.x * HeightTexel), pre-computed on CPU
+    // HeightScale = MaxHeight / (2 * TerrainSize.x * HeightTexel), pre-computed on CPU
+    // (the central difference spans two texels)
     float heightScale = HeightScale;
 
     float3 normal;
