@@ -1,0 +1,44 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <RootNamespace>Freefall.Editor</RootNamespace>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <UseWindowsForms>false</UseWindowsForms>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\..\Squid\Squid.csproj" />
+    <ProjectReference Include="..\Freefall.Engine\Freefall.Engine.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.CodeAnalysis.CSharp" Version="4.13.0" />
+    <PackageReference Include="ModelContextProtocol.AspNetCore" Version="2.2.0" />
+    <PackageReference Include="Vortice.WinForms" Version="3.8.2" />
+    <PackageReference Include="PhysX.Net" Version="5.0.1-alpha1" GeneratePathProperty="true" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Remove="Obsolete\**" />
+    <None Remove="Obsolete\**" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Update="texconv.exe">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Update="FbxConverter.exe">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>    
+    <Content Include="Resources\**\*">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+  </ItemGroup>
+
+  <Import Project="$(PkgPhysX_Net)\lib\RuntimeFiles.targets" Condition="'$(PkgPhysX_Net)' != ''" />
+
+</Project>

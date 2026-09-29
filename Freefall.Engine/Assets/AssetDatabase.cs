@@ -390,7 +390,8 @@ namespace Freefall.Assets
         }
 
         /// <summary>
-        /// Resolve a friendly name to a subasset GUID, filtered by type.
+        /// Resolve a friendly name to a GUID, filtered by asset type: subassets first, then source files with that
+        /// name whose main asset type matches (e.g. the "Full House 1" prefab next to an FBX mesh of the same name).
         /// </summary>
         public static string ResolveGuidByName(string name, string type)
         {
@@ -402,7 +403,29 @@ namespace Freefall.Assets
                     if (match != null) return match.Guid;
                 }
             }
+
+            foreach (var kvp in _pathToGuid)
+            {
+                if (Path.GetFileNameWithoutExtension(kvp.Key).Equals(name, StringComparison.OrdinalIgnoreCase)
+                    && IsOfType(kvp.Value, kvp.Key, type))
+                    return kvp.Value;
+            }
             return null;
+        }
+
+        /// <summary>
+        /// Type check for a source asset. Not every importer records MainAssetType in the meta (prefabs don't), so this
+        /// falls back to the importer's declared AssetType and finally to the file extension.
+        /// </summary>
+        private static bool IsOfType(string guid, string path, string type)
+        {
+            if (string.Equals(GetAssetTypeName(guid), type, StringComparison.OrdinalIgnoreCase)) return true;
+            try
+            {
+                if (string.Equals(GetImporter(guid)?.AssetType?.Name, type, StringComparison.OrdinalIgnoreCase)) return true;
+            }
+            catch { }
+            return string.Equals(Path.GetExtension(path).TrimStart('.'), type, StringComparison.OrdinalIgnoreCase);
         }
 
         /// <summary>
