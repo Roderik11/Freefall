@@ -17,7 +17,9 @@ namespace Freefall.Editor.Mcp
             - After an action, console_log shows warnings/errors it produced (console_clear first to isolate them).
 
             Entities & components
-            - Entity ids are ints that are only valid until the next scene load or editor restart — re-query after either.
+            - Entity ids are ints that are only valid until the next scene load or editor restart. Every entity result also
+              carries a 'uid' string (persistent, saved in the scene); every entity tool accepts uid instead of id. Keep uids for
+              anything you will touch again later. Generated PCG output gets new uids on every regeneration.
             - Member names in entity_set_properties / asset_set_properties are exact PascalCase C# names; read them from
               entity_get / asset_get first. Only top-level members can be set (no 'A.B' paths): lists are replaced whole
               with a JSON array, nested data objects (e.g. Terrain.Layers entries) with a JSON object of their members.

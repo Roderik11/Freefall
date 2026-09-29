@@ -94,7 +94,7 @@ namespace Freefall.Editor.Commands
                 {
                     status = "instantiated",
                     source = "prefab",
-                    id = entity.Id,
+                    id = entity.Id, uid = entity.UID.ToString(),
                     name = entity.Name,
                     prefab = new { name = prefab.Name, guid = prefab.Guid },
                     position = CommandHelpers.Vec3(entity.Transform.Position),
@@ -152,7 +152,7 @@ namespace Freefall.Editor.Commands
                         return CommandResult.Json(new
                         {
                             status = "instantiated", source = "prefab (auto)",
-                            id = pEntity.Id, name = pEntity.Name,
+                            id = pEntity.Id, uid = pEntity.UID.ToString(), name = pEntity.Name,
                             prefab = new { name = testPrefab.Name, guid = testPrefab.Guid },
                             position = CommandHelpers.Vec3(pEntity.Transform.Position),
                             components = pEntity.Components.Select(c => c.GetType().Name).ToArray()
@@ -223,7 +223,7 @@ namespace Freefall.Editor.Commands
             {
                 status = "instantiated",
                 source = "staticmesh",
-                id = entity2.Id,
+                id = entity2.Id, uid = entity2.UID.ToString(),
                 name = entity2.Name,
                 mesh = new { name = mesh.Name, guid = mesh.Guid },
                 position = CommandHelpers.Vec3(entity2.Transform.Position),
@@ -302,7 +302,7 @@ namespace Freefall.Editor.Commands
                 {
                     status = "updated",
                     prefab = entity.Prefab?.Name,
-                    id = entity.Id,
+                    id = entity.Id, uid = entity.UID.ToString(),
                     updated = 1
                 });
             }

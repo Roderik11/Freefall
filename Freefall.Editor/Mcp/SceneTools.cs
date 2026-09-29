@@ -67,7 +67,8 @@ namespace Freefall.Editor.Mcp
             => McpBridge.Post("/api/scene/save", new { path });
 
         [McpServerTool(Name = "scene_list_entities", Title = "List entities", ReadOnly = true, OpenWorld = false)]
-        [Description("Entities in the scene: id, name, component types. Ids are only valid until the next scene load or editor restart.")]
+        [Description("Entities in the scene: id, uid, name, component types. Ids are only valid until the next scene load or editor restart; " +
+                     "uids (strings) are persistent and accepted by every entity tool.")]
         public static async Task<CallToolResult> ListEntities(
             [Description("Include editor-internal entities hidden from the hierarchy")] bool includeHidden = false,
             [Description("Only entities that have a component with this type name")] string? component = null,
@@ -102,10 +103,13 @@ namespace Freefall.Editor.Mcp
         [Description("Full detail of one entity: transform and every public field/property of each component (names are exact, for entity_set_properties). " +
                      "Pass 'component' to limit the output to one component.")]
         public static async Task<CallToolResult> GetEntity(
-            int id,
-            [Description("Only return this component type (case-insensitive)")] string? component = null)
+            int? id = null,
+            [Description("Only return this component type (case-insensitive)")] string? component = null,
+            [Description(EntityRefs.UidHelp)] string? uid = null)
         {
-            var result = await McpBridge.Get($"/api/scene/entity/{id}");
+            var (rid, err) = await EntityRefs.Resolve(id, uid);
+            if (err != null) return err;
+            var result = await McpBridge.Get($"/api/scene/entity/{rid}");
             if (result.IsError == true || component == null) return result;
 
             var entity = JsonNode.Parse(EditorTools.TextOf(result))!.AsObject();
@@ -179,58 +183,92 @@ namespace Freefall.Editor.Mcp
 
         [McpServerTool(Name = "entity_delete", Title = "Delete entity", Destructive = true, OpenWorld = false)]
         [Description("Destroy an entity.")]
-        public static Task<CallToolResult> DeleteEntity(int id) => McpBridge.Post($"/api/entity/{id}/delete");
+        public static async Task<CallToolResult> DeleteEntity(int? id = null, [Description(EntityRefs.UidHelp)] string? uid = null)
+        {
+            var (rid, err) = await EntityRefs.Resolve(id, uid);
+            return err ?? await McpBridge.Post($"/api/entity/{rid}/delete");
+        }
 
         [McpServerTool(Name = "entity_rename", Title = "Rename entity", Idempotent = true, OpenWorld = false)]
-        public static Task<CallToolResult> RenameEntity(int id, string name)
-            => McpBridge.Post($"/api/entity/{id}/rename", new { name });
+        public static async Task<CallToolResult> RenameEntity(string name, int? id = null, [Description(EntityRefs.UidHelp)] string? uid = null)
+        {
+            var (rid, err) = await EntityRefs.Resolve(id, uid);
+            return err ?? await McpBridge.Post($"/api/entity/{rid}/rename", new { name });
+        }
 
         [McpServerTool(Name = "entity_clone", Title = "Clone entity", OpenWorld = false)]
         [Description("Duplicate an entity and its components (shallow copy — asset references are shared; children are not cloned).")]
-        public static Task<CallToolResult> CloneEntity(int id, string? name = null, [Description("Added to the local position")] Vec3? offset = null)
-            => McpBridge.Post($"/api/entity/{id}/clone", new { name, offset });
+        public static async Task<CallToolResult> CloneEntity(int? id = null, string? name = null, [Description("Added to the local position")] Vec3? offset = null,
+            [Description(EntityRefs.UidHelp)] string? uid = null)
+        {
+            var (rid, err) = await EntityRefs.Resolve(id, uid);
+            return err ?? await McpBridge.Post($"/api/entity/{rid}/clone", new { name, offset });
+        }
 
         [McpServerTool(Name = "entity_set_parent", Title = "Set parent", Idempotent = true, OpenWorld = false)]
-        [Description("Parent an entity under another (local transform values are kept), or pass parent=null to unparent.")]
-        public static Task<CallToolResult> SetParent(int id, int? parent)
-            => McpBridge.Post($"/api/entity/{id}/setparent", $"{{\"parent\":{(parent?.ToString() ?? "null")}}}");
+        [Description("Parent an entity under another (local transform values are kept), or omit parent/parentUid to unparent.")]
+        public static async Task<CallToolResult> SetParent(int? id = null, int? parent = null,
+            [Description(EntityRefs.UidHelp)] string? uid = null,
+            [Description("Parent by persistent UID (string)")] string? parentUid = null)
+        {
+            var (rid, err) = await EntityRefs.Resolve(id, uid);
+            if (err != null) return err;
+            var (pid, perr) = await EntityRefs.Resolve(parent, parentUid, required: false);
+            if (perr != null) return perr;
+            return await McpBridge.Post($"/api/entity/{rid}/setparent", $"{{\"parent\":{(pid?.ToString() ?? "null")}}}");
+        }
 
         [McpServerTool(Name = "entity_set_transform", Title = "Set transform", Idempotent = true, OpenWorld = false)]
         [Description("Set local position / rotation / scale. Omitted parts are unchanged.")]
-        public static Task<CallToolResult> SetTransform(
-            int id,
+        public static async Task<CallToolResult> SetTransform(
+            int? id = null,
             Vec3? position = null,
             [Description("Rotation as quaternion")] Quat? rotation = null,
             [Description("Rotation as Euler degrees (x=pitch, y=yaw, z=roll); ignored if 'rotation' is given")] Vec3? rotationEuler = null,
-            Vec3? scale = null)
-            => McpBridge.Post($"/api/entity/{id}/transform", new
+            Vec3? scale = null,
+            [Description(EntityRefs.UidHelp)] string? uid = null)
+        {
+            var (rid, err) = await EntityRefs.Resolve(id, uid);
+            return err ?? await McpBridge.Post($"/api/entity/{rid}/transform", new
             {
                 position, scale,
                 rotation = rotation ?? FromEuler(rotationEuler),
             });
+        }
 
         [McpServerTool(Name = "entity_align_to_terrain", Title = "Align to terrain", Idempotent = true, OpenWorld = false)]
         [Description("Drop an entity onto the terrain and tilt it to the ground under its footprint (keeps yaw, replaces pitch/roll).")]
-        public static Task<CallToolResult> AlignToTerrain(int id) => McpBridge.Post($"/api/entity/{id}/alignToTerrain");
+        public static async Task<CallToolResult> AlignToTerrain(int? id = null, [Description(EntityRefs.UidHelp)] string? uid = null)
+        {
+            var (rid, err) = await EntityRefs.Resolve(id, uid);
+            return err ?? await McpBridge.Post($"/api/entity/{rid}/alignToTerrain");
+        }
 
         [McpServerTool(Name = "entity_add_component", Title = "Add component", OpenWorld = false)]
         [Description("Add a component by type name (e.g. 'PointLight', 'HeightStamp'). Fails if the entity already has one of that type.")]
-        public static Task<CallToolResult> AddComponent(int id, string type)
-            => McpBridge.Post($"/api/entity/{id}/addcomponent", new { type });
+        public static async Task<CallToolResult> AddComponent(string type, int? id = null, [Description(EntityRefs.UidHelp)] string? uid = null)
+        {
+            var (rid, err) = await EntityRefs.Resolve(id, uid);
+            return err ?? await McpBridge.Post($"/api/entity/{rid}/addcomponent", new { type });
+        }
 
         [McpServerTool(Name = "entity_set_properties", Title = "Set component properties", Idempotent = true, OpenWorld = false)]
         [Description("Set public fields/properties on one component of an entity, e.g. component='PointLight', values={\"Intensity\": 4, \"Color\": [1,0.8,0.6]}. " +
                      "Member names are exact PascalCase (see entity_get). Applied in order; stops at the first failure (earlier ones stay applied). " +
                      "Also works for component='Transform'.")]
         public static async Task<CallToolResult> SetProperties(
-            int id,
             [Description("Component type name (case-insensitive)")] string component,
             [Description("Member name → value. Encodings: numbers/bools/strings as-is; vectors {x,y,z} or [x,y,z]; quaternions {x,y,z,w}; " +
                          "Color3/Color4 [r,g,b(,a)]; enums by name; asset references by GUID string (\"\" or null clears); " +
-                         "component references {\"entity\": id, \"component\"?: \"Type\"}; lists as JSON arrays (replaces the whole list, e.g. Spline.Points); " +
+                         "component references {\"entity\": id | \"entityUid\": \"uid\", \"component\"?: \"Type\"}; lists as JSON arrays (replaces the whole list, e.g. Spline.Points); " +
                          "nested data objects as JSON objects of their members.")]
-            Dictionary<string, JsonElement> values)
+            Dictionary<string, JsonElement> values,
+            int? id = null,
+            [Description(EntityRefs.UidHelp)] string? uid = null)
         {
+            var (rid, err) = await EntityRefs.Resolve(id, uid);
+            if (err != null) return err;
+            int eid = rid!.Value;
             var applied = new JsonObject();
             foreach (var (property, value) in values)
             {
@@ -240,7 +278,7 @@ namespace Freefall.Editor.Mcp
                     ["property"] = property,
                     ["value"] = JsonNode.Parse(value.GetRawText()),
                 };
-                var result = await McpBridge.Post($"/api/entity/{id}/setproperty", body.ToJsonString());
+                var result = await McpBridge.Post($"/api/entity/{eid}/setproperty", body.ToJsonString());
                 if (result.IsError == true)
                 {
                     var msg = $"Failed on '{property}': {EditorTools.TextOf(result)}";
@@ -249,13 +287,17 @@ namespace Freefall.Editor.Mcp
                 }
                 applied[property] = JsonNode.Parse(EditorTools.TextOf(result))?["value"]?.DeepClone();
             }
-            return EditorTools.Text(new JsonObject { ["id"] = id, ["component"] = component, ["applied"] = applied });
+            return EditorTools.Text(new JsonObject { ["id"] = eid, ["component"] = component, ["applied"] = applied });
         }
 
         [McpServerTool(Name = "prefab_update", Title = "Update prefab instances", OpenWorld = false)]
         [Description("Re-apply a prefab to its instances: pass prefabGuid to update all instances, or entityId to refresh a single instance.")]
-        public static Task<CallToolResult> UpdatePrefab(string? prefabGuid = null, int? entityId = null)
-            => McpBridge.Post("/api/prefab/update", new { guid = prefabGuid, id = entityId });
+        public static async Task<CallToolResult> UpdatePrefab(string? prefabGuid = null, int? entityId = null,
+            [Description("Instance by persistent UID (string)")] string? entityUid = null)
+        {
+            var (rid, err) = await EntityRefs.Resolve(entityId, entityUid, required: false);
+            return err ?? await McpBridge.Post("/api/prefab/update", new { guid = prefabGuid, id = rid });
+        }
 
         // --- Selection & camera ---
 
@@ -265,9 +307,13 @@ namespace Freefall.Editor.Mcp
 
         [McpServerTool(Name = "selection_set", Title = "Set selection", Idempotent = true, OpenWorld = false)]
         [Description("Select an entity by id or name (shows it in the inspector), or clear=true to deselect.")]
-        public static Task<CallToolResult> SetSelection(int? id = null, string? name = null, bool clear = false)
-            => clear ? McpBridge.Post("/api/selection", new { clear = true })
-                     : McpBridge.Post("/api/selection", new { id, name });
+        public static async Task<CallToolResult> SetSelection(int? id = null, string? name = null, bool clear = false,
+            [Description(EntityRefs.UidHelp)] string? uid = null)
+        {
+            if (clear) return await McpBridge.Post("/api/selection", new { clear = true });
+            var (rid, err) = await EntityRefs.Resolve(id, uid, required: false);
+            return err ?? await McpBridge.Post("/api/selection", new { id = rid, name });
+        }
 
         [McpServerTool(Name = "camera_get", Title = "Get editor camera", ReadOnly = true, OpenWorld = false)]
         [Description("Editor camera position, rotation, forward/up/right vectors, fov and clip planes.")]
@@ -280,8 +326,12 @@ namespace Freefall.Editor.Mcp
 
         [McpServerTool(Name = "camera_focus", Title = "Focus camera on entity", Idempotent = true, OpenWorld = false)]
         [Description("Frame an entity in the viewport (like double-clicking it in the hierarchy). The camera animates, so wait a moment before a screenshot.")]
-        public static Task<CallToolResult> FocusCamera(int? id = null, string? name = null)
-            => McpBridge.Post("/api/camera/focus", new { id, name });
+        public static async Task<CallToolResult> FocusCamera(int? id = null, string? name = null,
+            [Description(EntityRefs.UidHelp)] string? uid = null)
+        {
+            var (rid, err) = await EntityRefs.Resolve(id, uid, required: false);
+            return err ?? await McpBridge.Post("/api/camera/focus", new { id = rid, name });
+        }
 
         // --- helpers ---
 

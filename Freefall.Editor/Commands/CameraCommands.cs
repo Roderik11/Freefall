@@ -124,7 +124,7 @@ namespace Freefall.Editor.Commands
             return CommandResult.Json(new
             {
                 focused = target.Name,
-                id = target.Id,
+                id = target.Id, uid = target.UID.ToString(),
                 position = CommandHelpers.Vec3(target.Transform.WorldPosition)
             });
         }

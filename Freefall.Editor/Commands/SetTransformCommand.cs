@@ -27,7 +27,7 @@ namespace Freefall.Editor.Commands
 
             return CommandResult.Json(new
             {
-                id = entity.Id,
+                id = entity.Id, uid = entity.UID.ToString(),
                 name = entity.Name,
                 transform = CommandHelpers.SerializeTransform(entity.Transform)
             });

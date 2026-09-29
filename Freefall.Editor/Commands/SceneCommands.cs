@@ -51,7 +51,7 @@ namespace Freefall.Editor.Commands
                     status = "ok",
                     path,
                     entityCount = entities.Count,
-                    entities = entities.Select(e => new { id = e.Id, name = e.Name }).ToArray()
+                    entities = entities.Select(e => new { id = e.Id, uid = e.UID.ToString(), name = e.Name }).ToArray()
                 });
             }
             catch (Exception ex)

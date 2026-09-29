@@ -39,8 +39,13 @@ namespace Freefall.Editor.Mcp
             [Description("Euler degrees (x=pitch, y=yaw, z=roll)")] Vec3? rotationEuler = null,
             Vec3? scale = null,
             [Description("Parent entity id; transform values are local to it (spline points are then local to the parent)")] int? parent = null,
-            [Description("Run the entity's PCGComponent after building")] bool runPcg = true)
+            [Description("Run the entity's PCGComponent after building")] bool runPcg = true,
+            [Description("Parent by persistent UID (string) instead of id")] string? parentUid = null)
         {
+            var (parentId, parentErr) = await EntityRefs.Resolve(parent, parentUid, required: false);
+            if (parentErr != null) return parentErr;
+            parent = parentId;
+
             var comps = (components ?? Array.Empty<ComponentSpec>())
                 .Select(c => new ComponentSpec(c.Type, c.Values?.DeepClone().AsObject() ?? new JsonObject()))
                 .ToList();
@@ -85,7 +90,9 @@ namespace Freefall.Editor.Mcp
                 ? await McpBridge.Post("/api/entity/instantiate", new { guid = prefab, name, snapToGround = false })
                 : await McpBridge.Post("/api/entity/create", new { name });
             if (created.IsError == true) return created;
-            int id = JsonNode.Parse(EditorTools.TextOf(created))!["id"]!.GetValue<int>();
+            var createdJson = JsonNode.Parse(EditorTools.TextOf(created))!;
+            int id = createdJson["id"]!.GetValue<int>();
+            var uid = createdJson["uid"]?.GetValue<string>();
 
             var log = new JsonArray();
             static async Task<string?> Step(string what, Task<CallToolResult> call)
@@ -141,6 +148,7 @@ namespace Freefall.Editor.Mcp
             {
                 ["status"] = "built",
                 ["id"] = id,
+                ["uid"] = uid,
                 ["name"] = name,
                 ["components"] = log,
                 ["bounds"] = bounds,
@@ -151,22 +159,26 @@ namespace Freefall.Editor.Mcp
         [McpServerTool(Name = "spline_recenter", Title = "Center spline pivots", Destructive = true, OpenWorld = false)]
         [Description("Spline.CenterPivot on one or more entities: move each entity's pivot to the centre of its spline points " +
                      "(XZ bounds centre, average height; a Flat RuntimeMesh keeps its height) without moving the spline or " +
-                     "its hand-made children. Pass 'ids', or " +
+                     "its hand-made children. Pass 'ids'/'uids', or " +
                      "all=true for every Spline in the scene — e.g. to fix splines authored with the entity at the origin. " +
                      "Same as the 'Center Pivot' button in the Spline inspector.")]
         public static async Task<CallToolResult> RecenterSplines(
             int[]? ids = null,
             [Description("Every Spline component in the scene")] bool all = false,
-            [Description("Skip splines whose pivot is already within this distance of the centre (m)")] float tolerance = 0.5f)
+            [Description("Skip splines whose pivot is already within this distance of the centre (m)")] float tolerance = 0.5f,
+            [Description("Persistent entity UIDs (strings), in addition to 'ids'")] string[]? uids = null)
         {
-            if (ids == null && !all) return McpBridge.Error("Pass 'ids' or all=true.");
+            if (ids == null && uids == null && !all) return McpBridge.Error("Pass 'ids', 'uids' or all=true.");
+            var (resolved, idErr) = await EntityRefs.ResolveMany(ids, uids);
+            if (idErr != null) return idErr;
+            var targetIds = resolved!;
 
             var server = EditorCommandServer.Instance;
             var report = await server.RunOnMainThread(() =>
             {
                 IEnumerable<Freefall.Components.Spline> splines = all
                     ? Freefall.Base.ComponentCache<Freefall.Components.Spline>.All.OfType<Freefall.Components.Spline>().ToList()
-                    : ids!.Select(Commands.CommandHelpers.FindEntityById)
+                    : targetIds.Select(Commands.CommandHelpers.FindEntityById)
                           .Select(e => e?.GetComponent<Freefall.Components.Spline>())
                           .Where(s => s != null)!;
 
@@ -180,7 +192,7 @@ namespace Freefall.Editor.Mcp
                     var p = s.Transform.Position;
                     moved.Add(new JsonObject
                     {
-                        ["id"] = s.Entity.Id, ["name"] = s.Entity.Name, ["shift"] = MathF.Round(shift, 1),
+                        ["id"] = s.Entity.Id, ["uid"] = s.Entity.UID.ToString(), ["name"] = s.Entity.Name, ["shift"] = MathF.Round(shift, 1),
                         ["pivot"] = new JsonArray(R(p.X), R(p.Y), R(p.Z)),
                     });
                 }

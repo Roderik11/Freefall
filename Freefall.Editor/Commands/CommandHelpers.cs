@@ -22,6 +22,17 @@ namespace Freefall.Editor.Commands
             return null;
         }
 
+        /// <summary>By persistent UID (saved in the scene, unlike the runtime Id which changes on every load).</summary>
+        public static Entity FindEntityByUid(ulong uid)
+        {
+            foreach (var entity in EntityManager.Entities)
+            {
+                if (entity.UID == uid)
+                    return entity;
+            }
+            return null;
+        }
+
         public static Entity FindEntityByName(string name)
         {
             return EntityManager.Entities.FirstOrDefault(e =>
@@ -123,15 +134,15 @@ namespace Freefall.Editor.Commands
                 string s => s,
                 System.Enum e => e.ToString(),
                 Freefall.Assets.Asset a => new { type = a.GetType().Name, name = a.Name, guid = a.Guid },
-                Entity e => new { id = e.Id, name = e.Name },
-                Component c => new { entity = c.Entity?.Id, component = c.GetType().Name },
+                Entity e => new { id = e.Id, uid = e.UID.ToString(), name = e.Name },
+                Component c => new { entity = c.Entity?.Id, entityUid = c.Entity?.UID.ToString(), component = c.GetType().Name },
                 _ => value.ToString()
             };
         }
 
         public static object SerializeEntityBrief(Entity entity) => new
         {
-            id = entity.Id,
+            id = entity.Id, uid = entity.UID.ToString(),
             name = entity.Name,
             hidden = entity.HideInHierarchy,
             components = entity.Components.Select(c => c.GetType().Name).ToArray()
@@ -227,7 +238,7 @@ namespace Freefall.Editor.Commands
 
             return new
             {
-                id = entity.Id,
+                id = entity.Id, uid = entity.UID.ToString(),
                 name = entity.Name,
                 hidden = entity.HideInHierarchy,
                 transform = SerializeTransform(entity.Transform),

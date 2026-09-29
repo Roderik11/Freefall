@@ -30,7 +30,7 @@ namespace Freefall.Editor.Commands
             return CommandResult.Json(new
             {
                 status = "created",
-                id = entity.Id,
+                id = entity.Id, uid = entity.UID.ToString(),
                 name = entity.Name
             });
         }
@@ -292,13 +292,24 @@ namespace Freefall.Editor.Commands
                 if (el.ValueKind != System.Text.Json.JsonValueKind.Object)
                     throw new InvalidOperationException($"Component reference must be an object with 'entity' (id). Got {el.ValueKind}");
 
-                if (!el.TryGetProperty("entity", out var entityIdProp))
-                    throw new InvalidOperationException("Component reference must contain 'entity' (entity id)");
-
-                var refEntityId = entityIdProp.GetInt32();
-                var refEntity = CommandHelpers.FindEntityById(refEntityId);
-                if (refEntity == null)
-                    throw new InvalidOperationException($"Referenced entity {refEntityId} not found");
+                Entity refEntity;
+                if (el.TryGetProperty("entityUid", out var uidProp))
+                {
+                    // Persistent UID as a string (UIDs exceed JSON's exact integer range)
+                    var uidText = uidProp.ValueKind == System.Text.Json.JsonValueKind.String ? uidProp.GetString() : uidProp.GetRawText();
+                    if (!ulong.TryParse(uidText, out var refUid))
+                        throw new InvalidOperationException($"'entityUid' must be a UID string, got {uidText}");
+                    refEntity = CommandHelpers.FindEntityByUid(refUid)
+                        ?? throw new InvalidOperationException($"Referenced entity UID {refUid} not found");
+                }
+                else if (el.TryGetProperty("entity", out var entityIdProp))
+                {
+                    var refEntityId = entityIdProp.GetInt32();
+                    refEntity = CommandHelpers.FindEntityById(refEntityId)
+                        ?? throw new InvalidOperationException($"Referenced entity {refEntityId} not found");
+                }
+                else
+                    throw new InvalidOperationException("Component reference must contain 'entity' (id) or 'entityUid' (UID string)");
 
                 // If "component" is specified, find that specific type; otherwise use the field's type
                 Type compType = targetType;
@@ -310,7 +321,7 @@ namespace Freefall.Editor.Commands
 
                 var comp = refEntity.Components.FirstOrDefault(c => compType.IsAssignableFrom(c.GetType()));
                 if (comp == null)
-                    throw new InvalidOperationException($"Component '{compType.Name}' not found on entity {refEntityId} ('{refEntity.Name}')");
+                    throw new InvalidOperationException($"Component '{compType.Name}' not found on entity {refEntity.Id} ('{refEntity.Name}')");
 
                 return comp;
             }
@@ -402,7 +413,7 @@ namespace Freefall.Editor.Commands
             {
                 id,
                 name = entity.Name,
-                parent = new { id = parentEntity.Id, name = parentEntity.Name }
+                parent = new { id = parentEntity.Id, uid = parentEntity.UID.ToString(), name = parentEntity.Name }
             });
         }
     }
@@ -469,7 +480,7 @@ namespace Freefall.Editor.Commands
             {
                 status = "cloned",
                 sourceId = id,
-                id = clone.Id,
+                id = clone.Id, uid = clone.UID.ToString(),
                 name = clone.Name,
                 position = CommandHelpers.Vec3(clone.Transform.Position),
                 components = clone.Components.Select(c => c.GetType().Name).ToArray()

@@ -51,8 +51,12 @@ namespace Freefall.Editor.Mcp
         [McpServerTool(Name = "pcg_execute", Title = "Run PCG", OpenWorld = false)]
         [Description("Re-run the PCGComponent on an entity (or all PCG components when id is omitted) and report spawn counts and timing per component. " +
                      "PCG output regenerates on load and whenever its spline or graph changes; it is never saved into the scene.")]
-        public static Task<CallToolResult> ExecutePcg([Description("Entity id with a PCGComponent; omit for all")] int? id = null)
-            => McpBridge.Post("/api/pcg/execute", new { id });
+        public static async Task<CallToolResult> ExecutePcg([Description("Entity id with a PCGComponent; omit for all")] int? id = null,
+            [Description(EntityRefs.UidHelp)] string? uid = null)
+        {
+            var (rid, err) = await EntityRefs.Resolve(id, uid, required: false);
+            return err ?? await McpBridge.Post("/api/pcg/execute", new { id = rid });
+        }
 
         // --- Materials ---
 
@@ -89,20 +93,29 @@ namespace Freefall.Editor.Mcp
         [McpServerTool(Name = "entities_delete", Title = "Delete entities (bulk)", Destructive = true, OpenWorld = false)]
         [Description("Delete many entities at once: by 'ids' and/or the same filters as scene_query (name, component, prefab, area). " +
                      "Use dryRun=true first to see the count and per-name histogram. At least one of ids/filters is required.")]
-        public static Task<CallToolResult> DeleteMany(
+        public static async Task<CallToolResult> DeleteMany(
             int[]? ids = null,
             string? name = null,
             string? component = null,
             string? prefab = null,
             AreaFilter? area = null,
             bool topLevelOnly = true,
-            bool dryRun = false)
-            => McpBridge.Post("/api/scene/delete", new { ids, name, component, prefab, area, topLevelOnly, dryRun });
+            bool dryRun = false,
+            [Description("Persistent entity UIDs (strings), in addition to 'ids'")] string[]? uids = null)
+        {
+            var (all, err) = await EntityRefs.ResolveMany(ids, uids);
+            if (err != null) return err;
+            var idList = ids == null && uids == null ? null : all;
+            return await McpBridge.Post("/api/scene/delete", new { ids = idList, name, component, prefab, area, topLevelOnly, dryRun });
+        }
 
         [McpServerTool(Name = "entity_remove_component", Title = "Remove component", Destructive = true, OpenWorld = false)]
         [Description("Remove a component (by type name) from an entity. Transform cannot be removed.")]
-        public static Task<CallToolResult> RemoveComponent(int id, string type)
-            => McpBridge.Post($"/api/entity/{id}/removecomponent", new { type });
+        public static async Task<CallToolResult> RemoveComponent(string type, int? id = null, [Description(EntityRefs.UidHelp)] string? uid = null)
+        {
+            var (rid, err) = await EntityRefs.Resolve(id, uid);
+            return err ?? await McpBridge.Post($"/api/entity/{rid}/removecomponent", new { type });
+        }
 
         [McpServerTool(Name = "prefab_measure", Title = "Measure prefabs", ReadOnly = true, OpenWorld = false)]
         [Description("Bounds (min/max/size, relative to the prefab pivot at the origin) of one or more prefabs without placing them in the scene. " +

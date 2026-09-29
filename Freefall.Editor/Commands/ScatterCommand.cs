@@ -227,7 +227,7 @@ namespace Freefall.Editor.Commands
 
                 placed.Add(new
                 {
-                    id = entity.Id,
+                    id = entity.Id, uid = entity.UID.ToString(),
                     name = entity.Name,
                     position = CommandHelpers.Vec3(entity.Transform.Position),
                     scale = CommandHelpers.Vec3(entity.Transform.Scale)

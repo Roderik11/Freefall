@@ -110,7 +110,7 @@ namespace Freefall.Editor.Commands
             foreach (var entity in EntityManager.Entities)
                 foreach (var pcg in entity.Components.OfType<PCGComponent>())
                     if (pcg.Graph == graph)
-                        runs.Add(new { id = entity.Id, name = entity.Name, spawned = CountSpawned(entity) });
+                        runs.Add(new { id = entity.Id, uid = entity.UID.ToString(), name = entity.Name, spawned = CountSpawned(entity) });
             return runs;
         }
 
@@ -243,7 +243,7 @@ namespace Freefall.Editor.Commands
                 nodes = graph.Nodes.Select(AuthoringHelpers.DescribeNode).ToArray(),
                 connections = AuthoringHelpers.DescribeConnections(graph).ToArray(),
                 usedBy = EntityManager.Entities.Where(e => e.Components.OfType<PCGComponent>().Any(p => p.Graph == graph))
-                    .Select(e => new { id = e.Id, name = e.Name }).ToArray(),
+                    .Select(e => new { id = e.Id, uid = e.UID.ToString(), name = e.Name }).ToArray(),
             });
         }
     }
@@ -391,7 +391,7 @@ namespace Freefall.Editor.Commands
                 {
                     var t0 = sw.Elapsed.TotalMilliseconds;
                     pcg.Execute();
-                    runs.Add(new { id = e.Id, name = e.Name, graph = pcg.Graph?.Name, spawned = AuthoringHelpers.CountSpawned(e), ms = Math.Round(sw.Elapsed.TotalMilliseconds - t0, 1) });
+                    runs.Add(new { id = e.Id, uid = e.UID.ToString(), name = e.Name, graph = pcg.Graph?.Name, spawned = AuthoringHelpers.CountSpawned(e), ms = Math.Round(sw.Elapsed.TotalMilliseconds - t0, 1) });
                 }
             }
             if (runs.Count == 0) return CommandResult.NotFound("No PCGComponent found");
@@ -471,7 +471,7 @@ namespace Freefall.Editor.Commands
             var histogram = matches.GroupBy(e => e.Name).OrderByDescending(x => x.Count()).ToDictionary(x => x.Key, x => x.Count());
             var entities = summaryOnly ? Array.Empty<object>() : matches.Take(limit).Select(e => (object)new
             {
-                id = e.Id,
+                id = e.Id, uid = e.UID.ToString(),
                 name = e.Name,
                 prefab = e.Prefab?.Guid,
                 position = CommandHelpers.Vec3(e.Transform.WorldPosition),

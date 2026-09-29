@@ -412,7 +412,7 @@ namespace Freefall.Editor.Commands
             return CommandResult.Json(new
             {
                 status = "aligned",
-                id = entity.Id,
+                id = entity.Id, uid = entity.UID.ToString(),
                 name = entity.Name,
                 position = CommandHelpers.Vec3(entity.Transform.Position),
                 rotation = CommandHelpers.Quat(entity.Transform.Rotation),

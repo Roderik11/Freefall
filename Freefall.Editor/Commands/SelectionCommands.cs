@@ -16,7 +16,7 @@ namespace Freefall.Editor.Commands
             {
                 selected = new
                 {
-                    id = selected.Id,
+                    id = selected.Id, uid = selected.UID.ToString(),
                     name = selected.Name,
                     transform = CommandHelpers.SerializeTransform(selected.Transform)
                 }
@@ -42,7 +42,7 @@ namespace Freefall.Editor.Commands
                     return CommandResult.NotFound("Entity not found");
 
                 Selector.SelectedEntity = entity;
-                return CommandResult.Json(new { selected = entity.Id, name = entity.Name });
+                return CommandResult.Json(new { selected = entity.Id, uid = entity.UID.ToString(), name = entity.Name });
             }
 
             if (root.TryGetProperty("name", out var nameProp))
@@ -52,7 +52,7 @@ namespace Freefall.Editor.Commands
                     return CommandResult.NotFound($"Entity named '{nameProp.GetString()}' not found");
 
                 Selector.SelectedEntity = entity;
-                return CommandResult.Json(new { selected = entity.Id, name = entity.Name });
+                return CommandResult.Json(new { selected = entity.Id, uid = entity.UID.ToString(), name = entity.Name });
             }
 
             if (root.TryGetProperty("clear", out _))
