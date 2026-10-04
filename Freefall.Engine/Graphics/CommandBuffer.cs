@@ -53,6 +53,28 @@ namespace Freefall.Graphics
     }
 
     /// <summary>
+    /// The persistent (GPU-resident) draws of one renderer: instance records that stay in their
+    /// batches across frames instead of being re-enqueued. Owned by the renderer, filled by
+    /// CommandBuffer.AddPersistent, released as a whole by CommandBuffer.RemovePersistent.
+    /// </summary>
+    public sealed class DrawGroup
+    {
+        // One handle per (draw, render pass). Touched only on the main thread (CommandBuffer.FlushPersistent).
+        internal readonly List<InstanceBatch.InstanceHandle> Handles = new();
+    }
+
+    /// <summary>
+    /// A component whose draws are GPU-resident. It has no per-frame Draw(): when something its
+    /// draws depend on changes it calls CommandBuffer.Invalidate(this), and RefreshDraws runs once
+    /// on the main thread before the next frame is rendered.
+    /// </summary>
+    public interface IPersistentDrawSource
+    {
+        /// <summary>Bring the registered draws in line with the current state (main thread).</summary>
+        void RefreshDraws();
+    }
+
+    /// <summary>
     /// Thread-local bucket for collecting GPU-ready arrays during parallel Enqueue.
     /// Stores parallel arrays that can be block-copied with Array.Copy.
     /// </summary>
@@ -343,6 +365,18 @@ namespace Freefall.Graphics
                     instanceCount, meshPartId, customBindings);
             }
 
+            /// <summary>Find or create the batch for a key (persistent draws; main thread).</summary>
+            public InstanceBatch GetOrCreateBatch(BatchKey key, Material material)
+            {
+                if (!batches.TryGetValue(key, out var batch))
+                {
+                    batch = new InstanceBatch(key, material);
+                    batches.Add(key, batch);
+                    allBatches.Add(batch);
+                }
+                return batch;
+            }
+
             /// <summary>
             /// Execute this pass: merge buckets, upload, build, cull, draw.
             /// </summary>
@@ -360,13 +394,27 @@ namespace Freefall.Graphics
                     actions.Clear();
                 }
 
+                // Apply persistent add/remove requests queued during Draw(). Must happen before any
+                // batch is cleared and merged this frame (persistent records sit in front of the frame's draws).
+                FlushPersistent();
+
                 // 1. Batch draw calls by Effect
                 var batchingSw = System.Diagnostics.Stopwatch.StartNew();
-                
+
                 activeBatches.Clear();
-                
+
                 int drawCallCount = 0;
-                
+
+                // Batches with persistent instances are active every frame, even with no enqueued draws
+                foreach (var batch in allBatches)
+                {
+                    if (batch.PersistentCount == 0 || batch._activeFrame == Engine.FrameIndex) continue;
+                    batch._activeFrame = Engine.FrameIndex;
+                    batch.Clear();
+                    activeBatches.Add(batch);
+                    drawCallCount += batch.PersistentCount;
+                }
+
                 // Merge all thread-local buckets into batches with block copy
                 foreach (var threadBuckets in threadLocalBuckets.Values)
                 {
@@ -612,6 +660,145 @@ namespace Freefall.Graphics
             }
         }
         
+        #region Persistent (GPU-resident) draws
+
+        private struct PersistentOp
+        {
+            public DrawGroup Group;
+            public bool Add;      // false = remove every record of the group
+            public DrawCall Call; // Add only
+        }
+
+        private static readonly List<PersistentOp> _persistentOps = new();
+        private static readonly Lock _persistentLock = new();
+
+        /// <summary>
+        /// Register a draw that stays in its batches until the group is removed: nothing is enqueued
+        /// per frame for it. Same parameters as Enqueue. Thread-safe (callable from parallel Draw());
+        /// takes effect at the next pass execution. To change a registered draw, remove the group and
+        /// add a new one.
+        /// </summary>
+        public static void AddPersistent(DrawGroup group, Mesh mesh, int meshPartIndex, Material material, MaterialBlock materialBlock, int transformSlot, uint boneBufferIdx = 0, bool lodManaged = false)
+        {
+            var op = new PersistentOp
+            {
+                Group = group,
+                Add = true,
+                Call = new DrawCall
+                {
+                    Key = new BatchKey(material.Effect),
+                    Mesh = mesh,
+                    MeshPartIndex = meshPartIndex,
+                    Material = material,
+                    MaterialBlock = materialBlock,
+                    TransformSlot = transformSlot,
+                    BoneBufferIdx = boneBufferIdx,
+                    LodManaged = lodManaged
+                }
+            };
+
+            lock (_persistentLock)
+                _persistentOps.Add(op);
+        }
+
+        /// <summary>
+        /// Remove every persistent draw of a group. Thread-safe; takes effect at the next pass execution.
+        /// </summary>
+        public static void RemovePersistent(DrawGroup group)
+        {
+            lock (_persistentLock)
+                _persistentOps.Add(new PersistentOp { Group = group, Add = false });
+        }
+
+        /// <summary>
+        /// Change the bone buffer SRV index of every record of a group, in place. For skinned meshes:
+        /// the Animator's bone buffer is triple-buffered, so its SRV index changes every frame, and
+        /// re-registering the draws each frame would defeat the point of persistent draws.
+        ///
+        /// Safe without a lock from the (parallel) update phase: it only writes this group's own
+        /// records in the staging arrays, which are re-uploaded in full when the pass executes, and
+        /// batches are only restructured during rendering (FlushPersistent, bucket merge).
+        /// Records not applied yet (group registered this frame) get the value from their DrawCall.
+        /// </summary>
+        public static void SetBoneBuffer(DrawGroup group, uint boneBufferIdx)
+        {
+            var handles = group.Handles;
+            for (int i = 0; i < handles.Count; i++)
+                handles[i].Batch.SetPersistentBoneBuffer(handles[i], boneBufferIdx);
+        }
+
+        private static List<IPersistentDrawSource> _invalidSources = new();
+        private static List<IPersistentDrawSource> _refreshingSources = new();
+        private static readonly Lock _invalidLock = new();
+
+        /// <summary>
+        /// Ask for <paramref name="source"/>.RefreshDraws() to run before the next frame is rendered.
+        /// Thread-safe. The source is responsible for not queueing itself twice.
+        /// </summary>
+        public static void Invalidate(IPersistentDrawSource source)
+        {
+            lock (_invalidLock)
+                _invalidSources.Add(source);
+        }
+
+        /// <summary>
+        /// Run RefreshDraws on every invalidated source. Main thread. The renderer calls this before
+        /// the transform upload, so a transform slot first allocated by a refresh is uploaded the same
+        /// frame; FlushPersistent calls it again for anything invalidated later.
+        /// </summary>
+        public static void RefreshDrawSources()
+        {
+            lock (_invalidLock)
+            {
+                if (_invalidSources.Count == 0) return;
+                (_invalidSources, _refreshingSources) = (_refreshingSources, _invalidSources);
+            }
+
+            // Outside the lock: a refresh may invalidate other sources (they run next time)
+            foreach (var source in _refreshingSources)
+                source.RefreshDraws();
+            _refreshingSources.Clear();
+        }
+
+        /// <summary>
+        /// Apply queued persistent adds/removes in order. Main thread, called at the start of every
+        /// pass execution, so the batches of all passes are up to date before any is merged or culled.
+        /// </summary>
+        private static void FlushPersistent()
+        {
+            RefreshDrawSources();
+
+            lock (_persistentLock)
+            {
+                if (_persistentOps.Count == 0) return;
+
+                foreach (var op in _persistentOps)
+                {
+                    if (op.Add)
+                    {
+                        // One record per render pass of the material's effect, as Enqueue does
+                        foreach (var shaderPass in op.Call.Material.GetPasses())
+                        {
+                            if (shaderPass.RenderPass == RenderPass.Shadow)
+                                continue;
+                            var batch = current.passes[(int)shaderPass.RenderPass].GetOrCreateBatch(op.Call.Key, op.Call.Material);
+                            op.Group.Handles.Add(batch.AddPersistent(op.Call));
+                        }
+                    }
+                    else
+                    {
+                        foreach (var handle in op.Group.Handles)
+                            handle.Batch.RemovePersistent(handle);
+                        op.Group.Handles.Clear();
+                    }
+                }
+
+                _persistentOps.Clear();
+            }
+        }
+
+        #endregion
+
         /// <summary>
         /// Enqueue all mesh parts into all applicable RenderPasses based on the Material's Effect passes.
         /// </summary>

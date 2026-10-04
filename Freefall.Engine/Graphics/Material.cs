@@ -317,6 +317,12 @@ namespace Freefall.Graphics
         }
 
         /// <summary>
+        /// Raised after a material's effect was swapped. Persistent (GPU-resident) draws live in
+        /// batches keyed by effect and pass, so renderers using the material re-register.
+        /// </summary>
+        public static event Action<Material>? EffectChanged;
+
+        /// <summary>
         /// Change the Effect on an existing material at runtime.
         /// Disposes old PSOs/CBs and rebuilds with the new Effect.
         /// Preserves existing texture bindings.
@@ -345,6 +351,8 @@ namespace Freefall.Graphics
             // Re-apply saved textures
             foreach (var (slot, tex) in savedTextures)
                 SetTexture(slot, tex);
+
+            EffectChanged?.Invoke(this);
 
             //Debug.Log($"[Material] Switched '{Name}' to effect '{effect.Name}'");
         }
@@ -1100,12 +1108,26 @@ namespace Freefall.Graphics
 
         public Dictionary<int, ParameterValue> Parameters => _parameters;
 
+        /// <summary>
+        /// Raised by every Set*/Clear. Persistent (GPU-resident) draws copy the values once at
+        /// registration; their renderer subscribes to copy them again. Mutating a value in place
+        /// (through Parameters, or by writing into an array passed to SetParameterArray) does not raise it.
+        /// </summary>
+        public event Action? Changed;
+
         public void Clear()
         {
             _parameters.Clear();
+            Changed?.Invoke();
         }
 
         public void SetParameter<T>(string name, T value) where T : unmanaged
+        {
+            SetParameterCore(name, value);
+            Changed?.Invoke();
+        }
+
+        private void SetParameterCore<T>(string name, T value) where T : unmanaged
         {
             int hash = name.GetHashCode();
             if (!_parameters.TryGetValue(hash, out var param))
@@ -1121,6 +1143,7 @@ namespace Freefall.Graphics
 
         public void SetTexture(string name, Texture value)
         {
+            // No Changed: textures are not staged per instance
             int hash = name.GetHashCode();
             if (!_parameters.TryGetValue(hash, out var param))
             {
@@ -1146,6 +1169,7 @@ namespace Freefall.Graphics
             {
                 typedParam.Value = value;
             }
+            Changed?.Invoke();
         }
         
         public T? GetValue<T>(string name)

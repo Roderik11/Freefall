@@ -190,16 +190,205 @@ namespace Freefall.Graphics
             ResizeBuffers(8192);
         }
 
+        /// <summary>
+        /// Start a new frame. Persistent instances occupy the front of every per-instance array
+        /// ([0, PersistentCount)) and are kept; this frame's enqueued draws are appended after them.
+        /// </summary>
         public void Clear()
         {
-            _drawCount = 0;
+            _drawCount = _persistentCount;
             _uniqueMeshPartIds.Clear();
             SubBatchCount = 0;
             _maxTransformSlot = 0;
             _isGPUSourced = false;
+            // The staging arrays are re-uploaded in full every frame (one memcpy per channel), so the
+            // triple-buffered GPU copies never need per-slot dirty tracking.
             foreach (var buf in _perInstanceBuffers.Values)
-                buf.Dirty = false;
+                buf.Dirty = _persistentCount > 0;
         }
+
+        #region Persistent instances (GPU-resident draws)
+
+        /// <summary>
+        /// One persistent instance record in a batch. The batch patches Index when a swap-remove moves the record.
+        /// </summary>
+        public sealed class InstanceHandle
+        {
+            public InstanceBatch Batch { get; internal set; }
+            public int Index { get; internal set; }
+
+            internal InstanceHandle(InstanceBatch batch, int index)
+            {
+                Batch = batch;
+                Index = index;
+            }
+        }
+
+        private int _persistentCount;
+        private InstanceHandle?[] _handles = Array.Empty<InstanceHandle?>();
+
+        /// <summary>Number of persistent instance records (registered once, not re-enqueued per frame).</summary>
+        public int PersistentCount => _persistentCount;
+
+        /// <summary>
+        /// Add a persistent instance record. Main thread, and only before this frame's bucket merge
+        /// (CommandBuffer.FlushPersistent): the record goes at index PersistentCount, where the
+        /// per-frame draws would otherwise start.
+        /// </summary>
+        internal InstanceHandle AddPersistent(in DrawCall call)
+        {
+            int index = _persistentCount;
+            if (index + 1 > capacity)
+                ResizeBuffers(Math.Max(capacity * 2, index + 1));
+
+            int meshPartId = call.Mesh.GetMeshPartId(call.MeshPartIndex);
+            if (meshPartId < 0)
+            {
+                call.Mesh.RegisterMeshParts();
+                meshPartId = call.Mesh.GetMeshPartId(call.MeshPartIndex);
+            }
+
+            _draws[index] = new RawDraw
+            {
+                Mesh = call.Mesh,
+                PartIndex = call.MeshPartIndex,
+                Block = call.MaterialBlock,
+                TransformSlot = call.TransformSlot,
+                MaterialId = (uint)call.Material.MaterialID,
+                MeshPartId = meshPartId,
+            };
+
+            // Optional channels this record doesn't supply read as zero, never as a previous record's data
+            foreach (var pib in _perInstanceBuffers.Values)
+            {
+                int bytes = pib.ElementsPerInstance * pib.ElementStride;
+                if (bytes == 0) continue;
+                EnsureStaging(pib, index + 1);
+                Array.Clear(pib.StagingData, index * bytes, bytes);
+            }
+
+            var descriptor = new InstanceDescriptor
+            {
+                TransformSlot = (uint)call.TransformSlot,
+                MaterialId = (uint)call.Material.MaterialID,
+                CustomDataIdx = 0,
+                MeshPartIdx = (uint)call.MeshPartIndex,
+                BoneBufferIdx = call.BoneBufferIdx
+            };
+            WriteCore(DrawBucket.DescriptorsHash, 20, index, descriptor);
+            WriteCore(DrawBucket.SubbatchIdsHash, 4, index, (uint)meshPartId | (call.LodManaged ? DrawBucket.LodManagedBit : 0u));
+
+            if (call.MaterialBlock != null)
+            {
+                foreach (var (hash, param) in call.MaterialBlock.Parameters)
+                {
+                    if (param is TextureParameterValue) continue;
+
+                    if (param.PushConstantSlot < 0 && call.Material.Effect != null)
+                        param.PushConstantSlot = call.Material.Effect.GetPushConstantSlot(hash);
+
+                    int elemCount = param.GetElementCount();
+                    int elemStride = param.GetElementStride();
+                    if (elemCount == 0 || elemStride == 0) continue;
+
+                    if (!_perInstanceBuffers.TryGetValue(hash, out var pib))
+                    {
+                        pib = new PerInstanceBuffer
+                        {
+                            ParamHash = hash,
+                            PushConstantSlot = param.PushConstantSlot,
+                            ElementStride = elemStride,
+                            ElementsPerInstance = elemCount
+                        };
+                        _perInstanceBuffers[hash] = pib;
+                    }
+
+                    EnsureStaging(pib, index + 1);
+                    param.CopyToStaging(pib.StagingData, index * pib.ElementsPerInstance * pib.ElementStride);
+                }
+            }
+
+            var handle = new InstanceHandle(this, index);
+            _handles[index] = handle;
+            _persistentCount++;
+            return handle;
+        }
+
+        /// <summary>
+        /// Remove a persistent instance record (swap-remove: the last persistent record takes its place).
+        /// Main thread, before this frame's bucket merge.
+        /// </summary>
+        internal void RemovePersistent(InstanceHandle handle)
+        {
+            int index = handle.Index;
+            if (handle.Batch != this || index < 0 || index >= _persistentCount) return;
+
+            int last = _persistentCount - 1;
+            if (index != last)
+            {
+                _draws[index] = _draws[last];
+
+                foreach (var pib in _perInstanceBuffers.Values)
+                {
+                    int bytes = pib.ElementsPerInstance * pib.ElementStride;
+                    if (bytes == 0 || pib.StagingData.Length < (last + 1) * bytes) continue;
+                    Buffer.BlockCopy(pib.StagingData, last * bytes, pib.StagingData, index * bytes, bytes);
+                }
+
+                var moved = _handles[last]!;
+                moved.Index = index;
+                _handles[index] = moved;
+            }
+
+            _handles[last] = null;
+            _draws[last] = default;
+            _persistentCount--;
+            handle.Index = -1;
+        }
+
+        /// <summary>
+        /// Overwrite the bone buffer SRV index of a persistent record in place (CommandBuffer.SetBoneBuffer).
+        /// </summary>
+        internal unsafe void SetPersistentBoneBuffer(InstanceHandle handle, uint boneBufferIdx)
+        {
+            int index = handle.Index;
+            if (handle.Batch != this || index < 0 || index >= _persistentCount) return;
+            if (!_perInstanceBuffers.TryGetValue(DrawBucket.DescriptorsHash, out var pib)) return;
+
+            int offset = index * sizeof(InstanceDescriptor);
+            if (pib.StagingData.Length < offset + sizeof(InstanceDescriptor)) return;
+
+            fixed (byte* ptr = &pib.StagingData[offset])
+                ((InstanceDescriptor*)ptr)->BoneBufferIdx = boneBufferIdx;
+        }
+
+        private static void EnsureStaging(PerInstanceBuffer pib, int slots)
+        {
+            int required = slots * pib.ElementsPerInstance * pib.ElementStride;
+            if (pib.StagingData.Length < required)
+                Array.Resize(ref pib.StagingData, Math.Max(pib.StagingData.Length * 2, required));
+        }
+
+        private unsafe void WriteCore<T>(int hash, int stride, int index, T value) where T : unmanaged
+        {
+            if (!_perInstanceBuffers.TryGetValue(hash, out var pib))
+            {
+                pib = new PerInstanceBuffer
+                {
+                    ParamHash = hash,
+                    PushConstantSlot = -1, // Core data — bound by InstanceBatch, not shader
+                    ElementStride = stride,
+                    ElementsPerInstance = 1
+                };
+                _perInstanceBuffers[hash] = pib;
+            }
+
+            EnsureStaging(pib, index + 1);
+            fixed (byte* ptr = &pib.StagingData[index * stride])
+                *(T*)ptr = value;
+        }
+
+        #endregion
 
         /// <summary>
         /// Descriptor for a GPU-generated per-instance buffer channel.
@@ -340,6 +529,7 @@ namespace Freefall.Graphics
             DeferDisposeBuffers();
 
             Array.Resize(ref _draws, capacity);
+            Array.Resize(ref _handles, capacity);
 
             int slotSize = capacity * 4;
             int commandSize = MaxSubBatches * IndirectDrawSizes.IndirectCommandSize;

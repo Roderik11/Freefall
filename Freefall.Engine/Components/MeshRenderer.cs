@@ -1,9 +1,8 @@
 using System;
-using System.Numerics;
 using System.Collections.Generic;
 using Freefall.Graphics;
 using Freefall.Base;
-using Vortice.Mathematics;
+using Freefall.Reflection;
 
 namespace Freefall.Components
 {
@@ -19,60 +18,101 @@ namespace Freefall.Components
     }
 
 
+    /// <summary>
+    /// Draws a static mesh. The draws are GPU-resident (see PersistentRenderer): nothing runs per frame.
+    ///
+    /// Assigning Mesh, Material, Materials, ReplacementMaterial, Params or Enabled re-registers
+    /// automatically. Changing the contents of Materials in place (adding an override, editing one)
+    /// cannot be seen: call OnMemberChanged() afterwards. The inspector and the editor's
+    /// set-property commands already do.
+    /// </summary>
     [Icon("icon_mesh.png")]
-    public class MeshRenderer : Component, IDraw, IParallel
+    public class MeshRenderer : PersistentRenderer
     {
-        public Mesh? Mesh;
+        public Mesh? Mesh
+        {
+            get => _mesh;
+            set
+            {
+                if (_mesh == value) return;
+                _mesh = value;
+                Invalidate();
+            }
+        }
+        private Mesh? _mesh;
 
         /// <summary>
         /// Default material applied to all MeshParts (unless overridden).
         /// When null, only explicit MaterialOverrides render (mixed-mesh mode).
         /// </summary>
-        public Material? Material;
+        public Material? Material
+        {
+            get => _material;
+            set
+            {
+                if (_material == value) return;
+                _material = value;
+                Invalidate();
+            }
+        }
+        private Material? _material;
 
         /// <summary>
         /// Sparse per-slot material overrides. Only the slots that differ
         /// from the default need entries. MeshParts whose slot has no override
         /// and no default Material are invisible.
+        /// After changing the list's contents in place, call OnMemberChanged().
         /// </summary>
-        public List<MaterialOverride> Materials = [];
+        public List<MaterialOverride> Materials
+        {
+            get => _materials;
+            set
+            {
+                _materials = value;
+                Invalidate();
+            }
+        }
+        private List<MaterialOverride> _materials = [];
 
         /// <summary>
         /// When set, overrides ALL material routing (Material + Materials).
         /// Used for placement ghost mode. Not serialized.
         /// </summary>
-        [NonSerialized]
-        public Material? ReplacementMaterial;
-
-        public MaterialBlock Params = new();
-        [NonSerialized]
-        public BoundingSphere BoundingSphere;
-
-        private bool _boundsDirty = true;
-        private Mesh? _boundsMesh; // tracks which mesh instance bounds were computed from
-        private int _boundsVersion; // Mesh.GeometryVersion the bounds were computed from (hot reload)
-        private Vector3[] _boundsCorners = new Vector3[8];
-
-        protected override void Awake()
+        [DontSerialize]
+        public Material? ReplacementMaterial
         {
-            OnTransformChanged();
-            Transform.OnChanged += OnTransformChanged;
+            get => _replacementMaterial;
+            set
+            {
+                if (_replacementMaterial == value) return;
+                _replacementMaterial = value;
+                Invalidate();
+            }
         }
+        private Material? _replacementMaterial;
+
+        /// <summary>
+        /// Per-instance shader parameters. Their values are copied when the draws are registered;
+        /// the Set* methods re-register, mutating a value in place does not.
+        /// </summary>
+        public MaterialBlock Params
+        {
+            get => _params!;
+            set => SetParams(ref _params, value);
+        }
+        private MaterialBlock? _params;
+
+        public MeshRenderer()
+        {
+            Params = new MaterialBlock();
+        }
+
+        protected override Mesh? RenderMesh => _mesh;
 
         public override void Destroy()
         {
-            Transform.OnChanged -= OnTransformChanged;
-        }
-
-        void OnTransformChanged()
-        {
-            if (Mesh == null) { _boundsDirty = true; return; }
-
-            Mesh.BoundingBox.GetCorners(_boundsCorners, Mesh.RootRotation * Transform.WorldMatrix);
-            BoundingSphere = BoundingSphere.CreateFromPoints(_boundsCorners);
-            _boundsMesh = Mesh;
-            _boundsVersion = Mesh.GeometryVersion;
-            _boundsDirty = false;
+            base.Destroy();
+            if (_params != null) _params.Changed -= Invalidate;
         }
 
         /// <summary>
@@ -82,42 +122,31 @@ namespace Freefall.Components
         /// </summary>
         private Material? GetMaterial(int materialSlot)
         {
-            if (Materials != null)
+            if (_materials != null)
             {
-                for (int i = 0; i < Materials.Count; i++)
+                for (int i = 0; i < _materials.Count; i++)
                 {
-                    if (Materials[i].MaterialSlot == materialSlot)
-                        return ReplacementMaterial ?? Materials[i].Material;
+                    if (_materials[i].MaterialSlot == materialSlot)
+                        return _replacementMaterial ?? _materials[i].Material;
                 }
             }
 
-            return Material != null ? ReplacementMaterial ?? Material : null;
+            return _material != null ? _replacementMaterial ?? _material : null;
         }
 
-        public void Draw()
+        protected override void AddDraws(DrawGroup group, Mesh mesh, int transformSlot)
         {
-            if (!Enabled) return;
-            if (Mesh == null) return;
+            // LOD chain heads + non-LOD parts; the GPU culler resolves the LOD for each
+            var parts = mesh.DrawPartIndices;
+            var meshParts = mesh.MeshParts;
 
-            // Re-dirty bounds when the mesh reference changes (stub → loaded)
-            if (Mesh != _boundsMesh || Mesh.GeometryVersion != _boundsVersion) _boundsDirty = true;
-
-            if (_boundsDirty) OnTransformChanged();
-
-            if (Mesh.IsBelowCullSize(BoundingSphere)) return;
-
-            var slot = Transform.TransformSlot;
-
-            // LOD chain heads + non-LOD parts. The GPU culler picks the LOD and culls by screen size.
-            var parts = Mesh.DrawPartIndices;
-            var meshParts = Mesh.MeshParts;
             for (int i = 0; i < parts.Length; i++)
             {
                 int partIdx = parts[i];
                 if (partIdx >= meshParts.Count) continue;
                 var mat = GetMaterial(meshParts[partIdx].MaterialSlot);
                 if (mat != null)
-                    CommandBuffer.Enqueue(Mesh, partIdx, mat, Params, slot, lodManaged: true);
+                    CommandBuffer.AddPersistent(group, mesh, partIdx, mat, Params, transformSlot, lodManaged: true);
             }
         }
     }

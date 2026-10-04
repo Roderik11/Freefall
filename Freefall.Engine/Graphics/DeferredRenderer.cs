@@ -445,6 +445,8 @@ namespace Freefall.Graphics
              // This enqueues DrawShadows callback into ShadowMap pass AND opaque batches
              var drawTime = System.Diagnostics.Stopwatch.StartNew();
              ScriptExecution.Draw();
+             // Components with GPU-resident draws (no Draw()) update their registrations here
+             CommandBuffer.RefreshDrawSources();
              drawTime.Stop();
 
              // Upload transforms AFTER Draw() so per-frame SetTransform() calls

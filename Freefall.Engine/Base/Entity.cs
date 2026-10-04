@@ -125,6 +125,8 @@ namespace Freefall.Base
                 Transform = t;
             }
 
+            component.OnAttached();
+
             return component;
         }
 
@@ -218,6 +220,8 @@ namespace Freefall.Base
             var addMethod = cacheType.GetMethod("Add", BindingFlags.Public | BindingFlags.Static);
             addMethod?.Invoke(null, [this, component]);
 
+            component.OnAttached();
+
             return component;
         }
 
@@ -240,6 +244,7 @@ namespace Freefall.Base
 
             try
             {
+                component.IsDestroyed = true;
                 component.Destroy();
             }
             finally
@@ -299,7 +304,10 @@ namespace Freefall.Base
             }
 
             foreach (var component in _components)
+            {
+                component.IsDestroyed = true;
                 component.Destroy();
+            }
 
             // Unregister each component from its ComponentCache<T>
             foreach (var component in _components)

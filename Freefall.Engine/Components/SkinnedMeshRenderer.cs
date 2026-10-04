@@ -1,100 +1,112 @@
+using System.Collections.Generic;
 using Freefall.Base;
 using Freefall.Graphics;
-using System.Numerics;
-using Vortice.Mathematics;
-using static System.Net.WebRequestMethods;
 
 namespace Freefall.Components
 {
     /// <summary>
-    /// Renders skinned/animated meshes with bone transforms.
-    /// Bone buffer is set by the parent Animator — no per-SMR bone staging.
+    /// Renders skinned/animated meshes with bone transforms. The draws are GPU-resident
+    /// (see PersistentRenderer): nothing of this component runs per frame.
+    ///
+    /// The bone buffer is owned by the parent Animator. It is triple-buffered, so its SRV index
+    /// changes every frame; the Animator sets BoneBufferIdx after posing, which patches the index
+    /// into the registered draws in place instead of re-registering them.
+    ///
+    /// After changing the contents of Materials in place, call OnMemberChanged().
     /// </summary>
     [Icon("icon_skinnedmesh.png")]
-    public class SkinnedMeshRenderer : Component, IDraw
+    public class SkinnedMeshRenderer : PersistentRenderer
     {
-        public Mesh? Mesh;
-        public List<Material> Materials = new List<Material>();
-        public MaterialBlock Params = new MaterialBlock();
+        public Mesh? Mesh
+        {
+            get => _mesh;
+            set
+            {
+                if (_mesh == value) return;
+                _mesh = value;
+                Invalidate();
+            }
+        }
+        private Mesh? _mesh;
+
+        /// <summary>Material per MaterialSlot. After changing the list in place, call OnMemberChanged().</summary>
+        public List<Material> Materials
+        {
+            get => _materials;
+            set
+            {
+                _materials = value;
+                Invalidate();
+            }
+        }
+        private List<Material> _materials = new List<Material>();
 
         /// <summary>
-        /// Per-Animator bone buffer SRV index. Set by Animator.Update() each frame.
+        /// Per-instance shader parameters. Their values are copied when the draws are registered;
+        /// the Set* methods re-register, mutating a value in place does not.
+        /// </summary>
+        public MaterialBlock Params
+        {
+            get => _params!;
+            set => SetParams(ref _params, value);
+        }
+        private MaterialBlock? _params;
+
+        /// <summary>
+        /// Per-Animator bone buffer SRV index for the current frame. Set by Animator.Update() each frame.
         /// 0 = no bones (fallback to bind pose).
         /// </summary>
-        internal uint BoneBufferIdx;
-
-        [NonSerialized]
-        public BoundingSphere BoundingSphere;
-
-        private bool _boundsDirty = true;
-        private Mesh? _boundsMesh; // tracks which mesh instance bounds were computed from
-        private int _boundsVersion; // Mesh.GeometryVersion the bounds were computed from (hot reload)
-        private Vector3[] _boundsCorners = new Vector3[8];
-
-        protected override void Awake()
+        internal uint BoneBufferIdx
         {
-            OnTransformChanged();
-            Transform?.OnChanged += OnTransformChanged;
+            get => _boneBufferIdx;
+            set
+            {
+                if (_boneBufferIdx == value) return;
+                _boneBufferIdx = value;
+
+                // Patch the registered draws; a pending registration picks the value up in AddDraws
+                var draws = Draws;
+                if (draws != null)
+                    CommandBuffer.SetBoneBuffer(draws, value);
+            }
         }
+        private uint _boneBufferIdx;
+
+        public SkinnedMeshRenderer()
+        {
+            Params = new MaterialBlock();
+        }
+
+        protected override Mesh? RenderMesh => _mesh;
 
         public override void Destroy()
         {
-            Transform?.OnChanged -= OnTransformChanged;
+            base.Destroy();
+            if (_params != null) _params.Changed -= Invalidate;
         }
 
-        void OnTransformChanged()
+        private Material? GetMaterial(int materialSlot)
         {
-            if (Mesh == null) { _boundsDirty = true; return; }
+            if (_materials != null && _materials.Count > materialSlot)
+                return _materials[materialSlot];
 
-            Mesh.BoundingBox.GetCorners(_boundsCorners, Mesh.RootRotation * Transform.WorldMatrix);
-            BoundingSphere = BoundingSphere.CreateFromPoints(_boundsCorners);
-            _boundsMesh = Mesh;
-            _boundsVersion = Mesh.GeometryVersion;
-            _boundsDirty = false;
+            return null;
         }
 
-        public void Draw()
+        protected override void AddDraws(DrawGroup group, Mesh mesh, int transformSlot)
         {
-            if (!Enabled) return;
-            if (Mesh == null) return;
-            if (Materials == null || Materials.Count == 0) return;
+            // LOD chain heads + non-LOD parts; the GPU culler resolves the LOD for each
+            var parts = mesh.DrawPartIndices;
+            var meshParts = mesh.MeshParts;
 
-            // Re-dirty bounds when the mesh reference changes (stub → loaded)
-            if (Mesh != _boundsMesh || Mesh.GeometryVersion != _boundsVersion) _boundsDirty = true;
-
-            if (_boundsDirty) OnTransformChanged();
-
-            if (Mesh.IsBelowCullSize(BoundingSphere)) return;
-
-            var slot = Transform.TransformSlot;
-
-            // LOD chain heads + non-LOD parts. The GPU culler picks the LOD and culls by screen size.
-            var parts = Mesh.DrawPartIndices;
-            var meshParts = Mesh.MeshParts;
             for (int i = 0; i < parts.Length; i++)
             {
                 int partIdx = parts[i];
                 if (partIdx >= meshParts.Count) continue;
                 var mat = GetMaterial(meshParts[partIdx].MaterialSlot);
                 if (mat != null)
-                    CommandBuffer.Enqueue(Mesh, partIdx, mat, Params, slot, BoneBufferIdx, lodManaged: true);
+                    CommandBuffer.AddPersistent(group, mesh, partIdx, mat, Params, transformSlot, _boneBufferIdx, lodManaged: true);
             }
-        }
-
-        /// <summary>
-        /// Resolve material for a MeshPart by its MaterialSlot.
-        /// Checks sparse overrides first, falls back to default Material.
-        /// When Material is null, unmatched slots are invisible (mixed-mesh mode).
-        /// </summary>
-        private Material? GetMaterial(int materialSlot)
-        {
-            if (Materials != null)
-            {
-                if (Materials.Count > materialSlot)
-                    return Materials[materialSlot];
-            }
-
-            return null;
         }
     }
 }

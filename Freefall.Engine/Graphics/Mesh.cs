@@ -143,22 +143,6 @@ namespace Freefall.Graphics
         }
 
         /// <summary>
-        /// CPU early-out for renderers that still enqueue every frame: true if the sphere is below
-        /// LODCullScreenSize for Camera.Main. The GPU culler applies the same test (MeshPartLod.CullK);
-        /// this only saves the enqueue and the per-instance upload for objects it would reject anyway.
-        /// Squared space, no sqrt or division. Goes away once draws are GPU-resident.
-        /// </summary>
-        public static bool IsBelowCullSize(in BoundingSphere sphere)
-        {
-            var cam = Components.Camera.Main;
-            if (cam == null) return false;
-
-            float distanceSq = Vector3.DistanceSquared(sphere.Center, cam.Position);
-            float scale = Engine.Settings.LODScale;
-            return sphere.Radius * sphere.Radius * cam.FoVFactor * scale * scale < LODCullScreenSizeSq * distanceSq;
-        }
-
-        /// <summary>
         /// Part indices a renderer submits each frame: the head of every LOD chain plus the non-LOD
         /// parts (all parts if the mesh has no LOD chain). LOD selection happens on the GPU: the
         /// culling pass walks from each head to the part of the active LOD (see MeshRegistry.MeshPartLod).
@@ -192,6 +176,7 @@ namespace Freefall.Graphics
         private void ComputeLODChain()
         {
             int partCount = MeshParts.Count;
+            bool hadDrawParts = _drawPartIndices != null;
 
             if (LODs.Count == 0)
             {
@@ -199,6 +184,7 @@ namespace Freefall.Graphics
                 var all = new int[partCount];
                 for (int i = 0; i < partCount; i++) all[i] = i;
                 _drawPartIndices = all;
+                if (hadDrawParts) DrawPartsChanged?.Invoke(this);
                 return;
             }
 
@@ -258,7 +244,15 @@ namespace Freefall.Graphics
             _partLodLast = last;
             _partLodNext = next;
             _drawPartIndices = draw.ToArray();
+            if (hadDrawParts) DrawPartsChanged?.Invoke(this);
         }
+
+        /// <summary>
+        /// Raised when the DrawPartIndices or geometry of an already-used mesh change (hot reload,
+        /// rebuilt LOD chain, runtime mesh whose part count changed). Renderers with GPU-resident
+        /// draws re-register; there is no per-frame check that would notice otherwise.
+        /// </summary>
+        public static event Action<Mesh>? DrawPartsChanged;
 
         /// <summary>
         /// LOD data for one part's MeshRegistry entry. Distances are stored as "k" values:
@@ -684,6 +678,7 @@ namespace Freefall.Graphics
                 MeshRegistry.Unregister(this, MeshParts.Count);
 
             GeometryVersion++;
+            DrawPartsChanged?.Invoke(this);
             Engine.Device.DeferDispose(source);
         }
 

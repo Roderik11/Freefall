@@ -11,7 +11,8 @@ namespace Freefall.Editor
         {
             var cat = AddCategory(target.Name);
 
-            bool needsCheckbox = typeof(IUpdate).IsAssignableFrom(target.Type) || typeof(IDraw).IsAssignableFrom(target.Type);
+            bool needsCheckbox = typeof(IUpdate).IsAssignableFrom(target.Type) || typeof(IDraw).IsAssignableFrom(target.Type)
+                || typeof(Freefall.Graphics.IPersistentDrawSource).IsAssignableFrom(target.Type);
 
             if (needsCheckbox)
             {

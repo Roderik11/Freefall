@@ -48,3 +48,5 @@ dotnet-tools.json
 
 # Scripts (local dev tools)
 Scripts/
+/Tools/BlenderKits
+/Tools/RetargetLab
