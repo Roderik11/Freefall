@@ -207,6 +207,25 @@ namespace Freefall.Graphics
                 buf.Dirty = _persistentCount > 0;
         }
 
+        /// <summary>
+        /// Mark the batch as having nothing to draw this frame. Called for every batch that was not
+        /// activated in a frame. The shadow pass walks ALL batches of the opaque pass, active or not
+        /// (CommandBuffer.GetAllBatches), guarded only by SubBatchCount; without this an inactive
+        /// batch keeps the instance count and GPU buffers of the last frame it was active in, and the
+        /// shadow pass draws those stale records: instances of destroyed entities, pointing at
+        /// released bone buffers, transform slots and mesh buffers (GPU device removed).
+        /// </summary>
+        public void Deactivate()
+        {
+            // Engine.FrameIndex is the back buffer index and repeats every few frames, so a stale
+            // _activeFrame could otherwise match again and make the batch look already activated.
+            _activeFrame = -1;
+            _drawCount = 0;
+            SubBatchCount = 0;
+            _uniqueMeshPartIds.Clear();
+            _isGPUSourced = false;
+        }
+
         #region Persistent instances (GPU-resident draws)
 
         /// <summary>
@@ -762,7 +781,7 @@ namespace Freefall.Graphics
         {
             var camera = Components.Camera.Main;
             Vector3 position = default;
-            float factor = 0f; // 0 = LOD selection off (chain heads are drawn as-is)
+            float factor = 0f; // 0 = no valid camera: LOD-managed instances are not drawn this frame
             if (camera != null)
             {
                 float scale = Engine.Settings.LODScale;

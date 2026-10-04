@@ -189,6 +189,9 @@ namespace Freefall
             // reimport). Before Update/Draw so the whole frame sees the new data.
             Assets?.ReloadReimported();
 
+            // Recompile shaders whose .fx/.hlsl file changed on disk (same point: nothing is recording yet)
+            Graphics.ShaderHotReload.Update();
+
             // Flush pending entity additions before Update/Render
             //var _flushPendingSw = System.Diagnostics.Stopwatch.StartNew();
             //Base.EntityManager.FlushPending();
@@ -202,7 +205,17 @@ namespace Freefall
             
             // Update Logic
             var _updateSw = System.Diagnostics.Stopwatch.StartNew();
-            Update();
+            try
+            {
+                Update();
+            }
+            catch when (!Device.IsDeviceLost && Device.NativeDevice.DeviceRemovedReason.Failure)
+            {
+                // A component creating GPU resources in Update is often the first to notice a removed
+                // device. Write the reason (+ DRED) before the exception takes the process down.
+                Device.LogDeviceRemoved("Engine.Update");
+                throw;
+            }
             _updateSw.Stop();
 
             // --- Process all deferred resizes before rendering ---

@@ -76,6 +76,33 @@ namespace Freefall.Graphics
         }
 
         public bool DredEnabled { get; private set; }
+        public bool DebugLayerEnabled { get; private set; }
+
+        /// <summary>
+        /// Print the D3D12 validation messages recorded so far (errors and corruption only) to stdout and
+        /// clear them. No-op unless the debug layer is on (FREEFALL_D3DDEBUG=1).
+        /// </summary>
+        public void DumpDebugMessages(string where)
+        {
+            if (!DebugLayerEnabled) return;
+            try
+            {
+                using var queue = _device.QueryInterfaceOrNull<ID3D12InfoQueue>();
+                if (queue == null) return;
+
+                ulong count = queue.NumStoredMessages;
+                int printed = 0;
+                for (ulong i = 0; i < count && printed < 40; i++)
+                {
+                    var message = queue.GetMessage(i);
+                    if (message.Severity != MessageSeverity.Error && message.Severity != MessageSeverity.Corruption) continue;
+                    Console.WriteLine($"[D3D12 {message.Severity}] ({where}) {message.Id}: {message.Description}");
+                    printed++;
+                }
+                queue.ClearStoredMessages();
+            }
+            catch (Exception ex) { Console.WriteLine($"[D3D12] message dump failed: {ex.Message}"); }
+        }
         private bool _deviceRemovedLogged;
 
         /// <summary>
@@ -163,6 +190,16 @@ namespace Freefall.Graphics
             //     debug.Dispose();
             // }
             
+            // Debug layer (opt-in: FREEFALL_D3DDEBUG=1). Slow, and can itself cause a TDR on heavy scene loads, so it
+            // is for hunting an invalid command (a command list that fails to Close, a device removal without a
+            // page fault): DumpDebugMessages prints what the validation layer recorded. Must precede device creation.
+            DebugLayerEnabled = Environment.GetEnvironmentVariable("FREEFALL_D3DDEBUG") == "1";
+            if (DebugLayerEnabled && D3D12GetDebugInterface(out ID3D12Debug? debugLayer).Success && debugLayer != null)
+            {
+                debugLayer.EnableDebugLayer();
+                debugLayer.Dispose();
+            }
+
             // DRED (opt-in: FREEFALL_DRED=1): records auto-breadcrumbs + page-fault allocations so a device removal
             // can be traced to the faulting resource / command list (see LogDeviceRemoved). Must precede device creation.
             DredEnabled = Environment.GetEnvironmentVariable("FREEFALL_DRED") == "1";

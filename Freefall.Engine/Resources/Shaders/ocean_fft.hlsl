@@ -172,12 +172,14 @@ void CSAssembleMaps(uint3 id : SV_DispatchThreadID)
 
         // Temporal foam accumulation
         float foam = displacementTex[uint3(id.xy, i)].a;
-        foam *= exp(-oc.FoamDecayRate);
+        // Rates are authored per frame at 60 fps; scale by real time so foam lifetime is framerate independent
+        float foamStep = oc.DeltaTime * 60.0;
+        foam *= exp(-oc.FoamDecayRate * foamStep);
         foam = saturate(foam);
 
         float biasedJacobian = max(0.0f, -(jacobian - oc.FoamBias));
         if (biasedJacobian > oc.FoamThreshold)
-            foam += oc.FoamAdd * biasedJacobian;
+            foam += oc.FoamAdd * biasedJacobian * foamStep;
 
         // Write output
         displacementTex[uint3(id.xy, i)] = float4(displacement, foam);

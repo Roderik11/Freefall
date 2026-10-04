@@ -456,6 +456,14 @@ namespace Freefall.Graphics
                         activeBatches.Add(batch);
                 }
                 
+                // Batches with nothing to draw this frame must not keep last frame's instance count:
+                // the shadow pass walks all batches, not only the active ones.
+                foreach (var batch in allBatches)
+                {
+                    if (batch._activeFrame != Engine.FrameIndex)
+                        batch.Deactivate();
+                }
+
                 batchingSw.Stop();
 
                 // GPU culling requires Culler to be initialized
@@ -669,6 +677,7 @@ namespace Freefall.Graphics
             public DrawCall Call; // Add only
         }
 
+        private static int _lastFlushTick = -1;
         private static readonly List<PersistentOp> _persistentOps = new();
         private static readonly Lock _persistentLock = new();
 
@@ -762,10 +771,19 @@ namespace Freefall.Graphics
 
         /// <summary>
         /// Apply queued persistent adds/removes in order. Main thread, called at the start of every
-        /// pass execution, so the batches of all passes are up to date before any is merged or culled.
+        /// pass execution but only acting on the first one per tick, so the batches of all passes are
+        /// up to date before any is merged or culled and then stay fixed for the frame.
         /// </summary>
         private static void FlushPersistent()
         {
+            // Once per tick, at the first pass that executes. Batches must not change after that:
+            // the passes of a frame share them (the shadow pass culls the opaque pass's batches), and
+            // an add can grow a batch, which disposes and re-creates its GPU buffers. Doing that after
+            // the batch was culled would leave the shadow pass recording commands on null buffers.
+            // Requests queued mid-frame wait for the next one.
+            if (_lastFlushTick == Engine.TickCount) return;
+            _lastFlushTick = Engine.TickCount;
+
             RefreshDrawSources();
 
             lock (_persistentLock)

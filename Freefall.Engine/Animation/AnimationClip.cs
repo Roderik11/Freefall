@@ -56,9 +56,12 @@ namespace Freefall.Animation
         {
             if (_channelLookup != null) return;
 
-            _channelLookup = new Dictionary<int, int>(_channels.Count);
+            // Animators update in parallel and share clips: publish the dictionary only once it is
+            // complete, so another thread never reads it while it is still being filled.
+            var lookup = new Dictionary<int, int>(_channels.Count);
             for (int i = 0; i < _channels.Count; i++)
-                _channelLookup[_channels[i].Hash] = i;
+                lookup[_channels[i].Hash] = i;
+            _channelLookup = lookup;
         }
 
         /// <summary>

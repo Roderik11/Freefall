@@ -348,15 +348,12 @@ namespace Freefall.Graphics
             _compiled = true;
 
             // Resolve shader path
-            string resourcesPath = Path.Combine(AppContext.BaseDirectory, "Resources", "Shaders");
-            string fullPath = Path.Combine(resourcesPath, _filename);
+            string fullPath = ShaderHotReload.ResolvePath(_filename)
+                ?? throw new FileNotFoundException($"Compute shader not found: {_filename}");
 
-            if (!File.Exists(fullPath))
-            {
-                fullPath = Path.Combine(AppContext.BaseDirectory, _filename);
-                if (!File.Exists(fullPath))
-                    throw new FileNotFoundException($"Compute shader not found: {_filename}");
-            }
+            _fullPath = fullPath;
+            Dependencies = ShaderHotReload.CollectDependencies(fullPath);
+            ShaderHotReload.Register(this);
 
             _basePath = Path.GetDirectoryName(fullPath);
             _cachedSource = File.ReadAllText(fullPath);
@@ -371,6 +368,77 @@ namespace Freefall.Graphics
                 CompileKernel(name);
 
             _cachedSource = null;  // Free source after all kernels compiled
+        }
+
+        // ────────────── Hot reload ──────────────
+
+        private string? _fullPath;
+
+        internal string FileName => _filename;
+
+        /// <summary>The shader file and everything it includes (full paths). Null until first use.</summary>
+        internal HashSet<string>? Dependencies { get; private set; }
+
+        /// <summary>
+        /// Recompile from disk (ShaderHotReload, main thread between frames). Kernel indices and the
+        /// push constant values already set stay valid: PSOs are replaced in place, kernels that are new
+        /// in the file are appended. Throws, leaving everything untouched, when the source does not compile.
+        /// Returns false when there was nothing to do (not compiled yet / disposed).
+        /// </summary>
+        internal bool Reload()
+        {
+            if (!_compiled || _disposed || _fullPath == null) return false;
+
+            string source = File.ReadAllText(_fullPath);
+            var kernelNames = KernelParser.ParseKernels(source);
+            if (kernelNames.Count == 0 && _defaultEntryPoint != null)
+                kernelNames.Add(_defaultEntryPoint);
+
+            // Compile everything first: a failure must not leave half the kernels swapped
+            var device = Engine.Device;
+            var compiled = new List<(string name, ID3D12PipelineState pso, Shader shader)>();
+            try
+            {
+                foreach (var name in kernelNames)
+                {
+                    var shader = new Shader(source, name, "cs_6_6", _basePath);
+                    compiled.Add((name, device.CreateComputePipelineState(shader.Bytecode), shader));
+                }
+            }
+            catch
+            {
+                foreach (var c in compiled) { c.pso.Dispose(); c.shader.Dispose(); }
+                throw;
+            }
+
+            _resourceSlots.Clear();
+            _isUAV.Clear();
+
+            foreach (var (name, pso, shader) in compiled)
+            {
+                if (shader.Reflection != null)
+                {
+                    DiscoverPushConstants(shader.Reflection);
+                    DiscoverConstantBuffers(shader.Reflection, onlyNew: true);
+                }
+                shader.Dispose();
+
+                int index = _kernels.FindIndex(k => k.Name == name);
+                if (index >= 0)
+                {
+                    var kernel = _kernels[index];
+                    device.DeferDispose(kernel.PSO);   // frames in flight may still use it
+                    kernel.PSO = pso;
+                    _kernels[index] = kernel;
+                }
+                else
+                {
+                    _kernels.Add(new Kernel { Name = name, PSO = pso, Constants = new uint[MaxPushConstants] });
+                }
+            }
+
+            Dependencies = ShaderHotReload.CollectDependencies(_fullPath);
+            return true;
         }
 
         private void CompileKernel(string entryPoint)
@@ -439,7 +507,7 @@ namespace Freefall.Graphics
         /// <summary>
         /// Discover and create constant buffers from reflection (excluding PushConstants and externally managed b0-b2).
         /// </summary>
-        private void DiscoverConstantBuffers(ID3D12ShaderReflection reflection)
+        private void DiscoverConstantBuffers(ID3D12ShaderReflection reflection, bool onlyNew = false)
         {
             var device = Engine.Device;
 
@@ -447,6 +515,7 @@ namespace Freefall.Graphics
             {
                 var cbReflection = reflection.GetConstantBufferByIndex(i);
                 if (cbReflection.Description.Name == "PushConstants") continue;
+                if (onlyNew && _constantBuffers.ContainsKey(cbReflection.Description.Name)) continue;
 
                 var bindDesc = reflection.GetResourceBindingDescByName(cbReflection.Description.Name);
 

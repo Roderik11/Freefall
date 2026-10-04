@@ -387,8 +387,18 @@ namespace Freefall.Graphics
             var cmd = _commandLists[_frameIndex];
             cmd.ResourceBarrierTransition(_renderTargets[_frameIndex], ResourceStates.RenderTarget, ResourceStates.Present);
 
-            cmd.Close();
+            try
+            {
+                cmd.Close();
+            }
+            catch
+            {
+                // Close fails when an invalid command was recorded this frame; the debug layer knows which
+                _graphicsDevice.DumpDebugMessages("RenderView.Present/Close");
+                throw;
+            }
             _graphicsDevice.SubmitCommandList(cmd.Native);
+            _graphicsDevice.DumpDebugMessages("frame");
 
             // Tearing support check
             uint syncInterval = Engine.Settings.VSync ? 1u : 0u;

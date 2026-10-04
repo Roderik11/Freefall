@@ -135,14 +135,29 @@ namespace Freefall.Components
         public Color3 ShallowColor = new Color3(0.4f, 0.75f, 0.7f);
 
         [ValueRange(1f, 30f)]
-        [Description(@"Linear depth range in meters for PS shore effects.
-         Controls how wide the soft intersection and shallow color zones are")]
+        [Description(@"Underwater visibility in meters.
+         At this much water the seabed is tinted by ShallowColor and mostly faded out")]
         public float ShoreFadeDepth = 8f;
 
         [ValueRange(0f, 0.1f)]
         [Description(@"Refraction distortion strength for terrain show-through.
          How much the wave normal bends the view of the seabed")]
         public float RefractionStrength = 0.02f;
+
+        [ValueRange(0.5f, 10f)]
+        [Description(@"Water depth in meters below which foam bands roll in toward the beach.
+         Larger values start the swash further out")]
+        public float ShoreFoamDepth = 2.5f;
+
+        [ValueRange(0f, 1f)]
+        [Description(@"Amount of shore foam: swash bands plus the lace along the waterline
+         and around objects standing in the water")]
+        public float ShoreFoam = 0.8f;
+
+        [ValueRange(0f, 0.5f)]
+        [Description(@"How far the water level rises and falls at the beach, in meters, in step with the foam bands.
+         Makes the waterline travel up and down the sand; on a flat beach a few centimeters go a long way")]
+        public float ShoreSurge = 0.1f;
 
         [Category("Spectrum")]
         public List<SpectrumBand> Bands = CreateDefaultBands();
@@ -197,8 +212,10 @@ namespace Freefall.Components
             public uint NoiseSRV;
             public float InvViewportWidth;
             public float InvViewportHeight;
-            public Vector3 HorizonSkyColor;
-            public float _pad3;
+            public Vector3 CloudColor;
+            public float ShoreFoamDepth;
+            public float ShoreFoam;
+            public float ShoreSurge;
         }
 
         private const int GridSize = 128;
@@ -454,60 +471,14 @@ namespace Freefall.Components
                 NoiseSRV = _oceanFFT.NoiseSRV,
                 InvViewportWidth = 1.0f / MathF.Max(1, DeferredRenderer.Current?.DepthGBuffer?.Native.Description.Width ?? 1920),
                 InvViewportHeight = 1.0f / MathF.Max(1, DeferredRenderer.Current?.DepthGBuffer?.Native.Description.Height ?? 1080),
-                HorizonSkyColor = ComputeHorizonSkyColor(sunDir),
+                CloudColor = SkyboxRenderer.CurrentCloudColor,
+                ShoreFoamDepth = ShoreFoamDepth,
+                ShoreFoam = ShoreFoam,
+                ShoreSurge = ShoreSurge,
             });
 
 
             CommandBuffer.Enqueue(_mesh, _material, _params, Transform.TransformSlot);
-        }
-
-        /// <summary>
-        /// CPU port of HLSL GetSkyColor(float3(0, 0.15, 1), -sunDir).
-        /// Precomputed per-frame instead of per-pixel.
-        /// </summary>
-        private static Vector3 ComputeHorizonSkyColor(Vector3 sunDir)
-        {
-            Vector3 viewDir = new(0f, 0.15f, 1f);
-            Vector3 negSunDir = -sunDir;
-
-            float horizon = MathF.Abs(viewDir.Y);
-
-            Vector3 dayZenith = new(0.2f, 0.5f, 1.0f);
-            Vector3 dayHorizon = new(0.6f, 0.8f, 1.0f);
-            Vector3 sunsetZenith = new(0.4f, 0.3f, 0.6f);
-            Vector3 sunsetHorizon = new(1.0f, 0.5f, 0.3f);
-            Vector3 nightZenith = new(0.01f, 0.01f, 0.05f);
-            Vector3 nightHorizon = new(0.05f, 0.05f, 0.1f);
-
-            float sunElev = negSunDir.Y;
-            float dayF = Math.Clamp((sunElev - 0f) / 0.8f, 0, 1);
-            dayF = MathF.Pow(dayF, 0.7f);
-
-            float sunsetF = 0f;
-            if (sunElev < 0.15f && sunElev > -0.2f)
-            {
-                sunsetF = 1f - MathF.Abs((sunElev + 0.025f) / 0.175f);
-                sunsetF = MathF.Max(0f, sunsetF);
-            }
-
-            float nightF = Math.Clamp((-sunElev - 0.15f) / 0.3f, 0, 1);
-
-            float total = dayF + sunsetF + nightF;
-            if (total > 0f) { dayF /= total; sunsetF /= total; nightF /= total; }
-
-            Vector3 zenith = dayZenith * dayF + sunsetZenith * sunsetF + nightZenith * nightF;
-            Vector3 horiz = dayHorizon * dayF + sunsetHorizon * sunsetF + nightHorizon * nightF;
-
-            float t = MathF.Pow(horizon, 0.5f);
-            Vector3 sky = Vector3.Lerp(horiz, zenith, t);
-
-            float sunAngle = Vector3.Dot(viewDir, negSunDir);
-            float horizScatter = MathF.Pow(1f - horizon, 3f);
-            float sunScatter = MathF.Pow(Math.Clamp(sunAngle, 0, 1), 3f);
-            float scatter = (horizScatter + sunScatter * 0.5f) * Math.Clamp(dayF + sunsetF * 0.5f, 0, 1);
-            sky += new Vector3(1f, 0.8f, 0.6f) * scatter * 0.3f;
-
-            return sky;
         }
 
         private static Mesh CreateOceanGrid(GraphicsDevice device, int gridSize)

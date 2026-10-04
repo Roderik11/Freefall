@@ -258,6 +258,26 @@ namespace Freefall.Graphics
             }
         }
 
+        /// <summary>
+        /// Copy the current values of every variable that also exists in <paramref name="other"/>
+        /// (matched by name, sizes must agree). Used when a material is rebuilt after a shader hot
+        /// reload so values that are only set once survive a changed cbuffer layout.
+        /// </summary>
+        public void CopyValuesFrom(ConstantBuffer other)
+        {
+            foreach (var p in _parameterList)
+            {
+                foreach (var q in other._parameterList)
+                {
+                    if (q.Name != p.Name) continue;
+                    if (q.Size == p.Size && q.Offset + q.Size <= other._size && p.Offset + p.Size <= _size)
+                        other._shadowBuffer.AsSpan(q.Offset, q.Size).CopyTo(_shadowBuffer.AsSpan(p.Offset));
+                    break;
+                }
+            }
+            for (int i = 0; i < CommandBuffer.FrameCount; i++) _isDirty[i] = true;
+        }
+
         public void SetParameter<T>(string name, T value) where T : unmanaged
         {
              SetParameter(name.GetHashCode(), value);

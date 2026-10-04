@@ -301,6 +301,8 @@ namespace Freefall.Graphics
             
             InitMaterialProperties();
             InitFromEffect(effect, device);
+
+            lock (_liveMaterials) _liveMaterials.Add(new WeakReference<Material>(this));
         }
         
         private void InitMaterialProperties()
@@ -355,6 +357,65 @@ namespace Freefall.Graphics
             EffectChanged?.Invoke(this);
 
             //Debug.Log($"[Material] Switched '{Name}' to effect '{effect.Name}'");
+        }
+
+        // Every effect-based material, so shader hot reload can rebuild their pipeline states
+        private static readonly List<WeakReference<Material>> _liveMaterials = new();
+
+        /// <summary>
+        /// Rebuild every live material whose effect is named <paramref name="effectName"/> after that
+        /// effect was recompiled (ShaderHotReload). Main thread, between frames. Returns the count.
+        /// </summary>
+        internal static int RebuildForEffect(string effectName)
+        {
+            var targets = new List<Material>();
+            lock (_liveMaterials)
+            {
+                for (int i = _liveMaterials.Count - 1; i >= 0; i--)
+                {
+                    if (!_liveMaterials[i].TryGetTarget(out var m)) { _liveMaterials.RemoveAt(i); continue; }
+                    if (m._effect != null && m._effect.Name == effectName) targets.Add(m);
+                }
+            }
+
+            foreach (var m in targets)
+                m.RebuildFromEffect();
+            return targets.Count;
+        }
+
+        /// <summary>
+        /// Same as SetEffect for an effect whose shaders changed underneath it: new PSOs and constant
+        /// buffers, keeping textures, bindless indices and the values already written to the buffers.
+        /// Old GPU objects may still be referenced by frames in flight, so they are released deferred.
+        /// </summary>
+        private void RebuildFromEffect()
+        {
+            var device = Freefall.Engine.Device;
+            var effect = _effect;
+
+            var oldBuffers = new Dictionary<string, ConstantBuffer>(_constantBuffers);
+            // Only the native PSO: PipelineState.Dispose() also releases its root signature, which here
+            // is the device's shared GlobalRootSignature (disposing it crashes the next draw).
+            foreach (var pso in _passPipelineStates.Values) device.DeferDispose(pso.Native);
+            foreach (var pso in _passWireframePSOs.Values) device.DeferDispose(pso.Native);
+
+            _constantBuffers.Clear();
+            _passPipelineStates.Clear();
+            _passWireframePSOs.Clear();
+            _subShaders.Clear();
+            _textureParameters.Clear();
+            _textureSlots.Clear();
+
+            InitFromEffect(effect, device);
+
+            foreach (var (name, cb) in _constantBuffers)
+            {
+                if (oldBuffers.TryGetValue(name, out var oldCb))
+                    cb.CopyValuesFrom(oldCb);
+            }
+            foreach (var cb in oldBuffers.Values) device.DeferDispose(cb);
+
+            EffectChanged?.Invoke(this);
         }
 
         /// <summary>

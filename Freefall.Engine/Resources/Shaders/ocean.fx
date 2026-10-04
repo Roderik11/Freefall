@@ -73,8 +73,10 @@ struct OceanData
     float RefractionStrength; // how much normal distorts terrain show-through
     uint NoiseSRV;              // bindless SRV for noise texture (Perlin+Worley)
     float2 InvViewportSize;     // 1.0 / viewport dimensions (replaces GetDimensions)
-    float3 HorizonSkyColor;     // precomputed GetSkyColor at horizon direction
-    float _pad3;
+    float3 CloudColor;          // SkyboxRenderer.CurrentCloudColor (clouds in the sky reflection)
+    float ShoreFoamDepth;       // water depth (meters) below which swash foam bands roll in
+    float ShoreFoam;            // shore foam amount (0 = none)
+    float ShoreSurge;           // water level swing (meters) at the beach, in step with the swash bands
 };
 
 // Tessellation params
@@ -121,6 +123,85 @@ bool CullTriangle(float3 p0, float3 p1, float3 p2)
 }
 
 SamplerState OceanSampler : register(s0);
+
+// ── Shore waves: one event per wave, shared by the DS (water level) and the PS (foam) ──
+//
+// Each wave is a foam front that crosses the swash zone (still-water depth ShoreFoamDepth → 0) in
+// exactly one cycle, so there is one front in the zone at a time. The water level bottoms out at
+// -ShoreSurge, which puts the retreated waterline at still depth = ShoreSurge. The surge cycle is
+// offset so the run-up starts at the moment the front gets there: the front becomes the run-up.
+//
+//   ShoreClock  = cycles elapsed; the front of wave m is at still depth D * (m - ShoreClock)
+//   SurgeClock  = ShoreClock shifted so that frac() == 0 is "front meets the retreated waterline"
+//   frac(SurgeClock): 0..SurgeRise = run-up, SurgeRise..1 = backwash (0.5 would be symmetric)
+static const float SurgeRise = 0.38;
+
+float ShoreClock(float waveTime, float bandNoise)
+{
+    return waveTime * 0.22 + bandNoise * 1.5;   // noise staggers the waves along the coast
+}
+
+float SurgeClock(float shoreClock, float shoreSurge, float shoreFoamDepth)
+{
+    return shoreClock + shoreSurge / max(0.1, shoreFoamDepth);
+}
+
+float2 Hash22(float2 p)
+{
+    p = float2(dot(p, float2(127.1, 311.7)), dot(p, float2(269.5, 183.3)));
+    return frac(sin(p) * 43758.5453);
+}
+
+// Animated cellular noise for foam webs. Returns (F2 - F1, F1): x is 0 on the border between two
+// cells and grows toward the cell centers; y is the distance to the nearest center, largest where
+// several cells meet (used to thicken the knots). The feature points orbit with time, so the web
+// shifts and reconnects in place. The cells are stretched along flowDir through the distance metric
+// only — the grid itself stays world-aligned, so a flow direction that changes across the beach
+// cannot shear the pattern. On its own this is straight-edged Voronoi: warp the input to bend it.
+// drop (0..~0.65) is the fraction of points retired: raise it over the foam's life to make the cells grow.
+float2 FoamWeb(float2 x, float2 flowDir, float stretch, float time, float drop)
+{
+    float2 cell = floor(x);
+    float2 f = frac(x);
+    float d1 = 64.0, d2 = 64.0;
+
+    [unroll]
+    for (int j = -2; j <= 2; ++j)
+    {
+        [unroll]
+        for (int i = -2; i <= 2; ++i)
+        {
+            float2 g = float2(i, j);
+            float2 h = Hash22(cell + g);
+
+            float2 o = 0.5 + 0.48 * sin(time + 6.2831853 * h);
+            float2 r = g + o - f;
+
+            float along = dot(r, flowDir);
+            float2 rr = (r - flowDir * along) + flowDir * (along / stretch);
+            float d = dot(rr, rr);
+
+            // Each point retires once 'drop' passes its own random threshold. Its distance is pushed
+            // out gradually, so its cell shrinks away and the neighbours grow into the space — cells
+            // of very different sizes, and a web that coarsens smoothly as drop rises (no popping,
+            // and no zooming of the pattern, which would make it slide across the beach).
+            float retire = frac(h.x * 13.7 + h.y * 91.3);
+            float gone = smoothstep(retire - 0.1, retire + 0.1, drop);
+            d += gone * gone * 6.0;
+
+            if (d < d1) { d2 = d1; d1 = d; }
+            else if (d < d2) { d2 = d; }
+        }
+    }
+    d1 = sqrt(d1);
+    return float2(sqrt(d2) - d1, d1);
+}
+
+// How far a given wave runs up the beach (0.5..1), so no two waves look alike
+float WaveStrength(float waveId)
+{
+    return lerp(0.5, 1.0, frac(sin(waveId * 127.1) * 43758.5453));
+}
 
 // Per-band UV rotation to decorrelate cascade tiling patterns
 static const float BandAngles[8] = { 0.0, 0.297, 0.645, 0.925, 1.17, 1.42, 1.73, 2.05 };
@@ -250,6 +331,7 @@ struct DSOutput
     float3 UndisplacedXZ : TEXCOORD1;  // Pre-displacement XZ for PS texture sampling
     float Depth : TEXCOORD2;
     nointerpolation uint InstanceIdx : TEXCOORD3;
+    float3 SkyAmbient : TEXCOORD4;     // hemisphere sky ambient (same as composition), constant per frame
 };
 
 [domain("tri")]
@@ -284,18 +366,45 @@ DSOutput DS(HullConstantOutput patchConstants,
             (worldPos.x - ocean.TerrainOriginX) / ocean.TerrainSizeX,
             (worldPos.z - ocean.TerrainOriginZ) / ocean.TerrainSizeZ);
 
-        // Only attenuate inside terrain bounds
-        if (all(terrainUV >= 0) && all(terrainUV <= 1))
+        // The seabed outside the terrain is unknown: extend the border's depth outward (clamped UV) and
+        // fade to open-sea waves over the next 150 m. Stopping at the border instead makes the wave
+        // height jump along it wherever the seabed there is shallower than ShoreDepth.
+        float2 clampedUV = clamp(terrainUV, 0.002, 0.998);
+        float outside = length((terrainUV - clampedUV) * float2(ocean.TerrainSizeX, ocean.TerrainSizeZ));
+        if (outside < 150.0)
         {
             Texture2D<float> heightmap = ResourceDescriptorHeap[ocean.HeightmapSRV];
-            float h = heightmap.SampleLevel(OceanSampler, terrainUV, 0);
+            float h = heightmap.SampleLevel(OceanSampler, clampedUV, 0);
             float terrainWorldY = ocean.TerrainBaseY + h * ocean.MaxTerrainHeight;
 
             // Water depth = ocean surface - terrain surface (positive = water exists)
             float waterDepth = ocean.OceanPlaneY - terrainWorldY;
             float shoreBlend = smoothstep(0, ocean.ShoreDepth, waterDepth);
             float shoreAtten = lerp(ocean.ShoreMinWave, 1.0, shoreBlend);
-            displacement *= shoreAtten;
+
+            displacement *= lerp(shoreAtten, 1.0, smoothstep(0.0, 150.0, outside));
+
+            // Swash surge: the water level near the beach rises and falls in step with the foam bands
+            // (same phase as the PS), so the waterline travels up and down the sand instead of standing still.
+            if (ocean.NoiseSRV != 0)
+            {
+                Texture2D<float4> noiseTex = ResourceDescriptorHeap[ocean.NoiseSRV];
+                float bandNoise = noiseTex.SampleLevel(OceanSampler, worldPos.xz * 0.011, 0).r;
+                float swashZone = 1.0 - smoothstep(0.0, max(0.1, ocean.ShoreFoamDepth), waterDepth);
+
+                // Asymmetric like real swash: a quicker run-up (SurgeRise of the cycle) followed by a
+                // slower backwash. 0.5 = symmetric; 0.25 felt too abrupt up and too sluggish back.
+                float surgeClock = SurgeClock(ShoreClock(ocean.WaveTime, bandNoise), ocean.ShoreSurge, ocean.ShoreFoamDepth);
+                float surgePhase = frac(surgeClock);
+                float surge = surgePhase < SurgeRise
+                    ? smoothstep(0.0, SurgeRise, surgePhase)
+                    : 1.0 - smoothstep(SurgeRise, 1.0, surgePhase);
+
+                // Every wave starts from the same low water (-ShoreSurge) but runs up a different
+                // distance. Keeping the low point fixed keeps the level continuous from wave to wave.
+                float strength = WaveStrength(floor(surgeClock));
+                displacement.y += ocean.ShoreSurge * swashZone * (2.0 * strength * surge - 1.0);
+            }
         }
     }
 
@@ -306,6 +415,7 @@ DSOutput DS(HullConstantOutput patchConstants,
     output.Position = mul(mul(float4(displaced, 1.0), View), Projection);
     output.Depth = output.Position.w;
     output.InstanceIdx = idx;
+    output.SkyAmbient = GetSkyColor(float3(0, 1, 0), FogSunDirection) * 0.45 * AmbientScale;
 
     return output;
 }
@@ -349,8 +459,8 @@ PSOutput PS(DSOutput input)
         float scale = tileScales[i];
         float2 uv = RotateUV(worldXZ, angle) * scale;
 
-        // Displacement at mip 0 for crisp foam (alpha channel)
-        float4 disp = dispTex.SampleLevel(OceanSampler, float3(uv, i), 0);
+        // Filtered: the foam alpha is only a coverage mask, the visible detail comes from the foam texture
+        float4 disp = dispTex.Sample(OceanSampler, float3(uv, i));
         float2 slope = slopeTex.Sample(OceanSampler, float3(uv, i)).xy;
 
         // Counter-rotate slopes back to world space
@@ -395,11 +505,31 @@ PSOutput PS(DSOutput input)
     float F = saturate(0.02 + 0.668 * pow(base_f, 4.08));
 
     // ── Environment reflection ──
+    // Far away the per-pixel normal is sub-pixel noise: flatten it so the reflection converges on the
+    // sky just above the horizon in the mirrored view direction (same GetSkyColor as dome and fog,
+    // so it follows time of day and the environment preset).
     float reflSmooth = saturate(dist * 0.003);
-    float3 reflectDir = reflect(-V, N);
-    reflectDir.y = abs(reflectDir.y);
+    float3 reflN = normalize(lerp(N, float3(0, 1, 0), reflSmooth * 0.9));
+    float3 reflectDir = reflect(-V, reflN);
+    reflectDir.y = max(abs(reflectDir.y), 0.02);
+    reflectDir = normalize(reflectDir);
     float3 skyRefl = GetSkyColor(reflectDir, FogSunDirection);
-    float3 reflectColor = lerp(skyRefl, ocean.HorizonSkyColor, reflSmooth) * 0.5;
+
+    // Cloud layer in the reflection: same plane/UVs/density as the sky dome, flat-shaded with the
+    // CPU-blended day/sunset/night cloud color.
+    if (CloudNoiseLUTIdx != 0)
+    {
+        Texture3D<float4> cloudLUT = ResourceDescriptorHeap[CloudNoiseLUTIdx];
+        float2 cloudUV = CloudLayerUV((worldPos - camPos).xz + reflectDir.xz * (CloudAltitude / reflectDir.y));
+        float cloudMip = saturate(1.0 - reflectDir.y * 5.0) * 3.0;
+        float cloudDensity = smoothstep(0.0, 0.45, CloudBaseDensity(cloudLUT, OceanSampler, cloudUV, cloudMip));
+        cloudDensity *= smoothstep(0.0, 0.22, reflectDir.y);
+        skyRefl = lerp(skyRefl, ocean.CloudColor, 1.0 - exp(-cloudDensity * 4.5));
+    }
+
+    // Near water keeps the darker art-directed reflection; toward the horizon it approaches the full
+    // sky so the far ocean meets the sky without a hard dark line (most visible at night).
+    float3 reflectColor = skyRefl * lerp(0.5, 0.85, reflSmooth);
 
     // ── GGX sun specular (widen at distance to reduce tessellation sparkle) ──
     float waterRough = 0.075;
@@ -414,87 +544,282 @@ PSOutput PS(DSOutput input)
     specular /= max(0.001, 4.0 * max(0.001, NdotL));
     specular *= NdotL;
 
+    // ── Water column: what is seen through the surface ──
+    // pathLen  = distance the view ray travels under water before it hits the scene (depth buffer)
+    // bedDepth = vertical water depth right under this pixel (terrain heightmap, view independent)
+    float3 body = scatter;
+    float edgeFade = 1.0;
+    float pathLen = 1000.0;
+    float bufDepth = 1000.0;
+
+    // Terrain seabed. Its geometry and heightmap stop at the terrain border while the sea goes on, so
+    // everything derived from it is faded out across the border (seabedFade) to avoid a straight seam:
+    // show-through over the last 60 m inside, the heightmap depth over the first 150 m outside.
+    float terrainDepth = 1000.0;
+    float stillDepth = 1000.0;      // depth below the undisturbed sea level (no waves, no surge)
+    float seabedFade = 1.0;
+    float shallowFade = 0.0;
+    float2 terrainSize = float2(ocean.TerrainSizeX, ocean.TerrainSizeZ);
+    float2 clampedUV = 0.5;
+    if (ocean.HeightmapSRV != 0)
+    {
+        float2 terrainUV = (worldPos.xz - float2(ocean.TerrainOriginX, ocean.TerrainOriginZ)) / terrainSize;
+        clampedUV = clamp(terrainUV, 0.002, 0.998);
+        float outside = length((terrainUV - clampedUV) * terrainSize);
+        float2 toBorder = min(clampedUV, 1.0 - clampedUV) * terrainSize;
+
+        seabedFade = smoothstep(0.0, 60.0, min(toBorder.x, toBorder.y));
+        if (outside < 150.0)
+        {
+            Texture2D<float> heightmap = ResourceDescriptorHeap[ocean.HeightmapSRV];
+            float h = heightmap.SampleLevel(OceanSampler, clampedUV, 0);
+            float terrainY = ocean.TerrainBaseY + h * ocean.MaxTerrainHeight;
+            terrainDepth = worldPos.y - terrainY;
+            stillDepth = ocean.OceanPlaneY - terrainY;
+            shallowFade = 1.0 - smoothstep(0.0, 150.0, outside);
+        }
+    }
+
+    if (ocean.DepthGBufferSRV != 0)
+    {
+        Texture2D<float> depthGB = ResourceDescriptorHeap[ocean.DepthGBufferSRV];
+        float2 screenUV = input.Position.xy * ocean.InvViewportSize;
+        float sceneZ = depthGB.SampleLevel(OceanSampler, screenUV, 0);
+
+        if (sceneZ > 0)
+        {
+            // Scene point behind the pixel lies on the same view ray: scale by the linear depth ratio
+            float zRatio = max(sceneZ / max(input.Depth, 0.001), 1.0) - 1.0;
+            pathLen = dist * zRatio;
+            bufDepth = abs(camPos.y - worldPos.y) * zRatio;
+        }
+
+        // Soft waterline: reflection and specular fade out where the water film gets thin
+        edgeFade = saturate(pathLen / 0.3);
+
+        if (ocean.CompositeSRV != 0)
+        {
+            Texture2D<float4> compositeBuffer = ResourceDescriptorHeap[ocean.CompositeSRV];
+
+            // Refraction, rejected when the offset sample lands on something in front of the water
+            float2 refrUV = saturate(screenUV + N.xz * ocean.RefractionStrength * saturate(pathLen * 0.5));
+            float refrZ = depthGB.SampleLevel(OceanSampler, refrUV, 0);
+            if (refrZ > 0 && refrZ < input.Depth)
+                refrUV = screenUV;
+            float3 sceneColor = compositeBuffer.SampleLevel(OceanSampler, refrUV, 0).rgb;
+
+            // Beer-Lambert: at ShoreFadeDepth of water the seabed is tinted by ShallowColor and mostly gone
+            float x = pathLen / max(0.01, ocean.ShoreFadeDepth);
+            float3 transmittance = pow(max(ocean.ShallowColor, 0.02), x) * exp(-1.5 * x);
+            body = lerp(scatter, sceneColor, transmittance * seabedFade);
+        }
+    }
+
+    // Vertical water depth under the pixel: heightmap where there is one, depth buffer otherwise
+    float bedDepth = (terrainDepth < 999.0) ? terrainDepth : bufDepth;
+
+    // Light scattered back from a bright shallow bed: the turquoise shelf along the coast
+    float3 skyAmbient = input.SkyAmbient;
+    float shallow = exp(-max(bedDepth, 0.0) / max(0.01, ocean.ShoreFadeDepth)) * saturate(pathLen);
+    shallow *= (ocean.HeightmapSRV != 0) ? shallowFade : 1.0;
+    body += ocean.ShallowColor * (sunRadiance * saturate(L.y) + skyAmbient) * 0.06 * shallow;
+
     // ── Combine lighting ──
-    float3 color = (1.0 - F) * scatter + specular + F * reflectColor;
+    float3 color = (1.0 - F) * body + (specular + F * reflectColor) * edgeFade;
     color = max(0.0, color);
 
-    // ── Foam from FFT Jacobian ──
-    // Use noise to dissolve hard 512² texel grid edges
-    float foamRaw = saturate(totalFoam);
-    float foamThreshold = 0.0;
+    // ── Foam ──
+    // Everything below only builds a COVERAGE value; the visible foam is that coverage eroded by a
+    // cellular foam texture, so edges break up into bubbles/streaks instead of showing FFT texels.
+    float t = ocean.WaveTime;
+
+    // Open water: Jacobian foam from the FFT, faded at distance
+    float coverage = saturate(totalFoam) * saturate(1.0 - dist / 3000.0);
+
+    float foamTex = 0.5;
+    float streakFoam = 0.0;
     if (ocean.NoiseSRV != 0)
     {
         Texture2D<float4> noiseTex = ResourceDescriptorHeap[ocean.NoiseSRV];
-        // Two octaves of noise at different scales for organic breakup
-        float n1 = noiseTex.SampleLevel(OceanSampler, worldXZ * 0.08, 0).r;
-        float n2 = noiseTex.SampleLevel(OceanSampler, worldXZ * 0.25, 0).g;
-        foamThreshold = lerp(0.15, 0.45, n1 * 0.7 + n2 * 0.3);
+
+        // Shore: one foam front per wave (see ShoreClock). It crosses the swash zone on the STILL-water
+        // depth at a steady speed — on the actual depth, which includes the surge, a front stalls
+        // during the backwash and lurches forward with the next run-up. Sharp front on the shallow
+        // side, foam trailing off seaward. It only shows where there is water, so once it has caught
+        // up with the waterline the run-up edge is this front; its trail is what the backwash drains.
+        float bandNoise = noiseTex.SampleLevel(OceanSampler, worldPos.xz * 0.011, 0).r;
+        float shoreClock = ShoreClock(t, bandNoise);
+        float foamDepth = max(0.1, ocean.ShoreFoamDepth);
+        float bandDepth = (stillDepth < 999.0) ? stillDepth : bedDepth;
+        float swashZone = 1.0 - smoothstep(0.0, foamDepth, bandDepth);
+        float phase = bandDepth / foamDepth + shoreClock;
+        float bandPos = frac(phase);                        // 0 at the front, growing seaward
+        float waveStrength = lerp(0.55, 1.0, WaveStrength(floor(phase)));   // same wave id as its run-up
+
+        // Solid bubbly foam right behind the front, which thins out into the lacy web further back
+        // (its depth varies along the front — frontWidth — so it is a ragged band, not an even ribbon)
+        float frontBroad = noiseTex.SampleLevel(OceanSampler, worldPos.xz * 0.045 + t * 0.004, 0).r;
+        float frontFine = noiseTex.SampleLevel(OceanSampler, worldPos.xz * 0.21 - t * 0.006, 0).a;
+        float frontWidth = lerp(0.5, 2.6, saturate((frontBroad - 0.3) / 0.4)) * lerp(0.7, 1.3, frontFine);
+        float band = exp(-bandPos * 12.0 / frontWidth) * smoothstep(0.0, 0.025, bandPos) * waveStrength;
+        float trail = 1.0 - bandPos;
+        trail = trail * trail * trail * smoothstep(0.02, 0.14, bandPos) * waveStrength * swashZone;
+
+        // Downhill direction and steepness of the beach from the heightmap, over a 3 m baseline so
+        // they stay smooth. (Screen-space derivatives of the depth are too noisy: every pixel then
+        // gets a slightly different direction and stretched patterns turn into moire.)
+        // The slope converts widths given in meters along the beach into water depth, so the foam
+        // edge is equally wide on a steep shore and a flat one.
+        bool hasBeach = ocean.HeightmapSRV != 0 && terrainDepth < 999.0;
+        float2 flowDir = float2(0.0, 1.0);
+        float beachSlope = 0.1;
+        if (hasBeach && bandDepth < foamDepth)
+        {
+            Texture2D<float> heightmap = ResourceDescriptorHeap[ocean.HeightmapSRV];
+            float2 slopeStep = 3.0 / terrainSize;
+            float2 uphill = float2(
+                heightmap.SampleLevel(OceanSampler, clampedUV + float2(slopeStep.x, 0), 0)
+              - heightmap.SampleLevel(OceanSampler, clampedUV - float2(slopeStep.x, 0), 0),
+                heightmap.SampleLevel(OceanSampler, clampedUV + float2(0, slopeStep.y), 0)
+              - heightmap.SampleLevel(OceanSampler, clampedUV - float2(0, slopeStep.y), 0));
+            float steepness = length(uphill);
+            flowDir = -uphill / max(steepness, 1e-6);
+            beachSlope = clamp(steepness * ocean.MaxTerrainHeight / 6.0, 0.03, 1.0);
+        }
+
+        // Lace along the waterline and around anything standing in the water (piers, rocks, hulls)
+        // Its width varies along the coast (a broad noise plus a finer one), so the edge is a ragged
+        // band that swells and pinches rather than an even ribbon.
+        float edgeWidth = lerp(0.4, 2.4, saturate((frontBroad - 0.3) / 0.4)) * lerp(0.7, 1.3, frontFine);
+
+        float laceDepth = min(bedDepth, bufDepth);
+        static const float RunUpLaceWidth = 0.7;      // meters along the beach, before the variation
+        float lace = 1.0 - smoothstep(0.0, min(RunUpLaceWidth * edgeWidth * beachSlope, 0.7), laceDepth);
+
+        // The beach waterline follows the surge: a crisp foam edge while the water runs up, which
+        // breaks apart during the backwash. Objects standing in deeper water keep their lace.
+        float surgePhase = frac(SurgeClock(shoreClock, ocean.ShoreSurge, ocean.ShoreFoamDepth));
+        float advancing = max(1.0 - smoothstep(SurgeRise, SurgeRise + 0.2, surgePhase),
+                              smoothstep(0.92, 1.0, surgePhase));
+        float onBeach = 1.0 - smoothstep(0.0, 0.5, bedDepth);
+        static const float BackwashLace = 0.9;  // 0 = no foam on the retreating edge, 1 = same as the run-up
+        static const float BackwashLaceWidth = 1.1;   // meters along the beach on the retreat
+        float retreatLace = 1.0 - smoothstep(0.0, min(BackwashLaceWidth * edgeWidth * beachSlope, 0.7), laceDepth);
+        // On the retreat the edge foam is NOT this world-fixed bubble band: revealing the same pattern
+        // in reverse looks like the run-up being rewound. It becomes a dense part of the foam web
+        // below, which rides out with the water.
+        float retreatEdge = retreatLace * BackwashLace * (1.0 - advancing) * onBeach;
+        lace = hasBeach
+            ? lerp(lace, lace * advancing, onBeach)
+            : lerp(lace, lerp(retreatLace * BackwashLace, lace, advancing), onBeach);   // no heightmap: no web to hand over to
+
+        // Foam web: the lacy network foam stretches into as it thins. Used twice — on the back of the
+        // incoming wave (trail) and in the thin film draining off the beach (film).
+        float film = (1.0 - smoothstep(0.0, max(0.15, ocean.ShoreSurge * 1.5), bedDepth)) * (1.0 - advancing);
+
+        // ...and it fades away as the water retreats: strongest just after the top of the run-up,
+        // gone by the time the next wave arrives.
+        float backwashAge = saturate((surgePhase - SurgeRise) / (1.0 - SurgeRise));
+        film *= 1.0 - smoothstep(0.1, 0.9, backwashAge);
+        float webAmount = max(max(film, retreatEdge), trail);
+
+        if (webAmount > 0.01 && hasBeach)
+        {
+            // The web floats on the water, so it moves with it: carried seaward as the backwash drains
+            // and back in on the next run-up (straight up and down the slope; a sideways slide was
+            // tried and removed). The shift follows the
+            // surge's own profile, so it is continuous and returns to zero every cycle — a bounded
+            // offset, which is why a flow direction that bends along the coast cannot shear it apart.
+            float surgeShape = surgePhase < SurgeRise
+                ? smoothstep(0.0, SurgeRise, surgePhase)
+                : 1.0 - smoothstep(SurgeRise, 1.0, surgePhase);
+            float waterTravel = min(2.0 * ocean.ShoreSurge / beachSlope, 8.0) * 0.6 * swashZone;
+            float2 waterShift = flowDir * waterTravel * (1.0 - surgeShape);
+            float2 foamPos = worldPos.xz - waterShift;
+            // The borders between cells of animated Voronoi noise (FoamWeb). Iso-contours of blob noise
+            // can only close into rings; the negative space between cells is connected.
+            const float webCellSize = 0.95;    // meters across a cell (before stretching and merging)
+            const float webStretch = 2.0;      // cells are this much longer along the downhill flow
+            const float webRate = 0.9;         // how fast the cell points drift (radians per second of wave time)
+
+            // Bend the space first: a large slow warp squeezes some regions and opens others (uneven
+            // cell sizes), a medium one curves the strands, a little fine wobble roughens them.
+            float2 warpUV = foamPos * 0.19;
+            float2 bigWarp = float2(noiseTex.SampleLevel(OceanSampler, warpUV * 0.31 + 0.27, 0).r,
+                                    noiseTex.SampleLevel(OceanSampler, warpUV * 0.31 + 0.83, 0).r) - 0.5;
+            float2 warp = float2(noiseTex.SampleLevel(OceanSampler, warpUV + t * 0.006, 0).r,
+                                 noiseTex.SampleLevel(OceanSampler, warpUV + 0.43 - t * 0.005, 0).r) - 0.5;
+            float2 wobble = float2(noiseTex.SampleLevel(OceanSampler, warpUV * 2.9 + 0.11, 0).a,
+                                   noiseTex.SampleLevel(OceanSampler, warpUV * 2.9 + 0.71, 0).a) - 0.5;
+            float2 webPos = foamPos + bigWarp * 4.5 + warp * 1.8 + wobble * 0.12;
+
+            // Main web as a SOFT mask: 1 on the strand's center line, falling off to 0 at its edge.
+            // Strands swell into knots where cells meet. Thin hard lines of even brightness read as
+            // drawn cracks, however much they bend.
+            // A fixed third of the points is retired, for uneven cell sizes. Raising this over the
+            // foam's life (cells merging as it ages) was tried and rejected: the collapsing cells look
+            // worse than a web that simply fades.
+            const float webDrop = 0.33;
+
+            float2 web = FoamWeb(webPos / webCellSize, flowDir, webStretch, t * webRate, webDrop);
+            float webLace = saturate(1.0 - web.x / (0.09 + 0.17 * smoothstep(0.4, 0.9, web.y)));
+
+            // A finer, fainter web inside the cells for mixed sizes
+            float2 fine = FoamWeb(webPos / (webCellSize * 0.4) + 17.3, flowDir, webStretch, t * webRate * 1.3, webDrop);
+            webLace = max(webLace, saturate(1.0 - fine.x / 0.11) * 0.6 * smoothstep(0.2, 0.55, web.x));
+
+            // Patchy: the web thins out and tears open in places instead of covering the water evenly
+            float patches = noiseTex.SampleLevel(OceanSampler, foamPos * 0.06 - t * 0.004, 0).b;
+            webLace *= lerp(0.25, 1.0, smoothstep(0.38, 0.62, patches));
+
+            // Strands are made of bubbles: erode the soft mask with the fine cell texture, so the
+            // strand cores stay solid and the edges break into ragged clusters.
+            // (cells ~7 cm; the noise texture has no mips, so flatten it before it starts to shimmer)
+            float bubbles = noiseTex.SampleLevel(OceanSampler, foamPos * 1.75 - t * float2(0.013, 0.004), 0).g;
+            bubbles = saturate((bubbles - 0.15) / 0.55);
+            bubbles = lerp(bubbles, 0.5, saturate(dist / 45.0));
+            float webFoam = saturate((webLace * 1.35 - (1.0 - bubbles) * 0.75) * 2.2);
+
+            // The retreating edge: the web closes up into a torn sheet toward the waterline
+            float webFoamEdge = saturate(((webLace * 2.2 + 0.45) * 1.35 - (1.0 - bubbles) * 0.75) * 2.2);
+            webFoam = lerp(webFoam, webFoamEdge, retreatEdge);
+
+            streakFoam = webFoam * webAmount;
+        }
+
+        // Stays below full coverage so the foam texture always breaks it up
+        coverage = saturate(coverage + saturate(band * saturate(swashZone * 1.8) * 1.8 + lace) * 0.8 * ocean.ShoreFoam);
+
+        // Foam texture: two drifting scales of cellular noise (noise texture has no mips: flatten it far away)
+        float cells1 = noiseTex.SampleLevel(OceanSampler, worldPos.xz * 0.23 + t * float2(0.010, 0.006), 0).g;
+        float cells2 = noiseTex.SampleLevel(OceanSampler, worldPos.xz * 0.83 - t * float2(0.013, 0.004), 0).g;
+        foamTex = saturate((cells1 * 0.6 + cells2 * 0.4 - 0.15) / 0.6);
+
+        // Backwash filaments: translucent, lightly broken up by the fine cells
+        streakFoam *= 0.85 * lerp(0.75, 1.0, cells2) * ocean.ShoreFoam;
     }
-    float foam = smoothstep(foamThreshold, foamThreshold + 0.35, foamRaw);
-    // Fade foam at distance to hide low-res grid
-    foam *= saturate(1.0 - dist / 3000.0);
-    float3 foamColor = float3(0.70, 0.68, 0.65);
-    float3 foamLit = foamColor * (0.3 + 0.7 * NdotL) * sunRadiance;
-    color = lerp(color, foamLit, foam);
+
+    // Thin foam is translucent, thick foam keeps the cell structure as shading.
+    // The noise texture has no mips: far away the cells would only alias, so fade to a soft
+    // version of the coverage itself (whitecaps become faint streaks instead of solid blobs).
+    float foamFar = saturate(dist / 150.0);
+    float foam = saturate((coverage * 1.25 - (1.0 - foamTex)) * 3.0);
+    foam = lerp(foam, saturate((coverage - 0.35) * 1.5) * 0.7, foamFar);
+    foam = max(foam, streakFoam * (1.0 - foamFar));
+
+    // Always feather the last few centimeters of water: whatever the foam pattern, it must not end
+    // in the hard pixel edge where the water surface cuts into the beach.
+    foam *= smoothstep(0.0, 0.025, pathLen);
+    foamTex = lerp(foamTex, 0.5, foamFar);
+    float3 foamAlbedo = float3(0.80, 0.80, 0.78) * lerp(0.7, 1.0, foamTex);
+    float3 foamLit = foamAlbedo * ((0.27 + 0.5 * NdotL) * sunRadiance + skyAmbient * 1.15);
+    color = lerp(color, foamLit, foam * 0.9);
 
     // ── Atmospheric extinction — shared aerial perspective ──
     if (FogEnabled > 0)
     {
         color = ApplyAerialPerspective(color, worldPos, camPos, FogSunDirection);
     }
-
-    // ── Shore pixel effects ──
-    if (ocean.DepthGBufferSRV != 0)
-    {
-        Texture2D<float> depthGB = ResourceDescriptorHeap[ocean.DepthGBufferSRV];
-        float2 screenUV = input.Position.xy * ocean.InvViewportSize;
-
-        float sceneLinearZ = depthGB.SampleLevel(OceanSampler, screenUV, 0);
-        float oceanLinearZ = input.Depth;
-
-        float depthDiff = (sceneLinearZ > 0) ? (sceneLinearZ - oceanLinearZ) : 1000.0;
-        float shoreProximity = saturate(depthDiff / max(0.01, ocean.ShoreFadeDepth));
-
-        // ── Shore foam ──
-        float shoreFoamAmount = 0;
-        if (ocean.NoiseSRV != 0)
-        {
-            Texture2D<float4> noiseTex = ResourceDescriptorHeap[ocean.NoiseSRV];
-            float t = ocean.WaveTime;
-
-            float2 shapeUV = worldPos.xz * 0.02 + float2(t * 0.008, t * 0.005);
-            float foamShape = noiseTex.SampleLevel(OceanSampler, shapeUV, 0).r;
-            float foamDetail = noiseTex.SampleLevel(OceanSampler, worldPos.xz * 0.15, 0).g;
-
-            float foamThresh = lerp(0.3, 0.9, shoreProximity);
-            float shoreFoam = smoothstep(foamThresh, foamThresh + 0.1, foamShape);
-            float foamMask = 1.0 - smoothstep(0, 0.5, shoreProximity);
-            float edgeFoam = (1.0 - smoothstep(0, 0.05, shoreProximity)) * (foamDetail * 0.3 + 0.7);
-            shoreFoamAmount = saturate(shoreFoam * foamMask * (0.4 + 0.6 * foamDetail) + edgeFoam);
-        }
-
-        // ── Terrain show-through ──
-        if (ocean.CompositeSRV != 0)
-        {
-            Texture2D<float4> compositeBuffer = ResourceDescriptorHeap[ocean.CompositeSRV];
-            float2 refrUV = screenUV + N.xz * ocean.RefractionStrength * (1.0 - shoreProximity);
-            refrUV = saturate(refrUV);
-            float3 terrainColor = compositeBuffer.SampleLevel(OceanSampler, refrUV, 0).rgb;
-
-            float absorption = shoreProximity * shoreProximity;
-            float3 tintedTerrain = lerp(terrainColor, terrainColor * ocean.ShallowColor, absorption);
-
-            float terrainVisibility = (1.0 - shoreProximity);
-            terrainVisibility *= terrainVisibility;
-            terrainVisibility *= (1.0 - shoreFoamAmount);
-            color = lerp(color, tintedTerrain, terrainVisibility);
-        }
-
-        // ── Apply shore foam on top ──
-        color = lerp(color, foamLit, shoreFoamAmount);
-    }
-
-    // Fog is handled by ApplyAerialPerspective above — same function as all other shaders.
 
     // HDR output — no tonemapping/gamma here.
     // The finalize pass applies ACES + gamma to the entire Composite.

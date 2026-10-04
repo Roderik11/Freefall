@@ -167,6 +167,10 @@ namespace Freefall.Components
         public static float CurrentCloudShadowScale { get; private set; } = 1.0f;
         public static uint CurrentCloudNoiseLUTIdx => _cloudNoiseLUT?.BindlessIndex ?? 0u;
 
+        // Average cloud color for the current time of day (flat-shaded version of the mesh_skybox.fx
+        // cloud palettes). Used where clouds are reflected rather than drawn, e.g. the ocean.
+        public static Vector3 CurrentCloudColor { get; private set; } = new Vector3(0.7f, 0.72f, 0.78f);
+
         // Day/sunset/night weights of the current frame (normalized, sum to 1). Useful for gameplay/audio.
         public static float CurrentDayFactor { get; private set; } = 1.0f;
         public static float CurrentSunsetFactor { get; private set; } = 0.0f;
@@ -334,6 +338,14 @@ namespace Freefall.Components
                 dayFactor * SunDayColor.R + sunsetFactor * SunSunsetColor.R + nightFactor * SunNightColor.R,
                 dayFactor * SunDayColor.G + sunsetFactor * SunSunsetColor.G + nightFactor * SunNightColor.G,
                 dayFactor * SunDayColor.B + sunsetFactor * SunSunsetColor.B + nightFactor * SunNightColor.B);
+
+            // Flat-shaded cloud color: mid shadow/sunlit gradient of each palette in mesh_skybox.fx
+            static Vector3 V(Color3 c) => new Vector3(c.R, c.G, c.B);
+            float dayBrightness = CloudBrightness * 1.3f;
+            Vector3 dayCloud = Vector3.Lerp(V(CloudShadowColor), V(CloudSunlitColor), 0.5f) * dayBrightness;
+            Vector3 sunsetCloud = Vector3.Lerp(dayCloud, V(CloudSunsetTintColor) * dayBrightness, 0.5f);
+            Vector3 nightCloud = V(CloudNightColor) * 0.75f * CloudNightBrightness;
+            CurrentCloudColor = dayCloud * dayFactor + sunsetCloud * sunsetFactor + nightCloud * nightFactor;
         }
 
         /// <summary>

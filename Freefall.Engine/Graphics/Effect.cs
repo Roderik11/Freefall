@@ -126,38 +126,92 @@ namespace Freefall.Graphics
                 _resourceSlots = existing._resourceSlots;
                 RenderState = existing.RenderState;
                 _materialBlock = existing._materialBlock;
+                lock (_instances) _instances.Add(new WeakReference<Effect>(this));
                 return;
             }
             
-            string resourcesPath = Path.Combine(AppContext.BaseDirectory, "Resources", "Shaders");
-            string fullPath = Path.Combine(resourcesPath, filename + ".fx");
-            
-            if (!File.Exists(fullPath))
-            {
-                 // Fallback to project root if not found in Shaders folder (for dev convenience)
-                 fullPath = Path.Combine(AppContext.BaseDirectory, filename + ".fx");
-            }
+            _sourcePath = ShaderHotReload.ResolvePath(filename + ".fx")
+                ?? throw new FileNotFoundException($"Effect file {filename}.fx not found in {ShaderHotReload.Directory}");
 
-            if (!File.Exists(fullPath))
-                throw new FileNotFoundException($"Effect file {filename}.fx not found at {fullPath}");
-
-            string content = LoadWithIncludes(fullPath);
+            string content = LoadWithIncludes(_sourcePath);
             var techDescs = FXParser.ParseFx(content);
 
             foreach (var td in techDescs)
             {
                 Techniques.Add(new EffectTechnique(td.Name, td, content));
             }
-            
+
             // Discover push constant slot mappings via shader reflection
             // (same pattern as ComputeShader.DiscoverPushConstants)
             DiscoverPushConstants();
-            
+
             // Parse render state metadata from shader source (data-driven PSO creation)
             RenderState = FXParser.ParseRenderState(content);
-            
+
+            Dependencies = ShaderHotReload.CollectDependencies(_sourcePath);
+
             // Register in MasterEffects (Apex pattern)
             MasterEffects[hash] = this;
+            lock (_instances) _instances.Add(new WeakReference<Effect>(this));
+            ShaderHotReload.EnsureWatching();
+        }
+
+        // ── Hot reload ──
+        // Only the master (first instance of a name) owns a source path. Later instances share its
+        // Techniques / ResourceBindings / slot map by reference, so refilling those in place updates
+        // everyone; RenderState is a plain reference and is re-pointed on each live instance.
+        private readonly string? _sourcePath;
+        private static readonly List<WeakReference<Effect>> _instances = new();
+
+        /// <summary>The .fx file and everything it includes (full paths). Null on non-master instances.</summary>
+        internal HashSet<string>? Dependencies { get; private set; }
+
+        /// <summary>
+        /// Recompile from disk and swap the result in. Throws (leaving the effect untouched) when the
+        /// source does not compile. Materials must rebuild their pipeline states afterwards
+        /// (Material.RebuildForEffect).
+        /// </summary>
+        internal void Reload()
+        {
+            if (_sourcePath == null) return;
+
+            // Compile everything first: a failure must not leave a half-swapped effect
+            string content = LoadWithIncludes(_sourcePath);
+            var techniques = new List<EffectTechnique>();
+            try
+            {
+                foreach (var td in FXParser.ParseFx(content))
+                    techniques.Add(new EffectTechnique(td.Name, td, content));
+                if (techniques.Count == 0 || techniques[0].Passes.Count == 0)
+                    throw new Exception("no technique/pass found");
+            }
+            catch
+            {
+                foreach (var t in techniques) t.Dispose();
+                throw;
+            }
+
+            var old = new List<EffectTechnique>(Techniques);
+            Techniques.Clear();
+            Techniques.AddRange(techniques);
+
+            ResourceBindings.Clear();
+            _resourceSlots.Clear();
+            DiscoverPushConstants();
+
+            var renderState = FXParser.ParseRenderState(content);
+            lock (_instances)
+            {
+                for (int i = _instances.Count - 1; i >= 0; i--)
+                {
+                    if (!_instances[i].TryGetTarget(out var instance)) { _instances.RemoveAt(i); continue; }
+                    if (instance.Name == Name) instance.RenderState = renderState;
+                }
+            }
+
+            Dependencies = ShaderHotReload.CollectDependencies(_sourcePath);
+
+            foreach (var t in old) t.Dispose();
         }
         
         /// <summary>

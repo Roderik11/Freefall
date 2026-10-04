@@ -108,7 +108,7 @@ cbuffer PushConstants : register(b3)
     float LodCameraX;               // slot 34 — main camera position for LOD selection. Set for shadow
     float LodCameraY;               // slot 35   passes too, so shadows use the main view's LOD.
     float LodCameraZ;               // slot 36   (separate floats: a float3 would not pack into these slots)
-    float LodFactor;                // slot 37 — Camera.FoVFactor * LODScale² (0 = LOD selection off)
+    float LodFactor;                // slot 37 — Camera.FoVFactor * LODScale² (0 = no valid camera: LOD-managed instances are not drawn)
 };
 
 // Convenience aliases for named push constants (matching old #define usage)
@@ -199,8 +199,14 @@ struct MeshPartLod
 uint ResolveLodPart(uint subbatchId, row_major float4x4 world, float maxScaleSq)
 {
     uint partId = subbatchId & ~LOD_MANAGED_BIT;
-    if ((subbatchId & LOD_MANAGED_BIT) == 0 || LodFactor <= 0.0)
+    if ((subbatchId & LOD_MANAGED_BIT) == 0)
         return partId;
+
+    // No valid main camera this frame (none exists, or it has not updated its projection yet, as in
+    // the frames right after entering/leaving play mode): draw nothing. Falling back to the chain
+    // head would draw every instance at LOD 0 at once, which is enough to hang the GPU on a forest.
+    if (LodFactor <= 0.0)
+        return INVALID_PART;
 
     StructuredBuffer<MeshPartLod> lodRegistry = ResourceDescriptorHeap[MeshLodRegistryIdx];
     MeshPartLod lod = lodRegistry[partId];
