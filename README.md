@@ -1,7 +1,6 @@
 # Freefall
 
-Freefall is a game engine written in C# with Direct3D 12, built entirely with [Google Antigravity](https://antigravity.google/blog).
-
+Freefall is a game engine written in C# with Direct3D 12, built with the help of Opus, Fable, Grok and Gemini
 ## Architecture
 
 Freefall is a fully GPU-driven deferred renderer. The CPU submits unsorted draw calls in parallel; a multi-pass compute pipeline handles visibility culling, histogram-based grouping, and indirect command generation — so the GPU draws only what is visible, with zero CPU sorting.
