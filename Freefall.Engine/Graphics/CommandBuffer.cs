@@ -45,6 +45,11 @@ namespace Freefall.Graphics
         /// Per-Animator bone buffer SRV index (0 = static mesh).
         /// </summary>
         public uint BoneBufferIdx;
+        /// <summary>
+        /// The GPU culler resolves the LOD: MeshPartIndex is a LOD chain head (Mesh.DrawPartIndices)
+        /// and small-on-screen culling applies. False draws exactly the given part.
+        /// </summary>
+        public bool LodManaged;
     }
 
     /// <summary>
@@ -79,7 +84,10 @@ namespace Freefall.Graphics
 
         public int Count => Draws.Count;        
         
-        public void Add(Mesh mesh, int partIndex, Material material, MaterialBlock block, int transformSlot, uint boneBufferIdx = 0)
+        /// <summary>High bit of a staged subbatch ID: the culler resolves the LOD for this instance.</summary>
+        public const uint LodManagedBit = 0x80000000u;
+
+        public void Add(Mesh mesh, int partIndex, Material material, MaterialBlock block, int transformSlot, uint boneBufferIdx = 0, bool lodManaged = false)
         {
             // Get or register MeshPartId (done during parallel Enqueue!)
             int meshPartId = mesh.GetMeshPartId(partIndex);
@@ -113,7 +121,7 @@ namespace Freefall.Graphics
             };
 
             StageCore(DescriptorsHash, 20, descriptor);       // InstanceDescriptor: 20 bytes (5 uints)
-            StageCore(SubbatchIdsHash, 4,  (uint)meshPartId);        // uint: 4 bytes
+            StageCore(SubbatchIdsHash, 4,  (uint)meshPartId | (lodManaged ? LodManagedBit : 0u)); // uint: 4 bytes
             UniqueMeshPartIds.Add(meshPartId);
             
             if(block == null) return;
@@ -302,7 +310,7 @@ namespace Freefall.Graphics
                     bucket = new DrawBucket();
                     buckets[drawCall.Key] = bucket;
                 }
-                bucket.Add(drawCall.Mesh, drawCall.MeshPartIndex, drawCall.Material, drawCall.MaterialBlock, drawCall.TransformSlot, drawCall.BoneBufferIdx);
+                bucket.Add(drawCall.Mesh, drawCall.MeshPartIndex, drawCall.Material, drawCall.MaterialBlock, drawCall.TransformSlot, drawCall.BoneBufferIdx, drawCall.LodManaged);
             }
 
             /// <summary>
@@ -579,7 +587,8 @@ namespace Freefall.Graphics
         /// <summary>
         /// Enqueue draw call into all applicable RenderPasses based on the Material's Effect passes.
         /// </summary>
-        public static void Enqueue(Mesh mesh, int meshPartIndex, Material material, MaterialBlock materialBlock, int transformSlot = -1, uint boneBufferIdx = 0)
+        /// <param name="lodManaged">See <see cref="DrawCall.LodManaged"/>.</param>
+        public static void Enqueue(Mesh mesh, int meshPartIndex, Material material, MaterialBlock materialBlock, int transformSlot = -1, uint boneBufferIdx = 0, bool lodManaged = false)
         {
             var key = new BatchKey(material.Effect);
             var drawCall = new DrawCall 
@@ -590,9 +599,10 @@ namespace Freefall.Graphics
                 Material = material,
                 MaterialBlock = materialBlock,
                 TransformSlot = transformSlot,
-                BoneBufferIdx = boneBufferIdx
+                BoneBufferIdx = boneBufferIdx,
+                LodManaged = lodManaged
             };
-            
+
             // Iterate all passes defined in the Effect and enqueue to each
             foreach (var shaderPass in material.GetPasses())
             {

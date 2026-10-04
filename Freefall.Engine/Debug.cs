@@ -17,7 +17,17 @@ namespace Freefall
         public struct LogEntry
         {
             public string Message;
+
+            /// <summary>Live stack trace; null for logs from hot-reloadable script code (see StackText).</summary>
             public StackTrace StackTrace;
+
+            /// <summary>
+            /// Rendered stack + source locations, used instead of StackTrace when the stack runs through a
+            /// collectible (script) assembly: a kept StackTrace holds its MethodBases and would stop the old
+            /// script assembly from unloading after a hot-reload.
+            /// </summary>
+            public string StackText;
+            public (string File, int Line)[] StackLocations;
         }
 
         private static readonly List<LogEntry> lines = new List<LogEntry>();
@@ -37,11 +47,38 @@ namespace Freefall
             if (lines.Count >= MaxLines) lines.RemoveRange(0, MaxLines / 10);
 
             Console.WriteLine(message);
-            lines.Add(new LogEntry
+            var entry = new LogEntry { Message = message, StackTrace = stackTrace };
+            if (stackTrace != null && TouchesCollectibleCode(stackTrace))
             {
-                StackTrace = stackTrace,
-                Message = message
-            });
+                entry.StackText = stackTrace.GetFrames().StackFramesToString();
+                entry.StackLocations = StackLocationsOf(stackTrace);
+                entry.StackTrace = null;
+            }
+            lines.Add(entry);
+        }
+
+        private static bool TouchesCollectibleCode(StackTrace trace)
+        {
+            for (int i = 0; i < trace.FrameCount; i++)
+            {
+                if (trace.GetFrame(i)?.GetMethod()?.Module.Assembly.IsCollectible == true)
+                    return true;
+            }
+            return false;
+        }
+
+        /// <summary>Source file/line of every frame that has one (for clickable console links).</summary>
+        public static (string File, int Line)[] StackLocationsOf(StackTrace trace)
+        {
+            var result = new List<(string, int)>();
+            for (int i = 0; i < trace.FrameCount; i++)
+            {
+                var frame = trace.GetFrame(i);
+                var file = frame?.GetFileName();
+                if (!string.IsNullOrEmpty(file))
+                    result.Add((file, frame.GetFileLineNumber()));
+            }
+            return result.ToArray();
         }
 
 

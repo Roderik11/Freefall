@@ -564,6 +564,29 @@ namespace Freefall.Graphics
             }
         }
 
+        /// <summary>
+        /// Push constants 33-37 for GPU LOD selection (cull_instances.hlsl ResolveLodPart).
+        /// Always the main camera, for every pass including shadows, so all passes resolve the same LOD.
+        /// </summary>
+        private static void SetLodConstants(ID3D12GraphicsCommandList commandList)
+        {
+            var camera = Components.Camera.Main;
+            Vector3 position = default;
+            float factor = 0f; // 0 = LOD selection off (chain heads are drawn as-is)
+            if (camera != null)
+            {
+                float scale = Engine.Settings.LODScale;
+                position = camera.Position;
+                factor = camera.FoVFactor * scale * scale;
+            }
+
+            commandList.SetComputeRoot32BitConstant(0, MeshRegistry.LodSrvIndex, 33);
+            commandList.SetComputeRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(position.X), 34);
+            commandList.SetComputeRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(position.Y), 35);
+            commandList.SetComputeRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(position.Z), 36);
+            commandList.SetComputeRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(factor), 37);
+        }
+
         public void Cull(ID3D12GraphicsCommandList commandList, ulong frustumBufferGPUAddress, GPUCuller? culler)
         {
             if (SubBatchCount == 0) return;
@@ -602,6 +625,7 @@ namespace Freefall.Graphics
             commandList.SetComputeRoot32BitConstant(0, histogramUAVIndices[frameIndex], 26);
             commandList.SetComputeRoot32BitConstant(0, (uint)MeshRegistry.Count, 27);
             commandList.SetComputeRoot32BitConstant(0, drawCountUAVIndices[frameIndex], 18); // DrawCountUAVIdx
+            SetLodConstants(commandList);
 
 
             // Bind per-instance buffer SRV indices to COMPUTE push constants (hardcoded slots).
@@ -882,6 +906,7 @@ namespace Freefall.Graphics
             commandList.SetComputeRoot32BitConstant(0, shadowExpansionUAVIndices[frameIndex], 29);    // ExpansionUAVIdx
             commandList.SetComputeRoot32BitConstant(0, cascadeBufferSrv, 31);                         // CascadeBufferSRVIdx (Indices[7].w)
             commandList.SetComputeRoot32BitConstant(0, 0u, 18);                                       // DrawCountUAVIdx = 0 → fixed-index mode (shadow needs it)
+            SetLodConstants(commandList);                                                             // main camera: shadows use the main view's LOD
 
             foreach (var (hash, pib) in _perInstanceBuffers)
             {

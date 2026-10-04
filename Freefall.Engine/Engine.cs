@@ -185,6 +185,10 @@ namespace Freefall
             Device?.FlushFrameDeferredDisposals();
             _flushDisposeSw.Stop();
 
+            // Hot-reload loaded assets whose source was reimported (auto-import, asset_refresh, inspector
+            // reimport). Before Update/Draw so the whole frame sees the new data.
+            Assets?.ReloadReimported();
+
             // Flush pending entity additions before Update/Render
             //var _flushPendingSw = System.Diagnostics.Stopwatch.StartNew();
             //Base.EntityManager.FlushPending();
@@ -438,14 +442,15 @@ namespace Freefall
          public bool VSync { get; set; } = true;                            // F1 - VSync
          public bool Wireframe { get; set; } = false;                       // F2 - Global wireframe
          public bool EnableSMAA { get; set; } = false;                      // Anti-aliasing
+         public bool ShowGrid { get; set; } = true;                      // Show editor grid in scene view
 
-         [Category("Culling")]
+        [Category("Culling")]
          public bool FreezeFrustum { get; set; } = false;                   // F3 - Freeze culling frustum
          public bool DisableHiZ { get; set; } = false;                      // F6 - Disable Hi-Z occlusion
          public bool DisableDepthSort { get; set; } = true;                 // GPU doesn't order instances within a draw call — sort has no visual effect
 
          /// <summary>
-         /// Global LOD distance scale. Default 1.0.
+         /// Global LOD distance scale. Default 1.0. Linear: 2.0 doubles every LOD and cull distance.
          /// Higher = LODs stay high-detail longer (quality). Lower = transition sooner (performance).
          /// Multiplied with per-mesh Mesh.LODBias.
          /// </summary>
@@ -474,7 +479,25 @@ namespace Freefall
          [ValueRange(1f, 8f)]
          public float SSSShadowContrast { get; set; } = 2.0f;
 
-         [Category("Displacement")]                                         // Screen-Space Displacement Mapping (SSDM)
+         [Category("Ambient Occlusion")]                                    // GTAO (spatial-only, no TAA)
+         public bool EnableGTAO { get; set; } = true;
+
+         [ValueRange(0.1f, 4f)]
+         public float GTAORadius { get; set; } = 1.0f;                      // World-space radius (meters)
+
+         [ValueRange(0f, 1f)]
+         public float GTAOIntensity { get; set; } = 1.0f;
+
+         [ValueRange(0f, 1f)]
+         public float GTAODirectStrength { get; set; } = 0.5f;              // AO applied to direct light (0 = ambient only, physically correct)
+
+         [ValueRange(0.5f, 4f)]
+         public float GTAOPower{ get; set; } = 1.5f;                       // Visibility exponent (higher = darker)
+
+         [ValueRange(1, 8)]
+         public int GTAOSlices { get; set; } = 3;                           // Horizon slices per pixel (quality vs cost)
+
+         [Category("Displacement")]                                      // Screen-Space Displacement Mapping (SSDM)
          public bool EnableSSDM { get; set; } = true;
          public bool UseSSDMPyramid { get; set; } = true;
 

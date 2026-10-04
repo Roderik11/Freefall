@@ -1,4 +1,6 @@
 using Squid;
+using Freefall.Assets;
+using Freefall.Assets.Importers;
 using Freefall.Graphics;
 using Freefall.Reflection;
 
@@ -59,10 +61,25 @@ namespace Freefall.Editor
 
             // LOD bias
             AddCategory("Settings");
-            AddProperty(target.GetProperty(nameof(Mesh.LODBias)));
+            var lodBias = target.GetProperty(nameof(Mesh.LODBias));
+            AddProperty(lodBias);
+            lodBias.OnValueChanged += SaveMeshConfig;
 
             if (_preview == null)
                 _preview = new MeshPreview();
+        }
+
+        /// <summary>
+        /// Persist per-mesh settings on the source file's ModelImporter (applied at load, no reimport).
+        /// </summary>
+        private void SaveMeshConfig()
+        {
+            if (string.IsNullOrEmpty(_mesh.Guid)) return;
+            if (AssetDatabase.GetImporter(_mesh.Guid) is not ModelImporter importer) return;
+
+            var meshName = AssetDatabase.ResolveFriendlyName(_mesh.Guid);
+            importer.GetOrAddMeshConfig(meshName).LODBias = _mesh.LODBias;
+            AssetDatabase.SaveImporter(_mesh.Guid, importer);
         }
 
         public override Control GetPreview()

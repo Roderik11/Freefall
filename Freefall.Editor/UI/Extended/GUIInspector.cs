@@ -18,8 +18,18 @@ namespace Freefall.Editor
 
         public event Action<GUIProperty> OnValueChanged;
 
-        static GUIInspector()
+        static GUIInspector() => RebuildTypeMaps();
+
+        /// <summary>
+        /// (Re)build the member-type → control and type → inspector maps from the registered assemblies.
+        /// Called again after a script reload: the maps include script subtypes, and stale ones would keep the
+        /// unloaded script assembly alive.
+        /// </summary>
+        internal static void RebuildTypeMaps()
         {
+            memberTypeToControlType.Clear();
+            typeToInspectorType.Clear();
+
             var types = Freefall.Reflection.Reflector.GetTypes<PropertyControl>();
 
             foreach (var controlType in types)

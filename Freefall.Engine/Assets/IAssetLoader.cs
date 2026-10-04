@@ -46,6 +46,14 @@ namespace Freefall.Assets
             => Load(name, manager);
 
         /// <summary>
+        /// Hot reload: re-read <paramref name="cachePath"/> into the already-loaded <paramref name="existing"/>
+        /// instance, so every component holding the reference picks up the reimported data. Called on the
+        /// main thread between frames. Return false when the type can't be reloaded in place; the stale
+        /// instance is then left untouched.
+        /// </summary>
+        bool Reload(Asset existing, string cachePath, string name, AssetManager manager, string guid) => false;
+
+        /// <summary>
         /// Save an asset's runtime-generated data to disk (YAML + cache subassets).
         /// Default: no-op. Override for types with runtime data (e.g. Terrain DeltaMaps).
         /// </summary>

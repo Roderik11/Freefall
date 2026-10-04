@@ -52,7 +52,11 @@ namespace Freefall.Editor.Commands
             AssetDatabase.ImportAll();
             int after = AssetDatabase.GetAllPaths().Count();
 
-            return CommandResult.Json(new { status = "refreshed", assetCount = after, added = after - before });
+            // Update loaded meshes/textures/materials/prefabs in place now (the engine tick would
+            // otherwise do it next frame) so the response can report it.
+            int reloaded = Engine.Assets.ReloadReimported();
+
+            return CommandResult.Json(new { status = "refreshed", assetCount = after, added = after - before, reloaded });
         }
     }
 
@@ -229,6 +233,9 @@ namespace Freefall.Editor.Commands
     {
         private static Dictionary<string, Type> _assetTypes;
 
+        /// <summary>Forget the cached types after a script reload (it would pin the old script assembly).</summary>
+        internal static void ResetTypeCache() => _assetTypes = null;
+
         private static Dictionary<string, Type> AssetTypes
         {
             get
@@ -237,6 +244,7 @@ namespace Freefall.Editor.Commands
                 _assetTypes = new Dictionary<string, Type>(StringComparer.OrdinalIgnoreCase);
                 foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
                 {
+                    if (ScriptCompiler.IsStale(asm)) continue;
                     try
                     {
                         foreach (var type in asm.GetTypes())
@@ -291,7 +299,7 @@ namespace Freefall.Editor.Commands
             {
                 var guid = AssetCreator.CreateAsset(assetType, folderPath, name);
                 if (string.IsNullOrEmpty(guid))
-                    return CommandResult.Error(500, $"Failed to create asset of type '{typeName}'");
+                    return CommandResult.Error(500, $"Failed to create asset of type '{typeName}': {AssetCreator.LastError ?? "unknown error"}");
 
                 var asset = Engine.Assets.LoadByGuid(guid, assetType);
                 return CommandResult.Json(new { guid, type = assetType.Name, name = asset?.Name ?? name });

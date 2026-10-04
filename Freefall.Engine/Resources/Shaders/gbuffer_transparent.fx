@@ -35,6 +35,16 @@ cbuffer PushConstants : register(b3)
 
 #include "common.fx"
 #include "sky_common.fx"
+
+// Glass effects enabled for every material using this shader (bit mask, see "Feature mask" in PS):
+// 1 = specular, 2 = refraction, 4 = sky reflection. 0 = base only: a plain alpha-blended lit surface, the
+// known-good baseline to fall back to when bisecting (a material can add bits through DetailTiling.x).
+// 7 validated 2026-10-03 (no bright panes in shade) after the reflection fixes below.
+// 8 = damp the sky reflection on panes in the sun's shadow (heuristic), down to GLASS_SHADE_REFLECTION.
+//     Off by default: shaded windows really do reflect the sky, and the gate cuts the reflection along shadow
+//     edges. Use 15u if shaded narrow streets read too bright.
+#define GLASS_FX_DEFAULT 7u
+#define GLASS_SHADE_REFLECTION 0.25
 // @RenderState(RenderTargets=2, DepthWrite=false, Blend=AlphaBlend, CullMode=None)
 
 // Light params from ObjectConstants
@@ -131,9 +141,13 @@ VSOutput VS(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_InstanceI
     float3 norm = normals[vertexID];
     float2 uv = uvs[vertexID];
 
+    // World is an absolute transform and View carries the camera translation (same as gbuffer.fx).
+    // The pixel shader works camera-relative (V = -WorldPos, cascade depth, LightSpaces lookup), so hand it
+    // worldPos - CamPos; passing the absolute position made V point at the world origin, which flipped the
+    // normal of every pane facing away from the origin (lit when facing away from the sun, unlit facing it).
     float4 worldPos = mul(float4(pos, 1.0f), World);
-    output.WorldPos = worldPos;
-    output.AbsWorldPos = worldPos.xyz + CamPos;
+    output.WorldPos = float4(worldPos.xyz - CamPos, 1.0f);
+    output.AbsWorldPos = worldPos.xyz;
     output.Position = mul(mul(worldPos, View), Projection);
     output.Normal = mul(norm, W3);
     output.TexCoord = uv;
@@ -196,6 +210,7 @@ PSOutput PS(VSOutput input)
     float3 V = normalize(-input.WorldPos.xyz);
     if (dot(N, V) < 0.0)
         N = -N;
+    float3 Ng = N;   // geometric (pane) normal, before normal mapping — used for the glass reflection
 
     float3 dp1 = ddx(input.WorldPos.xyz);
     float3 dp2 = ddy(input.WorldPos.xyz);
@@ -307,6 +322,13 @@ PSOutput PS(VSOutput input)
     // Emissive adds directly to lighting (self-illumination)
     lighting += emissive * (1 - alpha);
 
+    // ── Feature mask ──
+    // The base is a lit surface alpha-blended by the albedo's alpha (known good). Effects are layered on top,
+    // each behind one bit, so they can be switched live per material while they are being validated:
+    // material DetailTiling.x (unused by this shader otherwise) = sum of
+    //   1 = specular highlight   2 = refraction (scene snapshot tinted by the glass)   4 = sky reflection (Fresnel)
+    uint glassFx = GLASS_FX_DEFAULT | (uint)(mat.DetailTiling.x + 0.5);
+
     // ── Refraction: sample scene behind through glass ──
     float3 refracted = float3(0, 0, 0);
     bool hasRefraction = false;
@@ -324,69 +346,63 @@ PSOutput PS(VSOutput input)
         hasRefraction = true;
     }
 
-    // ── Glass Fresnel: more reflective at glancing angles ──
-    float glassFresnel = pow(1.0 - NdotV, 4.0);
-    glassFresnel = lerp(0.04, 1.0, glassFresnel);
+    // ── Glass Fresnel (Schlick): more reflective at glancing angles ──
+    // From the pane's geometric normal: with the normal-mapped N the bumps of the lead cames swing NdotV
+    // towards 0 and the cames flare with sky colour.
+    float glassFresnel = lerp(0.04, 1.0, pow(1.0 - saturate(dot(Ng, V)), 5.0));
+    // Only the smooth panes mirror their surroundings; rough parts of the texture (lead) do not.
+    float gloss = saturate(1.0 - roughness);
+    glassFresnel *= gloss * gloss;
 
-    // Environment reflection (sky)
-    float3 reflectDir = reflect(-V, N);
-    reflectDir.y = abs(reflectDir.y);
-    float3 envReflect = GetSkyColor(reflectDir, FogSunDirection) * 0.5;
+    // Environment reflection: the sky above the horizon, a dark ground tone below it (a pane seen from above
+    // reflects the street, not the sky — mirroring the direction upwards made such panes glow).
+    float3 reflectDir = reflect(-V, Ng);
+    float3 skyReflect = GetSkyColor(normalize(float3(reflectDir.x, max(reflectDir.y, 0.02), reflectDir.z)), FogSunDirection);
+    float3 envReflect = lerp(gndCol * AmbientScale, skyReflect, smoothstep(-0.15, 0.1, reflectDir.y));
 
-    float3 finalColor;
-    float finalAlpha;
+    // Base: the lit glass surface; the blend state mixes it over what is behind with alpha.
+    // (Both lighting and refracted are linear HDR — finalize handles tonemapping.)
+    float3 finalColor = lighting;
+    float finalAlpha = saturate(alpha);
 
-    if (hasRefraction)
+    // 2: refraction — replace the base by "scene behind, tinted by the glass" mixed with the lit surface.
+    //    Output alpha still controls how much this pixel overwrites previously drawn transparent layers.
+    if ((glassFx & 2u) != 0 && hasRefraction)
     {
-        // Refraction path: alpha controls glass opacity.
-        // Both glassLit and refracted are now linear HDR — finalize handles tonemapping.
-        float3 glassLit = lighting;
-        
-        // Tint scene-behind by glass color
         float3 tintedScene = refracted * lerp(float3(1,1,1), color.rgb, 0.3);
-        
-        // Mix: alpha drives opacity (scene-behind vs glass surface)
-        finalColor = lerp(tintedScene, glassLit, alpha);
-        
-        // Fresnel reflection on top (increases opacity at glancing angles)
-        finalColor = lerp(finalColor, envReflect, glassFresnel * 0.5);
-        
-        // Specular highlights always on top — Reinhard rolloff prevents HDR blowout
-        finalColor += specLighting / (1.0 + specLighting);
-        
-        // Aerial perspective fog — use input.Depth (linear view-space Z) for distance
-        if (FogEnabled > 0)
-        {
-            float fogDist = input.Depth;
-            float fogFactor = saturate(1.0 - exp(-pow(fogDist * FogDensity, 2.0)));
-            float3 viewDir = normalize(input.WorldPos.xyz);
-            float3 inscatter = GetSkyColor(float3(viewDir.x, max(viewDir.y, 0.01), viewDir.z), FogSunDirection);
-            finalColor = lerp(finalColor, inscatter, fogFactor);
-        }
-        
-        // Output alpha for multi-layer transparency:
-        // The internal lerp already mixed refracted scene with glass lighting using alpha.
-        // Output alpha controls how much this pixel overwrites previously-drawn transparent layers.
-       // finalAlpha = saturate(alpha + glassFresnel * 0.3);
-        finalAlpha = saturate(alpha);
+        finalColor = lerp(tintedScene, lighting, alpha);
     }
-    else
+
+    // Surface terms. They belong to the glass surface, so the pane's transparency must not dim them:
+    //   pixel = (finalColor·a + behind·(1−a))·(1−F) + F·env + spec
+    // which the AlphaBlend state (src·A + dst·(1−A)) produces with
+    //   A = 1 − (1−a)(1−F),   src = (finalColor·a·(1−F) + F·env + spec) / A
+    // (Writing them into finalColor instead scaled them by a ≈ 0.3 a second time — together with the old
+    // halvings the reflection ended up at ~0.2 % of the sky: invisible.)
+    float Fr = 0.0;                                  // 4: Fresnel sky reflection, stronger at glancing angles
+    if ((glassFx & 4u) != 0)
+        Fr = glassFresnel;
+    // 8: damp the sky reflection on panes the sun does not reach (shadow map at the pane). A heuristic, not
+    //    reflection occlusion: shade usually means "narrow street, little sky to mirror", where an unoccluded sky
+    //    reflection reads as a glow. Wrong for a shaded pane under open sky (it would really show sky) and for a
+    //    sunlit pane facing a wall. A floor keeps shaded panes from going completely dead.
+    if ((glassFx & 8u) != 0)
+        Fr *= lerp(GLASS_SHADE_REFLECTION, 1.0, shadowFactor * step(0.0, dot(Ng, L)));
+    float3 surface = Fr * envReflect;
+    if ((glassFx & 1u) != 0)                         // 1: specular highlight — Reinhard rolloff against HDR blowout
+        surface += specLighting / (1.0 + specLighting);
+
+    float outAlpha = 1.0 - (1.0 - finalAlpha) * (1.0 - Fr);
+    finalColor = (finalColor * finalAlpha * (1.0 - Fr) + surface) / max(outAlpha, 1e-3);
+    finalAlpha = outAlpha;
+
+    // Aerial perspective fog — input.Depth is linear view-space Z
+    if (FogEnabled > 0)
     {
-        // Fallback: no composite snapshot available, use alpha blending
-        finalColor = lerp(envReflect, lighting, 1.0 - glassFresnel);
-        finalColor += specLighting / (1.0 + specLighting);
-        
-        // Aerial perspective fog — use input.Depth (linear view-space Z) for distance
-        if (FogEnabled > 0)
-        {
-            float fogDist = input.Depth;
-            float fogFactor = saturate(1.0 - exp(-pow(fogDist * FogDensity, 2.0)));
-            float3 viewDir = normalize(input.WorldPos.xyz);
-            float3 inscatter = GetSkyColor(float3(viewDir.x, max(viewDir.y, 0.01), viewDir.z), FogSunDirection);
-            finalColor = lerp(finalColor, inscatter, fogFactor);
-        }
-        
-        finalAlpha = alpha;
+        float fogFactor = saturate(1.0 - exp(-pow(input.Depth * FogDensity, 2.0)));
+        float3 viewDir = normalize(input.WorldPos.xyz);
+        float3 inscatter = GetSkyColor(float3(viewDir.x, max(viewDir.y, 0.01), viewDir.z), FogSunDirection);
+        finalColor = lerp(finalColor, inscatter, fogFactor);
     }
 
     output.Color = float4(finalColor, finalAlpha);

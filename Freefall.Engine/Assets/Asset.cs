@@ -44,6 +44,12 @@ namespace Freefall.Assets
         /// </summary>
         public void ClearDirty() => IsDirty = false;
 
+        /// <summary>
+        /// AssetDatabase.ImportStamp when this instance was loaded from cache. Hot reload only
+        /// refreshes instances loaded before their latest import.
+        /// </summary>
+        internal long LoadedAtImportStamp;
+
         // ── Streaming State ──
         private long _readyFenceValue = long.MaxValue;
         

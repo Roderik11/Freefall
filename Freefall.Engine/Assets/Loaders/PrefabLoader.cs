@@ -41,6 +41,20 @@ namespace Freefall.Assets.Loaders
         }
 
         /// <summary>
+        /// Hot reload: swap in the reimported YAML so future Instantiate() calls use it.
+        /// Already-placed instances are entities and keep their component state.
+        /// </summary>
+        public bool Reload(Asset existing, string cachePath, string name, AssetManager manager, string guid)
+        {
+            if (existing is not Prefab prefab)
+                return false;
+
+            using (var stream = File.OpenRead(cachePath))
+                prefab.SourceYaml = _packer.Read(stream).Yaml;
+            return true;
+        }
+
+        /// <summary>
         /// Save a Prefab's SourceYaml back to its source .prefab file,
         /// then re-import so the binary cache stays in sync.
         /// </summary>

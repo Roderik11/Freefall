@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Reflection;
 using System.Threading.Tasks;
 using System.Xml.Serialization;
@@ -196,9 +197,15 @@ namespace Freefall.Base
         /// Non-generic AddComponent for runtime deserialization.
         /// Uses reflection to call ComponentCache&lt;T&gt;.Add with the actual component type.
         /// </summary>
-        public Component AddComponent(Component component)
+        public Component AddComponent(Component component) => InsertComponent(_components.Count, component);
+
+        /// <summary>
+        /// Non-generic add at a given position in <see cref="Components"/> (clamped to the list).
+        /// Used by script hot-reload to put a migrated component back where the old one was.
+        /// </summary>
+        public Component InsertComponent(int index, Component component)
         {
-            _components.Add(component);
+            _components.Insert(Math.Clamp(index, 0, _components.Count), component);
             component.Entity = this;
 
             if (component is Transform t)
@@ -231,11 +238,43 @@ namespace Freefall.Base
             if (component is Transform) return; // never remove Transform
             if (!_components.Remove(component)) return;
 
-            component.Destroy();
+            try
+            {
+                component.Destroy();
+            }
+            finally
+            {
+                // A throwing Destroy() must not leave the component registered in its cache
+                var cacheType = GetCacheType(component.GetType());
+                var removeMethod = cacheType.GetMethod("Remove", BindingFlags.Public | BindingFlags.Static, [typeof(Entity)]);
+                removeMethod?.Invoke(null, [this]);
+            }
+        }
+
+        /// <summary>
+        /// Take a component off this entity WITHOUT destroying it, so it can be added to another entity
+        /// (prefab hydration moves components off a temporary root). Unregisters it from ComponentCache
+        /// under this entity; adding it elsewhere registers it again.
+        /// </summary>
+        internal void DetachComponent(Component component)
+        {
+            if (component is Transform) return;
+            if (!_components.Remove(component)) return;
 
             var cacheType = GetCacheType(component.GetType());
             var removeMethod = cacheType.GetMethod("Remove", BindingFlags.Public | BindingFlags.Static, [typeof(Entity)]);
             removeMethod?.Invoke(null, [this]);
+            component.Entity = null;
+        }
+
+        /// <summary>
+        /// Forget the ComponentCache&lt;T&gt; types built for component types matching the predicate
+        /// (script types whose assembly is being unloaded), so this static map doesn't pin their ALC.
+        /// </summary>
+        internal static void ForgetCacheTypes(Func<Type, bool> predicate)
+        {
+            foreach (var type in _cacheTypes.Keys.Where(predicate).ToList())
+                _cacheTypes.Remove(type);
         }
 
         public void RemoveComponent<T>() where T : Component

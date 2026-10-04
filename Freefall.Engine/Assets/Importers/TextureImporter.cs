@@ -62,7 +62,7 @@ namespace Freefall.Assets.Importers
         private static readonly string[] LinearSuffixes = {
             "_Nor", "Normal", "Norm", "Nrm", "_N",
             "_Spec", "_Specular", "_SpecGloss",
-            "_Roughness", "_Rough",
+            "_Roughness", "_Rough", "_Smoothness", "_Gloss",
             "_Metal", "_Metallic", "_MetallicGloss",
             "AO", "Aoc", "Occlusion",
             "_Depth", "_Height", "_Parallax",
@@ -77,6 +77,16 @@ namespace Freefall.Assets.Importers
             "_Nor", "Normal","Norm", "Nrm", "_N",
             "_DetailNormal",
             "_BumpMap", "_Bump",
+        };
+
+        // Single-channel data maps (shaders read .r only) — use BC4: one channel with 8-bit endpoints and
+        // 8 levels per block. BC1's 5:6:5 RGB terraces smooth gradients, which screen-space displacement
+        // turns into visible steps. Packed maps (_MetallicGloss, _SpecGloss, _Mask) are excluded.
+        private static readonly string[] SingleChannelSuffixes = {
+            "_Roughness", "_Rough", "_Smoothness", "_Gloss",
+            "_Metal", "_Metallic",
+            "AO", "Aoc", "Occlusion",
+            "_Depth", "_Height", "_Parallax", "_DetailMask",
         };
 
         public ImportResult Import(string filepath)
@@ -128,6 +138,10 @@ namespace Freefall.Assets.Importers
                         {
                             Format = TextureFormat.BC5_UNORM;
                             IsNormalMap = true;
+                        }
+                        else if (SingleChannelSuffixes.Any(s => name.EndsWith(s, StringComparison.OrdinalIgnoreCase)))
+                        {
+                            Format = TextureFormat.BC4_UNORM;
                         }
                     }
 

@@ -375,6 +375,26 @@ namespace Freefall.Serialization
         }
 
         /// <summary>
+        /// Read a { TypeName: { fields... } } document into an existing instance, matching members by name against
+        /// the instance's own type (the embedded type name is ignored). Unknown members are skipped. Asset and
+        /// Entity/Component references are left as stubs in DeferredRefs / DeferredUniqueIdRefs for the caller.
+        /// Used by script hot-reload to move a component's data onto the reloaded type.
+        /// </summary>
+        public void Populate(string text, object instance)
+        {
+            var bytes = Encoding.UTF8.GetBytes(text);
+            var parser = YamlParser.FromBytes(bytes);
+
+            parser.SkipAfter(ParseEventType.DocumentStart);
+            parser.SkipAfter(ParseEventType.MappingStart);
+            parser.ReadScalarAsString(); // type name
+
+            var fields = Reflector.GetMapping(instance.GetType());
+            while (parser.CurrentEventType != ParseEventType.MappingEnd && !parser.End)
+                ReadNext(ref parser, instance, fields);
+        }
+
+        /// <summary>
         /// Deserialize a multi-document YAML stream (e.g. a .scene file).
         /// Single-pass parsing using LiteYaml's native multi-document support.
         /// </summary>
@@ -499,10 +519,17 @@ namespace Freefall.Serialization
                     // Peek at the key — could be a type discriminator or a field name
                     var key = parser.ReadScalarAsString();
 
-                    // Type discriminator: "Freefall.Assets.MeshElement" followed by inner mapping
-                    if (key != null && key.Contains('.'))
+                    // Type discriminator: "Freefall.Assets.MeshElement" followed by inner mapping. Script types in
+                    // the global namespace have no dot ("TfRect"): a key that is no field of the type, names a type
+                    // assignable to it and opens a mapping is a discriminator too, or the element's fields would be
+                    // skipped (it would load as a default object).
+                    bool bareDiscriminator = key != null && !key.Contains('.') && !fields.TryGetValue(key, out _)
+                        && parser.CurrentEventType == ParseEventType.MappingStart
+                        && (key == type.Name || Reflector.FindTypeBySimpleName(key) is { } bare && type.IsAssignableFrom(bare));
+                    if (key != null && (key.Contains('.') || bareDiscriminator))
                     {
-                        var resolvedType = Reflector.GetType(key);
+                        var resolvedType = key.Contains('.') ? Reflector.GetType(key)
+                                         : key == type.Name ? type : Reflector.FindTypeBySimpleName(key);
                         if (resolvedType != null && type.IsAssignableFrom(resolvedType))
                         {
                             type = resolvedType;

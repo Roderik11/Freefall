@@ -169,7 +169,7 @@ namespace Freefall.Editor
         private void Result_MouseClick(Control sender, MouseEventArgs args)
         {
             var logentry = (Debug.LogEntry)sender.Tag;
-            var text = MakePretty(logentry.StackTrace);
+            var text = MakePretty(logentry);
             lblDetails.Text = text;
         }
 
@@ -189,23 +189,31 @@ namespace Freefall.Editor
             return result;
         }
         
-        private string MakePretty(StackTrace trace)
+        private string MakePretty(Debug.LogEntry entry)
         {
-            // Release builds log warnings/errors without a captured stack
-            if (trace == null) return "(no stack trace captured in Release builds)";
-            string text = trace.GetFrames().StackFramesToString();
+            // Script logs carry a pre-rendered stack (a live StackTrace would pin the script assembly)
+            string text;
+            (string File, int Line)[] locations;
+            if (entry.StackTrace != null)
+            {
+                text = entry.StackTrace.GetFrames().StackFramesToString();
+                locations = Debug.StackLocationsOf(entry.StackTrace);
+            }
+            else if (entry.StackText != null)
+            {
+                text = entry.StackText;
+                locations = entry.StackLocations ?? [];
+            }
+            else
+            {
+                // Release builds log warnings/errors without a captured stack
+                return "(no stack trace captured in Release builds)";
+            }
+
             string reg = "{0}:line {1}";
 
-            for (int i = 0; i < trace.FrameCount; i++)
+            foreach (var (filename, line) in locations)
             {
-                var frame = trace.GetFrame(i);
-                var filename = frame.GetFileName();
-
-                if (string.IsNullOrEmpty(filename))
-                    continue;
-            
-                var line = frame.GetFileLineNumber();
-
                 string find = string.Format(CultureInfo.InstalledUICulture, reg, filename, line);
                 text = text.Replace(find, $"[url={filename}:{line}]{find}[/url]");
             }

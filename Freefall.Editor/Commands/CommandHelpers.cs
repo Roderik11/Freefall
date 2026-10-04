@@ -184,6 +184,7 @@ namespace Freefall.Editor.Commands
                 var typeName = Freefall.Assets.AssetDatabase.GetAssetTypeName(guid);
                 if (typeName == null) return null;
                 type = System.AppDomain.CurrentDomain.GetAssemblies()
+                    .Where(a => !ScriptCompiler.IsStale(a))
                     .SelectMany(a => { try { return a.GetTypes(); } catch { return System.Type.EmptyTypes; } })
                     .FirstOrDefault(t => !t.IsAbstract && typeof(Freefall.Assets.Asset).IsAssignableFrom(t)
                                          && string.Equals(t.Name, typeName, System.StringComparison.OrdinalIgnoreCase));

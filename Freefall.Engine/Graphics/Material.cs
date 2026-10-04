@@ -58,6 +58,11 @@ namespace Freefall.Graphics
         /// Returns null if the value is at its default.
         /// </summary>
         public abstract string FormatValue();
+
+        /// <summary>
+        /// Restore the default value. Used when a hot-reloaded definition no longer sets this property.
+        /// </summary>
+        public abstract void ResetToDefault();
     }
 
     /// <summary>
@@ -104,6 +109,8 @@ namespace Freefall.Graphics
                 return null;
             return Serialization.YAMLConverterHelper.Format(_value);
         }
+
+        public override void ResetToDefault() => Value = _defaultValue;
     }
 
     
@@ -735,6 +742,20 @@ namespace Freefall.Graphics
             foreach (var tp in _textureParameters)
             {
                 if (tp.Name == name) { tp.Value = texture; break; }
+            }
+        }
+
+        /// <summary>
+        /// Remove a texture binding (hot reload of a definition that dropped the slot).
+        /// </summary>
+        public void ClearTexture(string name)
+        {
+            if (!_textures.Remove(name)) return;
+            UpdateMaterialData(name, 0);
+
+            foreach (var tp in _textureParameters)
+            {
+                if (tp.Name == name) { tp.Value = null; break; }
             }
         }
 

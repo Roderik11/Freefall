@@ -20,9 +20,12 @@ namespace Freefall.Components
         /// <summary>PCGGraph asset to execute.</summary>
         public PCGGraph Graph;
 
-        /// <summary>Auto-execute when the component wakes up.</summary>
-        [System.ComponentModel.DefaultValue(false)]
-        public bool ExecuteOnAwake = false;
+        /// <summary>
+        /// Auto-execute when the component wakes up. On by default: spawned output is DontSave, so a component that
+        /// doesn't run on awake comes back empty after every scene load.
+        /// </summary>
+        [System.ComponentModel.DefaultValue(true)]
+        public bool ExecuteOnAwake = true;
 
         /// <summary>
         /// Child entity that holds all spawned output.
@@ -154,6 +157,9 @@ namespace Freefall.Components
 
                 if (node is ExcludeStamps excludeStamps)
                     excludeStamps.IgnoreEntity = Entity;
+
+                if (node is MeshProjection meshProjection)
+                    meshProjection.IgnoreRoot = OutputEntity;
 
                 // Points are local to this entity; nodes testing them against world data need the transform.
                 if (node is IWorldSpaceNode worldNode)

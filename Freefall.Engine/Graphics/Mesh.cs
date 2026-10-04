@@ -39,6 +39,14 @@ namespace Freefall.Graphics
     public class MeshLOD
     {
         public int[] MeshPartIndices;
+
+        /// <summary>
+        /// Screen size (bounding sphere diameter as a fraction of viewport height) below which
+        /// this LOD takes over from the previous one. Derived from triangle counts by
+        /// Mesh.ComputeLODScreenSizes; LOD 0 is always float.MaxValue.
+        /// </summary>
+        [NonSerialized]
+        public float ScreenSize = float.MaxValue;
     }
 
     [AssetTypeAlias("MeshData")]
@@ -66,9 +74,234 @@ namespace Freefall.Graphics
         /// Multiplied with global Engine.Settings.LODScale.
         /// </summary>
         [ValueRange(0.1f, 10.0f)]
-        public float LODBias { get; set; } = 1.0f;
+        public float LODBias
+        {
+            get => _lodBias;
+            set
+            {
+                if (_lodBias == value) return;
+                _lodBias = value;
+                // The bias is folded into the GPU LOD chain (MeshRegistry), so refresh the entries.
+                if (_meshPartIds != null) RegisterMeshParts();
+            }
+        }
+        private float _lodBias = 1.0f;
 
         public bool IsDynamic { get; set; }
+
+        /// <summary>
+        /// Screen size at which LOD 0 is considered to have exactly the triangle density it needs.
+        /// Every lower LOD switches in where it reaches that same density, so the chain adapts to
+        /// how many LODs a mesh has and how strongly each one is reduced.
+        /// </summary>
+        public const float LODReferenceScreenSize = 0.5f;
+
+        /// <summary>Objects smaller than this fraction of viewport height are not drawn.</summary>
+        public const float LODCullScreenSize = 0.006f;
+
+        // A LOD must switch in at least this much below the previous one, even if it barely
+        // reduces the triangle count (or the chain is not monotonic).
+        private const float LODMinStep = 0.8f;
+
+        // ...and at most this much below it. Billboard/impostor LODs have almost no triangles
+        // (their detail is in the texture), so the density formula alone would put them at the
+        // cull size and they would never show.
+        private const float LODMaxStep = 0.5f;
+
+        private const float LODCullScreenSizeSq = LODCullScreenSize * LODCullScreenSize;
+
+        /// <summary>
+        /// Derive MeshLOD.ScreenSize for every LOD: ScreenSize[i] = reference * sqrt(tris[i] / tris[0]).
+        /// </summary>
+        public void ComputeLODScreenSizes()
+        {
+            if (LODs.Count == 0) return;
+
+            long baseIndices = CountLODIndices(LODs[0]);
+            LODs[0].ScreenSize = float.MaxValue;
+
+            float previous = LODReferenceScreenSize;
+            for (int i = 1; i < LODs.Count; i++)
+            {
+                long indices = CountLODIndices(LODs[i]);
+                float ratio = baseIndices > 0 ? MathF.Min(1f, (float)indices / baseIndices) : 1f;
+                float size = LODReferenceScreenSize * MathF.Sqrt(ratio);
+                size = Math.Clamp(size, previous * LODMaxStep, i == 1 ? previous : previous * LODMinStep);
+                LODs[i].ScreenSize = size;
+                previous = size;
+            }
+        }
+
+        private long CountLODIndices(MeshLOD lod)
+        {
+            long count = 0;
+            if (lod.MeshPartIndices != null)
+                foreach (var idx in lod.MeshPartIndices)
+                    if (idx < MeshParts.Count)
+                        count += MeshParts[idx].NumIndices;
+            return count;
+        }
+
+        /// <summary>
+        /// CPU early-out for renderers that still enqueue every frame: true if the sphere is below
+        /// LODCullScreenSize for Camera.Main. The GPU culler applies the same test (MeshPartLod.CullK);
+        /// this only saves the enqueue and the per-instance upload for objects it would reject anyway.
+        /// Squared space, no sqrt or division. Goes away once draws are GPU-resident.
+        /// </summary>
+        public static bool IsBelowCullSize(in BoundingSphere sphere)
+        {
+            var cam = Components.Camera.Main;
+            if (cam == null) return false;
+
+            float distanceSq = Vector3.DistanceSquared(sphere.Center, cam.Position);
+            float scale = Engine.Settings.LODScale;
+            return sphere.Radius * sphere.Radius * cam.FoVFactor * scale * scale < LODCullScreenSizeSq * distanceSq;
+        }
+
+        /// <summary>
+        /// Part indices a renderer submits each frame: the head of every LOD chain plus the non-LOD
+        /// parts (all parts if the mesh has no LOD chain). LOD selection happens on the GPU: the
+        /// culling pass walks from each head to the part of the active LOD (see MeshRegistry.MeshPartLod).
+        /// </summary>
+        public int[] DrawPartIndices
+        {
+            get
+            {
+                // Runtime-built meshes fill MeshParts without calling ComputeNonLodPartIndices
+                var draw = _drawPartIndices;
+                if (draw == null || (LODs.Count == 0 && draw.Length != MeshParts.Count))
+                {
+                    ComputeLODChain();
+                    draw = _drawPartIndices!;
+                }
+                return draw;
+            }
+        }
+        private int[]? _drawPartIndices;
+
+        // Per part: first/last LOD index containing it and the part that takes over at the next LOD
+        // (same material slot), or -1. Null if the mesh has no LOD chain.
+        private int[]? _partLodFirst;
+        private int[]? _partLodLast;
+        private int[]? _partLodNext;
+
+        /// <summary>
+        /// Build the per-part LOD chain: each part links to the part with the same material slot in
+        /// the next LOD that has one. Parts nothing links to are the chain heads.
+        /// </summary>
+        private void ComputeLODChain()
+        {
+            int partCount = MeshParts.Count;
+
+            if (LODs.Count == 0)
+            {
+                _partLodFirst = _partLodLast = _partLodNext = null;
+                var all = new int[partCount];
+                for (int i = 0; i < partCount; i++) all[i] = i;
+                _drawPartIndices = all;
+                return;
+            }
+
+            var first = new int[partCount];
+            var last = new int[partCount];
+            var next = new int[partCount];
+            Array.Fill(first, -1);
+            Array.Fill(last, -1);
+            Array.Fill(next, -1);
+
+            for (int lod = 0; lod < LODs.Count; lod++)
+            {
+                var indices = LODs[lod].MeshPartIndices;
+                if (indices == null) continue;
+                foreach (var idx in indices)
+                {
+                    if (idx >= partCount) continue;
+                    if (first[idx] < 0) first[idx] = lod;
+                    last[idx] = lod;
+                }
+            }
+
+            var isTarget = new bool[partCount];
+            for (int lod = 0; lod < LODs.Count; lod++)
+            {
+                var indices = LODs[lod].MeshPartIndices;
+                if (indices == null) continue;
+                foreach (var p in indices)
+                {
+                    if (p >= partCount || first[p] != lod) continue;
+                    int slot = MeshParts[p].MaterialSlot;
+
+                    for (int l = last[p] + 1; l < LODs.Count && next[p] < 0; l++)
+                    {
+                        var candidates = LODs[l].MeshPartIndices;
+                        if (candidates == null) continue;
+                        foreach (var q in candidates)
+                        {
+                            if (q >= partCount || first[q] != l || isTarget[q]) continue;
+                            if (MeshParts[q].MaterialSlot != slot) continue;
+                            next[p] = q;
+                            isTarget[q] = true;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            var draw = new List<int>();
+            for (int i = 0; i < partCount; i++)
+                if (first[i] >= 0 && !isTarget[i])
+                    draw.Add(i);
+            if (NonLodPartIndices != null)
+                draw.AddRange(NonLodPartIndices);
+
+            _partLodFirst = first;
+            _partLodLast = last;
+            _partLodNext = next;
+            _drawPartIndices = draw.ToArray();
+        }
+
+        /// <summary>
+        /// LOD data for one part's MeshRegistry entry. Distances are stored as "k" values:
+        /// k = distanceSq / (Camera.FoVFactor * LODScale² * instanceScale²), so a screen-size threshold T
+        /// becomes k = radius² * LODBias² / T². The mesh radius and bias are folded in here.
+        /// </summary>
+        /// <param name="center">Mesh-local centre every part measures distance to, so they switch together.</param>
+        /// <param name="cullK">Beyond this k the mesh is smaller than LODCullScreenSize. 0 = never.</param>
+        /// <param name="nearK">The part is not drawn closer than this. 0 = no limit.</param>
+        /// <param name="farK">Beyond this the next part takes over. 0 = no limit.</param>
+        /// <param name="nextPartIndex">Part of the next LOD, or -1.</param>
+        internal void GetPartLod(int partIndex, out Vector3 center, out float cullK, out float nearK, out float farK, out int nextPartIndex)
+        {
+            var box = BoundingBox;
+            center = (box.Min + box.Max) * 0.5f;
+            float radiusSq = Vector3.DistanceSquared(box.Max, center);
+
+            cullK = radiusSq / LODCullScreenSizeSq;
+            nearK = 0;
+            farK = 0;
+            nextPartIndex = -1;
+
+            var first = _partLodFirst;
+            var last = _partLodLast;
+            var next = _partLodNext;
+            if (first == null || last == null || next == null) return;
+            if (partIndex >= first.Length || first[partIndex] < 0) return;
+
+            float biased = radiusSq * _lodBias * _lodBias;
+            int a = first[partIndex];
+            int b = last[partIndex];
+            if (a > 0 && a < LODs.Count)
+            {
+                float t = LODs[a].ScreenSize;
+                nearK = biased / (t * t);
+            }
+            if (b + 1 < LODs.Count)
+            {
+                float t = LODs[b + 1].ScreenSize;
+                farK = biased / (t * t);
+            }
+            nextPartIndex = next[partIndex];
+        }
 
         /// <summary>
         /// Compute NonLodPartIndices from LODs and MeshParts.
@@ -76,9 +309,12 @@ namespace Freefall.Graphics
         /// </summary>
         public void ComputeNonLodPartIndices()
         {
+            ComputeLODScreenSizes();
+
             if (LODs.Count == 0 || MeshParts.Count == 0)
             {
                 NonLodPartIndices = null;
+                ComputeLODChain();
                 return;
             }
 
@@ -95,6 +331,7 @@ namespace Freefall.Graphics
                     nonLod.Add(i);
 
             NonLodPartIndices = nonLod.Count > 0 ? nonLod.ToArray() : null;
+            ComputeLODChain();
         }
         
         // Buffers
@@ -382,8 +619,74 @@ namespace Freefall.Graphics
 
         // Methods related to MeshRegistry, BoneWeights, Draw() etc. preserved...
         public int GetMeshPartId(int partIndex) { if (_meshPartIds == null) return -1; return _meshPartIds.Length > partIndex ? _meshPartIds[partIndex] : -1; }
-        public void RegisterMeshParts() { if (MeshParts.Count == 0) return; _meshPartIds = new int[MeshParts.Count]; for (int i = 0; i < MeshParts.Count; i++) _meshPartIds[i] = MeshRegistry.Register(this, i); }
+        public void RegisterMeshParts() { if (MeshParts.Count == 0) return; _meshPartIds = MeshRegistry.RegisterMesh(this); }
         
+        /// <summary>
+        /// Bumped by ReplaceGeometry. Renderers compare it to invalidate bounds cached from this instance.
+        /// </summary>
+        public int GeometryVersion { get; private set; }
+
+        /// <summary>
+        /// Hot reload: take over <paramref name="source"/>'s GPU buffers, parts, LODs and bounds so every
+        /// renderer referencing this instance draws the new geometry. <paramref name="source"/> receives the
+        /// old buffers and is disposed after the frames in flight retire; it must be a freshly created,
+        /// never-registered mesh whose uploads have completed (StreamingManager.Flush). Main thread only.
+        /// </summary>
+        public void ReplaceGeometry(Mesh source)
+        {
+            (_posBuffer, source._posBuffer) = (source._posBuffer, _posBuffer);
+            (_normBuffer, source._normBuffer) = (source._normBuffer, _normBuffer);
+            (_uvBuffer, source._uvBuffer) = (source._uvBuffer, _uvBuffer);
+            (_tanBuffer, source._tanBuffer) = (source._tanBuffer, _tanBuffer);
+            (_indexBuffer, source._indexBuffer) = (source._indexBuffer, _indexBuffer);
+            (_boneWeightBuffer, source._boneWeightBuffer) = (source._boneWeightBuffer, _boneWeightBuffer);
+            (_posView, source._posView) = (source._posView, _posView);
+            (_normView, source._normView) = (source._normView, _normView);
+            (_uvView, source._uvView) = (source._uvView, _uvView);
+            (_indexBufferView, source._indexBufferView) = (source._indexBufferView, _indexBufferView);
+
+            // Bindless indices travel with their buffers: the old ones are released when source is disposed.
+            (PosBufferIndex, source.PosBufferIndex) = (source.PosBufferIndex, PosBufferIndex);
+            (NormBufferIndex, source.NormBufferIndex) = (source.NormBufferIndex, NormBufferIndex);
+            (UVBufferIndex, source.UVBufferIndex) = (source.UVBufferIndex, UVBufferIndex);
+            (TanBufferIndex, source.TanBufferIndex) = (source.TanBufferIndex, TanBufferIndex);
+            (IndexBufferIndex, source.IndexBufferIndex) = (source.IndexBufferIndex, IndexBufferIndex);
+            (BoneWeightBufferIndex, source.BoneWeightBufferIndex) = (source.BoneWeightBufferIndex, BoneWeightBufferIndex);
+
+            _vertexCount = source._vertexCount;
+            _indexCount = source._indexCount;
+            Positions = source.Positions;
+            CpuIndices = source.CpuIndices;
+            BoneWeights = source.BoneWeights;
+            Skeleton = source.Skeleton ?? Skeleton;
+
+            // Swap list references rather than mutating: nothing else holds the old lists.
+            MeshParts = source.MeshParts;
+            LODs = source.LODs;
+            NonLodPartIndices = source.NonLodPartIndices;
+            _drawPartIndices = source._drawPartIndices;
+            _partLodFirst = source._partLodFirst;
+            _partLodLast = source._partLodLast;
+            _partLodNext = source._partLodNext;
+            BoundingBox = source.BoundingBox;
+
+            // Stale collision data; the next Collider cooks from the new Positions.
+            CookedTriMesh = null;
+
+            // Refresh registry entries in place (same MeshPartIds, new buffer indices/ranges/bounds),
+            // then free the ids of parts that no longer exist.
+            int oldPartCount = _meshPartIds?.Length ?? 0;
+            if (MeshParts.Count > 0)
+                RegisterMeshParts();
+            else
+                _meshPartIds = null;
+            if (oldPartCount > MeshParts.Count)
+                MeshRegistry.Unregister(this, MeshParts.Count);
+
+            GeometryVersion++;
+            Engine.Device.DeferDispose(source);
+        }
+
         public int IndexCount => _indexCount;
         public int VertexCount => _vertexCount;
         

@@ -36,5 +36,18 @@ namespace Freefall.Assets.Loaders
             texture.Name = name;
             return texture;
         }
+
+        public bool Reload(Asset existing, string cachePath, string name, AssetManager manager, string guid)
+        {
+            // Only plain cache-loaded textures; render targets and arrays own their resources differently.
+            if (existing is not Texture texture || existing.GetType() != typeof(Texture) || texture.BindlessIndex == 0)
+                return false;
+
+            var fresh = (Texture)LoadFromCache(cachePath, name, manager, guid);
+            StreamingManager.Instance?.Flush();
+
+            texture.ReplaceResource(fresh);
+            return true;
+        }
     }
 }

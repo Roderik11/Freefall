@@ -105,8 +105,10 @@ namespace Freefall.Components
             float vFOV = FieldOfView * (MathF.PI / 180f);
             Projection = CreateReverseZPerspectiveLH(vFOV, AspectRatio, NearPlane, FarPlane);
         
-            FoVFactor = (180f / MathF.PI) / FieldOfView;
-            FoVFactor *= FoVFactor; // squared to match squared size comparison
+            // radius² / distance² * FoVFactor = squared screen size, where screen size is the bounding
+            // sphere diameter as a fraction of viewport height. Kept squared so LOD selection needs no sqrt.
+            FoVFactor = 1f / MathF.Tan(vFOV * 0.5f);
+            FoVFactor *= FoVFactor;
         }
         
         /// <summary>
@@ -152,6 +154,16 @@ namespace Freefall.Components
                 pair.Value.SetParameter("NightHorizonColor", SkyboxRenderer.CurrentNightHorizonColor);
                 pair.Value.SetParameter("MieScattering", SkyboxRenderer.CurrentMieScattering);
                 pair.Value.SetParameter("MieAnisotropy", SkyboxRenderer.CurrentMieAnisotropy);
+
+                // Cloud layer — read by the sky dome and by the sun light for cloud shadows
+                pair.Value.SetParameter("CloudCoverage", SkyboxRenderer.CurrentCloudCoverage);
+                pair.Value.SetParameter("CloudTime", SkyboxRenderer.CurrentCloudTime);
+                pair.Value.SetParameter("CloudAltitude", SkyboxRenderer.CurrentCloudAltitude);
+                pair.Value.SetParameter("CloudAltitudeFrom", SkyboxRenderer.CurrentCloudAltitudeFrom);
+                pair.Value.SetParameter("CloudAltitudeBlend", SkyboxRenderer.CurrentCloudAltitudeBlend);
+                pair.Value.SetParameter("CloudShadowStrength", SkyboxRenderer.CurrentCloudShadowStrength);
+                pair.Value.SetParameter("CloudShadowScale", SkyboxRenderer.CurrentCloudShadowScale);
+                pair.Value.SetParameter("CloudNoiseLUTIdx", SkyboxRenderer.CurrentCloudNoiseLUTIdx);
             }
         }
         

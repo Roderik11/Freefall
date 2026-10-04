@@ -61,11 +61,11 @@ namespace Freefall.Editor.Mcp
         // --- Materials ---
 
         [McpServerTool(Name = "material_set_textures", Title = "Set material textures", Destructive = true, OpenWorld = false)]
-        [Description("Assign texture slots on a Material by slot name → texture GUID (e.g. {Albedo:'...', Normal:'...', Metallic:'...'}), optionally its effect, " +
+        [Description("Assign texture slots on a Material by slot name → texture GUID (e.g. {Albedo:'...', Normal:'...', Metallic:'...'}; null/\"\" clears a slot), optionally its effect, " +
                      "then save + reimport. The result lists the material's slot names. Create the material first with asset_create type 'Material'.")]
         public static Task<CallToolResult> SetMaterialTextures(
             string guid,
-            [Description("Slot name → texture GUID")] JsonObject textures,
+            [Description("Slot name → texture GUID; null or \"\" clears that slot")] JsonObject textures,
             [Description("Effect GUID (optional)")] string? effect = null)
             => McpBridge.Post("/api/material/settextures", new JsonObject
             {

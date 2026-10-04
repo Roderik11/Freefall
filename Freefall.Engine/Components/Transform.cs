@@ -154,15 +154,25 @@ namespace Freefall.Components
         {
             get
             {
+                // First access usually happens in the parallel draw loop, possibly from two components
+                // of the same entity at once: double-checked so exactly one slot gets allocated.
                 if (_transformSlot < 0 && TransformBuffer.Instance != null)
                 {
-                    _transformSlot = TransformBuffer.Instance.AllocateSlot();
-                    TransformBuffer.Instance.RegisterEntity(_transformSlot, Entity);
+                    lock (_slotInitLock)
+                    {
+                        if (_transformSlot < 0)
+                        {
+                            int slot = TransformBuffer.Instance.AllocateSlot();
+                            TransformBuffer.Instance.RegisterEntity(slot, Entity);
+                            _transformSlot = slot;
+                        }
+                    }
                 }
                 return _transformSlot;
             }
         }
-        private int _transformSlot = -1;
+        private volatile int _transformSlot = -1;
+        private readonly object _slotInitLock = new();
 
         public override void Destroy()
         {

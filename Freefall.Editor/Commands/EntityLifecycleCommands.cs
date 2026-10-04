@@ -282,6 +282,34 @@ namespace Freefall.Editor.Commands
                 return asset;
             }
 
+            // Entity references: null, {"entity": id}, {"entityUid": "uid"}, or a bare UID string / id number.
+            // Also takes the {"id", "uid"} shape entity_get returns. Used for e.g. NPCController.Player.
+            if (targetType == typeof(Entity))
+            {
+                if (el.ValueKind == System.Text.Json.JsonValueKind.Null)
+                    return null;
+                if (el.ValueKind == System.Text.Json.JsonValueKind.String)
+                {
+                    var uidText = el.GetString();
+                    if (string.IsNullOrEmpty(uidText))
+                        return null;
+                    if (!ulong.TryParse(uidText, out var refUid))
+                        throw new InvalidOperationException($"Entity reference string must be a UID, got {uidText}");
+                    return CommandHelpers.FindEntityByUid(refUid)
+                        ?? throw new InvalidOperationException($"Referenced entity UID {refUid} not found");
+                }
+                if (el.ValueKind == System.Text.Json.JsonValueKind.Number)
+                {
+                    var refEntityId = el.GetInt32();
+                    return CommandHelpers.FindEntityById(refEntityId)
+                        ?? throw new InvalidOperationException($"Referenced entity {refEntityId} not found");
+                }
+                if (el.ValueKind != System.Text.Json.JsonValueKind.Object)
+                    throw new InvalidOperationException($"Entity reference must be an object with 'entity' (id) or 'entityUid' (UID string). Got {el.ValueKind}");
+
+                return ResolveEntityReference(el, "Entity");
+            }
+
             // Component references: accept {"entity": id} or {"entity": id, "component": "TypeName"}
             // Used for linking e.g. SkyboxRenderer.SunLight → Sun entity's DirectionalLight
             if (typeof(Component).IsAssignableFrom(targetType))
@@ -292,24 +320,7 @@ namespace Freefall.Editor.Commands
                 if (el.ValueKind != System.Text.Json.JsonValueKind.Object)
                     throw new InvalidOperationException($"Component reference must be an object with 'entity' (id). Got {el.ValueKind}");
 
-                Entity refEntity;
-                if (el.TryGetProperty("entityUid", out var uidProp))
-                {
-                    // Persistent UID as a string (UIDs exceed JSON's exact integer range)
-                    var uidText = uidProp.ValueKind == System.Text.Json.JsonValueKind.String ? uidProp.GetString() : uidProp.GetRawText();
-                    if (!ulong.TryParse(uidText, out var refUid))
-                        throw new InvalidOperationException($"'entityUid' must be a UID string, got {uidText}");
-                    refEntity = CommandHelpers.FindEntityByUid(refUid)
-                        ?? throw new InvalidOperationException($"Referenced entity UID {refUid} not found");
-                }
-                else if (el.TryGetProperty("entity", out var entityIdProp))
-                {
-                    var refEntityId = entityIdProp.GetInt32();
-                    refEntity = CommandHelpers.FindEntityById(refEntityId)
-                        ?? throw new InvalidOperationException($"Referenced entity {refEntityId} not found");
-                }
-                else
-                    throw new InvalidOperationException("Component reference must contain 'entity' (id) or 'entityUid' (UID string)");
+                Entity refEntity = ResolveEntityReference(el, "Component");
 
                 // If "component" is specified, find that specific type; otherwise use the field's type
                 Type compType = targetType;
@@ -368,6 +379,29 @@ namespace Freefall.Editor.Commands
             }
 
             throw new NotSupportedException($"Cannot convert JSON to {targetType.Name}");
+        }
+
+        /// <summary>The entity named by a reference object: "entityUid" (UID string) or "entity" (runtime id).</summary>
+        private static Entity ResolveEntityReference(System.Text.Json.JsonElement el, string kind)
+        {
+            // Entity references also take the "uid"/"id" keys entity_get writes
+            bool entityKeys = kind == "Entity";
+            if (el.TryGetProperty("entityUid", out var uidProp) || (entityKeys && el.TryGetProperty("uid", out uidProp)))
+            {
+                // Persistent UID as a string (UIDs exceed JSON's exact integer range)
+                var uidText = uidProp.ValueKind == System.Text.Json.JsonValueKind.String ? uidProp.GetString() : uidProp.GetRawText();
+                if (!ulong.TryParse(uidText, out var refUid))
+                    throw new InvalidOperationException($"'entityUid' must be a UID string, got {uidText}");
+                return CommandHelpers.FindEntityByUid(refUid)
+                    ?? throw new InvalidOperationException($"Referenced entity UID {refUid} not found");
+            }
+            if (el.TryGetProperty("entity", out var entityIdProp) || (entityKeys && el.TryGetProperty("id", out entityIdProp)))
+            {
+                var refEntityId = entityIdProp.GetInt32();
+                return CommandHelpers.FindEntityById(refEntityId)
+                    ?? throw new InvalidOperationException($"Referenced entity {refEntityId} not found");
+            }
+            throw new InvalidOperationException($"{kind} reference must contain 'entity' (id) or 'entityUid' (UID string)");
         }
     }
 

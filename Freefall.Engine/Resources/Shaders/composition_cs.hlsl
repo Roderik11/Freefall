@@ -14,16 +14,28 @@ cbuffer PushConstants : register(b3)
     uint ScreenWidthIdx;
     uint ScreenHeightIdx;
     uint DepthGBufIdx;
+    uint AOTexIdx;
 };
 
 cbuffer Params : register(b4)
 {
     uint SSDMTexIdx;
-    uint3 _compPad;
+    float AODirectStrength;   // how much GTAO also darkens direct light (0 = ambient only)
+    uint2 _compPad;
 };
 
 #include "common.fx"
 #include "sky_common.fx"
+
+// Multi-bounce AO approximation (Jimenez et al. 2016): bright surfaces
+// re-light their own crevices, so occlusion is weaker on high albedo.
+float3 MultiBounceAO(float visibility, float3 albedo)
+{
+    float3 a = 2.0404 * albedo - 0.3324;
+    float3 b = -4.7951 * albedo + 0.6417;
+    float3 c = 2.7552 * albedo + 0.6903;
+    return max(visibility, ((visibility * a + b) * visibility + c) * visibility);
+}
 
 [numthreads(8, 8, 1)]
 void CSCompose(uint3 dispatchThreadId : SV_DispatchThreadID)
@@ -70,6 +82,16 @@ void CSCompose(uint3 dispatchThreadId : SV_DispatchThreadID)
     float3 groundColor = float3(0.12, 0.11, 0.10);  // warm ground bounce (terrain-dependent)
     float hemi = normal.y * 0.5 + 0.5;               // remap [-1,1] -> [0,1]
     float3 ambient = lerp(groundColor, skyColor, hemi) * ao * AmbientScale;
+
+    // Screen-space AO (GTAO) — fully occludes ambient; direct light only by AODirectStrength
+    // (not physically based, but keeps creases readable in sunlit areas)
+    if (AOTexIdx != 0)
+    {
+        Texture2D<float> AOTex = ResourceDescriptorHeap[AOTexIdx];
+        float gtao = AOTex.Load(displaced_coord);
+        ambient *= MultiBounceAO(gtao, albedo.rgb);
+        light.rgb *= lerp(1.0, gtao, AODirectStrength);
+    }
     
     // data.a flags: 0=unlit (skybox), >0=lit (0.5=vegetation, 1.0=standard PBR)
     float isLit = step(0.1, data.a);

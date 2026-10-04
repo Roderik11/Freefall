@@ -50,6 +50,7 @@ namespace Freefall.Components
 
         private bool _boundsDirty = true;
         private Mesh? _boundsMesh; // tracks which mesh instance bounds were computed from
+        private int _boundsVersion; // Mesh.GeometryVersion the bounds were computed from (hot reload)
         private Vector3[] _boundsCorners = new Vector3[8];
 
         protected override void Awake()
@@ -70,42 +71,8 @@ namespace Freefall.Components
             Mesh.BoundingBox.GetCorners(_boundsCorners, Mesh.RootRotation * Transform.WorldMatrix);
             BoundingSphere = BoundingSphere.CreateFromPoints(_boundsCorners);
             _boundsMesh = Mesh;
+            _boundsVersion = Mesh.GeometryVersion;
             _boundsDirty = false;
-        }
-
-        /// <summary>
-        /// Select active LOD index based on screen-relative size.
-        /// Returns -1 if no LOD chain (use all MeshParts).
-        /// </summary>
-        private int GetActiveLOD(out bool tooSmall)
-        {
-            tooSmall = true;
-
-            var cam = Camera.Main;
-            if (cam == null) return 0;
-
-            float distanceSq = Vector3.DistanceSquared(BoundingSphere.Center, cam.Position);
-            if (distanceSq < 0.001f) return 0;
-
-            float diameter = BoundingSphere.Radius;
-            float sizeSq = (diameter * diameter / MathF.Max(distanceSq, 0.001f)) * cam.FoVFactor;
-            sizeSq *= Engine.Settings.LODScale * Mesh.LODBias;
-
-            tooSmall = sizeSq < 0.00001f;
-
-            int lodCount = Mesh.LODs.Count;
-
-            if (lodCount == 0) return -1;
-
-            // Geometric progression: each LOD transition at half the screen size of the previous.
-            for (int i = 0; i < lodCount - 1; i++)
-            {
-                float t = MathF.Pow(0.5f, i + 1);
-                if (sizeSq > t * t)
-                    return i;
-            }
-
-            return lodCount - 1;
         }
 
         /// <summary>
@@ -133,50 +100,24 @@ namespace Freefall.Components
             if (Mesh == null) return;
 
             // Re-dirty bounds when the mesh reference changes (stub → loaded)
-            if (Mesh != _boundsMesh) _boundsDirty = true;
+            if (Mesh != _boundsMesh || Mesh.GeometryVersion != _boundsVersion) _boundsDirty = true;
 
             if (_boundsDirty) OnTransformChanged();
 
+            if (Mesh.IsBelowCullSize(BoundingSphere)) return;
+
             var slot = Transform.TransformSlot;
-            int lod = GetActiveLOD(out bool tooSmall);
 
-            if (tooSmall)
-                return;
-
-            if (lod >= 0 && Mesh.LODs[lod].MeshPartIndices != null)
+            // LOD chain heads + non-LOD parts. The GPU culler picks the LOD and culls by screen size.
+            var parts = Mesh.DrawPartIndices;
+            var meshParts = Mesh.MeshParts;
+            for (int i = 0; i < parts.Length; i++)
             {
-                // Draw active LOD parts
-                var indices = Mesh.LODs[lod].MeshPartIndices;
-                for (int i = 0; i < indices.Length; i++)
-                {
-                    int partIdx = indices[i];
-                    if (partIdx >= Mesh.MeshParts.Count) continue;
-                    var mat = GetMaterial(Mesh.MeshParts[partIdx].MaterialSlot);
-                    if (mat != null)
-                        CommandBuffer.Enqueue(Mesh, partIdx, mat, Params, slot);
-                }
-
-                // Draw truly non-LOD parts (precomputed, zero alloc)
-                if (Mesh.NonLodPartIndices != null)
-                {
-                    for (int i = 0; i < Mesh.NonLodPartIndices.Length; i++)
-                    {
-                        int partIdx = Mesh.NonLodPartIndices[i];
-                        var mat = GetMaterial(Mesh.MeshParts[partIdx].MaterialSlot);
-                        if (mat != null)
-                            CommandBuffer.Enqueue(Mesh, partIdx, mat, Params, slot);
-                    }
-                }
-            }
-            else
-            {
-                // No LODs — render all parts
-                for (int i = 0; i < Mesh.MeshParts.Count; i++)
-                {
-                    var mat = GetMaterial(Mesh.MeshParts[i].MaterialSlot);
-                    if (mat != null)
-                        CommandBuffer.Enqueue(Mesh, i, mat, Params, slot);
-                }
+                int partIdx = parts[i];
+                if (partIdx >= meshParts.Count) continue;
+                var mat = GetMaterial(meshParts[partIdx].MaterialSlot);
+                if (mat != null)
+                    CommandBuffer.Enqueue(Mesh, partIdx, mat, Params, slot, lodManaged: true);
             }
         }
     }

@@ -42,19 +42,86 @@ namespace Freefall.Graphics
             public uint Reserved9;
         }
 
+        /// <summary>
+        /// LOD chain data for a mesh part, in a buffer parallel to the MeshPartEntry buffer (same IDs).
+        /// Only the culling compute pass reads it. Must match shader MeshPartLod exactly (32 bytes).
+        /// "K" values are normalised squared distances, see Mesh.GetPartLod. An all-zero entry means
+        /// "no LOD": always drawn, never size-culled.
+        /// </summary>
+        [StructLayout(LayoutKind.Sequential)]
+        public struct MeshPartLod
+        {
+            // Mesh-local centre shared by all parts of the mesh, so they make the same LOD decision
+            public float CenterX;
+            public float CenterY;
+            public float CenterZ;
+            public float CullK;      // beyond this the mesh is too small on screen (0 = never)
+            public float NearK;      // the part is not drawn closer than this (0 = no limit)
+            public float FarK;       // beyond this NextPartId takes over (0 = no limit)
+            public uint NextPartId;  // MeshPartId of the next LOD's part + 1 (0 = none: not drawn beyond FarK)
+            public uint Reserved;
+        }
+
         public const int MaxMeshParts = 65536;
         public const int EntrySize = 72; // 18 uints
+        public const int LodEntrySize = 32;
 
         private static readonly Dictionary<(int meshId, int partIndex), int> _idMap = new();
         private static readonly List<MeshPartEntry> _entries = new();
+        private static readonly List<MeshPartLod> _lodEntries = new(); // parallel to _entries
         private static readonly Stack<int> _freeSlots = new();
         private static ID3D12Resource? _buffer;
+        private static ID3D12Resource? _lodBuffer;
         private static uint _srvIndex;
+        private static uint _lodSrvIndex;
         private static bool _dirty = true;
         private static readonly Lock _lock = new();
 
         public static uint SrvIndex => _srvIndex;
+        /// <summary>SRV of the MeshPartLod buffer (indexed by MeshPartId).</summary>
+        public static uint LodSrvIndex => _lodSrvIndex;
         public static int Count => _entries.Count;
+
+        /// <summary>
+        /// Register (or refresh) every part of a mesh, including its LOD chain. Returns the part IDs.
+        /// </summary>
+        public static int[] RegisterMesh(Mesh mesh)
+        {
+            lock (_lock)
+            {
+                int count = mesh.MeshParts.Count;
+                var ids = new int[count];
+                for (int i = 0; i < count; i++)
+                    ids[i] = Register(mesh, i);
+
+                // A chain link needs the next part's ID, which may only exist after the loop above
+                if (mesh.LODs.Count > 0)
+                    for (int i = 0; i < count; i++)
+                        _lodEntries[ids[i]] = BuildLodEntry(mesh, i);
+
+                return ids;
+            }
+        }
+
+        private static MeshPartLod BuildLodEntry(Mesh mesh, int partIndex)
+        {
+            mesh.GetPartLod(partIndex, out var center, out float cullK, out float nearK, out float farK, out int nextPartIndex);
+
+            uint next = 0;
+            if (nextPartIndex >= 0 && _idMap.TryGetValue((mesh.GetInstanceId(), nextPartIndex), out int nextId))
+                next = (uint)nextId + 1;
+
+            return new MeshPartLod
+            {
+                CenterX = center.X,
+                CenterY = center.Y,
+                CenterZ = center.Z,
+                CullK = cullK,
+                NearK = nearK,
+                FarK = farK,
+                NextPartId = next,
+            };
+        }
 
         /// <summary>
         /// Register a mesh part and get its stable ID.
@@ -84,12 +151,14 @@ namespace Freefall.Graphics
                     BoundsRadius = bounds.W,
                     TanBufferIdx = mesh.TanBufferIndex,
                 };
+                var lodEntry = BuildLodEntry(mesh, partIndex);
 
                 if (_idMap.TryGetValue(key, out int existingId))
                 {
                     // Refresh the entry — dynamic meshes (gizmos) change
                     // NumIndices/buffer indices every frame.
                     _entries[existingId] = entry;
+                    _lodEntries[existingId] = lodEntry;
                     _dirty = true;
                     return existingId;
                 }
@@ -98,6 +167,7 @@ namespace Freefall.Graphics
                 {
                     int id = _freeSlots.Pop();
                     _entries[id] = entry;
+                    _lodEntries[id] = lodEntry;
                     _idMap[key] = id;
                     _dirty = true;
                     return id;
@@ -108,6 +178,7 @@ namespace Freefall.Graphics
 
                 int newId = _entries.Count;
                 _entries.Add(entry);
+                _lodEntries.Add(lodEntry);
                 _idMap[key] = newId;
                 _dirty = true;
 
@@ -122,7 +193,13 @@ namespace Freefall.Graphics
         /// Unregister all parts of a mesh, freeing their registry slots for reuse.
         /// Call from Mesh.Dispose().
         /// </summary>
-        public static void Unregister(Mesh mesh)
+        public static void Unregister(Mesh mesh) => Unregister(mesh, 0);
+
+        /// <summary>
+        /// Unregister the parts of a mesh with index &gt;= <paramref name="firstPart"/>
+        /// (a hot-reloaded mesh that lost parts).
+        /// </summary>
+        public static void Unregister(Mesh mesh, int firstPart)
         {
             lock (_lock)
             {
@@ -130,12 +207,13 @@ namespace Freefall.Graphics
                 var keysToRemove = new List<(int, int)>();
                 foreach (var kv in _idMap)
                 {
-                    if (kv.Key.meshId == meshId)
+                    if (kv.Key.meshId == meshId && kv.Key.partIndex >= firstPart)
                     {
                         keysToRemove.Add(kv.Key);
                         _freeSlots.Push(kv.Value);
                         // Zero out the entry so GPU doesn't reference stale data
                         _entries[kv.Value] = default;
+                        _lodEntries[kv.Value] = default;
                     }
                 }
                 foreach (var key in keysToRemove)
@@ -179,13 +257,36 @@ namespace Freefall.Graphics
                 Debug.Log("MeshRegistry", $"Created registry buffer, SRV index {_srvIndex}");
             }
 
+            if (_lodBuffer == null)
+            {
+                _lodBuffer = device.CreateUploadBuffer(MaxMeshParts * LodEntrySize);
+                _lodSrvIndex = device.AllocateBindlessIndex();
+
+                var lodSrvDesc = new ShaderResourceViewDescription
+                {
+                    Format = Format.Unknown,
+                    ViewDimension = ShaderResourceViewDimension.Buffer,
+                    Shader4ComponentMapping = ShaderComponentMapping.Default,
+                    Buffer = new BufferShaderResourceView
+                    {
+                        FirstElement = 0,
+                        NumElements = MaxMeshParts,
+                        StructureByteStride = LodEntrySize,
+                        Flags = BufferShaderResourceViewFlags.None
+                    }
+                };
+                device.NativeDevice.CreateShaderResourceView(_lodBuffer, lodSrvDesc, device.GetCpuHandle(_lodSrvIndex));
+            }
+
             // Take snapshot under lock to avoid racing with background Register calls
             MeshPartEntry[] snapshot;
+            MeshPartLod[] lodSnapshot;
             int count;
             lock (_lock)
             {
                 count = _entries.Count;
                 snapshot = _entries.ToArray();
+                lodSnapshot = _lodEntries.ToArray();
                 _dirty = false;
             }
 
@@ -198,6 +299,11 @@ namespace Freefall.Graphics
                 for (int i = 0; i < count; i++)
                     span[i] = snapshot[i];
                 _buffer.Unmap(0);
+
+                void* pLodData;
+                _lodBuffer.Map(0, null, &pLodData);
+                lodSnapshot.AsSpan(0, count).CopyTo(new Span<MeshPartLod>(pLodData, count));
+                _lodBuffer.Unmap(0);
             }
         }
 
@@ -207,6 +313,7 @@ namespace Freefall.Graphics
         public static void Clear()
         {
             _entries.Clear();
+            _lodEntries.Clear();
             _idMap.Clear();
             _freeSlots.Clear();
             _dirty = true;
@@ -219,10 +326,17 @@ namespace Freefall.Graphics
         {
             _buffer?.Dispose();
             _buffer = null;
+            _lodBuffer?.Dispose();
+            _lodBuffer = null;
             if (_srvIndex != 0)
             {
                 Engine.Device?.ReleaseBindlessIndex(_srvIndex);
                 _srvIndex = 0;
+            }
+            if (_lodSrvIndex != 0)
+            {
+                Engine.Device?.ReleaseBindlessIndex(_lodSrvIndex);
+                _lodSrvIndex = 0;
             }
             Clear();
         }

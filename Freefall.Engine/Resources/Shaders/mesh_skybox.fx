@@ -24,24 +24,20 @@ cbuffer ObjectConstants : register(b1)
     float4x4 World;
     float3 SunDirection; // direction to sun
     float TimeOfDay; // 0-24
-    float CloudCoverage; // 0-1
-    float CloudTime;
-    float CloudSpeed; // speed multiplier
     float SunIntensity;
     float StarDensity;
     float StarBrightness;
     float CloudBrightness;       // overall cloud brightness (0-3)
-    float _cloudPad0;
     float3 CloudShadowColor;     // color of cloud shade side
-    float CloudAltitude;         // cloud layer height in world units
-    float3 CloudSunlitColor;     // color of sun-facing cloud tops
-    uint CloudNoiseLUTIdx;       // bindless index for 3D noise texture
-    float3 CloudSunsetTintColor; // warm tint mixed into clouds at sunset/sunrise
     float CloudNightBrightness;  // cloud brightness at night (0-3)
+    float3 CloudSunlitColor;     // color of sun-facing cloud tops
+    float _cloudPad0;
+    float3 CloudSunsetTintColor; // warm tint mixed into clouds at sunset/sunrise
+    float _cloudPad1;
     float3 CloudNightColor;      // moonlit cloud color at night
-    float CloudAltitudeFrom;     // altitude of the previous preset while a transition runs
-    float CloudAltitudeBlend;    // 0 = show CloudAltitudeFrom, 1 = show CloudAltitude (cross-fade weight)
-    float3 _cloudPad1;
+    float _cloudPad2;
+    // Cloud layer shape (coverage, time, altitude, noise LUT) lives in SceneConstants (common.fx):
+    // the directional light needs it too for cloud shadows.
 }
 
 SamplerState linearWrap : register(s0); // Linear filter, wrap addressing (3D noise LUT)
@@ -71,6 +67,8 @@ float hash13(float3 p3)
     return frac((p3.x + p3.y) * p3.z);
 }
 
+#include "sky_common.fx"
+
 // ────────────────────────────────────────────────
 // Main cloud function — LUT-based Nubis-style clouds
 //
@@ -85,15 +83,9 @@ float GetCloudsAt(float3 viewDir, float altitude)
     if (viewDir.y <= 0.001)
         return 0.0;
 
+    // Shared with the cloud shadows (sky_common.fx): same plane, same UVs, same base density
     float t = altitude / viewDir.y;
-    float2 cloudPos = viewDir.xz * t;
-    float2 uv = cloudPos * 0.00035;
-
-    // CloudTime is already the integral of CloudSpeed over time (SkyboxRenderer.Update), so it must
-    // NOT be scaled by CloudSpeed again here: that rescales the whole history whenever the speed
-    // changes and makes the clouds scrub forward/backward while a preset lerps.
-    float2 wind = float2(CloudTime * 0.01, CloudTime * 0.005);
-    uv += wind;
+    float2 uv = CloudLayerUV(viewDir.xz * t);
 
     Texture3D<float4> noiseLUT = ResourceDescriptorHeap[CloudNoiseLUTIdx];
     float timeZ = CloudTime * 0.005;
@@ -102,26 +94,8 @@ float GetCloudsAt(float3 viewDir, float altitude)
     // to hide tiling and create natural atmospheric softening
     float mip = saturate(1.0 - viewDir.y * 5.0) * 3.0;  // 0 at zenith, up to 3 at horizon
 
-    // ── Base shape: multi-scale Perlin-Worley (A channel) ──
-    float baseShape = 0;
-    baseShape += noiseLUT.SampleLevel(linearWrap, float3(uv * 0.25,        timeZ        ), mip    ).a * 0.625;
-    baseShape += noiseLUT.SampleLevel(linearWrap, float3(uv * 0.5 + 0.37,  timeZ * 0.7  ), mip    ).a * 0.25;
-    baseShape += noiseLUT.SampleLevel(linearWrap, float3(uv * 1.0 + 0.71,  timeZ * 1.3  ), mip * 0.5).a * 0.125;
-
-    // ── Coverage threshold ──
-    float coverageNoise = noiseLUT.SampleLevel(linearWrap, float3(uv * 0.06, timeZ * 0.15), 0).r;
-    float coverage = saturate(CloudCoverage + (coverageNoise - 0.5) * 0.3);
-
-    // Remap: only noise above the threshold survives as clouds, density = how far above it.
-    // The octave-averaged Perlin-Worley shape (cloud_noise_gen: (perlin - 0.4*worley)/(1 - 0.4*worley)) only spans
-    // ~0.15..0.62 (median ~0.37), so the original threshold (1 - coverage) left coverage 0..~0.5 dead (no clouds).
-    // Above 0.62 the original mapping is kept exactly (presets are tuned there: Clear Day 0.62, Overcast 0.97);
-    // below it the threshold walks linearly from 0.5 (coverage 0: the noise practically never exceeds it) to 0.38, so
-    // low coverages give gradually more clouds instead of a dead zone.
-    // Keep the (base - T) / (1 - T) density scale: normalising density to 0..1 pushed cores to CloudShadowColor
-    // (near black in Clear Day) and turned fair-weather clouds into dark grey slabs.
-    float threshold = min(1.0 - coverage, 0.5 - 0.1935 * coverage);
-    float cloudDensity = remap(baseShape, threshold, 1.0, 0.0, 1.0);
+    // ── Base shape against the coverage threshold ──
+    float cloudDensity = CloudBaseDensity(noiseLUT, linearWrap, uv, mip);
 
     // ── Detail erosion: Worley carves billowy edges ──
     // Use higher mip near horizon to blur out repetition
@@ -176,8 +150,6 @@ float3 GetStars(float3 viewDir, float nightFactor)
     float intensity = StarBrightness * visibility * bVar * twinkle;
     return star * intensity;
 }
-
-#include "sky_common.fx"
 
 float GetSun(float3 viewDir, float3 sunDir)
 {

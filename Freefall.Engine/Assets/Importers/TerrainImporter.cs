@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.IO;
 using System.Linq;
 using System.Text;
@@ -20,6 +20,7 @@ namespace Freefall.Assets.Importers
     [AssetImporter(".terrain", ImportPriority = 4)]
     public class TerrainImporter : IImporter
     {
+        [System.Text.Json.Serialization.JsonIgnore]
         public Type AssetType => typeof(Terrain);
         public ImportResult Import(string filepath)
         {

@@ -33,6 +33,9 @@ namespace Freefall.Editor
             return typeof(Asset);
         }
 
+        /// <summary>Forget the map after a script reload: it holds script asset types (and so the old script assembly).</summary>
+        internal static void ResetTypeMap() => _typeMap = null;
+
         private static Dictionary<string, Type> BuildTypeMap()
         {
             var map = new Dictionary<string, Type>(StringComparer.OrdinalIgnoreCase);
@@ -40,6 +43,7 @@ namespace Freefall.Editor
 
             foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
             {
+                if (ScriptCompiler.IsStale(asm)) continue;
                 try
                 {
                     foreach (var type in asm.GetTypes())

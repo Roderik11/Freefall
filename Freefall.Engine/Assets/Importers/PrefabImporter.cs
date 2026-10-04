@@ -1,4 +1,4 @@
-using System.IO;
+﻿using System.IO;
 
 namespace Freefall.Assets.Importers
 {
@@ -10,6 +10,7 @@ namespace Freefall.Assets.Importers
     [AssetImporter(".prefab", ImportPriority = 3)]
     public class PrefabImporter : IImporter
     {
+        [System.Text.Json.Serialization.JsonIgnore]
         public Type AssetType => typeof(Prefab);
         
         public ImportResult Import(string filepath)

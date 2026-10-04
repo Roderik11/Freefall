@@ -17,8 +17,13 @@ namespace Freefall.Editor
 
         static Dictionary<Type, Type> memberTypeToControlType = new Dictionary<Type, Type>();
 
-        static PropertyFrame()
+        static PropertyFrame() => RebuildTypeMaps();
+
+        /// <summary>(Re)build the member-type → control map; called again after a script reload (see GUIInspector).</summary>
+        internal static void RebuildTypeMaps()
         {
+            memberTypeToControlType.Clear();
+
             var types = Freefall.Reflection.Reflector.GetTypes<PropertyControl>();
 
             foreach (var type in types)

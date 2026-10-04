@@ -372,6 +372,7 @@ PSOutput PS(DSOutput input)
     float3 L = normalize(-sunDir);
     float NdotL = saturate(dot(N, L));
     float3 sunRadiance = ocean.SunColor * ocean.SunIntensity;
+    sunRadiance *= GetCloudShadow(OceanSampler, worldPos - camPos, L);
 
     float H = max(0.0, waveHeight);
 

@@ -95,10 +95,13 @@ namespace Freefall.Assets
             if (prefabEntities.Count == 0) return;
 
             // Copy non-Transform components from the prefab's root entity to the target
+            // Detach first: the deserializer registered them in ComponentCache under the temporary root, and a
+            // component left there is listed twice in ComponentCache<T>.All and stays referenced by the root.
             var root = prefabEntities[0];
-            foreach (var component in root.Components)
+            foreach (var component in root.Components.ToList())
             {
                 if (component is Transform) continue;
+                root.DetachComponent(component);
                 target.AddComponent(component);
             }
 
@@ -114,8 +117,9 @@ namespace Freefall.Assets
             // Tag it
             target.Prefab = this;
 
-            // Only remove the temporary root entity (children stay alive and registered)
-            EntityManager.RemoveEntity(root);
+            // Destroy the now-empty temporary root (children were re-parented above and stay alive). Merely
+            // unregistering it leaked it: its Transform keeps a TransformBuffer slot that references the entity.
+            root.Destroy();
         }
 
         public static Prefab Create(Entity source)
@@ -263,7 +267,14 @@ namespace Freefall.Assets
             foreach (var (type, templateComp) in templateComponents)
             {
                 if (matchedTypes.Contains(type)) continue;
-                target.AddComponent(templateComp);
+
+                // Add a fresh copy, never the template's own instance: the template is shared by every
+                // instance being updated and is destroyed afterwards (which destroys its components).
+                // The copy gets its own Id/UID from the Component constructor.
+                var copy = (Component)Activator.CreateInstance(type);
+                CopyFields(templateComp, copy);
+                copy.Enabled = templateComp.Enabled;
+                target.AddComponent(copy);
             }
 
             // Ensure prefab link

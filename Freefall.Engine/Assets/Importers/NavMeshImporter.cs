@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.IO;
 using System.Linq;
 using System.Text;
@@ -17,6 +17,7 @@ namespace Freefall.Assets.Importers
     [AssetImporter(".navmesh", ImportPriority = 4)]
     public class NavMeshImporter : IImporter
     {
+        [System.Text.Json.Serialization.JsonIgnore]
         public Type AssetType => typeof(NavMesh);
 
         public ImportResult Import(string filepath)

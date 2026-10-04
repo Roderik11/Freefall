@@ -104,6 +104,66 @@ namespace Freefall.Assets
         }
 
         /// <summary>
+        /// Hot-reload every loaded asset whose source was reimported since the last call
+        /// (see AssetDatabase.TakeReimportedGuids). Main thread only, between frames.
+        /// Returns the number of assets reloaded in place.
+        /// </summary>
+        public int ReloadReimported()
+        {
+            var reimported = AssetDatabase.TakeReimportedGuids();
+            if (reimported.Count == 0) return 0;
+
+            const string guidMarker = ":guid:";
+
+            // One pass over the cache (not FindByGuid per GUID: an initial project import queues thousands).
+            // Instances loaded after the import already hold the new data.
+            var targets = new List<(string guid, Asset asset)>();
+            var seen = new HashSet<Asset>(ReferenceEqualityComparer.Instance);
+            foreach (var (key, asset) in _assets)
+            {
+                int i = key.IndexOf(guidMarker, StringComparison.Ordinal);
+                if (i < 0) continue;
+                var guid = key[(i + guidMarker.Length)..];
+                if (reimported.TryGetValue(guid, out long stamp) && asset.LoadedAtImportStamp < stamp && seen.Add(asset))
+                    targets.Add((guid, asset));
+            }
+            return Reload(targets);
+        }
+
+        /// <summary>
+        /// Reload loaded instances in place via IAssetLoader.Reload, keeping object identity so scene
+        /// references stay valid. Types whose loader can't reload keep their stale instance.
+        /// </summary>
+        private int Reload(List<(string guid, Asset asset)> targets)
+        {
+            int reloaded = 0;
+            foreach (var (guid, asset) in targets)
+            {
+                var loader = FindLoader(asset.GetType());
+                var cachePath = AssetDatabase.ResolveCachePathByGuid(guid);
+                if (loader == null || cachePath == null || !File.Exists(cachePath))
+                    continue;
+
+                try
+                {
+                    var name = AssetDatabase.ResolveFriendlyName(guid) ?? asset.Name;
+                    long importStamp = AssetDatabase.ImportStamp;
+                    if (loader.Reload(asset, cachePath, name, this, guid))
+                    {
+                        asset.LoadedAtImportStamp = importStamp;
+                        reloaded++;
+                        Debug.Log("AssetManager", $"Hot-reloaded {asset.GetType().Name} '{name}'");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Debug.LogWarning("AssetManager", $"Hot reload failed for {asset.GetType().Name} '{asset.Name}' ({guid}): {ex.Message}");
+                }
+            }
+            return reloaded;
+        }
+
+        /// <summary>
         /// Snapshot all current cache keys. Used to diff before/after a batch operation.
         /// </summary>
         public HashSet<string> GetCachedKeys() => new(_assets.Keys);
@@ -345,6 +405,9 @@ namespace Freefall.Assets
             if (recordedType != null && !assetType.IsAssignableFrom(recordedType) && !recordedType.IsAssignableFrom(assetType))
                 return null;
 
+            // Read before the cache file: an import finishing mid-load gets a newer stamp and triggers a reload.
+            long importStamp = AssetDatabase.ImportStamp;
+
             // Load via cache-based loader if available
             var loader = FindLoader(assetType);
             if (loader != null)
@@ -369,6 +432,7 @@ namespace Freefall.Assets
             if (asset != null)
             {
                 asset.Guid = guid;
+                asset.LoadedAtImportStamp = importStamp;
                 _assets[cacheKey] = asset;
             }
 

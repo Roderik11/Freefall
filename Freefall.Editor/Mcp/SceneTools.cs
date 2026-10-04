@@ -159,6 +159,57 @@ namespace Freefall.Editor.Mcp
             return EditorTools.Text(placed);
         }
 
+        [McpServerTool(Name = "entity_instantiate_batch", Title = "Instantiate many", OpenWorld = false)]
+        [Description("Place many prefab/mesh instances in one call, e.g. the pieces of a modular building. With 'group' a new parent entity is " +
+                     "created and item transforms are local to it, so an assembly authored around the origin can be placed and turned as a unit. " +
+                     "Failing items are reported and skipped. snapToGround (default off here) snaps the group, or each item when there is no parent.")]
+        public static async Task<CallToolResult> InstantiateBatch(
+            BatchItem[] items,
+            [Description("Create a parent entity for the placed items")] BatchGroup? group = null,
+            [Description("Or parent under an existing entity id")] int? parent = null,
+            [Description("Existing parent by persistent UID (string)")] string? parentUid = null,
+            bool snapToGround = false)
+        {
+            int? pid = null;
+            if (group == null && (parent != null || parentUid != null))
+            {
+                var (rid, err) = await EntityRefs.Resolve(parent, parentUid);
+                if (err != null) return err;
+                pid = rid;
+            }
+
+            // '@Name' → prefab GUID (falling back to any asset of that name), resolved once per name
+            var cache = new Dictionary<string, string>();
+            var body = new List<object>(items.Length);
+            foreach (var it in items)
+            {
+                var guid = it.Guid;
+                if (guid.StartsWith('@'))
+                {
+                    if (!cache.TryGetValue(guid, out var resolved))
+                    {
+                        var res = await McpBridge.Get("/api/assets/resolve", ("name", guid[1..]), ("type", "Prefab"));
+                        if (res.IsError == true)
+                            res = await McpBridge.Get("/api/assets/resolve", ("name", guid[1..]));
+                        resolved = res.IsError == true ? null : JsonNode.Parse(EditorTools.TextOf(res))?["guid"]?.GetValue<string>();
+                        if (string.IsNullOrEmpty(resolved))
+                            return McpBridge.Error($"Asset '{guid}' not found (asset_search finds the exact name).");
+                        cache[guid] = resolved;
+                    }
+                    guid = resolved;
+                }
+                body.Add(new { guid, name = it.Name, position = it.Position, rotation = it.Rotation ?? FromEuler(it.RotationEuler), scale = it.Scale });
+            }
+
+            return await McpBridge.Post("/api/entity/instantiate_batch", new
+            {
+                items = body,
+                group = group == null ? null : new { name = group.Name, position = group.Position, rotation = FromEuler(group.RotationEuler) },
+                parent = pid,
+                snapToGround,
+            });
+        }
+
         [McpServerTool(Name = "entity_scatter", Title = "Scatter assets", OpenWorld = false)]
         [Description("Scatter many prefab/mesh instances in a circle on the terrain with Poisson spacing and height/slope filters. " +
                      "Fewer than 'count' may be placed when constraints are tight; the result reports placed vs requested.")]
@@ -260,6 +311,7 @@ namespace Freefall.Editor.Mcp
             [Description("Component type name (case-insensitive)")] string component,
             [Description("Member name → value. Encodings: numbers/bools/strings as-is; vectors {x,y,z} or [x,y,z]; quaternions {x,y,z,w}; " +
                          "Color3/Color4 [r,g,b(,a)]; enums by name; asset references by GUID string (\"\" or null clears); " +
+                         "entity references {\"entity\": id | \"entityUid\": \"uid\"} or a bare uid string (null clears); " +
                          "component references {\"entity\": id | \"entityUid\": \"uid\", \"component\"?: \"Type\"}; lists as JSON arrays (replaces the whole list, e.g. Spline.Points); " +
                          "nested data objects as JSON objects of their members.")]
             Dictionary<string, JsonElement> values,

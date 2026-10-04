@@ -34,6 +34,21 @@ namespace Freefall.Assets.Importers
     }
 
     /// <summary>
+    /// Per-mesh settings for one mesh produced by the import (a model file can produce several).
+    /// Keyed by the mesh sub-asset name. Applied by MeshLoader at load, so changing them needs no reimport.
+    /// </summary>
+    [Serializable]
+    public class MeshConfig
+    {
+        [ReadOnly(true)]
+        public string Name = string.Empty;
+        [ValueRange(0.1f, 10.0f)]
+        public float LODBias = 1.0f;
+
+        public override string ToString() => Name;
+    }
+
+    /// <summary>
     /// Unified model importer for FBX, DAE, OBJ files.
     /// Produces all artifacts from a single source: mesh data, skeleton, and animations.
     /// Replaces MeshImporter and AnimationClipImporter for standard model files.
@@ -66,6 +81,26 @@ namespace Freefall.Assets.Importers
         public float Scale = 1;
 
         public List<MeshPartConfig> Parts = new();
+        public List<MeshConfig> Meshes = new();
+
+        public MeshConfig? FindMeshConfig(string meshName)
+        {
+            foreach (var cfg in Meshes)
+                if (string.Equals(cfg.Name, meshName, StringComparison.OrdinalIgnoreCase))
+                    return cfg;
+            return null;
+        }
+
+        public MeshConfig GetOrAddMeshConfig(string meshName)
+        {
+            var cfg = FindMeshConfig(meshName);
+            if (cfg == null)
+            {
+                cfg = new MeshConfig { Name = meshName };
+                Meshes.Add(cfg);
+            }
+            return cfg;
+        }
 
         private List<Bone> _skeleton = new();
         private List<string> _boneNames = new();
@@ -855,6 +890,12 @@ namespace Freefall.Assets.Importers
 
             //Debug.Log("ModelImporter", $"{result.Count} mesh group(s): " +
             //    string.Join(", ", result.Select(r => $"{r.name}({r.data.Parts.Count}p)")));
+
+            // Sync mesh configs: one per produced mesh, keeping existing settings by name
+            var meshConfigs = new List<MeshConfig>();
+            foreach (var (groupName, _) in result)
+                meshConfigs.Add(FindMeshConfig(groupName) ?? new MeshConfig { Name = groupName });
+            Meshes = meshConfigs;
 
             return result;
         }

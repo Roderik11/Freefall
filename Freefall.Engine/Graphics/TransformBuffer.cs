@@ -16,7 +16,9 @@ namespace Freefall.Graphics
         private StreamingBuffer<Matrix4x4> _transforms;
         private StreamingBuffer<uint> _materials;
 
-        // Slot allocation
+        // Slot allocation. Slots are allocated lazily on first Transform.TransformSlot access, which
+        // happens inside the parallel draw loop (ComponentCache.Draw) — the allocator must be thread-safe.
+        private readonly object _slotLock = new();
         private readonly Stack<int> _freeSlots = new();
         private int _nextSlot = 0;
         private int _activeSlots = 0;
@@ -56,21 +58,24 @@ namespace Freefall.Graphics
         /// </summary>
         public int AllocateSlot()
         {
-            int slot;
-            if (_freeSlots.Count > 0)
+            lock (_slotLock)
             {
-                slot = _freeSlots.Pop();
-            }
-            else
-            {
-                slot = _nextSlot++;
-                _transforms.EnsureCapacity(_nextSlot);
-                _materials.EnsureCapacity(_nextSlot);
-            }
+                int slot;
+                if (_freeSlots.Count > 0)
+                {
+                    slot = _freeSlots.Pop();
+                }
+                else
+                {
+                    slot = _nextSlot++;
+                    _transforms.EnsureCapacity(_nextSlot);
+                    _materials.EnsureCapacity(_nextSlot);
+                }
 
-            _activeSlots++;
-            _transforms.Set(slot, Matrix4x4.Identity);
-            return slot;
+                _activeSlots++;
+                _transforms.Set(slot, Matrix4x4.Identity);
+                return slot;
+            }
         }
 
         /// <summary>
@@ -78,11 +83,14 @@ namespace Freefall.Graphics
         /// </summary>
         public void ReleaseSlot(int slot)
         {
-            if (slot < 0 || slot >= _nextSlot) return;
-            _freeSlots.Push(slot);
-            _activeSlots--;
-            _transforms.Set(slot, Matrix4x4.Identity);
-            _slotToEntity.TryRemove(slot, out _);
+            lock (_slotLock)
+            {
+                if (slot < 0 || slot >= _nextSlot) return;
+                _freeSlots.Push(slot);
+                _activeSlots--;
+                _transforms.Set(slot, Matrix4x4.Identity);
+                _slotToEntity.TryRemove(slot, out _);
+            }
         }
 
         /// <summary>

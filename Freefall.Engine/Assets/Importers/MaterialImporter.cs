@@ -1,4 +1,4 @@
-using System.IO;
+﻿using System.IO;
 using System.Text;
 using Freefall.Assets.Packers;
 using Freefall.Graphics;
@@ -12,6 +12,7 @@ namespace Freefall.Assets.Importers
     [AssetImporter(".mat", ImportPriority = 1)]
     public class MaterialImporter : IImporter
     {
+        [System.Text.Json.Serialization.JsonIgnore]
         public Type AssetType => typeof(Graphics.Material);
 
         /// <summary>

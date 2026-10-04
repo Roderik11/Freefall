@@ -3,6 +3,7 @@ using System.Linq;
 using System.Collections.Generic;
 using Freefall.Animation;
 using Freefall.Assets;
+using Freefall.Assets.Importers;
 using Freefall.Graphics;
 
 namespace Freefall.Assets.Loaders
@@ -31,6 +32,56 @@ namespace Freefall.Assets.Loaders
 
         public Asset LoadFromCache(string cachePath, string name, AssetManager manager, string sourceGuid = null)
         {
+            var mesh = Mesh.CreateAsync(Engine.Device, ReadMeshData(cachePath));
+            mesh.Name = name;
+
+            // Resolve sibling Skeleton BEFORE registering mesh parts,
+            // so MeshRegistry.NumBones is correct for GPU bone indexing.
+            ResolveSkeleton(mesh, sourceGuid, manager);
+            ApplyMeshConfig(mesh, sourceGuid);
+
+            mesh.RegisterMeshParts();
+
+            return mesh;
+        }
+
+        public bool Reload(Asset existing, string cachePath, string name, AssetManager manager, string guid)
+        {
+            if (existing is not Mesh mesh || existing.GetType() != typeof(Mesh))
+                return false;
+
+            // Build the new buffers on a throwaway mesh (never registered), wait for the copy queue so
+            // no frame can read half-uploaded buffers, then move them into the live instance.
+            var fresh = Mesh.CreateAsync(Engine.Device, ReadMeshData(cachePath));
+            ResolveSkeleton(fresh, guid, manager);
+            StreamingManager.Instance?.Flush();
+
+            mesh.ReplaceGeometry(fresh);
+            ApplyMeshConfig(mesh, guid);
+            return true;
+        }
+
+        /// <summary>
+        /// Apply per-mesh settings stored on the source file's ModelImporter (ModelImporter.Meshes).
+        /// These are not baked into the cache, so editing them needs no reimport.
+        /// </summary>
+        private static void ApplyMeshConfig(Mesh mesh, string meshGuid)
+        {
+            if (string.IsNullOrEmpty(meshGuid)) return;
+
+            // Skip the importer deserialization unless a non-default bias could be stored
+            var settings = AssetDatabase.GetMeta(meshGuid)?.ImporterSettings;
+            if (settings == null || !settings.Contains("\"LODBias\"")) return;
+
+            if (AssetDatabase.GetImporter(meshGuid) is not ModelImporter importer) return;
+
+            var config = importer.FindMeshConfig(AssetDatabase.ResolveFriendlyName(meshGuid));
+            if (config != null)
+                mesh.LODBias = config.LODBias;
+        }
+
+        private MeshData ReadMeshData(string cachePath)
+        {
             MeshData meshData;
             using (var stream = File.OpenRead(cachePath))
                 meshData = _packer.Read(stream);
@@ -54,16 +105,7 @@ namespace Freefall.Assets.Loaders
                 }
             }
 
-            var mesh = Mesh.CreateAsync(Engine.Device, meshData);
-            mesh.Name = name;
-
-            // Resolve sibling Skeleton BEFORE registering mesh parts,
-            // so MeshRegistry.NumBones is correct for GPU bone indexing.
-            ResolveSkeleton(mesh, sourceGuid, manager);
-
-            mesh.RegisterMeshParts();
-
-            return mesh;
+            return meshData;
         }
 
         private static void ResolveSkeleton(Mesh mesh, string meshGuid, AssetManager manager)

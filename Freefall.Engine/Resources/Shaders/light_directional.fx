@@ -10,6 +10,7 @@ cbuffer PushConstants : register(b3)
 };
 
 #include "common.fx"
+#include "sky_common.fx"
 // @RenderState(DepthTest=false, DepthWrite=false, Blend=Additive)
 
 
@@ -275,6 +276,9 @@ float4 PS(VSOutput input) : SV_Target
     // float contactShadow = ContactShadow(worldPos.xyz, LightDirection, input.Position.xy, viewDepth);
     // shadowFactor = min(shadowFactor, contactShadow);
     float contactShadow = 1.0; // disabled for now
+
+    // Cloud shadows: also reach past the last cascade (Sampler = linear wrap, s0)
+    shadowFactor *= GetCloudShadow(Sampler, worldPos.xyz, L);
 
     // Debug visualization modes
     if (DebugVisualizationMode == 1)

@@ -99,6 +99,90 @@ float3 GetSkyColor(float3 viewDir, float3 sunDir)
 }
 
 // ────────────────────────────────────────────────
+// Cloud layer — shared by the sky dome (mesh_skybox.fx) and the cloud shadows on lit surfaces.
+// The layer is a flat plane CloudAltitude above the camera, anchored to the world in XZ so the
+// shadows it casts stay put on the ground when the camera moves.
+// ────────────────────────────────────────────────
+
+// Noise UV of a point on the cloud plane, given by its camera-relative XZ.
+float2 CloudLayerUV(float2 relXZ)
+{
+    float2 uv = (CamPos.xz + relXZ) * 0.00035;
+
+    // CloudTime is already the integral of CloudSpeed over time (SkyboxRenderer.Update), so it must
+    // NOT be scaled by CloudSpeed again here: that rescales the whole history whenever the speed
+    // changes and makes the clouds scrub forward/backward while a preset lerps.
+    return uv + float2(CloudTime * 0.01, CloudTime * 0.005);
+}
+
+// Cloud density before detail erosion: multi-scale Perlin-Worley (LUT alpha) against the coverage threshold.
+// Can be negative (below the threshold).
+float CloudBaseDensity(Texture3D<float4> noiseLUT, SamplerState wrapSampler, float2 uv, float mip)
+{
+    float timeZ = CloudTime * 0.005;
+
+    float baseShape = 0;
+    baseShape += noiseLUT.SampleLevel(wrapSampler, float3(uv * 0.25,        timeZ        ), mip    ).a * 0.625;
+    baseShape += noiseLUT.SampleLevel(wrapSampler, float3(uv * 0.5 + 0.37,  timeZ * 0.7  ), mip    ).a * 0.25;
+    baseShape += noiseLUT.SampleLevel(wrapSampler, float3(uv * 1.0 + 0.71,  timeZ * 1.3  ), mip * 0.5).a * 0.125;
+
+    float coverageNoise = noiseLUT.SampleLevel(wrapSampler, float3(uv * 0.06, timeZ * 0.15), 0).r;
+    float coverage = saturate(CloudCoverage + (coverageNoise - 0.5) * 0.3);
+
+    // Remap: only noise above the threshold survives as clouds, density = how far above it.
+    // The octave-averaged Perlin-Worley shape (cloud_noise_gen: (perlin - 0.4*worley)/(1 - 0.4*worley)) only spans
+    // ~0.15..0.62 (median ~0.37), so the original threshold (1 - coverage) left coverage 0..~0.5 dead (no clouds).
+    // Above 0.62 the original mapping is kept exactly (presets are tuned there: Clear Day 0.62, Overcast 0.97);
+    // below it the threshold walks linearly from 0.5 (coverage 0: the noise practically never exceeds it) to 0.38, so
+    // low coverages give gradually more clouds instead of a dead zone.
+    // Keep the (base - T) / (1 - T) density scale: normalising density to 0..1 pushed cores to CloudShadowColor
+    // (near black in Clear Day) and turned fair-weather clouds into dark grey slabs.
+    float threshold = min(1.0 - coverage, 0.5 - 0.1935 * coverage);
+    return remap(baseShape, threshold, 1.0, 0.0, 1.0);
+}
+
+float CloudShadowDensityAt(Texture3D<float4> noiseLUT, SamplerState wrapSampler, float3 relPos, float3 toLight, float altitude)
+{
+    // Follow the light ray from the surface up to the cloud plane. For shadows the plane sits at an absolute
+    // world height (the sky dome keeps it above the camera): anything camera-relative here makes the shadows
+    // slide over the ground when the camera changes height.
+    float t = max(altitude - (CamPos.y + relPos.y), 0.0) / toLight.y;
+
+    // Real cloud shadows are km-sized: one covers a whole town and reads as "the light changed", not as a shadow.
+    // CloudShadowScale shrinks the pattern at the cost of no longer lining up exactly with the clouds in the sky.
+    // Only the position is scaled, not the drift: the pattern then passes at the same rate as the clouds overhead
+    // (ground speed / scale). Scaling the drift too made the small shadows race across the ground.
+    float scale = max(CloudShadowScale, 1.0);
+    float2 drift = CloudLayerUV(-CamPos.xz);   // UV of the world origin = wind offset only
+    float2 uv = (CloudLayerUV(relPos.xz + toLight.xz * t) - drift) * scale + drift;
+
+    // No detail erosion, and a steeper ramp than the sky dome so the shadow has a readable edge
+    return smoothstep(0.0, 0.2, CloudBaseDensity(noiseLUT, wrapSampler, uv, 0.0));
+}
+
+// Fraction of the sun's light (0..1) that reaches a surface point through the cloud layer.
+// relPos: camera-relative position, toLight: normalized direction toward the sun.
+float GetCloudShadow(SamplerState wrapSampler, float3 relPos, float3 toLight)
+{
+    if (CloudShadowStrength <= 0.0 || CloudNoiseLUTIdx == 0 || toLight.y <= 0.05)
+        return 1.0;
+
+    Texture3D<float4> noiseLUT = ResourceDescriptorHeap[CloudNoiseLUTIdx];
+
+    float density = CloudShadowDensityAt(noiseLUT, wrapSampler, relPos, toLight, CloudAltitude);
+    if (CloudAltitudeBlend < 0.999)
+    {
+        float densityFrom = CloudShadowDensityAt(noiseLUT, wrapSampler, relPos, toLight, CloudAltitudeFrom);
+        density = lerp(densityFrom, density, smoothstep(0.0, 1.0, saturate(CloudAltitudeBlend)));
+    }
+
+    // A low sun stretches the projection toward infinity — fade the shadows out before that
+    float lowSunFade = smoothstep(0.05, 0.3, toLight.y);
+
+    return 1.0 - density * CloudShadowStrength * lowSunFade;
+}
+
+// ────────────────────────────────────────────────
 // Unified aerial perspective: distance fog with per-pixel sky-derived color.
 // Replaces both FOG() and ocean's hardcoded haze.
 //

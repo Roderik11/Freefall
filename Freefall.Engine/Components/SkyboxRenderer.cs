@@ -37,8 +37,8 @@ namespace Freefall.Components
         [ValueRange(0f, 24f)]
         public float TimeOfDay = 16f;         // 0-24 hours
 
-        [ValueRange(0.1f, 1f)]
-        public float TimeOfDaySpeed = 0.1f; // Hours per second (tweak for testing)
+        [ValueRange(0.001f, 0.1f)]
+        public float TimeOfDaySpeed = 0.001f; // Hours per second (tweak for testing)
 
         [ValueRange(0f, 360f)]
         public float SunAzimuthAngle = 30.0f;    // Compass heading for sunrise in degrees (0=+X, 90=+Z, 180=-X, 270=-Z)
@@ -125,6 +125,12 @@ namespace Freefall.Components
         [ValueRange(0f, 3f)]
         public float CloudNightBrightness = 1.0f;   // Cloud brightness (night)
 
+        [ValueRange(0f, 1f)]
+        public float CloudShadowStrength = 0.8f;    // How much sunlight the clouds block on the ground (0 = no cloud shadows)
+
+        [ValueRange(1f, 16f)]
+        public float CloudShadowScale = 1.0f;       // Shadow pattern is this many times smaller than the visible clouds (1 = shadows match the clouds in the sky)
+
         // Cross-fade state for altitude changes, driven by EnvironmentController. Altitude scales the
         // projected cloud pattern, so instead of lerping it the shader blends two cloud layers.
         [Freefall.Reflection.DontSerialize, System.ComponentModel.Browsable(false)]
@@ -150,6 +156,16 @@ namespace Freefall.Components
         public static float CurrentMieAnisotropy { get; private set; } = 0.76f;
         public static Vector3 CurrentNightSkyColor { get; private set; } = new Vector3(0.01f, 0.01f, 0.04f);
         public static Vector3 CurrentNightHorizonColor { get; private set; } = new Vector3(0.03f, 0.04f, 0.08f);
+
+        // Cloud layer accessors for Camera.SetShaderParams() (SceneConstants: sky dome + cloud shadows)
+        public static float CurrentCloudCoverage { get; private set; } = 0.5f;
+        public static float CurrentCloudTime { get; private set; } = 0.0f;
+        public static float CurrentCloudAltitude { get; private set; } = 1800.0f;
+        public static float CurrentCloudAltitudeFrom { get; private set; } = 1800.0f;
+        public static float CurrentCloudAltitudeBlend { get; private set; } = 1.0f;
+        public static float CurrentCloudShadowStrength { get; private set; } = 0.0f;   // 0 until a skybox exists
+        public static float CurrentCloudShadowScale { get; private set; } = 1.0f;
+        public static uint CurrentCloudNoiseLUTIdx => _cloudNoiseLUT?.BindlessIndex ?? 0u;
 
         // Day/sunset/night weights of the current frame (normalized, sum to 1). Useful for gameplay/audio.
         public static float CurrentDayFactor { get; private set; } = 1.0f;
@@ -177,6 +193,7 @@ namespace Freefall.Components
         public override void Destroy()
         {
             Mesh?.Dispose();
+            CurrentCloudShadowStrength = 0.0f;
         }
 
         private void GenerateCloudNoiseLUT()
@@ -229,6 +246,14 @@ namespace Freefall.Components
             }
 
             CloudTime += (float)Time.Delta * CloudSpeed;
+
+            CurrentCloudCoverage = CloudCoverage;
+            CurrentCloudTime = CloudTime;
+            CurrentCloudAltitude = CloudAltitude;
+            CurrentCloudAltitudeFrom = CloudAltitudeFrom;
+            CurrentCloudAltitudeBlend = CloudAltitudeBlend;
+            CurrentCloudShadowStrength = Enabled ? CloudShadowStrength : 0.0f;
+            CurrentCloudShadowScale = CloudShadowScale;
 
             UpdateSunLight();
         }
@@ -380,6 +405,7 @@ namespace Freefall.Components
             CloudSunsetTintColor = p.CloudSunsetTintColor;
             CloudNightColor = p.CloudNightColor;
             CloudNightBrightness = p.CloudNightBrightness;
+            CloudShadowStrength = p.CloudShadowStrength;
         }
 
         /// <summary>Capture the current look into a preset (inverse of ApplyPreset) — "save what I tweaked".</summary>
@@ -420,6 +446,7 @@ namespace Freefall.Components
             p.CloudSunsetTintColor = CloudSunsetTintColor;
             p.CloudNightColor = CloudNightColor;
             p.CloudNightBrightness = CloudNightBrightness;
+            p.CloudShadowStrength = CloudShadowStrength;
         }
 
         public void Draw()
@@ -432,22 +459,17 @@ namespace Freefall.Components
             Material.SetParameter("World", Entity.Transform.WorldMatrix);
             Material.SetParameter("SunDirection", SunDirection);
             Material.SetParameter("TimeOfDay", TimeOfDay);
-            Material.SetParameter("CloudCoverage", CloudCoverage);
-            Material.SetParameter("CloudTime", CloudTime);
-            Material.SetParameter("CloudSpeed", CloudSpeed);
+            // Cloud layer shape (coverage, time, altitude, noise LUT) reaches the shader through SceneConstants,
+            // see Camera.SetShaderParams — the sun light reads the same values for cloud shadows.
             Material.SetParameter("SunIntensity", SunIntensity);
             Material.SetParameter("StarDensity", StarDensity);
             Material.SetParameter("StarBrightness", StarBrightness);
             Material.SetParameter("CloudBrightness", CloudBrightness);
             Material.SetParameter("CloudShadowColor", new Vector3(CloudShadowColor.R, CloudShadowColor.G, CloudShadowColor.B));
-            Material.SetParameter("CloudAltitude", CloudAltitude);
             Material.SetParameter("CloudSunlitColor", new Vector3(CloudSunlitColor.R, CloudSunlitColor.G, CloudSunlitColor.B));
-            Material.SetParameter("CloudNoiseLUTIdx", _cloudNoiseLUT?.BindlessIndex ?? 0u);
             Material.SetParameter("CloudSunsetTintColor", new Vector3(CloudSunsetTintColor.R, CloudSunsetTintColor.G, CloudSunsetTintColor.B));
             Material.SetParameter("CloudNightBrightness", CloudNightBrightness);
             Material.SetParameter("CloudNightColor", new Vector3(CloudNightColor.R, CloudNightColor.G, CloudNightColor.B));
-            Material.SetParameter("CloudAltitudeFrom", CloudAltitudeFrom);
-            Material.SetParameter("CloudAltitudeBlend", CloudAltitudeBlend);
 
             CommandBuffer.Enqueue(Mesh, Material, Params, slot);
         }

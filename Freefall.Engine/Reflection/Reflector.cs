@@ -87,29 +87,50 @@ namespace Freefall.Reflection
         {
             _assemblies.TryRemove(assembly.FullName!, out _);
 
-            // Remove types from this assembly from all caches
-            var assemblyTypes = new HashSet<Type>(assembly.GetTypes());
+            // Remove every cached type that involves this assembly — its own types and constructed
+            // types over them (List<ScriptType>, ScriptType[]), which assembly.GetTypes() doesn't list
+            var set = new[] { assembly };
 
             // Clear type name → Type cache entries pointing to this assembly
             foreach (var kvp in _typeCache)
             {
-                if (assemblyTypes.Contains(kvp.Value))
+                if (ReferencesAssembly(kvp.Value, set))
                     _typeCache.TryRemove(kvp.Key, out _);
             }
 
             // Clear FormerlySerializedAs entries
             foreach (var kvp in _formerNames)
             {
-                if (assemblyTypes.Contains(kvp.Value))
+                if (ReferencesAssembly(kvp.Value, set))
                     _formerNames.TryRemove(kvp.Key, out _);
             }
 
             // Clear mapping cache for types from this assembly
-            foreach (var type in assemblyTypes)
-                _mappingCache.TryRemove(type, out _);
+            foreach (var type in _mappingCache.Keys)
+            {
+                if (ReferencesAssembly(type, set))
+                    _mappingCache.TryRemove(type, out _);
+            }
 
             // Invalidate subtype cache entirely — could contain stale derived types
             _typesByBase.Clear();
+        }
+
+        /// <summary>
+        /// True if the type is defined in one of the assemblies, or is built from such a type
+        /// (array/pointer element, generic argument, e.g. List&lt;ScriptType&gt;).
+        /// </summary>
+        public static bool ReferencesAssembly(Type type, ICollection<Assembly> assemblies)
+        {
+            if (type == null) return false;
+            if (assemblies.Contains(type.Assembly)) return true;
+            if (type.HasElementType) return ReferencesAssembly(type.GetElementType(), assemblies);
+            if (type.IsGenericType && !type.IsGenericTypeDefinition)
+            {
+                foreach (var arg in type.GetGenericArguments())
+                    if (ReferencesAssembly(arg, assemblies)) return true;
+            }
+            return false;
         }
 
         public static Mapping<T> GetMapping<T>(Type type) where T : Attribute

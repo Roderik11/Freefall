@@ -40,6 +40,9 @@ namespace Freefall.Graphics
         /// <summary>Screen-space shadow pass (Bend Studio technique).</summary>
         public ScreenSpaceShadows? ScreenSpaceShadows { get; private set; }
 
+        /// <summary>Ground truth ambient occlusion (spatial-only GTAO).</summary>
+        public GTAO? Gtao { get; private set; }
+
         /// <summary>Screen-space displacement mapping (wavefront cooperative march).</summary>
         public ScreenSpaceDisplacement? ScreenSpaceDisplacement { get; private set; }
 
@@ -158,7 +161,10 @@ namespace Freefall.Graphics
             
             // Screen-space shadows
             ScreenSpaceShadows = new ScreenSpaceShadows();
-            
+
+            // Ambient occlusion
+            Gtao = new GTAO();
+
             // Screen-space displacement
             ScreenSpaceDisplacement = new ScreenSpaceDisplacement();
 
@@ -619,6 +625,17 @@ namespace Freefall.Graphics
                  PixMarker.End(list);
              }
 
+             // Ambient occlusion: horizon search against GBuffer linear depth + world normals.
+             // Consumed by composition (ambient term only).
+             if (Gtao != null && Engine.Settings.EnableGTAO)
+             {
+                 PixMarker.Begin(list, "GTAO");
+                 var viewRotation = Matrix4x4.CreateLookAtLeftHanded(Vector3.Zero, camera.Forward, camera.Up);
+                 int aw = (int)DepthGBuffer.Native.Description.Width;
+                 int ah = (int)DepthGBuffer.Native.Description.Height;
+                 Gtao.Execute(list, DepthGBuffer.BindlessIndex, Normals.BindlessIndex, aw, ah, viewRotation, camera.Projection);
+                 PixMarker.End(list);
+             }
 
              // Transition GBuffer depth to PixelShaderResource for light pass sampling
              Transition(list, DepthGBuffer.Native, ResourceStates.NonPixelShaderResource, ResourceStates.PixelShaderResource);
@@ -781,9 +798,11 @@ namespace Freefall.Graphics
             _compositionCS.SetPushConstant("ScreenWidth", (uint)desc.Width);
             _compositionCS.SetPushConstant("ScreenHeight", (uint)desc.Height);
             _compositionCS.SetPushConstant("DepthGBuf", DepthGBuffer.BindlessIndex);
+            _compositionCS.SetPushConstant("AOTex", Engine.Settings.EnableGTAO ? (Gtao?.OutputSrvIndex ?? 0u) : 0u);
             
             // Pass SSDM displacement texture to composition for ambient parallax
-            _compositionCS.SetParam("SSDMTexIdx", Engine.Settings.EnableSSDM ? (ScreenSpaceDisplacement?.OutputSrvIndex ?? 0u) : 0u);
+            _compositionCS.SetParam("AODirectStrength", Engine.Settings.GTAODirectStrength);
+            _compositionCS.SetParam("SSDMTexIdx",Engine.Settings.EnableSSDM ? (ScreenSpaceDisplacement?.OutputSrvIndex ?? 0u) : 0u);
 
             // Bind SceneConstants cbuffer (AmbientScale etc.)
             foreach (var cb in matDirectionalLight.ConstantBuffers)
@@ -1158,6 +1177,7 @@ namespace Freefall.Graphics
             CompositeSnapshot?.Dispose();
             ShadowTextureArray?.Dispose();
             ScreenSpaceShadows?.Dispose();
+            Gtao?.Dispose();
             ScreenSpaceDisplacement?.Dispose();
             RadianceCascades?.Dispose();
             Smaa?.Dispose();

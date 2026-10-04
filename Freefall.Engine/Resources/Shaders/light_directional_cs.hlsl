@@ -22,6 +22,7 @@ cbuffer PushConstants : register(b3)
 };
 
 #include "common.fx"
+#include "sky_common.fx"
 
 // Light params from ObjectConstants (Slot 2, b1)
 cbuffer ObjectConstants : register(b1)
@@ -252,6 +253,9 @@ void CSDirectionalLight(uint3 dispatchThreadId : SV_DispatchThreadID)
         sssShadow = sssTex.Load(displaced_coord).r;
         shadowFactor = min(shadowFactor, sssShadow);
     }
+
+    // Cloud shadows: also reach past the last cascade (Sampler = linear wrap, s0)
+    shadowFactor *= GetCloudShadow(Sampler, worldPos.xyz, L);
 
     // Debug visualization modes
     if (DebugVisualizationMode == 1)

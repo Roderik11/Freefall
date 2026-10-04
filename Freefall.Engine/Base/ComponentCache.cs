@@ -8,6 +8,7 @@ namespace Freefall.Base
 {
     public interface IComponentCache
     {
+        Type ComponentType { get; }
         void Early();
         void Awake();
         void Update();
@@ -30,6 +31,8 @@ namespace Freefall.Base
         private bool IsParallel;
         private bool HasUpdate;
         private bool HasDraw;
+
+        public Type ComponentType => Type;
 
         static ComponentCache()
         {

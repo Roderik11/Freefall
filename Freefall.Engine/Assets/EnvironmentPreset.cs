@@ -132,6 +132,10 @@ namespace Freefall.Assets
         [ValueRange(0f, 3f)]
         public float CloudNightBrightness = 1.0f;
 
+        [Description("How much sunlight the clouds block on the ground (0 = no cloud shadows)")]
+        [ValueRange(0f, 1f)]
+        public float CloudShadowStrength = 0.8f;
+
         // ── Fog ──
 
         [Category("Fog")]
@@ -224,6 +228,7 @@ namespace Freefall.Assets
             dest.CloudSunsetTintColor = L(a.CloudSunsetTintColor, b.CloudSunsetTintColor, t);
             dest.CloudNightColor = L(a.CloudNightColor, b.CloudNightColor, t);
             dest.CloudNightBrightness = L(a.CloudNightBrightness, b.CloudNightBrightness, t);
+            dest.CloudShadowStrength = L(a.CloudShadowStrength, b.CloudShadowStrength, t);
 
             dest.FogDensity = L(a.FogDensity, b.FogDensity, t);
 

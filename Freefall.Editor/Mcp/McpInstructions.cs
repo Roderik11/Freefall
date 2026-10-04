@@ -24,7 +24,8 @@ namespace Freefall.Editor.Mcp
               entity_get / asset_get first. Only top-level members can be set (no 'A.B' paths): lists are replaced whole
               with a JSON array, nested data objects (e.g. Terrain.Layers entries) with a JSON object of their members.
             - Value encodings: vectors {x,y,z} or [x,y,z]; quaternions {x,y,z,w}; Color3/Color4 [r,g,b(,a)]; enums by name;
-              asset references by GUID string; component references {"entity": id, "component": "Type"}.
+              asset references by GUID string; entity references {"entity": id} / {"entityUid": "uid"} (null clears);
+              component references the same plus optional "component": "Type".
             - Prefer prefab GUIDs over mesh GUIDs for entity_instantiate / entity_scatter.
             - Terrain is authored with stamp components on entities (TerrainStamp/HeightStamp/SplatStamp/DecoStamp), edited
               via entity_add_component + entity_set_properties.
@@ -44,6 +45,8 @@ namespace Freefall.Editor.Mcp
               SelfPruning, SpawnPrefab. pcg_execute reports spawn counts.
             - prefab_inspect before placing buildings/lights: door sides + ground-level flag, working lights/emitters, problems.
             - prefab_measure gives prefab sizes without placing them; scene_query / entities_delete work on many entities at once.
+            - Hand-placed assemblies (a building from modular kit pieces, a market stall set) go in with ONE entity_instantiate_batch
+              call: item transforms local to a new 'group' entity, so the assembly moves/turns as a unit. Never loop entity_instantiate.
 
             Limits
             - C# engine/editor changes need a rebuild and editor restart (editor_shutdown first; the DLL is locked while running).

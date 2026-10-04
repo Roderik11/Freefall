@@ -59,6 +59,18 @@ namespace Freefall.Assets
         // Data type name → runtime Type (reverse of AssetTypeAliasAttribute, built during discovery)
         private static readonly Dictionary<string, Type> _typeAliases = new(StringComparer.OrdinalIgnoreCase);
 
+        // Source + sub-asset GUIDs written by ImportAsset since the last TakeReimportedGuids(), with the
+        // import's stamp. ImportAsset runs on worker threads (ImportAllAsync), so the main thread drains
+        // this and hot-reloads what was loaded before that import (AssetManager.ReloadReimported).
+        private static readonly ConcurrentQueue<(string guid, long stamp)> _reimportedGuids = new();
+        private static long _importStamp;
+
+        /// <summary>
+        /// Monotonic counter bumped by every import. AssetManager records it when an asset is loaded,
+        /// so hot reload can skip instances that were loaded after their latest import.
+        /// </summary>
+        public static long ImportStamp => Interlocked.Read(ref _importStamp);
+
         private static readonly JsonSerializerOptions _jsonOptions = new()
         {
             WriteIndented = true,
@@ -399,7 +411,9 @@ namespace Freefall.Assets
             {
                 lock (entries)
                 {
-                    var match = entries.FirstOrDefault(e => e.Type.Equals(type, StringComparison.OrdinalIgnoreCase));
+                    // Sub-assets record their data type ("PrefabData", "MeshData"); callers ask for the
+                    // runtime type ("Prefab"), so compare through the alias map as well.
+                    var match = entries.FirstOrDefault(e => SubAssetIsOfType(e, type));
                     if (match != null) return match.Guid;
                 }
             }
@@ -411,6 +425,14 @@ namespace Freefall.Assets
                     return kvp.Value;
             }
             return null;
+        }
+
+        private static bool SubAssetIsOfType(SubAssetEntry e, string type)
+        {
+            if (string.Equals(e.Type, type, StringComparison.OrdinalIgnoreCase)
+                || string.Equals(e.AssetType, type, StringComparison.OrdinalIgnoreCase))
+                return true;
+            return string.Equals(ResolveAssetType(e.AssetType ?? e.Type)?.Name, type, StringComparison.OrdinalIgnoreCase);
         }
 
         /// <summary>
@@ -626,6 +648,22 @@ namespace Freefall.Assets
         /// </summary>
         public static void SaveImporterAndReimport(string guid, IImporter importer)
         {
+            var meta = SaveImporter(guid, importer);
+            if (meta == null) return;
+
+            Debug.Log($"[AssetDatabase] Saved importer settings for {meta.SourcePath}");
+
+            // Reimport with the new settings
+            ImportAsset(meta);
+        }
+
+        /// <summary>
+        /// Save modified importer settings to the meta file without reimporting.
+        /// For settings that are applied at load time (e.g. ModelImporter.Meshes).
+        /// Returns the meta that was written, or null on failure.
+        /// </summary>
+        public static MetaFile SaveImporter(string guid, IImporter importer)
+        {
             // Resolve to source GUID (in case we got a sub-asset GUID)
             if (_subAssetToSource.TryGetValue(guid, out var sourceGuid))
                 guid = sourceGuid;
@@ -633,7 +671,7 @@ namespace Freefall.Assets
             if (!_guidToMeta.TryGetValue(guid, out var meta))
             {
                 Debug.LogWarning("AssetDatabase", $"Cannot save importer settings: unknown GUID {guid}");
-                return;
+                return null;
             }
 
             // Serialize current importer state to the meta file
@@ -642,14 +680,11 @@ namespace Freefall.Assets
             catch (Exception ex)
             {
                 Debug.LogWarning("AssetDatabase", $"Failed to serialize importer settings: {ex.Message}");
-                return;
+                return null;
             }
 
             WriteMetaFile(meta);
-            Debug.Log($"[AssetDatabase] Saved importer settings for {meta.SourcePath}");
-
-            // Reimport with the new settings
-            ImportAsset(meta);
+            return meta;
         }
 
         // ── Core Logic ──
@@ -668,6 +703,7 @@ namespace Freefall.Assets
             _packers.Clear();
             _guidToThumb.Clear();
             _thumbTextures.Clear();
+            _reimportedGuids.Clear();
 
             _thumbGenerators.Clear();
             lock (_typeAliases)
@@ -1205,7 +1241,29 @@ namespace Freefall.Assets
             // Re-register subassets for lookup
             RegisterMeta(meta);
 
+            // Stamped after the cache files are written: a load that starts later records a stamp >= this
+            // and is not reloaded; one that started earlier may have read the old files and is.
+            long stamp = Interlocked.Increment(ref _importStamp);
+            _reimportedGuids.Enqueue((meta.Guid, stamp));
+            lock (meta)
+            {
+                foreach (var sub in meta.SubAssets)
+                    _reimportedGuids.Enqueue((sub.Guid, stamp));
+            }
+
             Debug.Log($"[AssetDatabase] Imported: {meta.SourcePath} → {meta.SubAssets.Count} artifacts");
+        }
+
+        /// <summary>
+        /// Drain the GUIDs (source and sub-asset) whose cache files were rewritten by an import since
+        /// the last call, mapped to the stamp of their latest import. Thread-safe.
+        /// </summary>
+        public static Dictionary<string, long> TakeReimportedGuids()
+        {
+            var guids = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
+            while (_reimportedGuids.TryDequeue(out var entry))
+                guids[entry.guid] = Math.Max(entry.stamp, guids.GetValueOrDefault(entry.guid));
+            return guids;
         }
 
         /// <summary>

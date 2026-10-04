@@ -234,6 +234,134 @@ namespace Freefall.Editor.Commands
     }
 
     /// <summary>
+    /// Place many prefab/mesh instances in one main-thread pass (modular kits, building assemblies).
+    /// POST /api/entity/instantiate_batch
+    /// Body: { items: [{ guid, name?, position?, rotation?, scale? }],
+    ///         group?: { name, position?, rotation? }   — new parent entity; item transforms are local to it
+    ///         parent?: id                              — or an existing parent entity
+    ///         snapToGround?: false                     — snaps the group (or each unparented item) to the terrain }
+    /// Assets are loaded once per GUID; a failing item is reported and skipped, the rest are placed.
+    /// </summary>
+    [CommandRoute("POST", "/api/entity/instantiate_batch")]
+    public class InstantiateBatchCommand : EditorCommand
+    {
+        public override CommandResult Execute(CommandContext context)
+        {
+            if (!Program.IsProjectOpen)
+                return CommandResult.Error(409, "No project is open");
+            if (string.IsNullOrEmpty(context.Body))
+                return CommandResult.BadRequest("Body required: {\"items\":[{\"guid\":...}]}");
+
+            using var doc = context.ParseBody();
+            var root = doc.RootElement;
+            if (!root.TryGetProperty("items", out var items) || items.ValueKind != System.Text.Json.JsonValueKind.Array)
+                return CommandResult.BadRequest("'items' array required");
+
+            bool snap = root.TryGetProperty("snapToGround", out var snapProp) && snapProp.GetBoolean();
+            var terrain = snap ? TerrainHeightCommand.FindTerrainRenderer() : null;
+
+            void Snap(Entity e)
+            {
+                if (terrain == null) return;
+                var p = e.Transform.Position;
+                p.Y = terrain.GetHeight(new System.Numerics.Vector3(p.X, 0, p.Z));
+                e.Transform.Position = p;
+            }
+
+            // Parent: a new group entity, or an existing entity
+            Entity parent = null;
+            bool newGroup = false;
+            if (root.TryGetProperty("group", out var groupProp) && groupProp.ValueKind == System.Text.Json.JsonValueKind.Object)
+            {
+                var gname = groupProp.TryGetProperty("name", out var gn) ? gn.GetString() : "Group";
+                parent = new Entity(gname);
+                if (groupProp.TryGetProperty("position", out var gp)) parent.Transform.Position = CommandHelpers.ParseVec3(gp);
+                if (groupProp.TryGetProperty("rotation", out var gr)) parent.Transform.Rotation = CommandHelpers.ParseQuat(gr);
+                Snap(parent);
+                newGroup = true;
+            }
+            else if (root.TryGetProperty("parent", out var parentProp) && parentProp.ValueKind == System.Text.Json.JsonValueKind.Number)
+            {
+                parent = CommandHelpers.FindEntityById(parentProp.GetInt32());
+                if (parent == null)
+                    return CommandResult.NotFound($"Parent entity {parentProp.GetInt32()} not found");
+            }
+
+            var prefabs = new System.Collections.Generic.Dictionary<string, Prefab>();
+            var meshes = new System.Collections.Generic.Dictionary<string, Mesh>();
+            var placed = new System.Collections.Generic.List<object>();
+            var failed = new System.Collections.Generic.List<object>();
+
+            int index = -1;
+            foreach (var item in items.EnumerateArray())
+            {
+                index++;
+                try
+                {
+                    var guid = item.TryGetProperty("guid", out var g) ? g.GetString() : null;
+                    if (string.IsNullOrEmpty(guid))
+                        throw new ArgumentException("missing 'guid'");
+
+                    Entity entity;
+                    if (!prefabs.TryGetValue(guid, out var prefab) && !meshes.ContainsKey(guid))
+                    {
+                        // Prefab first (it carries materials); the type guard makes the probe cheap for meshes
+                        try { prefab = Engine.Assets.LoadByGuid<Prefab>(guid); } catch { prefab = null; }
+                        if (prefab != null) prefabs[guid] = prefab;
+                        else
+                        {
+                            Mesh m = null;
+                            try { m = Engine.Assets.LoadByGuid<Mesh>(guid); } catch { }
+                            meshes[guid] = m ?? throw new ArgumentException($"no Prefab or Mesh with GUID '{guid}'");
+                        }
+                    }
+
+                    if (prefab != null)
+                    {
+                        entity = prefab.Instantiate() ?? throw new InvalidOperationException($"prefab '{prefab.Name}' failed to instantiate");
+                    }
+                    else
+                    {
+                        var mesh = meshes[guid];
+                        entity = new Entity(mesh.Name ?? "Entity");
+                        entity.AddComponent(new MeshRenderer { Mesh = mesh });
+                    }
+
+                    if (item.TryGetProperty("name", out var n) && n.ValueKind == System.Text.Json.JsonValueKind.String)
+                        entity.Name = n.GetString();
+                    if (item.TryGetProperty("position", out var p)) entity.Transform.Position = CommandHelpers.ParseVec3(p);
+                    if (item.TryGetProperty("rotation", out var r)) entity.Transform.Rotation = CommandHelpers.ParseQuat(r);
+                    if (item.TryGetProperty("scale", out var s)) entity.Transform.Scale = CommandHelpers.ParseVec3(s);
+
+                    if (parent != null)
+                        entity.Transform.Parent = parent.Transform;       // keeps local values
+                    else
+                        Snap(entity);
+
+                    placed.Add(new { index, id = entity.Id, uid = entity.UID.ToString(), name = entity.Name });
+                }
+                catch (Exception ex)
+                {
+                    failed.Add(new { index, error = ex.Message });
+                }
+            }
+
+            MessageDispatcher.Send(Msg.RefreshExplorer);
+
+            return CommandResult.Json(new
+            {
+                status = failed.Count == 0 ? "instantiated" : placed.Count == 0 ? "failed" : "partial",
+                placedCount = placed.Count,
+                failedCount = failed.Count,
+                group = parent == null ? null : new { id = parent.Id, uid = parent.UID.ToString(), name = parent.Name, created = newGroup },
+                bounds = parent != null ? CommandHelpers.WorldBounds(parent) : null,
+                placed,
+                failed,
+            });
+        }
+    }
+
+    /// <summary>
     /// Update prefab instances in the scene.
     /// POST /api/prefab/update
     /// Body: { guid: "prefab-guid" } — updates all instances
@@ -289,13 +417,16 @@ namespace Freefall.Editor.Commands
                 if (!entity.IsPrefabInstance)
                     return CommandResult.BadRequest($"Entity {id} is not a prefab instance");
 
-                var serializer = new Serialization.EntitySerializer();
-                var templates = serializer.LoadFromBytes(entity.Prefab.SourceYaml);
+                var serializer = new Serialization.EntitySerializer { DuplicateMode = true };
+                var templates = serializer.LoadFromBytes(entity.Prefab.SourceYaml, skipPrefabHydration: true);
                 if (templates.Count > 0)
                 {
                     entity.Prefab.UpdateInstance(entity, templates[0]);
-                    foreach (var te in templates)
-                        EntityManager.RemoveEntity(te);
+
+                    // Destroy() the temporary template entities (not just RemoveEntity): UpdateInstance leaves
+                    // the template's components on it, and they stay in ComponentCache until destroyed.
+                    for (int i = templates.Count - 1; i >= 0; i--)
+                        templates[i].Destroy();
                 }
 
                 return CommandResult.Json(new

@@ -705,6 +705,28 @@ void CSCopySlice(uint3 id : SV_DispatchThreadID) {
             _ => fmt
         };
 
+        /// <summary>
+        /// Hot reload: move <paramref name="source"/>'s resource into this texture and rewrite the SRV at
+        /// this texture's existing bindless index, so materials (which store the index) need no rebinding.
+        /// The heap is directly indexed (no static-descriptor guarantee), so rewriting a live slot is legal;
+        /// frames in flight read either the old or the new resource, and the old one is kept alive via
+        /// DeferDispose until they retire. <paramref name="source"/> must be fully uploaded
+        /// (StreamingManager.Flush) and unreferenced. Main thread only.
+        /// </summary>
+        public void ReplaceResource(Texture source)
+        {
+            var device = Engine.Device;
+
+            // Default SRV (null desc) = all mips, Texture2D or Texture2DArray by array size, resource format.
+            device.NativeDevice.CreateShaderResourceView(source._resource, null, SrvCpuHandle);
+            (_resource, source._resource) = (source._resource, _resource);
+
+            // source's own slot was never handed out, so it can be recycled right away.
+            device.ReleaseBindlessIndex(source.BindlessIndex);
+            source.BindlessIndex = 0;
+            device.DeferDispose(source);
+        }
+
         public void Dispose()
         {
             _resource?.Dispose();

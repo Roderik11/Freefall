@@ -36,6 +36,9 @@ namespace Freefall.Editor.Commands
 
         private static Dictionary<string, Type> _nodeTypes;
 
+        /// <summary>Forget the cached types after a script reload (it would pin the old script assembly).</summary>
+        internal static void ResetTypeCache() => _nodeTypes = null;
+
         /// <summary>Every concrete graph node type, by short class name.</summary>
         public static Dictionary<string, Type> NodeTypes
         {
@@ -45,6 +48,7 @@ namespace Freefall.Editor.Commands
                 _nodeTypes = new Dictionary<string, Type>(StringComparer.OrdinalIgnoreCase);
                 foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
                 {
+                    if (ScriptCompiler.IsStale(asm)) continue;
                     Type[] types;
                     try { types = asm.GetTypes(); } catch { continue; }
                     foreach (var t in types)
@@ -430,7 +434,14 @@ namespace Freefall.Editor.Commands
                 {
                     if (slots.Count > 0 && !slots.Contains(kv.Name))
                         return CommandResult.BadRequest($"Material has no texture slot '{kv.Name}'. Slots: {string.Join(", ", slots)}");
-                    if (CommandHelpers.FindOrLoadAsset(kv.Value.GetString() ?? "") is not Texture tex)
+                    // null or "" clears the slot (the shader then uses its default for that map)
+                    if (kv.Value.ValueKind == JsonValueKind.Null || string.IsNullOrEmpty(kv.Value.GetString()))
+                    {
+                        material.ClearTexture(kv.Name);
+                        applied[kv.Name] = null;
+                        continue;
+                    }
+                    if (CommandHelpers.FindOrLoadAsset(kv.Value.GetString()) is not Texture tex)
                         return CommandResult.NotFound($"Texture not found for '{kv.Name}': {kv.Value}");
                     material.SetTexture(kv.Name, tex);
                     applied[kv.Name] = tex.Name;

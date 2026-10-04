@@ -171,12 +171,18 @@ namespace Freefall.PCG
         [ValueRange(0f, 50f)]
         public float Margin = 1f;
 
+        /// <summary>
+        /// Also test the executing entity's own SplatStamp. For props offset beside a line (road lanterns, fences):
+        /// they are dropped wherever they land inside the road itself, e.g. on the inside of a hairpin or at a junction.
+        /// </summary>
+        public bool IncludeOwnStamps = false;
+
         [Output]
         public SamplePointSet Output;
 
         /// <summary>
         /// The executing PCG entity. Injected by PCGComponent: an area's own SplatStamp (e.g. a farmyard painted as
-        /// trampled dirt) keeps other scatter out but must not exclude the area's own points.
+        /// trampled dirt) keeps other scatter out but must not exclude the area's own points (unless IncludeOwnStamps).
         /// </summary>
         [Browsable(false)]
         public Entity IgnoreEntity;
@@ -193,7 +199,7 @@ namespace Freefall.PCG
             var stamps = new System.Collections.Generic.List<(SplatStamp stamp, Vortice.Mathematics.BoundingBox bounds)>();
             foreach (var s in ComponentCache<SplatStamp>.All)
             {
-                if (s is SplatStamp { Enabled: true } splat && splat.Entity != IgnoreEntity)
+                if (s is SplatStamp { Enabled: true } splat && (IncludeOwnStamps || splat.Entity != IgnoreEntity))
                     stamps.Add((splat, splat.GetWorldBounds()));
             }
 

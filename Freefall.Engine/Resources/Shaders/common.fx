@@ -30,6 +30,16 @@ cbuffer SceneConstants : register(b0)
     float MieScattering;               // Mie (haze/glow) strength (0–1)
     float MieAnisotropy;               // Henyey-Greenstein g (0–0.99)
     float3 _atmoPad;                   // explicit padding to 16-byte row
+
+    // ── Cloud layer (set by SkyboxRenderer) — shared by the sky dome and the cloud shadows ──
+    float CloudCoverage;               // 0-1
+    float CloudTime;                   // integral of CloudSpeed over time (drift + evolution)
+    float CloudAltitude;               // cloud layer height above the camera in world units
+    float CloudAltitudeFrom;           // altitude of the previous preset while a transition runs
+    float CloudAltitudeBlend;          // 0 = show CloudAltitudeFrom, 1 = show CloudAltitude (cross-fade weight)
+    float CloudShadowStrength;         // 0 = no cloud shadows, 1 = dense cloud blocks the sun completely
+    uint CloudNoiseLUTIdx;             // bindless index of the 3D cloud noise LUT (0 = none)
+    float CloudShadowScale;            // shadow pattern is this many times smaller than the visible clouds (1 = matching, km-sized)
 }
 
 // Material data for bindless texture lookup via Material ID indirection

@@ -104,6 +104,11 @@ cbuffer PushConstants : register(b3)
     uint Reserved30;                // slot 30 — (was per-batch bone buffer, now per-instance)
     uint CascadeBufferSRVIdx;       // slot 31 — SRV: StructuredBuffer<CascadeData> / shadow cascade idx (aliased)
     uint SortKeysUAVIdx;            // slot 32 — UAV: depth sort keys buffer (uint2 per entry)
+    uint MeshLodRegistryIdx;        // slot 33 — SRV: MeshPartLod buffer, parallel to the mesh registry
+    float LodCameraX;               // slot 34 — main camera position for LOD selection. Set for shadow
+    float LodCameraY;               // slot 35   passes too, so shadows use the main view's LOD.
+    float LodCameraZ;               // slot 36   (separate floats: a float3 would not pack into these slots)
+    float LodFactor;                // slot 37 — Camera.FoVFactor * LODScale² (0 = LOD selection off)
 };
 
 // Convenience aliases for named push constants (matching old #define usage)
@@ -162,6 +167,65 @@ struct MeshPartEntry
     uint Reserved8;
     uint Reserved9;
 };
+
+// LOD chain data per mesh part - matches C# MeshRegistry.MeshPartLod exactly (32 bytes).
+// Indexed by MeshPartId. "K" values are normalised squared distances:
+//   k = distanceSq / (LodFactor * instanceScale²)
+// with the mesh radius, screen-size thresholds and LODBias folded in on the CPU (Mesh.GetPartLod).
+struct MeshPartLod
+{
+    float3 Center;      // mesh-local centre shared by all parts, so they make the same decision
+    float CullK;        // beyond this the mesh is too small on screen (0 = never)
+    float NearK;        // the part is not drawn closer than this (0 = no limit)
+    float FarK;         // beyond this NextPartId takes over (0 = no limit)
+    uint NextPartId;    // MeshPartId of the next LOD's part + 1 (0 = none)
+    uint Reserved;
+};
+
+// High bit of a subbatch ID: the instance was submitted as a LOD chain head and the culler
+// resolves the part to draw (DrawBucket.LodManagedBit). Without it the ID is drawn as-is.
+#define LOD_MANAGED_BIT 0x80000000u
+#define INVALID_PART    0xFFFFFFFFu
+
+//-----------------------------------------------------------------------------
+// LOD selection: resolve a per-instance subbatch ID to the MeshPartId to draw.
+// Returns INVALID_PART if nothing should be drawn (too small, or no part at this LOD).
+// Depends only on the main camera (LodCamera*, LodFactor), never on the frustum being
+// culled against, so shadow passes resolve the same part as the main view.
+//
+// The visibility kernels store the result as (partId + 1) in the visibility flags
+// (0 = culled); CSHistogram / CSGlobalScatter / CSComputeDepthKeys read it from there.
+//-----------------------------------------------------------------------------
+uint ResolveLodPart(uint subbatchId, row_major float4x4 world, float maxScale)
+{
+    uint partId = subbatchId & ~LOD_MANAGED_BIT;
+    if ((subbatchId & LOD_MANAGED_BIT) == 0 || LodFactor <= 0.0)
+        return partId;
+
+    StructuredBuffer<MeshPartLod> lodRegistry = ResourceDescriptorHeap[MeshLodRegistryIdx];
+    MeshPartLod lod = lodRegistry[partId];
+
+    float3 toCamera = mul(float4(lod.Center, 1.0), world).xyz - float3(LodCameraX, LodCameraY, LodCameraZ);
+    float k = dot(toCamera, toCamera) / max(LodFactor * maxScale * maxScale, 1e-12);
+
+    if (lod.CullK > 0.0 && k > lod.CullK)
+        return INVALID_PART;
+
+    // Walk the chain to the part of the active LOD
+    for (uint i = 0; i < 8; i++)
+    {
+        if (k < lod.NearK)
+            return INVALID_PART;
+        if (lod.FarK == 0.0 || k < lod.FarK)
+            return partId;
+        if (lod.NextPartId == 0)
+            return INVALID_PART;
+
+        partId = lod.NextPartId - 1;
+        lod = lodRegistry[partId];
+    }
+    return partId;
+}
 
 // Per-instance descriptor (matches C# InstanceDescriptor exactly: 20 bytes = 5 uints)
 struct InstanceDescriptor
@@ -384,26 +448,31 @@ void CSVisibility(uint3 dispatchThreadId : SV_DispatchThreadID)
         return;
     }
     
-    // subbatchIds stores meshPartId directly (set in CommandBuffer.Enqueue)
-    uint subBatch = subbatchIds[instanceIdx];
-    
     // Data is stored in add-order, instanceIdx == drawIdx (identity mapping)
     uint transformSlot = descriptors[instanceIdx].TransformSlot;
-    
-    // Look up local bounding sphere from mesh registry (persistent, not per-instance)
-    float4 localSphere = meshRegistry[subBatch].LocalBounds;
-    
-    // Transform sphere to world space
     row_major float4x4 world = transforms[transformSlot];
-    float3 worldCenter = mul(float4(localSphere.xyz, 1.0), world).xyz;
-    
-    // Scale radius by maximum axis scale
+
+    // Maximum axis scale (for the radius and the LOD distance)
     float3 scale = float3(
         length(world[0].xyz),
         length(world[1].xyz),
         length(world[2].xyz)
     );
     float maxScale = max(scale.x, max(scale.y, scale.z));
+
+    // subbatchIds stores the meshPartId (set in CommandBuffer.Enqueue); resolve its LOD
+    uint subBatch = ResolveLodPart(subbatchIds[instanceIdx], world, maxScale);
+    if (subBatch == INVALID_PART)
+    {
+        visibilityFlags[instanceIdx] = 0;
+        return;
+    }
+
+    // Look up local bounding sphere from mesh registry (persistent, not per-instance)
+    float4 localSphere = meshRegistry[subBatch].LocalBounds;
+
+    // Transform sphere to world space
+    float3 worldCenter = mul(float4(localSphere.xyz, 1.0), world).xyz;
     float worldRadius = localSphere.w * maxScale;
     
     // Frustum test — save result for stats (avoid redundant re-evaluation)
@@ -422,8 +491,8 @@ void CSVisibility(uint3 dispatchThreadId : SV_DispatchThreadID)
     
     bool visible = frustumVisible && !hiZOccluded;
     
-    // Write visibility flag: 0 = culled, 1 = visible
-    visibilityFlags[instanceIdx] = visible ? 1u : 0u;
+    // Write visibility flag: 0 = culled, otherwise resolved MeshPartId + 1
+    visibilityFlags[instanceIdx] = visible ? (subBatch + 1u) : 0u;
     
     // Update cull stats — wave-aggregated to reduce atomic contention
     if (CullStatsUAVIdx != 0)
@@ -456,16 +525,14 @@ void CSHistogram(uint3 dispatchThreadId : SV_DispatchThreadID)
     if (instanceIdx >= TotalInstances)
         return;
     
-    // Read visibility flag from CSVisibility output (1=visible)
+    // Read visibility flag from the visibility pass (0 = culled, else LOD-resolved MeshPartId + 1)
     RWStructuredBuffer<uint> visibilityFlags = ResourceDescriptorHeap[VisibilityFlagsIdx];
     uint flag = visibilityFlags[instanceIdx];
-    
+
     if (flag == 0)
         return;
-    
-    // Read MeshPartId for this instance (stored in subbatchIds, which is actually MeshPartId)
-    StructuredBuffer<uint> meshPartIds = ResourceDescriptorHeap[SubbatchIdsIdx];
-    uint meshPartId = meshPartIds[instanceIdx];
+
+    uint meshPartId = flag - 1;
     
     // Atomically increment histogram counter for this MeshPartId
     RWStructuredBuffer<uint> histogram = ResourceDescriptorHeap[HistogramIdx];
@@ -494,8 +561,9 @@ void CSLocalScan(uint3 groupId : SV_GroupID, uint3 groupThreadId : SV_GroupThrea
     uint idx1 = blockOffset + tid;
     uint idx2 = blockOffset + tid + 256;
     
-    sharedData[tid] = (idx1 < TotalInstances) ? flags[idx1] : 0;
-    sharedData[tid + 256] = (idx2 < TotalInstances) ? flags[idx2] : 0;
+    // Flags hold MeshPartId + 1, not 1: count them, don't sum them
+    sharedData[tid] = (idx1 < TotalInstances && flags[idx1] != 0) ? 1 : 0;
+    sharedData[tid + 256] = (idx2 < TotalInstances && flags[idx2] != 0) ? 1 : 0;
     
     // Up-sweep (reduce) phase
     uint offset = 1;
@@ -615,14 +683,14 @@ void CSGlobalScatter(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupId
         return;
     
     RWStructuredBuffer<uint> visibilityFlags = ResourceDescriptorHeap[VisibilityFlagsIdx];
-    StructuredBuffer<uint> subbatchIds = ResourceDescriptorHeap[SubbatchIdsIdx];
     RWStructuredBuffer<uint> counters = ResourceDescriptorHeap[CounterBufferIdx];
     RWStructuredBuffer<uint> visibleOut = ResourceDescriptorHeap[VisibleIndicesUAVIdx];
-    
+
+    // 0 = culled, else LOD-resolved MeshPartId + 1
     uint flag = visibilityFlags[instanceIdx];
     if (flag >= 1)
     {
-        uint meshPartId = subbatchIds[instanceIdx];
+        uint meshPartId = flag - 1;
         
         uint outputIdx;
         InterlockedAdd(counters[meshPartId], 1, outputIdx);
@@ -923,36 +991,43 @@ void CSVisibilityShadow(uint3 dispatchThreadId : SV_DispatchThreadID)
         return;
     }
     
-    // Get transform and bounding sphere from mesh registry
+    // Get transform
     uint transformSlot = descriptors[instanceIdx].TransformSlot;
-    uint meshPartId = subbatchIds[instanceIdx];
-    float4 localSphere = meshRegistry[meshPartId].LocalBounds;
-    
-    // Transform sphere to world space
     row_major float4x4 world = transforms[transformSlot];
-    float3 worldCenter = mul(float4(localSphere.xyz, 1.0), world).xyz;
-    
-    // Scale radius by maximum axis scale
+
+    // Maximum axis scale (for the radius and the LOD distance)
     float3 scale = float3(
         length(world[0].xyz),
         length(world[1].xyz),
         length(world[2].xyz)
     );
     float maxScale = max(scale.x, max(scale.y, scale.z));
+
+    // Same LOD as the main view (resolved from the main camera, not the light)
+    uint meshPartId = ResolveLodPart(subbatchIds[instanceIdx], world, maxScale);
+    if (meshPartId == INVALID_PART)
+    {
+        visibilityFlags[instanceIdx] = 0;
+        return;
+    }
+
+    // Bounding sphere from mesh registry, transformed to world space
+    float4 localSphere = meshRegistry[meshPartId].LocalBounds;
+    float3 worldCenter = mul(float4(localSphere.xyz, 1.0), world).xyz;
     float worldRadius = localSphere.w * maxScale;
-    
+
     // For skinned meshes (BoneBufferIdx != 0), the bounding sphere is static (bind pose)
     // and doesn't account for animation. Inflate it to prevent culling when limbs move outside.
     if (descriptors[instanceIdx].BoneBufferIdx != 0)
     {
         worldRadius *= 1.5;
     }
-    
+
     // Frustum test against selected shadow cascade
     bool visible = IsVisibleShadow(worldCenter, worldRadius, ShadowCascadeIdx);
-    
-    // Write visibility flag
-    visibilityFlags[instanceIdx] = visible ? 1 : 0;
+
+    // Write visibility flag: 0 = culled, otherwise resolved MeshPartId + 1
+    visibilityFlags[instanceIdx] = visible ? (meshPartId + 1u) : 0u;
 }
 
 //-----------------------------------------------------------------------------
@@ -986,19 +1061,27 @@ void CSVisibilityShadow4(uint3 dispatchThreadId : SV_DispatchThreadID)
     StructuredBuffer<uint> subbatchIds = ResourceDescriptorHeap[SubbatchIdsIdx];
     
     uint transformSlot = descriptors[instanceIdx].TransformSlot;
-    uint meshPartId = subbatchIds[instanceIdx];
-    float4 localSphere = meshRegistry[meshPartId].LocalBounds;
-    
-    // Transform sphere to world space (done ONCE)
     row_major float4x4 world = transforms[transformSlot];
-    float3 worldCenter = mul(float4(localSphere.xyz, 1.0), world).xyz;
-    
+
     float3 scale = float3(
         length(world[0].xyz),
         length(world[1].xyz),
         length(world[2].xyz)
     );
     float maxScale = max(scale.x, max(scale.y, scale.z));
+
+    // Same LOD as the main view (resolved from the main camera, not the light)
+    uint meshPartId = ResolveLodPart(subbatchIds[instanceIdx], world, maxScale);
+    if (meshPartId == INVALID_PART)
+    {
+        combinedVis[instanceIdx] = 0;
+        cascadeMasks[instanceIdx] = 0;
+        return;
+    }
+
+    // Transform sphere to world space (done ONCE)
+    float4 localSphere = meshRegistry[meshPartId].LocalBounds;
+    float3 worldCenter = mul(float4(localSphere.xyz, 1.0), world).xyz;
     float worldRadius = localSphere.w * maxScale;
     
     // Inflate for skinned meshes (same as CSVisibilityShadow)
@@ -1011,8 +1094,9 @@ void CSVisibilityShadow4(uint3 dispatchThreadId : SV_DispatchThreadID)
     bool vis2 = IsVisibleShadow(worldCenter, worldRadius, 2) && !IsOccludedShadow(worldCenter, worldRadius, 2);
     bool vis3 = IsVisibleShadow(worldCenter, worldRadius, 3) && !IsOccludedShadow(worldCenter, worldRadius, 3);
     
-    // Combined visibility (union) — drives stream compaction
-    combinedVis[instanceIdx] = (vis0 || vis1 || vis2 || vis3) ? 1 : 0;
+    // Combined visibility (union) — drives stream compaction.
+    // 0 = culled, otherwise resolved MeshPartId + 1
+    combinedVis[instanceIdx] = (vis0 || vis1 || vis2 || vis3) ? (meshPartId + 1u) : 0u;
     
     // Per-instance cascade mask — VS reads this for early-out
     uint mask = (vis0 ? 1u : 0u) | (vis1 ? 2u : 0u) | (vis2 ? 4u : 0u) | (vis3 ? 8u : 0u);
@@ -1181,8 +1265,8 @@ void CSComputeDepthKeys(uint3 dispatchThreadId : SV_DispatchThreadID)
     
     StructuredBuffer<InstanceDescriptor> descriptors = ResourceDescriptorHeap[DescriptorBufferIdx];
     StructuredBuffer<row_major float4x4> transforms = ResourceDescriptorHeap[GlobalTransformsIdx];
-    StructuredBuffer<uint> subbatchIds = ResourceDescriptorHeap[SubbatchIdsIdx];
-    
+    RWStructuredBuffer<uint> visibilityFlags = ResourceDescriptorHeap[VisibilityFlagsIdx];
+
     uint transformSlot = descriptors[instanceIdx].TransformSlot;
     row_major float4x4 world = transforms[transformSlot];
     
@@ -1199,8 +1283,9 @@ void CSComputeDepthKeys(uint3 dispatchThreadId : SV_DispatchThreadID)
     if (SortDirection == 1)
         distQuantized = (~distQuantized) & 0xFFFFF;
     
-    uint meshPartId = subbatchIds[instanceIdx];
-    
+    // LOD-resolved MeshPartId + 1 (visible instances only reach here, so the flag is non-zero)
+    uint meshPartId = visibilityFlags[instanceIdx] - 1;
+
     // Composite key: meshPartId in upper 12 bits, distance in lower 20 bits
     uint compositeKey = (meshPartId << 20) | (distQuantized & 0xFFFFF);
     sortKeys[idx] = uint2(compositeKey, instanceIdx);

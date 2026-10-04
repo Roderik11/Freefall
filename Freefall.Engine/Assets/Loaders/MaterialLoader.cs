@@ -40,7 +40,48 @@ namespace Freefall.Assets.Loaders
             if (def == null)
                 throw new InvalidDataException($"Failed to deserialize Material from cache: {name}");
 
-            // Resolve Effect
+            // Create live Material
+            var material = new Material(ResolveEffect(def, manager));
+            material.Name = name;
+
+            ApplyDefinition(material, def, manager);
+
+            return material;
+        }
+
+        /// <summary>
+        /// Hot reload: apply the reimported definition to the live Material, keeping its MaterialID
+        /// so every renderer referencing it updates.
+        /// </summary>
+        public bool Reload(Asset existing, string cachePath, string name, AssetManager manager, string guid)
+        {
+            if (existing is not Material material)
+                return false;
+
+            MaterialDefinition def;
+            using (var stream = File.OpenRead(cachePath))
+                def = NativeImporter.LoadFromString(Encoding.UTF8.GetString(_packer.Read(stream).YamlBytes)) as MaterialDefinition;
+            if (def == null)
+                throw new InvalidDataException($"Failed to deserialize Material from cache: {name}");
+
+            // Effects by name are shared instances with fresh wrappers, so compare names:
+            // SetEffect rebuilds every PSO and should only run when the shader actually changed.
+            var effect = ResolveEffect(def, manager);
+            if (material.Effect == null || material.Effect.Name != effect.Name)
+                material.SetEffect(effect);
+
+            foreach (var slot in material.Textures.Keys.ToList())
+            {
+                if (!def.TextureRefs.ContainsKey(slot))
+                    material.ClearTexture(slot);
+            }
+
+            ApplyDefinition(material, def, manager, resetMissing: true);
+            return true;
+        }
+
+        private static Effect ResolveEffect(MaterialDefinition def, AssetManager manager)
+        {
             Effect effect = null;
             if (!string.IsNullOrEmpty(def.EffectRef))
             {
@@ -53,13 +94,11 @@ namespace Freefall.Assets.Loaders
                 }
             }
 
-            if (effect == null)
-                effect = InternalAssets.DefaultEffect;
+            return effect ?? InternalAssets.DefaultEffect;
+        }
 
-            // Create live Material
-            var material = new Material(effect);
-            material.Name = name;
-
+        private static void ApplyDefinition(Material material, MaterialDefinition def, AssetManager manager, bool resetMissing = false)
+        {
             // Resolve and bind textures
             foreach (var (slot, texRef) in def.TextureRefs)
             {
@@ -69,15 +108,15 @@ namespace Freefall.Assets.Loaders
                 else
                     Debug.LogWarning("MaterialLoader", $"Could not resolve texture '{texRef}' for slot '{slot}'");
             }
-            
+
             // Load material properties — data-driven via MaterialProperty.TryParseAndSet
             foreach (var prop in material.MaterialProperties)
             {
                 if (def.Parameters.TryGetValue(prop.Name, out var val))
                     prop.TryParseAndSet(val);
+                else if (resetMissing)
+                    prop.ResetToDefault();
             }
-
-            return material;
         }
 
         /// <summary>
@@ -91,12 +130,14 @@ namespace Freefall.Assets.Loaders
             File.WriteAllText(savePath, yaml, Encoding.UTF8);
             Debug.Log($"[MaterialLoader] Saved: {savePath}");
 
-            // Re-import to update the binary cache
+            // Re-import to update the binary cache. A newly created file isn't tracked yet
+            // (ImportAssetByPath would throw); the caller's Refresh registers and imports it.
             var assetsDir = Engine.Project?.AssetsDirectory;
             if (!string.IsNullOrEmpty(assetsDir) && savePath.StartsWith(assetsDir))
             {
                 var relativePath = Path.GetRelativePath(assetsDir, savePath).Replace('\\', '/');
-                AssetDatabase.ImportAssetByPath(relativePath);
+                if (AssetDatabase.PathToGuid(relativePath) != null)
+                    AssetDatabase.ImportAssetByPath(relativePath);
             }
         }
     }
