@@ -196,7 +196,7 @@ struct MeshPartLod
 // The visibility kernels store the result as (partId + 1) in the visibility flags
 // (0 = culled); CSHistogram / CSGlobalScatter / CSComputeDepthKeys read it from there.
 //-----------------------------------------------------------------------------
-uint ResolveLodPart(uint subbatchId, row_major float4x4 world, float maxScale)
+uint ResolveLodPart(uint subbatchId, row_major float4x4 world, float maxScaleSq)
 {
     uint partId = subbatchId & ~LOD_MANAGED_BIT;
     if ((subbatchId & LOD_MANAGED_BIT) == 0 || LodFactor <= 0.0)
@@ -206,7 +206,7 @@ uint ResolveLodPart(uint subbatchId, row_major float4x4 world, float maxScale)
     MeshPartLod lod = lodRegistry[partId];
 
     float3 toCamera = mul(float4(lod.Center, 1.0), world).xyz - float3(LodCameraX, LodCameraY, LodCameraZ);
-    float k = dot(toCamera, toCamera) / max(LodFactor * maxScale * maxScale, 1e-12);
+    float k = dot(toCamera, toCamera) / max(LodFactor * maxScaleSq, 1e-12);
 
     if (lod.CullK > 0.0 && k > lod.CullK)
         return INVALID_PART;
@@ -452,16 +452,13 @@ void CSVisibility(uint3 dispatchThreadId : SV_DispatchThreadID)
     uint transformSlot = descriptors[instanceIdx].TransformSlot;
     row_major float4x4 world = transforms[transformSlot];
 
-    // Maximum axis scale (for the radius and the LOD distance)
-    float3 scale = float3(
-        length(world[0].xyz),
-        length(world[1].xyz),
-        length(world[2].xyz)
-    );
-    float maxScale = max(scale.x, max(scale.y, scale.z));
+    // Largest axis scale, squared. The LOD distance uses it as is; only the radius needs the sqrt.
+    float maxScaleSq = max(dot(world[0].xyz, world[0].xyz),
+                       max(dot(world[1].xyz, world[1].xyz),
+                           dot(world[2].xyz, world[2].xyz)));
 
     // subbatchIds stores the meshPartId (set in CommandBuffer.Enqueue); resolve its LOD
-    uint subBatch = ResolveLodPart(subbatchIds[instanceIdx], world, maxScale);
+    uint subBatch = ResolveLodPart(subbatchIds[instanceIdx], world, maxScaleSq);
     if (subBatch == INVALID_PART)
     {
         visibilityFlags[instanceIdx] = 0;
@@ -473,7 +470,7 @@ void CSVisibility(uint3 dispatchThreadId : SV_DispatchThreadID)
 
     // Transform sphere to world space
     float3 worldCenter = mul(float4(localSphere.xyz, 1.0), world).xyz;
-    float worldRadius = localSphere.w * maxScale;
+    float worldRadius = localSphere.w * sqrt(maxScaleSq);
     
     // Frustum test — save result for stats (avoid redundant re-evaluation)
     bool frustumVisible = IsVisible(worldCenter, worldRadius);
@@ -995,16 +992,13 @@ void CSVisibilityShadow(uint3 dispatchThreadId : SV_DispatchThreadID)
     uint transformSlot = descriptors[instanceIdx].TransformSlot;
     row_major float4x4 world = transforms[transformSlot];
 
-    // Maximum axis scale (for the radius and the LOD distance)
-    float3 scale = float3(
-        length(world[0].xyz),
-        length(world[1].xyz),
-        length(world[2].xyz)
-    );
-    float maxScale = max(scale.x, max(scale.y, scale.z));
+    // Largest axis scale, squared. The LOD distance uses it as is; only the radius needs the sqrt.
+    float maxScaleSq = max(dot(world[0].xyz, world[0].xyz),
+                       max(dot(world[1].xyz, world[1].xyz),
+                           dot(world[2].xyz, world[2].xyz)));
 
     // Same LOD as the main view (resolved from the main camera, not the light)
-    uint meshPartId = ResolveLodPart(subbatchIds[instanceIdx], world, maxScale);
+    uint meshPartId = ResolveLodPart(subbatchIds[instanceIdx], world, maxScaleSq);
     if (meshPartId == INVALID_PART)
     {
         visibilityFlags[instanceIdx] = 0;
@@ -1014,7 +1008,7 @@ void CSVisibilityShadow(uint3 dispatchThreadId : SV_DispatchThreadID)
     // Bounding sphere from mesh registry, transformed to world space
     float4 localSphere = meshRegistry[meshPartId].LocalBounds;
     float3 worldCenter = mul(float4(localSphere.xyz, 1.0), world).xyz;
-    float worldRadius = localSphere.w * maxScale;
+    float worldRadius = localSphere.w * sqrt(maxScaleSq);
 
     // For skinned meshes (BoneBufferIdx != 0), the bounding sphere is static (bind pose)
     // and doesn't account for animation. Inflate it to prevent culling when limbs move outside.
@@ -1063,15 +1057,12 @@ void CSVisibilityShadow4(uint3 dispatchThreadId : SV_DispatchThreadID)
     uint transformSlot = descriptors[instanceIdx].TransformSlot;
     row_major float4x4 world = transforms[transformSlot];
 
-    float3 scale = float3(
-        length(world[0].xyz),
-        length(world[1].xyz),
-        length(world[2].xyz)
-    );
-    float maxScale = max(scale.x, max(scale.y, scale.z));
+    float maxScaleSq = max(dot(world[0].xyz, world[0].xyz),
+                       max(dot(world[1].xyz, world[1].xyz),
+                           dot(world[2].xyz, world[2].xyz)));
 
     // Same LOD as the main view (resolved from the main camera, not the light)
-    uint meshPartId = ResolveLodPart(subbatchIds[instanceIdx], world, maxScale);
+    uint meshPartId = ResolveLodPart(subbatchIds[instanceIdx], world, maxScaleSq);
     if (meshPartId == INVALID_PART)
     {
         combinedVis[instanceIdx] = 0;
@@ -1082,7 +1073,7 @@ void CSVisibilityShadow4(uint3 dispatchThreadId : SV_DispatchThreadID)
     // Transform sphere to world space (done ONCE)
     float4 localSphere = meshRegistry[meshPartId].LocalBounds;
     float3 worldCenter = mul(float4(localSphere.xyz, 1.0), world).xyz;
-    float worldRadius = localSphere.w * maxScale;
+    float worldRadius = localSphere.w * sqrt(maxScaleSq);
     
     // Inflate for skinned meshes (same as CSVisibilityShadow)
     if (descriptors[instanceIdx].BoneBufferIdx != 0)
