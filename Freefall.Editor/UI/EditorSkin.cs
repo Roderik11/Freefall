@@ -10,8 +10,8 @@ namespace Freefall.Editor
     {
         // Generated control art (see EnsureArt)
         public const string ButtonArt = "ui_button";                // white, radius 4 — tinted per state
-        private const string FieldArt = "ui_field";                 // inset well with a hairline border
-        private const string FieldHotArt = "ui_field_hot";
+        public const string FieldArt = "ui_field";                 // inset well with a hairline border
+        public const string FieldHotArt = "ui_field_hot";
         private const string FieldFocusArt = "ui_field_focus";      // accent border
         private const string UnderlineArt = "ui_underline";         // white 2px bottom edge
         private const string PopupArt = "ui_popup";                 // rounded panel with a light border
