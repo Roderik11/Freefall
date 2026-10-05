@@ -51,6 +51,12 @@ namespace Freefall.Editor
             }
         }
 
+        static System.Drawing.Icon? LoadAppIcon()
+        {
+            using var stream = typeof(Program).Assembly.GetManifestResourceStream("Freefall.Editor.icon.ico");
+            return stream != null ? new System.Drawing.Icon(stream) : null;
+        }
+
         [STAThread]
         static void Main()
         {
@@ -62,7 +68,8 @@ namespace Freefall.Editor
                 BackColor = color,
                 Size = new System.Drawing.Size(1680, 1020),
                 StartPosition = FormStartPosition.CenterScreen,
-                Text = "Freefall Editor"
+                Text = "Freefall Editor",
+                Icon = LoadAppIcon()
             };
 
             form.HandleCreated += (s, e) =>
@@ -71,6 +78,9 @@ namespace Freefall.Editor
                 if (DwmSetWindowAttribute(form.Handle, 19, [1], 4) != 0)
                     DwmSetWindowAttribute(form.Handle, 20, [1], 4);
             };
+
+            // Landing-page snapshot of the project being closed (no-op while on the landing page)
+            form.FormClosing += (s, e) => ProjectThumbnails.Capture();
 
             form.Show();
 
@@ -121,6 +131,10 @@ namespace Freefall.Editor
             // Start the AI agent command server (before project open so agent can trigger it)
             commandServer = new EditorCommandServer();
             commandServer.Start();
+
+            // Re-apply the icon now that startup is done: the taskbar asks the window for its icon while
+            // Engine.Initialize is still blocking this thread, gives up, and keeps a generic one until told again.
+            form.Icon = LoadAppIcon();
 
             RenderLoop.Run(form, Engine.Tick, true);
 

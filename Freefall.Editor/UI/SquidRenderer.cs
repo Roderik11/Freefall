@@ -55,6 +55,7 @@ namespace Freefall.Editor
             _fontTypes.Add("roboto_bold_9", new Squid.Font { Name = "roboto_bold_9", Family = "Roboto", Size = 9, Bold = true, International = true });
 
             Squid.Gui.AlwaysScissor = true;
+            Squid.Gui.ScaledFontResolver = GetScaledFont;
         }
 
         /// <summary>
@@ -189,10 +190,75 @@ namespace Freefall.Editor
             };
         }
 
+        private readonly Dictionary<string, (string TtfFile, int PixelSize, int LetterSpacing)> _runtimeFonts = new();
+
+        /// <summary>
+        /// Register a font that is rasterized from a TTF under Resources/Fonts on first use,
+        /// for sizes without a pre-baked DDS+XML atlas.
+        /// </summary>
+        public void RegisterRuntimeFont(string name, string ttfFile, int pixelSize, int letterSpacing = 0)
+        {
+            _runtimeFonts[name] = (ttfFile, pixelSize, letterSpacing);
+        }
+
+        // TTF and em size (px) behind each pre-baked atlas, so they can be re-rasterized at other sizes
+        private static readonly Dictionary<string, (string TtfFile, int PixelSize)> BakedFontSources = new()
+        {
+            { "roboto_regular_10", ("Roboto/Roboto-Regular.ttf", 11) },
+            { "roboto_medium_10", ("Roboto/Roboto-Medium.ttf", 11) },
+            { "roboto_regular_9", ("Roboto/Roboto-Regular.ttf", 10) },
+            { "roboto_medium_9", ("Roboto/Roboto-Medium.ttf", 10) },
+            { "roboto_bold_9", ("Roboto/Roboto-Bold.ttf", 10) },
+        };
+
+        /// <summary>
+        /// Font to draw with under a zoomed control (Gui.ScaledFontResolver): the same face
+        /// rasterized at the scaled size. Falls back to the unscaled font when the source is unknown.
+        /// </summary>
+        public int GetScaledFont(string name, float scale)
+        {
+            if (string.IsNullOrEmpty(name) || name == Squid.Font.Default)
+                name = "roboto_medium_10";
+
+            string ttfFile;
+            int basePixels, letterSpacing = 0;
+            if (_runtimeFonts.TryGetValue(name, out var runtime))
+                (ttfFile, basePixels, letterSpacing) = runtime;
+            else if (BakedFontSources.TryGetValue(name, out var baked))
+                (ttfFile, basePixels) = baked;
+            else
+                return GetFont(name);
+
+            int pixels = Math.Max(4, (int)MathF.Round(basePixels * scale));
+            if (pixels == basePixels)
+                return GetFont(name);
+
+            string scaledName = $"{name}@{pixels}";
+            if (!_runtimeFonts.ContainsKey(scaledName))
+                RegisterRuntimeFont(scaledName, ttfFile, pixels, (int)MathF.Round(letterSpacing * scale));
+
+            return GetFont(scaledName);
+        }
+
         public int GetFont(string name)
         {
             if (_fontLookup.TryGetValue(name, out var fontId))
                 return fontId;
+
+            if (_runtimeFonts.TryGetValue(name, out var runtime))
+            {
+                string ttfPath = Path.Combine(Engine.RootDirectory, "Resources", "Fonts", runtime.TtfFile);
+                if (File.Exists(ttfPath))
+                {
+                    _fontIndex++;
+                    _fontLookup.Add(name, _fontIndex);
+                    _fonts.Add(_fontIndex, RuntimeFont.Build(ttfPath, runtime.PixelSize, runtime.LetterSpacing));
+                    return _fontIndex;
+                }
+
+                Debug.LogWarning("SquidRenderer", $"Font file not found: {runtime.TtfFile}");
+                return -1;
+            }
 
             if (!_fontTypes.ContainsKey(name))
                 return -1;

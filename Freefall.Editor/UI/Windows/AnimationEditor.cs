@@ -27,15 +27,15 @@ namespace Freefall.Editor
             Size = new Point(800, 600);
 
             // ── Toolbar ──
-            Toolbar = new Frame { Style = "frame", Size = new Point(16, 24), Dock = DockStyle.Top };
-            Toolbar.Margin = new Margin(0, 0, 0, 1);
+            Toolbar = EditorToolbar.Create();
             Controls.Add(Toolbar);
 
-            AddToolbarButton("Save", BtnSave_Click);
-            AddToolbarButton("Add State", BtnAddState_Click);
-            AddToolbarButton("Add Tree", BtnAddTree_Click);
-            AddToolbarButton("Add Param", BtnAddParam_Click);
-            AddToolbarButton("Add Test", CreateBlendTreeAnimations);
+            EditorToolbar.Add(Toolbar, EditorSkin.IconSave, "Save", BtnSave_Click);
+            EditorToolbar.AddSeparator(Toolbar);
+            EditorToolbar.Add(Toolbar, EditorSkin.IconPlus, "State", BtnAddState_Click);
+            EditorToolbar.Add(Toolbar, EditorSkin.IconPlus, "Tree", BtnAddTree_Click);
+            EditorToolbar.Add(Toolbar, EditorSkin.IconPlus, "Param", BtnAddParam_Click);
+            EditorToolbar.Add(Toolbar, EditorSkin.IconPlus, "Test", CreateBlendTreeAnimations);
 
             // ── Split: Params (left) | Canvas (right) ──
             var split = new SplitContainer();
@@ -56,20 +56,6 @@ namespace Freefall.Editor
             Canvas = new AnimationCanvas(this);
             Canvas.Style = "canvas";
             split.SplitFrame2.Controls.Add(Canvas);
-        }
-
-        private void AddToolbarButton(string text, MouseEvent handler)
-        {
-            var btn = new Button
-            {
-                Text = text,
-                Size = new Point(100, 20),
-                Dock = DockStyle.Left,
-                Style = "button",
-                Margin = new Margin(1)
-            };
-            btn.MouseClick += handler;
-            Toolbar.Controls.Add(btn);
         }
 
         // ═══════════════════════════════════════════════════════

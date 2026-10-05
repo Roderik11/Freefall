@@ -264,17 +264,51 @@ namespace Freefall.Graphics
         /// </summary>
         public void DrawLine(int x1, int y1, int x2, int y2, Color4 color)
         {
+            // CPU-side scissor clipping, like the quad path: trim the segment to the scissor rect (Liang–Barsky)
+            float ax = x1, ay = y1, bx = x2, by = y2;
+            {
+                float dx = bx - ax, dy = by - ay;
+                float t0 = 0, t1 = 1;
+
+                if (!ClipLine(-dx, ax - Scissor.Left, ref t0, ref t1) ||
+                    !ClipLine(dx, Scissor.Right - ax, ref t0, ref t1) ||
+                    !ClipLine(-dy, ay - Scissor.Top, ref t0, ref t1) ||
+                    !ClipLine(dy, Scissor.Bottom - ay, ref t0, ref t1))
+                    return;
+
+                bx = ax + dx * t1; by = ay + dy * t1;
+                ax += dx * t0; ay += dy * t0;
+            }
 
             EnsureCapacity();
 
             ref var sprite = ref _sprites[_spriteCount++];
-            sprite.Position = new Vector2(x1, y1);
+            sprite.Position = new Vector2(ax, ay);
             sprite.Size = new Vector2(LineWidth, 0);
             sprite.Color = color;
             sprite.UVs = new Vector4(0, 0, 1, 1);
             sprite.TextureIndex = _whiteTextureIndex;
             sprite.Type = 1;
-            sprite.EndPosition = new Vector2(x2, y2);
+            sprite.EndPosition = new Vector2(bx, by);
+        }
+
+        // One Liang–Barsky edge test: p is the direction against the edge, q the distance to it.
+        private static bool ClipLine(float p, float q, ref float t0, ref float t1)
+        {
+            if (p == 0) return q >= 0;
+
+            float r = q / p;
+            if (p < 0)
+            {
+                if (r > t1) return false;
+                if (r > t0) t0 = r;
+            }
+            else
+            {
+                if (r < t0) return false;
+                if (r < t1) t1 = r;
+            }
+            return true;
         }
 
         /// <summary>

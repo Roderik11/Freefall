@@ -96,6 +96,7 @@ namespace Freefall.Editor.Commands
                 serializer.Save(path, entities);
                 if (Program.EditorUI != null)
                     Program.EditorUI.CurrentScenePath = path;
+                ProjectThumbnails.Capture();
 
                 return CommandResult.Json(new
                 {

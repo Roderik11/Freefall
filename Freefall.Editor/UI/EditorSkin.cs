@@ -8,28 +8,203 @@ namespace Freefall.Editor
     /// </summary>
     public static class EditorSkin
     {
+        // Generated control art (see EnsureArt)
+        public const string ButtonArt = "ui_button";                // white, radius 4 — tinted per state
+        private const string FieldArt = "ui_field";                 // inset well with a hairline border
+        private const string FieldHotArt = "ui_field_hot";
+        private const string FieldFocusArt = "ui_field_focus";      // accent border
+        private const string UnderlineArt = "ui_underline";         // white 2px bottom edge
+        private const string PopupArt = "ui_popup";                 // rounded panel with a light border
+        public const int ArtInset = 5;
+        private const int PopupInset = 8;
+
+        /// <summary>Corner mask (opaque outside radius 6) for rounding cards; tint with the colour behind them.</summary>
+        public const string CardMaskArt = "ui_card_mask";
+        public const int CardMaskInset = 7;
+
+        /// <summary>Folder icon for asset browser cards (128×128, draw centred).</summary>
+        public const string FolderArt = "ui_folder";
+
+        /// <summary>Roboto Medium, a step up from body text: panel and category headers.</summary>
+        public const string HeadingFont = "ui_heading";
+
+        // Toolbar glyphs: white, 18×18, tinted when drawn (see EditorToolbar)
+        public const string IconSave = "ui_icon_save";
+        public const string IconOpen = "ui_icon_open";
+        public const string IconPlay = "ui_icon_play";
+        public const string IconPlus = "ui_icon_plus";
+
+        private static readonly HashSet<string> _plugArt = new();
+
+        /// <summary>
+        /// Graph plug shapes rasterized at the exact on-screen diameter, so they stay crisp at any
+        /// canvas zoom. Returns the texture name: a ring, or the dot that sits inside it.
+        /// </summary>
+        public static string PlugArt(int diameter, bool dot)
+        {
+            string name = $"ui_plug_{(dot ? "dot" : "ring")}_{diameter}";
+            if (_plugArt.Add(name) && Gui.Renderer is SquidRenderer renderer)
+            {
+                LandingArt.Insert(renderer, name, diameter + 2, diameter + 2, (g, r) =>
+                {
+                    if (dot)
+                    {
+                        float size = diameter * .46f;
+                        g.FillEllipse(System.Drawing.Brushes.White, (r.Width - size) / 2, (r.Height - size) / 2, size, size);
+                    }
+                    else
+                    {
+                        float stroke = MathF.Max(1.5f, diameter * .14f);
+                        using var pen = new System.Drawing.Pen(System.Drawing.Color.White, stroke);
+                        g.DrawEllipse(pen, 1 + stroke / 2, 1 + stroke / 2, diameter - stroke, diameter - stroke);
+                    }
+                });
+            }
+            return name;
+        }
+
+        /// <summary>Graph editor node card colours (drawn by GraphFrame).</summary>
+        public static readonly int NodeBodyColor = Cool(.085f);
+        public static readonly int NodeHeaderColor = Cool(.19f);
+
+        /// <summary>Background of docked panels ("frame" style).</summary>
+        public static readonly int PanelColor = Cool(.125f);
+
+        private static bool _artReady;
+
+        /// <summary>
+        /// Neutral grey pulled slightly towards blue, so panels share the landing page's cool tone.
+        /// </summary>
+        private static int Cool(float v) => ColorInt.ARGB(1f, v - .016f, v - .004f, v + .020f);
+
+        private static void EnsureArt()
+        {
+            if (_artReady || Gui.Renderer is not SquidRenderer renderer) return;
+            _artReady = true;
+
+            LandingArt.Insert(renderer, ButtonArt, 16, 16, (g, r) =>
+            {
+                using var path = LandingArt.RoundedRect(r, 4);
+                g.FillPath(System.Drawing.Brushes.White, path);
+            });
+
+            void Field(string name, System.Drawing.Color border)
+            {
+                LandingArt.Insert(renderer, name, 16, 16, (g, r) =>
+                {
+                    using (var fill = LandingArt.RoundedRect(r, 4))
+                    using (var brush = new System.Drawing.SolidBrush(System.Drawing.Color.FromArgb(255, 14, 17, 23)))
+                        g.FillPath(brush, fill);
+
+                    r.Inflate(-.5f, -.5f);
+                    using var edge = LandingArt.RoundedRect(r, 3.5f);
+                    using var pen = new System.Drawing.Pen(border, 1f);
+                    g.DrawPath(pen, edge);
+                });
+            }
+
+            Field(FieldArt, System.Drawing.Color.FromArgb(22, 255, 255, 255));
+            Field(FieldHotArt, System.Drawing.Color.FromArgb(70, 255, 255, 255));
+            Field(FieldFocusArt, System.Drawing.Color.FromArgb(230, 255, 119, 95));
+
+            LandingArt.Insert(renderer, UnderlineArt, 8, 8, (g, r) =>
+                g.FillRectangle(System.Drawing.Brushes.White, 0, 6, 8, 2));
+
+            LandingArt.Insert(renderer, PopupArt, 24, 24, (g, r) =>
+            {
+                using (var fill = LandingArt.RoundedRect(r, 6))
+                using (var brush = new System.Drawing.SolidBrush(System.Drawing.Color.FromArgb(255, 24, 28, 36)))
+                    g.FillPath(brush, fill);
+
+                r.Inflate(-.5f, -.5f);
+                using var edge = LandingArt.RoundedRect(r, 5.5f);
+                using var pen = new System.Drawing.Pen(System.Drawing.Color.FromArgb(46, 255, 255, 255), 1f);
+                g.DrawPath(pen, edge);
+            });
+
+            LandingArt.Insert(renderer, CardMaskArt, 16, 16, (g, r) =>
+            {
+                using var path = LandingArt.RoundedRect(r, 6);
+                path.AddRectangle(r);       // alternate fill: the rect minus the rounded rect
+                g.FillPath(System.Drawing.Brushes.White, path);
+            });
+
+            LandingArt.Insert(renderer, FolderArt, 128, 128, (g, r) =>
+            {
+                // Back plate with its tab, then a lighter front flap
+                using var back = new System.Drawing.SolidBrush(System.Drawing.Color.FromArgb(255, 74, 86, 108));
+                using var tab = LandingArt.RoundedRect(new System.Drawing.RectangleF(22, 28, 40, 22), 6);
+                using var plate = LandingArt.RoundedRect(new System.Drawing.RectangleF(22, 38, 84, 62), 7);
+                g.FillPath(back, tab);
+                g.FillPath(back, plate);
+
+                var flap = new System.Drawing.RectangleF(22, 50, 84, 50);
+                using var front = new System.Drawing.Drawing2D.LinearGradientBrush(flap,
+                    System.Drawing.Color.FromArgb(255, 124, 140, 168), System.Drawing.Color.FromArgb(255, 102, 117, 144), 90f);
+                using var flapPath = LandingArt.RoundedRect(flap, 7);
+                g.FillPath(front, flapPath);
+            });
+
+            renderer.RegisterRuntimeFont(HeadingFont, "Roboto/Roboto-Medium.ttf", 12);
+
+            void Icon(string name, Action<System.Drawing.Graphics, System.Drawing.Pen> paint)
+            {
+                LandingArt.Insert(renderer, name, 18, 18, (g, r) =>
+                {
+                    g.ScaleTransform(18f / 16f, 18f / 16f);     // glyphs are authored on a 16px grid
+                    using var pen = new System.Drawing.Pen(System.Drawing.Color.White, 1.4f)
+                    {
+                        LineJoin = System.Drawing.Drawing2D.LineJoin.Round,
+                        StartCap = System.Drawing.Drawing2D.LineCap.Round,
+                        EndCap = System.Drawing.Drawing2D.LineCap.Round,
+                    };
+                    paint(g, pen);
+                });
+            }
+
+            Icon(IconSave, (g, pen) =>
+            {
+                g.DrawPolygon(pen, new System.Drawing.PointF[] { new(2.5f, 2.5f), new(10.5f, 2.5f), new(13.5f, 5.5f), new(13.5f, 13.5f), new(2.5f, 13.5f) });
+                g.DrawRectangle(pen, 5f, 2.5f, 4.5f, 3.5f);
+                g.DrawRectangle(pen, 5f, 9f, 6f, 4.5f);
+            });
+            Icon(IconOpen, (g, pen) =>
+                g.DrawPolygon(pen, new System.Drawing.PointF[] { new(1.5f, 3.5f), new(6f, 3.5f), new(7.5f, 5.5f), new(14.5f, 5.5f), new(14.5f, 12.5f), new(1.5f, 12.5f) }));
+            Icon(IconPlay, (g, pen) =>
+                g.FillPolygon(System.Drawing.Brushes.White, new System.Drawing.PointF[] { new(4.5f, 2.5f), new(13.5f, 8f), new(4.5f, 13.5f) }));
+            Icon(IconPlus, (g, pen) =>
+            {
+                pen.Width = 1.7f;
+                g.DrawLine(pen, 8f, 3.5f, 8f, 12.5f);
+                g.DrawLine(pen, 3.5f, 8f, 12.5f, 8f);
+            });
+        }
+
         public static void Apply(Desktop desktop)
         {
-            float b = .0061f;
+            EnsureArt();
 
-            int grey10 = ColorInt.ARGB(1f, .10f - b, .10f - b, .10f + b);
-            int grey125 = ColorInt.ARGB(1f, .125f - b, .125f - b, .125f + b);
-            int grey15 = ColorInt.ARGB(1f, .15f - b, .15f - b, .15f + b);
-            int grey166 = ColorInt.ARGB(1f, .166f - b, .166f - b, .166f + b);
-            int grey170 = ColorInt.ARGB(1f, .170f - b, .170f - b, .170f + b);
-            int grey175 = ColorInt.ARGB(1f, .175f - b, .175f - b, .175f + b);
-            int grey20 = ColorInt.ARGB(1f, .20f - b, .20f - b, .20f + b);
-            int grey25 = ColorInt.ARGB(1f, .25f - b, .25f - b, .25f + b);
-            int grey30 = ColorInt.ARGB(1f, .30f - b, .30f - b, .30f + b);
-            int grey35 = ColorInt.ARGB(1f, .35f - b, .35f - b, .35f + b);
-            int grey40 = ColorInt.ARGB(1f, .40f - b, .40f - b, .40f + b);
+            int accent = LandingArt.Coral;
+
+            int grey10 = Cool(.10f);
+            int grey125 = Cool(.125f);
+            int grey15 = Cool(.15f);
+            int grey166 = Cool(.166f);
+            int grey170 = Cool(.170f);
+            int grey175 = Cool(.175f);
+            int grey20 = Cool(.20f);
+            int grey25 = Cool(.25f);
+            int grey30 = Cool(.30f);
+            int grey35 = Cool(.35f);
+            int grey40 = Cool(.40f);
             int textColor = ColorInt.ARGB(1f, .80f, .80f, .80f);
             int darkColor = grey10;
 
             int windowColor = darkColor;
-            int normalColor = grey125;
+            int normalColor = PanelColor;
             int hotColor = grey20;
-            int selectedColor = grey25;
+            // Selection: the old grey25 warmed ~10% towards the accent
+            int selectedColor = ColorInt.ARGB(1f, .305f, .250f, .262f);
 
             ControlStyle baseStyle = new ControlStyle();
             baseStyle.Font = "roboto_regular_10";
@@ -119,18 +294,45 @@ namespace Freefall.Editor
             tab.CheckedPressed.BackColor = grey20;
             tab.SelectedPressed.BackColor = grey20;
 
+            // Active tab: accent underline
+            foreach (var state in new[] { tab.Selected, tab.SelectedHot, tab.SelectedPressed, tab.SelectedFocused,
+                                          tab.Checked, tab.CheckedHot, tab.CheckedPressed })
+            {
+                state.Texture = UnderlineArt;
+                state.Tiling = TextureMode.Grid;
+                state.Grid = new Squid.Margin(1, 1, 1, 2);
+                state.Tint = accent;
+            }
+
+            // Square, flat-colour button: the base for list items and anything that tiles edge to edge
+            ControlStyle flatButton = new ControlStyle(baseStyle);
+            flatButton.TextAlign = Alignment.MiddleCenter;
+            flatButton.BackColor = normalColor;
+            flatButton.Hot.BackColor = hotColor;
+            flatButton.Selected.BackColor = selectedColor;
+            flatButton.SelectedHot.BackColor = selectedColor;
+            flatButton.SelectedPressed.BackColor = selectedColor;
+            flatButton.SelectedFocused.BackColor = selectedColor;
+            flatButton.Checked.BackColor = selectedColor;
+            flatButton.CheckedHot.BackColor = selectedColor;
+
+            // Standalone button: rounded, tinted per state
             ControlStyle button = new ControlStyle(baseStyle);
             button.TextAlign = Alignment.MiddleCenter;
-            button.BackColor = normalColor;
-            button.Hot.BackColor = hotColor;
-            button.Selected.BackColor = selectedColor;
-            button.SelectedHot.BackColor = selectedColor;
-            button.SelectedPressed.BackColor = selectedColor;
-            button.SelectedFocused.BackColor = selectedColor;
-            button.Checked.BackColor = selectedColor;
-            button.CheckedHot.BackColor = selectedColor;
+            button.Texture = ButtonArt;
+            button.Tiling = TextureMode.Grid;
+            button.Grid = new Squid.Margin(ArtInset);
+            button.Tint = grey20;
+            button.Hot.Tint = grey25;
+            button.Pressed.Tint = grey30;
+            button.Selected.Tint = grey30;
+            button.SelectedHot.Tint = grey30;
+            button.SelectedPressed.Tint = grey30;
+            button.SelectedFocused.Tint = grey30;
+            button.Checked.Tint = grey30;
+            button.CheckedHot.Tint = grey30;
 
-            ControlStyle item = new ControlStyle(button);
+            ControlStyle item = new ControlStyle(flatButton);
             item.TextAlign = Alignment.MiddleLeft;
             item.TextPadding = new Squid.Margin(8, 0, 0, 0);
             item.BackColor = 0;
@@ -162,15 +364,30 @@ namespace Freefall.Editor
             menuitem.Default.BackColor = ColorInt.ARGB(0, 0, 0, 0);
             menuitem.TextPadding = new Margin(32, 0, 8, 0);
 
+            // Menus highlight with a rounded pill instead of a full-width bar
+            foreach (var state in new[] { menu.Hot, menu.Pressed, menuitem.Hot, menuitem.Pressed })
+            {
+                state.BackColor = 0;
+                state.Texture = ButtonArt;
+                state.Tiling = TextureMode.Grid;
+                state.Grid = new Squid.Margin(ArtInset);
+                state.Tint = grey25;
+            }
+
+            // Dropdowns, menus and tooltips: rounded panel with a light border (pad contents by 4)
+            var popup = new ControlStyle(baseStyle);
+            popup.Texture = PopupArt;
+            popup.Tiling = TextureMode.Grid;
+            popup.Grid = new Squid.Margin(PopupInset);
+
             ControlStyle textbox = new ControlStyle(baseStyle);
-            textbox.Texture = "shadow.png";
+            textbox.Texture = FieldArt;
             textbox.TextAlign = Alignment.MiddleLeft;
-            textbox.BackColor = grey10;
             textbox.TextPadding = new Squid.Margin(6, 0, 6, 0);
-            textbox.Hot.Texture = "border.dds";
-            textbox.Focused.Texture = "border.dds";
+            textbox.Hot.Texture = FieldHotArt;
+            textbox.Focused.Texture = FieldFocusArt;
             textbox.Tiling = TextureMode.Grid;
-            textbox.Grid = new Squid.Margin(4);
+            textbox.Grid = new Squid.Margin(ArtInset);
 
             var dropdownLabel = new ControlStyle(baseStyle);
             dropdownLabel.TextPadding = new Squid.Margin(6, 0, 6, 0);
@@ -188,7 +405,7 @@ namespace Freefall.Editor
             switchbutton.Tiling = TextureMode.Center;
 
             ControlStyle checkbox = new ControlStyle(textbox);
-            checkbox.CheckedHot.Texture = "border.dds";
+            checkbox.CheckedHot.Texture = FieldHotArt;
 
             ControlStyle border = new ControlStyle();
             border.Texture = "border.dds";
@@ -203,12 +420,15 @@ namespace Freefall.Editor
 
             ControlStyle scrollbutton = new ControlStyle(baseStyle);
             scrollbutton.TextAlign = Alignment.MiddleCenter;
-            scrollbutton.BackColor = grey30;
-            scrollbutton.Hot.BackColor = grey35;
-            scrollbutton.Pressed.BackColor = grey35;
+            scrollbutton.Texture = ButtonArt;
+            scrollbutton.Tiling = TextureMode.Grid;
+            scrollbutton.Grid = new Squid.Margin(ArtInset);
+            scrollbutton.Tint = grey30;
+            scrollbutton.Hot.Tint = grey40;
+            scrollbutton.Pressed.Tint = grey40;
 
             ControlStyle scroll = new ControlStyle(baseStyle);
-            scroll.BackColor = grey15;
+            scroll.BackColor = grey125;
 
             var multiline = new ControlStyle(baseStyle);
             multiline.TextPadding = new Squid.Margin(4);
@@ -242,12 +462,12 @@ namespace Freefall.Editor
             inport.Pressed.Texture = "port_hot.png";
             inport.SelectedPressed.Texture = "port_hot.png";
             inport.SelectedHot.Texture = "port_hot.png";
-            inport.Tint = ColorInt.ARGB(1f, .1f, .5f, .1f);
+            inport.Tint = ColorInt.ARGB(1f, .42f, .66f, .95f);
 
             var outport = new ControlStyle(inport);
-            outport.Tint = ColorInt.ARGB(1f, .5f, .3f, .1f);
+            outport.Tint = ColorInt.ARGB(1f, 1f, .52f, .40f);
 
-            var closebutton = new ControlStyle(button);
+            var closebutton = new ControlStyle(flatButton);
             closebutton.Texture = "close.dds";
             closebutton.Tiling = TextureMode.Center;
 
@@ -257,7 +477,7 @@ namespace Freefall.Editor
             closetab.Hot.Tint = ColorInt.ARGB(1f, .75f, .75f, .75f);
             closetab.Tiling = TextureMode.Center;
 
-            var alterRows = new ControlStyle(button);
+            var alterRows = new ControlStyle(flatButton);
             alterRows.Texture = "alter_rows.png";
             alterRows.Tiling = TextureMode.RepeatY;
 
@@ -289,6 +509,16 @@ namespace Freefall.Editor
             foldout.Checked.Texture = "icon_down.png";
 
             var canvas = new ControlStyle(frame);
+            canvas.BackColor = Cool(.105f);
+
+            var toolbarSeparator = new ControlStyle();
+            toolbarSeparator.BackColor = ColorInt.ARGB(.12f, 1f, 1f, 1f);
+
+            // Graph node title: text only, the node card paints the band behind it
+            var graphTitle = new ControlStyle(baseStyle);
+            graphTitle.Font = HeadingFont;
+            graphTitle.TextAlign = Alignment.MiddleLeft;
+            graphTitle.TextPadding = new Squid.Margin(10, 0, 0, 0);
 
             // Slider track: thin line texture (transparent with 2px center stripe)
             var sliderTrack = new ControlStyle();
@@ -305,8 +535,15 @@ namespace Freefall.Editor
             var prevtoolbutton = new ControlStyle(button);
             prevtoolbutton.TextPadding = new Squid.Margin(4, 0, 4, 0);
 
+            // Set last: the property-row styles above are copies of category and must keep the body font
+            category.Font = HeadingFont;
+            catbutton.Font = HeadingFont;
+            header.Font = HeadingFont;
+            tab.Font = HeadingFont;
+
             Skin skin = new Skin
             {
+                { "popup", popup },
                 { "prevtoolbutton", prevtoolbutton},
                 { "foldout", foldout},
                 { "iconplus", iconplus },
@@ -314,6 +551,8 @@ namespace Freefall.Editor
                 { "iconplay", iconplay },
                 { "iconstop", iconstop },
                 { "canvas", canvas },
+                { "graphTitle", graphTitle },
+                { "toolbarSeparator", toolbarSeparator },
                 { "window", window },
                 { "frame", frame },
                 { "label", label },
@@ -375,7 +614,7 @@ namespace Freefall.Editor
             desktop.CursorSet.Add(Cursors.SizeNWSE, new Cursor { Texture = "SizeNWSE.png", Size = cursorSize, HotSpot = halfSize });
 
             desktop.Skin = skin;
-            desktop.TooltipControl.Style = "frame";
+            desktop.TooltipControl.Style = "popup";
             desktop.TooltipControl.Padding = new Margin(4);
         }
     }

@@ -228,10 +228,10 @@ namespace Freefall.Editor
 
             int itemHeight = 26;
             int dropWidth = 160;
-            int dropHeight = creatables.Count * (itemHeight + 1) + 4;
+            int dropHeight = creatables.Count * (itemHeight + 1) + 8;
 
-            btnCreate.Dropdown.Style = "window";
-            btnCreate.Dropdown.Padding = new Margin(2);
+            btnCreate.Dropdown.Style = "popup";
+            btnCreate.Dropdown.Padding = new Margin(4);
             btnCreate.Dropdown.Size = new Point(dropWidth, dropHeight);
             btnCreate.Dropdown.Resizable = false;
 
@@ -264,7 +264,11 @@ namespace Freefall.Editor
 
             rightToolbar.Controls.Add(btnCreate);
             rightToolbar.Controls.Add(_searchBox);
-            rightToolbar.Controls.Add(_breadcrumb);
+
+            // The breadcrumb grows with the path; clip it to the space left of the Create button
+            var breadcrumbClip = new Frame { Dock = DockStyle.Fill, Scissor = true };
+            breadcrumbClip.Controls.Add(_breadcrumb);
+            rightToolbar.Controls.Add(breadcrumbClip);
 
             // Bottom bar with card size slider
             var bottomBar = new Frame
@@ -381,10 +385,10 @@ namespace Freefall.Editor
 
             int itemHeight = 26;
             int dropWidth = 160;
-            int dropHeight = creatables.Count * (itemHeight + 1) + 4;
+            int dropHeight = creatables.Count * (itemHeight + 1) + 8;
 
-            btnCreate.Dropdown.Style = "window";
-            btnCreate.Dropdown.Padding = new Margin(2);
+            btnCreate.Dropdown.Style = "popup";
+            btnCreate.Dropdown.Padding = new Margin(4);
             btnCreate.Dropdown.Size = new Point(dropWidth, dropHeight);
             btnCreate.Dropdown.Resizable = false;
 
@@ -916,6 +920,18 @@ namespace Freefall.Editor
             };
             card.GetElements().Add(typeLabel);
 
+            // Rounded corners: paint the panel colour over the card's corners, on top of everything else
+            var corners = new ImageControl
+            {
+                Size = new Point(_cardWidth, CardHeight),
+                Texture = EditorSkin.CardMaskArt,
+                Tiling = TextureMode.Grid,
+                Grid = new Margin(EditorSkin.CardMaskInset),
+                Color = EditorSkin.PanelColor,
+                NoEvents = true,
+            };
+            card.GetElements().Add(corners);
+
             return card;
         }
 
@@ -936,11 +952,14 @@ namespace Freefall.Editor
             var icon = elems[0] as ImageControl;
             icon.Size = new Point(_cardWidth, _cardWidth);
 
+            // [4] corner mask follows the card size
+            elems[4].Size = card.Size;
+
             if (data.IsFolder)
             {
-                icon.Texture = "icon_folder.png";
-                icon.Tiling = TextureMode.Center;
-                icon.Color = ColorInt.ARGB(1f, .6f, .6f, .6f);
+                icon.Texture = EditorSkin.FolderArt;
+                icon.Tiling = _cardWidth < 128 ? TextureMode.StretchAspect : TextureMode.Center;
+                icon.Color = -1;
             }
             else
             {

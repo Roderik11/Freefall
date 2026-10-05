@@ -74,10 +74,10 @@ namespace Freefall.Editor
 
             int itemHeight = 28;
             int dropWidth = 160;
-            int dropHeight = 5 * (itemHeight + 1) + 2;
+            int dropHeight = 5 * (itemHeight + 1) + 6;
 
-            btnCreate.Dropdown.Style = "window";
-            btnCreate.Dropdown.Padding = new Margin(2);
+            btnCreate.Dropdown.Style = "popup";
+            btnCreate.Dropdown.Padding = new Margin(4);
             btnCreate.Dropdown.Size = new Point(dropWidth, dropHeight);
             btnCreate.Dropdown.Resizable = false;
             btnCreate.Align = Alignment.TopLeft;

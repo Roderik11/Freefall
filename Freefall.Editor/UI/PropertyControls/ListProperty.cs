@@ -64,10 +64,10 @@ namespace Freefall.Editor
                 // Size the dropdown window to fit the items
                 int itemHeight = 26;
                 int dropWidth = 180;
-                int dropHeight = Math.Min(concreteTypes.Length * (itemHeight + 1) + 4, 300);
+                int dropHeight = Math.Min(concreteTypes.Length * (itemHeight + 1) + 8, 300);
 
-                btnPlus.Dropdown.Style = "window";
-                btnPlus.Dropdown.Padding = new Margin(2);
+                btnPlus.Dropdown.Style = "popup";
+                btnPlus.Dropdown.Padding = new Margin(4);
                 btnPlus.Dropdown.Size = new Point(dropWidth, dropHeight);
                 btnPlus.Dropdown.Resizable = false;
 

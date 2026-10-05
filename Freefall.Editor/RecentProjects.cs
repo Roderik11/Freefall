@@ -11,6 +11,10 @@ namespace Freefall.Editor
         public string Name { get; set; }
         public string Path { get; set; }
         public DateTime LastOpened { get; set; }
+
+        // Recorded when the project is closed or a scene is saved; empty until then.
+        public string Scene { get; set; }
+        public int EntityCount { get; set; }
     }
 
     /// <summary>
@@ -67,18 +71,26 @@ namespace Freefall.Editor
             }
         }
 
+        /// <summary>The project opened in this session, or null on the landing page.</summary>
+        public static RecentProjectEntry Current { get; private set; }
+
         public static void Add(string name, string path)
         {
+            var previous = Entries.Find(e => string.Equals(e.Path, path, StringComparison.OrdinalIgnoreCase));
+
             // Remove existing entry for same path (case-insensitive)
             Entries.RemoveAll(e => string.Equals(e.Path, path, StringComparison.OrdinalIgnoreCase));
 
             // Insert at top
-            Entries.Insert(0, new RecentProjectEntry
+            Current = new RecentProjectEntry
             {
                 Name = name,
                 Path = path,
-                LastOpened = DateTime.UtcNow
-            });
+                LastOpened = DateTime.UtcNow,
+                Scene = previous?.Scene,
+                EntityCount = previous?.EntityCount ?? 0,
+            };
+            Entries.Insert(0, Current);
 
             // Trim to max
             if (Entries.Count > MaxEntries)

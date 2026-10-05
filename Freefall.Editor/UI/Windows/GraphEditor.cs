@@ -38,36 +38,13 @@ namespace Freefall.Editor
             Position = new Point(300, 300);
             MaxSize = Point.Zero;
 
-            Toolbar = new Frame { Style = "frame", Size = new Point(16, 24), Dock = DockStyle.Top };
-            Toolbar.Margin = new Margin(0, 0, 0, 1);
+            Toolbar = EditorToolbar.Create();
             Controls.Add(Toolbar);
 
-            Button btnSave = new Button();
-            btnSave.Text = "Save";
-            btnSave.Size = new Point(100, 20);
-            btnSave.Dock = DockStyle.Left;
-            btnSave.MouseClick += BtnSave_MouseDown;
-            btnSave.Style = "button";
-            btnSave.Margin = new Squid.Margin(1);
-            Toolbar.Controls.Add(btnSave);
-
-            Button btnLoad = new Button();
-            btnLoad.Text = "Load";
-            btnLoad.Size = new Point(100, 20);
-            btnLoad.Dock = DockStyle.Left;
-            btnLoad.MouseClick += BtnLoad_MouseDown;
-            btnLoad.Style = "button";
-            btnLoad.Margin = new Squid.Margin(1);
-            Toolbar.Controls.Add(btnLoad);
-
-            Button btnExecute = new Button();
-            btnExecute.Text = "Execute";
-            btnExecute.Size = new Point(100, 20);
-            btnExecute.Dock = DockStyle.Left;
-            btnExecute.MouseClick += BtnExecute_MouseDown;
-            btnExecute.Style = "button";
-            btnExecute.Margin = new Squid.Margin(1);
-            Toolbar.Controls.Add(btnExecute);
+            EditorToolbar.Add(Toolbar, EditorSkin.IconSave, "Save", BtnSave_MouseDown);
+            EditorToolbar.Add(Toolbar, EditorSkin.IconOpen, "Load", BtnLoad_MouseDown);
+            EditorToolbar.AddSeparator(Toolbar);
+            EditorToolbar.Add(Toolbar, EditorSkin.IconPlay, "Execute", BtnExecute_MouseDown, primary: true);
 
             SplitContainer split = new SplitContainer();
             split.Dock = DockStyle.Fill;
@@ -363,21 +340,49 @@ namespace Freefall.Editor
             Position = (mouse - pointInChild * ratio) - Parent.Location;
         }
 
+        private static readonly Color4 WireColor = new Color4(.50f, .66f, .92f, 1);
+        private static readonly Color4 PendingWireColor = new Color4(1f, .47f, .37f, 1);
+
+        private const int GridStep = 24;
+        private const int GridMajorEvery = 5;
+
+        /// <summary>
+        /// Canvas background plus a grid that pans and zooms with the graph.
+        /// </summary>
+        protected override void DrawStyle(Style style, float opacity)
+        {
+            base.DrawStyle(style, opacity);
+            if (Parent == null) return;
+
+            float step = GridStep * UIScale;
+            if (step < 6) return;
+
+            // The canvas itself is huge; only the part inside the parent is visible
+            Point origin = Location, view = Parent.Location, viewSize = Parent.Size;
+            int minor = ColorInt.ARGB(.035f, 1f, 1f, 1f);
+            int major = ColorInt.ARGB(.075f, 1f, 1f, 1f);
+
+            int column = (int)MathF.Floor((view.x - origin.x) / step);
+            for (float gx = origin.x + column * step; gx < view.x + viewSize.x; gx += step, column++)
+                Gui.Renderer.DrawBox((int)gx, view.y, 1, viewSize.y, column % GridMajorEvery == 0 ? major : minor);
+
+            int row = (int)MathF.Floor((view.y - origin.y) / step);
+            for (float gy = origin.y + row * step; gy < view.y + viewSize.y; gy += step, row++)
+                Gui.Renderer.DrawBox(view.x, (int)gy, viewSize.x, 1, row % GridMajorEvery == 0 ? major : minor);
+        }
+
         protected override void DrawCustom()
         {
-            var batch = ((SquidRenderer)Gui.Renderer).SpriteBatch;
-
-            if (DownSource != null)
+            if (DownSource is Plug plug)
             {
-                Point a = DownSource.Location + DownSource.Size * UIScale / 2;
-                batch.DrawLine(a.x, a.y, Gui.MousePosition.x, Gui.MousePosition.y, new Color4(1, 1, 1, 1));
+                Point a = plug.Location + plug.Size * UIScale / 2;
+                int direction = (int)plug.Type * 2 - 1;
+                DrawWire(a, Gui.MousePosition, direction, -direction, PendingWireColor);
             }
         }
 
         protected override void DrawBeforeChildren()
         {
-            var batch = ((SquidRenderer)Gui.Renderer).SpriteBatch;
-
             foreach (var connection in Graph.Connections)
             {
                 if (connection.PortA == null || connection.PortB == null) continue;
@@ -388,34 +393,38 @@ namespace Freefall.Editor
                 Point start = plugA.Location + plugA.Size * UIScale / 2;
                 Point end = plugB.Location + plugB.Size * UIScale / 2;
 
-                Point offset = new Point(20, 0) * UIScale;
-                Point offsetA = start + offset * ((int)plugA.Port.Type * 2 - 1);
-                Point offsetB = end + offset * ((int)plugB.Port.Type * 2 - 1);
-                batch.DrawLine(start.x, start.y, offsetA.x, offsetA.y, new Color4(.7f, .8f, 1, 1));
-                batch.DrawLine(offsetA.x, offsetA.y, offsetB.x, offsetB.y, new Color4(.7f, .8f, 1, 1));
-                batch.DrawLine(offsetB.x, offsetB.y, end.x, end.y, new Color4(.7f, .8f, 1, 1));
-
-                //Point last;
-                //Point now = start;
-
-                //var count = 64f;
-                //for (int i = 0; i < count; i++)
-                //{
-                //    last = now;
-                //    now = Hermite2(start, end, i / count);
-                //    batch.DrawLine(last.x, last.y, now.x, now.y, new Color4(.7f, .8f, 1, 1));
-                //}
-
-                //batch.DrawLine(now.x, now.y, end.x, end.y, new Color4(.9f, 1, 1, 1));
+                DrawWire(start, end, (int)plugA.Port.Type * 2 - 1, (int)plugB.Port.Type * 2 - 1, WireColor);
             }
         }
 
-        //private Point Hermite2(Point a, Point b, float step)
-        //{
-        //    float bend = 64 * UIScale;
-        //    Vector2 v = Vector2.Hermite(new Vector2(a.x, a.y), new Vector2(bend, bend), new Vector2(b.x, b.y), new Vector2(bend, bend), step);
-        //    return new Point((int)v.X, (int)v.Y);
-        //}
+        /// <summary>
+        /// Cubic bezier between two plugs, leaving each one horizontally (direction: -1 = left, +1 = right).
+        /// </summary>
+        private void DrawWire(Point start, Point end, int startDirection, int endDirection, Color4 color)
+        {
+            var batch = ((SquidRenderer)Gui.Renderer).SpriteBatch;
+
+            float reach = Math.Clamp(Math.Abs(end.x - start.x) * .5f, 40 * UIScale, 160 * UIScale);
+            var p0 = new Vector2(start.x, start.y);
+            var p3 = new Vector2(end.x, end.y);
+            var p1 = p0 + new Vector2(reach * startDirection, 0);
+            var p2 = p3 + new Vector2(reach * endDirection, 0);
+
+            float savedWidth = batch.LineWidth;
+            batch.LineWidth = MathF.Max(1.5f, 2 * UIScale);
+
+            const int segments = 28;
+            var last = p0;
+            for (int i = 1; i <= segments; i++)
+            {
+                float t = i / (float)segments, u = 1 - t;
+                var point = u * u * u * p0 + 3 * u * u * t * p1 + 3 * u * t * t * p2 + t * t * t * p3;
+                batch.DrawLine((int)last.X, (int)last.Y, (int)point.X, (int)point.Y, color);
+                last = point;
+            }
+
+            batch.LineWidth = savedWidth;
+        }
     }
 
     public enum PlugType
@@ -447,6 +456,27 @@ namespace Freefall.Editor
             DragDrop += Plug_DragDrop;
 
             Selected = port.IsConnected;
+        }
+
+        /// <summary>
+        /// Ring, plus a dot when connected or hovered. Drawn from art generated at the on-screen size
+        /// instead of the skin texture, which blurs when the canvas is zoomed.
+        /// </summary>
+        protected override void DrawStyle(Style style, float opacity)
+        {
+            if (opacity == 0) return;
+
+            float scale = GetScale();
+            int diameter = Math.Max(6, (int)MathF.Round(14 * scale));
+            int cx = Location.x + (int)(Size.x * scale / 2);
+            int cy = Location.y + (int)(Size.y * scale / 2);
+
+            int color = Type == PlugType.In ? ColorInt.ARGB(1f, .42f, .66f, .95f) : ColorInt.ARGB(1f, 1f, .52f, .40f);
+            bool filled = State != ControlState.Default;   // connected (Selected) or under the mouse / a dragged wire
+
+            LandingArt.Centered(EditorSkin.PlugArt(diameter, dot: false), cx, cy, color);
+            if (filled)
+                LandingArt.Centered(EditorSkin.PlugArt(diameter, dot: true), cx, cy, color);
         }
 
         private void Plug_DragDrop(Control sender, DragDropEventArgs e)
@@ -639,12 +669,16 @@ namespace Freefall.Editor
             SnapGrid = 8;
           //  Style = "GraphNode";
 
-            MinSize = new Point(168, 80);
+            MinSize = new Point(168, 56);
             MaxSize = new Point(216, 600);
+
+            // The card (body, header band, outline) is painted in DrawStyle; children only add text and plugs
+            Style = "";
+            Padding = new Margin(1, 1, 1, 6);
 
             Titlebar.Cursor = Cursors.Move;
             Titlebar.Text = Node.GetType().Name;
-            Titlebar.Style = "header";
+            Titlebar.Style = "graphTitle";
             Titlebar.Button.Visible = false;
 
             Position = new Point((int)node.Position.X, (int)node.Position.Y);
@@ -657,7 +691,8 @@ namespace Freefall.Editor
 
             var obj = new GUIObject(Node);
 
-            int h = 50;
+            // Title bar (28 + 1) and padding, plus a little air under the last port; each port row is 20 high
+            int h = 40;
             foreach (var property in obj.GetProperties())
             {
                 var input = property.GetAttribute<InputAttribute>();
@@ -667,13 +702,13 @@ namespace Freefall.Editor
                 {
                     PortControl conn = new PortControl(property, Node, PlugType.In);
                     propertyGrid.Controls.Add(conn);
-                    h += 26;
+                    h += 20;
                 }
                 else if (output != null)
                 {
                     PortControl conn = new PortControl(property, Node, PlugType.Out);
                     propertyGrid.Controls.Add(conn);
-                    h += 26;
+                    h += 20;
                 }
                 //else
                 //{
@@ -702,6 +737,28 @@ namespace Freefall.Editor
             };
 
             PositionChanged += GraphFrame_PositionChanged;
+        }
+
+        protected override void DrawStyle(Style style, float opacity)
+        {
+            if (opacity == 0) return;
+
+            // Sizes are in canvas units; the canvas zoom scales them on screen
+            float scale = GetScale();
+            int x = Location.x, y = Location.y;
+            int w = (int)(Size.x * scale), h = (int)(Size.y * scale);
+            int header = (int)((Titlebar.Size.y + 1) * scale);
+            int edge = Math.Max(1, (int)MathF.Round(LandingArt.RadiusSmall * scale));
+
+            LandingArt.Slice(LandingArt.RoundSmall, x, y, w, h, LandingArt.RadiusSmall, EditorSkin.NodeBodyColor, scale);
+
+            // Header band: rounded on top, squared off where it meets the body
+            LandingArt.Slice(LandingArt.RoundSmall, x, y, w, header + edge, LandingArt.RadiusSmall, EditorSkin.NodeHeaderColor, scale);
+            Gui.Renderer.DrawBox(x, y + header, w, edge, EditorSkin.NodeBodyColor);
+
+            bool selected = ReferenceEquals(Selector.SelectedObject, Node);
+            LandingArt.Slice(LandingArt.OutlineSmall, x, y, w, h, LandingArt.RadiusSmall,
+                selected ? LandingArt.Coral : ColorInt.ARGB(.14f, 1f, 1f, 1f), scale);
         }
 
         private void GraphFrame_PositionChanged(Control sender)

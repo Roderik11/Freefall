@@ -160,6 +160,21 @@ namespace Freefall.Graphics
         }
 
         /// <summary>
+        /// Wrap an already-built atlas (e.g. glyphs rasterized at runtime). Glyph rects are in atlas pixels.
+        /// </summary>
+        public static Font FromGlyphs(Texture texture, int texWidth, int texHeight, Dictionary<char, Glyph> glyphs, int height)
+        {
+            return new Font
+            {
+                _texture = texture,
+                _texWidth = texWidth,
+                _texHeight = texHeight,
+                _glyphs = glyphs,
+                Height = height,
+            };
+        }
+
+        /// <summary>
         /// Load a font by name (searches for name.dds + name_data.xml in engine resources).
         /// </summary>
         public static Font LoadFont(string path)

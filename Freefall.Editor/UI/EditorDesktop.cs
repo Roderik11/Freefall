@@ -108,6 +108,7 @@ namespace Freefall.Editor
                     var serializer = new Freefall.Serialization.EntitySerializer();
                     var entities = EntityManager.Entities.ToArray();
                     serializer.Save(CurrentScenePath, entities);
+                    ProjectThumbnails.Capture();
                     Toast.Show("Saved scene: " + CurrentScenePath);
                 }
                 catch (Exception ex)
@@ -140,6 +141,7 @@ namespace Freefall.Editor
                     var entities = EntityManager.Entities.ToArray();
                     serializer.Save(dlg.FileName, entities);
                     CurrentScenePath = dlg.FileName;
+                    ProjectThumbnails.Capture();
                     Toast.Show("Saved scene: " + CurrentScenePath);
                 }
                 catch (Exception ex)

@@ -46,8 +46,8 @@ namespace Freefall.Editor
             Dropdown.Button.Margin = new Margin(1, 0, 0, 0);
             Dropdown.Button.TextAlign = Alignment.MiddleCenter;
             Dropdown.Button.Dock = DockStyle.Right;
-            Dropdown.Dropdown.Style = "window";
-            Dropdown.Dropdown.Padding = new Squid.Margin(1);
+            Dropdown.Dropdown.Style = "popup";
+            Dropdown.Dropdown.Padding = new Squid.Margin(4);
             Dropdown.DropdownAutoSize = true;
             Dropdown.Listbox.Size = new Point(200, 32);
 

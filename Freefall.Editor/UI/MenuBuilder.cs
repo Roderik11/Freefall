@@ -17,7 +17,8 @@ namespace Freefall.Editor
             btn.Margin = new Margin(1, 1, 0, 1);
             btn.AutoSize = AutoSize.Horizontal;
             btn.Dropdown.Size = new Point(280, 300);
-            btn.Dropdown.Padding = new Squid.Margin(1);
+            btn.Dropdown.Style = "popup";
+            btn.Dropdown.Padding = new Squid.Margin(4);
             btn.Dropdown.AutoSize = AutoSize.Vertical;
             parent.Controls.Add(btn);
 
@@ -51,7 +52,8 @@ namespace Freefall.Editor
             btn.Margin = new Margin(0, 0, 0, 1);
             btn.Dropdown.MinSize = new Point();
             btn.Dropdown.Size = new Point(200, 300);
-            btn.Dropdown.Padding = new Squid.Margin(1);
+            btn.Dropdown.Style = "popup";
+            btn.Dropdown.Padding = new Squid.Margin(4);
             btn.Dropdown.AutoSize = AutoSize.Vertical;
             btn.MouseClick += (s, e) => { parent.Close(); };
 
