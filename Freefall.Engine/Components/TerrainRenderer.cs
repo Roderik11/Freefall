@@ -840,6 +840,7 @@ namespace Freefall.Components
             material.SetParameter("CameraPos", Camera.Main.Position);
             material.SetParameter("HeightTexel", 1.0f / (heightmap != null ? Terrain.EffectiveHeightmapResolution : 1024));
             material.SetParameter("MaxHeight", Terrain.MaxHeight);
+            material.SetParameter("BlendDepth", Terrain.LayerBlendDepth);
             material.SetParameter("TerrainSize", Terrain.TerrainSize);
             material.SetParameter("TerrainOrigin", new Vector2(Transform.WorldPosition.X, Transform.WorldPosition.Z));
             material.SetParameter("LayerTiling", _layerTiling);
@@ -2572,7 +2573,7 @@ namespace Freefall.Components
             if (pass == RenderPass.Shadow)
             {
                 commandList.SetGraphicsRoot32BitConstant(0, DirectionalLight.CurrentCascadeSrvIndex, 11);
-                int grassShadowCascades = 2;// Math.Max(1, DirectionalLight.CascadeCount - 1);
+                int grassShadowCascades = 0;// Math.Max(1, DirectionalLight.CascadeCount - 1);
                 commandList.SetGraphicsRoot32BitConstant(0, (uint)grassShadowCascades, 12);
             }
 

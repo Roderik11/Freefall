@@ -151,7 +151,8 @@ namespace Freefall.Graphics
         {
             string ext = Path.GetExtension(path);
             if (!ext.Equals(".fx", StringComparison.OrdinalIgnoreCase) &&
-                !ext.Equals(".hlsl", StringComparison.OrdinalIgnoreCase))
+                !ext.Equals(".hlsl", StringComparison.OrdinalIgnoreCase) &&
+                !ext.Equals(".hlsli", StringComparison.OrdinalIgnoreCase))
                 return;
 
             _pending[Path.GetFullPath(path)] = Environment.TickCount64;

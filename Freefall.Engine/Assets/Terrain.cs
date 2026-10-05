@@ -229,6 +229,14 @@ namespace Freefall.Assets
         public List<TextureLayer> Layers= [];
 
         /// <summary>
+        /// Softness of transitions between texture layers, in splat-weight space.
+        /// Low = crisp edge shaped by the layer height maps, 1 = fade spans the whole
+        /// weight ramp (stamp Falloff / layer HeightBlend / SlopeBlend).
+        /// </summary>
+        [ValueRange(0.01f, 1f)]
+        public float LayerBlendDepth = 0.2f;
+
+        /// <summary>
         /// Migration only: catches the old flat ControlMaps list during deserialization.
         /// Used directly by TerrainRenderer for RGBA-packed GPU splatmap array.
         /// Will be replaced by per-layer R16 ControlMaps after channel-split migration.

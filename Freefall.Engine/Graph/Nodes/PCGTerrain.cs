@@ -211,7 +211,7 @@ namespace Freefall.PCG
                 {
                     if (p.X < b.Min.X - Margin || p.X > b.Max.X + Margin || p.Z < b.Min.Z - Margin || p.Z > b.Max.Z + Margin)
                         continue;
-                    if (stamp.GetDistance(p) <= stamp.Radius + Margin) return false;
+                    if (stamp.GetEdgeDistance(p) <= Margin) return false;
                 }
                 return true;
             }));

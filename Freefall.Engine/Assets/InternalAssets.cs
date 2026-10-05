@@ -43,6 +43,7 @@ namespace Freefall.Assets
             public const string TransparentEffect   = "00000000000000000000000000000016";
             public const string SkinnedEffect = "00000000000000000000000000000017";
             public const string CrossmeshEffect = "00000000000000000000000000000018";
+            public const string WaterEffect = "00000000000000000000000000000019";
 
             // materials
             public const string DefaultMaterial = "00000000000000000000000000000020";
@@ -52,6 +53,7 @@ namespace Freefall.Assets
             public const string TrunkMaterial = "00000000000000000000000000000024";
             public const string SkyboxMaterial = "00000000000000000000000000000025";
             public const string CrossmeshMaterial = "00000000000000000000000000000027";
+            public const string WaterMaterial = "00000000000000000000000000000028";
 
             // meshes
             public const string SphereMesh = "000000000000000000000000000001000";
@@ -84,6 +86,8 @@ namespace Freefall.Assets
         public static Effect TransparentEffect { get; private set; }
         public static Effect SkinnedEffect { get; private set; }
         public static Effect CrossmeshEffect { get; private set; }
+        /// <summary>Lakes and rivers (water.fx). Drawn by the WaterBody component, which supplies its per-instance data.</summary>
+        public static Effect WaterEffect { get; private set; }
 
         // Default materials mirror the default effects, with basic textures assigned where appropriate.
 
@@ -94,6 +98,7 @@ namespace Freefall.Assets
         public static Material TrunkMaterial { get; private set; }
         public static Material SkyboxMaterial { get; private set; }
         public static Material CrossmeshMaterial { get; private set; }
+        public static Material WaterMaterial { get; private set; }
 
 
         // default meshes
@@ -167,6 +172,7 @@ namespace Freefall.Assets
             TransparentEffect = new Effect("gbuffer_transparent");
             SkinnedEffect = new Effect("gbuffer_skinned");
             CrossmeshEffect = new Effect("gbuffer_crossmesh");
+            WaterEffect = new Effect("water");
 
             DefaultMaterial = new Material(DefaultEffect);
             DefaultMaterial.Name = "DefaultMaterial";
@@ -184,6 +190,8 @@ namespace Freefall.Assets
             SkyboxMaterial.Name = "SkyboxMaterial";
             CrossmeshMaterial = new Material(CrossmeshEffect);
             CrossmeshMaterial.Name = "CrossmeshMaterial";
+            WaterMaterial = new Material(WaterEffect);
+            WaterMaterial.Name = "WaterMaterial";
            
 
             SphereMesh = Mesh.CreateSphere(device, 0.5f, 16, 16);
@@ -223,6 +231,7 @@ namespace Freefall.Assets
             manager.RegisterAsset(Guids.TransparentEffect, TransparentEffect);
             manager.RegisterAsset(Guids.SkinnedEffect, SkinnedEffect);
             manager.RegisterAsset(Guids.CrossmeshEffect, CrossmeshEffect);
+            manager.RegisterAsset(Guids.WaterEffect, WaterEffect);
 
             manager.RegisterAsset(Guids.DefaultMaterial, DefaultMaterial);
             manager.RegisterAsset(Guids.DecoratorMaterial, DecoratorMaterial);
@@ -231,6 +240,7 @@ namespace Freefall.Assets
             manager.RegisterAsset(Guids.TrunkMaterial, TrunkMaterial);
             manager.RegisterAsset(Guids.SkyboxMaterial, SkyboxMaterial);
             manager.RegisterAsset(Guids.CrossmeshMaterial, CrossmeshMaterial);
+            manager.RegisterAsset(Guids.WaterMaterial, WaterMaterial);
 
             manager.RegisterAsset(Guids.SphereMesh, SphereMesh);
             manager.RegisterAsset(Guids.CubeMesh, CubeMesh);

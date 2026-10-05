@@ -166,6 +166,9 @@ namespace Freefall.Components
         private Material _material = null!;
         private MaterialBlock _params = new MaterialBlock();
         private OceanFFT? _oceanFFT;
+
+        /// <summary>The wave simulation. WaterBody borrows its slope and noise textures for ripples.</summary>
+        public OceanFFT? FFT => _oceanFFT;
         private float _waveTime;
         private DirectionalLight? _sunLight;
         private TerrainRenderer? _terrain;

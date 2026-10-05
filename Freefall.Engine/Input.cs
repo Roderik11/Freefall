@@ -34,6 +34,7 @@ namespace Freefall
         public static bool IsMouseReleased(int button) => _mouseReleased.Contains(button);
         public static bool Shift => IsKeyDown(Keys.ShiftKey);
         public static bool Control => IsKeyDown(Keys.ControlKey);
+        public static bool Alt => IsKeyDown(Keys.Menu);
 
         public static void Init(IntPtr hWnd)
         {

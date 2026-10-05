@@ -130,6 +130,12 @@ float EvaluateStampWeight(
         dist = (isClosed && inside) ? 0 : bestDist;
         nearestHeight = bestH;
         nearestHalfWidth = bestHalfW;
+
+        // Per-point spline width (Spline.Widths): the samples carry radius * width, and the falloff
+        // tapers with it, so a river's banks narrow together with its bed. 'radius' is still the
+        // stamp's own radius here; a zero radius (closed area with no growth) leaves the falloff alone.
+        if (radius > 1e-7)
+            falloff *= bestHalfW / radius;
         radius = bestHalfW;
     }
     else

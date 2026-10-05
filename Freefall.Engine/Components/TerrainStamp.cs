@@ -108,20 +108,39 @@ namespace Freefall.Components
         /// </summary>
         public float GetWeight(Vector3 worldPos)
         {
-            float distance = GetDistance(worldPos);
-            if (distance >= Radius + Falloff) return 0f;
-            if (distance <= Radius) return 1f;
-            float t = (distance - Radius) / Math.Max(Falloff, 0.001f);
+            float distance = GetDistance(worldPos, out float width);
+            float radius = Radius * width;
+            float falloff = Falloff * width;
+            if (distance >= radius + falloff) return 0f;
+            if (distance <= radius) return 1f;
+            float t = (distance - radius) / Math.Max(falloff, 0.001f);
             return 1f - SmoothStep(t);
+        }
+
+        /// <summary>
+        /// Distance from worldPos to the edge of the stamp's full-strength core (negative inside).
+        /// Unlike GetDistance(p) - Radius this follows the spline's per-point width.
+        /// </summary>
+        public float GetEdgeDistance(Vector3 worldPos)
+        {
+            float distance = GetDistance(worldPos, out float width);
+            return distance - Radius * width;
         }
 
         /// <summary>
         /// Get the minimum distance from worldPos to the stamp shape.
         /// </summary>
-        public float GetDistance(Vector3 worldPos)
+        public float GetDistance(Vector3 worldPos) => GetDistance(worldPos, out _);
+
+        /// <summary>
+        /// As GetDistance, also returning the spline's width multiplier at the nearest point
+        /// (1 for radial stamps): Radius and Falloff are scaled by it there.
+        /// </summary>
+        public float GetDistance(Vector3 worldPos, out float width)
         {
+            width = 1f;
             if (IsSplineMode)
-                return GetDistanceToSpline(worldPos);
+                return GetDistanceToSpline(worldPos, out width);
 
             var center = Transform?.WorldPosition ?? Vector3.Zero;
             float dx = worldPos.X - center.X;
@@ -138,6 +157,7 @@ namespace Freefall.Components
 
             if (IsSplineMode)
             {
+                extent *= _cachedSpline.MaxWidth;
                 var min = new Vector3(float.MaxValue);
                 var max = new Vector3(float.MinValue);
                 int samples = Math.Max(8, _cachedSpline.TotalSegments);
@@ -175,13 +195,15 @@ namespace Freefall.Components
             return (Transform?.WorldPosition.Y ?? 0f) + heightOffset;
         }
 
-        private float GetDistanceToSpline(Vector3 worldPos)
+        private float GetDistanceToSpline(Vector3 worldPos, out float width)
         {
+            float nearestT = FindNearestT(worldPos, 64);
+            width = _cachedSpline.GetWidth(nearestT);
+
             // Closed splines are filled areas on the GPU (terrain_stamp_overlay / height bake): match that here
             if (_cachedSpline.Closed && IsInsideClosedSpline(worldPos))
                 return 0f;
 
-            float nearestT = FindNearestT(worldPos, 64);
             var nearestPoint = _cachedSpline.GetWorldPoint(nearestT);
             float dx = worldPos.X - nearestPoint.X;
             float dz = worldPos.Z - nearestPoint.Z;
@@ -308,8 +330,9 @@ namespace Freefall.Components
 
                 var perp = Vector3.Normalize(new Vector3(-tangent.Z, 0, tangent.X));
 
-                var left = point + perp * Radius;
-                var right = point - perp * Radius;
+                float width = spline.GetWidth(t);
+                var left = point + perp * (Radius * width);
+                var right = point - perp * (Radius * width);
 
                 if (i > 0)
                 {
@@ -321,8 +344,8 @@ namespace Freefall.Components
 
                 if (hasFalloff)
                 {
-                    var outerLeft = point + perp * (Radius + Falloff);
-                    var outerRight = point - perp * (Radius + Falloff);
+                    var outerLeft = point + perp * ((Radius + Falloff) * width);
+                    var outerRight = point - perp * ((Radius + Falloff) * width);
 
                     if (i > 0)
                     {
@@ -356,7 +379,7 @@ namespace Freefall.Components
                 tangent = Vector3.Normalize(tangent);
                 var perp = Vector3.Normalize(new Vector3(-tangent.Z, 0, tangent.X));
 
-                float outerR = Radius + Falloff;
+                float outerR = (Radius + Falloff) * spline.GetPointWidth(i);
                 ctx.DrawLine(point - perp * outerR, point + perp * outerR);
             }
 

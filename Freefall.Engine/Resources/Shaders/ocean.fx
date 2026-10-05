@@ -32,6 +32,7 @@ cbuffer PushConstants : register(b3)
 
 #include "common.fx"
 #include "sky_common.fx"
+#include "water_common.fx"
 // @RenderState(RenderTargets=1)
 
 
@@ -500,57 +501,14 @@ PSOutput PS(DSOutput input)
 
     float3 scatter = ((k1 + k2) * baseColor + k3 * baseColor + 0.02 * bubbleColor) * sunRadiance;
 
-    // ── Fresnel (Schlick, precomputed for F0=0.02, roughness=0.075) ──
-    float base_f = 1.0 - NdotV;
-    float F = saturate(0.02 + 0.668 * pow(base_f, 4.08));
-
-    // ── Environment reflection ──
-    // Far away the per-pixel normal is sub-pixel noise: flatten it so the reflection converges on the
-    // sky just above the horizon in the mirrored view direction (same GetSkyColor as dome and fog,
-    // so it follows time of day and the environment preset).
-    float reflSmooth = saturate(dist * 0.003);
-    float3 reflN = normalize(lerp(N, float3(0, 1, 0), reflSmooth * 0.9));
-    float3 reflectDir = reflect(-V, reflN);
-    reflectDir.y = max(abs(reflectDir.y), 0.02);
-    reflectDir = normalize(reflectDir);
-    float3 skyRefl = GetSkyColor(reflectDir, FogSunDirection);
-
-    // Cloud layer in the reflection: same plane/UVs/density as the sky dome, flat-shaded with the
-    // CPU-blended day/sunset/night cloud color.
-    if (CloudNoiseLUTIdx != 0)
-    {
-        Texture3D<float4> cloudLUT = ResourceDescriptorHeap[CloudNoiseLUTIdx];
-        float2 cloudUV = CloudLayerUV((worldPos - camPos).xz + reflectDir.xz * (CloudAltitude / reflectDir.y));
-        float cloudMip = saturate(1.0 - reflectDir.y * 5.0) * 3.0;
-        float cloudDensity = smoothstep(0.0, 0.45, CloudBaseDensity(cloudLUT, OceanSampler, cloudUV, cloudMip));
-        cloudDensity *= smoothstep(0.0, 0.22, reflectDir.y);
-        skyRefl = lerp(skyRefl, ocean.CloudColor, 1.0 - exp(-cloudDensity * 4.5));
-    }
-
-    // Near water keeps the darker art-directed reflection; toward the horizon it approaches the full
-    // sky so the far ocean meets the sky without a hard dark line (most visible at night).
-    float3 reflectColor = skyRefl * lerp(0.5, 0.85, reflSmooth);
-
-    // ── GGX sun specular (widen at distance to reduce tessellation sparkle) ──
-    float waterRough = 0.075;
-    float distRough = lerp(waterRough, 0.6, reflSmooth);
-    float3 halfDir = normalize(L + V);
-    float NdotH = max(0.0001, dot(N, halfDir));
-    float a = distRough * distRough;
-    float a2 = a * a;
-    float dGGX = (NdotH * NdotH) * (a2 - 1.0) + 1.0;
-    float D = a2 / max(3.14159 * dGGX * dGGX, 1e-4);
-    float3 specular = sunRadiance * F * D * NdotL;
-    specular /= max(0.001, 4.0 * max(0.001, NdotL));
-    specular *= NdotL;
+    // ── Fresnel, sky reflection and sun glitter: shared with lakes and rivers (water_common.fx) ──
+    float F = WaterFresnel(NdotV);
+    float3 reflectColor = WaterSkyReflection(OceanSampler, V, N, worldPos - camPos, dist, ocean.CloudColor);
+    float3 specular = WaterSunSpecular(N, V, L, sunRadiance, F, dist);
 
     // ── Water column: what is seen through the surface ──
     // pathLen  = distance the view ray travels under water before it hits the scene (depth buffer)
     // bedDepth = vertical water depth right under this pixel (terrain heightmap, view independent)
-    float3 body = scatter;
-    float edgeFade = 1.0;
-    float pathLen = 1000.0;
-    float bufDepth = 1000.0;
 
     // Terrain seabed. Its geometry and heightmap stop at the terrain border while the sea goes on, so
     // everything derived from it is faded out across the border (seabedFade) to avoid a straight seam:
@@ -580,40 +538,13 @@ PSOutput PS(DSOutput input)
         }
     }
 
-    if (ocean.DepthGBufferSRV != 0)
-    {
-        Texture2D<float> depthGB = ResourceDescriptorHeap[ocean.DepthGBufferSRV];
-        float2 screenUV = input.Position.xy * ocean.InvViewportSize;
-        float sceneZ = depthGB.SampleLevel(OceanSampler, screenUV, 0);
-
-        if (sceneZ > 0)
-        {
-            // Scene point behind the pixel lies on the same view ray: scale by the linear depth ratio
-            float zRatio = max(sceneZ / max(input.Depth, 0.001), 1.0) - 1.0;
-            pathLen = dist * zRatio;
-            bufDepth = abs(camPos.y - worldPos.y) * zRatio;
-        }
-
-        // Soft waterline: reflection and specular fade out where the water film gets thin
-        edgeFade = saturate(pathLen / 0.3);
-
-        if (ocean.CompositeSRV != 0)
-        {
-            Texture2D<float4> compositeBuffer = ResourceDescriptorHeap[ocean.CompositeSRV];
-
-            // Refraction, rejected when the offset sample lands on something in front of the water
-            float2 refrUV = saturate(screenUV + N.xz * ocean.RefractionStrength * saturate(pathLen * 0.5));
-            float refrZ = depthGB.SampleLevel(OceanSampler, refrUV, 0);
-            if (refrZ > 0 && refrZ < input.Depth)
-                refrUV = screenUV;
-            float3 sceneColor = compositeBuffer.SampleLevel(OceanSampler, refrUV, 0).rgb;
-
-            // Beer-Lambert: at ShoreFadeDepth of water the seabed is tinted by ShallowColor and mostly gone
-            float x = pathLen / max(0.01, ocean.ShoreFadeDepth);
-            float3 transmittance = pow(max(ocean.ShallowColor, 0.02), x) * exp(-1.5 * x);
-            body = lerp(scatter, sceneColor, transmittance * seabedFade);
-        }
-    }
+    WaterColumn column = GetWaterColumn(OceanSampler, ocean.DepthGBufferSRV, ocean.CompositeSRV,
+        input.Position.xy * ocean.InvViewportSize, input.Depth, dist, abs(camPos.y - worldPos.y), N,
+        ocean.RefractionStrength, scatter, ocean.ShallowColor, ocean.ShoreFadeDepth, seabedFade);
+    float3 body = column.body;
+    float edgeFade = column.edgeFade;
+    float pathLen = column.pathLen;
+    float bufDepth = column.bufDepth;
 
     // Vertical water depth under the pixel: heightmap where there is one, depth buffer otherwise
     float bedDepth = (terrainDepth < 999.0) ? terrainDepth : bufDepth;

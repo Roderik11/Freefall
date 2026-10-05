@@ -48,6 +48,22 @@ namespace Freefall.Components
         [DefaultValue(RuntimeMeshHeightMode.Spline)]
         public RuntimeMeshHeightMode HeightMode = RuntimeMeshHeightMode.Spline;
 
+        /// <summary>
+        /// Lifts the whole generated mesh above the spline (after HeightMode). A water surface over a
+        /// riverbed whose spline carries the bed heights uses the water depth here.
+        /// </summary>
+        [DefaultValue(0f)]
+        [ValueRange(-10f, 10f)]
+        public float Offset = 0f;
+
+        /// <summary>
+        /// Closed spline only: grows the filled polygon outward by this many meters (negative shrinks),
+        /// like a closed stamp's Radius. A lake's water reaches past the bed outline up the shore.
+        /// </summary>
+        [DefaultValue(0f)]
+        [ValueRange(-20f, 50f)]
+        public float Expand = 0f;
+
         /// <summary>Smoothness: segments per spline span.</summary>
         [DefaultValue(8)]
         [ValueRange(2, 32)]
@@ -114,7 +130,10 @@ namespace Freefall.Components
             {
                 if (_renderer != null && _renderer.Mesh == _generatedMesh)
                     _renderer.Mesh = null;
-                _generatedMesh.Dispose();
+
+                // Deferred: a draw enqueued earlier this frame (WaterBody.Draw) and frames still in flight
+                // reference the mesh. Disposing it here crashed the editor when a lake was deleted.
+                Engine.Device.DeferDispose(_generatedMesh);
                 _generatedMesh = null;
             }
         }
@@ -147,7 +166,8 @@ namespace Freefall.Components
         /// </summary>
         public void Generate()
         {
-            if (Spline == null || _renderer == null) return;
+            // A MeshRenderer is optional: components that draw the mesh themselves (WaterBody) read GeneratedMesh
+            if (Spline == null) return;
             if (Spline.Points.Count < 2) return;
 
             // Dispose the mesh from two generations ago (GPU is definitely done)
@@ -160,9 +180,13 @@ namespace Freefall.Components
                 ? GenerateClosed()
                 : GenerateOpen();
 
-            if (_generatedMesh != null)
+            if (_generatedMesh != null && _renderer != null)
                 _renderer.Mesh = _generatedMesh;
         }
+
+        /// <summary>The current mesh (null until a spline with at least two points exists).</summary>
+        [System.ComponentModel.Browsable(false)]
+        public Mesh GeneratedMesh => _generatedMesh;
 
         // ═══════════════════════════════════════
         // ── Open Spline: Strip Along Curve ──
@@ -180,17 +204,17 @@ namespace Freefall.Components
             // Sample spline
             var points = new Vector3[samples];
             var tangents = new Vector3[samples];
+            var halfWidths = new float[samples];   // Width / 2, scaled by the spline's per-point width
             for (int i = 0; i < samples; i++)
             {
                 float t = (float)i / (samples - 1);
                 points[i] = Spline.GetPoint(t);
                 tangents[i] = Spline.GetTangent(t);
+                halfWidths[i] = Width * 0.5f * Spline.GetWidth(t);
             }
 
             // Apply height mode
             ApplyHeightMode(points);
-
-            float halfWidth = Width * 0.5f;
 
             // Compute per-edge positions
             var leftPositions = new Vector3[samples];
@@ -202,8 +226,8 @@ namespace Freefall.Components
                 var fwd = tangents[i];
                 var right = Vector3.Normalize(new Vector3(-fwd.Z, 0, fwd.X));
                 rights[i] = right;
-                leftPositions[i] = points[i] - right * halfWidth;
-                rightPositions[i] = points[i] + right * halfWidth;
+                leftPositions[i] = points[i] - right * halfWidths[i];
+                rightPositions[i] = points[i] + right * halfWidths[i];
             }
 
             // Center-line arc length for UV mapping
@@ -250,7 +274,7 @@ namespace Freefall.Components
 
                 float u = arcLengths[i] * UVScale;
                 uvs.Add(new Vector2(u, 0));
-                uvs.Add(new Vector2(u, Width * UVScale));
+                uvs.Add(new Vector2(u, halfWidths[i] * 2f * UVScale));
             }
 
             // Triangulate strip
@@ -360,7 +384,7 @@ namespace Freefall.Components
             // ── Curbs (separate MeshPart, slot 1) ──
             int curbStartIndex = indices.Count;
             if (EnableCurbs)
-                GenerateCurbs(points, rights, arcLengths, halfWidth, verts, norms, uvs, indices);
+                GenerateCurbs(points, rights, arcLengths, halfWidths, verts, norms, uvs, indices);
 
             if (indices.Count > curbStartIndex)
             {
@@ -382,7 +406,7 @@ namespace Freefall.Components
         /// Curbs sit at surface level and extend upward.
         /// </summary>
         private void GenerateCurbs(Vector3[] points, Vector3[] rights, float[] arcLengths,
-            float halfWidth,
+            float[] halfWidths,
             List<Vector3> verts, List<Vector3> norms, List<Vector2> uvs, List<uint> indices)
         {
             int samples = points.Length;
@@ -399,7 +423,7 @@ namespace Freefall.Components
                     var right = rights[i];
                     outward = right * s; // direction away from road center
 
-                    var innerBot = points[i] + right * (halfWidth * s);
+                    var innerBot = points[i] + right * (halfWidths[i] * s);
                     var innerTop = innerBot + Vector3.UnitY * CurbHeight;
                     var outerTop = innerTop + right * (CurbWidth * s);
                     var outerBot = innerBot + right * (CurbWidth * s);
@@ -498,6 +522,25 @@ namespace Freefall.Components
                 Array.Reverse(heights);
             }
 
+            // Grow / shrink the outline along the averaged outward normal of its two edges
+            if (MathF.Abs(Expand) > 0.001f)
+            {
+                int count = polygon2D.Count;
+                var grown = new List<Vector2>(count);
+                for (int i = 0; i < count; i++)
+                {
+                    var e0 = polygon2D[i] - polygon2D[(i - 1 + count) % count];
+                    var e1 = polygon2D[(i + 1) % count] - polygon2D[i];
+
+                    // CCW polygon: outward = (dz, -dx), same as the curbs below
+                    var normal = new Vector2(e0.Y, -e0.X) + new Vector2(e1.Y, -e1.X);
+                    grown.Add(normal.LengthSquared() > 1e-10f
+                        ? polygon2D[i] + Vector2.Normalize(normal) * Expand
+                        : polygon2D[i]);
+                }
+                polygon2D = grown;
+            }
+
             var triangles = EarClipTriangulate(polygon2D);
             if (triangles == null || triangles.Count < 3) return null;
 
@@ -531,6 +574,12 @@ namespace Freefall.Components
             {
                 for (int i = 0; i < n; i++)
                     yValues[i] = heights[i];
+            }
+
+            if (Offset != 0f)
+            {
+                for (int i = 0; i < n; i++)
+                    yValues[i] += Offset;
             }
 
             // ── Base surface ──
@@ -751,6 +800,12 @@ namespace Freefall.Components
                     break;
 
                 // Spline: keep Y as-is
+            }
+
+            if (Offset != 0f)
+            {
+                for (int i = 0; i < points.Length; i++)
+                    points[i].Y += Offset;
             }
         }
 

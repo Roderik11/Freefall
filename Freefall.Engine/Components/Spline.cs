@@ -23,6 +23,14 @@ namespace Freefall.Components
             new Vector3(0, 0, 5),
         };
 
+        /// <summary>
+        /// Width multiplier per control point (parallel to Points; missing entries count as 1).
+        /// Everything built along the spline scales its own width by it: stamp radius and falloff,
+        /// RuntimeMesh strips. A river that widens from spring to mouth is one spline.
+        /// Edit in the scene view by dragging a point with Alt held.
+        /// </summary>
+        public List<float> Widths = new();
+
         /// <summary>If true, the spline forms a closed loop.</summary>
         [System.ComponentModel.DefaultValue(false)]
         public bool Closed = false;
@@ -100,6 +108,86 @@ namespace Freefall.Components
             t.Position += parentShift;
             OnMemberChanged();
             return shift.Length();
+        }
+
+        // ═══════════════════════════
+        // ── Width ──
+        // ═══════════════════════════
+
+        /// <summary>Width multiplier of control point <paramref name="index"/> (1 when not set).</summary>
+        public float GetPointWidth(int index)
+            => index >= 0 && index < Widths.Count ? Widths[index] : 1f;
+
+        /// <summary>Set the width multiplier of a control point (pads the list with 1s as needed).</summary>
+        public void SetPointWidth(int index, float width)
+        {
+            if (index < 0 || index >= Points.Count) return;
+            while (Widths.Count <= index) Widths.Add(1f);
+            Widths[index] = MathF.Max(0.02f, width);
+        }
+
+        /// <summary>True when at least one point has a width other than 1.</summary>
+        public bool HasWidths
+        {
+            get
+            {
+                for (int i = 0; i < Widths.Count && i < Points.Count; i++)
+                    if (MathF.Abs(Widths[i] - 1f) > 0.001f) return true;
+                return false;
+            }
+        }
+
+        /// <summary>Largest width multiplier along the spline (for bounds).</summary>
+        public float MaxWidth
+        {
+            get
+            {
+                float max = 1f;
+                for (int i = 0; i < Widths.Count && i < Points.Count; i++)
+                    max = MathF.Max(max, Widths[i]);
+                return max;
+            }
+        }
+
+        /// <summary>
+        /// Width multiplier at t ∈ [0, 1], eased between the two neighbouring control points
+        /// (no overshoot: it never leaves the range of those two values).
+        /// </summary>
+        public float GetWidth(float t)
+        {
+            if (Widths.Count == 0 || Points.Count < 2) return 1f;
+
+            int spans = SpanCount;
+            t = Math.Clamp(t, 0f, 1f) * spans;
+            int span = (int)t;
+            if (span >= spans) span = spans - 1;
+            float local = t - span;
+
+            int n = Points.Count;
+            float w0 = GetPointWidth(span % n);
+            float w1 = GetPointWidth(Closed ? (span + 1) % n : Math.Min(n - 1, span + 1));
+            float s = local * local * (3f - 2f * local);
+            return w0 + (w1 - w0) * s;
+        }
+
+        /// <summary>
+        /// Half-width in meters that a width of 1 stands for on this entity: the widest thing built
+        /// along the spline. Only used to make Alt-dragging a point feel 1:1 (drag to where the edge
+        /// should be).
+        /// </summary>
+        private float WidthReference()
+        {
+            float reference = 0f;
+            if (Entity != null)
+            {
+                var height = Entity.GetComponent<HeightStamp>();
+                if (height != null) reference = MathF.Max(reference, height.Radius);
+                var splat = Entity.GetComponent<SplatStamp>();
+                if (splat != null) reference = MathF.Max(reference, splat.Radius);
+                var mesh = Entity.GetComponent<RuntimeMesh>();
+                if (mesh != null) reference = MathF.Max(reference, mesh.Width * 0.5f);
+            }
+            return reference > 0.01f ? reference : 1f;
         }
 
         // ═══════════════════════════
@@ -245,7 +333,18 @@ namespace Freefall.Components
 
                 if (ctx.Changed)
                 {
-                    Points[i] = newPos;
+                    if (Input.Alt)
+                    {
+                        // Alt-drag: the point stays put, the distance dragged away from it (on the
+                        // ground plane) becomes its half-width.
+                        var offset = newPos - Points[i];
+                        float dragged = MathF.Sqrt(offset.X * offset.X + offset.Z * offset.Z);
+                        SetPointWidth(i, dragged / WidthReference());
+                    }
+                    else
+                    {
+                        Points[i] = newPos;
+                    }
                     MessageDispatcher.Send(EngineMsg.SplineChanged, this);
                 }
             }
@@ -254,14 +353,35 @@ namespace Freefall.Components
             {
                 // Insert a new point halfway between the last two
                 Vector3 newPointPos = (Points[insertPoint] + Points[Math.Max(0, insertPoint - 1)]) * 0.5f;
+                if (Widths.Count > insertPoint)
+                    Widths.Insert(insertPoint, (GetPointWidth(insertPoint) + GetPointWidth(Math.Max(0, insertPoint - 1))) * 0.5f);
                 Points.Insert(insertPoint, newPointPos);
                 MessageDispatcher.Send(EngineMsg.SplineChanged, this);
             }
 
             if(deletePoint != -1)
             {
+                if (Widths.Count > deletePoint) Widths.RemoveAt(deletePoint);
                 Points.RemoveAt(deletePoint);
                 MessageDispatcher.Send(EngineMsg.SplineChanged, this);
+            }
+
+            // Width bars: across the spline at every point that has its own width (all points while
+            // Alt is held, so there is something to aim at before the first drag)
+            if (HasWidths || Input.Alt)
+            {
+                ctx.Color = new Color4(1f, 0.35f, 0.75f, 1f); // Pink
+                ctx.LineWidth = 2f;
+                float reference = WidthReference();
+                for (int i = 0; i < Points.Count; i++)
+                {
+                    float t = Closed ? (float)i / Points.Count : (float)i / (Points.Count - 1);
+                    var tangent = GetTangent(Math.Clamp(t, 0.001f, 0.999f));
+                    var across = new Vector3(-tangent.Z, 0, tangent.X);
+                    if (across.LengthSquared() < 1e-8f) continue;
+                    across = Vector3.Normalize(across) * (reference * GetPointWidth(i));
+                    ctx.DrawLine(Points[i] - across, Points[i] + across);
+                }
             }
 
             // Draw tangent indicators at control points

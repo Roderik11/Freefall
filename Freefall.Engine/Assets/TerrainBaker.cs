@@ -1496,7 +1496,7 @@ namespace Freefall.Assets
                         {
                             UV = new Vector2(u, v),
                             Height = normalizedH,
-                            HalfWidth = uvRadius,
+                            HalfWidth = uvRadius * spline.GetWidth(t),
                         });
                     }
 
@@ -1505,6 +1505,8 @@ namespace Freefall.Assets
                         pointCount |= 0x80000000;
 
                     desc.SplinePointCount = pointCount;
+                    // The stamp's own radius stays the reference: the shader scales the falloff by
+                    // (sample half-width / Radius), see EvaluateStampWeight.
                     desc.Radius = uvRadius;
                     desc.TargetHeight = 0;
                     desc.Center = Vector2.Zero;
@@ -1861,7 +1863,7 @@ namespace Freefall.Assets
                 {
                     UV = new Vector2(u, v),
                     Height = normalizedH,
-                    HalfWidth = uvRadius,
+                    HalfWidth = uvRadius * spline.GetWidth(t),
                 });
             }
 

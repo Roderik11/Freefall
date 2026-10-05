@@ -56,7 +56,7 @@ cbuffer terrain : register(b1)
     float3 CameraPos;
     float HeightTexel;
     float MaxHeight;
-    float _pad1;
+    float BlendDepth;   // layer transition softness in weight space (Terrain.LayerBlendDepth)
     float2 TerrainSize;
     float2 TerrainOrigin;
 }
@@ -259,7 +259,10 @@ FragmentOutput PS(VertexOutput input)
     // Height-based texture blending with back-to-front masking.
     // Later layers mask earlier layers (matching sequential lerp priority),
     // then height maps add micro-detail at transitions between similar-weight layers.
-    const float blendDepth = 0.2;
+    // blendDepth is the weight-space window in which layers crossfade: small = crisp
+    // height-map-shaped edge, 1 = fade spans the whole weight ramp (falloff / HeightBlend).
+    // Must stay <= 1 or zero-weight layers (skipped below) would pop in.
+    const float blendDepth = clamp(BlendDepth, 0.01, 1.0);
 
     bool hasAnyLayer = false;
     float blendedHeight = 0;
