@@ -36,6 +36,9 @@ namespace Freefall.Editor
             EditorToolbar.Add(Toolbar, EditorSkin.IconPlus, "Tree", BtnAddTree_Click);
             EditorToolbar.Add(Toolbar, EditorSkin.IconPlus, "Param", BtnAddParam_Click);
             EditorToolbar.Add(Toolbar, EditorSkin.IconPlus, "Test", CreateBlendTreeAnimations);
+            EditorToolbar.AddSeparator(Toolbar);
+            EditorToolbar.Add(Toolbar, EditorSkin.IconFrame, "Frame", (s, e) => Canvas.FrameNodes())
+                .Tooltip = "Bring all states into view";
 
             // ── Split: Params (left) | Canvas (right) ──
             var split = new SplitContainer();
@@ -488,6 +491,9 @@ namespace Freefall.Editor
                     AddStateNode(state);
                 }
             }
+
+            // Open on the states, wherever on the canvas they were saved
+            FrameNodes();
         }
 
         public void AddStateNode(AnimationState state)
@@ -565,12 +571,7 @@ namespace Freefall.Editor
         {
             const float hitThreshold = 8f;
 
-            var nodeMap = new Dictionary<int, AnimStateNode>();
-            foreach (Control ctrl in Controls)
-            {
-                if (ctrl is AnimStateNode node)
-                    nodeMap[node.State.ID] = node;
-            }
+            var nodeMap = BuildNodeMap();
 
             AnimationTransition closest = null;
             float closestDist = hitThreshold;
@@ -582,10 +583,9 @@ namespace Freefall.Editor
                     if (!nodeMap.TryGetValue(transition.SourceID, out var fromNode)) continue;
                     if (!nodeMap.TryGetValue(transition.TargetID, out var toNode)) continue;
 
-                    Point start = fromNode.Location + new Point(fromNode.Size.x, fromNode.Size.y / 2) * UIScale;
-                    Point end = toNode.Location + new Point(0, toNode.Size.y / 2) * UIScale;
+                    GetTransitionSegment(fromNode, toNode, out var start, out var end);
 
-                    float dist = PointToSegmentDist(mouse, start, end);
+                    float dist = PointToSegmentDist(mouse, new Point((int)start.X, (int)start.Y), new Point((int)end.X, (int)end.Y));
                     if (dist < closestDist)
                     {
                         closestDist = dist;
@@ -609,9 +609,30 @@ namespace Freefall.Editor
             return MathF.Sqrt(ex * ex + ey * ey);
         }
 
+        private bool framePending;
+
+        /// <summary>
+        /// Pan and zoom so all states are in view. Applied on the next update, once the canvas has its size.
+        /// </summary>
+        public void FrameNodes()
+        {
+            framePending = true;
+        }
+
         protected override void OnUpdate()
         {
             base.OnUpdate();
+
+            if (framePending)
+            {
+                var nodes = new List<Control>();
+                foreach (Control ctrl in Controls)
+                    if (ctrl is AnimStateNode) nodes.Add(ctrl);
+
+                if (CanvasDrawing.FrameNodes(this, maxSize, nodes))
+                    framePending = false;
+            }
+
             if (isDragging) return;
 
             var mouse = Gui.MousePosition;
@@ -642,15 +663,70 @@ namespace Freefall.Editor
 
         // ── Draw transition arrows ──
 
+        private static readonly Color4 ConditionalColor = new Color4(1f, .62f, .30f, 1f);
+        private static readonly Color4 UnconditionalColor = new Color4(.50f, .66f, .92f, 1f);
+        private static readonly Color4 SelectedColor = new Color4(1f, 1f, 1f, 1f);
+        private static readonly Color4 WiringColor = new Color4(1f, .47f, .37f, 1f);
+
+        protected override void DrawStyle(Style style, float opacity)
+        {
+            base.DrawStyle(style, opacity);
+            CanvasDrawing.DrawGrid(this);
+        }
+
+        /// <summary>
+        /// The on-screen segment a transition is drawn along: a straight line between the two state
+        /// cards, trimmed to their edges and shifted sideways so A→B and B→A don't overlap.
+        /// </summary>
+        private void GetTransitionSegment(AnimStateNode from, AnimStateNode to, out Vector2 start, out Vector2 end)
+        {
+            Vector2 fromHalf = new Vector2(from.Size.x, from.Size.y) * UIScale / 2;
+            Vector2 toHalf = new Vector2(to.Size.x, to.Size.y) * UIScale / 2;
+            Vector2 a = new Vector2(from.Location.x, from.Location.y) + fromHalf;
+            Vector2 b = new Vector2(to.Location.x, to.Location.y) + toHalf;
+
+            Vector2 delta = b - a;
+            if (delta.LengthSquared() < 1)
+            {
+                start = end = a;
+                return;
+            }
+
+            Vector2 direction = Vector2.Normalize(delta);
+            Vector2 side = new Vector2(-direction.Y, direction.X) * 7 * UIScale;
+            float gap = 4 * UIScale;
+
+            start = a + direction * (EdgeDistance(fromHalf, direction) + gap) + side;
+            end = b - direction * (EdgeDistance(toHalf, direction) + gap) + side;
+        }
+
+        // Distance from a box's centre to its edge along a direction
+        private static float EdgeDistance(Vector2 half, Vector2 direction)
+        {
+            float x = MathF.Abs(direction.X) > .0001f ? half.X / MathF.Abs(direction.X) : float.MaxValue;
+            float y = MathF.Abs(direction.Y) > .0001f ? half.Y / MathF.Abs(direction.Y) : float.MaxValue;
+            return MathF.Min(x, y);
+        }
+
+        private Dictionary<int, AnimStateNode> BuildNodeMap()
+        {
+            var nodeMap = new Dictionary<int, AnimStateNode>();
+            foreach (Control ctrl in Controls)
+            {
+                if (ctrl is AnimStateNode node)
+                    nodeMap[node.State.ID] = node;
+            }
+            return nodeMap;
+        }
+
         protected override void DrawCustom()
         {
-            var batch = ((SquidRenderer)Gui.Renderer).SpriteBatch;
-
-            // Draw wiring preview line
+            // Draw wiring preview arrow
             if (WiringSource != null)
             {
                 var from = WiringSource.Location + WiringSource.Size * UIScale / 2;
-                batch.DrawLine(from.x, from.y, Gui.MousePosition.x, Gui.MousePosition.y, new Color4(1, 0.8f, 0.3f, 1));
+                CanvasDrawing.DrawArrow(new Vector2(from.x, from.y), new Vector2(Gui.MousePosition.x, Gui.MousePosition.y),
+                    WiringColor, MathF.Max(1.5f, 2 * UIScale), 9 * UIScale);
             }
         }
 
@@ -658,15 +734,7 @@ namespace Freefall.Editor
         {
             if (_animation == null) return;
 
-            var batch = ((SquidRenderer)Gui.Renderer).SpriteBatch;
-
-            // Build state ID → node lookup
-            var nodeMap = new Dictionary<int, AnimStateNode>();
-            foreach (Control ctrl in Controls)
-            {
-                if (ctrl is AnimStateNode node)
-                    nodeMap[node.State.ID] = node;
-            }
+            var nodeMap = BuildNodeMap();
 
             // Draw transition arrows
             foreach (var layer in _animation.Layers)
@@ -676,28 +744,14 @@ namespace Freefall.Editor
                     if (!nodeMap.TryGetValue(transition.SourceID, out var fromNode)) continue;
                     if (!nodeMap.TryGetValue(transition.TargetID, out var toNode)) continue;
 
-                    // Arrow from right edge of source to left edge of target
-                    Point start = fromNode.Location + new Point(fromNode.Size.x, fromNode.Size.y / 2) * UIScale;
-                    Point end = toNode.Location + new Point(0, toNode.Size.y / 2) * UIScale;
+                    GetTransitionSegment(fromNode, toNode, out var start, out var end);
 
-                    // Color: orange for conditional, white for unconditional
-                    var color = transition.Conditions.Count > 0
-                        ? new Color4(1f, 0.7f, 0.2f, 1f)
-                        : new Color4(0.7f, 0.8f, 1f, 1f);
+                    // Amber for conditional, blue for unconditional, white while selected
+                    bool selected = ReferenceEquals(Selector.SelectedObject, transition);
+                    var color = selected ? SelectedColor
+                        : transition.Conditions.Count > 0 ? ConditionalColor : UnconditionalColor;
 
-                    // Simple 3-segment line (out, across, in)
-                    int nudge = (int)(15 * UIScale);
-                    var midStart = new Point(start.x + nudge, start.y);
-                    var midEnd = new Point(end.x - nudge, end.y);
-
-                    batch.DrawLine(start.x, start.y, midStart.x, midStart.y, color);
-                    batch.DrawLine(midStart.x, midStart.y, midEnd.x, midEnd.y, color);
-                    batch.DrawLine(midEnd.x, midEnd.y, end.x, end.y, color);
-
-                    // Arrowhead
-                    int ah = (int)(6 * UIScale);
-                    batch.DrawLine(end.x, end.y, end.x - ah, end.y - ah, color);
-                    batch.DrawLine(end.x, end.y, end.x - ah, end.y + ah, color);
+                    CanvasDrawing.DrawArrow(start, end, color, MathF.Max(1.5f, (selected ? 3 : 2) * UIScale), 9 * UIScale);
                 }
             }
         }
@@ -712,58 +766,74 @@ namespace Freefall.Editor
         public AnimationState State;
         private readonly AnimationCanvas _canvas;
         private readonly Label _titleBar;
+        private readonly Label _subtitle;
 
         public AnimStateNode(AnimationState state, AnimationCanvas canvas)
         {
             State = state;
             _canvas = canvas;
 
-            Style = "window";
-            Size = new Point(150, 44);
+            // The card is painted in DrawStyle; the labels only add text
+            Style = "";
+            Size = new Point(168, 52);
             Position = new Point((int)state.Position.X, (int)state.Position.Y);
             Resizable = false;
             AllowDragOut = true;
             MaxSize = Point.Zero;
             SnapDistance = 0;
-            Padding = new Margin(1);
-            Tooltip = state is AnimationBlendTree ? "Blend Tree" : (state.Clip?.Name ?? "No Clip");
+            Padding = new Margin(8, 7, 8, 7);
+            Tooltip = "Click to select, right-click to start a transition";
+
+            // What the state plays, under its name
+            _subtitle = new Label
+            {
+                Style = "stateSubtitle",
+                Dock = DockStyle.Bottom,
+                Size = new Point(100, 16),
+                Cursor = Cursors.Move,
+                AutoEllipsis = true,
+            };
+            Controls.Add(_subtitle);
 
             _titleBar = new Label
             {
                 Text = state.Name ?? "State",
-                Style = "header",
+                Style = "stateTitle",
                 Dock = DockStyle.Fill,
-                Size = new Point(100, 28),
+                Size = new Point(100, 22),
                 Cursor = Cursors.Move,
-                TextAlign = Alignment.MiddleCenter
+                AutoEllipsis = true,
             };
             Controls.Add(_titleBar);
 
-            _titleBar.MouseDrag += (s, a) =>
+            foreach (var label in new[] { _titleBar, _subtitle })
             {
-                StartDrag();
-            };
-
-            _titleBar.MouseUp += (s, a) =>
-            {
-                StopDrag();
-            };
-
-            // Left-click: select state in inspector
-            _titleBar.MouseClick += (s, a) =>
-            {
-                if (a.Button == 0)
+                label.MouseDrag += (s, a) =>
                 {
-                    if(_canvas.WiringSource != null && _canvas.WiringSource != this)
-                        _canvas._editor.CreateTransition(_canvas.WiringSource, this);
-                    else
-                        Selector.SelectedObject = State;
+                    StartDrag();
+                };
 
-                    _canvas.WiringSource = null;
-                }
-                else if (a.Button == 1)
-                    _canvas.WiringSource = this;
-            };
+                label.MouseUp += (s, a) =>
+                {
+                    StopDrag();
+                };
+
+                // Left-click: select state in inspector
+                label.MouseClick += (s, a) =>
+                {
+                    if (a.Button == 0)
+                    {
+                        if(_canvas.WiringSource != null && _canvas.WiringSource != this)
+                            _canvas._editor.CreateTransition(_canvas.WiringSource, this);
+                        else
+                            Selector.SelectedObject = State;
+
+                        _canvas.WiringSource = null;
+                    }
+                    else if (a.Button == 1)
+                        _canvas.WiringSource = this;
+                };
+            }
 
             PositionChanged += (s) =>
             {
@@ -775,6 +845,33 @@ namespace Freefall.Editor
         {
             base.OnUpdate();
             _titleBar.Text = State.Name ?? "State";
+            _subtitle.Text = State is AnimationBlendTree ? "Blend Tree" : (State.Clip?.Name ?? "No clip");
+        }
+
+        protected override void DrawStyle(Style style, float opacity)
+        {
+            if (opacity == 0) return;
+
+            // Sizes are in canvas units; the canvas zoom scales them on screen
+            float scale = GetScale();
+            int x = Location.x, y = Location.y;
+            int w = (int)(Size.x * scale), h = (int)(Size.y * scale);
+
+            bool selected = ReferenceEquals(Selector.SelectedObject, State);
+            bool wiring = _canvas.WiringSource == this;
+
+            LandingArt.Slice(LandingArt.RoundSmall, x, y, w, h, LandingArt.RadiusSmall, EditorSkin.NodeHeaderColor, scale);
+
+            // Blend trees carry an accent bar on the left edge
+            if (State is AnimationBlendTree)
+            {
+                int bar = Math.Max(2, (int)(3 * scale));
+                int inset = Math.Max(1, (int)(LandingArt.RadiusSmall * scale));
+                Gui.Renderer.DrawBox(x, y + inset, bar, h - inset * 2, ColorInt.ARGB(1f, .42f, .66f, .95f));
+            }
+
+            LandingArt.Slice(LandingArt.OutlineSmall, x, y, w, h, LandingArt.RadiusSmall,
+                selected || wiring ? LandingArt.Coral : ColorInt.ARGB(.16f, 1f, 1f, 1f), scale);
         }
     }
 }

@@ -530,6 +530,16 @@ namespace Freefall.Editor
             var canvas = new ControlStyle(frame);
             canvas.BackColor = Cool(.105f);
 
+            // Animation state cards: name over what it plays, both centred
+            var stateTitle = new ControlStyle(baseStyle);
+            stateTitle.Font = HeadingFont;
+            stateTitle.TextAlign = Alignment.MiddleCenter;
+
+            var stateSubtitle = new ControlStyle(baseStyle);
+            stateSubtitle.Font = "roboto_regular_9";
+            stateSubtitle.TextColor = ColorInt.ARGB(1f, .55f, .58f, .62f);
+            stateSubtitle.TextAlign = Alignment.MiddleCenter;
+
             var toolbarSeparator = new ControlStyle();
             toolbarSeparator.BackColor = ColorInt.ARGB(.12f, 1f, 1f, 1f);
 
@@ -572,6 +582,8 @@ namespace Freefall.Editor
                 { "canvas", canvas },
                 { "graphTitle", graphTitle },
                 { "toolbarSeparator", toolbarSeparator },
+                { "stateTitle", stateTitle },
+                { "stateSubtitle", stateSubtitle },
                 { "window", window },
                 { "frame", frame },
                 { "label", label },
