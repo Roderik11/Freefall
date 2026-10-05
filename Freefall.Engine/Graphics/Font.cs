@@ -28,7 +28,7 @@ namespace Freefall.Graphics
             public int Width;
             public int OffsetX;
             public int OffsetY;
-            public int Advance;
+            public float Advance;    // fractional for runtime-rasterized fonts, so small sizes keep their spacing
         }
 
         const char SPACE_CHAR = ' ';
@@ -41,7 +41,7 @@ namespace Freefall.Graphics
         {
             if (string.IsNullOrEmpty(str)) return;
 
-            int currentX = x;
+            float currentX = x;
             int currentY = y;
             var col = new Color4(color);
 
@@ -57,7 +57,7 @@ namespace Freefall.Graphics
                     if (c != SPACE_CHAR)
                     {
                         batch.Draw(
-                            currentX, currentY + glyph.OffsetY,
+                            (int)MathF.Round(currentX), currentY + glyph.OffsetY,
                             glyph.Width, glyph.Height,
                             glyph.Rect, col,
                             _texture.BindlessIndex,
@@ -75,15 +75,17 @@ namespace Freefall.Graphics
         public Point GetTextSize(string text)
         {
             var p = new Point(0, Height);
+            float width = 0;
 
             foreach (char c in text)
             {
                 if (c == NEWLINE_CHAR)
                     p.Y += Height;
                 else if (_glyphs.TryGetValue(c, out Glyph glyph))
-                    p.X += glyph.Advance - Spacing;
+                    width += glyph.Advance - Spacing;
             }
 
+            p.X = (int)MathF.Ceiling(width);
             return p;
         }
 

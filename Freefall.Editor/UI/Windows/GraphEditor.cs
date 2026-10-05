@@ -45,6 +45,16 @@ namespace Freefall.Editor
             EditorToolbar.Add(Toolbar, EditorSkin.IconOpen, "Load", BtnLoad_MouseDown);
             EditorToolbar.AddSeparator(Toolbar);
             EditorToolbar.Add(Toolbar, EditorSkin.IconPlay, "Execute", BtnExecute_MouseDown, primary: true);
+            EditorToolbar.AddSeparator(Toolbar);
+            EditorToolbar.Add(Toolbar, EditorSkin.IconArrange, "Arrange", (s, e) =>
+            {
+                if (Graph == null || Graph.Nodes.Count == 0) return;
+                GraphLayout.Arrange(Graph);
+                CanvasFrame.SyncNodePositions();
+                CanvasFrame.FrameNodes();
+            }).Tooltip = "Lay the nodes out left to right (not saved until you press Save)";
+            EditorToolbar.Add(Toolbar, EditorSkin.IconFrame, "Frame", (s, e) => CanvasFrame.FrameNodes())
+                .Tooltip = "Bring all nodes into view";
 
             SplitContainer split = new SplitContainer();
             split.Dock = DockStyle.Fill;
@@ -117,6 +127,9 @@ namespace Freefall.Editor
 
             foreach (var node in Graph.Nodes)
                 CanvasFrame.AddNode(node);
+
+            // Open on the nodes, wherever on the canvas they were saved
+            CanvasFrame.FrameNodes();
         }
 
         /// <summary>
@@ -255,6 +268,56 @@ namespace Freefall.Editor
             Controls.Add(frame);
         }
 
+        /// <summary>
+        /// Move every node card to its node's position (after the graph was re-laid out).
+        /// </summary>
+        public void SyncNodePositions()
+        {
+            foreach (var control in Controls)
+                if (control is GraphFrame frame)
+                    frame.Position = new Point((int)frame.Node.Position.X, (int)frame.Node.Position.Y);
+        }
+
+        private bool framePending;
+
+        /// <summary>
+        /// Pan and zoom so all nodes are in view. Applied on the next update, once the canvas has its size.
+        /// </summary>
+        public void FrameNodes()
+        {
+            framePending = true;
+        }
+
+        private void ApplyFrame()
+        {
+            if (Parent == null || Parent.Size.x <= 0 || Parent.Size.y <= 0) return;
+            framePending = false;
+
+            int minX = int.MaxValue, minY = int.MaxValue, maxX = int.MinValue, maxY = int.MinValue;
+            foreach (var control in Controls)
+            {
+                if (control is not GraphFrame frame) continue;
+                minX = Math.Min(minX, frame.Position.x);
+                minY = Math.Min(minY, frame.Position.y);
+                maxX = Math.Max(maxX, frame.Position.x + frame.Size.x);
+                maxY = Math.Max(maxY, frame.Position.y + frame.Size.y);
+            }
+            if (minX == int.MaxValue) return;
+
+            // Zoom out as far as needed to fit, but never zoom in past 100%
+            const int margin = 48;
+            Point view = Parent.Size;
+            float fit = Math.Min((view.x - margin * 2) / (float)Math.Max(1, maxX - minX),
+                                 (view.y - margin * 2) / (float)Math.Max(1, maxY - minY));
+            UIScale = MathF.Round(Math.Clamp(fit, 0.3f, 1f) / .05f) * .05f;
+
+            // Free the canvas from its initial centring dock, then put the nodes' centre at the view's centre
+            Dock = DockStyle.None;
+            Size = maxSize * UIScale;
+            float centerX = (minX + maxX) / 2f, centerY = (minY + maxY) / 2f;
+            Position = new Point((int)(view.x / 2f - centerX * UIScale), (int)(view.y / 2f - centerY * UIScale));
+        }
+
         private void Gui_MouseUp(Control sender, MouseEventArgs args)
         {
             DownSource = null;
@@ -304,6 +367,7 @@ namespace Freefall.Editor
         protected override void OnUpdate()
         {
             base.OnUpdate();
+            if (framePending) ApplyFrame();
             if (isDragging) return;
 
             var mouse = Gui.MousePosition;

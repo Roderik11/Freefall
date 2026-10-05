@@ -36,16 +36,19 @@ namespace Freefall.Editor.Mcp
                      "{op:'set', node:5, values:{Scale:40}}; {op:'remove', node:5}; " +
                      "{op:'connect', from:3, fromPort:'Output', to:'noise', toPort:'Input'} (ports default Output→Input); " +
                      "{op:'disconnect', from:3, to:7}. Settings use the same encodings as entity_set_properties " +
-                     "(lists of objects for SpawnPrefab.Entities: [{Prefab:'guid', Weight:1}]). Create a new graph with asset_create type 'PCGGraph'.")]
+                     "(lists of objects for SpawnPrefab.Entities: [{Prefab:'guid', Weight:1}]). Create a new graph with asset_create type 'PCGGraph'. " +
+                     "When a call adds nodes, the whole graph is auto-arranged left to right afterwards; pass arrange=false to keep an existing hand-made layout.")]
         public static Task<CallToolResult> EditGraph(
             string guid,
             [Description("Edit operations, applied in order")] JsonArray ops,
-            [Description("Re-run PCG components that use this graph")] bool run = true)
+            [Description("Re-run PCG components that use this graph")] bool run = true,
+            [Description("Auto-arrange the graph when this call added nodes")] bool arrange = true)
             => McpBridge.Post("/api/graph/edit", new JsonObject
             {
                 ["guid"] = guid,
                 ["ops"] = ops.DeepClone(),
                 ["run"] = run,
+                ["arrange"] = arrange,
             }.ToJsonString());
 
         [McpServerTool(Name = "pcg_execute", Title = "Run PCG", OpenWorld = false)]

@@ -290,6 +290,7 @@ namespace Freefall.Editor.Commands
             }
 
             int i = 0;
+            bool added = false;
             try
             {
                 foreach (var op in ops.EnumerateArray())
@@ -304,7 +305,8 @@ namespace Freefall.Editor.Commands
                                 throw new InvalidOperationException($"Unknown node type '{typeName}' (see graph_node_types)");
                             var node = (Node)Activator.CreateInstance(t);
                             graph.AddNode(node);
-                            // Lay new nodes out in a column to the right of the existing ones
+                            added = true;
+                            // Placeholder to the right of the existing nodes; the graph is re-laid out once all ops ran
                             float maxX = graph.Nodes.Where(x => x != node).Select(x => x.Position.X).DefaultIfEmpty(500000).Max();
                             node.Position = new Vector2(maxX + 220, 500000 + (node.ID % 8) * 120);
                             if (op.TryGetProperty("values", out var v)) AuthoringHelpers.ApplyNodeValues(node, v);
@@ -359,6 +361,10 @@ namespace Freefall.Editor.Commands
                 // Earlier ops stay applied in memory; nothing is saved
                 return CommandResult.Error(400, $"Op #{i} failed: {ex.Message}. Earlier ops are applied in memory but not saved; fix and resend, or reload.");
             }
+
+            // New nodes have no meaningful position yet: lay the graph out (arrange=false keeps a hand-made layout)
+            bool arrange = !root.TryGetProperty("arrange", out var ar) || ar.GetBoolean();
+            if (added && arrange) GraphLayout.Arrange(graph);
 
             string saved = AuthoringHelpers.SaveAndReimport(graph, guid);
             bool run = !root.TryGetProperty("run", out var rn) || rn.GetBoolean();

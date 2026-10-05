@@ -37,15 +37,19 @@ namespace Freefall.Editor
             using var format = new StringFormat(StringFormat.GenericTypographic);
             format.FormatFlags |= StringFormatFlags.MeasureTrailingSpaces | StringFormatFlags.NoClip;
 
+            // Grid-fitting snaps every glyph to whole pixels, which reads as letter-spacing at small sizes;
+            // there, keep the true outlines and fractional advances instead.
+            var hint = pixelSize < 12 ? TextRenderingHint.AntiAlias : TextRenderingHint.AntiAliasGridFit;
+
             const int pad = 1;
             int atlasWidth = pixelSize >= 20 ? 1024 : 512;
             int lineHeight;
-            var cells = new List<(char c, int x, int y, int w, int advance)>();
+            var cells = new List<(char c, int x, int y, int w, float advance)>();
 
             using (var scratch = new Bitmap(1, 1, PixelFormat.Format32bppArgb))
             using (var g = System.Drawing.Graphics.FromImage(scratch))
             {
-                g.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
+                g.TextRenderingHint = hint;
                 lineHeight = (int)Math.Ceiling(font.GetHeight(g));
 
                 int x = 0, y = 0;
@@ -58,7 +62,7 @@ namespace Freefall.Editor
                         x = 0;
                         y += lineHeight + pad;
                     }
-                    cells.Add((c, x, y, cellWidth, Math.Max(1, (int)Math.Round(width))));
+                    cells.Add((c, x, y, cellWidth, width));
                     x += cellWidth + pad;
                 }
             }
@@ -69,7 +73,7 @@ namespace Freefall.Editor
             using (var g = System.Drawing.Graphics.FromImage(atlas))
             {
                 g.Clear(System.Drawing.Color.Transparent);
-                g.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
+                g.TextRenderingHint = hint;
                 foreach (var cell in cells)
                     g.DrawString(cell.c.ToString(), font, Brushes.White, cell.x + pad, cell.y, format);
             }

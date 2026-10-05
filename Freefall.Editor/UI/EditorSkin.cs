@@ -33,6 +33,8 @@ namespace Freefall.Editor
         public const string IconOpen = "ui_icon_open";
         public const string IconPlay = "ui_icon_play";
         public const string IconPlus = "ui_icon_plus";
+        public const string IconArrange = "ui_icon_arrange";
+        public const string IconFrame = "ui_icon_frame";
 
         private static readonly HashSet<string> _plugArt = new();
 
@@ -172,7 +174,24 @@ namespace Freefall.Editor
                 g.DrawPolygon(pen, new System.Drawing.PointF[] { new(1.5f, 3.5f), new(6f, 3.5f), new(7.5f, 5.5f), new(14.5f, 5.5f), new(14.5f, 12.5f), new(1.5f, 12.5f) }));
             Icon(IconPlay, (g, pen) =>
                 g.FillPolygon(System.Drawing.Brushes.White, new System.Drawing.PointF[] { new(4.5f, 2.5f), new(13.5f, 8f), new(4.5f, 13.5f) }));
-            Icon(IconPlus, (g, pen) =>
+            Icon(IconArrange, (g, pen) =>
+            {
+                // One node feeding two
+                g.DrawRectangle(pen, 1.5f, 6f, 4f, 4f);
+                g.DrawRectangle(pen, 10.5f, 1.5f, 4f, 4f);
+                g.DrawRectangle(pen, 10.5f, 10.5f, 4f, 4f);
+                g.DrawLines(pen, new System.Drawing.PointF[] { new(5.5f, 8f), new(8f, 8f), new(8f, 3.5f), new(10.5f, 3.5f) });
+                g.DrawLines(pen, new System.Drawing.PointF[] { new(8f, 8f), new(8f, 12.5f), new(10.5f, 12.5f) });
+            });
+            Icon(IconFrame, (g, pen) =>
+            {
+                // Four corner brackets around a dot
+                g.DrawLines(pen, new System.Drawing.PointF[] { new(2.5f, 6f), new(2.5f, 2.5f), new(6f, 2.5f) });
+                g.DrawLines(pen, new System.Drawing.PointF[] { new(10f, 2.5f), new(13.5f, 2.5f), new(13.5f, 6f) });
+                g.DrawLines(pen, new System.Drawing.PointF[] { new(13.5f, 10f), new(13.5f, 13.5f), new(10f, 13.5f) });
+                g.DrawLines(pen, new System.Drawing.PointF[] { new(6f, 13.5f), new(2.5f, 13.5f), new(2.5f, 10f) });
+                g.FillEllipse(System.Drawing.Brushes.White, 6.5f, 6.5f, 3f, 3f);
+            });            Icon(IconPlus, (g, pen) =>
             {
                 pen.Width = 1.7f;
                 g.DrawLine(pen, 8f, 3.5f, 8f, 12.5f);
