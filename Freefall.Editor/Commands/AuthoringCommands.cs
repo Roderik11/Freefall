@@ -111,10 +111,15 @@ namespace Freefall.Editor.Commands
         {
             MessageDispatcher.Send(EngineMsg.GraphChanged, graph);
             var runs = new List<object>();
-            foreach (var entity in EntityManager.Entities)
-                foreach (var pcg in entity.Components.OfType<PCGComponent>())
-                    if (pcg.Graph == graph)
+            // Executing spawns entities, so collect the users before running any of them
+            var users = EntityManager.Entities
+                .SelectMany(e => e.Components.OfType<PCGComponent>().Where(p => p.Graph == graph).Select(p => (entity: e, pcg: p)))
+                .ToList();
+            foreach (var (entity, pcg) in users)
+                    {
+                        pcg.Execute(); // GraphChanged only queues the run; the caller reports spawn counts now
                         runs.Add(new { id = entity.Id, uid = entity.UID.ToString(), name = entity.Name, spawned = CountSpawned(entity) });
+                    }
             return runs;
         }
 

@@ -50,8 +50,14 @@ namespace Freefall.Editor
                 AddProperty(prop);
             }
 
-            target.OnValueChanged += (property) => 
+            Func<bool> isDragging = () => Desktop?.PressedControl != null;
+
+            target.OnValueChanged += (property) =>
             {
+                // Dragging a slider: PCG output regenerates on release, not on every step
+                if (isDragging())
+                    Freefall.PCG.PCGScheduler.HoldWhile(isDragging);
+
                 foreach(var comp in target.Targets)
                 {      
                     if(comp is Component c)

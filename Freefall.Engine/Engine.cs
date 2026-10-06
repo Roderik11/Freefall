@@ -373,6 +373,9 @@ namespace Freefall
             
             // Entity logic (includes component Updates like Camera, CharacterController, etc.)
             EntityManager.Update();
+
+            // Regenerate PCG components invalidated by edits, once the edit has finished
+            Freefall.PCG.PCGScheduler.Update();
         }
 
         [DllImport("kernel32.dll", SetLastError = true)]

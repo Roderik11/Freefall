@@ -322,22 +322,31 @@ namespace Freefall.Editor.Mcp
             if (err != null) return err;
             int eid = rid!.Value;
             var applied = new JsonObject();
-            foreach (var (property, value) in values)
+            // Each member notifies the component; hold PCG so it regenerates once for the whole call.
+            Freefall.PCG.PCGScheduler.BeginHold();
+            try
             {
-                var body = new JsonObject
+                foreach (var (property, value) in values)
                 {
-                    ["component"] = component,
-                    ["property"] = property,
-                    ["value"] = JsonNode.Parse(value.GetRawText()),
-                };
-                var result = await McpBridge.Post($"/api/entity/{eid}/setproperty", body.ToJsonString());
-                if (result.IsError == true)
-                {
-                    var msg = $"Failed on '{property}': {EditorTools.TextOf(result)}";
-                    if (applied.Count > 0) msg += $"\nAlready applied: {applied.ToJsonString()}";
-                    return McpBridge.Error(msg);
+                    var body = new JsonObject
+                    {
+                        ["component"] = component,
+                        ["property"] = property,
+                        ["value"] = JsonNode.Parse(value.GetRawText()),
+                    };
+                    var result = await McpBridge.Post($"/api/entity/{eid}/setproperty", body.ToJsonString());
+                    if (result.IsError == true)
+                    {
+                        var msg = $"Failed on '{property}': {EditorTools.TextOf(result)}";
+                        if (applied.Count > 0) msg += $"\nAlready applied: {applied.ToJsonString()}";
+                        return McpBridge.Error(msg);
+                    }
+                    applied[property] = JsonNode.Parse(EditorTools.TextOf(result))?["value"]?.DeepClone();
                 }
-                applied[property] = JsonNode.Parse(EditorTools.TextOf(result))?["value"]?.DeepClone();
+            }
+            finally
+            {
+                Freefall.PCG.PCGScheduler.EndHold();
             }
             return EditorTools.Text(new JsonObject { ["id"] = eid, ["component"] = component, ["applied"] = applied });
         }

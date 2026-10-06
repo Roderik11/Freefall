@@ -12,7 +12,8 @@ namespace Freefall.Components
     /// On Execute: destroys previous output, injects context (Spline, etc.) into source nodes,
     /// then runs the graph. SpawnPrefab nodes parent their output under this entity.
     /// 
-    /// Live editing: listens for SplineChanged and GraphChanged messages to auto-regenerate.
+    /// Live editing: SplineChanged, GraphChanged and TerrainHeightsChanged messages Invalidate() the component;
+    /// PCGScheduler then regenerates it once, after the edit (gizmo drag, inspector drag, build) has finished.
     /// </summary>
     [Icon("icon_pcg.png")]
     public class PCGComponent : Component
@@ -41,6 +42,8 @@ namespace Freefall.Components
         /// </summary>
         public void Execute()
         {
+            PCGScheduler.Cancel(this);
+
             if (Graph == null || Graph.Nodes.Count == 0)
             {
                 Debug.Log("[PCG] No graph to execute.");
@@ -70,6 +73,11 @@ namespace Freefall.Components
         }
 
         /// <summary>
+        /// Request a regeneration. Runs once via PCGScheduler, however many changes arrive before it does.
+        /// </summary>
+        public void Invalidate() => PCGScheduler.Request(this);
+
+        /// <summary>
         /// Destroy all previously spawned output entities.
         /// </summary>
         public void DestroyOutput()
@@ -83,6 +91,7 @@ namespace Freefall.Components
             MessageDispatcher.RemoveListener(EngineMsg.SplineChanged, OnSplineChanged);
             MessageDispatcher.RemoveListener(EngineMsg.GraphChanged, OnGraphChanged);
             MessageDispatcher.RemoveListener(EngineMsg.TerrainHeightsChanged, OnTerrainHeightsChanged);
+            PCGScheduler.Cancel(this);
             DestroyOutput();
             base.Destroy();
         }
@@ -100,8 +109,12 @@ namespace Freefall.Components
         /// <summary>Inspector / command-server edits (Graph, ExecuteOnAwake) re-run the graph.</summary>
         public override void OnMemberChanged()
         {
-            if (Graph != null) Execute();
-            else DestroyOutput();
+            if (Graph != null) Invalidate();
+            else
+            {
+                PCGScheduler.Cancel(this);
+                DestroyOutput();
+            }
         }
 
         // TerrainProjection samples the CPU HeightField, which can be stale at load until the GPU bake is read
@@ -110,14 +123,14 @@ namespace Freefall.Components
         {
             if (Graph == null || OutputEntity == null) return;
             foreach (var node in Graph.Nodes)
-                if (node is TerrainProjection) { Execute(); return; }
+                if (node is TerrainProjection) { Invalidate(); return; }
         }
 
         private void OnSplineChanged(Message msg)
         {
             if (msg.Data is not Spline spline) return;
             if (!IsDescendant(spline.Entity)) return;
-            Execute();
+            Invalidate();
         }
 
         private bool IsDescendant(Entity other)
@@ -134,7 +147,7 @@ namespace Freefall.Components
         private void OnGraphChanged(Message msg)
         {
             if (msg.Data != Graph) return; // not our graph
-            Execute();
+            Invalidate();
         }
 
         /// <summary>

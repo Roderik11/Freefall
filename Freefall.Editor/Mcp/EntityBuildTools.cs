@@ -116,29 +116,38 @@ namespace Freefall.Editor.Mcp
                 if (err != null) return await Fail(id, err, log);
             }
 
-            // 3. Components
-            foreach (var c in comps)
-            {
-                var add = await McpBridge.Post($"/api/entity/{id}/addcomponent", new { type = c.Type });
-                // Prefab instances may already carry the component; then only its values are set.
-                if (add.IsError == true && !EditorTools.TextOf(add).Contains("already", StringComparison.OrdinalIgnoreCase))
-                    return await Fail(id, $"add {c.Type}: {EditorTools.TextOf(add)}", log);
-
-                foreach (var (member, value) in c.Values!)
-                {
-                    var body = new JsonObject { ["component"] = c.Type, ["property"] = member, ["value"] = value?.DeepClone() };
-                    var err = await Step($"{c.Type}.{member}", McpBridge.Post($"/api/entity/{id}/setproperty", body.ToJsonString()));
-                    if (err != null) return await Fail(id, err, log);
-                }
-                log.Add($"{c.Type} ({c.Values.Count} values)");
-            }
-
-            // 4. PCG
+            // Every value set below invalidates the PCG; hold it so it runs once, on the finished entity.
             JsonNode? pcg = null;
-            if (runPcg && comps.Any(c => c.Type.Equals("PCGComponent", StringComparison.OrdinalIgnoreCase)))
+            Freefall.PCG.PCGScheduler.BeginHold();
+            try
             {
-                var run = await McpBridge.Post("/api/pcg/execute", new { id });
-                pcg = run.IsError == true ? EditorTools.TextOf(run) : JsonNode.Parse(EditorTools.TextOf(run));
+                // 3. Components
+                foreach (var c in comps)
+                {
+                    var add = await McpBridge.Post($"/api/entity/{id}/addcomponent", new { type = c.Type });
+                    // Prefab instances may already carry the component; then only its values are set.
+                    if (add.IsError == true && !EditorTools.TextOf(add).Contains("already", StringComparison.OrdinalIgnoreCase))
+                        return await Fail(id, $"add {c.Type}: {EditorTools.TextOf(add)}", log);
+
+                    foreach (var (member, value) in c.Values!)
+                    {
+                        var body = new JsonObject { ["component"] = c.Type, ["property"] = member, ["value"] = value?.DeepClone() };
+                        var err = await Step($"{c.Type}.{member}", McpBridge.Post($"/api/entity/{id}/setproperty", body.ToJsonString()));
+                        if (err != null) return await Fail(id, err, log);
+                    }
+                    log.Add($"{c.Type} ({c.Values.Count} values)");
+                }
+
+                // 4. PCG
+                if (runPcg && comps.Any(c => c.Type.Equals("PCGComponent", StringComparison.OrdinalIgnoreCase)))
+                {
+                    var run = await McpBridge.Post("/api/pcg/execute", new { id });
+                    pcg = run.IsError == true ? EditorTools.TextOf(run) : JsonNode.Parse(EditorTools.TextOf(run));
+                }
+            }
+            finally
+            {
+                Freefall.PCG.PCGScheduler.EndHold();
             }
 
             var detail = await McpBridge.Get($"/api/scene/entity/{id}");
