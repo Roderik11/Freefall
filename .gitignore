@@ -46,7 +46,7 @@ ws_client.js
 ssdm_paper_draft.docx
 dotnet-tools.json
 
-# Scripts (local dev tools)
-Scripts/
+# Scripts (local dev tools) — the top-level folder only; Freefall.Editor/Scripts is editor source
+/Scripts/
 /Tools/BlenderKits
 /Tools/RetargetLab
