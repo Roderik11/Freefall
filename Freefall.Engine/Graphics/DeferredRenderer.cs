@@ -232,6 +232,7 @@ namespace Freefall.Graphics
             _compositeSnapshotFirstFrame = true;
             CompositeSnapshot?.Dispose();
             CompositeSnapshot = null;
+
             
             // Recreate Hi-Z pyramid to match new depth buffer dimensions
             HiZPyramid?.Dispose();
@@ -982,6 +983,7 @@ namespace Freefall.Graphics
              Transition(list, Composite.Native, ResourceStates.CopySource, ResourceStates.RenderTarget);
              _compositeSnapshotFirstFrame = false;
 
+
              // Depth is in PixelShaderResource — forward objects can sample it via bindless SRV.
              // Transition depth back to DepthWrite so forward objects can depth-test.
              Transition(list, Depth.Native, ResourceStates.PixelShaderResource, ResourceStates.DepthWrite);
@@ -1177,6 +1179,7 @@ namespace Freefall.Graphics
             LightBuffer?.Dispose();
             Composite?.Dispose();
             CompositeSnapshot?.Dispose();
+
             ShadowTextureArray?.Dispose();
             ScreenSpaceShadows?.Dispose();
             Gtao?.Dispose();

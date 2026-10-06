@@ -6,6 +6,65 @@
 // Requires: common.fx (SceneConstants) and sky_common.fx included first.
 // ────────────────────────────────────────────────
 
+// ── Sun shadow (cascaded shadow map) ──
+// The directional light broadcasts these to every effect each frame (DirectionalLight.BroadcastLightParams),
+// and the forward pass puts the shadow map's SRV into push-constant slot 0 of every forward batch
+// (CommandBuffer.Pass.Execute). A water shader therefore only has to name slot 0 'ShadowMapIdx' in its
+// PushConstants and pass it in. Same layout as gbuffer_transparent.fx.
+cbuffer ObjectConstants : register(b1)
+{
+    float3 LightColor;
+    float LightIntensity;
+    float3 LightDirection;
+    float _lightPad0;
+
+    row_major float4x4 LightSpaces[8];   // camera-relative world → light clip space, per cascade
+    float4 Cascades[8];                  // y = far view depth of the cascade
+
+    int CascadeCount;
+    int _lightDebugMode;
+    float2 _lightPad1;
+};
+
+SamplerComparisonState WaterShadowSampler : register(s3);
+
+// Fraction of direct sunlight (0..1) reaching a point on the water: terrain, buildings, trees, piers.
+// Apply it to the sun's radiance only — sky reflection and ambient are not shadowed by the sun.
+//   relPos: surface position relative to the camera,  pixel: SV_Position.xy
+float WaterSunShadow(uint shadowMapIdx, float3 relPos, float2 pixel)
+{
+    if (shadowMapIdx == 0 || CascadeCount <= 0)
+        return 1.0;
+
+    float viewDepth = dot(relPos, float3(View._13, View._23, View._33));
+    if (viewDepth > Cascades[CascadeCount - 1].y)
+        return 1.0;
+
+    int cascadeIndex = CascadeCount - 1;
+    for (int ci = 0; ci < CascadeCount; ci++)
+    {
+        if (viewDepth < Cascades[ci].y)
+        {
+            cascadeIndex = ci;
+            break;
+        }
+    }
+
+    float4 lsPos = mul(float4(relPos, 1.0), LightSpaces[cascadeIndex]);
+    lsPos /= lsPos.w;
+
+    float2 shadowUV = lsPos.xy * 0.5 + 0.5;
+    shadowUV.y = 1.0 - shadowUV.y;
+    if (any(shadowUV < 0.0) || any(shadowUV > 1.0))
+        return 1.0;
+
+    // The flat up vector, not the rippled normal: the bias must not flicker with the waves
+    Texture2DArray shadowMap = ResourceDescriptorHeap[shadowMapIdx];
+    float zScale = abs(LightSpaces[cascadeIndex]._33);
+    return GetShadowFactor(shadowMap, WaterShadowSampler, shadowUV, lsPos.z,
+        cascadeIndex, float3(0, 1, 0), LightDirection, zScale, pixel);
+}
+
 // Fresnel (Schlick, precomputed for F0 = 0.02, roughness = 0.075)
 float WaterFresnel(float NdotV)
 {
@@ -53,6 +112,10 @@ float3 WaterSkyReflection(SamplerState wrapSampler, float3 V, float3 N, float3 r
     return skyRefl * lerp(0.5, 0.85, reflSmooth);
 }
 
+// Screen-space reflections of the scene were tried here (2026-10-05) and removed: marching the depth
+// buffer gives speckle on foliage (pixel-sized gaps make neighbouring rays hit or miss at random),
+// barcode-like stripes from trunks against bright sky, and halos once blurred enough to hide both.
+// Scene reflections are to come from ray tracing instead. See the ocean knowledge doc.
 // GGX sun glitter (widened with distance to keep it from sparkling). F = WaterFresnel(NdotV).
 float3 WaterSunSpecular(float3 N, float3 V, float3 L, float3 sunRadiance, float F, float dist)
 {

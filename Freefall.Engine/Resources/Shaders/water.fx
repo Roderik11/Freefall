@@ -4,9 +4,9 @@
 
 cbuffer PushConstants : register(b3)
 {
-    // Slots 0-1: Reserved for light/composition passes
-    uint _reserved0;
-    uint _reserved1;
+    // Slots 0-1: set by the forward pass for every forward batch
+    uint ShadowMapIdx;              // 0: Shadow cascade array SRV
+    uint _reserved1;                // 1: CompositeSnapshot SRV (taken from WaterData instead)
     // Slots 2-3: PER-DRAW (command signature writes these)
     uint MeshPartId;                // 2: Index into MeshRegistry
     uint InstanceBaseOffset;        // 3: Base offset for instance ID (per-command)
@@ -176,6 +176,7 @@ PSOutput PS(VSOutput input)
     float NdotL = saturate(dot(N, L));
     float3 sunRadiance = water.SunColor * water.SunIntensity;
     sunRadiance *= GetCloudShadow(WaterSampler, worldPos - camPos, L);
+    sunRadiance *= WaterSunShadow(ShadowMapIdx, worldPos - camPos, input.Position.xy);
     float3 skyAmbient = input.SkyAmbient;
 
     // ── Deep water color (same model as the ocean, without the wave-height term) ──
