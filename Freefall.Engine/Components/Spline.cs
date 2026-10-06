@@ -282,6 +282,29 @@ namespace Freefall.Components
             return result;
         }
 
+        /// <summary>
+        /// World-space XZ rectangle (X, Z) around the curve, grown by <paramref name="padding"/> meters.
+        /// False if the spline has no curve yet.
+        /// </summary>
+        public bool TryGetWorldBoundsXZ(float padding, out Vector2 min, out Vector2 max)
+        {
+            min = new Vector2(float.MaxValue);
+            max = new Vector2(float.MinValue);
+            if (Points.Count < 2 || Transform == null) return false;
+
+            int samples = Math.Max(8, TotalSegments);
+            for (int i = 0; i <= samples; i++)
+            {
+                var p = GetWorldPoint((float)i / samples);
+                var xz = new Vector2(p.X, p.Z);
+                min = Vector2.Min(min, xz);
+                max = Vector2.Max(max, xz);
+            }
+            min -= new Vector2(padding);
+            max += new Vector2(padding);
+            return true;
+        }
+
         // ═══════════════════
         // ── Gizmo ──
         // ═══════════════════

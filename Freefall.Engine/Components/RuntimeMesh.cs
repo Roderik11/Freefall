@@ -146,8 +146,14 @@ namespace Freefall.Components
         // matches the scene's stamps) until the GPU bake is read back, so rebuild whenever it is replaced.
         private void OnTerrainHeightsChanged(Message msg)
         {
-            if (HeightMode == RuntimeMeshHeightMode.Surface)
-                Generate();
+            if (HeightMode != RuntimeMeshHeightMode.Surface) return;
+
+            // Heights changed somewhere else on the terrain: the mesh still fits
+            if (msg.Data is TerrainHeightsChange { All: false } change && Spline != null
+                && Spline.TryGetWorldBoundsXZ(Width, out var min, out var max) && !change.Overlaps(min, max))
+                return;
+
+            Generate();
         }
 
         public override void OnMemberChanged()

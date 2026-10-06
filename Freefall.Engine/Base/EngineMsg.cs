@@ -9,7 +9,7 @@ namespace Freefall.Base
         public const string GraphChanged = "GraphChanged";
         public const string PCGExecuted = "PCGExecuted";
         public const string StampChanged = "StampChanged";
-        /// <summary>CPU-side terrain HeightField was replaced (GPU bake readback). Data = Terrain.</summary>
+        /// <summary>CPU-side terrain HeightField was replaced (GPU bake readback). Data = TerrainHeightsChange.</summary>
         public const string TerrainHeightsChanged = "TerrainHeightsChanged";
     }
 }

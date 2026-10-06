@@ -671,7 +671,14 @@ namespace Freefall.Components
             // GPU height layer bake (runs before any heightmap access)
             bool hasHeightWork = Terrain.HeightLayers.Count > 0 || Terrain.Stamps.Count > 0
                                  || ComponentCache<HeightStamp>.All.Count > 0;
-            if (Terrain.ConsumeFlags(TerrainDirtyFlags.HeightBake) && hasHeightWork)
+            bool heightBake = Terrain.ConsumeFlags(TerrainDirtyFlags.HeightBake);
+            if (heightBake)
+            {
+                // A bake nobody gave a region for (first bake, painting, layer edits) may change anything
+                if (!_heightRegionMarked) _heightChangeAll = true;
+                _heightRegionMarked = false;
+            }
+            if (heightBake && hasHeightWork)
             {
                 var baker = _baker;
 
@@ -689,8 +696,10 @@ namespace Freefall.Components
                 }
 
                 var renderer = this;
+                System.Threading.Interlocked.Increment(ref _heightBakesPending);
                 CommandBuffer.Enqueue(RenderPass.Opaque, (list) =>
                 {
+                    System.Threading.Interlocked.Decrement(ref renderer._heightBakesPending);
                     baker.Bake(Terrain, list);
                     _heightRangePyramidBuilt = false; // force rebuild with new heights
                     Terrain.MarkForUpdate(TerrainDirtyFlags.AlbedoBake); // re-bake albedo with new terrain shape
@@ -711,8 +720,20 @@ namespace Freefall.Components
                 if (heights != null && Terrain != null)
                 {
                     Terrain.SetHeightField(heights);
-                    // Surface-snapped geometry (RuntimeMesh) sampled the old heights — let it rebuild
-                    MessageDispatcher.Send(EngineMsg.TerrainHeightsChanged, Terrain);
+                    // Surface-snapped geometry (RuntimeMesh) and projected PCG output sampled the old heights —
+                    // let whatever lies in the changed region rebuild
+                    var change = new TerrainHeightsChange(Terrain, _heightChangeAll, _heightChangeMin, _heightChangeMax);
+
+                    // A bake that is enqueued but has not run yet (at load: this readback is of the cached
+                    // heightmap) still owes its region to the readback that follows it.
+                    if (System.Threading.Volatile.Read(ref _heightBakesPending) == 0)
+                    {
+                        _heightChangeAll = false;
+                        _heightChangeMin = new Vector2(float.MaxValue);
+                        _heightChangeMax = new Vector2(float.MinValue);
+                        SnapshotStampRegions();
+                    }
+                    MessageDispatcher.Send(EngineMsg.TerrainHeightsChanged, change);
                 }
             }
 
@@ -2613,8 +2634,71 @@ namespace Freefall.Components
         /// <summary>Diagnostics: stamp / spline change events that requested a re-bake (editor debug stats).</summary>
         public static int RebakeRequestCount;
 
+        // ── Changed region ──
+        // Listeners of TerrainHeightsChanged (PCG, surface meshes) only rebuild if they touch the region the
+        // stamps changed: where each edited stamp was at the last readback, plus where it is now.
+
+        private readonly Dictionary<TerrainStamp, (Vector2 min, Vector2 max)> _stampRegions = new();
+        private bool _heightChangeAll = true;   // the first bake covers everything
+        private bool _heightRegionMarked;       // a stamp gave a region for the pending bake
+        private int _heightBakesPending;        // bakes enqueued whose render callback has not run yet
+        private Vector2 _heightChangeMin = new(float.MaxValue);
+        private Vector2 _heightChangeMax = new(float.MinValue);
+
+        private static bool TryGetStampRegion(TerrainStamp stamp, out Vector2 min, out Vector2 max)
+        {
+            min = max = default;
+            if (stamp.IsSplineMode && stamp.GetSpline().Points.Count < 2) return false;
+
+            var bounds = stamp.GetWorldBounds();
+            float pad = 2f + (stamp.EnableNoise ? stamp.NoiseAmplitude : 0f);
+            min = new Vector2(bounds.Min.X - pad, bounds.Min.Z - pad);
+            max = new Vector2(bounds.Max.X + pad, bounds.Max.Z + pad);
+            return true;
+        }
+
+        private void GrowHeightChange(Vector2 min, Vector2 max)
+        {
+            _heightChangeMin = Vector2.Min(_heightChangeMin, min);
+            _heightChangeMax = Vector2.Max(_heightChangeMax, max);
+        }
+
+        private void MarkStampRegion(TerrainStamp stamp)
+        {
+            _heightRegionMarked = true;
+
+            if (_stampRegions.TryGetValue(stamp, out var old))
+                GrowHeightChange(old.min, old.max);
+
+            if (TryGetStampRegion(stamp, out var min, out var max))
+            {
+                GrowHeightChange(min, max);
+                _stampRegions[stamp] = (min, max);
+            }
+            else
+            {
+                _heightChangeAll = true;
+            }
+        }
+
+        private void SnapshotStampRegions()
+        {
+            _stampRegions.Clear();
+            foreach (var stamp in ComponentCache<HeightStamp>.All) Snapshot(stamp);
+            foreach (var stamp in ComponentCache<SplatStamp>.All) Snapshot(stamp);
+            foreach (var stamp in ComponentCache<DecoStamp>.All) Snapshot(stamp);
+
+            void Snapshot(TerrainStamp stamp)
+            {
+                if (TryGetStampRegion(stamp, out var min, out var max))
+                    _stampRegions[stamp] = (min, max);
+            }
+        }
+
         private void OnStampChanged(Message msg)
         {
+            if (msg.Data is TerrainStamp stamp) MarkStampRegion(stamp);
+
             RebakeRequestCount++;
             Terrain?.MarkForUpdate(
                 TerrainDirtyFlags.HeightBake |
@@ -2625,8 +2709,15 @@ namespace Freefall.Components
 
         private void OnSplineChanged(Message msg)
         {
-            // Rebake if the changed spline has any sibling stamp component
-            if (msg.Data is Spline spline && spline.Entity?.GetComponent<TerrainStamp>() != null)
+            // Rebake if the changed spline has any sibling stamp component. Components are cached by their
+            // concrete type, so GetComponent<TerrainStamp>() never finds a HeightStamp / SplatStamp / DecoStamp.
+            if (msg.Data is not Spline spline || spline.Entity == null) return;
+
+            bool hasStamp = false;
+            foreach (var component in spline.Entity.Components)
+                if (component is TerrainStamp stamp) { hasStamp = true; MarkStampRegion(stamp); }
+
+            if (hasStamp)
             {
                 RebakeRequestCount++;
                 Terrain?.MarkForUpdate(

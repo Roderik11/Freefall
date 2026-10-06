@@ -34,6 +34,12 @@ namespace Freefall.Components
         /// </summary>
         private Entity? OutputEntity;
 
+        /// <summary>
+        /// Meters around the spline that still count as this component's area when deciding whether a terrain
+        /// change concerns it (points can be offset from the curve by the graph).
+        /// </summary>
+        private const float RegionPadding = 10f;
+
         /// <summary>Diagnostics: total Execute() calls across all PCG components (editor debug stats).</summary>
         public static int ExecuteCount;
 
@@ -122,6 +128,16 @@ namespace Freefall.Components
         private void OnTerrainHeightsChanged(Message msg)
         {
             if (Graph == null || OutputEntity == null) return;
+
+            // Heights changed somewhere else on the terrain: this component's output is still right
+            if (msg.Data is TerrainHeightsChange { All: false } change)
+            {
+                var spline = Entity.GetComponentInChildren<Spline>();
+                if (spline != null && spline.TryGetWorldBoundsXZ(RegionPadding, out var min, out var max)
+                    && !change.Overlaps(min, max))
+                    return;
+            }
+
             foreach (var node in Graph.Nodes)
                 if (node is TerrainProjection) { Invalidate(); return; }
         }
