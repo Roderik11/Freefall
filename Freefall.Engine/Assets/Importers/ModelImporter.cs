@@ -285,8 +285,12 @@ namespace Freefall.Assets.Importers
                         // Check sub-assets first, then AssetDatabase
                         if (!materialLookup.TryGetValue(matName, out matGuid))
                         {
-                            // Resolve by name, but verify it's actually a material
-                            var candidateGuid = AssetDatabase.ResolveGuidByName(matName);
+                            // Resolve by name among materials first: an untyped lookup returns whatever asset
+                            // carries the name, and a mesh or model file of the same name ("Castle Wall 1A1.fbx"
+                            // next to "Castle Wall 1A1.mat") then hid the material and the slot fell back to
+                            // DefaultMaterial.
+                            var candidateGuid = AssetDatabase.ResolveGuidByName(matName, nameof(Graphics.Material))
+                                                ?? AssetDatabase.ResolveGuidByName(matName);
                             if (candidateGuid != null && IsMaterialGuid(candidateGuid))
                                 matGuid = candidateGuid;
                         }
