@@ -186,6 +186,8 @@ namespace Freefall.Components
                 if (splat != null) reference = MathF.Max(reference, splat.Radius);
                 var mesh = Entity.GetComponent<RuntimeMesh>();
                 if (mesh != null) reference = MathF.Max(reference, mesh.Width * 0.5f);
+                var water = Entity.GetComponent<WaterBody>();
+                if (water != null) reference = MathF.Max(reference, water.Width * 0.5f);
             }
             return reference > 0.01f ? reference : 1f;
         }

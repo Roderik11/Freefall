@@ -196,24 +196,13 @@ namespace Freefall.Components
 
         private Mesh GenerateOpen()
         {
-            int totalSamples = Spline.TotalSegments + 1;
-            if (totalSamples < 2) totalSamples = 2;
-
-            // Override resolution with our Smoothness
-            int samples = Spline.SpanCount * Smoothness + 1;
-            if (samples < 2) samples = 2;
-
-            // Sample spline
-            var points = new Vector3[samples];
-            var tangents = new Vector3[samples];
-            var halfWidths = new float[samples];   // Width / 2, scaled by the spline's per-point width
-            for (int i = 0; i < samples; i++)
-            {
-                float t = (float)i / (samples - 1);
-                points[i] = Spline.GetPoint(t);
-                tangents[i] = Spline.GetTangent(t);
-                halfWidths[i] = Width * 0.5f * Spline.GetWidth(t);
-            }
+            // Cross-sections along the spline (Smoothness per span), narrowed on the inside of tight bends
+            var strip = SplineStrip.Sample(Spline, Smoothness, Width);
+            int samples = strip.Count;
+            var points = strip.Points;
+            var tangents = strip.Tangents;
+            var halfWidths = strip.HalfWidths;   // Width / 2, scaled by the spline's per-point width
+            var rights = strip.Rights;
 
             // Apply height mode
             ApplyHeightMode(points);
@@ -221,23 +210,17 @@ namespace Freefall.Components
             // Compute per-edge positions
             var leftPositions = new Vector3[samples];
             var rightPositions = new Vector3[samples];
-            var rights = new Vector3[samples];
 
             for (int i = 0; i < samples; i++)
             {
-                var fwd = tangents[i];
-                var right = Vector3.Normalize(new Vector3(-fwd.Z, 0, fwd.X));
-                rights[i] = right;
-                leftPositions[i] = points[i] - right * halfWidths[i];
-                rightPositions[i] = points[i] + right * halfWidths[i];
+                leftPositions[i] = strip.Left(i);
+                rightPositions[i] = strip.Right(i);
             }
 
             // Center-line arc length for UV mapping
             // Using center-line for both edges avoids shearing on curves.
-            var arcLengths = new float[samples];
-            arcLengths[0] = 0;
-            for (int i = 1; i < samples; i++)
-                arcLengths[i] = arcLengths[i - 1] + Vector3.Distance(points[i], points[i - 1]);
+            strip.RecomputeArcLengths();
+            var arcLengths = strip.ArcLengths;
 
             // ── Per-sample slab height (Height, tapered by Start/EndRamp) ──
             bool extruded = Height > 0.001f;
@@ -386,7 +369,7 @@ namespace Freefall.Components
             // ── Curbs (separate MeshPart, slot 1) ──
             int curbStartIndex = indices.Count;
             if (EnableCurbs)
-                GenerateCurbs(points, rights, arcLengths, halfWidths, verts, norms, uvs, indices);
+                GenerateCurbs(strip, verts, norms, uvs, indices);
 
             if (indices.Count > curbStartIndex)
             {
@@ -407,11 +390,12 @@ namespace Freefall.Components
         /// Each curb is an L-shaped profile: inner wall, top ledge, outer wall.
         /// Curbs sit at surface level and extend upward.
         /// </summary>
-        private void GenerateCurbs(Vector3[] points, Vector3[] rights, float[] arcLengths,
-            float[] halfWidths,
+        private void GenerateCurbs(SplineStrip strip,
             List<Vector3> verts, List<Vector3> norms, List<Vector2> uvs, List<uint> indices)
         {
-            int samples = points.Length;
+            int samples = strip.Count;
+            var rights = strip.Rights;
+            var arcLengths = strip.ArcLengths;
 
             // For each side (left=-1, right=+1)
             for (int side = -1; side <= 1; side += 2)
@@ -425,7 +409,7 @@ namespace Freefall.Components
                     var right = rights[i];
                     outward = right * s; // direction away from road center
 
-                    var innerBot = points[i] + right * (halfWidths[i] * s);
+                    var innerBot = side > 0 ? strip.Right(i) : strip.Left(i);
                     var innerTop = innerBot + Vector3.UnitY * CurbHeight;
                     var outerTop = innerTop + right * (CurbWidth * s);
                     var outerBot = innerBot + right * (CurbWidth * s);
@@ -815,8 +799,8 @@ namespace Freefall.Components
         // ── Mesh Construction ──
         // ═══════════════════════════════════════
 
-        private static Mesh BuildMesh(List<Vector3> verts, List<Vector3> norms,
-            List<Vector2> uvs, List<uint> indices, List<MeshPart> parts)
+        internal static Mesh BuildMesh(List<Vector3> verts, List<Vector3> norms,
+            List<Vector2> uvs, List<uint> indices, List<MeshPart> parts, string namePrefix = "RuntimeMesh_")
         {
             if (verts.Count == 0 || indices.Count == 0) return null;
 
@@ -825,7 +809,7 @@ namespace Freefall.Components
 
             mesh.BoundingBox = ComputeBounds(verts);
             mesh.Guid = Guid.NewGuid().ToString("N");
-            mesh.Name = "RuntimeMesh_" + mesh.Guid;
+            mesh.Name = namePrefix + mesh.Guid;
             mesh.IsDynamic = true;
 
             foreach (var part in parts)
@@ -842,7 +826,7 @@ namespace Freefall.Components
         // ── Ear-Clipping Triangulation ──
         // ═══════════════════════════════════════
 
-        private static List<int> EarClipTriangulate(List<Vector2> polygon)
+        internal static List<int> EarClipTriangulate(List<Vector2> polygon)
         {
             var result = new List<int>();
             if (polygon.Count < 3) return result;
@@ -902,7 +886,7 @@ namespace Freefall.Components
 
         private static float Cross2D(Vector2 a, Vector2 b) => a.X * b.Y - a.Y * b.X;
 
-        private static float GetSignedArea(List<Vector2> poly)
+        internal static float GetSignedArea(List<Vector2> poly)
         {
             float area = 0;
             for (int i = 0; i < poly.Count; i++)

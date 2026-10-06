@@ -79,6 +79,7 @@ struct VSOutput
     float Depth : TEXCOORD2;
     nointerpolation uint InstanceIdx : TEXCOORD3;
     float3 SkyAmbient : TEXCOORD4;     // hemisphere sky ambient (same as composition), constant per frame
+    float3 Flow : TEXCOORD5;           // rivers: xy = world xz direction of the current, z = drop per meter
 };
 
 VSOutput VS(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_InstanceID)
@@ -105,6 +106,11 @@ VSOutput VS(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_InstanceI
 
     float3 worldPos = mul(float4(positions[vertexID], 1.0f), World).xyz;
 
+    // WaterBody stores the current in the normal stream of a river's mesh: xz = direction, y = steepness
+    StructuredBuffer<float3> normals = ResourceDescriptorHeap[part.NormBufferIdx];
+    float3 flow = normals[vertexID];
+    output.Flow = float3(mul(float4(flow.x, 0.0f, flow.z, 0.0f), World).xz, flow.y);
+
     output.WorldPos = worldPos;
     output.UV = uvs[vertexID];
     output.Position = mul(mul(float4(worldPos, 1.0), View), Projection);
@@ -112,14 +118,6 @@ VSOutput VS(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_InstanceI
     output.InstanceIdx = idx;
     output.SkyAmbient = GetSkyColor(float3(0, 1, 0), FogSunDirection) * 0.45 * AmbientScale;
     return output;
-}
-
-// World-space (xz) gradient of a value from its screen-space derivatives
-float2 WorldGradient(float2 dpx, float2 dpy, float dvx, float dvy)
-{
-    float det = dpx.x * dpy.y - dpx.y * dpy.x;
-    if (abs(det) < 1e-10) return 0;
-    return float2(dvx * dpy.y - dvy * dpx.y, dvy * dpx.x - dvx * dpy.x) / det;
 }
 
 struct PSOutput
@@ -142,13 +140,12 @@ PSOutput PS(VSOutput input)
     bool flowing = water.Flowing > 0.5;
 
     // ── Flow frame (rivers) ──
-    // The strip's u coordinate counts meters along the spline, so its gradient is the current's
-    // direction. The surface's own gradient tells how steep this stretch is (rapids).
-    float2 dpx = ddx(worldPos.xz), dpy = ddy(worldPos.xz);
-    float2 gradU = WorldGradient(dpx, dpy, ddx(input.UV.x), ddy(input.UV.x));
-    float2 flowDir = dot(gradU, gradU) > 1e-8 ? normalize(gradU) : float2(1, 0);
+    // The current's direction and how steeply this stretch falls (rapids) come per vertex from the
+    // spline. Screen-space derivatives of the surface would be constant per triangle, and in a bend
+    // the two triangles of a quad differ: that showed as stripes of white water.
+    float2 flowDir = flowing && dot(input.Flow.xy, input.Flow.xy) > 1e-8 ? normalize(input.Flow.xy) : float2(1, 0);
     float2 acrossDir = float2(-flowDir.y, flowDir.x);
-    float steep = flowing ? saturate(length(WorldGradient(dpx, dpy, ddx(worldPos.y), ddy(worldPos.y)))) : 0.0;
+    float steep = flowing ? saturate(input.Flow.z) : 0.0;
 
     // Pattern space: lakes sample in world space; rivers in strip space (u along the flow, v across),
     // scrolled downstream. Strip space bends with the river, so the scroll never shears.
