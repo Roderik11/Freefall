@@ -18,7 +18,6 @@ namespace Freefall.Editor
         public DockGroup? Assets;
         public DockGroup? Settings;
         public DockGroup? Preferences;
-        public DockGroup? Terrain;
         public DockGroup? Scene;
         public ViewportControl? SceneViewport;
         public DockGroup? DebugConsole;
@@ -397,7 +396,6 @@ namespace Freefall.Editor
             AssetBrowser = new AssetBrowserControl();
             AssetBrowser.Size = new Point(200, 200);
             Assets = DockArea.DockContent(Scene!, "Assets", AssetBrowser, DockStyle.Left);
-            Terrain = DockArea.DockContent(Assets!, "Terrain", new TerrainPanel(), DockStyle.Fill);
             var watabou = DockArea.DockContent(Assets!, "Watabou", new WatabouImporterPanel(), DockStyle.Fill);
 
             // Debug placeholder (tab next to assets)

@@ -12,9 +12,18 @@ using Vortice.DXGI;
 namespace Freefall.Assets
 {
     /// <summary>
-    /// GPU-based height layer + stamp compositor. Iterates HeightLayers bottom-to-top,
-    /// then applies Stamps (grouped by brush at dispatch time).
-    /// Output: R16_Float heightmap at configurable resolution.
+    /// GPU compositor for terrain stamps. Turns the stamps that apply to a terrain into its three
+    /// baked results:
+    ///   height   — R16_UNorm heightmap                    (HeightStamp, HeightNoiseStamp, HeightErosionStamp)
+    ///   splat    — packed layer-weight array              (SplatStamp)
+    ///   deco     — decoration control texture             (DecoStamp)
+    ///
+    /// Each bake is two steps. Prepare* runs on the main thread: it collects the stamps in scope, sorts
+    /// them by priority and copies everything the GPU needs into a plan, so the render thread never reads
+    /// a component. Bake* runs inside a render callback and only uploads the plan and dispatches.
+    ///
+    /// A bake always covers the whole terrain. Stamps composite in ascending Priority
+    /// (TerrainStamp.CompareBakeOrder).
     /// </summary>
     public class TerrainBaker : IDisposable
     {
@@ -22,18 +31,18 @@ namespace Freefall.Assets
         private static ComputeShader _cs;
         private static int _kernelClear;
         private static int _kernelImport;
-        private static int _kernelStampGroup;
-        private static int _kernelPaintBrush;
-        private static int _kernelClearDelta;
-        private static int _kernelImportChannel;
-        private static int _kernelPackChannels;
-        private static int _kernelBrushRaycast;
         private static int _kernelNoiseLayer;
         private static int _kernelErosionFilter;
         private static int _kernelInfluenceLayer;
         private static ID3D12Resource _noiseLUTTex;
         private static uint _noiseLUTSRV;
         private static bool _initialized;
+
+        private static ComputeShader _splatCS;
+        private static int _kernelSplatBake;
+        private static ComputeShader _decoCS;
+        private static int _kernelDecoControl;
+        private static bool _coverageInitialized;
 
         // ── Instance: per-terrain GPU resources ──
 
@@ -43,36 +52,33 @@ namespace Freefall.Assets
         private uint _heightSRV;
         private int _currentResolution;
 
-        // Stamp instance upload buffer (reused across groups)
-        private GraphicsBuffer _stampBuffer;
-        private int _stampBufferCapacity;
+        // Upload buffers (reused across bakes)
+        private GraphicsBuffer _heightStampBuffer;
+        private int _heightStampBufferCapacity;
+        private GraphicsBuffer _heightStampSplineBuffer;
+        private int _heightStampSplineCapacity;
 
-        // Brush stroke point upload buffer (reused across strokes)
-        private GraphicsBuffer _strokeBuffer;
-        private int _strokeBufferCapacity;
+        private GraphicsBuffer _splatStampBuffer;
+        private int _splatStampBufferCapacity;
+        private GraphicsBuffer _splatSplineBuffer;
+        private int _splatSplineCapacity;
 
-        // GPU raycast result buffer — written by CS_BrushRaycast, read by CS_PaintBrush
-        private GraphicsBuffer _raycastResultBuffer;
+        private GraphicsBuffer _decoStampBuffer;
+        private int _decoStampBufferCapacity;
+        private GraphicsBuffer _decoSplineBuffer;
+        private int _decoSplineCapacity;
 
-        /// <summary>Which ControlMap category to paint.</summary>
-        public enum ControlMapTarget { Height, Splatmap, Density }
+        /// <summary>Layers a terrain can render: 8 RGBA slices of the packed control array.</summary>
+        public const int MaxLayers = 32;
 
-        /// <summary>GPU struct matching HLSL StampData. 32 bytes.</summary>
-        [StructLayout(LayoutKind.Sequential)]
-        private struct StampDataGPU
-        {
-            public Vector2 Position;
-            public float Radius;
-            public float Strength;
-            public float Falloff;
-            public float Rotation;
-            public uint BrushIdx;
-            public uint BlendMode;
-        }
+        /// <summary>Decorators a terrain can render: slots of the decoration control texture.</summary>
+        public const int MaxDecorators = 32;
+
+        // ── GPU structs ──
 
         /// <summary>GPU struct matching HLSL HeightStampDescriptor. 64 bytes (16 x uint/float).</summary>
         [StructLayout(LayoutKind.Sequential)]
-        private struct HeightStampDescriptorGPU
+        internal struct HeightStampDescriptorGPU
         {
             public Vector2 Center;           // terrain UV center (radial)
             public float Radius;             // UV-space inner radius
@@ -88,21 +94,21 @@ namespace Freefall.Assets
             public float HeightmapStrength;  // normalized strength (worldStrength / maxHeight)
             public float RotationSin;        // sin(entity Y rotation)
             public float RotationCos;        // cos(entity Y rotation)
-            public float _pad0;              // pad to 64 bytes
+            public uint BlendMode;           // HeightBlendMode
         }
 
         /// <summary>GPU struct matching HLSL StampSplinePoint. 16 bytes.</summary>
         [StructLayout(LayoutKind.Sequential)]
-        private struct StampSplinePointGPU
+        internal struct StampSplinePointGPU
         {
             public Vector2 UV;       // terrain UV position
             public float Height;     // normalized [0..1]
             public float HalfWidth;  // UV-space half-width
         }
 
-        /// <summary>GPU struct matching HLSL SplatStampDescriptor. 48 bytes.</summary>
+        /// <summary>GPU struct matching HLSL CoverageStamp (terrain_coverage.hlsli). 80 bytes.</summary>
         [StructLayout(LayoutKind.Sequential)]
-        private struct SplatStampDescriptorGPU
+        internal struct CoverageStampGPU
         {
             public Vector2 Center;
             public float Radius;
@@ -112,60 +118,18 @@ namespace Freefall.Assets
             public float NoiseFreq;
             public float NoiseAmp;
             public uint NoiseSeed;
-            public uint TargetLayer;
+            public uint Flags;               // CoverageGlobal | CoverageFilter | (op << 8)
+            public uint Target;              // layer channel / decorator slot (AllTargets = every one)
             public float Strength;
-            public uint _pad;
+            public float HeightMin, HeightMax, HeightBlend;
+            public float SlopeMin, SlopeMax, SlopeBlend;
+            public uint RequireMask;
+            public uint ExcludeMask;
         }
 
-        /// <summary>GPU struct matching HLSL DecoStampDescriptor. 48 bytes.</summary>
-        [StructLayout(LayoutKind.Sequential)]
-        private struct DecoStampDescriptorGPU
-        {
-            public Vector2 Center;
-            public float Radius;
-            public float Falloff;
-            public uint SplinePointOffset;
-            public uint SplinePointCount;
-            public float NoiseFreq;
-            public float NoiseAmp;
-            public uint NoiseSeed;
-            public float Density;
-            public uint _pad0;
-            public uint _pad1;
-        }
-
-        // ── HeightStamp buffers (reused across bakes) ──
-        private GraphicsBuffer _heightStampBuffer;
-        private int _heightStampBufferCapacity;
-        private GraphicsBuffer _heightStampSplineBuffer;
-        private int _heightStampSplineCapacity;
-
-        // ── SplatStamp / DecoStamp overlay ──
-        private static ComputeShader _overlayCS;
-        private static int _kernelSplatStamp;
-        private static int _kernelDecoStamp;
-        private static int _kernelProceduralMask;
-        private static bool _overlayInitialized;
-
-        private GraphicsBuffer _splatStampBuffer;
-        private int _splatStampBufferCapacity;
-        private GraphicsBuffer _splatStampSplineBuffer;
-        private int _splatStampSplineCapacity;
-
-        private GraphicsBuffer _decoStampBuffer;
-        private int _decoStampBufferCapacity;
-        private GraphicsBuffer _decoStampSplineBuffer;
-        private int _decoStampSplineCapacity;
-
-        private static void EnsureOverlayInitialized()
-        {
-            if (_overlayInitialized) return;
-            _overlayCS = new ComputeShader("terrain_stamp_overlay.hlsl");
-            _kernelProceduralMask = _overlayCS.FindKernel("CS_ProceduralMask");
-            _kernelSplatStamp = _overlayCS.FindKernel("CS_SplatStamp");
-            _kernelDecoStamp = _overlayCS.FindKernel("CS_DecoStamp");
-            _overlayInitialized = true;
-        }
+        private const uint CoverageGlobal = 1u;
+        private const uint CoverageFilter = 2u;
+        private const uint AllTargets = 0xFFFFFFFFu;
 
         private static void EnsureInitialized()
         {
@@ -173,62 +137,315 @@ namespace Freefall.Assets
             _cs = new ComputeShader("terrain_height_bake.hlsl");
             _kernelClear = _cs.FindKernel("CS_Clear");
             _kernelImport = _cs.FindKernel("CS_ImportLayer");
-            _kernelStampGroup = _cs.FindKernel("CS_StampGroup");
-            _kernelPaintBrush = _cs.FindKernel("CS_PaintBrush");
-            _kernelClearDelta = _cs.FindKernel("CS_ClearDelta");
-            _kernelImportChannel = _cs.FindKernel("CS_ImportChannel");
-            _kernelPackChannels = _cs.FindKernel("CS_PackChannels");
-            _kernelBrushRaycast = _cs.FindKernel("CS_BrushRaycast");
             _kernelNoiseLayer = _cs.FindKernel("CS_NoiseLayer");
             _kernelErosionFilter = _cs.FindKernel("CS_ErosionFilter");
             _kernelInfluenceLayer = _cs.FindKernel("CS_InfluenceLayer");
             _initialized = true;
         }
 
-        /// <summary>
-        /// Bake all HeightLayers + Stamps into the terrain's BakedHeightmap.
-        /// </summary>
-        public void Bake(Terrain terrain, ID3D12GraphicsCommandList cmd)
+        private static void EnsureCoverageInitialized()
         {
-            var heightStamps = ComponentCache<HeightStamp>.All;
-            bool hasStamps = heightStamps.Count > 0;
-            if (terrain.HeightLayers.Count == 0 && terrain.Stamps.Count == 0 && !hasStamps) return;
+            if (_coverageInitialized) return;
+            _splatCS = new ComputeShader("terrain_splat_bake.hlsl");
+            _kernelSplatBake = _splatCS.FindKernel("CS_SplatBake");
+            _decoCS = new ComputeShader("decoration_prepass.hlsl");
+            _kernelDecoControl = _decoCS.FindKernel("CSBuildDecoControl");
+            _coverageInitialized = true;
+        }
+
+        // ═══════════════════════════════════════════════════════════════════
+        // ── Stamp collection ──
+        // ═══════════════════════════════════════════════════════════════════
+
+        /// <summary>
+        /// The stamps of one type that take part in a terrain's bake, in bake order.
+        /// </summary>
+        public static List<T> CollectStamps<T>(TerrainRenderer renderer) where T : TerrainStamp
+        {
+            var result = new List<T>();
+            var all = ComponentCache<T>.All;
+            for (int i = 0; i < all.Count; i++)
+            {
+                var stamp = all[i];
+                if (stamp != null && stamp.AppliesTo(renderer))
+                    result.Add(stamp);
+            }
+            result.Sort(TerrainStamp.CompareBakeOrder);
+            return result;
+        }
+
+        // ═══════════════════════════════════════════════════════════════════
+        // ── Height ──
+        // ═══════════════════════════════════════════════════════════════════
+
+        internal enum HeightStepKind { Influence, Import, Noise, Erosion }
+
+        internal struct HeightStep
+        {
+            public HeightStepKind Kind;
+
+            // Influence: a run of descriptors
+            public int Start, Count;
+
+            // Import / Noise / Erosion
+            public uint BlendMode;
+            public float Opacity;
+
+            // Import
+            public uint SourceSrv;
+            public float Scale, Bias;
+
+            // Noise
+            public uint NoiseType, Octaves, Seed, TerraceSteps;
+            public float Frequency, Amplitude, Lacunarity, Persistence, TerraceSmoothness;
+            public Vector2 Offset, MaskCenter;
+            public float MaskRadius, MaskFalloff;
+
+            // Erosion
+            public float EroScale, EroStrength, EroGullyWeight, EroDetail, EroLacunarity, EroGain, EroCellScale;
+            public float EroNormalization, EroRidgeRounding, EroCreaseRounding, EroSlopeOnset;
+            public float EroAssumedSlope, EroAssumedSlopeAmount;
+            public uint EroOctaves;
+        }
+
+        /// <summary>Everything a height bake needs, captured on the main thread.</summary>
+        public sealed class HeightPlan
+        {
+            internal readonly List<HeightStep> Steps = new();
+            internal readonly List<HeightStampDescriptorGPU> Descriptors = new();
+            internal readonly List<StampSplinePointGPU> SplinePoints = new();
+            internal int Resolution;
+
+            /// <summary>True if any stamp contributes; a bake without work is skipped so a terrain
+            /// with no height stamps keeps the heightmap it was saved with.</summary>
+            public bool HasWork => Steps.Count > 0;
+        }
+
+        /// <summary>
+        /// Collect the height stamps that apply to the terrain and lay out the bake: consecutive
+        /// HeightStamps become one dispatch, and every whole-terrain operation (import, noise, erosion)
+        /// is a dispatch of its own at its place in the priority order. Main thread.
+        /// </summary>
+        public HeightPlan PrepareHeight(Terrain terrain, TerrainRenderer renderer)
+        {
+            var plan = new HeightPlan { Resolution = terrain.EffectiveHeightmapResolution };
+
+            var stamps = new List<TerrainStamp>();
+            stamps.AddRange(CollectStamps<HeightStamp>(renderer));
+            stamps.AddRange(CollectStamps<HeightNoiseStamp>(renderer));
+            stamps.AddRange(CollectStamps<HeightErosionStamp>(renderer));
+            stamps.Sort(TerrainStamp.CompareBakeOrder);
+
+            var terrainSize = terrain.TerrainSize;
+            float maxHeight = terrain.MaxHeight;
+            float uvScale = 1f / Math.Max(terrainSize.X, terrainSize.Y);
+            var terrainOrigin = renderer.Transform?.WorldPosition ?? Vector3.Zero;
+
+            int runStart = 0;
+            void CloseRun()
+            {
+                int count = plan.Descriptors.Count - runStart;
+                if (count > 0)
+                    plan.Steps.Add(new HeightStep { Kind = HeightStepKind.Influence, Start = runStart, Count = count });
+                runStart = plan.Descriptors.Count;
+            }
+
+            foreach (var stamp in stamps)
+            {
+                switch (stamp)
+                {
+                    case HeightStamp height when height.IsGlobal:
+                    {
+                        // Whole-terrain import: nothing to do without a heightmap
+                        if (height.Heightmap == null || height.Heightmap.BindlessIndex == 0) break;
+                        CloseRun();
+                        // World Y, as the target height of a local stamp (see TryBuildHeightDescriptor)
+                        float baseY = (height.Transform?.WorldPosition.Y ?? 0f) + height.HeightOffset;
+                        plan.Steps.Add(new HeightStep
+                        {
+                            Kind = HeightStepKind.Import,
+                            BlendMode = (uint)HeightBlendMode.Set,
+                            Opacity = 1f,
+                            SourceSrv = height.Heightmap.BindlessIndex,
+                            Scale = height.Strength / maxHeight * (height.InvertShape ? -1f : 1f),
+                            Bias = baseY / maxHeight,
+                        });
+                        break;
+                    }
+
+                    case HeightStamp height:
+                        if (TryBuildHeightDescriptor(height, terrainOrigin, terrainSize, maxHeight, plan.SplinePoints, out var desc))
+                            plan.Descriptors.Add(desc);
+                        break;
+
+                    case HeightNoiseStamp noise:
+                    {
+                        CloseRun();
+                        var step = new HeightStep
+                        {
+                            Kind = HeightStepKind.Noise,
+                            BlendMode = (uint)noise.BlendMode,
+                            Opacity = noise.Opacity,
+                            NoiseType = (uint)noise.Type,
+                            Octaves = (uint)Math.Clamp(noise.Octaves, 1, 12),
+                            Frequency = noise.Frequency,
+                            Amplitude = noise.Amplitude,
+                            Lacunarity = noise.Lacunarity,
+                            Persistence = noise.Persistence,
+                            Offset = noise.Offset,
+                            Seed = (uint)noise.Seed,
+                            TerraceSteps = (uint)Math.Max(0, noise.TerraceSteps),
+                            TerraceSmoothness = noise.TerraceSmoothness,
+                        };
+                        if (!noise.IsGlobal)
+                        {
+                            // Radial fade around the entity: full strength at the centre, gone at Radius + Falloff.
+                            // The kernel's mask is 1 - (dist / radius)^exponent; a short falloff means a hard edge.
+                            var center = noise.Transform?.WorldPosition ?? Vector3.Zero;
+                            float extent = noise.Radius + noise.Falloff;
+                            step.MaskCenter = new Vector2(
+                                (center.X - terrainOrigin.X) / terrainSize.X,
+                                (center.Z - terrainOrigin.Z) / terrainSize.Y);
+                            step.MaskRadius = Math.Max(extent, 0.01f) * uvScale;
+                            step.MaskFalloff = Math.Clamp(2f * extent / Math.Max(noise.Falloff, 0.01f), 1f, 64f);
+                        }
+                        plan.Steps.Add(step);
+                        break;
+                    }
+
+                    case HeightErosionStamp erosion:
+                        CloseRun();
+                        plan.Steps.Add(new HeightStep
+                        {
+                            Kind = HeightStepKind.Erosion,
+                            BlendMode = (uint)erosion.BlendMode,
+                            Opacity = erosion.Opacity,
+                            EroScale = erosion.Scale,
+                            EroStrength = erosion.Strength,
+                            EroGullyWeight = erosion.GullyWeight,
+                            EroDetail = erosion.Detail,
+                            EroLacunarity = erosion.Lacunarity,
+                            EroGain = erosion.Gain,
+                            EroCellScale = erosion.CellScale,
+                            EroOctaves = (uint)Math.Clamp(erosion.Octaves, 1, 8),
+                            EroNormalization = erosion.Normalization,
+                            EroRidgeRounding = erosion.RidgeRounding,
+                            EroCreaseRounding = erosion.CreaseRounding,
+                            EroSlopeOnset = erosion.SlopeOnset,
+                            EroAssumedSlope = erosion.AssumedSlope,
+                            EroAssumedSlopeAmount = erosion.AssumedSlopeAmount,
+                        });
+                        break;
+                }
+            }
+            CloseRun();
+
+            return plan;
+        }
+
+        private static bool TryBuildHeightDescriptor(HeightStamp stamp, Vector3 terrainOrigin, Vector2 terrainSize,
+            float maxHeight, List<StampSplinePointGPU> splinePoints, out HeightStampDescriptorGPU desc)
+        {
+            desc = new HeightStampDescriptorGPU();
+            float uvScale = 1f / Math.Max(terrainSize.X, terrainSize.Y);
+
+            desc.InvertShape = stamp.InvertShape ? 1u : 0u;
+            desc.Falloff = stamp.Falloff * uvScale;
+            desc.BlendMode = (uint)stamp.BlendMode;
+
+            // Add raises the ground by an amount, so where the entity sits vertically must not count
+            bool relative = stamp.BlendMode == HeightBlendMode.Add;
+
+            if (stamp.EnableNoise)
+            {
+                desc.NoiseFreq = stamp.NoiseFrequency;
+                desc.NoiseAmp = stamp.NoiseAmplitude * uvScale;
+                desc.NoiseSeed = (uint)stamp.NoiseSeed;
+            }
+
+            if (stamp.IsSplineMode)
+            {
+                if (!BuildSplinePoints(stamp, terrainOrigin, terrainSize, maxHeight, stamp.HeightOffset, splinePoints,
+                        out desc.SplinePointOffset, out desc.SplinePointCount, out desc.Radius, useWorldY: !relative))
+                    return false;
+
+                desc.TargetHeight = 0;
+                desc.Center = Vector2.Zero;
+            }
+            else
+            {
+                var center = stamp.Transform?.WorldPosition ?? Vector3.Zero;
+                desc.Center = new Vector2(
+                    (center.X - terrainOrigin.X) / terrainSize.X,
+                    (center.Z - terrainOrigin.Z) / terrainSize.Y);
+                desc.Radius = stamp.Radius * uvScale;
+                desc.TargetHeight = ((relative ? 0f : center.Y) + stamp.HeightOffset) / maxHeight;
+                desc.SplinePointOffset = 0xFFFFFFFF;
+                desc.SplinePointCount = 0;
+            }
+
+            if (stamp.Heightmap != null)
+            {
+                desc.HeightmapIdx = stamp.Heightmap.BindlessIndex;
+                desc.HeightmapStrength = stamp.Strength / maxHeight;
+
+                // Extract Y rotation from entity transform
+                var rot = stamp.Transform?.Rotation ?? Quaternion.Identity;
+                float yaw = MathF.Atan2(2f * (rot.W * rot.Y + rot.X * rot.Z),
+                                        1f - 2f * (rot.Y * rot.Y + rot.Z * rot.Z));
+                desc.RotationSin = MathF.Sin(yaw);
+                desc.RotationCos = MathF.Cos(yaw);
+            }
+
+            return true;
+        }
+
+        /// <summary>
+        /// Run a height plan: clear, then one dispatch per step, into the terrain's BakedHeightmap.
+        /// Render callback.
+        /// </summary>
+        public void BakeHeight(Terrain terrain, HeightPlan plan, ID3D12GraphicsCommandList cmd)
+        {
+            if (plan == null || !plan.HasWork) return;
 
             EnsureInitialized();
-            EnsureTexture(terrain.EffectiveHeightmapResolution);
+            EnsureTexture(plan.Resolution);
 
             var device = Engine.Device;
             cmd.SetComputeRootSignature(device.GlobalRootSignature);
             cmd.SetDescriptorHeaps(1, new[] { device.SrvHeap });
 
-            int res = terrain.EffectiveHeightmapResolution;
-            uint groups = (uint)((res + 7) / 8);
+            uint groups = (uint)((plan.Resolution + 7) / 8);
 
-            // Phase 1: Clear
+            // Every influence run of this bake shares one upload: each dispatch reads its own range.
+            // (An upload buffer rewritten between dispatches of one command list would show every
+            // dispatch the last write.)
+            if (plan.Descriptors.Count > 0)
+            {
+                EnsureUpload<HeightStampDescriptorGPU>(ref _heightStampBuffer, ref _heightStampBufferCapacity, plan.Descriptors.Count, 16);
+                Upload(_heightStampBuffer, plan.Descriptors);
+            }
+            if (plan.SplinePoints.Count > 0)
+            {
+                EnsureUpload<StampSplinePointGPU>(ref _heightStampSplineBuffer, ref _heightStampSplineCapacity, plan.SplinePoints.Count, 128);
+                Upload(_heightStampSplineBuffer, plan.SplinePoints);
+            }
+
             _cs.SetPushConstant(_kernelClear, "Output", _heightUAV);
             _cs.Dispatch(_kernelClear, cmd, groups, groups);
             cmd.ResourceBarrierUnorderedAccessView(_heightTexture);
 
-            // Phase 2: Height layers (bottom-to-top)
-            foreach (var layer in terrain.HeightLayers)
+            foreach (var step in plan.Steps)
             {
-                if (!layer.Enabled) continue;
-                if (layer is ImportHeightLayer import)
-                    DispatchImport(cmd, import, groups);
-                else if (layer is PaintHeightLayer paint)
-                    DispatchPaint(cmd, paint, res, groups);
-                else if (layer is NoiseHeightLayer noise)
-                    DispatchNoise(cmd, noise, groups);
-                else if (layer is ErosionHeightLayer erosion)
-                    DispatchErosion(cmd, erosion, res, groups);
+                switch (step.Kind)
+                {
+                    case HeightStepKind.Influence: DispatchInfluence(cmd, plan, step, groups); break;
+                    case HeightStepKind.Import:    DispatchImport(cmd, step, groups); break;
+                    case HeightStepKind.Noise:     DispatchNoise(cmd, step, groups); break;
+                    case HeightStepKind.Erosion:   DispatchErosion(cmd, step, groups); break;
+                }
+                cmd.ResourceBarrierUnorderedAccessView(_heightTexture);
             }
-
-            // Phase 3: Stamps (after layers)
-            DispatchStamps(cmd, terrain.Stamps, groups);
-
-            // Phase 4: Height stamps (roads, rivers, buildings — after all layers + stamps)
-            if (hasStamps)
-                DispatchHeightStamps(cmd, terrain, heightStamps, groups);
 
             // Transition heightmap from UAV back to Common so it can be
             // implicitly promoted to SRV by the height-range pyramid builder
@@ -240,148 +457,97 @@ namespace Freefall.Assets
             terrain.BakedHeightmap = Texture.WrapNative(_heightTexture, _heightSRV);
         }
 
-        private void DispatchImport(ID3D12GraphicsCommandList cmd, ImportHeightLayer layer, uint groups)
+        private void DispatchInfluence(ID3D12GraphicsCommandList cmd, HeightPlan plan, in HeightStep step, uint groups)
         {
-            if (layer.Source == null) return;
-
-            _cs.SetPushConstant(_kernelImport, "Source", layer.Source.BindlessIndex);
-            _cs.SetPushConstant(_kernelImport, "Output", _heightUAV);
-            _cs.SetPushConstant(_kernelImport, "BlendMode", (uint)layer.BlendMode);
-            _cs.SetParam(_kernelImport, "Opacity", layer.Opacity);
-            _cs.Dispatch(_kernelImport, cmd, groups, groups);
-            cmd.ResourceBarrierUnorderedAccessView(_heightTexture);
+            var k = _kernelInfluenceLayer;
+            _cs.SetPushConstant(k, "Output", _heightUAV);
+            _cs.SetBuffer(k, "StampBuf", _heightStampBuffer);
+            _cs.SetPushConstant(k, "StampStart", (uint)step.Start);
+            _cs.SetPushConstant(k, "StampCount", (uint)step.Count);
+            // BrushRadius carries the spline point buffer's SRV index in this kernel
+            _cs.SetPushConstant(k, "BrushRadius",
+                plan.SplinePoints.Count > 0 && _heightStampSplineBuffer != null ? _heightStampSplineBuffer.SrvIndex : 0u);
+            _cs.Dispatch(k, cmd, groups, groups);
         }
 
-        private void DispatchPaint(ID3D12GraphicsCommandList cmd, PaintHeightLayer layer, int resolution, uint groups)
+        private void DispatchImport(ID3D12GraphicsCommandList cmd, in HeightStep step, uint groups)
         {
-            if (layer.ControlMap == null || layer.ControlMap.BindlessIndex == 0) return;
-
-
-            _cs.SetPushConstant(_kernelImport, "Source", layer.ControlMap.BindlessIndex);
-            _cs.SetPushConstant(_kernelImport, "Output", _heightUAV);
-            _cs.SetPushConstant(_kernelImport, "BlendMode", (uint)layer.BlendMode);
-            _cs.SetParam(_kernelImport, "Opacity", layer.Opacity);
-            _cs.Dispatch(_kernelImport, cmd, groups, groups);
-            cmd.ResourceBarrierUnorderedAccessView(_heightTexture);
+            var k = _kernelImport;
+            _cs.SetPushConstant(k, "Source", step.SourceSrv);
+            _cs.SetPushConstant(k, "Output", _heightUAV);
+            _cs.SetPushConstant(k, "BlendMode", step.BlendMode);
+            _cs.SetParam(k, "Opacity", step.Opacity);
+            _cs.SetParam(k, "Amplitude", step.Scale);
+            _cs.SetParam(k, "BrushTargetHeight", step.Bias);
+            _cs.Dispatch(k, cmd, groups, groups);
         }
 
-        /// <summary>
-        /// Dispatches all stamps in a single compute pass.
-        /// Each stamp carries its own brush index and blend mode in the structured buffer.
-        /// </summary>
-        private void DispatchStamps(ID3D12GraphicsCommandList cmd, List<Stamp> stamps, uint groups)
-        {
-            // Collect enabled stamps with valid brushes
-            int count = 0;
-            foreach (var s in stamps)
-            {
-                if (s.Enabled && s.Brush != null)
-                    count++;
-            }
-            if (count == 0) return;
-
-            // Upload all stamp data in one pass
-            EnsureStampBuffer(count);
-            unsafe
-            {
-                var dst = _stampBuffer.WritePtr<StampDataGPU>();
-                int idx = 0;
-                foreach (var s in stamps)
-                {
-                    if (!s.Enabled || s.Brush == null) continue;
-                    dst[idx++] = new StampDataGPU
-                    {
-                        Position = s.Position,
-                        Radius = s.Radius,
-                        Strength = s.Strength,
-                        Falloff = s.Falloff,
-                        Rotation = s.Rotation,
-                        BrushIdx = s.Brush.BindlessIndex,
-                        BlendMode = (uint)s.BlendMode,
-                    };
-                }
-            }
-
-            // Single dispatch — blend mode is per-stamp in the buffer
-            _cs.SetPushConstant(_kernelStampGroup, "Output", _heightUAV);
-            _cs.SetBuffer(_kernelStampGroup, "StampBuf", _stampBuffer);
-            _cs.SetPushConstant(_kernelStampGroup, "StampCount", (uint)count);
-            _cs.Dispatch(_kernelStampGroup, cmd, groups, groups);
-            cmd.ResourceBarrierUnorderedAccessView(_heightTexture);
-        }
-
-        private void DispatchNoise(ID3D12GraphicsCommandList cmd, NoiseHeightLayer layer, uint groups)
+        private void DispatchNoise(ID3D12GraphicsCommandList cmd, in HeightStep step, uint groups)
         {
             EnsureNoiseLUT();
 
-            _cs.SetPushConstant(_kernelNoiseLayer, "Output", _heightUAV);
-            _cs.SetPushConstant(_kernelNoiseLayer, "BlendMode", (uint)layer.BlendMode);
-            _cs.SetParam(_kernelNoiseLayer, "Opacity", layer.Opacity);
-            _cs.SetPushConstant(_kernelNoiseLayer, "NoiseType", (uint)layer.Type);
-            _cs.SetPushConstant(_kernelNoiseLayer, "Octaves", (uint)layer.Octaves);
-            _cs.SetParam(_kernelNoiseLayer, "Frequency", layer.Frequency);
-            _cs.SetParam(_kernelNoiseLayer, "Amplitude", layer.Amplitude);
-            _cs.SetParam(_kernelNoiseLayer, "Lacunarity", layer.Lacunarity);
-            _cs.SetParam(_kernelNoiseLayer, "Persistence", layer.Persistence);
-            _cs.SetParam(_kernelNoiseLayer, "OffsetX", layer.Offset.X);
-            _cs.SetParam(_kernelNoiseLayer, "OffsetY", layer.Offset.Y);
-            _cs.SetPushConstant(_kernelNoiseLayer, "NoiseSeed", (uint)layer.Seed);
+            var k = _kernelNoiseLayer;
+            _cs.SetPushConstant(k, "Output", _heightUAV);
+            _cs.SetPushConstant(k, "BlendMode", step.BlendMode);
+            _cs.SetParam(k, "Opacity", step.Opacity);
+            _cs.SetPushConstant(k, "NoiseType", step.NoiseType);
+            _cs.SetPushConstant(k, "Octaves", step.Octaves);
+            _cs.SetParam(k, "Frequency", step.Frequency);
+            _cs.SetParam(k, "Amplitude", step.Amplitude);
+            _cs.SetParam(k, "Lacunarity", step.Lacunarity);
+            _cs.SetParam(k, "Persistence", step.Persistence);
+            _cs.SetParam(k, "OffsetX", step.Offset.X);
+            _cs.SetParam(k, "OffsetY", step.Offset.Y);
+            _cs.SetPushConstant(k, "NoiseSeed", step.Seed);
             // Bind noise LUT SRV via the ErosionMode slot (aliased as NoiseLUTIdx in shader)
-            _cs.SetPushConstant(_kernelNoiseLayer, "ErosionMode", _noiseLUTSRV);
-            // Terrace params
-            _cs.SetPushConstant(_kernelNoiseLayer, "TerraceSteps", (uint)layer.TerraceSteps);
-            _cs.SetParam(_kernelNoiseLayer, "TerraceSmoothness", layer.TerraceSmoothness);
-            // Spatial mask params
-            _cs.SetParam(_kernelNoiseLayer, "MaskCenterX", layer.MaskCenter.X);
-            _cs.SetParam(_kernelNoiseLayer, "MaskCenterY", layer.MaskCenter.Y);
-            _cs.SetParam(_kernelNoiseLayer, "MaskRadius", layer.MaskRadius);
-            _cs.SetParam(_kernelNoiseLayer, "MaskFalloff", layer.MaskFalloff);
-            _cs.Dispatch(_kernelNoiseLayer, cmd, groups, groups);
-            cmd.ResourceBarrierUnorderedAccessView(_heightTexture);
+            _cs.SetPushConstant(k, "ErosionMode", _noiseLUTSRV);
+            _cs.SetPushConstant(k, "TerraceSteps", step.TerraceSteps);
+            _cs.SetParam(k, "TerraceSmoothness", step.TerraceSmoothness);
+            // Spatial mask (radius 0 = whole terrain)
+            _cs.SetParam(k, "MaskCenterX", step.MaskCenter.X);
+            _cs.SetParam(k, "MaskCenterY", step.MaskCenter.Y);
+            _cs.SetParam(k, "MaskRadius", step.MaskRadius);
+            _cs.SetParam(k, "MaskFalloff", step.MaskFalloff);
+            _cs.Dispatch(k, cmd, groups, groups);
         }
 
-        private void DispatchErosion(ID3D12GraphicsCommandList cmd, ErosionHeightLayer layer, int resolution, uint groups)
+        private void DispatchErosion(ID3D12GraphicsCommandList cmd, in HeightStep step, uint groups)
         {
             // Single-dispatch erosion filter — read accumulated height, write eroded result directly
             var k = _kernelErosionFilter;
 
             _cs.SetPushConstant(k, "Source", _heightSRV);
             _cs.SetPushConstant(k, "Output", _heightUAV);
-            _cs.SetPushConstant(k, "BlendMode", (uint)layer.BlendMode);
-            _cs.SetParam(k, "Opacity", layer.Opacity);
+            _cs.SetPushConstant(k, "BlendMode", step.BlendMode);
+            _cs.SetParam(k, "Opacity", step.Opacity);
 
             // Core erosion params (aliased onto existing push constant slots)
-            _cs.SetParam(k, "BrushRadius", layer.Scale);           // EFScale
-            _cs.SetParam(k, "Frequency", layer.Strength);          // EFStrength
-            _cs.SetParam(k, "Amplitude", layer.GullyWeight);       // EFGullyWeight
-            _cs.SetParam(k, "Lacunarity", layer.Detail);           // EFDetail
-            _cs.SetParam(k, "Persistence", layer.Lacunarity);      // EFLacunarity
-            _cs.SetParam(k, "OffsetX", layer.Gain);                // EFGain
-            _cs.SetParam(k, "OffsetY", layer.CellScale);           // EFCellScale
-            _cs.SetPushConstant(k, "NoiseSeed", (uint)layer.Octaves); // EFOctaves
+            _cs.SetParam(k, "BrushRadius", step.EroScale);          // EFScale
+            _cs.SetParam(k, "Frequency", step.EroStrength);         // EFStrength
+            _cs.SetParam(k, "Amplitude", step.EroGullyWeight);      // EFGullyWeight
+            _cs.SetParam(k, "Lacunarity", step.EroDetail);          // EFDetail
+            _cs.SetParam(k, "Persistence", step.EroLacunarity);     // EFLacunarity
+            _cs.SetParam(k, "OffsetX", step.EroGain);               // EFGain
+            _cs.SetParam(k, "OffsetY", step.EroCellScale);          // EFCellScale
+            _cs.SetPushConstant(k, "NoiseSeed", step.EroOctaves);   // EFOctaves
 
             // Float values sent through uint slots — reinterpret bits
-            unsafe
-            {
-                float normVal = layer.Normalization;
-                float ridgeVal = layer.RidgeRounding;
-                _cs.SetPushConstant(k, "ErosionMode", *(uint*)&normVal);    // EFNormalization
-                _cs.SetPushConstant(k, "TerraceSteps", *(uint*)&ridgeVal);  // EFRidgeRounding
-            }
+            _cs.SetPushConstant(k, "ErosionMode", BitConverter.SingleToUInt32Bits(step.EroNormalization));   // EFNormalization
+            _cs.SetPushConstant(k, "TerraceSteps", BitConverter.SingleToUInt32Bits(step.EroRidgeRounding)); // EFRidgeRounding
 
-            _cs.SetParam(k, "TerraceSmoothness", layer.CreaseRounding);  // EFCreaseRounding
-            _cs.SetParam(k, "MaskCenterX", 0.1f);                        // EFRoundInputMul
-            _cs.SetParam(k, "MaskCenterY", 2.0f);                        // EFRoundOctMul (= lacunarity)
-            _cs.SetParam(k, "MaskRadius", layer.SlopeOnset);             // EFOnsetInput
-            _cs.SetParam(k, "MaskFalloff", layer.SlopeOnset);            // EFOnsetOctave
+            _cs.SetParam(k, "TerraceSmoothness", step.EroCreaseRounding);  // EFCreaseRounding
+            _cs.SetParam(k, "MaskCenterX", 0.1f);                          // EFRoundInputMul
+            _cs.SetParam(k, "MaskCenterY", 2.0f);                          // EFRoundOctMul (= lacunarity)
+            _cs.SetParam(k, "MaskRadius", step.EroSlopeOnset);             // EFOnsetInput
+            _cs.SetParam(k, "MaskFalloff", step.EroSlopeOnset);            // EFOnsetOctave
 
             // Assumed slope override
-            _cs.SetParam(k, "BrushFalloff", layer.AssumedSlope);         // EFAssumedVal
-            _cs.SetParam(k, "BrushTargetHeight", layer.AssumedSlopeAmount); // EFAssumedAmt
+            _cs.SetParam(k, "BrushFalloff", step.EroAssumedSlope);             // EFAssumedVal
+            _cs.SetParam(k, "BrushTargetHeight", step.EroAssumedSlopeAmount);  // EFAssumedAmt
 
             _cs.Dispatch(k, cmd, groups, groups);
-            cmd.ResourceBarrierUnorderedAccessView(_heightTexture);
         }
+
 
         // ── Noise LUT generation ──────────────────────────────────────────
 
@@ -574,15 +740,6 @@ namespace Freefall.Assets
             return result * 0.5f + 0.5f; // map [-1,1] → [0,1]
         }
 
-        private void EnsureStampBuffer(int requiredCount)
-        {
-            if (_stampBuffer != null && _stampBufferCapacity >= requiredCount) return;
-
-            _stampBuffer?.Dispose();
-            _stampBufferCapacity = Math.Max(requiredCount, 64); // min 64 to reduce reallocs
-            _stampBuffer = GraphicsBuffer.CreateUpload<StampDataGPU>(_stampBufferCapacity, mapped: true);
-        }
-
         private void EnsureTexture(int resolution)
         {
             if (_heightTexture != null && _currentResolution == resolution)
@@ -619,294 +776,6 @@ namespace Freefall.Assets
             device.NativeDevice.CreateShaderResourceView(_heightTexture, srvDesc, device.GetCpuHandle(_heightSRV));
 
             _currentResolution = resolution;
-        }
-
-        // ── Brush Painting (Multi-Target) ────────────────────────────────
-
-        /// <summary>GPU state for a single ControlMap target.</summary>
-        private struct ControlMapGPU
-        {
-            public ID3D12Resource Texture;
-            public uint UAV, SRV;
-            public int Resolution;
-            public bool NeedsInitialClear;
-            /// <summary>Cached Texture wrapper — avoids WrapNative allocation per call.</summary>
-            public Texture Wrapper;
-        }
-
-        private readonly Dictionary<(ControlMapTarget, int), ControlMapGPU> _controlMaps = new();
-
-        /// <summary>
-        /// Dispatches a brush stroke on any ControlMap target.
-        /// setControlMap is called to wire the resulting Texture back to the owner.
-        /// Points are in terrain UV space [0..1].
-        /// </summary>
-        public void PaintBrush(Terrain terrain, ControlMapTarget target, int layerIndex,
-                               Action<Texture> setControlMap,
-                               ID3D12GraphicsCommandList cmd,
-                               Vector2[] strokePoints, int pointCount,
-                               uint mode, float strength,
-                               float radius, float falloff,
-                               float targetHeight = 0)
-        {
-            if (pointCount == 0 || strokePoints == null) return;
-
-            EnsureInitialized();
-            int res = ResolveControlMapResolution(terrain, target);
-            var key = (target, layerIndex);
-            var gpu = EnsureControlMap(key, res, setControlMap);
-
-            var device = Engine.Device;
-            cmd.SetComputeRootSignature(device.GlobalRootSignature);
-            cmd.SetDescriptorHeaps(1, new[] { device.SrvHeap });
-
-            uint groups = (uint)((res + 7) / 8);
-
-            // Clear on first use
-            if (gpu.NeedsInitialClear)
-            {
-                _cs.SetPushConstant(_kernelClearDelta, "Output", gpu.UAV);
-                _cs.Dispatch(_kernelClearDelta, cmd, groups, groups);
-                cmd.ResourceBarrierUnorderedAccessView(gpu.Texture);
-                gpu.NeedsInitialClear = false;
-                _controlMaps[key] = gpu;
-            }
-
-            // Upload stroke points
-            EnsureStrokeBuffer(pointCount);
-            unsafe
-            {
-                var dst = _strokeBuffer.WritePtr<Vector2>();
-                for (int i = 0; i < pointCount; i++)
-                    dst[i] = strokePoints[i];
-            }
-
-            // Convert world radius to UV radius
-            float uvRadius = radius / Math.Max(terrain.TerrainSize.X, terrain.TerrainSize.Y);
-
-            // Normalize target height
-            float normalizedTarget = targetHeight / terrain.MaxHeight;
-
-            // Push constants
-            _cs.SetPushConstant(_kernelPaintBrush, "Source", _heightSRV);  // Current baked heightmap for flatten/smooth
-            _cs.SetPushConstant(_kernelPaintBrush, "Output", gpu.UAV);
-            _cs.SetBuffer(_kernelPaintBrush, "StampBuf", _strokeBuffer);
-            _cs.SetPushConstant(_kernelPaintBrush, "BlendMode", mode);
-            _cs.SetParam(_kernelPaintBrush, "Opacity", strength);
-            _cs.SetPushConstant(_kernelPaintBrush, "StampCount", (uint)pointCount);
-
-            _cs.SetParam(_kernelPaintBrush, "BrushRadius", uvRadius);
-            _cs.SetParam(_kernelPaintBrush, "BrushFalloff", falloff);
-            _cs.SetParam(_kernelPaintBrush, "BrushTargetHeight", normalizedTarget);
-            _cs.SetPushConstant(_kernelPaintBrush, "FlipV", target != ControlMapTarget.Height ? 1u : 0u);
-
-            _cs.Dispatch(_kernelPaintBrush, cmd, groups, groups);
-            cmd.ResourceBarrierUnorderedAccessView(gpu.Texture);
-        }
-
-        /// <summary>
-        /// GPU-only brush: dispatches CS_BrushRaycast (ray march against heightmap)
-        /// then chains CS_PaintBrush (paints at the hit UV). Zero CPU readback.
-        /// </summary>
-        public void BrushRaycastAndPaint(Terrain terrain, ControlMapTarget target, int layerIndex,
-                                         Action<Texture> setControlMap,
-                                         ID3D12GraphicsCommandList cmd,
-                                         Vector3 rayOrigin, Vector3 rayDir,
-                                         Vector3 terrainOrigin, Vector2 terrainSize, float maxHeight,
-                                         uint mode, float strength,
-                                         float radius, float falloff,
-                                         float targetHeight = 0)
-        {
-            EnsureInitialized();
-            //Debug.Log($"[BrushRaycast] heightSRV={_heightSRV}, ray={rayOrigin}/{rayDir}, " +
-            //          $"terrainOrig={terrainOrigin}, size={terrainSize}, maxH={maxHeight}, " +
-            //          $"mode={mode}, str={strength}, rad={radius}");
-            int res = ResolveControlMapResolution(terrain, target);
-            var key = (target, layerIndex);
-            var gpu = EnsureControlMap(key, res, setControlMap);
-
-            var device = Engine.Device;
-            cmd.SetComputeRootSignature(device.GlobalRootSignature);
-            cmd.SetDescriptorHeaps(1, new[] { device.SrvHeap });
-
-            // Clear on first use
-            uint groups = (uint)((res + 7) / 8);
-            if (gpu.NeedsInitialClear)
-            {
-                _cs.SetPushConstant(_kernelClearDelta, "Output", gpu.UAV);
-                _cs.Dispatch(_kernelClearDelta, cmd, groups, groups);
-                cmd.ResourceBarrierUnorderedAccessView(gpu.Texture);
-                gpu.NeedsInitialClear = false;
-                _controlMaps[key] = gpu;
-            }
-
-            // ── Phase 1: GPU Raycast ──
-            // Create/reuse raycast result buffer (1 float2, SRV+UAV on GPU default heap)
-            if (_raycastResultBuffer == null)
-                _raycastResultBuffer = GraphicsBuffer.CreateStructured<Vector2>(1, srv: true, uav: true);
-
-            _cs.SetPushConstant(_kernelBrushRaycast, "Source", _heightSRV);
-            _cs.SetUAV(_kernelBrushRaycast, "StampBuf", _raycastResultBuffer);
-            _cs.SetParam(_kernelBrushRaycast, "RayOriginX", rayOrigin.X);
-            _cs.SetParam(_kernelBrushRaycast, "RayOriginY", rayOrigin.Y);
-            _cs.SetParam(_kernelBrushRaycast, "RayOriginZ", rayOrigin.Z);
-            _cs.SetParam(_kernelBrushRaycast, "RayDirX", rayDir.X);
-            _cs.SetParam(_kernelBrushRaycast, "RayDirY", rayDir.Y);
-            _cs.SetParam(_kernelBrushRaycast, "RayDirZ", rayDir.Z);
-            _cs.SetParam(_kernelBrushRaycast, "TerrainOriginX", terrainOrigin.X);
-            _cs.SetParam(_kernelBrushRaycast, "TerrainOriginZ", terrainOrigin.Z);
-            _cs.SetParam(_kernelBrushRaycast, "TerrainSizeX", terrainSize.X);
-            _cs.SetParam(_kernelBrushRaycast, "TerrainSizeZ", terrainSize.Y);
-            _cs.SetParam(_kernelBrushRaycast, "TerrainMaxHeight", maxHeight);
-
-            _cs.Dispatch(_kernelBrushRaycast, cmd, 1, 1, 1);
-            _raycastResultBuffer.UAVBarrier(cmd);
-
-            // ── Phase 2: Paint at hit UV ──
-            // Convert world radius to UV radius
-            float uvRadius = radius / Math.Max(terrainSize.X, terrainSize.Y);
-            float normalizedTarget = targetHeight / maxHeight;
-
-            _cs.SetPushConstant(_kernelPaintBrush, "Source", _heightSRV);
-            _cs.SetPushConstant(_kernelPaintBrush, "Output", gpu.UAV);
-            _cs.SetSRV(_kernelPaintBrush, "StampBuf", _raycastResultBuffer);
-            _cs.SetPushConstant(_kernelPaintBrush, "BlendMode", mode);
-            _cs.SetParam(_kernelPaintBrush, "Opacity", strength);
-            _cs.SetPushConstant(_kernelPaintBrush, "StampCount", 1u);
-            _cs.SetParam(_kernelPaintBrush, "BrushRadius", uvRadius);
-            _cs.SetParam(_kernelPaintBrush, "BrushFalloff", falloff);
-            _cs.SetParam(_kernelPaintBrush, "BrushTargetHeight", normalizedTarget);
-            _cs.SetPushConstant(_kernelPaintBrush, "FlipV", target != ControlMapTarget.Height ? 1u : 0u);
-
-            _cs.Dispatch(_kernelPaintBrush, cmd, groups, groups);
-            cmd.ResourceBarrierUnorderedAccessView(gpu.Texture);
-        }
-
-        /// <summary>
-        /// Clears a specific ControlMap to zero.
-        /// </summary>
-        public void ClearControlMap(ControlMapTarget target, int layerIndex, ID3D12GraphicsCommandList cmd, int resolution)
-        {
-            if (!_controlMaps.TryGetValue((target, layerIndex), out var gpu)) return;
-
-            EnsureInitialized();
-            var device = Engine.Device;
-            cmd.SetComputeRootSignature(device.GlobalRootSignature);
-            cmd.SetDescriptorHeaps(1, new[] { device.SrvHeap });
-
-            uint groups = (uint)((resolution + 7) / 8);
-
-            _cs.SetPushConstant(_kernelClearDelta, "Output", gpu.UAV);
-            _cs.Dispatch(_kernelClearDelta, cmd, groups, groups);
-            cmd.ResourceBarrierUnorderedAccessView(gpu.Texture);
-        }
-
-        /// <summary>
-        /// Imports a single channel from a source texture into a ControlMap.
-        /// channelIndex: 0=R, 1=G, 2=B, 3=A
-        /// </summary>
-        public void ImportChannel(Terrain terrain, ControlMapTarget target, int layerIndex,
-                                  Action<Texture> setControlMap,
-                                  ID3D12GraphicsCommandList cmd,
-                                  Texture sourceTexture, int channelIndex)
-        {
-            if (sourceTexture == null || sourceTexture.BindlessIndex == 0) return;
-
-            EnsureInitialized();
-            int res = ResolveControlMapResolution(terrain, target);
-            var key = (target, layerIndex);
-            var gpu = EnsureControlMap(key, res, setControlMap);
-            gpu.NeedsInitialClear = false;
-            _controlMaps[key] = gpu;
-
-            var device = Engine.Device;
-            cmd.SetComputeRootSignature(device.GlobalRootSignature);
-            cmd.SetDescriptorHeaps(1, new[] { device.SrvHeap });
-
-            uint groups = (uint)((res + 7) / 8);
-
-            _cs.SetPushConstant(_kernelImportChannel, "Source", sourceTexture.BindlessIndex);
-            _cs.SetPushConstant(_kernelImportChannel, "Output", gpu.UAV);
-            _cs.SetPushConstant(_kernelImportChannel, "BlendMode", (uint)channelIndex);
-            _cs.Dispatch(_kernelImportChannel, cmd, groups, groups);
-            cmd.ResourceBarrierUnorderedAccessView(gpu.Texture);
-        }
-
-        /// <summary>Returns the correct resolution for the given control map target.</summary>
-        private static int ResolveControlMapResolution(Terrain terrain, ControlMapTarget target) => target switch
-        {
-            ControlMapTarget.Splatmap => terrain.EffectiveSplatmapResolution,
-            ControlMapTarget.Density  => terrain.EffectiveDecorationMapResolution,
-            _                         => terrain.EffectiveHeightmapResolution,
-        };
-
-        /// <summary>
-        /// Ensures a ControlMap GPU texture exists for the given key.
-        /// Format: R8_UNorm for Splatmap/Density, R16_Float for Height.
-        /// Creates the resource + UAV/SRV on first call.
-        /// </summary>
-        private ControlMapGPU EnsureControlMap((ControlMapTarget, int) key, int resolution, Action<Texture> setControlMap)
-        {
-            if (_controlMaps.TryGetValue(key, out var existing) && existing.Resolution == resolution)
-            {
-                // Reuse cached wrapper — no allocation
-                setControlMap?.Invoke(existing.Wrapper);
-                return existing;
-            }
-
-            existing.Texture?.Release();
-
-            var device = Engine.Device;
-            var gpu = new ControlMapGPU
-            {
-                Resolution = resolution,
-                NeedsInitialClear = true
-            };
-
-            // Height painted layers need R16_Float for signed additive data.
-            // Splatmaps and density maps are 0..1 — R8_UNorm is sufficient.
-            var format = key.Item1 == ControlMapTarget.Height
-                ? Format.R16_Float
-                : Format.R8_UNorm;
-
-            gpu.Texture = device.CreateTexture2D(
-                format, resolution, resolution, 1, 1,
-                ResourceFlags.AllowUnorderedAccess, ResourceStates.Common);
-
-            gpu.UAV = device.AllocateBindlessIndex();
-            device.NativeDevice.CreateUnorderedAccessView(gpu.Texture, null,
-                new UnorderedAccessViewDescription
-                {
-                    Format = format,
-                    ViewDimension = UnorderedAccessViewDimension.Texture2D,
-                    Texture2D = new Texture2DUnorderedAccessView { MipSlice = 0 }
-                }, device.GetCpuHandle(gpu.UAV));
-
-            gpu.SRV = device.AllocateBindlessIndex();
-            device.NativeDevice.CreateShaderResourceView(gpu.Texture,
-                new ShaderResourceViewDescription
-                {
-                    Format = format,
-                    ViewDimension = ShaderResourceViewDimension.Texture2D,
-                    Shader4ComponentMapping = ShaderComponentMapping.Default,
-                    Texture2D = new Texture2DShaderResourceView { MostDetailedMip = 0, MipLevels = 1 }
-                }, device.GetCpuHandle(gpu.SRV));
-
-            // Create and cache the wrapper once
-            gpu.Wrapper = Texture.WrapNative(gpu.Texture, gpu.SRV);
-            _controlMaps[key] = gpu;
-            setControlMap?.Invoke(gpu.Wrapper);
-
-            return gpu;
-        }
-
-        private void EnsureStrokeBuffer(int requiredCount)
-        {
-            if (_strokeBuffer != null && _strokeBufferCapacity >= requiredCount) return;
-
-            _strokeBuffer?.Dispose();
-            _strokeBufferCapacity = Math.Max(requiredCount, 64);
-            _strokeBuffer = GraphicsBuffer.CreateUpload<Vector2>(_strokeBufferCapacity, mapped: true);
         }
 
         /// <summary>
@@ -1126,726 +995,282 @@ namespace Freefall.Assets
         /// <summary>Resolution of the current baked heightmap texture, or 0 if none.</summary>
         public int BakedResolution => _currentResolution;
 
-        // ── ControlMap Persistence ─────────────────────────────────────────
+        // ═══════════════════════════════════════════════════════════════════
+        // ── Coverage (splat + decoration) ──
+        // ═══════════════════════════════════════════════════════════════════
 
-        /// <summary>
-        /// Reads back a specific ControlMap GPU texture to CPU memory as raw pixel bytes.
-        /// Returns R8 (1 bpp) for Splatmap/Density, R16 (2 bpp) for Height.
-        /// Returns null if the target doesn't exist.
-        /// </summary>
-        public byte[] ReadbackControlMap(ControlMapTarget target, int layerIndex)
+        /// <summary>Stamp descriptors for a splat or decoration bake, captured on the main thread.</summary>
+        public sealed class CoveragePlan
         {
-            if (!_controlMaps.TryGetValue((target, layerIndex), out var gpu) || gpu.Texture == null)
-                return null;
+            internal readonly List<CoverageStampGPU> Stamps = new();
+            internal readonly List<StampSplinePointGPU> SplinePoints = new();
 
-            var device = Engine.Device;
-            int res = gpu.Resolution;
-            var format = target == ControlMapTarget.Height ? Format.R16_Float : Format.R8_UNorm;
-            int bytesPerPixel = target == ControlMapTarget.Height ? 2 : 1;
-            int rowPitch = (res * bytesPerPixel + 255) & ~255; // 256-byte aligned
-            int totalBytes = rowPitch * res;
+            /// <summary>Channels (splat) or slots (deco) the stamps index into.</summary>
+            public int TargetCount;
 
-            var readbackResource = device.NativeDevice.CreateCommittedResource(
-                new HeapProperties(HeapType.Readback),
-                HeapFlags.None,
-                ResourceDescription.Buffer((ulong)totalBytes),
-                ResourceStates.CopyDest,
-                null);
+            /// <summary>Number of layer channels the filters' layer masks refer to.</summary>
+            public int LayerCount;
 
-            var allocator = device.NativeDevice.CreateCommandAllocator(CommandListType.Direct);
-            var cmdList = device.NativeDevice.CreateCommandList<ID3D12GraphicsCommandList>(
-                0, CommandListType.Direct, allocator, null);
-
-            try
-            {
-                cmdList.ResourceBarrierTransition(gpu.Texture,
-                    ResourceStates.Common, ResourceStates.CopySource);
-
-                var src = new TextureCopyLocation(gpu.Texture, 0);
-                var dst = new TextureCopyLocation(readbackResource, new PlacedSubresourceFootPrint
-                {
-                    Offset = 0,
-                    Footprint = new SubresourceFootPrint(format, (uint)res, (uint)res, 1, (uint)rowPitch)
-                });
-                cmdList.CopyTextureRegion(dst, 0, 0, 0, src);
-
-                cmdList.ResourceBarrierTransition(gpu.Texture,
-                    ResourceStates.CopySource, ResourceStates.Common);
-
-                cmdList.Close();
-                device.SubmitAndWait(cmdList);
-
-                unsafe
-                {
-                    void* pData;
-                    readbackResource.Map(0, null, &pData);
-
-                    int srcRowBytes = res * bytesPerPixel;
-                    byte[] pixels = new byte[srcRowBytes * res];
-                    var srcPtr = (byte*)pData;
-                    for (int y = 0; y < res; y++)
-                        Marshal.Copy((IntPtr)(srcPtr + y * rowPitch), pixels, y * srcRowBytes, srcRowBytes);
-
-                    readbackResource.Unmap(0);
-                    return pixels;
-                }
-            }
-            finally
-            {
-                cmdList.Dispose();
-                allocator.Dispose();
-                readbackResource.Dispose();
-            }
+            public int StampCount => Stamps.Count;
         }
 
         /// <summary>
-        /// Uploads ControlMap pixel data (raw bytes from cache) to a specific target.
-        /// Handles format conversion: source may be R8/R16/R32, target is R8 (splatmap/density) or R16 (height).
-        /// Creates the GPU texture if needed.
+        /// Lay out a splat bake from the terrain's splat stamps (already in bake order).
+        /// 'layers' is the terrain's palette: a stamp's Layer becomes the index of its channel.
+        /// Main thread.
         /// </summary>
-        public void UploadControlMap(ControlMapTarget target, int layerIndex, byte[] pixels, int resolution, Action<Texture> setControlMap)
+        public CoveragePlan PrepareSplat(Terrain terrain, TerrainRenderer renderer,
+            IReadOnlyList<SplatStamp> stamps, IReadOnlyList<TerrainLayer> layers)
         {
-            if (pixels == null || pixels.Length == 0) return;
-
-            // Strip DDS header if present ("DDS " magic = 0x20534444)
-            int offset = 0;
-            if (pixels.Length > 128 && BitConverter.ToInt32(pixels, 0) == 0x20534444)
-            {
-                offset = 128;
-                // Check for DX10 extended header
-                if (pixels.Length > 148 && BitConverter.ToInt32(pixels, 84) == 0x30315844)
-                    offset = 148;
-            }
-
-            int pixelDataLen = pixels.Length - offset;
-
-            // Detect source format: try R8 (1 bpp), then R16 (2 bpp), then R32 (4 bpp)
-            int srcBpp = 1;
-            int srcRes = (int)Math.Sqrt(pixelDataLen);
-            if (srcRes * srcRes != pixelDataLen)
-            {
-                srcBpp = 2;
-                srcRes = (int)Math.Sqrt(pixelDataLen / 2);
-                if (srcRes * srcRes * 2 != pixelDataLen)
-                {
-                    srcBpp = 4;
-                    srcRes = (int)Math.Sqrt(pixelDataLen / 4);
-                }
-            }
-
-            if (srcRes * srcRes * srcBpp != pixelDataLen)
-            {
-                Debug.LogWarning("TerrainBaker", $"UploadControlMap {target}[{layerIndex}]: cannot determine resolution from {pixelDataLen} pixel bytes (offset={offset}). Skipping.");
-                return;
-            }
-
-            // Determine destination format
-            int dstBpp = target == ControlMapTarget.Height ? 2 : 1;
-            var dstFormat = target == ControlMapTarget.Height ? Format.R16_Float : Format.R8_UNorm;
-
-            int res = srcRes;
-            var key = (target, layerIndex);
-            var gpu = EnsureControlMap(key, res, setControlMap);
-            gpu.NeedsInitialClear = false;
-            _controlMaps[key] = gpu;
-
-            // Convert source data to destination format if needed
-            byte[] uploadPixels;
-            if (srcBpp == dstBpp)
-            {
-                uploadPixels = pixels;
-                // offset stays as-is
-            }
-            else
-            {
-                Debug.Log($"[TerrainBaker] Converting {srcBpp}bpp→{dstBpp}bpp for {target}[{layerIndex}] ({srcRes}x{srcRes})");
-                uploadPixels = new byte[res * res * dstBpp];
-                for (int i = 0; i < res * res; i++)
-                {
-                    // Read source as float
-                    float val;
-                    if (srcBpp == 4)
-                        val = BitConverter.ToSingle(pixels, offset + i * 4);
-                    else if (srcBpp == 2)
-                        val = (float)BitConverter.ToHalf(pixels, offset + i * 2);
-                    else
-                        val = pixels[offset + i] / 255.0f;
-
-                    // Write to destination format
-                    if (dstBpp == 2)
-                    {
-                        var halfBytes = BitConverter.GetBytes((Half)val);
-                        uploadPixels[i * 2] = halfBytes[0];
-                        uploadPixels[i * 2 + 1] = halfBytes[1];
-                    }
-                    else
-                    {
-                        uploadPixels[i] = (byte)Math.Clamp(val * 255.0f + 0.5f, 0, 255);
-                    }
-                }
-                offset = 0;
-            }
-
-            var device = Engine.Device;
-            int bytesPerPixel = dstBpp;
-            int rowPitch = (res * bytesPerPixel + 255) & ~255;
-            int totalBytes = rowPitch * res;
-
-            var uploadResource = device.NativeDevice.CreateCommittedResource(
-                new HeapProperties(HeapType.Upload),
-                HeapFlags.None,
-                ResourceDescription.Buffer((ulong)totalBytes),
-                ResourceStates.GenericRead,
-                null);
-
-            var allocator = device.NativeDevice.CreateCommandAllocator(CommandListType.Direct);
-            var cmdList = device.NativeDevice.CreateCommandList<ID3D12GraphicsCommandList>(
-                0, CommandListType.Direct, allocator, null);
-
-            try
-            {
-                unsafe
-                {
-                    void* pData;
-                    uploadResource.Map(0, null, &pData);
-
-                    int srcRowBytes = res * bytesPerPixel;
-                    var dstPtr = (byte*)pData;
-                    for (int y = 0; y < res; y++)
-                        Marshal.Copy(uploadPixels, offset + y * srcRowBytes, (IntPtr)(dstPtr + y * rowPitch), srcRowBytes);
-
-                    uploadResource.Unmap(0);
-                }
-
-                cmdList.ResourceBarrierTransition(gpu.Texture,
-                    ResourceStates.Common, ResourceStates.CopyDest);
-
-                var src = new TextureCopyLocation(uploadResource, new PlacedSubresourceFootPrint
-                {
-                    Offset = 0,
-                    Footprint = new SubresourceFootPrint(dstFormat, (uint)res, (uint)res, 1, (uint)rowPitch)
-                });
-                var dst = new TextureCopyLocation(gpu.Texture, 0);
-                cmdList.CopyTextureRegion(dst, 0, 0, 0, src);
-
-                cmdList.ResourceBarrierTransition(gpu.Texture,
-                    ResourceStates.CopyDest, ResourceStates.Common);
-
-                cmdList.Close();
-                device.SubmitAndWait(cmdList);
-
-                Debug.Log($"[TerrainBaker] Uploaded ControlMap {target}[{layerIndex}]: {res}x{res} {dstFormat} ({pixels.Length} bytes, src={srcBpp}bpp)");
-            }
-            finally
-            {
-                cmdList.Dispose();
-                allocator.Dispose();
-                uploadResource.Dispose();
-            }
-        }
-
-        // ── RGBA Packing ─────────────────────────────────────────────
-
-        private GraphicsBuffer[] _packIndexBuffers;
-
-        /// <summary>
-        /// Packs per-layer R16 ControlMaps directly into caller-owned Texture2DArray slices.
-        /// sliceUAVs: per-slice UAV bindless indices (created by caller for each array slice).
-        /// Stateless: no GPU resources are created or cached here.
-        /// </summary>
-        public void PackControlMaps(ID3D12GraphicsCommandList cmd, uint[] layerSrvIndices, uint[] sliceUAVs, int resolution)
-        {
-            if (layerSrvIndices == null || layerSrvIndices.Length == 0 || sliceUAVs == null) return;
-
-            EnsureInitialized();
-            var device = Engine.Device;
-            cmd.SetComputeRootSignature(device.GlobalRootSignature);
-            cmd.SetDescriptorHeaps(1, new[] { device.SrvHeap });
-
-            int layerCount = layerSrvIndices.Length;
-            int sliceCount = (layerCount + 3) / 4;
-            uint groups = (uint)((resolution + 7) / 8);
-
-            // Use one buffer per slice to avoid GPU race on Upload heap memory.
-            // All dispatches are recorded on the same command list — the GPU sees
-            // the final CPU-written state of a mapped Upload buffer, so a single
-            // buffer rewritten between dispatches causes all slices to read the
-            // last-written data.
-            if (_packIndexBuffers == null || _packIndexBuffers.Length < sliceCount)
-            {
-                if (_packIndexBuffers != null)
-                    foreach (var buf in _packIndexBuffers) buf?.Dispose();
-                _packIndexBuffers = new GraphicsBuffer[sliceCount];
-                for (int i = 0; i < sliceCount; i++)
-                    _packIndexBuffers[i] = GraphicsBuffer.CreateUpload<uint>(4, mapped: true);
-            }
-
-            for (int slice = 0; slice < sliceCount && slice < sliceUAVs.Length; slice++)
-            {
-                int channelCount = Math.Min(4, layerCount - slice * 4);
-                unsafe
-                {
-                    var ptr = _packIndexBuffers[slice].WritePtr<uint>();
-                    for (int c = 0; c < 4; c++)
-                    {
-                        int layerIdx = slice * 4 + c;
-                        ptr[c] = layerIdx < layerCount ? layerSrvIndices[layerIdx] : 0;
-                    }
-                }
-
-                _cs.SetPushConstant(_kernelPackChannels, "Output", sliceUAVs[slice]);
-                _cs.SetBuffer(_kernelPackChannels, "StampBuf", _packIndexBuffers[slice]);
-                _cs.SetPushConstant(_kernelPackChannels, "BlendMode", (uint)channelCount);
-                _cs.Dispatch(_kernelPackChannels, cmd, groups, groups);
-            }
-        }
-
-        /// <summary>
-        /// Release all per-instance GPU resources.
-        /// Static compute shader and noise LUT are shared and live for the process lifetime.
-        /// </summary>
-        public void Dispose()
-        {
-            // Only dispose internal scratch buffers. The height texture and control maps
-            // are outputs owned by the Terrain asset — they persist in the AssetManager cache.
-            _raycastResultBuffer?.Dispose();
-            _raycastResultBuffer = null;
-
-            _stampBuffer?.Dispose();
-            _strokeBuffer?.Dispose();
-            _heightStampBuffer?.Dispose();
-            _heightStampSplineBuffer?.Dispose();
-            _splatStampBuffer?.Dispose();
-            _splatStampSplineBuffer?.Dispose();
-            _decoStampBuffer?.Dispose();
-            _decoStampSplineBuffer?.Dispose();
-            if (_packIndexBuffers != null)
-                foreach (var buf in _packIndexBuffers) buf?.Dispose();
-        }
-
-        // ── Height Stamp Dispatch ──────────────────────────────────────
-
-        /// <summary>
-        /// Collects all HeightStamp components, builds GPU buffers,
-        /// and dispatches CS_InfluenceLayer.
-        /// </summary>
-        private void DispatchHeightStamps(ID3D12GraphicsCommandList cmd, Terrain terrain,
-            IReadOnlyList<HeightStamp> stamps, uint groups)
-        {
-            if (stamps.Count == 0) return;
-
-            // Collect active stamps and sort by priority
-            var active = new List<HeightStamp>();
-            foreach (var stamp in stamps)
-            {
-                if (stamp.Entity == null) continue;
-                active.Add(stamp);
-            }
-
-            if (active.Count == 0) return;
-            active.Sort((a, b) => a.Priority.CompareTo(b.Priority));
-
-            // Build descriptors and spline points
-            var descriptors = new List<HeightStampDescriptorGPU>();
-            var splinePoints = new List<StampSplinePointGPU>();
-
-            var terrainSize = terrain.TerrainSize;
-            float maxHeight = terrain.MaxHeight;
-            var terrainRenderer = ComponentCache<TerrainRenderer>.All.Count > 0
-                ? ComponentCache<TerrainRenderer>.All[0] : null;
-            var terrainOrigin = terrainRenderer?.Transform?.WorldPosition ?? Vector3.Zero;
-
-            foreach (var stamp in active)
-            {
-                var desc = new HeightStampDescriptorGPU();
-
-                desc.InvertShape = stamp.InvertShape ? 1u : 0u;
-
-                // Falloff in UV space
-                desc.Falloff = stamp.Falloff / Math.Max(terrainSize.X, terrainSize.Y);
-
-                // Edge noise
-                if (stamp.EnableNoise)
-                {
-                    desc.NoiseFreq = stamp.NoiseFrequency;
-                    desc.NoiseAmp = stamp.NoiseAmplitude / Math.Max(terrainSize.X, terrainSize.Y);
-                    desc.NoiseSeed = (uint)stamp.NoiseSeed;
-                }
-
-                if (stamp.IsSplineMode)
-                {
-                    var spline = stamp.GetSpline();
-                    if (spline == null || spline.Points.Count < 2)
-                        continue;
-
-                    desc.SplinePointOffset = (uint)splinePoints.Count;
-
-                    int sampleCount = Math.Max(spline.TotalSegments, spline.Points.Count * 4);
-                    float uvRadius = stamp.Radius / Math.Max(terrainSize.X, terrainSize.Y);
-
-                    for (int i = 0; i <= sampleCount; i++)
-                    {
-                        float t = (float)i / sampleCount;
-                        var worldPos = spline.GetWorldPoint(t);
-
-                        float u = (worldPos.X - terrainOrigin.X) / terrainSize.X;
-                        float v = (worldPos.Z - terrainOrigin.Z) / terrainSize.Y;
-                        float normalizedH = (worldPos.Y + stamp.HeightOffset) / maxHeight;
-
-                        splinePoints.Add(new StampSplinePointGPU
-                        {
-                            UV = new Vector2(u, v),
-                            Height = normalizedH,
-                            HalfWidth = uvRadius * spline.GetWidth(t),
-                        });
-                    }
-
-                    uint pointCount = (uint)(sampleCount + 1);
-                    if (spline.Closed)
-                        pointCount |= 0x80000000;
-
-                    desc.SplinePointCount = pointCount;
-                    // The stamp's own radius stays the reference: the shader scales the falloff by
-                    // (sample half-width / Radius), see EvaluateStampWeight.
-                    desc.Radius = uvRadius;
-                    desc.TargetHeight = 0;
-                    desc.Center = Vector2.Zero;
-                }
-                else
-                {
-                    // Radial mode
-                    var center = stamp.Transform?.WorldPosition ?? Vector3.Zero;
-                    float u = (center.X - terrainOrigin.X) / terrainSize.X;
-                    float v = (center.Z - terrainOrigin.Z) / terrainSize.Y;
-                    desc.Center = new Vector2(u, v);
-                    desc.Radius = stamp.Radius / Math.Max(terrainSize.X, terrainSize.Y);
-                    desc.TargetHeight = (center.Y + stamp.HeightOffset) / maxHeight;
-                    desc.SplinePointOffset = 0xFFFFFFFF;
-                    desc.SplinePointCount = 0;
-                }
-
-                // Heightmap (optional)
-                if (stamp.Heightmap != null)
-                {
-                    desc.HeightmapIdx = stamp.Heightmap.BindlessIndex;
-                    desc.HeightmapStrength = stamp.Strength / maxHeight;
-
-                    // Extract Y rotation from entity transform
-                    var rot = stamp.Transform?.Rotation ?? Quaternion.Identity;
-                    float yaw = MathF.Atan2(2f * (rot.W * rot.Y + rot.X * rot.Z),
-                                            1f - 2f * (rot.Y * rot.Y + rot.Z * rot.Z));
-                    desc.RotationSin = MathF.Sin(yaw);
-                    desc.RotationCos = MathF.Cos(yaw);
-                }
-
-                descriptors.Add(desc);
-            }
-
-            if (descriptors.Count == 0) return;
-
-            // Upload stamp descriptors
-            EnsureHeightStampBuffer(descriptors.Count);
-            unsafe
-            {
-                var dst = _heightStampBuffer.WritePtr<HeightStampDescriptorGPU>();
-                for (int i = 0; i < descriptors.Count; i++)
-                    dst[i] = descriptors[i];
-            }
-
-            // Upload spline points
-            if (splinePoints.Count > 0)
-            {
-                EnsureHeightStampSplineBuffer(splinePoints.Count);
-                unsafe
-                {
-                    var dst = _heightStampSplineBuffer.WritePtr<StampSplinePointGPU>();
-                    for (int i = 0; i < splinePoints.Count; i++)
-                        dst[i] = splinePoints[i];
-                }
-            }
-
-            // Dispatch CS_InfluenceLayer
-            var k = _kernelInfluenceLayer;
-            _cs.SetPushConstant(k, "Output", _heightUAV);
-            _cs.SetBuffer(k, "StampBuf", _heightStampBuffer);
-            _cs.SetPushConstant(k, "StampCount", (uint)descriptors.Count);
-
-            if (splinePoints.Count > 0 && _heightStampSplineBuffer != null)
-                _cs.SetPushConstant(k, "BrushRadius", _heightStampSplineBuffer.SrvIndex);
-            else
-                _cs.SetPushConstant(k, "BrushRadius", 0u);
-
-            _cs.Dispatch(k, cmd, groups, groups);
-            cmd.ResourceBarrierUnorderedAccessView(_heightTexture);
-        }
-
-        private void EnsureHeightStampBuffer(int count)
-        {
-            if (_heightStampBuffer != null && _heightStampBufferCapacity >= count) return;
-            _heightStampBuffer?.Dispose();
-            _heightStampBufferCapacity = Math.Max(count, 16);
-            _heightStampBuffer = GraphicsBuffer.CreateUpload<HeightStampDescriptorGPU>(_heightStampBufferCapacity, mapped: true);
-        }
-
-        private void EnsureHeightStampSplineBuffer(int count)
-        {
-            if (_heightStampSplineBuffer != null && _heightStampSplineCapacity >= count) return;
-            _heightStampSplineBuffer?.Dispose();
-            _heightStampSplineCapacity = Math.Max(count, 128);
-            _heightStampSplineBuffer = GraphicsBuffer.CreateUpload<StampSplinePointGPU>(_heightStampSplineCapacity, mapped: true);
-        }
-
-        // ── Procedural Auto-Mask Dispatch ──────────────────────────────
-
-        /// <summary>
-        /// Evaluates height/slope auto-mask per texel and writes procedural weights
-        /// into the packed ControlMapArray. Must be called AFTER PackControlMaps
-        /// (or after clearing) and BEFORE CS_SplatStamp.
-        /// </summary>
-        public void DispatchProceduralMask(
-            ID3D12GraphicsCommandList cmd,
-            Terrain terrain,
-            uint heightmapSRV,
-            GraphicsBuffer autoMaskBuffer,
-            uint controlArrayUAV,
-            int resolution,
-            int sliceCount)
-        {
-            EnsureOverlayInitialized();
-
-            var terrainSize = terrain.TerrainSize;
-            float maxHeight = terrain.MaxHeight;
-            float heightTexel = 1f / terrain.EffectiveHeightmapResolution;
-            float heightScale = maxHeight / (2f * terrainSize.X * heightTexel); // central difference spans two texels
-
-            var k = _kernelProceduralMask;
-            var device = Engine.Device;
-            cmd.SetComputeRootSignature(device.GlobalRootSignature);
-            cmd.SetDescriptorHeaps(1, new[] { device.SrvHeap });
-
-            _overlayCS.SetPushConstant(k, "Output", controlArrayUAV);
-            _overlayCS.SetPushConstant(k, "HeightTex", heightmapSRV);
-            _overlayCS.SetBuffer(k, "AutoMaskBuf", autoMaskBuffer);
-            _overlayCS.SetPushConstant(k, "HeightScale", BitConverter.SingleToUInt32Bits(heightScale));
-            _overlayCS.SetPushConstant(k, "StampCount", (uint)terrain.Layers.Count); // reused as LayerCount
-            _overlayCS.SetPushConstant(k, "Resolution", (uint)resolution);
-            _overlayCS.SetPushConstant(k, "SliceCount", (uint)sliceCount);
-            _overlayCS.SetPushConstant(k, "HeightTexel", BitConverter.SingleToUInt32Bits(heightTexel));
-
-            uint groups = (uint)((resolution + 7) / 8);
-            _overlayCS.Dispatch(k, cmd, groups, groups);
-        }
-
-        // ── Splat Stamp Dispatch ──────────────────────────────────────
-
-        /// <summary>
-        /// Collects all SplatStamp components and dispatches CS_SplatStamp
-        /// to overlay splat weights onto the packed ControlMapArray.
-        /// Must be called AFTER PackControlMaps on the same command list.
-        /// </summary>
-        public void DispatchSplatStamps(
-            ID3D12GraphicsCommandList cmd,
-            Terrain terrain,
-            IReadOnlyList<SplatStamp> stamps,
-            Vector3 terrainOrigin,
-            uint controlArrayUAV,
-            int resolution,
-            int sliceCount)
-        {
-            if (stamps.Count == 0) return;
-            EnsureOverlayInitialized();
-
-            var terrainSize = terrain.TerrainSize;
-
-            var descriptors = new List<SplatStampDescriptorGPU>();
-            var splinePoints = new List<StampSplinePointGPU>();
+            var plan = new CoveragePlan { TargetCount = layers.Count, LayerCount = layers.Count };
+            var layerIndex = BuildIndex(layers);
+            var terrainOrigin = renderer.Transform?.WorldPosition ?? Vector3.Zero;
 
             foreach (var stamp in stamps)
             {
-                var desc = new SplatStampDescriptorGPU();
-                desc.TargetLayer = (uint)Math.Max(0, stamp.SplatLayerIndex);
+                if (stamp.Layer == null || !layerIndex.TryGetValue(stamp.Layer, out int channel)) continue;
+
+                if (!TryBuildCoverage(stamp, terrain, terrainOrigin, layerIndex, plan.SplinePoints, out var desc))
+                    continue;
+
+                desc.Flags |= (uint)stamp.Op << 8;
+                desc.Target = (uint)channel;
                 desc.Strength = stamp.Strength;
-                desc.Falloff = stamp.Falloff / Math.Max(terrainSize.X, terrainSize.Y);
-
-                if (stamp.EnableNoise)
-                {
-                    desc.NoiseFreq = stamp.NoiseFrequency;
-                    desc.NoiseAmp = stamp.NoiseAmplitude / Math.Max(terrainSize.X, terrainSize.Y);
-                    desc.NoiseSeed = (uint)stamp.NoiseSeed;
-                }
-
-                if (stamp.IsSplineMode)
-                {
-                    BuildSplinePoints(stamp, terrain, terrainOrigin, terrainSize, 0f,
-                        splinePoints, ref desc.SplinePointOffset, ref desc.SplinePointCount,
-                        ref desc.Radius, ref desc.Center);
-                }
-                else
-                {
-                    BuildRadialCenter(stamp, terrainOrigin, terrainSize,
-                        ref desc.Radius, ref desc.Center, ref desc.SplinePointOffset, ref desc.SplinePointCount);
-                }
-
-                descriptors.Add(desc);
+                plan.Stamps.Add(desc);
             }
 
-            if (descriptors.Count == 0) return;
-
-            // Upload
-            EnsureSplatStampBuffer(descriptors.Count);
-            unsafe
-            {
-                var dst = _splatStampBuffer.WritePtr<SplatStampDescriptorGPU>();
-                for (int i = 0; i < descriptors.Count; i++)
-                    dst[i] = descriptors[i];
-            }
-
-            if (splinePoints.Count > 0)
-            {
-                EnsureSplatStampSplineBuffer(splinePoints.Count);
-                unsafe
-                {
-                    var dst = _splatStampSplineBuffer.WritePtr<StampSplinePointGPU>();
-                    for (int i = 0; i < splinePoints.Count; i++)
-                        dst[i] = splinePoints[i];
-                }
-            }
-
-            // Dispatch
-            var device = Engine.Device;
-            cmd.SetComputeRootSignature(device.GlobalRootSignature);
-            cmd.SetDescriptorHeaps(1, new[] { device.SrvHeap });
-
-            Debug.Log($"[SplatStamp] Dispatching {descriptors.Count} stamps, res={resolution}, slices={sliceCount}, uav={controlArrayUAV}, splines={splinePoints.Count}");
-
-            var k = _kernelSplatStamp;
-            _overlayCS.SetBuffer(k, "StampBuf", _splatStampBuffer);
-            _overlayCS.SetPushConstant(k, "Output", controlArrayUAV);
-            _overlayCS.SetPushConstant(k, "StampCount", (uint)descriptors.Count);
-            _overlayCS.SetPushConstant(k, "Resolution", (uint)resolution);
-            _overlayCS.SetPushConstant(k, "SliceCount", (uint)sliceCount);
-
-            if (splinePoints.Count > 0 && _splatStampSplineBuffer != null)
-                _overlayCS.SetPushConstant(k, "BrushRadius", _splatStampSplineBuffer.SrvIndex);
-            else
-                _overlayCS.SetPushConstant(k, "BrushRadius", 0u);
-
-            uint groups = (uint)((resolution + 7) / 8);
-            _overlayCS.Dispatch(k, cmd, groups, groups);
+            return plan;
         }
 
-        // ── Deco Stamp Dispatch ──────────────────────────────────────
-
         /// <summary>
-        /// Collects all DecoStamp components and dispatches CS_DecoStamp
-        /// to modulate decoration control weights.
-        /// Must be called AFTER DispatchDecoControlPrepass on the same command list.
+        /// Lay out a decoration coverage bake from the terrain's deco stamps (already in bake order).
+        /// 'decorators' is the terrain's decorator palette; 'layers' its layer palette (for filters).
+        /// Main thread.
         /// </summary>
-        public void DispatchDecoStamps(
-            ID3D12GraphicsCommandList cmd,
-            Terrain terrain,
-            IReadOnlyList<DecoStamp> stamps,
-            Vector3 terrainOrigin,
-            uint decoControlUAV,
-            int resolution)
+        public CoveragePlan PrepareDeco(Terrain terrain, TerrainRenderer renderer,
+            IReadOnlyList<DecoStamp> stamps, IReadOnlyList<TerrainDecorator> decorators,
+            IReadOnlyList<TerrainLayer> layers)
         {
-            if (stamps.Count == 0) return;
-            EnsureOverlayInitialized();
-
-            var terrainSize = terrain.TerrainSize;
-
-            var descriptors = new List<DecoStampDescriptorGPU>();
-            var splinePoints = new List<StampSplinePointGPU>();
+            var plan = new CoveragePlan { TargetCount = decorators.Count, LayerCount = layers.Count };
+            var layerIndex = BuildIndex(layers);
+            var decoratorIndex = BuildIndex(decorators);
+            var terrainOrigin = renderer.Transform?.WorldPosition ?? Vector3.Zero;
 
             foreach (var stamp in stamps)
             {
-                var desc = new DecoStampDescriptorGPU();
-                desc.Density = stamp.Density;
-                desc.Falloff = stamp.Falloff / Math.Max(terrainSize.X, terrainSize.Y);
+                uint target;
+                if (stamp.Decorator == null)
+                {
+                    // No decorator: a Multiply stamp thins or boosts everything; an Add stamp has nothing to add
+                    if (stamp.Op != DecoOp.Multiply) continue;
+                    target = AllTargets;
+                }
+                else if (decoratorIndex.TryGetValue(stamp.Decorator, out int slot))
+                {
+                    target = (uint)slot;
+                }
+                else continue;
+
+                if (!TryBuildCoverage(stamp, terrain, terrainOrigin, layerIndex, plan.SplinePoints, out var desc))
+                    continue;
+
+                desc.Flags |= (uint)stamp.Op << 8;
+                desc.Target = target;
+                desc.Strength = stamp.Weight;
+                plan.Stamps.Add(desc);
+            }
+
+            return plan;
+        }
+
+        private static Dictionary<T, int> BuildIndex<T>(IReadOnlyList<T> items) where T : class
+        {
+            var index = new Dictionary<T, int>(items.Count);
+            for (int i = 0; i < items.Count; i++)
+                index.TryAdd(items[i], i);
+            return index;
+        }
+
+        /// <summary>Shape, edge noise and filter of a coverage stamp. Op, target and strength are the caller's.</summary>
+        private static bool TryBuildCoverage(CoverageStamp stamp, Terrain terrain, Vector3 terrainOrigin,
+            Dictionary<TerrainLayer, int> layerIndex, List<StampSplinePointGPU> splinePoints, out CoverageStampGPU desc)
+        {
+            desc = new CoverageStampGPU();
+            var terrainSize = terrain.TerrainSize;
+            float uvScale = 1f / Math.Max(terrainSize.X, terrainSize.Y);
+
+            if (stamp.IsGlobal)
+            {
+                desc.Flags |= CoverageGlobal;
+                desc.SplinePointOffset = 0xFFFFFFFF;
+            }
+            else
+            {
+                desc.Falloff = stamp.Falloff * uvScale;
 
                 if (stamp.EnableNoise)
                 {
                     desc.NoiseFreq = stamp.NoiseFrequency;
-                    desc.NoiseAmp = stamp.NoiseAmplitude / Math.Max(terrainSize.X, terrainSize.Y);
+                    desc.NoiseAmp = stamp.NoiseAmplitude * uvScale;
                     desc.NoiseSeed = (uint)stamp.NoiseSeed;
                 }
 
                 if (stamp.IsSplineMode)
                 {
-                    BuildSplinePoints(stamp, terrain, terrainOrigin, terrainSize, 0f,
-                        splinePoints, ref desc.SplinePointOffset, ref desc.SplinePointCount,
-                        ref desc.Radius, ref desc.Center);
+                    if (!BuildSplinePoints(stamp, terrainOrigin, terrainSize, terrain.MaxHeight, 0f, splinePoints,
+                            out desc.SplinePointOffset, out desc.SplinePointCount, out desc.Radius))
+                    {
+                        // A spline without enough points covers nothing
+                        return false;
+                    }
                 }
                 else
                 {
-                    BuildRadialCenter(stamp, terrainOrigin, terrainSize,
-                        ref desc.Radius, ref desc.Center, ref desc.SplinePointOffset, ref desc.SplinePointCount);
-                }
-
-                descriptors.Add(desc);
-            }
-
-            if (descriptors.Count == 0) return;
-
-            // Upload
-            EnsureDecoStampBuffer(descriptors.Count);
-            unsafe
-            {
-                var dst = _decoStampBuffer.WritePtr<DecoStampDescriptorGPU>();
-                for (int i = 0; i < descriptors.Count; i++)
-                    dst[i] = descriptors[i];
-            }
-
-            if (splinePoints.Count > 0)
-            {
-                EnsureDecoStampSplineBuffer(splinePoints.Count);
-                unsafe
-                {
-                    var dst = _decoStampSplineBuffer.WritePtr<StampSplinePointGPU>();
-                    for (int i = 0; i < splinePoints.Count; i++)
-                        dst[i] = splinePoints[i];
+                    var pos = stamp.Transform?.WorldPosition ?? Vector3.Zero;
+                    desc.Center = new Vector2(
+                        (pos.X - terrainOrigin.X) / terrainSize.X,
+                        (pos.Z - terrainOrigin.Z) / terrainSize.Y);
+                    desc.Radius = stamp.Radius * uvScale;
+                    desc.SplinePointOffset = 0xFFFFFFFF;
                 }
             }
 
-            // Dispatch
+            // Filter. The ranges are always written so the shader never reads garbage.
+            desc.HeightMin = stamp.HeightRange.X;
+            desc.HeightMax = stamp.HeightRange.Y;
+            desc.HeightBlend = stamp.HeightBlend;
+            desc.SlopeMin = stamp.SlopeRange.X;
+            desc.SlopeMax = stamp.SlopeRange.Y;
+            desc.SlopeBlend = stamp.SlopeBlend;
+
+            if (stamp.HasFilter)
+            {
+                desc.Flags |= CoverageFilter;
+                desc.RequireMask = LayerMask(stamp.RequireLayers, layerIndex, out bool anyRequired);
+                desc.ExcludeMask = LayerMask(stamp.ExcludeLayers, layerIndex, out _);
+
+                // Requires layers, but none of them is on this terrain: the stamp can never apply
+                if (anyRequired && desc.RequireMask == 0)
+                    return false;
+            }
+
+            return true;
+        }
+
+        /// <summary>Bit N set = layer at channel N. Layers that are not in the palette have no weight anywhere.</summary>
+        private static uint LayerMask(List<TerrainLayer> layers, Dictionary<TerrainLayer, int> layerIndex, out bool any)
+        {
+            any = false;
+            if (layers == null) return 0;
+
+            uint mask = 0;
+            foreach (var layer in layers)
+            {
+                if (layer == null) continue;
+                any = true;
+                if (layerIndex.TryGetValue(layer, out int channel))
+                    mask |= 1u << channel;
+            }
+            return mask;
+        }
+
+        /// <summary>
+        /// Composite the splat stamps into the packed control array (ceil(layers / 4) RGBA slices).
+        /// Clears what an earlier bake left, so a plan without stamps yields an empty array.
+        /// Render callback.
+        /// </summary>
+        public void BakeSplat(CoveragePlan plan, ID3D12GraphicsCommandList cmd, Terrain terrain,
+            uint heightSrv, uint controlArrayUAV, int resolution, int sliceCount)
+        {
+            EnsureCoverageInitialized();
+
+            UploadCoverage(plan, ref _splatStampBuffer, ref _splatStampBufferCapacity,
+                ref _splatSplineBuffer, ref _splatSplineCapacity);
+
             var device = Engine.Device;
             cmd.SetComputeRootSignature(device.GlobalRootSignature);
             cmd.SetDescriptorHeaps(1, new[] { device.SrvHeap });
 
-            var k = _kernelDecoStamp;
-            _overlayCS.SetBuffer(k, "StampBuf", _decoStampBuffer);
-            _overlayCS.SetPushConstant(k, "Output", decoControlUAV);
-            _overlayCS.SetPushConstant(k, "StampCount", (uint)descriptors.Count);
-            _overlayCS.SetPushConstant(k, "Resolution", (uint)resolution);
-
-            if (splinePoints.Count > 0 && _decoStampSplineBuffer != null)
-                _overlayCS.SetPushConstant(k, "BrushRadius", _decoStampSplineBuffer.SrvIndex);
-            else
-                _overlayCS.SetPushConstant(k, "BrushRadius", 0u);
+            var k = _kernelSplatBake;
+            _splatCS.SetBuffer(k, "StampBuf", _splatStampBuffer);
+            _splatCS.SetPushConstant(k, "Output", controlArrayUAV);
+            _splatCS.SetPushConstant(k, "HeightTex", heightSrv);
+            _splatCS.SetPushConstant(k, "SplineBuf", _splatSplineBuffer.SrvIndex);
+            _splatCS.SetPushConstant(k, "StampCount", (uint)plan.StampCount);
+            _splatCS.SetPushConstant(k, "Resolution", (uint)resolution);
+            _splatCS.SetPushConstant(k, "SliceCount", (uint)sliceCount);
+            _splatCS.SetPushConstant(k, "LayerCount", (uint)plan.TargetCount);
+            _splatCS.SetParam(k, "MaxHeight", terrain.MaxHeight);
+            _splatCS.SetParam(k, "TerrainSizeX", terrain.TerrainSize.X);
 
             uint groups = (uint)((resolution + 7) / 8);
-            _overlayCS.Dispatch(k, cmd, groups, groups);
+            _splatCS.Dispatch(k, cmd, groups, groups);
         }
 
-        // ── Shared spline/radial helpers ─────────────────────────────
-
-        private static void BuildSplinePoints(
-            TerrainStamp stamp, Terrain terrain,
-            Vector3 terrainOrigin, Vector2 terrainSize,
-            float heightOffset,
-            List<StampSplinePointGPU> splinePoints,
-            ref uint splinePointOffset, ref uint splinePointCount,
-            ref float radius, ref Vector2 center)
+        /// <summary>
+        /// Composite the deco stamps into the decoration control texture (top 8 decorators per texel).
+        /// 'controlMapsSrv' is the finished splat result the layer filters read (0 = no layers).
+        /// Render callback; the control texture must be in UnorderedAccess state.
+        /// </summary>
+        public void BakeDecoControl(CoveragePlan plan, ID3D12GraphicsCommandList cmd, Terrain terrain,
+            uint heightSrv, uint controlMapsSrv, uint decoControlUAV, int resolution)
         {
+            EnsureCoverageInitialized();
+
+            UploadCoverage(plan, ref _decoStampBuffer, ref _decoStampBufferCapacity,
+                ref _decoSplineBuffer, ref _decoSplineCapacity);
+
+            var device = Engine.Device;
+            cmd.SetComputeRootSignature(device.GlobalRootSignature);
+            cmd.SetDescriptorHeaps(1, new[] { device.SrvHeap });
+
+            var k = _kernelDecoControl;
+            _decoCS.SetBuffer(k, "StampBuf", _decoStampBuffer);
+            _decoCS.SetPushConstant(k, "ControlUAV", decoControlUAV);
+            _decoCS.SetPushConstant(k, "DecoratorCount", (uint)plan.TargetCount);
+            _decoCS.SetPushConstant(k, "Resolution", (uint)resolution);
+            _decoCS.SetPushConstant(k, "HeightTex", heightSrv);
+            _decoCS.SetPushConstant(k, "SplineBuf", _decoSplineBuffer.SrvIndex);
+            _decoCS.SetPushConstant(k, "LayerCount", (uint)plan.LayerCount);
+            _decoCS.SetPushConstant(k, "ControlMaps", controlMapsSrv);
+            _decoCS.SetParam(k, "MaxHeight", terrain.MaxHeight);
+            _decoCS.SetParam(k, "TerrainSizeX", terrain.TerrainSize.X);
+            _decoCS.SetPushConstant(k, "StampCount", (uint)plan.StampCount);
+
+            uint groups = (uint)((resolution + 7) / 8);
+            _decoCS.Dispatch(k, cmd, groups, groups);
+        }
+
+        private void UploadCoverage(CoveragePlan plan,
+            ref GraphicsBuffer stampBuffer, ref int stampCapacity,
+            ref GraphicsBuffer splineBuffer, ref int splineCapacity)
+        {
+            // Both buffers always exist so the kernels have something valid to bind, even with no stamps
+            EnsureUpload<CoverageStampGPU>(ref stampBuffer, ref stampCapacity, plan.Stamps.Count, 16);
+            EnsureUpload<StampSplinePointGPU>(ref splineBuffer, ref splineCapacity, plan.SplinePoints.Count, 128);
+            Upload(stampBuffer, plan.Stamps);
+            Upload(splineBuffer, plan.SplinePoints);
+        }
+
+        // ── Shared helpers ─────────────────────────────────────────────
+
+        /// <summary>
+        /// Sample a stamp's spline into terrain UV points for the GPU. Returns false when the spline
+        /// has fewer than two points.
+        /// </summary>
+        private static bool BuildSplinePoints(
+            TerrainStamp stamp, Vector3 terrainOrigin, Vector2 terrainSize, float maxHeight, float heightOffset,
+            List<StampSplinePointGPU> splinePoints,
+            out uint splinePointOffset, out uint splinePointCount, out float radius, bool useWorldY = true)
+        {
+            splinePointOffset = 0xFFFFFFFF;
+            splinePointCount = 0;
+            radius = 0;
+
             var spline = stamp.GetSpline();
             if (spline == null || spline.Points.Count < 2)
-            {
-                splinePointOffset = 0xFFFFFFFF;
-                splinePointCount = 0;
-                return;
-            }
+                return false;
 
-            float maxHeight = terrain.MaxHeight;
             splinePointOffset = (uint)splinePoints.Count;
             float uvRadius = stamp.Radius / Math.Max(terrainSize.X, terrainSize.Y);
 
@@ -1855,14 +1280,12 @@ namespace Freefall.Assets
                 float t = (float)i / sampleCount;
                 var worldPos = spline.GetWorldPoint(t);
 
-                float u = (worldPos.X - terrainOrigin.X) / terrainSize.X;
-                float v = (worldPos.Z - terrainOrigin.Z) / terrainSize.Y;
-                float normalizedH = (worldPos.Y + heightOffset) / maxHeight;
-
                 splinePoints.Add(new StampSplinePointGPU
                 {
-                    UV = new Vector2(u, v),
-                    Height = normalizedH,
+                    UV = new Vector2(
+                        (worldPos.X - terrainOrigin.X) / terrainSize.X,
+                        (worldPos.Z - terrainOrigin.Z) / terrainSize.Y),
+                    Height = ((useWorldY ? worldPos.Y : 0f) + heightOffset) / maxHeight,
                     HalfWidth = uvRadius * spline.GetWidth(t),
                 });
             }
@@ -1871,57 +1294,44 @@ namespace Freefall.Assets
             if (spline.Closed) ptCount |= 0x80000000;
 
             splinePointCount = ptCount;
+            // The stamp's own radius stays the reference: the shader scales the falloff by
+            // (sample half-width / Radius), see EvaluateStampWeight.
             radius = uvRadius;
-            center = Vector2.Zero;
+            return true;
         }
 
-        private static void BuildRadialCenter(
-            TerrainStamp stamp,
-            Vector3 terrainOrigin, Vector2 terrainSize,
-            ref float radius, ref Vector2 center,
-            ref uint splinePointOffset, ref uint splinePointCount)
+        private static void EnsureUpload<T>(ref GraphicsBuffer buffer, ref int capacity, int count, int minimum)
+            where T : unmanaged
         {
-            var pos = stamp.Transform?.WorldPosition ?? Vector3.Zero;
-            float u = (pos.X - terrainOrigin.X) / terrainSize.X;
-            float v = (pos.Z - terrainOrigin.Z) / terrainSize.Y;
-            center = new Vector2(u, v);
-            radius = stamp.Radius / Math.Max(terrainSize.X, terrainSize.Y);
-            splinePointOffset = 0xFFFFFFFF;
-            splinePointCount = 0;
+            if (buffer != null && capacity >= count) return;
+            buffer?.Dispose();
+            capacity = Math.Max(count, minimum);
+            buffer = GraphicsBuffer.CreateUpload<T>(capacity, mapped: true);
         }
 
-        // ── Buffer helpers ───────────────────────────────────────────
-
-        private void EnsureSplatStampBuffer(int count)
+        private static unsafe void Upload<T>(GraphicsBuffer buffer, List<T> items) where T : unmanaged
         {
-            if (_splatStampBuffer != null && _splatStampBufferCapacity >= count) return;
+            if (items.Count == 0) return;
+            var dst = buffer.WritePtr<T>();
+            var src = CollectionsMarshal.AsSpan(items);
+            for (int i = 0; i < src.Length; i++)
+                dst[i] = src[i];
+        }
+
+        /// <summary>
+        /// Release all per-instance GPU resources.
+        /// Static compute shaders and the noise LUT are shared and live for the process lifetime.
+        /// </summary>
+        public void Dispose()
+        {
+            // Only dispose internal scratch buffers. The height texture is an output owned by the
+            // Terrain asset — it persists in the AssetManager cache.
+            _heightStampBuffer?.Dispose();
+            _heightStampSplineBuffer?.Dispose();
             _splatStampBuffer?.Dispose();
-            _splatStampBufferCapacity = Math.Max(count, 16);
-            _splatStampBuffer = GraphicsBuffer.CreateUpload<SplatStampDescriptorGPU>(_splatStampBufferCapacity, mapped: true);
-        }
-
-        private void EnsureSplatStampSplineBuffer(int count)
-        {
-            if (_splatStampSplineBuffer != null && _splatStampSplineCapacity >= count) return;
-            _splatStampSplineBuffer?.Dispose();
-            _splatStampSplineCapacity = Math.Max(count, 128);
-            _splatStampSplineBuffer = GraphicsBuffer.CreateUpload<StampSplinePointGPU>(_splatStampSplineCapacity, mapped: true);
-        }
-
-        private void EnsureDecoStampBuffer(int count)
-        {
-            if (_decoStampBuffer != null && _decoStampBufferCapacity >= count) return;
+            _splatSplineBuffer?.Dispose();
             _decoStampBuffer?.Dispose();
-            _decoStampBufferCapacity = Math.Max(count, 16);
-            _decoStampBuffer = GraphicsBuffer.CreateUpload<DecoStampDescriptorGPU>(_decoStampBufferCapacity, mapped: true);
-        }
-
-        private void EnsureDecoStampSplineBuffer(int count)
-        {
-            if (_decoStampSplineBuffer != null && _decoStampSplineCapacity >= count) return;
-            _decoStampSplineBuffer?.Dispose();
-            _decoStampSplineCapacity = Math.Max(count, 128);
-            _decoStampSplineBuffer = GraphicsBuffer.CreateUpload<StampSplinePointGPU>(_decoStampSplineCapacity, mapped: true);
+            _decoSplineBuffer?.Dispose();
         }
     }
 }

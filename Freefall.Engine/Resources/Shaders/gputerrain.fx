@@ -22,7 +22,7 @@ cbuffer PushConstants : register(b3)
     uint DiffuseMapsIdx;        // 19
     uint NormalMapsIdx;         // 20
     uint DecoControlMapIdx;     // 21: Decoration control texture
-    uint AutoMaskBufIdx;        // 22: StructuredBuffer<LayerAutoMask> for procedural slope/height masking
+    uint _reserved22;           // 22
     uint CascadeBufferSRVIdx;   // 23: SRV: StructuredBuffer<CascadeData>
     uint ShadowCascadeCount;    // 24: uint: number of cascades
     uint CascadeIdxBufIdx;      // 25: SRV: per-entry cascade index (uint)
@@ -31,16 +31,6 @@ cbuffer PushConstants : register(b3)
 
 #include "common.fx"
 // @RenderState(RenderTargets=6)
-
-// Per-layer procedural auto-mask parameters (uploaded from TextureLayer C# properties)
-struct LayerAutoMask
-{
-    float HeightMin, HeightMax;     // normalized 0..1 of MaxHeight
-    float SlopeMin, SlopeMax;       // degrees (0=flat, 90=cliff)
-    float HeightBlend, SlopeBlend;  // blend widths (normalized / degrees)
-    float ProceduralWeight;         // 0=paint only, 1=full procedural
-    float _pad;
-};
 
 // TerrainPatchData: per-instance data written by terrain_quadtree.hlsl compute shader.
 // World transform is computed from patch rect — no per-patch TransformSlot needed.
@@ -238,9 +228,6 @@ FragmentOutput PS(VertexOutput input)
 
     float3 terrainNormal = GetNormal(input.UV2);
     float3 faceNormal = terrainNormal;
-
-    // Load auto-mask buffer (kept for debug mode)
-    StructuredBuffer<LayerAutoMask> AutoMaskBuf = ResourceDescriptorHeap[AutoMaskBufIdx];
 
     float4 color = float4(0, 0, 0, 0);
     float4 normal = float4(0.5, 0.5, 0, 0); // flat normal default (BC5 midpoint)

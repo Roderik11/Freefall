@@ -3,7 +3,9 @@
 //
 // Pipeline:
 //   0. CS_BakeTerrainNormals: heightmap → R16G16_SNORM normal map (one-time)
-//   1. CS_SpawnInstances:     single-pass: camera-centered grid → instance placement + cull → append
+//   1. CS_SpawnInstances:     single-pass: camera-centered grid → instance placement + cull → append.
+//                             The control texture names decorators (coverage only); each decorator is a
+//                             group of variants, and density + clumping are evaluated per variant here.
 //   2. CS_BuildDrawArgs:      reads append counter → writes DispatchMesh indirect args
 //
 // Output: StructuredBuffer<DecoInstance> consumed by the lean AS/MS in grass.fx
@@ -14,7 +16,7 @@
 #pragma kernel CS_BuildDrawArgs
 #pragma kernel CS_BinMeshInstances
 
-#include "decoration_noise.hlsli"   // DecoHeightFactor (shared with decoration_prepass)
+#include "decoration_noise.hlsli"   // DecoClusterMask, DecoHeightFactor
 
 // Push constants (root parameter 0, register b3) — bindless indices only
 cbuffer PushConstants : register(b3)
@@ -39,6 +41,7 @@ cbuffer PushConstants : register(b3)
     uint DrawLODSRVIdx;             // slot 17 — SRV: → draw cmd slot 6
     uint DrawMeshRegSRVIdx;         // slot 18 — SRV: → draw cmd slot 7
     uint DrawMaterialsSRVIdx;       // slot 19 — SRV: → draw cmd slot 14
+    uint DecoratorGroupsIdx;        // slot 20 — SRV: StructuredBuffer<DecoratorGroup> (spawn kernel)
 };
 
 // Hi-Z occlusion parameters (root slot 2 → register b1, shared with terrain_quadtree.hlsl)
@@ -121,6 +124,15 @@ cbuffer DecoParams : register(b4)
 
 // ─── GPU structs (must match grass.fx and TerrainRenderer.cs) ──────────────
 
+// One TerrainDecorator: the slot index stored in the control texture. Its variants are a run of
+// DecoratorSlots.
+struct DecoratorGroup
+{
+    uint VariantOffset;
+    uint VariantCount;
+};
+
+// One decorator variant. Instances carry the index of this record (DecoInstance.SlotIdx).
 struct DecoratorSlot
 {
     float Density;
@@ -133,15 +145,15 @@ struct DecoratorSlot
     float Rot10, Rot11, Rot12;
     float Rot20, Rot21, Rot22;
     float SlopeBias;
-    uint DecoMapSlice;
-    uint SourceLayerMask;
+    uint Seed;                  // decorrelates this variant's scatter and noise fields from the others
+    uint _unused0;
     uint Mode;
     uint TextureIdx;
     float3 HealthyColor;
     float3 DryColor;
     float NoiseSpread;
-    uint ExclusionLayerMask;
-    float ProceduralBlend;
+    uint _unused1;
+    float _unused2;
     float ClusterScale;         // world size of density clumps in m (0 = off)
     float ClusterAmount;        // 0 = uniform, 1 = full clumps + bare gaps
     uint AlphaClip;             // mesh mode: 1 = alpha-test albedo (foliage), 0 = opaque (rocks, pebbles)
@@ -169,7 +181,7 @@ struct DecoInstance
     float  FadeFactor;      // distance fade [0-1]
     float2 Scale;           // (width, height) after density + fade bias
     float2 TerrainUV;       // for ground color sampling in PS
-    uint   SlotIdx;         // decorator slot index
+    uint   SlotIdx;         // decorator variant index (DecoratorSlot)
     uint   LOD;             // selected LOD index
     float  InstanceSeed;    // for color variation in PS
     uint   _pad;
@@ -265,11 +277,18 @@ void CS_BakeTerrainNormals(uint3 dtid : SV_DispatchThreadID)
 //
 // Dispatch(N, N, 1) where N = cells per side around camera.
 // Each group = one cell. [8,8,1] = 64 threads cooperate per cell.
-// Thread 0 loads control data into groupshared; all threads read from there.
+// Thread 0 turns the cell's control data into a list of (variant, instance count) entries in
+// groupshared; all threads read from there. Doing the per-variant clump noise once per cell rather
+// than once per thread is what keeps it cheap.
 // ═══════════════════════════════════════════════════════════════════════════
 
-groupshared uint gs_ctrl[8];
-groupshared bool gs_tileActive;
+#define MAX_CELL_ENTRIES 64     // 8 decorators per texel x 8 variants per decorator
+#define MAX_VARIANTS 8
+
+groupshared uint  gs_entrySlot[MAX_CELL_ENTRIES];    // variant index (DecoratorSlot)
+groupshared uint  gs_entryCount[MAX_CELL_ENTRIES];   // instances to spawn in this cell
+groupshared float gs_entryWeight[MAX_CELL_ENTRIES];  // cubed cell weight, 0..1
+groupshared uint  gs_entries;
 
 [numthreads(8, 8, 1)]
 void CS_SpawnInstances(uint3 gid : SV_GroupID, uint3 gtid3 : SV_GroupThreadID)
@@ -310,12 +329,11 @@ void CS_SpawnInstances(uint3 gid : SV_GroupID, uint3 gtid3 : SV_GroupThreadID)
 
     // ── Thread 0 reads BAKED control texture and populates groupshared ──
     // The baked control texture (RGBA16_UINT, 2 slices) was built by decoration_prepass.hlsl.
-    // Each channel packs (slotIndex << 8) | weight. Up to 8 slots per texel.
+    // Each channel packs (decoratorSlot << 8) | coverage. Up to 8 decorators per texel.
     StructuredBuffer<DecoratorSlot> slots = ResourceDescriptorHeap[DecoratorSlotsIdx];
     if (flatThread == 0)
     {
-        gs_tileActive = false;
-        [unroll] for (uint k = 0; k < 8; k++) gs_ctrl[k] = 0;
+        gs_entries = 0;
 
         // Hi-Z occlusion cull (thread 0 only): skip cells fully behind solid geometry
         if (tileValid && HiZSrvIdx != 0)
@@ -338,26 +356,50 @@ void CS_SpawnInstances(uint3 gid : SV_GroupID, uint3 gtid3 : SV_GroupThreadID)
             uint4 packed0 = controlTex.Load(int4(cx, cy, 0, 0));
             uint4 packed1 = controlTex.Load(int4(cx, cy, 1, 0));
 
-            uint activeIdx = 0;
-            [unroll] for (uint ch = 0; ch < 8; ch++)
+            StructuredBuffer<DecoratorGroup> groups = ResourceDescriptorHeap[DecoratorGroupsIdx];
+
+            // Cell centre in the frame the clump noise is defined in (terrain-local metres, Z measured
+            // from the far edge like the control texture rows)
+            float2 clumpPos = float2((float(cellX) + 0.5) * ts, TerrainSize.y - (float(cellZ) + 0.5) * ts);
+
+            uint entries = 0;
+            for (uint ch = 0; ch < 8; ch++)
             {
                 uint packed = (ch < 4) ? packed0[ch] : packed1[ch - 4];
-                uint slotIdx = packed >> 8;
-                uint weight  = packed & 0xFF;
+                uint groupIdx = packed >> 8;
+                uint coverage = packed & 0xFF;
 
-                if (slotIdx == 255 || weight == 0) continue;
+                if (groupIdx == 255 || coverage == 0) continue;
 
-                DecoratorSlot slot = slots[slotIdx];
+                DecoratorGroup group = groups[groupIdx];
+                uint variantCount = min(group.VariantCount, (uint)MAX_VARIANTS);
 
-                gs_ctrl[activeIdx] = packed;
-                activeIdx++;
+                for (uint v = 0; v < variantCount; v++)
+                {
+                    uint variantIdx = group.VariantOffset + v;
+                    DecoratorSlot variant = slots[variantIdx];
+
+                    // Coverage is shared by the decorator; natural patchiness is the variant's own
+                    float w = float(coverage) / 255.0;
+                    if (variant.ClusterScale > 0 && variant.ClusterAmount > 0)
+                        w *= lerp(1.0, DecoClusterMask(clumpPos, variant.ClusterScale, variant.Seed), saturate(variant.ClusterAmount));
+
+                    w = w * w * w; // aggressive power curve: crush low weights
+                    uint count = min(64u, (uint)(w * 64.0 * variant.Density * DecorationDensity + 0.5));
+                    if (count == 0) continue;
+
+                    gs_entrySlot[entries] = variantIdx;
+                    gs_entryCount[entries] = count;
+                    gs_entryWeight[entries] = w;
+                    entries++;
+                }
             }
-            gs_tileActive = (activeIdx > 0);
+            gs_entries = entries;
         }
     }
     GroupMemoryBarrierWithGroupSync();
 
-    if (!gs_tileActive) return;
+    if (gs_entries == 0) return;
 
     StructuredBuffer<LODEntry>      lodTbl = ResourceDescriptorHeap[LODTableIdx];
 
@@ -372,28 +414,22 @@ void CS_SpawnInstances(uint3 gid : SV_GroupID, uint3 gtid3 : SV_GroupThreadID)
     Texture2D heightTex = ResourceDescriptorHeap[HeightmapIdx];
     Texture2D<float2> bakedNormals = ResourceDescriptorHeap[BakedNormalIdx];
 
-    // Iterate over collected decorators (dynamic loop — all threads share gs_ctrl, no divergence)
-    for (uint ci = 0; ci < 8; ci++)
+    // Iterate over the cell's entries (dynamic loop — all threads share the list, no divergence)
+    uint entryCount = min(gs_entries, (uint)MAX_CELL_ENTRIES);
+    for (uint ci = 0; ci < entryCount; ci++)
     {
-        uint packed = gs_ctrl[ci];
-        uint slotIdx = packed >> 8;
-        uint weight  = packed & 0xFF;
-        if (slotIdx == 255 || weight == 0) break;
+        uint slotIdx = gs_entrySlot[ci];
+        uint decoInstCount = gs_entryCount[ci];
+        float cellWeight = gs_entryWeight[ci];
 
         DecoratorSlot slot = slots[slotIdx];
-
-        // Weight is 0-255 from density map; normalize to 0-1, then scale by max instances per tile
-        float cellWeight = float(weight) / 255.0;
-        cellWeight = cellWeight * cellWeight * cellWeight; // aggressive power curve: crush low weights
-        uint decoInstCount = min(64u, (uint)(cellWeight * 64.0 * slot.Density * DecorationDensity + 0.5));
-        if (decoInstCount == 0) continue;
 
         // Stride loop: 64 threads cooperate to spawn decoInstCount instances
         for (uint instanceIdx = flatThread; instanceIdx < decoInstCount; instanceIdx += 64)
         {
             // Per-instance jitter: seed from integer cell coords to avoid float hash correlation
             uint cellSeed = pcg(uint(cellX) * 1664525u ^ uint(cellZ) * 1013904223u);
-            uint instSeed = pcg(cellSeed + instanceIdx * 747796405u + slotIdx * 2891336453u);
+            uint instSeed = pcg(cellSeed + instanceIdx * 747796405u + slot.Seed * 2891336453u);
             float rngX = float(instSeed) / 4294967295.0;
             float rngY = float(pcg(instSeed)) / 4294967295.0;
             float2 tileOrig = float2(tileOriginX, tileOriginZ);
@@ -444,7 +480,7 @@ void CS_SpawnInstances(uint3 gid : SV_GroupID, uint3 gtid3 : SV_GroupThreadID)
             // Patch-scale height variation, independent of density (lush hollows vs. short grazed patches).
             // Density already couples to height via densityBias (clump fringes stay short).
             if (slot.HeightNoiseScale > 0 && slot.HeightNoiseAmount > 0)
-                scaleH *= DecoHeightFactor(texelUV * TerrainSize, slot.HeightNoiseScale, saturate(slot.HeightNoiseAmount), slotIdx);
+                scaleH *= DecoHeightFactor(texelUV * TerrainSize, slot.HeightNoiseScale, saturate(slot.HeightNoiseAmount), slot.Seed);
 
             // Distance fade: smoothly shrink in the last 25% of range
             float fadeStart = range * 0.85;

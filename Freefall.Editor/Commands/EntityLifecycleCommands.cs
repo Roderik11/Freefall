@@ -337,7 +337,7 @@ namespace Freefall.Editor.Commands
                 return comp;
             }
 
-            // Lists and arrays: convert each element with these same rules (e.g. Spline.Points, Terrain.Layers)
+            // Lists and arrays: convert each element with these same rules (e.g. Spline.Points, TerrainDecorator.Variants)
             if (el.ValueKind == System.Text.Json.JsonValueKind.Array)
             {
                 if (targetType.IsArray)
@@ -349,7 +349,7 @@ namespace Freefall.Editor.Commands
                         array.SetValue(ConvertJsonValue(item, elementType), i++);
                     return array;
                 }
-                // Any IList<T> with a parameterless ctor — includes subclasses like LayerMask : List<ulong>
+                // Any IList<T> with a parameterless ctor — includes List<T> subclasses
                 var listInterface = targetType.GetInterfaces().Append(targetType)
                     .FirstOrDefault(i => i.IsGenericType && i.GetGenericTypeDefinition() == typeof(IList<>));
                 if (listInterface != null && !targetType.IsAbstract && !targetType.IsInterface
@@ -363,7 +363,7 @@ namespace Freefall.Editor.Commands
                 }
             }
 
-            // Plain data objects (e.g. Terrain.TextureLayer, SpectrumBand): build a fresh instance and set members
+            // Plain data objects (e.g. DecoratorVariant, SpectrumBand): build a fresh instance and set members
             // by exact name; members not mentioned keep their constructor defaults.
             if (el.ValueKind == System.Text.Json.JsonValueKind.Object && !targetType.IsPrimitive && !targetType.IsAbstract
                 && (targetType.IsValueType || targetType.GetConstructor(Type.EmptyTypes) != null))

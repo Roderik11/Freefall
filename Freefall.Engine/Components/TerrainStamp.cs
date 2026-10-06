@@ -8,18 +8,33 @@ using Category = System.ComponentModel.CategoryAttribute;
 
 namespace Freefall.Components
 {
+    /// <summary>Where a terrain stamp applies.</summary>
+    public enum StampShape
+    {
+        /// <summary>A circle around the entity, or the corridor/area of a sibling Spline.</summary>
+        Local,
+        /// <summary>The whole terrain the stamp's entity is parented under. Position and radius are ignored;
+        /// what limits it is the stamp's filter (slope, height, layers).</summary>
+        Global,
+    }
+
     /// <summary>
-    /// Abstract base for terrain stamp components (HeightStamp, SplatStamp, DecoStamp).
-    /// Provides shape definition (radial or spline corridor/area), edge noise,
+    /// Abstract base for terrain stamp components (HeightStamp, SplatStamp, DecoStamp, ...).
+    /// Provides shape definition (global, radial or spline corridor/area), edge noise,
     /// priority ordering, and gizmo visualization.
+    ///
+    /// Stamps are the only way terrain is authored: everything a terrain shows is the result of
+    /// compositing the stamps in scope in ascending <see cref="Priority"/>.
     /// </summary>
     public abstract class TerrainStamp : Component, ISceneGizmo
     {
+        [Category("Shape")]
+        public StampShape Shape = StampShape.Local;
+
         /// <summary>
         /// Radius for radial stamps (when no Spline is present).
         /// Width for spline-based stamps (half-width on each side of the path).
         /// </summary>
-        [Category("Shape")]
         [ValueRange(0.1f, 200f)]
         public float Radius = 4f;
 
@@ -76,14 +91,52 @@ namespace Freefall.Components
         private Spline _cachedSpline;
         private bool _splineResolved;
 
+        /// <summary>True if this stamp covers the whole terrain it is parented under.</summary>
+        public bool IsGlobal => Shape == StampShape.Global;
+
         /// <summary>True if this stamp follows a spline path.</summary>
         public bool IsSplineMode
         {
             get
             {
+                if (IsGlobal) return false;
                 ResolveSpline();
                 return _cachedSpline != null;
             }
+        }
+
+        /// <summary>
+        /// The terrain a global stamp applies to: the nearest TerrainRenderer on this entity or an ancestor.
+        /// Null when there is none (the stamp then affects nothing).
+        /// </summary>
+        public TerrainRenderer FindOwningTerrain()
+        {
+            for (var t = Transform; t != null; t = t.Parent)
+            {
+                var renderer = t.Entity?.GetComponent<TerrainRenderer>();
+                if (renderer != null) return renderer;
+            }
+            return null;
+        }
+
+        /// <summary>
+        /// Whether this stamp takes part in the given terrain's bake. Local stamps apply to any terrain
+        /// (the shape decides where); global stamps only to the terrain they are parented under.
+        /// </summary>
+        public bool AppliesTo(TerrainRenderer renderer)
+        {
+            if (!Enabled || Entity == null) return false;
+            return !IsGlobal || FindOwningTerrain() == renderer;
+        }
+
+        /// <summary>
+        /// Bake order: ascending Priority, ties broken by a stable per-component id so the result does not
+        /// depend on the order components happen to sit in the cache.
+        /// </summary>
+        public static int CompareBakeOrder(TerrainStamp a, TerrainStamp b)
+        {
+            int byPriority = a.Priority.CompareTo(b.Priority);
+            return byPriority != 0 ? byPriority : a.UID.CompareTo(b.UID);
         }
 
         /// <summary>Get the sibling Spline component, if any.</summary>
@@ -108,6 +161,7 @@ namespace Freefall.Components
         /// </summary>
         public float GetWeight(Vector3 worldPos)
         {
+            if (IsGlobal) return 1f;
             float distance = GetDistance(worldPos, out float width);
             float radius = Radius * width;
             float falloff = Falloff * width;
@@ -276,6 +330,9 @@ namespace Freefall.Components
 
         public void DrawGizmos(GizmoContext ctx)
         {
+            // A global stamp has no shape of its own to show
+            if (IsGlobal) return;
+
             if (IsSplineMode)
                 DrawSplineGizmo(ctx);
             else

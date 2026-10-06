@@ -1,13 +1,11 @@
 using System;
 using System.Collections.Generic;
 using System.Numerics;
-using System.Runtime.InteropServices;
 using System.Text.Json.Serialization;
 using System.ComponentModel;
 using Freefall.Base;
 using Freefall.Graphics;
 using Freefall.Reflection;
-using Vortice.DXGI;
 
 namespace Freefall.Assets
 {
@@ -33,12 +31,6 @@ namespace Freefall.Assets
         _4096 = 4096,
     }
 
-    public enum DecoratorMode { Mesh, Billboard, Cross }
-
-    /// <summary>
-    /// Terrain asset — holds all resource data (heightmap, layers, splatmaps).
-    /// GPU rendering logic and Material live on TerrainRenderer (Component).
-    /// </summary>
     /// <summary>
     /// Granular dirty flags consumed by TerrainRenderer each frame.
     /// Multiple flags can be set simultaneously; renderer clears them after processing.
@@ -49,27 +41,27 @@ namespace Freefall.Assets
         None           = 0,
 
         // ── Atomic flags ──
-        /// <summary>Height layers changed — rebake heightmap via GPU compositor.</summary>
+        /// <summary>Height stamps changed — rebake the heightmap.</summary>
         HeightBake     = 1 << 0,
-        /// <summary>Splatmap control maps changed — repack into RGBA slices.</summary>
+        /// <summary>Splat stamps (or the height they filter on) changed — rebake the layer weights.</summary>
         SplatPack      = 1 << 1,
-        /// <summary>Layer parameters changed (tiling, auto-mask) — re-upload buffers.</summary>
+        /// <summary>Layer parameters changed (tiling, height scale) — re-upload buffers.</summary>
         LayerParams    = 1 << 2,
-        /// <summary>Layer textures added/removed/swapped — rebuild Texture2DArrays.</summary>
+        /// <summary>The set of layers or their textures changed — rebuild Texture2DArrays.</summary>
         TextureArrays  = 1 << 3,
         /// <summary>Baked albedo is stale — re-dispatch albedo bake compute.</summary>
         AlbedoBake     = 1 << 4,
-        /// <summary>Decorator structure changed (add/remove/mesh swap) — rebuild buffers.</summary>
+        /// <summary>The set of decorators or their variants changed (add/remove/mesh swap) — rebuild buffers.</summary>
         DecoStructure  = 1 << 5,
         /// <summary>Decorator parameters changed (density, scale, etc.) — re-upload data.</summary>
         DecoParams     = 1 << 6,
-        /// <summary>Density maps painted — re-dispatch control prepass.</summary>
+        /// <summary>Deco stamps (or the splat result they filter on) changed — rebake decoration coverage.</summary>
         DecoPrepass    = 1 << 7,
 
         // ── Combinations ──
         /// <summary>Height change → rebake heightmap + albedo (slope/height masks shift).</summary>
         HeightAll      = HeightBake | AlbedoBake,
-        /// <summary>Splat layer visuals changed → repack + rebake albedo + refresh decorators.</summary>
+        /// <summary>Splat layer visuals changed → rebake + rebake albedo + refresh decorators.</summary>
         SplatAll       = LayerParams | AlbedoBake | DecoPrepass | SplatPack,
         /// <summary>Full decorator rebuild.</summary>
         DecoAll        = DecoStructure | DecoParams | DecoPrepass,
@@ -78,7 +70,12 @@ namespace Freefall.Assets
     }
 
     /// <summary>
-    /// Terrain asset — holds all resource data (heightmap, layers, splatmaps).
+    /// Terrain asset — dimensions, resolutions and the cache of the last bake.
+    ///
+    /// A terrain holds no authored content. Its height, its ground materials and its ground cover are
+    /// the result of compositing the terrain stamps in the scene (HeightStamp, SplatStamp, DecoStamp, ...),
+    /// which reference <see cref="TerrainLayer"/> and <see cref="TerrainDecorator"/> assets. The layers
+    /// and decorators a terrain renders are derived from those stamps each bake (TerrainRenderer.Palette).
     /// GPU rendering logic and Material live on TerrainRenderer (Component).
     /// </summary>
     [CreateAsset("Terrain")]
@@ -113,9 +110,7 @@ namespace Freefall.Assets
         }
 
         /// <summary>
-        /// Inspector property changes — re-upload layer params (cheap).
-        /// Structural changes (add/remove layers) should explicitly call
-        /// MarkForUpdate(TextureArrays) at the call site.
+        /// Inspector property changes — re-upload layer params and rebake the weights (cheap).
         /// </summary>
         public override void MarkDirty()
         {
@@ -128,10 +123,10 @@ namespace Freefall.Assets
         /// </summary>
         public HeightmapResolution HeightmapResolution = HeightmapResolution._1025;
 
-        /// <summary>Resolution of splatmap control maps. Inherit = use heightmap resolution.</summary>
+        /// <summary>Resolution of the baked layer weights. Inherit = use heightmap resolution.</summary>
         public ControlMapResolution SplatmapResolution = ControlMapResolution.Inherit;
 
-        /// <summary>Resolution of decoration density maps. Inherit = use heightmap resolution.</summary>
+        /// <summary>Resolution of the baked decoration coverage. Inherit = use heightmap resolution.</summary>
         public ControlMapResolution DecorationMapResolution = ControlMapResolution.Inherit;
 
         /// <summary>Effective heightmap resolution as int.</summary>
@@ -167,12 +162,7 @@ namespace Freefall.Assets
         }
 
         /// <summary>
-        /// Non-destructive height layer stack. Composited bottom-to-top via GPU bake.
-        /// </summary>
-        public List<HeightLayer> HeightLayers = [];
-
-        /// <summary>
-        /// GPU-baked heightmap texture (runtime only, regenerated from HeightLayers).
+        /// GPU-baked heightmap texture (runtime only, regenerated from the height stamps in the scene).
         /// </summary>
         [Reflection.DontSerialize]
         [JsonIgnore]
@@ -194,68 +184,35 @@ namespace Freefall.Assets
         internal byte[] PendingBakedHeightmapBytes;
 
         /// <summary>
-        /// Stamps — decal-like height placements. Each stamp is self-contained.
-        /// The baker groups stamps by (Brush, BlendMode, Opacity) at dispatch time.
-        /// </summary>
-        [FormerlySerializedAs("StampGroups")]
-        public List<Stamp> Stamps = [];
-
-        /// <summary>
-        /// The final heightmap: baked result if available, otherwise the first ImportHeightLayer source.
-        /// All consumers (renderer, physics, decorators) should read this.
+        /// The final heightmap. All consumers (renderer, physics, decorators) should read this.
+        /// Null until the first bake (or cache upload) has run.
         /// </summary>
         [Reflection.DontSerialize]
         [JsonIgnore]
-        public Texture Heightmap
-        {
-            get
-            {
-                if (BakedHeightmap != null) return BakedHeightmap;
-
-                // Fallback: first enabled ImportHeightLayer source
-                foreach (var layer in HeightLayers)
-                {
-                    if (layer is ImportHeightLayer import && import.Enabled && import.Source != null)
-                        return import.Source;
-                }
-
-                return null;
-            }
-        }
+        public Texture Heightmap => BakedHeightmap;
 
         // ── Terrain dimensions ──
         public Vector2 TerrainSize = new(1700, 1700);
         public float MaxHeight = 600;
-        public List<TextureLayer> Layers= [];
 
         /// <summary>
         /// Softness of transitions between texture layers, in splat-weight space.
         /// Low = crisp edge shaped by the layer height maps, 1 = fade spans the whole
-        /// weight ramp (stamp Falloff / layer HeightBlend / SlopeBlend).
+        /// weight ramp (stamp Falloff / filter blends).
         /// </summary>
         [ValueRange(0.01f, 1f)]
         public float LayerBlendDepth = 0.2f;
 
-        /// <summary>
-        /// Migration only: catches the old flat ControlMaps list during deserialization.
-        /// Used directly by TerrainRenderer for RGBA-packed GPU splatmap array.
-        /// Will be replaced by per-layer R16 ControlMaps after channel-split migration.
-        /// </summary>
-        [FormerlySerializedAs("ControlMaps")]
-        [DontSerialize]
-        public List<Texture> _legacyControlMaps;
-
         // ── Ground Coverage ──
-        public List<Decoration> Decorations = [];
-        
+
+        /// <summary>Multiplies the density of every decorator variant on this terrain.</summary>
+        [DirtyFlag(TerrainDirtyFlags.DecoParams)]
         [ValueRange(0.1f, 10)]
         public float DecorationDensity = 0.1f;
 
         public float DecorationRadius = 100f;
 
         public bool DrawDetail = true;
-
-        [JsonIgnore] public int DecorationVersion { get; private set; }
 
         // ── HeightField — built internally from Heightmap ──
         [JsonIgnore]
@@ -274,216 +231,9 @@ namespace Freefall.Assets
         internal void SetCookedHeightField(PhysX.HeightField hf) => CookedHeightField = hf;
 
         /// <summary>
-        /// Builds the CPU-side height field from the current Heightmap texture.
-        /// Must be called after Heightmap is assigned (e.g. during loading).
-        /// </summary>
-        public void BuildHeightField(string heightmapPath)
-        {
-            HeightField = Texture.ReadHeightField(heightmapPath);
-        }
-
-        /// <summary>
         /// Sets the CPU-side height field directly from readback data.
         /// Called by TerrainRenderer after GPU heightmap readback.
         /// </summary>
         internal void SetHeightField(float[,] heights) => HeightField = heights;
-
-        // ── Texture Layer ──
-        [Serializable]
-        public class TextureLayer
-        {
-            /// <summary>Stable unique ID for this layer. Used by Decoration.SourceLayerIds
-            /// and ExclusionLayerIds to survive layer reordering.</summary>
-            public ulong LayerId = IDGenerator.GetUID();
-
-            [DirtyFlag(TerrainDirtyFlags.TextureArrays | TerrainDirtyFlags.AlbedoBake)]
-            public Texture Diffuse;
-
-            [DirtyFlag(TerrainDirtyFlags.TextureArrays | TerrainDirtyFlags.AlbedoBake)]
-            public Texture Normals;
-
-            [DirtyFlag(TerrainDirtyFlags.TextureArrays)]
-            public Texture Height;
-
-            /// <summary>Per-layer displacement height scale (multiplied with global SSDM scale).</summary>
-            [DirtyFlag(TerrainDirtyFlags.LayerParams)]
-            [ValueRange(0f, 5f)]
-            public float HeightScale = 1.0f;
-
-            [DirtyFlag(TerrainDirtyFlags.SplatAll)]
-            public Vector2 Tiling = Vector2.One;
-
-            /// <summary>Splatmap controlling where this layer paints (R8, hidden subasset).</summary>
-            ///
-            [Browsable(false)]
-            public Texture ControlMap;
-
-            /// <summary>Staging: raw R16 bytes loaded from cache, consumed by GPU upload.</summary>
-            [Reflection.DontSerialize]
-            [JsonIgnore]
-            public byte[] PendingControlMapBytes;
-
-            // ── Procedural Auto-Mask ──────────────────────────────────
-
-            /// <summary>Height range for procedural mask (normalized 0..1 of MaxHeight).</summary>
-            [DirtyFlag(TerrainDirtyFlags.SplatAll)]
-            public Vector2 HeightRange = new(0, 1);
-
-            /// <summary>Slope range for procedural mask (degrees, 0=flat, 90=cliff).</summary>
-            [DirtyFlag(TerrainDirtyFlags.SplatAll)]
-            public Vector2 SlopeRange = new(0, 90);
-
-            /// <summary>Smooth blend width at height range edges (normalized 0..1).</summary>
-            [DirtyFlag(TerrainDirtyFlags.SplatAll)]
-            [ValueRange(0f, 0.5f)]
-            public float HeightBlend = 0.05f;
-
-            /// <summary>Smooth blend width at slope range edges (degrees).</summary>
-            [DirtyFlag(TerrainDirtyFlags.SplatAll)]
-            [ValueRange(0f, 30f)]
-            public float SlopeBlend = 5.0f;
-
-            /// <summary>Procedural auto-mask blend.
-            /// Positive: max(paint, procedural * weight) — paint adds.
-            /// Negative: procedural * |weight| * (1 - paint) — paint erases.</summary>
-            [DirtyFlag(TerrainDirtyFlags.SplatAll)]
-            [ValueRange(-1f, 1f)]
-            public float ProceduralWeight = 0.0f;
-        }
-
-        // ── Ground Coverage Decoration ──
-        /// <summary>
-        /// A single decoration entry. References a StaticMesh or Texture for rendering,
-        /// plus an optional ControlMap (grayscale) that controls placement density.
-        /// At runtime, all unique ControlMaps are packed into a Texture2DArray.
-        /// </summary>
-        [Serializable]
-        public class Decoration
-        {
-            [DirtyFlag(TerrainDirtyFlags.DecoStructure)]
-            public DecoratorMode Mode = DecoratorMode.Mesh;
-
-            [DirtyFlag(TerrainDirtyFlags.DecoStructure)]
-            public Mesh Mesh;       // Mesh mode: geometry + LODs
-
-            /// <summary>Mesh mode: material to render the mesh with (meshes don't carry one; prefabs do).
-            /// Without it mesh decorators rendered with material 0.</summary>
-            [DirtyFlag(TerrainDirtyFlags.DecoStructure)]
-            public Material Material;
-
-            [DirtyFlag(TerrainDirtyFlags.DecoStructure)]
-            public Texture Texture;       // Billboard/Cross mode: alpha-tested texture
-
-            // ── Layer-Driven Placement ────────────────────────────────
-
-            /// <summary>
-            /// TextureLayer IDs that drive this decorator's density.
-            /// The effective weight is max(layerWeight[i]) for all referenced layers.
-            /// Empty = standalone mode (uses own ControlMap instead).
-            /// </summary>
-            [DirtyFlag(TerrainDirtyFlags.DecoStructure)]
-            public LayerMask SourceLayerIds = new();
-
-            /// <summary>
-            /// TextureLayer IDs that suppress this decorator's density.
-            /// Effective weight *= (1 - max(layerWeight[i])) for all referenced layers.
-            /// Empty = no exclusion.
-            /// </summary>
-            [DirtyFlag(TerrainDirtyFlags.DecoStructure)]
-            public LayerMask ExclusionLayerIds = new();
-
-            // ── Standalone Fallback ──────────────────────────────────
-
-            /// <summary>
-            /// Controls placement density (R8, hidden subasset).
-            /// Only used when SourceLayerIds is empty (standalone mode).
-            /// Without a control map, the decorator renders everywhere.
-            /// </summary>
-            [FormerlySerializedAs("DensityMap")]
-            [Browsable(false)]
-            public Texture ControlMap;
-
-            /// <summary>Staging: raw R16 bytes loaded from cache, consumed by GPU upload.</summary>
-            [Reflection.DontSerialize]
-            [JsonIgnore]
-            public byte[] PendingControlMapBytes;
-
-            // ── Procedural Blend ──────────────────────────────────────
-
-            /// <summary>Blend between painted density and layer-driven procedural.
-            /// Positive: max(paint, procedural * blend) — paint adds on top.
-            /// Negative: procedural * |blend| * (1 - paint) — paint erases.</summary>
-            [DirtyFlag(TerrainDirtyFlags.DecoPrepass | TerrainDirtyFlags.DecoParams)]
-            [ValueRange(-1f, 1f)]
-            public float ProceduralBlend = 1.0f;
-
-            // ── Clustering ────────────────────────────────────────────
-
-            /// <summary>World size (m) of the density clumps this decorator grows in. 0 = uniform coverage.
-            /// Real meadows are patchy: clover in drifts, grass tufts in clumps, flowers in scattered pockets.</summary>
-            [DirtyFlag(TerrainDirtyFlags.DecoPrepass | TerrainDirtyFlags.DecoParams)]
-            [ValueRange(0f, 100f)]
-            public float ClusterScale = 0f;
-
-            /// <summary>How strongly the clumps modulate density: 0 = uniform, 1 = dense clumps with bare gaps between.</summary>
-            [DirtyFlag(TerrainDirtyFlags.DecoPrepass | TerrainDirtyFlags.DecoParams)]
-            [ValueRange(0f, 1f)]
-            public float ClusterAmount = 0.7f;
-
-            /// <summary>World size (m) of short vs. lush patches, independent of the clumps. 0 = off.
-            /// Density already shortens plants at clump fringes; this varies height across whole areas.</summary>
-            [DirtyFlag(TerrainDirtyFlags.DecoParams)]
-            [ValueRange(0f, 200f)]
-            public float HeightNoiseScale = 0f;
-
-            /// <summary>Height variation strength: 0 = none, 1 = 0.4x (short patches) .. 1.4x (lush patches).</summary>
-            [DirtyFlag(TerrainDirtyFlags.DecoParams)]
-            [ValueRange(0f, 1f)]
-            public float HeightNoiseAmount = 0.5f;
-
-            // ── Rendering Parameters ─────────────────────────────────
-
-            /// <summary>Instances per square meter.</summary>
-            [DirtyFlag(TerrainDirtyFlags.DecoParams)]
-            [ValueRange(.01f, 4)]
-            public float Density = 1.0f;
-
-            [DirtyFlag(TerrainDirtyFlags.DecoParams)]
-            [ValueRange(0f, 1f)]
-            public float Weight = 1.0f;
-
-            [DirtyFlag(TerrainDirtyFlags.DecoParams)]
-            public Vector2 HeightRange = new(0.3f, 0.6f);
-
-            [DirtyFlag(TerrainDirtyFlags.DecoParams)]
-            public Vector2 WidthRange = new(0.2f, 0.4f);
-
-            /// <summary>Root rotation applied to mesh vertices (euler degrees).</summary>
-            [DirtyFlag(TerrainDirtyFlags.DecoParams)]
-            public Vector3 RootRotation = new(-90, 0, 0);
-
-            /// <summary>Blend factor for aligning to terrain slope (0=upright, 1=fully aligned).</summary>
-            [DirtyFlag(TerrainDirtyFlags.DecoParams)]
-            [ValueRange(-1, 1)]
-            public float SlopeBias = 0.0f;
-
-            /// <summary>Tint color for "healthy" instances (multiplicative). Alpha=0 means no tinting.</summary>
-            [DirtyFlag(TerrainDirtyFlags.DecoParams)]
-            public Vector4 HealthyColor = new(1, 1, 1, 1);
-
-            /// <summary>Tint color for "dry" instances (multiplicative). Alpha=0 means no tinting.</summary>
-            [DirtyFlag(TerrainDirtyFlags.DecoParams)]
-            public Vector4 DryColor = new(1, 1, 1, 1);
-
-            /// <summary>World-space noise frequency for healthy/dry blend. 0 = uniform healthy color.</summary>
-            [DirtyFlag(TerrainDirtyFlags.DecoParams)]
-            [ValueRange(0f, 1f)]
-            public float NoiseSpread = 1.0f;
-
-            /// <summary>True if this decorator is driven by texture layer weights.</summary>
-            [Reflection.DontSerialize]
-            [JsonIgnore]
-            public bool IsLayerDriven => SourceLayerIds.Count > 0;
-        }
     }
 }

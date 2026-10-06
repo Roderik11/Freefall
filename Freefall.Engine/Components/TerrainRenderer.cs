@@ -144,6 +144,9 @@ namespace Freefall.Components
         private GraphicsBuffer? _decoratorHeadersBuffer;
         private GraphicsBuffer? _decoratorSlotsBuffer;
         private GraphicsBuffer? _decoratorLODTableBuffer;
+        private GraphicsBuffer? _decoratorGroupsBuffer;  // one (variant offset, count) per decorator slot
+        private int _decoSlotCapacity, _decoLodCapacity, _decoGroupCapacity;
+        private int _decoVariantCount;
         private bool _decoratorBuffersBuilt;
         private bool _decoratorDispatched;
 
@@ -183,11 +186,9 @@ namespace Freefall.Components
         private bool _bakedNormalsDirty = true;
 
         // ───── Decoration Control Prepass ─────────────────────────────────
-        private ComputeShader? _decoPrepassCS;
         private ID3D12Resource? _decoControlTex;     // RGBA16_UINT, 2 slices
         private uint _decoControlUAV;
         private uint _decoControlSRV;
-        private GraphicsBuffer? _layerCtrlSrvBuffer; // StructuredBuffer<uint> of per-layer ControlMap SRVs
 
         // ───── Baked Terrain Albedo ───────────────────────────────────────
         private ComputeShader? _albedoBakeCS;
@@ -197,18 +198,31 @@ namespace Freefall.Components
         private GraphicsBuffer? _tilingBuffer;       // StructuredBuffer<float4>, 32 entries
         private const int BakedAlbedoSize = 256;
 
-        // ───── Procedural Auto-Mask Buffer ────────────────────────────────
-        // Must match LayerAutoMask in gputerrain.fx (32 bytes per entry)
-        [StructLayout(LayoutKind.Sequential)]
-        private struct LayerAutoMaskGPU
-        {
-            public float HeightMin, HeightMax;       // normalized 0..1
-            public float SlopeMin, SlopeMax;         // degrees
-            public float HeightBlend, SlopeBlend;    // blend widths
-            public float ProceduralWeight;           // 0 = paint only
-            public float _pad;
-        }
-        private GraphicsBuffer? _layerAutoMaskBuffer; // StructuredBuffer<LayerAutoMaskGPU>, 32 entries
+        // ───── Palette ──────────────────────────────────────────────────
+        // What this terrain renders is derived from the stamps in scope, never stored: the layers its
+        // splat stamps reference (one channel of the packed control array each, in bake order) and the
+        // decorators its deco stamps add (one slot of the decoration control texture each).
+        private List<TerrainLayer> _layerPalette = new();
+        private List<TerrainDecorator> _decoratorPalette = new();
+        private List<SplatStamp> _splatStamps = new();   // in bake order, collected with the palette
+        private List<DecoStamp> _decoStamps = new();
+        private readonly List<string> _layerWarnings = new();
+        private readonly List<string> _decoWarnings = new();
+
+        /// <summary>The layers this terrain renders, by control-array channel.</summary>
+        [Browsable(false)]
+        public IReadOnlyList<TerrainLayer> LayerPalette => _layerPalette;
+
+        /// <summary>The decorators this terrain renders, by control-texture slot.</summary>
+        [Browsable(false)]
+        public IReadOnlyList<TerrainDecorator> DecoratorPalette => _decoratorPalette;
+
+        /// <summary>Problems found while resolving the palette (too many layers, stamps that cannot apply).</summary>
+        [Browsable(false)]
+        public IReadOnlyList<string> PaletteWarnings => _layerWarnings.Concat(_decoWarnings).ToList();
+
+        // Decoration coverage bake prepared on the main thread, run by the next decorator dispatch
+        private TerrainBaker.CoveragePlan? _pendingDecoPlan;
 
         // ───── Height Bake (GPU layer compositor) ─────────────────────────
         private bool _needHeightFieldReadback;
@@ -221,222 +235,6 @@ namespace Freefall.Components
         private uint _packedControlArrayUAV;        // full-array UAV for stamp overlay
         private int _packedArrayResolution;
         private int _packedSliceCount;
-
-        /// <summary>
-        /// Enqueues a brush stroke to be dispatched on the render thread.
-        /// Points are in terrain UV space [0..1].
-        /// </summary>
-        public void EnqueueBrushStroke(Vector2[] strokePoints, int pointCount,
-                                       uint mode, float strength,
-                                       float radius, float falloff,
-                                       float targetHeight = 0,
-                                       TerrainBaker.ControlMapTarget target = TerrainBaker.ControlMapTarget.Height,
-                                       int layerIndex = 0)
-        {
-            if (Terrain == null || pointCount == 0) return;
-
-            // Resolve target: determine the Action<Texture> setter
-            Action<Texture> setControlMap = null;
-            switch (target)
-            {
-                case TerrainBaker.ControlMapTarget.Height:
-                {
-                    var paintLayer = Terrain.HeightLayers.OfType<PaintHeightLayer>().FirstOrDefault();
-                    if (paintLayer == null)
-                    {
-                        paintLayer = new PaintHeightLayer();
-                        Terrain.HeightLayers.Add(paintLayer);
-                    }
-                    var layer = paintLayer;
-                    setControlMap = tex => layer.ControlMap = tex;
-                    break;
-                }
-                case TerrainBaker.ControlMapTarget.Splatmap:
-                    if (Terrain.Layers != null && layerIndex >= 0 && layerIndex < Terrain.Layers.Count)
-                    {
-                        var layer = Terrain.Layers[layerIndex];
-                        setControlMap = tex => layer.ControlMap = tex;
-                    }
-                    break;
-                case TerrainBaker.ControlMapTarget.Density:
-                    if (Terrain.Decorations != null && layerIndex >= 0 && layerIndex < Terrain.Decorations.Count)
-                    {
-                        var deco = Terrain.Decorations[layerIndex];
-                        setControlMap = tex => deco.ControlMap = tex;
-                    }
-                    break;
-            }
-
-            if (setControlMap == null) return;
-
-            // Capture references for the lambda
-            var terrain = Terrain;
-            var baker = _baker;
-            var pts = strokePoints;
-            int count = pointCount;
-            var tgt = target;
-            int idx = layerIndex;
-            var setter = setControlMap;
-            bool isHeightTarget = target == TerrainBaker.ControlMapTarget.Height;
-
-            CommandBuffer.Enqueue(RenderPass.Opaque, (list) =>
-            {
-                baker.PaintBrush(terrain, tgt, idx, setter, list,
-                                 pts, count, mode, strength,
-                                 radius, falloff, targetHeight);
-                if (isHeightTarget)
-                {
-                    terrain.MarkForUpdate(TerrainDirtyFlags.HeightBake | TerrainDirtyFlags.AlbedoBake);
-                    _heightRangePyramidBuilt = false;
-                }
-                if (tgt == TerrainBaker.ControlMapTarget.Splatmap)
-                    terrain.MarkForUpdate(TerrainDirtyFlags.SplatPack | TerrainDirtyFlags.AlbedoBake);
-            });
-        }
-
-        /// <summary>
-        /// GPU-only brush: enqueues a compute raycast against the baked heightmap
-        /// followed by painting at the hit UV. No CPU heightfield involvement.
-        /// </summary>
-        public void EnqueueBrushRaycastAndPaint(Vector3 rayOrigin, Vector3 rayDir,
-                                                 uint mode, float strength,
-                                                 float radius, float falloff,
-                                                 float targetHeight = 0,
-                                                 TerrainBaker.ControlMapTarget target = TerrainBaker.ControlMapTarget.Height,
-                                                 int layerIndex = 0)
-        {
-            if (Terrain == null) return;
-
-            // Resolve the ControlMap setter (same pattern as EnqueueBrushStroke)
-            Action<Texture> setControlMap = null;
-            switch (target)
-            {
-                case TerrainBaker.ControlMapTarget.Height:
-                {
-                    var paintLayer = Terrain.HeightLayers.OfType<PaintHeightLayer>().FirstOrDefault();
-                    if (paintLayer == null)
-                    {
-                        paintLayer = new PaintHeightLayer();
-                        Terrain.HeightLayers.Add(paintLayer);
-                    }
-                    var layer = paintLayer;
-                    setControlMap = tex => layer.ControlMap = tex;
-                    break;
-                }
-                case TerrainBaker.ControlMapTarget.Splatmap:
-                    if (Terrain.Layers != null && layerIndex >= 0 && layerIndex < Terrain.Layers.Count)
-                    {
-                        var layer = Terrain.Layers[layerIndex];
-                        setControlMap = tex => layer.ControlMap = tex;
-                    }
-                    break;
-                case TerrainBaker.ControlMapTarget.Density:
-                    if (Terrain.Decorations != null && layerIndex >= 0 && layerIndex < Terrain.Decorations.Count)
-                    {
-                        var deco = Terrain.Decorations[layerIndex];
-                        setControlMap = tex => deco.ControlMap = tex;
-                    }
-                    break;
-            }
-
-            if (setControlMap == null) return;
-
-            // Capture for lambda
-            var terrain = Terrain;
-            var baker = _baker;
-            var origin = Transform?.Position ?? Vector3.Zero;
-            var size = terrain.TerrainSize;
-            var maxH = terrain.MaxHeight;
-            var setter = setControlMap;
-            var tgt = target;
-            int idx = layerIndex;
-
-            CommandBuffer.Enqueue(RenderPass.Opaque, (list) =>
-            {
-                baker.BrushRaycastAndPaint(terrain, tgt, idx, setter, list,
-                    rayOrigin, rayDir, origin, size, maxH,
-                    mode, strength, radius, falloff, targetHeight);
-
-                switch(tgt)
-                {
-                    case TerrainBaker.ControlMapTarget.Height:
-                        terrain.MarkForUpdate(TerrainDirtyFlags.HeightBake | TerrainDirtyFlags.AlbedoBake);
-                        _heightRangePyramidBuilt = false;
-                        break;
-                    case TerrainBaker.ControlMapTarget.Splatmap:
-                    terrain.MarkForUpdate(TerrainDirtyFlags.SplatPack | TerrainDirtyFlags.AlbedoBake);
-                        break;
-                    case TerrainBaker.ControlMapTarget.Density:
-                    terrain.MarkForUpdate(TerrainDirtyFlags.DecoPrepass | TerrainDirtyFlags.DecoParams);
-                        break;
-                }
-            });
-        }
-
-        /// <summary>
-        /// Enqueues a channel import from a source texture into a ControlMap.
-        /// channelIndex: 0=R, 1=G, 2=B, 3=A
-        /// </summary>
-        public void EnqueueImportChannel(Texture sourceTexture, int channelIndex,
-                                         TerrainBaker.ControlMapTarget target, int layerIndex)
-        {
-            if (Terrain == null || sourceTexture == null) return;
-
-            // Resolve setter
-            Action<Texture> setControlMap = null;
-            switch (target)
-            {
-                case TerrainBaker.ControlMapTarget.Height:
-                {
-                    var paintLayer = Terrain.HeightLayers.OfType<PaintHeightLayer>().FirstOrDefault();
-                    if (paintLayer == null)
-                    {
-                        paintLayer = new PaintHeightLayer();
-                        Terrain.HeightLayers.Add(paintLayer);
-                    }
-                    var layer = paintLayer;
-                    setControlMap = tex => layer.ControlMap = tex;
-                    break;
-                }
-                case TerrainBaker.ControlMapTarget.Splatmap:
-                    if (Terrain.Layers != null && layerIndex >= 0 && layerIndex < Terrain.Layers.Count)
-                    {
-                        var layer = Terrain.Layers[layerIndex];
-                        setControlMap = tex => layer.ControlMap = tex;
-                    }
-                    break;
-                case TerrainBaker.ControlMapTarget.Density:
-                    if (Terrain.Decorations != null && layerIndex >= 0 && layerIndex < Terrain.Decorations.Count)
-                    {
-                        var deco = Terrain.Decorations[layerIndex];
-                        setControlMap = tex => deco.ControlMap = tex;
-                    }
-                    break;
-            }
-
-            if (setControlMap == null) return;
-
-            var terrain = Terrain;
-            var baker = _baker;
-            var src = sourceTexture;
-            int ch = channelIndex;
-            var tgt = target;
-            int idx = layerIndex;
-            var setter = setControlMap;
-            bool isHeightTarget = target == TerrainBaker.ControlMapTarget.Height;
-
-            CommandBuffer.Enqueue(RenderPass.Opaque, (list) =>
-            {
-                baker.ImportChannel(terrain, tgt, idx, setter, list, src, ch);
-                if (isHeightTarget)
-                {
-                    terrain.MarkForUpdate(TerrainDirtyFlags.HeightBake | TerrainDirtyFlags.AlbedoBake);
-                    _heightRangePyramidBuilt = false;
-                }
-                if (tgt == TerrainBaker.ControlMapTarget.Splatmap)
-                    terrain.MarkForUpdate(TerrainDirtyFlags.SplatPack | TerrainDirtyFlags.AlbedoBake);
-            });
-        }
 
         // ───── Lifecycle ──────────────────────────────────────────────────
 
@@ -461,6 +259,7 @@ namespace Freefall.Components
 
             MessageDispatcher.AddListener(EngineMsg.StampChanged, OnStampChanged);
             MessageDispatcher.AddListener(EngineMsg.SplineChanged, OnSplineChanged);
+            MessageDispatcher.AddListener("AssetDirty", OnAssetDirty);
         }
 
         public override void Destroy()
@@ -533,7 +332,6 @@ namespace Freefall.Components
             _decoControlTex?.Release();
             if (_decoControlUAV != 0) device?.ReleaseBindlessIndex(_decoControlUAV);
             if (_decoControlSRV != 0) device?.ReleaseBindlessIndex(_decoControlSRV);
-            _layerCtrlSrvBuffer?.Dispose();
 
             // ── Baked albedo ──
             _bakedAlbedoTex?.Release();
@@ -553,6 +351,7 @@ namespace Freefall.Components
             _decoratorHeadersBuffer?.Dispose();
             _decoratorSlotsBuffer?.Dispose();
             _decoratorLODTableBuffer?.Dispose();
+            _decoratorGroupsBuffer?.Dispose();
 
             // ── Deco compute buffers ──
             _decoInstanceBuffer?.Dispose();
@@ -565,26 +364,23 @@ namespace Freefall.Components
             _meshDrawArgsBuffer?.Dispose();
             _meshDrawCountBuffer?.Dispose();
 
-            // ── Auto-mask buffer ──
-            _layerAutoMaskBuffer?.Dispose();
-
             // ── Compute shaders ──
             _quadtreeCS?.Dispose();
             _grassCS?.Dispose();
-            _decoPrepassCS?.Dispose();
             _albedoBakeCS?.Dispose();
 
             // ── Patch mesh ──
             _patchMesh?.Dispose();
 
-            // ── Baker: release scratch buffers (stamp, stroke, raycast, pack) ──
-            // Height texture and control maps are NOT released — they're owned by the
+            // ── Baker: release scratch buffers (stamp descriptors, spline points) ──
+            // The height texture is NOT released — it is owned by the
             // cached Terrain asset and persist for reuse on next scene load.
             _baker?.Dispose();
             _baker = null;
 
             MessageDispatcher.RemoveListener(EngineMsg.StampChanged, OnStampChanged);
             MessageDispatcher.RemoveListener(EngineMsg.SplineChanged, OnSplineChanged);
+            MessageDispatcher.RemoveListener("AssetDirty", OnAssetDirty);
         }
 
         private bool _textureArraysInitialized;
@@ -603,24 +399,6 @@ namespace Freefall.Components
         public void Draw()
         {
             if (Camera.Main == null || Terrain == null || !_computeInitialized) return;
-
-            // ── Consume dirty flags from Terrain ──
-            if (Terrain.ConsumeFlags(TerrainDirtyFlags.TextureArrays) || !_textureArraysInitialized)
-            {
-                try
-                {
-                    RebuildTextureArrays();
-                    _textureArraysInitialized = true;
-                }
-                catch (Exception ex)
-                {
-                    Debug.LogError("[TerrainRenderer]", $"RebuildTextureArrays failed: {ex.Message}");
-                    if (Engine.Device.IsDeviceLost) return;
-                }
-            }
-
-            if (Terrain.ConsumeFlags(TerrainDirtyFlags.LayerParams))
-                UpdateLayerParams();
 
             var material = Material;
             if (material == null || material.Effect == null) return;
@@ -668,41 +446,60 @@ namespace Freefall.Components
                                       TerrainDirtyFlags.AlbedoBake | TerrainDirtyFlags.DecoPrepass);
             }
 
-            // GPU height layer bake (runs before any heightmap access)
-            bool hasHeightWork = Terrain.HeightLayers.Count > 0 || Terrain.Stamps.Count > 0
-                                 || ComponentCache<HeightStamp>.All.Count > 0;
+            // ── Height: lay out the bake from the height stamps in scope ──
             bool heightBake = Terrain.ConsumeFlags(TerrainDirtyFlags.HeightBake);
+            TerrainBaker.HeightPlan? heightPlan = heightBake ? _baker.PrepareHeight(Terrain, this) : null;
+            bool hasHeightWork = heightPlan is { HasWork: true };
             if (heightBake)
             {
-                // A bake nobody gave a region for (first bake, painting, layer edits) may change anything
+                // A bake nobody gave a region for (first bake, terrain settings) may change anything
                 if (!_heightRegionMarked) _heightChangeAll = true;
                 _heightRegionMarked = false;
             }
-            if (heightBake && hasHeightWork)
+
+            // ── Palette: the layers and decorators this terrain renders are whatever its stamps reference ──
+            // Resolved before anything built from it (texture arrays, layer params, decorator buffers).
+            // New heights change what the stamps' height/slope filters let through, so they rebake both.
+            bool splatDirty = Terrain.ConsumeFlags(TerrainDirtyFlags.SplatPack) || hasHeightWork;
+            bool decoDirty = Terrain.ConsumeFlags(TerrainDirtyFlags.DecoPrepass) || splatDirty;
+
+            if (splatDirty || decoDirty)
+            {
+                if (splatDirty) RefreshLayerPalette();
+                RefreshDecoratorPalette();
+            }
+
+            if (Terrain.ConsumeFlags(TerrainDirtyFlags.TextureArrays) || !_textureArraysInitialized)
+            {
+                try
+                {
+                    RebuildTextureArrays();
+                    _textureArraysInitialized = true;
+                }
+                catch (Exception ex)
+                {
+                    Debug.LogError("[TerrainRenderer]", $"RebuildTextureArrays failed: {ex.Message}");
+                    if (Engine.Device.IsDeviceLost) return;
+                }
+            }
+
+            if (Terrain.ConsumeFlags(TerrainDirtyFlags.LayerParams))
+                UpdateLayerParams();
+
+            // GPU height bake (runs before any heightmap access)
+            if (hasHeightWork)
             {
                 var baker = _baker;
-
-                // Upload any pending ControlMap data loaded from cache
-                foreach (var layer in Terrain.HeightLayers)
-                {
-                    if (layer is PaintHeightLayer paint && paint.PendingControlMapBytes != null)
-                    {
-                        var p = paint; // capture for lambda
-                        baker.UploadControlMap(TerrainBaker.ControlMapTarget.Height, 0,
-                            paint.PendingControlMapBytes, Terrain.EffectiveHeightmapResolution,
-                            tex => p.ControlMap = tex);
-                        paint.PendingControlMapBytes = null; // consumed
-                    }
-                }
-
+                var terrain = Terrain;
+                var plan = heightPlan!;
                 var renderer = this;
                 System.Threading.Interlocked.Increment(ref _heightBakesPending);
                 CommandBuffer.Enqueue(RenderPass.Opaque, (list) =>
                 {
                     System.Threading.Interlocked.Decrement(ref renderer._heightBakesPending);
-                    baker.Bake(Terrain, list);
+                    baker.BakeHeight(terrain, plan, list);
                     _heightRangePyramidBuilt = false; // force rebuild with new heights
-                    Terrain.MarkForUpdate(TerrainDirtyFlags.AlbedoBake); // re-bake albedo with new terrain shape
+                    terrain.MarkForUpdate(TerrainDirtyFlags.AlbedoBake); // re-bake albedo with new terrain shape
                     _needHeightFieldReadback = true; // trigger CPU-side heightfield rebuild next frame
                     renderer._bakedNormalsDirty = true; // normals depend on height
                     renderer.BakeTerrainNormals(list);
@@ -712,7 +509,7 @@ namespace Freefall.Components
             // Capture heightmap AFTER cache upload / bake — BakedHeightmap may have just been set above
             var heightmap = Terrain.Heightmap;
 
-            // Debounced CPU heightfield readback — only when baking has settled (not during active painting)
+            // Debounced CPU heightfield readback — only when baking has settled (not while a stamp is dragged)
             if (_needHeightFieldReadback && !Terrain.NeedsUpdate(TerrainDirtyFlags.HeightBake))
             {
                 _needHeightFieldReadback = false;
@@ -737,124 +534,54 @@ namespace Freefall.Components
                 }
             }
 
-            // Upload any pending splatmap/density ControlMap data loaded from cache
-            if (Terrain?.Layers != null)
+            // ── Splat: composite the splat stamps into the packed layer weights ──
+            if (splatDirty)
             {
-                var baker2 = _baker;
-                for (int i = 0; i < Terrain.Layers.Count; i++)
-                {
-                    var layer = Terrain.Layers[i];
-                    if (layer.PendingControlMapBytes != null)
-                    {
-                        var l = layer;
-                        int idx = i;
-                        baker2.UploadControlMap(TerrainBaker.ControlMapTarget.Splatmap, idx,
-                            layer.PendingControlMapBytes, Terrain.EffectiveSplatmapResolution,
-                            tex => l.ControlMap = tex);
-                        layer.PendingControlMapBytes = null;
-                        Terrain.MarkForUpdate(TerrainDirtyFlags.SplatPack);
-                    }
-                }
-            }
-
-            if (Terrain?.Decorations != null)
-            {
-                var baker2 = _baker;
-                for (int i = 0; i < Terrain.Decorations.Count; i++)
-                {
-                    var deco = Terrain.Decorations[i];
-                    if (deco.PendingControlMapBytes != null)
-                    {
-                        var d = deco;
-                        int idx = i;
-                        baker2.UploadControlMap(TerrainBaker.ControlMapTarget.Density, idx,
-                            deco.PendingControlMapBytes, Terrain.EffectiveDecorationMapResolution,
-                            tex => d.ControlMap = tex);
-                        deco.PendingControlMapBytes = null;
-                    }
-                }
-            }
-
-            // GPU splatmap packing — pack per-layer R16 ControlMaps directly into cached array
-            if (Terrain.ConsumeFlags(TerrainDirtyFlags.SplatPack) && Terrain?.Layers != null && Terrain.Layers.Count > 0)
-            {
-                // Ensure texture arrays are built
-                if (!_textureArraysInitialized)
-                {
-                    try { RebuildTextureArrays(); _textureArraysInitialized = true; }
-                    catch (Exception ex) { Debug.LogError("[TerrainRenderer]", $"RebuildTextureArrays failed: {ex.Message}"); }
-                }
-
-                // Check if any layer has a ControlMap with a valid GPU resource
-                var srvIndices = new uint[Terrain.Layers.Count];
-                bool hasAny = false;
-                for (int i = 0; i < Terrain.Layers.Count; i++)
-                {
-                    var cm = Terrain.Layers[i].ControlMap;
-                    if (cm != null && cm.BindlessIndex != 0)
-                    {
-                        srvIndices[i] = cm.BindlessIndex;
-                        hasAny = true;
-                    }
-                }
-
-                bool hasSplatStamps = ComponentCache<SplatStamp>.All.Count > 0;
-
+                if (_layerPalette.Count > 0)
                 {
                     int res = Terrain.EffectiveSplatmapResolution;
-                    int layerCount = Terrain.Layers.Count;
-                    int sliceCount = (layerCount + 3) / 4;
+                    int sliceCount = (_layerPalette.Count + 3) / 4;
 
                     // Ensure packed array exists at correct resolution/slice count
                     EnsurePackedControlArray(res, sliceCount);
                     ControlMapsArray = _packedControlTexture;
 
-                    var indices = srvIndices;
-                    var sliceUAVs = _packedSliceUAVs;
+                    var plan = _baker.PrepareSplat(Terrain, this, _splatStamps, _layerPalette);
+                    var baker = _baker;
+                    var terrain = Terrain;
                     var packedArray = _packedControlArray;
-                    var renderer = this;
                     var arrayUAV = _packedControlArrayUAV;
-                    var splatStamps = ComponentCache<SplatStamp>.All;
-                    var terrainOrigin = Transform?.WorldPosition ?? Vector3.Zero;
-                    uint hmSRV = heightmap != null ? (uint)heightmap.BindlessIndex : 0;
-                    var autoMaskBuf = _layerAutoMaskBuffer;
                     CommandBuffer.Enqueue(RenderPass.Opaque, (list) =>
                     {
-                        // Transition to UAV for packing
+                        // The height bake enqueued above has run by now, so this reads the new heights
+                        var hm = terrain.Heightmap;
+                        uint hmSrv = hm != null ? (uint)hm.BindlessIndex : 0;
+
                         list.ResourceBarrierTransition(packedArray,
                             ResourceStates.Common, ResourceStates.UnorderedAccess);
 
-                        // 1. Pack painted ControlMaps (zeros for unpainted layers).
-                        // Always run it: it is also what resets the packed array. Skipping it when nothing is
-                        // painted (stamp-only terrains) left the max-accumulating procedural pass below reading
-                        // stale weights, so every region a layer ever covered stayed painted.
-                        _baker.PackControlMaps(list, indices, sliceUAVs, res);
-
+                        baker.BakeSplat(plan, list, terrain, hmSrv, arrayUAV, res, sliceCount);
                         list.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(packedArray)));
-
-                        // 2. Procedural auto-mask overlay (height/slope → max with painted)
-                        if (hmSRV != 0 && autoMaskBuf != null && renderer.Terrain != null)
-                        {
-                            _baker.DispatchProceduralMask(list, renderer.Terrain,
-                                hmSRV, autoMaskBuf, arrayUAV, res, sliceCount);
-                            list.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(packedArray)));
-                        }
-
-                        // 3. Splat stamp overlay (non-destructive, after procedural)
-                        if (splatStamps.Count > 0 && renderer.Terrain != null)
-                        {
-                            _baker.DispatchSplatStamps(list, renderer.Terrain, splatStamps,
-                                terrainOrigin, arrayUAV, res, sliceCount);
-                            list.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(packedArray)));
-                        }
 
                         // Back to common for shader reads
                         list.ResourceBarrierTransition(packedArray,
                             ResourceStates.UnorderedAccess, ResourceStates.Common);
 
-                        renderer.Terrain?.MarkForUpdate(TerrainDirtyFlags.AlbedoBake);
+                        terrain.MarkForUpdate(TerrainDirtyFlags.AlbedoBake);
                     });
                 }
+                else
+                {
+                    // No splat stamp references a layer: nothing to render the surface with
+                    ControlMapsArray = InternalAssets.BlackArray;
+                }
+            }
+
+            // ── Decoration coverage: laid out here, run by the decorator dispatch below ──
+            if (decoDirty)
+            {
+                var decoPlan = _baker.PrepareDeco(Terrain, this, _decoStamps, _decoratorPalette, _layerPalette);
+                System.Threading.Interlocked.Exchange(ref _pendingDecoPlan, decoPlan);
             }
 
             // Set shared material params
@@ -876,7 +603,6 @@ namespace Freefall.Components
             if (DiffuseMapsArray != null) material.SetTexture("DiffuseMaps", DiffuseMapsArray);
             if (NormalMapsArray != null) material.SetTexture("NormalMaps", NormalMapsArray);
             if (HeightMapsArray != null) material.SetTexture("HeightMaps", HeightMapsArray);
-            if (_layerAutoMaskBuffer != null) material.SetTextureIndex("AutoMaskBuf", _layerAutoMaskBuffer.SrvIndex);
 
             // Capture values for lambda closure
             int fi = frameIndex;
@@ -892,18 +618,137 @@ namespace Freefall.Components
             CommandBuffer.Enqueue(RenderPass.Shadow, (list) => self.DrawTerrainShadow(list, fi));
 
             // Decoration pipeline — CPU-side setup
-            if (Terrain.DrawDetail && Terrain.Decorations.Count > 0 && DecoratorMaterial?.Effect != null)
+            if (Terrain.DrawDetail && _decoratorPalette.Count > 0 && DecoratorMaterial?.Effect != null)
             {
-                if (Terrain.ConsumeFlags(TerrainDirtyFlags.DecoStructure) || _decoratorSlotsBuffer == null)
+                if (Terrain.ConsumeFlags(TerrainDirtyFlags.DecoStructure | TerrainDirtyFlags.DecoParams) || _decoratorSlotsBuffer == null)
                     RebuildDecoSlots();
-                else if (Terrain.ConsumeFlags(TerrainDirtyFlags.DecoParams))
-                    UpdateDecoSlots();
 
-                EnsureDecoRenderBuffers();
+                if (_decoVariantCount > 0)
+                {
+                    EnsureDecoRenderBuffers();
 
-                CommandBuffer.Enqueue(RenderPass.Opaque, (list) => self.DispatchDecorator(list, fi, RenderPass.Opaque));
-                CommandBuffer.Enqueue(RenderPass.Shadow, (list) => self.DispatchDecorator(list, fi, RenderPass.Shadow));
+                    CommandBuffer.Enqueue(RenderPass.Opaque, (list) => self.DispatchDecorator(list, fi, RenderPass.Opaque));
+                    CommandBuffer.Enqueue(RenderPass.Shadow, (list) => self.DispatchDecorator(list, fi, RenderPass.Shadow));
+                }
             }
+        }
+
+        // ───── Palette ────────────────────────────────────────────────────
+
+        /// <summary>
+        /// Collect the splat stamps that apply to this terrain and derive the layers it renders: each
+        /// distinct TerrainLayer gets a channel, in the order the stamps first use them. Raises the
+        /// texture-array rebuild when the set changes.
+        /// </summary>
+        private void RefreshLayerPalette()
+        {
+            _layerWarnings.Clear();
+            _splatStamps = TerrainBaker.CollectStamps<SplatStamp>(this);
+
+            var palette = new List<TerrainLayer>();
+            var dropped = new HashSet<TerrainLayer>();
+            int unassigned = 0;
+            foreach (var stamp in _splatStamps)
+            {
+                var layer = stamp.Layer;
+                if (layer == null) { unassigned++; continue; }
+                if (palette.Contains(layer)) continue;
+
+                if (palette.Count >= TerrainBaker.MaxLayers) dropped.Add(layer);
+                else palette.Add(layer);
+            }
+
+            if (unassigned > 0)
+                _layerWarnings.Add($"{unassigned} splat stamp(s) have no Layer and paint nothing.");
+            if (dropped.Count > 0)
+                _layerWarnings.Add($"Too many terrain layers: {palette.Count + dropped.Count} are referenced, " +
+                                   $"{TerrainBaker.MaxLayers} can be rendered. Not rendered: " +
+                                   string.Join(", ", dropped.Select(l => l.Name)));
+            WarnAboutStrayGlobals(ComponentCache<SplatStamp>.All, _layerWarnings);
+            ReportWarnings(_layerWarnings, ref _lastLayerWarning);
+
+            if (!palette.SequenceEqual(_layerPalette))
+            {
+                _layerPalette = palette;
+                Terrain!.MarkForUpdate(TerrainDirtyFlags.TextureArrays | TerrainDirtyFlags.LayerParams);
+            }
+        }
+
+        /// <summary>
+        /// Collect the deco stamps that apply to this terrain and derive the decorators it renders:
+        /// each decorator some stamp adds gets a slot. Raises the decorator buffer rebuild when the
+        /// set changes.
+        /// </summary>
+        private void RefreshDecoratorPalette()
+        {
+            _decoWarnings.Clear();
+            _decoStamps = TerrainBaker.CollectStamps<DecoStamp>(this);
+
+            var palette = new List<TerrainDecorator>();
+            var dropped = new HashSet<TerrainDecorator>();
+            foreach (var stamp in _decoStamps)
+            {
+                // Only an Add stamp puts a decorator on the terrain; Multiply merely scales what is there
+                var decorator = stamp.Decorator;
+                if (decorator == null || stamp.Op != DecoOp.Add || palette.Contains(decorator)) continue;
+
+                if (palette.Count >= TerrainBaker.MaxDecorators) dropped.Add(decorator);
+                else palette.Add(decorator);
+            }
+
+            if (dropped.Count > 0)
+                _decoWarnings.Add($"Too many terrain decorators: {palette.Count + dropped.Count} are placed, " +
+                                  $"{TerrainBaker.MaxDecorators} can be rendered. Not rendered: " +
+                                  string.Join(", ", dropped.Select(d => d.Name)));
+            foreach (var decorator in palette)
+                if (decorator.Variants.Count > TerrainDecorator.MaxVariants)
+                    _decoWarnings.Add($"Decorator '{decorator.Name}' has {decorator.Variants.Count} variants; " +
+                                      $"only the first {TerrainDecorator.MaxVariants} are scattered.");
+            WarnAboutStrayGlobals(ComponentCache<DecoStamp>.All, _decoWarnings);
+            ReportWarnings(_decoWarnings, ref _lastDecoWarning);
+
+            if (!palette.SequenceEqual(_decoratorPalette))
+            {
+                _decoratorPalette = palette;
+                Terrain!.MarkForUpdate(TerrainDirtyFlags.DecoStructure);
+            }
+        }
+
+        /// <summary>A global stamp only applies to the terrain it is parented under; one that sits elsewhere does nothing.</summary>
+        private static void WarnAboutStrayGlobals<T>(IReadOnlyList<T> stamps, List<string> warnings) where T : TerrainStamp
+        {
+            for (int i = 0; i < stamps.Count; i++)
+            {
+                var stamp = stamps[i];
+                if (stamp is { IsGlobal: true, Enabled: true } && stamp.Entity != null && stamp.FindOwningTerrain() == null)
+                    warnings.Add($"Global {stamp.GetType().Name} on '{stamp.Entity.Name}' is not parented under a terrain and applies to nothing.");
+            }
+        }
+
+        /// <summary>Log palette warnings when they change, not on every bake.</summary>
+        private static void ReportWarnings(List<string> warnings, ref string last)
+        {
+            string joined = string.Join("\n", warnings);
+            if (joined == last) return;
+            last = joined;
+            foreach (var warning in warnings)
+                Debug.LogWarning("TerrainRenderer", warning);
+        }
+
+        private string _lastLayerWarning = "";
+        private string _lastDecoWarning = "";
+
+        /// <summary>
+        /// A layer or decorator asset was edited: refresh what this terrain built from it.
+        /// </summary>
+        private void OnAssetDirty(Message msg)
+        {
+            if (Terrain == null) return;
+
+            if (msg.Data is TerrainLayer layer && _layerPalette.Contains(layer))
+                Terrain.MarkForUpdate(TerrainDirtyFlags.TextureArrays | TerrainDirtyFlags.LayerParams | TerrainDirtyFlags.AlbedoBake);
+            else if (msg.Data is TerrainDecorator decorator && _decoratorPalette.Contains(decorator))
+                Terrain.MarkForUpdate(TerrainDirtyFlags.DecoStructure | TerrainDirtyFlags.DecoParams);
         }
 
         /// <summary>
@@ -1601,70 +1446,54 @@ namespace Freefall.Components
         }
 
         /// <summary>
-        /// Lightweight: re-upload tiling and auto-mask buffers from layer properties.
-        /// No GPU allocations — just Map/memcpy/Unmap on existing upload buffers.
-        /// Called when LayerParams flag is consumed.
+        /// Lightweight: refresh the per-channel tiling from the palette's layer assets.
+        /// No GPU allocations. Called when LayerParams flag is consumed.
         /// </summary>
         private void UpdateLayerParams()
         {
             var terrainSize = Terrain?.TerrainSize ?? Vector2.One;
-            var layers = Terrain?.Layers;
-            var autoMaskData = new LayerAutoMaskGPU[32];
+            Array.Clear(_layerTiling);
 
-            if (layers != null)
+            for (int i = 0; i < _layerPalette.Count && i < _layerTiling.Length; i++)
             {
-                for (int i = 0; i < layers.Count && i < _layerTiling.Length; i++)
-                {
-                    var layer = layers[i];
-                    float hasHeight = (layer.Height?.Native != null) ? 1.0f : 0.0f;
-                    if (layer.Tiling.X != 0 && layer.Tiling.Y != 0)
-                        _layerTiling[i] = new Vector4(terrainSize.X / layer.Tiling.X, terrainSize.Y / layer.Tiling.Y, hasHeight, layer.HeightScale);
-                    else
-                        _layerTiling[i] = new Vector4(1, 1, hasHeight, layer.HeightScale);
-
-                    autoMaskData[i] = new LayerAutoMaskGPU
-                    {
-                        HeightMin = layer.HeightRange.X,
-                        HeightMax = layer.HeightRange.Y,
-                        SlopeMin = layer.SlopeRange.X,
-                        SlopeMax = layer.SlopeRange.Y,
-                        HeightBlend = layer.HeightBlend,
-                        SlopeBlend = layer.SlopeBlend,
-                        ProceduralWeight = layer.ProceduralWeight,
-                    };
-                }
+                var layer = _layerPalette[i];
+                float hasHeight = (layer.Height?.Native != null) ? 1.0f : 0.0f;
+                if (layer.Tiling.X != 0 && layer.Tiling.Y != 0)
+                    _layerTiling[i] = new Vector4(terrainSize.X / layer.Tiling.X, terrainSize.Y / layer.Tiling.Y, hasHeight, layer.HeightScale);
+                else
+                    _layerTiling[i] = new Vector4(1, 1, hasHeight, layer.HeightScale);
             }
-
-            _layerAutoMaskBuffer ??= GraphicsBuffer.CreateUpload<LayerAutoMaskGPU>(32);
-            _layerAutoMaskBuffer.Upload<LayerAutoMaskGPU>(autoMaskData.AsSpan());
         }
 
         /// <summary>
-        /// Heavy: rebuild DiffuseMapsArray, NormalMapsArray, ControlMapsArray.
-        /// Only called when TextureArrays flag is consumed (layer add/remove/texture swap).
-        /// Also re-uploads tiling/automask since layer order may have changed.
+        /// Heavy: rebuild DiffuseMapsArray, NormalMapsArray, HeightMapsArray from the palette.
+        /// Only called when TextureArrays flag is consumed (the set of layers or a layer's textures changed).
+        /// Also refreshes tiling since channels may have moved.
         /// </summary>
         private void RebuildTextureArrays()
         {
-            var layers = Terrain?.Layers;
             var diffuseList = new List<Texture>();
             var normalList = new List<Texture>();
             var heightList = new List<Texture>();
 
-            if (layers != null)
+            foreach (var layer in _layerPalette)
             {
-                for (int i = 0; i < layers.Count; i++)
-                {
-                    var layer = layers[i];
-                    if (layer.Diffuse != null && layer.Diffuse.Native != null) diffuseList.Add(layer.Diffuse);
-                    if (layer.Normals != null && layer.Normals.Native != null) normalList.Add(layer.Normals);
-                    if (layer.Height != null && layer.Height.Native != null)
-                        heightList.Add(layer.Height);
-                }
-                Debug.Log($"[Terrain] RebuildTextureArrays: {diffuseList.Count} diffuse, {normalList.Count} normals, {heightList.Count} heights from {layers.Count} layers");
+                if (layer.Diffuse != null && layer.Diffuse.Native != null) diffuseList.Add(layer.Diffuse);
+                if (layer.Normals != null && layer.Normals.Native != null) normalList.Add(layer.Normals);
+                if (layer.Height != null && layer.Height.Native != null)
+                    heightList.Add(layer.Height);
             }
+            Debug.Log($"[Terrain] RebuildTextureArrays: {diffuseList.Count} diffuse, {normalList.Count} normals, {heightList.Count} heights from {_layerPalette.Count} layers");
 
-            // Also refresh tiling/automask since layer order may have changed
+            // The arrays are indexed by channel, so a layer without a texture would shift every layer after it
+            if (diffuseList.Count != _layerPalette.Count)
+                Debug.LogWarning("TerrainRenderer", "A terrain layer has no Diffuse texture: the layers after it render with the wrong textures.");
+            if (normalList.Count != 0 && normalList.Count != _layerPalette.Count)
+                Debug.LogWarning("TerrainRenderer", "Some terrain layers have no Normals texture: the layers after them render with the wrong normals.");
+            if (heightList.Count != 0 && heightList.Count != _layerPalette.Count)
+                Debug.LogWarning("TerrainRenderer", "Some terrain layers have no Height texture: the layers after them blend with the wrong heights.");
+
+            // Also refresh tiling since channels may have moved
             UpdateLayerParams();
 
             var device = Engine.Device;
@@ -1679,10 +1508,7 @@ namespace Freefall.Components
             if (normalList.Count > 0)
                 NormalMapsArray = Texture.CreateTexture2DArray(device, normalList, stripSrgb: true);
             else
-            {
-                Debug.Log("[Terrain] Normals missing! Using flat normals.");
                 NormalMapsArray = InternalAssets.FlatNormalArray;
-            }
 
             // Height Fallback (SSDM per-layer displacement heights)
             if (heightList.Count > 0)
@@ -1690,26 +1516,8 @@ namespace Freefall.Components
             else
                 HeightMapsArray = null; // no height data = no displacement
 
-            // Build ControlMapsArray for GPU splatmap sampling
-            if (Terrain?._legacyControlMaps != null && Terrain._legacyControlMaps.Count > 0)
-            {
-                var controlList = new List<Texture>();
-                foreach (var splatmap in Terrain._legacyControlMaps)
-                {
-                    if (splatmap?.Native != null)
-                        controlList.Add(splatmap);
-                }
-                if (controlList.Count > 0)
-                    ControlMapsArray = Texture.CreateTexture2DArray(device, controlList);
-                else
-                    ControlMapsArray = InternalAssets.BlackArray;
-            }
-            else
-            {
-                // Per-layer R16 ControlMaps — pack lazily in Draw()
-                Terrain.MarkForUpdate(TerrainDirtyFlags.SplatPack);
-                ControlMapsArray = InternalAssets.BlackArray;
-            }
+            // The layer weights are baked separately (SplatPack); until the first bake nothing shows
+            ControlMapsArray = _packedControlTexture ?? InternalAssets.BlackArray;
         }
 
         // ───── IHeightProvider ────────────────────────────────────────────
@@ -1763,10 +1571,14 @@ namespace Freefall.Components
             public uint Count;
         }
 
+        /// <summary>
+        /// One decorator variant on the GPU ("DecoratorSlot" in the shaders). Instances carry the index
+        /// of this record. Must match DecoratorSlot in grass_compute.hlsl / grass.fx / grass_mesh.fx.
+        /// </summary>
         [StructLayout(LayoutKind.Sequential)]
         private struct DecoratorSlotGPU
         {
-            public float Density;     // absolute density (instances/m²)
+            public float Density;     // instances/m² at full coverage (the spawn kernel applies DecorationDensity)
             public float MinH, MaxH;
             public float MinW, MaxW;
             public uint LODCount;
@@ -1776,23 +1588,32 @@ namespace Freefall.Components
             public float Rot10, Rot11, Rot12;
             public float Rot20, Rot21, Rot22;
             public float SlopeBias;  // 0=upright, 1=fully slope-aligned
-            public uint DecoMapSlice;     // bindless SRV for standalone density map (0 = none)
-            // Layer-driven placement masks (resolved from stable LayerIds at upload time)
-            // Bit N = layer at index N in Terrain.Layers list
-            public uint SourceLayerMask;      // which layers drive density (0 = standalone)
+            public uint Seed;             // decorrelates this variant's scatter and noise from the others
+            public uint _unused0;
             public uint Mode;             // 0=Mesh, 1=Billboard, 2=Cross
             public uint TextureIdx;       // bindless index (billboard/cross)
             // Color tint (Unity detail prototype healthy/dry colors)
             public Vector3 HealthyColor;
             public Vector3 DryColor;
             public float NoiseSpread;
-            public uint ExclusionLayerMask;
-            public float ProceduralBlend;
+            public uint _unused1;
+            public float _unused2;
             public float ClusterScale;    // world size of density clumps (m), 0 = off
             public float ClusterAmount;   // 0 = uniform, 1 = full clumps with bare gaps
             public uint AlphaClip;        // mesh mode: 1 = alpha-test albedo, 0 = opaque material
             public float HeightNoiseScale;  // world size of short vs. lush patches (m), 0 = off
             public float HeightNoiseAmount; // 0 = none, 1 = 0.4x .. 1.4x height
+        }
+
+        /// <summary>
+        /// One TerrainDecorator on the GPU: the run of variants a control-texture slot stands for.
+        /// Must match DecoratorGroup in grass_compute.hlsl.
+        /// </summary>
+        [StructLayout(LayoutKind.Sequential)]
+        private struct DecoratorGroupGPU
+        {
+            public uint VariantOffset;
+            public uint VariantCount;
         }
 
         [StructLayout(LayoutKind.Sequential)]
@@ -1805,145 +1626,121 @@ namespace Freefall.Components
         }
 
         /// <summary>
-        /// Rebuilds all decoration GPU slot/header/LOD buffers from Terrain.Decorations.
-        /// Triggered on structural changes (add/remove decorations, mesh assignment, etc).
-        /// Resolves stable LayerIds to runtime bitmasks for the GPU prepass.
+        /// Builds the decoration GPU buffers from the decorator palette: one group per decorator, one
+        /// slot per renderable variant, and the LOD table the variants point into.
+        /// Runs on structural changes (decorators or variants added/removed, mesh swapped) and on
+        /// parameter edits alike; when the element counts are unchanged the existing buffers are
+        /// refilled in place, so dragging a slider allocates nothing.
         /// </summary>
         public void RebuildDecoSlots()
         {
             if (Terrain == null) return;
-            var decorations = Terrain.Decorations;
-            if (decorations.Count == 0) return;
 
-            Debug.Log($"[TerrainRenderer]", $"Building decorator buffers for {decorations.Count} decorations");
-
-            var device = Engine.Device;
-
-            // Dispose old buffers if rebuilding
-            _decoratorHeadersBuffer?.Dispose();
-            _decoratorSlotsBuffer?.Dispose();
-            _decoratorLODTableBuffer?.Dispose();
-
-            // Build LayerId → list index lookup for bitmask resolution
-            var layerIdToIndex = new Dictionary<ulong, int>();
-            if (Terrain.Layers != null)
-            {
-                for (int i = 0; i < Terrain.Layers.Count && i < 32; i++)
-                    layerIdToIndex[Terrain.Layers[i].LayerId] = i;
-            }
-
-            // Flat list — all decorators go into a single header.
+            // Flat list — all variants go into a single header.
             var headers = new List<ChannelHeader>();
             var slots = new List<DecoratorSlotGPU>();
+            var groups = new List<DecoratorGroupGPU>();
             var lodTable = new List<LODTableEntry>();
 
-            for (int i = 0; i < decorations.Count; i++)
+            foreach (var decorator in _decoratorPalette)
             {
-                var deco = decorations[i];
-                var mode = deco.Mode;
+                uint variantOffset = (uint)slots.Count;
+                int variantLimit = Math.Min(decorator.Variants.Count, TerrainDecorator.MaxVariants);
 
-                // Mesh mode requires a StaticMesh
-                if (mode == DecoratorMode.Mesh && deco.Mesh == null) continue;
-                // Billboard/Cross mode requires a Texture
-                if (mode != DecoratorMode.Mesh && deco.Texture == null && deco.Mesh == null) continue;
-
-                uint lodTableOffset = (uint)lodTable.Count;
-                uint lodCount = 0;
-                uint textureIdx = 0;
-
-                if (mode == DecoratorMode.Mesh)
+                for (int v = 0; v < variantLimit; v++)
                 {
-                    var mesh = deco.Mesh!;
-                    uint meshMatId = (uint)(deco.Material?.MaterialID ?? 0);
+                    var variant = decorator.Variants[v];
+                    if (variant == null || !variant.IsRenderable) continue;
 
-                    // Determine LOD0 part indices
-                    int[] lod0Indices;
-                    if (mesh.LODs.Count > 0 && mesh.LODs[0].MeshPartIndices != null)
-                        lod0Indices = mesh.LODs[0].MeshPartIndices;
-                    else
-                        lod0Indices = Enumerable.Range(0, mesh.MeshParts.Count).ToArray();
+                    var mode = variant.Mode;
+                    uint lodTableOffset = (uint)lodTable.Count;
+                    uint lodCount = 0;
+                    uint textureIdx = 0;
 
-                    // LOD0 parts
-                    foreach (var partIdx in lod0Indices)
+                    if (mode == DecoratorMode.Mesh)
                     {
-                        if (partIdx >= mesh.MeshParts.Count) continue;
-                        int partId = MeshRegistry.Register(mesh, partIdx);
-                        float maxDist = 100f;
-                        lodTable.Add(new LODTableEntry { MeshPartId = (uint)partId, MaxDistance = maxDist, MaterialId = meshMatId });
-                        lodCount++;
-                    }
+                        var mesh = variant.Mesh!;
+                        uint meshMatId = (uint)(variant.Material?.MaterialID ?? 0);
 
-                    // Additional LOD levels
-                    for (int lod = 1; lod < mesh.LODs.Count; lod++)
-                    {
-                        var lodLevel = mesh.LODs[lod];
-                        if (lodLevel.MeshPartIndices == null) continue;
-                        foreach (var partIdx in lodLevel.MeshPartIndices)
+                        // Determine LOD0 part indices
+                        int[] lod0Indices;
+                        if (mesh.LODs.Count > 0 && mesh.LODs[0].MeshPartIndices != null)
+                            lod0Indices = mesh.LODs[0].MeshPartIndices;
+                        else
+                            lod0Indices = Enumerable.Range(0, mesh.MeshParts.Count).ToArray();
+
+                        // LOD0 parts
+                        foreach (var partIdx in lod0Indices)
                         {
                             if (partIdx >= mesh.MeshParts.Count) continue;
                             int partId = MeshRegistry.Register(mesh, partIdx);
-                            float maxDist = 50f * (lod + 1);
-                            lodTable.Add(new LODTableEntry { MeshPartId = (uint)partId, MaxDistance = maxDist, MaterialId = meshMatId });
+                            lodTable.Add(new LODTableEntry { MeshPartId = (uint)partId, MaxDistance = 100f, MaterialId = meshMatId });
                             lodCount++;
                         }
+
+                        // Additional LOD levels
+                        for (int lod = 1; lod < mesh.LODs.Count; lod++)
+                        {
+                            var lodLevel = mesh.LODs[lod];
+                            if (lodLevel.MeshPartIndices == null) continue;
+                            foreach (var partIdx in lodLevel.MeshPartIndices)
+                            {
+                                if (partIdx >= mesh.MeshParts.Count) continue;
+                                int partId = MeshRegistry.Register(mesh, partIdx);
+                                float maxDist = 50f * (lod + 1);
+                                lodTable.Add(new LODTableEntry { MeshPartId = (uint)partId, MaxDistance = maxDist, MaterialId = meshMatId });
+                                lodCount++;
+                            }
+                        }
                     }
+                    else
+                    {
+                        // Billboard / Cross: one dummy LOD entry
+                        textureIdx = (uint)variant.Texture!.BindlessIndex;
+                        lodTable.Add(new LODTableEntry { MeshPartId = 0, MaxDistance = 200f, MaterialId = 0 });
+                        lodCount = 1;
+                    }
+
+                    float degToRad = MathF.PI / 180f;
+                    float rx = variant.RootRotation.X * degToRad;
+                    float ry = variant.RootRotation.Y * degToRad;
+                    float rz = variant.RootRotation.Z * degToRad;
+                    float cx = MathF.Cos(rx), sx = MathF.Sin(rx);
+                    float cy = MathF.Cos(ry), sy = MathF.Sin(ry);
+                    float cz = MathF.Cos(rz), sz = MathF.Sin(rz);
+
+                    slots.Add(new DecoratorSlotGPU
+                    {
+                        Density = variant.Density,
+                        MinH = variant.HeightRange.X,
+                        MaxH = variant.HeightRange.Y,
+                        MinW = variant.WidthRange.X,
+                        MaxW = variant.WidthRange.Y,
+                        LODCount = lodCount,
+                        LODTableOffset = lodTableOffset,
+                        Rot00 = cy*cz,              Rot01 = cy*sz,              Rot02 = -sy,
+                        Rot10 = sx*sy*cz - cx*sz,   Rot11 = sx*sy*sz + cx*cz,   Rot12 = sx*cy,
+                        Rot20 = cx*sy*cz + sx*sz,   Rot21 = cx*sy*sz - sx*cz,   Rot22 = cx*cy,
+                        SlopeBias = variant.SlopeBias,
+                        Seed = (uint)Math.Clamp(variant.Seed, 0, 255),
+                        Mode = (uint)mode,
+                        TextureIdx = textureIdx,
+                        HealthyColor = new Vector3(variant.HealthyColor.X, variant.HealthyColor.Y, variant.HealthyColor.Z),
+                        DryColor = new Vector3(variant.DryColor.X, variant.DryColor.Y, variant.DryColor.Z),
+                        NoiseSpread = variant.NoiseSpread,
+                        ClusterScale = variant.ClusterScale,
+                        ClusterAmount = variant.ClusterAmount,
+                        AlphaClip = variant.Material?.Effect?.Name == "gbuffer" ? 0u : 1u,
+                        HeightNoiseScale = variant.HeightNoiseScale,
+                        HeightNoiseAmount = variant.HeightNoiseAmount,
+                    });
                 }
-                else
+
+                groups.Add(new DecoratorGroupGPU
                 {
-                    // Billboard / Cross: use Texture's material or create a dummy LOD entry
-                    uint matId = 0;
-                    if (deco.Texture != null)
-                        textureIdx = (uint)deco.Texture.BindlessIndex;
-
-                    lodTable.Add(new LODTableEntry { MeshPartId = 0, MaxDistance = 200f, MaterialId = matId });
-                    lodCount = 1;
-                }
-
-                // Resolve stable LayerIds → runtime bitmasks
-                uint srcMask = ResolveLayerMask(deco.SourceLayerIds, layerIdToIndex);
-                uint exclMask = ResolveLayerMask(deco.ExclusionLayerIds, layerIdToIndex);
-
-                float degToRad = MathF.PI / 180f;
-                float rx = deco.RootRotation.X * degToRad;
-                float ry = deco.RootRotation.Y * degToRad;
-                float rz = deco.RootRotation.Z * degToRad;
-                float cx = MathF.Cos(rx), sx = MathF.Sin(rx);
-                float cy = MathF.Cos(ry), sy = MathF.Sin(ry);
-                float cz = MathF.Cos(rz), sz = MathF.Sin(rz);
-
-                slots.Add(new DecoratorSlotGPU
-                {
-                    Density = deco.Density,
-                    MinH = deco.HeightRange.X,
-                    MaxH = deco.HeightRange.Y,
-                    MinW = deco.WidthRange.X,
-                    MaxW = deco.WidthRange.Y,
-                    LODCount = lodCount,
-                    LODTableOffset = lodTableOffset,
-                    Rot00 = cy*cz,              Rot01 = cy*sz,              Rot02 = -sy,
-                    Rot10 = sx*sy*cz - cx*sz,   Rot11 = sx*sy*sz + cx*cz,   Rot12 = sx*cy,
-                    Rot20 = cx*sy*cz + sx*sz,   Rot21 = cx*sy*sz - sx*cz,   Rot22 = cx*cy,
-                    SlopeBias = deco.SlopeBias,
-                    DecoMapSlice = deco.ControlMap != null ? (uint)deco.ControlMap.BindlessIndex : 0,
-                    SourceLayerMask = srcMask,
-                    Mode = (uint)mode,
-                    TextureIdx = textureIdx,
-                    HealthyColor = new Vector3(deco.HealthyColor.X, deco.HealthyColor.Y, deco.HealthyColor.Z),
-                    DryColor = new Vector3(deco.DryColor.X, deco.DryColor.Y, deco.DryColor.Z),
-                    NoiseSpread = deco.NoiseSpread,
-                    ExclusionLayerMask = exclMask,
-                    ProceduralBlend = deco.ProceduralBlend,
-                    ClusterScale = deco.ClusterScale,
-                    ClusterAmount = deco.ClusterAmount,
-                    AlphaClip = deco.Material?.Effect?.Name == "gbuffer" ? 0u : 1u,
-                    HeightNoiseScale = deco.HeightNoiseScale,
-                    HeightNoiseAmount = deco.HeightNoiseAmount,
+                    VariantOffset = variantOffset,
+                    VariantCount = (uint)slots.Count - variantOffset,
                 });
-
-                string srcDesc = srcMask != 0 ? $"layers=0x{srcMask:X}" : "standalone";
-                string exclDesc = exclMask != 0 ? $" excl=0x{exclMask:X}" : "";
-                float logMaxDist = lodCount > 0 ? lodTable[^1].MaxDistance : 0;
-                Debug.Log($"[Deco] Slot {slots.Count - 1}: mode={mode} lodCount={lodCount} density={deco.Density} {srcDesc}{exclDesc} maxDist={logMaxDist:F0}");
             }
 
             // Single header covering all slots
@@ -1953,40 +1750,56 @@ namespace Freefall.Components
                 Count = (uint)slots.Count
             });
 
-            // Upload to GPU (creates new buffers + SRVs — only on structural changes)
-            _decoratorHeadersBuffer = CreateAndUpload(headers);
-            _decoratorSlotsBuffer = CreateAndUpload(slots);
-            _decoratorLODTableBuffer = CreateAndUpload(lodTable);
+            bool sameShape = _decoratorSlotsBuffer != null && _decoratorLODTableBuffer != null && _decoratorGroupsBuffer != null
+                             && _decoratorHeadersBuffer != null
+                             && slots.Count == _decoSlotCapacity && lodTable.Count == _decoLodCapacity
+                             && groups.Count == _decoGroupCapacity;
 
-            _decoratorBuffersBuilt = true;
-            Terrain.MarkForUpdate(TerrainDirtyFlags.DecoPrepass);  // trigger control prepass rebuild
-        }
-
-        /// <summary>
-        /// Resolves a list of stable TextureLayer UIDs to a uint bitmask
-        /// using the current layer ordering. Unknown IDs are silently skipped.
-        /// </summary>
-        private static uint ResolveLayerMask(List<ulong> layerIds, Dictionary<ulong, int> lookup)
-        {
-            if (layerIds == null || layerIds.Count == 0) return 0;
-            uint mask = 0;
-            foreach (var id in layerIds)
+            if (sameShape)
             {
-                if (lookup.TryGetValue(id, out int idx))
-                    mask |= 1u << idx;
+                // Same element counts: refill in place (no GPU allocations)
+                Refill(_decoratorHeadersBuffer!, headers);
+                Refill(_decoratorSlotsBuffer!, slots);
+                Refill(_decoratorGroupsBuffer!, groups);
+                Refill(_decoratorLODTableBuffer!, lodTable);
             }
-            return mask;
+            else
+            {
+                Debug.Log($"[TerrainRenderer] Building decorator buffers: {groups.Count} decorators, {slots.Count} variants, {lodTable.Count} LOD entries");
+
+                _decoratorHeadersBuffer?.Dispose();
+                _decoratorSlotsBuffer?.Dispose();
+                _decoratorGroupsBuffer?.Dispose();
+                _decoratorLODTableBuffer?.Dispose();
+
+                _decoratorHeadersBuffer = CreateAndUpload(headers);
+                _decoratorSlotsBuffer = CreateAndUpload(slots);
+                _decoratorGroupsBuffer = CreateAndUpload(groups);
+                _decoratorLODTableBuffer = CreateAndUpload(lodTable);
+
+                _decoSlotCapacity = slots.Count;
+                _decoLodCapacity = lodTable.Count;
+                _decoGroupCapacity = groups.Count;
+            }
+
+            _decoVariantCount = slots.Count;
+            _decoratorBuffersBuilt = true;
+        }
+
+        private static void Refill<T>(GraphicsBuffer buffer, List<T> data) where T : unmanaged
+        {
+            if (data.Count == 0) return;
+            buffer.Upload<T>(System.Runtime.InteropServices.CollectionsMarshal.AsSpan(data));
         }
 
         /// <summary>
-        /// Dispatches the decoration prepass compute shader: computes per-texel decoration
-        /// weights from layer splatmaps (layer-driven) or density maps (standalone),
-        /// applies exclusion masks, and packs top-8 into RGBA16_UINT control texture.
+        /// Runs the decoration coverage bake when one is pending: composites the deco stamps (laid out
+        /// on the main thread, see Draw) into the top-8 RGBA16_UINT control texture the spawn kernel reads.
         /// </summary>
         private void DispatchDecoControlPrepass(ID3D12GraphicsCommandList cmd)
         {
-            if (!Terrain.ConsumeFlags(TerrainDirtyFlags.DecoPrepass) || _decoratorSlotsBuffer == null)
-                return;
+            var plan = System.Threading.Interlocked.Exchange(ref _pendingDecoPlan, null);
+            if (plan == null || Terrain == null || _baker == null) return;
 
             var device = Engine.Device;
             int resolution = Terrain.EffectiveDecorationMapResolution;
@@ -2032,23 +1845,6 @@ namespace Freefall.Components
                 device.NativeDevice.CreateShaderResourceView(_decoControlTex, srvDesc, device.GetCpuHandle(_decoControlSRV));
             }
 
-            // Count valid slots
-            uint slotCount = 0;
-            if (Terrain?.Decorations != null)
-            {
-                foreach (var d in Terrain.Decorations)
-                {
-                    if (d.Mode == DecoratorMode.Mesh && d.Mesh == null) continue;
-                    if (d.Mode != DecoratorMode.Mesh && d.Texture == null && d.Mesh == null) continue;
-                    slotCount++;
-                }
-            }
-
-            // Dispatch prepass
-            _decoPrepassCS ??= new ComputeShader("decoration_prepass.hlsl");
-            cmd.SetComputeRootSignature(Engine.Device.GlobalRootSignature);
-            cmd.SetDescriptorHeaps(1, new[] { Engine.Device.SrvHeap });
-
             // Transition control texture back to UAV for writing
             // Fresh textures start in Common (implicit promotion to UAV).
             // Re-dispatches need explicit SRV → UAV transition.
@@ -2059,48 +1855,23 @@ namespace Freefall.Components
                         ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess)));
             }
 
-            // Heightmap SRV for slope/height computation
-            var heightmap = Terrain?.Heightmap;
+            // Heightmap for the stamps' height/slope filters
+            var heightmap = Terrain.Heightmap;
             uint heightSrv = heightmap != null ? (uint)heightmap.BindlessIndex : 0;
 
-            // Packed ControlMapArray SRV — same texture the surface shader samples
-            int layerCount = Terrain?.Layers?.Count ?? 0;
-            uint controlMapsSrv = ControlMapsArray != null ? (uint)ControlMapsArray.BindlessIndex : 0;
+            // Packed layer weights for the stamps' layer filters — the same array the surface shader
+            // samples, already rebaked this frame if the splat stamps changed
+            uint controlMapsSrv = plan.LayerCount > 0 && _packedControlTexture != null
+                ? (uint)_packedControlTexture.BindlessIndex : 0;
 
-            _decoPrepassCS.SetBuffer("Slots", _decoratorSlotsBuffer!);
-            _decoPrepassCS.SetPushConstant("ControlUAV", _decoControlUAV);
-            _decoPrepassCS.SetPushConstant("SlotCount", slotCount);
-            _decoPrepassCS.SetPushConstant("Resolution", (uint)resolution);
-            _decoPrepassCS.SetPushConstant("HeightTex", heightSrv);
-            _decoPrepassCS.SetPushConstant("AutoMaskBuf", _layerAutoMaskBuffer?.SrvIndex ?? 0);
-            _decoPrepassCS.SetPushConstant("LayerCount", (uint)layerCount);
-            _decoPrepassCS.SetPushConstant("ControlMaps", controlMapsSrv);
-
-            // Pass float values as raw uint bits (reinterpreted with asfloat on GPU)
-            float maxH = Terrain?.MaxHeight ?? 600f;
-            float sizeX = Terrain?.TerrainSize.X ?? 1700f;
-            _decoPrepassCS.SetPushConstant("MaxHeight", BitConverter.SingleToUInt32Bits(maxH));
-            _decoPrepassCS.SetPushConstant("TerrainSizeX", BitConverter.SingleToUInt32Bits(sizeX));
-
-            _decoPrepassCS.Dispatch(0, cmd, (uint)((resolution + 7) / 8), (uint)((resolution + 7) / 8));
+            _baker.BakeDecoControl(plan, cmd, Terrain, heightSrv, controlMapsSrv, _decoControlUAV, resolution);
 
             cmd.ResourceBarrierUnorderedAccessView(_decoControlTex);
-
-            // DecoStamp overlay (still in UAV state)
-            var decoStamps = ComponentCache<DecoStamp>.All;
-            if (decoStamps.Count > 0 && Terrain != null)
-            {
-                var terrainOrigin = Transform?.WorldPosition ?? Vector3.Zero;
-                _baker.DispatchDecoStamps(cmd, Terrain, decoStamps,
-                    terrainOrigin, _decoControlUAV, resolution);
-                cmd.ResourceBarrierUnorderedAccessView(_decoControlTex);
-            }
 
             // Transition from UAV → SRV so the spawn shader and terrain debug overlay can read correctly
             cmd.ResourceBarrier(new ResourceBarrier(
                 new ResourceTransitionBarrier(_decoControlTex,
                     ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource)));
-
         }
 
         /// <summary>
@@ -2160,120 +1931,12 @@ namespace Freefall.Components
             _albedoBakeCS.SetPushConstant("OutputUAV", _bakedAlbedoUAV); // uint (raw UAV index)
             _albedoBakeCS.SetBuffer("TilingBuf", _tilingBuffer);         // GraphicsBuffer → auto SRV
 
-            // Procedural masking params (slope/height auto-mask)
-            if (Terrain?.Heightmap != null)
-                _albedoBakeCS.SetTexture("HeightTex", Terrain.Heightmap);
-            if (_layerAutoMaskBuffer != null)
-                _albedoBakeCS.SetBuffer("AutoMaskBuf", _layerAutoMaskBuffer);
-            _albedoBakeCS.SetParam("MaxHeight", Terrain?.MaxHeight ?? 600f);
-            var heightmap2 = Terrain?.Heightmap;
-            _albedoBakeCS.SetParam("HeightTexel", heightmap2 != null ? 1.0f / heightmap2.Native.Description.Width : 1.0f / 1024.0f);
-            _albedoBakeCS.SetParam("TerrainSizeX", Terrain?.TerrainSize.X ?? 1700f);
-            _albedoBakeCS.SetParam("TerrainSizeZ", Terrain?.TerrainSize.Y ?? 1700f);
-
             uint groups = (uint)((BakedAlbedoSize + 7) / 8);
             _albedoBakeCS.Dispatch(0, cmd, groups, groups);
 
             cmd.ResourceBarrierUnorderedAccessView(_bakedAlbedoTex);
 
             // AlbedoBake flag already consumed in the guard above
-        }
-
-        /// <summary>
-        /// Updates per-slot parameter data (density, scale, rotation, colors)
-        /// without rebuilding structural data (LOD tables, mesh registrations).
-        /// Triggered on value-only changes like density/scale sliders.
-        /// </summary>
-        private unsafe void UpdateDecoSlots()
-        {
-            if (Terrain == null || _decoratorSlotsBuffer == null) return;
-
-            var decorations = Terrain.Decorations;
-            if (decorations.Count == 0) return;
-
-            // Rebuild slot data with current values
-            var slots = new List<DecoratorSlotGPU>();
-
-            // Read existing LOD/structural data from the current buffer
-            var pRead = _decoratorSlotsBuffer.Map<DecoratorSlotGPU>();
-            int validCount = 0;
-            foreach (var d in decorations)
-            {
-                if (d.Mode == DecoratorMode.Mesh && d.Mesh == null) continue;
-                if (d.Mode != DecoratorMode.Mesh && d.Texture == null && d.Mesh == null) continue;
-                validCount++;
-            }
-            var existing = new Span<DecoratorSlotGPU>(pRead, validCount);
-            var existingLodCounts = new uint[validCount];
-            var existingLodOffsets = new uint[validCount];
-            var existingDecoSlices = new uint[validCount];
-            var existingTextureIdx = new uint[validCount];
-            var existingSrcMask = new uint[validCount];
-            var existingExclMask = new uint[validCount];
-            for (int i = 0; i < validCount; i++)
-            {
-                existingLodCounts[i] = existing[i].LODCount;
-                existingLodOffsets[i] = existing[i].LODTableOffset;
-                existingDecoSlices[i] = existing[i].DecoMapSlice;
-                existingTextureIdx[i] = existing[i].TextureIdx;
-                existingSrcMask[i] = existing[i].SourceLayerMask;
-                existingExclMask[i] = existing[i].ExclusionLayerMask;
-            }
-            _decoratorSlotsBuffer.Unmap();
-
-            float degToRad = MathF.PI / 180f;
-            int slotIdx = 0;
-
-            foreach (var deco in decorations)
-            {
-                // Same filter as BuildDecoratorBuffers
-                if (deco.Mode == DecoratorMode.Mesh && deco.Mesh == null) continue;
-                if (deco.Mode != DecoratorMode.Mesh && deco.Texture == null && deco.Mesh == null) continue;
-
-                float rx = deco.RootRotation.X * degToRad;
-                float ry = deco.RootRotation.Y * degToRad;
-                float rz = deco.RootRotation.Z * degToRad;
-                float cx = MathF.Cos(rx), sx = MathF.Sin(rx);
-                float cy = MathF.Cos(ry), sy = MathF.Sin(ry);
-                float cz = MathF.Cos(rz), sz = MathF.Sin(rz);
-
-                slots.Add(new DecoratorSlotGPU
-                {
-                    Density = deco.Density * Terrain.DecorationDensity,
-                    MinH = deco.HeightRange.X,
-                    MaxH = deco.HeightRange.Y,
-                    MinW = deco.WidthRange.X,
-                    MaxW = deco.WidthRange.Y,
-                    LODCount = slotIdx < existingLodCounts.Length ? existingLodCounts[slotIdx] : 0,
-                    LODTableOffset = slotIdx < existingLodOffsets.Length ? existingLodOffsets[slotIdx] : 0,
-                    Rot00 = cy*cz,              Rot01 = cy*sz,              Rot02 = -sy,
-                    Rot10 = sx*sy*cz - cx*sz,   Rot11 = sx*sy*sz + cx*cz,   Rot12 = sx*cy,
-                    Rot20 = cx*sy*cz + sx*sz,   Rot21 = cx*sy*sz - sx*cz,   Rot22 = cx*cy,
-                    SlopeBias = deco.SlopeBias,
-                    DecoMapSlice = deco.ControlMap != null ? (uint)deco.ControlMap.BindlessIndex : 0,
-                    SourceLayerMask = slotIdx < existingSrcMask.Length ? existingSrcMask[slotIdx] : 0,
-                    Mode = (uint)deco.Mode,
-                    TextureIdx = slotIdx < existingTextureIdx.Length ? existingTextureIdx[slotIdx] : 0,
-                    HealthyColor = new Vector3(deco.HealthyColor.X, deco.HealthyColor.Y, deco.HealthyColor.Z),
-                    DryColor = new Vector3(deco.DryColor.X, deco.DryColor.Y, deco.DryColor.Z),
-                    NoiseSpread = deco.NoiseSpread,
-                    ExclusionLayerMask = slotIdx < existingExclMask.Length ? existingExclMask[slotIdx] : 0,
-                    ProceduralBlend = deco.ProceduralBlend,
-                    ClusterScale = deco.ClusterScale,
-                    ClusterAmount = deco.ClusterAmount,
-                    AlphaClip = deco.Material?.Effect?.Name == "gbuffer" ? 0u : 1u,
-                    HeightNoiseScale = deco.HeightNoiseScale,
-                    HeightNoiseAmount = deco.HeightNoiseAmount,
-                });
-                slotIdx++;
-            }
-
-            // Re-upload slot data
-            if (slots.Count > 0)
-            {
-                var span = System.Runtime.InteropServices.CollectionsMarshal.AsSpan(slots);
-                _decoratorSlotsBuffer.Upload<DecoratorSlotGPU>(span);
-            }
         }
 
         /// <summary>
@@ -2423,11 +2086,13 @@ namespace Freefall.Components
             // A freshly created terrain has no heightmap until its first bake; decorators need it for placement.
             if (Terrain.Heightmap == null) return;
 
-            // GPU prepass: build baked control texture from density maps
+            // GPU prepass: composite the deco stamps into the control texture (when they changed)
             DispatchDecoControlPrepass(commandList);
 
             if (!_decoBuffersCreated) return;
-            if (_decoratorSlotsBuffer == null || _decoratorLODTableBuffer == null) return;
+            if (_decoratorSlotsBuffer == null || _decoratorLODTableBuffer == null || _decoratorGroupsBuffer == null) return;
+            // Nothing to spawn from until the first coverage bake has run
+            if (_decoControlTex == null) return;
 
             var device = Engine.Device;
             var camPos = Camera.Main!.Position;
@@ -2462,6 +2127,7 @@ namespace Freefall.Components
                 // ── Push constants: bindless resource indices only ──
                 cs.SetBuffer("DecoratorSlots", _decoratorSlotsBuffer!);
                 cs.SetBuffer("LODTable", _decoratorLODTableBuffer!);
+                cs.SetBuffer("DecoratorGroups", _decoratorGroupsBuffer!);
                 cs.SetPushConstant("MeshRegistry", MeshRegistry.SrvIndex);
                 if (Terrain.Heightmap != null) cs.SetTexture("Heightmap", Terrain.Heightmap);
                 cs.SetPushConstant("DecoControl", _decoControlSRV);
@@ -2484,7 +2150,7 @@ namespace Freefall.Components
 
                 cs.SetParam("ControlWidth", (uint)controlW);
                 cs.SetParam("ControlHeight", (uint)controlH);
-                cs.SetParam("SlotCount", (uint)Terrain.Decorations.Count);
+                cs.SetParam("SlotCount", (uint)_decoVariantCount);
                 var hmDesc2 = Terrain.Heightmap!.Native.Description;
                 cs.SetParam("HeightmapSize", new Vortice.Mathematics.UInt2((uint)hmDesc2.Width, (uint)hmDesc2.Height));
 
@@ -2648,6 +2314,8 @@ namespace Freefall.Components
         private static bool TryGetStampRegion(TerrainStamp stamp, out Vector2 min, out Vector2 max)
         {
             min = max = default;
+            // A global stamp has no region: whatever it changes, it can change anywhere
+            if (stamp.IsGlobal) return false;
             if (stamp.IsSplineMode && stamp.GetSpline().Points.Count < 2) return false;
 
             var bounds = stamp.GetWorldBounds();
@@ -2685,6 +2353,8 @@ namespace Freefall.Components
         {
             _stampRegions.Clear();
             foreach (var stamp in ComponentCache<HeightStamp>.All) Snapshot(stamp);
+            foreach (var stamp in ComponentCache<HeightNoiseStamp>.All) Snapshot(stamp);
+            foreach (var stamp in ComponentCache<HeightErosionStamp>.All) Snapshot(stamp);
             foreach (var stamp in ComponentCache<SplatStamp>.All) Snapshot(stamp);
             foreach (var stamp in ComponentCache<DecoStamp>.All) Snapshot(stamp);
 
@@ -2695,10 +2365,45 @@ namespace Freefall.Components
             }
         }
 
+        /// <summary>
+        /// Request the rebakes a changed stamp needs.
+        ///
+        /// Height stamps rebake everything: the splat and deco stamps' height/slope filters depend on them.
+        /// Local splat and deco stamps also go through the height path, although they leave the heights
+        /// alone: its readback is what tells PCG and surface meshes which region changed, and PCG's
+        /// ExcludeStamps depends on where the splat stamps are.
+        /// Global splat and deco stamps skip it. They have no region, so they would regenerate every
+        /// PCG component on the terrain for a change none of them can see.
+        /// </summary>
+        private void RequestRebake(TerrainStamp stamp)
+        {
+            RebakeRequestCount++;
+
+            if (stamp is CoverageStamp { IsGlobal: true })
+            {
+                Terrain?.MarkForUpdate(stamp is DecoStamp
+                    ? TerrainDirtyFlags.DecoPrepass
+                    : TerrainDirtyFlags.SplatPack | TerrainDirtyFlags.AlbedoBake | TerrainDirtyFlags.DecoPrepass);
+                return;
+            }
+
+            MarkStampRegion(stamp);
+            Terrain?.MarkForUpdate(
+                TerrainDirtyFlags.HeightBake |
+                TerrainDirtyFlags.SplatPack |
+                TerrainDirtyFlags.AlbedoBake |
+                TerrainDirtyFlags.DecoPrepass);
+        }
+
         private void OnStampChanged(Message msg)
         {
-            if (msg.Data is TerrainStamp stamp) MarkStampRegion(stamp);
+            if (msg.Data is TerrainStamp stamp)
+            {
+                RequestRebake(stamp);
+                return;
+            }
 
+            // Sender unknown: rebake everything
             RebakeRequestCount++;
             Terrain?.MarkForUpdate(
                 TerrainDirtyFlags.HeightBake |
@@ -2713,19 +2418,9 @@ namespace Freefall.Components
             // concrete type, so GetComponent<TerrainStamp>() never finds a HeightStamp / SplatStamp / DecoStamp.
             if (msg.Data is not Spline spline || spline.Entity == null) return;
 
-            bool hasStamp = false;
             foreach (var component in spline.Entity.Components)
-                if (component is TerrainStamp stamp) { hasStamp = true; MarkStampRegion(stamp); }
-
-            if (hasStamp)
-            {
-                RebakeRequestCount++;
-                Terrain?.MarkForUpdate(
-                    TerrainDirtyFlags.HeightBake |
-                    TerrainDirtyFlags.SplatPack |
-                    TerrainDirtyFlags.AlbedoBake |
-                    TerrainDirtyFlags.DecoPrepass);
-            }
+                if (component is TerrainStamp stamp)
+                    RequestRebake(stamp);
         }
     }
 }

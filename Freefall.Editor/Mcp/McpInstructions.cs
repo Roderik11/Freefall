@@ -22,13 +22,18 @@ namespace Freefall.Editor.Mcp
               anything you will touch again later. Generated PCG output gets new uids on every regeneration.
             - Member names in entity_set_properties / asset_set_properties are exact PascalCase C# names; read them from
               entity_get / asset_get first. Only top-level members can be set (no 'A.B' paths): lists are replaced whole
-              with a JSON array, nested data objects (e.g. Terrain.Layers entries) with a JSON object of their members.
+              with a JSON array, nested data objects (e.g. TerrainDecorator.Variants entries) with a JSON object of their members.
             - Value encodings: vectors {x,y,z} or [x,y,z]; quaternions {x,y,z,w}; Color3/Color4 [r,g,b(,a)]; enums by name;
               asset references by GUID string; entity references {"entity": id} / {"entityUid": "uid"} (null clears);
               component references the same plus optional "component": "Type".
             - Prefer prefab GUIDs over mesh GUIDs for entity_instantiate / entity_scatter.
-            - Terrain is authored with stamp components on entities (TerrainStamp/HeightStamp/SplatStamp/DecoStamp), edited
-              via entity_add_component + entity_set_properties.
+            - Terrain is authored ONLY with stamp components on entities, edited via entity_add_component +
+              entity_set_properties; there is no painting and the Terrain asset holds no layers. HeightStamp shapes the
+              ground, SplatStamp places a TerrainLayer asset (Layer = its GUID), DecoStamp places or thins a TerrainDecorator
+              asset. Shape=Local is a circle or the entity's Spline; Shape=Global covers the terrain the entity is parented
+              under and is limited by the stamp's filter (HeightRange, SlopeRange, RequireLayers, ExcludeLayers) — that is
+              how terrain-wide rules are written. Stamps composite in ascending Priority: a later SplatStamp paints over an
+              earlier one. terrain_info lists the layers and decorators the stamps currently put on the terrain.
 
             Assets
             - The editor loads assets from its Library cache: editing .asset files on disk does NOT reach it. Use asset_set_properties

@@ -199,7 +199,8 @@ namespace Freefall.PCG
             var stamps = new System.Collections.Generic.List<(SplatStamp stamp, Vortice.Mathematics.BoundingBox bounds)>();
             foreach (var s in ComponentCache<SplatStamp>.All)
             {
-                if (s is SplatStamp { Enabled: true } splat && (IncludeOwnStamps || splat.Entity != IgnoreEntity))
+                // Global stamps are terrain-wide rules (grass on flats, rock on cliffs), not painted ground to keep clear of
+                if (s is SplatStamp { Enabled: true, IsGlobal: false } splat && (IncludeOwnStamps || splat.Entity != IgnoreEntity))
                     stamps.Add((splat, splat.GetWorldBounds()));
             }
 

@@ -55,8 +55,8 @@ namespace Freefall.Editor.Tools
         [ValueRange(3f, 25f)]
         public float TowerHeight = 30f;
 
-        /// <summary>Terrain splat layer index for road surface.</summary>
-        public int RoadSplatLayer = 1;
+        /// <summary>Terrain layer painted under the roads (none = roads leave the ground as it is).</summary>
+        public TerrainLayer RoadLayer;
 
         public bool ImportBuildings = true;
         public bool ImportRoads = true;
@@ -665,7 +665,7 @@ namespace Freefall.Editor.Tools
                     var ss = entity.AddComponent<SplatStamp>();
                     ss.Radius = hs.Radius;
                     ss.Falloff = hs.Falloff;
-                    ss.SplatLayerIndex = settings.RoadSplatLayer;
+                    ss.Layer = settings.RoadLayer;
 
                     var ds = entity.AddComponent<DecoStamp>();
                     ds.Radius = hs.Radius;

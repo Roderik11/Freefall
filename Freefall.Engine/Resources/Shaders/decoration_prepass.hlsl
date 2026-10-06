@@ -1,154 +1,150 @@
-// decoration_prepass.hlsl — Build decoration control texture from layer-driven + standalone decorators
+// decoration_prepass.hlsl — Composites the terrain's DecoStamps into the decoration control texture.
 // SM 6.6 bindless, push constants at b3
 //
-// For each texel: iterates all decoration slots, computes effective weight either from
-// splatmap layer weights (layer-driven via SourceLayerMask) or from standalone density maps.
-// Applies exclusion masks. Finds top 8 by weight, packs (slotIndex, weight) into RGBA16_UINT.
-// Each channel: (slotIndex << 8) | weight. Unused slots: index=255, weight=0.
+// For each texel: walks the deco stamps in priority order and builds one coverage weight per
+// decorator. Add raises a decorator's coverage, Multiply scales it (one decorator, or all of them).
+// Each stamp's weight is its shape times its filter: height/slope from the heightmap, and layer terms
+// from the finished splat result (so "grass blades where the grass layer shows" needs no ordering).
+//
+// Finds the top 8 decorators by weight and packs (slot, weight) into RGBA16_UINT x 2 slices.
+// Each channel: (decoratorSlot << 8) | weight. Unused entries: slot=255, weight=0.
+//
+// A slot is a TerrainDecorator, not one of its variants: the weight here is pure coverage. Density and
+// clumping are per variant and are applied by the spawn kernel (grass_compute.hlsl).
 
 #pragma kernel CSBuildDecoControl
 
-// Push constants (root parameter 0, register b3) — bindless indices only
+#include "terrain_stamp_common.hlsli"
+#include "terrain_coverage.hlsli"
+
 cbuffer PushConstants : register(b3)
 {
-    uint SlotsIdx;          // slot 0 — SRV: DecoratorSlot structured buffer
-    uint ControlUAVIdx;     // slot 1 — UAV: output RWTexture2DArray<uint4>
-    uint SlotCountIdx;      // slot 2 — number of decorator slots
-    uint ResolutionIdx;     // slot 3 — control texture width/height
-    uint HeightTexIdx;      // slot 4 — SRV: baked heightmap for slope/height evaluation
-    uint AutoMaskBufIdx;    // slot 5 — SRV: StructuredBuffer<LayerAutoMask> for layer weight computation
-    uint LayerCountIdx;     // slot 6 — total number of texture layers
-    uint ControlMapsIdx;    // slot 7 — SRV: packed Texture2DArray (RGBA, same as surface shader)
-    uint MaxHeightIdx;      // slot 8 — MaxHeight as uint bits (asfloat on GPU)
-    uint TerrainSizeXIdx;   // slot 9 — TerrainSize.x as uint bits
+    uint  StampBufIdx;      // slot 0 — SRV: StructuredBuffer<CoverageStamp>, sorted by priority
+    uint  ControlUAVIdx;    // slot 1 — UAV: output RWTexture2DArray<uint4>
+    uint  DecoratorCount;   // slot 2 — number of decorator slots (palette size)
+    uint  Resolution;       // slot 3 — control texture width/height
+    uint  HeightTexIdx;     // slot 4 — SRV: baked heightmap (0 = none: height/slope read as 0)
+    uint  SplineBufIdx;     // slot 5 — SRV: StructuredBuffer<StampSplinePoint>
+    uint  LayerCount;       // slot 6 — number of texture layers in the packed control array
+    uint  ControlMapsIdx;   // slot 7 — SRV: packed layer weights (same array the surface shader samples)
+    float MaxHeight;        // slot 8
+    float TerrainSizeX;     // slot 9
+    uint  StampCount;       // slot 10
 };
 
-// Must match DecoratorSlot in grass.fx / grass_compute.hlsl
-struct DecoratorSlot
-{
-    float Density;
-    float MinH, MaxH;
-    float MinW, MaxW;
-    uint LODCount;
-    uint LODTableOffset;
-    float Rot00, Rot01, Rot02;
-    float Rot10, Rot11, Rot12;
-    float Rot20, Rot21, Rot22;
-    float SlopeBias;
-    uint DecoMapSlice;          // bindless SRV for standalone density map (0 = none)
-    uint SourceLayerMask;       // which layers drive density (0 = standalone)
-    uint Mode;
-    uint TextureIdx;
-    float3 HealthyColor;
-    float3 DryColor;
-    float NoiseSpread;
-    uint ExclusionLayerMask;
-    float ProceduralBlend;
-    float ClusterScale;         // world size of density clumps in m (0 = off)
-    float ClusterAmount;        // 0 = uniform, 1 = full clumps + bare gaps
-    uint AlphaClip;             // mesh mode: 1 = alpha-test albedo (foliage), 0 = opaque (rocks, pebbles)
-    float HeightNoiseScale;     // world size of short vs. lush patches in m (0 = off)
-    float HeightNoiseAmount;    // 0 = none, 1 = 0.4x .. 1.4x height
-};
+#define DECO_OP_ADD      0u
+#define DECO_OP_MULTIPLY 1u
 
-// Must match LayerAutoMask in gputerrain.fx
-struct LayerAutoMask
-{
-    float HeightMin, HeightMax;
-    float SlopeMin, SlopeMax;
-    float HeightBlend, SlopeBlend;
-    float ProceduralWeight;
-    float _pad;
-};
+#define MAX_LAYERS     32
+#define MAX_DECORATORS 32
 
-// Sampler for density/height maps
 SamplerState ClampSampler : register(s2);
-
-#include "decoration_noise.hlsli"   // DecoClusterMask (gradient-noise fBm, shared with the spawn kernel)
 
 [numthreads(8, 8, 1)]
 void CSBuildDecoControl(uint3 dtid : SV_DispatchThreadID)
 {
     RWTexture2DArray<uint4> controlTex = ResourceDescriptorHeap[ControlUAVIdx];
-    StructuredBuffer<DecoratorSlot> slots = ResourceDescriptorHeap[SlotsIdx];
+    StructuredBuffer<CoverageStamp> stamps = ResourceDescriptorHeap[StampBufIdx];
+    StructuredBuffer<StampSplinePoint> splinePoints = ResourceDescriptorHeap[SplineBufIdx];
 
-    uint resolution = ResolutionIdx;
-    if (dtid.x >= resolution || dtid.y >= resolution) return;
+    if (dtid.x >= Resolution || dtid.y >= Resolution) return;
 
-    // Normalized UV for SampleLevel (texel center)
-    float2 uv = (float2(dtid.xy) + 0.5) / float2(resolution, resolution);
-    float2 flippedUv = float2(uv.x, 1.0 - uv.y);
+    // Control texture space is Y-flipped relative to terrain UV (heightmap, stamp shapes)
+    float2 uv = (float2(dtid.xy) + 0.5) / float2(Resolution, Resolution);
+    float2 terrainUV = float2(uv.x, 1.0 - uv.y);
 
-    // ── Height and slope (for procedural auto-mask) ──
-    float maxHeight = asfloat(MaxHeightIdx);
-    float terrainSizeX = asfloat(TerrainSizeXIdx);
-    Texture2D HeightTex = ResourceDescriptorHeap[HeightTexIdx];
-
-    float heightNorm = HeightTex.SampleLevel(ClampSampler, flippedUv, 0).r;
-
-    // Use heightmap's OWN resolution for neighbor offsets (may differ from control texture resolution)
-    uint hmW, hmH;
-    HeightTex.GetDimensions(hmW, hmH);
-    float heightTexel = 1.0 / float(hmW);
-    float4 h;
-    h[0] = HeightTex.SampleLevel(ClampSampler, flippedUv + float2(0, -heightTexel), 0).r;
-    h[1] = HeightTex.SampleLevel(ClampSampler, flippedUv + float2(-heightTexel, 0), 0).r;
-    h[2] = HeightTex.SampleLevel(ClampSampler, flippedUv + float2(heightTexel, 0), 0).r;
-    h[3] = HeightTex.SampleLevel(ClampSampler, flippedUv + float2(0, heightTexel), 0).r;
-    // Central difference spans two texels (matches gputerrain.fx GetNormal)
-    float texelWorldSize = terrainSizeX * heightTexel;
-    float heightScale = maxHeight / (2.0 * texelWorldSize);
-    float3 n;
-    n.z = (h[0] - h[3]) * heightScale;
-    n.x = (h[1] - h[2]) * heightScale;
-    n.y = 1.0f;
-    n = normalize(n);
-    float slopeDeg = acos(saturate(n.y)) * (180.0 / 3.14159265);
-
-    // ── Sample layer weights from the packed ControlMapArray (already contains procedural + stamps) ──
-    Texture2DArray ControlMaps = ResourceDescriptorHeap[ControlMapsIdx];
-
-    uint cmW, cmH, sliceCount;
-    ControlMaps.GetDimensions(cmW, cmH, sliceCount);
-
-    uint layerCount = LayerCountIdx;
-    uint clampedLayerCount = min(layerCount, 32);
-
-    // Compute raw per-layer weights — ControlMaps already has final weights
-    float rawWeight[32];
-    float effectiveWeight[32];
-
-    for (uint si = 0; si < sliceCount; si++)
+    float heightNorm = 0, slopeDeg = 0;
+    if (HeightTexIdx != 0)
     {
-        float4 weights = ControlMaps.SampleLevel(ClampSampler, float3(uv, si), 0);
+        Texture2D heightTex = ResourceDescriptorHeap[HeightTexIdx];
+        SampleTerrainHeightSlope(heightTex, ClampSampler, terrainUV, MaxHeight, TerrainSizeX, heightNorm, slopeDeg);
+    }
 
-        for (uint sj = 0; sj < 4; sj++)
+    // ── Layer weights from the packed control array (final splat result) ──
+    // raw = the weight as painted; visible = what shows after the layers above it:
+    // visible[i] = raw[i] * product(1 - raw[k]) for all k > i, as in gputerrain.fx
+    uint layerCount = ControlMapsIdx != 0 ? min(LayerCount, (uint)MAX_LAYERS) : 0;
+
+    float rawWeight[MAX_LAYERS];
+    float visibleWeight[MAX_LAYERS];
+    for (uint z = 0; z < MAX_LAYERS; z++) { rawWeight[z] = 0; visibleWeight[z] = 0; }
+
+    if (layerCount > 0)
+    {
+        Texture2DArray controlMaps = ResourceDescriptorHeap[ControlMapsIdx];
+        uint sliceCount = (layerCount + 3) / 4;
+        for (uint si = 0; si < sliceCount; si++)
         {
-            uint layerIdx = si * 4 + sj;
-            if (layerIdx >= clampedLayerCount) break;
+            float4 weights = controlMaps.SampleLevel(ClampSampler, float3(uv, si), 0);
+            for (uint sj = 0; sj < 4; sj++)
+            {
+                uint layerIdx = si * 4 + sj;
+                if (layerIdx < layerCount) rawWeight[layerIdx] = weights[sj];
+            }
+        }
 
-            rawWeight[layerIdx] = weights[sj];
-            effectiveWeight[layerIdx] = 0;
+        float cover = 1.0;
+        for (int li = int(layerCount) - 1; li >= 0; li--)
+        {
+            visibleWeight[li] = rawWeight[li] * cover;
+            cover *= saturate(1.0 - rawWeight[li]);
         }
     }
 
-    // ── Simulate sequential lerp to derive effective weights ──
-    // Exactly mirrors: color = lerp(color, layerColor[i], weight[i])
-    // After each lerp, all prior layers' contributions scale by (1 - w).
-    for (uint li = 0; li < clampedLayerCount; li++)
+    // ── Composite the stamps into one coverage weight per decorator ──
+    uint decoCount = min(DecoratorCount, (uint)MAX_DECORATORS);
+
+    float coverage[MAX_DECORATORS];
+    for (uint d0 = 0; d0 < MAX_DECORATORS; d0++) coverage[d0] = 0;
+
+    for (uint i = 0; i < StampCount; i++)
     {
-        float w = rawWeight[li];
-        if (w <= 0) continue;
+        CoverageStamp stamp = stamps[i];
 
-        // Scale down all previous layers' contributions
-        for (uint p = 0; p < li; p++)
-            effectiveWeight[p] *= (1.0 - w);
+        float weight = CoverageShapeWeight(stamp, terrainUV, splinePoints);
+        if (weight <= 0) continue;
 
-        // This layer claims w of the final result
-        effectiveWeight[li] = w;
+        if (stamp.Flags & COVERAGE_FILTER)
+        {
+            weight *= CoverageTerrainFilter(stamp, heightNorm, slopeDeg);
+
+            if ((stamp.RequireMask | stamp.ExcludeMask) != 0)
+            {
+                float required = 0, excluded = 0;
+                for (uint c = 0; c < layerCount; c++)
+                {
+                    uint bit = 1u << c;
+                    if (stamp.RequireMask & bit) required = max(required, visibleWeight[c]);
+                    if (stamp.ExcludeMask & bit) excluded = max(excluded, rawWeight[c]);
+                }
+                if (stamp.RequireMask != 0) weight *= required;
+                weight *= (1.0 - excluded);
+            }
+
+            if (weight <= 0) continue;
+        }
+
+        if (CoverageOp(stamp) == DECO_OP_ADD)
+        {
+            if (stamp.Target < decoCount)
+                coverage[stamp.Target] = max(coverage[stamp.Target], saturate(weight * stamp.Strength));
+        }
+        else
+        {
+            float factor = lerp(1.0, stamp.Strength, weight);
+            if (stamp.Target == COVERAGE_ALL_TARGETS)
+            {
+                for (uint d1 = 0; d1 < decoCount; d1++)
+                    coverage[d1] = saturate(coverage[d1] * factor);
+            }
+            else if (stamp.Target < decoCount)
+            {
+                coverage[stamp.Target] = saturate(coverage[stamp.Target] * factor);
+            }
+        }
     }
 
-    // ── Collect top 8 decorator slots by weight (descending) ──
+    // ── Collect top 8 decorators by weight (descending) ──
     uint topIdx[8];
     uint topWt[8];
     [unroll] for (uint k = 0; k < 8; k++)
@@ -157,57 +153,9 @@ void CSBuildDecoControl(uint3 dtid : SV_DispatchThreadID)
         topWt[k] = 0;
     }
     uint topCount = 0;
-    uint count = min(SlotCountIdx, 32);
-    for (uint i = 0; i < count; i++)
+    for (uint d = 0; d < decoCount; d++)
     {
-        DecoratorSlot s = slots[i];
-        if (s.LODCount == 0) continue;
-
-        // Painted density (standalone ControlMap)
-        float painted = 0;
-        if (s.DecoMapSlice != 0)
-        {
-            Texture2D<float> densityMap = ResourceDescriptorHeap[s.DecoMapSlice];
-            painted = densityMap.SampleLevel(ClampSampler, uv, 0).r;
-        }
-
-        // Layer-driven procedural weight
-        float procedural = 0;
-        if (s.SourceLayerMask != 0)
-        {
-            for (uint li2 = 0; li2 < clampedLayerCount; li2++)
-            {
-                if (s.SourceLayerMask & (1u << li2))
-                    procedural = max(procedural, effectiveWeight[li2]);
-            }
-        }
-
-        // Blend: positive = max(painted, procedural * blend), negative = procedural * |blend| * (1 - painted)
-        float blend = s.ProceduralBlend;
-        float val;
-        if (blend >= 0)
-            val = max(painted, procedural * blend);
-        else
-            val = procedural * abs(blend) * (1.0 - painted);
-        if (val <= 0) continue;
-
-        // Apply exclusion layers (use raw weight — exclusion checks presence, not visual dominance)
-        if (s.ExclusionLayerMask != 0)
-        {
-            float exclusion = 0;
-            for (uint ei = 0; ei < clampedLayerCount; ei++)
-            {
-                if (s.ExclusionLayerMask & (1u << ei))
-                    exclusion = max(exclusion, rawWeight[ei]);
-            }
-            val *= (1.0 - exclusion);
-        }
-
-        // Natural patchiness: modulate by a per-decorator world-space clump mask
-        if (s.ClusterScale > 0 && s.ClusterAmount > 0)
-            val *= lerp(1.0, DecoClusterMask(uv * terrainSizeX, s.ClusterScale, i), saturate(s.ClusterAmount));
-
-        uint weight = (uint)(val * 255.0 + 0.5);
+        uint weight = (uint)(coverage[d] * 255.0 + 0.5);
         if (weight == 0) continue;
 
         // Insertion sort: find position and shift down
@@ -226,26 +174,26 @@ void CSBuildDecoControl(uint3 dtid : SV_DispatchThreadID)
         }
 
         // Shift entries down to make room
-        [unroll] for (uint j = 7; j > 0; j--)
+        [unroll] for (uint j2 = 7; j2 > 0; j2--)
         {
-            if (j > pos)
+            if (j2 > pos)
             {
-                topIdx[j] = topIdx[j - 1];
-                topWt[j]  = topWt[j - 1];
+                topIdx[j2] = topIdx[j2 - 1];
+                topWt[j2]  = topWt[j2 - 1];
             }
         }
 
-        topIdx[pos] = i;
+        topIdx[pos] = d;
         topWt[pos]  = weight;
         if (topCount < 8) topCount++;
     }
 
-    // Pack: (slotIndex << 8) | weight
+    // Pack: (decoratorSlot << 8) | weight
     uint4 packed0, packed1;
-    [unroll] for (uint c = 0; c < 4; c++)
+    [unroll] for (uint ch = 0; ch < 4; ch++)
     {
-        packed0[c] = (topIdx[c] << 8) | topWt[c];
-        packed1[c] = (topIdx[c + 4] << 8) | topWt[c + 4];
+        packed0[ch] = (topIdx[ch] << 8) | topWt[ch];
+        packed1[ch] = (topIdx[ch + 4] << 8) | topWt[ch + 4];
     }
 
     controlTex[uint3(dtid.xy, 0)] = packed0;

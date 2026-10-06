@@ -50,3 +50,4 @@ dotnet-tools.json
 /Scripts/
 /Tools/BlenderKits
 /Tools/RetargetLab
+Tools/TerrainMigration/migrate-to-stamps.mjs

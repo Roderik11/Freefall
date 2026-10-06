@@ -10,14 +10,28 @@ namespace Freefall.Components
     /// When a Heightmap is assigned, applies a spatially-varying height pattern
     /// scaled by Strength, with rotation from the entity transform.
     /// InvertShape negates the displacement for trenches/riverbeds.
+    ///
+    /// With Shape = Global and a Heightmap, the heightmap is stretched over the whole terrain and
+    /// replaces what lower-priority stamps built (height = heightmap * Strength, plus the entity's Y and
+    /// HeightOffset): that is how an imported heightmap becomes the base of a terrain. A global stamp
+    /// without a heightmap does nothing.
     /// </summary>
     [Icon("icon_heightstamp.png")]
     public class HeightStamp : TerrainStamp
     {
         /// <summary>
-        /// Height offset from the entity/spline position (world units).
+        /// How the stamp's height combines with what lower-priority stamps built, inside the stamp zone.
+        /// Set flattens to it (roads, plots). Add raises the ground by HeightOffset plus the heightmap,
+        /// wherever the entity sits vertically (a hill dropped onto existing relief). Max / Min only
+        /// raise / only lower to it (a mountain that never digs, a basin that never fills).
+        /// Ignored by a global stamp, which always replaces.
         /// </summary>
         [System.ComponentModel.Category("Height")]
+        public HeightBlendMode BlendMode = HeightBlendMode.Set;
+
+        /// <summary>
+        /// Height offset from the entity/spline position (world units).
+        /// </summary>
         public float HeightOffset = 0f;
 
         /// <summary>

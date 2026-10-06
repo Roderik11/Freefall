@@ -15,7 +15,6 @@ namespace Freefall.Editor
         private TransformTranslate translate;
         private TransformRotate rotate;
         private TransformScale scale;
-        private TerrainBrush terrainBrush;
         private GizmoManager gizmoManager;
 
         private ToolBase activeTool;
@@ -42,9 +41,6 @@ namespace Freefall.Editor
 
             scale = new TransformScale();
             scale.Initialize();
-
-            terrainBrush = new TerrainBrush();
-            terrainBrush.Initialize();
 
             gizmoManager = new GizmoManager();
 
@@ -74,25 +70,6 @@ namespace Freefall.Editor
                 activeTool = rotate;
             if (Input.IsKeyPressed(Keys.F3))
                 activeTool = scale;
-            if (Input.IsKeyPressed(Keys.F4))
-            {
-                activeTool = terrainBrush;
-                // Auto-switch to Terrain panel tab
-                var desktop = Program.EditorUI as EditorDesktop;
-                if (desktop?.Terrain != null)
-                {
-                    //MessageDispatcher.Send(Msg.RequestFocus, desktop.Terrain);
-
-                    foreach (var tab in desktop.Terrain.TabPages)
-                    {
-                        if (tab is Squid.TabPage tp && tp.Button.Text == "Terrain")
-                        {
-                            desktop.Terrain.SelectedTab = tp;
-                            break;
-                        }
-                    }
-                }
-            }
 
             if (!EditorUI.KeyboardCaptured)
             {
