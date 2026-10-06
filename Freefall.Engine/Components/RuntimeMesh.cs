@@ -109,7 +109,6 @@ namespace Freefall.Components
 
         private MeshRenderer _renderer;
         private Mesh _generatedMesh;
-        private Mesh _retiring; // previous mesh kept alive until GPU is done with it
 
         protected override void Early()
         {
@@ -124,8 +123,6 @@ namespace Freefall.Components
         {
             MessageDispatcher.RemoveListener(EngineMsg.SplineChanged, OnSplineChanged);
             MessageDispatcher.RemoveListener(EngineMsg.TerrainHeightsChanged, OnTerrainHeightsChanged);
-            _retiring?.Dispose();
-            _retiring = null;
             if (_generatedMesh != null)
             {
                 if (_renderer != null && _renderer.Mesh == _generatedMesh)
@@ -161,8 +158,8 @@ namespace Freefall.Components
 
         /// <summary>
         /// Regenerate the mesh from the current spline state.
-        /// Double-buffers: the old mesh is kept alive for one cycle so the GPU
-        /// can finish rendering with it before its resources are freed.
+        /// The previous mesh is released through the device's deferred disposal, once the
+        /// frames still in flight have finished with it.
         /// </summary>
         public void Generate()
         {
@@ -170,11 +167,10 @@ namespace Freefall.Components
             if (Spline == null) return;
             if (Spline.Points.Count < 2) return;
 
-            // Dispose the mesh from two generations ago (GPU is definitely done)
-            _retiring?.Dispose();
-
-            // Current mesh retires — GPU may still be referencing it this frame
-            _retiring = _generatedMesh;
+            // Frames in flight (and draws enqueued earlier this frame, WaterBody.Draw) still reference the current
+            // mesh. A spline drag regenerates every frame, so "two generations ago" is only two frames old — fewer
+            // than the frames in flight; disposing it directly removed the device while dragging a river point.
+            Engine.Device.DeferDispose(_generatedMesh);
 
             _generatedMesh = Spline.Closed
                 ? GenerateClosed()
