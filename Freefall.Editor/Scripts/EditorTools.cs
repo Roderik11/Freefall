@@ -25,6 +25,7 @@ namespace Freefall.Editor
         // Pick state tracking
         private bool _pendingClickPick;   // True when pick was from a mouse click
         private bool _pendingHoverPick;   // True when pick was from hover (don't affect selection)
+        private System.Func<bool>? _isToolDragging;
 
         public static EditorTools Instance { get; private set; }
         public static ToolBase ActiveTool => Instance?.activeTool;
@@ -127,6 +128,11 @@ namespace Freefall.Editor
             gizmoSlotMap[gizmoManager.GizmoSlot] = (null, MoveAxis.Free);
 
             activeTool.Update(Camera.Main);
+
+            // PCG output regenerates when the drag ends, not on every frame of it (a stamp being moved
+            // rebakes the terrain under every forest it touches)
+            if (activeTool.IsClicked)
+                Freefall.PCG.PCGScheduler.HoldWhile(_isToolDragging ??= () => activeTool.IsClicked);
 
             // Release mouse capture on mouse up (drag end)
             if (activeTool.IsClicked && !Input.IsMouseDown(0))

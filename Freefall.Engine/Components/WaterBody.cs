@@ -287,6 +287,7 @@ namespace Freefall.Components
 
         public void Draw()
         {
+            if (!Enabled) return;
             if (_material == null) return;
 
             // Lazy lookups: the ocean (ripple textures) may be created after this component

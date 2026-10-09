@@ -1377,6 +1377,11 @@ namespace Freefall.Assets
                 var texture = Graphics.Texture.LoadFromFile(Engine.Device, thumbPath);
                 if (texture != null)
                 {
+                    // The UI draws the thumbnail in this same frame. Wait for its upload: sampling the
+                    // texture on the direct queue while the copy queue is still writing it is undefined.
+                    Graphics.StreamingManager.Instance?.Flush();
+                    Engine.Device.WaitForCopyQueue();
+
                     texture.Name = $"thumb_{guid}";
                     _thumbTextures[guid] = texture;
                     OnThumbnailLoaded?.Invoke(texture.Name, texture);

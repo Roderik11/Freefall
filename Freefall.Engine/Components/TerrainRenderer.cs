@@ -1809,7 +1809,7 @@ namespace Freefall.Components
             if (_decoControlTex == null || (int)_decoControlTex.Description.Width != resolution)
             {
                 freshTexture = true;
-                _decoControlTex?.Dispose();
+                device.DeferDispose(_decoControlTex); // frames in flight may still read it
                 _decoControlTex = device.CreateTexture2D(
                     Format.R16G16B16A16_UInt, resolution, resolution, 2, 1,
                     ResourceFlags.AllowUnorderedAccess, ResourceStates.Common);

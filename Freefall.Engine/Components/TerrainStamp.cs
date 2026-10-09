@@ -35,11 +35,9 @@ namespace Freefall.Components
         /// Radius for radial stamps (when no Spline is present).
         /// Width for spline-based stamps (half-width on each side of the path).
         /// </summary>
-        [ValueRange(0.1f, 200f)]
         public float Radius = 4f;
 
         /// <summary>Falloff distance (blend from full effect to none). World units.</summary>
-        [ValueRange(0f, 200f)]
         public float Falloff = 3f;
 
         /// <summary>Evaluation priority. Higher values are applied later (overwrite lower).</summary>
@@ -54,7 +52,6 @@ namespace Freefall.Components
         public float NoiseFrequency = 3f;
 
         /// <summary>Noise amplitude in world units (how far edges displace).</summary>
-        [ValueRange(0f, 20f)]
         public float NoiseAmplitude = 2f;
 
         /// <summary>Noise seed for variation between stamps.</summary>

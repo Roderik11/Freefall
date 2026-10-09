@@ -745,9 +745,9 @@ namespace Freefall.Assets
             if (_heightTexture != null && _currentResolution == resolution)
                 return;
 
-            _heightTexture?.Release();
-
             var device = Engine.Device;
+            device.DeferDispose(_heightTexture); // frames in flight may still read it
+
             _heightTexture = device.CreateTexture2D(
                 Format.R16_UNorm, resolution, resolution, 1, 1,
                 ResourceFlags.AllowUnorderedAccess, ResourceStates.Common);
@@ -1303,8 +1303,11 @@ namespace Freefall.Assets
         private static void EnsureUpload<T>(ref GraphicsBuffer buffer, ref int capacity, int count, int minimum)
             where T : unmanaged
         {
-            if (buffer != null && capacity >= count) return;
-            buffer?.Dispose();
+            // A bake's dispatches run on the GPU frames after they are recorded, and the next bake can be
+            // recorded before that (a stamp being dragged rebakes every frame). Every bake gets its own
+            // buffer and the previous one lives until its frames are done: rewriting or freeing it here
+            // fed the earlier bake's shader a stamp list that was changing under it (GPU hang).
+            Engine.Device.DeferDispose(buffer);
             capacity = Math.Max(count, minimum);
             buffer = GraphicsBuffer.CreateUpload<T>(capacity, mapped: true);
         }
