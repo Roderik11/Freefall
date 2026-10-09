@@ -1,15 +1,21 @@
 # Freefall
 
-Freefall is a game engine and world editor written in C# on Direct3D 12, built with the help of Opus, Fable, Grok and Gemini.
+Freefall is a game engine and world editor written in C# on Direct3D 12, built with the help of Opus, Fable, Grok and Gemini. The editor can be fully remote-controlled by AI agents.
 
 It is being built for an open-world sandbox RPG, so the focus so far is on the renderer, large outdoor scenes and the tools to author them. Gameplay systems and networking are still to come — see [Status](#status).
 
 ## Highlights
 
+- **Fully remote-controllable by AI agents** — an MCP server (about 60 tools) lets an agent such as Claude Code operate the editor end to end: launch it, open a project, import assets, build and save scenes, and check its own work through screenshots
 - **GPU-driven deferred renderer** — bindless (SM 6.6), compute culling with Hi-Z occlusion, GPU LOD selection, `ExecuteIndirect`
 - **Outdoor world** — CDLOD terrain authored entirely with non-destructive stamps, mesh-shader ground cover, FFT ocean, lakes and rivers, procedural sky with time of day and weather
 - **Editor** — docking UI, inspectors, gizmos, prefabs, PCG node graph, animation state-machine editor, C# scripts and shaders that hot-reload
-- **Fully remote-controllable by AI agents** — an MCP server (about 60 tools) lets an agent such as Claude Code operate the editor end to end: launch it, open a project, import assets, build and save scenes, and check its own work through screenshots
+
+## AI automation (MCP)
+
+The editor can be driven entirely by an AI agent, without anyone touching the UI. It hosts an MCP endpoint at `http://localhost:21721/mcp` whose tools cover the whole workflow: launching and shutting down the editor, opening projects, loading and saving scenes, importing and refreshing assets, creating and editing entities, components, prefabs and materials, terrain queries, PCG graphs, camera, selection and settings. The agent reads the console and takes screenshots of the viewport or the full editor to verify what it did.
+
+`Tools/FreefallMcp` is a stdio bridge that MCP clients launch. It proxies to the editor, keeps the connection alive while the editor is closed, and can start the editor itself. Building it installs it to `%LOCALAPPDATA%\Freefall\McpBridge`, which is where the checked-in `.mcp.json` points.
 
 ## Rendering architecture
 
@@ -101,11 +107,6 @@ Renderers register their instances with the GPU once and only touch them again w
 - Textures: BCn compression via texconv, PSD
 - Unity asset-pack and scene importer
 - Watabou town, city and dwelling importer (walls, gates, houses, multi-floor interiors)
-
-### Automation (MCP)
-The editor can be driven entirely by an AI agent, without anyone touching the UI. It hosts an MCP endpoint at `http://localhost:21721/mcp` whose tools cover the whole workflow: launching and shutting down the editor, opening projects, loading and saving scenes, importing and refreshing assets, creating and editing entities, components, prefabs and materials, terrain queries, PCG graphs, camera, selection and settings. The agent reads the console and takes screenshots of the viewport or the full editor to verify what it did.
-
-`Tools/FreefallMcp` is a stdio bridge that MCP clients launch. It proxies to the editor, keeps the connection alive while the editor is closed, and can start the editor itself. Building it installs it to `%LOCALAPPDATA%\Freefall\McpBridge`, which is where the checked-in `.mcp.json` points.
 
 ## Project structure
 
