@@ -1,141 +1,182 @@
 # Freefall
 
-Freefall is a game engine written in C# with Direct3D 12, built with the help of Opus, Fable, Grok and Gemini
-## Architecture
+Freefall is a game engine and world editor written in C# on Direct3D 12, built with the help of Opus, Fable, Grok and Gemini.
 
-Freefall is a fully GPU-driven deferred renderer. The CPU submits unsorted draw calls in parallel; a multi-pass compute pipeline handles visibility culling, histogram-based grouping, and indirect command generation — so the GPU draws only what is visible, with zero CPU sorting.
+It is being built for an open-world sandbox RPG, so the focus so far is on the renderer, large outdoor scenes and the tools to author them. Gameplay systems and networking are still to come — see [Status](#status).
+
+## Highlights
+
+- **GPU-driven deferred renderer** — bindless (SM 6.6), compute culling with Hi-Z occlusion, GPU LOD selection, `ExecuteIndirect`
+- **Outdoor world** — CDLOD terrain authored entirely with non-destructive stamps, mesh-shader ground cover, FFT ocean, lakes and rivers, procedural sky with time of day and weather
+- **Editor** — docking UI, inspectors, gizmos, prefabs, PCG node graph, animation state-machine editor, C# scripts and shaders that hot-reload
+- **AI-drivable** — the editor hosts an MCP server (about 60 tools), so an agent such as Claude Code can build and inspect scenes in the running editor
+
+## Rendering architecture
+
+Renderers register their instances with the GPU once and only touch them again when something changes. Each frame a compute pipeline culls every instance, picks its LOD, groups the survivors by mesh part and writes the indirect draw commands. The CPU does no per-frame sorting or per-object draw submission.
 
 ```
- ┌─────────────────────────── CPU ───────────────────────────┐     ┌──────────────── GPU ─────────────────┐
- │                                                           │     │                                      │
- │  Components (IParallel)                                   │     │  Compute (cull_instances.hlsl)        │
- │    StaticMesh ─┐                                          │     │    CSVisibility (frustum cull)        │
- │    SkinnedMesh ├──▶ ThreadLocal DrawBuckets               │     │    CSHistogram (count per mesh-part)  │
- │    Terrain     ┘     (zero contention)                    │     │    CSPrefixSum (offsets)              │
- │                         │                                 │     │    CSGlobalScatter (compact SoA)      │
- │                   Block-Copy Merge ─▶ GPU Upload (O(1))   │     │    CSMain (build draw commands)       │
- │                                                           │     │         │                             │
- └───────────────────────────────────────────────────────────┘     │    ExecuteIndirect                    │
-                                                                   │    (draws only visible instances)     │
-                                                                   └──────────────────────────────────────┘
+ CPU                                     GPU
+ ───                                     ───
+ MeshRenderer / SkinnedMeshRenderer      Culling compute (cull_instances.hlsl)
+   register once ──▶ InstanceBatch  ──▶    frustum + Hi-Z visibility, LOD select
+   (persistent instance records,           histogram per mesh part ─▶ prefix sum
+    transform slots, material IDs)         scatter ─▶ indirect command generation
+                                                      │
+ Components with per-frame work                       ▼
+ (terrain, ocean, sky, particles)        ExecuteIndirect (camera + 4 shadow cascades)
+   enqueue via CommandBuffer
 ```
 
-### Render Loop
+### Frame
 
-| Step | Pass | What happens |
-|------|------|--------------|
-| 1 | **Script Draw** | Components enqueue draws into the `CommandBuffer` |
-| 2 | **Opaque** | Merge buckets → upload → GPU cull → `ExecuteIndirect` → G-Buffer |
-| 3 | **Shadow** | Re-cull opaque batches per cascade → 4× `ExecuteIndirect` → shadow maps |
-| 4 | **Sky** | Skybox rendered as inside-out cube via the standard pipeline |
-| 5 | **Light** | Fullscreen quad reconstructs world pos, samples cascades, accumulates lighting |
-| 6 | **Compose** | `Albedo × LightBuffer` → Composite |
-| 7 | **Forward** | CompositeSnapshot copy → ocean and transparent forward objects render to Composite with depth testing |
-| 8 | **Blit** | Composite → backbuffer copy |
+| Stage | What happens |
+|-------|--------------|
+| **G-Buffer** | GPU cull → opaque geometry, terrain, ground cover and sky into the G-buffer (reverse-Z) |
+| **Shadows** | Four cascades rendered in a single pass, with their own Hi-Z caster culling and SDSM depth analysis |
+| **Screen-space** | Hi-Z pyramid, contact shadows, GTAO, terrain screen-space displacement |
+| **Lighting** | Directional light (compute) and tiled point lights (compute, Hi-Z pre-culled) |
+| **Composition** | The lit scene is composed into an HDR target |
+| **Forward** | Ocean, water bodies, transparents and particles |
+| **Post** | Bloom pyramid → ACES tonemap → optional SMAA → backbuffer |
 
-### Key Systems
+### Key systems
 
 | System | Description |
 |--------|-------------|
-| **InstanceBatch** | Core GPU-driven batcher. All per-instance data (descriptors, bounding spheres, subbatch IDs, terrain patches, bones, lights) flows through a unified `PerInstanceBuffer` system with auto-resize. Manages histogram culling pipeline and `ExecuteIndirect`. One batch per Effect. |
-| **CommandBuffer** | Thread-safe draw call collector. `Enqueue` dispatches to all applicable passes based on the Effect's declared passes. Thread-local `DrawBucket`s enable lock-free parallel submission. |
-| **MeshRegistry** | Global GPU buffer of mesh metadata. Persistent `MeshPartID`s eliminate per-frame CPU grouping — the GPU looks up vertex/index info directly. |
-| **TransformBuffer** | Pooled persistent GPU transform slots with dirty-flag uploads. Entities hold a stable `TransformSlot` for their lifetime. |
-| **MaterialBlock** | Per-instance parameter overrides. Data is staged into contiguous byte arrays at enqueue time and uploaded as generic per-instance SoA buffers via push constants. |
-| **Material / Effect** | Data-driven PSO management. `@RenderState` annotations in shaders auto-configure blend, depth, raster state. `MasterEffects` pattern for global parameter broadcast. Effect push constants discovered via shader reflection on named `cbuffer PushConstants`. |
-| **GPUCuller** | 6-pass compute pipeline: Clear → Visibility → Histogram → PrefixSum → Scatter → CommandGen. Shared between camera and shadow passes. |
-| **DeferredRenderer** | Orchestrates the G-Buffer, shadow atlas, light accumulation, and composition passes. |
+| **InstanceBatch** | The GPU-driven batcher. Holds persistent instance records and generic per-instance SoA buffers (descriptors, bounding spheres, bones, terrain patches), and runs the culling pipeline and `ExecuteIndirect`. One batch per effect. |
+| **GPUCuller / SceneCuller** | Compute culling shared by the camera and the shadow cascades: visibility, LOD, histogram, prefix sum, scatter, command generation. |
+| **MeshRegistry** | Global GPU buffer of mesh-part metadata and LOD chains. Shaders look up vertex and index data by ID; there is no input assembler. |
+| **TransformBuffer** | Pooled persistent transform slots with dirty-flag uploads. |
+| **Effect / Material** | The `.fx` format: techniques and passes are inferred from the shader, `@RenderState` annotations configure blend, depth and raster state, and push constants are discovered by reflection. Compiled with DXC. |
+| **CommandBuffer** | Thread-safe draw collector for components that submit per frame. Thread-local buckets, block-copy merge. |
+| **DeferredRenderer / RenderView** | Orchestrates the frame. Several views can render at once (viewport, previews, thumbnails). |
 
 ## Features
 
 ### Rendering
-- **GPU-Driven Rendering** — Indirect draw calls with compute-based visibility culling and instance scatter
-- **Reverse-Z Depth Buffer** — Near→1, far→0 projection for improved floating-point precision
-- **Deferred Shading** — GBuffer-based pipeline with directional and point light support
-- **Cascaded Shadow Maps** — 4-cascade PSSM with texel snapping, bounding-sphere stabilization, Vogel disc filtering, and adaptive SDSM splits
-- **Hi-Z Occlusion Culling** — Hierarchical depth buffer for GPU-side occlusion tests with visibility feedback to prevent false-positive culling loops
-- **Unified Per-Instance Buffers** — All per-instance data flows through a single generic SoA channel system with auto-resize and push-constant binding
-- **Persistent Transform Buffer** — Pooled GPU transform slots with dirty-flag uploads
-- **Skeletal Animation** — GPU skinning via per-instance bone buffers
-- **Terrain** — Fully GPU-driven restricted quadtree with compute-based node evaluation, screen-space error LOD, edge stitching, and indirect rendering
-- **Ocean** — FFT-based ocean with 4 spectrum bands, GPU tessellation, world-space shore displacement attenuation via terrain heightmap, PS shore effects (terrain show-through with refraction, animated foam, shallow water color), and distance-based normal band fadeout
-- **LOD System** — Automatic LOD level selection for static meshes based on screen-space size
-- **Point Lights** — Deferred point lights via per-instance `StructuredBuffer`, rendered as sphere volumes with additive blending
-- **Bindless SM 6.6** — All resources accessed via `ResourceDescriptorHeap` and reflection-driven named push constants; no Input Assembler
-- **Debug Visualization** — F5 cycles through: cascade colors, shadow factor, and linear depth
+- Deferred shading with PBR (GGX), foliage wrap lighting and translucency
+- Cascaded shadow maps: four cascades in one pass, stabilized, Vogel-disc PCF, adaptive (SDSM) splits
+- Screen-space contact shadows and GTAO
+- Tiled point lights
+- HDR pipeline with bloom and ACES tonemapping; SMAA
+- GPU skinning
+- GPU particles (compute-simulated; shapes, collision, flipbooks, soft particles)
+- Mesh, amplification, hull/domain and compute shader support
+- Shader hot reload: engine `.fx` / `.hlsl` files recompile on save
+- Async texture upload
+- Experimental: radiance-cascades GI, screen-space displacement mapping
 
-### Physics
-- **PhysX Integration** — NVIDIA PhysX via [MagicPhysX](https://github.com/Cysharp/MagicPhysX) for rigid body simulation
-- **Character Controller** — PhysX capsule controller with ground detection, slope handling, and gravity
-- **Precooked Collision Meshes** — Triangle mesh collision cooked at import time and stored as hidden subassets
-- **Terrain Collision** — Precooked terrain physics meshes for static world collision
-- **Foot IK** — Ground-height raycasting with differential IK corrections for natural foot placement on terrain
+### Terrain and world
+- **Terrain** — GPU quadtree CDLOD with seam stitching, Hi-Z culling and up to 32 splat layers
+- **Stamp-only authoring** — height, layer weights and decoration coverage are baked on the GPU from stamp components in the scene (`HeightStamp`, `SplatStamp`, `DecoStamp`, `CoverageStamp`). Stamps reference `TerrainLayer` and `TerrainDecorator` assets. There are no brushes.
+- **Ground cover** — grass, flowers and rocks through amplification and mesh shaders, with wind
+- **Splines** — Catmull-Rom splines with variable width drive roads, walls and pavements (`RuntimeMesh`), terrain stamps and PCG
+- **PCG** — node graph for scattering meshes and prefabs: surface and spline samplers, terrain and mesh projection, slope/height/density filters, obstacle and stamp exclusion, self-pruning, set operations
+- **Water** — FFT ocean (multi-band spectrum, foam, shoreline waves); lakes and rivers at any elevation via `WaterBody`, sharing the ocean's shading and receiving sun shadows
+- **Sky and weather** — Rayleigh/Mie atmosphere, day/night cycle, clouds with cloud shadows, aerial perspective, weather presets (rain, snow, hail, dust) that cross-fade
+- **Navigation** — navmesh baking, pathfinding and crowd agents via DotRecast
 
-### Asset Pipeline
-- **Asset Database** — GUID-based asset tracking with `.meta` files, import caching, and compound asset support (subassets with stable GUIDs)
-- **Importers** — StaticMesh (YAML + PhysX collision), Mesh (FBX/DAE/OBJ via Assimp), Material, Texture, AnimationClip, Skeleton, Terrain
-- **Loaders** — Cache-based asset loading with GUID reference resolution between assets
-- **Async Resource Streaming** — Two-phase loading (CPU parse → main-thread GPU upload) with time-budgeted work queue
-- **Scene Serialization** — YAML-based scene files with streaming entity spawn
-
-### Audio
-- **3D Positional Audio** — XAudio2-based spatial audio with distance attenuation
+### Runtime
+- Entity/component model with class components and a parallel update path (`IParallel`)
+- YAML scenes and prefabs
+- C# scripting compiled with Roslyn, hot-reloaded with live component migration
+- PhysX 5: rigid bodies, box/sphere/capsule/mesh colliders, terrain heightfield, capsule character controller
+- Animation: state machine with conditions and cross-fades, 2D blend trees, events, bone masks, humanoid retargeting
+- 3D positional audio (XAudio2; WAV and OGG)
+- Keyboard and raw mouse input
 
 ### Editor
-- **WinForms Editor** — Scene hierarchy explorer, basic property inspector, 3D viewport
-- **Asset Browser** — Navigate project assets with GUID tracking
-- **Scene Loading** — Load and inspect scenes with entity hierarchy
+- Landing page with recent projects; a project is a folder with a `.ffproject` file
+- Docking layout: scene hierarchy, inspector, asset browser with thumbnails, console, stats, viewport
+- GPU picking, translate/rotate/scale gizmos with snapping, drag-to-place with ghost preview
+- Prefabs, material and mesh inspectors, spline editing in the viewport
+- Graph editor for PCG graphs and an animation state-machine editor
+- Play-in-editor
+- UI built with [Squid](https://github.com/Roderik11/Squid)
 
-### Animation
-- **Clip Playback** — FBX animation clip import with bone-space keyframe sampling
-- **Blended Transitions** — Smooth crossfade between animation clips
+### Asset pipeline
+- GUID-based asset database with `.meta` files, sub-assets, rename detection and hot reload
+- Models: FBX, DAE, OBJ and X via Assimp, with LODs, skeletons, animation clips and cooked collision meshes
+- Textures: BCn compression via texconv, PSD
+- Unity asset-pack and scene importer
+- Watabou town, city and dwelling importer (walls, gates, houses, multi-floor interiors)
 
-## Project Structure
+### Automation (MCP)
+The editor hosts an MCP endpoint at `http://localhost:21721/mcp`. Its tools cover scenes, entities and components, assets, prefabs, terrain queries, PCG graphs, camera, settings, console and screenshots.
+
+`Tools/FreefallMcp` is a stdio bridge that MCP clients launch. It proxies to the editor, keeps the connection alive while the editor is closed, and can start the editor itself. Building it installs it to `%LOCALAPPDATA%\Freefall\McpBridge`, which is where the checked-in `.mcp.json` points.
+
+## Project structure
 
 ```
 Freefall/
 ├── Freefall.Engine/
-│   ├── Engine.cs               # Frame lifecycle, entity management, main-thread marshalling
-│   ├── Base/                   # Entity-component framework (Entity, ComponentCache, ScriptExecution)
-│   ├── Components/             # ECS components (Transform, Camera, Lights, Renderers, Terrain, RigidBody)
-│   ├── Graphics/
-│   │   ├── GraphicsDevice.cs   # D3D12 device, swap chain, root signature, descriptor heaps
-│   │   ├── DeferredRenderer.cs # Render loop orchestration (G-Buffer → Shadows → Light → Compose)
-│   │   ├── CommandBuffer.cs    # Thread-safe draw call collection and pass dispatch
-│   │   ├── InstanceBatch.cs    # GPU-driven batching, culling, and ExecuteIndirect
-│   │   ├── GPUCuller.cs        # 6-pass compute culling pipeline
-│   │   ├── MeshRegistry.cs     # Global GPU mesh metadata buffer
-│   │   ├── TransformBuffer.cs  # Persistent pooled GPU transform slots
-│   │   ├── Material.cs         # Bindless material system with MaterialBlock overrides
-│   │   ├── Effect.cs           # Shader compilation, technique/pass management, push constant reflection
-│   │   ├── OceanFFT.cs         # GPU compute FFT for ocean displacement, slope, and foam
-│   │   └── ...                 # Mesh, Texture, ConstantBuffer, StreamingManager, etc.
-│   ├── Animation/              # Skeletal animation, clip playback, bone matrix management
-│   ├── Assets/                 # Asset database, importers, loaders, packers, serialization
-│   └── Resources/Shaders/      # HLSL shaders (gbuffer, terrain, skybox, cull_instances, etc.)
-├── Freefall.Editor/            # WinForms editor (scene explorer, inspector, viewport)
-├── Freefall.Game/              # Game runtime (CharacterController, ThirdPersonCamera, etc.)
-└── ROADMAP.md                  # Project roadmap and vision
+│   ├── Engine.cs            # Frame lifecycle, project and scene handling
+│   ├── Base/                # Entity, Component, update/draw interfaces, physics and navmesh worlds
+│   ├── Components/          # Renderers, lights, terrain and stamps, spline, PCG, water, particles, audio
+│   ├── Graphics/            # Device, deferred renderer, batching and culling, effects, post-processing
+│   ├── Animation/           # Skeletons, clips, state machine, blend trees, retargeting
+│   ├── Assets/              # Asset database, importers, loaders, packers, terrain baker
+│   ├── Graph/               # Node graph core, PCG nodes and scheduler
+│   ├── Navigation/          # Navmesh builder
+│   ├── Serialization/       # YAML scene and asset serialization
+│   └── Resources/Shaders/   # .fx effects and .hlsl compute shaders
+├── Freefall.Editor/
+│   ├── UI/                  # Docking, inspectors, property controls, graph and animation editors
+│   ├── Mcp/                 # MCP tools
+│   ├── Commands/            # Editor commands behind the automation API
+│   ├── Tools/               # Unity and Watabou importers, thumbnail rendering
+│   └── Scripts/             # Editor camera, gizmos, selection
+├── Tools/FreefallMcp/       # stdio MCP bridge
+└── Freefall.slnx
 ```
 
-## Tech Stack
+## Tech stack
 
 - .NET 10 / C#
-- Direct3D 12 via [Vortice.Windows](https://github.com/amerkoleci/Vortice.Windows)
-- HLSL compute and graphics shaders (SM 6.6)
-- NVIDIA PhysX via [MagicPhysX](https://github.com/Cysharp/MagicPhysX)
-- Assimp for mesh importing
-- XAudio2 for spatial audio
+- Direct3D 12 via [Vortice.Windows](https://github.com/amerkoleci/Vortice.Windows), HLSL SM 6.6 compiled with DXC
+- PhysX 5 via [PhysX.Net](https://github.com/stilldesign/PhysX.Net)
+- [DotRecast](https://github.com/ikpil/DotRecast) for navigation
+- Assimp for model import, texconv for texture compression
+- Roslyn for scripts
+- XAudio2 for audio
+- [Squid](https://github.com/Roderik11/Squid) for the editor UI
+- [MCP C# SDK](https://github.com/modelcontextprotocol/csharp-sdk) for the automation server
 
 ## Building
 
+Requirements: Windows, the .NET 10 SDK, and a D3D12 GPU with mesh shader support.
+
+The editor references Squid by relative path, two directories above the repository root, so clone the two like this:
+
 ```
-dotnet build
-dotnet run --project Freefall.Game
+<root>/Squid/                 https://github.com/Roderik11/Squid
+<root>/<any folder>/Freefall/ this repository
 ```
 
-Requires Windows with a D3D12-capable GPU.
+Then build and run the editor:
+
+```
+dotnet build Freefall.Editor/Freefall.Editor.csproj
+dotnet run --project Freefall.Editor
+```
+
+`Freefall.slnx` also lists a `Freefall.Game` project (the standalone game runtime). It is not part of this repository yet, so build the editor project rather than the solution.
+
+To use the MCP tools from Claude Code or another MCP client:
+
+```
+dotnet build Tools/FreefallMcp/FreefallMcp.csproj
+```
 
 ## Status
 
-Active development. See [ROADMAP.md](ROADMAP.md) for the project vision and planned features.
+Active development. The renderer, terrain, world authoring and editor are the mature parts. Known gaps:
+
+- **World scale** — one terrain tile (about 4 km); no multi-tile terrain, world streaming or large-world precision yet
+- **Rendering** — no spot lights or local-light shadows, no reflections beyond the sky, no TAA
+- **Editor** — no undo/redo, no build/packaging step
+- **Runtime** — no fixed-update loop; physics lacks triggers, collision layers and joints; animation lacks root motion and IK
+- **Gameplay** — combat, stats, inventory, AI, UI/HUD and saves are not started
+- **Networking** — planned last
