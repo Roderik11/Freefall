@@ -385,7 +385,13 @@ namespace Freefall.Assets
             string cacheKey = $"{typeof(T).Name}:guid:{guid}";
 
             if (_assets.TryGetValue(cacheKey, out var cached))
-                return (T)cached;
+            {
+                if (cached is T hit)
+                    return hit;
+                // Same type NAME, different type: an asset class defined in project scripts, loaded before a
+                // script hot reload. The old instance belongs to the unloaded assembly — load it again.
+                _assets.TryRemove(cacheKey, out _);
+            }
 
             // Resolve GUID → cache file path
             var cachePath = AssetDatabase.ResolveCachePathByGuid(guid);
