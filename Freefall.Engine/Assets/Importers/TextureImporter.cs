@@ -227,8 +227,16 @@ namespace Freefall.Assets.Importers
                 if (PreserveAlphaCoverage)
                     args += $" -keepcoverage {AlphaCoverageThreshold.ToString(System.Globalization.CultureInfo.InvariantCulture)}";
 
-                if (sRGB)
-                    args += " -srgbi -srgbo";
+                // Always "sRGB in, sRGB out", also for linear data maps: the pair cancels, so texconv
+                // never colour-converts. Without it a source that is tagged sRGB (PNG sRGB chunk — Blender
+                // writes one into every PNG — or EXIF colour space) loads as *_UNORM_SRGB and is linearised
+                // into the UNORM target (normal 0.5 → 0.21). A no-op for untagged sources.
+                args += " -srgbi -srgbo";
+
+                // The flags keep the top mip intact, but texconv still filters the mips of a tagged image in
+                // decoded space. For linear data hand it a copy without the colour-space chunks instead.
+                if (!sRGB)
+                    sourcePath = StripPngColorSpace(sourcePath, tempDir) ?? sourcePath;
 
                 // Force alpha to 1.0 — strips alpha data so mips don't bleed black
                 if (IgnoreAlpha)
@@ -269,6 +277,47 @@ namespace Freefall.Assets.Importers
                 // Cleanup temp directory
                 try { Directory.Delete(tempDir, true); } catch { }
             }
+        }
+
+        /// <summary>
+        /// Writes a copy of a PNG without its colour-space chunks (sRGB, gAMA, cHRM, iCCP) into a
+        /// subfolder of <paramref name="tempDir"/>, keeping the file name. Returns null when the file
+        /// is not a PNG or carries none of them.
+        /// </summary>
+        private static string StripPngColorSpace(string path, string tempDir)
+        {
+            var data = File.ReadAllBytes(path);
+            if (data.Length < 8 || data[0] != 0x89 || data[1] != 'P' || data[2] != 'N' || data[3] != 'G')
+                return null;
+
+            using var stripped = new MemoryStream(data.Length);
+            stripped.Write(data, 0, 8);
+            bool found = false;
+
+            // Chunk: 4 length (big endian) + 4 type + data + 4 CRC — copied whole, so CRCs stay valid
+            int pos = 8;
+            while (pos + 12 <= data.Length)
+            {
+                long size = 12L + ((uint)data[pos] << 24 | (uint)data[pos + 1] << 16 | (uint)data[pos + 2] << 8 | data[pos + 3]);
+                if (pos + size > data.Length)
+                    return null; // truncated — let texconv report it on the original
+
+                var type = System.Text.Encoding.ASCII.GetString(data, pos + 4, 4);
+                if (type == "sRGB" || type == "gAMA" || type == "cHRM" || type == "iCCP")
+                    found = true;
+                else
+                    stripped.Write(data, pos, (int)size);
+                pos += (int)size;
+            }
+
+            if (!found)
+                return null;
+
+            var dir = Path.Combine(tempDir, "src");
+            Directory.CreateDirectory(dir);
+            var copy = Path.Combine(dir, Path.GetFileName(path));
+            File.WriteAllBytes(copy, stripped.ToArray());
+            return copy;
         }
 
         /// <summary>
