@@ -9,7 +9,7 @@ It is being built for an open-world sandbox RPG, so the focus so far is on the r
 - **GPU-driven deferred renderer** — bindless (SM 6.6), compute culling with Hi-Z occlusion, GPU LOD selection, `ExecuteIndirect`
 - **Outdoor world** — CDLOD terrain authored entirely with non-destructive stamps, mesh-shader ground cover, FFT ocean, lakes and rivers, procedural sky with time of day and weather
 - **Editor** — docking UI, inspectors, gizmos, prefabs, PCG node graph, animation state-machine editor, C# scripts and shaders that hot-reload
-- **AI-drivable** — the editor hosts an MCP server (about 60 tools), so an agent such as Claude Code can build and inspect scenes in the running editor
+- **Fully remote-controllable by AI agents** — an MCP server (about 60 tools) lets an agent such as Claude Code operate the editor end to end: launch it, open a project, import assets, build and save scenes, and check its own work through screenshots
 
 ## Rendering architecture
 
@@ -103,7 +103,7 @@ Renderers register their instances with the GPU once and only touch them again w
 - Watabou town, city and dwelling importer (walls, gates, houses, multi-floor interiors)
 
 ### Automation (MCP)
-The editor hosts an MCP endpoint at `http://localhost:21721/mcp`. Its tools cover scenes, entities and components, assets, prefabs, terrain queries, PCG graphs, camera, settings, console and screenshots.
+The editor can be driven entirely by an AI agent, without anyone touching the UI. It hosts an MCP endpoint at `http://localhost:21721/mcp` whose tools cover the whole workflow: launching and shutting down the editor, opening projects, loading and saving scenes, importing and refreshing assets, creating and editing entities, components, prefabs and materials, terrain queries, PCG graphs, camera, selection and settings. The agent reads the console and takes screenshots of the viewport or the full editor to verify what it did.
 
 `Tools/FreefallMcp` is a stdio bridge that MCP clients launch. It proxies to the editor, keeps the connection alive while the editor is closed, and can start the editor itself. Building it installs it to `%LOCALAPPDATA%\Freefall\McpBridge`, which is where the checked-in `.mcp.json` points.
 
@@ -162,7 +162,7 @@ dotnet build Freefall.Editor/Freefall.Editor.csproj
 dotnet run --project Freefall.Editor
 ```
 
-`Freefall.slnx` also lists a `Freefall.Game` project (the standalone game runtime). It is not part of this repository yet, so build the editor project rather than the solution.
+`Freefall.slnx` still lists `Freefall.Game`, the standalone runtime the engine started with. Play-in-editor has replaced it and it is not part of this repository, so build the editor project rather than the solution. It will be removed once the editor can export a standalone executable with packed resources.
 
 To use the MCP tools from Claude Code or another MCP client:
 
@@ -176,7 +176,7 @@ Active development. The renderer, terrain, world authoring and editor are the ma
 
 - **World scale** — one terrain tile (about 4 km); no multi-tile terrain, world streaming or large-world precision yet
 - **Rendering** — no spot lights or local-light shadows, no reflections beyond the sky, no TAA
-- **Editor** — no undo/redo, no build/packaging step
+- **Editor** — no undo/redo; exporting a standalone executable with packed resources is in progress
 - **Runtime** — no fixed-update loop; physics lacks triggers, collision layers and joints; animation lacks root motion and IK
 - **Gameplay** — combat, stats, inventory, AI, UI/HUD and saves are not started
 - **Networking** — planned last
