@@ -191,6 +191,13 @@ namespace Freefall.Editor
             AddMenuItem(sub, "Road", (s, a) => CreateRoad());
             AddMenuItem(sub, "Wall", (s, a) => CreateWall());
             AddMenuItem(sub, "Floor", (s, a) => CreateFloor());
+            AddMenuItem(sub, "River", (s, a) => CreateRiver());
+            AddMenuItem(sub, "Lake", (s, a) => CreateLake());
+
+            sub = AddMenuItem(btn, "Stamp...", null);
+            AddMenuItem(sub, "Height", (s, a) => CreateStamp<HeightStamp>("New Height Stamp"));
+            AddMenuItem(sub, "Splat", (s, a) => CreateStamp<SplatStamp>("New Splat Stamp"));
+            AddMenuItem(sub, "Deco", (s, a) => CreateStamp<DecoStamp>("New Deco Stamp"));
 
             sub = AddMenuItem(btn, "3D Primitive...", null);
             AddMenuItem(sub, "Cube", (s, a) => CreateCube());
@@ -618,6 +625,54 @@ namespace Freefall.Editor
             renderer.Materials.Add(new MaterialOverride { MaterialSlot = 1, Material = InternalAssets.DefaultMaterial });
             var mesh = entity.AddComponent<RuntimeMesh>();
             mesh.Height = .1f;
+            MessageDispatcher.Send(Msg.RefreshExplorer);
+        }
+
+        // River and lake: one entity whose spline carries the bed heights. The HeightStamp carves the bed,
+        // the SplatStamp surfaces it (assign its Layer) and the WaterBody lifts the water above it by Depth.
+        private void CreateRiver()
+        {
+            var entity = new Entity("New River");
+            entity.AddComponent<Spline>();
+            var bed = entity.AddComponent<HeightStamp>();
+            bed.Radius = 3f;
+            bed.Falloff = 6f;
+            bed.Priority = 8;
+            bed.EnableNoise = true;
+            bed.NoiseFrequency = 4.5f;
+            bed.NoiseAmplitude = 1.8f;
+            var splat = entity.AddComponent<SplatStamp>();
+            splat.Radius = bed.Radius + 1f;
+            splat.Priority = bed.Priority;
+            var water = entity.AddComponent<WaterBody>();
+            water.Width = 2f * (bed.Radius + bed.Falloff);
+            MessageDispatcher.Send(Msg.RefreshExplorer);
+        }
+
+        private void CreateLake()
+        {
+            var entity = new Entity("New Lake");
+            var spline = entity.AddComponent<Spline>();
+            spline.Closed = true;
+            var bed = entity.AddComponent<HeightStamp>();
+            bed.Radius = 0f;
+            bed.Falloff = 12f;
+            bed.Priority = 8;
+            bed.EnableNoise = true;
+            bed.NoiseAmplitude = 5f;
+            var splat = entity.AddComponent<SplatStamp>();
+            splat.Radius = 1f;
+            splat.Priority = bed.Priority;
+            var water = entity.AddComponent<WaterBody>();
+            water.Expand = 16f;
+            water.FlowSpeed = 0f;
+            MessageDispatcher.Send(Msg.RefreshExplorer);
+        }
+
+        private void CreateStamp<T>(string name) where T : TerrainStamp, new()
+        {
+            var entity = new Entity(name);
+            entity.AddComponent<T>();
             MessageDispatcher.Send(Msg.RefreshExplorer);
         }
 

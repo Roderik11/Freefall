@@ -295,7 +295,7 @@ namespace Freefall.Components
             _sunLight ??= EntityManager.FindComponent<DirectionalLight>();
             _spline ??= Entity.GetComponent<Spline>();
 
-            if (_meshDirty) RebuildMesh();
+            if (_meshDirty) RebuildMesh(); 
             var mesh = _mesh;
             if (mesh == null) return;
 

@@ -1,5 +1,7 @@
 using System;
+using System.Collections.Generic;
 using System.ComponentModel;
+using Freefall.Assets;
 using System.Numerics;
 using Freefall.Graph;
 using Freefall.Base;
@@ -177,6 +179,12 @@ namespace Freefall.PCG
         /// </summary>
         public bool IncludeOwnStamps = false;
 
+        /// <summary>
+        /// Stamps carrying any of these tags do not exclude anything here (e.g. "Forest Floor" for roadside props,
+        /// which belong along a road through a forest although the forest paints its own ground).
+        /// </summary>
+        public List<Tag> IgnoreTags = new List<Tag>();
+
         [Output]
         public SamplePointSet Output;
 
@@ -200,8 +208,11 @@ namespace Freefall.PCG
             foreach (var s in ComponentCache<SplatStamp>.All)
             {
                 // Global stamps are terrain-wide rules (grass on flats, rock on cliffs), not painted ground to keep clear of
-                if (s is SplatStamp { Enabled: true, IsGlobal: false } splat && (IncludeOwnStamps || splat.Entity != IgnoreEntity))
-                    stamps.Add((splat, splat.GetWorldBounds()));
+                if (s is not SplatStamp { Enabled: true, IsGlobal: false } splat || (!IncludeOwnStamps && splat.Entity == IgnoreEntity))
+                    continue;
+                if (IgnoreTags is { Count: > 0 } && splat.Tags is { Count: > 0 } && splat.Tags.Exists(t => t != null && IgnoreTags.Contains(t)))
+                    continue;
+                stamps.Add((splat, splat.GetWorldBounds()));
             }
 
             var m = WorldMatrix;

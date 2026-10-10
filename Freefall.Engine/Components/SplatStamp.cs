@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using Freefall.Assets;
 using Freefall.Base;
 using Vortice.Mathematics;
@@ -32,6 +33,13 @@ namespace Freefall.Components
         /// <summary>Paint: opacity at full weight. Remove: how much is taken away. Multiply: the factor.</summary>
         [ValueRange(0f, 1f)]
         public float Strength = 1f;
+
+        /// <summary>
+        /// What this painted ground is (project-defined <see cref="Tag"/> assets, e.g. "Forest Floor"). Scatter that
+        /// keeps clear of stamps (PCG ExcludeStamps) can name tags it does not mind: roadside props ignore a forest's
+        /// leaf litter, meadow flowers do not.
+        /// </summary>
+        public List<Tag> Tags = [];
 
         protected override Color4 GizmoColor => new Color4(0.9f, 0.6f, 0.2f, 1f); // orange
     }
