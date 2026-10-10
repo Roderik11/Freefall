@@ -6,6 +6,30 @@ namespace Freefall
     public sealed class UpdateInEditorAttribute : Attribute { }
 
     /// <summary>
+    /// The <see cref="Base.SystemGroup"/> a system is updated by. Without it a system lands in
+    /// <see cref="Base.UpdateGroup"/>.
+    /// </summary>
+    [AttributeUsage(AttributeTargets.Class)]
+    public sealed class UpdateInGroupAttribute(Type group) : Attribute
+    {
+        public Type Group = group;
+    }
+
+    /// <summary>Update this system before another system of the same group.</summary>
+    [AttributeUsage(AttributeTargets.Class, AllowMultiple = true)]
+    public sealed class UpdateBeforeAttribute(Type system) : Attribute
+    {
+        public Type SystemType = system;
+    }
+
+    /// <summary>Update this system after another system of the same group.</summary>
+    [AttributeUsage(AttributeTargets.Class, AllowMultiple = true)]
+    public sealed class UpdateAfterAttribute(Type system) : Attribute
+    {
+        public Type SystemType = system;
+    }
+
+    /// <summary>
     /// Constrains a numeric field to a [min, max] range in the inspector.
     /// Ported from Apex/Spark.
     /// </summary>

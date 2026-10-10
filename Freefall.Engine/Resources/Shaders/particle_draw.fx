@@ -1,55 +1,24 @@
 // GPU Particle Billboard Renderer
 // Vertex-pull quads via SV_VertexID + SV_InstanceID — no VB/IB needed.
-// Reads particle data from bindless structured buffers.
+// One draw covers every emitter of a render mode: the instance picks a pool slot from the draw
+// list, the slot's chunk names the emitter row, and the row carries texture and look.
 //
 // @RenderState(RenderTargets=1, DepthWrite=false, Blend=AlphaBlend, CullMode=None)
 
 #include "common.fx"
-
-// ────────────── Data Structures ──────────────
-
-struct ParticleCore
-{
-    float3 Position;
-    float  Age;
-    float3 Velocity;
-    float  Lifetime;
-};
-
-struct ParticleVisual
-{
-    float2 SizeStartEnd;
-    float4 ColorStart;
-    float  Rotation;
-    float  RotationSpeed;
-    uint   FlipbookFrame;
-    uint   FlipbookCount;
-    float  AnimSpeed;
-    float  _pad0;
-};
+#include "particle_common.hlsli"
 
 // ────────────── Push Constants ──────────────
 
 cbuffer PushConstants : register(b3)
 {
-    uint ParticleCoreIdx;      // DWORD 0   SRV: ParticleCore buffer
-    uint ParticleVisualIdx;    // DWORD 1   SRV: ParticleVisual buffer
-    uint AliveListIdx;         // DWORD 2   SRV: alive indices
-    uint TextureIdx;           // DWORD 3   SRV: particle texture
-    uint DepthGBufIdx;         // DWORD 4   SRV: depth buffer for soft particles
-    uint SoftEnabledIdx;       // DWORD 5   0 or 1
-    float SoftRangeVal;        // DWORD 6   depth fade distance
-    // NOTE: float4 would add padding here due to 16-byte cbuffer alignment.
-    // Use 4 separate floats so DWORD layout matches C# root constant writes.
-    float ColorEndR;           // DWORD 7
-    float ColorEndG;           // DWORD 8
-    float ColorEndB;           // DWORD 9
-    float ColorEndA;           // DWORD 10
-    uint FlipbookColsVal;      // DWORD 11  columns in flipbook atlas
-    uint FlipbookRowsVal;      // DWORD 12  rows in flipbook atlas
-    uint BillboardModeVal;     // DWORD 13  0 = camera facing, 1 = velocity stretched
-    float StretchFactorVal;    // DWORD 14  extra length per m/s (velocity stretched)
-    float AspectVal;           // DWORD 15  quad height / width
+    uint ParticleCoreIdx;      // DWORD 0   SRV: ParticleCore pool
+    uint ParticleVisualIdx;    // DWORD 1   SRV: ParticleVisual pool
+    uint DrawListIdx;          // DWORD 2   SRV: slots to draw
+    uint DrawListOffset;       // DWORD 3   first entry of this render mode's list
+    uint EmittersIdx;          // DWORD 4   SRV: ParticleEmitter rows
+    uint ChunkMapIdx;          // DWORD 5   SRV: chunk -> emitter row
+    uint DepthGBufIdx;         // DWORD 6   SRV: depth buffer for soft particles
 };
 
 #define BILLBOARD_CAMERA   0
@@ -90,15 +59,20 @@ struct VSOutput
     float2 TexCoord : TEXCOORD0;
     float4 Color    : COLOR0;
     float  Depth    : TEXCOORD1;  // linear view-space depth for soft particles
+    nointerpolation uint  TextureIdx : TEXCOORD2;
+    nointerpolation float SoftRange  : TEXCOORD3;  // <= 0: soft particles off
 };
 
 VSOutput VS(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
 {
     VSOutput output = (VSOutput)0;
 
-    // Look up which particle slot this instance maps to
-    StructuredBuffer<uint> AliveList = ResourceDescriptorHeap[AliveListIdx];
-    uint slot = AliveList[instanceID];
+    StructuredBuffer<uint> DrawList = ResourceDescriptorHeap[DrawListIdx];
+    uint slot = DrawList[DrawListOffset + instanceID];
+
+    StructuredBuffer<uint> ChunkMap = ResourceDescriptorHeap[ChunkMapIdx];
+    StructuredBuffer<ParticleEmitter> Emitters = ResourceDescriptorHeap[EmittersIdx];
+    ParticleEmitter e = Emitters[ChunkMap[slot >> PARTICLE_CHUNK_SHIFT]];
 
     StructuredBuffer<ParticleCore> Cores = ResourceDescriptorHeap[ParticleCoreIdx];
     StructuredBuffer<ParticleVisual> Visuals = ResourceDescriptorHeap[ParticleVisualIdx];
@@ -109,26 +83,23 @@ VSOutput VS(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
     // Age ratio [0..1]
     float t = saturate(core.Age / max(core.Lifetime, 0.001));
 
-    // Size interpolation
-    float size = lerp(vis.SizeStartEnd.x, vis.SizeStartEnd.y, t);
-
-    // Color interpolation
-    float4 colorEnd = float4(ColorEndR, ColorEndG, ColorEndB, ColorEndA);
-    output.Color = lerp(vis.ColorStart, colorEnd, t);
+    float size = lerp(e.SizeStartEnd.x, e.SizeStartEnd.y, t) * vis.SizeScale;
+    output.Color = lerp(e.ColorStart, e.ColorEnd, t);
+    output.TextureIdx = e.TextureIdx;
+    output.SoftRange = e.SoftEnabled != 0 ? max(e.SoftRange, 0.01) : 0.0;
 
     // Quad corner in local space
     float2 corner = QuadCorners[vertexID % 6];
     float2 uv = QuadUVs[vertexID % 6];
 
     // Flipbook UV adjustment
-    uint flipCols = max(FlipbookColsVal, 1u);
-    uint flipRows = max(FlipbookRowsVal, 1u);
-    uint totalFrames = vis.FlipbookCount > 0 ? vis.FlipbookCount : flipCols * flipRows;
+    uint flipCols = max(e.FlipbookCols, 1u);
+    uint flipRows = max(e.FlipbookRows, 1u);
+    uint totalFrames = e.FlipbookFrameCount > 0 ? e.FlipbookFrameCount : flipCols * flipRows;
 
     if (totalFrames > 1)
     {
-        uint frame = vis.FlipbookFrame + (uint)(core.Age * vis.AnimSpeed);
-        frame = frame % totalFrames;
+        uint frame = (uint)(core.Age * e.FlipbookAnimSpeed) % totalFrames;
 
         uint col = frame % flipCols;
         uint row = frame / flipCols;
@@ -141,7 +112,7 @@ VSOutput VS(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
     float3 worldPos;
 
     [branch]
-    if (BillboardModeVal == BILLBOARD_VELOCITY)
+    if (e.BillboardMode == BILLBOARD_VELOCITY)
     {
         // Velocity-stretched: quad up axis follows the velocity, right axis is
         // perpendicular to both velocity and the view direction so the streak
@@ -157,17 +128,18 @@ VSOutput VS(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
         right = rl > 1e-4 ? right / rl : float3(View._11, View._21, View._31);
 
         float width  = size;
-        float height = size * AspectVal + speed * StretchFactorVal;
+        float height = size * e.Aspect + speed * e.StretchFactor;
 
         // No rotation in this mode — orientation is fully defined by velocity
         worldPos = core.Position + right * (corner.x * width) + vdir * (corner.y * height);
     }
     else
     {
-        // Apply rotation
-        float cosR = cos(vis.Rotation);
-        float sinR = sin(vis.Rotation);
-        float2 scaled = float2(corner.x, corner.y * AspectVal);
+        // Rotation is a function of age, so the simulation never has to write it back
+        float rotation = vis.Rotation + vis.RotationSpeed * core.Age;
+        float cosR = cos(rotation);
+        float sinR = sin(rotation);
+        float2 scaled = float2(corner.x, corner.y * e.Aspect);
         float2 rotated = float2(
             scaled.x * cosR - scaled.y * sinR,
             scaled.x * sinR + scaled.y * cosR
@@ -192,15 +164,15 @@ VSOutput VS(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
 
 float4 PS(VSOutput input) : SV_Target0
 {
-    // Sample particle texture
-    Texture2D ParticleTex = ResourceDescriptorHeap[TextureIdx];
+    // Emitters of one draw use different textures
+    Texture2D ParticleTex = ResourceDescriptorHeap[NonUniformResourceIndex(input.TextureIdx)];
     float4 texColor = ParticleTex.Sample(SamplerLinearWrap, input.TexCoord);
 
     float4 finalColor = texColor * input.Color;
 
     // Soft particles: fade near opaque surfaces
     // DepthGBuffer = R32_Float linear view-space depth, 0 = sky/empty
-    if (SoftEnabledIdx > 0 && DepthGBufIdx > 0)
+    if (input.SoftRange > 0.0 && DepthGBufIdx > 0)
     {
         Texture2D<float> DepthBuf = ResourceDescriptorHeap[DepthGBufIdx];
 
@@ -211,8 +183,7 @@ float4 PS(VSOutput input) : SV_Target0
         if (sceneDepth > 0.001)
         {
             float depthDiff = sceneDepth - input.Depth;
-            float softFade = saturate(depthDiff / max(SoftRangeVal, 0.01));
-            finalColor.a *= softFade;
+            finalColor.a *= saturate(depthDiff / input.SoftRange);
         }
     }
 

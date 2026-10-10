@@ -49,6 +49,9 @@ namespace Freefall.Base
         [Browsable(false)]
         public bool IsDestroyed { get; internal set; }
 
+        /// <summary>ComponentCache&lt;T&gt;.Added was raised for this component and Removed is still owed.</summary>
+        internal bool Announced;
+
         internal void WakeUp()
         {
             if (_awake || IsDestroyed) return;

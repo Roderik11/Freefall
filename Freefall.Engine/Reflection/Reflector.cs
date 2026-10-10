@@ -65,6 +65,9 @@ namespace Freefall.Reflection
 
                 added = true;
 
+                // EntitySystems defined in the assembly get created on the main thread
+                Systems.RegisterAssembly(assembly);
+
                 // Scan for renamed types
                 foreach (var type in assembly.GetTypes())
                 {
@@ -86,6 +89,9 @@ namespace Freefall.Reflection
         public static void UnregisterAssembly(Assembly assembly)
         {
             _assemblies.TryRemove(assembly.FullName!, out _);
+
+            // Destroy and forget the systems it defined
+            Systems.UnregisterAssembly(assembly);
 
             // Remove every cached type that involves this assembly — its own types and constructed
             // types over them (List<ScriptType>, ScriptType[]), which assembly.GetTypes() doesn't list

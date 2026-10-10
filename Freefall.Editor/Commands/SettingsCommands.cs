@@ -99,6 +99,8 @@ namespace Freefall.Editor.Commands
                 deltaMs = Time.DeltaMilliseconds,
                 entityCount = EntityManager.Entities.Count,
                 frameIndex = Engine.FrameIndex,
+                // Frames since start: two readings a few seconds apart give an averaged frame time
+                tickCount = Engine.TickCount,
                 batchCount = CommandBuffer.LastBatchCount,
                 drawCallCount = CommandBuffer.LastDrawCallCount,
                 visibleCount = CommandBuffer.Culler?.LastVisibleCount ?? 0,
@@ -108,7 +110,13 @@ namespace Freefall.Editor.Commands
                 meshDrawCount = Freefall.Components.TerrainRenderer.LastMeshDrawCount,
                 meshRegistryCount = MeshRegistry.Count, // sub-batch ids: GPU culler buffers hold MaxSubBatches (4096)
                 terrainRebakeRequests = Freefall.Components.TerrainRenderer.RebakeRequestCount,
-                pcgExecutions = Freefall.Components.PCGComponent.ExecuteCount
+                pcgExecutions = Freefall.Components.PCGComponent.ExecuteCount,
+                // Shared particle pool: emitters, slots handed out to them, slots the GPU pool holds
+                particleEmitters = Freefall.Base.Systems.Get<ParticleSystem>()?.EmitterCount ?? 0,
+                particleSlots = Freefall.Base.Systems.Get<ParticleSystem>()?.AllocatedSlots ?? 0,
+                particlePoolSlots = Freefall.Base.Systems.Get<ParticleSystem>()?.PoolSlots ?? 0,
+                // System tree in update order, one "Name  ms" line per system (indent = nesting)
+                systems = Freefall.Base.Systems.Describe().Split('\n', StringSplitOptions.RemoveEmptyEntries)
             });
         }
     }

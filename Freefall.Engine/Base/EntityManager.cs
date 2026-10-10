@@ -62,9 +62,8 @@ namespace Freefall.Base
 
         public static void Update()
         {
-            var sw = System.Diagnostics.Stopwatch.StartNew();
-            ScriptExecution.Update();
-            sw.Stop();
+            ScriptExecution.WakeUp();
+            Systems.RunUpdate();
         }
 
         public static T? FindComponent<T>() where T : Component

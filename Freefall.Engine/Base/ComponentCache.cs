@@ -24,6 +24,22 @@ namespace Freefall.Base
         internal static readonly ComponentSet<IDraw> DrawList = new();
 
         internal static readonly List<T> WakeupList = [];
+        private static readonly List<T> RemovedList = [];
+
+        /// <summary>
+        /// Raised on the main thread in the wake-up step (ahead of the UpdateGroup), once per component after
+        /// its Awake(). For systems that keep state per component. A system created later than the
+        /// components it cares about walks <see cref="All"/> in Initialize(); it can then see a component
+        /// there first and get Added for it afterwards, so its handler must tolerate that.
+        /// A subscriber from a script assembly must unsubscribe in its Destroy().
+        /// </summary>
+        public static event Action<T>? Added;
+
+        /// <summary>
+        /// Raised in the same step for every component that left the cache after Added was raised for it
+        /// (destroyed, removed, or detached to move to another entity; the latter is announced again).
+        /// </summary>
+        public static event Action<T>? Removed;
 
         private static readonly Dictionary<int, int> Indices = [];
         private static readonly Lock _lock = new ();
@@ -68,6 +84,12 @@ namespace Freefall.Base
 
             if (a is IUpdate update) UpdateList.Remove(update);
             if (a is IDraw draw) DrawList.Remove(draw);
+
+            if (a.Announced)
+            {
+                a.Announced = false;
+                if (Removed != null) RemovedList.Add(a);
+            }
         }
 
         public static T? Get(Entity entity)
@@ -132,10 +154,24 @@ namespace Freefall.Base
         {
             lock (_lock)
             {
+                if (RemovedList.Count > 0)
+                {
+                    foreach (var component in RemovedList)
+                        Removed?.Invoke(component);
+
+                    RemovedList.Clear();
+                }
+
                 if (WakeupList.Count > 0)
                 {
                     foreach (var component in WakeupList)
+                    {
                         component.WakeUp();
+
+                        if (component.IsDestroyed || component.Announced) continue;
+                        component.Announced = true;
+                        Added?.Invoke(component);
+                    }
 
                     WakeupList.Clear();
                 }

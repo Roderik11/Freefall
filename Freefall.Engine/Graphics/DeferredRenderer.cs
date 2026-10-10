@@ -110,6 +110,12 @@ namespace Freefall.Graphics
         // so occlusion must project using the VP that matches the depth data
         private System.Numerics.Matrix4x4 _previousFrameViewProjection;
 
+        /// <summary>
+        /// GPU address of this view's frustum + Hi-Z constants (GPUCuller.FrustumConstants), valid from the
+        /// Opaque pass on. For compute passes that cull against the same frustum as the mesh culler.
+        /// </summary>
+        public ulong FrustumConstantsAddress { get; private set; }
+
         public DeferredRenderer()
         {
         }
@@ -329,8 +335,9 @@ namespace Freefall.Graphics
             {
                 *_frustumConstantsBuffers![frameIndex].WritePtr<GPUCuller.FrustumConstants>() = constants;
             }
-            
-            return _frustumConstantsBuffers![frameIndex].Native.GPUVirtualAddress;
+
+            FrustumConstantsAddress = _frustumConstantsBuffers![frameIndex].Native.GPUVirtualAddress;
+            return FrustumConstantsAddress;
         }
 
         public override void Render(Camera camera, ID3D12GraphicsCommandList list)
@@ -442,10 +449,10 @@ namespace Freefall.Graphics
              // Set shader parameters globally on all effects (Apex pattern)
              camera.SetShaderParams();
 
-             // Execute all IDraw components to enqueue draw commands
+             // Run the RenderGroup: IDraw components (ScriptDrawSystem) and draw systems enqueue their commands.
              // This enqueues DrawShadows callback into ShadowMap pass AND opaque batches
              var drawTime = System.Diagnostics.Stopwatch.StartNew();
-             ScriptExecution.Draw();
+             Systems.RunDraw();
              // Components with GPU-resident draws (no Draw()) update their registrations here
              CommandBuffer.RefreshDrawSources();
              drawTime.Stop();

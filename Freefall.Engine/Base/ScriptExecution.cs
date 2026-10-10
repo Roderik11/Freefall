@@ -24,18 +24,27 @@ namespace Freefall.Base
             return list.RemoveAll(c => predicate(c.ComponentType));
         }
 
-        public static void Update()
+        /// <summary>
+        /// Early()/Awake() for components added since the last frame, plus the caches' Added/Removed
+        /// notifications. Runs ahead of the UpdateGroup.
+        /// </summary>
+        public static void WakeUp()
         {
             for (int i = 0; i < list.Count; i++)
                 list[i].Early();
 
             for (int i = 0; i < list.Count; i++)
                 list[i].Awake();
+        }
 
+        /// <summary>IUpdate dispatch; called by <see cref="ScriptUpdateSystem"/>.</summary>
+        public static void UpdateComponents()
+        {
             for (int i = 0; i < list.Count; i++)
                 list[i].Update();
         }
 
+        /// <summary>IDraw dispatch; called by <see cref="ScriptDrawSystem"/>.</summary>
         public static void Draw()
         {
             for (int i = 0; i < list.Count; i++)

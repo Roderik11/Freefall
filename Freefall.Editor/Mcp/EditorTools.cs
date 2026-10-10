@@ -125,7 +125,7 @@ namespace Freefall.Editor.Mcp
         public static Task<CallToolResult> ConsoleClear() => McpBridge.Get("/api/console/clear");
 
         [McpServerTool(Name = "engine_stats", Title = "Engine stats", ReadOnly = true, OpenWorld = false)]
-        [Description("Frame stats: fps, frame time, entity count, and render counters (batches, draw calls, visible/occluded, grass and mesh instances).")]
+        [Description("Frame stats: fps, frame time, entity count, render counters (batches, draw calls, visible/occluded, grass and mesh instances), and the system tree in update order with each system's last update time in ms.")]
         public static Task<CallToolResult> EngineStats() => McpBridge.Get("/api/debug/stats");
 
         [McpServerTool(Name = "settings_get", Title = "Get engine settings", ReadOnly = true, OpenWorld = false)]
