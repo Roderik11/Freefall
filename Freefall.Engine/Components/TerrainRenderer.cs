@@ -268,114 +268,121 @@ namespace Freefall.Components
             _computeInitialized = false;
             var device = Engine.Device;
 
+            // Nothing below is released here. The command lists of the frames in flight still bind these
+            // buffers, textures and pipeline states, copy into the readback buffers and index the descriptor
+            // heap with the bindless slots; releasing them now risks removing the device (see
+            // Animator.Destroy). Everything goes to the device, which releases it once those frames are
+            // done. A raw resource's slots go the same way, or the next allocation could rewrite a
+            // descriptor those frames still read.
+
             // ── Per-frame GraphicsBuffer arrays ──
             for (int i = 0; i < FrameCount; i++)
             {
-                _descriptorBuffers[i]?.Dispose();
-                _sphereBuffers[i]?.Dispose();
-                _subbatchIdBuffers[i]?.Dispose();
-                _terrainDataBuffers[i]?.Dispose();
-                _counterBuffers[i]?.Dispose();
-                _splitFlagsBuffers[i]?.Dispose();
-                _indirectArgsBuffers[i]?.Dispose();
-                _shadowArgsBuffers[i]?.Dispose();
+                device?.DeferDispose(_descriptorBuffers[i]);
+                device?.DeferDispose(_sphereBuffers[i]);
+                device?.DeferDispose(_subbatchIdBuffers[i]);
+                device?.DeferDispose(_terrainDataBuffers[i]);
+                device?.DeferDispose(_counterBuffers[i]);
+                device?.DeferDispose(_splitFlagsBuffers[i]);
+                device?.DeferDispose(_indirectArgsBuffers[i]);
+                device?.DeferDispose(_shadowArgsBuffers[i]);
 
-                _shadowDescriptorBuffers[i]?.Dispose();
-                _shadowTerrainDataBuffers[i]?.Dispose();
-                _shadowSphereBuffers[i]?.Dispose();
-                _shadowSubbatchIdBuffers[i]?.Dispose();
-                _shadowCounterBuffers[i]?.Dispose();
-                _shadowCascadeIdxBuffers[i]?.Dispose();
+                device?.DeferDispose(_shadowDescriptorBuffers[i]);
+                device?.DeferDispose(_shadowTerrainDataBuffers[i]);
+                device?.DeferDispose(_shadowSphereBuffers[i]);
+                device?.DeferDispose(_shadowSubbatchIdBuffers[i]);
+                device?.DeferDispose(_shadowCounterBuffers[i]);
+                device?.DeferDispose(_shadowCascadeIdxBuffers[i]);
             }
 
             // ── Per-frame ID3D12Resource constant buffers + shadow cascade ──
             for (int i = 0; i < FrameCount; i++)
             {
-                _frustumPlaneBuffers[i]?.Release();
+                device?.DeferDispose(_frustumPlaneBuffers[i]);
                 _frustumPlaneBuffers[i] = null;
-                _hizParamBuffers[i]?.Release();
+                device?.DeferDispose(_hizParamBuffers[i]);
                 _hizParamBuffers[i] = null;
-                _terrainParamBuffers[i]?.Release();
+                device?.DeferDispose(_terrainParamBuffers[i]);
                 _terrainParamBuffers[i] = null;
-                _shadowTerrainParamBuffers[i]?.Release();
+                device?.DeferDispose(_shadowTerrainParamBuffers[i]);
                 _shadowTerrainParamBuffers[i] = null;
-                _shadowCascadeBuffers[i]?.Release();
+                device?.DeferDispose(_shadowCascadeBuffers[i]);
                 _shadowCascadeBuffers[i] = null;
 
                 if (_shadowCascadeBufferSrvs[i] != 0)
-                    device?.ReleaseBindlessIndex(_shadowCascadeBufferSrvs[i]);
+                    device?.DeferReleaseBindlessIndex(_shadowCascadeBufferSrvs[i]);
                 _shadowCascadeBufferSrvs[i] = 0;
             }
 
             // ── Readback buffers ──
-            _shadowCounterReadback?.Release();
-            _shadowArgsReadback?.Release();
-            _instanceCounterReadback?.Release();
+            device?.DeferDispose(_shadowCounterReadback);
+            device?.DeferDispose(_shadowArgsReadback);
+            device?.DeferDispose(_instanceCounterReadback);
 
             // ── Height range mip pyramid ──
-            _heightRangePyramid?.Release();
+            device?.DeferDispose(_heightRangePyramid);
             if (_heightRangeMipUAVs != null)
                 foreach (var idx in _heightRangeMipUAVs)
-                    if (idx != 0) device?.ReleaseBindlessIndex(idx);
+                    if (idx != 0) device?.DeferReleaseBindlessIndex(idx);
             if (_heightRangeMipSRVs != null)
                 foreach (var idx in _heightRangeMipSRVs)
-                    if (idx != 0) device?.ReleaseBindlessIndex(idx);
+                    if (idx != 0) device?.DeferReleaseBindlessIndex(idx);
             if (_heightRangePyramidSRV != 0)
-                device?.ReleaseBindlessIndex(_heightRangePyramidSRV);
+                device?.DeferReleaseBindlessIndex(_heightRangePyramidSRV);
 
             // ── Baked normals ──
-            _bakedNormalTex?.Release();
-            if (_bakedNormalUAV != 0) device?.ReleaseBindlessIndex(_bakedNormalUAV);
-            if (_bakedNormalSRV != 0) device?.ReleaseBindlessIndex(_bakedNormalSRV);
+            device?.DeferDispose(_bakedNormalTex);
+            if (_bakedNormalUAV != 0) device?.DeferReleaseBindlessIndex(_bakedNormalUAV);
+            if (_bakedNormalSRV != 0) device?.DeferReleaseBindlessIndex(_bakedNormalSRV);
 
             // ── Decoration control prepass ──
-            _decoControlTex?.Release();
-            if (_decoControlUAV != 0) device?.ReleaseBindlessIndex(_decoControlUAV);
-            if (_decoControlSRV != 0) device?.ReleaseBindlessIndex(_decoControlSRV);
+            device?.DeferDispose(_decoControlTex);
+            if (_decoControlUAV != 0) device?.DeferReleaseBindlessIndex(_decoControlUAV);
+            if (_decoControlSRV != 0) device?.DeferReleaseBindlessIndex(_decoControlSRV);
 
             // ── Baked albedo ──
-            _bakedAlbedoTex?.Release();
-            if (_bakedAlbedoUAV != 0) device?.ReleaseBindlessIndex(_bakedAlbedoUAV);
-            if (_bakedAlbedoSRV != 0) device?.ReleaseBindlessIndex(_bakedAlbedoSRV);
-            _tilingBuffer?.Dispose();
+            device?.DeferDispose(_bakedAlbedoTex);
+            if (_bakedAlbedoUAV != 0) device?.DeferReleaseBindlessIndex(_bakedAlbedoUAV);
+            if (_bakedAlbedoSRV != 0) device?.DeferReleaseBindlessIndex(_bakedAlbedoSRV);
+            device?.DeferDispose(_tilingBuffer);
 
             // ── Packed control array ──
-            _packedControlArray?.Release();
-            if (_packedControlSRV != 0) device?.ReleaseBindlessIndex(_packedControlSRV);
+            device?.DeferDispose(_packedControlArray);
+            if (_packedControlSRV != 0) device?.DeferReleaseBindlessIndex(_packedControlSRV);
             if (_packedSliceUAVs != null)
                 foreach (var idx in _packedSliceUAVs)
-                    if (idx != 0) device?.ReleaseBindlessIndex(idx);
-            if (_packedControlArrayUAV != 0) device?.ReleaseBindlessIndex(_packedControlArrayUAV);
+                    if (idx != 0) device?.DeferReleaseBindlessIndex(idx);
+            if (_packedControlArrayUAV != 0) device?.DeferReleaseBindlessIndex(_packedControlArrayUAV);
 
             // ── Decorator buffers ──
-            _decoratorHeadersBuffer?.Dispose();
-            _decoratorSlotsBuffer?.Dispose();
-            _decoratorLODTableBuffer?.Dispose();
-            _decoratorGroupsBuffer?.Dispose();
+            device?.DeferDispose(_decoratorHeadersBuffer);
+            device?.DeferDispose(_decoratorSlotsBuffer);
+            device?.DeferDispose(_decoratorLODTableBuffer);
+            device?.DeferDispose(_decoratorGroupsBuffer);
 
             // ── Deco compute buffers ──
-            _decoInstanceBuffer?.Dispose();
-            _instanceCounterBuffer?.Dispose();
-            _decoDispatchArgsBuffer?.Dispose();
+            device?.DeferDispose(_decoInstanceBuffer);
+            device?.DeferDispose(_instanceCounterBuffer);
+            device?.DeferDispose(_decoDispatchArgsBuffer);
 
             // ── Mesh-mode decorator buffers ──
-            _meshDecoInstanceBuffer?.Dispose();
-            _sortedMeshInstanceBuffer?.Dispose();
-            _meshDrawArgsBuffer?.Dispose();
-            _meshDrawCountBuffer?.Dispose();
+            device?.DeferDispose(_meshDecoInstanceBuffer);
+            device?.DeferDispose(_sortedMeshInstanceBuffer);
+            device?.DeferDispose(_meshDrawArgsBuffer);
+            device?.DeferDispose(_meshDrawCountBuffer);
 
-            // ── Compute shaders ──
-            _quadtreeCS?.Dispose();
-            _grassCS?.Dispose();
-            _albedoBakeCS?.Dispose();
+            // ── Compute shaders (pipeline states + their constant buffers) ──
+            device?.DeferDispose(_quadtreeCS);
+            device?.DeferDispose(_grassCS);
+            device?.DeferDispose(_albedoBakeCS);
 
             // ── Patch mesh ──
-            _patchMesh?.Dispose();
+            device?.DeferDispose(_patchMesh);
 
             // ── Baker: release scratch buffers (stamp descriptors, spline points) ──
             // The height texture is NOT released — it is owned by the
             // cached Terrain asset and persist for reuse on next scene load.
-            _baker?.Dispose();
+            device?.DeferDispose(_baker);
             _baker = null;
 
             MessageDispatcher.RemoveListener(EngineMsg.StampChanged, OnStampChanged);
@@ -760,10 +767,17 @@ namespace Freefall.Components
             if (_packedControlArray != null && _packedArrayResolution == resolution && _packedSliceCount == sliceCount)
                 return;
 
-            // Release old resources
-            _packedControlArray?.Release();
-
             var device = Engine.Device;
+
+            // Retire the old array. Deferred: the splat bake and the terrain draws of the frames in flight still
+            // reference it. Its slots go the same way; every reader takes them from the fields again each
+            // frame (they used to be overwritten below without being returned).
+            device.DeferDispose(_packedControlArray);
+            device.DeferReleaseBindlessIndex(_packedControlSRV);
+            if (_packedSliceUAVs != null)
+                foreach (var idx in _packedSliceUAVs)
+                    device.DeferReleaseBindlessIndex(idx);
+            device.DeferReleaseBindlessIndex(_packedControlArrayUAV);
 
             // Create Texture2DArray: RGBA8, resolution × resolution, sliceCount array slices
             var desc = ResourceDescription.Texture2D(
@@ -1767,10 +1781,12 @@ namespace Freefall.Components
             {
                 Debug.Log($"[TerrainRenderer] Building decorator buffers: {groups.Count} decorators, {slots.Count} variants, {lodTable.Count} LOD entries");
 
-                _decoratorHeadersBuffer?.Dispose();
-                _decoratorSlotsBuffer?.Dispose();
-                _decoratorGroupsBuffer?.Dispose();
-                _decoratorLODTableBuffer?.Dispose();
+                // Deferred: the decorator dispatches and draws of the frames in flight still read the old buffers
+                var device = Engine.Device;
+                device.DeferDispose(_decoratorHeadersBuffer);
+                device.DeferDispose(_decoratorSlotsBuffer);
+                device.DeferDispose(_decoratorGroupsBuffer);
+                device.DeferDispose(_decoratorLODTableBuffer);
 
                 _decoratorHeadersBuffer = CreateAndUpload(headers);
                 _decoratorSlotsBuffer = CreateAndUpload(slots);

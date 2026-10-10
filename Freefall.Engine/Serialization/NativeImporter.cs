@@ -172,6 +172,32 @@ namespace Freefall.Serialization
         }
 
         /// <summary>
+        /// Overwrite a loaded asset with the state in a YAML string, keeping the instance so everything that
+        /// references it sees the new data (hot reload of a reimported .asset, unsaved edits carried across a
+        /// script reload). The YAML is read into a new instance like a normal load, so members it leaves out
+        /// get their defaults, then every serialized member is moved over. Asset's own members (Name, Guid,
+        /// AssetPath) identify the instance and stay. Lists and nested objects are new objects afterwards.
+        /// False if the YAML holds another type; the asset is untouched then.
+        /// </summary>
+        public static bool LoadInto(Asset target, string yaml, AssetManager manager)
+        {
+            var loaded = LoadFromString(yaml, manager);
+            if (loaded == null || loaded.GetType() != target.GetType())
+                return false;
+
+            foreach (var field in Reflector.GetMapping(target.GetType()))
+            {
+                if (field.CanWrite && !field.Ignored && field.DeclaringType != typeof(Asset))
+                    field.SetValue(target, field.GetValue(loaded));
+            }
+
+            if (target is IRebuildAfterLoad rebuildable)
+                rebuildable.RebuildAfterLoad();
+
+            return true;
+        }
+
+        /// <summary>
         /// Convert !Tag format YAML into wrapped TypeName: { fields } format.
         /// Input:  "!StaticMesh\nName: Cage_01_V2\nMesh: abc123"
         /// Output: "StaticMesh:\n  Name: Cage_01_V2\n  Mesh: abc123"

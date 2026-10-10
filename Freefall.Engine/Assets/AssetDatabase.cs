@@ -227,29 +227,75 @@ namespace Freefall.Assets
         }
 
         /// <summary>
-        /// Data type name recorded in the meta for a source or sub-asset GUID (e.g. "Texture", "Mesh"), or null.
+        /// Type names recorded in the meta for a source or sub-asset GUID: the packed data type ("MeshData",
+        /// "AssetDefinitionData") and, where the importer recorded one, the semantic asset type ("Material",
+        /// "PCGGraph", a class from project scripts). False if the meta records no type for the GUID.
         /// </summary>
-        public static string GetAssetTypeName(string guid)
+        private static bool TryGetRecordedTypeNames(string guid, out string semanticType, out string dataType)
         {
+            semanticType = dataType = null;
             var meta = GetMeta(guid);
-            if (meta == null) return null;
+            if (meta == null) return false;
 
             if (string.Equals(meta.Guid, guid, StringComparison.OrdinalIgnoreCase) && meta.MainAssetType != null)
-                return meta.MainAssetType;
+            {
+                semanticType = meta.MainSemanticType;
+                dataType = meta.MainAssetType;
+                return true;
+            }
 
             lock (meta)
             {
                 foreach (var sub in meta.SubAssets)
                     if (string.Equals(sub.Guid, guid, StringComparison.OrdinalIgnoreCase))
-                        return sub.AssetType ?? sub.Type;
+                    {
+                        semanticType = sub.AssetType;
+                        dataType = sub.Type;
+                        return true;
+                    }
             }
-            return null;
+            return false;
+        }
+
+        /// <summary>
+        /// Type name recorded in the meta for a source or sub-asset GUID, or null: the semantic asset type
+        /// ("Material", "Terrain") where the importer recorded one, otherwise the data type ("MeshData").
+        /// </summary>
+        public static string GetAssetTypeName(string guid)
+        {
+            if (!TryGetRecordedTypeNames(guid, out var semanticType, out var dataType)) return null;
+            return string.IsNullOrEmpty(semanticType) ? dataType : semanticType;
         }
 
         /// <summary>
         /// Runtime asset type for a GUID, resolved from the meta without loading anything. Null if unknown.
         /// </summary>
-        public static Type GetAssetType(string guid) => ResolveAssetType(GetAssetTypeName(guid));
+        public static Type GetAssetType(string guid)
+        {
+            if (!TryGetRecordedTypeNames(guid, out var semanticType, out var dataType)) return null;
+
+            // .asset/.mat files all pack as "AssetDefinitionData", which says nothing about the asset class:
+            // the semantic type does. The data type is the fallback for a semantic name nothing resolves.
+            return ResolveAssetType(semanticType) ?? FindAssetClass(semanticType) ?? ResolveAssetType(dataType);
+        }
+
+        /// <summary>
+        /// Asset class by simple name across the assemblies registered with the Reflector. Unlike the alias map
+        /// (engine + entry assembly) that includes project scripts and plugins. Nothing is cached here: the
+        /// Reflector drops its subtype list on a script reload, so this never returns or pins a stale type.
+        /// </summary>
+        private static Type FindAssetClass(string typeName)
+        {
+            if (string.IsNullOrEmpty(typeName)) return null;
+            try
+            {
+                foreach (var type in Freefall.Reflection.Reflector.GetTypes<Asset>())
+                    if (type.Name == typeName)
+                        return type;
+            }
+            catch { }
+            return null;
+        }
 
         /// <summary>
         /// Find a sibling sub-asset of a given type from the same source file.
@@ -441,7 +487,11 @@ namespace Freefall.Assets
         /// </summary>
         private static bool IsOfType(string guid, string path, string type)
         {
-            if (string.Equals(GetAssetTypeName(guid), type, StringComparison.OrdinalIgnoreCase)) return true;
+            // Callers ask by data type (nameof(MeshData)) as well as by asset type ("Material")
+            if (TryGetRecordedTypeNames(guid, out var semanticType, out var dataType)
+                && (string.Equals(semanticType, type, StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(dataType, type, StringComparison.OrdinalIgnoreCase)))
+                return true;
             try
             {
                 if (string.Equals(GetImporter(guid)?.AssetType?.Name, type, StringComparison.OrdinalIgnoreCase)) return true;

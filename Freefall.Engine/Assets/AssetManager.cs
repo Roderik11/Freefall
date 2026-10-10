@@ -104,6 +104,27 @@ namespace Freefall.Assets
         }
 
         /// <summary>
+        /// Evict every cached asset whose class the predicate selects. Script hot reload calls this for the
+        /// asset classes defined in the script assemblies it unloads: a cached instance keeps its whole
+        /// assembly loaded, and LoadByGuid only replaces the ones somebody asks for again.
+        /// Returns the number of cache entries removed.
+        /// </summary>
+        public int EvictTypes(Func<Type, bool> match)
+        {
+            int evicted = 0;
+            foreach (var (key, asset) in _assets)
+            {
+                if (!match(asset.GetType()) || !_assets.TryRemove(key, out _))
+                    continue;
+
+                evicted++;
+                if (asset is IDisposable disposable)
+                    disposable.Dispose();
+            }
+            return evicted;
+        }
+
+        /// <summary>
         /// Hot-reload every loaded asset whose source was reimported since the last call
         /// (see AssetDatabase.TakeReimportedGuids). Main thread only, between frames.
         /// Returns the number of assets reloaded in place.

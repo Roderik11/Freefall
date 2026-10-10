@@ -173,8 +173,11 @@ namespace Freefall.Components
 
         public override void Destroy()
         {
+            // The frames in flight still read these through the bone buffer index of this character's
+            // draws. Releasing them here removed the device when many characters were deleted at once,
+            // so they go to the device to release once those frames are done.
             foreach (var entry in _boneBuffers.Values)
-                entry.Buffer.Dispose();
+                Engine.Device.DeferDispose(entry.Buffer);
             _boneBuffers.Clear();
         }
 

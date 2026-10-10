@@ -196,7 +196,8 @@ namespace Freefall.Components
 
         public override void Destroy()
         {
-            Mesh?.Dispose();
+            // Deferred: the sky draw of the frames in flight still references the mesh
+            Engine.Device.DeferDispose(Mesh);
             CurrentCloudShadowStrength = 0.0f;
         }
 

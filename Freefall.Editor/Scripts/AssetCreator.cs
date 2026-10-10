@@ -2,9 +2,11 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Reflection;
 using System.Text;
 using Freefall.Assets;
 using Freefall.Base;
+using Freefall.Reflection;
 using Freefall.Serialization;
 
 namespace Freefall.Editor
@@ -92,6 +94,65 @@ namespace Freefall.Editor
                 MessageDispatcher.Send(Msg.RefreshAssets);
 
             return saved;
+        }
+
+        /// <summary>Unsaved state of an asset whose class is defined in project scripts, on its way across a script reload.</summary>
+        internal readonly record struct UnsavedScriptAsset(string Guid, string TypeName, string Name, string Yaml);
+
+        /// <summary>
+        /// Script hot reload, while the old script assemblies are still loaded: take the assets whose class they
+        /// define out of the dirty list (the instances would keep the old assembly from unloading) and return
+        /// the state of those that have unsaved changes, for <see cref="RestoreScriptAssets"/>.
+        /// </summary>
+        internal static List<UnsavedScriptAsset> DetachScriptAssets(ICollection<Assembly> assemblies)
+        {
+            var unsaved = new List<UnsavedScriptAsset>();
+
+            foreach (var asset in _dirtyAssets.Where(a => Reflector.ReferencesAssembly(a.GetType(), assemblies)).ToList())
+            {
+                _dirtyAssets.Remove(asset);
+
+                // Saved since it was edited (saving one asset clears its flag, not this list), or never had a file
+                if (!asset.IsDirty || string.IsNullOrEmpty(asset.Guid)) continue;
+
+                try
+                {
+                    unsaved.Add(new UnsavedScriptAsset(asset.Guid, asset.GetType().FullName, asset.Name, NativeImporter.SaveToString(asset)));
+                }
+                catch (Exception ex)
+                {
+                    Debug.LogWarning("ScriptReload", $"Unsaved changes to '{asset.Name}' could not be kept: {ex.Message}");
+                }
+            }
+
+            return unsaved;
+        }
+
+        /// <summary>
+        /// After the reload: load each asset again as its new class, put the unsaved state back on it and mark
+        /// it dirty.
+        /// </summary>
+        internal static void RestoreScriptAssets(List<UnsavedScriptAsset> unsaved)
+        {
+            foreach (var entry in unsaved)
+            {
+                try
+                {
+                    var type = Reflector.GetType(entry.TypeName);
+                    var asset = type != null && typeof(Asset).IsAssignableFrom(type) ? Engine.Assets.LoadByGuid(entry.Guid, type) : null;
+                    if (asset != null && NativeImporter.LoadInto(asset, entry.Yaml, Engine.Assets))
+                    {
+                        asset.MarkDirty();
+                        continue;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Debug.LogWarning("ScriptReload", $"'{entry.Name}': {ex.Message}");
+                }
+
+                Debug.LogWarning("ScriptReload", $"Unsaved changes to '{entry.Name}' ({entry.TypeName}) were lost: the asset could not be loaded as that type after the reload");
+            }
         }
 
         /// <summary>Why the last CreateAsset call returned null (for callers that report errors).</summary>

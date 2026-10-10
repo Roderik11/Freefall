@@ -753,6 +753,23 @@ namespace Freefall.Graphics
                 _frameDeferredDisposals.Add((resource, Engine.TickCount + DeferredDisposeFrames));
         }
 
+        /// <summary>
+        /// Return a bindless slot to the free list once every frame currently in flight has finished.
+        /// For the descriptors of a raw resource that goes through <see cref="DeferDispose"/>: a slot freed
+        /// at once can be handed out and rewritten while those frames still index the heap with it.
+        /// Pass 0 to no-op.
+        /// </summary>
+        public void DeferReleaseBindlessIndex(uint index)
+        {
+            if (index == 0) return;
+            DeferDispose(new DeferredBindlessIndex(this, index));
+        }
+
+        private sealed class DeferredBindlessIndex(GraphicsDevice device, uint index) : IDisposable
+        {
+            public void Dispose() => device.ReleaseBindlessIndex(index);
+        }
+
         /// <summary>Release frame-deferred resources whose grace period has elapsed. Called once per tick.</summary>
         public void FlushFrameDeferredDisposals()
         {

@@ -51,3 +51,4 @@ dotnet-tools.json
 /Tools/BlenderKits
 /Tools/RetargetLab
 Tools/TerrainMigration/migrate-to-stamps.mjs
+/Tools/ModularCharacters

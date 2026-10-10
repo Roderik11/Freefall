@@ -15,6 +15,7 @@ namespace Freefall.Editor
         public const string SceneLoaded = "SceneLoaded";
         public const string RefreshAssets = "RefreshAssets";
         public const string AssetDirty = "AssetDirty";
+        public const string AssetReloaded = "AssetReloaded";
         public const string HandleClick = "HandleClick";
         public const string OpenAssetInEditor = "OpenAssetInEditor";
         public const string ScriptsReloaded = "ScriptsReloaded";

@@ -129,25 +129,30 @@ namespace Freefall.Components
 
         public override void Destroy()
         {
+            // The shadow passes of the frames in flight still read these: the cascade buffers through their
+            // bindless SRVs, the planes cbuffer by address. Releasing them here risks removing the device
+            // (see Animator.Destroy), so they go to the device to release once those frames are done.
+            var device = Engine.Device;
+
             if (_cascadeBuffers != null)
                 for (int i = 0; i < FrameCount; i++)
-                    _cascadeBuffers[i]?.Dispose();
+                    device.DeferDispose(_cascadeBuffers[i]);
 
             if (_vpOnlyBuffers != null)
                 for (int i = 0; i < FrameCount; i++)
-                    _vpOnlyBuffers[i]?.Dispose();
+                    device.DeferDispose(_vpOnlyBuffers[i]);
 
             if (_shadowCascadeCBs != null)
                 for (int i = 0; i < FrameCount; i++)
-                    _shadowCascadeCBs[i]?.Dispose();
+                    device.DeferDispose(_shadowCascadeCBs[i]);
 
             if (_gpuCascadeBuffers != null)
                 for (int i = 0; i < FrameCount; i++)
-                    _gpuCascadeBuffers[i]?.Dispose();
+                    device.DeferDispose(_gpuCascadeBuffers[i]);
 
             if (_shadowSceneConstantsBuffers != null)
                 for (int i = 0; i < FrameCount; i++)
-                    _shadowSceneConstantsBuffers[i]?.Release();
+                    device.DeferDispose(_shadowSceneConstantsBuffers[i]);
 
             if (_instance == this)
                 _instance = null;

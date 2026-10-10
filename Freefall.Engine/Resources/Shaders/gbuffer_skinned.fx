@@ -246,13 +246,13 @@ void PS_Shadow(ShadowVSOutput input)
     MaterialData mat = GET_MATERIAL(input.MaterialID);
     Texture2D albedoTex = ResourceDescriptorHeap[mat.AlbedoIdx];
     float alpha = albedoTex.Sample(Sampler, input.TexCoord).a;
-    //clip(alpha - 0.25f);
+    clip(alpha - 0.25f);
 }
 
 PSOutput PS(VSOutput input)
 {
     PSOutput output;
-    
+
     uint materialID = input.MaterialID;
     
     // Material lookup via MaterialID indirection
@@ -260,8 +260,10 @@ PSOutput PS(VSOutput input)
     Texture2D albedoTex = ResourceDescriptorHeap[mat.AlbedoIdx];
     
     float4 color = albedoTex.Sample(Sampler, input.TexCoord);
-    //clip(color.a - 0.25f);
-    
+    // Alpha test: hair, beard and eyebrow cards, torn cloth, visor slits. An albedo whose alpha channel holds
+    // something else than opacity (a mask) must be imported with IgnoreAlpha, or it gets holes here.
+    clip(color.a - 0.25f);
+
     // PBR material properties — defaults for meshes without PBR textures
     float roughness = 0.65;
     float metal = 0.0;

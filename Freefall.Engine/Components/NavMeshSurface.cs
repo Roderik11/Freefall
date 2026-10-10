@@ -80,7 +80,9 @@ namespace Freefall.Components
         public override void Destroy()
         {
             NavMeshWorld.Shutdown();
-            _gizmoMesh?.Dispose();
+
+            // Deferred: gizmo draws of the frames in flight still reference the mesh
+            Engine.Device.DeferDispose(_gizmoMesh);
             _gizmoMesh = null;
         }
 
@@ -119,7 +121,8 @@ namespace Freefall.Components
         /// </summary>
         private void BuildGizmoMesh(DotRecast.Detour.DtNavMesh navMesh)
         {
-            _gizmoMesh?.Dispose();
+            // Deferred: on a rebake, gizmo draws of the frames in flight still reference the old mesh
+            Engine.Device.DeferDispose(_gizmoMesh);
             _gizmoMesh = null;
             _gizmoMaterial = null; // force rebuild with potentially new effect
 

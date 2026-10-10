@@ -86,6 +86,7 @@ namespace Freefall.Editor
             searchbox.TextChanged += Searchbox_TextChanged;
             MessageDispatcher.AddListener(Msg.SelectionChanged, OnSelectionChanged);
             MessageDispatcher.AddListener(Msg.RefreshInspector, OnSelectionChanged);
+            MessageDispatcher.AddListener(Msg.AssetReloaded, OnAssetReloaded);
 
             // --- Initialize preview viewport (same pattern as ViewportControl) ---
             InitPreviewViewport();
@@ -186,6 +187,16 @@ namespace Freefall.Editor
                 // if an IImporter is selected,
                 // we need Apply/Revert buttons to save or discard the changes
             }
+        }
+
+        /// <summary>
+        /// The asset on display was hot-reloaded from its file: its lists and nested objects are new ones, and
+        /// the controls still edit the old.
+        /// </summary>
+        void OnAssetReloaded(Message msg)
+        {
+            if (msg.Data != null && ReferenceEquals(currentTarget?.Target, msg.Data))
+                OnSelectionChanged(msg);
         }
 
         private void Inspector_OnValueChanged(GUIProperty obj)

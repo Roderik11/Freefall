@@ -30,8 +30,9 @@ namespace Freefall.Editor.Mcp
         [McpServerTool(Name = "asset_refresh", Title = "Import new files", Idempotent = true, OpenWorld = false)]
         [Description("Rescan the Assets folder and import files that were added or changed on disk outside the editor " +
                      "(generated textures, meshes, copied packs). Needed before new files can be found or used. " +
-                     "Changed meshes, textures, materials and prefabs that are already loaded are hot-reloaded in place, " +
-                     "so placed instances update without a scene reload ('reloaded' = count).")]
+                     "Changed meshes, textures, materials, prefabs and .asset files that are already loaded are hot-reloaded in place, " +
+                     "so placed instances update without a scene reload ('reloaded' = count). A script component that generated " +
+                     "entities from a reloaded .asset keeps its old output until it rebuilds, e.g. when one of its members is set again.")]
         public static Task<CallToolResult> Refresh() => McpBridge.Post("/api/assets/refresh");
 
         [McpServerTool(Name = "asset_types", Title = "List asset types", ReadOnly = true, OpenWorld = false)]
@@ -53,7 +54,7 @@ namespace Freefall.Editor.Mcp
 
         [McpServerTool(Name = "asset_set_properties", Title = "Set asset properties", Destructive = true, Idempotent = true, OpenWorld = false)]
         [Description("Set fields on an asset, then (by default) save it to disk and reimport so the editor's cached copy matches. " +
-                     "This is the only way to edit assets: editing the file on disk does not reach the running editor. " +
+                     "A file edited or regenerated on disk reaches the running editor with asset_refresh instead. " +
                      "Same value encodings as entity_set_properties. Not atomic — earlier members stay set if a later one fails.")]
         public static Task<CallToolResult> SetProperties(
             string guid,

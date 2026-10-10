@@ -157,8 +157,8 @@ namespace Freefall.Serialization
 
         /// <summary>
         /// Drop engine-side caches keyed by types from these assemblies (ScriptExecution dispatch list,
-        /// Entity's ComponentCache&lt;T&gt; type map). Call after <see cref="Detach"/>; Reflector has its own
-        /// UnregisterAssembly.
+        /// Entity's ComponentCache&lt;T&gt; type map) and the cached assets whose class they define. Call after
+        /// <see cref="Detach"/>; Reflector has its own UnregisterAssembly.
         /// </summary>
         public static void ForgetTypes(ICollection<Assembly> assemblies)
         {
@@ -166,6 +166,10 @@ namespace Freefall.Serialization
             bool Stale(Type t) => Reflector.ReferencesAssembly(t, assemblies);
             ScriptExecution.RemoveCaches(Stale);
             Entity.ForgetCacheTypes(Stale);
+
+            // Restore() loads the ones a live component references again, by GUID, as the new type.
+            // The rest would stay cached as instances of the old assembly and keep it from unloading.
+            Engine.Assets?.EvictTypes(Stale);
         }
 
         // ── 4. Restore ────────────────────────────────────────────

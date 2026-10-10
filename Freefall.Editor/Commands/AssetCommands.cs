@@ -52,7 +52,7 @@ namespace Freefall.Editor.Commands
             AssetDatabase.ImportAll();
             int after = AssetDatabase.GetAllPaths().Count();
 
-            // Update loaded meshes/textures/materials/prefabs in place now (the engine tick would
+            // Update loaded meshes/textures/materials/prefabs/.asset files in place now (the engine tick would
             // otherwise do it next frame) so the response can report it.
             int reloaded = Engine.Assets.ReloadReimported();
 

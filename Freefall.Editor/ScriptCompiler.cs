@@ -8,6 +8,7 @@ using System.Threading;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.Emit;
+using Freefall.Assets;
 using Freefall.Base;
 using Freefall.Reflection;
 using Freefall.Serialization;
@@ -286,7 +287,18 @@ namespace Freefall.Editor
             var migrator = ScriptComponentMigrator.Capture(oldAssemblies);
             migrator.Detach();
 
-            // 2. Forget everything keyed by the old types, then start unloading their context
+            // The editor's own references to assets of a script-defined class: the dirty list, and the
+            // selection with the inspector controls built on it
+            var unsavedAssets = AssetCreator.DetachScriptAssets(oldAssemblies);
+            (string Guid, string TypeName)? shownAsset = null;
+            if (Selector.SelectedObject is Asset shown && Reflector.ReferencesAssembly(shown.GetType(), oldAssemblies))
+            {
+                shownAsset = (shown.Guid, shown.GetType().FullName!);
+                Selector.SelectedObject = null;
+            }
+
+            // 2. Forget everything keyed by the old types (cached assets of script classes included), then
+            //    start unloading their context
             foreach (var asm in oldAssemblies)
                 Reflector.UnregisterAssembly(asm);
             ScriptComponentMigrator.ForgetTypes(oldAssemblies);
@@ -353,6 +365,12 @@ namespace Freefall.Editor
 
             MessageDispatcher.Send(Msg.ScriptsReloaded);
             MessageDispatcher.Send(Msg.RefreshInspector);
+
+            // Script-class assets again, as instances of the new build
+            AssetCreator.RestoreScriptAssets(unsavedAssets);
+            if (shownAsset is (var guid, var typeName) && Reflector.GetType(typeName) is { } assetType
+                && Engine.Assets.LoadByGuid(guid, assetType) is { } reloaded)
+                Selector.SelectedObject = reloaded;
 
             if (oldContext != null)
                 WatchUnload(oldContext);

@@ -258,9 +258,13 @@ namespace Freefall.Components
 
         public override void Destroy()
         {
-            _tileScalesBuffer?.Dispose();
-            _oceanFFT?.Dispose();
-            _mesh?.Dispose();
+            // Deferred: the frames in flight still draw the grid, read the tile scales and the FFT textures
+            // through their bindless slots and run the FFT kernels. OceanFFT.Dispose releases only GPU objects
+            // (textures, buffers, compute pipeline states), so the whole simulation waits with them.
+            var device = Engine.Device;
+            device.DeferDispose(_tileScalesBuffer);
+            device.DeferDispose(_oceanFFT);
+            device.DeferDispose(_mesh);
         }
 
         private unsafe void CreateTileScalesBuffer()
