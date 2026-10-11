@@ -31,54 +31,128 @@ namespace Freefall.Components
         [DontSerialize] [JsonIgnore]
         private Material? _gizmoMaterial;
 
+        [DontSerialize] [JsonIgnore]
+        private NavMeshBake? _bake;
+
+        // From Bake() until the result has been applied on the main thread: a little longer than
+        // the bake itself runs, so "not baking" always means the asset shows the result.
+        [DontSerialize] [JsonIgnore]
+        private bool _bakePending;
+
         // ── Baking ──
 
         /// <summary>
-        /// Bake the navmesh from current scene geometry.
-        /// Binary data is persisted through the NavMeshLoader when the asset is saved.
+        /// The bake started last, running or finished. Null before the first bake.
+        /// A method, so reflection-driven code (inspector, entity dumps) does not walk into it.
         /// </summary>
-        public Assets.NavMesh? Bake()
+        public NavMeshBake? GetBake() => _bake;
+
+        [System.ComponentModel.Browsable(false)] [JsonIgnore]
+        public bool IsBaking => _bakePending;
+
+        /// <summary>0..1 while baking, 1 once a bake has finished.</summary>
+        [System.ComponentModel.Browsable(false)] [JsonIgnore]
+        public float BakeProgress => _bake == null ? 0f : _bake.IsCompleted ? 1f : _bake.Progress;
+
+        /// <summary>
+        /// Start baking the navmesh from the current scene geometry. Main thread; returns once the
+        /// scene has been captured, the bake itself runs on worker threads and is applied when done.
+        /// Tiles whose surroundings did not change since the last bake are kept, unless
+        /// <paramref name="rebuildAll"/> is set. The baked data is persisted through the
+        /// NavMeshLoader when the asset is saved.
+        /// </summary>
+        public NavMeshBake Bake(bool rebuildAll = false)
         {
+            if (IsBaking) return _bake!;
+
             NavMesh ??= new Assets.NavMesh { Name = "NavMesh" };
 
-            var dtNavMesh = NavMeshBuilder.Build(NavMesh, out int polyCount, out int vertCount);
-            if (dtNavMesh == null)
+            var asset = NavMesh;
+            var bake = NavMeshBuilder.Start(asset, rebuildAll ? null : asset.Tiles);
+            _bake = bake;
+            _bakePending = true;
+
+            bake.Completion.ContinueWith(_ =>
             {
-                Debug.Log("[NavMeshSurface] Bake failed — no navmesh produced.");
-                return null;
+                // Still off the main thread: the debug mesh of a large navmesh is millions of vertices
+                Vector3[]? vertices = null;
+                uint[]? indices = null;
+                try
+                {
+                    if (bake.Result?.NavMesh != null)
+                        NavMeshBuilder.BuildDebugGeometry(bake.Result.NavMesh, out vertices, out indices);
+                }
+                catch (Exception ex)
+                {
+                    Debug.LogWarning("NavMeshSurface", $"Could not build the navmesh debug mesh: {ex.Message}");
+                    vertices = null;
+                    indices = null;
+                }
+
+                Engine.RunOnMainThreadAsync(() => ApplyBake(bake, asset, vertices, indices));
+            });
+
+            return bake;
+        }
+
+        public void CancelBake() => _bake?.Cancel();
+
+        private void ApplyBake(NavMeshBake bake, Assets.NavMesh asset, Vector3[]? vertices, uint[]? indices)
+        {
+            if (_bake == bake) _bakePending = false;
+
+            var result = bake.Result;
+            if (result == null)
+            {
+                if (bake.Stage == NavMeshBakeStage.Cancelled)
+                    Debug.Log("[NavMeshSurface] Bake cancelled.");
+                return;
             }
 
-            NavMesh.PolyCount = polyCount;
-            NavMesh.VertexCount = vertCount;
+            // A bake that found every tile unchanged leaves the asset as it was: not dirty
+            bool changed = asset.Tiles == null || result.RebuiltCells > 0;
 
-            // Serialize to bytes — NavMeshLoader.Save() will persist to cache
-            NavMesh.MeshData = NavMeshSerializer.Serialize(dtNavMesh);
-            NavMesh.MarkDirty();
+            // The asset keeps its data even if the surface went away meanwhile
+            asset.Tiles = result.Tiles;
+            asset.PolyCount = result.Tiles.PolyCount;
+            asset.VertexCount = result.Tiles.VertexCount;
+            if (changed) asset.MarkDirty();
 
-            // Initialize the runtime world immediately
-            NavMeshWorld.Initialize(dtNavMesh);
+            Debug.Log($"[NavMeshSurface] Bake complete in {result.Seconds:0.0} s: {asset.PolyCount} polys in {result.Tiles.TileCount} tiles, " +
+                      $"{result.RebuiltCells} rebuilt, {result.ReusedCells} unchanged, {result.Tiles.ByteSize / 1024} KB ({result.Profile})");
 
-            // Build GPU debug mesh for gizmo rendering
-            BuildGizmoMesh(dtNavMesh);
+            if (IsDestroyed || NavMesh != asset || _bake != bake) return;
 
-            Debug.Log($"[NavMeshSurface] Bake complete: {polyCount} polys, {vertCount} verts, {NavMesh.MeshData.Length} bytes");
-            return NavMesh;
+            // Nothing new and the runtime already has it: swapping would only drop the crowd's agents
+            if (!changed && NavMeshWorld.IsReady && _gizmoMesh != null) return;
+
+            if (result.NavMesh == null)
+            {
+                Debug.LogWarning("NavMeshSurface", "Bake produced no walkable surface.");
+                NavMeshWorld.Shutdown();
+                SetGizmoMesh(null, null);
+                return;
+            }
+
+            NavMeshWorld.Initialize(result.NavMesh);
+            SetGizmoMesh(vertices, indices);
         }
 
         protected override void Awake()
         {
             // Initialize runtime if we have baked data (loaded by NavMeshLoader)
-            if (NavMesh?.MeshData != null && NavMesh.MeshData.Length > 0)
-            {
-                NavMeshWorld.Initialize(NavMesh);
-                var dtNav = NavMeshSerializer.Deserialize(NavMesh.MeshData);
-                if (dtNav != null)
-                    BuildGizmoMesh(dtNav);
-            }
+            var navMesh = NavMesh?.Tiles?.CreateNavMesh();
+            if (navMesh == null) return;
+
+            NavMeshWorld.Initialize(navMesh);
+
+            NavMeshBuilder.BuildDebugGeometry(navMesh, out var vertices, out var indices);
+            SetGizmoMesh(vertices, indices);
         }
 
         public override void Destroy()
         {
+            _bake?.Cancel();
             NavMeshWorld.Shutdown();
 
             // Deferred: gizmo draws of the frames in flight still reference the mesh
@@ -116,63 +190,29 @@ namespace Freefall.Components
         }
 
         /// <summary>
-        /// Build a GPU Mesh from the DotRecast navmesh for gizmo rendering.
-        /// Called once on bake or load — zero per-frame CPU work.
+        /// Replace the GPU mesh for gizmo rendering with the navmesh polygons from
+        /// NavMeshBuilder.BuildDebugGeometry. Called once on bake or load — zero per-frame CPU work.
         /// </summary>
-        private void BuildGizmoMesh(DotRecast.Detour.DtNavMesh navMesh)
+        private void SetGizmoMesh(Vector3[]? vertices, uint[]? indices)
         {
             // Deferred: on a rebake, gizmo draws of the frames in flight still reference the old mesh
             Engine.Device.DeferDispose(_gizmoMesh);
             _gizmoMesh = null;
             _gizmoMaterial = null; // force rebuild with potentially new effect
 
-            var verts = new System.Collections.Generic.List<Vector3>();
-            var indices = new System.Collections.Generic.List<uint>();
-
-            for (int tileIdx = 0; tileIdx < navMesh.GetMaxTiles(); tileIdx++)
-            {
-                var tile = navMesh.GetTile(tileIdx);
-                if (tile?.data == null) continue;
-
-                uint baseVert = (uint)verts.Count;
-
-                for (int v = 0; v < tile.data.header.vertCount; v++)
-                {
-                    verts.Add(new Vector3(
-                        tile.data.verts[v * 3],
-                        tile.data.verts[v * 3 + 1],
-                        tile.data.verts[v * 3 + 2]));
-                }
-
-                for (int p = 0; p < tile.data.header.polyCount; p++)
-                {
-                    var poly = tile.data.polys[p];
-                    if (poly.GetPolyType() == DotRecast.Detour.DtPolyTypes.DT_POLYTYPE_OFFMESH_CONNECTION)
-                        continue;
-
-                    for (int j = 2; j < poly.vertCount; j++)
-                    {
-                        indices.Add(baseVert + (uint)poly.verts[0]);
-                        indices.Add(baseVert + (uint)poly.verts[j - 1]);
-                        indices.Add(baseVert + (uint)poly.verts[j]);
-                    }
-                }
-            }
-
-            if (verts.Count == 0 || indices.Count == 0) return;
+            if (vertices == null || indices == null || vertices.Length == 0 || indices.Length == 0) return;
 
             // Build normals + UVs (flat up, zero UVs — unlit gizmo)
-            var normals = new Vector3[verts.Count];
-            var uvs = new Vector2[verts.Count];
+            var normals = new Vector3[vertices.Length];
+            var uvs = new Vector2[vertices.Length];
             Array.Fill(normals, Vector3.UnitY);
 
-            var mesh = new Mesh(Engine.Device,
-                verts.ToArray(), normals, uvs, indices.ToArray());
+            var mesh = new Mesh(Engine.Device, vertices, normals, uvs, indices);
 
             // Compute bounds
             var min = new Vector3(float.MaxValue);
             var max = new Vector3(float.MinValue);
-            foreach (var v in verts)
+            foreach (var v in vertices)
             {
                 min = Vector3.Min(min, v);
                 max = Vector3.Max(max, v);
@@ -185,7 +225,7 @@ namespace Freefall.Components
             mesh.MeshParts.Add(new MeshPart
             {
                 Name = "NavMesh",
-                NumIndices = indices.Count,
+                NumIndices = indices.Length,
                 BoundingBox = mesh.BoundingBox,
                 BoundingSphere = mesh.LocalBoundingSphere
             });

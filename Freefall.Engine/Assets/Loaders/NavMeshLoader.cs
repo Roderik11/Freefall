@@ -52,7 +52,7 @@ namespace Freefall.Assets.Loaders
 
                 navMesh.MarkReady();
                 Debug.Log($"[NavMeshLoader] '{name}' loaded: {navMesh.PolyCount} polys, {navMesh.VertexCount} verts, " +
-                          $"MeshData={(navMesh.MeshData?.Length ?? 0)} bytes");
+                          $"{navMesh.Tiles?.TileCount ?? 0} tiles");
 
                 return navMesh;
             }
@@ -86,10 +86,13 @@ namespace Freefall.Assets.Loaders
                 using var stream = File.OpenRead(cachePath);
                 var data = packer.Read(stream);
 
-                if (data?.BakedBytes != null && data.BakedBytes.Length > 0)
+                var tiles = Navigation.NavMeshTileSet.FromBytes(data?.BakedBytes);
+                if (tiles != null)
                 {
-                    navMesh.MeshData = data.BakedBytes;
-                    Debug.Log($"[NavMeshLoader] Loaded baked data: {data.BakedBytes.Length} bytes");
+                    navMesh.Tiles = tiles;
+                    navMesh.PolyCount = tiles.PolyCount;
+                    navMesh.VertexCount = tiles.VertexCount;
+                    Debug.Log($"[NavMeshLoader] Loaded baked data: {data!.BakedBytes!.Length} bytes");
                 }
             }
             catch (Exception ex)
@@ -127,7 +130,7 @@ namespace Freefall.Assets.Loaders
         /// </summary>
         private static void SaveBakedData(NavMesh navMesh)
         {
-            if (navMesh.MeshData == null || navMesh.MeshData.Length == 0)
+            if (navMesh.Tiles == null)
                 return;
 
             if (string.IsNullOrEmpty(navMesh.Guid)) return;
@@ -161,11 +164,12 @@ namespace Freefall.Assets.Loaders
                 Directory.CreateDirectory(Path.GetDirectoryName(cachePath)!);
             }
 
+            var bytes = navMesh.Tiles.ToBytes();
             var packer = new NavMeshDataPacker();
             using var stream = File.Create(cachePath);
-            packer.Write(stream, new NavMeshData { BakedBytes = navMesh.MeshData });
+            packer.Write(stream, new NavMeshData { BakedBytes = bytes });
 
-            Debug.Log($"[NavMeshLoader] Baked data saved: {navMesh.MeshData.Length} bytes → {cachePath}");
+            Debug.Log($"[NavMeshLoader] Baked data saved: {bytes.Length} bytes → {cachePath}");
         }
     }
 }

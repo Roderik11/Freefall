@@ -1,11 +1,9 @@
 using System;
 using System.Collections.Generic;
 using System.Numerics;
-using DotRecast.Core;
 using DotRecast.Core.Numerics;
 using DotRecast.Detour;
 using DotRecast.Detour.Crowd;
-using DotRecast.Detour.Io;
 
 namespace Freefall.Base
 {
@@ -56,20 +54,13 @@ namespace Freefall.Base
             Debug.Log($"[NavMeshWorld] Initialized: {totalPolys} polys, bounds=({minX:F1},{minY:F1},{minZ:F1})-({maxX:F1},{maxY:F1},{maxZ:F1})");
         }
 
-        /// <summary>Initialize from a NavMesh asset (loads MeshData bytes).</summary>
+        /// <summary>Initialize from a NavMesh asset (assembles the runtime navmesh from its baked tiles).</summary>
         public static void Initialize(Assets.NavMesh asset)
         {
-            if (asset.MeshData == null || asset.MeshData.Length == 0)
-            {
-                Debug.LogWarning("NavMeshWorld", "NavMesh asset has no baked data.");
-                return;
-            }
-
-            // Deserialize DtNavMesh from bytes
-            var navMesh = NavMeshSerializer.Deserialize(asset.MeshData);
+            var navMesh = asset.Tiles?.CreateNavMesh();
             if (navMesh == null)
             {
-                Debug.LogError("NavMeshWorld", "Failed to deserialize navmesh data.");
+                Debug.LogWarning("NavMeshWorld", "NavMesh asset has no baked data.");
                 return;
             }
 
@@ -212,38 +203,5 @@ namespace Freefall.Base
 
         internal static RcVec3f ToRc(Vector3 v) => new(v.X, v.Y, v.Z);
         internal static Vector3 FromRc(RcVec3f v) => new(v.X, v.Y, v.Z);
-    }
-
-    /// <summary>
-    /// Handles serialization/deserialization of DtNavMesh to/from byte arrays.
-    /// </summary>
-    internal static class NavMeshSerializer
-    {
-        /// <summary>Serialize a DtNavMesh to a byte array for storage.</summary>
-        public static byte[] Serialize(DtNavMesh navMesh)
-        {
-            var writer = new DtMeshSetWriter();
-            using var ms = new System.IO.MemoryStream();
-            using var bw = new System.IO.BinaryWriter(ms);
-            writer.Write(bw, navMesh, RcByteOrder.LITTLE_ENDIAN, false);
-            return ms.ToArray();
-        }
-
-        /// <summary>Deserialize a DtNavMesh from a byte array.</summary>
-        public static DtNavMesh? Deserialize(byte[] data)
-        {
-            try
-            {
-                var reader = new DtMeshSetReader();
-                using var ms = new System.IO.MemoryStream(data);
-                using var br = new System.IO.BinaryReader(ms);
-                return reader.Read(br, 6); // maxVertsPerPoly = 6
-            }
-            catch (Exception ex)
-            {
-                Debug.Log($"[NavMeshWorld] Deserialize failed: {ex.Message}");
-                return null;
-            }
-        }
     }
 }

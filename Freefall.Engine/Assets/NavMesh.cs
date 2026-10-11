@@ -40,12 +40,21 @@ namespace Freefall.Assets
         [ValueRange(0.5f, 10f)]
         public float TerrainSampleStep = 2.0f;
 
+        /// <summary>
+        /// Tile edge length in voxels. Tiles are baked independently and a rebake only rebuilds the
+        /// tiles whose surroundings changed: smaller tiles rebake less after a local edit, larger
+        /// tiles give fewer, bigger polygons.
+        /// </summary>
+        [ValueRange(16, 256)]
+        public int TileSize = 64;
+
         // ── Runtime Data (loaded from hidden subasset, not serialized) ──
 
+        /// <summary>The baked tiles. Null until baked or loaded.</summary>
         [DontSerialize]
         [JsonIgnore]
         [Browsable(false)]
-        internal byte[]? MeshData;
+        internal Navigation.NavMeshTileSet? Tiles;
 
         // ── Metadata ──
 
@@ -59,7 +68,7 @@ namespace Freefall.Assets
     }
 
     /// <summary>
-    /// Container for baked DotRecast navmesh bytes.
+    /// Container for the baked navmesh bytes (a serialized NavMeshTileSet).
     /// Stored as a hidden subasset, matching the CollisionMeshData pattern.
     /// </summary>
     public class NavMeshData
