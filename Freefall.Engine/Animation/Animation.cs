@@ -40,9 +40,55 @@ namespace Freefall.Animation
         public List<AnimationParameter> Parameters = new List<AnimationParameter>();
         public List<AnimationLayer> Layers = new List<AnimationLayer>();
 
+        /// <summary>
+        /// How much the fingers of a retargeted character follow this graph's clips: 1 = in full,
+        /// 0 = the hands stay as the character is bound. Clips made with the hands closed around
+        /// something look clenched on empty hands: an unarmed graph wants well under 1. An
+        /// <see cref="AnimationSet"/> has its own value for its clips.
+        /// </summary>
+        public float FingerWeight = 1f;
+
         // Sequential counter for state IDs — must produce small ints
         // because layer state tracking stores IDs as floats in the playback dictionary.
         private int _nextStateId = 1;
+
+        /// <summary>Adds a layer after the existing ones: it is evaluated last and overrides them.</summary>
+        public AnimationLayer AddLayer(string name)
+        {
+            var layer = new AnimationLayer { Name = name };
+            Layers.Add(layer);
+            ReindexLayers();
+            return layer;
+        }
+
+        public void RemoveLayer(AnimationLayer layer)
+        {
+            if (Layers.Remove(layer))
+                ReindexLayers();
+        }
+
+        /// <summary>Moves a layer earlier (-1) or later (+1) in the evaluation order. False at either end.</summary>
+        public bool MoveLayer(AnimationLayer layer, int offset)
+        {
+            int from = Layers.IndexOf(layer);
+            int to = from + offset;
+            if (from < 0 || to < 0 || to >= Layers.Count) return false;
+
+            Layers.RemoveAt(from);
+            Layers.Insert(to, layer);
+            ReindexLayers();
+            return true;
+        }
+
+        /// <summary>
+        /// A layer's Index keys its playback state: it has to equal the layer's position in the list.
+        /// Two layers with the same index share one current state, and the second plays nothing.
+        /// </summary>
+        public void ReindexLayers()
+        {
+            for (int i = 0; i < Layers.Count; i++)
+                Layers[i].Index = i;
+        }
 
         /// <summary>
         /// Assigns a unique ID to a state (and any nested children) and adds it to a layer.
@@ -80,9 +126,7 @@ namespace Freefall.Animation
         /// </summary>
         public void RebuildAfterLoad()
         {
-            // Assign layer indices
-            for (int i = 0; i < Layers.Count; i++)
-                Layers[i].Index = i;
+            ReindexLayers();
 
             // Assign parameter indices
             for (int i = 0; i < Parameters.Count; i++)

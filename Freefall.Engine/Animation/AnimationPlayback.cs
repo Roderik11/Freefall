@@ -12,6 +12,35 @@ namespace Freefall.Animation
     {
         private readonly Dictionary<long, float> _state = new();
 
+        /// <summary>The set whose clips replace the graph's own for this Animator (null = none).</summary>
+        public AnimationSet AnimationSet;
+
+        /// <summary>The set that was active before the last swap, sampled while <see cref="SetFade"/> runs.</summary>
+        public AnimationSet PreviousAnimationSet;
+
+        /// <summary>Cross-fade from the previous set to the current one: 0 = just swapped, 1 = done.</summary>
+        public float SetFade = 1f;
+
+        public AnimationClip ClipOf(AnimationState state)
+            => AnimationSet != null ? AnimationSet.Resolve(state) : state.Clip;
+
+        public AnimationClip PreviousClipOf(AnimationState state)
+            => PreviousAnimationSet != null ? PreviousAnimationSet.Resolve(state) : state.Clip;
+
+        /// <summary>Where the clip a state plays is taken up (<see cref="AnimationState.Start"/>): the set's value for a clip it replaces.</summary>
+        public float StartOf(AnimationState state)
+            => AnimationSet != null ? AnimationSet.ResolveStart(state) : state.Start;
+
+        public float PreviousStartOf(AnimationState state)
+            => PreviousAnimationSet != null ? PreviousAnimationSet.ResolveStart(state) : state.Start;
+
+        /// <summary>
+        /// Where in its loop's cycle the clip a state plays takes over (<see cref="AnimationState.Phase"/>),
+        /// played as it is or left for right; negative when not known.
+        /// </summary>
+        public float PhaseOf(AnimationState state, bool mirrored)
+            => AnimationSet != null ? AnimationSet.ResolvePhase(state, mirrored) : mirrored ? state.MirrorPhase : state.Phase;
+
         public float Get(long key, float fallback = 0f)
             => _state.TryGetValue(key, out var v) ? v : fallback;
 
@@ -41,6 +70,7 @@ namespace Freefall.Animation
         // State fields
         public const int Time   = 0;
         public const int Weight = 1;
+        public const int Mirrored = 2;
 
         // Layer fields
         public const int Current       = 0;
@@ -50,6 +80,8 @@ namespace Freefall.Animation
         public const int TransSource   = 4;
         public const int TransTarget   = 5;
         public const int ReturnTo      = 6;
+        public const int Serial        = 7;
+        public const int PreviousFade  = 8;
 
         static long Key(long id, uint category, uint field)
             => (id << 32) | (category | field);

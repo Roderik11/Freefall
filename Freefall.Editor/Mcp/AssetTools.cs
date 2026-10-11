@@ -72,6 +72,12 @@ namespace Freefall.Editor.Mcp
         public static Task<CallToolResult> Save(string guid, [Description("Override path; default is the asset's own file")] string? path = null)
             => McpBridge.Post("/api/asset/save", new { guid, path });
 
+        [McpServerTool(Name = "asset_open", Title = "Open asset in its editor", Idempotent = true, OpenWorld = false)]
+        [Description("Open an asset in its custom editor tab (node graphs, animation graphs, animation sets), like a double-click " +
+                     "in the asset browser. Follow with screenshot target='editor' to look at it.")]
+        public static Task<CallToolResult> Open(string guid)
+            => McpBridge.Post("/api/asset/open", new { guid });
+
         [McpServerTool(Name = "import_unity_pack", Title = "Import Unity asset pack", OpenWorld = false)]
         [Description("Convert a Unity asset pack from disk into the project's Assets/<pack> folder. Runs synchronously and can take minutes; " +
                      "if the call times out the import is still running — watch console_log.")]

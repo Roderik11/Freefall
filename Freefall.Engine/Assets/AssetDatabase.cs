@@ -213,6 +213,20 @@ namespace Freefall.Assets
             return _guidToPath.TryGetValue(guid, out var path) ? path : null;
         }
 
+        /// <summary>
+        /// Absolute path of the source file a GUID is tracked under: the file a loaded asset is saved to.
+        /// Null for anything without a file of its own (a sub-asset lives inside its source file, an internal
+        /// asset in none). Ask this instead of Asset.AssetPath, which nothing sets on a load by GUID and
+        /// which a .asset keeps from its last save (a copied or renamed file still names the old one).
+        /// </summary>
+        public static string GuidToFullPath(string guid)
+        {
+            if (string.IsNullOrEmpty(guid) || Project == null) return null;
+
+            var relativePath = GuidToPath(guid);
+            return relativePath != null ? Path.GetFullPath(Path.Combine(Project.AssetsDirectory, relativePath)) : null;
+        }
+
         public static MetaFile GetMeta(string guid)
         {
             // Try as source GUID first

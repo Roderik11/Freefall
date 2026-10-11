@@ -45,6 +45,26 @@ namespace Freefall.Animation
     }
 
     /// <summary>
+    /// How the fingers of a retargeted character follow the source rig. Two rigs seldom agree on
+    /// where the finger joints sit, least of all at the thumb, and a pose that closes into a
+    /// grip on one hand is an open claw on another.
+    /// </summary>
+    public enum FingerRetargeting
+    {
+        /// <summary>
+        /// The hand keeps its own shape: every finger bone starts from the character's bind pose
+        /// and bends by what the source bone bends from its own.
+        /// </summary>
+        KeepShape,
+
+        /// <summary>The four fingers point where the source's do; the thumb keeps its own shape.</summary>
+        KeepThumbShape,
+
+        /// <summary>Every finger bone points where the source's does.</summary>
+        MatchSource,
+    }
+
+    /// <summary>
     /// Produces a BoneMap between two humanoid skeletons using canonical bone
     /// definitions and pattern-based name matching.
     /// </summary>
@@ -59,7 +79,7 @@ namespace Freefall.Animation
         /// Try to create a BoneMap between two skeletons using humanoid auto-detection.
         /// Returns null if either skeleton doesn't have enough humanoid bone matches.
         /// </summary>
-        public static BoneMap TryMap(Skeleton source, Skeleton target)
+        public static BoneMap TryMap(Skeleton source, Skeleton target, FingerRetargeting fingers = FingerRetargeting.KeepShape)
         {
             var srcMapping = Detect(source);
             var dstMapping = Detect(target);
@@ -96,6 +116,35 @@ namespace Freefall.Animation
             AddHandTwistHints(twistHints, srcMapping, dstMapping, left: true);
             AddHandTwistHints(twistHints, srcMapping, dstMapping, left: false);
 
+            // Face bones keep their own bind orientation: a rig with a jaw bone (the
+            // Mixamo source has none) otherwise turns the target's jaw to its own.
+            var faceBones = new List<int>();
+            foreach (var bone in FaceBones)
+            {
+                if (srcMapping.ContainsKey(bone) && dstMapping.TryGetValue(bone, out int faceIdx))
+                    faceBones.Add(faceIdx);
+            }
+
+            // Fingers never go through the deadband: the hand they hang on is aligned in full,
+            // and a finger bone corrected in part ends up twisted against it. They either take
+            // the source's bind pose in full (they point where the source's do) or keep their
+            // own, like the face bones (the hand keeps its shape and bends from there).
+            var fingerBones = new List<int>();
+            var matchedFingers = new List<int>();
+            foreach (var hand in new[] { LeftHandBones, RightHandBones })
+            {
+                for (int i = 1; i < hand.Length; i++) // [0] is the hand itself, [1..3] the thumb
+                {
+                    if (!srcMapping.ContainsKey(hand[i]) || !dstMapping.TryGetValue(hand[i], out int fingerIdx)) continue;
+                    fingerBones.Add(fingerIdx);
+
+                    bool keepShape = fingers == FingerRetargeting.KeepShape
+                                  || (fingers == FingerRetargeting.KeepThumbShape && i <= 3);
+                    if (keepShape) faceBones.Add(fingerIdx);
+                    else matchedFingers.Add(fingerIdx);
+                }
+            }
+
             // Log the mapping
             var log = new System.Text.StringBuilder();
             log.Append($"[HumanoidTemplate] Mapping {source.Name} → {target.Name}: {pairs.Count} paired bones");
@@ -113,9 +162,24 @@ namespace Freefall.Animation
             }
             Freefall.Debug.Log(log.ToString());
 
-            return BoneMap.Create(source, target, pairs.ToArray(), srcRoot, dstRoot,
-                twistHints.ToArray());
+            var map = BoneMap.Create(source, target, pairs.ToArray(), srcRoot, dstRoot,
+                twistHints.ToArray(), faceBones.ToArray(), matchedFingers.ToArray());
+
+            map.TargetIsFinger = new bool[target.Bones.Length];
+            foreach (int bone in fingerBones)
+                map.TargetIsFinger[bone] = true;
+
+            return map;
         }
+
+        // The head is one of them: what hangs below a head bone differs from rig to rig (a
+        // head-top bone on one, only eyes and a jaw on another), so the direction "to its child"
+        // is up on one rig and towards an eye on the next, and aligning the two tips the head
+        // over by the difference (52° from the DoubleL rig onto a Mixamo one).
+        private static readonly HumanoidBone[] FaceBones =
+        {
+            HumanoidBone.Head, HumanoidBone.LeftEye, HumanoidBone.RightEye, HumanoidBone.Jaw,
+        };
 
         /// <summary>Hand and finger bones per side, in HumanoidBone order.</summary>
         private static readonly HumanoidBone[] LeftHandBones =
@@ -392,11 +456,11 @@ namespace Freefall.Animation
 
             // Fingers — Little/Pinky
             (HumanoidBone.LeftLittleProximal, HumanoidBone.RightLittleProximal,
-                new[] { "HandPinky1", "pinky_01", "pinky1", "f_pinky_01", "LittleProximal" }),
+                new[] { "HandPinky1", "pinky_01", "pinky1", "f_pinky_01", "LittleProximal", "PinkyProximal" }),
             (HumanoidBone.LeftLittleIntermediate, HumanoidBone.RightLittleIntermediate,
-                new[] { "HandPinky2", "pinky_02", "pinky2", "f_pinky_02", "LittleIntermediate" }),
+                new[] { "HandPinky2", "pinky_02", "pinky2", "f_pinky_02", "LittleIntermediate", "PinkyIntermediate" }),
             (HumanoidBone.LeftLittleDistal, HumanoidBone.RightLittleDistal,
-                new[] { "HandPinky3", "pinky_03", "pinky3", "f_pinky_03", "LittleDistal" }),
+                new[] { "HandPinky3", "pinky_03", "pinky3", "f_pinky_03", "LittleDistal", "PinkyDistal" }),
 
             // Eyes
             (HumanoidBone.LeftEye, HumanoidBone.RightEye,

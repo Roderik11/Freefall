@@ -195,7 +195,7 @@ namespace Freefall.Assets.Importers
             {
                 foreach (var anim in scene.Animations)
                 {
-                    var clip = ExtractAnimation(anim, scale);
+                    var clip = ExtractAnimation(scene, anim, scale);
                     if (clip.Channels.Count > 0)
                     {
                         var animName = clip.Name;
@@ -947,7 +947,7 @@ namespace Freefall.Assets.Importers
             if (scene.HasAnimations)
             {
                 foreach (var anim in scene.Animations)
-                    clips.Add(ExtractAnimation(anim, scale));
+                    clips.Add(ExtractAnimation(scene, anim, scale));
             }
             return clips;
         }
@@ -1380,16 +1380,29 @@ namespace Freefall.Assets.Importers
         // Animation Extraction (via Assimp)
         // ══════════════════════════════════════════════════════════════
 
-        private AnimationClip ExtractAnimation(Assimp.Animation anim, float scale)
+        private AnimationClip ExtractAnimation(Scene scene, Assimp.Animation anim, float scale)
         {
             var clip = new AnimationClip();
             clip.Name = anim.Name;
             clip.Duration = (float)anim.DurationInTicks;
             clip.TicksPerSecond = anim.TicksPerSecond > 0 ? (float)anim.TicksPerSecond : 30f;
 
+            // The skeleton has no pivot nodes (FlattenHierarchy folds them into the bone below), so
+            // every channel has to give a bone's pose relative to the bone above it.
+            //
+            // A channel on a node itself already does: Assimp bakes the node's whole FBX transform
+            // chain (translation, pre-rotation, ...) into it, and the only pivot nodes between that
+            // chain and the bone above are geometric ones, which bones leave out.
+            //
+            // An FBX node with real pivots or geometric transforms gets its channels on its pivot
+            // nodes instead. Those are composed into one channel for the bone afterwards.
+            Dictionary<string, List<AnimationChannel>> pivotChannels = null;
+
             foreach (var nodeChannel in anim.NodeAnimationChannels)
             {
                 var channel = new AnimationChannel { Target = nodeChannel.NodeName };
+
+                int pivot = nodeChannel.NodeName.IndexOf(PivotMarker, StringComparison.Ordinal);
 
                 // Position keys
                 if (nodeChannel.HasPositionKeys)
@@ -1397,8 +1410,9 @@ namespace Freefall.Assets.Importers
                     var posKeys = new List<VectorKey>(nodeChannel.PositionKeyCount);
                     foreach (var key in nodeChannel.PositionKeys)
                     {
-                        var p = new Vector3(key.Value.X, key.Value.Y, key.Value.Z) * scale;
-                        posKeys.Add(new VectorKey { Time = (float)key.Time, Value = p });
+                        var p = new Vector3(key.Value.X, key.Value.Y, key.Value.Z);
+                        // Pivot channels are composed in file units and scaled then
+                        posKeys.Add(new VectorKey { Time = (float)key.Time, Value = pivot < 0 ? p * scale : p });
                     }
                     channel.Position = new VectorKeys(posKeys);
                 }
@@ -1409,8 +1423,11 @@ namespace Freefall.Assets.Importers
                     var rotKeys = new List<QuaternionKey>(nodeChannel.RotationKeyCount);
                     foreach (var key in nodeChannel.RotationKeys)
                     {
-                        var q = new System.Numerics.Quaternion(key.Value.X, key.Value.Y, key.Value.Z, key.Value.W);
-                        rotKeys.Add(new QuaternionKey { Time = (float)key.Time, Value = q });
+                        rotKeys.Add(new QuaternionKey
+                        {
+                            Time = (float)key.Time,
+                            Value = new System.Numerics.Quaternion(key.Value.X, key.Value.Y, key.Value.Z, key.Value.W)
+                        });
                     }
                     channel.Rotation = new QuaternionKeys(rotKeys);
                 }
@@ -1430,10 +1447,93 @@ namespace Freefall.Assets.Importers
                     channel.Scale = new VectorKeys(scaleKeys);
                 }
 
-                clip.AddChannel(channel);
+                if (pivot < 0)
+                {
+                    clip.AddChannel(channel);
+                    continue;
+                }
+
+                string bone = nodeChannel.NodeName.Substring(0, pivot);
+                pivotChannels ??= new Dictionary<string, List<AnimationChannel>>();
+                if (!pivotChannels.TryGetValue(bone, out var list))
+                    pivotChannels[bone] = list = new List<AnimationChannel>();
+                list.Add(channel);
+            }
+
+            if (pivotChannels != null)
+            {
+                foreach (var (bone, channels) in pivotChannels)
+                    ComposePivotChannels(scene, clip, bone, channels, scale);
             }
 
             return clip;
+        }
+
+        private const string PivotMarker = "_$AssimpFbx$_";
+        private const string GeometricPivotMarker = "_$AssimpFbx$_Geometric";
+
+        /// <summary>
+        /// One channel for a bone whose FBX node is animated through its pivot nodes: at every key
+        /// time of those, the bone's pose is its node times each pivot node above it, animated or
+        /// not, as in <see cref="CollapsedLocal"/>.
+        /// </summary>
+        private static void ComposePivotChannels(Scene scene, AnimationClip clip, string boneName,
+            List<AnimationChannel> pivotChannels, float scale)
+        {
+            var node = scene.RootNode.FindNode(boneName);
+            if (node == null) return;
+
+            foreach (var existing in clip.Channels)
+                if (existing.Target == boneName) return; // keyed on the node as well: that channel stands
+
+            var byNode = new Dictionary<string, AnimationChannel>();
+            var times = new SortedSet<float>();
+            foreach (var channel in pivotChannels)
+            {
+                byNode[channel.Target] = channel;
+                for (int i = 0; i < (channel.Position?.Count ?? 0); i++) times.Add(channel.Position[i].Time);
+                for (int i = 0; i < (channel.Rotation?.Count ?? 0); i++) times.Add(channel.Rotation[i].Time);
+                for (int i = 0; i < (channel.Scale?.Count ?? 0); i++) times.Add(channel.Scale[i].Time);
+            }
+            if (times.Count == 0) return;
+
+            var posKeys = new List<VectorKey>(times.Count);
+            var rotKeys = new List<QuaternionKey>(times.Count);
+            var scaleKeys = new List<VectorKey>(times.Count);
+
+            foreach (float time in times)
+            {
+                var local = ToMatrix(node.Transform);
+                for (var parent = node.Parent; parent != null && IsPivotNode(parent); parent = parent.Parent)
+                {
+                    if (IsGeometricPivot(parent)) continue;
+
+                    if (byNode.TryGetValue(parent.Name, out var channel))
+                    {
+                        var pose = channel.GetBoneTransform(null, time);
+                        local *= Matrix4x4.CreateScale(pose.Scale)
+                               * Matrix4x4.CreateFromQuaternion(pose.Rotation)
+                               * Matrix4x4.CreateTranslation(pose.Position);
+                    }
+                    else
+                        local *= ToMatrix(parent.Transform);
+                }
+
+                if (!Matrix4x4.Decompose(local, out var s, out var r, out var t)) continue;
+
+                posKeys.Add(new VectorKey { Time = time, Value = t * scale });
+                rotKeys.Add(new QuaternionKey { Time = time, Value = r });
+                scaleKeys.Add(new VectorKey { Time = time, Value = s });
+            }
+            if (rotKeys.Count == 0) return;
+
+            clip.AddChannel(new AnimationChannel
+            {
+                Target = boneName,
+                Position = new VectorKeys(posKeys),
+                Rotation = new QuaternionKeys(rotKeys),
+                Scale = new VectorKeys(scaleKeys),
+            });
         }
 
         // ══════════════════════════════════════════════════════════════
@@ -1533,22 +1633,65 @@ namespace Freefall.Assets.Importers
             }
         }
 
+        /// <summary>
+        /// Assimp splits an FBX node's transform chain into extra nodes named
+        /// "&lt;node&gt;_$AssimpFbx$_&lt;part&gt;" (translation, pre-rotation, geometric transforms and their
+        /// inverses). They are not bones: nothing is skinned to them and no clip moves them on their own.
+        /// </summary>
+        private static bool IsPivotNode(Node node) => node.Name.Contains(PivotMarker, StringComparison.Ordinal);
+
+        /// <summary>
+        /// A pivot node for an FBX geometric transform, or for the inverse of one, which Assimp puts
+        /// below the node to keep the transform from its children. A geometric transform moves the
+        /// geometry attached to a node, not the node: bones leave both out. Rigs carry unit scales
+        /// there (×100 on a bone, ×0.01 on the one below), which must not end up in a bind pose.
+        /// </summary>
+        private static bool IsGeometricPivot(Node node) => node.Name.Contains(GeometricPivotMarker, StringComparison.Ordinal);
+
+        /// <summary>
+        /// A node's transform relative to the nearest ancestor that is not a pivot node, with the
+        /// pivot nodes in between folded in, except geometric ones.
+        /// world(node) = local(node) * local(parent) * ...
+        /// </summary>
+        private static Matrix4x4 CollapsedLocal(Node node, out Node parent)
+        {
+            var local = ToMatrix(node.Transform);
+            for (parent = node.Parent; parent != null && IsPivotNode(parent); parent = parent.Parent)
+            {
+                if (!IsGeometricPivot(parent))
+                    local *= ToMatrix(parent.Transform);
+            }
+            return local;
+        }
+
         private void FlattenHierarchy(Node node)
         {
             if (!_validNodes.ContainsKey(node.Name)) return;
             if (_validNodes[node.Name] == false) return;
 
+            // Pivot nodes are folded into the bone below them: they made up more than half of some
+            // skeletons, and a clip that keys a bone already includes them (see ExtractAnimation).
+            if (IsPivotNode(node))
+            {
+                if (node.HasChildren)
+                {
+                    foreach (Node child in node.Children)
+                        FlattenHierarchy(child);
+                }
+                return;
+            }
+
             _boneNames.Add(node.Name);
 
             var newBone = new Bone { Name = node.Name };
-            Matrix4x4 bind = ToMatrix(node.Transform);
+            Matrix4x4 bind = CollapsedLocal(node, out Node parent);
             Matrix4x4.Decompose(bind, out var s, out var r, out var t);
 
 
             newBone.BindPoseMatrix = bind;
             newBone.BindPose = new BonePose { Position = t, Rotation = r, Scale = s };
 
-            newBone.Parent = node.Parent != null ? _boneNames.IndexOf(node.Parent.Name) : -1;
+            newBone.Parent = parent != null ? _boneNames.IndexOf(parent.Name) : -1;
             _skeleton.Add(newBone);
 
             if (_bones.TryGetValue(node.Name, out Assimp.Bone? value))

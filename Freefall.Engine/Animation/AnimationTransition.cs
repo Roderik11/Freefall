@@ -17,6 +17,12 @@ namespace Freefall.Animation
     public class AnimationTransition
     {
         public float Duration = .2f;
+
+        /// <summary>
+        /// For a transition without conditions: the point of the source clip (0..1) at which it starts.
+        /// </summary>
+        public float ExitTime = .8f;
+
         public List<AnimationCondition> Conditions = new List<AnimationCondition>();
 
         /// <summary>Serialized state IDs — resolved to Source/Target by RebuildAfterLoad.</summary>

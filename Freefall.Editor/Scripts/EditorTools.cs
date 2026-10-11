@@ -158,6 +158,17 @@ namespace Freefall.Editor
             }
         }
 
+        /// <summary>
+        /// Pick at a position as a left click there does: what is under it gets selected, through the
+        /// same GPU readback. For driving the viewport without a mouse (MCP viewport_click).
+        /// </summary>
+        public void ClickPick(Vortice.Mathematics.Int2 position)
+        {
+            MessageDispatcher.Send(Msg.RequestPick, position);
+            _pendingClickPick = true;
+            _pendingHoverPick = false;
+        }
+
         public void Draw()
         {
             if(gizmoManager == null)

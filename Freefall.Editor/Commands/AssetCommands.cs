@@ -315,6 +315,7 @@ namespace Freefall.Editor.Commands
     /// Save an asset to disk by GUID.
     /// POST /api/asset/save
     /// Body: {"guid":"..."} or {"guid":"...", "path":"D:/custom/path.terrain"}
+    /// Without 'path' the asset is written to its own source file (resolved by GUID through the AssetDatabase).
     /// </summary>
     [CommandRoute("POST", "/api/asset/save")]
     public class SaveAssetCommand : EditorCommand
@@ -335,18 +336,16 @@ namespace Freefall.Editor.Commands
             if (asset == null)
                 return CommandResult.NotFound($"Asset not found: {guid}");
 
+            // The asset's own file is the one the database tracks the GUID under. Not asset.AssetPath: a load by
+            // GUID leaves it empty, or holding the path the .asset was last saved with (stale for a copied or
+            // renamed file). And never a path made up from the name: that wrote a second file with the same
+            // GUID into the Assets root.
             string savePath = root.TryGetProperty("path", out var pp) ? pp.GetString() : null;
             if (string.IsNullOrEmpty(savePath))
-                savePath = asset.AssetPath;
+                savePath = AssetDatabase.GuidToFullPath(guid);
             if (string.IsNullOrEmpty(savePath))
-            {
-                var projectDir = Engine.Project?.AssetsDirectory;
-                if (string.IsNullOrEmpty(projectDir))
-                    return CommandResult.BadRequest("No save path: asset has no registered path and no project is open");
-
-                string ext = AssetManager.GetFileExtension(asset.GetType());
-                savePath = Path.Combine(projectDir, (asset.Name ?? "asset") + ext);
-            }
+                return CommandResult.BadRequest(
+                    $"'{asset.Name}' ({asset.GetType().Name}) has no source file of its own (a sub-asset of an imported file, or a built-in asset): pass 'path' to write it somewhere");
 
             try
             {
@@ -364,6 +363,35 @@ namespace Freefall.Editor.Commands
             {
                 return CommandResult.Error(500, $"Failed to save asset: {ex.Message}");
             }
+        }
+    }
+
+    /// <summary>
+    /// Open an asset in its custom editor tab, like a double-click in the asset browser.
+    /// POST /api/asset/open
+    /// Body: {"guid":"..."}
+    /// </summary>
+    [CommandRoute("POST", "/api/asset/open")]
+    public class OpenAssetCommand : EditorCommand
+    {
+        public override CommandResult Execute(CommandContext context)
+        {
+            if (string.IsNullOrEmpty(context.Body))
+                return CommandResult.BadRequest("Body required with 'guid'");
+
+            using var doc = context.ParseBody();
+            string guid = doc.RootElement.TryGetProperty("guid", out var gp) ? gp.GetString() : null;
+            if (string.IsNullOrEmpty(guid))
+                return CommandResult.BadRequest("'guid' is required");
+
+            var assetType = AssetDatabase.GetAssetType(guid);
+            if (assetType == null)
+                return CommandResult.NotFound($"Asset not found: {guid}");
+            if (CustomAssetEditorRegistry.Find(assetType) == null)
+                return CommandResult.BadRequest($"No custom editor for asset type '{assetType.Name}'");
+
+            Freefall.Base.MessageDispatcher.Send(Msg.OpenAssetInEditor, (guid, assetType));
+            return CommandResult.Json(new { status = "opened", guid, type = assetType.Name });
         }
     }
 

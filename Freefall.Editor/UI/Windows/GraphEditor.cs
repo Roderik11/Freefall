@@ -154,11 +154,13 @@ namespace Freefall.Editor
         {
             if (Graph == null) return;
 
-            // If the graph has an asset path, save in place
-            if (!string.IsNullOrEmpty(Graph.AssetPath))
+            // Save in place: a graph the asset database tracks goes to its source file (its AssetPath is empty
+            // or what the .asset was last saved with), one from the file dialogs to the file picked there
+            string savePath = AssetDatabase.GuidToFullPath(Graph.Guid) ?? Graph.AssetPath;
+            if (!string.IsNullOrEmpty(savePath))
             {
-                Freefall.Assets.AssetFile.Save(Graph.AssetPath, Graph);
-                Debug.Log($"[GraphEditor] Saved: {Graph.AssetPath}");
+                Freefall.Assets.AssetFile.Save(savePath, Graph);
+                Debug.Log($"[GraphEditor] Saved: {savePath}");
                 return;
             }
 
@@ -187,6 +189,8 @@ namespace Freefall.Editor
                     if (loaded is NodeGraph graph)
                     {
                         graph.AssetPath = dlg.FileName;
+                        // The Guid in the file is the one it was last saved with (a copy still names the original)
+                        graph.Guid = AssetDatabase.PathToGuid(AssetCreator.GetRelativePath(dlg.FileName));
                         graph.RebuildAfterLoad();
                         ResetCanvas(graph);
                         Debug.Log($"[GraphEditor] Loaded: {dlg.FileName} ({graph.Nodes.Count} nodes)");

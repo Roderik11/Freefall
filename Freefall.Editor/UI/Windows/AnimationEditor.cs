@@ -21,6 +21,12 @@ namespace Freefall.Editor
 
         private Animation.Animation _animation;
 
+        // The layer on the canvas: states and transitions are added to it
+        private AnimationLayer _layer;
+
+        // Layer rows of the side panel, to follow renames made in the inspector
+        private readonly List<(Button Button, AnimationLayer Layer)> _layerRows = new();
+
         public AnimationEditor()
         {
             Dock = DockStyle.Fill;
@@ -32,6 +38,8 @@ namespace Freefall.Editor
 
             EditorToolbar.Add(Toolbar, EditorSkin.IconSave, "Save", BtnSave_Click);
             EditorToolbar.AddSeparator(Toolbar);
+            EditorToolbar.Add(Toolbar, EditorSkin.IconPlus, "Layer", BtnAddLayer_Click)
+                .Tooltip = "Add a layer on top: it overrides the ones below, on the bones of its mask";
             EditorToolbar.Add(Toolbar, EditorSkin.IconPlus, "State", BtnAddState_Click);
             EditorToolbar.Add(Toolbar, EditorSkin.IconPlus, "Tree", BtnAddTree_Click);
             EditorToolbar.Add(Toolbar, EditorSkin.IconPlus, "Param", BtnAddParam_Click);
@@ -51,7 +59,7 @@ namespace Freefall.Editor
 
             // Parameter panel
             ParamScroll = new ScrollPanel();
-            ParamPanel = new Frame { Dock = DockStyle.Fill };
+            ParamPanel = new Frame { Dock = DockStyle.Top, AutoSize = AutoSize.Vertical };
             ParamScroll.Content.Controls.Add(ParamPanel);
             split.SplitFrame1.Controls.Add(ParamScroll);
 
@@ -74,7 +82,14 @@ namespace Freefall.Editor
         public void Open(Animation.Animation animation)
         {
             _animation = animation;
-            Canvas.SetAnimation(animation);
+            ShowLayer(animation != null && animation.Layers.Count > 0 ? animation.Layers[0] : null);
+        }
+
+        /// <summary>Put one layer on the canvas. States and transitions are added to the layer shown.</summary>
+        private void ShowLayer(AnimationLayer layer)
+        {
+            _layer = layer;
+            Canvas.SetAnimation(_animation, layer);
             RebuildParamPanel();
         }
 
@@ -86,10 +101,13 @@ namespace Freefall.Editor
         {
             if (_animation == null) return;
 
-            if (!string.IsNullOrEmpty(_animation.AssetPath))
+            // An animation the asset database tracks goes to its source file (its AssetPath is empty or what
+            // the .asset was last saved with), a new one to the file picked in the dialog below
+            string savePath = AssetDatabase.GuidToFullPath(_animation.Guid) ?? _animation.AssetPath;
+            if (!string.IsNullOrEmpty(savePath))
             {
-                AssetFile.Save(_animation.AssetPath, _animation);
-                Debug.Log($"[AnimEditor] Saved: {_animation.AssetPath}");
+                AssetFile.Save(savePath, _animation);
+                Debug.Log($"[AnimEditor] Saved: {savePath}");
                 return;
             }
 
@@ -168,8 +186,7 @@ namespace Freefall.Editor
             animation.Name = "PlayerAnimation";
 
             // Create animation layer
-            var layer = new AnimationLayer { Name = "Default" };
-            animation.Layers.Add(layer);
+            var layer = animation.AddLayer("Default");
 
             // Add states (assigns IDs automatically)
             animation.AddState(layer, blendTree);
@@ -242,8 +259,16 @@ namespace Freefall.Editor
             animation.Parameters.Add(new AnimationParameter("landing", isTrigger: true));
             animation.Parameters.Add(new AnimationParameter("falling", isTrigger: true));
 
-            Canvas.SetAnimation(animation);
-            RebuildParamPanel();
+            ShowLayer(layer);
+        }
+
+        private void BtnAddLayer_Click(Control sender, MouseEventArgs args)
+        {
+            GetOrCreateLayer(); // ensure animation exists
+
+            var layer = _animation.AddLayer($"Layer {_animation.Layers.Count}");
+            ShowLayer(layer);
+            Selector.SelectedObject = layer;
         }
 
         private void BtnAddTree_Click(Control sender, MouseEventArgs args)
@@ -275,39 +300,37 @@ namespace Freefall.Editor
             RebuildParamPanel();
         }
 
+        /// <summary>The layer on the canvas, creating the animation and its first layer when there is none.</summary>
         private AnimationLayer GetOrCreateLayer()
         {
-            if (_animation == null)
-            {
-                _animation = new Animation.Animation { Name = "New Animation" };
-                Canvas.SetAnimation(_animation);
-                RebuildParamPanel();
-            }
+            _animation ??= new Animation.Animation { Name = "New Animation" };
 
             if (_animation.Layers.Count == 0)
-                _animation.Layers.Add(new AnimationLayer { Name = "Default" });
-            return _animation.Layers[0];
+                _animation.AddLayer("Default");
+
+            if (_layer == null || !_animation.Layers.Contains(_layer))
+                ShowLayer(_animation.Layers[0]);
+
+            return _layer;
         }
 
         // ═══════════════════════════════════════════════════════
-        //  Parameter Panel
+        //  Side Panel: layers, parameters
         // ═══════════════════════════════════════════════════════
 
         private void RebuildParamPanel()
         {
             ParamPanel.Controls.Clear();
+            _layerRows.Clear();
 
             if (_animation == null) return;
 
-            var header = new Label
-            {
-                Text = "Parameters",
-                Style = "label",
-                Size = new Point(100, 22),
-                Dock = DockStyle.Top,
-                Margin = new Margin(4, 4, 4, 2)
-            };
-            ParamPanel.Controls.Add(header);
+            ParamPanel.Controls.Add(CreateHeader("Layers"));
+
+            foreach (var layer in _animation.Layers)
+                ParamPanel.Controls.Add(CreateLayerRow(layer));
+
+            ParamPanel.Controls.Add(CreateHeader("Parameters"));
 
             for (int i = 0; i < _animation.Parameters.Count; i++)
             {
@@ -315,6 +338,114 @@ namespace Freefall.Editor
                 var row = CreateParamRow(param, i);
                 ParamPanel.Controls.Add(row);
             }
+        }
+
+        private static Label CreateHeader(string text)
+        {
+            return new Label
+            {
+                Text = text,
+                Style = "label",
+                Size = new Point(100, 22),
+                Dock = DockStyle.Top,
+                Margin = new Margin(4, 4, 4, 2)
+            };
+        }
+
+        private static string LayerCaption(AnimationLayer layer)
+        {
+            string name = string.IsNullOrEmpty(layer.Name) ? "Layer" : layer.Name;
+            return layer.Mask != null ? $"{name}  [{layer.Mask.Name}]" : name;
+        }
+
+        /// <summary>
+        /// One layer: click to put it on the canvas and into the inspector (name, mask, parent influence).
+        /// The list is in evaluation order: a layer overrides the ones above it.
+        /// </summary>
+        private Frame CreateLayerRow(AnimationLayer layer)
+        {
+            var row = new Frame
+            {
+                Size = new Point(100, 24),
+                Dock = DockStyle.Top,
+                Margin = new Margin(2, 0, 2, 1),
+                Style = "frame"
+            };
+
+            var btnDelete = new Button
+            {
+                Text = "X",
+                Size = new Point(20, 20),
+                Dock = DockStyle.Right,
+                Style = "button",
+                Margin = new Margin(1),
+                Tooltip = "Delete the layer with its states"
+            };
+            btnDelete.MouseClick += (s, a) =>
+            {
+                _animation.RemoveLayer(layer);
+                if (ReferenceEquals(Selector.SelectedObject, layer))
+                    Selector.SelectedObject = null;
+
+                if (_layer == layer)
+                    ShowLayer(_animation.Layers.Count > 0 ? _animation.Layers[0] : null);
+                else
+                    RebuildParamPanel();
+            };
+            row.Controls.Add(btnDelete);
+
+            row.Controls.Add(CreateMoveButton(layer, "v", 1, "Evaluate later: overrides the layer below it in this list"));
+            row.Controls.Add(CreateMoveButton(layer, "^", -1, "Evaluate earlier"));
+
+            var btnSelect = new Button
+            {
+                Text = LayerCaption(layer),
+                Size = new Point(80, 20),
+                Dock = DockStyle.Fill,
+                Style = "item",
+                Checked = layer == _layer,
+                Margin = new Margin(1),
+                AutoEllipsis = true,
+                Tooltip = "Show this layer's states"
+            };
+            btnSelect.MouseClick += (s, a) =>
+            {
+                if (layer != _layer)
+                    ShowLayer(layer);
+                Selector.SelectedObject = layer;
+            };
+            row.Controls.Add(btnSelect);
+            _layerRows.Add((btnSelect, layer));
+
+            return row;
+        }
+
+        private Button CreateMoveButton(AnimationLayer layer, string text, int offset, string tooltip)
+        {
+            var button = new Button
+            {
+                Text = text,
+                Size = new Point(20, 20),
+                Dock = DockStyle.Right,
+                Style = "button",
+                Margin = new Margin(1),
+                Tooltip = tooltip
+            };
+            button.MouseClick += (s, a) =>
+            {
+                if (_animation.MoveLayer(layer, offset))
+                    RebuildParamPanel();
+            };
+            return button;
+        }
+
+        protected override void OnUpdate()
+        {
+            base.OnUpdate();
+
+            // Name and mask are edited in the inspector
+            foreach (var (button, layer) in _layerRows)
+                button.Text = LayerCaption(layer);
         }
 
         private Frame CreateParamRow(AnimationParameter param, int index)
@@ -444,6 +575,7 @@ namespace Freefall.Editor
         internal AnimStateNode WiringSource;
 
         private Animation.Animation _animation;
+        private AnimationLayer _layer;
 
         public AnimationCanvas(AnimationEditor editor)
         {
@@ -464,32 +596,33 @@ namespace Freefall.Editor
             Gui.MouseUp += Gui_MouseUp;
         }
 
-        public void SetAnimation(Animation.Animation animation)
+        /// <summary>
+        /// Show one layer of an animation: its states as nodes, and (through the nodes) its transitions.
+        /// </summary>
+        public void SetAnimation(Animation.Animation animation, AnimationLayer layer)
         {
             _animation = animation;
+            _layer = layer;
             Controls.Clear();
+            WiringSource = null;
 
             UIScale = 1;
             Size = maxSize;
             Position = Size / -2;
 
-            if (_animation == null) return;
+            if (_animation == null || _layer == null) return;
 
             var center = GetVisibleCenter();
 
-            // Create nodes for all states across all layers
-            foreach (var layer in _animation.Layers)
+            for (int i = 0; i < _layer.States.Count; i++)
             {
-                for (int i = 0; i < layer.States.Count; i++)
-                {
-                    var state = layer.States[i];
+                var state = _layer.States[i];
 
-                    // Auto-layout if no editor position set
-                    if (state.Position == Vector2.Zero)
-                        state.Position = center + new Vector2(i * 200, 300);
+                // Auto-layout if no editor position set
+                if (state.Position == Vector2.Zero)
+                    state.Position = center + new Vector2(i * 200, 300);
 
-                    AddStateNode(state);
-                }
+                AddStateNode(state);
             }
 
             // Open on the states, wherever on the canvas they were saved
@@ -517,7 +650,7 @@ namespace Freefall.Editor
 
         private void Canvas_MouseDown(Control sender, MouseEventArgs args)
         {
-            if (args.Button == 2) { StartDrag(); isDragging = true; }
+            if (args.Button == 2) { StartDrag(); isDragging = true; framedView = default; }
         }
 
         private void Canvas_MouseUp(Control sender, MouseEventArgs args)
@@ -611,6 +744,9 @@ namespace Freefall.Editor
 
         private bool framePending;
 
+        // The view size the states were last framed for, until the canvas is moved by hand
+        private Point framedView;
+
         /// <summary>
         /// Pan and zoom so all states are in view. Applied on the next update, once the canvas has its size.
         /// </summary>
@@ -623,6 +759,12 @@ namespace Freefall.Editor
         {
             base.OnUpdate();
 
+            // Framed for a view that has changed size since, with the canvas untouched: an asset opened while
+            // the tab was hidden is framed for the few pixels the hidden tab had. Frame it for the real size.
+            if (!framePending && framedView.x > 0 && Parent != null
+                && (Parent.Size.x != framedView.x || Parent.Size.y != framedView.y))
+                framePending = true;
+
             if (framePending)
             {
                 var nodes = new List<Control>();
@@ -630,7 +772,10 @@ namespace Freefall.Editor
                     if (ctrl is AnimStateNode) nodes.Add(ctrl);
 
                 if (CanvasDrawing.FrameNodes(this, maxSize, nodes))
+                {
                     framePending = false;
+                    framedView = Parent.Size;
+                }
             }
 
             if (isDragging) return;
@@ -646,6 +791,7 @@ namespace Freefall.Editor
 
             if (UIScale == oldScale) return;
             var ratio = UIScale / oldScale;
+            framedView = default; // zoomed by hand: keep this view
 
             if (Dock != DockStyle.None)
             {

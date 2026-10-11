@@ -367,14 +367,24 @@ namespace Freefall.Editor.Mcp
         public static Task<CallToolResult> GetSelection() => McpBridge.Get("/api/selection");
 
         [McpServerTool(Name = "selection_set", Title = "Set selection", Idempotent = true, OpenWorld = false)]
-        [Description("Select an entity by id or name (shows it in the inspector), or clear=true to deselect.")]
+        [Description("Select an entity by id or name (shows it in the inspector), or clear=true to deselect. " +
+                     "assetGuid selects an asset instead, to look at its inspector with screenshot target='editor'.")]
         public static async Task<CallToolResult> SetSelection(int? id = null, string? name = null, bool clear = false,
-            [Description(EntityRefs.UidHelp)] string? uid = null)
+            [Description(EntityRefs.UidHelp)] string? uid = null,
+            [Description("GUID of an asset to show in the inspector, instead of an entity")] string? assetGuid = null)
         {
             if (clear) return await McpBridge.Post("/api/selection", new { clear = true });
+            if (!string.IsNullOrEmpty(assetGuid)) return await McpBridge.Post("/api/selection", new { assetGuid });
             var (rid, err) = await EntityRefs.Resolve(id, uid, required: false);
             return err ?? await McpBridge.Post("/api/selection", new { id = rid, name });
         }
+
+        [McpServerTool(Name = "viewport_click", Title = "Click in the viewport", OpenWorld = false)]
+        [Description("Left-click a pixel of the scene viewport: selects the entity under it through the same GPU pick the mouse uses " +
+                     "(a prefab's root for one of its parts). Coordinates are viewport pixels, as in a screenshot with target='viewport' " +
+                     "at maxSize=0. The pick resolves a frame or two later: follow with selection_get.")]
+        public static Task<CallToolResult> ViewportClick(int x, int y)
+            => McpBridge.Post("/api/viewport/click", new { x, y });
 
         [McpServerTool(Name = "camera_get", Title = "Get editor camera", ReadOnly = true, OpenWorld = false)]
         [Description("Editor camera position, rotation, forward/up/right vectors, fov and clip planes.")]

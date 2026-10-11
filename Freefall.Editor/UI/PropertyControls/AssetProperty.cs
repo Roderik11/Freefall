@@ -12,6 +12,9 @@ namespace Freefall.Editor
         public Button Button { get; private set; }
         private readonly ImageControl thumbnail;
 
+        /// <summary>Shown while no asset is assigned, e.g. the default an empty slot falls back to.</summary>
+        public string EmptyText = "- None -";
+
         private Button ClearButton;
 
         public AssetProperty(GUIProperty property) : base(property)
@@ -47,7 +50,7 @@ namespace Freefall.Editor
                 property.SetValue(null);
                 thumbnail.Texture = AssetDatabase.GetThumbnail(string.Empty);
 
-                Button.Text = "- None -";
+                Button.Text = EmptyText;
             };
 
             //Controls.Add(ClearButton);
@@ -131,7 +134,7 @@ namespace Freefall.Editor
             {
                 Timer = 0;
                 var asset = property.GetValue() as Asset;
-                Button.Text = asset != null ? asset.Name : "- None -";
+                Button.Text = asset != null ? asset.Name : EmptyText;
             }
         }
     }

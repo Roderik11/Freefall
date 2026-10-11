@@ -57,6 +57,9 @@ namespace Freefall.Animation
         /// </summary>
         public Matrix4x4 RootDeltaTransform = Matrix4x4.Identity;
 
+        /// <summary>Per target bone: a finger or thumb bone (null when the map was not made from humanoid rigs).</summary>
+        public bool[] TargetIsFinger;
+
         /// <summary>Root bone index in source skeleton (for position retargeting).</summary>
         public int SourceRoot;
 
@@ -106,11 +109,18 @@ namespace Freefall.Animation
         /// <summary>
         /// Create a BoneMap from explicit bone pairs.
         /// Each pair is (sourceBoneIndex, targetBoneIndex).
+        /// <paramref name="bindOrientedTargets"/> are target bones that follow the source's
+        /// motion but keep their own bind orientation (face bones: a jaw has no direction
+        /// that means the same thing in two rigs, so aligning it deforms the face).
+        /// <paramref name="poseMatchedTargets"/> are target bones whose bind pose is aligned to the
+        /// source's in full, however small the difference (fingers: see the deadband below).
         /// </summary>
         public static BoneMap Create(Skeleton source, Skeleton target,
             ReadOnlySpan<(int src, int dst)> pairs,
             int sourceRoot = 0, int targetRoot = 0,
-            ReadOnlySpan<TwistHint> twistHints = default)
+            ReadOnlySpan<TwistHint> twistHints = default,
+            ReadOnlySpan<int> bindOrientedTargets = default,
+            ReadOnlySpan<int> poseMatchedTargets = default)
         {
             var map = new BoneMap
             {
@@ -188,13 +198,23 @@ namespace Freefall.Animation
             var dirLog = new System.Text.StringBuilder();
             dirLog.AppendLine($"[TPose] {source.Name} → {target.Name}");
 
+            var bindOriented = new bool[target.Bones.Length];
+            foreach (int bone in bindOrientedTargets)
+                if (bone >= 0 && bone < bindOriented.Length)
+                    bindOriented[bone] = true;
+
+            var poseMatched = new bool[target.Bones.Length];
+            foreach (int bone in poseMatchedTargets)
+                if (bone >= 0 && bone < poseMatched.Length)
+                    poseMatched[bone] = true;
+
             for (int i = 0; i < target.Bones.Length; i++)
             {
                 int parentIdx = target.Bones[i].Parent;
                 var parentTPose = parentIdx >= 0 ? tposeModel[parentIdx] : Quaternion.Identity;
 
                 int srcIdx = map.TargetToSource[i];
-                if (srcIdx >= 0)
+                if (srcIdx >= 0 && !bindOriented[i])
                 {
                     var srcDir = GetBoneDirection(source, map.SrcBindModelPos, srcIdx);
                     var dstDir = GetBoneDirection(target, map.DstBindModelPos, i);
@@ -241,7 +261,15 @@ namespace Freefall.Animation
                     // correction in so only genuine pose mismatches (A-pose vs
                     // T-pose arms) are corrected and the target keeps its own
                     // proportions below the deadband.
-                    float fade = Math.Clamp((angle - CorrectionDeadbandDeg) / CorrectionFadeDeg, 0f, 1f);
+                    //
+                    // Not for fingers. How far a rig's fingers are curled or its palm is
+                    // rolled in the bind pose is pose, not build, and the hand above them is
+                    // corrected in full: a finger bone left alone, or corrected in part, ends
+                    // up rolled against the palm and against the next bone (thumb segments
+                    // each twisted differently, finger bases 30° off the knuckle line).
+                    float fade = poseMatched[i]
+                        ? 1f
+                        : Math.Clamp((angle - CorrectionDeadbandDeg) / CorrectionFadeDeg, 0f, 1f);
                     if (fade < 1f)
                         correction = Quaternion.Slerp(Quaternion.Identity, correction, fade);
 
@@ -255,7 +283,7 @@ namespace Freefall.Animation
                 }
                 else
                 {
-                    // Unmapped: cascade from parent's T-pose + own bind local
+                    // Unmapped or bind-oriented: cascade from parent's T-pose + own bind local
                     tposeModel[i] = Quaternion.Normalize(
                         parentTPose * target.Bones[i].BindPose.Rotation);
                 }
