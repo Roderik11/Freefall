@@ -249,11 +249,28 @@ namespace Freefall.Components
         [Freefall.Reflection.DontSerialize]
         public Vector2 HeadLook { get; set; }
 
+        /// <summary>
+        /// The share of <see cref="TorsoAim"/>'s turn to the side that the hips take, 0..1: with
+        /// the feet where they are a body turns in the hips as well, not at the waist alone. The
+        /// legs keep their place and the spine turns by that much less, so the shoulders point
+        /// where they are asked to either way. See <see cref="AnimationLayer.HipsFollow"/> for the
+        /// same on a masked layer.
+        /// </summary>
+        [Freefall.Reflection.DontSerialize]
+        public float TorsoAimHips { get; set; }
+
+        /// <summary>The most the hips are turned against the legs by aim and layers together, in radians.</summary>
+        private const float MaxHipsTurn = 0.5f;
+
+        // What the masked layers of the pose built last ask the hips to come round by (HipsFollow)
+        private float _layerHipsTurn;
+
         // Per bone of a skeleton, its share of TorsoAim and of HeadLook (0 for all but the spine,
-        // the neck and the head)
+        // the neck and the head), and the bones a turn of the hips involves
         private sealed class AimChain
         {
             public float[] Torso, Head;
+            public int Hips = -1, LeftLeg = -1, RightLeg = -1;
         }
 
         private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<Skeleton, AimChain> s_aimChains = new();
@@ -277,6 +294,16 @@ namespace Freefall.Components
 
             Share(humanoid, chain.Torso, HumanoidBone.Spine, HumanoidBone.Chest, HumanoidBone.UpperChest);
             Share(humanoid, chain.Head, HumanoidBone.Neck, HumanoidBone.Head);
+
+            // The hips can only take a turn where the legs can give it back
+            if (humanoid.TryGetValue(HumanoidBone.Hips, out int hips)
+                && humanoid.TryGetValue(HumanoidBone.LeftUpperLeg, out int leftLeg)
+                && humanoid.TryGetValue(HumanoidBone.RightUpperLeg, out int rightLeg))
+            {
+                chain.Hips = hips;
+                chain.LeftLeg = leftLeg;
+                chain.RightLeg = rightLeg;
+            }
             return chain;
         });
 
@@ -649,6 +676,9 @@ namespace Freefall.Components
             public bool ModelSpace;
             public float ParentInfluence;
 
+            /// <summary>The share of the layer's turn the hips take (AnimationLayer.HipsFollow), for ModelSpace.</summary>
+            public float HipsFollow;
+
             /// <summary>The state the layer plays. A transition changes it at once; the pose follows over time.</summary>
             public AnimationState State;
 
@@ -711,6 +741,7 @@ namespace Freefall.Components
         private bool PrepareLayers(PoseState state, Skeleton skeleton)
         {
             _pose = state;
+            _layerHipsTurn = 0f;
 
             var layers = Animation.Layers;
             if (state.Layers.Length != layers.Count)
@@ -741,6 +772,7 @@ namespace Freefall.Components
                 pose.MaskChain = mask?.Chain;
                 pose.ParentInfluence = Math.Clamp(layer.ParentInfluence, 0f, 1f);
                 pose.ModelSpace = mask != null && pose.ParentInfluence < 1f;
+                pose.HipsFollow = pose.ModelSpace ? Math.Clamp(layer.HipsFollow, 0f, 1f) : 0f;
 
                 pose.State = layer.GetCurrent(Playback);
                 pose.Fade = layer.GetFade(Playback);
@@ -923,6 +955,17 @@ namespace Freefall.Components
                         ? layer.ModelRot[parent] * pose.Rotation
                         : pose.Rotation;
 
+                    // The hips of the layer's own pose against the hips the body below has: how
+                    // far the layer's upper body is turned on the legs, about the vertical. The
+                    // hips come round by a share of it when the pose goes up the hierarchy.
+                    if (boneIndex == _pose.RootBone && posed && layer.HipsFollow > 0f && coverage > 0f)
+                    {
+                        var have = parent >= 0 ? modelRot[parent] * blendPose.Rotation : blendPose.Rotation;
+                        var apart = layer.ModelRot[boneIndex] * Quaternion.Inverse(have);
+                        if (apart.W < 0f) apart = -apart;
+                        _layerHipsTurn += 2f * MathF.Atan2(apart.Y, apart.W) * layer.HipsFollow * layer.Weight * coverage;
+                    }
+
                     if (!chainOnly && posed)
                     {
                         var modelLocal = parent >= 0
@@ -1070,9 +1113,16 @@ namespace Freefall.Components
             // Up the hierarchy into model space. Where the upper body or the head is asked to face
             // another way, the bones of the spine and neck are turned as they are reached, each by
             // its share: what hangs on them comes round with them.
+            //
+            // The hips take a share of a turn to the side: of the aim's (TorsoAimHips) and of what a
+            // masked layer is turned by against the legs (AnimationLayer.HipsFollow). The thighs
+            // turn back by as much, so the legs stay where they are, and the spine turns by that
+            // much less along its length, so the shoulders end up where they would anyway.
             var torsoAim = TorsoAim;
             var headLook = HeadLook;
-            var aim = torsoAim != Vector2.Zero || headLook != Vector2.Zero ? AimChainOf(target) : null;
+            float hipsTurn = Math.Clamp(torsoAim.X * Math.Clamp(TorsoAimHips, 0f, 1f) + _layerHipsTurn, -MaxHipsTurn, MaxHipsTurn);
+            var aim = torsoAim != Vector2.Zero || headLook != Vector2.Zero || hipsTurn != 0f ? AimChainOf(target) : null;
+            if (aim != null && aim.Hips < 0) hipsTurn = 0f;
             float aimedYaw = 0f;
 
             for (int i = 0; i < count; i++)
@@ -1082,10 +1132,25 @@ namespace Freefall.Components
 
                 if (aim == null) continue;
 
+                if (hipsTurn != 0f)
+                {
+                    if (i == aim.Hips)
+                    {
+                        TurnInModelSpace(ref bones[i], hipsTurn, 0f, 0f, flipXZ);
+                        aimedYaw += hipsTurn;
+                        continue;
+                    }
+                    if (i == aim.LeftLeg || i == aim.RightLeg)
+                    {
+                        TurnInModelSpace(ref bones[i], -hipsTurn, 0f, 0f, flipXZ);
+                        continue;
+                    }
+                }
+
                 float torso = aim.Torso[i], head = aim.Head[i];
                 if (torso == 0f && head == 0f) continue;
 
-                float yaw = torsoAim.X * torso + headLook.X * head;
+                float yaw = (torsoAim.X - hipsTurn) * torso + headLook.X * head;
                 float pitch = torsoAim.Y * torso + headLook.Y * head;
                 TurnInModelSpace(ref bones[i], yaw, pitch, aimedYaw, flipXZ);
                 aimedYaw += yaw;

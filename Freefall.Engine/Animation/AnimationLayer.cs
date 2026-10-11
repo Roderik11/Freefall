@@ -35,6 +35,16 @@ namespace Freefall.Animation
         /// </summary>
         public float ParentInfluence = 1f;
 
+        /// <summary>
+        /// How far the hips come round with the layer, 0..1: this share of the turn, about the
+        /// vertical, between the hips of the layer's own pose and the hips the body below has.
+        /// A layer that keeps its orientation over legs doing something else (an attack over a
+        /// walk) otherwise twists the body at the waist alone. The legs keep their place and the
+        /// spine gives the turn back along its length, so what the layer poses ends up where it
+        /// would anyway. Only used with a <see cref="Mask"/> and <see cref="ParentInfluence"/> below 1.
+        /// </summary>
+        public float HipsFollow;
+
         // States and transitions are edited on the animation editor's canvas, not as lists
         [System.ComponentModel.Browsable(false)]
         public List<AnimationState> States = new List<AnimationState>();
