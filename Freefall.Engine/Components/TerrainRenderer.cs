@@ -524,9 +524,13 @@ namespace Freefall.Components
                 if (heights != null && Terrain != null)
                 {
                     Terrain.SetHeightField(heights);
+                    _heightsReadBack = true;
                     // Surface-snapped geometry (RuntimeMesh) and projected PCG output sampled the old heights —
                     // let whatever lies in the changed region rebuild
                     var change = new TerrainHeightsChange(Terrain, _heightChangeAll, _heightChangeMin, _heightChangeMax);
+                    Debug.Log($"[Terrain] Heights read back (tick {Engine.TickCount}): " +
+                              (change.All ? "all" : $"x {change.Min.X:0}..{change.Max.X:0}, z {change.Min.Y:0}..{change.Max.Y:0}") +
+                              $", {System.Threading.Volatile.Read(ref _heightBakesPending)} bake(s) pending");
 
                     // A bake that is enqueued but has not run yet (at load: this readback is of the cached
                     // heightmap) still owes its region to the readback that follows it.
@@ -2319,6 +2323,22 @@ namespace Freefall.Components
         // ── Changed region ──
         // Listeners of TerrainHeightsChanged (PCG, surface meshes) only rebuild if they touch the region the
         // stamps changed: where each edited stamp was at the last readback, plus where it is now.
+
+        /// <summary>
+        /// The CPU height field is missing or about to be replaced: a height bake or its readback is still
+        /// outstanding. Whatever samples heights now (PCG graphs) gets flat ground or values that change in
+        /// a frame or two; TerrainHeightsChanged follows once they are in.
+        /// </summary>
+        [System.ComponentModel.Browsable(false)]
+        public bool HeightsPending
+            => Enabled && Terrain != null
+            && (Terrain.HeightField == null || !_heightsReadBack || _needHeightFieldReadback
+                || System.Threading.Volatile.Read(ref _heightBakesPending) > 0
+                || Terrain.NeedsUpdate(TerrainDirtyFlags.HeightBake));
+
+        // This renderer has read heights back at least once. Until then a Terrain asset still cached from the
+        // scene before a reload looks ready, although this renderer's first readback is yet to come.
+        private bool _heightsReadBack;
 
         private readonly Dictionary<TerrainStamp, (Vector2 min, Vector2 max)> _stampRegions = new();
         private bool _heightChangeAll = true;   // the first bake covers everything

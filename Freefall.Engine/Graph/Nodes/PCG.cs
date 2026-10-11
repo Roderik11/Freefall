@@ -306,7 +306,8 @@ namespace Freefall.PCG
     /// <summary>
     /// Removes points that fall inside (the XZ footprint of) scene geometry: buildings, props, trees.
     /// Flat or huge renderers (street floors, pavement blocks, terrain-sized meshes, long walls whose AABB
-    /// spans half the map) are ignored via MinHeight / MaxFootprint, as is this PCG component's own output.
+    /// spans half the map) are ignored via MinHeight / MaxFootprint, as is this PCG component's own output
+    /// and the output of PCG components that run after it (see PCGComponent.Sees).
     /// </summary>
     [Category("Filter")]
     public class ExcludeObstacles : Node, IWorldSpaceNode
@@ -337,6 +338,10 @@ namespace Freefall.PCG
         [Browsable(false)]
         public Entity IgnoreRoot;
 
+        /// <summary>The executing PCGComponent: decides which generated output counts. Injected before execution.</summary>
+        [Browsable(false)] [Freefall.Reflection.DontSerialize]
+        public PCGComponent Owner;
+
         public override void Process()
         {
             var points = GetInputValue<SamplePointSet>("Input");
@@ -346,6 +351,19 @@ namespace Freefall.PCG
                 return;
             }
 
+            // World positions once, and the area they cover: only obstacles reaching into it matter
+            var m = WorldMatrix;
+            var world = new Vector3[points.Count];
+            var areaMin = new Vector2(float.MaxValue);
+            var areaMax = new Vector2(float.MinValue);
+            for (int i = 0; i < world.Length; i++)
+            {
+                world[i] = Vector3.Transform(points.position[i], m);
+                var xz = new Vector2(world[i].X, world[i].Z);
+                areaMin = Vector2.Min(areaMin, xz);
+                areaMax = Vector2.Max(areaMax, xz);
+            }
+
             var boxes = new List<Vector4>(); // minX, minZ, maxX, maxZ
             foreach (var renderer in ComponentCache<MeshRenderer>.All)
             {
@@ -353,7 +371,7 @@ namespace Freefall.PCG
                 if (IsUnder(mr.Entity, IgnoreRoot)) continue;
 
                 var bb = mesh.BoundingBox;
-                var world = mr.Entity.Transform.WorldMatrix;
+                var transform = mr.Entity.Transform.WorldMatrix;
                 var min = new Vector3(float.MaxValue);
                 var max = new Vector3(float.MinValue);
                 for (int c = 0; c < 8; c++)
@@ -361,20 +379,26 @@ namespace Freefall.PCG
                     var corner = new Vector3((c & 1) != 0 ? bb.Max.X : bb.Min.X,
                                              (c & 2) != 0 ? bb.Max.Y : bb.Min.Y,
                                              (c & 4) != 0 ? bb.Max.Z : bb.Min.Z);
-                    var p = Vector3.Transform(corner, world);
+                    var p = Vector3.Transform(corner, transform);
                     min = Vector3.Min(min, p);
                     max = Vector3.Max(max, p);
                 }
 
                 if (max.Y - min.Y < MinHeight) continue;
                 if ((max.X - min.X) * (max.Z - min.Z) > MaxFootprint) continue;
-                boxes.Add(new Vector4(min.X - Margin, min.Z - Margin, max.X + Margin, max.Z + Margin));
+
+                var box = new Vector4(min.X - Margin, min.Z - Margin, max.X + Margin, max.Z + Margin);
+                if (box.Z < areaMin.X || box.X > areaMax.X || box.W < areaMin.Y || box.Y > areaMax.Y) continue;
+
+                // Output of PCG components that run after this one does not count, even while it is in the scene
+                if (Owner != null && !Owner.Sees(mr.Entity)) continue;
+
+                boxes.Add(box);
             }
 
-            var m = WorldMatrix;
             SetOutput("Output", points.Filter(i =>
             {
-                var p = Vector3.Transform(points.position[i], m);
+                var p = world[i];
                 foreach (var b in boxes)
                     if (p.X >= b.X && p.X <= b.Z && p.Z >= b.Y && p.Z <= b.W) return false;
                 return true;

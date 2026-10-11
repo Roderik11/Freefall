@@ -51,6 +51,10 @@ namespace Freefall.PCG
         [Browsable(false)]
         public Entity IgnoreRoot;
 
+        /// <summary>The executing PCGComponent: decides which generated output counts. Injected before execution.</summary>
+        [Browsable(false)] [Freefall.Reflection.DontSerialize]
+        public PCGComponent Owner;
+
         [Output]
         public SamplePointSet Output;
 
@@ -177,6 +181,9 @@ namespace Freefall.PCG
 
                 var worldM = entity.Transform.WorldMatrix;
                 if (!Overlaps(mesh.BoundingBox.Min, mesh.BoundingBox.Max, worldM, min, max)) continue;
+
+                // Output of PCG components that run after this one does not count, even while it is in the scene
+                if (Owner != null && !Owner.Sees(entity)) continue;
 
                 var wp = new Vector3[pos.Length];
                 for (int v = 0; v < pos.Length; v++) wp[v] = Vector3.Transform(pos[v], worldM);

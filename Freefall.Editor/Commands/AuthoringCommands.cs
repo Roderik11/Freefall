@@ -394,23 +394,34 @@ namespace Freefall.Editor.Commands
                 if (doc.RootElement.TryGetProperty("id", out var idEl) && idEl.ValueKind == JsonValueKind.Number) id = idEl.GetInt32();
             }
 
-            var entities = id.HasValue
-                ? new[] { CommandHelpers.FindEntityById(id.Value) ?? throw new InvalidOperationException($"Entity {id} not found") }
-                : EntityManager.Entities.Where(e => e.Components.OfType<PCGComponent>().Any()).ToArray();
-
             var runs = new List<object>();
-            var sw = System.Diagnostics.Stopwatch.StartNew();
-            foreach (var e in entities)
+            void Report(PCGComponent pcg, double ms)
             {
-                foreach (var pcg in e.Components.OfType<PCGComponent>())
+                var e = pcg.Entity;
+                runs.Add(new { id = e.Id, uid = e.UID.ToString(), name = e.Name, graph = pcg.Graph?.Name, spawned = AuthoringHelpers.CountSpawned(e), ms = Math.Round(ms, 1) });
+            }
+
+            if (id.HasValue)
+            {
+                var entity = CommandHelpers.FindEntityById(id.Value) ?? throw new InvalidOperationException($"Entity {id} not found");
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                foreach (var pcg in entity.Components.OfType<PCGComponent>())
                 {
                     var t0 = sw.Elapsed.TotalMilliseconds;
                     pcg.Execute();
-                    runs.Add(new { id = e.Id, uid = e.UID.ToString(), name = e.Name, graph = pcg.Graph?.Name, spawned = AuthoringHelpers.CountSpawned(e), ms = Math.Round(sw.Elapsed.TotalMilliseconds - t0, 1) });
+                    Report(pcg, sw.Elapsed.TotalMilliseconds - t0);
                 }
             }
+            else
+            {
+                // All of them, in the scheduler's order: every component runs once, after what it depends on
+                Freefall.PCG.PCGScheduler.ExecuteAll(Report);
+            }
+
             if (runs.Count == 0) return CommandResult.NotFound("No PCGComponent found");
-            return CommandResult.Json(new { count = runs.Count, runs });
+
+            // A run can queue later components that kept clear of the old output; they regenerate next frame
+            return CommandResult.Json(new { count = runs.Count, pending = Freefall.PCG.PCGScheduler.PendingCount, runs });
         }
     }
 
