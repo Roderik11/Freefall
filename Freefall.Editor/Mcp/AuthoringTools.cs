@@ -120,6 +120,16 @@ namespace Freefall.Editor.Mcp
             return err ?? await McpBridge.Post($"/api/entity/{rid}/removecomponent", new { type });
         }
 
+        [McpServerTool(Name = "entity_unpack", Title = "Unpack prefab instance", Destructive = true, OpenWorld = false)]
+        [Description("Turn a prefab instance (and everything under it) into plain entities, like the Explorer's 'Unpack'. " +
+                     "A prefab instance is saved as a reference to its prefab plus a transform: a component added to it, or a value " +
+                     "changed on it, is gone after the next scene load (and Play saves and reloads). Unpack an instance before adding to it.")]
+        public static async Task<CallToolResult> UnpackEntity(int? id = null, [Description(EntityRefs.UidHelp)] string? uid = null)
+        {
+            var (rid, err) = await EntityRefs.Resolve(id, uid);
+            return err ?? await McpBridge.Post($"/api/entity/{rid}/unpack", new { });
+        }
+
         [McpServerTool(Name = "prefab_measure", Title = "Measure prefabs", ReadOnly = true, OpenWorld = false)]
         [Description("Bounds (min/max/size, relative to the prefab pivot at the origin) of one or more prefabs without placing them in the scene. " +
                      "Use before choosing scale ranges for PCG spawners or placing modular pieces; empty=true means the prefab renders nothing.")]

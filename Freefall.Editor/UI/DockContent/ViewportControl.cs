@@ -8,7 +8,65 @@ using Freefall.Assets;
 
 namespace Freefall.Editor
 {
-    public class InnerViewport : ImageControl { }
+    public class InnerViewport : ImageControl
+    {
+        /// <summary>The view this control shows: marks are drawn only over the one the main camera renders to.</summary>
+        public RenderView View;
+
+        private const string OverlayFont = "overlay_text";
+        private static bool _overlayFontReady;
+        private readonly List<Overlay.Mark> _marks = new();
+
+        /// <summary>
+        /// Over the picture: what game code asked for this frame through Freefall.Graphics.Overlay
+        /// (a crosshair, a prompt). The game has no UI of its own yet, so in play mode this is
+        /// where it shows.
+        /// </summary>
+        protected override void DrawStyle(Style style, float opacity)
+        {
+            base.DrawStyle(style, opacity);
+
+            if (View == null || Camera.Main?.Target != View) return;
+
+            _marks.Clear();
+            Overlay.CopyTo(_marks);
+            if (_marks.Count == 0) return;
+
+            var renderer = Gui.Renderer;
+            var at = Location;
+            var size = Size;
+            int font = -1;
+
+            foreach (var mark in _marks)
+            {
+                int x = at.x + (int)MathF.Round(mark.Anchor.X * size.x + mark.Offset.X);
+                int y = at.y + (int)MathF.Round(mark.Anchor.Y * size.y + mark.Offset.Y);
+                int color = ColorInt.ARGB(mark.Color.W * opacity, mark.Color.X, mark.Color.Y, mark.Color.Z);
+
+                if (mark.Text == null)
+                {
+                    renderer.DrawBox(x, y, Math.Max(1, (int)MathF.Round(mark.Size.X)), Math.Max(1, (int)MathF.Round(mark.Size.Y)), color);
+                    continue;
+                }
+
+                if (font < 0)
+                {
+                    if (!_overlayFontReady && renderer is SquidRenderer squid)
+                    {
+                        squid.RegisterRuntimeFont(OverlayFont, "Roboto/Roboto-Medium.ttf", pixelSize: 18);
+                        _overlayFontReady = true;
+                    }
+                    font = renderer.GetFont(_overlayFontReady ? OverlayFont : "roboto_regular_10");
+                }
+
+                // Centred on the point, with a dark copy underneath so it reads on any ground
+                var extent = renderer.GetTextSize(mark.Text, font);
+                int left = x - extent.x / 2;
+                renderer.DrawText(mark.Text, left + 1, y + 1, font, ColorInt.ARGB(0.75f * mark.Color.W * opacity, 0f, 0f, 0f));
+                renderer.DrawText(mark.Text, left, y, font, color);
+            }
+        }
+    }
 
     public class ViewportControl : Frame
     {
@@ -49,6 +107,7 @@ namespace Freefall.Editor
             View = new RenderView(w, h, Engine.Device);
             View.Pipeline = new DeferredRenderer();
             View.Pipeline.Initialize(w, h);
+            image.View = View;
 
             // Register the BackBuffer texture in Squid (Apex: rend.InsertTexture(textureId, View.BackBufferTexture))
             var renderer = Gui.Renderer as SquidRenderer;

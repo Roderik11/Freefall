@@ -92,6 +92,7 @@ namespace Freefall.Graphics
         private GraphicsBuffer? _normalReadback;
         private int _pickRequestX = -1;
         private int _pickRequestY = -1;
+        private Animator? _pickSeeThrough;
         private bool _pickResultReady;
         private bool _pickCopyPending;
         
@@ -445,6 +446,12 @@ namespace Freefall.Graphics
              Transition(list, EntityIdBuffer.Native, fromState, ResourceStates.RenderTarget);
              Transition(list, HeightBuffer.Native, fromState, ResourceStates.RenderTarget);
              Transition(list, Depth.Native, depthFromState, ResourceStates.DepthWrite);
+
+             // A pick asked for this frame that sees through a character: its skin leaves that pixel open.
+             // Read here, not in RequestPick: the bone buffers' indices are those of the frame being drawn.
+             bool pickHole = _pickRequestX >= 0 && _pickSeeThrough != null;
+             camera.PickHolePixel = pickHole ? new Vector2(_pickRequestX + 0.5f, _pickRequestY + 0.5f) : Vector2.Zero;
+             camera.PickHoleBones = pickHole ? _pickSeeThrough!.BoneBufferIndices() : default;
 
              // Set shader parameters globally on all effects (Apex pattern)
              camera.SetShaderParams();
@@ -1038,6 +1045,7 @@ namespace Freefall.Graphics
                   _readbackPixelY = _pickRequestY;
                   _pickCopyPending = true;
                   _pickRequestX = -1;
+                  _pickSeeThrough = null;
               }
               else
               {
@@ -1098,10 +1106,17 @@ namespace Freefall.Graphics
         /// Request entity ID readback at the specified pixel coordinate.
         /// Result is available next frame via GetPickedEntityId.
         /// </summary>
-        public void RequestPick(int x, int y)
+        /// <param name="seeThrough">
+        /// A character whose skin leaves the picked pixel open in the frame it is read from
+        /// (gbuffer_skinned's pick hole), so the pick gets what is behind it: the player's own, for
+        /// a crosshair that its back or head is in the way of. That one pixel, that one character;
+        /// what it holds in its hands (not skinned) still counts.
+        /// </param>
+        public void RequestPick(int x, int y, Animator? seeThrough = null)
         {
             _pickRequestX = x;
             _pickRequestY = y;
+            _pickSeeThrough = seeThrough;
             _pickResultReady = false;
         }
 
@@ -1158,8 +1173,21 @@ namespace Freefall.Graphics
             PickedPixelX = _readbackPixelX;
             PickedPixelY = _readbackPixelY;
 
-            return packed >> 8;                       // upper 24 bits = entity ID
+            PickedEntitySlot = packed >> 8;           // upper 24 bits = entity ID
+            PickSerial++;
+            return PickedEntitySlot;
         }
+
+        /// <summary>
+        /// The TransformSlot read by the last <see cref="GetPickedEntityId"/> (0 = none), kept with
+        /// the pixel, depth and normal it came with. A result can only be taken once, so when two
+        /// ask (the editor's viewport and a game script in play mode) the one that comes second
+        /// reads it here, and tells by <see cref="PickSerial"/> that it is a new one.
+        /// </summary>
+        public uint PickedEntitySlot { get; private set; }
+
+        /// <summary>Counts the pick results taken so far.</summary>
+        public int PickSerial { get; private set; }
 
         /// <summary>MeshPart index from the last pick result.</summary>
         public uint PickedMeshPartId { get; private set; }

@@ -40,6 +40,11 @@ cbuffer SceneConstants : register(b0)
     float CloudShadowStrength;         // 0 = no cloud shadows, 1 = dense cloud blocks the sun completely
     uint CloudNoiseLUTIdx;             // bindless index of the 3D cloud noise LUT (0 = none)
     float CloudShadowScale;            // shadow pattern is this many times smaller than the visible clouds (1 = matching, km-sized)
+
+    // ── Pick hole (set per view by DeferredRenderer from RequestPick's seeThrough) ──
+    float2 PickPixel;                  // centre of the pixel the pick reads this frame
+    float2 _pickPad;
+    uint4 PickThroughBones;            // bone buffers (InstanceDescriptor.BoneBufferIdx) of the one character that leaves that pixel open; 0 = unused
 }
 
 // Material data for bindless texture lookup via Material ID indirection

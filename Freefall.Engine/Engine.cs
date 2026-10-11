@@ -205,6 +205,7 @@ namespace Freefall
             
             // Update Logic
             var _updateSw = System.Diagnostics.Stopwatch.StartNew();
+            Graphics.Overlay.Clear();   // what game code draws over the picture lasts one frame
             try
             {
                 Update();

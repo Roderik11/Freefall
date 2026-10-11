@@ -554,6 +554,23 @@ namespace Freefall.Components
         }
 
         /// <summary>
+        /// The bone buffer indices this character's renderers draw with in the current frame: what
+        /// a shader can tell its skin by (InstanceDescriptor.BoneBufferIdx). One per skeleton among
+        /// its parts, the first four; 0 = none.
+        /// </summary>
+        internal Vortice.Mathematics.Int4 BoneBufferIndices()
+        {
+            Span<int> found = stackalloc int[4];
+            int count = 0;
+            foreach (var entry in _boneBuffers.Values)
+            {
+                if (count == found.Length) break;
+                found[count++] = (int)entry.Buffer.SrvIndex;
+            }
+            return new Vortice.Mathematics.Int4(found[0], found[1], found[2], found[3]);
+        }
+
+        /// <summary>
         /// Get or create a bone buffer for a Skeleton. Lazily allocated.
         /// </summary>
         private BoneBufferEntry EnsureBoneBuffer(Skeleton skeleton)

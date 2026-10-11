@@ -57,6 +57,7 @@ struct VSOutput
     float Depth : TEXCOORD3;
     nointerpolation uint TransformSlot : TEXCOORD4;
     nointerpolation uint MeshPartIdx : TEXCOORD5;
+    nointerpolation uint PickThrough : TEXCOORD6;   // 1 = part of the character the pick sees through (see PS)
 };
 
 
@@ -154,6 +155,9 @@ VSOutput VS(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_InstanceI
     output.Depth = output.Position.w; // View-space Z (linear)
     output.TransformSlot = slot;
     output.MeshPartIdx = desc.MeshPartIdx;
+
+    // All parts of one character draw with its animator's bone buffer, which is what tells it apart
+    output.PickThrough = desc.BoneBufferIdx != 0u && any(PickThroughBones == desc.BoneBufferIdx) ? 1u : 0u;
     return output;
 }
 
@@ -263,6 +267,13 @@ PSOutput PS(VSOutput input)
     // Alpha test: hair, beard and eyebrow cards, torn cloth, visor slits. An albedo whose alpha channel holds
     // something else than opacity (a mask) must be imported with IgnoreAlpha, or it gets holes here.
     clip(color.a - 0.25f);
+
+    // The pick hole: the one pixel a game reads its aim from (the crosshair) is left open by the
+    // character the pick was asked to see through, the player's own. What is behind then shows in
+    // all targets of that pixel, so the pick gets the entity, depth and normal of what the
+    // crosshair is really on.
+    if (input.PickThrough != 0u && all(abs(input.Position.xy - PickPixel) < 0.5f))
+        discard;
 
     // PBR material properties — defaults for meshes without PBR textures
     float roughness = 0.65;

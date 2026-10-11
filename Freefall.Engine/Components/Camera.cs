@@ -112,6 +112,14 @@ namespace Freefall.Components
         }
         
         /// <summary>
+        /// The pick hole of the frame about to be drawn, set by the renderer before SetShaderParams
+        /// (see DeferredRenderer.RequestPick): the centre of the picked pixel and the bone buffers
+        /// of the character that leaves it open. All 0 = none.
+        /// </summary>
+        internal Vector2 PickHolePixel;
+        internal Int4 PickHoleBones;
+
+        /// <summary>
         /// Set shader parameters globally on all effects (Apex pattern).
         /// Called by DeferredRenderer before rendering.
         /// </summary>
@@ -141,6 +149,8 @@ namespace Freefall.Components
                 pair.Value.SetParameter("FogDensity", Engine.Settings.FogDensity);
                 pair.Value.SetParameter("FogSunDirection", SkyboxRenderer.CurrentSunDirection);
                 pair.Value.SetParameter("CamPos", cameraPos);
+                pair.Value.SetParameter("PickPixel", PickHolePixel);
+                pair.Value.SetParameter("PickThroughBones", PickHoleBones);
 
                 // Atmosphere scattering parameters
                 pair.Value.SetParameter("SkyTintColor", SkyboxRenderer.CurrentSkyTintColor);

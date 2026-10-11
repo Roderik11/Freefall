@@ -579,6 +579,40 @@ namespace Freefall.Editor.Commands
         }
     }
 
+    /// <summary>
+    /// POST /api/entity/{id}/unpack — the entity and everything under it stop being a prefab instance (the
+    /// Explorer's "Unpack"). An instance is saved as a reference to its prefab and a transform: what is
+    /// added to it or changed on it is lost with the next load. Unpacked, it is saved whole.
+    /// </summary>
+    [CommandRoute("POST", "/api/entity/{id}/unpack")]
+    public class UnpackEntityCommand : EditorCommand
+    {
+        public override CommandResult Execute(CommandContext context)
+        {
+            var id = context.GetInt("id");
+            var entity = CommandHelpers.FindEntityById(id);
+            if (entity == null) return CommandResult.NotFound($"Entity {id} not found");
+
+            string prefab = entity.Prefab?.Name;
+            int count = Unpack(entity);
+            MessageDispatcher.Send(Msg.RefreshExplorer);
+            return CommandResult.Json(new { status = count > 0 ? "unpacked" : "not a prefab instance", id, name = entity.Name, prefab, entities = count });
+        }
+
+        private static int Unpack(Entity entity)
+        {
+            int count = entity.Prefab != null ? 1 : 0;
+            entity.Prefab = null;
+            var transform = entity.Transform;
+            for (int i = 0; i < transform.GetChildCount(); i++)
+            {
+                var child = transform.GetChild(i)?.Entity;
+                if (child != null) count += Unpack(child);
+            }
+            return count;
+        }
+    }
+
     /// <summary>POST /api/prefab/measure {"guids":[...]} — local-space bounds of each prefab (instantiated off-scene and destroyed).</summary>
     [CommandRoute("POST", "/api/prefab/measure")]
     public class PrefabMeasureCommand : EditorCommand
