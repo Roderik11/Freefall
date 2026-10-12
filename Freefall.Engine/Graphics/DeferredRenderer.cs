@@ -728,14 +728,20 @@ namespace Freefall.Graphics
 
              // Upload light data to per-frame structured buffer
              var dst = _pointLightBuffers![frameIdx].WritePtr<Components.PointLight.PointLightData>();
+             float time = Time.TotalTime;
              for (int i = 0; i < count; i++)
              {
                  var pl = lights[i];
+                 float intensity = pl.Intensity;
+                 var position = pl.Entity.Transform.WorldPosition;
+                 if (pl.Flicker > 0f)
+                     pl.ApplyFlicker(time, ref intensity, ref position);
+
                  dst[i] = new Components.PointLight.PointLightData
                  {
                      Color = new Vector3(pl.Color.R, pl.Color.G, pl.Color.B),
-                     Intensity = pl.Intensity,
-                     Position = pl.Entity.Transform.WorldPosition - camPos,
+                     Intensity = intensity,
+                     Position = position - camPos,
                      Range = pl.Range
                  };
              }

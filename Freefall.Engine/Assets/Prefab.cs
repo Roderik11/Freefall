@@ -198,9 +198,15 @@ namespace Freefall.Assets
             source.Transform.Scale = System.Numerics.Vector3.One;
             source.Transform.Parent = null;
 
+            // What belongs to the instance stays out of the prefab
+            var own = SetAsidePerInstance(hierarchy);
+
             // Serialize the entire hierarchy to YAML
             var serializer = new EntitySerializer();
             var yaml = serializer.SaveToString(hierarchy);
+
+            foreach (var (component, field, value) in own)
+                field.SetValue(component, value);
 
             // Restore transform and prefab reference
             source.Transform.Position = savedPos;
@@ -219,6 +225,60 @@ namespace Freefall.Assets
 
             // Propagate to all other instances
             return UpdateAllInstances();
+        }
+
+        /// <summary>
+        /// For the moment an instance is written into this prefab: give its <see cref="PerInstanceAttribute"/>
+        /// members the values the prefab has for them (on a component the prefab does not have yet:
+        /// the value a new one has), and return what to put back afterwards. Without this, applying
+        /// an instance wrote down who that one instance happened to be (the seed a character rolled)
+        /// and every instance came back as the same one.
+        /// </summary>
+        private List<(Component component, Field field, object value)> SetAsidePerInstance(List<Entity> hierarchy)
+        {
+            var aside = new List<(Component, Field, object)>();
+
+            // The prefab as it stands, entity for entity while both have the same shape; else only the roots
+            List<Entity> template = null;
+            if (SourceYaml != null && SourceYaml.Length > 0)
+                template = new EntitySerializer { DuplicateMode = true }.LoadFromBytes(SourceYaml, skipPrefabHydration: true);
+
+            var written = hierarchy.Where(e => !e.DontSave).ToList();
+            bool sameShape = template != null && template.Count == written.Count;
+
+            for (int i = 0; i < written.Count; i++)
+            {
+                var counterpart = sameShape ? template[i]
+                                : i == 0 && template != null && template.Count > 0 ? template[0] : null;
+
+                foreach (var component in written[i].Components)
+                {
+                    var type = component.GetType();
+                    Component theirs = null, fresh = null;
+                    bool looked = false;
+
+                    foreach (var field in Reflector.GetMapping(type))
+                    {
+                        if (field.Ignored || !field.CanWrite || field.GetAttribute<PerInstanceAttribute>() == null) continue;
+
+                        if (!looked)
+                        {
+                            looked = true;
+                            theirs = counterpart?.Components.FirstOrDefault(c => c.GetType() == type);
+                        }
+
+                        var from = theirs ?? (fresh ??= (Component)Activator.CreateInstance(type));
+                        aside.Add((component, field, field.GetValue(component)));
+                        field.SetValue(component, field.GetValue(from));
+                    }
+                }
+            }
+
+            if (template != null)
+                for (int i = template.Count - 1; i >= 0; i--)
+                    template[i].Destroy();
+
+            return aside;
         }
 
         /// <summary>
@@ -248,8 +308,8 @@ namespace Freefall.Assets
 
                 if (templateComponents.TryGetValue(type, out var templateComp))
                 {
-                    // Type exists in both — delta copy fields
-                    CopyFields(templateComp, comp);
+                    // Type exists in both — delta copy fields; what belongs to the instance stays its own
+                    CopyFields(templateComp, comp, keepPerInstance: true);
                     matchedTypes.Add(type);
                 }
                 else
@@ -321,7 +381,7 @@ namespace Freefall.Assets
         /// Only copies fields from the concrete type — Component base fields (Entity, UID, Id, etc.)
         /// are infrastructure and must not be overwritten.
         /// </summary>
-        private static void CopyFields(Component source, Component target)
+        private static void CopyFields(Component source, Component target, bool keepPerInstance = false)
         {
             var mapping = Reflector.GetMapping(source.GetType());
 
@@ -330,6 +390,7 @@ namespace Freefall.Assets
                 if (field.Ignored) continue;
                 if (!field.CanWrite) continue;
                 if (field.DeclaringType == typeof(Component)) continue;
+                if (keepPerInstance && field.GetAttribute<PerInstanceAttribute>() != null) continue;
 
                 try
                 {

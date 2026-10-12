@@ -101,6 +101,7 @@ namespace Freefall.Animation
         {
             var clip = pb.ClipOf(this);
             SetTimeElapsed(pb, clip != null ? clip.DurationSeconds * Math.Clamp(pb.StartOf(this), 0f, 1f) : 0f);
+            pb.Set(PK.State(ID, PK.Entered), 1);
         }
 
         /// <summary>Whether the state plays left for right on one Animator: its own flag, turned round by a choice made when it was entered.</summary>
@@ -170,7 +171,7 @@ namespace Freefall.Animation
         public virtual void Update(Animator animator, AnimationPlayback pb, bool fireEvents = true)
         {
             float before = GetTimeElapsed(pb);
-            int wraps = Advance(animator, pb, fireEvents, 1f);
+            int wraps = Advance(animator, pb, fireEvents, 1f, IsMirrored(pb));
 
             // The frame a transition leaves this state it is moved on once more, without effects
             if (wraps >= 0 && fireEvents)
@@ -214,12 +215,14 @@ namespace Freefall.Animation
         /// plays its children at the blended pace instead of each at its own. Returns how often
         /// the clip started over, or -1 when the state plays no clip.
         /// </summary>
-        internal int Advance(Animator animator, AnimationPlayback pb, bool fireEvents, float rate)
+        /// <param name="mirrored">Whether the clip is played left for right: the events it passes are reported that way round.</param>
+        internal int Advance(Animator animator, AnimationPlayback pb, bool fireEvents, float rate, bool mirrored)
         {
             var clip = pb.ClipOf(this);
             if (clip == null) return -1;
 
-            float timeElapsed = GetTimeElapsed(pb);
+            float before = GetTimeElapsed(pb);
+            float timeElapsed = before;
             float step = Base.Time.SmoothDelta * Speed * rate;
             int wraps = 0;
 
@@ -231,27 +234,24 @@ namespace Freefall.Animation
                 {
                     wraps = (int)(timeElapsed * clip.DurationSecondsInverse);
                     timeElapsed %= clip.DurationSeconds;
-                    ResetEvents(clip, pb);
                 }
             }
-            else
+            else if (timeElapsed < clip.DurationSeconds)
             {
-                if (timeElapsed < clip.DurationSeconds)
-                {
-                    timeElapsed += step;
-
-                    if (timeElapsed > clip.DurationSeconds)
-                    {
-                        timeElapsed = clip.DurationSeconds;
-                        ResetEvents(clip, pb);
-                    }
-                }
+                timeElapsed = MathF.Min(timeElapsed + step, clip.DurationSeconds);
             }
 
             SetTimeElapsed(pb, timeElapsed);
 
             if (fireEvents)
-                FireEvents(clip, animator, pb);
+            {
+                long entered = PK.State(ID, PK.Entered);
+                bool first = pb.GetBool(entered);
+                if (first) pb.Set(entered, 0);
+
+                PassEvents(clip, animator, before * clip.DurationSecondsInverse, timeElapsed * clip.DurationSecondsInverse,
+                    wraps > 0, first, mirrored);
+            }
 
             foreach (var curve in Curves)
             {
@@ -262,29 +262,50 @@ namespace Freefall.Animation
             return wraps;
         }
 
-        private void FireEvents(AnimationClip clip, Animator animator, AnimationPlayback pb)
+        /// <summary>
+        /// Report what lies on the stretch of the clip that this update played: the events marked
+        /// on it and, for an Animator that wants them, the feet coming down. Going by the stretch
+        /// and not by a mark per event means that each is reported once however the state was
+        /// come by: taken up part-way, played to its end, left and entered again, or made the
+        /// heaviest child of a blend tree in the middle of its cycle.
+        /// </summary>
+        private void PassEvents(AnimationClip clip, Animator animator, float from, float to, bool wrapped, bool first, bool mirrored)
         {
-            if (clip.Events == null) return;
-            float normalizedTime = GetTimeElapsed(pb) * clip.DurationSecondsInverse;
-
-            for (int i = 0; i < clip.Events.Count; i++)
+            var events = clip.Events;
+            if (events != null)
             {
-                var evt = clip.Events[i];
-                long key = PK.Event(ID, i);
-
-                if (!pb.GetBool(key) && normalizedTime >= evt.Time)
+                for (int i = 0; i < events.Count; i++)
                 {
-                    pb.Set(key, 1);
-                    animator.FireAnimationEvent(evt.Name);
+                    var evt = events[i];
+                    if (evt == null || !Passed(evt.Time, from, to, wrapped, first)) continue;
+
+                    var bone = evt.Bone;
+                    if (mirrored && bone.HasValue) bone = HumanoidSides.Other(bone.Value);
+                    animator.ReportEvent(this, clip, evt.Name, bone, 1f);
+                }
+            }
+
+            if (animator.FootfallEvents && animator.TryGetClipSkeleton(out var skeleton))
+            {
+                var footfalls = clip.GetFootfalls(skeleton);
+                for (int i = 0; i < footfalls.Length; i++)
+                {
+                    ref readonly var fall = ref footfalls[i];
+                    if (!Passed(fall.Time, from, to, wrapped, first)) continue;
+
+                    bool left = fall.Left != mirrored;
+                    animator.ReportEvent(this, clip, AnimationEvent.Footfall, left ? HumanoidBone.LeftFoot : HumanoidBone.RightFoot, fall.Strength);
                 }
             }
         }
 
-        private void ResetEvents(AnimationClip clip, AnimationPlayback pb)
+        // Whether a point of the clip lies on the stretch played: after where it stood, up to where
+        // it stands now. The point a state is taken up at counts on its first update; a loop that
+        // started over has played to its end and on from its beginning.
+        private static bool Passed(float time, float from, float to, bool wrapped, bool first)
         {
-            if (clip.Events == null) return;
-            for (int i = 0; i < clip.Events.Count; i++)
-                pb.Set(PK.Event(ID, i), 0);
+            if (wrapped) return time > from || time <= to;
+            return time <= to && (time > from || (first && time >= from));
         }
 
         /// <summary>

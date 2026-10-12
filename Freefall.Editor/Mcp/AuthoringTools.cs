@@ -130,6 +130,19 @@ namespace Freefall.Editor.Mcp
             return err ?? await McpBridge.Post($"/api/entity/{rid}/unpack", new { });
         }
 
+        [McpServerTool(Name = "prefab_apply", Title = "Apply instance to its prefab", Destructive = true, OpenWorld = false)]
+        [Description("Write a prefab instance back into its prefab, like the Explorer's 'Apply to Prefab': the prefab becomes what this " +
+                     "instance is (its components and their values, the transform reset), and every other instance is brought in line. " +
+                     "The way to add a component to a prefab: add it to one instance, set it up, then apply. Everything changed on that " +
+                     "instance goes into the prefab, so apply from one that is otherwise untouched; only members a component marks " +
+                     "[PerInstance] (a rolled character's Seed) stay out. The prefab is changed in memory: follow with asset_save " +
+                     "(guid in the result) to keep it.")]
+        public static async Task<CallToolResult> ApplyToPrefab(int? id = null, [Description(EntityRefs.UidHelp)] string? uid = null)
+        {
+            var (rid, err) = await EntityRefs.Resolve(id, uid);
+            return err ?? await McpBridge.Post($"/api/entity/{rid}/applytoprefab", new { });
+        }
+
         [McpServerTool(Name = "prefab_measure", Title = "Measure prefabs", ReadOnly = true, OpenWorld = false)]
         [Description("Bounds (min/max/size, relative to the prefab pivot at the origin) of one or more prefabs without placing them in the scene. " +
                      "Use before choosing scale ranges for PCG spawners or placing modular pieces; empty=true means the prefab renders nothing.")]

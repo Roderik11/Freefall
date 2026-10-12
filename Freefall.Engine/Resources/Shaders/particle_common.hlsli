@@ -21,12 +21,12 @@ struct ParticleVisual      // 16 bytes — per-particle variation, everything el
     float SizeScale;       // random factor on the emitter's start/end size
     float Rotation;        // radians
     float RotationSpeed;   // radians/sec
-    float _pad;
+    float Random;          // 0..1, fixed for the particle's life (flipbook start frame)
 };
 
 // One row per emitter, rewritten by the CPU every frame (ParticleSystem.EmitterRow in C#).
 // Laid out in 16-byte rows so no vector straddles a boundary and the C# struct maps 1:1.
-struct ParticleEmitter     // 304 bytes
+struct ParticleEmitter     // 320 bytes
 {
     float3 Position;       float  ParticleRadius;      // largest half-extent of one particle quad
     float3 EmitDirection;  float  SpreadCos;           // emitter-local, normalized / cos(spread half-angle)
@@ -47,7 +47,8 @@ struct ParticleEmitter     // 304 bytes
     uint   TextureIdx;     uint   FlipbookCols;        uint  FlipbookRows;       uint  FlipbookFrameCount;
     float  FlipbookAnimSpeed; uint BillboardMode;      uint  SoftEnabled;        float SoftRange;
     float3 BoundsCenter;   float  BoundsRadius;        // everything this emitter can have alive
-    uint   RenderMode;     uint   Flags;               uint  _pad0;              uint  _pad1;
+    uint   RenderMode;     uint   Flags;               float Intensity;          float FadeInRate;   // brightness on RGB / 1 / (share of life to appear), 0 = appears at once
+    float  Turbulence;     float  TurbulenceFrequency; float WindLean;           uint  _pad0;        // m/s² / 1 / swirl size / m of lean at the sprite's top per m/s of Wind
 };
 
 // ParticleEmitter.RenderMode
@@ -56,6 +57,8 @@ struct ParticleEmitter     // 304 bytes
 #define PARTICLE_MODE_COUNT        2
 
 // ParticleEmitter.Flags
-#define PARTICLE_FLAG_RESET   1   // the emitter's slots hold someone else's data: kill them
+#define PARTICLE_FLAG_RESET            1   // the emitter's slots hold someone else's data: kill them
+#define PARTICLE_FLAG_FLIPBOOK_RANDOM  2   // each particle starts at its own frame
+#define PARTICLE_FLAG_FLIPBOOK_BLEND   4   // cross-fade from frame to frame
 
 #endif

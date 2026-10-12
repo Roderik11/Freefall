@@ -3,6 +3,10 @@
 // One draw covers every emitter of a render mode: the instance picks a pool slot from the draw
 // list, the slot's chunk names the emitter row, and the row carries texture and look.
 //
+// Colours are premultiplied: "AlphaBlend" is One / InvSrcAlpha, so RGB is added as it is and alpha
+// only says how much of the background the particle hides. Alpha 0 = additive, and everything that
+// fades a particle has to scale RGB along with alpha.
+//
 // @RenderState(RenderTargets=1, DepthWrite=false, Blend=AlphaBlend, CullMode=None)
 
 #include "common.fx"
@@ -23,6 +27,7 @@ cbuffer PushConstants : register(b3)
 
 #define BILLBOARD_CAMERA   0
 #define BILLBOARD_VELOCITY 1
+#define BILLBOARD_UPRIGHT  2
 
 // ────────────── Samplers ──────────────
 
@@ -61,6 +66,8 @@ struct VSOutput
     float  Depth    : TEXCOORD1;  // linear view-space depth for soft particles
     nointerpolation uint  TextureIdx : TEXCOORD2;
     nointerpolation float SoftRange  : TEXCOORD3;  // <= 0: soft particles off
+    float2 NextTexCoord : TEXCOORD4;               // the following flipbook frame
+    nointerpolation float FrameBlend : TEXCOORD5;  // 0..1 towards it; 0 = no cross-fade
 };
 
 VSOutput VS(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
@@ -85,6 +92,9 @@ VSOutput VS(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
 
     float size = lerp(e.SizeStartEnd.x, e.SizeStartEnd.y, t) * vis.SizeScale;
     output.Color = lerp(e.ColorStart, e.ColorEnd, t);
+    output.Color.rgb *= e.Intensity;
+    if (e.FadeInRate > 0.0)
+        output.Color *= saturate(t * e.FadeInRate);
     output.TextureIdx = e.TextureIdx;
     output.SoftRange = e.SoftEnabled != 0 ? max(e.SoftRange, 0.01) : 0.0;
 
@@ -97,17 +107,25 @@ VSOutput VS(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
     uint flipRows = max(e.FlipbookRows, 1u);
     uint totalFrames = e.FlipbookFrameCount > 0 ? e.FlipbookFrameCount : flipCols * flipRows;
 
+    float2 nextUV = uv;
     if (totalFrames > 1)
     {
-        uint frame = (uint)(core.Age * e.FlipbookAnimSpeed) % totalFrames;
+        float position = core.Age * e.FlipbookAnimSpeed;
+        if ((e.Flags & PARTICLE_FLAG_FLIPBOOK_RANDOM) != 0)
+            position += vis.Random * (float)totalFrames;
 
-        uint col = frame % flipCols;
-        uint row = frame / flipCols;
+        uint frame = (uint)position % totalFrames;
+        uint next = (frame + 1) % totalFrames;
 
         float2 uvSize = float2(1.0 / (float)flipCols, 1.0 / (float)flipRows);
-        uv = float2((float)col, (float)row) * uvSize + uv * uvSize;
+        nextUV = float2((float)(next % flipCols), (float)(next / flipCols)) * uvSize + uv * uvSize;
+        uv = float2((float)(frame % flipCols), (float)(frame / flipCols)) * uvSize + uv * uvSize;
+
+        if ((e.Flags & PARTICLE_FLAG_FLIPBOOK_BLEND) != 0)
+            output.FrameBlend = frac(position);
     }
     output.TexCoord = uv;
+    output.NextTexCoord = nextUV;
 
     float3 worldPos;
 
@@ -149,7 +167,35 @@ VSOutput VS(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
         float3 right = float3(View._11, View._21, View._31);
         float3 up    = float3(View._12, View._22, View._32);
 
+        [branch]
+        if (e.BillboardMode == BILLBOARD_UPRIGHT)
+        {
+            // Stands along world up: the foot of the quad stays where it is from every angle. Rotation is
+            // about that axis. Without any (RotationRange 0) the quad turns to face the camera; with it,
+            // every card keeps its own angle, so seen from above they cross and the fire has a body.
+            up = float3(0.0, 1.0, 0.0);
+            if (e.RotationRange > 0.0)
+            {
+                right = float3(cosR, 0.0, sinR);
+            }
+            else
+            {
+                float3 side = cross(CamPos - core.Position, up);
+                float sl = length(side);
+                right = sl > 1e-4 ? side / sl : right;   // looking straight down the axis: any direction will do
+            }
+            rotated = scaled;
+        }
+
         worldPos = core.Position + (rotated.x * right + rotated.y * up) * size;
+
+        // Lean with the wind: the bottom edge stays, the top moves downwind (a flame in its basket).
+        // Each sprite wavers at its own phase, or all of them would stand at one fixed slant.
+        if (e.WindLean > 0.0)
+        {
+            float waver = 1.0 + 0.4 * sin(core.Age * 5.0 + vis.Random * 6.283185);
+            worldPos += e.Wind * (e.WindLean * waver * (corner.y + 0.5));
+        }
     }
 
     // Transform to clip space
@@ -166,7 +212,13 @@ float4 PS(VSOutput input) : SV_Target0
 {
     // Emitters of one draw use different textures
     Texture2D ParticleTex = ResourceDescriptorHeap[NonUniformResourceIndex(input.TextureIdx)];
-    float4 texColor = ParticleTex.Sample(SamplerLinearWrap, input.TexCoord);
+
+    // Both frames are the same size on screen: one set of gradients, taken outside the branch
+    float2 dx = ddx(input.TexCoord);
+    float2 dy = ddy(input.TexCoord);
+    float4 texColor = ParticleTex.SampleGrad(SamplerLinearWrap, input.TexCoord, dx, dy);
+    if (input.FrameBlend > 0.0)
+        texColor = lerp(texColor, ParticleTex.SampleGrad(SamplerLinearWrap, input.NextTexCoord, dx, dy), input.FrameBlend);
 
     float4 finalColor = texColor * input.Color;
 
@@ -183,14 +235,13 @@ float4 PS(VSOutput input) : SV_Target0
         if (sceneDepth > 0.001)
         {
             float depthDiff = sceneDepth - input.Depth;
-            finalColor.a *= saturate(depthDiff / input.SoftRange);
+            finalColor *= saturate(depthDiff / input.SoftRange);
         }
     }
 
-    // Discard fully transparent fragments (optimization + avoids depth artifacts)
-    if (finalColor.a < 0.004) discard;
+    // Discard fragments that neither add nor hide anything (an additive particle has alpha 0)
+    if (max(finalColor.a, max(finalColor.r, max(finalColor.g, finalColor.b))) < 0.004) discard;
 
-    // Output with standard alpha — BlendState is SrcAlpha/InvSrcAlpha
     return finalColor;
 }
 

@@ -678,7 +678,7 @@ namespace Freefall.Editor
 
         void CreateComponentItems()
         {
-            componentsItem.Dropdown.Controls.Clear();
+            ClearItems(componentsItem);
 
             var types = Reflector.GetTypes<Component>();
             types.Sort((a, b) => a.Name.CompareTo(b.Name));

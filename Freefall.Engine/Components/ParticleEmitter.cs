@@ -36,7 +36,10 @@ namespace Freefall.Components
     public enum ParticleBillboardMode
     {
         CameraFacing,      // Classic billboard, always faces the camera
-        VelocityStretched  // Quad's up axis follows velocity, length grows with speed (rain, sparks)
+        VelocityStretched, // Quad's up axis follows velocity, length grows with speed (rain, sparks)
+        Upright            // Stands along world up (flames): a camera-facing quad swings its foot off the fire when
+                           // seen from above or near the screen edge. With RotationRange 0 it turns about the axis to
+                           // face the camera; above 0 every card keeps its own random angle about it (crossed cards)
     }
 
     /// <summary>What particles collide against.</summary>
@@ -135,6 +138,18 @@ namespace Freefall.Components
         [Description("Air velocity (world space). Only has an effect when Drag > 0")]
         public Vector3 Wind = Vector3.Zero;
 
+        [Description("Share of the weather's wind (EnvironmentController) added to Wind. Like Wind it needs Drag > 0")]
+        [ValueRange(0f, 1f)]
+        public float WeatherWind = 0f;
+
+        [Description("Swirling force that changes over space and time (m/s²): smoke curls, embers wander")]
+        [ValueRange(0f, 50f)]
+        public float Turbulence = 0f;
+
+        [Description("Size of the swirls (meters)")]
+        [ValueRange(0.05f, 20f)]
+        public float TurbulenceSize = 1f;
+
         // ── Collision ──
 
         [Category("Collision")]
@@ -181,16 +196,27 @@ namespace Freefall.Components
         [ValueRange(0.05f, 20f)]
         public float Aspect = 1f;
 
+        // Colours are premultiplied: RGB is what the particle adds to the picture, alpha how much it hides
+        // of what is behind it. Alpha 0 is additive (fire, sparks); to fade out, RGB has to go to 0 as well.
+
         [Category("Appearance")]
-        [Description("RGBA color at birth")]
+        [Description("RGBA color at birth. RGB is added to the picture, alpha hides what is behind: alpha 0 = additive")]
         public Vector4 ColorStart = Vector4.One;
 
         [Category("Appearance")]
-        [Description("RGBA color at death")]
+        [Description("RGBA color at death. Fading out needs RGB at 0 too")]
         public Vector4 ColorEnd = new(1, 1, 1, 0);
 
+        [Description("Brightness multiplier on RGB. Above 1 the particle glows: it reaches the bloom threshold")]
+        [ValueRange(0f, 100f)]
+        public float Intensity = 1f;
+
+        [Description("Share of its lifetime a particle takes to appear (0 = at once)")]
+        [ValueRange(0f, 1f)]
+        public float FadeIn = 0f;
+
         [Category("Appearance")]
-        [Description("Maximum rotation speed (radians/sec)")]
+        [Description("Maximum rotation speed (radians/sec); above 0 particles also start at a random angle. Upright quads rotate about the up axis")]
         [ValueRange(0f, 10f)]
         public float RotationRange = 1.0f;
 
@@ -215,6 +241,12 @@ namespace Freefall.Components
         [Description("Number of rows in the flipbook atlas")]
         public int FlipbookRows = 1;
 
+        [Description("Each particle starts at a random frame, so the sprites of one emitter do not animate in step")]
+        public bool FlipbookRandomStart = false;
+
+        [Description("Cross-fade from frame to frame instead of stepping")]
+        public bool FlipbookBlend = false;
+
         // ── Rendering ──
 
         [Category("Rendering")]
@@ -229,6 +261,10 @@ namespace Freefall.Components
         [Description("VelocityStretched: extra quad length per m/s of speed (meters)")]
         [ValueRange(0f, 1f)]
         public float StretchFactor = 0.05f;
+
+        [Description("CameraFacing / Upright: the sprite leans with the wind instead of being carried by it. Its top shifts by this many meters per m/s of Wind (plus the WeatherWind share), the bottom stays. For flames; keep Drag at 0")]
+        [ValueRange(0f, 0.5f)]
+        public float WindLean = 0f;
 
         [Category("Rendering")]
         [Description("Fade particles near opaque surfaces")]

@@ -613,6 +613,29 @@ namespace Freefall.Editor.Commands
         }
     }
 
+    /// <summary>
+    /// POST /api/entity/{id}/applytoprefab — write a prefab instance back into its prefab and bring the other
+    /// instances in line (the Explorer's "Apply to Prefab"). Members marked [PerInstance] keep the prefab's
+    /// value. The prefab asset is changed in memory only: save it.
+    /// </summary>
+    [CommandRoute("POST", "/api/entity/{id}/applytoprefab")]
+    public class ApplyToPrefabCommand : EditorCommand
+    {
+        public override CommandResult Execute(CommandContext context)
+        {
+            var id = context.GetInt("id");
+            var entity = CommandHelpers.FindEntityById(id);
+            if (entity == null) return CommandResult.NotFound($"Entity {id} not found");
+
+            var prefab = entity.Prefab;
+            if (prefab == null) return CommandResult.BadRequest($"'{entity.Name}' is not the root of a prefab instance");
+
+            int instances = prefab.UpdateFromInstance(entity);
+            MessageDispatcher.Send(Msg.RefreshExplorer);
+            return CommandResult.Json(new { status = "applied", id, name = entity.Name, prefab = prefab.Name, guid = prefab.Guid, instances });
+        }
+    }
+
     /// <summary>POST /api/prefab/measure {"guids":[...]} — local-space bounds of each prefab (instantiated off-scene and destroyed).</summary>
     [CommandRoute("POST", "/api/prefab/measure")]
     public class PrefabMeasureCommand : EditorCommand

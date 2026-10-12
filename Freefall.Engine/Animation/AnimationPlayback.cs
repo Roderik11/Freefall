@@ -65,12 +65,12 @@ namespace Freefall.Animation
         const uint LAYER = 0x10000000;
         const uint PARAM = 0x20000000;
         const uint BLEND = 0x30000000;
-        const uint EVENT = 0x40000000;
 
         // State fields
         public const int Time   = 0;
         public const int Weight = 1;
         public const int Mirrored = 2;
+        public const int Entered = 3;   // taken up and not yet moved on: an event at that very point is still to come
 
         // Layer fields
         public const int Current       = 0;
@@ -90,6 +90,5 @@ namespace Freefall.Animation
         public static long Layer(int layerIdx, int field) => Key(layerIdx, LAYER, (uint)field);
         public static long Param(int paramIdx) => Key(paramIdx, PARAM, 0);
         public static long BlendWeight(int treeId, int childIdx) => Key(treeId, BLEND, (uint)childIdx);
-        public static long Event(int stateId, int eventIdx) => Key(stateId, EVENT, (uint)eventIdx);
     }
 }

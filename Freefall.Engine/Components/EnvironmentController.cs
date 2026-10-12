@@ -186,6 +186,9 @@ namespace Freefall.Components
             var wind = _current.WindVector;
             var camPos = Camera.Main?.Position ?? Vector3.Zero;
 
+            // Every other emitter takes the share of it that its WeatherWind asks for (flames, smoke)
+            Graphics.ParticleSystem.WeatherWind = DriveWind ? wind : Vector3.Zero;
+
             DriveEmitter(ref _lastRain, RainEmitter, _current.RainIntensity, wind, camPos, EmitterHeight);
             DriveEmitter(ref _lastSnow, SnowEmitter, _current.SnowIntensity, wind, camPos, EmitterHeight);
             DriveEmitter(ref _lastHail, HailEmitter, _current.HailIntensity, wind, camPos, EmitterHeight);
@@ -232,6 +235,7 @@ namespace Freefall.Components
         {
             if (_target == null) return;
             _target = null;
+            Graphics.ParticleSystem.WeatherWind = Vector3.Zero;
             if (_lastRain != null) ReleaseEmitter(_lastRain);
             if (_lastSnow != null) ReleaseEmitter(_lastSnow);
             if (_lastHail != null) ReleaseEmitter(_lastHail);

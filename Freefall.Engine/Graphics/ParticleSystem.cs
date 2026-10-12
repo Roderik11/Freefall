@@ -35,6 +35,14 @@ namespace Freefall.Graphics
         private const int CoreStride = 32;          // ParticleCore
         private const int VisualStride = 16;        // ParticleVisual
         private const uint FlagReset = 1;           // = PARTICLE_FLAG_RESET
+        private const uint FlagFlipbookRandom = 2;  // = PARTICLE_FLAG_FLIPBOOK_RANDOM
+        private const uint FlagFlipbookBlend = 4;   // = PARTICLE_FLAG_FLIPBOOK_BLEND
+
+        /// <summary>
+        /// The weather's wind (world space), set by <see cref="EnvironmentController"/>. Emitters take
+        /// the share of it their <see cref="ParticleEmitter.WeatherWind"/> asks for.
+        /// </summary>
+        public static Vector3 WeatherWind;
 
         /// <summary>One table row. Must match struct ParticleEmitter in particle_common.hlsli.</summary>
         [StructLayout(LayoutKind.Sequential)]
@@ -58,7 +66,8 @@ namespace Freefall.Graphics
             public uint TextureIdx;        public uint FlipbookCols;        public uint FlipbookRows;       public uint FlipbookFrameCount;
             public float FlipbookAnimSpeed; public uint BillboardMode;      public uint SoftEnabled;        public float SoftRange;
             public Vector3 BoundsCenter;   public float BoundsRadius;
-            public uint RenderMode;        public uint Flags;               public uint Pad0;               public uint Pad1;
+            public uint RenderMode;        public uint Flags;               public float Intensity;         public float FadeInRate;
+            public float Turbulence;       public float TurbulenceFrequency; public float WindLean;         public uint Pad0;
         }
 
         /// <summary>Everything the system keeps per emitter. The component itself only holds authored data.</summary>
@@ -142,8 +151,8 @@ namespace Freefall.Graphics
 
         protected internal override void Initialize()
         {
-            if (Unsafe.SizeOf<EmitterRow>() != 304)
-                throw new InvalidOperationException("EmitterRow must match struct ParticleEmitter in particle_common.hlsli (304 bytes)");
+            if (Unsafe.SizeOf<EmitterRow>() != 320)
+                throw new InvalidOperationException("EmitterRow must match struct ParticleEmitter in particle_common.hlsli (320 bytes)");
 
             ComponentCache<ParticleEmitter>.Added += OnAdded;
             ComponentCache<ParticleEmitter>.Removed += OnRemoved;
@@ -369,8 +378,9 @@ namespace Freefall.Graphics
 
             var transform = e.Transform!;
             var position = transform.WorldPosition;
-            var wind = e.WindOverride ?? e.Wind;
+            var wind = e.WindOverride ?? e.Wind + WeatherWind * Math.Clamp(e.WeatherWind, 0f, 1f);
             float drag = MathF.Max(0f, e.Drag);
+            float turbulence = MathF.Max(0f, e.Turbulence);
             float lifetime = MathF.Max(0.01f, e.Lifetime);
             float lifeRandom = Math.Clamp(e.LifetimeRandomness, 0f, 1f);
             float sizeRandom = Math.Clamp(e.SizeRandomness, 0f, 1f);
@@ -386,6 +396,8 @@ namespace Freefall.Graphics
             float life = lifetime * (1f + lifeRandom);
             float gravity = MathF.Abs(e.Gravity.X) + MathF.Abs(e.Gravity.Y) + MathF.Abs(e.Gravity.Z);
             float drift = drag > 0f ? (MathF.Abs(wind.X) + MathF.Abs(wind.Y) + MathF.Abs(wind.Z)) : 0f;
+            // Turbulence pushes one way for a while at most: drag caps the speed it builds up
+            drift += drag > 0f ? MathF.Min(turbulence / drag, 0.5f * turbulence * life) : 0.5f * turbulence * life;
             float topSpeed = MathF.Max(MathF.Abs(speedMin), MathF.Abs(speedMax));
             float shape = e.Shape switch
             {
@@ -395,8 +407,11 @@ namespace Freefall.Graphics
             };
             float size = MathF.Max(e.StartSize, e.EndSize) * (1f + sizeRandom);
             float particleRadius = 0.5f * size * (1f + aspect);
+            float windLean = MathF.Max(0f, e.WindLean);
             if (e.BillboardMode == ParticleBillboardMode.VelocityStretched)
                 particleRadius += 0.5f * stretch * (topSpeed + gravity * life + drift);
+            else if (windLean > 0f)
+                particleRadius += 1.4f * windLean * (MathF.Abs(wind.X) + MathF.Abs(wind.Y) + MathF.Abs(wind.Z));   // 1.4: the lean wavers
 
             int mode = e.RenderMode == ParticleRenderMode.Transparent ? 1 : 0;
             _modeCount[mode]++;
@@ -450,7 +465,14 @@ namespace Freefall.Graphics
                 BoundsCenter = position + e.Gravity * (0.25f * life * life),
                 BoundsRadius = shape + topSpeed * life + 0.25f * gravity * life * life + drift * life + particleRadius,
                 RenderMode = (uint)mode,
-                Flags = entry.Reset ? FlagReset : 0u,
+                Flags = (entry.Reset ? FlagReset : 0u)
+                    | (e.FlipbookRandomStart ? FlagFlipbookRandom : 0u)
+                    | (e.FlipbookBlend ? FlagFlipbookBlend : 0u),
+                Intensity = MathF.Max(0f, e.Intensity),
+                FadeInRate = e.FadeIn > 0f ? 1f / MathF.Min(e.FadeIn, 1f) : 0f,
+                Turbulence = turbulence,
+                TurbulenceFrequency = 1f / MathF.Max(0.01f, e.TurbulenceSize),
+                WindLean = windLean,
             };
 
             if (capacity > 0)
@@ -622,6 +644,7 @@ namespace Freefall.Graphics
             cs.SetPushConstant("PoolSlots", (uint)_poolSlots);
             cs.SetPushConstant("SimulateFlag", simulate ? 1u : 0u);
             cs.SetPushConstant("DeltaTime", BitConverter.SingleToUInt32Bits((float)Time.Delta));
+            cs.SetPushConstant("SimTime", BitConverter.SingleToUInt32Bits(Time.TotalTime));
             cs.SetPushConstant("DepthTex", depth ? renderer.DepthGBuffer!.BindlessIndex : 0u);
             cs.SetPushConstant("NormalTex", depth ? renderer.Normals!.BindlessIndex : 0u);
 

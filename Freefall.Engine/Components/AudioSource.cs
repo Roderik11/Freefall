@@ -13,12 +13,23 @@ namespace Freefall.Components
         [System.ComponentModel.Category("Playback")]
         public AudioClip AudioClip;
         public float Volume = 1;
+
+        /// <summary>Plays faster and higher (above 1) or slower and lower. Set before Play to vary a sound that repeats.</summary>
+        public float Pitch = 1;
         public bool Loop;
         public bool PlayOnAwake;
 
         [System.ComponentModel.Category("Spatial")]
         public float Range = 10;
         public float MinDistance = 0;
+
+        /// <summary>
+        /// Within this many metres of the listener the sound is at full volume; beyond it the
+        /// volume is this over the distance (half at twice as far). 1 by default. A listener on
+        /// a camera that follows a character from a few metres away hears that character's own
+        /// sounds at a fraction unless this reaches the camera.
+        /// </summary>
+        public float FalloffStart = 1;
 
         private Emitter emitter;
         private IXAudio2SourceVoice sourceVoice;
@@ -98,7 +109,36 @@ namespace Freefall.Components
             sourceVoice.FlushSourceBuffers();
             sourceVoice.SubmitSourceBuffer(clip.Buffer, clip.DecodedPacketsInfo);
             sourceVoice.SetVolume(Volume);
+
+            // Where it is heard from, before the first sample: until the next Update the voice
+            // would play at full volume in the middle, however far away it is
+            if (emitter != null)
+            {
+                emitter.Position = Transform.WorldPosition;
+                emitter.Velocity = Vector3.Zero;
+                Place();
+            }
+
             sourceVoice.Start();
+        }
+
+        // Volume per speaker and pitch from where the listener is
+        private void Place()
+        {
+            var listener = AudioListener.Main?.Listener;
+            if (listener == null || sourceVoice == null) return;
+
+            emitter.OrientFront = Transform.Forward;
+            emitter.OrientTop = Transform.Up;
+            emitter.ChannelRadius = Range;
+            emitter.InnerRadius = MinDistance;
+            emitter.CurveDistanceScaler = MathF.Max(FalloffStart, 0.01f);
+
+            int sourceChannels = currentFormat?.Channels ?? 1;
+            var dspSettings = Engine.Audio3D.Calculate(listener, emitter, CalculateFlags.Matrix | CalculateFlags.Doppler, (uint)sourceChannels, 2);
+            sourceVoice.SetOutputMatrix((uint)sourceChannels, 2, dspSettings.MatrixCoefficients);
+            sourceVoice.SetFrequencyRatio(dspSettings.DopplerFactor * Pitch, 0);
+            sourceVoice.SetVolume(Volume);
         }
 
         private void SourceVoice_BufferEnd(System.IntPtr obj)
@@ -139,19 +179,11 @@ namespace Freefall.Components
             var newpos = Transform.WorldPosition;
             emitter.Velocity = Time.SmoothDelta > 0 ? (newpos - emitter.Position) / Time.SmoothDelta : Vector3.Zero;
             emitter.Position = newpos;
-            emitter.OrientFront = Transform.Forward;
-            emitter.OrientTop = Transform.Up;
-            emitter.ChannelRadius = Range;
-            emitter.InnerRadius = MinDistance;
 
-            if (sourceVoice?.State.BuffersQueued == 0)
+            if (sourceVoice.State.BuffersQueued == 0)
                 return;
 
-            int sourceChannels = currentFormat?.Channels ?? 1;
-            var dspSettings = Engine.Audio3D.Calculate(listener, emitter, CalculateFlags.Matrix | CalculateFlags.Doppler, (uint)sourceChannels, 2);
-            sourceVoice?.SetOutputMatrix((uint)sourceChannels, 2, dspSettings.MatrixCoefficients);
-            sourceVoice?.SetFrequencyRatio(dspSettings.DopplerFactor, 0);
-            sourceVoice?.SetVolume(Volume);
+            Place();
         }
     }
 }

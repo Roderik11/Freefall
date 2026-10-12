@@ -165,7 +165,8 @@ namespace Freefall.Animation
 
             // Update that anim
             float fromNorm = maxLayer.Animation.GetTimeNormalized(pb);
-            int wraps = maxLayer.Animation.Advance(animator, pb, fireEvents, maxPace > 0 ? pace / maxPace : 1f);
+            // Its events stand for the tree's: the children are at the same point of the cycle
+            int wraps = maxLayer.Animation.Advance(animator, pb, fireEvents, maxPace > 0 ? pace / maxPace : 1f, IsMirrored(pb));
 
             // Synchronize all active anims: the same point of the cycle they share, each counted
             // from where its own clip is taken up

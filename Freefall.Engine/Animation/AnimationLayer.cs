@@ -252,7 +252,9 @@ namespace Freefall.Animation
             currentState.SetWeight(pb, 1);
 
             animator.BeginLayerRootMotion();
+            animator.EventLayer = this;
             currentState.Update(animator, pb);
+            animator.EventLayer = null;
             animator.EndLayerRootMotion(this);
         }
     }

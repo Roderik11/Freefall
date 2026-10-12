@@ -43,6 +43,9 @@ namespace Freefall.Animation
 
             // Worked out when root motion is first asked for; replaced as a whole
             public RootBinding Root;
+
+            // Worked out when first asked for
+            public Footfall[] Footfalls;
         }
 
         /// <summary>
@@ -225,6 +228,24 @@ namespace Freefall.Animation
             if (humanoid == null || !humanoid.TryGetValue(HumanoidBone.Hips, out int hips))
                 return RootMotionTrack.Nothing;
             return GetRootMotion(skeleton.Bones, hips);
+        }
+
+        /// <summary>
+        /// Where each foot comes down in this clip on a humanoid skeleton, in the order they do
+        /// (empty for a skeleton without feet, and for a clip that keeps them where they are).
+        /// Found from the clip itself, once per skeleton. The same array comes back every time:
+        /// do not change it.
+        /// </summary>
+        public Footfall[] GetFootfalls(Skeleton skeleton)
+        {
+            var binding = BindingFor(skeleton.Bones);
+            var found = binding.Footfalls;
+            if (found != null) return found;
+
+            lock (_channels)
+            {
+                return binding.Footfalls ??= Footfalls.Find(binding.Bones, binding.Channels, FootBones.Of(skeleton), Duration, TicksPerSecond);
+            }
         }
 
         /// <summary>
@@ -482,22 +503,52 @@ namespace Freefall.Animation
     }
 
     /// <summary>
-    /// An event that fires at a specific normalized time during animation playback.
+    /// Something that happens at a point of a clip: the blow of a swing lands, a hand lets go.
+    /// The Animator reports it in the update in which playback passes that point
+    /// (<c>Animator.GetEvents</c>).
     /// </summary>
     public class AnimationEvent
     {
-        public bool fired;
+        /// <summary>
+        /// The name a foot coming down is reported under. Those are not marked on clips: they
+        /// are found from what the clip does with the feet (<c>Animator.FootfallEvents</c>).
+        /// </summary>
+        public const string Footfall = "footfall";
+
+        /// <summary>When, as a fraction of the clip's length.</summary>
         public float Time;
+
         public string Name;
 
-        public void Reset() => fired = false;
+        /// <summary>
+        /// Where on the body it happens, when that matters. A clip played left for right
+        /// reports the bone of the other side.
+        /// </summary>
+        public HumanoidBone? Bone;
+    }
 
-        public bool Fire(float time)
-        {
-            if (fired) return false;
-            if (time < Time) return false;
-            fired = true;
-            return true;
-        }
+    /// <summary>An <see cref="AnimationEvent"/> as it was passed on one Animator.</summary>
+    public struct AnimationEventInfo
+    {
+        public string Name;
+
+        /// <summary>Where on the body, the way round the clip was played; null when the event names none.</summary>
+        public HumanoidBone? Bone;
+
+        /// <summary>
+        /// How much of what the character shows there comes from the state that passed it, 0..1:
+        /// the weight of its layer and the layer's mask at <see cref="Bone"/>, less what the
+        /// layers above cover. A step of the legs under an upper-body attack counts in full; the
+        /// steps in the attack's own clip, whose legs are masked out, count for nothing.
+        /// </summary>
+        public float Weight;
+
+        /// <summary>A footfall: how fast the foot came down (<see cref="Footfall.Strength"/>). Otherwise 1.</summary>
+        public float Strength;
+
+        /// <summary>The layer, state and clip it comes from.</summary>
+        public int Layer;
+        public AnimationState State;
+        public AnimationClip Clip;
     }
 }

@@ -84,8 +84,22 @@ namespace Freefall.Components
         /// <summary>Event fired after hierarchy multiplication — bones are in model space.</summary>
         public event PostHierarchyHandler OnPostHierarchy;
 
-        /// <summary>Event fired when an animation event occurs.</summary>
-        public Action<string> OnAnimationEvent;
+        /// <summary>
+        /// Report each foot coming down as an event named <see cref="AnimationEvent.Footfall"/>,
+        /// with the foot as its bone and how hard it lands as its strength. Nobody marks these
+        /// on clips: they are found from what each clip does with the feet
+        /// (<see cref="AnimationClip.GetFootfalls"/>), the first time the clip is played. Set
+        /// by whoever wants them (footstep sounds, dust).
+        /// </summary>
+        [Freefall.Reflection.DontSerialize]
+        public bool FootfallEvents { get; set; }
+
+        // What the last update passed. Filled in that update, which runs in parallel with other
+        // Animators', and read afterwards by whoever asks: nothing is called from in there.
+        private readonly List<AnimationEventInfo> _events = new();
+
+        // The layer whose state is being updated
+        internal AnimationLayer EventLayer;
 
         // Retargeting
         private BoneMap _boneMap;
@@ -152,7 +166,82 @@ namespace Freefall.Components
                 Playback.Set(PK.Param(param.Index), 0);
         }
 
-        internal void FireAnimationEvent(string name) => OnAnimationEvent?.Invoke(name);
+        // --- Events ---
+
+        /// <summary>
+        /// The events the playing states passed in the last update: those marked on their clips
+        /// (<see cref="AnimationClip.Events"/>) and, with <see cref="FootfallEvents"/>, the feet
+        /// coming down. Read it once per frame from an Update of your own; each event is in it
+        /// for one frame. There is no callback on purpose: Animators update in parallel, and
+        /// code called from in there could touch nothing safely.
+        /// <code>
+        /// foreach (ref readonly var e in animator.GetEvents())
+        ///     if (e.Name == "hit" &amp;&amp; e.Weight > 0.5f) ...
+        /// </code>
+        /// </summary>
+        public ReadOnlySpan<AnimationEventInfo> GetEvents()
+            => System.Runtime.InteropServices.CollectionsMarshal.AsSpan(_events);
+
+        /// <summary>The skeleton the clips are played on: the source skeleton when retargeting.</summary>
+        internal bool TryGetClipSkeleton(out Skeleton skeleton)
+        {
+            skeleton = _boneMap != null ? _boneMap.Source : _poseRootSkeleton;
+            return skeleton != null;
+        }
+
+        /// <summary>A state passed an event of its clip in this update.</summary>
+        internal void ReportEvent(AnimationState state, AnimationClip clip, string name, HumanoidBone? bone, float strength)
+        {
+            var layer = EventLayer;
+            _events.Add(new AnimationEventInfo
+            {
+                Name = name,
+                Bone = bone,
+                Strength = strength,
+                Weight = layer != null ? ShareOf(layer, bone) : 1f,
+                Layer = layer?.Index ?? 0,
+                State = state,
+                Clip = clip,
+            });
+        }
+
+        /// <summary>
+        /// How much of what the character shows at a bone comes from one layer: its weight and
+        /// its mask there, less what the layers above put over it. Without a bone only layers
+        /// that take the whole body count as being over it.
+        /// </summary>
+        private float ShareOf(AnimationLayer layer, HumanoidBone? bone)
+        {
+            Skeleton skeleton = null;
+            int index = -1;
+            if (bone.HasValue && TryGetClipSkeleton(out skeleton))
+            {
+                var humanoid = s_humanoid.GetValue(skeleton, static s => HumanoidTemplate.Detect(s) ?? new Dictionary<HumanoidBone, int>());
+                if (!humanoid.TryGetValue(bone.Value, out index)) index = -1;
+            }
+
+            float share = layer.GetWeight(this);
+            if (layer.Mask != null && index >= 0)
+                share *= layer.Mask.GetWeights(skeleton).Weight[index];
+
+            var layers = Animation.Layers;
+            for (int i = layer.Index + 1; i < layers.Count && share > 0f; i++)
+            {
+                var above = layers[i];
+                float over = above.GetWeight(this);
+                if (over <= 0f) continue;
+
+                // A state that plays nothing lets the layers below through
+                var current = above.GetCurrent(Playback);
+                if (current == null || !current.Plays(Playback)) continue;
+
+                if (above.Mask != null)
+                    over *= index >= 0 ? above.Mask.GetWeights(skeleton).Weight[index] : 0f;
+                share *= 1f - over;
+            }
+
+            return share;
+        }
 
         // --- State queries ---
 
@@ -200,6 +289,8 @@ namespace Freefall.Components
 
         public void Update()
         {
+            _events.Clear();
+
             if (Entity == null) return;
             if (Animation == null) return;
 

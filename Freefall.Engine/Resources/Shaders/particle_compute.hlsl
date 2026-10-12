@@ -52,6 +52,7 @@ cbuffer PushConstants : register(b3)
     float DeltaTime;             // 10
     uint DepthTexIdx;            // 11  linear view-space depth GBuffer (0 = none)
     uint NormalTexIdx;           // 12  world-space normal GBuffer (0 = none)
+    float SimTime;               // 13  seconds, moves the turbulence field
 };
 
 #define COLL_NONE   0
@@ -191,6 +192,54 @@ float3 rand_disc_xz(uint seed, uint shell)
     return float3(r * cos(a), 0.0, r * sin(a));
 }
 
+// ────────────── Turbulence ──────────────
+
+float lattice(int3 p, uint seed)
+{
+    return rand01(((uint)p.x * 73856093u) ^ ((uint)p.y * 19349663u) ^ ((uint)p.z * 83492791u) ^ seed);
+}
+
+// Gradient of 3D value noise (quintic interpolation, analytic derivatives)
+float3 noise_gradient(float3 x, uint seed)
+{
+    float3 cell = floor(x);
+    float3 w = x - cell;
+    int3 i = (int3)cell;
+
+    float3 u = w * w * w * (w * (w * 6.0 - 15.0) + 10.0);
+    float3 du = 30.0 * w * w * (w * (w - 2.0) + 1.0);
+
+    float a = lattice(i, seed);
+    float b = lattice(i + int3(1, 0, 0), seed);
+    float c = lattice(i + int3(0, 1, 0), seed);
+    float d = lattice(i + int3(1, 1, 0), seed);
+    float e = lattice(i + int3(0, 0, 1), seed);
+    float f = lattice(i + int3(1, 0, 1), seed);
+    float g = lattice(i + int3(0, 1, 1), seed);
+    float h = lattice(i + int3(1, 1, 1), seed);
+
+    float k1 = b - a;
+    float k2 = c - a;
+    float k3 = e - a;
+    float k4 = a - b - c + d;
+    float k5 = a - c - e + g;
+    float k6 = a - b - e + f;
+    float k7 = -a + b + c - d + e - f - g + h;
+
+    return du * float3(k1 + k4 * u.y + k6 * u.z + k7 * u.y * u.z,
+                       k2 + k5 * u.z + k4 * u.x + k7 * u.z * u.x,
+                       k3 + k6 * u.x + k5 * u.y + k7 * u.x * u.y);
+}
+
+// Curl of three noise fields: a flow without sources or sinks, so particles swirl instead of bunching up
+float3 curl_noise(float3 x)
+{
+    float3 g1 = noise_gradient(x, 0x1F123BB5u);
+    float3 g2 = noise_gradient(x, 0x5F356495u);
+    float3 g3 = noise_gradient(x, 0x9E3779B9u);
+    return float3(g3.y - g2.z, g1.z - g3.x, g2.x - g1.y);
+}
+
 // ────────────── Emission ──────────────
 
 // Emitter-local → world rotation
@@ -294,7 +343,7 @@ void spawn(ParticleEmitter e, uint seed, out ParticleCore p, out ParticleVisual 
     v.SizeScale = rand_range(1.0 - e.SizeRandomness, 1.0 + e.SizeRandomness, seed + 5u);
     v.Rotation = (e.RotationRange > 0) ? rand_range(0, 6.283185, seed + 7u) : 0.0;
     v.RotationSpeed = rand_range(-e.RotationRange, e.RotationRange, seed + 8u);
-    v._pad = 0;
+    v.Random = rand01(seed + 9u);
 }
 
 // ────────────── Simulation ──────────────
@@ -310,6 +359,14 @@ bool integrate(ParticleEmitter e, inout ParticleCore p)
     if (e.Drag > 0.0)
         p.Velocity += (e.Wind - p.Velocity) * saturate(e.Drag * DeltaTime);
     p.Velocity += e.Gravity * DeltaTime;
+
+    // Turbulence: the field drifts upward over time, so a particle standing still is stirred too
+    [branch]
+    if (e.Turbulence > 0.0)
+    {
+        float3 at = p.Position * e.TurbulenceFrequency - float3(0.0, SimTime * 0.7, 0.0);
+        p.Velocity += curl_noise(at) * (e.Turbulence * DeltaTime);
+    }
 
     float3 newPos = p.Position + p.Velocity * DeltaTime;
 
