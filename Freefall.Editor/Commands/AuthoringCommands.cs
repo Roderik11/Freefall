@@ -18,7 +18,7 @@ namespace Freefall.Editor.Commands
     /// <summary>Shared helpers for the authoring routes (graphs, materials, bulk scene edits).</summary>
     internal static class AuthoringHelpers
     {
-        /// <summary>Save an asset to its source file and reimport it so the Library cache matches (same as asset setproperty).</summary>
+        /// <summary>Save an asset to its source file; SaveAsset reimports it so the Library cache matches (same as asset setproperty).</summary>
         public static string SaveAndReimport(Asset asset, string guid)
         {
             var relativePath = AssetDatabase.GuidToPath(guid);
@@ -29,8 +29,6 @@ namespace Freefall.Editor.Commands
             }
             var fullPath = Path.Combine(Engine.Project.AssetsDirectory, relativePath);
             Engine.Assets.SaveAsset(asset, fullPath);
-            AssetDatabase.ImportAssetByPath(relativePath);
-            asset.ClearDirty();
             return fullPath;
         }
 

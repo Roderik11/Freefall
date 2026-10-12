@@ -461,6 +461,65 @@ namespace Freefall.Components
             return true;
         }
 
+        /// <summary>
+        /// A humanoid bone as a parent: what to give a thing its own position, rotation and scale
+        /// against, as if it were a child of the bone. Put the thing under the character's entity
+        /// with <c>local = scale · rotation · position (the thing's own, as a child) × frame</c>.
+        ///
+        /// The frame is that of the bone on the rig the clips are made for, as an editor shows it
+        /// (Unity, for a rig imported from the same file), at the place the character's own bone
+        /// is. So the numbers are the ones a child of that bone has in the scene the animations
+        /// come from: a sword under the right hand of the kit's mannequin sits on every character
+        /// the kit's clips are retargeted to with the transform it has there, whichever way that
+        /// character's own bones lie. A character that plays its clips directly has only its own
+        /// rig. In the entity's space and without scale; false until the character has been
+        /// posed once after the first call, and for a bone the skeleton does not have.
+        /// </summary>
+        public bool TryGetBoneFrame(HumanoidBone bone, out Matrix4x4 frame)
+        {
+            frame = Matrix4x4.Identity;
+            _keepBonePoses = true;
+
+            var skeleton = _bonePoseSkeleton;
+            var poses = _bonePoses;
+            if (skeleton == null || poses == null) return false;
+
+            var humanoid = s_humanoid.GetValue(skeleton, static s => HumanoidTemplate.Detect(s) ?? new Dictionary<HumanoidBone, int>());
+            if (!humanoid.TryGetValue(bone, out int index) || (uint)index >= (uint)poses.Length) return false;
+            if (!Matrix4x4.Decompose(poses[index], out _, out var rotation, out var position)) return false;
+
+            // Retargeted, the bone of the clips' rig lies another way in its own space than the
+            // character's does: by what retargeting made of it in the last update. The pose kept
+            // may have been turned since (the aim on the spine), which carries over as it is.
+            bool rigFlipped = skeleton.FlipXZ;
+            var map = _boneMap;
+            var made = _retargetedModelRot;
+            var given = _srcAnimModelRot;
+            if (map != null && ReferenceEquals(map.Target, skeleton) && made != null && given != null && index < made.Length)
+            {
+                int source = map.TargetToSource[index];
+                if (source >= 0 && source < given.Length)
+                {
+                    rotation = Quaternion.Normalize(rotation * Quaternion.Inverse(made[index]) * given[source]);
+                    rigFlipped = map.Source.FlipXZ;
+                }
+            }
+
+            // A rig imported with its mesh turned round (FlipXZ) has its model space, and each
+            // bone's own space, half a turn about the vertical from what an editor shows. The
+            // first comes from the skeleton that is posed, the second from the rig of the frame.
+            var half = Quaternion.CreateFromAxisAngle(Vector3.UnitY, MathF.PI);
+            if (skeleton.FlipXZ)
+            {
+                rotation = half * rotation;
+                position = new Vector3(-position.X, position.Y, -position.Z);
+            }
+            if (rigFlipped) rotation = rotation * half;
+
+            frame = Matrix4x4.CreateFromQuaternion(Quaternion.Normalize(rotation)) * Matrix4x4.CreateTranslation(position);
+            return true;
+        }
+
         // In the model space of the skeleton root motion is taken from
         private Vector3 _frameRootMotion; // blended over the layers updated so far this frame
         private Vector3 _layerRootMotion; // what the layer being updated asked for

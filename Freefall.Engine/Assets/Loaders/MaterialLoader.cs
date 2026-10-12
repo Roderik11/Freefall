@@ -120,8 +120,8 @@ namespace Freefall.Assets.Loaders
         }
 
         /// <summary>
-        /// Save a Material to its source .mat file as YAML, then re-import
-        /// so the binary cache (.asset) stays in sync.
+        /// Save a Material to its source .mat file as YAML. AssetManager.SaveAsset imports the file
+        /// afterwards, so the binary cache (.asset) stays in sync.
         /// </summary>
         public void Save(Asset asset, string savePath)
         {
@@ -129,16 +129,6 @@ namespace Freefall.Assets.Loaders
             var yaml = serializer.Serialize(asset);
             File.WriteAllText(savePath, yaml, Encoding.UTF8);
             Debug.Log($"[MaterialLoader] Saved: {savePath}");
-
-            // Re-import to update the binary cache. A newly created file isn't tracked yet
-            // (ImportAssetByPath would throw); the caller's Refresh registers and imports it.
-            var assetsDir = Engine.Project?.AssetsDirectory;
-            if (!string.IsNullOrEmpty(assetsDir) && savePath.StartsWith(assetsDir))
-            {
-                var relativePath = Path.GetRelativePath(assetsDir, savePath).Replace('\\', '/');
-                if (AssetDatabase.PathToGuid(relativePath) != null)
-                    AssetDatabase.ImportAssetByPath(relativePath);
-            }
         }
     }
 }

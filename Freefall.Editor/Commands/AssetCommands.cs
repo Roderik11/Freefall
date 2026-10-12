@@ -316,6 +316,8 @@ namespace Freefall.Editor.Commands
     /// POST /api/asset/save
     /// Body: {"guid":"..."} or {"guid":"...", "path":"D:/custom/path.terrain"}
     /// Without 'path' the asset is written to its own source file (resolved by GUID through the AssetDatabase).
+    /// SaveAsset imports a tracked file right after writing it, so the cache holds the saved state too; a
+    /// 'path' the database does not track is only written.
     /// </summary>
     [CommandRoute("POST", "/api/asset/save")]
     public class SaveAssetCommand : EditorCommand
@@ -470,8 +472,6 @@ namespace Freefall.Editor.Commands
                     {
                         savedPath = Path.Combine(Engine.Project.AssetsDirectory, relativePath);
                         Engine.Assets.SaveAsset(asset, savedPath);
-                        AssetDatabase.ImportAssetByPath(relativePath);
-                        asset.ClearDirty();
                     }
                     else
                     {

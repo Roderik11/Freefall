@@ -11,12 +11,14 @@ namespace Freefall.Assets
     public static class AssetFile
     {
         /// <summary>
-        /// Save an asset definition to a .asset YAML file.
+        /// Save an asset definition to a .asset YAML file. A file the asset database tracks is imported
+        /// right after, like AssetManager.SaveAsset does, so the cached artifact matches it.
         /// </summary>
         public static void Save(string path, Asset asset)
         {
             NativeImporter.Save(path, asset);
             asset.ClearDirty();
+            AssetDatabase.ImportSavedFile(path);
         }
 
         /// <summary>

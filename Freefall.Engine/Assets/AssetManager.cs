@@ -501,6 +501,9 @@ namespace Freefall.Assets
         /// <summary>
         /// Save an asset via the type-specific IAssetLoader.Save() method.
         /// Falls back to NativeImporter.Save() for types without a dedicated saver.
+        /// A file the asset database tracks is imported right after, so the cached artifact never lags behind
+        /// the saved file (AssetDatabase.ImportSavedFile). Callers don't import it again; a new file is
+        /// registered and imported by the caller's AssetDatabase.Refresh.
         /// </summary>
         public void SaveAsset(Asset asset, string savePath)
         {
@@ -519,6 +522,7 @@ namespace Freefall.Assets
             }
 
             asset.ClearDirty();
+            AssetDatabase.ImportSavedFile(savePath);
         }
 
         public Task<T> LoadAsync<T>(string path) where T : Asset

@@ -7,9 +7,25 @@ namespace Freefall.Base
 {
     public class PhysXErrorOutput : ErrorCallback
     {
+        // A call PhysX refuses changes nothing and is reported only here, so warnings and errors
+        // have to reach the console in Release builds too; Debug.Log is compiled out of those.
         public override void ReportError(ErrorCode errorCode, string message, string file, int lineNumber)
         {
-            Debug.Log($"[PhysX] {errorCode}: {message}");
+            string text = $"[PhysX] {errorCode}: {message}";
+
+            switch (errorCode)
+            {
+                case ErrorCode.NoError:
+                case ErrorCode.DebugInfo:
+                    Debug.Log(text);
+                    break;
+                case ErrorCode.Warning:
+                    Debug.LogWarning(text);
+                    break;
+                default:
+                    Debug.LogError(text);
+                    break;
+            }
         }
     }
 
@@ -97,7 +113,8 @@ namespace Freefall.Base
         }
 
         /// <summary>
-        /// Performs a raycast against the physics scene, returning the closest hit.
+        /// Performs a raycast against the physics scene, returning the closest hit that is not a trigger.
+        /// A ray that starts inside a shape hits it at the origin, with the normal facing back along the ray.
         /// </summary>
         public static bool Raycast(Vector3 origin, Vector3 direction, float maxDistance,
                                    out Vector3 hitPosition, out Vector3 hitNormal)
@@ -107,27 +124,35 @@ namespace Freefall.Base
 
             if (Scene == null) return false;
 
-            Vector3 pos = origin;
+            direction = Vector3.Normalize(direction);
+
             Vector3 nrm = Vector3.UnitY;
-            float closestDist = maxDistance;
+            float closestDist = float.MaxValue;
             bool found = false;
 
-            Scene.Raycast(origin, Vector3.Normalize(direction), maxDistance, 1,
+            // The query hands over every hit along the ray, up to maximumHits per call and in no
+            // order, so the closest has to be picked out here. hit.Normal is only filled when the
+            // flag asks for it; the position comes from the distance, which is always right.
+            Scene.Raycast(origin, direction, maxDistance, 8,
                 (hits) =>
                 {
-                    if (hits != null && hits.Length > 0)
+                    if (hits == null) return true;
+
+                    foreach (var hit in hits)
                     {
-                        var hit = hits[0];
-                        pos = hit.Position;
+                        if (hit == null || hit.Distance >= closestDist) continue;
+                        if (hit.Shape != null && (hit.Shape.Flags & ShapeFlag.TriggerShape) != 0) continue;
+
+                        closestDist = hit.Distance;
                         nrm = hit.Normal;
                         found = true;
                     }
                     return true;
-                });
+                }, HitFlag.Normal);
 
             if (found)
             {
-                hitPosition = pos;
+                hitPosition = origin + direction * closestDist;
                 hitNormal = nrm;
             }
 

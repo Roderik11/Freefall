@@ -124,23 +124,31 @@ namespace Freefall.Editor
             }
         }
 
+        /// <summary>
+        /// The angles FromEuler makes this rotation from: X = pitch, Y = yaw, Z = roll, applied
+        /// roll first, then pitch, then yaw (what Unity shows for the same rotation). It has to
+        /// be the exact way back: the boxes are read again on every commit, and the angles of
+        /// another order (as this used to give) turned a rotation about more than one axis into
+        /// a different one as soon as a single box was edited.
+        /// </summary>
         static Vector3 ToEuler(Quaternion q)
         {
-            float deg = 180f / MathF.PI;
-            float sinr_cosp = 2f * (q.W * q.X + q.Y * q.Z);
-            float cosr_cosp = 1f - 2f * (q.X * q.X + q.Y * q.Y);
-            float roll = MathF.Atan2(sinr_cosp, cosr_cosp) * deg;
+            const float deg = 180f / MathF.PI;
+            q = Quaternion.Normalize(q);
 
-            float sinp = 2f * (q.W * q.Y - q.Z * q.X);
-            float pitch = MathF.Abs(sinp) >= 1f
-                ? MathF.CopySign(90f, sinp)
-                : MathF.Asin(sinp) * deg;
+            float sinPitch = 2f * (q.W * q.X - q.Y * q.Z);
 
-            float siny_cosp = 2f * (q.W * q.Z + q.X * q.Y);
-            float cosy_cosp = 1f - 2f * (q.Y * q.Y + q.Z * q.Z);
-            float yaw = MathF.Atan2(siny_cosp, cosy_cosp) * deg;
+            // Looking straight up or down, yaw and roll turn about the same axis: all of it goes to yaw
+            if (MathF.Abs(sinPitch) > 0.99999f)
+            {
+                float turn = MathF.Atan2(2f * (q.W * q.Y - q.X * q.Z), 1f - 2f * (q.Y * q.Y + q.Z * q.Z)) * deg;
+                return new Vector3(MathF.CopySign(90f, sinPitch), turn, 0f);
+            }
 
-            return new Vector3(roll, pitch, yaw);
+            float pitch = MathF.Asin(sinPitch) * deg;
+            float yaw = MathF.Atan2(2f * (q.W * q.Y + q.X * q.Z), 1f - 2f * (q.X * q.X + q.Y * q.Y)) * deg;
+            float roll = MathF.Atan2(2f * (q.W * q.Z + q.X * q.Y), 1f - 2f * (q.X * q.X + q.Z * q.Z)) * deg;
+            return new Vector3(pitch, yaw, roll);
         }
 
         static Quaternion FromEuler(Vector3 euler)

@@ -18,19 +18,43 @@ namespace Freefall.Components
 
         public Actor? Actor => _staticActor;
 
+        /// <summary>
+        /// Where the shape sits, in metres in the entity's frame (rotated with it, not scaled).
+        /// Read when the shape is made.
+        /// </summary>
         public Vector3 Offset;
 
+        private bool _isTrigger;
+
+        /// <summary>
+        /// A trigger takes no part in the simulation: bodies fall through it and character
+        /// controllers walk through it. Queries still report it (PhysicsWorld.Raycast leaves it out).
+        /// Meshes and terrain cannot be triggers.
+        /// </summary>
         public bool IsTrigger
         {
-            get => _shape != null && (_shape.Flags & ShapeFlag.TriggerShape) != 0;
+            get => _isTrigger;
             set
             {
-                if (_shape == null) return;
-                if (value)
-                    _shape.Flags |= ShapeFlag.TriggerShape;
-                else
-                    _shape.Flags &= ~ShapeFlag.TriggerShape;
+                _isTrigger = value;
+                ApplyTrigger();
             }
+        }
+
+        // Kept in a field because it is set before there is a shape (a scene load, the editor).
+        // PhysX refuses a shape that is a trigger and a simulation shape at once, so both flags
+        // change in one assignment.
+        private void ApplyTrigger()
+        {
+            if (_shape == null) return;
+
+            var flags = _shape.Flags;
+            _shape.Flags = _isTrigger
+                ? (flags & ~ShapeFlag.SimulationShape) | ShapeFlag.TriggerShape
+                : (flags & ~ShapeFlag.TriggerShape) | ShapeFlag.SimulationShape;
+
+            if (_isTrigger && (_shape.Flags & ShapeFlag.TriggerShape) == 0)
+                Debug.LogWarning($"[Collider] {Entity?.Name}: a {GetType().Name} cannot be a trigger, it stays solid");
         }
 
         protected override void Awake()
@@ -104,14 +128,28 @@ namespace Freefall.Components
                 return;
 
             _shape = RigidActorExt.CreateExclusiveShape(actor, geometry, PhysicsWorld.DefaultMaterial);
+            if (_isTrigger)
+                ApplyTrigger();
+
+            // Offset is in the collider's own frame; on a child of the actor's entity that frame
+            // is carried into the actor's.
+            var localPose = Matrix4x4.CreateTranslation(Offset);
+
+            // A PhysX capsule runs along its X axis; ours stands along the entity's Y.
+            if (geometry is CapsuleGeometry)
+                localPose = Matrix4x4.CreateRotationZ(MathF.PI / 2) * localPose;
+
             if(root != Entity)
             {
                 Matrix4x4.Invert(root.Transform.Matrix, out var worldInverse);
                 var relativeToParent = Matrix4x4.Multiply(Transform.Matrix, worldInverse);
                 relativeToParent.Deconstruct(out var shapeScale, out var shapeRotation, out var shapeTranslation);
                 var shapeWorldMatrix = Matrix4x4.CreateFromQuaternion(shapeRotation) * Matrix4x4.CreateTranslation(shapeTranslation);
-                _shape.LocalPose = shapeWorldMatrix;
+                localPose *= shapeWorldMatrix;
             }
+
+            if (!localPose.IsIdentity)
+                _shape.LocalPose = localPose;
         }
 
         public override void Destroy()
@@ -132,18 +170,8 @@ namespace Freefall.Components
 
     public class BoxCollider : Collider, ISceneGizmo
     {
+        /// <summary>Full edge lengths in metres. The entity's scale does not change them.</summary>
         public Vector3 Size = Vector3.One;
-
-        protected override void Awake()
-        {
-            var meshrenderer = Entity?.GetComponent<MeshRenderer>();
-            if (meshrenderer != null && meshrenderer.Mesh != null)
-            {
-                var bounds = meshrenderer.Mesh.BoundingBox;
-                Size = bounds.Size * 2;
-                Offset = bounds.Center;
-            }
-        }
 
         public override PhysX.Geometry? CreateGeometry()
         {
@@ -153,7 +181,7 @@ namespace Freefall.Components
         public void DrawGizmos(GizmoContext ctx)
         {
             ctx.Color = new Color4(0.3f, 0.8f, 1f, 1f);
-            ctx.DrawWireBox(Offset, Size * 0.5f);
+            ctx.DrawWireBox(Offset, Size);
         }
     }
 
@@ -175,17 +203,25 @@ namespace Freefall.Components
     public class CapsuleCollider : Collider, ISceneGizmo
     {
         public float Radius = 0.5f;
+
+        /// <summary>From end to end along the entity's Y, caps included. Never less than a ball of the radius.</summary>
         public float Height = 2.0f;
 
         public override PhysX.Geometry? CreateGeometry()
         {
-            return new CapsuleGeometry(Radius, Height * 0.5f);
+            // PhysX takes half the cylinder between the caps, and refuses a capsule that has
+            // none: that one is a sphere.
+            float halfCylinder = Height * 0.5f - Radius;
+            if (halfCylinder <= 0f)
+                return new SphereGeometry(Radius);
+
+            return new CapsuleGeometry(Radius, halfCylinder);
         }
 
         public void DrawGizmos(GizmoContext ctx)
         {
             ctx.Color = new Color4(0.3f, 0.8f, 1f, 1f);
-            ctx.DrawCapsule(Offset, Height, Radius);
+            ctx.DrawCapsule(Offset, MathF.Max(Height, Radius * 2f), Radius);
         }
     }
 

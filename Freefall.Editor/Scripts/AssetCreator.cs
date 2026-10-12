@@ -43,8 +43,7 @@ namespace Freefall.Editor
         }
 
         /// <summary>
-        /// Save all dirty assets to disk and clear their dirty flags.
-        /// Evicts stale entries from AssetManager cache and triggers reimport.
+        /// Save all dirty assets to disk (each is imported again by the save) and clear their dirty flags.
         /// Returns the number of assets saved.
         /// </summary>
         public static int SaveChangedAssets()
@@ -69,16 +68,9 @@ namespace Freefall.Editor
 
                 try
                 {
+                    // Writes the file and imports it, so the packed binary matches
                     Engine.Assets.SaveAsset(asset, savePath);
                     saved++;
-
-                    // Reimport source → cache so the packed binary matches
-                    if (!string.IsNullOrEmpty(asset.Guid))
-                    {
-                        var relativePath = AssetDatabase.GuidToPath(asset.Guid);
-                        if (relativePath != null)
-                            AssetDatabase.ImportAssetByPath(relativePath);
-                    }
 
                     Debug.Log($"[AssetCreator] Saved: {asset.Name} → {savePath}");
                 }

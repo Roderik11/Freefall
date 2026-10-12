@@ -165,6 +165,10 @@ namespace Freefall.Components
 
         public void Update()
         {
+            // Not awake yet: a source added while this frame's updates are running can get its
+            // first Update before its Awake, and there is nothing to place a sound with until then
+            if (emitter == null) return;
+
             var listener = AudioListener.Main?.Listener;
             if (listener == null) return;
 

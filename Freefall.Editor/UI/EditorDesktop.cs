@@ -827,17 +827,8 @@ namespace Freefall.Editor
 
             try
             {
+                // Writes the file and imports it, so the cache matches the YAML just written
                 Engine.Assets.SaveAsset(selectedAsset, savePath);
-
-                // Reimport source → cache so the packed binary matches
-                // the YAML we just wrote. Without this, EvictByGuid would
-                // cause the next load to read stale cache data.
-                if (!string.IsNullOrEmpty(selectedAsset.Guid))
-                {
-                    var relativePath = AssetDatabase.GuidToPath(selectedAsset.Guid);
-                    if (relativePath != null)
-                        AssetDatabase.ImportAssetByPath(relativePath);
-                }
 
                 Debug.Log($"[Editor] Asset saved: {savePath}");
                 Toast.Show($"Saved to:\n{savePath}", 2.0f);

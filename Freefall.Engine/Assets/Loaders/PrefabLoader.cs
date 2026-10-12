@@ -55,8 +55,8 @@ namespace Freefall.Assets.Loaders
         }
 
         /// <summary>
-        /// Save a Prefab's SourceYaml back to its source .prefab file,
-        /// then re-import so the binary cache stays in sync.
+        /// Save a Prefab's SourceYaml back to its source .prefab file. AssetManager.SaveAsset imports the
+        /// file afterwards, so the binary cache stays in sync.
         /// </summary>
         public void Save(Asset asset, string savePath)
         {
@@ -69,15 +69,6 @@ namespace Freefall.Assets.Loaders
 
             File.WriteAllBytes(savePath, prefab.SourceYaml);
             Debug.Log($"[PrefabLoader] Saved: {savePath}");
-
-            // Re-import to update the binary cache (may fail for newly created files)
-            var assetsDir = Engine.Project?.AssetsDirectory;
-            if (!string.IsNullOrEmpty(assetsDir) && savePath.StartsWith(assetsDir))
-            {
-                var relativePath = Path.GetRelativePath(assetsDir, savePath).Replace('\\', '/');
-                try { AssetDatabase.ImportAssetByPath(relativePath); }
-                catch { /* File not yet tracked — caller will Refresh + Import */ }
-            }
         }
     }
 }

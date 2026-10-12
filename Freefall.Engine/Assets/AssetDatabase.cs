@@ -200,6 +200,26 @@ namespace Freefall.Assets
             ImportAsset(_guidToMeta[guid]);
         }
 
+        /// <summary>
+        /// Import a source file that was just written from inside the editor (an asset saved to its file), so
+        /// the cached artifact holds what the file holds. Nothing watches asset files: without this the cache
+        /// keeps the previous state until the next ImportAll, and whoever loads the asset before that gets the
+        /// older state (a script reload evicts the assets of script classes and loads them again from the cache).
+        /// False if the database does not track the file: a path outside Assets, or a new file, which the
+        /// caller's Refresh registers and imports.
+        /// </summary>
+        public static bool ImportSavedFile(string fullPath)
+        {
+            if (Project == null || string.IsNullOrEmpty(fullPath)) return false;
+
+            var relativePath = Path.GetRelativePath(Project.AssetsDirectory, Path.GetFullPath(fullPath));
+            if (!_pathToGuid.TryGetValue(NormalizePath(relativePath), out var guid) || !_guidToMeta.TryGetValue(guid, out var meta))
+                return false;
+
+            ImportAsset(meta);
+            return true;
+        }
+
         // ── Lookups ──
 
         public static string PathToGuid(string relativePath)
