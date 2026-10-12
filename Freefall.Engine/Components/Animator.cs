@@ -298,11 +298,49 @@ namespace Freefall.Components
                 InitRetargeting();
 
             UpdateAnimationSet();
-            UpdateLayers();
+
+            // A clip being looked at takes the place of the graph for as long as it is asked for
+            _previewing = _previewClip != null && Environment.TickCount64 <= _previewUntil;
+            if (_previewing)
+            {
+                RootMotionDelta = Vector3.Zero;
+                RootTurnDelta = 0f;
+            }
+            else
+            {
+                _previewClip = null;
+                UpdateLayers();
+            }
 
             _sourceEvaluated = false;
             WalkChildren(Entity.Transform);
         }
+
+        // --- Looking at one clip ---
+
+        private AnimationClip _previewClip;
+        private float _previewSeconds;
+        private long _previewUntil;
+        private bool _previewing;
+
+        /// <summary>
+        /// Show one clip at one moment in place of what the graph plays: for an editor that
+        /// scrubs through a clip on this character. It lasts <paramref name="holdSeconds"/>
+        /// and has to be asked for again to stay (every frame while scrubbing), so a character
+        /// is never left frozen by something that stopped asking. The clip shows as it is, with
+        /// its travel: a lunge reaches as far as it reaches. The graph stands still meanwhile
+        /// and no events are reported. Null ends it at once.
+        /// </summary>
+        public void Preview(AnimationClip clip, float seconds, float holdSeconds = 0.25f)
+        {
+            _previewClip = clip;
+            _previewSeconds = MathF.Max(0f, seconds);
+            _previewUntil = Environment.TickCount64 + (long)(MathF.Max(0f, holdSeconds) * 1000f);
+        }
+
+        /// <summary>The clip being shown through <see cref="Preview"/> in the last update, or null.</summary>
+        [Freefall.Reflection.DontSerialize]
+        public AnimationClip Previewed => _previewing ? _previewClip : null;
 
         // --- Root motion ---
 
@@ -804,15 +842,24 @@ namespace Freefall.Components
                 _srcPose = new BonePose[count];
             }
 
-            _sourcePoseState.RootBone = _boneMap.SourceRoot;
-            PrepareLayers(_sourcePoseState, source);
+            // A clip being looked at (Preview) is sampled as it is; the layers are left as they stand
+            var preview = _previewing ? _previewClip : null;
+
+            if (preview == null)
+            {
+                _sourcePoseState.RootBone = _boneMap.SourceRoot;
+                PrepareLayers(_sourcePoseState, source);
+            }
 
             for (int j = 0; j < count; j++)
             {
                 var srcBone = source.Bones[j];
                 BonePose blendPose = srcBone.BindPose;
 
-                BlendLayers(source.Bones, j, _srcAnimModelRot, ref blendPose);
+                if (preview != null)
+                    preview.GetBonePose(source.Bones, j, _previewSeconds, ref blendPose);
+                else
+                    BlendLayers(source.Bones, j, _srcAnimModelRot, ref blendPose);
                 _srcPose[j] = blendPose;
 
                 int parent = srcBone.Parent;
@@ -821,7 +868,8 @@ namespace Freefall.Components
                     : blendPose.Rotation;
             }
 
-            FinishLayers();
+            if (preview == null)
+                FinishLayers();
         }
 
         /// <summary>
@@ -1260,7 +1308,7 @@ namespace Freefall.Components
                 // Without retargeting the pose is blended on this skeleton directly: track its
                 // model-space rotations when a masked layer keeps its own orientation.
                 _poseBones = skeleton;
-                _trackPoseModelRot = PrepareLayers(state, target);
+                _trackPoseModelRot = !_previewing && PrepareLayers(state, target);
                 if (_trackPoseModelRot && (_poseModelRot == null || _poseModelRot.Length != count))
                     _poseModelRot = new Quaternion[count];
             }
@@ -1268,7 +1316,7 @@ namespace Freefall.Components
             for (int i = 0; i < count; i++)
                 BlendBone(i, skeleton[i], out bones[i]);
 
-            if (_boneMap == null)
+            if (_boneMap == null && !_previewing)
                 FinishLayers();
 
             if (OnBoneTransform != null)
@@ -1408,7 +1456,10 @@ namespace Freefall.Components
             else
             {
                 blendPose = bone.BindPose;
-                BlendLayers(_poseBones, boneIndex, _poseModelRot, ref blendPose);
+                if (_previewing)
+                    _previewClip.GetBonePose(_poseBones, boneIndex, _previewSeconds, ref blendPose);
+                else
+                    BlendLayers(_poseBones, boneIndex, _poseModelRot, ref blendPose);
 
                 if (_trackPoseModelRot)
                 {

@@ -24,7 +24,9 @@ namespace Freefall.Editor
 
             // The slots are those of the base graph: list them again when it changes
             var baseProperty = target.GetProperty(nameof(AnimationSet.Base));
-            baseProperty.OnValueChanged += () => MessageDispatcher.Send(Msg.RefreshInspector);
+            // With the set as what to show: an asset is not in the selection, and a refresh without it
+            // leaves the inspector empty
+            baseProperty.OnValueChanged += () => MessageDispatcher.Send(Msg.RefreshInspector, _set);
             AddProperty(baseProperty);
             AddProperty(target.GetProperty(nameof(AnimationSet.FingerWeight)));
 

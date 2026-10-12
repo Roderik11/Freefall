@@ -158,6 +158,9 @@ namespace Freefall.Editor
             scrollpanel.Scroll(0);
             scrollpanel.Content.Controls.Clear();
 
+            // The clip inspector shows clips on the character that was selected last
+            ClipPreview.Note(Selector.Selection);
+
             var array = Selector.Selection.Cast<object>().ToArray();
             GUIObject target = null;
 

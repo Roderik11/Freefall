@@ -43,7 +43,32 @@ namespace Freefall.Assets.Loaders
                     clip.Skeleton = manager.LoadByGuid<Skeleton>(skelEntry.Guid);
             }
 
+            ApplyClipConfig(clip, sourceGuid);
+
             return clip;
+        }
+
+        /// <summary>
+        /// Put on the clip what is marked on it in the settings of the file it comes from
+        /// (ModelImporter.Clips). Those are not in the cache, so marking an event needs no reimport.
+        /// </summary>
+        private static void ApplyClipConfig(AnimationClip clip, string clipGuid)
+        {
+            if (string.IsNullOrEmpty(clipGuid)) return;
+
+            // Skip reading the importer back unless some clip of the file has settings
+            var settings = AssetDatabase.GetMeta(clipGuid)?.ImporterSettings;
+            if (settings == null || !settings.Contains("\"Events\"")) return;
+
+            if (AssetDatabase.GetImporter(clipGuid) is not Importers.ModelImporter importer) return;
+
+            var config = importer.FindClipConfig(AssetDatabase.ResolveFriendlyName(clipGuid));
+            if (config?.Events == null || config.Events.Count == 0) return;
+
+            var events = new System.Collections.Generic.List<AnimationEvent>(config.Events.Count);
+            foreach (var e in config.Events)
+                if (e != null) events.Add(e);
+            clip.Events = events;
         }
     }
 }

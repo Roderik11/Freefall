@@ -49,6 +49,22 @@ namespace Freefall.Assets.Importers
     }
 
     /// <summary>
+    /// Per-clip settings for one animation clip produced by the import. Keyed by the clip sub-asset name.
+    /// Applied by AnimationClipLoader at load, so changing them needs no reimport, and a reimport keeps them.
+    /// </summary>
+    [Serializable]
+    public class ClipConfig
+    {
+        [ReadOnly(true)]
+        public string Name = string.Empty;
+
+        /// <summary>What is marked on the clip (AnimationClip.Events).</summary>
+        public List<Freefall.Animation.AnimationEvent> Events = new();
+
+        public override string ToString() => Name;
+    }
+
+    /// <summary>
     /// Unified model importer for FBX, DAE, OBJ files.
     /// Produces all artifacts from a single source: mesh data, skeleton, and animations.
     /// Replaces MeshImporter and AnimationClipImporter for standard model files.
@@ -100,6 +116,51 @@ namespace Freefall.Assets.Importers
                 Meshes.Add(cfg);
             }
             return cfg;
+        }
+
+        /// <summary>Per-clip settings, by clip sub-asset name. Only clips that have any are listed.</summary>
+        public List<ClipConfig> Clips = new();
+
+        public ClipConfig? FindClipConfig(string clipName)
+        {
+            foreach (var cfg in Clips)
+                if (string.Equals(cfg.Name, clipName, StringComparison.OrdinalIgnoreCase))
+                    return cfg;
+            return null;
+        }
+
+        /// <summary>
+        /// Write the events of a loaded clip into the settings of the file it comes from and save
+        /// them (no reimport: they are put on the clip at load). A clip without events is taken
+        /// off the list. False for a clip that does not come from a model file.
+        /// </summary>
+        public static bool SetClipEvents(Freefall.Animation.AnimationClip clip)
+        {
+            if (clip == null || string.IsNullOrEmpty(clip.Guid)) return false;
+            if (AssetDatabase.GetImporter(clip.Guid) is not ModelImporter importer) return false;
+
+            string name = AssetDatabase.ResolveFriendlyName(clip.Guid);
+            var config = importer.FindClipConfig(name);
+
+            var events = new List<Freefall.Animation.AnimationEvent>();
+            if (clip.Events != null)
+                foreach (var e in clip.Events)
+                    if (e != null)
+                        events.Add(new Freefall.Animation.AnimationEvent { Name = e.Name ?? string.Empty, Time = Math.Clamp(e.Time, 0f, 1f), Bone = e.Bone });
+            events.Sort(static (a, b) => a.Time.CompareTo(b.Time));
+
+            if (events.Count == 0)
+            {
+                if (config == null) return true;
+                importer.Clips.Remove(config);
+            }
+            else
+            {
+                if (config == null) importer.Clips.Add(config = new ClipConfig { Name = name });
+                config.Events = events;
+            }
+
+            return AssetDatabase.SaveImporter(clip.Guid, importer) != null;
         }
 
         private List<Bone> _skeleton = new();

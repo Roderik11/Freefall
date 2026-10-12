@@ -15,7 +15,12 @@ namespace Freefall.Animation
         private readonly List<AnimationChannel> _channels = new List<AnimationChannel>();
         public readonly ReadOnlyCollection<AnimationChannel> Channels;
 
-        /// <summary>Animation events triggered at specific times.</summary>
+        /// <summary>
+        /// What is marked on this clip, in any order. Replace the list as a whole to change it
+        /// while characters play the clip (their updates read it in parallel). To keep a change,
+        /// write it to the importer's settings (<c>ModelImporter.SetClipEvents</c>): the clip
+        /// itself is imported data and is not saved.
+        /// </summary>
         public List<AnimationEvent> Events = new List<AnimationEvent>();
 
         /// <summary>The skeleton this clip was imported from (for retargeting).</summary>
@@ -506,7 +511,12 @@ namespace Freefall.Animation
     /// Something that happens at a point of a clip: the blow of a swing lands, a hand lets go.
     /// The Animator reports it in the update in which playback passes that point
     /// (<c>Animator.GetEvents</c>).
+    ///
+    /// The events of a clip are kept with the file it is imported from, in the importer's
+    /// settings (<c>ModelImporter.Clips</c>), and put on the clip when it is loaded: they are
+    /// not part of the imported data, so marking one needs no reimport and a reimport keeps them.
     /// </summary>
+    [Serializable]
     public class AnimationEvent
     {
         /// <summary>
@@ -515,16 +525,20 @@ namespace Freefall.Animation
         /// </summary>
         public const string Footfall = "footfall";
 
-        /// <summary>When, as a fraction of the clip's length.</summary>
-        public float Time;
+        /// <summary>What happens: the name game code listens for.</summary>
+        public string Name = string.Empty;
 
-        public string Name;
+        /// <summary>When, as a fraction of the clip's length.</summary>
+        [Freefall.ValueRange(0f, 1f, 0.001f)]
+        public float Time;
 
         /// <summary>
         /// Where on the body it happens, when that matters. A clip played left for right
         /// reports the bone of the other side.
         /// </summary>
         public HumanoidBone? Bone;
+
+        public override string ToString() => $"{(string.IsNullOrEmpty(Name) ? "(unnamed)" : Name)} at {Time:0.00}";
     }
 
     /// <summary>An <see cref="AnimationEvent"/> as it was passed on one Animator.</summary>
