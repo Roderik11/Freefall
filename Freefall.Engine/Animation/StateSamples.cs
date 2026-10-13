@@ -34,6 +34,13 @@ namespace Freefall.Animation
         /// facing the way it does in the clip (see <see cref="AnimationSet.MirrorLegsOnly"/>).
         /// </summary>
         public bool MirrorLegsOnly;
+
+        /// <summary>
+        /// A bone whose position is moved by a fixed amount, in its parent's space, and the
+        /// amount (see <see cref="AnimationState.Offset"/>). -1: none.
+        /// </summary>
+        public int ShiftBone;
+        public Vector3 Shift;
     }
 
     /// <summary>
@@ -91,6 +98,12 @@ namespace Freefall.Animation
         }
 
         private static void Read(ref ClipSample sample, Bone bone, int boneIndex, ref BonePose pose)
+        {
+            ReadClip(ref sample, bone, boneIndex, ref pose);
+            if (boneIndex == sample.ShiftBone) pose.Position += sample.Shift;
+        }
+
+        private static void ReadClip(ref ClipSample sample, Bone bone, int boneIndex, ref BonePose pose)
         {
             var mirror = sample.Mirror;
             if (mirror == null)

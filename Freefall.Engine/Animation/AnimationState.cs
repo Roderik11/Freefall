@@ -55,8 +55,8 @@ namespace Freefall.Animation
         /// <summary>
         /// The clip's travel over the ground moves the character: it is reported through
         /// <c>Animator.RootMotionDelta</c> for whoever moves it to apply. Off, the state plays in
-        /// place and the travel is dropped. Either way the travel is not in the pose.
-        /// On a blend tree this covers its children.
+        /// place and the travel is dropped. Either way the travel is not in the pose, unless
+        /// <see cref="TravelInPose"/> leaves it there. On a blend tree this covers its children.
         /// </summary>
         public bool RootMotion;
 
@@ -77,6 +77,40 @@ namespace Freefall.Animation
         /// reported for it. On a blend tree this covers its children.
         /// </summary>
         public bool RootLift;
+
+        /// <summary>
+        /// The clip plays as its file has it: its travel over the ground stays in the pose, so the
+        /// body moves off the spot the character stands on while the character itself stays where
+        /// it is. For clips that belong to a place and to each other there: sitting down onto a
+        /// seat behind, the idle on it and getting up again all count from the same spot, and with
+        /// the travel taken out of the two that have some, the body slides where one hands over
+        /// to the next. Nothing is reported, and <see cref="RootMotion"/>, <see cref="RootTurn"/>
+        /// and <see cref="RootLift"/> have no say. The state's own clip only: the children of a
+        /// blend tree each have their own.
+        /// </summary>
+        public bool TravelInPose;
+
+        /// <summary>
+        /// Play the clip from its end to its beginning: a stand-up as a sit-down. Everything that
+        /// counts time goes by how far the state is through playing it, as for a clip played
+        /// forwards: <see cref="Start"/> is where the way back is taken up (0.55 leaves out the
+        /// last 55% of the clip as its file has it), exit times and curves likewise. Marked events
+        /// are reported where the way back passes them; feet coming down are not, and neither
+        /// travel nor turn. The state's own clip only: the children of a blend tree each have
+        /// their own.
+        /// </summary>
+        public bool Reverse;
+
+        /// <summary>
+        /// Moves the body by a fixed amount: added to where the clip has the hips, in the model
+        /// space and the units of the skeleton the clip is played on (the rig it was made for,
+        /// as its file has it; on a retargeted character it is scaled and turned with the rest).
+        /// For a clip made around another spot than its neighbours: a seated idle whose hips are
+        /// 20 cm from where the way down leaves them. With <see cref="TravelInPose"/> the clips
+        /// of one place then agree, and the character itself need not be moved between them.
+        /// The state's own clip only: the children of a blend tree each have their own.
+        /// </summary>
+        public Vector3 Offset;
 
         public List<AnimationCurve> Curves = new List<AnimationCurve>();
 
@@ -178,7 +212,7 @@ namespace Freefall.Animation
             {
                 Vector3 travel = Vector3.Zero;
                 float turned = 0f;
-                if (RootMotion || RootTurn)
+                if ((RootMotion || RootTurn) && !TravelInPose && !Reverse)
                 {
                     RootStep(animator, pb, before, GetTimeElapsed(pb), wraps, RootTurn, out travel, out turned);
                     if (IsMirrored(pb))
@@ -277,7 +311,7 @@ namespace Freefall.Animation
                 for (int i = 0; i < events.Count; i++)
                 {
                     var evt = events[i];
-                    if (evt == null || !Passed(evt.Time, from, to, wrapped, first)) continue;
+                    if (evt == null || !Passed(Reverse ? 1f - evt.Time : evt.Time, from, to, wrapped, first)) continue;
 
                     var bone = evt.Bone;
                     if (mirrored && bone.HasValue) bone = HumanoidSides.Other(bone.Value);
@@ -285,7 +319,8 @@ namespace Freefall.Animation
                 }
             }
 
-            if (animator.FootfallEvents && animator.TryGetClipSkeleton(out var skeleton))
+            // Played backwards, a foot coming down is a foot leaving the ground
+            if (!Reverse && animator.FootfallEvents && animator.TryGetClipSkeleton(out var skeleton))
             {
                 var footfalls = clip.GetFootfalls(skeleton);
                 for (int i = 0; i < footfalls.Length; i++)
@@ -321,13 +356,25 @@ namespace Freefall.Animation
 
             float time = GetTimeElapsed(pb);
 
+            // With no root bone a clip hands out its own channels: the travel stays in them
+            int rootBone = TravelInPose ? -1 : samples.RootBone;
+
             ref var sample = ref samples.Add();
             sample.Mirror = mirrored && samples.Skeleton != null ? MirrorMap.Of(samples.Skeleton) : null;
             sample.MirrorLegsOnly = mirrored && pb.AnimationSet != null && pb.AnimationSet.MirrorLegsOnly;
-            sample.Channels = clip.ChannelsFor(bones, samples.RootBone, turning, lifting);
-            sample.Ticks = clip.TicksAt(time);
+            sample.Channels = clip.ChannelsFor(bones, rootBone, turning, lifting);
+            sample.Ticks = clip.TicksAt(Reverse ? MathF.Max(0f, clip.DurationSeconds - time) : time);
             sample.Share = share;
             sample.PreviousChannels = null;
+
+            // A slot of the samples is used again and again: both are set every time
+            sample.ShiftBone = -1;
+            sample.Shift = default;
+            if (Offset != Vector3.Zero && samples.RootBone >= 0)
+            {
+                sample.ShiftBone = samples.RootBone;
+                sample.Shift = IntoParentSpace(bones, samples.RootBone, Offset);
+            }
 
             if (pb.SetFade < 1f)
             {
@@ -335,13 +382,30 @@ namespace Freefall.Animation
                 if (previous != null && previous != clip)
                 {
                     float point = Aligned(time * clip.DurationSecondsInverse, pb.StartOf(this), pb.PreviousStartOf(this), Loop);
-                    sample.PreviousChannels = previous.ChannelsFor(bones, samples.RootBone, turning, lifting);
+                    if (Reverse) point = 1f - point;
+                    sample.PreviousChannels = previous.ChannelsFor(bones, rootBone, turning, lifting);
                     sample.PreviousTicks = previous.TicksAt(point * previous.DurationSeconds);
                     sample.SetFade = pb.SetFade;
                 }
             }
 
             return true;
+        }
+
+        // A direction in model space as the parent of a bone sees it, going by the bind pose of
+        // what is above the bone: a bone's position keys are in its parent's space.
+        private static Vector3 IntoParentSpace(Bone[] bones, int bone, Vector3 direction)
+        {
+            var above = Matrix4x4.Identity;
+            for (int parent = bones[bone].Parent; parent >= 0; parent = bones[parent].Parent)
+            {
+                var bind = bones[parent].BindPose;
+                above *= Matrix4x4.CreateScale(bind.Scale)
+                       * Matrix4x4.CreateFromQuaternion(bind.Rotation)
+                       * Matrix4x4.CreateTranslation(bind.Position);
+            }
+
+            return Matrix4x4.Invert(above, out var toParent) ? Vector3.TransformNormal(direction, toParent) : direction;
         }
 
         /// <summary>
