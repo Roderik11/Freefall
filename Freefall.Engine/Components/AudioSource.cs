@@ -35,6 +35,7 @@ namespace Freefall.Components
         private IXAudio2SourceVoice sourceVoice;
         private WaveFormat currentFormat;
         private AudioClip currentClip;
+        private float[] foldedMatrix;
         private bool firstUpdate = true;
 
         public AudioSource() { }
@@ -134,9 +135,25 @@ namespace Freefall.Components
             emitter.InnerRadius = MinDistance;
             emitter.CurveDistanceScaler = MathF.Max(FalloffStart, 0.01f);
 
+            // The emitter is one point with one channel. A clip with more is folded into it, every
+            // channel at its share (the average, as an .ogg is at import): asked for the clip's own
+            // count, X3DAudio filled the first channel's levels and left the others silent
+            var dspSettings = Engine.Audio3D.Calculate(listener, emitter, CalculateFlags.Matrix | CalculateFlags.Doppler, 1, 2);
             int sourceChannels = currentFormat?.Channels ?? 1;
-            var dspSettings = Engine.Audio3D.Calculate(listener, emitter, CalculateFlags.Matrix | CalculateFlags.Doppler, (uint)sourceChannels, 2);
-            sourceVoice.SetOutputMatrix((uint)sourceChannels, 2, dspSettings.MatrixCoefficients);
+            if (sourceChannels == 1)
+                sourceVoice.SetOutputMatrix(1, 2, dspSettings.MatrixCoefficients);
+            else
+            {
+                if (foldedMatrix?.Length != sourceChannels * 2)
+                    foldedMatrix = new float[sourceChannels * 2];
+
+                // XAudio2 reads the level from channel S to speaker D at [D * channels + S]
+                var levels = dspSettings.MatrixCoefficients;
+                for (int d = 0; d < 2; d++)
+                    for (int s = 0; s < sourceChannels; s++)
+                        foldedMatrix[d * sourceChannels + s] = levels[d] / sourceChannels;
+                sourceVoice.SetOutputMatrix((uint)sourceChannels, 2, foldedMatrix);
+            }
             sourceVoice.SetFrequencyRatio(dspSettings.DopplerFactor * Pitch, 0);
             sourceVoice.SetVolume(Volume);
         }
