@@ -11,6 +11,9 @@
 // it converts to visible ("effective") weights, alpha-composites the stamp, and converts back.
 // A layer that ends up completely covered keeps the weight it was painted with: nothing of it shows,
 // but filters that ask "was this painted here" (ExcludeLayers) can still see it.
+//
+// Second output: one R8_UINT texel per control texel naming the channel that shows most there. It is
+// what the CPU reads back to answer "which layer is under this point".
 
 #pragma kernel CS_SplatBake
 
@@ -29,6 +32,7 @@ cbuffer PushConstants : register(b3)
     uint  LayerCount;       // slot 7
     float MaxHeight;        // slot 8
     float TerrainSizeX;     // slot 9
+    uint  TopLayerIdx;      // slot 10 — UAV: RWTexture2D<uint>, the channel that shows most per texel
 };
 
 #define SPLAT_OP_PAINT    0u
@@ -132,4 +136,21 @@ void CS_SplatBake(uint3 dtid : SV_DispatchThreadID)
     uint sliceCount = min(SliceCount, 8u);
     for (uint s = 0; s < sliceCount; s++)
         output[uint3(dtid.xy, s)] = float4(raw[s * 4], raw[s * 4 + 1], raw[s * 4 + 2], raw[s * 4 + 3]);
+
+    // What the ground is here, for whoever asks on the CPU (TerrainRenderer.GetLayer): the channel
+    // with the greatest visible weight, stacked as the surface shader stacks them. 255 = nothing painted.
+    if (TopLayerIdx != 0)
+    {
+        RWTexture2D<uint> topLayer = ResourceDescriptorHeap[TopLayerIdx];
+
+        uint top = 255;
+        float most = 0.0, cover = 1.0;
+        for (int c = int(layerCount) - 1; c >= 0; c--)
+        {
+            float visible = raw[c] * cover;
+            if (visible > most) { most = visible; top = uint(c); }
+            cover *= (1.0 - raw[c]);
+        }
+        topLayer[dtid.xy] = top;
+    }
 }

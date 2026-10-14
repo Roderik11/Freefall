@@ -27,6 +27,21 @@ namespace Freefall.Animation
         /// </summary>
         public bool MirrorByPhase;
 
+        /// <summary>
+        /// A parameter that says which variant of a child plays. Children that sit at the same
+        /// point of the tree (<see cref="BlendLayer.Values"/>) stand in for one another, each for
+        /// one whole number of this parameter (<see cref="BlendLayer.Level"/>): the idle in the
+        /// middle of a locomotion tree with light, medium and heavy breathing at 0, 1 and 2. The
+        /// child at level 0 is the plain one and plays for every number that has no variant at
+        /// its point, so the rest of the tree needs nothing. When the number changes the tree
+        /// goes over from the one to the other in <see cref="LevelFade"/> seconds. Empty: every
+        /// child counts, as in a tree without variants (two at one point would then get no
+        /// weight at all).
+        /// </summary>
+        public string LevelParameter;
+
+        public float LevelFade = 0.6f;
+
         public override AnimationClip GetDominantClip() => _cachedDominantClip;
         private AnimationClip _cachedDominantClip;
 
@@ -112,7 +127,7 @@ namespace Freefall.Animation
         {
             int count = Layers.Count;
             Span<float> weights = count <= 32 ? stackalloc float[count] : new float[count];
-            Weigh(input, weights);
+            Weigh(input, 0, weights);
 
             int best = -1;
             float most = 0f;
@@ -236,7 +251,37 @@ namespace Freefall.Animation
                 ? stackalloc float[count]
                 : new float[count];
 
-            Weigh(input, normalizedWeights);
+            if (string.IsNullOrEmpty(LevelParameter))
+                Weigh(input, 0, normalizedWeights);
+            else
+            {
+                // Which variants play: the level asked for, and on the way there a share of the last one
+                int want = (int)MathF.Round(animator.GetParam(LevelParameter));
+                int level = (int)pb.Get(PK.State(ID, PK.Level));
+                int from = (int)pb.Get(PK.State(ID, PK.LevelFrom));
+                float left = pb.Get(PK.State(ID, PK.LevelLeft));
+
+                if (want != level)
+                {
+                    from = level;
+                    level = want;
+                    left = LevelFade > 0f ? 1f : 0f;
+                    pb.Set(PK.State(ID, PK.Level), level);
+                    pb.Set(PK.State(ID, PK.LevelFrom), from);
+                }
+                else if (left > 0f)
+                    left = MathF.Max(0f, left - Base.Time.SmoothDelta / LevelFade);
+                pb.Set(PK.State(ID, PK.LevelLeft), left);
+
+                Weigh(input, level, normalizedWeights);
+                if (left > 0f)
+                {
+                    Span<float> before = count <= 32 ? stackalloc float[count] : new float[count];
+                    Weigh(input, from, before);
+                    for (int i = 0; i < count; ++i)
+                        normalizedWeights[i] += (before[i] - normalizedWeights[i]) * left;
+                }
+            }
 
             for (int i = 0; i < count; ++i)
             {
@@ -245,14 +290,45 @@ namespace Freefall.Animation
             }
         }
 
-        /// <summary>The share of each child for an input, adding up to 1 (gradient band interpolation).</summary>
-        void Weigh(Vector2 input, Span<float> normalizedWeights)
+        /// <summary>
+        /// The child plays at this level: it is the variant for it, or the plain one (level 0) at
+        /// a point of the tree that has no variant for it.
+        /// </summary>
+        bool Counts(int index, int level)
+        {
+            int own = Layers[index].Level;
+            if (own == level) return true;
+            if (own != 0) return false;
+
+            var point = Layers[index].Values;
+            for (int j = 0; j < Layers.Count; j++)
+                if (j != index && Layers[j].Level == level && Layers[j].Values == point) return false;
+            return true;
+        }
+
+        /// <summary>
+        /// The share of each child for an input, adding up to 1 (gradient band interpolation),
+        /// among the children that play at <paramref name="level"/> (<see cref="LevelParameter"/>;
+        /// in a tree without one, all of them).
+        /// </summary>
+        void Weigh(Vector2 input, int level, Span<float> normalizedWeights)
         {
             float total_weight = 0.0f;
             int count = Layers.Count;
+            bool levelled = !string.IsNullOrEmpty(LevelParameter);
+
+            Span<bool> counts = count <= 32 ? stackalloc bool[count] : new bool[count];
+            for (int i = 0; i < count; ++i)
+                counts[i] = !levelled || Counts(i, level);
 
             for (int i = 0; i < count; ++i)
             {
+                if (!counts[i])
+                {
+                    normalizedWeights[i] = 0f;
+                    continue;
+                }
+
                 Vector2 point_i = Layers[i].Values;
                 Vector2 vec_is = input - point_i;
 
@@ -260,7 +336,7 @@ namespace Freefall.Animation
 
                 for (int j = 0; j < count; ++j)
                 {
-                    if (j == i)
+                    if (j == i || !counts[j])
                         continue;
 
                     Vector2 point_j = Layers[j].Values;
@@ -320,6 +396,9 @@ namespace Freefall.Animation
         {
             public AnimationState Animation = new AnimationState();
             public Vector2 Values;
+
+            /// <summary>Which number of the tree's <see cref="LevelParameter"/> this child plays for; 0 = the plain one.</summary>
+            public int Level;
         }
     }
 }

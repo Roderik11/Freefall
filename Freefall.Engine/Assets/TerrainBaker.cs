@@ -1177,10 +1177,11 @@ namespace Freefall.Assets
         /// <summary>
         /// Composite the splat stamps into the packed control array (ceil(layers / 4) RGBA slices).
         /// Clears what an earlier bake left, so a plan without stamps yields an empty array.
+        /// 'topLayerUAV' (0 = none) gets the channel that shows most per texel, see ReadbackTopLayers.
         /// Render callback.
         /// </summary>
         public void BakeSplat(CoveragePlan plan, ID3D12GraphicsCommandList cmd, Terrain terrain,
-            uint heightSrv, uint controlArrayUAV, int resolution, int sliceCount)
+            uint heightSrv, uint controlArrayUAV, uint topLayerUAV, int resolution, int sliceCount)
         {
             EnsureCoverageInitialized();
 
@@ -1202,9 +1203,79 @@ namespace Freefall.Assets
             _splatCS.SetPushConstant(k, "LayerCount", (uint)plan.TargetCount);
             _splatCS.SetParam(k, "MaxHeight", terrain.MaxHeight);
             _splatCS.SetParam(k, "TerrainSizeX", terrain.TerrainSize.X);
+            _splatCS.SetPushConstant(k, "TopLayer", topLayerUAV);
 
             uint groups = (uint)((resolution + 7) / 8);
             _splatCS.Dispatch(k, cmd, groups, groups);
+        }
+
+        /// <summary>
+        /// Reads back the splat bake's top-layer map (R8_UINT, in Common state): one byte per control
+        /// texel, row by row, holding the palette channel that shows most there (255 = none).
+        /// Blocks until the GPU has caught up, like <see cref="ReadbackHeightmap"/>. Main thread.
+        /// </summary>
+        public static byte[] ReadbackTopLayers(ID3D12Resource topLayerTex, int res)
+        {
+            if (topLayerTex == null || res <= 0)
+                return null;
+
+            var device = Engine.Device;
+            int rowPitch = (res + 255) & ~255; // 256-byte aligned
+            int totalBytes = rowPitch * res;
+
+            var readbackResource = device.NativeDevice.CreateCommittedResource(
+                new HeapProperties(HeapType.Readback),
+                HeapFlags.None,
+                ResourceDescription.Buffer((ulong)totalBytes),
+                ResourceStates.CopyDest,
+                null);
+
+            var allocator = device.NativeDevice.CreateCommandAllocator(CommandListType.Direct);
+            var cmdList = device.NativeDevice.CreateCommandList<ID3D12GraphicsCommandList>(
+                0, CommandListType.Direct, allocator, null);
+
+            try
+            {
+                cmdList.ResourceBarrierTransition(topLayerTex,
+                    ResourceStates.Common, ResourceStates.CopySource);
+
+                var src = new TextureCopyLocation(topLayerTex, 0);
+                var dst = new TextureCopyLocation(readbackResource, new PlacedSubresourceFootPrint
+                {
+                    Offset = 0,
+                    Footprint = new SubresourceFootPrint(Format.R8_UInt, (uint)res, (uint)res, 1, (uint)rowPitch)
+                });
+                cmdList.CopyTextureRegion(dst, 0, 0, 0, src);
+
+                cmdList.ResourceBarrierTransition(topLayerTex,
+                    ResourceStates.CopySource, ResourceStates.Common);
+
+                cmdList.Close();
+                device.SubmitAndWait(cmdList);
+
+                var layers = new byte[res * res];
+                unsafe
+                {
+                    void* pData;
+                    readbackResource.Map(0, null, &pData);
+
+                    fixed (byte* dstPtr = layers)
+                    {
+                        for (int y = 0; y < res; y++)
+                            Buffer.MemoryCopy((byte*)pData + (long)y * rowPitch, dstPtr + (long)y * res, res, res);
+                    }
+
+                    readbackResource.Unmap(0);
+                }
+
+                return layers;
+            }
+            finally
+            {
+                cmdList.Dispose();
+                allocator.Dispose();
+                readbackResource.Dispose();
+            }
         }
 
         /// <summary>

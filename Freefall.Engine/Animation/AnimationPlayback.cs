@@ -71,6 +71,9 @@ namespace Freefall.Animation
         public const int Weight = 1;
         public const int Mirrored = 2;
         public const int Entered = 3;   // taken up and not yet moved on: an event at that very point is still to come
+        public const int Level = 4;      // a blend tree: the level its children play at (AnimationBlendTree.LevelParameter)
+        public const int LevelFrom = 5;  // ... the level it is coming from
+        public const int LevelLeft = 6;  // ... and how much of the way from there is left, 1 to 0
 
         // Layer fields
         public const int Current       = 0;

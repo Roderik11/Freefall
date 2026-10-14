@@ -41,6 +41,30 @@ namespace Freefall.Components
             }
         }
 
+        /// <summary>The group every collider is in unless it is put elsewhere (<see cref="Groups"/>).</summary>
+        public const uint Solid = 1;
+
+        private uint _groups = Solid;
+
+        /// <summary>
+        /// The groups the collider is in, as bits. A query that names groups finds only what is
+        /// in one of them: a character's capsule moved with ControllerFilters.FilterData, a scene
+        /// query with QueryFilterData (word 0 of either). One that names none finds every
+        /// collider, and that is all the rays of PhysicsWorld. A capsule that looks for
+        /// <see cref="Solid"/> alone passes through what was taken out of it and still stands on
+        /// the ground. Not saved: whoever puts a collider elsewhere does so in play.
+        /// </summary>
+        [Reflection.DontSerialize]
+        public uint Groups
+        {
+            get => _groups;
+            set
+            {
+                _groups = value;
+                if (_shape != null) _shape.QueryFilterData = new FilterData(_groups, 0, 0, 0);
+            }
+        }
+
         // Kept in a field because it is set before there is a shape (a scene load, the editor).
         // PhysX refuses a shape that is a trigger and a simulation shape at once, so both flags
         // change in one assignment.
@@ -128,6 +152,12 @@ namespace Freefall.Components
                 return;
 
             _shape = RigidActorExt.CreateExclusiveShape(actor, geometry, PhysicsWorld.DefaultMaterial);
+
+            // Whose shape this is: under a RigidBody all colliders share the body's actor, whose
+            // UserData is the body's entity, so a query's hit can only tell the piece by its shape
+            _shape.UserData = this;
+            _shape.QueryFilterData = new FilterData(_groups, 0, 0, 0);
+
             if (_isTrigger)
                 ApplyTrigger();
 

@@ -1,3 +1,4 @@
+using System;
 using System.IO;
 using Freefall.Assets.Packers;
 
@@ -10,6 +11,14 @@ namespace Freefall.Assets.Importers
     [AssetImporter(".wav", ".ogg")]
     public class AudioClipImporter : IImporter
     {
+        // What the source file is to the editor: without it the browser card has no asset type,
+        // drags as a plain Asset, and no AudioClip field accepts the drop.
+        [System.Text.Json.Serialization.JsonIgnore]
+        public Type AssetType => typeof(AudioClip);
+
+        // A clip has nothing to edit (buffer, wave format, packet table): selecting the file shows the importer.
+        public object GetInspectionTarget(MetaFile meta) => this;
+
         public ImportResult Import(string filepath)
         {
             var result = new ImportResult();

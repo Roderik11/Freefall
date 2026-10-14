@@ -236,6 +236,19 @@ namespace Freefall.Components
         private int _packedArrayResolution;
         private int _packedSliceCount;
 
+        // ───── Top Layer Map (which layer is where, for GetLayer) ──────────
+        // One texel per control texel: the palette channel that shows most there. The splat bake
+        // writes it with the weights; the CPU copy is fetched only once somebody has asked.
+        private ID3D12Resource? _topLayerTex;      // R8_UINT
+        private uint _topLayerUAV;
+        private byte[]? _topLayers;                // row by row, as the control array lies (Y-flipped)
+        private int _topLayersResolution;
+        private List<TerrainLayer> _topLayersPalette = new();   // what the channels in _topLayers mean
+        private List<TerrainLayer> _bakedPalette = new();       // what they mean in the texture
+        private int _bakedTopLayerResolution;
+        private bool _topLayersWanted;
+        private volatile bool _topLayersStale;     // a bake has run since the CPU copy was fetched
+
         // ───── Lifecycle ──────────────────────────────────────────────────
 
         protected override void Awake()
@@ -353,6 +366,11 @@ namespace Freefall.Components
                 foreach (var idx in _packedSliceUAVs)
                     if (idx != 0) device?.DeferReleaseBindlessIndex(idx);
             if (_packedControlArrayUAV != 0) device?.DeferReleaseBindlessIndex(_packedControlArrayUAV);
+
+            // ── Top layer map ──
+            device?.DeferDispose(_topLayerTex);
+            if (_topLayerUAV != 0) device?.DeferReleaseBindlessIndex(_topLayerUAV);
+            _topLayers = null;
 
             // ── Decorator buffers ──
             device?.DeferDispose(_decoratorHeadersBuffer);
@@ -562,6 +580,10 @@ namespace Freefall.Components
                     var terrain = Terrain;
                     var packedArray = _packedControlArray;
                     var arrayUAV = _packedControlArrayUAV;
+                    var topLayerTex = _topLayerTex!;
+                    var topLayerUAV = _topLayerUAV;
+                    var palette = _layerPalette;   // replaced, never changed, when the layers change
+                    var renderer = this;
                     CommandBuffer.Enqueue(RenderPass.Opaque, (list) =>
                     {
                         // The height bake enqueued above has run by now, so this reads the new heights
@@ -570,21 +592,48 @@ namespace Freefall.Components
 
                         list.ResourceBarrierTransition(packedArray,
                             ResourceStates.Common, ResourceStates.UnorderedAccess);
+                        list.ResourceBarrierTransition(topLayerTex,
+                            ResourceStates.Common, ResourceStates.UnorderedAccess);
 
-                        baker.BakeSplat(plan, list, terrain, hmSrv, arrayUAV, res, sliceCount);
+                        baker.BakeSplat(plan, list, terrain, hmSrv, arrayUAV, topLayerUAV, res, sliceCount);
                         list.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(packedArray)));
+                        list.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(topLayerTex)));
 
-                        // Back to common for shader reads
+                        // Back to common for shader reads (and for the copy GetLayer's readback makes)
                         list.ResourceBarrierTransition(packedArray,
+                            ResourceStates.UnorderedAccess, ResourceStates.Common);
+                        list.ResourceBarrierTransition(topLayerTex,
                             ResourceStates.UnorderedAccess, ResourceStates.Common);
 
                         terrain.MarkForUpdate(TerrainDirtyFlags.AlbedoBake);
+
+                        renderer._bakedPalette = palette;
+                        renderer._bakedTopLayerResolution = res;
+                        renderer._topLayersStale = true;
                     });
                 }
                 else
                 {
                     // No splat stamp references a layer: nothing to render the surface with
                     ControlMapsArray = InternalAssets.BlackArray;
+                    _topLayers = null;
+                    _topLayersStale = false;
+                }
+            }
+
+            // The CPU copy of which layer is where, once somebody has asked (GetLayer) and the bakes have
+            // settled: the same blocking fetch as the height field's, so not while a stamp is dragged.
+            if (_topLayersWanted && _topLayersStale && !splatDirty && _topLayerTex != null
+                && _bakedTopLayerResolution == _packedArrayResolution)
+            {
+                _topLayersStale = false;
+                var palette = _bakedPalette;
+                var layers = TerrainBaker.ReadbackTopLayers(_topLayerTex, _bakedTopLayerResolution);
+                if (layers != null)
+                {
+                    _topLayersPalette = palette;
+                    _topLayersResolution = _bakedTopLayerResolution;
+                    _topLayers = layers;
                 }
             }
 
@@ -845,6 +894,21 @@ namespace Freefall.Components
             _packedControlTexture = Texture.WrapNative(_packedControlArray, _packedControlSRV);
             _packedArrayResolution = resolution;
             _packedSliceCount = sliceCount;
+
+            // The top layer map goes with the array: same texels, filled by the same bake
+            device.DeferDispose(_topLayerTex);
+            device.DeferReleaseBindlessIndex(_topLayerUAV);
+
+            _topLayerTex = device.CreateTexture2D(Format.R8_UInt, resolution, resolution, 1, 1,
+                ResourceFlags.AllowUnorderedAccess, ResourceStates.Common);
+            _topLayerUAV = device.AllocateBindlessIndex();
+            device.NativeDevice.CreateUnorderedAccessView(_topLayerTex, null,
+                new UnorderedAccessViewDescription
+                {
+                    Format = Format.R8_UInt,
+                    ViewDimension = UnorderedAccessViewDimension.Texture2D,
+                    Texture2D = new Texture2DUnorderedAccessView { MipSlice = 0 }
+                }, device.GetCpuHandle(_topLayerUAV));
         }
 
         // ───── Compute Pipeline ───────────────────────────────────────────
@@ -1578,6 +1642,36 @@ namespace Freefall.Components
             height += (h3 - h1) * zf;
 
             return Transform.Position.Y + height * maxHeight;
+        }
+
+        /// <summary>
+        /// The layer that shows most at a place on the terrain (X and Z of the position), or null:
+        /// off the terrain, nothing painted there, or not known yet. The answer comes from a CPU copy
+        /// of the splat bake's result that is only fetched once somebody asks, so the first calls after
+        /// a load return null for a frame or two; after the stamps changed, the old answer stands until
+        /// the new one has been fetched. One array lookup; main thread.
+        /// </summary>
+        public TerrainLayer? GetLayer(Vector3 position)
+        {
+            _topLayersWanted = true;
+
+            var layers = _topLayers;
+            if (layers == null || Terrain == null || Transform == null) return null;
+
+            var size = Terrain.TerrainSize;
+            var origin = Transform.Position;
+            float u = (position.X - origin.X) / size.X;
+            float v = (position.Z - origin.Z) / size.Y;
+            if (!(u >= 0f && u < 1f && v >= 0f && v < 1f)) return null;
+
+            // The control array is Y-flipped relative to terrain UV (see terrain_splat_bake.hlsl)
+            int res = _topLayersResolution;
+            int x = Math.Min((int)(u * res), res - 1);
+            int y = Math.Min((int)((1f - v) * res), res - 1);
+
+            int channel = layers[y * res + x];
+            var palette = _topLayersPalette;
+            return channel < palette.Count ? palette[channel] : null;
         }
 
         // ───── Ground Coverage Decorator ──────────────────────────────────

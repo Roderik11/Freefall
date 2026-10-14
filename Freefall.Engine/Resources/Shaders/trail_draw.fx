@@ -20,11 +20,12 @@ struct TrailPoint          // 48 bytes = TrailSystem.TrailPoint in C#
 {
     float3 Position;   float Width;
     float4 Color;
-    uint   Flags;      float3 _pad;
+    uint   Flags;      float3 Edge;    // a blade's other edge (TRAIL_BLADE)
 };
 
 #define TRAIL_FIRST 1      // far end of a trail: nothing before it
 #define TRAIL_LAST  2      // the end at the entity: nothing after it
+#define TRAIL_BLADE 4      // the sheet between Position and Edge, not a strip that faces the camera
 
 // A ribbon narrower than this on screen is drawn this wide and fainter by as much: a thin trail far
 // away stays a steady line instead of a row of pixels that come and go
@@ -46,6 +47,7 @@ struct VSOutput
     float4 Position : SV_Position;
     float4 Color    : COLOR0;
     float  Across   : TEXCOORD0;   // -1..1 from edge to edge
+    float  Blade    : TEXCOORD1;   // 1 on a blade's sheet
 };
 
 VSOutput VS(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
@@ -64,6 +66,16 @@ VSOutput VS(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
     float2 corner = Corners[vertexID % 6];
     uint index = instanceID + (uint)corner.x;
     TrailPoint p = Points[index];
+
+    // A blade: the sheet is given, from the point (the tip's edge) to its other edge
+    if ((p.Flags & TRAIL_BLADE) != 0)
+    {
+        output.Position = mul(float4(corner.y > 0.0 ? p.Position : p.Edge, 1.0), ViewProjection);
+        output.Color = p.Color;
+        output.Across = corner.y;
+        output.Blade = 1.0;
+        return output;
+    }
 
     // The ribbon runs the way its neighbours lie, so two pieces share their edge where they meet
     uint before = (p.Flags & TRAIL_FIRST) != 0 ? index : index - 1;
@@ -96,8 +108,11 @@ VSOutput VS(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
 
 float4 PS(VSOutput input) : SV_Target0
 {
-    // Full along the middle, nothing at the edges
-    float4 color = input.Color * saturate(1.0 - input.Across * input.Across);
+    // Full along the middle, nothing at the edges. A blade's sheet: full at the tip's edge, fading
+    // out towards the other, faster at first
+    float tipward = saturate(input.Across * 0.5 + 0.5);
+    float across = input.Blade > 0.5 ? tipward * tipward : saturate(1.0 - input.Across * input.Across);
+    float4 color = input.Color * across;
 
     if (max(color.a, max(color.r, max(color.g, color.b))) < 0.002) discard;
 

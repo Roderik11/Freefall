@@ -17,14 +17,31 @@ namespace Freefall.Assets.Loaders
     {
         private readonly AudioClipPacker _packer = new();
 
-        public object GetInspectionTarget(MetaFile meta) => this;
-
         public Asset Load(string name, AssetManager manager)
         {
             var cachePath = AssetDatabase.ResolveCachePath(name, "AudioClipData");
             if (cachePath == null || !File.Exists(cachePath))
                 throw new FileNotFoundException($"Cache file not found for audio clip '{name}'");
 
+            AudioClipData clipData;
+            using (var stream = File.OpenRead(cachePath))
+                clipData = _packer.Read(stream);
+
+            using (var ms = new MemoryStream(clipData.Bytes))
+            {
+                var clip = Load(ms);
+                clip.Name = name;
+                return clip;
+            }
+        }
+
+        /// <summary>
+        /// By GUID: the cache file that was resolved for it. The name-based Load above takes whichever
+        /// clip of that name it finds first, and names are not unique: a .wav next to an .ogg of the
+        /// same name, a take number repeated in another folder.
+        /// </summary>
+        public Asset LoadFromCache(string cachePath, string name, AssetManager manager, string sourceGuid = null)
+        {
             AudioClipData clipData;
             using (var stream = File.OpenRead(cachePath))
                 clipData = _packer.Read(stream);

@@ -139,6 +139,43 @@ namespace Freefall.Base
             return true;
         }
 
+        /// <summary>
+        /// A random point on the navmesh that a way leads to from <paramref name="from"/>, within
+        /// <paramref name="radius"/> of <paramref name="center"/>, any walkable spot as likely as
+        /// another: for wandering. A position picked blind and put on the navmesh can lie on a
+        /// piece of it nothing leads to (the floor of a fountain's basin, a walled yard), and an
+        /// agent sent there goes as near as a way leads and never arrives. False where there is
+        /// no navmesh under <paramref name="from"/>.
+        /// </summary>
+        public static bool RandomReachablePoint(Vector3 from, Vector3 center, float radius, out Vector3 point)
+        {
+            point = from;
+            if (_navQuery == null) return false;
+
+            _navQuery.FindNearestPoly(ToRc(from), QueryExtents, DefaultFilter,
+                out long startRef, out _, out _);
+            if (startRef == 0) return false;
+
+            // Spreads from the polygon it stands on over its neighbours, as far as the circle reaches
+            var status = _navQuery.FindRandomPointAroundCircle(startRef, ToRc(center), radius,
+                DefaultFilter, RandomSource, out long randomRef, out var randomPt);
+            if (status.Failed() || randomRef == 0) return false;
+
+            point = FromRc(randomPt);
+            return true;
+        }
+
+        private static readonly NavRandom RandomSource = new();
+
+        private sealed class NavRandom : DotRecast.Core.IRcRand
+        {
+            private readonly Random _random = new();
+
+            public float Next() => _random.NextSingle();
+            public double NextDouble() => _random.NextDouble();
+            public int NextInt32() => _random.Next();
+        }
+
         /// <summary>Is this world position on the navmesh?</summary>
         public static bool IsOnNavMesh(Vector3 position, float tolerance = 0.5f)
         {
@@ -163,9 +200,13 @@ namespace Freefall.Base
             _crowd?.RemoveAgent(agent);
         }
 
-        /// <summary>Set an agent's move target.</summary>
-        internal static bool SetAgentTarget(DtCrowdAgent agent, Vector3 target)
+        /// <summary>
+        /// Set an agent's move target. <paramref name="onNavMesh"/> is the target put on the
+        /// navmesh: the point the crowd steers for.
+        /// </summary>
+        internal static bool SetAgentTarget(DtCrowdAgent agent, Vector3 target, out Vector3 onNavMesh)
         {
+            onNavMesh = target;
             if (_crowd == null) return false;
 
             // Use the crowd's own query, filter, and extents — must match what
@@ -184,6 +225,7 @@ namespace Freefall.Base
                 return false;
             }
 
+            onNavMesh = FromRc(targetPt);
             bool ok = _crowd.RequestMoveTarget(agent, targetRef, targetPt);
             if (!ok)
                 Debug.Log($"[NavMeshWorld] SetAgentTarget: RequestMoveTarget failed (agent={agent.idx}, targetRef={targetRef})");

@@ -49,6 +49,10 @@ namespace Freefall.Components
         [ValueRange(0f, 100f)]
         public float Intensity = 1f;
 
+        [Category("Blade")]
+        [Description("A blade's trail: the ribbon is the sheet a line sweeps, from the entity to this point in the entity's own space (the entity at the tip of a blade, this towards its grip), bright at the entity's edge and fading to the other. It does not turn to the camera and the widths are not used. Zero = an ordinary trail")]
+        public Vector3 BladeOffset;
+
         /// <summary>Index of this trail's entry in <see cref="Graphics.TrailSystem"/>; -1 while it has none.</summary>
         internal int SystemIndex = -1;
     }

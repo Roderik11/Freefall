@@ -56,8 +56,9 @@ namespace Freefall.Components
         [DontSerialize] 
         public Vector3 Destination { get; private set; }
 
+        /// <summary>Metres left to where its way ends: the destination, or as near to it as a way leads.</summary>
         [DontSerialize]
-        public float RemainingDistance { get; private set; }
+        public float RemainingDistance => MathF.Sqrt(_remainingSquared);
 
         // ── Events ──
 
@@ -69,7 +70,8 @@ namespace Freefall.Components
         private DtCrowdAgent? _crowdAgent;
         private bool _destinationPending;
         private Vector3 _pendingTarget;
-        private bool _reachedFired;
+        private Vector3 _goal;            // Destination put on the navmesh: what the crowd steers for
+        private float _remainingSquared;
 
         // ── Lifecycle ──
 
@@ -128,13 +130,16 @@ namespace Freefall.Components
         public void SetDestination(Vector3 target)
         {
             Destination = target;
-            _reachedFired = false;
 
             if (_crowdAgent != null && NavMeshWorld.IsReady)
             {
-                HasPath = NavMeshWorld.SetAgentTarget(_crowdAgent, target);
+                HasPath = NavMeshWorld.SetAgentTarget(_crowdAgent, target, out _goal);
                 if (!HasPath)
+                {
+                    // Nowhere to go: not on to where it was going before, either
+                    NavMeshWorld.ResetAgentTarget(_crowdAgent);
                     OnPathFailed?.Invoke();
+                }
             }
             else
             {
@@ -185,10 +190,10 @@ namespace Freefall.Components
             var crowdPos = NavMeshWorld.FromRc(_crowdAgent.npos);
             var crowdVel = NavMeshWorld.FromRc(_crowdAgent.vel);
 
+            // Without a path it is going nowhere, whatever speed the crowd still has it at
             Position = crowdPos;
-            Velocity = crowdVel;
-            float speed = crowdVel.Length();
-            IsMoving = speed > 0.01f;
+            Velocity = HasPath ? crowdVel : Vector3.Zero;
+            IsMoving = HasPath && crowdVel.LengthSquared() > 0.0001f;
 
             if (DriveTransform)
             {
@@ -216,15 +221,22 @@ namespace Freefall.Components
                 _crowdAgent.npos = NavMeshWorld.ToRc(Transform.Position);
             }
 
-            // Check arrival
+            // Arrived: within StoppingDistance of where its way ends. That is the destination put
+            // on the navmesh (not the point asked for, which may be off it or at another height),
+            // or, once the crowd has found that no way leads there, the nearest point one does
+            // lead to. The crowd is told to stop: left with its target it keeps making for the
+            // exact point, and a character that follows the agent's velocity but moves by its
+            // clips walks past it, is sent back, and turns to and fro on the spot.
             if (HasPath)
             {
-                RemainingDistance = Vector3.Distance(crowdPos, Destination);
-                if (RemainingDistance <= StoppingDistance && !_reachedFired)
+                var end = _crowdAgent.targetState == DtMoveRequestState.DT_CROWDAGENT_TARGET_VALID
+                    ? NavMeshWorld.FromRc(_crowdAgent.corridor.GetTarget())
+                    : _goal;
+
+                _remainingSquared = Vector3.DistanceSquared(crowdPos, end);
+                if (_remainingSquared <= StoppingDistance * StoppingDistance)
                 {
-                    _reachedFired = true;
-                    HasPath = false;
-                    IsMoving = false;
+                    Stop();
                     OnDestinationReached?.Invoke();
                 }
             }
