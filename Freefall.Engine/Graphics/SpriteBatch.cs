@@ -209,9 +209,10 @@ namespace Freefall.Graphics
         }
 
         /// <summary>
-        /// Draw a textured quad.
+        /// Draw a textured quad. Point-sampled (pixel art drawn 1:1, the editor's UI) unless
+        /// <paramref name="smooth"/>: then linear with mips, for art drawn at another size than painted.
         /// </summary>
-        public void Draw(int x, int y, int width, int height, RectF rect, Color4 color, uint textureIndex, int texWidth = 0, int texHeight = 0)
+        public void Draw(int x, int y, int width, int height, RectF rect, Color4 color, uint textureIndex, int texWidth = 0, int texHeight = 0, bool smooth = false)
         {
             // CPU-side scissor clipping (always applied, matching Apex behavior)
             {
@@ -255,7 +256,7 @@ namespace Freefall.Graphics
             sprite.Color = color;
             sprite.UVs = new Vector4(rect.xMin / tw, rect.yMin / th, rect.xMax / tw, rect.yMax / th);
             sprite.TextureIndex = textureIndex;
-            sprite.Type = 0;
+            sprite.Type = smooth ? 3u : 0u;
             sprite.EndPosition = default;
         }
 

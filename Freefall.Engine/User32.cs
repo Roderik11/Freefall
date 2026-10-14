@@ -566,6 +566,10 @@ namespace Freefall
         public static extern bool ScreenToClient(IntPtr hWnd, ref POINT lpPoint);
 
         [DllImport(LibraryName)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool GetClientRect(IntPtr hWnd, out RECT lpRect);
+
+        [DllImport(LibraryName)]
         public static extern bool IsChild(IntPtr hWndParent, IntPtr hWnd);
 
         [DllImport(LibraryName)]

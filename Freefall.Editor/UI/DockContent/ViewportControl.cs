@@ -17,10 +17,20 @@ namespace Freefall.Editor
         private static bool _overlayFontReady;
         private readonly List<Overlay.Mark> _marks = new();
 
+        protected override void OnUpdate()
+        {
+            base.OnUpdate();
+
+            // The game's UI goes over the picture the main camera renders to
+            if (View != null && Camera.Main?.Target == View)
+                GameUIHost.Viewport = this;
+            else if (GameUIHost.Viewport == this)
+                GameUIHost.Viewport = null;
+        }
+
         /// <summary>
         /// Over the picture: what game code asked for this frame through Freefall.Graphics.Overlay
-        /// (a crosshair, a prompt). The game has no UI of its own yet, so in play mode this is
-        /// where it shows.
+        /// (a crosshair, a prompt), then the game's UI.
         /// </summary>
         protected override void DrawStyle(Style style, float opacity)
         {
@@ -28,6 +38,12 @@ namespace Freefall.Editor
 
             if (View == null || Camera.Main?.Target != View) return;
 
+            DrawMarks(opacity);
+            GameUIHost.Draw(this);
+        }
+
+        private void DrawMarks(float opacity)
+        {
             _marks.Clear();
             Overlay.CopyTo(_marks);
             if (_marks.Count == 0) return;

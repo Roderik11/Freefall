@@ -119,6 +119,7 @@ namespace Freefall.Editor.Commands
                 Vector2 v => new { x = v.X, y = v.Y },
                 Color3 c => new[] { c.R, c.G, c.B },
                 Color4 c => new[] { c.R, c.G, c.B, c.A },
+                Int4 i => new[] { i.X, i.Y, i.Z, i.W },
                 Matrix4x4 => "<matrix4x4>",
                 // System.Text.Json refuses NaN/Infinity and would fail the whole response
                 float f when !float.IsFinite(f) => f.ToString(System.Globalization.CultureInfo.InvariantCulture),

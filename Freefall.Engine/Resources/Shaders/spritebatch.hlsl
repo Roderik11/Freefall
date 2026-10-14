@@ -2,7 +2,8 @@
 // No geometry shader, no vertex buffer, no atlas.
 // Sprites are read from a StructuredBuffer via SV_VertexID.
 // Each sprite carries its own texture index into the bindless heap.
-// Type 0 = Quad, Type 1 = Line, Type 2 = Slug Glyph (GPU Bézier text)
+// Type 0 = Quad, Type 1 = Line, Type 2 = Slug Glyph (GPU Bézier text),
+// Type 3 = Quad sampled smoothly (scaled art: the game's UI skin)
 
 cbuffer PushConstants : register(b3)
 {
@@ -19,7 +20,7 @@ struct Sprite
     float4 Color;       // tint RGBA
     float4 UVs;         // minU, minV, maxU, maxV  (for Type=2: em-space bounds)
     uint   TextureIndex; // SRV heap index (bindless) — for Type=2: index into SlugGlyphData
-    uint   Type;         // 0 = Quad, 1 = Line, 2 = SlugGlyph
+    uint   Type;         // 0 = Quad, 1 = Line, 2 = SlugGlyph, 3 = Quad (linear)
     float2 EndPosition;  // For lines: pixel coords of end point
 };
 
@@ -49,6 +50,7 @@ struct PS_Input
 };
 
 SamplerState PointSampler : register(s1); // s1 = point clamp (static sampler)
+SamplerState LinearSampler : register(s2); // s2 = linear clamp with mips (static sampler)
 
 // ── Exact port of FormeShader.fx evaluation logic ──
 
@@ -308,7 +310,7 @@ float4 PS(PS_Input input) : SV_Target
     else
     {
         Texture2D tex = ResourceDescriptorHeap[input.TextureIndex];
-        float4 texColor = tex.Sample(PointSampler, input.UV);
+        float4 texColor = input.Type == 3 ? tex.Sample(LinearSampler, input.UV) : tex.Sample(PointSampler, input.UV);
         return texColor * input.Color;
     }
 }

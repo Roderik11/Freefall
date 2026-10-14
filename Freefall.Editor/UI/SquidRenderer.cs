@@ -13,7 +13,7 @@ namespace Freefall.Editor
     /// Squid GUI renderer implementation for Freefall's DX12 bindless engine.
     /// Bridges Squid's draw calls to SpriteBatch + Font.
     /// </summary>
-    public class SquidRenderer : Squid.ISquidRenderer, IDisposable
+    public class SquidRenderer : Squid.ISquidRenderer, Freefall.UI.IGameUIRenderer, IDisposable
     {
         public SpriteBatch SpriteBatch { get; private set; }
 
@@ -40,6 +40,7 @@ namespace Freefall.Editor
             public uint BindlessIndex;
             public int Width;
             public int Height;
+            public bool Smooth;   // linear sampling: art drawn at another size than painted (game UI)
         }
 
         public SquidRenderer(GraphicsDevice device)
@@ -148,6 +149,32 @@ namespace Freefall.Editor
         }
 
         /// <summary>
+        /// A texture of the game's UI skin: drawn smoothly, and known to Squid as <paramref name="scale"/>
+        /// times its size, so texture rects in those units draw the art at that scale.
+        /// </summary>
+        public void InsertTexture(string name, Texture texture, float scale)
+        {
+            var desc = texture.Native.Description;
+            var info = new TextureInfo
+            {
+                BindlessIndex = texture.BindlessIndex,
+                Width = Math.Max(1, (int)MathF.Round(desc.Width * scale)),
+                Height = Math.Max(1, (int)MathF.Round(desc.Height * scale)),
+                Smooth = true,
+            };
+
+            if (_textureLookup.TryGetValue(name, out var index))
+            {
+                _textures[index] = info;
+                return;
+            }
+
+            _textureIndex++;
+            _textureLookup.Add(name, _textureIndex);
+            _textures.Add(_textureIndex, info);
+        }
+
+        /// <summary>
         /// Insert a texture by bindless index and dimensions (for RenderTarget injection).
         /// </summary>
         public void InsertTexture(string name, uint bindlessIndex, int width, int height)
@@ -201,6 +228,18 @@ namespace Freefall.Editor
             _runtimeFonts[name] = (ttfFile, pixelSize, letterSpacing);
         }
 
+        private readonly Dictionary<string, (Freefall.Assets.Typeface Face, int PixelSize)> _typefaceFonts = new();
+
+        /// <summary>
+        /// A font of the game's UI skin: rasterized from the typeface's bytes on first use. A name
+        /// already built stays as it is (the name carries face and size).
+        /// </summary>
+        public void RegisterFont(string name, Freefall.Assets.Typeface face, int pixelSize)
+        {
+            if (face?.Data == null) return;
+            _typefaceFonts[name] = (face, pixelSize);
+        }
+
         // TTF and em size (px) behind each pre-baked atlas, so they can be re-rasterized at other sizes
         private static readonly Dictionary<string, (string TtfFile, int PixelSize)> BakedFontSources = new()
         {
@@ -244,6 +283,24 @@ namespace Freefall.Editor
         {
             if (_fontLookup.TryGetValue(name, out var fontId))
                 return fontId;
+
+            if (_typefaceFonts.TryGetValue(name, out var typeface))
+            {
+                try
+                {
+                    var built = RuntimeFont.Build(typeface.Face.Data, typeface.PixelSize, 0);
+                    _fontIndex++;
+                    _fontLookup.Add(name, _fontIndex);
+                    _fonts.Add(_fontIndex, built);
+                    return _fontIndex;
+                }
+                catch (Exception e)
+                {
+                    Debug.LogWarning("SquidRenderer", $"Typeface {typeface.Face.Name} could not be read: {e.Message}");
+                    _typefaceFonts.Remove(name);
+                    return GetFont(Squid.Font.Default);
+                }
+            }
 
             if (_runtimeFonts.TryGetValue(name, out var runtime))
             {
@@ -325,7 +382,7 @@ namespace Freefall.Editor
                 SpriteBatch.Draw(x, y, w, h,
                     new RectF(rect.Left, rect.Top, rect.Width, rect.Height),
                     new Color4(color),
-                    info.BindlessIndex, info.Width, info.Height);
+                    info.BindlessIndex, info.Width, info.Height, info.Smooth);
             }
         }
 

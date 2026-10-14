@@ -27,8 +27,28 @@ namespace Freefall.Editor
         {
             using var collection = new PrivateFontCollection();
             collection.AddFontFile(ttfPath);
-            var family = collection.Families[0];
+            return Build(collection.Families[0], pixelSize, letterSpacing);
+        }
 
+        /// <summary>From a font file's bytes (a <see cref="Freefall.Assets.Typeface"/>).</summary>
+        public static Freefall.Graphics.Font Build(byte[] fontFile, int pixelSize, int letterSpacing)
+        {
+            // GDI+ reads the face from this memory for as long as the collection lives
+            var pinned = GCHandle.Alloc(fontFile, GCHandleType.Pinned);
+            try
+            {
+                using var collection = new PrivateFontCollection();
+                collection.AddMemoryFont(pinned.AddrOfPinnedObject(), fontFile.Length);
+                return Build(collection.Families[0], pixelSize, letterSpacing);
+            }
+            finally
+            {
+                pinned.Free();
+            }
+        }
+
+        private static Freefall.Graphics.Font Build(FontFamily family, int pixelSize, int letterSpacing)
+        {
             // A single-weight file only answers to the style it was built as.
             var style = new[] { FontStyle.Regular, FontStyle.Bold, FontStyle.Italic, FontStyle.Bold | FontStyle.Italic }
                 .First(family.IsStyleAvailable);

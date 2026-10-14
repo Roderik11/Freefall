@@ -38,6 +38,65 @@ namespace Freefall.Editor
         /// <summary>Path of the scene last opened/saved (UI or command server); target of "Save Scene".</summary>
         public string? CurrentScenePath { get; set; }
 
+        private Button _playButton = null!, _stopButton = null!;
+
+        public bool IsPlaying => !Engine.IsEditor;
+
+        /// <summary>
+        /// Play button: saves the scene, then loads it again with game code running and the game's
+        /// camera on the scene viewport. Returns why it did not, or null.
+        /// </summary>
+        public string? StartPlay()
+        {
+            if (IsPlaying) return "Already playing.";
+
+            var validCamera = ComponentCache<Camera>.All.FirstOrDefault(x => x != EditorCamera.Camera);
+            if (validCamera == null)
+                return "Scene must have a main camera to enter play mode.";
+
+            if (!File.Exists(CurrentScenePath))
+                return "Scene must be saved before entering play mode.";
+
+            var serializer = new Freefall.Serialization.EntitySerializer();
+            serializer.Save(CurrentScenePath, EntityManager.Entities.ToArray());
+
+            EntityManager.ClearScene();
+            EditorCamera.DestroyCamera();
+            Engine.SetPlaymode(true);
+
+            serializer = new Freefall.Serialization.EntitySerializer();
+            serializer.Load(CurrentScenePath);
+
+            foreach (var camera in ComponentCache<Camera>.All)
+                camera.Target = RenderView.All[1];
+
+            _playButton.Enabled = false;
+            _stopButton.Enabled = true;
+            MessageDispatcher.Send(Msg.RefreshExplorer);
+            return null;
+        }
+
+        /// <summary>Stop button: the scene as it was saved when play started, with the editor camera back.</summary>
+        public void StopPlay()
+        {
+            if (!IsPlaying) return;
+
+            EntityManager.ClearScene();
+            Engine.SetPlaymode(false);
+
+            var serializer = new Freefall.Serialization.EntitySerializer();
+            serializer.Load(CurrentScenePath);
+
+            EditorCamera.CreateCamera();
+
+            foreach (var camera in ComponentCache<Camera>.All)
+                camera.Target = RenderView.All[1];
+
+            _playButton.Enabled = true;
+            _stopButton.Enabled = false;
+            MessageDispatcher.Send(Msg.RefreshExplorer);
+        }
+
         public EditorDesktop()
         {
             AssetCreator.Initialize();
@@ -303,71 +362,14 @@ namespace Freefall.Editor
 
             playButton.MouseClick += (s, a) =>
             {
-                // if scene has no main camera -> throw a Toast and return
-                var validCamera = ComponentCache<Camera>.All.FirstOrDefault(x => x != EditorCamera.Camera);
-                if (validCamera   == null)
-                {
-                    Toast.Show("Scene must have a main camera to enter play mode.", 3.0f);
-                    return;
-                }
-
-                // if scene has not been saved -> throw a Toast and return
-                if (!File.Exists(CurrentScenePath))
-                {
-                    Toast.Show("Scene must be saved before entering play mode.", 3.0f);
-                    return;
-                }
-
-                // save scene
-                var serializer = new Freefall.Serialization.EntitySerializer();
-                var entities = EntityManager.Entities.ToArray();
-                serializer.Save(CurrentScenePath, entities);
-
-                // clear scene
-                EntityManager.ClearScene();
-
-                // destroy EditorCamera
-                EditorCamera.DestroyCamera();
-
-                // enter playmode
-                Engine.SetPlaymode(true);
-
-                // load scene
-                serializer = new Freefall.Serialization.EntitySerializer();
-                var result = serializer.Load(CurrentScenePath);
-
-                foreach (var camera in ComponentCache<Camera>.All)
-                    camera.Target = RenderView.All[1];
-
-                playButton.Enabled = false;
-                stopButton.Enabled = true;
-                MessageDispatcher.Send(Msg.RefreshExplorer);
+                var refused = StartPlay();
+                if (refused != null) Toast.Show(refused, 3.0f);
             };
 
+            stopButton.MouseClick += (s, a) => StopPlay();
 
-            stopButton.MouseClick += (s, a) =>
-            {
-                // clear scene
-                EntityManager.ClearScene();
-
-                // exit playmode (Engine.IsEditor = true)
-                Engine.SetPlaymode(false);
-
-                // load scene
-                var serializer = new Freefall.Serialization.EntitySerializer();
-                var result = serializer.Load(CurrentScenePath);
-
-                // recreate EditorCamera
-                EditorCamera.CreateCamera();
-
-                foreach (var camera in ComponentCache<Camera>.All)
-                    camera.Target = RenderView.All[1];
-
-                playButton.Enabled = true;
-                stopButton.Enabled = false;
-                MessageDispatcher.Send(Msg.RefreshExplorer);
-            };
-
+            _playButton = playButton;
+            _stopButton = stopButton;
             stopButton.Enabled = false;
 
             playModeFrame.Controls.Add(playButton);

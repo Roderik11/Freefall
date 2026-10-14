@@ -150,6 +150,24 @@ namespace Freefall.Editor.Mcp
             [Description("Setting name → value")] JsonObject values)
             => McpBridge.Post("/api/settings", values);
 
+        [McpServerTool(Name = "play_mode", Title = "Play mode", OpenWorld = false)]
+        [Description("Enter or leave play mode, and open or close the game's menu (what Escape toggles: the game's windows, a free " +
+                     "cursor, no player control). No arguments = report only. Entering play SAVES the open scene first (the " +
+                     "toolbar's Play does too), so the user's unsaved edits are written; Stop reloads the scene as saved. " +
+                     "The game's UI is drawn over the scene viewport: screenshot target='viewport' shows it.")]
+        public static Task<CallToolResult> PlayMode(
+            [Description("true = Play, false = Stop")] bool? play = null,
+            [Description("true = game menu open, false = closed (play mode only)")] bool? menu = null)
+        {
+            if (play == null && menu == null)
+                return McpBridge.Get("/api/playmode");
+
+            var body = new JsonObject();
+            if (play != null) body["play"] = play.Value;
+            if (menu != null) body["menu"] = menu.Value;
+            return McpBridge.Post("/api/playmode", body);
+        }
+
         // --- helpers ---
 
         internal static CallToolResult Text(JsonNode node) => new()

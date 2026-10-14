@@ -80,6 +80,7 @@ namespace Freefall.Serialization
             _converters.Add(typeof(Vector4).FullName!, new Vector4YAMLConverter());
             _converters.Add(typeof(Quaternion).FullName!, new QuaternionYAMLConverter());
             _converters.Add(typeof(Vortice.Mathematics.Color3).FullName!, new Color3YAMLConverter());
+            _converters.Add(typeof(Vortice.Mathematics.Int4).FullName!, new Int4YAMLConverter());
             _converters.Add(typeof(ulong).FullName!, new ULongYAMLConverter());
             _converters.Add(typeof(uint).FullName!, new UIntYAMLConverter());
         }

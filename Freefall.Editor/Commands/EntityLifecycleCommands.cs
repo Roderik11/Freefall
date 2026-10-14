@@ -263,6 +263,12 @@ namespace Freefall.Editor.Commands
                 return CommandHelpers.ParseVec3(el);
             if (targetType == typeof(Vector4))
                 return CommandHelpers.ParseVec4(el);
+            if (targetType == typeof(Vortice.Mathematics.Int4))
+            {
+                // [x,y,z,w] or {x,y,z,w}, rounded
+                var v = CommandHelpers.ParseVec4(el);
+                return new Vortice.Mathematics.Int4((int)MathF.Round(v.X), (int)MathF.Round(v.Y), (int)MathF.Round(v.Z), (int)MathF.Round(v.W));
+            }
             if (targetType == typeof(Quaternion))
                 return CommandHelpers.ParseQuat(el);
             if (targetType.IsEnum)

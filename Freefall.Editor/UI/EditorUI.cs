@@ -60,7 +60,7 @@ namespace Freefall.Editor
             {
                 if (staticdesk == null) return false;
                 if (staticdesk.HotControl is InnerViewport)
-                    return false;
+                    return GameUIHost.MouseOverGameUI;   // a window of the game's own UI over the picture
                 return staticdesk.HotControl != staticdesk || staticdesk.PressedControl != null;
             }
         }

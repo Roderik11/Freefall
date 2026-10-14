@@ -138,6 +138,7 @@ namespace Freefall.Editor
         private static void GenerateScriptProject(string assetsDirectory)
         {
             var engineDll = typeof(Component).Assembly.Location;
+            var squidDll = typeof(Squid.Control).Assembly.Location;   // the game's UI (Freefall.UI.GameUI)
 
             var sb = new System.Text.StringBuilder();
             sb.AppendLine("<Project Sdk=\"Microsoft.NET.Sdk\">");
@@ -153,6 +154,7 @@ namespace Freefall.Editor
             sb.AppendLine("  </ItemGroup>");
             sb.AppendLine("  <ItemGroup>");
             sb.AppendLine($"    <Reference Include=\"Freefall.Engine\" HintPath=\"{engineDll}\" />");
+            sb.AppendLine($"    <Reference Include=\"Squid\" HintPath=\"{squidDll}\" />");
             sb.AppendLine("  </ItemGroup>");
             sb.AppendLine("</Project>");
 

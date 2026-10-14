@@ -248,6 +248,9 @@ namespace Freefall.Editor
             {
                 editor.Update();
 
+                // The game's UI over the scene viewport in play mode (after the editor's: it takes
+                // the mouse only where the editor left it to the picture)
+                GameUIHost.Update(editor);
 
                 // find all active camera
                 var cameras = ComponentCache<Camera>.All;

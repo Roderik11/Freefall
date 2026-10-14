@@ -169,6 +169,35 @@ namespace Freefall.Serialization
         }
     }
 
+    /// <summary>
+    /// Four integers, e.g. a rect (x, y, width, height) or borders (left, top, right, bottom) in pixels.
+    /// Reads numbers written as floats too (rounded), so a member that was a Vector4 keeps its value.
+    /// </summary>
+    public class Int4YAMLConverter : IYAMLConverter
+    {
+        public object Read(ref YamlParser parser)
+        {
+            parser.Read(); // SequenceStart
+            var x = (int)MathF.Round(parser.ReadScalarAsFloat());
+            var y = (int)MathF.Round(parser.ReadScalarAsFloat());
+            var z = (int)MathF.Round(parser.ReadScalarAsFloat());
+            var w = (int)MathF.Round(parser.ReadScalarAsFloat());
+            parser.Read(); // SequenceEnd
+            return new Vortice.Mathematics.Int4(x, y, z, w);
+        }
+
+        public void Write(object value, ref Utf8YamlEmitter emitter)
+        {
+            var v = (Vortice.Mathematics.Int4)value;
+            emitter.BeginSequence(SequenceStyle.Flow);
+            emitter.WriteInt32(v.X);
+            emitter.WriteInt32(v.Y);
+            emitter.WriteInt32(v.Z);
+            emitter.WriteInt32(v.W);
+            emitter.EndSequence();
+        }
+    }
+
     public class ULongYAMLConverter : IYAMLConverter
     {
         public object Read(ref YamlParser parser)

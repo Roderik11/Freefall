@@ -22,7 +22,17 @@ namespace Freefall
         public static Vortice.Mathematics.Int2 MouseDelta { get; private set; }
         public static Vortice.Mathematics.Int2 MousePosition { get; private set; }
         public static int MouseWheelDelta { get; private set; }
+
+        /// <summary>
+        /// The cursor is hidden and held in the middle of <see cref="LockArea"/> while the window has
+        /// the focus; only <see cref="MouseDelta"/> moves. The game's UI sets it (closed menu = locked).
+        /// </summary>
         public static bool IsMouseLocked { get; set; } = false;
+
+        /// <summary>Where a locked cursor is held, in client pixels: the game's picture. Empty = the whole window.</summary>
+        public static Vortice.Mathematics.RectI LockArea { get; set; }
+
+        private static bool _cursorHidden;
 
         public static bool IsKeyDown(Keys key) => _keysDown.Contains(key);
         public static bool IsKeyPressed(Keys key) => _keysPressed.Contains(key);
@@ -54,14 +64,39 @@ namespace Freefall
             _rawY = 0;
             _rawWheel = 0;
             
-            if (IsMouseLocked && User32.GetForegroundWindow() == hWnd)
+            bool lockNow = IsMouseLocked && hWnd != IntPtr.Zero && User32.GetForegroundWindow() == hWnd;
+            SetCursorHidden(lockNow);
+
+            if (lockNow)
             {
-                User32.ShowCursor(false);
+                // Held in the middle, so it never reaches the edge (raw deltas keep coming) and a click
+                // never lands outside the picture
+                var area = LockArea;
+                POINT middle;
+                if (area.Width > 0 && area.Height > 0)
+                    middle = new POINT(area.X + area.Width / 2, area.Y + area.Height / 2);
+                else
+                {
+                    User32.GetClientRect(hWnd, out var client);
+                    middle = new POINT((client.Left + client.Right) / 2, (client.Top + client.Bottom) / 2);
+                }
+                User32.ClientToScreen(hWnd, ref middle);
+                User32.SetCursorPos(middle.X, middle.Y);
             }
+        }
+
+        // ShowCursor keeps a count per thread: shown while it is 0 or more. Called every frame it ran up
+        // into the thousands and a later hide took as many frames; now it is called on a change only,
+        // until the count is on the wanted side.
+        private static void SetCursorHidden(bool hidden)
+        {
+            if (hidden == _cursorHidden) return;
+            _cursorHidden = hidden;
+
+            if (hidden)
+                while (User32.ShowCursor(false) >= 0) { }
             else
-            {
-                User32.ShowCursor(true);
-            }
+                while (User32.ShowCursor(true) < 0) { }
         }
 
         public static void ProcessRawInput(IntPtr lParam)
@@ -97,11 +132,6 @@ namespace Freefall
                 // High word of wParam contains wheel delta (typically ±120)
                 short delta = (short)(wParam.ToUInt64() >> 16);
                 _rawWheel += delta;
-            }
-
-            if (msg == 0x0100 && (Keys)wParam.ToUInt64() == Keys.Escape)
-            {
-                IsMouseLocked = !IsMouseLocked;
             }
 
             // Mouse buttons: WM_LBUTTONDOWN/UP = 0x0201/0x0202, WM_RBUTTONDOWN/UP = 0x0204/0x0205, WM_MBUTTONDOWN/UP = 0x0207/0x0208
