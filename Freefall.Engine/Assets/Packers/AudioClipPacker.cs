@@ -11,8 +11,8 @@ namespace Freefall.Assets.Packers
         public byte[] Bytes { get; set; }
 
         /// <summary>
-        /// Original file extension (e.g. ".wav", ".ogg") preserved
-        /// so the runtime loader knows the source format.
+        /// What Bytes are: ".wav" (an .ogg is decoded to a wav at import). ".ogg" only in
+        /// caches written before that, which hold the ogg file itself.
         /// </summary>
         public string Extension { get; set; }
 

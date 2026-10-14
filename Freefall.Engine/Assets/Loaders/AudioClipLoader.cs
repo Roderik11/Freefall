@@ -23,16 +23,7 @@ namespace Freefall.Assets.Loaders
             if (cachePath == null || !File.Exists(cachePath))
                 throw new FileNotFoundException($"Cache file not found for audio clip '{name}'");
 
-            AudioClipData clipData;
-            using (var stream = File.OpenRead(cachePath))
-                clipData = _packer.Read(stream);
-
-            using (var ms = new MemoryStream(clipData.Bytes))
-            {
-                var clip = Load(ms);
-                clip.Name = name;
-                return clip;
-            }
+            return LoadFromCache(cachePath, name, manager);
         }
 
         /// <summary>
@@ -45,6 +36,11 @@ namespace Freefall.Assets.Loaders
             AudioClipData clipData;
             using (var stream = File.OpenRead(cachePath))
                 clipData = _packer.Read(stream);
+
+            // The importer decodes an .ogg to a wav since 2026-10-14; a cache from before holds the
+            // ogg itself, which SoundStream reports as "Invalid RIFF file format"
+            if (clipData.Extension == ".ogg")
+                throw new InvalidDataException($"Audio clip '{name}' was imported before .ogg files were decoded at import: reimport it");
 
             using (var ms = new MemoryStream(clipData.Bytes))
             {
