@@ -669,13 +669,13 @@ namespace Freefall.Components
             var self = this;
 
             // Enqueue compute dispatch as custom action (runs first in Execute, before batch processing)
-            CommandBuffer.Enqueue(RenderPass.Opaque, (list) => self.DispatchQuadtreeEval(list, fi));
+            CommandBuffer.Enqueue(RenderPass.Opaque, (list) => { PixMarker.Begin(list, "Terrain quadtree"); self.DispatchQuadtreeEval(list, fi); PixMarker.End(list); });
 
             // Enqueue self-draw action: terrain draws itself via ExecuteIndirect
-            CommandBuffer.Enqueue(RenderPass.Opaque, (list) => self.DrawTerrain(list, fi));
+            CommandBuffer.Enqueue(RenderPass.Opaque, (list) => { PixMarker.Begin(list, "Terrain"); self.DrawTerrain(list, fi); PixMarker.End(list); });
 
             // Enqueue single-pass terrain shadow draw
-            CommandBuffer.Enqueue(RenderPass.Shadow, (list) => self.DrawTerrainShadow(list, fi));
+            CommandBuffer.Enqueue(RenderPass.Shadow, (list) => { PixMarker.Begin(list, "Terrain"); self.DrawTerrainShadow(list, fi); PixMarker.End(list); });
 
             // Decoration pipeline — CPU-side setup
             if (Terrain.DrawDetail && _decoratorPalette.Count > 0 && DecoratorMaterial?.Effect != null)
@@ -687,8 +687,8 @@ namespace Freefall.Components
                 {
                     EnsureDecoRenderBuffers();
 
-                    CommandBuffer.Enqueue(RenderPass.Opaque, (list) => self.DispatchDecorator(list, fi, RenderPass.Opaque));
-                    CommandBuffer.Enqueue(RenderPass.Shadow, (list) => self.DispatchDecorator(list, fi, RenderPass.Shadow));
+                    CommandBuffer.Enqueue(RenderPass.Opaque, (list) => { PixMarker.Begin(list, "Decorators"); self.DispatchDecorator(list, fi, RenderPass.Opaque); PixMarker.End(list); });
+                    CommandBuffer.Enqueue(RenderPass.Shadow, (list) => { PixMarker.Begin(list, "Decorators"); self.DispatchDecorator(list, fi, RenderPass.Shadow); PixMarker.End(list); });
                 }
             }
         }
@@ -2201,7 +2201,9 @@ namespace Freefall.Components
             if (Terrain.Heightmap == null) return;
 
             // GPU prepass: composite the deco stamps into the control texture (when they changed)
+            PixMarker.Begin(commandList, "Control prepass");
             DispatchDecoControlPrepass(commandList);
+            PixMarker.End(commandList);
 
             if (!_decoBuffersCreated) return;
             if (_decoratorSlotsBuffer == null || _decoratorLODTableBuffer == null || _decoratorGroupsBuffer == null) return;
@@ -2292,12 +2294,16 @@ namespace Freefall.Components
                 commandList.SetComputeRootConstantBufferView(2, _hizParamBuffers[frameIndex].GPUVirtualAddress);
                 LastDispatchN = N;
                 LastMaxInstances = _maxDecoInstances;
+                PixMarker.Begin(commandList, "Spawn");
                 cs.Dispatch(_kSpawnInstances, commandList, (uint)N, (uint)N);
                 commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(null)));
+                PixMarker.End(commandList);
 
                 // ── Stage 2: CS_BuildDrawArgs ──
+                PixMarker.Begin(commandList, "Build args");
                 cs.Dispatch(_kBuildDecoDrawArgs, commandList, 1);
                 commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(null)));
+                PixMarker.End(commandList);
 
                 // Transition billboard instance buffer to SRV for MS reads
                 _decoInstanceBuffer.Transition(commandList, ResourceStates.NonPixelShaderResource);
@@ -2322,8 +2328,10 @@ namespace Freefall.Components
                 cs.SetPushConstant(_kBinMeshInstances, "DrawMeshRegSRV", MeshRegistry.SrvIndex);
                 cs.SetPushConstant(_kBinMeshInstances, "DrawMaterialsSRV", Graphics.Material.MaterialsBufferIndex);
 
+                PixMarker.Begin(commandList, "Bin meshes");
                 cs.Dispatch(_kBinMeshInstances, commandList, 1);
                 commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(null)));
+                PixMarker.End(commandList);
 
                 // Transition all buffers for rendering
                 _decoDispatchArgsBuffer.Transition(commandList, ResourceStates.IndirectArgument);
@@ -2374,13 +2382,17 @@ namespace Freefall.Components
             if (pass == RenderPass.Shadow)
             {
                 commandList.SetGraphicsRoot32BitConstant(0, DirectionalLight.CurrentCascadeSrvIndex, 11);
-                int grassShadowCascades = 0;// Math.Max(1, DirectionalLight.CascadeCount - 1);
+                // Grass casts into the nearest cascade only (further out screen-space shadows carry it);
+                // AS_Shadow also skips the instances outside it
+                const int grassShadowCascades = 1;
                 commandList.SetGraphicsRoot32BitConstant(0, (uint)grassShadowCascades, 12);
             }
 
             // ExecuteIndirect with DispatchMesh args written by CS_BuildDrawArgs
             using var commandList6 = commandList.QueryInterface<ID3D12GraphicsCommandList6>();
+            PixMarker.Begin(commandList, "Grass draw");
             commandList6.ExecuteIndirect(device.DispatchMeshSignature,1,_decoDispatchArgsBuffer!.Native, 0, null, 0);
+            PixMarker.End(commandList);
 
             // ════════════════════════════════════════════════════════════════
             // Phase 3: Mesh-mode decorators via VS/PS + BindlessCommandSignature
@@ -2395,6 +2407,7 @@ namespace Freefall.Components
                 // (it only writes slots 2-15). All slots 2-15 are embedded in each draw command
                 // by the binning kernel — no additional SetGraphicsRoot32BitConstant needed.
 
+                PixMarker.Begin(commandList, "Mesh decorators");
                 commandList.ExecuteIndirect(
                     device.MeshDecoCommandSignature, // 72-byte commands from CS_BinMeshInstances
                     32,  // max 32 mesh types
@@ -2402,6 +2415,7 @@ namespace Freefall.Components
                     0,
                     _meshDrawCountBuffer!.Native,  // count buffer: actual number of draws
                     0);
+                PixMarker.End(commandList);
             }
 
             // Back to UAV for next frame's binning pass (written by CS_BinMeshInstances)

@@ -101,7 +101,7 @@ cbuffer PushConstants : register(b3)
     uint UniquePartCountIdx;        // slot 27 — Max unique MeshPartIds in registry
     uint CascadeMaskUAVIdx;         // slot 28 — UAV: per-instance 4-bit cascade mask
     uint ExpansionUAVIdx;           // slot 29 — UAV: expansion buffer for (instanceIdx, cascadeIdx)
-    uint Reserved30;                // slot 30 — (was per-batch bone buffer, now per-instance)
+    float ShadowMinCasterClip;      // slot 30 — shadow cascades 1+: smallest caster diameter in clip units (0 = off)
     uint CascadeBufferSRVIdx;       // slot 31 — SRV: StructuredBuffer<CascadeData> / shadow cascade idx (aliased)
     uint SortKeysUAVIdx;            // slot 32 — UAV: depth sort keys buffer (uint2 per entry)
     uint MeshLodRegistryIdx;        // slot 33 — SRV: MeshPartLod buffer, parallel to the mesh registry
@@ -350,6 +350,19 @@ bool IsOccluded(float3 worldCenter, float worldRadius)
 // Shadow cascade frustum culling helper
 // Tests a bounding sphere against the specified shadow cascade's frustum
 //-----------------------------------------------------------------------------
+// Whether a caster is big enough to draw into a cascade: its bounding sphere's diameter covers at least
+// ShadowMinCasterClip of the cascade's clip space (EngineSettings.ShadowMinCasterTexels * 2 / resolution).
+// Used for the cascades after the first: a small thing far out shades a texel or two, which screen-space
+// shadows already give it.
+bool CoversShadowTexels(float worldRadius, uint cascadeIndex)
+{
+    if (ShadowMinCasterClip <= 0.0) return true;
+    StructuredBuffer<CascadeData> cascades = ResourceDescriptorHeap[CascadeBufferSRVIdx];
+    row_major float4x4 vp = cascades[cascadeIndex].VP;
+    float clipPerMetre = length(float3(vp._11, vp._21, vp._31)); // orthographic: the same for every point
+    return 2.0 * worldRadius * clipPerMetre >= ShadowMinCasterClip;
+}
+
 bool IsVisibleShadow(float3 center, float radius, uint cascadeIndex)
 {
     // Read planes from CascadeData structured buffer (GPU-computed, no CPU readback)
@@ -1085,11 +1098,11 @@ void CSVisibilityShadow4(uint3 dispatchThreadId : SV_DispatchThreadID)
     if (descriptors[instanceIdx].BoneBufferIdx != 0)
         worldRadius *= 1.5;
     
-    // Test all cascade frustums + shadow Hi-Z occlusion
+    // Test all cascade frustums + shadow Hi-Z occlusion; past the first cascade, small casters are left out
     bool vis0 = IsVisibleShadow(worldCenter, worldRadius, 0) && !IsOccludedShadow(worldCenter, worldRadius, 0);
-    bool vis1 = IsVisibleShadow(worldCenter, worldRadius, 1) && !IsOccludedShadow(worldCenter, worldRadius, 1);
-    bool vis2 = IsVisibleShadow(worldCenter, worldRadius, 2) && !IsOccludedShadow(worldCenter, worldRadius, 2);
-    bool vis3 = IsVisibleShadow(worldCenter, worldRadius, 3) && !IsOccludedShadow(worldCenter, worldRadius, 3);
+    bool vis1 = CoversShadowTexels(worldRadius, 1) && IsVisibleShadow(worldCenter, worldRadius, 1) && !IsOccludedShadow(worldCenter, worldRadius, 1);
+    bool vis2 = CoversShadowTexels(worldRadius, 2) && IsVisibleShadow(worldCenter, worldRadius, 2) && !IsOccludedShadow(worldCenter, worldRadius, 2);
+    bool vis3 = CoversShadowTexels(worldRadius, 3) && IsVisibleShadow(worldCenter, worldRadius, 3) && !IsOccludedShadow(worldCenter, worldRadius, 3);
     
     // Combined visibility (union) — drives stream compaction.
     // 0 = culled, otherwise resolved MeshPartId + 1
@@ -1106,44 +1119,43 @@ void CSVisibilityShadow4(uint3 dispatchThreadId : SV_DispatchThreadID)
 // entry per set bit. Each entry packs cascadeIdx (bits 30-31) + sortedIdx (bits 0-29).
 // After expansion, patches indirect DrawInstanceCount with actual expanded count.
 //
-// Dispatch: ceil(visibleCount / 256) per sub-batch, 1 threadgroup per sub-batch
+// Dispatch: ceil(TotalInstances / 256), one thread per instance of the batch. It used to be a 2-D grid of
+// (instance groups) x (every MeshRegistry part), launched per batch: ~740k mostly empty thread groups for
+// a 76k-instance batch, 1.15 ms of the shadow pass on Eldermoor (2026-10-15).
 // Uses per-sub-batch counters to track expansion offset.
 //
 // Input push constants:
+//   VisibilityFlagsIdx - per-instance flag from the visibility pass: 0 = culled, else LOD-resolved MeshPartId + 1
 //   CascadeMaskUAVIdx  - SRV/UAV: per-instance 4-bit cascade masks
 //   ExpansionUAVIdx    - UAV: output expansion buffer
 //   OutputBufferIdx    - UAV: indirect draw commands (to read baseOffset + patch instanceCount)
-//   VisibleIndicesSRVIdx - SRV: compacted sorted indices
 //   CounterBufferIdx   - UAV: per-subbatch expansion counters (reused)
-//   UniquePartCount    - number of mesh parts
+//   TotalInstances     - instances in the batch
 //-----------------------------------------------------------------------------
 [numthreads(256, 1, 1)]
-void CSExpandCascades(uint3 groupId : SV_GroupID, uint3 groupThreadId : SV_GroupThreadID)
+void CSExpandCascades(uint3 dispatchThreadId : SV_DispatchThreadID)
 {
-    uint meshPartId = groupId.y;
-    if (meshPartId >= UniquePartCount)
+    uint instanceIdx = dispatchThreadId.x;
+    if (instanceIdx >= TotalInstances)
         return;
-    
-    // Read the indirect command to get baseOffset and visibleCount
-    RWStructuredBuffer<IndirectDrawCommand> commands = ResourceDescriptorHeap[OutputBufferIdx];
-    IndirectDrawCommand cmd = commands[meshPartId];
-    uint visibleCount = cmd.DrawInstanceCount; // = visibleCount (InstanceMultiplier=1)
-    uint baseOffset = cmd.InstanceBaseOffset;
-    
-    uint localIdx = groupId.x * 256 + groupThreadId.x;
-    if (localIdx >= visibleCount)
+
+    // The part this instance draws with (the same flag CSHistogram/CSGlobalScatter compacted by)
+    RWStructuredBuffer<uint> visibilityFlags = ResourceDescriptorHeap[VisibilityFlagsIdx];
+    uint flag = visibilityFlags[instanceIdx];
+    if (flag == 0)
         return;
-    
-    // Read the compacted sorted index for this visible instance
-    StructuredBuffer<uint> sortedIndices = ResourceDescriptorHeap[VisibleIndicesSRVIdx];
-    uint sortedEntry = sortedIndices[baseOffset + localIdx];
-    uint instanceIdx = sortedEntry & 0x7FFFFFFFu; // strip flip bit
-    
+    uint meshPartId = flag - 1;
+
     // Read cascade mask for this instance
     RWStructuredBuffer<uint> cascadeMasks = ResourceDescriptorHeap[CascadeMaskUAVIdx];
     uint mask = cascadeMasks[instanceIdx];
-    
+
     if (mask == 0) return;
+
+    // The part's compacted region starts at baseOffset; its expansion region at baseOffset * 4
+    RWStructuredBuffer<IndirectDrawCommand> commands = ResourceDescriptorHeap[OutputBufferIdx];
+    uint baseOffset = commands[meshPartId].InstanceBaseOffset;
+    uint sortedEntry = instanceIdx; // what CSGlobalScatter wrote for it (shadow path: no flip bit)
     
     // Count set bits to know how many entries to append
     uint bitCount = countbits(mask);

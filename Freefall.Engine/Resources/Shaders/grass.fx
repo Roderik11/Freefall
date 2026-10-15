@@ -342,27 +342,61 @@ PSOutput PS(MSOutput input)
 
 // ─── Shadow Rendering ──────────────────────────────────────────────────────
 
+// The instances of a group that fall inside a cascade being drawn, compacted
 struct ShadowASPayload
 {
-    uint BaseInstance;
+    uint Instances[INSTANCES_PER_GROUP];
     uint BatchCount;
 };
 
 groupshared ShadowASPayload s_ShadowPayload;
+groupshared uint s_ShadowVisible;
 
-[numthreads(1, 1, 1)]
-void AS_Shadow(uint3 gid : SV_GroupID)
+// One thread per instance. The instances come from the camera's prepass and reach out to the grass draw
+// distance, while grass casts into the nearest cascade(s) only, which may cover a few metres: an instance
+// whose root, widened by its own size, lies outside every drawn cascade's square is left out instead of
+// being expanded and clipped (2026-10-15: that was most of the 0.53 ms grass shadow pass on Eldermoor).
+[numthreads(INSTANCES_PER_GROUP, 1, 1)]
+void AS_Shadow(uint gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
 {
-    uint totalInstances = InstanceCount;
-    uint baseInst = gid.x * INSTANCES_PER_GROUP;
-    uint batchCount = min(INSTANCES_PER_GROUP, totalInstances - min(baseInst, totalInstances));
-
-    s_ShadowPayload.BaseInstance = baseInst;
-    s_ShadowPayload.BatchCount = batchCount;
+    if (gtid == 0) s_ShadowVisible = 0;
+    GroupMemoryBarrierWithGroupSync();
 
     uint cascadeCount = max(1u, ShadowCascadeCount);
-    uint groups = (batchCount > 0) ? 1u : 0u;
-    DispatchMesh(groups, cascadeCount, 1, s_ShadowPayload);
+    uint inst = gid.x * INSTANCES_PER_GROUP + gtid;
+    if (inst < InstanceCount)
+    {
+        StructuredBuffer<DecoInstance> instances = ResourceDescriptorHeap[DecoInstanceSRV];
+        StructuredBuffer<CascadeData> cascades = ResourceDescriptorHeap[CascadeBufferSRVIdx];
+        DecoInstance di = instances[inst];
+
+        // Half the width, the height and the wind's sway, with room to spare
+        float reach = 0.5 * di.Scale.x + 1.3 * di.Scale.y;
+
+        bool inside = false;
+        for (uint c = 0; c < cascadeCount && !inside; c++)
+        {
+            row_major float4x4 vp = cascades[c].VP;
+            float4 p = mul(float4(di.Position, 1.0), vp);
+            p.xy /= max(p.w, 1e-6);   // orthographic: w = 1
+            // A world offset of 'reach' moves clip x/y by at most reach times the length of that column
+            float2 margin = reach * float2(length(float3(vp._11, vp._21, vp._31)), length(float3(vp._12, vp._22, vp._32)));
+            inside = all(abs(p.xy) <= 1.0 + margin);
+        }
+
+        if (inside)
+        {
+            uint slot;
+            InterlockedAdd(s_ShadowVisible, 1, slot);
+            s_ShadowPayload.Instances[slot] = inst;
+        }
+    }
+
+    GroupMemoryBarrierWithGroupSync();
+    if (gtid == 0) s_ShadowPayload.BatchCount = s_ShadowVisible;
+    GroupMemoryBarrierWithGroupSync();
+
+    DispatchMesh(s_ShadowVisible > 0 ? 1u : 0u, cascadeCount, 1, s_ShadowPayload);
 }
 
 // Shadow MS output
@@ -405,7 +439,7 @@ void MS_Shadow(
     uint vertInInst  = gtid % VERTS_PER_INSTANCE;
     uint quadIdx     = vertInInst / 4;
     uint vertInQuad  = vertInInst % 4;
-    uint globalInst  = payload.BaseInstance + instInBatch;
+    uint globalInst  = instInBatch < batchCount ? payload.Instances[instInBatch] : 0xFFFFFFFFu;
 
     StructuredBuffer<DecoInstance>   instances = ResourceDescriptorHeap[DecoInstanceSRV];
     StructuredBuffer<DecoratorSlot> slots     = ResourceDescriptorHeap[DecoratorSlotsIdx];

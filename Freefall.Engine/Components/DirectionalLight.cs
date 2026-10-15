@@ -296,6 +296,9 @@ namespace Freefall.Components
             var cameraPosition = camera.Position;
             var shadowTex = DeferredRenderer.Current!.ShadowTextureArray!;
 
+            // Cascades 1+: casters spanning fewer texels than this are left out (clip space spans 2 units)
+            float minCasterClip = MathF.Max(0f, Engine.Settings.ShadowMinCasterTexels) * 2f / shadowTex.Width;
+
             // Set up cascade split distances
             float near = camera.NearPlane;
             const int numCascades = 4;
@@ -362,7 +365,7 @@ namespace Freefall.Components
                     CurrentVPOnlySrvIndex = _vpOnlySrvIndices != null ? _vpOnlySrvIndices[frameIndex] : 0;
                     
                     foreach (var batch in allBatches)
-                        batch.CullShadowAll(commandList, cascadeSRV, cascadeCBAddr, shadowHiZSrv, culler);
+                        batch.CullShadowAll(commandList, cascadeSRV, cascadeCBAddr, shadowHiZSrv, culler, minCasterClip);
                     
                     commandList.OMSetRenderTargets(0, (CpuDescriptorHandle[]?)null, false, shadowTex.FullArrayDsvHandle);
                     
@@ -443,27 +446,35 @@ namespace Freefall.Components
                     
                     // Cull all cascades for each batch using unified visibility pass
                     ulong cascadeCBAddr = _shadowCascadeCBs![frameIndex].Native.GPUVirtualAddress;
+                    PixMarker.Begin(commandList, "Shadow culling");
                     foreach (var batch in allBatches)
                     {
-                        batch.CullShadowAll(commandList, cascadeSrv, cascadeCBAddr, shadowHiZSrv, culler);
+                        batch.CullShadowAll(commandList, cascadeSrv, cascadeCBAddr, shadowHiZSrv, culler, minCasterClip);
                     }
-                    
+                    PixMarker.End(commandList);
+
                     // Phase 3: True single-pass draw — 1 ExecuteIndirect per batch for all cascades
                     // Bind full-array DSV (all slices at once)
                     commandList.OMSetRenderTargets(0, (CpuDescriptorHandle[]?)null, false, shadowTex.FullArrayDsvHandle);
-                    
+
+                    PixMarker.Begin(commandList, "Shadow draws");
                     foreach (var batch in allBatches)
                     {
                         if (!batch.Material.HasPass(RenderPass.Shadow)) continue;
                         batch.Material.SetPass(RenderPass.Shadow);
                         batch.Material.Apply(commandList, Engine.Device, null);
-                        
+
+                        PixMarker.Begin(commandList, batch.ProfileName);
                         batch.DrawShadowSinglePass(commandList, cascadeSrv);
+                        PixMarker.End(commandList);
                     }
+                    PixMarker.End(commandList);
 
                     // Custom shadow actions (grass) — single-pass via AS/MS cascade expansion
                     // FullArrayDsvHandle is already bound from batch shadows above
+                    PixMarker.Begin(commandList, "Terrain + decorators");
                     CommandBuffer.ExecuteCustomActions(RenderPass.Shadow, commandList);
+                    PixMarker.End(commandList);
                     CommandBuffer.ClearCustomActions(RenderPass.Shadow);
                 }
                 else

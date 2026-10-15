@@ -78,6 +78,7 @@ struct OceanData
     float ShoreFoamDepth;       // water depth (meters) below which swash foam bands roll in
     float ShoreFoam;            // shore foam amount (0 = none)
     float ShoreSurge;           // water level swing (meters) at the beach, in step with the swash bands
+    uint HiZSRV;                // this view's Hi-Z pyramid of the opaque depth (0 = no occlusion test)
 };
 
 // Tessellation params
@@ -106,21 +107,73 @@ float ScreenSpaceEdgeFactor(float3 p0, float3 p1)
     return clamp(edgePixels / TargetPixelsPerEdge, TessMinFactor, TessMaxFactor);
 }
 
-// Simple frustum cull for patches — zero out tessellation for off-screen triangles
-bool CullTriangle(float3 p0, float3 p1, float3 p2)
+// How far the waves can move a point of the grid, in every direction (metres): patch bounds are widened by it
+static const float PatchDisplacementBound = 20.0;
+
+// Whether a patch can be left out (tessellation factors 0): its box, widened by the waves, lies outside the
+// view, or behind the opaque scene in the Hi-Z pyramid. This used to test only "entirely behind the camera",
+// so every patch in front of the camera plane was tessellated and displaced, on screen or not, hidden behind
+// terrain or not (0.74 ms with no water in view on Eldermoor, 2026-10-15).
+bool CullTriangle(float3 p0, float3 p1, float3 p2, uint hiZSrv)
 {
-    // Expand bounds slightly to account for displacement
-    float bias = -20.0;
-    float3 minP = min(min(p0, p1), p2) + bias;
-    float3 maxP = max(max(p0, p1), p2) - bias;
+    float3 minP = min(min(p0, p1), p2) - PatchDisplacementBound;
+    float3 maxP = max(max(p0, p1), p2) + PatchDisplacementBound;
 
-    float4 clipMin = mul(mul(float4(minP, 1.0), View), Projection);
-    float4 clipMax = mul(mul(float4(maxP, 1.0), View), Projection);
+    // Clip-space corners; frustum planes as half-spaces (valid for corners behind the camera too)
+    uint outside = 0x1F;
+    float2 ndcMin = 1e30, ndcMax = -1e30;
+    float nearestW = 1e30;
+    bool reachesBehind = false;
+    [unroll]
+    for (uint i = 0; i < 8; i++)
+    {
+        float3 c = float3((i & 1) ? maxP.x : minP.x, (i & 2) ? maxP.y : minP.y, (i & 4) ? maxP.z : minP.z);
+        float4 clip = mul(mul(float4(c, 1.0), View), Projection);
 
-    // Behind camera check
-    if (clipMin.w < 0 && clipMax.w < 0) return true;
+        uint beyond = 0;
+        if (clip.x < -clip.w) beyond |= 1;
+        if (clip.x >  clip.w) beyond |= 2;
+        if (clip.y < -clip.w) beyond |= 4;
+        if (clip.y >  clip.w) beyond |= 8;
+        if (clip.w <= 0.0)    beyond |= 16;
+        outside &= beyond;
 
-    return false;
+        if (clip.w <= 0.01) reachesBehind = true;
+        else
+        {
+            float2 ndc = clip.xy / clip.w;
+            ndcMin = min(ndcMin, ndc);
+            ndcMax = max(ndcMax, ndc);
+            nearestW = min(nearestW, clip.w);
+        }
+    }
+
+    if (outside != 0) return true;              // all corners beyond one plane of the view
+    if (hiZSrv == 0 || reachesBehind) return false;
+
+    // Hi-Z: linear view depth (clip w), max over each texel's footprint, sky = FLT_MAX (never occludes).
+    // At the mip where the box's screen rectangle spans at most one texel, it touches at most 2x2 texels;
+    // it is hidden if even its nearest point is behind the farthest opaque depth there.
+    ndcMin = max(ndcMin, -1.0);
+    ndcMax = min(ndcMax, 1.0);
+    float2 uvMin = float2(ndcMin.x, -ndcMax.y) * 0.5 + 0.5;
+    float2 uvMax = float2(ndcMax.x, -ndcMin.y) * 0.5 + 0.5;
+
+    Texture2D<float> hiZ = ResourceDescriptorHeap[hiZSrv];
+    float w, h, levels;
+    hiZ.GetDimensions(0, w, h, levels);
+    float2 extent = (uvMax - uvMin) * float2(w, h);
+    uint mip = (uint)min(ceil(log2(max(max(extent.x, extent.y), 1.0))), levels - 1.0);
+
+    float mw, mh, unused;
+    hiZ.GetDimensions(mip, mw, mh, unused);
+    int2 maxCoord = int2(mw, mh) - 1;
+    int2 t0 = clamp(int2(uvMin * float2(mw, mh)), int2(0, 0), maxCoord);
+    int2 t1 = clamp(int2(uvMax * float2(mw, mh)), int2(0, 0), maxCoord);
+
+    float occluder = max(max(hiZ.Load(int3(t0.x, t0.y, mip)), hiZ.Load(int3(t1.x, t0.y, mip))),
+                         max(hiZ.Load(int3(t0.x, t1.y, mip)), hiZ.Load(int3(t1.x, t1.y, mip))));
+    return nearestW > occluder;
 }
 
 SamplerState OceanSampler : register(s0);
@@ -290,8 +343,9 @@ HullConstantOutput PatchConstantFunc(InputPatch<ControlPoint, 3> patch, uint pat
     float3 p1 = patch[1].WorldPos;
     float3 p2 = patch[2].WorldPos;
 
-    // Frustum cull — skip off-screen patches
-    if (CullTriangle(p0, p1, p2))
+    // Off screen or hidden behind the opaque scene — skip
+    StructuredBuffer<OceanData> oceanData = ResourceDescriptorHeap[OceanDataIdx];
+    if (CullTriangle(p0, p1, p2, oceanData[patch[0].InstanceIdx].HiZSRV))
     {
         output.EdgeTess[0] = output.EdgeTess[1] = output.EdgeTess[2] = 0;
         output.InsideTess = 0;

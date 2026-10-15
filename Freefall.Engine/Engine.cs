@@ -470,6 +470,14 @@ namespace Freefall
 
          [Category("Shadows")]
          public bool EnableShadows { get; set; } = true;
+
+         /// <summary>
+         /// Cascades after the first leave out casters whose bounding sphere spans fewer of that cascade's
+         /// shadow-map texels than this (diameter): far out a small thing darkens a texel or two, which
+         /// screen-space shadows already give it. 0 = every caster in every cascade.
+         /// </summary>
+         [ValueRange(0f, 16f)]
+         public float ShadowMinCasterTexels { get; set; } = 4f;
          public bool UseAdaptiveSplits { get; set; } = true;                // F4 - SDSM adaptive cascade splits
 
          [ValueRange(3, 8)]

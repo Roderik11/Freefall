@@ -219,6 +219,7 @@ namespace Freefall.Components
             public float ShoreFoamDepth;
             public float ShoreFoam;
             public float ShoreSurge;
+            public uint HiZSRV;          // the view's Hi-Z pyramid: hull shader skips hidden patches (0 = off)
         }
 
         private const int GridSize = 128;
@@ -482,6 +483,10 @@ namespace Freefall.Components
                 ShoreFoamDepth = ShoreFoamDepth,
                 ShoreFoam = ShoreFoam,
                 ShoreSurge = ShoreSurge,
+                // Built from this frame's opaque depth before the forward pass draws the water; not while
+                // frozen (stale) or with Hi-Z switched off
+                HiZSRV = DeferredRenderer.Current?.HiZPyramid is { Ready: true } pyramid
+                         && !Engine.Settings.FreezeFrustum && !Engine.Settings.DisableHiZ ? pyramid.FullSRV : 0,
             });
 
 

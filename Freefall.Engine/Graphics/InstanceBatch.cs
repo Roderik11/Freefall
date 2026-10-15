@@ -61,6 +61,12 @@ namespace Freefall.Graphics
         private HashSet<int> _uniqueMeshPartIds = new HashSet<int>();
 
         public int DrawCount => _drawCount;
+
+        /// <summary>The batch's effect, for profiler regions (GPU) and markers (CPU, with the instance count).</summary>
+        internal string ProfileName => _profileName ??= Key.Effect?.Name ?? Material?.Name ?? "Batch";
+        internal ProfilerMarker ProfileMarker => _profileMarker ??= ProfilerMarker.Get(ProfileName);
+        private string? _profileName;
+        private ProfilerMarker? _profileMarker;
         public int SubBatchCount { get; private set; }
 
         private int capacity = 0;
@@ -878,12 +884,15 @@ namespace Freefall.Graphics
                 new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(drawCountBuffers[frameIndex])));
 
             // Pass 1: CSVisibility â€” writes visibilityFlags
+            PixMarker.Begin(commandList, "Visibility");
             commandList.SetPipelineState(culler.VisibilityPSO);
             commandList.Dispatch((uint)((totalInstances + 255) / 256), 1, 1);
             // Only visibilityFlags was written; next pass (Histogram) reads it
             commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(visibilityFlagsBuffers[frameIndex])));
+            PixMarker.End(commandList);
 
             // Pass 2: CSHistogram â€” reads visibilityFlags, writes histogram
+            PixMarker.Begin(commandList, "Compaction");
             commandList.SetPipelineState(culler.HistogramPSO);
             commandList.Dispatch((uint)((totalInstances + 63) / 64), 1, 1);
             // Only histogram was written; next pass (PrefixSum) reads it
@@ -902,12 +911,14 @@ namespace Freefall.Graphics
             commandList.Barriers(
                 new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(visibleIndicesBuffers[frameIndex])),
                 new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(counterBuffers[frameIndex])));
+            PixMarker.End(commandList);
 
             // Pass 4b: GPU Depth Sort — sort visibleIndices by camera distance
             // Preserves MeshPartId grouping via composite key (meshPartId << 20 | distBits)
             if (!Engine.Settings.DisableDepthSort
                 && culler.ComputeDepthKeysPSO != null && culler.BitonicSortPairsPSO != null && culler.WriteSortedIndicesPSO != null)
             {
+                PixMarker.Begin(commandList, "Depth sort");
                 // Round up to next power of 2 for bitonic sort
                 uint sortN = 1;
                 while (sortN < (uint)totalInstances) sortN <<= 1;
@@ -943,11 +954,14 @@ namespace Freefall.Graphics
                 commandList.SetPipelineState(culler.WriteSortedIndicesPSO);
                 commandList.Dispatch((uint)((totalInstances + 255) / 256), 1, 1);
                 commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(visibleIndicesBuffers[frameIndex])));
+                PixMarker.End(commandList);
             }
 
             // Pass 5: CSMain — reads histogram+counters, writes commands
+            PixMarker.Begin(commandList, "Commands");
             commandList.SetPipelineState(culler.MainPSO);
             commandList.Dispatch((uint)((MeshRegistry.Count + 63) / 64), 1, 1);
+            PixMarker.End(commandList);
             // Commands buffer transitions to IndirectArgument in Draw(), no UAV barrier needed here
         }
 
@@ -1074,7 +1088,9 @@ namespace Freefall.Graphics
         /// CSVisibilityShadow4 writes combined visibility (union) + cascade mask.
         /// Compaction pipeline runs ONCE on the union set. CSMain sets DrawInstanceCount × 4.
         /// </summary>
-        public void CullShadowAll(ID3D12GraphicsCommandList commandList, uint cascadeBufferSrv, ulong cascadeBufferGpuAddress, uint shadowHiZSrv, GPUCuller? culler)
+        /// <param name="minCasterClip">Cascades 1+: smallest caster diameter in clip units (EngineSettings.ShadowMinCasterTexels * 2 / resolution; 0 = off).</param>
+        public void CullShadowAll(ID3D12GraphicsCommandList commandList, uint cascadeBufferSrv, ulong cascadeBufferGpuAddress, uint shadowHiZSrv, GPUCuller? culler,
+            float minCasterClip = 0f)
         {
             if (SubBatchCount == 0) return;
             if (culler?.VisibilityShadow4PSO == null || culler?.MainPSO == null || culler?.HistogramPSO == null) return;
@@ -1110,6 +1126,7 @@ namespace Freefall.Graphics
             commandList.SetComputeRoot32BitConstant(0, shadowHistogramUAVIndices[frameIndex], 26);
             commandList.SetComputeRoot32BitConstant(0, (uint)MeshRegistry.Count, 27);
             commandList.SetComputeRoot32BitConstant(0, shadowCascadeMaskUAVIndices[frameIndex], 28);  // CascadeMaskUAVIdx
+            commandList.SetComputeRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(minCasterClip), 30); // ShadowMinCasterClip
             commandList.SetComputeRoot32BitConstant(0, shadowExpansionUAVIndices[frameIndex], 29);    // ExpansionUAVIdx
             commandList.SetComputeRoot32BitConstant(0, cascadeBufferSrv, 31);                         // CascadeBufferSRVIdx (Indices[7].w)
             commandList.SetComputeRoot32BitConstant(0, 0u, 18);                                       // DrawCountUAVIdx = 0 → fixed-index mode (shadow needs it)
@@ -1143,15 +1160,21 @@ namespace Freefall.Graphics
                 new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(shadowVisibleIndicesBuffers[frameIndex])),
                 new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(shadowHistogramBuffers[frameIndex])));
 
+            using var _ = ProfileMarker.Auto(totalInstances);
+            PixMarker.Begin(commandList, ProfileName);
+
             // PHASE 1: Unified visibility (combined vis + cascade mask)
+            PixMarker.Begin(commandList, "Visibility");
             commandList.SetPipelineState(culler.VisibilityShadow4PSO);
             commandList.Dispatch((uint)((totalInstances + 255) / 256), 1, 1);
 
             commandList.Barriers(
                 new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(shadowCombinedVisBuffers[frameIndex])),
                 new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(shadowCascadeMaskBuffers[frameIndex])));
+            PixMarker.End(commandList);
 
             // PHASE 2: Single compaction pipeline (runs ONCE, not 4Ã—)
+            PixMarker.Begin(commandList, "Compaction");
             commandList.SetPipelineState(culler.HistogramPSO);
             commandList.Dispatch((uint)((totalInstances + 63) / 64), 1, 1);
             commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(shadowHistogramBuffers[frameIndex])));
@@ -1165,15 +1188,19 @@ namespace Freefall.Graphics
             commandList.Barriers(
                 new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(shadowVisibleIndicesBuffers[frameIndex])),
                 new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(shadowCounterBuffers[frameIndex])));
+            PixMarker.End(commandList);
 
             // CSMain - generates commands with DrawInstanceCount x 1
+            PixMarker.Begin(commandList, "Commands");
             commandList.SetPipelineState(culler.MainPSO);
             commandList.Dispatch((uint)((MeshRegistry.Count + 63) / 64), 1, 1);
 
             commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(shadowCommandBuffers[frameIndex])));
+            PixMarker.End(commandList);
 
             // PHASE 3: Cascade expansion - expand compacted instances by cascade mask
             // Re-clear counters for atomic append tracking
+            PixMarker.Begin(commandList, "Cascade expansion");
             commandList.ClearUnorderedAccessViewUint(
                 device.GetGpuHandle(shadowCounterUAVIndices[frameIndex]),
                 shadowCounterCPUHandles[frameIndex],
@@ -1181,10 +1208,9 @@ namespace Freefall.Graphics
                 new Vortice.Mathematics.Int4(0, 0, 0, 0));
             commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(shadowCounterBuffers[frameIndex])));
 
-            // Dispatch CSExpandCascades: 2D dispatch (x = instance groups, y = mesh parts)
-            uint maxVisiblePerPart = (uint)((totalInstances + 255) / 256);
+            // Dispatch CSExpandCascades: one thread per instance (it reads its part from the visibility flags)
             commandList.SetPipelineState(culler.ExpandCascadesPSO);
-            commandList.Dispatch(maxVisiblePerPart, (uint)MeshRegistry.Count, 1);
+            commandList.Dispatch((uint)((totalInstances + 255) / 256), 1, 1);
 
             commandList.Barriers(
                 new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(shadowExpansionBuffers[frameIndex])),
@@ -1195,9 +1221,11 @@ namespace Freefall.Graphics
             commandList.Dispatch((uint)((MeshRegistry.Count + 63) / 64), 1, 1);
 
             commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(shadowCommandBuffers[frameIndex])));
+            PixMarker.End(commandList);
 
             // PHASE 4: Compact non-empty commands from shadow buffer to opaque buffer (separate src/dest avoids race)
             // CSCompactCommands reads OutputBufferIdx (shadow), writes VisibleIndicesSRVIdx (opaque, repurposed as dest)
+            PixMarker.Begin(commandList, "Compact commands");
             commandList.ClearUnorderedAccessViewUint(
                 device.GetGpuHandle(drawCountUAVIndices[frameIndex]),
                 drawCountCPUHandles[frameIndex],
@@ -1213,6 +1241,9 @@ namespace Freefall.Graphics
             commandList.Barriers(
                 new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(gpuCommandBuffers[frameIndex])),
                 new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(drawCountBuffers[frameIndex])));
+            PixMarker.End(commandList);
+
+            PixMarker.End(commandList); // batch
         }
 
 

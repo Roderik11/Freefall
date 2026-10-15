@@ -388,8 +388,10 @@ namespace Freefall.Graphics
                 if (current.customQueues.TryGetValue(pass, out var actions) && actions.Count > 0)
                 {
                     using var _ = _customActionsMarker.Auto(actions.Count);
+                    PixMarker.Begin(commandList, "Custom actions");
                     foreach (var action in actions)
                         action(commandList);
+                    PixMarker.End(commandList);
                     actions.Clear();
                 }
 
@@ -497,8 +499,14 @@ namespace Freefall.Graphics
                 if (usingGPUPath)
                     CommandBuffer.Culler?.ClearCullStats(commandList);
                     
+                PixMarker.Begin(commandList, "Culling");
                 foreach (var batch in activeBatches)
+                {
+                    PixMarker.Begin(commandList, batch.ProfileName);
                     batch.Cull(commandList, frustumBufferGPUAddress, Culler);
+                    PixMarker.End(commandList);
+                }
+                PixMarker.End(commandList);
                 
                 if (usingGPUPath)
                     CommandBuffer.Culler?.CopyCullStatsToReadback(commandList);
@@ -508,8 +516,12 @@ namespace Freefall.Graphics
                 // 7. Draw (topology set per-batch: patch for tessellation, triangle list otherwise)
                 using var draw = _drawMarker.Auto(activeBatches.Count);
 
+                PixMarker.Begin(commandList, "Draws");
                 foreach (var batch in activeBatches)
                 {
+                    using var batchScope = batch.ProfileMarker.Auto(batch.DrawCount);
+                    PixMarker.Begin(commandList, batch.ProfileName);
+
                     // Apply Material (PSO)
                     batch.Material.Apply(commandList, device);
                     // Push constant slot 16: debug mode (not touched by command signature slots 2-15)
@@ -529,7 +541,9 @@ namespace Freefall.Graphics
                     }
 
                     batch.Draw(commandList, device);
+                    PixMarker.End(commandList);
                 }
+                PixMarker.End(commandList);
 
                 foreach (var batch in activeBatches)
                     batch.ResetBufferState(commandList);
