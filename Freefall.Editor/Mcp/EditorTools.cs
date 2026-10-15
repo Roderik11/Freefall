@@ -69,6 +69,32 @@ namespace Freefall.Editor.Mcp
         [Description("Close the editor window (e.g. before rebuilding the locked editor DLL). Unsaved work may prompt or be lost.")]
         public static Task<CallToolResult> Shutdown() => McpBridge.Get("/api/editor/shutdown");
 
+        [McpServerTool(Name = "editor_window", Title = "Editor window size and state", OpenWorld = false)]
+        [Description("Set the editor window's state ('normal', 'maximized', or 'fullscreen' = borderless over the whole screen) " +
+                     "and/or its client size in pixels (width + height, normal state). No arguments = report only. Returns the " +
+                     "window state, client size and the scene view's size, e.g. for measuring GPU cost at a given resolution.")]
+        public static async Task<CallToolResult> EditorWindow(string? state = null, int width = 0, int height = 0)
+        {
+            if (state != null || (width > 0 && height > 0))
+            {
+                var set = await McpBridge.Post("/api/editor/window", new { state, width, height });
+                if (set.IsError == true) return set;
+                await Task.Delay(750); // applied after the frame; the swap chain resizes on the next tick
+            }
+            return await McpBridge.Get("/api/editor/window");
+        }
+
+        [McpServerTool(Name = "scene_view_maximize", Title = "Maximize the scene view", OpenWorld = false)]
+        [Description("Show the scene view alone over the whole dock area (maximized: true) or put it back into the layout " +
+                     "(false). Same as double-clicking its tab. Returns the window and scene view sizes.")]
+        public static async Task<CallToolResult> SceneViewMaximize(bool maximized = true)
+        {
+            var result = await McpBridge.Post("/api/editor/scene-maximized", new { maximized });
+            if (result.IsError == true) return result;
+            await Task.Delay(300); // the viewport picks up its new size on the next layout
+            return await McpBridge.Get("/api/editor/window");
+        }
+
         [McpServerTool(Name = "screenshot", Title = "Screenshot", ReadOnly = true, OpenWorld = false)]
         [Description("Capture the editor as an image. Defaults to the whole editor window (UI panels, inspector, console included) " +
                      "downscaled to 1280px. Use target='viewport' for just the 3D scene view, and 'crop' (in the target's full-resolution " +
