@@ -77,6 +77,28 @@ namespace Freefall.Graphics
         private static bool _dirty = true;
         private static readonly Lock _lock = new();
 
+        // Entries changed since the last upload, as one range (Upload copies only these). Editor gizmos
+        // re-register their proxy meshes every frame, so a full copy each time is what this avoids.
+        private static int _dirtyMin = int.MaxValue;
+        private static int _dirtyMax = -1;
+
+        private static void MarkDirty(int id)
+        {
+            _dirty = true;
+            if (id < _dirtyMin) _dirtyMin = id;
+            if (id > _dirtyMax) _dirtyMax = id;
+        }
+
+        private static void MarkAllDirty()
+        {
+            _dirty = true;
+            _dirtyMin = 0;
+            _dirtyMax = int.MaxValue;
+        }
+
+        private static bool SameBytes<T>(in T a, in T b) where T : unmanaged =>
+            MemoryMarshal.AsBytes(new ReadOnlySpan<T>(in a)).SequenceEqual(MemoryMarshal.AsBytes(new ReadOnlySpan<T>(in b)));
+
         public static uint SrvIndex => _srvIndex;
         /// <summary>SRV of the MeshPartLod buffer (indexed by MeshPartId).</summary>
         public static uint LodSrvIndex => _lodSrvIndex;
@@ -97,7 +119,12 @@ namespace Freefall.Graphics
                 // A chain link needs the next part's ID, which may only exist after the loop above
                 if (mesh.LODs.Count > 0)
                     for (int i = 0; i < count; i++)
-                        _lodEntries[ids[i]] = BuildLodEntry(mesh, i);
+                    {
+                        var lod = BuildLodEntry(mesh, i);
+                        if (SameBytes(lod, _lodEntries[ids[i]])) continue;
+                        _lodEntries[ids[i]] = lod;
+                        MarkDirty(ids[i]);
+                    }
 
                 return ids;
             }
@@ -156,10 +183,13 @@ namespace Freefall.Graphics
                 if (_idMap.TryGetValue(key, out int existingId))
                 {
                     // Refresh the entry — dynamic meshes (gizmos) change
-                    // NumIndices/buffer indices every frame.
+                    // NumIndices/buffer indices every frame, often to the same values.
+                    if (SameBytes(entry, _entries[existingId]) && SameBytes(lodEntry, _lodEntries[existingId]))
+                        return existingId;
+
                     _entries[existingId] = entry;
                     _lodEntries[existingId] = lodEntry;
-                    _dirty = true;
+                    MarkDirty(existingId);
                     return existingId;
                 }
 
@@ -169,7 +199,7 @@ namespace Freefall.Graphics
                     _entries[id] = entry;
                     _lodEntries[id] = lodEntry;
                     _idMap[key] = id;
-                    _dirty = true;
+                    MarkDirty(id);
                     return id;
                 }
 
@@ -180,7 +210,7 @@ namespace Freefall.Graphics
                 _entries.Add(entry);
                 _lodEntries.Add(lodEntry);
                 _idMap[key] = newId;
-                _dirty = true;
+                MarkDirty(newId);
 
                 if (Engine.FrameIndex < 10)
                     Debug.Log("MeshRegistry", $"Registered mesh {mesh.Name} part {partIndex} as ID {newId}");
@@ -214,13 +244,11 @@ namespace Freefall.Graphics
                         // Zero out the entry so GPU doesn't reference stale data
                         _entries[kv.Value] = default;
                         _lodEntries[kv.Value] = default;
+                        MarkDirty(kv.Value);
                     }
                 }
                 foreach (var key in keysToRemove)
                     _idMap.Remove(key);
-
-                if (keysToRemove.Count > 0)
-                    _dirty = true;
             }
         }
 
@@ -253,8 +281,9 @@ namespace Freefall.Graphics
                     }
                 };
                 device.NativeDevice.CreateShaderResourceView(_buffer, srvDesc, device.GetCpuHandle(_srvIndex));
-                
+
                 Debug.Log("MeshRegistry", $"Created registry buffer, SRV index {_srvIndex}");
+                lock (_lock) MarkAllDirty(); // a new buffer gets every entry
             }
 
             if (_lodBuffer == null)
@@ -276,34 +305,36 @@ namespace Freefall.Graphics
                     }
                 };
                 device.NativeDevice.CreateShaderResourceView(_lodBuffer, lodSrvDesc, device.GetCpuHandle(_lodSrvIndex));
+                lock (_lock) MarkAllDirty();
             }
 
-            // Take snapshot under lock to avoid racing with background Register calls
-            MeshPartEntry[] snapshot;
-            MeshPartLod[] lodSnapshot;
-            int count;
+            // Copy the changed range straight from the lists, under the lock (background Register calls).
+            // Only a few entries change per frame, so this is short; no snapshot arrays.
             lock (_lock)
             {
-                count = _entries.Count;
-                snapshot = _entries.ToArray();
-                lodSnapshot = _lodEntries.ToArray();
+                int count = _entries.Count;
+                int first = Math.Max(_dirtyMin, 0);
+                int end = Math.Min(_dirtyMax, count - 1) + 1;
                 _dirty = false;
-            }
+                _dirtyMin = int.MaxValue;
+                _dirtyMax = -1;
+                if (end <= first) return;
 
-            // Upload snapshot (outside lock — GPU upload can be slow)
-            unsafe
-            {
-                void* pData;
-                _buffer.Map(0, null, &pData);
-                var span = new Span<MeshPartEntry>(pData, count);
-                for (int i = 0; i < count; i++)
-                    span[i] = snapshot[i];
-                _buffer.Unmap(0);
+                var entries = CollectionsMarshal.AsSpan(_entries)[first..end];
+                var lods = CollectionsMarshal.AsSpan(_lodEntries)[first..end];
 
-                void* pLodData;
-                _lodBuffer.Map(0, null, &pLodData);
-                lodSnapshot.AsSpan(0, count).CopyTo(new Span<MeshPartLod>(pLodData, count));
-                _lodBuffer.Unmap(0);
+                unsafe
+                {
+                    void* pData;
+                    _buffer.Map(0, null, &pData);
+                    entries.CopyTo(new Span<MeshPartEntry>((MeshPartEntry*)pData + first, entries.Length));
+                    _buffer.Unmap(0);
+
+                    void* pLodData;
+                    _lodBuffer.Map(0, null, &pLodData);
+                    lods.CopyTo(new Span<MeshPartLod>((MeshPartLod*)pLodData + first, lods.Length));
+                    _lodBuffer.Unmap(0);
+                }
             }
         }
 
@@ -316,7 +347,7 @@ namespace Freefall.Graphics
             _lodEntries.Clear();
             _idMap.Clear();
             _freeSlots.Clear();
-            _dirty = true;
+            MarkAllDirty();
         }
 
         /// <summary>
@@ -328,6 +359,7 @@ namespace Freefall.Graphics
             _buffer = null;
             _lodBuffer?.Dispose();
             _lodBuffer = null;
+            lock (_lock) MarkAllDirty(); // whatever buffer comes next needs everything
             if (_srvIndex != 0)
             {
                 Engine.Device?.ReleaseBindlessIndex(_srvIndex);

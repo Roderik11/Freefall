@@ -459,12 +459,11 @@ namespace Freefall.Graphics
             ID3D12Resource sortedIndicesBuffer)
         {
             // Transition back to Common for next frame's BeginCommandGeneration
-            commandList.ResourceBarrier(new[] {
+            commandList.Barriers(
                 new ResourceBarrier(
                     new ResourceTransitionBarrier(outputBuffer, ResourceStates.IndirectArgument, ResourceStates.Common)),
                 new ResourceBarrier(
-                    new ResourceTransitionBarrier(sortedIndicesBuffer, ResourceStates.NonPixelShaderResource, ResourceStates.Common))
-            });
+                    new ResourceTransitionBarrier(sortedIndicesBuffer, ResourceStates.NonPixelShaderResource, ResourceStates.Common)));
         }
         /// <summary>
         /// Generate the Hi-Z depth pyramid from the current depth buffer.
@@ -717,11 +716,10 @@ namespace Freefall.Graphics
             _depthHistogramBuffer!.ClearUAV(commandList, new Int4(0, 0, 0, 0));
             
             commandList.ResourceBarrierTransition(_depthSplitsBuffer!.Native, splitsFrom, ResourceStates.UnorderedAccess);
-            commandList.ResourceBarrier(new[] {
+            commandList.Barriers(
                 new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(_depthMinMaxBuffer!.Native)),
                 new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(_depthHistogramBuffer!.Native)),
-                new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(_depthSplitsBuffer!.Native))
-            });
+                new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(_depthSplitsBuffer!.Native)));
             
             // Set constants via ComputeShader API
             var da = _depthAnalysisShader!;
@@ -752,14 +750,13 @@ namespace Freefall.Graphics
             commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(_depthSplitsBuffer!.Native)));
             
             // Step 4: Transition splits + minmax to CopySource for readback (batched)
-            commandList.ResourceBarrier(new[] {
+            commandList.Barriers(
                 new ResourceBarrier(
                     new ResourceTransitionBarrier(_depthSplitsBuffer!.Native,
                         ResourceStates.UnorderedAccess, ResourceStates.CopySource)),
                 new ResourceBarrier(
                     new ResourceTransitionBarrier(_depthMinMaxBuffer!.Native,
-                        ResourceStates.UnorderedAccess, ResourceStates.CopySource))
-            });
+                        ResourceStates.UnorderedAccess, ResourceStates.CopySource)));
             // Histogram stays in UAV (next frame will transition it to CopyDest)
             
             // Step 5: Copy to readback buffer for this frame
@@ -771,9 +768,11 @@ namespace Freefall.Graphics
             _sdsmValidFrames++;
         }
         
+        private readonly float[] _adaptiveSplits = new float[4];
+
         /// <summary>
         /// Read the adaptive cascade splits computed by the previous frame's depth analysis.
-        /// Returns null if no valid data is available yet.
+        /// Returns null if no valid data is available yet. The array is reused: valid until the next call.
         /// </summary>
         public unsafe float[]? ReadAdaptiveSplits()
         {
@@ -788,7 +787,9 @@ namespace Freefall.Graphics
             if (pSplits[0] <= 0)
                 return null;
             
-            return new float[] { pSplits[0], pSplits[1], pSplits[2], pSplits[3] };
+            for (int i = 0; i < 4; i++)
+                _adaptiveSplits[i] = pSplits[i];
+            return _adaptiveSplits;
         }
 
         /// <summary>

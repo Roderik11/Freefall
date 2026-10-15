@@ -164,9 +164,9 @@ namespace Freefall.Components
             // Enqueue shadow rendering first (runs before light pass). Nothing queued = the renderer skips
             // its whole shadow pass (cascades, shadow Hi-Z, SDSM) and readers get no shadow map.
             if (CastShadows && Engine.Settings.EnableShadows && DeferredRenderer.Current?.ShadowTextureArray != null)
-                CommandBuffer.Enqueue(RenderPass.ShadowMap, DrawShadows);
-            
-            CommandBuffer.Enqueue(RenderPass.Light, DrawLight);
+                CommandBuffer.Enqueue(RenderPass.ShadowMap, _drawShadowsAction ??= DrawShadows);
+
+            CommandBuffer.Enqueue(RenderPass.Light, _drawLightAction ??= DrawLight);
         }
 
         /// <summary>
@@ -182,11 +182,31 @@ namespace Freefall.Components
                 pair.Value.SetParameter("LightColor", Color.ToVector3());
                 pair.Value.SetParameter("LightDirection", Transform.Forward);
                 pair.Value.SetParameter("LightIntensity", Intensity);
-                pair.Value.SetParameterArray("LightSpaces", lightSpace[..cc]);
-                pair.Value.SetParameterArray("Cascades", cascades[..cc]);
+                pair.Value.SetParameterArray("LightSpaces", _lightSpaceParam);
+                pair.Value.SetParameterArray("Cascades", _cascadesParam);
                 pair.Value.SetParameter("CascadeCount", cc);
             }
         }
+
+        // The first CascadeCount entries of lightSpace and cascades, as the arrays handed to the parameter
+        // blocks (which keep the array, not a copy): refilled in place each frame. Slicing (lightSpace[..cc])
+        // made two new arrays per effect per frame.
+        private Matrix4x4[] _lightSpaceParam = [];
+        private Vector4[] _cascadesParam = [];
+
+        private void RefreshCascadeParams(int cc)
+        {
+            if (_lightSpaceParam.Length != cc)
+            {
+                _lightSpaceParam = new Matrix4x4[cc];
+                _cascadesParam = new Vector4[cc];
+            }
+            Array.Copy(lightSpace, _lightSpaceParam, cc);
+            Array.Copy(cascades, _cascadesParam, cc);
+        }
+
+        private Action<ID3D12GraphicsCommandList>? _drawShadowsAction, _drawLightAction;
+        private static ID3D12DescriptorHeap[]? s_srvHeaps;
 
         private static int _diagFrameCount = 0;
         private void DrawLight(ID3D12GraphicsCommandList commandList)
@@ -209,8 +229,9 @@ namespace Freefall.Components
             Params.SetParameter("LightIntensity", Intensity);
             
             int cc = CascadeCount;
-            Params.SetParameterArray("LightSpaces", lightSpace[..cc]);
-            Params.SetParameterArray("Cascades", cascades[..cc]);
+            RefreshCascadeParams(cc);
+            Params.SetParameterArray("LightSpaces", _lightSpaceParam);
+            Params.SetParameterArray("Cascades", _cascadesParam);
             Params.SetParameter("CascadeCount", cc);
             Params.SetParameter("DebugVisualizationMode", Engine.Settings.DebugVisualizationMode);
             
@@ -234,7 +255,7 @@ namespace Freefall.Components
             // Switch to compute pipeline via ComputeShader
             var lightCS = renderer.DirectionalLightCS;
             commandList.SetComputeRootSignature(Engine.Device.GlobalRootSignature);
-            commandList.SetDescriptorHeaps(1, new[] { Engine.Device.SrvHeap });
+            commandList.SetDescriptorHeaps(1, s_srvHeaps ??= [Engine.Device.SrvHeap]);
             
             // Push constants via ComputeShader reflection (10 slots)
             var desc = renderer.LightBuffer.Native.Description;

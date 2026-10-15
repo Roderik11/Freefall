@@ -806,10 +806,9 @@ namespace Freefall.Graphics
              _pointLightCS.Dispatch(_kCullLights, list, cullGroups);
 
              // Barrier: Phase 0 writes must complete before Phase 1 reads
-             list.ResourceBarrier(new[] {
+             list.Barriers(
                  new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(_visibleLightIndices!.Native)),
-                 new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(_visibleLightCount.Native))
-             });
+                 new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(_visibleLightCount.Native)));
 
              // Phase 1+2: Tiled culling + PBR lighting
              uint groupsX = ((uint)desc.Width + 7) / 8;
@@ -939,10 +938,9 @@ namespace Freefall.Graphics
                 int dstH = Math.Max(1, bloom.Height >> i);
 
                 // Per-subresource: source mip[i+1] → SRV, dest mip[i] → UAV
-                list.ResourceBarrier(new ResourceBarrier[] {
+                list.Barriers(
                     new ResourceBarrier(new ResourceTransitionBarrier(bloom.Texture!, ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource, (uint)(i + 1))),
-                    new ResourceBarrier(new ResourceTransitionBarrier(bloom.Texture!, ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess, (uint)i)),
-                });
+                    new ResourceBarrier(new ResourceTransitionBarrier(bloom.Texture!, ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess, (uint)i)));
 
                 _bloomCS.SetPushConstant(_kBloomUpsample, "InputSrv", bloom.MipSRVs[i + 1]);
                 _bloomCS.SetPushConstant(_kBloomUpsample, "OutputUAV", bloom.MipUAVs[i]);

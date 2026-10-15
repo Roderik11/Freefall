@@ -222,11 +222,10 @@ namespace Freefall.Graphics
                 _histogramBuffers[f],
                 new Int4(0, 0, 0, 0));
 
-            commandList.ResourceBarrier(new[] {
+            commandList.Barriers(
                 new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(_counterBuffers[f])),
                 new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(_visibleIndicesBuffers[f])),
-                new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(_histogramBuffers[f]))
-            });
+                new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(_histogramBuffers[f])));
 
             // Pass 1: Visibility
             commandList.SetPipelineState(culler.VisibilityPSO);
@@ -246,10 +245,9 @@ namespace Freefall.Graphics
             // Pass 4: Scatter
             commandList.SetPipelineState(culler.GlobalScatterPSO);
             commandList.Dispatch((uint)((totalInstances + 255) / 256), 1, 1);
-            commandList.ResourceBarrier(new[] {
+            commandList.Barriers(
                 new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(_visibleIndicesBuffers[f])),
-                new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(_counterBuffers[f]))
-            });
+                new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(_counterBuffers[f])));
 
             // Pass 5: Generate commands
             commandList.SetPipelineState(culler.MainPSO);
@@ -270,14 +268,13 @@ namespace Freefall.Graphics
             if (commandBuffer == null) return;
 
             // Transition for reading (batched)
-            commandList.ResourceBarrier(new[] {
+            commandList.Barriers(
                 new ResourceBarrier(
                     new ResourceTransitionBarrier(_visibleIndicesBuffers[f],
                         ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource)),
                 new ResourceBarrier(
                     new ResourceTransitionBarrier(commandBuffer,
-                        ResourceStates.UnorderedAccess, ResourceStates.IndirectArgument))
-            });
+                        ResourceStates.UnorderedAccess, ResourceStates.IndirectArgument)));
 
             commandList.ExecuteIndirect(
                 Engine.Device.BindlessCommandSignature,
@@ -285,14 +282,13 @@ namespace Freefall.Graphics
                 commandBuffer, 0, null, 0);
 
             // Transition back (batched)
-            commandList.ResourceBarrier(new[] {
+            commandList.Barriers(
                 new ResourceBarrier(
                     new ResourceTransitionBarrier(commandBuffer,
                         ResourceStates.IndirectArgument, ResourceStates.UnorderedAccess)),
                 new ResourceBarrier(
                     new ResourceTransitionBarrier(_visibleIndicesBuffers[f],
-                        ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess))
-            });
+                        ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess)));
         }
 
         #endregion
@@ -434,12 +430,11 @@ namespace Freefall.Graphics
             commandList.SetPipelineState(culler.VisibilityShadow4PSO);
             commandList.Dispatch((uint)((totalInstances + 255) / 256), 1, 1);
 
-            commandList.ResourceBarrier(new[] {
+            commandList.Barriers(
                 new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(_shadowVisibilityBuffers[f, 0])),
                 new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(_shadowVisibilityBuffers[f, 1])),
                 new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(_shadowVisibilityBuffers[f, 2])),
-                new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(_shadowVisibilityBuffers[f, 3]))
-            });
+                new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(_shadowVisibilityBuffers[f, 3])));
 
             // Phase 2: Per-cascade Histogram → PrefixSum → Scatter → Main
             for (int c = 0; c < DirectionalLight.CascadeCount; c++)
@@ -461,11 +456,10 @@ namespace Freefall.Graphics
                     _shadowHistogramBuffers[f, c],
                     new Int4(0, 0, 0, 0));
 
-                commandList.ResourceBarrier(new[] {
+                commandList.Barriers(
                     new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(_shadowCounterBuffers[f, c])),
                     new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(_shadowVisibleIndicesBuffers[f, c])),
-                    new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(_shadowHistogramBuffers[f, c]))
-                });
+                    new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(_shadowHistogramBuffers[f, c])));
 
                 // Rebind per-cascade buffer indices
                 commandList.SetComputeRoot32BitConstant(0, _shadowCommandUAVIndices[f, c], 1);
@@ -488,10 +482,9 @@ namespace Freefall.Graphics
                 // Scatter
                 commandList.SetPipelineState(culler.GlobalScatterPSO);
                 commandList.Dispatch((uint)((totalInstances + 255) / 256), 1, 1);
-                commandList.ResourceBarrier(new[] {
+                commandList.Barriers(
                     new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(_shadowVisibleIndicesBuffers[f, c])),
-                    new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(_shadowCounterBuffers[f, c]))
-                });
+                    new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(_shadowCounterBuffers[f, c])));
 
                 // Main (command generation)
                 commandList.SetPipelineState(culler.MainPSO);
@@ -514,14 +507,13 @@ namespace Freefall.Graphics
             if (commandBuffer == null) return;
 
             // Transition for reading (batched)
-            commandList.ResourceBarrier(new[] {
+            commandList.Barriers(
                 new ResourceBarrier(
                     new ResourceTransitionBarrier(_shadowVisibleIndicesBuffers[f, cascadeIndex],
                         ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource)),
                 new ResourceBarrier(
                     new ResourceTransitionBarrier(commandBuffer,
-                        ResourceStates.UnorderedAccess, ResourceStates.IndirectArgument))
-            });
+                        ResourceStates.UnorderedAccess, ResourceStates.IndirectArgument)));
 
             commandList.ExecuteIndirect(
                 Engine.Device.BindlessCommandSignature,
@@ -529,14 +521,13 @@ namespace Freefall.Graphics
                 commandBuffer, 0, null, 0);
 
             // Transition back (batched)
-            commandList.ResourceBarrier(new[] {
+            commandList.Barriers(
                 new ResourceBarrier(
                     new ResourceTransitionBarrier(commandBuffer,
                         ResourceStates.IndirectArgument, ResourceStates.UnorderedAccess)),
                 new ResourceBarrier(
                     new ResourceTransitionBarrier(_shadowVisibleIndicesBuffers[f, cascadeIndex],
-                        ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess))
-            });
+                        ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess)));
         }
 
         #endregion

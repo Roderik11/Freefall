@@ -871,12 +871,11 @@ namespace Freefall.Graphics
                 drawCountBuffers[frameIndex],
                 new Vortice.Mathematics.Int4(0, 0, 0, 0));
 
-            commandList.ResourceBarrier(new[] {
+            commandList.Barriers(
                 new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(counterBuffers[frameIndex])),
                 new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(visibleIndicesBuffers[frameIndex])),
                 new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(histogramBuffers[frameIndex])),
-                new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(drawCountBuffers[frameIndex]))
-            });
+                new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(drawCountBuffers[frameIndex])));
 
             // Pass 1: CSVisibility â€” writes visibilityFlags
             commandList.SetPipelineState(culler.VisibilityPSO);
@@ -900,10 +899,9 @@ namespace Freefall.Graphics
             commandList.SetPipelineState(culler.GlobalScatterPSO);
             commandList.Dispatch((uint)((totalInstances + 255) / 256), 1, 1);
             // visibleIndices and counters were written; depth sort reads visibleIndices next
-            commandList.ResourceBarrier(new[] {
+            commandList.Barriers(
                 new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(visibleIndicesBuffers[frameIndex])),
-                new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(counterBuffers[frameIndex]))
-            });
+                new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(counterBuffers[frameIndex])));
 
             // Pass 4b: GPU Depth Sort — sort visibleIndices by camera distance
             // Preserves MeshPartId grouping via composite key (meshPartId << 20 | distBits)
@@ -1140,20 +1138,18 @@ namespace Freefall.Graphics
                 shadowHistogramBuffers[frameIndex],
                 new Vortice.Mathematics.Int4(0, 0, 0, 0));
 
-            commandList.ResourceBarrier(new[] {
+            commandList.Barriers(
                 new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(shadowCounterBuffers[frameIndex])),
                 new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(shadowVisibleIndicesBuffers[frameIndex])),
-                new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(shadowHistogramBuffers[frameIndex]))
-            });
+                new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(shadowHistogramBuffers[frameIndex])));
 
             // PHASE 1: Unified visibility (combined vis + cascade mask)
             commandList.SetPipelineState(culler.VisibilityShadow4PSO);
             commandList.Dispatch((uint)((totalInstances + 255) / 256), 1, 1);
 
-            commandList.ResourceBarrier(new[] {
+            commandList.Barriers(
                 new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(shadowCombinedVisBuffers[frameIndex])),
-                new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(shadowCascadeMaskBuffers[frameIndex]))
-            });
+                new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(shadowCascadeMaskBuffers[frameIndex])));
 
             // PHASE 2: Single compaction pipeline (runs ONCE, not 4Ã—)
             commandList.SetPipelineState(culler.HistogramPSO);
@@ -1166,10 +1162,9 @@ namespace Freefall.Graphics
 
             commandList.SetPipelineState(culler.GlobalScatterPSO);
             commandList.Dispatch((uint)((totalInstances + 255) / 256), 1, 1);
-            commandList.ResourceBarrier(new[] {
+            commandList.Barriers(
                 new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(shadowVisibleIndicesBuffers[frameIndex])),
-                new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(shadowCounterBuffers[frameIndex]))
-            });
+                new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(shadowCounterBuffers[frameIndex])));
 
             // CSMain - generates commands with DrawInstanceCount x 1
             commandList.SetPipelineState(culler.MainPSO);
@@ -1191,10 +1186,9 @@ namespace Freefall.Graphics
             commandList.SetPipelineState(culler.ExpandCascadesPSO);
             commandList.Dispatch(maxVisiblePerPart, (uint)MeshRegistry.Count, 1);
 
-            commandList.ResourceBarrier(new[] {
+            commandList.Barriers(
                 new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(shadowExpansionBuffers[frameIndex])),
-                new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(shadowCounterBuffers[frameIndex]))
-            });
+                new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(shadowCounterBuffers[frameIndex])));
 
             // Patch indirect args with expanded counts and updated base offsets
             commandList.SetPipelineState(culler.PatchExpandedPSO);
@@ -1216,10 +1210,9 @@ namespace Freefall.Graphics
             commandList.SetPipelineState(culler.CompactCommandsPSO);
             commandList.Dispatch((uint)((MeshRegistry.Count + 63) / 64), 1, 1);
 
-            commandList.ResourceBarrier(new[] {
+            commandList.Barriers(
                 new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(gpuCommandBuffers[frameIndex])),
-                new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(drawCountBuffers[frameIndex]))
-            });
+                new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(drawCountBuffers[frameIndex])));
         }
 
 
@@ -1272,14 +1265,13 @@ namespace Freefall.Graphics
 
             if (countBuffer != null)
             {
-                commandList.ResourceBarrier(new[] {
+                commandList.Barriers(
                     new ResourceBarrier(new ResourceTransitionBarrier(shadowExpansionBuffers[frameIndex],
                         ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource)),
                     new ResourceBarrier(new ResourceTransitionBarrier(commandBuffer,
                         ResourceStates.UnorderedAccess, ResourceStates.IndirectArgument)),
                     new ResourceBarrier(new ResourceTransitionBarrier(countBuffer,
-                        ResourceStates.UnorderedAccess, ResourceStates.IndirectArgument))
-                });
+                        ResourceStates.UnorderedAccess, ResourceStates.IndirectArgument)));
 
                 commandList.ExecuteIndirect(
                     Engine.Device.BindlessCommandSignature,
@@ -1290,24 +1282,22 @@ namespace Freefall.Graphics
                     0
                 );
 
-                commandList.ResourceBarrier(new[] {
+                commandList.Barriers(
                     new ResourceBarrier(new ResourceTransitionBarrier(commandBuffer,
                         ResourceStates.IndirectArgument, ResourceStates.UnorderedAccess)),
                     new ResourceBarrier(new ResourceTransitionBarrier(countBuffer,
                         ResourceStates.IndirectArgument, ResourceStates.UnorderedAccess)),
                     new ResourceBarrier(new ResourceTransitionBarrier(shadowExpansionBuffers[frameIndex],
-                        ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess))
-                });
+                        ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess)));
             }
             else
             {
                 // Fallback: no count buffer
-                commandList.ResourceBarrier(new[] {
+                commandList.Barriers(
                     new ResourceBarrier(new ResourceTransitionBarrier(shadowExpansionBuffers[frameIndex],
                         ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource)),
                     new ResourceBarrier(new ResourceTransitionBarrier(commandBuffer,
-                        ResourceStates.UnorderedAccess, ResourceStates.IndirectArgument))
-                });
+                        ResourceStates.UnorderedAccess, ResourceStates.IndirectArgument)));
 
                 commandList.ExecuteIndirect(
                     Engine.Device.BindlessCommandSignature,
@@ -1318,12 +1308,11 @@ namespace Freefall.Graphics
                     0
                 );
 
-                commandList.ResourceBarrier(new[] {
+                commandList.Barriers(
                     new ResourceBarrier(new ResourceTransitionBarrier(commandBuffer,
                         ResourceStates.IndirectArgument, ResourceStates.UnorderedAccess)),
                     new ResourceBarrier(new ResourceTransitionBarrier(shadowExpansionBuffers[frameIndex],
-                        ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess))
-                });
+                        ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess)));
             }
         }
 
@@ -1366,14 +1355,13 @@ namespace Freefall.Graphics
             if (countBuffer != null)
             {
                 // Batch all pre-draw transitions
-                commandList.ResourceBarrier(new[] {
+                commandList.Barriers(
                     new ResourceBarrier(new ResourceTransitionBarrier(visibleIndicesBuffers[frameIndex],
                         ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource)),
                     new ResourceBarrier(new ResourceTransitionBarrier(commandBuffer,
                         ResourceStates.UnorderedAccess, ResourceStates.IndirectArgument)),
                     new ResourceBarrier(new ResourceTransitionBarrier(countBuffer,
-                        ResourceStates.UnorderedAccess, ResourceStates.IndirectArgument))
-                });
+                        ResourceStates.UnorderedAccess, ResourceStates.IndirectArgument)));
 
                 commandList.ExecuteIndirect(
                     Engine.Device.BindlessCommandSignature,
@@ -1385,24 +1373,22 @@ namespace Freefall.Graphics
                 );
 
                 // Batch all post-draw transitions
-                commandList.ResourceBarrier(new[] {
+                commandList.Barriers(
                     new ResourceBarrier(new ResourceTransitionBarrier(commandBuffer,
                         ResourceStates.IndirectArgument, ResourceStates.UnorderedAccess)),
                     new ResourceBarrier(new ResourceTransitionBarrier(countBuffer,
                         ResourceStates.IndirectArgument, ResourceStates.UnorderedAccess)),
                     new ResourceBarrier(new ResourceTransitionBarrier(visibleIndicesBuffers[frameIndex],
-                        ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess))
-                });
+                        ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess)));
             }
             else
             {
                 // Fallback: no count buffer (after resize, before next Cull())
-                commandList.ResourceBarrier(new[] {
+                commandList.Barriers(
                     new ResourceBarrier(new ResourceTransitionBarrier(visibleIndicesBuffers[frameIndex],
                         ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource)),
                     new ResourceBarrier(new ResourceTransitionBarrier(commandBuffer,
-                        ResourceStates.UnorderedAccess, ResourceStates.IndirectArgument))
-                });
+                        ResourceStates.UnorderedAccess, ResourceStates.IndirectArgument)));
 
                 commandList.ExecuteIndirect(
                     Engine.Device.BindlessCommandSignature,
@@ -1413,12 +1399,11 @@ namespace Freefall.Graphics
                     0
                 );
 
-                commandList.ResourceBarrier(new[] {
+                commandList.Barriers(
                     new ResourceBarrier(new ResourceTransitionBarrier(commandBuffer,
                         ResourceStates.IndirectArgument, ResourceStates.UnorderedAccess)),
                     new ResourceBarrier(new ResourceTransitionBarrier(visibleIndicesBuffers[frameIndex],
-                        ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess))
-                });
+                        ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess)));
             }
 
         }

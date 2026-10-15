@@ -37,7 +37,9 @@ namespace Freefall.Components
         public Vector3 Forward => Vector3.Normalize(new Vector3(Matrix.M31, Matrix.M32, Matrix.M33));
         public Vector3 Right => Vector3.Normalize(new Vector3(Matrix.M11, Matrix.M12, Matrix.M13));
         public int Count => Children.Count;
-        public System.Collections.IEnumerator GetEnumerator() => Children.GetEnumerator();
+        // The list's struct enumerator: foreach over a transform allocates nothing (the IEnumerator it used to
+        // return boxed one per loop, e.g. every Animator walking its character each frame)
+        public List<Transform>.Enumerator GetEnumerator() => Children.GetEnumerator();
 
         internal void SetDirty()
         {

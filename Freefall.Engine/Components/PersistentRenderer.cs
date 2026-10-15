@@ -40,7 +40,6 @@ namespace Freefall.Components
         private bool _live;                   // between Awake and Destroy: only then may draws be registered
         private int _refreshQueued;           // 1 while a RefreshDraws is pending (Interlocked)
         private Transform? _trackedTransform; // the transform UpdateBounds is subscribed to
-        private Vector3[] _boundsCorners = new Vector3[8];
 
         // Live renderers, for the rare pushes from shared assets below
         private static readonly HashSet<PersistentRenderer> _liveRenderers = new();
@@ -108,13 +107,33 @@ namespace Freefall.Components
             if (_trackedTransform != null) _trackedTransform.OnChanged += UpdateBounds;
         }
 
+        /// <summary>
+        /// The world bounding sphere of the mesh's box. Runs on every transform change of this renderer or
+        /// any parent (a character moving re-runs it for each body part and held item), so it must not
+        /// allocate: Vortice's BoundingSphere.CreateFromPoints copies the points into a new array (120 B per
+        /// call, ~77 KB per frame with Eldermoor's townsfolk in play mode). The transformed box is centrally
+        /// symmetric, so the smallest sphere around its corners is centred on the box centre and reaches
+        /// the farthest corner.
+        /// </summary>
         private void UpdateBounds()
         {
             var mesh = RenderMesh;
             if (mesh == null || Transform == null) return;
 
-            mesh.BoundingBox.GetCorners(_boundsCorners, mesh.RootRotation * Transform.WorldMatrix);
-            BoundingSphere = BoundingSphere.CreateFromPoints(_boundsCorners);
+            var world = mesh.RootRotation * Transform.WorldMatrix;
+            var box = mesh.BoundingBox;
+            var center = Vector3.Transform((box.Min + box.Max) * 0.5f, world);
+
+            float radiusSquared = 0f;
+            for (int i = 0; i < 8; i++)
+            {
+                var corner = new Vector3((i & 1) != 0 ? box.Max.X : box.Min.X,
+                                         (i & 2) != 0 ? box.Max.Y : box.Min.Y,
+                                         (i & 4) != 0 ? box.Max.Z : box.Min.Z);
+                radiusSquared = MathF.Max(radiusSquared, Vector3.DistanceSquared(Vector3.Transform(corner, world), center));
+            }
+
+            BoundingSphere = new BoundingSphere(center, MathF.Sqrt(radiusSquared));
         }
 
         /// <summary>
