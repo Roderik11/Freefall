@@ -470,6 +470,9 @@ namespace Freefall.Editor.Commands
                     var relativePath = AssetDatabase.GuidToPath(guid);
                     if (relativePath != null && Engine.Project != null)
                     {
+                        // As an inspector edit does: dependents refresh on the dirty message (a terrain re-reads a
+                        // layer's tint and tiling), which saving alone never sends
+                        asset.MarkDirty();
                         savedPath = Path.Combine(Engine.Project.AssetsDirectory, relativePath);
                         Engine.Assets.SaveAsset(asset, savedPath);
                     }

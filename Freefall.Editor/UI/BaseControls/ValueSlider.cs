@@ -137,9 +137,12 @@ namespace Freefall.Editor
                     dragging ? ColorInt.ARGB(1f, .30f, .38f, .52f) : hot ? ColorInt.ARGB(1f, .25f, .31f, .41f) : ColorInt.ARGB(1f, .20f, .25f, .33f));
             }
 
-            // Handle at the value, always visible so a slider at its minimum doesn't pass for a text field
-            int handle = Math.Clamp(x + 1 + fill - 1, x + 3, x + w - 5);
-            Gui.Renderer.DrawBox(handle, y + 3, 2, h - 6, hot ? LandingArt.Coral : ColorInt.ARGB(1f, .42f, .50f, .64f));
+            // Handle at the value, always visible so a slider at its minimum doesn't pass for a text field. Not
+            // Math.Clamp: a slider laid out narrower than 8 px (for a frame while a panel rebuilds) has min > max,
+            // and Math.Clamp throws there; the unhandled exception closed the editor (2026-10-15).
+            int handle = Math.Max(x + 3, Math.Min(x + 1 + fill - 1, x + w - 5));
+            if (w >= 8)
+                Gui.Renderer.DrawBox(handle, y + 3, 2, h - 6, hot ? LandingArt.Coral : ColorInt.ARGB(1f, .42f, .50f, .64f));
 
             string text = Format(value);
             int font = Gui.Renderer.GetFont("roboto_regular_10");

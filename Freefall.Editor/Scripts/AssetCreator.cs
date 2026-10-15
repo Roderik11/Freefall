@@ -23,12 +23,12 @@ namespace Freefall.Editor
         /// <summary>
         /// True if any loaded asset has unsaved changes.
         /// </summary>
-        public static bool HasChangedAssets => _dirtyAssets.Count > 0;
+        public static bool HasChangedAssets => _dirtyAssets.Any(a => a.IsDirty);
 
         /// <summary>
         /// Number of assets with unsaved changes.
         /// </summary>
-        public static int DirtyAssetCount => _dirtyAssets.Count;
+        public static int DirtyAssetCount => _dirtyAssets.Count(a => a.IsDirty);
 
         /// <summary>
         /// Subscribe to AssetDirty messages. Call once at editor startup.
@@ -50,8 +50,13 @@ namespace Freefall.Editor
         {
             int saved = 0;
 
-            foreach (var asset in _dirtyAssets)
+            // A copy: saving imports again and may mark further assets dirty. Assets saved since they were edited
+            // (inspector edit then MCP save, or asset_set_properties, which marks and saves) are skipped: saving a
+            // terrain again re-reads its heightmap from the GPU and re-cooks its collision, tens of MB, for nothing.
+            foreach (var asset in _dirtyAssets.ToList())
             {
+                if (!asset.IsDirty) continue;
+
                 string savePath = null;
 
                 if (!string.IsNullOrEmpty(asset.Guid))

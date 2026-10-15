@@ -112,6 +112,17 @@ namespace Freefall.Editor
             squidRenderer = new SquidRenderer(Engine.Device);
             Squid.Gui.Renderer = squidRenderer;
 
+            // One control's bug must not close the editor: Squid skips a control whose own draw or update throws
+            // and reports it here. Each distinct failure is logged once (it would otherwise repeat every frame).
+            // A slider laid out 2 px wide for one frame threw from Math.Clamp and took the editor down (2026-10-15).
+            var reportedControlErrors = new System.Collections.Generic.HashSet<string>();
+            Squid.Gui.ControlException = (control, ex) =>
+            {
+                string key = control.GetType().FullName + "|" + ex.GetType().FullName + "|" + ex.Message;
+                if (reportedControlErrors.Add(key))
+                    Debug.LogError("[GUI]", $"{control.GetType().Name} skipped: {ex}");
+            };
+
             // Inject thumbnail textures into Squid when they're lazy-loaded
             AssetDatabase.OnThumbnailLoaded = (name, tex) => squidRenderer.InsertTexture(name, tex);
 
