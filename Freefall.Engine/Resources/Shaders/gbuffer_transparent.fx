@@ -181,6 +181,7 @@ PSOutput PS(VSOutput input)
     Texture2D albedoTex = ResourceDescriptorHeap[mat.AlbedoIdx];
 
     float4 color = albedoTex.Sample(Sampler, input.TexCoord);
+    color.rgb *= mat.Tint;                  // Material Tint (default white)
 
     // Alpha from albedo texture drives transparency (glass typically has low alpha)
     float alpha = color.a;

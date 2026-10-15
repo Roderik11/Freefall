@@ -213,9 +213,11 @@ namespace Freefall.Assets
         public float DecorationRadius = 100f;
 
         /// <summary>
-        /// How strongly the ground under decorators takes their colour (0 = off): full from about the decoration
-        /// radius out, where the cards end, a third of it near the camera, where the plants themselves show. Without
-        /// it the far ground keeps its own (mip-averaged, often greyer) colour and the edge of the grass is a line.
+        /// How much of the ground under decorators becomes the sward (0 = off, 1 = all of it): the plants' colour,
+        /// tinted by the layers there (TerrainLayer.PlantTint) and lit as the plants are, at every distance, so the
+        /// grass neither speckles with light ground near the camera nor ends at a line where its cards end. Hollows,
+        /// crests and the large-scale variation still show through. A quarter less up close, where the scanned
+        /// ground gives texture between the blades.
         /// </summary>
         [ValueRange(0f, 1f)]
         public float DecorationGroundTint = 0.8f;

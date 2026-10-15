@@ -17,6 +17,7 @@ cbuffer PushConstants : register(b3)
 };
 
 #include "common.fx"
+#include "ground_shape.hlsli"
 
 // ─── GPU structs (must match grass_compute.hlsl and TerrainRenderer.cs) ─────
 
@@ -45,7 +46,7 @@ struct DecoratorSlot
     uint AlphaClip;
     float HeightNoiseScale;
     float HeightNoiseAmount;
-    uint PlantPartsIdx;         // Flowers / Spikes: parts atlas (Tools/BlenderKits/build_flowers.py), 0 = none
+    uint PlantPartsIdx;         // Flowers / Spikes / Ferns: parts atlas (Tools/BlenderKits/build_flowers.py), 0 = none
 };
 
 struct DecoInstance
@@ -55,7 +56,8 @@ struct DecoInstance
     float3 TerrainNormal;
     float  FadeFactor;
     float2 Scale;           // (width, height) of the card this instance stands in for
-    float2 TerrainUV;
+    uint   GroundTint;      // what the ground at the root does to the colour (ground_shape.hlsli PackGroundTint)
+    uint   _groundTintPad;
     uint   SlotIdx;
     uint   LOD;
     float  InstanceSeed;
@@ -76,6 +78,7 @@ struct DecoInstance
 #define MODE_BLADES  3
 #define MODE_FLOWERS 4
 #define MODE_SPIKES  5
+#define MODE_FERNS   6
 
 SamplerState ClampSampler : register(s2);
 

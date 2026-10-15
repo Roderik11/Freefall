@@ -7,7 +7,7 @@
 #ifndef TERRAIN_COVERAGE_HLSLI
 #define TERRAIN_COVERAGE_HLSLI
 
-// A SplatStamp or DecoStamp as the GPU sees it (matches C# CoverageStampGPU, 80 bytes)
+// A SplatStamp or DecoStamp as the GPU sees it (matches C# CoverageStampGPU, 96 bytes)
 struct CoverageStamp
 {
     float2 Center;              // terrain UV center (radial)
@@ -25,6 +25,10 @@ struct CoverageStamp
     float  SlopeMin, SlopeMax, SlopeBlend;      // degrees
     uint   RequireMask;         // bit N = layer channel N must show here
     uint   ExcludeMask;         // bit N = layer channel N must not have been painted here
+    float  PatchSize;           // metres across, 0 = no patches
+    float  PatchCoverage;       // about the share of area covered
+    float  PatchSoftness;       // 0 = hard patch edge
+    uint   PatchSeed;
 };
 
 #define COVERAGE_GLOBAL 1u      // covers the whole terrain; shape fields are ignored
@@ -64,14 +68,30 @@ float CoverageRampDown(float edge, float blend, float x)
 
 float CoverageSmooth(float t) { return t * t * (3.0 - 2.0 * t); }
 
-// Height/slope part of the filter (1 = passes)
-float CoverageTerrainFilter(CoverageStamp s, float heightNorm, float slopeDeg)
+// Irregular patches (CoverageStamp.PatchSize): 1 inside a patch, 0 between them. Gradient noise at the patch size
+// plus an octave at a third of it for ragged edges. The sum is close to normal with sigma 0.185 (measured over 400k
+// samples); its logistic CDF turns it uniform, so PatchCoverage is the share of area at or above half weight.
+float CoveragePatches(CoverageStamp s, float2 worldXZ)
+{
+    if (s.PatchSize <= 0) return 1.0;
+    float2 seedOffset = float2(frac(s.PatchSeed * 0.0001234), frac(s.PatchSeed * 0.0007891)) * 1000.0;
+    float2 p = worldXZ / s.PatchSize + seedOffset;
+    float n = stamp_noise(p) + 0.35 * stamp_noise(p * 3.1 + 17.0);
+    n = 1.0 / (1.0 + exp(-9.2 * n));                // 1.702 / 0.185
+    float edge = 1.0 - s.PatchCoverage;
+    float soft = max(s.PatchSoftness * 0.5, 0.01);
+    return smoothstep(edge - soft, edge + soft, n);
+}
+
+// Height/slope/patch part of the filter (1 = passes). worldXZ: metres from the terrain origin.
+float CoverageTerrainFilter(CoverageStamp s, float heightNorm, float slopeDeg, float2 worldXZ)
 {
     float m = 1.0;
     m *= CoverageSmooth(CoverageRampUp(s.SlopeMin, s.SlopeBlend, slopeDeg));
     m *= CoverageSmooth(CoverageRampDown(s.SlopeMax, s.SlopeBlend, slopeDeg));
     m *= CoverageSmooth(CoverageRampUp(s.HeightMin, s.HeightBlend, heightNorm));
     m *= CoverageSmooth(CoverageRampDown(s.HeightMax, s.HeightBlend, heightNorm));
+    m *= CoveragePatches(s, worldXZ);
     return m;
 }
 

@@ -40,6 +40,9 @@ namespace Freefall.Components
         private const int MinPatches = 32768;
 
         private Vector4[] _layerTiling = new Vector4[32];
+        private Vector4[] _layerTint = Enumerable.Repeat(Vector4.One, 32).ToArray();   // TerrainLayer.Tint per channel
+        private Vector4[] _layerPlantTint = Enumerable.Repeat(Vector4.One, 32).ToArray();   // TerrainLayer.PlantTint per channel
+        private GraphicsBuffer? _plantTintBuffer;   // _layerPlantTint for the decorator spawn (grass_compute.hlsl LayerPlantTint)
 
         // ───── Internal State ─────────────────────────────────────────────
         private const int FrameCount = 3;
@@ -176,7 +179,7 @@ namespace Freefall.Components
         private const int BladeColorsPerVariant = 6;        // = COLORS_PER_VARIANT in the shaders: 4 height bands, foliage, bloom
         private GraphicsBuffer? _bladeInstanceBuffer;       // DecoInstance, 64 bytes; padded to whole AS groups
         private GraphicsBuffer? _bladeColorBuffer;          // float4 per variant x BladeColorsPerVariant (CS_BladeColors)
-        private GraphicsBuffer? _decoratorTintBuffer;       // float4 per decorator: ground tint (rgb, strength), CS_DecoratorTints
+        private GraphicsBuffer? _decoratorTintBuffer;       // 2 float4 per decorator: ground tint and clumps, CS_DecoratorTints
         private bool _bladeColorsDirty = true;
         private bool _decoHasBlades;                        // some variant draws a band as Blades (grass_blades.fx)
         private bool _decoHasPlants;                        // ... as Flowers or Spikes (grass_plants.fx)
@@ -288,6 +291,7 @@ namespace Freefall.Components
             MessageDispatcher.AddListener(EngineMsg.StampChanged, OnStampChanged);
             MessageDispatcher.AddListener(EngineMsg.SplineChanged, OnSplineChanged);
             MessageDispatcher.AddListener("AssetDirty", OnAssetDirty);
+            MessageDispatcher.AddListener("AssetReloaded", OnAssetReloaded);
         }
 
         public override void Destroy()
@@ -373,6 +377,7 @@ namespace Freefall.Components
             if (_bakedAlbedoUAV != 0) device?.DeferReleaseBindlessIndex(_bakedAlbedoUAV);
             if (_bakedAlbedoSRV != 0) device?.DeferReleaseBindlessIndex(_bakedAlbedoSRV);
             device?.DeferDispose(_tilingBuffer);
+            device?.DeferDispose(_plantTintBuffer);
 
             // ── Packed control array ──
             device?.DeferDispose(_packedControlArray);
@@ -426,6 +431,7 @@ namespace Freefall.Components
             MessageDispatcher.RemoveListener(EngineMsg.StampChanged, OnStampChanged);
             MessageDispatcher.RemoveListener(EngineMsg.SplineChanged, OnSplineChanged);
             MessageDispatcher.RemoveListener("AssetDirty", OnAssetDirty);
+            MessageDispatcher.RemoveListener("AssetReloaded", OnAssetReloaded);
         }
 
         private bool _textureArraysInitialized;
@@ -672,6 +678,8 @@ namespace Freefall.Components
             material.SetParameter("TerrainSize", Terrain.TerrainSize);
             material.SetParameter("TerrainOrigin", new Vector2(Transform.WorldPosition.X, Transform.WorldPosition.Z));
             material.SetParameter("LayerTiling", _layerTiling);
+            material.SetParameter("LayerTint", _layerTint);
+            material.SetParameter("LayerPlantTint", _layerPlantTint);
             material.SetParameter("DecoRadius", Terrain.DecorationRadius);
             material.SetParameter("DecoGroundTint", Terrain.DrawDetail ? Terrain.DecorationGroundTint : 0f);
 
@@ -693,8 +701,12 @@ namespace Freefall.Components
             // Enqueue compute dispatch as custom action (runs first in Execute, before batch processing)
             CommandBuffer.Enqueue(RenderPass.Opaque, (list) => { PixMarker.Begin(list, "Terrain quadtree"); self.DispatchQuadtreeEval(list, fi); PixMarker.End(list); });
 
-            // Enqueue self-draw action: terrain draws itself via ExecuteIndirect
-            CommandBuffer.Enqueue(RenderPass.Opaque, (list) => { PixMarker.Begin(list, "Terrain"); self.DrawTerrain(list, fi); PixMarker.End(list); });
+            // Self-draw via ExecuteIndirect, in two steps: depth only before the mesh batches (the terrain still hides
+            // what lies behind hills), the splat shading after them, so only terrain pixels that stay visible pay for
+            // it (gputerrain.fx technique). In one draw before the batches, a town plaza view paid ~1.4 ms of splat
+            // shading for terrain the paving and houses covered.
+            CommandBuffer.Enqueue(RenderPass.Opaque, (list) => { PixMarker.Begin(list, "Terrain depth"); self.DrawTerrain(list, fi, "DepthPrepass"); PixMarker.End(list); });
+            CommandBuffer.EnqueueLate(RenderPass.Opaque, (list) => { PixMarker.Begin(list, "Terrain"); self.DrawTerrain(list, fi, "Shade"); PixMarker.End(list); });
 
             // Enqueue single-pass terrain shadow draw
             CommandBuffer.Enqueue(RenderPass.Shadow, (list) => { PixMarker.Begin(list, "Terrain"); self.DrawTerrainShadow(list, fi); PixMarker.End(list); });
@@ -831,6 +843,29 @@ namespace Freefall.Components
                 Terrain.MarkForUpdate(TerrainDirtyFlags.TextureArrays | TerrainDirtyFlags.LayerParams | TerrainDirtyFlags.AlbedoBake);
             else if (msg.Data is TerrainDecorator decorator && _decoratorPalette.Contains(decorator))
                 Terrain.MarkForUpdate(TerrainDirtyFlags.DecoStructure | TerrainDirtyFlags.DecoParams);
+        }
+
+        /// <summary>
+        /// An asset was reimported in place. The layer arrays hold copies of a texture's old pixels, so a layer
+        /// texture changed on disk (a reprocessed height map) never showed until the layer itself was edited; a layer
+        /// or decorator file edited on disk is the same as an edit in the inspector.
+        /// </summary>
+        private void OnAssetReloaded(Message msg)
+        {
+            if (Terrain == null) return;
+            if (msg.Data is TerrainLayer or TerrainDecorator)
+            {
+                OnAssetDirty(msg);
+                return;
+            }
+            if (msg.Data is not Texture texture) return;
+
+            foreach (var layer in _layerPalette)
+                if (layer.Diffuse == texture || layer.Normals == texture || layer.Height == texture)
+                {
+                    Terrain.MarkForUpdate(TerrainDirtyFlags.TextureArrays | TerrainDirtyFlags.AlbedoBake);
+                    return;
+                }
         }
 
         /// <summary>
@@ -1139,15 +1174,15 @@ namespace Freefall.Components
         /// Self-draw via ExecuteIndirect. Sets root constants, applies material PSO,
         /// and calls ExecuteIndirect with the GPU-generated draw args.
         /// </summary>
-        private void DrawTerrain(ID3D12GraphicsCommandList commandList, int frameIndex)
+        /// <param name="pass">Technique pass by name: "DepthPrepass" (before the mesh batches) or "Shade" (after them)</param>
+        private void DrawTerrain(ID3D12GraphicsCommandList commandList, int frameIndex, string pass)
         {
             if (!_computeInitialized) return; // Destroyed between enqueue and execute
 
             var device = Engine.Device;
 
-            // Apply material PSO and textures (explicitly set Opaque pass in case shadow changed it)
-            Material!.SetPass(RenderPass.Shadow); // reset to first pass — Opaque
-            Material!.SetPass(RenderPass.Opaque);
+            // Apply material PSO and textures (the pass explicitly: the shadow draw changes it)
+            Material!.SetPass(pass);
             Material!.Apply(commandList, device);
 
             // Set topology
@@ -1558,16 +1593,25 @@ namespace Freefall.Components
         {
             var terrainSize = Terrain?.TerrainSize ?? Vector2.One;
             Array.Clear(_layerTiling);
+            Array.Fill(_layerTint, Vector4.One);
+            Array.Fill(_layerPlantTint, Vector4.One);
 
             for (int i = 0; i < _layerPalette.Count && i < _layerTiling.Length; i++)
             {
                 var layer = _layerPalette[i];
+                _layerTint[i] = new Vector4(layer.Tint.R, layer.Tint.G, layer.Tint.B, layer.TileRotation * MathF.PI / 180f);
+                _layerPlantTint[i] = new Vector4(layer.PlantTint.R, layer.PlantTint.G, layer.PlantTint.B, 1f);
                 float hasHeight = (layer.Height?.Native != null) ? 1.0f : 0.0f;
                 if (layer.Tiling.X != 0 && layer.Tiling.Y != 0)
                     _layerTiling[i] = new Vector4(terrainSize.X / layer.Tiling.X, terrainSize.Y / layer.Tiling.Y, hasHeight, layer.HeightScale);
                 else
                     _layerTiling[i] = new Vector4(1, 1, hasHeight, layer.HeightScale);
             }
+
+            // Written only when a layer changes; a frame in flight may still read the previous tints, which is
+            // harmless for a colour
+            _plantTintBuffer ??= GraphicsBuffer.CreateUpload<Vector4>(32);
+            _plantTintBuffer.Upload<Vector4>(_layerPlantTint.AsSpan());
         }
 
         /// <summary>
@@ -1970,7 +2014,7 @@ namespace Freefall.Components
                 Engine.Device.DeferDispose(_bladeColorBuffer);
                 _bladeColorBuffer = GraphicsBuffer.CreateStructured(bladeColorCount, 16, srv: true, uav: true);
             }
-            int tintCount = Math.Max(1, groups.Count);
+            int tintCount = Math.Max(1, groups.Count) * 2;     // colour + even weight, clumps (CS_DecoratorTints)
             if (_decoratorTintBuffer == null || _decoratorTintBuffer.ElementCount != tintCount)
             {
                 Engine.Device.DeferDispose(_decoratorTintBuffer);
@@ -2352,6 +2396,15 @@ namespace Freefall.Components
                 if (Terrain.Heightmap != null) cs.SetTexture("Heightmap", Terrain.Heightmap);
                 cs.SetPushConstant("DecoControl", _decoControlSRV);
                 cs.SetPushConstant("BakedNormal", _bakedNormalSRV);
+
+                // The layer weights and the layers' plant tints: each plant takes the colour of the ground it stands on
+                bool plantTints = ControlMapsArray != null && _plantTintBuffer != null && _layerPalette.Count > 0;
+                if (plantTints)
+                {
+                    cs.SetTexture("SplatControl", ControlMapsArray!);
+                    cs.SetBuffer("LayerPlantTint", _plantTintBuffer!);
+                }
+                cs.SetPushConstant("SplatLayerCount", plantTints ? (uint)_layerPalette.Count : 0u);
 
                 // ── cbuffer DecoParams ──
                 cs.SetParam("TerrainSize", new Vector2(Terrain.TerrainSize.X, Terrain.TerrainSize.Y));

@@ -172,7 +172,9 @@ void CSDirectionalLight(uint3 dispatchThreadId : SV_DispatchThreadID)
     // Sample Data texture at displaced coords
     Texture2D DataTex = ResourceDescriptorHeap[DataTexIdx];
     float4 data = DataTex.Load(displaced_coord);
-    bool isVegetation = (data.a > 0.3 && data.a < 0.7);
+    // data.a: 0.5 = vegetation, 1.0 = standard PBR. Values between blend the two: terrain standing in for the sward
+    // past the grass cards (gputerrain.fx) renders the way the cards before it do, without a line where it switches.
+    float vegetation = saturate((1.0 - data.a) * 2.0);
     
     // Compute NdotL
     float3 L = normalize(-LightDirection);
@@ -329,28 +331,31 @@ void CSDirectionalLight(uint3 dispatchThreadId : SV_DispatchThreadID)
     float3 kd = (1.0 - F) * (1.0 - metal);
     float3 diffuse = kd * (albedo / 3.14159);
     
-    float3 lighting;
-    
-    if (isVegetation)
+    float3 lighting = 0;
+
+    if (vegetation > 0)
     {
-        float wrap = saturate(rawNdotL * 0.5 + 0.5);
-        float vegShadow = lerp(1.0, shadowFactor, 0.85);
-        
-        float3 radiance = LightColor * LightIntensity * 1.14159 * wrap * shadowFactor;
-        lighting = diffuse * radiance * ao;
-        
+        // Wrap lighting as light_directional.fx: NdotL -1 -> 0.2, 0 -> 0.5, 1 -> 0.8, times pi like the ground's
+        // pi x NdotL, so a blade or leaf facing the sun is about as bright as ground facing it. The port had 1.14159
+        // for pi: every grass card, flower and leaf rendered at 0.36..0.45x and read 2-5x darker than the ground.
+        float wrap = saturate(rawNdotL * 0.3 + 0.5);
+
+        float3 radiance = LightColor * LightIntensity * 3.14159 * wrap * shadowFactor;
+        float3 vegLighting = diffuse * radiance * ao;
+
         // SSS translucency — use Load instead of Sample for compute
         float translucency = NormalTex.Load(coord).w;
         translucency = max(translucency, 0.3);
         // Only light that reaches the leaf can pass through it (see light_directional.fx)
         float backlight = max(-rawNdotL, 0.0) * shadowFactor;
         float3 sssColor = albedo * float3(1.0, 0.85, 0.6);
-        lighting += sssColor * LightColor * LightIntensity * backlight * translucency * 0.4;
+        vegLighting += sssColor * LightColor * LightIntensity * backlight * translucency * 0.4;
+        lighting += vegLighting * vegetation;
     }
-    else
+    if (vegetation < 1)
     {
         float3 radiance = LightColor * LightIntensity * 3.14159 * NdotL * shadowFactor;
-        lighting = (diffuse + spec) * radiance * ao;
+        lighting += (diffuse + spec) * radiance * ao * (1.0 - vegetation);
     }
     
     // Shadow wrap

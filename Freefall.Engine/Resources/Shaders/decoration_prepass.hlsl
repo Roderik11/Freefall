@@ -106,7 +106,7 @@ void CSBuildDecoControl(uint3 dtid : SV_DispatchThreadID)
 
         if (stamp.Flags & COVERAGE_FILTER)
         {
-            weight *= CoverageTerrainFilter(stamp, heightNorm, slopeDeg);
+            weight *= CoverageTerrainFilter(stamp, heightNorm, slopeDeg, terrainUV * TerrainSizeX);   // square terrain
 
             if ((stamp.RequireMask | stamp.ExcludeMask) != 0)
             {
@@ -114,10 +114,10 @@ void CSBuildDecoControl(uint3 dtid : SV_DispatchThreadID)
                 for (uint c = 0; c < layerCount; c++)
                 {
                     uint bit = 1u << c;
-                    if (stamp.RequireMask & bit) required = max(required, visibleWeight[c]);
+                    if (stamp.RequireMask & bit) required += visibleWeight[c];      // together: grass or dry grass covers it all
                     if (stamp.ExcludeMask & bit) excluded = max(excluded, rawWeight[c]);
                 }
-                if (stamp.RequireMask != 0) weight *= required;
+                if (stamp.RequireMask != 0) weight *= saturate(required);
                 weight *= (1.0 - excluded);
             }
 

@@ -1,12 +1,13 @@
 // ═══════════════════════════════════════════════════════════════════════════
-// Flowers and spikes — what flower cards become near the camera (Amplification → Mesh → Pixel)
+// Flowers, spikes and ferns — what plant cards become near the camera (Amplification → Mesh → Pixel)
 //
-// Every instance in a Flowers or Spikes distance band becomes a small plant of PLANT_STEMS stems (routing in
-// grass_procedural.hlsli; grass blades are grass_blades.fx). Geometry gives the structure — stems, where blooms
-// and leaves sit, which way they face, wind — and small parts of the variant's parts atlas
-// (DecoratorVariant.PlantParts, rendered by Tools/BlenderKits/build_flowers.py) give the detail: a bloom cap seen
-// from above, a crossed pair of spike strips, leaves. Each part fills most of its quad, so the alpha test wastes
-// few pixels (a whole flower card is ~15% opaque). Without an atlas the parts are flat colours from the card.
+// Every instance in a Flowers or Spikes distance band becomes a small plant of PLANT_STEMS stems, one in a Ferns
+// band a crown of FERN_FRONDS fronds (routing in grass_procedural.hlsli; grass blades are grass_blades.fx).
+// Geometry gives the structure — stems, where blooms and leaves sit, how fronds arch, which way they face, wind — and
+// small parts of the variant's parts atlas (DecoratorVariant.PlantParts, rendered by
+// Tools/BlenderKits/build_flowers.py) give the detail: a bloom cap seen from above, a crossed pair of spike strips,
+// leaves, a frond. Each part fills most of its quad, so the alpha test wastes few pixels (a whole flower card is
+// ~15% opaque). Without an atlas the parts are flat colours from the card.
 // ═══════════════════════════════════════════════════════════════════════════
 #include "grass_procedural.hlsli"
 
@@ -28,6 +29,12 @@
 #define FLOWER_TRIS (STEM_TRIS + FLOWER_LEAVES * LEAF_TRIS + CAP_TRIS)                     // 47
 #define SPIKE_VERTS (STEM_VERTS + SPIKE_LEAVES * LEAF_VERTS + 2 * SPIKE_STRIP_VERTS)       // 41
 #define SPIKE_TRIS (STEM_TRIS + SPIKE_LEAVES * LEAF_TRIS + 2 * SPIKE_STRIP_TRIS)           // 31
+#define FERN_FRONDS 10
+#define FROND_SEGMENTS 6
+#define FROND_VERTS (3 * (FROND_SEGMENTS + 1))  // rows of three: left edge, rachis, right edge (cupped)
+#define FROND_TRIS (4 * FROND_SEGMENTS)
+#define FERN_VERTS (FERN_FRONDS * FROND_VERTS)  // 210
+#define FERN_TRIS (FERN_FRONDS * FROND_TRIS)    // 240
 
 // Atlas layout (build_flowers.py; UV v down): bloom from above centred at (0.25, 0.25) with radius 0.24; the leaf
 // in the top-right cell from its base at v 0.49 up to its tip at v 0.01 around u 0.75; the spike in the left half
@@ -39,6 +46,10 @@
 #define SPIKE_U 0.25
 #define SPIKE_HALF_U 0.125
 #define SPIKE_FROM 0.35         // the spike strips cover the stem from here to its tip
+// Ferns: one frond filling the atlas, base at v 0.99, tip at v 0.01, |u - 0.5| < FROND_HALF_U
+#define FROND_HALF_U 0.245
+#define FROND_WIDTH 0.85        // the atlas frond is half as wide as long; a male fern's less: squeeze it a little
+#define FROND_CUP 0.18          // the frond's edges stand this share of its half-width above the rachis
 
 struct PlantVertexData
 {
@@ -108,9 +119,96 @@ void LeafVertex(inout PlantVertexData o, uint v, float3 base, float3 outDir, flo
     o.Textured = 1;
 }
 
+// Vertex 'vi' of a fern: FERN_FRONDS fronds from a small crown, spread unevenly round it. Each rises at 32..75
+// degrees (most low and long, a few young ones standing up in the middle) and arches over (its elevation falls
+// linearly along it, so its tip points down), is rolled a little about its rachis and cupped (edges higher than the
+// rachis). The crown leans with the slope and a little its own way. The first version rose at 52..80 degrees with
+// every axis near vertical: every plant the same upright shuttlecock. The frond's length is the instance height;
+// its width the atlas' squeezed by FROND_WIDTH.
+PlantVertexData FernVertex(DecoInstance di, DecoratorSlot slot, uint vi)
+{
+    uint frond = vi / FROND_VERTS;
+    uint v = vi % FROND_VERTS;
+    uint row = v / 3;
+    uint column = v % 3;                    // 0 left edge, 1 rachis, 2 right edge
+    uint h = pcg(asuint(di.InstanceSeed) ^ (frond * 0x9E3779B9u) ^ 0x2F6B3A15u);
+
+    // The crown's axis: between straight up and the slope (SlopeBias), leaning its own way by up to ~17 degrees (a
+    // hash of the instance only, so all fronds of a plant share it)
+    uint hp = pcg(asuint(di.InstanceSeed) ^ 0x7A3C51E9u);
+    float leanAngle = Rand(hp) * 6.2831853;
+    float3 up = normalize(lerp(float3(0, 1, 0), di.TerrainNormal, abs(slot.SlopeBias))
+                          + float3(cos(leanAngle), 0, sin(leanAngle)) * 0.3 * Rand(hp));
+    float azimuth = di.Rotation + (frond + 0.9 * Rand(h)) * (6.2831853 / FERN_FRONDS);
+    float3 out0 = float3(cos(azimuth), 0, sin(azimuth));
+    float3 outDir = normalize(out0 - up * dot(out0, up));
+    float young = Rand(h);                             // 1 = a young frond: shorter, standing up in the middle
+    float len = di.Scale.y * lerp(1.1, 0.55, young) * lerp(0.9, 1.1, Rand(h));
+    float rise = lerp(0.55, 1.3, young * young);       // radians above the ground at the base: most fronds spread
+    float bend = lerp(0.9, 1.7, Rand(h));              // how far the elevation falls to the tip
+    float roll = lerp(-0.35, 0.35, Rand(h));
+    float phase = Rand(h) * 6.2831853;
+    float brightness = lerp(0.85, 1.1, Rand(h));
+    float3 root = di.Position + outDir * 0.05 * di.Scale.y;
+
+    // Walk the rachis to this row: segment k points at elevation rise - bend * (k + 0.5) / segments
+    float3 p = root;
+    float segLen = len / FROND_SEGMENTS;
+    for (uint k = 0; k < row; k++)
+    {
+        float e = rise - bend * (k + 0.5) / FROND_SEGMENTS;
+        p += (outDir * cos(e) + up * sin(e)) * segLen;
+    }
+    float t = float(row) / FROND_SEGMENTS;
+    float eRow = rise - bend * t;
+    float3 tangent = outDir * cos(eRow) + up * sin(eRow);
+    float3 side = normalize(cross(up, outDir));
+    float3 normal = normalize(cross(tangent, side));
+    float3 across = side * cos(roll) + normal * sin(roll);
+    normal = normalize(cross(tangent, across));
+
+    float halfWidth = len * FROND_HALF_U / 0.98 * FROND_WIDTH;
+    float sideSign = float(column) - 1.0;              // -1, 0, 1
+    p += across * sideSign * halfWidth + normal * abs(sideSign) * halfWidth * FROND_CUP;
+    p += Wind(root, t, len * 0.6, phase);
+
+    PlantVertexData o;
+    o.WorldPos = p;
+    o.Normal = normalize(normal - across * sideSign * FROND_CUP * 2.0);
+    // Darker in the crown; old (long, low) fronds a little yellower and duller than the young ones in the middle
+    float3 age = lerp(float3(1.12, 1.0, 0.78), float3(0.95, 1.0, 1.0), young);
+    o.Color = slot.HealthyColor * age * brightness * lerp(0.55, 1.0, saturate(t / 0.4));
+    o.UV = float2(0.5 + sideSign * FROND_HALF_U, 0.99 - 0.98 * t);
+    o.Textured = 1;
+    if (slot.PlantPartsIdx == 0)
+    {
+        StructuredBuffer<float4> colors = ResourceDescriptorHeap[BladeColorsSRV];
+        float4 foliage = colors[di.SlotIdx * COLORS_PER_VARIANT + COLOR_FOLIAGE];
+        if (foliage.a <= 0) foliage = colors[di.SlotIdx * COLORS_PER_VARIANT];
+        o.Color *= foliage.rgb;
+        o.Textured = 0;
+    }
+    return o;
+}
+
+// Triangle 'ti' of a fern: per frond, per segment two quads (left edge to rachis, rachis to right edge)
+uint3 FernTriangle(uint ti)
+{
+    uint vb = (ti / FROND_TRIS) * FROND_VERTS;
+    uint t = ti % FROND_TRIS;
+    uint row = t / 4;
+    uint quad = (t % 4) / 2;                          // 0 left half, 1 right half
+    uint a = vb + row * 3 + quad;                     // this row's vertex on the quad's left
+    uint b = a + 3;                                   // the next row's
+    return (t & 1) ? uint3(a + 1, b + 1, b) : uint3(a, a + 1, b);
+}
+
 // Vertex 'vi' of a flower or spike plant: per stem the stalk, the leaves, then the bloom cap or the spike strips
 PlantVertexData PlantVertex(DecoInstance di, DecoratorSlot slot, uint vi, float dist)
 {
+    if (di.Mode == MODE_FERNS)
+        return FernVertex(di, slot, vi);
+
     bool spikes = di.Mode == MODE_SPIKES;
     uint vertsPerStem = spikes ? SPIKE_VERTS : FLOWER_VERTS;
     uint v = vi % vertsPerStem;
@@ -200,6 +298,8 @@ PlantVertexData PlantVertex(DecoInstance di, DecoratorSlot slot, uint vi, float 
 // Triangle 'ti' of a plant: per stem the stalk, the leaves (two quads each), then the cap or the spike strips
 uint3 PlantTriangle(uint mode, uint ti)
 {
+    if (mode == MODE_FERNS)
+        return FernTriangle(ti);
     bool spikes = mode == MODE_SPIKES;
     uint trisPerStem = spikes ? SPIKE_TRIS : FLOWER_TRIS;
     uint t = ti % trisPerStem;
@@ -235,7 +335,7 @@ uint3 PlantTriangle(uint mode, uint ti)
     return (t & 1) ? uint3(i1, o1, o0) : uint3(i0, i1, o0);
 }
 
-// What one MS group outputs for an instance: flowers and spikes only (blade clumps and padding: nothing)
+// What one MS group outputs for an instance: flowers, spikes and ferns only (blade clumps and padding: nothing)
 void PlantCounts(DecoInstance di, out uint verts, out uint prims)
 {
     verts = 0;
@@ -243,6 +343,7 @@ void PlantCounts(DecoInstance di, out uint verts, out uint prims)
     if (di.Scale.y <= 0) return;
     if (di.Mode == MODE_FLOWERS) { verts = PLANT_STEMS * FLOWER_VERTS; prims = PLANT_STEMS * FLOWER_TRIS; }
     else if (di.Mode == MODE_SPIKES) { verts = PLANT_STEMS * SPIKE_VERTS; prims = PLANT_STEMS * SPIKE_TRIS; }
+    else if (di.Mode == MODE_FERNS) { verts = FERN_VERTS; prims = FERN_TRIS; }
 }
 
 // ─── Mesh Shader ───────────────────────────────────────────────────────────
@@ -277,7 +378,7 @@ void MS(
     StructuredBuffer<DecoratorSlot> slots = ResourceDescriptorHeap[DecoratorSlotsIdx];
     DecoratorSlot slot = slots[di.SlotIdx];
     float dist = distance(CamPos, di.Position);
-    float3 variation = GroundVariation(di.Position.xz);     // the ground's large-scale variation (common.fx)
+    float3 variation = GroundVariation(di.Position.xz) * UnpackGroundTint(di.GroundTint);   // large-scale variation (common.fx) x the ground at the root (spawn)
 
     for (uint vi = gtid; vi < vertCount; vi += MS_THREADS)
     {
@@ -315,7 +416,9 @@ PSOutput PS(MSOutput input, bool isFrontFace : SV_IsFrontFace)
     if (input.TextureIdx != 0)
     {
         Texture2D parts = ResourceDescriptorHeap[input.TextureIdx];
-        float4 texel = parts.Sample(ClampSampler, input.UV);
+        // Half a mip sharper and a fixed cutoff: a lower cutoff with distance (as the cards) filled the gaps between
+        // a fern's pinnae, and the fronds read as broad smooth leaves
+        float4 texel = parts.SampleBias(ClampSampler, input.UV, -0.5);
         clip(texel.a - 0.5);
         color *= texel.rgb;
     }

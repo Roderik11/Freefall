@@ -115,7 +115,7 @@ void MS(
 
     StructuredBuffer<DecoratorSlot> slots = ResourceDescriptorHeap[DecoratorSlotsIdx];
     DecoratorSlot slot = slots[di.SlotIdx];
-    float3 variation = GroundVariation(di.Position.xz);     // the ground's large-scale variation (common.fx)
+    float3 variation = GroundVariation(di.Position.xz) * UnpackGroundTint(di.GroundTint);   // large-scale variation (common.fx) x the ground at the root (spawn)
 
     for (uint vi = gtid; vi < vertCount; vi += MS_THREADS)
     {

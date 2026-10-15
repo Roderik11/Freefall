@@ -264,6 +264,7 @@ PSOutput PS(VSOutput input)
     Texture2D albedoTex = ResourceDescriptorHeap[mat.AlbedoIdx];
     
     float4 color = albedoTex.Sample(Sampler, input.TexCoord);
+    color.rgb *= mat.Tint;                  // Material Tint (default white)
     // Alpha test: hair, beard and eyebrow cards, torn cloth, visor slits. An albedo whose alpha channel holds
     // something else than opacity (a mask) must be imported with IgnoreAlpha, or it gets holes here.
     clip(color.a - 0.25f);

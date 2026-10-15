@@ -83,7 +83,23 @@ float3 GroundVariation(float2 xz)
     float patches = smoothstep(0.3, 0.7, n1) * 0.35 + smoothstep(0.3, 0.7, n2) * 0.4 + smoothstep(0.3, 0.7, n3) * 0.25;
     float brightness = 1.0 + (patches - 0.5) * 0.6;                                             // ~0.7 .. 1.3
     float dry = smoothstep(0.35, 0.65, n2 * 0.6 + n3 * 0.4);
-    return brightness * lerp(float3(0.88, 1.0, 0.92), float3(1.22, 1.05, 0.72), dry);
+    // Dry is paler and a little warmer, not a more saturated yellow: the blue channel stays. This tone stacks with the
+    // dry grass layer's PlantTint, the crest tone and the sward grain; with each cutting blue (0.72 here) the far
+    // meadow came out lime (sRGB ~62,77,17, saturation ~0.8, 2026-10-15)
+    return brightness * lerp(float3(0.92, 1.0, 0.97), float3(1.12, 1.04, 0.94), dry);
+}
+
+// The colour of one tree's crown, from the tree's origin (its world matrix' translation), for every LOD of it
+// (gbuffer_foliage.fx near, gbuffer_crossmesh.fx far) so they hand over without a jump: a brightness and a hue of its
+// own (yellower .. bluer), and half of the land's GroundVariation, so groves follow the same dry and lush patches as
+// the ground and the grass under them. Every tree of a species had the one colour of its leaf atlas (2026-10-15).
+float3 TreeTint(float3 origin)
+{
+    float h1 = MacroHash(origin.xz * 0.731 + 17.3);
+    float h2 = MacroHash(origin.xz * 1.137 - 41.9);
+    float brightness = lerp(0.86, 1.14, h1);
+    float3 hue = lerp(float3(1.08, 1.0, 0.82), float3(0.92, 1.0, 1.12), h2);
+    return brightness * hue * lerp(1.0.xxx, GroundVariation(origin.xz), 0.5);
 }
 
 // ── Wind (grass cards, blades, flowers, trees) ──
@@ -164,7 +180,7 @@ float3 TreeSway(float3 worldPos, float3 origin)
     return offset;
 }
 // Material data for bindless texture lookup via Material ID indirection
-// 64 bytes — matches C# MaterialData layout exactly
+// 80 bytes — matches C# MaterialData layout exactly
 struct MaterialData
 {
     uint AlbedoIdx;
@@ -179,6 +195,8 @@ struct MaterialData
     float2 DetailOffset;
     float3 EmissiveColor;
     float EmissiveIntensity;
+    float3 Tint;                // multiplies the albedo map (Material "Tint", default white)
+    float _tintPad;
 };
 
 // Shadow cascade data — shared by all shadow-related shaders

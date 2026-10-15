@@ -72,7 +72,8 @@ struct DecoInstance
     float3 TerrainNormal;
     float  FadeFactor;
     float2 Scale;
-    float2 TerrainUV;
+    uint   GroundTint;      // what the ground at the root does to the colour (ground_shape.hlsli PackGroundTint)
+    uint   _groundTintPad;
     uint   SlotIdx;
     uint   LOD;
     float  InstanceSeed;
@@ -197,7 +198,7 @@ PSOutput PS(VSOutput input)
     {
         Texture2D albedoTex = ResourceDescriptorHeap[mat.AlbedoIdx];
         float4 texColor = albedoTex.Sample(Sampler, input.TexCoord);
-        baseColor = texColor.rgb;
+        baseColor = texColor.rgb * mat.Tint;   // Material Tint (default white)
         alpha = texColor.a;
         // Only alpha-tested decorators clip; opaque ones (rocks, pebbles) often carry smoothness or nothing in
         // alpha, which clipped them away entirely

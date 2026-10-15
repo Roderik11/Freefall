@@ -21,6 +21,7 @@
 #pragma kernel CS_DecoratorTints
 
 #include "decoration_noise.hlsli"   // DecoClusterMask, DecoHeightFactor
+#include "ground_shape.hlsli"       // GroundShape, GroundShapeTint, PackGroundTint
 
 // Push constants (root parameter 0, register b3) — bindless indices only
 cbuffer PushConstants : register(b3)
@@ -49,6 +50,9 @@ cbuffer PushConstants : register(b3)
     uint BladeInstanceUAVIdx;       // slot 21 — UAV: card instances near the camera, drawn as blade clumps
     uint BladeColorsUAVIdx;         // slot 22 — UAV: per card variant, blade colour root → tip (CS_BladeColors)
     uint DecoratorTintsUAVIdx;      // slot 23 — UAV: per decorator, the colour the ground under it takes (CS_DecoratorTints)
+    uint SplatControlIdx;           // slot 24 — SRV: the terrain's layer weights (Texture2DArray, 4 layers per slice)
+    uint LayerPlantTintIdx;         // slot 25 — SRV: StructuredBuffer<float4>, TerrainLayer.PlantTint per channel
+    uint SplatLayerCount;           // slot 26 — layers in the palette (0 = no plant tint)
 };
 
 // Camera frustum in terrain-local space (root slot 1 → register b0, uploaded by the terrain quadtree pass).
@@ -217,7 +221,8 @@ struct DecoInstance
     float3 TerrainNormal;   // pre-sampled from baked normal map
     float  FadeFactor;      // distance fade [0-1]
     float2 Scale;           // (width, height) after density + fade bias
-    float2 TerrainUV;       // for ground color sampling in PS
+    uint   GroundTint;      // what the ground at the root does to the plant's colour (PackGroundTint): layer, shape
+    uint   _groundTintPad;
     uint   SlotIdx;         // decorator variant index (DecoratorSlot)
     uint   LOD;             // selected LOD index
     float  InstanceSeed;    // for color variation in PS
@@ -232,6 +237,7 @@ struct DecoInstance
 #define MODE_BLADES    3        // MODE_BLADES and up: procedural, drawn by grass_blades.fx
 #define MODE_FLOWERS   4
 #define MODE_SPIKES    5
+#define MODE_FERNS     6
 #define MAX_BANDS      4
 
 // ─── Distance bands (DecoratorVariant.Bands) ──────────────────────────────
@@ -352,10 +358,18 @@ void CS_BakeTerrainNormals(uint3 dtid : SV_DispatchThreadID)
 #define MAX_CELL_ENTRIES 64     // 8 decorators per texel x 8 variants per decorator
 #define MAX_VARIANTS 8
 
+#define MAX_DECORATORS 32       // TerrainBaker.MaxDecorators: decorator indices in the control texture
+
 groupshared uint  gs_entrySlot[MAX_CELL_ENTRIES];    // variant index (DecoratorSlot)
-groupshared uint  gs_entryCount[MAX_CELL_ENTRIES];   // instances to spawn in this cell
-groupshared float gs_entryWeight[MAX_CELL_ENTRIES];  // cubed cell weight, 0..1
+groupshared uint  gs_entryStart[MAX_CELL_ENTRIES + 1]; // first candidate of each entry in the cell's list; [entries] = total
+groupshared uint  gs_entryGroup[MAX_CELL_ENTRIES];   // its decorator (row of gs_cov)
+groupshared float gs_entryKeep[MAX_CELL_ENTRIES];    // share of the candidates kept at the highest weight (expected / count)
+groupshared float gs_entryInvMax[MAX_CELL_ENTRIES];  // 1 / that weight: a survivor is kept with probability weight / it
+groupshared float gs_entryEven[MAX_CELL_ENTRIES];    // >= 0: coverage, even around the cell; -1 bilinear; -2 + edge offset
 groupshared uint  gs_entries;
+groupshared uint  gs_cellValid;
+groupshared uint  gs_groupMask;                      // bit N: decorator N covers one of the 3x3 texels
+groupshared float gs_cov[MAX_DECORATORS][9];         // coverage 0..1 per decorator at the 3x3 texel centres, row = z offset
 
 // The i-th cell of a square spiral around the centre cell: ring k holds the 8k cells at Chebyshev distance k.
 int2 SpiralCell(uint i)
@@ -372,6 +386,30 @@ int2 SpiralCell(uint i)
     if (side == 1) return int2(r, -r + t);
     if (side == 2) return int2(r - t, r);
     return int2(-r, r - t);
+}
+
+// The layers' plant tints (TerrainLayer.PlantTint) where they show, weighted as the terrain surface weights the
+// layers: a later channel covers the ones before it (gputerrain.fx, without its height blend). Ground no layer
+// covers tints nothing. controlUV: control-array space (Y flipped against terrain UV).
+float3 LayerPlantTint(float2 controlUV)
+{
+    Texture2DArray controlMaps = ResourceDescriptorHeap[SplatControlIdx];
+    StructuredBuffer<float4> plantTints = ResourceDescriptorHeap[LayerPlantTintIdx];
+    uint layerCount = min(SplatLayerCount, 32u);
+    float3 tint = 0;
+    float remaining = 1.0;
+    for (int slice = int((layerCount + 3) / 4) - 1; slice >= 0; slice--)
+    {
+        float4 w = controlMaps.SampleLevel(ClampSampler, float3(controlUV, slice), 0);
+        for (int c = 3; c >= 0; c--)
+        {
+            uint layer = uint(slice) * 4 + uint(c);
+            if (layer >= layerCount) continue;
+            tint += plantTints[layer].rgb * (w[c] * remaining);
+            remaining *= saturate(1.0 - w[c]);
+        }
+    }
+    return tint + remaining.xxx;
 }
 
 [numthreads(8, 8, 1)]
@@ -426,57 +464,101 @@ void CS_SpawnInstances(uint3 gid : SV_GroupID, uint3 gtid3 : SV_GroupThreadID)
             else if (HiZSrvIdx != 0 && IsCellOccluded(float3(cellLocal.x, h, cellLocal.y), ts * 0.707 + MaxHeight * 0.05))
                 tileValid = false;
         }
+        gs_cellValid = tileValid ? 1u : 0u;
+        gs_groupMask = 0;
+    }
+    GroupMemoryBarrierWithGroupSync();
+    if (gs_cellValid == 0) return;      // the same for the whole group: culled cells skip the two barriers below
 
-        if (tileValid)
+    // The cell's 3x3 control texels, one thread each. An instance looks its coverage up bilinearly between the
+    // texel centres around it, so a patch of decorators ends in a ramp instead of a staircase of 1 m squares that
+    // are each all in or all out. Each thread owns one column of the per-decorator table (clears it, then writes its
+    // texel's decorators), so nothing is merged serially: a thread-0 merge of the 72 channels cost as much as the old
+    // spawn did. (RGBA16_UINT is uncompressed: Load is valid; edges clamp.)
+    if (flatThread < 9)
+    {
+        for (uint z = 0; z < MAX_DECORATORS; z++) gs_cov[z][flatThread] = 0;
+        int2 d = int2(flatThread % 3, flatThread / 3) - 1;                 // cell offset in x, z
+        int2 texel = clamp(int2(cx + d.x, cy - d.y), int2(0, 0), int2(int(ControlWidth) - 1, int(ControlHeight) - 1));
+        uint4 s0 = controlTex.Load(int4(texel, 0, 0));
+        uint4 s1 = controlTex.Load(int4(texel, 1, 0));
+        [unroll] for (uint ch = 0; ch < 8; ch++)
         {
-            // Load baked control data (RGBA16_UINT is uncompressed — Load() is valid)
-            uint4 packed0 = controlTex.Load(int4(cx, cy, 0, 0));
-            uint4 packed1 = controlTex.Load(int4(cx, cy, 1, 0));
-
-            StructuredBuffer<DecoratorGroup> groups = ResourceDescriptorHeap[DecoratorGroupsIdx];
-
-            // Cell centre in the frame the clump noise is defined in (terrain-local metres, Z measured
-            // from the far edge like the control texture rows)
-            float2 clumpPos = float2((float(cellX) + 0.5) * ts, TerrainSize.y - (float(cellZ) + 0.5) * ts);
-
-            uint entries = 0;
-            for (uint ch = 0; ch < 8; ch++)
-            {
-                uint packed = (ch < 4) ? packed0[ch] : packed1[ch - 4];
-                uint groupIdx = packed >> 8;
-                uint coverage = packed & 0xFF;
-
-                if (groupIdx == 255 || coverage == 0) continue;
-
-                DecoratorGroup group = groups[groupIdx];
-                uint variantCount = min(group.VariantCount, (uint)MAX_VARIANTS);
-
-                for (uint v = 0; v < variantCount; v++)
-                {
-                    uint variantIdx = group.VariantOffset + v;
-                    DecoratorSlot variant = slots[variantIdx];
-
-                    // A cell past the variant's range (the end of its last band) spawns nothing of it
-                    float variantReach = VariantRange(variant) + ts;
-                    if (dx2 * dx2 + dz2 * dz2 > variantReach * variantReach) continue;
-
-                    // Coverage is shared by the decorator; natural patchiness is the variant's own
-                    float w = float(coverage) / 255.0;
-                    if (variant.ClusterScale > 0 && variant.ClusterAmount > 0)
-                        w *= lerp(1.0, DecoClusterMask(clumpPos, variant.ClusterScale, variant.Seed), saturate(variant.ClusterAmount));
-
-                    w = w * w * w; // aggressive power curve: crush low weights
-                    uint count = min(64u, (uint)(w * 64.0 * variant.Density * DecorationDensity + 0.5));
-                    if (count == 0) continue;
-
-                    gs_entrySlot[entries] = variantIdx;
-                    gs_entryCount[entries] = count;
-                    gs_entryWeight[entries] = w;
-                    entries++;
-                }
-            }
-            gs_entries = entries;
+            uint packed = ch < 4 ? s0[ch] : s1[ch - 4];
+            uint groupIdx = packed >> 8;
+            uint coverage = packed & 0xFF;
+            if (groupIdx >= MAX_DECORATORS || coverage == 0) continue;
+            gs_cov[groupIdx][flatThread] = float(coverage) / 255.0;
+            InterlockedOr(gs_groupMask, 1u << groupIdx);
         }
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    // Thread 0: per decorator present and per variant, how many candidates the cell tries. The count is made for the
+    // highest weight any point of the cell can look up; each candidate is then kept with probability (its own weight /
+    // that), see below.
+    if (flatThread == 0)
+    {
+        StructuredBuffer<DecoratorGroup> groups = ResourceDescriptorHeap[DecoratorGroupsIdx];
+
+        // Cell centre in the frame the clump noise is defined in (terrain-local metres, Z measured from the far edge
+        // like the control texture rows)
+        float2 clumpPos = float2((float(cellX) + 0.5) * ts, TerrainSize.y - (float(cellZ) + 0.5) * ts);
+
+        uint entries = 0;
+        uint candidates = 0;
+        uint present = gs_groupMask;
+        while (present != 0)
+        {
+            uint gk = firstbitlow(present);
+            present &= present - 1;
+
+            float coverMax = 0, coverMin = 1;
+            for (uint gt = 0; gt < 9; gt++)
+            {
+                coverMax = max(coverMax, gs_cov[gk][gt]);
+                coverMin = min(coverMin, gs_cov[gk][gt]);
+            }
+
+            DecoratorGroup group = groups[gk];
+            uint variantCount = min(group.VariantCount, (uint)MAX_VARIANTS);
+            for (uint v = 0; v < variantCount && entries < MAX_CELL_ENTRIES; v++)
+            {
+                uint variantIdx = group.VariantOffset + v;
+                DecoratorSlot variant = slots[variantIdx];
+
+                // A cell past the variant's range (the end of its last band) spawns nothing of it
+                float variantReach = VariantRange(variant) + ts;
+                if (dx2 * dx2 + dz2 * dz2 > variantReach * variantReach) continue;
+
+                // Clumps are evaluated per instance; for the count, the cell centre's plus a margin for how far the
+                // field moves within a cell (an underestimate only thins a steep clump edge slightly)
+                float clumpMax = 1.0;
+                if (variant.ClusterScale > 0 && variant.ClusterAmount > 0)
+                    clumpMax = lerp(1.0, saturate(DecoClusterMask(clumpPos, variant.ClusterScale, variant.Seed) + 0.35), saturate(variant.ClusterAmount));
+
+                float wMax = coverMax * clumpMax;
+                wMax = wMax * wMax * wMax;          // density = weight cubed: thin coverage thins out fast
+                float expected = wMax * 64.0 * variant.Density * DecorationDensity;
+                uint count = min(64u, (uint)ceil(expected - 0.001));
+                if (count == 0) continue;
+
+                gs_entrySlot[entries] = variantIdx;
+                gs_entryStart[entries] = candidates;
+                candidates += count;
+                gs_entryGroup[entries] = gk;
+                // How much lookup the instances need: none inside a patch (coverage within 0.03 everywhere around, the
+                // mean of the extremes), plain bilinear where it changes gently, and the edge offset (4 noises per
+                // instance) only across a real edge. Offset everywhere doubled the spawn's cost on Eldermoor.
+                float spread = coverMax - coverMin;
+                gs_entryEven[entries] = spread < 0.03 ? 0.5 * (coverMax + coverMin) : (spread < 0.2 ? -1.0 : -2.0);
+                gs_entryKeep[entries] = min(expected, 64.0) / float(count);
+                gs_entryInvMax[entries] = 1.0 / wMax;
+                entries++;
+            }
+        }
+        gs_entries = entries;
+        gs_entryStart[entries] = candidates;
     }
     GroupMemoryBarrierWithGroupSync();
 
@@ -494,24 +576,32 @@ void CS_SpawnInstances(uint3 gid : SV_GroupID, uint3 gtid3 : SV_GroupThreadID)
     Texture2D heightTex = ResourceDescriptorHeap[HeightmapIdx];
     Texture2D<float2> bakedNormals = ResourceDescriptorHeap[BakedNormalIdx];
 
-    // Iterate over the cell's entries (dynamic loop — all threads share the list, no divergence)
+    // All of the cell's candidates as one list, 64 threads over it. One pass per variant left most threads idle in
+    // each (a sparse variant has a candidate or two) while every pass still paid a full round of texture latency.
     uint entryCount = min(gs_entries, (uint)MAX_CELL_ENTRIES);
-    for (uint ci = 0; ci < entryCount; ci++)
+    uint totalCandidates = gs_entryStart[entryCount];
+    for (uint cand = flatThread; cand < totalCandidates; cand += 64)
     {
+        uint ci = 0;
+        while (ci + 1 < entryCount && gs_entryStart[ci + 1] <= cand) ci++;
+        uint instanceIdx = cand - gs_entryStart[ci];
         uint slotIdx = gs_entrySlot[ci];
-        uint decoInstCount = gs_entryCount[ci];
-        float cellWeight = gs_entryWeight[ci];
+        uint coverGroup = gs_entryGroup[ci];
+        float keepShare = gs_entryKeep[ci];
+        float invMaxWeight = gs_entryInvMax[ci];
+        float evenCover = gs_entryEven[ci];
 
         DecoratorSlot slot = slots[slotIdx];
         uint bandCount = BandCount(slot);
         float range = VariantRange(slot);
 
-        // Stride loop: 64 threads cooperate to spawn decoInstCount instances
-        for (uint instanceIdx = flatThread; instanceIdx < decoInstCount; instanceIdx += 64)
         {
             // Per-instance jitter: seed from integer cell coords to avoid float hash correlation
             uint cellSeed = pcg(uint(cellX) * 1664525u ^ uint(cellZ) * 1013904223u);
             uint instSeed = pcg(cellSeed + instanceIdx * 747796405u + slot.Seed * 2891336453u);
+            // First half of the keep test (the count was rounded up): before any noise is evaluated, so the extra
+            // candidate a sparse variant gets in every cell costs next to nothing
+            if (float(pcg(instSeed + 5099u)) / 4294967295.0 >= keepShare) continue;
             float rngX = float(instSeed) / 4294967295.0;
             float rngY = float(pcg(instSeed)) / 4294967295.0;
             float2 tileOrig = float2(tileOriginX, tileOriginZ);
@@ -526,6 +616,28 @@ void CS_SpawnInstances(uint3 gid : SV_GroupID, uint3 gtid3 : SV_GroupThreadID)
             );
             if (texelUV.x < 0 || texelUV.x > 1 || texelUV.y < 0 || texelUV.y > 1) continue;
 
+            // Weight here: the decorator's coverage bilinear between the 3x3 texel centres (grid 0..2 = the centres of
+            // cell offsets -1..1), looked up a little off the instance (DecoEdgeWarp, also in the ground tint) so a
+            // patch edge wobbles; times the variant's clumps here; cubed. Kept with probability weight / the cell's
+            // highest weight, which (with the first half above) makes the density weight-cubed x Density everywhere,
+            // down to a ragged, thinning edge.
+            float2 localXZ = float2(wx - TerrainOrigin.x, wz - TerrainOrigin.y);
+            float w = evenCover;
+            if (w < 0)
+            {
+                float2 offset = evenCover < -1.5 ? DecoEdgeWarp(localXZ) / ts : 0.0.xx;
+                float2 g = clamp(float2(rngX, rngY) + offset + 0.5, 0.0, 2.0);
+                uint2 g0 = min(uint2(g), uint2(1, 1));
+                float2 gf = g - float2(g0);
+                uint gi = g0.y * 3 + g0.x;
+                w = lerp(lerp(gs_cov[coverGroup][gi], gs_cov[coverGroup][gi + 1], gf.x),
+                         lerp(gs_cov[coverGroup][gi + 3], gs_cov[coverGroup][gi + 4], gf.x), gf.y);
+            }
+            if (slot.ClusterScale > 0 && slot.ClusterAmount > 0)
+                w *= lerp(1.0, DecoClusterMask(float2(localXZ.x, TerrainSize.y - localXZ.y), slot.ClusterScale, slot.Seed), saturate(slot.ClusterAmount));
+            float weight = w * w * w;
+            if (float(pcg(instSeed + 6211u)) / 4294967295.0 >= weight * invMaxWeight) continue;
+
             // ── Heightmap sample ──
             float h = heightTex.SampleLevel(HeightSampler, texelUV, 0).r;
             float3 instancePos = float3(wx, TerrainOrigin.z + h * MaxHeight, wz);
@@ -534,6 +646,13 @@ void CS_SpawnInstances(uint3 gid : SV_GroupID, uint3 gtid3 : SV_GroupThreadID)
             float3 toCam = instancePos - camPos;
             float camDistSq = dot(toCam, toCam);
             if (camDistSq >= range * range) continue;
+
+            // Thin out over the last 30% of the range instead of ending in a wall of cards at it: each instance
+            // drops out at its own distance (density falls linearly to nothing), the survivors shrink only in the
+            // last 8%. A full-density sward that stopped dead at 120 m was a hard line across every meadow.
+            float camDist = sqrt(camDistSq);
+            float keep = saturate((range - camDist) / (range * 0.3));
+            if (float(pcg(instSeed + 4243u)) / 4294967295.0 > keep) continue;
 
             // ── Terrain normal (R16G16_SNORM — already [-1,1]) ──
             float2 nxz = bakedNormals.SampleLevel(ClampSampler, texelUV, 0).rg;
@@ -553,7 +672,7 @@ void CS_SpawnInstances(uint3 gid : SV_GroupID, uint3 gtid3 : SV_GroupThreadID)
 
             // ── Per-instance scale & rotation ──
             uint scaleSeed = pcg(instSeed + 337u);
-            float densityBias = lerp(0.3, 1.0, cellWeight);
+            float densityBias = lerp(0.3, 1.0, weight);       // thin grass at a patch edge is short grass too
             float randH = float(scaleSeed) / 4294967295.0;
             float randW = float(pcg(scaleSeed + 779u)) / 4294967295.0;
             float scaleH = lerp(slot.MinH, slot.MaxH, randH * densityBias);
@@ -564,12 +683,20 @@ void CS_SpawnInstances(uint3 gid : SV_GroupID, uint3 gtid3 : SV_GroupThreadID)
             if (slot.HeightNoiseScale > 0 && slot.HeightNoiseAmount > 0)
                 scaleH *= DecoHeightFactor(texelUV * TerrainSize, slot.HeightNoiseScale, saturate(slot.HeightNoiseAmount), slot.Seed);
 
-            // Distance fade: smoothly shrink in the last 25% of range
-            float fadeStart = range * 0.85;
-            float camDist = sqrt(camDistSq);
-            float fadeFactor = smoothstep(0.0, 1.0, (range - camDist) / (range - fadeStart));
+            // The last few survivors of the thinning shrink away instead of popping
+            float fadeFactor = smoothstep(0.0, 1.0, (range - camDist) / (range * 0.08));
             scaleH *= fadeFactor;
             scaleW *= fadeFactor;
+
+            // What the ground here does to the plant's colour: the layers' plant tints (dry grass yellows what grows
+            // on it), then the shape of the land as the terrain's own colour takes it (ground_shape.hlsli), so the
+            // pattern of the bare ground past the decoration radius runs on through the sward
+            float3 groundTint = 1.0.xxx;
+            if (SplatLayerCount > 0 && SplatControlIdx != 0 && LayerPlantTintIdx != 0)
+                groundTint = LayerPlantTint(float2(texelUV.x, 1.0 - texelUV.y));
+            groundTint *= GroundShapeTint(GroundShape(heightTex, ClampSampler, texelUV, 1.0 / float(HeightmapSize.x), MaxHeight),
+                                          smoothstep(0.7, 0.9, terrainNormal.y));
+            groundTint *= SwardGrain(localXZ);       // the sward's grain, as the ground under it from afar
 
             float instanceRot = float(pcg(instSeed + 731u)) / 4294967295.0 * 6.2831853;
             float instanceSeedVal = float(pcg(instSeed + 991u)) / 4294967295.0;
@@ -581,7 +708,8 @@ void CS_SpawnInstances(uint3 gid : SV_GroupID, uint3 gtid3 : SV_GroupThreadID)
             di.TerrainNormal = terrainNormal;
             di.FadeFactor = fadeFactor;
             di.Scale = float2(scaleW, scaleH);
-            di.TerrainUV = texelUV;
+            di.GroundTint = PackGroundTint(groundTint);
+            di._groundTintPad = 0;
             di.SlotIdx = slotIdx;
             di.LOD = lod;
             di.InstanceSeed = instanceSeedVal;
@@ -760,15 +888,29 @@ void CS_BladeColors(uint3 gid : SV_GroupID, uint gtid : SV_GroupIndex)
 // ═══════════════════════════════════════════════════════════════════════════
 // CS_DecoratorTints
 //
-// One thread per decorator: the colour the ground under it takes (gputerrain.fx), as its cards look from afar —
+// One thread per decorator: the colour the ground under it takes (gputerrain.fx), as its plants look from afar —
 // each card variant's mean colour (CS_BladeColors' height bands, as the card PS shades it: x 0.8 average
-// brightness x HealthyColor), halved for the shade inside a mass of grass (at full albedo the ground past the
-// grass read as a bright lime band on Eldermoor), weighted by the opaque card area it puts on a square metre of
-// fully covered ground
-// (64 x Density x DecorationDensity instances, two quads of mean W x H, x the texture's coverage). That area,
-// saturated, is the strength: dense grass tints fully, a sparse flower drift barely. Mesh variants do not count.
-// Runs after CS_BladeColors, when the variants change.
+// brightness x HealthyColor), weighted by the opaque area it puts on a square metre (one control cell) of fully
+// covered ground: 64 x Density x DecorationDensity instances times the leaf area of one. A card is two quads of mean
+// W x H x the texture's coverage; a fern (Ferns band) FERN_FRONDS fronds of its length (instance height) and the
+// atlas frond's width, x the frond's coverage, seen from above. Mesh variants do not count.
+// Two float4 per decorator:
+//   [2g]     rgb = colour, a = the weight of its unclumped variants (gputerrain.fx saturates the sum)
+//   [2g + 1] the clumps of its heaviest strongly clumped variant (ClusterAmount > 0.5): scale, seed x 2 + amount,
+//            its range, weight. The terrain evaluates the same clump field (DecoClusterMask) as the spawn, so from
+//            afar the ground shows the patches the plants grow in instead of an even wash, and takes over exactly as
+//            the spawn thins the instances out (the last 30% of the range): no visible band where the plants end.
+//            Weakly clumped variants (grass, 0.3..0.45) count as even.
+// Runs after CS_BladeColors, when the variants change. (Until 2026-10-15 the colour was also halved, for vegetation
+// then lit at 0.4x by a 1.14-for-pi in light_directional_cs.hlsl; with that fixed, the ground past the cards
+// rendered half as bright as the cards before it. The fern area was first taken as two cards: ~5x too little.)
 // ═══════════════════════════════════════════════════════════════════════════
+
+// = grass_plants.fx: fronds per fern, the atlas frond's half-width (u) and its squeeze. Mean frond area: lengths
+// lerp(1.1, 0.55, young) x the height, squared and averaged = 0.706 x H^2; seen from above at ~0.8 of it.
+#define FERN_FRONDS_TINT 10.0
+#define FERN_FROND_HALF_U 0.245
+#define FERN_FROND_WIDTH 0.85
 
 [numthreads(64, 1, 1)]
 void CS_DecoratorTints(uint3 dtid : SV_DispatchThreadID)
@@ -785,6 +927,8 @@ void CS_DecoratorTints(uint3 dtid : SV_DispatchThreadID)
     DecoratorGroup g = groups[dtid.x];
     float3 colorSum = 0;
     float weightSum = 0;
+    float evenWeight = 0;
+    float4 clumps = 0;          // scale, seed x 2 + amount, range, weight of the heaviest strongly clumped variant
     for (uint v = 0; v < g.VariantCount; v++)
     {
         uint slotIdx = g.VariantOffset + v;
@@ -800,14 +944,38 @@ void CS_DecoratorTints(uint3 dtid : SV_DispatchThreadID)
             coverage += c.a;
         }
         if (coverage <= 0) continue;
-        float3 cardColor = bandColor / coverage * 0.8 * 0.5 * slot.HealthyColor;
+        float3 cardColor = bandColor / coverage * 0.8 * slot.HealthyColor;
+        coverage /= BLADE_COLOR_BANDS;      // the texture's opaque share
 
-        float cardArea = 2.0 * 0.5 * (slot.MinW + slot.MaxW) * 0.5 * (slot.MinH + slot.MaxH) * (coverage / BLADE_COLOR_BANDS);
-        float weight = 64.0 * slot.Density * DecorationDensity * cardArea;
+        float meanH = 0.5 * (slot.MinH + slot.MaxH);
+        float area = 2.0 * 0.5 * (slot.MinW + slot.MaxW) * meanH * coverage;
+        if (slot.Mode == MODE_FERNS || BandMode(slot, 0) == MODE_FERNS)
+        {
+            // A fern crown shades itself (fronds over fronds, darker towards the crown in grass_plants.fx): as flat
+            // ground at the cards' 0.8 its patches were brighter and greener than the ferns up close
+            cardColor *= 0.6;
+            float frondWidth = 2.0 * FERN_FROND_HALF_U / 0.98 * FERN_FROND_WIDTH;     // x the frond's length
+            float frondCoverage = saturate(coverage / (2.0 * FERN_FROND_HALF_U * 0.98));
+            area = FERN_FRONDS_TINT * 0.706 * meanH * meanH * frondWidth * frondCoverage * 0.8;
+        }
+        float weight = 64.0 * slot.Density * DecorationDensity * area;
         colorSum += cardColor * weight;
         weightSum += weight;
+        if (slot.ClusterScale > 0 && slot.ClusterAmount > 0.5)
+        {
+            if (weight > clumps.w)
+            {
+                evenWeight += clumps.w;     // a lighter clumped variant counts as even
+                clumps = float4(slot.ClusterScale, float(slot.Seed) * 2.0 + saturate(slot.ClusterAmount), VariantRange(slot), weight);
+            }
+            else
+                evenWeight += weight;
+        }
+        else
+            evenWeight += weight;
     }
-    tints[dtid.x] = float4(weightSum > 0 ? colorSum / weightSum : 0.0.xxx, saturate(weightSum));
+    tints[dtid.x * 2] = float4(weightSum > 0 ? colorSum / weightSum : 0.0.xxx, evenWeight);
+    tints[dtid.x * 2 + 1] = clumps;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

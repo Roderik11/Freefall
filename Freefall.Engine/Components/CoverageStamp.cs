@@ -1,5 +1,6 @@
 using System.Collections.Generic;
 using System.Numerics;
+using System.Security.Cryptography;
 using Freefall.Assets;
 using Freefall.Base;
 using Category = System.ComponentModel.CategoryAttribute;
@@ -34,8 +35,9 @@ namespace Freefall.Components
         public float SlopeBlend = 5.0f;
 
         /// <summary>
-        /// Apply only where one of these layers shows: the weight is multiplied by the strongest of them,
-        /// measured as what is visible after the layers painted over it. Empty = no requirement.
+        /// Apply only where these layers show: the weight is multiplied by how much of the ground they cover
+        /// together (their visible weights summed, after the layers painted over them), so grass that grows on
+        /// "Gras 01" or "Dry Grass" stays full where the two meet. Empty = no requirement.
         /// </summary>
         public List<TerrainLayer> RequireLayers = [];
 
@@ -45,9 +47,29 @@ namespace Freefall.Components
         /// </summary>
         public List<TerrainLayer> ExcludeLayers = [];
 
+        /// <summary>
+        /// Apply only in irregular patches about this many metres across, scattered over the whole stamp: dry grass
+        /// or bare soil breaking up a meadow, flowers in drifts. 0 = everywhere. Baked on the GPU only, so a PCG
+        /// graph that keeps clear of this stamp sees its full shape, not the patches.
+        /// </summary>
+        [Category("Patches")]
+        [ValueRange(0f, 200f)]
+        public float PatchSize = 0f;
+
+        /// <summary>About the share of the area the patches cover.</summary>
+        [ValueRange(0f, 1f)]
+        public float PatchCoverage = 0.3f;
+
+        /// <summary>How gradually a patch fades out at its edge (0 = hard edge).</summary>
+        [ValueRange(0f, 1f)]
+        public float PatchSoftness = 0.3f;
+
+        /// <summary>Moves the patches; stamps with the same size and seed have them in the same places.</summary>
+        public int PatchSeed = RandomNumberGenerator.GetInt32(99999);
+
         /// <summary>True if any filter term can reject a texel, i.e. the GPU has to evaluate it.</summary>
         public bool HasFilter =>
             HeightRange.X > 0f || HeightRange.Y < 1f || SlopeRange.X > 0f || SlopeRange.Y < 90f ||
-            RequireLayers is { Count: > 0 } || ExcludeLayers is { Count: > 0 };
+            RequireLayers is { Count: > 0 } || ExcludeLayers is { Count: > 0 } || PatchSize > 0f;
     }
 }

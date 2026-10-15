@@ -10,7 +10,7 @@ using Vortice.Mathematics;
 namespace Freefall.Graphics
 {
     /// <summary>
-    /// Material texture indices + scalar properties for bindless lookup — matches HLSL MaterialData (64 bytes)
+    /// Material texture indices + scalar properties for bindless lookup — matches HLSL MaterialData (80 bytes)
     /// </summary>
     public struct MaterialData
     {
@@ -26,6 +26,8 @@ namespace Freefall.Graphics
         public Vector2 DetailOffset;
         public Vector3 EmissiveColor;
         public float EmissiveIntensity;
+        public Vector3 Tint;            // multiplies the albedo map (Material "Tint", default white)
+        public float _tintPad;
 
         /// <summary>
         /// Texture slot names derived from this struct's fields (strips "Idx" suffix).
@@ -119,6 +121,9 @@ namespace Freefall.Graphics
     /// </summary>
     public class ShaderPass
     {
+        /// <summary>A pass whose name is no RenderPass (e.g. the terrain's "DepthPrepass"): selected by name only.</summary>
+        public const RenderPass NamedOnly = (RenderPass)(-1);
+
         public RenderPass RenderPass;
         public EffectPass EffectPass = null!;
         public int Index;
@@ -136,7 +141,9 @@ namespace Freefall.Graphics
             for (int i = 0; i < technique.Passes.Count; i++)
             {
                 var pass = technique.Passes[i];
-                Enum.TryParse<RenderPass>(pass.Name, out var type);
+                // An unknown name used to parse to default(RenderPass) = Shadow, and got the shadow PSO overrides
+                if (!Enum.TryParse<RenderPass>(pass.Name, out var type))
+                    type = ShaderPass.NamedOnly;
 
                 ShaderPasses.Add(new ShaderPass
                 {
@@ -295,6 +302,7 @@ namespace Freefall.Graphics
                 {
                     EmissiveColor = Vector3.One,
                     EmissiveIntensity = 1.0f,
+                    Tint = Vector3.One,
                 });
                 _materialsBufferDirty = true;
             }
@@ -308,6 +316,10 @@ namespace Freefall.Graphics
         private void InitMaterialProperties()
         {
             _materialProperties.Clear();
+            // Colour-matches a texture to the scene without editing the file: a pack's grey-teal leaves pulled to
+            // green, a too-bright bark darkened (like TerrainLayer.Tint). Unity packs often got this from _Color.
+            _materialProperties.Add(new MaterialProperty<Color3>("Tint", this, new Color3(1f, 1f, 1f),
+                (m, v) => m.UpdateMaterialScalar((ref MaterialData d) => d.Tint = v.ToVector3())));
             _materialProperties.Add(new MaterialProperty<Color3>("EmissiveColor", this, new Color3(),
                 (m, v) => m.UpdateMaterialScalar((ref MaterialData d) => d.EmissiveColor = v.ToVector3())));
             _materialProperties.Add(new MaterialProperty<float>("EmissiveIntensity", this, 1.0f,
@@ -421,6 +433,27 @@ namespace Freefall.Graphics
         /// <summary>
         /// Core initialization: build PSOs, SubShaders, CBs from an Effect.
         /// </summary>
+        /// <summary>
+        /// Blend "NoColor": every render target bound but none written, for a depth-only pass drawn with the G-buffer
+        /// targets still bound (the terrain's depth prepass; the targets' formats must still match the bound ones).
+        /// </summary>
+        private static BlendDescription NoColorWrites()
+        {
+            var desc = new BlendDescription { AlphaToCoverageEnable = false, IndependentBlendEnable = false };
+            desc.RenderTarget[0] = new RenderTargetBlendDescription
+            {
+                BlendEnable = false,
+                SourceBlend = Blend.One,
+                DestinationBlend = Blend.Zero,
+                BlendOperation = BlendOperation.Add,
+                SourceBlendAlpha = Blend.One,
+                DestinationBlendAlpha = Blend.Zero,
+                BlendOperationAlpha = BlendOperation.Add,
+                RenderTargetWriteMask = ColorWriteEnable.None
+            };
+            return desc;
+        }
+
         private void InitFromEffect(Effect effect, GraphicsDevice device)
         {
             //Debug.Log($"[Material] Creating Material for Effect: {effect.Name}");
@@ -642,6 +675,7 @@ namespace Freefall.Graphics
                     {
                         "Additive" => new BlendDescription(Blend.One, Blend.One),
                         "AlphaBlend" => BlendDescription.AlphaBlend,
+                        "NoColor" => NoColorWrites(),
                         _ => blendDesc
                     };
                 }

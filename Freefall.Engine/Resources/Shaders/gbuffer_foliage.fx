@@ -62,6 +62,7 @@ struct VSOutput
     nointerpolation uint MeshPartIdx : TEXCOORD5;
     float CanopyAO : TEXCOORD6;     // 0 = deep inside / under the canopy, 1 = outer sunlit shell
     float3 DomeNormal : TEXCOORD7;  // original look (mostly up) — used for materials that have a normal map
+    nointerpolation float3 TreeTint : TEXCOORD8;   // this tree's colour (common.fx TreeTint)
 };
 
 // Wind (common.fx). The crown rides its trunk's bend (TreeSway, as gbuffer_trunk.fx), and the leaves flutter about
@@ -124,6 +125,7 @@ VSOutput VS(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_InstanceI
     // material has a normal map (Sweetgum, beech): those trees were authored against this look.
     float3 treeOrigin = float3(World._41, World._42, World._43);
     output.DomeNormal = normalize(lerp(float3(0, 1, 0), normalize(worldPos.xyz - treeOrigin), 0.25));
+    output.TreeTint = TreeTint(treeOrigin);
 
     // Fake-volume canopy for foliage WITHOUT a normal map (e.g. Aquarius shrubs): normals point out of the leaf
     // part's bounding sphere, biased up — the dome lit them like flat ground, so they read as flat, bright blobs.
@@ -167,7 +169,8 @@ PSOutput PS(VSOutput input, bool isFrontFace : SV_IsFrontFace)
     Texture2D albedoTex = ResourceDescriptorHeap[mat.AlbedoIdx];
 
     float4 color = albedoTex.Sample(Sampler, input.TexCoord);
-    
+    color.rgb *= mat.Tint * input.TreeTint; // Material Tint (default white), this tree's own colour
+
     // Distance-based alpha threshold — preserve coverage at distance
     float dist = length(input.WorldPos.xyz);
    // float alphaThreshold = lerp(0.5, 0.15, saturate((dist - 30.0) / 50.0));

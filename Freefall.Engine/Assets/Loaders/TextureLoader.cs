@@ -47,6 +47,9 @@ namespace Freefall.Assets.Loaders
             StreamingManager.Instance?.Flush();
 
             texture.ReplaceResource(fresh);
+
+            // Whoever copied the old pixels (the terrain's layer arrays) rebuilds from the new ones
+            Freefall.Base.MessageDispatcher.Send("AssetReloaded", existing);
             return true;
         }
     }

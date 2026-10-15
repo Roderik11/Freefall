@@ -22,6 +22,7 @@ cbuffer PushConstants : register(b3)
 };
 
 #include "common.fx"
+#include "ground_shape.hlsli"
 
 // ─── GPU structs ───────────────────────────────────────────────────────────
 
@@ -63,7 +64,8 @@ struct DecoInstance
     float3 TerrainNormal;
     float  FadeFactor;
     float2 Scale;
-    float2 TerrainUV;
+    uint   GroundTint;      // what the ground at the root does to the colour (ground_shape.hlsli PackGroundTint)
+    uint   _groundTintPad;
     uint   SlotIdx;
     uint   LOD;
     float  InstanceSeed;
@@ -126,11 +128,10 @@ struct MSOutput
     nointerpolation uint MaterialId      : TEXCOORD3;
     nointerpolation uint TextureOverride  : TEXCOORD4;
     float  HeightFrac : TEXCOORD5;
-    float2 TerrainUV  : TEXCOORD6;
     nointerpolation float InstanceSeed : TEXCOORD7;
     nointerpolation uint SlotIdx : TEXCOORD8;
     nointerpolation float FadeFactor : TEXCOORD9;
-    nointerpolation float3 Variation : TEXCOORD10;    // GroundVariation at the card's root (common.fx)
+    nointerpolation float3 Variation : TEXCOORD10;    // at the card's root: GroundVariation (common.fx) x the ground tint (spawn)
 };
 
 [outputtopology("triangle")]
@@ -244,11 +245,10 @@ void MS(
     o.MaterialId = lodEntry.MaterialId;
     o.TextureOverride = slot.TextureIdx;
     o.HeightFrac = saturate(lp.y);
-    o.TerrainUV = di.TerrainUV;
     o.InstanceSeed = di.InstanceSeed;
     o.SlotIdx = di.SlotIdx;
     o.FadeFactor = di.FadeFactor;
-    o.Variation = GroundVariation(di.Position.xz);
+    o.Variation = GroundVariation(di.Position.xz) * UnpackGroundTint(di.GroundTint);
     verts[gtid] = o;
 
     if (vertInQuad < 2)
@@ -293,9 +293,6 @@ PSOutput PS(MSOutput input)
         float alphaThreshold = lerp(0.33, 0.8, 1.0 - input.FadeFactor);
         clip(alpha - alphaThreshold);
 
-        // Ground color fade
-        //Texture2D BakedAlbedo = ResourceDescriptorHeap[BakedAlbedoIdx];
-        //float3 groundColor = BakedAlbedo.SampleLevel(ClampSampler, input.TerrainUV, 0).rgb;
         float aoFactor = saturate(input.HeightFrac / 0.33);
         float brightVar = 0.6 + 0.4 * frac(input.InstanceSeed * 17.31);
         float3 variedBase = baseColor * brightVar;

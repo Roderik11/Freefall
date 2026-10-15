@@ -102,7 +102,7 @@ void CS_SplatBake(uint3 dtid : SV_DispatchThreadID)
 
         if (stamp.Flags & COVERAGE_FILTER)
         {
-            weight *= CoverageTerrainFilter(stamp, heightNorm, slopeDeg);
+            weight *= CoverageTerrainFilter(stamp, heightNorm, slopeDeg, terrainUV * TerrainSizeX);   // square terrain
 
             if ((stamp.RequireMask | stamp.ExcludeMask) != 0)
             {
@@ -112,11 +112,11 @@ void CS_SplatBake(uint3 dtid : SV_DispatchThreadID)
                 for (int c = int(layerCount) - 1; c >= 0; c--)
                 {
                     uint bit = 1u << uint(c);
-                    if (stamp.RequireMask & bit) required = max(required, raw[c] * cover);
+                    if (stamp.RequireMask & bit) required += raw[c] * cover;        // together, as in decoration_prepass
                     if (stamp.ExcludeMask & bit) excluded = max(excluded, raw[c]);
                     cover *= (1.0 - raw[c]);
                 }
-                if (stamp.RequireMask != 0) weight *= required;
+                if (stamp.RequireMask != 0) weight *= saturate(required);
                 weight *= (1.0 - excluded);
             }
 

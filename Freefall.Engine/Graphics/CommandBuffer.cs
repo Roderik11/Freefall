@@ -566,6 +566,7 @@ namespace Freefall.Graphics
 
         private Pass[] passes;
         private Dictionary<RenderPass, List<Action<ID3D12GraphicsCommandList>>> customQueues = new Dictionary<RenderPass, List<Action<ID3D12GraphicsCommandList>>>();
+        private Dictionary<RenderPass, List<Action<ID3D12GraphicsCommandList>>> lateQueues = new Dictionary<RenderPass, List<Action<ID3D12GraphicsCommandList>>>();
         
         // Static GPU culler - shared by all batches (never run in parallel)
         public static GPUCuller? Culler { get; private set; }
@@ -606,12 +607,24 @@ namespace Freefall.Graphics
             for (int i = 0; i < passes.Length; i++) passes[i] = new Pass();
             
             foreach (RenderPass pass in Enum.GetValues(typeof(RenderPass)))
+            {
                 customQueues[pass] = new List<Action<ID3D12GraphicsCommandList>>();
+                lateQueues[pass] = new List<Action<ID3D12GraphicsCommandList>>();
+            }
         }
 
         public static void Enqueue(RenderPass pass, Action<ID3D12GraphicsCommandList> action)
         {
             current.customQueues[pass].Add(action);
+        }
+
+        /// <summary>
+        /// A custom action that runs after the pass's batches instead of before them: for work that should see the
+        /// batches' depth, e.g. the terrain's shading after its depth prepass, so hidden terrain pixels are rejected.
+        /// </summary>
+        public static void EnqueueLate(RenderPass pass, Action<ID3D12GraphicsCommandList> action)
+        {
+            current.lateQueues[pass].Add(action);
         }
 
         /// <summary>
@@ -666,8 +679,8 @@ namespace Freefall.Graphics
             // Iterate all passes defined in the Effect and enqueue to each
             foreach (var shaderPass in material.GetPasses())
             {
-                if(shaderPass.RenderPass == RenderPass.Shadow)
-                continue;
+                if (shaderPass.RenderPass == RenderPass.Shadow || shaderPass.RenderPass == ShaderPass.NamedOnly)
+                    continue;
                 current.passes[(int)shaderPass.RenderPass].Add(drawCall);
             }
         }
@@ -801,7 +814,7 @@ namespace Freefall.Graphics
                         // One record per render pass of the material's effect, as Enqueue does
                         foreach (var shaderPass in op.Call.Material.GetPasses())
                         {
-                            if (shaderPass.RenderPass == RenderPass.Shadow)
+                            if (shaderPass.RenderPass == RenderPass.Shadow || shaderPass.RenderPass == ShaderPass.NamedOnly)
                                 continue;
                             var batch = current.passes[(int)shaderPass.RenderPass].GetOrCreateBatch(op.Call.Key, op.Call.Material);
                             op.Group.Handles.Add(batch.AddPersistent(op.Call));
@@ -843,6 +856,12 @@ namespace Freefall.Graphics
 
             // 2. Batches
             current.passes[(int)pass].Execute(commandList, device, pass, frustumGpuAddr);
+
+            // 3. Late custom actions (see EnqueueLate)
+            var late = current.lateQueues[pass];
+            for (int i = 0; i < late.Count; i++)
+                late[i](commandList);
+            late.Clear();
         }
 
         /// <summary>
@@ -868,6 +887,7 @@ namespace Freefall.Graphics
         {
             foreach (var pass in current.passes) pass.Clear();
             foreach (var queue in current.customQueues.Values) queue.Clear();
+            foreach (var queue in current.lateQueues.Values) queue.Clear();
         }
     }
 }

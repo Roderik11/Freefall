@@ -9,9 +9,10 @@ namespace Freefall.Assets
     /// How a decorator variant is drawn. The procedural modes build opaque geometry in a mesh shader instead of a
     /// mostly transparent card, coloured from the variant's texture — for near the camera:
     /// Blades = a clump of grass blades; Flowers = a few stems with paired leaves and a disc bloom (daisy, zinnia);
-    /// Spikes = stems carrying a spike of small florets (loosestrife, lavender).
+    /// Spikes = stems carrying a spike of small florets (loosestrife, lavender);
+    /// Ferns = a crown of arching fronds, each the parts atlas' frond on a bent, cupped strip.
     /// </summary>
-    public enum DecoratorMode { Mesh, Billboard, Cross, Blades, Flowers, Spikes }
+    public enum DecoratorMode { Mesh, Billboard, Cross, Blades, Flowers, Spikes, Ferns }
 
     /// <summary>
     /// Ground cover for terrain: a mix of things that are allowed in the same places.
@@ -54,8 +55,9 @@ namespace Freefall.Assets
         public Texture Texture;
 
         /// <summary>
-        /// Flowers / Spikes bands: atlas of the plant's parts — a bloom seen from above (Flowers) or the flower spike
-        /// from the side (Spikes), and a leaf — mapped onto the procedural plant. Rendered by
+        /// Flowers / Spikes / Ferns bands: atlas of the plant's parts — a bloom seen from above (Flowers) or the flower
+        /// spike from the side (Spikes), and a leaf; or one frond filling the atlas (Ferns, HeightRange = frond
+        /// length) — mapped onto the procedural plant. Rendered by
         /// Tools/BlenderKits/build_flowers.py, which documents the layout. Empty = flat colours from the card.
         /// The card's own texture cannot serve: it shows the blooms side-on.
         /// </summary>

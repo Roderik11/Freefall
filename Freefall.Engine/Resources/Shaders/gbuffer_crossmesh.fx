@@ -58,6 +58,7 @@ struct VSOutput
     float Depth : TEXCOORD3;
     nointerpolation uint TransformSlot : TEXCOORD4;
     nointerpolation uint MeshPartIdx : TEXCOORD5;
+    nointerpolation float3 TreeTint : TEXCOORD6;   // this tree's colour (common.fx TreeTint), as its nearer LODs
 };
 
 
@@ -102,6 +103,7 @@ VSOutput VS(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_InstanceI
     float3 treeOrigin = float3(World._41, World._42, World._43);
     float3 outward = normalize(worldPos.xyz - treeOrigin);
     output.Normal = normalize(lerp(float3(0, 1, 0), outward, 0.25));
+    output.TreeTint = TreeTint(treeOrigin);
 
     // Tree center depth: same View*Projection transform as vertices
     float treeCenterDepth = mul(mul(float4(treeOrigin, 1.0), View), Projection).w;
@@ -136,6 +138,7 @@ PSOutput PS(VSOutput input)
     Texture2D albedoTex = ResourceDescriptorHeap[mat.AlbedoIdx];
 
     float4 color = albedoTex.Sample(Sampler, input.TexCoord);
+    color.rgb *= mat.Tint * input.TreeTint; // Material Tint (default white), this tree's own colour
     clip(color.a - 0.2f);
 
     // Read AO map — encodes canopy depth:

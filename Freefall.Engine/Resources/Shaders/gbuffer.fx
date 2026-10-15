@@ -212,6 +212,7 @@ PSOutput PS(VSOutput input)
     Texture2D albedoTex = ResourceDescriptorHeap[mat.AlbedoIdx];
     
     float4 color = albedoTex.Sample(Sampler, input.TexCoord);
+    color.rgb *= mat.Tint;                  // Material Tint (default white)
     //clip(color.a - 0.25f);
     
     // PBR material properties — defaults for meshes without PBR textures

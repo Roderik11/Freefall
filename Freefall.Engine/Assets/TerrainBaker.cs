@@ -106,7 +106,7 @@ namespace Freefall.Assets
             public float HalfWidth;  // UV-space half-width
         }
 
-        /// <summary>GPU struct matching HLSL CoverageStamp (terrain_coverage.hlsli). 80 bytes.</summary>
+        /// <summary>GPU struct matching HLSL CoverageStamp (terrain_coverage.hlsli). 96 bytes.</summary>
         [StructLayout(LayoutKind.Sequential)]
         internal struct CoverageStampGPU
         {
@@ -125,6 +125,10 @@ namespace Freefall.Assets
             public float SlopeMin, SlopeMax, SlopeBlend;
             public uint RequireMask;
             public uint ExcludeMask;
+            public float PatchSize;          // metres, 0 = no patches
+            public float PatchCoverage;
+            public float PatchSoftness;
+            public uint PatchSeed;
         }
 
         private const uint CoverageGlobal = 1u;
@@ -1142,6 +1146,10 @@ namespace Freefall.Assets
             desc.SlopeMin = stamp.SlopeRange.X;
             desc.SlopeMax = stamp.SlopeRange.Y;
             desc.SlopeBlend = stamp.SlopeBlend;
+            desc.PatchSize = stamp.PatchSize;
+            desc.PatchCoverage = stamp.PatchCoverage;
+            desc.PatchSoftness = stamp.PatchSoftness;
+            desc.PatchSeed = (uint)stamp.PatchSeed;
 
             if (stamp.HasFilter)
             {
