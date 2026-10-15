@@ -176,12 +176,13 @@ namespace Freefall.Components
         private const int BladeColorsPerVariant = 6;        // = COLORS_PER_VARIANT in the shaders: 4 height bands, foliage, bloom
         private GraphicsBuffer? _bladeInstanceBuffer;       // DecoInstance, 64 bytes; padded to whole AS groups
         private GraphicsBuffer? _bladeColorBuffer;          // float4 per variant x BladeColorsPerVariant (CS_BladeColors)
+        private GraphicsBuffer? _decoratorTintBuffer;       // float4 per decorator: ground tint (rgb, strength), CS_DecoratorTints
         private bool _bladeColorsDirty = true;
         private bool _decoHasBlades;                        // some variant draws a band as Blades (grass_blades.fx)
         private bool _decoHasPlants;                        // ... as Flowers or Spikes (grass_plants.fx)
         private Material? _bladeMaterial;
         private Material? _plantMaterial;
-        private int _kBladeColors;
+        private int _kBladeColors, _kDecoratorTints;
 
         // ───── Debug Stats (read by editor SettingsControls) ─────────────
         public static int LastInstanceCount { get; set; }
@@ -406,6 +407,7 @@ namespace Freefall.Components
             // ── Blade clumps ──
             device?.DeferDispose(_bladeInstanceBuffer);
             device?.DeferDispose(_bladeColorBuffer);
+            device?.DeferDispose(_decoratorTintBuffer);
 
             // ── Compute shaders (pipeline states + their constant buffers) ──
             device?.DeferDispose(_quadtreeCS);
@@ -670,6 +672,8 @@ namespace Freefall.Components
             material.SetParameter("TerrainSize", Terrain.TerrainSize);
             material.SetParameter("TerrainOrigin", new Vector2(Transform.WorldPosition.X, Transform.WorldPosition.Z));
             material.SetParameter("LayerTiling", _layerTiling);
+            material.SetParameter("DecoRadius", Terrain.DecorationRadius);
+            material.SetParameter("DecoGroundTint", Terrain.DrawDetail ? Terrain.DecorationGroundTint : 0f);
 
             // Bind textures — texture arrays MUST be valid Texture2DArray resources.
             // The PS samples them as Texture2DArray with array index 0..3.
@@ -1168,8 +1172,9 @@ namespace Freefall.Components
             commandList.SetGraphicsRoot32BitConstant(0, TransformBuffer.Instance!.SrvIndex, 15);
             // Slot 16: Debug mode
             commandList.SetGraphicsRoot32BitConstant(0, (uint)Engine.Settings.DebugVisualizationMode, 16);
-            // Slot 21: Deco control map SRV (for debug mode 5)
+            // Slot 21: Deco control map SRV (ground tint, debug mode 5); slot 22: the tint per decorator
             commandList.SetGraphicsRoot32BitConstant(0, _decoControlSRV, 21);
+            commandList.SetGraphicsRoot32BitConstant(0, _decoratorTintBuffer?.SrvIndex ?? 0u, 22);
             // Slot 26: HeightMapsArray SRV (SSDM per-layer displacement)
             commandList.SetGraphicsRoot32BitConstant(0, (uint)(HeightMapsArray?.BindlessIndex ?? 0), 26);
 
@@ -1965,6 +1970,12 @@ namespace Freefall.Components
                 Engine.Device.DeferDispose(_bladeColorBuffer);
                 _bladeColorBuffer = GraphicsBuffer.CreateStructured(bladeColorCount, 16, srv: true, uav: true);
             }
+            int tintCount = Math.Max(1, groups.Count);
+            if (_decoratorTintBuffer == null || _decoratorTintBuffer.ElementCount != tintCount)
+            {
+                Engine.Device.DeferDispose(_decoratorTintBuffer);
+                _decoratorTintBuffer = GraphicsBuffer.CreateStructured(tintCount, 16, srv: true, uav: true);
+            }
             _bladeColorsDirty = true;
         }
 
@@ -2189,6 +2200,7 @@ namespace Freefall.Components
             _kBuildDecoDrawArgs = _grassCS.FindKernel("CS_BuildDrawArgs");
             _kBinMeshInstances  = _grassCS.FindKernel("CS_BinMeshInstances");
             _kBladeColors       = _grassCS.FindKernel("CS_BladeColors");
+            _kDecoratorTints    = _grassCS.FindKernel("CS_DecoratorTints");
 
             // Load mesh decorator material
             _meshDecoratorMaterial ??= new Material(new Effect("grass_mesh"));
@@ -2401,6 +2413,16 @@ namespace Freefall.Components
                     PixMarker.Begin(commandList, "Blade colours");
                     cs.Dispatch(_kBladeColors, commandList, (uint)_decoVariantCount);
                     commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(null)));
+                    if (_decoratorTintBuffer != null)
+                    {
+                        // The ground tint per decorator (gputerrain.fx) from those colours
+                        _decoratorTintBuffer.Transition(commandList, ResourceStates.UnorderedAccess);
+                        cs.SetBuffer(_kDecoratorTints, "BladeColorsUAV", _bladeColorBuffer);
+                        cs.SetBuffer(_kDecoratorTints, "DecoratorTintsUAV", _decoratorTintBuffer);
+                        cs.Dispatch(_kDecoratorTints, commandList, (uint)((_decoratorTintBuffer.ElementCount + 63) / 64));
+                        commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(null)));
+                        _decoratorTintBuffer.Transition(commandList, ResourceStates.PixelShaderResource);
+                    }
                     PixMarker.End(commandList);
                     _bladeColorBuffer.Transition(commandList, ResourceStates.NonPixelShaderResource);
                     _bladeColorsDirty = false;

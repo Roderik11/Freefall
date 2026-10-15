@@ -94,14 +94,11 @@ float Rand(inout uint h)
     return float(h) / 4294967295.0;
 }
 
-// The cards' sway at height fraction t of a part rooted at 'root', plus a per-part phase so a clump does not
-// move as one
+// The scene wind's sway (GrassWind, common.fx) at height fraction t of a part rooted at 'root', with a per-part
+// phase so a clump does not move as one
 float3 Wind(float3 root, float t, float height, float phase)
 {
-    float windInfluence = t * t;
-    float windWave1 = sin(Time * 2.1 + root.x * 0.8 + root.z * 0.6 + phase * 0.3) * 0.12;
-    float windWave2 = sin(Time * 1.4 + root.x * 0.5 - root.z * 0.9 + phase * 0.2) * 0.08;
-    return float3(windWave1 + windWave2, 0, windWave2 - windWave1 * 0.5) * windInfluence * height;
+    return GrassWind(root, t, height, phase);
 }
 
 // Triangle 'p' of a strip of 'segs' quads (left/right vertex pairs up from 'baseVertex') closed by a tip vertex

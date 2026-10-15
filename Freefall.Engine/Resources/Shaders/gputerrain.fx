@@ -22,7 +22,7 @@ cbuffer PushConstants : register(b3)
     uint DiffuseMapsIdx;        // 19
     uint NormalMapsIdx;         // 20
     uint DecoControlMapIdx;     // 21: Decoration control texture
-    uint _reserved22;           // 22
+    uint DecoTintIdx;           // 22: per decorator, the colour the ground under it takes (rgb, strength)
     uint CascadeBufferSRVIdx;   // 23: SRV: StructuredBuffer<CascadeData>
     uint ShadowCascadeCount;    // 24: uint: number of cascades
     uint CascadeIdxBufIdx;      // 25: SRV: per-entry cascade index (uint)
@@ -49,6 +49,8 @@ cbuffer terrain : register(b1)
     float BlendDepth;   // layer transition softness in weight space (Terrain.LayerBlendDepth)
     float2 TerrainSize;
     float2 TerrainOrigin;
+    float DecoRadius;       // decorators are drawn this far
+    float DecoGroundTint;   // Terrain.DecorationGroundTint: 0 = off
 }
 
 cbuffer tiling : register(b2)
@@ -222,6 +224,43 @@ float3 GetNormal(float2 uv)
 	return normalize(n);
 }
 
+// The colour of what grows here, as the decorators look from afar (CS_DecoratorTints), and how much of the ground it
+// claims: per texel of the decoration control map every decorator's coverage, cubed like the spawn's density, times
+// its strength. Four texels blended bilinearly: one is about a metre, which would show as squares up close.
+float4 DecoratorGroundTint(float2 ctrlUV)
+{
+    Texture2DArray<uint4> decoCtrl = ResourceDescriptorHeap[DecoControlMapIdx];
+    StructuredBuffer<float4> tints = ResourceDescriptorHeap[DecoTintIdx];
+    uint w, h, slices;
+    decoCtrl.GetDimensions(w, h, slices);
+    float2 p = ctrlUV * float2(w, h) - 0.5;
+    int2 i0 = int2(floor(p));
+    float2 f = p - floor(p);
+
+    float3 colorSum = 0;
+    float weightSum = 0;
+    [unroll] for (uint k = 0; k < 4; k++)
+    {
+        int2 offset = int2(k & 1, k >> 1);
+        float bilinear = (offset.x ? f.x : 1 - f.x) * (offset.y ? f.y : 1 - f.y);
+        int2 texel = clamp(i0 + offset, int2(0, 0), int2(w - 1, h - 1));
+        uint4 s0 = decoCtrl.Load(int4(texel, 0, 0));
+        uint4 s1 = decoCtrl.Load(int4(texel, 1, 0));
+        [unroll] for (uint c = 0; c < 8; c++)
+        {
+            uint packed = c < 4 ? s0[c] : s1[c - 4];
+            uint group = packed >> 8;
+            float coverage = (packed & 0xFF) / 255.0;
+            if (group == 255 || coverage <= 0) continue;
+            float4 tint = tints[group];
+            float wgt = bilinear * coverage * coverage * coverage * tint.a;
+            colorSum += tint.rgb * wgt;
+            weightSum += wgt;
+        }
+    }
+    return float4(weightSum > 0 ? colorSum / weightSum : 0.0.xxx, saturate(weightSum));
+}
+
 FragmentOutput PS(VertexOutput input)
 {
     FragmentOutput output;
@@ -362,8 +401,20 @@ FragmentOutput PS(VertexOutput input)
         terrainNormal = normalize(terrainNormal);
     }
 
-    output.Albedo = float4(color.rgb, 0);
-    output.Normals = float4(terrainNormal.xyz, 1); 
+    // Ground under decorators takes their colour: fully from about where their cards end, so the grass does not
+    // stop at a line on ground of another colour; a third of it near the camera, where the plants themselves show.
+    if (DecoGroundTint > 0 && DecoTintIdx != 0 && DecoControlMapIdx != 0)
+    {
+        float4 tint = DecoratorGroundTint(uv);
+        float reach = lerp(0.33, 1.0, smoothstep(0.3 * DecoRadius, 0.9 * DecoRadius, distance(input.WorldPos, CameraPos)));
+        color.rgb = lerp(color.rgb, tint.rgb, tint.a * DecoGroundTint * reach);
+    }
+
+    // Large-scale variation (common.fx), shared with the plants: half of it up close, where the layer textures carry
+    // the detail, all of it from ~150 m, where their mips have flattened every layer to one colour
+    float macroReach = lerp(0.5, 1.0, saturate(distance(input.WorldPos, CameraPos) / 150.0));
+    color.rgb *= lerp(1.0.xxx, GroundVariation(input.WorldPos.xz), macroReach);    output.Albedo = float4(color.rgb, 0);
+    output.Normals = float4(terrainNormal.xyz, 1);
     output.Data = float4(0.95, 0.0, 1.0, 1.0); // roughness=very matte, metal=0, ao=1, lit=PBR
     // Write height-offset depth: view-independent bias for consistent SSS shadows.
     float depthHeight = blendedHeight * 0.05;

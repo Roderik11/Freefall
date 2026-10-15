@@ -130,6 +130,7 @@ struct MSOutput
     nointerpolation float InstanceSeed : TEXCOORD7;
     nointerpolation uint SlotIdx : TEXCOORD8;
     nointerpolation float FadeFactor : TEXCOORD9;
+    nointerpolation float3 Variation : TEXCOORD10;    // GroundVariation at the card's root (common.fx)
 };
 
 [outputtopology("triangle")]
@@ -231,11 +232,7 @@ void MS(
     }
 
     // Wind
-    float windInfluence = lp.y * lp.y;
-    float windWave1 = sin(Time * 2.1 + worldPos.x * 0.8 + worldPos.z * 0.6) * 0.12;
-    float windWave2 = sin(Time * 1.4 + worldPos.x * 0.5 - worldPos.z * 0.9) * 0.08;
-    worldPos.x += (windWave1 + windWave2) * windInfluence * scaleH;
-    worldPos.z += (windWave2 - windWave1 * 0.5) * windInfluence * scaleH;
+    worldPos += GrassWind(di.Position, lp.y, scaleH, di.InstanceSeed * 6.2831853);   // the scene wind (common.fx), per card
 
     MSOutput o;
     float4 wp = float4(worldPos, 1.0);
@@ -251,6 +248,7 @@ void MS(
     o.InstanceSeed = di.InstanceSeed;
     o.SlotIdx = di.SlotIdx;
     o.FadeFactor = di.FadeFactor;
+    o.Variation = GroundVariation(di.Position.xz);
     verts[gtid] = o;
 
     if (vertInQuad < 2)
@@ -305,7 +303,7 @@ PSOutput PS(MSOutput input)
         // Apply decorator color tint
         StructuredBuffer<DecoratorSlot> psSlots = ResourceDescriptorHeap[DecoratorSlotsIdx];
         DecoratorSlot psSlot = psSlots[input.SlotIdx];
-        variedBase *= psSlot.HealthyColor;
+        variedBase *= psSlot.HealthyColor * input.Variation;
 
         output.Albedo = float4(variedBase, 0);
         output.Normal = float4(normalize(input.Normal), 1.0); // terrain normal
@@ -511,11 +509,7 @@ void MS_Shadow(
     }
 
     // Wind
-    float windInfluence = lp.y * lp.y;
-    float windWave1 = sin(Time * 2.1 + worldPos.x * 0.8 + worldPos.z * 0.6) * 0.12;
-    float windWave2 = sin(Time * 1.4 + worldPos.x * 0.5 - worldPos.z * 0.9) * 0.08;
-    worldPos.x += (windWave1 + windWave2) * windInfluence * scaleH;
-    worldPos.z += (windWave2 - windWave1 * 0.5) * windInfluence * scaleH;
+    worldPos += GrassWind(di.Position, lp.y, scaleH, di.InstanceSeed * 6.2831853);   // the scene wind (common.fx), per card
 
     ShadowMSOutput o;
     o.Position = mul(float4(worldPos, 1.0), cascadeVP);

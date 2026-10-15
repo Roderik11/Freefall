@@ -18,6 +18,7 @@
 #pragma kernel CS_BuildDrawArgs
 #pragma kernel CS_BinMeshInstances
 #pragma kernel CS_BladeColors
+#pragma kernel CS_DecoratorTints
 
 #include "decoration_noise.hlsli"   // DecoClusterMask, DecoHeightFactor
 
@@ -47,6 +48,7 @@ cbuffer PushConstants : register(b3)
     uint DecoratorGroupsIdx;        // slot 20 — SRV: StructuredBuffer<DecoratorGroup> (spawn kernel)
     uint BladeInstanceUAVIdx;       // slot 21 — UAV: card instances near the camera, drawn as blade clumps
     uint BladeColorsUAVIdx;         // slot 22 — UAV: per card variant, blade colour root → tip (CS_BladeColors)
+    uint DecoratorTintsUAVIdx;      // slot 23 — UAV: per decorator, the colour the ground under it takes (CS_DecoratorTints)
 };
 
 // Camera frustum in terrain-local space (root slot 1 → register b0, uploaded by the terrain quadtree pass).
@@ -753,6 +755,59 @@ void CS_BladeColors(uint3 gid : SV_GroupID, uint gtid : SV_GroupIndex)
         RWStructuredBuffer<float4> colors = ResourceDescriptorHeap[BladeColorsUAVIdx];
         colors[gid.x * COLORS_PER_VARIANT + gtid] = float4(s.a > 0 ? s.rgb / s.a : 0.0.xxx, cover / samples);
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CS_DecoratorTints
+//
+// One thread per decorator: the colour the ground under it takes (gputerrain.fx), as its cards look from afar —
+// each card variant's mean colour (CS_BladeColors' height bands, as the card PS shades it: x 0.8 average
+// brightness x HealthyColor), halved for the shade inside a mass of grass (at full albedo the ground past the
+// grass read as a bright lime band on Eldermoor), weighted by the opaque card area it puts on a square metre of
+// fully covered ground
+// (64 x Density x DecorationDensity instances, two quads of mean W x H, x the texture's coverage). That area,
+// saturated, is the strength: dense grass tints fully, a sparse flower drift barely. Mesh variants do not count.
+// Runs after CS_BladeColors, when the variants change.
+// ═══════════════════════════════════════════════════════════════════════════
+
+[numthreads(64, 1, 1)]
+void CS_DecoratorTints(uint3 dtid : SV_DispatchThreadID)
+{
+    StructuredBuffer<DecoratorGroup> groups = ResourceDescriptorHeap[DecoratorGroupsIdx];
+    StructuredBuffer<DecoratorSlot> slots = ResourceDescriptorHeap[DecoratorSlotsIdx];
+    RWStructuredBuffer<float4> colors = ResourceDescriptorHeap[BladeColorsUAVIdx];
+    RWStructuredBuffer<float4> tints = ResourceDescriptorHeap[DecoratorTintsUAVIdx];
+
+    uint groupCount, stride;
+    groups.GetDimensions(groupCount, stride);
+    if (dtid.x >= groupCount) return;
+
+    DecoratorGroup g = groups[dtid.x];
+    float3 colorSum = 0;
+    float weightSum = 0;
+    for (uint v = 0; v < g.VariantCount; v++)
+    {
+        uint slotIdx = g.VariantOffset + v;
+        DecoratorSlot slot = slots[slotIdx];
+        if (slot.Mode == MODE_MESH || slot.TextureIdx == 0) continue;
+
+        float3 bandColor = 0;
+        float coverage = 0;
+        [unroll] for (uint b = 0; b < BLADE_COLOR_BANDS; b++)
+        {
+            float4 c = colors[slotIdx * COLORS_PER_VARIANT + b];
+            bandColor += c.rgb * c.a;
+            coverage += c.a;
+        }
+        if (coverage <= 0) continue;
+        float3 cardColor = bandColor / coverage * 0.8 * 0.5 * slot.HealthyColor;
+
+        float cardArea = 2.0 * 0.5 * (slot.MinW + slot.MaxW) * 0.5 * (slot.MinH + slot.MaxH) * (coverage / BLADE_COLOR_BANDS);
+        float weight = 64.0 * slot.Density * DecorationDensity * cardArea;
+        colorSum += cardColor * weight;
+        weightSum += weight;
+    }
+    tints[dtid.x] = float4(weightSum > 0 ? colorSum / weightSum : 0.0.xxx, saturate(weightSum));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

@@ -212,6 +212,14 @@ namespace Freefall.Assets
 
         public float DecorationRadius = 100f;
 
+        /// <summary>
+        /// How strongly the ground under decorators takes their colour (0 = off): full from about the decoration
+        /// radius out, where the cards end, a third of it near the camera, where the plants themselves show. Without
+        /// it the far ground keeps its own (mip-averaged, often greyer) colour and the edge of the grass is a line.
+        /// </summary>
+        [ValueRange(0f, 1f)]
+        public float DecorationGroundTint = 0.8f;
+
         public bool DrawDetail = true;
 
         // ── HeightField — built internally from Heightmap ──

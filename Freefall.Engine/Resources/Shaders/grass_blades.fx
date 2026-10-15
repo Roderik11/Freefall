@@ -115,13 +115,14 @@ void MS(
 
     StructuredBuffer<DecoratorSlot> slots = ResourceDescriptorHeap[DecoratorSlotsIdx];
     DecoratorSlot slot = slots[di.SlotIdx];
+    float3 variation = GroundVariation(di.Position.xz);     // the ground's large-scale variation (common.fx)
 
     for (uint vi = gtid; vi < vertCount; vi += MS_THREADS)
     {
         BladeVertexData bv = BladeVertex(di, slot, vi / (2 * segs + 1), vi % (2 * segs + 1), segs, dist);
         MSOutput o;
         o.Position = mul(float4(bv.WorldPos, 1.0), ViewProjection);
-        o.Color = bv.Color;
+        o.Color = bv.Color * variation;
         o.BladeNormal = bv.BladeNormal;
         o.TerrainNormal = di.TerrainNormal;
         o.Depth = o.Position.w;

@@ -151,6 +151,10 @@ namespace Freefall.Components
                 pair.Value.SetParameter("CamPos", cameraPos);
                 pair.Value.SetParameter("PickPixel", PickHolePixel);
                 pair.Value.SetParameter("PickThroughBones", PickHoleBones);
+                pair.Value.SetParameter("WindDirection", Graphics.Wind.Direction);
+                pair.Value.SetParameter("WindStrength", Graphics.Wind.Strength);
+                pair.Value.SetParameter("WindPhase", Graphics.Wind.Phase);
+                pair.Value.SetParameter("WindOffset", Graphics.Wind.Offset);
 
                 // Atmosphere scattering parameters
                 pair.Value.SetParameter("SkyTintColor", SkyboxRenderer.CurrentSkyTintColor);

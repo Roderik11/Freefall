@@ -45,6 +45,72 @@ cbuffer SceneConstants : register(b0)
     float2 PickPixel;                  // centre of the pixel the pick reads this frame
     float2 _pickPad;
     uint4 PickThroughBones;            // bone buffers (InstanceDescriptor.BoneBufferIdx) of the one character that leaves that pixel open; 0 = unused
+
+    // ── Wind (Graphics.Wind: the environment preset's, else a light breeze) — sways grass, flowers, leaves ──
+    float3 WindDirection;              // horizontal unit vector the wind blows towards; zero in a calm
+    float WindStrength;                // m/s
+    float WindPhase;                   // sway and flutter: integral of their speed, so a change of strength never jumps
+    float2 WindOffset;                 // how far the air has moved (m), wrapped every 200 m: scrolls the gust pattern
+}
+
+// Gusts at a place, 0..1: two waves of fixed direction (about 24 and 37 m long) scrolled downwind by WindOffset, so
+// they roll with the wind. Their wave numbers are whole multiples of 2π / 200 m, so the offset's wrap is invisible.
+// Never a wave over dot(position, WindDirection): far from the origin it races whenever the wind turns.
+float GustPattern(float2 p)
+{
+    float2 q = p - WindOffset;
+    return 0.5 + 0.25 * (sin(dot(q, float2(0.2513, 0.0628))) + sin(dot(q, float2(-0.0628, 0.1571))));
+}
+
+// ── Large-scale variation of the ground and what grows on it (gputerrain.fx, grass cards, blades, flowers) ──
+
+float MacroHash(float2 p)
+{
+    return frac(sin(dot(p, float2(127.1, 311.7))) * 43758.5453);
+}
+
+float MacroNoise(float2 p)
+{
+    float2 i = floor(p);
+    float2 f = frac(p);
+    f = f * f * (3.0 - 2.0 * f);
+    float a = MacroHash(i), b = MacroHash(i + float2(1, 0)), c = MacroHash(i + float2(0, 1)), d = MacroHash(i + float2(1, 1));
+    return lerp(lerp(a, b, f.x), lerp(c, d, f.x), f.y);
+}
+
+// Colour multiplier at a place: patches tens to hundreds of metres across that are a little lighter or darker and
+// drier (yellower) or lusher. The terrain and the plants on it take the same field, so a dry patch carries on from
+// the grass into the bare ground past the decoration radius, and far meadows are no longer one flat colour.
+float3 GroundVariation(float2 xz)
+{
+    float n1 = MacroNoise(xz / 18.0);
+    float n2 = MacroNoise(xz / 55.0 + 17.3);
+    float n3 = MacroNoise(xz / 240.0 + 41.7);
+    // Value noise seldom leaves the middle: summed as is, the field moved only ~±8% (invisible on Eldermoor).
+    // Stretched into patches instead, carried mostly by the smaller scales: with 100–300 m patches a whole view
+    // sat inside one or two of them and still read as one colour.
+    float patches = smoothstep(0.3, 0.7, n1) * 0.35 + smoothstep(0.3, 0.7, n2) * 0.4 + smoothstep(0.3, 0.7, n3) * 0.25;
+    float brightness = 1.0 + (patches - 0.5) * 0.6;                                             // ~0.7 .. 1.3
+    float dry = smoothstep(0.35, 0.65, n2 * 0.6 + n3 * 0.4);
+    return brightness * lerp(float3(0.88, 1.0, 0.92), float3(1.22, 1.05, 0.72), dry);
+}
+
+// How a grass blade, card or flower stem sways at height fraction t of a part 'height' tall rooted at 'root': a
+// lean downwind that grows with the wind and with the gusts rolling through (GustPattern), and a flutter across it
+// that never quite stops. 'phase' (0..2π) keeps neighbours apart. Same in the shadow passes.
+// Every oscillation runs on WindPhase / WindOffset, never Time x a wind-dependent frequency: that jumps by tens of
+// radians while the wind changes (preset transitions) and scrubs the animation.
+float3 GrassWind(float3 root, float t, float height, float phase)
+{
+    float s = saturate(WindStrength / 12.0);                                    // calm .. gale
+    float2 dir = WindDirection.xz;
+    float2 across = float2(-dir.y, dir.x);
+    float gust = GustPattern(root.xz);
+    float lean = s * (0.25 + 0.75 * gust) * 0.6;
+    float flutter = sin(WindPhase * 5.0 + root.x * 1.3 + root.z * 0.9 + phase) * (0.03 + 0.06 * s);
+    float calm = saturate(1.0 - WindStrength / 0.5);                           // no direction to flutter across
+    float2 offset = dir * lean + across * flutter * (1.0 - calm) + float2(flutter, flutter * 0.5) * calm;
+    return float3(offset.x, -0.3 * lean * lean, offset.y) * (t * t * height);   // bending over costs a little height
 }
 
 // Material data for bindless texture lookup via Material ID indirection

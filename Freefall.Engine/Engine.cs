@@ -186,6 +186,7 @@ namespace Freefall
             TickCount++;
 
             Time.Update();
+            Graphics.Wind.Advance(Time.Delta);
             Input.Update();
 
             // Release GPU buffers from previous batch resizes (deferred N frames for safety)

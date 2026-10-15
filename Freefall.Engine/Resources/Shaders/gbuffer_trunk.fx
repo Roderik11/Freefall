@@ -61,10 +61,15 @@ struct VSOutput
 // Low-frequency trunk sway
 float3 TrunkSway(float3 worldPos, float weight)
 {
-    float phase = Time * 0.8 + worldPos.x * 0.05 + worldPos.z * 0.07;
+    // In the scene wind (common.fx): sways harder the stronger it blows and leans downwind with the gusts, like the
+    // leaves (gbuffer_foliage.fx WindDisplacement); in a calm only the slow sway is left
+    float s = saturate(WindStrength / 12.0);
+    float phase = WindPhase * 0.7 + worldPos.x * 0.05 + worldPos.z * 0.07;
     float swayX = sin(phase) * 0.25 + sin(phase * 1.7) * 0.1;
     float swayZ = sin(phase * 0.9 + 1.5) * 0.2;
-    return float3(swayX, 0, swayZ) * weight;
+    float calm = saturate(1.0 - WindStrength / 0.5);
+    float2 lean = WindDirection.xz * s * 0.6 * (0.5 + GustPattern(worldPos.xz)) * (1.0 - calm);
+    return float3(swayX * (0.5 + s) + lean.x, 0, swayZ * (0.5 + s) + lean.y) * weight;
 }
 
 VSOutput VS(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_InstanceID)

@@ -186,6 +186,9 @@ namespace Freefall.Components
             var wind = _current.WindVector;
             var camPos = Camera.Main?.Position ?? Vector3.Zero;
 
+            // Vegetation sways in the preset's wind (grass, flowers, leaves; Graphics.Wind)
+            Graphics.Wind.Velocity = wind;
+
             // Every other emitter takes the share of it that its WeatherWind asks for (flames, smoke)
             Graphics.ParticleSystem.WeatherWind = DriveWind ? wind : Vector3.Zero;
 
@@ -236,6 +239,7 @@ namespace Freefall.Components
             if (_target == null) return;
             _target = null;
             Graphics.ParticleSystem.WeatherWind = Vector3.Zero;
+            Graphics.Wind.Velocity = Graphics.Wind.DefaultVelocity;
             if (_lastRain != null) ReleaseEmitter(_lastRain);
             if (_lastSnow != null) ReleaseEmitter(_lastSnow);
             if (_lastHail != null) ReleaseEmitter(_lastHail);

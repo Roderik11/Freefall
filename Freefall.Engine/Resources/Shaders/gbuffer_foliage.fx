@@ -64,17 +64,27 @@ struct VSOutput
     float3 DomeNormal : TEXCOORD7;  // original look (mostly up) — used for materials that have a normal map
 };
 
-// Wind animation helpers
+// Wind animation helpers. The scene wind (common.fx): the crown leans downwind with the gusts rolling through
+// (GustPattern) and sways harder the stronger it blows; leaves flutter faster. In a calm only a slow idle sway is left.
 float3 WindDisplacement(float3 worldPos, float strength)
 {
-    float phase = Time + worldPos.x * 0.15 + worldPos.z * 0.12;
+    float s = saturate(WindStrength / 12.0);
+    float2 dir = WindDirection.xz;
+    float2 across = float2(-dir.y, dir.x);
+    float phase = WindPhase + worldPos.x * 0.15 + worldPos.z * 0.12;
     float sway = sin(phase * 1.2) * 0.3 + sin(phase * 2.7) * 0.15;
-    
-    // High-frequency flutter for leaves
-    float flutter = sin(phase * 5.3 + worldPos.y * 3.0) * 0.08
-                  + sin(phase * 7.1 + worldPos.z * 4.0) * 0.05;
-    
-    return float3(sway + flutter, flutter * 0.3, sway * 0.5 + flutter) * strength;
+    float gust = GustPattern(worldPos.xz);
+
+    // High-frequency flutter for leaves; on WindPhase, which speeds up with the wind without jumping (Time x a
+    // wind-dependent rate scrubbed the animation while the wind changed)
+    float flutterTime = WindPhase * 1.25 + worldPos.x * 0.15 + worldPos.z * 0.12;
+    float flutter = (sin(flutterTime * 5.3 + worldPos.y * 3.0) * 0.08
+                   + sin(flutterTime * 7.1 + worldPos.z * 4.0) * 0.05) * (0.5 + s);
+
+    float calm = saturate(1.0 - WindStrength / 0.5);                           // no direction to push along
+    float2 h = (dir * (s * 0.8 * (0.5 + gust) + sway * (0.4 + 1.2 * s)) + across * sway * 0.3) * (1.0 - calm)
+             + float2(sway, sway * 0.5) * 0.3 * calm;
+    return float3(h.x + flutter, flutter * 0.3, h.y + flutter) * strength;
 }
 
 VSOutput VS(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_InstanceID)
