@@ -6,15 +6,18 @@
 //   1. CS_SpawnInstances:     single-pass: camera-centered grid → instance placement + cull → append.
 //                             The control texture names decorators (coverage only); each decorator is a
 //                             group of variants, and density + clumping are evaluated per variant here.
-//   2. CS_BuildDrawArgs:      reads append counter → writes DispatchMesh indirect args
+//                             Card instances near the camera go to a separate buffer, drawn as blade clumps.
+//   2. CS_BuildDrawArgs:      reads append counters → writes DispatchMesh indirect args (cards, blade clumps)
+//   3. CS_BladeColors:        per card variant, blade colour root → tip from its texture (when variants change)
 //
-// Output: StructuredBuffer<DecoInstance> consumed by the lean AS/MS in grass.fx
+// Output: StructuredBuffer<DecoInstance> consumed by the lean AS/MS in grass.fx and grass_blades.fx
 // ═══════════════════════════════════════════════════════════════════════════
 
 #pragma kernel CS_BakeTerrainNormals
 #pragma kernel CS_SpawnInstances
 #pragma kernel CS_BuildDrawArgs
 #pragma kernel CS_BinMeshInstances
+#pragma kernel CS_BladeColors
 
 #include "decoration_noise.hlsli"   // DecoClusterMask, DecoHeightFactor
 
@@ -42,6 +45,15 @@ cbuffer PushConstants : register(b3)
     uint DrawMeshRegSRVIdx;         // slot 18 — SRV: → draw cmd slot 7
     uint DrawMaterialsSRVIdx;       // slot 19 — SRV: → draw cmd slot 14
     uint DecoratorGroupsIdx;        // slot 20 — SRV: StructuredBuffer<DecoratorGroup> (spawn kernel)
+    uint BladeInstanceUAVIdx;       // slot 21 — UAV: card instances near the camera, drawn as blade clumps
+    uint BladeColorsUAVIdx;         // slot 22 — UAV: per card variant, blade colour root → tip (CS_BladeColors)
+};
+
+// Camera frustum in terrain-local space (root slot 1 → register b0, uploaded by the terrain quadtree pass).
+// Normals point out: a point is outside a plane when dot(n, p) + w > 0.
+cbuffer FrustumPlanes : register(b0)
+{
+    float4 Planes[6];
 };
 
 // Hi-Z occlusion parameters (root slot 2 → register b1, shared with terrain_quadtree.hlsl)
@@ -112,7 +124,8 @@ cbuffer DecoParams : register(b4)
     float  TileSize;
     float3 TerrainOrigin;
     float  DecorationDensity;
-    float2 CamFwd;
+    float  DecoReach;           // farthest any decorator reaches from its root (m)
+    float  _decoPad;
     uint   ControlWidth;
     uint   ControlHeight;
     uint   SlotCount;
@@ -120,7 +133,28 @@ cbuffer DecoParams : register(b4)
     int    BaseTileZ;
     uint   MaxInstances;
     uint2  HeightmapSize;
+    float3 ShadowSweep;         // light direction x longest decorator shadow (0 = shadows off)
+    uint   GridSize;            // cells per side of the dispatch (odd: the camera's cell in the middle)
+    float  BladeDistance;       // card instances closer than this (m, per-instance band) become blade clumps; 0 = off
+    uint   MaxBladeInstances;
 };
+
+#define BLADE_CLUMPS_PER_AS 32  // grass_blades.fx: one AS group launches this many clump MS groups
+#define BLADE_COLOR_BANDS 4     // grass_blades.fx: blade colour bands, root to tip
+
+// True when a sphere (terrain-local), or the shadow it throws along ShadowSweep, can reach the camera frustum.
+bool CellInFrustum(float3 center, float radius)
+{
+    [unroll]
+    for (uint i = 0; i < 6; i++)
+    {
+        float d = dot(Planes[i].xyz, center) + Planes[i].w;
+        float dSwept = d + dot(Planes[i].xyz, ShadowSweep);
+        if (min(d, dSwept) > radius)
+            return false;
+    }
+    return true;
+}
 
 // ─── GPU structs (must match grass.fx and TerrainRenderer.cs) ──────────────
 
@@ -146,7 +180,7 @@ struct DecoratorSlot
     float Rot20, Rot21, Rot22;
     float SlopeBias;
     uint Seed;                  // decorrelates this variant's scatter and noise fields from the others
-    uint _unused0;
+    uint BladesNearCamera;      // 1 = near the camera this card variant is drawn as blade clumps (grass_blades.fx)
     uint Mode;
     uint TextureIdx;
     float3 HealthyColor;
@@ -275,8 +309,9 @@ void CS_BakeTerrainNormals(uint3 dtid : SV_DispatchThreadID)
 // ═══════════════════════════════════════════════════════════════════════════
 // CS_SpawnInstances — Single-pass instance spawning
 //
-// Dispatch(N, N, 1) where N = cells per side around camera.
-// Each group = one cell. [8,8,1] = 64 threads cooperate per cell.
+// Dispatch(N, N, 1) where N = GridSize = cells per side around the camera, walked as a spiral from its cell.
+// Each group = one cell, culled as a whole against the camera frustum and Hi-Z. [8,8,1] = 64 threads
+// cooperate per cell.
 // Thread 0 turns the cell's control data into a list of (variant, instance count) entries in
 // groupshared; all threads read from there. Doing the per-variant clump noise once per cell rather
 // than once per thread is what keeps it cheap.
@@ -290,14 +325,34 @@ groupshared uint  gs_entryCount[MAX_CELL_ENTRIES];   // instances to spawn in th
 groupshared float gs_entryWeight[MAX_CELL_ENTRIES];  // cubed cell weight, 0..1
 groupshared uint  gs_entries;
 
+// The i-th cell of a square spiral around the centre cell: ring k holds the 8k cells at Chebyshev distance k.
+int2 SpiralCell(uint i)
+{
+    if (i == 0) return int2(0, 0);
+    uint k = (uint)((sqrt((float)i) + 1.0) * 0.5);
+    if ((2 * k + 1) * (2 * k + 1) <= i) k++;            // float rounding at ring boundaries
+    if ((2 * k - 1) * (2 * k - 1) > i) k--;
+    uint j = i - (2 * k - 1) * (2 * k - 1);             // 0 .. 8k-1 along the ring
+    uint side = j / (2 * k);
+    int t = int(j % (2 * k));
+    int r = int(k);
+    if (side == 0) return int2(-r + t, -r);
+    if (side == 1) return int2(r, -r + t);
+    if (side == 2) return int2(r - t, r);
+    return int2(-r, r - t);
+}
+
 [numthreads(8, 8, 1)]
 void CS_SpawnInstances(uint3 gid : SV_GroupID, uint3 gtid3 : SV_GroupThreadID)
 {
     uint flatThread = gtid3.y * 8 + gtid3.x;  // 0..63
 
-    // Map group to world-space cell via base offset (camera-centered grid)
-    int cellX = BaseTileX + int(gid.x);
-    int cellZ = BaseTileZ + int(gid.y);
+    // Near cells first: groups launch in order, so the n-th group takes the n-th cell of a spiral around the
+    // camera's cell and the instances come out roughly near-to-far. Alpha-tested grass gets little early-Z, but
+    // far-to-near still cost ~7% more on Eldermoor (2026-10-15); the plain grid was far-to-near looking south.
+    int2 spiral = SpiralCell(gid.y * GridSize + gid.x);
+    int cellX = BaseTileX + int(GridSize / 2) + spiral.x;
+    int cellZ = BaseTileZ + int(GridSize / 2) + spiral.y;
 
     // Control texture (dimensions from cbuffer)
     Texture2DArray<uint4> controlTex = ResourceDescriptorHeap[DecoControlIdx];
@@ -318,15 +373,6 @@ void CS_SpawnInstances(uint3 gid : SV_GroupID, uint3 gtid3 : SV_GroupThreadID)
     bool tileValid = (cx >= 0 && cx < int(ControlWidth) && cy >= 0 && cy < int(ControlHeight))
                   && (dx2 * dx2 + dz2 * dz2 <= maxR * maxR);
 
-    // Half-space cull: reject tiles behind the camera.
-    // dot > -0.2 keeps ~100° behind-camera margin for scatter overshoot.
-    if (tileValid)
-    {
-        float len = sqrt(dx2 * dx2 + dz2 * dz2);
-        if (len > ts)   // skip tiles directly under the camera
-            tileValid = (dx2 * CamFwd.x + dz2 * CamFwd.y) / len > -0.2;
-    }
-
     // ── Thread 0 reads BAKED control texture and populates groupshared ──
     // The baked control texture (RGBA16_UINT, 2 slices) was built by decoration_prepass.hlsl.
     // Each channel packs (decoratorSlot << 8) | coverage. Up to 8 decorators per texel.
@@ -335,18 +381,17 @@ void CS_SpawnInstances(uint3 gid : SV_GroupID, uint3 gtid3 : SV_GroupThreadID)
     {
         gs_entries = 0;
 
-        // Hi-Z occlusion cull (thread 0 only): skip cells fully behind solid geometry
-        if (tileValid && HiZSrvIdx != 0)
+        // Cull the cell (thread 0 only) against the camera frustum, then against last frame's Hi-Z. Both take
+        // terrain-local positions. The frustum sphere sits on the ground at the cell centre and holds the largest
+        // decorator; two cells of slack cover the slope across the cell.
+        if (tileValid)
         {
             Texture2D heightTex2 = ResourceDescriptorHeap[HeightmapIdx];
-            float2 cellUV = float2(
-                (tileWorldX - TerrainOrigin.x) / TerrainSize.x,
-                (tileWorldZ - TerrainOrigin.y) / TerrainSize.y
-            );
-            float h = heightTex2.SampleLevel(HeightSampler, cellUV, 2).r * MaxHeight;
-            float3 sphereCenter = float3(tileWorldX, TerrainOrigin.z + h, tileWorldZ);
-            float sphereRadius = ts * 0.707 + MaxHeight * 0.05;
-            if (IsCellOccluded(sphereCenter, sphereRadius))
+            float2 cellLocal = (float2(cellX, cellZ) + 0.5) * ts;
+            float h = heightTex2.SampleLevel(HeightSampler, cellLocal / TerrainSize, 0).r * MaxHeight;
+            if (!CellInFrustum(float3(cellLocal.x, h + 0.5 * DecoReach, cellLocal.y), 2.0 * ts + DecoReach))
+                tileValid = false;
+            else if (HiZSrvIdx != 0 && IsCellOccluded(float3(cellLocal.x, h, cellLocal.y), ts * 0.707 + MaxHeight * 0.05))
                 tileValid = false;
         }
 
@@ -516,6 +561,18 @@ void CS_SpawnInstances(uint3 gid : SV_GroupID, uint3 gtid3 : SV_GroupThreadID)
             }
             else
             {
+                // Near the camera a grass card is drawn as a clump of blades instead (grass_blades.fx). Each
+                // instance switches at its own distance within ±15% of BladeDistance, so the hand-over has no ring.
+                if (slot.BladesNearCamera != 0 && camDist < BladeDistance * (0.85 + 0.3 * frac(instanceSeedVal * 13.37)))
+                {
+                    uint bladeIdx;
+                    instCounter.InterlockedAdd(8, 1, bladeIdx);
+                    if (bladeIdx >= MaxBladeInstances) continue;
+                    RWStructuredBuffer<DecoInstance> bladeBuffer = ResourceDescriptorHeap[BladeInstanceUAVIdx];
+                    bladeBuffer[bladeIdx] = di;
+                    continue;
+                }
+
                 // Billboard/Cross → main buffer, counter at offset 0
                 uint outIdx;
                 instCounter.InterlockedAdd(0, 1, outIdx);
@@ -551,6 +608,67 @@ void CS_BuildDrawArgs(uint3 dtid : SV_DispatchThreadID)
     uint meshCount = instCounter.Load(4);
     meshCount = min(meshCount, MaxInstances);
     argsBuffer.Store(12, meshCount);
+
+    // Blade clumps: DispatchMesh args at offset 16. Every AS group launches BLADE_CLUMPS_PER_AS clumps, so the
+    // last group's tail is padded with empty instances (zero scale), which the MS skips.
+    uint bladeCount = min(instCounter.Load(8), MaxBladeInstances);
+    uint bladeGroups = (bladeCount + BLADE_CLUMPS_PER_AS - 1) / BLADE_CLUMPS_PER_AS;
+    argsBuffer.Store(16, bladeGroups);
+    argsBuffer.Store(20, 1u);
+    argsBuffer.Store(24, 1u);
+    RWStructuredBuffer<DecoInstance> blades = ResourceDescriptorHeap[BladeInstanceUAVIdx];
+    for (uint pad = bladeCount; pad < bladeGroups * BLADE_CLUMPS_PER_AS; pad++)
+        blades[pad] = (DecoInstance)0;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CS_BladeColors
+//
+// One group per decorator variant: the colour its blade clumps take, root to tip, from its card texture — the
+// alpha-weighted mean of the texels in BLADE_COLOR_BANDS height bands (w = coverage). Read at full resolution on a
+// 128 x 128 grid: the transparent texels of the grass cards are near-black, so any mip would darken the mean.
+// Runs when the variants change.
+// ═══════════════════════════════════════════════════════════════════════════
+
+groupshared float4 gs_bandSum[BLADE_COLOR_BANDS][64];
+
+[numthreads(64, 1, 1)]
+void CS_BladeColors(uint3 gid : SV_GroupID, uint gtid : SV_GroupIndex)
+{
+    StructuredBuffer<DecoratorSlot> slots = ResourceDescriptorHeap[DecoratorSlotsIdx];
+    DecoratorSlot slot = slots[gid.x];
+
+    float4 sums[BLADE_COLOR_BANDS];
+    [unroll] for (uint b = 0; b < BLADE_COLOR_BANDS; b++) sums[b] = 0;
+
+    if (slot.Mode != MODE_MESH && slot.TextureIdx != 0)
+    {
+        Texture2D tex = ResourceDescriptorHeap[slot.TextureIdx];
+        uint w, h, mips;
+        tex.GetDimensions(0, w, h, mips);
+        for (uint row = gtid; row < 128; row += 64)
+        {
+            uint y = (row * h + h / 2) / 128;                               // row 0 = top of the card = tips
+            uint band = min(BLADE_COLOR_BANDS - 1, (127 - row) * BLADE_COLOR_BANDS / 128);
+            for (uint col = 0; col < 128; col++)
+            {
+                float4 c = tex.Load(int3((col * w + w / 2) / 128, y, 0));
+                [unroll] for (uint b2 = 0; b2 < BLADE_COLOR_BANDS; b2++)
+                    if (b2 == band) sums[b2] += float4(c.rgb * c.a, c.a);
+            }
+        }
+    }
+
+    [unroll] for (uint b3 = 0; b3 < BLADE_COLOR_BANDS; b3++) gs_bandSum[b3][gtid] = sums[b3];
+    GroupMemoryBarrierWithGroupSync();
+
+    if (gtid < BLADE_COLOR_BANDS)
+    {
+        float4 s = 0;
+        for (uint t = 0; t < 64; t++) s += gs_bandSum[gtid][t];
+        RWStructuredBuffer<float4> colors = ResourceDescriptorHeap[BladeColorsUAVIdx];
+        colors[gid.x * BLADE_COLOR_BANDS + gtid] = float4(s.a > 0 ? s.rgb / s.a : 0.0.xxx, s.a / (128.0 * 128.0 / BLADE_COLOR_BANDS));
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

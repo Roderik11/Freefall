@@ -553,6 +553,18 @@ namespace Freefall
          [ValueRange(0f, 5f)]
          public float RCIntensity { get; set; } = 1.0f;
 
+         /// <summary>
+         /// Card grass (cross / billboard decorators) closer than this many metres is drawn as clumps of
+         /// procedural blades instead (grass_blades.fx), each instance switching within ±15% of it. 0 = cards
+         /// everywhere. Prototype (2026-10-15): near cards cost the most, being mostly transparent pixels.
+         /// </summary>
+         [Category("Grass")]
+         [ValueRange(0f, 40f)]
+         public float GrassBladeDistance { get; set; } = 0f;
+
+         [ValueRange(1, 28)]
+         public int GrassBladesPerClump { get; set; } = 24;
+
          [Category("Debug")]
          public DebugVizMode DebugVisualizationMode { get; set; } = DebugVizMode.Off; // F5 - Debug viz
          public int RCDebugSubMode { get; set; } = 1;                       // 0=off, 1=tile lookup, 2=per-level radiance, 3=constant bypass, 4=raw pool readback

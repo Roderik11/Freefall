@@ -45,6 +45,13 @@ namespace Freefall.Assets
         public Texture Texture;
 
         /// <summary>
+        /// Billboard/Cross mode: closer than Settings › Grass › Blade distance, draw this variant as a clump of
+        /// procedural blades (coloured from its texture) instead of the card. For grass; flowers and other cards
+        /// a clump of blades cannot stand in for stay off.
+        /// </summary>
+        public bool BladesNearCamera = false;
+
+        /// <summary>
         /// Random seed (0..255) for this variant's scatter positions, clumps and height patches.
         /// Variants with the same seed and settings land on the same spots; changing it reshuffles
         /// this variant without touching the others.

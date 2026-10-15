@@ -106,6 +106,7 @@ namespace Freefall.Editor.Commands
                 visibleCount = CommandBuffer.Culler?.LastVisibleCount ?? 0,
                 occludedCount = CommandBuffer.Culler?.LastHiZOccludedCount ?? 0,
                 grassInstanceCount = Freefall.Components.TerrainRenderer.LastInstanceCount,
+                bladeClumpCount = Freefall.Components.TerrainRenderer.LastBladeInstanceCount,
                 meshInstanceCount = Freefall.Components.TerrainRenderer.LastMeshInstanceCount,
                 meshDrawCount = Freefall.Components.TerrainRenderer.LastMeshDrawCount,
                 meshRegistryCount = MeshRegistry.Count, // sub-batch ids: GPU culler buffers hold MaxSubBatches (4096)

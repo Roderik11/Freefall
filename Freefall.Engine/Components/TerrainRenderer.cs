@@ -147,6 +147,7 @@ namespace Freefall.Components
         private GraphicsBuffer? _decoratorGroupsBuffer;  // one (variant offset, count) per decorator slot
         private int _decoSlotCapacity, _decoLodCapacity, _decoGroupCapacity;
         private int _decoVariantCount;
+        private float _decoMaxReach;  // farthest any decorator reaches from its root (m): sizes the spawn's cell cull sphere
         private bool _decoratorBuffersBuilt;
         private bool _decoratorDispatched;
 
@@ -157,8 +158,8 @@ namespace Freefall.Components
         private ComputeShader? _grassCS;
         private int _kBakeNormals, _kSpawnInstances, _kBuildDecoDrawArgs, _kBinMeshInstances;
         private GraphicsBuffer? _decoInstanceBuffer;    // StructuredBuffer<DecoInstance> = 64 bytes
-        private GraphicsBuffer? _instanceCounterBuffer; // RWByteAddressBuffer (2 uints: billboard count + mesh count)
-        private GraphicsBuffer? _decoDispatchArgsBuffer; // RWByteAddressBuffer (4 uints: 3 for DispatchMesh + 1 mesh count)
+        private GraphicsBuffer? _instanceCounterBuffer; // RWByteAddressBuffer (3 uints: card, mesh, blade clump counts)
+        private GraphicsBuffer? _decoDispatchArgsBuffer; // RWByteAddressBuffer (7 uints: card DispatchMesh, mesh count, blade DispatchMesh at 16)
         private bool _decoBuffersCreated;
         private bool _decoDispatchLogged;
         private int _maxDecoInstances;
@@ -170,8 +171,18 @@ namespace Freefall.Components
         private GraphicsBuffer? _meshDrawCountBuffer;       // RWByteAddressBuffer (1 uint: draw count)
         private Material? _meshDecoratorMaterial;           // grass_mesh.fx
 
+        // ───── Blade Clumps (card grass near the camera, grass_blades.fx) ─────
+        private const int MaxBladeInstances = 128 * 1024;
+        private const int BladeColorBands = 4;              // = BLADE_COLOR_BANDS in the shaders
+        private GraphicsBuffer? _bladeInstanceBuffer;       // DecoInstance, 64 bytes; padded to whole AS groups
+        private GraphicsBuffer? _bladeColorBuffer;          // float4 per variant x BladeColorBands (CS_BladeColors)
+        private bool _bladeColorsDirty = true;
+        private Material? _bladeMaterial;
+        private int _kBladeColors;
+
         // ───── Debug Stats (read by editor SettingsControls) ─────────────
         public static int LastInstanceCount { get; set; }
+        public static int LastBladeInstanceCount { get; set; }
         public static int LastMeshInstanceCount { get; set; }
         public static int LastMeshDrawCount { get; set; }
         public static int LastMaxInstances { get; set; }
@@ -388,6 +399,10 @@ namespace Freefall.Components
             device?.DeferDispose(_sortedMeshInstanceBuffer);
             device?.DeferDispose(_meshDrawArgsBuffer);
             device?.DeferDispose(_meshDrawCountBuffer);
+
+            // ── Blade clumps ──
+            device?.DeferDispose(_bladeInstanceBuffer);
+            device?.DeferDispose(_bladeColorBuffer);
 
             // ── Compute shaders (pipeline states + their constant buffers) ──
             device?.DeferDispose(_quadtreeCS);
@@ -1701,7 +1716,7 @@ namespace Freefall.Components
             public float Rot20, Rot21, Rot22;
             public float SlopeBias;  // 0=upright, 1=fully slope-aligned
             public uint Seed;             // decorrelates this variant's scatter and noise from the others
-            public uint _unused0;
+            public uint BladesNearCamera; // 1 = blade clumps instead of cards near the camera (grass_blades.fx)
             public uint Mode;             // 0=Mesh, 1=Billboard, 2=Cross
             public uint TextureIdx;       // bindless index (billboard/cross)
             // Color tint (Unity detail prototype healthy/dry colors)
@@ -1753,6 +1768,7 @@ namespace Freefall.Components
             var slots = new List<DecoratorSlotGPU>();
             var groups = new List<DecoratorGroupGPU>();
             var lodTable = new List<LODTableEntry>();
+            float maxReach = 0;
 
             foreach (var decorator in _decoratorPalette)
             {
@@ -1813,6 +1829,18 @@ namespace Freefall.Components
                         lodCount = 1;
                     }
 
+                    // How far the variant reaches from its root at its largest: cards go up by H (plus wind sway)
+                    // and out by W/2; a mesh is scaled by (W, H, W). Height noise stretches H by up to 1.4x.
+                    float maxH = variant.HeightRange.Y * (1f + 0.4f * Math.Clamp(variant.HeightNoiseAmount, 0f, 1f));
+                    float maxW = variant.WidthRange.Y;
+                    float reach = 1.3f * maxH + 0.5f * maxW;
+                    if (mode == DecoratorMode.Mesh)
+                    {
+                        var bounds = variant.Mesh!.LocalBoundingSphere;
+                        reach = (new Vector3(bounds.X, bounds.Y, bounds.Z).Length() + bounds.W) * MathF.Max(maxH, maxW) * 1.2f;
+                    }
+                    maxReach = MathF.Max(maxReach, reach);
+
                     float degToRad = MathF.PI / 180f;
                     float rx = variant.RootRotation.X * degToRad;
                     float ry = variant.RootRotation.Y * degToRad;
@@ -1835,6 +1863,7 @@ namespace Freefall.Components
                         Rot20 = cx*sy*cz + sx*sz,   Rot21 = cx*sy*sz - sx*cz,   Rot22 = cx*cy,
                         SlopeBias = variant.SlopeBias,
                         Seed = (uint)Math.Clamp(variant.Seed, 0, 255),
+                        BladesNearCamera = variant.BladesNearCamera && mode != DecoratorMode.Mesh ? 1u : 0u,
                         Mode = (uint)mode,
                         TextureIdx = textureIdx,
                         HealthyColor = new Vector3(variant.HealthyColor.X, variant.HealthyColor.Y, variant.HealthyColor.Z),
@@ -1897,7 +1926,17 @@ namespace Freefall.Components
             }
 
             _decoVariantCount = slots.Count;
+            _decoMaxReach = maxReach;
             _decoratorBuffersBuilt = true;
+
+            // Blade colours are taken from the variants' textures again (CS_BladeColors, next decorator dispatch)
+            int bladeColorCount = Math.Max(1, slots.Count) * BladeColorBands;
+            if (_bladeColorBuffer == null || _bladeColorBuffer.ElementCount != bladeColorCount)
+            {
+                Engine.Device.DeferDispose(_bladeColorBuffer);
+                _bladeColorBuffer = GraphicsBuffer.CreateStructured(bladeColorCount, 16, srv: true, uav: true);
+            }
+            _bladeColorsDirty = true;
         }
 
         private static void Refill<T>(GraphicsBuffer buffer, List<T> data) where T : unmanaged
@@ -2085,8 +2124,9 @@ namespace Freefall.Components
             _maxDecoInstances = Math.Min(maxTiles * 8, 1024 * 1024); // cap at 1M
 
             _decoInstanceBuffer = GraphicsBuffer.CreateStructured(_maxDecoInstances, 64, srv: true, uav: true); // 64 bytes per DecoInstance
-            _instanceCounterBuffer = GraphicsBuffer.CreateRaw(2, uav: true, clearable: true); // 2 uints: billboard + mesh counts
-            _decoDispatchArgsBuffer = GraphicsBuffer.CreateRaw(4, uav: true); // 4 uints: 3 DispatchMesh args + 1 mesh count
+            _instanceCounterBuffer = GraphicsBuffer.CreateRaw(3, uav: true, clearable: true); // card, mesh, blade clump counts
+            _decoDispatchArgsBuffer = GraphicsBuffer.CreateRaw(7, uav: true); // card DispatchMesh (3), mesh count, blade DispatchMesh (3)
+            _bladeInstanceBuffer = GraphicsBuffer.CreateStructured(MaxBladeInstances, 64, srv: true, uav: true);
 
             // Mesh-mode decorator buffers
             _meshDecoInstanceBuffer = GraphicsBuffer.CreateStructured(_maxDecoInstances, 64, srv: true, uav: true);
@@ -2100,17 +2140,19 @@ namespace Freefall.Components
             _kSpawnInstances    = _grassCS.FindKernel("CS_SpawnInstances");
             _kBuildDecoDrawArgs = _grassCS.FindKernel("CS_BuildDrawArgs");
             _kBinMeshInstances  = _grassCS.FindKernel("CS_BinMeshInstances");
+            _kBladeColors       = _grassCS.FindKernel("CS_BladeColors");
 
             // Load mesh decorator material
             _meshDecoratorMaterial ??= new Material(new Effect("grass_mesh"));
+            _bladeMaterial ??= new Material(new Effect("grass_blades"));
 
             Debug.Log($"[TerrainRenderer] Deco buffers created: maxTiles={maxTiles} maxInstances={_maxDecoInstances} resolution={resolution}");
 
-            // Readback buffer for instance counter + mesh draw count (12 bytes for 3 uints)
+            // Readback buffer: card count, mesh count, mesh draw count, blade clump count (4 uints)
             _instanceCounterReadback = Engine.Device.NativeDevice.CreateCommittedResource(
                 new Vortice.Direct3D12.HeapProperties(Vortice.Direct3D12.HeapType.Readback),
                 Vortice.Direct3D12.HeapFlags.None,
-                Vortice.Direct3D12.ResourceDescription.Buffer(12),
+                Vortice.Direct3D12.ResourceDescription.Buffer(16),
                 Vortice.Direct3D12.ResourceStates.CopyDest,
                 null);
             unsafe
@@ -2228,6 +2270,7 @@ namespace Freefall.Components
             {
                 // Transition buffers to UAV
                 _decoInstanceBuffer!.Transition(commandList, ResourceStates.UnorderedAccess);
+                _bladeInstanceBuffer!.Transition(commandList, ResourceStates.UnorderedAccess);
                 _meshDecoInstanceBuffer!.Transition(commandList, ResourceStates.UnorderedAccess);
                 _sortedMeshInstanceBuffer!.Transition(commandList, ResourceStates.UnorderedAccess);
                 _meshDrawArgsBuffer!.Transition(commandList, ResourceStates.UnorderedAccess);
@@ -2258,11 +2301,18 @@ namespace Freefall.Components
                 cs.SetParam("TerrainOrigin", new Vector3(Transform.WorldPosition.X, Transform.WorldPosition.Z, Transform.WorldPosition.Y));
                 cs.SetParam("DecorationDensity", Terrain.DecorationDensity);
 
-                // Camera forward direction for half-space culling (normalized XZ)
-                var camFwd = Camera.Main?.Transform?.Forward ?? Vector3.UnitZ;
-                float fwdLen = MathF.Sqrt(camFwd.X * camFwd.X + camFwd.Z * camFwd.Z);
-                if (fwdLen > 0.001f) { camFwd.X /= fwdLen; camFwd.Z /= fwdLen; }
-                cs.SetParam("CamFwd", new Vector2(camFwd.X, camFwd.Z));
+                // Cell culling against the camera frustum (planes at b0). A cell just outside the view can still
+                // throw its shadow into it, so the cull sphere is swept along the light by the longest shadow
+                // a decorator casts on flat ground (a few metres; more when the sun is low).
+                cs.SetParam("DecoReach", _decoMaxReach);
+                var shadowSweep = Vector3.Zero;
+                if (Engine.Settings.EnableShadows)
+                {
+                    var lightDir = DirectionalLight.GetLightDirection();
+                    if (lightDir.Y < -0.001f)
+                        shadowSweep = lightDir * MathF.Min(_decoMaxReach / MathF.Max(-lightDir.Y, 0.1f), 20f);
+                }
+                cs.SetParam("ShadowSweep", shadowSweep);
 
                 cs.SetParam("ControlWidth", (uint)controlW);
                 cs.SetParam("ControlHeight", (uint)controlH);
@@ -2270,27 +2320,47 @@ namespace Freefall.Components
                 var hmDesc2 = Terrain.Heightmap!.Native.Description;
                 cs.SetParam("HeightmapSize", new Vortice.Mathematics.UInt2((uint)hmDesc2.Width, (uint)hmDesc2.Height));
 
-                // ── Camera-centered grid base tile ──
+                // ── Camera-centered grid: K rings of cells around the camera's cell (the spawn walks it as a spiral) ──
                 int camTileX = (int)MathF.Floor((camPos.X - Transform.WorldPosition.X) / tileSize);
                 int camTileZ = (int)MathF.Floor((camPos.Z - Transform.WorldPosition.Z) / tileSize);
-                int N = (int)MathF.Ceiling(2 * range / tileSize) + 1;
-                int baseTileX = camTileX - N / 2;
-                int baseTileZ = camTileZ - N / 2;
+                int rings = (int)MathF.Ceiling(range / tileSize) + 1;
+                int N = 2 * rings + 1;
+                int baseTileX = camTileX - rings;
+                int baseTileZ = camTileZ - rings;
 
                 cs.SetParam("BaseTileX", baseTileX);
                 cs.SetParam("BaseTileZ", baseTileZ);
+                cs.SetParam("GridSize", (uint)N);
                 cs.SetParam("MaxInstances", (uint)_maxDecoInstances);
+                cs.SetParam("BladeDistance", MathF.Max(0f, Engine.Settings.GrassBladeDistance));
+                cs.SetParam("MaxBladeInstances", (uint)MaxBladeInstances);
 
                 // ── Per-kernel push constants (resource indices only) ──
                 cs.SetBuffer(_kSpawnInstances, "DecoInstanceUAV", _decoInstanceBuffer);
                 cs.SetBuffer(_kSpawnInstances, "InstanceCounterUAV", _instanceCounterBuffer);
                 cs.SetBuffer(_kSpawnInstances, "MeshDecoInstanceUAV", _meshDecoInstanceBuffer);
+                cs.SetBuffer(_kSpawnInstances, "BladeInstanceUAV", _bladeInstanceBuffer);
 
                 cs.SetBuffer(_kBuildDecoDrawArgs, "InstanceCounterUAV", _instanceCounterBuffer);
                 cs.SetBuffer(_kBuildDecoDrawArgs, "DispatchArgsUAV", _decoDispatchArgsBuffer);
+                cs.SetBuffer(_kBuildDecoDrawArgs, "BladeInstanceUAV", _bladeInstanceBuffer);
+
+                // ── Blade colours from the card textures (when the variants changed) ──
+                if (_bladeColorsDirty && _bladeColorBuffer != null)
+                {
+                    _bladeColorBuffer.Transition(commandList, ResourceStates.UnorderedAccess);
+                    cs.SetBuffer(_kBladeColors, "BladeColorsUAV", _bladeColorBuffer);
+                    PixMarker.Begin(commandList, "Blade colours");
+                    cs.Dispatch(_kBladeColors, commandList, (uint)_decoVariantCount);
+                    commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(null)));
+                    PixMarker.End(commandList);
+                    _bladeColorBuffer.Transition(commandList, ResourceStates.NonPixelShaderResource);
+                    _bladeColorsDirty = false;
+                }
 
                 // ── Stage 1: CS_SpawnInstances (single-pass, camera-centered grid) ──
-                // Bind Hi-Z occlusion cbuffer (same _hizParamBuffers used by terrain quadtree)
+                // Bind the camera frustum (terrain-local) and Hi-Z cbuffers the terrain quadtree uploaded this frame
+                commandList.SetComputeRootConstantBufferView(1, _frustumPlaneBuffers[frameIndex].GPUVirtualAddress);
                 commandList.SetComputeRootConstantBufferView(2, _hizParamBuffers[frameIndex].GPUVirtualAddress);
                 LastDispatchN = N;
                 LastMaxInstances = _maxDecoInstances;
@@ -2305,8 +2375,9 @@ namespace Freefall.Components
                 commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(null)));
                 PixMarker.End(commandList);
 
-                // Transition billboard instance buffer to SRV for MS reads
+                // Transition billboard and blade clump instance buffers to SRV for MS reads
                 _decoInstanceBuffer.Transition(commandList, ResourceStates.NonPixelShaderResource);
+                _bladeInstanceBuffer.Transition(commandList, ResourceStates.NonPixelShaderResource);
 
                 // ── Stage 3: CS_BinMeshInstances ──
                 // Transition mesh instance buffer to SRV for binning reads
@@ -2347,10 +2418,12 @@ namespace Freefall.Components
                         LastInstanceCount = (int)pData[0];
                         LastMeshInstanceCount = (int)pData[1];
                         LastMeshDrawCount = (int)pData[2];
+                        LastBladeInstanceCount = (int)pData[3];
                     }
 
                     _instanceCounterBuffer.Transition(commandList, ResourceStates.CopySource);
                     commandList.CopyBufferRegion(_instanceCounterReadback, 0, _instanceCounterBuffer.Native, 0, 8);
+                    commandList.CopyBufferRegion(_instanceCounterReadback, 12, _instanceCounterBuffer.Native, 8, 4);
                     _instanceCounterBuffer.Transition(commandList, ResourceStates.UnorderedAccess);
 
                     _meshDrawCountBuffer!.Transition(commandList, ResourceStates.CopySource);
@@ -2393,6 +2466,23 @@ namespace Freefall.Components
             PixMarker.Begin(commandList, "Grass draw");
             commandList6.ExecuteIndirect(device.DispatchMeshSignature,1,_decoDispatchArgsBuffer!.Native, 0, null, 0);
             PixMarker.End(commandList);
+
+            // Card grass near the camera as blade clumps (grass_blades.fx); DispatchMesh args at offset 16
+            if (Engine.Settings.GrassBladeDistance > 0 && _bladeMaterial?.Effect != null && _bladeColorBuffer != null)
+            {
+                _bladeMaterial.SetPass(pass);
+                _bladeMaterial.Apply(commandList, device);
+                commandList.SetGraphicsRoot32BitConstant(0, _decoratorSlotsBuffer.SrvIndex, 0);
+                commandList.SetGraphicsRoot32BitConstant(0, _bladeInstanceBuffer!.SrvIndex, 1);
+                commandList.SetGraphicsRoot32BitConstant(0, _bladeColorBuffer.SrvIndex, 2);
+                commandList.SetGraphicsRoot32BitConstant(0, (uint)Math.Clamp(Engine.Settings.GrassBladesPerClump, 1, 28), 3);
+                if (pass == RenderPass.Shadow)
+                    commandList.SetGraphicsRoot32BitConstant(0, DirectionalLight.CurrentCascadeSrvIndex, 4);
+
+                PixMarker.Begin(commandList, "Grass blades");
+                commandList6.ExecuteIndirect(device.DispatchMeshSignature, 1, _decoDispatchArgsBuffer.Native, 16, null, 0);
+                PixMarker.End(commandList);
+            }
 
             // ════════════════════════════════════════════════════════════════
             // Phase 3: Mesh-mode decorators via VS/PS + BindlessCommandSignature
