@@ -34,6 +34,10 @@ namespace Freefall.Animation
         public float PreviousStartOf(AnimationState state)
             => PreviousAnimationSet != null ? PreviousAnimationSet.ResolveStart(state) : state.Start;
 
+        /// <summary>Where the clip a state plays hands over (<see cref="AnimationState.End"/>): the set's value for a clip it replaces.</summary>
+        public float EndOf(AnimationState state)
+            => AnimationSet != null ? AnimationSet.ResolveEnd(state) : state.End;
+
         /// <summary>
         /// Where in its loop's cycle the clip a state plays takes over (<see cref="AnimationState.Phase"/>),
         /// played as it is or left for right; negative when not known.

@@ -34,6 +34,16 @@ namespace Freefall.Animation
         public float Start;
 
         /// <summary>
+        /// Where the state hands over, as a fraction of its clip's length: a transition by exit
+        /// time leaves here at the latest, whatever its own exit time says. For a one-shot that
+        /// runs into a loop (a landing that walks on) and whose clip differs between animation
+        /// sets: one set's clip reaches the point of the stride the loop begins with at its end,
+        /// another's half a stride earlier, and the graph has one transition for both. An
+        /// animation set brings its own value with each clip it replaces. 1: at the exit time.
+        /// </summary>
+        public float End = 1f;
+
+        /// <summary>
         /// Play the clip left for right: every bone takes the pose of its counterpart on the other
         /// side, turned over, and the travel and turn go the other way. A stop made for one foot
         /// then serves the other. On a blend tree this covers its children, and the tree reads

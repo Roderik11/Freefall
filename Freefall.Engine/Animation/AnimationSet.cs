@@ -46,6 +46,9 @@ namespace Freefall.Animation
             /// <summary>In place of the state's <see cref="AnimationState.Phase"/> and <see cref="AnimationState.MirrorPhase"/>.</summary>
             public float Phase = -1f;
             public float MirrorPhase = -1f;
+
+            /// <summary>Where this clip hands over, in place of the state's <see cref="AnimationState.End"/>.</summary>
+            public float End = 1f;
         }
 
         // Clip and what goes with it per state ID (state IDs are small sequential ints); a null clip = not overridden
@@ -55,6 +58,7 @@ namespace Freefall.Animation
             public float[] Starts;
             public float[] Phases;
             public float[] MirrorPhases;
+            public float[] Ends;
             public List<ClipOverride> Source;
             public int Count;
         }
@@ -91,6 +95,16 @@ namespace Freefall.Animation
             return mirrored ? state.MirrorPhase : state.Phase;
         }
 
+        /// <summary>Where the clip of a state hands over: the override's value for a clip this set replaces, else the state's.</summary>
+        public float ResolveEnd(AnimationState state)
+        {
+            var table = Current();
+            int id = state.ID;
+            if ((uint)id < (uint)table.Clips.Length && table.Clips[id] != null)
+                return table.Ends[id];
+            return state.End;
+        }
+
         /// <summary>Call after changing an entry of <see cref="Overrides"/> in place.</summary>
         public void Invalidate() => _table = null;
 
@@ -118,6 +132,7 @@ namespace Freefall.Animation
                 Starts = new float[maxId + 1],
                 Phases = new float[maxId + 1],
                 MirrorPhases = new float[maxId + 1],
+                Ends = new float[maxId + 1],
                 Source = Overrides,
                 Count = Overrides.Count,
             };
@@ -128,6 +143,7 @@ namespace Freefall.Animation
                 table.Starts[entry.StateID] = entry.Start;
                 table.Phases[entry.StateID] = entry.Phase;
                 table.MirrorPhases[entry.StateID] = entry.MirrorPhase;
+                table.Ends[entry.StateID] = entry.End;
             }
 
             _table = table;

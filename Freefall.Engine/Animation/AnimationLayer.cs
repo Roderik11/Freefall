@@ -198,11 +198,12 @@ namespace Freefall.Animation
                 AnimationState target = null;
                 bool allConditionsMet = true;
 
-                // By exit time. A state that plays nothing has nothing to wait for and leaves at
-                // once: its clip can go from under it when the animation set changes (a bow's
-                // draw has no clip with a sword), and it would never get to its exit time.
+                // By exit time, or where the state's clip hands over if that is sooner
+                // (AnimationState.End). A state that plays nothing has nothing to wait for and
+                // leaves at once: its clip can go from under it when the animation set changes (a
+                // bow's draw has no clip with a sword), and it would never get to its exit time.
                 if (transition.Conditions.Count == 0)
-                    allConditionsMet = currentState.GetTimeNormalized(pb) >= transition.ExitTime || !currentState.Plays(pb);
+                    allConditionsMet = currentState.GetTimeNormalized(pb) >= MathF.Min(transition.ExitTime, pb.EndOf(currentState)) || !currentState.Plays(pb);
 
                 foreach (AnimationCondition condition in transition.Conditions)
                 {
