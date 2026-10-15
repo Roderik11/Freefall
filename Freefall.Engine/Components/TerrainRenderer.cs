@@ -173,12 +173,14 @@ namespace Freefall.Components
 
         // ───── Blade Clumps (card grass near the camera, grass_blades.fx) ─────
         private const int MaxBladeInstances = 128 * 1024;
-        private const int BladeColorBands = 4;              // = BLADE_COLOR_BANDS in the shaders
+        private const int BladeColorsPerVariant = 6;        // = COLORS_PER_VARIANT in the shaders: 4 height bands, foliage, bloom
         private GraphicsBuffer? _bladeInstanceBuffer;       // DecoInstance, 64 bytes; padded to whole AS groups
-        private GraphicsBuffer? _bladeColorBuffer;          // float4 per variant x BladeColorBands (CS_BladeColors)
+        private GraphicsBuffer? _bladeColorBuffer;          // float4 per variant x BladeColorsPerVariant (CS_BladeColors)
         private bool _bladeColorsDirty = true;
-        private bool _decoHasBlades;                        // some variant draws a band as Blades
+        private bool _decoHasBlades;                        // some variant draws a band as Blades (grass_blades.fx)
+        private bool _decoHasPlants;                        // ... as Flowers or Spikes (grass_plants.fx)
         private Material? _bladeMaterial;
+        private Material? _plantMaterial;
         private int _kBladeColors;
 
         // ───── Debug Stats (read by editor SettingsControls) ─────────────
@@ -1731,6 +1733,7 @@ namespace Freefall.Components
             public uint AlphaClip;        // mesh mode: 1 = alpha-test albedo, 0 = opaque material
             public float HeightNoiseScale;  // world size of short vs. lush patches (m), 0 = off
             public float HeightNoiseAmount; // 0 = none, 1 = 0.4x .. 1.4x height
+            public uint PlantPartsIdx;      // Flowers / Spikes: bindless index of the parts atlas, 0 = none
         }
 
         /// <summary>
@@ -1770,7 +1773,7 @@ namespace Freefall.Components
             var groups = new List<DecoratorGroupGPU>();
             var lodTable = new List<LODTableEntry>();
             float maxReach = 0;
-            bool hasBlades = false;
+            bool hasBlades = false, hasPlants = false;
 
             foreach (var decorator in _decoratorPalette)
             {
@@ -1857,10 +1860,10 @@ namespace Freefall.Components
                             uint half = BitConverter.HalfToUInt16Bits((Half)MathF.Max(0f, sorted[b].MaxDistance));
                             if (b < 2) bandEnds01 |= half << (16 * b);
                             else bandEnds23 |= half << (16 * (b - 2));
-                            if (bandMode == DecoratorMode.Blades) hasBlades = true;
+                            if (bandMode == DecoratorMode.Blades) hasBlades = true; else if (bandMode > DecoratorMode.Blades) hasPlants = true;
                         }
                     }
-                    if (mode == DecoratorMode.Blades) hasBlades = true;
+                    if (mode == DecoratorMode.Blades) hasBlades = true; else if (mode > DecoratorMode.Blades) hasPlants = true;
 
                     float degToRad = MathF.PI / 180f;
                     float rx = variant.RootRotation.X * degToRad;
@@ -1897,6 +1900,7 @@ namespace Freefall.Components
                         AlphaClip = variant.Material?.Effect?.Name == "gbuffer" ? 0u : 1u,
                         HeightNoiseScale = variant.HeightNoiseScale,
                         HeightNoiseAmount = variant.HeightNoiseAmount,
+                        PlantPartsIdx = (uint)(variant.PlantParts?.BindlessIndex ?? 0),
                     });
                 }
 
@@ -1951,16 +1955,36 @@ namespace Freefall.Components
             _decoVariantCount = slots.Count;
             _decoMaxReach = maxReach;
             _decoHasBlades = hasBlades;
+            _decoHasPlants = hasPlants;
             _decoratorBuffersBuilt = true;
 
             // Blade colours are taken from the variants' textures again (CS_BladeColors, next decorator dispatch)
-            int bladeColorCount = Math.Max(1, slots.Count) * BladeColorBands;
+            int bladeColorCount = Math.Max(1, slots.Count) * BladeColorsPerVariant;
             if (_bladeColorBuffer == null || _bladeColorBuffer.ElementCount != bladeColorCount)
             {
                 Engine.Device.DeferDispose(_bladeColorBuffer);
                 _bladeColorBuffer = GraphicsBuffer.CreateStructured(bladeColorCount, 16, srv: true, uav: true);
             }
             _bladeColorsDirty = true;
+        }
+
+        /// <summary>One procedural decorator pipeline over the procedural instance buffer (grass_procedural.hlsli).</summary>
+        private void DrawProcedural(ID3D12GraphicsCommandList6 commandList, RenderPass pass, Material? material, string marker)
+        {
+            if (material?.Effect == null || _bladeColorBuffer == null) return;
+            var device = Engine.Device;
+            material.SetPass(pass);
+            material.Apply(commandList, device);
+            commandList.SetGraphicsRoot32BitConstant(0, _decoratorSlotsBuffer!.SrvIndex, 0);
+            commandList.SetGraphicsRoot32BitConstant(0, _bladeInstanceBuffer!.SrvIndex, 1);
+            commandList.SetGraphicsRoot32BitConstant(0, _bladeColorBuffer.SrvIndex, 2);
+            commandList.SetGraphicsRoot32BitConstant(0, (uint)Math.Clamp(Engine.Settings.GrassBladesPerClump, 1, 28), 3);
+            if (pass == RenderPass.Shadow)
+                commandList.SetGraphicsRoot32BitConstant(0, DirectionalLight.CurrentCascadeSrvIndex, 4);
+
+            PixMarker.Begin(commandList, marker);
+            commandList.ExecuteIndirect(device.DispatchMeshSignature, 1, _decoDispatchArgsBuffer!.Native, 16, null, 0);
+            PixMarker.End(commandList);
         }
 
         private static void Refill<T>(GraphicsBuffer buffer, List<T> data) where T : unmanaged
@@ -2169,6 +2193,7 @@ namespace Freefall.Components
             // Load mesh decorator material
             _meshDecoratorMaterial ??= new Material(new Effect("grass_mesh"));
             _bladeMaterial ??= new Material(new Effect("grass_blades"));
+            _plantMaterial ??= new Material(new Effect("grass_plants"));
 
             Debug.Log($"[TerrainRenderer] Deco buffers created: maxTiles={maxTiles} maxInstances={_maxDecoInstances} resolution={resolution}");
 
@@ -2490,22 +2515,11 @@ namespace Freefall.Components
             commandList6.ExecuteIndirect(device.DispatchMeshSignature,1,_decoDispatchArgsBuffer!.Native, 0, null, 0);
             PixMarker.End(commandList);
 
-            // Variants' Blades bands as clumps of procedural blades (grass_blades.fx); DispatchMesh args at offset 16
-            if (_decoHasBlades && _bladeMaterial?.Effect != null && _bladeColorBuffer != null)
-            {
-                _bladeMaterial.SetPass(pass);
-                _bladeMaterial.Apply(commandList, device);
-                commandList.SetGraphicsRoot32BitConstant(0, _decoratorSlotsBuffer.SrvIndex, 0);
-                commandList.SetGraphicsRoot32BitConstant(0, _bladeInstanceBuffer!.SrvIndex, 1);
-                commandList.SetGraphicsRoot32BitConstant(0, _bladeColorBuffer.SrvIndex, 2);
-                commandList.SetGraphicsRoot32BitConstant(0, (uint)Math.Clamp(Engine.Settings.GrassBladesPerClump, 1, 28), 3);
-                if (pass == RenderPass.Shadow)
-                    commandList.SetGraphicsRoot32BitConstant(0, DirectionalLight.CurrentCascadeSrvIndex, 4);
-
-                PixMarker.Begin(commandList, "Grass blades");
-                commandList6.ExecuteIndirect(device.DispatchMeshSignature, 1, _decoDispatchArgsBuffer.Native, 16, null, 0);
-                PixMarker.End(commandList);
-            }
+            // The procedural bands (DispatchMesh args at offset 16): blade clumps (grass_blades.fx), then flowers and
+            // spikes (grass_plants.fx). Both walk the same instances, each building only its own kinds: the plants'
+            // alpha-tested parts would cost the blades their early depth test in one pipeline.
+            DrawProcedural(commandList6, pass, _decoHasBlades ? _bladeMaterial : null, "Grass blades");
+            DrawProcedural(commandList6, pass, _decoHasPlants ? _plantMaterial : null, "Flowers");
 
             // ════════════════════════════════════════════════════════════════
             // Phase 3: Mesh-mode decorators via VS/PS + BindlessCommandSignature

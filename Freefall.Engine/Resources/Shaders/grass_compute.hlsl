@@ -140,6 +140,7 @@ cbuffer DecoParams : register(b4)
 
 #define BLADE_CLUMPS_PER_AS 32  // grass_blades.fx: one AS group launches this many clump MS groups
 #define BLADE_COLOR_BANDS 4     // grass_blades.fx: blade colour bands, root to tip
+#define COLORS_PER_VARIANT 6    // CS_BladeColors: the height bands, then foliage and bloom
 
 // True when a sphere (terrain-local), or the shadow it throws along ShadowSweep, can reach the camera frustum.
 bool CellInFrustum(float3 center, float radius)
@@ -192,6 +193,7 @@ struct DecoratorSlot
     uint AlphaClip;             // mesh mode: 1 = alpha-test albedo (foliage), 0 = opaque (rocks, pebbles)
     float HeightNoiseScale;     // world size of short vs. lush patches in m (0 = off)
     float HeightNoiseAmount;    // 0 = none, 1 = 0.4x .. 1.4x height
+    uint PlantPartsIdx;         // Flowers / Spikes: parts atlas (grass_plants.fx), 0 = none
 };
 
 struct LODEntry { uint MeshPartId; float MaxDistance; uint MaterialId; uint _pad; };
@@ -225,7 +227,9 @@ struct DecoInstance
 #define MODE_MESH      0
 #define MODE_BILLBOARD 1
 #define MODE_CROSS     2
-#define MODE_BLADES    3
+#define MODE_BLADES    3        // MODE_BLADES and up: procedural, drawn by grass_blades.fx
+#define MODE_FLOWERS   4
+#define MODE_SPIKES    5
 #define MAX_BANDS      4
 
 // ─── Distance bands (DecoratorVariant.Bands) ──────────────────────────────
@@ -608,9 +612,9 @@ void CS_SpawnInstances(uint3 gid : SV_GroupID, uint3 gtid3 : SV_GroupThreadID)
                 RWStructuredBuffer<DecoInstance> meshBuffer = ResourceDescriptorHeap[MeshDecoInstanceUAVIdx];
                 meshBuffer[outIdx] = di;
             }
-            else if (mode == MODE_BLADES)
+            else if (mode >= MODE_BLADES)
             {
-                // Clumps of procedural blades (grass_blades.fx) → own buffer, counter at offset 8
+                // Procedural (grass_blades.fx: blade clumps, flowers, spikes) → own buffer, counter at offset 8
                 uint bladeIdx;
                 instCounter.InterlockedAdd(8, 1, bladeIdx);
                 if (bladeIdx >= MaxBladeInstances) continue;
@@ -670,13 +674,17 @@ void CS_BuildDrawArgs(uint3 dtid : SV_DispatchThreadID)
 // ═══════════════════════════════════════════════════════════════════════════
 // CS_BladeColors
 //
-// One group per decorator variant: the colour its blade clumps take, root to tip, from its card texture — the
-// alpha-weighted mean of the texels in BLADE_COLOR_BANDS height bands (w = coverage). Read at full resolution on a
-// 128 x 128 grid: the transparent texels of the grass cards are near-black, so any mip would darken the mean.
-// Runs when the variants change.
+// One group per decorator variant: the colours its procedural stand-ins (grass_blades.fx) take, from its card
+// texture. COLORS_PER_VARIANT float4 (rgb, coverage):
+//   0..3  alpha-weighted mean of all texels in BLADE_COLOR_BANDS height bands, root → tip (grass blades)
+//   4     foliage: the green-dominant texels (stems and leaves of flowers)
+//   5     bloom: the other texels, weighted by brightness² so dark stems and shading barely count
+// Read at full resolution on a 128 x 128 grid: the transparent texels of the cards are near-black, so any mip
+// would darken the means. Runs when the variants change.
 // ═══════════════════════════════════════════════════════════════════════════
 
-groupshared float4 gs_bandSum[BLADE_COLOR_BANDS][64];
+groupshared float4 gs_colorSum[COLORS_PER_VARIANT][64];   // (rgb x weight, weight)
+groupshared float  gs_coverage[COLORS_PER_VARIANT][64];
 
 [numthreads(64, 1, 1)]
 void CS_BladeColors(uint3 gid : SV_GroupID, uint gtid : SV_GroupIndex)
@@ -684,8 +692,9 @@ void CS_BladeColors(uint3 gid : SV_GroupID, uint gtid : SV_GroupIndex)
     StructuredBuffer<DecoratorSlot> slots = ResourceDescriptorHeap[DecoratorSlotsIdx];
     DecoratorSlot slot = slots[gid.x];
 
-    float4 sums[BLADE_COLOR_BANDS];
-    [unroll] for (uint b = 0; b < BLADE_COLOR_BANDS; b++) sums[b] = 0;
+    float4 sums[COLORS_PER_VARIANT];
+    float coverage[COLORS_PER_VARIANT];
+    [unroll] for (uint b = 0; b < COLORS_PER_VARIANT; b++) { sums[b] = 0; coverage[b] = 0; }
 
     if (slot.Mode != MODE_MESH && slot.TextureIdx != 0)
     {
@@ -700,20 +709,49 @@ void CS_BladeColors(uint3 gid : SV_GroupID, uint gtid : SV_GroupIndex)
             {
                 float4 c = tex.Load(int3((col * w + w / 2) / 128, y, 0));
                 [unroll] for (uint b2 = 0; b2 < BLADE_COLOR_BANDS; b2++)
-                    if (b2 == band) sums[b2] += float4(c.rgb * c.a, c.a);
+                {
+                    if (b2 == band)
+                    {
+                        sums[b2] += float4(c.rgb * c.a, c.a);
+                        coverage[b2] += c.a;
+                    }
+                }
+
+                float brightest = max(c.r, max(c.g, c.b));
+                if (c.g > max(c.r, c.b) * 1.05)
+                {
+                    sums[4] += float4(c.rgb * c.a, c.a);
+                    coverage[4] += c.a;
+                }
+                else
+                {
+                    float wBloom = c.a * brightest * brightest;
+                    sums[5] += float4(c.rgb * wBloom, wBloom);
+                    coverage[5] += c.a;
+                }
             }
         }
     }
 
-    [unroll] for (uint b3 = 0; b3 < BLADE_COLOR_BANDS; b3++) gs_bandSum[b3][gtid] = sums[b3];
+    [unroll] for (uint b3 = 0; b3 < COLORS_PER_VARIANT; b3++)
+    {
+        gs_colorSum[b3][gtid] = sums[b3];
+        gs_coverage[b3][gtid] = coverage[b3];
+    }
     GroupMemoryBarrierWithGroupSync();
 
-    if (gtid < BLADE_COLOR_BANDS)
+    if (gtid < COLORS_PER_VARIANT)
     {
         float4 s = 0;
-        for (uint t = 0; t < 64; t++) s += gs_bandSum[gtid][t];
+        float cover = 0;
+        for (uint t = 0; t < 64; t++)
+        {
+            s += gs_colorSum[gtid][t];
+            cover += gs_coverage[gtid][t];
+        }
+        float samples = 128.0 * 128.0 / (gtid < BLADE_COLOR_BANDS ? BLADE_COLOR_BANDS : 1);
         RWStructuredBuffer<float4> colors = ResourceDescriptorHeap[BladeColorsUAVIdx];
-        colors[gid.x * BLADE_COLOR_BANDS + gtid] = float4(s.a > 0 ? s.rgb / s.a : 0.0.xxx, s.a / (128.0 * 128.0 / BLADE_COLOR_BANDS));
+        colors[gid.x * COLORS_PER_VARIANT + gtid] = float4(s.a > 0 ? s.rgb / s.a : 0.0.xxx, cover / samples);
     }
 }
 

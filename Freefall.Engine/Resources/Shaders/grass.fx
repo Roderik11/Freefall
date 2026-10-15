@@ -50,6 +50,7 @@ struct DecoratorSlot
     uint AlphaClip;             // mesh mode: 1 = alpha-test albedo (foliage), 0 = opaque (rocks, pebbles)
     float HeightNoiseScale;     // world size of short vs. lush patches in m (0 = off)
     float HeightNoiseAmount;    // 0 = none, 1 = 0.4x .. 1.4x height
+    uint PlantPartsIdx;         // Flowers / Spikes: parts atlas (grass_plants.fx), 0 = none
 };
 
 struct LODEntry { uint MeshPartId; float MaxDistance; uint MaterialId; uint _pad; };

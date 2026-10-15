@@ -6,10 +6,12 @@ using Freefall.Graphics;
 namespace Freefall.Assets
 {
     /// <summary>
-    /// How a decorator variant is drawn. Blades: clumps of procedural blades coloured from the variant's texture,
-    /// opaque geometry instead of a mostly transparent card — for grass near the camera.
+    /// How a decorator variant is drawn. The procedural modes build opaque geometry in a mesh shader instead of a
+    /// mostly transparent card, coloured from the variant's texture — for near the camera:
+    /// Blades = a clump of grass blades; Flowers = a few stems with paired leaves and a disc bloom (daisy, zinnia);
+    /// Spikes = stems carrying a spike of small florets (loosestrife, lavender).
     /// </summary>
-    public enum DecoratorMode { Mesh, Billboard, Cross, Blades }
+    public enum DecoratorMode { Mesh, Billboard, Cross, Blades, Flowers, Spikes }
 
     /// <summary>
     /// Ground cover for terrain: a mix of things that are allowed in the same places.
@@ -48,15 +50,23 @@ namespace Freefall.Assets
         /// <summary>Mesh mode: material to render the mesh with (meshes don't carry one; prefabs do).</summary>
         public Material Material;
 
-        /// <summary>Billboard/Cross mode: alpha-tested texture. Blades mode: where the blade colours come from.</summary>
+        /// <summary>Billboard/Cross mode: alpha-tested texture. Procedural modes: where their colours come from.</summary>
         public Texture Texture;
+
+        /// <summary>
+        /// Flowers / Spikes bands: atlas of the plant's parts — a bloom seen from above (Flowers) or the flower spike
+        /// from the side (Spikes), and a leaf — mapped onto the procedural plant. Rendered by
+        /// Tools/BlenderKits/build_flowers.py, which documents the layout. Empty = flat colours from the card.
+        /// The card's own texture cannot serve: it shows the blooms side-on.
+        /// </summary>
+        public Texture PlantParts;
 
         /// <summary>
         /// How the variant is drawn at each distance, near to far (up to <see cref="TerrainDecorator.MaxBands"/>), e.g. grass as
         /// Blades to 15 m, then Cross. Empty = Mode out to the terrain's decoration radius. Beyond the last band
         /// the variant is not drawn (it shrinks away over the last 15%), so flowers can stop sooner than grass.
-        /// Card variants (Texture) take Blades, Cross and Billboard; a mesh variant stays a mesh and only gets
-        /// its range from the bands.
+        /// Card variants (Texture) take every mode but Mesh; a mesh variant stays a mesh and only gets its range
+        /// from the bands.
         /// </summary>
         public List<DecoratorBand> Bands = [];
 

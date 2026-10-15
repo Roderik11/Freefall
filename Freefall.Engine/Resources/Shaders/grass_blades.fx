@@ -1,91 +1,15 @@
 // ═══════════════════════════════════════════════════════════════════════════
 // Grass blades — what card grass becomes near the camera (Amplification → Mesh → Pixel)
 //
-// CS_SpawnInstances routes the instances in a variant's Blades distance band (DecoratorVariant.Bands; each
-// switching at its own point within ±15% of the band's end) into a buffer of their own; here every one of them
-// becomes a clump of procedural blades. Cards near the camera are
-// what grass cost: ~85% of a card's pixels are transparent and still run the alpha test, and with `clip` there is
-// little early-Z. Blades are opaque geometry: no alpha test, hidden blades rejected early, each pixel shaded
-// about once. Blade colours come from the card's own texture (CS_BladeColors), so the hand-over matches.
+// Every instance in a Blades distance band becomes a clump of procedural blades (see grass_procedural.hlsli for
+// the routing; flowers and spikes are grass_plants.fx). Cards near the camera are what grass cost: ~85% of a
+// card's pixels are transparent and still run the alpha test, and with `clip` there is little early-Z. Blades
+// are opaque geometry: no alpha test, hidden blades rejected early, each pixel shaded about once. Blade colours
+// come from the card's own texture (CS_BladeColors), so the hand-over matches.
 // ═══════════════════════════════════════════════════════════════════════════
-cbuffer PushConstants : register(b3)
-{
-    uint DecoratorSlotsIdx;     // 0
-    uint BladeInstanceSRV;      // 1: DecoInstance, padded to whole AS groups with zero-scale entries
-    uint BladeColorsSRV;        // 2: float4 per variant x BLADE_COLOR_BANDS (rgb, coverage), root → tip
-    uint BladesPerClump;        // 3
-    uint CascadeBufferSRVIdx;   // 4: shadow pass only
-};
+#include "grass_procedural.hlsli"
 
-#include "common.fx"
-
-// ─── GPU structs (must match grass_compute.hlsl and TerrainRenderer.cs) ─────
-
-struct DecoratorSlot
-{
-    float Density;
-    float MinH, MaxH;
-    float MinW, MaxW;
-    uint LODCount;
-    uint LODTableOffset;
-    float Rot00, Rot01, Rot02;
-    float Rot10, Rot11, Rot12;
-    float Rot20, Rot21, Rot22;
-    float SlopeBias;
-    uint Seed;
-    uint BandModes;
-    uint Mode;
-    uint TextureIdx;
-    float3 HealthyColor;
-    float3 DryColor;
-    float NoiseSpread;
-    uint BandEnds01;
-    uint BandEnds23;
-    float ClusterScale;
-    float ClusterAmount;
-    uint AlphaClip;
-    float HeightNoiseScale;
-    float HeightNoiseAmount;
-};
-
-struct DecoInstance
-{
-    float3 Position;
-    float  Rotation;
-    float3 TerrainNormal;
-    float  FadeFactor;
-    float2 Scale;           // (width, height) of the card this clump stands in for
-    float2 TerrainUV;
-    uint   SlotIdx;
-    uint   LOD;
-    float  InstanceSeed;
-    uint   Mode;
-};
-
-// ─── Constants ─────────────────────────────────────────────────────────────
-
-#define CLUMPS_PER_AS 32        // = BLADE_CLUMPS_PER_AS in grass_compute.hlsl
-#define BLADE_COLOR_BANDS 4     // = grass_compute.hlsl
-#define MAX_BLADES 28
-#define MAX_SEGMENTS 4
-#define MS_THREADS 128          // each thread writes up to two vertices and two triangles
-#define MAX_VERTS 256           // MAX_BLADES x (2 x MAX_SEGMENTS + 1) = 252
-#define MAX_PRIMS 256           // MAX_BLADES x (2 x MAX_SEGMENTS - 1) = 196
-
-// ─── Helpers ───────────────────────────────────────────────────────────────
-
-uint pcg(uint v)
-{
-    uint state = v * 747796405u + 2891336453u;
-    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
-    return (word >> 22u) ^ word;
-}
-
-float Rand(inout uint h)
-{
-    h = pcg(h);
-    return float(h) / 4294967295.0;
-}
+#define MAX_BLADES 28           // x (2 x 4 segments + 1) = 252 vertices, x (2 x 4 - 1) = 196 triangles
 
 // Segments per blade: the clump's distance picks how smooth the bend is
 uint SegmentsAt(float dist)
@@ -126,13 +50,7 @@ BladeVertexData BladeVertex(DecoInstance di, DecoratorSlot slot, uint blade, uin
 
     // Bend: the blade leans out along 'facing', more towards the tip; it loses a little height doing so
     float3 centre = root + up * height * t * (1.0 - 0.3 * lean * t) + facing * height * lean * t * t;
-
-    // Wind: the cards' sway, plus a per-blade phase so a clump does not move as one
-    float windInfluence = t * t;
-    float windWave1 = sin(Time * 2.1 + root.x * 0.8 + root.z * 0.6 + phase * 0.3) * 0.12;
-    float windWave2 = sin(Time * 1.4 + root.x * 0.5 - root.z * 0.9 + phase * 0.2) * 0.08;
-    centre.x += (windWave1 + windWave2) * windInfluence * height;
-    centre.z += (windWave2 - windWave1 * 0.5) * windInfluence * height;
+    centre += Wind(root, t, height, phase);
 
     BladeVertexData o;
     o.WorldPos = centre + side * sideSign * 0.5 * width * (1.0 - t);
@@ -146,9 +64,9 @@ BladeVertexData BladeVertex(DecoInstance di, DecoratorSlot slot, uint blade, uin
     StructuredBuffer<float4> bands = ResourceDescriptorHeap[BladeColorsSRV];
     float bandPos = t * (BLADE_COLOR_BANDS - 1);
     uint b0 = min((uint)bandPos, BLADE_COLOR_BANDS - 2);
-    float4 c0 = bands[di.SlotIdx * BLADE_COLOR_BANDS + b0];
-    float4 c1 = bands[di.SlotIdx * BLADE_COLOR_BANDS + b0 + 1];
-    float4 cRoot = bands[di.SlotIdx * BLADE_COLOR_BANDS];
+    float4 c0 = bands[di.SlotIdx * COLORS_PER_VARIANT + b0];
+    float4 c1 = bands[di.SlotIdx * COLORS_PER_VARIANT + b0 + 1];
+    float4 cRoot = bands[di.SlotIdx * COLORS_PER_VARIANT];
     // A band the card barely covers (the very tips) has a noisy mean: fall back towards the root colour
     c0.rgb = lerp(cRoot.rgb, c0.rgb, saturate(c0.a * 20.0));
     c1.rgb = lerp(cRoot.rgb, c1.rgb, saturate(c1.a * 20.0));
@@ -158,21 +76,13 @@ BladeVertexData BladeVertex(DecoInstance di, DecoratorSlot slot, uint blade, uin
     return o;
 }
 
-// ─── Amplification Shader ──────────────────────────────────────────────────
-
-struct BladePayload
+// What one MS group outputs for an instance: blade clumps only (plants and padding: nothing)
+void ClumpCounts(DecoInstance di, float dist, out uint verts, out uint prims, out uint segs)
 {
-    uint BaseInstance;
-};
-
-groupshared BladePayload s_Payload;
-
-// One clump per MS group. The instance buffer is padded to whole AS groups, so every group launches all of them.
-[numthreads(1, 1, 1)]
-void AS(uint3 gid : SV_GroupID)
-{
-    s_Payload.BaseInstance = gid.x * CLUMPS_PER_AS;
-    DispatchMesh(CLUMPS_PER_AS, 1, 1, s_Payload);
+    segs = SegmentsAt(dist);
+    uint blades = (di.Mode == MODE_BLADES && di.Scale.y > 0) ? min(BladesPerClump, (uint)MAX_BLADES) : 0;
+    verts = blades * (2 * segs + 1);
+    prims = blades * (2 * segs - 1);
 }
 
 // ─── Mesh Shader ───────────────────────────────────────────────────────────
@@ -186,22 +96,12 @@ struct MSOutput
     float  Depth       : TEXCOORD1;
 };
 
-// Triangle 'p' of a blade: quads up the blade as two triangles each, then one triangle to the tip
-uint3 BladeTriangle(uint baseVertex, uint p, uint segs)
-{
-    if (p >= 2 * (segs - 1))
-        return baseVertex + uint3(2 * (segs - 1), 2 * (segs - 1) + 1, 2 * segs);
-    uint k = p / 2;
-    uint l0 = baseVertex + 2 * k;
-    return (p & 1) ? uint3(l0 + 1, l0 + 3, l0 + 2) : uint3(l0, l0 + 1, l0 + 2);
-}
-
 [outputtopology("triangle")]
 [numthreads(MS_THREADS, 1, 1)]
 void MS(
     uint gtid : SV_GroupThreadID,
     uint3 gid : SV_GroupID,
-    in payload BladePayload payload,
+    in payload ProceduralPayload payload,
     out vertices MSOutput verts[MAX_VERTS],
     out indices uint3 tris[MAX_PRIMS])
 {
@@ -209,18 +109,16 @@ void MS(
     DecoInstance di = instances[payload.BaseInstance + gid.x];
 
     float dist = distance(CamPos, di.Position);
-    uint segs = SegmentsAt(dist);
-    uint blades = di.Scale.y > 0 ? min(BladesPerClump, (uint)MAX_BLADES) : 0;
-    uint vertsPerBlade = 2 * segs + 1;
-    uint trisPerBlade = 2 * segs - 1;
-    SetMeshOutputCounts(blades * vertsPerBlade, blades * trisPerBlade);
+    uint vertCount, primCount, segs;
+    ClumpCounts(di, dist, vertCount, primCount, segs);
+    SetMeshOutputCounts(vertCount, primCount);
 
     StructuredBuffer<DecoratorSlot> slots = ResourceDescriptorHeap[DecoratorSlotsIdx];
     DecoratorSlot slot = slots[di.SlotIdx];
 
-    for (uint vi = gtid; vi < blades * vertsPerBlade; vi += MS_THREADS)
+    for (uint vi = gtid; vi < vertCount; vi += MS_THREADS)
     {
-        BladeVertexData bv = BladeVertex(di, slot, vi / vertsPerBlade, vi % vertsPerBlade, segs, dist);
+        BladeVertexData bv = BladeVertex(di, slot, vi / (2 * segs + 1), vi % (2 * segs + 1), segs, dist);
         MSOutput o;
         o.Position = mul(float4(bv.WorldPos, 1.0), ViewProjection);
         o.Color = bv.Color;
@@ -230,8 +128,8 @@ void MS(
         verts[vi] = o;
     }
 
-    for (uint ti = gtid; ti < blades * trisPerBlade; ti += MS_THREADS)
-        tris[ti] = BladeTriangle((ti / trisPerBlade) * vertsPerBlade, ti % trisPerBlade, segs);
+    for (uint ti = gtid; ti < primCount; ti += MS_THREADS)
+        tris[ti] = StripTriangle((ti / (2 * segs - 1)) * (2 * segs + 1), ti % (2 * segs - 1), segs);
 }
 
 // ─── Pixel Shader ──────────────────────────────────────────────────────────
@@ -282,7 +180,7 @@ struct ShadowPrimAttribs
 void MS_Shadow(
     uint gtid : SV_GroupThreadID,
     uint3 gid : SV_GroupID,
-    in payload BladePayload payload,
+    in payload ProceduralPayload payload,
     out vertices ShadowMSOutput verts[MAX_VERTS],
     out indices uint3 tris[MAX_PRIMS],
     out primitives ShadowPrimAttribs primAttribs[MAX_PRIMS])
@@ -291,28 +189,26 @@ void MS_Shadow(
     DecoInstance di = instances[payload.BaseInstance + gid.x];
 
     float dist = distance(CamPos, di.Position);
-    uint segs = SegmentsAt(dist);
-    uint blades = di.Scale.y > 0 ? min(BladesPerClump, (uint)MAX_BLADES) : 0;
-    uint vertsPerBlade = 2 * segs + 1;
-    uint trisPerBlade = 2 * segs - 1;
-    SetMeshOutputCounts(blades * vertsPerBlade, blades * trisPerBlade);
+    uint vertCount, primCount, segs;
+    ClumpCounts(di, dist, vertCount, primCount, segs);
+    SetMeshOutputCounts(vertCount, primCount);
 
     StructuredBuffer<DecoratorSlot> slots = ResourceDescriptorHeap[DecoratorSlotsIdx];
     StructuredBuffer<CascadeData> cascades = ResourceDescriptorHeap[CascadeBufferSRVIdx];
     DecoratorSlot slot = slots[di.SlotIdx];
     row_major float4x4 cascadeVP = cascades[0].VP;
 
-    for (uint vi = gtid; vi < blades * vertsPerBlade; vi += MS_THREADS)
+    for (uint vi = gtid; vi < vertCount; vi += MS_THREADS)
     {
-        BladeVertexData bv = BladeVertex(di, slot, vi / vertsPerBlade, vi % vertsPerBlade, segs, dist);
+        BladeVertexData bv = BladeVertex(di, slot, vi / (2 * segs + 1), vi % (2 * segs + 1), segs, dist);
         ShadowMSOutput o;
         o.Position = mul(float4(bv.WorldPos, 1.0), cascadeVP);
         verts[vi] = o;
     }
 
-    for (uint ti = gtid; ti < blades * trisPerBlade; ti += MS_THREADS)
+    for (uint ti = gtid; ti < primCount; ti += MS_THREADS)
     {
-        tris[ti] = BladeTriangle((ti / trisPerBlade) * vertsPerBlade, ti % trisPerBlade, segs);
+        tris[ti] = StripTriangle((ti / (2 * segs - 1)) * (2 * segs + 1), ti % (2 * segs - 1), segs);
         primAttribs[ti].RTIndex = 0;
     }
 }
