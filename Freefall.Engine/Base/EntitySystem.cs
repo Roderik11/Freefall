@@ -1,6 +1,5 @@
 using System;
 using System.Collections.Generic;
-using System.Diagnostics;
 using System.Reflection;
 
 namespace Freefall.Base
@@ -18,8 +17,15 @@ namespace Freefall.Base
     {
         public bool Enabled = true;
 
-        /// <summary>Duration of the last <see cref="Update"/> in milliseconds; 0 when it was skipped.</summary>
-        public double ElapsedMs { get; internal set; }
+        /// <summary>
+        /// Time spent in <see cref="Update"/> during the last frame in milliseconds, summed over every run
+        /// (the render group runs once per view); 0 when it was skipped.
+        /// </summary>
+        public double ElapsedMs => Marker.LastMs;
+
+        /// <summary>Times this system's updates in the <see cref="Profiler"/>, named after its type.</summary>
+        public ProfilerMarker Marker => _marker ??= ProfilerMarker.Get(GetType().Name);
+        private ProfilerMarker? _marker;
 
         /// <summary>The group that updates this system; null for the root groups.</summary>
         public SystemGroup? Group { get; internal set; }
@@ -84,15 +90,10 @@ namespace Freefall.Base
             for (int i = 0; i < _systems.Count; i++)
             {
                 var system = _systems[i];
-                if (!system.Enabled || (editor && !system.RunsInEditor))
-                {
-                    system.ElapsedMs = 0;
-                    continue;
-                }
+                if (!system.Enabled || (editor && !system.RunsInEditor)) continue;
 
-                long start = Stopwatch.GetTimestamp();
+                using var _ = system.Marker.Auto();
                 system.Update();
-                system.ElapsedMs = Stopwatch.GetElapsedTime(start).TotalMilliseconds;
             }
         }
 

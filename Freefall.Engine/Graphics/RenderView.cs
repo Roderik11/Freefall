@@ -345,22 +345,29 @@ namespace Freefall.Graphics
         {
             if (_graphicsDevice.IsDeviceLost) return;
 
-            // Wait for swap chain to signal it's ready for a new frame
-            if (_frameLatencyWaitableObject != IntPtr.Zero)
+            // CPU time spent here is the GPU (or the display) being behind, not work
+            using (_waitMarker.Auto())
             {
-                Kernel32.WaitForSingleObject(_frameLatencyWaitableObject, 1000);
-            }
-            
-            // Wait for the GPU to be done with this specific frame buffer from the previous cycle
-            SyncFrame(_frameIndex);
+                // Wait for swap chain to signal it's ready for a new frame
+                if (_frameLatencyWaitableObject != IntPtr.Zero)
+                {
+                    Kernel32.WaitForSingleObject(_frameLatencyWaitableObject, 1000);
+                }
 
-            // Ensure GPU has finished any pending copy queue texture uploads before we render
-            _graphicsDevice.WaitForCopyQueue();
+                // Wait for the GPU to be done with this specific frame buffer from the previous cycle
+                SyncFrame(_frameIndex);
+
+                // Ensure GPU has finished any pending copy queue texture uploads before we render
+                _graphicsDevice.WaitForCopyQueue();
+            }
             _graphicsDevice.FlushDeferredDisposals();
 
             // Reset the command allocator and list for this frame
             var cmd = _commandLists[_frameIndex];
             cmd.Reset();
+
+            // GPU pass timings are taken on the primary view's list only
+            if (this == Primary) GpuProfiler.BeginFrame(cmd.Native);
             
             // Set descriptor heaps ONCE per frame - critical for D3D12 performance!
             _srvHeapArray ??= new[] { _graphicsDevice.SrvHeap };
@@ -382,10 +389,16 @@ namespace Freefall.Graphics
              OnAfterRender?.Invoke(this);
         }
 
+        private static readonly ProfilerMarker _waitMarker = ProfilerMarker.Get("Wait for GPU");
+        private static readonly ProfilerMarker _presentMarker = ProfilerMarker.Get("Present");
+
         public void Present()
         {
+            using var _ = _presentMarker.Auto();
             var cmd = _commandLists[_frameIndex];
             cmd.ResourceBarrierTransition(_renderTargets[_frameIndex], ResourceStates.RenderTarget, ResourceStates.Present);
+
+            if (this == Primary) GpuProfiler.EndFrame(cmd.Native);
 
             try
             {
@@ -398,6 +411,7 @@ namespace Freefall.Graphics
                 throw;
             }
             _graphicsDevice.SubmitCommandList(cmd.Native);
+            if (this == Primary) GpuProfiler.Submitted(_graphicsDevice.CommandQueue);
             _graphicsDevice.DumpDebugMessages("frame");
 
             // Tearing support check

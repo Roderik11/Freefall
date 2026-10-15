@@ -237,40 +237,56 @@ namespace Freefall.Editor
             // Squid layout pass
             squidRenderer.SetContext(cmd.Native, view.Width, view.Height);
 
-            // Process any AI agent commands queued by the HTTP server
-            commandServer?.ProcessCommands();
+            using (_commandsMarker.Auto())
+            {
+                // Process any AI agent commands queued by the HTTP server
+                commandServer?.ProcessCommands();
 
-            // Agent screenshots: cue → settle → capture, one step per frame (never blocks here)
-            Mcp.ScreenshotScheduler.Tick();
+                // Agent screenshots: cue → settle → capture, one step per frame (never blocks here)
+                Mcp.ScreenshotScheduler.Tick();
+            }
 
             // Update active desktop (landing page or editor)
             if (activeDesktop is EditorUI editor)
             {
-                editor.Update();
+                using (_editorUiMarker.Auto())
+                {
+                    editor.Update();
 
-                // The game's UI over the scene viewport in play mode (after the editor's: it takes
-                // the mouse only where the editor left it to the picture)
-                GameUIHost.Update(editor);
+                    // The game's UI over the scene viewport in play mode (after the editor's: it takes
+                    // the mouse only where the editor left it to the picture)
+                    GameUIHost.Update(editor);
+                }
 
                 // find all active camera
                 var cameras = ComponentCache<Camera>.All;
-                
-                foreach(var camera in cameras)
+
+                using (_sceneViewMarker.Auto())
                 {
-                    if(camera != Camera.Main) continue;
-                    camera.Render(cmd.Native);
-                    CommandBuffer.Clear();
+                    PixMarker.Begin(cmd.Native, "Scene view");
+                    foreach(var camera in cameras)
+                    {
+                        if(camera != Camera.Main) continue;
+                        camera.Render(cmd.Native);
+                        CommandBuffer.Clear();
+                    }
+                    PixMarker.End(cmd.Native);
                 }
 
                 // Render headless views (preview viewports etc.) on the primary command list.
-                foreach (var headless in RenderView.All)
+                using (_previewsMarker.Auto())
                 {
-                    if (headless == view) continue;
-                    if (!headless.Enabled) continue;
-                    if (headless.HasSwapChain) continue;
-                    if (headless.OnRender == null) continue;
+                    PixMarker.Begin(cmd.Native, "Previews");
+                    foreach (var headless in RenderView.All)
+                    {
+                        if (headless == view) continue;
+                        if (!headless.Enabled) continue;
+                        if (headless.HasSwapChain) continue;
+                        if (headless.OnRender == null) continue;
 
-                    headless.OnRender(headless);
+                        headless.OnRender(headless);
+                    }
+                    PixMarker.End(cmd.Native);
                 }
             }
             else if (activeDesktop is LandingDesktop landing)
@@ -297,9 +313,20 @@ namespace Freefall.Editor
             cmd.SetViewport(new Viewport(0, 0, view.Width, view.Height, 0.0f, 1.0f));
             cmd.SetScissorRect(new RectI(0, 0, view.Width, view.Height));
             cmd.ClearRenderTargetView(view.BackBufferTarget, new Color4(0, 0, 0, 1));
-            activeDesktop.Draw();
+            using (_editorUiDrawMarker.Auto())
+            {
+                PixMarker.Begin(cmd.Native, "Editor UI");
+                activeDesktop.Draw();
+                PixMarker.End(cmd.Native);
+            }
 
             view.Present();
         }
+
+        private static readonly ProfilerMarker _commandsMarker = ProfilerMarker.Get("Editor commands");
+        private static readonly ProfilerMarker _editorUiMarker = ProfilerMarker.Get("Editor UI");
+        private static readonly ProfilerMarker _sceneViewMarker = ProfilerMarker.Get("Scene view");
+        private static readonly ProfilerMarker _previewsMarker = ProfilerMarker.Get("Previews");
+        private static readonly ProfilerMarker _editorUiDrawMarker = ProfilerMarker.Get("Editor UI draw");
     }
 }

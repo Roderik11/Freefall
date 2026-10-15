@@ -384,23 +384,22 @@ namespace Freefall.Graphics
             /// If 0, a simple frustum (no Hi-Z) is built internally.</param>
             public void Execute(ID3D12GraphicsCommandList commandList, GraphicsDevice device, RenderPass pass, ulong frustumGpuAddr = 0)
             {
-                var totalSw = System.Diagnostics.Stopwatch.StartNew();
-                                
                 // 0. Execute custom actions (compute shader dispatches etc.) before batch processing
                 if (current.customQueues.TryGetValue(pass, out var actions) && actions.Count > 0)
                 {
+                    using var _ = _customActionsMarker.Auto(actions.Count);
                     foreach (var action in actions)
                         action(commandList);
                     actions.Clear();
                 }
+
+                var batching = _batchingMarker.Auto();
 
                 // Apply persistent add/remove requests queued during Draw(). Must happen before any
                 // batch is cleared and merged this frame (persistent records sit in front of the frame's draws).
                 FlushPersistent();
 
                 // 1. Batch draw calls by Effect
-                var batchingSw = System.Diagnostics.Stopwatch.StartNew();
-
                 activeBatches.Clear();
 
                 int drawCallCount = 0;
@@ -464,10 +463,10 @@ namespace Freefall.Graphics
                         batch.Deactivate();
                 }
 
-                batchingSw.Stop();
+                batching.Dispose();
+                var build = _buildMarker.Auto(activeBatches.Count);
 
                 // GPU culling requires Culler to be initialized
-                var sortDrawCallsSw = System.Diagnostics.Stopwatch.StartNew();
                 bool usingGPUPath = Culler != null && pass == RenderPass.Opaque;
 
                 // 2. Build frustum if not provided externally
@@ -488,7 +487,6 @@ namespace Freefall.Graphics
                     batch.Material.SetPass(pass);
                 
                 // 3. Upload transforms, materials (always needed)
-                var buildSw = System.Diagnostics.Stopwatch.StartNew();
                 foreach (var batch in activeBatches)
                     batch.UploadInstanceData(device);
                 
@@ -504,18 +502,15 @@ namespace Freefall.Graphics
                 
                 if (usingGPUPath)
                     CommandBuffer.Culler?.CopyCullStatsToReadback(commandList);
-                
-                buildSw.Stop();
-                sortDrawCallsSw.Stop();
+
+                build.Dispose();
 
                 // 7. Draw (topology set per-batch: patch for tessellation, triangle list otherwise)
-                var applySw = System.Diagnostics.Stopwatch.StartNew();
-                var drawSw = System.Diagnostics.Stopwatch.StartNew();
-                
+                using var draw = _drawMarker.Auto(activeBatches.Count);
+
                 foreach (var batch in activeBatches)
                 {
                     // Apply Material (PSO)
-                    applySw.Start();
                     batch.Material.Apply(commandList, device);
                     // Push constant slot 16: debug mode (not touched by command signature slots 2-15)
                     commandList.SetGraphicsRoot32BitConstant(0, (uint)Engine.Settings.DebugVisualizationMode, 16);
@@ -528,22 +523,17 @@ namespace Freefall.Graphics
                         var renderer = DeferredRenderer.Current;
                         if (renderer != null)
                         {
-                            commandList.SetGraphicsRoot32BitConstant(0, renderer.ShadowTextureArray?.BindlessIndex ?? 0u, 0);
+                            commandList.SetGraphicsRoot32BitConstant(0, renderer.ShadowMapIndex, 0);
                             commandList.SetGraphicsRoot32BitConstant(0, renderer.CompositeSnapshot?.BindlessIndex ?? 0u, 1);
                         }
                     }
-                    applySw.Stop();
-                    
-                    drawSw.Start();
+
                     batch.Draw(commandList, device);
-                    drawSw.Stop();
                 }
-                
+
                 foreach (var batch in activeBatches)
                     batch.ResetBufferState(commandList);
-                    
-                totalSw.Stop();
-                
+
                 bool isOpaque = pass == RenderPass.Opaque;
                 
                 // Expose stats for title bar
@@ -552,12 +542,12 @@ namespace Freefall.Graphics
                     CommandBuffer.LastDrawCallCount = drawCallCount;
                     CommandBuffer.LastBatchCount = activeBatches.Count;
                 }
-                
-                if (Engine.FrameIndex % 60 == 0 && isOpaque)
-                {
-                  //  Debug.Log($"[Pass.Execute] DrawCalls: {drawCallCount} | Batches: {activeBatches.Count} | Total: {totalSw.Elapsed.TotalMilliseconds:F2}ms | Batching: {batchingSw.Elapsed.TotalMilliseconds:F2}ms | BuildBuffers: {buildSw.Elapsed.TotalMilliseconds:F2}ms | Material.Apply: {applySw.Elapsed.TotalMilliseconds:F2}ms | DrawFast: {drawSw.Elapsed.TotalMilliseconds:F2}ms");
-                }
             }
+
+            private static readonly ProfilerMarker _customActionsMarker = ProfilerMarker.Get("Compute dispatches");
+            private static readonly ProfilerMarker _batchingMarker = ProfilerMarker.Get("Batching");
+            private static readonly ProfilerMarker _buildMarker = ProfilerMarker.Get("Build + cull");
+            private static readonly ProfilerMarker _drawMarker = ProfilerMarker.Get("Draw batches");
         }
 
         private Pass[] passes;

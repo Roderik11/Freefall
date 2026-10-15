@@ -22,6 +22,7 @@ namespace Freefall.Editor
         public ViewportControl? SceneViewport;
         public DockGroup? DebugConsole;
         public DockGroup? Stats;
+        public DockGroup? ProfilerTab;
         public DockGroup? Graph;
 
         private DropDownButton componentsItem;
@@ -400,6 +401,7 @@ namespace Freefall.Editor
             InspectorPanel = new InspectorControl();
             Inspector = DockArea.DockContent(Scene!, "Inspector", InspectorPanel, DockStyle.Right);
             Stats = DockArea.DockContent(Inspector!, "Stats", new StatsControl(), DockStyle.Fill);
+            ProfilerTab = DockArea.DockContent(Stats!, "Profiler", new ProfilerControl(), DockStyle.Fill);
 
             // Assets panel (below scene)
             AssetBrowser = new AssetBrowserControl();

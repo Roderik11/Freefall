@@ -30,7 +30,19 @@ namespace Freefall.Graphics
         public RenderTexture2D LdrOutput = null!;     // Final tonemapped output (R8G8B8A8_UNorm)
         public RenderTexture2D? CompositeSnapshot;
         public DepthTextureArray2D ShadowTextureArray = null!;
-        
+
+        /// <summary>
+        /// Bindless index of the shadow cascades rendered this frame, or 0 when none were (shadows switched off
+        /// in the settings, or no light queued its cascades). Shaders skip shadowing for 0, so pass this rather
+        /// than ShadowTextureArray.BindlessIndex, which would show the last cascades ever rendered.
+        /// </summary>
+        public uint ShadowMapIndex => _shadowsRendered ? ShadowTextureArray.BindlessIndex : 0u;
+        private bool _shadowsRendered;
+
+        // The shadow array is created once in DepthWrite and survives resizes, so its state is tracked here and
+        // not through _isFirstFrame (which a resize resets)
+        private ResourceStates _shadowMapState = ResourceStates.DepthWrite;
+
         /// <summary>Hi-Z depth pyramid, matched to this pipeline's depth buffer dimensions.</summary>
         public HiZPyramid? HiZPyramid { get; private set; }
 
@@ -341,87 +353,89 @@ namespace Freefall.Graphics
             return FrustumConstantsAddress;
         }
 
+        // CPU time of recording each pass (what the GPU spends on it is not measured here)
+        private static readonly ProfilerMarker _gbufferMarker = ProfilerMarker.Get("G-buffer");
+        private static readonly ProfilerMarker _drawSourcesMarker = ProfilerMarker.Get("Draw sources");
+        private static readonly ProfilerMarker _transformUploadMarker = ProfilerMarker.Get("Transform upload");
+        private static readonly ProfilerMarker _opaqueMarker = ProfilerMarker.Get("Opaque");
+        private static readonly ProfilerMarker _shadowsMarker = ProfilerMarker.Get("Shadows");
+        private static readonly ProfilerMarker _skyMarker = ProfilerMarker.Get("Sky");
+        private static readonly ProfilerMarker _transparentMarker = ProfilerMarker.Get("Transparent");
+        private static readonly ProfilerMarker _lightingMarker = ProfilerMarker.Get("Lighting");
+        private static readonly ProfilerMarker _composeMarker = ProfilerMarker.Get("Compose");
+        private static readonly ProfilerMarker _forwardMarker = ProfilerMarker.Get("Forward");
+        private static readonly ProfilerMarker _postMarker = ProfilerMarker.Get("Post-processing");
+        private static readonly ProfilerMarker _blitMarker = ProfilerMarker.Get("Blit");
+
         public override void Render(Camera camera, ID3D12GraphicsCommandList list)
         {
             // Set Current for duration of this render so DirectionalLight/other components
             // can access G-buffer textures (essential for non-primary editor viewports)
             var previousCurrent = Current;
             Current = this;
-            
-            var sw = System.Diagnostics.Stopwatch.StartNew();
 
-            PixMarker.Begin(list, "Frame");
+            PixMarker.Begin(list, "Deferred renderer");
 
             // Ensure Materials buffer is bound (creates SRV for bindless access)
             Material.BindMaterialsBuffer(list, Engine.Device);
 
             // 1. G-Buffer Pass (includes shadow rendering internally)
-            var gbufferTime = System.Diagnostics.Stopwatch.StartNew();
-            FillGBuffer(camera, list);
-            gbufferTime.Stop();
+            using (_gbufferMarker.Auto())
+                FillGBuffer(camera, list);
 
             // 2. Light Pass
-            var lightTime = System.Diagnostics.Stopwatch.StartNew();
-            FillLightBuffer(camera, list);
-            lightTime.Stop();
+            using (_lightingMarker.Auto())
+                FillLightBuffer(camera, list);
 
             // 3. Composition (HDR — no tonemapping)
-            var composeTime = System.Diagnostics.Stopwatch.StartNew();
-            Compose(camera, list);
-            composeTime.Stop();
+            using (_composeMarker.Auto())
+                Compose(camera, list);
 
             // 4. Forward pass — renders directly to HDR Composite with depth read.
             //    Depth is already in PixelShaderResource after FillGBuffer.
             //    Composite is still in RenderTarget from Compose.
-            var forwardTime = System.Diagnostics.Stopwatch.StartNew();
-            RenderForward(camera, list);
-            forwardTime.Stop();
+            using (_forwardMarker.Auto())
+                RenderForward(camera, list);
 
-            // 5. Bloom (reads HDR Composite — now includes both deferred + forward)
-            if (BloomPyramid != null && Engine.Settings.EnableBloom)
+            using (_postMarker.Auto())
             {
-                // Transition depth to NonPixelShaderResource for bloom sky mask
-                Transition(list, Depth.Native, ResourceStates.PixelShaderResource, ResourceStates.NonPixelShaderResource);
-                
-                PixMarker.Begin(list, "Bloom");
-                DispatchBloom(list);
-                PixMarker.End(list);
-                
-                // Restore depth state for next frame
-                Transition(list, Depth.Native, ResourceStates.NonPixelShaderResource, ResourceStates.PixelShaderResource);
-            }
+                // 5. Bloom (reads HDR Composite — now includes both deferred + forward)
+                if (BloomPyramid != null && Engine.Settings.EnableBloom)
+                {
+                    // Transition depth to NonPixelShaderResource for bloom sky mask
+                    Transition(list, Depth.Native, ResourceStates.PixelShaderResource, ResourceStates.NonPixelShaderResource);
 
-            // 6. Finalize (HDR → LDR: bloom + tonemap + gamma + dither)
-            PixMarker.Begin(list, "Finalize");
-            Finalize(list);
-            PixMarker.End(list);
+                    PixMarker.Begin(list, "Bloom");
+                    DispatchBloom(list);
+                    PixMarker.End(list);
 
-            // 7. SMAA Anti-Aliasing (optional, on LDR output)
-            if (Smaa != null && Engine.Settings.EnableSMAA)
-            {
-                PixMarker.Begin(list, "SMAA");
-                var desc = LdrOutput.Native.Description;
-                Smaa.Execute(list, LdrOutput.Native, LdrOutput.BindlessIndex, (int)desc.Width, (int)desc.Height);
+                    // Restore depth state for next frame
+                    Transition(list, Depth.Native, ResourceStates.NonPixelShaderResource, ResourceStates.PixelShaderResource);
+                }
+
+                // 6. Finalize (HDR → LDR: bloom + tonemap + gamma + dither)
+                PixMarker.Begin(list, "Finalize");
+                Finalize(list);
                 PixMarker.End(list);
+
+                // 7. SMAA Anti-Aliasing (optional, on LDR output)
+                if (Smaa != null && Engine.Settings.EnableSMAA)
+                {
+                    PixMarker.Begin(list, "SMAA");
+                    var desc = LdrOutput.Native.Description;
+                    Smaa.Execute(list, LdrOutput.Native, LdrOutput.BindlessIndex, (int)desc.Width, (int)desc.Height);
+                    PixMarker.End(list);
+                }
             }
 
             // 8. Blit to Backbuffer
-            var blitTime = System.Diagnostics.Stopwatch.StartNew();
-            BlitToBackBuffer(camera, list);
-            blitTime.Stop();
+            using (_blitMarker.Auto())
+                BlitToBackBuffer(camera, list);
 
-            PixMarker.End(list); // Frame
-            
+            PixMarker.End(list); // Deferred renderer
+
             _isFirstFrame = false;
-            
-            sw.Stop();
-            
-            // Per-pass timing (uncomment for profiling)
-            //if (Engine.FrameIndex % 60 == 0)
-            //{
-            //  Debug.Log($"[DeferredRenderer] Total: {sw.Elapsed.TotalMilliseconds:F2}ms | GBuffer: {gbufferTime.Elapsed.TotalMilliseconds:F2}ms | Light: {lightTime.Elapsed.TotalMilliseconds:F2}ms | Compose: {composeTime.Elapsed.TotalMilliseconds:F2}ms | Fwd: {forwardTime.Elapsed.TotalMilliseconds:F2}ms | Blit: {blitTime.Elapsed.TotalMilliseconds:F2}ms");
-            //}
-            
+
             // Restore previous Current (stack-safe for nested viewports)
             Current = previousCurrent;
         }
@@ -458,17 +472,15 @@ namespace Freefall.Graphics
 
              // Run the RenderGroup: IDraw components (ScriptDrawSystem) and draw systems enqueue their commands.
              // This enqueues DrawShadows callback into ShadowMap pass AND opaque batches
-             var drawTime = System.Diagnostics.Stopwatch.StartNew();
              Systems.RunDraw();
              // Components with GPU-resident draws (no Draw()) update their registrations here
-             CommandBuffer.RefreshDrawSources();
-             drawTime.Stop();
+             using (_drawSourcesMarker.Auto())
+                 CommandBuffer.RefreshDrawSources();
 
              // Upload transforms AFTER Draw() so per-frame SetTransform() calls
              // (e.g. terrain patch pool-slot reassignment) are captured before GPU reads
-             var uploadTime = System.Diagnostics.Stopwatch.StartNew();
-             TransformBuffer.Instance?.Upload();
-             uploadTime.Stop();
+             using (_transformUploadMarker.Auto())
+                 TransformBuffer.Instance?.Upload();
 
              // === GBuffer Draw ===
              // Cache GBuffer RTV handles to avoid per-frame allocation
@@ -497,27 +509,32 @@ namespace Freefall.Graphics
              list.RSSetScissorRect(scissor);
 
              // 1. Opaque pass FIRST — builds InstanceBatch GPU buffers
-             var opaqueTime = System.Diagnostics.Stopwatch.StartNew();
-             PixMarker.Begin(list, "Opaque");
-             ulong frustumGpuAddr = UploadFrustumConstants(camera, Engine.Device);
-             CommandBuffer.Execute(RenderPass.Opaque, list, Engine.Device, frustumGpuAddr);
-             PixMarker.End(list); // Opaque
-             opaqueTime.Stop();
+             using (_opaqueMarker.Auto())
+             {
+                 PixMarker.Begin(list, "Opaque");
+                 ulong frustumGpuAddr = UploadFrustumConstants(camera, Engine.Device);
+                 CommandBuffer.Execute(RenderPass.Opaque, list, Engine.Device, frustumGpuAddr);
+                 PixMarker.End(list); // Opaque
+             }
 
              // 2. Shadow pass — uses opaque batches (now built) for CullShadow/DrawShadow
              //    Must run AFTER Opaque so InstanceBatch GPU state is valid.
-             var shadowTime = System.Diagnostics.Stopwatch.StartNew();
-             if (ShadowTextureArray != null)
+             //    Only when shadows are on and a light queued its cascades (DirectionalLight.Draw, above);
+             //    otherwise readers get ShadowMapIndex 0 and the grass/terrain shadow actions are dropped
+             //    with the rest of the frame's queues (CommandBuffer.Clear).
+             _shadowsRendered = false;
+             if (ShadowTextureArray != null && Engine.Settings.EnableShadows
+                 && CommandBuffer.HasPendingCommands(RenderPass.ShadowMap))
              {
+                 using var _ = _shadowsMarker.Auto();
                  PixMarker.Begin(list, "Shadows");
                  // Transition shadow texture to DepthWrite for rendering
-                 var shadowFrom = _isFirstFrame ? ResourceStates.DepthWrite : ResourceStates.PixelShaderResource;
-                 if (shadowFrom != ResourceStates.DepthWrite)
+                 if (_shadowMapState != ResourceStates.DepthWrite)
                  {
                      list.ResourceBarrierTransition(ShadowTextureArray.Native,
-                         ResourceStates.PixelShaderResource, ResourceStates.DepthWrite);
+                         _shadowMapState, ResourceStates.DepthWrite);
                  }
-                 
+
                  CommandBuffer.Execute(RenderPass.ShadowMap, list, Engine.Device);
                  
                  // Generate shadow Hi-Z pyramid from this frame's shadow depth
@@ -539,10 +556,12 @@ namespace Freefall.Graphics
                  else
                  {
                      // No Hi-Z — transition directly to PixelShaderResource for light pass
-                     list.ResourceBarrierTransition(ShadowTextureArray.Native, 
+                     list.ResourceBarrierTransition(ShadowTextureArray.Native,
                          ResourceStates.DepthWrite, ResourceStates.PixelShaderResource);
                  }
-                 
+                 _shadowMapState = ResourceStates.PixelShaderResource;
+                 _shadowsRendered = true;
+
                  // Shadow pass changes render targets and viewport for depth rendering.
                  // Restore GBuffer state before Sky pass.
                  // Note: camera.SetShaderParams() is NOT needed here because the shadow pass
@@ -552,24 +571,21 @@ namespace Freefall.Graphics
                  list.RSSetScissorRect(scissor);
                  PixMarker.End(list); // Shadows
              }
-             shadowTime.Stop();
-             
+
              // 3. Sky pass
-             var skyTime = System.Diagnostics.Stopwatch.StartNew();
-             PixMarker.Begin(list, "Sky");
-             CommandBuffer.Execute(RenderPass.Sky, list, Engine.Device);
-             PixMarker.End(list); // Sky
-             skyTime.Stop();
-             
-             // 4. Transparent pass — renders after opaque+sky, can depth-test against both
-             PixMarker.Begin(list, "Transparent");
-             CommandBuffer.Execute(RenderPass.Transparent, list, Engine.Device);
-             PixMarker.End(list); // Transparent
-             
-             // Log every 60 frames
-             if (Engine.FrameIndex % 60 == 0)
+             using (_skyMarker.Auto())
              {
-                 //Debug.Log($"[FillGBuffer] Draw(): {drawTime.Elapsed.TotalMilliseconds:F2}ms | Upload: {uploadTime.Elapsed.TotalMilliseconds:F2}ms | Shadow: {shadowTime.Elapsed.TotalMilliseconds:F2}ms | Opaque: {opaqueTime.Elapsed.TotalMilliseconds:F2}ms | Sky: {skyTime.Elapsed.TotalMilliseconds:F2}ms");
+                 PixMarker.Begin(list, "Sky");
+                 CommandBuffer.Execute(RenderPass.Sky, list, Engine.Device);
+                 PixMarker.End(list); // Sky
+             }
+
+             // 4. Transparent pass — renders after opaque+sky, can depth-test against both
+             using (_transparentMarker.Auto())
+             {
+                 PixMarker.Begin(list, "Transparent");
+                 CommandBuffer.Execute(RenderPass.Transparent, list, Engine.Device);
+                 PixMarker.End(list); // Transparent
              }
 
              // End GBuffer
@@ -605,7 +621,8 @@ namespace Freefall.Graphics
              
              // SDSM: Analyze depth buffer for adaptive cascade splits
              // DepthGBuffer is still in NonPixelShaderResource — perfect for compute SRV reads
-             if (CommandBuffer.Culler?.SdsmReady == true)
+             // Only feeds the shadow cascades: skipped while no shadows are rendered
+             if (_shadowsRendered && CommandBuffer.Culler?.SdsmReady == true)
              {
                  PixMarker.Begin(list, "SDSM Depth Analysis");
                  int depthWidth = (int)DepthGBuffer.Native.Description.Width;

@@ -170,54 +170,62 @@ namespace Freefall
             Time.Initialize();
         }
 
+        private static readonly ProfilerMarker _disposalsMarker = ProfilerMarker.Get("Deferred disposals");
+        private static readonly ProfilerMarker _assetReloadMarker = ProfilerMarker.Get("Asset reload");
+        private static readonly ProfilerMarker _shaderReloadMarker = ProfilerMarker.Get("Shader reload");
+        private static readonly ProfilerMarker _physicsMarker = ProfilerMarker.Get("Physics");
+        private static readonly ProfilerMarker _navigationMarker = ProfilerMarker.Get("Navigation");
+        private static readonly ProfilerMarker _updateMarker = ProfilerMarker.Get("Update");
+        private static readonly ProfilerMarker _resizeMarker = ProfilerMarker.Get("Resize");
+        private static readonly ProfilerMarker _renderMarker = ProfilerMarker.Get("Render");
+        private static readonly ProfilerMarker _cameraMarker = ProfilerMarker.Get("Camera");
+        private static readonly ProfilerMarker _queueMarker = ProfilerMarker.Get("Main thread queue");
+
         public static void Tick()
         {
             TickCount++;
-
-            var _tickSw = System.Diagnostics.Stopwatch.StartNew();
 
             Time.Update();
             Input.Update();
 
             // Release GPU buffers from previous batch resizes (deferred N frames for safety)
-            var _flushDisposeSw = System.Diagnostics.Stopwatch.StartNew();
-            Graphics.InstanceBatch.FlushDeferredDisposals();
-            Device?.FlushFrameDeferredDisposals();
-            _flushDisposeSw.Stop();
+            using (_disposalsMarker.Auto())
+            {
+                Graphics.InstanceBatch.FlushDeferredDisposals();
+                Device?.FlushFrameDeferredDisposals();
+            }
 
             // Hot-reload loaded assets whose source was reimported (auto-import, asset_refresh, inspector
             // reimport). Before Update/Draw so the whole frame sees the new data.
-            Assets?.ReloadReimported();
+            using (_assetReloadMarker.Auto())
+                Assets?.ReloadReimported();
 
             // Recompile shaders whose .fx/.hlsl file changed on disk (same point: nothing is recording yet)
-            Graphics.ShaderHotReload.Update();
-
-            // Flush pending entity additions before Update/Render
-            //var _flushPendingSw = System.Diagnostics.Stopwatch.StartNew();
-            //Base.EntityManager.FlushPending();
-            //_flushPendingSw.Stop();
+            using (_shaderReloadMarker.Auto())
+                Graphics.ShaderHotReload.Update();
 
             // Physics (fixed-timestep)
-            var _physicsSw = System.Diagnostics.Stopwatch.StartNew();
-            PhysicsWorld.Update((float)Time.Delta);
-            NavMeshWorld.Update((float)Time.Delta);
-            _physicsSw.Stop();
-            
+            using (_physicsMarker.Auto())
+                PhysicsWorld.Update((float)Time.Delta);
+            using (_navigationMarker.Auto())
+                NavMeshWorld.Update((float)Time.Delta);
+
             // Update Logic
-            var _updateSw = System.Diagnostics.Stopwatch.StartNew();
-            Graphics.Overlay.Clear();   // what game code draws over the picture lasts one frame
-            try
+            using (_updateMarker.Auto())
             {
-                Update();
+                Graphics.Overlay.Clear();   // what game code draws over the picture lasts one frame
+                try
+                {
+                    Update();
+                }
+                catch when (!Device.IsDeviceLost && Device.NativeDevice.DeviceRemovedReason.Failure)
+                {
+                    // A component creating GPU resources in Update is often the first to notice a removed
+                    // device. Write the reason (+ DRED) before the exception takes the process down.
+                    Device.LogDeviceRemoved("Engine.Update");
+                    throw;
+                }
             }
-            catch when (!Device.IsDeviceLost && Device.NativeDevice.DeviceRemovedReason.Failure)
-            {
-                // A component creating GPU resources in Update is often the first to notice a removed
-                // device. Write the reason (+ DRED) before the exception takes the process down.
-                Device.LogDeviceRemoved("Engine.Update");
-                throw;
-            }
-            _updateSw.Stop();
 
             // --- Process all deferred resizes before rendering ---
             // Must sync GPU first — previous frames may still be using resources
@@ -229,6 +237,7 @@ namespace Freefall
 
             if (anyResizePending)
             {
+                using var _ = _resizeMarker.Auto();
                 RenderView.Primary?.WaitForGpu();
                 foreach (var v in RenderView.All)
                     v.ProcessPendingResize();
@@ -245,79 +254,64 @@ namespace Freefall
             _renderViews.Clear();
             _renderViews.AddRange(RenderView.All);
 
-            var _renderSw = System.Diagnostics.Stopwatch.StartNew();
-            double _prepareTotalMs = 0, _camRenderTotalMs = 0, _presentTotalMs = 0;
-
-            foreach (var view in _renderViews)
+            using (_renderMarker.Auto())
             {
-                if (!view.Enabled) continue;
-                if (!view.HasSwapChain) continue; // Headless views rendered inside primary view's OnRender
-
-                if (view.OnRender != null)
+                foreach (var view in _renderViews)
                 {
-                    view.OnRender(view);
-                }
-                else
-                {
-                    var _prepSw = System.Diagnostics.Stopwatch.StartNew();
-                    view.Prepare();
-                    _prepSw.Stop();
-                    _prepareTotalMs += _prepSw.Elapsed.TotalMilliseconds;
+                    if (!view.Enabled) continue;
+                    if (!view.HasSwapChain) continue; // Headless views rendered inside primary view's OnRender
 
-                    var _camSw = System.Diagnostics.Stopwatch.StartNew();
-                    var cam = Camera.Main;
-                    if (cam != null && cam.Target == view)
-                        cam.Render(view.CommandList.Native);
+                    if (view.OnRender != null)
+                    {
+                        view.OnRender(view);
+                    }
+                    else
+                    {
+                        view.Prepare();
 
-                    view.OnAfterRender?.Invoke(view);
-                    _camSw.Stop();
-                    _camRenderTotalMs += _camSw.Elapsed.TotalMilliseconds;
+                        using (_cameraMarker.Auto())
+                        {
+                            var cam = Camera.Main;
+                            if (cam != null && cam.Target == view)
+                                cam.Render(view.CommandList.Native);
 
-                    var _presSw = System.Diagnostics.Stopwatch.StartNew();
-                    view.Present();
-                    _presSw.Stop();
-                    _presentTotalMs += _presSw.Elapsed.TotalMilliseconds;
+                            view.OnAfterRender?.Invoke(view);
+                        }
+
+                        view.Present();
+                    }
                 }
             }
-            _renderSw.Stop();
 
             CommandBuffer.Clear();
-            
+
             // Drain main-thread queue AFTER Present (GPU fence ensures no commands in flight,
             // so creating GPU resources like upload buffers and SRV descriptors is safe here).
             // Time-budgeted: process items until 4ms spent to avoid frame hitches.
-            var _queueSw = System.Diagnostics.Stopwatch.StartNew();
-            int _queueItemCount = 0;
-            var budgetStart = System.Diagnostics.Stopwatch.GetTimestamp();
-            long budgetTicks = System.Diagnostics.Stopwatch.Frequency * 4 / 1000; // 4ms
-            while (_mainThreadQueue.TryDequeue(out var work))
+            if (!_mainThreadQueue.IsEmpty)
             {
-                try
+                using var _ = _queueMarker.Auto();
+                var budgetStart = System.Diagnostics.Stopwatch.GetTimestamp();
+                long budgetTicks = System.Diagnostics.Stopwatch.Frequency * 4 / 1000; // 4ms
+                while (_mainThreadQueue.TryDequeue(out var work))
                 {
-                    work.Action?.Invoke();
-                    work.Tcs?.SetResult(true);
+                    try
+                    {
+                        work.Action?.Invoke();
+                        work.Tcs?.SetResult(true);
+                    }
+                    catch (Exception ex)
+                    {
+                        work.Tcs?.SetException(ex);
+                    }
+                    if (System.Diagnostics.Stopwatch.GetTimestamp() - budgetStart >= budgetTicks)
+                        break;
                 }
-                catch (Exception ex)
-                {
-                    work.Tcs?.SetException(ex);
-                }
-                _queueItemCount++;
-                if (System.Diagnostics.Stopwatch.GetTimestamp() - budgetStart >= budgetTicks)
-                    break;
             }
-            _queueSw.Stop();
-
-            _tickSw.Stop();
-
-            // Per-frame timing (uncomment for profiling)
-            //if (Engine.FrameIndex % 60 == 0)
-            //{
-            //    Console.Error.WriteLine($"[Tick] {_tickSw.Elapsed.TotalMilliseconds:F1}ms | " +
-            //        $"Render:{_renderSw.Elapsed.TotalMilliseconds:F1} " +
-            //        $"(Prep:{_prepareTotalMs:F1} Cam:{_camRenderTotalMs:F1} Pres:{_presentTotalMs:F1})");
-            //}
 
             Input.ClearFrameCallbacks();
+
+            Profiler.EndFrame();
         }
 
         private static void Update()

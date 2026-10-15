@@ -161,8 +161,9 @@ namespace Freefall.Components
         // Called by DeferredRenderer via CommandBuffer
         public void Draw()
         {
-            // Enqueue shadow rendering first (runs before light pass)
-            if (CastShadows && DeferredRenderer.Current?.ShadowTextureArray != null)
+            // Enqueue shadow rendering first (runs before light pass). Nothing queued = the renderer skips
+            // its whole shadow pass (cascades, shadow Hi-Z, SDSM) and readers get no shadow map.
+            if (CastShadows && Engine.Settings.EnableShadows && DeferredRenderer.Current?.ShadowTextureArray != null)
                 CommandBuffer.Enqueue(RenderPass.ShadowMap, DrawShadows);
             
             CommandBuffer.Enqueue(RenderPass.Light, DrawLight);
@@ -239,11 +240,11 @@ namespace Freefall.Components
             var desc = renderer.LightBuffer.Native.Description;
             lightCS.SetPushConstant("NormalTex", renderer.Normals.BindlessIndex);
             lightCS.SetPushConstant("DepthTex", renderer.Depth.BindlessIndex);
-            lightCS.SetPushConstant("ShadowMap", Engine.Settings.EnableShadows ? (renderer.ShadowTextureArray?.BindlessIndex ?? 0u) : 0u);
+            lightCS.SetPushConstant("ShadowMap", renderer.ShadowMapIndex);
             lightCS.SetPushConstant("DepthGBuf", renderer.DepthGBuffer.BindlessIndex);
             lightCS.SetPushConstant("AlbedoTex", renderer.Albedo.BindlessIndex);
             lightCS.SetPushConstant("DataTex", renderer.Data.BindlessIndex);
-            lightCS.SetPushConstant("LightingCascadeSRV", Engine.Settings.EnableShadows ? _activeLightingCascadeSrv : 0u);
+            lightCS.SetPushConstant("LightingCascadeSRV", renderer.ShadowMapIndex != 0 ? _activeLightingCascadeSrv : 0u);
             lightCS.SetPushConstant("OutputUAV", renderer.LightBuffer.UavIndex);
             lightCS.SetPushConstant("ScreenWidth", (uint)desc.Width);
             lightCS.SetPushConstant("ScreenHeight", (uint)desc.Height);

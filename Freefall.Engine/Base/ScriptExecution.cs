@@ -9,6 +9,8 @@ namespace Freefall.Base
     {
         internal static List<IComponentCache> list = new List<IComponentCache>();
 
+        private static readonly ProfilerMarker _wakeUpMarker = ProfilerMarker.Get("Wake-up");
+
         internal static void Add(IComponentCache cache)
         {
             list.Add(cache);
@@ -30,6 +32,8 @@ namespace Freefall.Base
         /// </summary>
         public static void WakeUp()
         {
+            using var _ = _wakeUpMarker.Auto();
+
             for (int i = 0; i < list.Count; i++)
                 list[i].Early();
 

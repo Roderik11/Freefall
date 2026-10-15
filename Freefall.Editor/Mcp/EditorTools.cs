@@ -125,8 +125,18 @@ namespace Freefall.Editor.Mcp
         public static Task<CallToolResult> ConsoleClear() => McpBridge.Get("/api/console/clear");
 
         [McpServerTool(Name = "engine_stats", Title = "Engine stats", ReadOnly = true, OpenWorld = false)]
-        [Description("Frame stats: fps, frame time, entity count, render counters (batches, draw calls, visible/occluded, grass and mesh instances), and the system tree in update order with each system's last update time in ms.")]
+        [Description("Frame stats: fps, frame time, entity count, render counters (batches, draw calls, visible/occluded, grass and mesh instances), and the system tree in update order with each system's time in the last frame in ms. For where the frame's CPU time goes, use 'profiler'.")]
         public static Task<CallToolResult> EngineStats() => McpBridge.Get("/api/debug/stats");
+
+        [McpServerTool(Name = "profiler", Title = "CPU profiler", ReadOnly = true, OpenWorld = false)]
+        [Description("Where the frame's time goes. 'tree' is main-thread CPU time: engine tick phases, systems, each component type's " +
+                     "Update/Draw/wake-up loop (items = components), render passes (command recording), editor UI; 'Wait for GPU' is the " +
+                     "CPU waiting for the GPU. 'gpuTree' is GPU time per PIX region (G-buffer passes, shadows, lighting, post, editor UI) " +
+                     "on the primary command list, from timestamp queries. Average and max ms over the last 'frames' frames (max 300), " +
+                     "plus KB allocated on the main thread; 'slowest' shows the slowest of those frames instead. Sections under 'minMs' " +
+                     "(unless they spike to 10x that) are left out. Also shown live in the editor's Profiler tab.")]
+        public static Task<CallToolResult> ProfilerTree(int frames = 120, double minMs = 0.05, bool slowest = false)
+            => McpBridge.Get("/api/debug/profiler", ("frames", frames), ("minMs", minMs), ("slowest", slowest));
 
         [McpServerTool(Name = "settings_get", Title = "Get engine settings", ReadOnly = true, OpenWorld = false)]
         [Description("All engine render/debug settings (shadows, fog, bloom, SSDM, radiance cascades, debug visualization, ...). Keys are the PascalCase names settings_set expects.")]

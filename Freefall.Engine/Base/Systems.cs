@@ -1,7 +1,6 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
-using System.Diagnostics;
 using System.Linq;
 using System.Reflection;
 using System.Text;
@@ -93,9 +92,8 @@ namespace Freefall.Base
 
         private static void Run(SystemGroup root)
         {
-            long start = Stopwatch.GetTimestamp();
+            using var _ = root.Marker.Auto();
             root.Update();
-            root.ElapsedMs = Stopwatch.GetElapsedTime(start).TotalMilliseconds;
         }
 
         private static void ProcessPending()

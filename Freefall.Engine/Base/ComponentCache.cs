@@ -48,6 +48,9 @@ namespace Freefall.Base
         private bool HasUpdate;
         private bool HasDraw;
 
+        // One timing per loop over this type's components (Update, Draw, wake-up), not per component
+        private readonly ProfilerMarker _marker = ProfilerMarker.Get(Type.Name);
+
         public Type ComponentType => Type;
 
         static ComponentCache()
@@ -144,6 +147,7 @@ namespace Freefall.Base
             {
                 if (WakeupList.Count > 0)
                 {
+                    using var _ = _marker.Auto(WakeupList.Count);
                     foreach (var component in WakeupList)
                         component.EarlyBird();
                 }
@@ -154,6 +158,9 @@ namespace Freefall.Base
         {
             lock (_lock)
             {
+                if (RemovedList.Count == 0 && WakeupList.Count == 0) return;
+                using var _ = _marker.Auto(WakeupList.Count);
+
                 if (RemovedList.Count > 0)
                 {
                     foreach (var component in RemovedList)
@@ -184,6 +191,9 @@ namespace Freefall.Base
 
             lock (_lock)
             {
+                if (UpdateList.Count == 0) return;
+                using var _ = _marker.Auto(UpdateList.Count);
+
                 if (IsParallel)
                     Parallel.ForEach(UpdateList.Collection, comp => comp.Update());
                 else
@@ -193,7 +203,8 @@ namespace Freefall.Base
 
         public void Draw()
         {
-            if (!HasDraw) return;
+            if (!HasDraw || DrawList.Count == 0) return;
+            using var _ = _marker.Auto(DrawList.Count);
 
             if (IsParallel)
                 Parallel.ForEach(DrawList.Collection, comp => comp.Draw());

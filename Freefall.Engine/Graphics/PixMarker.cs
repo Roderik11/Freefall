@@ -7,6 +7,7 @@ namespace Freefall.Graphics
     /// <summary>
     /// PIX event marker helper using WinPixEventRuntime (shipped via Vortice.Pix.Native).
     /// Provides GPU command list markers that appear as collapsible named regions in PIX captures.
+    /// On the primary view's command list each region is also timed on the GPU (<see cref="GpuProfiler"/>).
     /// </summary>
     public static class PixMarker
     {
@@ -26,6 +27,7 @@ namespace Freefall.Graphics
         /// </summary>
         public static void Begin(ID3D12GraphicsCommandList list, string name)
         {
+            GpuProfiler.Begin(list, name);
             try
             {
                 PIXBeginEventOnCommandList(list.NativePointer, 0xFF00FF00, name);
@@ -38,6 +40,7 @@ namespace Freefall.Graphics
         /// </summary>
         public static void Begin(ID3D12GraphicsCommandList list, uint color, string name)
         {
+            GpuProfiler.Begin(list, name);
             try
             {
                 PIXBeginEventOnCommandList(list.NativePointer, color, name);
@@ -50,6 +53,7 @@ namespace Freefall.Graphics
         /// </summary>
         public static void End(ID3D12GraphicsCommandList list)
         {
+            GpuProfiler.End(list);
             try
             {
                 PIXEndEventOnCommandList(list.NativePointer);
