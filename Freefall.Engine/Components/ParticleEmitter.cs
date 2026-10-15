@@ -150,6 +150,10 @@ namespace Freefall.Components
         [ValueRange(0.05f, 20f)]
         public float TurbulenceSize = 1f;
 
+        [Description("Share of the emitter's own movement its live particles take part in. 0 = they stay where they were let go (the smoke a carried torch leaves behind), 1 = they move along with it (the torch's flame). Sprites that move along and have a WindLean also lean away from the way the emitter goes, as in a wind")]
+        [ValueRange(0f, 1f)]
+        public float FollowEmitter = 0f;
+
         // ── Collision ──
 
         [Category("Collision")]
@@ -265,6 +269,9 @@ namespace Freefall.Components
         [Description("CameraFacing / Upright: the sprite leans with the wind instead of being carried by it. Its top shifts by this many meters per m/s of Wind (plus the WeatherWind share), the bottom stays. For flames; keep Drag at 0")]
         [ValueRange(0f, 0.5f)]
         public float WindLean = 0f;
+
+        [Description("CameraFacing / Upright: where the quad sits on its particle, in quad widths (X) and heights (Y). (0, 0) = centred on it, (0, 0.5) = standing on it: the foot of a flame stays on a torch's head however the torch is turned")]
+        public Vector2 Pivot = Vector2.Zero;
 
         [Category("Rendering")]
         [Description("Fade particles near opaque surfaces")]

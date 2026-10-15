@@ -368,7 +368,8 @@ bool integrate(ParticleEmitter e, inout ParticleCore p)
         p.Velocity += curl_noise(at) * (e.Turbulence * DeltaTime);
     }
 
-    float3 newPos = p.Position + p.Velocity * DeltaTime;
+    // Carried along by a moving emitter (FollowEmitter): the flame of a torch goes where the torch goes
+    float3 newPos = p.Position + e.Carry + p.Velocity * DeltaTime;
 
     bool hit = false;
     float3 hitNormal = float3(0, 1, 0);

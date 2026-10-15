@@ -67,7 +67,9 @@ namespace Freefall.Graphics
             public float FlipbookAnimSpeed; public uint BillboardMode;      public uint SoftEnabled;        public float SoftRange;
             public Vector3 BoundsCenter;   public float BoundsRadius;
             public uint RenderMode;        public uint Flags;               public float Intensity;         public float FadeInRate;
-            public float Turbulence;       public float TurbulenceFrequency; public float WindLean;         public uint Pad0;
+            public float Turbulence;       public float TurbulenceFrequency; public float WindLean;         public float Follow;
+            public Vector3 Carry;          public float PivotX;
+            public Vector3 LeanWind;       public float PivotY;
         }
 
         /// <summary>Everything the system keeps per emitter. The component itself only holds authored data.</summary>
@@ -90,7 +92,23 @@ namespace Freefall.Graphics
             public float SpreadCos;
             public float ConeTan;
             public Vector3 Direction;
+
+            // Moving emitters (FollowEmitter): live particles have been carried along as far as CarriedTo,
+            // where the emitter was in the last row a simulate ran with. RowPosition / RowSerial: the last
+            // row written, which may never be simulated (a frame that is not rendered).
+            public Vector3 CarriedTo = new(float.NaN);
+            public Vector3 RowPosition;
+            public long RowSerial = -1;
+            public Vector3 LastPosition = new(float.NaN);
+            public Vector3 Velocity;     // smoothed, m/s: a flame leans from it, a trail widens the bounds
+            public Vector3 Lean;         // the spring a followed flame leans by (m/s of wind), and its rate
+            public Vector3 LeanRate;
         }
+
+        // The lean spring of a followed flame: about 1.6 swings a second, a third of critical damping,
+        // so it swings past once or twice and settles. LeanGiveWay (m/s, |x|+|y|+|z|): the lean grows
+        // ever slower past it.
+        private const float LeanStiffness = 100f, LeanDamping = 6f, LeanGiveWay = 6f;
 
         private readonly List<Entry> _entries = [];
         private EmitterRow[] _rows = new EmitterRow[64];
@@ -151,8 +169,8 @@ namespace Freefall.Graphics
 
         protected internal override void Initialize()
         {
-            if (Unsafe.SizeOf<EmitterRow>() != 320)
-                throw new InvalidOperationException("EmitterRow must match struct ParticleEmitter in particle_common.hlsli (320 bytes)");
+            if (Unsafe.SizeOf<EmitterRow>() != 352)
+                throw new InvalidOperationException("EmitterRow must match struct ParticleEmitter in particle_common.hlsli (352 bytes)");
 
             ComponentCache<ParticleEmitter>.Added += OnAdded;
             ComponentCache<ParticleEmitter>.Removed += OnRemoved;
@@ -391,6 +409,48 @@ namespace Freefall.Graphics
             bool depthCollision = e.CollisionMode == ParticleCollisionMode.Depth;
             _anyDepthCollision |= depthCollision;
 
+            // A moving emitter. Its velocity, smoothed over about a tenth of a second (a hand's jitter
+            // is not a wind), and how far its live particles are carried along this frame: from where
+            // they were last carried to, in case frames went by that were never simulated.
+            float follow = Math.Clamp(e.FollowEmitter, 0f, 1f);
+            if (float.IsNaN(entry.LastPosition.X)) entry.Velocity = Vector3.Zero;
+            else if (dt > 0f)
+            {
+                var moved = position - entry.LastPosition;
+                if (MathF.Abs(moved.X) + MathF.Abs(moved.Y) + MathF.Abs(moved.Z) > 10f) entry.Velocity = Vector3.Zero;   // put somewhere else
+                else entry.Velocity += (moved / dt - entry.Velocity) * MathF.Min(1f, dt * 10f);
+            }
+            entry.LastPosition = position;
+
+            if (entry.RowSerial >= 0 && _simulatedSerial >= entry.RowSerial) entry.CarriedTo = entry.RowPosition;
+            if (float.IsNaN(entry.CarriedTo.X)) entry.CarriedTo = position;
+            var carry = follow > 0f ? (position - entry.CarriedTo) * follow : Vector3.Zero;
+            entry.RowPosition = position;
+            entry.RowSerial = _gatherSerial;
+            float speed = MathF.Abs(entry.Velocity.X) + MathF.Abs(entry.Velocity.Y) + MathF.Abs(entry.Velocity.Z);
+
+            // The wind a sprite leans in. One carried along leans back from the way it goes, but not at
+            // once and not rigidly: the lean is a damped spring, a little late when the carrier sets off
+            // and swinging past when it stops or turns, and it gives way less and less the faster the
+            // carrier goes (a run does not lay the flame flat). An emitter that stays put leans in its
+            // wind as it always did.
+            var leanTarget = wind - entry.Velocity * follow;
+            Vector3 leanWind;
+            if (follow > 0f)
+            {
+                float step = MathF.Min(dt, 0.05f);
+                var pull = (leanTarget - entry.Lean) * LeanStiffness - entry.LeanRate * LeanDamping;
+                entry.LeanRate += pull * step;
+                entry.Lean += entry.LeanRate * step;
+                float l1 = MathF.Abs(entry.Lean.X) + MathF.Abs(entry.Lean.Y) + MathF.Abs(entry.Lean.Z);
+                leanWind = entry.Lean / (1f + l1 / LeanGiveWay);
+            }
+            else
+            {
+                entry.Lean = leanWind = leanTarget;
+                entry.LeanRate = Vector3.Zero;
+            }
+
             // Bounds for culling, from |x|+|y|+|z| norms: a little loose, but no square roots.
             // Gravity moves a particle by up to g*L²/2, so the sphere sits a quarter of the way along.
             float life = lifetime * (1f + lifeRandom);
@@ -410,8 +470,15 @@ namespace Freefall.Graphics
             float windLean = MathF.Max(0f, e.WindLean);
             if (e.BillboardMode == ParticleBillboardMode.VelocityStretched)
                 particleRadius += 0.5f * stretch * (topSpeed + gravity * life + drift);
-            else if (windLean > 0f)
-                particleRadius += 1.4f * windLean * (MathF.Abs(wind.X) + MathF.Abs(wind.Y) + MathF.Abs(wind.Z));   // 1.4: the lean wavers
+            else
+            {
+                particleRadius += size * (MathF.Abs(e.Pivot.X) + MathF.Abs(e.Pivot.Y) * aspect);
+                if (windLean > 0f)   // 1.4: the lean wavers; a followed flame's old sprites lean up to 1.6 times as far
+                    particleRadius += 1.4f * (1f + 0.6f * follow) * windLean * (MathF.Abs(leanWind.X) + MathF.Abs(leanWind.Y) + MathF.Abs(leanWind.Z));
+            }
+
+            // What the emitter leaves behind as it moves: particles that do not follow it trail back along its way
+            drift += speed * (1f - follow);
 
             int mode = e.RenderMode == ParticleRenderMode.Transparent ? 1 : 0;
             _modeCount[mode]++;
@@ -473,6 +540,11 @@ namespace Freefall.Graphics
                 Turbulence = turbulence,
                 TurbulenceFrequency = 1f / MathF.Max(0.01f, e.TurbulenceSize),
                 WindLean = windLean,
+                Follow = follow,
+                Carry = carry,
+                PivotX = e.Pivot.X,
+                LeanWind = leanWind,
+                PivotY = e.Pivot.Y,
             };
 
             if (capacity > 0)

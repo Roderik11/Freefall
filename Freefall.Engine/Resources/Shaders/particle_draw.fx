@@ -157,7 +157,8 @@ VSOutput VS(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
         float rotation = vis.Rotation + vis.RotationSpeed * core.Age;
         float cosR = cos(rotation);
         float sinR = sin(rotation);
-        float2 scaled = float2(corner.x, corner.y * e.Aspect);
+        // Pivot: where the quad sits on its particle; (0, 0.5) stands it on its foot
+        float2 scaled = float2(corner.x + e.PivotX, (corner.y + e.PivotY) * e.Aspect);
         float2 rotated = float2(
             scaled.x * cosR - scaled.y * sinR,
             scaled.x * sinR + scaled.y * cosR
@@ -190,11 +191,15 @@ VSOutput VS(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
         worldPos = core.Position + (rotated.x * right + rotated.y * up) * size;
 
         // Lean with the wind: the bottom edge stays, the top moves downwind (a flame in its basket).
-        // Each sprite wavers at its own phase, or all of them would stand at one fixed slant.
+        // Each sprite wavers at its own phase, or all of them would stand at one fixed slant. A flame
+        // that follows its emitter also leans back from the way the emitter goes (LeanWind), its
+        // older sprites further than the fresh ones (0.4 to 1.6 times over a life): the flame
+        // stretches back from the head instead of tilting as one card.
         if (e.WindLean > 0.0)
         {
             float waver = 1.0 + 0.4 * sin(core.Age * 5.0 + vis.Random * 6.283185);
-            worldPos += e.Wind * (e.WindLean * waver * (corner.y + 0.5));
+            float aged = lerp(1.0, 0.4 + 1.2 * saturate(core.Age / max(core.Lifetime, 0.001)), e.Follow);
+            worldPos += e.LeanWind * (e.WindLean * waver * aged * (corner.y + 0.5));
         }
     }
 
