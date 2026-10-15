@@ -562,6 +562,21 @@ namespace Freefall
          [ValueRange(1, 28)]
          public int GrassBladesPerClump { get; set; } = 24;
 
+         /// <summary>
+         /// Ignore the environment's wind and sway vegetation in OverrideWindStrength / OverrideWindDirection
+         /// instead (Graphics.Wind), for tuning the wind animation without switching presets.
+         /// </summary>
+         [Category("Wind")]
+         public bool OverrideWind { get; set; } = false;
+
+         /// <summary>Wind speed (m/s) while OverrideWind is on.</summary>
+         [ValueRange(0f, 25f)]
+         public float OverrideWindStrength { get; set; } = 6f;
+
+         /// <summary>Direction the wind blows towards (degrees, as EnvironmentPreset) while OverrideWind is on.</summary>
+         [ValueRange(0f, 360f)]
+         public float OverrideWindDirection { get; set; } = 45f;
+
          [Category("Debug")]
          public DebugVizMode DebugVisualizationMode { get; set; } = DebugVizMode.Off; // F5 - Debug viz
          public int RCDebugSubMode { get; set; } = 1;                       // 0=off, 1=tile lookup, 2=per-level radiance, 3=constant bypass, 4=raw pool readback

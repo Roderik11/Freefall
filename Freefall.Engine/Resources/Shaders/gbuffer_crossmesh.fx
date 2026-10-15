@@ -60,19 +60,6 @@ struct VSOutput
     nointerpolation uint MeshPartIdx : TEXCOORD5;
 };
 
-// Low-frequency trunk sway (matches gbuffer_trunk.fx)
-float3 TrunkSway(float3 worldPos, float weight)
-{
-    // In the scene wind (common.fx): sways harder the stronger it blows and leans downwind with the gusts, like the
-    // leaves (gbuffer_foliage.fx WindDisplacement); in a calm only the slow sway is left
-    float s = saturate(WindStrength / 12.0);
-    float phase = WindPhase * 0.7 + worldPos.x * 0.05 + worldPos.z * 0.07;
-    float swayX = sin(phase) * 0.25 + sin(phase * 1.7) * 0.1;
-    float swayZ = sin(phase * 0.9 + 1.5) * 0.2;
-    float calm = saturate(1.0 - WindStrength / 0.5);
-    float2 lean = WindDirection.xz * s * 0.6 * (0.5 + GustPattern(worldPos.xz)) * (1.0 - calm);
-    return float3(swayX * (0.5 + s) + lean.x, 0, swayZ * (0.5 + s) + lean.y) * weight;
-}
 
 VSOutput VS(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_InstanceID)
 {
@@ -105,8 +92,8 @@ VSOutput VS(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_InstanceI
     float4 worldPos = mul(float4(pos, 1.0f), World);
 
     // Trunk sway — stronger at height, zero at base
-    float swayWeight = saturate(pos.y * 0.15);
-    worldPos.xyz += TrunkSway(worldPos.xyz, swayWeight * 0.12);
+    // The whole tree bends about its base in the scene wind (TreeSway, common.fx); foliage rides the same bend
+    worldPos.xyz += TreeSway(worldPos.xyz, float3(World._41, World._42, World._43));
 
     output.WorldPos = worldPos;
     output.Position = mul(mul(worldPos, View), Projection);
@@ -259,8 +246,8 @@ ShadowVSOutput VS_Shadow(uint primitiveVertexID : SV_VertexID, uint instanceID :
     float4 worldPos = mul(float4(pos, 1.0f), World);
 
     // Match trunk sway from VS
-    float swayWeight = saturate(pos.y * 0.15);
-    worldPos.xyz += TrunkSway(worldPos.xyz, swayWeight * 0.12);
+    // The whole tree bends about its base in the scene wind (TreeSway, common.fx); foliage rides the same bend
+    worldPos.xyz += TreeSway(worldPos.xyz, float3(World._41, World._42, World._43));
 
     StructuredBuffer<CascadeData> cascadeData = ResourceDescriptorHeap[CascadeBufferSRVIdx];
     output.Position = mul(worldPos, cascadeData[cascadeIdx].VP);

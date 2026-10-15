@@ -64,27 +64,23 @@ struct VSOutput
     float3 DomeNormal : TEXCOORD7;  // original look (mostly up) — used for materials that have a normal map
 };
 
-// Wind animation helpers. The scene wind (common.fx): the crown leans downwind with the gusts rolling through
-// (GustPattern) and sways harder the stronger it blows; leaves flutter faster. In a calm only a slow idle sway is left.
-float3 WindDisplacement(float3 worldPos, float strength)
+// Wind (common.fx). The crown rides its trunk's bend (TreeSway, as gbuffer_trunk.fx), and the leaves flutter about
+// where they hang: clumps of ~0.75 m (from the rest position 'localPos', so a clump keeps its rhythm while the crown
+// moves) each on their own rate and direction, harder in the gusts at the tree. Without per-leaf pivots in the mesh
+// this is the best a vertex shader can do; a smooth function of the world position here (the first version) made
+// waves run through the crown — "wiggles like it's underwater".
+float3 WindDisplacement(float3 worldPos, float3 localPos, float3 origin)
 {
+    float3 sway = TreeSway(worldPos, origin);
+
+    float3 cell = floor(localPos / 0.75);
+    float seed = MacroHash(cell.xz + cell.y * 17.0 + origin.xz);
+    float rate = 0.8 + 0.4 * seed;
     float s = saturate(WindStrength / 12.0);
-    float2 dir = WindDirection.xz;
-    float2 across = float2(-dir.y, dir.x);
-    float phase = WindPhase + worldPos.x * 0.15 + worldPos.z * 0.12;
-    float sway = sin(phase * 1.2) * 0.3 + sin(phase * 2.7) * 0.15;
-    float gust = GustPattern(worldPos.xz);
-
-    // High-frequency flutter for leaves; on WindPhase, which speeds up with the wind without jumping (Time x a
-    // wind-dependent rate scrubbed the animation while the wind changed)
-    float flutterTime = WindPhase * 1.25 + worldPos.x * 0.15 + worldPos.z * 0.12;
-    float flutter = (sin(flutterTime * 5.3 + worldPos.y * 3.0) * 0.08
-                   + sin(flutterTime * 7.1 + worldPos.z * 4.0) * 0.05) * (0.5 + s);
-
-    float calm = saturate(1.0 - WindStrength / 0.5);                           // no direction to push along
-    float2 h = (dir * (s * 0.8 * (0.5 + gust) + sway * (0.4 + 1.2 * s)) + across * sway * 0.3) * (1.0 - calm)
-             + float2(sway, sway * 0.5) * 0.3 * calm;
-    return float3(h.x + flutter, flutter * 0.3, h.y + flutter) * strength;
+    float wave = sin(WindPhase * 7.0 * rate + seed * 40.0) * 0.6 + sin(WindPhase * 11.3 * rate + seed * 23.0) * 0.4;
+    float amount = (0.01 + 0.05 * s) * (0.4 + 0.6 * saturate(WindPush(origin.xz)));
+    float angle = seed * 6.2831853;
+    return sway + float3(cos(angle), 0.4 * (seed - 0.5), sin(angle)) * wave * amount;
 }
 
 VSOutput VS(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_InstanceID)
@@ -118,9 +114,8 @@ VSOutput VS(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_InstanceI
 
     float4 worldPos = mul(float4(pos, 1.0f), World);
     
-    // Wind flutter — scale by height above ground (local Y)
-    float windWeight = saturate(length(pos.xyz) * 0.3); // higher vertices move more
-    worldPos.xyz += WindDisplacement(worldPos.xyz, windWeight * 0.15);
+    // Wind: the tree's bend plus the leaves' flutter (identical in VS_Shadow)
+    worldPos.xyz += WindDisplacement(worldPos.xyz, pos.xyz, float3(World._41, World._42, World._43));
     
     output.WorldPos = worldPos;
     output.Position = mul(mul(worldPos, View), Projection);
@@ -250,9 +245,8 @@ ShadowVSOutput VS_Shadow(uint primitiveVertexID : SV_VertexID, uint instanceID :
     float3 pos = positions[vertexID];
     float4 worldPos = mul(float4(pos, 1.0f), World);
 
-    // Match wind displacement from VS
-    float windWeight = saturate(pos.y * 0.3);
-    worldPos.xyz += WindDisplacement(worldPos.xyz, windWeight * 0.15);
+    // Match wind displacement from VS (it used a different weight here once: shadows moved unlike the leaves)
+    worldPos.xyz += WindDisplacement(worldPos.xyz, pos.xyz, float3(World._41, World._42, World._43));
 
     StructuredBuffer<CascadeData> cascadeData = ResourceDescriptorHeap[CascadeBufferSRVIdx];
     output.Position = mul(worldPos, cascadeData[cascadeIdx].VP);

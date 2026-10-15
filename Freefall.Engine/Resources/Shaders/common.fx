@@ -53,15 +53,6 @@ cbuffer SceneConstants : register(b0)
     float2 WindOffset;                 // how far the air has moved (m), wrapped every 200 m: scrolls the gust pattern
 }
 
-// Gusts at a place, 0..1: two waves of fixed direction (about 24 and 37 m long) scrolled downwind by WindOffset, so
-// they roll with the wind. Their wave numbers are whole multiples of 2π / 200 m, so the offset's wrap is invisible.
-// Never a wave over dot(position, WindDirection): far from the origin it races whenever the wind turns.
-float GustPattern(float2 p)
-{
-    float2 q = p - WindOffset;
-    return 0.5 + 0.25 * (sin(dot(q, float2(0.2513, 0.0628))) + sin(dot(q, float2(-0.0628, 0.1571))));
-}
-
 // ── Large-scale variation of the ground and what grows on it (gputerrain.fx, grass cards, blades, flowers) ──
 
 float MacroHash(float2 p)
@@ -95,24 +86,83 @@ float3 GroundVariation(float2 xz)
     return brightness * lerp(float3(0.88, 1.0, 0.92), float3(1.22, 1.05, 0.72), dry);
 }
 
-// How a grass blade, card or flower stem sways at height fraction t of a part 'height' tall rooted at 'root': a
-// lean downwind that grows with the wind and with the gusts rolling through (GustPattern), and a flutter across it
-// that never quite stops. 'phase' (0..2π) keeps neighbours apart. Same in the shadow passes.
-// Every oscillation runs on WindPhase / WindOffset, never Time x a wind-dependent frequency: that jumps by tens of
-// radians while the wind changes (preset transitions) and scrubs the animation.
+// ── Wind (grass cards, blades, flowers, trees) ──
+// Every oscillation runs on WindPhase / WindOffset. Never Time x a wind-dependent frequency (it jumps by tens of
+// radians while the wind changes and scrubs the animation), never a wave over dot(position, WindDirection) (far from
+// the origin it races through hundreds of radians whenever a transition turns the wind).
+
+// Value noise whose lattice repeats every 'period' cells, for patterns scrolled by WindOffset (which wraps every 200 m)
+float PeriodicNoise(float2 p, float period)
+{
+    float2 i = floor(p);
+    float2 f = frac(p);
+    f = f * f * (3.0 - 2.0 * f);
+    float2 i1 = i + 1.0;
+    i -= period * floor(i / period);
+    i1 -= period * floor(i1 / period);
+    float a = MacroHash(i), b = MacroHash(float2(i1.x, i.y)), c = MacroHash(float2(i.x, i1.y)), d = MacroHash(i1);
+    return lerp(lerp(a, b, f.x), lerp(c, d, f.x), f.y);
+}
+
+// Gusts at a place, 0..1: irregular fronts (~20 m) with smaller eddies (~8 m) in them, scrolled downwind by
+// WindOffset and slowly changing shape on WindPhase. The lattices repeat every 200 m, the offset's wrap. (Two sine
+// waves did this first: the field rolled in even bands and everything wiggled to one rhythm.)
+float GustPattern(float2 p)
+{
+    float2 q = p - WindOffset;
+    float fronts = PeriodicNoise(q / 20.0, 10.0);
+    float eddies = PeriodicNoise(q / 8.0 + float2(WindPhase * 0.11, -WindPhase * 0.07), 25.0);
+    return smoothstep(0.2, 0.8, fronts * 0.65 + eddies * 0.35);
+}
+
+// How hard the wind pushes at a place, gusts and a little springiness: where a front is arriving the push runs ahead
+// of it, where one has passed it swings back below the base. The air that passed here 0.6 s ago is at p + wind x 0.6 s.
+float WindPush(float2 p)
+{
+    float gust = GustPattern(p);
+    float before = GustPattern(p + WindDirection.xz * WindStrength * 0.6);
+    return clamp(gust + 0.7 * (gust - before), -0.2, 1.4);
+}
+
+// How a grass blade, card or flower stem sways at height fraction t of a part 'height' tall rooted at 'root': a lean
+// downwind with the push (WindPush) and a flutter across it on two out-of-step rhythms, each part at its own rate,
+// harder in the gusts. 'phase' (0..2π) keeps neighbours apart. Same in the shadow passes.
 float3 GrassWind(float3 root, float t, float height, float phase)
 {
     float s = saturate(WindStrength / 12.0);                                    // calm .. gale
     float2 dir = WindDirection.xz;
     float2 across = float2(-dir.y, dir.x);
-    float gust = GustPattern(root.xz);
-    float lean = s * (0.25 + 0.75 * gust) * 0.6;
-    float flutter = sin(WindPhase * 5.0 + root.x * 1.3 + root.z * 0.9 + phase) * (0.03 + 0.06 * s);
+    float push = WindPush(root.xz);
+    float lean = s * (0.25 + 0.75 * push) * 0.6;
+    float rate = 0.75 + 0.5 * frac(phase * 7.13);
+    float wave = sin(WindPhase * 4.0 * rate + phase) * 0.65 + sin(WindPhase * 6.7 * rate + phase * 2.3) * 0.35;
+    float flutter = wave * (0.02 + 0.05 * s) * (0.3 + 0.7 * saturate(push));
     float calm = saturate(1.0 - WindStrength / 0.5);                           // no direction to flutter across
     float2 offset = dir * lean + across * flutter * (1.0 - calm) + float2(flutter, flutter * 0.5) * calm;
     return float3(offset.x, -0.3 * lean * lean, offset.y) * (t * t * height);   // bending over costs a little height
 }
 
+// A whole tree bending about its base 'origin' (the world matrix' translation) — trunks, far crossmesh LODs and
+// foliage alike, so a crown rides with its trunk. The bend grows with the square of the height above the base
+// (15 m up: 1, capped at 4); downwind with the push at the tree, plus a slow swing on two rhythms with a per-tree
+// phase. A breeze moves a 15 m point ~0.15 m, a gale ~0.9 m. Bending keeps the trunk's length (it drops a little).
+float3 TreeSway(float3 worldPos, float3 origin)
+{
+    float h = max(0.0, worldPos.y - origin.y);
+    float bend = min((h / 15.0) * (h / 15.0), 4.0);
+    float s = saturate(WindStrength / 12.0);
+    float treePhase = MacroHash(origin.xz) * 6.2831853;
+    float push = WindPush(origin.xz);
+    float swing = sin(WindPhase * 0.9 + treePhase) * 0.6 + sin(WindPhase * 1.53 + treePhase * 1.7) * 0.4;
+    float calm = saturate(1.0 - WindStrength / 0.5);
+    float2 dir = WindDirection.xz;
+    float2 across = float2(-dir.y, dir.x);
+    float2 d = (dir * (s * (0.3 + 0.5 * push)) + (dir * 0.6 + across * 0.4) * swing * (0.05 + 0.25 * s)) * (1.0 - calm)
+             + float2(swing, swing * 0.5) * 0.03 * calm;
+    float3 offset = float3(d.x, 0, d.y) * bend;
+    offset.y = -0.5 * dot(offset.xz, offset.xz) / max(h, 1.0);
+    return offset;
+}
 // Material data for bindless texture lookup via Material ID indirection
 // 64 bytes — matches C# MaterialData layout exactly
 struct MaterialData
