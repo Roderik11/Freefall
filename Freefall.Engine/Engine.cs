@@ -554,14 +554,10 @@ namespace Freefall
          public float RCIntensity { get; set; } = 1.0f;
 
          /// <summary>
-         /// Card grass (cross / billboard decorators) closer than this many metres is drawn as clumps of
-         /// procedural blades instead (grass_blades.fx), each instance switching within ±15% of it. 0 = cards
-         /// everywhere. Prototype (2026-10-15): near cards cost the most, being mostly transparent pixels.
+         /// Blades per clump where a terrain decorator variant's distance band draws Blades (grass_blades.fx):
+         /// one clump stands in for one card.
          /// </summary>
          [Category("Grass")]
-         [ValueRange(0f, 40f)]
-         public float GrassBladeDistance { get; set; } = 0f;
-
          [ValueRange(1, 28)]
          public int GrassBladesPerClump { get; set; } = 24;
 

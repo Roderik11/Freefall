@@ -5,7 +5,11 @@ using Freefall.Graphics;
 
 namespace Freefall.Assets
 {
-    public enum DecoratorMode { Mesh, Billboard, Cross }
+    /// <summary>
+    /// How a decorator variant is drawn. Blades: clumps of procedural blades coloured from the variant's texture,
+    /// opaque geometry instead of a mostly transparent card — for grass near the camera.
+    /// </summary>
+    public enum DecoratorMode { Mesh, Billboard, Cross, Blades }
 
     /// <summary>
     /// Ground cover for terrain: a mix of things that are allowed in the same places.
@@ -26,6 +30,9 @@ namespace Freefall.Assets
         /// <summary>Variants per decorator the spawn kernel will walk.</summary>
         public const int MaxVariants = 8;
 
+        /// <summary>Distance bands per variant the spawn kernel reads (<see cref="DecoratorVariant.Bands"/>).</summary>
+        public const int MaxBands = 4;
+
         public List<DecoratorVariant> Variants = [];
     }
 
@@ -41,15 +48,17 @@ namespace Freefall.Assets
         /// <summary>Mesh mode: material to render the mesh with (meshes don't carry one; prefabs do).</summary>
         public Material Material;
 
-        /// <summary>Billboard/Cross mode: alpha-tested texture.</summary>
+        /// <summary>Billboard/Cross mode: alpha-tested texture. Blades mode: where the blade colours come from.</summary>
         public Texture Texture;
 
         /// <summary>
-        /// Billboard/Cross mode: closer than Settings › Grass › Blade distance, draw this variant as a clump of
-        /// procedural blades (coloured from its texture) instead of the card. For grass; flowers and other cards
-        /// a clump of blades cannot stand in for stay off.
+        /// How the variant is drawn at each distance, near to far (up to <see cref="TerrainDecorator.MaxBands"/>), e.g. grass as
+        /// Blades to 15 m, then Cross. Empty = Mode out to the terrain's decoration radius. Beyond the last band
+        /// the variant is not drawn (it shrinks away over the last 15%), so flowers can stop sooner than grass.
+        /// Card variants (Texture) take Blades, Cross and Billboard; a mesh variant stays a mesh and only gets
+        /// its range from the bands.
         /// </summary>
-        public bool BladesNearCamera = false;
+        public List<DecoratorBand> Bands = [];
 
         /// <summary>
         /// Random seed (0..255) for this variant's scatter positions, clumps and height patches.
@@ -106,5 +115,19 @@ namespace Freefall.Assets
         [Freefall.Reflection.DontSerialize]
         [System.Text.Json.Serialization.JsonIgnore]
         public bool IsRenderable => Mode == DecoratorMode.Mesh ? Mesh != null : Texture != null;
+    }
+
+    /// <summary>One distance band of a <see cref="DecoratorVariant"/>: how it is drawn up to a distance.</summary>
+    [Serializable]
+    public class DecoratorBand
+    {
+        public DecoratorMode Mode = DecoratorMode.Cross;
+
+        /// <summary>
+        /// Far end of the band (m). The next band takes over here, each instance at its own point within ±15%
+        /// so the hand-over has no visible ring.
+        /// </summary>
+        [ValueRange(1f, 1000f)]
+        public float MaxDistance = 30f;
     }
 }

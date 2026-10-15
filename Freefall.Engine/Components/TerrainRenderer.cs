@@ -177,6 +177,7 @@ namespace Freefall.Components
         private GraphicsBuffer? _bladeInstanceBuffer;       // DecoInstance, 64 bytes; padded to whole AS groups
         private GraphicsBuffer? _bladeColorBuffer;          // float4 per variant x BladeColorBands (CS_BladeColors)
         private bool _bladeColorsDirty = true;
+        private bool _decoHasBlades;                        // some variant draws a band as Blades
         private Material? _bladeMaterial;
         private int _kBladeColors;
 
@@ -1716,15 +1717,15 @@ namespace Freefall.Components
             public float Rot20, Rot21, Rot22;
             public float SlopeBias;  // 0=upright, 1=fully slope-aligned
             public uint Seed;             // decorrelates this variant's scatter and noise from the others
-            public uint BladesNearCamera; // 1 = blade clumps instead of cards near the camera (grass_blades.fx)
+            public uint BandModes;        // distance bands near → far: DecoratorMode per byte, 0xFF = no band
             public uint Mode;             // 0=Mesh, 1=Billboard, 2=Cross
             public uint TextureIdx;       // bindless index (billboard/cross)
             // Color tint (Unity detail prototype healthy/dry colors)
             public Vector3 HealthyColor;
             public Vector3 DryColor;
             public float NoiseSpread;
-            public uint _unused1;
-            public float _unused2;
+            public uint BandEnds01;       // far ends of bands 0 and 1 (m), two halves
+            public uint BandEnds23;       // bands 2 and 3
             public float ClusterScale;    // world size of density clumps (m), 0 = off
             public float ClusterAmount;   // 0 = uniform, 1 = full clumps with bare gaps
             public uint AlphaClip;        // mesh mode: 1 = alpha-test albedo, 0 = opaque material
@@ -1769,6 +1770,7 @@ namespace Freefall.Components
             var groups = new List<DecoratorGroupGPU>();
             var lodTable = new List<LODTableEntry>();
             float maxReach = 0;
+            bool hasBlades = false;
 
             foreach (var decorator in _decoratorPalette)
             {
@@ -1841,6 +1843,25 @@ namespace Freefall.Components
                     }
                     maxReach = MathF.Max(maxReach, reach);
 
+                    // Distance bands, near → far. A card variant draws each band as its mode (a Mesh band
+                    // would have no mesh: Cross); a mesh variant stays a mesh and takes only the range.
+                    uint bandModes = 0xFFFFFFFFu, bandEnds01 = 0, bandEnds23 = 0;
+                    if (variant.Bands is { Count: > 0 } bands)
+                    {
+                        var sorted = bands.Where(b => b != null).OrderBy(b => b.MaxDistance).Take(TerrainDecorator.MaxBands).ToList();
+                        for (int b = 0; b < sorted.Count; b++)
+                        {
+                            var bandMode = mode == DecoratorMode.Mesh ? DecoratorMode.Mesh
+                                : sorted[b].Mode == DecoratorMode.Mesh ? DecoratorMode.Cross : sorted[b].Mode;
+                            bandModes = (bandModes & ~(0xFFu << (8 * b))) | ((uint)bandMode << (8 * b));
+                            uint half = BitConverter.HalfToUInt16Bits((Half)MathF.Max(0f, sorted[b].MaxDistance));
+                            if (b < 2) bandEnds01 |= half << (16 * b);
+                            else bandEnds23 |= half << (16 * (b - 2));
+                            if (bandMode == DecoratorMode.Blades) hasBlades = true;
+                        }
+                    }
+                    if (mode == DecoratorMode.Blades) hasBlades = true;
+
                     float degToRad = MathF.PI / 180f;
                     float rx = variant.RootRotation.X * degToRad;
                     float ry = variant.RootRotation.Y * degToRad;
@@ -1863,7 +1884,9 @@ namespace Freefall.Components
                         Rot20 = cx*sy*cz + sx*sz,   Rot21 = cx*sy*sz - sx*cz,   Rot22 = cx*cy,
                         SlopeBias = variant.SlopeBias,
                         Seed = (uint)Math.Clamp(variant.Seed, 0, 255),
-                        BladesNearCamera = variant.BladesNearCamera && mode != DecoratorMode.Mesh ? 1u : 0u,
+                        BandModes = bandModes,
+                        BandEnds01 = bandEnds01,
+                        BandEnds23 = bandEnds23,
                         Mode = (uint)mode,
                         TextureIdx = textureIdx,
                         HealthyColor = new Vector3(variant.HealthyColor.X, variant.HealthyColor.Y, variant.HealthyColor.Z),
@@ -1927,6 +1950,7 @@ namespace Freefall.Components
 
             _decoVariantCount = slots.Count;
             _decoMaxReach = maxReach;
+            _decoHasBlades = hasBlades;
             _decoratorBuffersBuilt = true;
 
             // Blade colours are taken from the variants' textures again (CS_BladeColors, next decorator dispatch)
@@ -2332,7 +2356,6 @@ namespace Freefall.Components
                 cs.SetParam("BaseTileZ", baseTileZ);
                 cs.SetParam("GridSize", (uint)N);
                 cs.SetParam("MaxInstances", (uint)_maxDecoInstances);
-                cs.SetParam("BladeDistance", MathF.Max(0f, Engine.Settings.GrassBladeDistance));
                 cs.SetParam("MaxBladeInstances", (uint)MaxBladeInstances);
 
                 // ── Per-kernel push constants (resource indices only) ──
@@ -2467,8 +2490,8 @@ namespace Freefall.Components
             commandList6.ExecuteIndirect(device.DispatchMeshSignature,1,_decoDispatchArgsBuffer!.Native, 0, null, 0);
             PixMarker.End(commandList);
 
-            // Card grass near the camera as blade clumps (grass_blades.fx); DispatchMesh args at offset 16
-            if (Engine.Settings.GrassBladeDistance > 0 && _bladeMaterial?.Effect != null && _bladeColorBuffer != null)
+            // Variants' Blades bands as clumps of procedural blades (grass_blades.fx); DispatchMesh args at offset 16
+            if (_decoHasBlades && _bladeMaterial?.Effect != null && _bladeColorBuffer != null)
             {
                 _bladeMaterial.SetPass(pass);
                 _bladeMaterial.Apply(commandList, device);

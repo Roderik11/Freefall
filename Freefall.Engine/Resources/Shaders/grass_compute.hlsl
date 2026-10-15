@@ -135,7 +135,6 @@ cbuffer DecoParams : register(b4)
     uint2  HeightmapSize;
     float3 ShadowSweep;         // light direction x longest decorator shadow (0 = shadows off)
     uint   GridSize;            // cells per side of the dispatch (odd: the camera's cell in the middle)
-    float  BladeDistance;       // card instances closer than this (m, per-instance band) become blade clumps; 0 = off
     uint   MaxBladeInstances;
 };
 
@@ -180,14 +179,14 @@ struct DecoratorSlot
     float Rot20, Rot21, Rot22;
     float SlopeBias;
     uint Seed;                  // decorrelates this variant's scatter and noise fields from the others
-    uint BladesNearCamera;      // 1 = near the camera this card variant is drawn as blade clumps (grass_blades.fx)
+    uint BandModes;             // distance bands near → far: one mode per byte, 0xFF = no band (Mode out to DecoRadius)
     uint Mode;
     uint TextureIdx;
     float3 HealthyColor;
     float3 DryColor;
     float NoiseSpread;
-    uint _unused1;
-    float _unused2;
+    uint BandEnds01;            // far ends of bands 0, 1 (m, two halves)
+    uint BandEnds23;            // bands 2, 3
     float ClusterScale;         // world size of density clumps in m (0 = off)
     float ClusterAmount;        // 0 = uniform, 1 = full clumps + bare gaps
     uint AlphaClip;             // mesh mode: 1 = alpha-test albedo (foliage), 0 = opaque (rocks, pebbles)
@@ -218,7 +217,7 @@ struct DecoInstance
     uint   SlotIdx;         // decorator variant index (DecoratorSlot)
     uint   LOD;             // selected LOD index
     float  InstanceSeed;    // for color variation in PS
-    uint   _pad;
+    uint   Mode;            // how this instance is drawn (MODE_*): its distance band's mode, else the variant's
 };  // 64 bytes — cache line aligned
 
 
@@ -226,6 +225,33 @@ struct DecoInstance
 #define MODE_MESH      0
 #define MODE_BILLBOARD 1
 #define MODE_CROSS     2
+#define MODE_BLADES    3
+#define MAX_BANDS      4
+
+// ─── Distance bands (DecoratorVariant.Bands) ──────────────────────────────
+
+uint BandMode(DecoratorSlot s, uint band) { return (s.BandModes >> (8 * band)) & 0xFF; }
+
+// Far end of a band (m), packed as halves two per uint
+float BandEnd(DecoratorSlot s, uint band)
+{
+    uint packed = band < 2 ? s.BandEnds01 : s.BandEnds23;
+    return f16tof32((packed >> (16 * (band & 1))) & 0xFFFF);
+}
+
+uint BandCount(DecoratorSlot s)
+{
+    uint n = 0;
+    while (n < MAX_BANDS && BandMode(s, n) != 0xFF) n++;
+    return n;
+}
+
+// How far the variant is drawn: the end of its last band, never past the decoration radius
+float VariantRange(DecoratorSlot s)
+{
+    uint n = BandCount(s);
+    return n > 0 ? min(DecoRadius, BandEnd(s, n - 1)) : DecoRadius;
+}
 
 // ─── Samplers ──────────────────────────────────────────────────────────────
 
@@ -424,6 +450,10 @@ void CS_SpawnInstances(uint3 gid : SV_GroupID, uint3 gtid3 : SV_GroupThreadID)
                     uint variantIdx = group.VariantOffset + v;
                     DecoratorSlot variant = slots[variantIdx];
 
+                    // A cell past the variant's range (the end of its last band) spawns nothing of it
+                    float variantReach = VariantRange(variant) + ts;
+                    if (dx2 * dx2 + dz2 * dz2 > variantReach * variantReach) continue;
+
                     // Coverage is shared by the decorator; natural patchiness is the variant's own
                     float w = float(coverage) / 255.0;
                     if (variant.ClusterScale > 0 && variant.ClusterAmount > 0)
@@ -448,7 +478,6 @@ void CS_SpawnInstances(uint3 gid : SV_GroupID, uint3 gtid3 : SV_GroupThreadID)
 
     StructuredBuffer<LODEntry>      lodTbl = ResourceDescriptorHeap[LODTableIdx];
 
-    float range = DecoRadius;
     float tileOriginX = TerrainOrigin.x + float(cellX) * ts;
     float tileOriginZ = TerrainOrigin.y + float(cellZ) * ts;
 
@@ -468,6 +497,8 @@ void CS_SpawnInstances(uint3 gid : SV_GroupID, uint3 gtid3 : SV_GroupThreadID)
         float cellWeight = gs_entryWeight[ci];
 
         DecoratorSlot slot = slots[slotIdx];
+        uint bandCount = BandCount(slot);
+        float range = VariantRange(slot);
 
         // Stride loop: 64 threads cooperate to spawn decoInstCount instances
         for (uint instanceIdx = flatThread; instanceIdx < decoInstCount; instanceIdx += 64)
@@ -548,9 +579,27 @@ void CS_SpawnInstances(uint3 gid : SV_GroupID, uint3 gtid3 : SV_GroupThreadID)
             di.SlotIdx = slotIdx;
             di.LOD = lod;
             di.InstanceSeed = instanceSeedVal;
-            di._pad = 0;
 
-            if (slot.Mode == MODE_MESH)
+            // How this instance is drawn: the first of the variant's distance bands it is inside. Each instance
+            // switches at its own point within ±15% of a band's end, so a hand-over has no ring; the last band
+            // ends at the variant's range (the fade above).
+            uint mode = slot.Mode;
+            if (bandCount > 0)
+            {
+                float switchAt = 0.85 + 0.3 * frac(instanceSeedVal * 13.37);
+                mode = BandMode(slot, bandCount - 1);
+                for (uint band = 0; band + 1 < bandCount; band++)
+                {
+                    if (camDist < BandEnd(slot, band) * switchAt)
+                    {
+                        mode = BandMode(slot, band);
+                        break;
+                    }
+                }
+            }
+            di.Mode = mode;
+
+            if (mode == MODE_MESH)
             {
                 // Mesh instances → separate buffer, counter at offset 4
                 uint outIdx;
@@ -559,20 +608,17 @@ void CS_SpawnInstances(uint3 gid : SV_GroupID, uint3 gtid3 : SV_GroupThreadID)
                 RWStructuredBuffer<DecoInstance> meshBuffer = ResourceDescriptorHeap[MeshDecoInstanceUAVIdx];
                 meshBuffer[outIdx] = di;
             }
+            else if (mode == MODE_BLADES)
+            {
+                // Clumps of procedural blades (grass_blades.fx) → own buffer, counter at offset 8
+                uint bladeIdx;
+                instCounter.InterlockedAdd(8, 1, bladeIdx);
+                if (bladeIdx >= MaxBladeInstances) continue;
+                RWStructuredBuffer<DecoInstance> bladeBuffer = ResourceDescriptorHeap[BladeInstanceUAVIdx];
+                bladeBuffer[bladeIdx] = di;
+            }
             else
             {
-                // Near the camera a grass card is drawn as a clump of blades instead (grass_blades.fx). Each
-                // instance switches at its own distance within ±15% of BladeDistance, so the hand-over has no ring.
-                if (slot.BladesNearCamera != 0 && camDist < BladeDistance * (0.85 + 0.3 * frac(instanceSeedVal * 13.37)))
-                {
-                    uint bladeIdx;
-                    instCounter.InterlockedAdd(8, 1, bladeIdx);
-                    if (bladeIdx >= MaxBladeInstances) continue;
-                    RWStructuredBuffer<DecoInstance> bladeBuffer = ResourceDescriptorHeap[BladeInstanceUAVIdx];
-                    bladeBuffer[bladeIdx] = di;
-                    continue;
-                }
-
                 // Billboard/Cross → main buffer, counter at offset 0
                 uint outIdx;
                 instCounter.InterlockedAdd(0, 1, outIdx);

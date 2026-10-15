@@ -1,8 +1,9 @@
 // ═══════════════════════════════════════════════════════════════════════════
 // Grass blades — what card grass becomes near the camera (Amplification → Mesh → Pixel)
 //
-// CS_SpawnInstances routes card instances closer than BladeDistance (each at its own distance within ±15%) into
-// a buffer of their own; here every one of them becomes a clump of procedural blades. Cards near the camera are
+// CS_SpawnInstances routes the instances in a variant's Blades distance band (DecoratorVariant.Bands; each
+// switching at its own point within ±15% of the band's end) into a buffer of their own; here every one of them
+// becomes a clump of procedural blades. Cards near the camera are
 // what grass cost: ~85% of a card's pixels are transparent and still run the alpha test, and with `clip` there is
 // little early-Z. Blades are opaque geometry: no alpha test, hidden blades rejected early, each pixel shaded
 // about once. Blade colours come from the card's own texture (CS_BladeColors), so the hand-over matches.
@@ -32,14 +33,14 @@ struct DecoratorSlot
     float Rot20, Rot21, Rot22;
     float SlopeBias;
     uint Seed;
-    uint BladesNearCamera;
+    uint BandModes;
     uint Mode;
     uint TextureIdx;
     float3 HealthyColor;
     float3 DryColor;
     float NoiseSpread;
-    uint _unused1;
-    float _unused2;
+    uint BandEnds01;
+    uint BandEnds23;
     float ClusterScale;
     float ClusterAmount;
     uint AlphaClip;
@@ -58,7 +59,7 @@ struct DecoInstance
     uint   SlotIdx;
     uint   LOD;
     float  InstanceSeed;
-    uint   _pad;
+    uint   Mode;
 };
 
 // ─── Constants ─────────────────────────────────────────────────────────────

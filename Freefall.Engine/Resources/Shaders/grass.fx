@@ -66,7 +66,7 @@ struct DecoInstance
     uint   SlotIdx;
     uint   LOD;
     float  InstanceSeed;
-    uint   _pad;
+    uint   Mode;            // how this instance is drawn (its distance band's mode)
 };  // 64 bytes
 
 
@@ -168,9 +168,9 @@ void MS(
     {
         di = instances[globalInst];
         slot = slots[di.SlotIdx];
-        if (slot.Mode == MODE_MESH) degenerate = true;
+        if (di.Mode != MODE_BILLBOARD && di.Mode != MODE_CROSS) degenerate = true;
         // Billboard: second quad (quadIdx==1) is degenerate
-        if (slot.Mode == MODE_BILLBOARD && quadIdx == 1) degenerate = true;
+        if (di.Mode == MODE_BILLBOARD && quadIdx == 1) degenerate = true;
     }
 
     if (degenerate)
@@ -210,7 +210,7 @@ void MS(
 
     float3 slopeUp = normalize(lerp(float3(0, 1, 0), di.TerrainNormal, abs(slot.SlopeBias)));
 
-    if (slot.Mode == MODE_BILLBOARD)
+    if (di.Mode == MODE_BILLBOARD)
     {
         // quadIdx == 0 only (quadIdx == 1 is degenerate for billboard)
         float3 toCamera = normalize(float3(camPos.x - di.Position.x, 0, camPos.z - di.Position.z));
@@ -455,8 +455,8 @@ void MS_Shadow(
     {
         di = instances[globalInst];
         slot = slots[di.SlotIdx];
-        if (slot.Mode == MODE_MESH) degenerate = true;
-        if (slot.Mode == MODE_BILLBOARD && quadIdx == 1) degenerate = true;
+        if (di.Mode != MODE_BILLBOARD && di.Mode != MODE_CROSS) degenerate = true;
+        if (di.Mode == MODE_BILLBOARD && quadIdx == 1) degenerate = true;
     }
 
     if (degenerate)
@@ -494,7 +494,7 @@ void MS_Shadow(
     float3 slopeUp = normalize(lerp(float3(0, 1, 0), di.TerrainNormal, abs(slot.SlopeBias)));
     float3 worldPos;
 
-    if (slot.Mode == MODE_BILLBOARD)
+    if (di.Mode == MODE_BILLBOARD)
     {
         float3 toCamera = normalize(float3(camPos.x - di.Position.x, 0, camPos.z - di.Position.z));
         float3 right = normalize(cross(slopeUp, toCamera));
