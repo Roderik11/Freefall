@@ -323,7 +323,10 @@ namespace Freefall.Graphics
             _materialProperties.Add(new MaterialProperty<Color3>("EmissiveColor", this, new Color3(),
                 (m, v) => m.UpdateMaterialScalar((ref MaterialData d) => d.EmissiveColor = v.ToVector3())));
             _materialProperties.Add(new MaterialProperty<float>("EmissiveIntensity", this, 1.0f,
-                (m, v) => m.UpdateMaterialScalar((ref MaterialData d) => d.EmissiveIntensity = v)));
+                (m, v) => m.SetEmissiveIntensity(v)));
+            // Lamp glass: glows only while lamps are lit (Daylight.Lamps), like a PointLight.OnlyWhenDark
+            _materialProperties.Add(new MaterialProperty<bool>("EmissiveWhenDark", this, false,
+                (m, v) => m.SetEmissiveWhenDark(v)));
             _materialProperties.Add(new MaterialProperty<Vector2>("DetailTiling", this, Vector2.Zero,
                 (m, v) => m.UpdateMaterialScalar((ref MaterialData d) => d.DetailTiling = v)));
             _materialProperties.Add(new MaterialProperty<Vector2>("DetailOffset", this, Vector2.Zero,
@@ -891,6 +894,47 @@ namespace Freefall.Graphics
         /// </summary>
         public void SetEmissiveIntensity(float intensity)
         {
+            _emissiveIntensity = intensity;
+            ApplyEmissiveIntensity();
+        }
+
+        private float _emissiveIntensity = 1.0f;
+        private bool _emissiveWhenDark;
+
+        // Materials whose glow follows Daylight.Lamps; rewritten only when the lamps change (while they fade)
+        private static readonly List<WeakReference<Material>> _lampMaterials = new();
+        private static bool _lampsHooked;
+
+        private void SetEmissiveWhenDark(bool whenDark)
+        {
+            _emissiveWhenDark = whenDark;
+            lock (_lampMaterials)
+            {
+                _lampMaterials.RemoveAll(r => !r.TryGetTarget(out var m) || m == this);
+                if (whenDark)
+                    _lampMaterials.Add(new WeakReference<Material>(this));
+                if (!_lampsHooked)
+                {
+                    _lampsHooked = true;
+                    Daylight.LampsChanged += ApplyLamps;
+                }
+            }
+            ApplyEmissiveIntensity();
+        }
+
+        private static void ApplyLamps()
+        {
+            lock (_lampMaterials)
+            {
+                foreach (var reference in _lampMaterials)
+                    if (reference.TryGetTarget(out var material))
+                        material.ApplyEmissiveIntensity();
+            }
+        }
+
+        private void ApplyEmissiveIntensity()
+        {
+            float intensity = _emissiveIntensity * (_emissiveWhenDark ? Daylight.Lamps : 1f);
             UpdateMaterialScalar((ref MaterialData d) => d.EmissiveIntensity = intensity);
         }
         

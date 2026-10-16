@@ -19,6 +19,7 @@ namespace Freefall.Components
         private float _range = 10;
         private float _flicker;
         private float _flickerSpeed = 8;
+        private bool _onlyWhenDark;
 
         /// <summary>Registry slot (PointLightBuffer), -1 while not registered.</summary>
         internal int GpuSlot = -1;
@@ -55,6 +56,14 @@ namespace Freefall.Components
         {
             get => _flickerSpeed;
             set { if (_flickerSpeed == value) return; _flickerSpeed = value; Changed(); }
+        }
+
+        [System.ComponentModel.Description("Lit only when it is dark (Daylight.Lamps): at night, in a thunderstorm, on an " +
+                                           "overcast dusk. Street lamps and lanterns; lights indoors stay on.")]
+        public bool OnlyWhenDark
+        {
+            get => _onlyWhenDark;
+            set { if (_onlyWhenDark == value) return; _onlyWhenDark = value; Changed(); }
         }
 
         private void Changed() => PointLightBuffer.Instance?.Changed(this);

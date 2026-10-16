@@ -78,6 +78,16 @@ namespace Freefall.Serialization
                 return false;
             }
 
+            if (typeof(T) == typeof(bool))
+            {
+                if (bool.TryParse(text, out bool b))
+                {
+                    result = (T)(object)b;
+                    return true;
+                }
+                return false;
+            }
+
             return false;
         }
 
@@ -86,6 +96,7 @@ namespace Freefall.Serialization
             return value switch
             {
                 float f => f.ToString(Inv),
+                bool b => b ? "true" : "false",
                 Vector2 v => $"[{v.X.ToString(Inv)}, {v.Y.ToString(Inv)}]",
                 Vector3 v => $"[{v.X.ToString(Inv)}, {v.Y.ToString(Inv)}, {v.Z.ToString(Inv)}]",
                 _ => value.ToString()

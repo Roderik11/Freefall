@@ -22,6 +22,7 @@ namespace Freefall.Graphics
         public const int MaxVisible = 4096;
 
         private const uint Enabled = 1;
+        private const uint OnlyWhenDark = 2;    // scaled by Daylight.Lamps (FrameParams.Lamps)
 
         /// <summary>One per light. Must match PointLightRecord in point_lights.hlsli (48 bytes).</summary>
         [StructLayout(LayoutKind.Sequential)]
@@ -66,7 +67,8 @@ namespace Freefall.Graphics
             public uint ShadowBudget;
             public uint Frame;
             public float Ambient;           // what the sky's ambient adds to an up-facing surface (× albedo)
-            private uint _pad0, _pad1;
+            public float Lamps;             // Daylight.Lamps: lights marked OnlyWhenDark are scaled by it
+            private uint _pad0;
         }
 
         public static PointLightBuffer? Instance { get; private set; }
@@ -161,7 +163,7 @@ namespace Freefall.Graphics
                 Flicker = light.Flicker,
                 FlickerSpeed = light.FlickerSpeed,
                 FlickerPhase = (light.Id & 1023) * 0.37f, // neighbouring lights do not waver in step
-                Flags = light.Enabled && transformSlot >= 0 ? Enabled : 0,
+                Flags = (light.Enabled && transformSlot >= 0 ? Enabled : 0) | (light.OnlyWhenDark ? OnlyWhenDark : 0),
             });
         }
 

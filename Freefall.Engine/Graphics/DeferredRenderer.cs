@@ -848,46 +848,16 @@ namespace Freefall.Graphics
                  Time = Time.TotalTime,
                  PixelsPerMetre = 0.5f * Albedo.Native.Description.Height * camera.Projection.M22,
                  FadeStep = Math.Clamp(Time.Delta, 0f, 0.1f) / PointShadowFadeSeconds,
-                 SunLight = SunLight(),
-                 Ambient = SkyAmbient(),
+                 SunLight = Daylight.SunLight(),
+                 Ambient = Daylight.SkyAmbient(),
                  ShadowBudget = (uint)Math.Clamp(Engine.Settings.MaxShadowedPointLights, 0, LocalShadows.MaxLights),
                  Frame = _lightFrame,
+                 Lamps = Daylight.Lamps,
              };
         }
 
         private static Vector4 NormalisePlane(Vector4 plane) =>
              plane / new Vector3(plane.X, plane.Y, plane.Z).Length();
-
-        // What the sun adds to a lit surface, as a multiple of its albedo: light_directional_cs's π × intensity × colour
-        // through Lambert's 1/π, dimmed by the clouds' average shade (coverage × cloud shadow strength), so overcast
-        // days count as dark. 0 without an enabled directional light.
-        private static float SunLight()
-        {
-             foreach (var sun in Base.ComponentCache<DirectionalLight>.All)
-             {
-                 if (!sun.Enabled) continue;
-                 float clouds = 1f - SkyboxRenderer.CurrentCloudShadowStrength * SkyboxRenderer.CurrentCloudCoverage;
-                 return sun.Intensity * Luminance(sun.Color.R, sun.Color.G, sun.Color.B) * Math.Clamp(clouds, 0f, 1f);
-             }
-             return 0f;
-        }
-
-        // What the sky's ambient adds to an up-facing surface, as a multiple of its albedo: composition_cs's
-        // GetSkyColor(up) × 0.45 × AmbientScale, with the zenith colour as sky_common.fx's day sky has it
-        // (tint × ~0.65 × density) and the night sky colour at night. 0 without a sky.
-        private static float SkyAmbient()
-        {
-             if (Base.ComponentCache<SkyboxRenderer>.All.Count == 0)
-                 return 0f;
-             var tint = SkyboxRenderer.CurrentSkyTintColor;
-             var night = SkyboxRenderer.CurrentNightSkyColor;
-             float day = Luminance(tint.X, tint.Y, tint.Z) * 0.65f * SkyboxRenderer.CurrentAtmosphereDensity;
-             float sky = (SkyboxRenderer.CurrentDayFactor + SkyboxRenderer.CurrentSunsetFactor) * day
-                       + SkyboxRenderer.CurrentNightFactor * Luminance(night.X, night.Y, night.Z);
-             return sky * 0.45f * SkyboxRenderer.AmbientScale;
-        }
-
-        private static float Luminance(float r, float g, float b) => 0.2126f * r + 0.7152f * g + 0.0722f * b;
 
         private unsafe void DispatchPointLights(Camera camera, ID3D12GraphicsCommandList list)
         {

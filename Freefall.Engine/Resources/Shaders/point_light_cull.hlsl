@@ -32,6 +32,7 @@ cbuffer PushConstants : register(b3)
 #define IMPORTANCE_BINS 64u
 
 // A light in view and its importance: steady brightness × its on-screen radius² (the size of its pool of light).
+// r.Intensity comes back scaled by the lamps for a light marked OnlyWhenDark; one that is out is not in view.
 // From the light's steady position, so flicker does not move it across a band and make it blink.
 bool CullLight(uint slot, PointLightFrame frame, out PointLightRecord r, out float3 world, out float importance)
 {
@@ -39,6 +40,8 @@ bool CullLight(uint slot, PointLightFrame frame, out PointLightRecord r, out flo
     r = records[slot];
     world = 0;
     importance = 0;
+    if ((r.Flags & POINT_LIGHT_WHEN_DARK) != 0)
+        r.Intensity *= frame.Lamps;     // street lamps: out by day, fading with the lamps at dusk and dawn
     if ((r.Flags & POINT_LIGHT_ENABLED) == 0 || r.Range <= 0.0 || r.Intensity <= 0.0)
         return false;
 

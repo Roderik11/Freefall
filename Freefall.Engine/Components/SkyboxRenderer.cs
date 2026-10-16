@@ -261,6 +261,7 @@ namespace Freefall.Components
             CurrentCloudShadowScale = CloudShadowScale;
 
             UpdateSunLight();
+            Daylight.Update((float)Time.Delta);
         }
 
         /// <summary>

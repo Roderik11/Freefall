@@ -5,6 +5,7 @@
 #define POINT_LIGHTS_HLSLI
 
 #define POINT_LIGHT_ENABLED     1u      // PointLightRecord.Flags
+#define POINT_LIGHT_WHEN_DARK   2u      // PointLight.OnlyWhenDark: intensity × PointLightFrame.Lamps
 #define MAX_VISIBLE_LIGHTS      4096u   // PointLightBuffer.MaxVisible
 #define VISIBLE_LIGHT_OCCLUDED  1u      // PointLightData.Flags: behind the Hi-Z (CSOccludeLights)
 #define POINT_LIGHT_NO_SHADOW   0xFFFFFFFFu
@@ -51,7 +52,8 @@ struct PointLightFrame
     uint ShadowBudget;                      // MaxShadowedPointLights
     uint Frame;                             // this renderer's frame count, from 1
     float Ambient;                          // what the sky's ambient adds to an up-facing surface (× albedo)
-    uint2 _pad;
+    float Lamps;                            // Daylight.Lamps: 0 = street lamps out, 1 = lit
+    uint _pad;
 };
 
 // ── Flicker: value noise over an integer hash, no trig ───────────────────────
