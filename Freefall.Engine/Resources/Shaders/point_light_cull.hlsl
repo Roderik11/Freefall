@@ -140,7 +140,7 @@ void CSCullLights(uint3 dtid : SV_DispatchThreadID, uint gi : SV_GroupIndex)
     if (band == g_FadedBand)
         intensity *= saturate(frac(log2(importance) * 2.0)); // fades out toward the band's lower edge
     if (r.Flicker > 0.0)
-        ApplyFlicker(r, frame.Time, intensity, world);
+        ApplyFlicker(r, frame.Time, intensity);
 
     RWByteAddressBuffer countBuf = ResourceDescriptorHeap[VisibleCountUAVIdx];
     uint index;

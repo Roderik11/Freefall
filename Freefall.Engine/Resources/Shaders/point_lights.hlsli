@@ -28,7 +28,7 @@ struct PointLightData
 {
     float3 Color;
     float Intensity;        // flicker applied
-    float3 Position;        // camera-relative, flicker applied
+    float3 Position;        // camera-relative, steady (flicker changes only the intensity)
     float Range;
     uint ShadowLight;       // index into LocalShadowLight[], POINT_LIGHT_NO_SHADOW
     uint Slot;              // registry slot
@@ -73,17 +73,14 @@ float FlickerNoise(float x)
     return a + (b - a) * f;
 }
 
-// This frame's intensity and position of a flickering light: the brightness wavers, and the flame moves a
-// few centimetres, which is enough to make highlights and shadows shift.
-void ApplyFlicker(PointLightRecord r, float time, inout float intensity, inout float3 position)
+// This frame's intensity of a flickering light: only the brightness wavers. Until 2026-10-16 the light also
+// moved a few centimetres; bars and grilles near the flame (brazier cages) magnified that into shadows
+// swinging tens of centimetres across a whole plaza.
+void ApplyFlicker(PointLightRecord r, float time, inout float intensity)
 {
     float t = time * r.FlickerSpeed + r.FlickerPhase;
     float wave = 0.65 * FlickerNoise(t) + 0.35 * FlickerNoise(t * 2.7 + 11.3);
     intensity *= 1.0 + r.Flicker * (wave * 1.4 - 0.7);
-
-    float s = t * 0.6;
-    position += float3(FlickerNoise(s + 5.1) - 0.5, FlickerNoise(s + 17.7) - 0.5, FlickerNoise(s + 31.3) - 0.5)
-              * (0.15 * r.Flicker);
 }
 
 #endif
