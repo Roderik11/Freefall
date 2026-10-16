@@ -104,6 +104,12 @@ namespace Freefall.Graphics
         
         // Render state metadata parsed from shader source (data-driven PSO creation)
         public ShaderRenderState RenderState { get; private set; } = new ShaderRenderState();
+
+        /// <summary>
+        /// Settings the effect declares for its materials ("//=" defaults in its ObjectConstants cbuffer,
+        /// FXParser.ParseMaterialParams). Shared by every instance of the effect and refilled in place on reload.
+        /// </summary>
+        public List<MaterialParamDesc> MaterialParams { get; private set; } = new();
         
         // MasterEffects: Global dictionary of all loaded effects (Apex pattern)
         // Camera.SetShaderParams iterates this to set View/Projection on all effects
@@ -125,6 +131,7 @@ namespace Freefall.Graphics
                 ResourceBindings = existing.ResourceBindings;
                 _resourceSlots = existing._resourceSlots;
                 RenderState = existing.RenderState;
+                MaterialParams = existing.MaterialParams;
                 _materialBlock = existing._materialBlock;
                 lock (_instances) _instances.Add(new WeakReference<Effect>(this));
                 return;
@@ -147,6 +154,7 @@ namespace Freefall.Graphics
 
             // Parse render state metadata from shader source (data-driven PSO creation)
             RenderState = FXParser.ParseRenderState(content);
+            MaterialParams.AddRange(FXParser.ParseMaterialParams(content));
 
             Dependencies = ShaderHotReload.CollectDependencies(_sourcePath);
 
@@ -198,6 +206,9 @@ namespace Freefall.Graphics
             ResourceBindings.Clear();
             _resourceSlots.Clear();
             DiscoverPushConstants();
+
+            MaterialParams.Clear();
+            MaterialParams.AddRange(FXParser.ParseMaterialParams(content));
 
             var renderState = FXParser.ParseRenderState(content);
             lock (_instances)

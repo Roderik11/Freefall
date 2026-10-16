@@ -169,7 +169,50 @@ namespace Freefall.Graphics
             
             return bindings;
         }
-        
+
+        // A material setting: "<type> <Name>; //= <default>", e.g. "float Intensity; //= 2" or
+        // "float3 Color; //= 0.62, 0.78, 1". Text after the default, set off by " -- ", is its description.
+        private static readonly Regex MaterialParamLine = new(
+            @"^\s*(float|float2|float3|int|uint|bool)\s+(\w+)\s*;\s*//=\s*([^\r\n]*?)\s*(?:--\s*([^\r\n]*?)\s*)?$",
+            RegexOptions.Multiline);
+
+        /// <summary>
+        /// The settings an effect declares for its materials: the variables of its <c>ObjectConstants</c>
+        /// cbuffer marked with a default after <c>//=</c>. Each becomes a material property (inspector, .mat
+        /// "Parameters") that writes into the material's own copy of that cbuffer. A float3 whose name ends in
+        /// "Color" is a colour (Color3, the colour picker). Unmarked variables stay out of the material.
+        /// </summary>
+        public static List<MaterialParamDesc> ParseMaterialParams(string content)
+        {
+            var list = new List<MaterialParamDesc>();
+            int start = content.IndexOf("cbuffer ObjectConstants", StringComparison.Ordinal);
+            if (start < 0) return list;
+            int open = content.IndexOf('{', start);
+            int close = open < 0 ? -1 : content.IndexOf('}', open);
+            if (open < 0 || close < 0) return list;
+
+            string body = content.Substring(open + 1, close - open - 1);
+            foreach (Match m in MaterialParamLine.Matches(body))
+            {
+                var values = new List<float>();
+                foreach (var part in m.Groups[3].Value.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+                {
+                    if (float.TryParse(part, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var v))
+                        values.Add(v);
+                    else if (bool.TryParse(part, out var b))
+                        values.Add(b ? 1f : 0f);
+                }
+                list.Add(new MaterialParamDesc
+                {
+                    Type = m.Groups[1].Value,
+                    Name = m.Groups[2].Value,
+                    Default = values.ToArray(),
+                    Description = m.Groups[4].Success ? m.Groups[4].Value : null,
+                });
+            }
+            return list;
+        }
+
         /// <summary>
         /// Parse render state metadata from shader source.
         /// Extracts // @RenderState(key=value, ...) comments.
@@ -246,6 +289,21 @@ namespace Freefall.Graphics
         }
     }
     
+    /// <summary>A setting an effect declares for its materials (FXParser.ParseMaterialParams).</summary>
+    public class MaterialParamDesc
+    {
+        public string Name = "";
+        /// <summary>HLSL type: float, float2, float3, int, uint or bool.</summary>
+        public string Type = "";
+        public float[] Default = Array.Empty<float>();
+        public string? Description;
+
+        /// <summary>A float3 named "...Color": shown with the colour picker.</summary>
+        public bool IsColor => Type == "float3" && Name.EndsWith("Color", StringComparison.Ordinal);
+
+        public float At(int i, float fallback = 0f) => i < Default.Length ? Default[i] : fallback;
+    }
+
     /// <summary>
     /// Render state configuration parsed from shader source.
     /// </summary>

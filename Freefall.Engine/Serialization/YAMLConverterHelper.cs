@@ -88,6 +88,16 @@ namespace Freefall.Serialization
                 return false;
             }
 
+            if (typeof(T) == typeof(int))
+            {
+                if (int.TryParse(text, NumberStyles.Integer, Inv, out int i))
+                {
+                    result = (T)(object)i;
+                    return true;
+                }
+                return false;
+            }
+
             return false;
         }
 
@@ -97,8 +107,12 @@ namespace Freefall.Serialization
             {
                 float f => f.ToString(Inv),
                 bool b => b ? "true" : "false",
+                int i => i.ToString(Inv),
                 Vector2 v => $"[{v.X.ToString(Inv)}, {v.Y.ToString(Inv)}]",
                 Vector3 v => $"[{v.X.ToString(Inv)}, {v.Y.ToString(Inv)}, {v.Z.ToString(Inv)}]",
+                // Invariant, in the form TryParse reads: Color3.ToString() follows the machine's culture, and a
+                // decimal comma (German Windows) split into the wrong channels when read back
+                Color3 c => $"<{c.R.ToString(Inv)}, {c.G.ToString(Inv)}, {c.B.ToString(Inv)}>",
                 _ => value.ToString()
             };
         }

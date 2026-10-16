@@ -50,6 +50,12 @@ namespace Freefall.Graphics
         public Material Material { get; set; }
         public abstract Type ValueType { get; }
 
+        /// <summary>What it does (an effect's "-- text" after its default); null for none.</summary>
+        public string? Description { get; set; }
+
+        /// <summary>Take the value of a property of the same type (a clone, or the same setting before a rebuild).</summary>
+        public abstract void CopyFrom(MaterialProperty other);
+
         /// <summary>
         /// Parse a string value and set this property. Used by MaterialLoader.
         /// </summary>
@@ -85,6 +91,7 @@ namespace Freefall.Graphics
             {
                 _value = value;
                 _apply?.Invoke(Material, value);
+                Material?.NotifyPropertyChanged(this);
             }
         }
 
@@ -113,6 +120,11 @@ namespace Freefall.Graphics
         }
 
         public override void ResetToDefault() => Value = _defaultValue;
+
+        public override void CopyFrom(MaterialProperty other)
+        {
+            if (other is MaterialProperty<T> same) Value = same.Value;
+        }
     }
 
     
@@ -166,6 +178,8 @@ namespace Freefall.Graphics
         private Dictionary<string, Texture> _textures = new();
         private List<TextureEffectParameter> _textureParameters = new();
         private List<MaterialProperty> _materialProperties = new();
+        // The effect's own settings (Effect.MaterialParams), writing into this material's ObjectConstants
+        private readonly List<MaterialProperty> _effectProperties = new();
         
         /// <summary>
         /// Read-only access to texture bindings (slot name → Texture).
@@ -180,9 +194,32 @@ namespace Freefall.Graphics
         public IReadOnlyList<TextureEffectParameter> TextureParameters => _textureParameters;
         
         /// <summary>
-        /// Scalar material properties for inspector binding. Each writes to MaterialData on change.
+        /// Scalar material properties for inspector binding and the .mat "Parameters". Normally the MaterialData
+        /// ones (Tint, emissive, detail), each writing to MaterialData on change. An effect that declares its own
+        /// settings ("//=" in its ObjectConstants, Effect.MaterialParams) gets those instead: it does not read
+        /// MaterialData, and its settings write into this material's own copy of that cbuffer.
         /// </summary>
-        public IReadOnlyList<MaterialProperty> MaterialProperties => _materialProperties;
+        public IReadOnlyList<MaterialProperty> MaterialProperties => _effectProperties.Count > 0 ? _effectProperties : _materialProperties;
+
+        /// <summary>A material property by name, or null.</summary>
+        public MaterialProperty? GetProperty(string name)
+        {
+            foreach (var p in MaterialProperties)
+                if (p.Name == name) return p;
+            return null;
+        }
+
+        /// <summary>
+        /// Set a material property by name (an effect setting or a MaterialData one). False if there is none of
+        /// that name and type. On an instance (<see cref="CreateInstance"/>) the property is its own from then on.
+        /// </summary>
+        public bool SetProperty<T>(string name, T value) where T : struct
+        {
+            if (GetProperty(name) is not MaterialProperty<T> p) return false;
+            if (_parent != null) _overridden.Add(name);
+            p.Value = value;
+            return true;
+        }
         
         // Material ID indirection system
         public int MaterialID { get; private set; }
@@ -309,8 +346,92 @@ namespace Freefall.Graphics
             
             InitMaterialProperties();
             InitFromEffect(effect, device);
+            InitEffectProperties();
 
             lock (_liveMaterials) _liveMaterials.Add(new WeakReference<Material>(this));
+        }
+
+        /// <summary>Raised when one of its properties is set: inspector, MCP, load, script.</summary>
+        public event Action<MaterialProperty>? PropertyChanged;
+
+        internal void NotifyPropertyChanged(MaterialProperty property) => PropertyChanged?.Invoke(property);
+
+        // An instance (CreateInstance): the material it follows, and the properties set on it, which no longer do
+        private Material? _parent;
+        private readonly HashSet<string> _overridden = new();
+
+        /// <summary>
+        /// A material instance for one object: this material's effect, textures and property values, so a
+        /// script can change some of them for that object alone (each bindstone's pulse) without touching the
+        /// shared asset. It follows later changes to this material (the inspector, the MCP), except for the
+        /// properties set on the instance (<see cref="SetProperty{T}"/>), which are its own from then on.
+        /// It is not saved. Dispose it when the object goes: that also stops it following.
+        /// </summary>
+        public Material CreateInstance()
+        {
+            var instance = new Material(Effect) { Name = Name + " (instance)" };
+            foreach (var (slot, texture) in _textures)
+                instance.SetTexture(slot, texture);
+            foreach (var p in MaterialProperties)
+                instance.GetProperty(p.Name)?.CopyFrom(p);
+
+            instance._parent = this;
+            PropertyChanged += instance.FollowParent;
+            return instance;
+        }
+
+        private void FollowParent(MaterialProperty property)
+        {
+            if (!_overridden.Contains(property.Name))
+                GetProperty(property.Name)?.CopyFrom(property);
+        }
+
+        /// <summary>
+        /// The effect's own settings as material properties. Settings that keep their name and type keep
+        /// their value when the effect changes or is recompiled; new ones start at their default.
+        /// </summary>
+        private void InitEffectProperties()
+        {
+            var before = new Dictionary<string, MaterialProperty>();
+            foreach (var p in _effectProperties) before[p.Name] = p;
+            _effectProperties.Clear();
+            if (_effect == null) return;
+
+            foreach (var desc in _effect.MaterialParams)
+            {
+                string name = desc.Name;
+                MaterialProperty? prop = desc.Type switch
+                {
+                    "float" => new MaterialProperty<float>(name, this, desc.At(0),
+                        (m, v) => m.SetEffectValue(name, v)),
+                    "float2" => new MaterialProperty<Vector2>(name, this, new Vector2(desc.At(0), desc.At(1)),
+                        (m, v) => m.SetEffectValue(name, v)),
+                    "float3" when desc.IsColor => new MaterialProperty<Color3>(name, this, new Color3(desc.At(0, 1f), desc.At(1, 1f), desc.At(2, 1f)),
+                        (m, v) => m.SetEffectValue(name, v.ToVector3())),
+                    "float3" => new MaterialProperty<Vector3>(name, this, new Vector3(desc.At(0), desc.At(1), desc.At(2)),
+                        (m, v) => m.SetEffectValue(name, v)),
+                    "int" => new MaterialProperty<int>(name, this, (int)desc.At(0),
+                        (m, v) => m.SetEffectValue(name, v)),
+                    "uint" => new MaterialProperty<int>(name, this, (int)desc.At(0),
+                        (m, v) => m.SetEffectValue(name, (uint)Math.Max(v, 0))),
+                    "bool" => new MaterialProperty<bool>(name, this, desc.At(0) != 0f,
+                        (m, v) => m.SetEffectValue(name, v ? 1u : 0u)),   // an HLSL bool is 4 bytes
+                    _ => null,
+                };
+                if (prop == null) continue;
+
+                prop.Description = desc.Description;
+                prop.ResetToDefault();                                    // writes the default into the cbuffer
+                if (before.TryGetValue(name, out var old)) prop.CopyFrom(old);
+                _effectProperties.Add(prop);
+            }
+        }
+
+        // An effect setting into this material's ObjectConstants (the cbuffer bound at root slot 2 per draw batch)
+        private void SetEffectValue<T>(string name, T value) where T : unmanaged
+        {
+            if (_constantBuffers.TryGetValue("ObjectConstants", out var cb))
+                cb.SetParameter(name, value);
         }
         
         private void InitMaterialProperties()
@@ -364,6 +485,7 @@ namespace Freefall.Graphics
             _textures.Clear();
 
             InitFromEffect(effect, Freefall.Engine.Device);
+            InitEffectProperties();
 
             // Re-apply saved textures
             foreach (var (slot, tex) in savedTextures)
@@ -429,6 +551,10 @@ namespace Freefall.Graphics
                     cb.CopyValuesFrom(oldCb);
             }
             foreach (var cb in oldBuffers.Values) device.DeferDispose(cb);
+
+            // The settings may have changed with the source; known ones keep their values (written again
+            // into the new buffer, whose layout may differ from the old one's)
+            InitEffectProperties();
 
             EffectChanged?.Invoke(this);
         }
@@ -1158,8 +1284,22 @@ namespace Freefall.Graphics
 
         public void Dispose()
         {
+            // An instance stops following its parent
+            if (_parent != null)
+            {
+                _parent.PropertyChanged -= FollowParent;
+                _parent = null;
+            }
+
+            // Frames in flight may still draw with these buffers (a script disposing its instance as the
+            // object goes): release them when those frames are done
+            var device = Freefall.Engine.Device;
             foreach (var cb in _constantBuffers.Values)
-                cb.Dispose();
+            {
+                if (device != null) device.DeferDispose(cb);
+                else cb.Dispose();
+            }
+            _constantBuffers.Clear();
         }
         
 

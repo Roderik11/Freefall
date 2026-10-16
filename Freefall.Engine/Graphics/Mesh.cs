@@ -981,6 +981,59 @@ namespace Freefall.Graphics
         }
 
         /// <summary>
+        /// An open tube along the Y axis from y=0 to y=height for effects (vfx.fx): <paramref name="radiusBottom"/>
+        /// at its foot, <paramref name="radiusTop"/> at its head (0 = a cone), <paramref name="rings"/> rows of
+        /// quads along it so the vertex shader can bend it (a pulse swelling it needs a few rows per pulse length).
+        /// U runs once round it (0..1, the seam's vertices doubled), V from 0 at the foot to 1 at the head. Normals
+        /// point out of the side, tilted with the taper.
+        /// </summary>
+        public static Mesh CreateTube(GraphicsDevice device, float radiusBottom, float radiusTop, float height, int slices, int rings)
+        {
+            slices = Math.Max(slices, 3);
+            rings = Math.Max(rings, 1);
+            int columns = slices + 1;
+            var verts = new Vector3[columns * (rings + 1)];
+            var norms = new Vector3[verts.Length];
+            var uvs = new Vector2[verts.Length];
+
+            // The side's slope: radius lost per metre of height
+            float slope = height > 0f ? (radiusBottom - radiusTop) / height : 0f;
+            for (int r = 0; r <= rings; r++)
+            {
+                float v = (float)r / rings;
+                float radius = radiusBottom + (radiusTop - radiusBottom) * v;
+                for (int s = 0; s <= slices; s++)
+                {
+                    float theta = 2 * MathF.PI * s / slices;
+                    float x = MathF.Cos(theta), z = MathF.Sin(theta);
+                    int i = r * columns + s;
+                    verts[i] = new Vector3(x * radius, height * v, z * radius);
+                    norms[i] = Vector3.Normalize(new Vector3(x, slope, z));
+                    uvs[i] = new Vector2((float)s / slices, v);
+                }
+            }
+
+            var indices = new uint[slices * rings * 6];
+            int ii = 0;
+            for (int r = 0; r < rings; r++)
+            {
+                for (int s = 0; s < slices; s++)
+                {
+                    uint bl = (uint)(r * columns + s), br = bl + 1;
+                    uint tl = bl + (uint)columns, tr = tl + 1;
+                    indices[ii++] = bl; indices[ii++] = tl; indices[ii++] = br;
+                    indices[ii++] = br; indices[ii++] = tl; indices[ii++] = tr;
+                }
+            }
+
+            float wide = MathF.Max(radiusBottom, radiusTop);
+            var mesh = new Mesh(device, verts, norms, uvs, indices);
+            mesh.BoundingBox = new BoundingBox(new Vector3(-wide, 0, -wide), new Vector3(wide, height, wide));
+            mesh.MeshParts.Add(new MeshPart { NumIndices = indices.Length, BoundingBox = mesh.BoundingBox, BoundingSphere = mesh.LocalBoundingSphere });
+            return mesh;
+        }
+
+        /// <summary>
         /// Create a cone along the Y axis from y=0 (base) to y=height (tip).
         /// </summary>
         public static Mesh CreateCone(GraphicsDevice device, float radius, float height, int slices)

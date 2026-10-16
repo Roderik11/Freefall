@@ -44,6 +44,7 @@ namespace Freefall.Assets
             public const string SkinnedEffect = "00000000000000000000000000000017";
             public const string CrossmeshEffect = "00000000000000000000000000000018";
             public const string WaterEffect = "00000000000000000000000000000019";
+            public const string VfxEffect = "0000000000000000000000000000001a";   // vfx.fx: glowing meshes (beams, lasers, spells)
 
             // materials
             public const string DefaultMaterial = "00000000000000000000000000000020";
@@ -58,6 +59,8 @@ namespace Freefall.Assets
             // meshes
             public const string SphereMesh = "000000000000000000000000000001000";
             public const string CubeMesh = "000000000000000000000000000001001";
+            public const string TubeMesh = "000000000000000000000000000001002";
+            public const string ConeMesh = "000000000000000000000000000001003";
 
         }
 
@@ -88,6 +91,7 @@ namespace Freefall.Assets
         public static Effect CrossmeshEffect { get; private set; }
         /// <summary>Lakes and rivers (water.fx). Drawn by the WaterBody component, which supplies its per-instance data.</summary>
         public static Effect WaterEffect { get; private set; }
+        public static Effect VfxEffect { get; private set; }
 
         // Default materials mirror the default effects, with basic textures assigned where appropriate.
 
@@ -105,6 +109,16 @@ namespace Freefall.Assets
 
         public static Mesh SphereMesh { get; private set; }
         public static Mesh CubeMesh { get; private set; }
+
+        /// <summary>
+        /// An open tube for effects (vfx.fx): radius 1, from y 0 to 1, 16 sides, 512 rings along it so a pulse can
+        /// bend it. Scale its entity to size it (x = z = radius, y = length): non-uniform scale keeps the side
+        /// normals level, which pushes and widening along them rely on. U once round, V from the foot to the head.
+        /// </summary>
+        public static Mesh TubeMesh { get; private set; }
+
+        /// <summary>The same as a cone: radius 1 at y 0 narrowing to a point at y 1 (a jet, a flame, a spike).</summary>
+        public static Mesh ConeMesh { get; private set; }
 
         public static void Initialize(GraphicsDevice device)
         {
@@ -173,6 +187,7 @@ namespace Freefall.Assets
             SkinnedEffect = new Effect("gbuffer_skinned");
             CrossmeshEffect = new Effect("gbuffer_crossmesh");
             WaterEffect = new Effect("water");
+            VfxEffect = new Effect("vfx");
 
             DefaultMaterial = new Material(DefaultEffect);
             DefaultMaterial.Name = "DefaultMaterial";
@@ -201,6 +216,14 @@ namespace Freefall.Assets
             CubeMesh = Mesh.CreateCube(device, 1.0f);
             CubeMesh.Name = "CubeMesh";
             CubeMesh.Guid = Guids.CubeMesh;
+
+            TubeMesh = Mesh.CreateTube(device, 1f, 1f, 1f, 16, 512);
+            TubeMesh.Name = "VfxTube";
+            TubeMesh.Guid = Guids.TubeMesh;
+
+            ConeMesh = Mesh.CreateTube(device, 1f, 0f, 1f, 16, 128);
+            ConeMesh.Name = "VfxCone";
+            ConeMesh.Guid = Guids.ConeMesh;
         }
 
         /// <summary>
@@ -232,6 +255,7 @@ namespace Freefall.Assets
             manager.RegisterAsset(Guids.SkinnedEffect, SkinnedEffect);
             manager.RegisterAsset(Guids.CrossmeshEffect, CrossmeshEffect);
             manager.RegisterAsset(Guids.WaterEffect, WaterEffect);
+            manager.RegisterAsset(Guids.VfxEffect, VfxEffect);
 
             manager.RegisterAsset(Guids.DefaultMaterial, DefaultMaterial);
             manager.RegisterAsset(Guids.DecoratorMaterial, DecoratorMaterial);
@@ -244,6 +268,8 @@ namespace Freefall.Assets
 
             manager.RegisterAsset(Guids.SphereMesh, SphereMesh);
             manager.RegisterAsset(Guids.CubeMesh, CubeMesh);
+            manager.RegisterAsset(Guids.TubeMesh, TubeMesh);
+            manager.RegisterAsset(Guids.ConeMesh, ConeMesh);
         }
     }
 }

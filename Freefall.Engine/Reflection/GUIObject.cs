@@ -78,7 +78,10 @@ namespace Freefall.Reflection
 
         static readonly Dictionary<int, bool> expandedTable = new Dictionary<int, bool>();
 
-        public string Description => _field.GetAttribute<System.ComponentModel.DescriptionAttribute>()?.Description;
+        public string Description => DescriptionOverride ?? _field.GetAttribute<System.ComponentModel.DescriptionAttribute>()?.Description;
+
+        /// <summary>A tooltip for a property that has no [Description] of its own (a material's effect setting).</summary>
+        public string DescriptionOverride { get; set; }
 
         public GUIProperty(Field field, params object[] targets)
         {
