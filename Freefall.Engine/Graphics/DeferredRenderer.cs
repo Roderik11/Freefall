@@ -665,8 +665,9 @@ namespace Freefall.Graphics
              
              // SDSM: Analyze depth buffer for adaptive cascade splits
              // DepthGBuffer is still in NonPixelShaderResource — perfect for compute SRV reads
-             // Only feeds the shadow cascades: skipped while no shadows are rendered
-             if (_shadowsRendered && CommandBuffer.Culler?.SdsmReady == true)
+             // Only feeds adaptive cascade splits: skipped while no shadows are rendered or the splits are fixed
+             // (DirectionalLight reads it only with UseAdaptiveSplits; 0.24 ms at 2176×1249 spent for nothing before)
+             if (_shadowsRendered && Engine.Settings.UseAdaptiveSplits && CommandBuffer.Culler?.SdsmReady == true)
              {
                  PixMarker.Begin(list, "SDSM Depth Analysis");
                  int depthWidth = (int)DepthGBuffer.Native.Description.Width;
