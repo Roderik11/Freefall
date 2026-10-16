@@ -431,6 +431,21 @@ namespace Freefall.Editor.Commands
             void Apply(string propertyName, JsonElement valueEl)
             {
                 var field = Freefall.Reflection.Reflector.GetField(assetType, propertyName);
+
+                // A material's shader properties (Tint, EmissiveColor, EmissiveIntensity, DetailTiling…) are not C#
+                // members: set their Value as the material inspector does
+                if (field == null && asset is Freefall.Graphics.Material material)
+                {
+                    foreach (var materialProperty in material.MaterialProperties)
+                    {
+                        if (materialProperty.Name != propertyName) continue;
+                        var valueField = new Freefall.Reflection.Field(materialProperty.GetType().GetProperty("Value")!);
+                        valueField.SetValue(materialProperty, SetPropertyCommand.ConvertJsonValue(valueEl, valueField.Type));
+                        applied[propertyName] = CommandHelpers.SerializeValue(valueField.GetValue(materialProperty));
+                        return;
+                    }
+                }
+
                 if (field == null)
                     throw new InvalidOperationException($"Property '{propertyName}' not found on '{assetType.Name}'");
                 object converted = SetPropertyCommand.ConvertJsonValue(valueEl, field.Type);

@@ -54,6 +54,7 @@ namespace Freefall.Editor.Mcp
 
         [McpServerTool(Name = "asset_set_properties", Title = "Set asset properties", Destructive = true, Idempotent = true, OpenWorld = false)]
         [Description("Set fields on an asset, then (by default) save it to disk and reimport so the editor's cached copy matches. " +
+                     "On a Material this also sets its shader properties by name (Tint, EmissiveColor, EmissiveIntensity, DetailTiling, …; asset_get lists them under MaterialProperties). " +
                      "A file edited or regenerated on disk reaches the running editor with asset_refresh instead. " +
                      "Same value encodings as entity_set_properties. Not atomic — earlier members stay set if a later one fails.")]
         public static Task<CallToolResult> SetProperties(
