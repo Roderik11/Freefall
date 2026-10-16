@@ -1,14 +1,13 @@
-// Point Light Compute Shader — Hi-Z pre-cull + tiled culling + PBR lighting
+// Point Light Compute Shader — tiled culling + PBR lighting
 //
-// Phase 0 (CSCullLights): Per-light frustum + Hi-Z occlusion test.
-//          Outputs a compacted list of visible light indices.
+// The lights come from this frame's visible list (point_light_cull.hlsl: registry → frustum → list;
+// CSOccludeLights flags those behind the Hi-Z).
 // Phase 1: Tile builds 4 frustum planes from its screen-space bounds.
 //          All 64 threads cooperatively test visible lights against the tile
 //          frustum, building a compact per-tile light list in groupshared memory.
 // Phase 2: Each thread loads its pixel's G-buffer and loops only over
 //          the tile's accepted lights.
 
-#pragma kernel CSCullLights
 #pragma kernel CSPointLight
 
 cbuffer PushConstants : register(b3)
@@ -18,24 +17,73 @@ cbuffer PushConstants : register(b3)
     uint AlbedoTexIdx;
     uint DataTexIdx;
     uint OutputUAVIdx;
-    uint LightDataIdx;      // StructuredBuffer<PointLightData>
-    uint LightCountIdx;     // raw uint — number of active lights
     uint ScreenWidthIdx;
     uint ScreenHeightIdx;
-    uint HiZTexIdx;         // Hi-Z pyramid SRV (0 = disabled)
-    uint VisibleLightUAVIdx;  // UAV: compacted visible light indices
-    uint VisibleLightCountUAVIdx; // UAV: atomic counter (RWByteAddressBuffer)
+    uint VisibleLightUAVIdx;      // RWStructuredBuffer<PointLightData>: this frame's visible lights
+    uint VisibleLightCountUAVIdx; // RWByteAddressBuffer: [0] = visible lights
+    uint LocalShadowAtlasIdx;   // Texture2DArray: point light shadow atlas (0 = none rendered this frame)
+    uint LocalShadowViewsIdx;   // StructuredBuffer<LocalShadowView>
+    uint LocalShadowLightsIdx;  // StructuredBuffer<LocalShadowLight>
 };
 
 #include "common.fx"
+#include "point_lights.hlsli"
 
-struct PointLightData
+SamplerComparisonState ShadowSampler : register(s3); // LessEqual, linear: standard Z
+
+// ── Point light shadows (LocalShadows.cs) ─────────────────────────────────
+// 1 = lit. The receiver is pushed toward the light and off the surface by about a texel of the face it
+// falls in (a perspective face's texels grow with distance, so a fixed depth bias would be 2 cm at 1 m and
+// half a metre at 5 m); the face is chosen from the pushed point, whose projection then lies inside the
+// face's 90° and so inside its tile's guard band. 3x3 bilinear compare taps.
+float PointLightShadow(PointLightData light, float3 worldPos, float3 N, float3 L)
 {
-    float3 Color;
-    float Intensity;
-    float3 Position; // camera-relative
-    float Range;
-};
+    if (light.ShadowLight == LOCAL_SHADOW_NO_VIEW || LocalShadowAtlasIdx == 0)
+        return 1.0;
+
+    StructuredBuffer<LocalShadowLight> shadowLights = ResourceDescriptorHeap[LocalShadowLightsIdx];
+    StructuredBuffer<LocalShadowView> views = ResourceDescriptorHeap[LocalShadowViewsIdx];
+
+    // Fading in after being picked, or out after being dropped from the budget
+    float strength = shadowLights[light.ShadowLight].Strength;
+    if (strength <= 0.0)
+        return 1.0;
+
+    float3 fromLight = worldPos - light.Position;
+    float axisDistance = max(abs(fromLight.x), max(abs(fromLight.y), abs(fromLight.z)));
+    uint v0 = shadowLights[light.ShadowLight].FaceView[LocalShadowFace(fromLight)];
+    if (v0 == LOCAL_SHADOW_NO_VIEW)
+        return 1.0;
+    float texel = views[v0].TexelPerMetre * axisDistance;
+
+    float3 biased = worldPos + N * (texel * 1.0) + L * (texel * 1.0);
+    uint v = shadowLights[light.ShadowLight].FaceView[LocalShadowFace(biased - light.Position)];
+    if (v == LOCAL_SHADOW_NO_VIEW)
+        return 1.0;
+    LocalShadowView view = views[v];
+
+    float4 clip = mul(float4(biased, 1.0), view.SampleVP);
+    float3 ndc = clip.xyz / clip.w;
+    float2 uv = ndc.xy * float2(0.5, -0.5) + 0.5;
+
+    // Stay inside the tile: the taps reach 2 texels out
+    float tileTexels = view.Tile.x * LOCAL_SHADOW_PAGE_SIZE;
+    float inset = 2.0 / tileTexels;
+    uv = clamp(uv, inset, 1.0 - inset);
+    float2 atlasUV = uv * view.Tile.xy + view.Tile.zw;
+
+    Texture2DArray<float> atlas = ResourceDescriptorHeap[LocalShadowAtlasIdx];
+    float t = 1.0 / LOCAL_SHADOW_PAGE_SIZE;
+    float lit = 0;
+    [unroll]
+    for (int y = -1; y <= 1; y++)
+    {
+        [unroll]
+        for (int x = -1; x <= 1; x++)
+            lit += atlas.SampleCmpLevelZero(ShadowSampler, float3(atlasUV + float2(x, y) * t, view.Page), ndc.z);
+    }
+    return lerp(1.0, lit / 9.0, strength);
+}
 
 // PBR helpers
 float3 FresnelSchlick(float cosTheta, float3 F0)
@@ -45,7 +93,9 @@ float3 FresnelSchlick(float cosTheta, float3 F0)
 
 // ── Tile culling shared memory ────────────────────────────────────────────
 #define TILE_SIZE 8
-#define MAX_LIGHTS_PER_TILE 64
+// Past this a tile drops lights in the order the GPU appends them, which changes every frame (they would blink):
+// 128 keeps that out of reach of dense streets (10,000 lanterns over Eldermoor, 2026-10-16)
+#define MAX_LIGHTS_PER_TILE 128
 
 groupshared uint g_TileLightCount;
 groupshared uint g_TileLightIndices[MAX_LIGHTS_PER_TILE];
@@ -103,105 +153,6 @@ bool SphereFrustumTest(float3 center, float radius, float4 planes[4])
     return true;
 }
 
-// ── Phase 0: Per-light frustum + Hi-Z cull ────────────────────────────────
-// One thread per light. Outputs compacted visible light index list.
-[numthreads(64, 1, 1)]
-void CSCullLights(uint3 dtid : SV_DispatchThreadID)
-{
-    uint li = dtid.x;
-    if (li >= LightCountIdx) return;
-
-    StructuredBuffer<PointLightData> lightData = ResourceDescriptorHeap[LightDataIdx];
-    PointLightData light = lightData[li];
-
-    // ── View frustum test ──
-    // Extract 6 planes from CameraRelativeVP (row-major, mul(v, M) convention)
-    // Column j = float4(M[0][j], M[1][j], M[2][j], M[3][j])
-    float4x4 vp = CameraRelativeVP;
-    float4 col0 = float4(vp[0][0], vp[1][0], vp[2][0], vp[3][0]);
-    float4 col1 = float4(vp[0][1], vp[1][1], vp[2][1], vp[3][1]);
-    float4 col2 = float4(vp[0][2], vp[1][2], vp[2][2], vp[3][2]);
-    float4 col3 = float4(vp[0][3], vp[1][3], vp[2][3], vp[3][3]);
-
-    float4 frustumPlanes[6];
-    frustumPlanes[0] = col3 + col0; // left
-    frustumPlanes[1] = col3 - col0; // right
-    frustumPlanes[2] = col3 + col1; // bottom
-    frustumPlanes[3] = col3 - col1; // top
-    frustumPlanes[4] = col2;        // near
-    frustumPlanes[5] = col3 - col2; // far
-
-    [unroll]
-    for (uint p = 0; p < 6; p++)
-    {
-        float len = length(frustumPlanes[p].xyz);
-        if (len > 0) frustumPlanes[p] /= len;
-    }
-
-    [unroll]
-    for (uint f = 0; f < 6; f++)
-    {
-        if (dot(frustumPlanes[f].xyz, light.Position) + frustumPlanes[f].w < -light.Range)
-            return;
-    }
-
-    // ── Hi-Z occlusion test ──
-    if (HiZTexIdx != 0)
-    {
-        float4 clipCenter = mul(float4(light.Position, 1.0), CameraRelativeVP);
-
-        // Only test if center is in front of the camera
-        if (clipCenter.w > 0)
-        {
-            float3 ndc = clipCenter.xyz / clipCenter.w;
-            float2 uv = ndc.xy * float2(0.5, -0.5) + 0.5;
-
-            // Only test if center projects on screen
-            if (all(uv >= 0.0) && all(uv <= 1.0))
-            {
-                Texture2D<float> hiZ = ResourceDescriptorHeap[HiZTexIdx];
-                float w, h, levels;
-                hiZ.GetDimensions(0, w, h, levels);
-
-                float projScale = max(abs(CameraRelativeVP._m11), 0.001);
-                float screenRadius = (light.Range * projScale / clipCenter.w) * h * 0.5;
-
-                float mipLevel = ceil(log2(max(screenRadius * 2.0, 1.0)));
-                mipLevel = min(mipLevel, levels - 1.0);
-                uint mip = (uint)mipLevel;
-
-                float mipW, mipH, unused;
-                hiZ.GetDimensions(mip, mipW, mipH, unused);
-                float2 mipSize = float2(mipW, mipH);
-
-                float2 texCoordFloat = uv * mipSize - 0.5;
-                int2 baseCoord = int2(texCoordFloat);
-                int2 maxCoord = int2(mipSize) - 1;
-
-                float d0 = hiZ.Load(int3(clamp(baseCoord,             int2(0,0), maxCoord), mip));
-                float d1 = hiZ.Load(int3(clamp(baseCoord + int2(1,0), int2(0,0), maxCoord), mip));
-                float d2 = hiZ.Load(int3(clamp(baseCoord + int2(0,1), int2(0,0), maxCoord), mip));
-                float d3 = hiZ.Load(int3(clamp(baseCoord + int2(1,1), int2(0,0), maxCoord), mip));
-
-                float sampledDepth = max(max(d0, d1), max(d2, d3));
-                float sphereNearestDepth = clipCenter.w - light.Range;
-
-                if (sphereNearestDepth > sampledDepth)
-                    return; // fully occluded
-            }
-        }
-    }
-
-    // ── Survived — append to visible list ──
-    RWByteAddressBuffer countBuf = ResourceDescriptorHeap[VisibleLightCountUAVIdx];
-    RWStructuredBuffer<uint> visibleOut = ResourceDescriptorHeap[VisibleLightUAVIdx];
-
-    uint slot;
-    countBuf.InterlockedAdd(0, 1, slot);
-    if (slot < 256)
-        visibleOut[slot] = li;
-}
-
 // ── Main kernel ───────────────────────────────────────────────────────────
 [numthreads(TILE_SIZE, TILE_SIZE, 1)]
 void CSPointLight(
@@ -212,10 +163,10 @@ void CSPointLight(
     uint2 px = dispatchThreadId.xy;
     float2 screenSize = float2(ScreenWidthIdx, ScreenHeightIdx);
 
-    // Read visible light count from Phase 0 output
+    // This frame's visible lights (point_light_cull.hlsl)
     RWByteAddressBuffer countBuf = ResourceDescriptorHeap[VisibleLightCountUAVIdx];
-    uint lightCount = countBuf.Load(0);
-    lightCount = min(lightCount, 256);
+    uint lightCount = min(countBuf.Load(0), MAX_VISIBLE_LIGHTS);
+    RWStructuredBuffer<PointLightData> lightData = ResourceDescriptorHeap[VisibleLightUAVIdx];
 
     // ── Phase 1: Tile-level light culling ─────────────────────────────────
     if (groupIndex == 0)
@@ -228,21 +179,18 @@ void CSPointLight(
         float4 tilePlanes[4];
         BuildTileFrustumPlanes(groupId.xy, screenSize, CameraInverse, tilePlanes);
 
-        // Read from the compacted visible light list
-        StructuredBuffer<PointLightData> lightData = ResourceDescriptorHeap[LightDataIdx];
-        RWStructuredBuffer<uint> visibleIndices = ResourceDescriptorHeap[VisibleLightUAVIdx];
-
         for (uint vi = groupIndex; vi < lightCount; vi += (TILE_SIZE * TILE_SIZE))
         {
-            uint lightIdx = visibleIndices[vi];
-            PointLightData light = lightData[lightIdx];
+            PointLightData light = lightData[vi];
+            if ((light.Flags & VISIBLE_LIGHT_OCCLUDED) != 0)
+                continue;
 
             if (SphereFrustumTest(light.Position, light.Range, tilePlanes))
             {
                 uint slot;
                 InterlockedAdd(g_TileLightCount, 1, slot);
                 if (slot < MAX_LIGHTS_PER_TILE)
-                    g_TileLightIndices[slot] = lightIdx;
+                    g_TileLightIndices[slot] = vi;
             }
         }
     }
@@ -303,9 +251,6 @@ void CSPointLight(
     // Diffuse coefficient
     float3 diffuseAlbedo = albedo / 3.14159;
 
-    // Light buffer (re-fetch for phase 2)
-    StructuredBuffer<PointLightData> lightData = ResourceDescriptorHeap[LightDataIdx];
-
     // Accumulate lighting from tile's lights only
     float3 totalLighting = 0;
 
@@ -333,6 +278,12 @@ void CSPointLight(
         // Attenuation: smooth quadratic falloff
         float attenuation = saturate(1.0 - (dist / light.Range));
         attenuation *= attenuation;
+
+        // Shadow: leaves lit from behind push off their side facing the light
+        float shadow = PointLightShadow(light, worldPos.xyz, rawNdotL < 0.0 ? -normal : normal, L);
+        if (shadow <= 0.0)
+            continue;
+        attenuation *= shadow;
 
         // Half vector
         float3 H = normalize(L + V);

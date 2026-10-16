@@ -174,6 +174,10 @@ namespace Freefall.Graphics
         private uint[] shadowExpansionSRVIndices = new uint[FrameCount];
         private CpuDescriptorHandle[] shadowExpansionCPUHandles = new CpuDescriptorHandle[FrameCount];
 
+        // Point light shadows: per-instance view mask (uint4 = 128 views), made by the first CullLocalShadowAll
+        private ID3D12Resource?[] localShadowMaskBuffers = new ID3D12Resource?[FrameCount];
+        private uint[] localShadowMaskUAVIndices = new uint[FrameCount];
+
         // Depth sort keys buffer — uint2 per instance: (compositeKey, instanceIdx)
         private ID3D12Resource[] sortKeysBuffers = new ID3D12Resource[FrameCount];
         private uint[] sortKeysUAVIndices = new uint[FrameCount];
@@ -1246,18 +1250,143 @@ namespace Freefall.Graphics
             PixMarker.End(commandList); // batch
         }
 
+        /// <summary>
+        /// Point light shadows: culls the batch against every cube face LocalShadows built this frame and expands
+        /// the visible (instance, face) pairs for DrawShadowSinglePass (LocalShadow pass, view buffer in slot 21).
+        /// Reuses the cascade buffers: it runs after the cascades have been drawn. Unlike the cascades the
+        /// expansion is sized exactly (the histogram counts an instance once per face) and the scatter writes it
+        /// directly (CS*LocalShadows in cull_instances.hlsl).
+        /// </summary>
+        /// <param name="countsUav">The selection's counts (local_shadow_select.hlsl), [0] = lights: picked on the GPU.</param>
+        /// <param name="placeholderCbAddress">Any CBV address for root slot 2, which must be bound (the kernels do not read it).</param>
+        public void CullLocalShadowAll(ID3D12GraphicsCommandList commandList, uint viewBufferSrv, uint lightBufferSrv, uint countsUav,
+            ulong placeholderCbAddress, GPUCuller culler)
+        {
+            if (SubBatchCount == 0) return;
+            if (culler.VisibilityLocalShadowsPSO == null || culler.HistogramLocalShadowsPSO == null
+                || culler.ScatterLocalShadowsPSO == null || culler.MainPSO == null) return;
 
+            InitializeShadowCullerResources();
 
+            int frameIndex = Engine.FrameIndex % FrameCount;
+            var device = Engine.Device;
+            int totalInstances = _drawCount;
 
+            if (localShadowMaskBuffers[frameIndex] == null)
+            {
+                const int maskStride = 4 * sizeof(uint);
+                for (int f = 0; f < FrameCount; f++)
+                {
+                    localShadowMaskBuffers[f] = device.CreateDefaultBuffer(capacity * maskStride);
+                    localShadowMaskUAVIndices[f] = device.AllocateBindlessIndex();
+                    device.CreateStructuredBufferUAV(localShadowMaskBuffers[f]!, (uint)capacity, maskStride, localShadowMaskUAVIndices[f]);
+                }
+            }
+            var maskBuffer = localShadowMaskBuffers[frameIndex]!;
 
+            commandList.SetComputeRootSignature(device.GlobalRootSignature);
+            _cachedSrvHeapArray ??= new[] { device.SrvHeap };
+            commandList.SetDescriptorHeaps(1, _cachedSrvHeapArray);
+            commandList.SetComputeRootConstantBufferView(2, placeholderCbAddress);
 
+            foreach (var (hash, pib) in _perInstanceBuffers)
+            {
+                if (!ComputeSlots.TryGetValue(hash, out int computeSlot)) continue;
+                commandList.SetComputeRoot32BitConstant(0, pib.SRVIndices[frameIndex], (uint)computeSlot);
+            }
 
+            commandList.SetComputeRoot32BitConstant(0, MeshRegistry.SrvIndex, 0);
+            commandList.SetComputeRoot32BitConstant(0, shadowCommandUAVIndices[frameIndex], 1);
+            commandList.SetComputeRoot32BitConstant(0, 0u, 2);                                         // no shadow Hi-Z
+            commandList.SetComputeRoot32BitConstant(0, 1u, 3);                                         // InstanceMultiplier: counts are entries already
+            commandList.SetComputeRoot32BitConstant(0, shadowCounterUAVIndices[frameIndex], 6);
+            commandList.SetComputeRoot32BitConstant(0, (uint)SubBatchCount, 7);
+            commandList.SetComputeRoot32BitConstant(0, TransformBuffer.Instance?.SrvIndex ?? 0, 10);
+            commandList.SetComputeRoot32BitConstant(0, shadowCombinedVisUAVIndices[frameIndex], 11);  // VisibilityFlagsIdx = combined
+            commandList.SetComputeRoot32BitConstant(0, (uint)totalInstances, 13);
+            commandList.SetComputeRoot32BitConstant(0, lightBufferSrv, 16);                           // LocalShadowLightsIdx
+            commandList.SetComputeRoot32BitConstant(0, countsUav, 17);                                // LocalShadowCountsIdx
+            commandList.SetComputeRoot32BitConstant(0, 0u, 18);                                       // DrawCountUAVIdx = 0 → fixed-index CSMain
+            commandList.SetComputeRoot32BitConstant(0, (uint)(capacity * 4), 19);                     // LocalShadowExpansionCapacity
+            commandList.SetComputeRoot32BitConstant(0, shadowCombinedVisUAVIndices[frameIndex], 24);  // CombinedShadowVisIdx
+            commandList.SetComputeRoot32BitConstant(0, Material.MaterialsBufferIndex, 25);
+            commandList.SetComputeRoot32BitConstant(0, shadowHistogramUAVIndices[frameIndex], 26);
+            commandList.SetComputeRoot32BitConstant(0, (uint)MeshRegistry.Count, 27);
+            commandList.SetComputeRoot32BitConstant(0, localShadowMaskUAVIndices[frameIndex], 28);   // LocalShadowMaskIdx (uint4 view mask)
+            commandList.SetComputeRoot32BitConstant(0, shadowExpansionUAVIndices[frameIndex], 29);
+            commandList.SetComputeRoot32BitConstant(0, 0u, 30);                                       // ShadowMinCasterClip: cascades only
+            commandList.SetComputeRoot32BitConstant(0, viewBufferSrv, 31);                            // LocalShadowViewsIdx
+            SetLodConstants(commandList);                                                             // main camera: same LOD as the view
 
+            commandList.ClearUnorderedAccessViewUint(
+                device.GetGpuHandle(shadowCounterUAVIndices[frameIndex]),
+                shadowCounterCPUHandles[frameIndex],
+                shadowCounterBuffers[frameIndex],
+                new Vortice.Mathematics.Int4(0, 0, 0, 0));
+            commandList.ClearUnorderedAccessViewUint(
+                device.GetGpuHandle(shadowHistogramUAVIndices[frameIndex]),
+                shadowHistogramCPUHandles[frameIndex],
+                shadowHistogramBuffers[frameIndex],
+                new Vortice.Mathematics.Int4(0, 0, 0, 0));
+            commandList.Barriers(
+                new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(shadowCounterBuffers[frameIndex])),
+                new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(shadowHistogramBuffers[frameIndex])));
+
+            using var _ = ProfileMarker.Auto(totalInstances);
+            PixMarker.Begin(commandList, ProfileName);
+
+            // Visibility: combined flag + view mask per instance
+            commandList.SetPipelineState(culler.VisibilityLocalShadowsPSO);
+            commandList.Dispatch((uint)((totalInstances + 255) / 256), 1, 1);
+            commandList.Barriers(
+                new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(shadowCombinedVisBuffers[frameIndex])),
+                new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(maskBuffer)));
+
+            // Entries per part, then their prefix sum (the parts' first entries)
+            commandList.SetPipelineState(culler.HistogramLocalShadowsPSO);
+            commandList.Dispatch((uint)((totalInstances + 63) / 64), 1, 1);
+            commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(shadowHistogramBuffers[frameIndex])));
+
+            commandList.SetPipelineState(culler.HistogramPrefixSumPSO);
+            commandList.Dispatch(1, 1, 1);
+            commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(shadowCounterBuffers[frameIndex])));
+
+            // Expansion entries, written in place
+            commandList.SetPipelineState(culler.ScatterLocalShadowsPSO);
+            commandList.Dispatch((uint)((totalInstances + 255) / 256), 1, 1);
+            commandList.Barriers(
+                new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(shadowExpansionBuffers[frameIndex])),
+                new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(shadowCounterBuffers[frameIndex])));
+
+            // Commands at fixed part indices: base = the part's first entry, count = its entries
+            commandList.SetPipelineState(culler.MainPSO);
+            commandList.Dispatch((uint)((MeshRegistry.Count + 63) / 64), 1, 1);
+            commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(shadowCommandBuffers[frameIndex])));
+
+            // Pack the non-empty commands into the opaque command buffer, as the cascades do
+            commandList.ClearUnorderedAccessViewUint(
+                device.GetGpuHandle(drawCountUAVIndices[frameIndex]),
+                drawCountCPUHandles[frameIndex],
+                drawCountBuffers[frameIndex],
+                new Vortice.Mathematics.Int4(0, 0, 0, 0));
+            commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(drawCountBuffers[frameIndex])));
+
+            commandList.SetComputeRoot32BitConstant(0, drawCountUAVIndices[frameIndex], 18); // DrawCountUAVIdx
+            commandList.SetComputeRoot32BitConstant(0, gpuCommandUAVIndices[frameIndex], 9);  // dest = opaque command buffer
+            commandList.SetPipelineState(culler.CompactCommandsPSO);
+            commandList.Dispatch((uint)((MeshRegistry.Count + 63) / 64), 1, 1);
+            commandList.Barriers(
+                new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(gpuCommandBuffers[frameIndex])),
+                new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(drawCountBuffers[frameIndex])));
+
+            PixMarker.End(commandList); // batch
+        }
 
         /// <summary>
-        /// Single-pass shadow draw: 1 ExecuteIndirect for all cascades.
+        /// Single-pass shadow draw: 1 ExecuteIndirect for all cascades (Shadow pass), or for all point light
+        /// cube faces after CullLocalShadowAll (LocalShadow pass; shadowVPSrv is then LocalShadows' view buffer).
         /// Material/PSO/descriptors must already be set by the caller.
-        /// Expansion buffer encodes (cascadeIdx, instanceIdx) — no cascade mask needed in VS.
+        /// Expansion buffer encodes (view, instanceIdx) — no view mask needed in VS.
         /// </summary>
         public void DrawShadowSinglePass(ID3D12GraphicsCommandList commandList, uint shadowVPSrv)
         {
@@ -1510,6 +1639,10 @@ namespace Freefall.Graphics
                     DeferDispose(shadowExpansionBuffers[f], shadowExpansionUAVIndices[f]);
                     DeferDispose(null, shadowExpansionSRVIndices[f]);
                     shadowExpansionBuffers[f] = null; shadowExpansionUAVIndices[f] = 0; shadowExpansionSRVIndices[f] = 0;
+
+                    if (localShadowMaskBuffers[f] != null)
+                        DeferDispose(localShadowMaskBuffers[f], localShadowMaskUAVIndices[f]);
+                    localShadowMaskBuffers[f] = null; localShadowMaskUAVIndices[f] = 0;
                 }
                 _shadowCullerInitialized = false;
                 _shadowCpuHeap?.Dispose();
@@ -1577,6 +1710,10 @@ namespace Freefall.Graphics
                     shadowExpansionBuffers[f]?.Dispose();
                     if (shadowExpansionUAVIndices[f] != 0) Engine.Device.ReleaseBindlessIndex(shadowExpansionUAVIndices[f]);
                     if (shadowExpansionSRVIndices[f] != 0) Engine.Device.ReleaseBindlessIndex(shadowExpansionSRVIndices[f]);
+
+                    localShadowMaskBuffers[f]?.Dispose();
+                    if (localShadowMaskUAVIndices[f] != 0) Engine.Device.ReleaseBindlessIndex(localShadowMaskUAVIndices[f]);
+                    localShadowMaskBuffers[f] = null; localShadowMaskUAVIndices[f] = 0;
                 }
                 _shadowCullerInitialized = false;
             }

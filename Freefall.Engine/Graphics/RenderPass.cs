@@ -11,6 +11,7 @@ namespace Freefall.Graphics
         Forward,
         PostProcess,
         Overlay,
-        Debug
+        Debug,
+        LocalShadow, // point light cube faces into the local shadow atlas (LocalShadows), drawn like Shadow
     }
 }

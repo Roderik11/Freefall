@@ -213,9 +213,11 @@ struct ShadowVSOutput
     float2 TexCoord : TEXCOORD0;
     nointerpolation uint MaterialID : TEXCOORD1;
     nointerpolation uint RTIndex : SV_RenderTargetArrayIndex;
+    float4 ClipDistance : SV_ClipDistance0;
 };
 
-ShadowVSOutput VS_Shadow(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_InstanceID)
+// Sun cascades, or point light cube faces when local
+ShadowVSOutput ShadowVertex(uint primitiveVertexID, uint instanceID, bool local)
 {
     ShadowVSOutput output;
     output.Position = float4(0, 0, 0, 1);
@@ -223,12 +225,9 @@ ShadowVSOutput VS_Shadow(uint primitiveVertexID : SV_VertexID, uint instanceID :
     output.MaterialID = 0;
     output.RTIndex = 0;
 
-    // Read expansion entry: bits 30-31 = cascadeIdx, bits 0-29 = instance index
     StructuredBuffer<uint> expansion = ResourceDescriptorHeap[ExpansionBufferIdx];
-    uint entry = expansion[InstanceBaseOffset + instanceID];
-    uint cascadeIdx = entry >> 30;
-    uint idx = entry & 0x3FFFFFFFu;
-    output.RTIndex = cascadeIdx;
+    uint view, idx;
+    DecodeShadowEntry(expansion[InstanceBaseOffset + instanceID], local, view, idx);
 
     StructuredBuffer<row_major matrix> globalTransforms = ResourceDescriptorHeap[GlobalTransformBufferIdx];
     
@@ -251,12 +250,21 @@ ShadowVSOutput VS_Shadow(uint primitiveVertexID : SV_VertexID, uint instanceID :
     // Match wind displacement from VS (it used a different weight here once: shadows moved unlike the leaves)
     worldPos.xyz += WindDisplacement(worldPos.xyz, pos.xyz, float3(World._41, World._42, World._43));
 
-    StructuredBuffer<CascadeData> cascadeData = ResourceDescriptorHeap[CascadeBufferSRVIdx];
-    output.Position = mul(worldPos, cascadeData[cascadeIdx].VP);
+    output.Position = ShadowClipPosition(worldPos, view, local, CascadeBufferSRVIdx, output.RTIndex, output.ClipDistance);
     output.TexCoord = uvs[vertexID];
     output.TexCoord.y = 1 - output.TexCoord.y;
     output.MaterialID = desc.MaterialId;
     return output;
+}
+
+ShadowVSOutput VS_Shadow(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_InstanceID)
+{
+    return ShadowVertex(primitiveVertexID, instanceID, false);
+}
+
+ShadowVSOutput VS_LocalShadow(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_InstanceID)
+{
+    return ShadowVertex(primitiveVertexID, instanceID, true);
 }
 
 void PS_Shadow(ShadowVSOutput input)
@@ -278,6 +286,12 @@ technique11 GBuffer
     pass Shadow
     {
         SetVertexShader(CompileShader(vs_6_6, VS_Shadow()));
+        SetPixelShader(CompileShader(ps_6_6, PS_Shadow()));
+    }
+
+    pass LocalShadow
+    {
+        SetVertexShader(CompileShader(vs_6_6, VS_LocalShadow()));
         SetPixelShader(CompileShader(ps_6_6, PS_Shadow()));
     }
 }

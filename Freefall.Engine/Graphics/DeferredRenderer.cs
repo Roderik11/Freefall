@@ -76,14 +76,21 @@ namespace Freefall.Graphics
         public ComputeShader DirectionalLightCS { get; private set; } = null!;
         private int _kDirectionalLight;
         
-        // Point light compute shader (Hi-Z pre-cull + tiled culling + PBR)
+        // Point lights: the GPU culls the light registry (PointLightBuffer) into this renderer's visible list after
+        // the opaque pass; the shadow selection and the tiled lighting (light_point_cs.hlsl) read it
         private ComputeShader _pointLightCS = null!;
-        private int _kCullLights;
         private int _kPointLight;
-        private GraphicsBuffer[]? _pointLightBuffers; // per-frame upload StructuredBuffer<PointLightData>
-        private GraphicsBuffer? _visibleLightIndices;  // UAV: compacted visible light indices
-        private GraphicsBuffer? _visibleLightCount;    // UAV: atomic counter (RWByteAddressBuffer)
-        private const int MaxPointLights = 256;
+        private ComputeShader _lightCullCS = null!;   // point_light_cull.hlsl
+        private int _kCountLights, _kCullLights, _kOccludeLights;
+        private GraphicsBuffer? _visibleLights;       // UAV: RWStructuredBuffer<PointLightData>[MaxVisible]
+        private GraphicsBuffer? _visibleLightCount;   // UAV: [0] lights in the list, [1] lights in view (RWByteAddressBuffer)
+        private GraphicsBuffer? _lightImportance;     // UAV: lights in view per importance band (which make the list)
+        private GraphicsBuffer[]? _lightFrameParams;  // per-frame upload: PointLightFrame (camera, budget, fade)
+        private uint _lightFrame;                     // this renderer's frames, for the shadow selection's state
+        private bool _pointLightsCulled;
+
+        /// <summary>Point light shadows: the local shadow atlas and the lights picked for it each frame.</summary>
+        public LocalShadows? LocalShadows { get; private set; }
         
         private bool _isFirstFrame = true;
         private bool _compositeSnapshotFirstFrame = true;
@@ -153,23 +160,26 @@ namespace Freefall.Graphics
             DirectionalLightCS = new ComputeShader("light_directional_cs.hlsl");
             _kDirectionalLight = DirectionalLightCS.FindKernel("CSDirectionalLight");
 
-            // Compile point light compute shader
+            // Point lights: GPU cull of the registry, then tiled lighting on the visible list
             _pointLightCS = new ComputeShader("light_point_cs.hlsl");
-            _kCullLights = _pointLightCS.FindKernel("CSCullLights");
             _kPointLight = _pointLightCS.FindKernel("CSPointLight");
-            
-            // Per-frame upload buffers for point light data
-            _pointLightBuffers = new GraphicsBuffer[FrameCount];
+            _lightCullCS = new ComputeShader("point_light_cull.hlsl");
+            _kCountLights = _lightCullCS.FindKernel("CSCountLights");
+            _kCullLights = _lightCullCS.FindKernel("CSCullLights");
+            _kOccludeLights = _lightCullCS.FindKernel("CSOccludeLights");
+            _visibleLights = GraphicsBuffer.CreateStructured<PointLightBuffer.VisibleLight>(PointLightBuffer.MaxVisible, uav: true);
+            _visibleLightCount = GraphicsBuffer.CreateRaw(2, uav: true, clearable: true);
+            _lightImportance = GraphicsBuffer.CreateStructured<uint>(64, uav: true);
+            _lightFrameParams = new GraphicsBuffer[FrameCount];
             for (int i = 0; i < FrameCount; i++)
-                _pointLightBuffers[i] = GraphicsBuffer.CreateUpload<Components.PointLight.PointLightData>(MaxPointLights, mapped: true);
-            
-            // Phase 0 output buffers for light culling
-            _visibleLightIndices = GraphicsBuffer.CreateStructured<uint>(MaxPointLights, uav: true);
-            _visibleLightCount = GraphicsBuffer.CreateRaw(1, uav: true, clearable: true);
+                _lightFrameParams[i] = GraphicsBuffer.CreateUpload<PointLightBuffer.FrameParams>(1, mapped: true);
 
             // Shadow Map Array (Cascades)
             ShadowTextureArray = new DepthTextureArray2D(2048, 2048, 4);
-            
+
+            // Point light shadows (own atlas, independent of the cascades)
+            LocalShadows = new LocalShadows();
+
             // Hi-Z pyramid (matched to depth buffer size)
             HiZPyramid = new HiZPyramid();
             HiZPyramid.Create(Engine.Device, width, height);
@@ -572,6 +582,37 @@ namespace Freefall.Graphics
                  PixMarker.End(list); // Shadows
              }
 
+             // 2b. Point lights: the GPU culls the light registry into this frame's visible list, then picks the
+             //     shadowed ones and renders their faces into their own atlas (independent of the sun's cascades).
+             //     No point light shadows in daylight.
+             _pointLightsCulled = CullPointLights(camera, list);
+             if (LocalShadows != null)
+             {
+                 if (_pointLightsCulled && Engine.Settings.EnableShadows && Engine.Settings.MaxShadowedPointLights > 0)
+                 {
+                     var frameParams = _lightFrameParams![Engine.FrameIndex % FrameCount];
+
+                     // The selection reads the linear depth (light centres hidden behind walls) and the sun's cascades
+                     // (lights the sun drowns get no shadow)
+                     Transition(list, DepthGBuffer.Native, ResourceStates.RenderTarget, ResourceStates.NonPixelShaderResource);
+                     LocalShadows.Select(list, camera, frameParams.SrvIndex, _visibleLights!.UavIndex,
+                         _visibleLightCount!, DepthGBuffer.BindlessIndex,
+                         ShadowMapIndex, DirectionalLight.CurrentCascadeSrvIndex, DirectionalLight.CascadeCount);
+                     Transition(list, DepthGBuffer.Native, ResourceStates.NonPixelShaderResource, ResourceStates.RenderTarget);
+
+                     if (LocalShadows.Render(list, frameParams.Native.GPUVirtualAddress))
+                     {
+                         list.OMSetRenderTargets(_cachedGBufferRtvHandles, Depth.DsvHandle);
+                         list.RSSetViewport(vp);
+                         list.RSSetScissorRect(scissor);
+                     }
+                 }
+                 else
+                 {
+                     LocalShadows.Skip();
+                 }
+             }
+
              // 3. Sky pass
              using (_skyMarker.Auto())
              {
@@ -734,58 +775,145 @@ namespace Freefall.Graphics
              PixMarker.End(list); // Lighting
         }
 
+        private const float PointShadowFadeSeconds = 0.3f;
+
+        // The GPU culls the light registry into this frame's visible list (point_light_cull.hlsl): position from the
+        // light's transform, flicker, camera frustum. False when there are no lights.
+        private bool CullPointLights(Camera camera, ID3D12GraphicsCommandList list)
+        {
+             var registry = PointLightBuffer.Instance;
+             if (registry == null || registry.SlotCount == 0)
+                 return false;
+             registry.Upload();
+
+             int frameIdx = Engine.FrameIndex % FrameCount;
+             _lightFrame++;
+             WriteLightFrameParams(camera, frameIdx);
+
+             PixMarker.Begin(list, "Point light cull");
+             _lightCullCS.SetPushConstant("Records", registry.SrvIndex);
+             _lightCullCS.SetPushConstant("RecordCount", (uint)registry.SlotCount);
+             _lightCullCS.SetPushConstant("Transforms", TransformBuffer.Instance.SrvIndex);
+             _lightCullCS.SetPushConstant("FrameParams", _lightFrameParams![frameIdx].SrvIndex);
+             _lightCullCS.SetPushConstant("VisibleUAV", _visibleLights!.UavIndex);
+             _lightCullCS.SetPushConstant("VisibleCountUAV", _visibleLightCount!.UavIndex);
+             _lightCullCS.SetPushConstant("HistogramUAV", _lightImportance!.UavIndex);
+             _lightCullCS.SetPushConstant("HiZTex", 0u);
+
+             list.SetComputeRootSignature(Engine.Device.GlobalRootSignature);
+             list.SetDescriptorHeaps(1, new[] { Engine.Device.SrvHeap });
+             _visibleLightCount.ClearUAV(list, new Vortice.Mathematics.Int4(0, 0, 0, 0));
+             _lightImportance.ClearUAV(list, new Vortice.Mathematics.Int4(0, 0, 0, 0));
+             list.Barriers(
+                 new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(_visibleLightCount.Native)),
+                 new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(_lightImportance.Native)));
+
+             // Count by importance first: past PointLightBuffer.MaxVisible the least important lights are left out
+             uint groups = (uint)((registry.SlotCount + 63) / 64);
+             _lightCullCS.Dispatch(_kCountLights, list, groups);
+             list.Barriers(
+                 new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(_visibleLightCount.Native)),
+                 new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(_lightImportance.Native)));
+             _lightCullCS.Dispatch(_kCullLights, list, groups);
+
+             list.Barriers(
+                 new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(_visibleLights.Native)),
+                 new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(_visibleLightCount.Native)));
+             PixMarker.End(list);
+             return true;
+        }
+
+        // Camera and frame for the light cull and the shadow selection, per renderer (PointLightFrame)
+        private unsafe void WriteLightFrameParams(Camera camera, int frameIdx)
+        {
+             // As FillLightBuffer builds it: the view without translation
+             var cvp = Matrix4x4.CreateLookAtLeftHanded(Vector3.Zero, camera.Forward, camera.Up) * camera.Projection;
+             var c0 = new Vector4(cvp.M11, cvp.M21, cvp.M31, cvp.M41);
+             var c1 = new Vector4(cvp.M12, cvp.M22, cvp.M32, cvp.M42);
+             var c3 = new Vector4(cvp.M14, cvp.M24, cvp.M34, cvp.M44);
+
+             var p = _lightFrameParams![frameIdx].WritePtr<PointLightBuffer.FrameParams>();
+             *p = new PointLightBuffer.FrameParams
+             {
+                 CameraRelativeVP = cvp,
+                 Plane0 = NormalisePlane(c3 + c0),     // left
+                 Plane1 = NormalisePlane(c3 - c0),     // right
+                 Plane2 = NormalisePlane(c3 + c1),     // bottom
+                 Plane3 = NormalisePlane(c3 - c1),     // top
+                 Plane4 = new Vector4(Vector3.Normalize(camera.Forward), -camera.NearPlane),
+                 CameraPosition = camera.Position,
+                 Time = Time.TotalTime,
+                 PixelsPerMetre = 0.5f * Albedo.Native.Description.Height * camera.Projection.M22,
+                 FadeStep = Math.Clamp(Time.Delta, 0f, 0.1f) / PointShadowFadeSeconds,
+                 SunLight = SunLight(),
+                 Ambient = SkyAmbient(),
+                 ShadowBudget = (uint)Math.Clamp(Engine.Settings.MaxShadowedPointLights, 0, LocalShadows.MaxLights),
+                 Frame = _lightFrame,
+             };
+        }
+
+        private static Vector4 NormalisePlane(Vector4 plane) =>
+             plane / new Vector3(plane.X, plane.Y, plane.Z).Length();
+
+        // What the sun adds to a lit surface, as a multiple of its albedo: light_directional_cs's π × intensity × colour
+        // through Lambert's 1/π, dimmed by the clouds' average shade (coverage × cloud shadow strength), so overcast
+        // days count as dark. 0 without an enabled directional light.
+        private static float SunLight()
+        {
+             foreach (var sun in Base.ComponentCache<DirectionalLight>.All)
+             {
+                 if (!sun.Enabled) continue;
+                 float clouds = 1f - SkyboxRenderer.CurrentCloudShadowStrength * SkyboxRenderer.CurrentCloudCoverage;
+                 return sun.Intensity * Luminance(sun.Color.R, sun.Color.G, sun.Color.B) * Math.Clamp(clouds, 0f, 1f);
+             }
+             return 0f;
+        }
+
+        // What the sky's ambient adds to an up-facing surface, as a multiple of its albedo: composition_cs's
+        // GetSkyColor(up) × 0.45 × AmbientScale, with the zenith colour as sky_common.fx's day sky has it
+        // (tint × ~0.65 × density) and the night sky colour at night. 0 without a sky.
+        private static float SkyAmbient()
+        {
+             if (Base.ComponentCache<SkyboxRenderer>.All.Count == 0)
+                 return 0f;
+             var tint = SkyboxRenderer.CurrentSkyTintColor;
+             var night = SkyboxRenderer.CurrentNightSkyColor;
+             float day = Luminance(tint.X, tint.Y, tint.Z) * 0.65f * SkyboxRenderer.CurrentAtmosphereDensity;
+             float sky = (SkyboxRenderer.CurrentDayFactor + SkyboxRenderer.CurrentSunsetFactor) * day
+                       + SkyboxRenderer.CurrentNightFactor * Luminance(night.X, night.Y, night.Z);
+             return sky * 0.45f * SkyboxRenderer.AmbientScale;
+        }
+
+        private static float Luminance(float r, float g, float b) => 0.2126f * r + 0.7152f * g + 0.0722f * b;
+
         private unsafe void DispatchPointLights(Camera camera, ID3D12GraphicsCommandList list)
         {
-             var lights = Base.ComponentCache<Components.PointLight>.All;
-             if (lights.Count == 0) return;
-
-             var camPos = camera.Position;
-             int frameIdx = Engine.FrameIndex % FrameCount;
-             int count = Math.Min(lights.Count, MaxPointLights);
-
-             // Upload light data to per-frame structured buffer
-             var dst = _pointLightBuffers![frameIdx].WritePtr<Components.PointLight.PointLightData>();
-             float time = Time.TotalTime;
-             for (int i = 0; i < count; i++)
+             if (!_pointLightsCulled)
              {
-                 var pl = lights[i];
-                 float intensity = pl.Intensity;
-                 var position = pl.Entity.Transform.WorldPosition;
-                 if (pl.Flicker > 0f)
-                     pl.ApplyFlicker(time, ref intensity, ref position);
-
-                 dst[i] = new Components.PointLight.PointLightData
-                 {
-                     Color = new Vector3(pl.Color.R, pl.Color.G, pl.Color.B),
-                     Intensity = intensity,
-                     Position = position - camPos,
-                     Range = pl.Range
-                 };
+                 LocalShadows?.EndFrame(list);
+                 return;
              }
 
-             // Push constants shared by both kernels
              var desc = LightBuffer.Native.Description;
              _pointLightCS.SetPushConstant("NormalTex", Normals.BindlessIndex);
              _pointLightCS.SetPushConstant("DepthTex", Depth.BindlessIndex);
              _pointLightCS.SetPushConstant("AlbedoTex", Albedo.BindlessIndex);
              _pointLightCS.SetPushConstant("DataTex", Data.BindlessIndex);
              _pointLightCS.SetPushConstant("OutputUAV", LightBuffer.UavIndex);
-             _pointLightCS.SetPushConstant("LightData", _pointLightBuffers[frameIdx].SrvIndex);
-             _pointLightCS.SetPushConstant("LightCount", (uint)count);
              _pointLightCS.SetPushConstant("ScreenWidth", (uint)desc.Width);
              _pointLightCS.SetPushConstant("ScreenHeight", (uint)desc.Height);
-
-             // Hi-Z + visible light buffer push constants
-             uint hiZSrv = (HiZPyramid != null && HiZPyramid.Ready && !Engine.Settings.DisableHiZ)
-                 ? HiZPyramid.FullSRV : 0u;
-             _pointLightCS.SetPushConstant("HiZTex", hiZSrv);
-             _pointLightCS.SetPushConstant("VisibleLightUAV", _visibleLightIndices!.UavIndex);
+             _pointLightCS.SetPushConstant("VisibleLightUAV", _visibleLights!.UavIndex);
              _pointLightCS.SetPushConstant("VisibleLightCountUAV", _visibleLightCount!.UavIndex);
+
+             // Point light shadows (atlas 0 = none rendered this frame: the shader skips them)
+             _pointLightCS.SetPushConstant("LocalShadowAtlas", LocalShadows?.AtlasIndex ?? 0u);
+             _pointLightCS.SetPushConstant("LocalShadowViews", LocalShadows?.ViewBufferSrv ?? 0u);
+             _pointLightCS.SetPushConstant("LocalShadowLights", LocalShadows?.LightBufferSrv ?? 0u);
 
              // Bind root signature, descriptor heap, and SceneConstants cbuffer (b0)
              list.SetComputeRootSignature(Engine.Device.GlobalRootSignature);
              list.SetDescriptorHeaps(1, new[] { Engine.Device.SrvHeap });
-             
+
              // Bind SceneConstants (b0) for CameraInverse + CameraRelativeVP
              foreach (var cb in matDirectionalLight.ConstantBuffers)
              {
@@ -797,23 +925,22 @@ namespace Freefall.Graphics
                  }
              }
 
-             // Phase 0: Cull lights (frustum + Hi-Z)
-             _visibleLightCount!.ClearUAV(list, new Vortice.Mathematics.Int4(0, 0, 0, 0));
-             list.ResourceBarrier(new ResourceBarrier(
-                 new ResourceUnorderedAccessViewBarrier(_visibleLightCount.Native)));
+             // Lights wholly behind this frame's Hi-Z (built after the cull) are skipped by the tiles
+             uint hiZSrv = (HiZPyramid != null && HiZPyramid.Ready && !Engine.Settings.DisableHiZ)
+                 ? HiZPyramid.FullSRV : 0u;
+             if (hiZSrv != 0)
+             {
+                 _lightCullCS.SetPushConstant("HiZTex", hiZSrv);
+                 _lightCullCS.Dispatch(_kOccludeLights, list, (uint)(PointLightBuffer.MaxVisible / 64));
+                 list.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(_visibleLights.Native)));
+             }
 
-             uint cullGroups = ((uint)count + 63) / 64;
-             _pointLightCS.Dispatch(_kCullLights, list, cullGroups);
-
-             // Barrier: Phase 0 writes must complete before Phase 1 reads
-             list.Barriers(
-                 new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(_visibleLightIndices!.Native)),
-                 new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(_visibleLightCount.Native)));
-
-             // Phase 1+2: Tiled culling + PBR lighting
+             // Tiled culling + PBR lighting
              uint groupsX = ((uint)desc.Width + 7) / 8;
              uint groupsY = ((uint)desc.Height + 7) / 8;
              _pointLightCS.Dispatch(_kPointLight, list, groupsX, groupsY);
+
+             LocalShadows?.EndFrame(list);
         }
 
         private void Compose(Camera camera, ID3D12GraphicsCommandList list)
@@ -1237,6 +1364,7 @@ namespace Freefall.Graphics
             CompositeSnapshot?.Dispose();
 
             ShadowTextureArray?.Dispose();
+            LocalShadows?.Dispose();
             ScreenSpaceShadows?.Dispose();
             Gtao?.Dispose();
             ScreenSpaceDisplacement?.Dispose();
@@ -1250,10 +1378,12 @@ namespace Freefall.Graphics
             _depthReadback?.Dispose();
             _normalReadback?.Dispose();
             _pointLightCS?.Dispose();
-            if (_pointLightBuffers != null)
-                foreach (var b in _pointLightBuffers) b?.Dispose();
-            _visibleLightIndices?.Dispose();
+            _lightCullCS?.Dispose();
+            _visibleLights?.Dispose();
             _visibleLightCount?.Dispose();
+            _lightImportance?.Dispose();
+            if (_lightFrameParams != null)
+                foreach (var b in _lightFrameParams) b?.Dispose();
         }
     }
 }

@@ -116,6 +116,8 @@ namespace Freefall.Editor.Commands
                 particleEmitters = Freefall.Base.Systems.Get<ParticleSystem>()?.EmitterCount ?? 0,
                 particleSlots = Freefall.Base.Systems.Get<ParticleSystem>()?.AllocatedSlots ?? 0,
                 particlePoolSlots = Freefall.Base.Systems.Get<ParticleSystem>()?.PoolSlots ?? 0,
+                // Point light shadows, per renderer: the lights picked last frame, their tile size, faces and fade
+                pointShadows = Freefall.Graphics.LocalShadows.DescribeAll(),
                 // System tree in update order, one "Name  ms" line per system (indent = nesting)
                 systems = Freefall.Base.Systems.Describe().Split('\n', StringSplitOptions.RemoveEmptyEntries)
             });

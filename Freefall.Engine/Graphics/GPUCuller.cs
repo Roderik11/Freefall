@@ -33,6 +33,7 @@ namespace Freefall.Graphics
         private int _visibilityShadowKernel, _visibilityShadow4Kernel;
         private int _expandCascadesKernel, _patchExpandedKernel, _compactCommandsKernel;
         private int _computeDepthKeysKernel, _bitonicSortPairsKernel, _writeSortedIndicesKernel;
+        private int _visibilityLocalShadowsKernel, _histogramLocalShadowsKernel, _scatterLocalShadowsKernel;
         
         // Cached kernel indices for depth_pyramid.hlsl
         private int _spdKernel, _perMipKernel, _shadowSpdKernel, _shadowPerMipKernel;
@@ -107,6 +108,10 @@ namespace Freefall.Graphics
         public ID3D12PipelineState? ComputeDepthKeysPSO => _cullShader?.GetPSO(_computeDepthKeysKernel);
         public ID3D12PipelineState? BitonicSortPairsPSO => _cullShader?.GetPSO(_bitonicSortPairsKernel);
         public ID3D12PipelineState? WriteSortedIndicesPSO => _cullShader?.GetPSO(_writeSortedIndicesKernel);
+        // Point light shadows (InstanceBatch.CullLocalShadowAll)
+        public ID3D12PipelineState? VisibilityLocalShadowsPSO => _cullShader?.GetPSO(_visibilityLocalShadowsKernel);
+        public ID3D12PipelineState? HistogramLocalShadowsPSO => _cullShader?.GetPSO(_histogramLocalShadowsKernel);
+        public ID3D12PipelineState? ScatterLocalShadowsPSO => _cullShader?.GetPSO(_scatterLocalShadowsKernel);
         public ID3D12PipelineState? DownsamplePSO => _pyramidShader?.GetPSO(_spdKernel);
         
         /// <summary>True after SDSM buffers are created and ready for dispatch.</summary>
@@ -266,6 +271,9 @@ namespace Freefall.Graphics
                 _computeDepthKeysKernel = _cullShader.FindKernel("CSComputeDepthKeys");
                 _bitonicSortPairsKernel = _cullShader.FindKernel("CSBitonicSortPairs");
                 _writeSortedIndicesKernel = _cullShader.FindKernel("CSWriteSortedIndices");
+                _visibilityLocalShadowsKernel = _cullShader.FindKernel("CSVisibilityLocalShadows");
+                _histogramLocalShadowsKernel = _cullShader.FindKernel("CSHistogramLocalShadows");
+                _scatterLocalShadowsKernel = _cullShader.FindKernel("CSScatterLocalShadows");
                 
                 // Hi-Z depth pyramid downsampler
                 _pyramidShader = new ComputeShader("depth_pyramid.hlsl");

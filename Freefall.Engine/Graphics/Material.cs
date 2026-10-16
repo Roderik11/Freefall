@@ -680,7 +680,7 @@ namespace Freefall.Graphics
                     };
                 }
 
-                if (passType == RenderPass.Shadow)
+                if (passType == RenderPass.Shadow || passType == RenderPass.LocalShadow)
                 {
                     passRtvFormats = Array.Empty<Format>();
                     passDepthFormat = Format.D32_Float;

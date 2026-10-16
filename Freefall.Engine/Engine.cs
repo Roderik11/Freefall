@@ -91,6 +91,7 @@ namespace Freefall
             
             // Initialize persistent transform buffer for GPU-driven rendering
             TransformBuffer.Initialize(Device);
+            PointLightBuffer.Initialize(Device); // GPU light registry: slots follow ComponentCache<PointLight>
             
             // Initialize streaming manager before assets (AssetManager creates default textures that need it)
             var streaming = new StreamingManager(Device);
@@ -125,6 +126,7 @@ namespace Freefall
             LoadPixGpuCapturer();
             Device = new GraphicsDevice();
             TransformBuffer.Initialize(Device);
+            PointLightBuffer.Initialize(Device); // GPU light registry: slots follow ComponentCache<PointLight>
 
             var streaming = new StreamingManager(Device);
             Assets = new AssetManager(Device);
@@ -486,6 +488,15 @@ namespace Freefall
 
          [ValueRange(50f, 1000f)]
          public float MaxShadowDistance { get; set; } = 300f;               // SDSM max depth for split analysis
+
+         /// <summary>
+         /// Point lights that get a shadow each frame, at night: every point light in view whose sphere is at least
+         /// 32 px in radius on screen competes, ranked on the GPU by brightness times the screen share of its sphere,
+         /// lower when its centre is hidden (LocalShadows). Fewer when the atlas is full. 0 = none.
+         /// </summary>
+         [Category("Point Light Shadows")]
+         [ValueRange(0, 32)]
+         public int MaxShadowedPointLights { get; set; } = 12;
 
          [Category("Screen-Space Shadows")]                                 // Bend Studio technique
          public bool EnableScreenSpaceShadows { get; set; } = true;

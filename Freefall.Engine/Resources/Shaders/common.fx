@@ -209,6 +209,50 @@ struct CascadeData
     float4 SplitDistances;      // X=near, Y=far (16 bytes)
 };
 
+#include "local_shadows.hlsli"
+
+// Shadow vertex shaders serve two passes: Shadow (sun cascades, one slice each) and LocalShadow (point light
+// cube faces, a tile each in the local shadow atlas). These decode the pass's expansion entry and project.
+void DecodeShadowEntry(uint entry, bool local, out uint view, out uint instance)
+{
+    if (local)
+    {
+        view = entry >> LOCAL_SHADOW_VIEW_SHIFT;
+        instance = entry & LOCAL_SHADOW_INSTANCE_MASK;
+    }
+    else
+    {
+        view = entry >> 30;
+        instance = entry & 0x3FFFFFFFu;
+    }
+}
+
+// Absolute world position -> the view's clip position and array slice. A cube face is squeezed into its
+// atlas tile; the clip distances (taken before the squeeze) cut what lies outside the face, which would
+// otherwise spill into the neighbouring tiles.
+float4 ShadowClipPosition(float4 worldPos, uint view, bool local, uint viewBufferIdx, out uint slice, out float4 clipDistance)
+{
+    if (!local)
+    {
+        StructuredBuffer<CascadeData> cascades = ResourceDescriptorHeap[viewBufferIdx];
+        slice = view;
+        clipDistance = 1;
+        return mul(worldPos, cascades[view].VP);
+    }
+
+    StructuredBuffer<LocalShadowView> views = ResourceDescriptorHeap[viewBufferIdx];
+    LocalShadowView v = views[view];
+    float4 clip = mul(worldPos, v.VP);
+    clipDistance = float4(clip.w + clip.x, clip.w - clip.x, clip.w + clip.y, clip.w - clip.y);
+
+    // Tile rect (UV) -> NDC scale and bias. UV y runs down and NDC y up, so y's bias is mirrored.
+    float2 size = v.Tile.xy;
+    float2 bias = float2(size.x + 2.0 * v.Tile.z - 1.0, 1.0 - size.y - 2.0 * v.Tile.w);
+    clip.xy = clip.xy * size + bias * clip.w;
+    slice = v.Page;
+    return clip;
+}
+
 // Per-instance descriptor (matches C# InstanceDescriptor: 20 bytes)
 // Single source of truth — do NOT redeclare in individual shaders.
 struct InstanceDescriptor

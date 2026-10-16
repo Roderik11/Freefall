@@ -24,6 +24,11 @@
 #pragma kernel CSExpandCascades
 #pragma kernel CSPatchExpandedCounts
 #pragma kernel CSCompactCommands
+#pragma kernel CSVisibilityLocalShadows
+#pragma kernel CSHistogramLocalShadows
+#pragma kernel CSScatterLocalShadows
+
+#include "local_shadows.hlsli"
 
 // Frustum planes + Hi-Z occlusion parameters (root slot 1 -> register b0)
 cbuffer FrustumPlanes : register(b0)
@@ -1231,6 +1236,172 @@ void CSCompactCommands(uint3 dispatchThreadId : SV_DispatchThreadID)
     
     RWStructuredBuffer<IndirectDrawCommand> dest = ResourceDescriptorHeap[VisibleIndicesSRVIdx];
     dest[slot] = cmd;
+}
+
+//-----------------------------------------------------------------------------
+// Point light shadows (LocalShadows.cs, InstanceBatch.CullLocalShadowAll)
+//
+// The cascade pipeline with three differences:
+//  - views are point light cube faces, grouped by light: up to 128, so the per-instance view mask is
+//    a uint4 (LocalShadowMaskIdx, a buffer of the local pass's own);
+//  - the histogram counts an instance once per view it is in, so the prefix sum sizes the expansion
+//    exactly (the cascades reserve 4 entries per instance, which a cube face set can exceed);
+//  - the scatter writes the expansion entries itself; CSMain then makes commands whose base and count
+//    are already in expansion entries (no patch pass).
+// Order: CSVisibilityLocalShadows → CSHistogramLocalShadows → CSHistogramPrefixSum →
+//        CSScatterLocalShadows → CSMain (fixed index) → CSCompactCommands.
+//
+// Push constants beyond the cascade path's, on slots that path leaves unused:
+//-----------------------------------------------------------------------------
+#define LocalShadowViewsIdx          CascadeBufferSRVIdx   // 31: SRV LocalShadowView[]
+#define LocalShadowLightsIdx         SubbatchStartIdx      // 16: SRV LocalShadowLight[]
+#define LocalShadowCountsIdx         SubbatchCountIdx      // 17: UAV the selection's counts, [0] = lights (local_shadow_select.hlsl)
+#define LocalShadowMaskIdx           CascadeMaskUAVIdx     // 28: UAV uint4 view mask per instance
+#define LocalShadowExpansionCapacity IndirectionUAVIdx     // 19: entries the expansion buffer holds
+
+uint ViewCount(uint4 mask)
+{
+    return countbits(mask.x) + countbits(mask.y) + countbits(mask.z) + countbits(mask.w);
+}
+
+bool InLocalShadowView(LocalShadowView v, float3 center, float radius)
+{
+    [unroll]
+    for (uint i = 0; i < 6; i++)
+    {
+        if (dot(v.Planes[i].xyz, center) + v.Planes[i].w > radius)
+            return false;
+    }
+    return true;
+}
+
+[numthreads(256, 1, 1)]
+void CSVisibilityLocalShadows(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    uint instanceIdx = dispatchThreadId.x;
+    if (instanceIdx >= TotalInstances)
+        return;
+
+    RWStructuredBuffer<uint> combinedVis = ResourceDescriptorHeap[CombinedShadowVisIdx];
+    RWStructuredBuffer<uint4> masks = ResourceDescriptorHeap[LocalShadowMaskIdx];
+
+    StructuredBuffer<InstanceDescriptor> descriptors = ResourceDescriptorHeap[DescriptorBufferIdx];
+    StructuredBuffer<row_major float4x4> transforms = ResourceDescriptorHeap[GlobalTransformsIdx];
+    StructuredBuffer<MeshPartEntry> meshRegistry = ResourceDescriptorHeap[MeshRegistryIdx];
+    StructuredBuffer<uint> subbatchIds = ResourceDescriptorHeap[SubbatchIdsIdx];
+
+    row_major float4x4 world = transforms[descriptors[instanceIdx].TransformSlot];
+    float maxScaleSq = max(dot(world[0].xyz, world[0].xyz),
+                       max(dot(world[1].xyz, world[1].xyz),
+                           dot(world[2].xyz, world[2].xyz)));
+
+    // Same LOD as the main view
+    uint meshPartId = ResolveLodPart(subbatchIds[instanceIdx], world, maxScaleSq);
+    if (meshPartId == INVALID_PART)
+    {
+        combinedVis[instanceIdx] = 0;
+        masks[instanceIdx] = 0;
+        return;
+    }
+
+    float4 localSphere = meshRegistry[meshPartId].LocalBounds;
+    float3 worldCenter = mul(float4(localSphere.xyz, 1.0), world).xyz;
+    float worldRadius = localSphere.w * sqrt(maxScaleSq);
+    if (descriptors[instanceIdx].BoneBufferIdx != 0)
+        worldRadius *= 1.5; // skinned: the bind-pose bounds do not hold the animated pose
+
+    StructuredBuffer<LocalShadowLight> lights = ResourceDescriptorHeap[LocalShadowLightsIdx];
+    StructuredBuffer<LocalShadowView> views = ResourceDescriptorHeap[LocalShadowViewsIdx];
+
+    RWStructuredBuffer<uint> shadowCounts = ResourceDescriptorHeap[LocalShadowCountsIdx];
+    uint lightCount = shadowCounts[0];
+
+    uint4 mask = 0;
+    for (uint l = 0; l < lightCount; l++)
+    {
+        LocalShadowLight light = lights[l];
+
+        // Out of the light's reach: none of its faces
+        float3 d = worldCenter - light.Position;
+        float reach = light.Range + worldRadius;
+        if (dot(d, d) > reach * reach)
+            continue;
+
+        for (uint f = 0; f < 6; f++)
+        {
+            uint v = light.FaceView[f];
+            if (v >= LOCAL_SHADOW_MAX_VIEWS || !InLocalShadowView(views[v], worldCenter, worldRadius))
+                continue;
+            uint bit = 1u << (v & 31u);
+            uint word = v >> 5;
+            if (word == 0)      mask.x |= bit;
+            else if (word == 1) mask.y |= bit;
+            else if (word == 2) mask.z |= bit;
+            else                mask.w |= bit;
+        }
+    }
+
+    // 0 = culled, otherwise the LOD-resolved MeshPartId + 1 (as the other visibility kernels)
+    combinedVis[instanceIdx] = any(mask != 0) ? (meshPartId + 1u) : 0u;
+    masks[instanceIdx] = mask;
+}
+
+// histogram[part] += the number of views each visible instance is in
+[numthreads(64, 1, 1)]
+void CSHistogramLocalShadows(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    uint instanceIdx = dispatchThreadId.x;
+    if (instanceIdx >= TotalInstances)
+        return;
+
+    RWStructuredBuffer<uint> visibilityFlags = ResourceDescriptorHeap[VisibilityFlagsIdx];
+    uint flag = visibilityFlags[instanceIdx];
+    if (flag == 0)
+        return;
+
+    RWStructuredBuffer<uint4> masks = ResourceDescriptorHeap[LocalShadowMaskIdx];
+    RWStructuredBuffer<uint> histogram = ResourceDescriptorHeap[HistogramIdx];
+    InterlockedAdd(histogram[flag - 1], ViewCount(masks[instanceIdx]));
+}
+
+// After CSHistogramPrefixSum: counters[part] = the part's first expansion entry. Appends one entry per view
+// (view << 25 | instance) and leaves counters[part] = start + count, which is what CSMain expects.
+[numthreads(256, 1, 1)]
+void CSScatterLocalShadows(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    uint instanceIdx = dispatchThreadId.x;
+    if (instanceIdx >= TotalInstances)
+        return;
+
+    RWStructuredBuffer<uint> visibilityFlags = ResourceDescriptorHeap[VisibilityFlagsIdx];
+    uint flag = visibilityFlags[instanceIdx];
+    if (flag == 0)
+        return;
+
+    RWStructuredBuffer<uint4> masks = ResourceDescriptorHeap[LocalShadowMaskIdx];
+    uint4 mask = masks[instanceIdx];
+
+    RWStructuredBuffer<uint> counters = ResourceDescriptorHeap[CounterBufferIdx];
+    uint pos;
+    InterlockedAdd(counters[flag - 1], ViewCount(mask), pos);
+
+    // Past the capacity an entry is dropped. The draw still counts it and reads 0 there (instance 0 in
+    // view 0): it needs the batch's instances in more than 4 faces each on average.
+    RWStructuredBuffer<uint> expansion = ResourceDescriptorHeap[ExpansionUAVIdx];
+    uint instanceBits = instanceIdx & LOCAL_SHADOW_INSTANCE_MASK;
+    [unroll]
+    for (uint word = 0; word < 4; word++)
+    {
+        uint bits = mask[word];
+        while (bits != 0)
+        {
+            uint v = firstbitlow(bits) + word * 32;
+            bits &= bits - 1;
+            if (pos < LocalShadowExpansionCapacity)
+                expansion[pos] = (v << LOCAL_SHADOW_VIEW_SHIFT) | instanceBits;
+            pos++;
+        }
+    }
 }
 
 //-----------------------------------------------------------------------------

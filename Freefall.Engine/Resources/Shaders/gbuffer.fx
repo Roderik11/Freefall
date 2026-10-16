@@ -144,12 +144,14 @@ struct ShadowVSOutput
     float2 TexCoord : TEXCOORD0;
     nointerpolation uint MaterialID : TEXCOORD1;
     nointerpolation uint RTIndex : SV_RenderTargetArrayIndex;
+    float4 ClipDistance : SV_ClipDistance0;
 };
 
-// Shadow vertex shader - single-pass multi-cascade via expansion buffer
-// Each instanceID maps to exactly one (instance, cascade) pair from the expansion buffer.
-// No cascade mask check needed — expansion only contains visible pairs.
-ShadowVSOutput VS_Shadow(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_InstanceID)
+// Shadow vertex shader - single-pass multi-view via expansion buffer
+// Each instanceID maps to exactly one (instance, view) pair from the expansion buffer: a sun cascade
+// (Shadow pass) or a point light's cube face (LocalShadow pass, local = true).
+// No view mask check needed — expansion only contains visible pairs.
+ShadowVSOutput ShadowVertex(uint primitiveVertexID, uint instanceID, bool local)
 {
     ShadowVSOutput output;
     output.Position = float4(0, 0, 0, 1);
@@ -157,12 +159,9 @@ ShadowVSOutput VS_Shadow(uint primitiveVertexID : SV_VertexID, uint instanceID :
     output.MaterialID = 0;
     output.RTIndex = 0;
 
-    // Read expansion entry: bits 30-31 = cascadeIdx, bits 0-29 = instance index
     StructuredBuffer<uint> expansion = ResourceDescriptorHeap[ExpansionBufferIdx];
-    uint entry = expansion[InstanceBaseOffset + instanceID];
-    uint cascadeIdx = entry >> 30;
-    uint idx = entry & 0x3FFFFFFFu;
-    output.RTIndex = cascadeIdx;
+    uint view, idx;
+    DecodeShadowEntry(expansion[InstanceBaseOffset + instanceID], local, view, idx);
 
     StructuredBuffer<row_major matrix> globalTransforms = ResourceDescriptorHeap[GlobalTransformBufferIdx];
     
@@ -183,13 +182,22 @@ ShadowVSOutput VS_Shadow(uint primitiveVertexID : SV_VertexID, uint instanceID :
     float3 pos = positions[vertexID];
     float4 worldPos = mul(float4(pos, 1.0f), World);
 
-    // Project using cascade-specific VP from shared CascadeData buffer
-    StructuredBuffer<CascadeData> cascades = ResourceDescriptorHeap[CascadeBufferSRVIdx];
-    output.Position = mul(worldPos, cascades[cascadeIdx].VP);
+    // Project with the view's VP (cascades: CascadeData, local: LocalShadowView, both at slot 21)
+    output.Position = ShadowClipPosition(worldPos, view, local, CascadeBufferSRVIdx, output.RTIndex, output.ClipDistance);
     output.TexCoord = uvs[vertexID];
     output.TexCoord.y = 1 - output.TexCoord.y;
     output.MaterialID = desc.MaterialId;
     return output;
+}
+
+ShadowVSOutput VS_Shadow(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_InstanceID)
+{
+    return ShadowVertex(primitiveVertexID, instanceID, false);
+}
+
+ShadowVSOutput VS_LocalShadow(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_InstanceID)
+{
+    return ShadowVertex(primitiveVertexID, instanceID, true);
 }
 
 // Shadow pixel shader - alpha test only, depth written by hardware
@@ -351,6 +359,12 @@ technique11 GBuffer
     pass Shadow
     {
         SetVertexShader(CompileShader(vs_6_6, VS_Shadow()));
+        SetPixelShader(CompileShader(ps_6_6, PS_Shadow()));
+    }
+
+    pass LocalShadow
+    {
+        SetVertexShader(CompileShader(vs_6_6, VS_LocalShadow()));
         SetPixelShader(CompileShader(ps_6_6, PS_Shadow()));
     }
 }

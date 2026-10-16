@@ -679,7 +679,7 @@ namespace Freefall.Graphics
             // Iterate all passes defined in the Effect and enqueue to each
             foreach (var shaderPass in material.GetPasses())
             {
-                if (shaderPass.RenderPass == RenderPass.Shadow || shaderPass.RenderPass == ShaderPass.NamedOnly)
+                if (shaderPass.RenderPass is RenderPass.Shadow or RenderPass.LocalShadow || shaderPass.RenderPass == ShaderPass.NamedOnly)
                     continue;
                 current.passes[(int)shaderPass.RenderPass].Add(drawCall);
             }
@@ -814,7 +814,7 @@ namespace Freefall.Graphics
                         // One record per render pass of the material's effect, as Enqueue does
                         foreach (var shaderPass in op.Call.Material.GetPasses())
                         {
-                            if (shaderPass.RenderPass == RenderPass.Shadow || shaderPass.RenderPass == ShaderPass.NamedOnly)
+                            if (shaderPass.RenderPass is RenderPass.Shadow or RenderPass.LocalShadow || shaderPass.RenderPass == ShaderPass.NamedOnly)
                                 continue;
                             var batch = current.passes[(int)shaderPass.RenderPass].GetOrCreateBatch(op.Call.Key, op.Call.Material);
                             op.Group.Handles.Add(batch.AddPersistent(op.Call));
