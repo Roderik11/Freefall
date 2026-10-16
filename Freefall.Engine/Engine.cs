@@ -510,6 +510,14 @@ namespace Freefall
          [ValueRange(1f, 8f)]
          public float SSSShadowContrast { get; set; } = 2.0f;
 
+         /// <summary>
+         /// Point lights that also get screen-space shadows: the highest ranked of the shadowed ones, each traced
+         /// within its sphere's rectangle on screen. They carry what the atlas cannot resolve, grass blades and
+         /// flowers. 0 = only the sun has them.
+         /// </summary>
+         [ValueRange(0, 4)]
+         public int ScreenShadowedPointLights { get; set; } = 4;
+
          [Category("Ambient Occlusion")]                                    // GTAO (spatial-only, no TAA)
          public bool EnableGTAO { get; set; } = true;
 

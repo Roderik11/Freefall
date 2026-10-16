@@ -346,6 +346,24 @@ namespace Freefall.Graphics
         private static void UavBarrier(ID3D12GraphicsCommandList list) =>
             list.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(null)));
 
+        /// <summary>
+        /// The registry slots of the lights this renderer ranked highest 2 frames ago (the readback the GPU has
+        /// finished): its wanted picks in rank order, not those fading out. Returns how many were written.
+        /// </summary>
+        public unsafe int TopPicks(Span<uint> slots)
+        {
+            if (_selectCount <= FrameCount)
+                return 0;
+            var bytes = _statsReadback[(Engine.FrameIndex + 1) % FrameCount].ReadPtr<byte>();
+            uint count = Math.Min(((uint*)bytes)[CountLights], (uint)MaxLights);
+            var picks = (Pick*)(bytes + StatsPicksOffset);
+            int written = 0;
+            for (int i = 0; i < count && written < slots.Length; i++)
+                if ((picks[i].Packed & (1u << 16)) != 0)
+                    slots[written++] = picks[i].Slot;
+            return written;
+        }
+
         /// <summary>Each renderer's picks of 2 frames ago, for the editor's stats.</summary>
         public static object DescribeAll()
         {

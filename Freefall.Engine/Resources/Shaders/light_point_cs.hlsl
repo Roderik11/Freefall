@@ -24,6 +24,16 @@ cbuffer PushConstants : register(b3)
     uint LocalShadowAtlasIdx;   // Texture2DArray: point light shadow atlas (0 = none rendered this frame)
     uint LocalShadowViewsIdx;   // StructuredBuffer<LocalShadowView>
     uint LocalShadowLightsIdx;  // StructuredBuffer<LocalShadowLight>
+    // Screen-space shadows of the top lights (DeferredRenderer.TracePointLightScreenShadows): the registry slot each
+    // mask was traced for (0xFFFFFFFF = none) and the mask (R8, 1 = lit)
+    uint ScreenShadowSlot0;
+    uint ScreenShadowSlot1;
+    uint ScreenShadowSlot2;
+    uint ScreenShadowSlot3;
+    uint ScreenShadowTex0Idx;
+    uint ScreenShadowTex1Idx;
+    uint ScreenShadowTex2Idx;
+    uint ScreenShadowTex3Idx;
 };
 
 #include "common.fx"
@@ -83,6 +93,23 @@ float PointLightShadow(PointLightData light, float3 worldPos, float3 N, float3 L
             lit += atlas.SampleCmpLevelZero(ShadowSampler, float3(atlasUV + float2(x, y) * t, view.Page), ndc.z);
     }
     return lerp(1.0, lit / 9.0, strength);
+}
+
+// 1 = lit. The screen-space shadow of a light among the top ones, faded with its atlas shadow (picked, dropped,
+// outshone by daylight): what the atlas cannot resolve, grass blades and flowers, at the pixel.
+float PointLightScreenShadow(PointLightData light, uint2 px)
+{
+    if (light.ShadowLight == POINT_LIGHT_NO_SHADOW || LocalShadowAtlasIdx == 0)
+        return 1.0;
+    uint mask = light.Slot == ScreenShadowSlot0 ? ScreenShadowTex0Idx
+              : light.Slot == ScreenShadowSlot1 ? ScreenShadowTex1Idx
+              : light.Slot == ScreenShadowSlot2 ? ScreenShadowTex2Idx
+              : light.Slot == ScreenShadowSlot3 ? ScreenShadowTex3Idx : 0;
+    if (mask == 0)
+        return 1.0;
+    StructuredBuffer<LocalShadowLight> shadowLights = ResourceDescriptorHeap[LocalShadowLightsIdx];
+    Texture2D<float> maskTex = ResourceDescriptorHeap[mask];
+    return lerp(1.0, maskTex.Load(int3(px, 0)), shadowLights[light.ShadowLight].Strength);
 }
 
 // PBR helpers
@@ -281,6 +308,7 @@ void CSPointLight(
 
         // Shadow: leaves lit from behind push off their side facing the light
         float shadow = PointLightShadow(light, worldPos.xyz, rawNdotL < 0.0 ? -normal : normal, L);
+        shadow = min(shadow, PointLightScreenShadow(light, px));
         if (shadow <= 0.0)
             continue;
         attenuation *= shadow;

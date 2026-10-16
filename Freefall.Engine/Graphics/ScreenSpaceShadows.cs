@@ -40,6 +40,63 @@ namespace Freefall.Graphics
             Matrix4x4 viewProjection,
             float nearPlane)
         {
+            // For directional lights: float4(direction, 0) * ViewProjectionMatrix
+            var lightProjection = Vector4.Transform(new Vector4(lightDirection, 0f), viewProjection);
+            Trace(commandList, depthSrvIndex, texWidth, texHeight, lightProjection, nearPlane,
+                new[] { 0, 0 }, new[] { texWidth, texHeight });
+        }
+
+        /// <summary>
+        /// Screen-space shadows toward a point light: Bend's projection with w = 1, traced only within the screen
+        /// rectangle of the light's sphere (no pixel outside it is lit by the light, so the rest of the mask is never
+        /// read). False when the sphere is off screen: nothing was traced.
+        /// </summary>
+        /// <param name="cameraRelativePosition">Light position minus the camera position (the view has no translation).</param>
+        public bool ExecutePoint(
+            ID3D12GraphicsCommandList commandList,
+            uint depthSrvIndex,
+            int texWidth, int texHeight,
+            Vector3 cameraRelativePosition, float range,
+            Matrix4x4 viewProjection,
+            float nearPlane)
+        {
+            if (!SphereBounds(cameraRelativePosition, range, viewProjection, texWidth, texHeight, out var min, out var max))
+                return false;
+            var lightProjection = Vector4.Transform(new Vector4(cameraRelativePosition, 1f), viewProjection);
+            Trace(commandList, depthSrvIndex, texWidth, texHeight, lightProjection, nearPlane, min, max);
+            return true;
+        }
+
+        // Pixel rectangle of a sphere's bounding box; the whole screen when a corner is behind the near plane
+        private static bool SphereBounds(Vector3 centre, float radius, Matrix4x4 viewProjection, int width, int height,
+            out int[] min, out int[] max)
+        {
+            min = new[] { 0, 0 };
+            max = new[] { width, height };
+            float x0 = float.MaxValue, y0 = float.MaxValue, x1 = float.MinValue, y1 = float.MinValue;
+            for (int i = 0; i < 8; i++)
+            {
+                var corner = centre + new Vector3((i & 1) != 0 ? radius : -radius, (i & 2) != 0 ? radius : -radius,
+                                                  (i & 4) != 0 ? radius : -radius);
+                var clip = Vector4.Transform(new Vector4(corner, 1f), viewProjection);
+                if (clip.W <= 1e-3f)
+                    return true;
+                x0 = MathF.Min(x0, clip.X / clip.W); x1 = MathF.Max(x1, clip.X / clip.W);
+                y0 = MathF.Min(y0, clip.Y / clip.W); y1 = MathF.Max(y1, clip.Y / clip.W);
+            }
+            if (x1 < -1f || x0 > 1f || y1 < -1f || y0 > 1f)
+                return false;
+            // NDC y up → pixel y down; a pixel's margin for rounding
+            min[0] = Math.Clamp((int)MathF.Floor((x0 * 0.5f + 0.5f) * width) - 1, 0, width);
+            max[0] = Math.Clamp((int)MathF.Ceiling((x1 * 0.5f + 0.5f) * width) + 1, 0, width);
+            min[1] = Math.Clamp((int)MathF.Floor((0.5f - y1 * 0.5f) * height) - 1, 0, height);
+            max[1] = Math.Clamp((int)MathF.Ceiling((0.5f - y0 * 0.5f) * height) + 1, 0, height);
+            return max[0] > min[0] && max[1] > min[1];
+        }
+
+        private void Trace(ID3D12GraphicsCommandList commandList, uint depthSrvIndex, int texWidth, int texHeight,
+            Vector4 lightProjection, float nearPlane, int[] minBounds, int[] maxBounds)
+        {
             EnsureOutputTexture(texWidth, texHeight);
 
             // Transition output to UAV (Common on first frame after creation)
@@ -47,15 +104,8 @@ namespace Freefall.Graphics
             commandList.ResourceBarrierTransition(_output!.Native, fromState, ResourceStates.UnorderedAccess);
             _firstFrame = false;
 
-            // Compute light screen projection
-            // For directional lights: float4(direction, 0) * ViewProjectionMatrix
-            var lightProjection = Vector4.Transform(
-                new Vector4(lightDirection, 0f), viewProjection);
-
             float[] lp = { lightProjection.X, lightProjection.Y, lightProjection.Z, lightProjection.W };
             int[] viewportSize = { texWidth, texHeight };
-            int[] minBounds = { 0, 0 };
-            int[] maxBounds = { texWidth, texHeight };
 
             var dispatches = BuildDispatchList(lp, viewportSize, minBounds, maxBounds);
 

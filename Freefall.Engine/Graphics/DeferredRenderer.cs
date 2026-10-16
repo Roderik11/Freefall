@@ -52,6 +52,14 @@ namespace Freefall.Graphics
         /// <summary>Screen-space shadow pass (Bend Studio technique).</summary>
         public ScreenSpaceShadows? ScreenSpaceShadows { get; private set; }
 
+        // Screen-space shadows of the highest ranked point lights (TracePointLightScreenShadows): a mask each, and
+        // the registry slot it was traced for this frame (NoScreenShadow = none), for the point light pass
+        private const int MaxScreenShadowedPointLights = 4;
+        private const uint NoScreenShadow = uint.MaxValue;
+        private readonly ScreenSpaceShadows?[] _pointScreenShadows = new ScreenSpaceShadows?[MaxScreenShadowedPointLights];
+        private readonly uint[] _pointScreenShadowSlots = { NoScreenShadow, NoScreenShadow, NoScreenShadow, NoScreenShadow };
+        private readonly uint[] _topPickSlots = new uint[MaxScreenShadowedPointLights];
+
         /// <summary>Ground truth ambient occlusion (spatial-only GTAO).</summary>
         public GTAO? Gtao { get; private set; }
 
@@ -702,7 +710,11 @@ namespace Freefall.Graphics
                  int dh = (int)DepthGBuffer.Native.Description.Height;
                  ScreenSpaceShadows.Execute(list, DepthGBuffer.BindlessIndex, dw, dh, lightDir, cvp, camera.NearPlane);
                  PixMarker.End(list);
+
+                 TracePointLightScreenShadows(camera, list, cvp, dw, dh);
              }
+             else
+                 Array.Fill(_pointScreenShadowSlots, NoScreenShadow);
 
              // Ambient occlusion: horizon search against GBuffer linear depth + world normals.
              // Consumed by composition (ambient term only).
@@ -860,6 +872,39 @@ namespace Freefall.Graphics
         private static Vector4 NormalisePlane(Vector4 plane) =>
              plane / new Vector3(plane.X, plane.Y, plane.Z).Length();
 
+        // Screen-space shadows toward the point lights the shadow selection ranked highest 2 frames ago (its
+        // readback): they carry what the atlas cannot resolve, grass blades and flowers, at screen resolution. Each
+        // light is traced within its sphere's rectangle on screen, from where its transform is now (a carried torch
+        // moves). The point light pass fades a mask with that light's atlas shadow, so it comes and goes with it.
+        private void TracePointLightScreenShadows(Camera camera, ID3D12GraphicsCommandList list, Matrix4x4 cameraRelativeVP,
+            int width, int height)
+        {
+             Array.Fill(_pointScreenShadowSlots, NoScreenShadow);
+             var registry = PointLightBuffer.Instance;
+             int wanted = Math.Clamp(Engine.Settings.ScreenShadowedPointLights, 0, MaxScreenShadowedPointLights);
+             if (LocalShadows == null || registry == null || wanted == 0 || !Engine.Settings.EnableShadows
+                 || Engine.Settings.MaxShadowedPointLights <= 0)
+                 return;
+
+             int count = LocalShadows.TopPicks(_topPickSlots.AsSpan(0, wanted));
+             if (count == 0)
+                 return;
+
+             PixMarker.Begin(list, "Point light screen-space shadows");
+             for (int i = 0; i < count; i++)
+             {
+                 var light = registry.LightAt((int)_topPickSlots[i]);
+                 var transform = light?.Entity?.Transform;
+                 if (light == null || transform == null || !light.Enabled)
+                     continue;
+                 var tracer = _pointScreenShadows[i] ??= new ScreenSpaceShadows();
+                 if (tracer.ExecutePoint(list, DepthGBuffer.BindlessIndex, width, height,
+                         transform.WorldPosition - camera.Position, light.Range, cameraRelativeVP, camera.NearPlane))
+                     _pointScreenShadowSlots[i] = _topPickSlots[i];
+             }
+             PixMarker.End(list);
+        }
+
         private unsafe void DispatchPointLights(Camera camera, ID3D12GraphicsCommandList list)
         {
              if (!_pointLightsCulled)
@@ -883,6 +928,14 @@ namespace Freefall.Graphics
              _pointLightCS.SetPushConstant("LocalShadowAtlas", LocalShadows?.AtlasIndex ?? 0u);
              _pointLightCS.SetPushConstant("LocalShadowViews", LocalShadows?.ViewBufferSrv ?? 0u);
              _pointLightCS.SetPushConstant("LocalShadowLights", LocalShadows?.LightBufferSrv ?? 0u);
+
+             // Screen-space shadows of the top lights: a light whose registry slot matches reads that mask
+             for (int i = 0; i < MaxScreenShadowedPointLights; i++)
+             {
+                 bool traced = _pointScreenShadowSlots[i] != NoScreenShadow;
+                 _pointLightCS.SetPushConstant($"ScreenShadowSlot{i}", _pointScreenShadowSlots[i]);
+                 _pointLightCS.SetPushConstant($"ScreenShadowTex{i}", traced ? _pointScreenShadows[i]!.OutputSrvIndex : 0u);
+             }
 
              // Bind root signature, descriptor heap, and SceneConstants cbuffer (b0)
              list.SetComputeRootSignature(Engine.Device.GlobalRootSignature);
@@ -1345,6 +1398,7 @@ namespace Freefall.Graphics
             ShadowTextureArray?.Dispose();
             LocalShadows?.Dispose();
             ScreenSpaceShadows?.Dispose();
+            foreach (var tracer in _pointScreenShadows) tracer?.Dispose();
             Gtao?.Dispose();
             ScreenSpaceDisplacement?.Dispose();
             RadianceCascades?.Dispose();
