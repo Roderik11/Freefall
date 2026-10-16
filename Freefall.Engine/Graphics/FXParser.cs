@@ -177,16 +177,20 @@ namespace Freefall.Graphics
             RegexOptions.Multiline);
 
         /// <summary>
-        /// The settings an effect declares for its materials: the variables of its <c>ObjectConstants</c>
-        /// cbuffer marked with a default after <c>//=</c>. Each becomes a material property (inspector, .mat
-        /// "Parameters") that writes into the material's own copy of that cbuffer. A float3 whose name ends in
-        /// "Color" is a colour (Color3, the colour picker). Unmarked variables stay out of the material.
+        /// The settings an effect declares for its materials: the members of its <c>struct Settings</c> marked with
+        /// a default after <c>//=</c>, optionally followed by a range "[min, max]" (a slider). Each becomes a
+        /// material property (inspector, .mat "Parameters") that writes into the material's block of the
+        /// settings buffer (Material.SettingsStride bytes at its MaterialID), which the shader loads by the
+        /// instance's MaterialID. Not a cbuffer: draws are batched by effect, so a per-material constant buffer
+        /// would always be the batch's first material's. Members are packed tightly in declaration order, so
+        /// every member must be marked. A float3 whose name ends in "Color" is a colour (Color3, the picker).
         /// </summary>
         public static List<MaterialParamDesc> ParseMaterialParams(string content)
         {
             var list = new List<MaterialParamDesc>();
-            int start = content.IndexOf("cbuffer ObjectConstants", StringComparison.Ordinal);
+            int start = content.IndexOf("struct Settings", StringComparison.Ordinal);
             if (start < 0) return list;
+            int offset = 0;
             int open = content.IndexOf('{', start);
             int close = open < 0 ? -1 : content.IndexOf('}', open);
             if (open < 0 || close < 0) return list;
@@ -194,21 +198,44 @@ namespace Freefall.Graphics
             string body = content.Substring(open + 1, close - open - 1);
             foreach (Match m in MaterialParamLine.Matches(body))
             {
+                // An optional range after the default, "[min, max]": the inspector shows a slider
+                string text = m.Groups[3].Value;
+                float? min = null, max = null;
+                var range = Regex.Match(text, @"\[\s*([^,\]]+)\s*,\s*([^\]]+)\]");
+                if (range.Success)
+                {
+                    var inv = System.Globalization.CultureInfo.InvariantCulture;
+                    if (float.TryParse(range.Groups[1].Value.Trim(), System.Globalization.NumberStyles.Float, inv, out var lo) &&
+                        float.TryParse(range.Groups[2].Value.Trim(), System.Globalization.NumberStyles.Float, inv, out var hi))
+                    {
+                        min = lo;
+                        max = hi;
+                    }
+                    text = text.Remove(range.Index, range.Length);
+                }
+
                 var values = new List<float>();
-                foreach (var part in m.Groups[3].Value.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+                foreach (var part in text.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
                 {
                     if (float.TryParse(part, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var v))
                         values.Add(v);
                     else if (bool.TryParse(part, out var b))
                         values.Add(b ? 1f : 0f);
                 }
+                // Tightly packed, in declaration order: how ByteAddressBuffer.Load<Settings> reads the struct
+                string type = m.Groups[1].Value;
+                int size = type switch { "float2" => 8, "float3" => 12, _ => 4 };
                 list.Add(new MaterialParamDesc
                 {
-                    Type = m.Groups[1].Value,
+                    Type = type,
                     Name = m.Groups[2].Value,
                     Default = values.ToArray(),
                     Description = m.Groups[4].Success ? m.Groups[4].Value : null,
+                    Min = min,
+                    Max = max,
+                    Offset = offset,
                 });
+                offset += size;
             }
             return list;
         }
@@ -297,6 +324,10 @@ namespace Freefall.Graphics
         public string Type = "";
         public float[] Default = Array.Empty<float>();
         public string? Description;
+        /// <summary>"[min, max]" after the default: shown as a slider in the inspector.</summary>
+        public float? Min, Max;
+        /// <summary>Byte offset in the material's settings block (tight packing, declaration order).</summary>
+        public int Offset;
 
         /// <summary>A float3 named "...Color": shown with the colour picker.</summary>
         public bool IsColor => Type == "float3" && Name.EndsWith("Color", StringComparison.Ordinal);

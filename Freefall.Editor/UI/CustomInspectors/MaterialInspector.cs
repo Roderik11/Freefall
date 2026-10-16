@@ -44,6 +44,9 @@ namespace Freefall.Editor
                 {
                     var valueField = new Field(prop.GetType().GetProperty("Value"));
                     var property = new GUIProperty(target, valueField, prop) { DescriptionOverride = prop.Description };
+                    // A ranged number is a slider: scrub it and watch the result (vfx PulsePreview)
+                    if (prop.Range is { } range)
+                        property.RangeOverride = new ValueRangeAttribute(range.X, range.Y, (range.Y - range.X) / 100f);
                     AddProperty(property, prop.Name);
                 }
             }
@@ -51,11 +54,9 @@ namespace Freefall.Editor
             // Constant buffer parameters discovered from shader reflection
             if (mat != null)
             {
-                // Skip global/system cbuffers — only show material-relevant ones. An effect that declares its
-                // settings ("//=", shown above as properties, saved with the material) has its ObjectConstants
-                // shown there; the raw variables here would only repeat them, unsaved.
+                // Skip global/system cbuffers — only show material-relevant ones. (An effect's own settings, "//="
+                // in its struct Settings, are not a cbuffer: they are the properties above, saved with the material.)
                 var skipBuffers = new HashSet<string> { "SceneConstants", "PushConstants" };
-                if (mat.Effect?.MaterialParams.Count > 0) skipBuffers.Add("ObjectConstants");
 
                 foreach (var cb in mat.ConstantBuffers)
                 {

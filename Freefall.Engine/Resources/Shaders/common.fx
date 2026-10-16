@@ -195,7 +195,7 @@ struct MaterialData
     float3 EmissiveColor;
     float EmissiveIntensity;
     float3 Tint;                // multiplies the albedo map (Material "Tint", default white)
-    float _tintPad;
+    uint SettingsBufferIdx;     // the raw buffer of every material's effect settings (Material.SettingsStride bytes at its MaterialID); was padding
 };
 
 // Shadow cascade data — shared by all shadow-related shaders

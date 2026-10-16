@@ -83,6 +83,9 @@ namespace Freefall.Reflection
         /// <summary>A tooltip for a property that has no [Description] of its own (a material's effect setting).</summary>
         public string DescriptionOverride { get; set; }
 
+        /// <summary>A range for a property that has no [ValueRange] of its own (a material's effect setting): the inspector shows a slider.</summary>
+        public ValueRangeAttribute RangeOverride { get; set; }
+
         public GUIProperty(Field field, params object[] targets)
         {
             this._field = field;
@@ -124,6 +127,8 @@ namespace Freefall.Reflection
 
         public K GetAttribute<K>() where K : Attribute
         {
+            if (RangeOverride != null && typeof(K) == typeof(ValueRangeAttribute))
+                return (K)(Attribute)RangeOverride;
             return _field.GetAttribute<K>();
         }
 

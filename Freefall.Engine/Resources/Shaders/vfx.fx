@@ -12,7 +12,7 @@
 //     (MinWidth, for meshes round their local Y axis: tubes, cones);
 //   - a pulse travelling along the mesh from V = 0 to V = 1 (Pulse...): a band that swells the surface
 //     and glows. A script starts it by setting PulseStart to Time.TotalTime (the shader's Time) on its
-//     own copy of the material (Material.Clone); the shader moves, grows and fades it, no work per frame.
+//     own instance of the material (Material.CreateInstance); the shader moves, grows and fades it, no work per frame.
 //
 // U runs round the mesh and V along it (Mesh.CreateTube: U 0..1 once round, V 0 at the foot). Noise is
 // periodic in U, so a tube's seam does not show. Not pickable: it writes the composite only, so a beam
@@ -43,39 +43,53 @@ cbuffer PushConstants : register(b3)
 
 // @RenderState(RenderTargets=1, DepthWrite=false, Blend=Additive, CullMode=None, RenderTargetFormat=R16G16B16A16_Float)
 
-// The material's settings: one copy per material (Material binds its own ObjectConstants per draw batch).
-cbuffer ObjectConstants : register(b1)
+// The material's settings, one block per material, loaded by each instance's MaterialID (LoadSettings):
+// draws are batched by effect, so a per-material cbuffer would only ever be the batch's first material's.
+// Packed tightly in declaration order (the C# side writes them so, Material.WriteSetting): every member
+// must carry its "//=" default, and the block must stay within Material.SettingsStride (256 bytes).
+struct Settings
 {
     float3 Color;            //= 1, 1, 1         -- Colour of the glow
     float  Intensity;        //= 1               -- Brightness (HDR: above 1 glows and blooms)
     float  Body;             //= 1               -- How it thins towards its outline: |N.V| to this power (0 = flat, higher = a thinner, softer body)
-    float  Axial;            //= 0               -- 1 for tubes and cones: thickness measured round the local Y axis, and brighter seen along it (more of it in the line of sight); 0 for spheres and blobs
+    float  Axial;            //= 0 [0, 1]        -- 1 for tubes and cones: thickness measured round the local Y axis, and brighter seen along it (more of it in the line of sight); 0 for spheres and blobs
     float  Rim;              //= 0               -- Extra glow at the outline
     float  RimPower;         //= 3               -- How tight that rim is
     float  MinWidth;         //= 0               -- Milliradians: never narrower on screen than this, so it stays seen from afar (meshes round their local Y axis)
     float2 FadeEnds;         //= 0, 0            -- Share of the length over which it fades in at the foot (x) and out at the head (y)
     float2 NoiseScale;       //= 4, 4            -- Noise cells round the mesh (U, rounded to whole cells) and along it (V)
     float2 NoiseScroll;      //= 0, 0            -- How fast the noise moves, in cells a second (positive V = towards the head)
-    float  NoiseAmount;      //= 0               -- 0 = no noise; 1 = the noise sets the brightness entirely
+    float  NoiseAmount;      //= 0 [0, 1]        -- 0 = no noise; 1 = the noise sets the brightness entirely
     float  NoiseContrast;    //= 1               -- Above 1 the noise has harder light and dark parts
     float2 WarpScale;        //= 2, 2            -- Cells of the second noise, which bends the first
     float2 WarpScroll;       //= 0, 0            -- Its speed, in cells a second
     float  Warp;             //= 0               -- How far it bends the first noise, in that noise's cells
-    float  Dissolve;         //= 0               -- 0..1: where the noise is below this the surface is gone
+    float  Dissolve;         //= 0 [0, 1]        -- 0..1: where the noise is below this the surface is gone
     float  DissolveEdge;     //= 0.05            -- Width of the glowing edge where it is eaten away
     float  Push;             //= 0               -- Metres: vertices pushed along their normal by noise
     float2 PushScale;        //= 3, 3            -- Cells of that noise round and along the mesh
     float2 PushScroll;       //= 0, 0            -- Its speed, in cells a second
     float3 PulseColor;       //= 1, 1, 1         -- Colour of the pulse
-    float  PulseGlow;        //= 0               -- Brightness of the pulse (0 = no glow; it can still swell the surface)
+    float  PulseGlow;        //= 0               -- Brightness of the pulse, times Intensity (0 = no glow; it can still swell the surface)
     float  PulseSwell;       //= 0               -- Metres the pulse pushes the surface outwards at its middle
     float  PulseLength;      //= 0.05            -- Share of the length the pulse covers
     float  PulseStart;       //= -100000         -- Time (Time.TotalTime) the latest pulse set off; set by scripts
     float  PulseDuration;    //= 4               -- Seconds from the foot to the head
     float  PulseEase;        //= 1               -- How it travels: its place along the mesh is (t / duration) to this power (1 = even, higher = slow start)
-    float  PulseGrow;        //= 0.15            -- Share of the duration over which it fades in and swells
-    float  PulseHold;        //= 0.6             -- Share of the way it keeps full strength before it fades out by the head
+    float  PulseGrow;        //= 0.15 [0, 1]     -- Share of the duration over which it fades in and swells
+    float  PulseHold;        //= 0.6 [0, 1]      -- Share of the way it keeps full strength before it fades out by the head
+    float  PulsePreview;     //= -1 [-1, 1]      -- 0..1: hold the pulse at this point of its run, to look at it while tuning; -1 = off
 };
+
+// This draw's settings, loaded at the start of VS and PS
+static Settings S;
+
+Settings LoadSettings(uint materialId)
+{
+    StructuredBuffer<MaterialData> materials = ResourceDescriptorHeap[MaterialsIdx];
+    ByteAddressBuffer all = ResourceDescriptorHeap[materials[materialId].SettingsBufferIdx];
+    return all.Load<Settings>(materialId * 256u);
+}
 
 // ── Noise ──
 
@@ -131,17 +145,17 @@ float SurfaceNoise(float2 uv, float2 scale, float2 scroll)
 float PulseAt(out float strength)
 {
     strength = 0.0;
-    float t = (Time - PulseStart) / max(PulseDuration, 1e-3);
+    float t = S.PulsePreview >= 0.0 ? S.PulsePreview : (Time - S.PulseStart) / max(S.PulseDuration, 1e-3);
     if (t < 0.0 || t > 1.0) return -10.0;
-    float along = pow(t, max(PulseEase, 0.01));
-    strength = smoothstep(0.0, max(PulseGrow, 1e-3), t) * (1.0 - smoothstep(PulseHold, 1.0, along));
+    float along = pow(t, max(S.PulseEase, 0.01));
+    strength = smoothstep(0.0, max(S.PulseGrow, 1e-3), t) * (1.0 - smoothstep(S.PulseHold, 1.0, along));
     return along;
 }
 
 // How much of the pulse a point at V gets: a soft band, its strength scaling it
 float PulseBand(float v, float along, float strength)
 {
-    float x = (v - along) / max(PulseLength * 0.5, 1e-5);
+    float x = (v - along) / max(S.PulseLength * 0.5, 1e-5);
     return strength * exp(-2.0 * x * x);
 }
 
@@ -155,6 +169,7 @@ struct VSOutput
     float3 ToEye    : TEXCOORD1;    // camera minus surface, world space
     float  Depth    : TEXCOORD2;    // linear view depth (fog)
     float3 Axis     : TEXCOORD3;    // the mesh's local Y in world space (Axial)
+    nointerpolation uint MaterialId : TEXCOORD4;   // whose settings the pixel shader loads
 };
 
 VSOutput VS(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_InstanceID)
@@ -167,6 +182,8 @@ VSOutput VS(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_InstanceI
 
     uint idx = sortedIndices[InstanceBaseOffset + instanceID] & 0x7FFFFFFFu;
     InstanceDescriptor desc = descriptors[idx];
+    S = LoadSettings(desc.MaterialId);
+    output.MaterialId = desc.MaterialId;
     row_major matrix World = globalTransforms[desc.TransformSlot];
     float3x3 W3 = (float3x3)World;
 
@@ -187,21 +204,21 @@ VSOutput VS(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_InstanceI
 
     // Pushed outwards: by noise, and by the pulse where it passes
     float push = 0.0;
-    if (Push != 0.0)
-        push += Push * (SurfaceNoise(uv, PushScale, PushScroll) * 2.0 - 1.0);
-    if (PulseSwell != 0.0)
+    if (S.Push != 0.0)
+        push += S.Push * (SurfaceNoise(uv, S.PushScale, S.PushScroll) * 2.0 - 1.0);
+    if (S.PulseSwell != 0.0)
     {
         float strength;
         float along = PulseAt(strength);
-        push += PulseSwell * PulseBand(uv.y, along, strength);
+        push += S.PulseSwell * PulseBand(uv.y, along, strength);
     }
 
     // Never thinner on screen than MinWidth: widened where the camera is far (its distance from the
     // mesh's local Y axis is its radius here, in world units)
-    if (MinWidth > 0.0)
+    if (S.MinWidth > 0.0)
     {
         float radius = length(mul(float3(pos.x, 0.0, pos.z), W3));
-        float least = distance(worldPos, CamPos) * MinWidth * 0.0005;
+        float least = distance(worldPos, CamPos) * S.MinWidth * 0.0005;
         push += max(least - radius - push, 0.0);
     }
 
@@ -220,6 +237,7 @@ VSOutput VS(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_InstanceI
 
 float4 PS(VSOutput input) : SV_Target0
 {
+    S = LoadSettings(input.MaterialId);
     float2 uv = input.TexCoord;
     float3 N = normalize(input.Normal);
     float3 V = normalize(input.ToEye);
@@ -228,60 +246,60 @@ float4 PS(VSOutput input) : SV_Target0
     // Round an axis (tubes, cones): how central the point is in the tube's outline, whatever the angle it is
     // seen at, and more light the more nearly one looks along it (seen end-on, |N.V| alone would put it out)
     float gain = 1.0;
-    if (Axial > 0.0)
+    if (S.Axial > 0.0)
     {
         float3 A = normalize(input.Axis);
         float3 across = V - A * dot(V, A);
         float side = length(across);
         float central = side > 1e-3 ? abs(dot(N, across / side)) : 1.0;
-        facing = lerp(facing, central, Axial);
-        gain = lerp(1.0, 1.0 / max(side, 0.3), Axial);
+        facing = lerp(facing, central, S.Axial);
+        gain = lerp(1.0, 1.0 / max(side, 0.3), S.Axial);
     }
 
     // Thick where it faces the eye, thinning towards the outline; the rim adds at the outline
-    float body = Body > 0.0 ? pow(facing, Body) : 1.0;
-    float rim = Rim > 0.0 ? Rim * pow(1.0 - facing, RimPower) : 0.0;
+    float body = S.Body > 0.0 ? pow(facing, S.Body) : 1.0;
+    float rim = S.Rim > 0.0 ? S.Rim * pow(1.0 - facing, S.RimPower) : 0.0;
 
     // Noise, its coordinates bent by the warp noise
     float noise = 1.0;
-    if (NoiseAmount > 0.0 || Dissolve > 0.0)
+    if (S.NoiseAmount > 0.0 || S.Dissolve > 0.0)
     {
         float2 p = uv;
-        if (Warp != 0.0)
+        if (S.Warp != 0.0)
         {
-            float wu = SurfaceNoise(uv, WarpScale, WarpScroll);
-            float wv = SurfaceNoise(uv + 0.37, WarpScale, WarpScroll);
-            float cellsU = max(round(NoiseScale.x), 1.0);
-            p += (float2(wu, wv) * 2.0 - 1.0) * Warp / max(float2(cellsU, NoiseScale.y), 1e-3);
+            float wu = SurfaceNoise(uv, S.WarpScale, S.WarpScroll);
+            float wv = SurfaceNoise(uv + 0.37, S.WarpScale, S.WarpScroll);
+            float cellsU = max(round(S.NoiseScale.x), 1.0);
+            p += (float2(wu, wv) * 2.0 - 1.0) * S.Warp / max(float2(cellsU, S.NoiseScale.y), 1e-3);
         }
-        noise = SurfaceNoise(p, NoiseScale, NoiseScroll);
-        noise = saturate((noise - 0.5) * NoiseContrast + 0.5);
+        noise = SurfaceNoise(p, S.NoiseScale, S.NoiseScroll);
+        noise = saturate((noise - 0.5) * S.NoiseContrast + 0.5);
     }
-    float shade = lerp(1.0, noise, NoiseAmount);
+    float shade = lerp(1.0, noise, S.NoiseAmount);
 
     // Eaten away where the noise is below Dissolve, with a glowing edge
     float edge = 0.0;
-    if (Dissolve > 0.0)
+    if (S.Dissolve > 0.0)
     {
-        float keep = smoothstep(Dissolve, Dissolve + max(DissolveEdge, 1e-4), noise);
-        edge = (1.0 - keep) * step(Dissolve - max(DissolveEdge, 1e-4), noise);
+        float keep = smoothstep(S.Dissolve, S.Dissolve + max(S.DissolveEdge, 1e-4), noise);
+        edge = (1.0 - keep) * step(S.Dissolve - max(S.DissolveEdge, 1e-4), noise);
         shade *= keep;
     }
 
     // The ends fade in and out
     float ends = 1.0;
-    if (FadeEnds.x > 0.0) ends *= smoothstep(0.0, FadeEnds.x, uv.y);
-    if (FadeEnds.y > 0.0) ends *= 1.0 - smoothstep(1.0 - FadeEnds.y, 1.0, uv.y);
+    if (S.FadeEnds.x > 0.0) ends *= smoothstep(0.0, S.FadeEnds.x, uv.y);
+    if (S.FadeEnds.y > 0.0) ends *= 1.0 - smoothstep(1.0 - S.FadeEnds.y, 1.0, uv.y);
 
-    float3 light = Color * Intensity * gain * ((body * shade + rim) * ends + edge * 2.0);
+    float3 light = S.Color * S.Intensity * gain * ((body * shade + rim) * ends + edge * 2.0);
 
     // The pulse glows where it passes, with the same noise moving through it
-    if (PulseGlow > 0.0)
+    if (S.PulseGlow > 0.0)
     {
         float strength;
         float along = PulseAt(strength);
         float band = PulseBand(uv.y, along, strength);
-        light += PulseColor * PulseGlow * band * lerp(1.0, noise, NoiseAmount) * (0.35 + 0.65 * body);
+        light += S.PulseColor * S.PulseGlow * S.Intensity * gain * band * lerp(1.0, noise, S.NoiseAmount) * body;   // thins to nothing at the outline, like the body
     }
 
     // Light seen through fog fades with it

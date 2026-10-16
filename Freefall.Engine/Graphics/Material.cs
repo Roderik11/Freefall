@@ -27,7 +27,7 @@ namespace Freefall.Graphics
         public Vector3 EmissiveColor;
         public float EmissiveIntensity;
         public Vector3 Tint;            // multiplies the albedo map (Material "Tint", default white)
-        public float _tintPad;
+        public uint SettingsBufferIdx;  // the raw buffer of every material's effect settings (Material.SettingsStride bytes at its MaterialID); was padding
 
         /// <summary>
         /// Texture slot names derived from this struct's fields (strips "Idx" suffix).
@@ -52,6 +52,9 @@ namespace Freefall.Graphics
 
         /// <summary>What it does (an effect's "-- text" after its default); null for none.</summary>
         public string? Description { get; set; }
+
+        /// <summary>The range of a number the inspector shows as a slider (an effect's "[min, max]"); null for a plain field.</summary>
+        public System.Numerics.Vector2? Range { get; set; }
 
         /// <summary>Take the value of a property of the same type (a clone, or the same setting before a rebuild).</summary>
         public abstract void CopyFrom(MaterialProperty other);
@@ -178,7 +181,7 @@ namespace Freefall.Graphics
         private Dictionary<string, Texture> _textures = new();
         private List<TextureEffectParameter> _textureParameters = new();
         private List<MaterialProperty> _materialProperties = new();
-        // The effect's own settings (Effect.MaterialParams), writing into this material's ObjectConstants
+        // The effect's own settings (Effect.MaterialParams), writing into this material's block of the settings buffer
         private readonly List<MaterialProperty> _effectProperties = new();
         
         /// <summary>
@@ -196,8 +199,8 @@ namespace Freefall.Graphics
         /// <summary>
         /// Scalar material properties for inspector binding and the .mat "Parameters". Normally the MaterialData
         /// ones (Tint, emissive, detail), each writing to MaterialData on change. An effect that declares its own
-        /// settings ("//=" in its ObjectConstants, Effect.MaterialParams) gets those instead: it does not read
-        /// MaterialData, and its settings write into this material's own copy of that cbuffer.
+        /// settings ("//=" in its struct Settings, Effect.MaterialParams) gets those instead: it does not read
+        /// MaterialData; its settings are written into the material's block of the settings buffer (WriteSetting).
         /// </summary>
         public IReadOnlyList<MaterialProperty> MaterialProperties => _effectProperties.Count > 0 ? _effectProperties : _materialProperties;
 
@@ -340,6 +343,7 @@ namespace Freefall.Graphics
                     EmissiveColor = Vector3.One,
                     EmissiveIntensity = 1.0f,
                     Tint = Vector3.One,
+                    SettingsBufferIdx = _settingsBufferBindlessIndex,
                 });
                 _materialsBufferDirty = true;
             }
@@ -400,38 +404,112 @@ namespace Freefall.Graphics
             foreach (var desc in _effect.MaterialParams)
             {
                 string name = desc.Name;
+                int at = desc.Offset;
                 MaterialProperty? prop = desc.Type switch
                 {
                     "float" => new MaterialProperty<float>(name, this, desc.At(0),
-                        (m, v) => m.SetEffectValue(name, v)),
+                        (m, v) => m.WriteSetting(at, v)),
                     "float2" => new MaterialProperty<Vector2>(name, this, new Vector2(desc.At(0), desc.At(1)),
-                        (m, v) => m.SetEffectValue(name, v)),
+                        (m, v) => m.WriteSetting(at, v)),
                     "float3" when desc.IsColor => new MaterialProperty<Color3>(name, this, new Color3(desc.At(0, 1f), desc.At(1, 1f), desc.At(2, 1f)),
-                        (m, v) => m.SetEffectValue(name, v.ToVector3())),
+                        (m, v) => m.WriteSetting(at, v.ToVector3())),
                     "float3" => new MaterialProperty<Vector3>(name, this, new Vector3(desc.At(0), desc.At(1), desc.At(2)),
-                        (m, v) => m.SetEffectValue(name, v)),
+                        (m, v) => m.WriteSetting(at, v)),
                     "int" => new MaterialProperty<int>(name, this, (int)desc.At(0),
-                        (m, v) => m.SetEffectValue(name, v)),
+                        (m, v) => m.WriteSetting(at, v)),
                     "uint" => new MaterialProperty<int>(name, this, (int)desc.At(0),
-                        (m, v) => m.SetEffectValue(name, (uint)Math.Max(v, 0))),
+                        (m, v) => m.WriteSetting(at, (uint)Math.Max(v, 0))),
                     "bool" => new MaterialProperty<bool>(name, this, desc.At(0) != 0f,
-                        (m, v) => m.SetEffectValue(name, v ? 1u : 0u)),   // an HLSL bool is 4 bytes
+                        (m, v) => m.WriteSetting(at, v ? 1u : 0u)),   // an HLSL bool is 4 bytes
                     _ => null,
                 };
                 if (prop == null) continue;
 
                 prop.Description = desc.Description;
+                if (desc.Min is float lo && desc.Max is float hi) prop.Range = new Vector2(lo, hi);
                 prop.ResetToDefault();                                    // writes the default into the cbuffer
                 if (before.TryGetValue(name, out var old)) prop.CopyFrom(old);
                 _effectProperties.Add(prop);
             }
         }
 
-        // An effect setting into this material's ObjectConstants (the cbuffer bound at root slot 2 per draw batch)
-        private void SetEffectValue<T>(string name, T value) where T : unmanaged
+        // ── Effect settings on the GPU ──
+        // Every material's effect settings (Effect.MaterialParams) sit in one raw buffer, SettingsStride bytes at
+        // MaterialID * SettingsStride, which shaders load by the instance's MaterialID (MaterialData.SettingsBufferIdx
+        // names the buffer). Not a per-material constant buffer: draws are batched by effect (BatchKey), and a batch
+        // binds the constant buffers of the first material it met, so every other material would draw with its
+        // settings (found 2026-10-16: every bindstone tube drew with one material's noise and pulse).
+        public const int SettingsStride = 256;
+        private static byte[] _settingsData = new byte[SettingsStride * 64];
+        private static bool _settingsDirty = true;
+        private static ID3D12Resource? _settingsBuffer;
+        private static IntPtr _settingsBufferPtr;
+        private static uint _settingsBufferBindlessIndex;
+        private static int _settingsBufferCapacity;
+
+        // An effect setting into this material's block of the settings buffer
+        private unsafe void WriteSetting<T>(int offset, T value) where T : unmanaged
         {
-            if (_constantBuffers.TryGetValue("ObjectConstants", out var cb))
-                cb.SetParameter(name, value);
+            if (offset < 0 || offset + sizeof(T) > SettingsStride) return;
+            lock (_materialIdLock)
+            {
+                int at = MaterialID * SettingsStride + offset;
+                if (at + sizeof(T) > _settingsData.Length)
+                    Array.Resize(ref _settingsData, Math.Max(_settingsData.Length * 2, (MaterialID + 1) * SettingsStride));
+                System.Runtime.InteropServices.MemoryMarshal.Write(_settingsData.AsSpan(at), in value);
+                _settingsDirty = true;
+            }
+        }
+
+        // The settings buffer: grown with the materials buffer, uploaded when a setting changed. Its bindless index
+        // never changes once made; every MaterialData carries it.
+        private static void BindSettingsBuffer(GraphicsDevice device, int capacity)
+        {
+            bool fixIndices = false;
+            if (_settingsBuffer == null || capacity > _settingsBufferCapacity)
+            {
+                int bytes = capacity * SettingsStride;
+                if (_settingsBuffer != null) device.DeferDispose(_settingsBuffer);
+                _settingsBuffer = device.NativeDevice.CreateCommittedResource(
+                    new HeapProperties(HeapType.Upload),
+                    HeapFlags.None,
+                    ResourceDescription.Buffer((ulong)bytes),
+                    ResourceStates.GenericRead);
+                unsafe
+                {
+                    void* ptr;
+                    _settingsBuffer.Map(0, null, &ptr);
+                    _settingsBufferPtr = (IntPtr)ptr;
+                }
+                if (_settingsBufferBindlessIndex == 0)
+                {
+                    _settingsBufferBindlessIndex = device.AllocateBindlessIndex();
+                    fixIndices = true;
+                }
+                device.CreateRawBufferSRV(_settingsBuffer, (uint)(bytes / 4), _settingsBufferBindlessIndex);
+                _settingsBufferCapacity = capacity;
+                _settingsDirty = true;
+            }
+
+            lock (_materialIdLock)
+            {
+                if (fixIndices)
+                {
+                    var all = System.Runtime.InteropServices.CollectionsMarshal.AsSpan(_allMaterials);
+                    for (int i = 0; i < all.Length; i++) all[i].SettingsBufferIdx = _settingsBufferBindlessIndex;
+                    _materialsBufferDirty = true;
+                }
+                if (_settingsDirty)
+                {
+                    int count = Math.Min(_settingsData.Length, _settingsBufferCapacity * SettingsStride);
+                    unsafe
+                    {
+                        fixed (byte* src = _settingsData)
+                            Buffer.MemoryCopy(src, (void*)_settingsBufferPtr, _settingsBufferCapacity * SettingsStride, count);
+                    }
+                    _settingsDirty = false;
+                }
+            }
         }
         
         private void InitMaterialProperties()
@@ -1255,7 +1333,12 @@ namespace Freefall.Graphics
                 // Force data update after recreate
                 dirty = true;
             }
-            
+
+            // The effect settings beside it, at the same capacity; making that buffer the first time gives every
+            // MaterialData its index, so the materials are uploaded again
+            BindSettingsBuffer(device, _materialsBufferCapacity);
+            lock (_materialIdLock) dirty |= _materialsBufferDirty;
+
             // Update buffer data only when dirty — zero-alloc via CollectionsMarshal.AsSpan
             if (dirty)
             {
