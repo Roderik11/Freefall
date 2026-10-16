@@ -171,11 +171,16 @@ namespace Freefall.Components
 
             if(root != Entity)
             {
-                Matrix4x4.Invert(root.Transform.Matrix, out var worldInverse);
-                var relativeToParent = Matrix4x4.Multiply(Transform.Matrix, worldInverse);
-                relativeToParent.Deconstruct(out var shapeScale, out var shapeRotation, out var shapeTranslation);
-                var shapeWorldMatrix = Matrix4x4.CreateFromQuaternion(shapeRotation) * Matrix4x4.CreateTranslation(shapeTranslation);
-                localPose *= shapeWorldMatrix;
+                // The actor's frame is the root's place and turn in the world without its scale (a
+                // PhysX pose carries none), so the shape is placed in that frame: in metres. Taken
+                // relative to the root's scaled matrix, a root (or anything above it) scaled by s put
+                // every shape s times too near the root's pivot.
+                root.Transform.Matrix.Deconstruct(out _, out var rootRotation, out var rootTranslation);
+                var rootFrame = Matrix4x4.CreateFromQuaternion(rootRotation) * Matrix4x4.CreateTranslation(rootTranslation);
+                Matrix4x4.Invert(rootFrame, out var rootInverse);
+                var relative = Matrix4x4.Multiply(Transform.Matrix, rootInverse);
+                relative.Deconstruct(out _, out var shapeRotation, out var shapeTranslation);
+                localPose *= Matrix4x4.CreateFromQuaternion(shapeRotation) * Matrix4x4.CreateTranslation(shapeTranslation);
             }
 
             if (!localPose.IsIdentity)
@@ -255,6 +260,10 @@ namespace Freefall.Components
         }
     }
 
+    /// <summary>
+    /// The entity's mesh (or <see cref="Mesh"/>) as a static triangle mesh, at the size it is drawn:
+    /// the entity's scale times its parents'. Cooked once per mesh.
+    /// </summary>
     public class MeshCollider : Collider
     {
         public Mesh? Mesh;
@@ -298,9 +307,14 @@ namespace Freefall.Components
                 return null;
             }
 
+            // The mesh as big as it is drawn: the entity's scale and that of everything above it. The
+            // actor's pose carries no scale (see CreateShape), so all of it goes into the geometry.
+            // With the entity's own Scale only, a mesh under a scaled parent (a whole assembly
+            // scaled up) collided at its unscaled size.
+            Transform.Matrix.Deconstruct(out var worldScale, out _, out _);
             return new TriangleMeshGeometry(Mesh.CookedTriMesh)
             {
-                Scale = new MeshScale(Transform.Scale, Quaternion.Identity)
+                Scale = new MeshScale(worldScale, Quaternion.Identity)
             };
         }
     }
