@@ -14,6 +14,8 @@
 #pragma kernel CSBloomDownsample
 #pragma kernel CSBloomUpsample
 
+#include "bloom.hlsli"
+
 // Engine-bound bilinear clamp sampler from the global root signature
 SamplerState _LinearClamp : register(s2);
 
@@ -98,8 +100,7 @@ void CSBloomThreshold(uint3 id : SV_DispatchThreadID)
     {
         Texture2D<float> depthTex = ResourceDescriptorHeap[DepthSrvIdx];
         // Sample any corner of the 2x2 block — if it's sky, the whole block is sky
-        float depth = depthTex.Load(int3(base, 0)).r;
-        if (depth < 0.00001)
+        if (BloomIsSky(depthTex.Load(int3(base, 0)).r))
         {
             output[id.xy] = float4(0, 0, 0, 1);
             return;
@@ -107,12 +108,7 @@ void CSBloomThreshold(uint3 id : SV_DispatchThreadID)
     }
 
     // Soft threshold
-    float lum = Luminance(avg);
-    float soft = max(0.0, lum - threshold + softKnee) / (2.0 * softKnee + 0.00001);
-    soft = saturate(soft);
-    soft = soft * soft;
-
-    output[id.xy] = float4(avg * soft, 1.0);
+    output[id.xy] = float4(avg * BloomShare(Luminance(avg), threshold, softKnee), 1.0);
 }
 
 // ============================================================================

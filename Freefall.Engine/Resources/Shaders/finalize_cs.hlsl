@@ -5,6 +5,8 @@
 
 #pragma kernel CSFinalize
 
+#include "bloom.hlsli"
+
 cbuffer PushConstants : register(b3)
 {
     uint InputSrvIdx;       // HDR Composite SRV
@@ -14,6 +16,11 @@ cbuffer PushConstants : register(b3)
     uint BloomTexIdx;       // Bloom mip 0 SRV (0 = no bloom)
     uint BloomIntBits;      // Bloom strength (float reinterpreted as uint)
     uint TimeBits;          // Frame time for dither (float reinterpreted as uint)
+    uint DepthSrvIdx;       // Depth SRV (spreading bloom: the sky gives nothing, as in the prefilter)
+    uint BloomThresholdBits;
+    uint BloomKneeBits;
+    uint BloomMipCount;     // mips the upsample chain added into mip 0
+    uint BloomSpreads;      // 1 = the bloom spreads a share of each pixel's light, 0 = it adds on top
 };
 
 SamplerState LinearClampSampler : register(s2);
@@ -43,7 +50,18 @@ void CSFinalize(uint3 dispatchThreadId : SV_DispatchThreadID)
         float2 uv = (float2(px) + 0.5) / float2(ScreenWidth, ScreenHeight);
         float3 bloom = BloomTex.SampleLevel(LinearClampSampler, uv, 0).rgb;
         bloom = max(bloom, 0);
-        finalColor += bloom * bloomIntensity;
+        if (BloomSpreads != 0)
+        {
+            // Mip 0 holds the sum of all mips, so their average is the spread light. This pixel
+            // gives up the share the prefilter put into the pyramid: the total stays the same.
+            Texture2D<float> DepthTex = ResourceDescriptorHeap[DepthSrvIdx];
+            float share = BloomIsSky(DepthTex.Load(int3(px, 0)))
+                ? 0
+                : BloomShare(dot(finalColor, float3(0.2126, 0.7152, 0.0722)), asfloat(BloomThresholdBits), asfloat(BloomKneeBits));
+            finalColor = max(finalColor + (bloom / BloomMipCount - finalColor * share) * bloomIntensity, 0);
+        }
+        else
+            finalColor += bloom * bloomIntensity;
     }
     
     // ACES Filmic Tone Mapping (Narkowicz 2015 approximation)

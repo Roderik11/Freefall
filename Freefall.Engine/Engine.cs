@@ -548,13 +548,18 @@ namespace Freefall
          public bool EnableBloom { get; set; } = true;
 
          [ValueRange(0f, 5f)]
-         public float BloomThreshold { get; set; } = 2.0f;
+         public float BloomThreshold { get; set; } = 0f;
 
          [ValueRange(0f, 1f)]
          public float BloomSoftKnee { get; set; } = 0.3f;
 
          [ValueRange(0f, 2f)]
-         public float BloomIntensity { get; set; } = 0.25f;
+         public float BloomIntensity { get; set; } = 0.3f;
+
+         // true: BloomIntensity (0-1) is the share of each pixel's light above the threshold that is spread
+         // out; the image keeps its total brightness. false: the bloom is added on top (mip 0 holds the sum of
+         // all mips, so a flat area gains about MipCount × BloomIntensity of its own light).
+         public bool BloomSpreadsLight { get; set; } = true;
 
          [ValueRange(0.5f, 3f)]
          public float BloomRadius { get; set; } = 1.0f;

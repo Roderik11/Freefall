@@ -410,23 +410,26 @@ namespace Freefall.Graphics
             using (_postMarker.Auto())
             {
                 // 5. Bloom (reads HDR Composite — now includes both deferred + forward)
-                if (BloomPyramid != null && Engine.Settings.EnableBloom)
+                bool bloom = BloomPyramid != null && Engine.Settings.EnableBloom;
+                if (bloom)
                 {
-                    // Transition depth to NonPixelShaderResource for bloom sky mask
+                    // Depth to NonPixelShaderResource: the bloom prefilter masks the sky with it, and so does
+                    // the finalize pass when the bloom spreads light
                     Transition(list, Depth.Native, ResourceStates.PixelShaderResource, ResourceStates.NonPixelShaderResource);
 
                     PixMarker.Begin(list, "Bloom");
                     DispatchBloom(list);
                     PixMarker.End(list);
-
-                    // Restore depth state for next frame
-                    Transition(list, Depth.Native, ResourceStates.NonPixelShaderResource, ResourceStates.PixelShaderResource);
                 }
 
                 // 6. Finalize (HDR → LDR: bloom + tonemap + gamma + dither)
                 PixMarker.Begin(list, "Finalize");
                 Finalize(list);
                 PixMarker.End(list);
+
+                // Restore depth state for next frame
+                if (bloom)
+                    Transition(list, Depth.Native, ResourceStates.NonPixelShaderResource, ResourceStates.PixelShaderResource);
 
                 // 7. SMAA Anti-Aliasing (optional, on LDR output)
                 if (Smaa != null && Engine.Settings.EnableSMAA)
@@ -1114,6 +1117,11 @@ namespace Freefall.Graphics
             _finalizeCS.SetPushConstant(_kFinalize, "BloomTex", bloomActive ? BloomPyramid!.MipSRVs[0] : 0u);
             _finalizeCS.SetPushConstant(_kFinalize, "BloomIntBits", BitConverter.SingleToUInt32Bits(bloomActive ? Engine.Settings.BloomIntensity : 0f));
             _finalizeCS.SetPushConstant(_kFinalize, "TimeBits", BitConverter.SingleToUInt32Bits(Time.TotalTime));
+            _finalizeCS.SetPushConstant(_kFinalize, "DepthSrv", Depth.BindlessIndex);
+            _finalizeCS.SetPushConstant(_kFinalize, "BloomThresholdBits", BitConverter.SingleToUInt32Bits(Engine.Settings.BloomThreshold));
+            _finalizeCS.SetPushConstant(_kFinalize, "BloomKneeBits", BitConverter.SingleToUInt32Bits(Engine.Settings.BloomSoftKnee));
+            _finalizeCS.SetPushConstant(_kFinalize, "BloomMipCount", bloomActive ? (uint)BloomPyramid!.MipCount : 1u);
+            _finalizeCS.SetPushConstant(_kFinalize, "BloomSpreads", bloomActive && Engine.Settings.BloomSpreadsLight ? 1u : 0u);
 
             uint groupsX = ((uint)desc.Width + 7) / 8;
             uint groupsY = ((uint)desc.Height + 7) / 8;
