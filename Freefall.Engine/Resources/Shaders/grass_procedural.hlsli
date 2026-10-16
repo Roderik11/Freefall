@@ -130,3 +130,49 @@ void AS(uint3 gid : SV_GroupID)
     s_Payload.BaseInstance = gid.x * CLUMPS_PER_AS;
     DispatchMesh(CLUMPS_PER_AS, 1, 1, s_Payload);
 }
+
+// ─── Shadow Amplification Shader ───────────────────────────────────────────
+// The camera's instances reach out to the procedural bands' ends, but these decorators cast into cascade 0 only,
+// and each of the two pipelines builds only its own kinds. One thread per instance: an instance of this effect's
+// kinds (PROCEDURAL_SHADOW_MODE, defined by the effect) whose root, widened by its size and sway, falls inside
+// cascade 0's square gets a mesh group; the rest get none (as grass.fx AS_Shadow does for the cards). Until
+// 2026-10-16 every instance of the prepass launched a group in both pipelines and the rasterizer clipped them.
+
+struct ProceduralShadowPayload
+{
+    uint Instances[CLUMPS_PER_AS];
+};
+
+groupshared ProceduralShadowPayload s_ShadowPayload;
+groupshared uint s_ShadowCount;
+
+[numthreads(CLUMPS_PER_AS, 1, 1)]
+void AS_Shadow(uint gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
+{
+    if (gtid == 0) s_ShadowCount = 0;
+    GroupMemoryBarrierWithGroupSync();
+
+    uint inst = gid.x * CLUMPS_PER_AS + gtid;
+    StructuredBuffer<DecoInstance> instances = ResourceDescriptorHeap[BladeInstanceSRV];
+    DecoInstance di = instances[inst];
+    if (di.Scale.y > 0 && PROCEDURAL_SHADOW_MODE(di.Mode))
+    {
+        StructuredBuffer<CascadeData> cascades = ResourceDescriptorHeap[CascadeBufferSRVIdx];
+        row_major float4x4 vp = cascades[0].VP;
+        float4 p = mul(float4(di.Position, 1.0), vp);
+        p.xy /= max(p.w, 1e-6);   // orthographic: w = 1
+        // Half the width, the height and the wind's sway, with room to spare; a world offset of 'reach' moves
+        // clip x/y by at most reach times the length of that column
+        float reach = 0.5 * di.Scale.x + 1.3 * di.Scale.y;
+        float2 margin = reach * float2(length(float3(vp._11, vp._21, vp._31)), length(float3(vp._12, vp._22, vp._32)));
+        if (all(abs(p.xy) <= 1.0 + margin))
+        {
+            uint slot;
+            InterlockedAdd(s_ShadowCount, 1, slot);
+            s_ShadowPayload.Instances[slot] = inst;
+        }
+    }
+
+    GroupMemoryBarrierWithGroupSync();
+    DispatchMesh(s_ShadowCount, 1, 1, s_ShadowPayload);
+}

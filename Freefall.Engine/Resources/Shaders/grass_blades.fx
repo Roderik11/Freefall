@@ -7,6 +7,7 @@
 // are opaque geometry: no alpha test, hidden blades rejected early, each pixel shaded about once. Blade colours
 // come from the card's own texture (CS_BladeColors), so the hand-over matches.
 // ═══════════════════════════════════════════════════════════════════════════
+#define PROCEDURAL_SHADOW_MODE(mode) ((mode) == MODE_BLADES)   // the kinds this effect builds (AS_Shadow)
 #include "grass_procedural.hlsli"
 
 #define MAX_BLADES 28           // x (2 x 4 segments + 1) = 252 vertices, x (2 x 4 - 1) = 196 triangles
@@ -164,7 +165,8 @@ PSOutput PS(MSOutput input, bool isFrontFace : SV_IsFrontFace)
 }
 
 // ─── Shadow ────────────────────────────────────────────────────────────────
-// Grass casts into the nearest cascade only (see grass.fx); blade clumps are near the camera, so they are in it.
+// Grass casts into the nearest cascade only (see grass.fx); AS_Shadow (grass_procedural.hlsli) launches only the
+// clumps inside it.
 
 struct ShadowMSOutput
 {
@@ -181,13 +183,13 @@ struct ShadowPrimAttribs
 void MS_Shadow(
     uint gtid : SV_GroupThreadID,
     uint3 gid : SV_GroupID,
-    in payload ProceduralPayload payload,
+    in payload ProceduralShadowPayload payload,
     out vertices ShadowMSOutput verts[MAX_VERTS],
     out indices uint3 tris[MAX_PRIMS],
     out primitives ShadowPrimAttribs primAttribs[MAX_PRIMS])
 {
     StructuredBuffer<DecoInstance> instances = ResourceDescriptorHeap[BladeInstanceSRV];
-    DecoInstance di = instances[payload.BaseInstance + gid.x];
+    DecoInstance di = instances[payload.Instances[gid.x]];
 
     float dist = distance(CamPos, di.Position);
     uint vertCount, primCount, segs;
@@ -232,7 +234,7 @@ technique11 GrassBlades
 
     pass Shadow
     {
-        SetAmplificationShader(CompileShader(as_6_6, AS()));
+        SetAmplificationShader(CompileShader(as_6_6, AS_Shadow()));
         SetMeshShader(CompileShader(ms_6_6, MS_Shadow()));
         SetPixelShader(CompileShader(ps_6_6, PS_Shadow()));
     }

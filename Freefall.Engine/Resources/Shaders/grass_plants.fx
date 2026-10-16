@@ -9,6 +9,7 @@
 // leaves, a frond. Each part fills most of its quad, so the alpha test wastes few pixels (a whole flower card is
 // ~15% opaque). Without an atlas the parts are flat colours from the card.
 // ═══════════════════════════════════════════════════════════════════════════
+#define PROCEDURAL_SHADOW_MODE(mode) ((mode) >= MODE_FLOWERS && (mode) <= MODE_FERNS)   // this effect's kinds
 #include "grass_procedural.hlsli"
 
 #define PLANT_STEMS 3
@@ -438,7 +439,8 @@ PSOutput PS(MSOutput input, bool isFrontFace : SV_IsFrontFace)
 }
 
 // ─── Shadow ────────────────────────────────────────────────────────────────
-// Cascade 0 only, like the cards and blades; textured parts cut their outline into the shadow too.
+// Cascade 0 only, like the cards and blades (AS_Shadow launches only the plants inside it); textured parts cut
+// their outline into the shadow too.
 
 struct ShadowMSOutput
 {
@@ -457,13 +459,13 @@ struct ShadowPrimAttribs
 void MS_Shadow(
     uint gtid : SV_GroupThreadID,
     uint3 gid : SV_GroupID,
-    in payload ProceduralPayload payload,
+    in payload ProceduralShadowPayload payload,
     out vertices ShadowMSOutput verts[MAX_VERTS],
     out indices uint3 tris[MAX_PRIMS],
     out primitives ShadowPrimAttribs primAttribs[MAX_PRIMS])
 {
     StructuredBuffer<DecoInstance> instances = ResourceDescriptorHeap[BladeInstanceSRV];
-    DecoInstance di = instances[payload.BaseInstance + gid.x];
+    DecoInstance di = instances[payload.Instances[gid.x]];
 
     uint vertCount, primCount;
     PlantCounts(di, vertCount, primCount);
@@ -515,7 +517,7 @@ technique11 GrassPlants
 
     pass Shadow
     {
-        SetAmplificationShader(CompileShader(as_6_6, AS()));
+        SetAmplificationShader(CompileShader(as_6_6, AS_Shadow()));
         SetMeshShader(CompileShader(ms_6_6, MS_Shadow()));
         SetPixelShader(CompileShader(ps_6_6, PS_Shadow()));
     }
