@@ -448,13 +448,14 @@ namespace Freefall.Graphics
 
             var pso = device.CreateComputePipelineState(shader.Bytecode);
 
-            // Merge push constant slots from every kernel's reflection,
-            // since HLSL optimizes out unused cbuffer members per entry point
+            // Merge push constant slots and constant buffers from every kernel's reflection, since HLSL optimizes out
+            // unused cbuffers and members per entry point (as Reload does). Taking the cbuffers from the first kernel
+            // only left a cbuffer that kernel does not read unbound for all the others, silently: SetParam found no
+            // such parameter (2026-10-16: a first kernel without Params took the camera from shadow_receivers.hlsl).
             if (shader.Reflection != null)
             {
                 DiscoverPushConstants(shader.Reflection);
-                if (_kernels.Count == 0)
-                    DiscoverConstantBuffers(shader.Reflection);
+                DiscoverConstantBuffers(shader.Reflection, onlyNew: true);
             }
 
             _kernels.Add(new Kernel

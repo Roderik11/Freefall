@@ -169,6 +169,23 @@ namespace Freefall.Components
 
         /// <summary>The wave simulation. WaterBody borrows its slope and noise textures for ripples.</summary>
         public OceanFFT? FFT => _oceanFFT;
+
+        // The ocean that queued its surface this tick, for the sun shadow receivers (ShadowReceivers marks the band
+        // its waves can reach along each view ray)
+        private static OceanRenderer? _drawn;
+        private int _drawnTick = -1;
+
+        /// <summary>
+        /// The ocean that queued its surface this tick (Draw), with its rest height, its displacement texture (one slice
+        /// per band, vertical displacement in .y) and the shore surge it adds on top; null when none did.
+        /// </summary>
+        internal static OceanRenderer? DrawnThisTick =>
+            _drawn != null && _drawn._drawnTick == Engine.TickCount && _drawn._oceanFFT != null ? _drawn : null;
+
+        internal float PlaneY => Transform.WorldPosition.Y;
+        internal uint DisplacementSrv => _oceanFFT?.DisplacementSRV ?? 0;
+        internal int BandCount => _oceanFFT?.NumBands ?? 0;
+        internal Effect SurfaceEffect => _material.Effect;
         private float _waveTime;
         private DirectionalLight? _sunLight;
         private TerrainRenderer? _terrain;
@@ -266,6 +283,8 @@ namespace Freefall.Components
             device.DeferDispose(_tileScalesBuffer);
             device.DeferDispose(_oceanFFT);
             device.DeferDispose(_mesh);
+            if (_drawn == this)
+                _drawn = null;
         }
 
         private unsafe void CreateTileScalesBuffer()
@@ -428,6 +447,8 @@ namespace Freefall.Components
         public void Draw()
         {
             if (_mesh == null || _material == null || _oceanFFT == null) return;
+            _drawn = this;
+            _drawnTick = Engine.TickCount;
 
             // Lazy terrain lookup (terrain may not exist at Awake time)
             if (_terrain == null)

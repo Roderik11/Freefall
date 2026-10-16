@@ -499,13 +499,9 @@ namespace Freefall.Graphics
                 if (usingGPUPath)
                     CommandBuffer.Culler?.ClearCullStats(commandList);
                     
+                // All batches stage by stage (Visibility / Compaction / Commands rows, not one per batch)
                 PixMarker.Begin(commandList, "Culling");
-                foreach (var batch in activeBatches)
-                {
-                    PixMarker.Begin(commandList, batch.ProfileName);
-                    batch.Cull(commandList, frustumBufferGPUAddress, Culler);
-                    PixMarker.End(commandList);
-                }
+                InstanceBatch.Cull(commandList, activeBatches, frustumBufferGPUAddress, Culler);
                 PixMarker.End(commandList);
                 
                 if (usingGPUPath)

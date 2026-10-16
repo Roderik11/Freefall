@@ -293,12 +293,8 @@ namespace Freefall.Graphics
                 list.ClearDepthStencilView(Atlas.SliceDsvHandles[p], ClearFlags.Depth, 1.0f, 0);
 
             PixMarker.Begin(list, "Culling");
-            foreach (var batch in batches)
-            {
-                if (!batch.Material.HasPass(RenderPass.LocalShadow)) continue;
-                batch.CullLocalShadowAll(list, _views.SrvIndex, _shadowLights.SrvIndex, _counts.UavIndex,
-                    placeholderCbAddress, culler);
-            }
+            InstanceBatch.CullLocalShadowAll(list, batches, _views.SrvIndex, _shadowLights.SrvIndex, _counts.UavIndex,
+                placeholderCbAddress, culler);
             PixMarker.End(list);
 
             list.OMSetRenderTargets(0, (CpuDescriptorHandle[]?)null, false, Atlas.FullArrayDsvHandle);

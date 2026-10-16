@@ -100,12 +100,12 @@ cbuffer PushConstants : register(b3)
     uint SortStrideIdx;             // slot 21 — Stride within block
     uint SortCountIdx;              // slot 22 — Total count to sort
     uint SubbatchIdsIdx;            // slot 23 — SRV: per-instance subbatch index
-    uint CombinedShadowVisUAVIdx;   // slot 24 — UAV: combined shadow visibility
+    uint CombinedShadowVisUAVIdx;   // slot 24 — UAV: combined shadow visibility; CSVisibility: the first instance its transform cache re-reads every frame (CacheRefreshFrom)
     uint MaterialsBufferIdx;        // slot 25 — SRV: materials array buffer
     uint HistogramUAVIdx;           // slot 26 — UAV: histogram buffer (count per MeshPartId)
     uint UniquePartCountIdx;        // slot 27 — Max unique MeshPartIds in registry
-    uint CascadeMaskUAVIdx;         // slot 28 — UAV: per-instance 4-bit cascade mask
-    uint ExpansionUAVIdx;           // slot 29 — UAV: expansion buffer for (instanceIdx, cascadeIdx)
+    uint CascadeMaskUAVIdx;         // slot 28 — UAV: per-instance 4-bit cascade mask; the camera's CSVisibility: its transform cache (VisibilityCacheIdx)
+    uint ExpansionUAVIdx;           // slot 29 — UAV: expansion buffer for (instanceIdx, cascadeIdx); CSVisibility: the slots uploaded this tick (ChangedSlotsIdx)
     float ShadowMinCasterClip;      // slot 30 — shadow cascades 1+: smallest caster diameter in clip units (0 = off)
     uint CascadeBufferSRVIdx;       // slot 31 — SRV: StructuredBuffer<CascadeData> / shadow cascade idx (aliased)
     uint SortKeysUAVIdx;            // slot 32 — UAV: depth sort keys buffer (uint2 per entry)
@@ -114,7 +114,11 @@ cbuffer PushConstants : register(b3)
     float LodCameraY;               // slot 35   passes too, so shadows use the main view's LOD.
     float LodCameraZ;               // slot 36   (separate floats: a float3 would not pack into these slots)
     float LodFactor;                // slot 37 — Camera.FoVFactor * LODScale² (0 = no valid camera: LOD-managed instances are not drawn)
+    uint InstanceBoundsUAVIdx;      // slot 38 — UAV: InstanceBounds per instance; CSVisibility writes, CSVisibilityShadow4/LocalShadows read (0 = none)
+    uint ShadowReceiversUAVIdx;     // slot 39 — UAV: the sun's receiver tiles + stats (shadow_receivers.hlsli); CSVisibilityShadow4 only (0 = none); CSVisibility: the changed records (ChangedRecordsIdx)
 };
+
+#include "shadow_receivers.hlsli"
 
 // Convenience aliases for named push constants (matching old #define usage)
 #define OutputBufferIdx       OutputBufferUAVIdx
@@ -141,6 +145,11 @@ cbuffer PushConstants : register(b3)
 #define CascadeMaskUAVIdx     CascadeMaskUAVIdx
 #define ShadowHiZSrvIdx       PrevVisibilityIdx
 #define ShadowCascadeIdx      CascadeBufferSRVIdx
+// The camera chain (InstanceBatch.Cull) never reads the shadow slots 24/28/29/39, so CSVisibility takes them over
+#define CacheRefreshFrom      CombinedShadowVisUAVIdx
+#define VisibilityCacheIdx    CascadeMaskUAVIdx
+#define ChangedSlotsIdx       ExpansionUAVIdx
+#define ChangedRecordsIdx     ShadowReceiversUAVIdx
 
 // Per-subbatch instance range (extended with MeshPartId)
 struct InstanceRange
@@ -247,6 +256,74 @@ struct InstanceDescriptor
     uint MeshPartIdx;
     uint BoneBufferIdx;
 };
+
+// An instance's world bounding sphere and LOD-resolved part as the camera's CSVisibility found them, for the
+// shadow culling (InstanceBatch.instanceBoundsBuffers, 20 bytes). Part = INVALID_PART: not drawn at this LOD.
+// Skinned instances carry the radius widened as the shadow passes need it.
+struct InstanceBounds
+{
+    float3 Center;
+    float Radius;
+    uint Part;
+};
+
+void WriteInstanceBounds(uint instanceIdx, float3 center, float radius, uint part)
+{
+    if (InstanceBoundsUAVIdx == 0)
+        return;
+    RWStructuredBuffer<InstanceBounds> bounds = ResourceDescriptorHeap[InstanceBoundsUAVIdx];
+    InstanceBounds b;
+    b.Center = center;
+    b.Radius = radius;
+    b.Part = part;
+    bounds[instanceIdx] = b;
+}
+
+// A shadow caster's world sphere and LOD part (returned; INVALID_PART = not drawn at this LOD) from its descriptor,
+// transform, LOD chain and mesh registry entry: what CSVisibility does before it writes InstanceBounds.
+uint GatherShadowCasterSphere(uint instanceIdx, out float3 worldCenter, out float worldRadius)
+{
+    worldCenter = 0;
+    worldRadius = 0;
+
+    StructuredBuffer<InstanceDescriptor> descriptors = ResourceDescriptorHeap[DescriptorBufferIdx];
+    StructuredBuffer<row_major float4x4> transforms = ResourceDescriptorHeap[GlobalTransformsIdx];
+    StructuredBuffer<MeshPartEntry> meshRegistry = ResourceDescriptorHeap[MeshRegistryIdx];
+    StructuredBuffer<uint> subbatchIds = ResourceDescriptorHeap[SubbatchIdsIdx];
+
+    row_major float4x4 world = transforms[descriptors[instanceIdx].TransformSlot];
+    float maxScaleSq = max(dot(world[0].xyz, world[0].xyz),
+                       max(dot(world[1].xyz, world[1].xyz),
+                           dot(world[2].xyz, world[2].xyz)));
+
+    // Same LOD as the main view (resolved from the main camera, not the light)
+    uint meshPartId = ResolveLodPart(subbatchIds[instanceIdx], world, maxScaleSq);
+    if (meshPartId == INVALID_PART)
+        return INVALID_PART;
+
+    float4 localSphere = meshRegistry[meshPartId].LocalBounds;
+    worldCenter = mul(float4(localSphere.xyz, 1.0), world).xyz;
+    worldRadius = localSphere.w * sqrt(maxScaleSq);
+    if (descriptors[instanceIdx].BoneBufferIdx != 0)
+        worldRadius *= 1.5; // skinned: the bind-pose bounds do not hold the animated pose
+    return meshPartId;
+}
+
+// The same from the camera's visibility pass this frame (InstanceBounds, 20 sequential bytes) when slot 38 is set,
+// else gathered. The gather cost about as much as the camera's own visibility pass (2026-10-16: 0.22 ms for the
+// 76k-instance batch in the point light culling, 85% of it). Both resolve the main camera's LOD and widen skinned
+// radii ×1.5, so either way the result is the same.
+uint ShadowCasterSphere(uint instanceIdx, out float3 worldCenter, out float worldRadius)
+{
+    if (InstanceBoundsUAVIdx == 0)
+        return GatherShadowCasterSphere(instanceIdx, worldCenter, worldRadius);
+
+    RWStructuredBuffer<InstanceBounds> bounds = ResourceDescriptorHeap[InstanceBoundsUAVIdx];
+    InstanceBounds b = bounds[instanceIdx];
+    worldCenter = b.Center;
+    worldRadius = b.Radius;
+    return b.Part;
+}
 
 // Must match C# IndirectDrawCommand exactly (24 bytes = 6 uints)
 struct IndirectDrawCommand
@@ -450,6 +527,142 @@ bool IsOccludedShadow(float3 worldCenter, float worldRadius, uint cascadeIdx)
 }
 
 //-----------------------------------------------------------------------------
+// Receiver mask (ShadowReceivers.cs, slot 39): whether a caster can darken anything the camera sees through this
+// cascade. Under its footprint, widened by the shadow filter's reach, some receiver must lie deeper (farther from the
+// sun) than the caster's nearest point; a tile without receivers holds 0. The footprint is read from the pyramid level
+// whose cells are at least as wide as it, so it touches at most 2x2 of them.
+//-----------------------------------------------------------------------------
+bool ShadesReceivers(RWStructuredBuffer<uint> receivers, float3 worldCenter, float worldRadius, uint cascadeIdx, float marginUV)
+{
+    StructuredBuffer<CascadeData> cascades = ResourceDescriptorHeap[CascadeBufferSRVIdx];
+    row_major float4x4 vp = cascades[cascadeIdx].VP;
+
+    float4 clip = mul(float4(worldCenter, 1.0), vp);    // orthographic: w = 1
+    float casterNear = clip.z - worldRadius * length(float3(vp._13, vp._23, vp._33));
+
+    float2 uv = clip.xy * float2(0.5, -0.5) + 0.5;
+    float radiusUV = 0.5 * worldRadius * length(float3(vp._11, vp._21, vp._31)) + marginUV;
+    float2 lo = saturate(uv - radiusUV) * RECEIVER_TILES;
+    float2 hi = saturate(uv + radiusUV) * RECEIVER_TILES;
+
+    float extent = max(hi.x - lo.x, hi.y - lo.y);
+    uint level = min((uint)ceil(log2(max(extent, 1.0))), RECEIVER_LEVELS - 1u);
+    uint size = RECEIVER_TILES >> level;
+    uint2 a = min((uint2)lo >> level, size - 1u);
+    uint2 b = min((uint2)hi >> level, size - 1u);
+
+    uint base = ReceiverLevelBase(cascadeIdx, level);
+    uint deepest = max(max(receivers[base + a.y * size + a.x], receivers[base + a.y * size + b.x]),
+                       max(receivers[base + b.y * size + a.x], receivers[base + b.y * size + b.x]));
+    return deepest != 0 && casterNear <= asfloat(deepest);
+}
+
+// Adds this wave's cascade entries, and those shading no receiver, to the receiver stats (entries and triangles)
+void CountReceiverEntries(RWStructuredBuffer<uint> receivers, uint cascadeIdx, bool entry, bool shades, uint triangles)
+{
+    bool cut = entry && !shades;
+    uint entries = WaveActiveCountBits(entry);
+    uint entriesCut = WaveActiveCountBits(cut);
+    uint tris = WaveActiveSum(entry ? triangles : 0u);
+    uint trisCut = WaveActiveSum(cut ? triangles : 0u);
+    if (WaveIsFirstLane() && entries > 0)
+    {
+        InterlockedAdd(receivers[RECEIVER_ENTRIES + cascadeIdx], entries);
+        InterlockedAdd(receivers[RECEIVER_ENTRIES_CUT + cascadeIdx], entriesCut);
+        InterlockedAdd(receivers[RECEIVER_TRIS + cascadeIdx], tris);
+        InterlockedAdd(receivers[RECEIVER_TRIS_CUT + cascadeIdx], trisCut);
+    }
+}
+
+//-----------------------------------------------------------------------------
+// The camera's transform cache (InstanceBatch.visibilityCacheBuffer; CSVisibility, slots 24/28/29/39). The transforms,
+// descriptors and subbatch ids live in upload heaps, so gathering them for every instance every frame read ~88 bytes
+// per instance across PCIe: all of CSVisibility's cost (2026-10-16, Eldermoor's 163k instances: 0.40-0.61 ms; with the
+// cache 0.18 ms while it still read the 24 bytes of descriptor and subbatch id to check each entry, 0.031-0.034 ms now).
+// The cache keeps what the gather found per instance, in video memory and instance order, and nothing but the cache
+// is read for an instance unless the C# or the transform upload says it changed:
+//   - its transform slot was uploaded this tick (ChangedSlotsIdx: TransformBuffer's bit per slot, 0 = none was),
+//   - its persistent record changed since the last culling (ChangedRecordsIdx: the batch's bit per instance, 0 = none:
+//     added, swap-removed into this index, skinned or no longer),
+//   - it is at or past CacheRefreshFrom: this frame's enqueued draws (PersistentCount), or every instance (0) when the
+//     cache is new, the batch missed a tick or a compute shader wrote its records.
+// Everything after the gather runs as before on the same values, so the flags and InstanceBounds come out identical.
+//-----------------------------------------------------------------------------
+#define VISIBILITY_CACHE_WRITTEN     1u     // Flags: 0 = never written (a new buffer is zeroed)
+#define VISIBILITY_CACHE_SKINNED     2u
+
+struct VisibilityCacheEntry     // 64 bytes (InstanceBatch.VisibilityCacheStride)
+{
+    float3 Row0;                // world[0..3].xyz: the affine rows; mul(float4(p, 1), world).xyz reads nothing else
+    uint TransformSlot;
+    float3 Row1;
+    float MaxScaleSq;
+    float3 Row2;
+    uint SubbatchId;            // as staged: chain head part | LOD_MANAGED_BIT
+    float3 Row3;
+    uint Flags;
+};
+
+// One bit of a bit-per-index buffer (bitsIdx = 0: no bit is set)
+bool BitSet(uint bitsIdx, uint index)
+{
+    if (bitsIdx == 0)
+        return false;
+    StructuredBuffer<uint> bits = ResourceDescriptorHeap[bitsIdx];
+    return ((bits[index >> 5] >> (index & 31u)) & 1u) != 0;
+}
+
+// What CSVisibility needs of an instance besides the mesh registry: its world matrix, largest axis scale squared,
+// staged subbatch id and whether it is skinned. From the transform cache when slot 28 is set (gathered and stored when
+// stale), else gathered through the descriptor's transform slot as before.
+void CameraCullInput(uint instanceIdx, out row_major float4x4 world, out float maxScaleSq, out uint subbatchId, out bool skinned)
+{
+    if (VisibilityCacheIdx != 0 && instanceIdx < CacheRefreshFrom)
+    {
+        RWStructuredBuffer<VisibilityCacheEntry> cache = ResourceDescriptorHeap[VisibilityCacheIdx];
+        VisibilityCacheEntry entry = cache[instanceIdx];
+        if (entry.Flags != 0 && !BitSet(ChangedRecordsIdx, instanceIdx) && !BitSet(ChangedSlotsIdx, entry.TransformSlot))
+        {
+            world = float4x4(float4(entry.Row0, 0.0), float4(entry.Row1, 0.0), float4(entry.Row2, 0.0), float4(entry.Row3, 1.0));
+            maxScaleSq = entry.MaxScaleSq;
+            subbatchId = entry.SubbatchId;
+            skinned = (entry.Flags & VISIBILITY_CACHE_SKINNED) != 0;
+            return;
+        }
+    }
+
+    StructuredBuffer<InstanceDescriptor> descriptors = ResourceDescriptorHeap[DescriptorBufferIdx];
+    StructuredBuffer<row_major float4x4> transforms = ResourceDescriptorHeap[GlobalTransformsIdx];
+    StructuredBuffer<uint> subbatchIds = ResourceDescriptorHeap[SubbatchIdsIdx];
+
+    // Data is stored in add-order, instanceIdx == drawIdx (identity mapping)
+    InstanceDescriptor descriptor = descriptors[instanceIdx];
+    world = transforms[descriptor.TransformSlot];
+    subbatchId = subbatchIds[instanceIdx];   // the meshPartId set in CommandBuffer.Enqueue, LOD-managed or not
+    skinned = descriptor.BoneBufferIdx != 0;
+
+    // Largest axis scale, squared. The LOD distance uses it as is; only the radius needs the sqrt.
+    maxScaleSq = max(dot(world[0].xyz, world[0].xyz),
+                 max(dot(world[1].xyz, world[1].xyz),
+                     dot(world[2].xyz, world[2].xyz)));
+
+    if (VisibilityCacheIdx != 0)
+    {
+        RWStructuredBuffer<VisibilityCacheEntry> cache = ResourceDescriptorHeap[VisibilityCacheIdx];
+        VisibilityCacheEntry entry;
+        entry.Row0 = world[0].xyz;
+        entry.TransformSlot = descriptor.TransformSlot;
+        entry.Row1 = world[1].xyz;
+        entry.MaxScaleSq = maxScaleSq;
+        entry.Row2 = world[2].xyz;
+        entry.SubbatchId = subbatchId;
+        entry.Row3 = world[3].xyz;
+        entry.Flags = VISIBILITY_CACHE_WRITTEN | (skinned ? VISIBILITY_CACHE_SKINNED : 0u);
+        cache[instanceIdx] = entry;
+    }
+}
+
+//-----------------------------------------------------------------------------
 // Pass 1: CSVisibility - Write visibility flags (1 if visible, 0 if not)
 // Also counts visible instances per subbatch for command generation
 //-----------------------------------------------------------------------------
@@ -457,35 +670,28 @@ bool IsOccludedShadow(float3 worldCenter, float worldRadius, uint cascadeIdx)
 void CSVisibility(uint3 dispatchThreadId : SV_DispatchThreadID)
 {
     uint instanceIdx = dispatchThreadId.x;
-    
-    StructuredBuffer<InstanceDescriptor> descriptors = ResourceDescriptorHeap[DescriptorBufferIdx];
-    StructuredBuffer<row_major float4x4> transforms = ResourceDescriptorHeap[GlobalTransformsIdx];
+
     StructuredBuffer<MeshPartEntry> meshRegistry = ResourceDescriptorHeap[MeshRegistryIdx];
-    StructuredBuffer<uint> subbatchIds = ResourceDescriptorHeap[SubbatchIdsIdx];
     RWStructuredBuffer<uint> visibilityFlags = ResourceDescriptorHeap[VisibilityFlagsIdx];
-    RWStructuredBuffer<uint> counters = ResourceDescriptorHeap[CounterBufferIdx];
-    
+
     // Bounds check - write 0 for out-of-range to clear stale visibility flags
     if (instanceIdx >= TotalInstances)
     {
         visibilityFlags[instanceIdx] = 0;
         return;
     }
-    
-    // Data is stored in add-order, instanceIdx == drawIdx (identity mapping)
-    uint transformSlot = descriptors[instanceIdx].TransformSlot;
-    row_major float4x4 world = transforms[transformSlot];
 
-    // Largest axis scale, squared. The LOD distance uses it as is; only the radius needs the sqrt.
-    float maxScaleSq = max(dot(world[0].xyz, world[0].xyz),
-                       max(dot(world[1].xyz, world[1].xyz),
-                           dot(world[2].xyz, world[2].xyz)));
+    row_major float4x4 world;
+    float maxScaleSq;
+    uint subbatchId;
+    bool skinned;
+    CameraCullInput(instanceIdx, world, maxScaleSq, subbatchId, skinned);
 
-    // subbatchIds stores the meshPartId (set in CommandBuffer.Enqueue); resolve its LOD
-    uint subBatch = ResolveLodPart(subbatchIds[instanceIdx], world, maxScaleSq);
+    uint subBatch = ResolveLodPart(subbatchId, world, maxScaleSq);
     if (subBatch == INVALID_PART)
     {
         visibilityFlags[instanceIdx] = 0;
+        WriteInstanceBounds(instanceIdx, 0, 0, INVALID_PART);
         return;
     }
 
@@ -495,7 +701,10 @@ void CSVisibility(uint3 dispatchThreadId : SV_DispatchThreadID)
     // Transform sphere to world space
     float3 worldCenter = mul(float4(localSphere.xyz, 1.0), world).xyz;
     float worldRadius = localSphere.w * sqrt(maxScaleSq);
-    
+
+    // For the point light shadow culling; skinned: the bind-pose bounds do not hold the animated pose
+    WriteInstanceBounds(instanceIdx, worldCenter, skinned ? worldRadius * 1.5 : worldRadius, subBatch);
+
     // Frustum test — save result for stats (avoid redundant re-evaluation)
     bool frustumVisible = IsVisible(worldCenter, worldRadius);
     bool hiZOccluded = false;
@@ -1072,21 +1281,10 @@ void CSVisibilityShadow4(uint3 dispatchThreadId : SV_DispatchThreadID)
         return;
     }
     
-    // Load instance data ONCE (instead of 4× in separate dispatches)
-    StructuredBuffer<InstanceDescriptor> descriptors = ResourceDescriptorHeap[DescriptorBufferIdx];
-    StructuredBuffer<row_major float4x4> transforms = ResourceDescriptorHeap[GlobalTransformsIdx];
-    StructuredBuffer<MeshPartEntry> meshRegistry = ResourceDescriptorHeap[MeshRegistryIdx];
-    StructuredBuffer<uint> subbatchIds = ResourceDescriptorHeap[SubbatchIdsIdx];
-    
-    uint transformSlot = descriptors[instanceIdx].TransformSlot;
-    row_major float4x4 world = transforms[transformSlot];
-
-    float maxScaleSq = max(dot(world[0].xyz, world[0].xyz),
-                       max(dot(world[1].xyz, world[1].xyz),
-                           dot(world[2].xyz, world[2].xyz)));
-
-    // Same LOD as the main view (resolved from the main camera, not the light)
-    uint meshPartId = ResolveLodPart(subbatchIds[instanceIdx], world, maxScaleSq);
+    // World sphere and LOD part, found once for all four cascades (the camera's InstanceBounds when slot 38 is set)
+    float3 worldCenter;
+    float worldRadius;
+    uint meshPartId = ShadowCasterSphere(instanceIdx, worldCenter, worldRadius);
     if (meshPartId == INVALID_PART)
     {
         combinedVis[instanceIdx] = 0;
@@ -1094,21 +1292,49 @@ void CSVisibilityShadow4(uint3 dispatchThreadId : SV_DispatchThreadID)
         return;
     }
 
-    // Transform sphere to world space (done ONCE)
-    float4 localSphere = meshRegistry[meshPartId].LocalBounds;
-    float3 worldCenter = mul(float4(localSphere.xyz, 1.0), world).xyz;
-    float worldRadius = localSphere.w * sqrt(maxScaleSq);
-    
-    // Inflate for skinned meshes (same as CSVisibilityShadow)
-    if (descriptors[instanceIdx].BoneBufferIdx != 0)
-        worldRadius *= 1.5;
-    
     // Test all cascade frustums + shadow Hi-Z occlusion; past the first cascade, small casters are left out
     bool vis0 = IsVisibleShadow(worldCenter, worldRadius, 0) && !IsOccludedShadow(worldCenter, worldRadius, 0);
     bool vis1 = CoversShadowTexels(worldRadius, 1) && IsVisibleShadow(worldCenter, worldRadius, 1) && !IsOccludedShadow(worldCenter, worldRadius, 1);
     bool vis2 = CoversShadowTexels(worldRadius, 2) && IsVisibleShadow(worldCenter, worldRadius, 2) && !IsOccludedShadow(worldCenter, worldRadius, 2);
     bool vis3 = CoversShadowTexels(worldRadius, 3) && IsVisibleShadow(worldCenter, worldRadius, 3) && !IsOccludedShadow(worldCenter, worldRadius, 3);
-    
+
+    // Receiver mask (slot 39): the entries whose caster shades nothing the camera sees through that cascade are
+    // counted (RECEIVER_MODE_COUNT), and left out with RECEIVER_MODE_CULL
+    if (ShadowReceiversUAVIdx != 0)
+    {
+        RWStructuredBuffer<uint> receivers = ResourceDescriptorHeap[ShadowReceiversUAVIdx];
+        float marginUV = asfloat(receivers[RECEIVER_MARGIN]);
+        bool shades0 = vis0 && ShadesReceivers(receivers, worldCenter, worldRadius, 0, marginUV);
+        bool shades1 = vis1 && ShadesReceivers(receivers, worldCenter, worldRadius, 1, marginUV);
+        bool shades2 = vis2 && ShadesReceivers(receivers, worldCenter, worldRadius, 2, marginUV);
+        bool shades3 = vis3 && ShadesReceivers(receivers, worldCenter, worldRadius, 3, marginUV);
+
+        StructuredBuffer<MeshPartEntry> meshRegistry = ResourceDescriptorHeap[MeshRegistryIdx];
+        uint triangles = meshRegistry[meshPartId].VertexCount / 3u;    // VertexCount = indices (vertex pulling)
+        CountReceiverEntries(receivers, 0, vis0, shades0, triangles);
+        CountReceiverEntries(receivers, 1, vis1, shades1, triangles);
+        CountReceiverEntries(receivers, 2, vis2, shades2, triangles);
+        CountReceiverEntries(receivers, 3, vis3, shades3, triangles);
+
+        bool inAny = vis0 || vis1 || vis2 || vis3;
+        bool cutFromAll = inAny && !(shades0 || shades1 || shades2 || shades3);
+        uint instances = WaveActiveCountBits(inAny);
+        uint instancesCut = WaveActiveCountBits(cutFromAll);
+        if (WaveIsFirstLane() && instances > 0)
+        {
+            InterlockedAdd(receivers[RECEIVER_INSTANCES], instances);
+            InterlockedAdd(receivers[RECEIVER_INSTANCES_CUT], instancesCut);
+        }
+
+        if (receivers[RECEIVER_MODE] == RECEIVER_MODE_CULL)
+        {
+            vis0 = shades0;
+            vis1 = shades1;
+            vis2 = shades2;
+            vis3 = shades3;
+        }
+    }
+
     // Combined visibility (union) — drives stream compaction.
     // 0 = culled, otherwise resolved MeshPartId + 1
     combinedVis[instanceIdx] = (vis0 || vis1 || vis2 || vis3) ? (meshPartId + 1u) : 0u;
@@ -1285,30 +1511,16 @@ void CSVisibilityLocalShadows(uint3 dispatchThreadId : SV_DispatchThreadID)
     RWStructuredBuffer<uint> combinedVis = ResourceDescriptorHeap[CombinedShadowVisIdx];
     RWStructuredBuffer<uint4> masks = ResourceDescriptorHeap[LocalShadowMaskIdx];
 
-    StructuredBuffer<InstanceDescriptor> descriptors = ResourceDescriptorHeap[DescriptorBufferIdx];
-    StructuredBuffer<row_major float4x4> transforms = ResourceDescriptorHeap[GlobalTransformsIdx];
-    StructuredBuffer<MeshPartEntry> meshRegistry = ResourceDescriptorHeap[MeshRegistryIdx];
-    StructuredBuffer<uint> subbatchIds = ResourceDescriptorHeap[SubbatchIdsIdx];
-
-    row_major float4x4 world = transforms[descriptors[instanceIdx].TransformSlot];
-    float maxScaleSq = max(dot(world[0].xyz, world[0].xyz),
-                       max(dot(world[1].xyz, world[1].xyz),
-                           dot(world[2].xyz, world[2].xyz)));
-
-    // Same LOD as the main view
-    uint meshPartId = ResolveLodPart(subbatchIds[instanceIdx], world, maxScaleSq);
+    // The sphere and LOD part (the camera's InstanceBounds when slot 38 is set)
+    float3 worldCenter;
+    float worldRadius;
+    uint meshPartId = ShadowCasterSphere(instanceIdx, worldCenter, worldRadius);
     if (meshPartId == INVALID_PART)
     {
         combinedVis[instanceIdx] = 0;
         masks[instanceIdx] = 0;
         return;
     }
-
-    float4 localSphere = meshRegistry[meshPartId].LocalBounds;
-    float3 worldCenter = mul(float4(localSphere.xyz, 1.0), world).xyz;
-    float worldRadius = localSphere.w * sqrt(maxScaleSq);
-    if (descriptors[instanceIdx].BoneBufferIdx != 0)
-        worldRadius *= 1.5; // skinned: the bind-pose bounds do not hold the animated pose
 
     StructuredBuffer<LocalShadowLight> lights = ResourceDescriptorHeap[LocalShadowLightsIdx];
     StructuredBuffer<LocalShadowView> views = ResourceDescriptorHeap[LocalShadowViewsIdx];

@@ -79,6 +79,12 @@ namespace Freefall.Components
         /// Current shadow VP buffer SRV index (for custom actions).
         /// </summary>
         public static uint CurrentCascadeSrvIndex { get; set; }
+
+        /// <summary>
+        /// This frame's sun shadow receivers (ShadowReceivers.Build) for the cascade culling's push constant slot 39;
+        /// 0 = none: the culling tests nothing.
+        /// </summary>
+        public static uint CurrentShadowReceiversUav { get; private set; }
         
         // TEMP DEBUG: VP-only buffer SRV for A/B testing
         public static uint CurrentVPOnlySrvIndex { get; set; }
@@ -290,6 +296,7 @@ namespace Freefall.Components
 
         private void DrawShadows(ID3D12GraphicsCommandList commandList)
         {
+            CurrentShadowReceiversUav = 0;   // built below on the CPU-cascade path only
             var camera = Camera.Main;
             if (camera == null) return;
             
@@ -364,9 +371,8 @@ namespace Freefall.Components
                     CurrentCascadeSrvIndex = cascadeSRV;
                     CurrentVPOnlySrvIndex = _vpOnlySrvIndices != null ? _vpOnlySrvIndices[frameIndex] : 0;
                     
-                    foreach (var batch in allBatches)
-                        batch.CullShadowAll(commandList, cascadeSRV, cascadeCBAddr, shadowHiZSrv, culler, minCasterClip);
-                    
+                    InstanceBatch.CullShadowAll(commandList, allBatches, cascadeSRV, cascadeCBAddr, shadowHiZSrv, culler, minCasterClip);
+
                     commandList.OMSetRenderTargets(0, (CpuDescriptorHandle[]?)null, false, shadowTex.FullArrayDsvHandle);
                     
                     foreach (var batch in allBatches)
@@ -444,13 +450,16 @@ namespace Freefall.Components
                     var shadowPyramid = DeferredRenderer.Current?.ShadowHiZPyramid;
                     uint shadowHiZSrv = (shadowPyramid?.Ready == true) ? shadowPyramid.FullSRV : 0;
                     
+                    // Where this frame's visible surfaces sample each cascade (the opaque pass has written the linear
+                    // depth): the culling tests every cascade entry against it (EngineSettings.ShadowReceiverCulling)
+                    var renderer = DeferredRenderer.Current!;
+                    CurrentShadowReceiversUav = renderer.ShadowReceivers?.Build(commandList, camera, renderer,
+                        cascadeSrv, CascadeCount, shadowTex.Width) ?? 0;
+
                     // Cull all cascades for each batch using unified visibility pass
                     ulong cascadeCBAddr = _shadowCascadeCBs![frameIndex].Native.GPUVirtualAddress;
                     PixMarker.Begin(commandList, "Shadow culling");
-                    foreach (var batch in allBatches)
-                    {
-                        batch.CullShadowAll(commandList, cascadeSrv, cascadeCBAddr, shadowHiZSrv, culler, minCasterClip);
-                    }
+                    InstanceBatch.CullShadowAll(commandList, allBatches, cascadeSrv, cascadeCBAddr, shadowHiZSrv, culler, minCasterClip);
                     PixMarker.End(commandList);
 
                     // Phase 3: True single-pass draw — 1 ExecuteIndirect per batch for all cascades

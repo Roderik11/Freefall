@@ -92,11 +92,14 @@ namespace Freefall.Graphics
         /// Upload dirty slots to the current frame's GPU buffer. O(D) where D = dirty count.
         /// Call once per frame before GPU dispatch.
         /// </summary>
-        public void Upload()
+        /// <param name="uploadedBits">Optional, one bit per slot (at least Capacity bits): the bits of the slots written
+        /// are set. The caller clears them.</param>
+        /// <returns>The number of slots written.</returns>
+        public int Upload(uint[]? uploadedBits = null)
         {
             int frame = Engine.FrameIndex % FrameCount;
 
-            if (!_anyDirty[frame]) return;
+            if (!_anyDirty[frame]) return 0;
 
             HashSet<int> dirty;
             lock (_dirtySlots[frame])
@@ -109,12 +112,17 @@ namespace Freefall.Graphics
             {
                 dst[slot] = _staging[slot];
             }
+            if (uploadedBits != null)
+                foreach (int slot in dirty)
+                    uploadedBits[slot >> 5] |= 1u << (slot & 31);
+            int count = dirty.Count;
 
             lock (_dirtySlots[frame])
             {
                 dirty.Clear();
                 _anyDirty[frame] = false;
             }
+            return count;
         }
 
         /// <summary>

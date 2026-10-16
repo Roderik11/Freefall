@@ -99,7 +99,18 @@ namespace Freefall.Graphics
 
         /// <summary>Point light shadows: the local shadow atlas and the lights picked for it each frame.</summary>
         public LocalShadows? LocalShadows { get; private set; }
-        
+
+        /// <summary>Sun shadow receivers: this frame's visible surfaces per cascade tile, tested by the cascade culling.</summary>
+        public ShadowReceivers? ShadowReceivers { get; private set; }
+
+        /// <summary>
+        /// This frame's visible point lights (RWStructuredBuffer&lt;PointLightData&gt; UAV) and their count
+        /// (RWByteAddressBuffer UAV, [0]) once the light cull has run, else 0 and 0: the shadow receivers mark the sun
+        /// samples the shadow selection takes around each.
+        /// </summary>
+        internal (uint lights, uint count) VisiblePointLights =>
+            _pointLightsCulled ? (_visibleLights!.UavIndex, _visibleLightCount!.UavIndex) : (0u, 0u);
+
         private bool _isFirstFrame = true;
         private bool _compositeSnapshotFirstFrame = true;
         
@@ -187,6 +198,9 @@ namespace Freefall.Graphics
 
             // Point light shadows (own atlas, independent of the cascades)
             LocalShadows = new LocalShadows();
+
+            // Where visible surfaces sample the cascades, for the cascade culling (DirectionalLight.DrawShadows)
+            ShadowReceivers = new ShadowReceivers();
 
             // Hi-Z pyramid (matched to depth buffer size)
             HiZPyramid = new HiZPyramid();
@@ -538,6 +552,10 @@ namespace Freefall.Graphics
                  PixMarker.End(list); // Opaque
              }
 
+             // Point lights: the GPU culls the light registry into this frame's visible list. Before the shadow pass,
+             // whose receiver culling keeps the sun samples the shadow selection (2b) takes around each visible light.
+             _pointLightsCulled = CullPointLights(camera, list);
+
              // 2. Shadow pass — uses opaque batches (now built) for CullShadow/DrawShadow
              //    Must run AFTER Opaque so InstanceBatch GPU state is valid.
              //    Only when shadows are on and a light queued its cascades (DirectionalLight.Draw, above);
@@ -593,10 +611,8 @@ namespace Freefall.Graphics
                  PixMarker.End(list); // Shadows
              }
 
-             // 2b. Point lights: the GPU culls the light registry into this frame's visible list, then picks the
-             //     shadowed ones and renders their faces into their own atlas (independent of the sun's cascades).
-             //     No point light shadows in daylight.
-             _pointLightsCulled = CullPointLights(camera, list);
+             // 2b. Point lights: picks the shadowed ones out of the visible list (culled above) and renders their faces
+             //     into their own atlas (independent of the sun's cascades). No point light shadows in daylight.
              if (LocalShadows != null)
              {
                  if (_pointLightsCulled && Engine.Settings.EnableShadows && Engine.Settings.MaxShadowedPointLights > 0)
@@ -1397,6 +1413,7 @@ namespace Freefall.Graphics
 
             ShadowTextureArray?.Dispose();
             LocalShadows?.Dispose();
+            ShadowReceivers?.Dispose();
             ScreenSpaceShadows?.Dispose();
             foreach (var tracer in _pointScreenShadows) tracer?.Dispose();
             Gtao?.Dispose();

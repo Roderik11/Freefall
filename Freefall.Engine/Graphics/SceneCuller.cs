@@ -204,6 +204,9 @@ namespace Freefall.Graphics
             commandList.SetComputeRoot32BitConstant(0, Material.MaterialsBufferIndex, 25);
             commandList.SetComputeRoot32BitConstant(0, _histogramUAVIndices[f], 26);
             commandList.SetComputeRoot32BitConstant(0, (uint)MeshRegistry.Count, 27);
+            commandList.SetComputeRoot32BitConstant(0, 0u, 38);    // InstanceBoundsUAVIdx: the scene culler keeps none
+            commandList.SetComputeRoot32BitConstant(0, 0u, 28);    // VisibilityCacheIdx: no transform cache, gather
+            commandList.SetComputeRoot32BitConstant(0, 0u, 29);    // ChangedSlotsIdx
 
             // Clear UAVs
             commandList.ClearUnorderedAccessViewUint(
@@ -422,6 +425,8 @@ namespace Freefall.Graphics
             commandList.SetComputeRoot32BitConstant(0, Material.MaterialsBufferIndex, 25);
             commandList.SetComputeRoot32BitConstant(0, (uint)MeshRegistry.Count, 27);
             commandList.SetComputeRoot32BitConstant(0, cascadeBufferSrv, 31);                         // CascadeBufferSRVIdx
+            commandList.SetComputeRoot32BitConstant(0, 0u, 38);                                       // InstanceBoundsUAVIdx: none, gather
+            commandList.SetComputeRoot32BitConstant(0, 0u, 39);                                       // ShadowReceiversUAVIdx: no receiver test
 
             // Phase 1: Unified visibility (all 4 cascades)
             commandList.SetComputeRoot32BitConstant(0, _shadowVisibilityUAVIndices[f, 0], 24);        // CombinedShadowVisIdx

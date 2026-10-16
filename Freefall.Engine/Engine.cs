@@ -450,6 +450,14 @@ namespace Freefall
         RCDebug = 7
     }
 
+    /// <summary>EngineSettings.ShadowReceiverCulling</summary>
+    public enum ShadowReceiverCulling
+    {
+        Off = 0,
+        Count = 1,      // receiver pass + counts only
+        On = 2,         // entries that shade no receiver are left out of the cascades
+    }
+
     public class EngineSettings
     {
          [Category("Display")]
@@ -481,6 +489,13 @@ namespace Freefall
          /// </summary>
          [ValueRange(0f, 16f)]
          public float ShadowMinCasterTexels { get; set; } = 4f;
+
+         /// <summary>
+         /// Receiver-mask caster culling (ShadowReceivers): a cascade entry whose caster lies deeper than every
+         /// visible receiver under its footprint darkens nothing on screen. On = such entries are left out of the
+         /// cascades; Count = the receiver pass only counts them (engine_stats: sunShadowReceivers).
+         /// </summary>
+         public ShadowReceiverCulling ShadowReceiverCulling { get; set; } = ShadowReceiverCulling.On;
          public bool UseAdaptiveSplits { get; set; } = true;                // F4 - SDSM adaptive cascade splits
 
          [ValueRange(3, 8)]

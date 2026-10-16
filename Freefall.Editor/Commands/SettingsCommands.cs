@@ -118,6 +118,8 @@ namespace Freefall.Editor.Commands
                 particlePoolSlots = Freefall.Base.Systems.Get<ParticleSystem>()?.PoolSlots ?? 0,
                 // Point light shadows, per renderer: the lights picked last frame, their tile size, faces and fade
                 pointShadows = Freefall.Graphics.LocalShadows.DescribeAll(),
+                // Sun cascades: entries whose caster shades no visible receiver (EngineSettings.ShadowReceiverCulling)
+                sunShadowReceivers = Freefall.Graphics.ShadowReceivers.DescribeAll(),
                 // System tree in update order, one "Name  ms" line per system (indent = nesting)
                 systems = Freefall.Base.Systems.Describe().Split('\n', StringSplitOptions.RemoveEmptyEntries)
             });

@@ -28,6 +28,10 @@ namespace Freefall.Graphics
         private static string? _directory;
         private static bool _isSourceDirectory;
 
+        // Numbers the reload lines: the console drops a line equal to the one before it, so a second
+        // "Reloaded x.hlsl" in a row would not show and the reload would look ignored
+        private static int _reloads;
+
         /// <summary>Directory engine shaders are loaded from.</summary>
         public static string Directory
         {
@@ -186,7 +190,7 @@ namespace Freefall.Graphics
                     var sw = System.Diagnostics.Stopwatch.StartNew();
                     effect.Reload();
                     int materials = Material.RebuildForEffect(effect.Name);
-                    Debug.LogAlways($"[ShaderHotReload] Reloaded {effect.Name}.fx ({materials} material(s), {sw.ElapsedMilliseconds} ms)");
+                    Debug.LogAlways($"[ShaderHotReload] Reloaded {effect.Name}.fx ({materials} material(s), {sw.ElapsedMilliseconds} ms, reload {++_reloads})");
                 }
                 catch (IOException)
                 {
@@ -215,7 +219,7 @@ namespace Freefall.Graphics
                 try
                 {
                     if (cs.Reload())
-                        Debug.LogAlways($"[ShaderHotReload] Reloaded {cs.FileName}");
+                        Debug.LogAlways($"[ShaderHotReload] Reloaded {cs.FileName} (reload {++_reloads})");
                 }
                 catch (IOException)
                 {

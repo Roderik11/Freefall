@@ -16,6 +16,15 @@ namespace Freefall.Graphics
         private StreamingBuffer<Matrix4x4> _transforms;
         private StreamingBuffer<uint> _materials;
 
+        // The slots uploaded this tick, one bit per slot (cull_instances.hlsl ChangedSlotsIdx): the camera culling's
+        // transform cache (InstanceBatch) reads an instance's transform again only when its slot's bit is set. A tick
+        // that renders several views uploads once per view; the bits are the union of them. A Set reaches each of the
+        // three frame buffers at its next upload, so a slot changed once is set in the bits of the next ticks too.
+        private StreamingBuffer<uint> _uploadedSlots;
+        private uint[] _uploadedBits = Array.Empty<uint>();
+        private int _uploadedTick = -1;
+        private int _uploadedCount;
+
         // Slot allocation. Slots are allocated lazily on first Transform.TransformSlot access, which
         // happens inside the parallel draw loop (ComponentCache.Draw) — the allocator must be thread-safe.
         private readonly object _slotLock = new();
@@ -41,6 +50,13 @@ namespace Freefall.Graphics
         /// </summary>
         public uint MaterialSrvIndex => _materials.SrvIndex;
 
+        /// <summary>
+        /// Bindless SRV index of the bits of the slots uploaded this tick (StructuredBuffer&lt;uint&gt;, one bit per slot),
+        /// or 0 when no slot was uploaded this tick.
+        /// </summary>
+        public uint ChangedSlotsSrvIndex =>
+            _uploadedTick == Engine.TickCount && _uploadedCount > 0 ? _uploadedSlots.SrvIndex : 0;
+
         public static void Initialize(GraphicsDevice device)
         {
             Instance = new TransformBuffer(device);
@@ -51,6 +67,7 @@ namespace Freefall.Graphics
         {
             _transforms = new StreamingBuffer<Matrix4x4>(device, InitialCapacity);
             _materials = new StreamingBuffer<uint>(device, InitialCapacity);
+            _uploadedSlots = new StreamingBuffer<uint>(device, InitialCapacity / 32);
         }
 
         /// <summary>
@@ -142,7 +159,23 @@ namespace Freefall.Graphics
         /// </summary>
         public void Upload()
         {
-            _transforms.Upload();
+            if (_uploadedTick != Engine.TickCount)
+            {
+                if (_uploadedCount > 0)
+                    Array.Clear(_uploadedBits);
+                _uploadedCount = 0;
+                _uploadedTick = Engine.TickCount;
+            }
+            int words = (_transforms.Capacity + 31) / 32;
+            if (_uploadedBits.Length < words)
+                Array.Resize(ref _uploadedBits, words);
+
+            int uploaded = _transforms.Upload(_uploadedBits);
+            if (uploaded > 0)
+            {
+                _uploadedCount += uploaded;
+                _uploadedSlots.BulkWrite(_uploadedBits);
+            }
             _materials.Upload();
             StreamingBuffer<Matrix4x4>.FlushDeferredDisposals();
         }
@@ -151,6 +184,7 @@ namespace Freefall.Graphics
         {
             _transforms?.Dispose();
             _materials?.Dispose();
+            _uploadedSlots?.Dispose();
         }
     }
 }
