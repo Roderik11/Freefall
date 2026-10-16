@@ -30,7 +30,8 @@ namespace Freefall.Editor
             camera.FarPlane = 16384;
             cameraEntity.AddComponent<EditorCamera>();
             cameraEntity.AddComponent<EditorTools>();
-            cameraEntity.AddComponent<AudioListener>();
+            // Outside play sounds are heard from the viewport, not from the scene's game camera
+            cameraEntity.AddComponent<AudioListener>().Activate();
             cameraEntity.AddComponent<Hologrid>();
             camera.Activate();
             Camera = camera;
