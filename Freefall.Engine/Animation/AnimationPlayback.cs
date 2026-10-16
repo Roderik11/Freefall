@@ -89,6 +89,9 @@ namespace Freefall.Animation
         public const int ReturnTo      = 6;
         public const int Serial        = 7;
         public const int PreviousFade  = 8;
+        public const int TransBlend    = 9;   // TransitionBlend of the running transition
+        public const int PreviousTime  = 10;  // seconds the interrupted transition had run
+        public const int PreviousBlend = 11;  // ... and its TransitionBlend
 
         static long Key(long id, uint category, uint field)
             => (id << 32) | (category | field);

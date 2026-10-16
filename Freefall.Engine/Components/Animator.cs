@@ -906,31 +906,255 @@ namespace Freefall.Components
             /// <summary>Progress of the running transition, 1 when settled.</summary>
             public float Fade;
 
+            /// <summary>Seconds since the running transition started, its length, and whether it is <see cref="TransitionBlend.Inertial"/>.</summary>
+            public float Elapsed, Duration;
+            public bool Inertial;
+
             /// <summary>A transition started since the last pose: this pose records what is carried over.</summary>
             public bool Capturing;
             public int Serial;
 
             /// <summary>While capturing: the state the transition left, and how far the one it interrupted had come.</summary>
             public AnimationState Previous;
-            public float PreviousFade;
+            public float PreviousFade, PreviousElapsed;
+            public bool PreviousInertial;
 
             /// <summary>The layer's own model-space rotations along <see cref="MaskChain"/>, for ModelSpace.</summary>
             public Quaternion[] ModelRot;
 
-            /// <summary>The pose the layer showed per bone, last time it was posed.</summary>
+            /// <summary>The pose the layer showed per bone, last time it was posed, and in which frame.</summary>
             public BonePose[] Last;
             public bool HasLast;
+            public long LastFrame;
 
             /// <summary>
-            /// Per bone, what the layer showed when the transition started relative to its new state:
-            /// rotation as a factor after the state's own, position and scale as differences.
+            /// Per bone, what the layer showed when the transition started relative to its new state.
             /// Valid once a pose has captured it for the running transition.
             /// </summary>
-            public BonePose[] Offset;
+            public BoneOffset[] Offset;
             public bool HasOffset;
+
+            /// <summary>
+            /// An inertial transition was captured in the last pose: the rates its offsets start
+            /// with are worked out in the next, once the new state has moved on by a frame.
+            /// </summary>
+            public bool RatesPending;
 
             /// <summary>How much of the layer was playing last time, and when the transition started.</summary>
             public float Coverage, FromCoverage;
+        }
+
+        /// <summary>
+        /// What a transition carries over at one bone: the difference between the pose the layer
+        /// showed when it started and its new state's pose, and for an inertial transition how fast
+        /// that difference was changing.
+        /// </summary>
+        private struct BoneOffset
+        {
+            /// <summary>Rotation as a factor after the state's own, position and scale as differences.</summary>
+            public Quaternion Rotation;
+            public Vector3 Position, Scale;
+
+            /// <summary>
+            /// Inertial: the rotation as a rotation vector (axis × radians), the rate it and the
+            /// position change at the start, per second, and when each comes to rest: the
+            /// transition's length, or sooner where the bone already heads for the new pose so fast
+            /// that it would go past it.
+            /// </summary>
+            public Vector3 Turn, TurnRate, PositionRate;
+            public float TurnTime, PositionTime;
+
+            /// <summary>The transition's length: scale goes in that time, starting still.</summary>
+            public float Length;
+
+            /// <summary>
+            /// Until the rates are worked out (the pose after the switch): the pose the layer would
+            /// have shown at the switch, with <see cref="TurnRate"/> and <see cref="PositionRate"/>
+            /// holding how fast it was moving then, in the bone's own space and its parent's.
+            /// </summary>
+            public Quaternion FromRotation;
+            public Vector3 FromPosition;
+
+            /// <summary>Whether that motion is known; not for a pose that jumped, whose offset starts still.</summary>
+            public bool Moving;
+        }
+
+        // A bone of a pose that was moving faster than this (radians a second, and lengths of the
+        // skeleton a second) jumped: it was cut to, or its clip started over. Nothing of that rate is
+        // carried on. The DoubleL clips turn a joint by up to about 27 rad/s (a head snapped back
+        // by a hit, the toes in a run).
+        private const float MaxTurnRate = 40f;
+        private const float MaxPositionRate = 8f;
+
+        private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<Skeleton, System.Runtime.CompilerServices.StrongBox<float>> s_size = new();
+
+        /// <summary>
+        /// The longest chain of a skeleton from its root, added up from the bones' own offsets: what
+        /// position rates are measured by, in the units the bones' positions are in (centimetres on
+        /// a rig whose root scales them down).
+        /// </summary>
+        private static float SizeOf(Skeleton skeleton) => s_size.GetValue(skeleton, static s =>
+        {
+            var bones = s.Bones;
+            var chain = new float[bones.Length];
+            float longest = 0f;
+            for (int i = 0; i < bones.Length; i++)
+            {
+                float length = bones[i].BindPose.Position.Length();
+                chain[i] = bones[i].Parent >= 0 ? chain[bones[i].Parent] + length : length;
+                longest = MathF.Max(longest, chain[i]);
+            }
+            return new System.Runtime.CompilerServices.StrongBox<float>(longest > 0f ? longest : 1f);
+        }).Value;
+
+        /// <summary>
+        /// The inertial decay of an offset: a quintic from <paramref name="x0"/>, moving at
+        /// <paramref name="v0"/> and not speeding up or slowing down yet, to rest at zero at
+        /// <paramref name="t1"/> with no speed or acceleration left. Per component it is
+        /// (1-s)^3 (x0 (1 + 3s + 6s^2) + v0 t (1 + 3s)) for s = t/t1: with v0 = 0 the eased fade
+        /// of smootherstep, and v0 t (1-s)^3 (1+3s) on top. Along x0 it never crosses zero as long
+        /// as v0 t1 does not head back by more than 2.5 x0 (<see cref="Settle"/>).
+        ///
+        /// It is Bollo's inertialization (GDC 2018) with the free coefficient spent on the start
+        /// instead of the end: his curve, (1-s)^4 (x0 (1+4s) + v0 t), comes to rest without jerk
+        /// but leaves with an acceleration of -20 x0 / t1^2. For the 0.06-0.3 s transitions of a
+        /// game at 60 frames a second that drops a fifth of the offset in the first frame of a
+        /// 0.1 s transition, which shows as a jump again; this one keeps the old motion going
+        /// through the first frames (RetargetLab --inertia).
+        /// </summary>
+        private static Vector3 Decay(Vector3 x0, Vector3 v0, float t, float t1)
+        {
+            if (t >= t1) return Vector3.Zero;
+            if (t <= 0f) return x0;
+            float s = t / t1;
+            float k = 1f - s;
+            return (x0 * (1f + 3f * s + 6f * s * s) + v0 * (t * (1f + 3f * s))) * (k * k * k);
+        }
+
+        /// <summary>
+        /// The time a decay takes, shortened where its rate heads back towards zero faster than
+        /// 2.5 x0 / t1 (the overshoot clamp of inertialization): it comes to rest sooner instead
+        /// of going past.
+        /// </summary>
+        private static float Settle(Vector3 x0, Vector3 v0, float t1)
+        {
+            float along = Vector3.Dot(x0, v0);
+            if (along >= 0f) return t1;
+            return MathF.Min(t1, -2.5f * x0.LengthSquared() / along);
+        }
+
+        /// <summary>A rotation as axis × radians, from the quaternion as it is (the long way round when W is negative).</summary>
+        private static Vector3 RotationVector(Quaternion q)
+        {
+            var axis = new Vector3(q.X, q.Y, q.Z);
+            float sine = axis.Length();
+            if (sine < 1e-7f) return axis * (q.W < 0f ? -2f : 2f);
+            return axis * (2f * MathF.Atan2(sine, q.W) / sine);
+        }
+
+        private static Quaternion FromRotationVector(Vector3 v)
+        {
+            float angle = v.Length();
+            if (angle < 1e-7f) return Quaternion.Identity;
+            var (sine, cosine) = MathF.SinCos(angle * 0.5f);
+            return new Quaternion(v * (sine / angle), cosine);
+        }
+
+        /// <summary>
+        /// The offset a transition leaves at one bone at a time of it: what is left of the
+        /// difference by the eased fade, or by the inertial decay.
+        /// </summary>
+        private static void ApplyOffset(in BoneOffset offset, ref BonePose pose, bool inertial, float elapsed, float remaining)
+        {
+            if (inertial)
+            {
+                var turn = Decay(offset.Turn, offset.TurnRate, elapsed, offset.TurnTime);
+                if (turn != Vector3.Zero) pose.Rotation = pose.Rotation * FromRotationVector(turn);
+                pose.Position += Decay(offset.Position, offset.PositionRate, elapsed, offset.PositionTime);
+                pose.Scale += Decay(offset.Scale, Vector3.Zero, elapsed, offset.Length);
+            }
+            else
+            {
+                pose.Rotation = pose.Rotation * Quaternion.Lerp(Quaternion.Identity, offset.Rotation, remaining);
+                pose.Position += offset.Position * remaining;
+                pose.Scale += offset.Scale * remaining;
+            }
+        }
+
+        /// <summary>
+        /// Start an inertial offset at the switch: the difference as a rotation vector, and how
+        /// fast the layer's pose was moving into the one it would show now (from the one it showed
+        /// last frame). The rates of the offset itself follow in <see cref="ResolveRates"/>.
+        /// </summary>
+        private static void BeginInertia(ref BoneOffset offset, in BonePose reference, in BonePose last, bool fresh, float duration, float size)
+        {
+            var rotation = offset.Rotation;
+            if (rotation.W < 0f) rotation = -rotation;
+            offset.Turn = RotationVector(rotation);
+            offset.TurnTime = offset.PositionTime = offset.Length = duration;
+            offset.FromRotation = reference.Rotation;
+            offset.FromPosition = reference.Position;
+            offset.TurnRate = offset.PositionRate = Vector3.Zero;
+            offset.Moving = false;
+
+            float dt = Base.Time.SmoothDelta;
+            if (!fresh || dt <= 0f) return;
+
+            var step = Quaternion.Inverse(last.Rotation) * reference.Rotation;
+            if (step.W < 0f) step = -step;
+            var turnRate = RotationVector(step) / dt;
+            var positionRate = (reference.Position - last.Position) / dt;
+
+            float maxPosition = MaxPositionRate * size;
+            if (turnRate.LengthSquared() > MaxTurnRate * MaxTurnRate || positionRate.LengthSquared() > maxPosition * maxPosition)
+                return;
+
+            offset.TurnRate = turnRate;
+            offset.PositionRate = positionRate;
+            offset.Moving = true;
+        }
+
+        /// <summary>
+        /// The first pose after an inertial switch, with the new state <paramref name="state"/>
+        /// (sampled without the offset) moved on by <paramref name="elapsed"/>: the offset's rates
+        /// are those that keep the bone going where the pose it left was heading, the pose left
+        /// moving on as it was minus the new state's own motion. Where it heads back to the new
+        /// pose so fast it would go past it, it comes to rest sooner (<see cref="Settle"/>).
+        /// </summary>
+        private static void ResolveRates(ref BoneOffset offset, in BonePose state, float elapsed, float size)
+        {
+            if (!offset.Moving)
+            {
+                offset.TurnRate = offset.PositionRate = Vector3.Zero;
+                return;
+            }
+            offset.Moving = false;
+
+            // Where the pose left would be by now, had it kept moving as it did
+            var ahead = offset.FromRotation * FromRotationVector(offset.TurnRate * elapsed);
+            var aheadPosition = offset.FromPosition + offset.PositionRate * elapsed;
+
+            // Its difference to the new state now, on the same side of the sphere as the one at the
+            // switch so the two subtract without a turn's jump
+            var rotation = offset.Rotation.W < 0f ? -offset.Rotation : offset.Rotation;
+            var now = Quaternion.Inverse(state.Rotation) * ahead;
+            if (Quaternion.Dot(now, rotation) < 0f) now = -now;
+
+            var turnRate = (RotationVector(now) - offset.Turn) / elapsed;
+            var positionRate = (aheadPosition - state.Position - offset.Position) / elapsed;
+
+            // The new state jumped in its first frame (its clip started over): nothing to match
+            float maxPosition = 2f * MaxPositionRate * size;
+            if (turnRate.LengthSquared() > 4f * MaxTurnRate * MaxTurnRate || positionRate.LengthSquared() > maxPosition * maxPosition)
+            {
+                offset.TurnRate = offset.PositionRate = Vector3.Zero;
+                return;
+            }
+
+            offset.TurnRate = turnRate;
+            offset.PositionRate = positionRate;
+            offset.TurnTime = Settle(offset.Turn, turnRate, offset.TurnTime);
+            offset.PositionTime = Settle(offset.Position, positionRate, offset.PositionTime);
         }
 
         /// <summary>
@@ -943,6 +1167,9 @@ namespace Freefall.Components
 
             /// <summary>The hips of the skeleton, -1 when it has none: clips are posed without their travel there.</summary>
             public int RootBone = -1;
+
+            /// <summary>How far the skeleton reaches from its root (<see cref="SizeOf"/>).</summary>
+            public float Size = 1f;
         }
 
         private PoseState _pose; // the one being built
@@ -957,6 +1184,7 @@ namespace Freefall.Components
         {
             _pose = state;
             _layerHipsTurn = 0f;
+            state.Size = SizeOf(skeleton);
 
             var layers = Animation.Layers;
             if (state.Layers.Length != layers.Count)
@@ -991,13 +1219,17 @@ namespace Freefall.Components
 
                 pose.State = layer.GetCurrent(Playback);
                 pose.Fade = layer.GetFade(Playback);
+                pose.Elapsed = layer.GetTransitionElapsed(Playback);
+                pose.Duration = layer.GetTransitionLength(Playback);
+                pose.Inertial = layer.GetTransitionBlend(Playback) == TransitionBlend.Inertial;
 
                 if (pose.Last == null || pose.Last.Length != boneCount)
                 {
                     pose.Last = new BonePose[boneCount];
-                    pose.Offset = new BonePose[boneCount];
+                    pose.Offset = new BoneOffset[boneCount];
                     pose.HasLast = false;
                     pose.HasOffset = false;
+                    pose.RatesPending = false;
                 }
 
                 // A layer that was switched off has nothing current to blend out of
@@ -1005,6 +1237,7 @@ namespace Freefall.Components
                 {
                     pose.HasLast = false;
                     pose.HasOffset = false;
+                    pose.RatesPending = false;
                 }
 
                 int serial = layer.GetTransitionSerial(Playback);
@@ -1017,6 +1250,8 @@ namespace Freefall.Components
                     pose.FromCoverage = pose.HasLast ? pose.Coverage : 1f;
                     pose.Previous = pose.HasLast ? layer.GetPrevious(Playback) : null;
                     pose.PreviousFade = pose.HasOffset ? layer.GetPreviousFade(Playback) : 1f;
+                    pose.PreviousElapsed = layer.GetPreviousElapsed(Playback);
+                    pose.PreviousInertial = layer.GetPreviousBlend(Playback) == TransitionBlend.Inertial;
                 }
 
                 // Which clips the bones read, at what time and with what share: the same for every
@@ -1049,7 +1284,14 @@ namespace Freefall.Components
                 if (layer.Weight <= 0f) continue;
 
                 layer.HasLast = true;
-                if (layer.Capturing) layer.HasOffset = true;
+                layer.LastFrame = Base.Time.FrameCount;
+                if (layer.Capturing)
+                {
+                    layer.HasOffset = true;
+                    layer.RatesPending = layer.Inertial && layer.Fade < 1f;
+                }
+                else if (layer.Elapsed > 0f || layer.Fade >= 1f)
+                    layer.RatesPending = false; // worked out in this pose (BlendLayers)
                 layer.Previous = null;
             }
         }
@@ -1059,10 +1301,13 @@ namespace Freefall.Components
         ///
         /// A layer plays one state. When a transition starts, the state changes at once and the
         /// layer carries the difference between the pose it was showing and the new state's pose,
-        /// which fades out over the transition. Nothing of the old state is sampled any more, so a
-        /// transition can be interrupted at any point: the next one blends out of whatever is on
-        /// screen. A state that plays nothing stands for the layers below, so a transition to or
-        /// from an empty state fades the layer out or in.
+        /// which goes over the transition: by default it dies away with the motion the old pose had
+        /// (inertialization: the rates are found in the pose after the switch, once the new state
+        /// has moved on by a frame), or it fades out on an eased curve (<see cref="TransitionBlend"/>).
+        /// Nothing of the old state is sampled any more, so a transition can be interrupted at any
+        /// point: the next one blends out of whatever is on screen, motion included. A state that
+        /// plays nothing stands for the layers below, so a transition to or from an empty state
+        /// fades the layer out or in.
         ///
         /// The layer's pose goes on top of the result so far by layer weight × mask weight × how
         /// much of the layer is playing.
@@ -1110,10 +1355,12 @@ namespace Freefall.Components
                             {
                                 if (layer.PreviousFade < 1f)
                                 {
-                                    float left = 1f - layer.PreviousFade;
-                                    reference.Rotation = reference.Rotation * Quaternion.Lerp(Quaternion.Identity, offset.Rotation, left);
-                                    reference.Position += offset.Position * left;
-                                    reference.Scale += offset.Scale * left;
+                                    // Interrupted in the frame after it started: its rates come
+                                    // from the state it led to, as they would have this frame
+                                    if (layer.RatesPending && layer.PreviousInertial && layer.PreviousElapsed > 0f)
+                                        ResolveRates(ref offset, reference, layer.PreviousElapsed, _pose.Size);
+
+                                    ApplyOffset(offset, ref reference, layer.PreviousInertial, layer.PreviousElapsed, 1f - layer.PreviousFade);
                                 }
                             }
                             else
@@ -1127,25 +1374,31 @@ namespace Freefall.Components
                             offset.Rotation = Quaternion.Inverse(pose.Rotation) * reference.Rotation;
                             offset.Position = reference.Position - pose.Position;
                             offset.Scale = reference.Scale - pose.Scale;
+
+                            // Inertial: how fast the layer's pose was moving, from the pose it showed
+                            // last frame, unless that was longer ago (the layer was not posed)
+                            if (layer.Inertial)
+                                BeginInertia(ref offset, reference, layer.Last[boneIndex],
+                                    Base.Time.FrameCount - layer.LastFrame <= 1, layer.Duration, _pose.Size);
                         }
                         else
                         {
-                            offset.Rotation = Quaternion.Identity;
-                            offset.Position = Vector3.Zero;
-                            offset.Scale = Vector3.Zero;
+                            offset = new BoneOffset { Rotation = Quaternion.Identity };
 
                             // To an empty state: this is the pose held while the layer fades out
                             if (hasReference)
                                 layer.Last[boneIndex] = reference;
                         }
                     }
+                    else if (layer.RatesPending && layer.Elapsed > 0f)
+                    {
+                        if (posed) ResolveRates(ref offset, pose, layer.Elapsed, _pose.Size);
+                        else offset.TurnRate = offset.PositionRate = Vector3.Zero;
+                    }
 
                     if (posed)
                     {
-                        float remaining = 1f - layer.Fade;
-                        pose.Rotation = pose.Rotation * Quaternion.Lerp(Quaternion.Identity, offset.Rotation, remaining);
-                        pose.Position += offset.Position * remaining;
-                        pose.Scale += offset.Scale * remaining;
+                        ApplyOffset(offset, ref pose, layer.Inertial, layer.Elapsed, 1f - layer.Fade);
                         coverage = layer.FromCoverage + (1f - layer.FromCoverage) * layer.Fade;
                     }
                     else if (layer.HasLast && layer.FromCoverage > 0f)

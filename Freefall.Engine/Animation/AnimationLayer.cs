@@ -125,7 +125,9 @@ namespace Freefall.Animation
 
         /// <summary>
         /// How far the running transition has come, 0..1 with ease in and out; 1 when none is running.
-        /// The pose carries what is left of the difference to the pose shown when it started.
+        /// A <see cref="TransitionBlend.Fade"/> transition carries what is left of the difference to
+        /// the pose shown when it started by this; an inertial one by its own decay
+        /// (<see cref="GetTransitionElapsed"/>). A layer fading in or out of an empty state follows it either way.
         /// </summary>
         public float GetFade(AnimationPlayback pb)
         {
@@ -138,6 +140,13 @@ namespace Freefall.Animation
             return x * x * (3f - 2f * x);
         }
 
+        /// <summary>Seconds since the running transition started, and how long it lasts (both 0 when none is running).</summary>
+        public float GetTransitionElapsed(AnimationPlayback pb) => GetInTransition(pb) ? GetTransitionTime(pb) : 0f;
+        public float GetTransitionLength(AnimationPlayback pb) => GetInTransition(pb) ? GetTransitionDuration(pb) : 0f;
+
+        /// <summary>How the running transition, or the last one, carries the pose it started from (<see cref="TransitionBlend"/>).</summary>
+        public TransitionBlend GetTransitionBlend(AnimationPlayback pb) => (TransitionBlend)(int)pb.Get(PK.Layer(Index, PK.TransBlend));
+
         /// <summary>Counts the transitions started on one Animator, so a pose can tell a new one has begun.</summary>
         public int GetTransitionSerial(AnimationPlayback pb) => (int)pb.Get(PK.Layer(Index, PK.Serial));
 
@@ -148,6 +157,10 @@ namespace Freefall.Animation
         /// <summary>How far the transition before the last one had come when it was interrupted (1 = it had finished).</summary>
         public float GetPreviousFade(AnimationPlayback pb) => pb.Get(PK.Layer(Index, PK.PreviousFade), 1f);
 
+        /// <summary>How many seconds the transition before the last one had run when it was interrupted, and its blend.</summary>
+        public float GetPreviousElapsed(AnimationPlayback pb) => pb.Get(PK.Layer(Index, PK.PreviousTime));
+        public TransitionBlend GetPreviousBlend(AnimationPlayback pb) => (TransitionBlend)(int)pb.Get(PK.Layer(Index, PK.PreviousBlend));
+
         public int GetStateCount(AnimationPlayback pb) => 1;
 
         public AnimationState GetState(int index, AnimationPlayback pb) => GetCurrentState(pb);
@@ -157,17 +170,21 @@ namespace Freefall.Animation
         /// pose blends out of whatever the layer was showing (Animator.BlendLayers), so a transition
         /// can start at any moment, also in the middle of another one.
         /// </summary>
-        private void StartTransition(Animator animator, AnimationPlayback pb, AnimationState current, AnimationState target, float duration)
+        private void StartTransition(Animator animator, AnimationPlayback pb, AnimationState current, AnimationState target, AnimationTransition transition)
         {
             // The pose blends out of what the layer would have shown this frame: the state it leaves,
             // moved on by this frame, with what was left of a transition it interrupts.
             pb.Set(PK.Layer(Index, PK.PreviousFade), GetFade(pb));
+            pb.Set(PK.Layer(Index, PK.PreviousTime), GetTransitionTime(pb));
+            pb.Set(PK.Layer(Index, PK.PreviousBlend), pb.Get(PK.Layer(Index, PK.TransBlend)));
             pb.Set(PK.Layer(Index, PK.TransSource), current.ID);
             current.Update(animator, pb, false);
 
+            float duration = transition.Duration;
             SetInTransition(pb, duration > 0f);
             SetTransitionTime(pb, 0);
             SetTransitionDuration(pb, duration);
+            pb.Set(PK.Layer(Index, PK.TransBlend), (int)transition.Blend);
             pb.Set(PK.Layer(Index, PK.Serial), pb.Get(PK.Layer(Index, PK.Serial)) + 1);
 
             current.SetWeight(pb, 0);
@@ -244,7 +261,7 @@ namespace Freefall.Animation
 
                 if (target != null)
                 {
-                    StartTransition(animator, pb, currentState, target, transition.Duration);
+                    StartTransition(animator, pb, currentState, target, transition);
                     currentState = target;
                     break;
                 }
