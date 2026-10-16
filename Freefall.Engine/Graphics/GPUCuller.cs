@@ -39,7 +39,9 @@ namespace Freefall.Graphics
         private int _spdKernel, _perMipKernel, _shadowSpdKernel, _shadowPerMipKernel;
         
         // Cached kernel indices for depth_analysis.hlsl
-        private int _depthReduceKernel, _depthHistogramKernel, _computeSplitsKernel;
+        private int _depthBinsKernel, _depthSplitsKernel;
+        private const int DepthBins = 1024;       // DEPTH_BINS in depth_analysis.hlsl
+        private const int DepthTilePixels = 128;  // TILE_PIXELS in depth_analysis.hlsl: one CSDepthBins group each
         
         // Cached kernel index for cascade_compute.hlsl
         private int _cascadeComputeKernel;
@@ -59,7 +61,7 @@ namespace Freefall.Graphics
         // SDSM depth analysis buffers
         private GraphicsBuffer? _depthMinMaxBuffer;            // 2 uints (min, max as float bits)
         private GraphicsBuffer? _depthMinMaxInitBuffer;        // Static upload buffer with init values {MAX_FLOAT, 0}
-        private GraphicsBuffer? _depthHistogramBuffer;         // 256 uints
+        private GraphicsBuffer? _depthHistogramBuffer;         // DepthBins uints
         private GraphicsBuffer? _depthSplitsBuffer;            // 4 floats (SRV + UAV)
         private GraphicsBuffer[]? _depthSplitsReadbackBuffers;  // Per-frame readback
         private bool _sdsmInitialized;
@@ -285,9 +287,8 @@ namespace Freefall.Graphics
                 
                 // SDSM depth analysis
                 _depthAnalysisShader = new ComputeShader("depth_analysis.hlsl");
-                _depthReduceKernel = _depthAnalysisShader.FindKernel("CSDepthReduce");
-                _depthHistogramKernel = _depthAnalysisShader.FindKernel("CSDepthHistogram");
-                _computeSplitsKernel = _depthAnalysisShader.FindKernel("CSComputeSplits");
+                _depthBinsKernel = _depthAnalysisShader.FindKernel("CSDepthBins");
+                _depthSplitsKernel = _depthAnalysisShader.FindKernel("CSDepthSplits");
                 
                 // Create SDSM GPU buffers
                 _depthMinMaxBuffer = GraphicsBuffer.CreateRaw(2, uav: true, clearable: true);
@@ -299,7 +300,7 @@ namespace Freefall.Graphics
                     pInit[0] = 0x7F7FFFFF;  // min = MAX_FLOAT
                     pInit[1] = 0;           // max = 0
                 }
-                _depthHistogramBuffer = GraphicsBuffer.CreateStructured<uint>(256, uav: true);
+                _depthHistogramBuffer = GraphicsBuffer.CreateStructured<uint>(DepthBins, uav: true);
                 _depthSplitsBuffer = GraphicsBuffer.CreateStructured<float>(4, srv: true, uav: true);
                 
                 // Readback buffers: one per frame
@@ -695,7 +696,9 @@ namespace Freefall.Graphics
         }
 
         /// <summary>
-        /// Dispatch SDSM depth analysis compute shaders.
+        /// Dispatch SDSM depth analysis: CSDepthBins (one pass over every 4th pixel each way: log-spaced depth
+        /// histogram + min/max), then CSDepthSplits (percentile splits, and it clears the histogram and min/max
+        /// for the next frame).
         /// Call after Hi-Z generation, when DepthGBuffer is in NonPixelShaderResource state.
         /// </summary>
         public void AnalyzeDepth(ID3D12GraphicsCommandList commandList, uint depthSrvIndex, int texWidth, int texHeight, float nearPlane, float maxShadowDistance)
@@ -707,27 +710,6 @@ namespace Freefall.Graphics
             commandList.SetComputeRootSignature(_device.GlobalRootSignature);
             _cachedSrvHeapArray ??= new[] { _device.SrvHeap };
             commandList.SetDescriptorHeaps(1, _cachedSrvHeapArray);
-            
-            // Clear SDSM buffers
-            var minMaxFrom = _sdsmValidFrames == 0 ? ResourceStates.Common : ResourceStates.CopySource;
-            var histFrom = _sdsmValidFrames == 0 ? ResourceStates.Common : ResourceStates.UnorderedAccess;
-            var splitsFrom = _sdsmValidFrames == 0 ? ResourceStates.Common : ResourceStates.CopySource;
-            
-            // MinMax buffer needs two different values {MAX_FLOAT, 0} — can't use ClearUAV (fills all elements with first component)
-            commandList.ResourceBarrierTransition(_depthMinMaxBuffer!.Native, minMaxFrom, ResourceStates.CopyDest);
-            commandList.CopyBufferRegion(_depthMinMaxBuffer!.Native, 0, _depthMinMaxInitBuffer!.Native, 0, 8);
-            commandList.ResourceBarrierTransition(_depthMinMaxBuffer!.Native, ResourceStates.CopyDest, ResourceStates.UnorderedAccess);
-            
-            // Histogram: uniform zero clear — ClearUAV is perfect for this
-            if (histFrom != ResourceStates.UnorderedAccess)
-                commandList.ResourceBarrierTransition(_depthHistogramBuffer!.Native, histFrom, ResourceStates.UnorderedAccess);
-            _depthHistogramBuffer!.ClearUAV(commandList, new Int4(0, 0, 0, 0));
-            
-            commandList.ResourceBarrierTransition(_depthSplitsBuffer!.Native, splitsFrom, ResourceStates.UnorderedAccess);
-            commandList.Barriers(
-                new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(_depthMinMaxBuffer!.Native)),
-                new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(_depthHistogramBuffer!.Native)),
-                new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(_depthSplitsBuffer!.Native)));
             
             // Set constants via ComputeShader API
             var da = _depthAnalysisShader!;
@@ -742,32 +724,42 @@ namespace Freefall.Graphics
             da.SetParam("NearPlane", nearPlane);
             da.SetParam("MaxShadowDistance", maxShadowDistance);
             
-            uint groupsX = ((uint)texWidth + 15) / 16;
-            uint groupsY = ((uint)texHeight + 15) / 16;
+            // Min/max and histogram stay in UnorderedAccess: CSDepthSplits hands them back cleared. Only the
+            // first run (created in Common) sets them up: min/max to {MAX_FLOAT, 0}, which ClearUAV cannot write
+            // (it fills every element with the first component), the histogram to zeros.
+            var splitsFrom = _sdsmValidFrames == 0 ? ResourceStates.Common : ResourceStates.CopySource;
+            if (_sdsmValidFrames == 0)
+            {
+                commandList.ResourceBarrierTransition(_depthMinMaxBuffer!.Native, ResourceStates.Common, ResourceStates.CopyDest);
+                commandList.CopyBufferRegion(_depthMinMaxBuffer!.Native, 0, _depthMinMaxInitBuffer!.Native, 0, 8);
+                commandList.ResourceBarrierTransition(_depthMinMaxBuffer!.Native, ResourceStates.CopyDest, ResourceStates.UnorderedAccess);
+                commandList.ResourceBarrierTransition(_depthHistogramBuffer!.Native, ResourceStates.Common, ResourceStates.UnorderedAccess);
+                _depthHistogramBuffer!.ClearUAV(commandList, new Int4(0, 0, 0, 0));
+                commandList.Barriers(
+                    new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(_depthMinMaxBuffer!.Native)),
+                    new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(_depthHistogramBuffer!.Native)));
+            }
             
-            // --- Pass 1: CSDepthReduce ---
-            da.Dispatch(_depthReduceKernel, commandList, groupsX, groupsY, 1);
-            commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(_depthMinMaxBuffer!.Native)));
-            
-            // --- Pass 2: CSDepthHistogram ---
-            da.Dispatch(_depthHistogramKernel, commandList, groupsX, groupsY, 1);
-            commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(_depthHistogramBuffer!.Native)));
-            
-            // --- Pass 3: CSComputeSplits ---
-            da.Dispatch(_computeSplitsKernel, commandList, 1, 1, 1);
-            commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(_depthSplitsBuffer!.Native)));
-            
-            // Step 4: Transition splits + minmax to CopySource for readback (batched)
+            // --- Pass 1: CSDepthBins, one group per 128x128 pixel tile ---
+            uint groupsX = ((uint)texWidth + DepthTilePixels - 1) / DepthTilePixels;
+            uint groupsY = ((uint)texHeight + DepthTilePixels - 1) / DepthTilePixels;
+            da.Dispatch(_depthBinsKernel, commandList, groupsX, groupsY, 1);
             commandList.Barriers(
-                new ResourceBarrier(
-                    new ResourceTransitionBarrier(_depthSplitsBuffer!.Native,
-                        ResourceStates.UnorderedAccess, ResourceStates.CopySource)),
-                new ResourceBarrier(
-                    new ResourceTransitionBarrier(_depthMinMaxBuffer!.Native,
-                        ResourceStates.UnorderedAccess, ResourceStates.CopySource)));
-            // Histogram stays in UAV (next frame will transition it to CopyDest)
+                new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(_depthHistogramBuffer!.Native)),
+                new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(_depthMinMaxBuffer!.Native)),
+                new ResourceBarrier(new ResourceTransitionBarrier(_depthSplitsBuffer!.Native,
+                    splitsFrom, ResourceStates.UnorderedAccess)));
             
-            // Step 5: Copy to readback buffer for this frame
+            // --- Pass 2: CSDepthSplits ---
+            da.Dispatch(_depthSplitsKernel, commandList, 1, 1, 1);
+            // Splits to CopySource for the readback; the cleared histogram and min/max land before the next run
+            commandList.Barriers(
+                new ResourceBarrier(new ResourceTransitionBarrier(_depthSplitsBuffer!.Native,
+                    ResourceStates.UnorderedAccess, ResourceStates.CopySource)),
+                new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(_depthHistogramBuffer!.Native)),
+                new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(_depthMinMaxBuffer!.Native)));
+            
+            // Copy to readback buffer for this frame
             commandList.CopyBufferRegion(
                 _depthSplitsReadbackBuffers![frameIndex].Native, 0,
                 _depthSplitsBuffer!.Native, 0,
