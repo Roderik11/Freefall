@@ -142,7 +142,12 @@ namespace Freefall.Animation
 
         public override void Update(Animator animator, AnimationPlayback pb, bool fireEvents = true)
         {
-            UpdateWeights(animator, pb);
+            // The frame a transition leaves the tree (no events) it moves on with the blend it was
+            // showing. The parameters may already be set for where the layer goes: a start to the
+            // left sets moveX, which the stop it leaves reads too, and re-weighed by that the stop
+            // showed a pose turned the other way for that frame, which the transition then carried.
+            if (fireEvents)
+                UpdateWeights(animator, pb);
 
             float maxWeight = 0;
             BlendLayer maxLayer = null;

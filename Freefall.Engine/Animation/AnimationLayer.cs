@@ -173,7 +173,9 @@ namespace Freefall.Animation
         private void StartTransition(Animator animator, AnimationPlayback pb, AnimationState current, AnimationState target, AnimationTransition transition)
         {
             // The pose blends out of what the layer would have shown this frame: the state it leaves,
-            // moved on by this frame, with what was left of a transition it interrupts.
+            // moved on by this frame (a blend tree with the blend it had, not by the parameters as
+            // they are set now, which may be meant for the target), with what was left of a
+            // transition it interrupts.
             pb.Set(PK.Layer(Index, PK.PreviousFade), GetFade(pb));
             pb.Set(PK.Layer(Index, PK.PreviousTime), GetTransitionTime(pb));
             pb.Set(PK.Layer(Index, PK.PreviousBlend), pb.Get(PK.Layer(Index, PK.TransBlend)));
