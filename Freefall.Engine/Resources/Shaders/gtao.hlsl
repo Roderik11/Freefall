@@ -4,9 +4,11 @@
 //
 // View space is left-handed (x right, y up, z forward); depth input is linear view-space Z.
 //
-// Runs at half resolution: CSDownsampleDepth → CSGTAO → CSDenoise at half size, then CSUpsample
-// writes the screen-size result. Each half-res pixel stands for a 2x2 block and takes the depth and
-// normal of ONE of its pixels (FullResPixel): positions stay exact, nothing is averaged.
+// Full resolution (FullWidth = 0): CSGTAO → CSDenoise, both at screen size.
+// Half resolution (default, GTAOHalfResolution): CSDownsampleDepth → CSGTAO → CSDenoise at half size, then
+// CSUpsample writes the screen-size result. Each half-res pixel stands for a 2x2 block and takes the depth
+// and normal of ONE of its pixels (FullResPixel): positions stay exact, nothing is averaged.
+// At 3 slices half resolution shimmered in motion; at 8 slices (the default) it holds up.
 
 #pragma kernel CSGTAO
 #pragma kernel CSDenoise
@@ -15,14 +17,14 @@
 
 cbuffer PushConstants : register(b3)
 {
-    uint DepthTexIdx;       // Half-res linear view-space Z (R32_Float), 0 = sky
+    uint DepthTexIdx;       // Linear view-space Z (R32_Float) at the AO resolution, 0 = sky
     uint NormalTexIdx;      // World-space normals, screen size (CSGTAO)
     uint AOInputIdx;        // AO to filter (CSDenoise, CSUpsample)
     uint OutputUAVIdx;
-    uint ScreenWidthIdx;    // AO (half) resolution
+    uint ScreenWidthIdx;    // AO resolution
     uint ScreenHeightIdx;
     uint FullDepthTexIdx;   // DepthGBuffer (CSDownsampleDepth, CSUpsample)
-    uint FullWidthIdx;      // Screen resolution
+    uint FullWidthIdx;      // Screen resolution when AO runs at half; 0 = AO runs at full resolution
     uint FullHeightIdx;
 };
 
@@ -49,18 +51,29 @@ static const float FALLOFF_RANGE = 0.615f;
 // Ordered 4x4 pattern — every value appears once per 4x4 block
 static const uint Bayer4[16] = { 0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5 };
 
-// The screen pixel an AO pixel takes its depth and normal from. The pick rotates through all four pixels of
-// the 2x2 block over each 2x2 group of AO pixels, so a one-pixel post still lands in some of them; it follows
-// from the AO coordinate alone, so every reader reconstructs the same exact position.
+bool IsHalfRes() { return FullWidthIdx != 0; }
+
+float2 FullResSize()
+{
+    return IsHalfRes() ? float2(FullWidthIdx, FullHeightIdx) : float2(ScreenWidthIdx, ScreenHeightIdx);
+}
+
+// The screen pixel an AO pixel takes its depth and normal from. At half resolution the pick rotates through all
+// four pixels of the 2x2 block over each 2x2 group of AO pixels, and both its x and y offsets alternate along
+// rows and columns, so every screen row and column is sampled (an earlier pick whose y offset depended on the
+// AO row alone never sampled screen rows 1, 2, 5, 6, ... and left a dotted seam along horizontal step edges).
+// It follows from the AO coordinate alone, so every reader reconstructs the same exact position.
 int2 FullResPixel(int2 aoPx)
 {
-    int2 pick = aoPx * 2 + int2((aoPx.x ^ aoPx.y) & 1, aoPx.y & 1);
+    if (!IsHalfRes())
+        return aoPx;
+    int2 pick = aoPx * 2 + int2((aoPx.x ^ aoPx.y) & 1, aoPx.x & 1);
     return min(pick, int2(FullWidthIdx, FullHeightIdx) - 1);
 }
 
 float3 ReconstructVS(int2 aoPx, float viewZ)
 {
-    float2 uv = (float2(FullResPixel(aoPx)) + 0.5f) / float2(FullWidthIdx, FullHeightIdx);
+    float2 uv = (float2(FullResPixel(aoPx)) + 0.5f) / FullResSize();
     float2 ndc = float2(uv.x * 2.0f - 1.0f, 1.0f - uv.y * 2.0f);
     return float3(ndc / ProjScale, 1.0f) * viewZ;
 }
@@ -84,9 +97,10 @@ void CSGTAO(uint3 dispatchThreadId : SV_DispatchThreadID)
     }
 
     // Projected radius in AO pixels. Too small = nothing to resolve; too large = cache thrash.
-    // The fade is judged in screen pixels (2 per AO pixel), as it was when AO ran at full resolution.
+    // The fade is judged in screen pixels so AO reaches as far at half resolution as at full.
+    float pixelScale = IsHalfRes() ? 2.0f : 1.0f;
     float screenRadius = Radius * 0.5f * ProjScale.y * float(ScreenHeightIdx) / viewZ;
-    float radiusFade = saturate((screenRadius * 2.0f - 2.0f) / 6.0f);
+    float radiusFade = saturate((screenRadius * pixelScale - 2.0f) / 6.0f);
     if (radiusFade <= 0.0f)
     {
         Output[px] = 1.0f;
@@ -229,7 +243,7 @@ void CSDenoise(uint3 dispatchThreadId : SV_DispatchThreadID)
     Output[px] = lerp(1.0f, ao, Intensity);
 }
 
-// The depth of the one screen pixel each AO pixel stands for.
+// Half resolution only: the depth of the one screen pixel each AO pixel stands for.
 [numthreads(8, 8, 1)]
 void CSDownsampleDepth(uint3 dispatchThreadId : SV_DispatchThreadID)
 {
@@ -242,7 +256,7 @@ void CSDownsampleDepth(uint3 dispatchThreadId : SV_DispatchThreadID)
     Output[px] = FullDepth.Load(int3(FullResPixel(int2(px)), 0));
 }
 
-// Denoised half-res AO → screen size. Takes the 2x2 AO pixels around this one
+// Half resolution only: denoised half-res AO → screen size. Takes the 2x2 AO pixels around this one
 // (bilinear footprint), weighted by distance to the screen pixel each was taken from and by how close
 // its depth is to this pixel's. The depth weight is 1/relDiff², so across an edge the samples on this
 // pixel's side win by orders of magnitude and the filter degrades to nearest-depth instead of bleeding.
