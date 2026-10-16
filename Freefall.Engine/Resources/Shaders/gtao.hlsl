@@ -3,18 +3,27 @@
 // pattern, which CSDenoise cancels exactly with a depth-aware 4x4 box filter.
 //
 // View space is left-handed (x right, y up, z forward); depth input is linear view-space Z.
+//
+// Runs at half resolution: CSDownsampleDepth → CSGTAO → CSDenoise at half size, then CSUpsample
+// writes the screen-size result. Each half-res pixel stands for a 2x2 block and takes the depth and
+// normal of ONE of its pixels (FullResPixel): positions stay exact, nothing is averaged.
 
 #pragma kernel CSGTAO
 #pragma kernel CSDenoise
+#pragma kernel CSDownsampleDepth
+#pragma kernel CSUpsample
 
 cbuffer PushConstants : register(b3)
 {
-    uint DepthTexIdx;       // Linear view-space Z (R32_Float), 0 = sky
-    uint NormalTexIdx;      // World-space normals (CSGTAO)
-    uint AOInputIdx;        // Raw AO (CSDenoise)
+    uint DepthTexIdx;       // Half-res linear view-space Z (R32_Float), 0 = sky
+    uint NormalTexIdx;      // World-space normals, screen size (CSGTAO)
+    uint AOInputIdx;        // AO to filter (CSDenoise, CSUpsample)
     uint OutputUAVIdx;
-    uint ScreenWidthIdx;
+    uint ScreenWidthIdx;    // AO (half) resolution
     uint ScreenHeightIdx;
+    uint FullDepthTexIdx;   // DepthGBuffer (CSDownsampleDepth, CSUpsample)
+    uint FullWidthIdx;      // Screen resolution
+    uint FullHeightIdx;
 };
 
 cbuffer Params : register(b4)
@@ -40,9 +49,18 @@ static const float FALLOFF_RANGE = 0.615f;
 // Ordered 4x4 pattern — every value appears once per 4x4 block
 static const uint Bayer4[16] = { 0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5 };
 
-float3 ReconstructVS(float2 pixelCenter, float viewZ)
+// The screen pixel an AO pixel takes its depth and normal from. The pick rotates through all four pixels of
+// the 2x2 block over each 2x2 group of AO pixels, so a one-pixel post still lands in some of them; it follows
+// from the AO coordinate alone, so every reader reconstructs the same exact position.
+int2 FullResPixel(int2 aoPx)
 {
-    float2 uv = pixelCenter / float2(ScreenWidthIdx, ScreenHeightIdx);
+    int2 pick = aoPx * 2 + int2((aoPx.x ^ aoPx.y) & 1, aoPx.y & 1);
+    return min(pick, int2(FullWidthIdx, FullHeightIdx) - 1);
+}
+
+float3 ReconstructVS(int2 aoPx, float viewZ)
+{
+    float2 uv = (float2(FullResPixel(aoPx)) + 0.5f) / float2(FullWidthIdx, FullHeightIdx);
     float2 ndc = float2(uv.x * 2.0f - 1.0f, 1.0f - uv.y * 2.0f);
     return float3(ndc / ProjScale, 1.0f) * viewZ;
 }
@@ -65,9 +83,10 @@ void CSGTAO(uint3 dispatchThreadId : SV_DispatchThreadID)
         return;
     }
 
-    // Projected radius in pixels. Too small = nothing to resolve; too large = cache thrash.
+    // Projected radius in AO pixels. Too small = nothing to resolve; too large = cache thrash.
+    // The fade is judged in screen pixels (2 per AO pixel), as it was when AO ran at full resolution.
     float screenRadius = Radius * 0.5f * ProjScale.y * float(ScreenHeightIdx) / viewZ;
-    float radiusFade = saturate((screenRadius - 2.0f) / 6.0f);
+    float radiusFade = saturate((screenRadius * 2.0f - 2.0f) / 6.0f);
     if (radiusFade <= 0.0f)
     {
         Output[px] = 1.0f;
@@ -77,10 +96,10 @@ void CSGTAO(uint3 dispatchThreadId : SV_DispatchThreadID)
 
     // Nudge towards the camera to avoid self-occlusion from depth precision
     float2 pixelCenter = float2(px) + 0.5f;
-    float3 P = ReconstructVS(pixelCenter, viewZ * 0.9999f);
+    float3 P = ReconstructVS(int2(px), viewZ * 0.9999f);
     float3 V = normalize(-P);
 
-    float3 worldN = NormalTex.Load(int3(px, 0)).xyz;
+    float3 worldN = NormalTex.Load(int3(FullResPixel(int2(px)), 0)).xyz;
     float3 N = normalize(float3(dot(worldN, ViewRight.xyz), dot(worldN, ViewUp.xyz), dot(worldN, ViewForward.xyz)));
 
     uint noiseIdx = (px.x & 3) + ((px.y & 3) << 2);
@@ -129,7 +148,7 @@ void CSGTAO(uint3 dispatchThreadId : SV_DispatchThreadID)
             float z0 = DepthTex.Load(int3(coord0, 0));
             if (z0 > 0.0f)
             {
-                float3 delta = ReconstructVS(float2(coord0) + 0.5f, z0) - P;
+                float3 delta = ReconstructVS(coord0, z0) - P;
                 float dist = length(delta);
                 float weight = saturate(dist * falloffMul + falloffAdd);
                 float shc = lerp(lowHorizonCos0, dot(delta / dist, V), weight);
@@ -140,7 +159,7 @@ void CSGTAO(uint3 dispatchThreadId : SV_DispatchThreadID)
             float z1 = DepthTex.Load(int3(coord1, 0));
             if (z1 > 0.0f)
             {
-                float3 delta = ReconstructVS(float2(coord1) + 0.5f, z1) - P;
+                float3 delta = ReconstructVS(coord1, z1) - P;
                 float dist = length(delta);
                 float weight = saturate(dist * falloffMul + falloffAdd);
                 float shc = lerp(lowHorizonCos1, dot(delta / dist, V), weight);
@@ -208,4 +227,68 @@ void CSDenoise(uint3 dispatchThreadId : SV_DispatchThreadID)
     // Center tap always has weight 1, so weightSum >= 1
     float ao = sum / weightSum;
     Output[px] = lerp(1.0f, ao, Intensity);
+}
+
+// The depth of the one screen pixel each AO pixel stands for.
+[numthreads(8, 8, 1)]
+void CSDownsampleDepth(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    uint2 px = dispatchThreadId.xy;
+    if (px.x >= ScreenWidthIdx || px.y >= ScreenHeightIdx)
+        return;
+
+    Texture2D<float> FullDepth = ResourceDescriptorHeap[FullDepthTexIdx];
+    RWTexture2D<float> Output = ResourceDescriptorHeap[OutputUAVIdx];
+    Output[px] = FullDepth.Load(int3(FullResPixel(int2(px)), 0));
+}
+
+// Denoised half-res AO → screen size. Takes the 2x2 AO pixels around this one
+// (bilinear footprint), weighted by distance to the screen pixel each was taken from and by how close
+// its depth is to this pixel's. The depth weight is 1/relDiff², so across an edge the samples on this
+// pixel's side win by orders of magnitude and the filter degrades to nearest-depth instead of bleeding.
+[numthreads(8, 8, 1)]
+void CSUpsample(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    uint2 px = dispatchThreadId.xy;
+    if (px.x >= FullWidthIdx || px.y >= FullHeightIdx)
+        return;
+
+    Texture2D<float> FullDepth = ResourceDescriptorHeap[FullDepthTexIdx];
+    Texture2D<float> HalfDepth = ResourceDescriptorHeap[DepthTexIdx];
+    Texture2D<float> AOInput = ResourceDescriptorHeap[AOInputIdx];
+    RWTexture2D<float> Output = ResourceDescriptorHeap[OutputUAVIdx];
+
+    float z = FullDepth.Load(int3(px, 0));
+    if (z <= 0.0f)
+    {
+        Output[px] = 1.0f;
+        return;
+    }
+
+    int2 base = (int2(px) - 1) >> 1;
+    int2 maxCoord = int2(ScreenWidthIdx, ScreenHeightIdx) - 1;
+    float invZ = 1.0f / z;
+
+    float sum = 0.0f;
+    float weightSum = 0.0f;
+    [unroll] for (int y = 0; y <= 1; y++)
+    {
+        [unroll] for (int x = 0; x <= 1; x++)
+        {
+            int2 h = clamp(base + int2(x, y), int2(0, 0), maxCoord);
+            float hz = HalfDepth.Load(int3(h, 0));
+            if (hz <= 0.0f)
+                continue; // sky sample: no AO to borrow
+
+            float2 d = abs(float2(FullResPixel(h)) - float2(px)); // in screen pixels, at most 2 per axis
+            float spatial = (1.0f - d.x * 0.4f) * (1.0f - d.y * 0.4f);
+            float relDiff = abs(hz - z) * invZ + 1e-3f;
+            float w = spatial / (relDiff * relDiff);
+            sum += AOInput.Load(int3(h, 0)) * w;
+            weightSum += w;
+        }
+    }
+
+    // All four were sky (a lone pixel at a silhouette against it): leave it open
+    Output[px] = weightSum > 0.0f ? sum / weightSum : 1.0f;
 }
