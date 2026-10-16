@@ -155,6 +155,57 @@ namespace Freefall.Editor.Commands
         }
     }
 
+    /// <summary>Presses a button a component shows in the inspector (a [Button] method), as a click on it does.</summary>
+    [CommandRoute("POST", "/api/entity/{id}/button")]
+    public class PressButtonCommand : EditorCommand
+    {
+        public override CommandResult Execute(CommandContext context)
+        {
+            var id = context.GetInt("id");
+            var entity = CommandHelpers.FindEntityById(id);
+            if (entity == null)
+                return CommandResult.NotFound($"Entity {id} not found");
+
+            if (string.IsNullOrEmpty(context.Body))
+                return CommandResult.BadRequest("Body required with 'component', 'button'");
+
+            using var doc = context.ParseBody();
+            var root = doc.RootElement;
+            if (!root.TryGetProperty("component", out var compProp) || !root.TryGetProperty("button", out var buttonProp))
+                return CommandResult.BadRequest("Body must contain 'component' and 'button'");
+
+            var componentName = compProp.GetString();
+            var buttonName = buttonProp.GetString();
+
+            var component = entity.Components.FirstOrDefault(c =>
+                string.Equals(c.GetType().Name, componentName, StringComparison.OrdinalIgnoreCase));
+            if (component == null)
+                return CommandResult.NotFound($"Component '{componentName}' not found on entity");
+
+            var entry = InspectorButtons.Find(component.GetType(), buttonName ?? "");
+            if (entry == null)
+            {
+                var names = InspectorButtons.Of(component.GetType()).Select(b => b.Method.Name).ToArray();
+                return CommandResult.NotFound(names.Length == 0
+                    ? $"'{componentName}' has no buttons"
+                    : $"'{componentName}' has no button '{buttonName}'; it has: {string.Join(", ", names)}");
+            }
+
+            int pressed = InspectorButtons.Press(entry, new object[] { component });
+            if (pressed == 0)
+                return CommandResult.Error(500, $"'{entry.Method.Name}' failed; see console_log");
+
+            return CommandResult.Json(new
+            {
+                status = "pressed",
+                id,
+                component = component.GetType().Name,
+                button = entry.Method.Name,
+                text = entry.Text,
+            });
+        }
+    }
+
     [CommandRoute("POST", "/api/entity/{id}/setproperty")]
     public class SetPropertyCommand : EditorCommand
     {

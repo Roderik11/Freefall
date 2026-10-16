@@ -351,6 +351,19 @@ namespace Freefall.Editor.Mcp
             return EditorTools.Text(new JsonObject { ["id"] = eid, ["component"] = component, ["applied"] = applied });
         }
 
+        [McpServerTool(Name = "entity_press_button", Title = "Press inspector button", OpenWorld = false)]
+        [Description("Press a button a component shows in the inspector (a method marked [Button]) on one entity, as a click on it does. " +
+                     "entity_get lists each component's buttons under 'buttons'. Works in the editor and in play mode.")]
+        public static async Task<CallToolResult> PressButton(
+            [Description("Component type name (case-insensitive)")] string component,
+            [Description("The button: its method name (as entity_get lists it) or the text it shows, case-insensitive")] string button,
+            int? id = null,
+            [Description(EntityRefs.UidHelp)] string? uid = null)
+        {
+            var (rid, err) = await EntityRefs.Resolve(id, uid);
+            return err ?? await McpBridge.Post($"/api/entity/{rid}/button", new { component, button });
+        }
+
         [McpServerTool(Name = "prefab_update", Title = "Update prefab instances", OpenWorld = false)]
         [Description("Re-apply a prefab to its instances: pass prefabGuid to update all instances, or entityId to refresh a single instance.")]
         public static async Task<CallToolResult> UpdatePrefab(string? prefabGuid = null, int? entityId = null,

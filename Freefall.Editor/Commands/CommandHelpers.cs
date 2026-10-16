@@ -236,7 +236,14 @@ namespace Freefall.Editor.Commands
         {
             var components = new System.Collections.Generic.List<object>();
             foreach (var comp in entity.Components)
-                components.Add(new { type = comp.GetType().Name, fields = SerializeMembers(comp) });
+            {
+                // Its inspector buttons, for entity_press_button
+                var buttons = InspectorButtons.Of(comp.GetType());
+                if (buttons.Count == 0)
+                    components.Add(new { type = comp.GetType().Name, fields = SerializeMembers(comp) });
+                else
+                    components.Add(new { type = comp.GetType().Name, fields = SerializeMembers(comp), buttons = buttons.Select(b => b.Method.Name).ToArray() });
+            }
 
             return new
             {

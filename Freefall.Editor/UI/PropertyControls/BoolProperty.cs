@@ -12,13 +12,17 @@ namespace Freefall.Editor
         public Button CheckButton { get; private set; }
         public ImageControl Image { get; private set; }
 
+        // The box is being set to the field's value: CheckedChanged fires, but that is no edit to write back.
+        // Before 2026-10-16 it was, so a field a script reset (a bindstone's ImpulseNow) came back from the
+        // refresh as a change, and the component rebuilt itself.
+        private bool _showing;
+
         public BoolProperty(GUIProperty property) : base(property)
         {
             CheckButton = new Button();
             CheckButton.Dock = DockStyle.Left;
             CheckButton.Size = new Point(18, 24);
             CheckButton.CheckOnClick = true;
-            CheckButton.CheckedChanged += CheckBox_CheckedChanged;
             CheckButton.Style = "checkbox";
             CheckButton.Margin = new Margin(0, 4, 4, 4);
             Controls.Add(CheckButton);
@@ -30,20 +34,27 @@ namespace Freefall.Editor
             Image.NoEvents = true;
             CheckButton.GetElements().Add(Image);
 
+            // Once: it was subscribed twice, and every click wrote the value (and notified the component) twice
             CheckButton.CheckedChanged += CheckBox_CheckedChanged;
 
-            object value = property.GetValue();
-
-            if (value != null)
-                CheckButton.Checked = (bool)value;
-
+            Show(property.GetValue());
             Image.Visible = CheckButton.Checked;
+        }
+
+        void Show(object value)
+        {
+            if (value is not bool on) return;
+            _showing = true;
+            CheckButton.Checked = on;
+            _showing = false;
+            Image.Visible = on;
         }
 
         void CheckBox_CheckedChanged(Control sender)
         {
-            property.SetValue(CheckButton.Checked);
             Image.Visible = CheckButton.Checked;
+            if (_showing) return;
+            property.SetValue(CheckButton.Checked);
         }
 
         protected override void OnUpdate()
@@ -52,11 +63,7 @@ namespace Freefall.Editor
             if (Timer > Interval)
             {
                 Timer = 0;
-
-                object value = property.GetValue();
-
-                if (value != null)
-                    CheckButton.Checked = (bool)value;
+                Show(property.GetValue());
             }
         }
     }

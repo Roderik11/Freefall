@@ -564,6 +564,15 @@ namespace Freefall.Editor
             var prevtoolbutton = new ControlStyle(button);
             prevtoolbutton.TextPadding = new Squid.Margin(4, 0, 4, 0);
 
+            // [Button] methods in the inspector (InspectorButtons): room round the text, since a button in a
+            // row is as wide as its text; with an icon the text starts right of it
+            var inspectorButton = new ControlStyle(button);
+            inspectorButton.TextPadding = new Squid.Margin(10, 0, 10, 0);
+
+            var inspectorIconButton = new ControlStyle(button);
+            inspectorIconButton.TextAlign = Alignment.MiddleLeft;
+            inspectorIconButton.TextPadding = new Squid.Margin(32, 0, 10, 0);
+
             // Set last: the property-row styles above are copies of category and must keep the body font
             category.Font = HeadingFont;
             catbutton.Font = HeadingFont;
@@ -574,6 +583,8 @@ namespace Freefall.Editor
             {
                 { "popup", popup },
                 { "prevtoolbutton", prevtoolbutton},
+                { "inspectorButton", inspectorButton },
+                { "inspectorIconButton", inspectorIconButton },
                 { "foldout", foldout},
                 { "iconplus", iconplus },
                 { "iconclose", iconclose },

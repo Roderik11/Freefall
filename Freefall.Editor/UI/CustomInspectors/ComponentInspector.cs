@@ -38,17 +38,31 @@ namespace Freefall.Editor
 
             var headers = new HashSet<string>();
 
+            // [Button] methods: each header's buttons close its fields; those without a category come last
+            var buttons = InspectorButtons.Of(target.Type);
+            string current = null;
+
             foreach (var prop in target.GetProperties())
             {
                 var header = prop.GetAttribute<System.ComponentModel.CategoryAttribute>();
                 if(header != null && !headers.Contains(header.Category))
                 {
+                    if (current != null) AddButtons(buttons, current, target);
                     AddHeader(header.Category.ToUpperInvariant());
                     headers.Add(header.Category);
+                    current = header.Category;
                 }
 
                 AddProperty(prop);
             }
+
+            if (current != null) AddButtons(buttons, current, target);
+            while (buttons.Find(b => b.Category != null) is { } next)
+            {
+                AddHeader(next.Category.ToUpperInvariant());
+                AddButtons(buttons, next.Category, target);
+            }
+            AddButtons(buttons, null, target);
 
             Func<bool> isDragging = () => Desktop?.PressedControl != null;
 
@@ -66,6 +80,17 @@ namespace Freefall.Editor
             };
         }
 
+
+        /// <summary>Adds the buttons of one category (null = those without one) and takes them off the list.</summary>
+        void AddButtons(List<InspectorButtons.Entry> buttons, string category, GUIObject target)
+        {
+            var these = buttons.FindAll(b => b.Category == category);
+            if (these.Count == 0) return;
+            buttons.RemoveAll(b => b.Category == category);
+
+            foreach (var control in InspectorButtons.Build(these, target))
+                AddControl(control);
+        }
 
         void CreateDropdownMenu(Control parent, GUIObject target)
         {
