@@ -36,6 +36,17 @@ cbuffer ObjectConstants : register(b1)
     float _cloudPad1;
     float3 CloudNightColor;      // moonlit cloud color at night
     float _cloudPad2;
+    // Moons (SkyboxRenderer.Moons, at most SkyboxRenderer.MaxMoons)
+    float4 MoonDirSize[4];       // xyz: direction to the moon, w: angular radius (radians)
+    float4 MoonColor[4];         // rgb: tint x brightness of the lit side
+    uint4 MoonTextures;          // bindless surface texture per moon, 0 = a plain disc
+    uint MoonCount;
+    // Star sphere (SkyboxRenderer): turns with the time of day round the sun path's pole
+    row_major float4x4 StarRotation;   // world direction → direction on the star sphere
+    float3 GalaxyPole;           // normal of the Milky Way's plane on the star sphere
+    float MilkyWayBrightness;
+    float3 GalaxyCenter;         // its bright core, a direction on that plane
+    float _galaxyPad;
     // Cloud layer shape (coverage, time, altitude, noise LUT) lives in SceneConstants (common.fx):
     // the directional light needs it too for cloud shadows.
 }
@@ -116,39 +127,175 @@ float GetCloudsAt(float3 viewDir, float altitude)
     return saturate(eroded);
 }
 
-float3 GetStars(float3 viewDir, float nightFactor)
+// ────────────────────────────────────────────────
+// Night sky: stars and the Milky Way on a sphere that turns with the time of day (StarRotation), so they wheel round
+// the celestial pole the way the sun crosses the sky. Directions on that sphere are called s below.
+
+// Star colours: mostly near white, some blue-white, a few yellow to orange. Kept pale (the game's muted palette).
+float3 StarColor(float h)
 {
-    float upMask = smoothstep(0.02, 0.25, viewDir.y);
-    float visibility = saturate(nightFactor) * upMask;
+    float3 c = lerp(float3(0.76, 0.84, 1.0), float3(1, 1, 1), smoothstep(0.0, 0.3, h));
+    c = lerp(c, float3(1.0, 0.92, 0.78), smoothstep(0.6, 0.78, h));
+    return lerp(c, float3(1.0, 0.76, 0.58), smoothstep(0.88, 0.98, h));
+}
 
-    float3 d0 = normalize(viewDir);
-    float starScale = lerp(120.0, 420.0, saturate(StarDensity));
-    float3 p = d0 * starScale;
+// One layer of stars: at most one per cell of a cube-map grid (2 × scale cells along a face), kept to the middle of its
+// cell so it never straddles a cell edge. A star is a point about a pixel and a half wide at any resolution: its
+// brightness, not its size, tells bright from faint; the brightest get a soft glow. They twinkle, more near the horizon.
+float3 StarLayer(float3 s, float pixelAngle, float twinkle, float scale, float density, float minB, float maxB, float glow, float seed)
+{
+    float3 a = abs(s);
+    float3 n, t, b;
+    if (a.x >= a.y && a.x >= a.z) { n = float3(sign(s.x), 0, 0); t = float3(0, 1, 0); b = float3(0, 0, 1); }
+    else if (a.y >= a.z)          { n = float3(0, sign(s.y), 0); t = float3(1, 0, 0); b = float3(0, 0, 1); }
+    else                          { n = float3(0, 0, sign(s.z)); t = float3(1, 0, 0); b = float3(0, 1, 0); }
+    float face = dot(n, float3(1, 2, 3));
+    float2 g = float2(dot(s, t), dot(s, b)) / dot(s, n) * scale;
+    float2 cell = floor(g);
+    float3 key = float3(cell.x + face * 7.31, cell.y - face * 3.17, face * 13.7 + seed);
+    if (hash13(key) > density)
+        return 0;
 
-    float3 cell = floor(p);
-    float3 fracP = frac(p);
+    float2 uv = (cell + 0.2 + 0.6 * float2(hash13(key + 11.7), hash13(key + 23.1))) / scale;
+    float3 starDir = normalize(n + uv.x * t + uv.y * b);
+    float px = length(s - starDir) / pixelAngle;              // distance from the star in pixels
 
-    float3 jitter = float3(
-        hash13(cell + float3(1.0, 0.0, 0.0)),
-        hash13(cell + float3(0.0, 1.0, 0.0)),
-        hash13(cell + float3(0.0, 0.0, 1.0))
-    );
+    float h = hash13(key + 37.9);
+    float bright = lerp(minB, maxB, h * h * h);               // most stars are faint
+    float flicker = 1.0 + twinkle * sin(Time * (1.7 + 2.9 * hash13(key + 61.3)) + h * 40.0);
+    float shape = exp(-px * px * 0.9) + glow * smoothstep(0.4, 1.0, h) * 0.12 * exp(-px * 0.55);
+    return StarColor(hash13(key + 51.3)) * bright * flicker * shape;
+}
 
-    float3 delta = fracP - jitter;
-    float dist = length(delta);
+// The Milky Way: a band along the great circle round GalaxyPole, brightest towards GalaxyCenter, clumped into star
+// clouds and split by dark dust lanes (noise from the cloud LUT, whose tiles the sphere spans once or a few times).
+// Returns its glow; crowd (0..1) is how densely faint stars crowd it there.
+float3 MilkyWay(float3 s, out float crowd)
+{
+    crowd = 0;
+    float b = dot(s, GalaxyPole);                              // sine of the galactic latitude
+    float wide = exp(-b * b / 0.09);
+    if (wide < 0.01 || CloudNoiseLUTIdx == 0)
+        return 0;
 
-    float r = lerp(0.12, 0.30, hash13(cell + 7.0)) / starScale;
-    float aa = max(fwidth(dist), 1e-4);
+    // Perlin FBM from the LUT sits mostly in 0.3..0.7: stretch each octave to 0..1
+    Texture3D<float4> lut = ResourceDescriptorHeap[CloudNoiseLUTIdx];
+    float clumps = saturate((lut.SampleLevel(linearWrap, s * 0.5 + 0.5, 0).r - 0.3) * 2.5);
+    float detail = saturate((lut.SampleLevel(linearWrap, s * 1.9 + 0.17, 0).r - 0.3) * 2.5);
+    float fine = saturate((lut.SampleLevel(linearWrap, s * 5.3 + 0.71, 0).r - 0.3) * 2.5);
+    float grain = saturate((lut.SampleLevel(linearWrap, s * 13.1 + 0.33, 0).r - 0.3) * 2.5);
 
-    float gate = step(lerp(0.995, 0.90, saturate(StarDensity)), hash13(cell + 13.0));
-    float disc = 1.0 - smoothstep(r - aa, r + aa, dist);
-    float star = gate * disc;
+    float bulge = exp((dot(s, GalaxyCenter) - 1.0) * 2.2);    // 1 at the core, ~0.01 opposite it
+    float bw = lerp(0.08, 0.19, bulge) * lerp(0.7, 1.35, clumps);
+    float band = exp(-b * b / (bw * bw));
+    float structure = detail * 0.5 + fine * 0.33 + grain * 0.17;  // star clouds
+    float lum = band * (0.25 + 0.75 * bulge) * smoothstep(0.15, 0.85, structure) * 2.2
+              + wide * 0.12 * (0.4 + bulge);
 
-    float bVar = lerp(0.4, 1.0, hash13(cell + 21.0));
-    float twinkle = 0.75 + 0.25 * sin(CloudTime * 2.0 + hash13(cell + 31.0) * 50.0);
+    // Dust: a rift wandering along the middle, broken into pieces and widest at the core, and dark knots across
+    // the band
+    float wander = (clumps - 0.5) * 0.10 + (fine - 0.5) * 0.03;
+    float rift = (b - wander) / (lerp(0.02, 0.06, bulge) * lerp(0.5, 1.5, detail));
+    float riftOn = smoothstep(0.35, 0.65, clumps * 0.4 + fine * 0.4 + grain * 0.2);
+    float dust = exp(-rift * rift) * riftOn + smoothstep(0.55, 0.95, detail * 0.55 + grain * 0.45) * band * 0.6;
+    lum *= 1.0 - 0.8 * saturate(dust);
 
-    float intensity = StarBrightness * visibility * bVar * twinkle;
-    return star * intensity;
+    crowd = saturate(band * (0.4 + bulge) * (1.0 - saturate(dust)));
+    float3 color = lerp(float3(0.70, 0.77, 1.0), float3(1.0, 0.87, 0.72), saturate(bulge * 1.3 + band * 0.15));
+    return color * lum;
+}
+
+// How much the moons above the horizon brighten the night (0 = none up or new, 1 = a full moon): it washes out the
+// Milky Way and the faint stars. Also returns the brightest moon's direction (for the clouds).
+float MoonLightOnSky(float3 sunDir, out float3 brightestDir)
+{
+    float total = 0, best = 0;
+    brightestDir = -sunDir;
+    for (uint m = 0; m < MoonCount; m++)
+    {
+        float3 md = MoonDirSize[m].xyz;
+        float light = 0.5 * (1 - dot(md, sunDir)) * smoothstep(0.0, 0.1, md.y);
+        total += light;
+        if (light > best) { best = light; brightestDir = md; }
+    }
+    return saturate(total);
+}
+
+// Stars and the Milky Way seen in a world direction (moons are drawn over them by MoonsAndStars)
+float3 NightSky(float3 viewDir, float pixelAngle, float nightFactor, float moonWash)
+{
+    float visible = saturate(nightFactor) * smoothstep(0.0, 0.25, viewDir.y);   // thicker air near the horizon
+    if (visible <= 0)
+        return 0;
+
+    float3 s = mul(viewDir, (float3x3)StarRotation);
+    float crowd;
+    float3 milky = MilkyWay(s, crowd) * (0.03 * MilkyWayBrightness * (1 - 0.6 * moonWash));
+
+    float twinkle = lerp(0.35, 0.08, saturate(viewDir.y * 2.0));
+    float density = 0.4 + 1.2 * saturate(StarDensity);
+    float3 stars = StarLayer(s, pixelAngle, twinkle, 8.0, 0.14 * density, 0.25, 1.6, 1.0, 1.0)
+                 + StarLayer(s, pixelAngle, twinkle, 24.0, 0.40 * density, 0.04, 0.30, 0.0, 2.0) * (1 - 0.3 * moonWash)
+                 + StarLayer(s, pixelAngle, twinkle, 70.0, (0.2 + 0.6 * crowd) * density, 0.008, 0.06, 0.0, 3.0) * (1 - 0.7 * moonWash);
+
+    return (stars * StarBrightness + milky) * visible;
+}
+
+// The bright haze round each moon (its light scattered in the air near it), over the sky and under the clouds
+float3 MoonGlow(float3 viewDir, float3 sunDir)
+{
+    float3 glow = 0;
+    for (uint m = 0; m < MoonCount; m++)
+    {
+        float3 md = MoonDirSize[m].xyz;
+        float light = 0.5 * (1 - dot(md, sunDir)) * smoothstep(-0.02, 0.05, md.y);
+        float away = 1 - saturate(dot(viewDir, md));          // ≈ angle² / 2
+        float3 tint = MoonColor[m].rgb * float3(0.8, 0.87, 1.0);
+        glow += tint * light * (exp(-away * 900.0) * 0.035 + exp(-away * 40.0) * 0.008);
+    }
+    return glow * smoothstep(-0.01, 0.05, viewDir.y);
+}
+
+// The moons, each a sphere lit by the sun (so its phase shows) with an optional surface texture, and the stars
+// wherever no moon covers them. Added over the sky colour: the atmosphere lies in front of the moons.
+float3 MoonsAndStars(float3 viewDir, float3 sunDir, float3 stars)
+{
+    float3 moons = 0;
+    float starsVisible = 1;
+    for (uint m = 0; m < MoonCount; m++)
+    {
+        float3 md = MoonDirSize[m].xyz;
+        float3 right = normalize(cross(abs(md.y) < 0.999 ? float3(0, 1, 0) : float3(0, 0, 1), md));
+        float3 up = cross(md, right);
+        float3 local = float3(dot(viewDir, right), dot(viewDir, up), dot(viewDir, md));
+
+        // Place on the disc: 0 at its centre, 1 on its rim
+        float2 p = local.xy / (max(local.z, 1e-4) * tan(MoonDirSize[m].w));
+        float r = length(p);
+        float2 uv = float2(p.x, -p.y) * 0.5 + 0.5;
+        float2 uvDx = ddx(uv), uvDy = ddy(uv);
+        float edge = max(fwidth(r), 1e-4);
+        float cover = (1 - smoothstep(1 - edge, 1, r)) * step(0, local.z) * smoothstep(-0.002, 0.002, viewDir.y);
+        if (cover <= 0)
+            continue;
+
+        // The sphere's normal here faces back towards the viewer
+        float3 n = p.x * right + p.y * up - sqrt(saturate(1 - r * r)) * md;
+        float lit = saturate(dot(n, sunDir));
+
+        float3 albedo = 0.6;
+        uint tex = MoonTextures[m];
+        if (tex != 0)
+        {
+            Texture2D surface = ResourceDescriptorHeap[tex];
+            albedo = surface.SampleGrad(linearWrap, saturate(uv), uvDx, uvDy).rgb;
+        }
+        float3 moon = albedo * MoonColor[m].rgb * (lit + 0.01);   // 0.01: earthshine, the dark side is not black
+
+        moons = lerp(moons, moon, cover);
+        starsVisible *= 1 - cover;
+    }
+    return moons + stars * starsVisible;
 }
 
 float GetSun(float3 viewDir, float3 sunDir)
@@ -214,14 +361,19 @@ FragmentOutput PS_Procedural(VertexOutput input)
 
     float3 viewDir = normalize(input.ViewDir);
     float3 sunDir = normalize(SunDirection);
+    float pixelAngle = max(length(fwidth(viewDir)) * 0.7071, 1e-5);   // radians per pixel, before any branch
 
     float3 skyColor = GetSkyColor(viewDir, sunDir);
 
     float dayFactor, sunsetFactor, nightFactor;
     GetDayNightFactors(sunDir.y, dayFactor, sunsetFactor, nightFactor);
 
-    // Stars (not in shared GetSkyColor — ocean reflections don't need them)
-    skyColor += GetStars(viewDir, nightFactor);
+    // Moons, their glow, stars and the Milky Way (not in shared GetSkyColor — ocean reflections don't need them).
+    // The moons and stars go on after the clouds (below): they are far brighter than the sky behind a cloud.
+    float3 moonDir;
+    float moonLight = MoonLightOnSky(sunDir, moonDir);
+    skyColor += MoonGlow(viewDir, sunDir);
+    float3 behindClouds = MoonsAndStars(viewDir, sunDir, NightSky(viewDir, pixelAngle, nightFactor, moonLight));
 
     float sun = GetSun(viewDir, sunDir) * SunIntensity;
     skyColor += float3(1.0, 0.9, 0.7) * sun;
@@ -246,9 +398,8 @@ FragmentOutput PS_Procedural(VertexOutput input)
         float transmittance = exp(-density * 3.0);  // 1.0 at edges, ~0.05 at dense cores
 
         // ── Directional sun shading ──
-        // At night the "sun" is below the horizon; the moon sits opposite, so flip the
-        // light direction as the night weight rises to keep a faint directional shading.
-        float3 cloudLightDir = normalize(lerp(sunDir, -sunDir, nightFactor));
+        // At night the light comes from the brightest moon (none up: from opposite the sun, barely lit)
+        float3 cloudLightDir = normalize(lerp(sunDir, moonDir, nightFactor));
         float sunDot = saturate(dot(viewDir, cloudLightDir));
         float sunGradient = sunDot * 0.5 + 0.5;  // 0.5 (shade side) to 1.0 (sun facing)
 
@@ -269,8 +420,11 @@ FragmentOutput PS_Procedural(VertexOutput input)
         // ── Sunset palette: day shading pulled toward the warm tint ──
         float3 sunsetCloud = lerp(dayCloud, CloudSunsetTintColor * CloudBrightness * 1.3, 0.5);
 
-        // ── Night palette: dim moonlit gradient, no silver lining ──
-        float3 nightCloud = lerp(CloudNightColor * 0.5, CloudNightColor, shadeFactor) * CloudNightBrightness;
+        // ── Night palette: lit by the moons — bright with a silver rim near a full moon, dark shapes against the
+        // stars when none is up ──
+        float3 nightCloud = lerp(CloudNightColor * 0.5, CloudNightColor, shadeFactor) * CloudNightBrightness * (0.25 + 0.75 * moonLight);
+        float moonDot = saturate(dot(viewDir, moonDir));
+        nightCloud += float3(0.8, 0.86, 1.0) * moonLight * (edgeMask * pow(moonDot, 40.0) * 0.5 + transmittance * pow(moonDot, 200.0) * 0.4);
 
         // ── Blend palettes with the same day/sunset/night weights as the sky ──
         float3 cloudColor = dayCloud * dayFactor
@@ -280,6 +434,10 @@ FragmentOutput PS_Procedural(VertexOutput input)
         // Blend into sky
         skyColor = lerp(skyColor, cloudColor, absorption);
     }
+
+    // Moons and stars through the clouds: hidden far sooner than the sky colour is. With the sky's absorption a thin
+    // cloud let ~2/3 of a moon through, 50-100x brighter than the cloud round it, so it seemed to hang in front.
+    skyColor += behindClouds * exp(-density * 15.0);
 
     output.Albedo = float4(skyColor, 1);
     output.Normal = float4(0, 1, 0, 1);

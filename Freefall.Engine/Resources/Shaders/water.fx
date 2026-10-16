@@ -116,7 +116,7 @@ VSOutput VS(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_InstanceI
     output.Position = mul(mul(float4(worldPos, 1.0), View), Projection);
     output.Depth = output.Position.w;
     output.InstanceIdx = idx;
-    output.SkyAmbient = GetSkyColor(float3(0, 1, 0), FogSunDirection) * 0.45 * AmbientScale;
+    output.SkyAmbient = SkyAmbientLight();
     return output;
 }
 

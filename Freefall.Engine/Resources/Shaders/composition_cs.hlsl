@@ -75,13 +75,10 @@ void CSCompose(uint3 dispatchThreadId : SV_DispatchThreadID)
     float4 data = DataTex.Load(displaced_coord);
     float3 normal = NormalTex.Load(displaced_coord).xyz;
     
-    // Hemisphere ambient: sky-facing surfaces get a cooler/brighter tint,
-    // ground-facing get warmer/darker. Gives shape to fully shadowed objects.
+    // Hemisphere ambient: the sky from above, the ground's bounce light from below.
+    // Gives shape to fully shadowed objects.
     float ao = data.b;
-    float3 skyColor    = GetSkyColor(float3(0, 1, 0), FogSunDirection) * 0.45;  // sky bounce from atmosphere
-    float3 groundColor = float3(0.12, 0.11, 0.10);  // warm ground bounce (terrain-dependent)
-    float hemi = normal.y * 0.5 + 0.5;               // remap [-1,1] -> [0,1]
-    float3 ambient = lerp(groundColor, skyColor, hemi) * ao * AmbientScale;
+    float3 ambient = HemisphereAmbient(normal) * ao;
 
     // Screen-space AO (GTAO) — fully occludes ambient; direct light only by AODirectStrength
     // (not physically based, but keeps creases readable in sunlit areas)

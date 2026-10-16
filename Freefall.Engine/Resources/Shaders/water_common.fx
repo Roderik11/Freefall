@@ -194,7 +194,7 @@ WaterColumn GetWaterColumn(SamplerState s, uint depthSRV, uint compositeSRV, flo
     return col;
 }
 
-// Foam lighting shared by all water (sun + sky ambient; skyAmbient = GetSkyColor(up) * 0.45 * AmbientScale)
+// Foam lighting shared by all water (sun + sky ambient; skyAmbient = SkyAmbientLight())
 float3 WaterFoamLit(float3 foamAlbedo, float NdotL, float3 sunRadiance, float3 skyAmbient)
 {
     return foamAlbedo * ((0.27 + 0.5 * NdotL) * sunRadiance + skyAmbient * 1.15);

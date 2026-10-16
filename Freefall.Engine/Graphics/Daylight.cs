@@ -1,4 +1,5 @@
 using System;
+using System.Numerics;
 using Freefall.Base;
 using Freefall.Components;
 
@@ -10,7 +11,8 @@ namespace Freefall.Graphics
     /// marked EmissiveWhenDark follow <see cref="Lamps"/>: lit when the daylight falls below
     /// <see cref="LampsOnBelow"/> (night, a thunderstorm, an overcast dusk), out again above
     /// <see cref="LampsOffAbove"/>, so a cloud passing at the mark does not blink them. Noon daylight with the
-    /// presets: Sunny 2.35, Clear Day 1.55, Snowfall 0.6, Overcast 0.41, Thunderstorm 0.14; a clear night 0.06.
+    /// presets: Sunny 2.35, Clear Day 1.55, Snowfall 0.6, Overcast 0.41, Thunderstorm 0.14; a night ~0.003 (new moon)
+    /// to ~0.07 (full moon high up).
     /// A street lantern adds about 0.15 to the ground under it.
     /// </summary>
     public static class Daylight
@@ -70,19 +72,23 @@ namespace Freefall.Graphics
             return 0f;
         }
 
-        // What the sky's ambient adds to an up-facing surface, as a multiple of its albedo: composition_cs's
-        // GetSkyColor(up) × 0.45 × AmbientScale, with the zenith colour as sky_common.fx's day sky has it
+        // What the sky's ambient adds to an up-facing surface, as a multiple of its albedo: sky_common.fx's
+        // SkyAmbientLight() = GetSkyColor(up) × 0.45, with the zenith colour as its day sky has it
         // (tint × ~0.65 × density) and the night sky colour at night. 0 without a sky.
         public static float SkyAmbient()
         {
+            var sky = SkyAmbientColor();
+            return Luminance(sky.X, sky.Y, sky.Z);
+        }
+
+        public static Vector3 SkyAmbientColor()
+        {
             if (ComponentCache<SkyboxRenderer>.All.Count == 0)
-                return 0f;
-            var tint = SkyboxRenderer.CurrentSkyTintColor;
-            var night = SkyboxRenderer.CurrentNightSkyColor;
-            float day = Luminance(tint.X, tint.Y, tint.Z) * 0.65f * SkyboxRenderer.CurrentAtmosphereDensity;
-            float sky = (SkyboxRenderer.CurrentDayFactor + SkyboxRenderer.CurrentSunsetFactor) * day
-                      + SkyboxRenderer.CurrentNightFactor * Luminance(night.X, night.Y, night.Z);
-            return sky * 0.45f * SkyboxRenderer.AmbientScale;
+                return Vector3.Zero;
+            Vector3 day = SkyboxRenderer.CurrentSkyTintColor * (0.65f * SkyboxRenderer.CurrentAtmosphereDensity);
+            Vector3 sky = (SkyboxRenderer.CurrentDayFactor + SkyboxRenderer.CurrentSunsetFactor) * day
+                        + SkyboxRenderer.CurrentNightFactor * SkyboxRenderer.CurrentNightSkyColor;
+            return sky * 0.45f;
         }
 
         private static float Luminance(float r, float g, float b) => 0.2126f * r + 0.7152f * g + 0.0722f * b;

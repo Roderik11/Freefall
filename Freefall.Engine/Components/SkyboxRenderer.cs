@@ -37,6 +37,8 @@ namespace Freefall.Components
         [ValueRange(0f, 24f)]
         public float TimeOfDay = 16f;         // 0-24 hours
 
+        public int Day = 0;                   // days since day 0: counts on as TimeOfDay wraps, moves the moons along their orbits
+
         [ValueRange(0.001f, 0.1f)]
         public float TimeOfDaySpeed = 0.001f; // Hours per second (tweak for testing)
 
@@ -58,14 +60,15 @@ namespace Freefall.Components
         [ValueRange(0f, 10f)]
         public float SunsetIntensity = 1.5f;    // Sun intensity during sunset/sunrise
 
-        [ValueRange(0f, 10f)]
-        public float NightIntensity = 0.1f;     // Ambient intensity at night
-
         public Color3 SunDayColor = new Color3(1.0f, 0.95f, 0.85f);
         public Color3 SunSunsetColor = new Color3(1.0f, 0.7f, 0.4f);
-        public Color3 SunNightColor = new Color3(0.1f, 0.15f, 0.3f);
 
         public Vector3 SunDirection = new Vector3(0, 1, 0);
+
+        // The world's moons. Their light comes through the one directional light (SunLight): at night it turns to the
+        // moon that gives the most light. The sky draws at most MaxMoons of them.
+        [Category("Moons")]
+        public List<Moon> Moons = [];
 
         [Category("Atmosphere")]
         public Color3 SkyTintColor = new Color3(0.5f, 0.7f, 1.0f);       // Overall sky color multiplier
@@ -95,14 +98,17 @@ namespace Freefall.Components
         public float SunsetTintIntensity = 0.8f;        // Sunset color strength
 
         [Category("Night")]
-        public Color3 NightSkyColor = new Color3(0.01f, 0.01f, 0.04f);   // Zenith color at night
-        public Color3 NightHorizonColor = new Color3(0.03f, 0.04f, 0.08f); // Horizon glow at night
+        public Color3 NightSkyColor = new Color3(0.004f, 0.0065f, 0.018f);  // Zenith color at night
+        public Color3 NightHorizonColor = new Color3(0.02f, 0.027f, 0.045f); // Horizon glow at night
 
         [ValueRange(0f, 1f)]
         public float StarDensity = 0.5f;        // 0-1, controls how many stars
 
         [ValueRange(0f, 10f)]
         public float StarBrightness = 1.0f;     // Star intensity multiplier
+
+        [ValueRange(0f, 4f)]
+        public float MilkyWayBrightness = 1.0f; // Glow of the Milky Way band (it turns with the stars)
 
         [Category("Clouds")]
         [ValueRange(0f, 1f)]
@@ -140,8 +146,15 @@ namespace Freefall.Components
         public float CloudAltitudeBlend = 1.0f;     // 1 = only CloudAltitude is shown
 
 
-        // Static ambient scale accessible by composition pass
-        public static float AmbientScale { get; private set; } = 1.0f;
+        // Light the ground sends back up onto surfaces facing down, as a multiple of their albedo: the hemisphere
+        // ambient's lower half (sky_common.fx HemisphereAmbient). The directional light on flat ground (after the
+        // clouds' average shade) plus the sky's ambient, times GroundAlbedo. Without a sky: a fixed warm grey.
+        private static readonly Vector3 NoSkyGroundBounce = new Vector3(0.12f, 0.11f, 0.10f);
+        public static Vector3 CurrentGroundBounce { get; private set; } = NoSkyGroundBounce;
+
+        // Average albedo of what lies around (earth, cobbles, grass), a part of it in shade
+        private static readonly Vector3 GroundAlbedo = new Vector3(0.11f, 0.10f, 0.085f);
+
         public static Vector3 CurrentSunDirection { get; private set; } = new Vector3(0, 1, 0);
 
         // Static atmosphere accessors for Camera.SetShaderParams()
@@ -154,8 +167,8 @@ namespace Freefall.Components
         public static float CurrentAtmosphereDensity { get; private set; } = 1.0f;
         public static float CurrentMieScattering { get; private set; } = 0.02f;
         public static float CurrentMieAnisotropy { get; private set; } = 0.76f;
-        public static Vector3 CurrentNightSkyColor { get; private set; } = new Vector3(0.01f, 0.01f, 0.04f);
-        public static Vector3 CurrentNightHorizonColor { get; private set; } = new Vector3(0.03f, 0.04f, 0.08f);
+        public static Vector3 CurrentNightSkyColor { get; private set; } = new Vector3(0.004f, 0.0065f, 0.018f);
+        public static Vector3 CurrentNightHorizonColor { get; private set; } = new Vector3(0.02f, 0.027f, 0.045f);
 
         // Cloud layer accessors for Camera.SetShaderParams() (SceneConstants: sky dome + cloud shadows)
         public static float CurrentCloudCoverage { get; private set; } = 0.5f;
@@ -178,6 +191,37 @@ namespace Freefall.Components
 
         private float CloudTime = 0.0f;
 
+        /// <summary>Moons the sky draws (mesh_skybox.fx MoonDirSize etc. are arrays of this size).</summary>
+        public const int MaxMoons = 4;
+
+        // The one directional light fades out, turns to its new source (sun ↔ moon) and fades in again, so its
+        // shadows never jump to a new direction while they show
+        private const float LightHandoverSeconds = 0.75f;
+
+        private struct MoonLight
+        {
+            public Vector3 Direction;   // towards the moon
+            public float Intensity;     // its LightIntensity × the lit part of the disc × above the horizon
+            public Color3 Color;
+        }
+
+        private readonly MoonLight[] _moonLights = new MoonLight[MaxMoons];
+        private readonly Vector4[] _moonDirSize = new Vector4[MaxMoons];
+        private readonly Vector4[] _moonColor = new Vector4[MaxMoons];
+        private Int4 _moonTextures;
+        private int _moonCount;
+
+        private int _lightSource = -1;      // -1 = the sun, else an index into _moonLights
+        private float _lightFade = 1f;
+        private bool _lightStarted;
+
+        // Star sphere: world direction → star sphere (mesh_skybox.fx StarRotation), and the Milky Way on it
+        private Matrix4x4 _starRotation = Matrix4x4.Identity;
+        private Vector3 _galaxyPole = Vector3.UnitZ;
+        private Vector3 _galaxyCenter = Vector3.UnitX;
+        private const float GalaxyTilt = 35f * (MathF.PI / 180f);             // band off the meridian at midnight
+        private const float GalaxyCoreFromZenith = 50f * (MathF.PI / 180f);  // where its bright core sits then
+
         // Cloud noise LUT — generated once at startup via compute shader
         private static RenderTexture3D? _cloudNoiseLUT;
         private static bool _noiseGenerated;
@@ -199,6 +243,7 @@ namespace Freefall.Components
             // Deferred: the sky draw of the frames in flight still references the mesh
             Engine.Device.DeferDispose(Mesh);
             CurrentCloudShadowStrength = 0.0f;
+            CurrentGroundBounce = NoSkyGroundBounce;
         }
 
         private void GenerateCloudNoiseLUT()
@@ -245,9 +290,8 @@ namespace Freefall.Components
             if (AnimateTimeOfDay)
             {
                 TimeOfDay += (float)Time.Delta * TimeOfDaySpeed;
-                if (TimeOfDay >= 24.0f) TimeOfDay -= 24.0f;
-                if (TimeOfDay < 0.0f) TimeOfDay += 24.0f;
-
+                if (TimeOfDay >= 24.0f) { TimeOfDay -= 24.0f; Day++; }
+                if (TimeOfDay < 0.0f) { TimeOfDay += 24.0f; Day--; }
             }
 
             CloudTime += (float)Time.Delta * CloudSpeed;
@@ -261,6 +305,7 @@ namespace Freefall.Components
             CurrentCloudShadowScale = CloudShadowScale;
 
             UpdateSunLight();
+            UpdateStarSphere();
             Daylight.Update((float)Time.Delta);
         }
 
@@ -296,31 +341,13 @@ namespace Freefall.Components
             if (SunLight == null) return;
 
             SunDirection = ComputeSunDirection(TimeOfDay, SunAzimuthAngle, MaxSunElevation, out Vector3 horizontal, out float elevation);
-
-            // Clamp light direction to prevent it from shining from below ground
-            float clampedElevation = MathF.Max(0.1f, elevation);
-            Vector3 lightDir = Vector3.Normalize(horizontal + Vector3.UnitY * clampedElevation);
-
-            // Set directional light rotation using CreateWorld
-            // Transform.Forward is what DirectionalLight uses as LightDirection
-            // The shader already negates this (L = -LightDirection), so we pass the direction light is pointing (toward ground)
-            SunLight.Transform.Rotation = Quaternion.CreateFromRotationMatrix(Matrix4x4.CreateWorld(Vector3.Zero, lightDir, Vector3.UnitY));
+            CurrentSunDirection = SunDirection;
 
             // ── Three-state blend matching sky_common.fx GetSkyColor ──
             ComputeDayNightFactors(elevation, out float dayFactor, out float sunsetFactor, out float nightFactor);
             CurrentDayFactor = dayFactor;
             CurrentSunsetFactor = sunsetFactor;
             CurrentNightFactor = nightFactor;
-
-            // Blended intensity
-            float intensity = dayFactor * DayIntensity
-                            + sunsetFactor * SunsetIntensity
-                            + nightFactor * NightIntensity;
-            SunLight.Intensity = intensity * SunIntensity;
-
-            // Ambient tracks blended sky brightness
-            AmbientScale = dayFactor * 1.0f + sunsetFactor * 0.4f + nightFactor * 0.05f;
-            CurrentSunDirection = SunDirection;
 
             // Sync atmosphere params to static accessors
             CurrentSkyTintColor = new Vector3(SkyTintColor.R, SkyTintColor.G, SkyTintColor.B);
@@ -335,11 +362,41 @@ namespace Freefall.Components
             CurrentNightSkyColor = new Vector3(NightSkyColor.R, NightSkyColor.G, NightSkyColor.B);
             CurrentNightHorizonColor = new Vector3(NightHorizonColor.R, NightHorizonColor.G, NightHorizonColor.B);
 
-            // Blended light color (day/sunset/night palettes matching shader)
-            SunLight.Color = new Color3(
-                dayFactor * SunDayColor.R + sunsetFactor * SunSunsetColor.R + nightFactor * SunNightColor.R,
-                dayFactor * SunDayColor.G + sunsetFactor * SunSunsetColor.G + nightFactor * SunNightColor.G,
-                dayFactor * SunDayColor.B + sunsetFactor * SunSunsetColor.B + nightFactor * SunNightColor.B);
+            // The sun's light: the day and sunset palettes (matching the shader); the night belongs to the moons.
+            // After sunset it keeps shining from 6° up (twilight) while it fades, never from below the ground.
+            float sunWeight = dayFactor + sunsetFactor;
+            float sunIntensity = (dayFactor * DayIntensity + sunsetFactor * SunsetIntensity) * SunIntensity;
+            float sunsetShare = sunWeight > 0f ? sunsetFactor / sunWeight : 1f;
+            var sunColor = new Color3(
+                SunDayColor.R + (SunSunsetColor.R - SunDayColor.R) * sunsetShare,
+                SunDayColor.G + (SunSunsetColor.G - SunDayColor.G) * sunsetShare,
+                SunDayColor.B + (SunSunsetColor.B - SunDayColor.B) * sunsetShare);
+            Vector3 sunLightDir = Vector3.Normalize(horizontal + Vector3.UnitY * MathF.Max(0.1f, elevation));
+
+            UpdateMoons();
+            ChooseLightSource(sunIntensity * Luminance(sunColor));
+
+            Vector3 lightDir = sunLightDir;
+            float lightIntensity = sunIntensity;
+            Color3 lightColor = sunColor;
+            if (_lightSource >= 0)
+            {
+                ref var moon = ref _moonLights[_lightSource];
+                lightDir = moon.Direction;
+                lightIntensity = moon.Intensity;
+                lightColor = moon.Color;
+            }
+
+            // Transform.Forward is what DirectionalLight uses as LightDirection; CreateWorld's forward becomes -Z, so
+            // passing the direction towards the source leaves Forward pointing from it towards the ground
+            Vector3 up = MathF.Abs(lightDir.Y) > 0.999f ? Vector3.UnitZ : Vector3.UnitY;
+            SunLight.Transform.Rotation = Quaternion.CreateFromRotationMatrix(Matrix4x4.CreateWorld(Vector3.Zero, lightDir, up));
+            SunLight.Intensity = lightIntensity * _lightFade;
+            SunLight.Color = lightColor;
+
+            float clouds = Math.Clamp(1f - CurrentCloudShadowStrength * CurrentCloudCoverage, 0f, 1f);
+            float onGround = SunLight.Enabled ? SunLight.Intensity * MathF.Max(0f, lightDir.Y) * clouds : 0f;
+            CurrentGroundBounce = GroundAlbedo * (new Vector3(lightColor.R, lightColor.G, lightColor.B) * onGround + Daylight.SkyAmbientColor());
 
             // Flat-shaded cloud color: mid shadow/sunlit gradient of each palette in mesh_skybox.fx
             static Vector3 V(Color3 c) => new Vector3(c.R, c.G, c.B);
@@ -348,6 +405,105 @@ namespace Freefall.Components
             Vector3 sunsetCloud = Vector3.Lerp(dayCloud, V(CloudSunsetTintColor) * dayBrightness, 0.5f);
             Vector3 nightCloud = V(CloudNightColor) * 0.75f * CloudNightBrightness;
             CurrentCloudColor = dayCloud * dayFactor + sunsetCloud * sunsetFactor + nightCloud * nightFactor;
+        }
+
+        /// <summary>
+        /// Where each moon stands, how much of it the sun lights and the light it gives; and what the sky shader draws.
+        /// A moon falls behind the sun by its phase × 24 h: beside the sun when new (phase 0), opposite it when full.
+        /// </summary>
+        private void UpdateMoons()
+        {
+            _moonCount = 0;
+            Span<int> textures = stackalloc int[MaxMoons];
+            double days = Day + TimeOfDay / 24.0;
+            foreach (var moon in Moons)
+            {
+                if (moon == null || _moonCount == MaxMoons) continue;
+
+                double cycle = days / Math.Max(moon.PeriodDays, 0.01f) + moon.PhaseOffset;
+                float phase = (float)(cycle - Math.Floor(cycle));
+                float hour = TimeOfDay - phase * 24f;
+                if (hour < 0f) hour += 24f;
+                Vector3 dir = ComputeSunDirection(hour, moon.Azimuth, moon.MaxElevation, out _, out float moonElevation);
+
+                // The part of the disc that is lit, seen from here: the sun lights the half facing it
+                float lit = 0.5f * (1f - Vector3.Dot(dir, SunDirection));
+                float t = Math.Clamp(moonElevation / 0.08f, 0f, 1f);
+                float aboveHorizon = t * t * (3f - 2f * t);
+
+                int i = _moonCount++;
+                _moonLights[i] = new MoonLight
+                {
+                    Direction = dir,
+                    Intensity = moon.LightIntensity * lit * aboveHorizon,
+                    Color = moon.LightColor,
+                };
+                _moonDirSize[i] = new Vector4(dir, moon.Size * 0.5f * (MathF.PI / 180f));
+                _moonColor[i] = new Vector4(moon.Tint.R, moon.Tint.G, moon.Tint.B, 0f) * moon.Brightness;
+                textures[i] = (int)(moon.Texture?.BindlessIndex ?? 0u);
+            }
+            _moonTextures = new Int4(textures[0], textures[1], textures[2], textures[3]);
+        }
+
+        /// <summary>
+        /// The one directional light shines from the sun or from the moon that gives the most light. It changes source
+        /// only when another gives 10% more, fading out first, so the shadows do not swing round while they show.
+        /// </summary>
+        private void ChooseLightSource(float sunStrength)
+        {
+            float Strength(int source) => source < 0
+                ? sunStrength
+                : _moonLights[source].Intensity * Luminance(_moonLights[source].Color);
+
+            int best = -1;
+            for (int i = 0; i < _moonCount; i++)
+                if (Strength(i) > Strength(best))
+                    best = i;
+
+            if (!_lightStarted || _lightSource >= _moonCount)
+            {
+                // A scene starts (or the moon list changed) with the light where it belongs, not fading
+                _lightStarted = true;
+                _lightSource = best;
+                _lightFade = 1f;
+                return;
+            }
+
+            int target = Strength(best) > Strength(_lightSource) * 1.1f ? best : _lightSource;
+            // A source that gives next to no light any more (a set sun, a moon gone under) needs no fading out
+            if (target != _lightSource && Strength(_lightSource) * _lightFade <= Strength(target) * 0.05f)
+                _lightFade = 0f;
+            if (target != _lightSource && _lightFade <= 0f)
+                _lightSource = target;
+
+            float step = Math.Clamp((float)Time.Delta, 0f, 0.1f) / LightHandoverSeconds;
+            _lightFade = target == _lightSource ? MathF.Min(1f, _lightFade + step) : MathF.Max(0f, _lightFade - step);
+        }
+
+        private static float Luminance(Color3 c) => 0.2126f * c.R + 0.7152f * c.G + 0.0722f * c.B;
+
+        /// <summary>
+        /// The stars turn round the pole of the sun's path once a day, the way the sun crosses the sky; at 06:00 the
+        /// star sphere lines up with the world. The Milky Way's band crosses the zenith at midnight, tilted off the
+        /// meridian, its bright core GalaxyCoreFromZenith away from it.
+        /// </summary>
+        private void UpdateStarSphere()
+        {
+            Vector3 rise = ComputeSunDirection(6f, SunAzimuthAngle, MaxSunElevation, out _, out _);
+            Vector3 noon = ComputeSunDirection(12f, SunAzimuthAngle, MaxSunElevation, out _, out _);
+            Vector3 pole = Vector3.Normalize(Vector3.Cross(rise, noon));
+            if (Vector3.Dot(Vector3.TransformNormal(rise, Matrix4x4.CreateFromAxisAngle(pole, MathF.PI / 2f)), noon) < 0f)
+                pole = -pole;
+
+            static float Turn(float hours) => (hours - 6f) / 24f * MathF.Tau;
+            _starRotation = Matrix4x4.CreateFromAxisAngle(pole, -Turn(TimeOfDay));
+
+            Vector3 zenith = Vector3.TransformNormal(Vector3.UnitY, Matrix4x4.CreateFromAxisAngle(pole, -Turn(24f)));
+            Vector3 meridian = Vector3.Cross(zenith, pole);     // normal of the plane through the pole and that zenith
+            meridian = meridian.LengthSquared() > 1e-6f ? Vector3.Normalize(meridian) : Vector3.UnitX;
+            _galaxyPole = Vector3.Normalize(Vector3.TransformNormal(meridian, Matrix4x4.CreateFromAxisAngle(zenith, GalaxyTilt)));
+            Vector3 along = Vector3.Normalize(Vector3.Cross(_galaxyPole, zenith));
+            _galaxyCenter = Vector3.Normalize(zenith * MathF.Cos(GalaxyCoreFromZenith) + along * MathF.Sin(GalaxyCoreFromZenith));
         }
 
         /// <summary>
@@ -389,10 +545,8 @@ namespace Freefall.Components
             SunIntensity = p.SunIntensity;
             DayIntensity = p.DayIntensity;
             SunsetIntensity = p.SunsetIntensity;
-            NightIntensity = p.NightIntensity;
             SunDayColor = p.SunDayColor;
             SunSunsetColor = p.SunSunsetColor;
-            SunNightColor = p.SunNightColor;
 
             SkyTintColor = p.SkyTintColor;
             AtmosphereDensity = p.AtmosphereDensity;
@@ -409,6 +563,7 @@ namespace Freefall.Components
             NightHorizonColor = p.NightHorizonColor;
             StarDensity = p.StarDensity;
             StarBrightness = p.StarBrightness;
+            MilkyWayBrightness = p.MilkyWayBrightness;
 
             CloudCoverage = p.CloudCoverage;
             CloudSpeed = p.CloudSpeed;
@@ -430,10 +585,8 @@ namespace Freefall.Components
             p.SunIntensity = SunIntensity;
             p.DayIntensity = DayIntensity;
             p.SunsetIntensity = SunsetIntensity;
-            p.NightIntensity = NightIntensity;
             p.SunDayColor = SunDayColor;
             p.SunSunsetColor = SunSunsetColor;
-            p.SunNightColor = SunNightColor;
 
             p.SkyTintColor = SkyTintColor;
             p.AtmosphereDensity = AtmosphereDensity;
@@ -450,6 +603,7 @@ namespace Freefall.Components
             p.NightHorizonColor = NightHorizonColor;
             p.StarDensity = StarDensity;
             p.StarBrightness = StarBrightness;
+            p.MilkyWayBrightness = MilkyWayBrightness;
 
             p.CloudCoverage = CloudCoverage;
             p.CloudSpeed = CloudSpeed;
@@ -484,6 +638,14 @@ namespace Freefall.Components
             Material.SetParameter("CloudSunsetTintColor", new Vector3(CloudSunsetTintColor.R, CloudSunsetTintColor.G, CloudSunsetTintColor.B));
             Material.SetParameter("CloudNightBrightness", CloudNightBrightness);
             Material.SetParameter("CloudNightColor", new Vector3(CloudNightColor.R, CloudNightColor.G, CloudNightColor.B));
+            Material.SetParameter("MoonDirSize", _moonDirSize);
+            Material.SetParameter("MoonColor", _moonColor);
+            Material.SetParameter("MoonTextures", _moonTextures);
+            Material.SetParameter("MoonCount", (uint)_moonCount);
+            Material.SetParameter("StarRotation", _starRotation);
+            Material.SetParameter("GalaxyPole", _galaxyPole);
+            Material.SetParameter("GalaxyCenter", _galaxyCenter);
+            Material.SetParameter("MilkyWayBrightness", MilkyWayBrightness);
 
             CommandBuffer.Enqueue(Mesh, Material, Params, slot);
         }

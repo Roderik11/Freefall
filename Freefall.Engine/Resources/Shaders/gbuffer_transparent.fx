@@ -313,11 +313,8 @@ PSOutput PS(VSOutput input)
     float3 diffuseLighting = diffuse * radiance * ao;
     float3 specLighting = spec * radiance;
 
-    // Hemisphere ambient
-    float hemi = N.y * 0.5 + 0.5;
-    float3 skyCol = float3(0.25, 0.28, 0.35);
-    float3 gndCol = float3(0.12, 0.11, 0.10);
-    float3 ambient = lerp(gndCol, skyCol, hemi) * ao * AmbientScale;
+    // Hemisphere ambient, the same as the opaque surfaces get in composition
+    float3 ambient = HemisphereAmbient(N) * ao;
     float3 lighting = diffuseLighting + ambient * color.rgb;
 
     // Emissive adds directly to lighting (self-illumination)
@@ -359,7 +356,7 @@ PSOutput PS(VSOutput input)
     // reflects the street, not the sky — mirroring the direction upwards made such panes glow).
     float3 reflectDir = reflect(-V, Ng);
     float3 skyReflect = GetSkyColor(normalize(float3(reflectDir.x, max(reflectDir.y, 0.02), reflectDir.z)), FogSunDirection);
-    float3 envReflect = lerp(gndCol * AmbientScale, skyReflect, smoothstep(-0.15, 0.1, reflectDir.y));
+    float3 envReflect = lerp(GroundBounce, skyReflect, smoothstep(-0.15, 0.1, reflectDir.y));
 
     // Base: the lit glass surface; the blend state mixes it over what is behind with alpha.
     // (Both lighting and refracted are linear HDR — finalize handles tonemapping.)

@@ -98,6 +98,19 @@ float3 GetSkyColor(float3 viewDir, float3 sunDir)
     return max(skyColor, 0.0);
 }
 
+// Hemisphere ambient for a surface normal, as a multiple of the surface's albedo: the sky above (its zenith colour,
+// which already darkens at night: never scale it by a day/night factor again), the ground's bounce light below.
+// One model for every lit pass (composition, glass); water takes the sky half.
+float3 SkyAmbientLight()
+{
+    return GetSkyColor(float3(0, 1, 0), FogSunDirection) * 0.45;
+}
+
+float3 HemisphereAmbient(float3 N)
+{
+    return lerp(GroundBounce, SkyAmbientLight(), N.y * 0.5 + 0.5);
+}
+
 // ────────────────────────────────────────────────
 // Cloud layer — shared by the sky dome (mesh_skybox.fx) and the cloud shadows on lit surfaces.
 // The layer is a flat plane CloudAltitude above the camera, anchored to the world in XZ so the

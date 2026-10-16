@@ -37,15 +37,9 @@ namespace Freefall.Assets
         [ValueRange(0f, 10f)]
         public float SunsetIntensity = 1.5f;
 
-        [Description("Directional light (moon) intensity at night")]
-        [ValueRange(0f, 10f)]
-        public float NightIntensity = 0.1f;
-
         public Color3 SunDayColor = new Color3(1.0f, 0.95f, 0.85f);
 
         public Color3 SunSunsetColor = new Color3(1.0f, 0.7f, 0.4f);
-
-        public Color3 SunNightColor = new Color3(0.1f, 0.15f, 0.3f);
 
         // ── Day sky ──
 
@@ -88,16 +82,20 @@ namespace Freefall.Assets
 
         [Category("Night Sky")]
         [Description("Zenith color at night")]
-        public Color3 NightSkyColor = new Color3(0.01f, 0.01f, 0.04f);
+        public Color3 NightSkyColor = new Color3(0.004f, 0.0065f, 0.018f);
 
         [Description("Horizon glow at night")]
-        public Color3 NightHorizonColor = new Color3(0.03f, 0.04f, 0.08f);
+        public Color3 NightHorizonColor = new Color3(0.02f, 0.027f, 0.045f);
 
         [ValueRange(0f, 1f)]
         public float StarDensity = 0.5f;
 
         [ValueRange(0f, 10f)]
         public float StarBrightness = 1.0f;
+
+        [Description("Glow of the Milky Way band (it turns with the stars; a moon washes it out)")]
+        [ValueRange(0f, 4f)]
+        public float MilkyWayBrightness = 1.0f;
 
         // ── Clouds ──
 
@@ -198,10 +196,8 @@ namespace Freefall.Assets
             dest.SunIntensity = L(a.SunIntensity, b.SunIntensity, t);
             dest.DayIntensity = L(a.DayIntensity, b.DayIntensity, t);
             dest.SunsetIntensity = L(a.SunsetIntensity, b.SunsetIntensity, t);
-            dest.NightIntensity = L(a.NightIntensity, b.NightIntensity, t);
             dest.SunDayColor = L(a.SunDayColor, b.SunDayColor, t);
             dest.SunSunsetColor = L(a.SunSunsetColor, b.SunSunsetColor, t);
-            dest.SunNightColor = L(a.SunNightColor, b.SunNightColor, t);
 
             dest.SkyTintColor = L(a.SkyTintColor, b.SkyTintColor, t);
             dest.AtmosphereDensity = L(a.AtmosphereDensity, b.AtmosphereDensity, t);
@@ -218,6 +214,7 @@ namespace Freefall.Assets
             dest.NightHorizonColor = L(a.NightHorizonColor, b.NightHorizonColor, t);
             dest.StarDensity = L(a.StarDensity, b.StarDensity, t);
             dest.StarBrightness = L(a.StarBrightness, b.StarBrightness, t);
+            dest.MilkyWayBrightness = L(a.MilkyWayBrightness, b.MilkyWayBrightness, t);
 
             dest.CloudCoverage = L(a.CloudCoverage, b.CloudCoverage, t);
             dest.CloudSpeed = L(a.CloudSpeed, b.CloudSpeed, t);

@@ -7,7 +7,6 @@ cbuffer SceneConstants : register(b0)
     row_major float4x4 ViewInverse;
     row_major float4x4 CameraInverse; // ViewProjection inverse for depth reconstruction
     row_major float4x4 CameraRelativeVP; // Zero-translation VP (inverse of CameraInverse)
-    float AmbientScale;               // Day/night ambient multiplier (0.05 night → 1.0 day)
     float ShadowTexelSize;             // 1.0 / shadowMapResolution (precomputed on CPU)
     float FogEnabled;                  // 0 or 1 toggle
     float FogDensity;                  // exponential squared density (e.g. 0.001)
@@ -29,7 +28,7 @@ cbuffer SceneConstants : register(b0)
     float3 NightHorizonColor;          // horizon glow at night
     float MieScattering;               // Mie (haze/glow) strength (0–1)
     float MieAnisotropy;               // Henyey-Greenstein g (0–0.99)
-    float3 _atmoPad;                   // explicit padding to 16-byte row
+    float3 GroundBounce;               // light the ground sends back up, as a multiple of albedo (SkyboxRenderer)
 
     // ── Cloud layer (set by SkyboxRenderer) — shared by the sky dome and the cloud shadows ──
     float CloudCoverage;               // 0-1
