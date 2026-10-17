@@ -33,7 +33,7 @@ namespace Freefall.Graphics
         private ID3D12Resource? _initialSpectrumTex;  // Tex2DArray N×N×bands, RGBA16F
         private ID3D12Resource? _spectrumTex;          // Tex2DArray N×N×bands*2, RGBA16F
         private ID3D12Resource? _displacementTex;      // Tex2DArray N×N×bands, RGBA16F (xyz + foam)
-        private ID3D12Resource? _slopeTex;             // Tex2DArray N×N×bands, RG16F
+        private ID3D12Resource? _slopeTex;             // Tex2DArray N×N×bands, RGBA16F slope moments (sx, sz, sx², sz²)
 
         // ── Bindless descriptor indices ──
         private uint _initialSpectrumUAV;
@@ -43,7 +43,8 @@ namespace Freefall.Graphics
 
         /// <summary>Bindless SRV for displacement Tex2DArray (xyz + foam in alpha).</summary>
         public uint DisplacementSRV { get; private set; }
-        /// <summary>Bindless SRV for slope Tex2DArray (dh/dx, dh/dz).</summary>
+        /// <summary>Bindless SRV for the slope moments Tex2DArray (dh/dx, dh/dz and their squares; with mips, so a
+        /// sample gives the mean slope and the slope variance of what it covers).</summary>
         public uint SlopeSRV { get; private set; }
         /// <summary>Bindless SRV for noise texture (Perlin+Worley, RGBA).</summary>
         public uint NoiseSRV { get; private set; }
@@ -235,16 +236,17 @@ namespace Freefall.Graphics
             DisplacementSRV = _device.AllocateBindlessIndex();
             CreateTex2DArraySRV(_displacementTex, Format.R16G16B16A16_Float, _numBands, mipCount, DisplacementSRV);
 
-            // Slope output: RG16F, N×N, numBands slices, with mips
+            // Slope moments output: RGBA16F (sx, sz, sx², sz²), N×N, numBands slices, with mips. The mips average all
+            // four, so the water shaders get the mean slope and the variance of whatever a sample covers.
             _slopeTex = _device.CreateTexture2D(
-                Format.R16G16_Float, N, N, _numBands, mipCount,
+                Format.R16G16B16A16_Float, N, N, _numBands, mipCount,
                 ResourceFlags.AllowUnorderedAccess, ResourceStates.Common);
 
             _slopeUAV = _device.AllocateBindlessIndex();
-            CreateTex2DArrayUAV(_slopeTex, Format.R16G16_Float, _numBands, _slopeUAV);
+            CreateTex2DArrayUAV(_slopeTex, Format.R16G16B16A16_Float, _numBands, _slopeUAV);
 
             SlopeSRV = _device.AllocateBindlessIndex();
-            CreateTex2DArraySRV(_slopeTex, Format.R16G16_Float, _numBands, mipCount, SlopeSRV);
+            CreateTex2DArraySRV(_slopeTex, Format.R16G16B16A16_Float, _numBands, mipCount, SlopeSRV);
 
             // Create per-mip UAVs for downsample chain
             _mipCount = mipCount;
@@ -260,7 +262,7 @@ namespace Freefall.Graphics
                 _displacementMipUAVs[m] = _device.AllocateBindlessIndex();
                 CreateTex2DArrayMipUAV(_displacementTex, Format.R16G16B16A16_Float, _numBands, m, _displacementMipUAVs[m]);
                 _slopeMipUAVs[m] = _device.AllocateBindlessIndex();
-                CreateTex2DArrayMipUAV(_slopeTex, Format.R16G16_Float, _numBands, m, _slopeMipUAVs[m]);
+                CreateTex2DArrayMipUAV(_slopeTex, Format.R16G16B16A16_Float, _numBands, m, _slopeMipUAVs[m]);
             }
         }
 
@@ -510,12 +512,12 @@ namespace Freefall.Graphics
                 _mipShader.Dispatch(_kDownsample, cmd, groups, groups);
                 cmd.ResourceBarrierUnorderedAccessView(_displacementTex!);
 
-                // Downsample slope (RG16F)
+                // Downsample the slope moments (RGBA16F: averaging s and s² keeps the variance of what a texel covers)
                 _mipShader.SetPushConstant(_kDownsample, "SrcMip", _slopeMipUAVs[mip - 1]);
                 _mipShader.SetPushConstant(_kDownsample, "DstMip", _slopeMipUAVs[mip]);
                 _mipShader.SetPushConstant(_kDownsample, "MipTexelSize", (uint)dstSize);
                 _mipShader.SetPushConstant(_kDownsample, "NumSlices", (uint)_numBands);
-                _mipShader.SetPushConstant(_kDownsample, "IsRG16F", 1u);
+                _mipShader.SetPushConstant(_kDownsample, "IsRG16F", 0u);
                 _mipShader.Dispatch(_kDownsample, cmd, groups, groups);
                 cmd.ResourceBarrierUnorderedAccessView(_slopeTex!);
 

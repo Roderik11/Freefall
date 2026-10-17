@@ -498,10 +498,13 @@ PSOutput PS(DSOutput input)
 
     // ── Merged per-band sampling: slope + displacement in one loop ──
     Texture2DArray<float4> dispTex = ResourceDescriptorHeap[ocean.DisplacementSRV];
-    Texture2DArray<float2> slopeTex = ResourceDescriptorHeap[ocean.SlopeSRV];
+    Texture2DArray<float4> slopeTex = ResourceDescriptorHeap[ocean.SlopeSRV];
     StructuredBuffer<float> tileScales = ResourceDescriptorHeap[ocean.TileScalesSRV];
 
-    float2 totalSlope = 0;
+    // Slope moments of every band (water_common.fx WaterSlopes): the mean slope makes the normal, the variance of
+    // the slopes under this pixel its roughness. NormalAtten scales the slopes (and so the variance by its square).
+    WaterSlopes slopes = (WaterSlopes)0;
+    float resolvedTotal = 0;
     float totalFoam = 0;
     float waveHeight = 0;
     float2 worldXZ = input.UndisplacedXZ.xy;
@@ -515,19 +518,20 @@ PSOutput PS(DSOutput input)
 
         // Filtered: the foam alpha is only a coverage mask, the visible detail comes from the foam texture
         float4 disp = dispTex.Sample(OceanSampler, float3(uv, i));
-        float2 slope = slopeTex.Sample(OceanSampler, float3(uv, i)).xy;
+        float4 moments = slopeTex.Sample(OceanSampler, float3(uv, i));
 
-        // Counter-rotate slopes back to world space
+        // Counter-rotate the mean slope back to world space (the variance does not depend on the rotation)
         float s, c;
         sincos(-angle, s, c);
-        totalSlope += float2(slope.x * c - slope.y * s, slope.x * s + slope.y * c);
+        float2 meanWorld = float2(moments.x * c - moments.y * s, moments.x * s + moments.y * c);
+        AddWaterBand(slopes, moments, meanWorld, ocean.NormalAtten);
+        resolvedTotal += WaterBandTotalVariance(slopeTex, OceanSampler, i, ocean.NormalAtten);
         totalFoam += disp.a;
         waveHeight += disp.y;
     }
 
-    // Build normal from accumulated slopes
-    float3 N = normalize(float3(-totalSlope.x, 1.0, -totalSlope.y));
-    N = normalize(lerp(float3(0, 1, 0), N, ocean.NormalAtten));
+    float3 N = normalize(float3(-slopes.mean.x, 1.0, -slopes.mean.y));
+    float alpha = WaterAlpha(slopes, WaterUnresolvedVariance(resolvedTotal));
 
     float NdotV = saturate(dot(N, V));
 
@@ -559,18 +563,11 @@ PSOutput PS(DSOutput input)
     float3 scatter = ((k1 + k2) * baseColor + k3 * baseColor + 0.02 * bubbleColor) * sunRadiance
                    + baseColor * WaterSkyIrradiance(input.SkyAmbient) * 0.1;   // light from the sky above, too
 
-    // ── Fresnel, sky reflection and sun glitter: shared with lakes and rivers (water_common.fx) ──
-    // Fresnel with the same distance-flattened normal the sky reflection mirrors with: far away the per-pixel
-    // normal is sub-pixel noise, and its scattered N·V took the grazing-angle reflectance (and with it the
-    // distant sea's brightness) down to about half.
-    // Toward the horizon it also moves from the roughness-adjusted curve (which tops out at 0.69) to plain
-    // Schlick: distant sea seen at ~88° mirrors ~0.85 of the sky, which is how bright the reference's was.
-    float distSmooth = WaterDistanceSmooth(dist);
-    float3 fresnelN = normalize(lerp(N, float3(0, 1, 0), distSmooth * 0.9));
-    float fresnelNV = saturate(dot(fresnelN, V));
-    float F = lerp(WaterFresnel(fresnelNV), 0.02 + 0.98 * pow(1.0 - fresnelNV, 5.0), distSmooth * 0.6);
-    float3 reflectColor = WaterSkyReflection(OceanSampler, V, N, worldPos - camPos, dist);
-    float3 specular = WaterSunSpecular(N, V, L, sunRadiance * 3.14159, F, dist);
+    // ── Reflectance, sky reflection and sun glint: shared with lakes and rivers (water_common.fx) ──
+    // All from the mean normal and the slope variance under the pixel: no distance ramps.
+    float F = WaterSpecularReflectance(NdotV, alpha);
+    float3 reflectColor = WaterSkyReflection(OceanSampler, V, N, worldPos - camPos, alpha);
+    float3 specular = WaterSunSpecular(N, V, L, sunRadiance * 3.14159, alpha);
 
     // ── Water column: what is seen through the surface ──
     // pathLen  = distance the view ray travels under water before it hits the scene (depth buffer)

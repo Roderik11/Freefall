@@ -150,21 +150,27 @@ PSOutput PS(VSOutput input)
     // scrolled downstream. Strip space bends with the river, so the scroll never shears.
     float2 patternPos = flowing ? float2(input.UV.x - water.FlowSpeed * t, input.UV.y) : worldPos.xz;
 
-    // ── Ripple normal ──
-    float2 slope = 0;
+    // ── Ripple normal and roughness: two ocean bands' slope moments (water_common.fx WaterSlopes) ──
+    WaterSlopes slopes = (WaterSlopes)0;
+    float resolvedTotal = 0;
     if (water.SlopeSRV != 0)
     {
-        Texture2DArray<float2> slopeTex = ResourceDescriptorHeap[water.SlopeSRV];
+        Texture2DArray<float4> slopeTex = ResourceDescriptorHeap[water.SlopeSRV];
         float2 p = patternPos / max(0.05, water.RippleSize);
-        slope = slopeTex.Sample(WaterSampler, float3(p * water.TileScaleA, water.BandA)).xy
-              + slopeTex.Sample(WaterSampler, float3(p * water.TileScaleB + 0.37, water.BandB)).xy;
-        slope *= water.RippleStrength * (1.0 + steep * 4.0);
+        float scale = water.RippleStrength * (1.0 + steep * 4.0);
+        float4 a = slopeTex.Sample(WaterSampler, float3(p * water.TileScaleA, water.BandA));
+        float4 b = slopeTex.Sample(WaterSampler, float3(p * water.TileScaleB + 0.37, water.BandB));
 
-        // Strip space → world
-        if (flowing)
-            slope = flowDir * slope.x + acrossDir * slope.y;
+        // Strip space → world (a rotation: the variance stays)
+        float2 meanA = flowing ? flowDir * a.x + acrossDir * a.y : a.xy;
+        float2 meanB = flowing ? flowDir * b.x + acrossDir * b.y : b.xy;
+        AddWaterBand(slopes, a, meanA, scale);
+        AddWaterBand(slopes, b, meanB, scale);
+        resolvedTotal = WaterBandTotalVariance(slopeTex, WaterSampler, water.BandA, scale)
+                      + WaterBandTotalVariance(slopeTex, WaterSampler, water.BandB, scale);
     }
-    float3 N = normalize(float3(-slope.x, 1.0, -slope.y));
+    float3 N = normalize(float3(-slopes.mean.x, 1.0, -slopes.mean.y));
+    float alpha = WaterAlpha(slopes, WaterUnresolvedVariance(resolvedTotal));
     float NdotV = saturate(dot(N, V));
 
     // ── Sun ──
@@ -181,9 +187,9 @@ PSOutput PS(VSOutput input)
                    + water.WaterColor * skyAmbient * 0.15;
 
     // ── Shared water shading ──
-    float F = WaterFresnel(NdotV);
-    float3 reflectColor = WaterSkyReflection(WaterSampler, V, N, worldPos - camPos, dist);
-    float3 specular = WaterSunSpecular(N, V, L, sunRadiance * 3.14159, F, dist);
+    float F = WaterSpecularReflectance(NdotV, alpha);
+    float3 reflectColor = WaterSkyReflection(WaterSampler, V, N, worldPos - camPos, alpha);
+    float3 specular = WaterSunSpecular(N, V, L, sunRadiance * 3.14159, alpha);
 
     WaterColumn column = GetWaterColumn(WaterSampler, water.DepthGBufferSRV, water.CompositeSRV,
         input.Position.xy * water.InvViewportSize, input.Depth, dist, abs(camPos.y - worldPos.y), N,

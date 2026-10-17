@@ -16,7 +16,7 @@ cbuffer PushConstants : register(b3)
     uint SpectrumParamsIdx;    // (unused here, shared layout with spectrum)
     uint OceanConstantsIdx;    // StructuredBuffer<OceanConstants>
     uint DisplacementIdx;      // RWTexture2DArray<float4> — output displacement + foam
-    uint SlopeIdx;             // RWTexture2DArray<float2> — output slopes
+    uint SlopeIdx;             // RWTexture2DArray<float4> — output slope moments (sx, sz, sx², sz²)
 };
 
 struct OceanConstants
@@ -145,7 +145,7 @@ void CSAssembleMaps(uint3 id : SV_DispatchThreadID)
 {
     RWTexture2DArray<float4> spectrumTex = ResourceDescriptorHeap[SpectrumIdx];
     RWTexture2DArray<float4> displacementTex = ResourceDescriptorHeap[DisplacementIdx];
-    RWTexture2DArray<float2> slopeTex = ResourceDescriptorHeap[SlopeIdx];
+    RWTexture2DArray<float4> slopeTex = ResourceDescriptorHeap[SlopeIdx];
     StructuredBuffer<OceanConstants> constants = ResourceDescriptorHeap[OceanConstantsIdx];
     OceanConstants oc = constants[0];
 
@@ -183,6 +183,8 @@ void CSAssembleMaps(uint3 id : SV_DispatchThreadID)
 
         // Write output
         displacementTex[uint3(id.xy, i)] = float4(displacement, foam);
-        slopeTex[uint3(id.xy, i)] = slopes;
+        // Slope moments: the mip chain averages all four, so a texel of any mip holds the mean slope and the mean
+        // squared slope of the waves it covers: their variance (E[s²] − E[s]²) is the roughness a pixel sees there
+        slopeTex[uint3(id.xy, i)] = float4(slopes, slopes * slopes);
     }
 }

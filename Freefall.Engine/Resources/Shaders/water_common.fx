@@ -65,70 +65,100 @@ float WaterSunShadow(uint shadowMapIdx, float3 relPos, float2 pixel)
         cascadeIndex, float3(0, 1, 0), LightDirection, zScale, pixel);
 }
 
-// Fresnel (Schlick, precomputed for F0 = 0.02, roughness = 0.075)
-float WaterFresnel(float NdotV)
+// ── Roughness from slope moments ──
+// ocean_fft.hlsl writes per band (sx, sz, sx², sz²) with a mip chain that averages all four, so a filtered sample
+// gives the mean slope of the waves it covers and their variance. The mean makes the normal; the variance is the
+// roughness of the surface as this pixel sees it: small near the camera (the waves are resolved, the normal carries
+// them), large far away (whole wave fields under one pixel). Nothing here depends on the distance. Bands are
+// independent, so their variances add; the variance is σx² + σz², which does not change with a band's rotation.
+struct WaterSlopes
 {
-    return saturate(0.02 + 0.668 * pow(1.0 - NdotV, 4.08));
+    float2 mean;        // world xz slope
+    float variance;     // σx² + σz² of the slopes under the sample
+};
+
+//   moments:   a band's sample; meanWorld: its mean slope (moments.xy) turned into world xz by the caller
+//   scale:     what the caller multiplies that band's slopes by
+void AddWaterBand(inout WaterSlopes s, float4 moments, float2 meanWorld, float scale)
+{
+    s.mean += meanWorld * scale;
+    s.variance += max(moments.z + moments.w - dot(moments.xy, moments.xy), 0.0) * scale * scale;
 }
 
-// 0 near the camera, 1 from ~330 m: how far the surface detail has collapsed below a pixel.
-// Drives the reflection flattening and the specular widening.
-float WaterDistanceSmooth(float dist)
+// A band's slope variance over its whole tile (the last mip: one texel averages the tile)
+float WaterBandTotalVariance(Texture2DArray<float4> slopeTex, SamplerState s, float slice, float scale)
 {
-    return saturate(dist * 0.003);
+    float w, h, elements, levels;
+    slopeTex.GetDimensions(0, w, h, elements, levels);
+    float4 m = slopeTex.SampleLevel(s, float3(0.5, 0.5, slice), levels - 1.0);
+    return max(m.z + m.w - dot(m.xy, m.xy), 0.0) * scale * scale;
 }
 
-// Sky (and cloud layer) mirrored in the water.
-// Far away the per-pixel normal is sub-pixel noise: flatten it so the reflection converges on the sky
-// just above the horizon in the mirrored view direction. The sky is the atmosphere's (SkyRadiance, the same
-// as the dome and the fog) and the low-sun mix below uses the true sun (AtmSunDirection), not the directional
-// light, which is the moon at night.
-//   relPos:     surface position relative to the camera
-float3 WaterSkyReflection(SamplerState wrapSampler, float3 V, float3 N, float3 relPos, float dist)
+// Mean square slope of a wind-roughened clean sea, both axes (Cox & Munk 1954): 0.003 + 5.12e-3 × wind (m/s)
+float CoxMunkVariance(float windSpeed)
 {
-    float reflSmooth = WaterDistanceSmooth(dist);
-    float3 reflN = normalize(lerp(N, float3(0, 1, 0), reflSmooth * 0.9));
-    float3 reflectDir = reflect(-V, reflN);
-    // How much of the cloud layer shows: the angle the surface really mirrors, going over to the flat mirror's
-    // (the view's own elevation) with distance, where what is left of the wave normal is sub-pixel noise.
-    float mirroredY = lerp(abs(reflectDir.y), abs(V.y), reflSmooth);
-    // Seen at a grazing angle, the wave facets turned toward the eye are the ones that show, and they mirror
-    // sky well above the horizon (~11° from ~330 m on; the reference's distant sea matched its sky at 10–14°):
-    // distant sea is bluer than the band of sky right above it. With the flattened normal alone it mirrored
-    // that band exactly (warm tan at sunset: a brown sea).
-    // Reached by 200 m: in between, pixels mirroring the fast gradient just above the horizon flipped between
-    // tan and blue from one ripple to the next (a grainy, speckled sea).
-    float3 lowDir = normalize(float3(reflectDir.x, max(abs(reflectDir.y), 0.02), reflectDir.z));
-    reflectDir.y = max(abs(reflectDir.y), lerp(0.03, 0.2, saturate(dist / 200.0)));
-    reflectDir = normalize(reflectDir);
-    float3 skyRefl = SkyRadiance(reflectDir);
+    return 0.003 + 0.00512 * max(windSpeed, 0.0);
+}
 
-    // The facets mirror a spread of angles. Toward a low sun the low ones see the bright glow round it and
-    // outshine the rest: the broad golden sheen on the sea under a setting sun. So mix in the low mirror
-    // direction, by how much the reflection points toward the sun.
-    float3 sunDir = AtmSunDirection();
-    float towardSun = saturate(dot(normalize(reflectDir.xz + 1e-5), normalize(sunDir.xz + 1e-5)));
-    float lowWeight = lerp(0.15, 0.75, towardSun * towardSun) * saturate(1.0 - sunDir.y * 2.0);
-    skyRefl = lerp(skyRefl, SkyRadiance(lowDir), lowWeight);
+// The roughness the FFT does not carry: the slopes below the finest band's resolution (capillary waves, millimetres
+// to centimetres). Cox-Munk's total at the current wind (SceneConstants.WindStrength: the preset's) minus what the
+// bands resolve over their whole tiles, never below Cox-Munk's calm-water floor.
+float WaterUnresolvedVariance(float resolvedTotal)
+{
+    return max(CoxMunkVariance(WindStrength) - resolvedTotal, 0.003);
+}
 
-    // Cloud layer: same plane / UVs / density as the sky dome, flat-shaded with the light on it
+// GGX roughness of the surface: α² = σx² + σz² (Beckmann m² = 2σ² per axis, GGX α ≈ m). Isotropic: each band's
+// slopes are rotated (BandAngles), which loses the cross term an anisotropic α would need; the sea's up-wind to
+// cross-wind ratio is only ~1.6 (Cox-Munk).
+float WaterAlpha(WaterSlopes s, float unresolved)
+{
+    return sqrt(max(s.variance + unresolved, 1e-4));
+}
+
+static const float WaterF0 = 0.02;     // water, n = 1.33
+
+// How much of the light round the mirror direction a rough water surface sends to the eye (Fresnel and the waves'
+// masking together): Karis' fit of the split-sum environment BRDF, with the mean normal. What is not reflected
+// enters the water (1 − this lights the body).
+float WaterSpecularReflectance(float NdotV, float alpha)
+{
+    float roughness = sqrt(alpha);     // perceptual
+    const float4 c0 = float4(-1.0, -0.0275, -0.572, 0.022);
+    const float4 c1 = float4(1.0, 0.0425, 1.04, -0.04);
+    float4 r = roughness * c0 + c1;
+    float a004 = min(r.x * r.x, exp2(-9.28 * saturate(NdotV))) * r.x + r.y;
+    float2 AB = float2(-1.04, 1.04) * a004 + r.zw;
+    return saturate(WaterF0 * AB.x + AB.y);
+}
+
+// The sky (and the cloud layer) a rough water surface mirrors, looked up where its reflection lobe peaks: from the
+// mirror direction of the mean normal toward the normal, the more the rougher (Frostbite's dominant direction).
+// That is why a rough sea far away mirrors sky well above the horizon. A lobe reaching under the horizon mirrors other
+// waves, which mirror the sky: it stays at the horizon. ATMOSPHERE_PLAN.md stage 4 replaces the single lookup with the
+// prefiltered sky probe (the whole lobe, the glow round a low sun included).
+//   relPos: surface position relative to the camera
+float3 WaterSkyReflection(SamplerState wrapSampler, float3 V, float3 N, float3 relPos, float alpha)
+{
+    float3 R = reflect(-V, N);
+    float smoothness = saturate(1.0 - alpha);
+    float3 dir = lerp(N, R, smoothness * (sqrt(smoothness) + alpha));
+    dir.y = max(dir.y, 0.0);
+    dir = normalize(dir);
+    float3 skyRefl = SkyRadiance(dir);
+
+    // Cloud layer: same plane / UVs / density as the sky dome (and its horizon fade), flat-shaded with the light on it
     // (sky_common.fx GetCloudLight: the sun and moon through the air, the sky's ambient, the air in front)
-    if (CloudNoiseLUTIdx != 0)
+    if (CloudNoiseLUTIdx != 0 && dir.y > 0.01)
     {
         Texture3D<float4> cloudLUT = ResourceDescriptorHeap[CloudNoiseLUTIdx];
-        float2 cloudUV = CloudLayerUV(relPos.xz + reflectDir.xz * (CloudAltitude / reflectDir.y));
-        float cloudMip = saturate(1.0 - reflectDir.y * 5.0) * 3.0;
+        float2 cloudUV = CloudLayerUV(relPos.xz + dir.xz * (CloudAltitude / dir.y));
+        float cloudMip = saturate(1.0 - dir.y * 5.0) * 3.0;
         float cloudDensity = smoothstep(0.0, 0.45, CloudBaseDensity(cloudLUT, wrapSampler, cloudUV, cloudMip));
-        // Faded by the angle the surface really mirrors: with the floor's angle, every distant pixel picked up
-        // the cloud layer 11° up and the far sea broke into big pale blotches.
-        cloudDensity *= smoothstep(0.0, 0.22, mirroredY);
+        cloudDensity *= smoothstep(0.0, 0.22, dir.y);
         if (cloudDensity > 0.001)
-            skyRefl = lerp(skyRefl, CloudFlatRadiance(GetCloudLight(reflectDir)), 1.0 - exp(-cloudDensity * 4.5));
+            skyRefl = lerp(skyRefl, CloudFlatRadiance(GetCloudLight(dir)), 1.0 - exp(-cloudDensity * 4.5));
     }
-
-    // The Fresnel term outside already sets how much of the sky shows. Near water used to get only half of it
-    // (an art-directed darkening from the white sky of before 2026-10-17); with the scattering sky that left
-    // the sunset sea far darker than the reference.
     return skyRefl;
 }
 
@@ -144,36 +174,27 @@ float3 WaterSkyIrradiance(float3 skyAmbient)
 // buffer gives speckle on foliage (pixel-sized gaps make neighbouring rays hit or miss at random),
 // barcode-like stripes from trunks against bright sky, and halos once blurred enough to hide both.
 // Scene reflections are to come from ray tracing instead. See the ocean knowledge doc.
-// GGX sun glitter (widened with distance to keep it from sparkling). F = WaterFresnel(NdotV).
-// Cook-Torrance: F·D·G / (4·N·L·N·V) × N·L, with the height-correlated Smith term as G / (4·N·L·N·V).
-// Until 2026-10-17 this returned F·D·N·L / 4: a factor N·L·N·V too small, harmless at noon but ~0.01 with a
-// low sun and a grazing view, so a sunset had no glitter path at all.
-// One GGX lobe (D × visibility, without F) for a perceptual roughness
-float WaterGGXLobe(float NdotH, float NdotL, float NdotV, float rough)
-{
-    float a = rough * rough;
-    float a2 = a * a;
-    float dGGX = (NdotH * NdotH) * (a2 - 1.0) + 1.0;
-    float D = a2 / max(3.14159 * dGGX * dGGX, 1e-4);
-    float vis = 0.5 / max(NdotL * sqrt(NdotV * NdotV * (1.0 - a2) + a2)
-                        + NdotV * sqrt(NdotL * NdotL * (1.0 - a2) + a2), 1e-5);
-    return D * vis;
-}
 
-float3 WaterSunSpecular(float3 N, float3 V, float3 L, float3 sunRadiance, float F, float dist)
+// The sun's glint off the waves a pixel covers: Cook-Torrance GGX with the height-correlated Smith visibility,
+// F·D·Vis·N·L. α is the slope variance under the pixel (WaterAlpha), so the one lobe gives the sparkles near the
+// camera and the broad path far away. Replaced 2026-10-17: two hand-tuned lobes whose roughness grew with distance
+// (tuned while the water's sun lacked its π, so with it the far sea at noon went milky white).
+//   sunIrradiance: E of the directional light (× π, pre-exposed, shadowed)
+float3 WaterSunSpecular(float3 N, float3 V, float3 L, float3 sunIrradiance, float alpha)
 {
     float NdotL = saturate(dot(N, L));
+    if (NdotL <= 0.0)
+        return 0;
     float NdotV = max(dot(N, V), 1e-3);
-    float NdotH = max(0.0001, dot(N, normalize(L + V)));
-    // Ripples far below a pixel spread the sun's reflection: 0.075 near the camera kept the sunset path a
-    // thin line of sparkles where the reference shows a broad golden band.
-    float sharp = WaterGGXLobe(NdotH, NdotL, NdotV, lerp(0.2, 0.55, saturate(dist * 0.004)));
-    // Glitter is two things: sparkles off the resolved waves and a broad, dimmer sheen off the countless
-    // capillary ripples the FFT does not resolve (their slopes reach ~±15°, Cox-Munk). The sheen lights the
-    // whole sun side of the sea golden; with the sharp lobe alone that side stayed dark and the path's peaks
-    // blew out to white.
-    float broad = WaterGGXLobe(NdotH, NdotL, NdotV, lerp(0.5, 0.7, saturate(dist * 0.002)));
-    return sunRadiance * F * (sharp * 0.75 + broad * 0.25) * NdotL;
+    float3 H = normalize(L + V);
+    float NdotH = saturate(dot(N, H));
+    float a2 = max(alpha * alpha, 1e-6);
+    float d = NdotH * NdotH * (a2 - 1.0) + 1.0;
+    float D = a2 / (3.14159 * d * d);
+    float vis = 0.5 / max(NdotL * sqrt(NdotV * NdotV * (1.0 - a2) + a2)
+                        + NdotV * sqrt(NdotL * NdotL * (1.0 - a2) + a2), 1e-5);
+    float F = WaterF0 + (1.0 - WaterF0) * pow(1.0 - saturate(dot(V, H)), 5.0);
+    return sunIrradiance * (F * D * vis * NdotL);
 }
 
 // What is seen through the surface, from the depth buffer.
