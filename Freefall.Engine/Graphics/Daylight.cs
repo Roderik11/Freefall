@@ -72,23 +72,15 @@ namespace Freefall.Graphics
             return 0f;
         }
 
-        // What the sky's ambient adds to an up-facing surface, as a multiple of its albedo: sky_common.fx's
-        // SkyAmbientLight() = GetSkyColor(up) × 0.45, from the CPU copy of the sky model (SkyModel). 0 without a sky.
+        // What the sky's ambient adds to an up-facing surface, as a multiple of its albedo, in the same older units:
+        // sky_common.fx's SkyAmbientLight(), read back from the atmosphere's ambient pass a few frames late. 0 without a
+        // sky. (Both halves move to lux with auto exposure: ATMOSPHERE_PLAN.md stage 2.)
         public static float SkyAmbient()
         {
-            var sky = SkyAmbientColor();
-            return Luminance(sky.X, sky.Y, sky.Z);
-        }
-
-        public static Vector3 SkyAmbientColor()
-        {
             if (ComponentCache<SkyboxRenderer>.All.Count == 0)
-                return Vector3.Zero;
-            Vector3 sky = SkyModel.ZenithSkyColor(SkyboxRenderer.CurrentSunDirection.Y, SkyboxRenderer.CurrentSkyTintColor,
-                SkyboxRenderer.CurrentAtmosphereDensity, SkyboxRenderer.CurrentMieScattering, SkyboxRenderer.CurrentMieAnisotropy,
-                SkyboxRenderer.CurrentDayFactor, SkyboxRenderer.CurrentSunsetFactor, SkyboxRenderer.CurrentNightFactor,
-                SkyboxRenderer.CurrentNightSkyColor);
-            return sky * 0.45f;
+                return 0f;
+            var sky = Atmosphere.SkyAmbientLegacy;
+            return Luminance(sky.X, sky.Y, sky.Z);
         }
 
         private static float Luminance(float r, float g, float b) => 0.2126f * r + 0.7152f * g + 0.0722f * b;

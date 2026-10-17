@@ -12,12 +12,12 @@ namespace Freefall.Assets
     /// by <see cref="Lerp"/> — that is why precipitation is stored as one intensity
     /// per type instead of an enum (rain can fade out while snow fades in).
     ///
-    /// Parameters are organized into Day / Sunset / Night groups: the sun elevation
-    /// (driven by <c>SkyboxRenderer.TimeOfDay</c>) blends between those groups at
-    /// runtime, so a preset describes the full 24h cycle, not a single moment.
+    /// A preset says what the air is made of and what lights it; the time of day (SkyboxRenderer.TimeOfDay) does the
+    /// rest through the physical atmosphere (Graphics.Atmosphere): the same preset gives the noon, the sunset and the
+    /// night, with nothing per time of day.
     ///
     /// Presets are applied by <c>EnvironmentController</c>, which pushes the blended
-    /// result into <c>SkyboxRenderer</c>, the fog settings and the weather emitters.
+    /// result into <c>SkyboxRenderer</c> and the weather emitters.
     /// </summary>
     [CreateAsset("Environment Preset")]
     public class EnvironmentPreset : Asset
@@ -25,66 +25,55 @@ namespace Freefall.Assets
         // ── Sun ──
 
         [Category("Sun")]
-        [Description("Sun brightness multiplier applied on top of the day/night intensity")]
-        [ValueRange(0f, 10f)]
-        public float SunIntensity = 1.2f;
+        [Description("Sunlight at the top of the atmosphere in lux (Earth: about 120000); the air takes its share on the way down")]
+        [ValueRange(0f, 200000f)]
+        public float SunIlluminance = 120000f;
 
-        [Description("Directional light intensity when the sun is at its highest")]
-        [ValueRange(0f, 10f)]
-        public float DayIntensity = 3.14159f;
-
-        [Description("Directional light intensity during sunset/sunrise")]
-        [ValueRange(0f, 10f)]
-        public float SunsetIntensity = 1.5f;
-
-        [Description("The sun's own tint. Its reddening at sunset comes from the sky model (the light's path through the air)")]
+        [Description("The sun's own tint. Its reddening at sunset comes from the air")]
         public Color3 SunDayColor = new Color3(1.0f, 0.95f, 0.85f);
 
-        // ── Day sky ──
+        // ── Atmosphere ──
 
-        [Category("Day Sky")]
-        [Description("Overall daytime sky color multiplier")]
-        public Color3 SkyTintColor = new Color3(0.5f, 0.7f, 1.0f);
+        [Category("Atmosphere")]
+        [Description("The air's Rayleigh scattering (1 = Earth): the blue of the sky, the reddening of a low sun")]
+        [ValueRange(0f, 4f)]
+        public float RayleighScale = 1f;
 
-        [Description("Global atmosphere thickness")]
-        [ValueRange(0.5f, 3f)]
-        public float AtmosphereDensity = 1.0f;
+        [Description("Aerosols (1 = Earth's average): the haze over the land, the glow round the sun")]
+        [ValueRange(0f, 10f)]
+        public float MieScale = 1f;
 
-        [Description("Mie haze/glow strength (sun halo)")]
-        [ValueRange(0f, 1f)]
-        public float MieScattering = 0.02f;
+        [Description("How much the aerosols and the fog scatter forward: higher = a tighter glow round the sun")]
+        [ValueRange(0f, 0.95f)]
+        public float MieAnisotropy = 0.8f;
 
-        [Description("Henyey-Greenstein anisotropy — higher = tighter sun glow")]
-        [ValueRange(0f, 0.99f)]
-        public float MieAnisotropy = 0.76f;
+        [Description("Ozone (1 = Earth): keeps the twilight sky blue overhead")]
+        [ValueRange(0f, 4f)]
+        public float OzoneScale = 1f;
 
-        [Description("Colored haze at the horizon")]
-        public Color3 HazeColor = new Color3(0.8f, 0.85f, 0.9f);
+        [Description("Average albedo of the ground: the light it bounces into the sky and onto surfaces facing down")]
+        public Color3 GroundAlbedo = new Color3(0.11f, 0.10f, 0.085f);
 
-        [ValueRange(0f, 2f)]
-        public float HazeIntensity = 0.3f;
+        // ── Ground fog ──
 
-        [Description("How high the haze reaches (viewDir.y)")]
-        [ValueRange(0f, 1f)]
-        public float HazeHeight = 0.15f;
+        [Category("Ground Fog")]
+        [Description("Extinction of the ground fog per metre at sea level: 0.0001 = about 40 km visibility, 0.001 = 4 km, 0 = none")]
+        [ValueRange(0f, 0.01f, 0.00001f)]
+        public float FogDensity = 0.0001f;
 
-        // ── Sunset ──
+        [Description("Metres of height over which the fog thins to a third")]
+        [ValueRange(10f, 3000f)]
+        public float FogHeight = 400f;
 
-        [Category("Sunset")]
-        [Description("Warm color near the horizon at sunset/sunrise")]
-        public Color3 SunsetTintColor = new Color3(1.0f, 0.5f, 0.2f);
-
-        [ValueRange(0f, 2f)]
-        public float SunsetTintIntensity = 0.8f;
+        [Description("The fog's single-scattering albedo: near white for mist, warm for dust, dark for smoke")]
+        public Color3 FogColor = new Color3(0.9f, 0.9f, 0.9f);
 
         // ── Night sky ──
 
         [Category("Night Sky")]
-        [Description("Zenith color at night")]
-        public Color3 NightSkyColor = new Color3(0.004f, 0.0065f, 0.018f);
-
-        [Description("Horizon glow at night")]
-        public Color3 NightHorizonColor = new Color3(0.02f, 0.027f, 0.045f);
+        [Description("Glow of the upper air on a moonless night, cd/m² at the zenith (Earth: about 0.0002)")]
+        [ValueRange(0f, 0.01f, 0.00001f)]
+        public float AirglowLuminance = 2e-4f;
 
         [ValueRange(0f, 1f)]
         public float StarDensity = 0.5f;
@@ -92,7 +81,7 @@ namespace Freefall.Assets
         [ValueRange(0f, 10f)]
         public float StarBrightness = 1.0f;
 
-        [Description("Glow of the Milky Way band (it turns with the stars; a moon washes it out)")]
+        [Description("Glow of the Milky Way band (it turns with the stars; a moon's light in the air washes it out)")]
         [ValueRange(0f, 4f)]
         public float MilkyWayBrightness = 1.0f;
 
@@ -109,36 +98,13 @@ namespace Freefall.Assets
         [ValueRange(500f, 5000f)]
         public float CloudAltitude = 1800.0f;
 
-        [Description("Daytime cloud brightness")]
-        [ValueRange(0f, 3f)]
-        public float CloudBrightness = 1.0f;
-
-        [Description("Daytime color of sun-facing cloud tops")]
-        public Color3 CloudSunlitColor = new Color3(1.0f, 0.98f, 0.95f);
-
-        [Description("Daytime color of the cloud shade side")]
-        public Color3 CloudShadowColor = new Color3(0.35f, 0.4f, 0.55f);
-
-        [Description("Warm tint mixed into clouds at sunset/sunrise")]
-        public Color3 CloudSunsetTintColor = new Color3(1.0f, 0.6f, 0.3f);
-
-        [Description("Moonlit cloud color at night")]
-        public Color3 CloudNightColor = new Color3(0.08f, 0.09f, 0.14f);
-
-        [Description("Night-time cloud brightness")]
-        [ValueRange(0f, 3f)]
-        public float CloudNightBrightness = 1.0f;
+        [Description("Share of the light a cloud sends back: lower = darker clouds (a storm)")]
+        [ValueRange(0f, 1f)]
+        public float CloudAlbedo = 0.8f;
 
         [Description("How much sunlight the clouds block on the ground (0 = no cloud shadows)")]
         [ValueRange(0f, 1f)]
         public float CloudShadowStrength = 0.8f;
-
-        // ── Fog ──
-
-        [Category("Fog")]
-        [Description("Exponential-squared fog density (see Engine.Settings.FogDensity)")]
-        [ValueRange(0f, 0.01f, 0.0001f)]
-        public float FogDensity = 0.0005f;
 
         // ── Weather ──
 
@@ -192,24 +158,20 @@ namespace Freefall.Assets
         {
             t = Math.Clamp(t, 0f, 1f);
 
-            dest.SunIntensity = L(a.SunIntensity, b.SunIntensity, t);
-            dest.DayIntensity = L(a.DayIntensity, b.DayIntensity, t);
-            dest.SunsetIntensity = L(a.SunsetIntensity, b.SunsetIntensity, t);
+            dest.SunIlluminance = L(a.SunIlluminance, b.SunIlluminance, t);
             dest.SunDayColor = L(a.SunDayColor, b.SunDayColor, t);
 
-            dest.SkyTintColor = L(a.SkyTintColor, b.SkyTintColor, t);
-            dest.AtmosphereDensity = L(a.AtmosphereDensity, b.AtmosphereDensity, t);
-            dest.MieScattering = L(a.MieScattering, b.MieScattering, t);
+            dest.RayleighScale = L(a.RayleighScale, b.RayleighScale, t);
+            dest.MieScale = L(a.MieScale, b.MieScale, t);
             dest.MieAnisotropy = L(a.MieAnisotropy, b.MieAnisotropy, t);
-            dest.HazeColor = L(a.HazeColor, b.HazeColor, t);
-            dest.HazeIntensity = L(a.HazeIntensity, b.HazeIntensity, t);
-            dest.HazeHeight = L(a.HazeHeight, b.HazeHeight, t);
+            dest.OzoneScale = L(a.OzoneScale, b.OzoneScale, t);
+            dest.GroundAlbedo = L(a.GroundAlbedo, b.GroundAlbedo, t);
 
-            dest.SunsetTintColor = L(a.SunsetTintColor, b.SunsetTintColor, t);
-            dest.SunsetTintIntensity = L(a.SunsetTintIntensity, b.SunsetTintIntensity, t);
+            dest.FogDensity = L(a.FogDensity, b.FogDensity, t);
+            dest.FogHeight = L(a.FogHeight, b.FogHeight, t);
+            dest.FogColor = L(a.FogColor, b.FogColor, t);
 
-            dest.NightSkyColor = L(a.NightSkyColor, b.NightSkyColor, t);
-            dest.NightHorizonColor = L(a.NightHorizonColor, b.NightHorizonColor, t);
+            dest.AirglowLuminance = L(a.AirglowLuminance, b.AirglowLuminance, t);
             dest.StarDensity = L(a.StarDensity, b.StarDensity, t);
             dest.StarBrightness = L(a.StarBrightness, b.StarBrightness, t);
             dest.MilkyWayBrightness = L(a.MilkyWayBrightness, b.MilkyWayBrightness, t);
@@ -217,15 +179,8 @@ namespace Freefall.Assets
             dest.CloudCoverage = L(a.CloudCoverage, b.CloudCoverage, t);
             dest.CloudSpeed = L(a.CloudSpeed, b.CloudSpeed, t);
             dest.CloudAltitude = L(a.CloudAltitude, b.CloudAltitude, t);
-            dest.CloudBrightness = L(a.CloudBrightness, b.CloudBrightness, t);
-            dest.CloudSunlitColor = L(a.CloudSunlitColor, b.CloudSunlitColor, t);
-            dest.CloudShadowColor = L(a.CloudShadowColor, b.CloudShadowColor, t);
-            dest.CloudSunsetTintColor = L(a.CloudSunsetTintColor, b.CloudSunsetTintColor, t);
-            dest.CloudNightColor = L(a.CloudNightColor, b.CloudNightColor, t);
-            dest.CloudNightBrightness = L(a.CloudNightBrightness, b.CloudNightBrightness, t);
+            dest.CloudAlbedo = L(a.CloudAlbedo, b.CloudAlbedo, t);
             dest.CloudShadowStrength = L(a.CloudShadowStrength, b.CloudShadowStrength, t);
-
-            dest.FogDensity = L(a.FogDensity, b.FogDensity, t);
 
             dest.RainIntensity = L(a.RainIntensity, b.RainIntensity, t);
             dest.SnowIntensity = L(a.SnowIntensity, b.SnowIntensity, t);

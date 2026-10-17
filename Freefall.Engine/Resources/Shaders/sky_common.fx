@@ -1,216 +1,70 @@
 // ────────────────────────────────────────────────
-// Shared procedural sky color: Rayleigh + Mie scattering with artist overrides
-// Used by mesh_skybox.fx, composition_cs.hlsl, ocean.fx, gbuffer_transparent.fx
+// The sky as every lit pass sees it: its light in a direction, the ambient it gives, the ground's bounce light, the
+// aerial perspective (fog) and the light on the cloud layer. All of it comes from the atmosphere
+// (atmosphere_common.hlsli, made each frame by Graphics/Atmosphere.cs): there is no second sky model to keep in step.
+// Light here is as the HDR targets store it: physical (cd/m²) × Exposure.
+// Used by mesh_skybox.fx, composition_cs.hlsl, light_directional_cs.hlsl, ocean.fx, water.fx, gbuffer_transparent.fx.
 //
-// Requires: SceneConstants (b0) from common.fx for atmosphere parameters
+// Requires: SceneConstants (b0) from common.fx.
 // ────────────────────────────────────────────────
+#ifndef SKY_COMMON
+#define SKY_COMMON
 
-// Rayleigh phase function: (3/16π)(1 + cos²θ)
-float RayleighPhase(float cosTheta)
+#include "atmosphere_common.hlsli"
+
+// Direction toward the sun (the true sun, also below the horizon), for passes that need its place in the sky
+float3 AtmSunDirection()
 {
-    return (3.0 / (16.0 * 3.14159265)) * (1.0 + cosTheta * cosTheta);
+    if (AtmosphereIdx == 0)
+        return float3(0, 1, 0);
+    return LoadAtmosphere().SunDirection;
 }
 
-// Henyey-Greenstein phase function for Mie scattering
-float HGPhase(float cosTheta, float g)
+// The sky's light from a direction: sun, moon and airglow scattered by the air, no discs, stars or clouds
+float3 SkyRadiance(float3 dir)
 {
-    float g2 = g * g;
-    float denom = 1.0 + g2 - 2.0 * g * cosTheta;
-    return (1.0 - g2) / (4.0 * 3.14159265 * pow(abs(denom), 1.5));
+    if (AtmosphereIdx == 0)
+        return 0;
+    return AtmosphereSkyLuminance(LoadAtmosphere(), dir) * Exposure;
 }
 
-// Day / sunset / night weights for a sun elevation (sunDir.y). Normalized, sum to 1.
-// Must match SkyboxRenderer.ComputeDayNightFactors() on the CPU (drives light intensity/color).
-void GetDayNightFactors(float sunElevation, out float dayFactor, out float sunsetFactor, out float nightFactor)
-{
-    dayFactor = saturate((sunElevation - 0.0) / 0.8);
-    dayFactor = pow(dayFactor, 0.7);
-
-    sunsetFactor = 0.0;
-    if (sunElevation < 0.15 && sunElevation > -0.2)
-    {
-        sunsetFactor = 1.0 - abs((sunElevation - (-0.025)) / 0.175);
-        sunsetFactor = max(0.0, sunsetFactor);
-    }
-
-    nightFactor = saturate((-sunElevation - 0.15) / 0.3);
-
-    float total = dayFactor + sunsetFactor + nightFactor;
-    if (total > 0.0)
-    {
-        dayFactor /= total;
-        sunsetFactor /= total;
-        nightFactor /= total;
-    }
-}
-
-// Relative air mass along a direction of elevation sin = mu: 1 at the zenith, ~9 at 6°, ~40 at the horizon
-// (a curved-atmosphere fit; 1/mu would go to infinity at the horizon).
-float AirMass(float mu)
-{
-    mu = max(mu, 0.0);
-    return 1.0 / (mu + 0.025 * exp(-11.0 * mu));
-}
-
-// Optical depth of clear air straight up, for red / green / blue (Rayleigh, ∝ λ⁻⁴ at ~612 / 549 / 465 nm).
-static const float3 SkyRayleighDepth = float3(0.065, 0.10, 0.196);
-
-// The preset's haze (MieScattering) as an optical depth, grey: Clear Day 0.02 → 0.03, Desert Haze 0.09 → 0.135.
-float SkyMieDepth()
-{
-    return MieScattering * 1.5;
-}
-
-// Air mass of the haze. It lies low (a thin layer against ~8 km for the air), so its slant path grows much
-// more in the last few degrees above the horizon (~330 at the horizon, like the air's above ~5°). That is
-// why the horizon of a sunset is warm: there the haze, which scatters every colour alike and so shows the
-// reddened sunlight as it is, outweighs the air, which would scatter the orange back toward yellow. Thin
-// straight up, it leaves the noon zenith blue (a thicker haze turned it grey).
-float HazeAirMass(float mu)
-{
-    mu = max(mu, 0.0);
-    return 1.0 / (mu + 0.003 * exp(-30.0 * mu));
-}
-
-// Ozone absorbs (it does not scatter) around 600 nm, between our red and green, blue hardly at all. It
-// sits high (~25 km), so the sun's light crosses it on its way to every point of the sky, along a slant that
-// is long when the sun is low. That keeps the upper sky of a sunset blue and its glow orange rather than
-// yellow; without it the fit against the reference stayed grey-green up high and lemon on the horizon.
-static const float3 SkyOzoneDepth = float3(0.075, 0.065, 0.006);
-
-float OzoneAirMass(float mu)
-{
-    mu = max(mu, 0.0);
-    return rsqrt(mu * mu + 0.0079);   // a thin shell 25 km up: ~11 at the horizon
-}
-
-// Optical depth of the sun's slant path toward elevation sin = mu: air plus haze plus ozone, per channel
-float3 SkySlantDepth(float mu)
-{
-    return SkyRayleighDepth * AirMass(mu) + SkyMieDepth() * HazeAirMass(mu) + SkyOzoneDepth * OzoneAirMass(mu);
-}
-
-// Colour of direct sunlight after its path through the air, 1 with the sun at the zenith: about white above
-// 45°, golden around 10°, orange at the horizon.
-float3 SunlightThroughAir(float sunY)
-{
-    return exp(-(SkySlantDepth(sunY) - SkySlantDepth(1.0)));
-}
-
-// Sky light in a direction, before the preset's grade: single scattering in a flat exponential atmosphere, in
-// closed form, with the slant paths from AirMass so both stay finite at the horizon. Per channel, a point at
-// air fraction u lights the eye with  tau·exp(-tauSun·u/muS) · exp(-tauView·(1-u)/muV);  integrated over u:
-//     xv · (exp(-xs) - exp(-xv)) / (xv - xs),   xs = tauSun / muS,  xv = tauView / muV.
-// That is what makes a sunset: high up all channels scatter little and blue most (blue); lower down blue has
-// been dimmed along the long path while green still grows (green-grey), then green goes too and the reddened
-// sunlight is left (yellow, then orange at the horizon). Blending blue into orange instead skips the green and
-// turns purple. The view path uses a thinner depth than the sun's path (SkyViewDepthScale), which keeps the
-// warm band narrow on the horizon while the low sun's light still turns orange.
-static const float SkyViewDepthScale = 0.75;
-
-float3 SkySingleScatter(float viewY, float sunY, float cosTheta)
-{
-    float3 xs = SkySlantDepth(sunY);
-    float3 viewR = SkyRayleighDepth * AirMass(viewY);
-    float viewM = SkyMieDepth() * HazeAirMass(viewY);
-    float3 xv = (viewR + viewM) * SkyViewDepthScale;
-    float3 diff = xv - xs;
-    diff = sign(diff) * max(abs(diff), 1e-4) + (diff == 0.0) * 1e-4;
-    float3 path = xv * (exp(-xs) - exp(-xv)) / diff;
-
-    // How much of the scattered light goes toward the eye, by the share of each along this view: the air
-    // (broad) and the haze (forward: the glow round the sun)
-    float3 phase = (viewR * RayleighPhase(cosTheta) + viewM * HGPhase(cosTheta, MieAnisotropy)) / (viewR + viewM);
-    return path * phase;
-}
-
-float3 GetSkyColor(float3 viewDir, float3 sunDir)
-{
-    float cosTheta = dot(viewDir, sunDir);
-    float viewY = viewDir.y;
-    float horizon = abs(viewY);
-
-    // ── Sun elevation blend factors (same structure as before for lighting sync) ──
-    float dayFactor, sunsetFactor, nightFactor;
-    GetDayNightFactors(sunDir.y, dayFactor, sunsetFactor, nightFactor);
-
-    float3 sunLight = SunlightThroughAir(sunDir.y);
-
-    // ── Day sky: single scattering (blue → green-grey → yellow → orange toward the horizon at sunset) ──
-    // Fitted against a sunset reference (vertical colour profiles, 2026-10-17) and the old noon sky.
-    float3 luma = float3(0.2126, 0.7152, 0.0722);
-    float3 single = SkySingleScatter(viewY, sunDir.y, cosTheta);
-    float3 zenith = SkySingleScatter(1.0, sunDir.y, sunDir.y);
-    float3 noonZenith = SkySingleScatter(1.0, 0.84, 0.84);   // sun 57° up
-    float lumSingle = max(dot(single, luma), 1e-8);
-    float lumZenith = max(dot(zenith, luma), 1e-8);
-    // Single scattering alone makes the horizon ~14× the zenith (real skies: 2–4×, multiple scattering lights
-    // the zenith too). Keep each direction's hue, compress its brightness relative to the zenith at this sun,
-    // and add a fill in the zenith's colour for the light scattered more than once.
-    float3 dayColor = single * pow(lumSingle / lumZenith, 0.55 - 1.0) + zenith * 0.6;
-    // Partly undo the sky's darkening with a low sun, as an eye (or a camera) adapts: physically ~1/5 of noon
-    // at sunset, which with the fixed exposure made the sunset scene dim.
-    dayColor *= pow(max(dot(noonZenith, luma), 1e-8) / lumZenith, 0.3) * 16.0;
-
-    // Glow round a low sun: the haze along the long low path scatters its light forward in a lobe much
-    // tighter than single scattering's phase gives (the reference's bright cream within ~15° of the sun).
-    // Lit by the transmitted sunlight. Only with the sun under ~20°: at noon it greyed the zenith. Fitted with
-    // the rest against the sunset reference (whitening it a little fitted the numbers but hid the sun's core).
-    float lowSun = 1.0 - saturate(sunDir.y / 0.35);
-    dayColor += HGPhase(cosTheta, 0.9) * MieScattering * 57.0 * lowSun * lowSun * sunLight;
-
-    // Sun below the horizon: the air above still catches its light for a while (twilight), then the night
-    // colours take over (nightFactor below).
-    dayColor *= saturate(1.0 + sunDir.y / 0.12);
-
-    // Preset grade. A saturated SkyTintColor (Clear Day) keeps the full colours, a grey one (Overcast, Storm)
-    // greys the sky out and gives it that tint's cast; AtmosphereDensity is the brightness. Saturation runs from
-    // vivid with a high sun (the old noon sky's blue) to muted with a low one (the reference sunset).
-    float tintMax = max(SkyTintColor.r, max(SkyTintColor.g, SkyTintColor.b));
-    float tintMin = min(SkyTintColor.r, min(SkyTintColor.g, SkyTintColor.b));
-    float tintSat = (tintMax - tintMin) / max(tintMax, 1e-3);
-    float saturation = lerp(0.2, lerp(2.3, 0.85, lowSun), tintSat);
-    float dayLum = dot(dayColor, luma);
-    float3 cast = lerp(SkyTintColor / max(dot(SkyTintColor, luma), 1e-3), 1.0, tintSat);
-    dayColor = max(dayLum + (dayColor - dayLum) * saturation, 0.0) * cast * AtmosphereDensity;
-
-    // ── Horizon haze: the preset's coloured haze at low angles, lit by the sun's light ──
-    // An artist extra for hazy presets (Desert Haze, Overcast); at a third of its old weight, since the
-    // scattering already brightens the horizon. Clear Day's 0.3 at full weight made its sunset horizon yellow.
-    float horizonMask = 1.0 - smoothstep(0.0, HazeHeight, horizon);
-    horizonMask *= horizonMask; // softer falloff
-    dayColor += HazeColor * horizonMask * HazeIntensity * 0.33 * sunLight * saturate(1.0 + sunDir.y / 0.12);
-
-    // ── Sunset/sunrise tint: an artist flavour on top, low on the horizon toward the sun ──
-    // The scattering above already makes the sunset; this is only a hint (at full strength it turned the
-    // sky pink, at a quarter the fit against the reference still got worse).
-    float sunProximity = pow(saturate(cosTheta * 0.5 + 0.5), 2.0);
-    float horizonWarm = pow(1.0 - saturate(abs(viewY) / 0.15), 2.0);
-    float3 sunsetTint = SunsetTintColor * SunsetTintIntensity * sunProximity * horizonWarm * 0.08;
-
-    // ── Night sky ──
-    float nightAltitude = saturate(abs(viewY));
-    float3 nightColor = lerp(NightHorizonColor, NightSkyColor, pow(nightAltitude, 0.5));
-
-    // ── Blend day/sunset/night using the same factors as SkyboxRenderer.UpdateSunLight() ──
-    float3 skyColor = dayColor * dayFactor
-                    + (dayColor + sunsetTint) * sunsetFactor
-                    + nightColor * nightFactor;
-
-    return max(skyColor, 0.0);
-}
-
-// Hemisphere ambient for a surface normal, as a multiple of the surface's albedo: the sky above (its zenith colour,
-// which already darkens at night: never scale it by a day/night factor again), the ground's bounce light below.
-// One model for every lit pass (composition, glass); water takes the sky half.
+// Ambient light as a multiple of a surface's albedo (E / π): from the whole sky on an up-facing surface, and from
+// the ground (its albedo × the sun, moon and sky on it) on a down-facing one. Made once a frame by CSAmbient; it
+// already darkens at night and goes blue at dusk, so it is never scaled by a day/night factor.
 float3 SkyAmbientLight()
 {
-    return GetSkyColor(float3(0, 1, 0), FogSunDirection) * 0.45;
+    if (AtmosphereIdx == 0)
+        return 0;
+    StructuredBuffer<float4> ambient = ResourceDescriptorHeap[LoadAtmosphere().Ambient];
+    return ambient[0].rgb;
 }
 
+float3 GroundBounceLight()
+{
+    if (AtmosphereIdx == 0)
+        return 0;
+    StructuredBuffer<float4> ambient = ResourceDescriptorHeap[LoadAtmosphere().Ambient];
+    return ambient[1].rgb;
+}
+
+// Hemisphere ambient for a surface normal: sky above, ground below. One model for every lit pass (composition, glass);
+// water takes the sky half. Until the sky probe (ATMOSPHERE_PLAN.md stage 4) it ignores where in the sky the light is.
 float3 HemisphereAmbient(float3 N)
 {
-    return lerp(GroundBounce, SkyAmbientLight(), N.y * 0.5 + 0.5);
+    return lerp(GroundBounceLight(), SkyAmbientLight(), N.y * 0.5 + 0.5);
+}
+
+// Aerial perspective: the air between the camera and a surface dims the surface's light and adds its own (the haze
+// and the ground fog of the preset, lit by the sun and the moon, in the earth's shadow after sunset).
+//   pixel:     SV_Position.xy (or the pixel a compute thread shades)
+//   viewDepth: linear view-space depth in metres (the G-buffer's depth, clip w)
+// Sky pixels (depth 0) must not come here: the sky's light already holds all of the air.
+float3 ApplyAerialPerspective(float3 color, float2 pixel, float viewDepth)
+{
+    if (FogEnabled <= 0.0 || AtmosphereIdx == 0)
+        return color;
+    float4 ap = AtmosphereAerialPerspective(LoadAtmosphere(), pixel / ViewportSize, viewDepth);
+    return color * ap.a + ap.rgb;
 }
 
 // ────────────────────────────────────────────────
@@ -297,26 +151,54 @@ float GetCloudShadow(SamplerState wrapSampler, float3 relPos, float3 toLight)
     return 1.0 - density * CloudShadowStrength * lowSunFade;
 }
 
-// ────────────────────────────────────────────────
-// Unified aerial perspective: distance fog with per-pixel sky-derived color.
-// Replaces both FOG() and ocean's hardcoded haze.
-//
-// Uses exponential-squared extinction with FogDensity from SceneConstants,
-// and GetSkyColor() for the inscatter color along the view ray.
-// Result: looking toward the sun → warm/golden fog, away → cool/blue.
-// ────────────────────────────────────────────────
-float3 ApplyAerialPerspective(float3 color, float3 worldPos, float3 camPos, float3 sunDir)
+// ── Light on the cloud layer ──
+// A cloud in direction dir (the flat layer CloudAltitude above the camera) is lit by the sun and the moon through the
+// air above it (nothing once the planet hides them: clouds stay lit a little after sunset, then go grey) and by the
+// sky and the ground. The air between the camera and the cloud dims it and lays its own light over it. Stage 1 of
+// ATMOSPHERE_PLAN.md; stage 5 adds a phase function and the sky probe's ambient.
+struct CloudLight
 {
-    float3 toSurface = worldPos - camPos;
-    float dist = length(toSurface);
-    float3 viewDir = toSurface / max(dist, 0.001);
+    float3 sun;          // E / π × Exposure of the sun at the cloud: what a white surface facing it sends back
+    float3 moon;         // the same for the brightest moon
+    float3 ambient;      // sky above and ground below, as a multiple of albedo
+    float3 viewT;        // transmittance from the camera to the cloud
+    float3 inFront;      // the light the air in front of the cloud adds (× Exposure)
+};
 
-    // Exponential-squared extinction (matches old FOG() math)
-    float fogFactor = 1.0 - exp(-pow(dist * FogDensity, 2.0));
-    fogFactor = saturate(fogFactor);
+CloudLight GetCloudLight(float3 dir)
+{
+    CloudLight c = (CloudLight)0;
+    c.viewT = 1;
+    if (AtmosphereIdx == 0)
+        return c;
+    AtmosphereParams A = LoadAtmosphere();
 
-    // Inscatter: sky color along the view ray (clamp y to avoid underground sampling)
-    float3 inscatter = GetSkyColor(float3(viewDir.x, max(viewDir.y, 0.01), viewDir.z), sunDir);
+    float viewHeight = AtmosphereViewHeight(A, CamPos.y);
+    float mu = max(dir.y, 0.01);
+    float tKm = min(CloudAltitude / mu, 300000.0) * 0.001;
+    float3 P = float3(0, viewHeight, 0) + float3(dir.x, mu, dir.z) * tKm;
+    float r = length(P);
 
-    return lerp(color, inscatter, fogFactor);
+    c.sun = A.SunIlluminance * AtmTransmittanceToLight(A, P, A.SunDirection) * (Exposure / ATM_PI);
+    c.moon = A.MoonIlluminance * AtmTransmittanceToLight(A, P, A.MoonDirection) * (Exposure / ATM_PI);
+
+    StructuredBuffer<float4> ambient = ResourceDescriptorHeap[A.Ambient];
+    c.ambient = (ambient[0].rgb + ambient[1].rgb) * 0.5;
+
+    // Transmittance camera → cloud from two LUT reads (to the top of the atmosphere from either end), and the share of
+    // the sky's in-scattered light that lies in front of the cloud, taken as the share of the optical depth there
+    float3 toTop = AtmTransmittance(A, viewHeight, mu);
+    float3 cloudToTop = AtmTransmittance(A, r, dot(P / r, normalize(float3(dir.x, mu, dir.z))));
+    c.viewT = saturate(toTop / max(cloudToTop, 1e-6));
+    float3 sky = AtmosphereSkyLuminance(A, normalize(float3(dir.x, mu, dir.z))) * Exposure;
+    c.inFront = sky * saturate((1.0 - c.viewT) / max(1.0 - toTop, 1e-4));
+    return c;
 }
+
+// The cloud layer as one flat colour (no self-shadowing, no lining), as it appears from the camera: for reflections.
+float3 CloudFlatRadiance(CloudLight c)
+{
+    return CloudAlbedo * ((c.sun + c.moon) * 0.25 + c.ambient) * c.viewT + c.inFront;
+}
+
+#endif // SKY_COMMON

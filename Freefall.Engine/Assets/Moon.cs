@@ -10,7 +10,8 @@ namespace Freefall.Assets
     /// (<c>SkyboxRenderer.Moons</c>). Each falls behind the sun by a whole day every <see cref="PeriodDays"/>, so it
     /// rises later each night and runs from new (beside the sun) through full (opposite it) and back; the sun lights
     /// the half of the disc that faces it. There is one directional light: the sun by day, at night the moon that
-    /// gives the most light (its intensity × the lit part of its disc, nothing below the horizon).
+    /// gives the most light (its illuminance × the lit part of its disc through the air, nothing below the horizon).
+    /// The brightest one also lights the night sky and its haze (Graphics.Atmosphere).
     /// </summary>
     [CreateAsset("Moon")]
     public class Moon : Asset
@@ -35,7 +36,7 @@ namespace Freefall.Assets
         [Category("Light")]
         public Color3 LightColor = new Color3(0.33f, 0.5f, 1.0f);
 
-        [Description("Directional light intensity at full moon (scaled down by the phase and near the horizon)")]
+        [Description("Illuminance in lux at full moon, above the atmosphere (our moon: about 0.25), scaled by the phase; the air dims it like the sun's, nothing below the horizon. Its hue only: LightColor keeps its brightness")]
         [ValueRange(0f, 2f)]
         public float LightIntensity = 0.22f;
 
@@ -49,7 +50,7 @@ namespace Freefall.Assets
 
         public Color3 Tint = new Color3(1f, 1f, 1f);
 
-        [Description("Brightness of the sunlit side")]
+        [Description("Brightness of the disc against the light it gives: 1 = a disc this size whose light is exactly LightIntensity")]
         [ValueRange(0f, 10f)]
         public float Brightness = 1.5f;
     }

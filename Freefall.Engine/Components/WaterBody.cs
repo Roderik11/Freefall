@@ -110,7 +110,6 @@ namespace Freefall.Components
             public float SunIntensity;
             public Vector3 SunColor;
             public float EdgeFoam;
-            public Vector3 CloudColor;
             public float RapidsFoam;
             public uint SlopeSRV;
             public uint NoiseSRV;
@@ -338,7 +337,6 @@ namespace Freefall.Components
                 SunIntensity = sunIntensity,
                 SunColor = sunColor,
                 EdgeFoam = EdgeFoam,
-                CloudColor = SkyboxRenderer.CurrentCloudColor,
                 RapidsFoam = RapidsFoam,
                 SlopeSRV = fft?.SlopeSRV ?? 0,
                 NoiseSRV = fft?.NoiseSRV ?? 0,

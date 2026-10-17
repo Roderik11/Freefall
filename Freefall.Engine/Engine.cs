@@ -579,10 +579,14 @@ namespace Freefall
          public float PixelErrorThreshold { get; set; } = 128.0f;
 
          [Category("Fog")]
-         public bool Fog { get; set; } = true;                              // Distance fog
+         public bool Fog { get; set; } = true;                              // Aerial perspective: the atmosphere and its ground fog between camera and scene (Graphics.Atmosphere)
 
-         [ValueRange(0.0001f, 0.01f)]
-         public float FogDensity { get; set; } = 0.0005f;                   // Fog density (exponential squared)
+         // Camera exposure as EV100: light in physical units (lux, cd/m²) times 1 / (1.2 · 2^EV) is what the
+         // tonemapper sees. 13.36 (Atmosphere.ReferenceEV) shows light sources in the engine's older units exactly as
+         // before; higher = darker image.
+         [Category("Exposure")]
+         [ValueRange(-6f, 20f)]
+         public float ExposureEV { get; set; } = Graphics.Atmosphere.ReferenceEV;
 
          [Category("Bloom")]
          public bool EnableBloom { get; set; } = true;

@@ -232,7 +232,6 @@ namespace Freefall.Components
             public uint NoiseSRV;
             public float InvViewportWidth;
             public float InvViewportHeight;
-            public Vector3 CloudColor;
             public float ShoreFoamDepth;
             public float ShoreFoam;
             public float ShoreSurge;
@@ -500,7 +499,6 @@ namespace Freefall.Components
                 NoiseSRV = _oceanFFT.NoiseSRV,
                 InvViewportWidth = 1.0f / MathF.Max(1, DeferredRenderer.Current?.DepthGBuffer?.Native.Description.Width ?? 1920),
                 InvViewportHeight = 1.0f / MathF.Max(1, DeferredRenderer.Current?.DepthGBuffer?.Native.Description.Height ?? 1080),
-                CloudColor = SkyboxRenderer.CurrentCloudColor,
                 ShoreFoamDepth = ShoreFoamDepth,
                 ShoreFoam = ShoreFoam,
                 ShoreSurge = ShoreSurge,

@@ -691,7 +691,7 @@ namespace Freefall.Editor.Commands
     /// so the Library cache matches the source file.
     /// POST /api/asset/setproperty
     /// Body: {"guid":"...", "property":"CloudCoverage", "value":0.8}
-    ///   or: {"guid":"...", "values": {"CloudCoverage":0.8, "SkyTintColor":[0.5,0.6,0.7]}}
+    ///   or: {"guid":"...", "values": {"CloudCoverage":0.8, "FogColor":[0.5,0.6,0.7]}}
     /// Optional: "save": false to only change the in-memory asset.
     /// Value encoding is the same as entity setproperty (floats, vectors, enums, asset GUIDs; Color3 as [r,g,b]).
     /// </summary>

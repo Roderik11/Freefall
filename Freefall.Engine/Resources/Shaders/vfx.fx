@@ -42,6 +42,7 @@ cbuffer PushConstants : register(b3)
 };
 
 #include "common.fx"
+#include "sky_common.fx"
 
 // @RenderState(RenderTargets=1, DepthWrite=false, Blend=Additive, CullMode=None, RenderTargetFormat=R16G16B16A16_Float)
 
@@ -104,10 +105,11 @@ Instance LoadInstance(uint slot)
     return all.Load<Instance>(slot * 128u);
 }
 
-// How much it is day, 0..1, from the sun's height: the sky's own blend (SkyboxRenderer.ComputeDayNightFactors)
+// How much it is day, 0..1, from the sun's height (the old sky's day/sunset/night blend; DayIntensity goes with
+// physical units in ATMOSPHERE_PLAN.md stage 3, when exposure makes a glow stand out at night by itself)
 float DayFactor()
 {
-    float e = FogSunDirection.y;
+    float e = AtmSunDirection().y;
     float day = pow(saturate(e / 0.8), 0.7);
     float sunset = (e < 0.15 && e > -0.2) ? max(0.0, 1.0 - abs((e + 0.025) / 0.175)) : 0.0;
     float night = saturate((-e - 0.15) / 0.3);
@@ -346,9 +348,12 @@ float4 PS(VSOutput input) : SV_Target0
     float intensity = S.Intensity * lerp(1.0, S.DayIntensity, DayFactor()) * I.Intensity;
     float3 light = S.Color * I.Color * intensity * gain * ((body * shade + rim) * ends + edge * 2.0);
 
-    // Light seen through fog fades with it
-    if (FogEnabled > 0)
-        light *= exp(-pow(input.Depth * FogDensity, 2.0));
+    // Light in the older units, pre-exposed like the lights (physical units: ATMOSPHERE_PLAN.md stage 3)
+    light *= LegacyLightScale;
+
+    // Additive, so it hides nothing: the air in front only dims it
+    if (FogEnabled > 0 && AtmosphereIdx != 0)
+        light *= AtmosphereAerialPerspective(LoadAtmosphere(), input.Position.xy / ViewportSize, input.Depth).a;
 
     return float4(light, 1.0);
 }

@@ -64,7 +64,7 @@ technique11 GBuffer
 {
     pass Forward
     {
-        SetRenderState(RenderTargets=1, DepthTest=false, DepthWrite=false);
+        SetRenderState(RenderTargets=1, DepthTest=false, DepthWrite=false, RenderTargetFormat=R8G8B8A8_UNorm);
         SetVertexShader(CompileShader(vs_6_6, VS()));
         SetPixelShader(CompileShader(ps_6_6, PS()));
     }

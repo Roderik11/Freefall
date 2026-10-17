@@ -309,7 +309,8 @@ PSOutput PS(VSOutput input)
     // Separate diffuse and specular: for transparent surfaces, specular is added
     // separately with Reinhard rolloff to prevent GGX peaks (500+ for smooth glass)
     // from dominating the alpha-blended output.
-    float3 radiance = LightColor * LightIntensity * 3.14159 * NdotL * shadowFactor;
+    // The sun's (or moon's) illuminance as the deferred light has it: LightIntensity in the older units × π, pre-exposed
+    float3 radiance = LightColor * LightIntensity * 3.14159 * LegacyLightScale * NdotL * shadowFactor;
     float3 diffuseLighting = diffuse * radiance * ao;
     float3 specLighting = spec * radiance;
 
@@ -317,8 +318,8 @@ PSOutput PS(VSOutput input)
     float3 ambient = HemisphereAmbient(N) * ao;
     float3 lighting = diffuseLighting + ambient * color.rgb;
 
-    // Emissive adds directly to lighting (self-illumination)
-    lighting += emissive * (1 - alpha);
+    // Emissive adds directly to lighting (self-illumination, older units)
+    lighting += emissive * (1 - alpha) * LegacyLightScale;
 
     // ── Feature mask ──
     // The base is a lit surface alpha-blended by the albedo's alpha (known good). Effects are layered on top,
@@ -355,8 +356,8 @@ PSOutput PS(VSOutput input)
     // Environment reflection: the sky above the horizon, a dark ground tone below it (a pane seen from above
     // reflects the street, not the sky — mirroring the direction upwards made such panes glow).
     float3 reflectDir = reflect(-V, Ng);
-    float3 skyReflect = GetSkyColor(normalize(float3(reflectDir.x, max(reflectDir.y, 0.02), reflectDir.z)), FogSunDirection);
-    float3 envReflect = lerp(GroundBounce, skyReflect, smoothstep(-0.15, 0.1, reflectDir.y));
+    float3 skyReflect = SkyRadiance(normalize(float3(reflectDir.x, max(reflectDir.y, 0.02), reflectDir.z)));
+    float3 envReflect = lerp(GroundBounceLight(), skyReflect, smoothstep(-0.15, 0.1, reflectDir.y));
 
     // Base: the lit glass surface; the blend state mixes it over what is behind with alpha.
     // (Both lighting and refracted are linear HDR — finalize handles tonemapping.)
@@ -394,14 +395,9 @@ PSOutput PS(VSOutput input)
     finalColor = (finalColor * finalAlpha * (1.0 - Fr) + surface) / max(outAlpha, 1e-3);
     finalAlpha = outAlpha;
 
-    // Aerial perspective fog — input.Depth is linear view-space Z
-    if (FogEnabled > 0)
-    {
-        float fogFactor = saturate(1.0 - exp(-pow(input.Depth * FogDensity, 2.0)));
-        float3 viewDir = normalize(input.WorldPos.xyz);
-        float3 inscatter = GetSkyColor(float3(viewDir.x, max(viewDir.y, 0.01), viewDir.z), FogSunDirection);
-        finalColor = lerp(finalColor, inscatter, fogFactor);
-    }
+    // Aerial perspective — input.Depth is linear view-space Z. The blend lays the glass's share over what is
+    // behind, which carries its own (longer) fog already.
+    finalColor = ApplyAerialPerspective(finalColor, input.Position.xy, input.Depth);
 
     output.Color = float4(finalColor, finalAlpha);
     output.EntityId = (input.TransformSlot << 8u) | (input.MeshPartIdx & 0xFFu);

@@ -57,7 +57,7 @@ float4 getCascade(int idx) {
 }
 
 SamplerState Sampler : register(s0);
-SamplerState ShadowClampSampler : register(s2); // Linear+Clamp for shadow map sampling (debug)
+#define ShadowClampSampler AtmosphereLinearClamp   // linear clamp (s2), declared by atmosphere_common.hlsli
 SamplerComparisonState ShadowSampler : register(s3); // Comparison+Bilinear for PCF
 
 // PBR helpers

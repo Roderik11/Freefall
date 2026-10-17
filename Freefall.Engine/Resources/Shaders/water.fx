@@ -54,7 +54,6 @@ struct WaterData
     float SunIntensity;
     float3 SunColor;
     float EdgeFoam;
-    float3 CloudColor;          // SkyboxRenderer.CurrentCloudColor
     float RapidsFoam;
     uint SlopeSRV;              // ocean FFT slope maps (Texture2DArray), 0 = flat water
     uint NoiseSRV;              // ocean noise texture (Perlin + Worley)
@@ -171,7 +170,8 @@ PSOutput PS(VSOutput input)
     // ── Sun ──
     float3 L = normalize(-water.SunDirection);
     float NdotL = saturate(dot(N, L));
-    float3 sunRadiance = water.SunColor * water.SunIntensity;
+    // Pre-exposed E / π of the directional light, as the deferred light has it; the specular takes E (× π)
+    float3 sunRadiance = water.SunColor * water.SunIntensity * LegacyLightScale;
     sunRadiance *= GetCloudShadow(WaterSampler, worldPos - camPos, L);
     sunRadiance *= WaterSunShadow(ShadowMapIdx, worldPos - camPos, input.Position.xy);
     float3 skyAmbient = input.SkyAmbient;
@@ -182,8 +182,8 @@ PSOutput PS(VSOutput input)
 
     // ── Shared water shading ──
     float F = WaterFresnel(NdotV);
-    float3 reflectColor = WaterSkyReflection(WaterSampler, V, N, worldPos - camPos, dist, water.CloudColor);
-    float3 specular = WaterSunSpecular(N, V, L, sunRadiance, F, dist);
+    float3 reflectColor = WaterSkyReflection(WaterSampler, V, N, worldPos - camPos, dist);
+    float3 specular = WaterSunSpecular(N, V, L, sunRadiance * 3.14159, F, dist);
 
     WaterColumn column = GetWaterColumn(WaterSampler, water.DepthGBufferSRV, water.CompositeSRV,
         input.Position.xy * water.InvViewportSize, input.Depth, dist, abs(camPos.y - worldPos.y), N,
@@ -229,8 +229,7 @@ PSOutput PS(VSOutput input)
     color = lerp(color, foamLit, foam * 0.9);
 
     // ── Aerial perspective ──
-    if (FogEnabled > 0)
-        color = ApplyAerialPerspective(color, worldPos, camPos, FogSunDirection);
+    color = ApplyAerialPerspective(color, input.Position.xy, input.Depth);
 
     // HDR output — the finalize pass tonemaps the whole Composite
     output.Color = float4(color, 1.0);

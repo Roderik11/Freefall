@@ -486,6 +486,30 @@ namespace Freefall.Graphics
 
         private void FillGBuffer(Camera camera, ID3D12GraphicsCommandList list)
         {
+             // A pick asked for this frame that sees through a character: its skin leaves that pixel open.
+             // Read here, not in RequestPick: the bone buffers' indices are those of the frame being drawn.
+             bool pickHole = _pickRequestX >= 0 && _pickSeeThrough != null;
+             camera.PickHolePixel = pickHole ? new Vector2(_pickRequestX + 0.5f, _pickRequestY + 0.5f) : Vector2.Zero;
+             camera.PickHoleBones = pickHole ? _pickSeeThrough!.BoneBufferIndices() : default;
+
+             // Set shader parameters globally on all effects (Apex pattern)
+             camera.SetShaderParams();
+
+             // Zero-translation CameraInverse: even though GBuffer depth was written with full View,
+             // NDC = (worldPos - camPos) × R × P, so inverse(R × P) correctly gives camera-relative pos.
+             // Set before anything is drawn: the atmosphere's aerial perspective volume needs it too.
+             var relativeVP = Matrix4x4.CreateLookAtLeftHanded(Vector3.Zero, camera.Forward, camera.Up) * camera.Projection;
+             Matrix4x4.Invert(relativeVP, out var cameraInverse);
+             foreach (var pair in Effect.MasterEffects)
+             {
+                 pair.Value.SetParameter("CameraInverse", cameraInverse);
+                 pair.Value.SetParameter("CameraRelativeVP", relativeVP);
+             }
+
+             // The atmosphere's LUTs for this view (sky-view, aerial perspective, ambient): the sky dome, the
+             // lighting, the composition and the forward passes all read them
+             Atmosphere.Render(list, BindSceneConstantsForCompute);
+
              PixMarker.Begin(list, "GBuffer");
              // First frame: textures start in Common state; subsequent frames: PixelShaderResource
              var fromState = _isFirstFrame ? ResourceStates.Common : ResourceStates.PixelShaderResource;
@@ -498,15 +522,6 @@ namespace Freefall.Graphics
              Transition(list, EntityIdBuffer.Native, fromState, ResourceStates.RenderTarget);
              Transition(list, HeightBuffer.Native, fromState, ResourceStates.RenderTarget);
              Transition(list, Depth.Native, depthFromState, ResourceStates.DepthWrite);
-
-             // A pick asked for this frame that sees through a character: its skin leaves that pixel open.
-             // Read here, not in RequestPick: the bone buffers' indices are those of the frame being drawn.
-             bool pickHole = _pickRequestX >= 0 && _pickSeeThrough != null;
-             camera.PickHolePixel = pickHole ? new Vector2(_pickRequestX + 0.5f, _pickRequestY + 0.5f) : Vector2.Zero;
-             camera.PickHoleBones = pickHole ? _pickSeeThrough!.BoneBufferIndices() : default;
-
-             // Set shader parameters globally on all effects (Apex pattern)
-             camera.SetShaderParams();
 
              // Run the RenderGroup: IDraw components (ScriptDrawSystem) and draw systems enqueue their commands.
              // This enqueues DrawShadows callback into ShadowMap pass AND opaque batches
@@ -760,17 +775,8 @@ namespace Freefall.Graphics
         {
              PixMarker.Begin(list, "Lighting");
 
-             // Zero-translation CameraInverse: even though GBuffer depth was written with full View,
-             // NDC = (worldPos - camPos) × R × P, so inverse(R × P) correctly gives camera-relative pos
-             var cvp = Matrix4x4.CreateLookAtLeftHanded(Vector3.Zero, camera.Forward, camera.Up) * camera.Projection;
-             Matrix4x4.Invert(cvp, out var cameraInverse);
-             foreach (var pair in Effect.MasterEffects)
-             {
-                 pair.Value.SetParameter("CameraInverse", cameraInverse);
-                 pair.Value.SetParameter("CameraRelativeVP", cvp);
-             }
-             
-             
+             // CameraInverse / CameraRelativeVP: set in FillGBuffer, before the atmosphere pass
+
              // Radiance Cascades GI — runs while LightBuffer is still in SRV state
              // so it can read last frame's lighting for bounce radiance estimation.
              if (RadianceCascades != null && Engine.Settings.EnableRadianceCascades)
@@ -989,6 +995,24 @@ namespace Freefall.Graphics
              LocalShadows?.EndFrame(list);
         }
 
+        /// <summary>
+        /// Bind SceneConstants (b0) for a compute pass: the directional light material's copy, which every
+        /// SetShaderParams writes like any other effect's. One buffer per frame in flight, so every pass of the
+        /// frame reads what was last committed before the list ran.
+        /// </summary>
+        private void BindSceneConstantsForCompute(ID3D12GraphicsCommandList list)
+        {
+            foreach (var cb in matDirectionalLight.ConstantBuffers)
+            {
+                if (cb.Slot == 1) // SceneConstants only
+                {
+                    matDirectionalLight.Effect!.GetMaterialBlock().Apply(cb);
+                    cb.Commit();
+                    list.SetComputeRootConstantBufferView((uint)cb.Slot, cb.GpuAddress);
+                }
+            }
+        }
+
         private void Compose(Camera camera, ID3D12GraphicsCommandList list)
         {
             PixMarker.Begin(list, "Composition");
@@ -1016,17 +1040,8 @@ namespace Freefall.Graphics
             _compositionCS.SetParam("AODirectStrength", Engine.Settings.GTAODirectStrength);
             _compositionCS.SetParam("SSDMTexIdx",Engine.Settings.EnableSSDM ? (ScreenSpaceDisplacement?.OutputSrvIndex ?? 0u) : 0u);
 
-            // Bind SceneConstants cbuffer (AmbientScale etc.)
-            foreach (var cb in matDirectionalLight.ConstantBuffers)
-            {
-                if (cb.Slot == 1) // SceneConstants only
-                {
-                    matDirectionalLight.Effect!.GetMaterialBlock().Apply(cb);
-                    cb.Commit();
-                    list.SetComputeRootConstantBufferView((uint)cb.Slot, cb.GpuAddress);
-                }
-            }
-            
+            BindSceneConstantsForCompute(list);
+
             uint groupsX = ((uint)desc.Width + 7) / 8;
             uint groupsY = ((uint)desc.Height + 7) / 8;
             _compositionCS.Dispatch(_kCompose, list, groupsX, groupsY);

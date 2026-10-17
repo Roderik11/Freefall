@@ -661,6 +661,73 @@ namespace Freefall.Graphics
             return desc;
         }
 
+        // The deferred renderer's targets, in the order it binds them (DeferredRenderer.CreateRenderTextures):
+        // 3-6 = the G-buffer (Albedo, Normals, Data, DepthGBuffer, EntityId, Height; always all six bound, a shader with
+        // fewer outputs gets no writes to the rest), 2 = the forward pass (Composite +
+        // EntityId), 1 = Composite (forward and post-process passes) or Albedo (transparent G-buffer pass): both
+        // R16G16B16A16_Float. A pipeline's formats must match the bound targets'. Until 2026-10-17 the count of 1 and
+        // 2 declared R8G8B8A8_UNorm and EntityId R32_Float while the targets are float16 and R32_UInt (undefined in
+        // D3D12, reported only by the debug layer). A shader drawing into another target names its format
+        // (RenderTargetFormat, e.g. the editor previews' 8-bit thumbnails).
+        private static readonly Format[] GBufferFormats =
+        {
+            Format.R16G16B16A16_Float, Format.R16G16B16A16_SNorm, Format.R8G8B8A8_UNorm,
+            Format.R32_Float, Format.R32_UInt, Format.R16G16_Float,
+        };
+
+        /// <summary>
+        /// The blend state fitted to the bound targets:
+        /// - blending off on integer targets (EntityId, R32_UInt): D3D12 rejects a pipeline that blends into one
+        ///   (E_INVALIDARG), and Vortice's BlendDescription constructors enable blending on every target, Opaque's
+        ///   One/Zero included, so an id is written as it is;
+        /// - no writes to the targets past the shader's own count (<paramref name="written"/>): a G-buffer shader with 4
+        ///   outputs (grass, the sky) is drawn with all six G-buffer targets bound, so its pipeline names all six.
+        /// The other targets keep the blend as it was (each its own copy of target 0's when it was shared).
+        /// </summary>
+        private static BlendDescription FitBlendToTargets(BlendDescription blend, Format[] formats, int written)
+        {
+            bool integer = false;
+            foreach (var f in formats) integer |= IsIntegerFormat(f);
+            if (!integer && written >= formats.Length) return blend;
+
+            if (!blend.IndependentBlendEnable)
+            {
+                var shared = blend.RenderTarget[0];
+                for (int i = 1; i < 8; i++)
+                    blend.RenderTarget[i] = shared;
+                blend.IndependentBlendEnable = true;
+            }
+            for (int i = 0; i < formats.Length && i < 8; i++)
+            {
+                var rt = blend.RenderTarget[i];
+                if (IsIntegerFormat(formats[i]))
+                {
+                    rt.BlendEnable = false;
+                    rt.LogicOpEnable = false;
+                }
+                if (i >= written)
+                    rt.RenderTargetWriteMask = ColorWriteEnable.None;
+                blend.RenderTarget[i] = rt;
+            }
+            return blend;
+        }
+
+        private static bool IsIntegerFormat(Format f) => f is Format.R32_UInt or Format.R32_SInt or Format.R16_UInt
+            or Format.R16_SInt or Format.R8_UInt or Format.R8_SInt or Format.R32G32_UInt or Format.R16G16_UInt
+            or Format.R8G8B8A8_UInt or Format.R32G32B32A32_UInt or Format.R16G16B16A16_UInt;
+
+        private static Format[] TargetFormats(int count, string? overrideFormat)
+        {
+            if (overrideFormat != null && count <= 1 && Enum.TryParse<Format>(overrideFormat, true, out var single))
+                return new[] { single };
+            return count switch
+            {
+                >= 3 => GBufferFormats,     // the G-buffer pass always binds all six (FitBlendToTargets masks the rest)
+                2 => new[] { Format.R16G16B16A16_Float, Format.R32_UInt },
+                _ => new[] { Format.R16G16B16A16_Float },
+            };
+        }
+
         private void InitFromEffect(Effect effect, GraphicsDevice device)
         {
             //Debug.Log($"[Material] Creating Material for Effect: {effect.Name}");
@@ -689,22 +756,8 @@ namespace Freefall.Graphics
 
             var renderState = effect.RenderState;
 
-            // Determine Render Target count and formats from shader metadata
-            Format[] rtvFormats = renderState.RenderTargetCount switch
-            {
-                6 => new[] { Format.R16G16B16A16_Float, Format.R16G16B16A16_SNorm, Format.R8G8B8A8_UNorm, Format.R32_Float, Format.R32_Float, Format.R16G16_Float }, // GBuffer + Depth + EntityId + Displacement
-                5 => new[] { Format.R16G16B16A16_Float, Format.R16G16B16A16_SNorm, Format.R8G8B8A8_UNorm, Format.R32_Float, Format.R32_Float }, // GBuffer + Depth + EntityId
-                4 => new[] { Format.R16G16B16A16_Float, Format.R16G16B16A16_SNorm, Format.R8G8B8A8_UNorm, Format.R32_Float }, // GBuffer + Depth
-                3 => new[] { Format.R16G16B16A16_Float, Format.R16G16B16A16_SNorm, Format.R8G8B8A8_UNorm }, // GBuffer
-                _ => new[] { Format.R8G8B8A8_UNorm } // Standard single target
-            };
-            
-            // Override render target format if specified in shader metadata
-            if (renderState.RenderTargetFormat != null && renderState.RenderTargetCount <= 1)
-            {
-                if (Enum.TryParse<Format>(renderState.RenderTargetFormat, true, out var rtFormat))
-                    rtvFormats = new[] { rtFormat };
-            }
+            // Render target formats from shader metadata: the deferred renderer's targets for that count
+            Format[] rtvFormats = TargetFormats(renderState.RenderTargetCount, renderState.RenderTargetFormat);
 
 
             // In bindless, we use the Global Root Signature from the device
@@ -806,6 +859,7 @@ namespace Freefall.Graphics
                 // Shadow pass overrides (shared by both traditional and mesh shader paths)
                 var passType = _subShaders[0].ShaderPasses[passIndex].RenderPass;
                 var passRtvFormats = rtvFormats;
+                int passWritten = currentPass.RenderState?.RenderTargetCount ?? renderState.RenderTargetCount;   // outputs the shader writes
                 var passDepthFormat = depthFormat;
                 var passDepthDesc = depthDesc;
                 var passRasterDesc = rasterizerDesc;
@@ -815,22 +869,7 @@ namespace Freefall.Graphics
                 if (passRS != null)
                 {
                     // Resolve RT formats for this pass
-                    passRtvFormats = passRS.RenderTargetCount switch
-                    {
-                        6 => new[] { Format.R16G16B16A16_Float, Format.R16G16B16A16_SNorm, Format.R8G8B8A8_UNorm, Format.R32_Float, Format.R32_Float, Format.R16G16_Float },
-                        5 => new[] { Format.R16G16B16A16_Float, Format.R16G16B16A16_SNorm, Format.R8G8B8A8_UNorm, Format.R32_Float, Format.R32_Float },
-                        4 => new[] { Format.R16G16B16A16_Float, Format.R16G16B16A16_SNorm, Format.R8G8B8A8_UNorm, Format.R32_Float },
-                        3 => new[] { Format.R16G16B16A16_Float, Format.R16G16B16A16_SNorm, Format.R8G8B8A8_UNorm },
-                        2 => new[] { Format.R8G8B8A8_UNorm, Format.R32_Float }, // Composite + EntityId (Forward pass)
-                        _ => new[] { Format.R8G8B8A8_UNorm }
-                    };
-                    
-                    // Override render target format if specified
-                    if (passRS.RenderTargetFormat != null && passRS.RenderTargetCount <= 1)
-                    {
-                        if (Enum.TryParse<Format>(passRS.RenderTargetFormat, true, out var rtFormat))
-                            passRtvFormats = new[] { rtFormat };
-                    }
+                    passRtvFormats = TargetFormats(passRS.RenderTargetCount, passRS.RenderTargetFormat);
                     
                     // Per-pass DepthFunc override (e.g. preview shaders use LessEqual vs reverse depth)
                     var passDepthFunc = parsedDepthFunc;
@@ -919,7 +958,7 @@ namespace Freefall.Graphics
                         MeshShader = currentPass.MeshShader!.Bytecode,
                         PixelShader = currentPass.PixelShader?.Bytecode ?? default,
                         RasterizerState = passRasterDesc,
-                        BlendState = passBlendDesc,
+                        BlendState = FitBlendToTargets(passBlendDesc, passRtvFormats, passWritten),
                         DepthStencilState = passDepthDesc,
                         RenderTargetFormats = passRtvFormats,
                         DepthStencilFormat = passDepthFormat,
@@ -950,7 +989,7 @@ namespace Freefall.Graphics
                     psoDesc.DepthStencilFormat = passDepthFormat;
                     psoDesc.DepthStencilState = passDepthDesc;
                     psoDesc.RasterizerState = passRasterDesc;
-                    psoDesc.BlendState = passBlendDesc;
+                    psoDesc.BlendState = FitBlendToTargets(passBlendDesc, passRtvFormats, passWritten);
                     
                     _passPipelineStates[passIndex] = new PipelineState(device, rootSignature, psoDesc);
                     

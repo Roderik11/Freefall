@@ -19,35 +19,27 @@ cbuffer PushConstants : register(b3)
 
 // SceneConstants (b0) from common.fx: Time, View, Projection, ViewProjection, ViewInverse
 
+// The sky dome: the atmosphere's light (sky-view LUT, atmosphere_common.hlsli), the sun's disc, the moons, the stars
+// and the Milky Way through the air, and the cloud layer lit by the sun and the moon at its height. Everything is in
+// physical units (cd/m²) × Exposure, written into the G-buffer's albedo, which the composition passes through.
 cbuffer ObjectConstants : register(b1)
 {
     float4x4 World;
-    float3 SunDirection; // direction to sun
-    float TimeOfDay; // 0-24
-    float SunIntensity;
     float StarDensity;
     float StarBrightness;
-    float CloudBrightness;       // overall cloud brightness (0-3)
-    float3 CloudShadowColor;     // color of cloud shade side
-    float CloudNightBrightness;  // cloud brightness at night (0-3)
-    float3 CloudSunlitColor;     // color of sun-facing cloud tops
-    float _cloudPad0;
-    float3 CloudSunsetTintColor; // warm tint mixed into clouds at sunset/sunrise
-    float _cloudPad1;
-    float3 CloudNightColor;      // moonlit cloud color at night
-    float _cloudPad2;
+    float MilkyWayBrightness;   // Glow of the Milky Way band (it turns with the stars)
+    uint MoonCount;
     // Moons (SkyboxRenderer.Moons, at most SkyboxRenderer.MaxMoons)
     float4 MoonDirSize[4];       // xyz: direction to the moon, w: angular radius (radians)
-    float4 MoonColor[4];         // rgb: tint x brightness of the lit side
+    float4 MoonColor[4];         // rgb: cd/m² of the surface where the sun shines straight on it, per unit of relative albedo
     uint4 MoonTextures;          // bindless surface texture per moon, 0 = a plain disc
-    uint MoonCount;
     // Star sphere (SkyboxRenderer): turns with the time of day round the sun path's pole
     row_major float4x4 StarRotation;   // world direction → direction on the star sphere
     float3 GalaxyPole;           // normal of the Milky Way's plane on the star sphere
-    float MilkyWayBrightness;
+    float _galaxyPad0;
     float3 GalaxyCenter;         // its bright core, a direction on that plane
-    float _galaxyPad;
-    // Cloud layer shape (coverage, time, altitude, noise LUT) lives in SceneConstants (common.fx):
+    float _galaxyPad1;
+    // Cloud layer shape (coverage, time, altitude, noise LUT, albedo) lives in SceneConstants (common.fx):
     // the directional light needs it too for cloud shadows.
 }
 
@@ -91,7 +83,7 @@ float hash13(float3 p3)
 //
 float GetCloudsAt(float3 viewDir, float altitude)
 {
-    if (viewDir.y <= 0.001)
+    if (viewDir.y <= 0.001 || CloudNoiseLUTIdx == 0)
         return 0.0;
 
     // Shared with the cloud shadows (sky_common.fx): same plane, same UVs, same base density
@@ -125,6 +117,22 @@ float GetCloudsAt(float3 viewDir, float altitude)
     eroded *= smoothstep(0.0, 0.22, viewDir.y);
 
     return saturate(eroded);
+}
+
+// How much of a light (sun or moon) a cloud sends toward the eye, per unit of what a white surface facing that light
+// would: the density's self-shadowing (thin edges bright, thick cores dark), brighter on the side toward the light,
+// a silver lining on thin edges and a powder glow at medium density when looking toward the light. 0.6: a sunlit
+// edge is a little over half as bright as a white wall in the sun (as the old palettes had it).
+float CloudDirectShade(float3 viewDir, float3 lightDir, float density, float transmittance)
+{
+    float lightDot = saturate(dot(viewDir, lightDir));
+    float gradient = lightDot * 0.5 + 0.5;              // 0.5 (shade side) to 1.0 (facing the light)
+    float shade = lerp(transmittance * 0.7, transmittance, gradient);
+
+    float edgeMask = smoothstep(0.0, 0.2, density) * smoothstep(0.5, 0.15, density);
+    shade += edgeMask * lightDot * lightDot * 0.4;                                      // silver lining
+    shade += (1.0 - transmittance) * transmittance * 2.0 * lightDot * lightDot * lightDot * 0.3;   // powder
+    return shade * 0.6;
 }
 
 // ────────────────────────────────────────────────
@@ -205,59 +213,26 @@ float3 MilkyWay(float3 s, out float crowd)
     return color * lum;
 }
 
-// How much the moons above the horizon brighten the night (0 = none up or new, 1 = a full moon): it washes out the
-// Milky Way and the faint stars. Also returns the brightest moon's direction (for the clouds).
-float MoonLightOnSky(float3 sunDir, out float3 brightestDir)
+// Stars and the Milky Way seen in a world direction, relative to the night sky's own glow (1 = the airglow at the
+// zenith; the caller scales by it). They were tuned against a night sky of 0.0065, hence that ratio. A bright sky
+// (day, twilight, a full moon's light in the air) washes them out by itself: nothing here fades them by the time.
+float3 NightSky(float3 viewDir, float pixelAngle)
 {
-    float total = 0, best = 0;
-    brightestDir = -sunDir;
-    for (uint m = 0; m < MoonCount; m++)
-    {
-        float3 md = MoonDirSize[m].xyz;
-        float light = 0.5 * (1 - dot(md, sunDir)) * smoothstep(0.0, 0.1, md.y);
-        total += light;
-        if (light > best) { best = light; brightestDir = md; }
-    }
-    return saturate(total);
-}
-
-// Stars and the Milky Way seen in a world direction (moons are drawn over them by MoonsAndStars)
-float3 NightSky(float3 viewDir, float pixelAngle, float nightFactor, float moonWash)
-{
-    float visible = saturate(nightFactor) * smoothstep(0.0, 0.25, viewDir.y);   // thicker air near the horizon
-    if (visible <= 0)
-        return 0;
-
     float3 s = mul(viewDir, (float3x3)StarRotation);
     float crowd;
-    float3 milky = MilkyWay(s, crowd) * (0.03 * MilkyWayBrightness * (1 - 0.6 * moonWash));
+    float3 milky = MilkyWay(s, crowd) * (0.03 * MilkyWayBrightness);
 
     float twinkle = lerp(0.35, 0.08, saturate(viewDir.y * 2.0));
     float density = 0.4 + 1.2 * saturate(StarDensity);
     float3 stars = StarLayer(s, pixelAngle, twinkle, 8.0, 0.14 * density, 0.25, 1.6, 1.0, 1.0)
-                 + StarLayer(s, pixelAngle, twinkle, 24.0, 0.40 * density, 0.04, 0.30, 0.0, 2.0) * (1 - 0.3 * moonWash)
-                 + StarLayer(s, pixelAngle, twinkle, 70.0, (0.2 + 0.6 * crowd) * density, 0.008, 0.06, 0.0, 3.0) * (1 - 0.7 * moonWash);
+                 + StarLayer(s, pixelAngle, twinkle, 24.0, 0.40 * density, 0.04, 0.30, 0.0, 2.0)
+                 + StarLayer(s, pixelAngle, twinkle, 70.0, (0.2 + 0.6 * crowd) * density, 0.008, 0.06, 0.0, 3.0);
 
-    return (stars * StarBrightness + milky) * visible;
-}
-
-// The bright haze round each moon (its light scattered in the air near it), over the sky and under the clouds
-float3 MoonGlow(float3 viewDir, float3 sunDir)
-{
-    float3 glow = 0;
-    for (uint m = 0; m < MoonCount; m++)
-    {
-        float3 md = MoonDirSize[m].xyz;
-        float light = 0.5 * (1 - dot(md, sunDir)) * smoothstep(-0.02, 0.05, md.y);
-        float away = 1 - saturate(dot(viewDir, md));          // ≈ angle² / 2
-        float3 tint = MoonColor[m].rgb * float3(0.8, 0.87, 1.0);
-        glow += tint * light * (exp(-away * 900.0) * 0.035 + exp(-away * 40.0) * 0.008);
-    }
-    return glow * smoothstep(-0.01, 0.05, viewDir.y);
+    return (stars * StarBrightness + milky) / 0.0065;
 }
 
 // The moons, each a sphere lit by the sun (so its phase shows) with an optional surface texture, and the stars
-// wherever no moon covers them. Added over the sky colour: the atmosphere lies in front of the moons.
+// wherever no moon covers them. In cd/m² before the air in front: the atmosphere lies in front of the moons.
 float3 MoonsAndStars(float3 viewDir, float3 sunDir, float3 stars)
 {
     float3 moons = 0;
@@ -283,12 +258,13 @@ float3 MoonsAndStars(float3 viewDir, float3 sunDir, float3 stars)
         float3 n = p.x * right + p.y * up - sqrt(saturate(1 - r * r)) * md;
         float lit = saturate(dot(n, sunDir));
 
-        float3 albedo = 0.6;
+        // Relative albedo: the texture against a mean of 0.5 (a plain disc is 1)
+        float3 albedo = 1.0;
         uint tex = MoonTextures[m];
         if (tex != 0)
         {
             Texture2D surface = ResourceDescriptorHeap[tex];
-            albedo = surface.SampleGrad(linearWrap, saturate(uv), uvDx, uvDy).rgb;
+            albedo = surface.SampleGrad(linearWrap, saturate(uv), uvDx, uvDy).rgb * 2.0;
         }
         float3 moon = albedo * MoonColor[m].rgb * (lit + 0.01);   // 0.01: earthshine, the dark side is not black
 
@@ -298,22 +274,27 @@ float3 MoonsAndStars(float3 viewDir, float3 sunDir, float3 stars)
     return moons + stars * starsVisible;
 }
 
-// The sun disc and its close glow, in the colour of the sunlight that reaches the ground (orange near the
-// horizon). The disc is far brighter than the sky round it, so it blows out to yellow-white and blooms;
-// at 1× it was barely brighter than the sky and read as a pale flat disc.
-float3 GetSun(float3 viewDir, float3 sunDir)
+// The sun's disc (cd/m²): its illuminance spread over the disc's solid angle, darker toward the limb (Hillaire's
+// sample: the fit for the visible spectrum, normalised so the disc as a whole still gives the illuminance).
+float3 SunDisc(AtmosphereParams A, float3 viewDir, float pixelAngle)
 {
-    float sun = saturate(dot(viewDir, sunDir));
-    // Disc ~0.55° across (the real sun: 0.53°); it was 2.3–3.6°, a big flat coin.
-    float sunDisc = smoothstep(0.99996, 0.99999, sun);
-    float sunGlow = pow(sun, 32.0) * 0.3;
-    // Aureole: the bright haze within a few degrees of the sun (forward scattering by the haze, much tighter
-    // than the sky's Mie glow): ~2 at 2°, 0.6 at 4°. With the small blown-out disc it reads as the glare of a
-    // low sun. The wide part is mostly the sky's own low-sun glow (sky_common.fx).
-    float aureole = pow(sun, 400.0) * 3.0 + pow(sun, 3000.0) * 20.0;
-    float3 sunLight = SunlightThroughAir(sunDir.y) * float3(1.0, 0.95, 0.85);
-    return sunLight * (sunDisc * 60.0 + sunGlow + aureole);
+    float r = A.SunAngularRadius;
+    float d = length(viewDir - A.SunDirection);              // ≈ the angle from the sun's centre
+    float edge = max(pixelAngle, 1e-5);
+    float cover = 1.0 - smoothstep(r - edge * 0.5, r + edge * 0.5, d);
+    if (cover <= 0.0)
+        return 0;
+
+    float centerToEdge = saturate(d / r);
+    float mu = sqrt(saturate(1.0 - centerToEdge * centerToEdge));
+    static const float3 limbAlpha = float3(0.397, 0.503, 0.652);
+    float3 limb = pow(max(mu, 1e-4).xxx, limbAlpha) * (limbAlpha + 2.0) * 0.5;
+    return A.SunIlluminance / (ATM_PI * r * r) * limb * cover;
 }
+
+// The HDR targets are half floats: the disc (~10⁹ cd/m², ~10⁵ even at a noon exposure) is capped below their range,
+// keeping its colour. Bloom's Karis average keeps a capped disc from flooding the screen.
+static const float SunDiscMaxPixel = 60000.0;
 
 VertexOutput VS(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_InstanceID)
 {
@@ -341,10 +322,10 @@ VertexOutput VS(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_Insta
     uint slot = descriptors[idx].TransformSlot;
 
     float3 rawPos = positions[vertexID];
-    
+
     // Extract camera position from inverse view
     float3 cameraPos = ViewInverse[3].xyz;
-    
+
     // Get world matrix from global transform buffer using the slot
     row_major float4x4 mat = globalTransforms[slot];
     mat._41 = cameraPos.x;
@@ -369,22 +350,38 @@ FragmentOutput PS_Procedural(VertexOutput input)
     FragmentOutput output;
 
     float3 viewDir = normalize(input.ViewDir);
-    float3 sunDir = normalize(SunDirection);
     float pixelAngle = max(length(fwidth(viewDir)) * 0.7071, 1e-5);   // radians per pixel, before any branch
 
-    float3 skyColor = GetSkyColor(viewDir, sunDir);
+    float3 skyColor = 0;
+    float3 behindClouds = 0;     // sun disc, moons, stars: far brighter than a cloud in front, so hidden sooner
+    float3 sunDir = float3(0, 1, 0);
+    float3 moonDir = float3(0, -1, 0);
+    if (AtmosphereIdx != 0)
+    {
+        AtmosphereParams A = LoadAtmosphere();
+        sunDir = A.SunDirection;
+        moonDir = A.MoonDirection;
 
-    float dayFactor, sunsetFactor, nightFactor;
-    GetDayNightFactors(sunDir.y, dayFactor, sunsetFactor, nightFactor);
+        // The air's own light: sun, moon and airglow scattered toward the eye
+        skyColor = AtmosphereSkyLuminance(A, viewDir) * Exposure;
 
-    // Moons, their glow, stars and the Milky Way (not in shared GetSkyColor — ocean reflections don't need them).
-    // The moons and stars go on after the clouds (below): they are far brighter than the sky behind a cloud.
-    float3 moonDir;
-    float moonLight = MoonLightOnSky(sunDir, moonDir);
-    skyColor += MoonGlow(viewDir, sunDir);
-    float3 behindClouds = MoonsAndStars(viewDir, sunDir, NightSky(viewDir, pixelAngle, nightFactor, moonLight));
+        // What lies beyond the air comes through it dimmed (nothing below the horizon)
+        float viewHeight = AtmosphereViewHeight(A, CamPos.y);
+        bool hitsGround = RaySphereIntersectNearest(float3(0, viewHeight, 0), viewDir, float3(0, 0, 0), A.BottomRadius) >= 0.0;
+        float3 viewT = hitsGround ? 0 : AtmTransmittance(A, viewHeight, viewDir.y);
 
-    skyColor += GetSun(viewDir, sunDir) * SunIntensity;
+        float3 sun = SunDisc(A, viewDir, pixelAngle) * viewT * Exposure;
+        sun *= min(1.0, SunDiscMaxPixel / max(max(sun.r, max(sun.g, sun.b)), 1e-6));
+
+        // Stars only where they could show against the sky's light: by day they are a millionth of it
+        float3 stars = 0;
+        float starScale = A.AirglowLuminance * Exposure;
+        float brightest = 2.0 * max(StarBrightness, MilkyWayBrightness * 0.07) / 0.0065 * starScale;
+        if (!hitsGround && brightest > 1e-3 * dot(skyColor, float3(0.2126, 0.7152, 0.0722)))
+            stars = NightSky(viewDir, pixelAngle) * A.AirglowLuminance;
+
+        behindClouds = sun + MoonsAndStars(viewDir, sunDir, stars) * viewT * Exposure;
+    }
 
     // Altitude scales the projected noise, so lerping it zooms the whole pattern. While a preset
     // transition runs we instead cross-fade the density of the old and new cloud layers.
@@ -400,51 +397,23 @@ FragmentOutput PS_Procedural(VertexOutput input)
         // ── Opacity via Beer-Lambert ──
         float absorption = 1.0 - exp(-density * 4.5);
 
-        // ── Core shading: density drives the shadow-sunlit gradient ──
-        // This is the key: the cloud shape detail IS the shading detail.
+        // ── Self-shadowing: the cloud shape detail IS the shading detail ──
         // Thin edges transmit light (bright), thick cores self-shadow (dark).
         float transmittance = exp(-density * 3.0);  // 1.0 at edges, ~0.05 at dense cores
 
-        // ── Directional sun shading ──
-        // At night the light comes from the brightest moon (none up: from opposite the sun, barely lit)
-        float3 cloudLightDir = normalize(lerp(sunDir, moonDir, nightFactor));
-        float sunDot = saturate(dot(viewDir, cloudLightDir));
-        float sunGradient = sunDot * 0.5 + 0.5;  // 0.5 (shade side) to 1.0 (sun facing)
+        // Lit by the sun and the brightest moon through the air above the cloud, and by the sky and the ground;
+        // the air between the camera and the cloud dims it and adds its own light in front
+        CloudLight cl = GetCloudLight(viewDir);
+        float3 lit = cl.sun * CloudDirectShade(viewDir, sunDir, density, transmittance)
+                   + cl.moon * CloudDirectShade(viewDir, moonDir, density, transmittance)
+                   + cl.ambient;
+        float3 cloudColor = CloudAlbedo * lit * cl.viewT + cl.inFront;
 
-        // Combine: transmittance provides detail, sunGradient provides directionality
-        float shadeFactor = lerp(transmittance * 0.7, transmittance, sunGradient);
-
-        // ── Day palette: shadow → sunlit, plus silver lining and backlit powder glow ──
-        float3 dayCloud = lerp(CloudShadowColor, CloudSunlitColor, shadeFactor);
-
-        float edgeMask = smoothstep(0.0, 0.2, density) * smoothstep(0.5, 0.15, density);
-        float silverLining = edgeMask * pow(sunDot, 2.0) * 0.4;
-        dayCloud += float3(1.0, 1.0, 0.95) * silverLining;
-
-        float powder = (1.0 - transmittance) * transmittance * 2.0;  // peaks at medium density
-        dayCloud += float3(1.0, 0.9, 0.7) * powder * pow(sunDot, 3.0) * 0.3;
-        dayCloud *= CloudBrightness * 1.3;
-
-        // ── Sunset palette: day shading pulled toward the warm tint ──
-        float3 sunsetCloud = lerp(dayCloud, CloudSunsetTintColor * CloudBrightness * 1.3, 0.5);
-
-        // ── Night palette: lit by the moons — bright with a silver rim near a full moon, dark shapes against the
-        // stars when none is up ──
-        float3 nightCloud = lerp(CloudNightColor * 0.5, CloudNightColor, shadeFactor) * CloudNightBrightness * (0.25 + 0.75 * moonLight);
-        float moonDot = saturate(dot(viewDir, moonDir));
-        nightCloud += float3(0.8, 0.86, 1.0) * moonLight * (edgeMask * pow(moonDot, 40.0) * 0.5 + transmittance * pow(moonDot, 200.0) * 0.4);
-
-        // ── Blend palettes with the same day/sunset/night weights as the sky ──
-        float3 cloudColor = dayCloud * dayFactor
-                          + sunsetCloud * sunsetFactor
-                          + nightCloud * nightFactor;
-
-        // Blend into sky
         skyColor = lerp(skyColor, cloudColor, absorption);
     }
 
-    // Moons and stars through the clouds: hidden far sooner than the sky colour is. With the sky's absorption a thin
-    // cloud let ~2/3 of a moon through, 50-100x brighter than the cloud round it, so it seemed to hang in front.
+    // Sun, moons and stars through the clouds: hidden far sooner than the sky colour is. With the sky's absorption a
+    // thin cloud let ~2/3 of a moon through, 50-100x brighter than the cloud round it, so it seemed to hang in front.
     skyColor += behindClouds * exp(-density * 15.0);
 
     output.Albedo = float4(skyColor, 1);

@@ -777,6 +777,10 @@ namespace Freefall.Graphics
             cmd.SetGraphicsRoot32BitConstant(0, _emitters!.SrvIndex, 4);                // EmittersIdx
             cmd.SetGraphicsRoot32BitConstant(0, _chunkMap!.SrvIndex, 5);                // ChunkMapIdx
             cmd.SetGraphicsRoot32BitConstant(0, DeferredRenderer.Current?.DepthGBuffer?.BindlessIndex ?? 0u, 6); // DepthGBufIdx
+            // Forward-mode particles are light (pre-exposed like the lights); Transparent ones an albedo the composition lights
+            float lightScale = mode == 0 ? Atmosphere.LegacyLightScale : 1f;
+            cmd.SetGraphicsRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(lightScale), 7);  // LightScale
+            cmd.SetGraphicsRoot32BitConstant(0, mode == 0 ? 1u : 0u, 8);                          // ApplyFog
 
             cmd.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
 

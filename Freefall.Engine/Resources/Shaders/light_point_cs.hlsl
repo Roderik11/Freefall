@@ -357,6 +357,6 @@ void CSPointLight(
     if (any(totalLighting > 0))
     {
         RWTexture2D<float4> Output = ResourceDescriptorHeap[OutputUAVIdx];
-        Output[px] += float4(totalLighting, 0);
+        Output[px] += float4(totalLighting * LegacyLightScale, 0);   // intensities in the older units, pre-exposed
     }
 }

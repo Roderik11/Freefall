@@ -94,29 +94,14 @@ void CSCompose(uint3 dispatchThreadId : SV_DispatchThreadID)
     float isLit = step(0.1, data.a);
     float emissiveMask = albedo.a;
     float3 pbrLit = ambient * albedo.rgb + light.rgb;
-    float3 emissiveGlow = albedo.rgb * 2.0; // self-illumination (HDR boost)
+    // Self-illumination (HDR boost × 2) in the older light units, pre-exposed like the lights
+    float3 emissiveGlow = albedo.rgb * (2.0 * LegacyLightScale);
+    // Unlit pixels (the sky dome) arrive pre-exposed already
     float3 finalColor = lerp(albedo.rgb, lerp(pbrLit, emissiveGlow, emissiveMask), isLit);
-    
-    // Aerial perspective — sky-derived per-pixel fog color
-    if (FogEnabled > 0 && isLit > 0)
-    {
-        float linearDepth = DepthGBuf.Load(coord).r;
 
-        // View direction from screen position (for per-pixel sky color)
-        float2 uv = (float2(px) + 0.5) / float2(ScreenWidthIdx, ScreenHeightIdx);
-        float2 ndc = float2(uv.x * 2.0 - 1.0, -(uv.y * 2.0 - 1.0));
-        float4 farClip = mul(float4(ndc, 0, 1), CameraInverse); // reverse-Z: 0 = far
-        float3 viewDir = normalize(farClip.xyz / farClip.w);
-
-        // Exponential-squared extinction using linear depth as distance
-        float fogFactor = 1.0 - exp(-pow(linearDepth * FogDensity, 2.0));
-        fogFactor = saturate(fogFactor);
-
-        // Inscatter: sky color along view ray (warm toward sun, cool away)
-        float3 inscatter = GetSkyColor(float3(viewDir.x, max(viewDir.y, 0.01), viewDir.z), FogSunDirection);
-
-        finalColor = lerp(finalColor, inscatter, fogFactor);
-    }
+    // Aerial perspective (the atmosphere's froxel volume); sky pixels already hold all of the air
+    if (isLit > 0)
+        finalColor = ApplyAerialPerspective(finalColor, float2(px) + 0.5, DepthGBuf.Load(coord).r);
     
     // Output HDR linear — tonemapping deferred to finalize pass
     Output[px] = float4(finalColor, 1.0f);

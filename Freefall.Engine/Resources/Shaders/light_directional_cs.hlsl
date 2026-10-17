@@ -63,7 +63,7 @@ float4 getCascade(int idx) {
 }
 
 SamplerState Sampler : register(s0);
-SamplerState ShadowClampSampler : register(s2);
+#define ShadowClampSampler AtmosphereLinearClamp   // the same static linear clamp sampler (s2), declared by atmosphere_common.hlsli
 SamplerComparisonState ShadowSampler : register(s3);
 
 // PBR helpers
@@ -363,6 +363,8 @@ void CSDirectionalLight(uint3 dispatchThreadId : SV_DispatchThreadID)
     
     // Note: GI composition moved to separate pass (CSComposeGI in radiance_cascades.hlsl)
     // so RC trace can read direct-light-only without feedback loop
-    
-    Output[px] = float4(lighting, 1.0f);
+
+    // LightIntensity is in the older units (SkyboxRenderer sets it from the sun's lux: E × ReferenceExposure / π):
+    // LegacyLightScale pre-exposes it for the camera's exposure
+    Output[px] = float4(lighting * LegacyLightScale, 1.0f);
 }

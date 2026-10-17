@@ -13,8 +13,7 @@ namespace Freefall.Components
     /// Pick a <see cref="Preset"/> in the inspector (or call <see cref="TransitionTo"/> from code) and the
     /// controller cross-fades from whatever is currently shown to the new preset over
     /// <see cref="TransitionDuration"/> seconds. The blended result is pushed every frame into:
-    ///   • <see cref="SkyboxRenderer"/> via <c>ApplyPreset</c> (sun colors, atmosphere, clouds, stars)
-    ///   • <c>Engine.Settings.FogDensity</c>
+    ///   • <see cref="SkyboxRenderer"/> via <c>ApplyPreset</c> (sun, atmosphere, ground fog, clouds, stars)
     ///   • the optional Rain / Snow / Hail / Dust <see cref="ParticleEmitter"/>s (emit rate scaled by
     ///     the preset's per-type intensity, wind copied to the emitter, emitter parked above the camera)
     ///
@@ -36,9 +35,6 @@ namespace Freefall.Components
 
         [Description("Skybox to drive. Found automatically when left empty.")]
         public SkyboxRenderer Skybox;
-
-        [Description("Push the preset's fog density into Engine.Settings.FogDensity")]
-        public bool DriveFog = true;
 
         [Category("Weather Emitters")]
         [Description("Emitter scaled by RainIntensity. Its EmitRate is treated as the rate at intensity 1.")]
@@ -179,9 +175,6 @@ namespace Freefall.Components
                 Skybox.CloudAltitudeFrom = _fromAltitude;
                 Skybox.CloudAltitudeBlend = _altitudeBlend;
             }
-
-            if (DriveFog)
-                Engine.Settings.FogDensity = _current.FogDensity;
 
             var wind = _current.WindVector;
             var camPos = Camera.Main?.Position ?? Vector3.Zero;

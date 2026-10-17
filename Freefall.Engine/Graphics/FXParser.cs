@@ -35,6 +35,7 @@ namespace Freefall.Graphics
         public bool? DepthWrite { get; set; }
         public string? DepthFunc { get; set; }
         public string? BlendMode { get; set; }
+        public string? RenderTargetFormat { get; set; }
     }
 
     public static class FXParser
@@ -120,6 +121,7 @@ namespace Freefall.Graphics
                                     case "DepthWrite": pass.DepthWrite = bool.Parse(value); break;
                                     case "DepthFunc": pass.DepthFunc = value; break;
                                     case "Blend": pass.BlendMode = value; break;
+                                    case "RenderTargetFormat": pass.RenderTargetFormat = value; break;
                                 }
                             }
                         }

@@ -132,7 +132,14 @@ namespace Freefall.Components
             Matrix4x4.Invert(proj, out var projInv);
             var cameraPos = Transform?.Position ?? Vector3.Zero;
             var time = Freefall.Base.Time.TotalTime;
-            
+
+            // The atmosphere's parameters for this frame (sky, sun, fog: atmosphere_common.hlsli); its LUTs are made
+            // by DeferredRenderer right after this, before anything is drawn
+            uint atmosphereIdx = Graphics.Atmosphere.PrepareFrame(cameraPos.Y);
+            float exposure = Graphics.Atmosphere.Exposure;
+            float legacyLightScale = Graphics.Atmosphere.LegacyLightScale;
+            var viewportSize = new Vector2(Math.Max(Target?.Width ?? 1, 1), Math.Max(Target?.Height ?? 1, 1));
+
             foreach (var pair in Graphics.Effect.MasterEffects)
             {
                 pair.Value.SetParameter("CameraPosition", cameraPos);
@@ -142,12 +149,13 @@ namespace Freefall.Components
                 pair.Value.SetParameter("ProjectionInverse", projInv);
                 pair.Value.SetParameter("ViewProjection", view * proj);
                 pair.Value.SetParameter("Time", time);
-                pair.Value.SetParameter("GroundBounce", SkyboxRenderer.CurrentGroundBounce);
                 float shadowRes = Graphics.DeferredRenderer.Current?.ShadowTextureArray?.Width ?? 2048f;
                 pair.Value.SetParameter("ShadowTexelSize", 1.0f / shadowRes);
                 pair.Value.SetParameter("FogEnabled", Engine.Settings.Fog ? 1.0f : 0.0f);
-                pair.Value.SetParameter("FogDensity", Engine.Settings.FogDensity);
-                pair.Value.SetParameter("FogSunDirection", SkyboxRenderer.CurrentSunDirection);
+                pair.Value.SetParameter("Exposure", exposure);
+                pair.Value.SetParameter("LegacyLightScale", legacyLightScale);
+                pair.Value.SetParameter("AtmosphereIdx", atmosphereIdx);
+                pair.Value.SetParameter("ViewportSize", viewportSize);
                 pair.Value.SetParameter("CamPos", cameraPos);
                 pair.Value.SetParameter("InstanceDataIdx", Graphics.InstanceData.BindlessIndex);
                 pair.Value.SetParameter("PickPixel", PickHolePixel);
@@ -157,20 +165,8 @@ namespace Freefall.Components
                 pair.Value.SetParameter("WindPhase", Graphics.Wind.Phase);
                 pair.Value.SetParameter("WindOffset", Graphics.Wind.Offset);
 
-                // Atmosphere scattering parameters
-                pair.Value.SetParameter("SkyTintColor", SkyboxRenderer.CurrentSkyTintColor);
-                pair.Value.SetParameter("AtmosphereDensity", SkyboxRenderer.CurrentAtmosphereDensity);
-                pair.Value.SetParameter("HazeColor", SkyboxRenderer.CurrentHazeColor);
-                pair.Value.SetParameter("HazeIntensity", SkyboxRenderer.CurrentHazeIntensity);
-                pair.Value.SetParameter("SunsetTintColor", SkyboxRenderer.CurrentSunsetTintColor);
-                pair.Value.SetParameter("SunsetTintIntensity", SkyboxRenderer.CurrentSunsetTintIntensity);
-                pair.Value.SetParameter("NightSkyColor", SkyboxRenderer.CurrentNightSkyColor);
-                pair.Value.SetParameter("HazeHeight", SkyboxRenderer.CurrentHazeHeight);
-                pair.Value.SetParameter("NightHorizonColor", SkyboxRenderer.CurrentNightHorizonColor);
-                pair.Value.SetParameter("MieScattering", SkyboxRenderer.CurrentMieScattering);
-                pair.Value.SetParameter("MieAnisotropy", SkyboxRenderer.CurrentMieAnisotropy);
-
                 // Cloud layer — read by the sky dome and by the sun light for cloud shadows
+                pair.Value.SetParameter("CloudAlbedo", SkyboxRenderer.CurrentCloudAlbedo);
                 pair.Value.SetParameter("CloudCoverage", SkyboxRenderer.CurrentCloudCoverage);
                 pair.Value.SetParameter("CloudTime", SkyboxRenderer.CurrentCloudTime);
                 pair.Value.SetParameter("CloudAltitude", SkyboxRenderer.CurrentCloudAltitude);

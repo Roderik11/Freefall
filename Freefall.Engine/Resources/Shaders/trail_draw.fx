@@ -9,6 +9,7 @@
 // @RenderState(RenderTargets=1, DepthWrite=false, Blend=AlphaBlend, CullMode=None, RenderTargetFormat=R16G16B16A16_Float)
 
 #include "common.fx"
+#include "sky_common.fx"
 
 cbuffer PushConstants : register(b3)
 {
@@ -48,6 +49,7 @@ struct VSOutput
     float4 Color    : COLOR0;
     float  Across   : TEXCOORD0;   // -1..1 from edge to edge
     float  Blade    : TEXCOORD1;   // 1 on a blade's sheet
+    float  Depth    : TEXCOORD2;   // view depth (clip w), for the aerial perspective
 };
 
 VSOutput VS(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
@@ -74,6 +76,7 @@ VSOutput VS(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
         output.Color = p.Color;
         output.Across = corner.y;
         output.Blade = 1.0;
+        output.Depth = output.Position.w;
         return output;
     }
 
@@ -103,6 +106,7 @@ VSOutput VS(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
     output.Position = mul(float4(p.Position + side * (corner.y * halfWidth), 1.0), ViewProjection);
     output.Color = p.Color * share;
     output.Across = corner.y;
+    output.Depth = output.Position.w;
     return output;
 }
 
@@ -116,6 +120,13 @@ float4 PS(VSOutput input) : SV_Target0
 
     if (max(color.a, max(color.r, max(color.g, color.b))) < 0.002) discard;
 
+    // Light in the older units, pre-exposed like the lights; then the air in front (premultiplied, as in particle_draw)
+    color.rgb *= LegacyLightScale;
+    if (FogEnabled > 0.0 && AtmosphereIdx != 0)
+    {
+        float4 ap = AtmosphereAerialPerspective(LoadAtmosphere(), input.Position.xy / ViewportSize, input.Depth);
+        color.rgb = color.rgb * ap.a + ap.rgb * color.a;
+    }
     return color;
 }
 

@@ -74,7 +74,6 @@ struct OceanData
     float RefractionStrength; // how much normal distorts terrain show-through
     uint NoiseSRV;              // bindless SRV for noise texture (Perlin+Worley)
     float2 InvViewportSize;     // 1.0 / viewport dimensions (replaces GetDimensions)
-    float3 CloudColor;          // SkyboxRenderer.CurrentCloudColor (clouds in the sky reflection)
     float ShoreFoamDepth;       // water depth (meters) below which swash foam bands roll in
     float ShoreFoam;            // shore foam amount (0 = none)
     float ShoreSurge;           // water level swing (meters) at the beach, in step with the swash bands
@@ -536,7 +535,10 @@ PSOutput PS(DSOutput input)
     float3 sunDir = normalize(ocean.SunDirection);
     float3 L = normalize(-sunDir);
     float NdotL = saturate(dot(N, L));
-    float3 sunRadiance = ocean.SunColor * ocean.SunIntensity;
+    // The directional light (sun or moon) in the older units, pre-exposed: what a white Lambert surface facing it
+    // sends back, as in the deferred light (E / π). The specular BRDF takes the illuminance itself (× π): until
+    // 2026-10-17 it got this radiance, and the water's sun was π times weaker than the deferred one.
+    float3 sunRadiance = ocean.SunColor * ocean.SunIntensity * LegacyLightScale;
     sunRadiance *= GetCloudShadow(OceanSampler, worldPos - camPos, L);
     sunRadiance *= WaterSunShadow(ShadowMapIdx, worldPos - camPos, input.Position.xy);
 
@@ -567,8 +569,8 @@ PSOutput PS(DSOutput input)
     float3 fresnelN = normalize(lerp(N, float3(0, 1, 0), distSmooth * 0.9));
     float fresnelNV = saturate(dot(fresnelN, V));
     float F = lerp(WaterFresnel(fresnelNV), 0.02 + 0.98 * pow(1.0 - fresnelNV, 5.0), distSmooth * 0.6);
-    float3 reflectColor = WaterSkyReflection(OceanSampler, V, N, worldPos - camPos, dist, ocean.CloudColor);
-    float3 specular = WaterSunSpecular(N, V, L, sunRadiance, F, dist);
+    float3 reflectColor = WaterSkyReflection(OceanSampler, V, N, worldPos - camPos, dist);
+    float3 specular = WaterSunSpecular(N, V, L, sunRadiance * 3.14159, F, dist);
 
     // ── Water column: what is seen through the surface ──
     // pathLen  = distance the view ray travels under water before it hits the scene (depth buffer)
@@ -810,11 +812,8 @@ PSOutput PS(DSOutput input)
     float3 foamLit = foamAlbedo * ((0.27 + 0.5 * NdotL) * sunRadiance + skyAmbient * 1.15);
     color = lerp(color, foamLit, foam * 0.9);
 
-    // ── Atmospheric extinction — shared aerial perspective ──
-    if (FogEnabled > 0)
-    {
-        color = ApplyAerialPerspective(color, worldPos, camPos, FogSunDirection);
-    }
+    // ── The air between the camera and the water (the atmosphere's aerial perspective) ──
+    color = ApplyAerialPerspective(color, input.Position.xy, input.Depth);
 
     // HDR output — no tonemapping/gamma here.
     // The finalize pass applies ACES + gamma to the entire Composite.

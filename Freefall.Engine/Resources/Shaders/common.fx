@@ -12,27 +12,14 @@ cbuffer SceneConstants : register(b0)
     row_major float4x4 CameraInverse; // ViewProjection inverse for depth reconstruction
     row_major float4x4 CameraRelativeVP; // Zero-translation VP (inverse of CameraInverse)
     float ShadowTexelSize;             // 1.0 / shadowMapResolution (precomputed on CPU)
-    float FogEnabled;                  // 0 or 1 toggle
-    float FogDensity;                  // exponential squared density (e.g. 0.001)
-    float _fogPad0;
-    float3 FogSunDirection;            // sun direction for sky-based fog color
-    float _fogPad1;
+    float FogEnabled;                  // 0 or 1: aerial perspective (the atmosphere's haze and ground fog) on surfaces
+    float Exposure;                    // pre-exposure: physical light (cd/m²) × Exposure is what the HDR targets store
+    float LegacyLightScale;            // light in the engine's older units (light intensities, emissive) × this = pre-exposed
     float3 CamPos;                     // camera world position
     uint InstanceDataIdx;              // bindless raw buffer of per-object effect data (InstanceData), 128 bytes a slot at InstanceDescriptor.CustomDataIdx
-
-    // ── Atmosphere scattering parameters (set by SkyboxRenderer) ──
-    float3 SkyTintColor;               // overall sky color multiplier
-    float AtmosphereDensity;           // global atmosphere thickness
-    float3 HazeColor;                  // colored haze at horizon
-    float HazeIntensity;               // horizon haze strength (0–2)
-    float3 SunsetTintColor;            // warm color near horizon at sunset
-    float SunsetTintIntensity;         // sunset color strength (0–2)
-    float3 NightSkyColor;              // zenith color at night
-    float HazeHeight;                  // how high haze reaches in viewDir.y (0–1)
-    float3 NightHorizonColor;          // horizon glow at night
-    float MieScattering;               // Mie (haze/glow) strength (0–1)
-    float MieAnisotropy;               // Henyey-Greenstein g (0–0.99)
-    float3 GroundBounce;               // light the ground sends back up, as a multiple of albedo (SkyboxRenderer)
+    float2 ViewportSize;               // pixels of the target being drawn (aerial perspective lookups by SV_Position)
+    uint AtmosphereIdx;                // bindless StructuredBuffer<AtmosphereParams> (atmosphere_common.hlsli); 0 = not made yet
+    float CloudAlbedo;                 // share of the light a cloud sends back (SkyboxRenderer)
 
     // ── Cloud layer (set by SkyboxRenderer) — shared by the sky dome and the cloud shadows ──
     float CloudCoverage;               // 0-1
@@ -292,12 +279,6 @@ struct MeshPartEntry
     uint Reserved8;
     uint Reserved9;
 };
-
-float3 FOG(float3 color, float depth, float3 fogColor)
-{
-    float fog = 1 - 1 / pow(2, pow(depth * FogDensity, 2)); // exponential squared
-    return lerp(color, fogColor, fog);
-}
 
 // Interleaved gradient noise — deterministic per-pixel, no banding
 float InterleavedGradientNoise(float2 screenPos)

@@ -80,13 +80,11 @@ float WaterDistanceSmooth(float dist)
 
 // Sky (and cloud layer) mirrored in the water.
 // Far away the per-pixel normal is sub-pixel noise: flatten it so the reflection converges on the sky
-// just above the horizon in the mirrored view direction. Uses the same GetSkyColor as the dome and
-// the fog, with the TRUE sun direction (FogSunDirection), so it follows time of day and the
-// environment preset. Never precompute this on the CPU or feed it the directional light's
-// direction: that one is clamped above the horizon at night (the ocean glowed silver from it).
+// just above the horizon in the mirrored view direction. The sky is the atmosphere's (SkyRadiance, the same
+// as the dome and the fog) and the low-sun mix below uses the true sun (AtmSunDirection), not the directional
+// light, which is the moon at night.
 //   relPos:     surface position relative to the camera
-//   cloudColor: SkyboxRenderer.CurrentCloudColor
-float3 WaterSkyReflection(SamplerState wrapSampler, float3 V, float3 N, float3 relPos, float dist, float3 cloudColor)
+float3 WaterSkyReflection(SamplerState wrapSampler, float3 V, float3 N, float3 relPos, float dist)
 {
     float reflSmooth = WaterDistanceSmooth(dist);
     float3 reflN = normalize(lerp(N, float3(0, 1, 0), reflSmooth * 0.9));
@@ -103,18 +101,18 @@ float3 WaterSkyReflection(SamplerState wrapSampler, float3 V, float3 N, float3 r
     float3 lowDir = normalize(float3(reflectDir.x, max(abs(reflectDir.y), 0.02), reflectDir.z));
     reflectDir.y = max(abs(reflectDir.y), lerp(0.03, 0.2, saturate(dist / 200.0)));
     reflectDir = normalize(reflectDir);
-    float3 skyRefl = GetSkyColor(reflectDir, FogSunDirection);
+    float3 skyRefl = SkyRadiance(reflectDir);
 
     // The facets mirror a spread of angles. Toward a low sun the low ones see the bright glow round it and
     // outshine the rest: the broad golden sheen on the sea under a setting sun. So mix in the low mirror
     // direction, by how much the reflection points toward the sun.
-    float2 sunXZ = FogSunDirection.xz;
-    float towardSun = saturate(dot(normalize(reflectDir.xz + 1e-5), normalize(sunXZ + 1e-5)));
-    float lowWeight = lerp(0.15, 0.75, towardSun * towardSun) * saturate(1.0 - FogSunDirection.y * 2.0);
-    skyRefl = lerp(skyRefl, GetSkyColor(lowDir, FogSunDirection), lowWeight);
+    float3 sunDir = AtmSunDirection();
+    float towardSun = saturate(dot(normalize(reflectDir.xz + 1e-5), normalize(sunDir.xz + 1e-5)));
+    float lowWeight = lerp(0.15, 0.75, towardSun * towardSun) * saturate(1.0 - sunDir.y * 2.0);
+    skyRefl = lerp(skyRefl, SkyRadiance(lowDir), lowWeight);
 
-    // Cloud layer: same plane / UVs / density as the sky dome, flat-shaded with the CPU-blended
-    // day / sunset / night cloud color.
+    // Cloud layer: same plane / UVs / density as the sky dome, flat-shaded with the light on it
+    // (sky_common.fx GetCloudLight: the sun and moon through the air, the sky's ambient, the air in front)
     if (CloudNoiseLUTIdx != 0)
     {
         Texture3D<float4> cloudLUT = ResourceDescriptorHeap[CloudNoiseLUTIdx];
@@ -124,7 +122,8 @@ float3 WaterSkyReflection(SamplerState wrapSampler, float3 V, float3 N, float3 r
         // Faded by the angle the surface really mirrors: with the floor's angle, every distant pixel picked up
         // the cloud layer 11° up and the far sea broke into big pale blotches.
         cloudDensity *= smoothstep(0.0, 0.22, mirroredY);
-        skyRefl = lerp(skyRefl, cloudColor, 1.0 - exp(-cloudDensity * 4.5));
+        if (cloudDensity > 0.001)
+            skyRefl = lerp(skyRefl, CloudFlatRadiance(GetCloudLight(reflectDir)), 1.0 - exp(-cloudDensity * 4.5));
     }
 
     // The Fresnel term outside already sets how much of the sky shows. Near water used to get only half of it
@@ -133,12 +132,12 @@ float3 WaterSkyReflection(SamplerState wrapSampler, float3 V, float3 N, float3 r
     return skyRefl;
 }
 
-// Light from the whole sky falling on a level surface (π × its radiance, with the zenith colour standing for all
-// of it). skyAmbient = SkyAmbientLight() = zenith × 0.45, hence × 7. At sunset this, not the low sun, is what
-// lights water from inside: with the sun term alone the shallow shelf and the deep colour went black.
+// Light from the whole sky falling on a level surface. skyAmbient = SkyAmbientLight() = E / π (pre-exposed), so
+// this is E. At sunset this, not the low sun, is what lights water from inside: with the sun term alone the
+// shallow shelf and the deep colour went black. (Before the physical sky: zenith × 0.45 × 7, a guess at the same.)
 float3 WaterSkyIrradiance(float3 skyAmbient)
 {
-    return skyAmbient * 7.0;
+    return skyAmbient * 3.14159;
 }
 
 // Screen-space reflections of the scene were tried here (2026-10-05) and removed: marching the depth
