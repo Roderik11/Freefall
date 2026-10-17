@@ -181,7 +181,7 @@ dotnet build Freefall.Editor/Freefall.Editor.csproj
 dotnet run --project Freefall.Editor
 ```
 
-`Freefall.slnx` still lists `Freefall.Game`, the standalone runtime the engine started with. Play-in-editor has replaced it and it is not part of this repository, so build the editor project rather than the solution. It will be removed once the editor can export a standalone executable with packed resources.
+The standalone runtime the engine started with (`Freefall.Game`) was removed on 2026-10-17: play-in-editor replaced it. A standalone build will come from the editor exporting an executable with packed resources.
 
 To use the MCP tools from Claude Code or another MCP client:
 

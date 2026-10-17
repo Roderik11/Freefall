@@ -219,14 +219,26 @@ namespace Freefall.Editor
 
         private readonly Dictionary<string, (string TtfFile, int PixelSize, int LetterSpacing)> _runtimeFonts = new();
 
+        // Runtime fonts being rasterized on workers since their registration (GetFont waits for its one, then uploads)
+        private readonly Dictionary<string, System.Threading.Tasks.Task<RuntimeFont.Raster>> _rasterizing = new();
+
         /// <summary>
-        /// Register a font that is rasterized from a TTF under Resources/Fonts on first use,
-        /// for sizes without a pre-baked DDS+XML atlas.
+        /// Register a font that is rasterized from a TTF under Resources/Fonts, for sizes without a pre-baked
+        /// DDS+XML atlas. Rasterizing starts on a worker now; the texture is made on first use.
         /// </summary>
         public void RegisterRuntimeFont(string name, string ttfFile, int pixelSize, int letterSpacing = 0)
         {
             _runtimeFonts[name] = (ttfFile, pixelSize, letterSpacing);
+
+            string ttfPath = RuntimeFontPath(ttfFile);
+            if (!_fontLookup.ContainsKey(name) && File.Exists(ttfPath))
+                _rasterizing[name] = RuntimeFont.TakePrefetched(ttfPath, pixelSize, letterSpacing)
+                    ?? System.Threading.Tasks.Task.Run(() => RuntimeFont.Rasterize(ttfPath, pixelSize, letterSpacing));
         }
+
+        /// <summary>Full path of a TTF under Resources/Fonts (valid before the engine starts).</summary>
+        public static string RuntimeFontPath(string ttfFile) =>
+            Path.Combine(AppContext.BaseDirectory, "Resources", "Fonts", ttfFile);
 
         private readonly Dictionary<string, (Freefall.Assets.Typeface Face, int PixelSize)> _typefaceFonts = new();
 
@@ -304,12 +316,16 @@ namespace Freefall.Editor
 
             if (_runtimeFonts.TryGetValue(name, out var runtime))
             {
-                string ttfPath = Path.Combine(Engine.RootDirectory, "Resources", "Fonts", runtime.TtfFile);
+                string ttfPath = RuntimeFontPath(runtime.TtfFile);
                 if (File.Exists(ttfPath))
                 {
+                    var raster = _rasterizing.Remove(name, out var pending)
+                        ? pending.GetAwaiter().GetResult()
+                        : RuntimeFont.Rasterize(ttfPath, runtime.PixelSize, runtime.LetterSpacing);
+                    var font = RuntimeFont.Upload(raster);
                     _fontIndex++;
                     _fontLookup.Add(name, _fontIndex);
-                    _fonts.Add(_fontIndex, RuntimeFont.Build(ttfPath, runtime.PixelSize, runtime.LetterSpacing));
+                    _fonts.Add(_fontIndex, font);
                     return _fontIndex;
                 }
 

@@ -62,10 +62,14 @@ namespace Freefall
 
         private static readonly ConcurrentQueue<WorkItem> _mainThreadQueue = new ConcurrentQueue<WorkItem>();
 
+        /// <summary>
+        /// Run an action on the main thread at the end of a tick (after Present; see Tick). The caller's continuation
+        /// runs on the thread pool, never inline inside the tick.
+        /// </summary>
         public static Task RunOnMainThreadAsync(Action action)
         {
             if (action == null) return Task.CompletedTask;
-            var tcs = new TaskCompletionSource<bool>();
+            var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
             _mainThreadQueue.Enqueue(new WorkItem { Action = action, Tcs = tcs });
             return tcs.Task;
         }
@@ -120,7 +124,7 @@ namespace Freefall
         public static void Initialize(IntPtr handle, int width, int height)
         {
             Kernel32.timeBeginPeriod(1);
-            
+
             RootDirectory = AppContext.BaseDirectory;
 
             LoadPixGpuCapturer();
@@ -138,26 +142,28 @@ namespace Freefall
             var view = new RenderView(handle, width, height, Device);
             view.Pipeline = new DeferredRenderer();
             view.Pipeline.Initialize(width, height);
-            
+
             Input.Init(handle);
-            
+
             AudioDevice = XAudio2.XAudio2Create(ProcessorSpecifier.DefaultProcessor, true);
             _masteringVoice = AudioDevice.CreateMasteringVoice();
             Audio3D = new X3DAudio(Speakers.FrontLeft | Speakers.FrontRight);
             Debug.Log("[Engine] Initialized (editor mode)");
             IsEditor = true;
-            
+
             PhysicsWorld.Initialize();
         }
 
         /// <summary>
         /// Open a project at runtime. Initializes AssetDatabase and sets asset base directory.
-        /// Can be called after Initialize() — enables the landing-page-first workflow.
+        /// Can be called after Initialize() — enables the landing-page-first workflow. Any thread: it reads the
+        /// project's files and fills the asset database, nothing that needs the main thread (the editor runs it on a
+        /// worker while the landing page shows progress). Progress: what it is doing, fraction 0..1.
         /// </summary>
-        public static void OpenProject(string path)
+        public static void OpenProject(string path, Action<string, float> progress = null)
         {
             Project = FreefallProject.Open(path);
-            AssetDatabase.Initialize(Project);
+            AssetDatabase.Initialize(Project, progress);
             Assets.BaseDirectory = Project.AssetsDirectory;
             Debug.Log($"[Engine] Project opened: {Project.Name}");
         }

@@ -243,53 +243,75 @@ namespace Freefall.Graphics
             _device = device;
         }
 
+        private volatile bool _shadersCompiled;
+
+        /// <summary>
+        /// Compile the culler's compute shaders (~30 kernels, ~1.2 s of DXC). Any thread: it creates only shader
+        /// objects and pipeline states (the D3D12 device is free-threaded), no buffers or descriptors. The editor
+        /// runs it on a worker while a project opens, so Initialize on the main thread only creates the buffers.
+        /// Throws if a shader does not compile (Initialize reports it).
+        /// </summary>
+        public void CompileShaders()
+        {
+            if (_shadersCompiled) return;
+
+            // Compile all GPU-driven rendering pipeline passes via ComputeShader
+            _cullShader = new ComputeShader("cull_instances.hlsl");
+            _clearKernel = _cullShader.FindKernel("CSClear");
+            _visibilityKernel = _cullShader.FindKernel("CSVisibility");
+            _histogramKernel = _cullShader.FindKernel("CSHistogram");
+            _histogramPrefixSumKernel = _cullShader.FindKernel("CSHistogramPrefixSum");
+            _localScanKernel = _cullShader.FindKernel("CSLocalScan");
+            _blockScanKernel = _cullShader.FindKernel("CSBlockScan");
+            _globalScatterKernel = _cullShader.FindKernel("CSGlobalScatter");
+            _bitonicSortKernel = _cullShader.FindKernel("CSBitonicSort");
+            _sortIndirectionKernel = _cullShader.FindKernel("CSSortIndirection");
+            _mainKernel = _cullShader.FindKernel("CSMain");
+            _visibilityShadowKernel = _cullShader.FindKernel("CSVisibilityShadow");
+            _visibilityShadow4Kernel = _cullShader.FindKernel("CSVisibilityShadow4");
+            _expandCascadesKernel = _cullShader.FindKernel("CSExpandCascades");
+            _patchExpandedKernel = _cullShader.FindKernel("CSPatchExpandedCounts");
+            _compactCommandsKernel = _cullShader.FindKernel("CSCompactCommands");
+            _computeDepthKeysKernel = _cullShader.FindKernel("CSComputeDepthKeys");
+            _bitonicSortPairsKernel = _cullShader.FindKernel("CSBitonicSortPairs");
+            _writeSortedIndicesKernel = _cullShader.FindKernel("CSWriteSortedIndices");
+            _visibilityLocalShadowsKernel = _cullShader.FindKernel("CSVisibilityLocalShadows");
+            _histogramLocalShadowsKernel = _cullShader.FindKernel("CSHistogramLocalShadows");
+            _scatterLocalShadowsKernel = _cullShader.FindKernel("CSScatterLocalShadows");
+
+            // Hi-Z depth pyramid downsampler
+            _pyramidShader = new ComputeShader("depth_pyramid.hlsl");
+            _spdKernel = _pyramidShader.FindKernel("CSSinglePassDownsample");
+            _perMipKernel = _pyramidShader.FindKernel("CSDownsample");
+            _shadowSpdKernel = _pyramidShader.FindKernel("CSSinglePassDownsampleShadow");
+            _shadowPerMipKernel = _pyramidShader.FindKernel("CSDownsampleShadow");
+            Debug.Log("GPUCuller", "depth_pyramid.hlsl compiled: 4 kernels");
+
+            // SDSM depth analysis
+            _depthAnalysisShader = new ComputeShader("depth_analysis.hlsl");
+            _depthBinsKernel = _depthAnalysisShader.FindKernel("CSDepthBins");
+            _depthSplitsKernel = _depthAnalysisShader.FindKernel("CSDepthSplits");
+
+            // GPU-driven cascade matrix computation
+            _cascadeShader = new ComputeShader("cascade_compute.hlsl");
+            _cascadeComputeKernel = _cascadeShader.FindKernel("CSComputeCascadeMatrices");
+
+            _shadersCompiled = true;
+        }
+
         /// <summary>
         /// Initialize the GPU culler by compiling the compute shader and creating buffers.
-        /// Called lazily on first use.
+        /// Called lazily on first use. Main thread (buffers, descriptors); the shaders may have been compiled
+        /// ahead on a worker (CompileShaders).
         /// </summary>
         public void Initialize()
         {
             if (_initialized) return;
-            
+
             try
             {
-                // Compile all GPU-driven rendering pipeline passes via ComputeShader
-                _cullShader = new ComputeShader("cull_instances.hlsl");
-                _clearKernel = _cullShader.FindKernel("CSClear");
-                _visibilityKernel = _cullShader.FindKernel("CSVisibility");
-                _histogramKernel = _cullShader.FindKernel("CSHistogram");
-                _histogramPrefixSumKernel = _cullShader.FindKernel("CSHistogramPrefixSum");
-                _localScanKernel = _cullShader.FindKernel("CSLocalScan");
-                _blockScanKernel = _cullShader.FindKernel("CSBlockScan");
-                _globalScatterKernel = _cullShader.FindKernel("CSGlobalScatter");
-                _bitonicSortKernel = _cullShader.FindKernel("CSBitonicSort");
-                _sortIndirectionKernel = _cullShader.FindKernel("CSSortIndirection");
-                _mainKernel = _cullShader.FindKernel("CSMain");
-                _visibilityShadowKernel = _cullShader.FindKernel("CSVisibilityShadow");
-                _visibilityShadow4Kernel = _cullShader.FindKernel("CSVisibilityShadow4");
-                _expandCascadesKernel = _cullShader.FindKernel("CSExpandCascades");
-                _patchExpandedKernel = _cullShader.FindKernel("CSPatchExpandedCounts");
-                _compactCommandsKernel = _cullShader.FindKernel("CSCompactCommands");
-                _computeDepthKeysKernel = _cullShader.FindKernel("CSComputeDepthKeys");
-                _bitonicSortPairsKernel = _cullShader.FindKernel("CSBitonicSortPairs");
-                _writeSortedIndicesKernel = _cullShader.FindKernel("CSWriteSortedIndices");
-                _visibilityLocalShadowsKernel = _cullShader.FindKernel("CSVisibilityLocalShadows");
-                _histogramLocalShadowsKernel = _cullShader.FindKernel("CSHistogramLocalShadows");
-                _scatterLocalShadowsKernel = _cullShader.FindKernel("CSScatterLocalShadows");
-                
-                // Hi-Z depth pyramid downsampler
-                _pyramidShader = new ComputeShader("depth_pyramid.hlsl");
-                _spdKernel = _pyramidShader.FindKernel("CSSinglePassDownsample");
-                _perMipKernel = _pyramidShader.FindKernel("CSDownsample");
-                _shadowSpdKernel = _pyramidShader.FindKernel("CSSinglePassDownsampleShadow");
-                _shadowPerMipKernel = _pyramidShader.FindKernel("CSDownsampleShadow");
-                Debug.Log("GPUCuller", "depth_pyramid.hlsl compiled: 4 kernels");
-                
-                // SDSM depth analysis
-                _depthAnalysisShader = new ComputeShader("depth_analysis.hlsl");
-                _depthBinsKernel = _depthAnalysisShader.FindKernel("CSDepthBins");
-                _depthSplitsKernel = _depthAnalysisShader.FindKernel("CSDepthSplits");
-                
+                CompileShaders();
+
                 // Create SDSM GPU buffers
                 _depthMinMaxBuffer = GraphicsBuffer.CreateRaw(2, uav: true, clearable: true);
                 // Static upload buffer with init values: min=MAX_FLOAT (0x7F7FFFFF), max=0
@@ -314,9 +336,6 @@ namespace Freefall.Graphics
                 // GPU-driven cascade matrix computation (depends on SDSM being initialized)
                 if (_sdsmInitialized)
                 {
-                    _cascadeShader = new ComputeShader("cascade_compute.hlsl");
-                    _cascadeComputeKernel = _cascadeShader.FindKernel("CSComputeCascadeMatrices");
-                    
                     int maxCascades = 8;
                     int lightingStride = Marshal.SizeOf<LightingCascadeData>();
                     int vpStride = Marshal.SizeOf<Matrix4x4>();

@@ -14,7 +14,8 @@ namespace Freefall.Editor.Mcp
     public static class EditorTools
     {
         [McpServerTool(Name = "editor_status", Title = "Editor status", ReadOnly = true, OpenWorld = false)]
-        [Description("Whether a project is open, which project and scene, plus fps/entity count. Call this first to check the editor is reachable and ready.")]
+        [Description("Whether a project is open, which project and scene, plus fps/entity count. Call this first to check the editor is reachable and ready. " +
+                     "While a project is opening, 'opening' says which step it is on and how far along it is (projectOpen is false until it is done).")]
         public static async Task<CallToolResult> Status()
         {
             var server = EditorCommandServer.Instance;
@@ -29,6 +30,9 @@ namespace Freefall.Editor.Mcp
                 ["scene"] = Program.EditorUI?.CurrentScenePath,
             });
 
+            if (ProjectOpening.Current is { } opening)
+                info["opening"] = OpeningJson(opening);
+
             var stats = await server.DispatchAsync("GET", "/api/engine/stats", null);
             if (stats.StatusCode == 200 && stats.Body != null)
                 info["stats"] = JsonNode.Parse(stats.Body);
@@ -41,11 +45,13 @@ namespace Freefall.Editor.Mcp
         public static Task<CallToolResult> ListRecentProjects() => McpBridge.Get("/api/project/recent");
 
         [McpServerTool(Name = "project_open", Title = "Open project", Destructive = false, OpenWorld = false)]
-        [Description("Open a project from the landing page and wait until import finishes. No-op if a project is already open (the editor cannot switch projects without a restart).")]
+        [Description("Open a project from the landing page and wait until it is fully open (asset scan, import, scripts, editor UI). " +
+                     "The editor stays responsive meanwhile: editor_status reports the step. If an open is already running, waits for that one. " +
+                     "No-op if a project is already open (the editor cannot switch projects without a restart).")]
         public static async Task<CallToolResult> OpenProject(
             [Description("Project root directory")] string? path = null,
             [Description("Index into project_list_recent, used when path is omitted")] int? recentIndex = null,
-            [Description("Max seconds to wait for the import to finish")] int waitSeconds = 300)
+            [Description("Max seconds to wait for the open to finish")] int waitSeconds = 300)
         {
             if (path == null && recentIndex == null)
                 return McpBridge.Error("Pass either 'path' or 'recentIndex'.");
@@ -54,16 +60,34 @@ namespace Freefall.Editor.Mcp
             if (start.IsError == true || TextOf(start).Contains("already_open"))
                 return start;
 
-            var server = EditorCommandServer.Instance;
-            var deadline = DateTime.UtcNow.AddSeconds(waitSeconds);
-            while (DateTime.UtcNow < deadline)
+            // Started (or already running): the open completes with null once the editor is up, else with the error
+            var completion = ProjectOpening.Completion;
+            try
             {
-                if (await server.RunOnMainThread(() => Program.IsProjectOpen))
-                    return await Status();
-                await Task.Delay(500);
+                var error = await completion.WaitAsync(TimeSpan.FromSeconds(waitSeconds));
+                if (error != null)
+                    return McpBridge.Error($"Opening the project failed: {error}");
             }
-            return McpBridge.Error($"Project is still importing after {waitSeconds}s — call editor_status later.");
+            catch (TimeoutException)
+            {
+                var opening = ProjectOpening.Current;
+                return McpBridge.Error($"The project is still opening after {waitSeconds}s" +
+                                       (opening != null ? $" (step: {opening.Step}, {opening.Fraction:P0})" : "") +
+                                       " — call editor_status later.");
+            }
+            return await Status();
         }
+
+        private static JsonObject OpeningJson(ProjectOpening.Status s) => new()
+        {
+            ["path"] = s.Path,
+            ["step"] = s.Step,
+            ["stepIndex"] = s.StepIndex + 1,
+            ["stepCount"] = s.StepCount,
+            ["detail"] = s.Detail,
+            ["fraction"] = Math.Round(s.Fraction, 3),
+            ["seconds"] = Math.Round(s.Seconds, 1),
+        };
 
         [McpServerTool(Name = "editor_shutdown", Title = "Close the editor", Destructive = true, OpenWorld = false)]
         [Description("Close the editor window (e.g. before rebuilding the locked editor DLL). Unsaved work may prompt or be lost.")]

@@ -56,18 +56,22 @@ namespace Freefall.Base
             var errorOutput = new PhysXErrorOutput();
             var foundation = new Foundation(errorOutput);
 
-            // PVD — attempt connection, fails gracefully if PVD app is not running
+            // PVD — connect only when the PVD app is listening: a TCP connect to a closed localhost port retries for
+            // ~2 s on Windows before it fails, which every editor start paid (2026-10-17)
             var pvd = new PhysX.VisualDebugger.Pvd(foundation);
             Physics = new PhysX.Physics(foundation, true, pvd);
-            
-            try
+
+            if (IsListening(PvdPort))
             {
-                Physics.Pvd.Connect("localhost");
-                Debug.Log("[PhysX] PVD connected");
-            }
-            catch
-            {
-                Debug.Log("[PhysX] PVD not available (optional)");
+                try
+                {
+                    Physics.Pvd.Connect("localhost");
+                    Debug.Log("[PhysX] PVD connected");
+                }
+                catch
+                {
+                    Debug.Log("[PhysX] PVD not available (optional)");
+                }
             }
 
             // Create scene with gravity and collision filtering
@@ -84,6 +88,20 @@ namespace Freefall.Base
             DefaultMaterial = Physics.CreateMaterial(0.7f, 0.7f, 0.1f);
 
             Debug.Log("[PhysX] Initialized — gravity (0, -9.81, 0)");
+        }
+
+        // The PhysX Visual Debugger's default port
+        private const int PvdPort = 5425;
+
+        private static bool IsListening(int port)
+        {
+            try
+            {
+                foreach (var endpoint in System.Net.NetworkInformation.IPGlobalProperties.GetIPGlobalProperties().GetActiveTcpListeners())
+                    if (endpoint.Port == port) return true;
+            }
+            catch (System.Net.NetworkInformation.NetworkInformationException) { }
+            return false;
         }
 
         public static void Update(float deltaTime)

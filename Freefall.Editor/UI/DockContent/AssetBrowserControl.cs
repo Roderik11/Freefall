@@ -36,6 +36,13 @@ namespace Freefall.Editor
         /// <summary>Forget the map after a script reload: it holds script asset types (and so the old script assembly).</summary>
         internal static void ResetTypeMap() => _typeMap = null;
 
+        /// <summary>
+        /// Build the map before the first lookup. Any thread: it scans every loaded assembly's types, ~0.4 s with
+        /// Roslyn loaded, which the asset browser's first folder paid on the main thread (project open runs it on a
+        /// worker after the scripts are loaded).
+        /// </summary>
+        internal static void WarmTypeMap() => _typeMap ??= BuildTypeMap();
+
         private static Dictionary<string, Type> BuildTypeMap()
         {
             var map = new Dictionary<string, Type>(StringComparer.OrdinalIgnoreCase);

@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
@@ -47,6 +48,17 @@ namespace Freefall.Editor
         public const string FontSmall = "landing_small";
         public const string FontEyebrow = "landing_eyebrow";
 
+        private static readonly (string Name, string TtfFile, int PixelSize, int LetterSpacing)[] Fonts =
+        {
+            (FontHeadline, "Roboto/Roboto-Medium.ttf", 32, 0),
+            (FontHeading, "Roboto/Roboto-Medium.ttf", 22, 0),
+            (FontTitle, "Roboto/Roboto-Medium.ttf", 16, 0),
+            (FontBody, "Roboto/Roboto-Regular.ttf", 14, 0),
+            (FontBodyMedium, "Roboto/Roboto-Medium.ttf", 14, 0),
+            (FontSmall, "Roboto/Roboto-Regular.ttf", 12, 0),
+            (FontEyebrow, "Roboto/Roboto-Medium.ttf", 11, 2),
+        };
+
         private static bool _ready;
 
         public static int Rgb(int rgb, float alpha = 1f)
@@ -54,18 +66,23 @@ namespace Freefall.Editor
             return ColorInt.ARGB(alpha, ((rgb >> 16) & 0xff) / 255f, ((rgb >> 8) & 0xff) / 255f, (rgb & 0xff) / 255f);
         }
 
+        /// <summary>
+        /// Start rasterizing the landing page's fonts on workers before anything else (top of Main): GDI+ takes
+        /// ~0.3 s for them, which then runs beside the engine's start instead of inside the first frame.
+        /// </summary>
+        public static void PrefetchFonts()
+        {
+            foreach (var font in Fonts)
+                RuntimeFont.Prefetch(SquidRenderer.RuntimeFontPath(font.TtfFile), font.PixelSize, font.LetterSpacing);
+        }
+
         public static void Ensure()
         {
             if (_ready || Gui.Renderer is not SquidRenderer renderer) return;
             _ready = true;
 
-            renderer.RegisterRuntimeFont(FontHeadline, "Roboto/Roboto-Medium.ttf", 32);
-            renderer.RegisterRuntimeFont(FontHeading, "Roboto/Roboto-Medium.ttf", 22);
-            renderer.RegisterRuntimeFont(FontTitle, "Roboto/Roboto-Medium.ttf", 16);
-            renderer.RegisterRuntimeFont(FontBody, "Roboto/Roboto-Regular.ttf", 14);
-            renderer.RegisterRuntimeFont(FontBodyMedium, "Roboto/Roboto-Medium.ttf", 14);
-            renderer.RegisterRuntimeFont(FontSmall, "Roboto/Roboto-Regular.ttf", 12);
-            renderer.RegisterRuntimeFont(FontEyebrow, "Roboto/Roboto-Medium.ttf", 11, letterSpacing: 2);
+            foreach (var font in Fonts)
+                renderer.RegisterRuntimeFont(font.Name, font.TtfFile, font.PixelSize, font.LetterSpacing);
 
             Insert(renderer, Round, 48, 48, (g, r) => { using var p = RoundedRect(r, 14); g.FillPath(Brushes.White, p); });
             Insert(renderer, Outline, 48, 48, (g, r) =>
@@ -219,6 +236,48 @@ namespace Freefall.Editor
                 if (Measure(font, candidate).x <= maxWidth) return candidate;
             }
             return "…";
+        }
+
+        /// <summary>
+        /// Break text into lines no wider than maxWidth (joined with '\n'). Squid wraps only at spaces, so a long path
+        /// ran off the dialog: a word too wide for a line is split, after a path separator where there is one.
+        /// </summary>
+        public static string Wrap(string font, string text, int maxWidth)
+        {
+            if (string.IsNullOrEmpty(text)) return text ?? "";
+
+            var lines = new List<string>();
+            foreach (var paragraph in text.Replace("\r", "").Split('\n'))
+            {
+                var line = "";
+                foreach (var word in paragraph.Split(' '))
+                {
+                    var candidate = line.Length == 0 ? word : line + " " + word;
+                    if (Measure(font, candidate).x <= maxWidth)
+                    {
+                        line = candidate;
+                        continue;
+                    }
+
+                    if (line.Length > 0)
+                        lines.Add(line);
+                    line = word;
+
+                    // Still too wide alone: split it, preferring the last separator that fits
+                    while (line.Length > 1 && Measure(font, line).x > maxWidth)
+                    {
+                        int fit = 1;
+                        while (fit < line.Length && Measure(font, line.Substring(0, fit + 1)).x <= maxWidth)
+                            fit++;
+                        int separator = line.LastIndexOfAny(new[] { '\\', '/' }, fit - 1);
+                        int cut = separator > 0 ? separator + 1 : fit;
+                        lines.Add(line.Substring(0, cut));
+                        line = line.Substring(cut);
+                    }
+                }
+                lines.Add(line);
+            }
+            return string.Join("\n", lines);
         }
 
         public static string TimeAgo(DateTime utc)

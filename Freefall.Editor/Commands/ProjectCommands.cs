@@ -11,6 +11,10 @@ namespace Freefall.Editor.Commands
             if (Program.IsProjectOpen)
                 return CommandResult.Json(new { status = "already_open", project = Engine.Project?.Name });
 
+            // One open at a time: a second request joins the one in progress (project_open waits for it)
+            if (ProjectOpening.Current is { } opening)
+                return CommandResult.Json(new { status = "opening", path = opening.Path, step = opening.Step, fraction = opening.Fraction });
+
             if (string.IsNullOrEmpty(context.Body))
                 return CommandResult.BadRequest("Request body required with 'path'");
 
@@ -35,8 +39,9 @@ namespace Freefall.Editor.Commands
             if (string.IsNullOrEmpty(path) || !Directory.Exists(path))
                 return CommandResult.BadRequest($"Invalid project path: '{path}'");
 
-            // Fire the project open on the main thread (async — returns immediately)
-            Program.OpenProject(path);
+            // Starts the open (workers + short main-thread slices) and returns at once; editor_status follows it
+            if (Program.Landing == null || !ProjectOpening.Start(path, Program.Landing))
+                return CommandResult.Error(409, "The editor cannot open a project now (not on the landing page)");
 
             return CommandResult.Json(new { status = "opening", path });
         }

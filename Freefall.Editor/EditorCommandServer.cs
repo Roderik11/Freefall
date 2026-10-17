@@ -33,7 +33,14 @@ namespace Freefall.Editor
     {
         public static EditorCommandServer Instance { get; private set; }
 
-        public const int Port = 21721;
+        public const int DefaultPort = 21721;
+
+        /// <summary>
+        /// DefaultPort, or FREEFALL_EDITOR_PORT: a second editor (e.g. a build under test next to the one in use)
+        /// needs a port of its own, the first one keeps 21721.
+        /// </summary>
+        public static readonly int Port =
+            int.TryParse(Environment.GetEnvironmentVariable("FREEFALL_EDITOR_PORT"), out var port) && port > 0 ? port : DefaultPort;
         private static readonly TimeSpan MainThreadTimeout = TimeSpan.FromSeconds(60);
 
         private readonly ConcurrentQueue<Action> _mainThreadQueue = new();

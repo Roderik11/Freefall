@@ -13,7 +13,9 @@ namespace Freefall.Editor
     /// <summary>
     /// Rasterizes a TTF into a bitmap-font atlas at startup, for sizes we don't ship pre-baked
     /// DDS+XML fonts for (headings on the landing page). Registered through
-    /// SquidRenderer.RegisterRuntimeFont and built lazily on first use.
+    /// SquidRenderer.RegisterRuntimeFont, which starts Rasterize on a worker right away (the landing page's
+    /// seven fonts took 0.37 s of its first frame one after another, 2026-10-17); Upload makes the texture on
+    /// first use.
     /// </summary>
     internal static class RuntimeFont
     {
@@ -22,16 +24,47 @@ namespace Freefall.Editor
             Enumerable.Range(32, 95).Concat(Enumerable.Range(161, 95)).Select(i => (char)i)
                 .Concat("…·×—–’“”•").ToArray();
 
+        /// <summary>A rasterized atlas before its texture exists (RGBA, coverage in alpha).</summary>
+        internal sealed class Raster
+        {
+            public byte[] Pixels;
+            public int Width, Height, LineHeight, LetterSpacing;
+            public Dictionary<char, Freefall.Graphics.Font.Glyph> Glyphs;
+        }
+
+        // Rasterizations started before anyone asked (Prefetch), taken by the registration that needs them
+        private static readonly System.Collections.Concurrent.ConcurrentDictionary<(string, int, int), System.Threading.Tasks.Task<Raster>> _prefetched = new();
+
+        /// <summary>Start rasterizing on a worker now; SquidRenderer.RegisterRuntimeFont takes the result.</summary>
+        public static void Prefetch(string ttfPath, int pixelSize, int letterSpacing)
+        {
+            if (System.IO.File.Exists(ttfPath))
+                _prefetched.GetOrAdd((ttfPath, pixelSize, letterSpacing),
+                    _ => System.Threading.Tasks.Task.Run(() => Rasterize(ttfPath, pixelSize, letterSpacing)));
+        }
+
+        /// <summary>The prefetched rasterization of this font (and forget it), or null.</summary>
+        public static System.Threading.Tasks.Task<Raster> TakePrefetched(string ttfPath, int pixelSize, int letterSpacing)
+            => _prefetched.TryRemove((ttfPath, pixelSize, letterSpacing), out var task) ? task : null;
+
         /// <param name="letterSpacing">Extra pixels between glyphs (for small uppercase labels).</param>
         public static Freefall.Graphics.Font Build(string ttfPath, int pixelSize, int letterSpacing)
-        {
-            using var collection = new PrivateFontCollection();
-            collection.AddFontFile(ttfPath);
-            return Build(collection.Families[0], pixelSize, letterSpacing);
-        }
+            => Upload(Rasterize(ttfPath, pixelSize, letterSpacing));
 
         /// <summary>From a font file's bytes (a <see cref="Freefall.Assets.Typeface"/>).</summary>
         public static Freefall.Graphics.Font Build(byte[] fontFile, int pixelSize, int letterSpacing)
+            => Upload(Rasterize(fontFile, pixelSize, letterSpacing));
+
+        /// <summary>Rasterize a TTF file's glyphs. Any thread (GDI+ objects of its own, no GPU).</summary>
+        public static Raster Rasterize(string ttfPath, int pixelSize, int letterSpacing)
+        {
+            using var collection = new PrivateFontCollection();
+            collection.AddFontFile(ttfPath);
+            return Rasterize(collection.Families[0], pixelSize, letterSpacing);
+        }
+
+        /// <summary>Rasterize a font file's bytes. Any thread.</summary>
+        public static Raster Rasterize(byte[] fontFile, int pixelSize, int letterSpacing)
         {
             // GDI+ reads the face from this memory for as long as the collection lives
             var pinned = GCHandle.Alloc(fontFile, GCHandleType.Pinned);
@@ -39,7 +72,7 @@ namespace Freefall.Editor
             {
                 using var collection = new PrivateFontCollection();
                 collection.AddMemoryFont(pinned.AddrOfPinnedObject(), fontFile.Length);
-                return Build(collection.Families[0], pixelSize, letterSpacing);
+                return Rasterize(collection.Families[0], pixelSize, letterSpacing);
             }
             finally
             {
@@ -47,7 +80,16 @@ namespace Freefall.Editor
             }
         }
 
-        private static Freefall.Graphics.Font Build(FontFamily family, int pixelSize, int letterSpacing)
+        /// <summary>The atlas texture and font. Main thread (creates a GPU texture).</summary>
+        public static Freefall.Graphics.Font Upload(Raster raster)
+        {
+            var texture = Texture.CreateFromData(Engine.Device, raster.Width, raster.Height, raster.Pixels);
+            var result = Freefall.Graphics.Font.FromGlyphs(texture, raster.Width, raster.Height, raster.Glyphs, raster.LineHeight);
+            result.Spacing = -raster.LetterSpacing;
+            return result;
+        }
+
+        private static Raster Rasterize(FontFamily family, int pixelSize, int letterSpacing)
         {
             // A single-weight file only answers to the style it was built as.
             var style = new[] { FontStyle.Regular, FontStyle.Bold, FontStyle.Italic, FontStyle.Bold | FontStyle.Italic }
@@ -108,8 +150,6 @@ namespace Freefall.Editor
             for (int i = 0; i < pixels.Length; i += 4)
                 pixels[i] = pixels[i + 1] = pixels[i + 2] = 255;
 
-            var texture = Texture.CreateFromData(Engine.Device, atlasWidth, atlasHeight, pixels);
-
             var glyphs = new Dictionary<char, Freefall.Graphics.Font.Glyph>(cells.Count);
             foreach (var cell in cells)
             {
@@ -122,9 +162,15 @@ namespace Freefall.Editor
                 };
             }
 
-            var result = Freefall.Graphics.Font.FromGlyphs(texture, atlasWidth, atlasHeight, glyphs, lineHeight);
-            result.Spacing = -letterSpacing;
-            return result;
+            return new Raster
+            {
+                Pixels = pixels,
+                Width = atlasWidth,
+                Height = atlasHeight,
+                LineHeight = lineHeight,
+                LetterSpacing = letterSpacing,
+                Glyphs = glyphs,
+            };
         }
     }
 }

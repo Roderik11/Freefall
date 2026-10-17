@@ -36,25 +36,32 @@ namespace Freefall
 
         public static event Action<string, StackTrace> OnLog;
 
-        public static void ClearLog() => lines.Clear();
+        public static void ClearLog()
+        {
+            lock (lines) lines.Clear();
+        }
 
         private const int MaxLines = 5000;
 
         static void Append(string message, StackTrace stackTrace)
         {
-            // Per-frame warnings would otherwise grow the log without bound: drop exact repeats of the last line
-            if (lines.Count > 0 && lines[^1].Message == message) return;
-            if (lines.Count >= MaxLines) lines.RemoveRange(0, MaxLines / 10);
-
-            Console.WriteLine(message);
-            var entry = new LogEntry { Message = message, StackTrace = stackTrace };
-            if (stackTrace != null && TouchesCollectibleCode(stackTrace))
+            // Workers log too (imports, the editor's project open): two threads adding at once would corrupt the list
+            lock (lines)
             {
-                entry.StackText = stackTrace.GetFrames().StackFramesToString();
-                entry.StackLocations = StackLocationsOf(stackTrace);
-                entry.StackTrace = null;
+                // Per-frame warnings would otherwise grow the log without bound: drop exact repeats of the last line
+                if (lines.Count > 0 && lines[^1].Message == message) return;
+                if (lines.Count >= MaxLines) lines.RemoveRange(0, MaxLines / 10);
+
+                Console.WriteLine(message);
+                var entry = new LogEntry { Message = message, StackTrace = stackTrace };
+                if (stackTrace != null && TouchesCollectibleCode(stackTrace))
+                {
+                    entry.StackText = stackTrace.GetFrames().StackFramesToString();
+                    entry.StackLocations = StackLocationsOf(stackTrace);
+                    entry.StackTrace = null;
+                }
+                lines.Add(entry);
             }
-            lines.Add(entry);
         }
 
         private static bool TouchesCollectibleCode(StackTrace trace)

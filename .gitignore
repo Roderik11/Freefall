@@ -22,9 +22,6 @@ debug_shader.fx
 *.png
 Freefall.Engine/Resources/Terrain/
 
-# Game project (excluded for now)
-Freefall.Game/
-
 # Antigravity agent
 .agent/
 

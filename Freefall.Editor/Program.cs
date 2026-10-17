@@ -61,6 +61,10 @@ namespace Freefall.Editor
         static void Main()
         {
             Thread.CurrentThread.CurrentCulture = CultureInfo.InvariantCulture;
+
+            // The landing page's fonts rasterize on workers while the engine starts (not in the first frame)
+            LandingArt.PrefetchFonts();
+
             var color = System.Drawing.ColorTranslator.FromHtml("#222222");
 
             form = new RenderForm
@@ -139,9 +143,11 @@ namespace Freefall.Editor
             landingDesktop.OnProjectSelected += OpenProject;
             activeDesktop = landingDesktop;
 
-            // Start the AI agent command server (before project open so agent can trigger it)
+            // Start the AI agent command server (before project open so agent can trigger it). Kestrel and the MCP
+            // tool scan take ~0.25 s: on a worker, the first frame does not wait for them (requests are queued for
+            // the main thread anyway).
             commandServer = new EditorCommandServer();
-            commandServer.Start();
+            System.Threading.Tasks.Task.Run(commandServer.Start);
 
             // Re-apply the icon now that startup is done: the taskbar asks the window for its icon while
             // Engine.Initialize is still blocking this thread, gives up, and keeps a generic one until told again.
@@ -156,83 +162,38 @@ namespace Freefall.Editor
         }
 
         /// <summary>
-        /// Called when a project is selected from the landing page.
-        /// Opens the project, runs async import with progress dialog,
-        /// then swaps to the editor desktop on success.
+        /// Called when a project is selected from the landing page (or MCP project_open): starts opening it in the
+        /// background with the progress popup (ProjectOpening). Main thread. Does nothing while an open is running.
         /// </summary>
-        internal static async void OpenProject(string path)
+        internal static void OpenProject(string path)
         {
-            var landing = activeDesktop as LandingDesktop;
-            if (landing == null) return;
+            ProjectOpening.Start(path, activeDesktop as LandingDesktop);
+        }
 
-            try
+        /// <summary>
+        /// Last step of ProjectOpening, main thread: swap the landing page for the editor desktop (built in an earlier
+        /// slice) and create the default scene.
+        /// </summary>
+        internal static void ShowEditor(EditorUI ui)
+        {
+            (activeDesktop as LandingDesktop)?.HideImportDialog();
+
+            editorUI = ui;
+            activeDesktop = ui;
+
+            // Create default editor scene (sun, skybox, camera)
+            var defaultScene = new EditorDefaultScene();
+            EditorCamera.Camera.Target = RenderView.All[1];
+
+            MessageDispatcher.Send(Msg.RefreshExplorer);
+
+            // Notify listeners that the project is ready
+            MessageDispatcher.Send(Msg.ProjectOpened, new
             {
-                // Sync: open project, scan meta files
-                Engine.OpenProject(path);
-                RecentProjects.Add(Engine.Project.Name, path);
-
-                // Show import progress dialog
-                landing.ShowImportDialog(Engine.Project.Name);
-
-                // Use direct callback instead of Progress<T> to avoid SynchronizationContext marshaling issues
-                // UpdateImportStatus is already thread-safe (volatile + OnUpdate polling)
-                await AssetDatabase.ImportAllAsync(
-                    status => landing.UpdateImportStatus(status));
-
-                // Marshal back to UI thread for editor initialization
-                form.Invoke(() =>
-                {
-                    landing.HideImportDialog();
-
-                    //Freefall.Editor.Tools.ManifestImporter.GenerateAssets(Engine.Project.AssetsDirectory);
-                    //Freefall.Editor.Tools.ManifestImporter.SaveScene(Engine.Project.AssetsDirectory);
-
-                    // SaveScene may create new .asset files (terrain, material) that weren't
-                    // present during the initial import. Re-scan to pick them up, then import.
-                    AssetDatabase.Refresh();
-                    AssetDatabase.ImportAll();
-
-                    // Generate thumbnails for any assets that don't have one yet
-                    AssetDatabase.GenerateMissingThumbnails(
-                        status => landing.UpdateImportStatus(status),
-                        () => new ThumbnailRenderer());
-
-                    ScriptCompiler.Initialize(Engine.Project.AssetsDirectory);
-
-                    // Swap from landing page to editor desktop
-                    editorUI = new EditorUI(form);
-                    EditorPreferences.RegisterStyles(editorUI);
-                    editorUI.AssetBrowser.Initialize();
-                    EditorPreferences.DiscoverAllTypes();
-                    activeDesktop = editorUI;
-
-                    CommandBuffer.InitializeCuller(Engine.Device);
-
-                    // Create default editor scene (sun, skybox, camera)
-                    var defaultScene = new EditorDefaultScene();
-                    EditorCamera.Camera.Target = RenderView.All[1];
-
-                    MessageDispatcher.Send(Msg.RefreshExplorer);
-
-                    // Notify listeners that the project is ready
-                    MessageDispatcher.Send(Msg.ProjectOpened, new
-                    {
-                        path = Engine.Project.RootDirectory,
-                        name = Engine.Project.Name,
-                        entityCount = Base.EntityManager.Entities.Count
-                    });
-                });
-            }
-            catch (Exception ex)
-            {
-                Debug.LogWarning("Editor", $"Failed to open project: {ex.Message}");
-
-                form.Invoke(() =>
-                {
-                    landing.ShowErrorDialog($"Failed to open project:\n{ex.Message}");
-                    landing.OnErrorDismissed += () => form.Close();
-                });
-            }
+                path = Engine.Project.RootDirectory,
+                name = Engine.Project.Name,
+                entityCount = Base.EntityManager.Entities.Count
+            });
         }
 
         /// <summary>
@@ -332,7 +293,19 @@ namespace Freefall.Editor
             }
 
             view.Present();
+
+            if (!_firstFrameLogged)
+            {
+                // Measured 2026-10-17: 11.1 s before the shader disk cache, PVD check and font prefetch, 2.1 s after
+                _firstFrameLogged = true;
+                var shaders = Shader.CacheStats;
+                var sinceStart = DateTime.Now - System.Diagnostics.Process.GetCurrentProcess().StartTime;
+                Debug.LogAlways($"[Startup] first frame {sinceStart.TotalSeconds:F1} s after process start; shaders: " +
+                                $"{shaders.DiskHits} from the disk cache, {shaders.Misses} compiled ({shaders.CompileMs / 1000:F1} s)");
+            }
         }
+
+        private static bool _firstFrameLogged;
 
         private static readonly ProfilerMarker _commandsMarker = ProfilerMarker.Get("Editor commands");
         private static readonly ProfilerMarker _editorUiMarker = ProfilerMarker.Get("Editor UI");

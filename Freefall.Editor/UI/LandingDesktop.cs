@@ -37,8 +37,9 @@ namespace Freefall.Editor
         private readonly List<RecentProjectEntry> gridItems = new();
 
         private Window importDialog;
-        private Label importStatusLabel;
-        private volatile string pendingStatus;
+        private Label importTitleLabel, importStepLabel, importDetailLabel;
+        private ProgressBar importBar;
+        private ProjectOpening.Status shownStatus;
 
         public LandingDesktop()
         {
@@ -85,6 +86,8 @@ namespace Freefall.Editor
             Skin["landing.brand"] = Text(LandingArt.FontTitle, LandingArt.Text);
             Skin["landing.headline"] = Text(LandingArt.FontHeadline, LandingArt.Text);
             Skin["landing.sub"] = Text(LandingArt.FontBody, LandingArt.Muted);
+            Skin["landing.body"] = Text(LandingArt.FontBody, LandingArt.Text);
+            Skin["landing.small"] = Text(LandingArt.FontSmall, LandingArt.Muted);
             Skin["landing.eyebrow"] = Text(LandingArt.FontEyebrow, LandingArt.Muted);
             Skin["landing.primary"] = primary;
             Skin["landing.ghost"] = ghost;
@@ -330,40 +333,56 @@ namespace Freefall.Editor
             return card;
         }
 
-        // ── Import progress dialog ──
+        // ── Project open progress dialog ──
 
         /// <summary>
-        /// Show a modal import progress dialog.
+        /// Show the modal progress dialog of a project open. It follows ProjectOpening.Current by itself (OnUpdate):
+        /// the step, what it is doing and a bar for the whole open.
         /// </summary>
         public void ShowImportDialog(string projectName)
         {
             importDialog = new Window
             {
                 Style = "frame",
-                Size = new Point(500, 120),
+                Size = new Point(560, 150),
                 Dock =  DockStyle.Center,
                 Modal = true,
+                Padding = new Margin(24, 18, 24, 18),
             };
 
-            importStatusLabel = new Label
+            importTitleLabel = new Label
             {
-                Text = $"Opening {projectName}...",
-                Style = "label",
-                Dock = DockStyle.Fill,
-                TextAlign = Alignment.MiddleCenter,
+                Text = $"Opening {projectName}",
+                Style = "landing.brand",
+                Size = new Point(100, 30),
+                Dock = DockStyle.Top,
             };
-            importDialog.Controls.Add(importStatusLabel);
+            importStepLabel = new Label
+            {
+                Text = "",
+                Style = "landing.body",
+                Size = new Point(100, 24),
+                Dock = DockStyle.Top,
+            };
+            importBar = new ProgressBar
+            {
+                Size = new Point(100, 6),
+                Dock = DockStyle.Top,
+                Margin = new Margin(0, 8, 0, 8),
+            };
+            importDetailLabel = new Label
+            {
+                Text = "",
+                Style = "landing.small",
+                Dock = DockStyle.Fill,
+            };
+            importDialog.Controls.Add(importTitleLabel);
+            importDialog.Controls.Add(importStepLabel);
+            importDialog.Controls.Add(importBar);
+            importDialog.Controls.Add(importDetailLabel);
+            shownStatus = null;
 
             importDialog.Show(this);
-        }
-
-        /// <summary>
-        /// Update the import dialog status text. Thread-safe — stores pending text
-        /// that gets applied on the next Update() call.
-        /// </summary>
-        public void UpdateImportStatus(string status)
-        {
-            pendingStatus = status;
         }
 
         /// <summary>
@@ -375,49 +394,99 @@ namespace Freefall.Editor
             {
                 importDialog.Close();
                 importDialog = null;
-                importStatusLabel = null;
+                importTitleLabel = importStepLabel = importDetailLabel = null;
+                importBar = null;
+                shownStatus = null;
+            }
+        }
+
+        /// <summary>Show the open's latest status (written by its workers; a new record per change).</summary>
+        private void UpdateImportDialog()
+        {
+            var status = ProjectOpening.Current;
+            if (importDialog == null || status == null || ReferenceEquals(status, shownStatus)) return;
+            shownStatus = status;
+
+            importTitleLabel.Text = $"Opening {status.Name}";
+            importStepLabel.Text = $"{status.Step}   ({status.StepIndex + 1}/{status.StepCount})";
+            importDetailLabel.Text = LandingArt.Fit(LandingArt.FontSmall, status.Detail,
+                Math.Max(40, importDetailLabel.Size.x), keepEnd: true);
+            importBar.Value = status.Fraction;
+        }
+
+        /// <summary>A thin bar: the share done of the project open.</summary>
+        private class ProgressBar : Control
+        {
+            public float Value;
+
+            protected override void DrawStyle(Style style, float opacity)
+            {
+                int x = Location.x, y = Location.y, w = Size.x, h = Size.y;
+                if (opacity == 0 || w <= 0 || h <= 0) return;
+
+                Gui.Renderer.DrawBox(x, y, w, h, LandingArt.Well);
+                int fill = (int)(w * Math.Clamp(Value, 0f, 1f));
+                if (fill > 0)
+                    Gui.Renderer.DrawBox(x, y, fill, h, LandingArt.Coral);
             }
         }
 
         /// <summary>
-        /// Show a modal error dialog with an OK button.
-        /// Clicking OK fires OnErrorDismissed.
+        /// Show a modal error dialog in the progress dialog's look: title, wrapped message, one button.
+        /// Clicking the button fires OnErrorDismissed.
         /// </summary>
-        public void ShowErrorDialog(string message)
+        public void ShowErrorDialog(string title, string message, string buttonText = "OK")
         {
             HideImportDialog();
 
             var errorWindow = new Window
             {
                 Style = "frame",
-                Size = new Point(500, 160),
-                Anchor = AnchorStyles.None,
+                Size = new Point(560, 200),
+                Dock = DockStyle.Center,
                 Modal = true,
+                Padding = new Margin(24, 18, 24, 18),
             };
 
-            var errorLabel = new Label
+            errorWindow.Controls.Add(new Label
             {
-                Text = message,
-                Style = "label",
-                Dock = DockStyle.Fill,
-                TextAlign = Alignment.MiddleCenter,
-            };
-            errorWindow.Controls.Add(errorLabel);
+                Text = title,
+                Style = "landing.brand",
+                Size = new Point(100, 30),
+                Dock = DockStyle.Top,
+            });
 
+            var buttons = new Frame
+            {
+                Size = new Point(100, 36),
+                Dock = DockStyle.Bottom,
+            };
             var okButton = new Button
             {
-                Text = "OK",
-                Style = "button",
-                Size = new Point(100, 32),
-                Dock = DockStyle.Bottom,
-                Margin = new Margin(0, 4, 0, 8),
+                Text = buttonText,
+                Style = "landing.primary",
+                Size = new Point(Math.Max(100, LandingArt.Measure(LandingArt.FontBodyMedium, buttonText).x + 40), 36),
+                Dock = DockStyle.Right,
+                Cursor = Cursors.Link,
             };
             okButton.MouseClick += (s, e) =>
             {
                 errorWindow.Close();
                 OnErrorDismissed?.Invoke();
             };
-            errorWindow.Controls.Add(okButton);
+            buttons.Controls.Add(okButton);
+            errorWindow.Controls.Add(buttons);
+
+            // Wrapped here: Squid wraps only at spaces, and the message is often a long path
+            int textWidth = errorWindow.Size.x - errorWindow.Padding.Left - errorWindow.Padding.Right;
+            errorWindow.Controls.Add(new Label
+            {
+                Text = LandingArt.Wrap(LandingArt.FontBody, message, textWidth),
+                Style = "landing.sub",
+                TextAlign = Alignment.TopLeft,
+                Dock = DockStyle.Fill,
+                Margin = new Margin(0, 8, 0, 8),
+            });
 
             errorWindow.Show(this);
         }
@@ -435,13 +504,7 @@ namespace Freefall.Editor
             }
 
             UpdateColumns();
-
-            // Apply pending status from background thread
-            if (pendingStatus != null && importStatusLabel != null)
-            {
-                importStatusLabel.Text = pendingStatus;
-                pendingStatus = null;
-            }
+            UpdateImportDialog();
         }
 
         private void OnOpenProjectClicked()

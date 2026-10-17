@@ -572,9 +572,26 @@ namespace Freefall.Graphics
         // Static GPU culler - shared by all batches (never run in parallel)
         public static GPUCuller? Culler { get; private set; }
 
+        // Created and compiled ahead by PrepareCuller, not in use until InitializeCuller
+        private static GPUCuller? _preparedCuller;
+
+        /// <summary>
+        /// Compile the culler's shaders ahead of InitializeCuller (~1.2 s). Any thread: the editor runs it on a
+        /// worker while a project opens. A shader that does not compile is reported by InitializeCuller.
+        /// </summary>
+        public static void PrepareCuller(GraphicsDevice device)
+        {
+            var culler = new GPUCuller(device);
+            try { culler.CompileShaders(); }
+            catch (Exception) { /* InitializeCuller compiles again and reports it */ }
+            _preparedCuller = culler;
+        }
+
+        /// <summary>Main thread: create the culler's buffers (and compile its shaders unless PrepareCuller did).</summary>
         public static void InitializeCuller(GraphicsDevice device)
         {
-            Culler = new GPUCuller(device);
+            Culler = _preparedCuller ?? new GPUCuller(device);
+            _preparedCuller = null;
             Culler.Initialize();
             Debug.Log("[CommandBuffer] GPU Culler initialized");
         }

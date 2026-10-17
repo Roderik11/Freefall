@@ -97,18 +97,21 @@ namespace Freefall.Assets
         /// <summary>
         /// Initialize the asset database for a project.
         /// Scans Assets/ for source files, loads/creates meta files in Library/.
+        /// Any thread (the editor opens projects on a worker); progress: what it is doing, fraction 0..1.
         /// </summary>
-        public static void Initialize(FreefallProject project)
+        public static void Initialize(FreefallProject project, Action<string, float> progress = null)
         {
             Project = project;
             Clear();
             DiscoverImporters();
             DiscoverPackers();
-            ScanAndSync();
+            ScanAndSync(progress);
+            progress?.Invoke("Thumbnails", 0.97f);
             ScanThumbnails();
             CleanOrphanedThumbnails();
             // The project's .fx assets and their includes recompile when saved, like the engine's shaders
             Graphics.ShaderHotReload.WatchProject(project.AssetsDirectory);
+            progress?.Invoke($"{_guidToMeta.Count} assets", 1f);
             Debug.Log($"[AssetDatabase] Initialized: {_guidToMeta.Count} assets tracked, " +
                       $"{_importersByExtension.Count} importers, {_packers.Count} packers, {_guidToThumb.Count} thumbnails");
         }
@@ -122,14 +125,25 @@ namespace Freefall.Assets
         }
 
         /// <summary>
+        /// Tracked assets whose cache is older than their source (or missing), in import order. Checks every
+        /// tracked file on disk (several file stats each), in parallel: ~0.15 s for 13k assets instead of 0.8 s.
+        /// </summary>
+        private static List<MetaFile> CollectDirty()
+        {
+            return _guidToMeta.Values
+                .AsParallel().AsOrdered()
+                .Where(m => NeedsReimport(m))
+                .AsSequential()
+                .OrderBy(m => GetImportPriority(m))
+                .ToList();
+        }
+
+        /// <summary>
         /// Import all dirty assets (source newer than cache).
         /// </summary>
         public static void ImportAll()
         {
-            var dirtyMetas = _guidToMeta.Values
-                .Where(m => NeedsReimport(m))
-                .OrderBy(m => GetImportPriority(m))
-                .ToList();
+            var dirtyMetas = CollectDirty();
 
             foreach (var meta in dirtyMetas)
                 ImportAsset(meta);
@@ -143,23 +157,33 @@ namespace Freefall.Assets
         /// Uses Action&lt;string&gt; instead of IProgress&lt;T&gt; to avoid SynchronizationContext
         /// marshaling issues with RenderLoop-based message pumps.
         /// </summary>
-        public static async System.Threading.Tasks.Task ImportAllAsync(
+        public static System.Threading.Tasks.Task ImportAllAsync(
             Action<string> progress = null,
             System.Threading.CancellationToken ct = default)
         {
-            var dirtyMetas = _guidToMeta.Values
-                .Where(m => NeedsReimport(m))
-                .OrderBy(m => GetImportPriority(m))
-                .ToList();
-            if (dirtyMetas.Count == 0)
-            {
-                return;
-            }
+            return ImportAllAsync(progress == null ? null : (status, _) => progress(status), ct);
+        }
 
-            progress?.Invoke($"Importing {dirtyMetas.Count} assets...");
-
-            await System.Threading.Tasks.Task.Run(() =>
+        /// <summary>
+        /// ImportAllAsync reporting the fraction done too (0..1). Finding the dirty assets runs on the worker as
+        /// well: it stats every tracked file, which took 0.8 s on the main thread for 13k assets.
+        /// </summary>
+        public static System.Threading.Tasks.Task ImportAllAsync(
+            Action<string, float> progress,
+            System.Threading.CancellationToken ct = default)
+        {
+            return System.Threading.Tasks.Task.Run(() =>
             {
+                progress?.Invoke("Checking for changed assets...", 0f);
+                var dirtyMetas = CollectDirty();
+                if (dirtyMetas.Count == 0)
+                {
+                    progress?.Invoke("All assets up to date", 1f);
+                    return;
+                }
+
+                progress?.Invoke($"Importing {dirtyMetas.Count} assets...", 0f);
+
                 int done = 0;
                 int failed = 0;
                 long lastReportTicks = 0;
@@ -180,7 +204,7 @@ namespace Freefall.Assets
                         long last = System.Threading.Interlocked.Read(ref lastReportTicks);
                         if (now - last > 250 && System.Threading.Interlocked.CompareExchange(ref lastReportTicks, now, last) == last)
                         {
-                            progress?.Invoke($"[{current}/{dirtyMetas.Count}] {meta.SourcePath}");
+                            progress?.Invoke($"[{current}/{dirtyMetas.Count}] {meta.SourcePath}", (current - 1) / (float)dirtyMetas.Count);
                         }
                         try
                         {
@@ -196,7 +220,7 @@ namespace Freefall.Assets
                         }
                     });
                 }
-                progress?.Invoke($"Done — {done - failed} imported, {failed} failed.");
+                progress?.Invoke($"Done — {done - failed} imported, {failed} failed.", 1f);
             }, ct);
         }
 
@@ -1032,13 +1056,15 @@ namespace Freefall.Assets
         /// <summary>
         /// Scan Assets/ for source files, load existing .meta files from Library/,
         /// create new .meta for untracked assets, detect renamed files, remove orphaned .meta files.
+        /// Progress (optional): what it is doing, fraction 0..0.95 (the caller has the rest).
         /// </summary>
-        public static void ScanAndSync()
+        public static void ScanAndSync(Action<string, float> progress = null)
         {
             var assetsDir = Project.AssetsDirectory;
             var libraryDir = Project.LibraryDirectory;
 
             // 1. Get all source files with importable extensions
+            progress?.Invoke("Listing source files", 0f);
             var sourceFiles = new Dictionary<string, FileInfo>(StringComparer.OrdinalIgnoreCase);
             if (Directory.Exists(assetsDir))
             {
@@ -1052,17 +1078,31 @@ namespace Freefall.Assets
                 }
             }
 
-            // 2. Load existing .meta files
+            // 2. Load existing .meta files. Read in parallel (13k files: 1.0 s → ~0.25 s), registered in the order
+            //    the files were listed, so a GUID present in two metas resolves as it always did (the last one wins).
             var existingMetas = new Dictionary<string, MetaFile>(StringComparer.OrdinalIgnoreCase);
             if (Directory.Exists(libraryDir))
             {
-                foreach (var metaFile in Directory.EnumerateFiles(libraryDir, "*.meta", SearchOption.AllDirectories))
+                var metaPaths = Directory.GetFiles(libraryDir, "*.meta", SearchOption.AllDirectories);
+                var read = new MetaFile[metaPaths.Length];
+                int readCount = 0;
+                progress?.Invoke($"Reading {metaPaths.Length} meta files", 0.1f);
+                System.Threading.Tasks.Parallel.For(0, metaPaths.Length, i =>
                 {
-                    var meta = ReadMetaFile(metaFile);
+                    read[i] = ReadMetaFile(metaPaths[i]);
+                    int n = System.Threading.Interlocked.Increment(ref readCount);
+                    if (n % 500 == 0)
+                        progress?.Invoke($"Reading meta files ({n}/{metaPaths.Length})", 0.1f + 0.75f * n / metaPaths.Length);
+                });
+
+                foreach (var meta in read)
+                {
                     if (meta != null)
                         existingMetas[meta.Guid] = meta;
                 }
             }
+
+            progress?.Invoke($"Matching {existingMetas.Count} metas to {sourceFiles.Count} source files", 0.85f);
 
             // 3. Match existing metas to source files, register or collect orphans
             var matchedPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -1902,54 +1942,103 @@ namespace Freefall.Assets
         public static void GenerateMissingThumbnails(Action<string> progress = null,
             Func<IDisposable> rendererFactory = null)
         {
+            using var batch = BeginMissingThumbnails(rendererFactory);
+            if (batch.Total == 0) return;
+
+            progress?.Invoke($"Generating {batch.Total} thumbnails...");
+            while (!batch.IsFinished)
+            {
+                progress?.Invoke($"Thumbnail {batch.Done + 1}/{batch.Total}: {batch.NextTypeName}");
+                batch.Step();
+            }
+        }
+
+        /// <summary>
+        /// Start generating the thumbnails GenerateMissingThumbnails would, one per ThumbnailBatch.Step(), so the
+        /// caller can spread them over frames (the editor's project open). Main thread (uses GPU); dispose the batch
+        /// when done. Total is 0 when nothing is missing (no renderer is created then). Types without a generator
+        /// are left out: Freefall-Solid lists 6k animation clips as "missing" on every open (2026-10-17).
+        /// </summary>
+        public static ThumbnailBatch BeginMissingThumbnails(Func<IDisposable> rendererFactory = null)
+        {
             if (_thumbGenerators.Count == 0)
                 DiscoverThumbnailGenerators();
 
             var missing = GetMissingThumbnails();
-            if (missing.Count == 0) return;
+            missing.RemoveAll(m => !_thumbGenerators.ContainsKey(m.assetType));
+            return new ThumbnailBatch(missing, rendererFactory);
+        }
 
-            // Flush streaming uploads so meshes have valid GPU buffers
-            Graphics.StreamingManager.Instance?.Flush();
+        /// <summary>Thumbnails being generated one at a time; see BeginMissingThumbnails. Main thread.</summary>
+        public sealed class ThumbnailBatch : IDisposable
+        {
+            private readonly List<(string guid, Type assetType)> _missing;
+            private readonly HashSet<string> _cacheSnapshot;
+            private IDisposable _renderer;
+            private int _generated, _skipped;
 
-            progress?.Invoke($"Generating {missing.Count} thumbnails...");
+            /// <summary>Thumbnails missing when the batch started.</summary>
+            public int Total => _missing.Count;
 
-            // Snapshot cache: preserve ALL pre-existing assets. EvictAllExcept will only
-            // remove entries loaded DURING the thumbnail batch (e.g. meshes loaded by
-            // PrefabThumbnailGenerator). This is critical during live editing — the old
-            // code excluded Meshes/Textures from the snapshot, which disposed GPU buffers
-            // still referenced by live scene entities, causing DEVICE_REMOVED.
-            var cacheSnapshot = Engine.Assets.GetCachedKeys();
+            /// <summary>Thumbnails handled so far (generated, failed or without a generator).</summary>
+            public int Done { get; private set; }
 
-            // Create the shared rendering context for this batch
-            using var renderer = rendererFactory?.Invoke();
+            public bool IsFinished { get; private set; }
 
-            int generated = 0;
-            int skipped = 0;
-            int index = 0;
+            /// <summary>Asset type of the thumbnail the next Step() makes (for progress text).</summary>
+            public string NextTypeName => Done < Total ? _missing[Done].assetType.Name : "";
 
-            foreach (var (guid, assetType) in missing)
+            internal ThumbnailBatch(List<(string guid, Type assetType)> missing, Func<IDisposable> rendererFactory)
             {
-                index++;
+                _missing = missing;
+                if (missing.Count == 0)
+                {
+                    IsFinished = true;
+                    return;
+                }
+
+                // Flush streaming uploads so meshes have valid GPU buffers
+                Graphics.StreamingManager.Instance?.Flush();
+
+                // Snapshot cache: preserve ALL pre-existing assets. EvictAllExcept will only
+                // remove entries loaded DURING the thumbnail batch (e.g. meshes loaded by
+                // PrefabThumbnailGenerator). This is critical during live editing — the old
+                // code excluded Meshes/Textures from the snapshot, which disposed GPU buffers
+                // still referenced by live scene entities, causing DEVICE_REMOVED.
+                _cacheSnapshot = Engine.Assets.GetCachedKeys();
+
+                // Create the shared rendering context for this batch
+                _renderer = rendererFactory?.Invoke();
+            }
+
+            /// <summary>Generate the next thumbnail. False once the batch is finished (all done, or the GPU was lost).</summary>
+            public bool Step()
+            {
+                if (IsFinished) return false;
+
+                var (guid, assetType) = _missing[Done++];
+                int index = Done;
+                if (Done >= Total) IsFinished = true;
 
                 if (!_thumbGenerators.TryGetValue(assetType, out var generator))
                 {
-                    skipped++;
-                    continue;
+                    _skipped++;
+                    return !IsFinished;
                 }
 
                 // Abort if GPU is dead (DEVICE_REMOVED from a prior thumbnail)
                 if (Engine.Device.IsDeviceLost)
                 {
                     Debug.LogWarning("AssetDatabase", $"GPU device lost before thumbnail #{index} — aborting");
-                    break;
+                    IsFinished = true;
+                    return false;
                 }
 
                 try
                 {
-                    progress?.Invoke($"Thumbnail {generated + skipped + 1}/{missing.Count}: {assetType.Name}");
-                    if (generator.Generate(guid, Engine.Assets, renderer))
+                    if (generator.Generate(guid, Engine.Assets, _renderer))
                     {
-                        generated++;
+                        _generated++;
                         Debug.Log($"[Thumb] OK #{index}: {guid}");
                     }
                     else
@@ -1967,7 +2056,8 @@ namespace Freefall.Assets
                 if (Engine.Device.IsDeviceLost)
                 {
                     Debug.LogWarning("AssetDatabase", $"GPU device lost AFTER Generate #{index} ({guid})");
-                    break;
+                    IsFinished = true;
+                    return false;
                 }
 
                 // Evict after each thumbnail to stay within MeshRegistry capacity.
@@ -1977,14 +2067,24 @@ namespace Freefall.Assets
                 if (Engine.Device.IsDeviceLost)
                 {
                     Debug.LogWarning("AssetDatabase", $"GPU device lost AFTER Flush #{index} ({guid})");
-                    break;
+                    IsFinished = true;
+                    return false;
                 }
 
-                Engine.Assets.EvictAllExcept(cacheSnapshot, leakBindlessIndices: true);
+                Engine.Assets.EvictAllExcept(_cacheSnapshot, leakBindlessIndices: true);
+                return !IsFinished;
             }
 
-            if (generated > 0)
-                Debug.Log($"[AssetDatabase] Generated {generated} thumbnails ({skipped} skipped, no generator)");
+            public void Dispose()
+            {
+                IsFinished = true;
+                if (_renderer == null) return;
+                _renderer.Dispose();
+                _renderer = null;
+
+                if (_generated > 0)
+                    Debug.Log($"[AssetDatabase] Generated {_generated} thumbnails ({_skipped} skipped, no generator)");
+            }
         }
     }
 }

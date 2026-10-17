@@ -125,9 +125,25 @@ namespace Freefall.Editor
         /// </summary>
         public static void Initialize(string assetsDirectory)
         {
-            _assetsDirectory = assetsDirectory;
+            Initialize(assetsDirectory, BuildForInitialize(assetsDirectory));
+        }
+
+        /// <summary>
+        /// The slow half of Initialize, for any thread: write the IDE project and compile the scripts (Roslyn, ~2.5 s
+        /// the first time). Touches no live state; hand the result to Initialize(assetsDirectory, build) on the main
+        /// thread. A failed compile still yields the plugins.
+        /// </summary>
+        internal static BuildResult BuildForInitialize(string assetsDirectory)
+        {
             GenerateScriptProject(assetsDirectory);
-            CompileAndLoad(assetsDirectory);
+            return Build(assetsDirectory) ?? new BuildResult { PluginPaths = FindPlugins(assetsDirectory) };
+        }
+
+        /// <summary>Main thread: load a BuildForInitialize result and start watching the scripts.</summary>
+        internal static void Initialize(string assetsDirectory, BuildResult build)
+        {
+            _assetsDirectory = assetsDirectory;
+            Swap(build);
             StartWatching(assetsDirectory);
         }
 
@@ -239,19 +255,12 @@ namespace Freefall.Editor
         private static int _buildGeneration;
 
         /// <summary>Output of a compile pass, ready to load into a fresh context.</summary>
-        private sealed class BuildResult
+        internal sealed class BuildResult
         {
             public string[] PluginPaths = [];
             public byte[]? Pe;
             public byte[]? Pdb;
             public int ScriptCount;
-        }
-
-        private static void CompileAndLoad(string assetsDirectory)
-        {
-            // A failed first compile still loads the plugins
-            var build = Build(assetsDirectory) ?? new BuildResult { PluginPaths = FindPlugins(assetsDirectory) };
-            Swap(build);
         }
 
         private static string[] FindPlugins(string assetsDirectory)
