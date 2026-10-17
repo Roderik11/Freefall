@@ -365,6 +365,6 @@ void CSDirectionalLight(uint3 dispatchThreadId : SV_DispatchThreadID)
     // so RC trace can read direct-light-only without feedback loop
 
     // LightIntensity is in the older units (SkyboxRenderer sets it from the sun's lux: E × ReferenceExposure / π):
-    // LegacyLightScale pre-exposes it for the camera's exposure
-    Output[px] = float4(lighting * LegacyLightScale, 1.0f);
+    // SunLightScale pre-exposes it for the camera's exposure
+    Output[px] = float4(lighting * SunLightScale, 1.0f);
 }

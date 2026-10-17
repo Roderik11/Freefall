@@ -542,7 +542,7 @@ PSOutput PS(DSOutput input)
     // The directional light (sun or moon) in the older units, pre-exposed: what a white Lambert surface facing it
     // sends back, as in the deferred light (E / π). The specular BRDF takes the illuminance itself (× π): until
     // 2026-10-17 it got this radiance, and the water's sun was π times weaker than the deferred one.
-    float3 sunRadiance = ocean.SunColor * ocean.SunIntensity * LegacyLightScale;
+    float3 sunRadiance = ocean.SunColor * ocean.SunIntensity * SunLightScale;
     sunRadiance *= GetCloudShadow(OceanSampler, worldPos - camPos, L);
     sunRadiance *= WaterSunShadow(ShadowMapIdx, worldPos - camPos, input.Position.xy);
 

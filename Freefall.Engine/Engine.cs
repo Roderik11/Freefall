@@ -582,11 +582,44 @@ namespace Freefall
          public bool Fog { get; set; } = true;                              // Aerial perspective: the atmosphere and its ground fog between camera and scene (Graphics.Atmosphere)
 
          // Camera exposure as EV100: light in physical units (lux, cd/m²) times 1 / (1.2 · 2^EV) is what the
-         // tonemapper sees. 13.36 (Atmosphere.ReferenceEV) shows light sources in the engine's older units exactly as
-         // before; higher = darker image.
+         // tonemapper sees; higher = darker image. Auto: metered from the scene each frame (Graphics.AutoExposure).
+         // Off: ExposureEV, which the captures lock (13.36 = Atmosphere.ReferenceEV shows light sources in the
+         // engine's older units exactly as before).
          [Category("Exposure")]
+         public bool AutoExposure { get; set; } = true;
+
          [ValueRange(-6f, 20f)]
          public float ExposureEV { get; set; } = Graphics.Atmosphere.ReferenceEV;
+
+         // EV added to the metering, + = brighter. The metering puts the scene's average at the standard 12.5 % grey
+         // (K = 12.5), darker than this engine's look was tuned at: the default brings a sunny noon back to ~EV 13.4.
+         [ValueRange(-4f, 6f)]
+         public float ExposureCompensation { get; set; } = 1.35f;
+
+         // Dim light: below ExposureDimLightEV (the metered EV100 before compensation; a clear noon meters ~14.8, an
+         // overcast one ~14) the exposure follows the scene only partly. Of each EV the scene loses there, this share
+         // still darkens the image, so dusk reads darker than day and a moonlit night darker than dusk; 0 = the eye
+         // adapts fully (dusk as bright as noon until ExposureMinEV, then a sudden fall to black).
+         [ValueRange(0f, 1f)]
+         public float ExposureDimLightDarkening { get; set; } = 0.3f;
+
+         [ValueRange(0f, 16f)]
+         public float ExposureDimLightEV { get; set; } = 12f;
+
+         // The darkest and brightest the auto exposure goes: how bright a moonless night may get (MinEV) is a choice
+         [ValueRange(-8f, 20f)]
+         public float ExposureMinEV { get; set; } = -1f;
+
+         [ValueRange(-8f, 20f)]
+         public float ExposureMaxEV { get; set; } = 16f;
+
+         // Adaptation rates (1/s, of the remaining EV difference): up = toward a darker image (into the light, fast),
+         // down = toward a brighter one (into the dark, slow, as the eye)
+         [ValueRange(0.05f, 20f)]
+         public float ExposureSpeedUp { get; set; } = 3f;
+
+         [ValueRange(0.05f, 20f)]
+         public float ExposureSpeedDown { get; set; } = 1f;
 
          [Category("Bloom")]
          public bool EnableBloom { get; set; } = true;

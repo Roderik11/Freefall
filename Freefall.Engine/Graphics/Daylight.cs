@@ -6,19 +6,20 @@ using Freefall.Components;
 namespace Freefall.Graphics
 {
     /// <summary>
-    /// How much daylight reaches the ground, and whether lamps are lit. The point light shadow selection weighs a
-    /// light against the daylight (local_shadow_select.hlsl); lights marked PointLight.OnlyWhenDark and materials
-    /// marked EmissiveWhenDark follow <see cref="Lamps"/>: lit when the daylight falls below
-    /// <see cref="LampsOnBelow"/> (night, a thunderstorm, an overcast dusk), out again above
-    /// <see cref="LampsOffAbove"/>, so a cloud passing at the mark does not blink them. Noon daylight with the
-    /// presets: Sunny 2.35, Clear Day 1.55, Snowfall 0.6, Overcast 0.41, Thunderstorm 0.14; a night ~0.003 (new moon)
-    /// to ~0.07 (full moon high up).
-    /// A street lantern adds about 0.15 to the ground under it.
+    /// How much daylight reaches the ground, and whether lamps are lit. Lights marked PointLight.OnlyWhenDark and
+    /// materials marked EmissiveWhenDark follow <see cref="Lamps"/>: lit when the illuminance on level ground
+    /// (<see cref="GroundIlluminance"/>, lux: the sun or moon through the air and the clouds' average shade, plus the
+    /// sky) falls below <see cref="LampsOnBelowLux"/>, out again above <see cref="LampsOffAboveLux"/>, so a cloud
+    /// passing at the mark does not blink them. Clear Day (SunAzimuth 161.2, Day 1): noon ~50000 lux, 18:00 ~940,
+    /// 18:20 ~50, 18:35 ~1.5 (lamps on), 18:45 ~0.06, 19:00 ~0.001 (no moon up); a thunderstorm noon is still thousands
+    /// of lux, so storms by day do not light the lamps. The point light shadow selection weighs a light against the
+    /// daylight in the older light units (<see cref="SunLight"/>, <see cref="SkyAmbient"/>, local_shadow_select.hlsl), a
+    /// ratio the exposure does not touch.
     /// </summary>
     public static class Daylight
     {
-        public const float LampsOnBelow = 0.25f;
-        public const float LampsOffAbove = 0.35f;
+        public const float LampsOnBelowLux = 1f;      // about where the auto exposure reaches ExposureMinEV at dusk
+        public const float LampsOffAboveLux = 2f;
         public const float LampFadeSeconds = 1.5f;
 
         /// <summary>0 = lamps out, 1 = lit; in between while they fade. 1 until a sky updates it.</summary>
@@ -33,8 +34,8 @@ namespace Freefall.Graphics
         /// <summary>Once per frame, after the sky has set the sun (SkyboxRenderer.Update).</summary>
         public static void Update(float deltaSeconds)
         {
-            float level = SunLight() + SkyAmbient();
-            if (_lit ? level > LampsOffAbove : level < LampsOnBelow)
+            float lux = GroundIlluminance();
+            if (_lit ? lux > LampsOffAboveLux : lux < LampsOnBelowLux)
                 _lit = !_lit;
 
             float target = _lit ? 1f : 0f;
@@ -72,9 +73,32 @@ namespace Freefall.Graphics
             return 0f;
         }
 
+        /// <summary>
+        /// Illuminance on level open ground in lux: the directional light (the sun, or at night the brightest moon)
+        /// after the air, at its height and through the clouds' average shade, plus the whole sky's light (read back
+        /// from the atmosphere's ambient pass a few frames late). 0 without a sky.
+        /// </summary>
+        public static float GroundIlluminance()
+        {
+            if (ComponentCache<SkyboxRenderer>.All.Count == 0)
+                return 0f;
+            float direct = 0f;
+            foreach (var sun in ComponentCache<DirectionalLight>.All)
+            {
+                if (!sun.Enabled) continue;
+                // Intensity is lux × ReferenceExposure / π (SkyboxRenderer); Forward points from the light to the ground
+                float normal = sun.Intensity * MathF.PI / Atmosphere.ReferenceExposure * Luminance(sun.Color.R, sun.Color.G, sun.Color.B);
+                float height = MathF.Max(-sun.Transform.Forward.Y, 0f);
+                float clouds = Math.Clamp(1f - SkyboxRenderer.CurrentCloudShadowStrength * SkyboxRenderer.CurrentCloudCoverage, 0f, 1f);
+                direct = normal * height * clouds;
+                break;
+            }
+            return direct + SkyAmbient() * MathF.PI / Atmosphere.ReferenceExposure;
+        }
+
         // What the sky's ambient adds to an up-facing surface, as a multiple of its albedo, in the same older units:
         // sky_common.fx's SkyAmbientLight(), read back from the atmosphere's ambient pass a few frames late. 0 without a
-        // sky. (Both halves move to lux with auto exposure: ATMOSPHERE_PLAN.md stage 2.)
+        // sky.
         public static float SkyAmbient()
         {
             if (ComponentCache<SkyboxRenderer>.All.Count == 0)

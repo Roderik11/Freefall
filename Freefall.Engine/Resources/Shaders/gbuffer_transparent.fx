@@ -310,7 +310,7 @@ PSOutput PS(VSOutput input)
     // separately with Reinhard rolloff to prevent GGX peaks (500+ for smooth glass)
     // from dominating the alpha-blended output.
     // The sun's (or moon's) illuminance as the deferred light has it: LightIntensity in the older units × π, pre-exposed
-    float3 radiance = LightColor * LightIntensity * 3.14159 * LegacyLightScale * NdotL * shadowFactor;
+    float3 radiance = LightColor * LightIntensity * 3.14159 * SunLightScale * NdotL * shadowFactor;
     float3 diffuseLighting = diffuse * radiance * ao;
     float3 specLighting = spec * radiance;
 

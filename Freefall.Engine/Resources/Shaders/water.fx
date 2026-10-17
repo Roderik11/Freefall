@@ -177,7 +177,7 @@ PSOutput PS(VSOutput input)
     float3 L = normalize(-water.SunDirection);
     float NdotL = saturate(dot(N, L));
     // Pre-exposed E / π of the directional light, as the deferred light has it; the specular takes E (× π)
-    float3 sunRadiance = water.SunColor * water.SunIntensity * LegacyLightScale;
+    float3 sunRadiance = water.SunColor * water.SunIntensity * SunLightScale;
     sunRadiance *= GetCloudShadow(WaterSampler, worldPos - camPos, L);
     sunRadiance *= WaterSunShadow(ShadowMapIdx, worldPos - camPos, input.Position.xy);
     float3 skyAmbient = input.SkyAmbient;

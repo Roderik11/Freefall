@@ -14,6 +14,7 @@ namespace Freefall.Components
     /// controller cross-fades from whatever is currently shown to the new preset over
     /// <see cref="TransitionDuration"/> seconds. The blended result is pushed every frame into:
     ///   • <see cref="SkyboxRenderer"/> via <c>ApplyPreset</c> (sun, atmosphere, ground fog, clouds, stars)
+    ///   • <c>Graphics.AutoExposure.PresetCompensation</c> (how bright the weather reads)
     ///   • the optional Rain / Snow / Hail / Dust <see cref="ParticleEmitter"/>s (emit rate scaled by
     ///     the preset's per-type intensity, wind copied to the emitter, emitter parked above the camera)
     ///
@@ -176,6 +177,9 @@ namespace Freefall.Components
                 Skybox.CloudAltitudeBlend = _altitudeBlend;
             }
 
+            // How bright this weather reads: added to the auto exposure's metering
+            Graphics.AutoExposure.PresetCompensation = _current.ExposureCompensation;
+
             var wind = _current.WindVector;
             var camPos = Camera.Main?.Position ?? Vector3.Zero;
 
@@ -231,6 +235,7 @@ namespace Freefall.Components
         {
             if (_target == null) return;
             _target = null;
+            Graphics.AutoExposure.PresetCompensation = 0f;
             Graphics.ParticleSystem.WeatherWind = Vector3.Zero;
             Graphics.Wind.Velocity = Graphics.Wind.DefaultVelocity;
             if (_lastRain != null) ReleaseEmitter(_lastRain);

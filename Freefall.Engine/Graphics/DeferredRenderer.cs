@@ -414,6 +414,10 @@ namespace Freefall.Graphics
             // Per-object effect data (struct Instance) that changed since the last frame
             InstanceData.Upload(Engine.Device);
 
+            // This frame's exposure (once per tick: the metering read back from an earlier frame), before any pass
+            // pre-exposes its light with it
+            AutoExposure.Update();
+
             // 1. G-Buffer Pass (includes shadow rendering internally)
             using (_gbufferMarker.Auto())
                 FillGBuffer(camera, list);
@@ -431,6 +435,10 @@ namespace Freefall.Graphics
             //    Composite is still in RenderTarget from Compose.
             using (_forwardMarker.Auto())
                 RenderForward(camera, list);
+
+            // Auto exposure metering of the finished HDR image (deferred + forward + sky), before bloom
+            var compositeDesc = Composite.Native.Description;
+            AutoExposure.Measure(list, Composite.BindlessIndex, (int)compositeDesc.Width, (int)compositeDesc.Height, Atmosphere.Exposure);
 
             using (_postMarker.Auto())
             {
@@ -872,6 +880,7 @@ namespace Freefall.Graphics
              var c0 = new Vector4(cvp.M11, cvp.M21, cvp.M31, cvp.M41);
              var c1 = new Vector4(cvp.M12, cvp.M22, cvp.M32, cvp.M42);
              var c3 = new Vector4(cvp.M14, cvp.M24, cvp.M34, cvp.M44);
+             float daylightToLights = Atmosphere.SunLightScale / Atmosphere.LegacyLightScale;
 
              var p = _lightFrameParams![frameIdx].WritePtr<PointLightBuffer.FrameParams>();
              *p = new PointLightBuffer.FrameParams
@@ -886,8 +895,10 @@ namespace Freefall.Graphics
                  Time = Time.TotalTime,
                  PixelsPerMetre = 0.5f * Albedo.Native.Description.Height * camera.Projection.M22,
                  FadeStep = Math.Clamp(Time.Delta, 0f, 0.1f) / PointShadowFadeSeconds,
-                 SunLight = Daylight.SunLight(),
-                 Ambient = Daylight.SkyAmbient(),
+                 // Daylight as it shows next to the lights: the lights' scale is capped below the reference exposure
+                 // (Atmosphere.LegacyLightScale), the sun's is not
+                 SunLight = Daylight.SunLight() * daylightToLights,
+                 Ambient = Daylight.SkyAmbient() * daylightToLights,
                  ShadowBudget = (uint)Math.Clamp(Engine.Settings.MaxShadowedPointLights, 0, LocalShadows.MaxLights),
                  Frame = _lightFrame,
                  Lamps = Daylight.Lamps,

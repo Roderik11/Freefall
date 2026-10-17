@@ -335,7 +335,7 @@ namespace Freefall.Components
             Vector3 up = MathF.Abs(lightDir.Y) > 0.999f ? Vector3.UnitZ : Vector3.UnitY;
             SunLight.Transform.Rotation = Quaternion.CreateFromRotationMatrix(Matrix4x4.CreateWorld(Vector3.Zero, lightDir, up));
 
-            // DirectionalLight.Intensity is in the engine's older units, which the shaders scale by LegacyLightScale:
+            // DirectionalLight.Intensity is in the engine's older units, which the shaders scale by SunLightScale:
             // lux × ReferenceExposure / π (light_directional_cs lights with Color × Intensity × π)
             float peak = MathF.Max(illuminance.X, MathF.Max(illuminance.Y, illuminance.Z));
             SunLight.Intensity = peak * Atmosphere.ReferenceExposure / MathF.PI * _lightFade;

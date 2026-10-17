@@ -138,6 +138,7 @@ namespace Freefall.Components
             uint atmosphereIdx = Graphics.Atmosphere.PrepareFrame(cameraPos.Y);
             float exposure = Graphics.Atmosphere.Exposure;
             float legacyLightScale = Graphics.Atmosphere.LegacyLightScale;
+            float sunLightScale = Graphics.Atmosphere.SunLightScale;
             var viewportSize = new Vector2(Math.Max(Target?.Width ?? 1, 1), Math.Max(Target?.Height ?? 1, 1));
 
             foreach (var pair in Graphics.Effect.MasterEffects)
@@ -154,6 +155,7 @@ namespace Freefall.Components
                 pair.Value.SetParameter("FogEnabled", Engine.Settings.Fog ? 1.0f : 0.0f);
                 pair.Value.SetParameter("Exposure", exposure);
                 pair.Value.SetParameter("LegacyLightScale", legacyLightScale);
+                pair.Value.SetParameter("SunLightScale", sunLightScale);
                 pair.Value.SetParameter("AtmosphereIdx", atmosphereIdx);
                 pair.Value.SetParameter("ViewportSize", viewportSize);
                 pair.Value.SetParameter("CamPos", cameraPos);

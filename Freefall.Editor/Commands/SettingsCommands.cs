@@ -120,6 +120,8 @@ namespace Freefall.Editor.Commands
                 pointShadows = Freefall.Graphics.LocalShadows.DescribeAll(),
                 // Sun cascades: entries whose caster shades no visible receiver (EngineSettings.ShadowReceiverCulling)
                 sunShadowReceivers = Freefall.Graphics.ShadowReceivers.DescribeAll(),
+                // Camera exposure: auto or locked, the EV in use and its target, the metered luminance, the daylight
+                exposure = Freefall.Graphics.AutoExposure.Describe(),
                 // System tree in update order, one "Name  ms" line per system (indent = nesting)
                 systems = Freefall.Base.Systems.Describe().Split('\n', StringSplitOptions.RemoveEmptyEntries)
             });

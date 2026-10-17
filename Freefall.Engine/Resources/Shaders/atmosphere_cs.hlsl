@@ -286,7 +286,7 @@ void CSAerialPerspective(uint3 id : SV_DispatchThreadID)
 // ── Ambient: the sky's light on an up-facing surface, and the ground's bounce light on a down-facing one ──
 // Ambient[0].rgb: sky (E_up / π × Exposure: a multiple of albedo, what the pixel stores)
 // Ambient[1].rgb: ground (GroundAlbedo × (direct light on the ground + E_up) / π × Exposure)
-// Ambient[2].rgb: sky in the engine's older units (Ambient[0] / LegacyLightScale), read back for Graphics.Daylight
+// Ambient[2].rgb: sky in the engine's older units (Ambient[0] / SunLightScale), read back for Graphics.Daylight
 // Ambient[3].rgb: transmittance toward the sun from the camera (LUT), read back for the CPU/GPU consistency check
 
 groupshared float3 SkyIrradianceShared[64];
@@ -341,7 +341,7 @@ void CSAmbient(uint3 id : SV_DispatchThreadID)
     float3 sky = skyUp / ATM_PI * Exposure;
     output[0] = float4(sky, 0);
     output[1] = float4(A.GroundAlbedo * (direct + skyUp) / ATM_PI * Exposure, 0);
-    output[2] = float4(sky / max(LegacyLightScale, 1e-20), 0);
+    output[2] = float4(sky / max(SunLightScale, 1e-20), 0);
     // The LUT's transmittance toward the sun from the camera: Atmosphere.CheckTransmittance holds it against the CPU's
     output[3] = float4(AtmTransmittanceToLight(A, pos, A.SunDirection), 0);
 }

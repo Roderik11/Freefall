@@ -58,6 +58,7 @@ namespace Freefall.Base
                         list[i].Destroy();
                 }
             }
+            Graphics.AutoExposure.Snap();     // the next scene starts at its own exposure, not a fade from this one
         }
 
         public static void Update()

@@ -106,6 +106,13 @@ namespace Freefall.Assets
         [ValueRange(0f, 1f)]
         public float CloudShadowStrength = 0.8f;
 
+        // ── Exposure ──
+
+        [Category("Exposure")]
+        [Description("EV added to the auto exposure's metering (+ = brighter): how bright this weather reads")]
+        [ValueRange(-4f, 4f)]
+        public float ExposureCompensation = 0f;
+
         // ── Weather ──
 
         [Category("Weather")]
@@ -181,6 +188,8 @@ namespace Freefall.Assets
             dest.CloudAltitude = L(a.CloudAltitude, b.CloudAltitude, t);
             dest.CloudAlbedo = L(a.CloudAlbedo, b.CloudAlbedo, t);
             dest.CloudShadowStrength = L(a.CloudShadowStrength, b.CloudShadowStrength, t);
+
+            dest.ExposureCompensation = L(a.ExposureCompensation, b.ExposureCompensation, t);
 
             dest.RainIntensity = L(a.RainIntensity, b.RainIntensity, t);
             dest.SnowIntensity = L(a.SnowIntensity, b.SnowIntensity, t);

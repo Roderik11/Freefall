@@ -14,7 +14,8 @@ cbuffer SceneConstants : register(b0)
     float ShadowTexelSize;             // 1.0 / shadowMapResolution (precomputed on CPU)
     float FogEnabled;                  // 0 or 1: aerial perspective (the atmosphere's haze and ground fog) on surfaces
     float Exposure;                    // pre-exposure: physical light (cd/m²) × Exposure is what the HDR targets store
-    float LegacyLightScale;            // light in the engine's older units (light intensities, emissive) × this = pre-exposed
+    float LegacyLightScale;            // light in the engine's older units (point lights, emissive, fire, VFX) × this = pre-exposed; never above 1 (Atmosphere.LegacyLightScale)
+    float SunLightScale;               // the directional light's intensity (sun, moon: lux × ReferenceExposure / π) × this = pre-exposed
     float3 CamPos;                     // camera world position
     uint InstanceDataIdx;              // bindless raw buffer of per-object effect data (InstanceData), 128 bytes a slot at InstanceDescriptor.CustomDataIdx
     float2 ViewportSize;               // pixels of the target being drawn (aerial perspective lookups by SV_Position)

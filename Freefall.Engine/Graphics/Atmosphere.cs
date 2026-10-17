@@ -55,9 +55,11 @@ namespace Freefall.Graphics
     /// SceneConstants.AtmosphereIdx (atmosphere_common.hlsli). Light is in physical units (lux, cd/m²); the camera's
     /// <see cref="Exposure"/> scales it into what the pixels store.
     ///
-    /// Light sources still in the engine's older units (directional and point light intensities, emissive materials,
-    /// particles) are multiplied by <see cref="LegacyLightScale"/>, which is 1 at <see cref="ReferenceEV"/>: at that
-    /// exposure they look exactly as before. Docs: .agent/knowledge/atmospheric_effects/, ATMOSPHERE_PLAN.md.
+    /// The directional light's intensity is the sun's or moon's lux in the engine's older units (× ReferenceExposure / π,
+    /// SkyboxRenderer); <see cref="SunLightScale"/> pre-exposes it. Light sources with no physical value yet (point
+    /// lights, emissive materials, fire, particles, VFX) are multiplied by <see cref="LegacyLightScale"/>, which is 1 at
+    /// <see cref="ReferenceEV"/> (at that exposure they look exactly as before) and never above it. Docs:
+    /// .agent/knowledge/atmospheric_effects/physical_atmosphere.md, ATMOSPHERE_PLAN.md.
     /// </summary>
     public static class Atmosphere
     {
@@ -66,8 +68,18 @@ namespace Freefall.Graphics
         public const float ReferenceEV = 13.36f;
 
         public static float ReferenceExposure => 1f / (1.2f * MathF.Pow(2f, ReferenceEV));
-        public static float Exposure => 1f / (1.2f * MathF.Pow(2f, Engine.Settings.ExposureEV));
-        public static float LegacyLightScale => Exposure / ReferenceExposure;
+        public static float Exposure => 1f / (1.2f * MathF.Pow(2f, AutoExposure.EV));
+        /// <summary>The directional light (physical lux in the older units' encoding) × this = pre-exposed.</summary>
+        public static float SunLightScale => Exposure / ReferenceExposure;
+
+        /// <summary>
+        /// Lights in the older units × this = pre-exposed. Capped at 1: a lantern in those units sends a tenth of the noon
+        /// sun's light (thousands of lux under it, an oil lantern gives a few), tuned at <see cref="ReferenceEV"/> against
+        /// a dark night. An exposure adapted to the night (EV −1 and below) would make them 2^14 times brighter and blow
+        /// the frame out; capped, they look at night as they always did, and dim in a brighter-than-reference noon. Goes
+        /// with ATMOSPHERE_PLAN stage 3 (lights in lumens, emissives in nits).
+        /// </summary>
+        public static float LegacyLightScale => MathF.Min(SunLightScale, 1f);
 
         public const float BottomRadiusKm = 6360f;
         public const float TopRadiusKm = 6460f;
@@ -228,10 +240,13 @@ namespace Freefall.Graphics
             _kAP = _cs.FindKernel("CSAerialPerspective");
             _kAmbient = _cs.FindKernel("CSAmbient");
 
-            _transmittance = new RenderTexture2D(device, TransmittanceW, TransmittanceH, Format.R16G16B16A16_Float, randomWrite: true);
-            _multiScat = new RenderTexture2D(device, MultiScatRes, MultiScatRes, Format.R16G16B16A16_Float, randomWrite: true);
-            _skyViewSun = new RenderTexture2D(device, SkyViewW, SkyViewH, Format.R16G16B16A16_Float, randomWrite: true);
-            _skyViewMoon = new RenderTexture2D(device, SkyViewW, SkyViewH, Format.R16G16B16A16_Float, randomWrite: true);
+            // fp32: these hold light per unit of the sun's illuminance, and in twilight the sky's share falls to ~1e-6 and
+            // below, fp16's subnormals (steps of 6e-8): an exposure adapted to dusk showed the sky-view LUT's texels as
+            // stair-stepped rings round the zenith. The AP volume is pre-exposed and stays fp16.
+            _transmittance = new RenderTexture2D(device, TransmittanceW, TransmittanceH, Format.R32G32B32A32_Float, randomWrite: true);
+            _multiScat = new RenderTexture2D(device, MultiScatRes, MultiScatRes, Format.R32G32B32A32_Float, randomWrite: true);
+            _skyViewSun = new RenderTexture2D(device, SkyViewW, SkyViewH, Format.R32G32B32A32_Float, randomWrite: true);
+            _skyViewMoon = new RenderTexture2D(device, SkyViewW, SkyViewH, Format.R32G32B32A32_Float, randomWrite: true);
             _ap = new RenderTexture3D(device, APRes, APRes, APSlices, Format.R16G16B16A16_Float);
             _ambient = GraphicsBuffer.CreateStructured<Vector4>(AmbientElements, srv: true, uav: true);
             for (int i = 0; i < FrameCount; i++)
