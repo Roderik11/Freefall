@@ -37,9 +37,8 @@ namespace Freefall.Assets
         [ValueRange(0f, 10f)]
         public float SunsetIntensity = 1.5f;
 
+        [Description("The sun's own tint. Its reddening at sunset comes from the sky model (the light's path through the air)")]
         public Color3 SunDayColor = new Color3(1.0f, 0.95f, 0.85f);
-
-        public Color3 SunSunsetColor = new Color3(1.0f, 0.7f, 0.4f);
 
         // ── Day sky ──
 
@@ -197,7 +196,6 @@ namespace Freefall.Assets
             dest.DayIntensity = L(a.DayIntensity, b.DayIntensity, t);
             dest.SunsetIntensity = L(a.SunsetIntensity, b.SunsetIntensity, t);
             dest.SunDayColor = L(a.SunDayColor, b.SunDayColor, t);
-            dest.SunSunsetColor = L(a.SunSunsetColor, b.SunSunsetColor, t);
 
             dest.SkyTintColor = L(a.SkyTintColor, b.SkyTintColor, t);
             dest.AtmosphereDensity = L(a.AtmosphereDensity, b.AtmosphereDensity, t);

@@ -298,12 +298,21 @@ float3 MoonsAndStars(float3 viewDir, float3 sunDir, float3 stars)
     return moons + stars * starsVisible;
 }
 
-float GetSun(float3 viewDir, float3 sunDir)
+// The sun disc and its close glow, in the colour of the sunlight that reaches the ground (orange near the
+// horizon). The disc is far brighter than the sky round it, so it blows out to yellow-white and blooms;
+// at 1× it was barely brighter than the sky and read as a pale flat disc.
+float3 GetSun(float3 viewDir, float3 sunDir)
 {
     float sun = saturate(dot(viewDir, sunDir));
-    float sunDisc = smoothstep(0.9995, 0.9998, sun);
+    // Disc ~0.55° across (the real sun: 0.53°); it was 2.3–3.6°, a big flat coin.
+    float sunDisc = smoothstep(0.99996, 0.99999, sun);
     float sunGlow = pow(sun, 32.0) * 0.3;
-    return sunDisc + sunGlow;
+    // Aureole: the bright haze within a few degrees of the sun (forward scattering by the haze, much tighter
+    // than the sky's Mie glow): ~2 at 2°, 0.6 at 4°. With the small blown-out disc it reads as the glare of a
+    // low sun. The wide part is mostly the sky's own low-sun glow (sky_common.fx).
+    float aureole = pow(sun, 400.0) * 3.0 + pow(sun, 3000.0) * 20.0;
+    float3 sunLight = SunlightThroughAir(sunDir.y) * float3(1.0, 0.95, 0.85);
+    return sunLight * (sunDisc * 60.0 + sunGlow + aureole);
 }
 
 VertexOutput VS(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_InstanceID)
@@ -375,8 +384,7 @@ FragmentOutput PS_Procedural(VertexOutput input)
     skyColor += MoonGlow(viewDir, sunDir);
     float3 behindClouds = MoonsAndStars(viewDir, sunDir, NightSky(viewDir, pixelAngle, nightFactor, moonLight));
 
-    float sun = GetSun(viewDir, sunDir) * SunIntensity;
-    skyColor += float3(1.0, 0.9, 0.7) * sun;
+    skyColor += GetSun(viewDir, sunDir) * SunIntensity;
 
     // Altitude scales the projected noise, so lerping it zooms the whole pattern. While a preset
     // transition runs we instead cross-fade the density of the old and new cloud layers.

@@ -73,8 +73,7 @@ namespace Freefall.Graphics
         }
 
         // What the sky's ambient adds to an up-facing surface, as a multiple of its albedo: sky_common.fx's
-        // SkyAmbientLight() = GetSkyColor(up) × 0.45, with the zenith colour as its day sky has it
-        // (tint × ~0.65 × density) and the night sky colour at night. 0 without a sky.
+        // SkyAmbientLight() = GetSkyColor(up) × 0.45, from the CPU copy of the sky model (SkyModel). 0 without a sky.
         public static float SkyAmbient()
         {
             var sky = SkyAmbientColor();
@@ -85,9 +84,10 @@ namespace Freefall.Graphics
         {
             if (ComponentCache<SkyboxRenderer>.All.Count == 0)
                 return Vector3.Zero;
-            Vector3 day = SkyboxRenderer.CurrentSkyTintColor * (0.65f * SkyboxRenderer.CurrentAtmosphereDensity);
-            Vector3 sky = (SkyboxRenderer.CurrentDayFactor + SkyboxRenderer.CurrentSunsetFactor) * day
-                        + SkyboxRenderer.CurrentNightFactor * SkyboxRenderer.CurrentNightSkyColor;
+            Vector3 sky = SkyModel.ZenithSkyColor(SkyboxRenderer.CurrentSunDirection.Y, SkyboxRenderer.CurrentSkyTintColor,
+                SkyboxRenderer.CurrentAtmosphereDensity, SkyboxRenderer.CurrentMieScattering, SkyboxRenderer.CurrentMieAnisotropy,
+                SkyboxRenderer.CurrentDayFactor, SkyboxRenderer.CurrentSunsetFactor, SkyboxRenderer.CurrentNightFactor,
+                SkyboxRenderer.CurrentNightSkyColor);
             return sky * 0.45f;
         }
 

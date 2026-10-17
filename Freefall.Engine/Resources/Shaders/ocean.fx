@@ -554,10 +554,19 @@ PSOutput PS(DSOutput input)
     float k2 = 0.1 * NdotV * NdotV;
     float k3 = 0.08 * NdotL;
 
-    float3 scatter = ((k1 + k2) * baseColor + k3 * baseColor + 0.02 * bubbleColor) * sunRadiance;
+    float3 scatter = ((k1 + k2) * baseColor + k3 * baseColor + 0.02 * bubbleColor) * sunRadiance
+                   + baseColor * WaterSkyIrradiance(input.SkyAmbient) * 0.1;   // light from the sky above, too
 
     // ── Fresnel, sky reflection and sun glitter: shared with lakes and rivers (water_common.fx) ──
-    float F = WaterFresnel(NdotV);
+    // Fresnel with the same distance-flattened normal the sky reflection mirrors with: far away the per-pixel
+    // normal is sub-pixel noise, and its scattered N·V took the grazing-angle reflectance (and with it the
+    // distant sea's brightness) down to about half.
+    // Toward the horizon it also moves from the roughness-adjusted curve (which tops out at 0.69) to plain
+    // Schlick: distant sea seen at ~88° mirrors ~0.85 of the sky, which is how bright the reference's was.
+    float distSmooth = WaterDistanceSmooth(dist);
+    float3 fresnelN = normalize(lerp(N, float3(0, 1, 0), distSmooth * 0.9));
+    float fresnelNV = saturate(dot(fresnelN, V));
+    float F = lerp(WaterFresnel(fresnelNV), 0.02 + 0.98 * pow(1.0 - fresnelNV, 5.0), distSmooth * 0.6);
     float3 reflectColor = WaterSkyReflection(OceanSampler, V, N, worldPos - camPos, dist, ocean.CloudColor);
     float3 specular = WaterSunSpecular(N, V, L, sunRadiance, F, dist);
 
@@ -608,7 +617,7 @@ PSOutput PS(DSOutput input)
     float3 skyAmbient = input.SkyAmbient;
     float shallow = exp(-max(bedDepth, 0.0) / max(0.01, ocean.ShoreFadeDepth)) * saturate(pathLen);
     shallow *= (ocean.HeightmapSRV != 0) ? shallowFade : 1.0;
-    body += ocean.ShallowColor * (sunRadiance * saturate(L.y) + skyAmbient) * 0.06 * shallow;
+    body += ocean.ShallowColor * (sunRadiance * saturate(L.y) + WaterSkyIrradiance(skyAmbient)) * 0.08 * shallow;
 
     // ── Combine lighting ──
     float3 color = (1.0 - F) * body + (specular + F * reflectColor) * edgeFade;

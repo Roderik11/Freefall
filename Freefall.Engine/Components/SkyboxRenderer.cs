@@ -60,8 +60,8 @@ namespace Freefall.Components
         [ValueRange(0f, 10f)]
         public float SunsetIntensity = 1.5f;    // Sun intensity during sunset/sunrise
 
+        // The sun's own tint; the reddening at sunset comes from the air (SkyModel.SunlightThroughAir)
         public Color3 SunDayColor = new Color3(1.0f, 0.95f, 0.85f);
-        public Color3 SunSunsetColor = new Color3(1.0f, 0.7f, 0.4f);
 
         public Vector3 SunDirection = new Vector3(0, 1, 0);
 
@@ -362,15 +362,17 @@ namespace Freefall.Components
             CurrentNightSkyColor = new Vector3(NightSkyColor.R, NightSkyColor.G, NightSkyColor.B);
             CurrentNightHorizonColor = new Vector3(NightHorizonColor.R, NightHorizonColor.G, NightHorizonColor.B);
 
-            // The sun's light: the day and sunset palettes (matching the shader); the night belongs to the moons.
-            // After sunset it keeps shining from 6° up (twilight) while it fades, never from below the ground.
-            float sunWeight = dayFactor + sunsetFactor;
+            // The sun's light; the night belongs to the moons. After sunset it keeps shining from 6° up (twilight)
+            // while it fades, never from below the ground.
+            // Its colour is the sky's own sunlight after the path through the air (SkyModel = sky_common.fx), hue
+            // only, times SunDayColor: so the light, the sun disc, the sky's glow and the glitter on the water turn
+            // golden together at sunset. Its brightness stays with the intensities above. A preset's separate
+            // SunSunsetColor did this before 2026-10-17 and was removed: blended by the day/sunset weights, it
+            // left the light pale yellow while the new sky was already orange at the horizon.
             float sunIntensity = (dayFactor * DayIntensity + sunsetFactor * SunsetIntensity) * SunIntensity;
-            float sunsetShare = sunWeight > 0f ? sunsetFactor / sunWeight : 1f;
-            var sunColor = new Color3(
-                SunDayColor.R + (SunSunsetColor.R - SunDayColor.R) * sunsetShare,
-                SunDayColor.G + (SunSunsetColor.G - SunDayColor.G) * sunsetShare,
-                SunDayColor.B + (SunSunsetColor.B - SunDayColor.B) * sunsetShare);
+            Vector3 throughAir = SkyModel.SunlightThroughAir(elevation, MieScattering);
+            throughAir /= MathF.Max(throughAir.X, MathF.Max(throughAir.Y, MathF.Max(throughAir.Z, 1e-6f)));
+            var sunColor = new Color3(SunDayColor.R * throughAir.X, SunDayColor.G * throughAir.Y, SunDayColor.B * throughAir.Z);
             Vector3 sunLightDir = Vector3.Normalize(horizontal + Vector3.UnitY * MathF.Max(0.1f, elevation));
 
             UpdateMoons();
@@ -546,7 +548,6 @@ namespace Freefall.Components
             DayIntensity = p.DayIntensity;
             SunsetIntensity = p.SunsetIntensity;
             SunDayColor = p.SunDayColor;
-            SunSunsetColor = p.SunSunsetColor;
 
             SkyTintColor = p.SkyTintColor;
             AtmosphereDensity = p.AtmosphereDensity;
@@ -586,7 +587,6 @@ namespace Freefall.Components
             p.DayIntensity = DayIntensity;
             p.SunsetIntensity = SunsetIntensity;
             p.SunDayColor = SunDayColor;
-            p.SunSunsetColor = SunSunsetColor;
 
             p.SkyTintColor = SkyTintColor;
             p.AtmosphereDensity = AtmosphereDensity;
