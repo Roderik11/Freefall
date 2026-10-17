@@ -5,6 +5,7 @@ using PhysX;
 using System;
 using System.IO;
 using System.Numerics;
+using System.Runtime.InteropServices;
 using Vortice.Direct3D12;
 using Vortice.Mathematics;
 
@@ -267,7 +268,20 @@ namespace Freefall.Components
     public class MeshCollider : Collider
     {
         public Mesh? Mesh;
-        static Dictionary<string, TriangleMesh> cookedMeshes = [];
+        // Cooked meshes by mesh GUID, shared across scene loads (a reload brings new Mesh objects of the same assets).
+        // An entry holds only for the geometry it was cooked from: a reimported mesh keeps its GUID, and until
+        // 2026-10-17 its colliders went on using the old shape (the reworked cave mouth: the player fell through its
+        // new floor where the old outcrop had none, even after scene reloads).
+        static Dictionary<string, (int Geometry, TriangleMesh Mesh)> cookedMeshes = [];
+
+        /// <summary>A fingerprint of what the cook reads (positions and indices).</summary>
+        static int GeometryKey(Mesh mesh)
+        {
+            var hash = new HashCode();
+            if (mesh.Positions != null) hash.AddBytes(MemoryMarshal.AsBytes(mesh.Positions.AsSpan()));
+            if (mesh.CpuIndices != null) hash.AddBytes(MemoryMarshal.AsBytes(mesh.CpuIndices.AsSpan()));
+            return hash.ToHashCode();
+        }
 
         public override PhysX.Geometry? CreateGeometry()
         {
@@ -286,19 +300,17 @@ namespace Freefall.Components
             }
 
 
-            if (Mesh?.CookedTriMesh == null)
+            if (Mesh.CookedTriMesh == null)
             {
-                if (!cookedMeshes.TryGetValue(Mesh.Guid, out var triMesh))
+                int geometry = GeometryKey(Mesh);
+                if (Mesh.Guid != null && cookedMeshes.TryGetValue(Mesh.Guid, out var cooked) && cooked.Geometry == geometry)
+                    Mesh.CookedTriMesh = cooked.Mesh;
+                else
                 {
-                    Mesh?.CookPhysicsMesh();
-                    if (Mesh?.CookedTriMesh != null)
-                    {
-                        cookedMeshes[Mesh.Guid] = Mesh.CookedTriMesh;
-                        triMesh = Mesh.CookedTriMesh;
-                    }
+                    Mesh.CookPhysicsMesh();
+                    if (Mesh.Guid != null && Mesh.CookedTriMesh != null)
+                        cookedMeshes[Mesh.Guid] = (geometry, Mesh.CookedTriMesh);
                 }
-
-                Mesh?.CookedTriMesh = triMesh;
             }
 
             if (Mesh?.CookedTriMesh == null)
