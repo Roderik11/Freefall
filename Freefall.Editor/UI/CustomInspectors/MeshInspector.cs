@@ -34,7 +34,10 @@ namespace Freefall.Editor
                 AddText("Bones", _mesh.Bones.Length.ToString());
 
             if (_mesh.LODs.Count > 0)
+            {
                 AddText("LOD Levels", _mesh.LODs.Count.ToString());
+                AddText("LOD Triangles", string.Join(" / ", _mesh.LODs.Select(CountTriangles)));
+            }
 
             var bounds = _mesh.BoundingBox;
             AddText("Min", $"{bounds.Min.X:F2}, {bounds.Min.Y:F2}, {bounds.Min.Z:F2}");
@@ -65,8 +68,46 @@ namespace Freefall.Editor
             AddProperty(lodBias);
             lodBias.OnValueChanged += SaveMeshConfig;
 
+            // LODs generated at import: settings of the whole model file, applied by reimporting it
+            if (!string.IsNullOrEmpty(_mesh.Guid) && AssetDatabase.GetImporter(_mesh.Guid) is ModelImporter importer)
+            {
+                AddCategory("Generated LODs (model import)");
+                var importerObj = new GUIObject(importer);
+                foreach (var member in ModelImporter.LODGenerationMembers)
+                {
+                    var property = importerObj.GetProperty(member);
+                    if (property != null) AddProperty(property);
+                }
+
+                var applyButton = new Button
+                {
+                    Text = "Apply & Reimport",
+                    Dock = DockStyle.Top,
+                    Size = new Point(100, 30),
+                    Margin = new Margin(4, 4, 4, 4),
+                    Style = "button",
+                };
+                var guid = _mesh.Guid;
+                applyButton.MouseClick += (s, e) =>
+                {
+                    if (e.Button > 0) return;
+                    AssetDatabase.SaveImporterAndReimport(guid, importer);
+                };
+                AddControl(applyButton);
+            }
+
             if (_preview == null)
                 _preview = new MeshPreview();
+        }
+
+        private long CountTriangles(MeshLOD lod)
+        {
+            long indices = 0;
+            if (lod.MeshPartIndices != null)
+                foreach (var idx in lod.MeshPartIndices)
+                    if (idx < _mesh.MeshParts.Count)
+                        indices += _mesh.MeshParts[idx].NumIndices;
+            return indices / 3;
         }
 
         /// <summary>

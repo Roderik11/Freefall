@@ -163,6 +163,31 @@ namespace Freefall.Assets.Importers
             return AssetDatabase.SaveImporter(clip.Guid, importer) != null;
         }
 
+        /// <summary>
+        /// Give meshes without LODs of their own (no _LOD1, _LOD2… objects in the file) a generated chain
+        /// (LODGenerator). Authored LODs always win; skinned meshes are left as they are.
+        /// </summary>
+        [Category("Generated LODs")]
+        public bool GenerateLODs = true;
+
+        /// <summary>Share of LOD 0's triangles for each generated level, decreasing.</summary>
+        public List<float> LODRatios = new() { 0.5f, 0.25f, 0.125f };
+
+        /// <summary>The chain ends before a level that would have fewer triangles than this.</summary>
+        public int LODMinTriangles = 64;
+
+        /// <summary>
+        /// Largest shape change of a level, in pixels of a 1080p screen at the size where the level takes over
+        /// (meshoptimizer's estimate, well above what shows). A level that cannot reach its ratio within it keeps
+        /// more triangles, or is not made. 0 = no limit.
+        /// </summary>
+        [ValueRange(0f, 30f)]
+        public float LODPixelError = 8f;
+
+        /// <summary>The members above, for inspectors that show them next to a mesh.</summary>
+        public static readonly string[] LODGenerationMembers =
+            { nameof(GenerateLODs), nameof(LODRatios), nameof(LODMinTriangles), nameof(LODPixelError) };
+
         private List<Bone> _skeleton = new();
         private List<string> _boneNames = new();
 
@@ -890,6 +915,10 @@ namespace Freefall.Assets.Importers
                     if (slot >= 0 && slot < matNames.Length && matNames[slot] == null)
                         matNames[slot] = gMatNames[i];
                 }
+
+                // No LODs in the file: generate a chain. The new parts take their LOD 0 part's material slot.
+                if (lods.Count == 0 && GenerateLODs && _skeleton.Count == 0)
+                    lods = LODGenerator.Generate(gParts, gPos, gNorm, gIdx, LODRatios, LODMinTriangles, LODPixelError, groupName);
 
 
                 // Global bounding box (must be after vertex correction)

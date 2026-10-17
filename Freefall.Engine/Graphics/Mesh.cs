@@ -395,7 +395,25 @@ namespace Freefall.Graphics
             if (Positions == null || CpuIndices == null)
                 return;
 
-            var triangles = System.Array.ConvertAll(CpuIndices, i => (int)i);
+            // Coarser LODs would collide as more surfaces just inside the first: cook LOD 0 and the parts
+            // outside the LOD chain (collision parts too), not the parts that only lower LODs draw.
+            int[] triangles;
+            var lodFirst = _partLodFirst;
+            if (lodFirst == null)
+                triangles = System.Array.ConvertAll(CpuIndices, i => (int)i);
+            else
+            {
+                var list = new List<int>(CpuIndices.Length);
+                for (int p = 0; p < MeshParts.Count; p++)
+                {
+                    if (p < lodFirst.Length && lodFirst[p] > 0) continue;
+                    var part = MeshParts[p];
+                    int end = Math.Min(part.BaseIndex + part.NumIndices, CpuIndices.Length);
+                    for (int i = part.BaseIndex; i < end; i++)
+                        list.Add((int)CpuIndices[i] + part.BaseVertex);
+                }
+                triangles = list.ToArray();
+            }
 
             var cooking = Freefall.Base.PhysicsWorld.Physics.CreateCooking();
             var desc = new PhysX.TriangleMeshDesc()
