@@ -44,8 +44,9 @@ namespace Freefall.Components
         }
         private List<InstanceValue> _instance = new();
 
-        // A slot of the instance data buffer per effect this renderer draws with (by effect name: Effect objects of
-        // one name share their layout), and the ones the current draws use
+        // A slot of the instance data buffer per effect this renderer draws with (by Effect.Key: Effect objects of
+        // one key share their layout; a project effect named like an engine one is another effect), and the ones
+        // the current draws use
         private readonly List<(Effect effect, int slot)> _instanceSlots = new();
         private readonly HashSet<string> _instanceSlotsUsed = new();
 
@@ -187,9 +188,9 @@ namespace Freefall.Components
             var effect = material?.Effect;
             if (effect == null || effect.InstanceParams.Count == 0) return 0;
 
-            _instanceSlotsUsed.Add(effect.Name);
+            _instanceSlotsUsed.Add(effect.Key);
             foreach (var (known, slot) in _instanceSlots)
-                if (known.Name == effect.Name) return slot;
+                if (known.Key == effect.Key) return slot;
 
             int made = InstanceData.Allocate();
             _instanceSlots.Add((effect, made));
@@ -310,7 +311,7 @@ namespace Freefall.Components
             for (int i = _instanceSlots.Count - 1; i >= 0; i--)
             {
                 var (effect, instanceSlot) = _instanceSlots[i];
-                if (_instanceSlotsUsed.Contains(effect.Name))
+                if (_instanceSlotsUsed.Contains(effect.Key))
                     WriteInstanceSlot(effect, instanceSlot);
                 else
                 {
