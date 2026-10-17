@@ -75,10 +75,11 @@ void CSCompose(uint3 dispatchThreadId : SV_DispatchThreadID)
     float4 data = DataTex.Load(displaced_coord);
     float3 normal = NormalTex.Load(displaced_coord).xyz;
     
-    // Hemisphere ambient: the sky from above, the ground's bounce light from below.
-    // Gives shape to fully shadowed objects.
+    // Hemisphere ambient: the sky from above, the ground's bounce light from below. Gives shape to fully shadowed
+    // objects. × how much of the sky the surface sees past the terrain (light_directional_cs puts it in the light
+    // buffer's alpha): a cave under a hill gets none
     float ao = data.b;
-    float3 ambient = HemisphereAmbient(normal) * ao;
+    float3 ambient = HemisphereAmbient(normal) * ao * saturate(light.a);
 
     // Screen-space AO (GTAO) — fully occludes ambient; direct light only by AODirectStrength
     // (not physically based, but keeps creases readable in sunlit areas)
@@ -101,7 +102,7 @@ void CSCompose(uint3 dispatchThreadId : SV_DispatchThreadID)
 
     // Aerial perspective (the atmosphere's froxel volume); sky pixels already hold all of the air
     if (isLit > 0)
-        finalColor = ApplyAerialPerspective(finalColor, float2(px) + 0.5, DepthGBuf.Load(coord).r);
+        finalColor = ApplyAerialPerspective(finalColor, float2(px) + 0.5, DepthGBuf.Load(coord).r, saturate(light.a));
     
     // Output HDR linear — tonemapping deferred to finalize pass
     Output[px] = float4(finalColor, 1.0f);

@@ -877,6 +877,7 @@ void CSComposeGI(uint3 dtid : SV_DispatchThreadID)
     float3 kd = (1.0 - metal); // simplified diffuse (no Fresnel for indirect)
     
     RWTexture2D<float4> lightBuf = ResourceDescriptorHeap[LightBufUavIdx];
-    float3 existing = lightBuf[dtid.xy].rgb;
-    lightBuf[dtid.xy] = float4(existing + kd * albedo * gi * ao, 1.0);
+    float4 existing = lightBuf[dtid.xy];
+    // Alpha is the sky visibility light_directional_cs left for the composition: keep it
+    lightBuf[dtid.xy] = float4(existing.rgb + kd * albedo * gi * ao, existing.a);
 }

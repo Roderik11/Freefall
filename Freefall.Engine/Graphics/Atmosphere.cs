@@ -69,6 +69,13 @@ namespace Freefall.Graphics
 
         public static float ReferenceExposure => 1f / (1.2f * MathF.Pow(2f, ReferenceEV));
         public static float Exposure => 1f / (1.2f * MathF.Pow(2f, AutoExposure.EV));
+        /// <summary>
+        /// The terrain the sky visibility reads this frame (sky_visibility.hlsli TerrainCover): heightmap bindless index (0 =
+        /// none, or Engine.Settings.SkyVisibility off), metres at 1, the terrain's corner, the metres it spans.
+        /// </summary>
+        public static (uint Heightmap, float MaxHeight, Vector3 Origin, Vector2 Size) TerrainCover =>
+            (_frame.TerrainHeightmap, _frame.TerrainMaxHeight, _frame.TerrainOrigin, new Vector2(_frame.TerrainSizeX, _frame.TerrainSizeZ));
+
         /// <summary>The directional light (physical lux in the older units' encoding) × this = pre-exposed.</summary>
         public static float SunLightScale => Exposure / ReferenceExposure;
 
@@ -210,7 +217,9 @@ namespace Freefall.Graphics
             public Vector3 MoonDirection; public float _pad0;
             public Vector3 MoonIlluminance; public float AirglowLuminance;
             public uint TransmittanceLut, MultiScatLut, SkyViewSunLut, SkyViewMoonLut;
-            public uint AerialPerspective, Ambient, _pad1, _pad2;
+            public uint AerialPerspective, Ambient, TerrainHeightmap; public float TerrainMaxHeight;
+            public Vector3 TerrainOrigin; public float TerrainSizeX;
+            public float TerrainSizeZ; public Vector3 _pad1;
 
             /// <summary>The part the transmittance and multiple scattering LUTs depend on</summary>
             public bool SameMedium(in GpuParams o) =>
@@ -326,6 +335,20 @@ namespace Freefall.Graphics
                 AerialPerspective = _ap!.BindlessIndex,
                 Ambient = _ambient!.SrvIndex,
             };
+            // Sky visibility (sky_common.fx SkyVisibility): the terrain shades the sky's light where hills rise round a
+            // place or over it (a cave under a hill)
+            foreach (var terrain in Base.ComponentCache<Components.TerrainRenderer>.All)
+            {
+                if (!Engine.Settings.SkyVisibility) break;
+                var heightmap = terrain.Enabled ? terrain.Terrain?.Heightmap : null;
+                if (heightmap == null) continue;
+                _frame.TerrainHeightmap = heightmap.BindlessIndex;
+                _frame.TerrainMaxHeight = terrain.Terrain!.MaxHeight;
+                _frame.TerrainOrigin = terrain.Transform!.WorldPosition;
+                _frame.TerrainSizeX = terrain.Terrain.TerrainSize.X;
+                _frame.TerrainSizeZ = terrain.Terrain.TerrainSize.Y;
+                break;
+            }
             unsafe { *_params[slot]!.WritePtr<GpuParams>() = _frame; }
             return _params[slot]!.SrvIndex;
         }

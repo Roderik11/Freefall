@@ -46,6 +46,10 @@ cbuffer PushConstants : register(b3)
 
 #include "local_shadows.hlsli"
 #include "point_lights.hlsli"
+#include "sky_visibility.hlsli"
+
+// The global root signature's linear clamp sampler (s2), for the terrain heightmap
+SamplerState TerrainLinearClamp : register(s2);
 
 // The sun's cascades (common.fx's CascadeData; this file does not include common.fx)
 struct SunCascade
@@ -252,12 +256,22 @@ float SunVisibility(float3 worldPos)
 
 // How much the light outshines the daylight around it: 0 when the sun and sky drown it, 1 when the light rules its
 // surroundings. All in lux: the light's a third of its range out (candela / d², its window leaves 0.975 there), the
-// sun's on a surface facing it where the cascades see it, the sky's on level ground.
+// sun's on a surface facing it where the cascades see it, the sky's on level ground. Both only as far as they reach
+// the light past the terrain (sky_visibility.hlsli): in a cave at noon the open sky's 15000 lux drowned every lamp,
+// and none got a shadow.
 float SunFactor(PointLightData light, PointLightFrame frame)
 {
+    TerrainCover terrain;
+    terrain.Heightmap = frame.TerrainHeightmap;
+    terrain.MaxHeight = frame.TerrainMaxHeight;
+    terrain.Origin = frame.TerrainOrigin;
+    terrain.Size = frame.TerrainSize;
+    float3 worldPos = light.Position + frame.CameraPosition;
     float own = light.Score * 0.975 * 9.0 / max(light.Range * light.Range, 1e-4);   // the cull's luminance × base candela
-    float sun = frame.SunLight > 0.0 ? frame.SunLight * SunVisibility(light.Position + frame.CameraPosition) : 0.0;
-    float dominance = own / max(own + sun + frame.Ambient, 1e-6);
+    float sun = frame.SunLight > 0.0
+        ? frame.SunLight * SunVisibility(worldPos) * TerrainOpenAt(terrain, TerrainLinearClamp, worldPos, float3(0, 1, 0)) : 0.0;
+    float sky = frame.Ambient * SkyVisibilityAt(terrain, TerrainLinearClamp, worldPos, float3(0, 1, 0));
+    float dominance = own / max(own + sun + sky, 1e-6);
     return smoothstep(0.25, 0.5, dominance);
 }
 

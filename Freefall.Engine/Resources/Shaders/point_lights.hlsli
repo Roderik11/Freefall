@@ -39,7 +39,7 @@ struct PointLightData
 
 // The camera and frame, per renderer, for the light cull and the shadow selection (not SceneConstants: those
 // are set for lighting later in the frame, and by whichever renderer ran last). Must match C#
-// PointLightBuffer.FrameParams (192 bytes).
+// PointLightBuffer.FrameParams (224 bytes).
 struct PointLightFrame
 {
     row_major float4x4 CameraRelativeVP;    // camera-relative world -> clip (view without translation)
@@ -53,7 +53,11 @@ struct PointLightFrame
     uint Frame;                             // this renderer's frame count, from 1
     float Ambient;                          // lux from the whole sky on level ground
     float Lamps;                            // Daylight.Lamps: 0 = street lamps out, 1 = lit
-    uint _pad;
+    uint TerrainHeightmap;                  // sky_visibility.hlsli: the daylight a light competes with is the sky and
+    float TerrainMaxHeight;                 // sun that reach it (a cave lamp in daytime gets its shadow); 0 = no terrain
+    float3 TerrainOrigin;
+    float2 TerrainSize;
+    float2 _pad;
 };
 
 // ── Flicker: value noise over an integer hash, no trig ───────────────────────

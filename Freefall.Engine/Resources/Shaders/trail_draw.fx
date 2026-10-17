@@ -51,6 +51,7 @@ struct VSOutput
     float  Across   : TEXCOORD0;   // -1..1 from edge to edge
     float  Blade    : TEXCOORD1;   // 1 on a blade's sheet
     float  Depth    : TEXCOORD2;   // view depth (clip w), for the aerial perspective
+    float  SkyVisible : TEXCOORD3; // how much sky the point sees past the terrain (scales the haze in front)
 };
 
 VSOutput VS(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
@@ -70,7 +71,9 @@ VSOutput VS(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
     uint index = instanceID + (uint)corner.x;
     TrailPoint p = Points[index];
     // Premultiplied: only the light scales. Lit: an albedo under the sky and the sun; else nits, pre-exposed as a light source
-    p.Color.rgb *= (p.Flags & TRAIL_LIT) != 0 ? ParticleLight() : EmissiveExposure.xxx;
+    float skyVisible = SkyVisibility(p.Position, float3(0, 1, 0));
+    p.Color.rgb *= (p.Flags & TRAIL_LIT) != 0 ? ParticleLight() * skyVisible : EmissiveExposure.xxx;
+    output.SkyVisible = skyVisible;
 
     // A blade: the sheet is given, from the point (the tip's edge) to its other edge
     if ((p.Flags & TRAIL_BLADE) != 0)
@@ -127,7 +130,7 @@ float4 PS(VSOutput input) : SV_Target0
     if (FogEnabled > 0.0 && AtmosphereIdx != 0)
     {
         float4 ap = AtmosphereAerialPerspective(LoadAtmosphere(), input.Position.xy / ViewportSize, input.Depth);
-        color.rgb = color.rgb * ap.a + ap.rgb * color.a;
+        color.rgb = color.rgb * ap.a + ap.rgb * (color.a * input.SkyVisible);   // no lit haze in a cave
     }
     return color;
 }

@@ -585,6 +585,11 @@ namespace Freefall
          // tonemapper sees; higher = darker image. Auto: metered from the scene each frame (Graphics.AutoExposure).
          // Off: ExposureEV, which the captures lock (13.36 = Atmosphere.ReferenceEV shows light sources in the
          // engine's older units exactly as before).
+         // The sky's ambient light reaches only as much of a surface as sees the sky past the terrain (a cave under a
+         // hill gets none: sky_common.fx SkyVisibility). Off: every surface gets the whole sky (before stage 4).
+         [Category("Ambient")]
+         public bool SkyVisibility { get; set; } = true;
+
          [Category("Exposure")]
          public bool AutoExposure { get; set; } = true;
 

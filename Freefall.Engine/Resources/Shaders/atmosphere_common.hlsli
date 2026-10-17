@@ -41,7 +41,9 @@ struct AtmosphereParams
     float3 MoonDirection;       float _pad0;
     float3 MoonIlluminance;     float AirglowLuminance;    // lux (phase and colour included); cd/m² of the night sky
     uint TransmittanceLut;      uint MultiScatLut;         uint SkyViewSunLut;     uint SkyViewMoonLut;
-    uint AerialPerspective;     uint Ambient;              uint _pad1;             uint _pad2;
+    uint AerialPerspective;     uint Ambient;              uint TerrainHeightmap;  float TerrainMaxHeight;   // sky visibility: the terrain's baked heightmap (R16, 0 = none); metres at 1
+    float3 TerrainOrigin;       float TerrainSizeX;        // world position of the terrain's corner (y = its base); metres it spans in x
+    float TerrainSizeZ;         float3 _pad1;
 };
 
 // The global root signature's linear clamp sampler (s2)

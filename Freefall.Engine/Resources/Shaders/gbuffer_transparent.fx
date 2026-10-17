@@ -304,6 +304,7 @@ PSOutput PS(VSOutput input)
                 cascadeIndex, N, LightDirection, zScale, input.Position.xy);
         }
     }
+    shadowFactor *= TerrainOpen(input.AbsWorldPos, N);   // under the terrain (a cave): no sun, as in light_directional_cs
 
     // ── Combine lighting ──
     // Separate diffuse and specular: for transparent surfaces, specular is added
@@ -314,8 +315,10 @@ PSOutput PS(VSOutput input)
     float3 diffuseLighting = diffuse * radiance * ao;
     float3 specLighting = spec * radiance;
 
-    // Hemisphere ambient, the same as the opaque surfaces get in composition
-    float3 ambient = HemisphereAmbient(N) * ao;
+    // Hemisphere ambient, the same as the opaque surfaces get in composition: × how much sky the pane sees past the
+    // terrain (also dims its sky reflection below)
+    float skyVisible = SkyVisibility(input.AbsWorldPos, N);
+    float3 ambient = HemisphereAmbient(N) * ao * skyVisible;
     float3 lighting = diffuseLighting + ambient * color.rgb;
 
     // Emissive adds directly to lighting (its luminance in nits, pre-exposed as a light source seen directly)
@@ -357,7 +360,7 @@ PSOutput PS(VSOutput input)
     // reflects the street, not the sky — mirroring the direction upwards made such panes glow).
     float3 reflectDir = reflect(-V, Ng);
     float3 skyReflect = SkyRadiance(normalize(float3(reflectDir.x, max(reflectDir.y, 0.02), reflectDir.z)));
-    float3 envReflect = lerp(GroundBounceLight(), skyReflect, smoothstep(-0.15, 0.1, reflectDir.y));
+    float3 envReflect = lerp(GroundBounceLight(), skyReflect, smoothstep(-0.15, 0.1, reflectDir.y)) * skyVisible;
 
     // Base: the lit glass surface; the blend state mixes it over what is behind with alpha.
     // (Both lighting and refracted are linear HDR — finalize handles tonemapping.)
@@ -397,7 +400,7 @@ PSOutput PS(VSOutput input)
 
     // Aerial perspective — input.Depth is linear view-space Z. The blend lays the glass's share over what is
     // behind, which carries its own (longer) fog already.
-    finalColor = ApplyAerialPerspective(finalColor, input.Position.xy, input.Depth);
+    finalColor = ApplyAerialPerspective(finalColor, input.Position.xy, input.Depth, skyVisible);
 
     output.Color = float4(finalColor, finalAlpha);
     output.EntityId = (input.TransformSlot << 8u) | (input.MeshPartIdx & 0xFFu);

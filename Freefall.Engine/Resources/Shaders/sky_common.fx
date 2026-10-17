@@ -11,6 +11,7 @@
 #define SKY_COMMON
 
 #include "atmosphere_common.hlsli"
+#include "sky_visibility.hlsli"
 
 // Direction toward the sun (the true sun, also below the horizon), for passes that need its place in the sky
 float3 AtmSunDirection()
@@ -54,10 +55,31 @@ float3 HemisphereAmbient(float3 N)
     return lerp(GroundBounceLight(), SkyAmbientLight(), N.y * 0.5 + 0.5);
 }
 
+// The terrain under the atmosphere's parameters, for sky_visibility.hlsli (Heightmap 0 = none, or SkyVisibility off)
+TerrainCover LoadTerrainCover()
+{
+    TerrainCover t = (TerrainCover)0;
+    if (AtmosphereIdx == 0)
+        return t;
+    AtmosphereParams A = LoadAtmosphere();
+    t.Heightmap = A.TerrainHeightmap;
+    t.MaxHeight = A.TerrainMaxHeight;
+    t.Origin = A.TerrainOrigin;
+    t.Size = float2(A.TerrainSizeX, A.TerrainSizeZ);
+    return t;
+}
+
+// 1 in the open, 0 four metres or more under the terrain (a cave): no sky and no sun there (sky_visibility.hlsli)
+float TerrainOpen(float3 worldPos, float3 N) { return TerrainOpenAt(LoadTerrainCover(), AtmosphereLinearClamp, worldPos, N); }
+
+// How much of the sky's light reaches a surface past the terrain, 0..1 (sky_visibility.hlsli). worldPos is absolute.
+float SkyVisibility(float3 worldPos, float3 N) { return SkyVisibilityAt(LoadTerrainCover(), AtmosphereLinearClamp, worldPos, N); }
+
 // Light on a lit particle or ribbon (smoke, rain, snow, a blade's trail) at the camera's height, as a multiple of its
 // albedo (E / π, pre-exposed): half the sun's and the moon's light through the air and the clouds' average shade (a
 // puff is lit from one side) and the sky's and the ground's ambient averaged, as for the clouds. No shadows: grey by
-// day, dark at night.
+// day, dark at night. Callers multiply by the SkyVisibility at the particle: smoke in a cave stays dark, since neither
+// the sky nor the sun reaches it there (they also scale the haze in front of it by that).
 float3 ParticleLight()
 {
     if (AtmosphereIdx == 0)
@@ -81,6 +103,17 @@ float3 ApplyAerialPerspective(float3 color, float2 pixel, float viewDepth)
         return color;
     float4 ap = AtmosphereAerialPerspective(LoadAtmosphere(), pixel / ViewportSize, viewDepth);
     return color * ap.a + ap.rgb;
+}
+
+// The same with the air's own light scaled by the surface's sky visibility (SkyVisibility): the volume lights every
+// slice of air with the sun and sky as if nothing shaded it, so in a cave (a ray ending under the hill crossed dark
+// air) it glowed over the black walls. A stand-in until the volume itself is shadowed (ATMOSPHERE_PLAN, open issues).
+float3 ApplyAerialPerspective(float3 color, float2 pixel, float viewDepth, float skyVisible)
+{
+    if (FogEnabled <= 0.0 || AtmosphereIdx == 0)
+        return color;
+    float4 ap = AtmosphereAerialPerspective(LoadAtmosphere(), pixel / ViewportSize, viewDepth);
+    return color * ap.a + ap.rgb * skyVisible;
 }
 
 // ────────────────────────────────────────────────

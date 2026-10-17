@@ -258,6 +258,9 @@ void CSDirectionalLight(uint3 dispatchThreadId : SV_DispatchThreadID)
 
     // Cloud shadows: also reach past the last cascade (Sampler = linear wrap, s0)
     shadowFactor *= GetCloudShadow(Sampler, worldPos.xyz, L);
+    // Under the terrain (a cave) the sun cannot reach, whatever the shadow map holds: its terrain pass follows the
+    // camera and can miss the hill over a cave, and the sun came through between the cave kit's pieces
+    shadowFactor *= TerrainOpen(worldPos.xyz + CamPos, normal);
 
     // Debug visualization modes
     if (DebugVisualizationMode == 1)
@@ -358,13 +361,17 @@ void CSDirectionalLight(uint3 dispatchThreadId : SV_DispatchThreadID)
         lighting += (diffuse + spec) * radiance * ao * (1.0 - vegetation);
     }
     
+    // How much of the sky this surface sees past the terrain (sky_common.fx): it gates the shadow wrap below (light
+    // bounced in from the sunlit surroundings) and goes to the composition in alpha for the sky's ambient light
+    float skyVisibility = SkyVisibility(worldPos.xyz + CamPos, normal);
+
     // Shadow wrap
-    lighting += diffuse * LightColor * LightIntensity * NdotL * (1.0 - shadowFactor) * 0.12 * ao;
-    
+    lighting += diffuse * LightColor * LightIntensity * NdotL * (1.0 - shadowFactor) * 0.12 * ao * skyVisibility;
+
     // Note: GI composition moved to separate pass (CSComposeGI in radiance_cascades.hlsl)
     // so RC trace can read direct-light-only without feedback loop
 
     // LightIntensity is in the older units (SkyboxRenderer sets it from the sun's lux: E × ReferenceExposure / π):
-    // SunLightScale pre-exposes it for the camera's exposure
-    Output[px] = float4(lighting * SunLightScale, 1.0f);
+    // SunLightScale pre-exposes it for the camera's exposure. Alpha: the sky visibility (point lights add with alpha 0)
+    Output[px] = float4(lighting * SunLightScale, skyVisibility);
 }

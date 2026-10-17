@@ -53,7 +53,7 @@ namespace Freefall.Graphics
             public float Score;
         }
 
-        /// <summary>The camera and frame for the cull and the shadow selection. Must match PointLightFrame (192 bytes).</summary>
+        /// <summary>The camera and frame for the cull and the shadow selection. Must match PointLightFrame (224 bytes).</summary>
         [StructLayout(LayoutKind.Sequential)]
         public struct FrameParams
         {
@@ -68,7 +68,11 @@ namespace Freefall.Graphics
             public uint Frame;
             public float Ambient;           // lux from the whole sky on level ground
             public float Lamps;             // Daylight.Lamps: lights marked OnlyWhenDark are scaled by it
-            private uint _pad0;
+            public uint TerrainHeightmap;   // sky_visibility.hlsli: daylight reaches a light only past the terrain
+            public float TerrainMaxHeight;  // (Atmosphere.TerrainCover); 0 = no terrain
+            public Vector3 TerrainOrigin;
+            public Vector2 TerrainSize;
+            private Vector2 _pad0;
         }
 
         public static PointLightBuffer? Instance { get; private set; }

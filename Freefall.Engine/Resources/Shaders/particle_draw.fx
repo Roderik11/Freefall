@@ -71,6 +71,7 @@ struct VSOutput
     nointerpolation float SoftRange  : TEXCOORD3;  // <= 0: soft particles off
     float2 NextTexCoord : TEXCOORD4;               // the following flipbook frame
     nointerpolation float FrameBlend : TEXCOORD5;  // 0..1 towards it; 0 = no cross-fade
+    nointerpolation float SkyVisible : TEXCOORD6;  // how much sky the particle sees past the terrain (scales the haze in front)
 };
 
 VSOutput VS(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
@@ -99,8 +100,9 @@ VSOutput VS(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
     // Premultiplied: only the light scales, not how much of the background it hides. Forward mode: a lit particle's
     // colour is an albedo under the sky and the sun, else a luminance (nits) pre-exposed as a light source.
     // Transparent mode writes an albedo the composition lights (LightScale 1).
+    output.SkyVisible = e.RenderMode == PARTICLE_MODE_FORWARD ? SkyVisibility(core.Position, float3(0, 1, 0)) : 1.0;
     if (e.RenderMode == PARTICLE_MODE_FORWARD && (e.Flags & PARTICLE_FLAG_LIT) != 0)
-        output.Color.rgb *= ParticleLight();
+        output.Color.rgb *= ParticleLight() * output.SkyVisible;
     else
         output.Color.rgb *= LightScale;
     if (e.FadeInRate > 0.0)
@@ -261,7 +263,7 @@ float4 PS(VSOutput input) : SV_Target0
     if (ApplyFog != 0 && FogEnabled > 0.0 && AtmosphereIdx != 0)
     {
         float4 ap = AtmosphereAerialPerspective(LoadAtmosphere(), input.Position.xy / ViewportSize, input.Depth);
-        finalColor.rgb = finalColor.rgb * ap.a + ap.rgb * finalColor.a;
+        finalColor.rgb = finalColor.rgb * ap.a + ap.rgb * (finalColor.a * input.SkyVisible);   // no lit haze in a cave
     }
     return finalColor;
 }

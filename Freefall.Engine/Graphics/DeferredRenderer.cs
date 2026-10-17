@@ -880,6 +880,7 @@ namespace Freefall.Graphics
              var c0 = new Vector4(cvp.M11, cvp.M21, cvp.M31, cvp.M41);
              var c1 = new Vector4(cvp.M12, cvp.M22, cvp.M32, cvp.M42);
              var c3 = new Vector4(cvp.M14, cvp.M24, cvp.M34, cvp.M44);
+             var terrain = Atmosphere.TerrainCover;
 
              var p = _lightFrameParams![frameIdx].WritePtr<PointLightBuffer.FrameParams>();
              *p = new PointLightBuffer.FrameParams
@@ -899,6 +900,10 @@ namespace Freefall.Graphics
                  ShadowBudget = (uint)Math.Clamp(Engine.Settings.MaxShadowedPointLights, 0, LocalShadows.MaxLights),
                  Frame = _lightFrame,
                  Lamps = Daylight.Lamps,
+                 TerrainHeightmap = terrain.Heightmap,
+                 TerrainMaxHeight = terrain.MaxHeight,
+                 TerrainOrigin = terrain.Origin,
+                 TerrainSize = terrain.Size,
              };
         }
 
