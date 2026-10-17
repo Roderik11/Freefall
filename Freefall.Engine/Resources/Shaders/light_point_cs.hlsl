@@ -302,9 +302,13 @@ void CSPointLight(
         if (NdotL <= 0.0 && !isVegetation)
             continue;
 
-        // Attenuation: smooth quadratic falloff
-        float attenuation = saturate(1.0 - (dist / light.Range));
-        attenuation *= attenuation;
+        // Inverse square (Intensity is candela: lux at 1 m), with a smooth window to nothing at Range (Karis 2013:
+        // (1 - (d/R)^4)^2) and no closer than 10 cm
+        float r4 = dist / light.Range;
+        r4 *= r4;
+        r4 *= r4;
+        float window = saturate(1.0 - r4);
+        float attenuation = window * window / max(dist * dist, 0.01);
 
         // Shadow: leaves lit from behind push off their side facing the light
         float shadow = PointLightShadow(light, worldPos.xyz, rawNdotL < 0.0 ? -normal : normal, L);
@@ -357,6 +361,6 @@ void CSPointLight(
     if (any(totalLighting > 0))
     {
         RWTexture2D<float4> Output = ResourceDescriptorHeap[OutputUAVIdx];
-        Output[px] += float4(totalLighting * LegacyLightScale, 0);   // intensities in the older units, pre-exposed
+        Output[px] += float4(totalLighting * Exposure, 0);   // radiance (cd/m²), pre-exposed
     }
 }

@@ -546,8 +546,8 @@ namespace Freefall.Editor
         {
             var entity = new Entity("New Point Light");
             var light = entity.AddComponent<PointLight>();
-            light.Intensity = 1;
-            light.Range = 10;
+            light.Lumens = 100;                         // an oil lantern
+            light.Range = PointLight.RangeFor(100);
             MessageDispatcher.Send(Msg.RefreshExplorer);
         }
 

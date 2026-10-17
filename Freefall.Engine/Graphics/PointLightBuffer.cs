@@ -63,10 +63,10 @@ namespace Freefall.Graphics
             public float Time;
             public float PixelsPerMetre;
             public float FadeStep;
-            public float SunLight;          // what the sun adds to a lit surface (× albedo), clouds included
+            public float SunLight;          // lux on a surface facing the sun (or moon), clouds' average shade included
             public uint ShadowBudget;
             public uint Frame;
-            public float Ambient;           // what the sky's ambient adds to an up-facing surface (× albedo)
+            public float Ambient;           // lux from the whole sky on level ground
             public float Lamps;             // Daylight.Lamps: lights marked OnlyWhenDark are scaled by it
             private uint _pad0;
         }
@@ -153,11 +153,13 @@ namespace Freefall.Graphics
             if (slot < 0) return;
 
             int transformSlot = light.Entity?.Transform?.TransformSlot ?? -1;
-            var c = light.Color;
+            // The colour is only the hue: scaled to luminance 1, so Lumens alone says how bright the light is
+            var c = new Vector3(light.Color.R, light.Color.G, light.Color.B);
+            float luminance = 0.2126f * c.X + 0.7152f * c.Y + 0.0722f * c.Z;
             _records.Set(slot, new Record
             {
-                Color = new Vector3(c.R, c.G, c.B),
-                Intensity = light.Intensity,
+                Color = luminance > 1e-4f ? c / luminance : Vector3.Zero,
+                Intensity = light.Lumens / (4f * MathF.PI),     // luminous intensity (candela): lux at 1 m
                 TransformSlot = (uint)Math.Max(transformSlot, 0),
                 Range = light.Range,
                 Flicker = light.Flicker,

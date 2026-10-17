@@ -14,7 +14,7 @@
 struct PointLightRecord
 {
     float3 Color;
-    float Intensity;
+    float Intensity;        // luminous intensity in candela (PointLight.Lumens / 4π): lux at 1 m
     uint TransformSlot;     // the light entity's world matrix in the global transform buffer
     float Range;
     float Flicker;
@@ -28,13 +28,13 @@ struct PointLightRecord
 struct PointLightData
 {
     float3 Color;
-    float Intensity;        // flicker applied
+    float Intensity;        // candela, flicker applied
     float3 Position;        // camera-relative, steady (flicker changes only the intensity)
     float Range;
     uint ShadowLight;       // index into LocalShadowLight[], POINT_LIGHT_NO_SHADOW
     uint Slot;              // registry slot
     uint Flags;             // VISIBLE_LIGHT_OCCLUDED
-    float Score;            // the cull writes luminance × base intensity; the shadow selection its rank score
+    float Score;            // the cull writes luminance × base candela; the shadow selection its rank score
 };
 
 // The camera and frame, per renderer, for the light cull and the shadow selection (not SceneConstants: those
@@ -48,10 +48,10 @@ struct PointLightFrame
     float Time;                             // flicker clock (Time.TotalTime)
     float PixelsPerMetre;                   // on-screen pixels of 1 m seen from 1 m (height / 2 × cot(fovY / 2))
     float FadeStep;                         // shadow fade per frame (Δt / fade time)
-    float SunLight;                         // what the sun adds to a lit surface (× albedo), clouds included
+    float SunLight;                         // lux on a surface facing the sun (or moon), clouds' average shade included
     uint ShadowBudget;                      // MaxShadowedPointLights
     uint Frame;                             // this renderer's frame count, from 1
-    float Ambient;                          // what the sky's ambient adds to an up-facing surface (× albedo)
+    float Ambient;                          // lux from the whole sky on level ground
     float Lamps;                            // Daylight.Lamps: 0 = street lamps out, 1 = lit
     uint _pad;
 };

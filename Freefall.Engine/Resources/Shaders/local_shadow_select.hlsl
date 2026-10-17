@@ -251,12 +251,11 @@ float SunVisibility(float3 worldPos)
 }
 
 // How much the light outshines the daylight around it: 0 when the sun and sky drown it, 1 when the light rules its
-// surroundings. All as what each adds to a lit surface's albedo: the light's diffuse is intensity × colour / π, taken a
-// third of its range out where its falloff leaves (2/3)²; the sun's π × intensity × colour (light_directional_cs) loses
-// the π the same way; the sky's ambient adds frame.Ambient (composition_cs) in sun and shade alike.
+// surroundings. All in lux: the light's a third of its range out (candela / d², its window leaves 0.975 there), the
+// sun's on a surface facing it where the cascades see it, the sky's on level ground.
 float SunFactor(PointLightData light, PointLightFrame frame)
 {
-    float own = light.Score * (4.0 / 9.0) / 3.14159;   // the cull's luminance × base intensity
+    float own = light.Score * 0.975 * 9.0 / max(light.Range * light.Range, 1e-4);   // the cull's luminance × base candela
     float sun = frame.SunLight > 0.0 ? frame.SunLight * SunVisibility(light.Position + frame.CameraPosition) : 0.0;
     float dominance = own / max(own + sun + frame.Ambient, 1e-6);
     return smoothstep(0.25, 0.5, dominance);

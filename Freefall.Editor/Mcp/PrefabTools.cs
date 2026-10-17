@@ -115,10 +115,10 @@ namespace Freefall.Editor.Mcp
                 foreach (var (t, path) in nodes)
                     foreach (var l in t.Entity.Components.OfType<PointLight>())
                     {
-                        bool works = l.Enabled && l.Intensity > 0f && l.Range > 0f;
+                        bool works = l.Enabled && l.Lumens > 0f && l.Range > 0f;
                         lights.Add(new JsonObject
                         {
-                            ["path"] = path, ["position"] = V(t.WorldPosition), ["intensity"] = R(l.Intensity),
+                            ["path"] = path, ["position"] = V(t.WorldPosition), ["lumens"] = R(l.Lumens),
                             ["range"] = R(l.Range), ["color"] = new JsonArray(R(l.Color.R), R(l.Color.G), R(l.Color.B)),
                             ["works"] = works,
                         });

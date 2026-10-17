@@ -304,7 +304,7 @@ namespace Freefall.Editor.Mcp
         }
 
         [McpServerTool(Name = "entity_set_properties", Title = "Set component properties", Idempotent = true, OpenWorld = false)]
-        [Description("Set public fields/properties on one component of an entity, e.g. component='PointLight', values={\"Intensity\": 4, \"Color\": [1,0.8,0.6]}. " +
+        [Description("Set public fields/properties on one component of an entity, e.g. component='PointLight', values={\"Lumens\": 300, \"Color\": [1,0.8,0.6]}. " +
                      "Member names are exact PascalCase (see entity_get). Applied in order; stops at the first failure (earlier ones stay applied). " +
                      "Also works for component='Transform'.")]
         public static async Task<CallToolResult> SetProperties(

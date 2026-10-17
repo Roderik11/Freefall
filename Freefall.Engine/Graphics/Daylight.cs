@@ -12,13 +12,12 @@ namespace Freefall.Graphics
     /// sky) falls below <see cref="LampsOnBelowLux"/>, out again above <see cref="LampsOffAboveLux"/>, so a cloud
     /// passing at the mark does not blink them. Clear Day (SunAzimuth 161.2, Day 1): noon ~50000 lux, 18:00 ~940,
     /// 18:20 ~50, 18:35 ~1.5 (lamps on), 18:45 ~0.06, 19:00 ~0.001 (no moon up); a thunderstorm noon is still thousands
-    /// of lux, so storms by day do not light the lamps. The point light shadow selection weighs a light against the
-    /// daylight in the older light units (<see cref="SunLight"/>, <see cref="SkyAmbient"/>, local_shadow_select.hlsl), a
-    /// ratio the exposure does not touch.
+    /// of lux, so storms by day do not light the lamps. The point light shadow selection weighs a light's lux against
+    /// the daylight's (<see cref="SunIlluminance"/>, <see cref="SkyIlluminance"/>, local_shadow_select.hlsl).
     /// </summary>
     public static class Daylight
     {
-        public const float LampsOnBelowLux = 1f;      // about where the auto exposure reaches ExposureMinEV at dusk
+        public const float LampsOnBelowLux = 1f;      // ~18:37 on a clear evening (stage 0 lamps: 18:40-18:50)
         public const float LampsOffAboveLux = 2f;
         public const float LampFadeSeconds = 1.5f;
 
@@ -59,52 +58,51 @@ namespace Freefall.Graphics
             LampsChanged?.Invoke();
         }
 
-        // What the sun adds to a lit surface, as a multiple of its albedo: light_directional_cs's π × intensity × colour
-        // through Lambert's 1/π, dimmed by the clouds' average shade (coverage × cloud shadow strength), so overcast
-        // days count as dark. 0 without an enabled directional light.
-        public static float SunLight()
-        {
-            foreach (var sun in ComponentCache<DirectionalLight>.All)
-            {
-                if (!sun.Enabled) continue;
-                float clouds = 1f - SkyboxRenderer.CurrentCloudShadowStrength * SkyboxRenderer.CurrentCloudCoverage;
-                return sun.Intensity * Luminance(sun.Color.R, sun.Color.G, sun.Color.B) * Math.Clamp(clouds, 0f, 1f);
-            }
-            return 0f;
-        }
-
         /// <summary>
-        /// Illuminance on level open ground in lux: the directional light (the sun, or at night the brightest moon)
-        /// after the air, at its height and through the clouds' average shade, plus the whole sky's light (read back
-        /// from the atmosphere's ambient pass a few frames late). 0 without a sky.
+        /// Illuminance on level open ground in lux: <see cref="SunIlluminance"/> at the light's height plus
+        /// <see cref="SkyIlluminance"/>. 0 without a sky.
         /// </summary>
         public static float GroundIlluminance()
         {
             if (ComponentCache<SkyboxRenderer>.All.Count == 0)
                 return 0f;
-            float direct = 0f;
+            float height = 0f;
             foreach (var sun in ComponentCache<DirectionalLight>.All)
             {
                 if (!sun.Enabled) continue;
-                // Intensity is lux × ReferenceExposure / π (SkyboxRenderer); Forward points from the light to the ground
-                float normal = sun.Intensity * MathF.PI / Atmosphere.ReferenceExposure * Luminance(sun.Color.R, sun.Color.G, sun.Color.B);
-                float height = MathF.Max(-sun.Transform.Forward.Y, 0f);
-                float clouds = Math.Clamp(1f - SkyboxRenderer.CurrentCloudShadowStrength * SkyboxRenderer.CurrentCloudCoverage, 0f, 1f);
-                direct = normal * height * clouds;
+                height = MathF.Max(-sun.Transform.Forward.Y, 0f);   // Forward points from the light to the ground
                 break;
             }
-            return direct + SkyAmbient() * MathF.PI / Atmosphere.ReferenceExposure;
+            return SunIlluminance() * height + SkyIlluminance();
         }
 
-        // What the sky's ambient adds to an up-facing surface, as a multiple of its albedo, in the same older units:
-        // sky_common.fx's SkyAmbientLight(), read back from the atmosphere's ambient pass a few frames late. 0 without a
-        // sky.
-        public static float SkyAmbient()
+        /// <summary>
+        /// Lux on a surface facing the directional light (the sun, or at night the brightest moon) after the air,
+        /// through the clouds' average shade (coverage × cloud shadow strength). 0 without an enabled directional light.
+        /// </summary>
+        public static float SunIlluminance()
+        {
+            foreach (var sun in ComponentCache<DirectionalLight>.All)
+            {
+                if (!sun.Enabled) continue;
+                // Intensity is lux × ReferenceExposure / π (SkyboxRenderer)
+                float normal = sun.Intensity * MathF.PI / Atmosphere.ReferenceExposure * Luminance(sun.Color.R, sun.Color.G, sun.Color.B);
+                float clouds = Math.Clamp(1f - SkyboxRenderer.CurrentCloudShadowStrength * SkyboxRenderer.CurrentCloudCoverage, 0f, 1f);
+                return normal * clouds;
+            }
+            return 0f;
+        }
+
+        /// <summary>
+        /// Lux from the whole sky on level ground (sky_common.fx's SkyAmbientLight × π), read back from the atmosphere's
+        /// ambient pass a few frames late. 0 without a sky.
+        /// </summary>
+        public static float SkyIlluminance()
         {
             if (ComponentCache<SkyboxRenderer>.All.Count == 0)
                 return 0f;
             var sky = Atmosphere.SkyAmbientLegacy;
-            return Luminance(sky.X, sky.Y, sky.Z);
+            return Luminance(sky.X, sky.Y, sky.Z) * MathF.PI / Atmosphere.ReferenceExposure;
         }
 
         private static float Luminance(float r, float g, float b) => 0.2126f * r + 0.7152f * g + 0.0722f * b;

@@ -62,10 +62,11 @@ bool CullLight(uint slot, PointLightFrame frame, out PointLightRecord r, out flo
     return importance > 0.0;
 }
 
-// Half-octave bands: the position within one is frac(log2(importance) × 2)
+// Half-octave bands: the position within one is frac(log2(importance) × 2). Importance runs from ~2^-2 (a candle far
+// off) to ~2^28 (a campfire's 240 cd filling the screen): the offset keeps that inside the 64 bands.
 uint ImportanceBin(float importance)
 {
-    return (uint)clamp((int)floor(log2(importance) * 2.0) + 16, 0, (int)IMPORTANCE_BINS - 1);
+    return (uint)clamp((int)floor(log2(importance) * 2.0) + 4, 0, (int)IMPORTANCE_BINS - 1);
 }
 
 [numthreads(64, 1, 1)]
