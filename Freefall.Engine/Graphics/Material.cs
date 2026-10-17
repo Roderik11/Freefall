@@ -94,7 +94,6 @@ namespace Freefall.Graphics
             {
                 _value = value;
                 _apply?.Invoke(Material, value);
-                Material?.NotifyPropertyChanged(this);
             }
         }
 
@@ -221,12 +220,12 @@ namespace Freefall.Graphics
 
         /// <summary>
         /// Set a material property by name (an effect setting or a MaterialData one). False if there is none of
-        /// that name and type. On an instance (<see cref="CreateInstance"/>) the property is its own from then on.
+        /// that name and type. This changes the material for everything drawn with it; a value for one object
+        /// is per-object data (the effect's struct Instance, PersistentRenderer.SetInstance).
         /// </summary>
         public bool SetProperty<T>(string name, T value) where T : struct
         {
             if (GetProperty(name) is not MaterialProperty<T> p) return false;
-            if (_parent != null) _overridden.Add(name);
             p.Value = value;
             return true;
         }
@@ -365,41 +364,6 @@ namespace Freefall.Graphics
 
             lock (_liveMaterials) _liveMaterials.Add(new WeakReference<Material>(this));
             _built = true;
-        }
-
-        /// <summary>Raised when one of its properties is set: inspector, MCP, load, script.</summary>
-        public event Action<MaterialProperty>? PropertyChanged;
-
-        internal void NotifyPropertyChanged(MaterialProperty property) => PropertyChanged?.Invoke(property);
-
-        // An instance (CreateInstance): the material it follows, and the properties set on it, which no longer do
-        private Material? _parent;
-        private readonly HashSet<string> _overridden = new();
-
-        /// <summary>
-        /// A material instance for one object: this material's effect, textures and property values, so a
-        /// script can change some of them for that object alone (each bindstone's pulse) without touching the
-        /// shared asset. It follows later changes to this material (the inspector, the MCP), except for the
-        /// properties set on the instance (<see cref="SetProperty{T}"/>), which are its own from then on.
-        /// It is not saved. Dispose it when the object goes: that also stops it following.
-        /// </summary>
-        public Material CreateInstance()
-        {
-            var instance = new Material(Effect) { Name = Name + " (instance)" };
-            foreach (var (slot, texture) in _textures)
-                instance.SetTexture(slot, texture);
-            foreach (var p in MaterialProperties)
-                instance.GetProperty(p.Name)?.CopyFrom(p);
-
-            instance._parent = this;
-            PropertyChanged += instance.FollowParent;
-            return instance;
-        }
-
-        private void FollowParent(MaterialProperty property)
-        {
-            if (!_overridden.Contains(property.Name))
-                GetProperty(property.Name)?.CopyFrom(property);
         }
 
         /// <summary>
@@ -1416,15 +1380,7 @@ namespace Freefall.Graphics
 
         public void Dispose()
         {
-            // An instance stops following its parent
-            if (_parent != null)
-            {
-                _parent.PropertyChanged -= FollowParent;
-                _parent = null;
-            }
-
-            // Frames in flight may still draw with these buffers (a script disposing its instance as the
-            // object goes): release them when those frames are done
+            // Frames in flight may still draw with these buffers: release them when those frames are done
             var device = Freefall.Engine.Device;
             foreach (var cb in _constantBuffers.Values)
             {

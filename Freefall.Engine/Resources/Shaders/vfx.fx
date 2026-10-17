@@ -53,6 +53,7 @@ struct Settings
 {
     float3 Color;            //= 1, 1, 1         -- Colour of the glow
     float  Intensity;        //= 1               -- Brightness (HDR: above 1 glows and blooms)
+    float  DayIntensity;     //= 1 [0, 20]       -- By day, Intensity times this: a glow that must stand out against a bright sky (night = 1; dusk in between, as the sky blends)
     float  Body;             //= 1               -- How it thins towards its outline: |N.V| to this power (0 = flat, higher = a thinner, softer body)
     float  Axial;            //= 0 [0, 1]        -- 1 for tubes and cones: thickness measured round the local Y axis, and brighter seen along it (more of it in the line of sight); 0 for spheres and blobs
     float  Rim;              //= 0               -- Extra glow at the outline
@@ -101,6 +102,17 @@ Instance LoadInstance(uint slot)
 {
     ByteAddressBuffer all = ResourceDescriptorHeap[InstanceDataIdx];
     return all.Load<Instance>(slot * 128u);
+}
+
+// How much it is day, 0..1, from the sun's height: the sky's own blend (SkyboxRenderer.ComputeDayNightFactors)
+float DayFactor()
+{
+    float e = FogSunDirection.y;
+    float day = pow(saturate(e / 0.8), 0.7);
+    float sunset = (e < 0.15 && e > -0.2) ? max(0.0, 1.0 - abs((e + 0.025) / 0.175)) : 0.0;
+    float night = saturate((-e - 0.15) / 0.3);
+    float total = day + sunset + night;
+    return total > 0.0 ? day / total : 0.0;
 }
 
 // ── Noise ──
@@ -331,7 +343,8 @@ float4 PS(VSOutput input) : SV_Target0
     if (S.FadeEnds.x > 0.0) ends *= smoothstep(0.0, S.FadeEnds.x, uv.y);
     if (S.FadeEnds.y > 0.0) ends *= 1.0 - smoothstep(1.0 - S.FadeEnds.y, 1.0, uv.y);
 
-    float3 light = S.Color * I.Color * S.Intensity * I.Intensity * gain * ((body * shade + rim) * ends + edge * 2.0);
+    float intensity = S.Intensity * lerp(1.0, S.DayIntensity, DayFactor()) * I.Intensity;
+    float3 light = S.Color * I.Color * intensity * gain * ((body * shade + rim) * ends + edge * 2.0);
 
     // Light seen through fog fades with it
     if (FogEnabled > 0)
