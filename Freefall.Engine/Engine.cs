@@ -173,6 +173,7 @@ namespace Freefall
         }
 
         private static readonly ProfilerMarker _disposalsMarker = ProfilerMarker.Get("Deferred disposals");
+        private static readonly ProfilerMarker _assetReimportMarker = ProfilerMarker.Get("Asset reimport");
         private static readonly ProfilerMarker _assetReloadMarker = ProfilerMarker.Get("Asset reload");
         private static readonly ProfilerMarker _shaderReloadMarker = ProfilerMarker.Get("Shader reload");
         private static readonly ProfilerMarker _physicsMarker = ProfilerMarker.Get("Physics");
@@ -197,6 +198,10 @@ namespace Freefall
                 Graphics.InstanceBatch.FlushDeferredDisposals();
                 Device?.FlushFrameDeferredDisposals();
             }
+
+            // A forced reimport (folder Reimport, MCP asset_reimport) imports a few files per frame
+            using (_assetReimportMarker.Auto())
+                AssetDatabase.TickReimports();
 
             // Hot-reload loaded assets whose source was reimported (auto-import, asset_refresh, inspector
             // reimport). Before Update/Draw so the whole frame sees the new data.

@@ -60,6 +60,295 @@ namespace Freefall.Editor.Commands
         }
     }
 
+    /// <summary>
+    /// Shared by the commands that start a forced reimport (AssetDatabase.ReimportFiles): the answers for a
+    /// running job, a started one and a finished one.
+    /// </summary>
+    internal static class ReimportResults
+    {
+        public static CommandResult Busy(ReimportJob running) => CommandResult.Error(409,
+            $"A reimport is running: {running.Describe()}. It goes on by itself (console_log shows its progress); " +
+            "start another one when it is done.");
+
+        public static object Started(ReimportJob job) => new
+        {
+            status = "started",
+            path = job.Label,
+            total = job.Total,
+            note = "Importing a few files per frame; console_log shows the progress, the last line the result.",
+        };
+
+        public static object Finished(ReimportJob job) => new
+        {
+            status = job.Aborted ? "aborted" : "reimported",
+            path = job.Label,
+            total = job.Total,
+            imported = job.Imported,
+            failed = job.Failed,
+            failedPaths = job.FailedPaths.Take(50).ToArray(),
+            reloaded = job.Reloaded,
+            seconds = Math.Round(job.Elapsed.TotalSeconds, 1),
+        };
+
+        /// <summary>Run 'start' on the main thread; if it started a job and the caller waits, answer when the job ends.</summary>
+        public static async Task<CommandResult> StartAndWaitAsync(Func<(CommandResult result, ReimportJob job, bool wait)> start,
+            Func<ReimportJob, object> finished)
+        {
+            var (result, job, wait) = await EditorCommandServer.Instance.RunOnMainThread(start);
+            if (job == null || !wait) return result;
+
+            // No time limit: a caller that gives up leaves the job running, it never depended on this wait
+            return CommandResult.Json(finished(await job.Completion));
+        }
+
+        /// <summary>Extensions from a JSON array of strings, or null.</summary>
+        public static string[] ParseExtensions(JsonElement root) =>
+            root.TryGetProperty("extensions", out var e) && e.ValueKind == JsonValueKind.Array
+                ? e.EnumerateArray().Select(x => x.GetString()).Where(x => !string.IsNullOrWhiteSpace(x)).ToArray()
+                : null;
+
+        public static bool ParseBool(JsonElement root, string name, bool fallback) =>
+            root.TryGetProperty(name, out var b) && (b.ValueKind == JsonValueKind.True || b.ValueKind == JsonValueKind.False)
+                ? b.GetBoolean() : fallback;
+    }
+
+    /// <summary>
+    /// Reimport every tracked file under a folder of Assets (or one file), changed or not: for cache files that
+    /// predate an importer change or new import settings (asset_refresh only imports files newer than their
+    /// last import).
+    /// POST /api/assets/reimport
+    /// Body: {"path":"Medieval Mega Pack", "extensions":["fbx"], "wait":true}   ("" = all of Assets)
+    /// The files import on the main thread, a few per frame (AssetDatabase.TickReimports): the editor keeps
+    /// drawing and the console shows the progress. With wait the answer comes after the last file; a caller
+    /// that times out leaves the reimport running, and a second call answers with its progress.
+    /// </summary>
+    [CommandRoute("POST", "/api/assets/reimport")]
+    public class ReimportAssetsCommand : EditorCommand, IAsyncEditorCommand
+    {
+        // Synchronous fallback: starts the reimport and answers right away
+        public override CommandResult Execute(CommandContext context) => Start(context).result;
+
+        public Task<CommandResult> ExecuteAsync(CommandContext context)
+            => ReimportResults.StartAndWaitAsync(() => Start(context), ReimportResults.Finished);
+
+        private static (CommandResult result, ReimportJob job, bool wait) Start(CommandContext context)
+        {
+            if (!Program.IsProjectOpen)
+                return (CommandResult.Error(409, "No project is open"), null, false);
+
+            using var doc = context.ParseBody();
+            var root = doc.RootElement;
+            if (!root.TryGetProperty("path", out var p) || p.ValueKind != JsonValueKind.String)
+                return (CommandResult.BadRequest("'path' is required: a folder or file relative to Assets, \"\" for all of Assets"), null, false);
+
+            var path = p.GetString().Trim().TrimStart('/', '\\');
+            var extensions = ReimportResults.ParseExtensions(root);
+            bool wait = ReimportResults.ParseBool(root, "wait", true);
+
+            if (AssetDatabase.ActiveReimport is { } running)
+                return (ReimportResults.Busy(running), null, false);
+
+            var fullPath = Path.Combine(Engine.Project.AssetsDirectory, path);
+            if (!Directory.Exists(fullPath) && AssetDatabase.PathToGuid(path) == null)
+                return (CommandResult.NotFound($"No folder or tracked file '{path}' in Assets"), null, false);
+
+            if (AssetDatabase.GetPathsInFolder(path, extensions).Count == 0)
+                return (CommandResult.NotFound($"No importable files in '{path}'"
+                    + (extensions != null ? $" with extension {string.Join(", ", extensions)}" : "")), null, false);
+
+            var job = AssetDatabase.ReimportFolder(path, extensions);
+            return (CommandResult.Json(ReimportResults.Started(job)), job, wait);
+        }
+    }
+
+    /// <summary>
+    /// Import settings of a source file: its importer's members as the meta stores them.
+    /// GET /api/asset/import-settings?path=Pack/Rock.fbx   (or the file's GUID, or a sub-asset's GUID)
+    /// </summary>
+    [CommandRoute("GET", "/api/asset/import-settings")]
+    public class GetImportSettingsCommand : EditorCommand
+    {
+        public override CommandResult Execute(CommandContext context)
+        {
+            if (!Program.IsProjectOpen)
+                return CommandResult.Error(409, "No project is open");
+
+            var query = CommandHelpers.ParseQueryString(context.Path);
+            if (!query.TryGetValue("path", out var path) || string.IsNullOrWhiteSpace(path))
+                return CommandResult.BadRequest("Query parameter 'path' is required (file relative to Assets, or a GUID)");
+
+            var guid = ImportSettings.ResolveSourceGuid(path);
+            if (guid == null)
+                return CommandResult.NotFound($"No tracked file or GUID '{path}'");
+
+            var importer = AssetDatabase.GetImporter(guid);
+            if (importer == null)
+                return CommandResult.BadRequest($"'{AssetDatabase.GuidToPath(guid)}' has no importer");
+
+            return CommandResult.Json(new
+            {
+                path = AssetDatabase.GuidToPath(guid),
+                guid,
+                importer = importer.GetType().Name,
+                settings = ImportSettings.Read(importer),
+            });
+        }
+    }
+
+    /// <summary>
+    /// Set import settings on one source file or on every tracked file under a folder, save them to the
+    /// metas and (by default) reimport the changed files.
+    /// POST /api/asset/import-settings
+    /// Body: {"path":"Pack/Rocks", "values":{"LODPixelError":6}, "extensions":["fbx"], "reimport":true, "wait":true}
+    /// In a folder only files whose importer has every given setting change (a texture has no LODPixelError);
+    /// the rest are counted as skipped. Nothing is saved if a value does not convert. The reimport is a
+    /// forced one (AssetDatabase.ReimportFiles), with the same progress and waiting as /api/assets/reimport.
+    /// </summary>
+    [CommandRoute("POST", "/api/asset/import-settings")]
+    public class SetImportSettingsCommand : EditorCommand, IAsyncEditorCommand
+    {
+        // Synchronous fallback: saves, starts the reimport and answers right away
+        public override CommandResult Execute(CommandContext context) => Start(context, out _).result;
+
+        public Task<CommandResult> ExecuteAsync(CommandContext context)
+        {
+            object saved = null;
+            return ReimportResults.StartAndWaitAsync(() => Start(context, out saved),
+                job => new { status = "saved", saved, reimport = ReimportResults.Finished(job) });
+        }
+
+        private static (CommandResult result, ReimportJob job, bool wait) Start(CommandContext context, out object saved)
+        {
+            saved = null;
+            if (!Program.IsProjectOpen)
+                return (CommandResult.Error(409, "No project is open"), null, false);
+
+            using var doc = context.ParseBody();
+            var root = doc.RootElement;
+            string path = root.TryGetProperty("path", out var p) ? p.GetString()?.Trim().TrimStart('/', '\\') : null;
+            if (string.IsNullOrWhiteSpace(path))
+                return (CommandResult.BadRequest("'path' is required: a file or folder relative to Assets, or a GUID"), null, false);
+            if (!root.TryGetProperty("values", out var values) || values.ValueKind != JsonValueKind.Object
+                || !values.EnumerateObject().Any())
+                return (CommandResult.BadRequest("'values' is required: an object of setting name → value"), null, false);
+
+            var extensions = ReimportResults.ParseExtensions(root);
+            bool reimport = ReimportResults.ParseBool(root, "reimport", true);
+            bool wait = ReimportResults.ParseBool(root, "wait", true);
+
+            if (reimport && AssetDatabase.ActiveReimport is { } running)
+                return (ReimportResults.Busy(running), null, false);
+
+            // One file (path or GUID), or every tracked file under a folder
+            List<string> guids;
+            var fileGuid = ImportSettings.ResolveSourceGuid(path);
+            bool single = fileGuid != null;
+            if (single)
+                guids = new List<string> { fileGuid };
+            else if (Directory.Exists(Path.Combine(Engine.Project.AssetsDirectory, path)))
+                guids = AssetDatabase.GetPathsInFolder(path, extensions).Select(AssetDatabase.PathToGuid).Where(g => g != null).ToList();
+            else
+                return (CommandResult.NotFound($"No tracked file, GUID or folder '{path}'"), null, false);
+
+            // Apply in memory first: nothing is saved if a value fails to convert
+            var changed = new List<(string guid, IImporter importer)>();
+            var skipped = new Dictionary<string, int>();
+            object applied = null;
+            foreach (var guid in guids)
+            {
+                var importer = AssetDatabase.GetImporter(guid);
+                var names = importer != null ? AssetDatabase.GetImporterSettingNames(importer) : new List<string>();
+                var missing = values.EnumerateObject().Select(v => v.Name).Where(n => !names.Contains(n)).ToList();
+                if (importer == null || missing.Count > 0)
+                {
+                    if (single)
+                        return (CommandResult.BadRequest(importer == null
+                            ? $"'{AssetDatabase.GuidToPath(guid)}' has no importer"
+                            : $"Not a setting of {importer.GetType().Name}: {string.Join(", ", missing)}. Its settings: {string.Join(", ", names)}"),
+                            null, false);
+                    var key = importer?.GetType().Name ?? "no importer";
+                    skipped[key] = skipped.GetValueOrDefault(key) + 1;
+                    continue;
+                }
+
+                try
+                {
+                    applied = ImportSettings.Apply(importer, values);
+                }
+                catch (Exception ex)
+                {
+                    return (CommandResult.BadRequest($"{AssetDatabase.GuidToPath(guid)}: {ex.Message} (nothing saved)"), null, false);
+                }
+                changed.Add((guid, importer));
+            }
+
+            if (changed.Count == 0)
+                return (CommandResult.BadRequest($"No file in '{path}' has the settings {string.Join(", ", values.EnumerateObject().Select(v => v.Name))}"
+                    + (skipped.Count > 0 ? $" (importers there: {string.Join(", ", skipped.Select(s => $"{s.Key} ×{s.Value}"))})" : "")), null, false);
+
+            foreach (var (guid, importer) in changed)
+                AssetDatabase.SaveImporter(guid, importer);
+
+            saved = new
+            {
+                changed = changed.Count,
+                skipped = skipped.Count > 0 ? skipped : null,
+                applied,
+            };
+
+            if (!reimport)
+                return (CommandResult.Json(new { status = "saved", saved, note = "Not reimported: asset_reimport applies the settings" }), null, false);
+
+            var label = single ? AssetDatabase.GuidToPath(changed[0].guid) : path.Replace('/', '\\').Trim('\\');
+            var job = AssetDatabase.ReimportFiles(changed.Select(c => AssetDatabase.GuidToPath(c.guid)), label);
+            return (CommandResult.Json(new { status = "saved", saved, reimport = ReimportResults.Started(job) }), job, wait);
+        }
+    }
+
+    /// <summary>Reading and writing importer settings by member name (any IImporter, through reflection).</summary>
+    internal static class ImportSettings
+    {
+        /// <summary>Source GUID for a path relative to Assets, a source GUID or a sub-asset GUID; null if none is tracked.</summary>
+        public static string ResolveSourceGuid(string pathOrGuid) =>
+            AssetDatabase.PathToGuid(pathOrGuid) ?? AssetDatabase.GetMeta(pathOrGuid)?.Guid;
+
+        /// <summary>Every setting the meta stores, name → value, in the importer's order.</summary>
+        public static Dictionary<string, object> Read(IImporter importer)
+        {
+            var settings = new Dictionary<string, object>();
+            foreach (var name in AssetDatabase.GetImporterSettingNames(importer))
+            {
+                var field = Freefall.Reflection.Reflector.GetField(importer.GetType(), name);
+                try { settings[name] = CommandHelpers.SerializeValue(field?.GetValue(importer)); }
+                catch { settings[name] = "<error>"; }
+            }
+            return settings;
+        }
+
+        /// <summary>
+        /// Set the given members on the importer and return them as read back. A TextureImporter is marked
+        /// UserConfigured, as the texture inspector's Apply does: otherwise its import guesses sRGB and format
+        /// from the file name again and overwrites what was set.
+        /// </summary>
+        public static Dictionary<string, object> Apply(IImporter importer, JsonElement values)
+        {
+            var type = importer.GetType();
+            var applied = new Dictionary<string, object>();
+            foreach (var kv in values.EnumerateObject())
+            {
+                var field = Freefall.Reflection.Reflector.GetField(type, kv.Name)
+                    ?? throw new InvalidOperationException($"'{kv.Name}' not found on {type.Name}");
+                field.SetValue(importer, SetPropertyCommand.ConvertJsonValue(kv.Value, field.Type));
+                applied[kv.Name] = CommandHelpers.SerializeValue(field.GetValue(importer));
+            }
+
+            if (importer is Freefall.Assets.Importers.TextureImporter texture && !applied.ContainsKey(nameof(texture.UserConfigured)))
+                texture.UserConfigured = true;
+
+            return applied;
+        }
+    }
+
     [CommandRoute("GET", "/api/assets/list")]
     public class ListAssetsCommand : EditorCommand
     {

@@ -38,6 +38,9 @@ namespace Freefall.Editor.Mcp
             Assets
             - The editor loads assets from its Library cache: editing .asset files on disk does NOT reach it. Use asset_set_properties
               (saves + reimports), and asset_create for new assets. Material texture slots: material_set_textures.
+            - Import settings of source files (models, textures, audio, ...) are not asset members: asset_get_import_settings /
+              asset_set_import_settings (one file or a whole folder). asset_reimport forces a reimport of a folder whose files did
+              not change (after an importer change); asset_refresh only imports files newer than their last import.
 
             Placement & PCG (prefer PCG for anything repeated)
             - Scatter vegetation, rocks, clutter, lanterns etc. with PCG: an entity with a Spline (closed = area) and a

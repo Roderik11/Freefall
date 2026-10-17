@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <RootNamespace>ReimportTest</RootNamespace>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>disable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\Freefall.Engine\Freefall.Engine.csproj" />
+    <!-- PhysX's native runtime files, as the editor copies them: without them PhysX.Net.dll does not load, so the
+         engine assembly's GetTypes fails and the AssetDatabase discovers no importers -->
+    <PackageReference Include="PhysX.Net" Version="5.0.1-alpha1" GeneratePathProperty="true" />
+  </ItemGroup>
+
+  <Import Project="$(PkgPhysX_Net)\lib\RuntimeFiles.targets" Condition="'$(PkgPhysX_Net)' != ''" />
+
+</Project>

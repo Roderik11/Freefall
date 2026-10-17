@@ -65,6 +65,16 @@ namespace Freefall.Assets
         private static readonly ConcurrentQueue<(string guid, long stamp)> _reimportedGuids = new();
         private static long _importStamp;
 
+        // Importer instances GetImporter handed out → the source GUID they were made for. An importer does not
+        // know its file, and the inspector's Apply & Reimport has only the instance.
+        private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<IImporter, string> _importerSources = new();
+
+        // Forced reimport in progress (ReimportFolder / ReimportFiles), advanced by TickReimports. Main thread.
+        private static ReimportJob _activeReimport;
+        // Per frame a reimport imports files until this is spent, at least one
+        private const double ReimportFrameBudgetMs = 100;
+        private const double ReimportProgressIntervalSeconds = 2;
+
         /// <summary>
         /// Monotonic counter bumped by every import. AssetManager records it when an asset is loaded,
         /// so hot reload can skip instances that were loaded after their latest import.
@@ -220,6 +230,135 @@ namespace Freefall.Assets
 
             ImportAsset(meta);
             return true;
+        }
+
+        // ── Forced reimport (asset browser folder Reimport, MCP asset_reimport) ──
+
+        /// <summary>The forced reimport in progress, or null.</summary>
+        public static ReimportJob ActiveReimport => _activeReimport;
+
+        /// <summary>
+        /// Relative paths of the tracked source files under a folder of Assets, sub-folders included, in import
+        /// order. The folder is relative to Assets ("" = all of it) or absolute under it; the path of a tracked
+        /// file gives that file alone. Extensions ("fbx" or ".fbx") limit the result; null or none = every
+        /// importable file. Files deleted since the last scan are left out.
+        /// </summary>
+        public static List<string> GetPathsInFolder(string folder, IEnumerable<string> extensions = null)
+        {
+            if (Project == null) return new List<string>();
+
+            var prefix = NormalizeFolder(folder);
+            var filter = extensions?
+                .Where(e => !string.IsNullOrWhiteSpace(e))
+                .Select(e => e.Trim().StartsWith('.') ? e.Trim() : "." + e.Trim())
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+            if (filter?.Count == 0) filter = null;
+
+            return _guidToMeta.Values
+                .Where(m => IsInFolder(NormalizePath(m.SourcePath), prefix)
+                            && (filter == null || filter.Contains(Path.GetExtension(m.SourcePath)))
+                            && File.Exists(Path.Combine(Project.AssetsDirectory, m.SourcePath)))
+                .OrderBy(m => GetImportPriority(m))
+                .ThenBy(m => m.SourcePath, StringComparer.OrdinalIgnoreCase)
+                .Select(m => m.SourcePath)
+                .ToList();
+        }
+
+        /// <summary>
+        /// Start a forced reimport of every tracked file under a folder (see GetPathsInFolder), changed or not:
+        /// for cache files that predate an importer change or new import settings, which ImportAll does not
+        /// see. It runs a few files per frame (TickReimports). Throws if a reimport is already running.
+        /// </summary>
+        public static ReimportJob ReimportFolder(string folder, IEnumerable<string> extensions = null)
+        {
+            var label = Project != null ? NormalizeFolder(folder) : "";
+            return ReimportFiles(GetPathsInFolder(folder, extensions), label.Length == 0 ? "Assets" : label);
+        }
+
+        /// <summary>
+        /// Start a forced reimport of these source files (relative to Assets) in import order, a few files per
+        /// frame (TickReimports). Throws if a reimport is already running: two would import the same files.
+        /// </summary>
+        public static ReimportJob ReimportFiles(IEnumerable<string> relativePaths, string label)
+        {
+            if (Project == null)
+                throw new InvalidOperationException("No project is open");
+            if (_activeReimport != null)
+                throw new InvalidOperationException($"A reimport is already running: {_activeReimport.Describe()}");
+
+            var paths = relativePaths
+                .Select(NormalizePath)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .OrderBy(GetImportPriority)
+                .ToList();
+
+            _activeReimport = new ReimportJob(label, paths);
+            Debug.LogAlways($"[AssetDatabase] Reimporting {paths.Count} files in '{label}'");
+            return _activeReimport;
+        }
+
+        /// <summary>
+        /// Advance the running reimport: import files until the frame budget is spent (at least one), update
+        /// loaded assets in place, log progress every few seconds, and end the job after its last file. Main
+        /// thread, from Engine.Tick; a tool without an engine loop calls it until the job completes.
+        /// </summary>
+        public static void TickReimports()
+        {
+            var job = _activeReimport;
+            if (job == null) return;
+
+            var frame = System.Diagnostics.Stopwatch.StartNew();
+            while (job.Done < job.Total)
+            {
+                var path = job.Paths[job.Done];
+                bool imported = false;
+                try
+                {
+                    if (_pathToGuid.TryGetValue(path, out var guid) && _guidToMeta.TryGetValue(guid, out var meta))
+                        imported = ImportAsset(meta);
+                    else
+                        Debug.LogWarning("AssetDatabase", $"Not tracked any more, skipped: {path}");
+                }
+                catch (Exception ex)
+                {
+                    Debug.LogWarning("AssetDatabase", $"Unhandled import error: {path} — {ex.Message}");
+                }
+                job.Advance(path, imported);
+
+                if (frame.Elapsed.TotalMilliseconds >= ReimportFrameBudgetMs) break;
+            }
+
+            // What Engine.Tick would reload right after this, counted for the job's result
+            job.Reloaded += Engine.Assets?.ReloadReimported() ?? 0;
+
+            if (job.Done < job.Total)
+            {
+                if (job.ShouldReport(ReimportProgressIntervalSeconds))
+                    Debug.LogAlways($"[AssetDatabase] Reimport {job.Describe()}");
+                return;
+            }
+
+            _activeReimport = null;
+            Debug.LogAlways(job.Summary());
+            job.Complete();
+        }
+
+        private static bool IsInFolder(string path, string folder) =>
+            folder.Length == 0
+            || path.Equals(folder, StringComparison.OrdinalIgnoreCase)
+            || (path.Length > folder.Length && path[folder.Length] == '\\'
+                && path.StartsWith(folder, StringComparison.OrdinalIgnoreCase));
+
+        /// <summary>A folder or file relative to Assets with backslashes and none at either end; an absolute path under Assets is made relative.</summary>
+        private static string NormalizeFolder(string folder)
+        {
+            if (string.IsNullOrWhiteSpace(folder)) return "";
+
+            folder = folder.Trim();
+            if (Path.IsPathFullyQualified(folder))
+                folder = Path.GetRelativePath(Project.AssetsDirectory, Path.GetFullPath(folder));
+            folder = NormalizePath(folder).TrimEnd('\\');
+            return folder == "." ? "" : folder;
         }
 
         // ── Lookups ──
@@ -725,7 +864,22 @@ namespace Freefall.Assets
                 catch { }
             }
 
+            _importerSources.AddOrUpdate(importer, sourceGuidResolved);
             return importer;
+        }
+
+        /// <summary>Source GUID of an importer instance GetImporter returned; null for any other instance.</summary>
+        public static string GetImporterSourceGuid(IImporter importer) =>
+            importer != null && _importerSources.TryGetValue(importer, out var guid) ? guid : null;
+
+        /// <summary>
+        /// Names of an importer's settings: the members its meta stores (what System.Text.Json writes of the
+        /// importer: public instance fields and properties without [JsonIgnore]), in the order they are written.
+        /// </summary>
+        public static List<string> GetImporterSettingNames(IImporter importer)
+        {
+            var json = JsonSerializer.SerializeToElement(importer, importer.GetType(), _importerJsonOptions);
+            return json.EnumerateObject().Select(p => p.Name).ToList();
         }
 
         /// <summary>
@@ -777,6 +931,15 @@ namespace Freefall.Assets
 
         private static void Clear()
         {
+            // A reimport of the previous project's files cannot go on
+            if (_activeReimport != null)
+            {
+                var job = _activeReimport;
+                _activeReimport = null;
+                Debug.LogWarning("AssetDatabase", $"Reimport stopped, the project changed: {job.Describe()}");
+                job.Complete(aborted: true);
+            }
+
             _guidToPath.Clear();
             _pathToGuid.Clear();
             _guidToMeta.Clear();
@@ -1149,19 +1312,22 @@ namespace Freefall.Assets
         /// Import priority from AssetImporterAttribute. Lower = earlier.
         /// Falls back to int.MaxValue for unknown extensions.
         /// </summary>
-        private static int GetImportPriority(MetaFile meta)
+        private static int GetImportPriority(MetaFile meta) => GetImportPriority(meta.SourcePath);
+
+        private static int GetImportPriority(string sourcePath)
         {
-            var ext = Path.GetExtension(meta.SourcePath);
+            var ext = Path.GetExtension(sourcePath);
             return _importerPriority.TryGetValue(ext, out var priority) ? priority : int.MaxValue;
         }
 
-        private static void ImportAsset(MetaFile meta)
+        /// <summary>Import one source file into the cache. False if it could not be imported (the reason is logged).</summary>
+        private static bool ImportAsset(MetaFile meta)
         {
             var sourcePath = Path.Combine(Project.AssetsDirectory, meta.SourcePath);
             if (!File.Exists(sourcePath))
             {
                 Debug.LogWarning("AssetDatabase", $"Source not found: {meta.SourcePath}");
-                return;
+                return false;
             }
 
             // Find importer
@@ -1171,7 +1337,7 @@ namespace Freefall.Assets
                 Debug.LogWarning("AssetDatabase", $"No importer for extension '{ext}'");
                 meta.LastImported = DateTime.UtcNow;
                 WriteMetaFile(meta);
-                return;
+                return false;
             }
 
             var importer = (IImporter)Activator.CreateInstance(importerType);
@@ -1200,7 +1366,7 @@ namespace Freefall.Assets
                 Debug.LogWarning("AssetDatabase", $"Import failed: {meta.SourcePath} — {ex.Message}");
                 meta.LastImported = DateTime.UtcNow;
                 WriteMetaFile(meta);
-                return;
+                return false;
             }
 
             // Pack artifacts to Cache/
@@ -1338,6 +1504,7 @@ namespace Freefall.Assets
             }
 
             Debug.Log($"[AssetDatabase] Imported: {meta.SourcePath} → {meta.SubAssets.Count} artifacts");
+            return true;
         }
 
         /// <summary>

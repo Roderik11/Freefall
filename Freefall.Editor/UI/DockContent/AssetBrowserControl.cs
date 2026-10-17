@@ -541,8 +541,14 @@ namespace Freefall.Editor
 
             row.MouseClick += (s, e) =>
             {
-                if (e.Button > 0) return;
-                SelectFolder(s.Tag as FolderNode);
+                var clicked = s.Tag as FolderNode;
+                if (e.Button > 0)
+                {
+                    if (clicked != null && !clicked.IsVirtual)
+                        ShowFolderContextMenu(clicked.Info);
+                    return;
+                }
+                SelectFolder(clicked);
             };
 
             row.AllowFocus = true;
@@ -1007,7 +1013,11 @@ namespace Freefall.Editor
 
             if (args.Button > 0)
             {
-                if (data.IsSourceCard && !data.IsFolder && !string.IsNullOrEmpty(data.SourceGuid))
+                if (data.IsFolder && data.FolderInfo != null)
+                {
+                    ShowFolderContextMenu(data.FolderInfo);
+                }
+                else if (data.IsSourceCard && !data.IsFolder && !string.IsNullOrEmpty(data.SourceGuid))
                 {
                     _selectedCard = sender as Button;
                     _selectedCardGuid = data.SourceGuid;
@@ -1150,19 +1160,55 @@ namespace Freefall.Editor
 
         // ── Context Menu ──
 
+        private static Window CreateContextMenu() => new Window
+        {
+            Style = "frame",
+            AutoSize = AutoSize.Vertical,
+            Size = new Point(180, 0),
+            MinSize = new Point(180, 0),
+            Position = new Point(Gui.MousePosition.x, Gui.MousePosition.y),
+        };
+
+        private void ShowFolderContextMenu(DirectoryInfo folder)
+        {
+            var desktop = Desktop;
+            if (desktop == null || folder == null) return;
+
+            var menu = CreateContextMenu();
+            AddContextMenuItem(menu, "Reimport", () =>
+            {
+                Desktop.CloseDropdowns();
+                ReimportFolder(folder);
+            });
+
+            menu.PerformLayout();
+            desktop.ShowDropdown(menu, false);
+        }
+
+        /// <summary>
+        /// Reimport every file in the folder and its sub-folders, changed or not (after an importer change, e.g.
+        /// generated LODs). It runs a few files per frame with its progress in the console; the view refreshes
+        /// when it ends.
+        /// </summary>
+        private void ReimportFolder(DirectoryInfo folder)
+        {
+            try
+            {
+                var job = AssetDatabase.ReimportFolder(folder.FullName);
+                job.Completed += _ => RefreshCurrentFolder();
+            }
+            catch (InvalidOperationException ex)
+            {
+                Debug.LogWarning("AssetBrowser", ex.Message);
+            }
+        }
+
         private void ShowAssetContextMenu(string sourceGuid, Button card)
         {
             var desktop = Desktop;
             if (desktop == null) return;
 
-            var menu = new Window
-            {
-                Style = "frame",
-                AutoSize = AutoSize.Vertical,
-                Size = new Point(180, 0),
-                MinSize = new Point(180, 0),
-                Position = new Point(Gui.MousePosition.x, Gui.MousePosition.y),
-            };
+            var menu = CreateContextMenu();
 
             AddContextMenuItem(menu, "Rename", () => { Desktop.CloseDropdowns(); BeginRename(card, sourceGuid); });
             AddContextMenuItem(menu, "Show in Explorer", () =>

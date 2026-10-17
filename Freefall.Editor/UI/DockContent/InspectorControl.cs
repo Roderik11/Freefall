@@ -179,17 +179,46 @@ namespace Freefall.Editor
             var inspector = GUIInspector.GetInspector(target);
             if (inspector != null)
             {
+                // An importer shown as itself (a model file, audio, effect, typeface): its fields are import
+                // settings, which take effect only when saved to the meta and the file is reimported
+                if (IsImporterTarget)
+                    AddApplyImporterButton(inspector, array.OfType<IImporter>().ToArray());
+
                 scrollpanel.Content.Controls.Add(inspector);
                 inspector.PerformLayout();
                 scrollpanel.Content.PerformLayout();
                 ActivatePreview(inspector);
             }
+        }
 
-            if(IsImporterTarget)
+        /// <summary>
+        /// "Apply & Reimport" under an importer's settings, as the texture and mesh inspectors have: saves each
+        /// selected importer to its meta and reimports its file. Without it edits there were never saved.
+        /// </summary>
+        private void AddApplyImporterButton(GUIInspector inspector, IImporter[] importers)
+        {
+            var sources = importers
+                .Select(importer => (importer, guid: AssetDatabase.GetImporterSourceGuid(importer)))
+                .Where(s => s.guid != null)
+                .ToArray();
+            if (sources.Length == 0) return;
+
+            var applyButton = new Button
             {
-                // if an IImporter is selected,
-                // we need Apply/Revert buttons to save or discard the changes
-            }
+                Text = "Apply & Reimport",
+                Dock = DockStyle.Top,
+                Size = new Point(100, 30),
+                Margin = new Margin(4, 4, 4, 4),
+                Style = "button",
+            };
+            applyButton.MouseClick += (s, e) =>
+            {
+                if (e.Button > 0) return;
+                foreach (var (importer, guid) in sources)
+                    AssetDatabase.SaveImporterAndReimport(guid, importer);
+                isTargetDirty = false;
+            };
+            inspector.AddControl(applyButton);
         }
 
         /// <summary>

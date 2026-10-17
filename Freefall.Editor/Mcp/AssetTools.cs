@@ -1,4 +1,5 @@
 using System.ComponentModel;
+using System.Linq;
 using System.Text.Json.Nodes;
 using System.Threading.Tasks;
 using ModelContextProtocol.Protocol;
@@ -32,8 +33,52 @@ namespace Freefall.Editor.Mcp
                      "(generated textures, meshes, copied packs). Needed before new files can be found or used. " +
                      "Changed meshes, textures, materials, prefabs and .asset files that are already loaded are hot-reloaded in place, " +
                      "so placed instances update without a scene reload ('reloaded' = count). A script component that generated " +
-                     "entities from a reloaded .asset keeps its old output until it rebuilds, e.g. when one of its members is set again.")]
+                     "entities from a reloaded .asset keeps its old output until it rebuilds, e.g. when one of its members is set again. " +
+                     "Files that did not change are not imported again: asset_reimport forces that.")]
         public static Task<CallToolResult> Refresh() => McpBridge.Post("/api/assets/refresh");
+
+        [McpServerTool(Name = "asset_reimport", Title = "Reimport folder", Idempotent = true, OpenWorld = false)]
+        [Description("Reimport every importable file under a folder of Assets (or one file), changed or not: for cache files that predate " +
+                     "an importer change (e.g. generated LODs) or new import settings, which asset_refresh skips (it imports only files newer " +
+                     "than their last import). Files import on the editor's main thread a few per frame, so the editor keeps running and " +
+                     "console_log shows the progress every few seconds. Loaded meshes, textures, materials and prefabs update in place. " +
+                     "The call answers after the last file with imported/failed counts; if it times out the reimport goes on — " +
+                     "calling asset_reimport again answers with the running job's progress, console_log's last line is the result. One at a time.")]
+        public static Task<CallToolResult> Reimport(
+            [Description("Folder or file relative to Assets, e.g. 'Medieval Mega Pack' or 'Rocks/Boulder.fbx'; '' = all of Assets")] string path,
+            [Description("Only files with these extensions, e.g. ['fbx'] (default: every importable file)")] string[]? extensions = null,
+            [Description("false = answer right after starting")] bool wait = true)
+            => McpBridge.Post("/api/assets/reimport", new { path, extensions, wait });
+
+        [McpServerTool(Name = "asset_get_import_settings", Title = "Get import settings", ReadOnly = true, OpenWorld = false)]
+        [Description("Import settings of a source file (model, texture, audio, effect, typeface, ...): its importer type and every setting " +
+                     "the meta stores, with names exact for asset_set_import_settings. Model files have e.g. GenerateLODs, LODRatios, " +
+                     "LODMinTriangles, LODPixelError (generated LODs), Scale, SmoothingAngle; textures Format, sRGB, IsNormalMap.")]
+        public static Task<CallToolResult> GetImportSettings(
+            [Description("Source file relative to Assets, or its GUID or a sub-asset's GUID (e.g. a mesh's)")] string path)
+            => McpBridge.Get("/api/asset/import-settings", ("path", path));
+
+        [McpServerTool(Name = "asset_set_import_settings", Title = "Set import settings", Destructive = true, Idempotent = true, OpenWorld = false)]
+        [Description("Set import settings on a source file, or on every file under a folder, save them to the meta and (by default) reimport " +
+                     "those files; loaded assets update in place. Works for every importer; asset_get_import_settings lists the names. In a " +
+                     "folder only files whose importer has every given setting change, the rest are counted as skipped (e.g. textures when " +
+                     "setting LODPixelError). Nothing is saved if a value fails to convert. A texture's settings mark it UserConfigured, as " +
+                     "the texture inspector's Apply does (otherwise its import guesses sRGB and format from the file name again). The " +
+                     "reimport behaves as asset_reimport (progress in console_log, goes on if the call times out). Same value encodings as asset_set_properties.")]
+        public static Task<CallToolResult> SetImportSettings(
+            [Description("File or folder relative to Assets, or a file's GUID or a sub-asset's GUID")] string path,
+            [Description("Setting name → value")] JsonObject values,
+            [Description("In a folder: only files with these extensions, e.g. ['fbx']")] string[]? extensions = null,
+            [Description("Reimport the changed files (false = only save; asset_reimport applies the settings later)")] bool reimport = true,
+            [Description("Wait for the reimport to finish")] bool wait = true)
+            => McpBridge.Post("/api/asset/import-settings", new JsonObject
+            {
+                ["path"] = path,
+                ["values"] = values.DeepClone(),
+                ["extensions"] = extensions != null ? new JsonArray(extensions.Select(e => (JsonNode?)JsonValue.Create(e)).ToArray()) : null,
+                ["reimport"] = reimport,
+                ["wait"] = wait,
+            }.ToJsonString());
 
         [McpServerTool(Name = "asset_types", Title = "List asset types", ReadOnly = true, OpenWorld = false)]
         [Description("Every importable file extension and its importer.")]
@@ -56,6 +101,7 @@ namespace Freefall.Editor.Mcp
         [Description("Set fields on an asset, then (by default) save it to disk and reimport so the editor's cached copy matches. " +
                      "On a Material this also sets its shader properties by name (Tint, EmissiveColor, EmissiveIntensity, DetailTiling, …; asset_get lists them under MaterialProperties). " +
                      "A file edited or regenerated on disk reaches the running editor with asset_refresh instead. " +
+                     "Import settings of a source file (a model's generated LODs, a texture's format) are set with asset_set_import_settings. " +
                      "Same value encodings as entity_set_properties. Not atomic — earlier members stay set if a later one fails.")]
         public static Task<CallToolResult> SetProperties(
             string guid,
