@@ -62,6 +62,43 @@ namespace Freefall.Components
         [Description(@"Whether this band's displacement affects vertex positions.
          Disable for fine-detail bands that only contribute normals")]
         public bool ContributeDisplacement = true;
+
+        [Description(@"Part of the sea the weather's wind raises (the environment preset's wind, Graphics.Wind): its waves come
+         from the wind's speed and heading and the ocean's Wind Sea settings, and the wind bands share the wavelengths
+         between them instead of each carrying all of them. Off = authored by the fields above (a swell from afar)")]
+        public bool FollowWind = false;
+    }
+
+    /// <summary>
+    /// The sea the wind raises, shared by every band with <see cref="SpectrumBand.FollowWind"/>: one JONSWAP spectrum at
+    /// the weather's wind speed, split over those bands by wavelength. A calm preset gives a calm sea, a storm a rough one.
+    /// </summary>
+    [Serializable]
+    public class WindSeaSettings
+    {
+        [Description("Distance in metres the wind has blown over open water: longer = a more developed sea, longer waves")]
+        [ValueRange(1000f, 1000000f)]
+        public float Fetch = 100000f;
+
+        [Description("Energy multiplier on the spectrum (1 = the sea this wind really makes: its slopes match Cox-Munk's)")]
+        [ValueRange(0f, 4f)]
+        public float Scale = 1f;
+
+        [Description("Directional spreading: cosine-power (0) to Donelan-Banner (1, measured on wind seas)")]
+        [ValueRange(0f, 1f)]
+        public float SpreadBlend = 1f;
+
+        [Description("Narrows the spread round the wind's heading: higher = longer-crested waves")]
+        [ValueRange(0f, 2f)]
+        public float Swell = 0.5f;
+
+        [Description("JONSWAP gamma: 3.3 = a growing sea, 1 = fully developed (Pierson-Moskowitz)")]
+        [ValueRange(1f, 7f)]
+        public float PeakEnhancement = 3.3f;
+
+        [Description("High-frequency rolloff of the finest waves (against aliasing at the finest band's resolution)")]
+        [ValueRange(0f, 1f)]
+        public float ShortWavesFade = 0.01f;
     }
 
     /// <summary>
@@ -161,6 +198,18 @@ namespace Freefall.Components
 
         [Category("Spectrum")]
         public List<SpectrumBand> Bands = CreateDefaultBands();
+
+        [Description("The sea the weather's wind raises, for the bands marked Follow Wind")]
+        public WindSeaSettings WindSea = new();
+
+        // Must match ocean.fx BandAngles: each band's texture is turned by this much (radians) against tiling, so a
+        // wave heading in the world is this much more in the band's own frame
+        private static readonly float[] BandAngles = { 0.0f, 0.297f, 0.645f, 0.925f, 1.17f, 1.42f, 1.73f, 2.05f };
+
+        // What the spectrum was last initialised with: it is only rebuilt when this changes (an edit, the wind)
+        private OceanFFT.SpectrumParameters[] _appliedSpectrums = Array.Empty<OceanFFT.SpectrumParameters>();
+        private uint[] _appliedLengthScales = Array.Empty<uint>();
+        private float _appliedDepth = float.NaN;
 
         private Mesh _mesh = null!;
         private Material _material = null!;
@@ -312,20 +361,66 @@ namespace Freefall.Components
             return scales;
         }
 
+        private const float Gravity = 9.81f;
+        private static float JonswapAlpha(float fetch, float windSpeed) =>
+            0.076f * MathF.Pow(Gravity * fetch / windSpeed / windSpeed, -0.22f);
+        private static float JonswapPeakOmega(float fetch, float windSpeed) =>
+            22f * MathF.Pow(windSpeed * fetch / Gravity / Gravity, -0.33f);
+
+        /// <summary>
+        /// The two spectrum layers of every band. Authored bands use their own fields over all wavelengths. Bands that
+        /// follow the wind carry one layer, the wind sea (the weather's wind speed, its heading turned into the band's
+        /// frame, the WindSea settings), over their share of the wavelengths: each wind band from the next finer wind
+        /// band's quarter tile up to its own tile, so the bands together are one spectrum, not one per band.
+        /// </summary>
         private OceanFFT.SpectrumParameters[] BuildSpectrumParams()
         {
-            float gravity = 9.81f;
-            float JonswapAlpha(float fetch, float windSpeed) =>
-                0.076f * MathF.Pow(gravity * fetch / windSpeed / windSpeed, -0.22f);
-            float JonswapPeakOmega(float fetch, float windSpeed) =>
-                22f * MathF.Pow(windSpeed * fetch / gravity / gravity, -0.33f);
-            float Rad(float deg) => deg / 180f * MathF.PI;
+            static float Rad(float deg) => deg / 180f * MathF.PI;
 
             var spectrums = new OceanFFT.SpectrumParameters[Bands.Count * 2];
+
+            // The weather's wind: never quite calm (JONSWAP divides by the wind speed)
+            float windSpeed = MathF.Max(Wind.Strength, 0.5f);
+            var dir = Wind.Direction;
+            float heading = dir.LengthSquared() > 0f ? MathF.Atan2(dir.Z, dir.X) : 0f;
+
+            // The wind bands' share of the wavelengths, coarsest first
+            var windBands = new List<int>();
+            for (int i = 0; i < Bands.Count; i++)
+                if (Bands[i].FollowWind) windBands.Add(i);
+            windBands.Sort((a, b) => Bands[b].LengthScale.CompareTo(Bands[a].LengthScale));
 
             for (int i = 0; i < Bands.Count; i++)
             {
                 var b = Bands[i];
+
+                if (b.FollowWind)
+                {
+                    // A boundary between two wind bands lies at a quarter of the finer one's tile (wavenumber 8π / tile):
+                    // longer waves go to the coarser band, so no fine band repeats them tile after tile
+                    int rank = windBands.IndexOf(i);
+                    float low = rank > 0 ? 8f * MathF.PI / b.LengthScale : 0f;
+                    float high = rank + 1 < windBands.Count
+                        ? 8f * MathF.PI / Bands[windBands[rank + 1]].LengthScale
+                        : float.MaxValue;
+
+                    var sea = WindSea;
+                    spectrums[i * 2] = new OceanFFT.SpectrumParameters
+                    {
+                        Scale = sea.Scale,
+                        Angle = heading + BandAngles[i % BandAngles.Length],
+                        SpreadBlend = sea.SpreadBlend,
+                        Swell = sea.Swell,
+                        Alpha = JonswapAlpha(sea.Fetch, windSpeed),
+                        PeakOmega = JonswapPeakOmega(sea.Fetch, windSpeed),
+                        Gamma = sea.PeakEnhancement,
+                        ShortWavesFade = sea.ShortWavesFade,
+                        LowCutoff = low,
+                        HighCutoff = high,
+                    };
+                    spectrums[i * 2 + 1] = new OceanFFT.SpectrumParameters { Scale = 0f, HighCutoff = float.MaxValue };
+                    continue;
+                }
 
                 spectrums[i * 2] = new OceanFFT.SpectrumParameters
                 {
@@ -337,6 +432,8 @@ namespace Freefall.Components
                     PeakOmega = JonswapPeakOmega(b.Fetch.X, b.WindSpeed.X),
                     Gamma = b.PeakEnhancement.X,
                     ShortWavesFade = b.ShortWavesFade.X,
+                    LowCutoff = 0f,
+                    HighCutoff = float.MaxValue,
                 };
 
                 spectrums[i * 2 + 1] = new OceanFFT.SpectrumParameters
@@ -349,6 +446,8 @@ namespace Freefall.Components
                     PeakOmega = JonswapPeakOmega(b.Fetch.Y, b.WindSpeed.Y),
                     Gamma = b.PeakEnhancement.Y,
                     ShortWavesFade = b.ShortWavesFade.Y,
+                    LowCutoff = 0f,
+                    HighCutoff = float.MaxValue,
                 };
             }
 
@@ -356,7 +455,8 @@ namespace Freefall.Components
         }
 
         /// <summary>
-        /// Create 4 default bands with logarithmic length scale spread.
+        /// Create 4 default bands with logarithmic length scale spread: an authored swell, and three bands the weather's
+        /// wind raises (their own wind fields only matter if Follow Wind is turned off).
         /// </summary>
         private static List<SpectrumBand> CreateDefaultBands()
         {
@@ -387,6 +487,7 @@ namespace Freefall.Components
                     Swell = new Vector2(1.0f, 1.0f),
                     PeakEnhancement = new Vector2(1.0f, 1.0f),
                     ShortWavesFade = new Vector2(0.5f, 0.5f),
+                    FollowWind = true,
                 },
                 // Band 2: 64m — close-range chop
                 new SpectrumBand
@@ -400,6 +501,7 @@ namespace Freefall.Components
                     Swell = new Vector2(1.0f, 0.695f),
                     PeakEnhancement = new Vector2(1.0f, 1.0f),
                     ShortWavesFade = new Vector2(0.5f, 0.5f),
+                    FollowWind = true,
                 },
                 // Band 3: 17m — fine ripples near camera
                 new SpectrumBand
@@ -413,6 +515,7 @@ namespace Freefall.Components
                     Swell = new Vector2(1.0f, 0.0f),
                     PeakEnhancement = new Vector2(1.0f, 1.0f),
                     ShortWavesFade = new Vector2(0.0001f, 0.15f),
+                    FollowWind = true,
                 },
             };
         }
@@ -422,10 +525,19 @@ namespace Freefall.Components
             if (_mesh == null || _material == null) return;
             _waveTime += (float)Time.Delta * WaveSpeed;
 
-            // Rebuild spectrum params from bands every frame (upload is tiny)
+            // The spectrum's parameters (the bands, the weather's wind): the initial spectrum is rebuilt only when they
+            // changed, e.g. while a preset transition turns the wind (until 2026-10-17 it was rebuilt every frame)
             var spectrums = BuildSpectrumParams();
             var lengthScales = BuildLengthScales();
-            _oceanFFT.RequestSpectrumReinit(spectrums, lengthScales);
+            // (the initial spectrum also depends on the water depth: dispersion and the shallow-water TMA factor)
+            if (!MemoryExtensions.SequenceEqual<byte>(MemoryMarshal.AsBytes(spectrums.AsSpan()), MemoryMarshal.AsBytes(_appliedSpectrums.AsSpan()))
+                || !lengthScales.AsSpan().SequenceEqual(_appliedLengthScales) || Depth != _appliedDepth)
+            {
+                _oceanFFT.RequestSpectrumReinit(spectrums, lengthScales);
+                _appliedSpectrums = spectrums;
+                _appliedLengthScales = lengthScales;
+                _appliedDepth = Depth;
+            }
 
             // Push runtime-tweakable params to OceanFFT each frame
             _oceanFFT.UpdateParams(Depth, FoamBias, FoamDecayRate, FoamThreshold, FoamAdd,

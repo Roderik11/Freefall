@@ -81,6 +81,8 @@ namespace Freefall.Graphics
             public float PeakOmega;
             public float Gamma;
             public float ShortWavesFade;
+            public float LowCutoff;     // wavenumbers (rad/m) this layer covers: the wind bands share them out
+            public float HighCutoff;
         }
 
         [StructLayout(LayoutKind.Sequential)]

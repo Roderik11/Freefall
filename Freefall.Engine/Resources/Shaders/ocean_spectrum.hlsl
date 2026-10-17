@@ -11,7 +11,7 @@ cbuffer PushConstants : register(b3)
 {
     uint InitialSpectrumIdx;   // RWTexture2DArray<float4> — H0 packed (rg=H0, ba=H0conj)
     uint SpectrumIdx;          // RWTexture2DArray<float4> — evolved displacement+slope spectra
-    uint SpectrumParamsIdx;    // StructuredBuffer<SpectrumParameters> — 8 entries (dual per band)
+    uint SpectrumParamsIdx;    // StructuredBuffer<SpectrumParameters> — 2 per band (primary, secondary)
     uint OceanConstantsIdx;    // StructuredBuffer<OceanConstants> — global params
 };
 
@@ -25,7 +25,15 @@ struct SpectrumParameters
     float peakOmega;
     float gamma;
     float shortWavesFade;
+    float lowCutoff;        // wavenumbers (rad/m) this layer covers: the wind bands share them out (OceanRenderer)
+    float highCutoff;
 };
+
+// 1 where a layer covers this wavenumber
+float InLayer(float kLength, SpectrumParameters spectrum)
+{
+    return (kLength >= spectrum.lowCutoff && kLength < spectrum.highCutoff) ? 1.0 : 0.0;
+}
 
 struct OceanConstants
 {
@@ -178,7 +186,12 @@ float DirectionSpectrum(float theta, float omega, SpectrumParameters spectrum)
 {
     float s = SpreadPower(omega, spectrum.peakOmega)
             + 16 * tanh(min(omega / spectrum.peakOmega, 20)) * spectrum.swell * spectrum.swell;
-    return lerp(2.0f / PI * cos(theta) * cos(theta),
+    // Both spreadings round the layer's wind angle, each integrating to 1 over the circle. Until 2026-10-17 the
+    // cosine-power one was centred on the texture's x axis whatever the wind, and ran both ways (up- and downwind),
+    // which integrates to 2.
+    float c = cos(theta - spectrum.angle);
+    float cosinePower = c > 0.0 ? 2.0f / PI * c * c : 0.0;
+    return lerp(cosinePower,
                 Cosine2s(theta - spectrum.angle, s),
                 spectrum.spreadBlend);
 }
@@ -223,18 +236,24 @@ void CSInitSpectrum(uint3 id : SV_DispatchThreadID)
             // Primary spectrum for this band
             float spectrum = JONSWAP(omega, spectrums[i * 2], oc.Gravity, oc.Depth)
                            * DirectionSpectrum(kAngle, omega, spectrums[i * 2])
-                           * ShortWavesFade(kLength, spectrums[i * 2]);
+                           * ShortWavesFade(kLength, spectrums[i * 2])
+                           * InLayer(kLength, spectrums[i * 2]);
 
             // Secondary spectrum (dual JONSWAP)
             if (spectrums[i * 2 + 1].scale > 0)
             {
                 spectrum += JONSWAP(omega, spectrums[i * 2 + 1], oc.Gravity, oc.Depth)
                           * DirectionSpectrum(kAngle, omega, spectrums[i * 2 + 1])
-                          * ShortWavesFade(kLength, spectrums[i * 2 + 1]);
+                          * ShortWavesFade(kLength, spectrums[i * 2 + 1])
+                          * InLayer(kLength, spectrums[i * 2 + 1]);
             }
 
+            // Amplitude so the sea carries the spectrum's energy: the height field's variance is Σ E|h(k,t)|², and
+            // h(k,t) = h0(k)·e^{iωt} + conj(h0(−k))·e^{−iωt} has two independent terms, each with E|h0|² = 2A² (two
+            // unit Gaussians). Σ over the grid must be ∫ Ψ d²k with Ψ = S(ω)·D·|dω/dk|/k, so A² = Ψ·Δk² / 4.
+            // Until 2026-10-17 this was √(2·Ψ·Δk²): 8× the energy (the slopes at 3 m/s were 8–9× Cox-Munk's).
             initialSpectrum[uint3(id.xy, i)] = float4(
-                float2(gauss2.x, gauss1.y) * sqrt(2 * spectrum * abs(dOmegadk) / kLength * deltaK * deltaK),
+                float2(gauss2.x, gauss1.y) * (0.5 * sqrt(spectrum * abs(dOmegadk) / kLength * deltaK * deltaK)),
                 0.0f, 0.0f
             );
         }
