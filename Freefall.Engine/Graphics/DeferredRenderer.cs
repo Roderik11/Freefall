@@ -411,6 +411,9 @@ namespace Freefall.Graphics
             // Ensure Materials buffer is bound (creates SRV for bindless access)
             Material.BindMaterialsBuffer(list, Engine.Device);
 
+            // Per-object effect data (struct Instance) that changed since the last frame
+            InstanceData.Upload(Engine.Device);
+
             // 1. G-Buffer Pass (includes shadow rendering internally)
             using (_gbufferMarker.Auto())
                 FillGBuffer(camera, list);

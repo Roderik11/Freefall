@@ -105,7 +105,7 @@ namespace Freefall.Components
                 if (partIdx >= meshParts.Count) continue;
                 var mat = GetMaterial(meshParts[partIdx].MaterialSlot);
                 if (mat != null)
-                    CommandBuffer.AddPersistent(group, mesh, partIdx, mat, Params, transformSlot, _boneBufferIdx, lodManaged: true);
+                    CommandBuffer.AddPersistent(group, mesh, partIdx, mat, Params, transformSlot, _boneBufferIdx, lodManaged: true, instanceSlot: InstanceSlotFor(mat));
             }
         }
     }

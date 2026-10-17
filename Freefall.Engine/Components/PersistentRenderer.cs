@@ -24,6 +24,31 @@ namespace Freefall.Components
         [NonSerialized]
         public BoundingSphere BoundingSphere;
 
+        /// <summary>
+        /// This object's values for the per-object data its effects declare (their struct Instance, "//=" members):
+        /// only the ones set here; every other member keeps the effect's default. Saved with the entity, shown in
+        /// the inspector under "Instance". Change them with <see cref="SetInstance(string, Vector4)"/> (cheap
+        /// enough for every frame: it rewrites this object's bytes of the instance data buffer and registers
+        /// nothing again); assigning the list rewrites them all.
+        /// </summary>
+        [System.ComponentModel.Browsable(false)]
+        public List<InstanceValue> Instance
+        {
+            get => _instance;
+            set
+            {
+                _instance = value ?? new List<InstanceValue>();
+                foreach (var (effect, slot) in _instanceSlots)
+                    WriteInstanceSlot(effect, slot);
+            }
+        }
+        private List<InstanceValue> _instance = new();
+
+        // A slot of the instance data buffer per effect this renderer draws with (by effect name: Effect objects of
+        // one name share their layout), and the ones the current draws use
+        private readonly List<(Effect effect, int slot)> _instanceSlots = new();
+        private readonly HashSet<string> _instanceSlotsUsed = new();
+
         /// <summary>The mesh the draws are built from (null = nothing to draw).</summary>
         protected abstract Mesh? RenderMesh { get; }
 
@@ -88,6 +113,99 @@ namespace Freefall.Components
             lock (_liveLock) _liveRenderers.Remove(this);
             TrackTransform(null);
             Unregister();
+            foreach (var (_, slot) in _instanceSlots) InstanceData.Release(slot);
+            _instanceSlots.Clear();
+        }
+
+        // ── Per-object data (struct Instance of the effects) ──
+
+        /// <summary>
+        /// Sets one of this object's instance values (a member of its effects' struct Instance, by name) and writes
+        /// it where its draws read it. Every frame is fine: nothing is registered again. A float uses X, a float2
+        /// XY, a float3 or colour XYZ.
+        /// </summary>
+        public void SetInstance(string name, Vector4 value)
+        {
+            int index = _instance.FindIndex(v => v.Name == name);
+            if (index >= 0) _instance[index].Value = value;
+            else _instance.Add(new InstanceValue { Name = name, Value = value });
+
+            foreach (var (effect, slot) in _instanceSlots)
+            {
+                var member = effect.InstanceParams.Find(p => p.Name == name);
+                if (member != null) InstanceData.Write(slot, member, value);
+            }
+        }
+
+        public void SetInstance(string name, float value) => SetInstance(name, new Vector4(value, 0f, 0f, 0f));
+        public void SetInstance(string name, Vector2 value) => SetInstance(name, new Vector4(value, 0f, 0f));
+        public void SetInstance(string name, Vector3 value) => SetInstance(name, new Vector4(value, 0f));
+        public void SetInstance(string name, Color3 value) => SetInstance(name, new Vector4(value.R, value.G, value.B, 0f));
+
+        /// <summary>
+        /// This object's value of an instance member: its own if set, else the default of the first of its
+        /// effects that declares one. False if none of them does.
+        /// </summary>
+        public bool TryGetInstance(string name, out Vector4 value)
+        {
+            int index = _instance.FindIndex(v => v.Name == name);
+            if (index >= 0) { value = _instance[index].Value; return true; }
+            foreach (var (effect, _) in _instanceSlots)
+            {
+                var member = effect.InstanceParams.Find(p => p.Name == name);
+                if (member != null) { value = InstanceData.DefaultOf(member); return true; }
+            }
+            value = default;
+            return false;
+        }
+
+        /// <summary>Drops this object's own value of a member: the effect's default applies again.</summary>
+        public void ResetInstance(string name)
+        {
+            if (_instance.RemoveAll(v => v.Name == name) == 0) return;
+            foreach (var (effect, slot) in _instanceSlots) WriteInstanceSlot(effect, slot);
+        }
+
+        /// <summary>
+        /// The effects whose instance data this renderer's current draws use (for the inspector), each once.
+        /// A method, not a property: reflection (entity_get, the serializer) lists public properties.
+        /// </summary>
+        public List<Effect> GetInstanceEffects()
+        {
+            var effects = new List<Effect>(_instanceSlots.Count);
+            foreach (var (effect, _) in _instanceSlots) effects.Add(effect);
+            return effects;
+        }
+
+        /// <summary>
+        /// The instance slot for a draw with <paramref name="material"/>, for CommandBuffer.AddPersistent: this
+        /// renderer's own for the material's effect (made and filled the first time), 0 if the effect declares no
+        /// struct Instance. Call from AddDraws.
+        /// </summary>
+        protected int InstanceSlotFor(Material material)
+        {
+            var effect = material?.Effect;
+            if (effect == null || effect.InstanceParams.Count == 0) return 0;
+
+            _instanceSlotsUsed.Add(effect.Name);
+            foreach (var (known, slot) in _instanceSlots)
+                if (known.Name == effect.Name) return slot;
+
+            int made = InstanceData.Allocate();
+            _instanceSlots.Add((effect, made));
+            WriteInstanceSlot(effect, made);
+            return made;
+        }
+
+        // Defaults first, then this object's own values, in the effect's layout
+        private void WriteInstanceSlot(Effect effect, int slot)
+        {
+            InstanceData.WriteDefaults(slot, effect.InstanceParams);
+            foreach (var own in _instance)
+            {
+                var member = effect.InstanceParams.Find(p => p.Name == own.Name);
+                if (member != null) InstanceData.Write(slot, member, own.Value);
+            }
         }
 
         protected override void OnEnabledChanged() => Invalidate();
@@ -183,8 +301,23 @@ namespace Freefall.Components
             UpdateBounds();
 
             var group = new DrawGroup();
+            _instanceSlotsUsed.Clear();
             AddDraws(group, mesh, slot);
             _drawGroup = group;
+
+            // Slots of effects the draws no longer use go back; the ones in use are rewritten (an effect's layout
+            // may have changed: a recompile invalidates every renderer through Material.EffectChanged)
+            for (int i = _instanceSlots.Count - 1; i >= 0; i--)
+            {
+                var (effect, instanceSlot) = _instanceSlots[i];
+                if (_instanceSlotsUsed.Contains(effect.Name))
+                    WriteInstanceSlot(effect, instanceSlot);
+                else
+                {
+                    InstanceData.Release(instanceSlot);
+                    _instanceSlots.RemoveAt(i);
+                }
+            }
         }
 
         private void Unregister()
@@ -193,5 +326,16 @@ namespace Freefall.Components
             CommandBuffer.RemovePersistent(_drawGroup);
             _drawGroup = null;
         }
+    }
+
+    /// <summary>
+    /// One of a renderer's own values for its effects' struct Instance (PersistentRenderer.Instance): the member's
+    /// name and up to four floats (a float uses X, a float2 XY, a float3 or colour XYZ).
+    /// </summary>
+    [Serializable]
+    public class InstanceValue
+    {
+        public string Name = "";
+        public Vector4 Value;
     }
 }

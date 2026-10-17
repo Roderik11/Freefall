@@ -50,6 +50,11 @@ namespace Freefall.Graphics
         /// and small-on-screen culling applies. False draws exactly the given part.
         /// </summary>
         public bool LodManaged;
+        /// <summary>
+        /// The object's slot of the instance data buffer (InstanceData), the draw's InstanceDescriptor.CustomDataIdx.
+        /// 0 = none of its own: the effect's defaults (Effect.DefaultInstanceSlot).
+        /// </summary>
+        public int InstanceSlot;
     }
 
     /// <summary>
@@ -137,7 +142,7 @@ namespace Freefall.Graphics
             {
                 TransformSlot = (uint)transformSlot,
                 MaterialId = (uint)material.MaterialID,
-                CustomDataIdx = 0,
+                CustomDataIdx = (uint)(material.Effect?.DefaultInstanceSlot ?? 0),   // per-frame draws bring no instance data of their own
                 MeshPartIdx = (uint)partIndex,
                 BoneBufferIdx = boneBufferIdx
             };
@@ -700,7 +705,7 @@ namespace Freefall.Graphics
         /// takes effect at the next pass execution. To change a registered draw, remove the group and
         /// add a new one.
         /// </summary>
-        public static void AddPersistent(DrawGroup group, Mesh mesh, int meshPartIndex, Material material, MaterialBlock materialBlock, int transformSlot, uint boneBufferIdx = 0, bool lodManaged = false)
+        public static void AddPersistent(DrawGroup group, Mesh mesh, int meshPartIndex, Material material, MaterialBlock materialBlock, int transformSlot, uint boneBufferIdx = 0, bool lodManaged = false, int instanceSlot = 0)
         {
             var op = new PersistentOp
             {
@@ -715,7 +720,8 @@ namespace Freefall.Graphics
                     MaterialBlock = materialBlock,
                     TransformSlot = transformSlot,
                     BoneBufferIdx = boneBufferIdx,
-                    LodManaged = lodManaged
+                    LodManaged = lodManaged,
+                    InstanceSlot = instanceSlot
                 }
             };
 

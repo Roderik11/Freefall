@@ -12,7 +12,7 @@ namespace Freefall.Graphics
     {
         public uint TransformSlot;   // index into GlobalTransformBuffer
         public uint MaterialId;      // index into MaterialsBuffer
-        public uint CustomDataIdx;   // index into per-batch StructuredBuffer (future use, 0 for now)
+        public uint CustomDataIdx;   // the object's slot of the instance data buffer (InstanceData; its effect's defaults slot if it has none)
         public uint MeshPartIdx;     // meshpart index within the mesh (for GPU picking)
         public uint BoneBufferIdx;   // per-Animator bone buffer SRV (0 = static mesh)
     }

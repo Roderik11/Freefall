@@ -110,7 +110,20 @@ namespace Freefall.Graphics
         /// FXParser.ParseMaterialParams). Shared by every instance of the effect and refilled in place on reload.
         /// </summary>
         public List<MaterialParamDesc> MaterialParams { get; private set; } = new();
-        
+
+        /// <summary>
+        /// Values the effect takes per object ("//=" members of its struct Instance, FXParser.ParseInstanceParams):
+        /// a renderer's slot of the instance data buffer (InstanceData). Shared like MaterialParams.
+        /// </summary>
+        public List<MaterialParamDesc> InstanceParams { get; private set; } = new();
+
+        /// <summary>
+        /// A slot of InstanceData holding the instance defaults, for draws that bring no slot of their own
+        /// (0 when the effect declares no struct Instance). Shared by every instance of the effect.
+        /// </summary>
+        public int DefaultInstanceSlot => _defaultInstanceSlot[0];
+        private int[] _defaultInstanceSlot = new int[1];
+
         // MasterEffects: Global dictionary of all loaded effects (Apex pattern)
         // Camera.SetShaderParams iterates this to set View/Projection on all effects
         internal static Dictionary<int, Effect> MasterEffects = new Dictionary<int, Effect>();
@@ -132,6 +145,8 @@ namespace Freefall.Graphics
                 _resourceSlots = existing._resourceSlots;
                 RenderState = existing.RenderState;
                 MaterialParams = existing.MaterialParams;
+                InstanceParams = existing.InstanceParams;
+                _defaultInstanceSlot = existing._defaultInstanceSlot;
                 _materialBlock = existing._materialBlock;
                 lock (_instances) _instances.Add(new WeakReference<Effect>(this));
                 return;
@@ -155,6 +170,8 @@ namespace Freefall.Graphics
             // Parse render state metadata from shader source (data-driven PSO creation)
             RenderState = FXParser.ParseRenderState(content);
             MaterialParams.AddRange(FXParser.ParseMaterialParams(content));
+            InstanceParams.AddRange(FXParser.ParseInstanceParams(content));
+            WriteInstanceDefaults();
 
             Dependencies = ShaderHotReload.CollectDependencies(_sourcePath);
 
@@ -173,6 +190,20 @@ namespace Freefall.Graphics
 
         /// <summary>The .fx file and everything it includes (full paths). Null on non-master instances.</summary>
         internal HashSet<string>? Dependencies { get; private set; }
+
+        // The defaults slot: made the first time the effect declares instance data, rewritten on every (re)load
+        private void WriteInstanceDefaults()
+        {
+            if (InstanceParams.Count == 0) return;
+
+            var last = InstanceParams[^1];
+            int bytes = last.Offset + last.Type switch { "float2" => 8, "float3" => 12, "float4" => 16, _ => 4 };
+            if (bytes > InstanceData.Stride)
+                Debug.LogWarning("Effect", $"{Name}: struct Instance is {bytes} bytes; only the first {InstanceData.Stride} reach the shader");
+
+            if (_defaultInstanceSlot[0] == 0) _defaultInstanceSlot[0] = InstanceData.Allocate();
+            InstanceData.WriteDefaults(_defaultInstanceSlot[0], InstanceParams);
+        }
 
         /// <summary>
         /// Recompile from disk and swap the result in. Throws (leaving the effect untouched) when the
@@ -209,6 +240,9 @@ namespace Freefall.Graphics
 
             MaterialParams.Clear();
             MaterialParams.AddRange(FXParser.ParseMaterialParams(content));
+            InstanceParams.Clear();
+            InstanceParams.AddRange(FXParser.ParseInstanceParams(content));
+            WriteInstanceDefaults();   // renderers rewrite their own slots when their materials rebuild (EffectChanged)
 
             var renderState = FXParser.ParseRenderState(content);
             lock (_instances)

@@ -14,7 +14,7 @@ cbuffer SceneConstants : register(b0)
     float3 FogSunDirection;            // sun direction for sky-based fog color
     float _fogPad1;
     float3 CamPos;                     // camera world position
-    float _camPad;
+    uint InstanceDataIdx;              // bindless raw buffer of per-object effect data (InstanceData), 128 bytes a slot at InstanceDescriptor.CustomDataIdx
 
     // ── Atmosphere scattering parameters (set by SkyboxRenderer) ──
     float3 SkyTintColor;               // overall sky color multiplier
@@ -258,7 +258,7 @@ struct InstanceDescriptor
 {
     uint TransformSlot;   // index into GlobalTransformBuffer
     uint MaterialId;      // index into MaterialsBuffer
-    uint CustomDataIdx;   // index into per-batch StructuredBuffer
+    uint CustomDataIdx;   // the object's slot of the per-object effect data (InstanceData, SceneConstants.InstanceDataIdx); its effect's defaults slot if it has none
     uint MeshPartIdx;     // meshpart index within the mesh (for GPU picking)
     uint BoneBufferIdx;   // per-Animator bone buffer SRV (0 = static mesh)
 };

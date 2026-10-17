@@ -44,7 +44,7 @@ namespace Freefall.Editor
                 {
                     var valueField = new Field(prop.GetType().GetProperty("Value"));
                     var property = new GUIProperty(target, valueField, prop) { DescriptionOverride = prop.Description };
-                    // A ranged number is a slider: scrub it and watch the result (vfx PulsePreview)
+                    // A ranged number is a slider: scrub it and watch the result
                     if (prop.Range is { } range)
                         property.RangeOverride = new ValueRangeAttribute(range.X, range.Y, (range.Y - range.X) / 100f);
                     AddProperty(property, prop.Name);

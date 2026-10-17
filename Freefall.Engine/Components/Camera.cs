@@ -149,6 +149,7 @@ namespace Freefall.Components
                 pair.Value.SetParameter("FogDensity", Engine.Settings.FogDensity);
                 pair.Value.SetParameter("FogSunDirection", SkyboxRenderer.CurrentSunDirection);
                 pair.Value.SetParameter("CamPos", cameraPos);
+                pair.Value.SetParameter("InstanceDataIdx", Graphics.InstanceData.BindlessIndex);
                 pair.Value.SetParameter("PickPixel", PickHolePixel);
                 pair.Value.SetParameter("PickThroughBones", PickHoleBones);
                 pair.Value.SetParameter("WindDirection", Graphics.Wind.Direction);

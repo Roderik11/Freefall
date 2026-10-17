@@ -173,7 +173,7 @@ namespace Freefall.Graphics
         // A material setting: "<type> <Name>; //= <default>", e.g. "float Intensity; //= 2" or
         // "float3 Color; //= 0.62, 0.78, 1". Text after the default, set off by " -- ", is its description.
         private static readonly Regex MaterialParamLine = new(
-            @"^\s*(float|float2|float3|int|uint|bool)\s+(\w+)\s*;\s*//=\s*([^\r\n]*?)\s*(?:--\s*([^\r\n]*?)\s*)?$",
+            @"^\s*(float|float2|float3|float4|int|uint|bool)\s+(\w+)\s*;\s*//=\s*([^\r\n]*?)\s*(?:--\s*([^\r\n]*?)\s*)?$",
             RegexOptions.Multiline);
 
         /// <summary>
@@ -185,11 +185,26 @@ namespace Freefall.Graphics
         /// would always be the batch's first material's. Members are packed tightly in declaration order, so
         /// every member must be marked. A float3 whose name ends in "Color" is a colour (Color3, the picker).
         /// </summary>
-        public static List<MaterialParamDesc> ParseMaterialParams(string content)
+        public static List<MaterialParamDesc> ParseMaterialParams(string content) => ParseStructParams(content, "Settings");
+
+        /// <summary>
+        /// The values an effect takes per object: the members of its <c>struct Instance</c>, in the same "//=" form as
+        /// <c>struct Settings</c>. A renderer holds them (PersistentRenderer.Instance, shown in its inspector) and
+        /// they go into its slot of the instance data buffer (InstanceData, InstanceData.Stride bytes), which the
+        /// shader loads by the draw's InstanceDescriptor.CustomDataIdx. Packed tightly in declaration order.
+        /// </summary>
+        public static List<MaterialParamDesc> ParseInstanceParams(string content) => ParseStructParams(content, "Instance");
+
+        // The "//=" members of the struct of this name: a declaration at the start of a line, the whole word.
+        // Not anywhere in the text: common.fx (included into every effect) declares InstanceDescriptor, and a
+        // comment naming "struct Instance" there was taken for the declaration (no members found, every vfx
+        // draw read zeros: 2026-10-17).
+        private static List<MaterialParamDesc> ParseStructParams(string content, string structName)
         {
             var list = new List<MaterialParamDesc>();
-            int start = content.IndexOf("struct Settings", StringComparison.Ordinal);
-            if (start < 0) return list;
+            var head = Regex.Match(content, @"^[ \t]*struct\s+" + structName + @"\b", RegexOptions.Multiline);
+            if (!head.Success) return list;
+            int start = head.Index;
             int offset = 0;
             int open = content.IndexOf('{', start);
             int close = open < 0 ? -1 : content.IndexOf('}', open);
@@ -224,7 +239,7 @@ namespace Freefall.Graphics
                 }
                 // Tightly packed, in declaration order: how ByteAddressBuffer.Load<Settings> reads the struct
                 string type = m.Groups[1].Value;
-                int size = type switch { "float2" => 8, "float3" => 12, _ => 4 };
+                int size = type switch { "float2" => 8, "float3" => 12, "float4" => 16, _ => 4 };
                 list.Add(new MaterialParamDesc
                 {
                     Type = type,
@@ -316,17 +331,20 @@ namespace Freefall.Graphics
         }
     }
     
-    /// <summary>A setting an effect declares for its materials (FXParser.ParseMaterialParams).</summary>
+    /// <summary>
+    /// A setting an effect declares for its materials (FXParser.ParseMaterialParams), or a value it takes per object
+    /// (FXParser.ParseInstanceParams).
+    /// </summary>
     public class MaterialParamDesc
     {
         public string Name = "";
-        /// <summary>HLSL type: float, float2, float3, int, uint or bool.</summary>
+        /// <summary>HLSL type: float, float2, float3, float4, int, uint or bool.</summary>
         public string Type = "";
         public float[] Default = Array.Empty<float>();
         public string? Description;
         /// <summary>"[min, max]" after the default: shown as a slider in the inspector.</summary>
         public float? Min, Max;
-        /// <summary>Byte offset in the material's settings block (tight packing, declaration order).</summary>
+        /// <summary>Byte offset in the material's settings block or the object's instance slot (tight packing, declaration order).</summary>
         public int Offset;
 
         /// <summary>A float3 named "...Color": shown with the colour picker.</summary>
