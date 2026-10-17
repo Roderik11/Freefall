@@ -52,7 +52,12 @@ namespace Freefall.Navigation
         private readonly int _dimX;
         private readonly int _dimZ;
 
-        public TerrainSource(float[,] heights, Vector3 position, Vector2 size, float maxHeight)
+        /// <summary>A copy of the terrain's hole mask (Terrain.Holes), null = no holes.</summary>
+        public readonly byte[]? Holes;
+        public readonly int HoleResolution;
+
+        public TerrainSource(float[,] heights, Vector3 position, Vector2 size, float maxHeight,
+            byte[]? holes = null, int holeResolution = 0)
         {
             Heights = heights;
             Position = position;
@@ -60,10 +65,16 @@ namespace Freefall.Navigation
             MaxHeight = maxHeight;
             _dimX = heights.GetLength(0) - 1;
             _dimZ = heights.GetLength(1) - 1;
+            Holes = holes;
+            HoleResolution = holeResolution;
 
             ulong h = NavHash.Mix(NavHash.Mix(1, position), maxHeight);
             Hash = NavHash.Mix(NavHash.Mix(h, size.X), size.Y);
         }
+
+        /// <summary>True where a HoleStamp opens the terrain (terrain-local position): no navmesh there.</summary>
+        public bool IsHole(float localX, float localZ)
+            => Holes != null && Freefall.Assets.Terrain.HoleWeight(Holes, HoleResolution, Size, localX, localZ) >= 0.5f;
 
         /// <summary>
         /// World height at a terrain-local position. Uses the collider's mapping (first and last
@@ -343,8 +354,10 @@ namespace Freefall.Navigation
                 if (terrain?.HeightField == null || renderer.Transform == null) continue;
                 if (terrain.HeightField.GetLength(0) < 2 || terrain.HeightField.GetLength(1) < 2) continue;
 
+                // The holes are copied: the bake runs on worker threads and a hole stamp may be moved meanwhile
                 input.Terrains.Add(new TerrainSource(
-                    terrain.HeightField, renderer.Transform.Position, terrain.TerrainSize, terrain.MaxHeight));
+                    terrain.HeightField, renderer.Transform.Position, terrain.TerrainSize, terrain.MaxHeight,
+                    (byte[]?)terrain.Holes?.Clone(), terrain.HoleResolution));
             }
 
             // Mesh -> index into Geometries, or -1 for a mesh with nothing to bake

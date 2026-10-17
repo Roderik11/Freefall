@@ -57,6 +57,8 @@ namespace Freefall.Assets
         DecoParams     = 1 << 6,
         /// <summary>Deco stamps (or the splat result they filter on) changed — rebake decoration coverage.</summary>
         DecoPrepass    = 1 << 7,
+        /// <summary>Hole stamps changed — rebake the hole mask (CPU) and upload it.</summary>
+        HoleBake       = 1 << 8,
 
         // ── Combinations ──
         /// <summary>Height change → rebake heightmap + albedo (slope/height masks shift).</summary>
@@ -66,7 +68,7 @@ namespace Freefall.Assets
         /// <summary>Full decorator rebuild.</summary>
         DecoAll        = DecoStructure | DecoParams | DecoPrepass,
         /// <summary>Everything.</summary>
-        All            = HeightBake | SplatPack | LayerParams | TextureArrays | AlbedoBake | DecoStructure | DecoParams | DecoPrepass,
+        All            = HeightBake | SplatPack | LayerParams | TextureArrays | AlbedoBake | DecoStructure | DecoParams | DecoPrepass | HoleBake,
     }
 
     /// <summary>
@@ -245,5 +247,79 @@ namespace Freefall.Assets
         /// Called by TerrainRenderer after GPU heightmap readback.
         /// </summary>
         internal void SetHeightField(float[,] heights) => HeightField = heights;
+
+        // ── Holes (HoleStamp) ──
+
+        /// <summary>
+        /// Serialized GUID reference to the saved hole mask (R8 DDS subasset, saved next to the baked heightmap).
+        /// Null when the terrain had no holes when it was saved.
+        /// </summary>
+        [Browsable(false)]
+        public Texture BakedHolesRef;
+
+        /// <summary>
+        /// Where the hole stamps cut the terrain, one byte per height sample: row by row along +Z, X along a row,
+        /// sample (x, z) at terrain-local (x, z) * TerrainSize / (HoleResolution - 1), the PhysX height field's
+        /// mapping. 0 = ground, 255 = fully cut; the edge of a hole is where it crosses 128. Null = no holes.
+        /// Baked on the CPU (TerrainBaker.BakeHoles) because physics, the navmesh and PCG need it here.
+        /// </summary>
+        [Reflection.DontSerialize]
+        [JsonIgnore]
+        public byte[] Holes { get; private set; }
+
+        [Reflection.DontSerialize]
+        [JsonIgnore]
+        public int HoleResolution { get; private set; }
+
+        /// <summary>True if any hole stamp cuts this terrain.</summary>
+        [Reflection.DontSerialize]
+        [JsonIgnore]
+        public bool HasHoles => Holes != null;
+
+        /// <summary>Replaces the hole mask (null = no holes). Called by TerrainRenderer after a hole bake, TerrainLoader on load.</summary>
+        internal void SetHoles(byte[] holes, int resolution)
+        {
+            Holes = holes;
+            HoleResolution = holes != null ? resolution : 0;
+        }
+
+        /// <summary>
+        /// How far the holes cut at a terrain-local position (0..1, bilinear between the samples, as the terrain
+        /// shader reads it). The ground is open where this is 0.5 or more.
+        /// </summary>
+        public float HoleWeight(float localX, float localZ) => HoleWeight(Holes, HoleResolution, TerrainSize, localX, localZ);
+
+        /// <summary>HoleWeight on a copy of a mask (the navmesh bake takes one, so it never reads one being re-cut).</summary>
+        public static float HoleWeight(byte[] holes, int resolution, Vector2 terrainSize, float localX, float localZ)
+        {
+            if (holes == null) return 0f;
+
+            int last = resolution - 1;
+            float fx = localX / terrainSize.X * last;
+            float fz = localZ / terrainSize.Y * last;
+            if (!(fx >= 0f && fz >= 0f && fx <= last && fz <= last)) return 0f;
+
+            int x0 = Math.Min((int)fx, last - 1), z0 = Math.Min((int)fz, last - 1);
+            float tx = fx - x0, tz = fz - z0;
+            int i = z0 * resolution + x0;
+            float h0 = holes[i] + (holes[i + 1] - holes[i]) * tx;
+            float h1 = holes[i + resolution] + (holes[i + resolution + 1] - holes[i + resolution]) * tx;
+            return (h0 + (h1 - h0) * tz) * (1f / 255f);
+        }
+
+        /// <summary>True where the ground is open at a terrain-local position.</summary>
+        public bool IsHole(float localX, float localZ) => HoleWeight(localX, localZ) >= 0.5f;
+
+        /// <summary>
+        /// True if the height-field cell between samples (x, z) and (x + 1, z + 1) is open: its centre lies in a
+        /// hole. What the PhysX height field and the navmesh leave out.
+        /// </summary>
+        public bool IsHoleCell(int x, int z)
+        {
+            var holes = Holes;
+            if (holes == null || x < 0 || z < 0 || x >= HoleResolution - 1 || z >= HoleResolution - 1) return false;
+            int i = z * HoleResolution + x;
+            return holes[i] + holes[i + 1] + holes[i + HoleResolution] + holes[i + HoleResolution + 1] >= 2 * 255;
+        }
     }
 }

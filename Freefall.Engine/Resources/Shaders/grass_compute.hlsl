@@ -22,6 +22,7 @@
 
 #include "decoration_noise.hlsli"   // DecoClusterMask, DecoHeightFactor
 #include "ground_shape.hlsli"       // GroundShape, GroundShapeTint, PackGroundTint
+#include "terrain_holes.hlsli"      // TerrainHoleAt
 
 // Push constants (root parameter 0, register b3) — bindless indices only
 cbuffer PushConstants : register(b3)
@@ -53,6 +54,7 @@ cbuffer PushConstants : register(b3)
     uint SplatControlIdx;           // slot 24 — SRV: the terrain's layer weights (Texture2DArray, 4 layers per slice)
     uint LayerPlantTintIdx;         // slot 25 — SRV: StructuredBuffer<float4>, TerrainLayer.PlantTint per channel
     uint SplatLayerCount;           // slot 26 — layers in the palette (0 = no plant tint)
+    uint HoleTexIdx;                // slot 27 — SRV: R8 hole mask (HoleStamp, terrain_holes.hlsli), 0 = no holes
 };
 
 // Camera frustum in terrain-local space (root slot 1 → register b0, uploaded by the terrain quadtree pass).
@@ -637,6 +639,9 @@ void CS_SpawnInstances(uint3 gid : SV_GroupID, uint3 gtid3 : SV_GroupThreadID)
                 w *= lerp(1.0, DecoClusterMask(float2(localXZ.x, TerrainSize.y - localXZ.y), slot.ClusterScale, slot.Seed), saturate(slot.ClusterAmount));
             float weight = w * w * w;
             if (float(pcg(instSeed + 6211u)) / 4294967295.0 >= weight * invMaxWeight) continue;
+
+            // Nothing grows where a hole opens the terrain (the edge the terrain is cut at)
+            if (TerrainHoleAt(HoleTexIdx, ClampSampler, localXZ, TerrainSize)) continue;
 
             // ── Heightmap sample ──
             float h = heightTex.SampleLevel(HeightSampler, texelUV, 0).r;

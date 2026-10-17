@@ -155,8 +155,13 @@ namespace Freefall.Graphics
             for (int i = 0; i < technique.Passes.Count; i++)
             {
                 var pass = technique.Passes[i];
-                // An unknown name used to parse to default(RenderPass) = Shadow, and got the shadow PSO overrides
-                if (!Enum.TryParse<RenderPass>(pass.Name, out var type))
+                // An unknown name used to parse to default(RenderPass) = Shadow, and got the shadow PSO overrides.
+                // "<Pass>_<variant>" (Shadow_Holes) is a variant of that pass: it gets the pass' PSO state, and only a
+                // renderer that asks for it by name draws with it (SetPass(RenderPass) finds the plain one first).
+                var passName = pass.Name;
+                int variant = passName.IndexOf('_');
+                if (variant > 0) passName = passName[..variant];
+                if (!Enum.TryParse<RenderPass>(passName, out var type))
                     type = ShaderPass.NamedOnly;
 
                 ShaderPasses.Add(new ShaderPass

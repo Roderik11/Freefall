@@ -51,6 +51,20 @@ namespace Freefall.PCG
             }
 
             var terrain = terrains[0] as IHeightProvider;
+
+            // No ground where a HoleStamp opens the terrain: points there would float over the hole
+            if (terrains[0].Terrain is { HasHoles: true })
+            {
+                var renderer = terrains[0];
+                var matrix = WorldMatrix;
+                points = points.Filter(i => !renderer.IsHole(Vector3.Transform(points.position[i], matrix)));
+                if (points.Count == 0)
+                {
+                    SetOutput("Output", SamplePointSet.Empty());
+                    return;
+                }
+            }
+
             var result = points.Clone();
             result.normal = new Vector3[result.Count];
             const float delta = 0.5f;

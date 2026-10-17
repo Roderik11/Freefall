@@ -27,6 +27,7 @@ cbuffer PushConstants : register(b3)
     uint ShadowCascadeCount;    // 24: uint: number of cascades
     uint CascadeIdxBufIdx;      // 25: SRV: per-entry cascade index (uint)
     uint HeightMapsIdx;         // 26: Texture2DArray for per-layer height maps (SSDM)
+    uint HoleTexIdx;            // 27: R8 hole mask (HoleStamp, terrain_holes.hlsli), 0 = no holes
 };
 
 #include "common.fx"
@@ -66,6 +67,14 @@ SamplerState sampData : register(s0); // WrappedAnisotropic
 SamplerState sampHeight : register(s1); // ClampedPoint2D
 SamplerState sampHeightFilter : register(s2); // ClampedBilinear2D
 SamplerState sampTrilinear : register(s4); // WrappedTrilinear — displacement/height maps
+
+#include "terrain_holes.hlsli"
+
+// Holes (HoleStamp): nothing of the terrain is drawn there, in any pass
+bool InTerrainHole(float2 worldXZ)
+{
+    return TerrainHoleAt(HoleTexIdx, sampHeightFilter, worldXZ - TerrainOrigin, TerrainSize);
+}
 
 // Edge-stitched vertex: snaps odd edge vertices to even positions on edges
 // adjacent to coarser neighbors. No morphing — hard LOD transition masked
@@ -515,6 +524,10 @@ FragmentOutput PS(VertexOutput input)
 {
     FragmentOutput output;
 
+    // Not in the depth prepass' variant without holes (DepthPrepass, no discard), so this pass must cut them itself:
+    // with no depth there, the hole would otherwise be shaded over whatever lies below it
+    if (InTerrainHole(input.WorldPos.xz)) discard;
+
     float3 terrainNormal = GetNormal(input.UV2);
     float3 faceNormal = terrainNormal;
 
@@ -613,6 +626,14 @@ FragmentOutput PS(VertexOutput input)
     {
         hasAnyLayer = true;
         float threshold = maxCombined - blendDepth;
+        // SSDM height: the same height blend, over the widest window (1) whatever the colour's depth. Displacing exactly
+        // the surface that shows (the colour's window, 0.2 on Eldermoor) flips the height from one layer to the next
+        // within a pixel or two (turf against the gap between two cobbles), a step the screen-space inversion cannot
+        // follow: dark specks along every patch edge; 0.5 still left a few. Until 2026-10-17 a lerp over the stack
+        // weights in channel order instead: a stone moved by its weight only, and halfway to the grass the height sank
+        // below both layers (0.5 hc + 0.25 hg)
+        float dispThreshold = maxCombined - 1.0;
+        float totalDisp = 0;
 
         float4 blendedColor = 0;
         float3 blendedMean = 0;
@@ -647,6 +668,10 @@ FragmentOutput PS(VertexOutput input)
                     else
                         heightVal = HeightMaps.SampleGrad(sampTrilinear, float3(texuv, layer), texDdx, texDdy).r;
                 }
+
+                float bd = max(ew + ew * heightVal - dispThreshold, 0);    // a layer without a height map is flat
+                blendedHeight += heightVal * LayerTiling[layer].w * bd;
+                totalDisp += bd;
 
                 float bf = max(ew + ew * heightVal - threshold, 0);
                 if (bf <= 0) continue;
@@ -691,13 +716,6 @@ FragmentOutput PS(VertexOutput input)
                 blendedMean += DiffuseMaps.SampleLevel(sampData, float3(0.5, 0.5, layer), 16).rgb * LayerTint[layer].rgb * bf;
                 blendedTilt += tilt * bf;
                 totalBlend += bf;
-
-                // SSDM displacement: sequential lerp using effective weight
-                if (HeightMapsIdx != 0 && LayerTiling[layer].z > 0.5)
-                {
-                    float h = heightVal * LayerTiling[layer].w;
-                    blendedHeight = lerp(blendedHeight, h, ew);
-                }
             }
         }
 
@@ -708,6 +726,8 @@ FragmentOutput PS(VertexOutput input)
             layerMean = blendedMean * invTotal;
             normalTilt = blendedTilt * invTotal;
         }
+        if (totalDisp > 0)
+            blendedHeight /= totalDisp;
     }
 
     // Normal maps, UDN (partial derivative addition) in world space: each projection's tilt is already oriented
@@ -860,6 +880,7 @@ FragmentOutput PS(VertexOutput input)
 struct ShadowVSOutput
 {
     float4 Position : SV_POSITION;
+    float2 WorldXZ : TEXCOORD0;     // for the hole test (Shadow_Holes)
     nointerpolation uint RTIndex : SV_RenderTargetArrayIndex;
 };
 
@@ -867,6 +888,7 @@ ShadowVSOutput VS_Shadow(uint primitiveVertexID : SV_VertexID, uint instanceID :
 {
     ShadowVSOutput output;
     output.Position = float4(0, 0, 0, 1);
+    output.WorldXZ = 0;
     output.RTIndex = 0;
 
     uint patchIdx = instanceID; // direct 1:1 mapping
@@ -899,6 +921,7 @@ ShadowVSOutput VS_Shadow(uint primitiveVertexID : SV_VertexID, uint instanceID :
     float3 stitchedPos = StitchVertex(pos, rect.xy, rectSize, stitchMask, entityWorld, heightUV);
 
     float4 worldPosition = mul(float4(stitchedPos, 1), world);
+    output.WorldXZ = worldPosition.xz;
 
     // Project using cascade-specific VP from cascade buffer
     StructuredBuffer<CascadeData> cascades = ResourceDescriptorHeap[CascadeBufferSRVIdx];
@@ -919,6 +942,9 @@ RasterizerState Wireframe
 // batches, every terrain pixel ran the full splat shader, also those the batches then covered: a town plaza view
 // paid ~1.4 ms for terrain it hardly showed (2026-10-16).
 // Opaque is the single-pass draw (kept for anything that draws the terrain without the late queue).
+// DepthPrepass_Holes / Shadow_Holes are what a terrain with holes (HoleStamp) draws instead of DepthPrepass / Shadow:
+// a pixel shader that can discard writes its depth late, so a terrain without holes keeps the variants without one.
+// The shading passes (Opaque, Shade) test for holes in either case: they write no depth (Shade) or run the full PS anyway.
 technique11 GPUTerrain
 {
     pass Opaque
@@ -946,6 +972,18 @@ technique11 GPUTerrain
         SetVertexShader(CompileShader(vs_6_6, VS_Shadow()));
         SetPixelShader(CompileShader(ps_6_6, PS_Shadow()));
     }
+    pass DepthPrepass_Holes
+    {
+        SetRasterizerState(Wireframe);
+        SetVertexShader(CompileShader(vs_6_6, VS()));
+        SetPixelShader(CompileShader(ps_6_6, PS_DepthOnly_Holes()));
+        SetRenderState(RenderTargets=6, Blend=NoColor)
+    }
+    pass Shadow_Holes
+    {
+        SetVertexShader(CompileShader(vs_6_6, VS_Shadow()));
+        SetPixelShader(CompileShader(ps_6_6, PS_Shadow_Holes()));
+    }
 }
 
 // Minimal depth-only PS — required for SV_RenderTargetArrayIndex propagation
@@ -953,3 +991,14 @@ void PS_Shadow(ShadowVSOutput input) { }
 
 // Depth prepass: no colour (Blend=NoColor masks the G-buffer targets)
 void PS_DepthOnly(VertexOutput input) { }
+
+// The same where a hole opens the terrain: no depth (the cave below shows) and no shadow (light falls into it)
+void PS_Shadow_Holes(ShadowVSOutput input)
+{
+    if (InTerrainHole(input.WorldXZ)) discard;
+}
+
+void PS_DepthOnly_Holes(VertexOutput input)
+{
+    if (InTerrainHole(input.WorldPos.xz)) discard;
+}

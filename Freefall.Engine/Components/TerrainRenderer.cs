@@ -267,6 +267,17 @@ namespace Freefall.Components
         private bool _topLayersWanted;
         private volatile bool _topLayersStale;     // a bake has run since the CPU copy was fetched
 
+        // ───── Holes (HoleStamp) ───────────────────────────────────────────
+        // The mask itself is Terrain.Holes, baked on the CPU (TerrainBaker.BakeHoles) because the PhysX height
+        // field, the navmesh and PCG need it there; this is its copy for the shaders (terrain_holes.hlsli).
+        private ID3D12Resource? _holeTex;          // R8_UNorm, one texel per height sample
+        private uint _holeSRV;
+        private int _holeTexResolution;
+        private List<TerrainBaker.HoleRect>? _holeRects;   // what the last hole bake cut; null = not known (mask from the cache)
+
+        /// <summary>The hole mask the shaders read (bindless SRV), 0 when nothing opens the terrain.</summary>
+        private uint HoleSrv => Terrain is { HasHoles: true } && _holeTex != null ? _holeSRV : 0u;
+
         // ───── Lifecycle ──────────────────────────────────────────────────
 
         protected override void Awake()
@@ -392,6 +403,12 @@ namespace Freefall.Components
             if (_topLayerUAV != 0) device?.DeferReleaseBindlessIndex(_topLayerUAV);
             _topLayers = null;
 
+            // ── Hole mask (the CPU mask stays with the Terrain asset, like its heights) ──
+            device?.DeferDispose(_holeTex);
+            if (_holeSRV != 0) device?.DeferReleaseBindlessIndex(_holeSRV);
+            _holeTex = null;
+            _holeSRV = 0;
+
             // ── Decorator buffers ──
             device?.DeferDispose(_decoratorHeadersBuffer);
             device?.DeferDispose(_decoratorSlotsBuffer);
@@ -494,7 +511,18 @@ namespace Freefall.Components
             {
                 _initialBakeRequested = true;
                 Terrain.MarkForUpdate(TerrainDirtyFlags.HeightBake | TerrainDirtyFlags.SplatPack |
-                                      TerrainDirtyFlags.AlbedoBake | TerrainDirtyFlags.DecoPrepass);
+                                      TerrainDirtyFlags.AlbedoBake | TerrainDirtyFlags.DecoPrepass |
+                                      TerrainDirtyFlags.HoleBake);
+            }
+
+            // ── Holes: cut on the CPU, where physics, the navmesh and PCG read them; the shaders get a copy ──
+            // What sampled the ground there hears of it once the stamps have settled (not while one is dragged)
+            if (Terrain.ConsumeFlags(TerrainDirtyFlags.HoleBake))
+                RebakeHoles();
+            else if (_holeChanges.Count > 0)
+            {
+                NotifyHolesChanged(_holeChanges);
+                _holeChanges.Clear();
             }
 
             // ── Height: lay out the bake from the height stamps in scope ──
@@ -1181,6 +1209,10 @@ namespace Freefall.Components
 
             var device = Engine.Device;
 
+            // Holes: the depth prepass needs its variant that can discard (see the technique in gputerrain.fx)
+            uint holes = HoleSrv;
+            if (holes != 0 && pass == "DepthPrepass") pass = "DepthPrepass_Holes";
+
             // Apply material PSO and textures (the pass explicitly: the shadow draw changes it)
             Material!.SetPass(pass);
             Material!.Apply(commandList, device);
@@ -1212,6 +1244,8 @@ namespace Freefall.Components
             commandList.SetGraphicsRoot32BitConstant(0, _decoratorTintBuffer?.SrvIndex ?? 0u, 22);
             // Slot 26: HeightMapsArray SRV (SSDM per-layer displacement)
             commandList.SetGraphicsRoot32BitConstant(0, (uint)(HeightMapsArray?.BindlessIndex ?? 0), 26);
+            // Slot 27: hole mask (HoleStamp), 0 = none
+            commandList.SetGraphicsRoot32BitConstant(0, holes, 27);
 
             // ExecuteIndirect with DrawInstancedSignature — args written by CSBuildDrawArgs
             commandList.ExecuteIndirect(
@@ -1353,11 +1387,15 @@ namespace Freefall.Components
             // Phase 2: Draw terrain shadows (graphics)
             // ════════════════════════════════════════════════════════════════
 
-            Material.SetPass(RenderPass.Shadow);
+            // Where a hole opens the terrain it casts no shadow: light falls into the cave mouth
+            uint holes = HoleSrv;
+            if (holes != 0) Material.SetPass("Shadow_Holes");
+            else Material.SetPass(RenderPass.Shadow);
             Material.Apply(commandList, device);
 
             commandList.IASetPrimitiveTopology(Vortice.Direct3D.PrimitiveTopology.TriangleList);
             commandList.SetDescriptorHeaps(1, new[] { device.SrvHeap });
+            commandList.SetGraphicsRoot32BitConstant(0, holes, 27);                                // HoleTexIdx
 
             // Bind shadow patch data
             commandList.SetGraphicsRoot32BitConstant(0, _shadowTerrainDataBuffers[frameIndex].SrvIndex, 1);  // TerrainDataIdx
@@ -1621,52 +1659,210 @@ namespace Freefall.Components
         /// </summary>
         private void RebuildTextureArrays()
         {
+            // The arrays are indexed by channel, so a layer without a texture gets a stand-in slice: skipped, it shifted
+            // every layer after it onto its neighbour's textures (2026-10-17: a cobble layer that lost its diffuse
+            // rendered the next layer's grass scan, untinted). No diffuse = the layer's Tint alone, no normals = flat,
+            // no height = never sampled (LayerTiling.z is 0 for it, UpdateLayerParams).
             var diffuseList = new List<Texture>();
             var normalList = new List<Texture>();
             var heightList = new List<Texture>();
+            var missingDiffuse = new List<string>();
+            var missingNormals = new List<string>();
+            int diffuseCount = 0, normalCount = 0, heightCount = 0;
 
             foreach (var layer in _layerPalette)
             {
-                if (layer.Diffuse != null && layer.Diffuse.Native != null) diffuseList.Add(layer.Diffuse);
-                if (layer.Normals != null && layer.Normals.Native != null) normalList.Add(layer.Normals);
-                if (layer.Height != null && layer.Height.Native != null)
-                    heightList.Add(layer.Height);
-            }
-            Debug.Log($"[Terrain] RebuildTextureArrays: {diffuseList.Count} diffuse, {normalList.Count} normals, {heightList.Count} heights from {_layerPalette.Count} layers");
+                if (layer.Diffuse?.Native != null) { diffuseList.Add(layer.Diffuse); diffuseCount++; }
+                else { diffuseList.Add(InternalAssets.White); missingDiffuse.Add(layer.Name); }
 
-            // The arrays are indexed by channel, so a layer without a texture would shift every layer after it
-            if (diffuseList.Count != _layerPalette.Count)
-                Debug.LogWarning("TerrainRenderer", "A terrain layer has no Diffuse texture: the layers after it render with the wrong textures.");
-            if (normalList.Count != 0 && normalList.Count != _layerPalette.Count)
-                Debug.LogWarning("TerrainRenderer", "Some terrain layers have no Normals texture: the layers after them render with the wrong normals.");
-            if (heightList.Count != 0 && heightList.Count != _layerPalette.Count)
-                Debug.LogWarning("TerrainRenderer", "Some terrain layers have no Height texture: the layers after them blend with the wrong heights.");
+                if (layer.Normals?.Native != null) { normalList.Add(layer.Normals); normalCount++; }
+                else { normalList.Add(InternalAssets.FlatNormal); missingNormals.Add(layer.Name); }
+
+                if (layer.Height?.Native != null) { heightList.Add(layer.Height); heightCount++; }
+                else heightList.Add(InternalAssets.Black);
+            }
+            Debug.Log($"[Terrain] RebuildTextureArrays: {diffuseCount} diffuse, {normalCount} normals, {heightCount} heights from {_layerPalette.Count} layers");
+
+            if (missingDiffuse.Count > 0)
+                Debug.LogWarning("TerrainRenderer", $"Terrain layer(s) without a Diffuse texture render as their Tint: {string.Join(", ", missingDiffuse)}");
+            if (missingNormals.Count > 0 && normalCount > 0)
+                Debug.LogWarning("TerrainRenderer", $"Terrain layer(s) without a Normals texture render flat: {string.Join(", ", missingNormals)}");
 
             // Also refresh tiling since channels may have moved
             UpdateLayerParams();
 
             var device = Engine.Device;
 
-            // Diffuse Fallback
-            if (diffuseList.Count > 0)
-                DiffuseMapsArray = Texture.CreateTexture2DArray(device, diffuseList);
-            else
-                DiffuseMapsArray = InternalAssets.BlackArray;
+            // A stand-in slice differs from the scans in size and format, so CreateTexture2DArray takes its compute
+            // path (uncompressed RGBA8) while any layer lacks a texture; with none missing it copies as before.
+            // Diffuse (no layer has one: every layer is its Tint)
+            DiffuseMapsArray = diffuseCount > 0 ? Texture.CreateTexture2DArray(device, diffuseList) : InternalAssets.WhiteArray;
 
-            // Normal Fallback
-            if (normalList.Count > 0)
-                NormalMapsArray = Texture.CreateTexture2DArray(device, normalList, stripSrgb: true);
-            else
-                NormalMapsArray = InternalAssets.FlatNormalArray;
+            // Normals
+            NormalMapsArray = normalCount > 0
+                ? Texture.CreateTexture2DArray(device, normalList, stripSrgb: true)
+                : InternalAssets.FlatNormalArray;
 
-            // Height Fallback (SSDM per-layer displacement heights)
-            if (heightList.Count > 0)
-                HeightMapsArray = Texture.CreateTexture2DArray(device, heightList, stripSrgb: true);
-            else
-                HeightMapsArray = null; // no height data = no displacement
+            // Heights (SSDM per-layer displacement heights; none = no displacement)
+            HeightMapsArray = heightCount > 0 ? Texture.CreateTexture2DArray(device, heightList, stripSrgb: true) : null;
 
             // The layer weights are baked separately (SplatPack); until the first bake nothing shows
             ControlMapsArray = _packedControlTexture ?? InternalAssets.BlackArray;
+        }
+
+        // ───── Holes ───────────────────────────────────────────────────────
+
+        /// <summary>
+        /// Re-cut the hole stamps into Terrain.Holes and bring the shaders' copy up to date. Only the samples the
+        /// stamps reach now or reached at the last bake are touched, so dragging a hole stamp costs its own area,
+        /// not the terrain's. Main thread.
+        /// </summary>
+        private void RebakeHoles()
+        {
+            var terrain = Terrain!;
+            var plan = TerrainBaker.PrepareHoles(terrain, this);
+            int res = plan.Resolution;
+            var mask = terrain.Holes;
+            bool sameMask = mask != null && terrain.HoleResolution == res;
+            // Where stamps cut at the last bake; null = not known (first bake: the mask came from the cache or
+            // another scene). No mask after a bake of this renderer = nothing was cut.
+            var cutBefore = _holeRects == null ? null
+                : mask == null ? new List<TerrainBaker.HoleRect>()
+                : sameMask ? _holeRects : null;
+
+            if (!plan.HasHoles)
+            {
+                if (mask != null)
+                {
+                    terrain.SetHoles(null, 0);
+                    if (cutBefore != null) _holeChanges.AddRange(cutBefore);
+                }
+                _holeRects = new List<TerrainBaker.HoleRect>();
+                return;
+            }
+
+            var cutNow = plan.Rects.ToList();
+            if (!sameMask)
+            {
+                mask = new byte[res * res];
+                TerrainBaker.BakeHoles(plan, mask, Array.Empty<TerrainBaker.HoleRect>());
+            }
+            else
+            {
+                // A mask of unknown origin (the saved one, or another scene's) is cleared whole once
+                TerrainBaker.BakeHoles(plan, mask!, cutBefore ?? [new TerrainBaker.HoleRect(0, 0, res - 1, res - 1)]);
+            }
+            terrain.SetHoles(mask, res);
+            _holeRects = cutNow;
+
+            // What changed: where stamps cut before and where they cut now (all of it when that is not known)
+            var changed = cutBefore != null ? cutBefore.Concat(cutNow).Distinct().ToList() : null;
+            // The texture holds only what was uploaded since it was made, and nothing that was cut while no
+            // mask existed: all of it then
+            bool created = EnsureHoleTexture(res);
+            UploadHoles(mask!, res, created || !sameMask ? null : changed);
+            if (changed != null)
+                foreach (var rect in changed)
+                    if (!_holeChanges.Contains(rect)) _holeChanges.Add(rect);
+        }
+
+        // Rects whose holes changed and whose listeners have not heard of it yet (sent once the bakes settle)
+        private readonly List<TerrainBaker.HoleRect> _holeChanges = new();
+
+        /// <summary>The R8 texture for the hole mask; true if it was (re)created and holds nothing yet.</summary>
+        private bool EnsureHoleTexture(int resolution)
+        {
+            if (_holeTex != null && _holeTexResolution == resolution) return false;
+
+            var device = Engine.Device;
+            device.DeferDispose(_holeTex);
+            if (_holeSRV != 0) device.DeferReleaseBindlessIndex(_holeSRV);
+
+            _holeTex = device.CreateTexture2D(Format.R8_UNorm, resolution, resolution, 1, 1,
+                ResourceFlags.None, ResourceStates.Common);
+            _holeSRV = device.AllocateBindlessIndex();
+            device.NativeDevice.CreateShaderResourceView(_holeTex,
+                new ShaderResourceViewDescription
+                {
+                    Format = Format.R8_UNorm,
+                    ViewDimension = ShaderResourceViewDimension.Texture2D,
+                    Shader4ComponentMapping = ShaderComponentMapping.Default,
+                    Texture2D = new Texture2DShaderResourceView { MostDetailedMip = 0, MipLevels = 1 }
+                }, device.GetCpuHandle(_holeSRV));
+            _holeTexResolution = resolution;
+            return true;
+        }
+
+        /// <summary>
+        /// Copy rects of the mask into the hole texture (null = all of it). The rows are copied into upload
+        /// buffers here, so the render callback never reads the mask while the next bake changes it.
+        /// </summary>
+        private unsafe void UploadHoles(byte[] mask, int res, List<TerrainBaker.HoleRect>? rects)
+        {
+            var device = Engine.Device;
+            var tex = _holeTex!;
+            rects ??= [new TerrainBaker.HoleRect(0, 0, res - 1, res - 1)];
+
+            foreach (var r in rects)
+            {
+                int w = r.X1 - r.X0 + 1, h = r.Z1 - r.Z0 + 1;
+                int rowPitch = (w + 255) & ~255;
+                var upload = device.NativeDevice.CreateCommittedResource(
+                    new HeapProperties(HeapType.Upload), HeapFlags.None,
+                    ResourceDescription.Buffer((ulong)(rowPitch * h)), ResourceStates.GenericRead, null);
+
+                void* data;
+                upload.Map(0, null, &data);
+                fixed (byte* src = mask)
+                    for (int z = 0; z < h; z++)
+                        Buffer.MemoryCopy(src + (long)(r.Z0 + z) * res + r.X0, (byte*)data + (long)z * rowPitch, w, w);
+                upload.Unmap(0);
+
+                var footprint = new PlacedSubresourceFootPrint
+                {
+                    Offset = 0,
+                    Footprint = new SubresourceFootPrint(Format.R8_UNorm, (uint)w, (uint)h, 1, (uint)rowPitch)
+                };
+                uint x0 = (uint)r.X0, z0 = (uint)r.Z0;
+                CommandBuffer.Enqueue(RenderPass.Opaque, list =>
+                {
+                    list.ResourceBarrierTransition(tex, ResourceStates.Common, ResourceStates.CopyDest);
+                    list.CopyTextureRegion(new TextureCopyLocation(tex, 0), x0, z0, 0, new TextureCopyLocation(upload, footprint));
+                    list.ResourceBarrierTransition(tex, ResourceStates.CopyDest, ResourceStates.Common);
+                });
+                device.DeferDispose(upload);   // until the frames that copy from it are done
+            }
+        }
+
+        /// <summary>
+        /// Tell what samples the ground (PCG's TerrainProjection drops points in holes) that the holes changed in
+        /// these rects. A first bake after a load records no rects: its height readback announces the whole
+        /// terrain anyway.
+        /// </summary>
+        private void NotifyHolesChanged(List<TerrainBaker.HoleRect> rects)
+        {
+            if (Terrain == null || Transform == null) return;
+
+            var origin = Transform.WorldPosition;
+            float step = Terrain.TerrainSize.X / (Terrain.EffectiveHeightmapResolution - 1);
+            foreach (var r in rects)
+            {
+                var min = new Vector2(origin.X + r.X0 * step, origin.Z + r.Z0 * step);
+                var max = new Vector2(origin.X + r.X1 * step, origin.Z + r.Z1 * step);
+                MessageDispatcher.Send(EngineMsg.TerrainHeightsChanged, new TerrainHeightsChange(Terrain, false, min, max));
+            }
+        }
+
+        /// <summary>
+        /// True where a HoleStamp opens the terrain (X and Z of the position): no ground is drawn there and nothing
+        /// collides with it. GetHeight still answers with the surface the hole was cut out of.
+        /// </summary>
+        public bool IsHole(Vector3 position)
+        {
+            var terrain = Terrain;
+            if (terrain is not { HasHoles: true } || Transform == null) return false;
+            var origin = Transform.Position;
+            return terrain.IsHole(position.X - origin.X, position.Z - origin.Z);
         }
 
         // ───── IHeightProvider ────────────────────────────────────────────
@@ -2405,6 +2601,7 @@ namespace Freefall.Components
                     cs.SetBuffer("LayerPlantTint", _plantTintBuffer!);
                 }
                 cs.SetPushConstant("SplatLayerCount", plantTints ? (uint)_layerPalette.Count : 0u);
+                cs.SetPushConstant("HoleTex", HoleSrv);   // nothing spawns in a hole
 
                 // ── cbuffer DecoParams ──
                 cs.SetParam("TerrainSize", new Vector2(Terrain.TerrainSize.X, Terrain.TerrainSize.Y));
@@ -2724,6 +2921,13 @@ namespace Freefall.Components
         private void RequestRebake(TerrainStamp stamp)
         {
             RebakeRequestCount++;
+
+            // A hole changes nothing the bakes on the GPU produce; it announces its own region (RebakeHoles)
+            if (stamp is HoleStamp)
+            {
+                Terrain?.MarkForUpdate(TerrainDirtyFlags.HoleBake);
+                return;
+            }
 
             if (stamp is CoverageStamp { IsGlobal: true })
             {

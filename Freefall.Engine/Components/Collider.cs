@@ -345,8 +345,8 @@ namespace Freefall.Components
             float fx = terrain.TerrainSize.X / (rows - 1);
             float fy = terrain.TerrainSize.Y / (cols - 1);
 
-            Debug.Log($"[RigidBody] Cooking HeightField: {rows}x{cols}, MaxHeight={terrain.MaxHeight}, fx={fx}, fy={fy}");
-            var samples = heightMap.ToSamples();
+            Debug.Log($"[RigidBody] Cooking HeightField: {rows}x{cols}, MaxHeight={terrain.MaxHeight}, fx={fx}, fy={fy}, holes={terrain.HasHoles}");
+            var samples = heightMap.ToSamples(terrain);
 
             var heightFieldDesc = new HeightFieldDesc()
             {

@@ -73,6 +73,9 @@ namespace Freefall.Assets.Loaders
                 // Load persisted baked heightmap (R16_UNorm DDS)
                 LoadBakedHeightmap(terrain);
 
+                // And the hole mask that goes with it (R8 DDS), so colliders cooked before the first bake have the holes
+                LoadBakedHoles(terrain);
+
                 Debug.Log($"[TerrainLoader] '{name}' loaded: HeightField={terrain.HeightField != null}, " +
                           $"CookedHeightField={terrain.CookedHeightField != null}");
 
@@ -158,6 +161,30 @@ namespace Freefall.Assets.Loaders
             {
                 Debug.Log($"[TerrainLoader] Baked heightmap loaded: {bytes.Length} bytes (CPU HeightField deferred)");
             }
+        }
+
+        /// <summary>
+        /// Loads the saved hole mask (one byte per height sample, see Terrain.Holes). The renderer rebakes it from
+        /// the hole stamps once it draws; until then (and in a process that never draws) this is what holds.
+        /// </summary>
+        private void LoadBakedHoles(Terrain terrain)
+        {
+            terrain.SetHoles(null, 0);
+            if (terrain.BakedHolesRef == null || string.IsNullOrEmpty(terrain.BakedHolesRef.Guid))
+                return;
+
+            var bytes = LoadDdsBytes(terrain.BakedHolesRef.Guid);
+            if (bytes == null) return;
+
+            int resolution = (int)Math.Sqrt(bytes.Length);
+            if (resolution * resolution != bytes.Length)
+            {
+                Debug.LogWarning("TerrainLoader", $"Hole mask of '{terrain.Name}' is {bytes.Length} bytes, not a square R8 image; ignored");
+                return;
+            }
+
+            terrain.SetHoles(bytes, resolution);
+            Debug.Log($"[TerrainLoader] Hole mask loaded: {resolution}x{resolution}");
         }
 
         /// <summary>
@@ -259,6 +286,21 @@ namespace Freefall.Assets.Loaders
             SaveDdsSubasset(terrain.BakedHeightmapRef.Guid, bytes);
             Debug.Log($"[TerrainLoader] Baked heightmap saved: {bytes.Length} bytes, res={resolution}");
 
+            // The hole mask next to it (CPU data, nothing to read back). No holes = no reference, so a load finds none.
+            if (terrain.HasHoles)
+            {
+                if (terrain.BakedHolesRef == null)
+                    terrain.BakedHolesRef = new Texture();
+                if (string.IsNullOrEmpty(terrain.BakedHolesRef.Guid))
+                    terrain.BakedHolesRef.Guid = System.Guid.NewGuid().ToString("N");
+                SaveDdsSubasset(terrain.BakedHolesRef.Guid, terrain.Holes);
+                Debug.Log($"[TerrainLoader] Hole mask saved: {terrain.HoleResolution}x{terrain.HoleResolution}");
+            }
+            else
+            {
+                terrain.BakedHolesRef = null;
+            }
+
             // Cook PhysX HeightField from the CPU HeightField (always in sync after readback)
             try
             {
@@ -283,7 +325,7 @@ namespace Freefall.Assets.Loaders
                     }
                 Debug.Log($"[TerrainLoader] HeightField at save: {rows}x{cols}, range=[{hMin:F6}..{hMax:F6}]");
 
-                var samples = heightMap.ToSamples();
+                var samples = heightMap.ToSamples(terrain);
                 var hfDesc = new HeightFieldDesc
                 {
                     NumberOfRows = rows,

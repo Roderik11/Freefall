@@ -93,34 +93,17 @@ namespace Freefall.Assets.Importers
                 return null;
             }
 
-            // Read the DDS file
-            byte[] rawBytes;
-            var packer = new DdsTexturePacker();
-            using (var stream = File.OpenRead(cachePath))
-            {
-                var dds = packer.Read(stream);
-                rawBytes = dds?.Bytes;
-            }
-
-            if (rawBytes == null || rawBytes.Length == 0)
+            var rawBytes = ReadDdsPixels(cachePath, out int offset);
+            if (rawBytes == null)
             {
                 Debug.LogWarning("TerrainImporter", "Baked heightmap DDS is empty");
                 return null;
             }
 
-            // Strip DDS header if present
-            int offset = 0;
-            if (rawBytes.Length > 128 && BitConverter.ToInt32(rawBytes, 0) == 0x20534444)
-            {
-                offset = 128;
-                if (rawBytes.Length > 148 && BitConverter.ToInt32(rawBytes, 84) == 0x30315844)
-                    offset = 148;
-            }
-
             int pixelDataLen = rawBytes.Length - offset;
 
-            // Parse the R16_Float data into float[,]
-            // R16_Float = 2 bytes per pixel
+            // The baked heightmap is R16_UNorm (TerrainBaker.ReadbackBakedHeightmapBytes), 2 bytes per pixel.
+            // Until 2026-10-17 this read them as half floats, which cooked a field of garbage.
             int resolution = (int)Math.Sqrt(pixelDataLen / 2);
             if (resolution * resolution * 2 != pixelDataLen)
             {
@@ -134,13 +117,28 @@ namespace Freefall.Assets.Importers
                 for (int x = 0; x < resolution; x++)
                 {
                     int idx = offset + (y * resolution + x) * 2;
-                    Half h = BitConverter.ToHalf(rawBytes, idx);
-                    heightField[x, y] = (float)h;
+                    heightField[x, y] = BitConverter.ToUInt16(rawBytes, idx) / 65535f;
+                }
+            }
+
+            // The hole mask saved with it (HoleStamp), if any
+            Terrain holes = null;
+            var holesGuid = ExtractGuid(yaml, "BakedHolesRef");
+            var holesPath = holesGuid != null ? AssetDatabase.ResolveCachePathByGuid(holesGuid) : null;
+            if (holesPath == null && holesGuid != null && AssetDatabase.Project?.CacheDirectory != null)
+                holesPath = Path.Combine(AssetDatabase.Project.CacheDirectory, $"{holesGuid}.dds");
+            if (holesPath != null && File.Exists(holesPath))
+            {
+                var holeBytes = ReadDdsPixels(holesPath, out int holeOffset);
+                if (holeBytes != null && holeBytes.Length - holeOffset == resolution * resolution)
+                {
+                    holes = new Terrain();
+                    holes.SetHoles(holeBytes.AsSpan(holeOffset).ToArray(), resolution);
                 }
             }
 
             // Cook PhysX HeightField
-            var samples = heightField.ToSamples();
+            var samples = heightField.ToSamples(holes);
             var heightFieldDesc = new HeightFieldDesc()
             {
                 NumberOfRows = resolution,
@@ -159,10 +157,30 @@ namespace Freefall.Assets.Importers
         /// <summary>
         /// Extract the BakedHeightmapRef GUID from the terrain YAML.
         /// </summary>
-        private static string ExtractBakedHeightmapGuid(string yaml)
+        private static string ExtractBakedHeightmapGuid(string yaml) => ExtractGuid(yaml, "BakedHeightmapRef");
+
+        private static string ExtractGuid(string yaml, string member)
         {
-            var match = Regex.Match(yaml, @"BakedHeightmapRef:\s*([0-9a-fA-F]{32})", RegexOptions.Multiline);
+            var match = Regex.Match(yaml, member + @":\s*([0-9a-fA-F]{32})", RegexOptions.Multiline);
             return match.Success ? match.Groups[1].Value : null;
+        }
+
+        /// <summary>A DDS subasset's bytes and where its pixels start (after the header, if it has one). Null if empty.</summary>
+        private static byte[] ReadDdsPixels(string path, out int offset)
+        {
+            offset = 0;
+            byte[] rawBytes;
+            using (var stream = File.OpenRead(path))
+                rawBytes = new DdsTexturePacker().Read(stream)?.Bytes;
+            if (rawBytes == null || rawBytes.Length == 0) return null;
+
+            if (rawBytes.Length > 128 && BitConverter.ToInt32(rawBytes, 0) == 0x20534444)
+            {
+                offset = 128;
+                if (rawBytes.Length > 148 && BitConverter.ToInt32(rawBytes, 84) == 0x30315844)
+                    offset = 148;
+            }
+            return rawBytes;
         }
     }
 }

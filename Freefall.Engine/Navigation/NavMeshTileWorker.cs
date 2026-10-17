@@ -33,9 +33,12 @@ namespace Freefall.Navigation
             private float[] _verts = new float[3 * 8192];
             private int _vertCount;
 
-            // Terrain patches sampled into _verts, waiting for the heightfield
-            private (int baseVertex, int rowWidth, int rows)[] _patches = new (int, int, int)[4];
+            // Terrain patches sampled into _verts, waiting for the heightfield. holeStart: the patch's quads in
+            // _quadHoles (true = a HoleStamp opens the terrain there), -1 = the terrain has no holes
+            private (int baseVertex, int rowWidth, int rows, int holeStart)[] _patches = new (int, int, int, int)[4];
             private int _patchCount;
+            private bool[] _quadHoles = new bool[1024];
+            private int _quadHoleCount;
 
             // ── Heightfield of the cell being built ──
             private RcHeightfield? _solid;
@@ -69,6 +72,7 @@ namespace Freefall.Navigation
 
                 _vertCount = 0;
                 _patchCount = 0;
+                _quadHoleCount = 0;
                 long t0 = Stopwatch.GetTimestamp();
 
                 // ── Inputs: hash them, find the height range ──
@@ -219,9 +223,32 @@ namespace Freefall.Navigation
                 hash = NavHash.Mix(hash, ((ulong)(uint)x0 << 32) | (uint)z0);
                 hash = NavHash.Mix(hash, ((ulong)(uint)x1 << 32) | (uint)z1);
 
+                // Holes: a quad whose centre lies in one is left out. Only quads that are holes go into the hash,
+                // so tiles away from every hole keep their hashes.
+                int holeStart = -1;
+                if (terrain.Holes != null)
+                {
+                    holeStart = _quadHoleCount;
+                    int quads = (rowWidth - 1) * (rows - 1);
+                    if (_quadHoleCount + quads > _quadHoles.Length)
+                        Array.Resize(ref _quadHoles, Math.Max(_quadHoles.Length * 2, _quadHoleCount + quads));
+                    int q = holeStart;
+                    for (int z = z0; z < z1; z++)
+                    {
+                        float centreZ = MathF.Min((z + 0.5f) * step, terrain.Size.Y);
+                        for (int x = x0; x < x1; x++)
+                        {
+                            bool hole = terrain.IsHole(MathF.Min((x + 0.5f) * step, terrain.Size.X), centreZ);
+                            _quadHoles[q++] = hole;
+                            if (hole) hash = NavHash.Mix(hash, ((ulong)(uint)x << 32) | (uint)z);
+                        }
+                    }
+                    _quadHoleCount = q;
+                }
+
                 if (_patchCount == _patches.Length)
                     Array.Resize(ref _patches, _patchCount * 2);
-                _patches[_patchCount++] = (_vertCount, rowWidth, rows);
+                _patches[_patchCount++] = (_vertCount, rowWidth, rows, holeStart);
 
                 var verts = _verts;
                 int o = _vertCount * 3;
@@ -249,11 +276,13 @@ namespace Freefall.Navigation
             {
                 for (int p = 0; p < _patchCount; p++)
                 {
-                    var (baseVertex, rowWidth, rows) = _patches[p];
+                    var (baseVertex, rowWidth, rows, holeStart) = _patches[p];
                     for (int z = 0; z < rows - 1; z++)
                     {
                         for (int x = 0; x < rowWidth - 1; x++)
                         {
+                            if (holeStart >= 0 && _quadHoles[holeStart + z * (rowWidth - 1) + x]) continue;
+
                             int i00 = baseVertex + z * rowWidth + x;
                             int i10 = i00 + 1;
                             int i01 = i00 + rowWidth;
@@ -266,6 +295,7 @@ namespace Freefall.Navigation
                 }
                 _vertCount = 0;
                 _patchCount = 0;
+                _quadHoleCount = 0;
             }
 
             // ── Meshes ──

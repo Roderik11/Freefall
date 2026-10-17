@@ -1331,6 +1331,231 @@ namespace Freefall.Assets
             Upload(splineBuffer, plan.SplinePoints);
         }
 
+        // ═══════════════════════════════════════════════════════════════════
+        // ── Holes (HoleStamp) ──
+        // ═══════════════════════════════════════════════════════════════════
+        //
+        // Baked on the CPU, not in a compute pass: the PhysX height field, the navmesh and PCG all need the mask
+        // on the CPU, and hole stamps are few and small, so only the samples under each stamp are evaluated. The
+        // shape is EvaluateStampWeight's (terrain_stamp_common.hlsli), ported below, edge noise included.
+
+        /// <summary>One hole stamp's shape in terrain UV, and the mask samples it can reach.</summary>
+        internal struct HoleShape
+        {
+            public Vector2 Center;
+            public float Radius, Falloff;
+            public int PointStart, PointCount;   // PointCount 0 = radial
+            public bool Closed;
+            public float NoiseFreq, NoiseAmp;
+            public uint NoiseSeed;
+            public HoleRect Rect;
+        }
+
+        /// <summary>Mask samples x0..x1, z0..z1 (inclusive).</summary>
+        public readonly record struct HoleRect(int X0, int Z0, int X1, int Z1)
+        {
+            public bool Overlaps(HoleRect o) => X0 <= o.X1 && X1 >= o.X0 && Z0 <= o.Z1 && Z1 >= o.Z0;
+        }
+
+        /// <summary>The hole stamps of a terrain, captured on the main thread.</summary>
+        public sealed class HolePlan
+        {
+            internal readonly List<HoleShape> Shapes = new();
+            internal readonly List<StampSplinePointGPU> Points = new();
+            public int Resolution;
+
+            public bool HasHoles => Shapes.Count > 0;
+
+            /// <summary>The samples each stamp can reach: what a later bake has to clear again.</summary>
+            public IEnumerable<HoleRect> Rects
+            {
+                get { foreach (var shape in Shapes) yield return shape.Rect; }
+            }
+        }
+
+        /// <summary>Collect the hole stamps that cut a terrain. Global ones would remove all of it and are skipped.</summary>
+        public static HolePlan PrepareHoles(Terrain terrain, TerrainRenderer renderer)
+        {
+            var plan = new HolePlan { Resolution = terrain.EffectiveHeightmapResolution };
+            var origin = renderer.Transform?.WorldPosition ?? Vector3.Zero;
+            var size = terrain.TerrainSize;
+            float uvScale = 1f / Math.Max(size.X, size.Y);
+            int last = plan.Resolution - 1;
+
+            foreach (var stamp in CollectStamps<HoleStamp>(renderer))
+            {
+                if (stamp.IsGlobal) continue;
+
+                var shape = new HoleShape { Falloff = Math.Max(stamp.Falloff, 0f) * uvScale };
+                if (stamp.EnableNoise && stamp.NoiseAmplitude > 0f)
+                {
+                    shape.NoiseFreq = stamp.NoiseFrequency;
+                    shape.NoiseAmp = stamp.NoiseAmplitude * uvScale;
+                    shape.NoiseSeed = (uint)stamp.NoiseSeed;
+                }
+
+                // How far the shape reaches in UV, around its centre or around every spline sample
+                Vector2 min, max;
+                if (stamp.IsSplineMode)
+                {
+                    shape.PointStart = plan.Points.Count;
+                    if (!BuildSplinePoints(stamp, origin, size, terrain.MaxHeight, 0f, plan.Points,
+                            out _, out uint count, out shape.Radius))
+                        continue;
+                    shape.Closed = (count & 0x80000000) != 0;
+                    shape.PointCount = (int)(count & 0x7FFFFFFF);
+
+                    min = new Vector2(float.MaxValue);
+                    max = new Vector2(float.MinValue);
+                    for (int i = shape.PointStart; i < shape.PointStart + shape.PointCount; i++)
+                    {
+                        var p = plan.Points[i];
+                        float falloff = shape.Radius > 1e-7f ? shape.Falloff * p.HalfWidth / shape.Radius : shape.Falloff;
+                        float reach = p.HalfWidth + falloff + shape.NoiseAmp;
+                        min = Vector2.Min(min, p.UV - new Vector2(reach));
+                        max = Vector2.Max(max, p.UV + new Vector2(reach));
+                    }
+                }
+                else
+                {
+                    var pos = stamp.Transform?.WorldPosition ?? Vector3.Zero;
+                    shape.Center = new Vector2((pos.X - origin.X) / size.X, (pos.Z - origin.Z) / size.Y);
+                    shape.Radius = Math.Max(stamp.Radius, 0f) * uvScale;
+                    float reach = shape.Radius + shape.Falloff + shape.NoiseAmp;
+                    min = shape.Center - new Vector2(reach);
+                    max = shape.Center + new Vector2(reach);
+                }
+
+                // Sample (x, z) lies at UV (x, z) / last
+                int x0 = Math.Max(0, (int)MathF.Floor(min.X * last)), z0 = Math.Max(0, (int)MathF.Floor(min.Y * last));
+                int x1 = Math.Min(last, (int)MathF.Ceiling(max.X * last)), z1 = Math.Min(last, (int)MathF.Ceiling(max.Y * last));
+                if (x0 > x1 || z0 > z1) continue;   // off the terrain
+                shape.Rect = new HoleRect(x0, z0, x1, z1);
+                plan.Shapes.Add(shape);
+            }
+
+            return plan;
+        }
+
+        /// <summary>
+        /// Clear the given rects of the mask, then cut every stamp of the plan into it (the union of the stamps, by
+        /// the largest weight). Rects a stamp covered at the last bake must be among 'clear', or it stays cut there.
+        /// </summary>
+        public static void BakeHoles(HolePlan plan, byte[] mask, IEnumerable<HoleRect> clear)
+        {
+            int res = plan.Resolution;
+            foreach (var r in clear)
+                for (int z = r.Z0; z <= r.Z1; z++)
+                    Array.Clear(mask, z * res + r.X0, r.X1 - r.X0 + 1);
+
+            float inv = 1f / (res - 1);
+            var points = CollectionsMarshal.AsSpan(plan.Points);
+            foreach (var shape in plan.Shapes)
+            {
+                var r = shape.Rect;
+                for (int z = r.Z0; z <= r.Z1; z++)
+                {
+                    int row = z * res;
+                    for (int x = r.X0; x <= r.X1; x++)
+                    {
+                        float w = HoleWeight(shape, points, new Vector2(x * inv, z * inv));
+                        if (w <= 0f) continue;
+                        byte b = (byte)MathF.Round(w * 255f);
+                        if (b > mask[row + x]) mask[row + x] = b;
+                    }
+                }
+            }
+        }
+
+        /// <summary>EvaluateStampWeight (terrain_stamp_common.hlsli) on the CPU.</summary>
+        private static float HoleWeight(in HoleShape s, ReadOnlySpan<StampSplinePointGPU> points, Vector2 uv)
+        {
+            float dist, radius = s.Radius, falloff = s.Falloff;
+
+            if (s.PointCount > 0)
+            {
+                int n = s.PointCount;
+                int segments = s.Closed ? n : n - 1;
+                float best = float.MaxValue, bestHalfWidth = radius;
+                bool inside = false;
+
+                for (int i = 0; i < segments; i++)
+                {
+                    var p0 = points[s.PointStart + i];
+                    var p1 = points[s.PointStart + (i + 1) % n];
+
+                    var ab = p1.UV - p0.UV;
+                    float lenSq = ab.LengthSquared();
+                    float t = lenSq < 1e-10f ? 0f : Math.Clamp(Vector2.Dot(uv - p0.UV, ab) / lenSq, 0f, 1f);
+                    float d = Vector2.Distance(uv, p0.UV + ab * t);
+                    if (d < best)
+                    {
+                        best = d;
+                        bestHalfWidth = p0.HalfWidth + (p1.HalfWidth - p0.HalfWidth) * t;
+                    }
+
+                    if (s.Closed)
+                    {
+                        var a = p0.UV;
+                        var b = p1.UV;
+                        if ((a.Y <= uv.Y && b.Y > uv.Y) || (b.Y <= uv.Y && a.Y > uv.Y))
+                        {
+                            float xHit = a.X + (uv.Y - a.Y) / (b.Y - a.Y) * (b.X - a.X);
+                            if (uv.X < xHit) inside = !inside;
+                        }
+                    }
+                }
+
+                dist = s.Closed && inside ? 0f : best;
+                if (radius > 1e-7f) falloff *= bestHalfWidth / radius;
+                radius = bestHalfWidth;
+            }
+            else
+            {
+                dist = Vector2.Distance(uv, s.Center);
+            }
+
+            float total = radius + falloff;
+            if (dist >= total + (s.NoiseFreq > 0f ? s.NoiseAmp : 0f)) return 0f;
+
+            if (s.NoiseFreq > 0f && s.NoiseAmp > 0f)
+            {
+                float scale = s.NoiseFreq / MathF.Max(total, 0.001f);
+                var coord = uv * scale + new Vector2(s.NoiseSeed * 1.37f, s.NoiseSeed * 0.73f);
+                dist = MathF.Max(dist + StampNoise(coord) * s.NoiseAmp, 0f);
+            }
+
+            if (dist >= total) return 0f;
+            if (dist <= radius) return 1f;
+            float k = (dist - radius) / MathF.Max(falloff, 0.001f);
+            return 1f - k * k * (3f - 2f * k);
+        }
+
+        /// <summary>stamp_noise (terrain_stamp_common.hlsli): gradient noise in -1..1.</summary>
+        private static float StampNoise(Vector2 p)
+        {
+            var i = new Vector2(MathF.Floor(p.X), MathF.Floor(p.Y));
+            var f = p - i;
+            var u = f * f * (new Vector2(3f) - 2f * f);
+
+            float n00 = Vector2.Dot(StampHash(i), f);
+            float n10 = Vector2.Dot(StampHash(i + new Vector2(1, 0)), f - new Vector2(1, 0));
+            float n01 = Vector2.Dot(StampHash(i + new Vector2(0, 1)), f - new Vector2(0, 1));
+            float n11 = Vector2.Dot(StampHash(i + new Vector2(1, 1)), f - new Vector2(1, 1));
+
+            float nx0 = n00 + (n10 - n00) * u.X;
+            float nx1 = n01 + (n11 - n01) * u.X;
+            return nx0 + (nx1 - nx0) * u.Y;
+        }
+
+        private static Vector2 StampHash(Vector2 p)
+        {
+            float a = Vector2.Dot(p, new Vector2(127.1f, 311.7f));
+            float b = Vector2.Dot(p, new Vector2(269.5f, 183.3f));
+            static float Frac(float v) => v - MathF.Floor(v);
+            return new Vector2(-1f + 2f * Frac(MathF.Sin(a) * 43758.5453123f), -1f + 2f * Frac(MathF.Sin(b) * 43758.5453123f));
+        }
+
         // ── Shared helpers ─────────────────────────────────────────────
 
         /// <summary>

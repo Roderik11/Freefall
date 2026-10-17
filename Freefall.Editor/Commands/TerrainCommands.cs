@@ -80,7 +80,9 @@ namespace Freefall.Editor.Commands
                 float x = pt.TryGetProperty("x", out var xp) ? xp.GetSingle() : 0;
                 float z = pt.TryGetProperty("z", out var zp) ? zp.GetSingle() : 0;
                 float y = terrain.GetHeight(new Vector3(x, 0, z));
-                results.Add(new { x, y, z });
+                // Where a HoleStamp opens the ground, y is the surface it was cut out of
+                if (terrain.IsHole(new Vector3(x, 0, z))) results.Add(new { x, y, z, hole = true });
+                else results.Add(new { x, y, z });
             }
 
             return CommandResult.Json(new { count = results.Count, heights = results });
@@ -137,6 +139,13 @@ namespace Freefall.Editor.Commands
                     guid = d.Guid,
                     variants = d.Variants.Count,
                 }),
+                // HoleStamps: how many cut this terrain, and how much ground they open (samples at or over 0.5)
+                holes = new
+                {
+                    stamps = TerrainBaker.CollectStamps<HoleStamp>(terrainRenderer).Count(s => !s.IsGlobal),
+                    resolution = terrain.HoleResolution,
+                    openSamples = terrain.Holes?.Count(b => b >= 128) ?? 0,
+                },
                 warnings = terrainRenderer.PaletteWarnings,
             });
         }
