@@ -45,12 +45,12 @@ namespace Freefall.Components
         [Description("RGBA color at the far end. Fading out needs RGB at 0 too")]
         public Vector4 ColorEnd = Vector4.Zero;
 
-        [Description("Lit like a surface by the sky and the sun (an arrow's or a blade's streak): RGB × Intensity is its albedo, " +
-                     "grey by day and dark at night. Off: the ribbon gives light (a spell's trail) and RGB × Intensity is its " +
-                     "luminance in nits, shown as a light source (Atmosphere.EmissiveExposure)")]
-        public bool Lit = true;
+        [Description("Off (default): the ribbon reads as light, RGB × Intensity its luminance in nits shown as a light source " +
+                     "(Atmosphere.EmissiveExposure): an arrow's or a blade's streak stays readable at night (~4000). On: lit like a " +
+                     "surface by the sky and the sun, RGB × Intensity its albedo: grey by day, dark at night")]
+        public bool Lit = false;
 
-        [Description("Multiplier on RGB: with Lit, of the albedo (keep RGB × Intensity at most 1); without, the luminance in nits")]
+        [Description("Multiplier on RGB: the luminance in nits, or with Lit the albedo (keep RGB × Intensity at most 1)")]
         [ValueRange(0f, 200000f)]
         public float Intensity = 1f;
 
