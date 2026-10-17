@@ -70,10 +70,16 @@ TerrainCover LoadTerrainCover()
 }
 
 // 1 in the open, 0 four metres or more under the terrain (a cave): no sky and no sun there (sky_visibility.hlsli)
-float TerrainOpen(float3 worldPos, float3 N) { return TerrainOpenAt(LoadTerrainCover(), AtmosphereLinearClamp, worldPos, N); }
+float TerrainOpen(float3 worldPos, float3 N)
+{
+    return TerrainOpenAt(LoadTerrainCover(), AtmosphereLinearClamp, worldPos, N, TerrainTolerance(distance(worldPos, CamPos)));
+}
 
 // How much of the sky's light reaches a surface past the terrain, 0..1 (sky_visibility.hlsli). worldPos is absolute.
-float SkyVisibility(float3 worldPos, float3 N) { return SkyVisibilityAt(LoadTerrainCover(), AtmosphereLinearClamp, worldPos, N); }
+float SkyVisibility(float3 worldPos, float3 N)
+{
+    return SkyVisibilityAt(LoadTerrainCover(), AtmosphereLinearClamp, worldPos, N, TerrainTolerance(distance(worldPos, CamPos)));
+}
 
 // Light on a lit particle or ribbon (smoke, rain, snow, a blade's trail) at the camera's height, as a multiple of its
 // albedo (E / π, pre-exposed): half the sun's and the moon's light through the air and the clouds' average shade (a

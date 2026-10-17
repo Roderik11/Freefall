@@ -385,7 +385,7 @@ struct DSOutput
     float3 UndisplacedXZ : TEXCOORD1;  // Pre-displacement XZ for PS texture sampling
     float Depth : TEXCOORD2;
     nointerpolation uint InstanceIdx : TEXCOORD3;
-    float4 SkyAmbient : TEXCOORD4;     // rgb: the sky's ambient (as composition) x a; a: how much sky the water sees past the terrain (SkyVisibility)
+    float4 SkyAmbient : TEXCOORD4;     // rgb: the sky's ambient (as composition), constant per frame
 };
 
 [domain("tri")]
@@ -469,8 +469,7 @@ DSOutput DS(HullConstantOutput patchConstants,
     output.Position = mul(mul(float4(displaced, 1.0), View), Projection);
     output.Depth = output.Position.w;
     output.InstanceIdx = idx;
-    float skyVisible = SkyVisibility(displaced, float3(0, 1, 0));
-    output.SkyAmbient = float4(SkyAmbientLight() * skyVisible, skyVisible);
+    output.SkyAmbient = float4(SkyAmbientLight(), 1.0);
 
     return output;
 }
@@ -494,6 +493,8 @@ PSOutput PS(DSOutput input)
     OceanData ocean = oceanData[input.InstanceIdx];
 
     float3 worldPos = input.WorldPos;
+    // How much sky this pixel of sea sees past the terrain (per pixel, as water.fx: per vertex, corners on land darkened the coast)
+    float skyVisible = SkyVisibility(worldPos, float3(0, 1, 0));
     float3 V = normalize(camPos - worldPos);
     float dist = distance(worldPos, camPos);
 
@@ -563,12 +564,12 @@ PSOutput PS(DSOutput input)
     float k3 = 0.08 * NdotL;
 
     float3 scatter = ((k1 + k2) * baseColor + k3 * baseColor + 0.02 * bubbleColor) * sunRadiance
-                   + baseColor * WaterSkyIrradiance(input.SkyAmbient.rgb) * 0.1;   // light from the sky above, too
+                   + baseColor * WaterSkyIrradiance(input.SkyAmbient.rgb * skyVisible) * 0.1;   // light from the sky above, too
 
     // ── Reflectance, sky reflection and sun glint: shared with lakes and rivers (water_common.fx) ──
     // All from the mean normal and the slope variance under the pixel: no distance ramps.
     float F = WaterSpecularReflectance(NdotV, alpha);
-    float3 reflectColor = WaterSkyReflection(OceanSampler, V, N, worldPos - camPos, alpha) * input.SkyAmbient.a;   // no sky to mirror under a cliff
+    float3 reflectColor = WaterSkyReflection(OceanSampler, V, N, worldPos - camPos, alpha) * skyVisible;   // no sky to mirror under a cliff
     float3 specular = WaterSunSpecular(N, V, L, sunRadiance * 3.14159, alpha);
 
     // ── Water column: what is seen through the surface ──
@@ -624,7 +625,7 @@ PSOutput PS(DSOutput input)
     float bedDepth = (terrainDepth < 999.0) ? terrainDepth : bufDepth;
 
     // Light scattered back from a bright shallow bed: the turquoise shelf along the coast
-    float3 skyAmbient = input.SkyAmbient.rgb;
+    float3 skyAmbient = input.SkyAmbient.rgb * skyVisible;
     float shallow = exp(-max(bedDepth, 0.0) / max(0.01, ocean.ShoreFadeDepth)) * saturate(pathLen);
     shallow *= (ocean.HeightmapSRV != 0) ? shallowFade : 1.0;
     body += ocean.ShallowColor * (sunRadiance * saturate(L.y) + WaterSkyIrradiance(skyAmbient)) * 0.08 * shallow;
@@ -821,7 +822,7 @@ PSOutput PS(DSOutput input)
     color = lerp(color, foamLit, foam * 0.9);
 
     // ── The air between the camera and the water (the atmosphere's aerial perspective) ──
-    color = ApplyAerialPerspective(color, input.Position.xy, input.Depth, input.SkyAmbient.a);
+    color = ApplyAerialPerspective(color, input.Position.xy, input.Depth, skyVisible);
 
     // HDR output — no tonemapping/gamma here.
     // The finalize pass applies ACES + gamma to the entire Composite.

@@ -77,7 +77,7 @@ struct VSOutput
     float2 UV : TEXCOORD1;             // rivers: x = meters along the spline, y = meters across
     float Depth : TEXCOORD2;
     nointerpolation uint InstanceIdx : TEXCOORD3;
-    float4 SkyAmbient : TEXCOORD4;     // rgb: the sky's ambient (as composition) x a; a: how much sky the water sees past the terrain (SkyVisibility)
+    float4 SkyAmbient : TEXCOORD4;     // rgb: the sky's ambient (as composition), constant per frame
     float3 Flow : TEXCOORD5;           // rivers: xy = world xz direction of the current, z = drop per meter
 };
 
@@ -115,8 +115,7 @@ VSOutput VS(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_InstanceI
     output.Position = mul(mul(float4(worldPos, 1.0), View), Projection);
     output.Depth = output.Position.w;
     output.InstanceIdx = idx;
-    float skyVisible = SkyVisibility(worldPos, float3(0, 1, 0));
-    output.SkyAmbient = float4(SkyAmbientLight() * skyVisible, skyVisible);
+    output.SkyAmbient = float4(SkyAmbientLight(), 1.0);
     return output;
 }
 
@@ -134,6 +133,9 @@ PSOutput PS(VSOutput input)
 
     float3 camPos = ViewInverse[3].xyz;
     float3 worldPos = input.WorldPos;
+    // How much sky this pixel of water sees past the terrain (per pixel: a lake is a few big triangles whose rim lies
+    // under the banks, and per vertex those dark corners painted wedges across it)
+    float skyVisible = SkyVisibility(worldPos, float3(0, 1, 0));
     float3 V = normalize(camPos - worldPos);
     float dist = distance(worldPos, camPos);
     float t = water.Time;
@@ -182,7 +184,7 @@ PSOutput PS(VSOutput input)
     sunRadiance *= GetCloudShadow(WaterSampler, worldPos - camPos, L);
     sunRadiance *= WaterSunShadow(ShadowMapIdx, worldPos - camPos, input.Position.xy);
     sunRadiance *= TerrainOpen(worldPos, float3(0, 1, 0));   // a sea cave under a hill: no sun, whatever the shadow map holds
-    float3 skyAmbient = input.SkyAmbient.rgb;
+    float3 skyAmbient = input.SkyAmbient.rgb * skyVisible;
 
     // ── Deep water color (same model as the ocean, without the wave-height term) ──
     float3 scatter = (0.1 * NdotV * NdotV + 0.08 * NdotL) * water.WaterColor * sunRadiance
@@ -190,7 +192,7 @@ PSOutput PS(VSOutput input)
 
     // ── Shared water shading ──
     float F = WaterSpecularReflectance(NdotV, alpha);
-    float3 reflectColor = WaterSkyReflection(WaterSampler, V, N, worldPos - camPos, alpha) * input.SkyAmbient.a;   // no sky to mirror under a hill
+    float3 reflectColor = WaterSkyReflection(WaterSampler, V, N, worldPos - camPos, alpha) * skyVisible;   // no sky to mirror under a hill
     float3 specular = WaterSunSpecular(N, V, L, sunRadiance * 3.14159, alpha);
 
     WaterColumn column = GetWaterColumn(WaterSampler, water.DepthGBufferSRV, water.CompositeSRV,
@@ -237,7 +239,7 @@ PSOutput PS(VSOutput input)
     color = lerp(color, foamLit, foam * 0.9);
 
     // ── Aerial perspective ──
-    color = ApplyAerialPerspective(color, input.Position.xy, input.Depth, input.SkyAmbient.a);
+    color = ApplyAerialPerspective(color, input.Position.xy, input.Depth, skyVisible);
 
     // HDR output — the finalize pass tonemaps the whole Composite
     output.Color = float4(color, 1.0);

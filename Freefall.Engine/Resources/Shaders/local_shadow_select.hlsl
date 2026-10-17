@@ -267,10 +267,11 @@ float SunFactor(PointLightData light, PointLightFrame frame)
     terrain.Origin = frame.TerrainOrigin;
     terrain.Size = frame.TerrainSize;
     float3 worldPos = light.Position + frame.CameraPosition;
+    float tolerance = TerrainTolerance(length(light.Position));
     float own = light.Score * 0.975 * 9.0 / max(light.Range * light.Range, 1e-4);   // the cull's luminance × base candela
     float sun = frame.SunLight > 0.0
-        ? frame.SunLight * SunVisibility(worldPos) * TerrainOpenAt(terrain, TerrainLinearClamp, worldPos, float3(0, 1, 0)) : 0.0;
-    float sky = frame.Ambient * SkyVisibilityAt(terrain, TerrainLinearClamp, worldPos, float3(0, 1, 0));
+        ? frame.SunLight * SunVisibility(worldPos) * TerrainOpenAt(terrain, TerrainLinearClamp, worldPos, float3(0, 1, 0), tolerance) : 0.0;
+    float sky = frame.Ambient * SkyVisibilityAt(terrain, TerrainLinearClamp, worldPos, float3(0, 1, 0), tolerance);
     float dominance = own / max(own + sun + sky, 1e-6);
     return smoothstep(0.25, 0.5, dominance);
 }
