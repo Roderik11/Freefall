@@ -97,6 +97,8 @@ namespace Freefall.Assets
             ScanAndSync();
             ScanThumbnails();
             CleanOrphanedThumbnails();
+            // The project's .fx assets and their includes recompile when saved, like the engine's shaders
+            Graphics.ShaderHotReload.WatchProject(project.AssetsDirectory);
             Debug.Log($"[AssetDatabase] Initialized: {_guidToMeta.Count} assets tracked, " +
                       $"{_importersByExtension.Count} importers, {_packers.Count} packers, {_guidToThumb.Count} thumbnails");
         }

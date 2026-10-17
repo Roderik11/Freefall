@@ -64,10 +64,10 @@ namespace Freefall.Assets.Loaders
             if (def == null)
                 throw new InvalidDataException($"Failed to deserialize Material from cache: {name}");
 
-            // Effects by name are shared instances with fresh wrappers, so compare names:
-            // SetEffect rebuilds every PSO and should only run when the shader actually changed.
+            // Effects by name are shared instances with fresh wrappers, so compare keys (an engine effect's name, a
+            // project effect's GUID): SetEffect rebuilds every PSO and should only run when the shader actually changed.
             var effect = ResolveEffect(def, manager);
-            if (material.Effect == null || material.Effect.Name != effect.Name)
+            if (material.Effect == null || material.Effect.Key != effect.Key)
                 material.SetEffect(effect);
 
             foreach (var slot in material.Textures.Keys.ToList())
@@ -85,12 +85,18 @@ namespace Freefall.Assets.Loaders
             Effect effect = null;
             if (!string.IsNullOrEmpty(def.EffectRef))
             {
-                // Try as GUID first, then as name
+                // Try as GUID first (built-in effects and a project's .fx assets, EffectLoader), then as name
                 effect = manager.LoadByGuid<Effect>(def.EffectRef);
                 if (effect == null)
                 {
                     // Fall back to loading by name (e.g. "gbuffer")
-                    effect = new Effect(def.EffectRef);
+                    try { effect = new Effect(def.EffectRef); }
+                    catch (FileNotFoundException)
+                    {
+                        // A GUID nothing resolves (a deleted .fx): drawn with the default effect. Saving it now
+                        // would replace the reference.
+                        Debug.LogWarning("MaterialLoader", $"Effect '{def.EffectRef}' not found; using the default effect");
+                    }
                 }
             }
 

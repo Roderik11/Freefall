@@ -172,8 +172,9 @@ namespace Freefall.Graphics
 
         // A material setting: "<type> <Name>; //= <default>", e.g. "float Intensity; //= 2" or
         // "float3 Color; //= 0.62, 0.78, 1". Text after the default, set off by " -- ", is its description.
+        // A TextureRef (common.fx: a uint, the texture's bindless index) names its default texture: "//= Gray".
         private static readonly Regex MaterialParamLine = new(
-            @"^\s*(float|float2|float3|float4|int|uint|bool)\s+(\w+)\s*;\s*//=\s*([^\r\n]*?)\s*(?:--\s*([^\r\n]*?)\s*)?$",
+            @"^\s*(float|float2|float3|float4|int|uint|bool|TextureRef)\s+(\w+)\s*;\s*//=\s*([^\r\n]*?)\s*(?:--\s*([^\r\n]*?)\s*)?$",
             RegexOptions.Multiline);
 
         /// <summary>
@@ -245,6 +246,7 @@ namespace Freefall.Graphics
                     Type = type,
                     Name = m.Groups[2].Value,
                     Default = values.ToArray(),
+                    DefaultTexture = type == "TextureRef" && text.Trim().Length > 0 ? text.Trim() : null,
                     Description = m.Groups[4].Success ? m.Groups[4].Value : null,
                     Min = min,
                     Max = max,
@@ -338,8 +340,10 @@ namespace Freefall.Graphics
     public class MaterialParamDesc
     {
         public string Name = "";
-        /// <summary>HLSL type: float, float2, float3, float4, int, uint or bool.</summary>
+        /// <summary>HLSL type: float, float2, float3, float4, int, uint, bool or TextureRef (a texture's bindless index).</summary>
         public string Type = "";
+        /// <summary>A TextureRef's default: an engine texture named after "//=" (White, Black, Gray, FlatNormal); null = White.</summary>
+        public string? DefaultTexture;
         public float[] Default = Array.Empty<float>();
         public string? Description;
         /// <summary>"[min, max]" after the default: shown as a slider in the inspector.</summary>
@@ -351,6 +355,18 @@ namespace Freefall.Graphics
         public bool IsColor => Type == "float3" && Name.EndsWith("Color", StringComparison.Ordinal);
 
         public float At(int i, float fallback = 0f) => i < Default.Length ? Default[i] : fallback;
+
+        /// <summary>A texture setting (TextureRef): shown as a texture slot, its bindless index written as a uint.</summary>
+        public bool IsTexture => Type == "TextureRef";
+
+        /// <summary>The engine texture a TextureRef uses while none is assigned, so the shader never reads descriptor 0.</summary>
+        public Texture DefaultTextureAsset => (DefaultTexture ?? "White").ToLowerInvariant() switch
+        {
+            "black" => Freefall.Assets.InternalAssets.Black,
+            "gray" or "grey" => Freefall.Assets.InternalAssets.Gray,
+            "flatnormal" or "normal" => Freefall.Assets.InternalAssets.FlatNormal,
+            _ => Freefall.Assets.InternalAssets.White,
+        };
     }
 
     /// <summary>

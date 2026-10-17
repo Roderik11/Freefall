@@ -135,7 +135,9 @@ namespace Freefall.Graphics
             {
                 if (_value == value) return;
                 _value = value;
-                Material?.SetTexture(Name, value);
+                // None (the inspector's clear button): the slot goes back to unset, or to an effect texture's default
+                if (value == null) Material?.ClearTexture(Name);
+                else Material?.SetTexture(Name, value);
             }
         }
     }

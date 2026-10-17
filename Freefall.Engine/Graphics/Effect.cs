@@ -87,6 +87,7 @@ namespace Freefall.Graphics
         }
     }
 
+    [AssetTypeAlias("EffectSourceData")]   // a project's .fx asset (EffectImporter)
     public class Effect : Asset, IDisposable
     {
         public List<EffectTechnique> Techniques { get; } = new List<EffectTechnique>();
@@ -130,12 +131,26 @@ namespace Freefall.Graphics
         
         // MaterialBlock for per-effect parameters set via SetParameter
         private MaterialBlock _materialBlock = new MaterialBlock();
-        
+
+        /// <summary>
+        /// What identifies the effect: its file name for an engine effect ("vfx"), "asset:" + GUID for a project's
+        /// .fx asset (<see cref="FromAsset"/>). Instances of one key share its compiled state (MasterEffects), and
+        /// hot reload and material rebuilds match by it, not by Name: a project "water.fx" is not the engine's water.
+        /// </summary>
+        public string Key { get; private set; }
+
+        /// <summary>
+        /// DXC's messages when the last compile failed (they name the real file and line), else null. A project
+        /// effect whose first compile failed has no techniques: its materials draw nothing until it compiles.
+        /// </summary>
+        public string? LastError { get; private set; }
+
         public Effect(string filename)
         {
             Name = filename;
+            Key = filename;
             int hash = filename.GetHashCode();
-            
+
             // If already loaded, reuse (Apex pattern)
             if (MasterEffects.TryGetValue(hash, out var existing))
             {
@@ -181,12 +196,84 @@ namespace Freefall.Graphics
             ShaderHotReload.EnsureWatching();
         }
 
+        /// <summary>The key of a project's .fx asset (<see cref="Key"/>).</summary>
+        public static string AssetKey(string guid) => "asset:" + guid;
+
+        /// <summary>
+        /// The effect of a project's .fx asset (EffectLoader), compiled from <paramref name="source"/>. Its includes are
+        /// looked up next to <paramref name="sourcePath"/> (the file in Assets; null when there is none), then among
+        /// the engine's shaders, so <c>#include "common.fx"</c> is the engine's. One effect per GUID: a second load
+        /// returns the first, recompiled if the source differs. A source that does not compile still gives the
+        /// effect, without techniques (<see cref="LastError"/>, logged): its materials keep the reference and their
+        /// settings, draw nothing, and come back when a save compiles (hot reload).
+        /// </summary>
+        public static Effect FromAsset(string guid, string name, string source, string? sourcePath)
+        {
+            var key = AssetKey(guid);
+            if (MasterEffects.TryGetValue(key.GetHashCode(), out var existing))
+            {
+                existing.Name = name;
+                if (existing._sourceText != source && existing.TryReloadFrom(source))
+                    Material.RebuildForEffect(existing);
+                return existing;
+            }
+            return new Effect(key, guid, name, source, sourcePath);
+        }
+
+        private Effect(string key, string guid, string name, string source, string? sourcePath)
+        {
+            Key = key;
+            Guid = guid;
+            Name = name;
+            _sourcePath = sourcePath != null ? Path.GetFullPath(sourcePath) : null;
+            _sourceText = source;
+
+            // The settings and the render state are read from the text even when it does not compile: the
+            // materials' saved values must survive a broken shader (a material saved meanwhile keeps them)
+            string content = source;
+            try
+            {
+                content = Flatten(source, _sourcePath);
+                foreach (var td in FXParser.ParseFx(content))
+                    Techniques.Add(new EffectTechnique(td.Name, td, content));
+                if (Techniques.Count == 0 || Techniques[0].Passes.Count == 0)
+                    throw new Exception("no technique with a pass found");
+                DiscoverPushConstants();
+            }
+            catch (Exception ex)
+            {
+                foreach (var t in Techniques) t.Dispose();
+                Techniques.Clear();
+                ResourceBindings.Clear();
+                _resourceSlots.Clear();
+                LastError = ex.Message;
+                Debug.LogError("Effect", $"{name}.fx does not compile; its materials draw nothing until it does: {ex.Message}");
+            }
+
+            RenderState = FXParser.ParseRenderState(content);
+            MaterialParams.AddRange(FXParser.ParseMaterialParams(content));
+            InstanceParams.AddRange(FXParser.ParseInstanceParams(content));
+            WriteInstanceDefaults();
+
+            if (_sourcePath != null)
+                Dependencies = ShaderHotReload.CollectDependencies(_sourcePath);
+
+            MasterEffects[key.GetHashCode()] = this;
+            lock (_instances) _instances.Add(new WeakReference<Effect>(this));
+            ShaderHotReload.EnsureWatching();
+        }
+
         // ── Hot reload ──
         // Only the master (first instance of a name) owns a source path. Later instances share its
         // Techniques / ResourceBindings / slot map by reference, so refilling those in place updates
         // everyone; RenderState is a plain reference and is re-pointed on each live instance.
         private readonly string? _sourcePath;
+        // The text last compiled (before includes), so a reimport of an unchanged asset compiles nothing
+        private string? _sourceText;
         private static readonly List<WeakReference<Effect>> _instances = new();
+
+        /// <summary>The .fx file the effect compiles from (full path), or null.</summary>
+        public string? SourcePath => _sourcePath;
 
         /// <summary>The .fx file and everything it includes (full paths). Null on non-master instances.</summary>
         internal HashSet<string>? Dependencies { get; private set; }
@@ -213,22 +300,50 @@ namespace Freefall.Graphics
         internal void Reload()
         {
             if (_sourcePath == null) return;
+            ReloadFrom(File.ReadAllText(_sourcePath));
+        }
 
+        /// <summary>
+        /// Recompile a project effect from a reimported source (EffectLoader.Reload). False when the text is the
+        /// one already compiled or does not compile (logged; the previous version stays). On true, materials must
+        /// rebuild (Material.RebuildForEffect).
+        /// </summary>
+        internal bool TryReloadFrom(string source)
+        {
+            if (source == _sourceText) return false;
+            try
+            {
+                ReloadFrom(source);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Debug.LogError("Effect", $"{Name}.fx not reloaded, keeping the previous version: {ex.Message}");
+                return false;
+            }
+        }
+
+        private void ReloadFrom(string source)
+        {
             // Compile everything first: a failure must not leave a half-swapped effect
-            string content = LoadWithIncludes(_sourcePath);
+            string content;
             var techniques = new List<EffectTechnique>();
             try
             {
+                content = Flatten(source, _sourcePath);
                 foreach (var td in FXParser.ParseFx(content))
                     techniques.Add(new EffectTechnique(td.Name, td, content));
                 if (techniques.Count == 0 || techniques[0].Passes.Count == 0)
                     throw new Exception("no technique/pass found");
             }
-            catch
+            catch (Exception ex)
             {
                 foreach (var t in techniques) t.Dispose();
+                LastError = ex.Message;
                 throw;
             }
+            LastError = null;
+            _sourceText = source;
 
             var old = new List<EffectTechnique>(Techniques);
             Techniques.Clear();
@@ -250,11 +365,12 @@ namespace Freefall.Graphics
                 for (int i = _instances.Count - 1; i >= 0; i--)
                 {
                     if (!_instances[i].TryGetTarget(out var instance)) { _instances.RemoveAt(i); continue; }
-                    if (instance.Name == Name) instance.RenderState = renderState;
+                    if (instance.Key == Key) instance.RenderState = renderState;
                 }
             }
 
-            Dependencies = ShaderHotReload.CollectDependencies(_sourcePath);
+            if (_sourcePath != null)
+                Dependencies = ShaderHotReload.CollectDependencies(_sourcePath);
 
             foreach (var t in old) t.Dispose();
         }
@@ -360,22 +476,44 @@ namespace Freefall.Graphics
             }
         }
 
-        private string LoadWithIncludes(string path)
-        {
-            string content = File.ReadAllText(path);
-            string directory = Path.GetDirectoryName(path) ?? "";
+        private static string LoadWithIncludes(string path) => Flatten(File.ReadAllText(path), path);
 
-            // Simple include resolver (regex search for #include "...")
-            content = System.Text.RegularExpressions.Regex.Replace(content, @"#include\s+""([^""]+)""", match =>
+        // A directive starts its line: an "#include" quoted in a comment (mesh_common.fx shows how to include
+        // itself) is no include
+        private static readonly System.Text.RegularExpressions.Regex IncludeRegex = new(
+            @"^[ \t]*#include\s+""([^""]+)""", System.Text.RegularExpressions.RegexOptions.Multiline);
+
+        /// <summary>
+        /// The source with every <c>#include "x"</c> replaced by that file, looked up next to the including file and
+        /// then among the engine's shaders (ShaderHotReload.ResolveInclude), between #line markers: DXC's messages
+        /// then name the real file and line, not a line of the flattened text.
+        /// </summary>
+        private static string Flatten(string source, string? path, int depth = 0)
+        {
+            if (depth > 16)
+                throw new Exception($"includes nested more than 16 deep at {path} (does a file include itself?)");
+
+            string directory = path != null ? Path.GetDirectoryName(path) ?? "" : ShaderHotReload.Directory;
+            string here = LineFileName(path);
+
+            string content = IncludeRegex.Replace(source, match =>
             {
-                string includeFile = match.Groups[1].Value;
-                string includePath = Path.Combine(directory, includeFile);
-                if (File.Exists(includePath))
-                {
-                    return LoadWithIncludes(includePath);
-                }
-                return match.Value; // Leave it if not found, DXC might handle it or error
+                string? includePath = ShaderHotReload.ResolveInclude(directory, match.Groups[1].Value);
+                if (includePath == null)
+                    return match.Value;     // left for DXC, which reports it
+
+                // The rest of the #include's line keeps its number; the line after the marker is that line
+                int line = 1;
+                for (int i = 0; i < match.Index; i++)
+                    if (source[i] == '\n') line++;
+                string text = Flatten(File.ReadAllText(includePath), includePath, depth + 1);
+                return $"#line 1 \"{LineFileName(includePath)}\"\n{text}\n#line {line} \"{here}\"\n";
             });
+
+            if (depth > 0) return content;
+
+            if (path != null)
+                content = $"#line 1 \"{here}\"\n" + content;
 
             // Patch legacy HLSL for DXC compatibility
             // Ternary on vectors is not allowed in DXC, use select()
@@ -387,8 +525,16 @@ namespace Freefall.Graphics
             return content;
         }
 
+        // A file name for #line: forward slashes (a backslash in its string would be an escape)
+        private static string LineFileName(string? path) => path?.Replace('\\', '/') ?? "effect.fx";
+
         public void Dispose()
         {
+            // The compiled techniques are shared by every instance of the effect and the materials using it, and
+            // a registered master lives as long as MasterEffects holds it: an asset cache eviction (thumbnail
+            // rendering evicts what it loaded) must not release them under live materials.
+            if (MasterEffects.TryGetValue(Key.GetHashCode(), out var master) && ReferenceEquals(master.Techniques, Techniques))
+                return;
             foreach (var tech in Techniques)
                 tech.Dispose();
         }

@@ -183,6 +183,12 @@ namespace Freefall.Graphics
         private List<MaterialProperty> _materialProperties = new();
         // The effect's own settings (Effect.MaterialParams), writing into this material's block of the settings buffer
         private readonly List<MaterialProperty> _effectProperties = new();
+        // Its texture settings (TextureRef): slots like the MaterialData ones, writing the texture's bindless index
+        private readonly List<TextureEffectParameter> _effectTextureParameters = new();
+        private readonly Dictionary<string, MaterialParamDesc> _effectTextureSettings = new();
+
+        // An effect that declares settings ("//=" in its struct Settings) reads those, not MaterialData
+        private bool HasOwnSettings => _effect?.MaterialParams.Count > 0;
         
         /// <summary>
         /// Read-only access to texture bindings (slot name → Texture).
@@ -191,10 +197,11 @@ namespace Freefall.Graphics
         public IReadOnlyDictionary<string, Texture> Textures => _textures;
         
         /// <summary>
-        /// Texture parameters for inspector binding. Each maps to a MaterialData slot
-        /// and writes back through SetTexture() when applied.
+        /// Texture parameters for inspector binding, writing back through SetTexture(). Normally the MaterialData
+        /// slots (Albedo, Normal, ...); for an effect that declares its own settings, its texture settings
+        /// (<c>TextureRef Name; //= Gray</c>), which write the texture's bindless index into the settings block.
         /// </summary>
-        public IReadOnlyList<TextureEffectParameter> TextureParameters => _textureParameters;
+        public IReadOnlyList<TextureEffectParameter> TextureParameters => HasOwnSettings ? _effectTextureParameters : _textureParameters;
         
         /// <summary>
         /// Scalar material properties for inspector binding and the .mat "Parameters". Normally the MaterialData
@@ -202,7 +209,7 @@ namespace Freefall.Graphics
         /// settings ("//=" in its struct Settings, Effect.MaterialParams) gets those instead: it does not read
         /// MaterialData; its settings are written into the material's block of the settings buffer (WriteSetting).
         /// </summary>
-        public IReadOnlyList<MaterialProperty> MaterialProperties => _effectProperties.Count > 0 ? _effectProperties : _materialProperties;
+        public IReadOnlyList<MaterialProperty> MaterialProperties => HasOwnSettings ? _effectProperties : _materialProperties;
 
         /// <summary>A material property by name, or null.</summary>
         public MaterialProperty? GetProperty(string name)
@@ -236,7 +243,7 @@ namespace Freefall.Graphics
         // SubShaders parsed from Effect techniques (Apex pattern)
         private readonly List<SubShader> _subShaders = new();
         
-        public PipelineState PipelineState => _passPipelineStates.TryGetValue(Pass, out var pso) ? pso : _passPipelineStates[0];
+        public PipelineState PipelineState => _passPipelineStates.TryGetValue(Pass, out var pso) ? pso : _passPipelineStates.GetValueOrDefault(0)!;
         public IEnumerable<ConstantBuffer> ConstantBuffers => _constantBuffers.Values;
         private Effect _effect;
         public Effect Effect
@@ -245,7 +252,7 @@ namespace Freefall.Graphics
             set
             {
                 // During construction or plain assignment: just set reference
-                if (_passPipelineStates.Count == 0)
+                if (!_built)
                 {
                     _effect = value;
                     return;
@@ -255,6 +262,10 @@ namespace Freefall.Graphics
                     SetEffect(value);
             }
         }
+
+        // Set once constructed: assigning Effect then swaps it (SetEffect). Not "has pipeline states": a material
+        // of a project effect that does not compile has none, and must still be able to change to another effect.
+        private bool _built;
         
         // Pass/Technique selection (Apex pattern)
         public int Pass { get; set; } = 0;
@@ -353,6 +364,7 @@ namespace Freefall.Graphics
             InitEffectProperties();
 
             lock (_liveMaterials) _liveMaterials.Add(new WeakReference<Material>(this));
+            _built = true;
         }
 
         /// <summary>Raised when one of its properties is set: inspector, MCP, load, script.</summary>
@@ -399,17 +411,35 @@ namespace Freefall.Graphics
             var before = new Dictionary<string, MaterialProperty>();
             foreach (var p in _effectProperties) before[p.Name] = p;
             _effectProperties.Clear();
+            _effectTextureParameters.Clear();
+            _effectTextureSettings.Clear();
             if (_effect == null) return;
 
             foreach (var desc in _effect.MaterialParams)
             {
                 string name = desc.Name;
                 int at = desc.Offset;
+
+                // A texture: a slot (saved under Textures:, like the MaterialData ones) whose bindless index goes
+                // into the block; the default texture until one is set
+                if (desc.IsTexture)
+                {
+                    _effectTextureSettings[name] = desc;
+                    _textures.TryGetValue(name, out var assigned);
+                    WriteSetting(at, (assigned ?? desc.DefaultTextureAsset)?.BindlessIndex ?? 0u);
+                    var slot = new TextureEffectParameter { Name = name, Material = this };
+                    slot.Value = assigned;    // its setter calls SetTexture, which is fine: the setting is known
+                    _effectTextureParameters.Add(slot);
+                    continue;
+                }
+
                 MaterialProperty? prop = desc.Type switch
                 {
                     "float" => new MaterialProperty<float>(name, this, desc.At(0),
                         (m, v) => m.WriteSetting(at, v)),
                     "float2" => new MaterialProperty<Vector2>(name, this, new Vector2(desc.At(0), desc.At(1)),
+                        (m, v) => m.WriteSetting(at, v)),
+                    "float4" => new MaterialProperty<Vector4>(name, this, new Vector4(desc.At(0), desc.At(1), desc.At(2), desc.At(3)),
                         (m, v) => m.WriteSetting(at, v)),
                     "float3" when desc.IsColor => new MaterialProperty<Color3>(name, this, new Color3(desc.At(0, 1f), desc.At(1, 1f), desc.At(2, 1f)),
                         (m, v) => m.WriteSetting(at, v.ToVector3())),
@@ -578,10 +608,11 @@ namespace Freefall.Graphics
         private static readonly List<WeakReference<Material>> _liveMaterials = new();
 
         /// <summary>
-        /// Rebuild every live material whose effect is named <paramref name="effectName"/> after that
-        /// effect was recompiled (ShaderHotReload). Main thread, between frames. Returns the count.
+        /// Rebuild every live material using <paramref name="effect"/> (any instance of its Key: an engine effect's
+        /// name, a project effect's GUID) after it was recompiled (ShaderHotReload, EffectLoader). Main thread,
+        /// between frames. Returns the count.
         /// </summary>
-        internal static int RebuildForEffect(string effectName)
+        internal static int RebuildForEffect(Effect effect)
         {
             var targets = new List<Material>();
             lock (_liveMaterials)
@@ -589,7 +620,7 @@ namespace Freefall.Graphics
                 for (int i = _liveMaterials.Count - 1; i >= 0; i--)
                 {
                     if (!_liveMaterials[i].TryGetTarget(out var m)) { _liveMaterials.RemoveAt(i); continue; }
-                    if (m._effect != null && m._effect.Name == effectName) targets.Add(m);
+                    if (m._effect != null && m._effect.Key == effect.Key) targets.Add(m);
                 }
             }
 
@@ -664,7 +695,7 @@ namespace Freefall.Graphics
         private void InitFromEffect(Effect effect, GraphicsDevice device)
         {
             //Debug.Log($"[Material] Creating Material for Effect: {effect.Name}");
-            Effect = effect;
+            _effect = effect;   // not the property: during SetEffect it would swap again
             
             // Populate SubShaders from Effect techniques (Apex pattern)
             foreach (var technique in effect.Techniques)
@@ -681,7 +712,12 @@ namespace Freefall.Graphics
                     Value = tex
                 });
             }
-            
+
+            // A project effect whose first compile failed has no techniques: no pipeline states, no passes, so no
+            // draws. Its settings still load and save; it is built when the effect compiles (RebuildForEffect).
+            if (effect.Techniques.Count == 0 || effect.Techniques[0].Passes.Count == 0)
+                return;
+
             var renderState = effect.RenderState;
 
             // Determine Render Target count and formats from shader metadata
@@ -979,6 +1015,7 @@ namespace Freefall.Graphics
             
             if (pixelShader.Reflection != null)
                 CreateConstantBuffers(device, pixelShader.Reflection);
+            _built = true;
         }
         
         private void CreateConstantBuffers(GraphicsDevice device, ID3D12ShaderReflection reflection)
@@ -1047,9 +1084,15 @@ namespace Freefall.Graphics
             if (texture == null) return;
             _textures[name] = texture;
             UpdateMaterialData(name, texture.BindlessIndex);
-            
+            if (_effectTextureSettings.TryGetValue(name, out var setting))
+                WriteSetting(setting.Offset, texture.BindlessIndex);
+
             // Keep TextureEffectParameter in sync (for inspector display)
             foreach (var tp in _textureParameters)
+            {
+                if (tp.Name == name) { tp.Value = texture; break; }
+            }
+            foreach (var tp in _effectTextureParameters)
             {
                 if (tp.Name == name) { tp.Value = texture; break; }
             }
@@ -1062,8 +1105,14 @@ namespace Freefall.Graphics
         {
             if (!_textures.Remove(name)) return;
             UpdateMaterialData(name, 0);
+            if (_effectTextureSettings.TryGetValue(name, out var setting))
+                WriteSetting(setting.Offset, setting.DefaultTextureAsset?.BindlessIndex ?? 0u);
 
             foreach (var tp in _textureParameters)
+            {
+                if (tp.Name == name) { tp.Value = null; break; }
+            }
+            foreach (var tp in _effectTextureParameters)
             {
                 if (tp.Name == name) { tp.Value = null; break; }
             }

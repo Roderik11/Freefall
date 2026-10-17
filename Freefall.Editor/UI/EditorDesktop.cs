@@ -424,6 +424,9 @@ namespace Freefall.Editor
                 AssetBrowser.RefreshCurrentFolder();
             });
 
+            // A new .fx saved into the project's Assets was imported by shader hot reload: show its card
+            Freefall.Graphics.ShaderHotReload.ProjectEffectAdded += () => AssetBrowser.RefreshCurrentFolder();
+
             // Bridge engine PCG events to editor UI refresh
             MessageDispatcher.AddListener(EngineMsg.PCGExecuted, (msg) =>
             {

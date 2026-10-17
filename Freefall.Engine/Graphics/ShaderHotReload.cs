@@ -102,7 +102,20 @@ namespace Freefall.Graphics
             return set;
         }
 
-        private static readonly Regex IncludeRegex = new(@"#include\s+""([^""]+)""", RegexOptions.Compiled);
+        // At the start of a line, as Effect.Flatten reads them (an "#include" quoted in a comment is none)
+        private static readonly Regex IncludeRegex = new(@"^[ \t]*#include\s+""([^""]+)""", RegexOptions.Compiled | RegexOptions.Multiline);
+
+        /// <summary>
+        /// Where an effect's <c>#include "file"</c> comes from: next to the including file first, then the engine's
+        /// shader directory, so a project shader in Assets can include "common.fx" (full path; null if neither has it).
+        /// </summary>
+        public static string? ResolveInclude(string includingDirectory, string file)
+        {
+            string local = Path.GetFullPath(Path.Combine(includingDirectory, file));
+            if (File.Exists(local)) return local;
+            string engine = Path.GetFullPath(Path.Combine(Directory, file));
+            return File.Exists(engine) ? engine : null;
+        }
 
         private static void Collect(string path, HashSet<string> set)
         {
@@ -114,7 +127,11 @@ namespace Freefall.Graphics
 
             string dir = Path.GetDirectoryName(path) ?? "";
             foreach (Match m in IncludeRegex.Matches(text))
-                Collect(Path.GetFullPath(Path.Combine(dir, m.Groups[1].Value)), set);
+            {
+                // One not found yet stays in the set where it would be made next to the file, so making it reloads
+                var file = m.Groups[1].Value;
+                Collect(ResolveInclude(dir, file) ?? Path.GetFullPath(Path.Combine(dir, file)), set);
+            }
         }
 
         internal static void Register(ComputeShader shader)
@@ -123,6 +140,54 @@ namespace Freefall.Graphics
                 _computeShaders.Add(new WeakReference<ComputeShader>(shader));
             EnsureWatching();
         }
+
+        // A project's Assets: its .fx assets (Effect.FromAsset) and the files they include
+        private static FileSystemWatcher? _projectWatcher;
+        private static string? _projectDirectory;
+
+        /// <summary>Raised on the main thread after a new .fx in the project's Assets was imported (the editor shows it).</summary>
+        public static event Action? ProjectEffectAdded;
+
+        /// <summary>
+        /// Watch a project's Assets folder for shader files too: saving a project .fx (or a file it includes)
+        /// recompiles it like an engine shader, and a new .fx is imported. AssetDatabase.Initialize calls it;
+        /// another project replaces the folder.
+        /// </summary>
+        public static void WatchProject(string assetsDirectory)
+        {
+            lock (_lock)
+            {
+                string full = Path.GetFullPath(assetsDirectory);
+                if (string.Equals(full, _projectDirectory, StringComparison.OrdinalIgnoreCase)) return;
+
+                _projectWatcher?.Dispose();
+                _projectWatcher = null;
+                _projectDirectory = full;
+                if (!System.IO.Directory.Exists(full)) return;
+
+                try
+                {
+                    var watcher = new FileSystemWatcher(full)
+                    {
+                        IncludeSubdirectories = true,
+                        NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.FileName | NotifyFilters.Size,
+                    };
+                    watcher.Changed += (_, e) => Queue(e.FullPath);
+                    watcher.Created += (_, e) => Queue(e.FullPath);
+                    watcher.Renamed += (_, e) => Queue(e.FullPath);
+                    watcher.EnableRaisingEvents = true;
+                    _projectWatcher = watcher;
+                    Debug.Log("ShaderHotReload", $"Watching project shaders in {full}");
+                }
+                catch (Exception ex)
+                {
+                    Debug.LogWarning("ShaderHotReload", $"Could not watch {full}: {ex.Message}");
+                }
+            }
+        }
+
+        private static bool IsInProject(string path) =>
+            _projectDirectory != null && path.StartsWith(_projectDirectory + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase);
 
         internal static void EnsureWatching()
         {
@@ -155,6 +220,7 @@ namespace Freefall.Graphics
         {
             string ext = Path.GetExtension(path);
             if (!ext.Equals(".fx", StringComparison.OrdinalIgnoreCase) &&
+                !ext.Equals(".fxh", StringComparison.OrdinalIgnoreCase) &&
                 !ext.Equals(".hlsl", StringComparison.OrdinalIgnoreCase) &&
                 !ext.Equals(".hlsli", StringComparison.OrdinalIgnoreCase))
                 return;
@@ -180,6 +246,10 @@ namespace Freefall.Graphics
             }
             if (changed == null) return;
 
+            // A new .fx in the project's Assets becomes an asset (a GUID, an Effect card); it compiles when a
+            // material first uses it
+            ImportNewProjectEffects(changed);
+
             // Effects: every instance of a name shares its compiled state with the master
             foreach (var effect in new List<Effect>(Effect.MasterEffects.Values))
             {
@@ -189,8 +259,13 @@ namespace Freefall.Graphics
                 {
                     var sw = System.Diagnostics.Stopwatch.StartNew();
                     effect.Reload();
-                    int materials = Material.RebuildForEffect(effect.Name);
+                    int materials = Material.RebuildForEffect(effect);
                     Debug.LogAlways($"[ShaderHotReload] Reloaded {effect.Name}.fx ({materials} material(s), {sw.ElapsedMilliseconds} ms, reload {++_reloads})");
+
+                    // A project effect's own file changed: import it, so its cached source (what the next start
+                    // loads) is the one now running. EffectLoader.Reload then finds it compiled and does nothing.
+                    if (effect.SourcePath != null && IsInProject(effect.SourcePath) && changed.Exists(p => string.Equals(p, effect.SourcePath, StringComparison.OrdinalIgnoreCase)))
+                        Freefall.Assets.AssetDatabase.ImportSavedFile(effect.SourcePath);
                 }
                 catch (IOException)
                 {
@@ -229,6 +304,37 @@ namespace Freefall.Graphics
                 {
                     Debug.LogError("ShaderHotReload", $"{cs.FileName} not reloaded, keeping the previous version: {ex.Message}");
                 }
+            }
+        }
+
+        private static void ImportNewProjectEffects(List<string> changed)
+        {
+            if (Freefall.Assets.AssetDatabase.Project == null) return;
+
+            List<string>? added = null;
+            foreach (var path in changed)
+            {
+                if (!IsInProject(path) || !Path.GetExtension(path).Equals(".fx", StringComparison.OrdinalIgnoreCase) || !File.Exists(path))
+                    continue;
+                var relative = Path.GetRelativePath(Freefall.Assets.AssetDatabase.Project.AssetsDirectory, path);
+                if (Freefall.Assets.AssetDatabase.PathToGuid(relative) == null)
+                    (added ??= new List<string>()).Add(path);
+            }
+            if (added == null) return;
+
+            try
+            {
+                Freefall.Assets.AssetDatabase.Refresh();
+                foreach (var path in added)
+                {
+                    Freefall.Assets.AssetDatabase.ImportSavedFile(path);
+                    Debug.Log("ShaderHotReload", $"Imported new effect {Path.GetFileName(path)}");
+                }
+                ProjectEffectAdded?.Invoke();
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning("ShaderHotReload", $"Could not import new effect(s): {ex.Message}");
             }
         }
 

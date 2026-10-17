@@ -68,6 +68,21 @@ namespace Freefall.Serialization
                 return false;
             }
 
+            if (typeof(T) == typeof(Vector4))
+            {
+                var parts = text.TrimStart('[').TrimEnd(']').Split(',');
+                if (parts.Length >= 4 &&
+                    float.TryParse(parts[0].Trim(), NumberStyles.Float, Inv, out float x) &&
+                    float.TryParse(parts[1].Trim(), NumberStyles.Float, Inv, out float y) &&
+                    float.TryParse(parts[2].Trim(), NumberStyles.Float, Inv, out float z) &&
+                    float.TryParse(parts[3].Trim(), NumberStyles.Float, Inv, out float w))
+                {
+                    result = (T)(object)new Vector4(x, y, z, w);
+                    return true;
+                }
+                return false;
+            }
+
             if (typeof(T) == typeof(float))
             {
                 if (float.TryParse(text, NumberStyles.Float, Inv, out float f))
@@ -110,6 +125,7 @@ namespace Freefall.Serialization
                 int i => i.ToString(Inv),
                 Vector2 v => $"[{v.X.ToString(Inv)}, {v.Y.ToString(Inv)}]",
                 Vector3 v => $"[{v.X.ToString(Inv)}, {v.Y.ToString(Inv)}, {v.Z.ToString(Inv)}]",
+                Vector4 v => $"[{v.X.ToString(Inv)}, {v.Y.ToString(Inv)}, {v.Z.ToString(Inv)}, {v.W.ToString(Inv)}]",
                 // Invariant, in the form TryParse reads: Color3.ToString() follows the machine's culture, and a
                 // decimal comma (German Windows) split into the wrong channels when read back
                 Color3 c => $"<{c.R.ToString(Inv)}, {c.G.ToString(Inv)}, {c.B.ToString(Inv)}>",

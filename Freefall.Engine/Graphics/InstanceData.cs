@@ -110,6 +110,7 @@ namespace Freefall.Graphics
                 case "int": Write(slot, member.Offset, (int)value.X); break;
                 case "uint": Write(slot, member.Offset, (uint)Math.Max(value.X, 0f)); break;
                 case "bool": Write(slot, member.Offset, value.X != 0f ? 1u : 0u); break;
+                case "TextureRef": Write(slot, member.Offset, (uint)Math.Max(value.X, 0f)); break;   // a bindless index
             }
         }
 
@@ -123,6 +124,8 @@ namespace Freefall.Graphics
         /// <summary>A member's default as up to four floats (colours default to white when not given).</summary>
         public static Vector4 DefaultOf(MaterialParamDesc member)
         {
+            if (member.IsTexture)
+                return new Vector4(member.DefaultTextureAsset?.BindlessIndex ?? 0u, 0f, 0f, 0f);
             float fallback = member.IsColor ? 1f : 0f;
             return new Vector4(member.At(0, fallback), member.At(1, fallback), member.At(2, fallback), member.At(3));
         }

@@ -1,3 +1,7 @@
+// Included once however often it is named (a project shader may include it and mesh_common.fx, which includes it)
+#ifndef COMMON_FX
+#define COMMON_FX
+
 cbuffer SceneConstants : register(b0)
 {
     float Time;
@@ -197,6 +201,11 @@ struct MaterialData
     float3 Tint;                // multiplies the albedo map (Material "Tint", default white)
     uint SettingsBufferIdx;     // the raw buffer of every material's effect settings (Material.SettingsStride bytes at its MaterialID); was padding
 };
+
+// A texture in an effect's material settings or instance data: its bindless index. Declared "TextureRef Noise; //= Gray"
+// (the default an engine texture: White, Black, Gray, FlatNormal), shown as a texture slot in the material inspector
+// and saved under the .mat's Textures. Read it with: Texture2D noise = ResourceDescriptorHeap[S.Noise];
+typedef uint TextureRef;
 
 // Shadow cascade data — shared by all shadow-related shaders
 // Stride must match C# GPUCuller.CascadeData exactly (240 bytes)
@@ -557,3 +566,5 @@ float3 SignedOctDecode(float3 n)
     OutN = normalize(OutN);
     return OutN;
 }
+
+#endif // COMMON_FX
