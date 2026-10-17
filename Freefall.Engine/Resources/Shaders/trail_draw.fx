@@ -27,6 +27,7 @@ struct TrailPoint          // 48 bytes = TrailSystem.TrailPoint in C#
 #define TRAIL_FIRST 1      // far end of a trail: nothing before it
 #define TRAIL_LAST  2      // the end at the entity: nothing after it
 #define TRAIL_BLADE 4      // the sheet between Position and Edge, not a strip that faces the camera
+#define TRAIL_LIT   8      // the colour is an albedo lit by the sky and the sun; else a luminance in nits
 
 // A ribbon narrower than this on screen is drawn this wide and fainter by as much: a thin trail far
 // away stays a steady line instead of a row of pixels that come and go
@@ -68,6 +69,8 @@ VSOutput VS(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
     float2 corner = Corners[vertexID % 6];
     uint index = instanceID + (uint)corner.x;
     TrailPoint p = Points[index];
+    // Premultiplied: only the light scales. Lit: an albedo under the sky and the sun; else nits, pre-exposed as a light source
+    p.Color.rgb *= (p.Flags & TRAIL_LIT) != 0 ? ParticleLight() : EmissiveExposure.xxx;
 
     // A blade: the sheet is given, from the point (the tip's edge) to its other edge
     if ((p.Flags & TRAIL_BLADE) != 0)
@@ -120,8 +123,7 @@ float4 PS(VSOutput input) : SV_Target0
 
     if (max(color.a, max(color.r, max(color.g, color.b))) < 0.002) discard;
 
-    // Light in the older units, pre-exposed like the lights; then the air in front (premultiplied, as in particle_draw)
-    color.rgb *= LegacyLightScale;
+    // The air in front (premultiplied, as in particle_draw); the light was scaled in VS
     if (FogEnabled > 0.0 && AtmosphereIdx != 0)
     {
         float4 ap = AtmosphereAerialPerspective(LoadAtmosphere(), input.Position.xy / ViewportSize, input.Depth);

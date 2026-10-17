@@ -24,7 +24,7 @@ cbuffer PushConstants : register(b3)
     uint EmittersIdx;          // DWORD 4   SRV: ParticleEmitter rows
     uint ChunkMapIdx;          // DWORD 5   SRV: chunk -> emitter row
     uint DepthGBufIdx;         // DWORD 6   SRV: depth buffer for soft particles
-    float LightScale;          // DWORD 7   Forward mode (light into the composite): LegacyLightScale; Transparent (an albedo): 1
+    float LightScale;          // DWORD 7   Forward mode: EmissiveExposure (a light source's nits); Transparent (an albedo): 1
     uint ApplyFog;             // DWORD 8   1 in Forward mode: aerial perspective here (Transparent: the composition does it)
 };
 
@@ -96,6 +96,13 @@ VSOutput VS(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
     float size = lerp(e.SizeStartEnd.x, e.SizeStartEnd.y, t) * vis.SizeScale;
     output.Color = lerp(e.ColorStart, e.ColorEnd, t);
     output.Color.rgb *= e.Intensity;
+    // Premultiplied: only the light scales, not how much of the background it hides. Forward mode: a lit particle's
+    // colour is an albedo under the sky and the sun, else a luminance (nits) pre-exposed as a light source.
+    // Transparent mode writes an albedo the composition lights (LightScale 1).
+    if (e.RenderMode == PARTICLE_MODE_FORWARD && (e.Flags & PARTICLE_FLAG_LIT) != 0)
+        output.Color.rgb *= ParticleLight();
+    else
+        output.Color.rgb *= LightScale;
     if (e.FadeInRate > 0.0)
         output.Color *= saturate(t * e.FadeInRate);
     output.TextureIdx = e.TextureIdx;
@@ -249,9 +256,6 @@ float4 PS(VSOutput input) : SV_Target0
 
     // Discard fragments that neither add nor hide anything (an additive particle has alpha 0)
     if (max(finalColor.a, max(finalColor.r, max(finalColor.g, finalColor.b))) < 0.004) discard;
-
-    // Premultiplied: only the light scales, not how much of the background it hides
-    finalColor.rgb *= LightScale;
 
     // The air in front dims the particle's own light and adds its haze over the part of the background it hides
     if (ApplyFog != 0 && FogEnabled > 0.0 && AtmosphereIdx != 0)

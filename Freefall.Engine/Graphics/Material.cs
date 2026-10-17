@@ -356,7 +356,7 @@ namespace Freefall.Graphics
                 _allMaterials.Add(new MaterialData
                 {
                     EmissiveColor = Vector3.One,
-                    EmissiveIntensity = 1.0f,
+                    EmissiveIntensity = DefaultEmissiveNits,
                     Tint = Vector3.One,
                     SettingsBufferIdx = _settingsBufferBindlessIndex,
                 });
@@ -520,7 +520,9 @@ namespace Freefall.Graphics
                 (m, v) => m.UpdateMaterialScalar((ref MaterialData d) => d.Tint = v.ToVector3())));
             _materialProperties.Add(new MaterialProperty<Color3>("EmissiveColor", this, new Color3(),
                 (m, v) => m.UpdateMaterialScalar((ref MaterialData d) => d.EmissiveColor = v.ToVector3())));
-            _materialProperties.Add(new MaterialProperty<float>("EmissiveIntensity", this, 1.0f,
+            // Luminance of the emissive map's white in nits (cd/m²); light sources seen directly are pre-exposed by
+            // Atmosphere.EmissiveExposure (gbuffer.fx). A lit window ~5-50, lantern glass ~15000, coals ~25000
+            _materialProperties.Add(new MaterialProperty<float>("EmissiveIntensity", this, DefaultEmissiveNits,
                 (m, v) => m.SetEmissiveIntensity(v)));
             // Lamp glass: glows only while lamps are lit (Daylight.Lamps), like a PointLight.OnlyWhenDark
             _materialProperties.Add(new MaterialProperty<bool>("EmissiveWhenDark", this, false,
@@ -1159,7 +1161,10 @@ namespace Freefall.Graphics
             ApplyEmissiveIntensity();
         }
 
-        private float _emissiveIntensity = 1.0f;
+        private float _emissiveIntensity = DefaultEmissiveNits;
+
+        /// <summary>EmissiveIntensity when a material sets none: 1 in the older units with the composition's ×2 (25200 nits).</summary>
+        public const float DefaultEmissiveNits = 25000f;
         private bool _emissiveWhenDark;
 
         // Materials whose glow follows Daylight.Lamps; rewritten only when the lamps change (while they fade)

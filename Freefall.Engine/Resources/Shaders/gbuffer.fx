@@ -234,14 +234,15 @@ PSOutput PS(VSOutput input)
     if (mat.MetallicIdx  != 0) { Texture2D mTex = ResourceDescriptorHeap[mat.MetallicIdx];  metal     = mTex.Sample(Sampler, input.TexCoord).r; }
     if (mat.AOIdx        != 0) { Texture2D aTex = ResourceDescriptorHeap[mat.AOIdx];        ao        = aTex.Sample(Sampler, input.TexCoord).r; }
     
-    // Emissive: sample texture, apply tint/intensity, blend into albedo
+    // Emissive: its luminance (texture × tint × EmissiveIntensity in nits), pre-exposed, takes the albedo's place
+    // where it outshines a lit surface (the composition shows it as it is there)
     float emissiveMask = 0;
     if (mat.EmissiveIdx != 0)
     {
         Texture2D eTex = ResourceDescriptorHeap[mat.EmissiveIdx];
-        float3 emissive = eTex.Sample(Sampler, input.TexCoord).rgb * mat.EmissiveColor * mat.EmissiveIntensity;
-        emissiveMask = max(emissive.r, max(emissive.g, emissive.b));
-        color.rgb = lerp(color.rgb, emissive, saturate(emissiveMask));
+        float3 emissive = eTex.Sample(Sampler, input.TexCoord).rgb * mat.EmissiveColor * (mat.EmissiveIntensity * EmissiveExposure);
+        emissiveMask = saturate(max(emissive.r, max(emissive.g, emissive.b)));
+        color.rgb = lerp(color.rgb, emissive, emissiveMask);
     }
     
     // Normal mapping via cotangent frame (no tangent buffer needed)

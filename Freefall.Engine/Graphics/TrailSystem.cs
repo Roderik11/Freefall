@@ -28,6 +28,7 @@ namespace Freefall.Graphics
         private const uint FlagFirst = 1;          // = TRAIL_FIRST
         private const uint FlagLast = 2;           // = TRAIL_LAST
         private const uint FlagBlade = 4;          // = TRAIL_BLADE
+        private const uint FlagLit = 8;            // = TRAIL_LIT
         private const float SamePlaceSq = 1e-8f;   // closer than a tenth of a millimetre: no piece of ribbon in between
 
         // A blade's sheet is rounded between the places it was recorded at: a swing moves a tip a
@@ -56,6 +57,7 @@ namespace Freefall.Graphics
             public int Count;
             public bool WasEmitting;
             public bool Blade;
+            public bool Lit;
 
             // The look, kept for when the component is gone
             public float Lifetime = 0.5f;
@@ -219,6 +221,7 @@ namespace Freefall.Graphics
             if (trail != null)
             {
                 entry.Blade = trail.BladeOffset != Vector3.Zero;
+                entry.Lit = trail.Lit;
                 entry.Lifetime = MathF.Max(0.01f, trail.Lifetime);
                 entry.StartWidth = MathF.Max(0f, trail.StartWidth);
                 entry.EndWidth = MathF.Max(0f, trail.EndWidth);
@@ -242,7 +245,7 @@ namespace Freefall.Graphics
                         var rest = new Entry
                         {
                             Positions = entry.Positions, Edges = entry.Edges, Ages = entry.Ages,
-                            Start = entry.Start, Count = entry.Count, Blade = entry.Blade,
+                            Start = entry.Start, Count = entry.Count, Blade = entry.Blade, Lit = entry.Lit,
                             Lifetime = entry.Lifetime, StartWidth = entry.StartWidth, EndWidth = entry.EndWidth,
                             ColorStart = entry.ColorStart, ColorEnd = entry.ColorEnd,
                         };
@@ -335,7 +338,7 @@ namespace Freefall.Graphics
                 Position = position,
                 Width = entry.StartWidth + (entry.EndWidth - entry.StartWidth) * t,
                 Color = Vector4.Lerp(entry.ColorStart, entry.ColorEnd, t) * fade,
-                Flags = entry.Blade ? FlagBlade : 0,
+                Flags = (entry.Blade ? FlagBlade : 0) | (entry.Lit ? FlagLit : 0),
                 Edge = edge,
             };
         }
@@ -371,7 +374,7 @@ namespace Freefall.Graphics
                         Edge = CatmullRom(before.Edge, from.Edge, to.Edge, after.Edge, t),
                         Width = from.Width + (to.Width - from.Width) * t,
                         Color = Vector4.Lerp(from.Color, to.Color, t),
-                        Flags = FlagBlade,
+                        Flags = FlagBlade | (from.Flags & FlagLit),
                     };
                 }
             }

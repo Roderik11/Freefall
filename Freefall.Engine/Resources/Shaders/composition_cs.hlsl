@@ -94,8 +94,8 @@ void CSCompose(uint3 dispatchThreadId : SV_DispatchThreadID)
     float isLit = step(0.1, data.a);
     float emissiveMask = albedo.a;
     float3 pbrLit = ambient * albedo.rgb + light.rgb;
-    // Self-illumination (HDR boost × 2) in the older light units, pre-exposed like the lights
-    float3 emissiveGlow = albedo.rgb * (2.0 * LegacyLightScale);
+    // Self-illumination: where it outshines the lit surface the G-buffer holds its luminance, pre-exposed (gbuffer.fx)
+    float3 emissiveGlow = albedo.rgb;
     // Unlit pixels (the sky dome) arrive pre-exposed already
     float3 finalColor = lerp(albedo.rgb, lerp(pbrLit, emissiveGlow, emissiveMask), isLit);
 

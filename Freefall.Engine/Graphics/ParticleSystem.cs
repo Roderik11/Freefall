@@ -37,6 +37,7 @@ namespace Freefall.Graphics
         private const uint FlagReset = 1;           // = PARTICLE_FLAG_RESET
         private const uint FlagFlipbookRandom = 2;  // = PARTICLE_FLAG_FLIPBOOK_RANDOM
         private const uint FlagFlipbookBlend = 4;   // = PARTICLE_FLAG_FLIPBOOK_BLEND
+        private const uint FlagLit = 8;             // = PARTICLE_FLAG_LIT
 
         /// <summary>
         /// The weather's wind (world space), set by <see cref="EnvironmentController"/>. Emitters take
@@ -534,7 +535,8 @@ namespace Freefall.Graphics
                 RenderMode = (uint)mode,
                 Flags = (entry.Reset ? FlagReset : 0u)
                     | (e.FlipbookRandomStart ? FlagFlipbookRandom : 0u)
-                    | (e.FlipbookBlend ? FlagFlipbookBlend : 0u),
+                    | (e.FlipbookBlend ? FlagFlipbookBlend : 0u)
+                    | (e.Lit ? FlagLit : 0u),
                 Intensity = MathF.Max(0f, e.Intensity),
                 FadeInRate = e.FadeIn > 0f ? 1f / MathF.Min(e.FadeIn, 1f) : 0f,
                 Turbulence = turbulence,
@@ -777,8 +779,8 @@ namespace Freefall.Graphics
             cmd.SetGraphicsRoot32BitConstant(0, _emitters!.SrvIndex, 4);                // EmittersIdx
             cmd.SetGraphicsRoot32BitConstant(0, _chunkMap!.SrvIndex, 5);                // ChunkMapIdx
             cmd.SetGraphicsRoot32BitConstant(0, DeferredRenderer.Current?.DepthGBuffer?.BindlessIndex ?? 0u, 6); // DepthGBufIdx
-            // Forward-mode particles are light (pre-exposed like the lights); Transparent ones an albedo the composition lights
-            float lightScale = mode == 0 ? Atmosphere.LegacyLightScale : 1f;
+            // Forward-mode particles that are not Lit are light sources in nits; Transparent ones an albedo the composition lights
+            float lightScale = mode == 0 ? Atmosphere.EmissiveExposure : 1f;
             cmd.SetGraphicsRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(lightScale), 7);  // LightScale
             cmd.SetGraphicsRoot32BitConstant(0, mode == 0 ? 1u : 0u, 8);                          // ApplyFog
 

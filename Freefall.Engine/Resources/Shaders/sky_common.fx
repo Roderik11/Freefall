@@ -54,6 +54,22 @@ float3 HemisphereAmbient(float3 N)
     return lerp(GroundBounceLight(), SkyAmbientLight(), N.y * 0.5 + 0.5);
 }
 
+// Light on a lit particle or ribbon (smoke, rain, snow, a blade's trail) at the camera's height, as a multiple of its
+// albedo (E / π, pre-exposed): half the sun's and the moon's light through the air and the clouds' average shade (a
+// puff is lit from one side) and the sky's and the ground's ambient averaged, as for the clouds. No shadows: grey by
+// day, dark at night.
+float3 ParticleLight()
+{
+    if (AtmosphereIdx == 0)
+        return 0;
+    AtmosphereParams A = LoadAtmosphere();
+    float3 P = float3(0, AtmosphereViewHeight(A, CamPos.y), 0);
+    float3 direct = A.SunIlluminance * AtmTransmittanceToLight(A, P, A.SunDirection)
+                  + A.MoonIlluminance * AtmTransmittanceToLight(A, P, A.MoonDirection);
+    StructuredBuffer<float4> ambient = ResourceDescriptorHeap[A.Ambient];
+    return direct * (A.CloudShade * 0.5 * Exposure / ATM_PI) + (ambient[0].rgb + ambient[1].rgb) * 0.5;
+}
+
 // Aerial perspective: the air between the camera and a surface dims the surface's light and adds its own (the haze
 // and the ground fog of the preset, lit by the sun and the moon, in the earth's shadow after sunset).
 //   pixel:     SV_Position.xy (or the pixel a compute thread shades)

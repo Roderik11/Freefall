@@ -211,8 +211,13 @@ namespace Freefall.Components
         [Description("RGBA color at death. Fading out needs RGB at 0 too")]
         public Vector4 ColorEnd = new(1, 1, 1, 0);
 
-        [Description("Brightness multiplier on RGB. Above 1 the particle glows: it reaches the bloom threshold")]
-        [ValueRange(0f, 100f)]
+        [Description("Lit like a surface by the sky and the sun (smoke, rain, snow, dust): RGB × Intensity is its albedo, grey " +
+                     "by day and dark at night. Off: the particle gives light (flames, embers, sparks) and RGB × Intensity is " +
+                     "its luminance in nits (a flame ~40000), shown as a light source (Atmosphere.EmissiveExposure)")]
+        public bool Lit = true;
+
+        [Description("Multiplier on RGB: with Lit, of the albedo (keep RGB × Intensity at most 1); without, the luminance in nits")]
+        [ValueRange(0f, 200000f)]
         public float Intensity = 1f;
 
         [Description("Share of its lifetime a particle takes to appear (0 = at once)")]

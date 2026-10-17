@@ -318,8 +318,8 @@ PSOutput PS(VSOutput input)
     float3 ambient = HemisphereAmbient(N) * ao;
     float3 lighting = diffuseLighting + ambient * color.rgb;
 
-    // Emissive adds directly to lighting (self-illumination, older units)
-    lighting += emissive * (1 - alpha) * LegacyLightScale;
+    // Emissive adds directly to lighting (its luminance in nits, pre-exposed as a light source seen directly)
+    lighting += emissive * (1 - alpha) * EmissiveExposure;
 
     // ── Feature mask ──
     // The base is a lit surface alpha-blended by the albedo's alpha (known good). Effects are layered on top,

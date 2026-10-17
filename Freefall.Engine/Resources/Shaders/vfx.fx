@@ -53,7 +53,7 @@ cbuffer PushConstants : register(b3)
 struct Settings
 {
     float3 Color;            //= 1, 1, 1         -- Colour of the glow
-    float  Intensity;        //= 1               -- Brightness (HDR: above 1 glows and blooms)
+    float  Intensity;        //= 10000 [0, 200000] -- Luminance in nits (cd/m²): a glow that reads at night ~1000, against a day sky ~10000
     float  DayIntensity;     //= 1 [0, 20]       -- By day, Intensity times this: a glow that must stand out against a bright sky (night = 1; dusk in between, as the sky blends)
     float  Body;             //= 1               -- How it thins towards its outline: |N.V| to this power (0 = flat, higher = a thinner, softer body)
     float  Axial;            //= 0 [0, 1]        -- 1 for tubes and cones: thickness measured round the local Y axis, and brighter seen along it (more of it in the line of sight); 0 for spheres and blobs
@@ -105,8 +105,8 @@ Instance LoadInstance(uint slot)
     return all.Load<Instance>(slot * 128u);
 }
 
-// How much it is day, 0..1, from the sun's height (the old sky's day/sunset/night blend; DayIntensity goes with
-// physical units in ATMOSPHERE_PLAN.md stage 3, when exposure makes a glow stand out at night by itself)
+// How much it is day, 0..1, from the sun's height (the old sky's day/sunset/night blend). DayIntensity stays with the
+// physical units: one luminance cannot be a faint glow at night and still stand out against a noon sky.
 float DayFactor()
 {
     float e = AtmSunDirection().y;
@@ -348,8 +348,8 @@ float4 PS(VSOutput input) : SV_Target0
     float intensity = S.Intensity * lerp(1.0, S.DayIntensity, DayFactor()) * I.Intensity;
     float3 light = S.Color * I.Color * intensity * gain * ((body * shade + rim) * ends + edge * 2.0);
 
-    // Light in the older units, pre-exposed like the lights (physical units: ATMOSPHERE_PLAN.md stage 3)
-    light *= LegacyLightScale;
+    // Luminance in nits, pre-exposed as a light source seen directly (Atmosphere.EmissiveExposure)
+    light *= EmissiveExposure;
 
     // Additive, so it hides nothing: the air in front only dims it
     if (FogEnabled > 0 && AtmosphereIdx != 0)

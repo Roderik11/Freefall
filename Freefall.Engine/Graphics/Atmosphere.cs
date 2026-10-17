@@ -56,10 +56,10 @@ namespace Freefall.Graphics
     /// <see cref="Exposure"/> scales it into what the pixels store.
     ///
     /// The directional light's intensity is the sun's or moon's lux in the engine's older units (× ReferenceExposure / π,
-    /// SkyboxRenderer); <see cref="SunLightScale"/> pre-exposes it. Light sources with no physical value yet (point
-    /// lights, emissive materials, fire, particles, VFX) are multiplied by <see cref="LegacyLightScale"/>, which is 1 at
-    /// <see cref="ReferenceEV"/> (at that exposure they look exactly as before) and never above it. Docs:
-    /// .agent/knowledge/atmospheric_effects/physical_atmosphere.md, ATMOSPHERE_PLAN.md.
+    /// SkyboxRenderer); <see cref="SunLightScale"/> pre-exposes it. Point lights are in lumens and take
+    /// <see cref="Exposure"/>; light sources seen directly (emissive materials, flames, embers, VFX glow, all in nits)
+    /// take <see cref="EmissiveExposure"/>. Docs: .agent/knowledge/atmospheric_effects/physical_atmosphere.md,
+    /// ATMOSPHERE_PLAN.md.
     /// </summary>
     public static class Atmosphere
     {
@@ -73,13 +73,22 @@ namespace Freefall.Graphics
         public static float SunLightScale => Exposure / ReferenceExposure;
 
         /// <summary>
-        /// Lights in the older units × this = pre-exposed. Capped at 1: a lantern in those units sends a tenth of the noon
-        /// sun's light (thousands of lux under it, an oil lantern gives a few), tuned at <see cref="ReferenceEV"/> against
-        /// a dark night. An exposure adapted to the night (EV −1 and below) would make them 2^14 times brighter and blow
-        /// the frame out; capped, they look at night as they always did, and dim in a brighter-than-reference noon. Goes
-        /// with ATMOSPHERE_PLAN stage 3 (lights in lumens, emissives in nits).
+        /// The pre-exposure of light sources seen directly: their luminance in nits × this is what the pixels store.
+        /// Physically it would be <see cref="Exposure"/>, but a flame (~40000 nits) is 10⁵ times the moonlit street and
+        /// would blow out white at night, as would lantern glass and lit windows. The eye adapts to what it looks at, so
+        /// below <see cref="ReferenceEV"/> (a sunny noon) this follows the exposure only by 1 − EmissiveAdaptation
+        /// (Engine.Settings, 0.8): Exposure^(1−w) × ReferenceExposure^w. In daylight it is the exposure itself.
         /// </summary>
-        public static float LegacyLightScale => MathF.Min(SunLightScale, 1f);
+        public static float EmissiveExposure
+        {
+            get
+            {
+                float exposure = Exposure, reference = ReferenceExposure;
+                if (exposure <= reference) return exposure;
+                float w = Math.Clamp(Engine.Settings.EmissiveAdaptation, 0f, 1f);
+                return MathF.Pow(exposure, 1f - w) * MathF.Pow(reference, w);
+            }
+        }
 
         public const float BottomRadiusKm = 6360f;
         public const float TopRadiusKm = 6460f;

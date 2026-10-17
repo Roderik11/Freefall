@@ -621,6 +621,13 @@ namespace Freefall
          [ValueRange(0.05f, 20f)]
          public float ExposureSpeedDown { get; set; } = 1f;
 
+         // How far the eye adapts to light sources (emissive materials, flames, embers, VFX glow) in the dark: below
+         // EV 13.36 (Atmosphere.ReferenceEV, a sunny noon) their pre-exposure follows the camera's only by 1 - this.
+         // 0 = physically (a 40000-nit flame blows out white at night), 1 = they look at night as at noon. 0.8 is the
+         // user's pick (2026-10-18): flames and lantern glass a little hotter than with 1. Graphics.Atmosphere.EmissiveExposure.
+         [ValueRange(0f, 1f)]
+         public float EmissiveAdaptation { get; set; } = 0.8f;
+
          [Category("Bloom")]
          public bool EnableBloom { get; set; } = true;
 
