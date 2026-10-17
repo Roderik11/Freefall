@@ -28,6 +28,9 @@ Freefall.Game/
 # Antigravity agent
 .agent/
 
+# Claude Code (skills, launch configs, local settings)
+.claude/
+
 # Backup files
 *.backup
 
