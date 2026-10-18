@@ -111,15 +111,26 @@ float3 ApplyAerialPerspective(float3 color, float2 pixel, float viewDepth)
     return color * ap.a + ap.rgb;
 }
 
-// The same with the air's own light scaled by the surface's sky visibility (SkyVisibility): the volume lights every
-// slice of air with the sun and sky as if nothing shaded it, so in a cave (a ray ending under the hill crossed dark
-// air) it glowed over the black walls. A stand-in until the volume itself is shadowed (ATMOSPHERE_PLAN, open issues).
+// How much of the air's own light to keep in front of a surface that sees skyVisible of the sky. The volume lights every
+// slice of air with the sun and sky as if nothing shaded it, so in a cave (a ray ending under the hill crossed dark air)
+// it glowed over the black walls. Only the stretch of the ray inside the cave is dark: at most the last 30 m when the
+// camera is in the open, all of it when the camera is in the cave too. Scaling the whole ray left a cave mouth seen from
+// 400 m without the haze that covers everything round it: a black blob in rain (user, 2026-10-18). A stand-in until
+// the volume itself is shadowed (ATMOSPHERE_PLAN, open issues).
+float AerialSkyVisible(float skyVisible, float viewDepth)
+{
+    float cameraOpen = TerrainOpen(CamPos, float3(0, 1, 0));
+    float darkStretch = lerp(viewDepth, min(viewDepth, 30.0), cameraOpen);
+    return 1.0 - (1.0 - skyVisible) * darkStretch / max(viewDepth, 1e-3);
+}
+
+// The same with the air's own light scaled by AerialSkyVisible
 float3 ApplyAerialPerspective(float3 color, float2 pixel, float viewDepth, float skyVisible)
 {
     if (FogEnabled <= 0.0 || AtmosphereIdx == 0)
         return color;
     float4 ap = AtmosphereAerialPerspective(LoadAtmosphere(), pixel / ViewportSize, viewDepth);
-    return color * ap.a + ap.rgb * skyVisible;
+    return color * ap.a + ap.rgb * AerialSkyVisible(skyVisible, viewDepth);
 }
 
 // ────────────────────────────────────────────────

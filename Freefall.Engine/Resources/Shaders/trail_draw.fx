@@ -130,7 +130,7 @@ float4 PS(VSOutput input) : SV_Target0
     if (FogEnabled > 0.0 && AtmosphereIdx != 0)
     {
         float4 ap = AtmosphereAerialPerspective(LoadAtmosphere(), input.Position.xy / ViewportSize, input.Depth);
-        color.rgb = color.rgb * ap.a + ap.rgb * (color.a * input.SkyVisible);   // no lit haze in a cave
+        color.rgb = color.rgb * ap.a + ap.rgb * (color.a * AerialSkyVisible(input.SkyVisible, input.Depth));   // no lit haze in a cave
     }
     return color;
 }
