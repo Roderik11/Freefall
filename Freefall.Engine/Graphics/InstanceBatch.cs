@@ -1163,6 +1163,23 @@ namespace Freefall.Graphics
             return true;
         }
 
+        /// <summary>
+        /// This tick's camera culling only, for the SDSM caster reach (GPUCuller.AnalyzeDepth): the bounds and the
+        /// visibility flags as UAVs (both still in UnorderedAccess after the culling wrote them) and the instance count.
+        /// False when the batch was not culled this tick.
+        /// </summary>
+        internal bool CameraCullThisTick(out uint boundsUav, out uint flagsUav, out int count)
+        {
+            boundsUav = flagsUav = 0;
+            count = 0;
+            if (_lastCullTick != Engine.TickCount || _lastCullCount == 0 || instanceBoundsBuffers[_lastCullSlot] == null)
+                return false;
+            boundsUav = instanceBoundsUAVIndices[_lastCullSlot];
+            flagsUav = visibilityFlagsUAVIndices[_lastCullSlot];
+            count = _lastCullCount;
+            return true;
+        }
+
         // Constants and clears of this batch's camera culling
         private void PrepareCull(ID3D12GraphicsCommandList list)
         {

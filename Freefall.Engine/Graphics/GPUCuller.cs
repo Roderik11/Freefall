@@ -39,9 +39,12 @@ namespace Freefall.Graphics
         private int _spdKernel, _perMipKernel, _shadowSpdKernel, _shadowPerMipKernel;
         
         // Cached kernel indices for depth_analysis.hlsl
-        private int _depthBinsKernel, _depthSplitsKernel;
+        private int _casterReachKernel, _depthBinsKernel, _depthSplitsKernel;
         private const int DepthBins = 1024;       // DEPTH_BINS in depth_analysis.hlsl
         private const int DepthTilePixels = 128;  // TILE_PIXELS in depth_analysis.hlsl: one CSDepthBins group each
+        // The analysis reaches at least this far whatever the casters: terrain bumps, grass and decorators cast into
+        // the cascades without being instances, and the terrain shadow map leaves out shallow near shadows
+        private const float SdsmMinRange = 128f;
         
         // Cached kernel index for cascade_compute.hlsl
         private int _cascadeComputeKernel;
@@ -59,8 +62,8 @@ namespace Freefall.Graphics
 
         
         // SDSM depth analysis buffers
-        private GraphicsBuffer? _depthMinMaxBuffer;            // 2 uints (min, max as float bits)
-        private GraphicsBuffer? _depthMinMaxInitBuffer;        // Static upload buffer with init values {MAX_FLOAT, 0}
+        private GraphicsBuffer? _depthMinMaxBuffer;            // 4 uints (min, max, caster reach as float bits, 0)
+        private GraphicsBuffer? _depthMinMaxInitBuffer;        // Static upload buffer with init values {MAX_FLOAT, 0, 0, 0}
         private GraphicsBuffer? _depthHistogramBuffer;         // DepthBins uints
         private GraphicsBuffer? _depthSplitsBuffer;            // 4 floats (SRV + UAV)
         private GraphicsBuffer[]? _depthSplitsReadbackBuffers;  // Per-frame readback
@@ -289,6 +292,7 @@ namespace Freefall.Graphics
 
             // SDSM depth analysis
             _depthAnalysisShader = new ComputeShader("depth_analysis.hlsl");
+            _casterReachKernel = _depthAnalysisShader.FindKernel("CSCasterReach");
             _depthBinsKernel = _depthAnalysisShader.FindKernel("CSDepthBins");
             _depthSplitsKernel = _depthAnalysisShader.FindKernel("CSDepthSplits");
 
@@ -313,14 +317,16 @@ namespace Freefall.Graphics
                 CompileShaders();
 
                 // Create SDSM GPU buffers
-                _depthMinMaxBuffer = GraphicsBuffer.CreateRaw(2, uav: true, clearable: true);
-                // Static upload buffer with init values: min=MAX_FLOAT (0x7F7FFFFF), max=0
-                _depthMinMaxInitBuffer = GraphicsBuffer.CreateUpload<uint>(2, mapped: true);
+                _depthMinMaxBuffer = GraphicsBuffer.CreateRaw(4, uav: true, clearable: true);
+                // Static upload buffer with init values: min=MAX_FLOAT (0x7F7FFFFF), max=0, caster reach=0
+                _depthMinMaxInitBuffer = GraphicsBuffer.CreateUpload<uint>(4, mapped: true);
                 unsafe
                 {
                     var pInit = _depthMinMaxInitBuffer.WritePtr<uint>();
                     pInit[0] = 0x7F7FFFFF;  // min = MAX_FLOAT
                     pInit[1] = 0;           // max = 0
+                    pInit[2] = 0;           // caster reach = 0
+                    pInit[3] = 0;
                 }
                 _depthHistogramBuffer = GraphicsBuffer.CreateStructured<uint>(DepthBins, uav: true);
                 _depthSplitsBuffer = GraphicsBuffer.CreateStructured<float>(4, srv: true, uav: true);
@@ -715,42 +721,53 @@ namespace Freefall.Graphics
         }
 
         /// <summary>
-        /// Dispatch SDSM depth analysis: CSDepthBins (one pass over every 4th pixel each way: log-spaced depth
-        /// histogram + min/max), then CSDepthSplits (percentile splits, and it clears the histogram and min/max
-        /// for the next frame).
-        /// Call after Hi-Z generation, when DepthGBuffer is in NonPixelShaderResource state.
+        /// Dispatch SDSM depth analysis: CSCasterReach (per shadow-casting batch the camera culled this tick: how far
+        /// in view depth its visible instances' shadows can reach), CSDepthBins (one pass over every 4th pixel each
+        /// way, up to that reach: log-spaced depth histogram + min/max), then CSDepthSplits (percentile splits capped at
+        /// the logarithmic ones, and it clears the histogram, min/max and reach for the next frame).
+        /// Call after Hi-Z generation, when DepthGBuffer is in NonPixelShaderResource state, after the opaque culling.
         /// </summary>
-        public void AnalyzeDepth(ID3D12GraphicsCommandList commandList, uint depthSrvIndex, int texWidth, int texHeight, float nearPlane, float maxShadowDistance)
+        /// <param name="toLight">Toward the directional light (sun or moon).</param>
+        /// <param name="maxShadowDistance">The ceiling (EngineSettings.MaxShadowDistance): never analysed farther.</param>
+        public void AnalyzeDepth(ID3D12GraphicsCommandList commandList, uint depthSrvIndex, int texWidth, int texHeight,
+            Camera camera, Vector3 toLight, float maxShadowDistance)
         {
             if (!_sdsmInitialized || _depthAnalysisShader == null) return;
-            
+
             int frameIndex = Engine.FrameIndex % FrameCount;
-            
+
             commandList.SetComputeRootSignature(_device.GlobalRootSignature);
             _cachedSrvHeapArray ??= new[] { _device.SrvHeap };
             commandList.SetDescriptorHeaps(1, _cachedSrvHeapArray);
-            
-            // Set constants via ComputeShader API
+
+            // Set constants via ComputeShader API: all push constants (a Params cbuffer has one copy per frame, and
+            // the scene and the game view each analyse their own camera)
             var da = _depthAnalysisShader!;
-            // Push constants (resource indices)
             da.SetPushConstant("DepthTex", depthSrvIndex);
             da.SetBuffer("MinMaxUAV", _depthMinMaxBuffer!);
             da.SetBuffer("HistogramUAV", _depthHistogramBuffer!);
             da.SetBuffer("SplitsUAV", _depthSplitsBuffer!);
-            // Params cbuffer
             da.SetParam("TexWidth", (uint)texWidth);
             da.SetParam("TexHeight", (uint)texHeight);
-            da.SetParam("NearPlane", nearPlane);
+            da.SetParam("NearPlane", camera.NearPlane);
             da.SetParam("MaxShadowDistance", maxShadowDistance);
-            
+            da.SetParam("MinRange", SdsmMinRange);
+            da.SetParam("ReachPerRadius", ShadowReachPerRadius(toLight, camera.Forward));
+            da.SetParam("CameraX", camera.Position.X);
+            da.SetParam("CameraY", camera.Position.Y);
+            da.SetParam("CameraZ", camera.Position.Z);
+            da.SetParam("ForwardX", camera.Forward.X);
+            da.SetParam("ForwardY", camera.Forward.Y);
+            da.SetParam("ForwardZ", camera.Forward.Z);
+
             // Min/max and histogram stay in UnorderedAccess: CSDepthSplits hands them back cleared. Only the
-            // first run (created in Common) sets them up: min/max to {MAX_FLOAT, 0}, which ClearUAV cannot write
-            // (it fills every element with the first component), the histogram to zeros.
+            // first run (created in Common) sets them up: min/max/reach to {MAX_FLOAT, 0, 0}, which ClearUAV cannot
+            // write (it fills every element with the first component), the histogram to zeros.
             var splitsFrom = _sdsmValidFrames == 0 ? ResourceStates.Common : ResourceStates.CopySource;
             if (_sdsmValidFrames == 0)
             {
                 commandList.ResourceBarrierTransition(_depthMinMaxBuffer!.Native, ResourceStates.Common, ResourceStates.CopyDest);
-                commandList.CopyBufferRegion(_depthMinMaxBuffer!.Native, 0, _depthMinMaxInitBuffer!.Native, 0, 8);
+                commandList.CopyBufferRegion(_depthMinMaxBuffer!.Native, 0, _depthMinMaxInitBuffer!.Native, 0, 16);
                 commandList.ResourceBarrierTransition(_depthMinMaxBuffer!.Native, ResourceStates.CopyDest, ResourceStates.UnorderedAccess);
                 commandList.ResourceBarrierTransition(_depthHistogramBuffer!.Native, ResourceStates.Common, ResourceStates.UnorderedAccess);
                 _depthHistogramBuffer!.ClearUAV(commandList, new Int4(0, 0, 0, 0));
@@ -758,7 +775,26 @@ namespace Freefall.Graphics
                     new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(_depthMinMaxBuffer!.Native)),
                     new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(_depthHistogramBuffer!.Native)));
             }
-            
+
+            // --- Pass 0: CSCasterReach, per shadow-casting batch the camera culled this tick ---
+            // The culling wrote each instance's bounds and visibility flag: wait for it once, then max-merge
+            var batches = CommandBuffer.GetAllBatches(RenderPass.Opaque);
+            if (batches != null)
+            {
+                commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(null)));
+                foreach (var batch in batches)
+                {
+                    if (!batch.Material.HasPass(RenderPass.Shadow) ||
+                        !batch.CameraCullThisTick(out uint bounds, out uint flags, out int count))
+                        continue;
+                    da.SetPushConstant("CasterBounds", bounds);
+                    da.SetPushConstant("CasterFlags", flags);
+                    da.SetPushConstant("CasterCount", (uint)count);
+                    da.Dispatch(_casterReachKernel, commandList, (uint)(count + 63) / 64, 1, 1);
+                }
+                commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(_depthMinMaxBuffer!.Native)));
+            }
+
             // --- Pass 1: CSDepthBins, one group per 128x128 pixel tile ---
             uint groupsX = ((uint)texWidth + DepthTilePixels - 1) / DepthTilePixels;
             uint groupsY = ((uint)texHeight + DepthTilePixels - 1) / DepthTilePixels;
@@ -787,6 +823,24 @@ namespace Freefall.Graphics
             _sdsmValidFrames++;
         }
         
+        /// <summary>
+        /// For CSCasterReach: the view depth a caster's shadow reaches past its centre, per metre of its bounding radius.
+        /// It stands on the ground, so its top is at most 2r up and its shadow at most 2r / tan(elevation) long, away
+        /// from the light; only the part along the view deepens it. A light at or under the horizon casts nothing on
+        /// the ground (1: the sphere alone); a low one reaches far, which the shader clamps to the ceiling.
+        /// </summary>
+        private static float ShadowReachPerRadius(Vector3 toLight, Vector3 forward)
+        {
+            float length = toLight.Length();
+            if (length < 1e-6f) return 1f;
+            toLight /= length;
+            float across = MathF.Sqrt(toLight.X * toLight.X + toLight.Z * toLight.Z);
+            if (toLight.Y <= 0f || across < 1e-4f) return 1f;
+            float along = MathF.Max(0f, (-toLight.X * forward.X - toLight.Z * forward.Z) / across);
+            float tan = MathF.Max(toLight.Y / across, 1e-3f);
+            return 1f + 2f * along / tan;
+        }
+
         private readonly float[] _adaptiveSplits = new float[4];
 
         /// <summary>

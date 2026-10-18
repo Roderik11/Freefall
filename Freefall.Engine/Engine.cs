@@ -514,8 +514,14 @@ namespace Freefall
          [ValueRange(3, 8)]
          public int ShadowCascadeCount { get; set; } = 4;                   // Number of shadow cascades
 
-         [ValueRange(50f, 1000f)]
-         public float MaxShadowDistance { get; set; } = 300f;               // SDSM max depth for split analysis
+         /// <summary>
+         /// The farthest the sun's cascades ever reach. SDSM analyses the depth only up to the farthest receiver a
+         /// visible caster can shade (its shadow's length at this sun height), at least 128 m; this only caps that
+         /// (and with it what the last cascade draws). It was a 300 m cut until 2026-10-18, because pixels past the
+         /// shadows pushed the percentile splits out.
+         /// </summary>
+         [ValueRange(100f, 4000f)]
+         public float MaxShadowDistance { get; set; } = 2000f;
 
          /// <summary>
          /// Point lights that get a shadow each frame, at night: every point light in view whose sphere is at least

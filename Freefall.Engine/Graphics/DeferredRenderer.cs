@@ -776,7 +776,7 @@ namespace Freefall.Graphics
                  int depthWidth = (int)DepthGBuffer.Native.Description.Width;
                  int depthHeight = (int)DepthGBuffer.Native.Description.Height;
                  CommandBuffer.Culler.AnalyzeDepth(list, DepthGBuffer.BindlessIndex,
-                     depthWidth, depthHeight, camera.NearPlane, Engine.Settings.MaxShadowDistance);
+                     depthWidth, depthHeight, camera, -DirectionalLight.GetLightDirection(), Engine.Settings.MaxShadowDistance);
                  PixMarker.End(list); // SDSM Depth Analysis
              }
              

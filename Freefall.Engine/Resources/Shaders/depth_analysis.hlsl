@@ -1,11 +1,17 @@
 // SDSM Depth Analysis
+// CSCasterReach - per visible instance of a shadow-casting batch (the camera culling's bounds and flags): the view
+//                 depth its shadow can reach, max-merged. The analysis looks only that far: the farthest receiver a
+//                 caster in view can shade. Pixels past it (open land, the sea, far hills, whose shadows the terrain
+//                 shadow map gives) pushed the percentile splits out, so a fixed 300 m cap stood in until 2026-10-18.
 // CSDepthBins   - one pass in 4x4 pixel blocks: nearest and farthest depth over every pixel, log-spaced depth
-//                 histogram over [NearPlane, MaxShadowDistance] of one pixel per block (1/16)
-// CSDepthSplits - prefix sum + 40/70/90/100 percentile splits; hands the histogram and min/max back cleared
-//                 for the next frame, so nothing is cleared before CSDepthBins
+//                 histogram over [NearPlane, range] of one pixel per block (1/16)
+// CSDepthSplits - prefix sum + 40/70/90/100 percentile splits, each no farther than the logarithmic split between the
+//                 nearest and the farthest pixel; hands the histogram, min/max and the reach back cleared for the next
+//                 frame, so nothing is cleared before CSCasterReach / CSDepthBins
 // Was a min/max pass + a histogram pass over every pixel with one groupshared atomic each (0.37 ms at 3440x1249,
 // 0.012 now); the splits match the old ones within ~0.5%.
 
+#pragma kernel CSCasterReach
 #pragma kernel CSDepthBins
 #pragma kernel CSDepthSplits
 
@@ -13,23 +19,42 @@
 // Input: DepthGBuffer (R32_Float, linear view-space depth, 0 = sky/empty)
 // Output: 4 cascade split distances in a small UAV buffer
 
+// Everything is pushed: a Params cbuffer has one copy per frame, and each view (scene, game) analyses its own camera
 cbuffer PushConstants : register(b3)
 {
     uint DepthTexIdx;           // slot 0  — SRV: DepthGBuffer (R32_Float)
-    uint MinMaxUAVIdx;          // slot 1  — UAV: RWByteAddressBuffer [minAsUint, maxAsUint]
+    uint MinMaxUAVIdx;          // slot 1  — UAV: RWByteAddressBuffer [minAsUint, maxAsUint, casterReachAsUint, 0]
     uint HistogramUAVIdx;       // slot 2  — UAV: RWStructuredBuffer<uint> [DEPTH_BINS bins]
     uint SplitsUAVIdx;          // slot 3  — UAV: RWStructuredBuffer<float> [4 splits]
+    uint CasterBoundsIdx;       // slot 4  — UAV: RWStructuredBuffer<InstanceBounds>, a batch's camera culling (CSCasterReach)
+    uint CasterFlagsIdx;        // slot 5  — UAV: RWStructuredBuffer<uint>, its visibility flags (0 = not seen)
+    uint CasterCountIdx;        // slot 6  — its instances
+    uint TexWidth;              // slot 7  — depth texture width
+    uint TexHeight;             // slot 8  — depth texture height
+    float NearPlane;            // slot 9  — camera near plane
+    float MaxShadowDistance;    // slot 10 — the ceiling: never analyse farther (EngineSettings.MaxShadowDistance)
+    float MinRange;             // slot 11 — analyse at least this far: terrain bumps, grass and decorators are no instances
+    float ReachPerRadius;       // slot 12 — view depth a caster's shadow reaches past its centre per metre of radius
+    float CameraX;              // slot 13-15 — camera position (world)
+    float CameraY;
+    float CameraZ;
+    float ForwardX;             // slot 16-18 — camera forward
+    float ForwardY;
+    float ForwardZ;
 };
+#define CameraPosition float3(CameraX, CameraY, CameraZ)
+#define CameraForward float3(ForwardX, ForwardY, ForwardZ)
 
-cbuffer Params : register(b4)
+// The camera culling's bounds per instance (cull_instances.hlsl InstanceBounds)
+struct InstanceBounds
 {
-    uint TexWidth;              // Depth texture width
-    uint TexHeight;             // Depth texture height
-    float NearPlane;            // Camera near plane
-    float MaxShadowDistance;    // Ignore pixels beyond this depth
+    float3 Center;
+    float Radius;
+    uint Part;
 };
+#define INVALID_PART 0xFFFFFFFFu
 
-#define DEPTH_BINS 1024         // log-spaced: each bin ~0.8% of its depth (near 0.1 m, MaxShadowDistance 439 m)
+#define DEPTH_BINS 1024         // log-spaced: each bin ~1% of its depth (near 0.1 m, range 2000 m)
 #define SAMPLE_STEP 4           // histogram: every 4th pixel each way, 1/16 of them is plenty for percentiles
 #define TILE_SAMPLES 32         // blocks per group edge: 16 threads x 2
 #define TILE_PIXELS (TILE_SAMPLES * SAMPLE_STEP) // 128: GPUCuller.AnalyzeDepth dispatches ceil(size / 128) groups
@@ -37,9 +62,49 @@ cbuffer Params : register(b4)
 
 SamplerState PointClamp : register(s1); // static sampler 1: point clamp (only Gather uses it)
 
+// How far this frame's analysis looks: the farthest receiver a visible caster can shade (CSCasterReach), at least
+// MinRange, at most MaxShadowDistance. Both kernels read it; CSDepthSplits clears it last.
+float AnalysisRange()
+{
+    RWByteAddressBuffer minMaxBuf = ResourceDescriptorHeap[MinMaxUAVIdx];
+    float reach = asfloat(minMaxBuf.Load(8));
+    return clamp(max(reach, MinRange), NearPlane + 1.0f, max(MaxShadowDistance, NearPlane + 1.0f));
+}
+
 // Bins are spaced evenly in log2(depth), so every split gets the same relative precision
 float LogNear() { return log2(max(NearPlane, 0.001f)); }
-float BinsPerLog2() { return DEPTH_BINS / max(log2(MaxShadowDistance) - LogNear(), 0.001f); }
+float BinsPerLog2(float range) { return DEPTH_BINS / max(log2(range) - LogNear(), 0.001f); }
+
+// ============================================================
+// CSCasterReach — one thread per instance of a shadow-casting batch, after its camera culling
+// ============================================================
+// A visible caster's shadow falls behind it, away from the sun: at most twice its radius high (it stands on the
+// ground), so up to 2r / tan(sun elevation) across the ground. Its farthest receiver in view depth: its centre's depth,
+// one radius, and that shadow's length along the view (ReachPerRadius = 1 + 2 · max(0, shadow dir · forward) / tan e,
+// from the CPU). Invisible instances and the parts the culling dropped add nothing.
+[numthreads(64, 1, 1)]
+void CSCasterReach(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    uint instanceIdx = dispatchThreadId.x;
+    float reach = 0.0f;
+    if (instanceIdx < CasterCountIdx)
+    {
+        RWStructuredBuffer<uint> flags = ResourceDescriptorHeap[CasterFlagsIdx];
+        RWStructuredBuffer<InstanceBounds> bounds = ResourceDescriptorHeap[CasterBoundsIdx];
+        InstanceBounds sphere = bounds[instanceIdx];
+        if (flags[instanceIdx] != 0 && sphere.Part != INVALID_PART && sphere.Radius > 0.0f)
+        {
+            float depth = dot(sphere.Center - CameraPosition, CameraForward);
+            reach = max(depth + sphere.Radius * ReachPerRadius, 0.0f);
+        }
+    }
+    reach = WaveActiveMax(reach);
+    if (WaveIsFirstLane() && reach > 0.0f)
+    {
+        RWByteAddressBuffer minMaxBuf = ResourceDescriptorHeap[MinMaxUAVIdx];
+        minMaxBuf.InterlockedMax(8, asuint(min(reach, MaxShadowDistance)));
+    }
+}
 
 uint DepthToBin(float depth, float logNear, float binsPerLog2)
 {
@@ -72,8 +137,9 @@ void CSDepthBins(uint3 groupId : SV_GroupID, uint3 threadId : SV_GroupThreadID, 
 
     Texture2D<float> depthTex = ResourceDescriptorHeap[DepthTexIdx];
     float2 texelSize = 1.0f / float2(TexWidth, TexHeight);
+    float range = AnalysisRange();
     float logNear = LogNear();
-    float binsPerLog2 = BinsPerLog2();
+    float binsPerLog2 = BinsPerLog2(range);
     float nearest = asfloat(FLOAT_MAX_BITS);
     float farthest = 0.0f;
 
@@ -98,7 +164,7 @@ void CSDepthBins(uint3 groupId : SV_GroupID, uint3 threadId : SV_GroupThreadID, 
             quads[2] = depthTex.GatherRed(PointClamp, uv + float2(0.0f, 2.0f) * texelSize);
             quads[3] = depthTex.GatherRed(PointClamp, uv + float2(2.0f, 2.0f) * texelSize);
 
-            // Skip sky/empty pixels (depth <= 0) and distant pixels beyond shadow range
+            // Skip sky/empty pixels (depth <= 0) and pixels past the farthest receiver a caster can shade
             [unroll]
             for (uint q = 0; q < 4; q++)
             {
@@ -106,7 +172,7 @@ void CSDepthBins(uint3 groupId : SV_GroupID, uint3 threadId : SV_GroupThreadID, 
                 for (uint c = 0; c < 4; c++)
                 {
                     float v = quads[q][c];
-                    if (v > 0.0f && v <= MaxShadowDistance)
+                    if (v > 0.0f && v <= range)
                     {
                         nearest = min(nearest, v);
                         farthest = max(farthest, v);
@@ -115,7 +181,7 @@ void CSDepthBins(uint3 groupId : SV_GroupID, uint3 threadId : SV_GroupThreadID, 
             }
 
             float depth = quads[0].w;
-            if (depth > 0.0f && depth <= MaxShadowDistance)
+            if (depth > 0.0f && depth <= range)
                 InterlockedAdd(gs_bins[DepthToBin(depth, logNear, binsPerLog2)], 1);
         }
     }
@@ -186,7 +252,7 @@ void CSDepthSplits(uint tid : SV_GroupIndex)
     uint total = gs_runSum[255];
     uint before = gs_runSum[tid] - runTotal;
     float logNear = LogNear();
-    float binsPerLog2 = BinsPerLog2();
+    float binsPerLog2 = BinsPerLog2(AnalysisRange());   // read by every thread before thread 0 clears it below
 
     // Near-biased percentile boundaries; the 100th is the farthest depth (below)
     const float percentiles[3] = { 0.40f, 0.70f, 0.90f };
@@ -222,7 +288,7 @@ void CSDepthSplits(uint tid : SV_GroupIndex)
 
         float minDepth = asfloat(minMaxBuf.Load(0));
         float maxDepth = asfloat(minMaxBuf.Load(4));
-        minMaxBuf.Store2(0, uint2(FLOAT_MAX_BITS, 0));
+        minMaxBuf.Store3(0, uint3(FLOAT_MAX_BITS, 0, 0));
 
         // No valid depth data: zeros, the light falls back to its fixed splits
         if (total == 0 || maxDepth - minDepth <= 0.0001f)
@@ -231,10 +297,15 @@ void CSDepthSplits(uint tid : SV_GroupIndex)
             return;
         }
 
+        // Each percentile split no farther than the logarithmic one between the nearest and the farthest pixel: a
+        // view full of distant ground (a vista over a forest that reaches a kilometre) put 40 % of the pixels past
+        // 300 m and cascade 0 with them. In a room the percentiles stay the nearer ones.
+        float logFrom = max(minDepth, NearPlane + 0.1f);
+        float logRatio = max(maxDepth, logFrom) / logFrom;
         float result[4];
         [unroll]
         for (uint c2 = 0; c2 < 3; c2++)
-            result[c2] = max(gs_split[c2], NearPlane + 0.1f);
+            result[c2] = min(max(gs_split[c2], NearPlane + 0.1f), logFrom * pow(logRatio, (c2 + 1) / 4.0f));
         // Last cascade covers everything
         result[3] = max(maxDepth, NearPlane + 0.1f);
 
