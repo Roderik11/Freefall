@@ -634,6 +634,14 @@ namespace Freefall
          [ValueRange(-4f, 6f)]
          public float ExposureCompensation { get; set; } = 1.35f;
 
+         // The exposure follows the light where the camera is (an incident meter there: the sun past the terrain,
+         // the meshes and the clouds, the sky the place sees, the lamps near it), so turning round in the same shade
+         // keeps the shade as bright. The screen's own metering may move it this many EV either way (softly): a
+         // sunlit mountain seen from the shade still darkens the image a little. 8 or more = the screen alone, as
+         // before 2026-10-18 (the shade looked dark facing the sunlit slope and like a sunny meadow turned away).
+         [ValueRange(0f, 8f)]
+         public float ExposureScreenRange { get; set; } = 1f;
+
          // Dim light: below ExposureDimLightEV (the metered EV100 before compensation; a clear noon meters ~14.8, an
          // overcast one ~14) the exposure follows the scene only partly. Of each EV the scene loses there, this share
          // still darkens the image, so dusk reads darker than day and a moonlit night darker than dusk; 0 = the eye

@@ -724,6 +724,10 @@ namespace Freefall.Graphics
              if (_fogVolumeIdx != 0)
                  VolumetricFog!.Render(list, camera.Position, _relativeVP, ShadowMapIndex, BindSceneConstantsForCompute);
 
+             // 2f. Exposure meter: the light at the camera past the terrain, the sky captures and the clouds, and the
+             //     lamps near it, for the auto exposure (read back a few frames later)
+             AutoExposure.MeterIncident(list, camera.Position, BindSceneConstantsForCompute);
+
              // 3. Sky pass
              using (_skyMarker.Auto())
              {
