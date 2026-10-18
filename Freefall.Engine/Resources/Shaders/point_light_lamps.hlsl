@@ -1,6 +1,7 @@
-// Lamps (PointLight.OnlyWhenDark) lit by the daylight where each one hangs (PointLightBuffer.UpdateLamps): once per
-// frame after the sky captures are drawn, every lamp in the scene whatever the camera looks at (a lamp coming into view is
-// already as it should be). The light cull reads the result the frame after.
+// The daylight where each point light hangs, and lamps (PointLight.OnlyWhenDark) lit by it (PointLightBuffer.UpdateLamps):
+// once per frame after the sky captures are drawn, every enabled light in the scene whatever the camera looks at (a lamp
+// coming into view is already as it should be). The light cull (lamps) and the shadow selection (SurfaceLux: what a
+// light competes with) read the result the frame after.
 //
 // The daylight at a lamp, in lux on level ground: the sun's (or moon's) SunLight × SunHeight and the sky's Ambient, as far
 // as they reach the lamp past the terrain (sky_visibility.hlsli: under a hill, the horizons of a valley, light through a
@@ -11,11 +12,13 @@
 // The sun's cascades are not used: they cover only what the camera looks at, so a lamp in a room at the edge of the view
 // or behind the camera was sunlit to them (out), and came on as the camera turned to it. Outdoors a lamp switches with
 // the sun under the horizon, where only the sky counts; indoors the roof that hides the sky hides the sun too, so the
-// meshes' share of the sky stands in for the sun's. No SkyCaptureBounce: it stands in for daylight that reaches a room's
-// surfaces through its doors and windows, and with it no lamp would light at noon (4 % of 15000 lux).
+// meshes' share of the sky stands in for the sun's. A lamp switches without SkyCaptureBounce: it stands in for daylight
+// that reaches a room's surfaces through its doors and windows, and with it no lamp would light at noon (4 % of 15000
+// lux). The shadow selection weighs a light against the surfaces' daylight with the bounce (SurfaceLux): a room light's
+// shadow at noon would be lost in those ~600 lux, so it waits until the room really darkens.
 //
-// LAMPS_PER_GROUP lamps per group of 64 threads, one thread per sky direction: each looks its direction up at the lamp's
-// five taps, the first thread of the lamp adds them up and judges it. One thread doing all 80 lookups of a lamp took
+// LAMPS_PER_GROUP lights per group of 64 threads, one thread per sky direction: each looks its direction up at the light's
+// five taps, the first thread of the light adds them up and judges it. One thread doing all 80 lookups of a light took
 // 0.045 ms for Eldermoor's 225 lamps (latency: four waves on the whole GPU).
 // Docs: .agent/knowledge/rendering_engine/features/lighting/point_lights.md.
 
@@ -31,6 +34,7 @@ cbuffer PushConstants : register(b3)
     uint TickIdx;               // Engine.TickCount: LampState.Seen (a lamp not judged the tick before starts as it should be)
     uint SkyCaptureViewsIdx;    // StructuredBuffer<SkyCaptureView>[SKY_CAPTURE_VIEWS]; 0 = no captures
     uint SkyCaptureDepthIdx;    // their depth maps (Texture2DArray)
+    uint SkyCaptureBounceIdx;   // asfloat: EngineSettings.SkyCaptureBounce, for SurfaceLux
 };
 
 #include "point_lights.hlsli"
@@ -55,8 +59,9 @@ static const float3 LampTaps[LAMP_TAPS] =
 groupshared SkyCaptureView gViews[SKY_CAPTURE_VIEWS];
 groupshared float gOpen[LAMPS_PER_GROUP][LAMP_TAPS][SKY_CAPTURE_VIEWS];
 
-// The daylight where a lamp hangs, lux on level ground, given the meshes' share of the sky there
-float LampDaylight(float3 worldPos, float meshes, PointLightFrame frame)
+// The daylight where a light hangs, lux on level ground, given the meshes' share of the sky there: without the bounce
+// (a lamp switches on it) and with it (surfaceLux: what the surfaces round the light get)
+float LightDaylight(float3 worldPos, float meshes, PointLightFrame frame, out float surfaceLux)
 {
     TerrainCover terrain;
     terrain.Heightmap = frame.TerrainHeightmap;
@@ -64,16 +69,18 @@ float LampDaylight(float3 worldPos, float meshes, PointLightFrame frame)
     terrain.Origin = frame.TerrainOrigin;
     terrain.Size = frame.TerrainSize;
 
-    // The terrain's tolerance as near the camera: a lamp is placed on the heightmap, not on the coarser terrain drawn far
+    // The terrain's tolerance as near the camera: a light is placed on the heightmap, not on the coarser terrain drawn far
     // off, and the judgement must not change with the camera's distance
     float open, portal;
     float sky = SkyVisibilityParts(terrain, LinearClamp, worldPos, float3(0, 1, 0), TerrainTolerance(0.0), open, portal);
 
-    // Joined as sky_common.fx SkyVisibilityWith does, without the bounce: in the open the meshes take their share of what
-    // the terrain's horizons leave; under the terrain the smaller of the two (both judge the same rock)
-    float skyVisible = lerp(min(portal, meshes), sky * meshes, open);
-    float sunVisible = open * meshes;
-    return frame.SunLight * frame.SunHeight * sunVisible + frame.Ambient * skyVisible;
+    // Joined as sky_common.fx SkyVisibilityWith does: in the open the meshes take their share of what the terrain's
+    // horizons leave (the surfaces at least the bounce's); under the terrain the smaller of the two (both judge the same
+    // rock, and no bounce: a cave stays dark)
+    float sun = frame.SunLight * frame.SunHeight * open * meshes;
+    float bounce = saturate(asfloat(SkyCaptureBounceIdx));
+    surfaceLux = sun + frame.Ambient * lerp(min(portal, meshes), sky * max(meshes, bounce), open);
+    return sun + frame.Ambient * lerp(min(portal, meshes), sky * meshes, open);
 }
 
 [numthreads(64, 1, 1)]
@@ -87,7 +94,7 @@ void CSLamps(uint3 gid : SV_GroupID, uint gi : SV_GroupIndex)
     }
     GroupMemoryBarrierWithGroupSync();
 
-    uint local = gi / SKY_CAPTURE_VIEWS;    // the lamp in this group
+    uint local = gi / SKY_CAPTURE_VIEWS;    // the light in this group
     uint dir = gi % SKY_CAPTURE_VIEWS;      // the direction this thread looks up
     uint slot = gid.x * LAMPS_PER_GROUP + local;
 
@@ -97,16 +104,16 @@ void CSLamps(uint3 gid : SV_GroupID, uint gi : SV_GroupIndex)
         StructuredBuffer<PointLightRecord> records = ResourceDescriptorHeap[RecordsIdx];
         r = records[slot];
     }
-    bool isLamp = (r.Flags & POINT_LIGHT_ENABLED) != 0 && (r.Flags & POINT_LIGHT_WHEN_DARK) != 0;
+    bool enabled = (r.Flags & POINT_LIGHT_ENABLED) != 0;
     float3 world = 0;
-    if (isLamp)
+    if (enabled)
     {
         StructuredBuffer<row_major float4x4> transforms = ResourceDescriptorHeap[TransformsIdx];
         world = mul(float4(0, 0, 0, 1), transforms[r.TransformSlot]).xyz;
     }
 
     // This direction at the five taps; one not captured yet is not read (its map may never have been drawn)
-    if (isLamp && meshes && gViews[dir].Valid > 0.0)
+    if (enabled && meshes && gViews[dir].Valid > 0.0)
     {
         Texture2DArray<float> depths = ResourceDescriptorHeap[SkyCaptureDepthIdx];
         float w, h, slices;
@@ -121,9 +128,9 @@ void CSLamps(uint3 gid : SV_GroupID, uint gi : SV_GroupIndex)
 
     RWStructuredBuffer<LampState> lamps = ResourceDescriptorHeap[LampsUAVIdx];
     LampState state = lamps[slot];
-    if (!isLamp)
+    if (!enabled)
     {
-        // Not a lamp (or off): the next lamp in this slot, or this one enabled again, starts as it should be
+        // Off or free: the next light in this slot, or this one enabled again, starts as it should be
         if (state.Seen != 0)
             lamps[slot] = (LampState)0;
         return;
@@ -157,18 +164,29 @@ void CSLamps(uint3 gid : SV_GroupID, uint gi : SV_GroupIndex)
 
     StructuredBuffer<PointLightFrame> frames = ResourceDescriptorHeap[FrameParamsIdx];
     PointLightFrame frame = frames[0];
-    float lux = LampDaylight(world, v[2], frame);
+    float surfaceLux;
+    float lux = LightDaylight(world, v[2], frame, surfaceLux);
 
-    bool fresh = state.Seen == 0 || state.Seen + 1 != TickIdx;
-    bool lit = fresh || state.Lit != 0;     // as Daylight: lit unless it is bright enough to go out
+    LampState judged;
+    judged.SurfaceLux = surfaceLux;
+    judged.Lux = lux;
+    if ((r.Flags & POINT_LIGHT_WHEN_DARK) == 0)
+    {
+        judged.Lamp = -1.0;     // a plain light: judged for the shadow selection only
+        judged.Seen = TickIdx;
+        lamps[slot] = judged;
+        return;
+    }
+
+    // A lamp: not judged as one the tick before (just added, enabled or marked) starts as it should be
+    bool fresh = state.Seen == 0 || (state.Seen & ~LAMP_LIT) + 1 != TickIdx || state.Lamp < 0.0;
+    bool lit = fresh || (state.Seen & LAMP_LIT) != 0;   // as Daylight: lit unless it is bright enough to go out
     if (lit ? lux > LAMPS_OFF_ABOVE_LUX : lux < LAMPS_ON_BELOW_LUX)
         lit = !lit;
 
     float target = lit ? 1.0 : 0.0;
-    state.Lamp = fresh ? target
+    judged.Lamp = fresh ? target
         : (target > state.Lamp ? min(target, state.Lamp + frame.LampFadeStep) : max(target, state.Lamp - frame.LampFadeStep));
-    state.Lit = lit ? 1u : 0u;
-    state.Seen = TickIdx;
-    state.Lux = lux;
-    lamps[slot] = state;
+    judged.Seen = TickIdx | (lit ? LAMP_LIT : 0u);
+    lamps[slot] = judged;
 }

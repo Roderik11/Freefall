@@ -162,10 +162,9 @@ namespace Freefall.Graphics
         /// <param name="visibleUav">The visible list (RWStructuredBuffer&lt;PointLightData&gt;).</param>
         /// <param name="visibleCount">Its count (RWByteAddressBuffer; read back for the stats too).</param>
         /// <param name="depthSrv">Linear depth (view-space Z) for the hidden-centre test, readable by compute.</param>
-        /// <param name="sunShadowMap">The sun's cascades rendered this frame (DeferredRenderer.ShadowMapIndex), 0 = none.</param>
-        /// <param name="sunCascades">Their CascadeData buffer (DirectionalLight.CurrentCascadeSrvIndex).</param>
+        /// <param name="lampStatesUav">The daylight at each light, judged last frame (PointLightBuffer.LampStatesUav).</param>
         public void Select(ID3D12GraphicsCommandList list, Camera camera, uint frameParamsSrv, uint visibleUav,
-            GraphicsBuffer visibleCount, uint depthSrv, uint sunShadowMap, uint sunCascades, int sunCascadeCount)
+            GraphicsBuffer visibleCount, uint depthSrv, uint lampStatesUav)
         {
             uint visibleCountUav = visibleCount.UavIndex;
             _cameraName = camera.Entity?.Name;
@@ -198,9 +197,7 @@ namespace Freefall.Graphics
             _cs.SetPushConstant("ShadowLightsUAV", _shadowLights.UavIndex);
             _cs.SetPushConstant("ViewsUAV", _views.UavIndex);
             _cs.SetPushConstant("DepthTex", depthSrv);
-            _cs.SetPushConstant("SunShadowMap", sunShadowMap);
-            _cs.SetPushConstant("SunCascades", sunCascades);
-            _cs.SetPushConstant("SunCascadeCount", sunShadowMap != 0 ? (uint)sunCascadeCount : 0u);
+            _cs.SetPushConstant("LampsUAV", lampStatesUav);
 
             list.SetComputeRootSignature(Engine.Device.GlobalRootSignature);
             list.SetDescriptorHeaps(1, new[] { Engine.Device.SrvHeap });

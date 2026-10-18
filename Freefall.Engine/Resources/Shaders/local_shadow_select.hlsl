@@ -5,9 +5,10 @@
 // CSScore      per visible light: rank score = luminance × intensity × range² / max(distance, range/4)²,
 //              ×1.3 while it has a shadow (no swapping between near-equal lights), ×0.25 when its centre is hidden
 //              behind the depth buffer (lights walled in), 0 under 32 px of on-screen radius; × its sun factor:
-//              how much the light outshines the sunlight reaching it (cascade shadow map around the light, clouds
-//              in the frame's sun irradiance). A street lamp at clear noon gets none, a room light that day keeps its
-//              shadow, an overcast or night street gets them. Score histogram.
+//              how much the light outshines the daylight on the surfaces round it (LampState.SurfaceLux, judged
+//              last frame by point_light_lamps.hlsl past the terrain and the walls and roofs). A street lamp at
+//              clear noon gets none, a cave lamp that day keeps its shadow, a room light gets one once the room is
+//              darker than its light, an overcast or night street gets them. Score histogram.
 // CSGather     per visible light: the lights in the histogram's top bins (at least the budget) and those still
 //              fading out become candidates, with their visible faces and preferred tier.
 // CSSelect     one group: sorts the candidates (bitonic), then one thread fits them into the atlas in rank order
@@ -39,26 +40,11 @@ cbuffer PushConstants : register(b3)
     uint ShadowLightsUAVIdx;    // RWStructuredBuffer<LocalShadowLight>
     uint ViewsUAVIdx;           // RWStructuredBuffer<LocalShadowView>
     uint DepthTexIdx;           // linear depth (view-space Z, 0 = sky)
-    uint SunShadowMapIdx;       // the sun's cascades this frame (Texture2DArray, standard Z), 0 = none rendered
-    uint SunCascadesIdx;        // StructuredBuffer<CascadeData> (absolute-world VP)
-    uint SunCascadeCountIdx;
+    uint LampsUAVIdx;           // RWStructuredBuffer<LampState> per registry slot (PointLightBuffer): the daylight at each light
 };
 
 #include "local_shadows.hlsli"
 #include "point_lights.hlsli"
-#include "sky_visibility.hlsli"
-
-// The global root signature's linear clamp sampler (s2), for the terrain heightmap
-SamplerState TerrainLinearClamp : register(s2);
-
-// The sun's cascades (common.fx's CascadeData; this file does not include common.fx)
-struct SunCascade
-{
-    float4 Planes[6];
-    row_major float4x4 VP;      // absolute world -> clip
-    row_major float4x4 PrevVP;
-    float4 SplitDistances;
-};
 
 #define SCORE_BINS          64u
 #define MAX_CANDIDATES      1024u   // LocalShadows.MaxCandidates
@@ -89,7 +75,7 @@ struct LightShadowState
     float Fade;     // fade 0..1
     uint Tier;      // 0 = none, else tier + 1
     uint Seen;      // last frame it was in view
-    float SunFactor;// 0..1: how much the light outshines the sunlight reaching it (CSScore)
+    float SunFactor;// 0..1: how much the light outshines the daylight round it (CSScore)
 };
 
 // Must match C# LocalShadows.Pick (16 bytes).
@@ -212,67 +198,22 @@ uint PreferredTier(float radiusPixels, uint stateTier)
     return radiusPixels > to512 ? 0u : radiusPixels > to256 ? 1u : 2u;
 }
 
-// Share of the sun the area around the light gets (0..1): the light's centre and four points 0.75 m around it in
-// the sun's cascades. Five points, so a lamp's own cage over the flame does not count as shade. 1 without cascades.
-float SunVisibility(float3 worldPos)
+// How much the light outshines the daylight around it: 0 when the daylight drowns it, 1 when the light rules its
+// surroundings. In lux: the light's a third of its range out (candela / d², its window leaves 0.975 there) against the
+// daylight on the surfaces round it (LampState.SurfaceLux: sun and sky past the terrain and the sky captures, with the
+// bounce stand-in; point_light_lamps.hlsl, last frame). The terrain alone weighed a room light at noon against the open
+// sky's 15000 lux (no shadow until the street outside was dark); the sun's cascades are left out with it, as they cover
+// only the camera's view and the shadows start where only the sky is left. 0 for a light not judged yet (one frame).
+float SunFactor(PointLightData light)
 {
-    if (SunShadowMapIdx == 0 || SunCascadeCountIdx == 0)
-        return 1.0;
-
-    StructuredBuffer<SunCascade> cascades = ResourceDescriptorHeap[SunCascadesIdx];
-    Texture2DArray<float> shadowMap = ResourceDescriptorHeap[SunShadowMapIdx];
-    float w, h, slices;
-    shadowMap.GetDimensions(w, h, slices);
-
-    static const float3 offsets[5] =
-    {
-        float3(0, 0, 0), float3(0.75, 0, 0), float3(-0.75, 0, 0), float3(0, 0, 0.75), float3(0, 0, -0.75)
-    };
-    float lit = 0.0;
-    [unroll]
-    for (uint t = 0; t < 5; t++)
-    {
-        float3 p = worldPos + offsets[t];
-        float sample = 1.0; // past the last cascade: sunlit
-        for (uint c = 0; c < SunCascadeCountIdx; c++)
-        {
-            float4 lsp = mul(float4(p, 1.0), cascades[c].VP);
-            float3 ndc = lsp.xyz / lsp.w;
-            if (any(abs(ndc.xy) > 1.0) || ndc.z < 0.0 || ndc.z > 1.0)
-                continue;
-            float2 uv = ndc.xy * float2(0.5, -0.5) + 0.5;
-            float stored = shadowMap.Load(int4(int2(uv * float2(w, h)), c, 0));
-            // 25 cm toward the sun, in this cascade's depth units: a cascade reaches far back toward the sun (to
-            // catch distant casters), so a fixed depth bias would be metres and let a roof over the lamp through
-            float4x4 vp = cascades[c].VP;
-            float bias = 0.25 * length(float3(vp._13, vp._23, vp._33));
-            sample = ndc.z - bias <= stored ? 1.0 : 0.0;
-            break;
-        }
-        lit += sample;
-    }
-    return lit / 5.0;
-}
-
-// How much the light outshines the daylight around it: 0 when the sun and sky drown it, 1 when the light rules its
-// surroundings. All in lux: the light's a third of its range out (candela / d², its window leaves 0.975 there), the
-// sun's on a surface facing it where the cascades see it, the sky's on level ground. Both only as far as they reach
-// the light past the terrain (sky_visibility.hlsli): in a cave at noon the open sky's 15000 lux drowned every lamp,
-// and none got a shadow.
-float SunFactor(PointLightData light, PointLightFrame frame)
-{
-    TerrainCover terrain;
-    terrain.Heightmap = frame.TerrainHeightmap;
-    terrain.MaxHeight = frame.TerrainMaxHeight;
-    terrain.Origin = frame.TerrainOrigin;
-    terrain.Size = frame.TerrainSize;
-    float3 worldPos = light.Position + frame.CameraPosition;
-    float tolerance = TerrainTolerance(length(light.Position));
+    if (LampsUAVIdx == 0)
+        return 0.0;
+    RWStructuredBuffer<LampState> lamps = ResourceDescriptorHeap[LampsUAVIdx];
+    LampState judged = lamps[light.Slot];
+    if (judged.Seen == 0)
+        return 0.0;
     float own = light.Score * 0.975 * 9.0 / max(light.Range * light.Range, 1e-4);   // the cull's luminance × base candela
-    float sun = frame.SunLight > 0.0
-        ? frame.SunLight * SunVisibility(worldPos) * TerrainOpenAt(terrain, TerrainLinearClamp, worldPos, float3(0, 1, 0), tolerance) : 0.0;
-    float sky = frame.Ambient * SkyVisibilityAt(terrain, TerrainLinearClamp, worldPos, float3(0, 1, 0), tolerance);
-    float dominance = own / max(own + sun + sky, 1e-6);
+    float dominance = own / max(own + judged.SurfaceLux, 1e-6);
     return smoothstep(0.25, 0.5, dominance);
 }
 
@@ -305,7 +246,7 @@ void CSScore(uint3 dtid : SV_DispatchThreadID)
         // Below the size limit the light keeps its last sun factor, for its shadow to fade out with
         if (RadiusPixels(light, frame) >= MIN_RADIUS_PIXELS && light.Range > 2.0 * NEAR_PLANE)
         {
-            state.SunFactor = SunFactor(light, frame);
+            state.SunFactor = SunFactor(light);
             float near = max(length(light.Position), 0.25 * light.Range);
             score = light.Score * light.Range * light.Range / (near * near) * state.SunFactor;
             if (state.Fade > 0.0)

@@ -83,11 +83,13 @@ namespace Freefall.Graphics
         [StructLayout(LayoutKind.Sequential)]
         private struct LampState
         {
-            public float Lamp;      // 0 = out, 1 = lit
-            public uint Lit;
-            public uint Seen;       // tick it was judged (UpdateLamps' TickCount + 1), 0 = never
-            public float Lux;       // daylight where it hangs, on level ground
+            public float Lamp;          // a lamp: 0 = out, 1 = lit; < 0 = judged as a plain light
+            public float SurfaceLux;    // daylight on the surfaces round the light, with the bounce (shadow selection)
+            public uint Seen;           // tick it was judged (UpdateLamps' TickCount + 1) | LampLit, 0 = never
+            public float Lux;           // daylight where it hangs, on level ground, no bounce (a lamp switches on it)
         }
+
+        private const uint LampLit = 0x80000000;    // LampState.Seen: the lamp's hysteresis side (point_lights.hlsli LAMP_LIT)
 
         public static PointLightBuffer? Instance { get; private set; }
 
@@ -209,9 +211,10 @@ namespace Freefall.Graphics
         }
 
         /// <summary>
-        /// The lamps' state per slot for the light cull (RWStructuredBuffer of point_lights.hlsli LampState): how lit each
-        /// light marked OnlyWhenDark is, as <see cref="UpdateLamps"/> judged it last frame. Call with the global root
-        /// signature's descriptor heap set (a new buffer is cleared).
+        /// The daylight at each light per slot (RWStructuredBuffer of point_lights.hlsli LampState), as
+        /// <see cref="UpdateLamps"/> judged it last frame: how lit each light marked OnlyWhenDark is (the light cull) and
+        /// what each light's glow competes with (the point light shadow selection). Call with the global root signature's
+        /// descriptor heap set (a new buffer is cleared).
         /// </summary>
         public uint LampStatesUav(ID3D12GraphicsCommandList list)
         {
@@ -220,10 +223,10 @@ namespace Freefall.Graphics
         }
 
         /// <summary>
-        /// Judges every lamp (OnlyWhenDark) by the daylight where it hangs: the terrain and the sky captures round the
-        /// camera (point_light_lamps.hlsl), with a hysteresis and a fade per lamp. Once per frame, by the first renderer to
-        /// get here, after the sky captures are drawn; the light cull reads it the frame after. Sets the compute root
-        /// signature and descriptor heap.
+        /// Judges the daylight where every enabled light hangs, past the terrain and the sky captures round the camera
+        /// (point_light_lamps.hlsl), and lights the lamps (OnlyWhenDark) by it, with a hysteresis and a fade per lamp. Once
+        /// per frame, by the first renderer to get here, after the sky captures are drawn; the light cull and the shadow
+        /// selection read it the frame after. Sets the compute root signature and descriptor heap.
         /// </summary>
         /// <param name="frameParamsSrv">This renderer's PointLightFrame (sun, sky, terrain, lamp fade step).</param>
         public void UpdateLamps(ID3D12GraphicsCommandList list, uint frameParamsSrv)
@@ -253,6 +256,7 @@ namespace Freefall.Graphics
             _lampsCS.SetPushConstant("Tick", (uint)Engine.TickCount + 1);
             _lampsCS.SetPushConstant("SkyCaptureViews", meshes ? captures.Views : 0u);
             _lampsCS.SetPushConstant("SkyCaptureDepth", meshes ? captures.Depth : 0u);
+            _lampsCS.SetPushConstant("SkyCaptureBounce", BitConverter.SingleToUInt32Bits(Math.Clamp(Engine.Settings.SkyCaptureBounce, 0f, 1f)));
             _lampsCS.Dispatch(_kLamps, list, (uint)((SlotCount + LampsPerGroup - 1) / LampsPerGroup));
             list.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(_lampStates.Native)));
 
@@ -320,14 +324,15 @@ namespace Freefall.Graphics
             for (int s = 0; s < slots; s++)
             {
                 var light = LightAt(s);
-                if (light == null || !light.Enabled || !light.OnlyWhenDark || states![s].Seen == 0)
+                if (light == null || !light.Enabled || !light.OnlyWhenDark || states![s].Seen == 0 || states[s].Lamp < 0f)
                     continue;
                 var state = states[s];
+                bool isLit = (state.Seen & LampLit) != 0;
                 lamps++;
-                if (state.Lit != 0) lit++;
+                if (isLit) lit++;
                 if (state.Lamp > 0f && state.Lamp < 1f) fading++;
                 if (open > 0f) shares.Add(state.Lux / open);
-                if (state.Lit != 0 && Daylight.Lamps < 1f && litByDay.Count < 32)
+                if (isLit && Daylight.Lamps < 1f && litByDay.Count < 32)
                     litByDay.Add(new { entity = light.Entity?.Id ?? 0, name = light.Entity?.Name, lux = MathF.Round(state.Lux, 3) });
             }
             shares.Sort();

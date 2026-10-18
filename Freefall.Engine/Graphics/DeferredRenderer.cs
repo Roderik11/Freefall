@@ -660,12 +660,11 @@ namespace Freefall.Graphics
                  {
                      var frameParams = _lightFrameParams![Engine.FrameIndex % FrameCount];
 
-                     // The selection reads the linear depth (light centres hidden behind walls) and the sun's cascades
-                     // (lights the sun drowns get no shadow)
+                     // The selection reads the linear depth (light centres hidden behind walls) and the daylight at each
+                     // light judged last frame (2d: lights the daylight drowns get no shadow)
                      Transition(list, DepthGBuffer.Native, ResourceStates.RenderTarget, ResourceStates.NonPixelShaderResource);
                      LocalShadows.Select(list, camera, frameParams.SrvIndex, _visibleLights!.UavIndex,
-                         _visibleLightCount!, DepthGBuffer.BindlessIndex,
-                         ShadowMapIndex, DirectionalLight.CurrentCascadeSrvIndex, DirectionalLight.CascadeCount);
+                         _visibleLightCount!, DepthGBuffer.BindlessIndex, PointLightBuffer.Instance!.LampStatesUav(list));
                      Transition(list, DepthGBuffer.Native, ResourceStates.NonPixelShaderResource, ResourceStates.RenderTarget);
 
                      if (LocalShadows.Render(list, frameParams.Native.GPUVirtualAddress))
@@ -691,9 +690,9 @@ namespace Freefall.Graphics
                  list.RSSetScissorRect(scissor);
              }
 
-             // 2d. Lamps: whether each light marked OnlyWhenDark is lit, by the daylight where it hangs past the terrain
-             //     and the meshes (point_light_lamps.hlsl); after the captures it reads, for next frame's cull. Once per
-             //     frame for all renderers.
+             // 2d. Lamps: the daylight where each light hangs past the terrain and the meshes, and whether each light
+             //     marked OnlyWhenDark is lit by it (point_light_lamps.hlsl); after the captures it reads, for next frame's
+             //     cull and shadow selection. Once per frame for all renderers.
              if (_pointLightsCulled)
                  PointLightBuffer.Instance?.UpdateLamps(list, _lightFrameParams![Engine.FrameIndex % FrameCount].SrvIndex);
 

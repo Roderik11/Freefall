@@ -64,15 +64,17 @@ struct PointLightFrame
     float LampFadeStep;                     // lamp fade per frame (Δt / Daylight.LampFadeSeconds)
 };
 
-// Per registry slot, whether a light marked OnlyWhenDark is lit (point_light_lamps.hlsl, once per frame for every slot;
-// the cull reads it the frame after). Must match C# PointLightBuffer.LampState (16 bytes).
+// Per registry slot: the daylight where each enabled light hangs, and whether a light marked OnlyWhenDark is lit
+// (point_light_lamps.hlsl, once per frame for every slot; the cull and the shadow selection read it the frame after).
+// Must match C# PointLightBuffer.LampState (16 bytes).
 struct LampState
 {
-    float Lamp;     // 0 = out, 1 = lit; in between while it fades
-    uint Lit;       // the hysteresis' side: on below LAMPS_ON_BELOW_LUX, out above LAMPS_OFF_ABOVE_LUX
-    uint Seen;      // Engine.TickCount it was last judged; 0 = never (the cull takes PointLightFrame.Lamps then)
-    float Lux;      // the daylight where it hangs, on level ground
+    float Lamp;         // a lamp: 0 = out, 1 = lit, in between while it fades; < 0: judged as a plain light, not as a lamp
+    float SurfaceLux;   // daylight on the surfaces round the light (with SkyCaptureBounce): what its light competes with
+    uint Seen;          // Engine.TickCount it was last judged, | LAMP_LIT; 0 = never (the cull takes PointLightFrame.Lamps)
+    float Lux;          // the daylight where it hangs (no bounce): a lamp switches on it
 };
+#define LAMP_LIT 0x80000000u    // LampState.Seen: the lamp's hysteresis side (on below LAMPS_ON_BELOW_LUX, out above LAMPS_OFF_ABOVE_LUX)
 
 // ── Flicker: value noise over an integer hash, no trig ───────────────────────
 // (was PointLight.ApplyFlicker on the CPU: same hash, same constants)

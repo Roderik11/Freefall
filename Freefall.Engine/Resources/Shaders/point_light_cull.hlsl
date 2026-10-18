@@ -34,14 +34,14 @@ cbuffer PushConstants : register(b3)
 #define IMPORTANCE_BINS 64u
 
 // How lit a lamp (OnlyWhenDark) is: by the daylight where it hangs, judged last frame; the open ground's lamps until
-// it has been judged (the first frame of a scene, a light just added)
+// it has been judged as a lamp (the first frame of a scene, a light just added or just marked)
 float LampAt(uint slot, PointLightFrame frame)
 {
     if (LampsUAVIdx == 0)
         return frame.Lamps;
     RWStructuredBuffer<LampState> lamps = ResourceDescriptorHeap[LampsUAVIdx];
     LampState lamp = lamps[slot];
-    return lamp.Seen != 0 ? lamp.Lamp : frame.Lamps;
+    return lamp.Seen != 0 && lamp.Lamp >= 0.0 ? lamp.Lamp : frame.Lamps;
 }
 
 // A light in view and its importance: steady brightness × its on-screen radius² (the size of its pool of light).
