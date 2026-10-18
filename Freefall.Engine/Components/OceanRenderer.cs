@@ -408,17 +408,19 @@ namespace Freefall.Components
                 pData[i] = 1.0f / Bands[i].LengthScale;
         }
 
-        // A swell from afar does not break in deep water: with wind bands for the local sea, the authored bands (swells)
-        // make no whitecaps. Its long crests still squeezed past the foam threshold now and then.
+        // Bands that make no whitecaps. A swell from afar does not break in deep water: with wind bands for the local sea
+        // the authored bands (swells) make none; their long crests still squeezed past the foam threshold now and then.
+        // Nor does a band whose tile is short: its foam repeats every tile, and the 17 m band's spots laid a grid of
+        // dashes over a storm sea (its squeeze comes from waves under 4 m, which break without whitecaps anyway).
+        private const uint MinWhitecapTile = 32;
         private uint NoWhitecapBands()
         {
             uint mask = 0;
             bool windSea = false;
             for (int i = 0; i < Bands.Count; i++)
                 windSea |= Bands[i].FollowWind;
-            if (!windSea) return 0;
             for (int i = 0; i < Bands.Count && i < 32; i++)
-                if (!Bands[i].FollowWind) mask |= 1u << i;
+                if ((windSea && !Bands[i].FollowWind) || Bands[i].LengthScale < MinWhitecapTile) mask |= 1u << i;
             return mask;
         }
 
