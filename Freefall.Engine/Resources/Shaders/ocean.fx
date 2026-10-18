@@ -548,7 +548,8 @@ PSOutput PS(DSOutput input)
     // 2026-10-17 it got this radiance, and the water's sun was π times weaker than the deferred one.
     float3 sunRadiance = ocean.SunColor * ocean.SunIntensity * SunLightScale;
     sunRadiance *= GetCloudShadow(OceanSampler, worldPos - camPos, L);
-    sunRadiance *= WaterSunShadow(ShadowMapIdx, worldPos - camPos, input.Position.xy);
+    // The cascades, and the terrain's shadow past them (a headland the sun stands behind), as the deferred light has them
+    sunRadiance *= min(WaterSunShadow(ShadowMapIdx, worldPos - camPos, input.Position.xy), TerrainLightShadow(worldPos, L));
     sunRadiance *= TerrainOpen(worldPos, float3(0, 1, 0));   // a sea cave under a hill: no sun, whatever the shadow map holds
 
     float H = max(0.0, waveHeight);

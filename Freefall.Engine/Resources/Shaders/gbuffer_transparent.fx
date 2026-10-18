@@ -304,6 +304,7 @@ PSOutput PS(VSOutput input)
                 cascadeIndex, N, LightDirection, zScale, input.Position.xy);
         }
     }
+    shadowFactor = min(shadowFactor, TerrainLightShadow(input.AbsWorldPos, L));   // the terrain past the cascades
     shadowFactor *= TerrainOpen(input.AbsWorldPos, N);   // under the terrain (a cave): no sun, as in light_directional_cs
 
     // ── Combine lighting ──

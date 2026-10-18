@@ -257,6 +257,11 @@ void CSDirectionalLight(uint3 dispatchThreadId : SV_DispatchThreadID)
         shadowFactor = min(shadowFactor, sssShadow);
     }
 
+    // The terrain's shadow past what the cascades hold (a mountain the sun stands behind, kilometres away). The same
+    // shadow as theirs where both have it, so the smaller, not the product, or the cascades' soft edges darken twice
+    float terrainShadow = TerrainLightShadow(worldPos.xyz + CamPos, L);
+    shadowFactor = min(shadowFactor, terrainShadow);
+
     // Cloud shadows: also reach past the last cascade (Sampler = linear wrap, s0)
     shadowFactor *= GetCloudShadow(Sampler, worldPos.xyz, L);
     // Under the terrain (a cave) the sun cannot reach, whatever the shadow map holds: its terrain pass follows the
@@ -382,8 +387,9 @@ void CSDirectionalLight(uint3 dispatchThreadId : SV_DispatchThreadID)
         return;
     }
 
-    // Shadow wrap
-    lighting += diffuse * LightColor * LightIntensity * NdotL * (1.0 - shadowFactor) * 0.12 * ao * skyVisibility;
+    // Shadow wrap: light bounced in from the sunlit ground round a shadow; none in the terrain's shadow, which is
+    // hundreds of metres wide and holds the ground round it too
+    lighting += diffuse * LightColor * LightIntensity * NdotL * (1.0 - shadowFactor) * 0.12 * ao * skyVisibility * terrainShadow;
 
     // Note: GI composition moved to separate pass (CSComposeGI in radiance_cascades.hlsl)
     // so RC trace can read direct-light-only without feedback loop

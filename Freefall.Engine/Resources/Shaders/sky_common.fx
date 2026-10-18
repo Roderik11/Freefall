@@ -102,6 +102,57 @@ float TerrainOpen(float3 worldPos, float3 N)
     return TerrainOpenAt(LoadTerrainCover(), AtmosphereLinearClamp, worldPos, N, TerrainTolerance(distance(worldPos, CamPos)));
 }
 
+// The terrain's shadow on a lit surface, 0..1, for the directional light toward toLight: the shadow height map of the
+// body it points at (the sun's or the brightest moon's, terrain_light_shadow_cs.hlsl; 1 for any other direction). The
+// cascades hold casters only ~300 m toward the sun and end at MaxShadowDistance: without this a mountain the sun stood
+// behind left the meadow and the woods in front of it sunlit while the air over them lay in its shadow (Lake Mere).
+// Only the terrain from TERRAIN_SHADOW_SKIP metres toward the light on counts, M(p + s0·d) − s0·tan(e): the map's
+// first texels (8 m wide, the highest of four samples each, the first step one texel toward the light) put the top a
+// metre or two over sunlit slopes at a low sun, and the cascades shade those near casters anyway. The surface is
+// tested on the heightmap where the coarser rendered terrain sits under it (a ridge from afar), lifted by 2 m plus the
+// most the four samples gain on its slope, soft over ±3 m. worldPos is absolute.
+#define TERRAIN_SHADOW_SKIP 32.0
+float TerrainLightShadow(float3 worldPos, float3 toLight)
+{
+    if (AtmosphereIdx == 0)
+        return 1.0;
+    AtmosphereParams A = LoadAtmosphere();
+    uint map = 0;
+    if (dot(toLight, A.SunDirection) > 0.999)
+        map = A.TerrainSunShadow;
+    else if (dot(toLight, A.MoonDirection) > 0.999)
+        map = A.TerrainMoonShadow;
+    float across = length(toLight.xz);
+    if (map == 0 || across < 1e-4)          // no map, or the light overhead: no shadow across the ground
+        return 1.0;
+    float2 d = toLight.xz / across;
+    float tanE = toLight.y / across;
+    float2 uv = (worldPos.xz + d * TERRAIN_SHADOW_SKIP - A.TerrainShadowOrigin) / A.TerrainShadowSize;
+    if (any(uv < 0.0) || any(uv > 1.0))
+        return 1.0;
+    Texture2D<float> shadowTop = ResourceDescriptorHeap[map];
+    float top = shadowTop.SampleLevel(AtmosphereLinearClamp, uv, 0) - TERRAIN_SHADOW_SKIP * tanE;
+
+    float y = worldPos.y;
+    float bias = 2.0;
+    if (y + bias >= top + 3.0)              // lit already: the heightmap can only lift it further (most of the screen)
+        return 1.0;
+    TerrainCover t = LoadTerrainCover();
+    if (t.Heightmap != 0)
+    {
+        float h = TerrainHeightAt(t, AtmosphereLinearClamp, worldPos.xz);
+        if (h - y < TerrainTolerance(distance(worldPos, CamPos)))
+            y = max(y, h);
+        // The map's four samples per texel sit a quarter texel either way: on a slope the highest gains that much
+        float2 slope = abs(float2(TerrainHeightAt(t, AtmosphereLinearClamp, worldPos.xz + float2(4, 0)),
+                                  TerrainHeightAt(t, AtmosphereLinearClamp, worldPos.xz + float2(0, 4))) - h) / 4.0;
+        float texelsX, texelsY;
+        shadowTop.GetDimensions(texelsX, texelsY);
+        bias += (slope.x + slope.y) * A.TerrainShadowSize / texelsX * 0.5;
+    }
+    return smoothstep(top - 3.0, top + 3.0, y + bias);
+}
+
 // How much of the sky's light reaches a surface past the meshes around the camera (walls, roofs, tree crowns, the cave
 // kit), 0..1 (sky_capture.hlsli; 1 without captures). worldPos is absolute.
 float MeshSkyVisibility(float3 worldPos, float3 N)
