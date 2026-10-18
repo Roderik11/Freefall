@@ -355,26 +355,48 @@ float GetCloudsAt(SamplerState wrapSampler, float3 viewDir, float altitude, floa
     // Softer smoothstep for fuller cloud bodies
     eroded = smoothstep(0.0, 0.45, eroded);
 
-    // Horizon fade
-    eroded *= smoothstep(0.0, 0.22, viewDir.y);
+    // Toward the horizon the noise fades (it would show its tiling) into what a layer looks like at grazing angles: the
+    // clouds behind one another close up. A broken layer leaves the horizon clear; a deck (coverage from ~0.8) runs on
+    // to it and sinks into the haze there. Fading a deck to nothing showed the shaded air under it as a dark band
+    // between the horizon and the deck's lower edge (stage 5).
+    float horizonDensity = smoothstep(0.75, 0.95, CloudCoverage);
+    eroded = lerp(horizonDensity, eroded, smoothstep(0.0, 0.22, viewDir.y));
 
     return saturate(eroded);
 }
 
+// Henyey-Greenstein × 4π: 1 for every angle when g = 0 (an isotropic scatterer)
+float HenyeyGreenstein4Pi(float cosTheta, float g)
+{
+    float g2 = g * g;
+    return (1.0 - g2) / pow(max(1.0 + g2 - 2.0 * g * cosTheta, 1e-4), 1.5);
+}
+
+// The two-lobe phase of cloud droplets (× 4π): a strong forward lobe (light passing on toward the eye when looking
+// toward the light: the bright rim round the sun) and a weak backward one (ATMOSPHERE_PLAN stage 5)
+#define CLOUD_PHASE_FORWARD   0.6
+#define CLOUD_PHASE_BACKWARD -0.25
+#define CLOUD_PHASE_MIX       0.6     // share of the forward lobe
+float CloudPhase4Pi(float cosTheta)
+{
+    return lerp(HenyeyGreenstein4Pi(cosTheta, CLOUD_PHASE_BACKWARD), HenyeyGreenstein4Pi(cosTheta, CLOUD_PHASE_FORWARD),
+        CLOUD_PHASE_MIX);
+}
+
 // How much of a light (sun or moon) a cloud sends toward the eye, per unit of what a white surface facing that light
-// would: the density's self-shadowing (thin edges bright, thick cores dark), brighter on the side toward the light,
-// a silver lining on thin edges and a powder glow at medium density when looking toward the light. 0.6: a sunlit
-// edge is a little over half as bright as a white wall in the sun (as the old palettes had it).
+// would (E / π). Two parts:
+//   - the light that gets into the cloud past its own density (transmittance: thin edges bright, thick cores dark),
+//     scattered by the two-lobe phase where the cloud is thin (single scattering) and ever more evenly where it is
+//     thick (light scattered many times forgets where it came from). 0.55: a thin-to-medium cloud 90° from the sun as
+//     bright as the hand-tuned shading before stage 5 (its gradient, silver lining and powder terms are gone);
+//   - the light the cloud's body diffuses through to its base, CLOUD_DIFFUSE of what the core holds back: a deck seen
+//     from below is lit grey-white by the sun above it, not left to the blue sky's ambient (an overcast deck was navy).
+#define CLOUD_DIFFUSE 0.15
 float CloudDirectShade(float3 viewDir, float3 lightDir, float density, float transmittance)
 {
-    float lightDot = saturate(dot(viewDir, lightDir));
-    float gradient = lightDot * 0.5 + 0.5;              // 0.5 (shade side) to 1.0 (facing the light)
-    float shade = lerp(transmittance * 0.7, transmittance, gradient);
-
-    float edgeMask = smoothstep(0.0, 0.2, density) * smoothstep(0.5, 0.15, density);
-    shade += edgeMask * lightDot * lightDot * 0.4;                                      // silver lining
-    shade += (1.0 - transmittance) * transmittance * 2.0 * lightDot * lightDot * lightDot * 0.3;   // powder
-    return shade * 0.6;
+    float single = exp(-density * 6.0);                 // share of the light scattered once: the thin edges
+    float phase = lerp(1.0, CloudPhase4Pi(dot(viewDir, lightDir)), single);
+    return transmittance * phase * 0.55 + (1.0 - transmittance) * CLOUD_DIFFUSE;
 }
 
 // The sky's light in direction viewDir (skyColor, × Exposure) with the cloud layer over it, lit by the sun and the
