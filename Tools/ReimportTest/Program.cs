@@ -139,6 +139,39 @@ namespace ReimportTest
             Check(reread.LODPixelError == 4 && reread.LODRatios.SequenceEqual(new[] { 0.6f, 0.3f }),
                 $"settings kept through the reimport (LODPixelError {reread.LODPixelError}, LODRatios {string.Join("/", reread.LODRatios)})");
 
+            // ── A model's own material survives reimports ──
+            // rock.obj's material RockSkin is emitted as a sub-asset and its prefab uses it. A reimport used to
+            // find that sub-asset by name, take it for an existing material, skip it, and leave the prefab on
+            // DefaultMaterial (Cliff_Rocks_Sets_3A1.fbx, 2026-10-18).
+            WriteTexturedCube(Path.Combine(assets, "Mat"));
+            AssetDatabase.Refresh();
+            AssetDatabase.ImportAll();
+            const string rock = @"Mat\rock.obj";
+            var (material, prefabUses) = OwnMaterial(rock, "RockSkin");
+            Check(material != null, "rock.obj emits its material RockSkin");
+            Check(prefabUses, "rock.obj's prefab uses RockSkin");
+            for (int i = 1; i <= 2; i++)
+            {
+                Drive(AssetDatabase.ReimportFiles(new[] { rock }, rock));
+                var (again, stillUses) = OwnMaterial(rock, "RockSkin");
+                Check(again != null && again == material, $"reimport {i}: RockSkin kept with its GUID (got {again ?? "none"})");
+                Check(stillUses, $"reimport {i}: the prefab still uses RockSkin");
+            }
+
+            // Another file naming the same material still uses that one and makes no copy (unchanged behaviour)
+            WriteTexturedCube(Path.Combine(assets, "Mat2"));
+            AssetDatabase.Refresh();
+            AssetDatabase.ImportAll();
+            for (int i = 0; i <= 1; i++)
+            {
+                if (i == 1) Drive(AssetDatabase.ReimportFiles(new[] { @"Mat2\rock.obj" }, "Mat2"));
+                var (copy, _) = OwnMaterial(@"Mat2\rock.obj", "RockSkin");
+                var meta2 = AssetDatabase.GetMeta(AssetDatabase.PathToGuid(@"Mat2\rock.obj"));
+                var prefab2 = meta2.SubAssets.First(s => s.Type == "PrefabData");
+                bool usesFirst = File.ReadAllText(AssetDatabase.ResolveCachePathByGuid(prefab2.Guid)).Contains(material);
+                Check(copy == null && usesFirst, $"{(i == 0 ? "import" : "reimport")} of Mat2/rock.obj: no RockSkin of its own, its prefab uses Mat/rock.obj's");
+            }
+
             // ── A project change ends a running reimport ──
             var stopped = AssetDatabase.ReimportFolder("Pack");
             AssetDatabase.Initialize(project);
@@ -158,6 +191,17 @@ namespace ReimportTest
             return ticks;
         }
 
+        /// <summary>The GUID of the model's material sub-asset of that name (null if none), and whether its prefab uses it.</summary>
+        static (string material, bool prefabUses) OwnMaterial(string modelPath, string materialName)
+        {
+            var meta = AssetDatabase.GetMeta(AssetDatabase.PathToGuid(modelPath));
+            var material = meta.SubAssets.FirstOrDefault(s => s.Name == materialName && s.Type == "AssetDefinitionData")?.Guid;
+            var prefab = meta.SubAssets.FirstOrDefault(s => s.Type == "PrefabData");
+            var cache = prefab != null ? AssetDatabase.ResolveCachePathByGuid(prefab.Guid) : null;
+            bool uses = material != null && cache != null && File.ReadAllText(cache).Contains(material);
+            return (material, uses);
+        }
+
         static Dictionary<string, DateTime> Stamps(params string[] paths) =>
             paths.ToDictionary(p => p, p => AssetDatabase.GetMeta(AssetDatabase.PathToGuid(p)).LastImported);
 
@@ -175,6 +219,25 @@ namespace ReimportTest
         {
             Out.WriteLine($"{(ok ? "PASS" : "FAIL")}  {what}");
             if (!ok) _failures++;
+        }
+
+        /// <summary>
+        /// rock.obj (a cube with the material RockSkin from rock.mtl) and the albedo the material names,
+        /// rock_albedo.png. The model importer emits a material only if a texture of it resolves to a tracked file.
+        /// </summary>
+        static void WriteTexturedCube(string folder)
+        {
+            Directory.CreateDirectory(folder);
+            var cube = Path.Combine(folder, "rock.obj");
+            WriteCube(cube);
+            var lines = File.ReadAllLines(cube).ToList();
+            lines.Insert(0, "mtllib rock.mtl");
+            lines.Insert(lines.FindIndex(l => l.StartsWith("o ")) + 1, "usemtl RockSkin");
+            File.WriteAllLines(cube, lines);
+            File.WriteAllText(Path.Combine(folder, "rock.mtl"), "newmtl RockSkin\nKd 1 1 1\nmap_Kd rock_albedo.png\n");
+            // A 1×1 PNG: only its being tracked matters
+            File.WriteAllBytes(Path.Combine(folder, "rock_albedo.png"), Convert.FromBase64String(
+                "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="));
         }
 
         /// <summary>A unit cube as OBJ: 8 vertices, 12 triangles.</summary>

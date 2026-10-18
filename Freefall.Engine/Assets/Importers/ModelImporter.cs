@@ -1059,8 +1059,12 @@ namespace Freefall.Assets.Importers
                 if (string.IsNullOrWhiteSpace(matName) || matName == "DefaultMaterial")
                     continue;
 
-                // Skip if an asset with this name already exists in AssetDatabase
-                var existingGuid = AssetDatabase.ResolveGuidByName(matName);
+                // Skip if an asset with this name already exists in AssetDatabase, unless it is this file's own
+                // material from its last import: emitted again, it keeps its GUID (ImportAsset reuses sub-asset GUIDs
+                // by name and type). Skipping that one as well dropped it from the meta on every reimport and left
+                // the file's prefabs on DefaultMaterial (Cliff_Rocks_Sets_3A1.fbx, 2026-10-18).
+                bool ownMaterial = AssetDatabase.HadSubAsset(filepath, matName, nameof(AssetDefinitionData));
+                var existingGuid = ownMaterial ? null : AssetDatabase.ResolveGuidByName(matName);
                 if (existingGuid != null)
                 {
                     Debug.Log("ModelImporter", $"Material '{matName}': existing asset found, skipping");

@@ -892,6 +892,24 @@ namespace Freefall.Assets
             return importer;
         }
 
+        /// <summary>
+        /// True if the tracked source file at this absolute path produced a sub-asset of that name and data type in
+        /// its last import. An importer can ask while it runs: ImportAsset replaces the meta's sub-assets only after
+        /// Import returns. False offline (no project) and for files the database does not track.
+        /// </summary>
+        public static bool HadSubAsset(string sourceFullPath, string name, string dataType)
+        {
+            if (Project == null || string.IsNullOrEmpty(sourceFullPath)) return false;
+
+            var relativePath = Path.GetRelativePath(Project.AssetsDirectory, Path.GetFullPath(sourceFullPath));
+            if (!_pathToGuid.TryGetValue(NormalizePath(relativePath), out var guid) || !_guidToMeta.TryGetValue(guid, out var meta))
+                return false;
+
+            // Compared as ImportAsset matches the sub-assets whose GUIDs it reuses
+            lock (meta)
+                return meta.SubAssets.Any(s => s.Name == name && s.Type == dataType);
+        }
+
         /// <summary>Source GUID of an importer instance GetImporter returned; null for any other instance.</summary>
         public static string GetImporterSourceGuid(IImporter importer) =>
             importer != null && _importerSources.TryGetValue(importer, out var guid) ? guid : null;
