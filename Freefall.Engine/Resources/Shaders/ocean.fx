@@ -277,7 +277,12 @@ float3 SampleDisplacement(OceanData ocean, float2 worldXZ, float depthAtten, flo
     {
         float2 uv = RotateUV(worldXZ, BandAngles[i]) * tileScales[i];
         float mipLevel = log2(max(1.0, camDist * tileScales[i] * 0.15));
-        totalDisp += dispTex.SampleLevel(OceanSampler, float3(uv, i), mipLevel).xyz;
+        float3 d = dispTex.SampleLevel(OceanSampler, float3(uv, i), mipLevel).xyz;
+        // The sideways displacement is in the band's turned frame: turn it back to the world, as the PS does the slopes.
+        // Added as it came (until 2026-10-18), it pushed the surface off to one side of the band's waves instead of
+        // toward their crests: choppiness sheared the pattern sideways and never sharpened a crest.
+        d.xz = RotateUV(d.xz, -BandAngles[i]);
+        totalDisp += d;
     }
 
     return totalDisp * depthAtten;
@@ -661,10 +666,12 @@ PSOutput PS(DSOutput input)
     // cellular foam texture, so edges break up into bubbles/streaks instead of showing FFT texels.
     float t = ocean.WaveTime;
 
-    // Open water: Jacobian foam from the FFT, faded at distance
-    float coverage = saturate(totalFoam) * saturate(1.0 - dist / 3000.0);
+    // Open water: whitecaps, the Jacobian foam from the FFT, faded at distance. The shore's foam builds `coverage`.
+    float whitecap = saturate(totalFoam) * saturate(1.0 - dist / 3000.0);
+    float coverage = 0.0;
 
     float foamTex = 0.5;
+    float capTex = 0.5;
     float streakFoam = 0.0;
     if (ocean.NoiseSRV != 0)
     {
@@ -825,6 +832,15 @@ PSOutput PS(DSOutput input)
 
         // Backwash filaments: translucent, lightly broken up by the fine cells
         streakFoam *= 0.85 * lerp(0.75, 1.0, cells2) * ocean.ShoreFoam;
+
+        // Whitecaps: the same cells in the wind's frame, drawn out downwind the harder it blows (a gale combs the foam
+        // into streaks along the wind; at 20 m/s 3.4 times as long as across)
+        float2 along = dot(WindDirection.xz, WindDirection.xz) > 1e-6 ? normalize(WindDirection.xz) : float2(1, 0);
+        float2 windPos = float2(dot(worldPos.xz, along) / (1.0 + WindStrength * 0.12),
+                                dot(worldPos.xz, float2(-along.y, along.x)));
+        float capCells1 = noiseTex.SampleLevel(OceanSampler, windPos * 0.23 + t * float2(0.010, 0.006), 0).g;
+        float capCells2 = noiseTex.SampleLevel(OceanSampler, windPos * 0.83 - t * float2(0.013, 0.004), 0).g;
+        capTex = saturate((capCells1 * 0.6 + capCells2 * 0.4 - 0.15) / 0.6);
     }
 
     // Thin foam is translucent, thick foam keeps the cell structure as shading.
@@ -834,6 +850,17 @@ PSOutput PS(DSOutput input)
     float foam = saturate((coverage * 1.25 - (1.0 - foamTex)) * 3.0);
     foam = lerp(foam, saturate((coverage - 0.35) * 1.5) * 0.7, foamFar);
     foam = max(foam, streakFoam * (1.0 - foamFar));
+
+    // A whitecap: a solid core while fresh, thinning into lace and streaks as it decays (the cells eat it from
+    // their edges). Under it and round it the air the breaking crest carried down scatters the light back up: pale
+    // turquoise water that outlasts the foam. Without it the foam lay on dark water like a paper cut-out.
+    float capFoam = saturate((whitecap * 1.3 - (1.0 - capTex)) * 2.5);
+    capFoam = lerp(capFoam, saturate((whitecap - 0.35) * 1.5) * 0.7, foamFar);
+    float aerated = smoothstep(0.03, 0.8, whitecap) * lerp(0.35, 1.0, capTex);
+    color += (1.0 - F) * aerated * WaterFoamLit(ocean.ShallowColor * 0.05, NdotL, sunRadiance, skyAmbient);
+    if (capFoam > foam)
+        foamTex = capTex;
+    foam = max(foam, capFoam);
 
     // Always feather the last few centimeters of water: whatever the foam pattern, it must not end
     // in the hard pixel edge where the water surface cuts into the beach.

@@ -104,7 +104,8 @@ namespace Freefall.Graphics
             public float FoamAdd;
             public uint NumBands;
             public uint LengthScalesSRV;  // bindless SRV to uint[] buffer
-            public uint _pad0, _pad1;
+            public uint NoWhitecapBands;  // bit per band whose crests make no foam (a swell); was padding: 0 = all foam
+            public uint _pad1;
         }
 
         /// <summary>
@@ -123,6 +124,7 @@ namespace Freefall.Graphics
             public float FoamDecayRate;
             public float FoamThreshold;
             public float FoamAdd;
+            public uint NoWhitecapBands; // bit per band whose crests make no foam
             public uint[] LengthScales; // one per band
             public SpectrumParameters[] Spectrums; // 2 per band
         }
@@ -134,7 +136,7 @@ namespace Freefall.Graphics
         /// Constants-buffer values (depth, foam, choppiness) take effect immediately.
         /// </summary>
         public void UpdateParams(float depth, float foamBias, float foamDecayRate,
-            float foamThreshold, float foamAdd, Vector2 lambda)
+            float foamThreshold, float foamAdd, Vector2 lambda, uint noWhitecapBands)
         {
             _params.Depth = depth;
             _params.FoamBias = foamBias;
@@ -142,6 +144,7 @@ namespace Freefall.Graphics
             _params.FoamThreshold = foamThreshold;
             _params.FoamAdd = foamAdd;
             _params.Lambda = lambda;
+            _params.NoWhitecapBands = noWhitecapBands;
         }
 
         /// <summary>
@@ -359,6 +362,7 @@ namespace Freefall.Graphics
                 FoamAdd = _params.FoamAdd,
                 NumBands = (uint)_numBands,
                 LengthScalesSRV = _lengthScalesBuffer!.SrvIndex,
+                NoWhitecapBands = _params.NoWhitecapBands,
             };
             *_constantsBuffer!.WritePtr<OceanConstants>() = constants;
         }

@@ -122,9 +122,8 @@ namespace Freefall.Components
         public float Depth = 40.0f;
         
         [ValueRange(0f, 1f)]
-        [Description(@"Horizontal displacement scale (Lambda).
-         Higher values push wave crests apart,
-         creating sharper peaks but risking self-intersection artifacts")]
+        [Description(@"Horizontal displacement scale (Lambda): squeezes the crests together into sharp peaks and
+         stretches the troughs (1 = what real waves do). The squeezed crests are where whitecaps form")]
         public float Choppiness = 1.0f;
         
         [ValueRange(0f, 5f)]
@@ -137,28 +136,30 @@ namespace Freefall.Components
          Higher values delay visible looping")]
         public float RepeatTime = 200.0f;
 
+        // Whitecaps: foam where a crest is squeezed, the Jacobian J of the choppy displacement under FoamBias −
+        // FoamThreshold. The defaults (2026-10-18) give Monahan's whitecap share within ~1.5× from 3 to 15 m/s of
+        // wind (none at 3, ~1% at 10, ~3.5% at 15) and somewhat less above (7.5% at 20 m/s against 10.5%).
         [Category("Foam")]
         [ValueRange(0f, 2f)]
-        [Description(@"Jacobian threshold for foam generation.
-         Lower values produce foam on gentler waves,
-         higher values restrict foam to steep crests only")]
-        public float FoamBias = 0.47f;
-        
+        [Description(@"Whitecaps form where a crest is squeezed below this Jacobian (minus the threshold).
+         Higher = more crests foam, at lighter winds")]
+        public float FoamBias = 0.88f;
+
         [ValueRange(0f, 0.1f)]
         [Description(@"Exponential decay rate per frame.
          Controls how quickly foam fades after forming.
          Lower values make foam linger longer")]
-        public float FoamDecayRate = 0.0175f;
-        
+        public float FoamDecayRate = 0.005f;
+
         [ValueRange(0f, 1f)]
         [Description(@"Minimum Jacobian deviation required before any foam is added.
          Acts as a noise gate to suppress faint foam")]
         public float FoamThreshold = 0.1f;
-        
+
         [ValueRange(0f, 1f)]
         [Description(@"Amount of foam injected per frame when the Jacobian exceeds the threshold.
          Higher values create thicker, more opaque foam")]
-        public float FoamAdd = 0.1f;
+        public float FoamAdd = 0.35f;
 
         [Category("Shore")]
         [ValueRange(1f, 100f)]
@@ -407,6 +408,20 @@ namespace Freefall.Components
                 pData[i] = 1.0f / Bands[i].LengthScale;
         }
 
+        // A swell from afar does not break in deep water: with wind bands for the local sea, the authored bands (swells)
+        // make no whitecaps. Its long crests still squeezed past the foam threshold now and then.
+        private uint NoWhitecapBands()
+        {
+            uint mask = 0;
+            bool windSea = false;
+            for (int i = 0; i < Bands.Count; i++)
+                windSea |= Bands[i].FollowWind;
+            if (!windSea) return 0;
+            for (int i = 0; i < Bands.Count && i < 32; i++)
+                if (!Bands[i].FollowWind) mask |= 1u << i;
+            return mask;
+        }
+
         private uint[] BuildLengthScales()
         {
             var scales = new uint[Bands.Count];
@@ -417,9 +432,25 @@ namespace Freefall.Components
 
         private const float Gravity = 9.81f;
         private static float JonswapAlpha(float fetch, float windSpeed) =>
-            0.076f * MathF.Pow(Gravity * fetch / windSpeed / windSpeed, -0.22f);
+            0.076f * MathF.Pow(Gravity * DevelopedFetch(fetch, windSpeed) / windSpeed / windSpeed, -0.22f);
         private static float JonswapPeakOmega(float fetch, float windSpeed) =>
-            22f * MathF.Pow(windSpeed * fetch / Gravity / Gravity, -0.33f);
+            22f * MathF.Pow(windSpeed * DevelopedFetch(fetch, windSpeed) / Gravity / Gravity, -0.33f);
+
+        // JONSWAP's fetch laws hold until the sea is fully developed, at a dimensionless fetch gF/U² of about 22 000,
+        // where they meet Pierson-Moskowitz (α 0.0081, peak 0.88 g/U). A longer fetch at a light wind raised a sea the
+        // wind cannot hold: 3 m/s over 100 km gave waves 0.5 m high and 25 m long instead of 0.2 m and 8 m.
+        private static float DevelopedFetch(float fetch, float windSpeed) =>
+            MathF.Min(fetch, 22000f * windSpeed * windSpeed / Gravity);
+
+        // A swell from afar: what reaches the coast of a distant storm's sea is its long waves; the short ones were
+        // spent on the way. Its spectrum keeps the frequencies below twice its peak (wavelengths over a quarter of the
+        // peak's, deep water: k = ω² / g). Its JONSWAP tail is where the slopes and the crests' squeeze live, so an
+        // authored 15 m/s band kept a rough, foaming sea on a calm day whatever the weather.
+        private static float SwellCutoff(float fetch, float windSpeed)
+        {
+            float omega = 2f * JonswapPeakOmega(fetch, windSpeed);
+            return omega * omega / Gravity;
+        }
 
         /// <summary>
         /// The two spectrum layers of every band. Authored bands use their own fields over all wavelengths. Bands that
@@ -476,6 +507,8 @@ namespace Freefall.Components
                     continue;
                 }
 
+                // With wind bands for the local sea an authored band is a swell from afar: its long waves only
+                bool swell = windBands.Count > 0;
                 spectrums[i * 2] = new OceanFFT.SpectrumParameters
                 {
                     Scale = b.Scale.X,
@@ -487,7 +520,7 @@ namespace Freefall.Components
                     Gamma = b.PeakEnhancement.X,
                     ShortWavesFade = b.ShortWavesFade.X,
                     LowCutoff = 0f,
-                    HighCutoff = float.MaxValue,
+                    HighCutoff = swell ? SwellCutoff(b.Fetch.X, b.WindSpeed.X) : float.MaxValue,
                 };
 
                 spectrums[i * 2 + 1] = new OceanFFT.SpectrumParameters
@@ -501,7 +534,7 @@ namespace Freefall.Components
                     Gamma = b.PeakEnhancement.Y,
                     ShortWavesFade = b.ShortWavesFade.Y,
                     LowCutoff = 0f,
-                    HighCutoff = float.MaxValue,
+                    HighCutoff = swell ? SwellCutoff(b.Fetch.Y, b.WindSpeed.Y) : float.MaxValue,
                 };
             }
 
@@ -595,7 +628,7 @@ namespace Freefall.Components
 
             // Push runtime-tweakable params to OceanFFT each frame
             _oceanFFT.UpdateParams(Depth, FoamBias, FoamDecayRate, FoamThreshold, FoamAdd,
-                new Vector2(Choppiness, Choppiness));
+                new Vector2(Choppiness, Choppiness), NoWhitecapBands());
 
             // Update tile scales buffer (in case LengthScale changed)
             UpdateTileScalesBuffer();

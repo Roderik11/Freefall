@@ -37,7 +37,8 @@ struct OceanConstants
     float FoamAdd;
     uint NumBands;
     uint LengthScalesSRV;
-    uint _pad0, _pad1;
+    uint NoWhitecapBands;  // bit per band whose crests make no foam (a swell from afar); 0 = every band foams
+    uint _pad1;
 };
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -167,8 +168,10 @@ void CSAssembleMaps(uint3 id : SV_DispatchThreadID)
         // Final displacement with choppiness (lambda)
         float3 displacement = float3(oc.Lambda.x * dxdz.x, dydxz.x, oc.Lambda.y * dxdz.y);
 
-        // Slopes normalized by displacement derivatives
-        float2 slopes = dyxdyz.xy / (1 + abs(dxxdzz * oc.Lambda));
+        // Slopes of the displaced surface: the choppy displacement squeezes a crest together (1 + λ·∂D/∂x < 1), so the
+        // same rise over a shorter run is steeper, and stretches a trough flatter. Floored where the crest folds over.
+        // Until 2026-10-18 divided by 1 + |λ·∂D/∂x|, which flattened crests as well as troughs.
+        float2 slopes = dyxdyz.xy / max(1.0 + dxxdzz * oc.Lambda, 0.2);
 
         // Temporal foam accumulation
         float foam = displacementTex[uint3(id.xy, i)].a;
@@ -177,8 +180,9 @@ void CSAssembleMaps(uint3 id : SV_DispatchThreadID)
         foam *= exp(-oc.FoamDecayRate * foamStep);
         foam = saturate(foam);
 
+        // Whitecaps where the crest is squeezed: J under FoamBias - FoamThreshold, more the deeper (a swell makes none)
         float biasedJacobian = max(0.0f, -(jacobian - oc.FoamBias));
-        if (biasedJacobian > oc.FoamThreshold)
+        if (biasedJacobian > oc.FoamThreshold && ((oc.NoWhitecapBands >> i) & 1u) == 0)
             foam += oc.FoamAdd * biasedJacobian * foamStep;
 
         // Write output
