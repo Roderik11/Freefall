@@ -137,13 +137,14 @@ namespace Freefall.Components
         public float RepeatTime = 200.0f;
 
         // Whitecaps: foam where a crest is squeezed, the Jacobian J of the choppy displacement under FoamBias −
-        // FoamThreshold. The defaults (2026-10-18) give Monahan's whitecap share within ~1.5× from 3 to 15 m/s of
-        // wind (none at 3, ~1% at 10, ~3.5% at 15) and somewhat less above (7.5% at 20 m/s against 10.5%).
+        // FoamThreshold, a finer band's only inside a coarser band's (FoamGate). The defaults (2026-10-18) give
+        // Monahan's whitecap share from 10 to 20 m/s of wind within ~1.7× (1.7 / 4.5 / 7.2% against 1.0 / 3.9 / 10.5%),
+        // none up to 6 m/s and 13% at 25 m/s (Monahan 22%).
         [Category("Foam")]
         [ValueRange(0f, 2f)]
         [Description(@"Whitecaps form where a crest is squeezed below this Jacobian (minus the threshold).
          Higher = more crests foam, at lighter winds")]
-        public float FoamBias = 0.88f;
+        public float FoamBias = 0.9f;
 
         [ValueRange(0f, 0.1f)]
         [Description(@"Exponential decay rate per frame.
@@ -159,7 +160,7 @@ namespace Freefall.Components
         [ValueRange(0f, 1f)]
         [Description(@"Amount of foam injected per frame when the Jacobian exceeds the threshold.
          Higher values create thicker, more opaque foam")]
-        public float FoamAdd = 0.35f;
+        public float FoamAdd = 0.5f;
 
         [Category("Shore")]
         [ValueRange(1f, 100f)]
@@ -261,7 +262,7 @@ namespace Freefall.Components
             public Vector3 OceanColor;
             public uint SeaMaskSRV;      // where the open sea is (SeaMask); 0 = everywhere. Was padding: an older build writes 0
             public Vector3 DeepColor;
-            public float _pad1;
+            public uint FoamGate;        // per band a nibble: 0 = foam shown as it is, k = only where band k - 1 foams (was padding)
             public Vector3 SunDirection;
             public float SunIntensity;
             public Vector3 SunColor;
@@ -408,20 +409,41 @@ namespace Freefall.Components
                 pData[i] = 1.0f / Bands[i].LengthScale;
         }
 
-        // Bands that make no whitecaps. A swell from afar does not break in deep water: with wind bands for the local sea
-        // the authored bands (swells) make none; their long crests still squeezed past the foam threshold now and then.
-        // Nor does a band whose tile is short: its foam repeats every tile, and the 17 m band's spots laid a grid of
-        // dashes over a storm sea (its squeeze comes from waves under 4 m, which break without whitecaps anyway).
-        private const uint MinWhitecapTile = 32;
+        // Bands that make no whitecaps: a swell from afar does not break in deep water, so with wind bands for the local
+        // sea the authored bands (swells) make none; their long crests still squeezed past the foam threshold now and then.
         private uint NoWhitecapBands()
         {
-            uint mask = 0;
             bool windSea = false;
             for (int i = 0; i < Bands.Count; i++)
                 windSea |= Bands[i].FollowWind;
+            if (!windSea) return 0;
+            uint mask = 0;
             for (int i = 0; i < Bands.Count && i < 32; i++)
-                if ((windSea && !Bands[i].FollowWind) || Bands[i].LengthScale < MinWhitecapTile) mask |= 1u << i;
+                if (!Bands[i].FollowWind) mask |= 1u << i;
             return mask;
+        }
+
+        // Which band's foam each band's whitecaps show inside (OceanData.FoamGate, ocean.fx): a nibble per band, 0 = its
+        // foam shows as it is, k = only where band k - 1 foams. Each foaming band is gated by the next coarser foaming
+        // band, so the finer bands add their detail inside the bigger whitecaps (short waves break on the crests of long
+        // ones): on its own the 17 m band's foam repeated every tile, a grid of specks over a storm sea. The shader works
+        // through the bands in order, so a band is only gated by one before it in the list (the default order runs
+        // coarse to fine).
+        private uint FoamGate()
+        {
+            uint noFoam = NoWhitecapBands();
+            uint gate = 0;
+            for (int i = 0; i < Bands.Count && i < 8; i++)
+            {
+                if ((noFoam & (1u << i)) != 0) continue;
+                int coarser = -1;
+                for (int j = 0; j < i; j++)
+                    if ((noFoam & (1u << j)) == 0 && Bands[j].LengthScale > Bands[i].LengthScale
+                        && (coarser < 0 || Bands[j].LengthScale < Bands[coarser].LengthScale))
+                        coarser = j;
+                if (coarser >= 0) gate |= (uint)(coarser + 1) << (i * 4);
+            }
+            return gate;
         }
 
         private uint[] BuildLengthScales()
@@ -681,6 +703,7 @@ namespace Freefall.Components
                 OceanColor = new Vector3(OceanColor.R, OceanColor.G, OceanColor.B),
                 SeaMaskSRV = Engine.Settings.DisableSeaMask ? 0 : _seaMask.Srv,
                 DeepColor = new Vector3(DeepColor.R, DeepColor.G, DeepColor.B),
+                FoamGate = FoamGate(),
                 SunDirection = sunDir,
                 SunColor = sunColor,
                 SunIntensity = sunIntensity,

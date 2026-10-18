@@ -46,7 +46,7 @@ struct OceanData
     float3 OceanColor;
     uint SeaMaskSRV;        // where the open sea is (C# SeaMask), 0 = everywhere. Was padding: an older build writes 0
     float3 DeepColor;
-    float _pad1;
+    uint FoamGate;          // per band a nibble: 0 = its foam shows as it is, k = only where band k - 1 foams. Was padding: 0
     float3 SunDirection;
     float SunIntensity;
     float3 SunColor;
@@ -533,7 +533,7 @@ PSOutput PS(DSOutput input)
     // the slopes under this pixel its roughness. NormalAtten scales the slopes (and so the variance by its square).
     WaterSlopes slopes = (WaterSlopes)0;
     float resolvedTotal = 0;
-    float totalFoam = 0;
+    float bandFoam[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
     float waveHeight = 0;
     float2 worldXZ = input.UndisplacedXZ.xy;
 
@@ -554,8 +554,24 @@ PSOutput PS(DSOutput input)
         float2 meanWorld = float2(moments.x * c - moments.y * s, moments.x * s + moments.y * c);
         AddWaterBand(slopes, moments, meanWorld, ocean.NormalAtten);
         resolvedTotal += WaterBandTotalVariance(slopeTex, OceanSampler, i, ocean.NormalAtten);
-        totalFoam += disp.a;
+        bandFoam[i] = disp.a;
         waveHeight += disp.y;
+    }
+
+    // The bands' whitecaps, a finer band's only where the next coarser foaming band is foaming (OceanData.FoamGate, a
+    // nibble per band: 0 = shown as it is, k = shown where band k - 1 foams): short waves break on the crests of long
+    // ones and in their wake, so each band adds its own detail inside the bigger whitecaps. On its own the 17 m band's
+    // foam repeated every tile: a grid of specks over a storm sea (2026-10-18).
+    float totalFoam = 0;
+    [unroll]
+    for (uint fb = 0; fb < 8; ++fb)
+    {
+        if (fb < ocean.NumBands)
+        {
+            uint gateBand = (ocean.FoamGate >> (fb * 4)) & 0xF;
+            bandFoam[fb] *= gateBand == 0 ? 1.0 : smoothstep(0.02, 0.2, bandFoam[min(gateBand - 1, 7)]);
+            totalFoam += bandFoam[fb];
+        }
     }
 
     float3 N = normalize(float3(-slopes.mean.x, 1.0, -slopes.mean.y));
@@ -666,14 +682,10 @@ PSOutput PS(DSOutput input)
     // cellular foam texture, so edges break up into bubbles/streaks instead of showing FFT texels.
     float t = ocean.WaveTime;
 
-    // Open water: whitecaps, the Jacobian foam from the FFT, faded at distance. The shore's foam builds `coverage`.
-    float whitecap = saturate(totalFoam) * saturate(1.0 - dist / 3000.0);
-    float coverage = 0.0;
+    // Open water: Jacobian foam from the FFT, faded at distance
+    float coverage = saturate(totalFoam) * saturate(1.0 - dist / 3000.0);
 
     float foamTex = 0.5;
-    float capTex = 0.5;
-    float2 windPos = worldPos.xz;    // whitecaps' pattern space: the wind's frame, drawn out downwind
-    float2 capWarp = 0.0;
     float streakFoam = 0.0;
     if (ocean.NoiseSRV != 0)
     {
@@ -834,17 +846,6 @@ PSOutput PS(DSOutput input)
 
         // Backwash filaments: translucent, lightly broken up by the fine cells
         streakFoam *= 0.85 * lerp(0.75, 1.0, cells2) * ocean.ShoreFoam;
-
-        // Whitecaps: the same cells in the wind's frame, drawn out downwind the harder it blows (a gale combs the foam
-        // into streaks along the wind; at 20 m/s 3.4 times as long as across)
-        float2 along = dot(WindDirection.xz, WindDirection.xz) > 1e-6 ? normalize(WindDirection.xz) : float2(1, 0);
-        windPos = float2(dot(worldPos.xz, along) / (1.0 + WindStrength * 0.12),
-                         dot(worldPos.xz, float2(-along.y, along.x)));
-        float capCells1 = noiseTex.SampleLevel(OceanSampler, windPos * 0.23 + t * float2(0.010, 0.006), 0).g;
-        float capCells2 = noiseTex.SampleLevel(OceanSampler, windPos * 0.83 - t * float2(0.013, 0.004), 0).g;
-        capTex = saturate((capCells1 * 0.6 + capCells2 * 0.4 - 0.15) / 0.6);
-        capWarp = float2(noiseTex.SampleLevel(OceanSampler, windPos * 0.06 + 0.27, 0).r,
-                         noiseTex.SampleLevel(OceanSampler, windPos * 0.06 + 0.83, 0).r) - 0.5;
     }
 
     // Thin foam is translucent, thick foam keeps the cell structure as shading.
@@ -854,42 +855,6 @@ PSOutput PS(DSOutput input)
     float foam = saturate((coverage * 1.25 - (1.0 - foamTex)) * 3.0);
     foam = lerp(foam, saturate((coverage - 0.35) * 1.5) * 0.7, foamFar);
     foam = max(foam, streakFoam * (1.0 - foamFar));
-
-    // A whitecap: a solid core while fresh (the cells only shade it); as it decays it opens into a web of strands, the
-    // shore's FoamWeb in the wind's frame (so drawn out downwind), bent by a slow warp, its strands thinning as the foam
-    // fades. Eroding it with the cells instead broke it into loose white specks and dashes. Under it and round it the
-    // air the breaking crest carried down scatters the light back up: pale turquoise water that outlasts the foam.
-    // Without it the foam lay on dark water like a paper cut-out.
-    // Solid only while nearly saturated: the crest breaking now and the half second after. Past 150 m the web would
-    // alias: the core stays and the older foam is a faint veil (a soft fill of the whole patch made white ovals).
-    float capFoam = 0.0;
-    if (whitecap > 0.02)
-    {
-        float core = smoothstep(0.82, 0.97, whitecap);
-        float web = 0.0;
-        if (dist < 150.0 && ocean.NoiseSRV != 0)
-        {
-            // The web takes only a little of the downwind stretch: drawn out as far as the cells, its strands ran as
-            // long straight lines across the sea (darker than the water where it mirrors the bright horizon)
-            float2 webPos = float2(windPos.x * (1.0 + WindStrength * 0.12) / (1.0 + WindStrength * 0.03), windPos.y);
-            float2 w = FoamWeb(webPos / 1.6 + capWarp * 2.5, float2(1, 0), 1.0, t * 0.5, 0.33);
-            float width = 0.02 + 0.2 * smoothstep(0.1, 0.85, whitecap);     // strands thin out as the foam decays
-            web = saturate(1.0 - w.x / (width + 0.12 * smoothstep(0.4, 0.9, w.y)));
-            // As on the shore: the web tears open in patches and its strands are made of bubbles. Whole, it laid an
-            // even net over a wide patch of old foam
-            Texture2D<float4> noiseTex = ResourceDescriptorHeap[ocean.NoiseSRV];
-            float patches = noiseTex.SampleLevel(OceanSampler, windPos * 0.05 - t * 0.004, 0).b;
-            web *= lerp(0.15, 1.0, smoothstep(0.35, 0.65, patches + whitecap * 0.4));
-            web = saturate((web * 1.3 - (1.0 - capTex) * 0.7) * 2.0);
-            web *= smoothstep(0.08, 0.4, whitecap) * (1.0 - smoothstep(60.0, 150.0, dist));
-        }
-        capFoam = max(core, lerp(web, smoothstep(0.1, 0.8, whitecap) * 0.15, foamFar));
-    }
-    float aerated = smoothstep(0.03, 0.8, whitecap) * lerp(0.35, 1.0, capTex);
-    color += (1.0 - F) * aerated * WaterFoamLit(ocean.ShallowColor * 0.05, NdotL, sunRadiance, skyAmbient);
-    if (capFoam > foam)
-        foamTex = capTex;
-    foam = max(foam, capFoam);
 
     // Always feather the last few centimeters of water: whatever the foam pattern, it must not end
     // in the hard pixel edge where the water surface cuts into the beach.
