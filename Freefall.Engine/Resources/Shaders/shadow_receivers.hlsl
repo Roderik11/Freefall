@@ -1,5 +1,5 @@
 // Sun shadow receivers (ShadowReceivers.cs): where this frame's visible surfaces sample each cascade, as the deepest
-// receiver light depth per tile, for the receiver-mask caster culling in CSVisibilityShadow4 (Bittner et al. 2011,
+// receiver light depth per tile, for the receiver-mask caster culling in CSVisibilityCascades (Bittner et al. 2011,
 // "Shadow caster culling for efficient shadow mapping"). Layout in shadow_receivers.hlsli.
 //
 // CSOceanWaveBound  per texel of the ocean's displacement (one slice per band): the band's largest |vertical
@@ -357,6 +357,7 @@ void CSReceiverPyramid(uint3 groupId : SV_GroupID, uint3 groupThreadId : SV_Grou
     {
         receivers[RECEIVER_MODE] = ModeIdx;
         receivers[RECEIVER_MARGIN] = asuint(MarginUV);
+        receivers[RECEIVER_CASCADES] = CascadeCountIdx;
     }
 
     // Level 1 from level 0's 2x2, counting the tiles with a receiver on the way

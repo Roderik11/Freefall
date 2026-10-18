@@ -1045,7 +1045,7 @@ namespace Freefall.Components
 
         private void CreateFrameBuffers(int i)
         {
-            int shadowCapacity = MaxPatches * DirectionalLight.CascadeCount;
+            int shadowCapacity = MaxPatches * DirectionalLight.MaxCascades;
 
             // Structured buffers with SRV + UAV
             _descriptorBuffers[i] = GraphicsBuffer.CreateStructured(MaxPatches, 20, srv: true, uav: true);

@@ -9,7 +9,7 @@ namespace Freefall.Graphics
     /// <summary>
     /// Sun shadow receivers: where this frame's visible surfaces sample each cascade, as the deepest receiver light depth
     /// per tile of a 64×64 grid over the cascade (shadow_receivers.hlsl; layout in shadow_receivers.hlsli). The cascade
-    /// culling (CSVisibilityShadow4, push constant slot 39) tests every cascade entry against it: a caster whose nearest
+    /// culling (CSVisibilityCascades, push constant slot 39) tests every cascade entry against it: a caster whose nearest
     /// point lies deeper than every receiver under its footprint darkens nothing the camera sees through that cascade
     /// (receiver-mask caster culling, Bittner et al. 2011).
     /// Built in DirectionalLight.DrawShadows, between the opaque pass (this frame's linear depth exists) and the
@@ -18,11 +18,11 @@ namespace Freefall.Graphics
     public sealed class ShadowReceivers : IDisposable
     {
         // shadow_receivers.hlsli
-        private const int HeaderWords = 32;
+        private const int HeaderWords = 48;
         private const int CascadeWords = 5461;
-        private const int MaxCascades = 4;          // CSVisibilityShadow4 tests four
-        private const int HeaderInstances = 2, HeaderInstancesCut = 3, HeaderTiles = 4, HeaderEntries = 8,
-                          HeaderEntriesCut = 12, HeaderTris = 16, HeaderTrisCut = 20;
+        private const int MaxCascades = DirectionalLight.MaxCascades;   // RECEIVER_MAX_CASCADES
+        private const int HeaderInstances = 2, HeaderInstancesCut = 3, HeaderTiles = 4, HeaderEntries = 10,
+                          HeaderEntriesCut = 16, HeaderTris = 22, HeaderTrisCut = 28, HeaderCascades = 42;
         private const uint ModeCount = 1, ModeCull = 2;
         private const int MaxOceanBands = 8;            // RECEIVER_MAX_BANDS
         private const uint MaxVisibleLights = 4096;     // PointLightBuffer.MaxVisible
@@ -235,9 +235,9 @@ namespace Freefall.Graphics
                 return null;
             var s = _stats;
 
-            var cascades = new object[MaxCascades];
+            var cascades = new object[Math.Clamp((int)s[HeaderCascades], 0, MaxCascades)];
             ulong entries = 0, entriesCut = 0, tris = 0, trisCut = 0;
-            for (int c = 0; c < MaxCascades; c++)
+            for (int c = 0; c < cascades.Length; c++)
             {
                 entries += s[HeaderEntries + c];
                 entriesCut += s[HeaderEntriesCut + c];

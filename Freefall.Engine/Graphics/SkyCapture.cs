@@ -35,7 +35,7 @@ namespace Freefall.Graphics
         public const float Below = 48f, Above = 96f; // metres captured under and over the snapped camera height
         private const float HeightStep = 16f;
         private const float MinCasterTexels = 2f;   // smaller casters are left out
-        private const int CullViews = 4;            // the cascade culling's view count
+        private const int CullViews = 1;            // the cascade culling's view count: this direction
         private const int FrameCount = 3;
 
         /// <summary>One direction. Must match SkyCaptureView in sky_capture.hlsli (80 bytes).</summary>
@@ -179,7 +179,7 @@ namespace Freefall.Graphics
             using var _ = _marker.Auto();
             PixMarker.Begin(list, "Sky captures");
 
-            // The culling's four views: this direction, then three that hold nothing (every plane rejects)
+            // The culling's one view: this direction
             int slot = Engine.FrameIndex % FrameCount;
             var vp = ViewProjection(Directions[view], _centre);
             unsafe
@@ -190,9 +190,6 @@ namespace Freefall.Graphics
                 data.VP = vp;
                 data.PrevVP = vp;
                 cull[0] = data;
-                var none = new Vector4(0, 0, 0, float.MaxValue);
-                for (int k = 1; k < CullViews; k++)
-                    cull[k] = new GPUCuller.CascadeData { Plane0 = none, Plane1 = none, Plane2 = none, Plane3 = none, Plane4 = none, Plane5 = none };
             }
             _views[view] = new View { VP = vp, Direction = Directions[view], Valid = 1 };
             WriteViews(slot);
@@ -207,7 +204,7 @@ namespace Freefall.Graphics
             var cullBuffer = _cullBuffers[slot]!;
             PixMarker.Begin(list, "Culling");
             InstanceBatch.CullShadowAll(list, _batches, cullBuffer.SrvIndex, cullBuffer.Native.GPUVirtualAddress,
-                shadowHiZSrv: 0, culler, minCasterClip: -MinCasterTexels * 2f / Resolution, receiversUav: 0);
+                shadowHiZSrv: 0, culler, cascadeCount: CullViews, minCasterClip: -MinCasterTexels * 2f / Resolution, receiversUav: 0);
             PixMarker.End(list);
 
             // A single-slice DSV: the vertex shader routes the view to array index 0

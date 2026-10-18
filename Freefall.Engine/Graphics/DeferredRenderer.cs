@@ -211,7 +211,7 @@ namespace Freefall.Graphics
                 _lightFrameParams[i] = GraphicsBuffer.CreateUpload<PointLightBuffer.FrameParams>(1, mapped: true);
 
             // Shadow Map Array (Cascades)
-            ShadowTextureArray = new DepthTextureArray2D(2048, 2048, 4);
+            ShadowTextureArray = new DepthTextureArray2D(2048, 2048, DirectionalLight.MaxCascades);
 
             // Point light shadows (own atlas, independent of the cascades)
             LocalShadows = new LocalShadows();
@@ -225,7 +225,7 @@ namespace Freefall.Graphics
             
             // Shadow Hi-Z pyramid (matched to shadow map size)
             ShadowHiZPyramid = new ShadowHiZPyramid();
-            ShadowHiZPyramid.Create(Engine.Device, 2048, 2048, Engine.Settings.ShadowCascadeCount);
+            ShadowHiZPyramid.Create(Engine.Device, 2048, 2048, DirectionalLight.MaxCascades);
             
             // Screen-space shadows
             ScreenSpaceShadows = new ScreenSpaceShadows();
@@ -644,7 +644,7 @@ namespace Freefall.Graphics
                          ResourceStates.DepthWrite, ResourceStates.NonPixelShaderResource);
                      
                      CommandBuffer.Culler.GenerateShadowHiZPyramid(
-                         list, ShadowTextureArray.BindlessIndex, ShadowHiZPyramid);
+                         list, ShadowTextureArray.BindlessIndex, ShadowHiZPyramid, DirectionalLight.CascadeCount);
                      
                      // Transition to PixelShaderResource for light pass sampling
                      list.ResourceBarrierTransition(ShadowTextureArray.Native,

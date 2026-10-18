@@ -123,6 +123,8 @@ namespace Freefall.Editor.Commands
                 lamps = Freefall.Graphics.PointLightBuffer.Instance?.DescribeLamps(),
                 // Sun cascades: entries whose caster shades no visible receiver (EngineSettings.ShadowReceiverCulling)
                 sunShadowReceivers = Freefall.Graphics.ShadowReceivers.DescribeAll(),
+                // Sun cascades this frame: view depth range, the radius of each square and its texel size
+                sunCascades = Freefall.Components.DirectionalLight.DescribeCascades(),
                 // Sky captures (sky visibility past the meshes): their centre, groups still due, groups drawn
                 skyCaptures = Freefall.Graphics.SkyCapture.Describe(),
                 // Camera exposure: auto or locked, the EV in use and its target, the metered luminance, the daylight

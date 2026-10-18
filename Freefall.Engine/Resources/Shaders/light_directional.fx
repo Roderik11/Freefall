@@ -284,7 +284,7 @@ float4 PS(VSOutput input) : SV_Target
     if (DebugVisualizationMode == 1)
     {
         // Cascade index as color: R=0, G=1, B=2, Y=3
-        float4 cascadeColors[4] = { float4(1,0,0,1), float4(0,1,0,1), float4(0,0,1,1), float4(1,1,0,1) };
+        float4 cascadeColors[6] = { float4(1,0,0,1), float4(0,1,0,1), float4(0,0,1,1), float4(1,1,0,1), float4(1,0,1,1), float4(0,1,1,1) };
         return cascadeColors[cascadeIndex];
     }
     if (DebugVisualizationMode == 2)

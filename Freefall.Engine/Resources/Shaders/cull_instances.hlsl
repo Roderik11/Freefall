@@ -20,7 +20,7 @@
 #pragma kernel CSBitonicSortPairs
 #pragma kernel CSWriteSortedIndices
 #pragma kernel CSVisibilityShadow
-#pragma kernel CSVisibilityShadow4
+#pragma kernel CSVisibilityCascades
 #pragma kernel CSExpandCascades
 #pragma kernel CSPatchExpandedCounts
 #pragma kernel CSCompactCommands
@@ -98,13 +98,13 @@ cbuffer PushConstants : register(b3)
     uint IndirectionUAVIdx;         // slot 19 — UAV: maps group-order -> draw-order index
     uint SortSizeIdx;               // slot 20 — Block size for this merge step
     uint SortStrideIdx;             // slot 21 — Stride within block
-    uint SortCountIdx;              // slot 22 — Total count to sort
+    uint SortCountIdx;              // slot 22 — Total count to sort; the cascade chain: its cascade count (ShadowCascadeCount)
     uint SubbatchIdsIdx;            // slot 23 — SRV: per-instance subbatch index
     uint CombinedShadowVisUAVIdx;   // slot 24 — UAV: combined shadow visibility; CSVisibility: the first instance its transform cache re-reads every frame (CacheRefreshFrom)
     uint MaterialsBufferIdx;        // slot 25 — SRV: materials array buffer
     uint HistogramUAVIdx;           // slot 26 — UAV: histogram buffer (count per MeshPartId)
     uint UniquePartCountIdx;        // slot 27 — Max unique MeshPartIds in registry
-    uint CascadeMaskUAVIdx;         // slot 28 — UAV: per-instance 4-bit cascade mask; the camera's CSVisibility: its transform cache (VisibilityCacheIdx)
+    uint CascadeMaskUAVIdx;         // slot 28 — UAV: per-instance cascade mask (a bit per cascade); the camera's CSVisibility: its transform cache (VisibilityCacheIdx)
     uint ExpansionUAVIdx;           // slot 29 — UAV: expansion buffer for (instanceIdx, cascadeIdx); CSVisibility: the slots uploaded this tick (ChangedSlotsIdx)
     float ShadowMinCasterClip;      // slot 30 — shadow cascades 1+: smallest caster diameter in clip units (0 = off)
     uint CascadeBufferSRVIdx;       // slot 31 — SRV: StructuredBuffer<CascadeData> / shadow cascade idx (aliased)
@@ -114,10 +114,11 @@ cbuffer PushConstants : register(b3)
     float LodCameraY;               // slot 35   passes too, so shadows use the main view's LOD.
     float LodCameraZ;               // slot 36   (separate floats: a float3 would not pack into these slots)
     float LodFactor;                // slot 37 — Camera.FoVFactor * LODScale² (0 = no valid camera: LOD-managed instances are not drawn)
-    uint InstanceBoundsUAVIdx;      // slot 38 — UAV: InstanceBounds per instance; CSVisibility writes, CSVisibilityShadow4/LocalShadows read (0 = none)
-    uint ShadowReceiversUAVIdx;     // slot 39 — UAV: the sun's receiver tiles + stats (shadow_receivers.hlsli); CSVisibilityShadow4 only (0 = none); CSVisibility: the changed records (ChangedRecordsIdx)
+    uint InstanceBoundsUAVIdx;      // slot 38 — UAV: InstanceBounds per instance; CSVisibility writes, CSVisibilityCascades/LocalShadows read (0 = none)
+    uint ShadowReceiversUAVIdx;     // slot 39 — UAV: the sun's receiver tiles + stats (shadow_receivers.hlsli); CSVisibilityCascades only (0 = none); CSVisibility: the changed records (ChangedRecordsIdx)
 };
 
+#include "shadow_cascades.hlsli"
 #include "shadow_receivers.hlsli"
 
 // Convenience aliases for named push constants (matching old #define usage)
@@ -145,6 +146,8 @@ cbuffer PushConstants : register(b3)
 #define CascadeMaskUAVIdx     CascadeMaskUAVIdx
 #define ShadowHiZSrvIdx       PrevVisibilityIdx
 #define ShadowCascadeIdx      CascadeBufferSRVIdx
+// The cascade chain never sorts: slot 22 holds its cascade count (clamped: a stale value must not run away)
+#define ShadowCascadeCount    min(SortCountIdx, SHADOW_MAX_CASCADES)
 // The camera chain (InstanceBatch.Cull) never reads the shadow slots 24/28/29/39, so CSVisibility takes them over
 #define CacheRefreshFrom      CombinedShadowVisUAVIdx
 #define VisibilityCacheIdx    CascadeMaskUAVIdx
@@ -435,8 +438,8 @@ bool IsOccluded(float3 worldCenter, float worldRadius)
 // Whether a caster is big enough to draw into a cascade: its bounding sphere's diameter covers at least
 // ShadowMinCasterClip of the cascade's clip space (EngineSettings.ShadowMinCasterTexels * 2 / resolution).
 // Used for the cascades after the first: a small thing far out shades a texel or two, which screen-space
-// shadows already give it. Negative: the same test with -ShadowMinCasterClip for all four views (the sky captures,
-// SkyCapture.cs, whose four views are alike).
+// shadows already give it. Negative: the same test with -ShadowMinCasterClip for every view (the sky captures,
+// SkyCapture.cs, whose view is no cascade).
 bool CoversShadowTexels(float worldRadius, uint cascadeIndex)
 {
     float minClip = abs(ShadowMinCasterClip);
@@ -1260,14 +1263,14 @@ void CSVisibilityShadow(uint3 dispatchThreadId : SV_DispatchThreadID)
 }
 
 //-----------------------------------------------------------------------------
-// CSVisibilityShadow4: Unified 4-cascade shadow visibility pass
-// Tests all 4 cascade frustums per instance in a single dispatch.
+// CSVisibilityCascades: every cascade's visibility of an instance in one dispatch (ShadowCascadeCount of them,
+// slot 22: the sun's cascades in use this frame, or the sky captures' one view).
 // Outputs:
-//   - Combined visibility flag (union of all 4 cascades) for stream compaction
-//   - 4-bit cascade mask per instance for VS early-out
+//   - Combined visibility flag (union of the cascades) for stream compaction
+//   - Cascade mask per instance (bit c = cascade c), which CSExpandCascades expands
 //-----------------------------------------------------------------------------
 [numthreads(256, 1, 1)]
-void CSVisibilityShadow4(uint3 dispatchThreadId : SV_DispatchThreadID)
+void CSVisibilityCascades(uint3 dispatchThreadId : SV_DispatchThreadID)
 {
     uint instanceIdx = dispatchThreadId.x;
     
@@ -1283,7 +1286,7 @@ void CSVisibilityShadow4(uint3 dispatchThreadId : SV_DispatchThreadID)
         return;
     }
     
-    // World sphere and LOD part, found once for all four cascades (the camera's InstanceBounds when slot 38 is set)
+    // World sphere and LOD part, found once for all cascades (the camera's InstanceBounds when slot 38 is set)
     float3 worldCenter;
     float worldRadius;
     uint meshPartId = ShadowCasterSphere(instanceIdx, worldCenter, worldRadius);
@@ -1294,12 +1297,15 @@ void CSVisibilityShadow4(uint3 dispatchThreadId : SV_DispatchThreadID)
         return;
     }
 
-    // Test all cascade frustums + shadow Hi-Z occlusion; past the first cascade, small casters are left out
-    bool vis0 = (ShadowMinCasterClip >= 0.0 || CoversShadowTexels(worldRadius, 0))
-        && IsVisibleShadow(worldCenter, worldRadius, 0) && !IsOccludedShadow(worldCenter, worldRadius, 0);
-    bool vis1 = CoversShadowTexels(worldRadius, 1) && IsVisibleShadow(worldCenter, worldRadius, 1) && !IsOccludedShadow(worldCenter, worldRadius, 1);
-    bool vis2 = CoversShadowTexels(worldRadius, 2) && IsVisibleShadow(worldCenter, worldRadius, 2) && !IsOccludedShadow(worldCenter, worldRadius, 2);
-    bool vis3 = CoversShadowTexels(worldRadius, 3) && IsVisibleShadow(worldCenter, worldRadius, 3) && !IsOccludedShadow(worldCenter, worldRadius, 3);
+    // Every cascade's frustum + shadow Hi-Z occlusion; past the first cascade, small casters are left out
+    uint cascadeCount = ShadowCascadeCount;
+    uint mask = 0;
+    for (uint c = 0; c < cascadeCount; c++)
+    {
+        bool big = (c == 0 && ShadowMinCasterClip >= 0.0) || CoversShadowTexels(worldRadius, c);
+        if (big && IsVisibleShadow(worldCenter, worldRadius, c) && !IsOccludedShadow(worldCenter, worldRadius, c))
+            mask |= 1u << c;
+    }
 
     // Receiver mask (slot 39): the entries whose caster shades nothing the camera sees through that cascade are
     // counted (RECEIVER_MODE_COUNT), and left out with RECEIVER_MODE_CULL
@@ -1307,20 +1313,21 @@ void CSVisibilityShadow4(uint3 dispatchThreadId : SV_DispatchThreadID)
     {
         RWStructuredBuffer<uint> receivers = ResourceDescriptorHeap[ShadowReceiversUAVIdx];
         float marginUV = asfloat(receivers[RECEIVER_MARGIN]);
-        bool shades0 = vis0 && ShadesReceivers(receivers, worldCenter, worldRadius, 0, marginUV);
-        bool shades1 = vis1 && ShadesReceivers(receivers, worldCenter, worldRadius, 1, marginUV);
-        bool shades2 = vis2 && ShadesReceivers(receivers, worldCenter, worldRadius, 2, marginUV);
-        bool shades3 = vis3 && ShadesReceivers(receivers, worldCenter, worldRadius, 3, marginUV);
-
         StructuredBuffer<MeshPartEntry> meshRegistry = ResourceDescriptorHeap[MeshRegistryIdx];
         uint triangles = meshRegistry[meshPartId].VertexCount / 3u;    // VertexCount = indices (vertex pulling)
-        CountReceiverEntries(receivers, 0, vis0, shades0, triangles);
-        CountReceiverEntries(receivers, 1, vis1, shades1, triangles);
-        CountReceiverEntries(receivers, 2, vis2, shades2, triangles);
-        CountReceiverEntries(receivers, 3, vis3, shades3, triangles);
 
-        bool inAny = vis0 || vis1 || vis2 || vis3;
-        bool cutFromAll = inAny && !(shades0 || shades1 || shades2 || shades3);
+        uint shades = 0;
+        for (uint c = 0; c < min(cascadeCount, RECEIVER_MAX_CASCADES); c++)
+        {
+            bool entry = (mask & (1u << c)) != 0;
+            bool shadesHere = entry && ShadesReceivers(receivers, worldCenter, worldRadius, c, marginUV);
+            CountReceiverEntries(receivers, c, entry, shadesHere, triangles);
+            if (shadesHere)
+                shades |= 1u << c;
+        }
+
+        bool inAny = mask != 0;
+        bool cutFromAll = inAny && shades == 0;
         uint instances = WaveActiveCountBits(inAny);
         uint instancesCut = WaveActiveCountBits(cutFromAll);
         if (WaveIsFirstLane() && instances > 0)
@@ -1330,27 +1337,19 @@ void CSVisibilityShadow4(uint3 dispatchThreadId : SV_DispatchThreadID)
         }
 
         if (receivers[RECEIVER_MODE] == RECEIVER_MODE_CULL)
-        {
-            vis0 = shades0;
-            vis1 = shades1;
-            vis2 = shades2;
-            vis3 = shades3;
-        }
+            mask = shades;
     }
 
     // Combined visibility (union) — drives stream compaction.
     // 0 = culled, otherwise resolved MeshPartId + 1
-    combinedVis[instanceIdx] = (vis0 || vis1 || vis2 || vis3) ? (meshPartId + 1u) : 0u;
-    
-    // Per-instance cascade mask — VS reads this for early-out
-    uint mask = (vis0 ? 1u : 0u) | (vis1 ? 2u : 0u) | (vis2 ? 4u : 0u) | (vis3 ? 8u : 0u);
+    combinedVis[instanceIdx] = mask != 0 ? (meshPartId + 1u) : 0u;
     cascadeMasks[instanceIdx] = mask;
 }
 
 //-----------------------------------------------------------------------------
 // CSExpandCascades: Expand compacted visible instances into per-cascade entries.
 // For each visible instance, reads its cascade mask and atomically appends one
-// entry per set bit. Each entry packs cascadeIdx (bits 30-31) + sortedIdx (bits 0-29).
+// entry per set bit. Each entry packs cascadeIdx (bits 29-31) + sortedIdx (bits 0-28), shadow_cascades.hlsli.
 // After expansion, patches indirect DrawInstanceCount with actual expanded count.
 //
 // Dispatch: ceil(TotalInstances / 256), one thread per instance of the batch. It used to be a 2-D grid of
@@ -1360,7 +1359,7 @@ void CSVisibilityShadow4(uint3 dispatchThreadId : SV_DispatchThreadID)
 //
 // Input push constants:
 //   VisibilityFlagsIdx - per-instance flag from the visibility pass: 0 = culled, else LOD-resolved MeshPartId + 1
-//   CascadeMaskUAVIdx  - SRV/UAV: per-instance 4-bit cascade masks
+//   CascadeMaskUAVIdx  - SRV/UAV: per-instance cascade masks
 //   ExpansionUAVIdx    - UAV: output expansion buffer
 //   OutputBufferIdx    - UAV: indirect draw commands (to read baseOffset + patch instanceCount)
 //   CounterBufferIdx   - UAV: per-subbatch expansion counters (reused)
@@ -1386,7 +1385,7 @@ void CSExpandCascades(uint3 dispatchThreadId : SV_DispatchThreadID)
 
     if (mask == 0) return;
 
-    // The part's compacted region starts at baseOffset; its expansion region at baseOffset * 4
+    // The part's compacted region starts at baseOffset; its expansion region at baseOffset * SHADOW_MAX_CASCADES
     RWStructuredBuffer<IndirectDrawCommand> commands = ResourceDescriptorHeap[OutputBufferIdx];
     uint baseOffset = commands[meshPartId].InstanceBaseOffset;
     uint sortedEntry = instanceIdx; // what CSGlobalScatter wrote for it (shadow path: no flip bit)
@@ -1399,18 +1398,18 @@ void CSExpandCascades(uint3 dispatchThreadId : SV_DispatchThreadID)
     uint appendBase;
     InterlockedAdd(counters[meshPartId], bitCount, appendBase);
     
-    // Write expansion entries: pack cascadeIdx in bits 30-31, instance index in bits 0-29
-    // Each sub-batch's expansion region starts at baseOffset * 4 (worst-case 4× expansion)
+    // Write expansion entries: cascade and instance packed as shadow_cascades.hlsli says
+    // Each sub-batch's expansion region starts at baseOffset * SHADOW_MAX_CASCADES (every instance in every cascade)
     RWStructuredBuffer<uint> expansion = ResourceDescriptorHeap[ExpansionUAVIdx];
-    uint expandedBase = baseOffset * 4;
+    uint expandedBase = baseOffset * SHADOW_MAX_CASCADES;
     uint writePos = expandedBase + appendBase;
-    
+
     // Iterate set bits
     uint m = mask;
     while (m != 0)
     {
         uint cascadeIdx = firstbitlow(m);
-        expansion[writePos] = (cascadeIdx << 30) | (sortedEntry & 0x3FFFFFFFu);
+        expansion[writePos] = (cascadeIdx << CASCADE_ENTRY_SHIFT) | (sortedEntry & CASCADE_ENTRY_INSTANCE_MASK);
         writePos++;
         m &= ~(1u << cascadeIdx);
     }
@@ -1432,7 +1431,7 @@ void CSPatchExpandedCounts(uint3 dispatchThreadId : SV_DispatchThreadID)
     
     // Update InstanceBaseOffset to point at expansion region
     uint origBase = commands[meshPartId].InstanceBaseOffset;
-    commands[meshPartId].InstanceBaseOffset = origBase * 4;
+    commands[meshPartId].InstanceBaseOffset = origBase * SHADOW_MAX_CASCADES;
     
     // Patch DrawInstanceCount with actual expanded count
     commands[meshPartId].DrawInstanceCount = counters[meshPartId];
@@ -1474,7 +1473,7 @@ void CSCompactCommands(uint3 dispatchThreadId : SV_DispatchThreadID)
 //  - views are point light cube faces, grouped by light: up to 128, so the per-instance view mask is
 //    a uint4 (LocalShadowMaskIdx, a buffer of the local pass's own);
 //  - the histogram counts an instance once per view it is in, so the prefix sum sizes the expansion
-//    exactly (the cascades reserve 4 entries per instance, which a cube face set can exceed);
+//    exactly (the cascades reserve SHADOW_MAX_CASCADES entries per instance, which a cube face set can exceed);
 //  - the scatter writes the expansion entries itself; CSMain then makes commands whose base and count
 //    are already in expansion entries (no patch pass).
 // Order: CSVisibilityLocalShadows → CSHistogramLocalShadows → CSHistogramPrefixSum →

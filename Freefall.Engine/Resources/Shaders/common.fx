@@ -210,6 +210,7 @@ struct CascadeData
 };
 
 #include "local_shadows.hlsli"
+#include "shadow_cascades.hlsli"
 
 // Shadow vertex shaders serve two passes: Shadow (sun cascades, one slice each) and LocalShadow (point light
 // cube faces, a tile each in the local shadow atlas). These decode the pass's expansion entry and project.
@@ -222,8 +223,8 @@ void DecodeShadowEntry(uint entry, bool local, out uint view, out uint instance)
     }
     else
     {
-        view = entry >> 30;
-        instance = entry & 0x3FFFFFFFu;
+        view = entry >> CASCADE_ENTRY_SHIFT;
+        instance = entry & CASCADE_ENTRY_INSTANCE_MASK;
     }
 }
 

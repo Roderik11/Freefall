@@ -30,7 +30,7 @@ namespace Freefall.Graphics
         private int _clearKernel, _visibilityKernel, _histogramKernel, _histogramPrefixSumKernel;
         private int _localScanKernel, _blockScanKernel, _globalScatterKernel;
         private int _bitonicSortKernel, _sortIndirectionKernel, _mainKernel;
-        private int _visibilityShadowKernel, _visibilityShadow4Kernel;
+        private int _visibilityShadowKernel, _visibilityCascadesKernel;
         private int _expandCascadesKernel, _patchExpandedKernel, _compactCommandsKernel;
         private int _computeDepthKeysKernel, _bitonicSortPairsKernel, _writeSortedIndicesKernel;
         private int _visibilityLocalShadowsKernel, _histogramLocalShadowsKernel, _scatterLocalShadowsKernel;
@@ -41,6 +41,8 @@ namespace Freefall.Graphics
         // Cached kernel indices for depth_analysis.hlsl
         private int _casterReachKernel, _depthBinsKernel, _depthSplitsKernel;
         private const int DepthBins = 1024;       // DEPTH_BINS in depth_analysis.hlsl
+        private const int DepthPercentiles = 31;  // DEPTH_PERCENTILES: the depth at every 1/32 of the pixels
+        private const int DepthSummaryFloats = 2 + DepthPercentiles;   // DEPTH_SUMMARY: nearest, farthest, percentiles
         private const int DepthTilePixels = 128;  // TILE_PIXELS in depth_analysis.hlsl: one CSDepthBins group each
         // The analysis reaches at least this far whatever the casters: terrain bumps, grass and decorators cast into
         // the cascades without being instances, and the terrain shadow map leaves out shallow near shadows
@@ -65,7 +67,7 @@ namespace Freefall.Graphics
         private GraphicsBuffer? _depthMinMaxBuffer;            // 4 uints (min, max, caster reach as float bits, 0)
         private GraphicsBuffer? _depthMinMaxInitBuffer;        // Static upload buffer with init values {MAX_FLOAT, 0, 0, 0}
         private GraphicsBuffer? _depthHistogramBuffer;         // DepthBins uints
-        private GraphicsBuffer? _depthSplitsBuffer;            // 4 floats (SRV + UAV)
+        private GraphicsBuffer? _depthSplitsBuffer;            // DepthSummaryFloats: the depth distribution (SRV + UAV)
         private GraphicsBuffer[]? _depthSplitsReadbackBuffers;  // Per-frame readback
         private bool _sdsmInitialized;
         private int _sdsmValidFrames;                          // Frames since SDSM started producing data
@@ -106,7 +108,7 @@ namespace Freefall.Graphics
         public ID3D12PipelineState? MainPSO => _cullShader?.GetPSO(_mainKernel);
         public ID3D12PipelineState? ClearPSO => _cullShader?.GetPSO(_clearKernel);
         public ID3D12PipelineState? VisibilityShadowPSO => _cullShader?.GetPSO(_visibilityShadowKernel);
-        public ID3D12PipelineState? VisibilityShadow4PSO => _cullShader?.GetPSO(_visibilityShadow4Kernel);
+        public ID3D12PipelineState? VisibilityCascadesPSO => _cullShader?.GetPSO(_visibilityCascadesKernel);
         public ID3D12PipelineState? ExpandCascadesPSO => _cullShader?.GetPSO(_expandCascadesKernel);
         public ID3D12PipelineState? PatchExpandedPSO => _cullShader?.GetPSO(_patchExpandedKernel);
         public ID3D12PipelineState? CompactCommandsPSO => _cullShader?.GetPSO(_compactCommandsKernel);
@@ -271,7 +273,7 @@ namespace Freefall.Graphics
             _sortIndirectionKernel = _cullShader.FindKernel("CSSortIndirection");
             _mainKernel = _cullShader.FindKernel("CSMain");
             _visibilityShadowKernel = _cullShader.FindKernel("CSVisibilityShadow");
-            _visibilityShadow4Kernel = _cullShader.FindKernel("CSVisibilityShadow4");
+            _visibilityCascadesKernel = _cullShader.FindKernel("CSVisibilityCascades");
             _expandCascadesKernel = _cullShader.FindKernel("CSExpandCascades");
             _patchExpandedKernel = _cullShader.FindKernel("CSPatchExpandedCounts");
             _compactCommandsKernel = _cullShader.FindKernel("CSCompactCommands");
@@ -329,12 +331,12 @@ namespace Freefall.Graphics
                     pInit[3] = 0;
                 }
                 _depthHistogramBuffer = GraphicsBuffer.CreateStructured<uint>(DepthBins, uav: true);
-                _depthSplitsBuffer = GraphicsBuffer.CreateStructured<float>(4, srv: true, uav: true);
+                _depthSplitsBuffer = GraphicsBuffer.CreateStructured<float>(DepthSummaryFloats, srv: true, uav: true);
                 
                 // Readback buffers: one per frame
                 _depthSplitsReadbackBuffers = new GraphicsBuffer[FrameCount];
                 for (int rb = 0; rb < FrameCount; rb++)
-                    _depthSplitsReadbackBuffers[rb] = GraphicsBuffer.CreateReadback<float>(4);
+                    _depthSplitsReadbackBuffers[rb] = GraphicsBuffer.CreateReadback<float>(DepthSummaryFloats);
                 
                 _sdsmInitialized = true;
                 Debug.Log("GPUCuller", "SDSM depth analysis initialized via ComputeShader: 3 kernels");
@@ -618,18 +620,21 @@ namespace Freefall.Graphics
         }
 
         /// <summary>
-        /// Generate Hi-Z pyramid from shadow depth maps (all cascades).
+        /// Generate Hi-Z pyramid from shadow depth maps: the first <paramref name="slices"/> cascades, the ones drawn
+        /// this frame (all of them the first time, which takes every slice out of its initial state).
         /// Call after shadow rendering, when shadow texture is in PixelShaderResource state.
         /// </summary>
         public void GenerateShadowHiZPyramid(
             ID3D12GraphicsCommandList commandList,
             uint shadowArraySrvIndex,
-            ShadowHiZPyramid pyramid)
+            ShadowHiZPyramid pyramid,
+            int slices)
         {
             if (!_initialized || _pyramidShader == null || pyramid?.Texture == null) return;
 
             bool firstGeneration = !pyramid.Ready;
             pyramid.Ready = true;
+            int sliceCount = firstGeneration ? pyramid.SliceCount : Math.Clamp(slices, 0, pyramid.SliceCount);
 
             int sourceW = pyramid.SourceWidth;
             int sourceH = pyramid.SourceHeight;
@@ -640,7 +645,7 @@ namespace Freefall.Graphics
             commandList.SetComputeRootSignature(_device.GlobalRootSignature);
 
             // Process each cascade slice
-            for (int slice = 0; slice < pyramid.SliceCount; slice++)
+            for (int slice = 0; slice < sliceCount; slice++)
             {
                 // Transition SPD mips (0 to spdMipCount-1) for this slice to UAV
                 var beforeState = firstGeneration ? ResourceStates.Common : ResourceStates.NonPixelShaderResource;
@@ -723,8 +728,8 @@ namespace Freefall.Graphics
         /// <summary>
         /// Dispatch SDSM depth analysis: CSCasterReach (per shadow-casting batch the camera culled this tick: how far
         /// in view depth its visible instances' shadows can reach), CSDepthBins (one pass over every 4th pixel each
-        /// way, up to that reach: log-spaced depth histogram + min/max), then CSDepthSplits (percentile splits capped at
-        /// the logarithmic ones, and it clears the histogram, min/max and reach for the next frame).
+        /// way, up to that reach: log-spaced depth histogram + min/max), then CSDepthSplits (the depth distribution, ReadDepthDistribution,
+        /// and it clears the histogram, min/max and reach for the next frame).
         /// Call after Hi-Z generation, when DepthGBuffer is in NonPixelShaderResource state, after the opaque culling.
         /// </summary>
         /// <param name="toLight">Toward the directional light (sun or moon).</param>
@@ -818,7 +823,7 @@ namespace Freefall.Graphics
             commandList.CopyBufferRegion(
                 _depthSplitsReadbackBuffers![frameIndex].Native, 0,
                 _depthSplitsBuffer!.Native, 0,
-                4 * sizeof(float));
+                DepthSummaryFloats * sizeof(float));
             
             _sdsmValidFrames++;
         }
@@ -841,28 +846,52 @@ namespace Freefall.Graphics
             return 1f + 2f * along / tan;
         }
 
-        private readonly float[] _adaptiveSplits = new float[4];
+        /// <summary>
+        /// The view depths an SDSM analysis saw (depth_analysis.hlsl CSDepthSplits): the nearest and the farthest pixel up
+        /// to the farthest receiver a visible caster can shade, and the depth below which each 1/32 of those pixels lie.
+        /// DirectionalLight makes the splits for its cascade count from it.
+        /// </summary>
+        public sealed class DepthDistribution
+        {
+            public float Nearest, Farthest;
+            public readonly float[] Percentiles = new float[DepthPercentiles];   // [i]: (i + 1) / 32 of the pixels
+
+            /// <summary>The depth below which <paramref name="share"/> (0..1) of the pixels lie, log-interpolated.</summary>
+            public float DepthAt(float share)
+            {
+                float x = Math.Clamp(share, 0f, 1f) * (DepthPercentiles + 1);   // 0 = nearest, 32 = farthest
+                int i = Math.Min((int)x, DepthPercentiles);
+                float a = i == 0 ? Nearest : Percentiles[i - 1];
+                float b = i == DepthPercentiles ? Farthest : Percentiles[i];
+                if (a <= 0f || b <= 0f) return MathF.Max(a, b);
+                return a * MathF.Pow(b / a, x - i);
+            }
+        }
+
+        private readonly DepthDistribution _distribution = new();
 
         /// <summary>
-        /// Read the adaptive cascade splits computed by the previous frame's depth analysis.
-        /// Returns null if no valid data is available yet. The array is reused: valid until the next call.
+        /// The depth distribution of the previous frame's analysis, or null while there is none (no depth, or SDSM not
+        /// run yet). The object is reused: valid until the next call.
         /// </summary>
-        public unsafe float[]? ReadAdaptiveSplits()
+        public unsafe DepthDistribution? ReadDepthDistribution()
         {
             if (!_sdsmInitialized || _depthSplitsReadbackBuffers == null || _sdsmValidFrames < 2)
                 return null;
-            
+
             // Read from the PREVIOUS frame's readback buffer (guaranteed complete)
             int readFrame = (Engine.FrameIndex - 1 + FrameCount) % FrameCount;
-            float* pSplits = _depthSplitsReadbackBuffers[readFrame].ReadPtr<float>();
-            
-            // Check for invalid data (zeros = no scene geometry)
-            if (pSplits[0] <= 0)
+            float* src = _depthSplitsReadbackBuffers[readFrame].ReadPtr<float>();
+
+            // Zeros = no scene geometry
+            if (src[1] <= 0)
                 return null;
-            
-            for (int i = 0; i < 4; i++)
-                _adaptiveSplits[i] = pSplits[i];
-            return _adaptiveSplits;
+
+            _distribution.Nearest = src[0];
+            _distribution.Farthest = src[1];
+            for (int i = 0; i < DepthPercentiles; i++)
+                _distribution.Percentiles[i] = src[2 + i];
+            return _distribution;
         }
 
         /// <summary>
@@ -920,6 +949,7 @@ namespace Freefall.Graphics
             
             // Push constants via ComputeShader API
             var cs = _cascadeShader!;
+            // Disabled path: since 2026-10-18 this buffer holds the depth distribution (DepthDistribution), not 4 splits
             cs.SetSRV(_cascadeComputeKernel, "SplitsBuffer", _depthSplitsBuffer!);
             cs.SetPushConstant(_cascadeComputeKernel, "CascadeOutUAV", cascadeOutUAV);
             cs.SetUAV(_cascadeComputeKernel, "LightingOutUAV", _lightingCascadeBuffer!);

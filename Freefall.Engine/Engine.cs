@@ -511,8 +511,13 @@ namespace Freefall
          public ShadowReceiverCulling ShadowReceiverCulling { get; set; } = ShadowReceiverCulling.On;
          public bool UseAdaptiveSplits { get; set; } = true;                // F4 - SDSM adaptive cascade splits
 
-         [ValueRange(3, 8)]
-         public int ShadowCascadeCount { get; set; } = 4;                   // Number of shadow cascades
+         /// <summary>
+         /// The sun's cascades (at most DirectionalLight.MaxCascades, the slices of the shadow array). Six since
+         /// 2026-10-18: with SDSM reaching the farthest shadowed receiver, four left the trees 100-500 m out in a
+         /// cascade with 1.5 m texels; the receiver culling keeps the extra cascades cheap.
+         /// </summary>
+         [ValueRange(1, 6)]
+         public int ShadowCascadeCount { get; set; } = 6;
 
          /// <summary>
          /// The farthest the sun's cascades ever reach. SDSM analyses the depth only up to the farthest receiver a

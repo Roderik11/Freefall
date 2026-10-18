@@ -17,25 +17,37 @@ namespace Freefall.Components
         public bool CastShadows = true;
         
         /// <summary>
-        /// Direct cascade split distances. Each value is the far boundary of that cascade.
-        /// Cascade 0: near..Splits[0], Cascade 1: Splits[0]..Splits[1], etc.
+        /// Fixed cascade split distances (EngineSettings.UseAdaptiveSplits off). Each value is the far boundary of that
+        /// cascade: cascade 0 near..Splits[0], cascade 1 Splits[0]..Splits[1], etc. With more cascades than values the
+        /// curve they draw is resampled (FixedSplits), so four values serve six cascades.
         /// </summary>
         public float[] CascadeSplits = { 16f, 64f, 128, 512 };
 
         private Material Material;
         private MaterialBlock Params;
 
-        internal const int MaxCascades = 8; // Support up to 8 cascades
+        /// <summary>Slices of the shadow array: the most cascades a frame can draw (shadow_cascades.hlsli).</summary>
+        public const int MaxCascades = 6;
 
         /// <summary>Metres every cascade's depth range reaches toward the sun past its slice of the view, so casters
         /// above a small room (ceiling, roof) are drawn however thin the adaptive splits make the cascade.</summary>
         private const float MinCasterReach = 300f;
         
-        // Shadow Cascades — arrays sized to max capacity, active count from Engine.Settings
+        // Shadow Cascades — arrays sized to max capacity, the count in use chosen per frame (CascadeCount)
         private readonly Vector4[] cascades = new Vector4[MaxCascades];
         private readonly Matrix4x4[] cascadeProjectionMatrices = new Matrix4x4[MaxCascades];
         private readonly Matrix4x4[] lightSpace = new Matrix4x4[MaxCascades];
         private readonly Vector3[] frustumCorners = new Vector3[8];
+        private readonly float[] _cascadeRadius = new float[MaxCascades];
+        private readonly float[] _splits = new float[MaxCascades];
+
+        // Cascades drawn this frame and last frame: a cascade that sat out has no Hi-Z of last frame's casters
+        private int _cascadeCount = MaxCascades;
+        private int _drawnLastFrame;
+        private int _shadowResolution = 2048;
+
+        // A previous-frame VP that puts everything off the map: the shadow Hi-Z test then assumes visible
+        private static readonly Matrix4x4 OffMapVP = new Matrix4x4(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 10, 0, 0, 1);
         
         // GPU-driven shadow rendering - frustum planes per cascade (6 planes each)
         private readonly Vector4[][] cascadeFrustumPlanes = new Vector4[MaxCascades][];
@@ -115,9 +127,31 @@ namespace Freefall.Components
         }
 
         /// <summary>
-        /// Number of active shadow cascades (from Engine.Settings).
+        /// The cascades drawn this frame (EngineSettings.ShadowCascadeCount, at most MaxCascades): decided when the
+        /// shadow pass starts; everything that reads the cascades later in the frame (terrain, grass, lighting, water,
+        /// fog) takes this many.
         /// </summary>
-        public static int CascadeCount => Engine.Settings.ShadowCascadeCount;
+        public static int CascadeCount => _instance?._cascadeCount ?? Math.Clamp(Engine.Settings.ShadowCascadeCount, 1, MaxCascades);
+
+        /// <summary>
+        /// This frame's cascades for engine_stats: view depth range, the bounding radius of its square and its texel
+        /// size; null before the first shadow pass.
+        /// </summary>
+        public static object? DescribeCascades()
+        {
+            var light = _instance;
+            if (light == null || light._drawnLastFrame == 0) return null;
+            var result = new object[light._drawnLastFrame];
+            for (int c = 0; c < result.Length; c++)
+                result[c] = new
+                {
+                    near = MathF.Round(light.cascades[c].X, 2),
+                    far = MathF.Round(light.cascades[c].Y, 1),
+                    radius = MathF.Round(light._cascadeRadius[c], 1),
+                    texelCm = MathF.Round(light._cascadeRadius[c] * 200f / light._shadowResolution, 1),
+                };
+            return new { adaptive = Engine.Settings.UseAdaptiveSplits, cascades = result };
+        }
 
         private static DirectionalLight? _instance;
 
@@ -131,7 +165,7 @@ namespace Freefall.Components
             Material = new Material(new Effect("light_directional"));
             Params = new MaterialBlock();
             
-            for (int i = 0; i < 4; i++)
+            for (int i = 0; i < MaxCascades; i++)
                 cascadeFrustumPlanes[i] = new Vector4[6];
 
             _instance = this;
@@ -311,14 +345,16 @@ namespace Freefall.Components
             // Cascades 1+: casters spanning fewer texels than this are left out (clip space spans 2 units)
             float minCasterClip = MathF.Max(0f, Engine.Settings.ShadowMinCasterTexels) * 2f / shadowTex.Width;
 
-            // Set up cascade split distances
+            // The cascades this frame draws: everything later in the frame reads CascadeCount
             float near = camera.NearPlane;
-            const int numCascades = 4;
-            
+            int numCascades = Math.Clamp(Engine.Settings.ShadowCascadeCount, 1, Math.Min(MaxCascades, shadowTex.Slices));
+            _cascadeCount = numCascades;
+            _shadowResolution = shadowTex.Width;
+
             // Check if GPU cascade compute is available and SDSM is active
             var culler = CommandBuffer.Culler;
             // TEMP: force CPU path to isolate GPU cascade compute bug
-            // SDSM splits still used via ReadAdaptiveSplits() in CPU path below
+            // SDSM splits still made from ReadDepthDistribution() in the CPU path below
             bool useGpuCascades = false;
             // bool useGpuCascades = Engine.Settings.UseAdaptiveSplits 
             //     && culler?.CascadeComputeReady == true;
@@ -376,10 +412,10 @@ namespace Freefall.Components
                     CurrentCascadeSrvIndex = cascadeSRV;
                     CurrentVPOnlySrvIndex = _vpOnlySrvIndices != null ? _vpOnlySrvIndices[frameIndex] : 0;
                     
-                    InstanceBatch.CullShadowAll(commandList, allBatches, cascadeSRV, cascadeCBAddr, shadowHiZSrv, culler, minCasterClip);
+                    InstanceBatch.CullShadowAll(commandList, allBatches, cascadeSRV, cascadeCBAddr, shadowHiZSrv, culler, 4, minCasterClip);
 
                     commandList.OMSetRenderTargets(0, (CpuDescriptorHandle[]?)null, false, shadowTex.FullArrayDsvHandle);
-                    
+
                     foreach (var batch in allBatches)
                     {
                         if (!batch.Material.HasPass(RenderPass.Shadow)) continue;
@@ -401,41 +437,32 @@ namespace Freefall.Components
                 _usedGpuCascadeCompute = false;
                 _activeLightingCascadeSrv = 0;
                 
-                // Try adaptive splits from SDSM depth analysis (previous frame)
-                float[] activeSplits = CascadeSplits;
-                bool usingAdaptive = false;
-                if (Engine.Settings.UseAdaptiveSplits)
-                {
-                    var adaptiveSplits = CommandBuffer.Culler?.ReadAdaptiveSplits();
-                    if (adaptiveSplits != null)
-                    {
-                        activeSplits = adaptiveSplits;
-                        usingAdaptive = true;
-                    }
-                }
-                
-                // Use active splits (adaptive or fixed)
-                cascades[0] = new Vector4(near, activeSplits[0], 0, 0);
+                // Adaptive splits from the SDSM depth analysis (last frame's depth), else the fixed ones
+                var distribution = Engine.Settings.UseAdaptiveSplits ? CommandBuffer.Culler?.ReadDepthDistribution() : null;
+                if (distribution == null || !AdaptiveSplits(distribution, near, numCascades, _splits))
+                    FixedSplits(CascadeSplits, near, numCascades, _splits);
+
+                cascades[0] = new Vector4(near, _splits[0], 0, 0);
                 for (int i = 1; i < numCascades; i++)
-                    cascades[i] = new Vector4(activeSplits[i - 1], activeSplits[i], 0, 0);
+                    cascades[i] = new Vector4(_splits[i - 1], _splits[i], 0, 0);
 
                 // Get cascade projection matrices
-                for (int i = 0; i < 4; i++)
+                for (int i = 0; i < numCascades; i++)
                     cascadeProjectionMatrices[i] = camera.GetProjectionMatrix(cascades[i].X, cascades[i].Y);
 
                 // Set viewport for shadow map size
                 commandList.RSSetViewport(new Viewport(0, 0, shadowTex.Width, shadowTex.Height));
                 commandList.RSSetScissorRect(new RectI(0, 0, shadowTex.Width, shadowTex.Height));
-                
-                // Clear all cascades first
-                for (int i = 0; i < 4; i++)
+
+                // Clear the cascades drawn this frame (a slice that sits out keeps last content, matching its Hi-Z)
+                for (int i = 0; i < numCascades; i++)
                     commandList.ClearDepthStencilView(shadowTex.SliceDsvHandles[i], ClearFlags.Depth, 1.0f, 0);
-                
+
                 if (!CastShadows) return;
-                
+
                 // Draw each cascade using GPU-driven rendering
                 // Phase 1: Compute cascade matrices and frustum planes
-                for (int i = 0; i < CascadeCount; i++)
+                for (int i = 0; i < numCascades; i++)
                     SetupCascade(i, camera, cameraPosition, shadowTex);
                 
                 // Phase 2: GPU-driven cull all cascades per batch (unified visibility pass)
@@ -446,6 +473,7 @@ namespace Freefall.Components
                 {
                     EnsureCascadeBuffer();
                     UploadCascadeBuffer(frameIndex);
+                    _drawnLastFrame = numCascades;
                     uint cascadeSrv = _cascadeBufferSrvIndices![frameIndex];
                     uint vpOnlySrv = _vpOnlySrvIndices![frameIndex]; // TEMP
                     CurrentCascadeSrvIndex = cascadeSrv;
@@ -459,12 +487,13 @@ namespace Freefall.Components
                     // depth): the culling tests every cascade entry against it (EngineSettings.ShadowReceiverCulling)
                     var renderer = DeferredRenderer.Current!;
                     CurrentShadowReceiversUav = renderer.ShadowReceivers?.Build(commandList, camera, renderer,
-                        cascadeSrv, CascadeCount, shadowTex.Width) ?? 0;
+                        cascadeSrv, numCascades, shadowTex.Width) ?? 0;
 
                     // Cull all cascades for each batch using unified visibility pass
                     ulong cascadeCBAddr = _shadowCascadeCBs![frameIndex].Native.GPUVirtualAddress;
                     PixMarker.Begin(commandList, "Shadow culling");
-                    InstanceBatch.CullShadowAll(commandList, allBatches, cascadeSrv, cascadeCBAddr, shadowHiZSrv, culler, minCasterClip);
+                    InstanceBatch.CullShadowAll(commandList, allBatches, cascadeSrv, cascadeCBAddr, shadowHiZSrv, culler,
+                        numCascades, minCasterClip);
                     PixMarker.End(commandList);
 
                     // Phase 3: True single-pass draw — 1 ExecuteIndirect per batch for all cascades
@@ -544,7 +573,8 @@ namespace Freefall.Components
             for (int i = 0; i < 8; i++)
                 radius = MathF.Max(radius, (frustumCorners[i] - frustumCenter).Length());
             radius = MathF.Ceiling(radius * 16.0f) / 16.0f;
-            
+            _cascadeRadius[index] = radius;
+
             float texelSize = (radius * 2.0f) / shadowTex.Width;
             
             //if (Engine.FrameIndex % 60 == 0)
@@ -674,28 +704,89 @@ namespace Freefall.Components
             }
         }
         
+        // The planes cbuffer (_shadowCascadeCBs, ShadowCascadePlanes in cull_instances.hlsl) is only bound because the
+        // root signature wants slot 2: the kernels read the planes from this structured buffer.
         private unsafe void UploadCascadeBuffer(int frameIndex)
         {
             var dst = _cascadeBuffers![frameIndex].WritePtr<GPUCuller.CascadeData>();
             var vpDst = _vpOnlyBuffers![frameIndex].WritePtr<Matrix4x4>();
-            var cbDst = _shadowCascadeCBs![frameIndex].WritePtr<Vector4>();
-            for (int c = 0; c < CascadeCount; c++)
+            int count = _cascadeCount;
+            for (int c = 0; c < count; c++)
             {
                 var data = new GPUCuller.CascadeData();
                 data.SetPlanes(cascadeFrustumPlanes[c]);
                 data.VP = _shadowVPMatrices[c];
-                data.PrevVP = _prevShadowVPMatrices[c];
+                // The shadow Hi-Z holds last frame's casters: none for a cascade that was not drawn then
+                data.PrevVP = c < _drawnLastFrame ? _prevShadowVPMatrices[c] : OffMapVP;
                 data.SplitDistances = cascades[c]; // X=near, Y=far
                 dst[c] = data;
                 vpDst[c] = _shadowVPMatrices[c];
-                
-                // Write planes to cbuffer (6 Vector4s per cascade)
-                for (int p = 0; p < 6; p++)
-                    cbDst[c * 6 + p] = cascadeFrustumPlanes[c][p];
             }
-            
+
             // Swap current → previous for next frame
-            Array.Copy(_shadowVPMatrices, _prevShadowVPMatrices, CascadeCount);
+            Array.Copy(_shadowVPMatrices, _prevShadowVPMatrices, count);
+        }
+
+        // ── Splits ──────────────────────────────────────────────────────────────────
+
+        /// <summary>
+        /// SDSM splits for <paramref name="count"/> cascades from last frame's depth distribution: logarithmic between
+        /// the depth of the nearest 1/32 of the pixels (a grass blade at the lens does not shrink cascade 0) and the
+        /// farthest pixel the analysis looked at, so every cascade spans the same far/near ratio and its texels grow with
+        /// distance as the pixels do. Until 2026-10-18 each inner split was the 40/70/90 % percentile of the pixels,
+        /// capped at this: on a forest floor the last 10 % of the pixels reached from 125 m to 1.2 km and put every tree
+        /// past 125 m in one cascade with 1.5 m texels, where their shadows vanished. False when there is no depth.
+        /// </summary>
+        private static bool AdaptiveSplits(GPUCuller.DepthDistribution d, float near, int count, float[] result)
+        {
+            if (d.Farthest <= 0f || d.Farthest - d.Nearest <= 0.0001f)
+                return false;
+
+            float floor = near + 0.1f;
+            float logFrom = MathF.Max(d.Percentiles[0], floor);
+            float logRatio = MathF.Max(d.Farthest, logFrom) / logFrom;
+            for (int k = 1; k < count; k++)
+                result[k - 1] = logFrom * MathF.Pow(logRatio, (float)k / count);
+            result[count - 1] = MathF.Max(d.Farthest, floor);
+            MakeIncreasing(result, count);
+            return true;
+        }
+
+        /// <summary>
+        /// The fixed splits (CascadeSplits) for <paramref name="count"/> cascades: as given when there are enough, else
+        /// resampled along the curve they draw (log depth over k / N from the near plane), so the last split stays.
+        /// </summary>
+        private static void FixedSplits(float[] configured, float near, int count, float[] result)
+        {
+            int n = configured.Length;
+            if (n == 0)
+            {
+                for (int k = 0; k < count; k++)
+                    result[k] = near * MathF.Pow(4f, k + 1);
+            }
+            else if (n >= count)
+            {
+                Array.Copy(configured, result, count);
+            }
+            else
+            {
+                for (int k = 1; k <= count; k++)
+                {
+                    float x = (float)k / count * n;             // position on the configured curve, 0 = near plane
+                    int i = Math.Min((int)x, n - 1);
+                    float a = i == 0 ? MathF.Max(near, 0.01f) : configured[i - 1];
+                    float b = configured[i];
+                    result[k - 1] = a * MathF.Pow(b / a, x - i);
+                }
+            }
+            MakeIncreasing(result, count);
+        }
+
+        private static void MakeIncreasing(float[] splits, int count)
+        {
+            for (int q = 1; q < count; q++)
+                if (splits[q] <= splits[q - 1])
+                    splits[q] = splits[q - 1] + 1f;
         }
 
         private void EnsureShadowSceneConstantsBuffer()

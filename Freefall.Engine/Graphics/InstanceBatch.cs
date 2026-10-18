@@ -193,7 +193,7 @@ namespace Freefall.Graphics
         private CpuDescriptorHandle[] shadowVisibleIndicesCPUHandles = new CpuDescriptorHandle[FrameCount];
         private CpuDescriptorHandle[] shadowHistogramCPUHandles = new CpuDescriptorHandle[FrameCount];
 
-        // Shadow cascade expansion buffer — stores (cascadeIdx<<30 | instanceIdx) per visible cascade
+        // Shadow cascade expansion buffer — one entry (cascade, instance; shadow_cascades.hlsli) per visible cascade
         private ID3D12Resource[] shadowExpansionBuffers = new ID3D12Resource[FrameCount];
         private uint[] shadowExpansionUAVIndices = new uint[FrameCount];
         private uint[] shadowExpansionSRVIndices = new uint[FrameCount];
@@ -1004,13 +1004,13 @@ namespace Freefall.Graphics
                 shadowHistogramCPUHandles[f] = histogramCpuHandle;
                 descriptorIdx++;
 
-                // Expansion buffer (capacity × 4 = worst case when every instance is in all 4 cascades)
-                int expansionBufferSize = capacity * 4 * sizeof(uint);
-                shadowExpansionBuffers[f] = device.CreateDefaultBuffer(expansionBufferSize);
+                // Expansion buffer (capacity × MaxCascades = worst case when every instance is in every cascade)
+                int expansionEntries = capacity * DirectionalLight.MaxCascades;
+                shadowExpansionBuffers[f] = device.CreateDefaultBuffer(expansionEntries * sizeof(uint));
                 shadowExpansionUAVIndices[f] = device.AllocateBindlessIndex();
-                device.CreateStructuredBufferUAV(shadowExpansionBuffers[f], (uint)(capacity * 4), sizeof(uint), shadowExpansionUAVIndices[f]);
+                device.CreateStructuredBufferUAV(shadowExpansionBuffers[f], (uint)expansionEntries, sizeof(uint), shadowExpansionUAVIndices[f]);
                 shadowExpansionSRVIndices[f] = device.AllocateBindlessIndex();
-                device.CreateStructuredBufferSRV(shadowExpansionBuffers[f], (uint)(capacity * 4), sizeof(uint), shadowExpansionSRVIndices[f]);
+                device.CreateStructuredBufferSRV(shadowExpansionBuffers[f], (uint)expansionEntries, sizeof(uint), shadowExpansionSRVIndices[f]);
 
                 // CPU handle for expansion clear
                 var expansionCpuHandle = _shadowCpuHeap.GetCPUDescriptorHandleForHeapStart() + (int)(descriptorIdx * handleIncrement);
@@ -1018,7 +1018,7 @@ namespace Freefall.Graphics
                 {
                     Format = Vortice.DXGI.Format.Unknown,
                     ViewDimension = UnorderedAccessViewDimension.Buffer,
-                    Buffer = new BufferUnorderedAccessView { FirstElement = 0, NumElements = (uint)(capacity * 4), StructureByteStride = sizeof(uint) }
+                    Buffer = new BufferUnorderedAccessView { FirstElement = 0, NumElements = (uint)expansionEntries, StructureByteStride = sizeof(uint) }
                 };
                 device.NativeDevice.CreateUnorderedAccessView(shadowExpansionBuffers[f], null, expansionUavDesc, expansionCpuHandle);
                 shadowExpansionCPUHandles[f] = expansionCpuHandle;
@@ -1239,17 +1239,18 @@ namespace Freefall.Graphics
         }
 
         /// <summary>
-        /// Culls all shadow cascades for all batches, stage by stage (see Cull): CSVisibilityShadow4 writes the combined
+        /// Culls all shadow cascades for all batches, stage by stage (see Cull): CSVisibilityCascades writes the combined
         /// visibility (union) and a cascade mask per instance, one compaction runs on the union, CSExpandCascades
         /// expands it by the masks, and the non-empty commands are packed into each batch's opaque command buffer.
         /// </summary>
-        /// <param name="minCasterClip">Cascades 1+: smallest caster diameter in clip units (EngineSettings.ShadowMinCasterTexels * 2 / resolution; 0 = off; negative: -minCasterClip for all four views).</param>
+        /// <param name="cascadeCount">The views in the cascade buffer to cull against (at most DirectionalLight.MaxCascades).</param>
+        /// <param name="minCasterClip">Cascades 1+: smallest caster diameter in clip units (EngineSettings.ShadowMinCasterTexels * 2 / resolution; 0 = off; negative: -minCasterClip for every view).</param>
         /// <param name="receiversUav">The receiver tiles to test casters against (ShadowReceivers; 0 = none); null = the sun's this frame.</param>
         public static void CullShadowAll(ID3D12GraphicsCommandList list, IReadOnlyList<InstanceBatch> batches,
-            uint cascadeBufferSrv, ulong cascadeBufferGpuAddress, uint shadowHiZSrv, GPUCuller? culler, float minCasterClip = 0f,
-            uint? receiversUav = null)
+            uint cascadeBufferSrv, ulong cascadeBufferGpuAddress, uint shadowHiZSrv, GPUCuller? culler, int cascadeCount,
+            float minCasterClip = 0f, uint? receiversUav = null)
         {
-            if (culler?.VisibilityShadow4PSO == null || culler.MainPSO == null || culler.HistogramPSO == null) return;
+            if (culler?.VisibilityCascadesPSO == null || culler.MainPSO == null || culler.HistogramPSO == null) return;
 
             _stageBatches.Clear();
             foreach (var batch in batches)
@@ -1262,13 +1263,14 @@ namespace Freefall.Graphics
             list.SetComputeRootConstantBufferView(2, cascadeBufferGpuAddress);
 
             uint receivers = receiversUav ?? DirectionalLight.CurrentShadowReceiversUav;
+            uint cascades = (uint)Math.Clamp(cascadeCount, 0, DirectionalLight.MaxCascades);
             foreach (var batch in _stageBatches)
-                batch.PrepareCullShadow(list, cascadeBufferSrv, shadowHiZSrv, minCasterClip, receivers);
+                batch.PrepareCullShadow(list, cascadeBufferSrv, shadowHiZSrv, minCasterClip, receivers, cascades);
             StageBarrier(list);
 
             // Combined flag + cascade mask per instance
             PixMarker.Begin(list, "Visibility");
-            DispatchStage(list, culler.VisibilityShadow4PSO, StageItems.Instances, 256);
+            DispatchStage(list, culler.VisibilityCascadesPSO, StageItems.Instances, 256);
             StageBarrier(list);
             PixMarker.End(list);
 
@@ -1315,7 +1317,7 @@ namespace Freefall.Graphics
         // Constants and clears of this batch's cascade culling. The draw count is cleared
         // here already: nothing touches it before the compaction at the end.
         private void PrepareCullShadow(ID3D12GraphicsCommandList list, uint cascadeBufferSrv, uint shadowHiZSrv, float minCasterClip,
-            uint receiversUav)
+            uint receiversUav, uint cascadeCount)
         {
             InitializeShadowCullerResources();
             int f = Engine.FrameIndex % FrameCount;
@@ -1334,6 +1336,7 @@ namespace Freefall.Graphics
             c[11] = shadowCombinedVisUAVIndices[f];           // VisibilityFlagsIdx = combined
             c[13] = (uint)_drawCount;
             c[18] = 0;                                        // DrawCountUAVIdx = 0: fixed-index commands
+            c[22] = cascadeCount;                             // ShadowCascadeCount (the sort's slot: the chain never sorts)
             c[24] = shadowCombinedVisUAVIndices[f];           // CombinedShadowVisIdx
             c[25] = Material.MaterialsBufferIndex;
             c[26] = shadowHistogramUAVIndices[f];
@@ -1449,7 +1452,7 @@ namespace Freefall.Graphics
             c[16] = lightBufferSrv;                           // LocalShadowLightsIdx
             c[17] = countsUav;                                // LocalShadowCountsIdx
             c[18] = 0;                                        // DrawCountUAVIdx = 0: fixed-index CSMain
-            c[19] = (uint)(capacity * 4);                     // LocalShadowExpansionCapacity
+            c[19] = (uint)(capacity * DirectionalLight.MaxCascades);    // LocalShadowExpansionCapacity
             c[24] = shadowCombinedVisUAVIndices[f];           // CombinedShadowVisIdx
             c[25] = Material.MaterialsBufferIndex;
             c[26] = shadowHistogramUAVIndices[f];

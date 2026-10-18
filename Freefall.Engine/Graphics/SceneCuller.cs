@@ -15,7 +15,7 @@ namespace Freefall.Graphics
     {
         public const int FrameCount = 3;
         private const int MaxSubBatches = 4096;
-        private const int MaxShadowCascades = 4; // Array capacity; active count from Engine.Settings.ShadowCascadeCount
+        private const int MaxShadowCascades = DirectionalLight.MaxCascades; // Array capacity; active count DirectionalLight.CascadeCount
 
         private int _capacity;
         private bool _cullerInitialized;
@@ -402,7 +402,7 @@ namespace Freefall.Graphics
             int totalInstances = SceneBuffers.ActiveSlotCount;
             int subBatchCount = MeshRegistry.Count;
             if (totalInstances == 0 || subBatchCount == 0) return;
-            if (culler?.VisibilityShadow4PSO == null || culler?.MainPSO == null || culler?.HistogramPSO == null) return;
+            if (culler?.VisibilityCascadesPSO == null || culler?.MainPSO == null || culler?.HistogramPSO == null) return;
 
             InitializeShadowCullerResources();
 
@@ -427,12 +427,13 @@ namespace Freefall.Graphics
             commandList.SetComputeRoot32BitConstant(0, cascadeBufferSrv, 31);                         // CascadeBufferSRVIdx
             commandList.SetComputeRoot32BitConstant(0, 0u, 38);                                       // InstanceBoundsUAVIdx: none, gather
             commandList.SetComputeRoot32BitConstant(0, 0u, 39);                                       // ShadowReceiversUAVIdx: no receiver test
+            commandList.SetComputeRoot32BitConstant(0, (uint)DirectionalLight.CascadeCount, 22);     // ShadowCascadeCount
 
             // Phase 1: Unified visibility (all 4 cascades)
             commandList.SetComputeRoot32BitConstant(0, _shadowVisibilityUAVIndices[f, 0], 24);        // CombinedShadowVisIdx
             commandList.SetComputeRoot32BitConstant(0, _shadowVisibilityUAVIndices[f, 0], 28);        // CascadeMaskUAVIdx
 
-            commandList.SetPipelineState(culler.VisibilityShadow4PSO);
+            commandList.SetPipelineState(culler.VisibilityCascadesPSO);
             commandList.Dispatch((uint)((totalInstances + 255) / 256), 1, 1);
 
             commandList.Barriers(

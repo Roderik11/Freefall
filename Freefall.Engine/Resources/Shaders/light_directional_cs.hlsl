@@ -271,7 +271,7 @@ void CSDirectionalLight(uint3 dispatchThreadId : SV_DispatchThreadID)
     // Debug visualization modes
     if (DebugVisualizationMode == 1)
     {
-        float4 cascadeColors[4] = { float4(1,0,0,1), float4(0,1,0,1), float4(0,0,1,1), float4(1,1,0,1) };
+        float4 cascadeColors[6] = { float4(1,0,0,1), float4(0,1,0,1), float4(0,0,1,1), float4(1,1,0,1), float4(1,0,1,1), float4(0,1,1,1) };
         Output[px] = cascadeColors[cascadeIndex];
         return;
     }

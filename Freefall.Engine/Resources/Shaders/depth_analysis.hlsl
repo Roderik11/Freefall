@@ -5,9 +5,10 @@
 //                 shadow map gives) pushed the percentile splits out, so a fixed 300 m cap stood in until 2026-10-18.
 // CSDepthBins   - one pass in 4x4 pixel blocks: nearest and farthest depth over every pixel, log-spaced depth
 //                 histogram over [NearPlane, range] of one pixel per block (1/16)
-// CSDepthSplits - prefix sum + 40/70/90/100 percentile splits, each no farther than the logarithmic split between the
-//                 nearest and the farthest pixel; hands the histogram, min/max and the reach back cleared for the next
-//                 frame, so nothing is cleared before CSCasterReach / CSDepthBins
+// CSDepthSplits - prefix sum, then the depth distribution for the CPU (GPUCuller.DepthDistribution): the nearest and
+//                 the farthest pixel and the depth at every 1/32 of the pixels, from which DirectionalLight makes the
+//                 splits for however many cascades it draws; hands the histogram, min/max and the reach back cleared
+//                 for the next frame, so nothing is cleared before CSCasterReach / CSDepthBins
 // Was a min/max pass + a histogram pass over every pixel with one groupshared atomic each (0.37 ms at 3440x1249,
 // 0.012 now); the splits match the old ones within ~0.5%.
 
@@ -17,7 +18,7 @@
 
 //
 // Input: DepthGBuffer (R32_Float, linear view-space depth, 0 = sky/empty)
-// Output: 4 cascade split distances in a small UAV buffer
+// Output: the depth distribution, DEPTH_SUMMARY floats in a small UAV buffer (all 0 = no depth)
 
 // Everything is pushed: a Params cbuffer has one copy per frame, and each view (scene, game) analyses its own camera
 cbuffer PushConstants : register(b3)
@@ -25,7 +26,7 @@ cbuffer PushConstants : register(b3)
     uint DepthTexIdx;           // slot 0  — SRV: DepthGBuffer (R32_Float)
     uint MinMaxUAVIdx;          // slot 1  — UAV: RWByteAddressBuffer [minAsUint, maxAsUint, casterReachAsUint, 0]
     uint HistogramUAVIdx;       // slot 2  — UAV: RWStructuredBuffer<uint> [DEPTH_BINS bins]
-    uint SplitsUAVIdx;          // slot 3  — UAV: RWStructuredBuffer<float> [4 splits]
+    uint SplitsUAVIdx;          // slot 3  — UAV: RWStructuredBuffer<float> [DEPTH_SUMMARY]: the depth distribution
     uint CasterBoundsIdx;       // slot 4  — UAV: RWStructuredBuffer<InstanceBounds>, a batch's camera culling (CSCasterReach)
     uint CasterFlagsIdx;        // slot 5  — UAV: RWStructuredBuffer<uint>, its visibility flags (0 = not seen)
     uint CasterCountIdx;        // slot 6  — its instances
@@ -59,6 +60,11 @@ struct InstanceBounds
 #define TILE_SAMPLES 32         // blocks per group edge: 16 threads x 2
 #define TILE_PIXELS (TILE_SAMPLES * SAMPLE_STEP) // 128: GPUCuller.AnalyzeDepth dispatches ceil(size / 128) groups
 #define FLOAT_MAX_BITS 0x7F7FFFFF
+
+// The distribution (GPUCuller.DepthDistribution): [0] nearest, [1] farthest pixel up to the range, [2 + i] the depth
+// below which (i + 1) / 32 of the analysed pixels lie
+#define DEPTH_PERCENTILES 31
+#define DEPTH_SUMMARY (2 + DEPTH_PERCENTILES)
 
 SamplerState PointClamp : register(s1); // static sampler 1: point clamp (only Gather uses it)
 
@@ -214,13 +220,13 @@ void CSDepthBins(uint3 groupId : SV_GroupID, uint3 threadId : SV_GroupThreadID, 
 }
 
 // ============================================================
-// CSDepthSplits — percentile splits from the histogram, then clear it and min/max for the next frame
+// CSDepthSplits — the depth distribution from the histogram, then clear it and min/max for the next frame
 // 256 threads, each owns a run of 4 consecutive bins; the thread whose run holds a percentile writes it
 // ============================================================
 #define BINS_PER_THREAD (DEPTH_BINS / 256)
 
 groupshared uint gs_runSum[256];
-groupshared float gs_split[3];
+groupshared float gs_split[DEPTH_PERCENTILES];
 
 [numthreads(256, 1, 1)]
 void CSDepthSplits(uint tid : SV_GroupIndex)
@@ -254,13 +260,11 @@ void CSDepthSplits(uint tid : SV_GroupIndex)
     float logNear = LogNear();
     float binsPerLog2 = BinsPerLog2(AnalysisRange());   // read by every thread before thread 0 clears it below
 
-    // Near-biased percentile boundaries; the 100th is the farthest depth (below)
-    const float percentiles[3] = { 0.40f, 0.70f, 0.90f };
-    [unroll]
-    for (uint c = 0; c < 3; c++)
+    // Every 1/32 of the pixels; the 32nd is the farthest depth (below)
+    for (uint c = 0; c < DEPTH_PERCENTILES; c++)
     {
         // The first bin whose inclusive prefix sum reaches the target
-        uint target = max((uint)(percentiles[c] * total), 1u);
+        uint target = max((uint)((c + 1) * total / 32u), 1u);
         if (target <= before || target > before + runTotal)
             continue;
 
@@ -293,32 +297,14 @@ void CSDepthSplits(uint tid : SV_GroupIndex)
         // No valid depth data: zeros, the light falls back to its fixed splits
         if (total == 0 || maxDepth - minDepth <= 0.0001f)
         {
-            splits[0] = 0; splits[1] = 0; splits[2] = 0; splits[3] = 0;
+            for (uint z = 0; z < DEPTH_SUMMARY; z++)
+                splits[z] = 0;
             return;
         }
 
-        // Each percentile split no farther than the logarithmic one between the nearest and the farthest pixel: a
-        // view full of distant ground (a vista over a forest that reaches a kilometre) put 40 % of the pixels past
-        // 300 m and cascade 0 with them. In a room the percentiles stay the nearer ones.
-        float logFrom = max(minDepth, NearPlane + 0.1f);
-        float logRatio = max(maxDepth, logFrom) / logFrom;
-        float result[4];
-        [unroll]
-        for (uint c2 = 0; c2 < 3; c2++)
-            result[c2] = min(max(gs_split[c2], NearPlane + 0.1f), logFrom * pow(logRatio, (c2 + 1) / 4.0f));
-        // Last cascade covers everything
-        result[3] = max(maxDepth, NearPlane + 0.1f);
-
-        // Ensure monotonically increasing
-        [unroll]
-        for (uint q = 1; q < 4; q++)
-        {
-            if (result[q] <= result[q - 1])
-                result[q] = result[q - 1] + 1.0f;
-        }
-
-        [unroll]
-        for (uint w = 0; w < 4; w++)
-            splits[w] = result[w];
+        splits[0] = minDepth;
+        splits[1] = maxDepth;
+        for (uint p = 0; p < DEPTH_PERCENTILES; p++)
+            splits[2 + p] = clamp(gs_split[p], minDepth, maxDepth);
     }
 }
