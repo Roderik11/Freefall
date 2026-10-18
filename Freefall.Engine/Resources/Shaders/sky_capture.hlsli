@@ -16,22 +16,11 @@ struct SkyCaptureView
     float Valid;            // 0 until this direction has been captured
 };
 
-// One direction's part: adds its weight to `total` and returns weight × how much of it is open. slice = the view's
+// How much of one direction's sky the point p sees past the meshes, 0..1 (1 outside the captured box). slice = the view's
 // index (its slice of the depth maps), size = the maps' texels.
-float SkyCaptureViewLight(SkyCaptureView v, uint slice, Texture2DArray<float> depths, float2 size, SamplerState clampSampler,
-    float3 worldPos, float3 N, inout float total)
+float SkyCaptureOpenAt(SkyCaptureView v, uint slice, Texture2DArray<float> depths, float2 size, SamplerState clampSampler,
+    float3 p)
 {
-    // The directions are spread cosine-weighted about the zenith, so for a surface facing up each counts alike. A
-    // surface facing elsewhere weighs them by its own cosine; a little for every one keeps a ceiling's average.
-    // A direction not captured yet weighs nothing.
-    float w = (max(dot(N, v.Direction), 0.0) / max(v.Direction.y, 0.05) + 0.05) * v.Valid;
-
-    // Seen from 0.4 m out along the surface's normal, so that its own texels in the map are not in the way (the lift also
-    // shifts the point across the map, as normal-offset shadows do). Nothing toward the sky: 0.3 m that way lifted the
-    // underside of a roof and the top of a gable wall through the thin roof boards into daylight (bright bands along the
-    // roof line, user 2026-10-18); along the normal a point moves away from its own surface and does not cross a roof or
-    // wall that meets it at an angle.
-    float3 p = worldPos + N * 0.4;
     float4 clip = mul(float4(p, 1.0), v.VP);
     float2 uv = clip.xy * float2(0.5, -0.5) + 0.5;
     float2 edge = min(uv, 1.0 - uv);
@@ -49,6 +38,24 @@ float SkyCaptureViewLight(SkyCaptureView v, uint slice, Texture2DArray<float> de
         float seen = lerp(lerp(open.w, open.z, f.x), lerp(open.x, open.y, f.x), f.y);
         visible = lerp(1.0, seen, inside);
     }
+    return visible;
+}
+
+// One direction's part: adds its weight to `total` and returns weight × how much of it is open.
+float SkyCaptureViewLight(SkyCaptureView v, uint slice, Texture2DArray<float> depths, float2 size, SamplerState clampSampler,
+    float3 worldPos, float3 N, inout float total)
+{
+    // The directions are spread cosine-weighted about the zenith, so for a surface facing up each counts alike. A
+    // surface facing elsewhere weighs them by its own cosine; a little for every one keeps a ceiling's average.
+    // A direction not captured yet weighs nothing.
+    float w = (max(dot(N, v.Direction), 0.0) / max(v.Direction.y, 0.05) + 0.05) * v.Valid;
+
+    // Seen from 0.4 m out along the surface's normal, so that its own texels in the map are not in the way (the lift also
+    // shifts the point across the map, as normal-offset shadows do). Nothing toward the sky: 0.3 m that way lifted the
+    // underside of a roof and the top of a gable wall through the thin roof boards into daylight (bright bands along the
+    // roof line, user 2026-10-18); along the normal a point moves away from its own surface and does not cross a roof or
+    // wall that meets it at an angle.
+    float visible = SkyCaptureOpenAt(v, slice, depths, size, clampSampler, worldPos + N * 0.4);
     total += w;
     return w * visible;
 }

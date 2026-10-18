@@ -123,12 +123,16 @@ namespace Freefall.Graphics
             if (!Enabled)
             {
                 _invalid = true;    // the scene may change meanwhile
-                return (0, 0, 0);
+                return Current = (0, 0, 0);
             }
             EnsureResources();
             WriteViews(slot);
-            return (_viewBuffers[slot]!.SrvIndex, _depth!.BindlessIndex, ViewCount);
+            return Current = (_viewBuffers[slot]!.SrvIndex, _depth!.BindlessIndex, ViewCount);
         }
+
+        /// <summary>What <see cref="PrepareFrame"/> handed on this frame (zeros when off): the views are this frame's once
+        /// <see cref="Render"/> has run (PointLightBuffer.UpdateLamps reads them after it).</summary>
+        public static (uint Views, uint Depth, uint Count) Current { get; private set; }
 
         private static unsafe void WriteViews(int slot)
         {

@@ -1,7 +1,8 @@
 // Point light cull (PointLightBuffer.cs, DeferredRenderer.CullPointLights)
 //
 // CSCountLights:  one thread per registry slot. Position from the light entity's world matrix in the global
-//                 transform buffer, camera frustum; histogram of the lights in view by importance.
+//                 transform buffer, camera frustum; histogram of the lights in view by importance. A lamp
+//                 (OnlyWhenDark) is as lit as point_light_lamps.hlsl judged it last frame.
 // CSCullLights:   the same per slot, flicker applied; appends the lights in view to this frame's visible list,
 //                 the most important first when there are more than it holds: lights below the importance band
 //                 that keeps the list within MAX_VISIBLE_LIGHTS are left out, those in that band fade with their
@@ -25,14 +26,26 @@ cbuffer PushConstants : register(b3)
     uint VisibleCountUAVIdx;    // RWByteAddressBuffer: [0] = lights in the list, [1] = lights in view
     uint HiZTexIdx;             // CSOccludeLights: Hi-Z pyramid of this frame's linear depth
     uint HistogramUAVIdx;       // RWStructuredBuffer<uint>[IMPORTANCE_BINS]: lights in view per importance band
+    uint LampsUAVIdx;           // RWStructuredBuffer<LampState> per slot (point_light_lamps.hlsl); 0 = all follow frame.Lamps
 };
 
 #include "point_lights.hlsli"
 
 #define IMPORTANCE_BINS 64u
 
+// How lit a lamp (OnlyWhenDark) is: by the daylight where it hangs, judged last frame; the open ground's lamps until
+// it has been judged (the first frame of a scene, a light just added)
+float LampAt(uint slot, PointLightFrame frame)
+{
+    if (LampsUAVIdx == 0)
+        return frame.Lamps;
+    RWStructuredBuffer<LampState> lamps = ResourceDescriptorHeap[LampsUAVIdx];
+    LampState lamp = lamps[slot];
+    return lamp.Seen != 0 ? lamp.Lamp : frame.Lamps;
+}
+
 // A light in view and its importance: steady brightness × its on-screen radius² (the size of its pool of light).
-// r.Intensity comes back scaled by the lamps for a light marked OnlyWhenDark; one that is out is not in view.
+// r.Intensity comes back scaled by its lamp for a light marked OnlyWhenDark; one that is out is not in view.
 // From the light's steady position, so flicker does not move it across a band and make it blink.
 bool CullLight(uint slot, PointLightFrame frame, out PointLightRecord r, out float3 world, out float importance)
 {
@@ -41,7 +54,7 @@ bool CullLight(uint slot, PointLightFrame frame, out PointLightRecord r, out flo
     world = 0;
     importance = 0;
     if ((r.Flags & POINT_LIGHT_WHEN_DARK) != 0)
-        r.Intensity *= frame.Lamps;     // street lamps: out by day, fading with the lamps at dusk and dawn
+        r.Intensity *= LampAt(slot, frame);   // street lamps out by day, a lamp in a dark room lit; fading at the switch
     if ((r.Flags & POINT_LIGHT_ENABLED) == 0 || r.Range <= 0.0 || r.Intensity <= 0.0)
         return false;
 

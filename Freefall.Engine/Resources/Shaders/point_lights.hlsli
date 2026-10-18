@@ -1,12 +1,15 @@
 // Point lights on the GPU (PointLightBuffer.cs): the persistent registry the CPU writes only when a light
 // changes, and the visible list the cull builds from it every frame (point_light_cull.hlsl), which the tiled
-// lighting (light_point_cs.hlsl) and the shadow selection (local_shadow_select.hlsl) read.
+// lighting (light_point_cs.hlsl) and the shadow selection (local_shadow_select.hlsl) read. Lamps (OnlyWhenDark)
+// are lit by the daylight where each one hangs (point_light_lamps.hlsl).
 #ifndef POINT_LIGHTS_HLSLI
 #define POINT_LIGHTS_HLSLI
 
 #define POINT_LIGHT_ENABLED     1u      // PointLightRecord.Flags
-#define POINT_LIGHT_WHEN_DARK   2u      // PointLight.OnlyWhenDark: intensity × PointLightFrame.Lamps
+#define POINT_LIGHT_WHEN_DARK   2u      // PointLight.OnlyWhenDark: intensity × the light's LampState.Lamp
 #define MAX_VISIBLE_LIGHTS      4096u   // PointLightBuffer.MaxVisible
+#define LAMPS_ON_BELOW_LUX      1.0     // Daylight.LampsOnBelowLux: a lamp lights when the daylight where it hangs
+#define LAMPS_OFF_ABOVE_LUX     2.0     // falls below this, goes out above Daylight.LampsOffAboveLux
 #define VISIBLE_LIGHT_OCCLUDED  1u      // PointLightData.Flags: behind the Hi-Z (CSOccludeLights)
 #define POINT_LIGHT_NO_SHADOW   0xFFFFFFFFu
 
@@ -52,12 +55,23 @@ struct PointLightFrame
     uint ShadowBudget;                      // MaxShadowedPointLights
     uint Frame;                             // this renderer's frame count, from 1
     float Ambient;                          // lux from the whole sky on level ground
-    float Lamps;                            // Daylight.Lamps: 0 = street lamps out, 1 = lit
+    float Lamps;                            // Daylight.Lamps (open ground): for a lamp not judged yet (LampState.Seen 0)
     uint TerrainHeightmap;                  // sky_visibility.hlsli: the daylight a light competes with is the sky and
     float TerrainMaxHeight;                 // sun that reach it (a cave lamp in daytime gets its shadow); 0 = no terrain
     float3 TerrainOrigin;
     float2 TerrainSize;
-    float2 _pad;
+    float SunHeight;                        // sine of the sun's (moon's) elevation, 0 below the horizon: SunLight × it = level ground
+    float LampFadeStep;                     // lamp fade per frame (Δt / Daylight.LampFadeSeconds)
+};
+
+// Per registry slot, whether a light marked OnlyWhenDark is lit (point_light_lamps.hlsl, once per frame for every slot;
+// the cull reads it the frame after). Must match C# PointLightBuffer.LampState (16 bytes).
+struct LampState
+{
+    float Lamp;     // 0 = out, 1 = lit; in between while it fades
+    uint Lit;       // the hysteresis' side: on below LAMPS_ON_BELOW_LUX, out above LAMPS_OFF_ABOVE_LUX
+    uint Seen;      // Engine.TickCount it was last judged; 0 = never (the cull takes PointLightFrame.Lamps then)
+    float Lux;      // the daylight where it hangs, on level ground
 };
 
 // ── Flicker: value noise over an integer hash, no trig ───────────────────────

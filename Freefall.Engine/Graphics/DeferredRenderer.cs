@@ -691,6 +691,12 @@ namespace Freefall.Graphics
                  list.RSSetScissorRect(scissor);
              }
 
+             // 2d. Lamps: whether each light marked OnlyWhenDark is lit, by the daylight where it hangs past the terrain
+             //     and the meshes (point_light_lamps.hlsl); after the captures it reads, for next frame's cull. Once per
+             //     frame for all renderers.
+             if (_pointLightsCulled)
+                 PointLightBuffer.Instance?.UpdateLamps(list, _lightFrameParams![Engine.FrameIndex % FrameCount].SrvIndex);
+
              // 3. Sky pass
              using (_skyMarker.Auto())
              {
@@ -899,6 +905,8 @@ namespace Freefall.Graphics
 
              list.SetComputeRootSignature(Engine.Device.GlobalRootSignature);
              list.SetDescriptorHeaps(1, new[] { Engine.Device.SrvHeap });
+             // Lamps (OnlyWhenDark) as lit as the daylight where each hangs let them, judged last frame (2d)
+             _lightCullCS.SetPushConstant("LampsUAV", registry.LampStatesUav(list));
              _visibleLightCount.ClearUAV(list, new Vortice.Mathematics.Int4(0, 0, 0, 0));
              _lightImportance.ClearUAV(list, new Vortice.Mathematics.Int4(0, 0, 0, 0));
              list.Barriers(
@@ -952,6 +960,8 @@ namespace Freefall.Graphics
                  TerrainMaxHeight = terrain.MaxHeight,
                  TerrainOrigin = terrain.Origin,
                  TerrainSize = terrain.Size,
+                 SunHeight = Daylight.SunHeight(),
+                 LampFadeStep = Math.Clamp(Time.Delta, 0f, 0.1f) / Daylight.LampFadeSeconds,
              };
         }
 

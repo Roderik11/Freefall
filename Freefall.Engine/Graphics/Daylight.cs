@@ -6,14 +6,17 @@ using Freefall.Components;
 namespace Freefall.Graphics
 {
     /// <summary>
-    /// How much daylight reaches the ground, and whether lamps are lit. Lights marked PointLight.OnlyWhenDark and
-    /// materials marked EmissiveWhenDark follow <see cref="Lamps"/>: lit when the illuminance on level ground
-    /// (<see cref="GroundIlluminance"/>, lux: the sun or moon through the air and the clouds' average shade, plus the
-    /// sky) falls below <see cref="LampsOnBelowLux"/>, out again above <see cref="LampsOffAboveLux"/>, so a cloud
-    /// passing at the mark does not blink them. Clear Day (SunAzimuth 161.2, Day 1): noon ~50000 lux, 18:00 ~940,
-    /// 18:20 ~50, 18:35 ~1.5 (lamps on), 18:45 ~0.06, 19:00 ~0.001 (no moon up); a thunderstorm noon is still thousands
-    /// of lux, so storms by day do not light the lamps. The point light shadow selection weighs a light's lux against
-    /// the daylight's (<see cref="SunIlluminance"/>, <see cref="SkyIlluminance"/>, local_shadow_select.hlsl).
+    /// How much daylight reaches the ground, and whether lamps are lit. <see cref="Lamps"/> is the open ground's: lit when
+    /// the illuminance on level ground (<see cref="GroundIlluminance"/>, lux: the sun or moon through the air and the
+    /// clouds' average shade, plus the sky) falls below <see cref="LampsOnBelowLux"/>, out again above
+    /// <see cref="LampsOffAboveLux"/>, so a cloud passing at the mark does not blink them. Materials marked
+    /// EmissiveWhenDark follow it. Lights marked PointLight.OnlyWhenDark use the same thresholds on the daylight where
+    /// each one hangs, past the terrain and the meshes round it (point_light_lamps.hlsl): a lamp in a closed room or a
+    /// cave is lit at noon; <see cref="Lamps"/> stands in for one not judged yet. Clear Day (SunAzimuth 161.2, Day 1):
+    /// noon ~50000 lux, 18:00 ~940, 18:20 ~50, 18:35 ~1.5 (lamps on), 18:45 ~0.06, 19:00 ~0.001 (no moon up); a
+    /// thunderstorm noon is still thousands of lux, so storms by day do not light the lamps. The point light shadow
+    /// selection weighs a light's lux against the daylight's (<see cref="SunIlluminance"/>, <see cref="SkyIlluminance"/>,
+    /// local_shadow_select.hlsl).
     /// </summary>
     public static class Daylight
     {
@@ -21,7 +24,7 @@ namespace Freefall.Graphics
         public const float LampsOffAboveLux = 2f;
         public const float LampFadeSeconds = 1.5f;
 
-        /// <summary>0 = lamps out, 1 = lit; in between while they fade. 1 until a sky updates it.</summary>
+        /// <summary>The open ground's lamps: 0 = out, 1 = lit; in between while they fade. 1 until a sky updates it.</summary>
         public static float Lamps { get; private set; } = 1f;
 
         /// <summary>Raised when <see cref="Lamps"/> changes: once per frame while lamps fade, never otherwise.</summary>
@@ -66,14 +69,21 @@ namespace Freefall.Graphics
         {
             if (ComponentCache<SkyboxRenderer>.All.Count == 0)
                 return 0f;
-            float height = 0f;
+            return SunIlluminance() * SunHeight() + SkyIlluminance();
+        }
+
+        /// <summary>
+        /// Sine of the directional light's elevation (0 below the horizon): <see cref="SunIlluminance"/> × it is the sun's
+        /// (or moon's) lux on level ground. 0 without an enabled directional light.
+        /// </summary>
+        public static float SunHeight()
+        {
             foreach (var sun in ComponentCache<DirectionalLight>.All)
             {
                 if (!sun.Enabled) continue;
-                height = MathF.Max(-sun.Transform.Forward.Y, 0f);   // Forward points from the light to the ground
-                break;
+                return MathF.Max(-sun.Transform.Forward.Y, 0f);   // Forward points from the light to the ground
             }
-            return SunIlluminance() * height + SkyIlluminance();
+            return 0f;
         }
 
         /// <summary>

@@ -118,6 +118,9 @@ namespace Freefall.Editor.Commands
                 particlePoolSlots = Freefall.Base.Systems.Get<ParticleSystem>()?.PoolSlots ?? 0,
                 // Point light shadows, per renderer: the lights picked last frame, their tile size, faces and fade
                 pointShadows = Freefall.Graphics.LocalShadows.DescribeAll(),
+                // Lamps (PointLight.OnlyWhenDark): how many are lit, the share of the open ground's daylight that reaches
+                // them, those lit while the open ground's lamps are out (rooms, caves)
+                lamps = Freefall.Graphics.PointLightBuffer.Instance?.DescribeLamps(),
                 // Sun cascades: entries whose caster shades no visible receiver (EngineSettings.ShadowReceiverCulling)
                 sunShadowReceivers = Freefall.Graphics.ShadowReceivers.DescribeAll(),
                 // Sky captures (sky visibility past the meshes): their centre, groups still due, groups drawn

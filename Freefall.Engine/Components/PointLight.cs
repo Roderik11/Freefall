@@ -75,8 +75,9 @@ namespace Freefall.Components
             set { if (_flickerSpeed == value) return; _flickerSpeed = value; Changed(); }
         }
 
-        [System.ComponentModel.Description("Lit only when it is dark (Daylight.Lamps): at night, in a thunderstorm, on an " +
-                                           "overcast dusk. Street lamps and lanterns; lights indoors stay on.")]
+        [System.ComponentModel.Description("Lit only when it is dark where it hangs: at night and at dusk, and by day in a " +
+                                           "closed room or a cave that daylight does not reach. Street lamps, lanterns, " +
+                                           "lamps in houses.")]
         public bool OnlyWhenDark
         {
             get => _onlyWhenDark;
