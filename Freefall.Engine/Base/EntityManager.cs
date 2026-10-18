@@ -59,6 +59,7 @@ namespace Freefall.Base
                 }
             }
             Graphics.AutoExposure.Snap();     // the next scene starts at its own exposure, not a fade from this one
+            Graphics.SkyCapture.Invalidate(); // and its sky captures are drawn anew
         }
 
         public static void Update()

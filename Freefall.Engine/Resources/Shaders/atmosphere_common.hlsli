@@ -43,7 +43,8 @@ struct AtmosphereParams
     uint TransmittanceLut;      uint MultiScatLut;         uint SkyViewSunLut;     uint SkyViewMoonLut;
     uint AerialPerspective;     uint Ambient;              uint TerrainHeightmap;  float TerrainMaxHeight;   // sky visibility: the terrain's baked heightmap (R16, 0 = none); metres at 1
     float3 TerrainOrigin;       float TerrainSizeX;        // world position of the terrain's corner (y = its base); metres it spans in x
-    float TerrainSizeZ;         float3 _pad1;
+    float TerrainSizeZ;         uint SkyCaptureViews;      uint SkyCaptureDepth;   uint SkyCaptureCount;     // sky visibility past the meshes (sky_capture.hlsli; 0 = none)
+    float SkyCaptureBounce;     float3 _pad1;              // the least share of the sky a place the meshes cover keeps (light bouncing in)
 };
 
 // The global root signature's linear clamp sampler (s2)

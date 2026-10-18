@@ -493,8 +493,10 @@ PSOutput PS(DSOutput input)
     OceanData ocean = oceanData[input.InstanceIdx];
 
     float3 worldPos = input.WorldPos;
-    // How much sky this pixel of sea sees past the terrain (per pixel, as water.fx: per vertex, corners on land darkened the coast)
-    float skyVisible = SkyVisibility(worldPos, float3(0, 1, 0));
+    // How much sky this pixel of sea sees past the terrain (per pixel, as water.fx: per vertex, corners on land darkened the coast).
+    // The terrain only: the sky captures' 16 lookups per pixel cost 0.29 ms where the sea fills the view (the coast),
+    // and over open water little but a pier stands in the sky's way
+    float skyVisible = SkyVisibilityWith(worldPos, float3(0, 1, 0), 1.0);
     float3 V = normalize(camPos - worldPos);
     float dist = distance(worldPos, camPos);
 

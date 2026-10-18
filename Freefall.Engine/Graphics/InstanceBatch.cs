@@ -1226,9 +1226,11 @@ namespace Freefall.Graphics
         /// visibility (union) and a cascade mask per instance, one compaction runs on the union, CSExpandCascades
         /// expands it by the masks, and the non-empty commands are packed into each batch's opaque command buffer.
         /// </summary>
-        /// <param name="minCasterClip">Cascades 1+: smallest caster diameter in clip units (EngineSettings.ShadowMinCasterTexels * 2 / resolution; 0 = off).</param>
+        /// <param name="minCasterClip">Cascades 1+: smallest caster diameter in clip units (EngineSettings.ShadowMinCasterTexels * 2 / resolution; 0 = off; negative: -minCasterClip for all four views).</param>
+        /// <param name="receiversUav">The receiver tiles to test casters against (ShadowReceivers; 0 = none); null = the sun's this frame.</param>
         public static void CullShadowAll(ID3D12GraphicsCommandList list, IReadOnlyList<InstanceBatch> batches,
-            uint cascadeBufferSrv, ulong cascadeBufferGpuAddress, uint shadowHiZSrv, GPUCuller? culler, float minCasterClip = 0f)
+            uint cascadeBufferSrv, ulong cascadeBufferGpuAddress, uint shadowHiZSrv, GPUCuller? culler, float minCasterClip = 0f,
+            uint? receiversUav = null)
         {
             if (culler?.VisibilityShadow4PSO == null || culler.MainPSO == null || culler.HistogramPSO == null) return;
 
@@ -1242,8 +1244,9 @@ namespace Freefall.Graphics
             // Root signature requires all CBV slots bound (the kernels read the cascades from the SRV)
             list.SetComputeRootConstantBufferView(2, cascadeBufferGpuAddress);
 
+            uint receivers = receiversUav ?? DirectionalLight.CurrentShadowReceiversUav;
             foreach (var batch in _stageBatches)
-                batch.PrepareCullShadow(list, cascadeBufferSrv, shadowHiZSrv, minCasterClip);
+                batch.PrepareCullShadow(list, cascadeBufferSrv, shadowHiZSrv, minCasterClip, receivers);
             StageBarrier(list);
 
             // Combined flag + cascade mask per instance
@@ -1294,7 +1297,8 @@ namespace Freefall.Graphics
 
         // Constants and clears of this batch's cascade culling. The draw count is cleared
         // here already: nothing touches it before the compaction at the end.
-        private void PrepareCullShadow(ID3D12GraphicsCommandList list, uint cascadeBufferSrv, uint shadowHiZSrv, float minCasterClip)
+        private void PrepareCullShadow(ID3D12GraphicsCommandList list, uint cascadeBufferSrv, uint shadowHiZSrv, float minCasterClip,
+            uint receiversUav)
         {
             InitializeShadowCullerResources();
             int f = Engine.FrameIndex % FrameCount;
@@ -1323,7 +1327,7 @@ namespace Freefall.Graphics
             c[31] = cascadeBufferSrv;                         // CascadeBufferSRVIdx
             // The camera's visibility pass left each instance's sphere and LOD part (0 = not this frame: gather them)
             c[38] = _boundsWritten ? instanceBoundsUAVIndices[f] : 0u;
-            c[39] = DirectionalLight.CurrentShadowReceiversUav;   // ShadowReceiversUAVIdx: the sun's receiver tiles (0 = none)
+            c[39] = receiversUav;                             // ShadowReceiversUAVIdx: the sun's receiver tiles (0 = none)
             WriteLodConstants(c);                             // main camera: shadows use the main view's LOD
             WritePerInstanceConstants(f);
 

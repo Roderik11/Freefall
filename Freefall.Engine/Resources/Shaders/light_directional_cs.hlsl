@@ -19,6 +19,7 @@ cbuffer PushConstants : register(b3)
     uint SSSTexIdx;
     uint SSDMTexIdx;
     uint GITexIdx;
+    uint SkyVisTexIdx;      // sky_visibility_cs.hlsl's result (0 = look it up here)
 };
 
 #include "common.fx"
@@ -361,9 +362,25 @@ void CSDirectionalLight(uint3 dispatchThreadId : SV_DispatchThreadID)
         lighting += (diffuse + spec) * radiance * ao * (1.0 - vegetation);
     }
     
-    // How much of the sky this surface sees past the terrain (sky_common.fx): it gates the shadow wrap below (light
-    // bounced in from the sunlit surroundings) and goes to the composition in alpha for the sky's ambient light
-    float skyVisibility = SkyVisibility(worldPos.xyz + CamPos, normal);
+    // How much of the sky this surface sees past the terrain and the meshes (sky_visibility_cs.hlsl, or sky_common.fx
+    // here): it gates the shadow wrap below (light bounced in from the sunlit surroundings) and goes to the composition
+    // in alpha for the sky's ambient light
+    float skyVisibility;
+    if (SkyVisTexIdx != 0)
+    {
+        Texture2D<float> SkyVisTex = ResourceDescriptorHeap[SkyVisTexIdx];
+        skyVisibility = SkyVisTex.Load(displaced_coord);
+    }
+    else
+        skyVisibility = SkyVisibility(worldPos.xyz + CamPos, normal);
+    // Debug views: the sky visibility (8), the meshes' part of it (9), a quarter of it (mid grey = the whole sky, so the
+    // tone mapping keeps the steps apart), black = none
+    if (DebugVisualizationMode == 8 || DebugVisualizationMode == 9)
+    {
+        float v = DebugVisualizationMode == 8 ? skyVisibility : MeshSkyVisibility(worldPos.xyz + CamPos, normal);
+        Output[px] = float4(v.xxx * 0.25, 0);
+        return;
+    }
 
     // Shadow wrap
     lighting += diffuse * LightColor * LightIntensity * NdotL * (1.0 - shadowFactor) * 0.12 * ao * skyVisibility;

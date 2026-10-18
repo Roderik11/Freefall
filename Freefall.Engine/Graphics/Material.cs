@@ -180,7 +180,23 @@ namespace Freefall.Graphics
         // Per-pass PSOs (Apex pattern for multi-pass rendering like shadow maps)
         private Dictionary<int, PipelineState> _passPipelineStates = new();
         private Dictionary<int, PipelineState> _passWireframePSOs = new();
+        // The Shadow pass drawn into the sky captures (SkyCapture.cs): the same shaders with a small, clamped slope bias.
+        // The shadows' bias (3 × the depth slope, unclamped) pushes a wall seen edge-on from a low sky direction metres
+        // back, and the room behind it would see the sky through it. Made on first use: only the batches' materials draw.
+        private Dictionary<int, GraphicsPipelineStateDescription> _passCaptureDescs = new();
+        private Dictionary<int, PipelineState> _passCapturePSOs = new();
         private bool _isFullscreenPass = false; // Skip wireframe for post-process passes
+
+        /// <summary>While set, <see cref="Apply(ID3D12GraphicsCommandList, GraphicsDevice, MaterialBlock?)"/> binds a
+        /// Shadow pass's sky capture variant (SkyCapture.Render sets it around its draws).</summary>
+        internal static bool SkyCaptureRaster;
+
+        private static readonly RasterizerDescription SkyCaptureRasterizer = new(CullMode.None, FillMode.Solid)
+        {
+            DepthBias = 0,
+            SlopeScaledDepthBias = 1.0f,
+            DepthBiasClamp = 0.0005f,   // of the capture's depth range (~300-450 m): at most ~0.2 m
+        };
         private Dictionary<string, ConstantBuffer> _constantBuffers = new();
         private Dictionary<string, Texture> _textures = new();
         private List<TextureEffectParameter> _textureParameters = new();
@@ -554,6 +570,8 @@ namespace Freefall.Graphics
             _constantBuffers.Clear();
             _passPipelineStates.Clear();
             _passWireframePSOs.Clear();
+            _passCaptureDescs.Clear();
+            _passCapturePSOs.Clear();
             _subShaders.Clear();
             _textureParameters.Clear();
             _textureSlots.Clear();
@@ -615,10 +633,13 @@ namespace Freefall.Graphics
             // is the device's shared GlobalRootSignature (disposing it crashes the next draw).
             foreach (var pso in _passPipelineStates.Values) device.DeferDispose(pso.Native);
             foreach (var pso in _passWireframePSOs.Values) device.DeferDispose(pso.Native);
+            foreach (var pso in _passCapturePSOs.Values) device.DeferDispose(pso.Native);
 
             _constantBuffers.Clear();
             _passPipelineStates.Clear();
             _passWireframePSOs.Clear();
+            _passCaptureDescs.Clear();
+            _passCapturePSOs.Clear();
             _subShaders.Clear();
             _textureParameters.Clear();
             _textureSlots.Clear();
@@ -994,7 +1015,32 @@ namespace Freefall.Graphics
                     psoDesc.BlendState = FitBlendToTargets(passBlendDesc, passRtvFormats, passWritten);
                     
                     _passPipelineStates[passIndex] = new PipelineState(device, rootSignature, psoDesc);
-                    
+
+                    // A new description, not a copy of psoDesc: Vortice's description is a class, and the wireframe
+                    // variant below rewrites psoDesc's rasterizer (a capture PSO made from it later drew in wireframe:
+                    // empty maps at 19 ms a group)
+                    if (passType == RenderPass.Shadow)
+                    {
+                        _passCaptureDescs[passIndex] = new GraphicsPipelineStateDescription
+                        {
+                            RootSignature = psoDesc.RootSignature,
+                            InputLayout = psoDesc.InputLayout,
+                            VertexShader = psoDesc.VertexShader,
+                            PixelShader = psoDesc.PixelShader,
+                            HullShader = psoDesc.HullShader,
+                            DomainShader = psoDesc.DomainShader,
+                            RasterizerState = SkyCaptureRasterizer,
+                            BlendState = psoDesc.BlendState,
+                            DepthStencilState = psoDesc.DepthStencilState,
+                            PrimitiveTopologyType = psoDesc.PrimitiveTopologyType,
+                            RenderTargetFormats = psoDesc.RenderTargetFormats,
+                            DepthStencilFormat = psoDesc.DepthStencilFormat,
+                            SampleDescription = psoDesc.SampleDescription,
+                            SampleMask = psoDesc.SampleMask,
+                            Flags = psoDesc.Flags,
+                        };
+                    }
+
                     psoDesc.RasterizerState = new RasterizerDescription(CullMode.None, FillMode.Wireframe);
                     _passWireframePSOs[passIndex] = new PipelineState(device, rootSignature, psoDesc);
                 }
@@ -1282,6 +1328,12 @@ namespace Freefall.Graphics
             if (Engine.Settings.Wireframe && !_isFullscreenPass && _passWireframePSOs.TryGetValue(Pass, out var wireframePso))
             {
                 pso = wireframePso;
+            }
+            if (SkyCaptureRaster && _passCaptureDescs.TryGetValue(Pass, out var captureDesc))
+            {
+                if (!_passCapturePSOs.TryGetValue(Pass, out var capturePso))
+                    _passCapturePSOs[Pass] = capturePso = new PipelineState(device, device.GlobalRootSignature, captureDesc);
+                pso = capturePso;
             }
             if (pso?.Native == null) return; // Device lost — PSO wasn't created
             commandList.SetPipelineState(pso.Native);

@@ -26,6 +26,14 @@ namespace Freefall.Graphics
         public DepthTexture2D Depth;
         
         public RenderTexture2D LightBuffer = null!;
+        /// <summary>How much of the sky each opaque pixel sees past the terrain and the meshes (sky_visibility_cs.hlsl),
+        /// R8; read by the directional light.</summary>
+        public RenderTexture2D SkyVisibilityTex = null!;
+        /// <summary>Its bindless SRV this frame, 0 when not drawn (the directional light then looks it up itself).</summary>
+        public uint SkyVisibilitySrv { get; private set; }
+        private ResourceStates _skyVisState = ResourceStates.Common;
+        private ComputeShader _skyVisCS = null!;
+        private int _kSkyVis;
         public RenderTexture2D Composite = null!;     // HDR intermediate (R16G16B16A16_Float)
         public RenderTexture2D LdrOutput = null!;     // Final tonemapped output (R8G8B8A8_UNorm)
         public RenderTexture2D? CompositeSnapshot;
@@ -179,6 +187,10 @@ namespace Freefall.Graphics
             DirectionalLightCS = new ComputeShader("light_directional_cs.hlsl");
             _kDirectionalLight = DirectionalLightCS.FindKernel("CSDirectionalLight");
 
+            // Sky visibility of the opaque surfaces (terrain + sky captures), for the directional light and composition
+            _skyVisCS = new ComputeShader("sky_visibility_cs.hlsl");
+            _kSkyVis = _skyVisCS.FindKernel("CSSkyVisibility");
+
             // Point lights: GPU cull of the registry, then tiled lighting on the visible list
             _pointLightCS = new ComputeShader("light_point_cs.hlsl");
             _kPointLight = _pointLightCS.FindKernel("CSPointLight");
@@ -261,6 +273,8 @@ namespace Freefall.Graphics
             Depth = new DepthTexture2D(width, height, Format.D32_Float, true);
 
             LightBuffer = new RenderTexture2D(Engine.Device, width, height, Format.R16G16B16A16_Float, randomWrite: true);
+            SkyVisibilityTex = new RenderTexture2D(Engine.Device, width, height, Format.R8_UNorm, randomWrite: true);
+            _skyVisState = ResourceStates.Common;
             Composite = new RenderTexture2D(Engine.Device, width, height, Format.R16G16B16A16_Float, randomWrite: true);
             LdrOutput = new RenderTexture2D(Engine.Device, width, height, Format.R8G8B8A8_UNorm, randomWrite: true);
         }
@@ -275,6 +289,7 @@ namespace Freefall.Graphics
             HeightBuffer?.Dispose();
             Depth?.Dispose();
             LightBuffer?.Dispose();
+            SkyVisibilityTex?.Dispose();
             Composite?.Dispose();
             LdrOutput?.Dispose();
 
@@ -666,6 +681,16 @@ namespace Freefall.Graphics
                  }
              }
 
+             // 2c. Sky captures: the meshes round the camera seen from directions of the sky, for the sky visibility
+             //     (sky_capture.hlsli). Four directions per frame while any is due; after the shadows, whose per-batch
+             //     culling buffers it reuses.
+             if (SkyCapture.Render(list, camera))
+             {
+                 list.OMSetRenderTargets(_cachedGBufferRtvHandles, Depth.DsvHandle);
+                 list.RSSetViewport(vp);
+                 list.RSSetScissorRect(scissor);
+             }
+
              // 3. Sky pass
              using (_skyMarker.Auto())
              {
@@ -795,6 +820,29 @@ namespace Freefall.Graphics
              // NOW transition LightBuffer to UAV for directional light (after RC has read it as SRV)
              var fromState = _isFirstFrame ? ResourceStates.Common : ResourceStates.PixelShaderResource;
              Transition(list, LightBuffer.Native, fromState, ResourceStates.UnorderedAccess);
+
+             // How much sky each opaque pixel sees past the terrain and the meshes, for the directional light below
+             SkyVisibilitySrv = 0;
+             if (Engine.Settings.SkyVisibility)
+             {
+                 PixMarker.Begin(list, "Sky visibility");
+                 if (_skyVisState != ResourceStates.UnorderedAccess)
+                     Transition(list, SkyVisibilityTex.Native, _skyVisState, ResourceStates.UnorderedAccess);
+                 var size = SkyVisibilityTex.Native.Description;
+                 _skyVisCS.SetPushConstant("NormalTex", Normals.BindlessIndex);
+                 _skyVisCS.SetPushConstant("DepthTex", Depth.BindlessIndex);
+                 _skyVisCS.SetPushConstant("OutputUAV", SkyVisibilityTex.UavIndex);
+                 _skyVisCS.SetPushConstant("ScreenWidth", (uint)size.Width);
+                 _skyVisCS.SetPushConstant("ScreenHeight", (uint)size.Height);
+                 list.SetComputeRootSignature(Engine.Device.GlobalRootSignature);
+                 list.SetDescriptorHeaps(1, new[] { Engine.Device.SrvHeap });
+                 BindSceneConstantsForCompute(list);
+                 _skyVisCS.Dispatch(_kSkyVis, list, ((uint)size.Width + 7) / 8, ((uint)size.Height + 7) / 8);
+                 Transition(list, SkyVisibilityTex.Native, ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource);
+                 _skyVisState = ResourceStates.NonPixelShaderResource;
+                 SkyVisibilitySrv = SkyVisibilityTex.BindlessIndex;
+                 PixMarker.End(list);
+             }
 
              // Execute custom Light actions (directional light compute dispatch writes to UAV)
              PixMarker.Begin(list, "Directional Light");
@@ -1439,6 +1487,7 @@ namespace Freefall.Graphics
             HeightBuffer?.Dispose();
             Depth?.Dispose();
             LightBuffer?.Dispose();
+            SkyVisibilityTex?.Dispose();
             Composite?.Dispose();
             CompositeSnapshot?.Dispose();
 

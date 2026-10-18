@@ -435,14 +435,16 @@ bool IsOccluded(float3 worldCenter, float worldRadius)
 // Whether a caster is big enough to draw into a cascade: its bounding sphere's diameter covers at least
 // ShadowMinCasterClip of the cascade's clip space (EngineSettings.ShadowMinCasterTexels * 2 / resolution).
 // Used for the cascades after the first: a small thing far out shades a texel or two, which screen-space
-// shadows already give it.
+// shadows already give it. Negative: the same test with -ShadowMinCasterClip for all four views (the sky captures,
+// SkyCapture.cs, whose four views are alike).
 bool CoversShadowTexels(float worldRadius, uint cascadeIndex)
 {
-    if (ShadowMinCasterClip <= 0.0) return true;
+    float minClip = abs(ShadowMinCasterClip);
+    if (minClip <= 0.0) return true;
     StructuredBuffer<CascadeData> cascades = ResourceDescriptorHeap[CascadeBufferSRVIdx];
     row_major float4x4 vp = cascades[cascadeIndex].VP;
     float clipPerMetre = length(float3(vp._11, vp._21, vp._31)); // orthographic: the same for every point
-    return 2.0 * worldRadius * clipPerMetre >= ShadowMinCasterClip;
+    return 2.0 * worldRadius * clipPerMetre >= minClip;
 }
 
 bool IsVisibleShadow(float3 center, float radius, uint cascadeIndex)
@@ -1293,7 +1295,8 @@ void CSVisibilityShadow4(uint3 dispatchThreadId : SV_DispatchThreadID)
     }
 
     // Test all cascade frustums + shadow Hi-Z occlusion; past the first cascade, small casters are left out
-    bool vis0 = IsVisibleShadow(worldCenter, worldRadius, 0) && !IsOccludedShadow(worldCenter, worldRadius, 0);
+    bool vis0 = (ShadowMinCasterClip >= 0.0 || CoversShadowTexels(worldRadius, 0))
+        && IsVisibleShadow(worldCenter, worldRadius, 0) && !IsOccludedShadow(worldCenter, worldRadius, 0);
     bool vis1 = CoversShadowTexels(worldRadius, 1) && IsVisibleShadow(worldCenter, worldRadius, 1) && !IsOccludedShadow(worldCenter, worldRadius, 1);
     bool vis2 = CoversShadowTexels(worldRadius, 2) && IsVisibleShadow(worldCenter, worldRadius, 2) && !IsOccludedShadow(worldCenter, worldRadius, 2);
     bool vis3 = CoversShadowTexels(worldRadius, 3) && IsVisibleShadow(worldCenter, worldRadius, 3) && !IsOccludedShadow(worldCenter, worldRadius, 3);

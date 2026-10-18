@@ -340,7 +340,7 @@ namespace Freefall
             // F6: Cycle debug visualization mode
             if (Input.IsKeyPressed(Keys.F6))
             {
-                Settings.DebugVisualizationMode = (DebugVizMode)(((int)Settings.DebugVisualizationMode + 1) % 8);
+                Settings.DebugVisualizationMode = (DebugVizMode)(((int)Settings.DebugVisualizationMode + 1) % 10);
                 Debug.Log($"[Engine] Debug Viz: {Settings.DebugVisualizationMode}");
             }
             
@@ -458,7 +458,9 @@ namespace Freefall
         LinearDepth = 4,
         DecoControlMap = 5,
         HeightMap = 6,
-        RCDebug = 7
+        RCDebug = 7,
+        SkyVisibility = 8,          // light_directional_cs: the sky's share a surface sees past terrain and meshes
+        MeshSkyVisibility = 9       // the meshes' part of it alone (SkyCapture)
     }
 
     /// <summary>EngineSettings.ShadowReceiverCulling</summary>
@@ -589,6 +591,14 @@ namespace Freefall
          // hill gets none: sky_common.fx SkyVisibility). Off: every surface gets the whole sky (before stage 4).
          [Category("Ambient")]
          public bool SkyVisibility { get; set; } = true;
+         // With SkyVisibility: the meshes round the camera shade the sky too (walls, roofs, tree crowns; a room is lit
+         // only through its door and windows), from depth maps drawn from 16 directions of the sky (SkyCapture).
+         // Off: only the terrain shades it.
+         public bool SkyCaptures { get; set; } = true;
+         // With SkyCaptures: the least share of the sky's ambient light a place the meshes cover keeps, a stand-in for
+         // daylight bouncing in through doors and windows (a room without a lamp was black at noon). Caves under the
+         // terrain do not get it.
+         public float SkyCaptureBounce { get; set; } = 0.04f;
 
          [Category("Exposure")]
          public bool AutoExposure { get; set; } = true;

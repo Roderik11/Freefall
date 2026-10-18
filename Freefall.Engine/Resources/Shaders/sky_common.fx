@@ -12,6 +12,7 @@
 
 #include "atmosphere_common.hlsli"
 #include "sky_visibility.hlsli"
+#include "sky_capture.hlsli"
 
 // Direction toward the sun (the true sun, also below the horizon), for passes that need its place in the sky
 float3 AtmSunDirection()
@@ -75,10 +76,35 @@ float TerrainOpen(float3 worldPos, float3 N)
     return TerrainOpenAt(LoadTerrainCover(), AtmosphereLinearClamp, worldPos, N, TerrainTolerance(distance(worldPos, CamPos)));
 }
 
-// How much of the sky's light reaches a surface past the terrain, 0..1 (sky_visibility.hlsli). worldPos is absolute.
+// How much of the sky's light reaches a surface past the meshes around the camera (walls, roofs, tree crowns, the cave
+// kit), 0..1 (sky_capture.hlsli; 1 without captures). worldPos is absolute.
+float MeshSkyVisibility(float3 worldPos, float3 N)
+{
+    if (AtmosphereIdx == 0)
+        return 1;
+    AtmosphereParams A = LoadAtmosphere();
+    return MeshSkyVisibilityAt(A.SkyCaptureViews, A.SkyCaptureDepth, A.SkyCaptureCount, AtmosphereLinearClamp, worldPos, N);
+}
+
+// How much of the sky's light reaches a surface past the terrain and the meshes, 0..1, given the meshes' part. In the
+// open the meshes take their share of what the terrain's horizons leave, but never less than SkyCaptureBounce: a stand-in
+// for daylight bouncing in through doors and windows, which the 16 directions mostly miss (a room without a lamp was
+// black at noon, user 2026-10-18). Under the terrain both judge the same rock (the portal light through a cave mouth,
+// the cave kit in the captures): the smaller wins, and a cave stays black.
+float SkyVisibilityWith(float3 worldPos, float3 N, float meshes)
+{
+    float open, portal;
+    float sky = SkyVisibilityParts(LoadTerrainCover(), AtmosphereLinearClamp, worldPos, N,
+        TerrainTolerance(distance(worldPos, CamPos)), open, portal);
+    float bounce = AtmosphereIdx != 0 ? LoadAtmosphere().SkyCaptureBounce : 0.0;
+    return lerp(min(portal, meshes), sky * max(meshes, bounce), open);
+}
+
+// The same, the meshes' part looked up here. worldPos is absolute. The opaque surfaces have theirs from
+// sky_visibility_cs.hlsl (the light buffer's alpha), cheaper per pixel.
 float SkyVisibility(float3 worldPos, float3 N)
 {
-    return SkyVisibilityAt(LoadTerrainCover(), AtmosphereLinearClamp, worldPos, N, TerrainTolerance(distance(worldPos, CamPos)));
+    return SkyVisibilityWith(worldPos, N, MeshSkyVisibility(worldPos, N));
 }
 
 // Light on a lit particle or ribbon (smoke, rain, snow, a blade's trail) at the camera's height, as a multiple of its

@@ -56,15 +56,19 @@ float TerrainOpenAt(TerrainCover t, SamplerState linearClamp, float3 worldPos, f
 // cos²h = 1 / (1 + tan²h). A cave under a hill sees none of it (the heightmap keeps the hill's surface over a terrain
 // hole), a valley less of it, open ground all of it. Under the surface there is rock straight above: the open factor
 // takes the rest (the horizons alone left a sliver of zenith, an 87° horizon passes 0.3 % of the sky, which the auto
-// exposure lifted to a lit grey cave). worldPos is absolute. Roofs and tree crowns are not in the terrain: they come
-// with a mesh height capture.
-float SkyVisibilityAt(TerrainCover t, SamplerState linearClamp, float3 worldPos, float3 N, float tolerance)
+// exposure lifted to a lit grey cave). worldPos is absolute. Walls, roofs and tree crowns are not in the terrain: the
+// sky captures add them (sky_capture.hlsli, sky_common.fx SkyVisibility).
+// Returns the sky in the open; open = 1 in the open, 0 under the terrain; portal = the daylight under the terrain.
+float SkyVisibilityParts(TerrainCover t, SamplerState linearClamp, float3 worldPos, float3 N, float tolerance,
+    out float open, out float portal)
 {
+    open = 1;
+    portal = 0;
     if (t.Heightmap == 0)
         return 1;
     float under;
     float3 p = SkyLookPoint(t, linearClamp, worldPos, N, tolerance, under);
-    float open = 1.0 - smoothstep(tolerance, tolerance + 4.0, under);
+    open = 1.0 - smoothstep(tolerance, tolerance + 4.0, under);
 
     // In the open: the terrain's horizons
     float sky = 0;
@@ -87,7 +91,6 @@ float SkyVisibilityAt(TerrainCover t, SamplerState linearClamp, float3 worldPos,
     // within 32 m where the ground is lower than the point. The opening passes about a third of that direction's sky,
     // falling off with the distance to it like light down a 4 m tunnel; past 32 m of rock the cave is dark. Without
     // this a cave mouth was a black hole from outside, and from inside the walls by the exit stayed unlit.
-    float portal = 0;
     if (open < 1.0)
     {
         static const float steps[5] = { 2.0, 4.0, 8.0, 16.0, 32.0 };
@@ -105,6 +108,13 @@ float SkyVisibilityAt(TerrainCover t, SamplerState linearClamp, float3 worldPos,
         }
         portal *= 0.125 * 0.35;
     }
+    return sky;
+}
+
+float SkyVisibilityAt(TerrainCover t, SamplerState linearClamp, float3 worldPos, float3 N, float tolerance)
+{
+    float open, portal;
+    float sky = SkyVisibilityParts(t, linearClamp, worldPos, N, tolerance, open, portal);
     return lerp(portal, sky, open);
 }
 

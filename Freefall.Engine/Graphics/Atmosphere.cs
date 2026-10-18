@@ -219,7 +219,8 @@ namespace Freefall.Graphics
             public uint TransmittanceLut, MultiScatLut, SkyViewSunLut, SkyViewMoonLut;
             public uint AerialPerspective, Ambient, TerrainHeightmap; public float TerrainMaxHeight;
             public Vector3 TerrainOrigin; public float TerrainSizeX;
-            public float TerrainSizeZ; public Vector3 _pad1;
+            public float TerrainSizeZ; public uint SkyCaptureViews, SkyCaptureDepth, SkyCaptureCount;
+            public float SkyCaptureBounce; public Vector3 _pad1;
 
             /// <summary>The part the transmittance and multiple scattering LUTs depend on</summary>
             public bool SameMedium(in GpuParams o) =>
@@ -349,6 +350,9 @@ namespace Freefall.Graphics
                 _frame.TerrainSizeZ = terrain.Terrain.TerrainSize.Y;
                 break;
             }
+            // ... and the meshes round the camera: walls, roofs, tree crowns (SkyCapture, sky_capture.hlsli)
+            (_frame.SkyCaptureViews, _frame.SkyCaptureDepth, _frame.SkyCaptureCount) = SkyCapture.PrepareFrame(slot);
+            _frame.SkyCaptureBounce = Math.Clamp(Engine.Settings.SkyCaptureBounce, 0f, 1f);
             unsafe { *_params[slot]!.WritePtr<GpuParams>() = _frame; }
             return _params[slot]!.SrvIndex;
         }
