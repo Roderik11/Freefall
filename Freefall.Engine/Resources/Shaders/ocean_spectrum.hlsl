@@ -316,7 +316,11 @@ void CSEvolveSpectrum(uint3 id : SV_DispatchThreadID)
         float w_0 = 2.0f * PI / oc.RepeatTime;
         float dispersion = floor(Dispersion(kMag, oc.Gravity, oc.Depth) / w_0) * w_0 * oc.FrameTime;
 
-        float2 exponent = EulerFormula(dispersion);
+        // h(k,t) = h0(k)·e^{−iωt} + conj(h0(−k))·e^{+iωt}: with the inverse FFT's e^{+ik·x} both terms travel along the
+        // spectrum's heading (the layer's angle: downwind). Until 2026-10-19 the signs were the other way round and every
+        // sea ran against its heading: the wind sea upwind (measured with the wind toward 0°/112°/180°/292°: crests came
+        // at a camera looking downwind), and Eldermoor's swell, authored at 22°, toward 202°
+        float2 exponent = EulerFormula(-dispersion);
         float2 htilde = ComplexMult(h0, exponent) + ComplexMult(h0conj, float2(exponent.x, -exponent.y));
         float2 ih = float2(-htilde.y, htilde.x);
 
