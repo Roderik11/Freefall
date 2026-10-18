@@ -33,6 +33,7 @@ cbuffer ObjectConstants : register(b1)
     float4 MoonDirSize[4];       // xyz: direction to the moon, w: angular radius (radians)
     float4 MoonColor[4];         // rgb: cd/m² of the surface where the sun shines straight on it, per unit of relative albedo
     uint4 MoonTextures;          // bindless surface texture per moon, 0 = a plain disc
+    uint4 MoonNormals;           // bindless tangent-space normal map per moon (red east, green up on the disc), 0 = smooth
     // Star sphere (SkyboxRenderer): turns with the time of day round the sun path's pole
     row_major float4x4 StarRotation;   // world direction → direction on the star sphere
     float3 GalaxyPole;           // normal of the Milky Way's plane on the star sphere
@@ -170,11 +171,17 @@ float3 NightSky(float3 viewDir, float pixelAngle)
     return (stars * StarBrightness + milky) / 0.0065;
 }
 
-// The moons, each a sphere lit by the sun (so its phase shows) with an optional surface texture, and the stars
-// wherever no moon covers them. In cd/m² before the air in front: the atmosphere lies in front of the moons.
-float3 MoonsAndStars(float3 viewDir, float3 sunDir, float3 stars)
+// How far a moon's disc follows the camera's exposure: 0 = fully (physical: at a night exposure a full moon is ~10⁵
+// times the moonlit land and clipped to a white disc, its face and phase gone), 1 = not at all (shown as at a sunny
+// noon: a dim grey disc at night). Halfway, a full moon at night lands bright but whole (~1.6 in the frame at EV −1).
+#define MOON_ADAPTATION 0.55
+
+// The moons, each a sphere lit by the sun (so its phase shows) with an optional surface texture and relief, and the
+// stars wherever no moon covers them. In cd/m² before the air in front (the atmosphere lies in front of the moons):
+// the moons are returned in `moons`, ready for MoonExposure(), the stars (× what the moons leave of them) as the result.
+float3 MoonsAndStars(float3 viewDir, float3 sunDir, float3 stars, out float3 moons)
 {
-    float3 moons = 0;
+    moons = 0;
     float starsVisible = 1;
     for (uint m = 0; m < MoonCount; m++)
     {
@@ -195,6 +202,17 @@ float3 MoonsAndStars(float3 viewDir, float3 sunDir, float3 stars)
 
         // The sphere's normal here faces back towards the viewer
         float3 n = p.x * right + p.y * up - sqrt(saturate(1 - r * r)) * md;
+
+        // Relief: the normal map tilts it in the sphere's own tangent frame (east along the disc's x, north along its y)
+        uint normalTex = MoonNormals[m];
+        if (normalTex != 0)
+        {
+            Texture2D relief = ResourceDescriptorHeap[normalTex];
+            float2 t = relief.SampleGrad(linearWrap, saturate(uv), uvDx, uvDy).rg * 2.0 - 1.0;   // BC5: blue rebuilt
+            float3 east = normalize(right - dot(right, n) * n);
+            float3 north = cross(east, n);    // at the disc's centre: the disc's up
+            n = normalize(east * t.x + north * t.y + n * max(sqrt(saturate(1 - dot(t, t))), 0.05));
+        }
         float lit = saturate(dot(n, sunDir));
 
         // Relative albedo: the texture against a mean of 0.5 (a plain disc is 1)
@@ -205,12 +223,22 @@ float3 MoonsAndStars(float3 viewDir, float3 sunDir, float3 stars)
             Texture2D surface = ResourceDescriptorHeap[tex];
             albedo = surface.SampleGrad(linearWrap, saturate(uv), uvDx, uvDy).rgb * 2.0;
         }
-        float3 moon = albedo * MoonColor[m].rgb * (lit + 0.01);   // 0.01: earthshine, the dark side is not black
+        // Earthshine: the dark side lit by the world, which shows the moon the rest of the phase (full behind a
+        // crescent moon, none behind a full one)
+        float earthshine = 0.01 * 0.5 * (1 + dot(md, sunDir));
+        float3 moon = albedo * MoonColor[m].rgb * (lit + earthshine);
 
         moons = lerp(moons, moon, cover);
         starsVisible *= 1 - cover;
     }
-    return moons + stars * starsVisible;
+    return stars * starsVisible;
+}
+
+// A moon's pre-exposure: Exposure^(1 − MOON_ADAPTATION) × the noon reference's^MOON_ADAPTATION (Exposure / SunLightScale
+// is the reference exposure, Atmosphere.ReferenceEV), as EmissiveExposure does for flames with its own weight
+float MoonExposure()
+{
+    return Exposure * pow(max(SunLightScale, 1e-20), -MOON_ADAPTATION);
 }
 
 // The sun's disc (cd/m²): its illuminance spread over the disc's solid angle, darker toward the limb (Hillaire's
@@ -319,7 +347,9 @@ FragmentOutput PS_Procedural(VertexOutput input)
         if (!hitsGround && brightest > 1e-3 * dot(skyColor, float3(0.2126, 0.7152, 0.0722)))
             stars = NightSky(viewDir, pixelAngle) * A.AirglowLuminance;
 
-        behindClouds = sun + MoonsAndStars(viewDir, sunDir, stars) * viewT * Exposure;
+        float3 moons;
+        float3 starsLeft = MoonsAndStars(viewDir, sunDir, stars, moons);
+        behindClouds = sun + (starsLeft * Exposure + moons * MoonExposure()) * viewT;
     }
 
     // The cloud layer over the sky's light (sky_common.fx)

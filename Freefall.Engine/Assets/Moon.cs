@@ -44,6 +44,9 @@ namespace Freefall.Assets
         [Description("Surface of the full disc as seen from the ground; empty = a plain grey disc")]
         public Texture Texture;
 
+        [Description("Relief of the disc, a tangent-space normal map in the same view as Texture (red = east, green = up on the disc): craters and maria catch the light along the line between day and night; empty = a smooth sphere")]
+        public Texture NormalMap;
+
         [Description("Apparent diameter in degrees (our moon: 0.5)")]
         [ValueRange(0.2f, 20f)]
         public float Size = 3f;

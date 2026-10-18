@@ -178,6 +178,7 @@ namespace Freefall.Components
         private readonly Vector4[] _moonDirSize = new Vector4[MaxMoons];
         private readonly Vector4[] _moonColor = new Vector4[MaxMoons];
         private Int4 _moonTextures;
+        private Int4 _moonNormals;
         private int _moonCount;
 
         private int _lightSource = -1;      // -1 = the sun, else an index into _moonLights
@@ -384,6 +385,7 @@ namespace Freefall.Components
         {
             _moonCount = 0;
             Span<int> textures = stackalloc int[MaxMoons];
+            Span<int> normals = stackalloc int[MaxMoons];
             double days = Day + TimeOfDay / 24.0;
             foreach (var moon in Moons)
             {
@@ -412,8 +414,10 @@ namespace Freefall.Components
                 _moonDirSize[i] = new Vector4(dir, radius);
                 _moonColor[i] = new Vector4(moon.Tint.R, moon.Tint.G, moon.Tint.B, 0f) * (moon.Brightness * fullLuminance);
                 textures[i] = (int)(moon.Texture?.BindlessIndex ?? 0u);
+                normals[i] = (int)(moon.NormalMap?.BindlessIndex ?? 0u);
             }
             _moonTextures = new Int4(textures[0], textures[1], textures[2], textures[3]);
+            _moonNormals = new Int4(normals[0], normals[1], normals[2], normals[3]);
         }
 
         /// <summary>
@@ -565,6 +569,7 @@ namespace Freefall.Components
             Material.SetParameter("MoonDirSize", _moonDirSize);
             Material.SetParameter("MoonColor", _moonColor);
             Material.SetParameter("MoonTextures", _moonTextures);
+            Material.SetParameter("MoonNormals", _moonNormals);
             Material.SetParameter("MoonCount", (uint)_moonCount);
             Material.SetParameter("StarRotation", _starRotation);
             Material.SetParameter("GalaxyPole", _galaxyPole);
