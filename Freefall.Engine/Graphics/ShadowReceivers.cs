@@ -185,6 +185,8 @@ namespace Freefall.Graphics
         // cover everything: its band is marked per pixel). Forward batches are culled in the forward pass, after the
         // shadows, so last frame's culling is the newest there is; an instance seen for the first time this frame is
         // not marked, which can leave its shadow out for one frame.
+        // Only effects that read the shadow map receive anything: a bindstone's sky beam (vfx.fx, unlit) is a 600 m
+        // tube whose sphere covered every cascade's whole square in a vista, and nothing was culled (2026-10-18).
         private void MarkForwardInstances(ID3D12GraphicsCommandList cmd, OceanRenderer? ocean)
         {
             var batches = CommandBuffer.GetAllBatches(RenderPass.Forward);
@@ -192,7 +194,10 @@ namespace Freefall.Graphics
                 return;
             foreach (var batch in batches)
             {
-                if (ocean != null && ReferenceEquals(batch.Material.Effect, ocean.SurfaceEffect))
+                var effect = batch.Material.Effect;
+                if (effect == null || !effect.ReadsShadowMap)
+                    continue;
+                if (ocean != null && ReferenceEquals(effect, ocean.SurfaceEffect))
                     continue;
                 if (!batch.RecentCameraCull(out uint bounds, out uint flags, out int count))
                     continue;

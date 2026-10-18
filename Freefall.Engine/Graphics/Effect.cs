@@ -127,6 +127,15 @@ namespace Freefall.Graphics
         public int DefaultInstanceSlot => _defaultInstanceSlot[0];
         private int[] _defaultInstanceSlot = new int[1];
 
+        /// <summary>
+        /// True when a shader of the effect reads push constant slot 0, which the Forward pass fills with the sun's
+        /// cascade array (CommandBuffer.Pass.Execute; such effects name it ShadowMapIdx): glass and water receive the
+        /// sun's shadow, an unlit effect such as vfx.fx declares the slot and never reads it. From DXC's reflection
+        /// (the variable's Used flag); shared like DefaultInstanceSlot and refreshed on every (re)compile.
+        /// </summary>
+        public bool ReadsShadowMap => _readsShadowMap[0];
+        private bool[] _readsShadowMap = new bool[1];
+
         // MasterEffects: Global dictionary of all loaded effects (Apex pattern)
         // Camera.SetShaderParams iterates this to set View/Projection on all effects
         internal static Dictionary<int, Effect> MasterEffects = new Dictionary<int, Effect>();
@@ -164,6 +173,7 @@ namespace Freefall.Graphics
                 MaterialParams = existing.MaterialParams;
                 InstanceParams = existing.InstanceParams;
                 _defaultInstanceSlot = existing._defaultInstanceSlot;
+                _readsShadowMap = existing._readsShadowMap;
                 _materialBlock = existing._materialBlock;
                 lock (_instances) _instances.Add(new WeakReference<Effect>(this));
                 return;
@@ -411,6 +421,8 @@ namespace Freefall.Graphics
         /// </summary>
         private void DiscoverPushConstants()
         {
+            _readsShadowMap[0] = ReadsPushConstantZero();
+
             // Find shader reflection that has a PushConstants cbuffer.
             // Must check ALL stages — some shaders only declare PushConstants in PS.
             Vortice.Direct3D12.Shader.ID3D12ShaderReflection? reflection = null;
@@ -476,6 +488,38 @@ namespace Freefall.Graphics
                 }
                 break; // Only one PushConstants cbuffer
             }
+        }
+
+        // Whether any stage of any pass reads push constant slot 0 (ReadsShadowMap). A shader without reflection
+        // counts as reading it: a forward effect wrongly taken for unlit would lose its sun shadow.
+        private bool ReadsPushConstantZero()
+        {
+            foreach (var tech in Techniques)
+            {
+                foreach (var pass in tech.Passes)
+                {
+                    var stages = new[] { pass.VertexShader, pass.PixelShader, pass.MeshShader, pass.AmplificationShader,
+                                         pass.HullShader, pass.DomainShader };
+                    foreach (var shader in stages)
+                    {
+                        if (shader == null) continue;
+                        var reflection = shader.Reflection;
+                        if (reflection == null) return true;
+                        for (uint i = 0; i < reflection.Description.ConstantBuffers; i++)
+                        {
+                            var cb = reflection.GetConstantBufferByIndex(i);
+                            if (cb.Description.Name != "PushConstants") continue;
+                            for (uint v = 0; v < cb.Description.VariableCount; v++)
+                            {
+                                var desc = cb.GetVariableByIndex(v).Description;
+                                if (desc.StartOffset == 0 && (desc.Flags & Vortice.Direct3D.ShaderVariableFlags.Used) != 0)
+                                    return true;
+                            }
+                        }
+                    }
+                }
+            }
+            return false;
         }
 
         private static string LoadWithIncludes(string path) => Flatten(File.ReadAllText(path), path);
