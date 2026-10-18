@@ -268,7 +268,7 @@ namespace Freefall.Assets
                         if (height.Heightmap == null || height.Heightmap.BindlessIndex == 0) break;
                         CloseRun();
                         // World Y, as the target height of a local stamp (see TryBuildHeightDescriptor)
-                        float baseY = (height.Transform?.WorldPosition.Y ?? 0f) + height.HeightOffset;
+                        float baseY = (height.Transform?.WorldPosition.Y ?? 0f) + height.HeightOffset - terrainOrigin.Y;
                         plan.Steps.Add(new HeightStep
                         {
                             Kind = HeightStepKind.Import,
@@ -387,7 +387,8 @@ namespace Freefall.Assets
                     (center.X - terrainOrigin.X) / terrainSize.X,
                     (center.Z - terrainOrigin.Z) / terrainSize.Y);
                 desc.Radius = stamp.Radius * uvScale;
-                desc.TargetHeight = ((relative ? 0f : center.Y) + stamp.HeightOffset) / maxHeight;
+                // A world height, measured up from the terrain's base (its entity's Y) as the heightmap is
+                desc.TargetHeight = ((relative ? 0f : center.Y - terrainOrigin.Y) + stamp.HeightOffset) / maxHeight;
                 desc.SplinePointOffset = 0xFFFFFFFF;
                 desc.SplinePointCount = 0;
 
@@ -1658,7 +1659,7 @@ namespace Freefall.Assets
                     UV = new Vector2(
                         (worldPos.X - terrainOrigin.X) / terrainSize.X,
                         (worldPos.Z - terrainOrigin.Z) / terrainSize.Y),
-                    Height = ((useWorldY ? worldPos.Y : 0f) + heightOffset) / maxHeight,
+                    Height = ((useWorldY ? worldPos.Y - terrainOrigin.Y : 0f) + heightOffset) / maxHeight,
                     HalfWidth = uvRadius * spline.GetWidth(t),
                 });
             }
