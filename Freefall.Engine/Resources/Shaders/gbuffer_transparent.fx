@@ -315,10 +315,10 @@ PSOutput PS(VSOutput input)
     float3 diffuseLighting = diffuse * radiance * ao;
     float3 specLighting = spec * radiance;
 
-    // Hemisphere ambient, the same as the opaque surfaces get in composition: × how much sky the pane sees past the
-    // terrain (also dims its sky reflection below)
+    // The sky's ambient, the same as the opaque surfaces get in composition: × how much sky the pane sees past the
+    // terrain and the meshes (also dims its sky reflection below)
     float skyVisible = SkyVisibility(input.AbsWorldPos, N);
-    float3 ambient = HemisphereAmbient(N) * ao * skyVisible;
+    float3 ambient = SkyAmbient(N) * ao * skyVisible;
     float3 lighting = diffuseLighting + ambient * color.rgb;
 
     // Emissive adds directly to lighting (its luminance in nits, pre-exposed as a light source seen directly)
@@ -356,11 +356,10 @@ PSOutput PS(VSOutput input)
     float gloss = saturate(1.0 - roughness);
     glassFresnel *= gloss * gloss;
 
-    // Environment reflection: the sky above the horizon, a dark ground tone below it (a pane seen from above
-    // reflects the street, not the sky — mirroring the direction upwards made such panes glow).
+    // Environment reflection: the sky probe in the mirror direction (the sky and its clouds above the horizon, the lit
+    // ground below: a pane seen from above reflects the street, not the sky), blurred by the pane's roughness
     float3 reflectDir = reflect(-V, Ng);
-    float3 skyReflect = SkyRadiance(normalize(float3(reflectDir.x, max(reflectDir.y, 0.02), reflectDir.z)));
-    float3 envReflect = lerp(GroundBounceLight(), skyReflect, smoothstep(-0.15, 0.1, reflectDir.y)) * skyVisible;
+    float3 envReflect = SkyReflection(reflectDir, roughness) * skyVisible;
 
     // Base: the lit glass surface; the blend state mixes it over what is behind with alpha.
     // (Both lighting and refracted are linear HDR — finalize handles tonemapping.)

@@ -49,11 +49,37 @@ float3 GroundBounceLight()
     return ambient[1].rgb;
 }
 
-// Hemisphere ambient for a surface normal: sky above, ground below. One model for every lit pass (composition, glass);
-// water takes the sky half. Until the sky probe (ATMOSPHERE_PLAN.md stage 4) it ignores where in the sky the light is.
-float3 HemisphereAmbient(float3 N)
+// The sky's ambient light on a surface facing N, as a multiple of its albedo (E / π × Exposure): from the sky probe's
+// SH9 (sky_probe_cs.hlsl), so it knows where in the sky the light is (the bright side at sunset, the blue zenith, the
+// clouds, the lit ground below). Without the probe (Engine.Settings.SkyProbe off): sky above, ground below, lerped by
+// N.y (stage 1-3). One model for every lit pass (composition, glass).
+float3 SkyAmbient(float3 N)
 {
-    return lerp(GroundBounceLight(), SkyAmbientLight(), N.y * 0.5 + 0.5);
+    if (AtmosphereIdx == 0)
+        return 0;
+    AtmosphereParams A = LoadAtmosphere();
+    if (A.SkyProbeSH == 0)
+        return lerp(GroundBounceLight(), SkyAmbientLight(), N.y * 0.5 + 0.5);
+    StructuredBuffer<float4> sh = ResourceDescriptorHeap[A.SkyProbeSH];
+    float3 e = sh[0].rgb * 0.282095
+             + sh[1].rgb * (0.488603 * N.y) + sh[2].rgb * (0.488603 * N.z) + sh[3].rgb * (0.488603 * N.x)
+             + sh[4].rgb * (1.092548 * N.x * N.y) + sh[5].rgb * (1.092548 * N.y * N.z)
+             + sh[6].rgb * (0.315392 * (3.0 * N.z * N.z - 1.0)) + sh[7].rgb * (1.092548 * N.x * N.z)
+             + sh[8].rgb * (0.546274 * (N.x * N.x - N.y * N.y));
+    return max(e, 0.0);
+}
+
+// The sky's light in direction R blurred for a surface of this roughness (0 sharp .. 1 the whole hemisphere), from the
+// sky probe's mips; without the probe the sky above the horizon and the ground light below it
+float3 SkyReflection(float3 R, float roughness)
+{
+    if (AtmosphereIdx == 0)
+        return 0;
+    AtmosphereParams A = LoadAtmosphere();
+    if (A.SkyProbeCube == 0)
+        return lerp(GroundBounceLight(), SkyRadiance(normalize(float3(R.x, max(R.y, 0.02), R.z))), smoothstep(-0.15, 0.1, R.y));
+    TextureCube<float4> probe = ResourceDescriptorHeap[A.SkyProbeCube];
+    return probe.SampleLevel(AtmosphereLinearClamp, R, saturate(roughness) * (A.SkyProbeMips - 1.0)).rgb;
 }
 
 // The terrain under the atmosphere's parameters, for sky_visibility.hlsli (Heightmap 0 = none, or SkyVisibility off)
@@ -291,6 +317,91 @@ CloudLight GetCloudLight(float3 dir)
 float3 CloudFlatRadiance(CloudLight c)
 {
     return CloudAlbedo * ((c.sun + c.moon) * 0.25 + c.ambient) * c.viewT + c.inFront;
+}
+
+// ── The cloud layer as the sky dome draws it (mesh_skybox.fx), and the sky probe (sky_probe_cs.hlsl) with it ──
+// LUT-based Nubis-style clouds. LUT channels (cloud_noise_gen.hlsl): R Perlin FBM (smooth connected shapes), G Worley
+// FBM (low-freq billowy erosion), B Worley FBM (high-freq detail erosion), A Perlin-Worley (pre-combined cloud shape).
+// mipBias blurs the noise further (the probe's coarse texels).
+float GetCloudsAt(SamplerState wrapSampler, float3 viewDir, float altitude, float mipBias)
+{
+    if (viewDir.y <= 0.001 || CloudNoiseLUTIdx == 0)
+        return 0.0;
+
+    // Shared with the cloud shadows: same plane, same UVs, same base density
+    float t = altitude / viewDir.y;
+    float2 uv = CloudLayerUV(viewDir.xz * t);
+
+    Texture3D<float4> noiseLUT = ResourceDescriptorHeap[CloudNoiseLUTIdx];
+    float timeZ = CloudTime * 0.005;
+
+    // Mip level based on viewing angle — blur out detail near the horizon
+    // to hide tiling and create natural atmospheric softening
+    float mip = saturate(1.0 - viewDir.y * 5.0) * 3.0 + mipBias;  // 0 at zenith, up to 3 at horizon
+
+    // ── Base shape against the coverage threshold ──
+    float cloudDensity = CloudBaseDensity(noiseLUT, wrapSampler, uv, mip);
+
+    // ── Detail erosion: Worley carves billowy edges ──
+    // Use higher mip near horizon to blur out repetition
+    float4 detailSample = noiseLUT.SampleLevel(wrapSampler, float3(uv * 2.0 + 1.13, timeZ * 1.5), mip);
+    float detailFBM = detailSample.g * 0.625 + detailSample.b * 0.375;
+
+    // Key fix: erosion strength scales with (1 - density)
+    // Thick cloud cores resist erosion; only thin edges get carved
+    float erodeStrength = detailFBM * 0.2 * (1.0 - cloudDensity * 0.7);
+    float eroded = remap(cloudDensity, erodeStrength, 1.0, 0.0, 1.0);
+
+    // Softer smoothstep for fuller cloud bodies
+    eroded = smoothstep(0.0, 0.45, eroded);
+
+    // Horizon fade
+    eroded *= smoothstep(0.0, 0.22, viewDir.y);
+
+    return saturate(eroded);
+}
+
+// How much of a light (sun or moon) a cloud sends toward the eye, per unit of what a white surface facing that light
+// would: the density's self-shadowing (thin edges bright, thick cores dark), brighter on the side toward the light,
+// a silver lining on thin edges and a powder glow at medium density when looking toward the light. 0.6: a sunlit
+// edge is a little over half as bright as a white wall in the sun (as the old palettes had it).
+float CloudDirectShade(float3 viewDir, float3 lightDir, float density, float transmittance)
+{
+    float lightDot = saturate(dot(viewDir, lightDir));
+    float gradient = lightDot * 0.5 + 0.5;              // 0.5 (shade side) to 1.0 (facing the light)
+    float shade = lerp(transmittance * 0.7, transmittance, gradient);
+
+    float edgeMask = smoothstep(0.0, 0.2, density) * smoothstep(0.5, 0.15, density);
+    shade += edgeMask * lightDot * lightDot * 0.4;                                      // silver lining
+    shade += (1.0 - transmittance) * transmittance * 2.0 * lightDot * lightDot * lightDot * 0.3;   // powder
+    return shade * 0.6;
+}
+
+// The sky's light in direction viewDir (skyColor, × Exposure) with the cloud layer over it, lit by the sun and the
+// brightest moon through the air above the cloud and by the sky and the ground; the air between the camera and the
+// cloud dims it and adds its own light in front. density: the cloud's, for what lies behind it (sun, moons, stars).
+float3 SkyThroughClouds(SamplerState wrapSampler, float3 viewDir, float3 skyColor, float mipBias, out float density)
+{
+    // Altitude scales the projected noise, so lerping it zooms the whole pattern. While a preset
+    // transition runs we instead cross-fade the density of the old and new cloud layers.
+    density = GetCloudsAt(wrapSampler, viewDir, CloudAltitude, mipBias);
+    if (CloudAltitudeBlend < 0.999)
+    {
+        float densityFrom = GetCloudsAt(wrapSampler, viewDir, CloudAltitudeFrom, mipBias);
+        density = lerp(densityFrom, density, smoothstep(0.0, 1.0, saturate(CloudAltitudeBlend)));
+    }
+    if (density <= 0.001 || AtmosphereIdx == 0)
+        return skyColor;
+
+    AtmosphereParams A = LoadAtmosphere();
+    float absorption = 1.0 - exp(-density * 4.5);           // opacity, Beer-Lambert
+    float transmittance = exp(-density * 3.0);              // self-shadowing: 1 at thin edges, ~0.05 in dense cores
+    CloudLight cl = GetCloudLight(viewDir);
+    float3 lit = cl.sun * CloudDirectShade(viewDir, A.SunDirection, density, transmittance)
+               + cl.moon * CloudDirectShade(viewDir, A.MoonDirection, density, transmittance)
+               + cl.ambient;
+    float3 cloudColor = CloudAlbedo * lit * cl.viewT + cl.inFront;
+    return lerp(skyColor, cloudColor, absorption);
 }
 
 #endif // SKY_COMMON

@@ -599,6 +599,10 @@ namespace Freefall
          // daylight bouncing in through doors and windows (a room without a lamp was black at noon). Caves under the
          // terrain do not get it.
          public float SkyCaptureBounce { get; set; } = 0.04f;
+         // The ambient light and glass's sky reflections from the sky probe: a cubemap of the sky, the clouds and the lit
+         // ground round the camera every frame, its SH9 for the ambient (SkyProbe). Off: the sky above, the ground below,
+         // lerped by the normal (stages 1-3).
+         public bool SkyProbe { get; set; } = true;
 
          [Category("Exposure")]
          public bool AutoExposure { get; set; } = true;

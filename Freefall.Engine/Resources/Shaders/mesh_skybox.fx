@@ -72,68 +72,7 @@ float hash13(float3 p3)
 
 #include "sky_common.fx"
 
-// ────────────────────────────────────────────────
-// Main cloud function — LUT-based Nubis-style clouds
-//
-// LUT channels (from cloud_noise_gen.hlsl):
-//   R: Perlin FBM     (smooth connected shapes)
-//   G: Worley FBM     (low-freq billowy erosion)
-//   B: Worley FBM     (high-freq detail erosion)
-//   A: Perlin-Worley  (pre-combined cloud shape)
-//
-float GetCloudsAt(float3 viewDir, float altitude)
-{
-    if (viewDir.y <= 0.001 || CloudNoiseLUTIdx == 0)
-        return 0.0;
-
-    // Shared with the cloud shadows (sky_common.fx): same plane, same UVs, same base density
-    float t = altitude / viewDir.y;
-    float2 uv = CloudLayerUV(viewDir.xz * t);
-
-    Texture3D<float4> noiseLUT = ResourceDescriptorHeap[CloudNoiseLUTIdx];
-    float timeZ = CloudTime * 0.005;
-
-    // Mip level based on viewing angle — blur out detail near the horizon
-    // to hide tiling and create natural atmospheric softening
-    float mip = saturate(1.0 - viewDir.y * 5.0) * 3.0;  // 0 at zenith, up to 3 at horizon
-
-    // ── Base shape against the coverage threshold ──
-    float cloudDensity = CloudBaseDensity(noiseLUT, linearWrap, uv, mip);
-
-    // ── Detail erosion: Worley carves billowy edges ──
-    // Use higher mip near horizon to blur out repetition
-    float4 detailSample = noiseLUT.SampleLevel(linearWrap, float3(uv * 2.0 + 1.13, timeZ * 1.5), mip);
-    float detailFBM = detailSample.g * 0.625 + detailSample.b * 0.375;
-
-    // Key fix: erosion strength scales with (1 - density)
-    // Thick cloud cores resist erosion; only thin edges get carved
-    float erodeStrength = detailFBM * 0.2 * (1.0 - cloudDensity * 0.7);
-    float eroded = remap(cloudDensity, erodeStrength, 1.0, 0.0, 1.0);
-
-    // Softer smoothstep for fuller cloud bodies
-    eroded = smoothstep(0.0, 0.45, eroded);
-
-    // Horizon fade
-    eroded *= smoothstep(0.0, 0.22, viewDir.y);
-
-    return saturate(eroded);
-}
-
-// How much of a light (sun or moon) a cloud sends toward the eye, per unit of what a white surface facing that light
-// would: the density's self-shadowing (thin edges bright, thick cores dark), brighter on the side toward the light,
-// a silver lining on thin edges and a powder glow at medium density when looking toward the light. 0.6: a sunlit
-// edge is a little over half as bright as a white wall in the sun (as the old palettes had it).
-float CloudDirectShade(float3 viewDir, float3 lightDir, float density, float transmittance)
-{
-    float lightDot = saturate(dot(viewDir, lightDir));
-    float gradient = lightDot * 0.5 + 0.5;              // 0.5 (shade side) to 1.0 (facing the light)
-    float shade = lerp(transmittance * 0.7, transmittance, gradient);
-
-    float edgeMask = smoothstep(0.0, 0.2, density) * smoothstep(0.5, 0.15, density);
-    shade += edgeMask * lightDot * lightDot * 0.4;                                      // silver lining
-    shade += (1.0 - transmittance) * transmittance * 2.0 * lightDot * lightDot * lightDot * 0.3;   // powder
-    return shade * 0.6;
-}
+// The cloud layer (its density and light) is in sky_common.fx: the sky probe (sky_probe_cs.hlsl) draws the same clouds.
 
 // ────────────────────────────────────────────────
 // Night sky: stars and the Milky Way on a sphere that turns with the time of day (StarRotation), so they wheel round
@@ -383,34 +322,9 @@ FragmentOutput PS_Procedural(VertexOutput input)
         behindClouds = sun + MoonsAndStars(viewDir, sunDir, stars) * viewT * Exposure;
     }
 
-    // Altitude scales the projected noise, so lerping it zooms the whole pattern. While a preset
-    // transition runs we instead cross-fade the density of the old and new cloud layers.
-    float density = GetCloudsAt(viewDir, CloudAltitude);
-    if (CloudAltitudeBlend < 0.999)
-    {
-        float densityFrom = GetCloudsAt(viewDir, CloudAltitudeFrom);
-        density = lerp(densityFrom, density, smoothstep(0.0, 1.0, saturate(CloudAltitudeBlend)));
-    }
-
-    if (density > 0.001)
-    {
-        // ── Opacity via Beer-Lambert ──
-        float absorption = 1.0 - exp(-density * 4.5);
-
-        // ── Self-shadowing: the cloud shape detail IS the shading detail ──
-        // Thin edges transmit light (bright), thick cores self-shadow (dark).
-        float transmittance = exp(-density * 3.0);  // 1.0 at edges, ~0.05 at dense cores
-
-        // Lit by the sun and the brightest moon through the air above the cloud, and by the sky and the ground;
-        // the air between the camera and the cloud dims it and adds its own light in front
-        CloudLight cl = GetCloudLight(viewDir);
-        float3 lit = cl.sun * CloudDirectShade(viewDir, sunDir, density, transmittance)
-                   + cl.moon * CloudDirectShade(viewDir, moonDir, density, transmittance)
-                   + cl.ambient;
-        float3 cloudColor = CloudAlbedo * lit * cl.viewT + cl.inFront;
-
-        skyColor = lerp(skyColor, cloudColor, absorption);
-    }
+    // The cloud layer over the sky's light (sky_common.fx)
+    float density;
+    skyColor = SkyThroughClouds(linearWrap, viewDir, skyColor, 0.0, density);
 
     // Sun, moons and stars through the clouds: hidden far sooner than the sky colour is. With the sky's absorption a
     // thin cloud let ~2/3 of a moon through, 50-100x brighter than the cloud round it, so it seemed to hang in front.

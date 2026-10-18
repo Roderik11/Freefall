@@ -220,7 +220,7 @@ namespace Freefall.Graphics
             public uint AerialPerspective, Ambient, TerrainHeightmap; public float TerrainMaxHeight;
             public Vector3 TerrainOrigin; public float TerrainSizeX;
             public float TerrainSizeZ; public uint SkyCaptureViews, SkyCaptureDepth, SkyCaptureCount;
-            public float SkyCaptureBounce; public Vector3 _pad1;
+            public float SkyCaptureBounce; public uint SkyProbeCube, SkyProbeSH; public float SkyProbeMips;
 
             /// <summary>The part the transmittance and multiple scattering LUTs depend on</summary>
             public bool SameMedium(in GpuParams o) =>
@@ -353,6 +353,8 @@ namespace Freefall.Graphics
             // ... and the meshes round the camera: walls, roofs, tree crowns (SkyCapture, sky_capture.hlsli)
             (_frame.SkyCaptureViews, _frame.SkyCaptureDepth, _frame.SkyCaptureCount) = SkyCapture.PrepareFrame(slot);
             _frame.SkyCaptureBounce = Math.Clamp(Engine.Settings.SkyCaptureBounce, 0f, 1f);
+            // The sky probe (SkyProbe, sky_probe_cs.hlsl): the ambient light and the sky's reflections
+            (_frame.SkyProbeCube, _frame.SkyProbeSH, _frame.SkyProbeMips) = SkyProbe.Indices;
             unsafe { *_params[slot]!.WritePtr<GpuParams>() = _frame; }
             return _params[slot]!.SrvIndex;
         }
@@ -409,6 +411,9 @@ namespace Freefall.Graphics
             int slot = Engine.FrameIndex % FrameCount;
             list.CopyBufferRegion(_readback[slot]!.Native, 0, _ambient.Native, 0, AmbientElements * 16);
             _ambient.Transition(list, shaderRead);
+
+            // The sky probe: the sky, the clouds and the lit ground round the camera (reads the ambient's ground light)
+            SkyProbe.Render(list);
 
             _texturesWritten = true;
             PixMarker.End(list);

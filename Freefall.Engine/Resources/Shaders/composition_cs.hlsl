@@ -75,11 +75,12 @@ void CSCompose(uint3 dispatchThreadId : SV_DispatchThreadID)
     float4 data = DataTex.Load(displaced_coord);
     float3 normal = NormalTex.Load(displaced_coord).xyz;
     
-    // Hemisphere ambient: the sky from above, the ground's bounce light from below. Gives shape to fully shadowed
-    // objects. × how much of the sky the surface sees past the terrain (light_directional_cs puts it in the light
-    // buffer's alpha): a cave under a hill gets none
+    // The sky's ambient light for this normal (the sky probe's SH, sky_common.fx SkyAmbient): the sky, the clouds and the
+    // lit ground, brighter toward where the sky is bright. Gives shape to fully shadowed objects. × how much of the sky
+    // the surface sees past the terrain and the meshes (sky_visibility_cs, in the light buffer's alpha): a cave or a room
+    // gets little
     float ao = data.b;
-    float3 ambient = HemisphereAmbient(normal) * ao * saturate(light.a);
+    float3 ambient = SkyAmbient(normal) * ao * saturate(light.a);
 
     // Screen-space AO (GTAO) — fully occludes ambient; direct light only by AODirectStrength
     // (not physically based, but keeps creases readable in sunlit areas)
