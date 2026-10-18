@@ -694,6 +694,12 @@ namespace Freefall
          [ValueRange(0.5f, 3f)]
          public float BloomRadius { get; set; } = 1.0f;
 
+         // The most light one pixel gives the bloom, in the exposed image's units (1 ≈ white): softly capped, L / (1 + L / this).
+         // Daylight seen from a dark cave is thousands of times white, and any share of it spread out was a blinding blob
+         // round the mouth; capped, a bright opening glows like a lamp. 0 = no cap.
+         [ValueRange(0f, 64f)]
+         public float BloomMaxBrightness { get; set; } = 4f;
+
          [Category("Radiance Cascades")]                                    // Sparse 3D GI
          public bool EnableRadianceCascades { get; set; } = false;
 

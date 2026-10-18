@@ -21,6 +21,7 @@ cbuffer PushConstants : register(b3)
     uint BloomKneeBits;
     uint BloomMipCount;     // mips the upsample chain added into mip 0
     uint BloomSpreads;      // 1 = the bloom spreads a share of each pixel's light, 0 = it adds on top
+    uint BloomCapBits;      // BloomMaxBrightness: the light a pixel can give the bloom (bloom.hlsli BloomSource; 0 = no cap)
 };
 
 SamplerState LinearClampSampler : register(s2);
@@ -53,12 +54,13 @@ void CSFinalize(uint3 dispatchThreadId : SV_DispatchThreadID)
         if (BloomSpreads != 0)
         {
             // Mip 0 holds the sum of all mips, so their average is the spread light. This pixel
-            // gives up the share the prefilter put into the pyramid: the total stays the same.
+            // gives up the share the prefilter put into the pyramid (of its capped light): the total stays the same.
             Texture2D<float> DepthTex = ResourceDescriptorHeap[DepthSrvIdx];
+            float3 source = BloomSource(finalColor, asfloat(BloomCapBits));
             float share = BloomIsSky(DepthTex.Load(int3(px, 0)))
                 ? 0
-                : BloomShare(dot(finalColor, float3(0.2126, 0.7152, 0.0722)), asfloat(BloomThresholdBits), asfloat(BloomKneeBits));
-            finalColor = max(finalColor + (bloom / BloomMipCount - finalColor * share) * bloomIntensity, 0);
+                : BloomShare(dot(source, float3(0.2126, 0.7152, 0.0722)), asfloat(BloomThresholdBits), asfloat(BloomKneeBits));
+            finalColor = max(finalColor + (bloom / BloomMipCount - source * share) * bloomIntensity, 0);
         }
         else
             finalColor += bloom * bloomIntensity;

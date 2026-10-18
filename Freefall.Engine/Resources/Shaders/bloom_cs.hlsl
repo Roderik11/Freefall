@@ -29,7 +29,7 @@ cbuffer PushConstants : register(b3)
     uint OutputHeight;
     uint Param0Bits;    // Threshold / InputTexelSize.x (reinterpreted as float)
     uint Param1Bits;    // SoftKnee  / InputTexelSize.y (reinterpreted as float)
-    uint Param2Bits;    // unused    / BloomRadius      (reinterpreted as float)
+    uint Param2Bits;    // MaxBrightness / BloomRadius (reinterpreted as float)
     uint DepthSrvIdx;   // Depth buffer SRV (threshold only — sky mask)
 };
 
@@ -72,12 +72,13 @@ void CSBloomThreshold(uint3 id : SV_DispatchThreadID)
     Texture2D<float4> input  = ResourceDescriptorHeap[InputSrvIdx];
     RWTexture2D<float4> output = ResourceDescriptorHeap[OutputUAVIdx];
 
-    // Load 2x2 block from the full-res source
+    // Load 2x2 block from the full-res source, each pixel's light capped as the finalize takes it back (bloom.hlsli)
+    float cap = asfloat(Param2Bits);
     uint2 base = id.xy * 2;
-    float3 s0 = SafeHDR(input.Load(int3(base + uint2(0, 0), 0)).rgb);
-    float3 s1 = SafeHDR(input.Load(int3(base + uint2(1, 0), 0)).rgb);
-    float3 s2 = SafeHDR(input.Load(int3(base + uint2(0, 1), 0)).rgb);
-    float3 s3 = SafeHDR(input.Load(int3(base + uint2(1, 1), 0)).rgb);
+    float3 s0 = BloomSource(SafeHDR(input.Load(int3(base + uint2(0, 0), 0)).rgb), cap);
+    float3 s1 = BloomSource(SafeHDR(input.Load(int3(base + uint2(1, 0), 0)).rgb), cap);
+    float3 s2 = BloomSource(SafeHDR(input.Load(int3(base + uint2(0, 1), 0)).rgb), cap);
+    float3 s3 = BloomSource(SafeHDR(input.Load(int3(base + uint2(1, 1), 0)).rgb), cap);
 
     // Per-sample luminance
     float l0 = Luminance(s0);

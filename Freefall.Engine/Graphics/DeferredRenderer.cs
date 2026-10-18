@@ -1182,6 +1182,7 @@ namespace Freefall.Graphics
             _bloomCS.SetPushConstant(_kBloomThreshold, "OutputHeight", (uint)compDesc.Height);
             _bloomCS.SetPushConstant(_kBloomThreshold, "Param0Bits", BitConverter.SingleToUInt32Bits(settings.BloomThreshold));
             _bloomCS.SetPushConstant(_kBloomThreshold, "Param1Bits", BitConverter.SingleToUInt32Bits(settings.BloomSoftKnee));
+            _bloomCS.SetPushConstant(_kBloomThreshold, "Param2Bits", BitConverter.SingleToUInt32Bits(MathF.Max(settings.BloomMaxBrightness, 0f)));
             _bloomCS.SetPushConstant(_kBloomThreshold, "DepthSrv", Depth.BindlessIndex);
 
             uint threshX = ((uint)bloom.Width + 7) / 8;
@@ -1282,6 +1283,7 @@ namespace Freefall.Graphics
             _finalizeCS.SetPushConstant(_kFinalize, "BloomKneeBits", BitConverter.SingleToUInt32Bits(Engine.Settings.BloomSoftKnee));
             _finalizeCS.SetPushConstant(_kFinalize, "BloomMipCount", bloomActive ? (uint)BloomPyramid!.MipCount : 1u);
             _finalizeCS.SetPushConstant(_kFinalize, "BloomSpreads", bloomActive && Engine.Settings.BloomSpreadsLight ? 1u : 0u);
+            _finalizeCS.SetPushConstant(_kFinalize, "BloomCapBits", BitConverter.SingleToUInt32Bits(MathF.Max(Engine.Settings.BloomMaxBrightness, 0f)));
 
             uint groupsX = ((uint)desc.Width + 7) / 8;
             uint groupsY = ((uint)desc.Height + 7) / 8;
