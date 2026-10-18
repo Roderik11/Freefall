@@ -26,6 +26,10 @@ namespace Freefall.Components
         private MaterialBlock Params;
 
         internal const int MaxCascades = 8; // Support up to 8 cascades
+
+        /// <summary>Metres every cascade's depth range reaches toward the sun past its slice of the view, so casters
+        /// above a small room (ceiling, roof) are drawn however thin the adaptive splits make the cascade.</summary>
+        private const float MinCasterReach = 300f;
         
         // Shadow Cascades — arrays sized to max capacity, active count from Engine.Settings
         private readonly Vector4[] cascades = new Vector4[MaxCascades];
@@ -593,9 +597,12 @@ namespace Freefall.Components
             minZ = MathF.Floor(minZ / texelSize) * texelSize;
             maxZ = MathF.Ceiling(maxZ / texelSize) * texelSize;
             
-            // Inflate Z to catch shadow casters behind the camera
+            // Inflate Z to catch shadow casters behind the camera, and at least MinCasterReach toward the sun: with adaptive
+            // splits inside a small room all four cascades crowd into the few metres in view, and the last one reached
+            // only about its own depth toward the sun. The ceiling and roof above lay beyond it, were clipped, and the
+            // far corner of the room stood in full sun, coming and going as the camera turned (user, 2026-10-18).
             float zRange = maxZ - minZ;
-            float backExtension = zRange * MathF.Pow(3.5f, 3 - index);
+            float backExtension = MathF.Max(zRange * MathF.Pow(3.5f, 3 - index), MinCasterReach);
             minZ -= backExtension;
             
             var lightProj = Matrix4x4.CreateOrthographicOffCenterLeftHanded(
