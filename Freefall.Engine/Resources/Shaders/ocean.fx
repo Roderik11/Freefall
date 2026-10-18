@@ -44,7 +44,7 @@ struct OceanData
     float FoamDecayRate;
     float FoamThreshold;
     float3 OceanColor;
-    float _pad0;
+    uint SeaMaskSRV;        // where the open sea is (C# SeaMask), 0 = everywhere. Was padding: an older build writes 0
     float3 DeepColor;
     float _pad1;
     float3 SunDirection;
@@ -483,6 +483,22 @@ struct PSOutput
     float4 Color : SV_Target0;
 };
 
+// The sea plane is endless, but the sea is only where it can flow in from the open sea across ground below sea level
+// (C# SeaMask: flooded from the terrain's border, reaching a little up the beaches). Enclosed low ground, a lake bed
+// deeper than the sea or a hall under a hill, gets no sea. Past the terrain it is all sea.
+bool OutsideSea(OceanData ocean, float2 xz)
+{
+    if (ocean.SeaMaskSRV == 0) return false;
+    float2 uv = (xz - float2(ocean.TerrainOriginX, ocean.TerrainOriginZ)) / float2(ocean.TerrainSizeX, ocean.TerrainSizeZ);
+    if (any(uv < 0.0) || any(uv > 1.0)) return false;
+
+    Texture2D<float> mask = ResourceDescriptorHeap[ocean.SeaMaskSRV];
+    uint w, h;
+    mask.GetDimensions(w, h);
+    uv = clamp(uv, 0.5 / float2(w, h), 1.0 - 0.5 / float2(w, h));   // no blending in the far border's texels
+    return mask.SampleLevel(OceanSampler, uv, 0) < 0.5;
+}
+
 PSOutput PS(DSOutput input)
 {
     PSOutput output;
@@ -491,6 +507,9 @@ PSOutput PS(DSOutput input)
 
     StructuredBuffer<OceanData> oceanData = ResourceDescriptorHeap[OceanDataIdx];
     OceanData ocean = oceanData[input.InstanceIdx];
+
+    if (OutsideSea(ocean, input.UndisplacedXZ.xy))
+        discard;
 
     float3 worldPos = input.WorldPos;
     // How much sky this pixel of sea sees past the terrain (per pixel, as water.fx: per vertex, corners on land darkened the coast).

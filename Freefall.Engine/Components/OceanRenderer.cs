@@ -5,6 +5,8 @@ using Category = System.ComponentModel.CategoryAttribute;
 using System.Linq;
 using System.Numerics;
 using System.Runtime.InteropServices;
+using System.Threading;
+using System.Threading.Tasks;
 using Freefall;
 using Freefall.Base;
 using Freefall.Components;
@@ -239,6 +241,12 @@ namespace Freefall.Components
         private DirectionalLight? _sunLight;
         private TerrainRenderer? _terrain;
 
+        // Where the open sea is: rebuilt on a worker when the terrain's heights come back or the sea level moves
+        private readonly SeaMask _seaMask = new();
+        private SeaMask.Result? _builtSeaMask;   // finished on a worker, waiting for Draw to upload it
+        private int _seaMaskRequest;
+        private float _seaMaskLevel = float.NaN;
+
         // GPU buffer for tile scales (1/lengthScale per band)
         private GraphicsBuffer? _tileScalesBuffer;
 
@@ -250,7 +258,7 @@ namespace Freefall.Components
             public float FoamDecayRate;
             public float FoamThreshold;
             public Vector3 OceanColor;
-            public float _pad0;
+            public uint SeaMaskSRV;      // where the open sea is (SeaMask); 0 = everywhere. Was padding: an older build writes 0
             public Vector3 DeepColor;
             public float _pad1;
             public Vector3 SunDirection;
@@ -320,10 +328,56 @@ namespace Freefall.Components
 
             // Create tile scales buffer for the render shader
             CreateTileScalesBuffer();
+
+            MessageDispatcher.AddListener(EngineMsg.TerrainHeightsChanged, OnTerrainHeightsChanged);
+            Transform?.OnChanged += OnTransformChanged;
+        }
+
+        private void OnTerrainHeightsChanged(Message msg)
+        {
+            if (msg.Data is TerrainHeightsChange change && change.Terrain == _terrain?.Terrain)
+                RequestSeaMask();
+        }
+
+        // The sea level is the entity's height
+        private void OnTransformChanged()
+        {
+            if (Transform.WorldPosition.Y != _seaMaskLevel)
+                RequestSeaMask();
+        }
+
+        /// <summary>
+        /// Flood the terrain's current heights into a new sea mask on a worker; Draw uploads it. A request made while
+        /// an older one runs wins: the older result is dropped.
+        /// </summary>
+        private void RequestSeaMask()
+        {
+            var terrain = _terrain?.Terrain;
+            var heights = terrain?.HeightField;
+            if (terrain == null || heights == null || heights.GetLength(0) < 2) return;
+
+            float seaLevel = Transform.WorldPosition.Y;
+            float baseY = _terrain!.Transform?.WorldPosition.Y ?? 0f;
+            float seaLevel01 = (seaLevel - baseY) / MathF.Max(terrain.MaxHeight, 0.001f);
+            float spacing = terrain.TerrainSize.X / (heights.GetLength(0) - 1);
+            _seaMaskLevel = seaLevel;
+
+            int request = Interlocked.Increment(ref _seaMaskRequest);
+            Task.Run(() =>
+            {
+                var mask = SeaMask.Build(heights, seaLevel01, spacing, seaLevel);
+                if (Volatile.Read(ref _seaMaskRequest) == request)
+                    Volatile.Write(ref _builtSeaMask, mask);
+            });
         }
 
         public override void Destroy()
         {
+            MessageDispatcher.RemoveListener(EngineMsg.TerrainHeightsChanged, OnTerrainHeightsChanged);
+            Transform?.OnChanged -= OnTransformChanged;
+            Interlocked.Increment(ref _seaMaskRequest);   // a build still running is dropped
+            _seaMask.Dispose();
+
             // Deferred: the frames in flight still draw the grid, read the tile scales and the FFT textures
             // through their bindless slots and run the FFT kernels. OceanFFT.Dispose releases only GPU objects
             // (textures, buffers, compute pipeline states), so the whole simulation waits with them.
@@ -565,6 +619,13 @@ namespace Freefall.Components
             if (_terrain == null)
                 _terrain = EntityManager.FindComponent<TerrainRenderer>();
 
+            // The first sea mask, as soon as the terrain has heights (at load they can come from its cache with no
+            // readback message); later ones follow TerrainHeightsChanged and the sea level
+            if (_seaMaskRequest == 0)
+                RequestSeaMask();
+            if (Interlocked.Exchange(ref _builtSeaMask, null) is { } seaMask)
+                _seaMask.Upload(seaMask);
+
             // Sun light
             var sunDir = Vector3.UnitY;
             var sunColor = Vector3.One;
@@ -583,6 +644,7 @@ namespace Freefall.Components
                 FoamDecayRate = FoamDecayRate,
                 FoamThreshold = FoamThreshold,
                 OceanColor = new Vector3(OceanColor.R, OceanColor.G, OceanColor.B),
+                SeaMaskSRV = Engine.Settings.DisableSeaMask ? 0 : _seaMask.Srv,
                 DeepColor = new Vector3(DeepColor.R, DeepColor.G, DeepColor.B),
                 SunDirection = sunDir,
                 SunColor = sunColor,
