@@ -368,8 +368,12 @@ namespace Freefall.Components
 
             // Closed: an area whose edge is the outline grown by Radius. A height stamp's falloff lies inside that
             // edge, a coverage stamp's outside it (EvaluateStampWeight insetFalloff). Open: a corridor, falloff outside.
-            float falloffLine = spline.Closed && FalloffInsideClosedSpline ? Radius - Falloff : Radius + Falloff;
-            DrawOutline(ctx, spline, Radius, Falloff > 0.01f ? falloffLine : null, scaleWithWidth: true);
+            // A height stamp covering the outside: its edge moves in by Radius and the falloff runs outward from it.
+            bool outside = spline.Closed && ClosedSplineOutside;
+            float edge = outside ? -Radius : Radius;
+            float falloffLine = outside ? edge + Falloff
+                : spline.Closed && FalloffInsideClosedSpline ? Radius - Falloff : Radius + Falloff;
+            DrawOutline(ctx, spline, edge, Falloff > 0.01f ? falloffLine : null, scaleWithWidth: true);
         }
 
         /// <summary>
@@ -476,6 +480,9 @@ namespace Freefall.Components
 
         /// <summary>True where a closed spline's falloff lies inside its edge (height stamps); coverage stamps fade outside it.</summary>
         protected virtual bool FalloffInsideClosedSpline => false;
+
+        /// <summary>True where a closed spline's stamp covers the outside of the outline (HeightStamp.Outside).</summary>
+        protected virtual bool ClosedSplineOutside => false;
 
         /// <summary>A closed spline confining this round stamp, drawn with it (HeightStamp.MaskSpline).</summary>
         protected virtual Spline? GizmoMaskSpline => null;

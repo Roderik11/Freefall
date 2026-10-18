@@ -501,14 +501,14 @@ void CS_ErosionFilter(uint3 dtid : SV_DispatchThreadID)
 
 #include "terrain_stamp_common.hlsli"
 
-// Per-stamp descriptor (matches C# HeightStampDescriptorGPU, 88 bytes)
+// Per-stamp descriptor (matches C# HeightStampDescriptorGPU, 104 bytes)
 struct HeightStampDescriptor
 {
     float2 Center;             // terrain UV center (radial mode)
     float  Radius;             // UV-space inner radius
     float  Falloff;            // UV-space falloff width
     float  TargetHeight;       // normalized target height [0..1]
-    uint   InvertShape;        // 1 = the heightmap's relief digs instead of raising
+    uint   InvertShape;        // bit 0: the heightmap's relief digs instead of raising; bit 1: Outside (HeightStamp)
     uint   SplinePointOffset;  // offset into spline point buffer (0xFFFFFFFF = radial)
     uint   SplinePointCount;   // number of spline points (0 = radial, high bit = closed area)
     float  NoiseFreq;          // edge noise frequency (0 = disabled)
@@ -523,6 +523,8 @@ struct HeightStampDescriptor
     float2 HeightmapExtent;    // UV half-size of the heightmap along its turned axes
     uint   MaskPointOffset;    // a parent's closed spline masking a round stamp: its samples in the spline buffer
     uint   MaskPointCount;     // 0 = no mask
+    float2 BoundsMin;          // terrain UV box outside which the weight is 0 (TerrainBaker.StampBounds)
+    float2 BoundsMax;
 };
 
 [numthreads(8, 8, 1)]
@@ -543,14 +545,17 @@ void CS_InfluenceLayer(uint3 dtid : SV_DispatchThreadID)
     for (uint i = StampStart; i < StampStart + StampDescCount; i++)
     {
         HeightStampDescriptor stamp = Stamps[i];
+        // Out of the stamp's reach: skip it without walking its spline
+        if (any(uv < stamp.BoundsMin) || any(uv > stamp.BoundsMax)) continue;
 
-        // A closed spline of the stamp's own is a mask: its falloff lies inside the edge (insetFalloff)
+        // A closed spline of the stamp's own is a mask: its falloff lies inside the edge (insetFalloff), or the mask
+        // is turned inside out (InvertShape bit 1, HeightStamp.Outside)
         float nearestH, nearestHalfW;
-        float weight = EvaluateStampWeight(
+        float weight = EvaluateStampWeightEx(
             uv, stamp.Center, stamp.Radius, stamp.Falloff,
             stamp.SplinePointOffset, stamp.SplinePointCount,
             stamp.NoiseFreq, stamp.NoiseAmp, stamp.NoiseSeed,
-            SplinePoints, nearestH, nearestHalfW, true);
+            SplinePoints, nearestH, nearestHalfW, true, (stamp.InvertShape & 2u) != 0);
 
         if (weight <= 0) continue;
 
@@ -587,7 +592,7 @@ void CS_InfluenceLayer(uint3 dtid : SV_DispatchThreadID)
             float relief = Heightmap.SampleLevel(sampLinear, hmUV, 0) * stamp.HeightmapStrength;
 
             // InvertShape turns the relief upside down: the texture digs (lake depths, craters)
-            targetH += stamp.InvertShape ? -relief : relief;
+            targetH += (stamp.InvertShape & 1u) ? -relief : relief;
         }
 
         // Combine with the height built so far, then fade by the stamp weight

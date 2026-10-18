@@ -49,6 +49,13 @@ namespace Freefall.Components
         public bool InvertShape = false;
 
         /// <summary>
+        /// Closed spline only: the stamp covers everything outside the outline instead of inside, fading in over
+        /// Falloff outward from it (Radius moves that edge into the outline). A seabed dug around an island's shelf:
+        /// one outline along the shelf edge, BlendMode Min, the deep as its height. Its Heightmap spans the terrain.
+        /// </summary>
+        public bool Outside = false;
+
+        /// <summary>
         /// Optional heightmap texture. When set, the stamp applies this height pattern
         /// instead of flattening to a uniform height. Sampled in the stamp's local space
         /// with rotation from the entity transform, stretched over the stamp's footprint
@@ -80,6 +87,8 @@ namespace Freefall.Components
 
         // A closed spline of its own is a mask: the falloff lies inside the edge
         protected override bool FalloffInsideClosedSpline => true;
+
+        protected override bool ClosedSplineOutside => Outside;
 
         protected override Spline? GizmoMaskSpline => MaskSpline;
 

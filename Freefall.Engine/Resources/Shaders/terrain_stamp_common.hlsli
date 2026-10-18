@@ -62,8 +62,11 @@ float StampDistToSegment(float2 P, float2 A, float2 B, out float projT, out floa
 // insetFalloff (height stamps): a closed spline is a mask. Its area is the outline grown by radius, and the falloff
 // lies INSIDE that edge: full effect deeper in than the falloff, nothing past the edge. Without it (coverage stamps)
 // the area is full up to the grown edge and the falloff runs outside it. Circles and open splines are not affected.
+//
+// outsideClosed (with insetFalloff, HeightStamp.Outside): the mask is turned inside out. The area is everything beyond
+// the outline (radius moves its edge into the outline) and the falloff runs outward from that edge.
 
-float EvaluateStampWeight(
+float EvaluateStampWeightEx(
     float2 uv,
     float2 center,
     float radius,
@@ -76,7 +79,8 @@ float EvaluateStampWeight(
     StructuredBuffer<StampSplinePoint> splinePoints,
     out float nearestHeight,
     out float nearestHalfWidth,
-    bool insetFalloff)
+    bool insetFalloff,
+    bool outsideClosed)
 {
     float dist;
     float outlineDist = 0;      // distance to the spline itself, inside or out
@@ -159,8 +163,10 @@ float EvaluateStampWeight(
 
     if (closedMask)
     {
-        // Signed distance to the outline (negative inside); the area ends at the outline grown by radius
+        // Signed distance to the outline (negative inside); the area ends at the outline grown by radius.
+        // Outside: the sign turns, so the area is what lies beyond the outline.
         float sd = insideClosed ? -outlineDist : outlineDist;
+        if (outsideClosed) sd = -sd;
         if (sd >= radius + noiseMargin) return 0;
 
         if (noiseFreq > 0 && noiseAmp > 0)
@@ -197,6 +203,25 @@ float EvaluateStampWeight(
 
     float t = (dist - radius) / max(falloff, 0.001);
     return 1.0 - t * t * (3.0 - 2.0 * t);
+}
+
+float EvaluateStampWeight(
+    float2 uv,
+    float2 center,
+    float radius,
+    float falloff,
+    uint splinePointOffset,
+    uint splinePointCount,
+    float noiseFreq,
+    float noiseAmp,
+    uint noiseSeed,
+    StructuredBuffer<StampSplinePoint> splinePoints,
+    out float nearestHeight,
+    out float nearestHalfWidth,
+    bool insetFalloff)
+{
+    return EvaluateStampWeightEx(uv, center, radius, falloff, splinePointOffset, splinePointCount, noiseFreq, noiseAmp,
+        noiseSeed, splinePoints, nearestHeight, nearestHalfWidth, insetFalloff, false);
 }
 
 #endif // TERRAIN_STAMP_COMMON_HLSLI

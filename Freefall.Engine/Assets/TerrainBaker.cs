@@ -76,7 +76,7 @@ namespace Freefall.Assets
 
         // ── GPU structs ──
 
-        /// <summary>GPU struct matching HLSL HeightStampDescriptor. 88 bytes (22 x uint/float).</summary>
+        /// <summary>GPU struct matching HLSL HeightStampDescriptor. 104 bytes (26 x uint/float).</summary>
         [StructLayout(LayoutKind.Sequential)]
         internal struct HeightStampDescriptorGPU
         {
@@ -84,7 +84,7 @@ namespace Freefall.Assets
             public float Radius;             // UV-space inner radius
             public float Falloff;            // UV-space falloff width
             public float TargetHeight;       // normalized [0..1]
-            public uint InvertShape;         // 1 = the heightmap's relief digs instead of raising
+            public uint InvertShape;         // bit 0: the heightmap's relief digs instead of raising; bit 1: Outside
             public uint SplinePointOffset;   // into spline point buffer (0xFFFFFFFF = radial)
             public uint SplinePointCount;    // 0 = radial, high bit = closed area
             public float NoiseFreq;          // edge noise frequency (0 = disabled)
@@ -99,6 +99,8 @@ namespace Freefall.Assets
             public Vector2 HeightmapExtent;  // UV half-size of the heightmap along its turned axes
             public uint MaskPointOffset;     // HeightStamp.MaskSpline's samples (a round stamp under a closed spline)
             public uint MaskPointCount;      // 0 = no mask, else count | closed bit
+            public Vector2 BoundsMin;        // terrain UV box outside which the stamp's weight is 0 (StampBounds)
+            public Vector2 BoundsMax;
         }
 
         /// <summary>GPU struct matching HLSL StampSplinePoint. 16 bytes.</summary>
@@ -357,7 +359,9 @@ namespace Freefall.Assets
             desc = new HeightStampDescriptorGPU();
             float uvScale = 1f / Math.Max(terrainSize.X, terrainSize.Y);
 
-            desc.InvertShape = stamp.InvertShape ? 1u : 0u;
+            // Outside: a closed spline's stamp covers what lies beyond its outline (HeightStamp.Outside)
+            bool outside = stamp.Outside && stamp.IsSplineMode && stamp.GetSpline() is { Closed: true };
+            desc.InvertShape = (stamp.InvertShape ? 1u : 0u) | (outside ? 2u : 0u);
             desc.Falloff = stamp.Falloff * uvScale;
             desc.BlendMode = (uint)stamp.BlendMode;
 
@@ -411,7 +415,15 @@ namespace Freefall.Assets
                     float yaw = MathF.Atan2(-world.M13, world.M11);
                     desc.RotationSin = -MathF.Sin(yaw);
                     desc.RotationCos = MathF.Cos(yaw);
-                    FitHeightmapToSpline(ref desc, splinePoints);
+                    if (outside)
+                    {
+                        // What it covers reaches to the terrain's border: the texture spans the terrain, turned
+                        float e = 0.5f * (MathF.Abs(desc.RotationCos) + MathF.Abs(desc.RotationSin));
+                        desc.HeightmapCenter = new Vector2(0.5f);
+                        desc.HeightmapExtent = new Vector2(e);
+                    }
+                    else
+                        FitHeightmapToSpline(ref desc, splinePoints);
                 }
                 else
                 {
@@ -427,7 +439,51 @@ namespace Freefall.Assets
                 }
             }
 
+            StampBounds(ref desc, splinePoints, outside);
             return true;
+        }
+
+        /// <summary>
+        /// The terrain UV box beyond which a stamp's weight is 0, so the bake skips it there without walking its spline:
+        /// every texel used to evaluate every stamp, and a 4 km terrain with its roads and rivers took ~1.5 s per bake
+        /// (Eldermoor, 2026-10-19), close to the GPU's 2 s timeout. The reach is EvaluateStampWeight's early-out: a
+        /// circle's Radius + Falloff, a closed outline grown by its width (the falloff lies inside), an open spline's
+        /// corridor plus its falloff, each plus the edge noise. An Outside stamp reaches everywhere.
+        /// </summary>
+        private static void StampBounds(ref HeightStampDescriptorGPU desc, List<StampSplinePointGPU> splinePoints, bool outside)
+        {
+            if (outside)
+            {
+                desc.BoundsMin = new Vector2(-1e9f);
+                desc.BoundsMax = new Vector2(1e9f);
+                return;
+            }
+
+            float noise = desc.NoiseFreq > 0 ? desc.NoiseAmp : 0f;
+            if (desc.SplinePointOffset == 0xFFFFFFFF)
+            {
+                // Radial (a mask under a parent's spline only takes from the circle)
+                var reach = new Vector2(desc.Radius + desc.Falloff + noise);
+                desc.BoundsMin = desc.Center - reach;
+                desc.BoundsMax = desc.Center + reach;
+                return;
+            }
+
+            int start = (int)desc.SplinePointOffset;
+            int end = start + (int)(desc.SplinePointCount & 0x7FFFFFFF);
+            bool closed = (desc.SplinePointCount & 0x80000000) != 0;
+            var min = new Vector2(float.MaxValue);
+            var max = new Vector2(float.MinValue);
+            for (int i = start; i < end; i++)
+            {
+                var p = splinePoints[i];
+                float falloff = closed ? 0f : desc.Radius > 1e-7f ? desc.Falloff * p.HalfWidth / desc.Radius : desc.Falloff;
+                var reach = new Vector2(Math.Max(p.HalfWidth, 0f) + falloff + noise);
+                min = Vector2.Min(min, p.UV - reach);
+                max = Vector2.Max(max, p.UV + reach);
+            }
+            desc.BoundsMin = min;
+            desc.BoundsMax = max;
         }
 
         /// <summary>
