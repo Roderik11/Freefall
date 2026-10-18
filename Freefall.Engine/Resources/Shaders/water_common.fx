@@ -132,37 +132,51 @@ float WaterSpecularReflectance(float NdotV, float alpha)
     return saturate(WaterF0 * AB.x + AB.y);
 }
 
-// The sky (and the cloud layer) a rough water surface mirrors, looked up where its reflection lobe peaks: from the
-// mirror direction of the mean normal toward the normal, the more the rougher (Frostbite's dominant direction).
-// That is why a rough sea far away mirrors sky well above the horizon. A lobe reaching under the horizon mirrors other
-// waves, which mirror the sky: it stays at the horizon. ATMOSPHERE_PLAN.md stage 4 replaces the single lookup with the
-// prefiltered sky probe (the whole lobe, the glow round a low sun included).
-//   relPos: surface position relative to the camera
-float3 WaterSkyReflection(SamplerState wrapSampler, float3 V, float3 N, float3 relPos, float alpha)
+// The sky in one direction of a reflection lobe. A direction under the horizon meets the next wave, which mirrors the
+// sky as far above the horizon, as much of it as its Fresnel reflects at that grazing angle (the rest is the dark water
+// body). Clamping such directions to the horizon instead painted every wave back with the horizon's glow: an orange
+// band across the sea at sunset where the backs face the camera. The blur never reaches further under the horizon than
+// the direction stands above it.
+float3 WaterSkyTap(float3 dir, float width)
+{
+    float below = max(-dir.y, 0.0);
+    float nextWave = WaterF0 + (1.0 - WaterF0) * pow(1.0 - below, 5.0);   // 1 at the horizon
+    dir.y = abs(dir.y);
+    return SkyReflectionCone(dir, width, 2.0 * asin(dir.y) + 0.05) * nextWave;
+}
+
+// The sky (and the cloud layer) a rough water surface mirrors, from the sky probe (sky_common.fx SkyReflectionCone).
+// The lobe is centred where it peaks: from the mirror direction of the mean normal toward the normal, the more the
+// rougher (Frostbite's dominant direction), which is why a rough sea far away mirrors sky well above the horizon. A GGX
+// lobe spreads a mirrored direction over ~2.6 α radians (full width at half maximum) up and down, but sideways only
+// N·V of that: a wave tilted sideways turns a grazing reflection little (why a sun path is a tall narrow streak). One
+// probe lookup blurred as wide as the tall side mixed in sky far to the side of the sun and greyed the sunset sea, so
+// five lookups lie along the tall side, each blurred as wide as the narrow side (at least their spacing).
+// Until stage 6 (2026-10-18) one sharp sky lookup and a ray of its own into the cloud layer, flat-shaded.
+float3 WaterSkyReflection(float3 V, float3 N, float alpha)
 {
     float3 R = reflect(-V, N);
     float smoothness = saturate(1.0 - alpha);
-    float3 dir = lerp(N, R, smoothness * (sqrt(smoothness) + alpha));
-    dir.y = max(dir.y, 0.0);
-    dir = normalize(dir);
-    float3 skyRefl = SkyRadiance(dir);
+    float3 dir = normalize(lerp(N, R, smoothness * (sqrt(smoothness) + alpha)));
 
-    // Cloud layer: same plane / UVs / density as the sky dome (and its horizon fade), flat-shaded with the light on it
-    // (sky_common.fx GetCloudLight: the sun and moon through the air, the sky's ambient, the air in front)
-    if (CloudNoiseLUTIdx != 0 && dir.y > 0.01)
+    float tall = 2.6 * alpha;
+    float spacing = tall * 0.2;
+    float width = max(tall * saturate(dot(N, V)), spacing);
+    float3 up = float3(0, 1, 0) - dir * dir.y;                     // toward the zenith, across dir
+    up = dot(up, up) > 1e-6 ? normalize(up) : float3(1, 0, 0);     // looking straight down: any way is up
+
+    float3 sky = WaterSkyTap(dir, width) * 0.4;
+    [unroll] for (int k = 1; k <= 2; k++)
     {
-        Texture3D<float4> cloudLUT = ResourceDescriptorHeap[CloudNoiseLUTIdx];
-        float2 cloudUV = CloudLayerUV(relPos.xz + dir.xz * (CloudAltitude / dir.y));
-        float cloudMip = saturate(1.0 - dir.y * 5.0) * 3.0;
-        float cloudDensity = smoothstep(0.0, 0.45, CloudBaseDensity(cloudLUT, wrapSampler, cloudUV, cloudMip));
-        cloudDensity *= smoothstep(0.0, 0.22, dir.y);
-        if (cloudDensity > 0.001)
-            skyRefl = lerp(skyRefl, CloudFlatRadiance(GetCloudLight(dir)), 1.0 - exp(-cloudDensity * 4.5));
+        float s, c;
+        sincos(spacing * k, s, c);
+        float w = k == 1 ? 0.2 : 0.1;
+        sky += (WaterSkyTap(dir * c + up * s, width) + WaterSkyTap(dir * c - up * s, width)) * w;
     }
-    return skyRefl;
+    return sky;
 }
 
-// Light from the whole sky falling on a level surface. skyAmbient = SkyAmbientLight() = E / π (pre-exposed), so
+// Light from the whole sky falling on a level surface. skyAmbient = SkyAmbient(up) = E / π (pre-exposed), so
 // this is E. At sunset this, not the low sun, is what lights water from inside: with the sun term alone the
 // shallow shelf and the deep colour went black. (Before the physical sky: zenith × 0.45 × 7, a guess at the same.)
 float3 WaterSkyIrradiance(float3 skyAmbient)
@@ -259,7 +273,7 @@ WaterColumn GetWaterColumn(SamplerState s, uint depthSRV, uint compositeSRV, flo
     return col;
 }
 
-// Foam lighting shared by all water (sun + sky ambient; skyAmbient = SkyAmbientLight())
+// Foam lighting shared by all water (sun + sky ambient; skyAmbient = SkyAmbient(N), the sky's light on the foam's face)
 float3 WaterFoamLit(float3 foamAlbedo, float NdotL, float3 sunRadiance, float3 skyAmbient)
 {
     return foamAlbedo * ((0.27 + 0.5 * NdotL) * sunRadiance + skyAmbient * 1.15);

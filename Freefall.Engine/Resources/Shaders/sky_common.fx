@@ -82,6 +82,24 @@ float3 SkyReflection(float3 R, float roughness)
     return probe.SampleLevel(AtmosphereLinearClamp, R, saturate(roughness) * (A.SkyProbeMips - 1.0)).rgb;
 }
 
+// The sky's light round direction R averaged over a cone `width` radians across, from the sky probe's mip whose texels
+// are that wide (mip 0's texels span 90° / its size; each mip doubles them). maxWidth caps the blur (water: the lobe
+// never reaches under the horizon). Without the probe as SkyReflection.
+float3 SkyReflectionCone(float3 R, float width, float maxWidth)
+{
+    if (AtmosphereIdx == 0)
+        return 0;
+    AtmosphereParams A = LoadAtmosphere();
+    if (A.SkyProbeCube == 0)
+        return SkyReflection(R, 0.0);
+    TextureCube<float4> probe = ResourceDescriptorHeap[A.SkyProbeCube];
+    float size, height, mips;
+    probe.GetDimensions(0, size, height, mips);
+    float texel = 0.5 * ATM_PI / size;
+    float mip = clamp(log2(max(min(width, maxWidth), 1e-4) / texel), 0.0, mips - 1.0);
+    return probe.SampleLevel(AtmosphereLinearClamp, R, mip).rgb;
+}
+
 // The terrain under the atmosphere's parameters, for sky_visibility.hlsli (Heightmap 0 = none, or SkyVisibility off)
 TerrainCover LoadTerrainCover()
 {
@@ -433,12 +451,6 @@ CloudLight GetCloudLight(float3 dir)
     float3 sky = AtmosphereSkyLuminance(A, normalize(float3(dir.x, mu, dir.z))) * Exposure;
     c.inFront = sky * saturate((1.0 - c.viewT) / max(1.0 - toTop, 1e-4));
     return c;
-}
-
-// The cloud layer as one flat colour (no self-shadowing, no lining), as it appears from the camera: for reflections.
-float3 CloudFlatRadiance(CloudLight c)
-{
-    return CloudAlbedo * ((c.sun + c.moon) * 0.25 + c.ambient) * c.viewT + c.inFront;
 }
 
 // ── The cloud layer as the sky dome draws it (mesh_skybox.fx), and the sky probe (sky_probe_cs.hlsl) with it ──

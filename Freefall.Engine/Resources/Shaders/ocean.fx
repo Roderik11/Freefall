@@ -385,7 +385,7 @@ struct DSOutput
     float3 UndisplacedXZ : TEXCOORD1;  // Pre-displacement XZ for PS texture sampling
     float Depth : TEXCOORD2;
     nointerpolation uint InstanceIdx : TEXCOORD3;
-    float4 SkyAmbient : TEXCOORD4;     // rgb: the sky's ambient (as composition), constant per frame
+    float4 SkyAmbient : TEXCOORD4;     // rgb: the sky's light on a level surface (SkyAmbient(up), the sky probe), constant per frame
 };
 
 [domain("tri")]
@@ -469,7 +469,7 @@ DSOutput DS(HullConstantOutput patchConstants,
     output.Position = mul(mul(float4(displaced, 1.0), View), Projection);
     output.Depth = output.Position.w;
     output.InstanceIdx = idx;
-    output.SkyAmbient = float4(SkyAmbientLight(), 1.0);
+    output.SkyAmbient = float4(SkyAmbient(float3(0, 1, 0)), 1.0);
 
     return output;
 }
@@ -591,7 +591,7 @@ PSOutput PS(DSOutput input)
     // ── Reflectance, sky reflection and sun glint: shared with lakes and rivers (water_common.fx) ──
     // All from the mean normal and the slope variance under the pixel: no distance ramps.
     float F = WaterSpecularReflectance(NdotV, alpha);
-    float3 reflectColor = WaterSkyReflection(OceanSampler, V, N, worldPos - camPos, alpha) * skyVisible;   // no sky to mirror under a cliff
+    float3 reflectColor = WaterSkyReflection(V, N, alpha) * skyVisible;   // no sky to mirror under a cliff
     float3 specular = WaterSunSpecular(N, V, L, sunRadiance * 3.14159, alpha);
 
     // ── Water column: what is seen through the surface ──
@@ -839,9 +839,12 @@ PSOutput PS(DSOutput input)
     // in the hard pixel edge where the water surface cuts into the beach.
     foam *= smoothstep(0.0, 0.025, pathLen);
     foamTex = lerp(foamTex, 0.5, foamFar);
-    float3 foamAlbedo = float3(0.80, 0.80, 0.78) * lerp(0.7, 1.0, foamTex);
-    float3 foamLit = foamAlbedo * ((0.27 + 0.5 * NdotL) * sunRadiance + skyAmbient * 1.15);
-    color = lerp(color, foamLit, foam * 0.9);
+    if (foam > 0.001)
+    {
+        float3 foamAlbedo = float3(0.80, 0.80, 0.78) * lerp(0.7, 1.0, foamTex);
+        float3 foamLit = WaterFoamLit(foamAlbedo, NdotL, sunRadiance, SkyAmbient(N) * skyVisible);
+        color = lerp(color, foamLit, foam * 0.9);
+    }
 
     // ── The air between the camera and the water (the atmosphere's aerial perspective) ──
     color = ApplyAerialPerspective(color, input.Position.xy, input.Depth, skyVisible);
