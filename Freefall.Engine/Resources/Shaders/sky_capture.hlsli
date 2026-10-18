@@ -26,10 +26,12 @@ float SkyCaptureViewLight(SkyCaptureView v, uint slice, Texture2DArray<float> de
     // A direction not captured yet weighs nothing.
     float w = (max(dot(N, v.Direction), 0.0) / max(v.Direction.y, 0.05) + 0.05) * v.Valid;
 
-    // Seen from just off the surface (a fifth of a metre out along its normal, 0.3 m toward the sky), so that the
-    // surface's own texels in the map are not in the way. Half a metre along the normal pushed the edges of floor stones
-    // and corner pieces that face a wall through it into the daylight: bright seams in a dark room.
-    float3 p = worldPos + N * 0.2 + v.Direction * 0.3;
+    // Seen from 0.4 m out along the surface's normal, so that its own texels in the map are not in the way (the lift also
+    // shifts the point across the map, as normal-offset shadows do). Nothing toward the sky: 0.3 m that way lifted the
+    // underside of a roof and the top of a gable wall through the thin roof boards into daylight (bright bands along the
+    // roof line, user 2026-10-18); along the normal a point moves away from its own surface and does not cross a roof or
+    // wall that meets it at an angle.
+    float3 p = worldPos + N * 0.4;
     float4 clip = mul(float4(p, 1.0), v.VP);
     float2 uv = clip.xy * float2(0.5, -0.5) + 0.5;
     float2 edge = min(uv, 1.0 - uv);
