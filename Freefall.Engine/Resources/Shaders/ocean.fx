@@ -473,14 +473,9 @@ DSOutput DS(HullConstantOutput patchConstants,
             float shoreBlend = smoothstep(0, ocean.ShoreDepth, waterDepth);
             float shoreAtten = lerp(ocean.ShoreMinWave, 1.0, shoreBlend);
 
-            // Where the terrain lies on its floor it has no seabed to tell either: a flat plane under the sea with the
-            // land raised from it (Eldermoor's floor is 12 m down), so open sea as outside it. The shore damps the waves
-            // only over the land's slope, faded in over its lower half so the foot of the slope draws no line. Until
-            // 2026-10-18 the whole floor counted as a 12 m shelf: the long waves stood at a third of their height
-            // everywhere on the map and grew to full height over the 150 m past its border
-            float floorDepth = max(ocean.OceanPlaneY - ocean.TerrainBaseY, 1.0);
-            float onFloor = 1.0 - smoothstep(0.0, 0.5 * floorDepth, terrainWorldY - ocean.TerrainBaseY);
-            float open = max(smoothstep(0.0, 150.0, outside), onFloor);
+            // The terrain is the seabed: a sea built on a flat floor needs seabed stamps to deepen (Eldermoor since
+            // 2026-10-19). For a day before that, terrain lying on its floor counted as open sea here, a stand-in
+            float open = smoothstep(0.0, 150.0, outside);
             waveAtten = lerp(shoreAtten, 1.0, open);
             shoreDepth = max(waterDepth, 0.0) + open * 1e4;
         }
@@ -713,11 +708,8 @@ PSOutput PS(DSOutput input)
             float terrainY = ocean.TerrainBaseY + h * ocean.MaxTerrainHeight;
             terrainDepth = worldPos.y - terrainY;
             stillDepth = ocean.OceanPlaneY - terrainY;
-            // No bed on the terrain's floor either (DS): only the land's slope shows the turquoise shelf. The flat floor
-            // 12 m down tinted all of Eldermoor's sea, up to a line 150 m past the border
-            float floorDepth = max(ocean.OceanPlaneY - ocean.TerrainBaseY, 1.0);
-            float onFloor = 1.0 - smoothstep(0.0, 0.5 * floorDepth, terrainY - ocean.TerrainBaseY);
-            shallowFade = (1.0 - smoothstep(0.0, 150.0, outside)) * (1.0 - onFloor);
+            // The turquoise shelf is wherever the seabed is shallow (no floor rule since 2026-10-19, as in the DS)
+            shallowFade = 1.0 - smoothstep(0.0, 150.0, outside);
             // Under the land: where the terrain stands more than 3 m above the still sea (far past any wave's run-up)
             // the sea shows only where the terrain does not cover what is under it, a sea cave under a hill or a
             // terrain hole. That is no beach: read as one, it was a sheet of "shore" foam. Open water there
