@@ -174,22 +174,28 @@ float3 AtmTransmittanceToLight(AtmosphereParams A, float3 posKm, float3 lightDir
     return AtmTransmittance(A, r, mu);
 }
 
-// How much of a light reaches a place in the air past the terrain: 0 in the terrain's shadow toward it (the shadow height
-// maps of terrain_light_shadow_cs.hlsl, one per light), soft over 4 m either side of the shadow's top. 1 without the maps,
-// outside them, and for a light at or below the horizon (no map then: the earth's shadow takes over). moon: the brightest
-// moon's map instead of the sun's. worldPos is absolute. Without it the air in front of a mountain the sun stood behind
-// glowed orange as if the sun shone through the rock (god rays: the mountains' shafts in the haze).
-float AtmTerrainLightVisibility(AtmosphereParams A, float3 worldPos, bool moon)
+// How far a place lies above the top of the terrain's shadow toward a light, in metres (negative inside the shadow), from
+// the shadow height maps of terrain_light_shadow_cs.hlsl, one per light. 1e4 without the maps, outside them, and for a
+// light at or below the horizon (no map then: the earth's shadow takes over). moon: the brightest moon's map instead of
+// the sun's. worldPos is absolute.
+float AtmTerrainLightMargin(AtmosphereParams A, float3 worldPos, bool moon)
 {
     uint map = moon ? A.TerrainMoonShadow : A.TerrainSunShadow;
     if (map == 0)
-        return 1.0;
+        return 1e4;
     float2 uv = (worldPos.xz - A.TerrainShadowOrigin) / A.TerrainShadowSize;
     if (any(uv < 0.0) || any(uv > 1.0))
-        return 1.0;
+        return 1e4;
     Texture2D<float> shadowTop = ResourceDescriptorHeap[map];
-    float top = shadowTop.SampleLevel(AtmosphereLinearClamp, uv, 0);
-    return smoothstep(top - 4.0, top + 4.0, worldPos.y);
+    return worldPos.y - shadowTop.SampleLevel(AtmosphereLinearClamp, uv, 0);
+}
+
+// How much of a light reaches a place in the air past the terrain: 0 in the terrain's shadow toward it, soft over 4 m
+// either side of the shadow's top (AtmTerrainLightMargin). Without it the air in front of a mountain the sun stood behind
+// glowed orange as if the sun shone through the rock (god rays: the mountains' shafts in the haze).
+float AtmTerrainLightVisibility(AtmosphereParams A, float3 worldPos, bool moon)
+{
+    return smoothstep(-4.0, 4.0, AtmTerrainLightMargin(A, worldPos, moon));
 }
 
 // ── Multiple scattering LUT (Hillaire's Ψ_ms: light scattered twice or more, per unit illuminance) ──
@@ -297,6 +303,33 @@ float3 AtmosphereSkyLuminance(AtmosphereParams A, float3 dir)
     return L + AtmAirglow(A, dir, T);
 }
 
+// A volume read with a cubic B-spline across the screen and linearly in depth: 4 trilinear taps (Sigg & Hadwiger,
+// GPU Gems 2 ch. 20). Linear filtering bends the gradient at every cell border, which the eye reads as a grid (Mach
+// bands): the terrain's shadow in the haze showed its 20 px cells along a ridge. The B-spline's curve is smooth through
+// them, for a haze about one cell softer.
+float4 SampleScreenBSpline(Texture3D<float4> volume, float2 screenUV, float w)
+{
+    float width, height, depth;
+    volume.GetDimensions(width, height, depth);
+    float2 size = float2(width, height);
+    float2 coord = screenUV * size - 0.5;           // texel i's centre at i
+    float2 index = floor(coord);
+    float2 f = coord - index;
+    float2 f2 = f * f, f3 = f2 * f;
+    float2 w0 = (1.0 - 3.0 * f + 3.0 * f2 - f3) / 6.0;
+    float2 w1 = (4.0 - 6.0 * f2 + 3.0 * f3) / 6.0;
+    float2 w2 = (1.0 + 3.0 * f + 3.0 * f2 - 3.0 * f3) / 6.0;
+    float2 w3 = f3 / 6.0;
+    float2 g0 = w0 + w1, g1 = w2 + w3;
+    // Each tap lands between two texels so the linear filter weighs them as the B-spline would
+    float2 h0 = (index - 0.5 + w1 / g0) / size;
+    float2 h1 = (index + 1.5 + w3 / g1) / size;
+    return g0.y * (g0.x * volume.SampleLevel(AtmosphereLinearClamp, float3(h0.x, h0.y, w), 0)
+                 + g1.x * volume.SampleLevel(AtmosphereLinearClamp, float3(h1.x, h0.y, w), 0))
+         + g1.y * (g0.x * volume.SampleLevel(AtmosphereLinearClamp, float3(h0.x, h1.y, w), 0)
+                 + g1.x * volume.SampleLevel(AtmosphereLinearClamp, float3(h1.x, h1.y, w), 0));
+}
+
 // Aerial perspective between the camera and a point on screen at a view depth (metres): rgb = light scattered in
 // on the way (cd/m² × Exposure, i.e. what the pixel stores), a = how much of the point's own light gets through.
 // From this view's volume (SceneConstants.AerialPerspectiveIdx); a build that predates it set the shared one in the
@@ -316,7 +349,7 @@ float4 AtmosphereAerialPerspective(AtmosphereParams A, float2 screenUV, float vi
         w = 0.5 / AP_SLICES;
     }
     Texture3D<float4> ap = ResourceDescriptorHeap[volume];
-    float4 s = ap.SampleLevel(AtmosphereLinearClamp, float3(screenUV, w), 0);
+    float4 s = SampleScreenBSpline(ap, screenUV, w);
     float3 inscatter = s.rgb * weight;   // already sun + moon, × Exposure (CSAerialPerspective)
     float transmittance = 1.0 - weight * (1.0 - s.a);
     return float4(inscatter, transmittance);

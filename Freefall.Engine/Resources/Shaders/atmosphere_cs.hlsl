@@ -247,20 +247,48 @@ void CSSkyView(uint3 id : SV_DispatchThreadID)
 // AP_STEPS samples per slice. The volume is sized to the view (Graphics/AerialPerspectiveVolume.cs: a cell per ~20
 // pixels): at 32×32 the terrain's shadow in the haze showed 40-110 px steps along a ridge, and a march per froxel from
 // the camera (up to 32 samples each, ~784 a column) would have cost ~6× as much at that size.
+// The terrain's shadow is not sampled at a point per step: a step a few hundred metres long that a shadow edge crosses
+// was lit or dark as a whole, all the columns together, and the haze showed contour bands along the shafts. Instead the
+// step's lit share comes from how far the ray lies above the shadow's top at its start, middle and end, linear between
+// (APLitShare): it changes smoothly as the ray turns past an edge. Four times the samples cost 0.1 ms more and did
+// less; a 4×4 dither of the sample places over the columns, smoothed by the lookup's B-spline, left a checkerboard.
 
 #define AP_STEPS 3
 
+// ∫ saturate(x) dx from 0: the soft edge of the terrain's shadow as a ramp
+float APRampIntegral(float x)
+{
+    return x <= 0.0 ? 0.0 : (x >= 1.0 ? x - 0.5 : 0.5 * x * x);
+}
+
+// The lit share of a stretch of the ray along which its margin above the shadow's top (AtmTerrainLightMargin) goes
+// linearly from m0 to m1: the mean of the ±4 m ramp over it
+float APLitShare(float m0, float m1)
+{
+    float a = (m0 + 4.0) / 8.0, b = (m1 + 4.0) / 8.0;
+    if (abs(b - a) < 1e-3)
+        return saturate(0.5 * (a + b));
+    return (APRampIntegral(b) - APRampIntegral(a)) / (b - a);
+}
+
 // One body's light scattered toward the camera at a sample, per unit illuminance and km: single scattering through the
-// air above (0 in the earth's shadow and the terrain's) with the given phase-weighted scattering, plus Ψ_ms
-float3 APSampleLight(AtmosphereParams A, AtmMedium medium, float3 P, float3 up, float pHeight, float3 worldPos,
-                     float3 lightDir, float miePhase, float rayleighPhase, bool moon)
+// air above (0 in the earth's shadow; × terrainLit, the step's share out of the terrain's shadow) with the given
+// phase-weighted scattering, plus Ψ_ms
+float3 APSampleLight(AtmosphereParams A, AtmMedium medium, float3 P, float3 up, float pHeight, float terrainLit,
+                     float3 lightDir, float miePhase, float rayleighPhase)
 {
     float lightZenithCos = dot(lightDir, up);
     float3 toLight = AtmTransmittance(A, pHeight, lightZenithCos);
     float tEarth = RaySphereIntersectNearest(P, lightDir, PLANET_RADIUS_OFFSET * up, A.BottomRadius);
-    float visible = tEarth >= 0.0 ? 0.0 : AtmTerrainLightVisibility(A, worldPos, moon);
+    float visible = tEarth >= 0.0 ? 0.0 : terrainLit;
     float3 single = medium.scatteringMie * miePhase + medium.scatteringRay * rayleighPhase;
     return visible * toLight * single + AtmMultipleScattering(A, P, lightZenithCos) * medium.scattering;
+}
+
+// A point of the ray in the world (the atmosphere's frame: km round the camera, the ground flat as the world's)
+float3 APWorldPos(AtmosphereParams A, float3 P)
+{
+    return float3(CamPos.x + P.x * 1000.0, (P.y - A.BottomRadius) * 1000.0, CamPos.z + P.z * 1000.0);
 }
 
 [numthreads(8, 8, 1)]
@@ -297,6 +325,9 @@ void CSAerialPerspective(uint3 id : SV_DispatchThreadID)
     float3 L = 0;               // × the illuminances
     float3 throughput = 1.0;
     float t = 0.0;
+    // The ray's margin above the terrain's shadow toward the sun and the moon where the step starts
+    float sunMargin = AtmTerrainLightMargin(A, APWorldPos(A, pos), false);
+    float moonMargin = moonLit ? AtmTerrainLightMargin(A, APWorldPos(A, pos), true) : 1e4;
     for (uint s = 0; s < slices; s++)
     {
         float w = (s + 0.5) / slices;
@@ -307,16 +338,27 @@ void CSAerialPerspective(uint3 id : SV_DispatchThreadID)
             for (uint k = 0; k < AP_STEPS; k++)
             {
                 float3 P = pos + (t + (k + 0.5) * dt) * dir;
+                float3 worldMid = APWorldPos(A, P);
+                float3 worldEnd = APWorldPos(A, pos + (t + (k + 1.0) * dt) * dir);
                 float pHeight = length(P);
                 float3 up = P / pHeight;
-                float3 worldPos = float3(CamPos.x + P.x * 1000.0, (P.y - A.BottomRadius) * 1000.0, CamPos.z + P.z * 1000.0);
                 AtmMedium medium = SampleAtmMedium(P, A);
 
-                float3 S = A.SunIlluminance * APSampleLight(A, medium, P, up, pHeight, worldPos, A.SunDirection,
-                                                            sunMie, sunRayleigh, false);
+                float midMargin = AtmTerrainLightMargin(A, worldMid, false);
+                float endMargin = AtmTerrainLightMargin(A, worldEnd, false);
+                float sunLit = 0.5 * (APLitShare(sunMargin, midMargin) + APLitShare(midMargin, endMargin));
+                sunMargin = endMargin;
+                float3 S = A.SunIlluminance * APSampleLight(A, medium, P, up, pHeight, sunLit, A.SunDirection,
+                                                            sunMie, sunRayleigh);
                 if (moonLit)
-                    S += A.MoonIlluminance * APSampleLight(A, medium, P, up, pHeight, worldPos, A.MoonDirection,
-                                                           moonMie, moonRayleigh, true);
+                {
+                    midMargin = AtmTerrainLightMargin(A, worldMid, true);
+                    endMargin = AtmTerrainLightMargin(A, worldEnd, true);
+                    float moonShare = 0.5 * (APLitShare(moonMargin, midMargin) + APLitShare(midMargin, endMargin));
+                    moonMargin = endMargin;
+                    S += A.MoonIlluminance * APSampleLight(A, medium, P, up, pHeight, moonShare, A.MoonDirection,
+                                                           moonMie, moonRayleigh);
+                }
 
                 // ∫ S e^(−σx) dx over the step (Frostbite 2015), written so a short step of clear air keeps its light
                 float3 x = medium.extinction * dt;
