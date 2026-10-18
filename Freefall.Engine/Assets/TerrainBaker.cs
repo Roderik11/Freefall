@@ -76,7 +76,7 @@ namespace Freefall.Assets
 
         // ── GPU structs ──
 
-        /// <summary>GPU struct matching HLSL HeightStampDescriptor. 64 bytes (16 x uint/float).</summary>
+        /// <summary>GPU struct matching HLSL HeightStampDescriptor. 80 bytes (20 x uint/float).</summary>
         [StructLayout(LayoutKind.Sequential)]
         internal struct HeightStampDescriptorGPU
         {
@@ -84,7 +84,7 @@ namespace Freefall.Assets
             public float Radius;             // UV-space inner radius
             public float Falloff;            // UV-space falloff width
             public float TargetHeight;       // normalized [0..1]
-            public uint InvertShape;         // 0 = flatten toward, 1 = push away
+            public uint InvertShape;         // 1 = the heightmap's relief digs instead of raising
             public uint SplinePointOffset;   // into spline point buffer (0xFFFFFFFF = radial)
             public uint SplinePointCount;    // 0 = radial, high bit = closed area
             public float NoiseFreq;          // edge noise frequency (0 = disabled)
@@ -92,9 +92,11 @@ namespace Freefall.Assets
             public uint NoiseSeed;
             public uint HeightmapIdx;        // bindless SRV index (0 = no heightmap)
             public float HeightmapStrength;  // normalized strength (worldStrength / maxHeight)
-            public float RotationSin;        // sin(entity Y rotation)
-            public float RotationCos;        // cos(entity Y rotation)
+            public float RotationSin;        // the heightmap's turn: UV delta → texture frame
+            public float RotationCos;
             public uint BlendMode;           // HeightBlendMode
+            public Vector2 HeightmapCenter;  // terrain UV of the heightmap's centre
+            public Vector2 HeightmapExtent;  // UV half-size of the heightmap along its turned axes
         }
 
         /// <summary>GPU struct matching HLSL StampSplinePoint. 16 bytes.</summary>
@@ -393,15 +395,60 @@ namespace Freefall.Assets
                 desc.HeightmapIdx = stamp.Heightmap.BindlessIndex;
                 desc.HeightmapStrength = stamp.Strength / maxHeight;
 
-                // Extract Y rotation from entity transform
-                var rot = stamp.Transform?.Rotation ?? Quaternion.Identity;
-                float yaw = MathF.Atan2(2f * (rot.W * rot.Y + rot.X * rot.Z),
-                                        1f - 2f * (rot.Y * rot.Y + rot.Z * rot.Z));
-                desc.RotationSin = MathF.Sin(yaw);
-                desc.RotationCos = MathF.Cos(yaw);
+                if (stamp.IsSplineMode)
+                {
+                    // The texture turns with the spline (the entity's world yaw) and spans its footprint
+                    var world = stamp.Transform?.Matrix ?? Matrix4x4.Identity;
+                    float yaw = MathF.Atan2(-world.M13, world.M11);
+                    desc.RotationSin = -MathF.Sin(yaw);
+                    desc.RotationCos = MathF.Cos(yaw);
+                    FitHeightmapToSpline(ref desc, splinePoints);
+                }
+                else
+                {
+                    // A radial stamp's texture spans Radius + Falloff each way. It has always turned against its
+                    // entity (sin taken as the inverse's); kept so rotated stamps in existing scenes keep their shape.
+                    var rot = stamp.Transform?.Rotation ?? Quaternion.Identity;
+                    float yaw = MathF.Atan2(2f * (rot.W * rot.Y + rot.X * rot.Z),
+                                            1f - 2f * (rot.Y * rot.Y + rot.Z * rot.Z));
+                    desc.RotationSin = MathF.Sin(yaw);
+                    desc.RotationCos = MathF.Cos(yaw);
+                    desc.HeightmapCenter = desc.Center;
+                    desc.HeightmapExtent = new Vector2(desc.Radius + desc.Falloff);
+                }
             }
 
             return true;
+        }
+
+        /// <summary>
+        /// A spline stamp's heightmap covers what the stamp reaches, as a radial stamp's covers its Radius + Falloff:
+        /// the rectangle, in the texture's turned frame, around every sample's half-width, falloff and edge noise.
+        /// A closed spline's area thereby gets the whole texture and its outline is where the texture fades out.
+        /// </summary>
+        private static void FitHeightmapToSpline(ref HeightStampDescriptorGPU desc, List<StampSplinePointGPU> splinePoints)
+        {
+            int start = (int)desc.SplinePointOffset;
+            int end = start + (int)(desc.SplinePointCount & 0x7FFFFFFF);
+            float s = desc.RotationSin, c = desc.RotationCos;
+
+            var min = new Vector2(float.MaxValue);
+            var max = new Vector2(float.MinValue);
+            for (int i = start; i < end; i++)
+            {
+                var p = splinePoints[i];
+                // The falloff tapers with the sample's width, as in EvaluateStampWeight
+                float falloff = desc.Radius > 1e-7f ? desc.Falloff * p.HalfWidth / desc.Radius : desc.Falloff;
+                var reach = new Vector2(Math.Max(p.HalfWidth, 0f) + falloff + desc.NoiseAmp);
+                var local = new Vector2(p.UV.X * c + p.UV.Y * s, -p.UV.X * s + p.UV.Y * c);
+                min = Vector2.Min(min, local - reach);
+                max = Vector2.Max(max, local + reach);
+            }
+
+            // Back from the turned frame (the transpose of the turn above) to terrain UV
+            var mid = (min + max) * 0.5f;
+            desc.HeightmapCenter = new Vector2(mid.X * c - mid.Y * s, mid.X * s + mid.Y * c);
+            desc.HeightmapExtent = Vector2.Max((max - min) * 0.5f, new Vector2(1e-6f));
         }
 
         /// <summary>

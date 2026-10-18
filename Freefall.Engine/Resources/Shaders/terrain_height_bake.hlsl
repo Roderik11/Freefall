@@ -501,14 +501,14 @@ void CS_ErosionFilter(uint3 dtid : SV_DispatchThreadID)
 
 #include "terrain_stamp_common.hlsli"
 
-// Per-stamp descriptor (matches C# HeightStampDescriptorGPU, 64 bytes)
+// Per-stamp descriptor (matches C# HeightStampDescriptorGPU, 80 bytes)
 struct HeightStampDescriptor
 {
     float2 Center;             // terrain UV center (radial mode)
     float  Radius;             // UV-space inner radius
     float  Falloff;            // UV-space falloff width
     float  TargetHeight;       // normalized target height [0..1]
-    uint   InvertShape;        // 0 = flatten toward, 1 = push away
+    uint   InvertShape;        // 1 = the heightmap's relief digs instead of raising
     uint   SplinePointOffset;  // offset into spline point buffer (0xFFFFFFFF = radial)
     uint   SplinePointCount;   // number of spline points (0 = radial, high bit = closed area)
     float  NoiseFreq;          // edge noise frequency (0 = disabled)
@@ -516,9 +516,11 @@ struct HeightStampDescriptor
     uint   NoiseSeed;          // noise seed
     uint   HeightmapIdx;       // bindless SRV index (0 = no heightmap)
     float  HeightmapStrength;  // normalized strength (worldStrength / maxHeight)
-    float  RotationSin;        // sin(entity Y rotation)
-    float  RotationCos;        // cos(entity Y rotation)
+    float  RotationSin;        // the heightmap's turn: UV delta → texture frame
+    float  RotationCos;
     uint   BlendMode;          // 0=Set, 1=Add, 2=Max, 3=Lerp (as Set), 4=Min
+    float2 HeightmapCenter;    // terrain UV of the heightmap's centre
+    float2 HeightmapExtent;    // UV half-size of the heightmap along its turned axes
 };
 
 [numthreads(8, 8, 1)]
@@ -556,22 +558,20 @@ void CS_InfluenceLayer(uint3 dtid : SV_DispatchThreadID)
         // Heightmap: add spatially-varying height from texture
         if (stamp.HeightmapIdx != 0)
         {
-            // Compute local UV within stamp footprint
-            float2 localDelta = uv - stamp.Center;
-
-            // Apply inverse rotation
+            // Into the texture's frame: its centre, turned, [-extent, +extent] → [0, 1]. The extent is
+            // Radius + Falloff for a radial stamp and the footprint of a spline stamp (TerrainBaker.FitHeightmapToSpline).
+            float2 localDelta = uv - stamp.HeightmapCenter;
             float2 rotLocal = float2(
                 localDelta.x * stamp.RotationCos + localDelta.y * stamp.RotationSin,
                -localDelta.x * stamp.RotationSin + localDelta.y * stamp.RotationCos
             );
-
-            // Map from [-extent, +extent] to [0, 1] for heightmap sampling
-            float extent = stamp.Radius + stamp.Falloff;
-            float2 hmUV = rotLocal / extent * 0.5 + 0.5;
+            float2 hmUV = rotLocal / stamp.HeightmapExtent * 0.5 + 0.5;
 
             Texture2D<float> Heightmap = ResourceDescriptorHeap[stamp.HeightmapIdx];
-            float hmValue = Heightmap.SampleLevel(sampLinear, hmUV, 0);
-            targetH += hmValue * stamp.HeightmapStrength;
+            float relief = Heightmap.SampleLevel(sampLinear, hmUV, 0) * stamp.HeightmapStrength;
+
+            // InvertShape turns the relief upside down: the texture digs (lake depths, craters)
+            targetH += stamp.InvertShape ? -relief : relief;
         }
 
         // Combine with the height built so far, then fade by the stamp weight
@@ -580,10 +580,7 @@ void CS_InfluenceLayer(uint3 dtid : SV_DispatchThreadID)
         else if (stamp.BlendMode == 2) blended = max(currentHeight, targetH); // Max
         else if (stamp.BlendMode == 4) blended = min(currentHeight, targetH); // Min
 
-        // Optionally invert the displacement
-        float delta = blended - currentHeight;
-        if (stamp.InvertShape) delta = -delta;
-        currentHeight += delta * weight;
+        currentHeight += (blended - currentHeight) * weight;
         modified = true;
     }
 

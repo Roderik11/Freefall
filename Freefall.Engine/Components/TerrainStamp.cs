@@ -369,6 +369,17 @@ namespace Freefall.Components
             Vector3 prevOuterLeft = Vector3.Zero, prevOuterRight = Vector3.Zero;
             bool hasFalloff = Falloff > 0.01f;
 
+            // A closed spline is an area: its core is the outline grown by Radius and the falloff lies outside
+            // (EvaluateStampWeight), so only the outer side gets lines. 'perp' is the left side of travel,
+            // which is the inside of a counter-clockwise outline.
+            bool drawLeft = true, drawRight = true;
+            if (spline.Closed)
+            {
+                bool counterClockwise = SignedAreaXZ(spline, samples) > 0f;
+                drawLeft = !counterClockwise;
+                drawRight = counterClockwise;
+            }
+
             for (int i = 0; i <= samples; i++)
             {
                 float t = (float)i / samples;
@@ -392,8 +403,8 @@ namespace Freefall.Components
                 {
                     ctx.Color = GizmoColor;
                     ctx.LineWidth = 1.5f;
-                    ctx.DrawLine(prevLeft, left);
-                    ctx.DrawLine(prevRight, right);
+                    if (drawLeft) ctx.DrawLine(prevLeft, left);
+                    if (drawRight) ctx.DrawLine(prevRight, right);
                 }
 
                 if (hasFalloff)
@@ -405,8 +416,8 @@ namespace Freefall.Components
                     {
                         ctx.Color = new Color4(GizmoColor.R, GizmoColor.G, GizmoColor.B, 0.4f);
                         ctx.LineWidth = 1f;
-                        ctx.DrawLine(prevOuterLeft, outerLeft);
-                        ctx.DrawLine(prevOuterRight, outerRight);
+                        if (drawLeft) ctx.DrawLine(prevOuterLeft, outerLeft);
+                        if (drawRight) ctx.DrawLine(prevOuterRight, outerRight);
                     }
 
                     prevOuterLeft = outerLeft;
@@ -434,10 +445,24 @@ namespace Freefall.Components
                 var perp = Vector3.Normalize(new Vector3(-tangent.Z, 0, tangent.X));
 
                 float outerR = (Radius + Falloff) * spline.GetPointWidth(i);
-                ctx.DrawLine(point - perp * outerR, point + perp * outerR);
+                ctx.DrawLine(drawRight ? point - perp * outerR : point, drawLeft ? point + perp * outerR : point);
             }
 
             ctx.Matrix = savedMatrix;
+        }
+
+        /// <summary>Shoelace area of the spline's world outline seen from above; positive = counter-clockwise in X/Z.</summary>
+        private static float SignedAreaXZ(Spline spline, int samples)
+        {
+            float area = 0f;
+            var prev = spline.GetWorldPoint(0f);
+            for (int i = 1; i <= samples; i++)
+            {
+                var cur = spline.GetWorldPoint((float)i / samples);
+                area += prev.X * cur.Z - cur.X * prev.Z;
+                prev = cur;
+            }
+            return area * 0.5f;
         }
 
         /// <summary>Override in subclasses for distinct gizmo colors.</summary>
