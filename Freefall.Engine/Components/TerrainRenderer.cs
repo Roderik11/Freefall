@@ -2971,6 +2971,17 @@ namespace Freefall.Components
             foreach (var component in spline.Entity.Components)
                 if (component is TerrainStamp stamp)
                     RequestRebake(stamp);
+
+            // Round height stamps on its children are confined to it (HeightStamp.MaskSpline), or were until this edit
+            // opened the spline
+            if (spline.Transform == null) return;
+            foreach (var child in spline.Transform)
+            {
+                if (child.Entity == null) continue;
+                foreach (var component in child.Entity.Components)
+                    if (component is HeightStamp { IsGlobal: false, IsSplineMode: false } height)
+                        RequestRebake(height);
+            }
         }
     }
 }

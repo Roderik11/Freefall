@@ -501,7 +501,7 @@ void CS_ErosionFilter(uint3 dtid : SV_DispatchThreadID)
 
 #include "terrain_stamp_common.hlsli"
 
-// Per-stamp descriptor (matches C# HeightStampDescriptorGPU, 80 bytes)
+// Per-stamp descriptor (matches C# HeightStampDescriptorGPU, 88 bytes)
 struct HeightStampDescriptor
 {
     float2 Center;             // terrain UV center (radial mode)
@@ -521,6 +521,8 @@ struct HeightStampDescriptor
     uint   BlendMode;          // 0=Set, 1=Add, 2=Max, 3=Lerp (as Set), 4=Min
     float2 HeightmapCenter;    // terrain UV of the heightmap's centre
     float2 HeightmapExtent;    // UV half-size of the heightmap along its turned axes
+    uint   MaskPointOffset;    // a parent's closed spline masking a round stamp: its samples in the spline buffer
+    uint   MaskPointCount;     // 0 = no mask
 };
 
 [numthreads(8, 8, 1)]
@@ -542,14 +544,28 @@ void CS_InfluenceLayer(uint3 dtid : SV_DispatchThreadID)
     {
         HeightStampDescriptor stamp = Stamps[i];
 
+        // A closed spline of the stamp's own is a mask: its falloff lies inside the edge (insetFalloff)
         float nearestH, nearestHalfW;
         float weight = EvaluateStampWeight(
             uv, stamp.Center, stamp.Radius, stamp.Falloff,
             stamp.SplinePointOffset, stamp.SplinePointCount,
             stamp.NoiseFreq, stamp.NoiseAmp, stamp.NoiseSeed,
-            SplinePoints, nearestH, nearestHalfW);
+            SplinePoints, nearestH, nearestHalfW, true);
 
         if (weight <= 0) continue;
+
+        // A round stamp under a closed spline is confined to it: the parent's outline, faded inward over the
+        // stamp's own falloff (the mask's samples carry no width, so the outline is not grown)
+        if (stamp.MaskPointCount != 0)
+        {
+            float maskH, maskHalfW;
+            weight *= EvaluateStampWeight(
+                uv, float2(0, 0), 0, stamp.Falloff,
+                stamp.MaskPointOffset, stamp.MaskPointCount,
+                stamp.NoiseFreq, stamp.NoiseAmp, stamp.NoiseSeed,
+                SplinePoints, maskH, maskHalfW, true);
+            if (weight <= 0) continue;
+        }
 
         // Spline mode: use interpolated height from nearest spline point
         float targetH = (stamp.SplinePointCount > 0 && stamp.SplinePointOffset != 0xFFFFFFFF)

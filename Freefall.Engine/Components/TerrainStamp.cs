@@ -331,9 +331,17 @@ namespace Freefall.Components
             if (IsGlobal) return;
 
             if (IsSplineMode)
+            {
                 DrawSplineGizmo(ctx);
-            else
-                DrawRadialGizmo(ctx);
+                return;
+            }
+
+            DrawRadialGizmo(ctx);
+
+            // The parent's outline confines the circle; the stamp is at full strength from Falloff inside it on
+            // (unscaled by the spline's widths, as the bake's mask samples carry none)
+            if (GizmoMaskSpline is { } mask && mask.Points.Count >= 2)
+                DrawOutline(ctx, mask, 0f, Falloff > 0.01f ? -Falloff : null, scaleWithWidth: false);
         }
 
         private void DrawRadialGizmo(GizmoContext ctx)
@@ -358,94 +366,92 @@ namespace Freefall.Components
             var spline = _cachedSpline;
             if (spline == null || spline.Points.Count < 2) return;
 
+            // Closed: an area whose edge is the outline grown by Radius. A height stamp's falloff lies inside that
+            // edge, a coverage stamp's outside it (EvaluateStampWeight insetFalloff). Open: a corridor, falloff outside.
+            float falloffLine = spline.Closed && FalloffInsideClosedSpline ? Radius - Falloff : Radius + Falloff;
+            DrawOutline(ctx, spline, Radius, Falloff > 0.01f ? falloffLine : null, scaleWithWidth: true);
+        }
+
+        /// <summary>
+        /// Lines along a spline at offsets from it (m): the edge (bright) and the falloff's other end (faint), with
+        /// hatches between them at the control points. On a closed outline an offset is outward (negative = inside)
+        /// and only that side is drawn; an open spline gets both sides.
+        /// </summary>
+        private void DrawOutline(GizmoContext ctx, Spline spline, float edge, float? falloffLine, bool scaleWithWidth)
+        {
             int samples = spline.TotalSegments;
             var savedMatrix = ctx.Matrix;
             ctx.Matrix = Matrix4x4.Identity;
 
-            ctx.Color = GizmoColor;
-            ctx.LineWidth = 1.5f;
+            // 'perp' is the left side of travel: the inside of a counter-clockwise outline
+            float outward = spline.Closed && SignedAreaXZ(spline, samples) > 0f ? -1f : 1f;
+            bool bothSides = !spline.Closed;
+            var rotation = Matrix4x4.CreateFromQuaternion(spline.Transform?.Rotation ?? Quaternion.Identity);
 
-            Vector3 prevLeft = Vector3.Zero, prevRight = Vector3.Zero;
-            Vector3 prevOuterLeft = Vector3.Zero, prevOuterRight = Vector3.Zero;
-            bool hasFalloff = Falloff > 0.01f;
-
-            // A closed spline is an area: its core is the outline grown by Radius and the falloff lies outside
-            // (EvaluateStampWeight), so only the outer side gets lines. 'perp' is the left side of travel,
-            // which is the inside of a counter-clockwise outline.
-            bool drawLeft = true, drawRight = true;
-            if (spline.Closed)
+            Vector3 Perp(float t)
             {
-                bool counterClockwise = SignedAreaXZ(spline, samples) > 0f;
-                drawLeft = !counterClockwise;
-                drawRight = counterClockwise;
+                var tangent = Vector3.Normalize(Vector3.TransformNormal(spline.GetTangent(t), rotation));
+                return Vector3.Normalize(new Vector3(-tangent.Z, 0, tangent.X)) * outward;
             }
 
+            Vector3 prevEdge = default, prevEdgeB = default, prevFall = default, prevFallB = default;
             for (int i = 0; i <= samples; i++)
             {
                 float t = (float)i / samples;
                 var point = spline.GetWorldPoint(t);
-                var tangent = spline.GetTangent(t);
+                var perp = Perp(t);
+                float width = scaleWithWidth ? spline.GetWidth(t) : 1f;
 
-                if (Transform != null)
-                {
-                    var rotMatrix = Matrix4x4.CreateFromQuaternion(Transform.Rotation);
-                    tangent = Vector3.TransformNormal(tangent, rotMatrix);
-                }
-                tangent = Vector3.Normalize(tangent);
-
-                var perp = Vector3.Normalize(new Vector3(-tangent.Z, 0, tangent.X));
-
-                float width = spline.GetWidth(t);
-                var left = point + perp * (Radius * width);
-                var right = point - perp * (Radius * width);
-
+                var edgeA = point + perp * (edge * width);
+                var edgeB = point - perp * (edge * width);
                 if (i > 0)
                 {
                     ctx.Color = GizmoColor;
                     ctx.LineWidth = 1.5f;
-                    if (drawLeft) ctx.DrawLine(prevLeft, left);
-                    if (drawRight) ctx.DrawLine(prevRight, right);
+                    ctx.DrawLine(prevEdge, edgeA);
+                    if (bothSides) ctx.DrawLine(prevEdgeB, edgeB);
                 }
+                prevEdge = edgeA;
+                prevEdgeB = edgeB;
 
-                if (hasFalloff)
+                if (falloffLine is float fl)
                 {
-                    var outerLeft = point + perp * ((Radius + Falloff) * width);
-                    var outerRight = point - perp * ((Radius + Falloff) * width);
-
+                    var fallA = point + perp * (fl * width);
+                    var fallB = point - perp * (fl * width);
                     if (i > 0)
                     {
                         ctx.Color = new Color4(GizmoColor.R, GizmoColor.G, GizmoColor.B, 0.4f);
                         ctx.LineWidth = 1f;
-                        if (drawLeft) ctx.DrawLine(prevOuterLeft, outerLeft);
-                        if (drawRight) ctx.DrawLine(prevOuterRight, outerRight);
+                        ctx.DrawLine(prevFall, fallA);
+                        if (bothSides) ctx.DrawLine(prevFallB, fallB);
                     }
-
-                    prevOuterLeft = outerLeft;
-                    prevOuterRight = outerRight;
+                    prevFall = fallA;
+                    prevFallB = fallB;
                 }
-
-                prevLeft = left;
-                prevRight = right;
             }
 
-            // Cross-hatches at control points
+            // Cross-hatches at control points, across the band between the outline, the edge and the falloff line
             ctx.Color = new Color4(GizmoColor.R, GizmoColor.G, GizmoColor.B, 0.6f);
             ctx.LineWidth = 1f;
+            float far = falloffLine ?? edge;
             for (int i = 0; i < spline.Points.Count; i++)
             {
                 float t = spline.Points.Count > 1 ? (float)i / (spline.Points.Count - 1) : 0f;
                 var point = spline.GetWorldPoint(t);
-                var tangent = spline.GetTangent(Math.Clamp(t, 0.001f, 0.999f));
-                if (Transform != null)
-                {
-                    var rotMatrix = Matrix4x4.CreateFromQuaternion(Transform.Rotation);
-                    tangent = Vector3.TransformNormal(tangent, rotMatrix);
-                }
-                tangent = Vector3.Normalize(tangent);
-                var perp = Vector3.Normalize(new Vector3(-tangent.Z, 0, tangent.X));
+                var perp = Perp(Math.Clamp(t, 0.001f, 0.999f));
+                float width = scaleWithWidth ? spline.GetPointWidth(i) : 1f;
 
-                float outerR = (Radius + Falloff) * spline.GetPointWidth(i);
-                ctx.DrawLine(drawRight ? point - perp * outerR : point, drawLeft ? point + perp * outerR : point);
+                if (bothSides)
+                {
+                    float r = MathF.Max(MathF.Abs(edge), MathF.Abs(far)) * width;
+                    ctx.DrawLine(point - perp * r, point + perp * r);
+                }
+                else
+                {
+                    float lo = MathF.Min(0f, MathF.Min(edge, far)) * width;
+                    float hi = MathF.Max(0f, MathF.Max(edge, far)) * width;
+                    ctx.DrawLine(point + perp * lo, point + perp * hi);
+                }
             }
 
             ctx.Matrix = savedMatrix;
@@ -467,5 +473,11 @@ namespace Freefall.Components
 
         /// <summary>Override in subclasses for distinct gizmo colors.</summary>
         protected virtual Color4 GizmoColor => new Color4(0.3f, 0.9f, 0.3f, 1f);
+
+        /// <summary>True where a closed spline's falloff lies inside its edge (height stamps); coverage stamps fade outside it.</summary>
+        protected virtual bool FalloffInsideClosedSpline => false;
+
+        /// <summary>A closed spline confining this round stamp, drawn with it (HeightStamp.MaskSpline).</summary>
+        protected virtual Spline? GizmoMaskSpline => null;
     }
 }

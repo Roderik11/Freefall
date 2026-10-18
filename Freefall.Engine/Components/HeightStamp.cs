@@ -10,9 +10,14 @@ namespace Freefall.Components
     /// When a Heightmap is assigned, applies a spatially-varying height pattern
     /// scaled by Strength, with rotation from the entity transform. InvertShape makes it dig.
     ///
-    /// A radial stamp's heightmap spans its Radius + Falloff. A spline stamp's spans everything the spline
-    /// reaches and turns with it, so the spline's shape is the stamp's falloff: on a closed spline the texture
-    /// applies in full over the area and fades out across the Falloff outside the outline (a lake's depths).
+    /// A closed spline is a mask with its falloff inside. On the stamp's own entity the stamp covers the outline
+    /// grown by Radius and fades in over Falloff from that edge: nothing reaches past it. A round stamp (no spline
+    /// of its own) on a child of an entity with a closed spline is confined to that outline the same way: its own
+    /// circle and texture, faded inward over its Falloff (see <see cref="MaskSpline"/>). Move it around under the
+    /// spline and it never leaves the shape. Open splines are corridors with the falloff outside, as before.
+    ///
+    /// A radial stamp's heightmap spans its Radius + Falloff; a spline stamp's spans the spline's area (closed) or
+    /// corridor plus falloff (open) and turns with it.
     ///
     /// With Shape = Global and a Heightmap, the heightmap is stretched over the whole terrain and
     /// replaces what lower-priority stamps built (height = heightmap * Strength, plus the entity's Y and
@@ -58,6 +63,25 @@ namespace Freefall.Components
         /// </summary>
         [ValueRange(0f, 600f)]
         public float Strength = 50f;
+
+        /// <summary>
+        /// The closed spline that confines this stamp: the parent entity's, when this is a round local stamp with no
+        /// spline of its own. Null otherwise.
+        /// </summary>
+        public Spline? MaskSpline
+        {
+            get
+            {
+                if (IsGlobal || IsSplineMode) return null;
+                var spline = Transform?.Parent?.Entity?.GetComponent<Spline>();
+                return spline is { Closed: true } && spline.Points.Count >= 3 ? spline : null;
+            }
+        }
+
+        // A closed spline of its own is a mask: the falloff lies inside the edge
+        protected override bool FalloffInsideClosedSpline => true;
+
+        protected override Spline? GizmoMaskSpline => MaskSpline;
 
         protected override Color4 GizmoColor => new Color4(0.3f, 0.9f, 0.3f, 1f); // green
     }

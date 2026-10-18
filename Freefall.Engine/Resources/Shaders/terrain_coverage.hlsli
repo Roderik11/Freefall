@@ -48,7 +48,7 @@ float CoverageShapeWeight(CoverageStamp s, float2 terrainUV, StructuredBuffer<St
         terrainUV, s.Center, s.Radius, s.Falloff,
         s.SplinePointOffset, s.SplinePointCount,
         s.NoiseFreq, s.NoiseAmp, s.NoiseSeed,
-        splinePoints, nearestH, nearestHalfW);
+        splinePoints, nearestH, nearestHalfW, false);
 }
 
 // Ramp that is 0 below (edge - blend) and 1 from edge on. A zero blend is a hard step that includes the

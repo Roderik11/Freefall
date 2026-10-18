@@ -76,7 +76,7 @@ namespace Freefall.Assets
 
         // ── GPU structs ──
 
-        /// <summary>GPU struct matching HLSL HeightStampDescriptor. 80 bytes (20 x uint/float).</summary>
+        /// <summary>GPU struct matching HLSL HeightStampDescriptor. 88 bytes (22 x uint/float).</summary>
         [StructLayout(LayoutKind.Sequential)]
         internal struct HeightStampDescriptorGPU
         {
@@ -97,6 +97,8 @@ namespace Freefall.Assets
             public uint BlendMode;           // HeightBlendMode
             public Vector2 HeightmapCenter;  // terrain UV of the heightmap's centre
             public Vector2 HeightmapExtent;  // UV half-size of the heightmap along its turned axes
+            public uint MaskPointOffset;     // HeightStamp.MaskSpline's samples (a round stamp under a closed spline)
+            public uint MaskPointCount;      // 0 = no mask, else count | closed bit
         }
 
         /// <summary>GPU struct matching HLSL StampSplinePoint. 16 bytes.</summary>
@@ -388,6 +390,12 @@ namespace Freefall.Assets
                 desc.TargetHeight = ((relative ? 0f : center.Y) + stamp.HeightOffset) / maxHeight;
                 desc.SplinePointOffset = 0xFFFFFFFF;
                 desc.SplinePointCount = 0;
+
+                // Under a closed spline: confined to its outline (the samples carry no width: the outline is not grown)
+                // (a spline that cannot be sampled leaves the count at 0: no mask)
+                if (stamp.MaskSpline is { } mask)
+                    BuildSplinePoints(mask, 0f, terrainOrigin, terrainSize, maxHeight, 0f, splinePoints,
+                        out desc.MaskPointOffset, out desc.MaskPointCount, out _);
             }
 
             if (stamp.Heightmap != null)
@@ -423,13 +431,14 @@ namespace Freefall.Assets
 
         /// <summary>
         /// A spline stamp's heightmap covers what the stamp reaches, as a radial stamp's covers its Radius + Falloff:
-        /// the rectangle, in the texture's turned frame, around every sample's half-width, falloff and edge noise.
-        /// A closed spline's area thereby gets the whole texture and its outline is where the texture fades out.
+        /// the rectangle, in the texture's turned frame, around every sample's reach. On a closed spline that is the
+        /// outline grown by Radius (the falloff lies inside it), on an open one the corridor plus its falloff.
         /// </summary>
         private static void FitHeightmapToSpline(ref HeightStampDescriptorGPU desc, List<StampSplinePointGPU> splinePoints)
         {
             int start = (int)desc.SplinePointOffset;
             int end = start + (int)(desc.SplinePointCount & 0x7FFFFFFF);
+            bool closed = (desc.SplinePointCount & 0x80000000) != 0;
             float s = desc.RotationSin, c = desc.RotationCos;
 
             var min = new Vector2(float.MaxValue);
@@ -438,7 +447,7 @@ namespace Freefall.Assets
             {
                 var p = splinePoints[i];
                 // The falloff tapers with the sample's width, as in EvaluateStampWeight
-                float falloff = desc.Radius > 1e-7f ? desc.Falloff * p.HalfWidth / desc.Radius : desc.Falloff;
+                float falloff = closed ? 0f : desc.Radius > 1e-7f ? desc.Falloff * p.HalfWidth / desc.Radius : desc.Falloff;
                 var reach = new Vector2(Math.Max(p.HalfWidth, 0f) + falloff + desc.NoiseAmp);
                 var local = new Vector2(p.UV.X * c + p.UV.Y * s, -p.UV.X * s + p.UV.Y * c);
                 min = Vector2.Min(min, local - reach);
@@ -1619,17 +1628,24 @@ namespace Freefall.Assets
             TerrainStamp stamp, Vector3 terrainOrigin, Vector2 terrainSize, float maxHeight, float heightOffset,
             List<StampSplinePointGPU> splinePoints,
             out uint splinePointOffset, out uint splinePointCount, out float radius, bool useWorldY = true)
+            => BuildSplinePoints(stamp.GetSpline(), stamp.Radius, terrainOrigin, terrainSize, maxHeight, heightOffset,
+                splinePoints, out splinePointOffset, out splinePointCount, out radius, useWorldY);
+
+        /// <summary>Sample a spline into terrain UV points; each carries <paramref name="worldRadius"/> × its width.</summary>
+        private static bool BuildSplinePoints(
+            Spline? spline, float worldRadius, Vector3 terrainOrigin, Vector2 terrainSize, float maxHeight, float heightOffset,
+            List<StampSplinePointGPU> splinePoints,
+            out uint splinePointOffset, out uint splinePointCount, out float radius, bool useWorldY = true)
         {
             splinePointOffset = 0xFFFFFFFF;
             splinePointCount = 0;
             radius = 0;
 
-            var spline = stamp.GetSpline();
             if (spline == null || spline.Points.Count < 2)
                 return false;
 
             splinePointOffset = (uint)splinePoints.Count;
-            float uvRadius = stamp.Radius / Math.Max(terrainSize.X, terrainSize.Y);
+            float uvRadius = worldRadius / Math.Max(terrainSize.X, terrainSize.Y);
 
             int sampleCount = Math.Max(spline.TotalSegments, spline.Points.Count * 4);
             for (int i = 0; i <= sampleCount; i++)

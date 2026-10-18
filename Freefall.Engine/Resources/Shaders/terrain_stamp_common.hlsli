@@ -58,6 +58,10 @@ float StampDistToSegment(float2 P, float2 A, float2 B, out float projT, out floa
 // Parameters match the common shape fields shared by all stamp descriptor structs.
 // Returns: weight (0 = outside, 1 = full effect)
 // Out: nearestHeight, nearestHalfWidth (for spline mode height interpolation)
+//
+// insetFalloff (height stamps): a closed spline is a mask. Its area is the outline grown by radius, and the falloff
+// lies INSIDE that edge: full effect deeper in than the falloff, nothing past the edge. Without it (coverage stamps)
+// the area is full up to the grown edge and the falloff runs outside it. Circles and open splines are not affected.
 
 float EvaluateStampWeight(
     float2 uv,
@@ -71,9 +75,13 @@ float EvaluateStampWeight(
     uint noiseSeed,
     StructuredBuffer<StampSplinePoint> splinePoints,
     out float nearestHeight,
-    out float nearestHalfWidth)
+    out float nearestHalfWidth,
+    bool insetFalloff)
 {
     float dist;
+    float outlineDist = 0;      // distance to the spline itself, inside or out
+    bool insideClosed = false;
+    bool closedMask = false;
     nearestHeight = 0;
     nearestHalfWidth = radius;
 
@@ -128,6 +136,9 @@ float EvaluateStampWeight(
         }
 
         dist = (isClosed && inside) ? 0 : bestDist;
+        outlineDist = bestDist;
+        insideClosed = isClosed && inside;
+        closedMask = isClosed && insetFalloff;
         nearestHeight = bestH;
         nearestHalfWidth = bestHalfW;
 
@@ -144,9 +155,28 @@ float EvaluateStampWeight(
     }
 
     float totalRadius = radius + falloff;
+    float noiseMargin = (noiseFreq > 0) ? noiseAmp : 0;
+
+    if (closedMask)
+    {
+        // Signed distance to the outline (negative inside); the area ends at the outline grown by radius
+        float sd = insideClosed ? -outlineDist : outlineDist;
+        if (sd >= radius + noiseMargin) return 0;
+
+        if (noiseFreq > 0 && noiseAmp > 0)
+        {
+            float noiseScale = noiseFreq / max(totalRadius, 0.001);
+            float2 noiseCoord = uv * noiseScale + float2(noiseSeed * 1.37, noiseSeed * 0.73);
+            sd += stamp_noise(noiseCoord) * noiseAmp;
+        }
+
+        float depth = radius - sd;   // how far inside the edge
+        if (depth <= 0) return 0;
+        float s = saturate(depth / max(falloff, 1e-6));
+        return s * s * (3.0 - 2.0 * s);
+    }
 
     // Early out with noise margin
-    float noiseMargin = (noiseFreq > 0) ? noiseAmp : 0;
     if (dist >= totalRadius + noiseMargin) return 0;
 
     // Noise displacement on distance field
