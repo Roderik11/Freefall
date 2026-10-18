@@ -139,8 +139,9 @@ void CSMeter(uint gi : SV_GroupIndex)
         float terrainOpen, portal;
         float terrainSky = SkyVisibilityParts(LoadTerrainCover(), AtmosphereLinearClamp, tap, up,
             TerrainTolerance(distance(tap, CamPos)), terrainOpen, portal);
-        float skyVis = lerp(min(portal, meshSky), terrainSky * max(meshSky, A.SkyCaptureBounce), terrainOpen);
-        float skySeen = lerp(min(portal, meshSky), terrainSky * meshSky, terrainOpen);
+        float caveSky = min(portal, CaveMeshShare(meshSky, portal));
+        float skyVis = lerp(caveSky, terrainSky * max(meshSky, A.SkyCaptureBounce), terrainOpen);
+        float skySeen = lerp(caveSky, terrainSky * meshSky, terrainOpen);
         float terrain, cloud, mt, mc;
         float sunVis = BodyVisible(tap, A.SunDirection, open, meshSun, terrain, cloud);
         float moonVis = any(A.MoonIlluminance > 0) ? BodyVisible(tap, A.MoonDirection, open, meshMoon, mt, mc) : 0.0;

@@ -163,6 +163,19 @@ float MeshSkyVisibility(float3 worldPos, float3 N)
     return MeshSkyVisibilityAt(A.SkyCaptureViews, A.SkyCaptureDepth, A.SkyCaptureCount, AtmosphereLinearClamp, worldPos, N);
 }
 
+// Under the terrain the meshes' part loses its first 5 % inside the cave: there the captures' noise (a facet that happens
+// to face the one low direction that reaches in through the mouth, slope bias) read 0.3-4 % open on scattered facets, and
+// at a cave's exposure, ~13 EV under the daylight, that much sky turned them pure white: streaks over the walls and roof
+// like snow (user report, Whispering Hollow, 2026-10-18). At the mouth the floor fades out with the portal light (~0.7 %
+// where the streaks were, 16 m in; ~1.6 % on the floor under the mouth's overhang, which a fixed 5 % turned into dark
+// islands in the daylight).
+#define CAVE_MESH_FLOOR 0.05
+float CaveMeshShare(float meshes, float portal)
+{
+    float floorShare = CAVE_MESH_FLOOR * (1.0 - smoothstep(0.008, 0.02, portal));
+    return saturate((meshes - floorShare) / (1.0 - floorShare));
+}
+
 // How much of the sky's light reaches a surface past the terrain and the meshes, 0..1, given the meshes' part. In the
 // open the meshes take their share of what the terrain's horizons leave, but never less than SkyCaptureBounce: a stand-in
 // for daylight bouncing in through doors and windows, which the 16 directions mostly miss (a room without a lamp was
@@ -174,7 +187,7 @@ float SkyVisibilityWith(float3 worldPos, float3 N, float meshes)
     float sky = SkyVisibilityParts(LoadTerrainCover(), AtmosphereLinearClamp, worldPos, N,
         TerrainTolerance(distance(worldPos, CamPos)), open, portal);
     float bounce = AtmosphereIdx != 0 ? LoadAtmosphere().SkyCaptureBounce : 0.0;
-    return lerp(min(portal, meshes), sky * max(meshes, bounce), open);
+    return lerp(min(portal, CaveMeshShare(meshes, portal)), sky * max(meshes, bounce), open);
 }
 
 // The same, the meshes' part looked up here. worldPos is absolute. The opaque surfaces have theirs from

@@ -55,7 +55,15 @@ float SkyCaptureViewLight(SkyCaptureView v, uint slice, Texture2DArray<float> de
     // underside of a roof and the top of a gable wall through the thin roof boards into daylight (bright bands along the
     // roof line, user 2026-10-18); along the normal a point moves away from its own surface and does not cross a roof or
     // wall that meets it at an angle.
-    float visible = SkyCaptureOpenAt(v, slice, depths, size, clampSampler, worldPos + N * 0.4);
+    // A direction from behind the surface (the sky above a ceiling) sees the surface itself first, but the lift put the
+    // point only 0.4 × |cos| under it along that direction: 0.14 m at the lowest ring, inside the maps' slope bias (up to
+    // ~0.2 m), so the rock read as open sky: white streaks over a cave's roof and walls at the cave's exposure (user,
+    // Whispering Hollow, 2026-10-18). For those the point goes 0.3 m further from that sky, along its own line to it: the
+    // test along that line is the same, only past the bias.
+    float3 p = worldPos + N * 0.4;
+    if (dot(N, v.Direction) < 0.0)
+        p -= v.Direction * 0.3;
+    float visible = SkyCaptureOpenAt(v, slice, depths, size, clampSampler, p);
     total += w;
     return w * visible;
 }
