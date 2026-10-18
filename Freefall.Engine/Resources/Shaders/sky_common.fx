@@ -219,7 +219,9 @@ float AerialSkyVisible(float skyVisible, float viewDepth)
 #define FOG_TILE 16     // pixels a froxel spans each way (VolumetricFog.TileSize)
 
 // The air between the camera and viewDepth (at most FogVolumeRange) from the near fog volume: rgb = its light
-// (× Exposure), a = transmittance. Slice s holds the air up to view depth ((s + 1) / slices)² × FogVolumeRange.
+// (× Exposure), a = transmittance. Slice s holds the air up to view depth ((s + 1) / slices)² × FogVolumeRange. Read
+// with the B-spline across the screen (atmosphere_common.hlsli SampleScreenBSpline): linearly, the shafts through the
+// trees showed the 16 px tiles as steps.
 float4 NearFog(float2 pixel, float viewDepth)
 {
     Texture3D<float4> fog = ResourceDescriptorHeap[FogVolumeIdx];
@@ -230,10 +232,10 @@ float4 NearFog(float2 pixel, float viewDepth)
     if (s < 1.0)
     {
         // In front of the first slice's far side: toward nothing at the camera
-        float4 first = fog.SampleLevel(AtmosphereLinearClamp, float3(uv, 0.5 / slices), 0);
+        float4 first = SampleScreenBSpline(fog, uv, 0.5 / slices);
         return float4(first.rgb * s, 1.0 - s * (1.0 - first.a));
     }
-    return fog.SampleLevel(AtmosphereLinearClamp, float3(uv, (s - 0.5) / slices), 0);
+    return SampleScreenBSpline(fog, uv, (s - 0.5) / slices);
 }
 
 // The fog between the camera and a surface at viewDepth: rgb = the light the air adds (× Exposure), a = the share of the
