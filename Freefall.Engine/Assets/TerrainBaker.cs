@@ -459,6 +459,7 @@ namespace Freefall.Assets
 
             // Wrap the baked texture for the rendering pipeline
             terrain.BakedHeightmap = Texture.WrapNative(_heightTexture, _heightSRV);
+            HeightVersion++;
         }
 
         private void DispatchInfluence(ID3D12GraphicsCommandList cmd, HeightPlan plan, in HeightStep step, uint groups)
@@ -841,6 +842,7 @@ namespace Freefall.Assets
                 device.SubmitAndWait(cmdList);
 
                 Debug.Log($"[TerrainBaker] Uploaded baked heightmap from cache: {resolution}x{resolution} ({pixels.Length} bytes)");
+                HeightVersion++;
                 return Texture.WrapNative(_heightTexture, _heightSRV);
             }
             finally
@@ -998,6 +1000,10 @@ namespace Freefall.Assets
 
         /// <summary>Resolution of the current baked heightmap texture, or 0 if none.</summary>
         public int BakedResolution => _currentResolution;
+
+        /// <summary>Counts the baked heightmaps' changes (a bake, an upload from the cache): what is made from the heights
+        /// (Graphics.TerrainLightShadow) is made again when it moves on.</summary>
+        public static int HeightVersion { get; private set; }
 
         // ═══════════════════════════════════════════════════════════════════
         // ── Coverage (splat + decoration) ──

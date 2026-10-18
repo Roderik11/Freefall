@@ -101,9 +101,12 @@ void CSCompose(uint3 dispatchThreadId : SV_DispatchThreadID)
     // Unlit pixels (the sky dome) arrive pre-exposed already
     float3 finalColor = lerp(albedo.rgb, lerp(pbrLit, emissiveGlow, emissiveMask), isLit);
 
-    // Aerial perspective (the atmosphere's froxel volume); sky pixels already hold all of the air
+    // The fog (sky_common.fx AtmosphereFog); sky pixels already hold all of the air, the near fog volume takes the first
+    // stretch of it over
     if (isLit > 0)
         finalColor = ApplyAerialPerspective(finalColor, float2(px) + 0.5, DepthGBuf.Load(coord).r, saturate(light.a));
+    else
+        finalColor = AtmosphereFogOverSky(finalColor, float2(px) + 0.5);
     
     // Output HDR linear — tonemapping deferred to finalize pass
     Output[px] = float4(finalColor, 1.0f);

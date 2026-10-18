@@ -25,6 +25,16 @@ cbuffer PushConstants : register(b3)
 #include "common.fx"
 #include "atmosphere_common.hlsli"
 
+// The terrain's shadow on a sample of the air (atmosphere_common.hlsli AtmTerrainLightVisibility; god rays, ATMOSPHERE_PLAN
+// open issue "the sun's glow in the haze is not shadowed"). posKm is in the atmosphere's frame round the camera (km, the
+// camera at x = z = 0, the ground flat as the world's): the point's world position is the camera's plus its offset.
+// terrainShadow: 1 = the sun's map, 2 = the moon's.
+float TerrainLightVisibility(AtmosphereParams A, float3 posKm, uint terrainShadow)
+{
+    float3 worldPos = float3(CamPos.x + posKm.x * 1000.0, (posKm.y - A.BottomRadius) * 1000.0, CamPos.z + posKm.z * 1000.0);
+    return AtmTerrainLightVisibility(A, worldPos, terrainShadow == 2);
+}
+
 struct ScatteringResult
 {
     float3 L;               // scattered light reaching the start of the ray, per unit illuminance
@@ -38,9 +48,12 @@ struct ScatteringResult
 //   miePhase:    true = Rayleigh + Mie phases, false = isotropic (for the multiple scattering LUT)
 //   multiScat:   add Ψ_ms (the multiple scattering LUT must exist)
 //   tMaxMax:     stop the march here (km)
+//   terrainShadow: 1 = the sun's, 2 = the moon's: the light's single scattering at each sample × the terrain's shadow
+//                (TerrainLightVisibility; posKm must be the camera). The aerial perspective volume only: the sky-view
+//                LUT is made per angle to the light, not per place.
 ScatteringResult IntegrateScatteredLuminance(AtmosphereParams A, float3 posKm, float3 dir, float3 lightDir,
                                              bool ground, float sampleCount, bool miePhase, bool multiScat,
-                                             float tMaxMax)
+                                             float tMaxMax, uint terrainShadow = 0)
 {
     ScatteringResult result = (ScatteringResult)0;
     result.Transmittance = 1.0;
@@ -99,7 +112,10 @@ ScatteringResult IntegrateScatteredLuminance(AtmosphereParams A, float3 posKm, f
 
         float3 multiScattered = multiScat ? AtmMultipleScattering(A, P, lightZenithCos) : 0;
 
-        float3 S = earthShadow * transmittanceToLight * phaseTimesScattering + multiScattered * medium.scattering;
+        float lightVisible = earthShadow;
+        if (terrainShadow != 0 && earthShadow > 0.0)
+            lightVisible *= TerrainLightVisibility(A, P, terrainShadow);
+        float3 S = lightVisible * transmittanceToLight * phaseTimesScattering + multiScattered * medium.scattering;
 
         // Energy scattered as if the light over the sphere were 1 (power series of f_ms, analytic per segment)
         float3 ms = medium.scattering;
@@ -273,10 +289,10 @@ void CSAerialPerspective(uint3 id : SV_DispatchThreadID)
     }
 
     float sampleCount = clamp(2.0 * (id.z + 1), 2.0, 32.0);
-    ScatteringResult r = IntegrateScatteredLuminance(A, pos, dir, A.SunDirection, false, sampleCount, true, true, tMaxKm);
+    ScatteringResult r = IntegrateScatteredLuminance(A, pos, dir, A.SunDirection, false, sampleCount, true, true, tMaxKm, 1);
     float3 L = r.L * A.SunIlluminance;
     if (any(A.MoonIlluminance > 0))
-        L += IntegrateScatteredLuminance(A, pos, dir, A.MoonDirection, false, sampleCount, true, true, tMaxKm).L * A.MoonIlluminance;
+        L += IntegrateScatteredLuminance(A, pos, dir, A.MoonDirection, false, sampleCount, true, true, tMaxKm, 2).L * A.MoonIlluminance;
 
     // Stored as the pixel stores light (× Exposure): sun and moon together, and small enough for half floats
     RWTexture3D<float4> output = ResourceDescriptorHeap[APUAVIdx];

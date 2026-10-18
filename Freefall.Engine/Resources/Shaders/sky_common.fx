@@ -150,25 +150,13 @@ float3 ParticleLight()
     return direct * (A.CloudShade * 0.5 * Exposure / ATM_PI) + (ambient[0].rgb + ambient[1].rgb) * 0.5;
 }
 
-// Aerial perspective: the air between the camera and a surface dims the surface's light and adds its own (the haze
-// and the ground fog of the preset, lit by the sun and the moon, in the earth's shadow after sunset).
-//   pixel:     SV_Position.xy (or the pixel a compute thread shades)
-//   viewDepth: linear view-space depth in metres (the G-buffer's depth, clip w)
-// Sky pixels (depth 0) must not come here: the sky's light already holds all of the air.
-float3 ApplyAerialPerspective(float3 color, float2 pixel, float viewDepth)
-{
-    if (FogEnabled <= 0.0 || AtmosphereIdx == 0)
-        return color;
-    float4 ap = AtmosphereAerialPerspective(LoadAtmosphere(), pixel / ViewportSize, viewDepth);
-    return color * ap.a + ap.rgb;
-}
-
-// How much of the air's own light to keep in front of a surface that sees skyVisible of the sky. The volume lights every
-// slice of air with the sun and sky as if nothing shaded it, so in a cave (a ray ending under the hill crossed dark air)
-// it glowed over the black walls. Only the stretch of the ray inside the cave is dark: at most the last 30 m when the
-// camera is in the open, all of it when the camera is in the cave too. Scaling the whole ray left a cave mouth seen from
-// 400 m without the haze that covers everything round it: a black blob in rain (user, 2026-10-18). A stand-in until
-// the volume itself is shadowed (ATMOSPHERE_PLAN, open issues).
+// How much of the air's own light to keep in front of a surface that sees skyVisible of the sky. The aerial perspective
+// volume lights every slice of air with the sun and sky as if nothing shaded it, so in a cave (a ray ending under the
+// hill crossed dark air) it glowed over the black walls. Only the stretch of the ray inside the cave is dark: at most the
+// last 30 m when the camera is in the open, all of it when the camera is in the cave too. Scaling the whole ray left a
+// cave mouth seen from 400 m without the haze that covers everything round it: a black blob in rain (user, 2026-10-18).
+// With the near fog volume it applies to the far part of the ray only (AtmosphereFog): the near volume knows per froxel
+// where the sky is seen.
 float AerialSkyVisible(float skyVisible, float viewDepth)
 {
     float cameraOpen = TerrainOpen(CamPos, float3(0, 1, 0));
@@ -176,13 +164,81 @@ float AerialSkyVisible(float skyVisible, float viewDepth)
     return 1.0 - (1.0 - skyVisible) * darkStretch / max(viewDepth, 1e-3);
 }
 
-// The same with the air's own light scaled by AerialSkyVisible
-float3 ApplyAerialPerspective(float3 color, float2 pixel, float viewDepth, float skyVisible)
+// ── Near fog volume (Graphics.VolumetricFog, volumetric_fog_cs.hlsl) ──
+#define FOG_TILE 16     // pixels a froxel spans each way (VolumetricFog.TileSize)
+
+// The air between the camera and viewDepth (at most FogVolumeRange) from the near fog volume: rgb = its light
+// (× Exposure), a = transmittance. Slice s holds the air up to view depth ((s + 1) / slices)² × FogVolumeRange.
+float4 NearFog(float2 pixel, float viewDepth)
+{
+    Texture3D<float4> fog = ResourceDescriptorHeap[FogVolumeIdx];
+    float width, height, slices;
+    fog.GetDimensions(width, height, slices);
+    float2 uv = pixel / (FOG_TILE * float2(width, height));
+    float s = sqrt(saturate(viewDepth / FogVolumeRange)) * slices;   // the far side of slice k at s = k + 1
+    if (s < 1.0)
+    {
+        // In front of the first slice's far side: toward nothing at the camera
+        float4 first = fog.SampleLevel(AtmosphereLinearClamp, float3(uv, 0.5 / slices), 0);
+        return float4(first.rgb * s, 1.0 - s * (1.0 - first.a));
+    }
+    return fog.SampleLevel(AtmosphereLinearClamp, float3(uv, (s - 0.5) / slices), 0);
+}
+
+// The fog between the camera and a surface at viewDepth: rgb = the light the air adds (× Exposure), a = the share of the
+// surface's own light that gets through; color × a + rgb. With the near fog volume (Engine.Settings.VolumetricFog) its
+// first FogVolumeRange metres come from it, lit with the sun's and the moon's shadows (cascades, clouds, the terrain: god
+// rays) and with the sky's light only where the sky is seen; the aerial perspective volume goes on from there,
+//   far = (AP(d) − AP(R)) / T(R), T_far = T(d) / T(R),   fog = (color × T_far + far) × T_near + near.
+// skyVisible (the surface's SkyVisibility, 1 for one in the open) dims the far part's light (AerialSkyVisible).
+//   pixel:     SV_Position.xy (or the pixel a compute thread shades)
+//   viewDepth: linear view-space depth in metres (the G-buffer's depth, clip w)
+// Sky pixels must not come here (AtmosphereFogOverSky): the sky's light already holds all of the air.
+float4 AtmosphereFog(float2 pixel, float viewDepth, float skyVisible)
 {
     if (FogEnabled <= 0.0 || AtmosphereIdx == 0)
-        return color;
-    float4 ap = AtmosphereAerialPerspective(LoadAtmosphere(), pixel / ViewportSize, viewDepth);
-    return color * ap.a + ap.rgb * AerialSkyVisible(skyVisible, viewDepth);
+        return float4(0, 0, 0, 1);
+    AtmosphereParams A = LoadAtmosphere();
+    float2 uv = pixel / ViewportSize;
+    float4 ap = AtmosphereAerialPerspective(A, uv, viewDepth);
+    if (FogVolumeIdx == 0)
+        return float4(ap.rgb * AerialSkyVisible(skyVisible, viewDepth), ap.a);
+
+    float range = FogVolumeRange;
+    float4 nearFog = NearFog(pixel, min(viewDepth, range));
+    if (viewDepth <= range)
+        return nearFog;
+    float4 apNear = AtmosphereAerialPerspective(A, uv, range);
+    float throughNear = max(apNear.a, 1e-4);
+    float3 farLight = max(ap.rgb - apNear.rgb, 0.0) / throughNear * AerialSkyVisible(skyVisible, viewDepth - range);
+    float farTransmittance = saturate(ap.a / throughNear);
+    return float4(nearFog.rgb + nearFog.a * farLight, nearFog.a * farTransmittance);
+}
+
+// A sky pixel (its light holds all of the air along the ray, the sky-view LUT) with the first FogVolumeRange metres of
+// that air from the near fog volume instead: the shafts of light and the shade in the air reach over the sky too
+float3 AtmosphereFogOverSky(float3 sky, float2 pixel)
+{
+    if (FogEnabled <= 0.0 || AtmosphereIdx == 0 || FogVolumeIdx == 0)
+        return sky;
+    float4 apNear = AtmosphereAerialPerspective(LoadAtmosphere(), pixel / ViewportSize, FogVolumeRange);
+    float4 nearFog = NearFog(pixel, FogVolumeRange);
+    return max(sky - apNear.rgb, 0.0) / max(apNear.a, 1e-4) * nearFog.a + nearFog.rgb;
+}
+
+// Aerial perspective: the air between the camera and a surface dims the surface's light and adds its own (the haze
+// and the ground fog of the preset, lit by the sun and the moon, in the earth's shadow after sunset). AtmosphereFog.
+float3 ApplyAerialPerspective(float3 color, float2 pixel, float viewDepth)
+{
+    float4 fog = AtmosphereFog(pixel, viewDepth, 1.0);
+    return color * fog.a + fog.rgb;
+}
+
+// The same for a surface that sees skyVisible of the sky
+float3 ApplyAerialPerspective(float3 color, float2 pixel, float viewDepth, float skyVisible)
+{
+    float4 fog = AtmosphereFog(pixel, viewDepth, skyVisible);
+    return color * fog.a + fog.rgb;
 }
 
 // ────────────────────────────────────────────────

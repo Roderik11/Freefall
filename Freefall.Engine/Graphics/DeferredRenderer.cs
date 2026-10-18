@@ -60,6 +60,11 @@ namespace Freefall.Graphics
         /// <summary>Screen-space shadow pass (Bend Studio technique).</summary>
         public ScreenSpaceShadows? ScreenSpaceShadows { get; private set; }
 
+        /// <summary>The near fog volume (god rays): the air near the camera lit with the sun's shadows.</summary>
+        public VolumetricFog? VolumetricFog { get; private set; }
+        private uint _fogVolumeIdx;             // this frame's SceneConstants.FogVolumeIdx (0 = off)
+        private Matrix4x4 _relativeVP;          // this frame's view-projection without translation
+
         // Screen-space shadows of the highest ranked point lights (TracePointLightScreenShadows): a mask each, and
         // the registry slot it was traced for this frame (NoScreenShadow = none), for the point light pass
         private const int MaxScreenShadowedPointLights = 4;
@@ -224,6 +229,9 @@ namespace Freefall.Graphics
             
             // Screen-space shadows
             ScreenSpaceShadows = new ScreenSpaceShadows();
+
+            // Near fog volume
+            VolumetricFog = new VolumetricFog();
 
             // Ambient occlusion
             Gtao = new GTAO();
@@ -523,10 +531,20 @@ namespace Freefall.Graphics
              // Set before anything is drawn: the atmosphere's aerial perspective volume needs it too.
              var relativeVP = Matrix4x4.CreateLookAtLeftHanded(Vector3.Zero, camera.Forward, camera.Up) * camera.Projection;
              Matrix4x4.Invert(relativeVP, out var cameraInverse);
+
+             // The near fog volume this view's passes read (filled after the shadows, 2e below, before anything reads it):
+             // its index stays the same from frame to frame, so it is set here with the camera, not mid-frame
+             var compositeSize = Composite.Native.Description;
+             _fogVolumeIdx = VolumetricFog != null && Engine.Settings.Fog && Engine.Settings.VolumetricFog
+                 ? VolumetricFog.Prepare((int)compositeSize.Width, (int)compositeSize.Height) : 0u;
+             _relativeVP = relativeVP;
+
              foreach (var pair in Effect.MasterEffects)
              {
                  pair.Value.SetParameter("CameraInverse", cameraInverse);
                  pair.Value.SetParameter("CameraRelativeVP", relativeVP);
+                 pair.Value.SetParameter("FogVolumeIdx", _fogVolumeIdx);
+                 pair.Value.SetParameter("FogVolumeRange", VolumetricFog?.Range ?? 0f);
              }
 
              // The atmosphere's LUTs for this view (sky-view, aerial perspective, ambient): the sky dome, the
@@ -695,6 +713,11 @@ namespace Freefall.Graphics
              //     cull and shadow selection. Once per frame for all renderers.
              if (_pointLightsCulled)
                  PointLightBuffer.Instance?.UpdateLamps(list, _lightFrameParams![Engine.FrameIndex % FrameCount].SrvIndex);
+
+             // 2e. Near fog volume: the air near the camera lit with this frame's cascades and sky captures, before the
+             //     transparent pass, the composition and the forward passes read it (sky_common.fx AtmosphereFog)
+             if (_fogVolumeIdx != 0)
+                 VolumetricFog!.Render(list, camera.Position, _relativeVP, ShadowMapIndex, BindSceneConstantsForCompute);
 
              // 3. Sky pass
              using (_skyMarker.Auto())
@@ -1504,6 +1527,7 @@ namespace Freefall.Graphics
             LocalShadows?.Dispose();
             ShadowReceivers?.Dispose();
             ScreenSpaceShadows?.Dispose();
+            VolumetricFog?.Dispose();
             foreach (var tracer in _pointScreenShadows) tracer?.Dispose();
             Gtao?.Dispose();
             ScreenSpaceDisplacement?.Dispose();

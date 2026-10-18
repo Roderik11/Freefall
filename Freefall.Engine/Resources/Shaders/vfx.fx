@@ -353,7 +353,7 @@ float4 PS(VSOutput input) : SV_Target0
 
     // Additive, so it hides nothing: the air in front only dims it
     if (FogEnabled > 0 && AtmosphereIdx != 0)
-        light *= AtmosphereAerialPerspective(LoadAtmosphere(), input.Position.xy / ViewportSize, input.Depth).a;
+        light *= AtmosphereFog(input.Position.xy, input.Depth, 1.0).a;
 
     return float4(light, 1.0);
 }

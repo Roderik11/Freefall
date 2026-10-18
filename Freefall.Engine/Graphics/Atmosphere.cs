@@ -221,6 +221,8 @@ namespace Freefall.Graphics
             public Vector3 TerrainOrigin; public float TerrainSizeX;
             public float TerrainSizeZ; public uint SkyCaptureViews, SkyCaptureDepth, SkyCaptureCount;
             public float SkyCaptureBounce; public uint SkyProbeCube, SkyProbeSH; public float SkyProbeMips;
+            public uint TerrainSunShadow, TerrainMoonShadow; public Vector2 TerrainShadowOrigin;
+            public float TerrainShadowSize;
 
             /// <summary>The part the transmittance and multiple scattering LUTs depend on</summary>
             public bool SameMedium(in GpuParams o) =>
@@ -355,6 +357,10 @@ namespace Freefall.Graphics
             _frame.SkyCaptureBounce = Math.Clamp(Engine.Settings.SkyCaptureBounce, 0f, 1f);
             // The sky probe (SkyProbe, sky_probe_cs.hlsl): the ambient light and the sky's reflections
             (_frame.SkyProbeCube, _frame.SkyProbeSH, _frame.SkyProbeMips) = SkyProbe.Indices;
+            // The terrain's shadow in the air toward the sun and the moon (TerrainLightShadow, made in Render when due):
+            // the haze and the near fog in front of a mountain the light stands behind
+            (_frame.TerrainSunShadow, _frame.TerrainMoonShadow, _frame.TerrainShadowOrigin, _frame.TerrainShadowSize) =
+                TerrainLightShadow.Prepare(TerrainCover, _frame.SunDirection, _frame.MoonDirection, s.MoonIlluminance != Vector3.Zero);
             unsafe { *_params[slot]!.WritePtr<GpuParams>() = _frame; }
             return _params[slot]!.SrvIndex;
         }
@@ -378,6 +384,10 @@ namespace Freefall.Graphics
             ResourceStates from = _texturesWritten ? shaderRead : ResourceStates.Common;
 
             PixMarker.Begin(list, "Atmosphere");
+
+            // The terrain's shadow toward each light, when the light moved or the terrain changed: before the aerial
+            // perspective, which reads it
+            TerrainLightShadow.Render(list);
 
             // Transmittance and multiple scattering: only when the medium changed
             if (!_mediumValid || !_frame.SameMedium(_medium))

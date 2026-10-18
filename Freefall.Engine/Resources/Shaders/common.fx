@@ -42,6 +42,10 @@ cbuffer SceneConstants : register(b0)
     float WindStrength;                // m/s
     float WindPhase;                   // sway and flutter: integral of their speed, so a change of strength never jumps
     float2 WindOffset;                 // how far the air has moved (m), wrapped every 200 m: scrolls the gust pattern
+
+    // ── Near fog volume (Graphics.VolumetricFog, set per view by DeferredRenderer) — sky_common.fx AtmosphereFog ──
+    uint FogVolumeIdx;                 // bindless Texture3D: the air's light (rgb × Exposure) and transmittance (a) up to each slice; 0 = off
+    float FogVolumeRange;              // metres of view depth it covers; the aerial perspective volume takes over past it
 }
 
 // ── Large-scale variation of the ground and what grows on it (gputerrain.fx, grass cards, blades, flowers) ──

@@ -582,6 +582,14 @@ namespace Freefall
 
          [Category("Fog")]
          public bool Fog { get; set; } = true;                              // Aerial perspective: the atmosphere and its ground fog between camera and scene (Graphics.Atmosphere)
+         // With Fog: the air near the camera as a froxel volume lit with the sun's and the moon's shadows (cascades,
+         // clouds, terrain) and the sky's light only where the sky is seen: shafts of light through trees and windows,
+         // dark air in rooms and caves (Graphics.VolumetricFog). Off: the aerial perspective volume all the way, unshadowed.
+         public bool VolumetricFog { get; set; } = true;
+         // Metres of view depth the volume covers; the aerial perspective volume goes on past it. Longer reaches further
+         // with the shafts but makes each of its 64 slices deeper.
+         [ValueRange(32f, 512f)]
+         public float VolumetricFogRange { get; set; } = 128f;
 
          // Camera exposure as EV100: light in physical units (lux, cd/m²) times 1 / (1.2 · 2^EV) is what the
          // tonemapper sees; higher = darker image. Auto: metered from the scene each frame (Graphics.AutoExposure).

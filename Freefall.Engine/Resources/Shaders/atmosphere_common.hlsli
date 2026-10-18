@@ -46,6 +46,8 @@ struct AtmosphereParams
     float TerrainSizeZ;         uint SkyCaptureViews;      uint SkyCaptureDepth;   uint SkyCaptureCount;     // sky visibility past the meshes (sky_capture.hlsli; 0 = none)
     float SkyCaptureBounce;                                // the least share of the sky a place the meshes cover keeps (light bouncing in)
     uint SkyProbeCube;          uint SkyProbeSH;           float SkyProbeMips;     // sky probe (sky_probe_cs.hlsl): TextureCube, 9 × float4 SH, mip count (0 = none)
+    uint TerrainSunShadow;      uint TerrainMoonShadow;    float2 TerrainShadowOrigin;   // the terrain's shadow in the air per light (terrain_light_shadow_cs.hlsl; 0 = none); the maps' corner (world xz)
+    float TerrainShadowSize;                               // metres the maps span each way
 };
 
 // The global root signature's linear clamp sampler (s2)
@@ -170,6 +172,24 @@ float3 AtmTransmittanceToLight(AtmosphereParams A, float3 posKm, float3 lightDir
     if (RaySphereIntersectNearest(posKm, lightDir, float3(0, 0, 0), A.BottomRadius) >= 0.0)
         return 0;
     return AtmTransmittance(A, r, mu);
+}
+
+// How much of a light reaches a place in the air past the terrain: 0 in the terrain's shadow toward it (the shadow height
+// maps of terrain_light_shadow_cs.hlsl, one per light), soft over 4 m either side of the shadow's top. 1 without the maps,
+// outside them, and for a light at or below the horizon (no map then: the earth's shadow takes over). moon: the brightest
+// moon's map instead of the sun's. worldPos is absolute. Without it the air in front of a mountain the sun stood behind
+// glowed orange as if the sun shone through the rock (god rays: the mountains' shafts in the haze).
+float AtmTerrainLightVisibility(AtmosphereParams A, float3 worldPos, bool moon)
+{
+    uint map = moon ? A.TerrainMoonShadow : A.TerrainSunShadow;
+    if (map == 0)
+        return 1.0;
+    float2 uv = (worldPos.xz - A.TerrainShadowOrigin) / A.TerrainShadowSize;
+    if (any(uv < 0.0) || any(uv > 1.0))
+        return 1.0;
+    Texture2D<float> shadowTop = ResourceDescriptorHeap[map];
+    float top = shadowTop.SampleLevel(AtmosphereLinearClamp, uv, 0);
+    return smoothstep(top - 4.0, top + 4.0, worldPos.y);
 }
 
 // ── Multiple scattering LUT (Hillaire's Ψ_ms: light scattered twice or more, per unit illuminance) ──
