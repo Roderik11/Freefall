@@ -572,7 +572,7 @@ namespace Freefall.Components
             float radius = 0;
             for (int i = 0; i < 8; i++)
                 radius = MathF.Max(radius, (frustumCorners[i] - frustumCenter).Length());
-            radius = MathF.Ceiling(radius * 16.0f) / 16.0f;
+            radius = HoldRadius(index, radius);
             _cascadeRadius[index] = radius;
 
             float texelSize = (radius * 2.0f) / shadowTex.Width;
@@ -725,6 +725,33 @@ namespace Freefall.Components
 
             // Swap current → previous for next frame
             Array.Copy(_shadowVPMatrices, _prevShadowVPMatrices, count);
+        }
+
+        // ── Cascade size ────────────────────────────────────────────────────────────
+
+        // Steps of a cascade's square (radius), per octave: 2^(1/8), 9 % apart
+        private const float RadiusStepsPerOctave = 8f;
+        // A held square shrinks only when its slice fits one this many steps smaller
+        private const float RadiusShrinkSteps = 2f;
+        private readonly float[] _heldRadius = new float[MaxCascades];
+
+        /// <summary>
+        /// The square radius cascade <paramref name="index"/> uses for a slice that needs <paramref name="needed"/>: a
+        /// step of a fixed ladder (2^(k/8) m), kept while the slice fits it and is not two steps smaller; grown at once
+        /// when the slice needs more. SDSM moves the splits every frame, with a still camera too (swaying trees move
+        /// the depth distribution), and a square that followed them changed its texel size every frame: the texel
+        /// snapping then put the grid somewhere new each frame and the shadows crawled in cascades 1+ (2026-10-18).
+        /// </summary>
+        private float HoldRadius(int index, float needed)
+        {
+            float held = _heldRadius[index];
+            float shrinkBelow = held * MathF.Pow(2f, -RadiusShrinkSteps / RadiusStepsPerOctave);
+            if (needed <= held && needed > shrinkBelow)
+                return held;
+            float step = MathF.Ceiling(MathF.Log2(MathF.Max(needed, 0.01f)) * RadiusStepsPerOctave);
+            held = MathF.Pow(2f, step / RadiusStepsPerOctave);
+            _heldRadius[index] = held;
+            return held;
         }
 
         // ── Splits ──────────────────────────────────────────────────────────────────
