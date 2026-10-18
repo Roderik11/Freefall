@@ -235,12 +235,11 @@ namespace Freefall.Graphics
         private const int FrameCount = 3;
         private const int AmbientElements = 4;      // atmosphere_cs.hlsl CSAmbient: sky, ground, sky (older units), sun transmittance
         private const int TransmittanceW = 256, TransmittanceH = 64, MultiScatRes = 32;
-        private const int SkyViewW = 192, SkyViewH = 108, APRes = 32, APSlices = 32;
+        private const int SkyViewW = 192, SkyViewH = 108;
 
         private static ComputeShader? _cs;
         private static int _kTransmittance, _kMultiScat, _kSkyView, _kAP, _kAmbient;
         private static RenderTexture2D? _transmittance, _multiScat, _skyViewSun, _skyViewMoon;
-        private static RenderTexture3D? _ap;
         private static GraphicsBuffer? _ambient;
         private static readonly GraphicsBuffer?[] _params = new GraphicsBuffer?[FrameCount];
         private static readonly GraphicsBuffer?[] _readback = new GraphicsBuffer?[FrameCount];
@@ -263,12 +262,12 @@ namespace Freefall.Graphics
 
             // fp32: these hold light per unit of the sun's illuminance, and in twilight the sky's share falls to ~1e-6 and
             // below, fp16's subnormals (steps of 6e-8): an exposure adapted to dusk showed the sky-view LUT's texels as
-            // stair-stepped rings round the zenith. The AP volume is pre-exposed and stays fp16.
+            // stair-stepped rings round the zenith. The AP volume (one per view, AerialPerspectiveVolume) is pre-exposed
+            // and stays fp16.
             _transmittance = new RenderTexture2D(device, TransmittanceW, TransmittanceH, Format.R32G32B32A32_Float, randomWrite: true);
             _multiScat = new RenderTexture2D(device, MultiScatRes, MultiScatRes, Format.R32G32B32A32_Float, randomWrite: true);
             _skyViewSun = new RenderTexture2D(device, SkyViewW, SkyViewH, Format.R32G32B32A32_Float, randomWrite: true);
             _skyViewMoon = new RenderTexture2D(device, SkyViewW, SkyViewH, Format.R32G32B32A32_Float, randomWrite: true);
-            _ap = new RenderTexture3D(device, APRes, APRes, APSlices, Format.R16G16B16A16_Float);
             _ambient = GraphicsBuffer.CreateStructured<Vector4>(AmbientElements, srv: true, uav: true);
             for (int i = 0; i < FrameCount; i++)
             {
@@ -280,7 +279,6 @@ namespace Freefall.Graphics
             _cs.SetPushConstant("MultiScatUAV", _multiScat.UavIndex);
             _cs.SetPushConstant("SkyViewSunUAV", _skyViewSun.UavIndex);
             _cs.SetPushConstant("SkyViewMoonUAV", _skyViewMoon.UavIndex);
-            _cs.SetPushConstant("APUAV", _ap.UavIndex);
             _cs.SetPushConstant("AmbientUAV", _ambient.UavIndex);
         }
 
@@ -335,7 +333,7 @@ namespace Freefall.Graphics
                 MultiScatLut = _multiScat!.BindlessIndex,
                 SkyViewSunLut = _skyViewSun!.BindlessIndex,
                 SkyViewMoonLut = _skyViewMoon!.BindlessIndex,
-                AerialPerspective = _ap!.BindlessIndex,
+                AerialPerspective = 0,      // each view has its own (SceneConstants.AerialPerspectiveIdx)
                 Ambient = _ambient!.SrvIndex,
             };
             // Sky visibility (sky_common.fx SkyVisibility): the terrain shades the sky's light where hills rise round a
@@ -366,11 +364,13 @@ namespace Freefall.Graphics
         }
 
         /// <summary>
-        /// Make the LUTs for the view about to be drawn: the scene constants (camera, AtmosphereIdx, Exposure) must be set
-        /// and bound for compute by <paramref name="bindSceneConstants"/>. Call after <see cref="PrepareFrame"/> (via
+        /// Make the LUTs for the view about to be drawn, and its aerial perspective volume (<paramref name="aerialPerspective"/>,
+        /// prepared to the view's size): the scene constants (camera, AtmosphereIdx, Exposure) must be set and bound for
+        /// compute by <paramref name="bindSceneConstants"/>. Call after <see cref="PrepareFrame"/> (via
         /// Camera.SetShaderParams), before anything samples the sky.
         /// </summary>
-        public static void Render(ID3D12GraphicsCommandList list, Action<ID3D12GraphicsCommandList> bindSceneConstants)
+        public static void Render(ID3D12GraphicsCommandList list, Action<ID3D12GraphicsCommandList> bindSceneConstants,
+            AerialPerspectiveVolume aerialPerspective)
         {
             EnsureResources();
             var cs = _cs!;
@@ -404,15 +404,26 @@ namespace Freefall.Graphics
                 _mediumValid = true;
             }
 
-            // Sky-view (sun and moon) and aerial perspective
+            // Sky-view (sun and moon)
             list.ResourceBarrierTransition(_skyViewSun!.Native, from, ResourceStates.UnorderedAccess);
             list.ResourceBarrierTransition(_skyViewMoon!.Native, from, ResourceStates.UnorderedAccess);
-            list.ResourceBarrierTransition(_ap!.Native, from, ResourceStates.UnorderedAccess);
             cs.Dispatch(_kSkyView, list, (SkyViewW + 7) / 8, (SkyViewH + 7) / 8, 2);
-            cs.Dispatch(_kAP, list, APRes / 8, APRes / 8, APSlices);
             list.ResourceBarrierTransition(_skyViewSun.Native, ResourceStates.UnorderedAccess, shaderRead);
             list.ResourceBarrierTransition(_skyViewMoon.Native, ResourceStates.UnorderedAccess, shaderRead);
-            list.ResourceBarrierTransition(_ap.Native, ResourceStates.UnorderedAccess, shaderRead);
+
+            // This view's aerial perspective: one thread per column, marching through all of its slices
+            var ap = aerialPerspective.Texture;
+            if (ap != null)
+            {
+                PixMarker.Begin(list, "Aerial perspective");
+                if (aerialPerspective.State != ResourceStates.UnorderedAccess)
+                    list.ResourceBarrierTransition(ap.Native, aerialPerspective.State, ResourceStates.UnorderedAccess);
+                cs.SetPushConstant("APUAV", ap.UavIndex);
+                cs.Dispatch(_kAP, list, (uint)(aerialPerspective.Width + 7) / 8, (uint)(aerialPerspective.Height + 7) / 8);
+                list.ResourceBarrierTransition(ap.Native, ResourceStates.UnorderedAccess, shaderRead);
+                aerialPerspective.State = shaderRead;
+                PixMarker.End(list);
+            }
 
             // Ambient from the sky-view LUTs, then a copy for the CPU (Daylight)
             _ambient!.Transition(list, ResourceStates.UnorderedAccess);

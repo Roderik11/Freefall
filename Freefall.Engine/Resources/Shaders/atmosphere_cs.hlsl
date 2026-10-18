@@ -2,7 +2,8 @@
 //   CSTransmittance      256×64   transmittance from a height toward a zenith angle, to the top of the atmosphere
 //   CSMultiScattering    32×32    Ψ_ms: light scattered twice or more, isotropic, per unit illuminance
 //   CSSkyView            192×108  sky luminance from the camera, per unit illuminance; z = 0 sun, 1 the brightest moon
-//   CSAerialPerspective  32³      light scattered in between camera and each froxel (rgb, sun + moon, × Exposure), transmittance (a)
+//   CSAerialPerspective  ~20 px cells × 32 slices, sized to the view: light scattered in between camera and each froxel
+//                        (rgb, sun + moon, × Exposure), transmittance (a); one march per column
 //   CSAmbient            1 group  sky light on an up-facing surface and the ground's bounce light (Ambient buffer)
 // The first two depend on the medium only (made when it changes); the rest on the camera and the lights.
 
@@ -25,16 +26,6 @@ cbuffer PushConstants : register(b3)
 #include "common.fx"
 #include "atmosphere_common.hlsli"
 
-// The terrain's shadow on a sample of the air (atmosphere_common.hlsli AtmTerrainLightVisibility; god rays, ATMOSPHERE_PLAN
-// open issue "the sun's glow in the haze is not shadowed"). posKm is in the atmosphere's frame round the camera (km, the
-// camera at x = z = 0, the ground flat as the world's): the point's world position is the camera's plus its offset.
-// terrainShadow: 1 = the sun's map, 2 = the moon's.
-float TerrainLightVisibility(AtmosphereParams A, float3 posKm, uint terrainShadow)
-{
-    float3 worldPos = float3(CamPos.x + posKm.x * 1000.0, (posKm.y - A.BottomRadius) * 1000.0, CamPos.z + posKm.z * 1000.0);
-    return AtmTerrainLightVisibility(A, worldPos, terrainShadow == 2);
-}
-
 struct ScatteringResult
 {
     float3 L;               // scattered light reaching the start of the ray, per unit illuminance
@@ -48,12 +39,9 @@ struct ScatteringResult
 //   miePhase:    true = Rayleigh + Mie phases, false = isotropic (for the multiple scattering LUT)
 //   multiScat:   add Ψ_ms (the multiple scattering LUT must exist)
 //   tMaxMax:     stop the march here (km)
-//   terrainShadow: 1 = the sun's, 2 = the moon's: the light's single scattering at each sample × the terrain's shadow
-//                (TerrainLightVisibility; posKm must be the camera). The aerial perspective volume only: the sky-view
-//                LUT is made per angle to the light, not per place.
 ScatteringResult IntegrateScatteredLuminance(AtmosphereParams A, float3 posKm, float3 dir, float3 lightDir,
                                              bool ground, float sampleCount, bool miePhase, bool multiScat,
-                                             float tMaxMax, uint terrainShadow = 0)
+                                             float tMaxMax)
 {
     ScatteringResult result = (ScatteringResult)0;
     result.Transmittance = 1.0;
@@ -112,10 +100,7 @@ ScatteringResult IntegrateScatteredLuminance(AtmosphereParams A, float3 posKm, f
 
         float3 multiScattered = multiScat ? AtmMultipleScattering(A, P, lightZenithCos) : 0;
 
-        float lightVisible = earthShadow;
-        if (terrainShadow != 0 && earthShadow > 0.0)
-            lightVisible *= TerrainLightVisibility(A, P, terrainShadow);
-        float3 S = lightVisible * transmittanceToLight * phaseTimesScattering + multiScattered * medium.scattering;
+        float3 S = earthShadow * transmittanceToLight * phaseTimesScattering + multiScattered * medium.scattering;
 
         // Energy scattered as if the light over the sphere were 1 (power series of f_ms, analytic per segment)
         float3 ms = medium.scattering;
@@ -257,46 +242,94 @@ void CSSkyView(uint3 id : SV_DispatchThreadID)
 }
 
 // ── Aerial perspective volume: froxels over the screen, slices by view depth ──
+// One thread per column: a single march front to back through every slice (all the slices of a column share the
+// direction through its centre), writing each slice's light and transmittance as the march passes the slice's depth,
+// AP_STEPS samples per slice. The volume is sized to the view (Graphics/AerialPerspectiveVolume.cs: a cell per ~20
+// pixels): at 32×32 the terrain's shadow in the haze showed 40-110 px steps along a ridge, and a march per froxel from
+// the camera (up to 32 samples each, ~784 a column) would have cost ~6× as much at that size.
+
+#define AP_STEPS 3
+
+// One body's light scattered toward the camera at a sample, per unit illuminance and km: single scattering through the
+// air above (0 in the earth's shadow and the terrain's) with the given phase-weighted scattering, plus Ψ_ms
+float3 APSampleLight(AtmosphereParams A, AtmMedium medium, float3 P, float3 up, float pHeight, float3 worldPos,
+                     float3 lightDir, float miePhase, float rayleighPhase, bool moon)
+{
+    float lightZenithCos = dot(lightDir, up);
+    float3 toLight = AtmTransmittance(A, pHeight, lightZenithCos);
+    float tEarth = RaySphereIntersectNearest(P, lightDir, PLANET_RADIUS_OFFSET * up, A.BottomRadius);
+    float visible = tEarth >= 0.0 ? 0.0 : AtmTerrainLightVisibility(A, worldPos, moon);
+    float3 single = medium.scatteringMie * miePhase + medium.scatteringRay * rayleighPhase;
+    return visible * toLight * single + AtmMultipleScattering(A, P, lightZenithCos) * medium.scattering;
+}
 
 [numthreads(8, 8, 1)]
 void CSAerialPerspective(uint3 id : SV_DispatchThreadID)
 {
-    if (id.x >= AP_RES || id.y >= AP_RES || id.z >= AP_SLICES)
+    RWTexture3D<float4> output = ResourceDescriptorHeap[APUAVIdx];
+    uint width, height, slices;
+    output.GetDimensions(width, height, slices);
+    // id.z > 0: a dispatch over every froxel (builds before the column march) does each column once
+    if (id.x >= width || id.y >= height || id.z != 0)
         return;
     AtmosphereParams A = LoadAtmosphere();
 
-    // Camera-relative view direction through the froxel's centre (reverse-Z: the far plane is z = 0)
-    float2 uv = (float2(id.xy) + 0.5) / AP_RES;
+    // Camera-relative view direction through the column's centre (reverse-Z: the far plane is z = 0)
+    float2 uv = (float2(id.xy) + 0.5) / float2(width, height);
     float2 ndc = float2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
     float4 farClip = mul(float4(ndc, 0, 1), CameraInverse);
     float3 dir = normalize(farClip.xyz / farClip.w);
     float3 forward = normalize(float3(View._13, View._23, View._33));
+    float kmPerMetre = 0.001 / max(dot(dir, forward), 0.05);      // km along the ray per metre of view depth
 
-    float slice = (id.z + 0.5) / AP_SLICES;
-    float viewDepth = slice * slice * A.APMaxDepth;                 // metres along the view axis
-    float tMaxKm = viewDepth / max(dot(dir, forward), 0.05) * 0.001;
+    // The march ends where the ray meets the ground (the slices past it keep the last value) or leaves the air
+    float3 pos = float3(0, AtmosphereViewHeight(A, CamPos.y), 0);
+    float tGround = RaySphereIntersectNearest(pos, dir, float3(0, 0, 0), A.BottomRadius);
+    float tTop = RaySphereIntersectNearest(pos, dir, float3(0, 0, 0), A.TopRadius);
+    float tEnd = tGround >= 0.0 ? tGround : max(tTop, 0.0);
 
-    float viewHeight = AtmosphereViewHeight(A, CamPos.y);
-    float3 pos = float3(0, viewHeight, 0);
+    // The phases depend on the column's direction only
+    float sunCos = dot(dir, A.SunDirection), moonCos = dot(dir, A.MoonDirection);
+    float sunMie = AtmMiePhase(A.MieG, sunCos), sunRayleigh = AtmRayleighPhase(sunCos);
+    float moonMie = AtmMiePhase(A.MieG, moonCos), moonRayleigh = AtmRayleighPhase(moonCos);
+    bool moonLit = any(A.MoonIlluminance > 0);
 
-    // A froxel under the ground: stop at the ground
-    float3 end = pos + dir * tMaxKm;
-    if (length(end) <= A.BottomRadius)
+    float3 L = 0;               // × the illuminances
+    float3 throughput = 1.0;
+    float t = 0.0;
+    for (uint s = 0; s < slices; s++)
     {
-        end = normalize(end) * (A.BottomRadius + PLANET_RADIUS_OFFSET + 0.001);
-        tMaxKm = length(end - pos);
-        dir = (end - pos) / max(tMaxKm, 1e-6);
+        float w = (s + 0.5) / slices;
+        float tSlice = min(w * w * A.APMaxDepth * kmPerMetre, tEnd);     // slice s: view depth w² × APMaxDepth
+        float dt = max(tSlice - t, 0.0) / AP_STEPS;
+        if (dt > 0.0)
+        {
+            for (uint k = 0; k < AP_STEPS; k++)
+            {
+                float3 P = pos + (t + (k + 0.5) * dt) * dir;
+                float pHeight = length(P);
+                float3 up = P / pHeight;
+                float3 worldPos = float3(CamPos.x + P.x * 1000.0, (P.y - A.BottomRadius) * 1000.0, CamPos.z + P.z * 1000.0);
+                AtmMedium medium = SampleAtmMedium(P, A);
+
+                float3 S = A.SunIlluminance * APSampleLight(A, medium, P, up, pHeight, worldPos, A.SunDirection,
+                                                            sunMie, sunRayleigh, false);
+                if (moonLit)
+                    S += A.MoonIlluminance * APSampleLight(A, medium, P, up, pHeight, worldPos, A.MoonDirection,
+                                                           moonMie, moonRayleigh, true);
+
+                // ∫ S e^(−σx) dx over the step (Frostbite 2015), written so a short step of clear air keeps its light
+                float3 x = medium.extinction * dt;
+                float3 through = exp(-x);
+                float3 share = lerp(1.0 - 0.5 * x, (1.0 - through) / max(x, 1e-12), step(1e-4, x));
+                L += throughput * S * dt * share;
+                throughput *= through;
+            }
+            t = tSlice;
+        }
+        // Stored as the pixel stores light (× Exposure): sun and moon together, and small enough for half floats
+        output[uint3(id.xy, s)] = float4(L * Exposure, dot(throughput, 1.0 / 3.0));
     }
-
-    float sampleCount = clamp(2.0 * (id.z + 1), 2.0, 32.0);
-    ScatteringResult r = IntegrateScatteredLuminance(A, pos, dir, A.SunDirection, false, sampleCount, true, true, tMaxKm, 1);
-    float3 L = r.L * A.SunIlluminance;
-    if (any(A.MoonIlluminance > 0))
-        L += IntegrateScatteredLuminance(A, pos, dir, A.MoonDirection, false, sampleCount, true, true, tMaxKm, 2).L * A.MoonIlluminance;
-
-    // Stored as the pixel stores light (× Exposure): sun and moon together, and small enough for half floats
-    RWTexture3D<float4> output = ResourceDescriptorHeap[APUAVIdx];
-    output[id] = float4(L * Exposure, dot(r.Transmittance, 1.0 / 3.0));
 }
 
 // ── Ambient: the sky's light on an up-facing surface, and the ground's bounce light on a down-facing one ──

@@ -63,6 +63,8 @@ namespace Freefall.Graphics
         /// <summary>The near fog volume (god rays): the air near the camera lit with the sun's shadows.</summary>
         public VolumetricFog? VolumetricFog { get; private set; }
         private uint _fogVolumeIdx;             // this frame's SceneConstants.FogVolumeIdx (0 = off)
+        // This view's aerial perspective volume (the far haze), sized to its target: SceneConstants.AerialPerspectiveIdx
+        private readonly AerialPerspectiveVolume _aerialPerspective = new();
         private Matrix4x4 _relativeVP;          // this frame's view-projection without translation
 
         // Screen-space shadows of the highest ranked point lights (TracePointLightScreenShadows): a mask each, and
@@ -538,6 +540,8 @@ namespace Freefall.Graphics
              _fogVolumeIdx = VolumetricFog != null && Engine.Settings.Fog && Engine.Settings.VolumetricFog
                  ? VolumetricFog.Prepare((int)compositeSize.Width, (int)compositeSize.Height) : 0u;
              _relativeVP = relativeVP;
+             // ... and this view's aerial perspective volume, sized to it (filled by Atmosphere.Render just below)
+             uint aerialPerspectiveIdx = _aerialPerspective.Prepare((int)compositeSize.Width, (int)compositeSize.Height);
 
              foreach (var pair in Effect.MasterEffects)
              {
@@ -545,11 +549,12 @@ namespace Freefall.Graphics
                  pair.Value.SetParameter("CameraRelativeVP", relativeVP);
                  pair.Value.SetParameter("FogVolumeIdx", _fogVolumeIdx);
                  pair.Value.SetParameter("FogVolumeRange", VolumetricFog?.Range ?? 0f);
+                 pair.Value.SetParameter("AerialPerspectiveIdx", aerialPerspectiveIdx);
              }
 
              // The atmosphere's LUTs for this view (sky-view, aerial perspective, ambient): the sky dome, the
              // lighting, the composition and the forward passes all read them
-             Atmosphere.Render(list, BindSceneConstantsForCompute);
+             Atmosphere.Render(list, BindSceneConstantsForCompute, _aerialPerspective);
 
              PixMarker.Begin(list, "GBuffer");
              // First frame: textures start in Common state; subsequent frames: PixelShaderResource
@@ -1528,6 +1533,7 @@ namespace Freefall.Graphics
             ShadowReceivers?.Dispose();
             ScreenSpaceShadows?.Dispose();
             VolumetricFog?.Dispose();
+            _aerialPerspective.Dispose();
             foreach (var tracer in _pointScreenShadows) tracer?.Dispose();
             Gtao?.Dispose();
             ScreenSpaceDisplacement?.Dispose();

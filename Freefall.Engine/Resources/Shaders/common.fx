@@ -46,6 +46,7 @@ cbuffer SceneConstants : register(b0)
     // ── Near fog volume (Graphics.VolumetricFog, set per view by DeferredRenderer) — sky_common.fx AtmosphereFog ──
     uint FogVolumeIdx;                 // bindless Texture3D: the air's light (rgb × Exposure) and transmittance (a) up to each slice; 0 = off
     float FogVolumeRange;              // metres of view depth it covers; the aerial perspective volume takes over past it
+    uint AerialPerspectiveIdx;         // this view's aerial perspective volume (Graphics.AerialPerspectiveVolume, sized to it); 0 = AtmosphereParams.AerialPerspective
 }
 
 // ── Large-scale variation of the ground and what grows on it (gputerrain.fx, grass cards, blades, flowers) ──

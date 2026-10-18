@@ -21,8 +21,8 @@
 #define MULTISCAT_LUT_RES 32
 #define SKYVIEW_LUT_W 192
 #define SKYVIEW_LUT_H 108
-#define AP_RES 32           // froxels across the screen, each way
-#define AP_SLICES 32        // depth slices: slice s ends at ((s + 0.5) / AP_SLICES)² × APMaxDepth (view depth)
+#define AP_SLICES 32        // depth slices: slice s ends at ((s + 0.5) / AP_SLICES)² × APMaxDepth (view depth); its cells
+                            // across the screen follow the view (Graphics/AerialPerspectiveVolume.cs)
 
 static const float PLANET_RADIUS_OFFSET = 0.01;   // km: keeps sample points just off the ground
 
@@ -298,9 +298,14 @@ float3 AtmosphereSkyLuminance(AtmosphereParams A, float3 dir)
 }
 
 // Aerial perspective between the camera and a point on screen at a view depth (metres): rgb = light scattered in
-// on the way (cd/m² × Exposure, i.e. what the pixel stores), a = how much of the point's own light gets through
+// on the way (cd/m² × Exposure, i.e. what the pixel stores), a = how much of the point's own light gets through.
+// From this view's volume (SceneConstants.AerialPerspectiveIdx); a build that predates it set the shared one in the
+// atmosphere's parameters instead.
 float4 AtmosphereAerialPerspective(AtmosphereParams A, float2 screenUV, float viewDepth)
 {
+    uint volume = AerialPerspectiveIdx != 0 ? AerialPerspectiveIdx : A.AerialPerspective;
+    if (volume == 0)
+        return float4(0, 0, 0, 1);
     float w = sqrt(saturate(viewDepth / A.APMaxDepth));
     float slice = w * AP_SLICES;
     float weight = 1.0;
@@ -310,7 +315,7 @@ float4 AtmosphereAerialPerspective(AtmosphereParams A, float2 screenUV, float vi
         weight = saturate(slice * 2.0);
         w = 0.5 / AP_SLICES;
     }
-    Texture3D<float4> ap = ResourceDescriptorHeap[A.AerialPerspective];
+    Texture3D<float4> ap = ResourceDescriptorHeap[volume];
     float4 s = ap.SampleLevel(AtmosphereLinearClamp, float3(screenUV, w), 0);
     float3 inscatter = s.rgb * weight;   // already sun + moon, × Exposure (CSAerialPerspective)
     float transmittance = 1.0 - weight * (1.0 - s.a);
