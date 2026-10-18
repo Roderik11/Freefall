@@ -32,6 +32,13 @@ namespace Freefall.PCG
         private static bool _terrainGaveUp;
         private const int MaxTerrainWaitFrames = 300;
 
+        // Debounce: queued components run only once no request has come from outside a run for this long. Edits
+        // that arrive as separate calls a few frames apart (MCP / REST property sets, inspector field edits) would
+        // otherwise each regenerate everything they touch, a whole town's or forest's PCG per call.
+        private const double QuietSeconds = 0.4;
+        private static long _lastRequest;
+        private static bool _flushing;
+
         /// <summary>Components waiting to regenerate.</summary>
         public static int PendingCount => _dirty.Count;
 
@@ -39,6 +46,9 @@ namespace Freefall.PCG
         {
             if (!_dirty.Contains(component))
                 _dirty.Add(component);
+            // A run queueing the components after it is part of the same change: it does not restart the wait
+            if (!_flushing)
+                _lastRequest = System.Diagnostics.Stopwatch.GetTimestamp();
         }
 
         public static void Cancel(PCGComponent component) => _dirty.Remove(component);
@@ -87,6 +97,7 @@ namespace Freefall.PCG
 
             if (_dirty.Count == 0) return;
             if (_holdConditions.Count > 0 || Volatile.Read(ref _holds) > 0) return;
+            if (System.Diagnostics.Stopwatch.GetElapsedTime(_lastRequest).TotalSeconds < QuietSeconds) return;
 
             if (terrainPending && !_terrainGaveUp)
             {
