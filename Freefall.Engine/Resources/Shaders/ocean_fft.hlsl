@@ -180,10 +180,19 @@ void CSAssembleMaps(uint3 id : SV_DispatchThreadID)
         foam *= exp(-oc.FoamDecayRate * foamStep);
         foam = saturate(foam);
 
-        // Whitecaps where the crest is squeezed: J under FoamBias - FoamThreshold, more the deeper (a swell makes none)
-        float biasedJacobian = max(0.0f, -(jacobian - oc.FoamBias));
-        if (biasedJacobian > oc.FoamThreshold && ((oc.NoWhitecapBands >> i) & 1u) == 0)
-            foam += oc.FoamAdd * biasedJacobian * foamStep;
+        // Whitecaps where the crest is squeezed: J under FoamBias - FoamThreshold, more the deeper. A band that makes no
+        // whitecaps of its own (NoWhitecapBands) stores how squeezed its crests are right now instead (1 - J): ocean.fx
+        // lights those crests up inside the whitecaps of the band that does, as their structure
+        if (((oc.NoWhitecapBands >> i) & 1u) != 0)
+        {
+            foam = saturate(1.0 - jacobian);
+        }
+        else
+        {
+            float biasedJacobian = max(0.0f, -(jacobian - oc.FoamBias));
+            if (biasedJacobian > oc.FoamThreshold)
+                foam += oc.FoamAdd * biasedJacobian * foamStep;
+        }
 
         // Write output
         displacementTex[uint3(id.xy, i)] = float4(displacement, foam);

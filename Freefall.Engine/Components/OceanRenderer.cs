@@ -101,6 +101,16 @@ namespace Freefall.Components
         [Description("High-frequency rolloff of the finest waves (against aliasing at the finest band's resolution)")]
         [ValueRange(0f, 1f)]
         public float ShortWavesFade = 0.01f;
+
+        [Description(@"How much taller than the wind really raises it the sea stands as the wind rises: the wave height × this
+         from 20 m/s of wind, ramping in from 5 m/s (calm seas stay as the wind makes them; a 10 m/s sea stands a third
+         taller, enough for white horses). A real storm sea is long and not very steep; 1 = real")]
+        [ValueRange(1f, 3f)]
+        public float StormWaveScale = 2f;
+
+        /// <summary>The wind sea's height as a multiple of the real one at this wind</summary>
+        public float WaveScaleAt(float windSpeed) =>
+            1f + (StormWaveScale - 1f) * Math.Clamp((windSpeed - 5f) / 15f, 0f, 1f);
     }
 
     /// <summary>
@@ -121,10 +131,11 @@ namespace Freefall.Components
          Shallower water produces shorter, steeper waves")]
         public float Depth = 40.0f;
         
-        [ValueRange(0f, 1f)]
+        [ValueRange(0f, 2f)]
         [Description(@"Horizontal displacement scale (Lambda): squeezes the crests together into sharp peaks and
-         stretches the troughs (1 = what real waves do). The squeezed crests are where whitecaps form")]
-        public float Choppiness = 1.0f;
+         stretches the troughs (1 = linear theory). The squeezed crests are where whitecaps form. 1.4 gives the peaked
+         crests of a storm sea; much more folds them over")]
+        public float Choppiness = 1.4f;
         
         [ValueRange(0f, 5f)]
         [Description(@"Time multiplier for wave animation speed.
@@ -136,31 +147,31 @@ namespace Freefall.Components
          Higher values delay visible looping")]
         public float RepeatTime = 200.0f;
 
-        // Whitecaps: foam where a crest is squeezed, the Jacobian J of the choppy displacement under FoamBias −
-        // FoamThreshold, a finer band's only inside a coarser band's (FoamGate). The defaults (2026-10-18) give
-        // Monahan's whitecap share from 10 to 20 m/s of wind within ~1.7× (1.7 / 4.5 / 7.2% against 1.0 / 3.9 / 10.5%),
-        // none up to 6 m/s and 13% at 25 m/s (Monahan 22%).
+        // Whitecaps: foam where a crest of the whitecap band (WhitecapBand) is squeezed (the Jacobian J of the displacement)
+        // under FoamBias − FoamThreshold; the finer bands' crests give it its structure (ocean.fx). The defaults
+        // (2026-10-18, tuned by eye against a storm reference with WindSea.StormWaveScale 2): calm and moderate seas stay
+        // clean (their crests barely squeeze), a storm's taller crests foam all over and leave trails.
         [Category("Foam")]
         [ValueRange(0f, 2f)]
         [Description(@"Whitecaps form where a crest is squeezed below this Jacobian (minus the threshold).
          Higher = more crests foam, at lighter winds")]
-        public float FoamBias = 0.9f;
+        public float FoamBias = 0.82f;
 
         [ValueRange(0f, 0.1f)]
         [Description(@"Exponential decay rate per frame.
          Controls how quickly foam fades after forming.
          Lower values make foam linger longer")]
-        public float FoamDecayRate = 0.005f;
+        public float FoamDecayRate = 0.012f;
 
         [ValueRange(0f, 1f)]
         [Description(@"Minimum Jacobian deviation required before any foam is added.
          Acts as a noise gate to suppress faint foam")]
-        public float FoamThreshold = 0.1f;
+        public float FoamThreshold = 0.02f;
 
         [ValueRange(0f, 1f)]
         [Description(@"Amount of foam injected per frame when the Jacobian exceeds the threshold.
          Higher values create thicker, more opaque foam")]
-        public float FoamAdd = 0.5f;
+        public float FoamAdd = 0.1f;
 
         [Category("Shore")]
         [ValueRange(1f, 100f)]
@@ -262,11 +273,11 @@ namespace Freefall.Components
             public Vector3 OceanColor;
             public uint SeaMaskSRV;      // where the open sea is (SeaMask); 0 = everywhere. Was padding: an older build writes 0
             public Vector3 DeepColor;
-            public uint FoamGate;        // per band a nibble: 0 = foam shown as it is, k = only where band k - 1 foams (was padding)
+            public uint WindBands;       // bit per band carrying the wind sea (FollowWind): its crests glow (was padding)
             public Vector3 SunDirection;
             public float SunIntensity;
             public Vector3 SunColor;
-            public float _pad2;
+            public uint WhitecapBand;    // the band whose foam marks the whitecaps (WhitecapBand) + 1; 0 = none (was padding)
             public uint DisplacementSRV;
             public uint SlopeSRV;
             public uint NumBands;
@@ -409,41 +420,49 @@ namespace Freefall.Components
                 pData[i] = 1.0f / Bands[i].LengthScale;
         }
 
-        // Bands that make no whitecaps: a swell from afar does not break in deep water, so with wind bands for the local
-        // sea the authored bands (swells) make none; their long crests still squeezed past the foam threshold now and then.
+        // The band whose foam says where the whitecaps are: the wind band that holds the wind sea's peak, the dominant waves
+        // one sees break. They shorten as the wind drops, so the calmer the sea the finer that band (the user's idea,
+        // 2026-10-18): on Eldermoor the 250 m band from ~4 m/s up (peaks 16-100 m), the 64 m band below. The finer wind
+        // bands give the whitecaps their structure (ocean.fx); on their own their crests foamed where no crest is seen:
+        // random blobs. -1 without wind bands.
+        private int WhitecapBand()
+        {
+            var windBands = new List<int>();
+            for (int i = 0; i < Bands.Count; i++)
+                if (Bands[i].FollowWind) windBands.Add(i);
+            if (windBands.Count == 0) return -1;
+            windBands.Sort((a, b) => Bands[b].LengthScale.CompareTo(Bands[a].LengthScale));
+
+            // Deep-water wavelength of the spectrum's peak; each wind band holds from a quarter of the next finer one's
+            // tile up to a quarter of its own (the coarsest: everything longer), as BuildSpectrumParams shares them out
+            float omega = JonswapPeakOmega(WindSea.Fetch, MathF.Max(Wind.Strength, 0.5f));
+            float peak = 2f * MathF.PI * Gravity / (omega * omega);
+            for (int r = windBands.Count - 1; r > 0; r--)
+                if (peak < Bands[windBands[r]].LengthScale / 4f)
+                    return windBands[r];
+            return windBands[0];
+        }
+
+        // Bands that make no whitecaps of their own: with wind bands all but the whitecap band (WhitecapBand); a swell
+        // from afar does not break in deep water. Without wind bands (authored seas) every band foams, as in the
+        // reference implementation.
         private uint NoWhitecapBands()
         {
-            bool windSea = false;
-            for (int i = 0; i < Bands.Count; i++)
-                windSea |= Bands[i].FollowWind;
-            if (!windSea) return 0;
+            int capBand = WhitecapBand();
+            if (capBand < 0) return 0;
             uint mask = 0;
             for (int i = 0; i < Bands.Count && i < 32; i++)
-                if (!Bands[i].FollowWind) mask |= 1u << i;
+                if (i != capBand) mask |= 1u << i;
             return mask;
         }
 
-        // Which band's foam each band's whitecaps show inside (OceanData.FoamGate, ocean.fx): a nibble per band, 0 = its
-        // foam shows as it is, k = only where band k - 1 foams. Each foaming band is gated by the next coarser foaming
-        // band, so the finer bands add their detail inside the bigger whitecaps (short waves break on the crests of long
-        // ones): on its own the 17 m band's foam repeated every tile, a grid of specks over a storm sea. The shader works
-        // through the bands in order, so a band is only gated by one before it in the list (the default order runs
-        // coarse to fine).
-        private uint FoamGate()
+
+        private uint WindBandMask()
         {
-            uint noFoam = NoWhitecapBands();
-            uint gate = 0;
-            for (int i = 0; i < Bands.Count && i < 8; i++)
-            {
-                if ((noFoam & (1u << i)) != 0) continue;
-                int coarser = -1;
-                for (int j = 0; j < i; j++)
-                    if ((noFoam & (1u << j)) == 0 && Bands[j].LengthScale > Bands[i].LengthScale
-                        && (coarser < 0 || Bands[j].LengthScale < Bands[coarser].LengthScale))
-                        coarser = j;
-                if (coarser >= 0) gate |= (uint)(coarser + 1) << (i * 4);
-            }
-            return gate;
+            uint mask = 0;
+            for (int i = 0; i < Bands.Count && i < 32; i++)
+                if (Bands[i].FollowWind) mask |= 1u << i;
+            return mask;
         }
 
         private uint[] BuildLengthScales()
@@ -492,6 +511,7 @@ namespace Freefall.Components
             float windSpeed = MathF.Max(Wind.Strength, 0.5f);
             var dir = Wind.Direction;
             float heading = dir.LengthSquared() > 0f ? MathF.Atan2(dir.Z, dir.X) : 0f;
+            float stormScale = WindSea.WaveScaleAt(windSpeed);
 
             // The wind bands' share of the wavelengths, coarsest first
             var windBands = new List<int>();
@@ -516,7 +536,8 @@ namespace Freefall.Components
                     var sea = WindSea;
                     spectrums[i * 2] = new OceanFFT.SpectrumParameters
                     {
-                        Scale = sea.Scale,
+                        // Storms stand taller than physics (WindSea.StormWaveScale): wave height × that, energy × its square
+                        Scale = sea.Scale * stormScale * stormScale,
                         Angle = heading + BandAngles[i % BandAngles.Length],
                         SpreadBlend = sea.SpreadBlend,
                         Swell = sea.Swell,
@@ -703,7 +724,8 @@ namespace Freefall.Components
                 OceanColor = new Vector3(OceanColor.R, OceanColor.G, OceanColor.B),
                 SeaMaskSRV = Engine.Settings.DisableSeaMask ? 0 : _seaMask.Srv,
                 DeepColor = new Vector3(DeepColor.R, DeepColor.G, DeepColor.B),
-                FoamGate = FoamGate(),
+                WindBands = WindBandMask(),
+                WhitecapBand = (uint)(WhitecapBand() + 1),
                 SunDirection = sunDir,
                 SunColor = sunColor,
                 SunIntensity = sunIntensity,

@@ -6,7 +6,6 @@
 #pragma kernel CSEvolveSpectrum
 
 #define PI 3.14159265358979323846
-#define WHITECAP_K (2.0 * PI / 1.0)    // wavenumber of a 1 m wave: shorter ones squeeze no foam out of the crests
 
 cbuffer PushConstants : register(b3)
 {
@@ -326,15 +325,15 @@ void CSEvolveSpectrum(uint3 id : SV_DispatchThreadID)
         float2 displacementY = htilde;
         float2 displacementZ = ih * K.y * kMagRcp;
 
-        // Derivative spectra (for slopes + Jacobian). The squeeze of the choppy displacement (∂D/∂x) is what makes
-        // whitecaps (the Jacobian) and steepens crests in the normals: only from waves longer than about a metre.
-        // Ripples break without foam, and the finest band's squeeze, almost all ripples, foamed at 3 m/s.
-        float breaking = exp(-kMag * kMag / (WHITECAP_K * WHITECAP_K));
-        float2 displacementX_dx = -htilde * K.x * K.x * kMagRcp * breaking;
+        // Derivative spectra (for slopes + Jacobian): every band's own squeeze, ripples included. The finer bands' squeeze
+        // is the structure inside the whitecaps (ocean.fx), the ripples its finest detail. (A cut to waves over 1 m,
+        // 2026-10-18, kept the ripples from foaming on their own; since only the whitecap band foams it only cost
+        // that detail.)
+        float2 displacementX_dx = -htilde * K.x * K.x * kMagRcp;
         float2 displacementY_dx = ih * K.x;
-        float2 displacementZ_dx = -htilde * K.x * K.y * kMagRcp * breaking;
+        float2 displacementZ_dx = -htilde * K.x * K.y * kMagRcp;
         float2 displacementY_dz = ih * K.y;
-        float2 displacementZ_dz = -htilde * K.y * K.y * kMagRcp * breaking;
+        float2 displacementZ_dz = -htilde * K.y * K.y * kMagRcp;
 
         // Pack into 2 RGBA texels per band (numBands*2 slices total)
         float2 htildeDisplacementX = float2(displacementX.x - displacementZ.y, displacementX.y + displacementZ.x);

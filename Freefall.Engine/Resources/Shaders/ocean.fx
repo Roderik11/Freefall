@@ -46,11 +46,11 @@ struct OceanData
     float3 OceanColor;
     uint SeaMaskSRV;        // where the open sea is (C# SeaMask), 0 = everywhere. Was padding: an older build writes 0
     float3 DeepColor;
-    uint FoamGate;          // per band a nibble: 0 = its foam shows as it is, k = only where band k - 1 foams. Was padding: 0
+    uint WindBands;         // bit per band carrying the wind sea (C# FollowWind). Was padding: an older build writes 0
     float3 SunDirection;
     float SunIntensity;
     float3 SunColor;
-    float _pad2;
+    uint WhitecapBand;      // the band whose foam marks the whitecaps + 1 (C# WhitecapBand); 0 = the coarsest wind band
     uint DisplacementSRV;
     uint SlopeSRV;
     uint NumBands;
@@ -189,6 +189,20 @@ SamplerState OceanSampler : register(s0);
 //   frac(SurgeClock): 0..SurgeRise = run-up, SurgeRise..1 = backwash (0.5 would be symmetric)
 static const float SurgeRise = 0.38;
 
+// Light through the crests (PS): full at this height (m) of the wind sea above the mean, and the share of the light on a
+// crest that scatters through it to the eye
+// Whitecaps (PS): the opacity of the coarsest wind band's foam where the finer bands' crests are not squeezed, and how
+// much their squeeze (1 - J, summed) raises it
+#define WHITECAP_VEIL 0.08
+#define WHITECAP_CRESTS 3.0
+#define WHITECAP_THIN 0.03
+#define WHITECAP_RAMP 0.55
+
+#define CREST_GLOW_HEIGHT 3.0
+#define CREST_GLOW 0.25
+// Bubbles under a whitecap (PS): the share of the light on the water that they send back up, per unit of whitecap foam
+#define AERATION 0.1
+
 float ShoreClock(float waveTime, float bandNoise)
 {
     return waveTime * 0.22 + bandNoise * 1.5;   // noise staggers the waves along the coast
@@ -266,7 +280,20 @@ float2 RotateUV(float2 uv, float angle)
     return float2(uv.x * c - uv.y * s, uv.x * s + uv.y * c);
 }
 
-float3 SampleDisplacement(OceanData ocean, float2 worldXZ, float depthAtten, float camDist)
+// How much of a band's waves the shore lets stand: waves feel the bottom where the water is shallower than about half
+// their length, so the long swell flattens toward the beach while the ripples run on over a shallow shelf. A band holds
+// the waves from a quarter of its tile to the whole tile long (the coarser band the longer ones); they stand in full
+// where its shortest are in deep water, from an eighth of the tile (17 m band: 2 m, 64 m: 8 m, 250 m: 31 m, the 1000 m
+// swell: 125 m). Until 2026-10-18 the shore damped every band alike, ripples too, and only the heights: the PS shaded a
+// flattened shelf as the full open-sea chop.
+//   shoreAtten: the shore's damping of the longest waves (ShoreMinWave..1), depth: still-water depth (m)
+float BandShoreAtten(float shoreAtten, float depth, float tileScale)
+{
+    return lerp(shoreAtten, 1.0, saturate(depth * tileScale * 8.0));
+}
+
+//   shoreAtten, depth: as BandShoreAtten (1 and a large depth away from the shore)
+float3 SampleDisplacement(OceanData ocean, float2 worldXZ, float depthAtten, float camDist, float shoreAtten, float depth)
 {
     Texture2DArray<float4> dispTex = ResourceDescriptorHeap[ocean.DisplacementSRV];
     StructuredBuffer<float> tileScales = ResourceDescriptorHeap[ocean.TileScalesSRV];
@@ -282,7 +309,7 @@ float3 SampleDisplacement(OceanData ocean, float2 worldXZ, float depthAtten, flo
         // Added as it came (until 2026-10-18), it pushed the surface off to one side of the band's waves instead of
         // toward their crests: choppiness sheared the pattern sideways and never sharpened a crest.
         d.xz = RotateUV(d.xz, -BandAngles[i]);
-        totalDisp += d;
+        totalDisp += d * BandShoreAtten(shoreAtten, depth, tileScales[i]);
     }
 
     return totalDisp * depthAtten;
@@ -387,7 +414,8 @@ struct DSOutput
 {
     float4 Position : SV_POSITION;
     float3 WorldPos : TEXCOORD0;       // Displaced world position
-    float3 UndisplacedXZ : TEXCOORD1;  // Pre-displacement XZ for PS texture sampling
+    float4 UndisplacedXZ : TEXCOORD1;  // xy: pre-displacement XZ for PS texture sampling, z, w: the shore's damping of the
+                                       // longest waves and the depth that sets each band's share of it (BandShoreAtten)
     float Depth : TEXCOORD2;
     nointerpolation uint InstanceIdx : TEXCOORD3;
     float4 SkyAmbient : TEXCOORD4;     // rgb: the sky's light on a level surface (SkyAmbient(up), the sky probe), constant per frame
@@ -414,8 +442,12 @@ DSOutput DS(HullConstantOutput patchConstants,
     float3 camPos = ViewInverse[3].xyz;
     float camDist = length(worldPos - camPos);
 
-    // Sample FFT displacement from all bands (with distance-based mips)
-    float3 displacement = SampleDisplacement(ocean, worldPos.xz, ocean.DisplacementAtten, camDist);
+    // How far the shore flattens the longest waves here and the depth that sets how much each band feels of it
+    // (BandShoreAtten): the PS weighs the bands' slopes and foam alike
+    float waveAtten = 1.0;
+    float shoreDepth = 1e4;
+    float waterDepth = 1e4;
+    float outside = 1e4;
 
     // ── Shore attenuation: sample terrain heightmap for world-space water depth ──
     if (ocean.HeightmapSRV != 0)
@@ -429,7 +461,7 @@ DSOutput DS(HullConstantOutput patchConstants,
         // fade to open-sea waves over the next 150 m. Stopping at the border instead makes the wave
         // height jump along it wherever the seabed there is shallower than ShoreDepth.
         float2 clampedUV = clamp(terrainUV, 0.002, 0.998);
-        float outside = length((terrainUV - clampedUV) * float2(ocean.TerrainSizeX, ocean.TerrainSizeZ));
+        outside = length((terrainUV - clampedUV) * float2(ocean.TerrainSizeX, ocean.TerrainSizeZ));
         if (outside < 150.0)
         {
             Texture2D<float> heightmap = ResourceDescriptorHeap[ocean.HeightmapSRV];
@@ -437,39 +469,51 @@ DSOutput DS(HullConstantOutput patchConstants,
             float terrainWorldY = ocean.TerrainBaseY + h * ocean.MaxTerrainHeight;
 
             // Water depth = ocean surface - terrain surface (positive = water exists)
-            float waterDepth = ocean.OceanPlaneY - terrainWorldY;
+            waterDepth = ocean.OceanPlaneY - terrainWorldY;
             float shoreBlend = smoothstep(0, ocean.ShoreDepth, waterDepth);
             float shoreAtten = lerp(ocean.ShoreMinWave, 1.0, shoreBlend);
 
-            displacement *= lerp(shoreAtten, 1.0, smoothstep(0.0, 150.0, outside));
-
-            // Swash surge: the water level near the beach rises and falls in step with the foam bands
-            // (same phase as the PS), so the waterline travels up and down the sand instead of standing still.
-            if (ocean.NoiseSRV != 0)
-            {
-                Texture2D<float4> noiseTex = ResourceDescriptorHeap[ocean.NoiseSRV];
-                float bandNoise = noiseTex.SampleLevel(OceanSampler, worldPos.xz * 0.011, 0).r;
-                float swashZone = 1.0 - smoothstep(0.0, max(0.1, ocean.ShoreFoamDepth), waterDepth);
-
-                // Asymmetric like real swash: a quicker run-up (SurgeRise of the cycle) followed by a
-                // slower backwash. 0.5 = symmetric; 0.25 felt too abrupt up and too sluggish back.
-                float surgeClock = SurgeClock(ShoreClock(ocean.WaveTime, bandNoise), ocean.ShoreSurge, ocean.ShoreFoamDepth);
-                float surgePhase = frac(surgeClock);
-                float surge = surgePhase < SurgeRise
-                    ? smoothstep(0.0, SurgeRise, surgePhase)
-                    : 1.0 - smoothstep(SurgeRise, 1.0, surgePhase);
-
-                // Every wave starts from the same low water (-ShoreSurge) but runs up a different
-                // distance. Keeping the low point fixed keeps the level continuous from wave to wave.
-                float strength = WaveStrength(floor(surgeClock));
-                displacement.y += ocean.ShoreSurge * swashZone * (2.0 * strength * surge - 1.0);
-            }
+            // Where the terrain lies on its floor it has no seabed to tell either: a flat plane under the sea with the
+            // land raised from it (Eldermoor's floor is 12 m down), so open sea as outside it. The shore damps the waves
+            // only over the land's slope, faded in over its lower half so the foot of the slope draws no line. Until
+            // 2026-10-18 the whole floor counted as a 12 m shelf: the long waves stood at a third of their height
+            // everywhere on the map and grew to full height over the 150 m past its border
+            float floorDepth = max(ocean.OceanPlaneY - ocean.TerrainBaseY, 1.0);
+            float onFloor = 1.0 - smoothstep(0.0, 0.5 * floorDepth, terrainWorldY - ocean.TerrainBaseY);
+            float open = max(smoothstep(0.0, 150.0, outside), onFloor);
+            waveAtten = lerp(shoreAtten, 1.0, open);
+            shoreDepth = max(waterDepth, 0.0) + open * 1e4;
         }
+    }
+
+    // Sample FFT displacement from all bands (with distance-based mips), each as far as the shore lets it stand
+    float3 displacement = SampleDisplacement(ocean, worldPos.xz, ocean.DisplacementAtten, camDist, waveAtten, shoreDepth);
+
+    // Swash surge: the water level near the beach rises and falls in step with the foam bands
+    // (same phase as the PS), so the waterline travels up and down the sand instead of standing still.
+    if (ocean.HeightmapSRV != 0 && outside < 150.0 && ocean.NoiseSRV != 0)
+    {
+        Texture2D<float4> noiseTex = ResourceDescriptorHeap[ocean.NoiseSRV];
+        float bandNoise = noiseTex.SampleLevel(OceanSampler, worldPos.xz * 0.011, 0).r;
+        float swashZone = 1.0 - smoothstep(0.0, max(0.1, ocean.ShoreFoamDepth), waterDepth);
+
+        // Asymmetric like real swash: a quicker run-up (SurgeRise of the cycle) followed by a
+        // slower backwash. 0.5 = symmetric; 0.25 felt too abrupt up and too sluggish back.
+        float surgeClock = SurgeClock(ShoreClock(ocean.WaveTime, bandNoise), ocean.ShoreSurge, ocean.ShoreFoamDepth);
+        float surgePhase = frac(surgeClock);
+        float surge = surgePhase < SurgeRise
+            ? smoothstep(0.0, SurgeRise, surgePhase)
+            : 1.0 - smoothstep(SurgeRise, 1.0, surgePhase);
+
+        // Every wave starts from the same low water (-ShoreSurge) but runs up a different
+        // distance. Keeping the low point fixed keeps the level continuous from wave to wave.
+        float strength = WaveStrength(floor(surgeClock));
+        displacement.y += ocean.ShoreSurge * swashZone * (2.0 * strength * surge - 1.0);
     }
 
     float3 displaced = worldPos + displacement;
 
-    output.UndisplacedXZ = worldPos.xzx; // Pass XZ for PS sampling (z component unused)
+    output.UndisplacedXZ = float4(worldPos.xz, waveAtten, shoreDepth);
     output.WorldPos = displaced;
     output.Position = mul(mul(float4(displaced, 1.0), View), Projection);
     output.Depth = output.Position.w;
@@ -533,9 +577,37 @@ PSOutput PS(DSOutput input)
     // the slopes under this pixel its roughness. NormalAtten scales the slopes (and so the variance by its square).
     WaterSlopes slopes = (WaterSlopes)0;
     float resolvedTotal = 0;
-    float bandFoam[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+    float totalFoam = 0;
     float waveHeight = 0;
+    float windHeight = 0;      // the wind sea's part of it (not the swell): what stands up in crests
     float2 worldXZ = input.UndisplacedXZ.xy;
+    // The shore flattens each band's waves by its length (DS, BandShoreAtten): their slopes, crests and foam shrink with
+    // them. Until 2026-10-18 only the heights did, and over the shelf a nearly flat sea was shaded as the full open-sea chop
+    float shoreAtten = input.UndisplacedXZ.z;
+    float shoreDepth = input.UndisplacedXZ.w;
+
+    // Whitecaps (C# WhitecapBand, NoWhitecapBands): only the wind band holding the wind sea's peak, the waves one sees
+    // break (the finer the calmer the sea), makes foam; the other wind bands store how squeezed their crests are right
+    // now (ocean_fft.hlsl), and the finer ones' light up inside its foam. An older build sends no band: the coarsest
+    uint windBands = ocean.WindBands;
+    uint capBand = 0xFFFFFFFF;
+    float capScale = 1e30;
+    [loop]
+    for (uint wb = 0; wb < ocean.NumBands; ++wb)
+    {
+        if (((windBands >> wb) & 1u) && tileScales[wb] < capScale)
+        {
+            capScale = tileScales[wb];
+            capBand = wb;
+        }
+    }
+    if (ocean.WhitecapBand != 0 && ocean.WhitecapBand <= ocean.NumBands)
+    {
+        capBand = ocean.WhitecapBand - 1;
+        capScale = tileScales[capBand];
+    }
+    float capFoam = 0;         // the whitecap band's foam: where the whitecaps are
+    float smallCrests = 0;     // the finer wind bands' crest squeeze now: the structure inside them
 
     [loop]
     for (uint i = 0; i < ocean.NumBands; ++i)
@@ -547,32 +619,30 @@ PSOutput PS(DSOutput input)
         // Filtered: the foam alpha is only a coverage mask, the visible detail comes from the foam texture
         float4 disp = dispTex.Sample(OceanSampler, float3(uv, i));
         float4 moments = slopeTex.Sample(OceanSampler, float3(uv, i));
+        float waveAtten = BandShoreAtten(shoreAtten, shoreDepth, scale);
+        disp *= waveAtten;
 
         // Counter-rotate the mean slope back to world space (the variance does not depend on the rotation)
         float s, c;
         sincos(-angle, s, c);
         float2 meanWorld = float2(moments.x * c - moments.y * s, moments.x * s + moments.y * c);
-        AddWaterBand(slopes, moments, meanWorld, ocean.NormalAtten);
-        resolvedTotal += WaterBandTotalVariance(slopeTex, OceanSampler, i, ocean.NormalAtten);
-        bandFoam[i] = disp.a;
+        AddWaterBand(slopes, moments, meanWorld, ocean.NormalAtten * waveAtten);
+        resolvedTotal += WaterBandTotalVariance(slopeTex, OceanSampler, i, ocean.NormalAtten * waveAtten);
+        totalFoam += disp.a;
         waveHeight += disp.y;
-    }
-
-    // The bands' whitecaps, a finer band's only where the next coarser foaming band is foaming (OceanData.FoamGate, a
-    // nibble per band: 0 = shown as it is, k = shown where band k - 1 foams): short waves break on the crests of long
-    // ones and in their wake, so each band adds its own detail inside the bigger whitecaps. On its own the 17 m band's
-    // foam repeated every tile: a grid of specks over a storm sea (2026-10-18).
-    float totalFoam = 0;
-    [unroll]
-    for (uint fb = 0; fb < 8; ++fb)
-    {
-        if (fb < ocean.NumBands)
+        if ((windBands >> i) & 1u)
         {
-            uint gateBand = (ocean.FoamGate >> (fb * 4)) & 0xF;
-            bandFoam[fb] *= gateBand == 0 ? 1.0 : smoothstep(0.02, 0.2, bandFoam[min(gateBand - 1, 7)]);
-            totalFoam += bandFoam[fb];
+            windHeight += disp.y;
+            // Weighted by the band's size against the whitecap band's: the 64 m band's crest lines give the structure,
+            // the ripples (whose squeeze is the strongest, in round cells) only its finest detail. Unweighted they
+            // spotted the whitecaps like a dalmatian
+            if (i == capBand)
+                capFoam = disp.a;
+            else if (scale > capScale)
+                smallCrests += disp.a * sqrt(capScale / scale);
         }
     }
+
 
     float3 N = normalize(float3(-slopes.mean.x, 1.0, -slopes.mean.y));
     float alpha = WaterAlpha(slopes, WaterUnresolvedVariance(resolvedTotal));
@@ -643,7 +713,11 @@ PSOutput PS(DSOutput input)
             float terrainY = ocean.TerrainBaseY + h * ocean.MaxTerrainHeight;
             terrainDepth = worldPos.y - terrainY;
             stillDepth = ocean.OceanPlaneY - terrainY;
-            shallowFade = 1.0 - smoothstep(0.0, 150.0, outside);
+            // No bed on the terrain's floor either (DS): only the land's slope shows the turquoise shelf. The flat floor
+            // 12 m down tinted all of Eldermoor's sea, up to a line 150 m past the border
+            float floorDepth = max(ocean.OceanPlaneY - ocean.TerrainBaseY, 1.0);
+            float onFloor = 1.0 - smoothstep(0.0, 0.5 * floorDepth, terrainY - ocean.TerrainBaseY);
+            shallowFade = (1.0 - smoothstep(0.0, 150.0, outside)) * (1.0 - onFloor);
             // Under the land: where the terrain stands more than 3 m above the still sea (far past any wave's run-up)
             // the sea shows only where the terrain does not cover what is under it, a sea cave under a hill or a
             // terrain hole. That is no beach: read as one, it was a sheet of "shore" foam. Open water there
@@ -673,17 +747,50 @@ PSOutput PS(DSOutput input)
     shallow *= (ocean.HeightmapSRV != 0) ? shallowFade : 1.0;
     body += ocean.ShallowColor * (sunRadiance * saturate(L.y) + WaterSkyIrradiance(skyAmbient)) * 0.08 * shallow;
 
+    // Light through the crests: a wind wave's crest is a thin wall of water. Sky light (and the sun's, strongest when
+    // looking toward it) entering its back and top scatters through it toward the eye, tinted by what ~1.5 m of water
+    // lets through (ShallowColor is its per-metre transmittance): the teal glow of a storm sea's crests. It grows with the
+    // crest's height above the mean (wind sea only: the long swell is thick) and on faces seen at a slant. Under a storm
+    // sky the sun-only term above (k1) left the whole sea a dark sky mirror.
+    float crestRise = smoothstep(CREST_GLOW_HEIGHT * 0.25, CREST_GLOW_HEIGHT, windHeight);
+    crestRise *= crestRise;
+    float slant = 1.0 - NdotV;
+    float3 throughCrest = pow(max(ocean.ShallowColor, 0.02), 2.5);
+    throughCrest = lerp(dot(throughCrest, float3(0.2126, 0.7152, 0.0722)), throughCrest, 0.7);   // storm water is murky
+    float3 crestLight = skyAmbient + sunRadiance * (0.2 + 3.0 * pow(saturate(dot(L, -V)), 4.0));
+    body += crestLight * throughCrest * (CREST_GLOW * crestRise * lerp(0.3, 1.0, slant * slant)) * skyVisible;
+
+    // Under a whitecap the water is full of the air the breaking crest carried down: the bubbles scatter the light
+    // back up, pale turquoise water under the foam and behind it that lasts as long as the whitecap band's foam does
+    // (its foam is the measure, as for the whitecaps below)
+    body += (skyAmbient + sunRadiance * 0.3) * throughCrest * (AERATION * saturate(capFoam)) * skyVisible;
+
     // ── Combine lighting ──
     float3 color = (1.0 - F) * body + (specular + F * reflectColor) * edgeFade;
     color = max(0.0, color);
 
     // ── Foam ──
-    // Everything below only builds a COVERAGE value; the visible foam is that coverage eroded by a
-    // cellular foam texture, so edges break up into bubbles/streaks instead of showing FFT texels.
+    // Open water: foam's opacity comes straight from the bands' Jacobian foam, as in the reference implementation (the
+    // GarrettGunnell port, 2026-02-28). From 2026-10-04 it went through the shore's coverage path below (eroded by the
+    // cells, a soft fill past 150 m), which turned saturated foam into solid white sheets with holes and far foam into
+    // blobs (user, 2026-10-18). With a wind sea the coarsest wind band's foam is the mask of where the whitecaps are,
+    // and inside it the finer bands' crests, squeezed right now, raise the opacity: the small waves' crests light up
+    // in the whitecap and move with it, and as the whitecap fades only they remain, a lace of the sea's own pattern
+    // (the user's idea, 2026-10-18). Outside a whitecap they show nothing: on their own the finer bands' foam came up
+    // as random blobs where no visible crest is. Without wind bands every band's foam is summed as in the reference.
+    // The foam lives in mipmapped textures, so far away it averages out instead of aliasing.
     float t = ocean.WaveTime;
+    // Foam is bubbles: there or not. Thin foam drawn at a fraction of its opacity greyed the water like smoke, so the
+    // wind sea's foam drops out below WHITECAP_THIN and is solid from WHITECAP_THIN + WHITECAP_RAMP: as it thins it
+    // breaks up along the small crests' pattern instead of fading as a whole
+    float whitecap = capBand != 0xFFFFFFFF
+        ? saturate((saturate(capFoam) * saturate(WHITECAP_VEIL + WHITECAP_CRESTS * smallCrests) - WHITECAP_THIN) / WHITECAP_RAMP)
+        : saturate(totalFoam);
+    whitecap *= saturate(1.0 - dist / 3000.0);
 
-    // Open water: Jacobian foam from the FFT, faded at distance
-    float coverage = saturate(totalFoam) * saturate(1.0 - dist / 3000.0);
+    // The shore: everything below only builds a COVERAGE value; the visible foam is that coverage eroded by a
+    // cellular foam texture, so edges break up into bubbles/streaks instead of showing FFT texels.
+    float coverage = 0.0;
 
     float foamTex = 0.5;
     float streakFoam = 0.0;
@@ -858,13 +965,16 @@ PSOutput PS(DSOutput input)
 
     // Always feather the last few centimeters of water: whatever the foam pattern, it must not end
     // in the hard pixel edge where the water surface cuts into the beach.
-    foam *= smoothstep(0.0, 0.025, pathLen);
+    float feather = smoothstep(0.0, 0.025, pathLen);
+    foam *= feather;
+    whitecap *= feather;
     foamTex = lerp(foamTex, 0.5, foamFar);
-    if (foam > 0.001)
+    if (foam > 0.001 || whitecap > 0.001)
     {
+        float3 skyOnFoam = SkyAmbient(N) * skyVisible;
+        color = lerp(color, WaterFoamLit(float3(0.80, 0.80, 0.78), NdotL, sunRadiance, skyOnFoam), whitecap);
         float3 foamAlbedo = float3(0.80, 0.80, 0.78) * lerp(0.7, 1.0, foamTex);
-        float3 foamLit = WaterFoamLit(foamAlbedo, NdotL, sunRadiance, SkyAmbient(N) * skyVisible);
-        color = lerp(color, foamLit, foam * 0.9);
+        color = lerp(color, WaterFoamLit(foamAlbedo, NdotL, sunRadiance, skyOnFoam), foam * 0.9);
     }
 
     // ── The air between the camera and the water (the atmosphere's aerial perspective) ──
@@ -908,7 +1018,7 @@ ShadowDSOutput DS_Shadow(HullConstantOutput patchConstants,
     StructuredBuffer<OceanData> oceanData = ResourceDescriptorHeap[OceanDataIdx];
     OceanData ocean = oceanData[patch[0].InstanceIdx];
 
-    float3 displacement = SampleDisplacement(ocean, worldPos.xz, 1.0, 0.0);
+    float3 displacement = SampleDisplacement(ocean, worldPos.xz, 1.0, 0.0, 1.0, 1e4);
     float3 displaced = worldPos + displacement;
 
     output.Position = mul(mul(float4(displaced, 1.0), View), Projection);
