@@ -256,6 +256,12 @@ SurfFoamMass SurfFoamLook(Texture2D<float4> noiseTex, float2 foamPos, float t, f
     // The texture's space squeezed along the heading where the trail is: q = M p
     float squeeze = 1.0 / lerp(1.0, SURF_FOAM_STREAK, saturate(trail));
     float2 q = along * (dot(foamPos, along) * squeeze) + across * dot(foamPos, across);
+    // The cells' space torn by a smooth warp (two Perlin octaves, ~9 m and ~2 m): cut at a threshold the cellular noise
+    // left round cells with scalloped rims where the white water thins, its edges in rosettes (user: "the foam pattern
+    // looks like flowers")
+    float4 warpBig = noiseTex.SampleLevel(OceanSampler, q * 0.11 + t * float2(0.004, 0.003), 0);
+    float4 warpFine = noiseTex.SampleLevel(OceanSampler, q * 0.47 - t * float2(0.006, 0.002), 0);
+    q += (warpBig.ra - 0.5) * 2.4 + (warpFine.ra - 0.5) * 0.45;
     m.height = SurfFoamLumps(noiseTex, q, t, fine);
     m.slope = 0.0;
     [branch]
