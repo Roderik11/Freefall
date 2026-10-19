@@ -342,6 +342,8 @@ namespace Freefall.Components
             public float LipBarrels;     // Barrels: 0 lips where the physics puts them, 1 nearly every breaker
             public uint LipMapSRV;       // where the lips stand round the camera (LipMap): amount, k, age; 0 = no lips
             public Vector2 LipMapOrigin; // its corner (world xz)
+            public uint LipSurfaceSRV;   // the smooth swell's displacement over the same texels (LipMap): xyz, w 1 = written
+            public float _lipPad;
         }
 
         private const int GridSize = 128;
@@ -852,9 +854,11 @@ namespace Freefall.Components
             // Dispatch FFT compute before enqueueing draw
             CommandBuffer.Enqueue(RenderPass.Opaque, (cmd) =>
             {
+                PixMarker.Begin(cmd, "Ocean FFT");
                 _oceanFFT.GenerateNoise(cmd);
                 _oceanFFT.InitSpectrum(cmd);
                 _oceanFFT.Update(cmd, _waveTime, (float)Time.Delta);
+                PixMarker.End(cmd);
             });
         }
 
@@ -959,6 +963,7 @@ namespace Freefall.Components
                 LipBarrels = Math.Clamp(Barrels, 0f, 1f),
                 LipMapSRV = lips ? _lipMap.Srv : 0,
                 LipMapOrigin = lipMapOrigin,
+                LipSurfaceSRV = lips ? _lipMap.SurfaceSrv : 0,
             };
             _params.SetParameter("OceanData", data);
 

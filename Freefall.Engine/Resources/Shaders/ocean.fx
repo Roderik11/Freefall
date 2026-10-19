@@ -141,6 +141,20 @@ PSOutput PS(DSOutput input)
     if (OutsideSea(ocean, input.UndisplacedXZ.xy))
         discard;
 
+    // Where a breaking lip stands, the lip pass (ocean_lip.fx) draws the strip ahead of the crest, the curl and a steep
+    // face under it: this gentle face would stand in front of the tube. By the lip map (LipMapAt, decided once per frame)
+    // and the blurred waves' phase (LipWave), as the lip pass reads them, so they meet. First, before the water's
+    // shading: after the band loop it cost the shading of every pixel the lip covers (0.06 ms with a breaker in view)
+    float2 worldXZ = input.UndisplacedXZ.xy;
+    float shoreDepth = input.UndisplacedXZ.w;
+    [branch]
+    if (ocean.ShoreWarpSRV != 0 && shoreDepth < 1e3 && LipMapAt(ocean, worldXZ).x > LIP_MIN)
+    {
+        float lipPhase = LipPhase(LipWave(ocean, worldXZ));
+        if (lipPhase > 0.08 && lipPhase < LIP_STRIP)
+            discard;
+    }
+
     float3 worldPos = input.WorldPos;
     // How much sky this pixel of sea sees past the terrain (per pixel, as water.fx: per vertex, corners on land darkened the coast).
     // The terrain only: the sky captures' 16 lookups per pixel cost 0.29 ms where the sea fills the view (the coast),
@@ -150,11 +164,9 @@ PSOutput PS(DSOutput input)
     float dist = distance(worldPos, camPos);
 
     // ── The bands at this water (ocean_shade.hlsli, shared with the lip) ──
-    float2 worldXZ = input.UndisplacedXZ.xy;
     // The shore flattens each band's waves by its length (DS, BandShoreAtten): their slopes, crests and foam shrink with
     // them. Until 2026-10-18 only the heights did, and over the shelf a nearly flat sea was shaded as the full open-sea chop
     float shoreAtten = input.UndisplacedXZ.z;
-    float shoreDepth = input.UndisplacedXZ.w;
     OceanBands bands = SampleOceanBands(ocean, worldXZ, shoreAtten, shoreDepth);
     WaterSlopes slopes = bands.slopes;
     float waveHeight = bands.waveHeight;
@@ -167,17 +179,6 @@ PSOutput PS(DSOutput input)
         waveHeight = DepthLimit(waveHeight, shoreDepth, capSlope);
         slopes.mean *= capSlope;
         slopes.variance *= capSlope * capSlope;
-
-        // Where a breaking lip stands, the lip pass (ocean_lip.fx) draws the strip ahead of the crest, the curl and a
-        // steep face under it: this gentle face would stand in front of the tube. By the lip map (LipMapAt, decided
-        // once per frame) and the blurred waves' phase (LipWave), as the lip pass reads them, so they meet
-        [branch]
-        if (LipMapAt(ocean, worldXZ).x > LIP_MIN)
-        {
-            float lipPhase = LipPhase(LipWave(ocean, worldXZ));
-            if (lipPhase > 0.08 && lipPhase < LIP_STRIP)
-                discard;
-        }
     }
 
     float3 N = normalize(float3(-slopes.mean.x, 1.0, -slopes.mean.y));

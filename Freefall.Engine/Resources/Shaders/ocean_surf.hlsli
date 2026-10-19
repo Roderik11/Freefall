@@ -53,6 +53,8 @@ struct OceanData
     float LipBarrels;           // OceanRenderer.Barrels: 0 lips where the physics puts them, 1 nearly every breaker (LipAmount)
     uint LipMapSRV;             // where the lips stand round the camera (C# LipMap, LipMapAt): amount, k, age; 0 = no lips
     float2 LipMapOrigin;        // its corner (world xz)
+    uint LipSurfaceSRV;         // the smooth swell's displacement over the same texels (LipSurfaceAt): xyz, w 1 = written
+    float _lipPad;
 };
 
 SamplerState OceanSampler : register(s0);
@@ -706,6 +708,29 @@ float3 LipMapAt(OceanData ocean, float2 xz)
     float kSum = dot(kw, 1.0);
     if (kSum <= 1e-4) return float3(amount, 0.0, 0.0);
     return float3(amount, dot(kw, float4(a.y, b.y, c.y, d.y)) / kSum, dot(kw, float4(a.z, b.z, c.z, d.z)) / kSum);
+}
+
+// The camera distance at which SampleDisplacement's mips have texels of LIP_WAVE_BLUR metres (its texel is camDist ×
+// 0.15 / N, N = 512 the FFT's size): the ocean's surface with the small waves averaged out, the swell left. The lip's
+// face is shaped from it (ocean_lip.fx)
+static const float LIP_SMOOTH_CAM_DIST = LIP_WAVE_BLUR * 512.0 / 0.15;
+
+// The smooth swell's displacement at xz (OceanSurfaceDisplacement at LIP_SMOOTH_CAM_DIST), from the lip map's surface
+// texture (ocean_lip_map.hlsl writes it every frame where the coast is). valid: all four texels were written; where
+// not, the caller samples the ocean itself
+float3 LipSurfaceAt(OceanData ocean, float2 xz, out bool valid)
+{
+    valid = false;
+    if (ocean.LipSurfaceSRV == 0) return 0.0;
+    Texture2D<float4> map = ResourceDescriptorHeap[ocean.LipSurfaceSRV];
+    float2 t = (xz - ocean.LipMapOrigin) / LIP_MAP_TEXEL - 0.5;
+    int2 i = int2(floor(t));
+    if (any(i < 0) || any(i >= LIP_MAP_SIZE - 1)) return 0.0;
+    float2 f = t - float2(i);
+    float4 a = map.Load(int3(i, 0)), b = map.Load(int3(i + int2(1, 0), 0));
+    float4 c = map.Load(int3(i + int2(0, 1), 0)), d = map.Load(int3(i + int2(1, 1), 0));
+    valid = min(min(a.w, b.w), min(c.w, d.w)) > 0.5;
+    return lerp(lerp(a.xyz, b.xyz, f.x), lerp(c.xyz, d.xyz, f.x), f.y);
 }
 
 #endif

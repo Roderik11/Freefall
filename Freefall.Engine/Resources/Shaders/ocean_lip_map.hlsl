@@ -16,6 +16,7 @@ cbuffer PushConstants : register(b3)
     uint RawUAVIdx;      // RWTexture2D<float4>: amount, k, age
     uint RawSRVIdx;      // the same, to read
     uint MapUAVIdx;      // RWTexture2D<float4>
+    uint SurfaceUAVIdx;  // RWTexture2D<float4>: the smooth swell's displacement, w 1 where written (LipSurfaceAt)
 };
 
 // The phase range a texel is decided over: wider than the lip's own (its skirt reaches 0.2 behind the crest and to 3.0
@@ -34,9 +35,14 @@ void CSLipMapBuild(uint3 id : SV_DispatchThreadID)
     float2 xz = ocean.LipMapOrigin + (float2(id.xy) + 0.5) * LIP_MAP_TEXEL;
     float2 centre = ocean.LipMapOrigin + 0.5 * LIP_MAP_SIZE * LIP_MAP_TEXEL;
     float4 result = 0.0;
+    float4 surface = 0.0;
     OceanShore shore = ShoreAt(ocean, xz);
     if (ocean.WarpOmega.x + ocean.WarpOmega.y > 0.0 && ocean.HeightmapSRV != 0 && shore.shoreDepth < 1e3)
     {
+        // The smooth swell over the whole coast, where the lip's crest, face and trough end can lie
+        OceanShore smoothShore;
+        SurfWave smoothSurf;
+        surface = float4(OceanSurfaceDisplacement(ocean, xz, LIP_SMOOTH_CAM_DIST, smoothShore, smoothSurf), 1.0);
         SurfWave wave = LipWave(ocean, xz);
         float phase = LipPhase(wave);
         // As the lip pass's patch test had it: no lip where the wave is small for the depth or long past breaking
@@ -52,6 +58,8 @@ void CSLipMapBuild(uint3 id : SV_DispatchThreadID)
         }
     }
     raw[id.xy] = result;
+    RWTexture2D<float4> surfaceMap = ResourceDescriptorHeap[SurfaceUAVIdx];
+    surfaceMap[id.xy] = surface;
 }
 
 [numthreads(8, 8, 1)]

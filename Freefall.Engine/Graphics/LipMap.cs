@@ -17,6 +17,10 @@ namespace Freefall.Graphics
     /// <see cref="Size"/>² texels of <see cref="Texel"/> m, snapped to whole texels round the camera (the lip's grid
     /// and its fade reach 128 m). RGBA16F: amount, k (0 outside a strip), the crest's age (LipAmount), unused. OceanRenderer
     /// runs it after the FFT.
+    ///
+    /// Over the same texels the smooth swell's displacement (<see cref="SurfaceSrv"/>: the ocean with the small waves
+    /// averaged out, which the lip's face is shaped from): the lip's DS read it at four points per vertex, a full
+    /// ocean sample each (0.14 ms of its 1.37 with a breaker filling the view, 0.11 of 0.56 from a wader's height).
     /// </summary>
     public sealed class LipMap : IDisposable
     {
@@ -26,14 +30,17 @@ namespace Freefall.Graphics
         /// <summary>A texel's size in metres (LIP_MAP_TEXEL).</summary>
         public const float Texel = 1.0f;
 
-        private ID3D12Resource? _raw, _map;
-        private uint _rawUav, _rawSrv, _mapUav, _mapSrv;
+        private ID3D12Resource? _raw, _map, _surface;
+        private uint _rawUav, _rawSrv, _mapUav, _mapSrv, _surfaceUav, _surfaceSrv;
         private ComputeShader? _shader;
         private int _kBuild, _kSmooth;
         private ID3D12DescriptorHeap[]? _heaps;
 
         /// <summary>Bindless SRV of the smoothed map; 0 until <see cref="EnsureCreated"/>.</summary>
         public uint Srv => _mapSrv;
+
+        /// <summary>Bindless SRV of the smooth swell's displacement (xyz; w 1 where written); 0 until created.</summary>
+        public uint SurfaceSrv => _surfaceSrv;
 
         /// <summary>The map's corner (world xz) round a camera: snapped to whole texels, or it would swim.</summary>
         public static Vector2 OriginFor(Vector3 camera)
@@ -48,6 +55,7 @@ namespace Freefall.Graphics
             if (_map != null) return;
             _raw = CreateTexture(device, out _rawUav, out _rawSrv);
             _map = CreateTexture(device, out _mapUav, out _mapSrv);
+            _surface = CreateTexture(device, out _surfaceUav, out _surfaceSrv);
             _shader = new ComputeShader("ocean_lip_map.hlsl");
             _kBuild = _shader.FindKernel("CSLipMapBuild");
             _kSmooth = _shader.FindKernel("CSLipMapSmooth");
@@ -82,7 +90,8 @@ namespace Freefall.Graphics
         /// </summary>
         public void Dispatch(ID3D12GraphicsCommandList cmd, GraphicsDevice device, uint oceanDataSrv)
         {
-            if (_shader == null || _raw == null || _map == null || oceanDataSrv == 0) return;
+            if (_shader == null || _raw == null || _map == null || _surface == null || oceanDataSrv == 0) return;
+            PixMarker.Begin(cmd, "Lip map");
             cmd.SetComputeRootSignature(device.GlobalRootSignature);
             cmd.SetDescriptorHeaps(1, _heaps!);
             uint groups = (uint)((Size + 7) / 8);
@@ -91,10 +100,13 @@ namespace Freefall.Graphics
             _shader.SetPushConstant("RawUAV", _rawUav);
             _shader.SetPushConstant("RawSRV", _rawSrv);
             _shader.SetPushConstant("MapUAV", _mapUav);
+            _shader.SetPushConstant("SurfaceUAV", _surfaceUav);
             _shader.Dispatch(_kBuild, cmd, groups, groups);
             cmd.ResourceBarrierUnorderedAccessView(_raw);
+            cmd.ResourceBarrierUnorderedAccessView(_surface);
             _shader.Dispatch(_kSmooth, cmd, groups, groups);
             cmd.ResourceBarrierUnorderedAccessView(_map);
+            PixMarker.End(cmd);
         }
 
         /// <summary>Deferred: the frames in flight still read the map and run its kernels.</summary>
@@ -103,14 +115,17 @@ namespace Freefall.Graphics
             var device = Engine.Device;
             device.DeferDispose(_raw);
             device.DeferDispose(_map);
+            device.DeferDispose(_surface);
             device.DeferReleaseBindlessIndex(_rawUav);
             device.DeferReleaseBindlessIndex(_rawSrv);
             device.DeferReleaseBindlessIndex(_mapUav);
             device.DeferReleaseBindlessIndex(_mapSrv);
+            device.DeferReleaseBindlessIndex(_surfaceUav);
+            device.DeferReleaseBindlessIndex(_surfaceSrv);
             device.DeferDispose(_shader);
-            _raw = _map = null;
+            _raw = _map = _surface = null;
             _shader = null;
-            _rawUav = _rawSrv = _mapUav = _mapSrv = 0;
+            _rawUav = _rawSrv = _mapUav = _mapSrv = _surfaceUav = _surfaceSrv = 0;
         }
     }
 }

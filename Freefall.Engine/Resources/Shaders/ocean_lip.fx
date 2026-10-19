@@ -136,9 +136,38 @@ struct LipOutput
     float Clip : SV_ClipDistance0;      // < 0 off the strip or where no lip is: the sheet's edges follow the wave
 };
 
-// The camera distance at which SampleDisplacement's mips have texels of LIP_WAVE_BLUR metres (its texel is camDist ×
-// 0.15 / N, N = 512 the FFT's size): the ocean's surface with the small waves averaged out, the swell left
-static const float LipSmoothCamDist = LIP_WAVE_BLUR * 512.0 / 0.15;
+// The ocean's surface with the small waves averaged out, the swell left (ocean_surf.hlsli)
+static const float LipSmoothCamDist = LIP_SMOOTH_CAM_DIST;
+// 1: the smooth swell from the lip map's surface texture (LipSurfaceAt), written once per frame; 0: sampled from the
+// ocean at every vertex, four points each (0.14 ms more with a breaker filling the view)
+#define LIP_SURFACE_MAP 1
+
+// The smooth swell's displacement at the four points the face is shaped from: the vertex's own water, the crest, the
+// strip's end and 1 m past it. From the map where all four texel squares were written, else from the ocean
+void LipSmoothSurfaces(OceanData ocean, float2 p0, float2 p1, float2 p2, float2 p3,
+                       out float3 d0, out float3 d1, out float3 d2, out float3 d3)
+{
+    bool v0 = false, v1 = false, v2 = false, v3 = false;
+    d0 = d1 = d2 = d3 = 0.0;
+#if LIP_SURFACE_MAP
+    d0 = LipSurfaceAt(ocean, p0, v0);
+    d1 = LipSurfaceAt(ocean, p1, v1);
+    d2 = LipSurfaceAt(ocean, p2, v2);
+    d3 = LipSurfaceAt(ocean, p3, v3);
+#endif
+    [branch]
+    if (!(v0 && v1 && v2 && v3))
+    {
+        // All four from the same source: the face's detail is the vertex's water less the swell there, and it meets
+        // the ocean at the strip's end only where both swells are the same function
+        OceanShore s;
+        SurfWave w;
+        d0 = OceanSurfaceDisplacement(ocean, p0, LipSmoothCamDist, s, w);
+        d1 = OceanSurfaceDisplacement(ocean, p1, LipSmoothCamDist, s, w);
+        d2 = OceanSurfaceDisplacement(ocean, p2, LipSmoothCamDist, s, w);
+        d3 = OceanSurfaceDisplacement(ocean, p3, LipSmoothCamDist, s, w);
+    }
+}
 
 // The face from its root (v = 0) down into the trough (v = 1): almost straight down at first, flattening as it runs
 // forward, arriving at the ocean's own slope (the cubic term: nothing at the root, the slope's difference at the end)
@@ -214,28 +243,19 @@ LipOutput DS_Lip(HullConstantOutput patchConstants, float3 bary : SV_DomainLocat
         // and in the trough, where the sheet meets the ocean, and none on the curl (detailWeight). Built from the full
         // surface, each vertex's crest, trough end and the slope past it fell on different ripples: the face jumped
         // from vertex to vertex, and the slope, carried over the face's whole run, raised it into spikes over the crest
-        OceanShore smoothShore;
-        SurfWave smoothSurf;
-        float3 detail = displacement - OceanSurfaceDisplacement(ocean, gridPos.xz, LipSmoothCamDist, smoothShore, smoothSurf);
-        float detailWeight;
-        // The crest it hangs from
-        OceanShore crestShore;
-        SurfWave crestDetail;
-        float3 C = float3(crestXZ.x, ocean.OceanPlaneY, crestXZ.y)
-                 + OceanSurfaceDisplacement(ocean, crestXZ, LipSmoothCamDist, crestShore, crestDetail);
+        // At the vertex, the crest it hangs from, the strip's far end (where the face meets the ocean ahead of it) and
+        // 1 m past it (how steeply the swell falls on from there: the face arrives at that slope, or a crease shows
+        // where they meet)
         float2 h = second ? crest.heading.zw : crest.heading.xy;
-        // The strip's far end, where the face meets the ocean ahead of it
         float2 endXZ = crestXZ + h * (LIP_STRIP / k);
-        OceanShore endShore;
-        SurfWave endWave;
-        float3 E = float3(endXZ.x, ocean.OceanPlaneY, endXZ.y)
-                 + OceanSurfaceDisplacement(ocean, endXZ, LipSmoothCamDist, endShore, endWave);
-        // and how steeply the swell falls on from there: the face arrives at that slope, or a crease shows where they meet
         float2 aheadXZ = endXZ + h * 1.0;
-        OceanShore aheadShore;
-        SurfWave aheadWave;
-        float3 ahead = float3(aheadXZ.x, ocean.OceanPlaneY, aheadXZ.y)
-                     + OceanSurfaceDisplacement(ocean, aheadXZ, LipSmoothCamDist, aheadShore, aheadWave);
+        float3 smoothHere, smoothCrest, smoothEnd, smoothAhead;
+        LipSmoothSurfaces(ocean, gridPos.xz, crestXZ, endXZ, aheadXZ, smoothHere, smoothCrest, smoothEnd, smoothAhead);
+        float3 detail = displacement - smoothHere;
+        float detailWeight;
+        float3 C = float3(crestXZ.x, ocean.OceanPlaneY, crestXZ.y) + smoothCrest;
+        float3 E = float3(endXZ.x, ocean.OceanPlaneY, endXZ.y) + smoothEnd;
+        float3 ahead = float3(aheadXZ.x, ocean.OceanPlaneY, aheadXZ.y) + smoothAhead;
         // (bounded: on a choppy fold the two points barely part sideways, and the face shot up in shards)
         float endSlope = clamp((ahead.y - E.y) / max(length(ahead.xz - E.xz), 0.05), -0.6, 0.6);
 
