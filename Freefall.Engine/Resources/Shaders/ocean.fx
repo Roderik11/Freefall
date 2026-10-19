@@ -126,6 +126,9 @@ bool OutsideSea(OceanData ocean, float2 xz)
     return mask.SampleLevel(OceanSampler, uv, 0) < 0.5;
 }
 
+// How far the surf's water must at least face the eye (the cosine of its normal's angle to the view): PS below
+static const float SURF_FACING = 0.15;
+
 PSOutput PS(DSOutput input)
 {
     PSOutput output;
@@ -178,6 +181,15 @@ PSOutput PS(DSOutput input)
     }
 
     float3 N = normalize(float3(-slopes.mean.x, 1.0, -slopes.mean.y));
+    // In the surf the swell's slopes, steepened through the shore's warp, can face away from a low eye on water it sees
+    // (the back of a bore from in front of it: the grid's coarse surface faces the eye there, the slopes' normal does
+    // not). Its mirror then fell under the horizon and a dark crease ran along the bore (user, 2026-10-19: "that crease
+    // is just the shading", fine from behind). There the normal leans toward the eye until it faces it a little; over
+    // the open sea the backs of waves facing away keep their dark mirror
+    float facing = SURF_FACING * (1.0 - smoothstep(1.5, 4.0, shoreDepth));
+    float rawNdotV = dot(N, V);
+    if (facing > 0.0 && rawNdotV < facing)
+        N = normalize(N + (facing - rawNdotV) * V);
     float alpha = WaterAlpha(slopes, WaterUnresolvedVariance(bands.resolvedTotal));
 
     float NdotV = saturate(dot(N, V));
