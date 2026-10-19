@@ -26,7 +26,7 @@ struct ParticleVisual      // 16 bytes — per-particle variation, everything el
 
 // One row per emitter, rewritten by the CPU every frame (ParticleSystem.EmitterRow in C#).
 // Laid out in 16-byte rows so no vector straddles a boundary and the C# struct maps 1:1.
-struct ParticleEmitter     // 352 bytes
+struct ParticleEmitter     // 368 bytes
 {
     float3 Position;       float  ParticleRadius;      // largest half-extent of one particle quad
     float3 EmitDirection;  float  SpreadCos;           // emitter-local, normalized / cos(spread half-angle)
@@ -51,6 +51,7 @@ struct ParticleEmitter     // 352 bytes
     float  Turbulence;     float  TurbulenceFrequency; float WindLean;           float Follow;       // m/s² / 1 / swirl size / m of lean at the sprite's top per m/s of Wind / FollowEmitter
     float3 Carry;          float  PivotX;              // how far live particles move along with the emitter this frame (FollowEmitter)
     float3 LeanWind;       float  PivotY;              // the wind a sprite leans in: Wind less the emitter's own motion it follows / quad offset in its sizes
+    float  ForwardScatter; float  _pad0;               float _pad1;              float _pad2;        // lit: Henyey-Greenstein g of the sun's and moon's light (ParticleLight)
 };
 
 // ParticleEmitter.RenderMode

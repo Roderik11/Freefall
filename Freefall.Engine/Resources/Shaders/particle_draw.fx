@@ -102,7 +102,7 @@ VSOutput VS(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
     // Transparent mode writes an albedo the composition lights (LightScale 1).
     output.SkyVisible = e.RenderMode == PARTICLE_MODE_FORWARD ? SkyVisibility(core.Position, float3(0, 1, 0)) : 1.0;
     if (e.RenderMode == PARTICLE_MODE_FORWARD && (e.Flags & PARTICLE_FLAG_LIT) != 0)
-        output.Color.rgb *= ParticleLight() * output.SkyVisible;
+        output.Color.rgb *= ParticleLight(normalize(CamPos - core.Position), e.ForwardScatter) * output.SkyVisible;
     else
         output.Color.rgb *= LightScale;
     if (e.FadeInRate > 0.0)

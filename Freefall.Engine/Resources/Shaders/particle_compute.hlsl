@@ -332,6 +332,7 @@ bool spawn_surf(ParticleEmitter e, uint seed, inout ParticleCore p)
     SurfWave wave = (SurfWave)0;
     float3 d = 0;
     float height = 0;
+    float breaking = 0;
     bool found = false;
     [loop]
     for (uint attempt = 0; attempt < SURF_TRIES && !found; attempt++)
@@ -343,14 +344,17 @@ bool spawn_surf(ParticleEmitter e, uint seed, inout ParticleCore p)
 
         d = SampleDisplacement(ocean, xz, ocean.DisplacementAtten, distance(CameraPosition.xz, xz), shore.waveAtten,
                                shore.shoreDepth, shore.surfUV, true, wave);
-        float breaking = SurfBreaking(wave, shore.shoreDepth) * smoothstep(SURF_FOAM_END.x, SURF_FOAM_END.y, shore.shoreDepth);
+        breaking = SurfBreaking(wave, shore.shoreDepth) * smoothstep(SURF_FOAM_END.x, SURF_FOAM_END.y, shore.shoreDepth);
         float2 weight = wave.envelope / max(max(wave.envelope.x, wave.envelope.y), 1e-6);
         float2 rt0 = SurfRollerTrail(wave.phase.x) * weight.x;
         float2 rt1 = SurfRollerTrail(wave.phase.y) * weight.y;
         float roller = max(rt0.x, rt1.x), trail = max(rt0.y, rt1.y);
+        // Spray tears off the lip, the very top of the crest (phase 0, about a tenth of a radian either way), not off
+        // the whole white roller down the face: born across the roller it was a band of puffs over the broken water
+        float lip = max(exp(-wave.phase.x * wave.phase.x / 0.02) * weight.x, exp(-wave.phase.y * wave.phase.y / 0.02) * weight.y);
         // The bigger the breaker, the more it throws: a knee-high wave hardly any
         height = 2.0 * SurfEnvelope(wave);
-        float chance = breaking * (mist ? max(trail, 0.5 * roller) : roller) * saturate(height / 1.5);
+        float chance = breaking * (mist ? max(trail, 0.5 * roller) : lip) * saturate(height / 1.5);
         found = rand01(s + 2u) < chance;
     }
     if (!found) return false;
@@ -378,8 +382,13 @@ bool spawn_surf(ParticleEmitter e, uint seed, inout ParticleCore p)
     }
     float speed = length(velocity);
 
-    // xz is the world's (x, z): float3(xz + d.xz, y) made it (x, z, y), every drop born ~500 m up with its height as z
-    p.Position = float3(xz.x + d.x, ocean.OceanPlaneY + crest + (mist ? 0.3 : 0.1), xz.y + d.z);
+    // Where the ocean draws this point (its DS): pushed sideways no further than the water is deep, and on a breaking
+    // wave leant forward by SURF_LEAN x the crest's height. Without the lean the spray rose up to 1.6 crest heights
+    // behind the drawn lip
+    float2 side = d.xz * min(1.0, max(shore.shoreDepth, 0.05) / max(length(d.xz), 1e-4));
+    side += heading * (SURF_LEAN * breaking * max(crest, 0.0));
+    // xz is the world's (x, z): float3(xz + side, y) made it (x, z, y), every drop born ~500 m up with its height as z
+    p.Position = float3(xz.x + side.x, ocean.OceanPlaneY + crest + (mist ? 0.3 : 0.1), xz.y + side.y);
     p.Velocity = rand_cone(velocity / max(speed, 1e-4), e.SpreadCos, seed + 5u) * speed;
     return true;
 }

@@ -220,17 +220,31 @@ float SkyVisibility(float3 worldPos, float3 N)
 // puff is lit from one side) and the sky's and the ground's ambient averaged, as for the clouds. No shadows: grey by
 // day, dark at night. Callers multiply by the SkyVisibility at the particle: smoke in a cave stays dark, since neither
 // the sky nor the sun reaches it there (they also scale the haze in front of it by that).
-float3 ParticleLight()
+
+// How much more of a light a particle shows seen at angle cosTheta from the light's way on (1 = looking into the light
+// through it) than an even scatterer would: Henyey-Greenstein with anisotropy g, 1 everywhere for g = 0. Droplets throw
+// most of the light on, so spray glows with the sun behind it and dims with the sun behind the viewer; 40 % stays even,
+// the light scattered several times inside a dense cloud (ParticleEmitter.ForwardScatter, 2026-10-19)
+float ParticlePhase(float cosTheta, float g)
+{
+    float d = 1.0 + g * g - 2.0 * g * cosTheta;
+    return 0.4 + 0.6 * (1.0 - g * g) / (d * sqrt(d));
+}
+
+//   toEye: from the particle to the camera; g: its forward scattering (0 = the same from every side)
+float3 ParticleLight(float3 toEye, float g)
 {
     if (AtmosphereIdx == 0)
         return 0;
     AtmosphereParams A = LoadAtmosphere();
     float3 P = float3(0, AtmosphereViewHeight(A, CamPos.y), 0);
-    float3 direct = A.SunIlluminance * AtmTransmittanceToLight(A, P, A.SunDirection)
-                  + A.MoonIlluminance * AtmTransmittanceToLight(A, P, A.MoonDirection);
+    float3 direct = A.SunIlluminance * AtmTransmittanceToLight(A, P, A.SunDirection) * ParticlePhase(dot(toEye, -A.SunDirection), g)
+                  + A.MoonIlluminance * AtmTransmittanceToLight(A, P, A.MoonDirection) * ParticlePhase(dot(toEye, -A.MoonDirection), g);
     StructuredBuffer<float4> ambient = ResourceDescriptorHeap[A.Ambient];
     return direct * (A.CloudShade * 0.5 * Exposure / ATM_PI) + (ambient[0].rgb + ambient[1].rgb) * 0.5;
 }
+
+float3 ParticleLight() { return ParticleLight(float3(0, 1, 0), 0.0); }
 
 // How much of the air's own light to keep in front of a surface that sees skyVisible of the sky. The aerial perspective
 // volume lights every slice of air with the sun and sky as if nothing shaded it, so in a cave (a ray ending under the

@@ -72,6 +72,7 @@ namespace Freefall.Graphics
             public float Turbulence;       public float TurbulenceFrequency; public float WindLean;         public float Follow;
             public Vector3 Carry;          public float PivotX;
             public Vector3 LeanWind;       public float PivotY;
+            public float ForwardScatter;   public float Pad0;               public float Pad1;              public float Pad2;
         }
 
         /// <summary>Everything the system keeps per emitter. The component itself only holds authored data.</summary>
@@ -171,8 +172,8 @@ namespace Freefall.Graphics
 
         protected internal override void Initialize()
         {
-            if (Unsafe.SizeOf<EmitterRow>() != 352)
-                throw new InvalidOperationException("EmitterRow must match struct ParticleEmitter in particle_common.hlsli (352 bytes)");
+            if (Unsafe.SizeOf<EmitterRow>() != 368)
+                throw new InvalidOperationException("EmitterRow must match struct ParticleEmitter in particle_common.hlsli (368 bytes)");
 
             ComponentCache<ParticleEmitter>.Added += OnAdded;
             ComponentCache<ParticleEmitter>.Removed += OnRemoved;
@@ -551,6 +552,7 @@ namespace Freefall.Graphics
                 PivotX = e.Pivot.X,
                 LeanWind = leanWind,
                 PivotY = e.Pivot.Y,
+                ForwardScatter = Math.Clamp(e.ForwardScatter, 0f, 0.9f),
             };
 
             if (capacity > 0)

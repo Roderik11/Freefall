@@ -222,6 +222,12 @@ namespace Freefall.Components
                      "its luminance in nits (a flame ~40000), shown as a light source (Atmosphere.EmissiveExposure)")]
         public bool Lit = true;
 
+        [Description("Lit: how much of the sun's and moon's light the particles throw on along its way, so they glow with the " +
+                     "light behind them and dim with it behind you (droplets: spray, mist, rain ~0.7; thin smoke ~0.3). " +
+                     "0 = the same from every side")]
+        [ValueRange(0f, 0.9f)]
+        public float ForwardScatter = 0f;
+
         [Description("Multiplier on RGB: with Lit, of the albedo (keep RGB × Intensity at most 1); without, the luminance in nits")]
         [ValueRange(0f, 200000f)]
         public float Intensity = 1f;
