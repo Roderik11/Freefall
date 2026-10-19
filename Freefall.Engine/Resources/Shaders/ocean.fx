@@ -194,6 +194,8 @@ static const float SurgeRise = 0.38;
 #define SURF_BUBBLES 0.06
 // The roller's opacity where the crests are not squeezed: nearly solid
 #define SURF_ROLLER 0.6
+// The still-water depth over which the bore's white water and its lean fade out toward the waterline (m)
+static const float2 SURF_FOAM_END = float2(0.3, 1.2);
 
 // Light through the crests (PS): full at this height (m) of the wind sea above the mean, and the share of the light on a
 // crest that scatters through it to the eye
@@ -610,6 +612,8 @@ DSOutput DS(HullConstantOutput patchConstants,
 
         // A breaking wave's face leans forward over its trough: the higher a point of the crest, the further ahead
         float breaking = SurfBreaking(surf, shoreDepth);
+        // (not by the waterline: the beach's phase runs across the shore, SURF_FOAM_END)
+        breaking *= smoothstep(SURF_FOAM_END.x, SURF_FOAM_END.y, shoreDepth);
         displacement.xz += SurfHeading(surf) * (SURF_LEAN * breaking * max(displacement.y, 0.0));
 
         // The swash: by the waterline and up the beach the level is the bores' run-up, each arriving wave's own, in step
@@ -970,9 +974,10 @@ PSOutput PS(DSOutput input)
         float structure = saturate(fineSqueeze / max(fineNorm, 1e-4));
         surfFoam = max(roller * saturate(SURF_ROLLER + SURF_CRESTS * structure),
                        trail * saturate(SURF_VEIL + SURF_CRESTS * structure));
-        // Up the beach the warp holds the waterline's phase (C# ShoreWarp): the bore's white water ends at the waterline,
-        // and the swash's edge is the waterline's lace (below)
-        surfFoam *= smoothstep(0.0, 0.4, shoreDepth);
+        // Up the beach the warp holds the waterline's phase (C# ShoreWarp), lines across the shore that the swash runs on:
+        // drawn as white water they made hooks along the waterline (user, 2026-10-19). The bore's white water ends where
+        // the water gets that shallow (SURF_FOAM_END), and the swash's edge is the waterline's lace (below)
+        surfFoam *= smoothstep(SURF_FOAM_END.x, SURF_FOAM_END.y, shoreDepth);
         surfFoam = saturate((saturate(surfFoam) - WHITECAP_THIN) / WHITECAP_RAMP);
         surfFoam *= saturate(1.0 - dist / 3000.0);
     }

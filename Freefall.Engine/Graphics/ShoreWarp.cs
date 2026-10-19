@@ -284,26 +284,40 @@ namespace Freefall.Graphics
                 }
             }
 
-            for (int z = 0; z < n; z++)
-            for (int x = 0; x < n; x++)
+            // From every known cell to its neighbours in the phase's cells, then march until none is left
+            void PushNeighbours(int i, bool[] allowed)
             {
-                int i = z * n + x;
-                if (!source[i]) continue;
-                if (x > 0 && sea[i - 1] && state[i - 1] != 2) Push(i - 1);
-                if (x < n - 1 && sea[i + 1] && state[i + 1] != 2) Push(i + 1);
-                if (z > 0 && sea[i - n] && state[i - n] != 2) Push(i - n);
-                if (z < n - 1 && sea[i + n] && state[i + n] != 2) Push(i + n);
-            }
-            while (queue.TryDequeue(out int i, out float t))
-            {
-                if (state[i] == 2 || t > tau[i]) continue;
-                state[i] = 2;
                 int x = i % n, z = i / n;
-                if (x > 0 && sea[i - 1] && state[i - 1] != 2) Push(i - 1);
-                if (x < n - 1 && sea[i + 1] && state[i + 1] != 2) Push(i + 1);
-                if (z > 0 && sea[i - n] && state[i - n] != 2) Push(i - n);
-                if (z < n - 1 && sea[i + n] && state[i + n] != 2) Push(i + n);
+                if (x > 0 && allowed[i - 1] && state[i - 1] != 2) Push(i - 1);
+                if (x < n - 1 && allowed[i + 1] && state[i + 1] != 2) Push(i + 1);
+                if (z > 0 && allowed[i - n] && state[i - n] != 2) Push(i - n);
+                if (z < n - 1 && allowed[i + n] && state[i + n] != 2) Push(i + n);
             }
+            void March(bool[] allowed)
+            {
+                for (int i = 0; i < count; i++)
+                    if (state[i] == 2) PushNeighbours(i, allowed);
+                while (queue.TryDequeue(out int i, out float t))
+                {
+                    if (state[i] == 2 || t > tau[i]) continue;
+                    state[i] = 2;
+                    PushNeighbours(i, allowed);
+                }
+            }
+
+            // The water first, then up the beach from it. Up the beach the rays run at the deep speed (the warp holds the
+            // waterline's phase there), and marched together with the water that fast strip carried the waves along the
+            // sand ahead of the shallows and back into them: foam surging out to sea against the incoming waves and white
+            // hooks racing along the shore (user, 2026-10-19). Marched after the water, the beach only takes from it
+            var water = new bool[count];
+            var beach = new bool[count];
+            for (int i = 0; i < count; i++)
+            {
+                water[i] = sea[i] && depth[i] > 0f;
+                beach[i] = sea[i] && !water[i];
+            }
+            March(water);
+            March(beach);
 
             var known = new bool[count];
             for (int i = 0; i < count; i++) known[i] = sea[i] && state[i] == 2;
