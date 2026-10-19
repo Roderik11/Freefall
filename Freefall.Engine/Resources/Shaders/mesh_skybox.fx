@@ -59,7 +59,8 @@ struct FragmentOutput
     float4 Normal : SV_TARGET1;
     float4 Data : SV_TARGET2;
     float4 Depth : SV_TARGET3;
-    float fDepth : SV_DEPTH;
+    // No SV_DEPTH: the vertex shader puts the dome on the far plane already (reverse-Z 0), and writing the depth from
+    // here turned early depth rejection off, so the whole sky (the clouds' air with it) was shaded under every surface
 };
 
 // ────────────────────────────────────────────────
@@ -360,15 +361,10 @@ FragmentOutput PS_Procedural(VertexOutput input)
     // from sky_common.fx AtmosphereSkyWithClouds
     if (CloudTargetIdx != 0)
     {
-        Texture2D<float4> clouds = ResourceDescriptorHeap[CloudTargetIdx];
-        float2 cloudUV = input.Position.xy / ViewportSize;
-        float4 c = clouds.SampleLevel(AtmosphereLinearClamp, cloudUV, 0);
-        float cloudDepth = 0.0;
-        if (CloudDepthIdx != 0)
-        {
-            Texture2D<float> depths = ResourceDescriptorHeap[CloudDepthIdx];
-            cloudDepth = depths.SampleLevel(AtmosphereLinearClamp, cloudUV, 0) * 1000.0;
-        }
+        // The texels marched past any silhouette (sky_common.fx CloudsAt: a sky pixel's own depth is 0)
+        float4 c;
+        float cloudDepth;
+        CloudsAt(input.Position.xy, 0.0, c, cloudDepth);
         float3 sunThrough = sunBehind * c.a;
         sunThrough *= min(1.0, SunDiscMaxPixel / max(max(sunThrough.r, max(sunThrough.g, sunThrough.b)), 1e-6));
         skyColor = AtmosphereSkyWithClouds(input.Position.xy, viewDir, skyColor, c.rgb, c.a, cloudDepth)
@@ -378,7 +374,6 @@ FragmentOutput PS_Procedural(VertexOutput input)
         output.Normal = float4(0, 1, 0, 1);
         output.Data = float4(0, 0, 0, 0);
         output.Depth = float4(0, 0, 0, 0);
-        output.fDepth = 0;
         return output;
     }
     sunBehind *= min(1.0, SunDiscMaxPixel / max(max(sunBehind.r, max(sunBehind.g, sunBehind.b)), 1e-6));
@@ -399,7 +394,6 @@ FragmentOutput PS_Procedural(VertexOutput input)
     output.Normal = float4(0, 1, 0, 1);
     output.Data = float4(0, 0, 0, 0);
     output.Depth = float4(0, 0, 0, 0);
-    output.fDepth = 0; // Reverse-Z: far plane = 0
 
     return output;
 }

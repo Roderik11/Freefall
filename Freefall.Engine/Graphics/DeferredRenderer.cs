@@ -557,6 +557,7 @@ namespace Freefall.Graphics
                  pair.Value.SetParameter("AerialPerspectiveIdx", aerialPerspectiveIdx);
                  pair.Value.SetParameter("CloudTargetIdx", _cloudTargetIdx);
                  pair.Value.SetParameter("CloudDepthIdx", _cloudTargetIdx != 0 ? _cloudView.DepthIndex : 0u);
+                 pair.Value.SetParameter("CloudSceneDepthIdx", _cloudTargetIdx != 0 ? _cloudView.SceneDepthIndex : 0u);
              }
 
              // The atmosphere's LUTs for this view (sky-view, aerial perspective, ambient): the sky dome, the
@@ -736,9 +737,15 @@ namespace Freefall.Graphics
              AutoExposure.MeterIncident(list, camera.Position, BindSceneConstantsForCompute);
 
              // 2g. Volumetric clouds: this view's march through the field baked in Atmosphere.Render, before the sky pass
-             //     draws them (mesh_skybox.fx, SceneConstants.CloudTargetIdx)
+             //     draws them (mesh_skybox.fx, SceneConstants.CloudTargetIdx), each ray up to the opaque surface (the
+             //     linear depth is complete here: the opaque pass ran first); composition and the forward passes lay
+             //     them over the geometry (sky_common.fx AtmosphereFog)
              if (_cloudTargetIdx != 0)
-                 _cloudView.Render(list, camera.Position, _relativeVP, BindSceneConstantsForCompute);
+             {
+                 Transition(list, DepthGBuffer.Native, ResourceStates.RenderTarget, ResourceStates.NonPixelShaderResource);
+                 _cloudView.Render(list, camera.Position, _relativeVP, BindSceneConstantsForCompute, DepthGBuffer.BindlessIndex);
+                 Transition(list, DepthGBuffer.Native, ResourceStates.NonPixelShaderResource, ResourceStates.RenderTarget);
+             }
 
              // 3. Sky pass
              using (_skyMarker.Auto())

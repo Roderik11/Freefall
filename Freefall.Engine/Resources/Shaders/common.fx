@@ -50,6 +50,7 @@ cbuffer SceneConstants : register(b0)
     uint CloudParamsIdx;               // StructuredBuffer<CloudParams>: the cloud field this frame; 0 = no volumetric clouds
     uint CloudTargetIdx;               // this view's clouds (Graphics.CloudView, half size): rgb their light × Exposure, a what they let through; 0 = none
     uint CloudDepthIdx;                // the same view's cloud depth (R16F, km along the ray to where their light comes from); 0 = none
+    uint CloudSceneDepthIdx;           // the scene's view depth (m, 0 = sky) each of its texels was marched to: sky_common.fx CloudsAt
 }
 
 // ── Large-scale variation of the ground and what grows on it (gputerrain.fx, grass cards, blades, flowers) ──

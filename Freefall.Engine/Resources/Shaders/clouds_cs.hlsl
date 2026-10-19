@@ -21,6 +21,7 @@
 #pragma kernel CSCloudMarch
 #pragma kernel CSCloudReconstruct
 #pragma kernel CSCloudProbeFace
+#pragma kernel CSCloudSceneDepth
 
 // What changes from dispatch to dispatch is pushed: a ComputeShader's Params buffer holds one copy per frame
 cbuffer PushConstants : register(b3)
@@ -42,6 +43,9 @@ cbuffer PushConstants : register(b3)
     uint SparseDepthTexIdx;
     uint HistoryTexIdx;         // reconstruct: last frame's colour (0 = none)
     uint ProbeFace;             // probe: the face marched this frame
+    uint SceneDepthTexIdx;      // march, reconstruct: this frame's half-size scene depth (CSCloudSceneDepth; 0 = none);
+                                // scene depth: the G-buffer's linear depth (SourceTexIdx's role there)
+    uint PrevSceneDepthTexIdx;  // reconstruct: last frame's (0 = none)
 };
 
 // The view's reprojection (CloudView: its own ComputeShader, so two views in a frame do not share these)
@@ -475,15 +479,19 @@ struct CloudMarchResult
 
 #define CLOUD_FAR_DEPTH 20000.0
 
-// One view ray through the clouds. stepScale > 1 marches coarser (the probe's faces); jitter (0..1) offsets the steps.
+// One view ray through the clouds. stepScale > 1 marches coarser (the probe's faces); jitter (0..1) offsets the steps;
+// tLimit (m along the ray) ends it at the scene's surface: a summit in a deck, a hill in front of the clouds.
 CloudMarchResult CloudMarchRay(CloudParams C, AtmosphereParams A, Texture3D<float4> lut, float3 dir, float jitter,
-                               float stepScale)
+                               float stepScale, float tLimit)
 {
     CloudMarchResult result;
     result.color = float4(0, 0, 0, 1);
     result.depth = CLOUD_FAR_DEPTH;
     float tStart, tEnd;
     if (!CloudSlabSegment(C, dir, tStart, tEnd))
+        return result;
+    tEnd = min(tEnd, tLimit);
+    if (tEnd <= tStart)
         return result;
 
     // The light the volumes were made for: the sun, or after it has set at the clouds too the brightest moon
@@ -497,6 +505,9 @@ CloudMarchResult CloudMarchRay(CloudParams C, AtmosphereParams A, Texture3D<floa
 
     StructuredBuffer<float4> ambientBuffer = ResourceDescriptorHeap[A.Ambient];
     float3 skyAmbient = ambientBuffer[0].rgb, groundAmbient = ambientBuffer[1].rgb;     // E / π × Exposure
+    // The terrain's shadow toward the light (a peak shades the cloud behind it): only below the terrain's top
+    float terrainTop = A.TerrainHeightmap != 0 ? A.TerrainOrigin.y + A.TerrainMaxHeight : -1e9;
+    bool moonLight = C.LightIsMoon != 0;
 
     float3 L = 0;
     float T = 1.0;
@@ -520,7 +531,10 @@ CloudMarchResult CloudMarchRay(CloudParams C, AtmosphereParams A, Texture3D<floa
             continue;
         }
 
+        // Near the camera (in a cloud) short steps, so a whiteout fades in instead of popping at the first long step;
+        // never past the scene's surface
         float step = voxel * 0.6 * stepScale * (0.75 + 0.5 * jitter);
+        step = min(min(step, max(4.0, 0.25 * t)), tEnd - t);
         float3 p = dir * (t + step * 0.5);
         float hp = CloudHeight(p);
         float2 xzp = C.CameraCloud + p.xz;
@@ -533,6 +547,8 @@ CloudMarchResult CloudMarchRay(CloudParams C, AtmosphereParams A, Texture3D<floa
 
             // The light reaching this place through the air above (faded out in the earth's shadow) and through the cloud
             float3 toLight = CloudLightThroughAir(A, CloudAtmospherePos(p), lightDir);
+            if (hp < terrainTop)
+                toLight *= AtmTerrainLightVisibility(A, CamPos + p, moonLight);
             float tau = any(toLight > 0.0) ? CloudLightDepth(C, lut, p, lightDir, jitter, stepScale < 1.5) : 0.0;
             float beam = 0.0;
             [unroll] for (int o = 0; o < 3; o++)
@@ -563,7 +579,12 @@ CloudMarchResult CloudMarchRay(CloudParams C, AtmosphereParams A, Texture3D<floa
             depthWeight += T - T * through;
             T *= through;
             if (T < 0.005)
+            {
+                // Opaque from here: what is left of the light behind (the sun's disc, ~10⁶ pre-exposed, 0.5 % of it a
+                // white disc through the thickest cumulus) is gone. The cloud's own light past this point is < 0.5 %.
+                T = 0.0;
                 break;
+            }
         }
         t += step;
     }
@@ -619,15 +640,67 @@ void CSCloudMarch(uint3 id : SV_DispatchThreadID)
 
     uint2 pixel = MarchMode == 0 ? id.xy : min(id.xy * 2 + CloudMarchOffset(FrameIndex), uint2(TargetWidth, TargetHeight) - 1);
     float2 uv = (float2(pixel) + 0.5) / float2(TargetWidth, TargetHeight);
-    CloudMarchResult r = CloudMarchRay(C, A, lut, CloudViewDir(uv), CloudJitter(pixel, FrameIndex), 1.0);
+    float3 dir = CloudViewDir(uv);
+    // Up to the scene's surface (CSCloudSceneDepth), its view depth along the ray
+    float tLimit = 1e9;
+    if (SceneDepthTexIdx != 0)
+    {
+        Texture2D<float> sceneDepth = ResourceDescriptorHeap[SceneDepthTexIdx];
+        float viewDepth = sceneDepth.Load(int3(pixel, 0));
+        if (viewDepth > 0.0)
+            tLimit = viewDepth / max(dot(dir, normalize(float3(View._13, View._23, View._33))), 1e-3);
+    }
+    CloudMarchResult r = CloudMarchRay(C, A, lut, dir, CloudJitter(pixel, FrameIndex), 1.0, tLimit);
     target[id.xy] = r.color;
     depthTarget[id.xy] = r.depth * 0.001;      // km: half floats hold it
 }
 
+// The scene's view depth a half-size texel is marched to (TargetUAV, R32F, m; 0 = the sky) from the G-buffer's linear
+// depth (SourceTexIdx): its 2×2 pixels' nearest surface in one texel, their farthest (the sky if any is sky) in the next,
+// a checkerboard, so along a summit's silhouette there are clouds marched on both sides of it to choose from when a
+// pixel is upsampled (Frostbite, UE5)
+[numthreads(8, 8, 1)]
+void CSCloudSceneDepth(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= TargetWidth || id.y >= TargetHeight)
+        return;
+    Texture2D<float> depth = ResourceDescriptorHeap[SourceTexIdx];
+    uint width, height;
+    depth.GetDimensions(width, height);
+    float nearest = 1e30, farthest = 0.0;
+    bool sky = false;
+    [unroll] for (uint j = 0; j < 2; j++)
+    {
+        [unroll] for (uint i = 0; i < 2; i++)
+        {
+            float d = depth.Load(int3(min(id.xy * 2 + uint2(i, j), uint2(width, height) - 1), 0));
+            if (d <= 0.0)
+                sky = true;
+            else
+            {
+                nearest = min(nearest, d);
+                farthest = max(farthest, d);
+            }
+        }
+    }
+    bool takeFar = ((id.x + id.y) & 1) != 0;
+    RWTexture2D<float> target = ResourceDescriptorHeap[TargetUAVIdx];
+    target[id.xy] = takeFar ? (sky ? 0.0 : farthest) : (nearest < 1e30 ? nearest : 0.0);
+}
+
+// Whether two scene depths (m, 0 = the sky) are the same surface for the clouds: within 10 %
+bool CloudSameSurface(float a, float b)
+{
+    if (a <= 0.0 || b <= 0.0)
+        return a <= 0.0 && b <= 0.0;
+    return abs(a - b) <= 0.1 * max(a, b);
+}
+
 // A view's clouds this frame from the texels marched (one of each 2×2 block) and last frame's, reprojected: the place a
-// texel's clouds were at last frame (the camera's move, the wind's), clamped to what this frame's marched neighbours
-// show (no ghost outlives a change), a marched texel blended with its own history to smooth the jitter. Off screen or
-// without a history: this frame's sparse samples, interpolated. Writes the half-size target the sky reads.
+// texel's clouds were at last frame (the camera's move, the wind's), clamped to what this frame's marched neighbours on
+// the same surface show (no ghost outlives a change), a marched texel blended with its own history to smooth the
+// jitter. Off screen, without a history, or where the scene's surface there has changed (a summit's silhouette moved
+// past): this frame's sparse samples on the same surface, interpolated. Writes the half-size target.
 [numthreads(8, 8, 1)]
 void CSCloudReconstruct(uint3 id : SV_DispatchThreadID)
 {
@@ -639,18 +712,37 @@ void CSCloudReconstruct(uint3 id : SV_DispatchThreadID)
     RWTexture2D<float> depthTarget = ResourceDescriptorHeap[DepthUAVIdx];
     uint2 sparseSize = uint2((TargetWidth + 1) / 2, (TargetHeight + 1) / 2);
     int2 q = int2(id.xy / 2);
-    bool fresh = all((id.xy & 1) == CloudMarchOffset(FrameIndex));
+    uint2 offset = CloudMarchOffset(FrameIndex);
+    bool fresh = all((id.xy & 1) == offset);
 
-    // This frame's marched neighbours: the clamp's box
-    float4 lo = 1e9, hi = -1e9;
+    // The scene's surface at this texel and at each marched one (the half-size scene depth; all sky without it)
+    Texture2D<float> sceneDepth = ResourceDescriptorHeap[SceneDepthTexIdx];
+    bool hasScene = SceneDepthTexIdx != 0;
+    uint2 maxTexel = uint2(TargetWidth, TargetHeight) - 1;
+    float surface = hasScene ? sceneDepth.Load(int3(id.xy, 0)) : 0.0;
+
+    // This frame's marched neighbours on the same surface: the clamp's box (all of them where none is)
+    float4 lo = 1e9, hi = -1e9, loAll = 1e9, hiAll = -1e9;
     [unroll] for (int j = -1; j <= 1; j++)
     {
         [unroll] for (int i = -1; i <= 1; i++)
         {
-            float4 s = sparse.Load(int3(clamp(q + int2(i, j), int2(0, 0), int2(sparseSize) - 1), 0));
-            lo = min(lo, s);
-            hi = max(hi, s);
+            int2 qn = clamp(q + int2(i, j), int2(0, 0), int2(sparseSize) - 1);
+            float4 s = sparse.Load(int3(qn, 0));
+            loAll = min(loAll, s);
+            hiAll = max(hiAll, s);
+            float sd = hasScene ? sceneDepth.Load(int3(min(uint2(qn) * 2 + offset, maxTexel), 0)) : 0.0;
+            if (CloudSameSurface(sd, surface))
+            {
+                lo = min(lo, s);
+                hi = max(hi, s);
+            }
         }
+    }
+    if (lo.a > hi.a)
+    {
+        lo = loAll;
+        hi = hiAll;
     }
     float4 own = sparse.Load(int3(q, 0));
     float depthKm = sparseDepth.Load(int3(q, 0));
@@ -663,8 +755,17 @@ void CSCloudReconstruct(uint3 id : SV_DispatchThreadID)
     float2 prevUV = float2(prevClip.x, -prevClip.y) / max(prevClip.w, 1e-6) * 0.5 + 0.5;
     bool onScreen = prevClip.w > 0.0 && all(prevUV >= 0.0) && all(prevUV <= 1.0);
 
+    // Last frame's surface where the history comes from must be this one (a silhouette that moved leaves none)
+    bool sameSurface = true;
+    if (hasScene && PrevSceneDepthTexIdx != 0 && onScreen)
+    {
+        Texture2D<float> prevScene = ResourceDescriptorHeap[PrevSceneDepthTexIdx];
+        sameSurface = CloudSameSurface(prevScene.Load(int3(min(uint2(prevUV * float2(TargetWidth, TargetHeight)), maxTexel), 0)),
+                                       surface);
+    }
+
     float4 result;
-    if (HistoryTexIdx != 0 && onScreen)
+    if (HistoryTexIdx != 0 && onScreen && sameSurface)
     {
         Texture2D<float4> history = ResourceDescriptorHeap[HistoryTexIdx];
         float4 h = history.SampleLevel(AtmosphereLinearClamp, prevUV, 0);
@@ -672,16 +773,33 @@ void CSCloudReconstruct(uint3 id : SV_DispatchThreadID)
         h = clamp(h, lo, hi);
         result = fresh ? lerp(own, h, 0.5) : h;
     }
+    else if (fresh)
+        result = own;
     else
     {
-        // No history here: this frame's samples round it, bilinearly (the sparse grid's texel centres sit at 2q + offset)
-        float2 sq = (float2(id.xy) - float2(CloudMarchOffset(FrameIndex))) * 0.5;
+        // No history here: this frame's samples round it, bilinearly (the sparse grid's texel centres sit at 2q + offset),
+        // those on another surface left out (all of them where none is on this one)
+        float2 sq = (float2(id.xy) - float2(offset)) * 0.5;
         int2 b = int2(floor(sq));
         float2 f = sq - b;
         int2 hiq = int2(sparseSize) - 1;
-        float4 s00 = sparse.Load(int3(clamp(b, 0, hiq), 0)), s10 = sparse.Load(int3(clamp(b + int2(1, 0), 0, hiq), 0));
-        float4 s01 = sparse.Load(int3(clamp(b + int2(0, 1), 0, hiq), 0)), s11 = sparse.Load(int3(clamp(b + int2(1, 1), 0, hiq), 0));
-        result = fresh ? own : lerp(lerp(s00, s10, f.x), lerp(s01, s11, f.x), f.y);
+        float4 sum = 0, sumAll = 0;
+        float weight = 0, weightAll = 0;
+        [unroll] for (int k = 0; k < 4; k++)
+        {
+            int2 qk = clamp(b + int2(k & 1, k >> 1), 0, hiq);
+            float wk = ((k & 1) != 0 ? f.x : 1.0 - f.x) * ((k >> 1) != 0 ? f.y : 1.0 - f.y) + 1e-4;
+            float4 s = sparse.Load(int3(qk, 0));
+            sumAll += s * wk;
+            weightAll += wk;
+            float sd = hasScene ? sceneDepth.Load(int3(min(uint2(qk) * 2 + offset, maxTexel), 0)) : 0.0;
+            if (CloudSameSurface(sd, surface))
+            {
+                sum += s * wk;
+                weight += wk;
+            }
+        }
+        result = weight > 0.0 ? sum / weight : sumAll / weightAll;
     }
     if (any(isnan(result)))
         result = own;
@@ -725,7 +843,7 @@ void CSCloudProbeFace(uint3 id : SV_DispatchThreadID)
     Texture3D<float4> lut = ResourceDescriptorHeap[C.NoiseLut];
     float2 uv = (float2(id.xy) + 0.5) / TargetWidth * 2.0 - 1.0;
     float3 dir = CloudCubeDirection(ProbeFace, uv);
-    CloudMarchResult r = CloudMarchRay(C, A, lut, dir, 0.5, 3.0);
+    CloudMarchResult r = CloudMarchRay(C, A, lut, dir, 0.5, 3.0, 1e9);
     if (r.color.a < 0.999)
     {
         // With the air in front (the probe has no aerial perspective volume)

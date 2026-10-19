@@ -262,7 +262,8 @@ float4 NearFog(float2 pixel, float viewDepth)
 //   pixel:     SV_Position.xy (or the pixel a compute thread shades)
 //   viewDepth: linear view-space depth in metres (the G-buffer's depth, clip w)
 // Sky pixels must not come here (AtmosphereFogOverSky): the sky's light already holds all of the air.
-float4 AtmosphereFog(float2 pixel, float viewDepth, float skyVisible)
+// The air alone: AtmosphereFog (below) adds the volumetric clouds in front of the surface.
+float4 AtmosphereFogAir(float2 pixel, float viewDepth, float skyVisible)
 {
     if (FogEnabled <= 0.0 || AtmosphereIdx == 0)
         return float4(0, 0, 0, 1);
@@ -292,21 +293,6 @@ float3 AtmosphereFogOverSky(float3 sky, float2 pixel)
     float4 apNear = AtmosphereAerialPerspective(LoadAtmosphere(), pixel / ViewportSize, FogVolumeRange);
     float4 nearFog = NearFog(pixel, FogVolumeRange);
     return max(sky - apNear.rgb, 0.0) / max(apNear.a, 1e-4) * nearFog.a + nearFog.rgb;
-}
-
-// Aerial perspective: the air between the camera and a surface dims the surface's light and adds its own (the haze
-// and the ground fog of the preset, lit by the sun and the moon, in the earth's shadow after sunset). AtmosphereFog.
-float3 ApplyAerialPerspective(float3 color, float2 pixel, float viewDepth)
-{
-    float4 fog = AtmosphereFog(pixel, viewDepth, 1.0);
-    return color * fog.a + fog.rgb;
-}
-
-// The same for a surface that sees skyVisible of the sky
-float3 ApplyAerialPerspective(float3 color, float2 pixel, float viewDepth, float skyVisible)
-{
-    float4 fog = AtmosphereFog(pixel, viewDepth, skyVisible);
-    return color * fog.a + fog.rgb;
 }
 
 // ────────────────────────────────────────────────
@@ -548,13 +534,27 @@ float3 AtmosphereSkyBelowClouds(AtmosphereParams A, float3 dir)
 }
 
 // The air's transmittance from the camera to a point s metres along a ray (unit dir), from two transmittance LUT reads
-// (to the top of the atmosphere from either end); the planet's curvature as the clouds have it
+// (to the top of the atmosphere from either end); the planet's curvature as the clouds have it. A ray going down (a
+// deck seen from above) is read the other way round, upward from the point through the camera: the LUT holds rays to
+// the top of the atmosphere, and one that meets the ground has none (the clouds under the camera went black).
+// Within ~3° of the horizon both reads are tiny (the whole atmosphere edge-on) and their ratio falls apart channel by
+// channel (a yellow line along the horizon from inside a deck): there the segment itself is integrated, 8 samples.
 float3 AtmTransmittanceAlong(AtmosphereParams A, float3 dir, float s)
 {
     float3 P = CloudAtmospherePos(dir * s);
     float r = length(P);
-    return saturate(AtmTransmittance(A, AtmosphereViewHeight(A, CamPos.y), dir.y)
-                    / max(AtmTransmittance(A, r, dot(P / r, dir)), 1e-6));
+    float viewHeight = AtmosphereViewHeight(A, CamPos.y);
+    float3 lut = dir.y >= 0.0
+        ? saturate(AtmTransmittance(A, viewHeight, dir.y) / max(AtmTransmittance(A, r, dot(P / r, dir)), 1e-6))
+        : saturate(AtmTransmittance(A, r, dot(P / r, -dir)) / max(AtmTransmittance(A, viewHeight, -dir.y), 1e-6));
+    float horizon = 1.0 - smoothstep(0.02, 0.05, abs(dir.y));
+    if (horizon <= 0.0)
+        return lut;
+    float3 depth = 0;
+    float dt = s * 0.001 / 8.0;     // km
+    [unroll] for (uint k = 0; k < 8; k++)
+        depth += SampleAtmMedium(CloudAtmospherePos(dir * (s * (k + 0.5) / 8.0)), A).extinction * dt;
+    return lerp(lut, exp(-depth), horizon);
 }
 
 // The air between the camera and clouds `depth` metres along dir without the aerial perspective volume: its
@@ -619,6 +619,98 @@ float3 AtmosphereSkyWithClouds(float2 pixel, float3 dir, float3 sky, float3 clou
     float3 endToSpace = hitsGround ? 0.0 : saturate(AtmTransmittance(A, viewHeight, dir.y) / max(toEnd, 1e-6));
     float3 f = saturate((1.0 - endToCloud) / max(1.0 - endToSpace, 1e-4));
     return apEnd.rgb + toCloud * cloudLight + (f + cloudT * (1.0 - f)) * past;
+}
+
+// ── The volumetric clouds at a pixel (stage 6: over the sky, and in front of a summit or anything else) ──
+// From the view's half-size targets (CloudTargetIdx: their own light, transmittance; CloudDepthIdx: km to their light;
+// CloudSceneDepthIdx: the scene depth each texel was marched to, a checkerboard of each 2×2's nearest and farthest
+// surface): the four texels round the pixel, bilinearly, each weighed by how near its surface is to the pixel's, so a
+// summit's silhouette takes the clouds marched to it and the sky beside it those marched past it. viewDepth: the pixel's
+// (m, 0 = the sky). cloud: (light × Exposure, transmittance; (0, 0, 0, 1) = none); depth: metres along the ray.
+void CloudsAt(float2 pixel, float viewDepth, out float4 cloud, out float depth)
+{
+    cloud = float4(0, 0, 0, 1);
+    depth = 0.0;
+    if (CloudTargetIdx == 0)
+        return;
+    Texture2D<float4> clouds = ResourceDescriptorHeap[CloudTargetIdx];
+    uint width, height;
+    clouds.GetDimensions(width, height);
+    float2 coord = pixel * 0.5 - 0.5;
+    int2 base = int2(floor(coord));
+    float2 f = coord - base;
+    int2 hiTexel = int2(width, height) - 1;
+    int2 texels[4] = { clamp(base, 0, hiTexel), clamp(base + int2(1, 0), 0, hiTexel),
+                       clamp(base + int2(0, 1), 0, hiTexel), clamp(base + int2(1, 1), 0, hiTexel) };
+    float4 c[4];
+    bool cloudy = false;
+    [unroll] for (int k = 0; k < 4; k++)
+    {
+        c[k] = clouds.Load(int3(texels[k], 0));
+        cloudy = cloudy || c[k].a < 0.999;
+    }
+    if (!cloudy)
+        return;                     // most of the ground: no cloud in front of it
+
+    Texture2D<float> scene = ResourceDescriptorHeap[CloudSceneDepthIdx];
+    Texture2D<float> depths = ResourceDescriptorHeap[CloudDepthIdx];
+    float4 sum = 0;
+    float depthSum = 0.0, weight = 0.0;
+    [unroll] for (int k = 0; k < 4; k++)
+    {
+        float wb = ((k & 1) != 0 ? f.x : 1.0 - f.x) * ((k >> 1) != 0 ? f.y : 1.0 - f.y);
+        float s = CloudSceneDepthIdx != 0 ? scene.Load(int3(texels[k], 0)) : 0.0;
+        float apart = (s <= 0.0 || viewDepth <= 0.0) ? ((s <= 0.0 && viewDepth <= 0.0) ? 0.0 : 10.0)
+                    : abs(s - viewDepth) / max(s, viewDepth);
+        float w = (wb + 1e-3) / (0.05 + apart);
+        sum += c[k] * w;
+        depthSum += (CloudDepthIdx != 0 ? depths.Load(int3(texels[k], 0)) : 0.0) * w;
+        weight += w;
+    }
+    cloud = sum / weight;
+    depth = depthSum / weight * 1000.0;
+}
+
+// The fog between the camera and a surface (AtmosphereFogAir) with the volumetric clouds in front of it: a summit in a
+// deck, a hill seen from above the clouds, water, glass, particles and trails all through this. With the clouds' light
+// L, transmittance T and the air's light up to them (the fog at their depth), color × a + rgb becomes
+//   T × (surface through the air) + (1 − T) × air up to the clouds + T(0→d) L
+// (VOLUMETRIC_CLOUDS_PLAN §14). A cloud the upsampling brings from behind the surface is left out.
+float4 AtmosphereFog(float2 pixel, float viewDepth, float skyVisible)
+{
+    float4 fog = AtmosphereFogAir(pixel, viewDepth, skyVisible);
+    if (CloudTargetIdx == 0 || AtmosphereIdx == 0)
+        return fog;
+    float4 cloud;
+    float cloudDepth;
+    CloudsAt(pixel, viewDepth, cloud, cloudDepth);
+    if (cloud.a >= 0.999)
+        return fog;
+    float2 uv = pixel / ViewportSize;
+    float4 farClip = mul(float4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 0, 1), CameraInverse);
+    float3 dir = normalize(farClip.xyz / farClip.w);
+    float cloudView = cloudDepth * max(dot(dir, normalize(float3(View._13, View._23, View._33))), 1e-3);
+    if (cloudView >= viewDepth)
+        return fog;
+    float3 inFront = AtmosphereFogAir(pixel, cloudView, 1.0).rgb;
+    float3 toCloud = AtmTransmittanceAlong(LoadAtmosphere(), dir, cloudDepth);
+    return float4(cloud.a * fog.rgb + (1.0 - cloud.a) * inFront + toCloud * cloud.rgb, cloud.a * fog.a);
+}
+
+// Aerial perspective: the air between the camera and a surface dims the surface's light and adds its own (the haze
+// and the ground fog of the preset, lit by the sun and the moon, in the earth's shadow after sunset), and the clouds in
+// front of it. AtmosphereFog.
+float3 ApplyAerialPerspective(float3 color, float2 pixel, float viewDepth)
+{
+    float4 fog = AtmosphereFog(pixel, viewDepth, 1.0);
+    return color * fog.a + fog.rgb;
+}
+
+// The same for a surface that sees skyVisible of the sky
+float3 ApplyAerialPerspective(float3 color, float2 pixel, float viewDepth, float skyVisible)
+{
+    float4 fog = AtmosphereFog(pixel, viewDepth, skyVisible);
+    return color * fog.a + fog.rgb;
 }
 
 // ── Light on the cloud layer ──

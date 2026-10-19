@@ -252,6 +252,7 @@ void CSMeter(uint gi : SV_GroupIndex)
     // screen's metering); the brightness round it alone left a mountain's shade as dark as the old metering of a sunlit
     // view (the bright sky is half of it). AutoExposure takes them half and half.
     float skyUpper = skyLux / ATM_PI;    // a sky alike all over: its mean luminance is E / π
+    float lower = bounce / ATM_PI;
     if (AtmosphereIdx != 0)
     {
         AtmosphereParams A = LoadAtmosphere();
@@ -261,11 +262,19 @@ void CSMeter(uint gi : SV_GroupIndex)
             // band 2 terms integrate to 0 there), / 2π
             StructuredBuffer<float4> sh = ResourceDescriptorHeap[A.SkyProbeSH];
             skyUpper = max(Luma(sh[0].rgb * 0.282095 + sh[1].rgb * 0.366452), 0.0) / max(Exposure, 1e-30);
+            // Over the clouds' base, below is the probe's lower half where it is brighter than the ground's bounce and the
+            // sky is open round the camera: a sunlit deck under it (volumetric clouds stage 6; the bounce alone left EV
+            // 15 over a deck that read 16 from inside, and the deck blew out). Not lower down: there the lower half's
+            // haze toward the horizon would move every view the meter was calibrated on (§7.1).
+            if (CloudParamsIdx != 0 && CamPos.y > LoadClouds().Base)
+            {
+                float skyLower = max(Luma(sh[0].rgb * 0.282095 - sh[1].rgb * 0.366452), 0.0) / max(Exposure, 1e-30);
+                lower = lerp(lower, max(lower, skyLower), parts.w);
+            }
         }
     }
     float surround = METER_SURROUND_ALBEDO * sphere / ATM_PI;
     float upper = lerp(surround, skyUpper, parts.w);
-    float lower = bounce / ATM_PI;
     float adapt = 0.5 * (upper + lower);
 
     RWStructuredBuffer<float4> output = ResourceDescriptorHeap[OutputUAVIdx];

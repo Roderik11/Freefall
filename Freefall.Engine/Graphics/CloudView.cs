@@ -27,11 +27,12 @@ namespace Freefall.Graphics
         }
 
         private ComputeShader? _cs;
-        private int _kMarch, _kReconstruct;
+        private int _kMarch, _kReconstruct, _kSceneDepth;
         private Target? _sparse, _sparseDepth;
-        private readonly Target?[] _color = new Target?[2], _depth = new Target?[2];
+        private readonly Target?[] _color = new Target?[2], _depth = new Target?[2], _sceneDepth = new Target?[2];
         private uint _frame;
         private bool _historyValid;
+        private bool _prevSceneValid;      // last frame's scene depth was made
         private Matrix4x4 _prevRelativeVP;
         private Vector3 _prevCameraPos;
         private float _prevExposure;
@@ -42,6 +43,10 @@ namespace Freefall.Graphics
         /// <summary>Bindless index of this frame's cloud depth (R16F, km), the target <see cref="Prepare"/> returned
         /// goes with: SceneConstants.CloudDepthIdx (the sky dome's shadows over the sky).</summary>
         public uint DepthIndex => _depth[_frame & 1]?.Texture.BindlessIndex ?? 0u;
+
+        /// <summary>Bindless index of this frame's half-size scene depth (R32F, m of view depth, 0 = the sky): what each texel
+        /// was marched to, a checkerboard of each 2×2's nearest and farthest surface (SceneConstants.CloudSceneDepthIdx).</summary>
+        public uint SceneDepthIndex => _sceneDepth[_frame & 1]?.Texture.BindlessIndex ?? 0u;
 
         private const ResourceStates ShaderRead = ResourceStates.NonPixelShaderResource | ResourceStates.PixelShaderResource;
 
@@ -65,12 +70,14 @@ namespace Freefall.Graphics
                 {
                     _color[i] = Make(w, h, Format.R16G16B16A16_Float);     // pre-exposed light, transmittance
                     _depth[i] = Make(w, h, Format.R16_Float);              // km
+                    _sceneDepth[i] = Make(w, h, Format.R32_Float);         // m of view depth
                 }
                 _sparse = Make((w + 1) / 2, (h + 1) / 2, Format.R16G16B16A16_Float);
                 _sparseDepth = Make((w + 1) / 2, (h + 1) / 2, Format.R16_Float);
                 Width = w;
                 Height = h;
                 _historyValid = false;
+                _prevSceneValid = false;
             }
             return _color[_frame & 1]!.Texture.BindlessIndex;
         }
@@ -78,10 +85,11 @@ namespace Freefall.Graphics
         /// <summary>
         /// March this view's clouds: after Clouds.Render (the bake, the light) and the atmosphere's LUTs, before the sky
         /// is drawn. The scene constants must be bound for compute by <paramref name="bindSceneConstants"/>;
-        /// <paramref name="relativeVP"/> is the view-projection without translation.
+        /// <paramref name="relativeVP"/> is the view-projection without translation; <paramref name="sceneDepthIdx"/> the
+        /// G-buffer's linear depth (readable by compute; 0 = march to the slab's end): the march stops at the surface.
         /// </summary>
         public void Render(ID3D12GraphicsCommandList list, Vector3 cameraPos, Matrix4x4 relativeVP,
-            Action<ID3D12GraphicsCommandList> bindSceneConstants)
+            Action<ID3D12GraphicsCommandList> bindSceneConstants, uint sceneDepthIdx)
         {
             if (!Clouds.Active || _color[0] == null)
                 return;
@@ -90,6 +98,7 @@ namespace Freefall.Graphics
                 _cs = new ComputeShader("clouds_cs.hlsl");
                 _kMarch = _cs.FindKernel("CSCloudMarch");
                 _kReconstruct = _cs.FindKernel("CSCloudReconstruct");
+                _kSceneDepth = _cs.FindKernel("CSCloudSceneDepth");
             }
             var cs = _cs;
             var device = Engine.Device;
@@ -108,6 +117,22 @@ namespace Freefall.Graphics
             cs.SetParam("CameraMove", move);
             cs.SetParam("ExposureRatio", _prevExposure > 0f ? exposure / _prevExposure : 1f);
             cs.SetParam("CloudStep", Clouds.LastStep);
+
+            // The scene's depth at half size, what each texel is marched to (a checkerboard of each 2×2's nearest and farthest)
+            var scene = _sceneDepth[cur]!;
+            uint sceneIdx = 0;
+            if (sceneDepthIdx != 0)
+            {
+                Transition(list, scene, ResourceStates.UnorderedAccess);
+                cs.SetPushConstant(_kSceneDepth, "SourceTex", sceneDepthIdx);
+                cs.SetPushConstant(_kSceneDepth, "TargetUAV", scene.Texture.UavIndex);
+                cs.SetPushConstant(_kSceneDepth, "TargetWidth", (uint)Width);
+                cs.SetPushConstant(_kSceneDepth, "TargetHeight", (uint)Height);
+                cs.Dispatch(_kSceneDepth, list, (uint)(Width + 7) / 8, (uint)(Height + 7) / 8);
+                Transition(list, scene, ShaderRead);
+                sceneIdx = scene.Texture.BindlessIndex;
+            }
+            cs.SetPushConstant(_kMarch, "SceneDepthTex", sceneIdx);
 
             var color = _color[cur]!; var depth = _depth[cur]!;
             if (full)
@@ -139,6 +164,10 @@ namespace Freefall.Graphics
                 cs.SetPushConstant(_kReconstruct, "SparseTex", _sparse.Texture.BindlessIndex);
                 cs.SetPushConstant(_kReconstruct, "SparseDepthTex", _sparseDepth.Texture.BindlessIndex);
                 cs.SetPushConstant(_kReconstruct, "HistoryTex", _color[prev]!.Texture.BindlessIndex);
+                // Last frame's scene depth: the history is dropped where the surface there was another (a silhouette moved)
+                Transition(list, _sceneDepth[prev]!, ShaderRead);
+                cs.SetPushConstant(_kReconstruct, "SceneDepthTex", sceneIdx);
+                cs.SetPushConstant(_kReconstruct, "PrevSceneDepthTex", sceneIdx != 0 && _prevSceneValid ? _sceneDepth[prev]!.Texture.BindlessIndex : 0u);
                 cs.Dispatch(_kReconstruct, list, (uint)(Width + 7) / 8, (uint)(Height + 7) / 8);
             }
             Transition(list, color, ShaderRead);
@@ -149,6 +178,7 @@ namespace Freefall.Graphics
             _prevCameraPos = cameraPos;
             _prevExposure = exposure;
             _historyValid = true;
+            _prevSceneValid = sceneIdx != 0;
             _frame++;
         }
 
@@ -180,6 +210,7 @@ namespace Freefall.Graphics
             {
                 _color[i]?.Texture.Dispose(); _color[i] = null;
                 _depth[i]?.Texture.Dispose(); _depth[i] = null;
+                _sceneDepth[i]?.Texture.Dispose(); _sceneDepth[i] = null;
             }
             _sparse?.Texture.Dispose(); _sparse = null;
             _sparseDepth?.Texture.Dispose(); _sparseDepth = null;

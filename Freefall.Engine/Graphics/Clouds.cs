@@ -117,6 +117,8 @@ namespace Freefall.Graphics
         private static int _probeTurn;
         private static bool _probeAll = true;
         private static readonly int[] ProbeFaces = { 0, 1, 2, 4, 5 };     // +X −X +Y +Z −Z (−Y sees the ground)
+        private static readonly int[] ProbeFacesAbove = { 0, 1, 2, 3, 4, 5 };   // over the clouds' base: −Y sees them too
+        private static bool _cameraOverBase;      // the camera above the slab's bottom: clouds can lie below it
 
         /// <summary>How far the wind carried the clouds this frame (world xz, m): the views' reprojection.</summary>
         public static Vector2 LastStep { get; private set; }
@@ -247,6 +249,10 @@ namespace Freefall.Graphics
             bool rebuild = slabBottom != _slabBottom || slabTop != _slabTop
                 || double.IsNaN(_lastHours) || Math.Abs(_gameHours - _lastHours) > 0.25;
             _slabBottom = slabBottom;
+            bool overBase = cameraPos.Y > slabBottom;
+            if (overBase != _cameraOverBase)
+                _probeAll = true;                   // −Y joins or leaves the round: march it once more either way
+            _cameraOverBase = overBase;
             _slabTop = slabTop;
             _lastHours = _gameHours;
 
@@ -485,13 +491,14 @@ namespace Freefall.Graphics
             int faces = _probeAll ? 6 : 1;          // all six once (−Y too: it must hold "no cloud", not garbage)
             for (int f = 0; f < faces; f++)
             {
-                int face = _probeAll ? f : ProbeFaces[_probeTurn];
+                var round = _cameraOverBase ? ProbeFacesAbove : ProbeFaces;
+                int face = _probeAll ? f : round[_probeTurn % round.Length];
                 cs.SetPushConstant(_kProbeFace, "TargetUAV", _probeCloudsUav);
                 cs.SetPushConstant(_kProbeFace, "TargetWidth", (uint)ProbeSize);
                 cs.SetPushConstant(_kProbeFace, "ProbeFace", (uint)face);
                 cs.Dispatch(_kProbeFace, list, ProbeSize / 8, ProbeSize / 8, 1);
             }
-            if (!_probeAll) _probeTurn = (_probeTurn + 1) % ProbeFaces.Length;
+            if (!_probeAll) _probeTurn = (_probeTurn + 1) % (_cameraOverBase ? ProbeFacesAbove.Length : ProbeFaces.Length);
             _probeAll = false;
             list.ResourceBarrierTransition(_probeClouds!, ResourceStates.UnorderedAccess, shaderRead);
             _probeCloudsState = shaderRead;
