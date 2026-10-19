@@ -20,10 +20,15 @@ namespace Freefall.Graphics
     public sealed class SeaMask : IDisposable
     {
         /// <summary>
-        /// How far the sea reaches up the land past the still waterline (m). Waves and the swash run up the beach above
-        /// sea level, and a mask that ended at the waterline would cut them off. Never crosses into enclosed low ground.
+        /// How far the sea reaches up the land past the still waterline (m), at most: over land up to
+        /// <see cref="BeachReachHeight"/> above the sea. Waves and the swash run up the beach above sea level, and a mask
+        /// that ended short of them cut them off along a hard line (the surf's swash runs 15–20 m up a flat beach: the
+        /// reach was a flat 8 m until 2026-10-19). Never crosses into enclosed low ground.
         /// </summary>
-        public const float BeachReach = 8f;
+        public const float BeachReach = 60f;
+
+        /// <summary>How high above the still sea the beach reach goes (m): no swash wets the land higher than this.</summary>
+        public const float BeachReachHeight = 2.5f;
 
         /// <summary>Most cells along a side: a 4097² heightmap is flooded at every second sample (2 m on a 4 km terrain).</summary>
         public const int MaxSize = 2049;
@@ -47,10 +52,11 @@ namespace Freefall.Graphics
 
         /// <summary>
         /// Flood the height field (values 0..1 of the terrain's MaxHeight, [x, z]) from its border across every sample
-        /// below <paramref name="seaLevel01"/>, then let the sea reach <see cref="BeachReach"/> up the land.
-        /// <paramref name="sampleSpacing"/> is the distance between two height samples (m). Any thread.
+        /// below <paramref name="seaLevel01"/>, then let the sea reach up the land (<see cref="BeachReach"/>,
+        /// <see cref="BeachReachHeight"/>). <paramref name="sampleSpacing"/> is the distance between two height samples
+        /// (m). Any thread.
         /// </summary>
-        public static Result Build(float[,] heights, float seaLevel01, float sampleSpacing, float seaLevel)
+        public static Result Build(float[,] heights, float seaLevel01, float sampleSpacing, float seaLevel, float maxHeight)
         {
             long start = System.Diagnostics.Stopwatch.GetTimestamp();
             int res = Math.Min(heights.GetLength(0), heights.GetLength(1));
@@ -100,8 +106,10 @@ namespace Freefall.Graphics
                 queue[tail++] = n;
             }
 
-            // Up the beaches: land within BeachReach of the sea, never into low ground the sea did not reach
-            int reach = Math.Max(1, (int)MathF.Ceiling(BeachReach / Math.Max(sampleSpacing * step, 0.01f)));
+            // Up the beaches: land within BeachReach of the sea and lower than BeachReachHeight over it, never into low
+            // ground the sea did not reach
+            int reach = Math.Clamp((int)MathF.Ceiling(BeachReach / Math.Max(sampleSpacing * step, 0.01f)), 1, 255);
+            float reachTop01 = seaLevel01 + BeachReachHeight / Math.Max(maxHeight, 0.001f);
             var distance = new byte[count];
             head = 0;
             tail = 0;
@@ -119,7 +127,7 @@ namespace Freefall.Graphics
                     int nx = x + dx, nz = z + dz;
                     if ((dx | dz) == 0 || nx < 0 || nz < 0 || nx >= size || nz >= size) continue;
                     int n = nz * size + nx;
-                    if (cells[n] != 0 || below[n]) continue;
+                    if (cells[n] != 0 || below[n] || heights[nx * step, nz * step] > reachTop01) continue;
                     cells[n] = 255;
                     distance[n] = (byte)(d + 1);
                     queue[tail++] = n;

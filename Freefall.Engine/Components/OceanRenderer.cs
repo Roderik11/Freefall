@@ -196,19 +196,14 @@ namespace Freefall.Components
          How much the wave normal bends the view of the seabed")]
         public float RefractionStrength = 0.02f;
 
-        [ValueRange(0.5f, 10f)]
-        [Description(@"Water depth in meters below which foam bands roll in toward the beach.
-         Larger values start the swash further out")]
-        public float ShoreFoamDepth = 2.5f;
-
         [ValueRange(0f, 1f)]
-        [Description(@"Amount of shore foam: swash bands plus the lace along the waterline
-         and around objects standing in the water")]
+        [Description(@"Amount of foam along the waterline and around objects standing in the water.
+         The surf's white water comes from the breaking waves themselves")]
         public float ShoreFoam = 0.8f;
 
-        [ValueRange(0f, 0.5f)]
-        [Description(@"How far the water level rises and falls at the beach, in meters, in step with the foam bands.
-         Makes the waterline travel up and down the sand; on a flat beach a few centimeters go a long way")]
+        [ValueRange(0f, 1.5f)]
+        [Description(@"How high the swash runs up the beach at most, in meters over the still sea: each wave's bore runs up as far
+         as its height carries it (a third of it), up to this. On a flat beach a few decimeters go a long way")]
         public float ShoreSurge = 0.1f;
 
         [Category("Spectrum")]
@@ -260,6 +255,16 @@ namespace Freefall.Components
         private int _seaMaskRequest;
         private float _seaMaskLevel = float.NaN;
 
+        // The surf (ShoreWarp): baked on the sea mask's worker right after it, and on its own when a warped band's heading
+        // or frequency moves (the weather); the newest bake wins, and a band change waits for the running bake to finish
+        private readonly ShoreWarp _shoreWarp = new();
+        private ShoreWarp.Result? _builtShoreWarp;
+        private ShoreWarp.Band[] _warpRequested = Array.Empty<ShoreWarp.Band>();
+        private int _warpRequest;
+        private int _warpRunning;
+        private float[,]? _warpHeights;       // what the last sea mask was flooded from, for a bake of the warp alone
+        private SeaMask.Result? _warpMask;
+
         // GPU buffer for tile scales (1/lengthScale per band)
         private GraphicsBuffer? _tileScalesBuffer;
 
@@ -302,10 +307,15 @@ namespace Freefall.Components
             public uint NoiseSRV;
             public float InvViewportWidth;
             public float InvViewportHeight;
-            public float ShoreFoamDepth;
+            public float _shorePad;      // was ShoreFoamDepth (the clock-driven swash bands, gone with the surf 2026-10-19)
             public float ShoreFoam;
             public float ShoreSurge;
             public uint HiZSRV;          // the view's Hi-Z pyramid: hull shader skips hidden patches (0 = off)
+            public uint ShoreWarpSRV;    // the surf (ShoreWarp): per warped band Δu, amplitude, c/c0; 0 = no warp
+            public uint ShoreWarpJacobianSRV;   // its ∂u/∂x
+            public uint WarpSlots;       // band + 1 of warp slice 0 (bits 0-7) and slice 1 (bits 8-15); 0 = none
+            public float _warpPad;
+            public Vector4 WarpDirs;     // the deep heading (world xz) of slice 0 (xy) and slice 1 (zw)
         }
 
         private const int GridSize = 128;
@@ -376,12 +386,140 @@ namespace Freefall.Components
             _seaMaskLevel = seaLevel;
 
             int request = Interlocked.Increment(ref _seaMaskRequest);
+            var warp = BeginShoreWarp();
             Task.Run(() =>
             {
-                var mask = SeaMask.Build(heights, seaLevel01, spacing, seaLevel);
-                if (Volatile.Read(ref _seaMaskRequest) == request)
+                try
+                {
+                    var mask = SeaMask.Build(heights, seaLevel01, spacing, seaLevel, terrain.MaxHeight);
+                    if (Volatile.Read(ref _seaMaskRequest) != request) return;
                     Volatile.Write(ref _builtSeaMask, mask);
+                    BakeShoreWarp(warp, heights, mask);
+                }
+                finally { Interlocked.Decrement(ref _warpRunning); }
             });
+        }
+
+        // What a bake of the surf's warp needs from the main thread: the bands and where the terrain is
+        private struct ShoreWarpJob
+        {
+            public int Request;
+            public ShoreWarp.Band[] Bands;
+            public float SeaLevel01, MaxHeight;
+            public Vector2 TerrainSize, Origin;
+        }
+
+        private ShoreWarpJob BeginShoreWarp()
+        {
+            var terrain = _terrain!.Terrain!;
+            var origin = _terrain.Transform?.WorldPosition ?? Vector3.Zero;
+            var bands = WarpBands();
+            _warpRequested = bands;
+            Interlocked.Increment(ref _warpRunning);
+            return new ShoreWarpJob
+            {
+                Request = Interlocked.Increment(ref _warpRequest),
+                Bands = bands,
+                SeaLevel01 = (Transform.WorldPosition.Y - origin.Y) / MathF.Max(terrain.MaxHeight, 0.001f),
+                MaxHeight = terrain.MaxHeight,
+                TerrainSize = terrain.TerrainSize,
+                Origin = new Vector2(origin.X, origin.Z),
+            };
+        }
+
+        // On a worker. The warp's own heights and mask are kept for the next bake of the warp alone
+        private void BakeShoreWarp(ShoreWarpJob job, float[,] heights, SeaMask.Result mask)
+        {
+            if (Volatile.Read(ref _warpRequest) != job.Request) return;
+            var warp = ShoreWarp.Build(heights, mask, job.SeaLevel01, job.MaxHeight, job.TerrainSize, job.Origin, job.Bands);
+            if (Volatile.Read(ref _warpRequest) != job.Request) return;
+            Volatile.Write(ref _warpHeights, heights);
+            Volatile.Write(ref _warpMask, mask);
+            Volatile.Write(ref _builtShoreWarp, warp);
+        }
+
+        // A warped band's heading or frequency moved (a preset turning the wind): bake the warp again on its own, from the
+        // heights and mask of the last bake, once no bake is running
+        private void UpdateShoreWarpBands()
+        {
+            var heights = Volatile.Read(ref _warpHeights);
+            var mask = Volatile.Read(ref _warpMask);
+            if (heights == null || mask == null || _terrain?.Terrain == null || Volatile.Read(ref _warpRunning) > 0) return;
+
+            var bands = WarpBands();
+            bool same = bands.Length == _warpRequested.Length;
+            for (int i = 0; same && i < bands.Length; i++)
+                same = bands[i].SameAs(_warpRequested[i]);
+            if (same) return;
+
+            var job = BeginShoreWarp();
+            Task.Run(() =>
+            {
+                try { BakeShoreWarp(job, heights, mask); }
+                finally { Interlocked.Decrement(ref _warpRunning); }
+            });
+        }
+
+        /// <summary>
+        /// The bands the surf carries in from the open sea (ShoreWarp), at most two: a swell from afar (the first authored
+        /// band, when wind bands make the local sea; without them the coarsest band) and the wind sea's coarsest band,
+        /// which holds its long waves. Each with the world heading its waves travel along and the spectrum's peak.
+        /// </summary>
+        private ShoreWarp.Band[] WarpBands()
+        {
+            static float Rad(float deg) => deg / 180f * MathF.PI;
+            static Vector2 Heading(float angle) => new(MathF.Cos(angle), MathF.Sin(angle));
+
+            var bands = new List<ShoreWarp.Band>(ShoreWarp.MaxBands);
+            int coarsestWind = -1, finerWind = -1;
+            for (int i = 0; i < Bands.Count; i++)
+                if (Bands[i].FollowWind && (coarsestWind < 0 || Bands[i].LengthScale > Bands[coarsestWind].LengthScale))
+                    coarsestWind = i;
+            for (int i = 0; i < Bands.Count; i++)
+                if (Bands[i].FollowWind && i != coarsestWind && (finerWind < 0 || Bands[i].LengthScale > Bands[finerWind].LengthScale))
+                    finerWind = i;
+
+            // The swell: its layer's angle is in the band's turned frame (BandAngles), the world heading that much less
+            int swell = -1;
+            for (int i = 0; i < Bands.Count && swell < 0; i++)
+                if (!Bands[i].FollowWind && Bands[i].Scale.X > 0f && (coarsestWind >= 0 || i == CoarsestBand()))
+                    swell = i;
+            if (swell >= 0)
+            {
+                var b = Bands[swell];
+                bands.Add(new ShoreWarp.Band
+                {
+                    Index = swell,
+                    Direction = Heading(Rad(b.WindDirection.X) - BandAngles[swell % BandAngles.Length]),
+                    Omega = JonswapPeakOmega(b.Fetch.X, b.WindSpeed.X),
+                });
+            }
+
+            // The wind sea: its peak, kept to the wavelengths its coarsest band holds (from a quarter of the next finer
+            // wind band's tile up to its own tile)
+            if (coarsestWind >= 0)
+            {
+                var dir = Wind.Direction;
+                float shortest = finerWind >= 0 ? Bands[finerWind].LengthScale / 4f : Bands[coarsestWind].LengthScale / 16f;
+                float longest = Bands[coarsestWind].LengthScale;
+                float omega = JonswapPeakOmega(WindSea.Fetch, MathF.Max(Wind.Strength, 0.5f));
+                omega = Math.Clamp(omega, MathF.Sqrt(2f * MathF.PI * Gravity / longest), MathF.Sqrt(2f * MathF.PI * Gravity / shortest));
+                bands.Add(new ShoreWarp.Band
+                {
+                    Index = coarsestWind,
+                    Direction = dir.LengthSquared() > 0f ? Vector2.Normalize(new Vector2(dir.X, dir.Z)) : Vector2.UnitX,
+                    Omega = omega,
+                });
+            }
+            return bands.ToArray();
+        }
+
+        private int CoarsestBand()
+        {
+            int c = -1;
+            for (int i = 0; i < Bands.Count; i++)
+                if (c < 0 || Bands[i].LengthScale > Bands[c].LengthScale) c = i;
+            return c;
         }
 
         public override void Destroy()
@@ -389,7 +527,9 @@ namespace Freefall.Components
             MessageDispatcher.RemoveListener(EngineMsg.TerrainHeightsChanged, OnTerrainHeightsChanged);
             Transform?.OnChanged -= OnTransformChanged;
             Interlocked.Increment(ref _seaMaskRequest);   // a build still running is dropped
+            Interlocked.Increment(ref _warpRequest);
             _seaMask.Dispose();
+            _shoreWarp.Dispose();
 
             // Deferred: the frames in flight still draw the grid, read the tile scales and the FFT textures
             // through their bindless slots and run the FFT kernels. OceanFFT.Dispose releases only GPU objects
@@ -703,6 +843,20 @@ namespace Freefall.Components
                 RequestSeaMask();
             if (Interlocked.Exchange(ref _builtSeaMask, null) is { } seaMask)
                 _seaMask.Upload(seaMask);
+            if (Interlocked.Exchange(ref _builtShoreWarp, null) is { } shoreWarp)
+                _shoreWarp.Upload(shoreWarp);
+            UpdateShoreWarpBands();
+
+            // The uploaded warp's slices: which band each carries and its deep heading
+            var warpBands = _shoreWarp.Bands;
+            uint warpSlots = 0;
+            var warpDirs = Vector4.Zero;
+            for (int s = 0; s < warpBands.Length && s < ShoreWarp.MaxBands; s++)
+            {
+                warpSlots |= (uint)(warpBands[s].Index + 1) << (8 * s);
+                if (s == 0) { warpDirs.X = warpBands[s].Direction.X; warpDirs.Y = warpBands[s].Direction.Y; }
+                else { warpDirs.Z = warpBands[s].Direction.X; warpDirs.W = warpBands[s].Direction.Y; }
+            }
 
             // Sun light
             var sunDir = Vector3.UnitY;
@@ -753,13 +907,16 @@ namespace Freefall.Components
                 NoiseSRV = _oceanFFT.NoiseSRV,
                 InvViewportWidth = 1.0f / MathF.Max(1, DeferredRenderer.Current?.DepthGBuffer?.Native.Description.Width ?? 1920),
                 InvViewportHeight = 1.0f / MathF.Max(1, DeferredRenderer.Current?.DepthGBuffer?.Native.Description.Height ?? 1080),
-                ShoreFoamDepth = ShoreFoamDepth,
                 ShoreFoam = ShoreFoam,
                 ShoreSurge = ShoreSurge,
                 // Built from this frame's opaque depth before the forward pass draws the water; not while
                 // frozen (stale) or with Hi-Z switched off
                 HiZSRV = DeferredRenderer.Current?.HiZPyramid is { Ready: true } pyramid
                          && !Engine.Settings.FreezeFrustum && !Engine.Settings.DisableHiZ ? pyramid.FullSRV : 0,
+                ShoreWarpSRV = warpSlots != 0 && !Engine.Settings.DisableShoreWarp ? _shoreWarp.WarpSrv : 0,
+                ShoreWarpJacobianSRV = _shoreWarp.JacobianSrv,
+                WarpSlots = warpSlots,
+                WarpDirs = warpDirs,
             });
 
 

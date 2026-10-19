@@ -733,6 +733,7 @@ namespace Freefall
          public DebugVizMode DebugVisualizationMode { get; set; } = DebugVizMode.Off; // F5 - Debug viz
          public int RCDebugSubMode { get; set; } = 1;                       // 0=off, 1=tile lookup, 2=per-level radiance, 3=constant bypass, 4=raw pool readback
          public bool DisableSeaMask { get; set; } = false;                  // the ocean draws over all ground below sea level again (A/B of SeaMask)
+        public bool DisableShoreWarp { get; set; } = false;                // the ocean's bands are sampled unwarped at the coast again (A/B of ShoreWarp)
 
          public System.Numerics.Matrix4x4 FrozenViewProjection { get; set; } // VP matrix when frustum frozen
     }
