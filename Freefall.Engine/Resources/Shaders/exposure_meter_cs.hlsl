@@ -98,7 +98,7 @@ float BodyVisible(float3 tap, float3 toLight, float open, float meshes, out floa
     if (toLight.y <= 0.0 || open <= 0.0)
         return 0.0;
     terrain = TerrainLightShadow(tap, toLight);
-    cloud = GetCloudShadow(MeterWrapSampler, tap - CamPos, toLight);
+    cloud = CloudBeam(MeterWrapSampler, tap - CamPos, toLight);       // the beam: what the clouds diffuse is in the sky's share
     return open * terrain * meshes * cloud;
 }
 
@@ -228,9 +228,11 @@ void CSMeter(uint gi : SV_GroupIndex)
         moonLux = any(A.MoonIlluminance > 0) ? Luma(A.MoonIlluminance * AtmTransmittanceToLight(A, posKm, A.MoonDirection)) : 0.0;
         sunHeight = saturate(A.SunDirection.y);
         moonHeight = saturate(A.MoonDirection.y);
-        // The ambient is E / π × Exposure (sky on level ground, the ground's bounce on a down-facing surface)
+        // The ambient is E / π × Exposure (sky on level ground, the ground's bounce on a down-facing surface). The sky's
+        // from the probe, as the surfaces get it: with the clouds in it, the deck's lit base instead of the blue sky it
+        // hides (the clouds' diffused light; the sun's share above is the beam only)
         float toLux = ATM_PI / max(Exposure, 1e-30);
-        skyLux = Luma(SkyAmbientLight()) * toLux;
+        skyLux = Luma(SkyAmbient(float3(0, 1, 0))) * toLux;
         groundLux = Luma(GroundBounceLight()) * toLux;
     }
 

@@ -112,11 +112,10 @@ float FogMeshSkyVisibility(AtmosphereParams A, float3 worldPos)
 // from the whole cloud base where the sky is seen; and the multiple scattering (the sky's light, in effect, dimmed under
 // a deck to the light the cloud base gives: CloudAirLight .z) there too
 float3 FroxelBodyLight(AtmosphereParams A, AtmMedium medium, bool moon, float3 posKm, float3 worldPos,
-                       float3 relPos, float3 V, float viewDepth, float3 lightDir, float open, float sky, float deckToLight,
-                       float skyDimming)
+                       float3 relPos, float3 V, float viewDepth, float3 lightDir, float open, float sky, float skyDimming)
 {
     float3 toLight = AtmTransmittanceToLight(A, posKm, lightDir);
-    float3 cloud = CloudAirLight(FogWrapSampler, relPos, lightDir, deckToLight, skyDimming);
+    float3 cloud = CloudAirLight(FogWrapSampler, relPos, lightDir, skyDimming);
     float visible = open * cloud.x;
     if (visible > 0.0 && any(toLight > 0.0))
     {
@@ -161,12 +160,12 @@ void CSFogScatter(uint3 id : SV_DispatchThreadID)
     float open = TerrainOpenAt(terrain, AtmosphereLinearClamp, worldPos, float3(0, 1, 0), TerrainTolerance(length(relPos)));
     float sky = open > 0.0 ? open * max(FogMeshSkyVisibility(A, worldPos), A.SkyCaptureBounce) : 0.0;
 
-    float4 deck = CloudDeck();      // the layer's mean density (x, y) and the clouds in front of the sun and the moon (z, w)
+    float skyDimming = CloudSkyDimming(CloudDeck());      // Ψ_ms under the clouds round the camera
     float3 L = A.SunIlluminance * FroxelBodyLight(A, medium, false, posKm, worldPos, relPos, V, viewDepth,
-                                                  A.SunDirection, open, sky, deck.z, CloudSkyDimming(deck.x));
+                                                  A.SunDirection, open, sky, skyDimming);
     if (any(A.MoonIlluminance > 0))
         L += A.MoonIlluminance * FroxelBodyLight(A, medium, true, posKm, worldPos, relPos, V, viewDepth,
-                                                 A.MoonDirection, open, sky, deck.w, CloudSkyDimming(deck.y));
+                                                 A.MoonDirection, open, sky, skyDimming);
     float4 current = float4(L * Exposure, dot(medium.extinction, 1.0 / 3.0));
 
     // Last frame's light at the froxel's centre: the grid moves with the camera, so the centre is found in last frame's

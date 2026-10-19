@@ -436,7 +436,7 @@ LipPSOutput PS_Lip(LipOutput input)
     float skyOpen = SkyVisibilityWith(worldPos, float3(0, 1, 0), 1.0);
     float skyVisible = skyOpen * (1.0 - LipTubeShade * input.Sheet.w);
     float3 sunRadiance = ocean.SunColor * ocean.SunIntensity * SunLightScale;
-    sunRadiance *= GetCloudShadow(OceanSampler, worldPos - camPos, L);
+    sunRadiance *= CloudBeam(OceanSampler, worldPos - camPos, L);     // the clouds' beam
 
 #if LIP_CLAY
     // Lambert from the sun, the sky by how much the face looks up; a dark terracotta (neither sand, foam nor water,

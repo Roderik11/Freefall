@@ -490,6 +490,7 @@ CloudMarchResult CloudMarchRay(CloudParams C, AtmosphereParams A, Texture3D<floa
     float3 lightDir = C.LightDir;
     float3 lightE = C.LightIsMoon != 0 ? A.MoonIlluminance : A.SunIlluminance;
     float cosTheta = dot(dir, lightDir);
+    float diffuseEntry = saturate(lightDir.y) / ATM_PI;     // the diffused light's radiance per unit of E (below)
     float phase[3];
     [unroll] for (int o = 0; o < 3; o++)
         phase[o] = CloudPhase(cosTheta, pow(0.5, o));
@@ -537,9 +538,13 @@ CloudMarchResult CloudMarchRay(CloudParams C, AtmosphereParams A, Texture3D<floa
             float beam = 0.0;
             [unroll] for (int o = 0; o < 3; o++)
                 beam += pow(0.5, o) * phase[o] * exp(-pow(0.5, o) * tau);
-            // Deep in a thick cloud the light has diffused: it falls as 1 / (1 + 0.75 (1 − g) τ) (two-stream, g 0.85), not
-            // exponentially, which is why an overcast deck's base is grey and not black
-            float scattered = beam * CloudInScatter(C, density, hp, cosTheta) + 1.0 / (4.0 * ATM_PI) / (1.0 + 0.1125 * tau);
+            // Deep in a thick cloud the light has diffused: it falls as 1 / (1 + 0.75 (1 − g) τ) (two-stream, g 0.85,
+            // sky_common.fx CloudThrough), not exponentially, which is why an overcast deck's base is grey and not black.
+            // Of the flux the light brings in through a deck's top, E × sin(its elevation), that share leaves the base as
+            // diffuse light: radiance CloudThrough × E sin / π. The ground, the air and the meter take the same share
+            // (CloudTransmission), so the base the sky probe sees lights the surfaces with what the ground's light says
+            // comes through. (Until stage 4: 1 / (4π), a base ~3× too dark at noon against that.)
+            float scattered = beam * CloudInScatter(C, density, hp, cosTheta) + CloudThrough(tau) * diffuseEntry;
 
             // The sky above and the lit ground below, as much of each as the cloud over and under this place leaves
             // (diffuse light gets deeper than a beam): bright tops, dark cores, the ground's warm light on the bases.

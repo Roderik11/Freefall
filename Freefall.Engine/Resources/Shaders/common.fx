@@ -28,9 +28,7 @@ cbuffer SceneConstants : register(b0)
     float CloudAltitude;               // cloud layer height above the camera in world units
     float CloudAltitudeFrom;           // altitude of the previous preset while a transition runs
     float CloudAltitudeBlend;          // 0 = show CloudAltitudeFrom, 1 = show CloudAltitude (cross-fade weight)
-    float CloudShadowStrength;         // 0 = no cloud shadows, 1 = dense cloud blocks the sun completely
     uint CloudNoiseLUTIdx;             // bindless index of the 3D cloud noise LUT (0 = none)
-    float CloudShadowScale;            // shadow pattern is this many times smaller than the visible clouds (1 = matching, km-sized)
 
     // ── Pick hole (set per view by DeferredRenderer from RequestPick's seeThrough) ──
     float2 PickPixel;                  // centre of the pixel the pick reads this frame

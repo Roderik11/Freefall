@@ -153,12 +153,6 @@ namespace Freefall.Components
         [ValueRange(0.005f, 0.2f)]
         public float CloudDensity = 0.05f;
 
-        [ValueRange(0f, 1f)]
-        public float CloudShadowStrength = 0.8f;    // How much sunlight the clouds block on the ground (0 = no cloud shadows)
-
-        [ValueRange(1f, 16f)]
-        public float CloudShadowScale = 1.0f;       // Shadow pattern is this many times smaller than the visible clouds (1 = shadows match the clouds in the sky)
-
         // Cross-fade state for altitude changes, driven by EnvironmentController. Altitude scales the
         // projected cloud pattern, so instead of lerping it the shader blends two cloud layers.
         [Freefall.Reflection.DontSerialize, System.ComponentModel.Browsable(false)]
@@ -175,8 +169,6 @@ namespace Freefall.Components
         public static float CurrentCloudAltitude { get; private set; } = 1800.0f;
         public static float CurrentCloudAltitudeFrom { get; private set; } = 1800.0f;
         public static float CurrentCloudAltitudeBlend { get; private set; } = 1.0f;
-        public static float CurrentCloudShadowStrength { get; private set; } = 0.0f;   // 0 until a skybox exists
-        public static float CurrentCloudShadowScale { get; private set; } = 1.0f;
         public static float CurrentCloudAlbedo { get; private set; } = 0.8f;
         public static uint CurrentCloudNoiseLUTIdx => _cloudNoiseLUT?.BindlessIndex ?? 0u;
 
@@ -234,7 +226,7 @@ namespace Freefall.Components
         {
             // Deferred: the sky draw of the frames in flight still references the mesh
             Engine.Device.DeferDispose(Mesh);
-            CurrentCloudShadowStrength = 0.0f;
+            CurrentCloudCoverage = 0.0f;     // no 2D layer, and none of its shadows, without a sky
             Clouds.Settings = CloudSettings.Default;
             Atmosphere.Settings = AtmosphereSettings.Default;
         }
@@ -312,8 +304,6 @@ namespace Freefall.Components
             CurrentCloudAltitude = CloudAltitude;
             CurrentCloudAltitudeFrom = CloudAltitudeFrom;
             CurrentCloudAltitudeBlend = CloudAltitudeBlend;
-            CurrentCloudShadowStrength = Enabled ? CloudShadowStrength : 0.0f;
-            CurrentCloudShadowScale = CloudShadowScale;
             CurrentCloudAlbedo = CloudAlbedo;
 
             UpdateSunLight(Camera.Main.Position.Y);
@@ -406,7 +396,6 @@ namespace Freefall.Components
                 MoonDirection = brightest >= 0 ? _moonLights[brightest].Direction : -SunDirection,
                 MoonIlluminance = brightest >= 0 ? _moonLights[brightest].Top : Vector3.Zero,
                 AirglowLuminance = AirglowLuminance,
-                CloudShade = Math.Clamp(1f - CurrentCloudShadowStrength * CloudCoverage, 0f, 1f),
                 RayleighScale = RayleighScale,
                 MieScale = MieScale,
                 MieAnisotropy = MieAnisotropy,
@@ -561,7 +550,6 @@ namespace Freefall.Components
             CloudSpeed = p.CloudSpeed;
             CloudAltitude = p.CloudAltitude;
             CloudAlbedo = p.CloudAlbedo;
-            CloudShadowStrength = p.CloudShadowStrength;
             CloudThickness = p.CloudThickness;
             CloudType = p.CloudType;
             CloudTowers = p.CloudTowers;
@@ -596,7 +584,6 @@ namespace Freefall.Components
             p.CloudSpeed = CloudSpeed;
             p.CloudAltitude = CloudAltitude;
             p.CloudAlbedo = CloudAlbedo;
-            p.CloudShadowStrength = CloudShadowStrength;
             p.CloudThickness = CloudThickness;
             p.CloudType = CloudType;
             p.CloudTowers = CloudTowers;

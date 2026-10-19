@@ -277,8 +277,8 @@ float4 PS(VSOutput input) : SV_Target
     // shadowFactor = min(shadowFactor, contactShadow);
     float contactShadow = 1.0; // disabled for now
 
-    // Cloud shadows: also reach past the last cascade (Sampler = linear wrap, s0)
-    shadowFactor *= GetCloudShadow(Sampler, worldPos.xyz, L);
+    // The clouds' beam: also past the last cascade (Sampler = linear wrap, s0)
+    shadowFactor *= CloudBeam(Sampler, worldPos.xyz, L);
 
     // Debug visualization modes
     if (DebugVisualizationMode == 1)

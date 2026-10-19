@@ -181,7 +181,7 @@ PSOutput PS(VSOutput input)
     float NdotL = saturate(dot(N, L));
     // Pre-exposed E / π of the directional light, as the deferred light has it; the specular takes E (× π)
     float3 sunRadiance = water.SunColor * water.SunIntensity * SunLightScale;
-    sunRadiance *= GetCloudShadow(WaterSampler, worldPos - camPos, L);
+    sunRadiance *= CloudBeam(WaterSampler, worldPos - camPos, L);     // the clouds' beam: no glint under a deck
     // The cascades, and the terrain's shadow past them (a mountain the sun stands behind), as the deferred light has them
     sunRadiance *= min(WaterSunShadow(ShadowMapIdx, worldPos - camPos, input.Position.xy), TerrainLightShadow(worldPos, L));
     sunRadiance *= TerrainOpen(worldPos, float3(0, 1, 0));   // a sea cave under a hill: no sun, whatever the shadow map holds

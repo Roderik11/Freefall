@@ -306,6 +306,7 @@ PSOutput PS(VSOutput input)
     }
     shadowFactor = min(shadowFactor, TerrainLightShadow(input.AbsWorldPos, L));   // the terrain past the cascades
     shadowFactor *= TerrainOpen(input.AbsWorldPos, N);   // under the terrain (a cave): no sun, as in light_directional_cs
+    shadowFactor *= CloudBeam(Sampler, input.WorldPos.xyz, L);   // the clouds' beam (Sampler: linear wrap, s0)
 
     // ── Combine lighting ──
     // Separate diffuse and specular: for transparent surfaces, specular is added

@@ -11,6 +11,8 @@
 #include "common.fx"
 #include "sky_common.fx"
 
+SamplerState TrailWrapSampler : register(s0);      // linear wrap (the clouds' volumes, ParticleLight)
+
 cbuffer PushConstants : register(b3)
 {
     uint  PointsIdx;     // DWORD 0   SRV: TrailPoint list
@@ -72,7 +74,7 @@ VSOutput VS(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
     TrailPoint p = Points[index];
     // Premultiplied: only the light scales. Lit: an albedo under the sky and the sun; else nits, pre-exposed as a light source
     float skyVisible = SkyVisibility(p.Position, float3(0, 1, 0));
-    p.Color.rgb *= (p.Flags & TRAIL_LIT) != 0 ? ParticleLight() * skyVisible : EmissiveExposure.xxx;
+    p.Color.rgb *= (p.Flags & TRAIL_LIT) != 0 ? ParticleLight(TrailWrapSampler, p.Position - CamPos, normalize(CamPos - p.Position), 0.0) * skyVisible : EmissiveExposure.xxx;
     output.SkyVisible = skyVisible;
 
     // A blade: the sheet is given, from the point (the tip's edge) to its other edge

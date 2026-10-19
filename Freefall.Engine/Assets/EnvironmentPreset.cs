@@ -123,10 +123,6 @@ namespace Freefall.Assets
         [ValueRange(0.005f, 0.2f)]
         public float CloudDensity = 0.05f;
 
-        [Description("How much sunlight the clouds block on the ground (0 = no cloud shadows)")]
-        [ValueRange(0f, 1f)]
-        public float CloudShadowStrength = 0.8f;
-
         // ── Exposure ──
 
         [Category("Exposure")]
@@ -192,7 +188,6 @@ namespace Freefall.Assets
             dest.CloudSpeed = L(a.CloudSpeed, b.CloudSpeed, t);
             dest.CloudAltitude = L(a.CloudAltitude, b.CloudAltitude, t);
             dest.CloudAlbedo = L(a.CloudAlbedo, b.CloudAlbedo, t);
-            dest.CloudShadowStrength = L(a.CloudShadowStrength, b.CloudShadowStrength, t);
             dest.CloudThickness = L(a.CloudThickness, b.CloudThickness, t);
             dest.CloudType = L(a.CloudType, b.CloudType, t);
             dest.CloudTowers = L(a.CloudTowers, b.CloudTowers, t);

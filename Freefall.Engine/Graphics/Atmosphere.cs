@@ -17,7 +17,6 @@ namespace Freefall.Graphics
         public Vector3 MoonDirection;       // toward the brightest moon
         public Vector3 MoonIlluminance;     // lux at the top of the atmosphere, its phase included
         public float AirglowLuminance;      // cd/m²: the faint glow of the upper air on a dark night
-        public float CloudShade;            // average share of the sunlight the clouds let through to the ground
 
         public float RayleighScale;         // 1 = Earth's air
         public float MieScale;              // 1 = Earth's average aerosols
@@ -36,7 +35,6 @@ namespace Freefall.Graphics
             MoonDirection = -Vector3.UnitY,
             MoonIlluminance = Vector3.Zero,
             AirglowLuminance = 2e-4f,
-            CloudShade = 1f,
             RayleighScale = 1f,
             MieScale = 1f,
             MieAnisotropy = 0.8f,
@@ -116,18 +114,23 @@ namespace Freefall.Graphics
         /// <c>Daylight</c> measures), read back from the GPU a few frames late.</summary>
         public static Vector3 SkyAmbientLegacy { get; private set; }
 
-        /// <summary>The cloud layer round the camera as the air takes it (atmosphere_cs.hlsl CSCloudDeck, sky_common.fx
-        /// CloudDeck), read back a few frames late: X, Y its mean density toward the sun / the brightest moon (the
-        /// sky-view's air below it), Z, W how much the sky's clouds hide the sun / the moon.</summary>
-        public static Vector4 CloudDeck { get; private set; }
+        /// <summary>The clouds round the camera as the ground and the air below them take them (atmosphere_cs.hlsl
+        /// CSCloudDeck, sky_common.fx CloudDeck), read back a few frames late, toward the light the clouds are lit by (the
+        /// sun, at night the brightest moon): X the mean beam over 16 km (e^−τ: the light as a direction), Y the mean of
+        /// all they let through (the beam and what they diffuse), Z the beam at the camera, W 1 when the light is the
+        /// moon. (1, 1, 1, 0) without clouds.</summary>
+        public static Vector4 CloudDeck { get; private set; } = new(1f, 1f, 1f, 0f);
+
+        /// <summary>The share of the daylight the clouds round the camera let through to the ground: <see cref="CloudDeck"/>'s Y.</summary>
+        public static float CloudThrough => Math.Clamp(CloudDeck.Y, 0f, 1f);
 
         /// <summary>For engine_stats: <see cref="CloudDeck"/>.</summary>
         public static object DescribeCloudDeck() => new
         {
-            sunDensity = CloudDeck.X,
-            moonDensity = CloudDeck.Y,
-            sunCover = CloudDeck.Z,
-            moonCover = CloudDeck.W,
+            meanBeam = CloudDeck.X,
+            meanThrough = CloudDeck.Y,
+            beamAtCamera = CloudDeck.Z,
+            light = CloudDeck.W > 0.5f ? "moon" : "sun",
         };
 
         /// <summary>Largest relative difference (0..1) between the CPU's transmittance toward the sun (which sets the
@@ -226,7 +229,7 @@ namespace Freefall.Graphics
             public Vector3 FogScattering; public float MieExpScale;
             public Vector3 FogExtinction; public float FogExpScale;
             public Vector3 GroundAlbedo; public float SunAngularRadius;
-            public Vector3 SunDirection; public float CloudShade;
+            public Vector3 SunDirection; public float _pad1;
             public Vector3 SunIlluminance; public float APMaxDepth;
             public Vector3 MoonDirection; public float _pad0;
             public Vector3 MoonIlluminance; public float AirglowLuminance;
@@ -315,7 +318,8 @@ namespace Freefall.Graphics
             {
                 var back = _readback[slot]!.ReadPtr<Vector4>();
                 SkyAmbientLegacy = new Vector3(back[2].X, back[2].Y, back[2].Z);
-                CloudDeck = back[4];
+                if (back[4] != Vector4.Zero)        // all 0: not written yet (Y, all the clouds let through, is never 0)
+                    CloudDeck = back[4];
                 CheckTransmittance(new Vector3(back[3].X, back[3].Y, back[3].Z), _cpuSunTransmittance[slot]);
             }
             _cpuSunTransmittance[slot] = TransmittanceToLight(cameraHeight, Settings.SunDirection);
@@ -340,7 +344,6 @@ namespace Freefall.Graphics
                 GroundAlbedo = s.GroundAlbedo,
                 SunAngularRadius = s.SunAngularRadius,
                 SunDirection = Vector3.Normalize(s.SunDirection),
-                CloudShade = Math.Clamp(s.CloudShade, 0f, 1f),
                 SunIlluminance = s.SunIlluminance,
                 APMaxDepth = APMaxDepth,
                 MoonDirection = Vector3.Normalize(s.MoonDirection),

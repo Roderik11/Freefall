@@ -235,7 +235,11 @@ float2 CloudSkyDepthAt(CloudParams C, uint level, float2 xz, float h, SamplerSta
 // The clouds' optical depth toward the light from a place (camera-relative): the light volume where the light's path
 // crosses the slab's base, or at the place itself inside the slab. The path's height rises with the planet's curvature:
 // h + s·L.y + s²/2R reaches the base at s = 2|c| / (L.y + sqrt(L.y² + 2|c|/R)), c = h − base, written without
-// cancellation. 0 for any other light than the one the volumes are made for (a moon by day lights nothing that shows).
+// cancellation. A crossing past the coarsest level (a light a degree or two over the horizon: 138 km for a 1.5 km base
+// at 0°) is drawn back to its edge, where the toroidal volumes would wrap onto other clouds: the clouds there toward the
+// light stand for the rest of the way (a deck that runs on keeps the light out, and at that angle every place round the
+// camera looks through nearly the same clouds). 0 for any other light than the one the volumes are made for
+// (sky_common.fx CloudTransmission uses the deck's means for that one).
 float CloudShadowDepth(CloudParams C, float3 rel, float3 toLight, SamplerState wrap)
 {
     if (dot(toLight, C.LightDir) < 0.99)
@@ -250,6 +254,12 @@ float CloudShadowDepth(CloudParams C, float3 rel, float3 toLight, SamplerState w
         h = C.SlabBottom + 1.0;
     }
     float dist = max(abs(q.x), abs(q.z));
+    float edge = C.Levels[CLOUD_LEVELS - 1].Reach * 0.95;
+    if (dist > edge)
+    {
+        q.xz *= edge / dist;
+        dist = edge;
+    }
     float blend;
     uint level = CloudLevelAt(C, dist, blend);
     float2 xz = C.CameraCloud + q.xz;

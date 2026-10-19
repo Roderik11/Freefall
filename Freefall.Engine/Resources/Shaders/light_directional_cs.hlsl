@@ -262,11 +262,15 @@ void CSDirectionalLight(uint3 dispatchThreadId : SV_DispatchThreadID)
     float terrainShadow = TerrainLightShadow(worldPos.xyz + CamPos, L);
     shadowFactor = min(shadowFactor, terrainShadow);
 
-    // Cloud shadows: also reach past the last cascade (Sampler = linear wrap, s0)
-    shadowFactor *= GetCloudShadow(Sampler, worldPos.xyz, L);
     // Under the terrain (a cave) the sun cannot reach, whatever the shadow map holds: its terrain pass follows the
     // camera and can miss the hill over a cave, and the sun came through between the cave kit's pieces
     shadowFactor *= TerrainOpen(worldPos.xyz + CamPos, normal);
+    // The clouds' beam (sky_common.fx CloudBeam), also past the last cascade (Sampler = linear wrap, s0): only the light
+    // that comes through as the sun's direction. What the clouds diffuse reaches the surface as the sky probe's ambient
+    // (the deck's lit base). The shadows of things near (localShadow) gate the shadow wrap below.
+    float localShadow = shadowFactor;
+    float cloudBeam = CloudBeam(Sampler, worldPos.xyz, L);
+    shadowFactor *= cloudBeam;
 
     // Debug visualization modes
     if (DebugVisualizationMode == 1)
@@ -388,8 +392,9 @@ void CSDirectionalLight(uint3 dispatchThreadId : SV_DispatchThreadID)
     }
 
     // Shadow wrap: light bounced in from the sunlit ground round a shadow; none in the terrain's shadow, which is
-    // hundreds of metres wide and holds the ground round it too
-    lighting += diffuse * LightColor * LightIntensity * NdotL * (1.0 - shadowFactor) * 0.12 * ao * skyVisibility * terrainShadow;
+    // hundreds of metres wide and holds the ground round it too, and × the clouds' beam: a cloud's shadow is kilometres
+    // wide and holds the surroundings as well (folded into the shadow, it raised the wrap under a cloud)
+    lighting += diffuse * LightColor * LightIntensity * NdotL * (1.0 - localShadow) * cloudBeam * 0.12 * ao * skyVisibility * terrainShadow;
 
     // Note: GI composition moved to separate pass (CSComposeGI in radiance_cascades.hlsl)
     // so RC trace can read direct-light-only without feedback loop

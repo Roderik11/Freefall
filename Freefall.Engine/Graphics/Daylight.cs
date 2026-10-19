@@ -7,8 +7,8 @@ namespace Freefall.Graphics
 {
     /// <summary>
     /// How much daylight reaches the ground, and whether lamps are lit. <see cref="Lamps"/> is the open ground's: lit when
-    /// the illuminance on level ground (<see cref="GroundIlluminance"/>, lux: the sun or moon through the air and the
-    /// clouds' average shade, plus the sky) falls below <see cref="LampsOnBelowLux"/>, out again above
+    /// the illuminance on level ground (<see cref="GroundIlluminance"/>, lux: the sun or moon through the air and the sky,
+    /// through the clouds round the camera) falls below <see cref="LampsOnBelowLux"/>, out again above
     /// <see cref="LampsOffAboveLux"/>, so a cloud passing at the mark does not blink them. Materials marked
     /// EmissiveWhenDark follow it. Lights marked PointLight.OnlyWhenDark use the same thresholds on the daylight where
     /// each one hangs, past the terrain and the meshes round it (point_light_lamps.hlsl): a lamp in a closed room or a
@@ -87,8 +87,9 @@ namespace Freefall.Graphics
         }
 
         /// <summary>
-        /// Lux on a surface facing the directional light (the sun, or at night the brightest moon) after the air,
-        /// through the clouds' average shade (coverage × cloud shadow strength). 0 without an enabled directional light.
+        /// Lux on a surface facing the directional light (the sun, or at night the brightest moon) after the air and the
+        /// clouds round the camera: the share they let through, beam and diffused (<see cref="Atmosphere.CloudThrough"/>,
+        /// read back from the GPU a few frames late). 0 without an enabled directional light.
         /// </summary>
         public static float SunIlluminance()
         {
@@ -97,22 +98,22 @@ namespace Freefall.Graphics
                 if (!sun.Enabled) continue;
                 // Intensity is lux × ReferenceExposure / π (SkyboxRenderer)
                 float normal = sun.Intensity * MathF.PI / Atmosphere.ReferenceExposure * Luminance(sun.Color.R, sun.Color.G, sun.Color.B);
-                float clouds = Math.Clamp(1f - SkyboxRenderer.CurrentCloudShadowStrength * SkyboxRenderer.CurrentCloudCoverage, 0f, 1f);
-                return normal * clouds;
+                return normal * Atmosphere.CloudThrough;
             }
             return 0f;
         }
 
         /// <summary>
-        /// Lux from the whole sky on level ground (sky_common.fx's SkyAmbientLight × π), read back from the atmosphere's
-        /// ambient pass a few frames late. 0 without a sky.
+        /// Lux from the whole sky on level ground (sky_common.fx's SkyAmbientLight × π, the cloudless sky) through the clouds
+        /// round the camera (<see cref="Atmosphere.CloudThrough"/>), read back from the atmosphere's passes a few frames
+        /// late. 0 without a sky.
         /// </summary>
         public static float SkyIlluminance()
         {
             if (ComponentCache<SkyboxRenderer>.All.Count == 0)
                 return 0f;
             var sky = Atmosphere.SkyAmbientLegacy;
-            return Luminance(sky.X, sky.Y, sky.Z) * MathF.PI / Atmosphere.ReferenceExposure;
+            return Luminance(sky.X, sky.Y, sky.Z) * MathF.PI / Atmosphere.ReferenceExposure * Atmosphere.CloudThrough;
         }
 
         private static float Luminance(float r, float g, float b) => 0.2126f * r + 0.7152f * g + 0.0722f * b;

@@ -203,7 +203,7 @@ PSOutput PS(DSOutput input)
     // sends back, as in the deferred light (E / π). The specular BRDF takes the illuminance itself (× π): until
     // 2026-10-17 it got this radiance, and the water's sun was π times weaker than the deferred one.
     float3 sunRadiance = ocean.SunColor * ocean.SunIntensity * SunLightScale;
-    sunRadiance *= GetCloudShadow(OceanSampler, worldPos - camPos, L);
+    sunRadiance *= CloudBeam(OceanSampler, worldPos - camPos, L);     // the clouds' beam: no glint under a deck
     // The cascades, and the terrain's shadow past them (a headland the sun stands behind), as the deferred light has them
     sunRadiance *= min(WaterSunShadow(ShadowMapIdx, worldPos - camPos, input.Position.xy), TerrainLightShadow(worldPos, L));
     sunRadiance *= TerrainOpen(worldPos, float3(0, 1, 0));   // a sea cave under a hill: no sun, whatever the shadow map holds

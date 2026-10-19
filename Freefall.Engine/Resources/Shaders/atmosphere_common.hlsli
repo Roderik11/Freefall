@@ -36,7 +36,7 @@ struct AtmosphereParams
     float3 FogScattering;       float MieExpScale;         // ground fog: a thin aerosol layer near the ground
     float3 FogExtinction;       float FogExpScale;
     float3 GroundAlbedo;        float SunAngularRadius;    // radians
-    float3 SunDirection;        float CloudShade;          // average sunlight the clouds let through to the ground (0..1)
+    float3 SunDirection;        float _pad1;
     float3 SunIlluminance;      float APMaxDepth;          // lux at the top of the atmosphere (colour × lux); metres
     float3 MoonDirection;       float _pad0;
     float3 MoonIlluminance;     float AirglowLuminance;    // lux (phase and colour included); cd/m² of the night sky

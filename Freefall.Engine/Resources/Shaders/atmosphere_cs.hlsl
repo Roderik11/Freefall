@@ -253,12 +253,14 @@ void CSSkyView(uint3 id : SV_DispatchThreadID)
     float viewZenithSin = sqrt(saturate(1.0 - viewZenithCos * viewZenithCos));
     float3 dir = float3(viewZenithSin * lightViewCos, viewZenithCos, viewZenithSin * sqrt(saturate(1.0 - lightViewCos * lightViewCos)));
 
-    // The air below the cloud layer (the sky dome's plane, CloudAltitude over the camera) lies in its shade. The LUT knows
-    // a direction only (and the light's angle from it, not its side), so the shade is the layer's mean round the camera
-    // (CloudDeck): under a deck the haze toward the sun no longer glowed as if the sun shone through the clouds.
-    float deckDensity = id.z == 0 ? CloudDeck().x : CloudDeck().y;
-    float4 deck = float4(viewHeight - A.BottomRadius + CloudAltitude * 0.001, 1.0 - deckDensity,
-                         (1.0 - CloudShadowStrength) * deckDensity, 1.0 - CloudSkyDimming(deckDensity));
+    // The air below the clouds lies in their shade. The LUT knows a direction only (and the light's angle from it, not its
+    // side), so the shade is the deck's mean round the camera (CloudDeck: its beam, and the rest of what it lets through
+    // diffused), for either light: under a deck the haze toward the sun no longer glows as if the sun shone through the
+    // clouds. Below the volumetric clouds' base (a flat plane at its height above sea level, as the sky dome's layer
+    // is flat), else the 2D layer's plane CloudAltitude over the camera.
+    float4 cloudDeck = CloudDeck();
+    float deckHeight = CloudParamsIdx != 0 ? LoadClouds().Base * 0.001 : viewHeight - A.BottomRadius + CloudAltitude * 0.001;
+    float4 deck = float4(deckHeight, cloudDeck.x, max(cloudDeck.y - cloudDeck.x, 0.0), 1.0 - CloudSkyDimming(cloudDeck));
 
     float3 pos = float3(0, viewHeight, 0);
     ScatteringResult r = IntegrateScatteredLuminance(A, pos, dir, lightDir, false, 32.0, true, true, 9000000.0, deck);
@@ -354,8 +356,7 @@ void CSAerialPerspective(uint3 id : SV_DispatchThreadID)
     float sunMie = AtmMiePhase(A.MieG, sunCos), sunRayleigh = AtmRayleighPhase(sunCos);
     float moonMie = AtmMiePhase(A.MieG, moonCos), moonRayleigh = AtmRayleighPhase(moonCos);
     bool moonLit = any(A.MoonIlluminance > 0);
-    float4 deck = CloudDeck();      // the layer's mean density (x, y) and the clouds in front of the sun and the moon (z, w)
-    float sunSkyDimming = CloudSkyDimming(deck.x), moonSkyDimming = CloudSkyDimming(deck.y);
+    float skyDimming = CloudSkyDimming(CloudDeck());
 
     float3 L = 0;               // × the illuminances
     float3 throughput = 1.0;
@@ -386,7 +387,7 @@ void CSAerialPerspective(uint3 id : SV_DispatchThreadID)
                 // The cloud layer at the step's middle (the near fog volume's own CloudAirLight, so the two meet at
                 // its range without a seam)
                 float3 relMid = worldMid - CamPos;
-                float3 sunCloud = CloudAirLight(CloudWrapSampler, relMid, A.SunDirection, deck.z, sunSkyDimming);
+                float3 sunCloud = CloudAirLight(CloudWrapSampler, relMid, A.SunDirection, skyDimming);
                 float3 S = A.SunIlluminance * APSampleLight(A, medium, P, up, pHeight, sunLit, sunCloud, A.SunDirection,
                                                             sunMie, sunRayleigh);
                 if (moonLit)
@@ -395,7 +396,7 @@ void CSAerialPerspective(uint3 id : SV_DispatchThreadID)
                     endMargin = AtmTerrainLightMargin(A, worldEnd, true);
                     float moonShare = 0.5 * (APLitShare(moonMargin, midMargin) + APLitShare(midMargin, endMargin));
                     moonMargin = endMargin;
-                    float3 moonCloud = CloudAirLight(CloudWrapSampler, relMid, A.MoonDirection, deck.w, moonSkyDimming);
+                    float3 moonCloud = CloudAirLight(CloudWrapSampler, relMid, A.MoonDirection, skyDimming);
                     S += A.MoonIlluminance * APSampleLight(A, medium, P, up, pHeight, moonShare, moonCloud,
                                                            A.MoonDirection, moonMie, moonRayleigh);
                 }
@@ -416,7 +417,8 @@ void CSAerialPerspective(uint3 id : SV_DispatchThreadID)
 
 // ── Ambient: the sky's light on an up-facing surface, and the ground's bounce light on a down-facing one ──
 // Ambient[0].rgb: sky (E_up / π × Exposure: a multiple of albedo, what the pixel stores)
-// Ambient[1].rgb: ground (GroundAlbedo × (direct light on the ground + E_up) / π × Exposure)
+// Ambient[1].rgb: ground (GroundAlbedo × (direct light on the ground + E_up) × what the clouds round the camera let
+//                 through (CloudDeck().y) / π × Exposure)
 // Ambient[2].rgb: sky in the engine's older units (Ambient[0] / SunLightScale), read back for Graphics.Daylight
 // Ambient[3].rgb: transmittance toward the sun from the camera (LUT), read back for the CPU/GPU consistency check
 
@@ -463,67 +465,69 @@ void CSAmbient(uint3 id : SV_DispatchThreadID)
 
     float3 skyUp = SkyIrradianceShared[0];   // lux on an up-facing surface from the sky
 
-    // Direct light on flat ground: the sun and the moon through the air (0 below the horizon), the clouds' average shade
+    // Direct light on flat ground: the sun and the moon through the air (0 below the horizon). The ground round the camera
+    // gets it and the sky's through the clouds: the mean of what they let through there, beam and diffused (CSCloudDeck
+    // ran first this frame). The sky's own light (Ambient[0]) stays the cloudless sky's: it lights the clouds' tops.
     float3 direct = A.SunIlluminance * AtmTransmittanceToLight(A, pos, A.SunDirection) * saturate(A.SunDirection.y)
                   + A.MoonIlluminance * AtmTransmittanceToLight(A, pos, A.MoonDirection) * saturate(A.MoonDirection.y);
-    direct *= A.CloudShade;
+    float through = saturate(CloudDeck().y);
 
     RWStructuredBuffer<float4> output = ResourceDescriptorHeap[AmbientUAVIdx];
     float3 sky = skyUp / ATM_PI * Exposure;
     output[0] = float4(sky, 0);
-    output[1] = float4(A.GroundAlbedo * (direct + skyUp) / ATM_PI * Exposure, 0);
+    output[1] = float4(A.GroundAlbedo * (direct + skyUp) * through / ATM_PI * Exposure, 0);
     output[2] = float4(sky / max(SunLightScale, 1e-20), 0);
     // The LUT's transmittance toward the sun from the camera: Atmosphere.CheckTransmittance holds it against the CPU's
     output[3] = float4(AtmTransmittanceToLight(A, pos, A.SunDirection), 0);
 }
 
-// ── The cloud layer round the camera (sky_common.fx CloudDeck), into the Ambient buffer's element 4 ──
-// x, y: the layer's mean shadow density toward the sun / the brightest moon over CLOUD_DECK_RADIUS round the camera, 256
-// places on a sunflower spiral (the sky-view LUT lights its air below the layer alike in every direction); z, w: the
-// sky's clouds in front of the sun / the moon, as the sky dome hides their discs (CloudSunDiscCover; the moon's
-// 1 − exp(−15 × density)). Below 17° the
-// light's x, y fade into its z, w, as CloudAirLight fades: the stretched shadow pattern is no use there, the clouds in
-// front of the light tell whether a deck hides it (a deck runs on to the horizon, a broken layer leaves it clear).
-// Dispatched first in Atmosphere.Render (the sky-view and the AP read it); 0 without clouds.
+// ── The clouds round the camera (sky_common.fx CloudDeck), into the Ambient buffer's element 4 ──
+// Toward the light the clouds are lit by (the volumetric clouds' CloudParams.LightDir: the sun, at night the brightest
+// moon; for the 2D layer the sun while it is above 3°, else the moon): x the mean beam and y the mean of all they let
+// through (beam and diffused, CloudThrough) over CLOUD_DECK_RADIUS round the camera, 256 places on a sunflower spiral at
+// the camera's height; z the beam at the camera; w 1 for the moon. (1, 1, 1, 0) without clouds. The means stand for the
+// clouds wherever one place will not do: the sky-view LUT's air below them (alike in every direction), the ground's light
+// round the camera (CSAmbient, Daylight), the light a moon gets through them by day.
+// Dispatched first in Atmosphere.Render (the sky-view, the AP and CSAmbient read it).
 
-#define CLOUD_DECK_RADIUS 16000.0       // metres; the shadow pattern's largest octave repeats every ~11 km
+#define CLOUD_DECK_RADIUS 16000.0       // metres
 
 groupshared float2 CloudDeckShared[64];
 
-float CloudCoverToward(float3 lightDir, bool sun)
+// The clouds' optical depth toward the light they are lit by (never the deck's means, which this pass makes)
+float CloudDeckDepth(float3 relPos, float3 lightDir)
 {
-    // The volumetric clouds: what their optical depth from the camera toward the light hides
     if (CloudParamsIdx != 0)
-        return 1.0 - exp(-CloudShadowDepth(LoadClouds(), float3(0, 0, 0), lightDir, CloudWrapSampler));
-    float3 dir = normalize(float3(lightDir.x, max(lightDir.y, 0.002), lightDir.z));     // at or under the horizon: its clouds
-    float density = GetCloudsAt(CloudWrapSampler, dir, CloudAltitude, 0.0);
-    if (CloudAltitudeBlend < 0.999)
-        density = lerp(GetCloudsAt(CloudWrapSampler, dir, CloudAltitudeFrom, 0.0), density,
-                       smoothstep(0.0, 1.0, saturate(CloudAltitudeBlend)));
-    return sun ? CloudSunDiscCover(density) : 1.0 - exp(-15.0 * density);
+        return CloudShadowDepth(LoadClouds(), relPos, lightDir, CloudWrapSampler);
+    return CloudLayerDepth(CloudWrapSampler, relPos, lightDir);
 }
 
 [numthreads(64, 1, 1)]
 void CSCloudDeck(uint3 id : SV_DispatchThreadID)
 {
     AtmosphereParams A = LoadAtmosphere();
-    bool clouds = CloudShadowStrength > 0.0 && CloudNoiseLUTIdx != 0;
-    bool moonLit = any(A.MoonIlluminance > 0);
+    bool moon;
+    float3 lightDir;
+    if (CloudParamsIdx != 0)
+    {
+        CloudParams C = LoadClouds();
+        lightDir = C.LightDir;
+        moon = C.LightIsMoon != 0;
+    }
+    else
+    {
+        moon = A.SunDirection.y <= 0.05 && any(A.MoonIlluminance > 0);
+        lightDir = moon ? A.MoonDirection : A.SunDirection;
+    }
 
     float2 sum = 0;
-    if (clouds)
+    for (uint k = 0; k < 4; k++)
     {
-        for (uint k = 0; k < 4; k++)
-        {
-            uint n = id.x * 4 + k;
-            float r = sqrt((n + 0.5) / 256.0) * CLOUD_DECK_RADIUS;
-            float phi = n * 2.3999632;      // the golden angle
-            float3 relPos = float3(r * cos(phi), 0.0, r * sin(phi));
-            if (A.SunDirection.y > 0.05)
-                sum.x += CloudShadowDensity(CloudWrapSampler, relPos, A.SunDirection);
-            if (moonLit && A.MoonDirection.y > 0.05)
-                sum.y += CloudShadowDensity(CloudWrapSampler, relPos, A.MoonDirection);
-        }
+        uint n = id.x * 4 + k;
+        float r = sqrt((n + 0.5) / 256.0) * CLOUD_DECK_RADIUS;
+        float phi = n * 2.3999632;      // the golden angle
+        float tau = CloudDeckDepth(float3(r * cos(phi), 0.0, r * sin(phi)), lightDir);
+        sum += float2(exp(-tau), CloudThrough(tau));
     }
     CloudDeckShared[id.x] = sum;
     GroupMemoryBarrierWithGroupSync();
@@ -539,14 +543,5 @@ void CSCloudDeck(uint3 id : SV_DispatchThreadID)
         return;
 
     RWStructuredBuffer<float4> output = ResourceDescriptorHeap[AmbientUAVIdx];
-    if (!clouds)
-    {
-        output[4] = 0;
-        return;
-    }
-    float2 mean = CloudDeckShared[0] / 256.0;
-    float sunCover = CloudCoverToward(A.SunDirection, true);
-    float moonCover = moonLit ? CloudCoverToward(A.MoonDirection, false) : 0.0;
-    output[4] = float4(lerp(sunCover, mean.x, smoothstep(0.05, 0.3, A.SunDirection.y)),
-                       lerp(moonCover, mean.y, smoothstep(0.05, 0.3, A.MoonDirection.y)), sunCover, moonCover);
+    output[4] = float4(CloudDeckShared[0] / 256.0, exp(-CloudDeckDepth(float3(0, 0, 0), lightDir)), moon ? 1.0 : 0.0);
 }
