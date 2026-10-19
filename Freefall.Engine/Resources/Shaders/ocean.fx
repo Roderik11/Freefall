@@ -365,6 +365,65 @@ float2 SurfRollerTrail(float phase)
     return float2(roller, trail);
 }
 
+// How far into its backwash the swash is (0 at the top of the run-up, 1 as the next bore arrives), -1 while it runs up
+float SwashBackwash(float phase)
+{
+    float cycle = frac(1.0 - phase / 6.2831853);
+    return cycle < SurgeRise ? -1.0 : (cycle - SurgeRise) / (1.0 - SurgeRise);
+}
+
+float2 Hash22(float2 p)
+{
+    p = float2(dot(p, float2(127.1, 311.7)), dot(p, float2(269.5, 183.3)));
+    return frac(sin(p) * 43758.5453);
+}
+
+// Animated cellular noise for foam webs: the net of bubble films a thinning foam sheet breaks into. The look only: where
+// and when it shows is the waves' (the backwash of each wave's swash, the thinning trail of the surf). Returns
+// (F2 - F1, F1): x is 0 on the border between two cells and grows toward the cell centers; y is the distance to the
+// nearest center, largest where several cells meet (used to thicken the knots). The feature points orbit with time, so
+// the web shifts and reconnects in place. The cells are stretched along flowDir through the distance metric only — the
+// grid itself stays world-aligned, so a flow direction that changes across the beach cannot shear the pattern. On its
+// own this is straight-edged Voronoi: warp the input to bend it.
+// drop (0..~0.65) is the fraction of points retired: raise it over the foam's life to make the cells grow.
+float2 FoamWeb(float2 x, float2 flowDir, float stretch, float time, float drop)
+{
+    float2 cell = floor(x);
+    float2 f = frac(x);
+    float d1 = 64.0, d2 = 64.0;
+
+    [unroll]
+    for (int j = -2; j <= 2; ++j)
+    {
+        [unroll]
+        for (int i = -2; i <= 2; ++i)
+        {
+            float2 g = float2(i, j);
+            float2 h = Hash22(cell + g);
+
+            float2 o = 0.5 + 0.48 * sin(time + 6.2831853 * h);
+            float2 r = g + o - f;
+
+            float along = dot(r, flowDir);
+            float2 rr = (r - flowDir * along) + flowDir * (along / stretch);
+            float d = dot(rr, rr);
+
+            // Each point retires once 'drop' passes its own random threshold. Its distance is pushed
+            // out gradually, so its cell shrinks away and the neighbours grow into the space — cells
+            // of very different sizes, and a web that coarsens smoothly as drop rises (no popping,
+            // and no zooming of the pattern, which would make it slide across the beach).
+            float retire = frac(h.x * 13.7 + h.y * 91.3);
+            float gone = smoothstep(retire - 0.1, retire + 0.1, drop);
+            d += gone * gone * 6.0;
+
+            if (d < d1) { d2 = d1; d1 = d; }
+            else if (d < d2) { d2 = d; }
+        }
+    }
+    d1 = sqrt(d1);
+    return float2(sqrt(d2) - d1, d1);
+}
+
 // The water stands no higher over the seabed than a breaking wave allows (a wave breaks at about 0.78 × the depth from
 // trough to crest, its crest some 0.6 × the depth over the still level) and sinks no lower than 0.8 × the depth. Soft,
 // with what it leaves of the slopes (d limited / d height). The surf's shoaling waves would otherwise rise into walls.
@@ -961,6 +1020,7 @@ PSOutput PS(DSOutput input)
     // ran on a clock: bands crossing the swash zone on a noise-staggered schedule (ShoreClock), a hash per wave
     // (WaveStrength), a drifting Voronoi web (FoamWeb) and streaks, none of it a wave.
     float surfFoam = 0.0;
+    float surfTrailWeb = 0.0;     // how much thinning trail there is, for the web (below)
     if (ocean.ShoreWarpSRV != 0 && shoreDepth < 1e3)
     {
         float breaking = SurfBreaking(surfWave, shoreDepth);
@@ -980,6 +1040,9 @@ PSOutput PS(DSOutput input)
         surfFoam *= smoothstep(SURF_FOAM_END.x, SURF_FOAM_END.y, shoreDepth);
         surfFoam = saturate((saturate(surfFoam) - WHITECAP_THIN) / WHITECAP_RAMP);
         surfFoam *= saturate(1.0 - dist / 3000.0);
+        // The trail as it thins, away from the roller: the web takes it over
+        surfTrailWeb = saturate(trail * 1.4) * (1.0 - saturate(roller * 2.0))
+                     * smoothstep(SURF_FOAM_END.x, SURF_FOAM_END.y, shoreDepth);
     }
 
     // The waterline: foam gathers where the water meets the sand, a rock or a pier, a ragged band that swells and pinches
@@ -987,6 +1050,7 @@ PSOutput PS(DSOutput input)
     // builds a COVERAGE value, eroded by a cellular foam texture so the edge breaks up into bubbles.
     float coverage = 0.0;
     float foamTex = 0.5;
+    float streakFoam = 0.0;
     if (ocean.NoiseSRV != 0)
     {
         Texture2D<float4> noiseTex = ResourceDescriptorHeap[ocean.NoiseSRV];
@@ -997,6 +1061,7 @@ PSOutput PS(DSOutput input)
         // The beach's steepness from the heightmap, over a 3 m baseline so it stays smooth: it converts the edge's width
         // along the beach into water depth, so the edge is as wide on a steep shore as on a flat one
         float beachSlope = 0.1;
+        float2 downhill = float2(0.0, 1.0);
         float laceDepth = min(bedDepth, bufDepth);
         bool hasBeach = ocean.HeightmapSRV != 0 && terrainDepth < 999.0;
         if (hasBeach && laceDepth < 1.0)
@@ -1008,7 +1073,9 @@ PSOutput PS(DSOutput input)
               - heightmap.SampleLevel(OceanSampler, clampedUV - float2(slopeStep.x, 0), 0),
                 heightmap.SampleLevel(OceanSampler, clampedUV + float2(0, slopeStep.y), 0)
               - heightmap.SampleLevel(OceanSampler, clampedUV - float2(0, slopeStep.y), 0));
-            beachSlope = clamp(length(uphill) * ocean.MaxTerrainHeight / 6.0, 0.03, 1.0);
+            float steepness = length(uphill);
+            downhill = -uphill / max(steepness, 1e-6);
+            beachSlope = clamp(steepness * ocean.MaxTerrainHeight / 6.0, 0.03, 1.0);
         }
         static const float LaceWidth = 0.7;      // meters along the beach, before the variation
         float lace = 1.0 - smoothstep(0.0, min(LaceWidth * edgeWidth * beachSlope, 0.7), laceDepth);
@@ -1033,6 +1100,71 @@ PSOutput PS(DSOutput input)
         float cells1 = noiseTex.SampleLevel(OceanSampler, foamPos * 0.23 + t * float2(0.010, 0.006), 0).g;
         float cells2 = noiseTex.SampleLevel(OceanSampler, foamPos * 0.83 - t * float2(0.013, 0.004), 0).g;
         foamTex = saturate((cells1 * 0.6 + cells2 * 0.4 - 0.15) / 0.6);
+
+        // The web (FoamWeb): the net of bubble films foam breaks into as it thins, where and when the waves leave thin
+        // foam: the film of each wave's backwash draining off the sand, strongest at the top of its run-up and gone by
+        // the time the next bore arrives, and the thinning trail behind the surf's broken crests. Its look only is
+        // made up; until 2026-10-19 a clock decided when it showed too, and it went with the clock that day. Only near
+        // the camera: far away the cells would only alias
+        float film = 0.0;
+        float rise = 1.0;
+        if (ocean.ShoreWarpSRV != 0 && hasBeach)
+        {
+            float2 share = SurfShare(surfWave);
+            float age0 = SwashBackwash(surfWave.phase.x), age1 = SwashBackwash(surfWave.phase.y);
+            float fresh = (age0 < 0.0 ? 0.0 : 1.0 - smoothstep(0.1, 0.9, age0)) * share.x
+                        + (age1 < 0.0 ? 0.0 : 1.0 - smoothstep(0.1, 0.9, age1)) * share.y;
+            film = fresh * (1.0 - smoothstep(0.0, max(0.15, ocean.ShoreSurge * 1.5), bedDepth));   // in thin water only
+            rise = SwashRise(surfWave.phase.x) * share.x + SwashRise(surfWave.phase.y) * share.y;
+        }
+        float webAmount = max(film, surfTrailWeb) * (1.0 - saturate(dist / 150.0));
+        if (webAmount > 0.01)
+        {
+            // It floats on the water: the backwash's film is carried down the beach as the water drains and back up with
+            // the next bore (a bounded shift that follows the swash, so a flow that bends along the coast cannot shear
+            // it), the trail's is stretched along the waves' heading
+            bool backwash = film >= surfTrailWeb;
+            float2 flowDir = backwash ? downhill : SurfHeading(surfWave);
+            float swashZone = 1.0 - smoothstep(0.0, 2.0 * SWASH_DEPTH, stillDepth);
+            float waterTravel = min(2.0 * ocean.ShoreSurge / beachSlope, 8.0) * 0.6 * swashZone;
+            float2 webBase = foamPos - flowDir * (backwash ? waterTravel * (1.0 - rise) : 0.0);
+
+            const float webCellSize = 0.95;    // meters across a cell (before stretching and merging)
+            const float webStretch = 2.0;      // cells are this much longer along the flow
+            const float webRate = 0.9;         // how fast the cell points drift (radians per second of wave time)
+            const float webDrop = 0.33;        // a fixed third of the points retired, for uneven cell sizes
+
+            // Bend the space first: a large slow warp squeezes some regions and opens others (uneven cell sizes), a
+            // medium one curves the strands, a little fine wobble roughens them
+            float2 warpUV = webBase * 0.19;
+            float2 bigWarp = float2(noiseTex.SampleLevel(OceanSampler, warpUV * 0.31 + 0.27, 0).r,
+                                    noiseTex.SampleLevel(OceanSampler, warpUV * 0.31 + 0.83, 0).r) - 0.5;
+            float2 warp = float2(noiseTex.SampleLevel(OceanSampler, warpUV + t * 0.006, 0).r,
+                                 noiseTex.SampleLevel(OceanSampler, warpUV + 0.43 - t * 0.005, 0).r) - 0.5;
+            float2 wobble = float2(noiseTex.SampleLevel(OceanSampler, warpUV * 2.9 + 0.11, 0).a,
+                                   noiseTex.SampleLevel(OceanSampler, warpUV * 2.9 + 0.71, 0).a) - 0.5;
+            float2 webPos = webBase + bigWarp * 4.5 + warp * 1.8 + wobble * 0.12;
+
+            // A soft mask, 1 on a strand's centre line, swelling into knots where cells meet (thin hard lines of even
+            // brightness read as drawn cracks), with a finer, fainter web inside the cells
+            float2 web = FoamWeb(webPos / webCellSize, flowDir, webStretch, t * webRate, webDrop);
+            float webLace = saturate(1.0 - web.x / (0.09 + 0.17 * smoothstep(0.4, 0.9, web.y)));
+            float2 fine = FoamWeb(webPos / (webCellSize * 0.4) + 17.3, flowDir, webStretch, t * webRate * 1.3, webDrop);
+            webLace = max(webLace, saturate(1.0 - fine.x / 0.11) * 0.6 * smoothstep(0.2, 0.55, web.x));
+
+            // Patchy: it thins out and tears open in places instead of covering the water evenly
+            float patches = noiseTex.SampleLevel(OceanSampler, webBase * 0.06 - t * 0.004, 0).b;
+            webLace *= lerp(0.25, 1.0, smoothstep(0.38, 0.62, patches));
+
+            // Strands are made of bubbles: the fine cells erode the soft mask, so the cores stay solid and the edges
+            // break into ragged clusters (cells ~7 cm; flattened before they start to shimmer)
+            float bubbles = noiseTex.SampleLevel(OceanSampler, webBase * 1.75 - t * float2(0.013, 0.004), 0).g;
+            bubbles = lerp(saturate((bubbles - 0.15) / 0.55), 0.5, saturate(dist / 45.0));
+            float webFoam = saturate((webLace * 1.35 - (1.0 - bubbles) * 0.75) * 2.2);
+
+            // Translucent filaments, lightly broken up by the fine cells
+            streakFoam = webFoam * webAmount * 0.85 * lerp(0.75, 1.0, cells2) * ocean.ShoreFoam;
+        }
     }
 
     // Thin foam is translucent, thick foam keeps the cell structure as shading.
@@ -1045,6 +1177,7 @@ PSOutput PS(DSOutput input)
     // edges looked like paper), solid where it is thick; far away as it is (the lace's fade is for thin lines)
     float surfNear = saturate((surfFoam * 1.3 - (1.0 - foamTex)) * 2.0);
     foam = max(foam, lerp(surfNear, surfFoam, foamFar));
+    foam = max(foam, streakFoam * (1.0 - foamFar));   // the web of thinning foam
     float thickness = saturate(max(coverage, surfFoam));
 
     // Always feather the last few centimeters of water: whatever the foam pattern, it must not end
