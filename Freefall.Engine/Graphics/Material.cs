@@ -564,9 +564,13 @@ namespace Freefall.Graphics
         {
             if (effect == null || effect == Effect) return;
 
-            // Dispose old GPU state
-            foreach (var cb in _constantBuffers.Values)
-                cb.Dispose();
+            // Release the old GPU state deferred, as RebuildFromEffect does: frames in flight may still use it. Only the
+            // native PSOs: their root signature is the device's shared one
+            var device = Freefall.Engine.Device;
+            foreach (var cb in _constantBuffers.Values) device.DeferDispose(cb);
+            foreach (var pso in _passPipelineStates.Values) device.DeferDispose(pso.Native);
+            foreach (var pso in _passWireframePSOs.Values) device.DeferDispose(pso.Native);
+            foreach (var pso in _passCapturePSOs.Values) device.DeferDispose(pso.Native);
             _constantBuffers.Clear();
             _passPipelineStates.Clear();
             _passWireframePSOs.Clear();
@@ -1416,8 +1420,14 @@ namespace Freefall.Graphics
                 newCapacity = (int)Math.Pow(2, Math.Ceiling(Math.Log2(newCapacity)));
                 
                 int newBufferSize = newCapacity * System.Runtime.InteropServices.Marshal.SizeOf<MaterialData>();
-                
-                _materialsBuffer?.Dispose();
+
+                // Frames in flight still read the old buffer through the slot they recorded: released deferred,
+                // and the new buffer gets a slot of its own. Disposed at once and its slot rewritten in place, a
+                // material count passing a power of two (a scene load, materials made on a shader hot reload)
+                // removed the device (DXGI_ERROR_DEVICE_HUNG, 2026-10-19)
+                if (_materialsBuffer != null) device.DeferDispose(_materialsBuffer);
+                if (_materialsBufferBindlessIndex != 0) device.DeferReleaseBindlessIndex(_materialsBufferBindlessIndex);
+                _materialsBufferBindlessIndex = 0;
                 _materialsBuffer = device.NativeDevice.CreateCommittedResource(
                     new HeapProperties(HeapType.Upload),
                     HeapFlags.None,
