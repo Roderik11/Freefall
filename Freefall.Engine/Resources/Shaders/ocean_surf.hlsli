@@ -661,8 +661,11 @@ float LipStripAmount(OceanData ocean, float2 xz, SurfWave wave, float2 camXZ, ou
     crestXZ = LipCrest(ocean, xz, wave, depth, k);
     crestWave = LipWave(ocean, crestXZ);
     OceanShore crestShore = ShoreAt(ocean, crestXZ);
+    // The search checked: the crest found must lie where the phase is 0. Where the shallows' phase is too tangled for
+    // it, the point is no strip's (by the beach such points hung from crests far off, the sheet in blocky shards)
+    float found = 1.0 - smoothstep(0.3, 0.6, abs(LipPhase(crestWave)));
     return LipAmount(ocean, crestXZ, crestWave, crestShore.shoreDepth, distance(crestXZ, camXZ))
-         * smoothstep(SWASH_DEPTH, 2.5 * SWASH_DEPTH, depth);
+         * smoothstep(SWASH_DEPTH, 2.5 * SWASH_DEPTH, depth) * found;
 }
 
 #endif
