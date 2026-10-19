@@ -153,6 +153,14 @@ namespace Freefall.Components
         [ValueRange(0.005f, 0.2f)]
         public float CloudDensity = 0.05f;
 
+        [Description("Volumetric clouds: lightning flashes a minute in the raining storm cells near the camera (0 = none)")]
+        [ValueRange(0f, 30f)]
+        public float LightningRate = 0f;
+
+        [Button("Lightning flash")]
+        [Description("A flash now in the raining storm cell nearest the camera (none without one)")]
+        public void LightningFlash() => Clouds.FlashNow();
+
         // Cross-fade state for altitude changes, driven by EnvironmentController. Altitude scales the
         // projected cloud pattern, so instead of lerping it the shader blends two cloud layers.
         [Freefall.Reflection.DontSerialize, System.ComponentModel.Browsable(false)]
@@ -294,6 +302,7 @@ namespace Freefall.Components
                 TowerShare = CloudTowers,
                 TowerTop = CloudTowerTop,
                 Density = CloudDensity,
+                LightningRate = LightningRate,
                 Albedo = CloudAlbedo,
                 Speed = CloudSpeed,
             };
@@ -555,6 +564,7 @@ namespace Freefall.Components
             CloudTowers = p.CloudTowers;
             CloudTowerTop = p.CloudTowerTop;
             CloudDensity = p.CloudDensity;
+            LightningRate = p.LightningRate;
         }
 
         /// <summary>Capture the current look into a preset (inverse of ApplyPreset) — "save what I tweaked".</summary>
@@ -589,6 +599,7 @@ namespace Freefall.Components
             p.CloudTowers = CloudTowers;
             p.CloudTowerTop = CloudTowerTop;
             p.CloudDensity = CloudDensity;
+            p.LightningRate = LightningRate;
         }
 
         public void Draw()

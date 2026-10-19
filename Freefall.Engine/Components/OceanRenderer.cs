@@ -252,6 +252,13 @@ namespace Freefall.Components
         internal static OceanRenderer? DrawnThisTick =>
             _drawn != null && _drawn._drawnTick == Engine.TickCount && _drawn._oceanFFT != null ? _drawn : null;
 
+        /// <summary>
+        /// The sea's rest height while an ocean is drawn (this tick or the last: read before this tick's Draw), else null.
+        /// Rain ends at it (Graphics.Clouds): the clouds are marched before the ocean is drawn and do not see its surface.
+        /// </summary>
+        internal static float? SeaLevel =>
+            _drawn != null && _drawn._drawnTick >= Engine.TickCount - 1 ? _drawn.Transform.WorldPosition.Y : null;
+
         internal float PlaneY => Transform.WorldPosition.Y;
         internal uint DisplacementSrv => _oceanFFT?.DisplacementSRV ?? 0;
         internal int BandCount => _oceanFFT?.NumBands ?? 0;

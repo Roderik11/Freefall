@@ -390,7 +390,7 @@ float4 CloudDeck()
 // How far a place (camera-relative) lies under the clouds: 1 below their base, 0 above it, over CLOUD_DECK_EDGE
 float CloudBelowBase(float3 relPos)
 {
-    if (CloudParamsIdx != 0)
+    if (CloudsOn != 0)
     {
         CloudParams C = LoadClouds();
         return 1.0 - smoothstep(C.Base - CLOUD_DECK_EDGE, C.Base + CLOUD_DECK_EDGE, CloudHeight(relPos));
@@ -424,7 +424,7 @@ float CloudLayerDepth(SamplerState wrapSampler, float3 relPos, float3 toLight)
 float2 CloudTransmission(SamplerState wrapSampler, float3 relPos, float3 toLight)
 {
     float tau;
-    if (CloudParamsIdx != 0)
+    if (CloudsOn != 0)
     {
         CloudParams C = LoadClouds();
         if (dot(toLight, C.LightDir) < 0.99)
@@ -460,12 +460,37 @@ float CloudSkyDimming(float4 deck)
 //   x  the beam, which the air scatters with its phases (the Mie forward lobe is the glow round the sun);
 //   y  the light the clouds have diffused, CloudThrough − the beam, which the air scatters evenly: under a deck the sun
 //      still lights the air, but from the whole cloud base, not from its place in the sky (CloudDiffusedLight);
-//   z  the share of the multiple scattering (Ψ_ms) left: 1 − skyDimming (CloudSkyDimming) below the clouds' base.
+//   z  the share of the multiple scattering (Ψ_ms) left: the volumetric clouds' sky light at the place, what their
+//      column over it lets through diffused (the sky volume's depth straight up); the 2D layer's 1 − skyDimming
+//      (CloudSkyDimming) below its base. The deck's mean round the camera there left a storm's air lit by most of the
+//      blue sky: the deck toward the sun read blue (stage 7).
 // relPos: camera-relative.
-float3 CloudAirLight(SamplerState wrapSampler, float3 relPos, float3 toLight, float skyDimming)
+// diffusedTint: what .y's light carries over the beam's colour at the place: under the volumetric clouds it entered them
+// above, through less air than a beam down to here takes (clouds_cs.hlsl CloudMarchClouds), so × the air's transmittance
+// there over here's (the air under a storm came out sepia); 1 for the 2D layer.
+float3 CloudAirLight(SamplerState wrapSampler, float3 relPos, float3 toLight, float skyDimming, out float3 diffusedTint)
 {
     float2 t = CloudTransmission(wrapSampler, relPos, toLight);
-    return float3(t.x, max(t.y - t.x, 0.0), 1.0 - skyDimming * CloudBelowBase(relPos));
+    diffusedTint = 1.0;
+    float sky;
+    if (CloudsOn != 0)
+    {
+        CloudParams C = LoadClouds();
+        float tauUp = CloudSkyDepth(C, relPos, wrapSampler).x;
+        sky = CloudThrough(tauUp);
+        if (AtmosphereIdx != 0 && t.y > t.x + 1e-3)
+        {
+            AtmosphereParams A = LoadAtmosphere();
+            float h = CloudHeight(relPos);
+            float entry = min(max(h, C.Base) + 2.0 * tauUp / max(C.Density, 1e-4), C.SlabTop) - h;
+            float3 here = AtmTransmittanceToLight(A, CloudAtmospherePos(relPos), toLight);
+            float3 there = AtmTransmittanceToLight(A, CloudAtmospherePos(relPos + float3(0.0, max(entry, 0.0), 0.0)), toLight);
+            diffusedTint = all(here > 1e-3) ? min(there / here, 3.0) : 1.0;
+        }
+    }
+    else
+        sky = 1.0 - skyDimming * CloudBelowBase(relPos);
+    return float3(t.x, max(t.y - t.x, 0.0), sky);
 }
 
 // Light on a lit particle or ribbon (smoke, rain, snow, a blade's trail), as a multiple of its albedo (E / π,
@@ -669,6 +694,23 @@ void CloudsAt(float2 pixel, float viewDepth, out float4 cloud, out float depth)
     }
     cloud = sum / weight;
     depth = depthSum / weight * 1000.0;
+
+    // Lightning: the flash's light on the cloud where its light comes from, per pixel and every frame (the march's
+    // targets update a quarter of their texels a frame and keep a history: a 25 ms stroke came out as a few dithered
+    // texels, or nothing). Spread through the cloud round the flash as clouds_cs.hlsl's probe march has it.
+    if (CloudsOn != 0)
+    {
+        CloudParams C = LoadClouds();
+        if (C.FlashIntensity > 0.0)
+        {
+            float2 uv = pixel / ViewportSize;
+            float4 farClip = mul(float4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 0, 1), CameraInverse);
+            float3 toFlash = normalize(farClip.xyz / farClip.w) * depth - C.FlashPos;
+            float d2 = max(dot(toFlash, toFlash), 40000.0);
+            float lux = C.FlashIntensity / d2 * CloudThrough(C.FlashSpread * sqrt(d2));
+            cloud.rgb += (1.0 - cloud.a) * (C.Albedo * lux / ATM_PI * Exposure) * CLOUD_FLASH_COLOR;
+        }
+    }
 }
 
 // The fog between the camera and a surface (AtmosphereFogAir) with the volumetric clouds in front of it: a summit in a

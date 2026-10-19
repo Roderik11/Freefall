@@ -69,7 +69,7 @@ float3 SkyProbeRadiance(float3 dir)
     }
 
     // The volumetric clouds: their own cube (clouds_cs.hlsl CSCloudProbeFace, a face a frame), the same texels as ours
-    if (CloudParamsIdx != 0)
+    if (CloudsOn != 0)
         return sky;
 
     // The cloud layer, blurred two mips more than the dome's (a probe texel spans ~1.4°)
@@ -84,7 +84,7 @@ void CSProbeFaces(uint3 id : SV_DispatchThreadID)
         return;
     float2 uv = (float2(id.xy) + 0.5) / SizeIdx * 2.0 - 1.0;
     float3 radiance = SkyProbeRadiance(CubeDirection(id.z, uv));
-    if (CloudParamsIdx != 0)
+    if (CloudsOn != 0)
     {
         uint clouds = LoadClouds().ProbeClouds;
         if (clouds != 0)

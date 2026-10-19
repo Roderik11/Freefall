@@ -76,35 +76,47 @@ float CloudLayerProfile(float hf, float type)
     return type < 0.5 ? lerp(stratus, strato, type * 2.0) : lerp(strato, cumulus, type * 2.0 - 1.0);
 }
 
-// The coverage at a place: the preset's, varied by the large-scale pattern (~50 km)
+// How rough a deck's base is, 0..1: a dense heaped deck (a storm's) hangs lower in places and rolls; fair-weather cumulus
+// and a stratus sheet keep a flat base. CLOUD_BASE_DIP: how far below the base it hangs at the most (Clouds.cs BaseDip).
+#define CLOUD_BASE_DIP 450.0
+float CloudBaseRough(CloudParams C)
+{
+    return saturate((C.Coverage - 0.6) / 0.25) * saturate((C.Type - 0.4) / 0.3);
+}
+
+// The coverage at a place: the preset's, varied by the large-scale pattern (~50 km). A storm's deck swings harder, from
+// broken to solid: dark cores and thinner, brighter places between them (a uniform deck read flat, without contrast)
 float CloudCoverageAt(CloudParams C, Texture3D<float4> lut, float2 xz)
 {
     float n = lut.SampleLevel(CloudWrap, float3(xz / CLOUD_COVER_TILE, C.Evolution / 4000.0), 0).r;
-    return saturate(C.Coverage + (n - 0.5) * 0.4);
+    return saturate(C.Coverage + (n - 0.5) * (0.4 + 0.6 * CloudBaseRough(C)));
 }
 
 // How deep a place lies in one tower's envelope (0 outside, 1 on its axis): a column from the base to its top, leaning
 // downwind with height; a dome over the top of a growing tower; a mature one spreads an anvil over its top fifth, pushed
 // downwind, with a dome over its updraft above it
 // turret (−0.5..0.5, a ~2 km noise at the place) bulges and dents the column and the anvil's rim, so a tower is a stack
-// of turrets rather than a cylinder
-float CloudTowerEnvelope(CloudParams C, CloudCell k, float2 center, float2 xz, float h, float turret)
+// of turrets rather than a cylinder; lobe (−0.5..0.5, the ~6 km base shape) swells and pinches it in broad masses
+// (with turrets alone a tower read as a chimney); pouch (0..1, round blobs ~1.4 km apart) hangs mammatus under a mature
+// anvil. x the column, y the anvil (CloudFieldAt keeps an anvil's sheet whole).
+float2 CloudTowerEnvelope(CloudParams C, CloudCell k, float2 center, float2 xz, float h, float turret, float lobe, float pouch)
 {
     float top = k.Top;
     float span = max(top - C.Base, 1.0);
     float hf = (h - C.Base) / span;
-    if (hf < 0.0 || hf > 1.12)
+    if (hf < -0.05 || hf > 1.12)
         return 0.0;
     float2 axis = center + C.WindDir * ((h - C.Base) * 0.12);          // the wind shears the tower
     float2 rel = xz - axis;
-    float d = length(rel) * (1.0 - 0.9 * turret);
+    float d = length(rel) * (1.0 - 0.9 * turret - 0.6 * lobe);
 
-    // The column: widest a third of the way up, narrowing above, rounding off over the top (flatter under an anvil)
+    // The column: broad through its middle, narrowing above, rounding off over the top (flatter under an anvil)
     float dome = lerp(0.3, 0.1, k.Anvil);
-    float bulge = 0.85 + 0.3 * sin(saturate(hf * 1.3) * 3.14159);
+    float bulge = 0.9 + 0.4 * sin(saturate(hf * 1.2) * 3.14159);
     float r = k.Radius * bulge * sqrt(saturate((1.0 - hf) / dome));
-    float column = r > 0.0 ? saturate((r - d) / (0.35 * r)) : 0.0;
-    column *= saturate((h - C.Base) / 60.0);                             // the flat base
+    float column = r > 0.0 ? saturate((r - d) / (0.4 * r)) : 0.0;
+    // The base: flat on the whole, ragged where the turrets hang lower (a flat smooth base read as a dark lens from afar)
+    column *= saturate((h - C.Base + 250.0 * saturate(turret + 0.2)) / 80.0);
 
     // The anvil: the top spreading downwind as a wedge, a short overhang upwind, flat on top, its underside rising and
     // the sheet thinning toward its far rim; an overshooting dome over the updraft
@@ -118,23 +130,28 @@ float CloudTowerEnvelope(CloudParams C, CloudCell k, float2 center, float2 xz, f
         float ww = w / (k.Radius * (1.0 + 1.2 * k.Anvil * saturate(uu)));      // widening downwind
         float e = sqrt(uu * uu + ww * ww) * (1.0 - 0.7 * turret);             // 0 at the tower, 1 at the rim
         float under = lerp(0.84, 0.97, saturate(e));
+        // Mammatus: pouches hanging from the underside downwind of the tower, inside the rim, up to ~8 % of the tower
+        // (~700 m under a 9 km storm); at 6 % × pouch² they were too shallow to break the flat underside, and a √ of
+        // the blob's rise flattened their tops into facets with creases between
+        under -= 0.08 * smoothstep(0.2, 0.95, pouch) * saturate(uu * 2.0) * saturate((1.0 - e) / 0.4) * k.Anvil;
         float sheet = saturate((hf - under) / 0.03) * saturate((1.0 - hf) / 0.03);
-        anvil = saturate((1.0 - e) / 0.35) * sheet * k.Anvil;
+        // Full out to near its rim: at (1 − e) / 0.35 most of the sheet sat under 1 and the noise ate it to a shelf
+        anvil = saturate((1.0 - e) / 0.12) * sheet * k.Anvil;
         float rt = k.Radius * 0.55 * k.Anvil;
         float dome2 = rt * sqrt(saturate((1.09 - hf) / 0.1));
-        anvil = max(anvil, hf > 0.9 && dome2 > 0.0 ? saturate((dome2 - d) / (0.5 * dome2)) : 0.0);
+        column = max(column, hf > 0.9 && dome2 > 0.0 ? saturate((dome2 - d) / (0.5 * dome2)) : 0.0);
     }
-    return max(column, anvil);
+    return float2(column, anvil);
 }
 
-float CloudTowers(CloudParams C, float2 xz, float h, float turret)
+float2 CloudTowers(CloudParams C, float2 xz, float h, float turret, float lobe, float pouch)
 {
     if (C.Cells == 0 || C.TowerShare <= 0.0)
         return 0.0;
     StructuredBuffer<CloudCell> cells = ResourceDescriptorHeap[C.Cells];
     int n = (int)C.CellsPerSide;
     int2 home = (int2)floor(xz / C.CellSize);
-    float env = 0.0;
+    float2 env = 0.0;
     // 5 × 5: an anvil reaches up to ~1.5 cells from its tower
     [loop] for (int j = -2; j <= 2; j++)
     {
@@ -143,7 +160,7 @@ float CloudTowers(CloudParams C, float2 xz, float h, float turret)
             int2 c = home + int2(i, j);
             int2 w = ((c % n) + n) % n;
             CloudCell k = cells[w.y * n + w.x];
-            if (k.Radius <= 0.0 || h < C.Base || h > C.Base + (k.Top - C.Base) * 1.12)
+            if (k.Radius <= 0.0 || h < C.Base - 250.0 || h > C.Base + (k.Top - C.Base) * 1.12)
                 continue;
             // Out of the tower's reach (its widest column with the turrets, the shear, the anvil's wedge): skip it
             float2 center = float2(c) * C.CellSize + k.Center;
@@ -151,7 +168,7 @@ float CloudTowers(CloudParams C, float2 xz, float h, float turret)
             float2 off = xz - center;
             if (dot(off, off) > reach * reach)
                 continue;
-            env = max(env, CloudTowerEnvelope(C, k, center, xz, h, turret));
+            env = max(env, CloudTowerEnvelope(C, k, center, xz, h, turret, lobe, pouch));
         }
     }
     return env;
@@ -167,10 +184,17 @@ float2 CloudFieldAt(CloudParams C, float2 xz, float h)
     float4 n = lut.SampleLevel(CloudWrap, (float3(xz.x, h, xz.y) + slide) / CLOUD_BASE_TILE, 0);
 
     float cover = CloudCoverageAt(C, lut, xz);
-    float layer = cover * CloudLayerProfile((h - C.Base) / max(C.Thickness, 1.0), C.Type);
+    // A rough base dips by up to CLOUD_BASE_DIP in broad swells (~5 km), the Perlin FBM sliding with the clouds
+    float dip = CLOUD_BASE_DIP * CloudBaseRough(C)
+              * saturate((lut.SampleLevel(CloudWrap, float3(xz.x + slide.x, 0.37, xz.y + slide.z) / (CLOUD_PERIOD / 50.0), 0).r - 0.35) / 0.3);
+    float layer = cover * CloudLayerProfile((h - (C.Base - dip)) / max(C.Thickness + dip, 1.0), C.Type);
     // Turrets: the Perlin-Worley at a 2.1 km tile (CLOUD_PERIOD / 120), for the towers' bulges
     float turret = lut.SampleLevel(CloudWrap, (float3(xz.x, h, xz.y) + slide) / (CLOUD_PERIOD / 120.0), 0).a - 0.4;
-    float env = max(layer, CloudTowers(C, xz, h, turret));
+    // Mammatus pouches: the Worley FBM's blobs (high at the cells' centres) at a ~1.4 km tile, flat in height
+    // (a mip down: the Worley cells' creases blurred, so each pouch is a smooth dome)
+    float pouch = saturate((lut.SampleLevel(CloudWrap, float3(xz.x + slide.x, 0.0, xz.y + slide.z) / (CLOUD_PERIOD / 180.0), 1.5).g - 0.5) / 0.35);
+    float2 towers = CloudTowers(C, xz, h, turret, n.a - 0.45, pouch);
+    float env = max(layer, max(towers.x, towers.y));
     if (env <= 0.002)
         return 0;
 
@@ -178,6 +202,8 @@ float2 CloudFieldAt(CloudParams C, float2 xz, float h)
     float shape = saturate(CloudRemap(n.a, fbm - 1.0, 1.0, 0.0, 1.0));
     // The LUT's shape sits in a narrow band (~0.45-0.8): spread over 0..1, so coverage thins the clouds gradually
     shape = saturate(CloudRemap(shape, 0.42, 0.82, 0.0, 1.0));
+    // An anvil is a sheet, smooth underneath (where mammatus hang): the shape may not hole it (it came out like lace)
+    shape = max(shape, 0.6 * saturate(towers.y * 1.5));
     // Baked smooth: how far past the threshold (cloud_common.hlsli CloudFieldDensity sharpens it in the march)
     return float2(saturate(0.5 + shape - (1.0 - env)), env);
 }
@@ -406,7 +432,8 @@ float CloudErode(CloudParams C, Texture3D<float4> lut, float2 field, float2 xz, 
         detail = lerp(detail, detail * 0.65 + 0.35 * lut.SampleLevel(CloudWrap, q / (CLOUD_DETAIL_TILE * 0.37), 0).b, near);
     detail = saturate((detail - 0.3) / 0.45);           // the Worley FBM sits in a narrow band: spread it
     float hf = saturate((h - C.Base) / max(C.TowerTop - C.Base, C.Thickness));
-    float erode = lerp(detail, 1.0 - detail, saturate(hf * 5.0));
+    // A storm's base is billowy too, rolls and lumps hanging down (ref 2), not the wisps under fair-weather cumulus
+    float erode = lerp(lerp(detail, 1.0 - detail, CloudBaseRough(C)), 1.0 - detail, saturate(hf * 5.0));
     return CloudFieldDensity(field.x - (erode - 0.35) * CLOUD_BILLOW * strength);
 }
 
@@ -444,21 +471,6 @@ float CloudLightDepth(CloudParams C, Texture3D<float4> lut, float3 rel, float3 l
     return tau + volume;
 }
 
-// Optical depth straight up (x) and down (y) from a place, from the sky volume of the level its distance picks: how much
-// of the sky above (and of the lit ground below) a part of a cloud sees past the cloud round it
-float2 CloudSkyDepth(CloudParams C, float3 rel)
-{
-    float h = CloudHeight(rel);
-    float dist = max(abs(rel.x), abs(rel.z));
-    float blend;
-    uint level = CloudLevelAt(C, dist, blend);
-    float2 xz = C.CameraCloud + rel.xz;
-    float2 tau = CloudSkyDepthAt(C, level, xz, h, CloudWrap);
-    if (blend > 0.0)
-        tau = lerp(tau, CloudSkyDepthAt(C, level + 1, xz, h, CloudWrap), blend);
-    return tau;
-}
-
 // Schneider's in-scatter probability (Nubis 2017): light gets scattered toward the eye only where it has had some cloud
 // to scatter in, so thin edges and the side of a billow away from where the light comes in are darker than a plain
 // march makes them (the dark-edged, cauliflower look); stronger higher up, where the billows are. Only with the light
@@ -479,10 +491,20 @@ struct CloudMarchResult
 
 #define CLOUD_FAR_DEPTH 20000.0
 
-// One view ray through the clouds. stepScale > 1 marches coarser (the probe's faces); jitter (0..1) offsets the steps;
-// tLimit (m along the ray) ends it at the scene's surface: a summit in a deck, a hill in front of the clouds.
-CloudMarchResult CloudMarchRay(CloudParams C, AtmosphereParams A, Texture3D<float4> lut, float3 dir, float jitter,
-                               float stepScale, float tLimit)
+// The lit ground's light under a place in the clouds (groundAmbient: E / π × albedo × Exposure, lit through the deck's
+// mean round the camera, deckThrough): as much as gets through the cloud over that ground, taken as the place's optical
+// depth toward the light (tau), never more than the mean gives. Under a storm cell the mean (~0.7 with sunny gaps round
+// it) lit the ground several times too bright and its warm bounce made the base tan.
+float3 CloudGroundLight(float3 groundAmbient, float deckThrough, float tau)
+{
+    return groundAmbient * saturate(CloudThrough(tau) / deckThrough);
+}
+
+// One view ray through the clouds (not the rain: CloudMarchRay). stepScale > 1 marches coarser (the probe's faces);
+// jitter (0..1) offsets the steps; tLimit (m along the ray) ends it at the scene's surface: a summit in a deck, a hill in
+// front of the clouds.
+CloudMarchResult CloudMarchClouds(CloudParams C, AtmosphereParams A, Texture3D<float4> lut, float3 dir, float jitter,
+                                  float stepScale, float tLimit)
 {
     CloudMarchResult result;
     result.color = float4(0, 0, 0, 1);
@@ -505,6 +527,9 @@ CloudMarchResult CloudMarchRay(CloudParams C, AtmosphereParams A, Texture3D<floa
 
     StructuredBuffer<float4> ambientBuffer = ResourceDescriptorHeap[A.Ambient];
     float3 skyAmbient = ambientBuffer[0].rgb, groundAmbient = ambientBuffer[1].rgb;     // E / π × Exposure
+    // The ground's light is lit through the clouds' mean round the camera (CSAmbient): under a cloud it is what gets
+    // through there instead (CloudGroundLight)
+    float deckThrough = max(ambientBuffer[4].y, 0.05);
     // The terrain's shadow toward the light (a peak shades the cloud behind it): only below the terrain's top
     float terrainTop = A.TerrainHeightmap != 0 ? A.TerrainOrigin.y + A.TerrainMaxHeight : -1e9;
     bool moonLight = C.LightIsMoon != 0;
@@ -546,10 +571,16 @@ CloudMarchResult CloudMarchRay(CloudParams C, AtmosphereParams A, Texture3D<floa
             float sigmaS = sigmaT * C.Albedo;
 
             // The light reaching this place through the air above (faded out in the earth's shadow) and through the cloud
-            float3 toLight = CloudLightThroughAir(A, CloudAtmospherePos(p), lightDir);
-            if (hp < terrainTop)
-                toLight *= AtmTerrainLightVisibility(A, CamPos + p, moonLight);
+            float terrainLit = hp < terrainTop ? AtmTerrainLightVisibility(A, CamPos + p, moonLight) : 1.0;
+            float3 toLight = CloudLightThroughAir(A, CloudAtmospherePos(p), lightDir) * terrainLit;
             float tau = any(toLight > 0.0) ? CloudLightDepth(C, lut, p, lightDir, jitter, stepScale < 1.5) : 0.0;
+            float2 skyTau = CloudSkyDepth(C, p, CloudWrap);
+            // The light diffused down to here entered the cloud above, through less air than a beam down to this height
+            // takes: its colour is the air's transmittance up there (a storm's base lit with the sun as reddened by the
+            // low air came out sepia). That height from the optical depth over the place: at least τ / CloudDensity of
+            // cloud, taken as half full.
+            float entry = min(hp + 2.0 * skyTau.x / max(C.Density, 1e-4), C.SlabTop) - hp;
+            float3 toLightDiffused = CloudLightThroughAir(A, CloudAtmospherePos(p + float3(0.0, entry, 0.0)), lightDir) * terrainLit;
             float beam = 0.0;
             [unroll] for (int o = 0; o < 3; o++)
                 beam += pow(0.5, o) * phase[o] * exp(-pow(0.5, o) * tau);
@@ -559,19 +590,54 @@ CloudMarchResult CloudMarchRay(CloudParams C, AtmosphereParams A, Texture3D<floa
             // diffuse light: radiance CloudThrough × E sin / π. The ground, the air and the meter take the same share
             // (CloudTransmission), so the base the sky probe sees lights the surfaces with what the ground's light says
             // comes through. (Until stage 4: 1 / (4π), a base ~3× too dark at noon against that.)
-            float scattered = beam * CloudInScatter(C, density, hp, cosTheta) + CloudThrough(tau) * diffuseEntry;
+            float3 scattered = toLight * (beam * CloudInScatter(C, density, hp, cosTheta))
+                             + toLightDiffused * (CloudThrough(tau) * diffuseEntry);
 
             // The sky above and the lit ground below, as much of each as the cloud over and under this place leaves
             // (diffuse light gets deeper than a beam): bright tops, dark cores, the ground's warm light on the bases.
             // Near the face we see, also what that face sees out toward the camera: a tower's flank half the sky (its
             // blue shade), a deck's base none of it, only the ground
-            float2 skyTau = CloudSkyDepth(C, p);
             float faceOpen = pow(T, 0.3);
-            float skySeen = max(exp(-0.3 * skyTau.x), saturate(0.5 - 0.5 * dir.y) * faceOpen);
+            // The face sees the sky only where the air in front of it is open to the sky: a deck's base seen low sees
+            // more base, not the blue (half the blue sky on every grazing base turned a storm deck blue). The sky
+            // volume's column over a place ~a kilometre toward the eye says which.
+            // Two columns: ~1 km toward the eye, and ~8 km out, level: under an anvil the near one is covered while the
+            // face still sees the bright low sky past the anvil's edge (faces under anvils came out black); a deck
+            // covers both
+            float faceSky = saturate(0.5 - 0.5 * dir.y) * faceOpen;
+            float farOpen = 0.0;            // the far column's openness: the ground out there is sunlit too
+            if (faceOpen > 0.01)
+            {
+                float2 level = -dir.xz * rsqrt(max(dot(dir.xz, dir.xz), 1e-6));
+                float nearSky = exp(-0.3 * CloudSkyDepth(C, p - dir * min(1000.0, 0.5 * t), CloudWrap).x);
+                farOpen = exp(-0.3 * CloudSkyDepth(C, p + float3(level.x, 0.0, level.y) * 8000.0, CloudWrap).x);
+                faceSky *= max(nearSky, farOpen);
+            }
+            // The sky's light also diffuses down through the cloud over this place, as the sun's does (CloudThrough of the
+            // optical depth above): under a deck it is part of the base's light, and without it everything under a storm
+            // was the sun's colour alone (a tan haze, a sepia base)
+            float skySeen = max(max(exp(-0.3 * skyTau.x), CloudThrough(skyTau.x)), faceSky);
             float groundSeen = max(exp(-0.3 * skyTau.y), saturate(0.5 + 0.5 * dir.y) * faceOpen);
-            float3 ambient = skyAmbient * skySeen + groundAmbient * groundSeen;
+            // What lies below: low down the ground; high up (an anvil, a tower's upper flanks) the lit air and the sunlit
+            // cloud tops under it, much brighter than the ground (lit only by the ground, anvil undersides went black)
+            float3 belowAir = 0.35 * skyAmbient + 0.15 * lightE * toLight * (saturate(lightDir.y) / ATM_PI * Exposure);
+            // (the ground: as lit under this place, or as the open ground far out the face sees, whichever is brighter)
+            float3 ground = max(CloudGroundLight(groundAmbient, deckThrough, tau), groundAmbient * (farOpen * faceOpen));
+            float3 below = lerp(ground, belowAir, saturate((hp - C.Base - 0.5 * C.Thickness) / 4000.0));
+            float3 ambient = skyAmbient * skySeen + below * groundSeen;
 
-            float3 S = sigmaS * (lightE * toLight * scattered * Exposure + ambient);
+            float3 S = sigmaS * (lightE * scattered * Exposure + ambient);
+            // Lightning in the sky probe's clouds (so the land brightens through the ambient): the flash's light spread
+            // through the cloud round it (its illuminance over the distance², as it diffuses through the cloud's mean
+            // extinction, scattered evenly). A view's clouds take it per pixel instead (sky_common.fx CloudsAt): their
+            // targets keep a history a stroke of 25 ms would not show in.
+            if (C.FlashIntensity > 0.0 && stepScale > 1.5)
+            {
+                float3 toFlash = p - C.FlashPos;
+                float d2 = max(dot(toFlash, toFlash), 40000.0);
+                S += sigmaS * (C.FlashIntensity / d2 * CloudThrough(C.FlashSpread * sqrt(d2)) / (4.0 * ATM_PI) * Exposure)
+                   * CLOUD_FLASH_COLOR;
+            }
             float x = sigmaT * step;
             float through = exp(-x);
             L += T * S * (x > 1e-4 ? (1.0 - through) / sigmaT : step);
@@ -602,6 +668,175 @@ CloudMarchResult CloudMarchRay(CloudParams C, AtmosphereParams A, Texture3D<floa
     return result;
 }
 
+// ── Rain shafts (VOLUMETRIC_CLOUDS_PLAN §15) ──
+// Under the raining cells nearest the camera (Clouds.cs PlaceRainShafts: CloudParams.RainShafts): a thin medium from the
+// clouds' base down to the ground or, for virga, ending in the air, in curtains, leaning downwind as it falls. Not baked
+// (the volumes start at the base: stretching them to the ground would spend their layers on rain): each shaft is a
+// column the ray is intersected with and marched through in RAIN_STEPS. Drops throw the light on (HG g RAIN_PHASE_G),
+// so a curtain glows toward the sun and stays grey away from it; the sun reaches it as the clouds' beam there (dark
+// under the storm, bright where a low sun comes in under the anvil), the clouds' diffused light and the sky's and the
+// ground's light as for the clouds.
+
+#define RAIN_SIGMA 0.001        // extinction per metre in the heaviest rain (visibility ~3 km): heavier made a shaft a
+                                // wall a few km across, black under a tower and a dark flat lens seen from afar
+#define RAIN_PHASE_G 0.75
+#define RAIN_STEPS 8
+#define RAIN_LEAN 0.25          // metres downwind per metre fallen
+
+struct CloudRainResult
+{
+    float3 L;                   // the rain's light (× Exposure)
+    float T;                    // what it lets through
+    float depthSum, depthWeight;    // its transmittance-weighted distance
+};
+
+CloudRainResult CloudRain(CloudParams C, AtmosphereParams A, Texture3D<float4> lut, float3 dir, float tLimit, float jitter)
+{
+    CloudRainResult r;
+    r.L = 0;
+    r.T = 1.0;
+    r.depthSum = 0.0;
+    r.depthWeight = 0.0;
+    if (C.RainShafts == 0 || C.RainCount == 0)
+        return r;
+    StructuredBuffer<CloudRainShaft> shafts = ResourceDescriptorHeap[C.RainShafts];
+    float3 lightDir = C.LightDir;
+    float3 lightE = C.LightIsMoon != 0 ? A.MoonIlluminance : A.SunIlluminance;
+    float phase = HenyeyGreenstein4Pi(dot(dir, lightDir), RAIN_PHASE_G) / (4.0 * ATM_PI);
+    StructuredBuffer<float4> ambientBuffer = ResourceDescriptorHeap[A.Ambient];
+    float3 skyAmbient = ambientBuffer[0].rgb, groundAmbient = ambientBuffer[1].rgb;
+    float deckThrough = max(ambientBuffer[4].y, 0.05);
+    float2 d2 = dir.xz;
+    float a = dot(d2, d2);
+    float2 d2n = a > 1e-8 ? d2 * rsqrt(a) : float2(1.0, 0.0);
+
+    for (uint k = 0; k < C.RainCount; k++)
+    {
+        CloudRainShaft s = shafts[k];
+        // The column round its lean (wider by the lean over the fall), between its bottom and the base
+        float fall = C.Base - max(s.Bottom, -500.0);
+        float2 center = s.Center + C.WindDir * (0.5 * fall * RAIN_LEAN);
+        float radius = s.Radius + 0.5 * fall * RAIN_LEAN;
+        float t0 = 0.0, t1 = tLimit;
+        if (a > 1e-8)
+        {
+            float b = dot(d2, center), c = dot(center, center) - radius * radius;
+            float disc = b * b - a * c;
+            if (disc <= 0.0)
+                continue;
+            float sq = sqrt(disc);
+            t0 = (b - sq) / a;
+            t1 = min(t1, (b + sq) / a);
+        }
+        else if (dot(center, center) > radius * radius)
+            continue;
+        if (abs(dir.y) > 1e-5)
+        {
+            float tBase = (C.Base - CamPos.y) / dir.y, tBottom = (s.Bottom - CamPos.y) / dir.y;
+            t0 = max(t0, min(tBase, tBottom));
+            t1 = min(t1, max(tBase, tBottom));
+        }
+        else if (CamPos.y > C.Base || CamPos.y < s.Bottom)
+            continue;
+        t0 = max(t0, 0.0);
+        if (t1 <= t0)
+            continue;
+
+        // How open the sky is round the shaft: the column over four places two radii out (once per shaft). Under a lone
+        // tower the sky round it lights the curtains from the sides; under a deck nothing does (a shaft lit only through
+        // the tower over it came out black against the white towers)
+        float open = 0.0;
+        [unroll] for (uint q = 0; q < 4; q++)
+        {
+            float2 o = float2(q == 0 ? 1.0 : (q == 1 ? -1.0 : 0.0), q == 2 ? 1.0 : (q == 3 ? -1.0 : 0.0)) * (2.0 * s.Radius);
+            float3 around = float3(s.Center.x + o.x, C.Base - CamPos.y, s.Center.y + o.y);
+            open += 0.25 * exp(-0.3 * CloudSkyDepth(C, around, CloudWrap).x);
+        }
+
+        float dt = (t1 - t0) / RAIN_STEPS;
+        for (uint i = 0; i < RAIN_STEPS; i++)
+        {
+            float t = t0 + (i + jitter) * dt;
+            float3 p = dir * t;
+            float h = CloudHeight(p);
+            // The shaft's edge where the rain at this height has drifted to, its curtains (the Worley FBM's cells
+            // stretched up and down, moving with the cloud), heavier near the base, fading out at a virga's bottom
+            float2 axis = s.Center + C.WindDir * ((C.Base - h) * RAIN_LEAN);
+            // Curtains across the shaft as the camera sees it: the axis's offset from the ray (m) is the same all along
+            // the ray at a height, so they are streaks that hold still in the view, not noise marched through (a 3D
+            // pattern sampled 8 times over kilometres came out as a dithered smudge). Two octaves of the Worley FBM's
+            // cells, stretched up and down, the finer ~250 m across, falling slowly
+            float across = d2n.x * axis.y - d2n.y * axis.x;
+            float fallen = h + C.Evolution * 6.0;
+            float4 coarse = lut.SampleLevel(CloudWrap, float3(across / 1100.0 + s.Seed * 13.0, fallen / 3000.0, s.Seed), 0);
+            float4 fine = lut.SampleLevel(CloudWrap, float3(across / 260.0 + s.Seed * 29.0, fallen / 1500.0, s.Seed + 0.5), 0);
+            float streak = coarse.g * 0.75 + fine.b * 0.25;
+            // Never quite clear between them (a hard barcode otherwise)
+            float curtain = 0.3 + 0.7 * smoothstep(0.3, 0.7, streak);
+            // A frayed edge (the curtains reach out past the mean radius and leave gaps inside it)
+            float edge = saturate((s.Radius - length(p.xz - axis)) / (0.5 * s.Radius) + (streak - 0.5) * 0.8);
+            // In from the base over ~400 m (no flat lid: the rain grows out of the cloud's shade), out at a virga's bottom
+            float fade = (s.Fade > 0.0 ? saturate((h - s.Bottom) / s.Fade) : 1.0) * saturate((C.Base - h) / 400.0);
+            float sigma = RAIN_SIGMA * s.Rain * edge * curtain * fade;
+            if (sigma <= 1e-7)
+                continue;
+
+            // Its light: the clouds' beam and their diffused light at this place, the sky through them and the ground
+            float tau = CloudShadowDepth(C, p, lightDir, CloudWrap);
+            float beam = exp(-tau), through = CloudThrough(tau);
+            float3 toLight = CloudLightThroughAir(A, CloudAtmospherePos(p), lightDir);
+            // The diffused light comes down from the whole cloud base, a bright hemisphere overhead (irradiance E·through·
+            // sin): drops scatter half of it on toward an eye looking across (an even scatterer: 0.5 / π of the
+            // irradiance), more looking up into it (forward), less looking down. Taken as a point overhead (the phase at
+            // the angle to straight down) the curtains came out ~3× too dark, sooty against the haze.
+            float diffusedPhase = (0.5 + 0.35 * dir.y) / ATM_PI;
+            // The sky's light through the column overhead, the ground's as lit under the cloud, half each (above, below);
+            // the diffused light coloured by the air where it entered the cloud (as in CloudMarchClouds)
+            float tauUp = CloudSkyDepth(C, p, CloudWrap).x;
+            // From above through the column, from the sides as open as the sky round the shaft (half the sky's light)
+            float skyThrough = max(CloudThrough(tauUp), 0.5 * open);
+            float entry = min(C.Base + 2.0 * tauUp / max(C.Density, 1e-4), C.SlabTop) - h;
+            float3 toLightDiffused = CloudLightThroughAir(A, CloudAtmospherePos(p + float3(0.0, entry, 0.0)), lightDir);
+            float3 S = sigma * (lightE * (toLight * beam * phase
+                                          + toLightDiffused * (max(through - beam, 0.0) * saturate(lightDir.y) * diffusedPhase)) * Exposure
+                              + 0.5 * (skyAmbient * skyThrough
+                                       + max(CloudGroundLight(groundAmbient, deckThrough, tau), 0.5 * open * groundAmbient)));
+            float x = sigma * dt;
+            float pass = exp(-x);
+            r.L += r.T * S * (x > 1e-4 ? (1.0 - pass) / sigma : dt);
+            r.depthSum += t * (r.T - r.T * pass);
+            r.depthWeight += r.T - r.T * pass;
+            r.T *= pass;
+        }
+    }
+    return r;
+}
+
+// One view ray through the clouds and the rain under them, in the order the ray meets them (the rain is under the base:
+// in front of the clouds seen from below, behind them seen from above). Arguments as CloudMarchClouds.
+CloudMarchResult CloudMarchRay(CloudParams C, AtmosphereParams A, Texture3D<float4> lut, float3 dir, float jitter,
+                               float stepScale, float tLimit)
+{
+    CloudMarchResult clouds = CloudMarchClouds(C, A, lut, dir, jitter, stepScale, tLimit);
+    CloudRainResult rain = CloudRain(C, A, lut, dir, tLimit, jitter);
+    if (rain.T >= 0.999)
+        return clouds;
+    float rainDepth = rain.depthSum / max(rain.depthWeight, 1e-6);
+    float rainWeight = 1.0 - rain.T, cloudWeight = 1.0 - clouds.color.a;
+    CloudMarchResult result;
+    if (rainDepth <= clouds.depth || clouds.color.a >= 0.999)
+    {
+        result.color = float4(rain.L + rain.T * clouds.color.rgb, rain.T * clouds.color.a);
+        result.depth = (rainDepth * rainWeight + clouds.depth * cloudWeight * rain.T) / max(rainWeight + cloudWeight * rain.T, 1e-6);
+    }
+    else
+    {
+        result.color = float4(clouds.color.rgb + clouds.color.a * rain.L, rain.T * clouds.color.a);
+        result.depth = (clouds.depth * cloudWeight + rainDepth * rainWeight * clouds.color.a) / max(cloudWeight + rainWeight * clouds.color.a, 1e-6);
+    }
+    return result;
+}
+
 // The camera-relative view direction through a place in the view (uv 0..1; reverse-Z: the far plane is z = 0)
 float3 CloudViewDir(float2 uv)
 {
@@ -628,7 +863,7 @@ void CSCloudMarch(uint3 id : SV_DispatchThreadID)
         return;
     RWTexture2D<float4> target = ResourceDescriptorHeap[TargetUAVIdx];
     RWTexture2D<float> depthTarget = ResourceDescriptorHeap[DepthUAVIdx];
-    if (CloudParamsIdx == 0 || AtmosphereIdx == 0)
+    if (CloudsOn == 0 || AtmosphereIdx == 0)
     {
         target[id.xy] = float4(0, 0, 0, 1);
         depthTarget[id.xy] = CLOUD_FAR_DEPTH * 0.001;
@@ -833,7 +1068,7 @@ void CSCloudProbeFace(uint3 id : SV_DispatchThreadID)
         return;
     RWTexture2DArray<float4> target = ResourceDescriptorHeap[TargetUAVIdx];
     uint3 texel = uint3(id.xy, ProbeFace);
-    if (CloudParamsIdx == 0 || AtmosphereIdx == 0)
+    if (CloudsOn == 0 || AtmosphereIdx == 0)
     {
         target[texel] = float4(0, 0, 0, 1);
         return;

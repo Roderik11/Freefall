@@ -115,7 +115,8 @@ float3 FroxelBodyLight(AtmosphereParams A, AtmMedium medium, bool moon, float3 p
                        float3 relPos, float3 V, float viewDepth, float3 lightDir, float open, float sky, float skyDimming)
 {
     float3 toLight = AtmTransmittanceToLight(A, posKm, lightDir);
-    float3 cloud = CloudAirLight(FogWrapSampler, relPos, lightDir, skyDimming);
+    float3 diffusedTint;
+    float3 cloud = CloudAirLight(FogWrapSampler, relPos, lightDir, skyDimming, diffusedTint);
     float visible = open * cloud.x;
     if (visible > 0.0 && any(toLight > 0.0))
     {
@@ -126,7 +127,7 @@ float3 FroxelBodyLight(AtmosphereParams A, AtmMedium medium, bool moon, float3 p
     float cosTheta = dot(V, lightDir);
     float lightZenithCos = dot(normalize(posKm), lightDir);
     float3 single = medium.scatteringMie * AtmMiePhase(A.MieG, cosTheta) + medium.scatteringRay * AtmRayleighPhase(cosTheta);
-    float3 diffused = medium.scattering * (CloudDiffusedLight(cloud.y, lightZenithCos) * sky);
+    float3 diffused = medium.scattering * diffusedTint * (CloudDiffusedLight(cloud.y, lightZenithCos) * sky);
     float3 multiple = AtmMultipleScattering(A, posKm, lightZenithCos) * (medium.scattering * cloud.z);
     return toLight * (visible * single + diffused) + multiple * sky;
 }

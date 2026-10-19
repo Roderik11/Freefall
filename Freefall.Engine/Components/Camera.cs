@@ -177,6 +177,7 @@ namespace Freefall.Components
                 pair.Value.SetParameter("CloudAltitudeBlend", SkyboxRenderer.CurrentCloudAltitudeBlend);
                 pair.Value.SetParameter("CloudNoiseLUTIdx", SkyboxRenderer.CurrentCloudNoiseLUTIdx);
                 pair.Value.SetParameter("CloudParamsIdx", cloudParamsIdx);
+                pair.Value.SetParameter("CloudsOn", Graphics.Clouds.Active ? 1u : 0u);
             }
         }
         

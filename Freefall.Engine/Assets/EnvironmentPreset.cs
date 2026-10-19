@@ -123,6 +123,10 @@ namespace Freefall.Assets
         [ValueRange(0.005f, 0.2f)]
         public float CloudDensity = 0.05f;
 
+        [Description("Volumetric clouds: lightning flashes a minute in the raining storm cells near the camera (0 = none)")]
+        [ValueRange(0f, 30f)]
+        public float LightningRate = 0f;
+
         // ── Exposure ──
 
         [Category("Exposure")]
@@ -193,6 +197,7 @@ namespace Freefall.Assets
             dest.CloudTowers = L(a.CloudTowers, b.CloudTowers, t);
             dest.CloudTowerTop = L(a.CloudTowerTop, b.CloudTowerTop, t);
             dest.CloudDensity = L(a.CloudDensity, b.CloudDensity, t);
+            dest.LightningRate = L(a.LightningRate, b.LightningRate, t);
 
             dest.ExposureCompensation = L(a.ExposureCompensation, b.ExposureCompensation, t);
 

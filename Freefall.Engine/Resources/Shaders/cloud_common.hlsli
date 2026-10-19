@@ -1,5 +1,5 @@
 // Volumetric clouds (VOLUMETRIC_CLOUDS_PLAN.md): what every cloud pass shares. Graphics/Clouds.cs fills CloudParams each
-// frame (SceneConstants.CloudParamsIdx; 0 = off) and bakes the cloud field into a clipmap of 3D textures that live in
+// frame (SceneConstants.CloudParamsIdx; SceneConstants.CloudsOn 0 = off) and bakes the cloud field into a clipmap of 3D textures that live in
 // cloud space, the world's xz carried by the wind: the clouds are modelled once and drift with it for free.
 //   Levels   5 × 256² texels horizontally, 16 / 32 / 64 / 128 / 256 km wide (62.5 m … 1 km voxels), centred on the
 //            camera and addressed modulo 256 (toroidal: a move bakes only the slabs that enter); height over the slab,
@@ -18,6 +18,7 @@
 #define CLOUD_BRICK 8               // texels a brick spans each way
 #define CLOUD_PERIOD 256000.0       // metres: the weather repeats in cloud space (noise tiles, cells); Clouds.Period
 #define CLOUD_EARTH_RADIUS 6360000.0
+#define CLOUD_FLASH_COLOR float3(0.85, 0.9, 1.0)   // lightning: a blue-white
 #define CLOUD_BASE_TILE (CLOUD_PERIOD / 40.0)      // 6.4 km: the base shape's noise tile
 #define CLOUD_DETAIL_TILE (CLOUD_PERIOD / 160.0)   // 1.6 km: the billows' noise tile (Worley cells of 400 m and down)
 #define CLOUD_COVER_TILE (CLOUD_PERIOD / 5.0)      // 51.2 km: the coverage pattern's tile
@@ -62,7 +63,24 @@ struct CloudParams
     uint LightIsMoon;
     uint ProbeClouds;       // Texture2DArray<float4> 64² × 6: the sky probe's clouds (rgb light, a transmittance), a face
                             // a frame (clouds_cs.hlsl CSCloudProbeFace); 0 = none yet
-    float3 _paramsPad;
+    uint RainShafts;        // StructuredBuffer<CloudRainShaft>: the raining cells nearest the camera (RainCount of them)
+    uint RainCount;
+    float FlashIntensity;   // a lightning flash's luminous intensity now (cd; 0 = none)
+    float3 FlashPos;        // where it is, camera-relative (m)
+    float FlashSpread;      // the extinction (per m) its light diffuses through, the cloud's mean round it
+};
+
+// A rain shaft under a raining cell (Clouds.cs PlaceRainShafts): from the clouds' base down to Bottom (the ground, or
+// higher for virga), in curtains
+struct CloudRainShaft
+{
+    float2 Center;          // camera-relative xz at the base (m)
+    float Radius;           // m
+    float Rain;             // 0..1
+    float Bottom;           // metres above sea level where it ends: evaporated (virga), the sea, or below the ground
+    float Seed;             // 0..1, shifts its curtains
+    float Fade;             // metres over which virga thins out above Bottom; 0 = it ends at a surface
+    float _shaftPad;
 };
 
 struct CloudCell
@@ -76,6 +94,9 @@ struct CloudCell
     float _cellPad;
 };
 
+// This frame's parameters. CloudParamsIdx is always a real buffer (an empty frame while CloudsOn is 0): callers test
+// CloudsOn first, but the driver may load ahead of that test, and a structured load at descriptor 0 (the first resource
+// the bindless allocator handed out) hung the GPU
 CloudParams LoadClouds()
 {
     StructuredBuffer<CloudParams> buffer = ResourceDescriptorHeap[CloudParamsIdx];
@@ -266,6 +287,22 @@ float CloudShadowDepth(CloudParams C, float3 rel, float3 toLight, SamplerState w
     float tau = CloudLightDepthAt(C, level, xz, h, wrap);
     if (blend > 0.0)
         tau = lerp(tau, CloudLightDepthAt(C, level + 1, xz, h, wrap), blend);
+    return tau;
+}
+
+// Optical depth straight up (x) and down (y) from a place (camera-relative), from the sky volume of the level its
+// distance picks: how much of the sky above (and of the lit ground below) a part of a cloud sees past the cloud round
+// it; below the slab, the whole column over the place (the air under a storm sees the sky only through it)
+float2 CloudSkyDepth(CloudParams C, float3 rel, SamplerState wrap)
+{
+    float h = CloudHeight(rel);
+    float dist = max(abs(rel.x), abs(rel.z));
+    float blend;
+    uint level = CloudLevelAt(C, dist, blend);
+    float2 xz = C.CameraCloud + rel.xz;
+    float2 tau = CloudSkyDepthAt(C, level, xz, h, wrap);
+    if (blend > 0.0)
+        tau = lerp(tau, CloudSkyDepthAt(C, level + 1, xz, h, wrap), blend);
     return tau;
 }
 

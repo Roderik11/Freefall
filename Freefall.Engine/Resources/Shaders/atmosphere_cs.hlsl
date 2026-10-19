@@ -271,7 +271,7 @@ void CSSkyView(uint3 id : SV_DispatchThreadID)
     // clouds. Below the volumetric clouds' base (a flat plane at its height above sea level, as the sky dome's layer
     // is flat), else the 2D layer's plane CloudAltitude over the camera.
     float4 cloudDeck = CloudDeck();
-    float deckHeight = CloudParamsIdx != 0 ? LoadClouds().Base * 0.001 : viewHeight - A.BottomRadius + CloudAltitude * 0.001;
+    float deckHeight = CloudsOn != 0 ? LoadClouds().Base * 0.001 : viewHeight - A.BottomRadius + CloudAltitude * 0.001;
     float4 deck = float4(deckHeight, cloudDeck.x, max(cloudDeck.y - cloudDeck.x, 0.0), 1.0 - CloudSkyDimming(cloudDeck));
 
     float3 pos = float3(0, viewHeight, 0);
@@ -340,15 +340,16 @@ float APLitShare(float m0, float m1)
 // One body's light scattered toward the camera at a sample, per unit illuminance and km: single scattering through the
 // air above (0 in the earth's shadow) and the cloud layer (CloudAirLight: x its beam, with the given phase-weighted
 // scattering and × terrainLit, the step's share out of the terrain's shadow; y what it diffuses, scattered evenly and
-// coming from the whole cloud base, so past the terrain's shadow toward the light too), plus Ψ_ms × cloud.z
+// coming from the whole cloud base, so past the terrain's shadow toward the light too, × diffusedTint: the colour of the
+// air it came down through, CloudAirLight), plus Ψ_ms × cloud.z
 float3 APSampleLight(AtmosphereParams A, AtmMedium medium, float3 P, float3 up, float pHeight, float terrainLit,
-                     float3 cloud, float3 lightDir, float miePhase, float rayleighPhase)
+                     float3 cloud, float3 diffusedTint, float3 lightDir, float miePhase, float rayleighPhase)
 {
     float lightZenithCos = dot(lightDir, up);
     float3 toLight = AtmTransmittance(A, pHeight, lightZenithCos);
     float tEarth = RaySphereIntersectNearest(P, lightDir, PLANET_RADIUS_OFFSET * up, A.BottomRadius);
     float3 single = (medium.scatteringMie * miePhase + medium.scatteringRay * rayleighPhase) * (terrainLit * cloud.x)
-                  + medium.scattering * CloudDiffusedLight(cloud.y, lightZenithCos);
+                  + medium.scattering * diffusedTint * CloudDiffusedLight(cloud.y, lightZenithCos);
     return (tEarth >= 0.0 ? 0.0 : 1.0) * toLight * single
          + AtmMultipleScattering(A, P, lightZenithCos) * (medium.scattering * cloud.z);
 }
@@ -422,17 +423,19 @@ void CSAerialPerspective(uint3 id : SV_DispatchThreadID)
                 // The cloud layer at the step's middle (the near fog volume's own CloudAirLight, so the two meet at
                 // its range without a seam)
                 float3 relMid = worldMid - CamPos;
-                float3 sunCloud = CloudAirLight(CloudWrapSampler, relMid, A.SunDirection, skyDimming);
-                float3 S = A.SunIlluminance * APSampleLight(A, medium, P, up, pHeight, sunLit, sunCloud, A.SunDirection,
-                                                            sunMie, sunRayleigh);
+                float3 sunTint;
+                float3 sunCloud = CloudAirLight(CloudWrapSampler, relMid, A.SunDirection, skyDimming, sunTint);
+                float3 S = A.SunIlluminance * APSampleLight(A, medium, P, up, pHeight, sunLit, sunCloud, sunTint,
+                                                            A.SunDirection, sunMie, sunRayleigh);
                 if (moonLit)
                 {
                     midMargin = AtmTerrainLightMargin(A, worldMid, true);
                     endMargin = AtmTerrainLightMargin(A, worldEnd, true);
                     float moonShare = 0.5 * (APLitShare(moonMargin, midMargin) + APLitShare(midMargin, endMargin));
                     moonMargin = endMargin;
-                    float3 moonCloud = CloudAirLight(CloudWrapSampler, relMid, A.MoonDirection, skyDimming);
-                    S += A.MoonIlluminance * APSampleLight(A, medium, P, up, pHeight, moonShare, moonCloud,
+                    float3 moonTint;
+                    float3 moonCloud = CloudAirLight(CloudWrapSampler, relMid, A.MoonDirection, skyDimming, moonTint);
+                    S += A.MoonIlluminance * APSampleLight(A, medium, P, up, pHeight, moonShare, moonCloud, moonTint,
                                                            A.MoonDirection, moonMie, moonRayleigh);
                 }
 
@@ -532,7 +535,7 @@ groupshared float2 CloudDeckShared[64];
 // The clouds' optical depth toward the light they are lit by (never the deck's means, which this pass makes)
 float CloudDeckDepth(float3 relPos, float3 lightDir)
 {
-    if (CloudParamsIdx != 0)
+    if (CloudsOn != 0)
         return CloudShadowDepth(LoadClouds(), relPos, lightDir, CloudWrapSampler);
     return CloudLayerDepth(CloudWrapSampler, relPos, lightDir);
 }
@@ -543,7 +546,7 @@ void CSCloudDeck(uint3 id : SV_DispatchThreadID)
     AtmosphereParams A = LoadAtmosphere();
     bool moon;
     float3 lightDir;
-    if (CloudParamsIdx != 0)
+    if (CloudsOn != 0)
     {
         CloudParams C = LoadClouds();
         lightDir = C.LightDir;

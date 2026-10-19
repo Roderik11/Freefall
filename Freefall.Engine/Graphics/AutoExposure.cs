@@ -171,6 +171,11 @@ namespace Freefall.Graphics
                 return;
             }
 
+            // Lightning: an eye does not adapt to a flash of a tenth of a second, and the readback that meters it arrives
+            // a few frames late: hold still until its light is out of the metering (it chased each flash by ~1 EV)
+            if (Clouds.FlashInMetering)
+                return;
+
             // Toward a darker image (higher EV: the scene got brighter) the eye adapts fast, toward the dark slowly
             float delta = TargetEV - _current;
             float rate = delta > 0f ? settings.ExposureSpeedUp : settings.ExposureSpeedDown;

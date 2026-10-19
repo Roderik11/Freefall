@@ -266,7 +266,7 @@ void CSMeter(uint gi : SV_GroupIndex)
             // sky is open round the camera: a sunlit deck under it (volumetric clouds stage 6; the bounce alone left EV
             // 15 over a deck that read 16 from inside, and the deck blew out). Not lower down: there the lower half's
             // haze toward the horizon would move every view the meter was calibrated on (§7.1).
-            if (CloudParamsIdx != 0 && CamPos.y > LoadClouds().Base)
+            if (CloudsOn != 0 && CamPos.y > LoadClouds().Base)
             {
                 float skyLower = max(Luma(sh[0].rgb * 0.282095 - sh[1].rgb * 0.366452), 0.0) / max(Exposure, 1e-30);
                 lower = lerp(lower, max(lower, skyLower), parts.w);

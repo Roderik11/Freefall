@@ -21,11 +21,12 @@ namespace Freefall.Graphics
         public float Density;           // extinction per metre at full density
         public float Albedo;            // single-scattering albedo
         public float Speed;             // CloudSpeed: the drift (~32 m/s × it) and the clouds' own change
+        public float LightningRate;     // flashes a minute in the raining cells near the camera (0 = none)
 
         public static CloudSettings Default => new()
         {
             Enabled = false, Coverage = 0.5f, Type = 1f, Base = 1800f, Thickness = 1000f, TowerShare = 0f,
-            TowerTop = 6000f, Density = 0.05f, Albedo = 0.99f, Speed = 1f,
+            TowerTop = 6000f, Density = 0.05f, Albedo = 0.99f, Speed = 1f, LightningRate = 0f,
         };
     }
 
@@ -37,7 +38,8 @@ namespace Freefall.Graphics
     /// column of each level is baked again for the clouds' own change (a level a ~32 frames). The weather repeats every
     /// <see cref="Period"/> in cloud space (its noise tiles and cells), a whole number of every level's texture, so the
     /// offset's wrap changes nothing. Each view marches it (<see cref="CloudView"/>, clouds_cs.hlsl). Shaders find it
-    /// through SceneConstants.CloudParamsIdx (cloud_common.hlsli; 0 = off). Setting: Engine.Settings.VolumetricClouds.
+    /// through SceneConstants.CloudParamsIdx (cloud_common.hlsli), on while SceneConstants.CloudsOn is 1. Setting:
+    /// Engine.Settings.VolumetricClouds.
     /// Docs: .agent/knowledge/atmospheric_effects/volumetric_clouds.md.
     /// </summary>
     public static class Clouds
@@ -50,6 +52,7 @@ namespace Freefall.Graphics
         private const float Level0Voxel = 62.5f;
         private const float ReachTexels = 100f;         // a level serves the march out to this many of its texels
         private const float DriftSpeed = 32f;           // m/s at CloudSpeed 1, as the 2D layer drifted
+        private const float BaseDip = 450f;             // clouds_cs.hlsl CLOUD_BASE_DIP
         private static readonly int[] Layers = { 128, 64, 64, 64, 64 };
         private const int FrameCount = 3;
         private const int BricksPerSide = TexelsPerLevel / Brick;
@@ -78,7 +81,15 @@ namespace Freefall.Graphics
             public Vector2 WindDir; public float Evolution; public uint NoiseLut;
             public uint Cells; public float CellSize; public uint CellsPerSide; public float Reach;
             public Vector3 LightDir; public uint LightIsMoon;
-            public uint ProbeClouds; public Vector3 _pad;
+            public uint ProbeClouds; public uint RainShafts, RainCount; public float FlashIntensity;
+            public Vector3 FlashPos; public float FlashSpread;
+        }
+
+        // CloudRainShaft in cloud_common.hlsli
+        [StructLayout(LayoutKind.Sequential, Pack = 4)]
+        private struct GpuRainShaft
+        {
+            public Vector2 Center; public float Radius, Rain, Bottom, Seed, Fade, _pad;
         }
 
         // CloudCell in cloud_common.hlsli
@@ -129,8 +140,26 @@ namespace Freefall.Graphics
         private static bool _lightIsMoon;
         private static readonly Level[] _levels = new Level[LevelCount];
         private static readonly GraphicsBuffer?[] _params = new GraphicsBuffer?[FrameCount];
+        private static GraphicsBuffer? _offParams;      // an empty frame for CloudParamsIdx while the clouds are off
         private static readonly GraphicsBuffer?[] _cells = new GraphicsBuffer?[FrameCount];
         private static readonly GpuCell[] _cellData = new GpuCell[CellsPerSide * CellsPerSide];
+        private const int MaxRainShafts = 16;
+        private const float RainShaftReach = 80000f;   // m: raining cells farther than this are not marched
+        private static readonly GraphicsBuffer?[] _rainShafts = new GraphicsBuffer?[FrameCount];
+        private static readonly GpuRainShaft[] _shaftData = new GpuRainShaft[MaxRainShafts];
+        private static readonly float[] _shaftDistance = new float[MaxRainShafts];
+        private static int _shaftCount;
+
+        // Lightning: one flash at a time in a raining cell, a few strokes over 0.05-0.3 s
+        private const float FlashPeakCandela = 5e9f;   // a stroke's luminous intensity (lightning: ~1e9-1e10 cd)
+        private static readonly Random _flashRandom = new(20261019);
+        private static double _flashClock = 1e9;       // seconds since the current flash began
+        private static float _flashLength, _flashPeak, _nextFlashIn = 5f, _lastDt;
+        private static int _flashStrokes;
+        private static bool _flashRequested;
+        private static double _describeCx, _describeCz;     // this frame's camera in cloud space and flash, for Describe
+        private static Vector3 _describeFlash;
+        private static Vector3 _flashCloud;            // cloud-space x, height, z
         private static readonly List<Bake> _bakes = new();
         private static readonly GpuLevel[] _gpuLevels = new GpuLevel[LevelCount];
         private static int _preparedTick = -1, _renderedTick = -1;
@@ -183,6 +212,7 @@ namespace Freefall.Graphics
             {
                 _params[i] = GraphicsBuffer.CreateUpload<GpuParams>(1, mapped: true);
                 _cells[i] = GraphicsBuffer.CreateUpload<GpuCell>(_cellData.Length, mapped: true);
+                _rainShafts[i] = GraphicsBuffer.CreateUpload<GpuRainShaft>(MaxRainShafts, mapped: true);
             }
 
             // The probe's clouds: pre-exposed light and a transmittance, as the probe holds light
@@ -219,21 +249,29 @@ namespace Freefall.Graphics
             _evolution += dt * Settings.Speed;
             if (_evolution > 1e6) _evolution -= 1e6;
             _gameHours = gameHours;
+            _lastDt = dt;
         }
 
         private static double Wrap(double v) => v - Period * Math.Floor(v / Period);
 
         /// <summary>
         /// This frame's parameters (once per frame) and the bindless index of their buffer for SceneConstants.CloudParamsIdx
-        /// (0 = no clouds): the levels follow the camera, the brick columns to bake are chosen (<see cref="Render"/>), the
-        /// storm cells are placed.
+        /// (SceneConstants.CloudsOn = <see cref="Active"/>): the levels follow the camera, the brick columns to bake are
+        /// chosen (<see cref="Render"/>), the storm cells are placed. Without clouds, an empty frame's buffer, never 0:
+        /// shaders test CloudsOn, but the driver may load ahead of that test, and a structured load at descriptor 0 (the
+        /// first resource the bindless allocator handed out, a texture) hung the GPU.
         /// </summary>
         public static uint PrepareFrame(Vector3 cameraPos)
         {
             if (!Active)
             {
                 _paramsIdx = 0;
-                return 0;
+                if (_offParams == null)
+                {
+                    _offParams = GraphicsBuffer.CreateUpload<GpuParams>(1, mapped: true);
+                    unsafe { *_offParams.WritePtr<GpuParams>() = default; }
+                }
+                return _offParams.SrvIndex;
             }
             if (_preparedTick == Engine.TickCount)
                 return _paramsIdx;
@@ -243,8 +281,12 @@ namespace Freefall.Graphics
             var s = Settings;
 
             // The heights the volumes span: the layer and the towers, snapped so a preset blend rebakes rarely
+            // (a storm's rough base hangs up to BaseDip lower in places: clouds_cs.hlsl CloudBaseRough, CLOUD_BASE_DIP)
             float top = MathF.Max(s.Base + s.Thickness, s.TowerShare > 0f ? s.TowerTop * 1.12f : 0f);
-            float slabBottom = MathF.Floor(MathF.Max(s.Base, 0f) / 250f) * 250f;
+            // and a tower's ragged base up to 250 m lower: clouds_cs.hlsl CloudTowerEnvelope)
+            float rough = Math.Clamp((s.Coverage - 0.6f) / 0.25f, 0f, 1f) * Math.Clamp((s.Type - 0.4f) / 0.3f, 0f, 1f);
+            float dip = MathF.Max(BaseDip * rough, s.TowerShare > 0f ? 250f : 0f);
+            float slabBottom = MathF.Floor(MathF.Max(s.Base - dip, 0f) / 250f) * 250f;
             float slabTop = MathF.Max(MathF.Ceiling(top / 250f) * 250f, slabBottom + 250f);
             bool rebuild = slabBottom != _slabBottom || slabTop != _slabTop
                 || double.IsNaN(_lastHours) || Math.Abs(_gameHours - _lastHours) > 0.25;
@@ -325,6 +367,11 @@ namespace Freefall.Graphics
             }
 
             PlaceCells(s, slot);
+            PlaceRainShafts(s, slot, cx, cz);
+            UpdateFlash(s, cameraPos, cx, cz);
+            _describeCx = cx;
+            _describeCz = cz;
+            _describeFlash = FlashRelative(cameraPos, cx, cz);
 
             var wind = Wind.GeneratedDirection;
             var p = new GpuParams
@@ -351,6 +398,13 @@ namespace Freefall.Graphics
                 LightDir = lightDir,
                 LightIsMoon = moon ? 1u : 0u,
                 ProbeClouds = _probeCloudsState != ResourceStates.Common ? _probeCloudsSrv : 0u,
+                RainShafts = _rainShafts[slot]!.SrvIndex,
+                RainCount = (uint)_shaftCount,
+                FlashIntensity = FlashIntensityNow(),
+                FlashPos = FlashRelative(cameraPos, cx, cz),
+                // The light spreads through the cloud's mean extinction round the flash, a tenth of a full cloud's: at
+                // 0.4 only the core within ~1 km lit, where a flash lights a whole storm cell
+                FlashSpread = MathF.Max(s.Density, 0f) * 0.1f,
             };
             unsafe { *_params[slot]!.WritePtr<GpuParams>() = p; }
             _paramsIdx = _params[slot]!.SrvIndex;
@@ -400,7 +454,9 @@ namespace Freefall.Graphics
                         Top = s.Base + s.Thickness * 0.5f + (potential - s.Base - s.Thickness * 0.5f) * growth,
                         // Only a tall tower spreads an anvil, against the tropopause it does not reach here
                         Anvil = SmoothStep(0.4f, 0.65f, f) * decay * Math.Clamp((potential - 6000f) / 2500f, 0f, 1f),
-                        Rain = SmoothStep(0.45f, 0.55f, f) * (1f - SmoothStep(0.8f, 0.92f, f)),
+                        // Rain from a cumulonimbus (a potential top over ~5.5 km): fair-weather towers stay dry
+                        Rain = SmoothStep(0.45f, 0.55f, f) * (1f - SmoothStep(0.8f, 0.92f, f))
+                             * Math.Clamp((potential - 5500f) / 1500f, 0f, 1f),
                         Growth = f,
                     };
                 }
@@ -411,6 +467,139 @@ namespace Freefall.Graphics
                 for (int k = 0; k < _cellData.Length; k++) dst[k] = _cellData[k];
             }
         }
+
+        /// <summary>
+        /// The raining cells nearest the camera (at most <see cref="MaxRainShafts"/> within <see cref="RainShaftReach"/>),
+        /// for the march's rain shafts (clouds_cs.hlsl CloudRain): a column under the cell from the clouds' base, down to
+        /// the ground or the sea or, for about a third of them, thinning out in the air (virga). The ground ends a shaft
+        /// through the scene's depth; the sea here (the clouds are marched before the ocean is drawn: rain under the sea
+        /// counted as in front of it, and its fog dropped the shaft over the water).
+        /// </summary>
+        private static void PlaceRainShafts(in CloudSettings s, int slot, double cx, double cz)
+        {
+            float cellSize = (float)(Period / CellsPerSide);
+            float floor = Components.OceanRenderer.SeaLevel ?? -1000f;
+            _shaftCount = 0;
+            for (int j = 0; j < CellsPerSide; j++)
+            {
+                for (int i = 0; i < CellsPerSide; i++)
+                {
+                    ref var cell = ref _cellData[j * CellsPerSide + i];
+                    if (cell.Rain <= 0.02f || cell.Radius <= 0f)
+                        continue;
+                    float dx = (float)WrapDelta(i * cellSize + cell.Center.X - cx), dz = (float)WrapDelta(j * cellSize + cell.Center.Y - cz);
+                    float dist = MathF.Sqrt(dx * dx + dz * dz);
+                    if (dist > RainShaftReach)
+                        continue;
+                    uint h = Hash((uint)i + 977u, (uint)j + 131u);
+                    float virga = Rand(ref h), depth = Rand(ref h), seed = Rand(ref h);
+                    float bottom = virga < 0.35f ? MathF.Max(s.Base * (0.3f + 0.4f * depth), floor) : floor;
+                    var shaft = new GpuRainShaft
+                    {
+                        Center = new Vector2(dx, dz),
+                        Radius = cell.Radius * 0.8f,
+                        Rain = cell.Rain,
+                        Bottom = bottom,
+                        Seed = seed,
+                        // Virga thins out over its lower 30 %; rain that reaches the ground or the sea ends there
+                        Fade = virga < 0.35f ? 0.3f * (s.Base - bottom) : 0f,
+                    };
+                    // Keep the nearest: insert in order of distance
+                    int k = Math.Min(_shaftCount, MaxRainShafts - 1);
+                    if (_shaftCount == MaxRainShafts && dist >= _shaftDistance[k])
+                        continue;
+                    while (k > 0 && _shaftDistance[k - 1] > dist)
+                    {
+                        _shaftData[k] = _shaftData[k - 1];
+                        _shaftDistance[k] = _shaftDistance[k - 1];
+                        k--;
+                    }
+                    _shaftData[k] = shaft;
+                    _shaftDistance[k] = dist;
+                    if (_shaftCount < MaxRainShafts) _shaftCount++;
+                }
+            }
+            unsafe
+            {
+                var dst = _rainShafts[slot]!.WritePtr<GpuRainShaft>();
+                for (int k = 0; k < _shaftCount; k++) dst[k] = _shaftData[k];
+            }
+        }
+
+        private static double WrapDelta(double d)
+        {
+            d -= Period * Math.Floor(d / Period);
+            return d >= Period / 2 ? d - Period : d;
+        }
+
+        /// <summary>
+        /// Lightning (<see cref="CloudSettings.LightningRate"/> flashes a minute, at random intervals): a flash in one of
+        /// the raining cells near the camera, at a random place inside its column, 1-4 strokes over 0.05-0.3 s. Its place
+        /// stays put in cloud space (the wind carries it with the cloud).
+        /// </summary>
+        private static void UpdateFlash(in CloudSettings s, Vector3 cameraPos, double cx, double cz)
+        {
+            _flashClock += _lastDt;
+            if (_flashRequested && _shaftCount > 0)
+            {
+                _flashRequested = false;
+                StartFlash(s, cx, cz, 0);           // the nearest raining cell (the shafts' list is by distance)
+                return;
+            }
+            if (s.LightningRate <= 0f || _shaftCount == 0)
+                return;
+            _nextFlashIn -= _lastDt;
+            if (_nextFlashIn > 0f)
+                return;
+            _nextFlashIn = -MathF.Log(1f - (float)_flashRandom.NextDouble() * 0.999f) * 60f / s.LightningRate;
+            // A raining cell, the harder it rains the likelier (the nearest few are the shafts' list)
+            float total = 0f;
+            for (int k = 0; k < _shaftCount; k++) total += _shaftData[k].Rain;
+            float pick = (float)_flashRandom.NextDouble() * total;
+            int chosen = 0;
+            for (int k = 0; k < _shaftCount; k++)
+            {
+                pick -= _shaftData[k].Rain;
+                if (pick <= 0f) { chosen = k; break; }
+            }
+            StartFlash(s, cx, cz, chosen);
+        }
+
+        /// <summary>A flash on the next frame in the raining cell nearest the camera (SkyboxRenderer's button; tests).</summary>
+        public static void FlashNow() => _flashRequested = true;
+
+        /// <summary>A flash is lighting the clouds, or did so recently enough to be in the exposure's metering still
+        /// (its readback lags a few frames): AutoExposure holds still meanwhile.</summary>
+        public static bool FlashInMetering => _flashRequested || _flashClock < _flashLength + 0.4;
+
+        private static void StartFlash(in CloudSettings s, double cx, double cz, int chosen)
+        {
+            var shaft = _shaftData[chosen];
+            float angle = (float)_flashRandom.NextDouble() * MathF.Tau, r = shaft.Radius * 0.6f * MathF.Sqrt((float)_flashRandom.NextDouble());
+            float height = s.Base + (MathF.Max(s.TowerTop, s.Base + s.Thickness) - s.Base) * (0.2f + 0.4f * (float)_flashRandom.NextDouble());
+            _flashCloud = new Vector3((float)(cx + shaft.Center.X + r * MathF.Cos(angle)), height, (float)(cz + shaft.Center.Y + r * MathF.Sin(angle)));
+            _flashClock = 0.0;
+            _flashLength = 0.05f + 0.25f * (float)_flashRandom.NextDouble();
+            _flashStrokes = 1 + _flashRandom.Next(4);
+            _flashPeak = FlashPeakCandela * (0.5f + (float)_flashRandom.NextDouble());
+        }
+
+        // The flash's luminous intensity now: each stroke a jump that fades over ~25 ms
+        private static float FlashIntensityNow()
+        {
+            if (_flashClock > _flashLength + 0.15)
+                return 0f;
+            float t = (float)_flashClock, sum = 0f;
+            for (int k = 0; k < _flashStrokes; k++)
+            {
+                float tk = _flashLength * k / _flashStrokes;
+                if (t >= tk) sum += MathF.Exp(-(t - tk) / 0.025f);
+            }
+            return _flashPeak * MathF.Min(sum, 1.5f);
+        }
+
+        private static Vector3 FlashRelative(Vector3 cameraPos, double cx, double cz) =>
+            new((float)WrapDelta(_flashCloud.X - cx), _flashCloud.Y - cameraPos.Y, (float)WrapDelta(_flashCloud.Z - cz));
 
         private static uint Hash(uint x, uint y)
         {
@@ -578,7 +767,7 @@ namespace Freefall.Graphics
         public static object Describe() => new
         {
             active = Active,
-            slab = new[] { _slabBottom, _slabTop },
+            slab = float.IsNaN(_slabBottom) ? null : new[] { _slabBottom, _slabTop },     // NaN until the clouds first ran
             bakesThisFrame = _bakes.Count,
             voxelsBaked = _voxelsBaked,
             offset = new[] { _offsetX, _offsetZ },
@@ -587,7 +776,32 @@ namespace Freefall.Graphics
             towers = CountTowers(),
             lightLevelsThisFrame = _lightLevels.Count,
             litBy = _lightIsMoon ? "moon" : "sun",
+            rainShafts = _shaftCount,
+            nearestRainKm = _shaftCount > 0 ? _shaftDistance[0] / 1000f : -1f,
+            flashCandela = FlashIntensityNow(),
+            nextFlashInSeconds = Settings.LightningRate > 0f ? _nextFlashIn : -1f,
+            // Camera-relative xz (m) of the nearest raining cell and the nearest mature anvil, and the last flash (x, height
+            // over the camera, z): where to look for rain, mammatus, a flash
+            nearestRainAt = _shaftCount > 0 ? new[] { _shaftData[0].Center.X, _shaftData[0].Center.Y } : null,
+            nearestAnvilAt = NearestAnvil(),
+            lastFlashAt = new[] { _describeFlash.X, _describeFlash.Y, _describeFlash.Z },
         };
+
+        private static float[]? NearestAnvil()
+        {
+            float cellSize = (float)(Period / CellsPerSide), best = float.MaxValue;
+            float[]? at = null;
+            for (int j = 0; j < CellsPerSide; j++)
+                for (int i = 0; i < CellsPerSide; i++)
+                {
+                    var c = _cellData[j * CellsPerSide + i];
+                    if (c.Anvil < 0.5f) continue;
+                    float dx = (float)WrapDelta(i * cellSize + c.Center.X - _describeCx), dz = (float)WrapDelta(j * cellSize + c.Center.Y - _describeCz);
+                    float d = dx * dx + dz * dz;
+                    if (d < best) { best = d; at = new[] { dx, dz, c.Anvil, c.Top }; }
+                }
+            return at;
+        }
 
         private static int CountTowers()
         {
