@@ -131,6 +131,8 @@ namespace Freefall.Editor.Commands
                 exposure = Freefall.Graphics.AutoExposure.Describe(),
                 // The cloud layer as the air takes it: its mean density toward the sun and the moon, how much it hides them
                 cloudDeck = Freefall.Graphics.Atmosphere.DescribeCloudDeck(),
+                // The volumetric clouds: on, the slab's heights, this frame's bake, the wind's offset and heading, towers
+                clouds = Freefall.Graphics.Clouds.Describe(),
                 // System tree in update order, one "Name  ms" line per system (indent = nesting)
                 systems = Freefall.Base.Systems.Describe().Split('\n', StringSplitOptions.RemoveEmptyEntries)
             });

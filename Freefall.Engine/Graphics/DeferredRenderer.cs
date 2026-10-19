@@ -65,6 +65,9 @@ namespace Freefall.Graphics
         private uint _fogVolumeIdx;             // this frame's SceneConstants.FogVolumeIdx (0 = off)
         // This view's aerial perspective volume (the far haze), sized to its target: SceneConstants.AerialPerspectiveIdx
         private readonly AerialPerspectiveVolume _aerialPerspective = new();
+        // This view's volumetric clouds (half size): SceneConstants.CloudTargetIdx
+        private readonly CloudView _cloudView = new();
+        private uint _cloudTargetIdx;
         private Matrix4x4 _relativeVP;          // this frame's view-projection without translation
 
         // Screen-space shadows of the highest ranked point lights (TracePointLightScreenShadows): a mask each, and
@@ -542,6 +545,8 @@ namespace Freefall.Graphics
              _relativeVP = relativeVP;
              // ... and this view's aerial perspective volume, sized to it (filled by Atmosphere.Render just below)
              uint aerialPerspectiveIdx = _aerialPerspective.Prepare((int)compositeSize.Width, (int)compositeSize.Height);
+             // ... and its volumetric clouds (marched in 2g below, before the sky reads them; 0 = the 2D layer)
+             _cloudTargetIdx = _cloudView.Prepare((int)compositeSize.Width, (int)compositeSize.Height);
 
              foreach (var pair in Effect.MasterEffects)
              {
@@ -550,6 +555,7 @@ namespace Freefall.Graphics
                  pair.Value.SetParameter("FogVolumeIdx", _fogVolumeIdx);
                  pair.Value.SetParameter("FogVolumeRange", VolumetricFog?.Range ?? 0f);
                  pair.Value.SetParameter("AerialPerspectiveIdx", aerialPerspectiveIdx);
+                 pair.Value.SetParameter("CloudTargetIdx", _cloudTargetIdx);
              }
 
              // The atmosphere's LUTs for this view (sky-view, aerial perspective, ambient): the sky dome, the
@@ -727,6 +733,11 @@ namespace Freefall.Graphics
              // 2f. Exposure meter: the light at the camera past the terrain, the sky captures and the clouds, and the
              //     lamps near it, for the auto exposure (read back a few frames later)
              AutoExposure.MeterIncident(list, camera.Position, BindSceneConstantsForCompute);
+
+             // 2g. Volumetric clouds: this view's march through the field baked in Atmosphere.Render, before the sky pass
+             //     draws them (mesh_skybox.fx, SceneConstants.CloudTargetIdx)
+             if (_cloudTargetIdx != 0)
+                 _cloudView.Render(list, BindSceneConstantsForCompute);
 
              // 3. Sky pass
              using (_skyMarker.Auto())
@@ -1540,6 +1551,7 @@ namespace Freefall.Graphics
             ScreenSpaceShadows?.Dispose();
             VolumetricFog?.Dispose();
             _aerialPerspective.Dispose();
+            _cloudView.Dispose();
             foreach (var tracer in _pointScreenShadows) tracer?.Dispose();
             Gtao?.Dispose();
             ScreenSpaceDisplacement?.Dispose();

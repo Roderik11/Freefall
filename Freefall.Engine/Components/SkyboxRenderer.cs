@@ -124,12 +124,34 @@ namespace Freefall.Components
         [ValueRange(0f, 10f)]
         public float CloudSpeed = 1.0f;         // Speed multiplier
 
-        [ValueRange(500f, 5000f)]
-        public float CloudAltitude = 1800.0f;       // Cloud layer height in world units
+        [Description("The clouds' base, metres above sea level (the 2D layer's height)")]
+        [ValueRange(300f, 5000f)]
+        public float CloudAltitude = 1800.0f;
 
-        [Description("Share of the light a cloud sends back: lower = darker clouds (a storm)")]
+        [Description("Share of the light a droplet scatters rather than absorbs (real clouds ~0.99+); lower darkens a thick " +
+                     "cloud, whose light has scattered many times")]
+        [ValueRange(0.5f, 1f)]
+        public float CloudAlbedo = 0.99f;
+
+        [Description("Volumetric clouds: depth of the ordinary layer above its base, metres")]
+        [ValueRange(100f, 4000f)]
+        public float CloudThickness = 1000f;
+
+        [Description("Volumetric clouds: 0 stratus (a flat sheet), 0.5 stratocumulus, 1 cumulus (heaped, flat bases)")]
         [ValueRange(0f, 1f)]
-        public float CloudAlbedo = 0.8f;
+        public float CloudType = 1f;
+
+        [Description("Volumetric clouds: share of the storm cells that grow into towers (0 = none, 1 = a sky of them)")]
+        [ValueRange(0f, 1f)]
+        public float CloudTowers = 0f;
+
+        [Description("Volumetric clouds: the tallest tower's top, metres above sea level; from ~7000 they spread anvils")]
+        [ValueRange(1000f, 13000f)]
+        public float CloudTowerTop = 6000f;
+
+        [Description("Volumetric clouds: extinction per metre inside a cloud (cumulus 0.05-0.1, stratus 0.02-0.05)")]
+        [ValueRange(0.005f, 0.2f)]
+        public float CloudDensity = 0.05f;
 
         [ValueRange(0f, 1f)]
         public float CloudShadowStrength = 0.8f;    // How much sunlight the clouds block on the ground (0 = no cloud shadows)
@@ -213,6 +235,7 @@ namespace Freefall.Components
             // Deferred: the sky draw of the frames in flight still references the mesh
             Engine.Device.DeferDispose(Mesh);
             CurrentCloudShadowStrength = 0.0f;
+            Clouds.Settings = CloudSettings.Default;
             Atmosphere.Settings = AtmosphereSettings.Default;
         }
 
@@ -265,6 +288,24 @@ namespace Freefall.Components
             }
 
             CloudTime += (float)Time.Delta * CloudSpeed;
+
+            // The volumetric clouds (Graphics.Clouds): the wind's direction follows the game time, and carries them
+            double gameHours = Day * 24.0 + TimeOfDay;
+            Wind.GameHours = gameHours;
+            Clouds.Settings = new CloudSettings
+            {
+                Enabled = Enabled,
+                Coverage = CloudCoverage,
+                Type = CloudType,
+                Base = CloudAltitude,
+                Thickness = CloudThickness,
+                TowerShare = CloudTowers,
+                TowerTop = CloudTowerTop,
+                Density = CloudDensity,
+                Albedo = CloudAlbedo,
+                Speed = CloudSpeed,
+            };
+            Clouds.Advance((float)Time.Delta, Wind.GeneratedDirection, gameHours);
 
             CurrentCloudCoverage = CloudCoverage;
             CurrentCloudTime = CloudTime;
@@ -521,6 +562,11 @@ namespace Freefall.Components
             CloudAltitude = p.CloudAltitude;
             CloudAlbedo = p.CloudAlbedo;
             CloudShadowStrength = p.CloudShadowStrength;
+            CloudThickness = p.CloudThickness;
+            CloudType = p.CloudType;
+            CloudTowers = p.CloudTowers;
+            CloudTowerTop = p.CloudTowerTop;
+            CloudDensity = p.CloudDensity;
         }
 
         /// <summary>Capture the current look into a preset (inverse of ApplyPreset) — "save what I tweaked".</summary>
@@ -551,6 +597,11 @@ namespace Freefall.Components
             p.CloudAltitude = CloudAltitude;
             p.CloudAlbedo = CloudAlbedo;
             p.CloudShadowStrength = CloudShadowStrength;
+            p.CloudThickness = CloudThickness;
+            p.CloudType = CloudType;
+            p.CloudTowers = CloudTowers;
+            p.CloudTowerTop = CloudTowerTop;
+            p.CloudDensity = CloudDensity;
         }
 
         public void Draw()

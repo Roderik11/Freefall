@@ -136,6 +136,7 @@ namespace Freefall.Components
             // The atmosphere's parameters for this frame (sky, sun, fog: atmosphere_common.hlsli); its LUTs are made
             // by DeferredRenderer right after this, before anything is drawn
             uint atmosphereIdx = Graphics.Atmosphere.PrepareFrame(cameraPos.Y);
+            uint cloudParamsIdx = Graphics.Clouds.PrepareFrame(cameraPos);
             float exposure = Graphics.Atmosphere.Exposure;
             float emissiveExposure = Graphics.Atmosphere.EmissiveExposure;
             float sunLightScale = Graphics.Atmosphere.SunLightScale;
@@ -177,6 +178,7 @@ namespace Freefall.Components
                 pair.Value.SetParameter("CloudShadowStrength", SkyboxRenderer.CurrentCloudShadowStrength);
                 pair.Value.SetParameter("CloudShadowScale", SkyboxRenderer.CurrentCloudShadowScale);
                 pair.Value.SetParameter("CloudNoiseLUTIdx", SkyboxRenderer.CurrentCloudNoiseLUTIdx);
+                pair.Value.SetParameter("CloudParamsIdx", cloudParamsIdx);
             }
         }
         

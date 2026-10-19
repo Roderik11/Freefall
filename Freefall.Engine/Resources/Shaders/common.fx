@@ -47,6 +47,10 @@ cbuffer SceneConstants : register(b0)
     uint FogVolumeIdx;                 // bindless Texture3D: the air's light (rgb × Exposure) and transmittance (a) up to each slice; 0 = off
     float FogVolumeRange;              // metres of view depth it covers; the aerial perspective volume takes over past it
     uint AerialPerspectiveIdx;         // this view's aerial perspective volume (Graphics.AerialPerspectiveVolume, sized to it); 0 = AtmosphereParams.AerialPerspective
+
+    // ── Volumetric clouds (Graphics.Clouds, cloud_common.hlsli) ──
+    uint CloudParamsIdx;               // StructuredBuffer<CloudParams>: the cloud field this frame; 0 = no volumetric clouds
+    uint CloudTargetIdx;               // this view's clouds (Graphics.CloudView, half size): rgb their light × Exposure, a what they let through; 0 = none
 }
 
 // ── Large-scale variation of the ground and what grows on it (gputerrain.fx, grass cards, blades, flowers) ──

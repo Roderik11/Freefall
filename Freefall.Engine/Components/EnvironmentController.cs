@@ -180,11 +180,11 @@ namespace Freefall.Components
             // How bright this weather reads: added to the auto exposure's metering
             Graphics.AutoExposure.PresetCompensation = _current.ExposureCompensation;
 
-            var wind = _current.WindVector;
+            // Vegetation sways in the preset's wind (grass, flowers, leaves; Graphics.Wind): its speed; the direction is
+            // the generated one, which the clouds drift in too
+            Graphics.Wind.Speed = _current.WindStrength;
+            var wind = Graphics.Wind.Velocity;
             var camPos = Camera.Main?.Position ?? Vector3.Zero;
-
-            // Vegetation sways in the preset's wind (grass, flowers, leaves; Graphics.Wind)
-            Graphics.Wind.Velocity = wind;
 
             // Every other emitter takes the share of it that its WeatherWind asks for (flames, smoke)
             Graphics.ParticleSystem.WeatherWind = DriveWind ? wind : Vector3.Zero;
@@ -237,7 +237,7 @@ namespace Freefall.Components
             _target = null;
             Graphics.AutoExposure.PresetCompensation = 0f;
             Graphics.ParticleSystem.WeatherWind = Vector3.Zero;
-            Graphics.Wind.Velocity = Graphics.Wind.DefaultVelocity;
+            Graphics.Wind.Speed = Graphics.Wind.DefaultSpeed;
             if (_lastRain != null) ReleaseEmitter(_lastRain);
             if (_lastSnow != null) ReleaseEmitter(_lastSnow);
             if (_lastHail != null) ReleaseEmitter(_lastHail);

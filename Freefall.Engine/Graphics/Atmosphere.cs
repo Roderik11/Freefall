@@ -406,6 +406,9 @@ namespace Freefall.Graphics
             // perspective, which reads it
             TerrainLightShadow.Render(list);
 
+            // The volumetric clouds' field round the camera: the brick columns that entered or are due (once per frame)
+            Clouds.Render(list);
+
             // Transmittance and multiple scattering: only when the medium changed
             if (!_mediumValid || !_frame.SameMedium(_medium))
             {

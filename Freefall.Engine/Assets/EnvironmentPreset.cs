@@ -94,13 +94,34 @@ namespace Freefall.Assets
         [ValueRange(0f, 10f)]
         public float CloudSpeed = 1.0f;
 
-        [Description("Cloud layer height in world units")]
-        [ValueRange(500f, 5000f)]
+        [Description("The clouds' base, metres above sea level (the 2D layer's height)")]
+        [ValueRange(300f, 5000f)]
         public float CloudAltitude = 1800.0f;
 
-        [Description("Share of the light a cloud sends back: lower = darker clouds (a storm)")]
+        [Description("Share of the light a droplet scatters rather than absorbs (real clouds ~0.99+); lower darkens a thick " +
+                     "cloud, whose light has scattered many times")]
+        [ValueRange(0.5f, 1f)]
+        public float CloudAlbedo = 0.99f;
+
+        [Description("Volumetric clouds: depth of the ordinary layer above its base, metres")]
+        [ValueRange(100f, 4000f)]
+        public float CloudThickness = 1000f;
+
+        [Description("Volumetric clouds: 0 stratus (a flat sheet), 0.5 stratocumulus, 1 cumulus (heaped, flat bases)")]
         [ValueRange(0f, 1f)]
-        public float CloudAlbedo = 0.8f;
+        public float CloudType = 1f;
+
+        [Description("Volumetric clouds: share of the storm cells that grow into towers (0 = none, 1 = a sky of them)")]
+        [ValueRange(0f, 1f)]
+        public float CloudTowers = 0f;
+
+        [Description("Volumetric clouds: the tallest tower's top, metres above sea level; from ~7000 they spread anvils")]
+        [ValueRange(1000f, 13000f)]
+        public float CloudTowerTop = 6000f;
+
+        [Description("Volumetric clouds: extinction per metre inside a cloud (cumulus 0.05-0.1, stratus 0.02-0.05)")]
+        [ValueRange(0.005f, 0.2f)]
+        public float CloudDensity = 0.05f;
 
         [Description("How much sunlight the clouds block on the ground (0 = no cloud shadows)")]
         [ValueRange(0f, 1f)]
@@ -129,23 +150,10 @@ namespace Freefall.Assets
         [ValueRange(0f, 2f)]
         public float DustIntensity = 0f;
 
-        [Description("Compass heading the wind blows toward, degrees (0=+X, 90=+Z)")]
-        [ValueRange(0f, 360f)]
-        public float WindDirection = 0f;
-
-        [Description("Wind speed in m/s, applied to weather emitters and cloud drift")]
+        [Description("Wind speed in m/s near the ground: vegetation, the weather's particles, the sea. Its direction is " +
+                     "not set here: it wanders with the time of day (Graphics.Wind), the clouds drifting the same way")]
         [ValueRange(0f, 50f)]
         public float WindStrength = 0f;
-
-        /// <summary>Wind as a world-space velocity vector.</summary>
-        public Vector3 WindVector
-        {
-            get
-            {
-                float rad = WindDirection * (MathF.PI / 180f);
-                return new Vector3(MathF.Cos(rad), 0f, MathF.Sin(rad)) * WindStrength;
-            }
-        }
 
         // ── Blending ──
 
@@ -157,10 +165,7 @@ namespace Freefall.Assets
         /// <summary>Copy every parameter (not the asset identity) from another preset.</summary>
         public void CopyFrom(EnvironmentPreset src) => Lerp(src, src, 0f, this);
 
-        /// <summary>
-        /// Linearly blend <paramref name="a"/> and <paramref name="b"/> into <paramref name="dest"/>.
-        /// Wind direction is blended through its vector so 350° → 10° does not swing through 180°.
-        /// </summary>
+        /// <summary>Linearly blend <paramref name="a"/> and <paramref name="b"/> into <paramref name="dest"/>.</summary>
         public static void Lerp(EnvironmentPreset a, EnvironmentPreset b, float t, EnvironmentPreset dest)
         {
             t = Math.Clamp(t, 0f, 1f);
@@ -188,6 +193,11 @@ namespace Freefall.Assets
             dest.CloudAltitude = L(a.CloudAltitude, b.CloudAltitude, t);
             dest.CloudAlbedo = L(a.CloudAlbedo, b.CloudAlbedo, t);
             dest.CloudShadowStrength = L(a.CloudShadowStrength, b.CloudShadowStrength, t);
+            dest.CloudThickness = L(a.CloudThickness, b.CloudThickness, t);
+            dest.CloudType = L(a.CloudType, b.CloudType, t);
+            dest.CloudTowers = L(a.CloudTowers, b.CloudTowers, t);
+            dest.CloudTowerTop = L(a.CloudTowerTop, b.CloudTowerTop, t);
+            dest.CloudDensity = L(a.CloudDensity, b.CloudDensity, t);
 
             dest.ExposureCompensation = L(a.ExposureCompensation, b.ExposureCompensation, t);
 
@@ -196,11 +206,7 @@ namespace Freefall.Assets
             dest.HailIntensity = L(a.HailIntensity, b.HailIntensity, t);
             dest.DustIntensity = L(a.DustIntensity, b.DustIntensity, t);
 
-            var wind = Vector3.Lerp(a.WindVector, b.WindVector, t);
-            dest.WindStrength = wind.Length();
-            dest.WindDirection = dest.WindStrength > 1e-4f
-                ? (MathF.Atan2(wind.Z, wind.X) * (180f / MathF.PI) + 360f) % 360f
-                : L(a.WindDirection, b.WindDirection, t);
+            dest.WindStrength = L(a.WindStrength, b.WindStrength, t);
         }
     }
 }

@@ -602,6 +602,12 @@ namespace Freefall
          [ValueRange(32f, 512f)]
          public float VolumetricFogRange { get; set; } = 128f;
 
+         // Volumetric clouds (Graphics.Clouds, VOLUMETRIC_CLOUDS_PLAN.md): the cloud field baked round the camera and
+         // marched per view. Off: the 2D cloud layer. In stage 1 the sky dome alone draws them (the probe, the shadows
+         // and the haze still take the 2D layer).
+         [Category("Clouds")]
+         public bool VolumetricClouds { get; set; } = false;
+
          // Camera exposure as EV100: light in physical units (lux, cd/m²) times 1 / (1.2 · 2^EV) is what the
          // tonemapper sees; higher = darker image. Auto: metered from the scene each frame (Graphics.AutoExposure).
          // Off: ExposureEV, which the captures lock (13.36 = Atmosphere.ReferenceEV shows light sources in the

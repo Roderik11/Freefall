@@ -338,8 +338,8 @@ FragmentOutput PS_Procedural(VertexOutput input)
         bool hitsGround = RaySphereIntersectNearest(float3(0, viewHeight, 0), viewDir, float3(0, 0, 0), A.BottomRadius) >= 0.0;
         float3 viewT = hitsGround ? 0 : AtmTransmittance(A, viewHeight, viewDir.y);
 
+        // Capped below for the 2D layer; the volumetric clouds dim it first (what a thin edge lets through keeps its glare)
         float3 sun = SunDisc(A, viewDir, pixelAngle) * viewT * Exposure;
-        sun *= min(1.0, SunDiscMaxPixel / max(max(sun.r, max(sun.g, sun.b)), 1e-6));
 
         // Stars only where they could show against the sky's light: by day they are a millionth of it
         float3 stars = 0;
@@ -353,6 +353,26 @@ FragmentOutput PS_Procedural(VertexOutput input)
         sunBehind = sun;
         behindClouds = (starsLeft * Exposure + moons * MoonExposure()) * viewT;
     }
+
+    // The volumetric clouds (VOLUMETRIC_CLOUDS_PLAN.md): this view's march (clouds_cs.hlsl CSCloudMarch, half size), the
+    // clouds' light with the air in front of them and what they let through, which dims the sky behind them and the sun,
+    // the moons and the stars by the clouds' own optical depth
+    if (CloudTargetIdx != 0)
+    {
+        Texture2D<float4> clouds = ResourceDescriptorHeap[CloudTargetIdx];
+        float4 c = clouds.SampleLevel(AtmosphereLinearClamp, input.Position.xy / ViewportSize, 0);
+        float3 sunThrough = sunBehind * c.a;
+        sunThrough *= min(1.0, SunDiscMaxPixel / max(max(sunThrough.r, max(sunThrough.g, sunThrough.b)), 1e-6));
+        skyColor = skyColor * c.a + c.rgb + sunThrough + behindClouds * c.a;
+
+        output.Albedo = float4(skyColor, 1);
+        output.Normal = float4(0, 1, 0, 1);
+        output.Data = float4(0, 0, 0, 0);
+        output.Depth = float4(0, 0, 0, 0);
+        output.fDepth = 0;
+        return output;
+    }
+    sunBehind *= min(1.0, SunDiscMaxPixel / max(max(sunBehind.r, max(sunBehind.g, sunBehind.b)), 1e-6));
 
     // The cloud layer over the sky's light (sky_common.fx)
     float density;
