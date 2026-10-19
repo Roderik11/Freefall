@@ -167,10 +167,12 @@ namespace Freefall.Graphics
             // there, and on the terrain's border (past it the seabed is unknown)
             float sourceDepth = 2f / k0;
 
+            // Per cell: the travel time, the ray's along-crest coordinate where it left the deep sea (the deep heading turned
+            // left, d⊥·x there) and the exposure
+            var dPerp = new Vector2(-dir.Y, dir.X);
             var slowness = new float[count];
             var tau = new float[count];
-            var ux = new float[count];
-            var uz = new float[count];
+            var side = new float[count];
             var exposure = new float[count];
             var state = new byte[count];          // 0 far, 1 trial, 2 known
             var source = new bool[count];
@@ -192,8 +194,7 @@ namespace Freefall.Graphics
                 {
                     var p = origin + new Vector2(x * hx, z * hz);
                     tau[i] = Vector2.Dot(dir, p) / c0;
-                    ux[i] = p.X;
-                    uz[i] = p.Y;
+                    side[i] = Vector2.Dot(dPerp, p);
                     exposure[i] = 1f;
                     state[i] = 2;
                     source[i] = true;
@@ -201,8 +202,8 @@ namespace Freefall.Graphics
             }
 
             // Fast marching: cells become known in order of arrival time, each from its known neighbours (first-order
-            // upwind). Along with the time each cell takes where its ray came from: the deep sea position u (moved on
-            // along the deep heading as far as the wave would have travelled there in the same time) and the exposure
+            // upwind). Along with the time each cell takes from where its ray came: the ray's along-crest coordinate (it
+            // keeps it all the way) and the exposure
             var queue = new PriorityQueue<int, float>();
 
             bool Relax(int i)
@@ -251,7 +252,7 @@ namespace Freefall.Graphics
                 if (wsum <= 0f) { wx = nxI >= 0 ? 1f : 0f; wz = 1f - wx; wsum = 1f; }
                 wx /= wsum; wz /= wsum;
 
-                float tauUp = 0f, uxUp = 0f, uzUp = 0f, eUp = 0f;
+                float sideUp = 0f, eUp = 0f;
                 float gl = MathF.Sqrt(gx * gx + gz * gz);
                 float along = gl > 0f ? (gx * dir.X + gz * dir.Y) / gl : 1f;
                 // A ray leaving the deep sea has to run with the wave: on a lee shore it would run against it, and
@@ -259,19 +260,17 @@ namespace Freefall.Graphics
                 float leave = Smooth(-0.1f, 0.4f, along);
                 if (nxI >= 0)
                 {
-                    tauUp += wx * a; uxUp += wx * ux[nxI]; uzUp += wx * uz[nxI];
+                    sideUp += wx * side[nxI];
                     eUp += wx * exposure[nxI] * (source[nxI] ? leave : 1f);
                 }
                 if (nzI >= 0)
                 {
-                    tauUp += wz * b; uxUp += wz * ux[nzI]; uzUp += wz * uz[nzI];
+                    sideUp += wz * side[nzI];
                     eUp += wz * exposure[nzI] * (source[nzI] ? leave : 1f);
                 }
 
                 tau[i] = t;
-                float travelled = c0 * (t - tauUp);
-                ux[i] = uxUp + dir.X * travelled;
-                uz[i] = uzUp + dir.Y * travelled;
+                side[i] = sideUp;
                 exposure[i] = eUp;
                 return true;
             }
@@ -306,9 +305,25 @@ namespace Freefall.Graphics
                 if (z < n - 1 && sea[i + n] && state[i + n] != 2) Push(i + n);
             }
 
-            // From u: its Jacobian, the wave height (energy flux kept between rays: det J = (c0/c)·(b0/b), so
-            // H/H0 = √(det J · ½ / n), n the group over phase speed), and the blend back to no warp toward deep water
-            // and the terrain's border
+            var known = new bool[count];
+            for (int i = 0; i < count; i++) known[i] = sea[i] && state[i] == 2;
+
+            // Smooth what first-order marching leaves: the travel time's corners where the rays from two sides meet (a crease
+            // in the crests) a little, in symmetric windows only (on a straight slope that changes nothing); the rays'
+            // along-crest coordinate, which marching copies from one neighbour or the other in steps, over a quarter
+            // wavelength like the height (it only sets how far the rays spread)
+            int radius = Math.Clamp((int)MathF.Round(0.25f * (2f * MathF.PI / k0) / MathF.Max(hx, hz)), 1, 24);
+            SmoothSymmetric(tau, n, known, 2);
+            for (int pass = 0; pass < 2; pass++)
+                BoxBlurWide(side, n, known, radius);
+
+            // The sample position u: along the deep heading as far as the wave would have run in deep water in the same
+            // time (c0·τ, exact and smooth), across it where the point is: u = d·c0·τ + d⊥·(d⊥·x). Until 2026-10-19 u was
+            // carried along the rays as a whole, and the copied cross part stepped the breakers' crests sideways in stairs
+            // (user screenshots). J = d ⊗ c0∇τ + d⊥ ⊗ d⊥ turns the slopes. The height comes from the rays themselves:
+            // the energy flux between two rays is kept, det(∂(c0τ, side)/∂x) = c0·(∇τ × ∇side) = (c0/c)·(b0/b), so
+            // H/H0 = √(det · ½ / n), n the group over phase speed. Then the blend back to no warp toward deep water and the
+            // terrain's border
             var jac = new float[count * 4];
             var amp = new float[count];
             var speed = new float[count];
@@ -319,20 +334,27 @@ namespace Freefall.Graphics
                 int i = z * n + x;
                 jac[i * 4 + 0] = 1f; jac[i * 4 + 3] = 1f;
                 amp[i] = 1f; speed[i] = 1f; blend[i] = 1f;
-                if (!sea[i] || state[i] != 2) continue;
+                if (!known[i]) continue;
 
                 // Central differences where both neighbours are sea, one-sided at the coast
-                bool l = x > 0 && sea[i - 1] && state[i - 1] == 2, rt = x < n - 1 && sea[i + 1] && state[i + 1] == 2;
-                bool d = z > 0 && sea[i - n] && state[i - n] == 2, u = z < n - 1 && sea[i + n] && state[i + n] == 2;
+                bool l = x > 0 && known[i - 1], rt = x < n - 1 && known[i + 1];
+                bool d = z > 0 && known[i - n], u = z < n - 1 && known[i + n];
                 int x0 = l ? i - 1 : i, x1 = rt ? i + 1 : i;
                 int z0 = d ? i - n : i, z1 = u ? i + n : i;
                 float dxs = (x1 - x0) * hx, dzs = ((z1 - z0) / n) * hz;
-                if (dxs > 0f) { jac[i * 4 + 0] = (ux[x1] - ux[x0]) / dxs; jac[i * 4 + 2] = (uz[x1] - uz[x0]) / dxs; }
-                if (dzs > 0f) { jac[i * 4 + 1] = (ux[z1] - ux[z0]) / dzs; jac[i * 4 + 3] = (uz[z1] - uz[z0]) / dzs; }
+                float tx = dxs > 0f ? (tau[x1] - tau[x0]) / dxs : dir.X / c0;
+                float tz = dzs > 0f ? (tau[z1] - tau[z0]) / dzs : dir.Y / c0;
+                float sx = dxs > 0f ? (side[x1] - side[x0]) / dxs : dPerp.X;
+                float sz = dzs > 0f ? (side[z1] - side[z0]) / dzs : dPerp.Y;
+
+                jac[i * 4 + 0] = dir.X * c0 * tx + dPerp.X * dPerp.X;
+                jac[i * 4 + 1] = dir.X * c0 * tz + dPerp.X * dPerp.Y;
+                jac[i * 4 + 2] = dir.Y * c0 * tx + dPerp.Y * dPerp.X;
+                jac[i * 4 + 3] = dir.Y * c0 * tz + dPerp.Y * dPerp.Y;
 
                 float h = MathF.Max(depth[i], MinDepth);
                 float kh = WaveNumberDepth(omega, h);
-                float det = jac[i * 4 + 0] * jac[i * 4 + 3] - jac[i * 4 + 1] * jac[i * 4 + 2];
+                float det = c0 * (tx * sz - tz * sx);
                 float k = MathF.Sqrt(Math.Clamp(det * 0.5f / GroupRatio(kh), 0f, 6f));
                 amp[i] = k * exposure[i];
                 speed[i] = (omega * h / kh) / c0;                       // c / c0
@@ -341,12 +363,10 @@ namespace Freefall.Graphics
                                      1f - Smooth(0f, BorderFade, borderDist[i]));
             }
 
-            // Smooth the Jacobian (first-order marching leaves grid noise in its derivatives), and the height over about a
-            // quarter wavelength: a wave's height cannot change faster than that (diffraction blurs the edge of an island's
-            // shadow, where the rays from its two sides meet and the exposure jumps)
-            for (int pass = 0; pass < 2; pass++)
-                BoxBlur(jac, 4, n, sea);
-            int radius = Math.Clamp((int)MathF.Round(0.25f * (2f * MathF.PI / k0) / MathF.Max(hx, hz)), 1, 24);
+            // The Jacobian a little (the slopes' grid noise), the height over about a quarter wavelength: a wave's height
+            // cannot change faster than that (diffraction blurs the edge of an island's shadow, where the rays from its two
+            // sides meet and the exposure jumps)
+            BoxBlur(jac, 4, n, sea);
             for (int pass = 0; pass < 3; pass++)
                 BoxBlurWide(amp, n, sea, radius);
 
@@ -357,15 +377,17 @@ namespace Freefall.Graphics
                 int i = z * n + x;
                 float w = blend[i];
                 var p = origin + new Vector2(x * hx, z * hz);
-                bool known = sea[i] && state[i] == 2;
-                r.Warp[o + i * 4 + 0] = known ? (ux[i] - p.X) * (1f - w) : 0f;
-                r.Warp[o + i * 4 + 1] = known ? (uz[i] - p.Y) * (1f - w) : 0f;
-                r.Warp[o + i * 4 + 2] = known ? amp[i] + (1f - amp[i]) * w : 1f;
-                r.Warp[o + i * 4 + 3] = known ? speed[i] + (1f - speed[i]) * w : 1f;
+                bool ok = known[i];
+                // u − x = d·(c0·τ − d·x): the warp moves a point along the deep heading only
+                float ahead = ok ? (c0 * tau[i] - Vector2.Dot(dir, p)) * (1f - w) : 0f;
+                r.Warp[o + i * 4 + 0] = dir.X * ahead;
+                r.Warp[o + i * 4 + 1] = dir.Y * ahead;
+                r.Warp[o + i * 4 + 2] = ok ? amp[i] + (1f - amp[i]) * w : 1f;
+                r.Warp[o + i * 4 + 3] = ok ? speed[i] + (1f - speed[i]) * w : 1f;
                 for (int c = 0; c < 4; c++)
                 {
                     float id = c == 0 || c == 3 ? 1f : 0f;
-                    r.Jacobian[o + i * 4 + c] = (Half)(known ? jac[i * 4 + c] + (id - jac[i * 4 + c]) * w : id);
+                    r.Jacobian[o + i * 4 + c] = (Half)(ok ? jac[i * 4 + c] + (id - jac[i * 4 + c]) * w : id);
                 }
             }
 
@@ -438,6 +460,36 @@ namespace Freefall.Graphics
                         sum += copy[j * stride + c]; cnt++;
                     }
                     data[i * stride + c] = sum / cnt;
+                }
+            }
+        }
+
+        // Average over ±r cells along rows, then columns, only where the whole window is usable (else the cell keeps its
+        // value): symmetric windows leave a straight slope as it is, so a steep field like the travel time near the
+        // coast is not pulled toward its land side
+        private static void SmoothSymmetric(float[] data, int n, bool[] ok, int r)
+        {
+            var tmp = (float[])data.Clone();
+            for (int pass = 0; pass < 2; pass++)
+            {
+                bool rows = pass == 0;
+                var src = rows ? data : tmp;
+                var dst = rows ? tmp : data;
+                for (int line = 0; line < n; line++)
+                for (int k = 0; k < n; k++)
+                {
+                    int i = rows ? line * n + k : k * n + line;
+                    dst[i] = src[i];
+                    if (!ok[i] || k < r || k >= n - r) continue;
+                    float sum = 0f;
+                    bool full = true;
+                    for (int m = -r; m <= r && full; m++)
+                    {
+                        int j = rows ? line * n + k + m : (k + m) * n + line;
+                        full = ok[j];
+                        sum += src[j];
+                    }
+                    if (full) dst[i] = sum / (2 * r + 1);
                 }
             }
         }

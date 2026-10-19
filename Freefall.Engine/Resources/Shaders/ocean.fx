@@ -283,33 +283,57 @@ BandWarp SampleBandWarp(OceanData ocean, uint slice, float2 worldXZ, float2 terr
 // The surf's wave at a point. A carried band's height and its sideways displacement along the local heading are in
 // quadrature (η = A·cos φ, D = −λ·A·sin φ, λ the choppiness), which gives the wave's local amplitude and phase with no
 // history: so each wave knows on its own whether it has broken, and where its crest and its trail are.
+// Per carried band (a warp slice), so the two blend by their energy: following whichever was stronger (until
+// 2026-10-19) jumped the phase where they were about equal, a zig-zag in the swash's edge on the sand
 struct SurfWave
 {
-    float eta;         // the carried bands' height (m)
-    float envelope;    // the strongest carried band's local amplitude A (m)
-    float phase;       // its phase: 0 on the crest, > 0 ahead of it (still to come), < 0 behind it (passed)
-    float2 heading;    // its local heading (world xz)
+    float eta;             // the carried bands' height (m)
+    float2 envelope;       // each carried band's local amplitude A (m)
+    float2 phase;          // its phase: 0 on the crest, > 0 ahead of it (still to come), < 0 behind it (passed)
+    float4 heading;        // its local heading (world xz): slice 0 in xy, slice 1 in zw
 };
 
 //   d: a carried band's displacement in world xz (turned to the local heading) and height, both × its amplitude
-void AddSurfWave(inout SurfWave s, OceanData ocean, float3 d, float2 heading)
+void AddSurfWave(inout SurfWave s, OceanData ocean, float3 d, float2 heading, uint slice)
 {
     float quadrature = -dot(d.xz, heading) / max(ocean.Choppiness, 0.05);
     float envelope = sqrt(d.y * d.y + quadrature * quadrature);
+    float phase = atan2(quadrature, d.y);
     s.eta += d.y;
-    if (envelope > s.envelope)
-    {
-        s.envelope = envelope;
-        s.phase = atan2(quadrature, d.y);
-        s.heading = heading;
-    }
+    if (slice == 0) { s.envelope.x = envelope; s.phase.x = phase; s.heading.xy = heading; }
+    else            { s.envelope.y = envelope; s.phase.y = phase; s.heading.zw = heading; }
+}
+
+// The carried bands' amplitude together, and each band's share of their energy
+float SurfEnvelope(SurfWave s) { return length(s.envelope); }
+float2 SurfShare(SurfWave s) { return s.envelope * s.envelope / max(dot(s.envelope, s.envelope), 1e-8); }
+
+// The local heading, weighted by the bands' energy
+float2 SurfHeading(SurfWave s)
+{
+    float2 share = SurfShare(s);
+    float2 h = s.heading.xy * share.x + s.heading.zw * share.y;
+    return dot(h, h) > 1e-8 ? normalize(h) : float2(1.0, 0.0);
 }
 
 // Shoaling waves break when they stand about 0.8 × the depth from trough to crest: 0 before, 1 once broken (inside the
 // surf zone every wave stays broken: as the water shallows its height keeps up with the depth)
 float SurfBreaking(SurfWave s, float depth)
 {
-    return smoothstep(0.55, 0.85, 2.0 * s.envelope / max(depth, 0.05));
+    return smoothstep(0.55, 0.85, 2.0 * SurfEnvelope(s) / max(depth, 0.05));
+}
+
+// Where in its period the arriving wave is, 0 as its crest arrives (rising with time), and how much the bore is running
+// up the beach then (0..1, quick up for SurgeRise of the period, slow down)
+float SwashRise(float phase)
+{
+    float cycle = frac(1.0 - phase / 6.2831853);
+    return cycle < SurgeRise ? smoothstep(0.0, SurgeRise, cycle) : 1.0 - smoothstep(SurgeRise, 1.0, cycle);
+}
+float SwashAdvancing(float phase)
+{
+    float cycle = frac(1.0 - phase / 6.2831853);
+    return max(1.0 - smoothstep(SurgeRise, SurgeRise + 0.2, cycle), smoothstep(0.92, 1.0, cycle));
 }
 
 // How far a breaking face leans forward over its trough, per metre of crest height (m/m)
@@ -325,10 +349,18 @@ float SurfBreaking(SurfWave s, float depth)
 // wave's period) as far as its height carries it (at most ShoreSurge) and drains back slowly, in step with the wave
 float SwashLevel(SurfWave s, float maxRunUp)
 {
-    float cycle = frac(1.0 - s.phase / 6.2831853);    // 0 as the crest arrives, rising with time
-    float rise = cycle < SurgeRise ? smoothstep(0.0, SurgeRise, cycle) : 1.0 - smoothstep(SurgeRise, 1.0, cycle);
-    float runUp = min(SWASH_RUNUP * 2.0 * s.envelope, maxRunUp);
+    float2 share = SurfShare(s);
+    float rise = SwashRise(s.phase.x) * share.x + SwashRise(s.phase.y) * share.y;
+    float runUp = min(SWASH_RUNUP * 2.0 * SurfEnvelope(s), maxRunUp);
     return lerp(-SWASH_DRAWDOWN * runUp, runUp, rise);
+}
+
+// The broken water a carried band's wave carries at its phase: the roller on its crest and face, the trail behind it
+float2 SurfRollerTrail(float phase)
+{
+    float roller = exp(-(phase - 0.1) * (phase - 0.1) / 0.12);
+    float trail = phase < 0.0 ? 0.7 * exp(phase / 0.8) : 0.0;
+    return float2(roller, trail);
 }
 
 // The water stands no higher over the seabed than a breaking wave allows (a wave breaks at about 0.78 × the depth from
@@ -349,7 +381,6 @@ float3 SampleDisplacement(OceanData ocean, float2 worldXZ, float depthAtten, flo
                           float2 terrainUV, bool surf, out SurfWave wave)
 {
     wave = (SurfWave)0;
-    wave.heading = float2(1.0, 0.0);
     Texture2DArray<float4> dispTex = ResourceDescriptorHeap[ocean.DisplacementSRV];
     StructuredBuffer<float> tileScales = ResourceDescriptorHeap[ocean.TileScalesSRV];
     float3 totalDisp = 0;
@@ -388,7 +419,7 @@ float3 SampleDisplacement(OceanData ocean, float2 worldXZ, float depthAtten, flo
         d.xz = float2(d.x * turn.x - d.z * turn.y, d.x * turn.y + d.z * turn.x);
         totalDisp += d * amp;
         if (slice != 0xFF)
-            AddSurfWave(wave, ocean, d * amp, heading);
+            AddSurfWave(wave, ocean, d * amp, heading, slice);
     }
 
     return totalDisp * depthAtten;
@@ -579,7 +610,7 @@ DSOutput DS(HullConstantOutput patchConstants,
 
         // A breaking wave's face leans forward over its trough: the higher a point of the crest, the further ahead
         float breaking = SurfBreaking(surf, shoreDepth);
-        displacement.xz += surf.heading * (SURF_LEAN * breaking * max(displacement.y, 0.0));
+        displacement.xz += SurfHeading(surf) * (SURF_LEAN * breaking * max(displacement.y, 0.0));
 
         // The swash: by the waterline and up the beach the level is the bores' run-up, each arriving wave's own, in step
         // with it. Until 2026-10-19 a clock (ShoreClock, noise-staggered) and a hash per wave (WaveStrength) ran it
@@ -665,7 +696,6 @@ PSOutput PS(DSOutput input)
     float2 surfUV = saturate((worldXZ - float2(ocean.TerrainOriginX, ocean.TerrainOriginZ))
                              / float2(ocean.TerrainSizeX, ocean.TerrainSizeZ));
     SurfWave surfWave = (SurfWave)0;
-    surfWave.heading = float2(1.0, 0.0);
 
     // Whitecaps (C# WhitecapBand, NoWhitecapBands): only the wind band holding the wind sea's peak, the waves one sees
     // break (the finer the calmer the sea), makes foam; the other wind bands store how squeezed their crests are right
@@ -726,7 +756,7 @@ PSOutput PS(DSOutput input)
             // The surf's wave: its height and its sideways displacement along the local heading (as the DS has them)
             float2 side = RotateUV(disp.xz, -angle);
             side = float2(side.x * turn.x - side.y * turn.y, side.x * turn.y + side.y * turn.x);
-            AddSurfWave(surfWave, ocean, float3(side.x, disp.y, side.y), heading);
+            AddSurfWave(surfWave, ocean, float3(side.x, disp.y, side.y), heading, slice);
         }
 
         // Counter-rotate the mean slope back to world space (the variance does not depend on the rotation)
@@ -930,9 +960,12 @@ PSOutput PS(DSOutput input)
     if (ocean.ShoreWarpSRV != 0 && shoreDepth < 1e3)
     {
         float breaking = SurfBreaking(surfWave, shoreDepth);
-        float ahead = surfWave.phase;                    // > 0: the crest is still to come, < 0: it has passed
-        float roller = breaking * exp(-(ahead - 0.1) * (ahead - 0.1) / 0.12);
-        float trail = breaking * (ahead < 0.0 ? 0.7 * exp(ahead / 0.8) : 0.0) + SURF_BUBBLES * breaking * breaking;
+        // Each carried band's roller and trail at its own phase, the weaker band's in proportion to its height
+        float2 weight = surfWave.envelope / max(max(surfWave.envelope.x, surfWave.envelope.y), 1e-6);
+        float2 rt0 = SurfRollerTrail(surfWave.phase.x) * weight.x;
+        float2 rt1 = SurfRollerTrail(surfWave.phase.y) * weight.y;
+        float roller = breaking * max(rt0.x, rt1.x);
+        float trail = breaking * max(rt0.y, rt1.y) + SURF_BUBBLES * breaking * breaking;
         // The roller is a churning white mass, broken only at its edges; what it leaves behind breaks up along the crests
         float structure = saturate(fineSqueeze / max(fineNorm, 1e-4));
         surfFoam = max(roller * saturate(SURF_ROLLER + SURF_CRESTS * structure),
@@ -979,8 +1012,8 @@ PSOutput PS(DSOutput input)
         // thinner while the water drains. Objects standing in deeper water keep their lace.
         if (ocean.ShoreWarpSRV != 0 && hasBeach)
         {
-            float cycle = frac(1.0 - surfWave.phase / 6.2831853);
-            float advancing = max(1.0 - smoothstep(SurgeRise, SurgeRise + 0.2, cycle), smoothstep(0.92, 1.0, cycle));
+            float2 share = SurfShare(surfWave);
+            float advancing = SwashAdvancing(surfWave.phase.x) * share.x + SwashAdvancing(surfWave.phase.y) * share.y;
             float onBeach = 1.0 - smoothstep(0.0, 0.5, bedDepth);
             lace *= lerp(1.0, lerp(0.45, 1.0, advancing), onBeach);
         }
