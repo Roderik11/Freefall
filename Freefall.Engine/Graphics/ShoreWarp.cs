@@ -17,7 +17,8 @@ namespace Freefall.Graphics
     /// Baked on a worker from the terrain's height field and the sea mask, per warped band (its heading and frequency),
     /// by fast marching the wave's travel time from deep water, where it is the plane wave's own. ocean.fx
     /// (SampleBandWarp) reads two texture arrays, a slice per warped band, laid out like the heightmap (row = Z):
-    /// RGBA32F (u − x, amplitude, wave speed / deep speed) and RGBA16F (∂u/∂x: ∂ux/∂x, ∂ux/∂z, ∂uz/∂x, ∂uz/∂z).
+    /// RGBA32F (u − x, amplitude, up the beach how far below the ridge before it a spot lies) and RGBA16F (∂u/∂x:
+    /// ∂ux/∂x, ∂ux/∂z, ∂uz/∂x, ∂uz/∂z).
     /// See .agent/knowledge/ocean_system/surf_plan.md.
     /// </summary>
     public sealed class ShoreWarp : IDisposable
@@ -36,6 +37,9 @@ namespace Freefall.Graphics
         /// <summary>The warp fades to nothing over this distance inside the terrain's border (m): past it the seabed is unknown.</summary>
         private const float BorderFade = 200f;
 
+        /// <summary>The share of the swell's height that wraps round an island to its lee shore.</summary>
+        private const float LeeShare = 0.3f;
+
         public struct Band
         {
             public int Index;            // the ocean band
@@ -52,7 +56,7 @@ namespace Freefall.Graphics
         {
             public int Size;
             public Band[] Bands = Array.Empty<Band>();
-            public float[] Warp = Array.Empty<float>();        // slice-major, Size² × (Δu.x, Δu.z, amplitude, c/c0)
+            public float[] Warp = Array.Empty<float>();        // slice-major, Size² × (Δu.x, Δu.z, amplitude, hollow m)
             public Half[] Jacobian = Array.Empty<Half>();      // slice-major, Size² × (∂ux/∂x, ∂ux/∂z, ∂uz/∂x, ∂uz/∂z)
             public double Milliseconds;
         }
@@ -115,11 +119,49 @@ namespace Freefall.Graphics
             for (int s = slices; s < MaxBands; s++)
                 FillIdentity(result, s, count);
 
+            var hollow = BeachHollows(n, depth, sea);
             for (int s = 0; s < slices; s++)
-                BakeBand(result, s, bands[s], n, hx, hz, origin, depth, sea, borderDist);
+                BakeBand(result, s, bands[s], n, hx, hz, origin, depth, sea, borderDist, hollow);
 
             result.Milliseconds = System.Diagnostics.Stopwatch.GetElapsedTime(start).TotalMilliseconds;
             return result;
+        }
+
+        // Up the beach (the sea mask's reach above the waterline): how far below the ridge between it and the sea each cell
+        // lies (m), 0 on a plain slope. The spill level of a priority flood from the water: the lowest level at which the
+        // swash reaches the cell, over any path; minus the cell's own height. ocean.fx keeps a hollow dry until the run-up
+        // tops its ridge. (Carried along the marched rays instead, the 4-neighbour grid lifted plain slope cells to a
+        // neighbour's height and the waterline frayed into grid stairs.)
+        private static float[] BeachHollows(int n, float[] depth, bool[] sea)
+        {
+            int count = n * n;
+            var spill = new float[count];
+            var queue = new PriorityQueue<int, float>();
+            for (int i = 0; i < count; i++)
+            {
+                spill[i] = float.PositiveInfinity;
+                if (sea[i] && depth[i] > 0f) { spill[i] = 0f; queue.Enqueue(i, 0f); }
+            }
+            while (queue.TryDequeue(out int i, out float level))
+            {
+                if (level > spill[i]) continue;
+                int x = i % n, z = i / n;
+                for (int dz = -1; dz <= 1; dz++)
+                for (int dx = -1; dx <= 1; dx++)
+                {
+                    int xx = x + dx, zz = z + dz;
+                    if ((dx | dz) == 0 || xx < 0 || zz < 0 || xx >= n || zz >= n) continue;
+                    int j = zz * n + xx;
+                    if (!sea[j] || depth[j] > 0f) continue;
+                    float l = MathF.Max(level, -depth[j]);
+                    if (l < spill[j]) { spill[j] = l; queue.Enqueue(j, l); }
+                }
+            }
+            var hollow = new float[count];
+            for (int i = 0; i < count; i++)
+                if (sea[i] && depth[i] <= 0f && spill[i] < float.PositiveInfinity)
+                    hollow[i] = MathF.Max(spill[i] + depth[i], 0f);
+            return hollow;
         }
 
         private static void FillIdentity(Result r, int slice, int count)
@@ -128,7 +170,6 @@ namespace Freefall.Graphics
             for (int i = 0; i < count; i++)
             {
                 r.Warp[o + i * 4 + 2] = 1f;
-                r.Warp[o + i * 4 + 3] = 1f;
                 r.Jacobian[o + i * 4 + 0] = (Half)1f;
                 r.Jacobian[o + i * 4 + 3] = (Half)1f;
             }
@@ -155,7 +196,7 @@ namespace Freefall.Graphics
             kh > 10f ? 0.5f : 0.5f * (1f + 2f * kh / MathF.Sinh(2f * kh));
 
         private static void BakeBand(Result r, int slice, Band band, int n, float hx, float hz, Vector2 origin,
-                                     float[] depth, bool[] sea, float[] borderDist)
+                                     float[] depth, bool[] sea, float[] borderDist, float[] hollow)
         {
             int count = n * n;
             float omega = MathF.Max(band.Omega, 0.05f);
@@ -255,9 +296,10 @@ namespace Freefall.Graphics
                 float sideUp = 0f, eUp = 0f;
                 float gl = MathF.Sqrt(gx * gx + gz * gz);
                 float along = gl > 0f ? (gx * dir.X + gz * dir.Y) / gl : 1f;
-                // A ray leaving the deep sea has to run with the wave: on a lee shore it would run against it, and
-                // the wave never gets there (the island's shadow)
-                float leave = Smooth(-0.1f, 0.4f, along);
+                // A ray leaving the deep sea against the wave reaches a lee shore: the island's shadow, where only the swell
+                // that wraps round it arrives (LeeShare of its height; shoreward, as the lee rays run). With none, the
+                // open sea off a lee coast showed the full swell and the beach no surf at all (user, 2026-10-19)
+                float leave = LeeShare + (1f - LeeShare) * Smooth(-0.1f, 0.4f, along);
                 if (nxI >= 0)
                 {
                     sideUp += wx * side[nxI];
@@ -340,14 +382,13 @@ namespace Freefall.Graphics
             // terrain's border
             var jac = new float[count * 4];
             var amp = new float[count];
-            var speed = new float[count];
             var blend = new float[count];
             for (int z = 0; z < n; z++)
             for (int x = 0; x < n; x++)
             {
                 int i = z * n + x;
                 jac[i * 4 + 0] = 1f; jac[i * 4 + 3] = 1f;
-                amp[i] = 1f; speed[i] = 1f; blend[i] = 1f;
+                amp[i] = 1f; blend[i] = 1f;
                 if (!known[i]) continue;
 
                 // Central differences where both neighbours are sea, one-sided at the coast
@@ -368,10 +409,10 @@ namespace Freefall.Graphics
 
                 float h = MathF.Max(depth[i], MinDepth);
                 float kh = WaveNumberDepth(omega, h);
-                float det = c0 * (tx * sz - tz * sx);
+                // (its size: on a lee shore the rays run the other way round and the determinant is negative)
+                float det = MathF.Abs(c0 * (tx * sz - tz * sx));
                 float k = MathF.Sqrt(Math.Clamp(det * 0.5f / GroupRatio(kh), 0f, 6f));
                 amp[i] = k * exposure[i];
-                speed[i] = (omega * h / kh) / c0;                       // c / c0
 
                 blend[i] = MathF.Max(Smooth(0.5f * sourceDepth, sourceDepth, depth[i]),
                                      1f - Smooth(0f, BorderFade, borderDist[i]));
@@ -397,7 +438,9 @@ namespace Freefall.Graphics
                 r.Warp[o + i * 4 + 0] = dir.X * ahead;
                 r.Warp[o + i * 4 + 1] = dir.Y * ahead;
                 r.Warp[o + i * 4 + 2] = ok ? amp[i] + (1f - amp[i]) * w : 1f;
-                r.Warp[o + i * 4 + 3] = ok ? speed[i] + (1f - speed[i]) * w : 1f;
+                // How far below the ridge before it a beach cell lies (BeachHollows: 0 on a plain slope): stored as that,
+                // not as the ridge's height, so interpolating between cells cannot lift a ridge above the real sand
+                r.Warp[o + i * 4 + 3] = hollow[i];
                 for (int c = 0; c < 4; c++)
                 {
                     float id = c == 0 || c == 3 ? 1f : 0f;

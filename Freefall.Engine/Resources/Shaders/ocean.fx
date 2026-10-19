@@ -241,7 +241,7 @@ struct BandWarp
 {
     float2 u;          // where to sample the band (world xz, in the open sea's frame)
     float amp;         // the wave's height here over the open sea's: shoaling, the rays' convergence, the island's shadow
-    float speedRatio;  // the wave's speed here over its deep-water speed
+    float hollow;      // up the beach: how far below the ridge between it and the waterline this spot lies (m, 0 on a slope)
     float2x2 J;        // ∂u/∂x: rows ux, uz; columns ∂/∂x, ∂/∂z
     float2 turn;       // cos, sin of the turn from the deep heading to the local one (sideways displacement, breakers)
     float2 heading;    // the local heading (world xz unit vector)
@@ -271,7 +271,7 @@ BandWarp SampleBandWarp(OceanData ocean, uint slice, float2 worldXZ, float2 terr
     BandWarp b;
     b.u = worldXZ + a.xy;
     b.amp = a.z;
-    b.speedRatio = a.w;
+    b.hollow = a.w;
     b.J = float2x2(j.x, j.y, j.z, j.w);
     // The local heading: the gradient of the deep phase d·u, Jᵀd
     float2 d = slice == 0 ? ocean.WarpDirs.xy : ocean.WarpDirs.zw;
@@ -293,6 +293,7 @@ struct SurfWave
     float2 envelope;       // each carried band's local amplitude A (m)
     float2 phase;          // its phase: 0 on the crest, > 0 ahead of it (still to come), < 0 behind it (passed)
     float4 heading;        // its local heading (world xz): slice 0 in xy, slice 1 in zw
+    float hollow;          // up the beach: how far below the ridge before it this spot lies (BandWarp.hollow, m)
 };
 
 //   d: a carried band's displacement in world xz (turned to the local heading) and height, both × its amplitude
@@ -464,6 +465,7 @@ float3 SampleDisplacement(OceanData ocean, float2 worldXZ, float depthAtten, flo
             amp = w.amp;
             turn = w.turn;
             heading = w.heading;
+            wave.hollow = max(wave.hollow, w.hollow);
             stretch = sqrt(max(w.J[0][0] * w.J[0][0] + w.J[1][0] * w.J[1][0], w.J[0][1] * w.J[0][1] + w.J[1][1] * w.J[1][1]));
         }
         else
@@ -678,7 +680,21 @@ DSOutput DS(HullConstantOutput patchConstants,
         // The swash: by the waterline and up the beach the level is the bores' run-up, each arriving wave's own, in step
         // with it. Until 2026-10-19 a clock (ShoreClock, noise-staggered) and a hash per wave (WaveStrength) ran it
         float swashZone = 1.0 - smoothstep(0.0, SWASH_DEPTH, waterDepth);
-        displacement.y = lerp(displacement.y, SwashLevel(surf, ocean.ShoreSurge), swashZone);
+        float level = SwashLevel(surf, ocean.ShoreSurge);
+        // Up the beach the run-up wets a spot only once it has topped everything between the waterline and there: a
+        // hollow behind a ridge stays dry until the water pours over. One level over the whole beach filled every hollow
+        // below it within the sea mask's reach, puddles far up the sand outlined by the lace (until 2026-10-19)
+        // The ridge is the sand's own height (1 m heightmap) plus how far below it the spot lies (C# ShoreWarp, 0 on a
+        // plain slope): baked as the ridge's height, its 4 m cells frayed the waterline into a sawtooth
+        if (waterDepth < 0.0)
+        {
+            float sand = -waterDepth;                                          // the sand's height over the sea
+            float ridge = sand + surf.hollow;
+            float inHollow = smoothstep(0.02, 0.1, surf.hollow);
+            float topped = smoothstep(ridge - 0.05, ridge + 0.05, level);
+            level = lerp(level, sand - 0.3, inHollow * (1.0 - topped));
+        }
+        displacement.y = lerp(displacement.y, level, swashZone);
     }
 
     float3 displaced = worldPos + displacement;
