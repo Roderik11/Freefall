@@ -312,7 +312,7 @@ void sample_shape(ParticleEmitter e, uint seed, out float3 localPos, out float3 
 
 // Shape Surf: spray and mist where the ocean's surf breaks (ocean_surf.hlsli, the same waves the ocean draws). A
 // candidate point is picked around the camera (ShapeExtents.xz half sizes) and the sea there decides whether anything
-// is born: lip spray where a broken wave's crest is (its roller), thrown forward with the wave and up by its height;
+// is born: lip spray where a broken wave's crest is (its roller), thrown ahead along the wave's heading, a little up;
 // mist (PARTICLE_FLAG_SURF_MIST) over the broken water and behind the crests, drifting slowly. Nothing is born where
 // no wave breaks: no clock, no emitters along the shore. False = no candidate was used (the slot stays dead).
 // A slot tries SURF_TRIES points: the surf is a thin band of the square (a breaker's roller a few metres wide), and with
@@ -359,9 +359,23 @@ bool spawn_surf(ParticleEmitter e, uint seed, inout ParticleCore p)
     float crest = DepthLimit(d.y, shore.shoreDepth, slopeScale);
     float2 heading = SurfHeading(wave);
     float celerity = sqrt(9.81 * max(shore.shoreDepth, 0.3));       // the breaker's speed in shallow water
-    float forward = celerity * (mist ? 0.3 : rand_range(0.5, 0.9, seed + 3u));
-    float up = rand_range(e.SpeedRange.x, e.SpeedRange.y, seed + 4u) * (mist ? 1.0 : saturate(0.3 + height / 3.0));
-    float3 velocity = float3(heading.x * forward, up, heading.y * forward);
+    float3 velocity;
+    if (mist)
+    {
+        // Mist rises off the broken water and drifts on with it, slowly
+        float forward = celerity * 0.3;
+        velocity = float3(heading.x * forward, rand_range(e.SpeedRange.x, e.SpeedRange.y, seed + 4u), heading.y * forward);
+    }
+    else
+    {
+        // The lip is thrown ahead of the wave, faster than the crest runs, and only a little up (about 10 to 30 degrees
+        // over the heading); SpeedRange adds to it, more for a bigger breaker. Until 2026-10-19 it went mostly up
+        // (SpeedRange straight up, a fraction of the crest's speed forward): "should launch in wave direction, not up"
+        float speed = celerity * rand_range(1.0, 1.4, seed + 3u)
+                    + rand_range(e.SpeedRange.x, e.SpeedRange.y, seed + 4u) * saturate(0.3 + height / 3.0);
+        float lift = rand_range(0.18, 0.55, seed + 6u);
+        velocity = normalize(float3(heading.x, lift, heading.y)) * speed;
+    }
     float speed = length(velocity);
 
     // xz is the world's (x, z): float3(xz + d.xz, y) made it (x, z, y), every drop born ~500 m up with its height as z
