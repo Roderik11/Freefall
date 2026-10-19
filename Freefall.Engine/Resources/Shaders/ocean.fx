@@ -1018,13 +1018,15 @@ PSOutput PS(DSOutput input)
             lace *= lerp(1.0, lerp(0.45, 1.0, advancing), onBeach);
         }
 
-        // Stays below full coverage so the foam texture always breaks it up. The surf's white water is drawn the same way:
-        // a mass of bubbles, ragged at its edges and grey where it thins
-        coverage = saturate(max(lace * 0.8 * ocean.ShoreFoam, surfFoam * 0.92));
+        // Stays below full coverage so the foam texture always breaks it up
+        coverage = saturate(lace * 0.8 * ocean.ShoreFoam);
 
-        // Foam texture: two drifting scales of cellular noise (noise texture has no mips: flatten it far away)
-        float cells1 = noiseTex.SampleLevel(OceanSampler, worldPos.xz * 0.23 + t * float2(0.010, 0.006), 0).g;
-        float cells2 = noiseTex.SampleLevel(OceanSampler, worldPos.xz * 0.83 - t * float2(0.013, 0.004), 0).g;
+        // Foam texture: two drifting scales of cellular noise (noise texture has no mips: flatten it far away). Sampled
+        // where the surface's water rests (the undisplaced position): the bubbles ride the water they float on, out with
+        // a breaking lip and back with the swash. At the displaced position the white water slid over a fixed pattern
+        float2 foamPos = input.UndisplacedXZ.xy;
+        float cells1 = noiseTex.SampleLevel(OceanSampler, foamPos * 0.23 + t * float2(0.010, 0.006), 0).g;
+        float cells2 = noiseTex.SampleLevel(OceanSampler, foamPos * 0.83 - t * float2(0.013, 0.004), 0).g;
         foamTex = saturate((cells1 * 0.6 + cells2 * 0.4 - 0.15) / 0.6);
     }
 
@@ -1034,7 +1036,11 @@ PSOutput PS(DSOutput input)
     float foamFar = saturate(dist / 150.0);
     float foam = saturate((coverage * 1.25 - (1.0 - foamTex)) * 3.0);
     foam = lerp(foam, saturate((coverage - 0.35) * 1.5) * 0.7, foamFar);
-    foam = max(foam, surfFoam * foamFar);           // far away the surf's white water as it is (the lace's fade is for thin lines)
+    // The surf's white water: a mass of bubbles, eroded more gently than the waterline's thin lace (cut as hard, its
+    // edges looked like paper), solid where it is thick; far away as it is (the lace's fade is for thin lines)
+    float surfNear = saturate((surfFoam * 1.3 - (1.0 - foamTex)) * 2.0);
+    foam = max(foam, lerp(surfNear, surfFoam, foamFar));
+    float thickness = saturate(max(coverage, surfFoam));
 
     // Always feather the last few centimeters of water: whatever the foam pattern, it must not end
     // in the hard pixel edge where the water surface cuts into the beach.
@@ -1046,7 +1052,8 @@ PSOutput PS(DSOutput input)
     {
         float3 skyOnFoam = SkyAmbient(N) * skyVisible;
         color = lerp(color, WaterFoamLit(float3(0.80, 0.80, 0.78), NdotL, sunRadiance, skyOnFoam), whitecap);
-        float3 foamAlbedo = float3(0.80, 0.80, 0.78) * lerp(0.7, 1.0, foamTex);
+        // Thick foam is bright, thinning foam greys as the water shows through its bubbles
+        float3 foamAlbedo = float3(0.80, 0.80, 0.78) * lerp(0.65, 1.0, foamTex) * lerp(0.78, 1.05, thickness);
         color = lerp(color, WaterFoamLit(foamAlbedo, NdotL, sunRadiance, skyOnFoam), foam * 0.9);
     }
 
