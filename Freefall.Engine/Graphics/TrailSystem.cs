@@ -465,7 +465,8 @@ namespace Freefall.Graphics
         {
             if (_trails == null || !_trails.PrepareFrame()) return;
 
-            CommandBuffer.Enqueue(RenderPass.Forward, _render!);
+            // After the pass's batches, so the ocean (a batch) does not cover the ribbons in front of it
+            CommandBuffer.EnqueueLate(RenderPass.Forward, _render!);
         }
     }
 }

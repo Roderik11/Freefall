@@ -265,6 +265,13 @@ namespace Freefall.Components
         private float[,]? _warpHeights;       // what the last sea mask was flooded from, for a bake of the warp alone
         private SeaMask.Result? _warpMask;
 
+        // This frame's OceanData for the particle kernel (ParticleSystem, shape Surf), one buffer per frame in flight
+        private readonly GraphicsBuffer?[] _surfData = new GraphicsBuffer?[3];
+        private uint _surfDataSrv;
+
+        /// <summary>A StructuredBuffer of this frame's OceanData (ocean_surf.hlsli), for the surf's spray and mist; 0 = none yet.</summary>
+        internal uint SurfDataSrv => _surfDataSrv;
+
         // GPU buffer for tile scales (1/lengthScale per band)
         private GraphicsBuffer? _tileScalesBuffer;
 
@@ -536,6 +543,7 @@ namespace Freefall.Components
             // (textures, buffers, compute pipeline states), so the whole simulation waits with them.
             var device = Engine.Device;
             device.DeferDispose(_tileScalesBuffer);
+            foreach (var b in _surfData) device.DeferDispose(b);
             device.DeferDispose(_oceanFFT);
             device.DeferDispose(_mesh);
             if (_drawn == this)
@@ -869,7 +877,7 @@ namespace Freefall.Components
                 sunIntensity = _sunLight.Intensity;
             }
 
-            _params.SetParameter("OceanData", new OceanData
+            var data = new OceanData
             {
                 WaveTime = _waveTime,
                 Choppiness = Choppiness,
@@ -917,8 +925,15 @@ namespace Freefall.Components
                 ShoreWarpJacobianSRV = _shoreWarp.JacobianSrv,
                 WarpSlots = warpSlots,
                 WarpDirs = warpDirs,
-            });
+            };
+            _params.SetParameter("OceanData", data);
 
+            // The same data for the particle kernel (ParticleEmitter shape Surf: spray and mist where the surf breaks), in
+            // a buffer of its own per frame in flight
+            int frame = Engine.FrameIndex % _surfData.Length;
+            _surfData[frame] ??= GraphicsBuffer.CreateUpload<OceanData>(1, mapped: true);
+            unsafe { *_surfData[frame]!.WritePtr<OceanData>() = data; }
+            _surfDataSrv = _surfData[frame]!.SrvIndex;
 
             CommandBuffer.Enqueue(_mesh, _material, _params, Transform.TransformSlot);
         }

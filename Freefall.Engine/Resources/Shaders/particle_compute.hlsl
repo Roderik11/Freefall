@@ -9,6 +9,7 @@
 #pragma kernel CSSimulate
 
 #include "particle_common.hlsli"
+#include "ocean_surf.hlsli"
 
 // The renderer's frustum constants for this view (root slot 1). Layout = cull_instances.hlsl.
 cbuffer FrustumPlanes : register(b0)
@@ -53,6 +54,7 @@ cbuffer PushConstants : register(b3)
     uint DepthTexIdx;            // 11  linear view-space depth GBuffer (0 = none)
     uint NormalTexIdx;           // 12  world-space normal GBuffer (0 = none)
     float SimTime;               // 13  seconds, moves the turbulence field
+    uint OceanDataIdx;           // 14  StructuredBuffer<OceanData>, the ocean drawn this frame (shape Surf), 0 = none
 };
 
 #define COLL_NONE   0
@@ -69,6 +71,7 @@ cbuffer PushConstants : register(b3)
 #define SHAPE_CIRCLE     3
 #define SHAPE_BOX        4
 #define SHAPE_CONE       5
+#define SHAPE_SURF       6
 
 #define DIR_DIRECTIONAL  0
 #define DIR_RADIAL       1
@@ -307,8 +310,84 @@ void sample_shape(ParticleEmitter e, uint seed, out float3 localPos, out float3 
     }
 }
 
+// Shape Surf: spray and mist where the ocean's surf breaks (ocean_surf.hlsli, the same waves the ocean draws). A
+// candidate point is picked around the camera (ShapeExtents.xz half sizes) and the sea there decides whether anything
+// is born: lip spray where a broken wave's crest is (its roller), thrown forward with the wave and up by its height;
+// mist (PARTICLE_FLAG_SURF_MIST) over the broken water and behind the crests, drifting slowly. Nothing is born where
+// no wave breaks: no clock, no emitters along the shore. False = no candidate was used (the slot stays dead).
+// A slot tries SURF_TRIES points: the surf is a thin band of the square (a breaker's roller a few metres wide), and with
+// one try a slot was used so rarely that a 40 m breaker threw some 25 drops a second. Land and open sea fail the first,
+// cheap test; only points in the coastal water sample the waves.
+#define SURF_TRIES 16
+bool spawn_surf(ParticleEmitter e, uint seed, inout ParticleCore p)
+{
+    if (OceanDataIdx == 0) return false;
+    StructuredBuffer<OceanData> oceans = ResourceDescriptorHeap[OceanDataIdx];
+    OceanData ocean = oceans[0];
+    if (ocean.ShoreWarpSRV == 0) return false;
+    bool mist = (e.Flags & PARTICLE_FLAG_SURF_MIST) != 0;
+
+    float2 xz = 0;
+    OceanShore shore = (OceanShore)0;
+    SurfWave wave = (SurfWave)0;
+    float3 d = 0;
+    float height = 0;
+    bool found = false;
+    [loop]
+    for (uint attempt = 0; attempt < SURF_TRIES && !found; attempt++)
+    {
+        uint s = seed + attempt * 7u;
+        xz = CameraPosition.xz + (float2(rand01(s), rand01(s + 1u)) * 2.0 - 1.0) * e.ShapeExtents.xz;
+        shore = ShoreAt(ocean, xz);
+        if (shore.shoreDepth > 1e3 || shore.waterDepth < SURF_FOAM_END.x) continue;
+
+        d = SampleDisplacement(ocean, xz, ocean.DisplacementAtten, distance(CameraPosition.xz, xz), shore.waveAtten,
+                               shore.shoreDepth, shore.surfUV, true, wave);
+        float breaking = SurfBreaking(wave, shore.shoreDepth) * smoothstep(SURF_FOAM_END.x, SURF_FOAM_END.y, shore.shoreDepth);
+        float2 weight = wave.envelope / max(max(wave.envelope.x, wave.envelope.y), 1e-6);
+        float2 rt0 = SurfRollerTrail(wave.phase.x) * weight.x;
+        float2 rt1 = SurfRollerTrail(wave.phase.y) * weight.y;
+        float roller = max(rt0.x, rt1.x), trail = max(rt0.y, rt1.y);
+        // The bigger the breaker, the more it throws: a knee-high wave hardly any
+        height = 2.0 * SurfEnvelope(wave);
+        float chance = breaking * (mist ? max(trail, 0.5 * roller) : roller) * saturate(height / 1.5);
+        found = rand01(s + 2u) < chance;
+    }
+    if (!found) return false;
+
+    float slopeScale;
+    float crest = DepthLimit(d.y, shore.shoreDepth, slopeScale);
+    float2 heading = SurfHeading(wave);
+    float celerity = sqrt(9.81 * max(shore.shoreDepth, 0.3));       // the breaker's speed in shallow water
+    float forward = celerity * (mist ? 0.3 : rand_range(0.5, 0.9, seed + 3u));
+    float up = rand_range(e.SpeedRange.x, e.SpeedRange.y, seed + 4u) * (mist ? 1.0 : saturate(0.3 + height / 3.0));
+    float3 velocity = float3(heading.x * forward, up, heading.y * forward);
+    float speed = length(velocity);
+
+    // xz is the world's (x, z): float3(xz + d.xz, y) made it (x, z, y), every drop born ~500 m up with its height as z
+    p.Position = float3(xz.x + d.x, ocean.OceanPlaneY + crest + (mist ? 0.3 : 0.1), xz.y + d.z);
+    p.Velocity = rand_cone(velocity / max(speed, 1e-4), e.SpreadCos, seed + 5u) * speed;
+    return true;
+}
+
 void spawn(ParticleEmitter e, uint seed, out ParticleCore p, out ParticleVisual v)
 {
+    [branch]
+    if (e.Shape == SHAPE_SURF)
+    {
+        p.Age = 0.0;
+        p.Position = e.Position;
+        p.Velocity = 0.0;
+        p.Lifetime = max(0.01, e.Lifetime * rand_range(1.0 - e.LifetimeRandomness, 1.0 + e.LifetimeRandomness, seed + 3u));
+        if (!spawn_surf(e, seed + 300u, p))
+            p.Lifetime = 0.0;                                       // nothing breaking here: the slot stays dead
+        v.SizeScale = rand_range(1.0 - e.SizeRandomness, 1.0 + e.SizeRandomness, seed + 5u);
+        v.Rotation = (e.RotationRange > 0) ? rand_range(0, 6.283185, seed + 7u) : 0.0;
+        v.RotationSpeed = rand_range(-e.RotationRange, e.RotationRange, seed + 8u);
+        v.Random = rand01(seed + 9u);
+        return;
+    }
+
     float3 localPos, shapeDir;
     sample_shape(e, seed + 100u, localPos, shapeDir);
 
@@ -498,7 +577,7 @@ void CSSimulate(uint3 gid : SV_GroupID, uint3 dtid : SV_DispatchThreadID)
             RWStructuredBuffer<ParticleVisual> Visuals = ResourceDescriptorHeap[ParticleVisualUAVIdx];
             Visuals[slot] = v;
             Particles[slot] = p;
-            alive = true;
+            alive = p.Age < p.Lifetime;     // a Surf candidate where nothing breaks is born dead
         }
         else if ((e.Flags & PARTICLE_FLAG_RESET) != 0)
         {

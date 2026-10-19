@@ -38,6 +38,7 @@ namespace Freefall.Graphics
         private const uint FlagFlipbookRandom = 2;  // = PARTICLE_FLAG_FLIPBOOK_RANDOM
         private const uint FlagFlipbookBlend = 4;   // = PARTICLE_FLAG_FLIPBOOK_BLEND
         private const uint FlagLit = 8;             // = PARTICLE_FLAG_LIT
+        private const uint FlagSurfMist = 16;       // = PARTICLE_FLAG_SURF_MIST
 
         /// <summary>
         /// The weather's wind (world space), set by <see cref="EnvironmentController"/>. Emitters take
@@ -531,12 +532,15 @@ namespace Freefall.Graphics
                 SoftEnabled = e.SoftParticles ? 1u : 0u,
                 SoftRange = e.SoftRange,
                 BoundsCenter = position + e.Gravity * (0.25f * life * life),
-                BoundsRadius = shape + topSpeed * life + 0.25f * gravity * life * life + drift * life + particleRadius,
+                // Surf: born anywhere round the camera where the sea breaks, so never culled as a whole (each particle is)
+                BoundsRadius = e.Shape == EmissionShape.Surf ? 1e6f
+                    : shape + topSpeed * life + 0.25f * gravity * life * life + drift * life + particleRadius,
                 RenderMode = (uint)mode,
                 Flags = (entry.Reset ? FlagReset : 0u)
                     | (e.FlipbookRandomStart ? FlagFlipbookRandom : 0u)
                     | (e.FlipbookBlend ? FlagFlipbookBlend : 0u)
-                    | (e.Lit ? FlagLit : 0u),
+                    | (e.Lit ? FlagLit : 0u)
+                    | (e.SurfMist ? FlagSurfMist : 0u),
                 Intensity = MathF.Max(0f, e.Intensity),
                 FadeInRate = e.FadeIn > 0f ? 1f / MathF.Min(e.FadeIn, 1f) : 0f,
                 Turbulence = turbulence,
@@ -721,6 +725,8 @@ namespace Freefall.Graphics
             cs.SetPushConstant("SimTime", BitConverter.SingleToUInt32Bits(Time.TotalTime));
             cs.SetPushConstant("DepthTex", depth ? renderer.DepthGBuffer!.BindlessIndex : 0u);
             cs.SetPushConstant("NormalTex", depth ? renderer.Normals!.BindlessIndex : 0u);
+            // The ocean drawn this frame, for the Surf shape's spray and mist (its waves decide where they are born)
+            cs.SetPushConstant("OceanData", Freefall.Components.OceanRenderer.DrawnThisTick?.SurfDataSrv ?? 0u);
 
             cs.Dispatch(_kCull, cmd, ((uint)_uploadedRows + 63) / 64);
             _visibility.UAVBarrier(cmd);
@@ -793,8 +799,9 @@ namespace Freefall.Graphics
 
     /// <summary>
     /// The render half of <see cref="ParticleSystem"/>: runs once per rendered view while draws are being
-    /// enqueued. Compute and both draws are custom actions, executed in enqueue order inside their pass:
-    /// running after the IDraw components keeps particles on top of what those draw (the ocean).
+    /// enqueued. Compute and both draws are custom actions. The Forward draw is a late one, after the pass's
+    /// batches: the ocean is a batch, and drawn after the particles it covered every one in front of the water
+    /// (custom actions run before batches whatever their enqueue order).
     /// </summary>
     [UpdateInEditor]
     [UpdateInGroup(typeof(RenderGroup))]
@@ -818,7 +825,7 @@ namespace Freefall.Graphics
             if (_particles == null || !_particles.PrepareFrame()) return;
 
             CommandBuffer.Enqueue(RenderPass.Transparent, _transparent!);
-            CommandBuffer.Enqueue(RenderPass.Forward, _forward!);
+            CommandBuffer.EnqueueLate(RenderPass.Forward, _forward!);
         }
     }
 }

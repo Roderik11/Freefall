@@ -21,7 +21,8 @@ namespace Freefall.Components
         Hemisphere,  // Upper half of a sphere (local +Y)
         Circle,      // Flat disc in the local XZ plane
         Box,         // Box of ShapeExtents (half sizes)
-        Cone         // Disc of ShapeRadius; velocity fans outward by ConeAngle
+        Cone,        // Disc of ShapeRadius; velocity fans outward by ConeAngle
+        Surf         // Where the ocean's surf breaks, within ShapeExtents.XZ of the camera (SurfMist; particle_compute.hlsl)
     }
 
     /// <summary>How the initial velocity direction is chosen.</summary>
@@ -105,6 +106,11 @@ namespace Freefall.Components
         [Category("Shape")]
         [Description("Spawn only on the surface/edge of the shape instead of filling its volume")]
         public bool EmitFromShell = false;
+
+        [Category("Shape")]
+        [Description(@"Surf shape: mist over the broken water and behind the crests instead of spray off the breaking lips.
+         Either way particles are born only where a wave breaks (EmitRate counts the slots respawned, each trying up to 16 points around the camera)")]
+        public bool SurfMist = false;
 
         // ── Motion ──
 
