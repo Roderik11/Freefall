@@ -1,7 +1,8 @@
 // The atmosphere's LUTs (Hillaire 2020), made each frame by Graphics/Atmosphere.cs:
 //   CSTransmittance      256×64   transmittance from a height toward a zenith angle, to the top of the atmosphere
 //   CSMultiScattering    32×32    Ψ_ms: light scattered twice or more, isotropic, per unit illuminance
-//   CSSkyView            192×108  sky luminance from the camera, per unit illuminance; z = 0 sun, 1 the brightest moon
+//   CSSkyView            192×108  sky luminance from the camera, per unit illuminance; z = 0 sun, 1 the brightest moon;
+//                                 z = 2, 3 the same from past the aerial perspective volume's end (AtmosphereSkyPast)
 //   CSAerialPerspective  ~20 px cells × 32 slices, sized to the view: light scattered in between camera and each froxel
 //                        (rgb, sun + moon, × Exposure), transmittance (a); one march per column
 //   CSAmbient            1 group  sky light on an up-facing surface and the ground's bounce light (Ambient buffer)
@@ -24,6 +25,8 @@ cbuffer PushConstants : register(b3)
     uint SkyViewMoonUAVIdx;
     uint APUAVIdx;
     uint AmbientUAVIdx;
+    uint SkyViewPastSunUAVIdx;
+    uint SkyViewPastMoonUAVIdx;
 };
 
 #include "common.fx"
@@ -232,6 +235,13 @@ void CSMultiScattering(uint3 id : SV_DispatchThreadID)
 }
 
 // ── Sky-view LUT, one per light (z = 0 the sun, 1 the brightest moon) ──
+// z = 2, 3: the same for the air past the aerial perspective volume's end along the ray (AtmosphereAPEnd, ~31 km), seen
+// from the camera (× the air's transmittance up to there), for the sky pixels, which take the air before it from the
+// volume with its shadows (sky_common.fx AtmosphereSkyWithClouds). Subtracting the volume's air from the whole ray's
+// instead went negative: the 32 samples over a ray hundreds of kilometres long hold about half of the near haze's glow
+// toward a low sun that the volume's slices do, and the clouds and the sky near the sun turned blue.
+
+#define SKY_PAST_TRANSMITTANCE_STEPS 16
 
 [numthreads(8, 8, 1)]
 void CSSkyView(uint3 id : SV_DispatchThreadID)
@@ -239,6 +249,8 @@ void CSSkyView(uint3 id : SV_DispatchThreadID)
     if (id.x >= SKYVIEW_LUT_W || id.y >= SKYVIEW_LUT_H)
         return;
     AtmosphereParams A = LoadAtmosphere();
+    bool past = id.z >= 2;
+    bool moon = (id.z & 1) != 0;
 
     float viewHeight = AtmosphereViewHeight(A, CamPos.y);
     float2 uv = (float2(id.xy) + 0.5) / float2(SKYVIEW_LUT_W, SKYVIEW_LUT_H);
@@ -247,7 +259,7 @@ void CSSkyView(uint3 id : SV_DispatchThreadID)
 
     // The light in the local x-y plane at its zenith angle; the view at its zenith angle and its horizontal angle to
     // the light (the sky is the same all round, apart from where the light is)
-    float3 light = id.z == 0 ? A.SunDirection : A.MoonDirection;
+    float3 light = moon ? A.MoonDirection : A.SunDirection;
     float lightZenithCos = light.y;
     float3 lightDir = normalize(float3(sqrt(saturate(1.0 - lightZenithCos * lightZenithCos)), lightZenithCos, 0));
     float viewZenithSin = sqrt(saturate(1.0 - viewZenithCos * viewZenithCos));
@@ -263,6 +275,27 @@ void CSSkyView(uint3 id : SV_DispatchThreadID)
     float4 deck = float4(deckHeight, cloudDeck.x, max(cloudDeck.y - cloudDeck.x, 0.0), 1.0 - CloudSkyDimming(cloudDeck));
 
     float3 pos = float3(0, viewHeight, 0);
+    if (past)
+    {
+        // From the volume's end on, × the air's transmittance up to it (a short march: the transmittance LUT holds rays
+        // to the top of the atmosphere, not ones that meet the ground); nothing where the ray meets the ground first
+        float start = AtmosphereAPEnd(A) * 0.001;
+        float tGround = RaySphereIntersectNearest(pos, dir, float3(0, 0, 0), A.BottomRadius);
+        float3 L = 0;
+        if (tGround < 0.0 || tGround > start)
+        {
+            float3 depth = 0;
+            float dt = start / SKY_PAST_TRANSMITTANCE_STEPS;
+            for (uint k = 0; k < SKY_PAST_TRANSMITTANCE_STEPS; k++)
+                depth += SampleAtmMedium(pos + (k + 0.5) * dt * dir, A).extinction * dt;
+            ScatteringResult rp = IntegrateScatteredLuminance(A, pos + start * dir, dir, lightDir, false, 32.0, true, true,
+                                                              9000000.0, deck);
+            L = rp.L * exp(-depth);
+        }
+        RWTexture2D<float4> pastOutput = ResourceDescriptorHeap[moon ? SkyViewPastMoonUAVIdx : SkyViewPastSunUAVIdx];
+        pastOutput[id.xy] = float4(L, 1.0);
+        return;
+    }
     ScatteringResult r = IntegrateScatteredLuminance(A, pos, dir, lightDir, false, 32.0, true, true, 9000000.0, deck);
 
     // a: the share of the light scattered below the layer, the air in front of a cloud (sky_common.fx GetCloudLight).
@@ -270,7 +303,7 @@ void CSSkyView(uint3 id : SV_DispatchThreadID)
     // shaded deck as a bright band over a dark horizon.
     float total = dot(r.L, float3(0.2126, 0.7152, 0.0722));
     float belowShare = total > 1e-30 ? saturate(dot(r.LBelow, float3(0.2126, 0.7152, 0.0722)) / total) : 1.0;
-    RWTexture2D<float4> output = ResourceDescriptorHeap[id.z == 0 ? SkyViewSunUAVIdx : SkyViewMoonUAVIdx];
+    RWTexture2D<float4> output = ResourceDescriptorHeap[moon ? SkyViewMoonUAVIdx : SkyViewSunUAVIdx];
     output[id.xy] = float4(r.L, belowShare);
 }
 
@@ -326,6 +359,8 @@ float3 APWorldPos(AtmosphereParams A, float3 P)
     return float3(CamPos.x + P.x * 1000.0, (P.y - A.BottomRadius) * 1000.0, CamPos.z + P.z * 1000.0);
 }
 
+// Sky pixels take their air from it too, out to its end (sky_common.fx AtmosphereSkyWithClouds): the shafts through a
+// broken layer and a mountain's shadow at sunset reach over the sky.
 [numthreads(8, 8, 1)]
 void CSAerialPerspective(uint3 id : SV_DispatchThreadID)
 {

@@ -355,15 +355,24 @@ FragmentOutput PS_Procedural(VertexOutput input)
     }
 
     // The volumetric clouds (VOLUMETRIC_CLOUDS_PLAN.md): this view's march (clouds_cs.hlsl CSCloudMarch, half size), the
-    // clouds' light with the air in front of them and what they let through, which dims the sky behind them and the sun,
-    // the moons and the stars by the clouds' own optical depth
+    // clouds' own light, what they let through (which dims the sky behind them and the sun, the moons and the stars by
+    // their own optical depth) and how far they are; the air in front of them, with its shadows, and the sky past them
+    // from sky_common.fx AtmosphereSkyWithClouds
     if (CloudTargetIdx != 0)
     {
         Texture2D<float4> clouds = ResourceDescriptorHeap[CloudTargetIdx];
-        float4 c = clouds.SampleLevel(AtmosphereLinearClamp, input.Position.xy / ViewportSize, 0);
+        float2 cloudUV = input.Position.xy / ViewportSize;
+        float4 c = clouds.SampleLevel(AtmosphereLinearClamp, cloudUV, 0);
+        float cloudDepth = 0.0;
+        if (CloudDepthIdx != 0)
+        {
+            Texture2D<float> depths = ResourceDescriptorHeap[CloudDepthIdx];
+            cloudDepth = depths.SampleLevel(AtmosphereLinearClamp, cloudUV, 0) * 1000.0;
+        }
         float3 sunThrough = sunBehind * c.a;
         sunThrough *= min(1.0, SunDiscMaxPixel / max(max(sunThrough.r, max(sunThrough.g, sunThrough.b)), 1e-6));
-        skyColor = skyColor * c.a + c.rgb + sunThrough + behindClouds * c.a;
+        skyColor = AtmosphereSkyWithClouds(input.Position.xy, viewDir, skyColor, c.rgb, c.a, cloudDepth)
+                 + sunThrough + behindClouds * c.a;
 
         output.Albedo = float4(skyColor, 1);
         output.Normal = float4(0, 1, 0, 1);

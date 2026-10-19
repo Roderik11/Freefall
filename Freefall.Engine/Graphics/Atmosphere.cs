@@ -229,9 +229,9 @@ namespace Freefall.Graphics
             public Vector3 FogScattering; public float MieExpScale;
             public Vector3 FogExtinction; public float FogExpScale;
             public Vector3 GroundAlbedo; public float SunAngularRadius;
-            public Vector3 SunDirection; public float _pad1;
+            public Vector3 SunDirection; public uint SkyViewPastSunLut;
             public Vector3 SunIlluminance; public float APMaxDepth;
-            public Vector3 MoonDirection; public float _pad0;
+            public Vector3 MoonDirection; public uint SkyViewPastMoonLut;
             public Vector3 MoonIlluminance; public float AirglowLuminance;
             public uint TransmittanceLut, MultiScatLut, SkyViewSunLut, SkyViewMoonLut;
             public uint AerialPerspective, Ambient, TerrainHeightmap; public float TerrainMaxHeight;
@@ -258,6 +258,8 @@ namespace Freefall.Graphics
         private static ComputeShader? _cs;
         private static int _kTransmittance, _kMultiScat, _kSkyView, _kAP, _kAmbient, _kCloudDeck;
         private static RenderTexture2D? _transmittance, _multiScat, _skyViewSun, _skyViewMoon;
+        private static RenderTexture2D? _skyViewPastSun, _skyViewPastMoon;     // the sky-view past the AP volume's end
+        private static RenderTexture2D[] _skyViews = Array.Empty<RenderTexture2D>();   // the four, for their barriers
         private static GraphicsBuffer? _ambient;
         private static readonly GraphicsBuffer?[] _params = new GraphicsBuffer?[FrameCount];
         private static readonly GraphicsBuffer?[] _readback = new GraphicsBuffer?[FrameCount];
@@ -287,6 +289,9 @@ namespace Freefall.Graphics
             _multiScat = new RenderTexture2D(device, MultiScatRes, MultiScatRes, Format.R32G32B32A32_Float, randomWrite: true);
             _skyViewSun = new RenderTexture2D(device, SkyViewW, SkyViewH, Format.R32G32B32A32_Float, randomWrite: true);
             _skyViewMoon = new RenderTexture2D(device, SkyViewW, SkyViewH, Format.R32G32B32A32_Float, randomWrite: true);
+            _skyViewPastSun = new RenderTexture2D(device, SkyViewW, SkyViewH, Format.R32G32B32A32_Float, randomWrite: true);
+            _skyViewPastMoon = new RenderTexture2D(device, SkyViewW, SkyViewH, Format.R32G32B32A32_Float, randomWrite: true);
+            _skyViews = new[] { _skyViewSun, _skyViewMoon, _skyViewPastSun, _skyViewPastMoon };
             _ambient = GraphicsBuffer.CreateStructured<Vector4>(AmbientElements, srv: true, uav: true);
             for (int i = 0; i < FrameCount; i++)
             {
@@ -298,6 +303,8 @@ namespace Freefall.Graphics
             _cs.SetPushConstant("MultiScatUAV", _multiScat.UavIndex);
             _cs.SetPushConstant("SkyViewSunUAV", _skyViewSun.UavIndex);
             _cs.SetPushConstant("SkyViewMoonUAV", _skyViewMoon.UavIndex);
+            _cs.SetPushConstant("SkyViewPastSunUAV", _skyViewPastSun.UavIndex);
+            _cs.SetPushConstant("SkyViewPastMoonUAV", _skyViewPastMoon.UavIndex);
             _cs.SetPushConstant("AmbientUAV", _ambient.UavIndex);
         }
 
@@ -353,6 +360,8 @@ namespace Freefall.Graphics
                 MultiScatLut = _multiScat!.BindlessIndex,
                 SkyViewSunLut = _skyViewSun!.BindlessIndex,
                 SkyViewMoonLut = _skyViewMoon!.BindlessIndex,
+                SkyViewPastSunLut = _skyViewPastSun!.BindlessIndex,
+                SkyViewPastMoonLut = _skyViewPastMoon!.BindlessIndex,
                 AerialPerspective = 0,      // each view has its own (SceneConstants.AerialPerspectiveIdx)
                 Ambient = _ambient!.SrvIndex,
             };
@@ -433,12 +442,12 @@ namespace Freefall.Graphics
             cs.Dispatch(_kCloudDeck, list, 1);
             _ambient.Transition(list, shaderRead);
 
-            // Sky-view (sun and moon)
-            list.ResourceBarrierTransition(_skyViewSun!.Native, from, ResourceStates.UnorderedAccess);
-            list.ResourceBarrierTransition(_skyViewMoon!.Native, from, ResourceStates.UnorderedAccess);
-            cs.Dispatch(_kSkyView, list, (SkyViewW + 7) / 8, (SkyViewH + 7) / 8, 2);
-            list.ResourceBarrierTransition(_skyViewSun.Native, ResourceStates.UnorderedAccess, shaderRead);
-            list.ResourceBarrierTransition(_skyViewMoon.Native, ResourceStates.UnorderedAccess, shaderRead);
+            // Sky-view (sun and moon), and the same past the aerial perspective volume's end (the sky pixels' far air)
+            foreach (var lut in _skyViews)
+                list.ResourceBarrierTransition(lut.Native, from, ResourceStates.UnorderedAccess);
+            cs.Dispatch(_kSkyView, list, (SkyViewW + 7) / 8, (SkyViewH + 7) / 8, 4);
+            foreach (var lut in _skyViews)
+                list.ResourceBarrierTransition(lut.Native, ResourceStates.UnorderedAccess, shaderRead);
 
             // This view's aerial perspective: one thread per column, marching through all of its slices
             var ap = aerialPerspective.Texture;

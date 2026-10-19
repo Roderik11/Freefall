@@ -547,6 +547,80 @@ float3 AtmosphereSkyBelowClouds(AtmosphereParams A, float3 dir)
     return L;
 }
 
+// The air's transmittance from the camera to a point s metres along a ray (unit dir), from two transmittance LUT reads
+// (to the top of the atmosphere from either end); the planet's curvature as the clouds have it
+float3 AtmTransmittanceAlong(AtmosphereParams A, float3 dir, float s)
+{
+    float3 P = CloudAtmospherePos(dir * s);
+    float r = length(P);
+    return saturate(AtmTransmittance(A, AtmosphereViewHeight(A, CamPos.y), dir.y)
+                    / max(AtmTransmittance(A, r, dot(P / r, dir)), 1e-6));
+}
+
+// The air between the camera and clouds `depth` metres along dir without the aerial perspective volume: its
+// transmittance, and the sky's light scattered below the clouds' base in that direction (AtmosphereSkyBelowClouds,
+// × Exposure). The sky probe's clouds, and the sky dome with the fog off; clouds L, T: L × viewT + inFront × (1 − T).
+void CloudAirInFront(AtmosphereParams A, float3 dir, float depth, out float3 viewT, out float3 inFront)
+{
+    viewT = AtmTransmittanceAlong(A, dir, depth);
+    inFront = AtmosphereSkyBelowClouds(A, normalize(float3(dir.x, max(dir.y, 0.0), dir.z))) * Exposure;
+}
+
+// ── A sky pixel: the sky, the volumetric clouds and the air in front of them (VOLUMETRIC_CLOUDS_PLAN §10, stage 5) ──
+// The air in front comes from the aerial perspective volume, out to its end (AtmosphereAPEnd, ~31 km along the ray):
+// with the clouds' and the terrain's shadows in it, so the shafts through a broken layer and a mountain's shadow at
+// sunset reach over the sky; the same haze in front of a cloud as in front of a hill at its distance. What lies past
+// the volume comes from sky-view LUTs that start there (AtmosphereSkyPast). Nothing is subtracted: taking the volume's
+// air off the whole ray's LUT went negative near a low sun (the LUT's 32 samples over hundreds of kilometres hold half
+// the near haze's glow the volume's slices do) and turned the clouds and the sky there blue. With L, T the clouds' own
+// light and transmittance, d their distance along the ray, past the LUTs' light:
+//   d ≤ end:  AP(d) + T(0→d) L + T (AP(end) − AP(d) + past)
+//   d > end:  AP(end) + T(0→d) L + (f + T (1 − f)) past,   f = (1 − T(end→d)) / (1 − T(end→∞)),
+// T(a→b) the air's transmittance by colour (LUT reads; the volume's own is grey, and a far cloud must redden). Past the
+// volume the air in front of the cloud is taken as a share of what lies past it by optical depth, which meets the first
+// line at d = end; with T = 1 both are AP(end) + past. The volume is read at view depth (distance × the cosine to the
+// view's axis). Without the volume or the LUTs (the fog off) as the march composed it until stage 5, from the whole
+// ray's LUT (sky): sky T + L viewT + inFront (1 − T).
+//   pixel: SV_Position.xy; dir: unit, camera-relative; depth: metres along the ray to the clouds' light
+float3 AtmosphereSkyWithClouds(float2 pixel, float3 dir, float3 sky, float3 cloudLight, float cloudT, float depth)
+{
+    if (AtmosphereIdx == 0)
+        return sky * cloudT + cloudLight;
+    AtmosphereParams A = LoadAtmosphere();
+    if (FogEnabled <= 0.0 || A.SkyViewPastSunLut == 0)
+    {
+        if (cloudT >= 0.999)
+            return sky;
+        float3 viewT, inFront;
+        CloudAirInFront(A, dir, depth, viewT, inFront);
+        return sky * cloudT + cloudLight * viewT + inFront * (1.0 - cloudT);
+    }
+
+    float2 uv = pixel / ViewportSize;
+    float3 forward = normalize(float3(View._13, View._23, View._33));
+    float cosForward = max(dot(dir, forward), 1e-3);
+    float end = AtmosphereAPEnd(A);
+    float4 apEnd = AtmosphereAerialPerspective(A, uv, end * cosForward);
+    float3 past = AtmosphereSkyPast(A, dir);
+    if (cloudT >= 0.999)
+        return apEnd.rgb + past;
+
+    // The clouds' light through the air by colour (the transmittance LUT; the volume's is grey): a far cloud reddens
+    float3 toCloud = AtmTransmittanceAlong(A, dir, depth);
+    if (depth <= end)
+    {
+        float3 inFront = AtmosphereAerialPerspective(A, uv, depth * cosForward).rgb;
+        return inFront + toCloud * cloudLight + cloudT * (max(apEnd.rgb - inFront, 0.0) + past);
+    }
+    float3 toEnd = AtmTransmittanceAlong(A, dir, end);
+    float3 endToCloud = saturate(toCloud / max(toEnd, 1e-6));
+    float viewHeight = AtmosphereViewHeight(A, CamPos.y);
+    bool hitsGround = RaySphereIntersectNearest(float3(0, viewHeight, 0), dir, float3(0, 0, 0), A.BottomRadius) >= 0.0;
+    float3 endToSpace = hitsGround ? 0.0 : saturate(AtmTransmittance(A, viewHeight, dir.y) / max(toEnd, 1e-6));
+    float3 f = saturate((1.0 - endToCloud) / max(1.0 - endToSpace, 1e-4));
+    return apEnd.rgb + toCloud * cloudLight + (f + cloudT * (1.0 - f)) * past;
+}
+
 // ── Light on the cloud layer ──
 // A cloud in direction dir (the flat layer CloudAltitude above the camera) is lit by the sun and the moon through the
 // air above it (nothing once the planet hides them: clouds stay lit a little after sunset, then go grey) and by the

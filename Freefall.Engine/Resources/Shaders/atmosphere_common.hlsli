@@ -36,9 +36,9 @@ struct AtmosphereParams
     float3 FogScattering;       float MieExpScale;         // ground fog: a thin aerosol layer near the ground
     float3 FogExtinction;       float FogExpScale;
     float3 GroundAlbedo;        float SunAngularRadius;    // radians
-    float3 SunDirection;        float _pad1;
+    float3 SunDirection;        uint SkyViewPastSunLut;    // the sky-view LUTs of the air past the aerial perspective volume's end (AtmosphereSkyPast)
     float3 SunIlluminance;      float APMaxDepth;          // lux at the top of the atmosphere (colour × lux); metres
-    float3 MoonDirection;       float _pad0;
+    float3 MoonDirection;       uint SkyViewPastMoonLut;
     float3 MoonIlluminance;     float AirglowLuminance;    // lux (phase and colour included); cd/m² of the night sky
     uint TransmittanceLut;      uint MultiScatLut;         uint SkyViewSunLut;     uint SkyViewMoonLut;
     uint AerialPerspective;     uint Ambient;              uint TerrainHeightmap;  float TerrainMaxHeight;   // sky visibility: the terrain's baked heightmap (R16, 0 = none); metres at 1
@@ -334,9 +334,8 @@ float4 SampleScreenBSpline(Texture3D<float4> volume, float2 screenUV, float w)
 // on the way (cd/m² × Exposure, i.e. what the pixel stores), a = how much of the point's own light gets through.
 // From this view's volume (SceneConstants.AerialPerspectiveIdx); a build that predates it set the shared one in the
 // atmosphere's parameters instead.
-float4 AtmosphereAerialPerspective(AtmosphereParams A, float2 screenUV, float viewDepth)
+float4 AtmosphereAerialPerspectiveFrom(AtmosphereParams A, uint volume, float2 screenUV, float viewDepth)
 {
-    uint volume = AerialPerspectiveIdx != 0 ? AerialPerspectiveIdx : A.AerialPerspective;
     if (volume == 0)
         return float4(0, 0, 0, 1);
     float w = sqrt(saturate(viewDepth / A.APMaxDepth));
@@ -353,6 +352,41 @@ float4 AtmosphereAerialPerspective(AtmosphereParams A, float2 screenUV, float vi
     float3 inscatter = s.rgb * weight;   // already sun + moon, × Exposure (CSAerialPerspective)
     float transmittance = 1.0 - weight * (1.0 - s.a);
     return float4(inscatter, transmittance);
+}
+
+float4 AtmosphereAerialPerspective(AtmosphereParams A, float2 screenUV, float viewDepth)
+{
+    return AtmosphereAerialPerspectiveFrom(A, AerialPerspectiveIdx != 0 ? AerialPerspectiveIdx : A.AerialPerspective,
+                                           screenUV, viewDepth);
+}
+
+// How far the aerial perspective volume reaches (metres of view depth): its last slice's, where a lookup clamps
+float AtmosphereAPEnd(AtmosphereParams A)
+{
+    float w = (AP_SLICES - 0.5) / AP_SLICES;
+    return A.APMaxDepth * w * w;
+}
+
+// The sky's light from past AtmosphereAPEnd metres along a ray (× Exposure, sun + moon + airglow): what the sky-view
+// LUT holds less the air the aerial perspective volume holds, from LUTs made for it (CSSkyView z = 2, 3), so a sky pixel
+// is the volume's air with its shadows plus this, nothing subtracted. 0 without them.
+float3 AtmosphereSkyPast(AtmosphereParams A, float3 dir)
+{
+    if (A.SkyViewPastSunLut == 0)
+        return 0;
+    float viewHeight = AtmosphereViewHeight(A, CamPos.y);
+    bool hitsGround = RaySphereIntersectNearest(float3(0, viewHeight, 0), dir, float3(0, 0, 0), A.BottomRadius) >= 0.0;
+    Texture2D<float4> sunLut = ResourceDescriptorHeap[A.SkyViewPastSunLut];
+    float3 L = sunLut.SampleLevel(AtmosphereLinearClamp,
+        SkyViewLutUv(A, hitsGround, dir.y, LightViewCos(dir, A.SunDirection), viewHeight), 0).rgb * A.SunIlluminance;
+    if (any(A.MoonIlluminance > 0))
+    {
+        Texture2D<float4> moonLut = ResourceDescriptorHeap[A.SkyViewPastMoonLut];
+        L += moonLut.SampleLevel(AtmosphereLinearClamp,
+            SkyViewLutUv(A, hitsGround, dir.y, LightViewCos(dir, A.MoonDirection), viewHeight), 0).rgb * A.MoonIlluminance;
+    }
+    float3 T = hitsGround ? 0 : AtmTransmittance(A, viewHeight, dir.y);
+    return (L + AtmAirglow(A, dir, T)) * Exposure;
 }
 
 #endif // ATMOSPHERE_COMMON

@@ -556,6 +556,7 @@ namespace Freefall.Graphics
                  pair.Value.SetParameter("FogVolumeRange", VolumetricFog?.Range ?? 0f);
                  pair.Value.SetParameter("AerialPerspectiveIdx", aerialPerspectiveIdx);
                  pair.Value.SetParameter("CloudTargetIdx", _cloudTargetIdx);
+                 pair.Value.SetParameter("CloudDepthIdx", _cloudTargetIdx != 0 ? _cloudView.DepthIndex : 0u);
              }
 
              // The atmosphere's LUTs for this view (sky-view, aerial perspective, ambient): the sky dome, the

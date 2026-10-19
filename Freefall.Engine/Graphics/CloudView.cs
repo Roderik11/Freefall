@@ -6,8 +6,9 @@ using Vortice.DXGI;
 namespace Freefall.Graphics
 {
     /// <summary>
-    /// A view's volumetric clouds (clouds_cs.hlsl): their light in front of the sky (the air between included, ×
-    /// Exposure), what they let through and how far they are, at half the view's size each way. Each frame marches one
+    /// A view's volumetric clouds (clouds_cs.hlsl): their own light (× Exposure; the air in front of them is the sky
+    /// dome's, from the aerial perspective volume: sky_common.fx AtmosphereSkyWithClouds), what they let through and how
+    /// far they are (<see cref="DepthIndex"/>), at half the view's size each way. Each frame marches one
     /// texel of every 2×2 block (CSCloudMarch, sparse, Bayer order: all of them every 4 frames) and CSCloudReconstruct
     /// fills the rest from last frame's, reprojected for the camera's move and the wind's and clamped to this frame's
     /// marched neighbours. Without a history (the first frame, a resize, a jump, <see cref="EngineSettings.VolumetricCloudsFullRate"/>)
@@ -37,6 +38,10 @@ namespace Freefall.Graphics
 
         public int Width { get; private set; }
         public int Height { get; private set; }
+
+        /// <summary>Bindless index of this frame's cloud depth (R16F, km), the target <see cref="Prepare"/> returned
+        /// goes with: SceneConstants.CloudDepthIdx (the sky dome's shadows over the sky).</summary>
+        public uint DepthIndex => _depth[_frame & 1]?.Texture.BindlessIndex ?? 0u;
 
         private const ResourceStates ShaderRead = ResourceStates.NonPixelShaderResource | ResourceStates.PixelShaderResource;
 

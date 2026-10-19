@@ -497,7 +497,6 @@ CloudMarchResult CloudMarchRay(CloudParams C, AtmosphereParams A, Texture3D<floa
 
     StructuredBuffer<float4> ambientBuffer = ResourceDescriptorHeap[A.Ambient];
     float3 skyAmbient = ambientBuffer[0].rgb, groundAmbient = ambientBuffer[1].rgb;     // E / π × Exposure
-    float viewHeightKm = AtmosphereViewHeight(A, CamPos.y);
 
     float3 L = 0;
     float T = 1.0;
@@ -575,15 +574,10 @@ CloudMarchResult CloudMarchRay(CloudParams C, AtmosphereParams A, Texture3D<floa
         return result;
     }
 
-    // The air between the camera and the clouds (two transmittance LUT reads, as the 2D layer had it) and the sky's own
-    // light scattered in front of them
-    float d = depthSum / max(depthWeight, 1e-6);
-    float3 cloudKm = CloudAtmospherePos(dir * d);
-    float r = length(cloudKm);
-    float3 viewT = saturate(AtmTransmittance(A, viewHeightKm, dir.y) / max(AtmTransmittance(A, r, dot(cloudKm / r, dir)), 1e-6));
-    float3 inFront = AtmosphereSkyBelowClouds(A, normalize(float3(dir.x, max(dir.y, 0.0), dir.z))) * Exposure;
-    result.color = float4(L * viewT + inFront * (1.0 - T), T);
-    result.depth = d;
+    // The clouds' own light: the air in front of them is the caller's (the sky dome takes it from the aerial perspective
+    // volume, with the shadows in it; the probe from CloudAirInFront)
+    result.color = float4(L, T);
+    result.depth = depthSum / max(depthWeight, 1e-6);
     return result;
 }
 
@@ -730,5 +724,14 @@ void CSCloudProbeFace(uint3 id : SV_DispatchThreadID)
     AtmosphereParams A = LoadAtmosphere();
     Texture3D<float4> lut = ResourceDescriptorHeap[C.NoiseLut];
     float2 uv = (float2(id.xy) + 0.5) / TargetWidth * 2.0 - 1.0;
-    target[texel] = CloudMarchRay(C, A, lut, CloudCubeDirection(ProbeFace, uv), 0.5, 3.0).color;
+    float3 dir = CloudCubeDirection(ProbeFace, uv);
+    CloudMarchResult r = CloudMarchRay(C, A, lut, dir, 0.5, 3.0);
+    if (r.color.a < 0.999)
+    {
+        // With the air in front (the probe has no aerial perspective volume)
+        float3 viewT, inFront;
+        CloudAirInFront(A, dir, r.depth, viewT, inFront);
+        r.color.rgb = r.color.rgb * viewT + inFront * (1.0 - r.color.a);
+    }
+    target[texel] = r.color;
 }
