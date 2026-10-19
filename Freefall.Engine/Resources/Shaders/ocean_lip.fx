@@ -293,8 +293,11 @@ LipOutput DS_Lip(HullConstantOutput patchConstants, float3 bary : SV_DomainLocat
         // meets the ocean's at the crest, at the tip (both sides) and in the trough; where the lip narrows out it goes back
         // to the vertex's own water
         float outerArc = length(float2(LipSweep * lipThrow * rho0 * (1.0 - 0.5 * shrink), rho0 * shrink));
-        float innerArc = length(float2(LipSweep * lipThrow * (rho0 * (1.0 - 0.5 * shrink) - 0.5 * thick0),
+        float innerArc = length(float2(LipSweep * lipThrow * (rho0 * (1.0 - 0.5 * shrink) - 0.75 * thick0),
                                        rho0 * shrink - thick0));
+        // Where the lip lands: its tip (LipTip), and whether it points down at the water yet (falling)
+        float falling;
+        float3 tipPos = LipTip(C, fwd, height, lipThrow, falling);
         float sheetOff;
         if (t < LipInnerEnd)
         {
@@ -302,16 +305,20 @@ LipOutput DS_Lip(HullConstantOutput patchConstants, float3 bary : SV_DomainLocat
             float u = outer ? t / LipOuterEnd : (LipInnerEnd - t) / (LipInnerEnd - LipOuterEnd);
             float dudt = outer ? 1.0 / LipOuterEnd : -1.0 / (LipInnerEnd - LipOuterEnd);
             float theta = theta0 + LipSweep * lipThrow * u;
-            float rho = rho0 * (1.0 - shrink * u) - (outer ? 0.0 : thick0 * (1.0 - u));
-            float drho = -rho0 * shrink + (outer ? 0.0 : thick0);
+            // The lip's thickness, thinning to nothing at the tip as 1 - u³: thinning linearly, its two sides lay within
+            // millimetres of each other over the last tenth and fought for the depth there, the inner side's tube shade
+            // showing through the outer side's foam in grey hatching along the barrel's front
+            float thick = thick0 * (1.0 - u * u * u);
+            float rho = rho0 * (1.0 - shrink * u) - (outer ? 0.0 : thick);
+            float drho = -rho0 * shrink + (outer ? 0.0 : 3.0 * u * u * thick0);
             float3 radial = sin(theta) * fwd + cos(theta) * up;
             target = O + rho * radial;
             tangent = (rho * LipSweep * lipThrow * (cos(theta) * fwd - sin(theta) * up) + drho * radial) * dudt;
             // Light crosses the lip's own thickness, toward its tip; at its root the crest, the whole wave under it.
-            // Under the lip the tube's roof
-            sheetThick = lerp(height, max(thick0 * (1.0 - u), 0.03), smoothstep(0.0, 0.4, u));
+            // Under the lip the tube's roof, open again at the very tip, where both sides are the same thin edge
+            sheetThick = lerp(height, max(thick, 0.03), smoothstep(0.0, 0.4, u));
             splash = smoothstep(outer ? 0.6 : 0.5, 1.0, u);       // the tip's end of the lip, both sides
-            tubeShade = outer ? 0.0 : 1.0;
+            tubeShade = outer ? 0.0 : 1.0 - smoothstep(0.75, 1.0, u);
             sheetOff = outer ? -outerArc * u : -outerArc + innerArc * (1.0 - u);
             detailWeight = outer ? 1.0 - smoothstep(0.0, 0.3, u) : 0.0;     // the thin curl carries none
         }
@@ -325,11 +332,15 @@ LipOutput DS_Lip(HullConstantOutput patchConstants, float3 bary : SV_DomainLocat
             float3 runFlat = float3(run.x, 0.0, run.z);
             // (bounded by the wave's height: the term bulges the face by up to 4/27 of it mid-way, and over a run of
             // 20-30 m, where the crest lay far back, a modest slope raised the face into a fin metres over the crest)
-            float endRise = clamp(endSlope * 2.5 * length(runFlat), -0.75 * height, 0.75 * height);            target = root + LipFaceCurve(runFlat, run.y, endRise, v);
+            float endRise = clamp(endSlope * 2.5 * length(runFlat), -0.75 * height, 0.75 * height);
+            target = root + LipFaceCurve(runFlat, run.y, endRise, v);
             tangent = runFlat * (2.5 * pow(max(v, 1e-4), 1.5)) + up * (run.y * 2.0 * (1.0 - v) + endRise * (3.0 * v * v - 2.0 * v));
             // The wave's body behind it; the tube's back wall under the lip, open to the sky a tube's width further down
             float faceLen = LipFaceLength(runFlat, run.y, endRise, v);
-            splash = exp(-faceLen / (1.5 * R));                  // the face under the lip, where the tip comes down
+            // White water on the face where the tip comes down onto it, fading away from it. Near the face's root
+            // instead (the tube's back wall under the lip, hidden from the front) the tip met dark water along a hard
+            // line across the barrel's front (user, 2026-10-19)
+            splash = exp(-distance(target, tipPos) / (1.5 * R));
             sheetThick = height;
             tubeShade = saturate(1.0 - faceLen / (3.0 * R));
             tubeShade *= tubeShade;
@@ -342,9 +353,7 @@ LipOutput DS_Lip(HullConstantOutput patchConstants, float3 bary : SV_DomainLocat
         sheetThick = lerp(height, sheetThick, blend);
         tubeShade *= blend * lipThrow;        // no roof over the face before the lip is thrown
         // White water thrown up where the lip lands: once its tip points down at the trough (LipTip's falling, as the
-        // spray splashes up there), over the lip's tip end and the face under it
-        float falling;
-        LipTip(C, fwd, height, lipThrow, falling);
+        // spray splashes up there), over the lip's tip end and the face where it comes down
         splash *= falling * blend;
         float gridOff = max(phase, 0.0) / k;
         texXZ = gridPos.xz + heading * ((sheetOff - gridOff) * blend);
