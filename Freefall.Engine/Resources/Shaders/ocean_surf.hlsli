@@ -613,18 +613,22 @@ float LipPhaseRate(OceanData ocean, uint slice, float2 xz, float2 heading)
 // guess is the rate over the whole span, and the guess moves to where that rate puts phase 0. The phase runs up to
 // twice as fast near the crest as on the face: by the warp's own wavenumber (LipWavenumber, 1-1.2 x the dispersion
 // relation's) the crests of the face's points lay far behind the drawn one (a strip judged by those came out as rings),
-// and by local rates at two points they still wandered, the strip's far end in fingers. Bounded round the warp's
-// wavenumber, which is smooth: by the waterline the measured phase goes astray. At full detail the phase jittered and
-// the lip's sheet crumpled like foil; stepping by the phase without bounds reached the next wave or stopped on the
-// face, and the sheet tore into shards between vertices. k: the mean rate between the point and its crest
-float2 LipCrest(OceanData ocean, float2 xz, SurfWave wave, out float k)
+// and by local rates at two points they still wandered, the strip's far end in fingers. Bounded round the dispersion
+// relation's wavenumber at the point's depth (depth: LipBed's), which is smooth and keeps the crest near in shallow
+// water: bounded round the warp's, whose Jacobian goes erratic by the waterline, points in the shallows hung from
+// crests tens of metres out and the sheet burst into giant shards there. At full detail the phase jittered and the
+// lip's sheet crumpled like foil; stepping by the phase without bounds reached the next wave or stopped on the face,
+// and the sheet tore into shards between vertices. k: the mean rate between the point and its crest
+float2 LipCrest(OceanData ocean, float2 xz, SurfWave wave, float depth, out float k)
 {
     bool second = LipSecondBand(wave);
     uint slice = second ? 1u : 0u;
     float phase = max(LipPhase(wave), 0.0);
     float2 heading = second ? wave.heading.zw : wave.heading.xy;
-    float kWarp = max(LipWavenumber(ocean, slice, xz), 1e-3);
-    k = clamp(LipPhaseRate(ocean, slice, xz, heading), 0.7 * kWarp, 2.5 * kWarp);
+    float omega = second ? ocean.WarpOmega.y : ocean.WarpOmega.x;
+    float k0 = omega * omega / 9.81;
+    float kDepth = k0 / sqrt(tanh(k0 * max(depth, 0.3)));
+    k = clamp(LipPhaseRate(ocean, slice, xz, heading), 0.7 * kDepth, 2.5 * kDepth);
     if (phase < 1e-3) return xz;
     [unroll]
     for (int i = 0; i < 2; ++i)
@@ -632,22 +636,26 @@ float2 LipCrest(OceanData ocean, float2 xz, SurfWave wave, out float k)
         float back = phase / k;
         float drop = phase - LipBandPhase(ocean, slice, xz - heading * back);
         drop -= 6.2831853 * floor(drop / 6.2831853);        // the phase falls going back: into [0, 2π)
-        k = clamp(drop / back, 0.7 * kWarp, 2.5 * kWarp);
+        k = clamp(drop / back, 0.7 * kDepth, 2.5 * kDepth);
     }
     return xz - heading * (phase / k);
 }
 
 // The lip amount a point of a strip goes by (wave: LipWave there): its crest's (LipCrest), where the lip stands, not
 // its own. A strip's length ahead of its crest the water is shallower and the point's own amount had run out of the
-// breaker's life: the strip was cut short in ragged tongues, and the half-bent face at the cut stood as a shelf. The
-// ocean's cut-out and the lip pass both decide by this, so they agree. crestXZ, crestWave: the crest and its waves
+// breaker's life: the strip was cut short in ragged tongues, and the half-bent face at the cut stood as a shelf. None
+// in the swash's water (SWASH_DEPTH), where the ocean is the run-up's sheet. The ocean's cut-out and the lip pass both
+// decide by this, so they agree. crestXZ, crestWave: the crest and its waves
 float LipStripAmount(OceanData ocean, float2 xz, SurfWave wave, float2 camXZ, out float2 crestXZ, out SurfWave crestWave,
                      out float k)
 {
-    crestXZ = LipCrest(ocean, xz, wave, k);
+    float depth, slope;
+    LipBed(ocean, xz, depth, slope);
+    crestXZ = LipCrest(ocean, xz, wave, depth, k);
     crestWave = LipWave(ocean, crestXZ);
     OceanShore crestShore = ShoreAt(ocean, crestXZ);
-    return LipAmount(ocean, crestXZ, crestWave, crestShore.shoreDepth, distance(crestXZ, camXZ));
+    return LipAmount(ocean, crestXZ, crestWave, crestShore.shoreDepth, distance(crestXZ, camXZ))
+         * smoothstep(SWASH_DEPTH, 2.5 * SWASH_DEPTH, depth);
 }
 
 #endif
