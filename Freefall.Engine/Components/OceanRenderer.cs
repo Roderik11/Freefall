@@ -223,6 +223,11 @@ namespace Freefall.Components
 
         private Mesh _mesh = null!;
         private Material _material = null!;
+        // The surf's breaking lips (ocean_lip.fx): a grid of their own round the camera, drawn over the ocean with its
+        // parameters; the ocean's 128 m cells give a curl a few metres long no more than two or three segments
+        private const int LipGridSize = 64;
+        private Mesh _lipMesh = null!;
+        private Material _lipMaterial = null!;
         private MaterialBlock _params = new MaterialBlock();
         private OceanFFT? _oceanFFT;
 
@@ -323,6 +328,7 @@ namespace Freefall.Components
             public uint WarpSlots;       // band + 1 of warp slice 0 (bits 0-7) and slice 1 (bits 8-15); 0 = none
             public float _warpPad;
             public Vector4 WarpDirs;     // the deep heading (world xz) of slice 0 (xy) and slice 1 (zw)
+            public Vector2 WarpOmega;    // the angular frequency of each slice's band at its peak (rad/s), for the lip
         }
 
         private const int GridSize = 128;
@@ -331,6 +337,8 @@ namespace Freefall.Components
         {
             _mesh = CreateOceanGrid(Engine.Device, GridSize);
             _material = new Material(new Effect("ocean"));
+            _lipMesh = CreateOceanGrid(Engine.Device, LipGridSize);
+            _lipMaterial = new Material(new Effect("ocean_lip"));
             _sunLight = EntityManager.FindComponent<DirectionalLight>()!;
             _terrain = EntityManager.FindComponent<TerrainRenderer>();
 
@@ -546,6 +554,7 @@ namespace Freefall.Components
             foreach (var b in _surfData) device.DeferDispose(b);
             device.DeferDispose(_oceanFFT);
             device.DeferDispose(_mesh);
+            device.DeferDispose(_lipMesh);
             if (_drawn == this)
                 _drawn = null;
         }
@@ -859,11 +868,12 @@ namespace Freefall.Components
             var warpBands = _shoreWarp.Bands;
             uint warpSlots = 0;
             var warpDirs = Vector4.Zero;
+            var warpOmega = Vector2.Zero;
             for (int s = 0; s < warpBands.Length && s < ShoreWarp.MaxBands; s++)
             {
                 warpSlots |= (uint)(warpBands[s].Index + 1) << (8 * s);
-                if (s == 0) { warpDirs.X = warpBands[s].Direction.X; warpDirs.Y = warpBands[s].Direction.Y; }
-                else { warpDirs.Z = warpBands[s].Direction.X; warpDirs.W = warpBands[s].Direction.Y; }
+                if (s == 0) { warpDirs.X = warpBands[s].Direction.X; warpDirs.Y = warpBands[s].Direction.Y; warpOmega.X = warpBands[s].Omega; }
+                else { warpDirs.Z = warpBands[s].Direction.X; warpDirs.W = warpBands[s].Direction.Y; warpOmega.Y = warpBands[s].Omega; }
             }
 
             // Sun light
@@ -925,6 +935,8 @@ namespace Freefall.Components
                 ShoreWarpJacobianSRV = _shoreWarp.JacobianSrv,
                 WarpSlots = warpSlots,
                 WarpDirs = warpDirs,
+                // No lips: 0, and the ocean's PS draws its own face where they would stand (LipAmount)
+                WarpOmega = Engine.Settings.DisableSurfLip ? Vector2.Zero : warpOmega,
             };
             _params.SetParameter("OceanData", data);
 
@@ -936,6 +948,10 @@ namespace Freefall.Components
             _surfDataSrv = _surfData[frame]!.SrvIndex;
 
             CommandBuffer.Enqueue(_mesh, _material, _params, Transform.TransformSlot);
+            // The lips over it, with the same OceanData (its VS places the grid round the camera; the transform only
+            // keeps the batch from being culled: the grid's bounds times the ocean's scale)
+            if (warpSlots != 0 && !Engine.Settings.DisableSurfLip && !Engine.Settings.DisableShoreWarp)
+                CommandBuffer.Enqueue(_lipMesh, _lipMaterial, _params, Transform.TransformSlot);
         }
 
         private static Mesh CreateOceanGrid(GraphicsDevice device, int gridSize)

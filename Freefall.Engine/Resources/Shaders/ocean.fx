@@ -1,205 +1,13 @@
-cbuffer PushConstants : register(b3)
-{
-    // Slots 0-1: set by the forward pass for every forward batch
-    uint ShadowMapIdx;              // 0: Shadow cascade array SRV
-    uint _reserved1;                // 1: CompositeSnapshot SRV (taken from OceanData instead)
-    // Slots 2-3: PER-DRAW (command signature writes these)
-    uint MeshPartId;                // 2: Index into MeshRegistry
-    uint InstanceBaseOffset;        // 3: Base offset for instance ID (per-command)
-    // Slots 4-8: PER-BATCH (set before ExecuteIndirect)
-    uint DescriptorBufIdx;          // 4: StructuredBuffer<InstanceDescriptor>
-    uint SortedIndicesIdx;          // 5: StructuredBuffer<uint> - sorted draw order indices
-    uint MeshRegistryIdx;           // 6: StructuredBuffer<MeshPartEntry>
-    uint MaterialsIdx;              // 7: Index to materials buffer
-    uint GlobalTransformBufferIdx;  // 8: Index to global TransformBuffer
-    // Slots 9-15: Custom / Reserved
-    uint OceanDataIdx;              // 9: Per-instance OceanData buffer
-    uint _reserved10;
-    uint _reserved11;
-    uint _reserved12;
-    uint _reserved13;
-    uint _reserved14;
-    uint _reserved15;
-    // Slot 16: Debug
-    uint DebugMode;                 // 16: Debug visualization mode
-    uint _reserved17;
-    uint _reserved18;
-    uint _reserved19;
-    // Slots 20-21: Shadow pass
-    uint ExpansionBufferIdx;        // 20: SRV: expansion buffer
-    uint CascadeBufferSRVIdx;       // 21: SRV: StructuredBuffer<CascadeData>
-};
-
-#include "common.fx"
-#include "sky_common.fx"
-#include "water_common.fx"
+#include "ocean_patch.hlsli"
+#include "ocean_shade.hlsli"
 // @RenderState(RenderTargets=1)
-
-
-
-#include "ocean_surf.hlsli"
-
-// Tessellation params
-static const float TessMinFactor = 1.0;
-static const float TessMaxFactor = 48.0;
-static const float TargetPixelsPerEdge = 10.0; // tessellate until edges are ~10 pixels
-
-// Screen-space edge length tessellation heuristic
-float ScreenSpaceEdgeFactor(float3 p0, float3 p1)
-{
-    // Project both endpoints to clip space
-    float4 clip0 = mul(mul(float4(p0, 1.0), View), Projection);
-    float4 clip1 = mul(mul(float4(p1, 1.0), View), Projection);
-
-    // NDC [-1,1] → screen pixels
-    // Use Projection[0][0] for horizontal FOV scale
-    float2 screen0 = clip0.xy / clip0.w;
-    float2 screen1 = clip1.xy / clip1.w;
-
-    // Get viewport size from projection matrix
-    // ViewportWidth ≈ 2 / Projection[0][0], but we just need relative pixel count
-    float2 pixelScale = float2(abs(Projection[0][0]), abs(Projection[1][1])) * 512.0;
-    float2 diff = (screen1 - screen0) * pixelScale;
-    float edgePixels = length(diff);
-
-    return clamp(edgePixels / TargetPixelsPerEdge, TessMinFactor, TessMaxFactor);
-}
-
-// How far the waves can move a point of the grid, in every direction (metres): patch bounds are widened by it
-static const float PatchDisplacementBound = 20.0;
-
-// Whether a patch can be left out (tessellation factors 0): its box, widened by the waves, lies outside the
-// view, or behind the opaque scene in the Hi-Z pyramid. This used to test only "entirely behind the camera",
-// so every patch in front of the camera plane was tessellated and displaced, on screen or not, hidden behind
-// terrain or not (0.74 ms with no water in view on Eldermoor, 2026-10-15).
-bool CullTriangle(float3 p0, float3 p1, float3 p2, uint hiZSrv)
-{
-    float3 minP = min(min(p0, p1), p2) - PatchDisplacementBound;
-    float3 maxP = max(max(p0, p1), p2) + PatchDisplacementBound;
-
-    // Clip-space corners; frustum planes as half-spaces (valid for corners behind the camera too)
-    uint outside = 0x1F;
-    float2 ndcMin = 1e30, ndcMax = -1e30;
-    float nearestW = 1e30;
-    bool reachesBehind = false;
-    [unroll]
-    for (uint i = 0; i < 8; i++)
-    {
-        float3 c = float3((i & 1) ? maxP.x : minP.x, (i & 2) ? maxP.y : minP.y, (i & 4) ? maxP.z : minP.z);
-        float4 clip = mul(mul(float4(c, 1.0), View), Projection);
-
-        uint beyond = 0;
-        if (clip.x < -clip.w) beyond |= 1;
-        if (clip.x >  clip.w) beyond |= 2;
-        if (clip.y < -clip.w) beyond |= 4;
-        if (clip.y >  clip.w) beyond |= 8;
-        if (clip.w <= 0.0)    beyond |= 16;
-        outside &= beyond;
-
-        if (clip.w <= 0.01) reachesBehind = true;
-        else
-        {
-            float2 ndc = clip.xy / clip.w;
-            ndcMin = min(ndcMin, ndc);
-            ndcMax = max(ndcMax, ndc);
-            nearestW = min(nearestW, clip.w);
-        }
-    }
-
-    if (outside != 0) return true;              // all corners beyond one plane of the view
-    if (hiZSrv == 0 || reachesBehind) return false;
-
-    // Hi-Z: linear view depth (clip w), max over each texel's footprint, sky = FLT_MAX (never occludes).
-    // At the mip where the box's screen rectangle spans at most one texel, it touches at most 2x2 texels;
-    // it is hidden if even its nearest point is behind the farthest opaque depth there.
-    ndcMin = max(ndcMin, -1.0);
-    ndcMax = min(ndcMax, 1.0);
-    float2 uvMin = float2(ndcMin.x, -ndcMax.y) * 0.5 + 0.5;
-    float2 uvMax = float2(ndcMax.x, -ndcMin.y) * 0.5 + 0.5;
-
-    Texture2D<float> hiZ = ResourceDescriptorHeap[hiZSrv];
-    float w, h, levels;
-    hiZ.GetDimensions(0, w, h, levels);
-    float2 extent = (uvMax - uvMin) * float2(w, h);
-    uint mip = (uint)min(ceil(log2(max(max(extent.x, extent.y), 1.0))), levels - 1.0);
-
-    float mw, mh, unused;
-    hiZ.GetDimensions(mip, mw, mh, unused);
-    int2 maxCoord = int2(mw, mh) - 1;
-    int2 t0 = clamp(int2(uvMin * float2(mw, mh)), int2(0, 0), maxCoord);
-    int2 t1 = clamp(int2(uvMax * float2(mw, mh)), int2(0, 0), maxCoord);
-
-    float occluder = max(max(hiZ.Load(int3(t0.x, t0.y, mip)), hiZ.Load(int3(t1.x, t0.y, mip))),
-                         max(hiZ.Load(int3(t0.x, t1.y, mip)), hiZ.Load(int3(t1.x, t1.y, mip))));
-    return nearestW > occluder;
-}
-
-
-// Light through the crests (PS): full at this height (m) of the wind sea above the mean, and the share of the light on a
-// crest that scatters through it to the eye
-// Whitecaps (PS): the opacity of the coarsest wind band's foam where the finer bands' crests are not squeezed, and how
-// much their squeeze (1 - J, summed) raises it
-#define WHITECAP_VEIL 0.08
-#define WHITECAP_CRESTS 3.0
-#define WHITECAP_THIN 0.03
-#define WHITECAP_RAMP 0.55
-
-#define CREST_GLOW_HEIGHT 3.0
-#define CREST_GLOW 0.25
-// Bubbles under a whitecap (PS): the share of the light on the water that they send back up, per unit of whitecap foam
-#define AERATION 0.1
 
 
 // SampleNormal + SampleFoam merged into PS loop below
 
 // ═══════════════════════════════════════════════════════════════════════
-// CONTROL POINT SHADER — pass world position through
-// ═══════════════════════════════════════════════════════════════════════
-
-struct ControlPoint
-{
-    float3 WorldPos : WORLDPOS;
-    nointerpolation uint InstanceIdx : TEXCOORD0;
-};
-
-ControlPoint VS_Control(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_InstanceID)
-{
-    ControlPoint output;
-
-    StructuredBuffer<InstanceDescriptor> descriptors = ResourceDescriptorHeap[DescriptorBufIdx];
-    StructuredBuffer<row_major matrix> globalTransforms = ResourceDescriptorHeap[GlobalTransformBufferIdx];
-    StructuredBuffer<uint> sortedIndices = ResourceDescriptorHeap[SortedIndicesIdx];
-
-    // Look up mesh buffer indices from MeshRegistry
-    StructuredBuffer<MeshPartEntry> meshRegistry = ResourceDescriptorHeap[MeshRegistryIdx];
-    MeshPartEntry part = meshRegistry[MeshPartId];
-
-    StructuredBuffer<uint> indices = ResourceDescriptorHeap[part.IndexBufferIdx];
-    uint vertexID = indices[primitiveVertexID + part.BaseIndex];
-    StructuredBuffer<float3> positions = ResourceDescriptorHeap[part.PosBufferIdx];
-
-    uint dataPos = InstanceBaseOffset + instanceID;
-    uint packedIdx = sortedIndices[dataPos];
-    uint idx = packedIdx & 0x7FFFFFFFu;
-
-    InstanceDescriptor desc = descriptors[idx];
-    row_major matrix World = globalTransforms[desc.TransformSlot];
-
-    output.WorldPos = mul(float4(positions[vertexID], 1.0f), World).xyz;
-    output.InstanceIdx = idx;
-
-    return output;
-}
-
-// ═══════════════════════════════════════════════════════════════════════
 // HULL SHADER — screen-space adaptive tessellation
 // ═══════════════════════════════════════════════════════════════════════
-
-struct HullConstantOutput
-{
-    float EdgeTess[3] : SV_TessFactor;
-    float InsideTess : SV_InsideTessFactor;
-};
 
 HullConstantOutput PatchConstantFunc(InputPatch<ControlPoint, 3> patch, uint patchID : SV_PrimitiveID)
 {
@@ -277,58 +85,13 @@ DSOutput DS(HullConstantOutput patchConstants,
     float3 camPos = ViewInverse[3].xyz;
     float camDist = length(worldPos - camPos);
 
-    // How far the shore flattens the longest waves here and the depth that sets how much each band feels of it
-    // (BandShoreAtten): the PS weighs the bands' slopes and foam alike
-    OceanShore shore = ShoreAt(ocean, worldPos.xz);
-    float waveAtten = shore.waveAtten;
-    float shoreDepth = shore.shoreDepth;
-    float waterDepth = shore.waterDepth;
-    float2 surfUV = shore.surfUV;
-
-    // Sample FFT displacement from all bands (with distance-based mips), each as far as the shore lets it stand, the
-    // surf's bands where their waves were out at sea
+    // The bands' displacement and near the shore the surf's (ocean_surf.hlsli, shared with the lip)
+    OceanShore shore;
     SurfWave surf;
-    float3 displacement = SampleDisplacement(ocean, worldPos.xz, ocean.DisplacementAtten, camDist, waveAtten, shoreDepth,
-                                             surfUV, ocean.HeightmapSRV != 0, surf);
-
-    if (ocean.ShoreWarpSRV != 0 && shoreDepth < 1e3)
-    {
-        // The surf's waves grow as they shoal: over shallow water the sea stands no higher than a breaking wave and sinks
-        // no lower than the bed, and nothing is pushed sideways further than the water is deep
-        float slopeScale;
-        displacement.y = DepthLimit(displacement.y, shoreDepth, slopeScale);
-        float sideways = length(displacement.xz);
-        displacement.xz *= min(1.0, max(shoreDepth, 0.05) / max(sideways, 1e-4));
-
-        // A breaking wave's face leans forward over its trough: the higher a point of the crest, the further ahead
-        float breaking = SurfBreaking(surf, shoreDepth);
-        // (not by the waterline: the beach's phase runs across the shore, SURF_FOAM_END)
-        breaking *= smoothstep(SURF_FOAM_END.x, SURF_FOAM_END.y, shoreDepth);
-        displacement.xz += SurfHeading(surf) * (SURF_LEAN * breaking * max(displacement.y, 0.0));
-
-        // The swash: by the waterline and up the beach the level is the bores' run-up, each arriving wave's own, in step
-        // with it. Until 2026-10-19 a clock (ShoreClock, noise-staggered) and a hash per wave (WaveStrength) ran it
-        float swashZone = 1.0 - smoothstep(0.0, SWASH_DEPTH, waterDepth);
-        float level = SwashLevel(surf, ocean.ShoreSurge);
-        // Up the beach the run-up wets a spot only once it has topped everything between the waterline and there: a
-        // hollow behind a ridge stays dry until the water pours over. One level over the whole beach filled every hollow
-        // below it within the sea mask's reach, puddles far up the sand outlined by the lace (until 2026-10-19)
-        // The ridge is the sand's own height (1 m heightmap) plus how far below it the spot lies (C# ShoreWarp, 0 on a
-        // plain slope): baked as the ridge's height, its 4 m cells frayed the waterline into a sawtooth
-        if (waterDepth < 0.0)
-        {
-            float sand = -waterDepth;                                          // the sand's height over the sea
-            float ridge = sand + surf.hollow;
-            float inHollow = smoothstep(0.02, 0.1, surf.hollow);
-            float topped = smoothstep(ridge - 0.05, ridge + 0.05, level);
-            level = lerp(level, sand - 0.3, inHollow * (1.0 - topped));
-        }
-        displacement.y = lerp(displacement.y, level, swashZone);
-    }
-
+    float3 displacement = OceanSurfaceDisplacement(ocean, worldPos.xz, camDist, shore, surf);
     float3 displaced = worldPos + displacement;
 
-    output.UndisplacedXZ = float4(worldPos.xz, waveAtten, shoreDepth);
+    output.UndisplacedXZ = float4(worldPos.xz, shore.waveAtten, shore.shoreDepth);
     output.WorldPos = displaced;
     output.Position = mul(mul(float4(displaced, 1.0), View), Projection);
     output.Depth = output.Position.w;
@@ -383,129 +146,16 @@ PSOutput PS(DSOutput input)
     float3 V = normalize(camPos - worldPos);
     float dist = distance(worldPos, camPos);
 
-    // ── Merged per-band sampling: slope + displacement in one loop ──
-    Texture2DArray<float4> dispTex = ResourceDescriptorHeap[ocean.DisplacementSRV];
-    Texture2DArray<float4> slopeTex = ResourceDescriptorHeap[ocean.SlopeSRV];
-    StructuredBuffer<float> tileScales = ResourceDescriptorHeap[ocean.TileScalesSRV];
-
-    // Slope moments of every band (water_common.fx WaterSlopes): the mean slope makes the normal, the variance of
-    // the slopes under this pixel its roughness. NormalAtten scales the slopes (and so the variance by its square).
-    WaterSlopes slopes = (WaterSlopes)0;
-    float resolvedTotal = 0;
-    float totalFoam = 0;
-    float waveHeight = 0;
-    float windHeight = 0;      // the wind sea's part of it (not the swell): what stands up in crests
+    // ── The bands at this water (ocean_shade.hlsli, shared with the lip) ──
     float2 worldXZ = input.UndisplacedXZ.xy;
     // The shore flattens each band's waves by its length (DS, BandShoreAtten): their slopes, crests and foam shrink with
     // them. Until 2026-10-18 only the heights did, and over the shelf a nearly flat sea was shaded as the full open-sea chop
     float shoreAtten = input.UndisplacedXZ.z;
     float shoreDepth = input.UndisplacedXZ.w;
-    // The surf's bands are sampled where their waves were out at sea (SampleBandWarp)
-    float2 surfUV = saturate((worldXZ - float2(ocean.TerrainOriginX, ocean.TerrainOriginZ))
-                             / float2(ocean.TerrainSizeX, ocean.TerrainSizeZ));
-    SurfWave surfWave = (SurfWave)0;
-
-    // Whitecaps (C# WhitecapBand, NoWhitecapBands): only the wind band holding the wind sea's peak, the waves one sees
-    // break (the finer the calmer the sea), makes foam; the other wind bands store how squeezed their crests are right
-    // now (ocean_fft.hlsl), and the finer ones' light up inside its foam. An older build sends no band: the coarsest
-    uint windBands = ocean.WindBands;
-    uint capBand = 0xFFFFFFFF;
-    float capScale = 1e30;
-    [loop]
-    for (uint wb = 0; wb < ocean.NumBands; ++wb)
-    {
-        if (((windBands >> wb) & 1u) && tileScales[wb] < capScale)
-        {
-            capScale = tileScales[wb];
-            capBand = wb;
-        }
-    }
-    if (ocean.WhitecapBand != 0 && ocean.WhitecapBand <= ocean.NumBands)
-    {
-        capBand = ocean.WhitecapBand - 1;
-        capScale = tileScales[capBand];
-    }
-    float capFoam = 0;         // the whitecap band's foam: where the whitecaps are
-    float smallCrests = 0;     // the finer wind bands' crest squeeze now: the structure inside them
-    float fineSqueeze = 0;     // the surf's structure: the uncarried wind bands' crest squeeze...
-    float fineNorm = 0;        // ...and what squeeze their slopes make at a typical crest
-
-    [loop]
-    for (uint i = 0; i < ocean.NumBands; ++i)
-    {
-        float angle = BandAngles[i];
-        float scale = tileScales[i];
-
-        // The surf's bands where their waves were out at sea, as high as they have grown (DS SampleDisplacement)
-        uint slice = WarpSlice(ocean, i);
-        float2 p = worldXZ;
-        float waveAtten;
-        float2x2 J = float2x2(1.0, 0.0, 0.0, 1.0);
-        float2 turn = float2(1.0, 0.0), heading = float2(1.0, 0.0);
-        if (slice != 0xFF)
-        {
-            BandWarp w = SampleBandWarp(ocean, slice, worldXZ, surfUV);
-            p = w.u;
-            waveAtten = w.amp;
-            J = w.J;
-            turn = w.turn;
-            heading = w.heading;
-        }
-        else
-            waveAtten = BandShoreAtten(shoreAtten, shoreDepth, scale);
-        float2 uv = RotateUV(p, angle) * scale;
-
-        // Filtered: the foam alpha is only a coverage mask, the visible detail comes from the foam texture
-        float4 disp = dispTex.Sample(OceanSampler, float3(uv, i));
-        float4 moments = slopeTex.Sample(OceanSampler, float3(uv, i));
-        disp *= waveAtten;
-        if (slice != 0xFF)
-        {
-            // The surf's wave: its height and its sideways displacement along the local heading (as the DS has them)
-            float2 side = RotateUV(disp.xz, -angle);
-            side = float2(side.x * turn.x - side.y * turn.y, side.x * turn.y + side.y * turn.x);
-            AddSurfWave(surfWave, ocean, float3(side.x, disp.y, side.y), heading, slice);
-        }
-
-        // Counter-rotate the mean slope back to world space (the variance does not depend on the rotation)
-        float s, c;
-        sincos(-angle, s, c);
-        float2 meanWorld = float2(moments.x * c - moments.y * s, moments.x * s + moments.y * c);
-        if (slice != 0xFF)
-        {
-            // Through the warp the slopes are Jᵀ·(the open sea's): the crowded crests are steeper. The variance grows
-            // with the mean square stretch
-            float slopeScale = ocean.NormalAtten * waveAtten;
-            float stretch2 = 0.5 * (J[0][0] * J[0][0] + J[0][1] * J[0][1] + J[1][0] * J[1][0] + J[1][1] * J[1][1]);
-            slopes.mean += mul(meanWorld, J) * slopeScale;
-            slopes.variance += max(moments.z + moments.w - dot(moments.xy, moments.xy), 0.0) * slopeScale * slopeScale * stretch2;
-            resolvedTotal += WaterBandTotalVariance(slopeTex, OceanSampler, i, slopeScale) * stretch2;
-        }
-        else
-        {
-            AddWaterBand(slopes, moments, meanWorld, ocean.NormalAtten * waveAtten);
-            float bandVariance = WaterBandTotalVariance(slopeTex, OceanSampler, i, ocean.NormalAtten * waveAtten);
-            resolvedTotal += bandVariance;
-            if (((windBands >> i) & 1u) && i != capBand)
-            {
-                fineSqueeze += disp.a;
-                fineNorm += ocean.Choppiness * sqrt(bandVariance);
-            }
-        }
-        totalFoam += disp.a;
-        waveHeight += disp.y;
-        if ((windBands >> i) & 1u)
-        {
-            windHeight += disp.y;
-            // Weighted by the band's size against the whitecap band's: the 64 m band's crest lines give the structure,
-            // the ripples (whose squeeze is the strongest, in round cells) only its finest detail. Unweighted they
-            // spotted the whitecaps like a dalmatian
-            if (i == capBand)
-                capFoam = disp.a;
-            else if (scale > capScale)
-                smallCrests += disp.a * sqrt(capScale / scale);
-        }
-    }
+    OceanBands bands = SampleOceanBands(ocean, worldXZ, shoreAtten, shoreDepth);
+    WaterSlopes slopes = bands.slopes;
+    float waveHeight = bands.waveHeight;
+    SurfWave surfWave = bands.surf;
 
     // The DS's depth limit flattens the shoaled crests (DepthLimit): their slopes with them
     if (ocean.ShoreWarpSRV != 0 && shoreDepth < 1e3)
@@ -514,10 +164,17 @@ PSOutput PS(DSOutput input)
         waveHeight = DepthLimit(waveHeight, shoreDepth, capSlope);
         slopes.mean *= capSlope;
         slopes.variance *= capSlope * capSlope;
+
+        // Where a breaking lip stands, the lip pass (ocean_lip.fx) draws the strip ahead of the crest, the curl and a
+        // steep face under it: this gentle face would stand in front of the tube. By the same test, so they meet
+        float lipPhase = LipPhase(surfWave);
+        if (lipPhase > 0.0 && lipPhase < LIP_STRIP
+            && LipAmount(ocean, worldXZ, surfWave, shoreDepth, distance(worldXZ, camPos.xz)) > LIP_MIN)
+            discard;
     }
 
     float3 N = normalize(float3(-slopes.mean.x, 1.0, -slopes.mean.y));
-    float alpha = WaterAlpha(slopes, WaterUnresolvedVariance(resolvedTotal));
+    float alpha = WaterAlpha(slopes, WaterUnresolvedVariance(bands.resolvedTotal));
 
     float NdotV = saturate(dot(N, V));
 
@@ -621,7 +278,7 @@ PSOutput PS(DSOutput input)
     // lets through (ShallowColor is its per-metre transmittance): the teal glow of a storm sea's crests. It grows with the
     // crest's height above the mean (wind sea only: the long swell is thick) and on faces seen at a slant. Under a storm
     // sky the sun-only term above (k1) left the whole sea a dark sky mirror.
-    float crestRise = smoothstep(CREST_GLOW_HEIGHT * 0.25, CREST_GLOW_HEIGHT, windHeight);
+    float crestRise = smoothstep(CREST_GLOW_HEIGHT * 0.25, CREST_GLOW_HEIGHT, bands.windHeight);
     crestRise *= crestRise;
     float slant = 1.0 - NdotV;
     float3 throughCrest = pow(max(ocean.ShallowColor, 0.02), 2.5);
@@ -632,7 +289,7 @@ PSOutput PS(DSOutput input)
     // Under a whitecap the water is full of the air the breaking crest carried down: the bubbles scatter the light
     // back up, pale turquoise water under the foam and behind it that lasts as long as the whitecap band's foam does
     // (its foam is the measure, as for the whitecaps below)
-    body += (skyAmbient + sunRadiance * 0.3) * throughCrest * (AERATION * saturate(capFoam)) * skyVisible;
+    body += (skyAmbient + sunRadiance * 0.3) * throughCrest * (AERATION * saturate(bands.capFoam)) * skyVisible;
 
     // ── Combine lighting ──
     float3 color = (1.0 - F) * body + (specular + F * reflectColor) * edgeFade;
@@ -649,46 +306,10 @@ PSOutput PS(DSOutput input)
     // as random blobs where no visible crest is. Without wind bands every band's foam is summed as in the reference.
     // The foam lives in mipmapped textures, so far away it averages out instead of aliasing.
     float t = ocean.WaveTime;
-    // Foam is bubbles: there or not. Thin foam drawn at a fraction of its opacity greyed the water like smoke, so the
-    // wind sea's foam drops out below WHITECAP_THIN and is solid from WHITECAP_THIN + WHITECAP_RAMP: as it thins it
-    // breaks up along the small crests' pattern instead of fading as a whole
-    float whitecap = capBand != 0xFFFFFFFF
-        ? saturate((saturate(capFoam) * saturate(WHITECAP_VEIL + WHITECAP_CRESTS * smallCrests) - WHITECAP_THIN) / WHITECAP_RAMP)
-        : saturate(totalFoam);
-    whitecap *= saturate(1.0 - dist / 3000.0);
-
-    // ── The surf: foam from the waves themselves (C# ShoreWarp, SurfWave) ──
-    // Every carried wave knows its own height and phase: once it stands taller than ~0.8 × the depth it has broken, and
-    // stays broken toward the beach (big waves of a set break further out). Its white water rides its crest and face (the
-    // roller) and is left behind it, thinning over about a third of a wave, with the bubbles of the broken water all
-    // through the surf zone. Drawn like the whitecaps, through the finer bands' crests. Until 2026-10-19 the shore's foam
-    // ran on a clock: bands crossing the swash zone on a noise-staggered schedule (ShoreClock), a hash per wave
-    // (WaveStrength), a drifting Voronoi web (FoamWeb) and streaks, none of it a wave.
-    float surfFoam = 0.0;
-    float surfTrailWeb = 0.0;     // how much thinning trail there is, for the web (below)
-    if (ocean.ShoreWarpSRV != 0 && shoreDepth < 1e3)
-    {
-        float breaking = SurfBreaking(surfWave, shoreDepth);
-        // Each carried band's roller and trail at its own phase, the weaker band's in proportion to its height
-        float2 weight = surfWave.envelope / max(max(surfWave.envelope.x, surfWave.envelope.y), 1e-6);
-        float2 rt0 = SurfRollerTrail(surfWave.phase.x) * weight.x;
-        float2 rt1 = SurfRollerTrail(surfWave.phase.y) * weight.y;
-        float roller = breaking * max(rt0.x, rt1.x);
-        float trail = breaking * max(rt0.y, rt1.y) + SURF_BUBBLES * breaking * breaking;
-        // The roller is a churning white mass, broken only at its edges; what it leaves behind breaks up along the crests
-        float structure = saturate(fineSqueeze / max(fineNorm, 1e-4));
-        surfFoam = max(roller * saturate(SURF_ROLLER + SURF_CRESTS * structure),
-                       trail * saturate(SURF_VEIL + SURF_CRESTS * structure));
-        // Up the beach the warp holds the waterline's phase (C# ShoreWarp), lines across the shore that the swash runs on:
-        // drawn as white water they made hooks along the waterline (user, 2026-10-19). The bore's white water ends where
-        // the water gets that shallow (SURF_FOAM_END), and the swash's edge is the waterline's lace (below)
-        surfFoam *= smoothstep(SURF_FOAM_END.x, SURF_FOAM_END.y, shoreDepth);
-        surfFoam = saturate((saturate(surfFoam) - WHITECAP_THIN) / WHITECAP_RAMP);
-        surfFoam *= saturate(1.0 - dist / 3000.0);
-        // The trail as it thins, away from the roller: the web takes it over
-        surfTrailWeb = saturate(trail * 1.4) * (1.0 - saturate(roller * 2.0))
-                     * smoothstep(SURF_FOAM_END.x, SURF_FOAM_END.y, shoreDepth);
-    }
+    // The whitecaps, and the surf's white water from the waves themselves (ocean_shade.hlsli, shared with the lip)
+    float whitecap = OceanWhitecap(bands, dist);
+    float surfTrailWeb;     // how much thinning trail there is, for the web (below)
+    float surfFoam = SurfWhiteWater(ocean, bands, shoreDepth, dist, surfTrailWeb);
 
     // The waterline: foam gathers where the water meets the sand, a rock or a pier, a ragged band that swells and pinches
     // along the coast; on a beach the swash's edge, crisp as a bore runs up and thinner as it drains. Everything below
@@ -739,13 +360,10 @@ PSOutput PS(DSOutput input)
         // Stays below full coverage so the foam texture always breaks it up
         coverage = saturate(lace * 0.8 * ocean.ShoreFoam);
 
-        // Foam texture: two drifting scales of cellular noise (noise texture has no mips: flatten it far away). Sampled
-        // where the surface's water rests (the undisplaced position): the bubbles ride the water they float on, out with
-        // a breaking lip and back with the swash. At the displaced position the white water slid over a fixed pattern
+        // Foam texture: the foam's cells where the surface's water rests (OceanFoamCells)
         float2 foamPos = input.UndisplacedXZ.xy;
-        float cells1 = noiseTex.SampleLevel(OceanSampler, foamPos * 0.23 + t * float2(0.010, 0.006), 0).g;
-        float cells2 = noiseTex.SampleLevel(OceanSampler, foamPos * 0.83 - t * float2(0.013, 0.004), 0).g;
-        foamTex = saturate((cells1 * 0.6 + cells2 * 0.4 - 0.15) / 0.6);
+        float cells2;
+        foamTex = OceanFoamCells(noiseTex, foamPos, t, cells2);
 
         // The waterline's foam is fine: a ragged line of small bubbles (0.3 to 0.6 m), not the coarse cells above. Cut by
         // those it broke into round clusters along the edge like paw prints (user, 2026-10-19)

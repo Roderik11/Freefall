@@ -49,6 +49,7 @@ struct OceanData
     uint WarpSlots;             // band + 1 of warp slice 0 (bits 0-7) and slice 1 (bits 8-15); 0 = none
     float _warpPad;
     float4 WarpDirs;            // the deep heading (world xz) of slice 0 (xy) and slice 1 (zw)
+    float2 WarpOmega;           // the angular frequency of slice 0 and slice 1's band at its peak (rad/s): the lip's wavelength
 };
 
 SamplerState OceanSampler : register(s0);
@@ -242,8 +243,6 @@ float SwashAdvancing(float phase)
     return max(1.0 - smoothstep(SurgeRise, SurgeRise + 0.2, cycle), smoothstep(0.92, 1.0, cycle));
 }
 
-// How far a breaking face leans forward over its trough, per metre of crest height (m/m)
-#define SURF_LEAN 1.6
 // The swash: within this depth of the waterline (and up the beach) the sea's level is the run-up's
 #define SWASH_DEPTH 0.6
 // How high the bores run up the beach per metre of the arriving wave's height, and how far the backwash draws the
@@ -389,6 +388,104 @@ float3 SampleDisplacement(OceanData ocean, float2 worldXZ, float depthAtten, flo
     }
 
     return totalDisp * depthAtten;
+}
+
+// Where the ocean draws the point of its grid at worldXZ, as an offset from (worldXZ, OceanPlaneY): the bands'
+// displacement, and near the shore the surf's limits (no higher than a breaking wave, no lower than the bed, nothing
+// pushed sideways further than the water is deep), the breaking face's lean and the swash's run-up. The ocean's DS, and
+// the lip (ocean_lip.fx) for the crest its sheet hangs from. shore, surf: as the DS needs them for the PS
+float3 OceanSurfaceDisplacement(OceanData ocean, float2 worldXZ, float camDist, out OceanShore shore, out SurfWave surf)
+{
+    // How far the shore flattens the longest waves here and the depth that sets how much each band feels of it
+    // (BandShoreAtten): the PS weighs the bands' slopes and foam alike
+    shore = ShoreAt(ocean, worldXZ);
+    float shoreDepth = shore.shoreDepth;
+    float waterDepth = shore.waterDepth;
+
+    // Sample FFT displacement from all bands (with distance-based mips), each as far as the shore lets it stand, the
+    // surf's bands where their waves were out at sea
+    float3 displacement = SampleDisplacement(ocean, worldXZ, ocean.DisplacementAtten, camDist, shore.waveAtten, shoreDepth,
+                                             shore.surfUV, ocean.HeightmapSRV != 0, surf);
+
+    if (ocean.ShoreWarpSRV != 0 && shoreDepth < 1e3)
+    {
+        // The surf's waves grow as they shoal: over shallow water the sea stands no higher than a breaking wave and sinks
+        // no lower than the bed, and nothing is pushed sideways further than the water is deep
+        float slopeScale;
+        displacement.y = DepthLimit(displacement.y, shoreDepth, slopeScale);
+        float sideways = length(displacement.xz);
+        displacement.xz *= min(1.0, max(shoreDepth, 0.05) / max(sideways, 1e-4));
+        // A breaking face used to lean forward here (SURF_LEAN 1.6 m per metre of crest height): the crest's points
+        // and the white water riding them moved off the wave's bulge, the foam lagging behind it (user, 2026-10-19). The
+        // lip (ocean_lip.fx) throws the crest forward instead
+
+        // The swash: by the waterline and up the beach the level is the bores' run-up, each arriving wave's own, in step
+        // with it. Until 2026-10-19 a clock (ShoreClock, noise-staggered) and a hash per wave (WaveStrength) ran it
+        float swashZone = 1.0 - smoothstep(0.0, SWASH_DEPTH, waterDepth);
+        float level = SwashLevel(surf, ocean.ShoreSurge);
+        // Up the beach the run-up wets a spot only once it has topped everything between the waterline and there: a
+        // hollow behind a ridge stays dry until the water pours over. One level over the whole beach filled every hollow
+        // below it within the sea mask's reach, puddles far up the sand outlined by the lace (until 2026-10-19)
+        // The ridge is the sand's own height (1 m heightmap) plus how far below it the spot lies (C# ShoreWarp, 0 on a
+        // plain slope): baked as the ridge's height, its 4 m cells frayed the waterline into a sawtooth
+        if (waterDepth < 0.0)
+        {
+            float sand = -waterDepth;                                          // the sand's height over the sea
+            float ridge = sand + surf.hollow;
+            float inHollow = smoothstep(0.02, 0.1, surf.hollow);
+            float topped = smoothstep(ridge - 0.05, ridge + 0.05, level);
+            level = lerp(level, sand - 0.3, inHollow * (1.0 - topped));
+        }
+        displacement.y = lerp(displacement.y, level, swashZone);
+    }
+    return displacement;
+}
+
+// ── The breaking lip (ocean_lip.fx, .agent/knowledge/ocean_system/surf_lip_plan.md) ──
+// Where a lip stands the lip pass draws the strip ahead of the crest (the curl and a steep face under it) and the
+// ocean leaves its own gentle face out (PS), both by LipAmount: the same test, so they meet with no gap.
+
+// The wave's height over the depth (2A / d): the lip starts to form (breaking begins at 0.55, SurfBreaking), is fully
+// thrown, and has collapsed into the roller's white water
+static const float3 LIP_LIFE = float3(0.45, 0.75, 0.95);
+// Iribarren number (bed slope over the square root of the wave's steepness H / L0): spilling below, plunging above
+static const float2 LIP_PLUNGE = float2(0.35, 0.7);
+// The camera's distance over which the lip fades out: further out its strip has too few vertices
+static const float2 LIP_FADE = float2(90.0, 120.0);
+// The strip ahead of a crest the lip and its face take, in radians of the band's phase
+static const float LIP_STRIP = 1.2;
+// Above this LipAmount the lip pass draws the strip and the ocean leaves it out
+static const float LIP_MIN = 0.02;
+
+// The bed's steepness round xz (rise over run, over a 10 m baseline)
+float BedSlope(OceanData ocean, float2 xz)
+{
+    Texture2D<float> heightmap = ResourceDescriptorHeap[ocean.HeightmapSRV];
+    float2 size = float2(ocean.TerrainSizeX, ocean.TerrainSizeZ);
+    float2 uv = clamp((xz - float2(ocean.TerrainOriginX, ocean.TerrainOriginZ)) / size, 0.002, 0.998);
+    float2 stride = 5.0 / size;
+    float dx = heightmap.SampleLevel(OceanSampler, uv + float2(stride.x, 0), 0) - heightmap.SampleLevel(OceanSampler, uv - float2(stride.x, 0), 0);
+    float dz = heightmap.SampleLevel(OceanSampler, uv + float2(0, stride.y), 0) - heightmap.SampleLevel(OceanSampler, uv - float2(0, stride.y), 0);
+    return length(float2(dx, dz)) * ocean.MaxTerrainHeight / 10.0;
+}
+
+// The carried band a lip belongs to: the stronger one here; its phase (0 at the crest, positive ahead of it)
+bool LipSecondBand(SurfWave wave) { return wave.envelope.y > wave.envelope.x; }
+float LipPhase(SurfWave wave) { return LipSecondBand(wave) ? wave.phase.y : wave.phase.x; }
+
+// How far a lip stands at xz, 0..1: the wave breaking but not yet collapsed, over a bed that makes it plunge, near the
+// camera. 0 without lips (the C# leaves WarpOmega 0 when Engine.Settings.DisableSurfLip)
+float LipAmount(OceanData ocean, float2 xz, SurfWave wave, float depth, float camDistXZ)
+{
+    float omega = LipSecondBand(wave) ? ocean.WarpOmega.y : ocean.WarpOmega.x;
+    if (omega <= 0.05 || ocean.HeightmapSRV == 0 || depth > 1e3) return 0.0;
+    float height = 2.0 * SurfEnvelope(wave);
+    float r = height / max(depth, 0.05);
+    float life = smoothstep(LIP_LIFE.x, LIP_LIFE.y, r) * (1.0 - smoothstep(LIP_LIFE.y, LIP_LIFE.z, r));
+    if (life <= 0.0) return 0.0;
+    float L0 = 6.2831853 * 9.81 / (omega * omega);
+    float xi = BedSlope(ocean, xz) / sqrt(max(height, 0.05) / L0);
+    return life * smoothstep(LIP_PLUNGE.x, LIP_PLUNGE.y, xi) * (1.0 - smoothstep(LIP_FADE.x, LIP_FADE.y, camDistXZ));
 }
 
 #endif

@@ -382,11 +382,8 @@ bool spawn_surf(ParticleEmitter e, uint seed, inout ParticleCore p)
     }
     float speed = length(velocity);
 
-    // Where the ocean draws this point (its DS): pushed sideways no further than the water is deep, and on a breaking
-    // wave leant forward by SURF_LEAN x the crest's height. Without the lean the spray rose up to 1.6 crest heights
-    // behind the drawn lip
+    // Where the ocean draws this point (its DS, OceanSurfaceDisplacement): pushed sideways no further than the water is deep
     float2 side = d.xz * min(1.0, max(shore.shoreDepth, 0.05) / max(length(d.xz), 1e-4));
-    side += heading * (SURF_LEAN * breaking * max(crest, 0.0));
     // xz is the world's (x, z): float3(xz + side, y) made it (x, z, y), every drop born ~500 m up with its height as z
     p.Position = float3(xz.x + side.x, ocean.OceanPlaneY + crest + (mist ? 0.3 : 0.1), xz.y + side.y);
     p.Velocity = rand_cone(velocity / max(speed, 1e-4), e.SpreadCos, seed + 5u) * speed;
