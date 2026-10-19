@@ -368,19 +368,21 @@ bool spawn_surf(ParticleEmitter e, uint seed, inout ParticleCore p)
     float2 side = d.xz * min(1.0, max(shore.shoreDepth, 0.05) / max(length(d.xz), 1e-4));
     // xz is the world's (x, z): float3(xz + side, y) made it (x, z, y), every drop born ~500 m up with its height as z
     float3 from = float3(xz.x + side.x, ocean.OceanPlaneY + crest, xz.y + side.y);
-    // With a lip standing (ocean_lip.fx, by the same blurred waves and LipAmount), the spray leaves from its tip where
-    // the lip pass draws it, not from the crest top inside the curl; once the tip points down at the trough (the
-    // plunge) it splashes up off the water. A spilling breaker has no lip and throws its spray from the crest
+    // With a lip standing (ocean_lip.fx, by the same lip map and blurred waves), the spray leaves from its tip where the
+    // lip pass draws it, not from the crest top inside the curl; once the tip points down at the trough (the plunge) it
+    // splashes up off the water. A spilling breaker has no lip and throws its spray from the crest
     float falling = 0.0;
     if (!mist)
     {
-        SurfWave lipWave = LipWave(ocean, xz);
-        float thrown = LipAmount(ocean, xz, lipWave, shore.shoreDepth, distance(CameraPosition.xz, xz));
+        float3 lipMap = LipMapAt(ocean, xz);
+        float thrown = lipMap.y > 0.0 ? lipMap.x : 0.0;
         if (thrown > LIP_MIN)
         {
+            SurfWave lipWave = LipWave(ocean, xz);
             float2 lipHeading = LipSecondBand(lipWave) ? lipWave.heading.zw : lipWave.heading.xy;
             float blend = thrown * smoothstep(LIP_MIN, LIP_MIN + 0.15, thrown);     // as the lip pass bends its sheet
-            float3 tip = LipTip(from, float3(lipHeading.x, 0.0, lipHeading.y), 2.0 * SurfEnvelope(lipWave), thrown, falling);
+            float3 tip = LipTip(from, float3(lipHeading.x, 0.0, lipHeading.y), 2.0 * SurfEnvelope(lipWave),
+                                LipThrow(lipMap.z), falling);
             from = lerp(from, tip, blend);
             falling *= blend;
         }

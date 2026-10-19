@@ -276,7 +276,11 @@ namespace Freefall.Components
         private float[,]? _warpHeights;       // what the last sea mask was flooded from, for a bake of the warp alone
         private SeaMask.Result? _warpMask;
 
-        // This frame's OceanData for the particle kernel (ParticleSystem, shape Surf), one buffer per frame in flight
+        // Where the lips stand round the camera, decided once per frame for the ocean's PS and the lip pass alike
+        private readonly LipMap _lipMap = new();
+
+        // This frame's OceanData for the particle kernel (ParticleSystem, shape Surf) and the lip map, one buffer per
+        // frame in flight
         private readonly GraphicsBuffer?[] _surfData = new GraphicsBuffer?[3];
         private uint _surfDataSrv;
 
@@ -336,7 +340,8 @@ namespace Freefall.Components
             public Vector4 WarpDirs;     // the deep heading (world xz) of slice 0 (xy) and slice 1 (zw)
             public Vector2 WarpOmega;    // the angular frequency of each slice's band at its peak (rad/s), for the lip
             public float LipBarrels;     // Barrels: 0 lips where the physics puts them, 1 nearly every breaker
-            public float _lipPad;
+            public uint LipMapSRV;       // where the lips stand round the camera (LipMap): amount, k, age; 0 = no lips
+            public Vector2 LipMapOrigin; // its corner (world xz)
         }
 
         private const int GridSize = 128;
@@ -553,6 +558,7 @@ namespace Freefall.Components
             Interlocked.Increment(ref _warpRequest);
             _seaMask.Dispose();
             _shoreWarp.Dispose();
+            _lipMap.Dispose();
 
             // Deferred: the frames in flight still draw the grid, read the tile scales and the FFT textures
             // through their bindless slots and run the FFT kernels. OceanFFT.Dispose releases only GPU objects
@@ -883,6 +889,11 @@ namespace Freefall.Components
                 if (s == 0) { warpDirs.X = warpBands[s].Direction.X; warpDirs.Y = warpBands[s].Direction.Y; warpOmega.X = warpBands[s].Omega; }
                 else { warpDirs.Z = warpBands[s].Direction.X; warpDirs.W = warpBands[s].Direction.Y; warpOmega.Y = warpBands[s].Omega; }
             }
+            bool lips = warpSlots != 0 && !Engine.Settings.DisableSurfLip && !Engine.Settings.DisableShoreWarp
+                        && Camera.Main != null;
+            if (lips)
+                _lipMap.EnsureCreated(Engine.Device);
+            var lipMapOrigin = lips ? LipMap.OriginFor(Camera.Main!.Position) : Vector2.Zero;
 
             // Sun light
             var sunDir = Vector3.UnitY;
@@ -946,6 +957,8 @@ namespace Freefall.Components
                 // No lips: 0, and the ocean's PS draws its own face where they would stand (LipAmount)
                 WarpOmega = Engine.Settings.DisableSurfLip ? Vector2.Zero : warpOmega,
                 LipBarrels = Math.Clamp(Barrels, 0f, 1f),
+                LipMapSRV = lips ? _lipMap.Srv : 0,
+                LipMapOrigin = lipMapOrigin,
             };
             _params.SetParameter("OceanData", data);
 
@@ -956,10 +969,17 @@ namespace Freefall.Components
             unsafe { *_surfData[frame]!.WritePtr<OceanData>() = data; }
             _surfDataSrv = _surfData[frame]!.SrvIndex;
 
+            // Where the lips stand, from this frame's waves (after the FFT, enqueued in Update) before the ocean draws
+            if (lips)
+            {
+                uint oceanDataSrv = _surfDataSrv;
+                CommandBuffer.Enqueue(RenderPass.Opaque, cmd => _lipMap.Dispatch(cmd, Engine.Device, oceanDataSrv));
+            }
+
             CommandBuffer.Enqueue(_mesh, _material, _params, Transform.TransformSlot);
             // The lips over it, with the same OceanData (its VS places the grid round the camera; the transform only
             // keeps the batch from being culled: the grid's bounds times the ocean's scale)
-            if (warpSlots != 0 && !Engine.Settings.DisableSurfLip && !Engine.Settings.DisableShoreWarp)
+            if (lips)
                 CommandBuffer.Enqueue(_lipMesh, _lipMaterial, _params, Transform.TransformSlot);
         }
 

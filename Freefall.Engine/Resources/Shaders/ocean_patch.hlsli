@@ -46,25 +46,16 @@ static const float TessMinFactor = 1.0;
 static const float TessMaxFactor = 48.0;
 static const float TargetPixelsPerEdge = 10.0; // tessellate until edges are ~10 pixels
 
-// Screen-space edge length tessellation heuristic
-float ScreenSpaceEdgeFactor(float3 p0, float3 p1)
+// An edge's tessellation factor by its length in the world against a pixel's size at its distance, whichever way it
+// faces (pixelsPerEdge: the segments' length on screen). The control points lie flat at sea level, and seen low that
+// flat edge is a sliver on screen while the waves bent out of it stand tall. Measured on screen, the edges running
+// away from a camera at a wader's height got a few segments each: near crests stood in saw teeth metres wide (the
+// "spikes" seen from the beach, 2026-10-19), and the lip's sheet ran in patch-sized stairs
+float WorldEdgeFactor(float3 p0, float3 p1, float pixelsPerEdge, float maxFactor)
 {
-    // Project both endpoints to clip space
-    float4 clip0 = mul(mul(float4(p0, 1.0), View), Projection);
-    float4 clip1 = mul(mul(float4(p1, 1.0), View), Projection);
-
-    // NDC [-1,1] → screen pixels
-    // Use Projection[0][0] for horizontal FOV scale
-    float2 screen0 = clip0.xy / clip0.w;
-    float2 screen1 = clip1.xy / clip1.w;
-
-    // Get viewport size from projection matrix
-    // ViewportWidth ≈ 2 / Projection[0][0], but we just need relative pixel count
-    float2 pixelScale = float2(abs(Projection[0][0]), abs(Projection[1][1])) * 512.0;
-    float2 diff = (screen1 - screen0) * pixelScale;
-    float edgePixels = length(diff);
-
-    return clamp(edgePixels / TargetPixelsPerEdge, TessMinFactor, TessMaxFactor);
+    float dist = max(distance(0.5 * (p0 + p1), ViewInverse[3].xyz), 0.5);
+    float edgePixels = distance(p0, p1) * abs(Projection[1][1]) * 512.0 / dist;
+    return clamp(edgePixels / pixelsPerEdge, TessMinFactor, maxFactor);
 }
 
 // How far the waves can move a point of the grid, in every direction (metres): patch bounds are widened by it

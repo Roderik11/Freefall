@@ -51,7 +51,8 @@ struct OceanData
     float4 WarpDirs;            // the deep heading (world xz) of slice 0 (xy) and slice 1 (zw)
     float2 WarpOmega;           // the angular frequency of slice 0 and slice 1's band at its peak (rad/s): the lip's wavelength
     float LipBarrels;           // OceanRenderer.Barrels: 0 lips where the physics puts them, 1 nearly every breaker (LipAmount)
-    float _lipPad;
+    uint LipMapSRV;             // where the lips stand round the camera (C# LipMap, LipMapAt): amount, k, age; 0 = no lips
+    float2 LipMapOrigin;        // its corner (world xz)
 };
 
 SamplerState OceanSampler : register(s0);
@@ -447,9 +448,16 @@ float3 OceanSurfaceDisplacement(OceanData ocean, float2 worldXZ, float camDist, 
 // Where a lip stands the lip pass draws the strip ahead of the crest (the curl and a steep face under it) and the
 // ocean leaves its own gentle face out (PS), both by LipAmount: the same test, so they meet with no gap.
 
-// The wave's height over the depth (2A / d): the lip starts to form (breaking begins at 0.55, SurfBreaking), is fully
-// thrown, and has collapsed into the roller's white water
-static const float3 LIP_LIFE = float3(0.45, 0.75, 0.95);
+// The wave's height over the depth (2A / d): the face starts to steepen (breaking begins at 0.55, SurfBreaking), the
+// lip is fully thrown, and has collapsed into the roller's white water. At 0.45 (0.30 with Barrels) the lip threw while
+// the face was still gentle, a crease on a sloping wave: "breaking a bit too early" (user, 2026-10-19)
+static const float3 LIP_LIFE = float3(0.5, 0.8, 1.0);
+// The share of its life (LipAmount's age: 0 at the onset, 0.5 fully thrown, 1 collapsed) over which the lip stands up
+// (only the face steepening under a sharpening crest), and over which its curl is thrown (LipThrow). Driven by the
+// amount, which rises and falls over the life, the curl threw the moment a lip formed and wound back up as it collapsed
+static const float LIP_STAND = 0.2;
+static const float2 LIP_THROW = float2(0.15, 0.55);
+float LipThrow(float age) { return smoothstep(LIP_THROW.x, LIP_THROW.y, age); }
 // Iribarren number (bed slope over the square root of the wave's steepness H / L0): spilling below, plunging above
 static const float2 LIP_PLUNGE = float2(0.35, 0.7);
 // The camera's distance over which the lip fades out: further out its strip has too few vertices
@@ -541,34 +549,40 @@ static const float2 LIP_CENTRE = float2(0.6, 0.8);
 static const float LIP_SWEEP = 3.8;
 static const float LIP_TIP_SHRINK = 0.35;
 
-// The lip's tip, from its crest top C (fwd: the wave's heading, height: the wave's from trough to crest, thrown: its
-// LipAmount): where the curl's outer side ends. falling: 0 while it is thrown forward, 1 once it points down at the
-// trough (the plunge, where it lands)
+// The lip's tip, from its crest top C (fwd: the wave's heading, height: the wave's from trough to crest, thrown: how
+// far its curl is thrown, LipThrow): where the curl's outer side ends. falling: 0 while it is thrown forward, 1 once
+// it points down at the trough (the plunge, where it lands)
 float3 LipTip(float3 C, float3 fwd, float height, float thrown, out float falling)
 {
     float R = LIP_RADIUS * height;
     float3 O = C + fwd * (LIP_CENTRE.x * R) - float3(0.0, LIP_CENTRE.y * R, 0.0);
     float theta = atan2(-LIP_CENTRE.x, LIP_CENTRE.y) + LIP_SWEEP * thrown;
-    float rho = R * length(LIP_CENTRE) * (1.0 - LIP_TIP_SHRINK);
+    float rho = R * length(LIP_CENTRE) * (1.0 - LIP_TIP_SHRINK * thrown);
     falling = smoothstep(1.6, 3.0, theta);
     return O + rho * (sin(theta) * fwd + float3(0.0, cos(theta), 0.0));
 }
 
 // How far a lip stands at xz, 0..1: the wave breaking but not yet collapsed, over a bed that makes it plunge, one band
-// clearly leading, near the camera. 0 without lips (the C# leaves WarpOmega 0 when Engine.Settings.DisableSurfLip)
-float LipAmount(OceanData ocean, float2 xz, SurfWave wave, float depth, float camDistXZ)
+// clearly leading, near the camera. 0 without lips (the C# leaves WarpOmega 0 when Engine.Settings.DisableSurfLip).
+// age: how far through its life the breaker is, rising only as it runs into shallower water (0 at the onset, 0.5
+// fully thrown, 1 collapsed): its shape goes by this (LipThrow), the amount only says how much of it stands
+float LipAmount(OceanData ocean, float2 xz, SurfWave wave, float depth, float camDistXZ, out float age)
 {
+    age = 0.0;
     float omega = LipSecondBand(wave) ? ocean.WarpOmega.y : ocean.WarpOmega.x;
     if (omega <= 0.05 || ocean.HeightmapSRV == 0 || depth > 1e3) return 0.0;
     float bedDepth, bedSlope;
     LipBed(ocean, xz, bedDepth, bedSlope);
     float height = 2.0 * SurfEnvelope(wave);
     float r = height / max(bedDepth, 0.05);
-    // OceanRenderer.Barrels (immersive over realistic): the lip forms earlier and lasts into shallower water, and the bed
-    // need hardly be steeper than the wave for it to plunge
+    // OceanRenderer.Barrels (immersive over realistic): the lip lasts into shallower water, and the bed need hardly be
+    // steeper than the wave for it to plunge (not earlier: an earlier onset threw it off a gentle face)
     float barrels = saturate(ocean.LipBarrels);
-    float3 lifeWindow = float3(LIP_LIFE.x - 0.15 * barrels, LIP_LIFE.y, LIP_LIFE.z + 0.25 * barrels);
-    float life = smoothstep(lifeWindow.x, lifeWindow.y, r) * (1.0 - smoothstep(lifeWindow.y, lifeWindow.z, r));
+    float3 lifeWindow = float3(LIP_LIFE.x - 0.05 * barrels, LIP_LIFE.y, LIP_LIFE.z + 0.3 * barrels);
+    age = r < lifeWindow.y ? 0.5 * saturate((r - lifeWindow.x) / (lifeWindow.y - lifeWindow.x))
+                           : 0.5 + 0.5 * saturate((r - lifeWindow.y) / (lifeWindow.z - lifeWindow.y));
+    // It stands up early in its life (the steepening face), and sinks into the white water as it collapses
+    float life = smoothstep(0.0, LIP_STAND, age) * (1.0 - smoothstep(0.5, 1.0, age));
     if (life <= 0.0) return 0.0;
     float L0 = 6.2831853 * 9.81 / (omega * omega);
     float xi = bedSlope / sqrt(max(height, 0.05) / L0);
@@ -651,10 +665,11 @@ float2 LipCrest(OceanData ocean, float2 xz, SurfWave wave, float depth, out floa
 // The lip amount a point of a strip goes by (wave: LipWave there): its crest's (LipCrest), where the lip stands, not
 // its own. A strip's length ahead of its crest the water is shallower and the point's own amount had run out of the
 // breaker's life: the strip was cut short in ragged tongues, and the half-bent face at the cut stood as a shelf. None
-// in the swash's water (SWASH_DEPTH), where the ocean is the run-up's sheet. The ocean's cut-out and the lip pass both
-// decide by this, so they agree. crestXZ, crestWave: the crest and its waves
+// in the swash's water (SWASH_DEPTH), where the ocean is the run-up's sheet. Behind the crest (phase below 0) the point
+// is its own crest. Decided once per frame round the camera into the lip map (ocean_lip_map.hlsl), which the ocean's
+// cut-out and the lip pass both read. crestXZ, crestWave: the crest and its waves; age: the crest's (LipAmount)
 float LipStripAmount(OceanData ocean, float2 xz, SurfWave wave, float2 camXZ, out float2 crestXZ, out SurfWave crestWave,
-                     out float k)
+                     out float k, out float age)
 {
     float depth, slope;
     LipBed(ocean, xz, depth, slope);
@@ -663,9 +678,34 @@ float LipStripAmount(OceanData ocean, float2 xz, SurfWave wave, float2 camXZ, ou
     OceanShore crestShore = ShoreAt(ocean, crestXZ);
     // The search checked: the crest found must lie where the phase is 0. Where the shallows' phase is too tangled for
     // it, the point is no strip's (by the beach such points hung from crests far off, the sheet in blocky shards)
-    float found = 1.0 - smoothstep(0.3, 0.6, abs(LipPhase(crestWave)));
-    return LipAmount(ocean, crestXZ, crestWave, crestShore.shoreDepth, distance(crestXZ, camXZ))
+    float found = LipPhase(wave) <= 0.0 ? 1.0 : 1.0 - smoothstep(0.3, 0.6, abs(LipPhase(crestWave)));
+    return LipAmount(ocean, crestXZ, crestWave, crestShore.shoreDepth, distance(crestXZ, camXZ), age)
          * smoothstep(SWASH_DEPTH, 2.5 * SWASH_DEPTH, depth) * found;
+}
+
+// The lip map (C# LipMap): LIP_MAP_SIZE² texels of LIP_MAP_TEXEL m from ocean.LipMapOrigin
+static const int LIP_MAP_SIZE = 256;
+static const float LIP_MAP_TEXEL = 1.0;
+
+// Where a lip stands at xz by the map: x the amount of the crest its strip belongs to (as LipStripAmount, smoothed),
+// y the phase's mean rate back to that crest (0 outside a strip: the crest lies phase / y back along the heading), z
+// the crest's age (LipAmount). Bilinear by hand: k and the age only over the texels in a strip, and 0 off the map
+float3 LipMapAt(OceanData ocean, float2 xz)
+{
+    if (ocean.LipMapSRV == 0) return 0.0;
+    Texture2D<float4> map = ResourceDescriptorHeap[ocean.LipMapSRV];
+    float2 t = (xz - ocean.LipMapOrigin) / LIP_MAP_TEXEL - 0.5;
+    int2 i = int2(floor(t));
+    if (any(i < 0) || any(i >= LIP_MAP_SIZE - 1)) return 0.0;
+    float2 f = t - float2(i);
+    float3 a = map.Load(int3(i, 0)).xyz, b = map.Load(int3(i + int2(1, 0), 0)).xyz;
+    float3 c = map.Load(int3(i + int2(0, 1), 0)).xyz, d = map.Load(int3(i + int2(1, 1), 0)).xyz;
+    float4 w = float4((1.0 - f.x) * (1.0 - f.y), f.x * (1.0 - f.y), (1.0 - f.x) * f.y, f.x * f.y);
+    float amount = dot(w, float4(a.x, b.x, c.x, d.x));
+    float4 kw = w * float4(a.y > 0.0, b.y > 0.0, c.y > 0.0, d.y > 0.0);
+    float kSum = dot(kw, 1.0);
+    if (kSum <= 1e-4) return float3(amount, 0.0, 0.0);
+    return float3(amount, dot(kw, float4(a.y, b.y, c.y, d.y)) / kSum, dot(kw, float4(a.z, b.z, c.z, d.z)) / kSum);
 }
 
 #endif

@@ -26,13 +26,13 @@ HullConstantOutput PatchConstantFunc(InputPatch<ControlPoint, 3> patch, uint pat
         return output;
     }
 
-    // Screen-space edge length — tessellate proportional to pixel coverage
+    // By each edge's length in the world against a pixel's size there (WorldEdgeFactor)
     // Edge indices: edge[0] = opposite vertex 0 = edge(1,2)
     //               edge[1] = opposite vertex 1 = edge(0,2)
     //               edge[2] = opposite vertex 2 = edge(0,1)
-    output.EdgeTess[0] = ScreenSpaceEdgeFactor(p1, p2);
-    output.EdgeTess[1] = ScreenSpaceEdgeFactor(p2, p0);
-    output.EdgeTess[2] = ScreenSpaceEdgeFactor(p0, p1);
+    output.EdgeTess[0] = WorldEdgeFactor(p1, p2, TargetPixelsPerEdge, TessMaxFactor);
+    output.EdgeTess[1] = WorldEdgeFactor(p2, p0, TargetPixelsPerEdge, TessMaxFactor);
+    output.EdgeTess[2] = WorldEdgeFactor(p0, p1, TargetPixelsPerEdge, TessMaxFactor);
 
     output.InsideTess = (output.EdgeTess[0] + output.EdgeTess[1] + output.EdgeTess[2]) / 3.0;
 
@@ -166,24 +166,14 @@ PSOutput PS(DSOutput input)
         slopes.variance *= capSlope * capSlope;
 
         // Where a breaking lip stands, the lip pass (ocean_lip.fx) draws the strip ahead of the crest, the curl and a
-        // steep face under it: this gentle face would stand in front of the tube. By the same test on the same blurred
-        // waves (LipWave, LipStripAmount: the crest's amount), so they meet; only where a wave stands anywhere near
-        // breaking by the full detail (a strip's far end lies in shallower water than its crest), so the rest of the
-        // coast pays nothing for it
-        float nearBreaking = 2.0 * SurfEnvelope(surfWave) / max(shoreDepth, 0.05);
-        if (ocean.WarpOmega.x + ocean.WarpOmega.y > 0.0 && nearBreaking > LIP_LIFE.x - 0.25 && nearBreaking < 2.0)
+        // steep face under it: this gentle face would stand in front of the tube. By the lip map (LipMapAt, decided
+        // once per frame) and the blurred waves' phase (LipWave), as the lip pass reads them, so they meet
+        [branch]
+        if (LipMapAt(ocean, worldXZ).x > LIP_MIN)
         {
-            SurfWave lipWave = LipWave(ocean, worldXZ);
-            float lipPhase = LipPhase(lipWave);
-            [branch]
-            if (lipPhase > 0.0 && lipPhase < LIP_STRIP)
-            {
-                float2 lipCrestXZ;
-                SurfWave lipCrestWave;
-                float lipK;
-                if (LipStripAmount(ocean, worldXZ, lipWave, camPos.xz, lipCrestXZ, lipCrestWave, lipK) > LIP_MIN)
-                    discard;
-            }
+            float lipPhase = LipPhase(LipWave(ocean, worldXZ));
+            if (lipPhase > 0.08 && lipPhase < LIP_STRIP)
+                discard;
         }
     }
 

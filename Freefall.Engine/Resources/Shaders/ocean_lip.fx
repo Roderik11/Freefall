@@ -63,29 +63,20 @@ ControlPoint VS_Lip(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_I
 // HULL SHADER — only patches where a carried wave breaks, tessellated finely
 // ═══════════════════════════════════════════════════════════════════════
 
-// By the edge's length in the world against a pixel's size at its distance, whichever way it faces: the control points
-// lie flat at sea level, and seen low that flat edge is a sliver on screen while the face bent out of it stands tall.
-// Measured on screen, low views got a few segments per patch, the sheet's edges ran in patch-sized stairs and missed
-// the ocean's per-pixel cut-out (the seabed showed through along the seams)
+// By the edge's length in the world against a pixel's size at its distance (WorldEdgeFactor). Measured on screen, low
+// views got a few segments per patch, the sheet's edges ran in patch-sized stairs and missed the ocean's per-pixel
+// cut-out (the seabed showed through along the seams)
 float LipEdgeFactor(float3 p0, float3 p1)
 {
-    float dist = max(distance(0.5 * (p0 + p1), ViewInverse[3].xyz), 0.5);
-    float edgePixels = distance(p0, p1) * abs(Projection[1][1]) * 512.0 / dist;
-    return clamp(edgePixels / LipPixelsPerEdge, 1.0, 64.0);
+    return WorldEdgeFactor(p0, p1, LipPixelsPerEdge, 64.0);
 }
 
-// Whether a lip can stand at xz, loosely: by the blurred waves the strip goes by (LipWave), a lip's life well widened.
-// The patch's corners, edge middles and middle are tested: with the corners and middle alone, and the full detail, the
-// depth near the beach changed fast enough that the ocean cut itself out inside a patch tested empty, and the seabed
-// showed through
+// Whether a lip stands at xz, its skirt included: by the lip map, as the ocean's cut-out decides (the map's smoothing
+// spreads a strip's amount a few metres past it). The patch's corners, edge middles and middle are tested: with the
+// corners and middle alone the ocean cut itself out inside a patch tested empty, and the seabed showed through
 float LipBreakingAt(OceanData ocean, float2 xz)
 {
-    OceanShore shore = ShoreAt(ocean, xz);
-    if (shore.shoreDepth > 1e3) return 0.0;
-    float r = 2.0 * SurfEnvelope(LipWave(ocean, xz)) / max(shore.shoreDepth, 0.05);
-    // A strip's far end lies in shallower water than its crest; and wider than the ocean's gate on its cut-out (0.2-2 by
-    // the full detail at the pixel), or patches it cut into were tested empty and the seabed showed through
-    return step(0.1, r) * step(r, 3.0);
+    return LipMapAt(ocean, xz).x > 0.0 ? 1.0 : 0.0;
 }
 
 HullConstantOutput LipPatchConstantFunc(InputPatch<ControlPoint, 3> patch, uint patchID : SV_PrimitiveID)
@@ -94,7 +85,7 @@ HullConstantOutput LipPatchConstantFunc(InputPatch<ControlPoint, 3> patch, uint 
 
     StructuredBuffer<OceanData> oceanData = ResourceDescriptorHeap[OceanDataIdx];
     OceanData ocean = oceanData[patch[0].InstanceIdx];
-    if (ocean.ShoreWarpSRV == 0 || ocean.HeightmapSRV == 0) return output;
+    if (ocean.ShoreWarpSRV == 0 || ocean.HeightmapSRV == 0 || ocean.LipMapSRV == 0) return output;
 
     float3 p0 = patch[0].WorldPos, p1 = patch[1].WorldPos, p2 = patch[2].WorldPos;
     float3 mid = (p0 + p1 + p2) / 3.0;
@@ -192,21 +183,30 @@ LipOutput DS_Lip(HullConstantOutput patchConstants, float3 bary : SV_DomainLocat
     float clip = -1.0;
     float sheetThick = 10.0, tubeShade = 0.0, splash = 0.0;
 
-    // The lip here, by the ocean's own test (its PS leaves its face out where this is above LIP_MIN): the amount of the
-    // crest this strip belongs to (LipStripAmount, the crest LipCrest finds), and the band it is of, where on it the
-    // vertex lies and which way it runs: all from the blurred waves (LipWave), as the ocean's test. By the full detail
-    // the amount flickered from vertex to vertex, the sheet with it between the face and the surface
+    // The lip here, by the ocean's own test (its PS leaves its face out where the map's amount is above LIP_MIN): the
+    // lip map's amount of the crest this strip belongs to and the phase's mean rate k back to it (LipMapAt), and the
+    // band it is of, where on it the vertex lies and which way it runs: from the blurred waves (LipWave), as the
+    // ocean's test. By the full detail the amount flickered from vertex to vertex, the sheet with it between the face
+    // and the surface; by the crest search per vertex, it jumped where the search did (teeth, scallops, slivers of
+    // seabed where the ocean's per-pixel search disagreed)
     SurfWave wave = LipWave(ocean, gridPos.xz);
     bool second = LipSecondBand(wave);
     float phase = LipPhase(wave);
     float2 heading = second ? wave.heading.zw : wave.heading.xy;
     float2 sheetHeading = heading;
     float2 texXZ = gridPos.xz;
-    float local = 0.0, k = 1.0;
+    float local = 0.0, k = 1.0, age = 0.0;
     float2 crestXZ = gridPos.xz;
     SurfWave crest = wave;
     if (phase > -LipSkirt.x && phase < LIP_STRIP + LipSkirt.y)
-        local = LipStripAmount(ocean, gridPos.xz, wave, camPos.xz, crestXZ, crest, k);
+    {
+        float3 lipMap = LipMapAt(ocean, gridPos.xz);
+        local = lipMap.y > 0.0 ? lipMap.x : 0.0;
+        k = max(lipMap.y, 1e-3);
+        age = lipMap.z;
+        crestXZ = gridPos.xz - heading * (max(phase, 0.0) / k);
+        crest = LipWave(ocean, crestXZ);
+    }
     if (local > 0.0 && phase > -LipSkirt.x && phase < LIP_STRIP + LipSkirt.y)
     {
         // The sheet's shape comes from the swell alone (the ocean's surface with the small waves averaged out,
@@ -239,11 +239,14 @@ LipOutput DS_Lip(HullConstantOutput patchConstants, float3 bary : SV_DomainLocat
         // (bounded: on a choppy fold the two points barely part sideways, and the face shot up in shards)
         float endSlope = clamp((ahead.y - E.y) / max(length(ahead.xz - E.xz), 0.05), -0.6, 0.6);
 
-        // How far the crest's lip has formed sets its shape (from the onset of breaking, gone as the roller takes over,
-        // over a bed that makes it plunge). The same amount decides the strip, so along the heading the whole strip
-        // agrees and along the crest the sheet's edges narrow back into the ocean instead of being cut
+        // How much of the crest's lip stands (the amount: risen as the face steepens, sunk as the roller takes over,
+        // over a bed that makes it plunge) sets how far the sheet leaves the ocean's surface; how far through its life
+        // the breaker is (the age, LipThrow) sets how far the curl is thrown. The same amount decides the strip, so
+        // along the heading the whole strip agrees and along the crest the sheet's edges narrow back into the ocean
+        // instead of being cut. Before the curl throws, the strip is a face hanging steeply from a sharp crest
         thrown = local;
         float blend = thrown * smoothstep(LIP_MIN, LIP_MIN + 0.15, local);
+        float lipThrow = LipThrow(age);
         float height = 2.0 * SurfEnvelope(crest);
 
         float3 fwd = float3(h.x, 0.0, h.y);
@@ -252,12 +255,14 @@ LipOutput DS_Lip(HullConstantOutput patchConstants, float3 bary : SV_DomainLocat
         t = saturate(phase / LIP_STRIP);
         // The curl turns round the tube's centre O from the crest top (u = 0) to its tip (u = 1): up and forward off the
         // crest, over O and down, its radius shrinking so the tip turns in under it. Its inner side keeps the lip's
-        // thickness off the outer one, thinning to nothing at the tip, and its root C' is where the face hangs from
+        // thickness off the outer one, thinning to nothing at the tip, and its root C' is where the face hangs from.
+        // Unthrown (lipThrow 0) the whole curl lies at the crest top, and the face hangs from it
         float R = LipRadius * height;
         float3 O = C + fwd * (LipCentre.x * R) - up * (LipCentre.y * R);
         float theta0 = atan2(-LipCentre.x, LipCentre.y);
         float rho0 = R * length(LipCentre);
-        float thick0 = LipThickness * R * thrown;
+        float thick0 = LipThickness * R * lipThrow;
+        float shrink = LipTipShrink * lipThrow;
 
         // The ocean's textures over the sheet (its slopes' detail, the foam's cells) by the length along it, from the
         // crest: the curl's outer side carries the water from behind the crest (the texture mirrored back over it), its
@@ -267,21 +272,21 @@ LipOutput DS_Lip(HullConstantOutput patchConstants, float3 bary : SV_DomainLocat
         // sides of the lip run toward the tip, as the water thrown off the crest does, and the texture keeps its scale. It
         // meets the ocean's at the crest, at the tip (both sides) and in the trough; where the lip narrows out it goes back
         // to the vertex's own water
-        float outerArc = length(float2(LipSweep * thrown * rho0 * (1.0 - 0.5 * LipTipShrink), rho0 * LipTipShrink));
-        float innerArc = length(float2(LipSweep * thrown * (rho0 * (1.0 - 0.5 * LipTipShrink) - 0.5 * thick0),
-                                       rho0 * LipTipShrink - thick0));
+        float outerArc = length(float2(LipSweep * lipThrow * rho0 * (1.0 - 0.5 * shrink), rho0 * shrink));
+        float innerArc = length(float2(LipSweep * lipThrow * (rho0 * (1.0 - 0.5 * shrink) - 0.5 * thick0),
+                                       rho0 * shrink - thick0));
         float sheetOff;
         if (t < LipInnerEnd)
         {
             bool outer = t < LipOuterEnd;
             float u = outer ? t / LipOuterEnd : (LipInnerEnd - t) / (LipInnerEnd - LipOuterEnd);
             float dudt = outer ? 1.0 / LipOuterEnd : -1.0 / (LipInnerEnd - LipOuterEnd);
-            float theta = theta0 + LipSweep * thrown * u;
-            float rho = rho0 * (1.0 - LipTipShrink * u) - (outer ? 0.0 : thick0 * (1.0 - u));
-            float drho = -rho0 * LipTipShrink + (outer ? 0.0 : thick0);
+            float theta = theta0 + LipSweep * lipThrow * u;
+            float rho = rho0 * (1.0 - shrink * u) - (outer ? 0.0 : thick0 * (1.0 - u));
+            float drho = -rho0 * shrink + (outer ? 0.0 : thick0);
             float3 radial = sin(theta) * fwd + cos(theta) * up;
             target = O + rho * radial;
-            tangent = (rho * LipSweep * thrown * (cos(theta) * fwd - sin(theta) * up) + drho * radial) * dudt;
+            tangent = (rho * LipSweep * lipThrow * (cos(theta) * fwd - sin(theta) * up) + drho * radial) * dudt;
             // Light crosses the lip's own thickness, toward its tip; at its root the crest, the whole wave under it.
             // Under the lip the tube's roof
             sheetThick = lerp(height, max(thick0 * (1.0 - u), 0.03), smoothstep(0.0, 0.4, u));
@@ -298,8 +303,9 @@ LipOutput DS_Lip(HullConstantOutput patchConstants, float3 bary : SV_DomainLocat
             float3 root = O + (rho0 - thick0) * (sin(theta0) * fwd + cos(theta0) * up);
             float3 run = E - root;
             float3 runFlat = float3(run.x, 0.0, run.z);
-            float endRise = endSlope * 2.5 * length(runFlat);
-            target = root + LipFaceCurve(runFlat, run.y, endRise, v);
+            // (bounded by the wave's height: the term bulges the face by up to 4/27 of it mid-way, and over a run of
+            // 20-30 m, where the crest lay far back, a modest slope raised the face into a fin metres over the crest)
+            float endRise = clamp(endSlope * 2.5 * length(runFlat), -0.75 * height, 0.75 * height);            target = root + LipFaceCurve(runFlat, run.y, endRise, v);
             tangent = runFlat * (2.5 * pow(max(v, 1e-4), 1.5)) + up * (run.y * 2.0 * (1.0 - v) + endRise * (3.0 * v * v - 2.0 * v));
             // The wave's body behind it; the tube's back wall under the lip, open to the sky a tube's width further down
             float faceLen = LipFaceLength(runFlat, run.y, endRise, v);
@@ -314,11 +320,11 @@ LipOutput DS_Lip(HullConstantOutput patchConstants, float3 bary : SV_DomainLocat
         P = lerp(surface, target + detail * detailWeight, blend);
         sheetHeading = h;
         sheetThick = lerp(height, sheetThick, blend);
-        tubeShade *= blend;
+        tubeShade *= blend * lipThrow;        // no roof over the face before the lip is thrown
         // White water thrown up where the lip lands: once its tip points down at the trough (LipTip's falling, as the
         // spray splashes up there), over the lip's tip end and the face under it
         float falling;
-        LipTip(C, fwd, height, thrown, falling);
+        LipTip(C, fwd, height, lipThrow, falling);
         splash *= falling * blend;
         float gridOff = max(phase, 0.0) / k;
         texXZ = gridPos.xz + heading * ((sheetOff - gridOff) * blend);
