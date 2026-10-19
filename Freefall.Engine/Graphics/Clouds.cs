@@ -78,6 +78,7 @@ namespace Freefall.Graphics
             public Vector2 WindDir; public float Evolution; public uint NoiseLut;
             public uint Cells; public float CellSize; public uint CellsPerSide; public float Reach;
             public Vector3 LightDir; public uint LightIsMoon;
+            public uint ProbeClouds; public Vector3 _pad;
         }
 
         // CloudCell in cloud_common.hlsli
@@ -106,7 +107,19 @@ namespace Freefall.Graphics
         private readonly record struct Bake(int Level, long X0, long Z0, int BricksX, int BricksZ);
 
         private static ComputeShader? _cs;
-        private static int _kBake, _kLightInit, _kLightStep, _kLightChain, _kSkyScan;
+        private static int _kBake, _kLightInit, _kLightStep, _kLightChain, _kSkyScan, _kProbeFace;
+
+        // The sky probe's clouds: 64² × 6 (SkyProbe's size), a face a frame round the five that see the sky
+        private const int ProbeSize = 64;
+        private static ID3D12Resource? _probeClouds;
+        private static uint _probeCloudsSrv, _probeCloudsUav;
+        private static ResourceStates _probeCloudsState = ResourceStates.Common;
+        private static int _probeTurn;
+        private static bool _probeAll = true;
+        private static readonly int[] ProbeFaces = { 0, 1, 2, 4, 5 };     // +X −X +Y +Z −Z (−Y sees the ground)
+
+        /// <summary>How far the wind carried the clouds this frame (world xz, m): the views' reprojection.</summary>
+        public static Vector2 LastStep { get; private set; }
         private const int LightPasses = 8;              // doubling passes: 256 steps along the light cross a level
         private static readonly List<int> _lightLevels = new();     // levels whose light and sky volumes are made this frame
         private static int _lightTurn;
@@ -141,6 +154,7 @@ namespace Freefall.Graphics
             _kLightStep = _cs.FindKernel("CSCloudLightStep");
             _kLightChain = _cs.FindKernel("CSCloudLightChain");
             _kSkyScan = _cs.FindKernel("CSCloudSkyScan");
+            _kProbeFace = _cs.FindKernel("CSCloudProbeFace");
         }
 
         private static void EnsureResources()
@@ -168,6 +182,25 @@ namespace Freefall.Graphics
                 _params[i] = GraphicsBuffer.CreateUpload<GpuParams>(1, mapped: true);
                 _cells[i] = GraphicsBuffer.CreateUpload<GpuCell>(_cellData.Length, mapped: true);
             }
+
+            // The probe's clouds: pre-exposed light and a transmittance, as the probe holds light
+            const Format probeFormat = Format.R16G16B16A16_Float;
+            _probeClouds = device.CreateTexture2D(probeFormat, ProbeSize, ProbeSize, 6, 1, ResourceFlags.AllowUnorderedAccess, ResourceStates.Common);
+            _probeCloudsUav = device.AllocateBindlessIndex();
+            device.NativeDevice.CreateUnorderedAccessView(_probeClouds, null, new UnorderedAccessViewDescription
+            {
+                Format = probeFormat,
+                ViewDimension = UnorderedAccessViewDimension.Texture2DArray,
+                Texture2DArray = new Texture2DArrayUnorderedAccessView { MipSlice = 0, FirstArraySlice = 0, ArraySize = 6 }
+            }, device.GetCpuHandle(_probeCloudsUav));
+            _probeCloudsSrv = device.AllocateBindlessIndex();
+            device.NativeDevice.CreateShaderResourceView(_probeClouds, new ShaderResourceViewDescription
+            {
+                Format = probeFormat,
+                ViewDimension = ShaderResourceViewDimension.Texture2DArray,
+                Shader4ComponentMapping = ShaderComponentMapping.Default,
+                Texture2DArray = new Texture2DArrayShaderResourceView { MostDetailedMip = 0, MipLevels = 1, FirstArraySlice = 0, ArraySize = 6 }
+            }, device.GetCpuHandle(_probeCloudsSrv));
         }
 
         /// <summary>
@@ -178,6 +211,7 @@ namespace Freefall.Graphics
         public static void Advance(float dt, Vector2 windDirection, double gameHours)
         {
             double speed = DriftSpeed * Settings.Speed;
+            LastStep = new Vector2((float)(windDirection.X * speed * dt), (float)(windDirection.Y * speed * dt));
             _offsetX = Wrap(_offsetX + windDirection.X * speed * dt);
             _offsetZ = Wrap(_offsetZ + windDirection.Y * speed * dt);
             _evolution += dt * Settings.Speed;
@@ -222,6 +256,7 @@ namespace Freefall.Graphics
             bool moon = atm.SunDirection.Y < -0.06f && atm.MoonIlluminance != Vector3.Zero;
             var lightDir = Vector3.Normalize(moon ? atm.MoonDirection : atm.SunDirection);
             bool relight = rebuild || moon != _lightIsMoon;
+            if (relight) _probeAll = true;
             _lightIsMoon = moon;
             _lightDir = lightDir;
             // A level's light and sky volumes a frame, coarse to fine (each adds the coarser level's light where its path
@@ -309,6 +344,7 @@ namespace Freefall.Graphics
                 Reach = Level0Voxel * (1 << (LevelCount - 1)) * ReachTexels,
                 LightDir = lightDir,
                 LightIsMoon = moon ? 1u : 0u,
+                ProbeClouds = _probeCloudsState != ResourceStates.Common ? _probeCloudsSrv : 0u,
             };
             unsafe { *_params[slot]!.WritePtr<GpuParams>() = p; }
             _paramsIdx = _params[slot]!.SrvIndex;
@@ -436,6 +472,29 @@ namespace Freefall.Graphics
             PixMarker.Begin(list, "Cloud light");
             foreach (int i in _lightLevels)
                 MakeLight(list, i);
+            PixMarker.End(list);
+
+            // The sky probe's clouds: a face a frame (all five after a rebake or a change of light); the probe composes
+            // them over its sky every frame (sky_probe_cs.hlsl), so it follows the time and the exposure as before
+            PixMarker.Begin(list, "Cloud probe");
+            if (_probeCloudsState != ResourceStates.UnorderedAccess)
+            {
+                list.ResourceBarrierTransition(_probeClouds!, _probeCloudsState, ResourceStates.UnorderedAccess);
+                _probeCloudsState = ResourceStates.UnorderedAccess;
+            }
+            int faces = _probeAll ? 6 : 1;          // all six once (−Y too: it must hold "no cloud", not garbage)
+            for (int f = 0; f < faces; f++)
+            {
+                int face = _probeAll ? f : ProbeFaces[_probeTurn];
+                cs.SetPushConstant(_kProbeFace, "TargetUAV", _probeCloudsUav);
+                cs.SetPushConstant(_kProbeFace, "TargetWidth", (uint)ProbeSize);
+                cs.SetPushConstant(_kProbeFace, "ProbeFace", (uint)face);
+                cs.Dispatch(_kProbeFace, list, ProbeSize / 8, ProbeSize / 8, 1);
+            }
+            if (!_probeAll) _probeTurn = (_probeTurn + 1) % ProbeFaces.Length;
+            _probeAll = false;
+            list.ResourceBarrierTransition(_probeClouds!, ResourceStates.UnorderedAccess, shaderRead);
+            _probeCloudsState = shaderRead;
             PixMarker.End(list);
         }
 

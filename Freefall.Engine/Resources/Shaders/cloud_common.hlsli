@@ -60,6 +60,9 @@ struct CloudParams
     float3 LightDir;        // toward the light the clouds are lit by (the sun, after ~3.4° below the horizon the
                             // brightest moon): the light volumes are made along it
     uint LightIsMoon;
+    uint ProbeClouds;       // Texture2DArray<float4> 64² × 6: the sky probe's clouds (rgb light, a transmittance), a face
+                            // a frame (clouds_cs.hlsl CSCloudProbeFace); 0 = none yet
+    float3 _paramsPad;
 };
 
 struct CloudCell
@@ -227,6 +230,33 @@ float2 CloudSkyDepthAt(CloudParams C, uint level, float2 xz, float h, SamplerSta
     CloudLevel L = C.Levels[level];
     Texture3D<float2> sky = ResourceDescriptorHeap[L.SkyTex];
     return sky.SampleLevel(wrap, CloudLevelUvw(C, L, xz, clamp(h, C.SlabBottom, C.SlabTop)), 0);
+}
+
+// The clouds' optical depth toward the light from a place (camera-relative): the light volume where the light's path
+// crosses the slab's base, or at the place itself inside the slab. The path's height rises with the planet's curvature:
+// h + s·L.y + s²/2R reaches the base at s = 2|c| / (L.y + sqrt(L.y² + 2|c|/R)), c = h − base, written without
+// cancellation. 0 for any other light than the one the volumes are made for (a moon by day lights nothing that shows).
+float CloudShadowDepth(CloudParams C, float3 rel, float3 toLight, SamplerState wrap)
+{
+    if (dot(toLight, C.LightDir) < 0.99)
+        return 0.0;
+    float h = CloudHeight(rel);
+    float3 q = rel;
+    if (h < C.SlabBottom)
+    {
+        float c = C.SlabBottom - h;
+        float s = 2.0 * c / (toLight.y + sqrt(toLight.y * toLight.y + 2.0 * c / CLOUD_EARTH_RADIUS));
+        q = rel + toLight * s;
+        h = C.SlabBottom + 1.0;
+    }
+    float dist = max(abs(q.x), abs(q.z));
+    float blend;
+    uint level = CloudLevelAt(C, dist, blend);
+    float2 xz = C.CameraCloud + q.xz;
+    float tau = CloudLightDepthAt(C, level, xz, h, wrap);
+    if (blend > 0.0)
+        tau = lerp(tau, CloudLightDepthAt(C, level + 1, xz, h, wrap), blend);
+    return tau;
 }
 
 // How far a ray (unit dir) goes from a place before it leaves that place's brick: across, the brick's xz walls; in

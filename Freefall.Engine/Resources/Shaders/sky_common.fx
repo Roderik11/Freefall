@@ -13,6 +13,7 @@
 #include "atmosphere_common.hlsli"
 #include "sky_visibility.hlsli"
 #include "sky_capture.hlsli"
+#include "cloud_common.hlsli"
 
 // Direction toward the sun (the true sun, also below the horizon), for passes that need its place in the sky
 float3 AtmSunDirection()
@@ -405,6 +406,10 @@ float CloudShadowDensityAt(Texture3D<float4> noiseLUT, SamplerState wrapSampler,
 // the low-sun fade, the old and the new layer cross-faded while a preset changes the altitude. relPos: camera-relative.
 float CloudShadowDensity(SamplerState wrapSampler, float3 relPos, float3 toLight)
 {
+    // The volumetric clouds (VOLUMETRIC_CLOUDS_PLAN stage 3): what their optical depth hides, 1 − e^−τ, so every reader of
+    // the 2D layer's shadow (the ground, the water, the air, the meter) takes the clouds the sky shows
+    if (CloudParamsIdx != 0)
+        return 1.0 - exp(-CloudShadowDepth(LoadClouds(), relPos, toLight, wrapSampler));
     Texture3D<float4> noiseLUT = ResourceDescriptorHeap[CloudNoiseLUTIdx];
     float density = CloudShadowDensityAt(noiseLUT, wrapSampler, relPos, toLight, CloudAltitude);
     if (CloudAltitudeBlend < 0.999)

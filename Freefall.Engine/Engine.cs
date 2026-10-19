@@ -603,10 +603,11 @@ namespace Freefall
          public float VolumetricFogRange { get; set; } = 128f;
 
          // Volumetric clouds (Graphics.Clouds, VOLUMETRIC_CLOUDS_PLAN.md): the cloud field baked round the camera and
-         // marched per view. Off: the 2D cloud layer. In stage 1 the sky dome alone draws them (the probe, the shadows
-         // and the haze still take the 2D layer).
+         // marched per view; the sky, the probe, the cloud shadows and the air take them. Off: the 2D cloud layer.
          [Category("Clouds")]
-         public bool VolumetricClouds { get; set; } = false;
+         public bool VolumetricClouds { get; set; } = true;
+         // March every texel of the clouds every frame (captures, A/B) instead of one of each 2×2 block and the history
+         public bool VolumetricCloudsFullRate { get; set; } = false;
 
          // Camera exposure as EV100: light in physical units (lux, cd/m²) times 1 / (1.2 · 2^EV) is what the
          // tonemapper sees; higher = darker image. Auto: metered from the scene each frame (Graphics.AutoExposure).

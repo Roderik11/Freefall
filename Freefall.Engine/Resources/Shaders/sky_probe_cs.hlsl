@@ -68,6 +68,10 @@ float3 SkyProbeRadiance(float3 dir)
         return sky + ambient[1].rgb * T;
     }
 
+    // The volumetric clouds: their own cube (clouds_cs.hlsl CSCloudProbeFace, a face a frame), the same texels as ours
+    if (CloudParamsIdx != 0)
+        return sky;
+
     // The cloud layer, blurred two mips more than the dome's (a probe texel spans ~1.4°)
     float density;
     return SkyThroughClouds(linearWrap, dir, sky, 2.0, density);
@@ -79,8 +83,19 @@ void CSProbeFaces(uint3 id : SV_DispatchThreadID)
     if (id.x >= SizeIdx || id.y >= SizeIdx)
         return;
     float2 uv = (float2(id.xy) + 0.5) / SizeIdx * 2.0 - 1.0;
+    float3 radiance = SkyProbeRadiance(CubeDirection(id.z, uv));
+    if (CloudParamsIdx != 0)
+    {
+        uint clouds = LoadClouds().ProbeClouds;
+        if (clouds != 0)
+        {
+            Texture2DArray<float4> cube = ResourceDescriptorHeap[clouds];
+            float4 c = cube.Load(int4(id.xy, id.z, 0));
+            radiance = radiance * c.a + c.rgb;
+        }
+    }
     RWTexture2DArray<float4> output = ResourceDescriptorHeap[OutputUAVIdx];
-    output[id] = float4(SkyProbeRadiance(CubeDirection(id.z, uv)), 1.0);
+    output[id] = float4(radiance, 1.0);
 }
 
 [numthreads(8, 8, 1)]

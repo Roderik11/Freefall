@@ -492,6 +492,9 @@ groupshared float2 CloudDeckShared[64];
 
 float CloudCoverToward(float3 lightDir, bool sun)
 {
+    // The volumetric clouds: what their optical depth from the camera toward the light hides
+    if (CloudParamsIdx != 0)
+        return 1.0 - exp(-CloudShadowDepth(LoadClouds(), float3(0, 0, 0), lightDir, CloudWrapSampler));
     float3 dir = normalize(float3(lightDir.x, max(lightDir.y, 0.002), lightDir.z));     // at or under the horizon: its clouds
     float density = GetCloudsAt(CloudWrapSampler, dir, CloudAltitude, 0.0);
     if (CloudAltitudeBlend < 0.999)

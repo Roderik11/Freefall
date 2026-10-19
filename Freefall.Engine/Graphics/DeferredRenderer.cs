@@ -737,7 +737,7 @@ namespace Freefall.Graphics
              // 2g. Volumetric clouds: this view's march through the field baked in Atmosphere.Render, before the sky pass
              //     draws them (mesh_skybox.fx, SceneConstants.CloudTargetIdx)
              if (_cloudTargetIdx != 0)
-                 _cloudView.Render(list, BindSceneConstantsForCompute);
+                 _cloudView.Render(list, camera.Position, _relativeVP, BindSceneConstantsForCompute);
 
              // 3. Sky pass
              using (_skyMarker.Auto())

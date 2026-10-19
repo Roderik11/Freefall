@@ -6,8 +6,11 @@
 //                 shadow map is made): τ₀ = σΔ, τ_{k+1}(p) = τ_k(p) + τ_k(p + 2^k Δ d), 8 passes; where the path leaves
 //                 the level's box the coarser level's depth is added (the chain)
 //   CSCloudSkyScan  a level's sky volume, a thread per column: the optical depth straight up and straight down
-//   CSCloudMarch  one thread per texel of a view's half-size cloud target: the clouds' light in front of the sky
-//                 (rgb × Exposure, the air between included) and what they let through (a)
+//   CSCloudMarch  a view's clouds, at half its size: every texel (MarchMode 0) or one of each 2×2 block (1, a quarter-
+//                 size sparse target): the clouds' light in front of the sky (rgb × Exposure, the air between included),
+//                 what they let through (a) and how far they are (depth)
+//   CSCloudReconstruct  the half-size target from the sparse texels and last frame's, reprojected and clamped
+//   CSCloudProbeFace  one face of the sky probe's clouds (64², coarser)
 // Docs: .agent/knowledge/atmospheric_effects/volumetric_clouds.md.
 
 #pragma kernel CSCloudBake
@@ -16,6 +19,8 @@
 #pragma kernel CSCloudLightChain
 #pragma kernel CSCloudSkyScan
 #pragma kernel CSCloudMarch
+#pragma kernel CSCloudReconstruct
+#pragma kernel CSCloudProbeFace
 
 // What changes from dispatch to dispatch is pushed: a ComputeShader's Params buffer holds one copy per frame
 cbuffer PushConstants : register(b3)
@@ -25,12 +30,28 @@ cbuffer PushConstants : register(b3)
     uint BakeLevel;             // bake, light, sky: which level
     uint RegionX0Bits;          // bake: asint, the region's first texel in x and z, in the level's cloud-space texels
     uint RegionZ0Bits;
-    uint TargetUAVIdx;          // march: the view's cloud target (RWTexture2D<float4>); light, sky: the texture written
-    uint TargetWidth;           // march: its size
+    uint TargetUAVIdx;          // march, reconstruct: the colour written; light, sky, probe: the texture written
+    uint TargetWidth;           // march, reconstruct: the view's half-size target; probe: the face's size
     uint TargetHeight;
-    uint FrameIndex;            // march: the jitter's frame
+    uint FrameIndex;            // march, reconstruct: the jitter's frame and which texel of each 2×2 is marched
     uint SourceTexIdx;          // light step: the last pass (Texture3D<float>)
     uint LightStepBits;         // light step: asfloat, this pass's reach along the light (m)
+    uint DepthUAVIdx;           // march, reconstruct: the depth written (RWTexture2D<float>, km)
+    uint MarchMode;             // march: 0 every texel, 1 one of each 2×2 block (sparse)
+    uint SparseTexIdx;          // reconstruct: this frame's sparse colour and depth
+    uint SparseDepthTexIdx;
+    uint HistoryTexIdx;         // reconstruct: last frame's colour (0 = none)
+    uint ProbeFace;             // probe: the face marched this frame
+};
+
+// The view's reprojection (CloudView: its own ComputeShader, so two views in a frame do not share these)
+cbuffer Params : register(b4)
+{
+    row_major float4x4 PrevCameraRelativeVP;    // last frame's view-projection without translation
+    float3 CameraMove;                          // this frame's camera position minus last frame's
+    float ExposureRatio;                        // this frame's exposure / last frame's: the history is pre-exposed
+    float2 CloudStep;                           // how far the wind carried the clouds since last frame (world xz, m)
+    float2 _cloudParamsPad;
 };
 
 #include "common.fx"
@@ -118,9 +139,15 @@ float CloudTowers(CloudParams C, float2 xz, float h, float turret)
             int2 c = home + int2(i, j);
             int2 w = ((c % n) + n) % n;
             CloudCell k = cells[w.y * n + w.x];
-            if (k.Radius <= 0.0)
+            if (k.Radius <= 0.0 || h < C.Base || h > C.Base + (k.Top - C.Base) * 1.12)
                 continue;
-            env = max(env, CloudTowerEnvelope(C, k, float2(c) * C.CellSize + k.Center, xz, h, turret));
+            // Out of the tower's reach (its widest column with the turrets, the shear, the anvil's wedge): skip it
+            float2 center = float2(c) * C.CellSize + k.Center;
+            float reach = k.Radius * (2.6 + 3.5 * k.Anvil) + 0.12 * (k.Top - C.Base);
+            float2 off = xz - center;
+            if (dot(off, off) > reach * reach)
+                continue;
+            env = max(env, CloudTowerEnvelope(C, k, center, xz, h, turret));
         }
     }
     return env;
@@ -383,21 +410,25 @@ float CloudErode(CloudParams C, Texture3D<float4> lut, float2 field, float2 xz, 
 // other) out to CLOUD_SHORT_LIGHT metres, then the light volume from there on (the whole way out of the slab: a tower
 // shades the cloud behind it, a storm far toward a low sun the near deck)
 #define CLOUD_SHORT_LIGHT 560.0
-float CloudLightDepth(CloudParams C, Texture3D<float4> lut, float3 rel, float3 lightDir, float jitter)
+float CloudLightDepth(CloudParams C, Texture3D<float4> lut, float3 rel, float3 lightDir, float jitter, bool shortSteps)
 {
     float tau = 0.0;
-    const float at[3] = { 40.0, 160.0, 400.0 };
-    const float len[3] = { 80.0, 160.0, 320.0 };
-    [unroll] for (int i = 0; i < 3; i++)
+    float3 far = rel;
+    if (shortSteps)
     {
-        float3 p = rel + lightDir * (at[i] * (0.8 + 0.4 * jitter));
-        float h = CloudHeight(p);
-        float2 xz = C.CameraCloud + p.xz;
-        float dist = max(abs(p.x), abs(p.z));
-        tau += CloudErode(C, lut, CloudSample(C, xz, h, dist, CloudWrap), xz, h, dist) * len[i];
+        const float at[3] = { 40.0, 160.0, 400.0 };
+        const float len[3] = { 80.0, 160.0, 320.0 };
+        [unroll] for (int i = 0; i < 3; i++)
+        {
+            float3 p = rel + lightDir * (at[i] * (0.8 + 0.4 * jitter));
+            float h = CloudHeight(p);
+            float2 xz = C.CameraCloud + p.xz;
+            float dist = max(abs(p.x), abs(p.z));
+            tau += CloudErode(C, lut, CloudSample(C, xz, h, dist, CloudWrap), xz, h, dist) * len[i];
+        }
+        tau *= C.Density;
+        far = rel + lightDir * CLOUD_SHORT_LIGHT;
     }
-    tau *= C.Density;
-    float3 far = rel + lightDir * CLOUD_SHORT_LIGHT;
     float hf = CloudHeight(far);
     float distFar = max(abs(far.x), abs(far.z));
     float blend;
@@ -436,33 +467,24 @@ float CloudInScatter(CloudParams C, float density, float h, float cosTheta)
     return lerp(1.0, saturate(depth), CLOUD_INSCATTER * saturate(0.5 - 0.5 * cosTheta));
 }
 
-[numthreads(8, 8, 1)]
-void CSCloudMarch(uint3 id : SV_DispatchThreadID)
+struct CloudMarchResult
 {
-    if (id.x >= TargetWidth || id.y >= TargetHeight)
-        return;
-    RWTexture2D<float4> target = ResourceDescriptorHeap[TargetUAVIdx];
-    if (CloudParamsIdx == 0 || AtmosphereIdx == 0)
-    {
-        target[id.xy] = float4(0, 0, 0, 1);
-        return;
-    }
-    CloudParams C = LoadClouds();
-    AtmosphereParams A = LoadAtmosphere();
-    Texture3D<float4> lut = ResourceDescriptorHeap[C.NoiseLut];
+    float4 color;           // rgb the clouds' light with the air in front of them (× Exposure), a what they let through
+    float depth;            // metres to where their light comes from (transmittance-weighted); CLOUD_FAR_DEPTH if none
+};
 
-    // Camera-relative view direction through the texel's centre (reverse-Z: the far plane is z = 0)
-    float2 uv = (float2(id.xy) + 0.5) / float2(TargetWidth, TargetHeight);
-    float2 ndc = float2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
-    float4 farClip = mul(float4(ndc, 0, 1), CameraInverse);
-    float3 dir = normalize(farClip.xyz / farClip.w);
+#define CLOUD_FAR_DEPTH 20000.0
 
+// One view ray through the clouds. stepScale > 1 marches coarser (the probe's faces); jitter (0..1) offsets the steps.
+CloudMarchResult CloudMarchRay(CloudParams C, AtmosphereParams A, Texture3D<float4> lut, float3 dir, float jitter,
+                               float stepScale)
+{
+    CloudMarchResult result;
+    result.color = float4(0, 0, 0, 1);
+    result.depth = CLOUD_FAR_DEPTH;
     float tStart, tEnd;
     if (!CloudSlabSegment(C, dir, tStart, tEnd))
-    {
-        target[id.xy] = float4(0, 0, 0, 1);
-        return;
-    }
+        return result;
 
     // The light the volumes were made for: the sun, or after it has set at the clouds too the brightest moon
     float3 lightDir = C.LightDir;
@@ -476,7 +498,6 @@ void CSCloudMarch(uint3 id : SV_DispatchThreadID)
     float3 skyAmbient = ambientBuffer[0].rgb, groundAmbient = ambientBuffer[1].rgb;     // E / π × Exposure
     float viewHeightKm = AtmosphereViewHeight(A, CamPos.y);
 
-    float jitter = CloudJitter(id.xy, FrameIndex);
     float3 L = 0;
     float T = 1.0;
     float depthSum = 0.0, depthWeight = 0.0;
@@ -491,16 +512,15 @@ void CSCloudMarch(uint3 id : SV_DispatchThreadID)
         float h = CloudHeight(rel);
         float2 xz = C.CameraCloud + rel.xz;
 
-        // An empty brick: leap half a brick
         if (CloudBrickMax(C, level, xz, h) <= 0.0 && (blend <= 0.0 || CloudBrickMax(C, level + 1, xz, h) <= 0.0))
         {
-            // Out of the brick (a slab: wide across, thin in height) and just into the next: a brick's layers can be a few
-            // metres thick, so any more skips the base of the cloud in it
+            // Out of the empty brick (a slab: wide across, thin in height) and just into the next: a brick's layers can
+            // be a few metres thick, so any more skips the base of the cloud in it
             t += CloudBrickExit(C, level, xz, h, dir) + 0.5;
             continue;
         }
 
-        float step = voxel * 0.6 * (0.75 + 0.5 * jitter);
+        float step = voxel * 0.6 * stepScale * (0.75 + 0.5 * jitter);
         float3 p = dir * (t + step * 0.5);
         float hp = CloudHeight(p);
         float2 xzp = C.CameraCloud + p.xz;
@@ -513,7 +533,7 @@ void CSCloudMarch(uint3 id : SV_DispatchThreadID)
 
             // The light reaching this place through the air above (faded out in the earth's shadow) and through the cloud
             float3 toLight = CloudLightThroughAir(A, CloudAtmospherePos(p), lightDir);
-            float tau = any(toLight > 0.0) ? CloudLightDepth(C, lut, p, lightDir, jitter) : 0.0;
+            float tau = any(toLight > 0.0) ? CloudLightDepth(C, lut, p, lightDir, jitter, stepScale < 1.5) : 0.0;
             float beam = 0.0;
             [unroll] for (int o = 0; o < 3; o++)
                 beam += pow(0.5, o) * phase[o] * exp(-pow(0.5, o) * tau);
@@ -546,8 +566,8 @@ void CSCloudMarch(uint3 id : SV_DispatchThreadID)
 
     if (T >= 0.999)
     {
-        target[id.xy] = float4(0, 0, 0, 1);
-        return;
+        result.depth = 0.5 * (tStart + tEnd);
+        return result;
     }
 
     // The air between the camera and the clouds (two transmittance LUT reads, as the 2D layer had it) and the sky's own
@@ -557,5 +577,153 @@ void CSCloudMarch(uint3 id : SV_DispatchThreadID)
     float r = length(cloudKm);
     float3 viewT = saturate(AtmTransmittance(A, viewHeightKm, dir.y) / max(AtmTransmittance(A, r, dot(cloudKm / r, dir)), 1e-6));
     float3 inFront = AtmosphereSkyBelowClouds(A, normalize(float3(dir.x, max(dir.y, 0.0), dir.z))) * Exposure;
-    target[id.xy] = float4(L * viewT + inFront * (1.0 - T), T);
+    result.color = float4(L * viewT + inFront * (1.0 - T), T);
+    result.depth = d;
+    return result;
+}
+
+// The camera-relative view direction through a place in the view (uv 0..1; reverse-Z: the far plane is z = 0)
+float3 CloudViewDir(float2 uv)
+{
+    float2 ndc = float2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+    float4 farClip = mul(float4(ndc, 0, 1), CameraInverse);
+    return normalize(farClip.xyz / farClip.w);
+}
+
+// The texel of a 2×2 block marched in frame f: Bayer order, so each frame's sparse set is spread evenly
+uint2 CloudMarchOffset(uint f)
+{
+    const uint2 offsets[4] = { uint2(0, 0), uint2(1, 1), uint2(1, 0), uint2(0, 1) };
+    return offsets[f & 3];
+}
+
+// MarchMode 0: every texel of the half-size target (TargetUAV, depth DepthUAV; the history is not used: the first frame,
+// a resize, a jump, VolumetricCloudsFullRate). 1: one texel of each 2×2 block, into the quarter-size sparse targets
+// (TargetUAV, DepthUAV, sized TargetWidth/2 × TargetHeight/2), for CSCloudReconstruct.
+[numthreads(8, 8, 1)]
+void CSCloudMarch(uint3 id : SV_DispatchThreadID)
+{
+    uint2 size = MarchMode == 0 ? uint2(TargetWidth, TargetHeight) : uint2((TargetWidth + 1) / 2, (TargetHeight + 1) / 2);
+    if (any(id.xy >= size))
+        return;
+    RWTexture2D<float4> target = ResourceDescriptorHeap[TargetUAVIdx];
+    RWTexture2D<float> depthTarget = ResourceDescriptorHeap[DepthUAVIdx];
+    if (CloudParamsIdx == 0 || AtmosphereIdx == 0)
+    {
+        target[id.xy] = float4(0, 0, 0, 1);
+        depthTarget[id.xy] = CLOUD_FAR_DEPTH * 0.001;
+        return;
+    }
+    CloudParams C = LoadClouds();
+    AtmosphereParams A = LoadAtmosphere();
+    Texture3D<float4> lut = ResourceDescriptorHeap[C.NoiseLut];
+
+    uint2 pixel = MarchMode == 0 ? id.xy : min(id.xy * 2 + CloudMarchOffset(FrameIndex), uint2(TargetWidth, TargetHeight) - 1);
+    float2 uv = (float2(pixel) + 0.5) / float2(TargetWidth, TargetHeight);
+    CloudMarchResult r = CloudMarchRay(C, A, lut, CloudViewDir(uv), CloudJitter(pixel, FrameIndex), 1.0);
+    target[id.xy] = r.color;
+    depthTarget[id.xy] = r.depth * 0.001;      // km: half floats hold it
+}
+
+// A view's clouds this frame from the texels marched (one of each 2×2 block) and last frame's, reprojected: the place a
+// texel's clouds were at last frame (the camera's move, the wind's), clamped to what this frame's marched neighbours
+// show (no ghost outlives a change), a marched texel blended with its own history to smooth the jitter. Off screen or
+// without a history: this frame's sparse samples, interpolated. Writes the half-size target the sky reads.
+[numthreads(8, 8, 1)]
+void CSCloudReconstruct(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= TargetWidth || id.y >= TargetHeight)
+        return;
+    Texture2D<float4> sparse = ResourceDescriptorHeap[SparseTexIdx];
+    Texture2D<float> sparseDepth = ResourceDescriptorHeap[SparseDepthTexIdx];
+    RWTexture2D<float4> target = ResourceDescriptorHeap[TargetUAVIdx];
+    RWTexture2D<float> depthTarget = ResourceDescriptorHeap[DepthUAVIdx];
+    uint2 sparseSize = uint2((TargetWidth + 1) / 2, (TargetHeight + 1) / 2);
+    int2 q = int2(id.xy / 2);
+    bool fresh = all((id.xy & 1) == CloudMarchOffset(FrameIndex));
+
+    // This frame's marched neighbours: the clamp's box
+    float4 lo = 1e9, hi = -1e9;
+    [unroll] for (int j = -1; j <= 1; j++)
+    {
+        [unroll] for (int i = -1; i <= 1; i++)
+        {
+            float4 s = sparse.Load(int3(clamp(q + int2(i, j), int2(0, 0), int2(sparseSize) - 1), 0));
+            lo = min(lo, s);
+            hi = max(hi, s);
+        }
+    }
+    float4 own = sparse.Load(int3(q, 0));
+    float depthKm = sparseDepth.Load(int3(q, 0));
+
+    // Where this texel's clouds were last frame: the camera moved (CameraMove) and the wind carried them (CloudStep)
+    float2 uv = (float2(id.xy) + 0.5) / float2(TargetWidth, TargetHeight);
+    float3 rel = CloudViewDir(uv) * (depthKm * 1000.0);
+    float3 prevRel = rel + CameraMove - float3(CloudStep.x, 0.0, CloudStep.y);
+    float4 prevClip = mul(float4(prevRel, 1.0), PrevCameraRelativeVP);
+    float2 prevUV = float2(prevClip.x, -prevClip.y) / max(prevClip.w, 1e-6) * 0.5 + 0.5;
+    bool onScreen = prevClip.w > 0.0 && all(prevUV >= 0.0) && all(prevUV <= 1.0);
+
+    float4 result;
+    if (HistoryTexIdx != 0 && onScreen)
+    {
+        Texture2D<float4> history = ResourceDescriptorHeap[HistoryTexIdx];
+        float4 h = history.SampleLevel(AtmosphereLinearClamp, prevUV, 0);
+        h.rgb *= ExposureRatio;
+        h = clamp(h, lo, hi);
+        result = fresh ? lerp(own, h, 0.5) : h;
+    }
+    else
+    {
+        // No history here: this frame's samples round it, bilinearly (the sparse grid's texel centres sit at 2q + offset)
+        float2 sq = (float2(id.xy) - float2(CloudMarchOffset(FrameIndex))) * 0.5;
+        int2 b = int2(floor(sq));
+        float2 f = sq - b;
+        int2 hiq = int2(sparseSize) - 1;
+        float4 s00 = sparse.Load(int3(clamp(b, 0, hiq), 0)), s10 = sparse.Load(int3(clamp(b + int2(1, 0), 0, hiq), 0));
+        float4 s01 = sparse.Load(int3(clamp(b + int2(0, 1), 0, hiq), 0)), s11 = sparse.Load(int3(clamp(b + int2(1, 1), 0, hiq), 0));
+        result = fresh ? own : lerp(lerp(s00, s10, f.x), lerp(s01, s11, f.x), f.y);
+    }
+    if (any(isnan(result)))
+        result = own;
+    target[id.xy] = result;
+    depthTarget[id.xy] = depthKm;
+}
+
+// Direction of a texel of cube face `face` (D3D order +X −X +Y −Y +Z −Z), uv in −1..1 (u right, v down): as the sky
+// probe's (sky_probe_cs.hlsl)
+float3 CloudCubeDirection(uint face, float2 uv)
+{
+    float3 d;
+    switch (face)
+    {
+        case 0:  d = float3( 1.0, -uv.y, -uv.x); break;
+        case 1:  d = float3(-1.0, -uv.y,  uv.x); break;
+        case 2:  d = float3( uv.x,  1.0,  uv.y); break;
+        case 3:  d = float3( uv.x, -1.0, -uv.y); break;
+        case 4:  d = float3( uv.x, -uv.y,  1.0); break;
+        default: d = float3(-uv.x, -uv.y, -1.0); break;
+    }
+    return normalize(d);
+}
+
+// One face of the sky probe's clouds (Clouds.ProbeClouds, 64² × 6, the face ProbeFace this frame), marched coarser than
+// the view (steps × 2): the probe composes them over its sky every frame (sky_probe_cs.hlsl)
+[numthreads(8, 8, 1)]
+void CSCloudProbeFace(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= TargetWidth || id.y >= TargetWidth)
+        return;
+    RWTexture2DArray<float4> target = ResourceDescriptorHeap[TargetUAVIdx];
+    uint3 texel = uint3(id.xy, ProbeFace);
+    if (CloudParamsIdx == 0 || AtmosphereIdx == 0)
+    {
+        target[texel] = float4(0, 0, 0, 1);
+        return;
+    }
+    CloudParams C = LoadClouds();
+    AtmosphereParams A = LoadAtmosphere();
+    Texture3D<float4> lut = ResourceDescriptorHeap[C.NoiseLut];
+    float2 uv = (float2(id.xy) + 0.5) / TargetWidth * 2.0 - 1.0;
+    target[texel] = CloudMarchRay(C, A, lut, CloudCubeDirection(ProbeFace, uv), 0.5, 3.0).color;
 }
