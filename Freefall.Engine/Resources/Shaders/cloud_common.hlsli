@@ -19,7 +19,7 @@
 #define CLOUD_PERIOD 256000.0       // metres: the weather repeats in cloud space (noise tiles, cells); Clouds.Period
 #define CLOUD_EARTH_RADIUS 6360000.0
 #define CLOUD_BASE_TILE (CLOUD_PERIOD / 40.0)      // 6.4 km: the base shape's noise tile
-#define CLOUD_DETAIL_TILE (CLOUD_PERIOD / 320.0)   // 800 m: the billows' noise tile
+#define CLOUD_DETAIL_TILE (CLOUD_PERIOD / 160.0)   // 1.6 km: the billows' noise tile (Worley cells of 400 m and down)
 #define CLOUD_COVER_TILE (CLOUD_PERIOD / 5.0)      // 51.2 km: the coverage pattern's tile
 
 struct CloudLevel
@@ -29,8 +29,11 @@ struct CloudLevel
     uint Layers;            // texels in height
     uint DensityTex;        // Texture3D<float2> (RG8): density, profile
     uint BrickTex;          // Texture3D<float> (R8): the most density in each brick
+    uint LightTex;          // Texture3D<float> (R16F), half the density's texels each way: the optical depth toward the
+                            // light (LightDir) from there out of the slab, the coarser levels' added where it leaves this one
+    uint SkyTex;            // Texture3D<float2> (RG16F), the same texels: optical depth straight up (x) and down (y)
     float Reach;            // metres from the camera (each way) this level is used to
-    float _levelPad;
+    float _levelPad0, _levelPad1, _levelPad2;
 };
 
 struct CloudParams
@@ -54,6 +57,9 @@ struct CloudParams
     float CellSize;         // metres a cell spans
     uint CellsPerSide;
     float Reach;            // metres along a view ray the march goes
+    float3 LightDir;        // toward the light the clouds are lit by (the sun, after ~3.4° below the horizon the
+                            // brightest moon): the light volumes are made along it
+    uint LightIsMoon;
 };
 
 struct CloudCell
@@ -76,6 +82,16 @@ CloudParams LoadClouds()
 float CloudRemap(float v, float lo, float hi, float newLo, float newHi)
 {
     return newLo + (v - lo) / max(hi - lo, 1e-5) * (newHi - newLo);
+}
+
+// The baked field is smooth: 0.5 + how far the shape stands past the coverage's threshold (0.5 = a cloud's surface,
+// higher inside). The march turns it into density with the billows (CloudErode): the surface moves by the detail
+// before this ramp sharpens it. Baking the sharp density instead left no room for the billows and interpolated badly.
+#define CLOUD_RAMP 0.1              // field units over which density rises from 0 to 1 (~150 m): a cumulus' sharp edge
+#define CLOUD_BILLOW 0.3            // how far (field units, ~450 m) the detail moves the surface in or out
+float CloudFieldDensity(float field)
+{
+    return saturate((field - 0.5) / CLOUD_RAMP);
 }
 
 // Height above sea level (m) of a camera-relative position on the round planet, written so the 6360 km radius cancels
@@ -193,6 +209,24 @@ float CloudBrickMax(CloudParams C, uint level, float2 xz, float h)
     int3 brick = int3(floor(uvw.xy * (CLOUD_TEXELS / CLOUD_BRICK)), min((int)(uvw.z * L.Layers) / CLOUD_BRICK, (int)(L.Layers / CLOUD_BRICK) - 1));
     brick.xy = ((brick.xy % (CLOUD_TEXELS / CLOUD_BRICK)) + (CLOUD_TEXELS / CLOUD_BRICK)) % (CLOUD_TEXELS / CLOUD_BRICK);
     return bricks.Load(int4(brick, 0));
+}
+
+// The optical depth toward the light from the light volume of one level (0 above the slab)
+float CloudLightDepthAt(CloudParams C, uint level, float2 xz, float h, SamplerState wrap)
+{
+    if (h > C.SlabTop)
+        return 0.0;
+    CloudLevel L = C.Levels[level];
+    Texture3D<float> light = ResourceDescriptorHeap[L.LightTex];
+    return light.SampleLevel(wrap, CloudLevelUvw(C, L, xz, clamp(h, C.SlabBottom, C.SlabTop)), 0);
+}
+
+// The optical depth above (x) and below (y) a place, straight up and down, from the sky volume of one level
+float2 CloudSkyDepthAt(CloudParams C, uint level, float2 xz, float h, SamplerState wrap)
+{
+    CloudLevel L = C.Levels[level];
+    Texture3D<float2> sky = ResourceDescriptorHeap[L.SkyTex];
+    return sky.SampleLevel(wrap, CloudLevelUvw(C, L, xz, clamp(h, C.SlabBottom, C.SlabTop)), 0);
 }
 
 // How far a ray (unit dir) goes from a place before it leaves that place's brick: across, the brick's xz walls; in

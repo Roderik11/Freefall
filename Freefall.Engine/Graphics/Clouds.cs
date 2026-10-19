@@ -63,7 +63,8 @@ namespace Freefall.Graphics
         private struct GpuLevel
         {
             public Vector2 Origin; public float VoxelSize; public uint Layers;
-            public uint DensityTex, BrickTex; public float Reach, _pad;
+            public uint DensityTex, BrickTex, LightTex, SkyTex;
+            public float Reach, _pad0, _pad1, _pad2;
         }
 
         // Must match CloudParams in cloud_common.hlsli, field for field
@@ -76,6 +77,7 @@ namespace Freefall.Graphics
             public float TowerShare, TowerTop, Density, Albedo;
             public Vector2 WindDir; public float Evolution; public uint NoiseLut;
             public uint Cells; public float CellSize; public uint CellsPerSide; public float Reach;
+            public Vector3 LightDir; public uint LightIsMoon;
         }
 
         // CloudCell in cloud_common.hlsli
@@ -89,6 +91,11 @@ namespace Freefall.Graphics
         {
             public RenderTexture3D Density = null!, Bricks = null!;
             public ResourceStates State = ResourceStates.Common;
+            // The light volume (A, the one read; B the doubling's other half) and the sky volume: half the density's
+            // texels each way
+            public RenderTexture3D LightA = null!, LightB = null!, Sky = null!;
+            public ResourceStates LightAState = ResourceStates.Common, LightBState = ResourceStates.Common,
+                SkyState = ResourceStates.Common;
             public float Voxel;
             public int Layers;
             public long CenterX, CenterZ;       // the brick (in cloud space) the camera is in
@@ -99,7 +106,12 @@ namespace Freefall.Graphics
         private readonly record struct Bake(int Level, long X0, long Z0, int BricksX, int BricksZ);
 
         private static ComputeShader? _cs;
-        private static int _kBake;
+        private static int _kBake, _kLightInit, _kLightStep, _kLightChain, _kSkyScan;
+        private const int LightPasses = 8;              // doubling passes: 256 steps along the light cross a level
+        private static readonly List<int> _lightLevels = new();     // levels whose light and sky volumes are made this frame
+        private static int _lightTurn;
+        private static Vector3 _lightDir = Vector3.UnitY;
+        private static bool _lightIsMoon;
         private static readonly Level[] _levels = new Level[LevelCount];
         private static readonly GraphicsBuffer?[] _params = new GraphicsBuffer?[FrameCount];
         private static readonly GraphicsBuffer?[] _cells = new GraphicsBuffer?[FrameCount];
@@ -125,6 +137,10 @@ namespace Freefall.Graphics
             if (_cs != null) return;
             _cs = new ComputeShader("clouds_cs.hlsl");
             _kBake = _cs.FindKernel("CSCloudBake");
+            _kLightInit = _cs.FindKernel("CSCloudLightInit");
+            _kLightStep = _cs.FindKernel("CSCloudLightStep");
+            _kLightChain = _cs.FindKernel("CSCloudLightChain");
+            _kSkyScan = _cs.FindKernel("CSCloudSkyScan");
         }
 
         private static void EnsureResources()
@@ -141,6 +157,10 @@ namespace Freefall.Graphics
                     // Density and profile, 8 bits each: the field before the detail, smooth over a texel
                     Density = new RenderTexture3D(device, TexelsPerLevel, TexelsPerLevel, Layers[i], Format.R8G8_UNorm),
                     Bricks = new RenderTexture3D(device, BricksPerSide, BricksPerSide, Layers[i] / Brick, Format.R8_UNorm),
+                    // Optical depths: tens to thousands through a storm, half floats hold them
+                    LightA = new RenderTexture3D(device, TexelsPerLevel / 2, TexelsPerLevel / 2, Layers[i] / 2, Format.R16_Float),
+                    LightB = new RenderTexture3D(device, TexelsPerLevel / 2, TexelsPerLevel / 2, Layers[i] / 2, Format.R16_Float),
+                    Sky = new RenderTexture3D(device, TexelsPerLevel / 2, TexelsPerLevel / 2, Layers[i] / 2, Format.R16G16_Float),
                 };
             }
             for (int i = 0; i < FrameCount; i++)
@@ -196,6 +216,27 @@ namespace Freefall.Graphics
             _slabTop = slabTop;
             _lastHours = _gameHours;
 
+            // The light the volumes are made along: the sun until it is ~3.4° under the horizon (a 12 km anvil still
+            // sees it), then the brightest moon
+            var atm = Atmosphere.Settings;
+            bool moon = atm.SunDirection.Y < -0.06f && atm.MoonIlluminance != Vector3.Zero;
+            var lightDir = Vector3.Normalize(moon ? atm.MoonDirection : atm.SunDirection);
+            bool relight = rebuild || moon != _lightIsMoon;
+            _lightIsMoon = moon;
+            _lightDir = lightDir;
+            // A level's light and sky volumes a frame, coarse to fine (each adds the coarser level's light where its path
+            // leaves it); all of them when everything is baked again or the light changed source
+            _lightLevels.Clear();
+            if (relight)
+            {
+                for (int i = LevelCount - 1; i >= 0; i--) _lightLevels.Add(i);
+            }
+            else
+            {
+                _lightLevels.Add(LevelCount - 1 - _lightTurn);
+                _lightTurn = (_lightTurn + 1) % LevelCount;
+            }
+
             // The camera in cloud space
             double cx = Wrap(cameraPos.X - _offsetX), cz = Wrap(cameraPos.Z - _offsetZ);
             _bakes.Clear();
@@ -236,6 +277,8 @@ namespace Freefall.Graphics
                     Layers = (uint)level.Layers,
                     DensityTex = level.Density.BindlessIndex,
                     BrickTex = level.Bricks.BindlessIndex,
+                    LightTex = level.LightA.BindlessIndex,
+                    SkyTex = level.Sky.BindlessIndex,
                     Reach = level.Voxel * ReachTexels,
                 };
             }
@@ -264,6 +307,8 @@ namespace Freefall.Graphics
                 CellSize = (float)(Period / CellsPerSide),
                 CellsPerSide = CellsPerSide,
                 Reach = Level0Voxel * (1 << (LevelCount - 1)) * ReachTexels,
+                LightDir = lightDir,
+                LightIsMoon = moon ? 1u : 0u,
             };
             unsafe { *_params[slot]!.WritePtr<GpuParams>() = p; }
             _paramsIdx = _params[slot]!.SrvIndex;
@@ -387,6 +432,80 @@ namespace Freefall.Graphics
                 level.State = shaderRead;
             }
             PixMarker.End(list);
+
+            PixMarker.Begin(list, "Cloud light");
+            foreach (int i in _lightLevels)
+                MakeLight(list, i);
+            PixMarker.End(list);
+        }
+
+        /// <summary>
+        /// A level's light volume (each texel's optical depth toward the light out of the slab, by doubling, the coarser
+        /// level's added where the path leaves this one) and its sky volume (straight up and down). The coarser level's
+        /// light must be made already (this frame or before): levels go coarse to fine.
+        /// </summary>
+        private static void MakeLight(ID3D12GraphicsCommandList list, int i)
+        {
+            var cs = _cs!;
+            var level = _levels[i];
+            var shaderRead = ResourceStates.NonPixelShaderResource | ResourceStates.PixelShaderResource;
+            uint groupsXY = (uint)(TexelsPerLevel / 2 / 8), groupsZ = (uint)(level.Layers / 2 / 8);
+
+            // The step along the light that moves at most one light texel each way (CloudLightStepLength)
+            float across = level.Voxel * 2f, up = (_slabTop - _slabBottom) / (level.Layers / 2);
+            var d = Vector3.Abs(_lightDir);
+            float step = MathF.Min(MathF.Min(across / MathF.Max(d.X, 1e-4f), across / MathF.Max(d.Z, 1e-4f)), up / MathF.Max(d.Y, 1e-4f));
+
+            Transition(list, level.LightA, ref level.LightAState, ResourceStates.UnorderedAccess);
+            cs.SetPushConstant(_kLightInit, "BakeLevel", (uint)i);
+            cs.SetPushConstant(_kLightInit, "TargetUAV", level.LightA.UavIndex);
+            cs.Dispatch(_kLightInit, list, groupsXY, groupsXY, groupsZ);
+
+            // Doubling: A → B → A ... the eighth pass ends in A
+            var src = level.LightA; var dst = level.LightB;
+            for (int k = 0; k < LightPasses; k++)
+            {
+                if (src == level.LightA) Transition(list, src, ref level.LightAState, shaderRead);
+                else Transition(list, src, ref level.LightBState, shaderRead);
+                if (dst == level.LightA) Transition(list, dst, ref level.LightAState, ResourceStates.UnorderedAccess);
+                else Transition(list, dst, ref level.LightBState, ResourceStates.UnorderedAccess);
+                cs.SetPushConstant(_kLightStep, "BakeLevel", (uint)i);
+                cs.SetPushConstant(_kLightStep, "SourceTex", src.BindlessIndex);
+                cs.SetPushConstant(_kLightStep, "TargetUAV", dst.UavIndex);
+                cs.SetPushConstant(_kLightStep, "LightStepBits", BitConverter.SingleToUInt32Bits(step * (1 << k)));
+                cs.Dispatch(_kLightStep, list, groupsXY, groupsXY, groupsZ);
+                (src, dst) = (dst, src);
+            }
+
+            // The coarser level's light past this level's box
+            Transition(list, level.LightA, ref level.LightAState, ResourceStates.UnorderedAccess);
+            if (i < LevelCount - 1)
+            {
+                cs.SetPushConstant(_kLightChain, "BakeLevel", (uint)i);
+                cs.SetPushConstant(_kLightChain, "TargetUAV", level.LightA.UavIndex);
+                cs.Dispatch(_kLightChain, list, groupsXY, groupsXY, groupsZ);
+            }
+            Transition(list, level.LightA, ref level.LightAState, shaderRead);
+
+            // The sky volume: a thread per column
+            Transition(list, level.Sky, ref level.SkyState, ResourceStates.UnorderedAccess);
+            cs.SetPushConstant(_kSkyScan, "BakeLevel", (uint)i);
+            cs.SetPushConstant(_kSkyScan, "TargetUAV", level.Sky.UavIndex);
+            cs.Dispatch(_kSkyScan, list, groupsXY, groupsXY, 1);
+            Transition(list, level.Sky, ref level.SkyState, shaderRead);
+        }
+
+        private static void Transition(ID3D12GraphicsCommandList list, RenderTexture3D texture, ref ResourceStates state,
+            ResourceStates to)
+        {
+            if (state == to)
+            {
+                if (to == ResourceStates.UnorderedAccess)
+                    list.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(texture.Native)));
+                return;
+            }
+            list.ResourceBarrierTransition(texture.Native, state, to);
+            state = to;
         }
 
         /// <summary>For engine_stats.</summary>
@@ -400,6 +519,8 @@ namespace Freefall.Graphics
             wind = new[] { Wind.GeneratedDirection.X, Wind.GeneratedDirection.Y },
             gameHours = _gameHours,
             towers = CountTowers(),
+            lightLevelsThisFrame = _lightLevels.Count,
+            litBy = _lightIsMoon ? "moon" : "sun",
         };
 
         private static int CountTowers()
