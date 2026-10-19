@@ -107,24 +107,29 @@ float FogMeshSkyVisibility(AtmosphereParams A, float3 worldPos)
 }
 
 // One body's light scattered toward the camera per km of air (× its illuminance): single scattering through the air
-// above (0 in the earth's shadow) where the shadows let it through, with the Rayleigh and Mie phases, and the multiple
-// scattering (the sky's light, in effect) where the sky is seen
+// above (0 in the earth's shadow) and the cloud layer (sky_common.fx CloudAirLight, as the aerial perspective takes it):
+// its beam where the shadows let it through, with the Rayleigh and Mie phases, and what it diffuses, scattered evenly
+// from the whole cloud base where the sky is seen; and the multiple scattering (the sky's light, in effect, dimmed under
+// a deck to the light the cloud base gives: CloudAirLight .z) there too
 float3 FroxelBodyLight(AtmosphereParams A, AtmMedium medium, bool moon, float3 posKm, float3 worldPos,
-                       float3 relPos, float3 V, float viewDepth, float3 lightDir, float open, float sky)
+                       float3 relPos, float3 V, float viewDepth, float3 lightDir, float open, float sky, float deckToLight,
+                       float skyDimming)
 {
     float3 toLight = AtmTransmittanceToLight(A, posKm, lightDir);
-    float visible = open;
+    float3 cloud = CloudAirLight(FogWrapSampler, relPos, lightDir, deckToLight, skyDimming);
+    float visible = open * cloud.x;
     if (visible > 0.0 && any(toLight > 0.0))
     {
         if (dot(lightDir, ShadowLightDir) > 0.999)
             visible *= CascadeShadow(worldPos, viewDepth);
-        visible *= GetCloudShadow(FogWrapSampler, relPos, lightDir);
         visible *= AtmTerrainLightVisibility(A, worldPos, moon);
     }
     float cosTheta = dot(V, lightDir);
+    float lightZenithCos = dot(normalize(posKm), lightDir);
     float3 single = medium.scatteringMie * AtmMiePhase(A.MieG, cosTheta) + medium.scatteringRay * AtmRayleighPhase(cosTheta);
-    float3 multiple = AtmMultipleScattering(A, posKm, dot(normalize(posKm), lightDir)) * medium.scattering;
-    return toLight * visible * single + multiple * sky;
+    float3 diffused = medium.scattering * (CloudDiffusedLight(cloud.y, lightZenithCos) * sky);
+    float3 multiple = AtmMultipleScattering(A, posKm, lightZenithCos) * (medium.scattering * cloud.z);
+    return toLight * (visible * single + diffused) + multiple * sky;
 }
 
 [numthreads(8, 8, 1)]
@@ -156,11 +161,12 @@ void CSFogScatter(uint3 id : SV_DispatchThreadID)
     float open = TerrainOpenAt(terrain, AtmosphereLinearClamp, worldPos, float3(0, 1, 0), TerrainTolerance(length(relPos)));
     float sky = open > 0.0 ? open * max(FogMeshSkyVisibility(A, worldPos), A.SkyCaptureBounce) : 0.0;
 
+    float4 deck = CloudDeck();      // the layer's mean density (x, y) and the clouds in front of the sun and the moon (z, w)
     float3 L = A.SunIlluminance * FroxelBodyLight(A, medium, false, posKm, worldPos, relPos, V, viewDepth,
-                                                  A.SunDirection, open, sky);
+                                                  A.SunDirection, open, sky, deck.z, CloudSkyDimming(deck.x));
     if (any(A.MoonIlluminance > 0))
         L += A.MoonIlluminance * FroxelBodyLight(A, medium, true, posKm, worldPos, relPos, V, viewDepth,
-                                                 A.MoonDirection, open, sky);
+                                                 A.MoonDirection, open, sky, deck.w, CloudSkyDimming(deck.y));
     float4 current = float4(L * Exposure, dot(medium.extinction, 1.0 / 3.0));
 
     // Last frame's light at the froxel's centre: the grid moves with the camera, so the centre is found in last frame's

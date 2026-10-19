@@ -387,6 +387,20 @@ float CloudShadowDensityAt(Texture3D<float4> noiseLUT, SamplerState wrapSampler,
     return smoothstep(0.0, 0.2, CloudBaseDensity(noiseLUT, wrapSampler, uv, 0.0));
 }
 
+// The cloud layer's density (0..1) on the way from a place to a light, as its shadow: before CloudShadowStrength and
+// the low-sun fade, the old and the new layer cross-faded while a preset changes the altitude. relPos: camera-relative.
+float CloudShadowDensity(SamplerState wrapSampler, float3 relPos, float3 toLight)
+{
+    Texture3D<float4> noiseLUT = ResourceDescriptorHeap[CloudNoiseLUTIdx];
+    float density = CloudShadowDensityAt(noiseLUT, wrapSampler, relPos, toLight, CloudAltitude);
+    if (CloudAltitudeBlend < 0.999)
+    {
+        float densityFrom = CloudShadowDensityAt(noiseLUT, wrapSampler, relPos, toLight, CloudAltitudeFrom);
+        density = lerp(densityFrom, density, smoothstep(0.0, 1.0, saturate(CloudAltitudeBlend)));
+    }
+    return density;
+}
+
 // Fraction of the sun's light (0..1) that reaches a surface point through the cloud layer.
 // relPos: camera-relative position, toLight: normalized direction toward the sun.
 float GetCloudShadow(SamplerState wrapSampler, float3 relPos, float3 toLight)
@@ -394,19 +408,99 @@ float GetCloudShadow(SamplerState wrapSampler, float3 relPos, float3 toLight)
     if (CloudShadowStrength <= 0.0 || CloudNoiseLUTIdx == 0 || toLight.y <= 0.05)
         return 1.0;
 
-    Texture3D<float4> noiseLUT = ResourceDescriptorHeap[CloudNoiseLUTIdx];
-
-    float density = CloudShadowDensityAt(noiseLUT, wrapSampler, relPos, toLight, CloudAltitude);
-    if (CloudAltitudeBlend < 0.999)
-    {
-        float densityFrom = CloudShadowDensityAt(noiseLUT, wrapSampler, relPos, toLight, CloudAltitudeFrom);
-        density = lerp(densityFrom, density, smoothstep(0.0, 1.0, saturate(CloudAltitudeBlend)));
-    }
+    float density = CloudShadowDensity(wrapSampler, relPos, toLight);
 
     // A low sun stretches the projection toward infinity — fade the shadows out before that
     float lowSunFade = smoothstep(0.05, 0.3, toLight.y);
 
     return 1.0 - density * CloudShadowStrength * lowSunFade;
+}
+
+// ── The clouds in the air (the aerial perspective, the sky-view LUT, the near fog volume) ──
+
+// The cloud layer round the camera, made each frame by atmosphere_cs.hlsl CSCloudDeck (the Ambient buffer's element 4):
+//   x, y  the layer's mean density between the air and the sun / the brightest moon over CLOUD_DECK_RADIUS round the
+//         camera (the sky-view LUT's air below the layer, which is the same in every direction), at a low light faded
+//         into z, w as CloudAirLight fades;
+//   z, w  how much the sky's clouds hide the sun / the moon seen from the camera: 1 − exp(−15 × density), as the sky
+//         dome hides their discs (mesh_skybox.fx).
+// 0 (no layer) where the buffer has no element 4 (a build before 2026-10-19 reading these shaders).
+float4 CloudDeck()
+{
+    if (AtmosphereIdx == 0)
+        return 0;
+    StructuredBuffer<float4> ambient = ResourceDescriptorHeap[LoadAtmosphere().Ambient];
+    return ambient[4];
+}
+
+// How much the multiple scattering (Ψ_ms) of the air below the cloud layer is dimmed, 0..1, given the layer's mean density
+// toward the light (CloudDeck().x / .y). Ψ_ms is the light of a cloudless sky and the lit ground round a place. Under a
+// deck all of it has come through the deck, which lets 1 − CloudShadowStrength through (as to the ground), and the light
+// the deck gives itself is CloudDiffusedLight; without the dimming the haze under a deck outshone the deck (a dark band
+// under it on the Overcast horizon). A broken layer's gaps still show the blue sky that makes most of Ψ_ms, hence the
+// square: Clear Day (mean 0.15-0.25) loses 2-5 %, a deck (1) 80 %.
+// Tried first: the sky probe's mean radiance against Ψ_ms × the illuminance; without a cloud it read 0.89-1.03 with the
+// time of day, so it dimmed a cloudless noon by 10 %.
+float CloudSkyDimming(float meanDensity)
+{
+    return CloudShadowStrength > 0.0 ? CloudShadowStrength * meanDensity * meanDensity : 0.0;
+}
+
+// What the cloud layer lets through to a place in the air toward a light, as shares of its illuminance:
+//   x  the beam, which the air scatters with its phases (the Mie forward lobe is the glow round the sun): 1 − density,
+//      what passes where the layer is open or thin;
+//   y  the light the layer has diffused, (1 − CloudShadowStrength) × density, which the air scatters evenly: under a deck
+//      the sun still lights the air, but from the whole cloud base, not from its place in the sky (CloudDiffusedLight);
+//   z  the share of the multiple scattering (Ψ_ms) left below the layer: 1 − skyDimming (CloudSkyDimming).
+// A surface takes x + y as one shadow (GetCloudShadow). In the air the split matters: the 20 % a deck lets through,
+// scattered with the forward lobe, still drew the sun's glow through a thunderstorm deck.
+// A low light stretches the shadow's pattern toward infinity (GetCloudShadow fades it out below 17°); here it fades into
+// deckToLight instead (CloudDeck().z / .w: the clouds in front of that light as the sky draws them), so the air under a
+// deck stays shaded at sunset while a broken layer, whose horizon is clear, lets a low sun through. Above the layer's
+// plane (CloudAltitude, ±100 m) nothing is in the way. relPos: camera-relative.
+float3 CloudAirLight(SamplerState wrapSampler, float3 relPos, float3 toLight, float deckToLight, float skyDimming)
+{
+    if (CloudShadowStrength <= 0.0 || CloudNoiseLUTIdx == 0)
+        return float3(1.0, 0.0, 1.0);
+    float below = 1.0 - smoothstep(CloudAltitude - 100.0, CloudAltitude + 100.0, CamPos.y + relPos.y);
+    if (below <= 0.0)
+        return float3(1.0, 0.0, 1.0);
+    float fade = smoothstep(0.05, 0.3, toLight.y);
+    float density = deckToLight;
+    if (fade > 0.0)
+        density = lerp(deckToLight, CloudShadowDensity(wrapSampler, relPos, toLight), fade);
+    density *= below;
+    return float3(1.0 - density, (1.0 - CloudShadowStrength) * density, 1.0 - skyDimming * below);
+}
+
+// The light the cloud layer diffuses (CloudAirLight .y, a share of the light's illuminance E) as the air below it scatters
+// it toward the eye, per unit illuminance and of the air's scattering coefficient: the base sends share × E × cos(the
+// light's zenith angle) down over the lower hemisphere (radiance share × E cos / π), and the air scatters it evenly,
+// σs × share × E cos / (2π). Like the ground's light under the deck, it falls with the sun.
+float CloudDiffusedLight(float share, float lightZenithCos)
+{
+    return share * saturate(lightZenithCos) / (2.0 * ATM_PI);
+}
+
+// The sky's light from a direction scattered below the cloud layer's plane (cd/m², sun + moon, no airglow: that is
+// behind the clouds), from the sky-view LUTs' alpha (atmosphere_cs.hlsl CSSkyView): the air in front of a cloud there.
+// It was the sky's light × the share of the optical depth in front of the cloud; once the air under a deck lay in its
+// shade, the lit air above the deck (behind the cloud) came through that share as a bright band over a dark horizon.
+float3 AtmosphereSkyBelowClouds(AtmosphereParams A, float3 dir)
+{
+    float viewHeight = AtmosphereViewHeight(A, CamPos.y);
+    Texture2D<float4> sunLut = ResourceDescriptorHeap[A.SkyViewSunLut];
+    float4 sun = sunLut.SampleLevel(AtmosphereLinearClamp,
+        SkyViewLutUv(A, false, dir.y, LightViewCos(dir, A.SunDirection), viewHeight), 0);
+    float3 L = sun.rgb * sun.a * A.SunIlluminance;
+    if (any(A.MoonIlluminance > 0))
+    {
+        Texture2D<float4> moonLut = ResourceDescriptorHeap[A.SkyViewMoonLut];
+        float4 moon = moonLut.SampleLevel(AtmosphereLinearClamp,
+            SkyViewLutUv(A, false, dir.y, LightViewCos(dir, A.MoonDirection), viewHeight), 0);
+        L += moon.rgb * moon.a * A.MoonIlluminance;
+    }
+    return L;
 }
 
 // ── Light on the cloud layer ──
@@ -443,13 +537,12 @@ CloudLight GetCloudLight(float3 dir)
     StructuredBuffer<float4> ambient = ResourceDescriptorHeap[A.Ambient];
     c.ambient = (ambient[0].rgb + ambient[1].rgb) * 0.5;
 
-    // Transmittance camera → cloud from two LUT reads (to the top of the atmosphere from either end), and the share of
-    // the sky's in-scattered light that lies in front of the cloud, taken as the share of the optical depth there
+    // Transmittance camera → cloud from two LUT reads (to the top of the atmosphere from either end), and the sky's
+    // light scattered in front of the cloud (AtmosphereSkyBelowClouds)
     float3 toTop = AtmTransmittance(A, viewHeight, mu);
     float3 cloudToTop = AtmTransmittance(A, r, dot(P / r, normalize(float3(dir.x, mu, dir.z))));
     c.viewT = saturate(toTop / max(cloudToTop, 1e-6));
-    float3 sky = AtmosphereSkyLuminance(A, normalize(float3(dir.x, mu, dir.z))) * Exposure;
-    c.inFront = sky * saturate((1.0 - c.viewT) / max(1.0 - toTop, 1e-4));
+    c.inFront = AtmosphereSkyBelowClouds(A, normalize(float3(dir.x, mu, dir.z))) * Exposure;
     return c;
 }
 

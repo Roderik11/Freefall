@@ -116,6 +116,20 @@ namespace Freefall.Graphics
         /// <c>Daylight</c> measures), read back from the GPU a few frames late.</summary>
         public static Vector3 SkyAmbientLegacy { get; private set; }
 
+        /// <summary>The cloud layer round the camera as the air takes it (atmosphere_cs.hlsl CSCloudDeck, sky_common.fx
+        /// CloudDeck), read back a few frames late: X, Y its mean density toward the sun / the brightest moon (the
+        /// sky-view's air below it), Z, W how much the sky's clouds hide the sun / the moon.</summary>
+        public static Vector4 CloudDeck { get; private set; }
+
+        /// <summary>For engine_stats: <see cref="CloudDeck"/>.</summary>
+        public static object DescribeCloudDeck() => new
+        {
+            sunDensity = CloudDeck.X,
+            moonDensity = CloudDeck.Y,
+            sunCover = CloudDeck.Z,
+            moonCover = CloudDeck.W,
+        };
+
         /// <summary>Largest relative difference (0..1) between the CPU's transmittance toward the sun (which sets the
         /// directional light) and the transmittance LUT's, for the same frame: the two copies of the medium must agree.
         /// Logged as a warning when it goes over 3% (the LUT's own interpolation error reaches ~1.6% with a low sun).</summary>
@@ -233,12 +247,13 @@ namespace Freefall.Graphics
         }
 
         private const int FrameCount = 3;
-        private const int AmbientElements = 4;      // atmosphere_cs.hlsl CSAmbient: sky, ground, sky (older units), sun transmittance
+        private const int AmbientElements = 5;      // atmosphere_cs.hlsl CSAmbient: sky, ground, sky (older units), sun
+                                                    // transmittance; CSCloudDeck: the cloud layer
         private const int TransmittanceW = 256, TransmittanceH = 64, MultiScatRes = 32;
         private const int SkyViewW = 192, SkyViewH = 108;
 
         private static ComputeShader? _cs;
-        private static int _kTransmittance, _kMultiScat, _kSkyView, _kAP, _kAmbient;
+        private static int _kTransmittance, _kMultiScat, _kSkyView, _kAP, _kAmbient, _kCloudDeck;
         private static RenderTexture2D? _transmittance, _multiScat, _skyViewSun, _skyViewMoon;
         private static GraphicsBuffer? _ambient;
         private static readonly GraphicsBuffer?[] _params = new GraphicsBuffer?[FrameCount];
@@ -259,6 +274,7 @@ namespace Freefall.Graphics
             _kSkyView = _cs.FindKernel("CSSkyView");
             _kAP = _cs.FindKernel("CSAerialPerspective");
             _kAmbient = _cs.FindKernel("CSAmbient");
+            _kCloudDeck = _cs.FindKernel("CSCloudDeck");
 
             // fp32: these hold light per unit of the sun's illuminance, and in twilight the sky's share falls to ~1e-6 and
             // below, fp16's subnormals (steps of 6e-8): an exposure adapted to dusk showed the sky-view LUT's texels as
@@ -299,6 +315,7 @@ namespace Freefall.Graphics
             {
                 var back = _readback[slot]!.ReadPtr<Vector4>();
                 SkyAmbientLegacy = new Vector3(back[2].X, back[2].Y, back[2].Z);
+                CloudDeck = back[4];
                 CheckTransmittance(new Vector3(back[3].X, back[3].Y, back[3].Z), _cpuSunTransmittance[slot]);
             }
             _cpuSunTransmittance[slot] = TransmittanceToLight(cameraHeight, Settings.SunDirection);
@@ -403,6 +420,12 @@ namespace Freefall.Graphics
                 _medium = _frame;
                 _mediumValid = true;
             }
+
+            // The cloud layer round the camera (Ambient[4]): the sky-view, the aerial perspective and the near fog volume
+            // shade the air below it with it
+            _ambient!.Transition(list, ResourceStates.UnorderedAccess);
+            cs.Dispatch(_kCloudDeck, list, 1);
+            _ambient.Transition(list, shaderRead);
 
             // Sky-view (sun and moon)
             list.ResourceBarrierTransition(_skyViewSun!.Native, from, ResourceStates.UnorderedAccess);

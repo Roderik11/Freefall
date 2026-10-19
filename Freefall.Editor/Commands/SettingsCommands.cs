@@ -129,6 +129,8 @@ namespace Freefall.Editor.Commands
                 skyCaptures = Freefall.Graphics.SkyCapture.Describe(),
                 // Camera exposure: auto or locked, the EV in use and its target, the metered luminance, the daylight
                 exposure = Freefall.Graphics.AutoExposure.Describe(),
+                // The cloud layer as the air takes it: its mean density toward the sun and the moon, how much it hides them
+                cloudDeck = Freefall.Graphics.Atmosphere.DescribeCloudDeck(),
                 // System tree in update order, one "Name  ms" line per system (indent = nesting)
                 systems = Freefall.Base.Systems.Describe().Split('\n', StringSplitOptions.RemoveEmptyEntries)
             });
