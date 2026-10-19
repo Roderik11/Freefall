@@ -320,7 +320,8 @@ FragmentOutput PS_Procedural(VertexOutput input)
     float pixelAngle = max(length(fwidth(viewDir)) * 0.7071, 1e-5);   // radians per pixel, before any branch
 
     float3 skyColor = 0;
-    float3 behindClouds = 0;     // sun disc, moons, stars: far brighter than a cloud in front, so hidden sooner
+    float3 behindClouds = 0;     // moons, stars: far brighter than a cloud in front, so hidden sooner
+    float3 sunBehind = 0;        // the sun's disc: brighter still
     float3 sunDir = float3(0, 1, 0);
     float3 moonDir = float3(0, -1, 0);
     if (AtmosphereIdx != 0)
@@ -349,16 +350,21 @@ FragmentOutput PS_Procedural(VertexOutput input)
 
         float3 moons;
         float3 starsLeft = MoonsAndStars(viewDir, sunDir, stars, moons);
-        behindClouds = sun + (starsLeft * Exposure + moons * MoonExposure()) * viewT;
+        sunBehind = sun;
+        behindClouds = (starsLeft * Exposure + moons * MoonExposure()) * viewT;
     }
 
     // The cloud layer over the sky's light (sky_common.fx)
     float density;
     skyColor = SkyThroughClouds(linearWrap, viewDir, skyColor, 0.0, density);
 
-    // Sun, moons and stars through the clouds: hidden far sooner than the sky colour is. With the sky's absorption a
-    // thin cloud let ~2/3 of a moon through, 50-100x brighter than the cloud round it, so it seemed to hang in front.
-    skyColor += behindClouds * exp(-density * 15.0);
+    // Sun, moons and stars through the clouds: hidden far sooner than the sky colour is, each down to about the cloud's own
+    // light where the cloud reads ~3/4 solid (density ~0.3 under the sky's absorption 1 − exp(−4.5 d)): a cloud that looks
+    // white is optically thick. Moons and stars, 50-100x the cloud round them: exp(−15 d) (with the sky's absorption a thin
+    // cloud let ~2/3 of a moon through, so it seemed to hang in front). The sun's disc, up to SunDiscMaxPixel against a
+    // cloud of 1-10: exp(−30 d) (CloudSunDiscCover); at 15 a cloud 83 % solid (0.4) still let ~150 through and the disc
+    // burnt through white clouds.
+    skyColor += sunBehind * (1.0 - CloudSunDiscCover(density)) + behindClouds * exp(-density * 15.0);
 
     output.Albedo = float4(skyColor, 1);
     output.Normal = float4(0, 1, 0, 1);

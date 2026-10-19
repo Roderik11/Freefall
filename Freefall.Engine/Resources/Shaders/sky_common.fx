@@ -436,8 +436,8 @@ float GetCloudShadow(SamplerState wrapSampler, float3 relPos, float3 toLight)
 //   x, y  the layer's mean density between the air and the sun / the brightest moon over CLOUD_DECK_RADIUS round the
 //         camera (the sky-view LUT's air below the layer, which is the same in every direction), at a low light faded
 //         into z, w as CloudAirLight fades;
-//   z, w  how much the sky's clouds hide the sun / the moon seen from the camera: 1 − exp(−15 × density), as the sky
-//         dome hides their discs (mesh_skybox.fx).
+//   z, w  how much the sky's clouds hide the sun / the moon seen from the camera, as the sky dome hides their discs
+//         (mesh_skybox.fx: CloudSunDiscCover, the moon's 1 − exp(−15 × density)).
 // 0 (no layer) where the buffer has no element 4 (a build before 2026-10-19 reading these shaders).
 float4 CloudDeck()
 {
@@ -604,6 +604,14 @@ float GetCloudsAt(SamplerState wrapSampler, float3 viewDir, float altitude, floa
     eroded = lerp(horizonDensity, eroded, smoothstep(0.0, 0.22, viewDir.y));
 
     return saturate(eroded);
+}
+
+// How much the sky's clouds hide the sun's disc at a cloud density (GetCloudsAt, SkyThroughClouds' density out):
+// 1 − exp(−30 d), so the disc (up to 60000 in the frame) is down to about the cloud's own light where the cloud reads ~3/4
+// solid. The sky dome (mesh_skybox.fx) and CSCloudDeck (whether a deck hides the sun from the air below) share it.
+float CloudSunDiscCover(float density)
+{
+    return 1.0 - exp(-30.0 * density);
 }
 
 // Henyey-Greenstein × 4π: 1 for every angle when g = 0 (an isotropic scatterer)

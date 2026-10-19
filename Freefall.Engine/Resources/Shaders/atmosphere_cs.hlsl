@@ -480,7 +480,8 @@ void CSAmbient(uint3 id : SV_DispatchThreadID)
 // ── The cloud layer round the camera (sky_common.fx CloudDeck), into the Ambient buffer's element 4 ──
 // x, y: the layer's mean shadow density toward the sun / the brightest moon over CLOUD_DECK_RADIUS round the camera, 256
 // places on a sunflower spiral (the sky-view LUT lights its air below the layer alike in every direction); z, w: the
-// sky's clouds in front of the sun / the moon, 1 − exp(−15 × density), as the sky dome hides their discs. Below 17° the
+// sky's clouds in front of the sun / the moon, as the sky dome hides their discs (CloudSunDiscCover; the moon's
+// 1 − exp(−15 × density)). Below 17° the
 // light's x, y fade into its z, w, as CloudAirLight fades: the stretched shadow pattern is no use there, the clouds in
 // front of the light tell whether a deck hides it (a deck runs on to the horizon, a broken layer leaves it clear).
 // Dispatched first in Atmosphere.Render (the sky-view and the AP read it); 0 without clouds.
@@ -489,14 +490,14 @@ void CSAmbient(uint3 id : SV_DispatchThreadID)
 
 groupshared float2 CloudDeckShared[64];
 
-float CloudCoverToward(float3 lightDir)
+float CloudCoverToward(float3 lightDir, bool sun)
 {
     float3 dir = normalize(float3(lightDir.x, max(lightDir.y, 0.002), lightDir.z));     // at or under the horizon: its clouds
     float density = GetCloudsAt(CloudWrapSampler, dir, CloudAltitude, 0.0);
     if (CloudAltitudeBlend < 0.999)
         density = lerp(GetCloudsAt(CloudWrapSampler, dir, CloudAltitudeFrom, 0.0), density,
                        smoothstep(0.0, 1.0, saturate(CloudAltitudeBlend)));
-    return 1.0 - exp(-15.0 * density);
+    return sun ? CloudSunDiscCover(density) : 1.0 - exp(-15.0 * density);
 }
 
 [numthreads(64, 1, 1)]
@@ -541,8 +542,8 @@ void CSCloudDeck(uint3 id : SV_DispatchThreadID)
         return;
     }
     float2 mean = CloudDeckShared[0] / 256.0;
-    float sunCover = CloudCoverToward(A.SunDirection);
-    float moonCover = moonLit ? CloudCoverToward(A.MoonDirection) : 0.0;
+    float sunCover = CloudCoverToward(A.SunDirection, true);
+    float moonCover = moonLit ? CloudCoverToward(A.MoonDirection, false) : 0.0;
     output[4] = float4(lerp(sunCover, mean.x, smoothstep(0.05, 0.3, A.SunDirection.y)),
                        lerp(moonCover, mean.y, smoothstep(0.05, 0.3, A.MoonDirection.y)), sunCover, moonCover);
 }
