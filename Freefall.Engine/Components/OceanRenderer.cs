@@ -206,6 +206,12 @@ namespace Freefall.Components
          as its height carries it (a third of it), up to this. On a flat beach a few decimeters go a long way")]
         public float ShoreSurge = 0.1f;
 
+        [ValueRange(0f, 1f)]
+        [Description(@"How readily the breakers plunge into a barrel, a lip curling over a tube. 0 = where the physics puts
+         them: while a wave stands 0.45 to 0.95 times the depth, and where the bed is steep for the wave (Iribarren); a
+         gentle beach mostly spills. 1 = nearly every breaker barrels, its lip forming earlier and lasting longer")]
+        public float Barrels = 0f;
+
         [Category("Spectrum")]
         public List<SpectrumBand> Bands = CreateDefaultBands();
 
@@ -329,6 +335,8 @@ namespace Freefall.Components
             public float _warpPad;
             public Vector4 WarpDirs;     // the deep heading (world xz) of slice 0 (xy) and slice 1 (zw)
             public Vector2 WarpOmega;    // the angular frequency of each slice's band at its peak (rad/s), for the lip
+            public float LipBarrels;     // Barrels: 0 lips where the physics puts them, 1 nearly every breaker
+            public float _lipPad;
         }
 
         private const int GridSize = 128;
@@ -937,6 +945,7 @@ namespace Freefall.Components
                 WarpDirs = warpDirs,
                 // No lips: 0, and the ocean's PS draws its own face where they would stand (LipAmount)
                 WarpOmega = Engine.Settings.DisableSurfLip ? Vector2.Zero : warpOmega,
+                LipBarrels = Math.Clamp(Barrels, 0f, 1f),
             };
             _params.SetParameter("OceanData", data);
 

@@ -50,6 +50,8 @@ struct OceanData
     float _warpPad;
     float4 WarpDirs;            // the deep heading (world xz) of slice 0 (xy) and slice 1 (zw)
     float2 WarpOmega;           // the angular frequency of slice 0 and slice 1's band at its peak (rad/s): the lip's wavelength
+    float LipBarrels;           // OceanRenderer.Barrels: 0 lips where the physics puts them, 1 nearly every breaker (LipAmount)
+    float _lipPad;
 };
 
 SamplerState OceanSampler : register(s0);
@@ -562,11 +564,16 @@ float LipAmount(OceanData ocean, float2 xz, SurfWave wave, float depth, float ca
     LipBed(ocean, xz, bedDepth, bedSlope);
     float height = 2.0 * SurfEnvelope(wave);
     float r = height / max(bedDepth, 0.05);
-    float life = smoothstep(LIP_LIFE.x, LIP_LIFE.y, r) * (1.0 - smoothstep(LIP_LIFE.y, LIP_LIFE.z, r));
+    // OceanRenderer.Barrels (immersive over realistic): the lip forms earlier and lasts into shallower water, and the bed
+    // need hardly be steeper than the wave for it to plunge
+    float barrels = saturate(ocean.LipBarrels);
+    float3 lifeWindow = float3(LIP_LIFE.x - 0.15 * barrels, LIP_LIFE.y, LIP_LIFE.z + 0.25 * barrels);
+    float life = smoothstep(lifeWindow.x, lifeWindow.y, r) * (1.0 - smoothstep(lifeWindow.y, lifeWindow.z, r));
     if (life <= 0.0) return 0.0;
     float L0 = 6.2831853 * 9.81 / (omega * omega);
     float xi = bedSlope / sqrt(max(height, 0.05) / L0);
-    return life * smoothstep(LIP_PLUNGE.x, LIP_PLUNGE.y, xi) * smoothstep(LIP_LEAD.x, LIP_LEAD.y, LipLead(wave))
+    float2 plunge = lerp(LIP_PLUNGE, float2(0.0, 0.1), barrels);
+    return life * smoothstep(plunge.x, plunge.y, xi) * smoothstep(LIP_LEAD.x, LIP_LEAD.y, LipLead(wave))
          * (1.0 - smoothstep(LIP_FADE.x, LIP_FADE.y, camDistXZ));
 }
 
