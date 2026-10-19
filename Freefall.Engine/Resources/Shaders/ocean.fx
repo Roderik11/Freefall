@@ -322,6 +322,10 @@ PSOutput PS(DSOutput input)
     float foamTex = 0.5;
     float laceTex = 0.5;
     float streakFoam = 0.0;
+    SurfFoamMass surfMass = (SurfFoamMass)0;     // the surf's white water as a mass of lumps (ocean_shade.hlsli)
+    surfMass.height = 0.5;
+    surfMass.cover = saturate((surfFoam * 1.3 - 0.5) * 2.0);
+    float surfFootprint = SurfFoamFootprint(input.UndisplacedXZ.xy);
     if (ocean.NoiseSRV != 0)
     {
         Texture2D<float4> noiseTex = ResourceDescriptorHeap[ocean.NoiseSRV];
@@ -368,6 +372,9 @@ PSOutput PS(DSOutput input)
         float2 foamPos = input.UndisplacedXZ.xy;
         float cells2;
         foamTex = OceanFoamCells(noiseTex, foamPos, t, cells2);
+        [branch]
+        if (surfFoam > 0.001)
+            surfMass = SurfFoamLook(noiseTex, foamPos, t, surfFoam, surfTrailWeb, SurfHeading(surfWave), dist, surfFootprint);
 
         // The waterline's foam is fine: a ragged line of small bubbles (0.3 to 0.6 m), not the coarse cells above. Cut by
         // those it broke into round clusters along the edge like paw prints (user, 2026-10-19)
@@ -449,7 +456,7 @@ PSOutput PS(DSOutput input)
     foam = lerp(foam, saturate((coverage - 0.35) * 1.5) * 0.7, foamFar);
     // The surf's white water: a mass of bubbles, eroded more gently than the waterline's thin lace (cut as hard, its
     // edges looked like paper), solid where it is thick; far away as it is (the lace's fade is for thin lines)
-    float surfNear = saturate((surfFoam * 1.3 - (1.0 - foamTex)) * 2.0);
+    float surfNear = surfMass.cover;
     foam = max(foam, lerp(surfNear, surfFoam, foamFar));
     foam = max(foam, streakFoam * (1.0 - foamFar));   // the web of thinning foam
     float thickness = saturate(max(coverage, surfFoam));
@@ -464,9 +471,14 @@ PSOutput PS(DSOutput input)
     {
         float3 skyOnFoam = SkyAmbient(N) * skyVisible;
         color = lerp(color, WaterFoamLit(float3(0.80, 0.80, 0.78), NdotL, sunRadiance, skyOnFoam), whitecap);
-        // Thick foam is bright, thinning foam greys as the water shows through its bubbles
-        float3 foamAlbedo = float3(0.80, 0.80, 0.78) * lerp(0.65, 1.0, foamTex) * lerp(0.78, 1.05, thickness);
-        color = lerp(color, WaterFoamLit(foamAlbedo, NdotL, sunRadiance, skyOnFoam), foam * 0.9);
+        // Thick foam is bright, thinning foam greys as the water shows through its bubbles. Where the surf's white water
+        // is the foam, its lumps light it: their tops toward the sun, the shade between them (SurfFoamMass)
+        float surfShare = saturate(surfNear * (1.0 - foamFar) / max(foam, 1e-3));
+        float3 foamN = normalize(N - float3(surfMass.slope.x, 0.0, surfMass.slope.y) * surfShare);
+        float shade = lerp(lerp(0.65, 1.0, foamTex), SurfFoamShade(surfMass, thickness), surfShare);
+        float3 foamAlbedo = float3(0.80, 0.80, 0.78) * shade * lerp(0.78, 1.05, thickness);
+        color = lerp(color, WaterFoamLit(foamAlbedo, saturate(dot(foamN, L)), sunRadiance, SkyAmbient(foamN) * skyVisible),
+                     foam * 0.9);
     }
 
     // ── The air between the camera and the water (the atmosphere's aerial perspective) ──

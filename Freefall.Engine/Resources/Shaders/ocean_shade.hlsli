@@ -210,4 +210,71 @@ float OceanFoamCells(Texture2D<float4> noiseTex, float2 foamPos, float t, out fl
     return saturate((cells1 * 0.6 + cells2 * 0.4 - 0.15) / 0.6);
 }
 
+// ── The surf's white water as a mass (ocean.fx and ocean_lip.fx alike) ──
+// A churned mass of bubbles, not a sheet: lumps a few decimetres across that catch the sun on their tops and shut it
+// out between them, eroded at the edges into bubbles a few centimetres across, and behind the roller pulled out along
+// the waves' heading. Until 2026-10-19 it was the foam's cells as an opacity mask over one flat white lit by the
+// water's own normal: a white pipe of cotton wool on the breakers, blotches behind them (user: "the whitewash texture
+// isn't great")
+static const float SURF_FOAM_RELIEF = 0.15;              // the lumps' height (m) per unit of their height field, for light
+static const float SURF_FOAM_STREAK = 2.5;               // how much longer the trail's lumps are along the heading
+static const float2 SURF_FOAM_NEAR = float2(30.0, 90.0); // the fine bubbles and the lumps' relief fade out by (m; the
+                                                         // noise texture has no mips)
+
+struct SurfFoamMass
+{
+    float cover;    // how much of the water it covers, 0..1
+    float height;   // its lumps' height, 0..1 (low: the shade between them)
+    float2 slope;   // that height's slope over the water, per metre along foamPos's x and y, times SURF_FOAM_RELIEF
+};
+
+// The lumps: the foam's cells at OceanFoamCells' two scales and a finer one for the bubbles at the edges (fine: 0 far
+// away, where it would only shimmer)
+float SurfFoamLumps(Texture2D<float4> noiseTex, float2 p, float t, float fine)
+{
+    float big = noiseTex.SampleLevel(OceanSampler, p * 0.23 + t * float2(0.010, 0.006), 0).g;
+    float mid = noiseTex.SampleLevel(OceanSampler, p * 0.83 - t * float2(0.013, 0.004), 0).g;
+    float tiny = noiseTex.SampleLevel(OceanSampler, p * 2.3 + t * float2(0.009, 0.011), 0).g;
+    return saturate((big * 0.5 + mid * 0.33 + lerp(0.5, tiny, fine) * 0.17 - 0.12) / 0.66);
+}
+
+// amount: the white water's amount here (SurfWhiteWater); trail: how much of it is the thinning trail behind the roller
+// (its trailWeb); heading: the waves' heading in foamPos's space; footprint: how much water a pixel covers (m,
+// SurfFoamFootprint, taken outside any branch)
+float SurfFoamFootprint(float2 foamPos) { return max(length(ddx(foamPos)), length(ddy(foamPos))); }
+
+SurfFoamMass SurfFoamLook(Texture2D<float4> noiseTex, float2 foamPos, float t, float amount, float trail, float2 heading,
+                          float dist, float footprint)
+{
+    SurfFoamMass m;
+    // The fine bubbles (~5 cm) and the lumps' relief (the ~15 cm cells' slopes) only while a pixel covers less of the
+    // water than they are small: on the lip's face seen edge-on the texture is squeezed and they stood in hatching
+    float fine = (1.0 - saturate(dist / SURF_FOAM_NEAR.x)) * (1.0 - smoothstep(0.012, 0.03, footprint));
+    float relief = (1.0 - saturate(dist / SURF_FOAM_NEAR.y)) * (1.0 - smoothstep(0.04, 0.1, footprint));
+    float2 along = dot(heading, heading) > 1e-8 ? normalize(heading) : float2(1.0, 0.0);
+    float2 across = float2(-along.y, along.x);
+    // The texture's space squeezed along the heading where the trail is: q = M p
+    float squeeze = 1.0 / lerp(1.0, SURF_FOAM_STREAK, saturate(trail));
+    float2 q = along * (dot(foamPos, along) * squeeze) + across * dot(foamPos, across);
+    m.height = SurfFoamLumps(noiseTex, q, t, fine);
+    m.slope = 0.0;
+    [branch]
+    if (relief > 0.0)
+    {
+        const float e = 0.05;
+        float2 qx = along * (along.x * e * squeeze) + across * (across.x * e);
+        float2 qy = along * (along.y * e * squeeze) + across * (across.y * e);
+        m.slope = float2(SurfFoamLumps(noiseTex, q + qx, t, fine) - m.height,
+                         SurfFoamLumps(noiseTex, q + qy, t, fine) - m.height) * (SURF_FOAM_RELIEF * relief / e);
+    }
+    m.cover = saturate((amount * 1.3 - (1.0 - m.height)) * 2.0);
+    return m;
+}
+
+// The foam's own brightness from its lumps: deep between them little of the sky and the sun gets in (thick foam only)
+float SurfFoamShade(SurfFoamMass m, float thickness)
+{
+    return lerp(1.0, lerp(0.4, 1.1, smoothstep(0.15, 0.85, m.height)), saturate(thickness * 1.5));
+}
+
 #endif

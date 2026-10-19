@@ -401,6 +401,7 @@ LipPSOutput PS_Lip(LipOutput input)
     float3 V = normalize(camPos - worldPos);
     float dist = distance(worldPos, camPos);
     float3 Ng = normalize(input.Normal);
+    float3 outward = Ng;                    // the water's outside, where its foam lies and is lit
     Ng = dot(Ng, V) < 0.0 ? -Ng : Ng;       // the water is closed round the tube: its back only through a crack
     float3 L = normalize(-ocean.SunDirection);
     float skyOpen = SkyVisibilityWith(worldPos, float3(0, 1, 0), 1.0);
@@ -506,26 +507,39 @@ LipPSOutput PS_Lip(LipOutput input)
     bands.surf.phase = input.Surf.zw;
     float surfFoam = SurfWhiteWater(ocean, bands, shoreDepth, dist, trailWeb);
     float whitecap = OceanWhitecap(bands, dist);
-    float foamTex = 0.5;
-    if (ocean.NoiseSRV != 0)
+    // With the white water the landing lip throws up (DS Splash): a churning mass over the tip's end and the face under
+    // it. Both as the ocean's surf: a mass of lumps (SurfFoamLook) at the sheet's texture position
+    float splash = saturate(input.Splash);
+    float amount = max(surfFoam, splash * (1.4 / 1.3));
+    float thickness = saturate(max(surfFoam, splash));
+    SurfFoamMass mass = (SurfFoamMass)0;
+    mass.height = 0.5;
+    mass.cover = saturate((amount * 1.3 - 0.5) * 2.0);
+    float footprint = SurfFoamFootprint(worldXZ);
+    [branch]
+    if (ocean.NoiseSRV != 0 && amount > 0.001)
     {
         Texture2D<float4> noiseTex = ResourceDescriptorHeap[ocean.NoiseSRV];
-        float cells2;
-        foamTex = OceanFoamCells(noiseTex, worldXZ, ocean.WaveTime, cells2);
+        // (no trail on the curl and the face: drawn by the vertex's own water, its lumps streaked down the face)
+        mass = SurfFoamLook(noiseTex, worldXZ, ocean.WaveTime, amount, 0.0, h, dist, footprint);
     }
     float foamFar = saturate(dist / 150.0);
-    float foam = lerp(saturate((surfFoam * 1.3 - (1.0 - foamTex)) * 2.0), surfFoam, foamFar);
-    // The white water the landing lip throws up (DS Splash): a churning mass over the tip's end and the face under it,
-    // broken up at its edges by the same cells
-    float splash = saturate(input.Splash);
-    foam = max(foam, lerp(saturate((splash * 1.4 - (1.0 - foamTex)) * 2.0), splash, foamFar));
-    foamTex = lerp(foamTex, 0.5, foamFar);
+    float foam = lerp(mass.cover, saturate(amount), foamFar);
     if (foam > 0.001 || whitecap > 0.001)
     {
         float3 skyOnFoam = SkyAmbient(N) * skyVisible;
         color = lerp(color, WaterFoamLit(float3(0.80, 0.80, 0.78), NdotL, sunRadiance, skyOnFoam), whitecap);
-        float3 foamAlbedo = float3(0.80, 0.80, 0.78) * lerp(0.65, 1.0, foamTex) * lerp(0.78, 1.05, saturate(max(surfFoam, splash)));
-        color = lerp(color, WaterFoamLit(foamAlbedo, NdotL, sunRadiance, skyOnFoam), foam * 0.9);
+        // The lumps' slope tilts the foam in the sheet's frame, as the bands' slopes tilt the water above. On the
+        // water's outside: seen from behind (the curl's back over the crest, from in front of the wave), lit by the
+        // normal turned to the eye the foam faced the ground and stood as a dark line along the crest
+        float foamNear = 1.0 - foamFar;
+        float3 outT = normalize(cross(outward, side));
+        float2 foamSlope = bands.slopes.mean + mass.slope * foamNear;
+        float3 foamN = normalize(outward - dot(foamSlope, h) * outT - dot(foamSlope, side.xz) * side);
+        float3 foamAlbedo = float3(0.80, 0.80, 0.78) * lerp(1.0, SurfFoamShade(mass, thickness), foamNear)
+                          * lerp(0.78, 1.05, thickness);
+        color = lerp(color, WaterFoamLit(foamAlbedo, saturate(dot(foamN, L)), sunRadiance, SkyAmbient(foamN) * skyVisible),
+                     foam * 0.9);
     }
 
     color = ApplyAerialPerspective(color, input.Position.xy, input.Depth, skyVisible);
