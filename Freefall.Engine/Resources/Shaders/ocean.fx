@@ -166,11 +166,25 @@ PSOutput PS(DSOutput input)
         slopes.variance *= capSlope * capSlope;
 
         // Where a breaking lip stands, the lip pass (ocean_lip.fx) draws the strip ahead of the crest, the curl and a
-        // steep face under it: this gentle face would stand in front of the tube. By the same test, so they meet
-        float lipPhase = LipPhase(surfWave);
-        if (lipPhase > 0.0 && lipPhase < LIP_STRIP
-            && LipAmount(ocean, worldXZ, surfWave, shoreDepth, distance(worldXZ, camPos.xz)) > LIP_MIN)
-            discard;
+        // steep face under it: this gentle face would stand in front of the tube. By the same test on the same blurred
+        // waves (LipWave, LipStripAmount: the crest's amount), so they meet; only where a wave stands anywhere near
+        // breaking by the full detail (a strip's far end lies in shallower water than its crest), so the rest of the
+        // coast pays nothing for it
+        float nearBreaking = 2.0 * SurfEnvelope(surfWave) / max(shoreDepth, 0.05);
+        if (ocean.WarpOmega.x + ocean.WarpOmega.y > 0.0 && nearBreaking > LIP_LIFE.x - 0.25 && nearBreaking < 2.0)
+        {
+            SurfWave lipWave = LipWave(ocean, worldXZ);
+            float lipPhase = LipPhase(lipWave);
+            [branch]
+            if (lipPhase > 0.0 && lipPhase < LIP_STRIP)
+            {
+                float2 lipCrestXZ;
+                SurfWave lipCrestWave;
+                float lipK;
+                if (LipStripAmount(ocean, worldXZ, lipWave, camPos.xz, lipCrestXZ, lipCrestWave, lipK) > LIP_MIN)
+                    discard;
+            }
+        }
     }
 
     float3 N = normalize(float3(-slopes.mean.x, 1.0, -slopes.mean.y));

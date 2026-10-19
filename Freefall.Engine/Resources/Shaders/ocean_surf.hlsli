@@ -452,40 +452,202 @@ static const float3 LIP_LIFE = float3(0.45, 0.75, 0.95);
 static const float2 LIP_PLUNGE = float2(0.35, 0.7);
 // The camera's distance over which the lip fades out: further out its strip has too few vertices
 static const float2 LIP_FADE = float2(90.0, 120.0);
-// The strip ahead of a crest the lip and its face take, in radians of the band's phase
-static const float LIP_STRIP = 1.2;
-// Above this LipAmount the lip pass draws the strip and the ocean leaves it out
-static const float LIP_MIN = 0.02;
+// The strip ahead of a crest the lip and its face take, in radians of the band's phase: nearly down to the trough (π),
+// so the breaking face is the wave's front. At 1.2 the ocean's own gentle front ran on below the lip's face and the
+// breakers sat behind the swell's front (user, 2026-10-19)
+static const float LIP_STRIP = 2.4;
+// Above this LipAmount the lip pass draws the strip and the ocean leaves it out. The lip covers down to 0 (its skirt):
+// the margin must hold between the ocean's per-pixel amount and the lip's per-vertex one (sampled at another mip),
+// which part where the amount changes fast along the crest. At 0.02 (the lip down to 0.004) the seabed showed through
+// where a lip's edge forked near the beach
+static const float LIP_MIN = 0.05;
 
-// The bed's steepness round xz (rise over run, over a 10 m baseline)
-float BedSlope(OceanData ocean, float2 xz)
+// The bed under xz as the lip reads it, over its breaking zone: the still water's depth (a weighted cross of samples
+// 6 m out) and the bed's steepness (rise over run, over 12 and 24 m). Read at the point and over 10 m, the seabed's
+// 1 m detail made the lip's amount change every few metres along the crest: its edges tore into tongues and flaps,
+// and where it faded the half-bent face stood as a shelf
+void LipBed(OceanData ocean, float2 xz, out float depth, out float slope)
 {
     Texture2D<float> heightmap = ResourceDescriptorHeap[ocean.HeightmapSRV];
     float2 size = float2(ocean.TerrainSizeX, ocean.TerrainSizeZ);
     float2 uv = clamp((xz - float2(ocean.TerrainOriginX, ocean.TerrainOriginZ)) / size, 0.002, 0.998);
-    float2 stride = 5.0 / size;
-    float dx = heightmap.SampleLevel(OceanSampler, uv + float2(stride.x, 0), 0) - heightmap.SampleLevel(OceanSampler, uv - float2(stride.x, 0), 0);
-    float dz = heightmap.SampleLevel(OceanSampler, uv + float2(0, stride.y), 0) - heightmap.SampleLevel(OceanSampler, uv - float2(0, stride.y), 0);
-    return length(float2(dx, dz)) * ocean.MaxTerrainHeight / 10.0;
+    float2 near = 6.0 / size, far = 12.0 / size;
+    float c = heightmap.SampleLevel(OceanSampler, uv, 0);
+    float e1 = heightmap.SampleLevel(OceanSampler, uv + float2(near.x, 0), 0), w1 = heightmap.SampleLevel(OceanSampler, uv - float2(near.x, 0), 0);
+    float n1 = heightmap.SampleLevel(OceanSampler, uv + float2(0, near.y), 0), s1 = heightmap.SampleLevel(OceanSampler, uv - float2(0, near.y), 0);
+    float e2 = heightmap.SampleLevel(OceanSampler, uv + float2(far.x, 0), 0), w2 = heightmap.SampleLevel(OceanSampler, uv - float2(far.x, 0), 0);
+    float n2 = heightmap.SampleLevel(OceanSampler, uv + float2(0, far.y), 0), s2 = heightmap.SampleLevel(OceanSampler, uv - float2(0, far.y), 0);
+    float h = (2.0 * c + e1 + w1 + n1 + s1) / 6.0;
+    depth = max(ocean.OceanPlaneY - (ocean.TerrainBaseY + h * ocean.MaxTerrainHeight), 0.0);
+    float2 gradient = 0.5 * (float2(e1 - w1, n1 - s1) / 12.0 + float2(e2 - w2, n2 - s2) / 24.0);
+    slope = length(gradient) * ocean.MaxTerrainHeight;
 }
 
 // The carried band a lip belongs to: the stronger one here; its phase (0 at the crest, positive ahead of it)
 bool LipSecondBand(SurfWave wave) { return wave.envelope.y > wave.envelope.x; }
 float LipPhase(SurfWave wave) { return LipSecondBand(wave) ? wave.phase.y : wave.phase.x; }
 
-// How far a lip stands at xz, 0..1: the wave breaking but not yet collapsed, over a bed that makes it plunge, near the
-// camera. 0 without lips (the C# leaves WarpOmega 0 when Engine.Settings.DisableSurfLip)
+// How clearly one carried band leads (0 where the two are as high, 1 with one alone): a lip only where one does. Where
+// the two crossed about evenly the stronger one flipped from point to point, each side bending round its own crests:
+// the sheet tore into saw teeth along the line, and the ocean's cut-out and the lip chose different bands there
+static const float2 LIP_LEAD = float2(0.15, 0.35);
+float LipLead(SurfWave wave)
+{
+    return abs(wave.envelope.x - wave.envelope.y) / max(wave.envelope.x + wave.envelope.y, 1e-4);
+}
+
+// The carried bands' waves at xz as the lip reads them, both its pass (its strip, its crest, the crest's height and
+// heading) and the ocean's PS (where it leaves its face out for the lip): blurred to texels of LIP_WAVE_BLUR metres.
+// At full detail the swell band's shorter waves jittered each vertex's phase and phase rate, and a strip's length from
+// the crest neighbouring vertices bent round crests tens of centimetres apart: the sheet crumpled like foil near the
+// camera, where it is finest. The ocean decides by the same waves, or it cut itself out where the lip hung its skirt
+// low, and the seabed showed through the open step between them
+static const float LIP_WAVE_BLUR = 6.0;
+
+SurfWave LipWave(OceanData ocean, float2 xz)
+{
+    SurfWave wave = (SurfWave)0;
+    Texture2DArray<float4> dispTex = ResourceDescriptorHeap[ocean.DisplacementSRV];
+    StructuredBuffer<float> tileScales = ResourceDescriptorHeap[ocean.TileScalesSRV];
+    float texW, texH, slices;
+    dispTex.GetDimensions(texW, texH, slices);
+    float2 terrainUV = clamp((xz - float2(ocean.TerrainOriginX, ocean.TerrainOriginZ))
+                             / float2(ocean.TerrainSizeX, ocean.TerrainSizeZ), 0.002, 0.998);
+    [loop]
+    for (uint i = 0; i < ocean.NumBands; ++i)
+    {
+        uint slice = WarpSlice(ocean, i);
+        if (slice == 0xFF) continue;
+        // As SampleDisplacement samples a carried band, at the mip whose texels are LIP_WAVE_BLUR metres
+        BandWarp bw = SampleBandWarp(ocean, slice, xz, terrainUV);
+        float stretch = sqrt(max(bw.J[0][0] * bw.J[0][0] + bw.J[1][0] * bw.J[1][0], bw.J[0][1] * bw.J[0][1] + bw.J[1][1] * bw.J[1][1]));
+        float2 uv = RotateUV(bw.u, BandAngles[i]) * tileScales[i];
+        float mip = log2(max(1.0, LIP_WAVE_BLUR * tileScales[i] * texW * stretch));
+        float3 d = dispTex.SampleLevel(OceanSampler, float3(uv, i), mip).xyz;
+        d.xz = RotateUV(d.xz, -BandAngles[i]);
+        d.xz = float2(d.x * bw.turn.x - d.z * bw.turn.y, d.x * bw.turn.y + d.z * bw.turn.x);
+        AddSurfWave(wave, ocean, d * bw.amp, bw.heading, slice);
+    }
+    return wave;
+}
+
+// The curl (ocean_lip.fx draws it; the surf's spray leaves from its tip): the tube's radius per metre of wave height,
+// where its centre lies from the crest top (in radii: ahead, below), how far the curl turns round it when fully thrown
+// (radians), and how much its radius shrinks to the tip
+static const float LIP_RADIUS = 0.3;
+static const float2 LIP_CENTRE = float2(0.6, 0.8);
+static const float LIP_SWEEP = 3.8;
+static const float LIP_TIP_SHRINK = 0.35;
+
+// The lip's tip, from its crest top C (fwd: the wave's heading, height: the wave's from trough to crest, thrown: its
+// LipAmount): where the curl's outer side ends. falling: 0 while it is thrown forward, 1 once it points down at the
+// trough (the plunge, where it lands)
+float3 LipTip(float3 C, float3 fwd, float height, float thrown, out float falling)
+{
+    float R = LIP_RADIUS * height;
+    float3 O = C + fwd * (LIP_CENTRE.x * R) - float3(0.0, LIP_CENTRE.y * R, 0.0);
+    float theta = atan2(-LIP_CENTRE.x, LIP_CENTRE.y) + LIP_SWEEP * thrown;
+    float rho = R * length(LIP_CENTRE) * (1.0 - LIP_TIP_SHRINK);
+    falling = smoothstep(1.6, 3.0, theta);
+    return O + rho * (sin(theta) * fwd + float3(0.0, cos(theta), 0.0));
+}
+
+// How far a lip stands at xz, 0..1: the wave breaking but not yet collapsed, over a bed that makes it plunge, one band
+// clearly leading, near the camera. 0 without lips (the C# leaves WarpOmega 0 when Engine.Settings.DisableSurfLip)
 float LipAmount(OceanData ocean, float2 xz, SurfWave wave, float depth, float camDistXZ)
 {
     float omega = LipSecondBand(wave) ? ocean.WarpOmega.y : ocean.WarpOmega.x;
     if (omega <= 0.05 || ocean.HeightmapSRV == 0 || depth > 1e3) return 0.0;
+    float bedDepth, bedSlope;
+    LipBed(ocean, xz, bedDepth, bedSlope);
     float height = 2.0 * SurfEnvelope(wave);
-    float r = height / max(depth, 0.05);
+    float r = height / max(bedDepth, 0.05);
     float life = smoothstep(LIP_LIFE.x, LIP_LIFE.y, r) * (1.0 - smoothstep(LIP_LIFE.y, LIP_LIFE.z, r));
     if (life <= 0.0) return 0.0;
     float L0 = 6.2831853 * 9.81 / (omega * omega);
-    float xi = BedSlope(ocean, xz) / sqrt(max(height, 0.05) / L0);
-    return life * smoothstep(LIP_PLUNGE.x, LIP_PLUNGE.y, xi) * (1.0 - smoothstep(LIP_FADE.x, LIP_FADE.y, camDistXZ));
+    float xi = bedSlope / sqrt(max(height, 0.05) / L0);
+    return life * smoothstep(LIP_PLUNGE.x, LIP_PLUNGE.y, xi) * smoothstep(LIP_LEAD.x, LIP_LEAD.y, LipLead(wave))
+         * (1.0 - smoothstep(LIP_FADE.x, LIP_FADE.y, camDistXZ));
+}
+
+// The local wavenumber of a carried band (its warp slice) at xz: its deep-water wavenumber at the band's peak, times how
+// far the warp stretches the deep phase along the heading (|Jᵀd|: smooth, the warp's Jacobian is bilinear)
+float LipWavenumber(OceanData ocean, uint slice, float2 xz)
+{
+    float2 terrainUV = clamp((xz - float2(ocean.TerrainOriginX, ocean.TerrainOriginZ))
+                             / float2(ocean.TerrainSizeX, ocean.TerrainSizeZ), 0.002, 0.998);
+    BandWarp bw = SampleBandWarp(ocean, slice, xz, terrainUV);
+    float2 deep = slice == 0 ? ocean.WarpDirs.xy : ocean.WarpDirs.zw;
+    float omega = slice == 0 ? ocean.WarpOmega.x : ocean.WarpOmega.y;
+    return omega * omega / 9.81 * length(mul(deep, bw.J));
+}
+
+// A carried band's blurred phase at xz (as LipWave has it), and how fast it runs along the heading there, over 3 m
+float LipBandPhase(OceanData ocean, uint slice, float2 xz)
+{
+    uint band = (slice == 0 ? (ocean.WarpSlots & 0xFFu) : ((ocean.WarpSlots >> 8) & 0xFFu)) - 1;
+    Texture2DArray<float4> dispTex = ResourceDescriptorHeap[ocean.DisplacementSRV];
+    StructuredBuffer<float> tileScales = ResourceDescriptorHeap[ocean.TileScalesSRV];
+    float texW, texH, slices;
+    dispTex.GetDimensions(texW, texH, slices);
+    float2 terrainUV = clamp((xz - float2(ocean.TerrainOriginX, ocean.TerrainOriginZ))
+                             / float2(ocean.TerrainSizeX, ocean.TerrainSizeZ), 0.002, 0.998);
+    BandWarp bw = SampleBandWarp(ocean, slice, xz, terrainUV);
+    float stretch = sqrt(max(bw.J[0][0] * bw.J[0][0] + bw.J[1][0] * bw.J[1][0], bw.J[0][1] * bw.J[0][1] + bw.J[1][1] * bw.J[1][1]));
+    float2 uv = RotateUV(bw.u, BandAngles[band]) * tileScales[band];
+    float3 d = dispTex.SampleLevel(OceanSampler, float3(uv, band), log2(max(1.0, LIP_WAVE_BLUR * tileScales[band] * texW * stretch))).xyz;
+    d.xz = RotateUV(d.xz, -BandAngles[band]);
+    d.xz = float2(d.x * bw.turn.x - d.z * bw.turn.y, d.x * bw.turn.y + d.z * bw.turn.x);
+    return atan2(-dot(d.xz, bw.heading) / max(ocean.Choppiness, 0.05), d.y);
+}
+
+float LipPhaseRate(OceanData ocean, uint slice, float2 xz, float2 heading)
+{
+    float dPhase = LipBandPhase(ocean, slice, xz + heading * 1.5) - LipBandPhase(ocean, slice, xz - heading * 1.5);
+    dPhase -= 6.2831853 * round(dPhase / 6.2831853);           // across the ±π seam
+    return dPhase / 3.0;
+}
+
+// The crest a point of a strip belongs to (wave: LipWave there): back along the heading where the blurred phase is 0.
+// A first guess by the phase's rate at the point, then two secant steps: the phase drop from the point back to the
+// guess is the rate over the whole span, and the guess moves to where that rate puts phase 0. The phase runs up to
+// twice as fast near the crest as on the face: by the warp's own wavenumber (LipWavenumber, 1-1.2 x the dispersion
+// relation's) the crests of the face's points lay far behind the drawn one (a strip judged by those came out as rings),
+// and by local rates at two points they still wandered, the strip's far end in fingers. Bounded round the warp's
+// wavenumber, which is smooth: by the waterline the measured phase goes astray. At full detail the phase jittered and
+// the lip's sheet crumpled like foil; stepping by the phase without bounds reached the next wave or stopped on the
+// face, and the sheet tore into shards between vertices. k: the mean rate between the point and its crest
+float2 LipCrest(OceanData ocean, float2 xz, SurfWave wave, out float k)
+{
+    bool second = LipSecondBand(wave);
+    uint slice = second ? 1u : 0u;
+    float phase = max(LipPhase(wave), 0.0);
+    float2 heading = second ? wave.heading.zw : wave.heading.xy;
+    float kWarp = max(LipWavenumber(ocean, slice, xz), 1e-3);
+    k = clamp(LipPhaseRate(ocean, slice, xz, heading), 0.7 * kWarp, 2.5 * kWarp);
+    if (phase < 1e-3) return xz;
+    [unroll]
+    for (int i = 0; i < 2; ++i)
+    {
+        float back = phase / k;
+        float drop = phase - LipBandPhase(ocean, slice, xz - heading * back);
+        drop -= 6.2831853 * floor(drop / 6.2831853);        // the phase falls going back: into [0, 2π)
+        k = clamp(drop / back, 0.7 * kWarp, 2.5 * kWarp);
+    }
+    return xz - heading * (phase / k);
+}
+
+// The lip amount a point of a strip goes by (wave: LipWave there): its crest's (LipCrest), where the lip stands, not
+// its own. A strip's length ahead of its crest the water is shallower and the point's own amount had run out of the
+// breaker's life: the strip was cut short in ragged tongues, and the half-bent face at the cut stood as a shelf. The
+// ocean's cut-out and the lip pass both decide by this, so they agree. crestXZ, crestWave: the crest and its waves
+float LipStripAmount(OceanData ocean, float2 xz, SurfWave wave, float2 camXZ, out float2 crestXZ, out SurfWave crestWave,
+                     out float k)
+{
+    crestXZ = LipCrest(ocean, xz, wave, k);
+    crestWave = LipWave(ocean, crestXZ);
+    OceanShore crestShore = ShoreAt(ocean, crestXZ);
+    return LipAmount(ocean, crestXZ, crestWave, crestShore.shoreDepth, distance(crestXZ, camXZ));
 }
 
 #endif

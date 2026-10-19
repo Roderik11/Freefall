@@ -363,6 +363,28 @@ bool spawn_surf(ParticleEmitter e, uint seed, inout ParticleCore p)
     float crest = DepthLimit(d.y, shore.shoreDepth, slopeScale);
     float2 heading = SurfHeading(wave);
     float celerity = sqrt(9.81 * max(shore.shoreDepth, 0.3));       // the breaker's speed in shallow water
+
+    // Where the ocean draws this point (its DS, OceanSurfaceDisplacement): pushed sideways no further than the water is deep
+    float2 side = d.xz * min(1.0, max(shore.shoreDepth, 0.05) / max(length(d.xz), 1e-4));
+    // xz is the world's (x, z): float3(xz + side, y) made it (x, z, y), every drop born ~500 m up with its height as z
+    float3 from = float3(xz.x + side.x, ocean.OceanPlaneY + crest, xz.y + side.y);
+    // With a lip standing (ocean_lip.fx, by the same blurred waves and LipAmount), the spray leaves from its tip where
+    // the lip pass draws it, not from the crest top inside the curl; once the tip points down at the trough (the
+    // plunge) it splashes up off the water. A spilling breaker has no lip and throws its spray from the crest
+    float falling = 0.0;
+    if (!mist)
+    {
+        SurfWave lipWave = LipWave(ocean, xz);
+        float thrown = LipAmount(ocean, xz, lipWave, shore.shoreDepth, distance(CameraPosition.xz, xz));
+        if (thrown > LIP_MIN)
+        {
+            float2 lipHeading = LipSecondBand(lipWave) ? lipWave.heading.zw : lipWave.heading.xy;
+            float blend = thrown * smoothstep(LIP_MIN, LIP_MIN + 0.15, thrown);     // as the lip pass bends its sheet
+            float3 tip = LipTip(from, float3(lipHeading.x, 0.0, lipHeading.y), 2.0 * SurfEnvelope(lipWave), thrown, falling);
+            from = lerp(from, tip, blend);
+            falling *= blend;
+        }
+    }
     float3 velocity;
     if (mist)
     {
@@ -378,14 +400,14 @@ bool spawn_surf(ParticleEmitter e, uint seed, inout ParticleCore p)
         float speed = celerity * rand_range(1.0, 1.4, seed + 3u)
                     + rand_range(e.SpeedRange.x, e.SpeedRange.y, seed + 4u) * saturate(0.3 + height / 3.0);
         float lift = rand_range(0.18, 0.55, seed + 6u);
+        // Where the tip lands the water splashes up off the trough, steeper and slower than the lip is thrown
+        lift = lerp(lift, rand_range(0.8, 1.6, seed + 11u), falling);
+        speed *= lerp(1.0, 0.7, falling);
         velocity = normalize(float3(heading.x, lift, heading.y)) * speed;
     }
     float speed = length(velocity);
 
-    // Where the ocean draws this point (its DS, OceanSurfaceDisplacement): pushed sideways no further than the water is deep
-    float2 side = d.xz * min(1.0, max(shore.shoreDepth, 0.05) / max(length(d.xz), 1e-4));
-    // xz is the world's (x, z): float3(xz + side, y) made it (x, z, y), every drop born ~500 m up with its height as z
-    p.Position = float3(xz.x + side.x, ocean.OceanPlaneY + crest + (mist ? 0.3 : 0.1), xz.y + side.y);
+    p.Position = from + float3(0.0, mist ? 0.3 : 0.1, 0.0);
     p.Velocity = rand_cone(velocity / max(speed, 1e-4), e.SpreadCos, seed + 5u) * speed;
     return true;
 }
