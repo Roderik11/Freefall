@@ -116,6 +116,14 @@ VSOutput VS(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
         output.Color.rgb *= LightScale;
     if (e.FadeInRate > 0.0)
         output.Color *= saturate(t * e.FadeInRate);
+    // Volumetric: inside its range the near fog volume carries the particle (volumetric_fog_cs.hlsl CSFogInject), the
+    // sprite only past it; nothing to draw while the volume takes all of it
+    float spriteShare = 1.0;
+    if ((e.Flags & PARTICLE_FLAG_VOLUME) != 0 && e.RenderMode == PARTICLE_MODE_FORWARD)
+    {
+        spriteShare = 1.0 - FogVolumeShare(mul(float4(core.Position - CamPos, 1.0), CameraRelativeVP).w);
+        output.Color *= spriteShare;
+    }
     output.TextureIdx = e.TextureIdx;
     output.SoftRange = e.SoftEnabled != 0 ? max(e.SoftRange, 0.01) : 0.0;
 
@@ -224,8 +232,8 @@ VSOutput VS(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
         }
     }
 
-    // Transform to clip space
-    output.Position = mul(float4(worldPos, 1.0), ViewProjection);
+    // Transform to clip space (off the screen when the near fog volume draws it)
+    output.Position = spriteShare > 0.0 ? mul(float4(worldPos, 1.0), ViewProjection) : float4(2.0, 2.0, 2.0, 1.0);
 
     // Linear depth for soft particles (view-space Z)
     float3 viewPos = mul(float4(worldPos, 1.0), View).xyz;

@@ -634,6 +634,43 @@ namespace Freefall.Editor.Commands
         }
     }
 
+    /// <summary>
+    /// POST /api/entity/{id}/createprefab {"path":"Effects/Brazier Fire.prefab"} — save the entity and everything under it
+    /// as a new prefab asset (the root's transform reset; never overwriting: a numeric suffix is added) and import it.
+    /// Without a path it goes into the Assets root, named after the entity. The entity itself is left as it is.
+    /// </summary>
+    [CommandRoute("POST", "/api/entity/{id}/createprefab")]
+    public class CreatePrefabCommand : EditorCommand
+    {
+        public override CommandResult Execute(CommandContext context)
+        {
+            var id = context.GetInt("id");
+            var entity = CommandHelpers.FindEntityById(id);
+            if (entity == null) return CommandResult.NotFound($"Entity {id} not found");
+
+            var assets = Engine.Project?.AssetsDirectory;
+            if (string.IsNullOrEmpty(assets)) return CommandResult.BadRequest("No project open");
+
+            string folder = assets, name = null;
+            if (!string.IsNullOrEmpty(context.Body))
+            {
+                using var doc = context.ParseBody();
+                if (doc.RootElement.TryGetProperty("path", out var p) && !string.IsNullOrEmpty(p.GetString()))
+                {
+                    var full = Path.Combine(assets, p.GetString()!);
+                    folder = Path.GetDirectoryName(full) ?? assets;
+                    name = Path.GetFileNameWithoutExtension(full);
+                }
+            }
+            if (!Directory.Exists(folder)) Directory.CreateDirectory(folder);
+
+            var guid = AssetCreator.CreatePrefab(entity, folder, name);
+            if (guid == null) return CommandResult.Error(500, $"Failed to create the prefab: {AssetCreator.LastError ?? "unknown error"}");
+            var prefab = Engine.Assets.LoadByGuid<Prefab>(guid);
+            return CommandResult.Json(new { status = "created", guid, name = prefab?.Name ?? name });
+        }
+    }
+
     /// <summary>POST /api/prefab/measure {"guids":[...]} — local-space bounds of each prefab (instantiated off-scene and destroyed).</summary>
     [CommandRoute("POST", "/api/prefab/measure")]
     public class PrefabMeasureCommand : EditorCommand

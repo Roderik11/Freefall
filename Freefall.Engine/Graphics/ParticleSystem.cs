@@ -39,6 +39,7 @@ namespace Freefall.Graphics
         private const uint FlagFlipbookBlend = 4;   // = PARTICLE_FLAG_FLIPBOOK_BLEND
         private const uint FlagLit = 8;             // = PARTICLE_FLAG_LIT
         private const uint FlagSurfMist = 16;       // = PARTICLE_FLAG_SURF_MIST
+        private const uint FlagVolume = 32;         // = PARTICLE_FLAG_VOLUME
 
         /// <summary>
         /// The weather's wind (world space), set by <see cref="EnvironmentController"/>. Emitters take
@@ -87,6 +88,8 @@ namespace Freefall.Graphics
             public bool Reset;           // its chunks hold another emitter's particles
             public long ResetSerial;
             public bool PoolFull;
+            public float OutFor;         // seconds it has been disabled
+            public bool Asleep;          // disabled and its particles gone: its last row stands (OnEnabledChanged wakes it)
 
             // Derived values, recomputed only when their source changes (no trig per emitter per frame)
             public float SpreadAngle = float.NaN;
@@ -118,6 +121,7 @@ namespace Freefall.Graphics
         private int _rowCount;
         private readonly int[] _modeCount = new int[RenderModeCount];
         private bool _anyDepthCollision;
+        private bool _anyVolumetric;     // some Lit emitter is Volumetric: the near fog volume takes its particles
 
         // Chunk allocator: free runs sorted by start
         private readonly List<(int Start, int Count)> _free = [];
@@ -167,6 +171,28 @@ namespace Freefall.Graphics
 
         /// <summary>Slots the GPU pool can hold.</summary>
         public int PoolSlots => _poolSlots;
+
+        /// <summary>
+        /// The pool as the last simulation left it (it runs in the transparent pass, after the near fog volume: a frame
+        /// old), for the volume's injection of Volumetric emitters (VolumetricFog). False when no emitter is Volumetric or
+        /// the pool is being regrown (its copy runs later in the frame: one frame without them).
+        /// </summary>
+        internal bool VolumeSources(ID3D12GraphicsCommandList cmd, out uint core, out uint visual, out uint emitters,
+            out uint chunkMap, out uint slots)
+        {
+            core = visual = emitters = chunkMap = slots = 0;
+            if (!_anyVolumetric || _core == null || _visual == null || _emitters == null || _chunkMap == null
+                || _copyCore != null || _uploadedHighWater == 0)
+                return false;
+            _core.Transition(cmd, ResourceStates.NonPixelShaderResource);
+            _visual.Transition(cmd, ResourceStates.NonPixelShaderResource);
+            core = _core.SrvIndex;
+            visual = _visual.SrvIndex;
+            emitters = _emitters.SrvIndex;
+            chunkMap = _chunkMap.SrvIndex;
+            slots = (uint)Math.Min(_uploadedHighWater * ChunkSize, _poolSlots);
+            return true;
+        }
 
         // ────────────── Emitter registration ──────────────
 
@@ -342,13 +368,31 @@ namespace Freefall.Graphics
 
             _gatherSerial++;
             _anyDepthCollision = false;
+            _anyVolumetric = false;
             Array.Clear(_modeCount);
 
             float dt = (float)Time.Delta;
             for (int i = 0; i < count; i++)
-                BuildRow(_entries[i], i, ref _rows[i], dt);
+            {
+                var entry = _entries[i];
+                if (!entry.Asleep)
+                    BuildRow(entry, i, ref _rows[i], dt);
+            }
 
             _rowCount = count;
+        }
+
+        /// <summary>
+        /// An emitter was enabled or disabled (ParticleEmitter.OnEnabledChanged): one asleep is gathered again. A town's
+        /// chimneys that are out cost the gather nothing once their smoke has gone.
+        /// </summary>
+        internal void EnabledChanged(ParticleEmitter emitter)
+        {
+            int index = emitter.SystemIndex;
+            if (index < 0 || index >= _entries.Count || _entries[index].Emitter != emitter) return;
+            var entry = _entries[index];
+            entry.Asleep = false;
+            entry.OutFor = 0f;
         }
 
         private void BuildRow(Entry entry, int index, ref EmitterRow row, float dt)
@@ -411,6 +455,7 @@ namespace Freefall.Graphics
             float speedMax = MathF.Max(e.SpeedRange.X, e.SpeedRange.Y);
             bool depthCollision = e.CollisionMode == ParticleCollisionMode.Depth;
             _anyDepthCollision |= depthCollision;
+            _anyVolumetric |= e.Volumetric && e.Lit;
 
             // A moving emitter. Its velocity, smoothed over about a tenth of a second (a hand's jitter
             // is not a wind), and how far its live particles are carried along this frame: from where
@@ -541,7 +586,8 @@ namespace Freefall.Graphics
                     | (e.FlipbookRandomStart ? FlagFlipbookRandom : 0u)
                     | (e.FlipbookBlend ? FlagFlipbookBlend : 0u)
                     | (e.Lit ? FlagLit : 0u)
-                    | (e.SurfMist ? FlagSurfMist : 0u),
+                    | (e.SurfMist ? FlagSurfMist : 0u)
+                    | (e.Volumetric && e.Lit ? FlagVolume : 0u),
                 Intensity = MathF.Max(0f, e.Intensity),
                 FadeInRate = e.FadeIn > 0f ? 1f / MathF.Min(e.FadeIn, 1f) : 0f,
                 Turbulence = turbulence,
@@ -558,6 +604,11 @@ namespace Freefall.Graphics
 
             if (capacity > 0)
                 entry.Cursor = (entry.Cursor + emit) % capacity;
+
+            // Disabled for longer than its particles live (and nothing of another emitter's left to clear): this row,
+            // which emits nothing, stands until it is enabled again
+            entry.OutFor = e.Enabled ? 0f : entry.OutFor + dt;
+            entry.Asleep = !e.Enabled && !entry.Reset && entry.OutFor > life + 0.5f;
         }
 
         // PCG hash, same as the shader's

@@ -37,7 +37,10 @@ namespace Freefall.Graphics
         private static int _next = 1;                                   // slot 0: zeros
         private static readonly Stack<int> _free = new();
         private static readonly List<(int slot, int tick)> _released = new();
+        // What changed since the last upload: only those bytes are copied (a town's 4000 windows hold a slot each, and
+        // one lit window must not copy them all)
         private static bool _dirty = true;
+        private static int _dirtyFrom, _dirtyTo = int.MaxValue;
 
         private static ID3D12Resource? _buffer;
         private static IntPtr _bufferPtr;
@@ -68,7 +71,7 @@ namespace Freefall.Graphics
                 if (end > _data.Length)
                     Array.Resize(ref _data, Math.Max(_data.Length * 2, end));
                 Array.Clear(_data, slot * Stride, Stride);
-                _dirty = true;
+                MarkDirty(slot * Stride, end);
                 return slot;
             }
         }
@@ -91,8 +94,22 @@ namespace Freefall.Graphics
                 int at = slot * Stride + offset;
                 if (at + size > _data.Length) return;
                 MemoryMarshal.Write(_data.AsSpan(at), in value);
-                _dirty = true;
+                MarkDirty(at, at + size);
             }
+        }
+
+        // (under _lock)
+        private static void MarkDirty(int from, int to)
+        {
+            if (!_dirty)
+            {
+                _dirty = true;
+                _dirtyFrom = from;
+                _dirtyTo = to;
+                return;
+            }
+            _dirtyFrom = Math.Min(_dirtyFrom, from);
+            _dirtyTo = Math.Max(_dirtyTo, to);
         }
 
         /// <summary>
@@ -159,16 +176,20 @@ namespace Freefall.Graphics
                     if (_bindlessIndex == 0) _bindlessIndex = device.AllocateBindlessIndex();
                     device.CreateRawBufferSRV(_buffer, (uint)(bytes / 4), _bindlessIndex);
                     _bufferSlots = capacity;
-                    _dirty = true;
+                    _dirty = true;                  // a new buffer takes everything
+                    _dirtyFrom = 0;
+                    _dirtyTo = int.MaxValue;
                 }
 
                 if (!_dirty) return;
-                int count = Math.Min(_data.Length, _bufferSlots * Stride);
-                unsafe
-                {
-                    fixed (byte* src = _data)
-                        Buffer.MemoryCopy(src, (void*)_bufferPtr, (long)_bufferSlots * Stride, count);
-                }
+                int from = Math.Max(_dirtyFrom, 0);
+                int to = Math.Min(_dirtyTo, Math.Min(_data.Length, _bufferSlots * Stride));
+                if (to > from)
+                    unsafe
+                    {
+                        fixed (byte* src = _data)
+                            Buffer.MemoryCopy(src + from, (byte*)_bufferPtr + from, (long)_bufferSlots * Stride - from, to - from);
+                    }
                 _dirty = false;
             }
         }

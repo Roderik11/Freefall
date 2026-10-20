@@ -234,6 +234,15 @@ float AerialSkyVisible(float skyVisible, float viewDepth)
 // ── Near fog volume (Graphics.VolumetricFog, volumetric_fog_cs.hlsl) ──
 #define FOG_TILE 16     // pixels a froxel spans each way (VolumetricFog.TileSize)
 
+// How much of a Volumetric particle (ParticleEmitter.Volumetric) the near fog volume carries at a view depth: all of it
+// inside, none past FogVolumeRange, handing over to the sprites across the last tenth; none when the volume is off
+float FogVolumeShare(float viewDepth)
+{
+    if (FogVolumeIdx == 0 || FogVolumeRange <= 0.0)
+        return 0.0;
+    return saturate((FogVolumeRange - viewDepth) / (0.1 * FogVolumeRange));
+}
+
 // The air between the camera and viewDepth (at most FogVolumeRange) from the near fog volume: rgb = its light
 // (× Exposure), a = transmittance. Slice s holds the air up to view depth ((s + 1) / slices)² × FogVolumeRange. Read
 // with the B-spline across the screen (atmosphere_common.hlsli SampleScreenBSpline): linearly, the shafts through the

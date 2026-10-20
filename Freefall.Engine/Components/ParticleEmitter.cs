@@ -234,6 +234,12 @@ namespace Freefall.Components
         [ValueRange(0f, 1f)]
         public float MultipleScattering = 0.4f;
 
+        [Description("Lit: inside the near fog volume (VolumetricFogRange) the particles are density in the air instead of " +
+                     "sprites, lit as the air is: through the sun's and moon's shadows, by the sky where it is seen and by " +
+                     "every point light through its shadow (a fire lights its smoke from inside). Past the volume they are " +
+                     "sprites. Soft, at the volume's resolution: smoke, steam, dust clouds")]
+        public bool Volumetric = false;
+
         [Description("Multiplier on RGB: with Lit, of the albedo (at most 1 for a particle that is one thing, a puff; more " +
                      "for a few particles standing in for many, as rain streaks do for the drops round them); without, " +
                      "the luminance in nits")]
@@ -320,5 +326,8 @@ namespace Freefall.Components
 
         /// <summary>Index of this emitter's entry in <see cref="Graphics.ParticleSystem"/>; -1 while it has none.</summary>
         internal int SystemIndex = -1;
+
+        // A disabled emitter whose particles are gone sleeps in the system: it has to hear of it
+        protected override void OnEnabledChanged() => Systems.Get<Graphics.ParticleSystem>()?.EnabledChanged(this);
     }
 }

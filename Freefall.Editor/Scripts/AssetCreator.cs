@@ -202,6 +202,41 @@ namespace Freefall.Editor
 
 
         /// <summary>
+        /// Save an entity and everything under it as a new prefab asset in <paramref name="folderPath"/> (named
+        /// <paramref name="name"/>, else after the entity; never overwriting) and import it. The entity stays as it is.
+        /// Returns the new GUID, or null with <see cref="LastError"/> set.
+        /// </summary>
+        public static string CreatePrefab(Entity source, string folderPath, string name = null)
+        {
+            LastError = null;
+            var prefab = Prefab.Create(source);
+            if (!string.IsNullOrEmpty(name)) prefab.Name = name;
+            string ext = AssetManager.GetFileExtension(typeof(Prefab));
+            string savePath = GetUniquePath(Path.Combine(folderPath, prefab.Name + ext));
+            prefab.Name = Path.GetFileNameWithoutExtension(savePath);
+
+            try
+            {
+                Engine.Assets.SaveAsset(prefab, savePath);
+                AssetDatabase.Refresh();
+                string relativePath = GetRelativePath(savePath);
+                var guid = AssetDatabase.PathToGuid(relativePath);
+                if (guid == null)
+                    throw new InvalidOperationException($"'{relativePath}' was saved but the AssetDatabase did not register it");
+                AssetDatabase.ImportAssetByPath(relativePath);
+                Debug.Log($"[AssetCreator] Created Prefab: {savePath}");
+                return guid;
+            }
+            catch (Exception ex)
+            {
+                LastError = ex.Message;
+                Debug.LogWarning("AssetCreator", $"Failed to create prefab {prefab.Name}: {ex.Message}");
+                try { if (File.Exists(savePath)) File.Delete(savePath); } catch { }
+                return null;
+            }
+        }
+
+        /// <summary>
         /// Get a unique file path by appending (1), (2), etc. if the file already exists.
         /// </summary>
         private static string GetUniquePath(string path)

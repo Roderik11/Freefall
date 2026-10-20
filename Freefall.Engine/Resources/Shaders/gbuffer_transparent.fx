@@ -68,6 +68,23 @@ inline MaterialData GetMaterial(uint id)
     StructuredBuffer<MaterialData> materials = ResourceDescriptorHeap[MaterialsIdx];
     return materials[id];
 }
+
+// What one object gives its glass on top of the material (the renderer's INSTANCE rows, PersistentRenderer.SetInstance
+// from scripts: a lit window): the light of a lit room behind the pane. The pane lets it through as it lets the scene
+// behind through, so the lead cames stay dark and the panes glow. 0 = a dark room (every pane by default).
+struct Instance
+{
+    float3 RoomColor;        //= 1, 0.5, 0.18    -- Hue of the lit room behind the pane (candles, a hearth); scaled to luminance 1
+    float  RoomLight;        //= 0 [0, 20]       -- Luminance of the lit room behind the pane, in nits (candle-lit ~0.5, hearth-lit ~3); 0 = dark
+};
+
+static Instance I;
+
+Instance LoadInstance(uint slot)
+{
+    ByteAddressBuffer all = ResourceDescriptorHeap[InstanceDataIdx];
+    return all.Load<Instance>(slot * 128u);
+}
 #define GET_MATERIAL(id) GetMaterial(id)
 
 SamplerState Sampler : register(s0);
@@ -88,6 +105,7 @@ struct VSOutput
     nointerpolation uint TransformSlot : TEXCOORD4;
     nointerpolation uint MeshPartIdx : TEXCOORD5;
     float3 AbsWorldPos : TEXCOORD6;     // absolute world position (for shadow lookup)
+    nointerpolation uint InstanceSlot : TEXCOORD7;   // its per-object values (struct Instance)
 };
 
 struct PSOutput
@@ -156,6 +174,7 @@ VSOutput VS(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_InstanceI
     output.Depth = output.Position.w;
     output.TransformSlot = slot;
     output.MeshPartIdx = desc.MeshPartIdx;
+    output.InstanceSlot = desc.CustomDataIdx;
     return output;
 }
 
@@ -395,8 +414,21 @@ PSOutput PS(VSOutput input)
     if ((glassFx & 1u) != 0)                         // 1: specular highlight — Reinhard rolloff against HDR blowout
         surface += specLighting / (1.0 + specLighting);
 
+    // The lit room behind the pane (struct Instance): behind it like the scene, so it comes through (1−a)(1−F),
+    // tinted by the glass as the refraction is. Lit walls, not a light source seen directly: the scene's exposure, not
+    // EmissiveExposure (which holds flames and lamp glass ~4000 times below it at night: a room at its physical few
+    // nits vanished)
+    I = LoadInstance(input.InstanceSlot);
+    float3 room = 0;
+    if (I.RoomLight > 0.0)
+    {
+        float hueLuminance = max(dot(I.RoomColor, float3(0.2126, 0.7152, 0.0722)), 1e-3);
+        room = I.RoomColor / hueLuminance * I.RoomLight * Exposure * lerp(float3(1, 1, 1), color.rgb, 0.3);
+    }
+
     float outAlpha = 1.0 - (1.0 - finalAlpha) * (1.0 - Fr);
-    finalColor = (finalColor * finalAlpha * (1.0 - Fr) + surface) / max(outAlpha, 1e-3);
+    finalColor = (finalColor * finalAlpha * (1.0 - Fr) + surface + room * (1.0 - finalAlpha) * (1.0 - Fr))
+               / max(outAlpha, 1e-3);
     finalAlpha = outAlpha;
 
     // Aerial perspective — input.Depth is linear view-space Z. The blend lays the glass's share over what is

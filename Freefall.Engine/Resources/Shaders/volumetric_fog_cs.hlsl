@@ -3,6 +3,7 @@
 // aerial perspective volume cannot know: the sun's and the moon's shadows (the cascades, the clouds, the terrain) and the
 // sky's light only where the sky is seen (no glowing air in a room or a cave). Made every frame by Graphics/VolumetricFog.cs
 // after the shadow maps and the sky captures, before anything draws fog:
+//   CSFogInject     one thread per particle pool slot: Volumetric particles (smoke) as density in the froxels they cover
 //   CSFogScatter    one thread per froxel: the light the air there scatters toward the camera and its extinction, per km,
 //                   at a place in the froxel jittered each frame and blended with the froxel's reprojected history
 //                   (rgb × Exposure, a = σe); the sun, the moon and the point lights that reach it (light_clusters.hlsli)
@@ -12,6 +13,7 @@
 // Grid: FOG_TILE pixels square (sky_common.fx), FOG_SLICES slices; slice s ends at view depth ((s + 1) / FOG_SLICES)² × range.
 // Docs: .agent/knowledge/atmospheric_effects/physical_atmosphere.md §13.
 
+#pragma kernel CSFogInject
 #pragma kernel CSFogScatter
 #pragma kernel CSFogIntegrate
 
@@ -23,6 +25,12 @@ cbuffer PushConstants : register(b3)
     uint IntegratedUAVIdx;      // the volume the passes read
     uint ShadowMapIdx;          // the directional light's cascades (Texture2DArray); 0 = none this frame
     uint CascadeBufferIdx;      // StructuredBuffer<CascadeData>: absolute world → light clip, split distances
+    uint DensityUAVIdx;         // RWByteAddressBuffer, 3 uints a froxel: Volumetric particles' σe, σs, σs·g (per km × 16); 0 = none
+    uint ParticleCoreIdx;       // the particle pool as the last simulation left it (ParticleSystem.VolumeSources)
+    uint ParticleVisualIdx;
+    uint ParticleEmittersIdx;
+    uint ParticleChunkMapIdx;
+    uint ParticleSlots;         // slots to walk
 };
 
 cbuffer Params : register(b4)
@@ -44,6 +52,7 @@ cbuffer Params : register(b4)
 #include "common.fx"
 #include "sky_common.fx"
 #include "light_clusters.hlsli"
+#include "particle_common.hlsli"
 
 #define FOG_SLICES 64           // VolumetricFog.Slices
 // The air closer to a light than this (m²) takes the light it gets there: a froxel's sample can sit in the flame itself,
@@ -66,6 +75,160 @@ float3 FroxelPosition(float3 cell, out float viewDepth)
     return dir * (viewDepth / max(dot(dir, forward), 0.05));
 }
 
+// ── Volumetric particles (ParticleEmitter.Volumetric): their density, injected per froxel ──
+#define FOG_DENSITY_SCALE 16.0      // the density buffer holds coefficients per km × this, as uints (atomic adds)
+#define FOG_INJECT_MAX_CELLS 16     // froxels a puff may cover each way (a puff right by the camera is cut down)
+
+uint FroxelIndex(uint3 id)
+{
+    return (id.z * GridSize.y + id.y) * GridSize.x + id.x;
+}
+
+// A froxel's volume (m³) at its view depth: its tile's width and height there times its slice's depth
+float FroxelVolume(uint slice, float viewDepth, float2 projScale)
+{
+    float2 size = TileUV * 2.0 * viewDepth / projScale;
+    return size.x * size.y * FogRange * (2.0 * slice + 1.0) / (FOG_SLICES * FOG_SLICES);
+}
+
+// One thread per particle pool slot. A Volumetric particle is a puff of radius r (half its size) with density
+// σ0 (1 − (d/r)²)², whose optical depth through the centre is the −ln(1 − alpha) its sprite hides: σ0 = τ 15 / (16 r),
+// σ0 r³ 32π/105 in all. That total is shared out over the froxels the puff covers by the kernel at their centres and
+// their volumes (so it holds however coarse the froxels are; a puff between froxel centres goes into the one it is in),
+// × FogVolumeShare: past the volume's range the sprites draw it. σs = σe × its albedo (grey), with its ForwardScatter.
+// The pool is the last simulation's (a frame old: it runs in the transparent pass).
+[numthreads(64, 1, 1)]
+void CSFogInject(uint3 dtid : SV_DispatchThreadID)
+{
+    uint slot = dtid.x;
+    if (slot >= ParticleSlots || DensityUAVIdx == 0)
+        return;
+    StructuredBuffer<uint> chunkMap = ResourceDescriptorHeap[ParticleChunkMapIdx];
+    uint row = chunkMap[slot >> PARTICLE_CHUNK_SHIFT];
+    if (row == PARTICLE_NO_EMITTER)
+        return;
+    StructuredBuffer<ParticleEmitter> emitters = ResourceDescriptorHeap[ParticleEmittersIdx];
+    ParticleEmitter e = emitters[row];
+    if ((e.Flags & PARTICLE_FLAG_VOLUME) == 0 || (e.Flags & PARTICLE_FLAG_RESET) != 0)
+        return;
+    StructuredBuffer<ParticleCore> cores = ResourceDescriptorHeap[ParticleCoreIdx];
+    ParticleCore core = cores[slot];
+    if (core.Lifetime <= 0.0 || core.Age >= core.Lifetime)
+        return;
+    StructuredBuffer<ParticleVisual> visuals = ResourceDescriptorHeap[ParticleVisualIdx];
+    ParticleVisual vis = visuals[slot];
+
+    // Colour and size as the sprite would have them (particle_draw.fx)
+    float t = saturate(core.Age / max(core.Lifetime, 0.001));
+    float4 colour = lerp(e.ColorStart, e.ColorEnd, t);
+    colour.rgb *= e.Intensity;
+    if (e.FadeInRate > 0.0)
+        colour *= saturate(t * e.FadeInRate);
+    float alpha = saturate(colour.a);
+    if (alpha <= 1e-3)
+        return;
+    float r = max(0.5 * lerp(e.SizeStartEnd.x, e.SizeStartEnd.y, t) * vis.SizeScale, 0.01);
+
+    float3 rel = core.Position - CamPos;
+    float4 clip = mul(float4(rel, 1.0), CameraRelativeVP);
+    float z = clip.w;
+    float share = FogVolumeShare(z);
+    if (share <= 0.0 || z <= 0.05)
+        return;
+
+    float tau = -log(max(1.0 - alpha, 1e-3));
+    float total = share * tau * r * r * (32.0 * ATM_PI * 15.0 / (105.0 * 16.0));    // m² (σ0 r³ 32π/105)
+    float albedo = saturate(dot(colour.rgb, float3(0.2126, 0.7152, 0.0722)) / alpha);
+
+    // Where its density goes: the kernel never narrower than 1.5 froxels along any of the view's axes (a froxel's width
+    // and height there on screen, its slice's depth along the view), so a puff smaller than that glides from froxel to
+    // froxel as it drifts instead of jumping (small puffs and every puff along the view, where slices are ~1.4 m deep at
+    // 15 m: the plume read as blocky in motion). The total stays its own.
+    float2 projScale = float2(length(float3(CameraRelativeVP._11, CameraRelativeVP._21, CameraRelativeVP._31)),
+                              length(float3(CameraRelativeVP._12, CameraRelativeVP._22, CameraRelativeVP._32)));
+    float3 right = float3(CameraRelativeVP._11, CameraRelativeVP._21, CameraRelativeVP._31) / projScale.x;
+    float3 up = float3(CameraRelativeVP._12, CameraRelativeVP._22, CameraRelativeVP._32) / projScale.y;
+    float3 forward = normalize(float3(CameraRelativeVP._14, CameraRelativeVP._24, CameraRelativeVP._34));
+    float2 cellSize = TileUV * 2.0 * z / projScale;
+    float cellDepth = 2.0 * sqrt(z * FogRange) / FOG_SLICES;
+    // ... and never wider than the froxels a puff may cover (FOG_INJECT_MAX_CELLS): a big old puff by the camera is
+    // drawn smaller and denser (its total stays), round. Cut off at the cap's box instead, it showed as a square block
+    // (user, 2026-10-20, a bonfire's 3 m puffs a few metres away). Along the view it reaches at most half way to the
+    // camera; across, it is held to the cap in froxels as wide as they are at its nearest depth, where it covers the most
+    // of the screen.
+    const float maxCells = FOG_INJECT_MAX_CELLS / 2 - 1;
+    float3 radii;
+    radii.z = min(min(max(r, 1.5 * cellDepth), maxCells * cellDepth), 0.5 * z);
+    float nearShare = (z - radii.z) / z;
+    radii.xy = min(max(float2(r, r), 1.5 * cellSize), maxCells * cellSize * nearShare);
+    float3 invRadii = 1.0 / radii;
+
+    // The froxels round it: on screen its half extent at its nearest depth, in depth its slices. Not clamped to the
+    // grid: a puff at or past the screen's edge is weighed over all of its footprint (cells off the screen have
+    // positions too) and leaves only its on-screen share. Clamped, a puff off the screen fell back whole into the edge
+    // column, a bright band that panning then smeared across the view.
+    float2 uv = clip.xy / z * float2(0.5, -0.5) + 0.5;
+    float2 halfUV = 0.5 * radii.xy * projScale / max(z - radii.z, 0.1);
+    int3 hi = int3(GridSize) - 1;
+    int3 centre = int3(int2(floor(uv / TileUV)), (int)floor(sqrt(saturate(z / FogRange)) * FOG_SLICES));
+    int3 lo3 = int3(int2(floor((uv - halfUV) / TileUV)),
+                    (int)floor(sqrt(saturate(max(z - radii.z, 0.0) / FogRange)) * FOG_SLICES));
+    int3 hi3 = int3(int2(floor((uv + halfUV) / TileUV)), (int)floor(sqrt((z + radii.z) / FogRange) * FOG_SLICES));
+    lo3 = max(lo3, centre - FOG_INJECT_MAX_CELLS / 2);
+    hi3 = min(hi3, centre + FOG_INJECT_MAX_CELLS / 2 - 1);
+    // On the grid: what it may write
+    int3 lo3In = max(lo3, 0), hi3In = min(hi3, hi);
+    if (any(hi3In < lo3In))
+        return;
+
+    float weighted = 0.0;   // Σ kernel × volume, over the whole footprint
+    for (int s = lo3.z; s <= hi3.z; s++)
+        for (int y = lo3.y; y <= hi3.y; y++)
+            for (int x = lo3.x; x <= hi3.x; x++)
+            {
+                float depthThere;
+                float3 d = FroxelPosition(float3(x, y, s) + 0.5, depthThere) - rel;
+                float3 q = float3(dot(d, right), dot(d, up), dot(d, forward)) * invRadii;
+                float u2 = dot(q, q);
+                if (u2 < 1.0)
+                    weighted += (1.0 - u2) * (1.0 - u2) * FroxelVolume((uint)s, depthThere, projScale);
+            }
+
+    RWByteAddressBuffer density = ResourceDescriptorHeap[DensityUAVIdx];
+    // per km × FOG_DENSITY_SCALE
+    float toUnits = 1000.0 * FOG_DENSITY_SCALE;
+    if (weighted <= 0.0)
+    {
+        // Between froxel centres (only when it sits on the grid; off it, nothing of it shows)
+        if (any(centre < 0) || any(centre > hi))
+            return;
+        float depthThere;
+        FroxelPosition(float3(centre) + 0.5, depthThere);
+        float sigma = total / FroxelVolume((uint)centre.z, depthThere, projScale) * toUnits;
+        uint at = FroxelIndex(uint3(centre)) * 12;
+        density.InterlockedAdd(at, (uint)(sigma + 0.5));
+        density.InterlockedAdd(at + 4, (uint)(sigma * albedo + 0.5));
+        density.InterlockedAdd(at + 8, (uint)(sigma * albedo * e.ForwardScatter + 0.5));
+        return;
+    }
+    float perWeight = total / weighted * toUnits;
+    for (int s2 = lo3In.z; s2 <= hi3In.z; s2++)
+        for (int y2 = lo3In.y; y2 <= hi3In.y; y2++)
+            for (int x2 = lo3In.x; x2 <= hi3In.x; x2++)
+            {
+                float depthThere;
+                float3 d = FroxelPosition(float3(x2, y2, s2) + 0.5, depthThere) - rel;
+                float3 q = float3(dot(d, right), dot(d, up), dot(d, forward)) * invRadii;
+                float u2 = dot(q, q);
+                if (u2 >= 1.0)
+                    continue;
+                float sigma = (1.0 - u2) * (1.0 - u2) * perWeight;
+                uint at = FroxelIndex(uint3(x2, y2, s2)) * 12;
+                density.InterlockedAdd(at, (uint)(sigma + 0.5));
+                density.InterlockedAdd(at + 4, (uint)(sigma * albedo + 0.5));
+                density.InterlockedAdd(at + 8, (uint)(sigma * albedo * e.ForwardScatter + 0.5));
+            }
+}
 // The directional light's shadow at a place in the air: the first cascade that holds it, one bilinear comparison
 // (the jitter and the history do the filtering). 1 outside every cascade and without shadow maps.
 float CascadeShadow(float3 worldPos, float viewDepth)
@@ -115,7 +278,51 @@ float FogMeshSkyVisibility(AtmosphereParams A, float3 worldPos)
 // its beam where the shadows let it through, with the Rayleigh and Mie phases, and what it diffuses, scattered evenly
 // from the whole cloud base where the sky is seen; and the multiple scattering (the sky's light, in effect, dimmed under
 // a deck to the light the cloud base gives: CloudAirLight .z) there too
-float3 FroxelBodyLight(AtmosphereParams A, AtmMedium medium, bool moon, float3 posKm, float3 worldPos,
+// Volumetric particles in a froxel (CSFogInject): their scattering per km and its Henyey-Greenstein g. medium already
+// holds their scattering and extinction (CSFogScatter adds them); their single scattering takes their own phase.
+struct FroxelSmoke
+{
+    float Scattering;
+    float G;
+    float ShadowOffset;     // where this froxel's smoke shadow samples start, 0..1 of a step (changes every frame)
+};
+
+float SmokePhase(float g, float cosTheta)
+{
+    float d = 1.0 + g * g - 2.0 * g * cosTheta;
+    return (1.0 - g * g) / (4.0 * ATM_PI * d * sqrt(d));
+}
+
+// The smoke's own shadow: the light reaching smoke has come through the smoke between it and the light. A fire lights
+// the underside of its column; the column above stands in the shadow of the smoke below it, and by day the side away from
+// the sun is darker. Transmittance along ray (from a camera-relative place toward a light, as far as the ray is long):
+// SMOKE_SHADOW_STEPS point samples of the injected density, from an offset that changes per froxel and per frame (the
+// history averages them). Only smoke in the grid shadows: a column's part off the screen casts none.
+#define SMOKE_SHADOW_STEPS 8
+#define SMOKE_SHADOW_RANGE 8.0      // metres looked through toward a light: a tall column's height
+
+float SmokeShadow(FroxelSmoke smoke, float3 relPos, float3 ray)
+{
+    if (smoke.Scattering <= 0.0)
+        return 1.0;
+    RWByteAddressBuffer density = ResourceDescriptorHeap[DensityUAVIdx];
+    float3 stepRay = ray * (1.0 / SMOKE_SHADOW_STEPS);
+    float sigmaSum = 0;
+    [loop] for (uint i = 0; i < SMOKE_SHADOW_STEPS; i++)
+    {
+        float4 clip = mul(float4(relPos + stepRay * (i + smoke.ShadowOffset), 1.0), CameraRelativeVP);
+        if (clip.w <= 1e-3)
+            continue;
+        float3 cell = float3((clip.xy / clip.w * float2(0.5, -0.5) + 0.5) / TileUV, sqrt(clip.w / FogRange) * FOG_SLICES);
+        if (any(cell < 0.0) || any(cell >= float3(GridSize)))
+            continue;
+        sigmaSum += density.Load(FroxelIndex(uint3(cell)) * 12);
+    }
+    // per km × FOG_DENSITY_SCALE, over steps of length(stepRay) metres
+    return exp(-sigmaSum * (length(stepRay) * 0.001 / FOG_DENSITY_SCALE));
+}
+
+float3 FroxelBodyLight(AtmosphereParams A, AtmMedium medium, FroxelSmoke smoke, bool moon, float3 posKm, float3 worldPos,
                        float3 relPos, float3 V, float viewDepth, float3 lightDir, float open, float sky, float skyDimming)
 {
     float3 toLight = AtmTransmittanceToLight(A, posKm, lightDir);
@@ -127,10 +334,13 @@ float3 FroxelBodyLight(AtmosphereParams A, AtmMedium medium, bool moon, float3 p
         if (dot(lightDir, ShadowLightDir) > 0.999)
             visible *= CascadeShadow(worldPos, viewDepth);
         visible *= AtmTerrainLightVisibility(A, worldPos, moon);
+        if (visible > 0.0)
+            visible *= SmokeShadow(smoke, relPos, lightDir * SMOKE_SHADOW_RANGE);
     }
     float cosTheta = dot(V, lightDir);
     float lightZenithCos = dot(normalize(posKm), lightDir);
-    float3 single = medium.scatteringMie * AtmMiePhase(A.MieG, cosTheta) + medium.scatteringRay * AtmRayleighPhase(cosTheta);
+    float3 single = medium.scatteringMie * AtmMiePhase(A.MieG, cosTheta) + medium.scatteringRay * AtmRayleighPhase(cosTheta)
+                  + smoke.Scattering * SmokePhase(smoke.G, cosTheta);
     float3 diffused = medium.scattering * diffusedTint * (CloudDiffusedLight(cloud.y, lightZenithCos) * sky);
     float3 multiple = AtmMultipleScattering(A, posKm, lightZenithCos) * (medium.scattering * cloud.z);
     return toLight * (visible * single + diffused) + multiple * sky;
@@ -139,7 +349,8 @@ float3 FroxelBodyLight(AtmosphereParams A, AtmMedium medium, bool moon, float3 p
 // The point lights' light scattered toward the camera per km of air (lux × σs × phase, as a body's single scattering):
 // the lights that reach the place (light_clusters.hlsli), each through its shadow where it has one this frame. A light
 // without a shadow lights the air through walls; the halo of a lamp in a room shows outside only as far as its range.
-float3 FroxelPointLights(AtmosphereParams A, AtmMedium medium, float3 relPos, float3 V, float2 uv, float viewDepth)
+float3 FroxelPointLights(AtmosphereParams A, AtmMedium medium, FroxelSmoke smoke, float3 relPos, float3 V, float2 uv,
+                         float viewDepth)
 {
     if (LightClustersIdx == 0 || ClusterLightsIdx == 0)
         return 0;
@@ -161,8 +372,11 @@ float3 FroxelPointLights(AtmosphereParams A, AtmMedium medium, float3 relPos, fl
         float shadow = PointLightShadowAt(clusters, light, relPos, FogShadowSampler);
         if (shadow <= 0.0)
             continue;
-        float cosTheta = dot(V, toLight) * rsqrt(max(dot(toLight, toLight), 1e-6));
-        float3 phase = medium.scatteringMie * AtmMiePhase(A.MieG, cosTheta) + medium.scatteringRay * AtmRayleighPhase(cosTheta);
+        float d2 = dot(toLight, toLight);
+        shadow *= SmokeShadow(smoke, relPos, toLight * min(1.0, SMOKE_SHADOW_RANGE * rsqrt(max(d2, 1e-6))));
+        float cosTheta = dot(V, toLight) * rsqrt(max(d2, 1e-6));
+        float3 phase = medium.scatteringMie * AtmMiePhase(A.MieG, cosTheta) + medium.scatteringRay * AtmRayleighPhase(cosTheta)
+                     + smoke.Scattering * SmokePhase(smoke.G, cosTheta);
         sum += E * (shadow * phase);
     }
     return sum;
@@ -191,6 +405,20 @@ void CSFogScatter(uint3 id : SV_DispatchThreadID)
     posKm.y = max(posKm.y, A.BottomRadius + 0.001);
     AtmMedium medium = SampleAtmMedium(posKm, A);
 
+    // Volumetric particles (smoke) injected into this froxel: grey, with their own phase
+    FroxelSmoke smoke = (FroxelSmoke)0;
+    if (DensityUAVIdx != 0)
+    {
+        RWByteAddressBuffer density = ResourceDescriptorHeap[DensityUAVIdx];
+        uint3 d = density.Load3(FroxelIndex(id) * 12);
+        float sigmaE = d.x * (1.0 / FOG_DENSITY_SCALE);
+        smoke.Scattering = d.y * (1.0 / FOG_DENSITY_SCALE);
+        smoke.G = smoke.Scattering > 0.0 ? d.z * (1.0 / FOG_DENSITY_SCALE) / smoke.Scattering : 0.0;
+        smoke.ShadowOffset = frac(InterleavedGradientNoise(float2(id.xy) + float2(5.588238 * id.z, 0)) + Jitter.z);
+        medium.scattering += smoke.Scattering;
+        medium.extinction += sigmaE;
+    }
+
     // Under the terrain (in a cave, inside a hill) neither the sun nor the sky; past the meshes (walls, roofs, crowns)
     // only the share of the sky that they leave, never less than the light bouncing in (SkyCaptureBounce)
     TerrainCover terrain = LoadTerrainCover();
@@ -198,12 +426,12 @@ void CSFogScatter(uint3 id : SV_DispatchThreadID)
     float sky = open > 0.0 ? open * max(FogMeshSkyVisibility(A, worldPos), A.SkyCaptureBounce) : 0.0;
 
     float skyDimming = CloudSkyDimming(CloudDeck());      // Ψ_ms under the clouds round the camera
-    float3 L = A.SunIlluminance * FroxelBodyLight(A, medium, false, posKm, worldPos, relPos, V, viewDepth,
+    float3 L = A.SunIlluminance * FroxelBodyLight(A, medium, smoke, false, posKm, worldPos, relPos, V, viewDepth,
                                                   A.SunDirection, open, sky, skyDimming);
     if (any(A.MoonIlluminance > 0))
-        L += A.MoonIlluminance * FroxelBodyLight(A, medium, true, posKm, worldPos, relPos, V, viewDepth,
+        L += A.MoonIlluminance * FroxelBodyLight(A, medium, smoke, true, posKm, worldPos, relPos, V, viewDepth,
                                                  A.MoonDirection, open, sky, skyDimming);
-    L += FroxelPointLights(A, medium, relPos, V, (float2(id.xy) + Jitter.xy) * TileUV, viewDepth);
+    L += FroxelPointLights(A, medium, smoke, relPos, V, (float2(id.xy) + Jitter.xy) * TileUV, viewDepth);
     // Within half floats: dense fog right by a big fire would pass 65504 and turn the history to inf
     float4 current = float4(min(L * Exposure, 6e4), dot(medium.extinction, 1.0 / 3.0));
 

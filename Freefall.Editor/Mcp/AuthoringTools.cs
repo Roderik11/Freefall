@@ -143,6 +143,18 @@ namespace Freefall.Editor.Mcp
             return err ?? await McpBridge.Post($"/api/entity/{rid}/applytoprefab", new { });
         }
 
+        [McpServerTool(Name = "prefab_create", Title = "Create prefab from entity", OpenWorld = false)]
+        [Description("Save an entity and everything under it as a new prefab asset (the root's transform reset), like dragging it into " +
+                     "the Asset Browser. 'path' is relative to Assets, e.g. 'Effects/Brazier Fire.prefab' (default: the Assets root, " +
+                     "named after the entity); an existing file is never overwritten (a numeric suffix is added). The entity is left as it " +
+                     "is: delete it if it was only built to make the prefab. Returns the new guid.")]
+        public static async Task<CallToolResult> CreatePrefab(int? id = null, [Description(EntityRefs.UidHelp)] string? uid = null,
+            [Description("Asset path relative to Assets, e.g. 'Effects/Brazier Fire.prefab'")] string? path = null)
+        {
+            var (rid, err) = await EntityRefs.Resolve(id, uid);
+            return err ?? await McpBridge.Post($"/api/entity/{rid}/createprefab", new { path });
+        }
+
         [McpServerTool(Name = "prefab_measure", Title = "Measure prefabs", ReadOnly = true, OpenWorld = false)]
         [Description("Bounds (min/max/size, relative to the prefab pivot at the origin) of one or more prefabs without placing them in the scene. " +
                      "Use before choosing scale ranges for PCG spawners or placing modular pieces; empty=true means the prefab renders nothing.")]

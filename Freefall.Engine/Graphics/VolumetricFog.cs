@@ -3,6 +3,7 @@ using System.Numerics;
 using System.Runtime.InteropServices;
 using Vortice.Direct3D12;
 using Vortice.DXGI;
+using Freefall.Base;
 using Freefall.Components;
 
 namespace Freefall.Graphics
@@ -29,7 +30,10 @@ namespace Freefall.Graphics
         private struct UInt3 { public uint X, Y, Z; }
 
         private readonly ComputeShader _cs;
-        private readonly int _kScatter, _kIntegrate;
+        private readonly int _kInject, _kScatter, _kIntegrate;
+        // Volumetric particles' density per froxel (σe, σs, σs·g as uints, CSFogInject); cleared and filled each frame
+        private GraphicsBuffer? _density;
+        private ParticleSystem? _particles;
         private readonly RenderTexture3D?[] _scatter = new RenderTexture3D?[2];
         private readonly ResourceStates[] _scatterState = new ResourceStates[2];
         private RenderTexture3D? _integrated;
@@ -50,6 +54,7 @@ namespace Freefall.Graphics
         public VolumetricFog()
         {
             _cs = new ComputeShader("volumetric_fog_cs.hlsl");
+            _kInject = _cs.FindKernel("CSFogInject");
             _kScatter = _cs.FindKernel("CSFogScatter");
             _kIntegrate = _cs.FindKernel("CSFogIntegrate");
         }
@@ -74,6 +79,7 @@ namespace Freefall.Graphics
                 }
                 _integrated = new RenderTexture3D(device, gw, gh, Slices, Format.R16G16B16A16_Float);
                 _integratedState = ResourceStates.Common;
+                _density = GraphicsBuffer.CreateRaw(gw * gh * Slices * 3, uav: true, clearable: true);
                 _gridW = gw;
                 _gridH = gh;
                 _historyValid = false;
@@ -132,6 +138,26 @@ namespace Freefall.Graphics
 
             uint gx = (uint)(_gridW + 7) / 8, gy = (uint)(_gridH + 7) / 8;
 
+            // Volumetric particles (smoke) into the froxels they cover, from the pool the last simulation left
+            _particles ??= Systems.Get<ParticleSystem>();
+            uint densityUav = 0;
+            if (_density != null && _particles != null
+                && _particles.VolumeSources(list, out uint core, out uint visual, out uint emitters, out uint chunkMap, out uint slots))
+            {
+                _density.ClearUAV(list, new Vortice.Mathematics.Int4(0, 0, 0, 0));
+                _density.UAVBarrier(list);
+                _cs.SetPushConstant("DensityUAV", _density.UavIndex);
+                _cs.SetPushConstant("ParticleCore", core);
+                _cs.SetPushConstant("ParticleVisual", visual);
+                _cs.SetPushConstant("ParticleEmitters", emitters);
+                _cs.SetPushConstant("ParticleChunkMap", chunkMap);
+                _cs.SetPushConstant("ParticleSlots", slots);
+                _cs.Dispatch(_kInject, list, (slots + 63) / 64);
+                _density.UAVBarrier(list);
+                densityUav = _density.UavIndex;
+            }
+            _cs.SetPushConstant("DensityUAV", densityUav);
+
             // Light the froxels
             Transition(list, current, ref _scatterState[cur], ResourceStates.UnorderedAccess);
             if (useHistory)
@@ -187,6 +213,9 @@ namespace Freefall.Graphics
             }
             _integrated?.Dispose();
             _integrated = null;
+            if (_density != null)
+                Engine.Device.DeferDispose(_density);
+            _density = null;
         }
 
         public void Dispose()

@@ -65,5 +65,6 @@ struct ParticleEmitter     // 368 bytes
 #define PARTICLE_FLAG_FLIPBOOK_BLEND   4   // cross-fade from frame to frame
 #define PARTICLE_FLAG_LIT              8   // Forward mode: the colour is an albedo lit by the sky and the sun (smoke, rain); else a luminance in nits
 #define PARTICLE_FLAG_SURF_MIST       16   // shape Surf: mist over the surf's broken water, else spray off its breaking lips
+#define PARTICLE_FLAG_VOLUME          32   // Lit + Volumetric: density in the near fog volume inside its range, sprites past it
 
 #endif
