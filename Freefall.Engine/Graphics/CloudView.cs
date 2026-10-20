@@ -164,6 +164,8 @@ namespace Freefall.Graphics
                 cs.SetPushConstant(_kReconstruct, "SparseTex", _sparse.Texture.BindlessIndex);
                 cs.SetPushConstant(_kReconstruct, "SparseDepthTex", _sparseDepth.Texture.BindlessIndex);
                 cs.SetPushConstant(_kReconstruct, "HistoryTex", _color[prev]!.Texture.BindlessIndex);
+                Transition(list, _depth[prev]!, ShaderRead);
+                cs.SetPushConstant(_kReconstruct, "HistoryDepthTex", _depth[prev]!.Texture.BindlessIndex);
                 // Last frame's scene depth: the history is dropped where the surface there was another (a silhouette moved)
                 Transition(list, _sceneDepth[prev]!, ShaderRead);
                 cs.SetPushConstant(_kReconstruct, "SceneDepthTex", sceneIdx);

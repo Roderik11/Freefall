@@ -46,6 +46,7 @@ cbuffer PushConstants : register(b3)
     uint SceneDepthTexIdx;      // march, reconstruct: this frame's half-size scene depth (CSCloudSceneDepth; 0 = none);
                                 // scene depth: the G-buffer's linear depth (SourceTexIdx's role there)
     uint PrevSceneDepthTexIdx;  // reconstruct: last frame's (0 = none)
+    uint HistoryDepthTexIdx;    // reconstruct: last frame's clouds' depth (km; 0 = none)
 };
 
 // The view's reprojection (CloudView: its own ComputeShader, so two views in a frame do not share these)
@@ -89,7 +90,10 @@ float CloudBaseRough(CloudParams C)
 float CloudCoverageAt(CloudParams C, Texture3D<float4> lut, float2 xz)
 {
     float n = lut.SampleLevel(CloudWrap, float3(xz / CLOUD_COVER_TILE, C.Evolution / 4000.0), 0).r;
-    return saturate(C.Coverage + (n - 0.5) * (0.4 + 0.6 * CloudBaseRough(C)));
+    // A second octave at ~13 km (P/19): fields of cloud and clear patches between them, so the base shape's tile does
+    // not decide alone where the clouds stand
+    float n2 = lut.SampleLevel(CloudWrap, float3(xz / (CLOUD_PERIOD / 19.0), 0.47 + C.Evolution / 3000.0), 0).r;
+    return saturate(C.Coverage + (n - 0.5) * (0.4 + 0.6 * CloudBaseRough(C)) + (n2 - 0.5) * 0.35);
 }
 
 // How deep a place lies in one tower's envelope (0 outside, 1 on its axis): a column from the base to its top, leaning
@@ -174,6 +178,51 @@ float2 CloudTowers(CloudParams C, float2 xz, float h, float turret, float lobe, 
     return env;
 }
 
+// Fair-weather cumulus placed as clouds: a jittered grid of 3.2 km cells (P/80), each holding one cloud at a time with
+// its own place and size, which grows, stands and dissolves over CLOUD_CU_LIFE of the evolution (~30 min at speed 0.5)
+// before the next starts elsewhere in the cell. The coverage (presence, 0..1) decides how many stand at a time, so less
+// of it gives fewer clouds instead of smaller puffs: a threshold on the shape noise alone left only its peaks (user,
+// 2026-10-20). The shape noise carves each one (CloudFieldAt). x 0..1: how deep a place lies in the nearest cloud; y that
+// cloud's base above the layer's (m), each its own, ±120 m (every base at one height read as cut off, user). A base
+// curling up toward the rim made a step: the core hung below as a second, narrower pancake.
+#define CLOUD_CU_CELL (CLOUD_PERIOD / 80.0)
+#define CLOUD_CU_LIFE 900.0
+float2 CloudCumulusCells(CloudParams C, float2 xz, float presence, float wobble)
+{
+    const int n = 80;
+    int2 home = (int2)floor(xz / CLOUD_CU_CELL);
+    float v = 0.0, baseShift = 0.0;
+    [unroll] for (int j = -1; j <= 1; j++)
+    {
+        [unroll] for (int i = -1; i <= 1; i++)
+        {
+            int2 c = home + int2(i, j);
+            float2 id = float2(((c % n) + n) % n);
+            float t = C.Evolution / CLOUD_CU_LIFE + MacroHash(id + 0.37);
+            float2 seed = id + floor(t) * float2(0.1713, 0.3171);       // this cell's cloud of the moment
+            if (MacroHash(seed + 5.3) >= presence)
+                continue;
+            // A young or dissolving cloud is a smaller whole cloud, not a fainter one, and each has a full core with a
+            // narrow edge: where the field is faint only the shape noise's peaks cross it, which made the many small
+            // puffs that flickered in the history (user, 2026-10-20)
+            float life = frac(t);
+            float grow = smoothstep(0.0, 0.25, life) * smoothstep(1.0, 0.7, life);
+            float2 p = (float2(c) + 0.2 + 0.6 * float2(MacroHash(seed + 1.1), MacroHash(seed + 2.7))) * CLOUD_CU_CELL;
+            float radius = (0.3 + 0.3 * MacroHash(seed + 4.9)) * CLOUD_CU_CELL * (0.55 + 0.45 * grow);
+            // Its outline pushed in and out by the turrets and lobes (wobble): with a narrow edge alone they were discs.
+            // Out by at most 1 / 0.65 of the radius (≤ 2.9 km), inside the 3 × 3 cells that see it (a cloud two cells
+            // off is ≥ 3.8 km away): pushed further, it was cut off flat at a cell's border (brick-sided clouds, user)
+            float here = saturate(grow * 4.0) * smoothstep(1.0, 0.65, length(xz - p) / radius * (1.0 - clamp(wobble, -0.5, 0.35)));
+            if (here > v)
+            {
+                v = here;
+                baseShift = (MacroHash(seed + 6.1) - 0.5) * 240.0;
+            }
+        }
+    }
+    return float2(v, baseShift);
+}
+
 // The cloud field at a cloud-space place: density 0..1 (before CloudDensity) and the profile, after Nubis: the base
 // shape (Perlin-Worley eroded by Worley FBM) against the envelope (the layer's coverage × its height profile, or a
 // tower's), the detail left to the march
@@ -182,14 +231,41 @@ float2 CloudFieldAt(CloudParams C, float2 xz, float h)
     Texture3D<float4> lut = ResourceDescriptorHeap[C.NoiseLut];
     float3 slide = float3(0.7, 0.3, 0.4) * (C.Evolution * 3.0);         // the noise slides through the shapes
     float4 n = lut.SampleLevel(CloudWrap, (float3(xz.x, h, xz.y) + slide) / CLOUD_BASE_TILE, 0);
+    // Fair weather: a finer octave (P/72, ~3.6 km) over the base shape, its place pushed about by a smooth noise of a
+    // tile that shares no factor with either (P/11, ~23 km). The 6.4 km shape alone stood the same pair of clouds in
+    // every 6.4 km square (a lattice across the sky) and made slabs several km wide. A storm's deck and the towers keep
+    // the 6.4 km shape (rough decks, the towers' lobes).
+    float rough = CloudBaseRough(C);
+    float4 shapeNoise = n;
+    if (rough < 1.0)
+    {
+        float2 warp = float2(lut.SampleLevel(CloudWrap, float3(xz / (CLOUD_PERIOD / 11.0), 0.61), 0).r,
+                             lut.SampleLevel(CloudWrap, float3(xz / (CLOUD_PERIOD / 11.0), 0.13), 0).r) - 0.5;
+        float2 fineXZ = xz + warp * 3000.0;
+        float4 fine = lut.SampleLevel(CloudWrap, (float3(fineXZ.x, h, fineXZ.y) + slide) / (CLOUD_PERIOD / 72.0), 0);
+        shapeNoise = lerp(0.6 * fine + 0.4 * n, n, rough);
+    }
 
     float cover = CloudCoverageAt(C, lut, xz);
     // A rough base dips by up to CLOUD_BASE_DIP in broad swells (~5 km), the Perlin FBM sliding with the clouds
     float dip = CLOUD_BASE_DIP * CloudBaseRough(C)
               * saturate((lut.SampleLevel(CloudWrap, float3(xz.x + slide.x, 0.37, xz.y + slide.z) / (CLOUD_PERIOD / 50.0), 0).r - 0.35) / 0.3);
-    float layer = cover * CloudLayerProfile((h - (C.Base - dip)) / max(C.Thickness + dip, 1.0), C.Type);
     // Turrets: the Perlin-Worley at a 2.1 km tile (CLOUD_PERIOD / 120), for the towers' bulges
     float turret = lut.SampleLevel(CloudWrap, (float3(xz.x, h, xz.y) + slide) / (CLOUD_PERIOD / 120.0), 0).a - 0.4;
+    // Broken fair-weather layers are single clouds (CloudCumulusCells), decks and storms the coverage itself
+    float deck = max(smoothstep(0.55, 0.9, C.Coverage), rough);
+    float placed = cover, baseShift = 0.0;
+    if (deck < 1.0)
+    {
+        float2 cells = CloudCumulusCells(C, xz, cover, 0.9 * turret + 0.6 * (shapeNoise.a - 0.5));
+        placed = lerp(cells.x, cover, deck);
+        baseShift = cells.y * (1.0 - deck);
+    }
+    float bottom = C.Base + baseShift - dip;
+    float layer = placed * CloudLayerProfile((h - bottom) / max(C.Thickness + dip - baseShift, 1.0), C.Type);
+    // A fair-weather cloud's base fades in over ~350 m, so the shape noise lowers its underside in broad lumps instead of
+    // one dead-flat plane (user)
+    layer *= lerp(smoothstep(0.0, 350.0, h - bottom), 1.0, deck);
     // Mammatus pouches: the Worley FBM's blobs (high at the cells' centres) at a ~1.4 km tile, flat in height
     // (a mip down: the Worley cells' creases blurred, so each pouch is a smooth dome)
     float pouch = saturate((lut.SampleLevel(CloudWrap, float3(xz.x + slide.x, 0.0, xz.y + slide.z) / (CLOUD_PERIOD / 180.0), 1.5).g - 0.5) / 0.35);
@@ -198,8 +274,8 @@ float2 CloudFieldAt(CloudParams C, float2 xz, float h)
     if (env <= 0.002)
         return 0;
 
-    float fbm = n.g * 0.75 + n.b * 0.25;
-    float shape = saturate(CloudRemap(n.a, fbm - 1.0, 1.0, 0.0, 1.0));
+    float fbm = shapeNoise.g * 0.75 + shapeNoise.b * 0.25;
+    float shape = saturate(CloudRemap(shapeNoise.a, fbm - 1.0, 1.0, 0.0, 1.0));
     // The LUT's shape sits in a narrow band (~0.45-0.8): spread over 0..1, so coverage thins the clouds gradually
     shape = saturate(CloudRemap(shape, 0.42, 0.82, 0.0, 1.0));
     // An anvil is a sheet, smooth underneath (where mammatus hang): the shape may not hole it (it came out like lace)
@@ -304,7 +380,10 @@ void CSCloudLightStep(uint3 id : SV_DispatchThreadID)
     Texture3D<float> source = ResourceDescriptorHeap[SourceTexIdx];
     float tau = source.Load(int4(id, 0));
     float3 q = CloudAlongLight(C, CloudLightTexelPos(C, L, id), asfloat(LightStepBits));
-    if (CloudInLevelBox(C, BakeLevel, L, q))
+    // The coarsest level wraps the whole period: a path no longer than half of it (128 km), or a low sun's path along
+    // the slab went round the torus and met the same storms again toward the light (tower tops dark at sunset)
+    bool inReach = BakeLevel < CLOUD_LEVELS - 1 || asfloat(LightStepBits) <= CLOUD_PERIOD * 0.25;
+    if (inReach && CloudInLevelBox(C, BakeLevel, L, q))
         tau += source.SampleLevel(CloudWrap, CloudLevelUvw(C, L, q.xz, q.y), 0);
     RWTexture3D<float> target = ResourceDescriptorHeap[TargetUAVIdx];
     target[id] = tau;
@@ -431,10 +510,14 @@ float CloudErode(CloudParams C, Texture3D<float4> lut, float2 field, float2 xz, 
     if (near > 0.0)
         detail = lerp(detail, detail * 0.65 + 0.35 * lut.SampleLevel(CloudWrap, q / (CLOUD_DETAIL_TILE * 0.37), 0).b, near);
     detail = saturate((detail - 0.3) / 0.45);           // the Worley FBM sits in a narrow band: spread it
-    float hf = saturate((h - C.Base) / max(C.TowerTop - C.Base, C.Thickness));
-    // A storm's base is billowy too, rolls and lumps hanging down (ref 2), not the wisps under fair-weather cumulus
-    float erode = lerp(lerp(detail, 1.0 - detail, CloudBaseRough(C)), 1.0 - detail, saturate(hf * 5.0));
-    return CloudFieldDensity(field.x - (erode - 0.35) * CLOUD_BILLOW * strength);
+    // Billows (the inverted Worley: round puffs) on heaped clouds all the way down, a storm's base too (rolls and lumps
+    // hanging down, ref 2); wisps only along the base of a stratus-like layer (~300 m). On cumulus the wisps' band near the
+    // base carved where the billows above filled out: a waist ~100 m up, every cloud two stacked pancakes (user).
+    float billowy = max(CloudBaseRough(C), saturate(C.Type * 2.0 - 1.0));
+    float erode = lerp(lerp(detail, 1.0 - detail, billowy), 1.0 - detail, saturate((h - C.Base) / 300.0));
+    // Fair-weather cumulus sharper than the volumes' ramp (CLOUD_RAMP, ~150 m): their edges are where the billows are.
+    // A storm's deck keeps the soft ramp (sharp, its base read as popcorn)
+    return saturate((field.x - (erode - 0.35) * CLOUD_BILLOW * strength - 0.5) / (CLOUD_RAMP * lerp(0.6, 1.0, CloudBaseRough(C))));
 }
 
 // Optical depth toward the light from a place: three short steps through the detail (the billows, ~400 m, shade each
@@ -447,18 +530,23 @@ float CloudLightDepth(CloudParams C, Texture3D<float4> lut, float3 rel, float3 l
     float3 far = rel;
     if (shortSteps)
     {
+        // Out past a texel and a half of the light volume where it is coarse (far away its texels are 1-2 km): read
+        // within the cloud's own body, its layers (~400 m there) striped the faces a low sun lights
+        float blendHere;
+        uint levelHere = CloudLevelAt(C, max(abs(rel.x), abs(rel.z)), blendHere);
+        float reach = max(CLOUD_SHORT_LIGHT, 3.0 * C.Levels[levelHere].VoxelSize) / CLOUD_SHORT_LIGHT;
         const float at[3] = { 40.0, 160.0, 400.0 };
         const float len[3] = { 80.0, 160.0, 320.0 };
         [unroll] for (int i = 0; i < 3; i++)
         {
-            float3 p = rel + lightDir * (at[i] * (0.8 + 0.4 * jitter));
+            float3 p = rel + lightDir * (at[i] * reach * (0.8 + 0.4 * jitter));
             float h = CloudHeight(p);
             float2 xz = C.CameraCloud + p.xz;
             float dist = max(abs(p.x), abs(p.z));
-            tau += CloudErode(C, lut, CloudSample(C, xz, h, dist, CloudWrap), xz, h, dist) * len[i];
+            tau += CloudErode(C, lut, CloudSample(C, xz, h, dist, CloudWrap), xz, h, dist) * len[i] * reach;
         }
         tau *= C.Density;
-        far = rel + lightDir * CLOUD_SHORT_LIGHT;
+        far = rel + lightDir * (CLOUD_SHORT_LIGHT * reach);
     }
     float hf = CloudHeight(far);
     float distFar = max(abs(far.x), abs(far.z));
@@ -520,7 +608,6 @@ CloudMarchResult CloudMarchClouds(CloudParams C, AtmosphereParams A, Texture3D<f
     float3 lightDir = C.LightDir;
     float3 lightE = C.LightIsMoon != 0 ? A.MoonIlluminance : A.SunIlluminance;
     float cosTheta = dot(dir, lightDir);
-    float diffuseEntry = saturate(lightDir.y) / ATM_PI;     // the diffused light's radiance per unit of E (below)
     float phase[3];
     [unroll] for (int o = 0; o < 3; o++)
         phase[o] = CloudPhase(cosTheta, pow(0.5, o));
@@ -590,8 +677,27 @@ CloudMarchResult CloudMarchClouds(CloudParams C, AtmosphereParams A, Texture3D<f
             // diffuse light: radiance CloudThrough × E sin / π. The ground, the air and the meter take the same share
             // (CloudTransmission), so the base the sky probe sees lights the surfaces with what the ground's light says
             // comes through. (Until stage 4: 1 / (4π), a base ~3× too dark at noon against that.)
-            float3 scattered = toLight * (beam * CloudInScatter(C, density, hp, cosTheta))
-                             + toLightDiffused * (CloudThrough(tau) * diffuseEntry);
+            // A deck is a slab: the diffused light fills it and passes CloudThrough down through its base (a storm's deck
+            // without it inside went the sky's blue), of the flux through its top, E sin(elevation). Broken cumulus
+            // (coverage under ~0.55; decks over ~0.9, between them a blend) are lit by it where it leaves them, as the eye
+            // looks along the light: toward it (a base seen from below at noon, a cloud against the low sun) the light
+            // passing through, out of the underside (near it, with little cloud below; 40 % of the slab's share, a lone
+            // cumulus loses much of it through its sides: grey bases under bright edges); away from it (tops from above,
+            // the sunlit side of a cloud at sunset) what the cloud reflects, 1 − CloudThrough of the column, most where
+            // the light gets in (creases keep their relief), of the full flux into the faces toward the light (a deck's
+            // sin(elevation) left the sides a low sun lights grey, not gold).
+            // Everywhere at full strength it lay over the beam's relief as an even white: the sunlit faces took a
+            // Lambertian white on top of the beam, the shaded flanks most of it, and fair-weather cumulus came out flat.
+            // The light passing through takes the air's colour where it entered above (toLightDiffused); the reflected
+            // light entered at the face, as reddened as the sample's own (from higher up, a low sun's gold came out
+            // white).
+            float seeThrough = saturate(0.5 + 1.5 * cosTheta);
+            float deck = smoothstep(0.55, 0.9, C.Coverage);
+            float passing = lerp(seeThrough * 0.4 * CloudThrough(tau) * exp(-0.2 * skyTau.y), CloudThrough(tau), deck)
+                          * saturate(lightDir.y);
+            float reflected = (1.0 - deck) * (1.0 - seeThrough) * (1.0 - CloudThrough(tau + skyTau.y)) * exp(-0.1 * tau);
+            float3 scattered = toLight * (beam * CloudInScatter(C, density, hp, cosTheta) + reflected / ATM_PI)
+                             + toLightDiffused * (passing / ATM_PI);
 
             // The sky above and the lit ground below, as much of each as the cloud over and under this place leaves
             // (diffuse light gets deeper than a beam): bright tops, dark cores, the ground's warm light on the bases.
@@ -604,7 +710,9 @@ CloudMarchResult CloudMarchClouds(CloudParams C, AtmosphereParams A, Texture3D<f
             // Two columns: ~1 km toward the eye, and ~8 km out, level: under an anvil the near one is covered while the
             // face still sees the bright low sky past the anvil's edge (faces under anvils came out black); a deck
             // covers both
-            float faceSky = saturate(0.5 - 0.5 * dir.y) * faceOpen;
+            // A base faces down whatever way it is seen: near the base no sky (it lit fair-weather cumulus bases seen
+            // 20° up with a third of the sky, and they came out as white as their sunlit sides)
+            float faceSky = saturate(0.5 - 0.5 * dir.y) * faceOpen * saturate((hp - C.Base) / 400.0);
             float farOpen = 0.0;            // the far column's openness: the ground out there is sunlit too
             if (faceOpen > 0.01)
             {
@@ -893,7 +1001,10 @@ void CSCloudMarch(uint3 id : SV_DispatchThreadID)
 // The scene's view depth a half-size texel is marched to (TargetUAV, R32F, m; 0 = the sky) from the G-buffer's linear
 // depth (SourceTexIdx): its 2×2 pixels' nearest surface in one texel, their farthest (the sky if any is sky) in the next,
 // a checkerboard, so along a summit's silhouette there are clouds marched on both sides of it to choose from when a
-// pixel is upsampled (Frostbite, UE5)
+// pixel is upsampled (Frostbite, UE5). The farthest looks a pixel past its block for the sky: a sky pixel reads its own
+// texel and one neighbour across and one down (CloudsAt), and the neighbours of a "nearest" texel are "farthest" ones, so
+// every sky pixel has the sky's clouds among its four. Without that the sky through a gap in a crown, whose four texels
+// were all marched to the leaves, came out cloudless: bright specks in the trees, the sun's disc through them.
 [numthreads(8, 8, 1)]
 void CSCloudSceneDepth(uint3 id : SV_DispatchThreadID)
 {
@@ -902,23 +1013,27 @@ void CSCloudSceneDepth(uint3 id : SV_DispatchThreadID)
     Texture2D<float> depth = ResourceDescriptorHeap[SourceTexIdx];
     uint width, height;
     depth.GetDimensions(width, height);
+    bool takeFar = ((id.x + id.y) & 1) != 0;
     float nearest = 1e30, farthest = 0.0;
     bool sky = false;
-    [unroll] for (uint j = 0; j < 2; j++)
+    [unroll] for (int j = -1; j <= 2; j++)
     {
-        [unroll] for (uint i = 0; i < 2; i++)
+        [unroll] for (int i = -1; i <= 2; i++)
         {
-            float d = depth.Load(int3(min(id.xy * 2 + uint2(i, j), uint2(width, height) - 1), 0));
+            bool inBlock = i >= 0 && i <= 1 && j >= 0 && j <= 1;
+            if (!inBlock && !takeFar)
+                continue;
+            int2 p = clamp(int2(id.xy) * 2 + int2(i, j), int2(0, 0), int2(width, height) - 1);
+            float d = depth.Load(int3(p, 0));
             if (d <= 0.0)
                 sky = true;
-            else
+            else if (inBlock)
             {
                 nearest = min(nearest, d);
                 farthest = max(farthest, d);
             }
         }
     }
-    bool takeFar = ((id.x + id.y) & 1) != 0;
     RWTexture2D<float> target = ResourceDescriptorHeap[TargetUAVIdx];
     target[id.xy] = takeFar ? (sky ? 0.0 : farthest) : (nearest < 1e30 ? nearest : 0.0);
 }
@@ -956,8 +1071,13 @@ void CSCloudReconstruct(uint3 id : SV_DispatchThreadID)
     uint2 maxTexel = uint2(TargetWidth, TargetHeight) - 1;
     float surface = hasScene ? sceneDepth.Load(int3(id.xy, 0)) : 0.0;
 
-    // This frame's marched neighbours on the same surface: the clamp's box (all of them where none is)
+    // This frame's marched neighbours on the same surface: the clamp's box, their mean and their clouds' depth. None in
+    // the 3×3 (a texel of sky in a tree's crown, its neighbours all marched to the leaves): the ring round it. Only where
+    // that has none either all of them: samples marched to a leaf hold "no cloud", and a sky texel clamped to them let
+    // its history go clear (the sky and the sun's disc through the gaps in the leaves, under a storm deck).
     float4 lo = 1e9, hi = -1e9, loAll = 1e9, hiAll = -1e9;
+    float4 sameSum = 0;
+    float sameDepth = 0.0, sameCount = 0.0;
     [unroll] for (int j = -1; j <= 1; j++)
     {
         [unroll] for (int i = -1; i <= 1; i++)
@@ -971,16 +1091,53 @@ void CSCloudReconstruct(uint3 id : SV_DispatchThreadID)
             {
                 lo = min(lo, s);
                 hi = max(hi, s);
+                sameSum += s;
+                sameDepth += sparseDepth.Load(int3(qn, 0));
+                sameCount += 1.0;
             }
         }
     }
-    if (lo.a > hi.a)
+    if (sameCount == 0.0)
+    {
+        for (int j = -2; j <= 2; j++)
+        {
+            for (int i = -2; i <= 2; i++)
+            {
+                if (abs(i) < 2 && abs(j) < 2)
+                    continue;
+                int2 qn = clamp(q + int2(i, j), int2(0, 0), int2(sparseSize) - 1);
+                float sd = hasScene ? sceneDepth.Load(int3(min(uint2(qn) * 2 + offset, maxTexel), 0)) : 0.0;
+                if (CloudSameSurface(sd, surface))
+                {
+                    float4 s = sparse.Load(int3(qn, 0));
+                    lo = min(lo, s);
+                    hi = max(hi, s);
+                    sameSum += s;
+                    sameDepth += sparseDepth.Load(int3(qn, 0));
+                    sameCount += 1.0;
+                }
+            }
+        }
+    }
+    if (sameCount == 0.0)
     {
         lo = loAll;
         hi = hiAll;
     }
     float4 own = sparse.Load(int3(q, 0));
+    // The depth goes with the clouds this texel takes: its block's marched sample is on another surface where a leaf or
+    // a summit's edge splits the block (a sky texel beside a leaf marched to it had the leaf's rain at 15 m for a depth,
+    // and the sky's clouds then lay in front of the leaf: white specks in the crowns)
     float depthKm = sparseDepth.Load(int3(q, 0));
+    float ownSurface = hasScene ? sceneDepth.Load(int3(min(uint2(q) * 2 + offset, maxTexel), 0)) : 0.0;
+    if (!fresh && !CloudSameSurface(ownSurface, surface) && sameCount > 0.0)
+        depthKm = sameDepth / sameCount;
+    // Nothing on this surface marched near it this frame (a texel of sky deep in a crown, the blocks round it marched to
+    // the leaves): last frame's clouds on this surface round where it was, texel by texel (a bilinear history mixes in
+    // the leaves'), reprojected from the far sky where it is sky
+    bool lonely = hasScene && sameCount == 0.0;
+    if (lonely && surface <= 0.0)
+        depthKm = CLOUD_FAR_DEPTH * 0.001;
 
     // Where this texel's clouds were last frame: the camera moved (CameraMove) and the wind carried them (CloudStep)
     float2 uv = (float2(id.xy) + 0.5) / float2(TargetWidth, TargetHeight);
@@ -999,21 +1156,59 @@ void CSCloudReconstruct(uint3 id : SV_DispatchThreadID)
                                        surface);
     }
 
-    float4 result;
-    if (HistoryTexIdx != 0 && onScreen && sameSurface)
+    float4 result = 0;
+    bool kept = false;
+    if (lonely && HistoryTexIdx != 0 && PrevSceneDepthTexIdx != 0 && onScreen)
+    {
+        Texture2D<float4> history = ResourceDescriptorHeap[HistoryTexIdx];
+        Texture2D<float> prevScene = ResourceDescriptorHeap[PrevSceneDepthTexIdx];
+        // Never descriptor 0 (a load behind a test of the index still runs: root_signature_bindless.md "Index 0")
+        Texture2D<float> historyDepth = ResourceDescriptorHeap[HistoryDepthTexIdx != 0 ? HistoryDepthTexIdx : SparseDepthTexIdx];
+        int2 pt = int2(prevUV * float2(TargetWidth, TargetHeight));
+        float4 hs = 0;
+        float hd = 0.0, hn = 0.0;
+        [unroll] for (int j = -1; j <= 1; j++)
+        {
+            [unroll] for (int i = -1; i <= 1; i++)
+            {
+                int3 p = int3(clamp(pt + int2(i, j), int2(0, 0), int2(maxTexel)), 0);
+                if (CloudSameSurface(prevScene.Load(p), surface))
+                {
+                    hs += history.Load(p);
+                    hd += HistoryDepthTexIdx != 0 ? historyDepth.Load(p) : depthKm;
+                    hn += 1.0;
+                }
+            }
+        }
+        if (hn > 0.0)
+        {
+            result = hs / hn;
+            result.rgb *= ExposureRatio;
+            depthKm = hd / hn;
+            kept = true;
+        }
+    }
+    if (kept)
+    {
+        // last frame's, above
+    }
+    else if (HistoryTexIdx != 0 && onScreen && sameSurface)
     {
         Texture2D<float4> history = ResourceDescriptorHeap[HistoryTexIdx];
         float4 h = history.SampleLevel(AtmosphereLinearClamp, prevUV, 0);
         h.rgb *= ExposureRatio;
         h = clamp(h, lo, hi);
-        result = fresh ? lerp(own, h, 0.5) : h;
+        // A fresh texel keeps 80 % of its history: the march's jitter (its steps, the light's short steps) showed as a
+        // hammered grain on sharp-edged cumulus at 50 %. The clamp to this frame's neighbours keeps it from ghosting.
+        result = fresh ? lerp(own, h, 0.8) : h;
     }
     else if (fresh)
         result = own;
     else
     {
         // No history here: this frame's samples round it, bilinearly (the sparse grid's texel centres sit at 2q + offset),
-        // those on another surface left out (all of them where none is on this one)
+        // those on another surface left out (the mean of those found further out where none of the four is on this one;
+        // all of them where none is)
         float2 sq = (float2(id.xy) - float2(offset)) * 0.5;
         int2 b = int2(floor(sq));
         float2 f = sq - b;
@@ -1034,7 +1229,7 @@ void CSCloudReconstruct(uint3 id : SV_DispatchThreadID)
                 weight += wk;
             }
         }
-        result = weight > 0.0 ? sum / weight : sumAll / weightAll;
+        result = weight > 0.0 ? sum / weight : (sameCount > 0.0 ? sameSum / sameCount : sumAll / weightAll);
     }
     if (any(isnan(result)))
         result = own;

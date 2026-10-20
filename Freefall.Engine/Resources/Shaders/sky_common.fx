@@ -490,7 +490,16 @@ float3 CloudAirLight(SamplerState wrapSampler, float3 relPos, float3 toLight, fl
     }
     else
         sky = 1.0 - skyDimming * CloudBelowBase(relPos);
-    return float3(t.x, max(t.y - t.x, 0.0), sky);
+    // Through a thin cloud (a cumulus' edge) droplets (g 0.85) throw most of what they scatter straight on: it lights the
+    // air like the beam, with the air's phase. Taken as diffused (scattered evenly) at every depth it outshone the open
+    // sun's backscatter: a bright ring round every cloud's shadow in the haze seen from above. Only through a thick
+    // cloud has it spread evenly.
+    float diffused = max(t.y - t.x, 0.0);
+    // e^(−τ/20), τ from the share passing through, CloudThrough = 1 / (1 + CLOUD_DIFFUSION τ) (the beam underflows past
+    // τ ~14)
+    float tau = (1.0 / max(t.y, 1e-4) - 1.0) / CLOUD_DIFFUSION;
+    float forward = diffused * exp(-tau / 20.0);
+    return float3(t.x + forward, diffused - forward, sky);
 }
 
 // Light on a lit particle or ribbon (smoke, rain, snow, a blade's trail), as a multiple of its albedo (E / π,
@@ -679,21 +688,43 @@ void CloudsAt(float2 pixel, float viewDepth, out float4 cloud, out float depth)
 
     Texture2D<float> scene = ResourceDescriptorHeap[CloudSceneDepthIdx];
     Texture2D<float> depths = ResourceDescriptorHeap[CloudDepthIdx];
+    // A texel's clouds behind this pixel's surface count as none, each on its own: a mean of the four depths let the
+    // sky's clouds beside a leaf come out in front of it
+    float viewCos = 1.0;
+    if (viewDepth > 0.0)
+    {
+        float2 uv = pixel / ViewportSize;
+        float4 farClip = mul(float4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 0, 1), CameraInverse);
+        viewCos = max(dot(normalize(farClip.xyz / farClip.w), normalize(float3(View._13, View._23, View._33))), 1e-3);
+    }
+    // The sky takes only texels marched as sky where it has any (CSCloudSceneDepth sees to that): those marched to a
+    // surface end there, and a few per cent of their "no cloud" let the sun's disc through a storm deck
+    float s[4];
+    bool anySky = false;
+    [unroll] for (int k = 0; k < 4; k++)
+    {
+        s[k] = CloudSceneDepthIdx != 0 ? scene.Load(int3(texels[k], 0)) : 0.0;
+        anySky = anySky || s[k] <= 0.0;
+    }
     float4 sum = 0;
-    float depthSum = 0.0, weight = 0.0;
+    float depthSum = 0.0, depthWeight = 0.0, weight = 0.0;
     [unroll] for (int k = 0; k < 4; k++)
     {
         float wb = ((k & 1) != 0 ? f.x : 1.0 - f.x) * ((k >> 1) != 0 ? f.y : 1.0 - f.y);
-        float s = CloudSceneDepthIdx != 0 ? scene.Load(int3(texels[k], 0)) : 0.0;
-        float apart = (s <= 0.0 || viewDepth <= 0.0) ? ((s <= 0.0 && viewDepth <= 0.0) ? 0.0 : 10.0)
-                    : abs(s - viewDepth) / max(s, viewDepth);
-        float w = (wb + 1e-3) / (0.05 + apart);
+        float apart = (s[k] <= 0.0 || viewDepth <= 0.0) ? ((s[k] <= 0.0 && viewDepth <= 0.0) ? 0.0 : 10.0)
+                    : abs(s[k] - viewDepth) / max(s[k], viewDepth);
+        float w = (viewDepth <= 0.0 && anySky && s[k] > 0.0) ? 0.0 : (wb + 1e-3) / (0.05 + apart);
+        float d = CloudDepthIdx != 0 ? depths.Load(int3(texels[k], 0)) * 1000.0 : 0.0;
+        if (viewDepth > 0.0 && d * viewCos >= viewDepth)
+            c[k] = float4(0, 0, 0, 1);
         sum += c[k] * w;
-        depthSum += (CloudDepthIdx != 0 ? depths.Load(int3(texels[k], 0)) : 0.0) * w;
+        float wd = w * (1.0 - c[k].a);
+        depthSum += d * wd;
+        depthWeight += wd;
         weight += w;
     }
     cloud = sum / weight;
-    depth = depthSum / weight * 1000.0;
+    depth = depthSum / max(depthWeight, 1e-6);
 
     // Lightning: the flash's light on the cloud where its light comes from, per pixel and every frame (the march's
     // targets update a quarter of their texels a frame and keep a history: a 25 ms stroke came out as a few dithered
