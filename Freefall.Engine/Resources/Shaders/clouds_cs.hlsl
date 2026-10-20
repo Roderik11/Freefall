@@ -639,6 +639,31 @@ float3 CloudGroundLight(float3 groundAmbient, float deckThrough, float tau)
     return groundAmbient * saturate(CloudThrough(tau) / deckThrough);
 }
 
+// How open the sky is over the ground a face sees far out toward the eye (towardEye: level, unit), from a place p
+// (camera-relative): the mean of exp(−0.3 τ up) over nine columns 4-12 km out and ±4 km across, at the place's height,
+// read from a coarse level (≥ 500 m texels: a column's edge fades over a texel, not a voxel of level 0). A deck or a
+// storm round the place covers them all; broken cumulus leave a share open. One column 8 km out decided it before, open
+// or covered: every point of a base took its own point out there, and the other clouds' footprints landed on the bases
+// as hard navy patches and stripes that slid as the camera moved (user, 2026-10-20)
+#define CLOUD_FAR_OPEN_LEVEL 3
+float CloudFarOpen(CloudParams C, float3 p, float2 towardEye)
+{
+    float2 across = float2(-towardEye.y, towardEye.x);
+    float open = 0.0;
+    [unroll] for (int i = 0; i < 3; i++)
+    {
+        [unroll] for (int j = 0; j < 3; j++)
+        {
+            float2 o = towardEye * (4000.0 * (i + 1)) + across * (4000.0 * (j - 1));
+            float3 q = p + float3(o.x, 0.0, o.y);
+            float blend;
+            uint level = max(CloudLevelAt(C, max(abs(q.x), abs(q.z)), blend), (uint)CLOUD_FAR_OPEN_LEVEL);
+            open += exp(-0.3 * CloudSkyDepthAt(C, level, C.CameraCloud + q.xz, CloudHeight(q), CloudWrap).x);
+        }
+    }
+    return open / 9.0;
+}
+
 // One view ray through the clouds (not the rain: CloudMarchRay). stepScale > 1 marches coarser (the probe's faces);
 // jitter (0..1) offsets the steps; tLimit (m along the ray) ends it at the scene's surface: a summit in a deck, a hill in
 // front of the clouds.
@@ -675,6 +700,10 @@ CloudMarchResult CloudMarchClouds(CloudParams C, AtmosphereParams A, Texture3D<f
     float3 L = 0;
     float T = 1.0;
     float depthSum = 0.0, depthWeight = 0.0;
+    // The far ground's openness (CloudFarOpen): a wide mean, worked out once a ray (at the first face it meets, and again
+    // every 2 km along it), not per sample
+    float2 towardEye = -dir.xz * rsqrt(max(dot(dir.xz, dir.xz), 1e-6));
+    float farOpen = -1.0, farAt = 0.0;
     float t = tStart;
     [loop] for (int s = 0; s < 512 && t < tEnd; s++)
     {
@@ -758,18 +787,20 @@ CloudMarchResult CloudMarchClouds(CloudParams C, AtmosphereParams A, Texture3D<f
             // The face sees the sky only where the air in front of it is open to the sky: a deck's base seen low sees
             // more base, not the blue (half the blue sky on every grazing base turned a storm deck blue). The sky
             // volume's column over a place ~a kilometre toward the eye says which.
-            // Two columns: ~1 km toward the eye, and ~8 km out, level: under an anvil the near one is covered while the
-            // face still sees the bright low sky past the anvil's edge (faces under anvils came out black); a deck
-            // covers both
+            // The column ~1 km toward the eye, and how open the sky is 4-12 km out (CloudFarOpen): under an anvil the near
+            // one is covered while the face still sees the bright low sky past the anvil's edge (faces under anvils came
+            // out black); a deck covers both
             // A base faces down whatever way it is seen: near the base no sky (it lit fair-weather cumulus bases seen
             // 20° up with a third of the sky, and they came out as white as their sunlit sides)
             float faceSky = saturate(0.5 - 0.5 * dir.y) * faceOpen * saturate((hp - C.Base) / 400.0);
-            float farOpen = 0.0;            // the far column's openness: the ground out there is sunlit too
             if (faceOpen > 0.01)
             {
-                float2 level = -dir.xz * rsqrt(max(dot(dir.xz, dir.xz), 1e-6));
                 float nearSky = exp(-0.3 * CloudSkyDepth(C, p - dir * min(1000.0, 0.5 * t), CloudWrap).x);
-                farOpen = exp(-0.3 * CloudSkyDepth(C, p + float3(level.x, 0.0, level.y) * 8000.0, CloudWrap).x);
+                if (farOpen < 0.0 || t - farAt > 2000.0)
+                {
+                    farOpen = CloudFarOpen(C, p, towardEye);
+                    farAt = t;
+                }
                 faceSky *= max(nearSky, farOpen);
             }
             // The sky's light also diffuses down through the cloud over this place, as the sun's does (CloudThrough of the
@@ -781,7 +812,7 @@ CloudMarchResult CloudMarchClouds(CloudParams C, AtmosphereParams A, Texture3D<f
             // cloud tops under it, much brighter than the ground (lit only by the ground, anvil undersides went black)
             float3 belowAir = 0.35 * skyAmbient + 0.15 * lightE * toLight * (saturate(lightDir.y) / ATM_PI * Exposure);
             // (the ground: as lit under this place, or as the open ground far out the face sees, whichever is brighter)
-            float3 ground = max(CloudGroundLight(groundAmbient, deckThrough, tau), groundAmbient * (farOpen * faceOpen));
+            float3 ground = max(CloudGroundLight(groundAmbient, deckThrough, tau), groundAmbient * (max(farOpen, 0.0) * faceOpen));
             float3 below = lerp(ground, belowAir, saturate((hp - C.Base - 0.5 * C.Thickness) / 4000.0));
             float3 ambient = skyAmbient * skySeen + below * groundSeen;
 
