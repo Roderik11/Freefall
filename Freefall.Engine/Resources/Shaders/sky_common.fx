@@ -476,12 +476,22 @@ float3 CloudAirLight(SamplerState wrapSampler, float3 relPos, float3 toLight, fl
     if (CloudsOn != 0)
     {
         CloudParams C = LoadClouds();
-        float tauUp = CloudSkyDepth(C, relPos, wrapSampler).x;
+        // The sky light comes from a wide cone of the sky, not a line straight up: the clouds over an area about as wide
+        // as the place lies under the base (a gap's light spreads ~45° each way). The column straight up alone drew
+        // every gap of a broken deck as a vertical shaft of brighter air, standing straight up whatever the sun's
+        // direction (the real shafts, the beam's, point at the sun). One read of a coarser level of the sky volume, its
+        // texels a quarter of that depth wide, filtered (four columns round the place cost the aerial perspective
+        // 0.24 ms).
+        float h = CloudHeight(relPos);
+        float blend;
+        uint near = CloudLevelAt(C, max(abs(relPos.x), abs(relPos.z)), blend);
+        uint wide = (uint)clamp(floor(log2(max(C.Base - h, 250.0) / (4.0 * C.Levels[0].VoxelSize))), (float)near,
+                                (float)(CLOUD_LEVELS - 1));
+        float tauUp = CloudSkyDepthAt(C, wide, C.CameraCloud + relPos.xz, h, wrapSampler).x;
         sky = CloudThrough(tauUp);
         if (AtmosphereIdx != 0 && t.y > t.x + 1e-3)
         {
             AtmosphereParams A = LoadAtmosphere();
-            float h = CloudHeight(relPos);
             float entry = min(max(h, C.Base) + 2.0 * tauUp / max(C.Density, 1e-4), C.SlabTop) - h;
             float3 here = AtmTransmittanceToLight(A, CloudAtmospherePos(relPos), toLight);
             float3 there = AtmTransmittanceToLight(A, CloudAtmospherePos(relPos + float3(0.0, max(entry, 0.0), 0.0)), toLight);
