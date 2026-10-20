@@ -228,7 +228,15 @@ namespace Freefall.Components
         [ValueRange(0f, 0.9f)]
         public float ForwardScatter = 0f;
 
-        [Description("Multiplier on RGB: with Lit, of the albedo (keep RGB × Intensity at most 1); without, the luminance in nits")]
+        [Description("Lit: share of the light scattered evenly, as it is when it bounces around inside a dense puff (smoke, " +
+                     "cloud: 0.4). 0 for particles that each scatter the light once, on their own: rain drops (the forward " +
+                     "scattering alone, ForwardScatter ~0.87 for water)")]
+        [ValueRange(0f, 1f)]
+        public float MultipleScattering = 0.4f;
+
+        [Description("Multiplier on RGB: with Lit, of the albedo (at most 1 for a particle that is one thing, a puff; more " +
+                     "for a few particles standing in for many, as rain streaks do for the drops round them); without, " +
+                     "the luminance in nits")]
         [ValueRange(0f, 200000f)]
         public float Intensity = 1f;
 

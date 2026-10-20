@@ -9,12 +9,11 @@
 //                 importance. Which lights miss out is decided by their importance, not by the order the GPU
 //                 happens to append them in (that order changes every frame: whole lights blinked, 2026-10-16).
 //                 Runs after the opaque pass, before the point light shadows (their selection ranks this list).
-// CSOccludeLights: one thread per visible light, in the lighting phase once this frame's Hi-Z pyramid exists:
-//                 flags lights wholly behind it, which the tiled pass then skips.
+// (CSOccludeLights, which flagged the lights wholly behind the Hi-Z, went on 2026-10-20: the point light pass tests
+// every light against the depths of each 8×8 group it shades, light_point_cs.hlsl.)
 
 #pragma kernel CSCountLights
 #pragma kernel CSCullLights
-#pragma kernel CSOccludeLights
 
 cbuffer PushConstants : register(b3)
 {
@@ -24,7 +23,6 @@ cbuffer PushConstants : register(b3)
     uint FrameParamsIdx;        // StructuredBuffer<PointLightFrame>: [0]
     uint VisibleUAVIdx;         // RWStructuredBuffer<PointLightData>: the visible list
     uint VisibleCountUAVIdx;    // RWByteAddressBuffer: [0] = lights in the list, [1] = lights in view
-    uint HiZTexIdx;             // CSOccludeLights: Hi-Z pyramid of this frame's linear depth
     uint HistogramUAVIdx;       // RWStructuredBuffer<uint>[IMPORTANCE_BINS]: lights in view per importance band
     uint LampsUAVIdx;           // RWStructuredBuffer<LampState> per slot (point_light_lamps.hlsl); 0 = all follow frame.Lamps
 };
@@ -177,55 +175,4 @@ void CSCullLights(uint3 dtid : SV_DispatchThreadID, uint gi : SV_GroupIndex)
 
     RWStructuredBuffer<PointLightData> visible = ResourceDescriptorHeap[VisibleUAVIdx];
     visible[index] = light;
-}
-
-// Sphere wholly behind the Hi-Z pyramid (the test CSCullLights in light_point_cs.hlsl used to make)
-[numthreads(64, 1, 1)]
-void CSOccludeLights(uint3 dtid : SV_DispatchThreadID)
-{
-    RWByteAddressBuffer countBuf = ResourceDescriptorHeap[VisibleCountUAVIdx];
-    uint count = min(countBuf.Load(0), MAX_VISIBLE_LIGHTS);
-    uint i = dtid.x;
-    if (i >= count || HiZTexIdx == 0)
-        return;
-
-    RWStructuredBuffer<PointLightData> visible = ResourceDescriptorHeap[VisibleUAVIdx];
-    PointLightData light = visible[i];
-
-    StructuredBuffer<PointLightFrame> frames = ResourceDescriptorHeap[FrameParamsIdx];
-    float4x4 vp = frames[0].CameraRelativeVP;
-
-    float4 clipCenter = mul(float4(light.Position, 1.0), vp);
-    if (clipCenter.w <= 0)
-        return; // centre behind the camera: cannot tell
-
-    float3 ndc = clipCenter.xyz / clipCenter.w;
-    float2 uv = ndc.xy * float2(0.5, -0.5) + 0.5;
-    if (any(uv < 0.0) || any(uv > 1.0))
-        return; // centre off screen: cannot tell
-
-    Texture2D<float> hiZ = ResourceDescriptorHeap[HiZTexIdx];
-    float w, h, levels;
-    hiZ.GetDimensions(0, w, h, levels);
-
-    float projScale = max(abs(vp._m11), 0.001);
-    float screenRadius = (light.Range * projScale / clipCenter.w) * h * 0.5;
-
-    float mipLevel = min(ceil(log2(max(screenRadius * 2.0, 1.0))), levels - 1.0);
-    uint mip = (uint)mipLevel;
-
-    float mipW, mipH, unused;
-    hiZ.GetDimensions(mip, mipW, mipH, unused);
-    float2 mipSize = float2(mipW, mipH);
-
-    int2 baseCoord = int2(uv * mipSize - 0.5);
-    int2 maxCoord = int2(mipSize) - 1;
-    float d0 = hiZ.Load(int3(clamp(baseCoord,             int2(0, 0), maxCoord), mip));
-    float d1 = hiZ.Load(int3(clamp(baseCoord + int2(1, 0), int2(0, 0), maxCoord), mip));
-    float d2 = hiZ.Load(int3(clamp(baseCoord + int2(0, 1), int2(0, 0), maxCoord), mip));
-    float d3 = hiZ.Load(int3(clamp(baseCoord + int2(1, 1), int2(0, 0), maxCoord), mip));
-
-    float sampledDepth = max(max(d0, d1), max(d2, d3));
-    if (clipCenter.w - light.Range > sampledDepth)
-        visible[i].Flags = light.Flags | VISIBLE_LIGHT_OCCLUDED;
 }

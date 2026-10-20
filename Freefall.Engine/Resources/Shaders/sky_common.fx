@@ -14,6 +14,7 @@
 #include "sky_visibility.hlsli"
 #include "sky_capture.hlsli"
 #include "cloud_common.hlsli"
+#include "light_clusters.hlsli"
 
 // Direction toward the sun (the true sun, also below the horizon), for passes that need its place in the sky
 float3 AtmSunDirection()
@@ -513,39 +514,142 @@ float3 CloudAirLight(SamplerState wrapSampler, float3 relPos, float3 toLight, fl
 }
 
 // Light on a lit particle or ribbon (smoke, rain, snow, a blade's trail), as a multiple of its albedo (E / π,
-// pre-exposed): half the sun's and the moon's light through the air (at the camera's height) and the clouds' beam at the
-// particle (a puff is lit from one side), and the sky probe's ambient from above and below averaged, which holds the
-// light the clouds diffuse (their lit base) as it does for surfaces. No other shadows: grey by day, dark at night.
-// Callers multiply by the SkyVisibility at the particle: smoke in a cave stays dark, since neither the sky nor the sun
-// reaches it there (they also scale the haze in front of it by that).
+// pre-exposed): half the sun's and the moon's light through the air (at the camera's height), the clouds' beam and the
+// shadows at the particle (a puff is lit from one side), and the sky probe's ambient from above and below averaged, which
+// holds the light the clouds diffuse (their lit base) as it does for surfaces: grey by day, dark at night. Callers
+// multiply by the SkyVisibility at the particle: smoke in a cave stays dark, since neither the sky nor the sun reaches it
+// there (they also scale the haze in front of it by that). The point lights come on top (ParticlePointLight), not scaled
+// by it: the fire in the cave lights its own smoke.
 
 // How much more of a light a particle shows seen at angle cosTheta from the light's way on (1 = looking into the light
 // through it) than an even scatterer would: Henyey-Greenstein with anisotropy g, 1 everywhere for g = 0. Droplets throw
-// most of the light on, so spray glows with the sun behind it and dims with the sun behind the viewer; 40 % stays even,
-// the light scattered several times inside a dense cloud (ParticleEmitter.ForwardScatter, 2026-10-19)
-float ParticlePhase(float cosTheta, float g)
+// most of the light on, so spray glows with the sun behind it and dims with the sun behind the viewer; the share `even`
+// stays even, the light scattered several times inside a dense puff (ParticleEmitter.ForwardScatter, 2026-10-19;
+// MultipleScattering, 2026-10-20: 0.4 for smoke and spray, 0 for rain drops, each of which scatters the light once)
+float ParticlePhase(float cosTheta, float g, float even)
 {
     float d = 1.0 + g * g - 2.0 * g * cosTheta;
-    return 0.4 + 0.6 * (1.0 - g * g) / (d * sqrt(d));
+    return even + (1.0 - even) * (1.0 - g * g) / (d * sqrt(d));
 }
 
+float ParticlePhase(float cosTheta, float g) { return ParticlePhase(cosTheta, g, 0.4); }
+
 //   relPos: the particle, camera-relative; toEye: from it to the camera; g: its forward scattering (0 = the same from
-//   every side); wrapSampler: linear wrap (the clouds' volumes)
-float3 ParticleLight(SamplerState wrapSampler, float3 relPos, float3 toEye, float g)
+//   every side); even: the share of it scattered evenly (ParticlePhase); shadows: x the sun's, y the moon's (1 = lit,
+//   ParticleBodyShadows); wrapSampler: linear wrap (the clouds' volumes)
+float3 ParticleLight(SamplerState wrapSampler, float3 relPos, float3 toEye, float g, float even, float2 shadows)
 {
     if (AtmosphereIdx == 0)
         return 0;
     AtmosphereParams A = LoadAtmosphere();
     float3 P = float3(0, AtmosphereViewHeight(A, CamPos.y), 0);
     float3 direct = A.SunIlluminance * AtmTransmittanceToLight(A, P, A.SunDirection)
-                  * (ParticlePhase(dot(toEye, -A.SunDirection), g) * CloudBeam(wrapSampler, relPos, A.SunDirection))
+                  * (ParticlePhase(dot(toEye, -A.SunDirection), g, even) * CloudBeam(wrapSampler, relPos, A.SunDirection) * shadows.x)
                   + A.MoonIlluminance * AtmTransmittanceToLight(A, P, A.MoonDirection)
-                  * (ParticlePhase(dot(toEye, -A.MoonDirection), g) * CloudBeam(wrapSampler, relPos, A.MoonDirection));
+                  * (ParticlePhase(dot(toEye, -A.MoonDirection), g, even) * CloudBeam(wrapSampler, relPos, A.MoonDirection) * shadows.y);
     return direct * (0.5 * Exposure / ATM_PI) + (SkyAmbient(float3(0, 1, 0)) + SkyAmbient(float3(0, -1, 0))) * 0.5;
+}
+
+float3 ParticleLight(SamplerState wrapSampler, float3 relPos, float3 toEye, float g, float2 shadows)
+{
+    return ParticleLight(wrapSampler, relPos, toEye, g, 0.4, shadows);
+}
+
+float3 ParticleLight(SamplerState wrapSampler, float3 relPos, float3 toEye, float g)
+{
+    return ParticleLight(wrapSampler, relPos, toEye, g, 0.4, float2(1.0, 1.0));
 }
 
 // At the camera, lit evenly from every side (ribbons without a place of their own)
 float3 ParticleLight(SamplerState wrapSampler) { return ParticleLight(wrapSampler, float3(0, 0, 0), float3(0, 1, 0), 0.0); }
+
+// The sun's and the moon's shadow (x, y; 1 = lit) at a place off the surfaces (a particle, a ribbon's point): the
+// terrain's past 32 m (TerrainLightShadow), and for the body the cascades were drawn for this frame the first cascade that
+// holds the place, one comparison 0.3 m toward the light (as the near fog volume takes them). The cascades come from the
+// light clusters' header (built after they are drawn). relPos: camera-relative; cmp: comparison, less-equal (s3).
+float2 ParticleBodyShadows(float3 relPos, SamplerComparisonState cmp)
+{
+    if (AtmosphereIdx == 0)
+        return 1.0;
+    AtmosphereParams A = LoadAtmosphere();
+    float3 absPos = CamPos + relPos;
+    float2 shadows = float2(TerrainLightShadow(absPos, A.SunDirection), TerrainLightShadow(absPos, A.MoonDirection));
+    if (LightClustersIdx == 0)
+        return shadows;
+    ByteAddressBuffer clusters = ResourceDescriptorHeap[LightClustersIdx];
+    uint mapIdx = clusters.Load(LC_SUN_SHADOW_MAP * 4);
+    if (mapIdx == 0)
+        return shadows;
+    float3 shadowDir = asfloat(clusters.Load3(LC_SUN_DIRECTION * 4));
+    bool sun = dot(shadowDir, A.SunDirection) > 0.999;
+    if (!sun && dot(shadowDir, A.MoonDirection) <= 0.999)
+        return shadows;
+
+    StructuredBuffer<CascadeData> cascades = ResourceDescriptorHeap[clusters.Load(LC_SUN_CASCADES * 4)];
+    Texture2DArray<float> shadowMap = ResourceDescriptorHeap[mapIdx];
+    uint count = clusters.Load(LC_SUN_CASCADE_COUNT * 4);
+    float viewDepth = mul(float4(relPos, 1.0), CameraRelativeVP).w;
+    float lit = 1.0;
+    for (uint c = 0; c < count; c++)
+    {
+        CascadeData cd = cascades[c];
+        if (viewDepth > cd.SplitDistances.y)
+            continue;
+        float4 p = mul(float4(absPos, 1.0), cd.VP);
+        float2 uv = p.xy * float2(0.5, -0.5) + 0.5;
+        if (any(uv < 0.0) || any(uv > 1.0))
+            continue;
+        float zPerMetre = length(float3(cd.VP._13, cd.VP._23, cd.VP._33));
+        lit = shadowMap.SampleCmpLevelZero(cmp, float3(uv, c), p.z - 0.3 * zPerMetre);
+        break;
+    }
+    if (sun)
+        shadows.x = min(shadows.x, lit);
+    else
+        shadows.y = min(shadows.y, lit);
+    return shadows;
+}
+
+// The point lights' light on a lit particle or ribbon, as ParticleLight gives the sun's (half of E / π, pre-exposed, with
+// its forward scattering g): the lights that reach it (light_clusters.hlsli), each through its shadow where it has one
+// this frame. Taken no closer to a light than the particle's radius: its light is the mean over the puff, not 1 / d² at
+// its centre (smoke born inside the brazier's flame). relPos: camera-relative; cmp: comparison, less-equal (s3).
+float3 ParticlePointLight(float3 relPos, float3 toEye, float g, float even, float radius, SamplerComparisonState cmp)
+{
+    if (LightClustersIdx == 0 || ClusterLightsIdx == 0)
+        return 0;
+    float4 clip = mul(float4(relPos, 1.0), CameraRelativeVP);
+    if (clip.w <= 1e-3)
+        return 0;
+    ByteAddressBuffer clusters = ResourceDescriptorHeap[LightClustersIdx];
+    StructuredBuffer<PointLightData> lights = ResourceDescriptorHeap[ClusterLightsIdx];
+    LightClusterWalk walk;
+    if (!LightClusterBegin(clusters, clip.xy / clip.w * float2(0.5, -0.5) + 0.5, clip.w, walk))
+        return 0;
+
+    float minD2 = max(radius * radius, 0.01);
+    float3 sum = 0;
+    uint s;
+    [loop] while (LightClusterNext(clusters, walk, s))
+    {
+        PointLightData light = lights[s];
+        float3 toLight = light.Position - relPos;
+        float3 E = PointLightIlluminance(light, toLight, minD2);
+        if (all(E <= 0.0))
+            continue;
+        float shadow = PointLightShadowAt(clusters, light, relPos, cmp);
+        if (shadow <= 0.0)
+            continue;
+        float cosTheta = -dot(toEye, toLight) * rsqrt(max(dot(toLight, toLight), 1e-6));
+        sum += E * (shadow * ParticlePhase(cosTheta, g, even));
+    }
+    return sum * (0.5 * Exposure / ATM_PI);
+}
+
+float3 ParticlePointLight(float3 relPos, float3 toEye, float g, float radius, SamplerComparisonState cmp)
+{
+    return ParticlePointLight(relPos, toEye, g, 0.4, radius, cmp);
+}
 
 // The light the cloud layer diffuses (CloudAirLight .y, a share of the light's illuminance E) as the air below it scatters
 // it toward the eye, per unit illuminance and of the air's scattering coefficient: the base sends share × E × cos(the

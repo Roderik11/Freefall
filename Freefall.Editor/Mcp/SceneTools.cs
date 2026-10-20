@@ -210,28 +210,6 @@ namespace Freefall.Editor.Mcp
             });
         }
 
-        [McpServerTool(Name = "entity_scatter", Title = "Scatter assets", OpenWorld = false)]
-        [Description("Scatter many prefab/mesh instances in a circle on the terrain with Poisson spacing and height/slope filters. " +
-                     "Fewer than 'count' may be placed when constraints are tight; the result reports placed vs requested.")]
-        public static Task<CallToolResult> Scatter(
-            [Description("Assets to pick from, weighted")] WeightedAsset[] assets,
-            ScatterArea area,
-            int count = 10,
-            [Description("Minimum distance between instances")] float spacing = 10,
-            [Description("Uniform random scale range, default 0.8–1.2")] MinMax? scale = null,
-            [Description("Extra random Y-scale variance (0.2 = ±20%)")] float scaleYVariance = 0,
-            bool randomYaw = true,
-            [Description("Euler degrees applied before the random yaw")] Vec3? baseRotation = null,
-            bool snapToGround = true,
-            [Description("Only place where terrain height (world Y) is in range")] MinMax? height = null,
-            [Description("Only place where slope in degrees is in range (0 flat, 90 vertical)")] MinMax? slope = null,
-            [Description("Random seed for reproducible results")] int? seed = null)
-            => McpBridge.Post("/api/entity/scatter", new
-            {
-                meshes = assets, area, count, spacing, scale, scaleYVariance, randomYaw,
-                baseRotation, snapToGround, height, slope, seed,
-            });
-
         [McpServerTool(Name = "entity_delete", Title = "Delete entity", Destructive = true, OpenWorld = false)]
         [Description("Destroy an entity.")]
         public static async Task<CallToolResult> DeleteEntity(int? id = null, [Description(EntityRefs.UidHelp)] string? uid = null)

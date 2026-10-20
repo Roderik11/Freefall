@@ -36,6 +36,7 @@ cbuffer PushConstants : register(b3)
 
 SamplerState SamplerLinearWrap : register(s0);
 SamplerState SamplerPointClamp : register(s1);
+SamplerComparisonState ParticleShadowSampler : register(s3);    // less-equal: the sun's cascades, point light shadows
 
 // ────────────── Quad Geometry ──────────────
 
@@ -98,11 +99,19 @@ VSOutput VS(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
     output.Color = lerp(e.ColorStart, e.ColorEnd, t);
     output.Color.rgb *= e.Intensity;
     // Premultiplied: only the light scales, not how much of the background it hides. Forward mode: a lit particle's
-    // colour is an albedo under the sky and the sun, else a luminance (nits) pre-exposed as a light source.
-    // Transparent mode writes an albedo the composition lights (LightScale 1).
+    // colour is an albedo under the sky, the sun (through their shadows) and the point lights that reach it, else a
+    // luminance (nits) pre-exposed as a light source. Transparent mode writes an albedo the composition lights
+    // (LightScale 1).
     output.SkyVisible = e.RenderMode == PARTICLE_MODE_FORWARD ? SkyVisibility(core.Position, float3(0, 1, 0)) : 1.0;
     if (e.RenderMode == PARTICLE_MODE_FORWARD && (e.Flags & PARTICLE_FLAG_LIT) != 0)
-        output.Color.rgb *= ParticleLight(SamplerLinearWrap, core.Position - CamPos, normalize(CamPos - core.Position), e.ForwardScatter) * output.SkyVisible;
+    {
+        float3 relPos = core.Position - CamPos;
+        float3 toEye = normalize(-relPos);
+        output.Color.rgb *= ParticleLight(SamplerLinearWrap, relPos, toEye, e.ForwardScatter, e.MultipleScattering,
+                                          ParticleBodyShadows(relPos, ParticleShadowSampler)) * output.SkyVisible
+                          + ParticlePointLight(relPos, toEye, e.ForwardScatter, e.MultipleScattering, 0.5 * size,
+                                               ParticleShadowSampler);
+    }
     else
         output.Color.rgb *= LightScale;
     if (e.FadeInRate > 0.0)

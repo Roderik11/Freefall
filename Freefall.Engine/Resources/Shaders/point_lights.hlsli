@@ -10,7 +10,6 @@
 #define MAX_VISIBLE_LIGHTS      4096u   // PointLightBuffer.MaxVisible
 #define LAMPS_ON_BELOW_LUX      1.0     // Daylight.LampsOnBelowLux: a lamp lights when the daylight where it hangs
 #define LAMPS_OFF_ABOVE_LUX     2.0     // falls below this, goes out above Daylight.LampsOffAboveLux
-#define VISIBLE_LIGHT_OCCLUDED  1u      // PointLightData.Flags: behind the Hi-Z (CSOccludeLights)
 #define POINT_LIGHT_NO_SHADOW   0xFFFFFFFFu
 
 // One per PointLight, at its registry slot. Must match C# PointLightBuffer.Record (48 bytes).
@@ -36,7 +35,7 @@ struct PointLightData
     float Range;
     uint ShadowLight;       // index into LocalShadowLight[], POINT_LIGHT_NO_SHADOW
     uint Slot;              // registry slot
-    uint Flags;             // VISIBLE_LIGHT_OCCLUDED
+    uint Flags;             // none so far (was VISIBLE_LIGHT_OCCLUDED, the Hi-Z test, until 2026-10-20)
     float Score;            // the cull writes luminance × base candela; the shadow selection its rank score
 };
 

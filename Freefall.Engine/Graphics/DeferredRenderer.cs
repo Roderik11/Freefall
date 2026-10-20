@@ -63,6 +63,8 @@ namespace Freefall.Graphics
         /// <summary>The near fog volume (god rays): the air near the camera lit with the sun's shadows.</summary>
         public VolumetricFog? VolumetricFog { get; private set; }
         private uint _fogVolumeIdx;             // this frame's SceneConstants.FogVolumeIdx (0 = off)
+        // Which visible point lights reach a place off the surfaces (the air, particles): SceneConstants.LightClustersIdx
+        private readonly LightClusters _lightClusters = new();
         // This view's aerial perspective volume (the far haze), sized to its target: SceneConstants.AerialPerspectiveIdx
         private readonly AerialPerspectiveVolume _aerialPerspective = new();
         // This view's volumetric clouds (half size): SceneConstants.CloudTargetIdx
@@ -107,7 +109,7 @@ namespace Freefall.Graphics
         private ComputeShader _pointLightCS = null!;
         private int _kPointLight;
         private ComputeShader _lightCullCS = null!;   // point_light_cull.hlsl
-        private int _kCountLights, _kCullLights, _kOccludeLights;
+        private int _kCountLights, _kCullLights;
         private GraphicsBuffer? _visibleLights;       // UAV: RWStructuredBuffer<PointLightData>[MaxVisible]
         private GraphicsBuffer? _visibleLightCount;   // UAV: [0] lights in the list, [1] lights in view (RWByteAddressBuffer)
         private GraphicsBuffer? _lightImportance;     // UAV: lights in view per importance band (which make the list)
@@ -207,7 +209,6 @@ namespace Freefall.Graphics
             _lightCullCS = new ComputeShader("point_light_cull.hlsl");
             _kCountLights = _lightCullCS.FindKernel("CSCountLights");
             _kCullLights = _lightCullCS.FindKernel("CSCullLights");
-            _kOccludeLights = _lightCullCS.FindKernel("CSOccludeLights");
             _visibleLights = GraphicsBuffer.CreateStructured<PointLightBuffer.VisibleLight>(PointLightBuffer.MaxVisible, uav: true);
             _visibleLightCount = GraphicsBuffer.CreateRaw(2, uav: true, clearable: true);
             _lightImportance = GraphicsBuffer.CreateStructured<uint>(64, uav: true);
@@ -464,6 +465,11 @@ namespace Freefall.Graphics
             using (_forwardMarker.Auto())
                 RenderForward(camera, list);
 
+            // The point light shadows and the light clusters were read up to the forward pass (particles, ribbons):
+            // back to UAV for the next frame's selection and build
+            LocalShadows?.EndFrame(list);
+            _lightClusters.EndFrame(list);
+
             // Auto exposure metering of the finished HDR image (deferred + forward + sky), before bloom
             var compositeDesc = Composite.Native.Description;
             AutoExposure.Measure(list, Composite.BindlessIndex, (int)compositeDesc.Width, (int)compositeDesc.Height, Atmosphere.Exposure);
@@ -547,6 +553,8 @@ namespace Freefall.Graphics
              uint aerialPerspectiveIdx = _aerialPerspective.Prepare((int)compositeSize.Width, (int)compositeSize.Height);
              // ... and its volumetric clouds (marched in 2g below, before the sky reads them; 0 = the 2D layer)
              _cloudTargetIdx = _cloudView.Prepare((int)compositeSize.Width, (int)compositeSize.Height);
+             // ... and its light clusters (built in 2b below, after the point light shadow selection)
+             _lightClusters.Prepare((int)compositeSize.Width, (int)compositeSize.Height);
 
              foreach (var pair in Effect.MasterEffects)
              {
@@ -558,6 +566,8 @@ namespace Freefall.Graphics
                  pair.Value.SetParameter("CloudTargetIdx", _cloudTargetIdx);
                  pair.Value.SetParameter("CloudDepthIdx", _cloudTargetIdx != 0 ? _cloudView.DepthIndex : 0u);
                  pair.Value.SetParameter("CloudSceneDepthIdx", _cloudTargetIdx != 0 ? _cloudView.SceneDepthIndex : 0u);
+                 pair.Value.SetParameter("LightClustersIdx", _lightClusters.ClustersSrv);
+                 pair.Value.SetParameter("ClusterLightsIdx", _lightClusters.LightsSrv);
              }
 
              // The atmosphere's LUTs for this view (sky-view, aerial perspective, ambient): the sky dome, the
@@ -710,6 +720,15 @@ namespace Freefall.Graphics
                      LocalShadows.Skip();
                  }
              }
+
+             // Light clusters: the visible lights sorted by view depth, z-bins and tile masks, for the near fog volume
+             // (2e), particles and ribbons. After the selection, which writes each light's shadow into the list; the
+             // header also carries this frame's point light shadows and the sun's cascades to the particles.
+             _lightClusters.Build(list, _lightFrameParams![Engine.FrameIndex % FrameCount].SrvIndex,
+                 _visibleLights!.UavIndex, _pointLightsCulled ? _visibleLightCount!.UavIndex : 0u,
+                 LocalShadows?.AtlasIndex ?? 0u, LocalShadows?.ViewBufferSrv ?? 0u, LocalShadows?.LightBufferSrv ?? 0u,
+                 ShadowMapIndex, DirectionalLight.CurrentCascadeSrvIndex, Math.Clamp(DirectionalLight.CascadeCount, 0, 8),
+                 -DirectionalLight.GetLightDirection());
 
              // 2c. Sky captures: the meshes round the camera seen from directions of the sky, for the sky visibility
              //     (sky_capture.hlsli). Four directions per frame while any is due; after the shadows, whose per-batch
@@ -951,7 +970,6 @@ namespace Freefall.Graphics
              _lightCullCS.SetPushConstant("VisibleUAV", _visibleLights!.UavIndex);
              _lightCullCS.SetPushConstant("VisibleCountUAV", _visibleLightCount!.UavIndex);
              _lightCullCS.SetPushConstant("HistogramUAV", _lightImportance!.UavIndex);
-             _lightCullCS.SetPushConstant("HiZTex", 0u);
 
              list.SetComputeRootSignature(Engine.Device.GlobalRootSignature);
              list.SetDescriptorHeaps(1, new[] { Engine.Device.SrvHeap });
@@ -1054,10 +1072,7 @@ namespace Freefall.Graphics
         private unsafe void DispatchPointLights(Camera camera, ID3D12GraphicsCommandList list)
         {
              if (!_pointLightsCulled)
-             {
-                 LocalShadows?.EndFrame(list);
                  return;
-             }
 
              var desc = LightBuffer.Native.Description;
              _pointLightCS.SetPushConstant("NormalTex", Normals.BindlessIndex);
@@ -1067,8 +1082,6 @@ namespace Freefall.Graphics
              _pointLightCS.SetPushConstant("OutputUAV", LightBuffer.UavIndex);
              _pointLightCS.SetPushConstant("ScreenWidth", (uint)desc.Width);
              _pointLightCS.SetPushConstant("ScreenHeight", (uint)desc.Height);
-             _pointLightCS.SetPushConstant("VisibleLightUAV", _visibleLights!.UavIndex);
-             _pointLightCS.SetPushConstant("VisibleLightCountUAV", _visibleLightCount!.UavIndex);
 
              // Point light shadows (atlas 0 = none rendered this frame: the shader skips them)
              _pointLightCS.SetPushConstant("LocalShadowAtlas", LocalShadows?.AtlasIndex ?? 0u);
@@ -1098,22 +1111,11 @@ namespace Freefall.Graphics
                  }
              }
 
-             // Lights wholly behind this frame's Hi-Z (built after the cull) are skipped by the tiles
-             uint hiZSrv = (HiZPyramid != null && HiZPyramid.Ready && !Engine.Settings.DisableHiZ)
-                 ? HiZPyramid.FullSRV : 0u;
-             if (hiZSrv != 0)
-             {
-                 _lightCullCS.SetPushConstant("HiZTex", hiZSrv);
-                 _lightCullCS.Dispatch(_kOccludeLights, list, (uint)(PointLightBuffer.MaxVisible / 64));
-                 list.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(_visibleLights.Native)));
-             }
-
-             // Tiled culling + PBR lighting
+             // On the light clusters (built in FillGBuffer, SceneConstants.LightClustersIdx): each 8×8 group takes the
+             // lights its cluster tile and its pixels' depths allow (light_point_cs.hlsl)
              uint groupsX = ((uint)desc.Width + 7) / 8;
              uint groupsY = ((uint)desc.Height + 7) / 8;
              _pointLightCS.Dispatch(_kPointLight, list, groupsX, groupsY);
-
-             LocalShadows?.EndFrame(list);
         }
 
         /// <summary>
@@ -1558,6 +1560,7 @@ namespace Freefall.Graphics
             ShadowReceivers?.Dispose();
             ScreenSpaceShadows?.Dispose();
             VolumetricFog?.Dispose();
+            _lightClusters.Dispose();
             _aerialPerspective.Dispose();
             _cloudView.Dispose();
             foreach (var tracer in _pointScreenShadows) tracer?.Dispose();

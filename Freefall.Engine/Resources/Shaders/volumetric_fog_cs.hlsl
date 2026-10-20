@@ -5,7 +5,7 @@
 // after the shadow maps and the sky captures, before anything draws fog:
 //   CSFogScatter    one thread per froxel: the light the air there scatters toward the camera and its extinction, per km,
 //                   at a place in the froxel jittered each frame and blended with the froxel's reprojected history
-//                   (rgb × Exposure, a = σe)
+//                   (rgb × Exposure, a = σe); the sun, the moon and the point lights that reach it (light_clusters.hlsli)
 //   CSFogIntegrate  one thread per column, front to back: the light the air adds between the camera and the far side of
 //                   each slice (× Exposure, rgb) and the transmittance (a)
 // Read by sky_common.fx AtmosphereFog through SceneConstants.FogVolumeIdx / FogVolumeRange.
@@ -43,8 +43,12 @@ cbuffer Params : register(b4)
 
 #include "common.fx"
 #include "sky_common.fx"
+#include "light_clusters.hlsli"
 
 #define FOG_SLICES 64           // VolumetricFog.Slices
+// The air closer to a light than this (m²) takes the light it gets there: a froxel's sample can sit in the flame itself,
+// where 1 / d² would make single samples flare (the flame or the lamp glass hides that air anyway)
+#define FOG_POINT_LIGHT_MIN_D2 0.25
 
 SamplerState FogWrapSampler : register(s0);                   // linear wrap (the cloud noise)
 SamplerComparisonState FogShadowSampler : register(s3);       // comparison, less-equal (standard Z shadow maps)
@@ -132,6 +136,38 @@ float3 FroxelBodyLight(AtmosphereParams A, AtmMedium medium, bool moon, float3 p
     return toLight * (visible * single + diffused) + multiple * sky;
 }
 
+// The point lights' light scattered toward the camera per km of air (lux × σs × phase, as a body's single scattering):
+// the lights that reach the place (light_clusters.hlsli), each through its shadow where it has one this frame. A light
+// without a shadow lights the air through walls; the halo of a lamp in a room shows outside only as far as its range.
+float3 FroxelPointLights(AtmosphereParams A, AtmMedium medium, float3 relPos, float3 V, float2 uv, float viewDepth)
+{
+    if (LightClustersIdx == 0 || ClusterLightsIdx == 0)
+        return 0;
+    ByteAddressBuffer clusters = ResourceDescriptorHeap[LightClustersIdx];
+    StructuredBuffer<PointLightData> lights = ResourceDescriptorHeap[ClusterLightsIdx];
+    LightClusterWalk walk;
+    if (!LightClusterBegin(clusters, uv, viewDepth, walk))
+        return 0;
+
+    float3 sum = 0;
+    uint s;
+    [loop] while (LightClusterNext(clusters, walk, s))
+    {
+        PointLightData light = lights[s];
+        float3 toLight = light.Position - relPos;
+        float3 E = PointLightIlluminance(light, toLight, FOG_POINT_LIGHT_MIN_D2);
+        if (all(E <= 0.0))
+            continue;
+        float shadow = PointLightShadowAt(clusters, light, relPos, FogShadowSampler);
+        if (shadow <= 0.0)
+            continue;
+        float cosTheta = dot(V, toLight) * rsqrt(max(dot(toLight, toLight), 1e-6));
+        float3 phase = medium.scatteringMie * AtmMiePhase(A.MieG, cosTheta) + medium.scatteringRay * AtmRayleighPhase(cosTheta);
+        sum += E * (shadow * phase);
+    }
+    return sum;
+}
+
 [numthreads(8, 8, 1)]
 void CSFogScatter(uint3 id : SV_DispatchThreadID)
 {
@@ -167,7 +203,9 @@ void CSFogScatter(uint3 id : SV_DispatchThreadID)
     if (any(A.MoonIlluminance > 0))
         L += A.MoonIlluminance * FroxelBodyLight(A, medium, true, posKm, worldPos, relPos, V, viewDepth,
                                                  A.MoonDirection, open, sky, skyDimming);
-    float4 current = float4(L * Exposure, dot(medium.extinction, 1.0 / 3.0));
+    L += FroxelPointLights(A, medium, relPos, V, (float2(id.xy) + Jitter.xy) * TileUV, viewDepth);
+    // Within half floats: dense fog right by a big fire would pass 65504 and turn the history to inf
+    float4 current = float4(min(L * Exposure, 6e4), dot(medium.extinction, 1.0 / 3.0));
 
     // Last frame's light at the froxel's centre: the grid moves with the camera, so the centre is found in last frame's
     // grid; outside it (or in the first frame) this frame's sample stands alone

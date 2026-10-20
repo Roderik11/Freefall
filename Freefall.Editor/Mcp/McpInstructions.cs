@@ -26,7 +26,8 @@ namespace Freefall.Editor.Mcp
             - Value encodings: vectors {x,y,z} or [x,y,z]; quaternions {x,y,z,w}; Color3/Color4 [r,g,b(,a)]; enums by name;
               asset references by GUID string; entity references {"entity": id} / {"entityUid": "uid"} (null clears);
               component references the same plus optional "component": "Type".
-            - Prefer prefab GUIDs over mesh GUIDs for entity_instantiate / entity_scatter.
+            - Prefer prefab GUIDs over mesh GUIDs for entity_instantiate. Anything repeated over an area goes through PCG
+              (below): there is no scatter tool.
             - Terrain is authored ONLY with stamp components on entities, edited via entity_add_component +
               entity_set_properties; there is no painting and the Terrain asset holds no layers. HeightStamp shapes the
               ground, SplatStamp places a TerrainLayer asset (Layer = its GUID), DecoStamp places or thins a TerrainDecorator

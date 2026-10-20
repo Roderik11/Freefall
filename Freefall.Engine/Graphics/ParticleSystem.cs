@@ -72,7 +72,7 @@ namespace Freefall.Graphics
             public float Turbulence;       public float TurbulenceFrequency; public float WindLean;         public float Follow;
             public Vector3 Carry;          public float PivotX;
             public Vector3 LeanWind;       public float PivotY;
-            public float ForwardScatter;   public float Pad0;               public float Pad1;              public float Pad2;
+            public float ForwardScatter;   public float MultipleScattering; public float Pad1;              public float Pad2;
         }
 
         /// <summary>Everything the system keeps per emitter. The component itself only holds authored data.</summary>
@@ -553,6 +553,7 @@ namespace Freefall.Graphics
                 LeanWind = leanWind,
                 PivotY = e.Pivot.Y,
                 ForwardScatter = Math.Clamp(e.ForwardScatter, 0f, 0.9f),
+                MultipleScattering = Math.Clamp(e.MultipleScattering, 0f, 1f),
             };
 
             if (capacity > 0)

@@ -13,19 +13,8 @@ namespace Freefall.Editor.Mcp
     [Description("World-space ground position (x, z)")]
     public record PointXZ(float X, float Z);
 
-    [Description("Inclusive range; omit either end for unbounded/default")]
-    public record MinMax(float? Min = null, float? Max = null);
-
     [Description("Pixel rectangle")]
     public record PixelRect(int X, int Y, int Width, int Height);
-
-    public record WeightedAsset(
-        [property: Description("Prefab (preferred) or Mesh GUID")] string Guid,
-        [property: Description("Relative selection weight, default 1")] float? Weight = null);
-
-    public record ScatterArea(
-        [property: Description("Circle center on the ground plane")] PointXZ Center,
-        [property: Description("Circle radius in world units, default 100")] float? Radius = null);
 
     public record BatchItem(
         [property: Description("Prefab (preferred) or Mesh GUID, or '@Exact Name' (resolves the prefab of that name)")] string Guid,

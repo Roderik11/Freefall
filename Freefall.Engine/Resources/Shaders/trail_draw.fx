@@ -12,6 +12,7 @@
 #include "sky_common.fx"
 
 SamplerState TrailWrapSampler : register(s0);      // linear wrap (the clouds' volumes, ParticleLight)
+SamplerComparisonState TrailShadowSampler : register(s3);   // less-equal: the sun's cascades, point light shadows
 
 cbuffer PushConstants : register(b3)
 {
@@ -72,9 +73,18 @@ VSOutput VS(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
     float2 corner = Corners[vertexID % 6];
     uint index = instanceID + (uint)corner.x;
     TrailPoint p = Points[index];
-    // Premultiplied: only the light scales. Lit: an albedo under the sky and the sun; else nits, pre-exposed as a light source
+    // Premultiplied: only the light scales. Lit: an albedo under the sky and the sun (through their shadows) and the
+    // point lights that reach it; else nits, pre-exposed as a light source
     float skyVisible = SkyVisibility(p.Position, float3(0, 1, 0));
-    p.Color.rgb *= (p.Flags & TRAIL_LIT) != 0 ? ParticleLight(TrailWrapSampler, p.Position - CamPos, normalize(CamPos - p.Position), 0.0) * skyVisible : EmissiveExposure.xxx;
+    if ((p.Flags & TRAIL_LIT) != 0)
+    {
+        float3 relPos = p.Position - CamPos;
+        float3 toEye = normalize(-relPos);
+        p.Color.rgb *= ParticleLight(TrailWrapSampler, relPos, toEye, 0.0, ParticleBodyShadows(relPos, TrailShadowSampler)) * skyVisible
+                     + ParticlePointLight(relPos, toEye, 0.0, 0.5 * p.Width, TrailShadowSampler);
+    }
+    else
+        p.Color.rgb *= EmissiveExposure;
     output.SkyVisible = skyVisible;
 
     // A blade: the sheet is given, from the point (the tip's edge) to its other edge

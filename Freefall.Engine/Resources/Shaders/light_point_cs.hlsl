@@ -1,12 +1,9 @@
-// Point Light Compute Shader — tiled culling + PBR lighting
+// Point Light Compute Shader — PBR lighting of the opaque surfaces by this frame's visible point lights
 //
-// The lights come from this frame's visible list (point_light_cull.hlsl: registry → frustum → list;
-// CSOccludeLights flags those behind the Hi-Z).
-// Phase 1: Tile builds 4 frustum planes from its screen-space bounds.
-//          All 64 threads cooperatively test visible lights against the tile
-//          frustum, building a compact per-tile light list in groupshared memory.
-// Phase 2: Each thread loads its pixel's G-buffer and loops only over
-//          the tile's accepted lights.
+// CSPointLight: each 8×8 group takes the lights the light clusters give its tile and depth range (light_clusters.hlsli),
+// tests them against its own frustum and depths, and every pixel shades with those. Since 2026-10-20; before, each
+// group tested every visible light against its frustum (no depth bounds, at most 128 a tile) and skipped those a Hi-Z
+// pass had flagged.
 
 #pragma kernel CSPointLight
 
@@ -19,8 +16,6 @@ cbuffer PushConstants : register(b3)
     uint OutputUAVIdx;
     uint ScreenWidthIdx;
     uint ScreenHeightIdx;
-    uint VisibleLightUAVIdx;      // RWStructuredBuffer<PointLightData>: this frame's visible lights
-    uint VisibleLightCountUAVIdx; // RWByteAddressBuffer: [0] = visible lights
     uint LocalShadowAtlasIdx;   // Texture2DArray: point light shadow atlas (0 = none rendered this frame)
     uint LocalShadowViewsIdx;   // StructuredBuffer<LocalShadowView>
     uint LocalShadowLightsIdx;  // StructuredBuffer<LocalShadowLight>
@@ -38,6 +33,7 @@ cbuffer PushConstants : register(b3)
 
 #include "common.fx"
 #include "point_lights.hlsli"
+#include "light_clusters.hlsli"
 
 SamplerComparisonState ShadowSampler : register(s3); // LessEqual, linear: standard Z
 
@@ -118,14 +114,8 @@ float3 FresnelSchlick(float cosTheta, float3 F0)
     return F0 + (1.0 - F0) * pow(1.0 - cosTheta, 5.0);
 }
 
-// ── Tile culling shared memory ────────────────────────────────────────────
+// ── Tiles ──────────────────────────────────────────────────────────────────
 #define TILE_SIZE 8
-// Past this a tile drops lights in the order the GPU appends them, which changes every frame (they would blink):
-// 128 keeps that out of reach of dense streets (10,000 lanterns over Eldermoor, 2026-10-16)
-#define MAX_LIGHTS_PER_TILE 128
-
-groupshared uint g_TileLightCount;
-groupshared uint g_TileLightIndices[MAX_LIGHTS_PER_TILE];
 
 // Build 4 side planes for a screen-space tile, in camera-relative view space.
 // Each plane normal points INWARD (toward tile center).
@@ -180,7 +170,133 @@ bool SphereFrustumTest(float3 center, float radius, float4 planes[4])
     return true;
 }
 
-// ── Main kernel ───────────────────────────────────────────────────────────
+// ── A pixel's surface, and one light on it ──────────────────────────────────
+struct PointSurface
+{
+    float3 Pos;             // camera-relative
+    float3 N;
+    float3 V;
+    float NdotV;
+    float3 F0;
+    float3 DiffuseAlbedo;
+    float A2;
+    float K;
+    float Gv;
+    float Metal;
+    float AO;
+    bool Vegetation;
+    uint2 Px;
+};
+
+// The G-buffer at a pixel; false for the sky
+bool LoadPointSurface(uint2 px, float2 screenSize, out PointSurface s)
+{
+    s = (PointSurface)0;
+    Texture2D NormalTex = ResourceDescriptorHeap[NormalTexIdx];
+    Texture2D DepthTex  = ResourceDescriptorHeap[DepthTexIdx];
+    int3 coord = int3(px, 0);
+    float depth = DepthTex.Load(coord).r;
+    // Sky pixels: reverse depth, far = 0
+    if (depth <= 0.0f)
+        return false;
+
+    // World position from depth (camera-relative, zero translation)
+    float2 texCoord = (float2(px) + 0.5) / screenSize;
+    s.Pos = posFromDepth(texCoord, depth, CameraInverse).xyz;
+    s.N = NormalTex.Load(coord).xyz;
+    s.Px = px;
+
+    Texture2D AlbedoTex = ResourceDescriptorHeap[AlbedoTexIdx];
+    Texture2D DataTex   = ResourceDescriptorHeap[DataTexIdx];
+    float3 albedo   = AlbedoTex.Load(coord).rgb;
+    float4 dataFull = DataTex.Load(coord);
+    s.Vegetation = (dataFull.a > 0.3 && dataFull.a < 0.7);
+
+    float rough = max(dataFull.r, 0.04);
+    s.Metal = saturate(dataFull.g);
+    s.AO    = saturate(dataFull.b);
+
+    // View vector (the camera at the origin)
+    s.V = normalize(-s.Pos);
+    s.NdotV = max(dot(s.N, s.V), 0.001);
+    s.F0 = lerp(float3(0.04, 0.04, 0.04), albedo, s.Metal);
+    float a = rough * rough;
+    s.A2 = a * a;
+    // Smith GGX geometry term (view component, shared across lights)
+    s.K = (rough + 1.0) * (rough + 1.0) / 8.0;
+    s.Gv = s.NdotV / max(s.NdotV * (1.0 - s.K) + s.K, 1e-4);
+    s.DiffuseAlbedo = albedo / 3.14159;
+    return true;
+}
+
+// One light's radiance off the surface (physical, not yet pre-exposed); 0 past its range or behind the surface
+float3 ShadePointLight(PointLightData light, PointSurface s)
+{
+    // Direction from surface to light
+    float3 toLight = light.Position - s.Pos;
+    float dist = length(toLight);
+    if (dist > light.Range)
+        return 0;
+    float3 L = toLight / dist;
+
+    float rawNdotL = dot(s.N, L);
+    float NdotL = max(rawNdotL, 0.0);
+    if (NdotL <= 0.0 && !s.Vegetation)
+        return 0;
+
+    // Inverse square (Intensity is candela: lux at 1 m), with a smooth window to nothing at Range (Karis 2013:
+    // (1 - (d/R)^4)^2) and no closer than 10 cm
+    float r4 = dist / light.Range;
+    r4 *= r4;
+    r4 *= r4;
+    float window = saturate(1.0 - r4);
+    float attenuation = window * window / max(dist * dist, 0.01);
+
+    // Shadow: leaves lit from behind push off their side facing the light
+    float shadow = PointLightShadow(light, s.Pos, rawNdotL < 0.0 ? -s.N : s.N, L);
+    shadow = min(shadow, PointLightScreenShadow(light, s.Px));
+    if (shadow <= 0.0)
+        return 0;
+    attenuation *= shadow;
+
+    float3 H = normalize(L + s.V);
+    float NdotH = max(dot(s.N, H), 0.0);
+    float VdotH = max(dot(s.V, H), 0.0);
+
+    // GGX normal distribution, Smith GGX geometry (light component), Schlick Fresnel
+    float denom = (NdotH * NdotH) * (s.A2 - 1.0) + 1.0;
+    float D = s.A2 / max(3.14159 * denom * denom, 1e-4);
+    float Gl = NdotL / max(NdotL * (1.0 - s.K) + s.K, 1e-4);
+    float G = s.Gv * Gl;
+    float3 F = FresnelSchlick(VdotH, s.F0);
+    float3 spec = (D * G) * F / max(4.0 * NdotL * s.NdotV, 1e-4);
+
+    // Diffuse (energy-conserving Lambert)
+    float3 kd = (1.0 - F) * (1.0 - s.Metal);
+    float3 diffuse = kd * s.DiffuseAlbedo;
+
+    if (s.Vegetation)
+    {
+        float wrapNdotL = rawNdotL * 0.5 + 0.5;
+        float stdNdotL = max(rawNdotL, 0.0);
+        float sunFacing = saturate(rawNdotL * 2.0);
+        float vegNdotL = lerp(stdNdotL, wrapNdotL, sunFacing);
+        return diffuse * (light.Color * light.Intensity * vegNdotL * attenuation) * s.AO;
+    }
+    return (diffuse + spec) * (light.Color * light.Intensity * NdotL * attenuation) * s.AO;
+}
+
+// ── On the light clusters (light_clusters.hlsli) ─────────────────────────────
+// Each 8×8 group lies in one 32-pixel cluster tile. It takes the view depths its pixels span, the sorted lights the
+// z-bins of those depths hold and the tile's mask lets through, and keeps (as a bitmask over the sorted list, no cap)
+// those whose sphere its own frustum and depth range see: a light behind every pixel of the group, or in front of all
+// of them, is left out (what the Hi-Z occlusion test did per light, now per group). Every pixel walks the same bits.
+groupshared uint g_MinDepth;
+groupshared uint g_MaxDepth;
+groupshared uint g_First;
+groupshared uint g_Last;
+groupshared uint g_GroupLights[LIGHT_CLUSTER_WORDS];
+
 [numthreads(TILE_SIZE, TILE_SIZE, 1)]
 void CSPointLight(
     uint3 dispatchThreadId : SV_DispatchThreadID,
@@ -189,171 +305,97 @@ void CSPointLight(
 {
     uint2 px = dispatchThreadId.xy;
     float2 screenSize = float2(ScreenWidthIdx, ScreenHeightIdx);
+    float3 forward = float3(CameraRelativeVP._14, CameraRelativeVP._24, CameraRelativeVP._34);
 
-    // This frame's visible lights (point_light_cull.hlsl)
-    RWByteAddressBuffer countBuf = ResourceDescriptorHeap[VisibleLightCountUAVIdx];
-    uint lightCount = min(countBuf.Load(0), MAX_VISIBLE_LIGHTS);
-    RWStructuredBuffer<PointLightData> lightData = ResourceDescriptorHeap[VisibleLightUAVIdx];
+    PointSurface s;
+    bool lit = px.x < ScreenWidthIdx && px.y < ScreenHeightIdx && LoadPointSurface(px, screenSize, s);
+    float viewDepth = lit ? dot(s.Pos, forward) + CameraRelativeVP._44 : 0.0;
 
-    // ── Phase 1: Tile-level light culling ─────────────────────────────────
     if (groupIndex == 0)
-        g_TileLightCount = 0;
-
+    {
+        g_MinDepth = 0x7F7FFFFFu;
+        g_MaxDepth = 0u;
+        g_First = 0xFFFFu;
+        g_Last = 0u;
+    }
+    GroupMemoryBarrierWithGroupSync();
+    // Positive floats sort as their bits do
+    if (lit)
+    {
+        InterlockedMin(g_MinDepth, asuint(max(viewDepth, 0.0)));
+        InterlockedMax(g_MaxDepth, asuint(max(viewDepth, 0.0)));
+    }
     GroupMemoryBarrierWithGroupSync();
 
-    if (lightCount > 0)
+    // From here on every return is the whole group's: the values decided on are in group shared memory
+    if (g_MaxDepth == 0u || LightClustersIdx == 0 || ClusterLightsIdx == 0)
+        return;
+    ByteAddressBuffer clusters = ResourceDescriptorHeap[LightClustersIdx];
+    if (clusters.Load(LC_COUNT * 4) == 0)
+        return;
+    float minDepth = asfloat(g_MinDepth), maxDepth = asfloat(g_MaxDepth);
+
+    // The first and last sorted light of any z-bin the group's depths span
+    uint b1 = LightZBin(maxDepth);
+    for (uint b = LightZBin(minDepth) + groupIndex; b <= b1; b += TILE_SIZE * TILE_SIZE)
     {
-        float4 tilePlanes[4];
-        BuildTileFrustumPlanes(groupId.xy, screenSize, CameraInverse, tilePlanes);
-
-        for (uint vi = groupIndex; vi < lightCount; vi += (TILE_SIZE * TILE_SIZE))
+        uint range = clusters.Load((LC_BINS + b) * 4);
+        uint first = range & 0xFFFFu, last = range >> 16;
+        if (first <= last)
         {
-            PointLightData light = lightData[vi];
-            if ((light.Flags & VISIBLE_LIGHT_OCCLUDED) != 0)
-                continue;
-
-            if (SphereFrustumTest(light.Position, light.Range, tilePlanes))
-            {
-                uint slot;
-                InterlockedAdd(g_TileLightCount, 1, slot);
-                if (slot < MAX_LIGHTS_PER_TILE)
-                    g_TileLightIndices[slot] = vi;
-            }
+            InterlockedMin(g_First, first);
+            InterlockedMax(g_Last, last);
         }
     }
+    GroupMemoryBarrierWithGroupSync();
+    uint firstLight = g_First, lastLight = g_Last;
+    if (firstLight > lastLight)
+        return;
+    uint w0 = firstLight >> 5, w1 = lastLight >> 5;
 
+    // The group's cluster tile (by the group's centre: the cluster grid was sized to the view, as this pass is)
+    uint2 size = uint2(clusters.Load(LC_WIDTH * 4), clusters.Load(LC_HEIGHT * 4));
+    float2 centre = (float2(groupId.xy * TILE_SIZE) + 0.5 * TILE_SIZE) / screenSize;
+    uint2 tile = min(uint2(centre * float2(size)), size - 1u) >> LIGHT_CLUSTER_TILE_SHIFT;
+    uint maskBase = (LC_MASKS + (tile.y * clusters.Load(LC_TILES_X * 4) + tile.x) * LIGHT_CLUSTER_WORDS) * 4;
+
+    float4 planes[4];
+    BuildTileFrustumPlanes(groupId.xy, screenSize, CameraInverse, planes);
+    StructuredBuffer<PointLightData> lights = ResourceDescriptorHeap[ClusterLightsIdx];
+    for (uint w = w0 + groupIndex; w <= w1; w += TILE_SIZE * TILE_SIZE)
+    {
+        uint bits = clusters.Load(maskBase + w * 4);
+        if (w == w0)
+            bits &= 0xFFFFFFFFu << (firstLight & 31u);
+        if (w == w1)
+            bits &= LightClusterLastMask(lastLight);
+        uint kept = 0;
+        while (bits != 0)
+        {
+            uint bit = firstbitlow(bits);
+            bits &= bits - 1u;
+            PointLightData light = lights[w * 32u + bit];
+            float z = dot(light.Position, forward) + CameraRelativeVP._44;
+            if (z + light.Range < minDepth || z - light.Range > maxDepth)
+                continue;
+            if (SphereFrustumTest(light.Position, light.Range, planes))
+                kept |= 1u << bit;
+        }
+        g_GroupLights[w] = kept;
+    }
     GroupMemoryBarrierWithGroupSync();
 
-    // ── Phase 2: Per-pixel PBR lighting ───────────────────────────────────
-    if (px.x >= ScreenWidthIdx || px.y >= ScreenHeightIdx)
+    if (!lit)
         return;
-
-    uint tileLightCount = min(g_TileLightCount, MAX_LIGHTS_PER_TILE);
-    if (tileLightCount == 0)
-        return;
-
-    // Load G-Buffer
-    Texture2D NormalTex = ResourceDescriptorHeap[NormalTexIdx];
-    Texture2D DepthTex  = ResourceDescriptorHeap[DepthTexIdx];
-
-    int3 coord = int3(px, 0);
-    float3 normal = NormalTex.Load(coord).xyz;
-    float depth = DepthTex.Load(coord).r;
-
-    // Skip sky pixels — reverse depth: far=0
-    if (depth <= 0.0f)
-        return;
-
-    // Reconstruct world position from depth (camera-relative, zero-translation)
-    float2 texCoord = (float2(px) + 0.5) / screenSize;
-    float4 worldPos = posFromDepth(texCoord, depth, CameraInverse);
-
-    // Load material data
-    Texture2D AlbedoTex = ResourceDescriptorHeap[AlbedoTexIdx];
-    Texture2D DataTex   = ResourceDescriptorHeap[DataTexIdx];
-
-    float3 albedo   = AlbedoTex.Load(coord).rgb;
-    float4 dataFull = DataTex.Load(coord);
-    bool isVegetation = (dataFull.a > 0.3 && dataFull.a < 0.7);
-
-    float rough = max(dataFull.r, 0.04);
-    float metal = saturate(dataFull.g);
-    float ao    = saturate(dataFull.b);
-
-    // View vector (worldPos is camera-relative, camera at origin)
-    float3 V = normalize(-worldPos.xyz);
-    float NdotV = max(dot(normal, V), 0.001);
-
-    // Metallic F0
-    float3 F0 = lerp(float3(0.04, 0.04, 0.04), albedo, metal);
-
-    float a  = rough * rough;
-    float a2 = a * a;
-
-    // Smith GGX geometry term (view component, shared across lights)
-    float k = (rough + 1.0);
-    k = (k * k) / 8.0;
-    float Gv = NdotV / max(NdotV * (1.0 - k) + k, 1e-4);
-
-    // Diffuse coefficient
-    float3 diffuseAlbedo = albedo / 3.14159;
-
-    // Accumulate lighting from tile's lights only
     float3 totalLighting = 0;
-
-    for (uint ti = 0; ti < tileLightCount; ti++)
+    for (uint w2 = w0; w2 <= w1; w2++)
     {
-        PointLightData light = lightData[g_TileLightIndices[ti]];
-
-        // Direction from surface to light
-        float3 toLight = light.Position - worldPos.xyz;
-        float dist = length(toLight);
-
-        // Per-pixel range check (tile test is conservative)
-        if (dist > light.Range)
-            continue;
-
-        float3 L = toLight / dist;
-
-        // N·L
-        float rawNdotL = dot(normal, L);
-        float NdotL = max(rawNdotL, 0.0);
-
-        if (NdotL <= 0.0 && !isVegetation)
-            continue;
-
-        // Inverse square (Intensity is candela: lux at 1 m), with a smooth window to nothing at Range (Karis 2013:
-        // (1 - (d/R)^4)^2) and no closer than 10 cm
-        float r4 = dist / light.Range;
-        r4 *= r4;
-        r4 *= r4;
-        float window = saturate(1.0 - r4);
-        float attenuation = window * window / max(dist * dist, 0.01);
-
-        // Shadow: leaves lit from behind push off their side facing the light
-        float shadow = PointLightShadow(light, worldPos.xyz, rawNdotL < 0.0 ? -normal : normal, L);
-        shadow = min(shadow, PointLightScreenShadow(light, px));
-        if (shadow <= 0.0)
-            continue;
-        attenuation *= shadow;
-
-        // Half vector
-        float3 H = normalize(L + V);
-        float NdotH = max(dot(normal, H), 0.0);
-        float VdotH = max(dot(V, H), 0.0);
-
-        // GGX Normal Distribution Function
-        float denom = (NdotH * NdotH) * (a2 - 1.0) + 1.0;
-        float D = a2 / max(3.14159 * denom * denom, 1e-4);
-
-        // Smith GGX Geometry (light component)
-        float Gl = NdotL / max(NdotL * (1.0 - k) + k, 1e-4);
-        float G = Gv * Gl;
-
-        // Fresnel (Schlick)
-        float3 F = FresnelSchlick(VdotH, F0);
-
-        // Specular BRDF
-        float3 spec = (D * G) * F / max(4.0 * NdotL * NdotV, 1e-4);
-
-        // Diffuse BRDF (energy-conserving Lambert)
-        float3 kd = (1.0 - F) * (1.0 - metal);
-        float3 diffuse = kd * diffuseAlbedo;
-
-        // Final lighting
-        if (isVegetation)
+        uint bits = g_GroupLights[w2];
+        while (bits != 0)
         {
-            float wrapNdotL = rawNdotL * 0.5 + 0.5;
-            float stdNdotL = max(rawNdotL, 0.0);
-            float sunFacing = saturate(rawNdotL * 2.0);
-            float vegNdotL = lerp(stdNdotL, wrapNdotL, sunFacing);
-            float3 radiance = light.Color * light.Intensity * vegNdotL * attenuation;
-            totalLighting += diffuse * radiance * ao;
-        }
-        else
-        {
-            float3 radiance = light.Color * light.Intensity * NdotL * attenuation;
-            totalLighting += (diffuse + spec) * radiance * ao;
+            uint bit = firstbitlow(bits);
+            bits &= bits - 1u;
+            totalLighting += ShadePointLight(lights[w2 * 32u + bit], s);
         }
     }
 

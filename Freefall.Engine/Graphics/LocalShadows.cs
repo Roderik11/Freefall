@@ -116,7 +116,8 @@ namespace Freefall.Graphics
         private ResourceStates _atlasState = ResourceStates.DepthWrite;
         private int _selectCount;
         private uint _recentLights = uint.MaxValue;
-        private bool _selected;     // Select ran this frame: views and shadow lights are in NonPixelShaderResource
+        private bool _selected;     // Select ran this frame: views and shadow lights are in ShaderRead until EndFrame
+        private const ResourceStates ShaderRead = ResourceStates.NonPixelShaderResource | ResourceStates.PixelShaderResource;
         private bool _rendered;
         private string? _cameraName;
 
@@ -212,11 +213,11 @@ namespace Freefall.Graphics
             _cs.Dispatch(_kBuildViews, list, (uint)(MaxViews / 64));
             UavBarrier(list);
 
-            // Views and shadow lights are read through SRVs by the culler, the shadow vertex shaders and the
-            // point light shader until EndFrame
+            // Views and shadow lights are read through SRVs by the culler, the shadow vertex shaders, the point light
+            // shader, the near fog volume and the particles until EndFrame (after the forward pass)
             list.Barriers(
-                new ResourceBarrier(new ResourceTransitionBarrier(_views.Native, ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource)),
-                new ResourceBarrier(new ResourceTransitionBarrier(_shadowLights.Native, ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource)));
+                new ResourceBarrier(new ResourceTransitionBarrier(_views.Native, ResourceStates.UnorderedAccess, ShaderRead)),
+                new ResourceBarrier(new ResourceTransitionBarrier(_shadowLights.Native, ResourceStates.UnorderedAccess, ShaderRead)));
             _selected = true;
 
             // What was picked, for the stats (read 2 frames later)
@@ -324,13 +325,13 @@ namespace Freefall.Graphics
             _selected = false;
         }
 
-        /// <summary>After the point light shader: views and shadow lights go back to UAV for the next selection.</summary>
+        /// <summary>After the forward pass (particles read them too): views and shadow lights go back to UAV for the next selection.</summary>
         public void EndFrame(ID3D12GraphicsCommandList list)
         {
             if (!_selected) return;
             list.Barriers(
-                new ResourceBarrier(new ResourceTransitionBarrier(_views.Native, ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess)),
-                new ResourceBarrier(new ResourceTransitionBarrier(_shadowLights.Native, ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess)));
+                new ResourceBarrier(new ResourceTransitionBarrier(_views.Native, ShaderRead, ResourceStates.UnorderedAccess)),
+                new ResourceBarrier(new ResourceTransitionBarrier(_shadowLights.Native, ShaderRead, ResourceStates.UnorderedAccess)));
             _selected = false;
         }
 

@@ -51,7 +51,7 @@ struct ParticleEmitter     // 368 bytes
     float  Turbulence;     float  TurbulenceFrequency; float WindLean;           float Follow;       // m/s² / 1 / swirl size / m of lean at the sprite's top per m/s of Wind / FollowEmitter
     float3 Carry;          float  PivotX;              // how far live particles move along with the emitter this frame (FollowEmitter)
     float3 LeanWind;       float  PivotY;              // the wind a sprite leans in: Wind less the emitter's own motion it follows / quad offset in its sizes
-    float  ForwardScatter; float  _pad0;               float _pad1;              float _pad2;        // lit: Henyey-Greenstein g of the sun's and moon's light (ParticleLight)
+    float  ForwardScatter; float  MultipleScattering;  float _pad1;              float _pad2;        // lit: Henyey-Greenstein g of the light (ParticleLight) / its even share (ParticlePhase)
 };
 
 // ParticleEmitter.RenderMode

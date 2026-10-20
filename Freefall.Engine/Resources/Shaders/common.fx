@@ -52,6 +52,10 @@ cbuffer SceneConstants : register(b0)
     uint CloudDepthIdx;                // the same view's cloud depth (R16F, km along the ray to where their light comes from); 0 = none
     uint CloudSceneDepthIdx;           // the scene's view depth (m, 0 = sky) each of its texels was marched to: sky_common.fx CloudsAt
     uint CloudsOn;                     // 1: the volumetric clouds this frame; 0: the 2D layer (CloudParamsIdx then holds an empty frame)
+
+    // ── Light clusters (Graphics.LightClusters, set per view by DeferredRenderer) — light_clusters.hlsli ──
+    uint LightClustersIdx;             // ByteAddressBuffer: header, z-bins and tile masks of this view's point lights; 0 = none
+    uint ClusterLightsIdx;             // StructuredBuffer<PointLightData>: the visible lights in view-depth order
 }
 
 // ── Large-scale variation of the ground and what grows on it (gputerrain.fx, grass cards, blades, flowers) ──
