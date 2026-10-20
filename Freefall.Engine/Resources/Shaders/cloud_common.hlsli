@@ -22,6 +22,8 @@
 #define CLOUD_BASE_TILE (CLOUD_PERIOD / 40.0)      // 6.4 km: the base shape's noise tile
 #define CLOUD_DETAIL_TILE (CLOUD_PERIOD / 160.0)   // 1.6 km: the billows' noise tile (Worley cells of 400 m and down)
 #define CLOUD_COVER_TILE (CLOUD_PERIOD / 5.0)      // 51.2 km: the coverage pattern's tile
+#define CLOUD_SHADOW_TEXELS 1024    // the ground shadow map's texels each way (Clouds.ShadowMapTexels)
+#define CLOUD_SHADOW_MARGIN 1500.0  // metres inside its window's edge where it hands over to the light volume
 
 struct CloudLevel
 {
@@ -68,6 +70,12 @@ struct CloudParams
     float FlashIntensity;   // a lightning flash's luminous intensity now (cd; 0 = none)
     float3 FlashPos;        // where it is, camera-relative (m)
     float FlashSpread;      // the extinction (per m) its light diffuses through, the cloud's mean round it
+    uint ShadowMap;         // Texture2D<float> (R16F) CLOUD_SHADOW_TEXELS²: the optical depth toward the light from where a
+                            // ray toward it crosses the slab's bottom (the ground shadow map, clouds_cs.hlsl
+                            // CSCloudShadowMap), toroidal in cloud space; always a real texture
+    float ShadowTexel;      // metres a texel spans (0 = not made yet)
+    float2 ShadowCentre;    // cloud-space xz the map's window is centred on (where the camera's ray toward the light
+                            // crosses the slab's bottom, snapped to texels)
 };
 
 // A rain shaft under a raining cell (Clouds.cs PlaceRainShafts): from the clouds' base down to Bottom (the ground, or
@@ -253,6 +261,12 @@ float2 CloudSkyDepthAt(CloudParams C, uint level, float2 xz, float h, SamplerSta
     return sky.SampleLevel(wrap, CloudLevelUvw(C, L, xz, clamp(h, C.SlabBottom, C.SlabTop)), 0);
 }
 
+// A cloud-space difference brought to the nearest of its period's repeats (−P/2 … P/2)
+float2 CloudWrapDelta(float2 d)
+{
+    return d - CLOUD_PERIOD * round(d / CLOUD_PERIOD);
+}
+
 // The clouds' optical depth toward the light from a place (camera-relative): the light volume where the light's path
 // crosses the slab's base, or at the place itself inside the slab. The path's height rises with the planet's curvature:
 // h + s·L.y + s²/2R reaches the base at s = 2|c| / (L.y + sqrt(L.y² + 2|c|/R)), c = h − base, written without
@@ -261,18 +275,35 @@ float2 CloudSkyDepthAt(CloudParams C, uint level, float2 xz, float h, SamplerSta
 // light stand for the rest of the way (a deck that runs on keeps the light out, and at that angle every place round the
 // camera looks through nearly the same clouds). 0 for any other light than the one the volumes are made for
 // (sky_common.fx CloudTransmission uses the deck's means for that one).
+// Below the slab, where the crossing lies inside the ground shadow map's window (clouds_cs.hlsl CSCloudShadowMap), the
+// map instead, handing over to the light volume over CLOUD_SHADOW_MARGIN at its edge: a low light crosses the slab
+// kilometres away, where the light volume's texels are 0.25-1 km, and its shadows came out as blocks that flipped as its
+// levels followed the camera (the moon's glint on the sea cut by squares; user, 2026-10-20).
 float CloudShadowDepth(CloudParams C, float3 rel, float3 toLight, SamplerState wrap)
 {
     if (dot(toLight, C.LightDir) < 0.99)
         return 0.0;
     float h = CloudHeight(rel);
     float3 q = rel;
+    float mapShare = 0.0, mapTau = 0.0;
     if (h < C.SlabBottom)
     {
         float c = C.SlabBottom - h;
         float s = 2.0 * c / (toLight.y + sqrt(toLight.y * toLight.y + 2.0 * c / CLOUD_EARTH_RADIUS));
         q = rel + toLight * s;
         h = C.SlabBottom + 1.0;
+        if (C.ShadowTexel > 0.0)
+        {
+            float2 xzc = C.CameraCloud + q.xz;
+            float2 fromCentre = CloudWrapDelta(xzc - C.ShadowCentre);
+            float halfSize = 0.5 * CLOUD_SHADOW_TEXELS * C.ShadowTexel;
+            mapShare = saturate((halfSize - CLOUD_SHADOW_MARGIN - max(abs(fromCentre.x), abs(fromCentre.y)))
+                                / CLOUD_SHADOW_MARGIN);
+            Texture2D<float> map = ResourceDescriptorHeap[C.ShadowMap];
+            mapTau = map.SampleLevel(wrap, xzc / (CLOUD_SHADOW_TEXELS * C.ShadowTexel), 0);
+            if (mapShare >= 1.0)
+                return mapTau;
+        }
     }
     float dist = max(abs(q.x), abs(q.z));
     float edge = C.Levels[CLOUD_LEVELS - 1].Reach * 0.95;
@@ -287,7 +318,7 @@ float CloudShadowDepth(CloudParams C, float3 rel, float3 toLight, SamplerState w
     float tau = CloudLightDepthAt(C, level, xz, h, wrap);
     if (blend > 0.0)
         tau = lerp(tau, CloudLightDepthAt(C, level + 1, xz, h, wrap), blend);
-    return tau;
+    return lerp(tau, mapTau, mapShare);
 }
 
 // Optical depth straight up (x) and down (y) from a place (camera-relative), from the sky volume of the level its

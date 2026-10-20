@@ -83,6 +83,7 @@ namespace Freefall.Graphics
             public Vector3 LightDir; public uint LightIsMoon;
             public uint ProbeClouds; public uint RainShafts, RainCount; public float FlashIntensity;
             public Vector3 FlashPos; public float FlashSpread;
+            public uint ShadowMap; public float ShadowTexel; public Vector2 ShadowCentre;
         }
 
         // CloudRainShaft in cloud_common.hlsli
@@ -118,7 +119,25 @@ namespace Freefall.Graphics
         private readonly record struct Bake(int Level, long X0, long Z0, int BricksX, int BricksZ);
 
         private static ComputeShader? _cs;
-        private static int _kBake, _kLightInit, _kLightStep, _kLightChain, _kSkyScan, _kProbeFace;
+        private static int _kBake, _kLightInit, _kLightStep, _kLightChain, _kSkyScan, _kProbeFace, _kShadowMap;
+
+        // The ground shadow map (clouds_cs.hlsl CSCloudShadowMap, VOLUMETRIC_CLOUDS_PLAN §8): the optical depth toward the
+        // light from where a ray toward it crosses the slab's bottom, 1024² over 32 km of cloud space round the camera's
+        // own crossing, toroidal. A low light crosses the slab kilometres away, where the light volume's texels are
+        // 0.25-1 km: its shadows came out as blocks that flipped as the levels followed the camera.
+        public const int ShadowMapTexels = 1024;                // cloud_common.hlsli CLOUD_SHADOW_TEXELS
+        private const float ShadowMapTexel = 31.25f;            // m: 32 km across
+        private const float EarthRadius = 6360000f;             // cloud_common.hlsli CLOUD_EARTH_RADIUS
+        // All of it every 16 frames: ~0.075 ms at 64 rows (0.15 ms at 128); the map is in cloud space, so only the clouds'
+        // own slow change and a moving light age it
+        private const int ShadowRowsPerFrame = ShadowMapTexels / 16;
+        private static RenderTexture2D? _shadowMap;
+        private static ResourceStates _shadowMapState = ResourceStates.Common;
+        private static int _shadowRow;
+        private static bool _shadowAll = true;                  // every row this frame (a rebake, the light jumped, a teleport)
+        private static Vector3 _shadowLightDir;                 // last frame's
+        private static Vector2 _shadowCentre;                   // cloud space, snapped to texels
+        private static int _shadowRowsLast;
 
         // The sky probe's clouds: 64² × 6 (SkyProbe's size), a face a frame round the five that see the sky
         private const int ProbeSize = 64;
@@ -186,6 +205,7 @@ namespace Freefall.Graphics
             _kLightChain = _cs.FindKernel("CSCloudLightChain");
             _kSkyScan = _cs.FindKernel("CSCloudSkyScan");
             _kProbeFace = _cs.FindKernel("CSCloudProbeFace");
+            _kShadowMap = _cs.FindKernel("CSCloudShadowMap");
         }
 
         private static void EnsureResources()
@@ -214,6 +234,9 @@ namespace Freefall.Graphics
                 _cells[i] = GraphicsBuffer.CreateUpload<GpuCell>(_cellData.Length, mapped: true);
                 _rainShafts[i] = GraphicsBuffer.CreateUpload<GpuRainShaft>(MaxRainShafts, mapped: true);
             }
+
+            // Optical depths, half floats as the light volumes
+            _shadowMap = new RenderTexture2D(device, ShadowMapTexels, ShadowMapTexels, Format.R16_Float, randomWrite: true);
 
             // The probe's clouds: pre-exposed light and a transmittance, as the probe holds light
             const Format probeFormat = Format.R16G16B16A16_Float;
@@ -373,6 +396,24 @@ namespace Freefall.Graphics
             _describeCz = cz;
             _describeFlash = FlashRelative(cameraPos, cx, cz);
 
+            // The ground shadow map's window: centred on where the camera's ray toward the light crosses the slab's bottom
+            // (cloud_common.hlsli CloudShadowDepth's formula), snapped to texels. Every row again when the field was baked
+            // again, the light changed source or jumped over 0.1° in a frame (a time-of-day drag; the day's own slow turn
+            // is followed by the rolling rows), or the window jumped (a teleport); otherwise a share of the rows a frame,
+            // round and round (the clouds change slowly; the window moves with them in cloud space)
+            float below = MathF.Max(slabBottom - cameraPos.Y, 0f);
+            float ly = MathF.Max(lightDir.Y, 0.02f);
+            float cross = below > 0f ? MathF.Min(2f * below / (ly + MathF.Sqrt(ly * ly + 2f * below / EarthRadius)), 100000f) : 0f;
+            var centre = new Vector2(
+                (float)(Math.Round(Wrap(cx + lightDir.X * cross) / ShadowMapTexel) * ShadowMapTexel),
+                (float)(Math.Round(Wrap(cz + lightDir.Z * cross) / ShadowMapTexel) * ShadowMapTexel));
+            double jumpX = WrapDelta(centre.X - _shadowCentre.X), jumpZ = WrapDelta(centre.Y - _shadowCentre.Y);
+            if (relight || Vector3.Dot(lightDir, _shadowLightDir) < MathF.Cos(0.1f * MathF.PI / 180f)
+                || jumpX * jumpX + jumpZ * jumpZ > 4000.0 * 4000.0)
+                _shadowAll = true;
+            _shadowLightDir = lightDir;
+            _shadowCentre = centre;
+
             var wind = Wind.GeneratedDirection;
             var p = new GpuParams
             {
@@ -405,6 +446,9 @@ namespace Freefall.Graphics
                 // The light spreads through the cloud's mean extinction round the flash, a tenth of a full cloud's: at
                 // 0.4 only the core within ~1 km lit, where a flash lights a whole storm cell
                 FlashSpread = MathF.Max(s.Density, 0f) * 0.1f,
+                ShadowMap = _shadowMap!.BindlessIndex,
+                ShadowTexel = ShadowMapTexel,
+                ShadowCentre = centre,
             };
             unsafe { *_params[slot]!.WritePtr<GpuParams>() = p; }
             _paramsIdx = _params[slot]!.SrvIndex;
@@ -669,6 +713,27 @@ namespace Freefall.Graphics
                 MakeLight(list, i);
             PixMarker.End(list);
 
+            // The ground shadow map: a share of its rows (all of them after a rebake, a change of light or a jump), after
+            // the light volumes (it takes the rest of a storm's depth from them)
+            PixMarker.Begin(list, "Cloud shadow map");
+            if (_shadowMapState != ResourceStates.UnorderedAccess)
+            {
+                list.ResourceBarrierTransition(_shadowMap!.Native, _shadowMapState, ResourceStates.UnorderedAccess);
+                _shadowMapState = ResourceStates.UnorderedAccess;
+            }
+            int firstRow = _shadowAll ? 0 : _shadowRow, rows = _shadowAll ? ShadowMapTexels : ShadowRowsPerFrame;
+            cs.SetPushConstant(_kShadowMap, "TargetUAV", _shadowMap!.UavIndex);
+            cs.SetPushConstant(_kShadowMap, "TargetWidth", (uint)ShadowMapTexels);
+            cs.SetPushConstant(_kShadowMap, "TargetHeight", (uint)rows);
+            cs.SetPushConstant(_kShadowMap, "RegionZ0Bits", (uint)firstRow);
+            cs.Dispatch(_kShadowMap, list, ShadowMapTexels / 8, (uint)(rows + 7) / 8, 1);
+            _shadowRowsLast = rows;
+            if (!_shadowAll) _shadowRow = (_shadowRow + rows) % ShadowMapTexels;
+            _shadowAll = false;
+            list.ResourceBarrierTransition(_shadowMap.Native, ResourceStates.UnorderedAccess, shaderRead);
+            _shadowMapState = shaderRead;
+            PixMarker.End(list);
+
             // The sky probe's clouds: a face a frame (all five after a rebake or a change of light); the probe composes
             // them over its sky every frame (sky_probe_cs.hlsl), so it follows the time and the exposure as before
             PixMarker.Begin(list, "Cloud probe");
@@ -785,6 +850,13 @@ namespace Freefall.Graphics
             nearestRainAt = _shaftCount > 0 ? new[] { _shaftData[0].Center.X, _shaftData[0].Center.Y } : null,
             nearestAnvilAt = NearestAnvil(),
             lastFlashAt = new[] { _describeFlash.X, _describeFlash.Y, _describeFlash.Z },
+            // The ground shadow map: its window's centre relative to the camera (m, where the camera's ray toward the light
+            // crosses the slab's bottom) and the rows made last frame
+            shadowMap = new
+            {
+                centre = new[] { (float)WrapDelta(_shadowCentre.X - _describeCx), (float)WrapDelta(_shadowCentre.Y - _describeCz) },
+                rowsLastFrame = _shadowRowsLast,
+            },
         };
 
         private static float[]? NearestAnvil()

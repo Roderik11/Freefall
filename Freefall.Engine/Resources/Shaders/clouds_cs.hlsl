@@ -11,6 +11,8 @@
 //                 what they let through (a) and how far they are (depth)
 //   CSCloudReconstruct  the half-size target from the sparse texels and last frame's, reprojected and clamped
 //   CSCloudProbeFace  one face of the sky probe's clouds (64², coarser)
+//   CSCloudShadowMap  rows of the ground shadow map: the optical depth toward the light from where a ray crosses the
+//                 slab's bottom, marched through the field (the shadows on the ground, the water, the air)
 // Docs: .agent/knowledge/atmospheric_effects/volumetric_clouds.md.
 
 #pragma kernel CSCloudBake
@@ -22,6 +24,7 @@
 #pragma kernel CSCloudReconstruct
 #pragma kernel CSCloudProbeFace
 #pragma kernel CSCloudSceneDepth
+#pragma kernel CSCloudShadowMap
 
 // What changes from dispatch to dispatch is pushed: a ComputeShader's Params buffer holds one copy per frame
 cbuffer PushConstants : register(b3)
@@ -531,6 +534,80 @@ float CloudLightDepth(CloudParams C, Texture3D<float4> lut, float3 rel, float3 l
     if (blend > 0.0)
         volume = lerp(volume, CloudLightDepthAt(C, level + 1, xzFar, hf, CloudWrap), blend);
     return tau + volume;
+}
+
+// ── The ground shadow map (VOLUMETRIC_CLOUDS_PLAN §8) ──
+// Where a ray toward the light crosses the slab's bottom, the optical depth along it out of the slab: every place below
+// whose ray crosses there takes the same shadow (cloud_common.hlsli CloudShadowDepth). A toroidal window of
+// CLOUD_SHADOW_TEXELS² in cloud space round ShadowCentre (Clouds.cs: the camera's own crossing), TargetHeight of its rows
+// from row RegionZ0Bits a dispatch. Marched through the baked field with the billows (CloudErode: the shapes the view
+// sees), empty bricks leapt; once the beam is gone (τ > 12) the rest of the way from the light volume there (its optical
+// depth out of the slab), so a storm keeps its τ for the diffused share without a march through all of it.
+#define CLOUD_SHADOW_STEPS 96
+[numthreads(8, 8, 1)]
+void CSCloudShadowMap(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= TargetWidth || id.y >= TargetHeight)
+        return;
+    CloudParams C = LoadClouds();
+    Texture3D<float4> lut = ResourceDescriptorHeap[C.NoiseLut];
+    int size = (int)TargetWidth;
+    int2 phys = int2((int)id.x, (int)((asuint(RegionZ0Bits) + id.y) % TargetWidth));
+    // The physical texel's place in the window round the centre (the window wraps as it follows the camera)
+    int2 origin = int2(floor(C.ShadowCentre / C.ShadowTexel)) - size / 2;
+    int2 logical = origin + (((phys - origin) % size) + size) % size;
+    float2 rel0 = CloudWrapDelta((float2(logical) + 0.5) * C.ShadowTexel - C.CameraCloud);
+
+    // The path rises with the planet's curvature: h = bottom + s·L.y + a·s², a = (1 − L.y²) / 2R; to the slab's top
+    // (capped at 40 km; a light at the horizon would run on)
+    float3 L = C.LightDir;
+    float a = (1.0 - L.y * L.y) / (2.0 * CLOUD_EARTH_RADIUS);
+    float rise = C.SlabTop - C.SlabBottom;
+    float ly = max(L.y, 0.0);
+    float sMax = min(2.0 * rise / (ly + sqrt(ly * ly + 4.0 * a * rise)), 40000.0);
+
+    float tau = 0.0, s = 0.0;
+    [loop] for (int k = 0; k < CLOUD_SHADOW_STEPS && s < sMax; k++)
+    {
+        float2 relXZ = rel0 + L.xz * s;
+        float h = C.SlabBottom + L.y * s + a * s * s;
+        if (h < C.SlabBottom)
+        {
+            s += 500.0;             // a light under the horizon: its path dips under the slab first
+            continue;
+        }
+        float dist = max(abs(relXZ.x), abs(relXZ.y));
+        float blend;
+        uint level = CloudLevelAt(C, dist, blend);
+        float2 xz = C.CameraCloud + relXZ;
+        if (CloudBrickMax(C, level, xz, h) <= 0.0 && (blend <= 0.0 || CloudBrickMax(C, level + 1, xz, h) <= 0.0))
+        {
+            s += CloudBrickExit(C, level, xz, h, L) + 0.5;
+            continue;
+        }
+        float step = C.Levels[level].VoxelSize * 0.75;
+        float sm = s + 0.5 * step;
+        float2 xzm = C.CameraCloud + rel0 + L.xz * sm;
+        float hm = C.SlabBottom + L.y * sm + a * sm * sm;
+        tau += CloudErode(C, lut, CloudSample(C, xzm, hm, dist, CloudWrap), xzm, hm, dist) * C.Density * step;
+        s += step;
+        if (tau > 12.0)
+            break;
+    }
+    if (s < sMax)
+    {
+        float2 relXZ = rel0 + L.xz * s;
+        float h = max(C.SlabBottom + L.y * s + a * s * s, C.SlabBottom);
+        float blend;
+        uint level = CloudLevelAt(C, max(abs(relXZ.x), abs(relXZ.y)), blend);
+        float2 xz = C.CameraCloud + relXZ;
+        float rest = CloudLightDepthAt(C, level, xz, h, CloudWrap);
+        if (blend > 0.0)
+            rest = lerp(rest, CloudLightDepthAt(C, level + 1, xz, h, CloudWrap), blend);
+        tau += rest;
+    }
+    RWTexture2D<float> target = ResourceDescriptorHeap[TargetUAVIdx];
+    target[phys] = tau;
 }
 
 // Schneider's in-scatter probability (Nubis 2017): light gets scattered toward the eye only where it has had some cloud
