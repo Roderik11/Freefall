@@ -525,6 +525,13 @@ namespace Freefall.Editor.Commands
         /// <summary>Forget the cached types after a script reload (it would pin the old script assembly).</summary>
         internal static void ResetTypeCache() => _assetTypes = null;
 
+        /// <summary>The Asset class of this name (case-insensitive), or null.</summary>
+        internal static Type FindAssetType(string name)
+            => !string.IsNullOrEmpty(name) && AssetTypes.TryGetValue(name, out var type) ? type : null;
+
+        /// <summary>Every Asset class a type name may be.</summary>
+        internal static IEnumerable<string> AssetTypeNames => AssetTypes.Keys;
+
         private static Dictionary<string, Type> AssetTypes
         {
             get
@@ -608,6 +615,39 @@ namespace Freefall.Editor.Commands
     /// SaveAsset imports a tracked file right after writing it, so the cache holds the saved state too; a
     /// 'path' the database does not track is only written.
     /// </summary>
+    [CommandRoute("POST", "/api/asset/rename")]
+    public class RenameAssetCommand : EditorCommand
+    {
+        /// <summary>
+        /// POST /api/asset/rename  Body: {"guid":"...", "name":"Hunter's Roast"}
+        /// Renames the asset's source file in its folder (the extension stays) and the loaded asset with it
+        /// (AssetDatabase.RenameAsset, as the asset browser's rename does). The GUID stays, so every
+        /// reference to it holds. An asset's name is its file's name: this is how a name is changed.
+        /// </summary>
+        public override CommandResult Execute(CommandContext context)
+        {
+            if (string.IsNullOrEmpty(context.Body))
+                return CommandResult.BadRequest("Body required: {\"guid\", \"name\"}");
+
+            using var doc = context.ParseBody();
+            var root = doc.RootElement;
+            string guid = root.TryGetProperty("guid", out var g) ? g.GetString() : null;
+            string name = root.TryGetProperty("name", out var n) ? n.GetString()?.Trim() : null;
+            if (string.IsNullOrEmpty(guid) || string.IsNullOrEmpty(name))
+                return CommandResult.BadRequest("'guid' and 'name' are required");
+            if (name.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0)
+                return CommandResult.BadRequest($"'{name}' cannot be a file name");
+
+            string before = AssetDatabase.GuidToPath(guid);
+            if (before == null)
+                return CommandResult.NotFound($"No asset file with GUID {guid}");
+            if (!AssetDatabase.RenameAsset(guid, name))
+                return CommandResult.BadRequest($"Could not rename {before} to '{name}' (a file of that name there already? see console_log)");
+
+            return CommandResult.Json(new { status = "renamed", guid, from = before, to = AssetDatabase.GuidToPath(guid) });
+        }
+    }
+
     [CommandRoute("POST", "/api/asset/save")]
     public class SaveAssetCommand : EditorCommand
     {
@@ -694,6 +734,9 @@ namespace Freefall.Editor.Commands
     ///   or: {"guid":"...", "values": {"CloudCoverage":0.8, "FogColor":[0.5,0.6,0.7]}}
     /// Optional: "save": false to only change the in-memory asset.
     /// Value encoding is the same as entity setproperty (floats, vectors, enums, asset GUIDs; Color3 as [r,g,b]).
+    /// An asset reference may also be an asset's path relative to Assets with a leading '@'
+    /// ("@Characters/Stats/Strength.asset"; '@@' for a string that really starts with '@'), and an element
+    /// of a list of an abstract type names its class with "$type" ({"$type":"StatBonus", ...}).
     /// </summary>
     [CommandRoute("POST", "/api/asset/setproperty")]
     public class SetAssetPropertyCommand : EditorCommand
@@ -717,43 +760,18 @@ namespace Freefall.Editor.Commands
             var assetType = asset.GetType();
             var applied = new Dictionary<string, object>();
 
-            void Apply(string propertyName, JsonElement valueEl)
-            {
-                var field = Freefall.Reflection.Reflector.GetField(assetType, propertyName);
-
-                // A material's shader properties (Tint, EmissiveColor, EmissiveIntensity, DetailTiling…) are not C#
-                // members: set their Value as the material inspector does
-                if (field == null && asset is Freefall.Graphics.Material material)
-                {
-                    foreach (var materialProperty in material.MaterialProperties)
-                    {
-                        if (materialProperty.Name != propertyName) continue;
-                        var valueField = new Freefall.Reflection.Field(materialProperty.GetType().GetProperty("Value")!);
-                        valueField.SetValue(materialProperty, SetPropertyCommand.ConvertJsonValue(valueEl, valueField.Type));
-                        applied[propertyName] = CommandHelpers.SerializeValue(valueField.GetValue(materialProperty));
-                        return;
-                    }
-                }
-
-                if (field == null)
-                    throw new InvalidOperationException($"Property '{propertyName}' not found on '{assetType.Name}'");
-                object converted = SetPropertyCommand.ConvertJsonValue(valueEl, field.Type);
-                field.SetValue(asset, converted);
-                applied[propertyName] = CommandHelpers.SerializeValue(field.GetValue(asset));
-            }
-
             try
             {
                 if (root.TryGetProperty("values", out var values) && values.ValueKind == JsonValueKind.Object)
                 {
                     foreach (var kv in values.EnumerateObject())
-                        Apply(kv.Name, kv.Value);
+                        applied[kv.Name] = ApplyValue(asset, kv.Name, kv.Value);
                 }
                 else
                 {
                     if (!root.TryGetProperty("property", out var pp) || !root.TryGetProperty("value", out var vp))
                         return CommandResult.BadRequest("Body must contain 'property' and 'value', or a 'values' object");
-                    Apply(pp.GetString(), vp);
+                    applied[pp.GetString()] = ApplyValue(asset, pp.GetString(), vp);
                 }
             }
             catch (Exception ex)
@@ -796,6 +814,101 @@ namespace Freefall.Editor.Commands
             }
 
             return CommandResult.Json(new { status = "set", guid, type = assetType.Name, name = asset.Name, applied, saved = savedPath });
+        }
+
+        /// <summary>
+        /// Sets one member of an asset from JSON (the encodings above, '@path' references included) and returns
+        /// the value as it now reads. A material's shader properties count as members.
+        /// </summary>
+        internal static object ApplyValue(Asset asset, string propertyName, JsonElement valueEl)
+        {
+            var assetType = asset.GetType();
+            valueEl = AssetPathReferences.Resolve(valueEl);
+            var field = Freefall.Reflection.Reflector.GetField(assetType, propertyName);
+
+            // A material's shader properties (Tint, EmissiveColor, EmissiveIntensity, DetailTiling…) are not C#
+            // members: set their Value as the material inspector does
+            if (field == null && asset is Freefall.Graphics.Material material)
+            {
+                foreach (var materialProperty in material.MaterialProperties)
+                {
+                    if (materialProperty.Name != propertyName) continue;
+                    var valueField = new Freefall.Reflection.Field(materialProperty.GetType().GetProperty("Value")!);
+                    valueField.SetValue(materialProperty, SetPropertyCommand.ConvertJsonValue(valueEl, valueField.Type));
+                    return CommandHelpers.SerializeValue(valueField.GetValue(materialProperty));
+                }
+            }
+
+            if (field == null)
+                throw new InvalidOperationException($"Property '{propertyName}' not found on '{assetType.Name}'");
+            object converted = SetPropertyCommand.ConvertJsonValue(valueEl, field.Type);
+            field.SetValue(asset, converted);
+            return CommandHelpers.SerializeValue(field.GetValue(asset));
+        }
+    }
+
+    /// <summary>
+    /// Asset references by path in JSON values: a string that starts with '@' is the path of an asset relative
+    /// to Assets ("@Characters/Stats/Strength.asset"; the extension may be left off for a .asset) and becomes its
+    /// GUID. "@@..." stands for a string that really starts with '@'.
+    /// </summary>
+    internal static class AssetPathReferences
+    {
+        public static JsonElement Resolve(JsonElement element)
+        {
+            if (!Mentions(element)) return element;
+            var node = System.Text.Json.Nodes.JsonNode.Parse(element.GetRawText());
+            node = Replace(node);
+            using var doc = JsonDocument.Parse(node?.ToJsonString() ?? "null");
+            return doc.RootElement.Clone();
+        }
+
+        /// <summary>The GUID of the asset at a path relative to Assets, or null.</summary>
+        public static string GuidOf(string path)
+        {
+            if (string.IsNullOrEmpty(path)) return null;
+            path = path.Replace('/', '\\').TrimStart('\\');
+            return AssetDatabase.PathToGuid(path)
+                ?? (string.IsNullOrEmpty(Path.GetExtension(path)) ? AssetDatabase.PathToGuid(path + ".asset") : null);
+        }
+
+        static bool Mentions(JsonElement element) => element.ValueKind switch
+        {
+            JsonValueKind.String => element.GetString()?.StartsWith('@') == true,
+            JsonValueKind.Array => element.EnumerateArray().Any(Mentions),
+            JsonValueKind.Object => element.EnumerateObject().Any(p => Mentions(p.Value)),
+            _ => false,
+        };
+
+        static System.Text.Json.Nodes.JsonNode Replace(System.Text.Json.Nodes.JsonNode node)
+        {
+            switch (node)
+            {
+                case System.Text.Json.Nodes.JsonArray array:
+                    for (int i = 0; i < array.Count; i++)
+                    {
+                        var replaced = Replace(array[i]);
+                        if (!ReferenceEquals(replaced, array[i])) array[i] = replaced;
+                    }
+                    return array;
+
+                case System.Text.Json.Nodes.JsonObject obj:
+                    foreach (var key in obj.Select(p => p.Key).ToList())
+                    {
+                        var replaced = Replace(obj[key]);
+                        if (!ReferenceEquals(replaced, obj[key])) obj[key] = replaced;
+                    }
+                    return obj;
+
+                case System.Text.Json.Nodes.JsonValue value when value.TryGetValue(out string text) && text.StartsWith('@'):
+                    if (text.StartsWith("@@", StringComparison.Ordinal))
+                        return System.Text.Json.Nodes.JsonValue.Create(text[1..]);
+                    return System.Text.Json.Nodes.JsonValue.Create(GuidOf(text[1..])
+                        ?? throw new InvalidOperationException($"No asset at '{text[1..]}' (paths are relative to Assets)"));
+
+                default:
+                    return node;
+            }
         }
     }
 

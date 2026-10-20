@@ -212,21 +212,98 @@ namespace Freefall.Editor.Mcp
 
         [McpServerTool(Name = "play_mode", Title = "Play mode", OpenWorld = false)]
         [Description("Enter or leave play mode, and open or close the game's menu (what Escape toggles: the game's windows, a free " +
-                     "cursor, no player control). No arguments = report only. Entering play SAVES the open scene first (the " +
-                     "toolbar's Play does too), so the user's unsaved edits are written; Stop reloads the scene as saved. " +
-                     "The game's UI is drawn over the scene viewport: screenshot target='viewport' shows it.")]
-        public static Task<CallToolResult> PlayMode(
+                     "cursor, no player control). No arguments = report only. By default this does NOT save the scene: it is kept in " +
+                     "memory and Stop goes back to it, so the scene file is untouched (save=true writes it first, as the toolbar's Play " +
+                     "does). Play waits until the game is running and has settled (the scene reload takes ~20-40 s on Eldermoor), " +
+                     "Stop until the scene is back and settled, unless wait=false. " +
+                     "The game's UI is drawn over the scene viewport: screenshot target='viewport' shows it. Drive the game with " +
+                     "play_input; read the game UI's controls with game_ui.")]
+        public static async Task<CallToolResult> PlayMode(
             [Description("true = Play, false = Stop")] bool? play = null,
-            [Description("true = game menu open, false = closed (play mode only)")] bool? menu = null)
+            [Description("true = game menu open, false = closed (play mode only)")] bool? menu = null,
+            [Description("Play only: write the scene to its file first (the toolbar's way). Default false: kept in memory")] bool save = false,
+            [Description("Wait until the game runs (Play) or the scene is back (Stop), and has settled")] bool wait = true,
+            [Description("Max seconds to wait")] int waitSeconds = 120)
         {
             if (play == null && menu == null)
-                return McpBridge.Get("/api/playmode");
+                return await McpBridge.Get("/api/playmode");
 
             var body = new JsonObject();
             if (play != null) body["play"] = play.Value;
-            if (menu != null) body["menu"] = menu.Value;
-            return McpBridge.Post("/api/playmode", body);
+            if (play == true) body["save"] = save;
+            if (menu != null && play != true) body["menu"] = menu.Value;
+            var result = await McpBridge.Post("/api/playmode", body);
+            if (play == null || !wait || result.IsError == true) return result;
+
+            // The scene reloads on the main thread: calls time out meanwhile. Done once the game's UI runs
+            // (Play) or is gone (Stop); then the first frames (start-up, PCG, streaming) still hold the
+            // main thread for a while, and a call made then times out: wait for them as scene_load does
+            var deadline = DateTime.UtcNow.AddSeconds(waitSeconds);
+            while (DateTime.UtcNow < deadline)
+            {
+                await Task.Delay(1000);
+                var status = await McpBridge.Get("/api/playmode");
+                if (status.IsError == true) continue;
+                var json = JsonNode.Parse(TextOf(status));
+                if (json?["uiRunning"]?.GetValue<bool>() != play.Value) continue;
+
+                int left = Math.Max(5, (int)(deadline - DateTime.UtcNow).TotalSeconds);
+                await SceneTools.WaitUntilSettled(left);
+
+                if (play == true && menu != null)
+                    return await McpBridge.Post("/api/playmode", new JsonObject { ["menu"] = menu.Value });
+                return await McpBridge.Get("/api/playmode");
+            }
+            return McpBridge.Error(play == true
+                ? $"Play started, but the game was not running after {waitSeconds}s; check play_mode later."
+                : $"Stop asked, but the game was still running after {waitSeconds}s; check play_mode later.");
         }
+
+        [McpServerTool(Name = "play_input", Title = "Play input into the game", OpenWorld = false)]
+        [Description("Play input into the running game, as the player's hands would: keys, mouse buttons, mouse look, the game UI's " +
+                     "cursor (a separate one; the user's real mouse is not moved), waits. steps is a list, each one of: " +
+                     "{\"key\":\"W\",\"hold\":1.5} (tap without hold), {\"down\":\"W\"} / {\"up\":\"W\"}, {\"mouseDown\":\"left\"} / {\"mouseUp\":\"left\"}, " +
+                     "{\"click\":\"left\",\"at\":[x,y]}, {\"drag\":{\"from\":[x,y],\"to\":[x,y],\"over\":0.3}}, {\"cursor\":[x,y]} (null = real mouse again), " +
+                     "{\"move\":[x,y],\"over\":0.3}, {\"look\":[dx,dy],\"over\":0.5} (camera; ~10 counts a degree), {\"scroll\":120}, {\"wait\":0.5}. " +
+                     "Keys by Freefall.Keys name (W A S D, Space, Escape, ShiftKey, E, F, Q, 1-9). Coordinates are pixels of the game's " +
+                     "picture at the viewport's full size (screenshot target='viewport' reports it; game_ui gives control rects in the same " +
+                     "pixels); the tool's cursor shows as a small cross in screenshots. Escape opens the game menu (or play_mode menu=true). " +
+                     "A new call stops steps still playing (and lets go of what they held); after steps that finished, the cursor " +
+                     "and held keys/buttons stay, so a drag can be held across calls (mouseDown, move, screenshot, then mouseUp). " +
+                     "play_input_stop lets go of everything. Waits until the steps are done unless wait=false.")]
+        public static async Task<CallToolResult> PlayInput(
+            [Description("The steps, in order")] JsonArray steps,
+            [Description("Wait until the steps are done")] bool wait = true)
+        {
+            var result = await McpBridge.Post("/api/play/input", new JsonObject { ["steps"] = steps.DeepClone() }.ToJsonString());
+            if (!wait || result.IsError == true) return result;
+
+            float seconds = 0f;
+            try { seconds = JsonNode.Parse(TextOf(result))?["seconds"]?.GetValue<float>() ?? 0f; } catch { }
+            var deadline = DateTime.UtcNow.AddSeconds(seconds + 30);
+            await Task.Delay(TimeSpan.FromSeconds(Math.Min(seconds, 60)));
+            while (DateTime.UtcNow < deadline)
+            {
+                var status = await McpBridge.Get("/api/play/input");
+                if (status.IsError != true && JsonNode.Parse(TextOf(status))?["playing"]?.GetValue<bool>() == false)
+                    return status;
+                await Task.Delay(100);
+            }
+            return await McpBridge.Get("/api/play/input");
+        }
+
+        [McpServerTool(Name = "play_input_stop", Title = "Stop played input", OpenWorld = false)]
+        [Description("Stop the steps play_input is playing, let go of every key and button they hold, and give the game UI the real mouse back.")]
+        public static Task<CallToolResult> PlayInputStop() => McpBridge.Post("/api/play/input/stop", new JsonObject());
+
+        [McpServerTool(Name = "game_ui", Title = "Game UI controls", ReadOnly = true, OpenWorld = false)]
+        [Description("The game UI's controls that show (play mode): type, name, style, text, tag (what a control stands for: an item, " +
+                     "a slot), rect [x,y,w,h] in pixels of the game's picture (what play_input takes), hot/selected, and path. " +
+                     "filter = only those whose name, text, tag, style or type contains it (case-insensitive). all = hidden ones too.")]
+        public static Task<CallToolResult> GameUITree(
+            [Description("Substring to look for")] string? filter = null,
+            [Description("Include hidden controls")] bool all = false)
+            => McpBridge.Get("/api/play/ui", ("filter", filter), ("all", all ? "true" : null));
 
         // --- helpers ---
 

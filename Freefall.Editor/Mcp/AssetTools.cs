@@ -97,6 +97,20 @@ namespace Freefall.Editor.Mcp
             [Description("Path relative to Assets, e.g. 'Environment/Storm.asset' — its file name overrides 'name'; the extension is chosen automatically")] string? path = null)
             => McpBridge.Post("/api/asset/create", new { type, name, path });
 
+        [McpServerTool(Name = "asset_create_batch", Title = "Create assets in a batch", Destructive = true, Idempotent = true, OpenWorld = false)]
+        [Description("Create many assets in one call and set their fields: [{\"type\": \"Stat\", \"path\": \"Characters/Stats/Strength.asset\", \"values\": {...}}, ...]. " +
+                     "All new files are written and registered first, then the values are set, so assets of the batch can refer to each other in any order: " +
+                     "an asset reference may be a GUID or '@' + a path relative to Assets ('@Characters/Stats/Strength.asset'; the .asset extension may be left off; '@@' escapes a literal '@'). " +
+                     "A path whose file exists is updated in place (same GUID; the fields given replace its own, the rest stay), so the same batch can be sent again after an edit. " +
+                     "Values are encoded as for asset_set_properties; an element of a list of an abstract type names its class with \"$type\" ({\"$type\": \"StatBonus\", \"Stat\": \"@...\"}). " +
+                     "Each asset is reported with its guid and created / updated / failed (with the error); one failure does not stop the rest.")]
+        public static Task<CallToolResult> CreateBatch(
+            [Description("The assets: {type, path, values?} each")] JsonArray assets)
+            => McpBridge.Post("/api/assets/create-batch", new JsonObject
+            {
+                ["assets"] = assets.DeepClone(),
+            }.ToJsonString());
+
         [McpServerTool(Name = "asset_set_properties", Title = "Set asset properties", Destructive = true, Idempotent = true, OpenWorld = false)]
         [Description("Set fields on an asset, then (by default) save it to disk and reimport so the editor's cached copy matches. " +
                      "On a Material this also sets its shader properties by name (Tint, EmissiveColor, EmissiveIntensity, DetailTiling, …; asset_get lists them under MaterialProperties). " +
@@ -119,6 +133,13 @@ namespace Freefall.Editor.Mcp
                      "Use after in-memory edits, e.g. terrain changes or asset_set_properties with save=false.")]
         public static Task<CallToolResult> Save(string guid, [Description("Override path; default is the asset's own file")] string? path = null)
             => McpBridge.Post("/api/asset/save", new { guid, path });
+
+        [McpServerTool(Name = "asset_rename", Title = "Rename asset", Destructive = true, OpenWorld = false)]
+        [Description("Rename an asset: its source file in its folder (the extension stays) and the loaded asset, as the asset browser's " +
+                     "rename does. An asset's name is its file's name (a Name written into an .asset file is replaced by it), so this is " +
+                     "how a shown name changes (\"Hunter's Roast\"). The GUID stays: references hold.")]
+        public static Task<CallToolResult> Rename(string guid, [Description("The new name, without extension")] string name)
+            => McpBridge.Post("/api/asset/rename", new { guid, name });
 
         [McpServerTool(Name = "asset_open", Title = "Open asset in its editor", Idempotent = true, OpenWorld = false)]
         [Description("Open an asset in its custom editor tab (node graphs, animation graphs, animation sets), like a double-click " +

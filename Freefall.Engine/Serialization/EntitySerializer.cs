@@ -261,11 +261,27 @@ namespace Freefall.Serialization
             }
         }
 
-        private static void ResolveObjectStubs(object obj, string context)
+        private static void ResolveObjectStubs(object obj, string context, int depth = 0, HashSet<object> seen = null)
         {
+            // Data that refers back to itself (an animation state and its transitions) is walked once
+            seen ??= new HashSet<object>(ReferenceEqualityComparer.Instance);
+            if (!seen.Add(obj)) return;
+
             var mapping = Reflector.GetMapping(obj.GetType());
             foreach (var field in mapping)
             {
+                // A nested [Serializable] object (the item inside an equipment entry): its own fields, as the
+                // serializer wrote them. Strings and primitives also count as serializable to reflection, so
+                // only plain classes the serializer writes as a mapping qualify.
+                if (field.CanWrite && !field.Ignored && field.Type.IsClass && field.Type != typeof(string)
+                    && !typeof(Asset).IsAssignableFrom(field.Type) && !typeof(IList).IsAssignableFrom(field.Type)
+                    && field.Type.IsSerializable && depth < 16)
+                {
+                    var nested = field.GetValue(obj);
+                    if (nested != null) ResolveObjectStubs(nested, $"{context}.{field.Name}", depth + 1, seen);
+                    continue;
+                }
+
                 // Direct Asset field
                 if (typeof(Asset).IsAssignableFrom(field.Type))
                 {
@@ -322,12 +338,12 @@ namespace Freefall.Serialization
                         continue;
                     }
 
-                    if (elType != null && Reflector.GetAttribute<SerializableAttribute>(elType) != null)
+                    if (elType != null && Reflector.GetAttribute<SerializableAttribute>(elType) != null && depth < 16)
                     {
                         for (int i = 0; i < list.Count; i++)
                         {
                             if (list[i] != null)
-                                ResolveObjectStubs(list[i], $"{context}.{field.Name}[{i}]");
+                                ResolveObjectStubs(list[i], $"{context}.{field.Name}[{i}]", depth + 1, seen);
                         }
                     }
                 }

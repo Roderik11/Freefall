@@ -9,14 +9,15 @@ namespace Freefall.Editor.Commands
         {
             var editor = Program.EditorUI;
             if (editor == null) return CommandResult.BadRequest("No project open");
-            return CommandResult.Json(new { playing = editor.IsPlaying, menuOpen = GameUI.MenuOpen });
+            return CommandResult.Json(new { playing = editor.IsPlaying, menuOpen = GameUI.MenuOpen, uiRunning = GameUI.Running });
         }
     }
 
     /// <summary>
-    /// Body {"play": true|false, "menu": true|false}, both optional. play = the toolbar's Play / Stop
-    /// (Play saves the scene first); menu = what Escape toggles in the game (windows, free cursor,
-    /// no player control).
+    /// Body {"play": true|false, "menu": true|false, "save": true|false}, all optional. play = the
+    /// toolbar's Play / Stop (Play saves the scene first; with "save": false it keeps it in memory
+    /// for Stop instead and leaves the file alone); menu = what Escape toggles in the game
+    /// (windows, free cursor, no player control).
     /// </summary>
     [CommandRoute("POST", "/api/playmode")]
     public class SetPlayModeCommand : EditorCommand
@@ -33,7 +34,9 @@ namespace Freefall.Editor.Commands
             {
                 if (play.GetBoolean())
                 {
-                    var refused = editor.StartPlay();
+                    // save: false keeps the scene in memory for Stop instead of writing it (tools)
+                    bool save = !root.TryGetProperty("save", out var s) || s.GetBoolean();
+                    var refused = editor.StartPlay(save);
                     if (refused != null && editor.IsPlaying == false)
                         return CommandResult.BadRequest(refused);
                 }
@@ -47,7 +50,7 @@ namespace Freefall.Editor.Commands
                 GameUI.MenuOpen = menu.GetBoolean();
             }
 
-            return CommandResult.Json(new { playing = editor.IsPlaying, menuOpen = GameUI.MenuOpen });
+            return CommandResult.Json(new { playing = editor.IsPlaying, menuOpen = GameUI.MenuOpen, uiRunning = GameUI.Running });
         }
     }
 }

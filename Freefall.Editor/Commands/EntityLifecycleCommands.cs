@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Linq;
 using System.Numerics;
 using Freefall.Assets;
@@ -420,6 +421,13 @@ namespace Freefall.Editor.Commands
                 }
             }
 
+            // A member or list element of an abstract type (an affix's effects) names its class: "$type"
+            if (el.ValueKind == System.Text.Json.JsonValueKind.Object && el.TryGetProperty("$type", out var typeProp))
+                targetType = ConcreteType(typeProp.GetString(), targetType);
+            else if (el.ValueKind == System.Text.Json.JsonValueKind.Object && (targetType.IsAbstract || targetType.IsInterface))
+                throw new InvalidOperationException(
+                    $"'{targetType.Name}' is abstract: name the class with \"$type\" (one of {string.Join(", ", ConcreteTypes(targetType).Select(t => t.Name))})");
+
             // Plain data objects (e.g. DecoratorVariant, SpectrumBand): build a fresh instance and set members
             // by exact name; members not mentioned keep their constructor defaults.
             if (el.ValueKind == System.Text.Json.JsonValueKind.Object && !targetType.IsPrimitive && !targetType.IsAbstract
@@ -428,6 +436,7 @@ namespace Freefall.Editor.Commands
                 var instance = Activator.CreateInstance(targetType);
                 foreach (var member in el.EnumerateObject())
                 {
+                    if (member.Name == "$type") continue;
                     var memberField = Reflector.GetField(targetType, member.Name)
                         ?? throw new InvalidOperationException($"'{targetType.Name}' has no member '{member.Name}'");
                     memberField.SetValue(instance, ConvertJsonValue(member.Value, memberField.Type));
@@ -436,6 +445,30 @@ namespace Freefall.Editor.Commands
             }
 
             throw new NotSupportedException($"Cannot convert JSON to {targetType.Name}");
+        }
+
+        /// <summary>The class "$type" names (its name, or its full name) that is a <paramref name="baseType"/>.</summary>
+        private static Type ConcreteType(string name, Type baseType)
+        {
+            var match = ConcreteTypes(baseType).FirstOrDefault(t => t.Name == name || t.FullName == name);
+            return match ?? throw new InvalidOperationException(
+                $"\"$type\": '{name}' is no {baseType.Name} (one of {string.Join(", ", ConcreteTypes(baseType).Select(t => t.Name))})");
+        }
+
+        /// <summary>The classes that can stand where a <paramref name="baseType"/> is wanted, in the loaded assemblies (stale script builds left out).</summary>
+        private static IEnumerable<Type> ConcreteTypes(Type baseType)
+        {
+            foreach (var assembly in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                if (ScriptCompiler.IsStale(assembly)) continue;
+                Type[] types;
+                try { types = assembly.GetTypes(); }
+                catch (System.Reflection.ReflectionTypeLoadException ex) { types = ex.Types.Where(t => t != null).ToArray(); }
+                foreach (var type in types)
+                    if (!type.IsAbstract && !type.IsInterface && baseType.IsAssignableFrom(type)
+                        && (type.IsValueType || type.GetConstructor(Type.EmptyTypes) != null))
+                        yield return type;
+            }
         }
 
         /// <summary>The entity named by a reference object: "entityUid" (UID string) or "entity" (runtime id).</summary>

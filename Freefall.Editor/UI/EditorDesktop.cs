@@ -46,8 +46,12 @@ namespace Freefall.Editor
         /// <summary>
         /// Play button: saves the scene, then loads it again with game code running and the game's
         /// camera on the scene viewport. Returns why it did not, or null.
+        ///
+        /// With <paramref name="saveScene"/> off (tools: the MCP play_mode's save=false) the scene is
+        /// kept in memory instead of written, and Stop goes back to that copy: the file on disk is
+        /// not touched, and edits not saved before Play are back after Stop, still unsaved.
         /// </summary>
-        public string? StartPlay()
+        public string? StartPlay(bool saveScene = true)
         {
             if (IsPlaying) return "Already playing.";
 
@@ -55,18 +59,25 @@ namespace Freefall.Editor
             if (validCamera == null)
                 return "Scene must have a main camera to enter play mode.";
 
-            if (!File.Exists(CurrentScenePath))
+            if (saveScene && !File.Exists(CurrentScenePath))
                 return "Scene must be saved before entering play mode.";
 
             var serializer = new Freefall.Serialization.EntitySerializer();
-            serializer.Save(CurrentScenePath, EntityManager.Entities.ToArray());
+            if (saveScene)
+            {
+                serializer.Save(CurrentScenePath, EntityManager.Entities.ToArray());
+                _playSnapshot = null;
+            }
+            else
+                _playSnapshot = serializer.SaveToString(EntityManager.Entities.ToArray());
 
             EntityManager.ClearScene();
             EditorCamera.DestroyCamera();
             Engine.SetPlaymode(true);
 
             serializer = new Freefall.Serialization.EntitySerializer();
-            serializer.Load(CurrentScenePath);
+            if (_playSnapshot != null) serializer.LoadFromString(_playSnapshot);
+            else serializer.Load(CurrentScenePath);
 
             foreach (var camera in ComponentCache<Camera>.All)
                 camera.Target = RenderView.All[1];
@@ -77,16 +88,22 @@ namespace Freefall.Editor
             return null;
         }
 
-        /// <summary>Stop button: the scene as it was saved when play started, with the editor camera back.</summary>
+        // The scene as it was when a play that did not save started (StartPlay saveScene: false)
+        private string? _playSnapshot;
+
+        /// <summary>Stop button: the scene as it was saved when play started (or as it was kept in memory), with the editor camera back.</summary>
         public void StopPlay()
         {
             if (!IsPlaying) return;
 
             EntityManager.ClearScene();
             Engine.SetPlaymode(false);
+            Input.StopSimulation();   // keys a tool held down are let go
 
             var serializer = new Freefall.Serialization.EntitySerializer();
-            serializer.Load(CurrentScenePath);
+            if (_playSnapshot != null) serializer.LoadFromString(_playSnapshot);
+            else serializer.Load(CurrentScenePath);
+            _playSnapshot = null;
 
             EditorCamera.CreateCamera();
 

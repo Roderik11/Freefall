@@ -52,9 +52,96 @@ namespace Freefall
             RawInputDevice.RegisterDevice(HidUsageAndPage.Mouse, RawInputDeviceFlags.None, hWnd);
         }
 
+        // ---- Simulated input: what a tool plays in place of the player's hands (the editor's MCP
+        // play_input). Keys and buttons go into the same sets as the devices', so the game cannot tell
+        // them apart; the game UI gets a cursor of its own (SimulatedCursor), the real one is untouched.
+
+        private static readonly HashSet<Keys> _simulatedKeys = new();
+        private static readonly HashSet<int> _simulatedButtons = new();
+
+        /// <summary>The script a tool is playing, or null.</summary>
+        public static InputScript Script { get; private set; }
+
+        /// <summary>
+        /// Where a tool holds the game UI's cursor, in pixels of the game's picture from its top left;
+        /// null = the game UI follows the real mouse.
+        /// </summary>
+        public static System.Numerics.Vector2? SimulatedCursor { get; private set; }
+
+        /// <summary>The wheel a tool turned this frame, for the game UI under <see cref="SimulatedCursor"/>.</summary>
+        public static int SimulatedWheel { get; private set; }
+
+        /// <summary>A tool holds this mouse button down (for the game UI under <see cref="SimulatedCursor"/>).</summary>
+        public static bool IsSimulatedButtonDown(int button) => _simulatedButtons.Contains(button);
+
+        /// <summary>
+        /// Plays a script from the next frame on. One still playing is stopped and what it held let go;
+        /// after one that finished, the cursor, keys and buttons it left stay as they are (a drag held
+        /// across calls, with a look at the screen between them).
+        /// </summary>
+        public static void Play(InputScript script)
+        {
+            if (Script != null) StopSimulation();
+            Script = script;
+        }
+
+        /// <summary>Stops a script, lets go of every key and button a tool holds, gives the game UI the real mouse back.</summary>
+        public static void StopSimulation()
+        {
+            Script = null;
+            foreach (var key in new List<Keys>(_simulatedKeys)) SimulateKey(key, false);
+            foreach (var button in new List<int>(_simulatedButtons)) SimulateButton(button, false);
+            SimulatedCursor = null;
+            SimulatedWheel = 0;
+        }
+
+        public static void SimulateKey(Keys key, bool down)
+        {
+            if (down)
+            {
+                if (_simulatedKeys.Add(key) && _keysDown.Add(key)) _keysPressed.Add(key);
+            }
+            else if (_simulatedKeys.Remove(key) && _keysDown.Remove(key))
+                _keysReleased.Add(key);
+        }
+
+        public static void SimulateButton(int button, bool down)
+        {
+            if (down)
+            {
+                if (_simulatedButtons.Add(button) && _mouseDown.Add(button)) _mousePressed.Add(button);
+            }
+            else if (_simulatedButtons.Remove(button) && _mouseDown.Remove(button))
+                _mouseReleased.Add(button);
+        }
+
+        /// <summary>Raw mouse movement, as the device sends it: the camera turns.</summary>
+        public static void SimulateLook(int dx, int dy)
+        {
+            _rawX += dx;
+            _rawY += dy;
+        }
+
+        public static void SimulateCursor(System.Numerics.Vector2? at) => SimulatedCursor = at;
+
+        public static void SimulateWheel(int delta)
+        {
+            SimulatedWheel += delta;
+            _rawWheel += delta;
+        }
+
         public static void Update()
         {
             var hWnd = _hWnd;
+
+            // A tool's script plays first, so this frame sees what it does as if the devices had sent it
+            SimulatedWheel = 0;
+            if (Script != null)
+            {
+                Script.Tick(Freefall.Base.Time.Delta);
+                if (Script.Done) Script = null;
+            }
+
             // Accumulate raw delta into the public MouseDelta
             MouseDelta = new Vortice.Mathematics.Int2(_rawX, _rawY);
             MouseWheelDelta = _rawWheel;
