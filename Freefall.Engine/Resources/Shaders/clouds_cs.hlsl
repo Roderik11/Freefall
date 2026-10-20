@@ -85,15 +85,38 @@ float CloudBaseRough(CloudParams C)
     return saturate((C.Coverage - 0.6) / 0.25) * saturate((C.Type - 0.4) / 0.3);
 }
 
-// The coverage at a place: the preset's, varied by the large-scale pattern (~50 km). A storm's deck swings harder, from
-// broken to solid: dark cores and thinner, brighter places between them (a uniform deck read flat, without contrast)
+// How much the layer is a deck, 0..1: coverage over ~0.9, or a storm's (CloudBaseRough); under ~0.55 fair weather
+float CloudDeckness(CloudParams C)
+{
+    return max(smoothstep(0.55, 0.9, C.Coverage), CloudBaseRough(C));
+}
+
+// The coverage at a place.
+// A deck: the preset's, varied by the large-scale pattern (~50 km) and a second octave (~13 km); a storm's swings
+// harder, from broken to solid (dark cores and brighter places between; a uniform deck read flat).
+// Fair weather: fields of cloud with clear sky between them, and inside a field the clouds the noise makes at a natural
+// density (~0.5). The preset's coverage decides how much of the sky lies in fields (a presence pattern of ~50, 13 and
+// 7 km), so less of it gives fewer clouds, not thinner ones: lowered evenly everywhere, it left only the shape noise's
+// peaks, many small puffs that flickered in the history. (Single clouds placed in 3.2 km cells instead looked drawn:
+// each the same flat-topped dome on a lens base, evenly spaced, too steep for the billows to carve; user, "studio
+// ghibli".)
 float CloudCoverageAt(CloudParams C, Texture3D<float4> lut, float2 xz)
 {
     float n = lut.SampleLevel(CloudWrap, float3(xz / CLOUD_COVER_TILE, C.Evolution / 4000.0), 0).r;
-    // A second octave at ~13 km (P/19): fields of cloud and clear patches between them, so the base shape's tile does
-    // not decide alone where the clouds stand
     float n2 = lut.SampleLevel(CloudWrap, float3(xz / (CLOUD_PERIOD / 19.0), 0.47 + C.Evolution / 3000.0), 0).r;
-    return saturate(C.Coverage + (n - 0.5) * (0.4 + 0.6 * CloudBaseRough(C)) + (n2 - 0.5) * 0.35);
+    float deckCover = saturate(C.Coverage + (n - 0.5) * (0.4 + 0.6 * CloudBaseRough(C)) + (n2 - 0.5) * 0.35);
+    float deck = CloudDeckness(C);
+    if (deck >= 1.0)
+        return deckCover;
+    float n3 = lut.SampleLevel(CloudWrap, float3(xz / (CLOUD_PERIOD / 37.0), 0.83 + C.Evolution / 2000.0), 0).r;
+    // The octaves' sum spread to ~0.5 ± 0.15; the share of the sky in fields is coverage × 1.3 (inside a field the
+    // clouds cover about three quarters of it), its threshold the normal quantile, linearised. Inside, ~0.6 (± 0.15 from
+    // field to field): at 0.5 the noise's clouds broke into many small cloudlets.
+    float presence = 0.5 + (0.25 * n + 0.45 * n2 + 0.3 * n3 - 0.5) * 2.5;
+    float threshold = 0.5 + (0.5 - saturate(C.Coverage * 1.3)) * 0.4;
+    float inField = smoothstep(threshold - 0.02, threshold + 0.06, presence);
+    float fair = inField * (max(0.6, C.Coverage) + (n3 - 0.5) * 0.3);
+    return lerp(fair, deckCover, deck);
 }
 
 // How deep a place lies in one tower's envelope (0 outside, 1 on its axis): a column from the base to its top, leaning
@@ -178,51 +201,6 @@ float2 CloudTowers(CloudParams C, float2 xz, float h, float turret, float lobe, 
     return env;
 }
 
-// Fair-weather cumulus placed as clouds: a jittered grid of 3.2 km cells (P/80), each holding one cloud at a time with
-// its own place and size, which grows, stands and dissolves over CLOUD_CU_LIFE of the evolution (~30 min at speed 0.5)
-// before the next starts elsewhere in the cell. The coverage (presence, 0..1) decides how many stand at a time, so less
-// of it gives fewer clouds instead of smaller puffs: a threshold on the shape noise alone left only its peaks (user,
-// 2026-10-20). The shape noise carves each one (CloudFieldAt). x 0..1: how deep a place lies in the nearest cloud; y that
-// cloud's base above the layer's (m), each its own, ±120 m (every base at one height read as cut off, user). A base
-// curling up toward the rim made a step: the core hung below as a second, narrower pancake.
-#define CLOUD_CU_CELL (CLOUD_PERIOD / 80.0)
-#define CLOUD_CU_LIFE 900.0
-float2 CloudCumulusCells(CloudParams C, float2 xz, float presence, float wobble)
-{
-    const int n = 80;
-    int2 home = (int2)floor(xz / CLOUD_CU_CELL);
-    float v = 0.0, baseShift = 0.0;
-    [unroll] for (int j = -1; j <= 1; j++)
-    {
-        [unroll] for (int i = -1; i <= 1; i++)
-        {
-            int2 c = home + int2(i, j);
-            float2 id = float2(((c % n) + n) % n);
-            float t = C.Evolution / CLOUD_CU_LIFE + MacroHash(id + 0.37);
-            float2 seed = id + floor(t) * float2(0.1713, 0.3171);       // this cell's cloud of the moment
-            if (MacroHash(seed + 5.3) >= presence)
-                continue;
-            // A young or dissolving cloud is a smaller whole cloud, not a fainter one, and each has a full core with a
-            // narrow edge: where the field is faint only the shape noise's peaks cross it, which made the many small
-            // puffs that flickered in the history (user, 2026-10-20)
-            float life = frac(t);
-            float grow = smoothstep(0.0, 0.25, life) * smoothstep(1.0, 0.7, life);
-            float2 p = (float2(c) + 0.2 + 0.6 * float2(MacroHash(seed + 1.1), MacroHash(seed + 2.7))) * CLOUD_CU_CELL;
-            float radius = (0.3 + 0.3 * MacroHash(seed + 4.9)) * CLOUD_CU_CELL * (0.55 + 0.45 * grow);
-            // Its outline pushed in and out by the turrets and lobes (wobble): with a narrow edge alone they were discs.
-            // Out by at most 1 / 0.65 of the radius (≤ 2.9 km), inside the 3 × 3 cells that see it (a cloud two cells
-            // off is ≥ 3.8 km away): pushed further, it was cut off flat at a cell's border (brick-sided clouds, user)
-            float here = saturate(grow * 4.0) * smoothstep(1.0, 0.65, length(xz - p) / radius * (1.0 - clamp(wobble, -0.5, 0.35)));
-            if (here > v)
-            {
-                v = here;
-                baseShift = (MacroHash(seed + 6.1) - 0.5) * 240.0;
-            }
-        }
-    }
-    return float2(v, baseShift);
-}
-
 // The cloud field at a cloud-space place: density 0..1 (before CloudDensity) and the profile, after Nubis: the base
 // shape (Perlin-Worley eroded by Worley FBM) against the envelope (the layer's coverage × its height profile, or a
 // tower's), the detail left to the march
@@ -252,20 +230,16 @@ float2 CloudFieldAt(CloudParams C, float2 xz, float h)
               * saturate((lut.SampleLevel(CloudWrap, float3(xz.x + slide.x, 0.37, xz.y + slide.z) / (CLOUD_PERIOD / 50.0), 0).r - 0.35) / 0.3);
     // Turrets: the Perlin-Worley at a 2.1 km tile (CLOUD_PERIOD / 120), for the towers' bulges
     float turret = lut.SampleLevel(CloudWrap, (float3(xz.x, h, xz.y) + slide) / (CLOUD_PERIOD / 120.0), 0).a - 0.4;
-    // Broken fair-weather layers are single clouds (CloudCumulusCells), decks and storms the coverage itself
-    float deck = max(smoothstep(0.55, 0.9, C.Coverage), rough);
-    float placed = cover, baseShift = 0.0;
-    if (deck < 1.0)
-    {
-        float2 cells = CloudCumulusCells(C, xz, cover, 0.9 * turret + 0.6 * (shapeNoise.a - 0.5));
-        placed = lerp(cells.x, cover, deck);
-        baseShift = cells.y * (1.0 - deck);
-    }
-    float bottom = C.Base + baseShift - dip;
-    float layer = placed * CloudLayerProfile((h - bottom) / max(C.Thickness + dip - baseShift, 1.0), C.Type);
-    // A fair-weather cloud's base fades in over ~350 m, so the shape noise lowers its underside in broad lumps instead of
-    // one dead-flat plane (user)
-    layer *= lerp(smoothstep(0.0, 350.0, h - bottom), 1.0, deck);
+    // Fair weather: the base swells ±150 m over a few km (neighbouring clouds at their own heights), and fades in over
+    // ~350 m so the shape noise lowers each underside in broad lumps (every base at one height, dead flat, read as cut
+    // off; user)
+    float fair = 1.0 - CloudDeckness(C);
+    float swell = fair > 0.0
+        ? (lut.SampleLevel(CloudWrap, float3(xz / (CLOUD_PERIOD / 60.0), 0.71), 0).r - 0.5) * 300.0 * fair : 0.0;
+    swell = max(swell, C.SlabBottom + 20.0 - C.Base);       // the slab has room below the base only for towers' bases
+    float bottom = C.Base + swell - dip;
+    float layer = cover * CloudLayerProfile((h - bottom) / max(C.Thickness + dip - swell, 1.0), C.Type);
+    layer *= lerp(1.0, smoothstep(0.0, 350.0, h - bottom), fair);
     // Mammatus pouches: the Worley FBM's blobs (high at the cells' centres) at a ~1.4 km tile, flat in height
     // (a mip down: the Worley cells' creases blurred, so each pouch is a smooth dome)
     float pouch = saturate((lut.SampleLevel(CloudWrap, float3(xz.x + slide.x, 0.0, xz.y + slide.z) / (CLOUD_PERIOD / 180.0), 1.5).g - 0.5) / 0.35);
