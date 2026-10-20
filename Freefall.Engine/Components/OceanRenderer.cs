@@ -263,6 +263,10 @@ namespace Freefall.Components
         internal uint DisplacementSrv => _oceanFFT?.DisplacementSRV ?? 0;
         internal int BandCount => _oceanFFT?.NumBands ?? 0;
         internal Effect SurfaceEffect => _material.Effect;
+        // The lips' effect, and whether this tick's Draw queued them: their batch carries the ocean's bounds, so the
+        // sun shadow receivers mark the band they stand in per pixel instead of that sphere
+        internal Effect LipEffect => _lipMaterial.Effect;
+        internal bool LipsDrawn { get; private set; }
         private float _waveTime;
         private DirectionalLight? _sunLight;
         private TerrainRenderer? _terrain;
@@ -902,6 +906,7 @@ namespace Freefall.Components
             }
             bool lips = warpSlots != 0 && !Engine.Settings.DisableSurfLip && !Engine.Settings.DisableShoreWarp
                         && Camera.Main != null;
+            LipsDrawn = lips;
             if (lips)
                 _lipMap.EnsureCreated(Engine.Device);
             var lipMapOrigin = lips ? LipMap.OriginFor(Camera.Main!.Position) : Vector2.Zero;

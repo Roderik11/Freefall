@@ -40,6 +40,7 @@ cbuffer PushConstants : register(b3)
     uint SphereCountIdx;        // its instances then
     uint VisibleLightsIdx;      // RWStructuredBuffer<PointLightData>: this frame's visible point lights (0 = none)
     uint VisibleLightCountIdx;  // RWByteAddressBuffer: [0] = visible lights
+    float OceanBoundScale;      // the bands' summed heights times this (> 1 while the breaking lips draw: they reach above the crest)
 };
 
 cbuffer Params : register(b4)
@@ -199,14 +200,16 @@ void CSReceiverTiles(uint3 dispatchThreadId : SV_DispatchThreadID)
         }
 
         // The ocean, drawn forward after the shadows. Whatever the waves do, the surface this pixel sees lies on its view
-        // ray inside the band OceanPlaneY ± (the bands' largest heights summed): mark where the ray enters and leaves the
+        // ray inside the band OceanPlaneY ± (the bands' largest heights summed, a quarter more while the breaking lips
+        // draw, plus the margin), and so does every lip: mark where the ray enters and leaves the
         // band in front of the opaque surface, both at the deeper end's depth. The ends of the neighbouring pixels'
         // segments fall in between, so together they cover the band.
         if (OceanDisplacementIdx != 0)
         {
-            float waveBound = OceanMargin;
+            float waveBound = 0.0;
             for (uint b = 0; b < min(OceanBandCountIdx, RECEIVER_MAX_BANDS); b++)
                 waveBound += asfloat(receivers[RECEIVER_WAVE_BOUND + b]);
+            waveBound = waveBound * OceanBoundScale + OceanMargin;
 
             StructuredBuffer<SunCascade> cascades = ResourceDescriptorHeap[CascadesIdx];
             float lastSplit = cascades[CascadeCountIdx - 1].SplitDistances.y;

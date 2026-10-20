@@ -35,6 +35,12 @@ namespace Freefall.Graphics
         // the surface the forward pass draws later in the frame moves on by a frame at most
         private const float OceanSlack = 0.25f;
 
+        // The breaking lips (ocean_lip.fx) stand in the ocean's band but reach above the crest they are thrown from: the
+        // curl by 0.06 of the wave's height (crest to trough), the face's bulge by up to 0.11. Against the bands' summed
+        // heights (each at least half its wave's height) that is under a quarter more; while lips are drawn the band
+        // grows by this share
+        private const float OceanLipReach = 1.25f;
+
         private const int FrameCount = 3;
 
         private readonly ComputeShader _shader;
@@ -157,6 +163,7 @@ namespace Freefall.Graphics
             {
                 _shader.SetPushConstant("OceanPlaneY", BitConverter.SingleToUInt32Bits(ocean!.PlaneY));
                 _shader.SetPushConstant("OceanMargin", BitConverter.SingleToUInt32Bits(MathF.Abs(ocean.ShoreSurge) + OceanSlack));
+                _shader.SetPushConstant("OceanBoundScale", BitConverter.SingleToUInt32Bits(ocean.LipsDrawn ? OceanLipReach : 1f));
                 _shader.Dispatch(_waveBoundKernel, cmd, OceanFFT.N / 8, OceanFFT.N / 8, (uint)bands);
                 buffer.UAVBarrier(cmd);
             }
@@ -181,10 +188,12 @@ namespace Freefall.Graphics
             return buffer.UavIndex;
         }
 
-        // The forward batches' instances the camera saw last frame (glass, water bodies; not the ocean, whose sphere would
-        // cover everything: its band is marked per pixel). Forward batches are culled in the forward pass, after the
-        // shadows, so last frame's culling is the newest there is; an instance seen for the first time this frame is
-        // not marked, which can leave its shadow out for one frame.
+        // The forward batches' instances the camera saw last frame (glass, water bodies; not the ocean or its breaking
+        // lips, whose sphere would cover everything: their band is marked per pixel). Forward batches are culled in the
+        // forward pass, after the shadows, so last frame's culling is the newest there is; an instance seen for the first
+        // time this frame is not marked, which can leave its shadow out for one frame.
+        // The lips' batch carries the ocean's transform and grid bounds, kilometres across: with the sea nowhere in view
+        // it still passed the camera's culling and marked all 4096 tiles of every cascade, and nothing was cut (2026-10-20).
         // Only effects that read the shadow map receive anything: a bindstone's sky beam (vfx.fx, unlit) is a 600 m
         // tube whose sphere covered every cascade's whole square in a vista, and nothing was culled (2026-10-18).
         private void MarkForwardInstances(ID3D12GraphicsCommandList cmd, OceanRenderer? ocean)
@@ -197,7 +206,7 @@ namespace Freefall.Graphics
                 var effect = batch.Material.Effect;
                 if (effect == null || !effect.ReadsShadowMap)
                     continue;
-                if (ocean != null && ReferenceEquals(effect, ocean.SurfaceEffect))
+                if (ocean != null && (ReferenceEquals(effect, ocean.SurfaceEffect) || ReferenceEquals(effect, ocean.LipEffect)))
                     continue;
                 if (!batch.RecentCameraCull(out uint bounds, out uint flags, out int count))
                     continue;
