@@ -159,6 +159,16 @@ namespace Freefall.Components
                 Playback.Set(PK.Param(param.Index), value);
         }
 
+        /// <summary>What a state's SpeedParameter multiplies its speed by: the parameter's value, 1 for none or one the graph does not have.</summary>
+        internal float SpeedFactor(string name)
+        {
+            if (string.IsNullOrEmpty(name)) return 1f;
+            EnsureParamMap();
+            if (_paramMap != null && _paramMap.TryGetValue(name, out var param))
+                return MathF.Max(0f, Playback.Get(PK.Param(param.Index), param.DefaultValue));
+            return 1f;
+        }
+
         internal void ConsumeTrigger(string name)
         {
             EnsureParamMap();

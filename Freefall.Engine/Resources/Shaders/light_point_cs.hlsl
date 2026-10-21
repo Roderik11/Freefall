@@ -250,7 +250,7 @@ float3 ShadePointLight(PointLightData light, PointSurface s)
     r4 *= r4;
     r4 *= r4;
     float window = saturate(1.0 - r4);
-    float attenuation = window * window / max(dist * dist, 0.01);
+    float attenuation = window * window * PointLightInner(light.InnerRadius, dist * dist) / max(dist * dist, 0.01);
 
     // Shadow: leaves lit from behind push off their side facing the light
     float shadow = PointLightShadow(light, s.Pos, rawNdotL < 0.0 ? -s.N : s.N, L);

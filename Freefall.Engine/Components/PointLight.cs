@@ -32,6 +32,7 @@ namespace Freefall.Components
         private float _flicker;
         private float _flickerSpeed = 8;
         private bool _onlyWhenDark;
+        private float _innerRadius;
 
         /// <summary>Registry slot (PointLightBuffer), -1 while not registered.</summary>
         internal int GpuSlot = -1;
@@ -82,6 +83,16 @@ namespace Freefall.Components
         {
             get => _onlyWhenDark;
             set { if (_onlyWhenDark == value) return; _onlyWhenDark = value; Changed(); }
+        }
+
+        [System.ComponentModel.Description("Metres round the light that get none of it: for a light that leaves its fitting " +
+                                           "through glass (a lantern), so the fitting's own frame is not lit from within. " +
+                                           "Full light from 1.5 times this. 0 = none.")]
+        [ValueRange(0f, 2f)]
+        public float InnerRadius
+        {
+            get => _innerRadius;
+            set { if (_innerRadius == value) return; _innerRadius = value; Changed(); }
         }
 
         private void Changed() => PointLightBuffer.Instance?.Changed(this);

@@ -37,6 +37,7 @@ namespace Freefall.Components
         private AudioClip currentClip;
         private float[] foldedMatrix;
         private bool firstUpdate = true;
+        private bool warnedStreamed;
 
         public AudioSource() { }
 
@@ -71,7 +72,7 @@ namespace Freefall.Components
             if (Engine.AudioDevice == null) return;
 
             // Resolve deferred stub: has GUID but no audio data loaded yet
-            if (clip.WaveFormat == null && !string.IsNullOrEmpty(clip.Guid) && Engine.Assets != null)
+            if (clip.WaveFormat == null && !clip.IsStreamed && !string.IsNullOrEmpty(clip.Guid) && Engine.Assets != null)
             {
                 var loaded = Engine.Assets.LoadByGuid<AudioClip>(clip.Guid);
                 if (loaded != null)
@@ -80,6 +81,15 @@ namespace Freefall.Components
                     clip = loaded;
                 }
                 else return;
+            }
+
+            // Kept compressed for an AudioStream, which plays it flat; a source places one held whole
+            if (clip.IsStreamed)
+            {
+                if (!warnedStreamed)
+                    Debug.LogWarning("[AudioSource]", $"'{clip.Name}' is imported with Stream on: an AudioStream plays it, not an AudioSource");
+                warnedStreamed = true;
+                return;
             }
             if (clip.WaveFormat == null) return;
 

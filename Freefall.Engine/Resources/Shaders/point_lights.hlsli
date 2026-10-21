@@ -23,7 +23,8 @@ struct PointLightRecord
     float FlickerSpeed;
     float FlickerPhase;     // per light, so neighbouring lights do not waver in step
     uint Flags;             // POINT_LIGHT_ENABLED
-    uint2 _pad;
+    float InnerRadius;      // PointLight.InnerRadius: nothing nearer gets its light (PointLightInner)
+    uint _pad;
 };
 
 // A light in the camera's view this frame. Must match C# PointLightBuffer.VisibleLight (48 bytes).
@@ -35,9 +36,21 @@ struct PointLightData
     float Range;
     uint ShadowLight;       // index into LocalShadowLight[], POINT_LIGHT_NO_SHADOW
     uint Slot;              // registry slot
-    uint Flags;             // none so far (was VISIBLE_LIGHT_OCCLUDED, the Hi-Z test, until 2026-10-20)
+    float InnerRadius;      // the record's (this word was Flags, unused since VISIBLE_LIGHT_OCCLUDED went, 2026-10-20)
     float Score;            // the cull writes luminance × base candela; the shadow selection its rank score
 };
+
+// A light that leaves its fitting through glass (a lantern) lights nothing inside the fitting: nothing nearer than its
+// InnerRadius, then fading in to full at 1.5 times it. Its own frame, 3-15 cm from the flame, took hundreds of lux
+// and glowed through the panes as hard bright edges. 1 for a light without one. d2: squared distance to the light.
+float PointLightInner(float innerRadius, float d2)
+{
+    if (innerRadius <= 0.0)
+        return 1.0;
+    float a = innerRadius * innerRadius;
+    float t = saturate((d2 - a) / (1.25 * a));
+    return t * t * (3.0 - 2.0 * t);
+}
 
 // The camera and frame, per renderer, for the light cull and the shadow selection (not SceneConstants: those
 // are set for lighting later in the frame, and by whichever renderer ran last). Must match C#

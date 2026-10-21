@@ -45,6 +45,10 @@ cbuffer PushConstants : register(b3)
 //     edges. Use 15u if shaded narrow streets read too bright.
 #define GLASS_FX_DEFAULT 7u
 #define GLASS_SHADE_REFLECTION 0.25
+// A lit room's light at a window's corners, as a share of its brightest (struct Instance RoomLight), and how far below
+// the middle that brightest is (in the glass part's bounding radii)
+#define ROOM_VIGNETTE_FLOOR 0.05
+#define ROOM_HOT_SPOT_DROP 0.2
 // @RenderState(RenderTargets=2, DepthWrite=false, Blend=AlphaBlend, CullMode=None)
 
 // Light params from ObjectConstants
@@ -106,6 +110,7 @@ struct VSOutput
     nointerpolation uint MeshPartIdx : TEXCOORD5;
     float3 AbsWorldPos : TEXCOORD6;     // absolute world position (for shadow lookup)
     nointerpolation uint InstanceSlot : TEXCOORD7;   // its per-object values (struct Instance)
+    float3 PaneOffset : TEXCOORD8;      // from the centre of its mesh part (a window's panes) in the part's radii
 };
 
 struct PSOutput
@@ -175,6 +180,7 @@ VSOutput VS(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_InstanceI
     output.TransformSlot = slot;
     output.MeshPartIdx = desc.MeshPartIdx;
     output.InstanceSlot = desc.CustomDataIdx;
+    output.PaneOffset = (pos - part.LocalBounds.xyz) / max(part.LocalBounds.w, 1e-4);
     return output;
 }
 
@@ -424,6 +430,14 @@ PSOutput PS(VSOutput input)
     {
         float hueLuminance = max(dot(I.RoomColor, float3(0.2126, 0.7152, 0.0722)), 1e-3);
         room = I.RoomColor / hueLuminance * I.RoomLight * Exposure * lerp(float3(1, 1, 1), color.rgb, 0.3);
+        // Seen through an opening, a lit room is brightest in the middle and falls off towards the frame and into the
+        // corners (the reveal, the room's own falloff); one flat level over the pane read as a cut-out (user). Over the
+        // glass part's bounding sphere (the corners at its surface), brightest a little below the middle, where a hearth
+        // or a candle on a table lights the room. (1 − d²)⁴: (1 − d²)² still read as one flat level.
+        float3 fromHot = input.PaneOffset + float3(0, ROOM_HOT_SPOT_DROP, 0);
+        float v = saturate(1.0 - dot(fromHot, fromHot));
+        v *= v;
+        room *= lerp(ROOM_VIGNETTE_FLOOR, 1.0, v * v);
     }
 
     float outAlpha = 1.0 - (1.0 - finalAlpha) * (1.0 - Fr);

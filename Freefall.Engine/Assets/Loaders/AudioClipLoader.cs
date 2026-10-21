@@ -37,6 +37,18 @@ namespace Freefall.Assets.Loaders
             using (var stream = File.OpenRead(cachePath))
                 clipData = _packer.Read(stream);
 
+            // Kept compressed: only the length is read here (from the headers and the last page)
+            if (clipData.Streamed)
+            {
+                using var reader = new NVorbis.VorbisReader(new MemoryStream(clipData.Bytes, writable: false), closeOnDispose: true);
+                return new AudioClip
+                {
+                    Name = name,
+                    StreamData = clipData.Bytes,
+                    Length = (float)reader.TotalTime.TotalSeconds,
+                };
+            }
+
             // The importer decodes an .ogg to a wav since 2026-10-14; a cache from before holds the
             // ogg itself, which SoundStream reports as "Invalid RIFF file format"
             if (clipData.Extension == ".ogg")
@@ -46,6 +58,9 @@ namespace Freefall.Assets.Loaders
             {
                 var clip = Load(ms);
                 clip.Name = name;
+                var format = clip.WaveFormat;
+                if (format != null && format.AverageBytesPerSecond > 0)
+                    clip.Length = (float)clip.Buffer.AudioBytes / format.AverageBytesPerSecond;
                 return clip;
             }
         }

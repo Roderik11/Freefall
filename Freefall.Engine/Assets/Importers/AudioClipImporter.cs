@@ -8,7 +8,8 @@ namespace Freefall.Assets.Importers
     /// <summary>
     /// Imports audio files (.wav, .ogg) for the editor pipeline.
     /// A .wav is cached as it is; an .ogg is decoded here, once, into a mono 16-bit wav, because the
-    /// loader reads clips through SoundStream, which knows RIFF only.
+    /// loader reads clips through SoundStream, which knows RIFF only. An .ogg with Stream on is cached
+    /// as it is, to be decoded while it plays.
     /// </summary>
     [AssetImporter(".wav", ".ogg")]
     public class AudioClipImporter : IImporter
@@ -17,6 +18,13 @@ namespace Freefall.Assets.Importers
         // drags as a plain Asset, and no AudioClip field accepts the drop.
         [System.Text.Json.Serialization.JsonIgnore]
         public Type AssetType => typeof(AudioClip);
+
+        /// <summary>
+        /// For music and other long sounds (.ogg only): kept compressed, with all its channels, and
+        /// decoded a little at a time while an AudioStream plays it, flat, not placed in the world. A
+        /// three-minute stereo track is 5 MB so, and 33 MB decoded. An AudioSource cannot play it.
+        /// </summary>
+        public bool Stream;
 
         // A clip has nothing to edit (buffer, wave format, packet table): selecting the file shows the importer.
         public object GetInspectionTarget(MetaFile meta) => this;
@@ -27,14 +35,18 @@ namespace Freefall.Assets.Importers
             var name = Path.GetFileNameWithoutExtension(filepath);
             var extension = Path.GetExtension(filepath).ToLowerInvariant();
 
-            var bytes = extension == ".ogg" ? DecodeOgg(filepath) : File.ReadAllBytes(filepath);
-            if (extension == ".ogg") extension = ".wav";
+            if (Stream && extension != ".ogg")
+                Debug.LogWarning("[AudioClipImporter]", $"{Path.GetFileName(filepath)}: only an .ogg can be streamed; held decoded");
+            bool streamed = Stream && extension == ".ogg";
+
+            var bytes = extension == ".ogg" && !streamed ? DecodeOgg(filepath) : File.ReadAllBytes(filepath);
+            if (extension == ".ogg" && !streamed) extension = ".wav";
 
             result.Artifacts.Add(new ImportArtifact
             {
                 Name = name,
                 Type = nameof(AudioClipData),
-                Data = new AudioClipData(bytes, extension)
+                Data = new AudioClipData(bytes, extension, streamed)
             });
 
             return result;

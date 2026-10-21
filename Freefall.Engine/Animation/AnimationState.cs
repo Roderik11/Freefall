@@ -22,6 +22,14 @@ namespace Freefall.Animation
         public string Name;
         public AnimationClip Clip;
         public float Speed = 1f;
+
+        /// <summary>
+        /// The name of a float parameter of the graph that multiplies Speed, so a character plays
+        /// this state faster or slower than another (a quicker worker's swings). A parameter the
+        /// graph does not have counts as 1. Empty = Speed alone.
+        /// </summary>
+        public string SpeedParameter = string.Empty;
+
         public bool Loop;
 
         /// <summary>
@@ -267,7 +275,7 @@ namespace Freefall.Animation
 
             float before = GetTimeElapsed(pb);
             float timeElapsed = before;
-            float step = Base.Time.SmoothDelta * Speed * rate;
+            float step = Base.Time.SmoothDelta * Speed * rate * (animator?.SpeedFactor(SpeedParameter) ?? 1f);
             int wraps = 0;
 
             if (Loop)

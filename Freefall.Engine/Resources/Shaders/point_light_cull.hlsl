@@ -170,7 +170,7 @@ void CSCullLights(uint3 dtid : SV_DispatchThreadID, uint gi : SV_GroupIndex)
     light.Range = r.Range;
     light.ShadowLight = POINT_LIGHT_NO_SHADOW;
     light.Slot = slot;
-    light.Flags = 0;
+    light.InnerRadius = r.InnerRadius;
     light.Score = dot(r.Color, float3(0.2126, 0.7152, 0.0722)) * r.Intensity; // steady: no flicker in the rank
 
     RWStructuredBuffer<PointLightData> visible = ResourceDescriptorHeap[VisibleUAVIdx];

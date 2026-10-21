@@ -114,7 +114,7 @@ bool LightClusterNext(ByteAddressBuffer clusters, inout LightClusterWalk walk, o
 
 // A light's illuminance at a place (lux, colour included): inverse square with the Karis window to nothing at its range,
 // as light_point_cs lights surfaces, but no closer than minDistance² (a place in the air or a particle can sit in the
-// flame itself). toLight: from the place to the light. 0 past the range.
+// flame itself), and nothing inside its fitting (PointLightInner). toLight: from the place to the light. 0 past the range.
 float3 PointLightIlluminance(PointLightData light, float3 toLight, float minDistanceSq)
 {
     float d2 = dot(toLight, toLight);
@@ -122,7 +122,7 @@ float3 PointLightIlluminance(PointLightData light, float3 toLight, float minDist
     if (x >= 1.0)
         return 0;
     float window = 1.0 - x * x;
-    return light.Color * (light.Intensity * window * window / max(d2, minDistanceSq));
+    return light.Color * (light.Intensity * window * window * PointLightInner(light.InnerRadius, d2) / max(d2, minDistanceSq));
 }
 
 // 1 = lit: a light's shadow at a place with no surface (the air, a particle), from the point light shadow atlas, one

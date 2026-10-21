@@ -39,7 +39,8 @@ namespace Freefall.Graphics
             public float FlickerSpeed;
             public float FlickerPhase;
             public uint Flags;
-            private uint _pad0, _pad1;
+            public float InnerRadius;
+            private uint _pad0;
         }
 
         /// <summary>A light in view, written by the GPU. Must match PointLightData in point_lights.hlsli (48 bytes).</summary>
@@ -52,7 +53,7 @@ namespace Freefall.Graphics
             public float Range;
             public uint ShadowLight;
             public uint Slot;
-            public uint Flags;
+            public float InnerRadius;
             public float Score;
         }
 
@@ -200,6 +201,7 @@ namespace Freefall.Graphics
                 FlickerSpeed = light.FlickerSpeed,
                 FlickerPhase = (light.Id & 1023) * 0.37f, // neighbouring lights do not waver in step
                 Flags = (light.Enabled && transformSlot >= 0 ? Enabled : 0) | (light.OnlyWhenDark ? OnlyWhenDark : 0),
+                InnerRadius = MathF.Max(0f, light.InnerRadius),
             });
         }
 
