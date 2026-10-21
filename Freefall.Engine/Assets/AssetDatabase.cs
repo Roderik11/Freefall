@@ -256,6 +256,20 @@ namespace Freefall.Assets
             return true;
         }
 
+        /// <summary>
+        /// Import a tracked asset now if its source changed since its last import or its cache file is missing (the
+        /// check ImportAll makes), for a file the editor is about to use through its artifact and that may have been
+        /// replaced on disk (opening a scene). True if it imported.
+        /// </summary>
+        public static bool ImportIfChanged(string guid)
+        {
+            if (string.IsNullOrEmpty(guid) || !_guidToMeta.TryGetValue(guid, out var meta) || !NeedsReimport(meta))
+                return false;
+
+            ImportAsset(meta);
+            return true;
+        }
+
         // ── Forced reimport (asset browser folder Reimport, MCP asset_reimport) ──
 
         /// <summary>The forced reimport in progress, or null.</summary>

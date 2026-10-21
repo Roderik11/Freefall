@@ -182,6 +182,7 @@ namespace Freefall
         private static readonly ProfilerMarker _assetReimportMarker = ProfilerMarker.Get("Asset reimport");
         private static readonly ProfilerMarker _assetReloadMarker = ProfilerMarker.Get("Asset reload");
         private static readonly ProfilerMarker _shaderReloadMarker = ProfilerMarker.Get("Shader reload");
+        private static readonly ProfilerMarker _sceneLoadMarker = ProfilerMarker.Get("Scene load");
         private static readonly ProfilerMarker _physicsMarker = ProfilerMarker.Get("Physics");
         private static readonly ProfilerMarker _navigationMarker = ProfilerMarker.Get("Navigation");
         private static readonly ProfilerMarker _updateMarker = ProfilerMarker.Get("Update");
@@ -217,6 +218,11 @@ namespace Freefall
             // Recompile shaders whose .fx/.hlsl file changed on disk (same point: nothing is recording yet)
             using (_shaderReloadMarker.Auto())
                 Graphics.ShaderHotReload.Update();
+
+            // A scene change game code asked for last frame (SceneManager.Load): before physics and Update,
+            // so the whole frame runs on the new scene
+            using (_sceneLoadMarker.Auto())
+                SceneManager.Update();
 
             // Physics (fixed-timestep)
             using (_physicsMarker.Auto())

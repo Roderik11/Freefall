@@ -28,6 +28,7 @@ namespace Freefall.Editor.Mcp
                     ["path"] = Engine.Project.RootDirectory,
                 },
                 ["scene"] = Program.EditorUI?.CurrentScenePath,
+                ["sceneGuid"] = Program.EditorUI?.CurrentScene?.Guid,
             });
 
             if (ProjectOpening.Current is { } opening)

@@ -718,7 +718,8 @@ namespace Freefall.Editor.Commands
             var assetType = AssetDatabase.GetAssetType(guid);
             if (assetType == null)
                 return CommandResult.NotFound($"Asset not found: {guid}");
-            if (CustomAssetEditorRegistry.Find(assetType) == null)
+            // A scene opens in the scene view, like a double-click on it
+            if (CustomAssetEditorRegistry.Find(assetType) == null && !typeof(SceneAsset).IsAssignableFrom(assetType))
                 return CommandResult.BadRequest($"No custom editor for asset type '{assetType.Name}'");
 
             Freefall.Base.MessageDispatcher.Send(Msg.OpenAssetInEditor, (guid, assetType));

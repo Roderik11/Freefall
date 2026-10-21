@@ -6,6 +6,7 @@ using Freefall.Graphics;
 using Freefall.Reflection;
 using Squid;
 using System.Reflection;
+using System.Text;
 using static Freefall.Editor.MenuBuilder;
 using Reflector = Freefall.Reflection.Reflector;
 
@@ -36,12 +37,94 @@ namespace Freefall.Editor
 
         private ToastFrame toastFrame;
 
-        /// <summary>Path of the scene last opened/saved (UI or command server); target of "Save Scene".</summary>
-        public string? CurrentScenePath { get; set; }
+        /// <summary>
+        /// The scene last opened or saved (UI or command server); target of "Save Scene". Kept as the asset, so a
+        /// rename or move in the asset browser does not lose it. Unchanged while playing, whatever game code loads.
+        /// </summary>
+        public SceneAsset? CurrentScene { get; private set; }
+
+        /// <summary>Source file of <see cref="CurrentScene"/>, resolved from its GUID; null when no scene is open.</summary>
+        public string? CurrentScenePath => CurrentScene?.Guid is { } guid ? AssetDatabase.GuidToFullPath(guid) : null;
 
         private Button _playButton = null!, _stopButton = null!;
 
         public bool IsPlaying => !Engine.IsEditor;
+
+        /// <summary>
+        /// The scene asset of a .scene file, by its path (absolute, or relative to Assets). A file new to the
+        /// database (copied in, just written) is registered and imported first. Null if the path is not a file
+        /// inside the project's Assets folder.
+        /// </summary>
+        public static SceneAsset? FindScene(string path)
+        {
+            if (Engine.Project == null || string.IsNullOrEmpty(path)) return null;
+
+            var fullPath = Path.GetFullPath(Path.IsPathRooted(path) ? path : Path.Combine(Engine.Project.AssetsDirectory, path));
+            var relative = Path.GetRelativePath(Engine.Project.AssetsDirectory, fullPath);
+            if (relative.StartsWith("..") || Path.IsPathRooted(relative) || !File.Exists(fullPath))
+                return null;
+
+            var guid = AssetDatabase.PathToGuid(relative);
+            if (guid == null)
+            {
+                AssetDatabase.Refresh();
+                guid = AssetDatabase.PathToGuid(relative);
+                if (guid == null) return null;
+                AssetDatabase.ImportAssetByPath(relative);
+            }
+            return Engine.Assets.LoadByGuid<SceneAsset>(guid);
+        }
+
+        /// <summary>
+        /// Replace the scene in the editor with <paramref name="scene"/>. A scene file replaced on disk since its
+        /// last import (a backup copied back) is imported first, so what opens is what the file holds.
+        /// </summary>
+        public List<Entity> OpenScene(SceneAsset scene)
+        {
+            if (AssetDatabase.ImportIfChanged(scene.Guid))
+                Engine.Assets.ReloadReimported();
+
+            var entities = SceneManager.LoadNow(scene);
+            CurrentScene = scene;
+            MessageDispatcher.Send(Msg.RefreshExplorer);
+            return entities;
+        }
+
+        /// <summary>
+        /// Write the scene's entities to <paramref name="path"/> (absolute, or relative to Assets; null: the current
+        /// scene's file) and import the file, so its artifact and the loaded SceneAsset hold what was written. A new
+        /// file becomes an asset here. The saved scene becomes the current one. Scenes live inside Assets.
+        /// </summary>
+        public SceneAsset SaveScene(string? path = null)
+        {
+            if (Engine.Project == null) throw new InvalidOperationException("No project is open");
+
+            path ??= CurrentScenePath ?? throw new InvalidOperationException("No scene is open: save it under a path");
+            var fullPath = Path.GetFullPath(Path.IsPathRooted(path) ? path : Path.Combine(Engine.Project.AssetsDirectory, path));
+            var relative = Path.GetRelativePath(Engine.Project.AssetsDirectory, fullPath);
+            if (relative.StartsWith("..") || Path.IsPathRooted(relative))
+                throw new InvalidOperationException($"Scenes are saved inside the project's Assets folder, not at {fullPath}");
+
+            Directory.CreateDirectory(Path.GetDirectoryName(fullPath)!);
+            new Freefall.Serialization.EntitySerializer().Save(fullPath, EntityManager.Entities.ToArray());
+
+            if (AssetDatabase.ImportSavedFile(fullPath))
+                Engine.Assets.ReloadReimported();
+
+            CurrentScene = FindScene(fullPath)
+                ?? throw new InvalidOperationException($"'{relative}' was saved but the asset database did not register it");
+            return CurrentScene;
+        }
+
+        /// <summary>A scene game code loaded during play (SceneManager.Load): its cameras draw into the scene viewport.</summary>
+        private void OnSceneLoaded(SceneAsset? scene, List<Entity> entities)
+        {
+            if (!IsPlaying) return;
+
+            foreach (var camera in ComponentCache<Camera>.All)
+                camera.Target = RenderView.All[1];
+            MessageDispatcher.Send(Msg.RefreshExplorer);
+        }
 
         /// <summary>
         /// Play button: saves the scene, then loads it again with game code running and the game's
@@ -59,28 +142,23 @@ namespace Freefall.Editor
             if (validCamera == null)
                 return "Scene must have a main camera to enter play mode.";
 
-            if (saveScene && !File.Exists(CurrentScenePath))
+            if (saveScene && (CurrentScene == null || !File.Exists(CurrentScenePath)))
                 return "Scene must be saved before entering play mode.";
 
-            var serializer = new Freefall.Serialization.EntitySerializer();
             if (saveScene)
             {
-                serializer.Save(CurrentScenePath, EntityManager.Entities.ToArray());
+                SaveScene();
                 _playSnapshot = null;
             }
             else
-                _playSnapshot = serializer.SaveToString(EntityManager.Entities.ToArray());
+                _playSnapshot = Encoding.UTF8.GetBytes(new Freefall.Serialization.EntitySerializer().SaveToString(EntityManager.Entities.ToArray()));
 
             EntityManager.ClearScene();
             EditorCamera.DestroyCamera();
             Engine.SetPlaymode(true);
 
-            serializer = new Freefall.Serialization.EntitySerializer();
-            if (_playSnapshot != null) serializer.LoadFromString(_playSnapshot);
-            else serializer.Load(CurrentScenePath);
-
-            foreach (var camera in ComponentCache<Camera>.All)
-                camera.Target = RenderView.All[1];
+            // OnSceneLoaded puts the game's cameras on the scene viewport
+            SceneManager.LoadNow(CurrentScene, _playSnapshot);
 
             _playButton.Enabled = false;
             _stopButton.Enabled = true;
@@ -89,9 +167,12 @@ namespace Freefall.Editor
         }
 
         // The scene as it was when a play that did not save started (StartPlay saveScene: false)
-        private string? _playSnapshot;
+        private byte[]? _playSnapshot;
 
-        /// <summary>Stop button: the scene as it was saved when play started (or as it was kept in memory), with the editor camera back.</summary>
+        /// <summary>
+        /// Stop button: the scene as it was saved when play started (or as it was kept in memory), with the editor
+        /// camera back. Whatever scene game code loaded meanwhile is gone too.
+        /// </summary>
         public void StopPlay()
         {
             if (!IsPlaying) return;
@@ -100,9 +181,7 @@ namespace Freefall.Editor
             Engine.SetPlaymode(false);
             Input.StopSimulation();   // keys a tool held down are let go
 
-            var serializer = new Freefall.Serialization.EntitySerializer();
-            if (_playSnapshot != null) serializer.LoadFromString(_playSnapshot);
-            else serializer.Load(CurrentScenePath);
+            SceneManager.LoadNow(CurrentScene, _playSnapshot);
             _playSnapshot = null;
 
             EditorCamera.CreateCamera();
@@ -150,20 +229,21 @@ namespace Freefall.Editor
                 {
                     try
                     {
-                        EntityManager.ClearScene();
-                        var serializer = new Freefall.Serialization.EntitySerializer();
-                        var entities = serializer.Load(dlg.FileName);
+                        var scene = FindScene(dlg.FileName);
+                        if (scene == null)
+                        {
+                            Toast.Show("Scenes open from the project's Assets folder", 2.0f);
+                            return;
+                        }
 
-                        CurrentScenePath = dlg.FileName;
-
+                        var entities = OpenScene(scene);
                         Toast.Show($"[Editor] Loaded scene: {entities.Count} entities");
                         Debug.Log($"[Editor] Loaded scene: {entities.Count} entities");
-                        MessageDispatcher.Send(Msg.RefreshExplorer);
                     }
                     catch (Exception ex)
                     {
                         Toast.Show("Failed to load scene");
-                        Debug.Log("Failed to load scene");
+                        Debug.Log($"Failed to load scene: {ex.Message}");
                     }
                 }
             });
@@ -181,16 +261,14 @@ namespace Freefall.Editor
 
                 try
                 {
-                    var serializer = new Freefall.Serialization.EntitySerializer();
-                    var entities = EntityManager.Entities.ToArray();
-                    serializer.Save(CurrentScenePath, entities);
+                    SaveScene();
                     ProjectThumbnails.Capture();
                     Toast.Show("Saved scene: " + CurrentScenePath);
                 }
                 catch (Exception ex)
                 {
                     Toast.Show("Failed to save scene");
-                    Debug.Log("Failed to save scene");
+                    Debug.Log($"Failed to save scene: {ex.Message}");
                 }
                 return;
             });
@@ -213,17 +291,14 @@ namespace Freefall.Editor
 
                 try
                 {
-                    var serializer = new Freefall.Serialization.EntitySerializer();
-                    var entities = EntityManager.Entities.ToArray();
-                    serializer.Save(dlg.FileName, entities);
-                    CurrentScenePath = dlg.FileName;
+                    SaveScene(dlg.FileName);
                     ProjectThumbnails.Capture();
                     Toast.Show("Saved scene: " + CurrentScenePath);
                 }
                 catch (Exception ex)
                 {
                     Toast.Show("Failed to save scene");
-                    Debug.Log("Failed to save scene");
+                    Debug.Log($"Failed to save scene: {ex.Message}");
                 }
 
             });
@@ -463,6 +538,7 @@ namespace Freefall.Editor
 
             MessageDispatcher.AddListener(Msg.OpenAssetInEditor, OpenAssetInEditor);
             MessageDispatcher.AddListener(Msg.ScriptsReloaded, (m) => CreateComponentItems());
+            SceneManager.Loaded += OnSceneLoaded;
         }
 
         private void ConvertMeshToSkinnedRenderer()
@@ -718,6 +794,26 @@ namespace Freefall.Editor
         void OpenAssetInEditor(Message message)
         {
             (string guid, Type assetType) = ((string, Type))message.Data;
+
+            // A scene opens in the scene view (double-click in the asset browser, MCP asset_open)
+            if (typeof(SceneAsset).IsAssignableFrom(assetType))
+            {
+                if (!Engine.IsEditor)
+                {
+                    Toast.Show("Stop play mode to open a scene", 2.0f);
+                    return;
+                }
+                try
+                {
+                    var entities = OpenScene(Engine.Assets.LoadByGuid<SceneAsset>(guid));
+                    Toast.Show($"[Editor] Loaded scene: {entities.Count} entities");
+                }
+                catch (Exception ex)
+                {
+                    Debug.Log($"[AssetBrowser] Failed to open scene {guid}: {ex.Message}");
+                }
+                return;
+            }
 
             var editor = CustomAssetEditorRegistry.Find(assetType);
             if (editor == null)

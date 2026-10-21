@@ -16,10 +16,10 @@ namespace Freefall.Editor.Mcp
         // --- Scene ---
 
         [McpServerTool(Name = "scene_load", Title = "Load scene", Destructive = true, OpenWorld = false)]
-        [Description("Replace the current scene with a .scene file. Destroys all current entities (unsaved changes are lost) and invalidates every entity id. " +
-                     "Waits until the scene has settled (PCG output spawned, frames rendering normally) before returning, so the next call works.")]
+        [Description("Replace the current scene with a scene asset (a .scene file inside Assets). Destroys all current entities (unsaved changes are lost) and invalidates every entity id. " +
+                     "Waits until the scene has settled (PCG output spawned, frames rendering normally) before returning, so the next call works. Not while playing.")]
         public static async Task<CallToolResult> LoadScene(
-            [Description("Scene path, relative to the project Assets folder or absolute")] string path,
+            [Description("The scene's asset GUID, or its path relative to the project Assets folder (or absolute, inside Assets)")] string path,
             [Description("Max seconds to wait for the scene to settle")] int waitSeconds = 120)
         {
             var result = await McpBridge.Post("/api/scene/load", new { path });
@@ -61,9 +61,9 @@ namespace Freefall.Editor.Mcp
         }
 
         [McpServerTool(Name = "scene_save", Title = "Save scene", Destructive = true, OpenWorld = false)]
-        [Description("Save all entities to a .scene file. Without 'path' this overwrites the currently open scene (same as File > Save Scene).")]
+        [Description("Save all entities to a .scene file inside Assets and import it, returning the scene's asset GUID. Without 'path' this overwrites the currently open scene (same as File > Save Scene). Not while playing.")]
         public static Task<CallToolResult> SaveScene(
-            [Description("Target path relative to Assets (or absolute); omit to save over the open scene")] string? path = null)
+            [Description("Target path relative to Assets (or absolute, inside Assets); omit to save over the open scene")] string? path = null)
             => McpBridge.Post("/api/scene/save", new { path });
 
         [McpServerTool(Name = "scene_list_entities", Title = "List entities", ReadOnly = true, OpenWorld = false)]

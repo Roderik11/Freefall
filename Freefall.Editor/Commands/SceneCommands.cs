@@ -1,6 +1,7 @@
 using System;
 using System.IO;
 using System.Linq;
+using Freefall.Assets;
 using Freefall.Base;
 
 namespace Freefall.Editor.Commands
@@ -10,36 +11,43 @@ namespace Freefall.Editor.Commands
     {
         public override CommandResult Execute(CommandContext context)
         {
-            if (!Program.IsProjectOpen)
+            if (!Program.IsProjectOpen || Program.EditorUI == null)
                 return CommandResult.Error(409, "No project is open");
+            if (Program.EditorUI.IsPlaying)
+                return CommandResult.Error(409, "Stop play mode before loading a scene");
 
             if (string.IsNullOrEmpty(context.Body))
-                return CommandResult.BadRequest("Request body required with 'path'");
+                return CommandResult.BadRequest("Request body required with 'guid' or 'path'");
 
             using var doc = context.ParseBody();
             var root = doc.RootElement;
 
-            if (!root.TryGetProperty("path", out var pathProp))
-                return CommandResult.BadRequest("Body must contain 'path'");
+            // 'guid', or 'path' (relative to Assets or absolute), which may also hold a scene's GUID
+            string? guid = root.TryGetProperty("guid", out var guidProp) ? guidProp.GetString() : null;
+            string? path = root.TryGetProperty("path", out var pathProp) ? pathProp.GetString() : null;
+            if (string.IsNullOrEmpty(guid) && AssetDatabase.GetMeta(path ?? "") != null)
+                guid = path;
 
-            var path = pathProp.GetString();
-
-            // Allow relative paths (resolved against project assets directory)
-            if (!Path.IsPathRooted(path) && Engine.Project != null)
-                path = Path.Combine(Engine.Project.AssetsDirectory, path);
-
-            if (!File.Exists(path))
-                return CommandResult.NotFound($"Scene file not found: {path}");
+            SceneAsset? scene;
+            if (!string.IsNullOrEmpty(guid))
+            {
+                if (AssetDatabase.GetAssetType(guid) is not { } type || !typeof(SceneAsset).IsAssignableFrom(type))
+                    return CommandResult.NotFound($"No scene asset with GUID {guid}");
+                scene = Engine.Assets.LoadByGuid<SceneAsset>(guid);
+            }
+            else if (!string.IsNullOrEmpty(path))
+            {
+                scene = EditorDesktop.FindScene(path);
+                if (scene == null)
+                    return CommandResult.NotFound($"Scene file not found inside the project's Assets folder: {path}");
+            }
+            else
+                return CommandResult.BadRequest("Body must contain 'guid' or 'path'");
 
             try
             {
-                // Clear existing scene entities (preserves DontDestroyOnLoad)
-                EntityManager.ClearScene();
-                var serializer = new Freefall.Serialization.EntitySerializer();
-                var entities = serializer.Load(path);
-                if (Program.EditorUI != null)
-                    Program.EditorUI.CurrentScenePath = path;
-                MessageDispatcher.Send(Msg.RefreshExplorer);
+                var entities = Program.EditorUI.OpenScene(scene);
+                path = Program.EditorUI.CurrentScenePath;
                 MessageDispatcher.Send(Msg.SceneLoaded, new
                 {
                     path,
@@ -49,6 +57,7 @@ namespace Freefall.Editor.Commands
                 return CommandResult.Json(new
                 {
                     status = "ok",
+                    guid = scene.Guid,
                     path,
                     entityCount = entities.Count,
                     entities = entities.Select(e => new { id = e.Id, uid = e.UID.ToString(), name = e.Name }).ToArray()
@@ -66,10 +75,12 @@ namespace Freefall.Editor.Commands
     {
         public override CommandResult Execute(CommandContext context)
         {
-            if (!Program.IsProjectOpen)
+            if (!Program.IsProjectOpen || Program.EditorUI == null)
                 return CommandResult.Error(409, "No project is open");
+            if (Program.EditorUI.IsPlaying)
+                return CommandResult.Error(409, "Stop play mode before saving the scene");
 
-            string path = null;
+            string? path = null;
 
             if (!string.IsNullOrEmpty(context.Body))
             {
@@ -79,30 +90,20 @@ namespace Freefall.Editor.Commands
             }
 
             // Default to the scene that is currently open (same target as File > Save Scene)
-            if (string.IsNullOrEmpty(path))
-                path = Program.EditorUI?.CurrentScenePath;
-
-            if (string.IsNullOrEmpty(path))
+            if (string.IsNullOrEmpty(path) && Program.EditorUI.CurrentScene == null)
                 return CommandResult.BadRequest("No scene is open yet — pass 'path' (relative to Assets) to save as a new file");
-
-            // Relative paths resolve against the project assets directory, like scene/load
-            if (!Path.IsPathRooted(path) && Engine.Project != null)
-                path = Path.Combine(Engine.Project.AssetsDirectory, path);
 
             try
             {
-                var serializer = new Freefall.Serialization.EntitySerializer();
-                var entities = EntityManager.Entities.ToArray();
-                serializer.Save(path, entities);
-                if (Program.EditorUI != null)
-                    Program.EditorUI.CurrentScenePath = path;
+                var scene = Program.EditorUI.SaveScene(string.IsNullOrEmpty(path) ? null : path);
                 ProjectThumbnails.Capture();
 
                 return CommandResult.Json(new
                 {
                     status = "saved",
-                    path,
-                    entityCount = entities.Length
+                    guid = scene.Guid,
+                    path = Program.EditorUI.CurrentScenePath,
+                    entityCount = EntityManager.Entities.Count
                 });
             }
             catch (Exception ex)
