@@ -15,8 +15,6 @@ namespace Freefall.Editor
 
         public EntityProperty(GUIProperty property) : base(property)
         {
-            RowHeight = 68;
-
             var entity = property.GetValue() as Entity;
 
             Button = new Button

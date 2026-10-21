@@ -1737,6 +1737,22 @@ namespace Freefall.Assets
         }
 
         /// <summary>
+        /// True when a field of this type can hold an asset that gets a thumbnail, i.e. a generator exists for the
+        /// type or one of its subtypes (a field typed Asset can hold a mesh). Inspectors leave the thumbnail out otherwise.
+        /// </summary>
+        public static bool CanHaveThumbnail(Type assetType)
+        {
+            if (assetType == null) return false;
+            if (_thumbGenerators.Count == 0)
+                DiscoverThumbnailGenerators();
+
+            foreach (var type in _thumbGenerators.Keys)
+                if (assetType.IsAssignableFrom(type))
+                    return true;
+            return false;
+        }
+
+        /// <summary>
         /// Register a thumbnail after generation.
         /// </summary>
         public static void RegisterThumbnail(string guid, string path)

@@ -10,6 +10,8 @@ namespace Freefall.Editor
     public class AssetProperty : PropertyControl
     {
         public Button Button { get; private set; }
+
+        /// <summary>Null for asset types that never get a thumbnail: the row then keeps the normal height.</summary>
         private readonly ImageControl thumbnail;
 
         /// <summary>Shown while no asset is assigned, e.g. the default an empty slot falls back to.</summary>
@@ -19,8 +21,6 @@ namespace Freefall.Editor
 
         public AssetProperty(GUIProperty property) : base(property)
         {
-            RowHeight = 68;
-
             var asset = property.GetValue() as Asset;
 
             Button = new Button
@@ -48,13 +48,20 @@ namespace Freefall.Editor
             ClearButton.MouseClick += (s, e) =>
             {
                 property.SetValue(null);
-                thumbnail.Texture = AssetDatabase.GetThumbnail(string.Empty);
+                if (thumbnail != null)
+                    thumbnail.Texture = AssetDatabase.GetThumbnail(string.Empty);
 
                 Button.Text = EmptyText;
             };
 
-            //Controls.Add(ClearButton);
-           // Controls.Add(Button);
+            if (!AssetDatabase.CanHaveThumbnail(property.Type))
+            {
+                Controls.Add(ClearButton);
+                Controls.Add(Button);
+                return;
+            }
+
+            RowHeight = 68;
 
             Frame frame = new Frame { Dock = DockStyle.Top, Size = new Point(20, 26) };
             frame.Controls.Add(ClearButton);
@@ -116,7 +123,8 @@ namespace Freefall.Editor
             {
                 property.SetValue(asset);
                 Button.Text = asset.Name;
-                thumbnail.Texture = AssetDatabase.GetThumbnail(asset);
+                if (thumbnail != null)
+                    thumbnail.Texture = AssetDatabase.GetThumbnail(asset);
             }
         }
 
