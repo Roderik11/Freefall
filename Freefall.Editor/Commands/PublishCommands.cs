@@ -35,6 +35,8 @@ namespace Freefall.Editor.Commands
             {
                 var scan = DependencyScanner.Scan(profile);
                 var missed = scan.LoadedNotReached = compareLoaded ? DependencyScanner.LoadedNotReached(scan) : null;
+                var textures = scan.Textures = profile.MeasureTextures(scan);
+                var over = textures?.Over;
                 scan.WriteReport(profile.ReportPath);
 
                 return CommandResult.Json(new
@@ -53,6 +55,22 @@ namespace Freefall.Editor.Commands
                     warnings = scan.Warnings.Take(15).ToArray(),
                     report = profile.ReportPath,
                     seconds = Math.Round(scan.Elapsed.TotalSeconds, 2),
+                    textures = textures == null ? null : new
+                    {
+                        budget = textures.Budget,
+                        target = textures.Target,
+                        overBudget = over!.Count,
+                        sizeNow = BuildScan.Size(over.Sum(t => t.Artifact.Size)),
+                        sizeCapped = BuildScan.Size(over.Sum(t => t.CappedBytes)),
+                        belowTarget = over.Count(textures.BelowTarget),
+                        noUseFound = over.Count(t => double.IsNaN(t.Coarsest)),
+                        seconds = Math.Round(textures.Elapsed.TotalSeconds, 2),
+                        coarsest = over.Where(t => !double.IsNaN(t.CoarsestAtBudget)).OrderBy(t => t.CoarsestAtBudget).Take(15).Select(t => new
+                        {
+                            path = t.Artifact.SourcePath, size = $"{t.Width}x{t.Height} {t.Format}",
+                            pxPerMetre = Math.Round(t.Coarsest), atBudget = Math.Round(t.CoarsestAtBudget), where = t.CoarsestUse,
+                        }).ToArray(),
+                    },
                     loadedNotReachedCount = missed?.Count,
                     loadedNotReachedByFolder = missed?.GroupBy(m => BuildScan.FolderOf(m.SourcePath))
                         .Select(g => new { folder = g.Key, assets = g.Count() }).ToArray(),

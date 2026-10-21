@@ -18,7 +18,8 @@ namespace Freefall.Editor.Mcp
         [McpServerTool(Name = "publish_scan", Title = "Scan a build profile", Idempotent = true, OpenWorld = false)]
         [Description("What a published game would pack: walks the references from a BuildProfile's scenes (and every asset under an " +
                      "AlwaysPublish folder) all the way down, and writes the build report next to the profile's output folder " +
-                     "(every asset with its size and the chain that reached it). Returns the totals by root, type and folder, and the " +
+                     "(every asset with its size and the chain that reached it). Returns the totals by root, type and folder, the textures over " +
+                     "the profile's TextureBudget (what capping them would save, the ones that would show coarsest), and the " +
                      "first warnings (unknown GUIDs, assets not imported). Nothing is published.")]
         public static Task<CallToolResult> Scan(
             [Description("The BuildProfile asset's GUID, or its path relative to Assets")] string profile,

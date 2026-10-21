@@ -53,6 +53,8 @@ namespace Freefall.Editor.Publishing
         public List<string> Warnings = new();
         /// <summary>Set by the compareLoaded check (DependencyScanner.LoadedNotReached): written into the report.</summary>
         public List<(string Guid, string Name, string Type, string SourcePath)>? LoadedNotReached;
+        /// <summary>The textures against the profile's size budget (TextureBudgetScan), when measured: a section of the report.</summary>
+        public TextureBudgetResult? Textures;
         public TimeSpan Elapsed;
         public DateTime Time = DateTime.Now;
 
@@ -147,6 +149,8 @@ namespace Freefall.Editor.Publishing
                     sb.AppendLine($"  {m.Type,-14}  {m.Guid}  {m.SourcePath}  ({m.Name})");
                 sb.AppendLine();
             }
+
+            Textures?.WriteTo(sb);
 
             sb.AppendLine("Largest assets:");
             foreach (var a in Artifacts.OrderByDescending(a => a.Size).Take(40))

@@ -197,6 +197,7 @@ namespace Freefall.Editor.Publishing
                         if (!scan.Scenes.Any(s => s.Root != null))
                             throw new InvalidOperationException("None of the profile's scenes is a saved scene asset");
 
+                        scan.Textures = profile.MeasureTextures(scan);
                         scan.WriteReport(result.Report, published: true);
                         result.Warnings.AddRange(scan.Warnings);
                         job = PackBuilder.Prepare(profile, scan);

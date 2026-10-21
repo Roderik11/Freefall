@@ -23,6 +23,16 @@ namespace Freefall.Editor.Publishing
         [Description("Largest pack file in MB: the artifacts go into data0.ffpack, data1.ffpack, … in the order the scan reached them, a new pack once this size would be passed")]
         public int PackSizeLimitMB = 2048;
 
+        [Description("Texture size guideline in pixels (the larger side). The build report lists the textures above it, what capping them at it would save, and how sharp each would show capped. 0 = no list. Nothing is capped: that is each texture's Max Size")]
+        public int TextureBudget = 1024;
+
+        [Description("Pixels per metre a texture should keep where it shows coarsest: the report flags textures that would fall below it at the budget, the candidates for kit pieces, tiling materials or trim sheets")]
+        public float TexelDensityTarget = 512;
+
+        /// <summary>The scan's textures against <see cref="TextureBudget"/>, or null when it is 0. Worker-safe.</summary>
+        public TextureBudgetResult? MeasureTextures(BuildScan scan) =>
+            TextureBudget > 0 ? TextureBudgetScan.Measure(scan, TextureBudget, TexelDensityTarget) : null;
+
         /// <summary>The profile with this GUID, or at this path relative to Assets; null if there is none.</summary>
         public static BuildProfile? Find(string key)
         {
@@ -59,10 +69,14 @@ namespace Freefall.Editor.Publishing
         public void Scan()
         {
             var scan = DependencyScanner.Scan(this);
+            scan.Textures = MeasureTextures(scan);
             scan.WriteReport(ReportPath);
 
+            var over = scan.Textures?.Over;
             var summary = $"[Build] {Name}: {scan.Artifacts.Count:N0} assets, {BuildScan.Size(scan.TotalBytes)}, " +
-                          $"{scan.Warnings.Count} warnings, {scan.Elapsed.TotalSeconds:0.0} s. Report: {ReportPath}";
+                          $"{scan.Warnings.Count} warnings, {scan.Elapsed.TotalSeconds:0.0} s" +
+                          (over != null ? $"; {over.Count} textures over {TextureBudget} px ({BuildScan.Size(over.Sum(t => t.Artifact.Size))})" : "") +
+                          $". Report: {ReportPath}";
             Debug.LogAlways(summary);
             Toast.Show($"{scan.Artifacts.Count:N0} assets, {BuildScan.Size(scan.TotalBytes)}: report written", 3f);
         }
