@@ -39,6 +39,8 @@ namespace Freefall.PCG
         private static long _lastRequest;
         private static bool _flushing;
 
+        private static readonly ProfilerMarker _flushMarker = ProfilerMarker.Get("PCG");
+
         /// <summary>Components waiting to regenerate.</summary>
         public static int PendingCount => _dirty.Count;
 
@@ -117,28 +119,102 @@ namespace Freefall.PCG
         public static void Flush()
         {
             if (_dirty.Count == 0) return;
+            using var _ = _flushMarker.Auto(_dirty.Count);
 
             // A run queues the later components around it; those are picked up below, in order. A component
             // queued again after it ran here (a message sent by a run, missing terrain heights) waits for the
             // next frame, so this always ends.
             _ranThisFlush.Clear();
-            while (true)
+            ObstacleCache.BeginBatch();
+            try
             {
-                PCGComponent? next = null;
-                foreach (var component in _dirty)
+                while (true)
                 {
-                    if (_ranThisFlush.Contains(component)) continue;
-                    if (next == null || PCGComponent.CompareOrder(component, next) < 0)
-                        next = component;
-                }
-                if (next == null) break;
+                    PCGComponent? next = null;
+                    foreach (var component in _dirty)
+                    {
+                        if (_ranThisFlush.Contains(component)) continue;
+                        if (next == null || PCGComponent.CompareOrder(component, next) < 0)
+                            next = component;
+                    }
+                    if (next == null) break;
 
-                _ranThisFlush.Add(next);
-                _dirty.Remove(next);
-                if (!next.IsDestroyed)
-                    next.Execute();
+                    _ranThisFlush.Add(next);
+                    _dirty.Remove(next);
+                    if (!next.IsDestroyed)
+                        next.Execute();
+                }
+            }
+            finally
+            {
+                ObstacleCache.EndBatch();
             }
             _ranThisFlush.Clear();
+        }
+
+        /// <summary>
+        /// A scene load's PCG slice: what is queued, in order, until <paramref name="deadline"/> (a Stopwatch timestamp);
+        /// true once the queue is empty. Like <see cref="Flush"/> (edit holds and the quiet time do not apply), but it can
+        /// stop between components: <paramref name="ran"/> carries over between slices, and a component queued again after
+        /// it ran waits for the next round, as it would wait for the next frame's flush. Returns at once while terrain
+        /// heights are on their way. Run it inside an ObstacleCache batch.
+        /// </summary>
+        internal static bool RunQueued(long deadline, HashSet<PCGComponent> ran)
+        {
+            if (_dirty.Count == 0) return true;
+            using var _ = _flushMarker.Auto(_dirty.Count);
+            _loadRunning = true;
+            try
+            {
+                while (_dirty.Count > 0)
+                {
+                    if (TerrainHeightsPending) return false;
+
+                    PCGComponent? next = null;
+                    foreach (var component in _dirty)
+                    {
+                        if (ran.Contains(component)) continue;
+                        if (next == null || PCGComponent.CompareOrder(component, next) < 0)
+                            next = component;
+                    }
+                    if (next == null)
+                    {
+                        ran.Clear();   // all that is left ran already: a new round
+                        continue;
+                    }
+
+                    ran.Add(next);
+                    _dirty.Remove(next);
+                    LastRun = next;
+                    if (!next.IsDestroyed)
+                        next.Execute();
+                    if (System.Diagnostics.Stopwatch.GetTimestamp() >= deadline) break;
+                }
+            }
+            finally
+            {
+                _loadRunning = false;
+            }
+            return _dirty.Count == 0;
+        }
+
+        private static bool _loadRunning;
+
+        /// <summary>
+        /// A scene load is in progress and this is not its Generating step: PCGComponent.Execute() queues instead of
+        /// running, so that PCG runs once, in order, inside the load's obstacle batch.
+        /// </summary>
+        internal static bool DeferringForLoad => !_loadRunning && SceneManager.IsLoading;
+
+        /// <summary>The component <see cref="RunQueued"/> ran last (for a progress line).</summary>
+        internal static PCGComponent? LastRun { get; private set; }
+
+        /// <summary>Stop waiting for terrain heights that do not come (a terrain nothing draws), as Update does after a while.</summary>
+        internal static void StopWaitingForTerrain()
+        {
+            if (_terrainGaveUp) return;
+            _terrainGaveUp = true;
+            Debug.LogWarning("PCG", "Terrain heights did not arrive; running PCG graphs without them.");
         }
 
         /// <summary>
@@ -154,11 +230,19 @@ namespace Freefall.PCG
             components.Sort(PCGComponent.CompareOrder);
 
             var sw = System.Diagnostics.Stopwatch.StartNew();
-            foreach (var component in components)
+            ObstacleCache.BeginBatch();
+            try
             {
-                double start = sw.Elapsed.TotalMilliseconds;
-                component.Execute();
-                executed?.Invoke(component, sw.Elapsed.TotalMilliseconds - start);
+                foreach (var component in components)
+                {
+                    double start = sw.Elapsed.TotalMilliseconds;
+                    component.Execute();
+                    executed?.Invoke(component, sw.Elapsed.TotalMilliseconds - start);
+                }
+            }
+            finally
+            {
+                ObstacleCache.EndBatch();
             }
         }
 

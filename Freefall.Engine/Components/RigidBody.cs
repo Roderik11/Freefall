@@ -78,6 +78,9 @@ namespace Freefall.Components
             }
         }
 
+        // The colliders whose shapes are on the actor: their wrappers go before the actor does (its release takes the shapes)
+        private List<Collider>? _colliders;
+
         public void CreateActor()
         {
             var colliders = Entity.GetComponentsInChildren<Collider>();
@@ -86,12 +89,7 @@ namespace Freefall.Components
 
             // Remove old actor
             if (Actor != null)
-            {
-                PhysicsWorld.Scene.RemoveActor(Actor);
-                Actor.Dispose();
-                _staticActor = null;
-                _dynamicActor = null;
-            }
+                ReleaseActor();
 
             Transform.Matrix.Deconstruct(out var scale, out var rotation, out var translation);
 
@@ -126,6 +124,7 @@ namespace Freefall.Components
 
             foreach (var collider in colliders)
                 collider.CreateShape(Entity, actor);
+            _colliders = colliders;
 
             PhysicsWorld.Scene.AddActor(Actor!);
         }
@@ -135,12 +134,22 @@ namespace Freefall.Components
             Transform.OnChanged -= OnTransformChanged;
 
             if (Actor != null)
-            {
-                PhysicsWorld.Scene.RemoveActor(Actor);
-                Actor.Dispose();
-                _staticActor = null;
-                _dynamicActor = null;
-            }
+                ReleaseActor();
+        }
+
+        // Out of the scene, the shapes' wrappers first (left on the actor), then the actor with its shapes in one release
+        private void ReleaseActor()
+        {
+            PhysicsWorld.Scene.RemoveActor(Actor!);
+            if (_colliders != null)
+                foreach (var collider in _colliders)
+                    if (collider.ShapeHost == Entity)
+                        collider.ReleaseShape(native: false);
+            _colliders = null;
+
+            PhysXRelease.Release((PhysX.IDisposable?)_staticActor ?? _dynamicActor);
+            _staticActor = null;
+            _dynamicActor = null;
         }
     }
 }

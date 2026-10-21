@@ -53,6 +53,9 @@ namespace Freefall.Base
 
         public static void Initialize()
         {
+            // Before the first object: it learns every object's pointer as the wrapper registers it
+            PhysXRelease.Initialize();
+
             var errorOutput = new PhysXErrorOutput();
             var foundation = new Foundation(errorOutput);
 

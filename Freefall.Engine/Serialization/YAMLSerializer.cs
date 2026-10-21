@@ -19,7 +19,7 @@ namespace Freefall.Serialization
     /// asset references as GUIDs, enum-as-int, [DefaultValue] skip,
     /// [Serializable] nested objects, and list serialization.
     /// </summary>
-    public class YAMLSerializer
+    public partial class YAMLSerializer
     {
         /// <summary>
         /// When true, asset references create stub objects with GUID only (no LoadByGuid).
@@ -448,6 +448,7 @@ namespace Freefall.Serialization
 
                             var fields = Reflector.GetMapping(type);
                             var instance = Activator.CreateInstance(type);
+                            Track(instance);
 
                             while (parser.CurrentEventType != ParseEventType.MappingEnd && !parser.End)
                                 ReadNext(ref parser, instance, fields);
@@ -456,12 +457,14 @@ namespace Freefall.Serialization
                                 parser.Read(); // consume MappingEnd
 
                             results.Add(instance);
+                            if (RecipeOf(instance) is { } recipe) _recording!.Documents.Add(recipe);
                         }
                         catch (Exception ex)
                         {
                             Debug.LogWarning("YAMLSerializer",
                                 $"DeserializeAll doc #{results.Count}: {ex.GetType().Name}: {ex.Message}");
                             SkipToDocumentEnd(ref parser);
+                            if (_recording != null) _recording.Failed = true;
                         }
                     }
                     else
@@ -506,6 +509,7 @@ namespace Freefall.Serialization
             var fields = Reflector.GetMapping(type);
             // Defer instantiation — type may be abstract, resolved by type discriminator below
             object value = type.IsAbstract || type.IsInterface ? null : Activator.CreateInstance(type);
+            Track(value);
 
             while (parser.CurrentEventType != ParseEventType.MappingEnd)
             {
@@ -536,6 +540,7 @@ namespace Freefall.Serialization
                             type = resolvedType;
                             fields = Reflector.GetMapping(type);
                             value = Activator.CreateInstance(type);
+                            Track(value);
                         }
 
                         // Read the inner mapping containing the actual fields
@@ -554,7 +559,11 @@ namespace Freefall.Serialization
                     }
 
                     // Lazy instantiation for non-discriminated concrete types
-                    value ??= Activator.CreateInstance(type);
+                    if (value == null)
+                    {
+                        value = Activator.CreateInstance(type);
+                        Track(value);
+                    }
 
                     // Regular field name — process value using ReadNode logic
                     if (key != null && fields.TryGetValue(key, out var field))
@@ -569,7 +578,11 @@ namespace Freefall.Serialization
                 }
 
                 // Fallback
-                value ??= Activator.CreateInstance(type);
+                if (value == null)
+                {
+                    value = Activator.CreateInstance(type);
+                    Track(value);
+                }
                 ReadNext(ref parser, value, fields);
             }
 
@@ -656,11 +669,14 @@ namespace Freefall.Serialization
                     if (oldUidValue is ulong oldUid && oldUid != 0)
                     {
                         DuplicateUidMap[oldUid] = uniqueObj.UID;
+                        Record(parent, new Op { Kind = OpKind.DuplicateUid, Field = field, Value = oldUid });
                     }
                 }
                 else
                 {
-                    field.SetValue(parent, converter.Read(ref parser));
+                    var value = converter.Read(ref parser);
+                    field.SetValue(parent, value);
+                    RecordSet(parent, field, value);
                 }
                 return;
             }
@@ -668,7 +684,9 @@ namespace Freefall.Serialization
             // ── Enum ──
             if (field.Type.IsEnum)
             {
-                field.SetValue(parent, parser.ReadScalarAsInt32());
+                object value = parser.ReadScalarAsInt32();
+                field.SetValue(parent, value);
+                RecordSet(parent, field, value);
                 return;
             }
 
@@ -693,6 +711,7 @@ namespace Freefall.Serialization
                             Field = field,
                             UID = uid,
                         });
+                        Record(parent, new Op { Kind = OpKind.UidRef, Field = field, Value = uid });
                     }
                 }
                 else
@@ -748,6 +767,7 @@ namespace Freefall.Serialization
                         Guid = guidValue,
                         AssetType = field.Type
                     });
+                    Record(parent, new Op { Kind = OpKind.AssetStub, Field = field, Value = guidValue, Type = field.Type });
                 }
                 catch { }
 
@@ -759,6 +779,8 @@ namespace Freefall.Serialization
             {
                 var value = DeserializeNested(ref parser, field.Type);
                 field.SetValue(parent, value);
+                if (RecipeOf(value) is { } nested)
+                    Record(parent, new Op { Kind = OpKind.Nested, Field = field, Nested = nested });
                 return;
             }
 
@@ -795,6 +817,7 @@ namespace Freefall.Serialization
                     for (int i = 0; i < temp.Count; i++)
                         arr.SetValue(Convert.ChangeType(temp[i], eltype), i);
                     field.SetValue(parent, arr);
+                    Record(parent, new Op { Kind = OpKind.PrimitiveArray, Field = field, Type = eltype, Values = temp.ToArray() });
                 }
                 else
                 {
@@ -802,7 +825,10 @@ namespace Freefall.Serialization
                     list!.Clear();
                     foreach (var v in temp) list.Add(v);
                     field.SetValue(parent, list);
+                    Record(parent, new Op { Kind = OpKind.PrimitiveList, Field = field, Type = type, Values = temp.ToArray() });
                 }
+                if (_recording != null && temp.Exists(v => v != null && v is not string && !v.GetType().IsValueType))
+                    _recording.Failed = true;
                 return;
             }
 
@@ -815,6 +841,7 @@ namespace Freefall.Serialization
 
             var newlist = (field.GetValue(parent) ?? Activator.CreateInstance(type)) as IList;
             newlist!.Clear();
+            var items = _recording != null ? new List<object>() : null;   // what the replay adds, element by element
 
             parser.Read(); // consume SequenceStart
 
@@ -824,7 +851,10 @@ namespace Freefall.Serialization
                 {
                     var deserialized = DeserializeNested(ref parser, eltype);
                     if (deserialized != null)
+                    {
                         newlist!.Add(deserialized);
+                        if (items != null && RecipeOf(deserialized) is { } recipe) items.Add(recipe);
+                    }
                 }
                 else if (parser.CurrentEventType == ParseEventType.Scalar)
                 {
@@ -852,6 +882,7 @@ namespace Freefall.Serialization
                                 Guid = scalarValue,
                                 AssetType = eltype
                             });
+                            items?.Add(new AssetItem(eltype, scalarValue));
                             continue;
                         }
                     }
@@ -864,7 +895,10 @@ namespace Freefall.Serialization
                     {
                         var deserialized = DeserializeNested(ref parser, serializedType);
                         if (deserialized != null)
+                        {
                             newlist!.Add(deserialized);
+                            if (items != null && RecipeOf(deserialized) is { } recipe) items.Add(recipe);
+                        }
                     }
                 }
                 else
@@ -876,6 +910,8 @@ namespace Freefall.Serialization
             parser.Read(); // consume SequenceEnd
 
             field.SetValue(parent, newlist);
+            if (items != null)
+                Record(parent, new Op { Kind = OpKind.List, Field = field, Type = type, Items = items });
         }
 
         // ── Helpers ───────────────────────────────────────────────

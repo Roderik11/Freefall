@@ -386,48 +386,123 @@ namespace Freefall.Graphics
         [System.Text.Json.Serialization.JsonIgnore]
         public PhysX.TriangleMesh? CookedTriMesh { get; set; }
 
+        // A cook started by RequestPhysicsCook: the cooked bytes, made into CookedTriMesh by CookPhysicsMesh
+        private System.Threading.Tasks.Task<System.IO.MemoryStream>? _physicsCook;
+        private PhysX.Cooking? _physicsCooking;
+
+        /// <summary>A cook for <see cref="CookedTriMesh"/> is under way (<see cref="RequestPhysicsCook"/>).</summary>
+        public bool PhysicsCookRequested => _physicsCook != null;
+
         /// <summary>
-        /// Cook the physics triangle mesh on the calling thread (background) and cache it.
-        /// Thread-safe: each call creates its own Cooking instance.
+        /// Start cooking the physics triangle mesh on a worker; <see cref="CookPhysicsMesh"/> takes the result (waiting
+        /// for it if need be). MeshCollider asks in Early(), so a wake-up of thousands of colliders cooks its meshes
+        /// in parallel instead of one after another in Awake() (Eldermoor's first Play: 376 meshes, 3.5 s). Main thread:
+        /// the cooking object goes into PhysX.Net's object table, which is not thread-safe.
+        /// </summary>
+        public void RequestPhysicsCook()
+        {
+            if (CookedTriMesh != null || _physicsCook != null || Positions == null || CpuIndices == null)
+                return;
+            var cooking = Freefall.Base.PhysicsWorld.Physics.CreateCooking();
+            var positions = Positions;
+            var indices = CpuIndices;
+            var parts = MeshParts.ToArray();
+            var lodFirst = _partLodFirst;
+            _physicsCooking = cooking;
+            _physicsCook = System.Threading.Tasks.Task.Run(() => Cook(cooking, positions, indices, parts, lodFirst));
+        }
+
+        /// <summary>
+        /// Make <see cref="CookedTriMesh"/>: from the cook <see cref="RequestPhysicsCook"/> started, or cooked now.
+        /// Main thread.
         /// </summary>
         public void CookPhysicsMesh()
         {
-            if (Positions == null || CpuIndices == null)
+            if (CookedTriMesh != null || Positions == null || CpuIndices == null)
                 return;
 
+            System.IO.MemoryStream stream;
+            var cooking = _physicsCooking;
+            try
+            {
+                if (_physicsCook != null)
+                    stream = _physicsCook.GetAwaiter().GetResult();
+                else
+                {
+                    cooking = Freefall.Base.PhysicsWorld.Physics.CreateCooking();
+                    stream = Cook(cooking, Positions, CpuIndices, MeshParts.ToArray(), _partLodFirst);
+                }
+            }
+            finally
+            {
+                // Cooking objects were never released before: one per mesh stayed in the object table
+                Freefall.Base.PhysXRelease.Release(cooking);
+                _physicsCook = null;
+                _physicsCooking = null;
+            }
+
+            CookedTriMesh = Freefall.Base.PhysicsWorld.Physics.CreateTriangleMesh(stream);
+        }
+
+        // Any thread: reads only what it is given
+        private static System.IO.MemoryStream Cook(PhysX.Cooking cooking, Vector3[] positions, uint[] indices, MeshPart[] parts, int[]? lodFirst)
+        {
             // Coarser LODs would collide as more surfaces just inside the first: cook LOD 0 and the parts
             // outside the LOD chain (collision parts too), not the parts that only lower LODs draw.
             int[] triangles;
-            var lodFirst = _partLodFirst;
             if (lodFirst == null)
-                triangles = System.Array.ConvertAll(CpuIndices, i => (int)i);
+                triangles = System.Array.ConvertAll(indices, i => (int)i);
             else
             {
-                var list = new List<int>(CpuIndices.Length);
-                for (int p = 0; p < MeshParts.Count; p++)
+                var list = new List<int>(indices.Length);
+                for (int p = 0; p < parts.Length; p++)
                 {
                     if (p < lodFirst.Length && lodFirst[p] > 0) continue;
-                    var part = MeshParts[p];
-                    int end = Math.Min(part.BaseIndex + part.NumIndices, CpuIndices.Length);
+                    var part = parts[p];
+                    int end = Math.Min(part.BaseIndex + part.NumIndices, indices.Length);
                     for (int i = part.BaseIndex; i < end; i++)
-                        list.Add((int)CpuIndices[i] + part.BaseVertex);
+                        list.Add((int)indices[i] + part.BaseVertex);
                 }
                 triangles = list.ToArray();
             }
 
-            var cooking = Freefall.Base.PhysicsWorld.Physics.CreateCooking();
             var desc = new PhysX.TriangleMeshDesc()
             {
                 Flags = (PhysX.MeshFlag)0,
                 Triangles = triangles,
-                Points = Positions
+                Points = positions
             };
 
             var stream = new System.IO.MemoryStream();
             cooking.CookTriangleMesh(desc, stream);
-
             stream.Position = 0;
-            CookedTriMesh = Freefall.Base.PhysicsWorld.Physics.CreateTriangleMesh(stream);
+            return stream;
+        }
+
+        /// <summary>
+        /// A fingerprint of everything the physics cook reads (positions, indices, which parts are LOD 0), so meshes of
+        /// equal geometry share one cooked mesh: a reload's new Mesh objects of the same assets, and RuntimeMesh output
+        /// rebuilt the same on every load under a new name. 64-bit FNV-1a by words.
+        /// </summary>
+        public ulong PhysicsGeometryKey()
+        {
+            ulong h = 14695981039346656037UL;
+            void Mix(ReadOnlySpan<byte> bytes)
+            {
+                var words = System.Runtime.InteropServices.MemoryMarshal.Cast<byte, ulong>(bytes);
+                foreach (var w in words) h = (h ^ w) * 1099511628211UL;
+                for (int i = words.Length * 8; i < bytes.Length; i++) h = (h ^ bytes[i]) * 1099511628211UL;
+                h = (h ^ (ulong)bytes.Length) * 1099511628211UL;
+            }
+            if (Positions != null) Mix(System.Runtime.InteropServices.MemoryMarshal.AsBytes(Positions.AsSpan()));
+            if (CpuIndices != null) Mix(System.Runtime.InteropServices.MemoryMarshal.AsBytes(CpuIndices.AsSpan()));
+            if (_partLodFirst != null)
+            {
+                Mix(System.Runtime.InteropServices.MemoryMarshal.AsBytes(_partLodFirst.AsSpan()));
+                foreach (var part in MeshParts)
+                    h = ((h ^ (ulong)(uint)part.BaseIndex) * 1099511628211UL ^ (ulong)(uint)part.NumIndices ^ ((ulong)(uint)part.BaseVertex << 32)) * 1099511628211UL;
+            }
+            return h;
         }
 
         private int[]? _meshPartIds;
@@ -503,13 +578,17 @@ namespace Freefall.Graphics
             Positions = positions;
             CpuIndices = indices;
 
-            _posBuffer = CreateBuffer(device, positions);
+            // All of the mesh's buffers in one copy list, submitted without a CPU wait (GraphicsDevice.SubmitCommandList
+            // makes every direct-queue list GPU-wait for earlier copies). One wait per buffer, polled with Thread.Sleep(1),
+            // made a generated mesh cost ~5 ms: RuntimeMesh took ~0.8 s of a scene load's wake-up on Eldermoor.
+            using var uploads = new BufferUploads(device);
+            _posBuffer = uploads.Create(positions);
             _posView = new VertexBufferView { BufferLocation = _posBuffer.GPUVirtualAddress, SizeInBytes = (uint)(positions.Length * 12), StrideInBytes = 12 };
 
-            _normBuffer = CreateBuffer(device, normals);
+            _normBuffer = uploads.Create(normals);
             _normView = new VertexBufferView { BufferLocation = _normBuffer.GPUVirtualAddress, SizeInBytes = (uint)(normals.Length * 12), StrideInBytes = 12 };
 
-            _uvBuffer = CreateBuffer(device, uvs);
+            _uvBuffer = uploads.Create(uvs);
             _uvView = new VertexBufferView { BufferLocation = _uvBuffer.GPUVirtualAddress, SizeInBytes = (uint)(uvs.Length * 8), StrideInBytes = 8 };
 
             PosBufferIndex = device.AllocateBindlessIndex();
@@ -524,7 +603,7 @@ namespace Freefall.Graphics
             // Tangent buffer (float4, 16 bytes per vertex)
             if (tangents != null && tangents.Length > 0)
             {
-                _tanBuffer = CreateBuffer(device, tangents);
+                _tanBuffer = uploads.Create(tangents);
                 TanBufferIndex = device.AllocateBindlessIndex();
                 CreateStructuredBufferSRV(device, _tanBuffer, (uint)tangents.Length, 16, TanBufferIndex);
             }
@@ -532,7 +611,7 @@ namespace Freefall.Graphics
             if (indices != null)
             {
                 _indexCount = indices.Length;
-                _indexBuffer = CreateBuffer(device, indices); // Note: CreateBuffer<uint>
+                _indexBuffer = uploads.Create(indices);
                  _indexBufferView = new IndexBufferView { BufferLocation = _indexBuffer.GPUVirtualAddress, SizeInBytes = (uint)(indices.Length * 4), Format = Format.R32_UInt };
                  
                 IndexBufferIndex = device.AllocateBindlessIndex();
@@ -597,6 +676,51 @@ namespace Freefall.Graphics
             // The Streaming Manager could return a "Task" or "Fence" for the batch?
         }
         
+        /// <summary>
+        /// Default-heap buffers filled by one copy list, submitted when disposed and not waited for: the next direct-queue
+        /// list GPU-waits for it. The staging buffers, the list and its allocator go through the deferred disposal, which
+        /// outlasts the frames that could still be copying from them.
+        /// </summary>
+        private sealed class BufferUploads : IDisposable
+        {
+            private readonly GraphicsDevice _device;
+            private readonly List<ID3D12Resource> _staging = new();
+            private ID3D12CommandAllocator? _allocator;
+            private ID3D12GraphicsCommandList? _list;
+
+            public BufferUploads(GraphicsDevice device) => _device = device;
+
+            public ID3D12Resource Create<T>(T[] data) where T : unmanaged
+            {
+                int size = data.Length * System.Runtime.InteropServices.Marshal.SizeOf<T>();
+                var buffer = _device.NativeDevice.CreateCommittedResource(
+                    new HeapProperties(HeapType.Default), HeapFlags.None, ResourceDescription.Buffer((ulong)size), ResourceStates.Common, null);
+
+                var upload = _device.CreateUploadBuffer(data);
+                _staging.Add(upload);
+                if (_list == null)
+                {
+                    _allocator = _device.NativeDevice.CreateCommandAllocator(CommandListType.Copy);
+                    _list = _device.NativeDevice.CreateCommandList<ID3D12GraphicsCommandList>(0, CommandListType.Copy, _allocator);
+                }
+                _list.CopyResource(buffer, upload);
+                return buffer;
+            }
+
+            public void Dispose()
+            {
+                if (_list == null) return;
+                _list.Close();
+                _device.CopyQueueSubmit(_list);
+
+                foreach (var upload in _staging)
+                    _device.DeferDispose(upload);
+                _device.DeferDispose(_list);
+                _device.DeferDispose(_allocator);
+                _list = null;
+            }
+        }
+
         // Helper
         private static ID3D12Resource CreateBuffer<T>(GraphicsDevice device, T[] data) where T : unmanaged
         {
@@ -682,8 +806,15 @@ namespace Freefall.Graphics
             _partLodNext = source._partLodNext;
             BoundingBox = source.BoundingBox;
 
-            // Stale collision data; the next Collider cooks from the new Positions.
+            // Stale collision data; the next Collider cooks from the new Positions (a cook under way had the old ones).
             CookedTriMesh = null;
+            if (_physicsCook != null)
+            {
+                var cooking = _physicsCooking;
+                _physicsCook.ContinueWith(_ => Engine.RunOnMainThreadAsync(() => Freefall.Base.PhysXRelease.Release(cooking)));
+                _physicsCook = null;
+                _physicsCooking = null;
+            }
 
             // Refresh registry entries in place (same MeshPartIds, new buffer indices/ranges/bounds),
             // then free the ids of parts that no longer exist.

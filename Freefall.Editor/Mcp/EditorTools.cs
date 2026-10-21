@@ -39,6 +39,11 @@ namespace Freefall.Editor.Mcp
             if (ProgressJob.Running?.Current is { } job)
                 info["job"] = JobJson(job);
 
+            // A scene load in progress: its step, what it is doing, how far (calls that change the scene wait for it)
+            var sceneLoad = await server.DispatchAsync("GET", "/api/scene/load-status", null);
+            if (sceneLoad.StatusCode == 200 && sceneLoad.Body != null && JsonNode.Parse(sceneLoad.Body)?["loading"] is JsonObject loading)
+                info["sceneLoad"] = loading.DeepClone();
+
             var stats = await server.DispatchAsync("GET", "/api/engine/stats", null);
             if (stats.StatusCode == 200 && stats.Body != null)
                 info["stats"] = JsonNode.Parse(stats.Body);
@@ -200,10 +205,12 @@ namespace Freefall.Editor.Mcp
                      "Update/Draw/wake-up loop (items = components), render passes (command recording), editor UI; 'Wait for GPU' is the " +
                      "CPU waiting for the GPU. 'gpuTree' is GPU time per PIX region (G-buffer passes, shadows, lighting, post, editor UI) " +
                      "on the primary command list, from timestamp queries. Average and max ms over the last 'frames' frames (max 300), " +
-                     "plus KB allocated on the main thread; 'slowest' shows the slowest of those frames instead. Sections under 'minMs' " +
+                     "plus KB allocated on the main thread; 'slowest' shows the slowest of those frames instead, and 'frame' one frame by " +
+                     "index (the result lists every frame over 100 ms in 'longFrames': a scene load's stalls, for instance). Sections under 'minMs' " +
                      "(unless they spike to 10x that) are left out. Also shown live in the editor's Profiler tab.")]
-        public static Task<CallToolResult> ProfilerTree(int frames = 120, double minMs = 0.05, bool slowest = false)
-            => McpBridge.Get("/api/debug/profiler", ("frames", frames), ("minMs", minMs), ("slowest", slowest));
+        public static Task<CallToolResult> ProfilerTree(int frames = 120, double minMs = 0.05, bool slowest = false,
+            [Description("One recorded frame by index (from longFrames); -1 = none")] long frame = -1)
+            => McpBridge.Get("/api/debug/profiler", ("frames", frames), ("minMs", minMs), ("slowest", slowest), ("frame", frame));
 
         [McpServerTool(Name = "settings_get", Title = "Get engine settings", ReadOnly = true, OpenWorld = false)]
         [Description("All engine render/debug settings (shadows, fog, bloom, SSDM, radiance cascades, debug visualization, ...). Keys are the PascalCase names settings_set expects.")]
@@ -231,8 +238,8 @@ namespace Freefall.Editor.Mcp
         [Description("Enter or leave play mode, and open or close the game's menu (what Escape toggles: the game's windows, a free " +
                      "cursor, no player control). No arguments = report only. By default this does NOT save the scene: it is kept in " +
                      "memory and Stop goes back to it, so the scene file is untouched (save=true writes it first, as the toolbar's Play " +
-                     "does). Play waits until the game is running and has settled (the scene reload takes ~20-40 s on Eldermoor), " +
-                     "Stop until the scene is back and settled, unless wait=false. " +
+                     "does). Play and Stop are scene loads behind the editor's progress popup; this waits until the load is done " +
+                     "(Play on Eldermoor ~12 s, most of it physics cooking; Stop ~5 s), unless wait=false. " +
                      "The game's UI is drawn over the scene viewport: screenshot target='viewport' shows it. Drive the game with " +
                      "play_input; read the game UI's controls with game_ui.")]
         public static async Task<CallToolResult> PlayMode(
@@ -252,28 +259,18 @@ namespace Freefall.Editor.Mcp
             var result = await McpBridge.Post("/api/playmode", body);
             if (play == null || !wait || result.IsError == true) return result;
 
-            // The scene reloads on the main thread: calls time out meanwhile. Done once the game's UI runs
-            // (Play) or is gone (Stop); then the first frames (start-up, PCG, streaming) still hold the
-            // main thread for a while, and a call made then times out: wait for them as scene_load does
-            var deadline = DateTime.UtcNow.AddSeconds(waitSeconds);
-            while (DateTime.UtcNow < deadline)
-            {
-                await Task.Delay(1000);
-                var status = await McpBridge.Get("/api/playmode");
-                if (status.IsError == true) continue;
-                var json = JsonNode.Parse(TextOf(status));
-                if (json?["uiRunning"]?.GetValue<bool>() != play.Value) continue;
+            // Play and Stop are scene loads (SceneLoad, in slices behind the editor's popup): done when the load is
+            var done = await SceneTools.WaitForLoad(waitSeconds);
+            if (done == null)
+                return McpBridge.Error(play == true
+                    ? $"Play started, but the scene was still loading after {waitSeconds}s; check play_mode later."
+                    : $"Stop asked, but the scene was still loading after {waitSeconds}s; check play_mode later.");
+            if (done["last"]?["failed"] is { } failed)
+                return McpBridge.Error($"The scene load failed: {failed}");
 
-                int left = Math.Max(5, (int)(deadline - DateTime.UtcNow).TotalSeconds);
-                await SceneTools.WaitUntilSettled(left);
-
-                if (play == true && menu != null)
-                    return await McpBridge.Post("/api/playmode", new JsonObject { ["menu"] = menu.Value });
-                return await McpBridge.Get("/api/playmode");
-            }
-            return McpBridge.Error(play == true
-                ? $"Play started, but the game was not running after {waitSeconds}s; check play_mode later."
-                : $"Stop asked, but the game was still running after {waitSeconds}s; check play_mode later.");
+            if (play == true && menu != null)
+                return await McpBridge.Post("/api/playmode", new JsonObject { ["menu"] = menu.Value });
+            return await McpBridge.Get("/api/playmode");
         }
 
         [McpServerTool(Name = "play_input", Title = "Play input into the game", OpenWorld = false)]

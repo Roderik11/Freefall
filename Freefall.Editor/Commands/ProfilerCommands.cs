@@ -6,11 +6,15 @@ namespace Freefall.Editor.Commands
 {
     /// <summary>
     /// The <see cref="Profiler"/> call tree: average and max ms over the last 'frames' recorded frames, or
-    /// one frame ('slowest' = the slowest of them). Children sorted by time; sections under 'minMs' are left out.
+    /// one frame ('slowest' = the slowest of them, 'frame' = one by index from 'longFrames'). Children sorted by
+    /// time; sections under 'minMs' are left out.
     /// </summary>
     [CommandRoute("GET", "/api/debug/profiler")]
     public class GetProfilerCommand : EditorCommand
     {
+        /// <summary>Frames longer than this are listed by index ('longFrames'), to look at one with 'frame'.</summary>
+        private const float LongFrameMs = 100;
+
         public override CommandResult Execute(CommandContext context)
         {
             var qs = CommandHelpers.ParseQueryString(context.Path);
@@ -27,6 +31,7 @@ namespace Freefall.Editor.Commands
             float sum = 0, max = 0;
             long alloc = 0, slowestFrame = start;
             int gcFrames = 0;
+            var longFrames = new List<object>();
             for (long i = start; i < end; i++)
             {
                 float ms = Profiler.FrameMs(i);
@@ -34,9 +39,13 @@ namespace Freefall.Editor.Commands
                 if (ms > max) { max = ms; slowestFrame = i; }
                 alloc += Profiler.FrameAllocatedBytes(i);
                 if (Profiler.FrameCollections(i) != 0) gcFrames++;
+                if (ms > LongFrameMs) longFrames.Add(new { index = i, ms = Math.Round(ms) });
             }
 
+            // 'frame' = one recorded frame by index (from longFrames), else the slowest when asked
             long? frame = slowest ? slowestFrame : null;
+            if (qs.TryGetValue("frame", out var fi) && long.TryParse(fi, out var index) && Profiler.IsRecorded(index))
+                frame = index;
             var gpu = Profiler.GpuRoot.Stats(n);
 
             return CommandResult.Json(new
@@ -51,6 +60,7 @@ namespace Freefall.Editor.Commands
                 // the per-section allocKB below counts the main thread only
                 allocatedKBPerFrameAllThreads = Math.Round(alloc / 1024.0 / n, 1),
                 framesWithGC = gcFrames,
+                longFrames,
                 frame = frame == null ? null : new
                 {
                     index = frame.Value,

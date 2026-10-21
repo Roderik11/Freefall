@@ -94,39 +94,39 @@ namespace Freefall.Assets.Loaders
         }
 
         /// <summary>
-        /// Find a CollisionMeshData subasset by type in the meta, load it, and create
-        /// a PhysX HeightField from the cooked bytes.
+        /// The PhysX height field cooked when <paramref name="terrain"/> was last saved (its CollisionMeshData subasset),
+        /// or null. It holds the heights and holes as they were saved: Terrain.CookedHeightFieldAsync takes it only while
+        /// they still are. Main thread.
         /// </summary>
-        private static void LoadCookedHeightField(Terrain terrain, string guid)
+        internal static PhysX.HeightField LoadSavedCook(Terrain terrain)
         {
+            var guid = terrain?.Guid;
             try
             {
-                if (string.IsNullOrEmpty(guid)) return;
+                if (string.IsNullOrEmpty(guid)) return null;
 
                 var meta = AssetDatabase.GetMeta(guid);
-                if (meta == null) return;
+                if (meta == null) return null;
 
                 var collisionSub = meta.SubAssets.FirstOrDefault(
                     s => s.Type == nameof(CollisionMeshData));
-                if (collisionSub == null) return;
+                if (collisionSub == null) return null;
 
                 var physxPath = AssetDatabase.ResolveCachePathByGuid(collisionSub.Guid);
-                if (physxPath == null || !Artifacts.Exists(physxPath)) return;
+                if (physxPath == null || !Artifacts.Exists(physxPath)) return null;
 
                 var packer = new CollisionMeshPacker();
                 using var stream = Artifacts.Open(physxPath);
                 var cooked = packer.Read(stream);
 
-                Debug.Log($"[TerrainLoader] Cooked bytes loaded: {cooked.CookedBytes.Length} bytes from {physxPath}");
-
                 var hf = PhysicsWorld.Physics.CreateHeightField(new MemoryStream(cooked.CookedBytes));
-                terrain.SetCookedHeightField(hf);
-
-                Debug.Log($"[TerrainLoader] Pre-cooked HeightField loaded: {guid}, {cooked.CookedBytes.Length} cooked bytes");
+                Debug.LogAlways($"[TerrainLoader] '{terrain.Name}': collision height field from the saved cook ({cooked.CookedBytes.Length / 1024} KB)");
+                return hf;
             }
             catch (Exception ex)
             {
                 Debug.LogWarning("TerrainLoader", $"Failed to load cooked HeightField '{guid}': {ex.Message}");
+                return null;
             }
         }
 
@@ -158,6 +158,7 @@ namespace Freefall.Assets.Loaders
                         heights[x, y] = raw / 65535.0f;
                     }
                 terrain.SetHeightField(heights);
+                terrain.HeightFieldStampsHash = terrain.BakedStampsHash;   // the saved map's heights, from the saved map's stamps
                 Debug.Log($"[TerrainLoader] Baked heightmap loaded + CPU HeightField built: {resolution}x{resolution}");
             }
             else
@@ -282,8 +283,9 @@ namespace Freefall.Assets.Loaders
             if (string.IsNullOrEmpty(terrain.BakedHeightmapRef.Guid))
                 terrain.BakedHeightmapRef.Guid = System.Guid.NewGuid().ToString("N");
 
-            // Save baked heightmap DDS
+            // Save baked heightmap DDS, and what it was baked from (written with the YAML after this)
             SaveDdsSubasset(terrain.BakedHeightmapRef.Guid, bytes);
+            terrain.BakedStampsHash = terrain.HeightmapStampsHash;
             Debug.Log($"[TerrainLoader] Baked heightmap saved: {bytes.Length} bytes, res={resolution}");
 
             // The hole mask next to it (CPU data, nothing to read back). No holes = no reference, so a load finds none.

@@ -52,6 +52,9 @@ namespace Freefall.Components
         /// <summary>Diagnostics: total Execute() calls across all PCG components (editor debug stats).</summary>
         public static int ExecuteCount;
 
+        private static readonly ProfilerMarker _destroyMarker = ProfilerMarker.Get("PCG destroy output");
+        private static readonly ProfilerMarker _graphMarker = ProfilerMarker.Get("PCG graph");
+
         /// <summary>
         /// Execute the PCG graph now: destroy previous output, inject context, run graph.
         /// While terrain heights are still on their way (scene load) the run is queued instead and happens
@@ -67,7 +70,9 @@ namespace Freefall.Components
                 return;
             }
 
-            if (PCGScheduler.TerrainHeightsPending)
+            // While terrain heights are on their way, and while a scene loads (its Generating step runs the queue in
+            // order: a script asking for a run while the scene wakes, TimberKit.RerunPcg, gets it there)
+            if (PCGScheduler.TerrainHeightsPending || PCGScheduler.DeferringForLoad)
             {
                 Invalidate();
                 return;
@@ -76,7 +81,8 @@ namespace Freefall.Components
             ExecuteCount++;
 
             // 1. Destroy previous output
-            DestroyOutput();
+            using (_destroyMarker.Auto())
+                DestroyOutput();
 
             // 2. Create output container
             OutputEntity = new Entity("PCG_Output");
@@ -88,7 +94,8 @@ namespace Freefall.Components
             InjectContext();
 
             // 4. Execute graph
-            Graph.Execute();
+            using (_graphMarker.Auto())
+                Graph.Execute();
 
             int childCount = OutputEntity.Transform.GetChildCount();
             Debug.Log($"[PCG] '{Entity?.Name}' ran '{Graph.Name}' (tick {Engine.TickCount}): {Graph.Nodes.Count} nodes, {childCount} children spawned." +
@@ -141,6 +148,9 @@ namespace Freefall.Components
         /// <summary>True once the graph has run and its output (possibly empty) is in the scene.</summary>
         [System.ComponentModel.Browsable(false)]
         public bool HasOutput => OutputEntity != null;
+
+        /// <summary>The container of the last run's output (a new one per run), or null.</summary>
+        internal Entity? Output => OutputEntity;
 
         // ── Order and visibility between components ──
 

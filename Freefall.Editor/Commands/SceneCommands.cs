@@ -6,6 +6,52 @@ using Freefall.Base;
 
 namespace Freefall.Editor.Commands
 {
+    /// <summary>
+    /// The scene load in progress (step i/n, what it is doing, 0..1, seconds), or none; and the last one that finished:
+    /// its scene, whether it failed or was superseded, its [SceneLoad] summary, and with ?entities=true the entities read
+    /// from its file (id, uid, name). MCP scene_load and play_mode wait on this.
+    /// </summary>
+    [CommandRoute("GET", "/api/scene/load-status")]
+    public class SceneLoadStatusCommand : EditorCommand
+    {
+        public override CommandResult Execute(CommandContext context)
+        {
+            var qs = CommandHelpers.ParseQueryString(context.Path);
+            bool withEntities = qs.TryGetValue("entities", out var e) && e == "true";
+            var loading = SceneManager.Loading;
+            var last = SceneManager.LastLoad;
+            return CommandResult.Json(new
+            {
+                inProgress = loading != null,
+                loading = loading == null ? null : Describe(loading),
+                last = last == null ? null : new
+                {
+                    scene = last.Name,
+                    guid = last.Scene?.Guid,
+                    seconds = Math.Round(last.Seconds, 1),
+                    failed = last.Error?.Message,
+                    superseded = last.Superseded,
+                    entityCount = last.Entities.Count,
+                    entities = withEntities
+                        ? last.Entities.Where(x => EntityManager.GetEntity(x.Id) == x).Select(x => new { id = x.Id, uid = x.UID.ToString(), name = x.Name }).ToArray()
+                        : null,
+                },
+                lastReport = SceneManager.LastLoadReport,
+            });
+        }
+
+        internal static object Describe(SceneLoad load) => new
+        {
+            scene = load.Name,
+            step = SceneLoad.Describe(load.Current),
+            stepIndex = (int)load.Current + 1,
+            stepCount = SceneLoad.StepCount,
+            activity = load.Activity,
+            fraction = Math.Round(load.Progress, 3),
+            seconds = Math.Round(load.Seconds, 1),
+        };
+    }
+
     [CommandRoute("POST", "/api/scene/load")]
     public class LoadSceneCommand : EditorCommand
     {
@@ -46,22 +92,25 @@ namespace Freefall.Editor.Commands
 
             try
             {
-                var entities = Program.EditorUI.OpenScene(scene);
+                // Starts the load and returns: it runs in slices behind the progress popup (GET /api/scene/load-status)
+                var load = Program.EditorUI.OpenScene(scene);
                 path = Program.EditorUI.CurrentScenePath;
-                MessageDispatcher.Send(Msg.SceneLoaded, new
+                load.Completed += done => MessageDispatcher.Send(Msg.SceneLoaded, new
                 {
                     path,
-                    entityCount = entities.Count
+                    entityCount = done.Entities.Count
                 });
 
                 return CommandResult.Json(new
                 {
-                    status = "ok",
+                    status = "loading",
                     guid = scene.Guid,
                     path,
-                    entityCount = entities.Count,
-                    entities = entities.Select(e => new { id = e.Id, uid = e.UID.ToString(), name = e.Name }).ToArray()
                 });
+            }
+            catch (InvalidOperationException ex)
+            {
+                return CommandResult.Error(409, ex.Message);
             }
             catch (Exception ex)
             {

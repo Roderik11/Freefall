@@ -181,8 +181,8 @@ namespace Freefall.Editor
                 if (command == null)
                     return NoRoute(method, pathAndQuery);
                 if (command is IAsyncEditorCommand asyncCommand)
-                    return await asyncCommand.ExecuteAsync(context);
-                return await RunOnMainThread(() => command.Execute(context));
+                    return RefuseWhileLoading(command) ?? await asyncCommand.ExecuteAsync(context);
+                return await RunOnMainThread(() => RefuseWhileLoading(command) ?? command.Execute(context));
             }
             catch (TimeoutException)
             {
@@ -192,6 +192,26 @@ namespace Freefall.Editor
             {
                 return CommandResult.Error(500, ex.Message);
             }
+        }
+
+        // Writes that are harmless while a scene loads (the camera, the window, settings, a new load that supersedes the
+        // running one, reads that need a body). Every other write waits: the scene is half built and the world paused.
+        private static readonly HashSet<string> AllowedWhileLoading = new()
+        {
+            "POST /api/camera/move", "POST /api/camera/focus", "POST /api/editor/window", "POST /api/editor/scene-maximized",
+            "POST /api/settings", "POST /api/scene/load", "POST /api/scene/query", "POST /api/terrain/heights",
+            "POST /api/terrain/sample", "POST /api/play/input", "POST /api/play/input/stop", "POST /api/selection",
+        };
+
+        /// <summary>A 409 for a command that changes things while a scene loads (SceneManager.IsLoading); null when it may run.</summary>
+        private static CommandResult? RefuseWhileLoading(EditorCommand command)
+        {
+            var load = Freefall.Base.SceneManager.Loading;
+            if (load == null) return null;
+            var route = command.GetType().GetCustomAttributes(typeof(CommandRouteAttribute), false).FirstOrDefault() as CommandRouteAttribute;
+            if (route == null || route.Method == "GET" || AllowedWhileLoading.Contains($"{route.Method} {route.Pattern}")) return null;
+            return CommandResult.Error(409, $"A scene is loading ({load.Name}: {Freefall.Base.SceneLoad.Describe(load.Current)}, {load.Progress:P0}); " +
+                                            "try again when it is done (editor_status shows it)");
         }
 
         // --- REST pass-through ---

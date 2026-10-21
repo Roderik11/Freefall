@@ -45,21 +45,52 @@ namespace Freefall.Base
         /// Remove all entities except those flagged DontDestroyOnLoad.
         /// Call before loading a new scene.
         /// </summary>
-        public static void ClearScene()
+        public static void ClearScene() => new ClearJob().Step(long.MaxValue);
+
+        /// <summary>
+        /// <see cref="ClearScene"/> in slices (a scene load clears ~77,000 entities in ~0.4 s): the same entities,
+        /// destroyed in the same order, as many as fit before a deadline. Call <see cref="Step"/> until it returns true.
+        /// </summary>
+        internal sealed class ClearJob
         {
-            lock (_lock)
+            private readonly List<Entity> _list;
+            private int _next;
+
+            public ClearJob()
             {
-                CommandBuffer.Clear();
-                var list = new List<Entity>(_entities.Collection);
-                for (int i = list.Count - 1; i >= 0; i--)
+                lock (_lock)
                 {
-                    if (list[i] == null) continue;
-                    if (!list[i].DontDestroy)
-                        list[i].Destroy();
+                    CommandBuffer.Clear();
+                    _list = new List<Entity>(_entities.Collection);
                 }
+                _next = _list.Count - 1;
             }
-            Graphics.AutoExposure.Snap();     // the next scene starts at its own exposure, not a fade from this one
-            Graphics.SkyCapture.Invalidate(); // and its sky captures are drawn anew
+
+            /// <summary>0..1</summary>
+            public float Progress => _list.Count == 0 ? 1f : 1f - (float)(_next + 1) / _list.Count;
+
+            public int Total => _list.Count;
+
+            /// <summary>Destroy until done or <paramref name="deadline"/> (a Stopwatch timestamp) has passed. True when done.</summary>
+            public bool Step(long deadline)
+            {
+                lock (_lock)
+                {
+                    while (_next >= 0)
+                    {
+                        var entity = _list[_next--];
+                        if (entity != null && !entity.DontDestroy)
+                            entity.Destroy();
+                        if (deadline != long.MaxValue && System.Diagnostics.Stopwatch.GetTimestamp() >= deadline)
+                            break;
+                    }
+                }
+                if (_next >= 0) return false;
+
+                Graphics.AutoExposure.Snap();     // the next scene starts at its own exposure, not a fade from this one
+                Graphics.SkyCapture.Invalidate(); // and its sky captures are drawn anew
+                return true;
+            }
         }
 
         public static void Update()

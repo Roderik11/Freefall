@@ -57,6 +57,7 @@ namespace Freefall.Editor
         public static ProgressJob Start(string title, string tag, params (string Name, double Weight)[] steps)
         {
             if (Running is { } other) throw new InvalidOperationException($"Wait for it to finish: {other.Title} is running");
+            if (Freefall.Base.SceneManager.Loading is { } load) throw new InvalidOperationException($"Wait for it to finish: {load.Name} is loading");
             var job = new ProgressJob(title, tag, steps);
             Volatile.Write(ref _running, job);
             return job;

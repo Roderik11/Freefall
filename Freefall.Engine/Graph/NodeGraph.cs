@@ -157,6 +157,8 @@ namespace Freefall.Graph
             {
                 try
                 {
+                    // One profiler section per node type (interned by name, so no Type is held)
+                    using var _ = ProfilerMarker.Get(node.GetType().Name).Auto();
                     node.Process();
                 }
                 catch (Exception e)

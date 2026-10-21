@@ -614,11 +614,14 @@ namespace Freefall.Graphics
 
         /// <summary>
         /// Thread-safe command list submission. Use this instead of CommandQueue.ExecuteCommandList directly.
+        /// The list runs after every copy submitted before it (a GPU-side wait, see <see cref="WaitForCopyQueue"/>),
+        /// so what a copy uploads may be used by the next list whoever recorded it: nobody needs to CPU-wait for copies.
         /// </summary>
         public void SubmitCommandList(ID3D12GraphicsCommandList commandList)
         {
             lock (_queueLock)
             {
+                WaitForCopiesLocked();
                 _commandQueue.ExecuteCommandList(commandList);
             }
         }
@@ -633,6 +636,7 @@ namespace Freefall.Graphics
             var fence = _device.CreateFence(0);
             lock (_queueLock)
             {
+                WaitForCopiesLocked();
                 _commandQueue.ExecuteCommandList(commandList);
                 _commandQueue.Signal(fence, 1);
             }
@@ -798,16 +802,22 @@ namespace Freefall.Graphics
         {
             lock (_deferredDisposalLock)
             {
+                // Dispose what is due (last first, as always), then keep the rest in one pass: removing each due entry
+                // from the middle of the list was quadratic after a scene clear, ~0.2 s on Eldermoor
+                var list = _frameDeferredDisposals;
                 int now = Engine.TickCount;
-                for (int i = _frameDeferredDisposals.Count - 1; i >= 0; i--)
+                for (int i = list.Count - 1; i >= 0; i--)
                 {
-                    if (now >= _frameDeferredDisposals[i].tickToDispose)
+                    if (now >= list[i].tickToDispose)
                     {
-                        try { _frameDeferredDisposals[i].resource.Dispose(); }
+                        try { list[i].resource.Dispose(); }
                         catch (Exception ex) { Debug.LogWarning("GraphicsDevice", $"Deferred dispose failed: {ex.Message}"); }
-                        _frameDeferredDisposals.RemoveAt(i);
                     }
                 }
+                int keep = 0;
+                for (int i = 0; i < list.Count; i++)
+                    if (now < list[i].tickToDispose) list[keep++] = list[i];
+                list.RemoveRange(keep, list.Count - keep);
             }
         }
 
@@ -817,6 +827,13 @@ namespace Freefall.Graphics
         /// This is a GPU-side wait — the CPU returns immediately.
         /// </summary>
         public void WaitForCopyQueue()
+        {
+            lock (_queueLock)
+                WaitForCopiesLocked();
+        }
+
+        // Under _queueLock: the wait has to come before the list it protects, and _lastWaitedCopyFenceValue is shared
+        private void WaitForCopiesLocked()
         {
             long pendingValue;
             lock (_copyFenceLock)

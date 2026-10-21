@@ -3,6 +3,7 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Reflection;
 using System.Linq;
+using System.Threading;
 using Freefall.Base;
 
 namespace Freefall.Reflection
@@ -79,8 +80,19 @@ namespace Freefall.Reflection
 
             // New assembly means cached subtype queries are stale
             if (added)
+            {
                 _typesByBase.Clear();
+                Interlocked.Increment(ref _generation);
+            }
         }
+
+        private static int _generation;
+
+        /// <summary>
+        /// Changes whenever an assembly is registered or unregistered (a script hot reload). Anything that keeps types or
+        /// fields beyond one call (a YAMLSerializer.Recording) compares it to know they are still the loaded ones.
+        /// </summary>
+        public static int Generation => Volatile.Read(ref _generation);
 
         /// <summary>
         /// Unregister an assembly and invalidate all caches that may reference its types.
@@ -120,6 +132,7 @@ namespace Freefall.Reflection
 
             // Invalidate subtype cache entirely — could contain stale derived types
             _typesByBase.Clear();
+            Interlocked.Increment(ref _generation);
         }
 
         /// <summary>

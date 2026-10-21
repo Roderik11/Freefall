@@ -454,6 +454,17 @@ namespace Freefall.Components
         private bool _textureArraysInitialized;
         private bool _initialBakeRequested;
 
+        // The first Draw after a load does every bake: these show which part of it costs what
+        private static readonly ProfilerMarker _uploadMarker = ProfilerMarker.Get("Terrain heightmap upload");
+        private static readonly ProfilerMarker _holesMarker = ProfilerMarker.Get("Terrain holes");
+        private static readonly ProfilerMarker _planMarker = ProfilerMarker.Get("Terrain height plan");
+        private static readonly ProfilerMarker _paletteMarker = ProfilerMarker.Get("Terrain palettes");
+        private static readonly ProfilerMarker _arraysMarker = ProfilerMarker.Get("Terrain texture arrays");
+        private static readonly ProfilerMarker _readbackMarker = ProfilerMarker.Get("Terrain height readback");
+        private static readonly ProfilerMarker _heightsChangedMarker = ProfilerMarker.Get("Terrain heights changed");
+        private static readonly ProfilerMarker _splatPlanMarker = ProfilerMarker.Get("Terrain splat plan");
+        private static readonly ProfilerMarker _decoPlanMarker = ProfilerMarker.Get("Terrain deco plan");
+
         /// <summary>
         /// Inspector / command-server edits (e.g. assigning a different Terrain at runtime) must rebuild
         /// everything derived from the terrain asset, as a scene load would.
@@ -476,6 +487,7 @@ namespace Freefall.Components
             // Upload saved baked heightmap from cache (skips GPU compositor if present)
             if (Terrain.PendingBakedHeightmapBytes != null)
             {
+                using var _ = _uploadMarker.Auto();
                 var baker = _baker;
                 var bytes = Terrain.PendingBakedHeightmapBytes;
                 Terrain.PendingBakedHeightmapBytes = null; // consumed
@@ -489,6 +501,7 @@ namespace Freefall.Components
                     if (tex != null)
                     {
                         Terrain.BakedHeightmap = tex;
+                        Terrain.HeightmapStampsHash = Terrain.BakedStampsHash;
                         Terrain.ConsumeFlags(TerrainDirtyFlags.HeightBake); // loaded from cache, skip bake
                         _heightRangePyramidBuilt = false;
                         Terrain.MarkForUpdate(TerrainDirtyFlags.AlbedoBake);
@@ -505,11 +518,12 @@ namespace Freefall.Components
 
             // The Terrain asset is shared across scene loads, so its BakedHeightmap may hold another scene's
             // (or an older) stamp result, and stamps only send StampChanged when edited, not when loaded.
-            // Bake once per renderer so this scene's stamps always win; the cached heightmap above only
-            // bridges the first frames.
+            // Bake once per renderer so this scene's stamps always win, unless the heights in place were baked from
+            // stamps that hash the same (below: KeepsHeights).
             if (!_initialBakeRequested)
             {
                 _initialBakeRequested = true;
+                _initialHeightCheck = true;
                 Terrain.MarkForUpdate(TerrainDirtyFlags.HeightBake | TerrainDirtyFlags.SplatPack |
                                       TerrainDirtyFlags.AlbedoBake | TerrainDirtyFlags.DecoPrepass |
                                       TerrainDirtyFlags.HoleBake);
@@ -518,7 +532,10 @@ namespace Freefall.Components
             // ── Holes: cut on the CPU, where physics, the navmesh and PCG read them; the shaders get a copy ──
             // What sampled the ground there hears of it once the stamps have settled (not while one is dragged)
             if (Terrain.ConsumeFlags(TerrainDirtyFlags.HoleBake))
-                RebakeHoles();
+            {
+                using (_holesMarker.Auto())
+                    RebakeHoles();
+            }
             else if (_holeChanges.Count > 0)
             {
                 NotifyHolesChanged(_holeChanges);
@@ -527,13 +544,29 @@ namespace Freefall.Components
 
             // ── Height: lay out the bake from the height stamps in scope ──
             bool heightBake = Terrain.ConsumeFlags(TerrainDirtyFlags.HeightBake);
-            TerrainBaker.HeightPlan? heightPlan = heightBake ? _baker.PrepareHeight(Terrain, this) : null;
+            TerrainBaker.HeightPlan? heightPlan = null;
+            if (heightBake)
+            {
+                using (_planMarker.Auto())
+                    heightPlan = _baker.PrepareHeight(Terrain, this);
+            }
             bool hasHeightWork = heightPlan is { HasWork: true };
             if (heightBake)
             {
                 // A bake nobody gave a region for (first bake, terrain settings) may change anything
                 if (!_heightRegionMarked) _heightChangeAll = true;
                 _heightRegionMarked = false;
+            }
+
+            // The first bake of this renderer, of a map that is already right: keep it
+            if (heightBake && _initialHeightCheck)
+            {
+                _initialHeightCheck = false;
+                if (hasHeightWork && KeepsHeights(heightPlan!))
+                {
+                    hasHeightWork = false;
+                    KeepHeights();
+                }
             }
 
             // ── Palette: the layers and decorators this terrain renders are whatever its stamps reference ──
@@ -544,6 +577,7 @@ namespace Freefall.Components
 
             if (splatDirty || decoDirty)
             {
+                using var _ = _paletteMarker.Auto();
                 if (splatDirty) RefreshLayerPalette();
                 RefreshDecoratorPalette();
             }
@@ -552,6 +586,7 @@ namespace Freefall.Components
             {
                 try
                 {
+                    using var _ = _arraysMarker.Auto();
                     RebuildTextureArrays();
                     _textureArraysInitialized = true;
                 }
@@ -576,12 +611,17 @@ namespace Freefall.Components
                 CommandBuffer.Enqueue(RenderPass.Opaque, (list) =>
                 {
                     System.Threading.Interlocked.Decrement(ref renderer._heightBakesPending);
+                    PixMarker.Begin(list, "Terrain height bake");
                     baker.BakeHeight(terrain, plan, list);
+                    PixMarker.End(list);
+                    terrain.HeightmapStampsHash = plan.Hash;
                     _heightRangePyramidBuilt = false; // force rebuild with new heights
                     terrain.MarkForUpdate(TerrainDirtyFlags.AlbedoBake); // re-bake albedo with new terrain shape
                     _needHeightFieldReadback = true; // trigger CPU-side heightfield rebuild next frame
                     renderer._bakedNormalsDirty = true; // normals depend on height
+                    PixMarker.Begin(list, "Terrain normals bake");
                     renderer.BakeTerrainNormals(list);
+                    PixMarker.End(list);
                 });
             }
 
@@ -592,10 +632,12 @@ namespace Freefall.Components
             if (_needHeightFieldReadback && !Terrain.NeedsUpdate(TerrainDirtyFlags.HeightBake))
             {
                 _needHeightFieldReadback = false;
+                using var readbackScope = _readbackMarker.Auto();
                 var heights = _baker.ReadbackHeightmap();
                 if (heights != null && Terrain != null)
                 {
                     Terrain.SetHeightField(heights);
+                    Terrain.HeightFieldStampsHash = Terrain.HeightmapStampsHash;   // read back from the map as it is now
                     Terrain.CheckMapsAgainstSaved();    // on Save Changed Assets when the bake no longer equals the saved heightmap
                     _heightsReadBack = true;
                     // Surface-snapped geometry (RuntimeMesh) and projected PCG output sampled the old heights —
@@ -614,7 +656,8 @@ namespace Freefall.Components
                         _heightChangeMax = new Vector2(float.MinValue);
                         SnapshotStampRegions();
                     }
-                    MessageDispatcher.Send(EngineMsg.TerrainHeightsChanged, change);
+                    using (_heightsChangedMarker.Auto())
+                        MessageDispatcher.Send(EngineMsg.TerrainHeightsChanged, change);
                 }
             }
 
@@ -630,7 +673,9 @@ namespace Freefall.Components
                     EnsurePackedControlArray(res, sliceCount);
                     ControlMapsArray = _packedControlTexture;
 
-                    var plan = _baker.PrepareSplat(Terrain, this, _splatStamps, _layerPalette);
+                    TerrainBaker.CoveragePlan plan;
+                    using (_splatPlanMarker.Auto())
+                        plan = _baker.PrepareSplat(Terrain, this, _splatStamps, _layerPalette);
                     var baker = _baker;
                     var terrain = Terrain;
                     var packedArray = _packedControlArray;
@@ -650,7 +695,9 @@ namespace Freefall.Components
                         list.ResourceBarrierTransition(topLayerTex,
                             ResourceStates.Common, ResourceStates.UnorderedAccess);
 
+                        PixMarker.Begin(list, "Terrain splat bake");
                         baker.BakeSplat(plan, list, terrain, hmSrv, arrayUAV, topLayerUAV, res, sliceCount);
+                        PixMarker.End(list);
                         list.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(packedArray)));
                         list.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(topLayerTex)));
 
@@ -695,6 +742,7 @@ namespace Freefall.Components
             // ── Decoration coverage: laid out here, run by the decorator dispatch below ──
             if (decoDirty)
             {
+                using var _ = _decoPlanMarker.Auto();
                 var decoPlan = _baker.PrepareDeco(Terrain, this, _decoStamps, _decoratorPalette, _layerPalette);
                 System.Threading.Interlocked.Exchange(ref _pendingDecoPlan, decoPlan);
             }
@@ -2849,6 +2897,46 @@ namespace Freefall.Components
         // This renderer has read heights back at least once. Until then a Terrain asset still cached from the
         // scene before a reload looks ready, although this renderer's first readback is yet to come.
         private bool _heightsReadBack;
+
+        // The first height bake of this renderer is yet to be laid out: it may keep the heights in place
+        private bool _initialHeightCheck;
+
+        /// <summary>
+        /// The GPU heightmap and the CPU height field both hold what this plan would bake (the saved map at a cold load,
+        /// the last bake at a reload): equal <see cref="TerrainBaker.HeightPlan.Hash"/>es bake equal maps.
+        /// </summary>
+        private bool KeepsHeights(TerrainBaker.HeightPlan plan)
+        {
+            if (Terrain.Heightmap == null || Terrain.HeightField == null) return false;
+            ulong hash = plan.Hash;
+            return hash == Terrain.HeightmapStampsHash && hash == Terrain.HeightFieldStampsHash;
+        }
+
+        /// <summary>
+        /// Skip the first bake: no GPU bake, no readback and no TerrainHeightsChanged (nothing changed). What the bake
+        /// would have left behind is set up here: the heights count as read back, the stamp regions are where the
+        /// stamps are, and this renderer's normals are baked from the map in place. At load this saves a full-terrain
+        /// bake (~1.5 s of GPU on Eldermoor) and the readback that waited for it.
+        /// </summary>
+        private void KeepHeights()
+        {
+            _needHeightFieldReadback = false;
+            _heightsReadBack = true;
+            _heightChangeAll = false;
+            _heightChangeMin = new Vector2(float.MaxValue);
+            _heightChangeMax = new Vector2(float.MinValue);
+            SnapshotStampRegions();
+
+            _bakedNormalsDirty = true;
+            var renderer = this;
+            CommandBuffer.Enqueue(RenderPass.Opaque, (list) =>
+            {
+                PixMarker.Begin(list, "Terrain normals bake");
+                renderer.BakeTerrainNormals(list);
+                PixMarker.End(list);
+            });
+            Debug.LogAlways($"[Terrain] '{Terrain.Name}': heights kept, the stamps are those they were baked from");
+        }
 
         private readonly Dictionary<TerrainStamp, (Vector2 min, Vector2 max)> _stampRegions = new();
         private bool _heightChangeAll = true;   // the first bake covers everything

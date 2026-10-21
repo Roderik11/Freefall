@@ -364,14 +364,97 @@ namespace Freefall.PCG
                 areaMax = Vector2.Max(areaMax, xz);
             }
 
-            var boxes = new List<Vector4>(); // minX, minZ, maxX, maxZ
-            foreach (var renderer in ComponentCache<MeshRenderer>.All)
-            {
-                if (renderer is not MeshRenderer { Enabled: true, Mesh: { } mesh } mr) continue;
-                if (IsUnder(mr.Entity, IgnoreRoot)) continue;
+            var gatherScope = _gatherMarker.Auto();
+            var boxes = new List<Vector4>(); // minX, minZ, maxX, maxZ, grown by the margin
+            var cache = ObstacleCache.Current;
 
+            // Authored content and what scripts build (houses, walls): always counts
+            Gather(cache.Authored(), boxes, areaMin, areaMax);
+
+            // Generated output counts only from components that run before this one, even while later output is in
+            // the scene (PCGComponent.Sees)
+            foreach (var pcg in ComponentCache<PCGComponent>.All)
+            {
+                if (pcg == Owner || pcg.Output is not { } output || IsUnder(output, IgnoreRoot)) continue;
+                if (Owner != null && PCGComponent.CompareOrder(pcg, Owner) >= 0) continue;
+                Gather(cache.Generated(pcg, output), boxes, areaMin, areaMax);
+            }
+            gatherScope.Dispose();
+
+            using var filterScope = _filterMarker.Auto();
+            SetOutput("Output", points.Filter(i =>
+            {
+                var p = world[i];
+                foreach (var b in boxes)
+                    if (p.X >= b.X && p.X <= b.Z && p.Z >= b.Y && p.Z <= b.W) return false;
+                return true;
+            }));
+        }
+
+        private static readonly ProfilerMarker _gatherMarker = ProfilerMarker.Get("ExcludeObstacles gather");
+        private static readonly ProfilerMarker _filterMarker = ProfilerMarker.Get("ExcludeObstacles filter");
+
+        /// <summary>The boxes of a set that reach into the area, grown by the margin, if they pass this node's filters.</summary>
+        private void Gather(ObstacleCache.Set set, List<Vector4> boxes, Vector2 areaMin, Vector2 areaMax)
+        {
+            if (set.Boxes.Count == 0) return;
+            // Nothing of the set comes near the area (a forest at the other end of the map)
+            if (set.Max.X + Margin < areaMin.X || set.Min.X - Margin > areaMax.X
+                || set.Max.Y + Margin < areaMin.Y || set.Min.Y - Margin > areaMax.Y) return;
+
+            foreach (var o in set.Boxes)
+            {
+                if (o.Height < MinHeight) continue;
+                if (o.Footprint > MaxFootprint) continue;
+
+                var box = new Vector4(o.Min.X - Margin, o.Min.Y - Margin, o.Max.X + Margin, o.Max.Y + Margin);
+                if (box.Z < areaMin.X || box.X > areaMax.X || box.W < areaMin.Y || box.Y > areaMax.Y) continue;
+                boxes.Add(box);
+            }
+        }
+
+        private static bool IsUnder(Entity entity, Entity root)
+        {
+            if (root == null) return false;
+            for (var t = entity?.Transform; t != null; t = t.Parent)
+                if (t.Entity == root) return true;
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// World boxes of the scene's renderers for ExcludeObstacles, worked out once per batch of PCG runs (a scheduler
+    /// flush, "run all") instead of once per run: an Eldermoor load runs ExcludeObstacles ~140 times, and each run used
+    /// to transform the boxes of all ~80,000 renderers again (1.7 s, then 1 s with a cheap reject first).
+    /// Within a batch, what no PCG component generated stays where it is (scripts move things in their own updates,
+    /// not during a flush). Generated output is kept per output container, and a run that regenerates puts out a new
+    /// container. Outside a batch (a single Execute) every run gets a fresh cache: the same work as the old scan.
+    /// </summary>
+    internal sealed class ObstacleCache
+    {
+        internal readonly struct Box
+        {
+            public readonly Vector2 Min, Max;   // world XZ
+            public readonly float Height, Footprint;
+            public Box(Vector3 min, Vector3 max)
+            {
+                Min = new Vector2(min.X, min.Z);
+                Max = new Vector2(max.X, max.Z);
+                Height = max.Y - min.Y;
+                Footprint = (max.X - min.X) * (max.Z - min.Z);
+            }
+        }
+
+        internal sealed class Set
+        {
+            public readonly List<Box> Boxes = new();
+            public Vector2 Min = new(float.MaxValue), Max = new(float.MinValue);   // XZ bounds of all boxes
+
+            public void Add(MeshRenderer renderer)
+            {
+                if (renderer is not { Enabled: true, Mesh: { } mesh }) return;
                 var bb = mesh.BoundingBox;
-                var transform = mr.Entity.Transform.WorldMatrix;
+                var transform = renderer.Entity.Transform.WorldMatrix;
                 var min = new Vector3(float.MaxValue);
                 var max = new Vector3(float.MinValue);
                 for (int c = 0; c < 8; c++)
@@ -384,33 +467,54 @@ namespace Freefall.PCG
                     max = Vector3.Max(max, p);
                 }
 
-                if (max.Y - min.Y < MinHeight) continue;
-                if ((max.X - min.X) * (max.Z - min.Z) > MaxFootprint) continue;
-
-                var box = new Vector4(min.X - Margin, min.Z - Margin, max.X + Margin, max.Z + Margin);
-                if (box.Z < areaMin.X || box.X > areaMax.X || box.W < areaMin.Y || box.Y > areaMax.Y) continue;
-
-                // Output of PCG components that run after this one does not count, even while it is in the scene
-                if (Owner != null && !Owner.Sees(mr.Entity)) continue;
-
-                boxes.Add(box);
+                var box = new Box(min, max);
+                Boxes.Add(box);
+                Min = Vector2.Min(Min, box.Min);
+                Max = Vector2.Max(Max, box.Max);
             }
-
-            SetOutput("Output", points.Filter(i =>
-            {
-                var p = world[i];
-                foreach (var b in boxes)
-                    if (p.X >= b.X && p.X <= b.Z && p.Z >= b.Y && p.Z <= b.W) return false;
-                return true;
-            }));
         }
 
-        private static bool IsUnder(Entity entity, Entity root)
+        private static ObstacleCache? _batch;
+        private static int _depth;
+
+        private Set? _authored;
+        private readonly Dictionary<Entity, Set> _generated = new();
+
+        /// <summary>The batch's cache, or a fresh one outside a batch.</summary>
+        public static ObstacleCache Current => _batch ?? new ObstacleCache();
+
+        /// <summary>From here until the matching <see cref="EndBatch"/> (nested batches share the outer one) runs share one cache. Main thread.</summary>
+        public static void BeginBatch()
         {
-            if (root == null) return false;
-            for (var t = entity?.Transform; t != null; t = t.Parent)
-                if (t.Entity == root) return true;
-            return false;
+            if (_depth++ == 0) _batch = new ObstacleCache();
+        }
+
+        public static void EndBatch()
+        {
+            if (_depth > 0 && --_depth == 0) _batch = null;
+        }
+
+        /// <summary>Renderers no PCG component spawned.</summary>
+        public Set Authored()
+        {
+            if (_authored != null) return _authored;
+            var set = new Set();
+            foreach (var renderer in ComponentCache<MeshRenderer>.All)
+                if (renderer.Enabled && renderer.Mesh != null && PCGComponent.GeneratorOf(renderer.Entity) == null)
+                    set.Add(renderer);
+            return _authored = set;
+        }
+
+        /// <summary>The renderers <paramref name="pcg"/> spawned into <paramref name="output"/> (not those of a PCG component nested in it).</summary>
+        public Set Generated(PCGComponent pcg, Entity output)
+        {
+            if (_generated.TryGetValue(output, out var set)) return set;
+            set = new Set();
+            foreach (var renderer in output.GetComponentsInChildren<MeshRenderer>())
+                if (PCGComponent.GeneratorOf(renderer.Entity) == pcg)
+                    set.Add(renderer);
+            _generated[output] = set;
+            return set;
         }
     }
 

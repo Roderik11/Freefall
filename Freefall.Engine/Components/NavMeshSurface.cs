@@ -138,16 +138,54 @@ namespace Freefall.Components
             SetGizmoMesh(vertices, indices);
         }
 
+        private static readonly ProfilerMarker _worldMarker = ProfilerMarker.Get("NavMesh world");
+        private static readonly ProfilerMarker _gizmoMarker = ProfilerMarker.Get("NavMesh gizmo mesh");
+
+        // Bumped by every gizmo change (a bake's result included): a navmesh or debug mesh still being built on a worker
+        // for an older state is dropped
+        [DontSerialize] [JsonIgnore]
+        private int _gizmoGeneration;
+
         protected override void Awake()
         {
             // Initialize runtime if we have baked data (loaded by NavMeshLoader)
-            var navMesh = NavMesh?.Tiles?.CreateNavMesh();
-            if (navMesh == null) return;
+            var tiles = NavMesh?.Tiles;
+            if (tiles == null) return;
 
-            NavMeshWorld.Initialize(navMesh);
+            // Assembling the tiles (~0.5 s on Eldermoor) and the editor's debug mesh run on a worker; the runtime takes
+            // the navmesh on the main thread. A scene load waits for it (agents only move once the world runs again);
+            // outside a load the navmesh arrives a moment after the component wakes. A bake started meanwhile wins.
+            bool gizmo = Engine.HostedByEditor;
+            int generation = ++_gizmoGeneration;
+            var load = System.Threading.Tasks.Task.Run(() =>
+            {
+                var navMesh = tiles.CreateNavMesh();
+                Vector3[]? vertices = null;
+                uint[]? indices = null;
+                if (navMesh != null && gizmo)
+                {
+                    try
+                    {
+                        NavMeshBuilder.BuildDebugGeometry(navMesh, out vertices, out indices);
+                    }
+                    catch (Exception ex)
+                    {
+                        Debug.LogWarning("NavMeshSurface", $"Could not build the navmesh debug mesh: {ex.Message}");
+                        vertices = null;
+                        indices = null;
+                    }
+                }
 
-            NavMeshBuilder.BuildDebugGeometry(navMesh, out var vertices, out var indices);
-            SetGizmoMesh(vertices, indices);
+                return Engine.RunOnMainThreadAsync(() =>
+                {
+                    if (IsDestroyed || generation != _gizmoGeneration || navMesh == null) return;
+                    using (_worldMarker.Auto())
+                        NavMeshWorld.Initialize(navMesh);
+                    if (gizmo) SetGizmoMesh(vertices, indices);
+                });
+            });
+
+            SceneManager.Loading?.WaitFor(load, "Navmesh");
         }
 
         public override void Destroy()
@@ -195,6 +233,9 @@ namespace Freefall.Components
         /// </summary>
         private void SetGizmoMesh(Vector3[]? vertices, uint[]? indices)
         {
+            using var _ = _gizmoMarker.Auto();
+            _gizmoGeneration++;
+
             // Deferred: on a rebake, gizmo draws of the frames in flight still reference the old mesh
             Engine.Device.DeferDispose(_gizmoMesh);
             _gizmoMesh = null;

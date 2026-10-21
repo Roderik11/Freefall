@@ -110,6 +110,9 @@ namespace Freefall.Components
         private MeshRenderer _renderer;
         private Mesh _generatedMesh;
 
+        private static readonly ProfilerMarker _generateMarker = ProfilerMarker.Get("RuntimeMesh generate");
+        private static readonly ProfilerMarker _uploadMarker = ProfilerMarker.Get("RuntimeMesh upload");
+
         protected override void Early()
         {
             Spline = Spline ?? Entity.GetComponent<Spline>();
@@ -172,6 +175,7 @@ namespace Freefall.Components
             // A MeshRenderer is optional: components that draw the mesh themselves (WaterBody) read GeneratedMesh
             if (Spline == null) return;
             if (Spline.Points.Count < 2) return;
+            using var _ = _generateMarker.Auto();
 
             // Frames in flight (and draws enqueued earlier this frame, WaterBody.Draw) still reference the current
             // mesh. A spline drag regenerates every frame, so "two generations ago" is only two frames old — fewer
@@ -804,8 +808,9 @@ namespace Freefall.Components
         {
             if (verts.Count == 0 || indices.Count == 0) return null;
 
-            var mesh = new Mesh(Engine.Device,
-                verts.ToArray(), norms.ToArray(), uvs.ToArray(), indices.ToArray());
+            Mesh mesh;
+            using (_uploadMarker.Auto())
+                mesh = new Mesh(Engine.Device, verts.ToArray(), norms.ToArray(), uvs.ToArray(), indices.ToArray());
 
             mesh.BoundingBox = ComputeBounds(verts);
             mesh.Guid = Guid.NewGuid().ToString("N");

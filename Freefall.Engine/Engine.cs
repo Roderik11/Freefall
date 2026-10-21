@@ -48,6 +48,12 @@ namespace Freefall
         /// </summary>
         public static bool IsEditor { get; private set; }
 
+        /// <summary>
+        /// The editor runs this engine (in edit or play mode alike); false in a published game. For what only the
+        /// editor shows (gizmos, debug meshes), where <see cref="IsEditor"/> would also be false during play.
+        /// </summary>
+        public static bool HostedByEditor { get; private set; }
+
         public static void SetPlaymode(bool playmode)
         {
             IsEditor = !playmode;
@@ -161,6 +167,7 @@ namespace Freefall
             Audio3D = new X3DAudio(Speakers.FrontLeft | Speakers.FrontRight);
             Debug.Log(editor ? "[Engine] Initialized (editor mode)" : "[Engine] Initialized (game)");
             IsEditor = editor;
+            HostedByEditor = editor;
 
             PhysicsWorld.Initialize();
         }
@@ -254,16 +261,22 @@ namespace Freefall
             using (_shaderReloadMarker.Auto())
                 Graphics.ShaderHotReload.Update();
 
-            // A scene change game code asked for last frame (SceneManager.Load): before physics and Update,
-            // so the whole frame runs on the new scene
+            // A scene change game code asked for last frame (SceneManager.Load), and the slice of the load in
+            // progress: before physics and Update, so the whole frame runs on the new scene
             using (_sceneLoadMarker.Auto())
                 SceneManager.Update();
 
+            // While a scene loads, the world is paused: the load wakes and generates it, nothing else runs it
+            bool loading = SceneManager.IsLoading;
+
             // Physics (fixed-timestep)
-            using (_physicsMarker.Auto())
-                PhysicsWorld.Update((float)Time.Delta);
-            using (_navigationMarker.Auto())
-                NavMeshWorld.Update((float)Time.Delta);
+            if (!loading)
+            {
+                using (_physicsMarker.Auto())
+                    PhysicsWorld.Update((float)Time.Delta);
+                using (_navigationMarker.Auto())
+                    NavMeshWorld.Update((float)Time.Delta);
+            }
 
             // Update Logic
             using (_updateMarker.Auto())
@@ -271,7 +284,7 @@ namespace Freefall
                 Graphics.Overlay.Clear();   // what game code draws over the picture lasts one frame
                 try
                 {
-                    Update();
+                    if (!loading) Update();
                 }
                 catch when (!Device.IsDeviceLost && Device.NativeDevice.DeviceRemovedReason.Failure)
                 {

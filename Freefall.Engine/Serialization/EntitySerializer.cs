@@ -1,6 +1,7 @@
 using System;
 using System.Collections;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Text;
@@ -23,6 +24,18 @@ namespace Freefall.Serialization
     {
         private readonly YAMLSerializer _yaml = new();
         public bool DuplicateMode { get; set; } = false;
+
+        /// <summary>What the phases of the last <see cref="LoadFromBytes"/> took, in ms.</summary>
+        public readonly record struct Timings(double ParseMs, double ReferencesMs, double AssetsMs, double PrefabsMs);
+
+        public Timings LastTimings { get; private set; }
+
+        private static readonly ProfilerMarker _parseMarker = ProfilerMarker.Get("Parse YAML");
+        private static readonly ProfilerMarker _readMarker = ProfilerMarker.Get("Read YAML");          // text to objects (entities register here)
+        private static readonly ProfilerMarker _attachMarker = ProfilerMarker.Get("Attach components");
+        private static readonly ProfilerMarker _referencesMarker = ProfilerMarker.Get("Resolve references");
+        private static readonly ProfilerMarker _assetsMarker = ProfilerMarker.Get("Resolve assets");
+        private static readonly ProfilerMarker _prefabsMarker = ProfilerMarker.Get("Hydrate prefabs");
 
         // ── Save ──────────────────────────────────────────────────
 
@@ -80,169 +93,319 @@ namespace Freefall.Serialization
             return LoadFromBytes(Encoding.UTF8.GetBytes(yaml));
         }
 
-        public List<Entity> LoadFromBytes(byte[] bytes, bool skipPrefabHydration = false)
+        public List<Entity> LoadFromBytes(byte[] bytes, bool skipPrefabHydration = false) =>
+            Load(bytes, null, skipPrefabHydration);
+
+        /// <summary>
+        /// <see cref="LoadFromBytes(byte[], bool)"/>, recording the parse into <paramref name="record"/> so that the same
+        /// YAML loads again with <see cref="LoadFromRecording"/> (prefabs: PCG points, kit pieces).
+        /// </summary>
+        public List<Entity> LoadFromBytes(byte[] bytes, YAMLSerializer.Recording record, bool skipPrefabHydration = false) =>
+            Load(bytes, record, skipPrefabHydration);
+
+        /// <summary>
+        /// The entities a recorded parse loaded, made anew without reading the YAML again (fresh UIDs in DuplicateMode,
+        /// the mode it was recorded in). Everything after the parse (references, assets, prefabs) runs as for YAML.
+        /// </summary>
+        public List<Entity> LoadFromRecording(YAMLSerializer.Recording recording, bool skipPrefabHydration = false) =>
+            Load(null, recording, skipPrefabHydration);
+
+        private List<Entity> Load(byte[]? bytes, YAMLSerializer.Recording? recording, bool skipPrefabHydration)
         {
-            // Strip BOM if present
-            if (bytes.Length >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF)
-            {
-                var trimmed = new byte[bytes.Length - 3];
-                Array.Copy(bytes, 3, trimmed, 0, trimmed.Length);
-                bytes = trimmed;
-            }
+            var job = new Job(this, bytes, recording, skipPrefabHydration);
+            job.Step(long.MaxValue);
+            return job.Entities;
+        }
 
-            // ── Phase 1: Parse with deferred asset loading ──
-            // Asset fields get stub objects (Guid set, nothing else).
-            // Entity/Component ref fields collect UIDs into DeferredUniqueIdRefs.
-            // No LoadByGuid calls during parse = no parser corruption.
-            _yaml.DeferAssetLoading = true;
-            _yaml.DeferredUniqueIdRefs.Clear();
-            _yaml.DuplicateMode = DuplicateMode;
-            _yaml.DuplicateUidMap.Clear();
+        /// <summary>
+        /// Start a load that can stop between entities and carry on later (SceneLoad gives it a slice per frame): the
+        /// parse and the references at once, then the asset stubs and the prefab instances entity by entity. Call
+        /// <see cref="Job.Step"/> until it returns true. <see cref="LoadFromBytes(byte[], bool)"/> is one run to the end.
+        /// </summary>
+        public Job BeginLoad(byte[] bytes, bool skipPrefabHydration = false) => new(this, bytes, null, skipPrefabHydration);
 
-            List<object> objects;
-            try
-            {
-                objects = _yaml.DeserializeAll(bytes);
-            }
-            finally
-            {
-                _yaml.DeferAssetLoading = false;
-                _yaml.DuplicateMode = false;
-            }
+        /// <summary>A load in phases (<see cref="BeginLoad"/>). Main thread.</summary>
+        public sealed class Job
+        {
+            private enum Phase { Parse, Assets, Prefabs, Done }
 
-            var entities = new List<Entity>();
-            Entity current = null;
+            private readonly EntitySerializer _owner;
+            private byte[]? _bytes;
+            private YAMLSerializer.Recording? _recording;
+            private readonly bool _skipPrefabHydration;
+            private Phase _phase = Phase.Parse;
+            private int _cursor;
+            private int _prefabCount, _uidCount;
+            private long _parseTicks, _referencesTicks, _assetsTicks, _prefabsTicks;
 
-            foreach (var obj in objects)
+            /// <summary>The entities, once the parse has run (the first <see cref="Step"/>).</summary>
+            public List<Entity> Entities { get; private set; } = new();
+
+            public bool IsDone => _phase == Phase.Done;
+
+            /// <summary>What it is doing, for a progress line.</summary>
+            public string Activity => _phase switch
             {
-                if (obj is Entity entity)
+                Phase.Parse => "Reading the scene",
+                Phase.Assets => $"Loading assets ({_cursor}/{Entities.Count})",
+                Phase.Prefabs => $"Placing prefabs ({_cursor}/{Entities.Count})",
+                _ => "Read",
+            };
+
+            /// <summary>0..1, by phase and entity.</summary>
+            public float Progress
+            {
+                get
                 {
-                    current = entity;
-                    entities.Add(entity);
-                }
-                else if (obj is Component component && current != null)
-                {
-                    if (component is Transform t)
+                    float within = Entities.Count == 0 ? 1f : (float)_cursor / Entities.Count;
+                    return _phase switch
                     {
-                        CopyFields(t, current.Transform);
-                      
-                        // Retarget deferred UID refs from temp Transform to entity's real Transform.
-                        // Without this, Phase 2 would set Parent on the discarded temp object.
-                        var deferredRefs = _yaml.DeferredUniqueIdRefs;
-                        for (int i = 0; i < deferredRefs.Count; i++)
-                        {
-                            if (ReferenceEquals(deferredRefs[i].Parent, t))
-                            {
-                                var fixup = deferredRefs[i];
-                                fixup.Parent = current.Transform;
-                                deferredRefs[i] = fixup;
-                            }
-                        }
+                        Phase.Parse => 0f,
+                        Phase.Assets => 0.1f + 0.6f * within,
+                        Phase.Prefabs => 0.7f + 0.3f * within,
+                        _ => 1f,
+                    };
+                }
+            }
 
-                        // Retarget DuplicateUidMap mapping from temp Transform to entity's real Transform
-                        if (DuplicateMode)
+            internal Job(EntitySerializer owner, byte[]? bytes, YAMLSerializer.Recording? recording, bool skipPrefabHydration)
+            {
+                // Strip BOM if present
+                if (bytes != null && bytes.Length >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF)
+                {
+                    var trimmed = new byte[bytes.Length - 3];
+                    Array.Copy(bytes, 3, trimmed, 0, trimmed.Length);
+                    bytes = trimmed;
+                }
+
+                _owner = owner;
+                _bytes = bytes;
+                _recording = recording;
+                _skipPrefabHydration = skipPrefabHydration;
+            }
+
+            /// <summary>Carry on until done or <paramref name="deadline"/> (a Stopwatch timestamp) has passed; checked between entities. True when done.</summary>
+            public bool Step(long deadline)
+            {
+                if (_phase == Phase.Parse)
+                {
+                    Parse();
+                    _phase = Phase.Assets;
+                    _cursor = 0;
+                    if (Engine.Assets == null) _phase = Phase.Prefabs;
+                    if (Stopwatch.GetTimestamp() >= deadline) return false;
+                }
+
+                if (_phase == Phase.Assets)
+                {
+                    long start = Stopwatch.GetTimestamp();
+                    using (_assetsMarker.Auto())
+                    {
+                        // ── Phase 3: Resolve deferred Asset stubs ──
+                        // Now that parsing is done, resolve every Asset stub via LoadByGuid.
+                        while (_cursor < Entities.Count)
                         {
-                            ulong oldTransformUid = 0;
-                            foreach (var kvp in _yaml.DuplicateUidMap)
+                            foreach (var component in Entities[_cursor].Components)
+                                ResolveObjectStubs(component, component.GetType().Name);
+                            _cursor++;
+                            if (Stopwatch.GetTimestamp() >= deadline) break;
+                        }
+                    }
+                    _assetsTicks += Stopwatch.GetTimestamp() - start;
+                    if (_cursor < Entities.Count) return false;
+                    _phase = Phase.Prefabs;
+                    _cursor = 0;
+                }
+
+                if (_phase == Phase.Prefabs)
+                {
+                    long start = Stopwatch.GetTimestamp();
+                    using (_prefabsMarker.Auto())
+                    {
+                        // ── Phase 4: Hydrate prefab instances ──
+                        // Entities saved as prefab references only have Entity + Transform in the scene file.
+                        // ResolveAssetStubs only walks component fields — resolve Entity.Prefab explicitly.
+                        // Skipped when called from Prefab.ApplyTo to prevent infinite recursion.
+                        while (!_skipPrefabHydration && _cursor < Entities.Count)
+                        {
+                            var entity = Entities[_cursor++];
+                            if (entity.Prefab != null && !string.IsNullOrEmpty(entity.Prefab.Guid))
                             {
-                                if (kvp.Value == t.UID)
+                                // Resolve the stub → fully loaded Prefab with SourceYaml
+                                var loaded = Engine.Assets?.LoadByGuid(entity.Prefab.Guid, typeof(Prefab)) as Prefab;
+                                if (loaded != null)
                                 {
-                                    oldTransformUid = kvp.Key;
-                                    break;
+                                    entity.Prefab = loaded;
+                                    loaded.ApplyTo(entity);
+                                    _prefabCount++;
                                 }
                             }
-                            if (oldTransformUid != 0)
+                            if (Stopwatch.GetTimestamp() >= deadline) break;
+                        }
+                    }
+                    _prefabsTicks += Stopwatch.GetTimestamp() - start;
+                    if (!_skipPrefabHydration && _cursor < Entities.Count) return false;
+                    Finish();
+                }
+
+                return true;
+            }
+
+            private void Parse()
+            {
+                var yaml = _owner._yaml;
+                long start = Stopwatch.GetTimestamp();
+                var parseScope = _parseMarker.Auto();
+
+                // ── Phase 1: Parse with deferred asset loading ──
+                // Asset fields get stub objects (Guid set, nothing else).
+                // Entity/Component ref fields collect UIDs into DeferredUniqueIdRefs.
+                // No LoadByGuid calls during parse = no parser corruption.
+                yaml.DeferAssetLoading = true;
+                yaml.DeferredUniqueIdRefs.Clear();
+                yaml.DuplicateMode = _owner.DuplicateMode;
+                yaml.DuplicateUidMap.Clear();
+
+                List<object> objects;
+                try
+                {
+                    using (_readMarker.Auto())
+                    {
+                        objects = _bytes == null ? yaml.Replay(_recording!)
+                                : _recording != null ? yaml.DeserializeAll(_bytes, _recording)
+                                : yaml.DeserializeAll(_bytes);
+                    }
+                }
+                finally
+                {
+                    yaml.DeferAssetLoading = false;
+                    yaml.DuplicateMode = false;
+                }
+                _bytes = null;
+
+                var entities = Entities;
+                Entity current = null;
+                var attachScope = _attachMarker.Auto();
+
+                foreach (var obj in objects)
+                {
+                    if (obj is Entity entity)
+                    {
+                        current = entity;
+                        entities.Add(entity);
+                    }
+                    else if (obj is Component component && current != null)
+                    {
+                        if (component is Transform t)
+                        {
+                            CopyFields(t, current.Transform);
+
+                            // Retarget deferred UID refs from temp Transform to entity's real Transform.
+                            // Without this, Phase 2 would set Parent on the discarded temp object.
+                            var deferredRefs = yaml.DeferredUniqueIdRefs;
+                            for (int i = 0; i < deferredRefs.Count; i++)
                             {
-                                _yaml.DuplicateUidMap[oldTransformUid] = current.Transform.UID;
+                                if (ReferenceEquals(deferredRefs[i].Parent, t))
+                                {
+                                    var fixup = deferredRefs[i];
+                                    fixup.Parent = current.Transform;
+                                    deferredRefs[i] = fixup;
+                                }
                             }
+
+                            // Retarget DuplicateUidMap mapping from temp Transform to entity's real Transform
+                            if (_owner.DuplicateMode)
+                            {
+                                ulong oldTransformUid = 0;
+                                foreach (var kvp in yaml.DuplicateUidMap)
+                                {
+                                    if (kvp.Value == t.UID)
+                                    {
+                                        oldTransformUid = kvp.Key;
+                                        break;
+                                    }
+                                }
+                                if (oldTransformUid != 0)
+                                {
+                                    yaml.DuplicateUidMap[oldTransformUid] = current.Transform.UID;
+                                }
+                            }
+                        }
+                        else
+                        {
+                            current.AddComponent(component);
+                        }
+                    }
+                }
+
+                attachScope.Dispose();
+                parseScope.Dispose();
+                long parsed = Stopwatch.GetTimestamp();
+                var referencesScope = _referencesMarker.Auto();
+
+                // ── Phase 2: Build UID table and resolve IUniqueId references ──
+                var uidLookup = new Dictionary<ulong, IUniqueId>();
+
+                foreach (var entity in entities)
+                {
+                    if (entity.UID != 0)
+                        uidLookup.TryAdd(entity.UID, entity);
+
+                    foreach (var component in entity.Components)
+                    {
+                        if (component.UID != 0)
+                            uidLookup.TryAdd(component.UID, component);
+                    }
+                }
+
+                // Resolve deferred IUniqueId refs (entities + components)
+                foreach (var deferred in yaml.DeferredUniqueIdRefs)
+                {
+                    ulong targetUid = deferred.UID;
+                    if (_owner.DuplicateMode && yaml.DuplicateUidMap.TryGetValue(targetUid, out var newUid))
+                    {
+                        targetUid = newUid;
+                    }
+
+                    if (uidLookup.TryGetValue(targetUid, out var resolved))
+                    {
+                        try
+                        {
+                            deferred.Field.SetValue(deferred.Parent, resolved);
+                        }
+                        catch (Exception ex)
+                        {
+                            Debug.LogWarning("EntitySerializer",
+                                $"UID ref resolve failed: UID {targetUid} (original: {deferred.UID}) on " +
+                                $"{deferred.Parent.GetType().Name}.{deferred.Field.Name}: {ex.Message}");
                         }
                     }
                     else
                     {
-                        current.AddComponent(component);
-                    }
-                }
-            }
-
-            // ── Phase 2: Build UID table and resolve IUniqueId references ──
-            var uidLookup = new Dictionary<ulong, IUniqueId>();
-
-            foreach (var entity in entities)
-            {
-                if (entity.UID != 0)
-                    uidLookup.TryAdd(entity.UID, entity);
-
-                foreach (var component in entity.Components)
-                {
-                    if (component.UID != 0)
-                        uidLookup.TryAdd(component.UID, component);
-                }
-            }
-
-            // Resolve deferred IUniqueId refs (entities + components)
-            foreach (var deferred in _yaml.DeferredUniqueIdRefs)
-            {
-                ulong targetUid = deferred.UID;
-                if (DuplicateMode && _yaml.DuplicateUidMap.TryGetValue(targetUid, out var newUid))
-                {
-                    targetUid = newUid;
-                }
-
-                if (uidLookup.TryGetValue(targetUid, out var resolved))
-                {
-                    try
-                    {
-                        deferred.Field.SetValue(deferred.Parent, resolved);
-                    }
-                    catch (Exception ex)
-                    {
                         Debug.LogWarning("EntitySerializer",
-                            $"UID ref resolve failed: UID {targetUid} (original: {deferred.UID}) on " +
-                            $"{deferred.Parent.GetType().Name}.{deferred.Field.Name}: {ex.Message}");
+                            $"UID ref not found: UID {targetUid} (original: {deferred.UID}) for " +
+                            $"{deferred.Parent.GetType().Name}.{deferred.Field.Name}");
                     }
                 }
-                else
-                {
-                    Debug.LogWarning("EntitySerializer",
-                        $"UID ref not found: UID {targetUid} (original: {deferred.UID}) for " +
-                        $"{deferred.Parent.GetType().Name}.{deferred.Field.Name}");
-                }
+
+                yaml.DeferredUniqueIdRefs.Clear();
+                _uidCount = uidLookup.Count;
+
+                referencesScope.Dispose();
+                long referenced = Stopwatch.GetTimestamp();
+                _parseTicks = parsed - start;
+                _referencesTicks = referenced - parsed;
             }
 
-            _yaml.DeferredUniqueIdRefs.Clear();
-
-            // ── Phase 3: Resolve deferred Asset stubs ──
-            // Now that parsing is done, resolve every Asset stub via LoadByGuid.
-            if (Engine.Assets != null)
-                ResolveAssetStubs(entities);
-
-            // ── Phase 4: Hydrate prefab instances ──
-            // Entities saved as prefab references only have Entity + Transform in the scene file.
-            // ResolveAssetStubs only walks component fields — resolve Entity.Prefab explicitly.
-            // Skipped when called from Prefab.ApplyTo to prevent infinite recursion.
-            int prefabCount = 0;
-            if (!skipPrefabHydration)
+            private void Finish()
             {
-                foreach (var entity in entities)
-                {
-                    if (entity.Prefab != null && !string.IsNullOrEmpty(entity.Prefab.Guid))
-                    {
-                        // Resolve the stub → fully loaded Prefab with SourceYaml
-                        var loaded = Engine.Assets?.LoadByGuid(entity.Prefab.Guid, typeof(Prefab)) as Prefab;
-                        if (loaded != null)
-                        {
-                            entity.Prefab = loaded;
-                            loaded.ApplyTo(entity);
-                            prefabCount++;
-                        }
-                    }
-                }
+                _phase = Phase.Done;
+                static double Ms(long ticks) => ticks * 1000.0 / Stopwatch.Frequency;
+                _owner.LastTimings = new Timings(Ms(_parseTicks), Ms(_referencesTicks), Ms(_assetsTicks), Ms(_prefabsTicks));
+
+                Debug.Log($"[EntitySerializer] Loaded {Entities.Count} entities " +
+                          $"({_prefabCount} prefab instances, {_uidCount} UIDs resolved)");
             }
-
-            Debug.Log($"[EntitySerializer] Loaded {entities.Count} entities " +
-                      $"({prefabCount} prefab instances, {uidLookup.Count} UIDs resolved)");
-
-            return entities;
         }
 
         // ── Asset stub resolution ─────────────────────────────────
@@ -261,13 +424,16 @@ namespace Freefall.Serialization
             }
         }
 
-        private static void ResolveObjectStubs(object obj, string context, int depth = 0, HashSet<object> seen = null)
-        {
-            // Data that refers back to itself (an animation state and its transitions) is walked once
-            seen ??= new HashSet<object>(ReferenceEqualityComparer.Instance);
-            if (!seen.Add(obj)) return;
+        // Which fields of a type can hold an asset stub, worked out once per type: testing every field of every
+        // component with reflection on each load cost more than the asset lookups themselves. Keyed by the
+        // Reflector's mapping, which a script reload replaces, so a plan never outlives the types it names.
+        private enum StubSlot : byte { Nested, Asset, AssetList, NestedList }
+        private sealed record StubPlan((Field Field, StubSlot Slot, Type? Element)[] Slots, bool Recurses);
+        private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<Mapping, StubPlan> _stubPlans = new();
 
-            var mapping = Reflector.GetMapping(obj.GetType());
+        private static StubPlan BuildStubPlan(Mapping mapping)
+        {
+            var slots = new List<(Field, StubSlot, Type?)>();
             foreach (var field in mapping)
             {
                 // A nested [Serializable] object (the item inside an equipment entry): its own fields, as the
@@ -275,15 +441,60 @@ namespace Freefall.Serialization
                 // only plain classes the serializer writes as a mapping qualify.
                 if (field.CanWrite && !field.Ignored && field.Type.IsClass && field.Type != typeof(string)
                     && !typeof(Asset).IsAssignableFrom(field.Type) && !typeof(IList).IsAssignableFrom(field.Type)
-                    && field.Type.IsSerializable && depth < 16)
+                    && field.Type.IsSerializable)
                 {
-                    var nested = field.GetValue(obj);
-                    if (nested != null) ResolveObjectStubs(nested, $"{context}.{field.Name}", depth + 1, seen);
+                    slots.Add((field, StubSlot.Nested, null));
                     continue;
                 }
 
                 // Direct Asset field
                 if (typeof(Asset).IsAssignableFrom(field.Type))
+                {
+                    slots.Add((field, StubSlot.Asset, null));
+                    continue;
+                }
+
+                // List of Asset references, or of nested [Serializable] objects
+                if (typeof(IList).IsAssignableFrom(field.Type))
+                {
+                    var elType = field.Type.IsArray
+                        ? field.Type.GetElementType()
+                        : field.Type.IsGenericType
+                            ? field.Type.GetGenericArguments()[0]
+                            : null;
+
+                    if (elType != null && typeof(Asset).IsAssignableFrom(elType))
+                        slots.Add((field, StubSlot.AssetList, elType));
+                    else if (elType != null && Reflector.GetAttribute<SerializableAttribute>(elType) != null)
+                        slots.Add((field, StubSlot.NestedList, elType));
+                }
+            }
+            return new StubPlan(slots.ToArray(), slots.Exists(s => s.Item2 is StubSlot.Nested or StubSlot.NestedList));
+        }
+
+        private static void ResolveObjectStubs(object obj, string context, int depth = 0, HashSet<object> seen = null)
+        {
+            // Data that refers back to itself (an animation state and its transitions) is walked once
+            if (seen != null && !seen.Add(obj)) return;
+
+            var plan = _stubPlans.GetValue(Reflector.GetMapping(obj.GetType()), BuildStubPlan);
+            if (plan.Recurses && seen == null)
+            {
+                seen = new HashSet<object>(ReferenceEqualityComparer.Instance);
+                seen.Add(obj);
+            }
+
+            foreach (var (field, slot, elType) in plan.Slots)
+            {
+                if (slot == StubSlot.Nested)
+                {
+                    if (depth >= 16) continue;
+                    var nested = field.GetValue(obj);
+                    if (nested != null) ResolveObjectStubs(nested, $"{context}.{field.Name}", depth + 1, seen);
+                    continue;
+                }
+
+                if (slot == StubSlot.Asset)
                 {
                     var stub = field.GetValue(obj) as Asset;
                     if (stub == null || string.IsNullOrEmpty(stub.Guid))
@@ -304,19 +515,12 @@ namespace Freefall.Serialization
                     continue;
                 }
 
-                // List of Asset references — resolve each element
-                if (typeof(IList).IsAssignableFrom(field.Type))
+                // A list: of Asset references (each element resolved), or of nested [Serializable] objects
                 {
                     var list = field.GetValue(obj) as IList;
                     if (list == null || list.Count == 0) continue;
 
-                    var elType = field.Type.IsArray
-                        ? field.Type.GetElementType()
-                        : field.Type.IsGenericType
-                            ? field.Type.GetGenericArguments()[0]
-                            : null;
-
-                    if (elType != null && typeof(Asset).IsAssignableFrom(elType))
+                    if (slot == StubSlot.AssetList)
                     {
                         for (int i = 0; i < list.Count; i++)
                         {
@@ -338,7 +542,7 @@ namespace Freefall.Serialization
                         continue;
                     }
 
-                    if (elType != null && Reflector.GetAttribute<SerializableAttribute>(elType) != null && depth < 16)
+                    if (depth < 16)
                     {
                         for (int i = 0; i < list.Count; i++)
                         {

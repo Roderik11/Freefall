@@ -488,11 +488,30 @@ namespace Freefall.Assets
         /// </summary>
         private static MethodInfo _loadByGuidGeneric;
 
+        // One open delegate per asset type instead of MakeGenericMethod + Invoke per call (scene and prefab loads
+        // resolve every asset field through here). Project asset types are among the keys: the map is dropped when a
+        // script assembly comes or goes (Reflector.Generation), so it never keeps an unloaded one alive.
+        private static ConcurrentDictionary<Type, Func<AssetManager, string, Asset>> _loadByGuidByType = new();
+        private static int _loadByGuidGeneration = -1;
+
         public Asset LoadByGuid(string guid, Type assetType)
         {
-            _loadByGuidGeneric ??= typeof(AssetManager).GetMethod(nameof(LoadByGuid), new[] { typeof(string) });
-            var method = _loadByGuidGeneric!.MakeGenericMethod(assetType);
-            return method.Invoke(this, new object[] { guid }) as Asset;
+            var map = _loadByGuidByType;
+            int generation = Freefall.Reflection.Reflector.Generation;
+            if (Volatile.Read(ref _loadByGuidGeneration) != generation)
+            {
+                map = new ConcurrentDictionary<Type, Func<AssetManager, string, Asset>>();
+                _loadByGuidByType = map;
+                Volatile.Write(ref _loadByGuidGeneration, generation);
+            }
+
+            if (!map.TryGetValue(assetType, out var load))
+            {
+                _loadByGuidGeneric ??= typeof(AssetManager).GetMethod(nameof(LoadByGuid), new[] { typeof(string) });
+                load = _loadByGuidGeneric!.MakeGenericMethod(assetType).CreateDelegate<Func<AssetManager, string, Asset>>();
+                map[assetType] = load;
+            }
+            return load(this, guid);
         }
 
         /// <summary>

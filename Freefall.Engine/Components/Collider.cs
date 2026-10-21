@@ -17,6 +17,16 @@ namespace Freefall.Components
         private RigidStatic? _staticActor;
         private Shape? _shape;
 
+        // Where play mode's start goes (a wake-up of thousands of colliders)
+        private static readonly ProfilerMarker _findBodyMarker = ProfilerMarker.Get("Collider find body");
+        private static readonly ProfilerMarker _actorMarker = ProfilerMarker.Get("Collider actor");
+        private static readonly ProfilerMarker _geometryMarker = ProfilerMarker.Get("Collider geometry");
+        private static readonly ProfilerMarker _shapeMarker = ProfilerMarker.Get("Collider shape");
+
+        // The entity whose actor the shape is on: this one (its own static actor) or a RigidBody's above it
+        private Entity? _shapeHost;
+        internal Entity? ShapeHost => _shapeHost;
+
         public Actor? Actor => _staticActor;
 
         /// <summary>
@@ -89,11 +99,14 @@ namespace Freefall.Components
 
             try
             {
-                var rigidBody = Entity?.GetComponentInParents<RigidBody>();
+                RigidBody? rigidBody;
+                using (_findBodyMarker.Auto())
+                    rigidBody = Entity?.GetComponentInParents<RigidBody>();
                 if (rigidBody != null)
                     return;
 
-                CreateFullActor();
+                using (_actorMarker.Auto())
+                    CreateFullActor();
 
                 Transform.OnChanged += OnTransformChanged;
             }
@@ -120,11 +133,12 @@ namespace Freefall.Components
 
         void CreateFullActor()
         {
-            // Remove old actor
+            // Remove old actor (its shape goes with it)
             if (Actor != null)
             {
                 PhysicsWorld.Scene.RemoveActor(Actor);
-                Actor.Dispose();
+                ReleaseShape(native: false);
+                PhysXRelease.Release(_staticActor);
                 _staticActor = null;
             }
 
@@ -146,13 +160,23 @@ namespace Freefall.Components
             PhysicsWorld.Scene.AddActor(Actor!);
         }
 
+        // The shape being made: for a geometry that comes later (TerrainCollider) to call CreateShape with again
+        protected Entity? ShapeRoot { get; private set; }
+        protected RigidActor? ShapeActor { get; private set; }
+
         public void CreateShape(Entity root, RigidActor actor)
         {
-            var geometry = CreateGeometry();
+            ShapeRoot = root;
+            ShapeActor = actor;
+            PhysX.Geometry? geometry;
+            using (_geometryMarker.Auto())
+                geometry = CreateGeometry();
             if (geometry == null)
                 return;
 
+            using var shapeScope = _shapeMarker.Auto();
             _shape = RigidActorExt.CreateExclusiveShape(actor, geometry, PhysicsWorld.DefaultMaterial);
+            _shapeHost = root;
 
             // Whose shape this is: under a RigidBody all colliders share the body's actor, whose
             // UserData is the body's entity, so a query's hit can only tell the piece by its shape
@@ -194,12 +218,28 @@ namespace Freefall.Components
 
             if (Actor != null)
             {
+                // Its own actor: the shape goes with it
                 PhysicsWorld.Scene.RemoveActor(Actor);
-                Actor.Dispose();
+                ReleaseShape(native: false);
+                PhysXRelease.Release(_staticActor);
+                _staticActor = null;
+                return;
             }
 
-            _shape?.Dispose();
-            _staticActor?.Dispose();
+            // On a RigidBody's actor: left to the actor when the body goes too (a scene clear: thousands of pieces per
+            // house block, each detached from an actor still in the scene, otherwise), detached when only this goes
+            ReleaseShape(native: _shapeHost == null || !_shapeHost.IsBeingDestroyed);
+        }
+
+        /// <summary>
+        /// Let go of the shape's wrapper; with <paramref name="native"/> false the PhysX shape stays on its actor, for the
+        /// actor's release to take with it. RigidBody calls this for the shapes on its actor before releasing it.
+        /// </summary>
+        internal void ReleaseShape(bool native)
+        {
+            PhysXRelease.Release(_shape, native);
+            _shape = null;
+            _shapeHost = null;
         }
     }
 
@@ -268,50 +308,108 @@ namespace Freefall.Components
     public class MeshCollider : Collider
     {
         public Mesh? Mesh;
-        // Cooked meshes by mesh GUID, shared across scene loads (a reload brings new Mesh objects of the same assets).
-        // An entry holds only for the geometry it was cooked from: a reimported mesh keeps its GUID, and until
-        // 2026-10-17 its colliders went on using the old shape (the reworked cave mouth: the player fell through its
-        // new floor where the old outcrop had none, even after scene reloads).
-        static Dictionary<string, (int Geometry, TriangleMesh Mesh)> cookedMeshes = [];
 
-        /// <summary>A fingerprint of what the cook reads (positions and indices).</summary>
-        static int GeometryKey(Mesh mesh)
+        // Cooked meshes by geometry (Mesh.PhysicsGeometryKey), shared across scene loads: a reload brings new Mesh
+        // objects of the same assets, and RuntimeMesh output (streets, paving) comes back the same under a new name.
+        // By GUID until 2026-10-21: RuntimeMesh meshes got a new one per load, so all 75 of Eldermoor's cooked again on
+        // every Play (0.8 s) and the cache gained 75 entries each time. By geometry also means a reimported mesh is
+        // cooked anew (until 2026-10-17 its colliders kept the old shape: the player fell through the reworked cave
+        // mouth's new floor). Entries of RuntimeMesh output that the last loads did not use are let go.
+        sealed class Cooked
         {
-            var hash = new HashCode();
-            if (mesh.Positions != null) hash.AddBytes(MemoryMarshal.AsBytes(mesh.Positions.AsSpan()));
-            if (mesh.CpuIndices != null) hash.AddBytes(MemoryMarshal.AsBytes(mesh.CpuIndices.AsSpan()));
-            return hash.ToHashCode();
+            public required TriangleMesh Mesh;
+            public bool Dynamic;
+            public int LastUsed;
+        }
+        static readonly Dictionary<ulong, Cooked> cookedMeshes = [];
+        static readonly ProfilerMarker _cookMarker = ProfilerMarker.Get("Collider mesh cook");
+
+        // Counts the scene loads that made mesh colliders (an edit-mode load makes none, so Play, Stop, Play keeps them)
+        static int _loadNumber;
+        static SceneLoad? _numberedLoad;
+
+        static int LoadNumber()
+        {
+            var load = SceneManager.Loading;
+            if (load != null && load != _numberedLoad)
+            {
+                _numberedLoad = load;
+                _loadNumber++;
+                List<ulong>? stale = null;
+                foreach (var (key, entry) in cookedMeshes)
+                    if (entry.Dynamic && entry.LastUsed < _loadNumber - 2) (stale ??= []).Add(key);
+                if (stale != null)
+                    foreach (var key in stale)
+                    {
+                        PhysXRelease.Release(cookedMeshes[key].Mesh);   // shapes still on it keep the PhysX mesh
+                        cookedMeshes.Remove(key);
+                    }
+            }
+            return _loadNumber;
+        }
+
+        // The mesh CreateGeometry will use, as far as it is known yet
+        Mesh? ResolveMesh()
+        {
+            var rendered = Entity?.GetComponent<MeshRenderer>()?.Mesh;
+            return rendered != null && (Mesh == null || rendered.IsDynamic) ? rendered : Mesh;
+        }
+
+        /// <summary>
+        /// Give <paramref name="mesh"/> its cooked mesh from the cache; failing that, start its cook on a worker
+        /// (<paramref name="now"/> false) or finish or make it (true).
+        /// </summary>
+        static void Prepare(Mesh mesh, bool now)
+        {
+            if (mesh.CookedTriMesh is { Disposed: true }) mesh.CookedTriMesh = null;   // let go by the cache
+            if (mesh.CookedTriMesh != null) return;
+
+            if (!mesh.PhysicsCookRequested && cookedMeshes.TryGetValue(mesh.PhysicsGeometryKey(), out var hit))
+            {
+                hit.LastUsed = LoadNumber();
+                mesh.CookedTriMesh = hit.Mesh;
+                return;
+            }
+
+            if (!now)
+            {
+                mesh.RequestPhysicsCook();
+                return;
+            }
+
+            mesh.CookPhysicsMesh();
+            if (mesh.CookedTriMesh == null) return;
+
+            ulong key = mesh.PhysicsGeometryKey();
+            if (cookedMeshes.TryGetValue(key, out var same))
+            {
+                // Another Mesh of this geometry was cooked meanwhile: one PhysX mesh for both
+                PhysXRelease.Release(mesh.CookedTriMesh);
+                mesh.CookedTriMesh = same.Mesh;
+                same.LastUsed = LoadNumber();
+            }
+            else
+                cookedMeshes[key] = new Cooked { Mesh = mesh.CookedTriMesh, Dynamic = mesh.IsDynamic, LastUsed = LoadNumber() };
+        }
+
+        // Every component has Early() before any has Awake(): the cooks of a whole scene's meshes run side by side
+        protected override void Early()
+        {
+            if (Engine.IsEditor) return;
+            if (ResolveMesh() is { } mesh) Prepare(mesh, now: false);
         }
 
         public override PhysX.Geometry? CreateGeometry()
         {
-            var meshrenderer = Entity?.GetComponent<MeshRenderer>();
-
-            if (meshrenderer?.Mesh != null)
-            {
-                if(Mesh == null || meshrenderer.Mesh.IsDynamic)
-                    Mesh = meshrenderer.Mesh;
-            }
-            
+            Mesh = ResolveMesh();
             if(Mesh == null)
             {
                 Debug.Log("[RigidBody] No Mesh found for MeshCollider");
                 return null;
             }
 
-
-            if (Mesh.CookedTriMesh == null)
-            {
-                int geometry = GeometryKey(Mesh);
-                if (Mesh.Guid != null && cookedMeshes.TryGetValue(Mesh.Guid, out var cooked) && cooked.Geometry == geometry)
-                    Mesh.CookedTriMesh = cooked.Mesh;
-                else
-                {
-                    Mesh.CookPhysicsMesh();
-                    if (Mesh.Guid != null && Mesh.CookedTriMesh != null)
-                        cookedMeshes[Mesh.Guid] = (geometry, Mesh.CookedTriMesh);
-                }
-            }
+            using (_cookMarker.Auto())
+                Prepare(Mesh, now: true);
 
             if (Mesh?.CookedTriMesh == null)
             {
@@ -333,6 +431,11 @@ namespace Freefall.Components
 
     public class TerrainCollider : Collider
     {
+        /// <summary>
+        /// The terrain's height field (Terrain.CookedHeightFieldAsync: made once per version of the heights and holes).
+        /// When it still has to be cooked, there is no shape yet: it is put on the actor once the cook is done, and a
+        /// scene load waits for that, so nothing walks or falls before there is ground.
+        /// </summary>
         public override PhysX.Geometry? CreateGeometry()
         {
             var terrainRenderer = Entity?.GetComponent<TerrainRenderer>();
@@ -350,31 +453,27 @@ namespace Freefall.Components
                 return null;
             }
 
-            var heightMap = terrain.HeightField;
-            int rows = heightMap.GetLength(0);
-            int cols = heightMap.GetLength(1);
+            var cooked = terrain.CookedHeightFieldAsync();
+            if (cooked.IsCompleted)
+                return cooked.Result is { } field ? Geometry(terrain, field) : null;
 
-            float fx = terrain.TerrainSize.X / (rows - 1);
-            float fy = terrain.TerrainSize.Y / (cols - 1);
-
-            Debug.Log($"[RigidBody] Cooking HeightField: {rows}x{cols}, MaxHeight={terrain.MaxHeight}, fx={fx}, fy={fy}, holes={terrain.HasHoles}");
-            var samples = heightMap.ToSamples(terrain);
-
-            var heightFieldDesc = new HeightFieldDesc()
+            var (root, actor) = (ShapeRoot!, ShapeActor!);
+            var attach = cooked.ContinueWith(_ => Engine.RunOnMainThreadAsync(() =>
             {
-                NumberOfRows = rows,
-                NumberOfColumns = cols,
-                Samples = samples,
-            };
+                // Still wanted on that actor: not destroyed, not replaced, no shape made meanwhile
+                if (IsDestroyed || actor.Disposed || ShapeHost != null) return;
+                if (cooked.Result != null) CreateShape(root, actor);
+            })).Unwrap();
+            SceneManager.Loading?.WaitFor(attach, "Terrain collision");
+            return null;
+        }
 
-            var cooking = PhysicsWorld.Physics.CreateCooking();
-            var stream = new MemoryStream();
-            cooking.CookHeightField(heightFieldDesc, stream);
-
-            stream.Position = 0;
-            HeightField heightField = PhysicsWorld.Physics.CreateHeightField(stream);
-
-            return new HeightFieldGeometry(heightField, 0, terrain.MaxHeight / short.MaxValue, fx, fy);
+        private static HeightFieldGeometry Geometry(Terrain terrain, HeightField field)
+        {
+            // The field was made from these heights (the cache is per version of them)
+            float fx = terrain.TerrainSize.X / (terrain.HeightField.GetLength(0) - 1);
+            float fy = terrain.TerrainSize.Y / (terrain.HeightField.GetLength(1) - 1);
+            return new HeightFieldGeometry(field, 0, terrain.MaxHeight / short.MaxValue, fx, fy);
         }
     }
 }

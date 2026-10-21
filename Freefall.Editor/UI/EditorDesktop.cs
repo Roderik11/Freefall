@@ -76,18 +76,23 @@ namespace Freefall.Editor
         }
 
         /// <summary>
-        /// Replace the scene in the editor with <paramref name="scene"/>. A scene file replaced on disk since its
-        /// last import (a backup copied back) is imported first, so what opens is what the file holds.
+        /// Start replacing the scene in the editor with <paramref name="scene"/>: the load runs in slices over the next
+        /// frames behind the progress popup (SceneLoad), and the returned load says when it is done. A scene file replaced
+        /// on disk since its last import (a backup copied back) is imported first, so what opens is what the file holds.
         /// </summary>
-        public List<Entity> OpenScene(SceneAsset scene)
+        public SceneLoad OpenScene(SceneAsset scene)
         {
+            if (ProgressJob.Running is { } job)
+                throw new InvalidOperationException($"Wait for it to finish: {job.Title} is running");
+
             if (AssetDatabase.ImportIfChanged(scene.Guid))
                 Engine.Assets.ReloadReimported();
 
-            var entities = SceneManager.LoadNow(scene);
+            var load = SceneManager.LoadAsync(scene);
             CurrentScene = scene;
-            MessageDispatcher.Send(Msg.RefreshExplorer);
-            return entities;
+            load.Completed += _ => MessageDispatcher.Send(Msg.RefreshExplorer);
+            SceneLoadPopup.Follow(load, $"Opening {scene.Name}");
+            return load;
         }
 
         /// <summary>
@@ -153,16 +158,19 @@ namespace Freefall.Editor
             else
                 _playSnapshot = Encoding.UTF8.GetBytes(new Freefall.Serialization.EntitySerializer().SaveToString(EntityManager.Entities.ToArray()));
 
-            EntityManager.ClearScene();
-            EditorCamera.DestroyCamera();
-            Engine.SetPlaymode(true);
-
-            // OnSceneLoaded puts the game's cameras on the scene viewport
-            SceneManager.LoadNow(CurrentScene, _playSnapshot);
+            // The edit scene is cleared in edit mode, then the game starts: play mode and no editor camera before the
+            // scene is read. OnSceneLoaded puts the game's cameras on the scene viewport.
+            var load = SceneManager.LoadAsync(CurrentScene, _playSnapshot);
+            load.Cleared += _ =>
+            {
+                EditorCamera.DestroyCamera();
+                Engine.SetPlaymode(true);
+            };
+            load.Completed += _ => MessageDispatcher.Send(Msg.RefreshExplorer);
+            SceneLoadPopup.Follow(load, $"Playing {CurrentScene?.Name ?? "the scene"}");
 
             _playButton.Enabled = false;
             _stopButton.Enabled = true;
-            MessageDispatcher.Send(Msg.RefreshExplorer);
             return null;
         }
 
@@ -177,21 +185,25 @@ namespace Freefall.Editor
         {
             if (!IsPlaying) return;
 
-            EntityManager.ClearScene();
-            Engine.SetPlaymode(false);
-            Input.StopSimulation();   // keys a tool held down are let go
-
-            SceneManager.LoadNow(CurrentScene, _playSnapshot);
+            // The game is torn down in play mode, then the editor is back (edit mode, its camera) before the scene is read
+            var load = SceneManager.LoadAsync(CurrentScene, _playSnapshot);
             _playSnapshot = null;
-
-            EditorCamera.CreateCamera();
-
-            foreach (var camera in ComponentCache<Camera>.All)
-                camera.Target = RenderView.All[1];
+            load.Cleared += _ =>
+            {
+                Engine.SetPlaymode(false);
+                Input.StopSimulation();   // keys a tool held down are let go
+                EditorCamera.CreateCamera();
+            };
+            load.Read += _ =>
+            {
+                foreach (var camera in ComponentCache<Camera>.All)
+                    camera.Target = RenderView.All[1];
+            };
+            load.Completed += _ => MessageDispatcher.Send(Msg.RefreshExplorer);
+            SceneLoadPopup.Follow(load, $"Back to {CurrentScene?.Name ?? "the scene"}");
 
             _playButton.Enabled = true;
             _stopButton.Enabled = false;
-            MessageDispatcher.Send(Msg.RefreshExplorer);
         }
 
         public EditorDesktop()
@@ -236,9 +248,8 @@ namespace Freefall.Editor
                             return;
                         }
 
-                        var entities = OpenScene(scene);
-                        Toast.Show($"[Editor] Loaded scene: {entities.Count} entities");
-                        Debug.Log($"[Editor] Loaded scene: {entities.Count} entities");
+                        var load = OpenScene(scene);
+                        load.Completed += done => Toast.Show(done.Error == null ? $"Opened {done.Name}" : $"Opening {done.Name} failed");
                     }
                     catch (Exception ex)
                     {
@@ -805,8 +816,8 @@ namespace Freefall.Editor
                 }
                 try
                 {
-                    var entities = OpenScene(Engine.Assets.LoadByGuid<SceneAsset>(guid));
-                    Toast.Show($"[Editor] Loaded scene: {entities.Count} entities");
+                    var load = OpenScene(Engine.Assets.LoadByGuid<SceneAsset>(guid));
+                    load.Completed += done => Toast.Show(done.Error == null ? $"Opened {done.Name}" : $"Opening {done.Name} failed");
                 }
                 catch (Exception ex)
                 {

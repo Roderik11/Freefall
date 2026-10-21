@@ -33,6 +33,38 @@ namespace Freefall.Assets
         /// </summary>
         public int EntityCount { get; set; }
 
+        private static readonly ProfilerMarker _instantiateMarker = ProfilerMarker.Get("Prefab.Instantiate");
+        private static readonly ProfilerMarker _applyMarker = ProfilerMarker.Get("Prefab.ApplyTo");
+
+        // What parsing SourceYaml does, recorded at the first instance and replayed for the next ones (PCG and kits
+        // instantiate the same prefab thousands of times). Tied to the YAML array it was recorded from: a new
+        // SourceYaml (reimport, prefab update) records again, and so does a script reload (Recording.IsCurrent).
+        private sealed record Template(byte[] Yaml, YAMLSerializer.Recording Recording);
+        private Template? _template;
+
+        /// <summary>Diagnostics: FREEFALL_PREFAB_TEMPLATES=0 before starting parses every instance (to compare scenes with scene_fingerprint).</summary>
+        public static readonly bool UseTemplates = Environment.GetEnvironmentVariable("FREEFALL_PREFAB_TEMPLATES") != "0";
+
+        /// <summary>The prefab's entities, made anew (fresh UIDs): replays the recorded parse when it still applies.</summary>
+        private List<Entity> LoadEntities(bool skipPrefabHydration)
+        {
+            var serializer = new EntitySerializer { DuplicateMode = true };
+            var yaml = SourceYaml;
+            if (!UseTemplates) return serializer.LoadFromBytes(yaml, skipPrefabHydration);
+            var template = _template;
+            if (template != null && ReferenceEquals(template.Yaml, yaml) && template.Recording.IsCurrent)
+            {
+                return template.Recording.HasFailed
+                    ? serializer.LoadFromBytes(yaml, skipPrefabHydration)
+                    : serializer.LoadFromRecording(template.Recording, skipPrefabHydration);
+            }
+
+            var recording = new YAMLSerializer.Recording();
+            var entities = serializer.LoadFromBytes(yaml, recording, skipPrefabHydration);
+            _template = new Template(yaml, recording);
+            return entities;
+        }
+
         /// <summary>
         /// Instantiate this prefab: parse the YAML, assign fresh UIDs,
         /// resolve asset references, and register entities in EntityManager.
@@ -40,18 +72,18 @@ namespace Freefall.Assets
         /// </summary>
         public Entity Instantiate()
         {
+            using var _ = _instantiateMarker.Auto();
             if (SourceYaml == null || SourceYaml.Length == 0)
             {
                 Debug.LogWarning("Prefab", $"Cannot instantiate '{Name}': no source YAML");
                 return null;
             }
 
-            // SceneLoader handles everything:
+            // The serializer handles everything:
             //   - Deserializes entities (Entity constructor auto-generates fresh UIDs + registers)
             //   - Resolves UID cross-references within the prefab
             //   - Resolves asset references via LoadByGuid
-            var serializer = new EntitySerializer { DuplicateMode = true };
-            var entities = serializer.LoadFromBytes(SourceYaml);
+            var entities = LoadEntities(skipPrefabHydration: false);
 
             if (entities.Count == 0)
             {
@@ -87,10 +119,10 @@ namespace Freefall.Assets
         /// </summary>
         public void ApplyTo(Entity target)
         {
+            using var _ = _applyMarker.Auto();
             if (SourceYaml == null || SourceYaml.Length == 0) return;
 
-            var serializer = new EntitySerializer { DuplicateMode = true };
-            var prefabEntities = serializer.LoadFromBytes(SourceYaml, skipPrefabHydration: true);
+            var prefabEntities = LoadEntities(skipPrefabHydration: true);
 
             if (prefabEntities.Count == 0) return;
 

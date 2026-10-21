@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Numerics;
+using System.Threading.Tasks;
 using System.Text.Json.Serialization;
 using System.ComponentModel;
 using Freefall.Base;
@@ -134,8 +135,20 @@ namespace Freefall.Assets
         /// </summary>
         internal void CheckMapsAgainstSaved()
         {
-            if (Engine.IsEditor && !IsDirty && MapsHash() != _savedMapsHash)
+            if (!Engine.IsEditor || IsDirty) return;
+            if (MapsHash() != _savedMapsHash)
+            {
                 base.MarkDirty();
+                return;
+            }
+
+            // The bake equals the saved maps, but the stamps it came from are not what the asset says (a terrain saved
+            // before the hash existed): now they are known. Saved once, a load can keep the map without baking.
+            if (HeightFieldStampsHash != 0 && BakedStampsHash != HeightFieldStampsHash)
+            {
+                BakedStampsHash = HeightFieldStampsHash;
+                base.MarkDirty();
+            }
         }
 
         // FNV-1a over the bits of the CPU height field and the hole mask (~10 ms for 4097²)
@@ -215,6 +228,23 @@ namespace Freefall.Assets
         public Texture BakedHeightmapRef;
 
         /// <summary>
+        /// The height stamps the saved heightmap was baked from, as <see cref="TerrainBaker.HeightPlan.Hash"/>. A scene
+        /// whose stamps hash the same keeps the saved map as it is: no bake and no readback at load. 0 = not known.
+        /// </summary>
+        [Browsable(false)]
+        public ulong BakedStampsHash;
+
+        /// <summary>What the GPU heightmap was baked from: set when a bake runs, or to <see cref="BakedStampsHash"/> when the saved one is uploaded. 0 = not known.</summary>
+        [Reflection.DontSerialize]
+        [JsonIgnore]
+        internal ulong HeightmapStampsHash;
+
+        /// <summary>What the CPU <see cref="HeightField"/> holds: set when the heightmap is read back, or by the loader from the saved map. 0 = not known.</summary>
+        [Reflection.DontSerialize]
+        [JsonIgnore]
+        internal ulong HeightFieldStampsHash;
+
+        /// <summary>
         /// Pending baked heightmap bytes loaded from cache, awaiting GPU upload.
         /// Consumed by TerrainRenderer on the next Draw frame.
         /// </summary>
@@ -268,16 +298,98 @@ namespace Freefall.Assets
         public float[,] HeightField { get; private set; }
 
         /// <summary>
-        /// Pre-cooked PhysX height field. Populated during asset loading from the
-        /// collision subasset so that RigidBody.Awake() doesn't need to cook on the main thread.
+        /// The PhysX height field of the heights and holes as they were when it was made (TerrainCollider's geometry).
+        /// Use <see cref="CookedHeightFieldAsync"/>, which makes it again when they have changed.
         /// </summary>
         [JsonIgnore]
         public PhysX.HeightField CookedHeightField { get; private set; }
 
+        // MapsHash of the heights and holes the cooked height field, and the cook under way, were made from. A hash, not
+        // a count of changes: during a load the hole mask goes empty (stamps not awake yet) and back to the same cuts.
+        private ulong _cookedMapsHash;
+        private Task<PhysX.HeightField?>? _cooking;
+        private ulong _cookingMapsHash;
+
         /// <summary>
-        /// Set the pre-cooked PhysX height field. Called by TerrainLoader.
+        /// Set the cooked PhysX height field, made from the heights and holes as they are now (TerrainLoader on save).
+        /// The one it replaces is released; shapes still on it keep it alive (PhysX counts references).
         /// </summary>
-        internal void SetCookedHeightField(PhysX.HeightField hf) => CookedHeightField = hf;
+        internal void SetCookedHeightField(PhysX.HeightField hf) => SetCookedHeightField(hf, MapsHash());
+
+        private void SetCookedHeightField(PhysX.HeightField hf, ulong mapsHash)
+        {
+            if (CookedHeightField != null && CookedHeightField != hf)
+                PhysXRelease.Release(CookedHeightField);
+            CookedHeightField = hf;
+            _cookedMapsHash = mapsHash;
+        }
+
+        /// <summary>
+        /// The PhysX height field of the heights and holes as they are now, for TerrainCollider. Play used to cook it
+        /// every time on the main thread: ~5.4 s for 4097² on Eldermoor. Now, in order: the one in memory, when it was
+        /// made from these maps; the cook saved with the terrain, when they are the saved ones; a cook on a worker (the
+        /// samples and PhysX cooking; creating the PhysX object stays on the main thread, PhysX.Net's object table is not
+        /// thread-safe). Null without heights. Main thread.
+        /// </summary>
+        internal Task<PhysX.HeightField?> CookedHeightFieldAsync()
+        {
+            var heights = HeightField;
+            if (heights == null)
+                return Task.FromResult<PhysX.HeightField?>(null);
+
+            ulong maps = MapsHash();
+            if (CookedHeightField != null && _cookedMapsHash == maps)
+                return Task.FromResult<PhysX.HeightField?>(CookedHeightField);
+            if (_cooking != null && _cookingMapsHash == maps)
+                return _cooking;
+
+            // The cook written by the last save, from these very maps
+            if (maps == _savedMapsHash && Loaders.TerrainLoader.LoadSavedCook(this) is { } saved)
+            {
+                SetCookedHeightField(saved, maps);
+                return Task.FromResult<PhysX.HeightField?>(saved);
+            }
+
+            // The heights array is replaced, never written, but the hole mask is re-cut in place: the worker gets a copy
+            var holes = Holes?.ToArray();
+            int holeResolution = HoleResolution;
+            var cooking = PhysicsWorld.Physics.CreateCooking();
+            var done = new TaskCompletionSource<PhysX.HeightField?>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+            Task.Run(() =>
+            {
+                var desc = new PhysX.HeightFieldDesc
+                {
+                    NumberOfRows = heights.GetLength(0),
+                    NumberOfColumns = heights.GetLength(1),
+                    Samples = heights.ToSamples(holes, holeResolution),
+                };
+                var stream = new System.IO.MemoryStream();
+                cooking.CookHeightField(desc, stream);
+                stream.Position = 0;
+                return stream;
+            }).ContinueWith(cook => Engine.RunOnMainThreadAsync(() =>
+            {
+                // Always completes: a scene load waits for the shape made from it
+                try
+                {
+                    PhysXRelease.Release(cooking);
+                    var field = PhysicsWorld.Physics.CreateHeightField(cook.Result);
+                    SetCookedHeightField(field, maps);   // maps changed meanwhile: the next request cooks again
+                    Debug.LogAlways($"[Terrain] '{Name}': collision height field cooked on a worker");
+                    done.SetResult(field);
+                }
+                catch (Exception ex)
+                {
+                    Debug.LogWarning("Terrain", $"'{Name}': cooking the collision height field failed: {ex.GetBaseException().Message}");
+                    done.SetResult(null);
+                }
+            }));
+
+            _cooking = done.Task;
+            _cookingMapsHash = maps;
+            return _cooking;
+        }
 
         /// <summary>
         /// Sets the CPU-side height field directly from readback data.

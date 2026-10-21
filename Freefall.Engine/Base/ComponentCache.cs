@@ -9,8 +9,12 @@ namespace Freefall.Base
     public interface IComponentCache
     {
         Type ComponentType { get; }
-        void Early();
-        void Awake();
+        /// <summary>Components added since the last wake-up, waiting for their Early/Awake.</summary>
+        int PendingWakeups { get; }
+        /// <summary>Early() for the waiting components, until <paramref name="deadline"/> (a Stopwatch timestamp). True when none is left.</summary>
+        bool Early(long deadline);
+        /// <summary>The Removed/Added events, and Awake() for the waiting components that have had Early(), until <paramref name="deadline"/>. True when none is left.</summary>
+        bool Awake(long deadline);
         void Update();
         void Draw();
     }
@@ -52,6 +56,12 @@ namespace Freefall.Base
         private readonly ProfilerMarker _marker = ProfilerMarker.Get(Type.Name);
 
         public Type ComponentType => Type;
+
+        public int PendingWakeups => WakeupList.Count - _awakeCursor;
+
+        // How far Early() and Awake() got through WakeupList. A wake-up can stop at a deadline (a scene load wakes the
+        // scene a slice per frame) and carry on from here; Awake() never passes Early().
+        private static int _earlyCursor, _awakeCursor;
 
         static ComponentCache()
         {
@@ -141,25 +151,27 @@ namespace Freefall.Base
             }
         }
 
-        public void Early()
+        public bool Early(long deadline)
         {
             lock (_lock)
             {
-                if (WakeupList.Count > 0)
+                if (_earlyCursor >= WakeupList.Count) return true;
+                using var _ = _marker.Auto(WakeupList.Count - _earlyCursor);
+                while (_earlyCursor < WakeupList.Count)
                 {
-                    using var _ = _marker.Auto(WakeupList.Count);
-                    foreach (var component in WakeupList)
-                        component.EarlyBird();
+                    WakeupList[_earlyCursor++].EarlyBird();
+                    if (deadline != long.MaxValue && System.Diagnostics.Stopwatch.GetTimestamp() >= deadline) break;
                 }
+                return _earlyCursor >= WakeupList.Count;
             }
         }
 
-        public void Awake()
+        public bool Awake(long deadline)
         {
             lock (_lock)
             {
-                if (RemovedList.Count == 0 && WakeupList.Count == 0) return;
-                using var _ = _marker.Auto(WakeupList.Count);
+                if (RemovedList.Count == 0 && _awakeCursor >= _earlyCursor) return _awakeCursor >= WakeupList.Count;
+                using var _ = _marker.Auto(_earlyCursor - _awakeCursor);
 
                 if (RemovedList.Count > 0)
                 {
@@ -169,19 +181,28 @@ namespace Freefall.Base
                     RemovedList.Clear();
                 }
 
-                if (WakeupList.Count > 0)
+                // Only those that have had Early(): one added meanwhile (by another component's Awake) gets both later
+                while (_awakeCursor < _earlyCursor)
                 {
-                    foreach (var component in WakeupList)
-                    {
-                        component.WakeUp();
+                    var component = WakeupList[_awakeCursor++];
+                    component.WakeUp();
 
-                        if (component.IsDestroyed || component.Announced) continue;
+                    if (!component.IsDestroyed && !component.Announced)
+                    {
                         component.Announced = true;
                         Added?.Invoke(component);
                     }
-
-                    WakeupList.Clear();
+                    if (deadline != long.MaxValue && System.Diagnostics.Stopwatch.GetTimestamp() >= deadline) break;
                 }
+
+                // Drop the woken ones; the cursors keep pointing at the same components
+                if (_awakeCursor > 0)
+                {
+                    WakeupList.RemoveRange(0, _awakeCursor);
+                    _earlyCursor -= _awakeCursor;
+                    _awakeCursor = 0;
+                }
+                return WakeupList.Count == 0;
             }
         }
 

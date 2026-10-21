@@ -24,17 +24,22 @@ namespace Freefall.Graphics
         /// </summary>
         public static void FlushDeferredDisposals()
         {
+            // Dispose what is due (last first), then keep the rest in one pass, not one RemoveAt per entry
             int currentFrame = Engine.TickCount;
-            for (int i = _deferredDisposals.Count - 1; i >= 0; i--)
+            var list = _deferredDisposals;
+            for (int i = list.Count - 1; i >= 0; i--)
             {
-                if (currentFrame >= _deferredDisposals[i].FrameToDispose)
+                if (currentFrame >= list[i].FrameToDispose)
                 {
-                    _deferredDisposals[i].Resource?.Dispose();
-                    if (_deferredDisposals[i].BindlessIndex != 0)
-                        Engine.Device?.ReleaseBindlessIndex(_deferredDisposals[i].BindlessIndex);
-                    _deferredDisposals.RemoveAt(i);
+                    list[i].Resource?.Dispose();
+                    if (list[i].BindlessIndex != 0)
+                        Engine.Device?.ReleaseBindlessIndex(list[i].BindlessIndex);
                 }
             }
+            int keep = 0;
+            for (int i = 0; i < list.Count; i++)
+                if (currentFrame < list[i].FrameToDispose) list[keep++] = list[i];
+            list.RemoveRange(keep, list.Count - keep);
         }
 
         private static void DeferDispose(ID3D12Resource? resource, uint bindlessIndex)

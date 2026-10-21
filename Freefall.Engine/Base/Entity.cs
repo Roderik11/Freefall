@@ -290,11 +290,20 @@ namespace Freefall.Base
         }
 
         /// <summary>
+        /// Set when <see cref="Destroy"/> starts, before its children go: a component on a child can tell that what it
+        /// belongs to goes with it (a collider whose shape is on a parent's RigidBody leaves the shape to the body's actor).
+        /// </summary>
+        [System.ComponentModel.Browsable(false)]
+        [Reflection.DontSerialize]
+        public bool IsBeingDestroyed { get; private set; }
+
+        /// <summary>
         /// Destroy this entity: call Destroy() on all components,
         /// unregister from ComponentCaches, remove from EntityManager.
         /// </summary>
         public void Destroy()
         {
+            IsBeingDestroyed = true;
             var childCount = Transform.Count;
 
             for (int i = childCount - 1; i >= 0; i--)

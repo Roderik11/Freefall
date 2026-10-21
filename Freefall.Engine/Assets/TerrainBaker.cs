@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Numerics;
 using System.Runtime.InteropServices;
 
@@ -224,11 +225,79 @@ namespace Freefall.Assets
             internal readonly List<HeightStep> Steps = new();
             internal readonly List<HeightStampDescriptorGPU> Descriptors = new();
             internal readonly List<StampSplinePointGPU> SplinePoints = new();
+            internal readonly List<string> Sources = new();   // GUIDs of the heightmap textures, in the order the plan uses them
             internal int Resolution;
+            internal Vector2 TerrainSize;
+            internal float MaxHeight;
 
             /// <summary>True if any stamp contributes; a bake without work is skipped so a terrain
             /// with no height stamps keeps the heightmap it was saved with.</summary>
             public bool HasWork => Steps.Count > 0;
+
+            /// <summary>
+            /// What the bake of this plan comes out as, as a hash: every step, descriptor and spline point (the bindless
+            /// indices left out, the textures they name by GUID), the resolution and the terrain's size, and the bake
+            /// shader's source. Equal hashes bake equal heightmaps, so a heightmap baked from an equal hash can be kept
+            /// (Terrain.BakedStampsHash). A heightmap texture reimported under the same GUID is not seen.
+            /// </summary>
+            public ulong Hash => _hash ??= ComputeHash();
+            private ulong? _hash;
+
+            private ulong ComputeHash()
+            {
+                ulong h = Fnv.Start;
+                h = Fnv.Mix(h, Resolution);
+                h = Fnv.Mix(h, TerrainSize.X); h = Fnv.Mix(h, TerrainSize.Y); h = Fnv.Mix(h, MaxHeight);
+                h = Fnv.Mix(h, ShaderHash);
+
+                var steps = Steps.ToArray();
+                for (int i = 0; i < steps.Length; i++) steps[i].SourceSrv = 0;
+                h = Fnv.Mix(h, MemoryMarshal.AsBytes(steps.AsSpan()));
+
+                var descriptors = Descriptors.ToArray();
+                for (int i = 0; i < descriptors.Length; i++) descriptors[i].HeightmapIdx = descriptors[i].HeightmapIdx != 0 ? 1u : 0u;
+                h = Fnv.Mix(h, MemoryMarshal.AsBytes(descriptors.AsSpan()));
+
+                h = Fnv.Mix(h, MemoryMarshal.AsBytes(System.Runtime.InteropServices.CollectionsMarshal.AsSpan(SplinePoints)));
+                foreach (var source in Sources)
+                    h = Fnv.Mix(h, System.Text.Encoding.UTF8.GetBytes(source));
+                return h == 0 ? 1 : h;   // 0 means "not known" on the terrain
+            }
+        }
+
+        // The height bake shader and everything it includes, hashed once per process: a changed kernel bakes
+        // differently from the same stamps
+        private static ulong? _shaderHash;
+        private static ulong ShaderHash => _shaderHash ??= HashShader("terrain_height_bake.hlsl");
+
+        private static ulong HashShader(string file)
+        {
+            ulong h = Fnv.Start;
+            var path = Graphics.ShaderHotReload.ResolvePath(file);
+            if (path == null) return h;
+            var files = new List<string>(Graphics.ShaderHotReload.CollectDependencies(path)) { path };
+            files.Sort(StringComparer.OrdinalIgnoreCase);
+            foreach (var f in files.Distinct(StringComparer.OrdinalIgnoreCase))
+                if (EngineFiles.Exists(f))
+                    h = Fnv.Mix(h, EngineFiles.ReadAllBytes(f));
+            return h;
+        }
+
+        /// <summary>64-bit FNV-1a, for the bake hashes.</summary>
+        internal static class Fnv
+        {
+            public const ulong Start = 14695981039346656037UL;
+            private const ulong Prime = 1099511628211UL;
+
+            public static ulong Mix(ulong h, ReadOnlySpan<byte> bytes)
+            {
+                foreach (var b in bytes) h = (h ^ b) * Prime;
+                return (h ^ (ulong)bytes.Length) * Prime;
+            }
+
+            public static ulong Mix(ulong h, ulong value) => (h ^ value) * Prime;
+            public static ulong Mix(ulong h, int value) => Mix(h, (ulong)(uint)value);
+            public static ulong Mix(ulong h, float value) => Mix(h, (ulong)BitConverter.SingleToUInt32Bits(value));
         }
 
         /// <summary>
@@ -238,7 +307,7 @@ namespace Freefall.Assets
         /// </summary>
         public HeightPlan PrepareHeight(Terrain terrain, TerrainRenderer renderer)
         {
-            var plan = new HeightPlan { Resolution = terrain.EffectiveHeightmapResolution };
+            var plan = new HeightPlan { Resolution = terrain.EffectiveHeightmapResolution, TerrainSize = terrain.TerrainSize, MaxHeight = terrain.MaxHeight };
 
             var stamps = new List<TerrainStamp>();
             stamps.AddRange(CollectStamps<HeightStamp>(renderer));
@@ -269,6 +338,7 @@ namespace Freefall.Assets
                         // Whole-terrain import: nothing to do without a heightmap
                         if (height.Heightmap == null || height.Heightmap.BindlessIndex == 0) break;
                         CloseRun();
+                        plan.Sources.Add(height.Heightmap.Guid ?? height.Heightmap.Name ?? "");
                         // World Y, as the target height of a local stamp (see TryBuildHeightDescriptor)
                         float baseY = (height.Transform?.WorldPosition.Y ?? 0f) + height.HeightOffset - terrainOrigin.Y;
                         plan.Steps.Add(new HeightStep
@@ -285,7 +355,10 @@ namespace Freefall.Assets
 
                     case HeightStamp height:
                         if (TryBuildHeightDescriptor(height, terrainOrigin, terrainSize, maxHeight, plan.SplinePoints, out var desc))
+                        {
                             plan.Descriptors.Add(desc);
+                            if (height.Heightmap != null) plan.Sources.Add(height.Heightmap.Guid ?? height.Heightmap.Name ?? "");
+                        }
                         break;
 
                     case HeightNoiseStamp noise:

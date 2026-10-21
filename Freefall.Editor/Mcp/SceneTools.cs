@@ -17,47 +17,49 @@ namespace Freefall.Editor.Mcp
 
         [McpServerTool(Name = "scene_load", Title = "Load scene", Destructive = true, OpenWorld = false)]
         [Description("Replace the current scene with a scene asset (a .scene file inside Assets). Destroys all current entities (unsaved changes are lost) and invalidates every entity id. " +
-                     "Waits until the scene has settled (PCG output spawned, frames rendering normally) before returning, so the next call works. Not while playing.")]
+                     "The load runs in slices behind the editor's progress popup (the editor stays responsive, editor_status shows the step); " +
+                     "this waits until it is done (everything awake, terrain ready, PCG output generated) and returns the scene's entities and the load's " +
+                     "[SceneLoad] summary. Other calls that change the scene are refused while a load runs. Not while playing.")]
         public static async Task<CallToolResult> LoadScene(
             [Description("The scene's asset GUID, or its path relative to the project Assets folder (or absolute, inside Assets)")] string path,
-            [Description("Max seconds to wait for the scene to settle")] int waitSeconds = 120)
+            [Description("Max seconds to wait for the load")] int waitSeconds = 180)
         {
             var result = await McpBridge.Post("/api/scene/load", new { path });
             if (result.IsError == true) return result;
 
-            var sw = System.Diagnostics.Stopwatch.StartNew();
-            var settled = await WaitUntilSettled(waitSeconds);
             var json = JsonNode.Parse(EditorTools.TextOf(result))!.AsObject();
-            json["settled"] = settled.ok;
-            json["settleMs"] = sw.ElapsedMilliseconds;
-            json["entityCountSettled"] = settled.entityCount; // incl. generated PCG output
+            var done = await WaitForLoad(waitSeconds, entities: true);
+            if (done == null)
+                return McpBridge.Error($"The scene is still loading after {waitSeconds}s; editor_status shows the step.");
+
+            var last = done["last"]?.AsObject();
+            json["status"] = last?["failed"] is { } failed ? $"failed: {failed}" : "ok";
+            json["loadSeconds"] = last?["seconds"]?.DeepClone();
+            json["entityCount"] = last?["entityCount"]?.DeepClone();
+            json["entityCountWithGenerated"] = await EditorCommandServer.Instance.RunOnMainThread(() => Freefall.Base.EntityManager.Entities.Count);
+            json["entities"] = last?["entities"]?.DeepClone();
+            json["loadReport"] = done["lastReport"]?.DeepClone();
             return EditorTools.Text(json);
         }
 
         /// <summary>
-        /// Loading returns before the heavy first frames (component start-up, PCG regeneration, terrain bake) have run.
-        /// Settled = the entity count is unchanged for ~1 s while frames keep advancing at a normal frame time.
+        /// Wait until no scene load is in progress (SceneManager.Loading), polling GET /api/scene/load-status. Returns its
+        /// last answer (the finished load under "last"), or null when <paramref name="waitSeconds"/> ran out.
         /// </summary>
-        internal static async Task<(bool ok, int entityCount)> WaitUntilSettled(int waitSeconds)
+        internal static async Task<JsonObject?> WaitForLoad(int waitSeconds, bool entities = false)
         {
             var server = EditorCommandServer.Instance;
             var deadline = System.DateTime.UtcNow.AddSeconds(waitSeconds);
-            int lastCount = -1, stablePolls = 0;
-            long lastFrame = -1;
+            string route = "/api/scene/load-status" + (entities ? "?entities=true" : "");
             while (System.DateTime.UtcNow < deadline)
             {
-                var (frame, deltaMs, count) = await server.RunOnMainThread(() =>
-                    ((long)Engine.TickCount, Freefall.Base.Time.DeltaMilliseconds, Freefall.Base.EntityManager.Entities.Count));
-
-                bool healthy = frame > lastFrame && deltaMs < 250f;
-                stablePolls = healthy && count == lastCount ? stablePolls + 1 : 0;
-                if (stablePolls >= 4) return (true, count);
-
-                lastCount = count;
-                lastFrame = frame;
+                var status = await server.DispatchAsync("GET", route, null);
+                if (status.StatusCode == 200 && status.Body != null
+                    && JsonNode.Parse(status.Body) is JsonObject json && json["inProgress"]?.GetValue<bool>() == false)
+                    return json;
                 await Task.Delay(250);
             }
-            return (false, lastCount);
+            return null;
         }
 
         [McpServerTool(Name = "scene_save", Title = "Save scene", Destructive = true, OpenWorld = false)]
