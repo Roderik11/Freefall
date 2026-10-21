@@ -63,18 +63,23 @@ namespace Freefall.Assets.Loaders
             }
         }
 
+        /// <summary>The navmesh's baked tiles: its hidden NavMeshData sub-asset, as LoadBakedData finds it.</summary>
+        public IEnumerable<ImplicitArtifact> GetImplicitDependencies(string guid)
+        {
+            if (FindBakedData(guid) is { } navSub)
+                yield return new ImplicitArtifact(navSub.Guid);
+        }
+
+        private static SubAssetEntry FindBakedData(string guid) =>
+            string.IsNullOrEmpty(guid) ? null
+                : AssetDatabase.GetMeta(guid)?.SubAssets.FirstOrDefault(s => s.Type == nameof(NavMeshData));
+
         /// <summary>
         /// Find the NavMeshData hidden subasset and load the baked bytes.
         /// </summary>
         private static void LoadBakedData(NavMesh navMesh, string guid)
         {
-            if (string.IsNullOrEmpty(guid)) return;
-
-            var meta = AssetDatabase.GetMeta(guid);
-            if (meta == null) return;
-
-            var navSub = meta.SubAssets.FirstOrDefault(
-                s => s.Type == nameof(NavMeshData));
+            var navSub = FindBakedData(guid);
             if (navSub == null) return;
 
             var cachePath = AssetDatabase.ResolveCachePathByGuid(navSub.Guid);

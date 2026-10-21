@@ -11,6 +11,12 @@ namespace Freefall.Assets
     {
         public string CacheExtension { get; }
 
+        /// <summary>
+        /// The packed data is YAML text that names other assets by GUID (scenes, prefabs, .asset files). The publish
+        /// scanner reads these artifacts for references; artifacts of other types name none.
+        /// </summary>
+        public bool HoldsReferences { get; set; }
+
         public AssetPackerAttribute(string cacheExtension)
         {
             CacheExtension = cacheExtension;

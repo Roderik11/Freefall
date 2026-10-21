@@ -36,17 +36,23 @@ namespace Freefall.Assets.Loaders
             clip.Name = name;
 
             // Resolve sibling Skeleton from the same source file
-            if (!string.IsNullOrEmpty(sourceGuid))
-            {
-                var skelEntry = AssetDatabase.FindSiblingSubAsset(sourceGuid, nameof(Skeleton));
-                if (skelEntry != null)
-                    clip.Skeleton = manager.LoadByGuid<Skeleton>(skelEntry.Guid);
-            }
+            if (FindSkeleton(sourceGuid) is { } skelEntry)
+                clip.Skeleton = manager.LoadByGuid<Skeleton>(skelEntry.Guid);
 
             ApplyClipConfig(clip, sourceGuid);
 
             return clip;
         }
+
+        /// <summary>The clip's skeleton: a sibling sub-asset of the same model file, as LoadFromCache finds it.</summary>
+        public IEnumerable<ImplicitArtifact> GetImplicitDependencies(string guid)
+        {
+            if (FindSkeleton(guid) is { } skelEntry)
+                yield return new ImplicitArtifact(skelEntry.Guid);
+        }
+
+        private static SubAssetEntry FindSkeleton(string clipGuid) =>
+            string.IsNullOrEmpty(clipGuid) ? null : AssetDatabase.FindSiblingSubAsset(clipGuid, nameof(Skeleton));
 
         /// <summary>
         /// Put on the clip what is marked on it in the settings of the file it comes from

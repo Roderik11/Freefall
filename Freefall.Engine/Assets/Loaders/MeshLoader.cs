@@ -108,11 +108,19 @@ namespace Freefall.Assets.Loaders
             return meshData;
         }
 
+        /// <summary>The mesh's skeleton: a sibling sub-asset of the same model file, as ResolveSkeleton finds it.</summary>
+        public IEnumerable<ImplicitArtifact> GetImplicitDependencies(string guid)
+        {
+            if (FindSkeleton(guid) is { } skelEntry)
+                yield return new ImplicitArtifact(skelEntry.Guid);
+        }
+
+        private static SubAssetEntry FindSkeleton(string meshGuid) =>
+            string.IsNullOrEmpty(meshGuid) ? null : AssetDatabase.FindSiblingSubAsset(meshGuid, nameof(Skeleton));
+
         private static void ResolveSkeleton(Mesh mesh, string meshGuid, AssetManager manager)
         {
-            if (string.IsNullOrEmpty(meshGuid)) return;
-
-            var skelEntry = AssetDatabase.FindSiblingSubAsset(meshGuid, nameof(Skeleton));
+            var skelEntry = FindSkeleton(meshGuid);
             if (skelEntry == null) return;
 
             var skeleton = manager.LoadByGuid<Skeleton>(skelEntry.Guid);

@@ -8,7 +8,7 @@ namespace Freefall.Assets.Packers
     /// Stores YAML bytes as a length-prefixed blob. Simple but consistent
     /// with the cache pipeline — game builds get the prefab in Library/.
     /// </summary>
-    [AssetPacker(".prefab")]
+    [AssetPacker(".prefab", HoldsReferences = true)]
     public class PrefabPacker : AssetPacker<PrefabData>
     {
         public override int Version => 1;

@@ -6,7 +6,7 @@ namespace Freefall.Assets.Packers
     /// <summary>
     /// Binary packer for SceneData: the YAML bytes as a length-prefixed blob.
     /// </summary>
-    [AssetPacker(".scene")]
+    [AssetPacker(".scene", HoldsReferences = true)]
     public class ScenePacker : AssetPacker<SceneData>
     {
         public override int Version => 1;

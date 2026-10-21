@@ -196,11 +196,7 @@ namespace Freefall.Assets.Loaders
 
             var cachePath = AssetDatabase.ResolveCachePathByGuid(guid);
             if (cachePath == null || !File.Exists(cachePath))
-            {
-                // Fallback: match SaveDdsSubasset's fallback path
-                var cacheDir = AssetDatabase.Project.CacheDirectory;
-                cachePath = Path.Combine(cacheDir, $"{guid}.dds");
-            }
+                cachePath = BakedMapFallbackPath(guid);
             if (!File.Exists(cachePath)) return null;
 
             try
@@ -402,16 +398,43 @@ namespace Freefall.Assets.Loaders
         {
             if (string.IsNullOrEmpty(guid) || pixels == null) return;
 
-            var cachePath = AssetDatabase.ResolveCachePathByGuid(guid);
-            if (cachePath == null)
-            {
-                // Create a cache path for this subasset
-                var cacheDir = AssetDatabase.Project.CacheDirectory;
-                cachePath = Path.Combine(cacheDir, $"{guid}.dds");
-            }
+            var cachePath = AssetDatabase.ResolveCachePathByGuid(guid) ?? BakedMapFallbackPath(guid);
 
             using var stream = File.Create(cachePath);
             _ddsPacker.Write(stream, new DdsTextureData(pixels));
+        }
+
+        /// <summary>
+        /// Where a baked map (heightmap, hole mask) lives: no meta lists these GUIDs, so the database does not
+        /// resolve them and they sit in the Cache root as {guid}.dds.
+        /// </summary>
+        private static string BakedMapFallbackPath(string guid) =>
+            Path.Combine(AssetDatabase.Project.CacheDirectory, $"{guid}.dds");
+
+        private static readonly System.Text.RegularExpressions.Regex BakedMapRef = new(
+            @"^\s*(?:BakedHeightmapRef|BakedHolesRef):\s*""?([0-9a-fA-F]{32})""?\s*$",
+            System.Text.RegularExpressions.RegexOptions.Multiline);
+
+        /// <summary>
+        /// The terrain's baked heightmap and hole mask (BakedHeightmapRef, BakedHolesRef), read from its YAML the way
+        /// LoadDdsBytes finds them: through the database, or the Cache-root file no meta lists.
+        /// </summary>
+        public IEnumerable<ImplicitArtifact> GetImplicitDependencies(string guid)
+        {
+            var cachePath = AssetDatabase.ResolveCachePathByGuid(guid);
+            if (cachePath == null || !File.Exists(cachePath)) yield break;
+
+            AssetDefinitionData defData;
+            using (var stream = File.OpenRead(cachePath))
+                defData = _packer.Read(stream);
+
+            foreach (System.Text.RegularExpressions.Match m in BakedMapRef.Matches(Encoding.UTF8.GetString(defData.YamlBytes)))
+            {
+                var mapGuid = m.Groups[1].Value;
+                yield return AssetDatabase.ResolveCachePathByGuid(mapGuid) != null
+                    ? new ImplicitArtifact(mapGuid)
+                    : new ImplicitArtifact(mapGuid, BakedMapFallbackPath(mapGuid), nameof(DdsTextureData));
+            }
         }
     }
 }

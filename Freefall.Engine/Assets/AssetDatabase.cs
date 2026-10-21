@@ -49,6 +49,9 @@ namespace Freefall.Assets
         // Artifact type name → cache file extension (discovered from AssetPackerAttribute)
         private static readonly Dictionary<string, string> _cacheExtensions = new(StringComparer.OrdinalIgnoreCase);
 
+        // Artifact type names whose data names other assets by GUID (AssetPackerAttribute.HoldsReferences)
+        private static readonly HashSet<string> _referenceHolders = new(StringComparer.OrdinalIgnoreCase);
+
         // ── Thumbnail tracking ──
         // GUID → thumbnail file path (absolute). Populated by ScanThumbnails().
         private static readonly ConcurrentDictionary<string, string> _guidToThumb = new(StringComparer.OrdinalIgnoreCase);
@@ -789,6 +792,33 @@ namespace Freefall.Assets
         }
 
         /// <summary>
+        /// The artifact a GUID loads, picked as <see cref="ResolveCachePathByGuid"/> picks it (a compound source's
+        /// first visible sub-asset): its own GUID, its data type (the packer's type name) and its cache path. Null
+        /// when the database does not know the GUID.
+        /// </summary>
+        public static (string Guid, string DataType, string CachePath)? ResolveArtifact(string guid)
+        {
+            if (string.IsNullOrEmpty(guid)) return null;
+
+            if (_sourceGuidCacheType.TryGetValue(guid, out var typeName))
+                return (guid, typeName, GetCachePath(guid, typeName));
+
+            var sourceGuid = _subAssetToSource.TryGetValue(guid, out var s) ? s : guid;
+            if (!_guidToMeta.TryGetValue(sourceGuid, out var meta)) return null;
+
+            lock (meta)
+            {
+                var sub = sourceGuid != guid
+                    ? meta.SubAssets.FirstOrDefault(x => x.Guid == guid)
+                    : meta.SubAssets.FirstOrDefault(x => !x.Hidden) ?? meta.SubAssets.FirstOrDefault();
+                return sub == null ? null : (sub.Guid, sub.Type, GetCachePath(sub.Guid, sub.Type));
+            }
+        }
+
+        /// <summary>Whether artifacts of this data type name other assets by GUID (AssetPackerAttribute.HoldsReferences).</summary>
+        public static bool HoldsReferences(string dataType) => dataType != null && _referenceHolders.Contains(dataType);
+
+        /// <summary>
         /// Compute the cache file path for a subasset: Cache/{guid[..2]}/{guid}{ext}
         /// </summary>
         private static string GetCachePath(string guid, string typeName)
@@ -1006,6 +1036,7 @@ namespace Freefall.Assets
             _importersByExtension.Clear();
             _importerPriority.Clear();
             _packers.Clear();
+            _referenceHolders.Clear();
             _guidToThumb.Clear();
             _thumbTextures.Clear();
             _reimportedGuids.Clear();
@@ -1079,6 +1110,7 @@ namespace Freefall.Assets
                         var instance = Activator.CreateInstance(type);
                         _packers[packedType.Name] = instance;
                         _cacheExtensions[packedType.Name] = attr.CacheExtension;
+                        if (attr.HoldsReferences) _referenceHolders.Add(packedType.Name);
                     }
                 }
                 catch (ReflectionTypeLoadException) { }

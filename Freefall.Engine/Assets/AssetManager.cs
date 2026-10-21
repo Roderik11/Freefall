@@ -75,6 +75,22 @@ namespace Freefall.Assets
         /// Find a cached asset by GUID, searching across all type prefixes.
         /// Returns null if not found in the in-memory cache.
         /// </summary>
+        /// <summary>
+        /// The GUIDs of everything loaded by GUID so far, engine assets included: what the publish scan's
+        /// compareLoaded check holds against what it reached, to find assets code loads without a reference.
+        /// </summary>
+        public List<string> LoadedGuids()
+        {
+            const string guidMarker = ":guid:";
+            var guids = new List<string>();
+            foreach (var key in _assets.Keys)
+            {
+                int i = key.IndexOf(guidMarker, StringComparison.Ordinal);
+                if (i >= 0) guids.Add(key[(i + guidMarker.Length)..]);
+            }
+            return guids;
+        }
+
         public Asset FindByGuid(string guid)
         {
             if (string.IsNullOrEmpty(guid)) return null;
@@ -259,7 +275,7 @@ namespace Freefall.Assets
         /// <summary>
         /// Find a loader for the given type, walking up the inheritance chain.
         /// </summary>
-        private static IAssetLoader FindLoader(Type assetType)
+        public static IAssetLoader FindLoader(Type assetType)
         {
             var type = assetType;
             while (type != null && type != typeof(object))

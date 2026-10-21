@@ -58,5 +58,20 @@ namespace Freefall.Assets
         /// Default: no-op. Override for types with runtime data (e.g. Terrain DeltaMaps).
         /// </summary>
         void Save(Asset asset, string savePath) { }
+
+        /// <summary>
+        /// Artifacts loading the artifact <paramref name="guid"/> also reads that its data does not name by a GUID the
+        /// asset database knows: a sibling sub-asset found through the meta (a mesh's or clip's skeleton, a navmesh's
+        /// baked tiles), or a cache file no meta lists (a terrain's baked maps). The publish scanner packs them with
+        /// the asset, so this sits next to the code that follows the same link.
+        /// </summary>
+        IEnumerable<ImplicitArtifact> GetImplicitDependencies(string guid) => Array.Empty<ImplicitArtifact>();
     }
+
+    /// <summary>
+    /// An artifact a loader reads besides the one it was asked for (<see cref="IAssetLoader.GetImplicitDependencies"/>).
+    /// <paramref name="CachePath"/> and <paramref name="DataType"/> are given only for a cache file no meta lists;
+    /// otherwise the GUID resolves through the asset database.
+    /// </summary>
+    public readonly record struct ImplicitArtifact(string Guid, string CachePath = null, string DataType = null);
 }

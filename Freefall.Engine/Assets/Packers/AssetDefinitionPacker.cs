@@ -26,7 +26,7 @@ namespace Freefall.Assets.Packers
     /// <summary>
     /// Caches .asset definitions as UTF-8 YAML bytes with a version header.
     /// </summary>
-    [AssetPacker(".asset")]
+    [AssetPacker(".asset", HoldsReferences = true)]
     public class AssetDefinitionPacker : AssetPacker<AssetDefinitionData>
     {
         public override int Version => 2; // Bumped: JSON → YAML
