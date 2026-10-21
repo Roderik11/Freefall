@@ -30,8 +30,8 @@ namespace Freefall.Editor.Publishing
         public float TexelDensityTarget = 512;
 
         /// <summary>The scan's textures against <see cref="TextureBudget"/>, or null when it is 0. Worker-safe.</summary>
-        public TextureBudgetResult? MeasureTextures(BuildScan scan) =>
-            TextureBudget > 0 ? TextureBudgetScan.Measure(scan, TextureBudget, TexelDensityTarget) : null;
+        public TextureBudgetResult? MeasureTextures(BuildScan scan, Action<string, float>? report = null) =>
+            TextureBudget > 0 ? TextureBudgetScan.Measure(scan, TextureBudget, TexelDensityTarget, report) : null;
 
         /// <summary>The profile with this GUID, or at this path relative to Assets; null if there is none.</summary>
         public static BuildProfile? Find(string key)
@@ -65,20 +65,11 @@ namespace Freefall.Editor.Publishing
         public static string ReportPathFor(string output) => output.TrimEnd('\\', '/') + ".report.txt";
 
         [Button]
-        [Description("Walk the references from the scenes and write the build report next to the output folder. Nothing is published")]
+        [Description("Walk the references from the scenes, measure the textures against the budget and write the build report next to the output folder (on workers, with a progress popup). Nothing is published")]
         public void Scan()
         {
-            var scan = DependencyScanner.Scan(this);
-            scan.Textures = MeasureTextures(scan);
-            scan.WriteReport(ReportPath);
-
-            var over = scan.Textures?.Over;
-            var summary = $"[Build] {Name}: {scan.Artifacts.Count:N0} assets, {BuildScan.Size(scan.TotalBytes)}, " +
-                          $"{scan.Warnings.Count} warnings, {scan.Elapsed.TotalSeconds:0.0} s" +
-                          (over != null ? $"; {over.Count} textures over {TextureBudget} px ({BuildScan.Size(over.Sum(t => t.Artifact.Size))})" : "") +
-                          $". Report: {ReportPath}";
-            Debug.LogAlways(summary);
-            Toast.Show($"{scan.Artifacts.Count:N0} assets, {BuildScan.Size(scan.TotalBytes)}: report written", 3f);
+            try { BuildScanJob.Start(this); }
+            catch (InvalidOperationException ex) { ModalDialogs.ShowMessage(Program.EditorUI, $"Could not scan {Name}", ex.Message, ("OK", null)); }
         }
 
         [Button]

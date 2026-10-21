@@ -56,16 +56,6 @@ namespace Freefall.Editor.Publishing
     {
         public const string MarkerFile = ".freefall-build";
 
-        /// <summary>Where a publish stands; a new instance per change, so readers on any thread see a consistent one.</summary>
-        public sealed record Status(
-            string Profile,
-            string Product,
-            int StepIndex,
-            int StepCount,
-            string Step,
-            string Detail,
-            float Fraction,       // the whole publish, 0..1
-            double Seconds);
 
         const string Checking = "Checking and scanning", Scripts = "Compiling scripts", Player = "Building the player",
                      Copying = "Copying the player", Packs = "Writing packs", Verifying = "Verifying packs";
@@ -78,18 +68,10 @@ namespace Freefall.Editor.Publishing
         };
         const double WriteBytesPerSecond = 200e6, VerifyBytesPerSecond = 370e6;
 
-        static volatile Status? _status;
         static Task<PublishResult> _completion = Task.FromResult(new PublishResult());
-        static string[] _steps = [];
-        static double[] _weights = [];
-        static int _stepIndex;
-        static Stopwatch _clock = new();
 
         /// <summary>True from Start until the publish is written (or failed).</summary>
-        public static bool IsPublishing => _status != null;
-
-        /// <summary>The publish in progress, or null.</summary>
-        public static Status? Current => _status;
+        public static bool IsPublishing => !_completion.IsCompleted;
 
         /// <summary>The latest publish (faulted with the reason when it failed). Already completed when none was started.</summary>
         public static Task<PublishResult> Completion => _completion;
@@ -125,7 +107,7 @@ namespace Freefall.Editor.Publishing
         /// </summary>
         public static Task<PublishResult> Start(BuildProfile profile, PublishOptions options)
         {
-            if (IsPublishing) throw new InvalidOperationException("A publish is running already");
+            if (ProgressJob.Running is { } running) throw new InvalidOperationException($"Wait for it to finish: {running.Title} is running");
             if (!Program.IsProjectOpen || Engine.Project == null) throw new InvalidOperationException("No project is open");
             if (profile.Scenes.All(s => s == null)) throw new InvalidOperationException($"The profile {profile.Name} has no scenes");
             var playerProject = PlayerBuild.FindProject() ?? throw new InvalidOperationException(
@@ -136,31 +118,23 @@ namespace Freefall.Editor.Publishing
             CheckOutputFolder(output, Engine.Project.RootDirectory);
             var steps = new List<string> { Checking, Scripts, Player, Copying, Packs };
             if (options.Verify) steps.Add(Verifying);
-            _steps = steps.ToArray();
-            _weights = _steps.Select(s => Weights[s]).ToArray();
-            _stepIndex = 0;
-            _clock = Stopwatch.StartNew();
-            _status = new Status(profile.Name, product, 0, _steps.Length, _steps[0], "", 0f, 0);
-
-            var desktop = Program.EditorUI;
-            var popup = ModalDialogs.ShowProgress(desktop, () => _status is { } s
-                ? new ModalDialogs.Progress($"Publishing {s.Product}", $"{s.Step}   ({s.StepIndex + 1}/{s.StepCount})", s.Detail, s.Fraction)
-                : null);
-
-            _completion = Task.Run(() => RunAsync(profile, options, output, playerProject, desktop, popup));
+            var progress = ProgressJob.Start($"Publishing {product}", "Publish", steps.Select(s => (s, Weights[s])).ToArray());
+            _completion = Task.Run(() => RunAsync(profile, options, output, playerProject, progress));
             return _completion;
         }
 
-        static async Task<PublishResult> RunAsync(BuildProfile profile, PublishOptions options, string output, string playerProject,
-                                                  Desktop desktop, Window popup)
+        static async Task<PublishResult> RunAsync(BuildProfile profile, PublishOptions options, string output, string playerProject, ProgressJob progress)
         {
             var result = new PublishResult { Product = profile.ResolvedProductName, Output = output, Report = BuildProfile.ReportPathFor(output) };
+            void Report(string detail, float fraction) => progress.Report(detail, fraction);
+            void SetWeight(string step, double weight) => progress.SetWeight(step, weight);
+            Task Step(string name, Func<Task> work) => progress.Step(name, work);
             try
             {
                 // ── The scan (worker; the database's lookups are concurrent), what is unsaved (main thread), the metas ──
                 PackJob job = null!;
                 string assets = "", staging = "";
-                await Step(Checking, result, async () =>
+                await Step(Checking, async () =>
                 {
                     Report("Following the references from the scenes", 0f);
                     var scan = await Task.Run(() => DependencyScanner.Scan(profile));
@@ -199,6 +173,7 @@ namespace Freefall.Editor.Publishing
 
                         scan.Textures = profile.MeasureTextures(scan);
                         scan.WriteReport(result.Report, published: true);
+                        BuildScanJob.Store(profile, scan);
                         result.Warnings.AddRange(scan.Warnings);
                         job = PackBuilder.Prepare(profile, scan);
 
@@ -209,7 +184,7 @@ namespace Freefall.Editor.Publishing
                 });
 
                 // ── Workers ──
-                await Step(Scripts, result, () => Task.Run(() =>
+                await Step(Scripts, () => Task.Run(() =>
                 {
                     Report($"Clearing {output}", 0f);
                     ClearOutputFolder(output);
@@ -224,15 +199,15 @@ namespace Freefall.Editor.Publishing
                 }));
 
                 string publish = "";
-                await Step(Player, result, () => Task.Run(() => publish = PlayerBuild.Build(playerProject, staging, Report)));
+                await Step(Player, () => Task.Run(() => publish = PlayerBuild.Build(playerProject, staging, Report)));
 
-                await Step(Copying, result, () => Task.Run(() =>
+                await Step(Copying, () => Task.Run(() =>
                 {
                     result.Exe = Path.Combine(output, ExeName(result.Product));
                     (result.PlayerFiles, result.PlayerBytes) = PlayerBuild.Copy(publish, output, Path.GetFileName(result.Exe), Report);
                 }));
 
-                await Step(Packs, result, () => Task.Run(() =>
+                await Step(Packs, () => Task.Run(() =>
                 {
                     var data = Path.Combine(output, PackBuilder.DataFolderName);
                     result.Packs = PackBuilder.Write(data, job, (detail, f) => Report(detail, 0.98f * f));
@@ -242,39 +217,29 @@ namespace Freefall.Editor.Publishing
                 }));
 
                 if (options.Verify)
-                    await Step(Verifying, result, () => Task.Run(() =>
+                    await Step(Verifying, () => Task.Run(() =>
                     {
                         int before = result.Packs.Problems.Count;
                         PackBuilder.Verify(job, result.Packs, Report);
                         result.Warnings.AddRange(result.Packs.Problems.Skip(before));
                     }));
 
-                result.Elapsed = _clock.Elapsed;
+                result.Elapsed = progress.Elapsed;
+                result.Steps = progress.StepTimes;
                 File.AppendAllText(result.Report, Summary(result));
                 Debug.LogAlways($"[Publish] {result.Product}: {BuildScan.Size(result.Packs.Bytes)} in {result.Packs.Packs.Count} packs, " +
                                 $"player {BuildScan.Size(result.PlayerBytes)}, {result.Warnings.Count} warnings, " +
                                 $"{result.Elapsed.TotalSeconds:0} s ({string.Join(", ", result.Steps.Select(s => $"{s.Step} {s.Seconds:0.0} s"))}): {result.Exe}");
 
-                await Engine.RunOnMainThreadAsync(() =>
-                {
-                    _status = null;
-                    popup.Close();
-                    Toast.Show($"Published {result.Product}", 4f);
-                });
+                await progress.Finish($"Published {result.Product}");
                 if (options.Run)
                     Process.Start(new ProcessStartInfo(result.Exe) { WorkingDirectory = output, UseShellExecute = true });
                 return result;
             }
             catch (Exception ex)
             {
-                var error = ex is AggregateException agg ? agg.Flatten().InnerException ?? ex : ex;
-                Debug.LogWarning("Publish", $"{result.Product}: {error}");
-                await Engine.RunOnMainThreadAsync(() =>
-                {
-                    _status = null;
-                    popup.Close();
-                    ModalDialogs.ShowMessage(desktop, $"Could not publish {result.Product}", error.Message, ("OK", null));
-                });
+                var error = ProgressJob.Unwrap(ex);
+                await progress.Fail($"Could not publish {result.Product}", error);
                 throw error;
             }
         }
@@ -356,54 +321,6 @@ namespace Freefall.Editor.Publishing
                 sb.AppendLine("    " + p);
             if (r.Packs.Problems.Count == 0) sb.AppendLine("    none");
             return sb.ToString();
-        }
-
-        // ── Steps and progress ──
-
-        static async Task Step(string name, PublishResult result, Func<Task> work)
-        {
-            _stepIndex = Array.IndexOf(_steps, name);
-            Publish(name, "", 0f);
-            var watch = Stopwatch.StartNew();
-            await work();
-            result.Steps.Add((name, watch.Elapsed.TotalSeconds));
-            Debug.LogAlways($"[Publish] {name}: {watch.Elapsed.TotalSeconds:0.0} s");
-        }
-
-        /// <summary>Progress within the current step (any thread): what it is doing, the share of the step done.</summary>
-        static void Report(string detail, float fraction)
-        {
-            var status = _status;
-            if (status != null) Publish(status.Step, detail, fraction);
-        }
-
-        static void SetWeight(string step, double weight)
-        {
-            int i = Array.IndexOf(_steps, step);
-            if (i >= 0) _weights[i] = weight;
-        }
-
-        static void Publish(string step, string detail, float stepFraction)
-        {
-            var status = _status;
-            if (status == null) return;
-
-            double total = 0, done = 0;
-            for (int i = 0; i < _weights.Length; i++)
-            {
-                total += _weights[i];
-                if (i < _stepIndex) done += _weights[i];
-            }
-            done += _weights[_stepIndex] * Math.Clamp(stepFraction, 0f, 1f);
-
-            _status = status with
-            {
-                StepIndex = _stepIndex,
-                Step = step,
-                Detail = detail ?? "",
-                Fraction = total > 0 ? (float)(done / total) : 0f,
-                Seconds = _clock.Elapsed.TotalSeconds,
-            };
         }
     }
 }

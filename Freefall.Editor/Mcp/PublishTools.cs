@@ -20,13 +20,36 @@ namespace Freefall.Editor.Mcp
                      "AlwaysPublish folder) all the way down, and writes the build report next to the profile's output folder " +
                      "(every asset with its size and the chain that reached it). Returns the totals by root, type and folder, the textures over " +
                      "the profile's TextureBudget (what capping them would save, the ones that would show coarsest), and the " +
-                     "first warnings (unknown GUIDs, assets not imported). Nothing is published.")]
-        public static Task<CallToolResult> Scan(
+                     "first warnings (unknown GUIDs, assets not imported). Nothing is published. Runs on workers with the editor's progress " +
+                     "popup, as the profile's Scan button does; the profile inspector's texture list shows the result.")]
+        public static async Task<CallToolResult> Scan(
             [Description("The BuildProfile asset's GUID, or its path relative to Assets")] string profile,
             [Description("Also list the assets this editor has loaded that the scan did not reach. With the profile's scenes open " +
                          "(and played), that is what code loads by name or by a GUID written in it; the editor loads a few things " +
-                         "for itself too (a selected asset, an open graph)")] bool compareLoaded = false)
-            => McpBridge.Post("/api/publish/scan", new { profile, compareLoaded });
+                         "for itself too (a selected asset, an open graph)")] bool compareLoaded = false,
+            [Description("Max seconds to wait")] int waitSeconds = 120)
+        {
+            BuildProfile? found = null;
+            Task<BuildScan> task;
+            try
+            {
+                task = await EditorCommandServer.Instance.RunOnMainThread(() =>
+                {
+                    found = BuildProfile.Find(profile) ?? throw new InvalidOperationException($"No BuildProfile asset at {profile}");
+                    return BuildScanJob.Start(found, compareLoaded);
+                });
+            }
+            catch (Exception ex)
+            {
+                return McpBridge.Error(ex.GetBaseException().Message);
+            }
+
+            if (await Task.WhenAny(task, Task.Delay(TimeSpan.FromSeconds(waitSeconds))) != task)
+                return McpBridge.Error($"Still scanning after {waitSeconds} s; editor_status reports it");
+            if (task.IsFaulted)
+                return McpBridge.Error("The scan failed: " + task.Exception!.GetBaseException().Message);
+            return EditorTools.Text(System.Text.Json.JsonSerializer.SerializeToNode(Commands.PublishScanCommand.Summary(found!, task.Result))!);
+        }
 
         [McpServerTool(Name = "game_publish", Title = "Publish a build profile's game", OpenWorld = false)]
         [Description("Write a BuildProfile's game into its output folder (or 'output'), ready to run, as the profile's Publish button does: " +
@@ -60,7 +83,7 @@ namespace Freefall.Editor.Mcp
 
             if (await Task.WhenAny(task, Task.Delay(TimeSpan.FromSeconds(waitSeconds))) != task)
             {
-                var s = Publisher.Current;
+                var s = ProgressJob.Running?.Current;
                 return McpBridge.Error($"Still publishing after {waitSeconds} s" + (s != null ? $" (step: {s.Step}, {s.Fraction:P0})" : "") +
                                        "; editor_status reports it");
             }
@@ -95,6 +118,48 @@ namespace Freefall.Editor.Mcp
             });
         }
 
+        [McpServerTool(Name = "texture_caps", Title = "Cap or uncap a profile's textures", OpenWorld = false)]
+        [Description("Set Max Size on textures from a BuildProfile's latest scan (Scan or publish_scan first), as the profile " +
+                     "inspector's Cap and Uncap buttons do. cap=true takes the textures under 'paths' (folders or files relative " +
+                     "to Assets) that are over the profile's TextureBudget and caps them at it; cap=false takes the capped ones " +
+                     "back to their source size. They reimport side by side, then the profile is scanned again, with the editor's " +
+                     "progress popup. The source files are not touched.")]
+        public static async Task<CallToolResult> TextureCaps(
+            [Description("The BuildProfile asset's GUID, or its path relative to Assets")] string profile,
+            [Description("Folders or files relative to Assets, e.g. ['Characters\\\\Paladin']")] string[] paths,
+            [Description("true = cap at the profile's TextureBudget, false = uncap")] bool cap = true,
+            [Description("Max seconds to wait")] int waitSeconds = 900)
+        {
+            Task<int> task;
+            int count = 0;
+            try
+            {
+                task = await EditorCommandServer.Instance.RunOnMainThread(() =>
+                {
+                    var p = BuildProfile.Find(profile) ?? throw new InvalidOperationException($"No BuildProfile asset at {profile}");
+                    var rows = BuildScanJob.Latest(p)?.Textures?.Rows
+                        ?? throw new InvalidOperationException("The profile has no scan in this editor yet: publish_scan first");
+                    var wanted = paths.Select(x => x.Trim().TrimEnd('\\', '/').Replace('/', '\\')).Where(x => x.Length > 0).ToList();
+                    var picked = rows.Where(t => wanted.Any(w => t.Artifact.SourcePath.Equals(w, StringComparison.OrdinalIgnoreCase)
+                                                             || t.Artifact.SourcePath.StartsWith(w + "\\", StringComparison.OrdinalIgnoreCase)))
+                                     .Where(t => cap ? t.OverBudget(p.TextureBudget) && !t.Capped : t.Capped)
+                                     .Select(t => t.Artifact.Guid).ToList();
+                    count = picked.Count;
+                    if (count == 0) return Task.FromResult(0);
+                    return Publishing.TextureCaps.Start(p, picked, cap ? p.TextureBudget : 0);
+                });
+            }
+            catch (Exception ex)
+            {
+                return McpBridge.Error(ex.GetBaseException().Message);
+            }
+
+            if (await Task.WhenAny(task, Task.Delay(TimeSpan.FromSeconds(waitSeconds))) != task)
+                return McpBridge.Error($"Still working after {waitSeconds} s; editor_status reports it");
+            if (task.IsFaulted)
+                return McpBridge.Error("Failed: " + task.Exception!.GetBaseException().Message);
+            return EditorTools.Text(new JsonObject { ["matched"] = count, ["changed"] = task.Result, ["capped"] = cap });
+        }
         [McpServerTool(Name = "publish_mount", Title = "Mount a profile's packs over the Cache", OpenWorld = false)]
         [Description("Test packs in the editor: mount=true makes every artifact load from a BuildProfile's packs (Data/ in its output folder) " +
                      "before the Cache folder, mount=false goes back to the folder alone. Only what loads after mounting comes from the packs, " +

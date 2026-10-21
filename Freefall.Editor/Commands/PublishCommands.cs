@@ -6,7 +6,8 @@ using Freefall.Editor.Publishing;
 namespace Freefall.Editor.Commands
 {
     /// <summary>
-    /// Scan a build profile: what a published game would pack, written to its build report.
+    /// Scan a build profile: what a published game would pack, written to its build report. Runs in the call on the
+    /// main thread; MCP publish_scan runs the same as a job with the progress popup (BuildScanJob).
     /// POST /api/publish/scan
     /// Body: {"profile": "&lt;BuildProfile GUID, or its path relative to Assets&gt;", "compareLoaded": false}
     /// </summary>
@@ -34,54 +35,63 @@ namespace Freefall.Editor.Commands
             try
             {
                 var scan = DependencyScanner.Scan(profile);
-                var missed = scan.LoadedNotReached = compareLoaded ? DependencyScanner.LoadedNotReached(scan) : null;
-                var textures = scan.Textures = profile.MeasureTextures(scan);
-                var over = textures?.Over;
+                if (compareLoaded) scan.LoadedNotReached = DependencyScanner.LoadedNotReached(scan);
+                scan.Textures = profile.MeasureTextures(scan);
                 scan.WriteReport(profile.ReportPath);
-
-                return CommandResult.Json(new
-                {
-                    status = "scanned",
-                    profile = profile.Name,
-                    product = profile.ResolvedProductName,
-                    scenes = scan.Scenes.Select(s => new { name = s.Name, guid = s.Guid, inList = s.Root != null }).ToArray(),
-                    assets = scan.Artifacts.Count,
-                    size = BuildScan.Size(scan.TotalBytes),
-                    bytes = scan.TotalBytes,
-                    byRoot = scan.ByRoot().Select(r => new { root = r.Root, assets = r.Count, size = BuildScan.Size(r.Bytes) }).ToArray(),
-                    byType = scan.ByType().Select(t => new { type = t.Type, assets = t.Count, size = BuildScan.Size(t.Bytes) }).ToArray(),
-                    largestFolders = scan.ByFolder().Take(12).Select(f => new { folder = f.Folder, assets = f.Count, size = BuildScan.Size(f.Bytes) }).ToArray(),
-                    warningCount = scan.Warnings.Count,
-                    warnings = scan.Warnings.Take(15).ToArray(),
-                    report = profile.ReportPath,
-                    seconds = Math.Round(scan.Elapsed.TotalSeconds, 2),
-                    textures = textures == null ? null : new
-                    {
-                        budget = textures.Budget,
-                        target = textures.Target,
-                        overBudget = over!.Count,
-                        sizeNow = BuildScan.Size(over.Sum(t => t.Artifact.Size)),
-                        sizeCapped = BuildScan.Size(over.Sum(t => t.CappedBytes)),
-                        belowTarget = over.Count(textures.BelowTarget),
-                        noUseFound = over.Count(t => double.IsNaN(t.Coarsest)),
-                        seconds = Math.Round(textures.Elapsed.TotalSeconds, 2),
-                        coarsest = over.Where(t => !double.IsNaN(t.CoarsestAtBudget)).OrderBy(t => t.CoarsestAtBudget).Take(15).Select(t => new
-                        {
-                            path = t.Artifact.SourcePath, size = $"{t.Width}x{t.Height} {t.Format}",
-                            pxPerMetre = Math.Round(t.Coarsest), atBudget = Math.Round(t.CoarsestAtBudget), where = t.CoarsestUse,
-                        }).ToArray(),
-                    },
-                    loadedNotReachedCount = missed?.Count,
-                    loadedNotReachedByFolder = missed?.GroupBy(m => BuildScan.FolderOf(m.SourcePath))
-                        .Select(g => new { folder = g.Key, assets = g.Count() }).ToArray(),
-                    loadedNotReached = missed?.Take(50)
-                        .Select(m => new { guid = m.Guid, name = m.Name, type = m.Type, path = m.SourcePath }).ToArray(),
-                });
+                BuildScanJob.Store(profile, scan);
+                return CommandResult.Json(Summary(profile, scan));
             }
             catch (Exception ex)
             {
                 return CommandResult.Error(500, $"Scan failed: {ex.Message}");
             }
+        }
+
+        /// <summary>What a scan found, for REST and MCP: totals, warnings, the textures against the budget, what is loaded but not reached.</summary>
+        internal static object Summary(BuildProfile profile, BuildScan scan)
+        {
+            var missed = scan.LoadedNotReached;
+            var textures = scan.Textures;
+            var over = textures?.Over;
+            return new
+            {
+                status = "scanned",
+                profile = profile.Name,
+                product = profile.ResolvedProductName,
+                scenes = scan.Scenes.Select(s => new { name = s.Name, guid = s.Guid, inList = s.Root != null }).ToArray(),
+                assets = scan.Artifacts.Count,
+                size = BuildScan.Size(scan.TotalBytes),
+                bytes = scan.TotalBytes,
+                byRoot = scan.ByRoot().Select(r => new { root = r.Root, assets = r.Count, size = BuildScan.Size(r.Bytes) }).ToArray(),
+                byType = scan.ByType().Select(t => new { type = t.Type, assets = t.Count, size = BuildScan.Size(t.Bytes) }).ToArray(),
+                largestFolders = scan.ByFolder().Take(12).Select(f => new { folder = f.Folder, assets = f.Count, size = BuildScan.Size(f.Bytes) }).ToArray(),
+                warningCount = scan.Warnings.Count,
+                warnings = scan.Warnings.Take(15).ToArray(),
+                report = profile.ReportPath,
+                seconds = Math.Round(scan.Elapsed.TotalSeconds, 2),
+                textures = textures == null ? null : new
+                {
+                    budget = textures.Budget,
+                    target = textures.Target,
+                    overBudget = over!.Count,
+                    sizeNow = BuildScan.Size(over.Sum(t => t.Artifact.Size)),
+                    sizeCapped = BuildScan.Size(over.Sum(t => t.CappedBytes)),
+                    belowTarget = over.Count(textures.BelowTarget),
+                    noUseFound = over.Count(t => double.IsNaN(t.Coarsest)),
+                    capped = textures.Textures.Count(t => t.Capped),
+                    seconds = Math.Round(textures.Elapsed.TotalSeconds, 2),
+                    coarsest = over.Where(t => !double.IsNaN(t.CoarsestAtBudget)).OrderBy(t => t.CoarsestAtBudget).Take(15).Select(t => new
+                    {
+                        path = t.Artifact.SourcePath, size = $"{t.Width}x{t.Height} {t.Format}",
+                        pxPerMetre = Math.Round(t.Coarsest), atBudget = Math.Round(t.CoarsestAtBudget), where = t.CoarsestUse,
+                    }).ToArray(),
+                },
+                loadedNotReachedCount = missed?.Count,
+                loadedNotReachedByFolder = missed?.GroupBy(m => BuildScan.FolderOf(m.SourcePath))
+                    .Select(g => new { folder = g.Key, assets = g.Count() }).ToArray(),
+                loadedNotReached = missed?.Take(50)
+                    .Select(m => new { guid = m.Guid, name = m.Name, type = m.Type, path = m.SourcePath }).ToArray(),
+            };
         }
     }
 }

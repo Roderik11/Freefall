@@ -249,6 +249,47 @@ namespace Freefall.Assets
         }
 
         /// <summary>
+        /// Import these assets (source GUIDs, or a sub-asset's) on workers, side by side as ImportAllAsync does, changed
+        /// or not: after their import settings changed (the texture caps of the editor's build profile). Loaded assets
+        /// update in place on the main thread afterwards (ReloadReimported). Reports each file and the share done.
+        /// Returns how many failed.
+        /// </summary>
+        public static System.Threading.Tasks.Task<int> ImportAssetsAsync(IEnumerable<string> guids, Action<string, float> progress = null)
+        {
+            var metas = guids
+                .Select(g => _subAssetToSource.TryGetValue(g, out var source) ? source : g)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .Select(g => _guidToMeta.TryGetValue(g, out var meta) ? meta : null)
+                .Where(m => m != null)
+                .OrderBy(m => GetImportPriority(m))
+                .ToList();
+
+            return System.Threading.Tasks.Task.Run(() =>
+            {
+                int done = 0, failed = 0;
+                var options = new System.Threading.Tasks.ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount };
+                foreach (var group in metas.GroupBy(m => GetImportPriority(m)).OrderBy(g => g.Key))
+                {
+                    System.Threading.Tasks.Parallel.ForEach(group, options, meta =>
+                    {
+                        try
+                        {
+                            if (!ImportAsset(meta)) System.Threading.Interlocked.Increment(ref failed);
+                        }
+                        catch (Exception ex)
+                        {
+                            Debug.LogWarning("AssetDatabase", $"Unhandled import error: {meta.SourcePath} — {ex.Message}");
+                            System.Threading.Interlocked.Increment(ref failed);
+                        }
+                        int current = System.Threading.Interlocked.Increment(ref done);
+                        progress?.Invoke($"[{current}/{metas.Count}] {meta.SourcePath}", current / (float)Math.Max(1, metas.Count));
+                    });
+                }
+                return failed;
+            });
+        }
+
+        /// <summary>
         /// Import a single asset by its relative source path.
         /// </summary>
         public static void ImportAssetByPath(string relativePath)

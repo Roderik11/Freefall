@@ -23,8 +23,13 @@ namespace Freefall.Editor.Publishing
         /// <summary>That use: "Rock_Chunk_1A1 › Rock_Chunk_1A1 part 0 (Albedo, scale 2.5)".</summary>
         public string CoarsestUse = "";
         public int Uses;
+        /// <summary>The texture importer's Max Size (0 = the source's): a capped texture's artifact is already the smaller one.</summary>
+        public int MaxSize;
 
         public bool OverBudget(int budget) => budget > 0 && Math.Max(Width, Height) > budget;
+        public bool Capped => MaxSize > 0;
+        /// <summary>What capping it would save (0 when it is within the budget).</summary>
+        public long Saving => Math.Max(0, Artifact.Size - CappedBytes);
     }
 
     /// <summary>What <see cref="TextureBudgetScan.Measure"/> found.</summary>
@@ -36,6 +41,10 @@ namespace Freefall.Editor.Publishing
         public TimeSpan Elapsed;
 
         public List<BudgetTexture> Over => Textures.Where(t => t.OverBudget(Budget)).OrderByDescending(t => t.Artifact.Size).ToList();
+
+        /// <summary>The textures a list of the budget shows: those over it, then those capped already (by their Max Size), biggest saving first.</summary>
+        public List<BudgetTexture> Rows => Textures.Where(t => t.OverBudget(Budget) || t.Capped)
+            .OrderByDescending(t => t.Saving).ThenByDescending(t => t.Artifact.Size).ToList();
         public bool BelowTarget(BudgetTexture t) => !double.IsNaN(t.CoarsestAtBudget) && t.CoarsestAtBudget < Target;
 
         public void WriteTo(StringBuilder sb)
@@ -103,7 +112,7 @@ namespace Freefall.Editor.Publishing
         }
 
         /// <summary>Worker-safe: reads Cache files and the database's lookups (concurrent).</summary>
-        public static TextureBudgetResult Measure(BuildScan scan, int budget, float target)
+        public static TextureBudgetResult Measure(BuildScan scan, int budget, float target, Action<string, float>? report = null)
         {
             var watch = Stopwatch.StartNew();
             var result = new TextureBudgetResult { Budget = budget, Target = target };
@@ -115,6 +124,7 @@ namespace Freefall.Editor.Publishing
             {
                 var t = ReadHeader(a, budget);
                 if (t == null) continue;
+                if (AssetDatabase.GetImporter(a.Guid) is Freefall.Assets.Importers.TextureImporter importer) t.MaxSize = importer.MaxSize;
                 textures[a.Guid] = t;
                 result.Textures.Add(t);
             }
@@ -160,11 +170,15 @@ namespace Freefall.Editor.Publishing
             }
 
             // ── Meshes: surface and UV area per LOD0 part ──
+            report?.Invoke("Mesh surfaces and UV areas", 0.4f);
             var meshPacker = new MeshPacker();
             var areas = new Dictionary<string, (int Slot, double Uv, double Surface, string Name)[]>(StringComparer.OrdinalIgnoreCase);
-            foreach (var mesh in uses.Select(u => u.Mesh).Distinct(StringComparer.OrdinalIgnoreCase))
+            var meshes = uses.Select(u => u.Mesh).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+            for (int m = 0; m < meshes.Count; m++)
             {
+                var mesh = meshes[m];
                 if (!byGuid.TryGetValue(mesh, out var art) || art.DataType != nameof(MeshData) || !File.Exists(art.CachePath)) continue;
+                if (m % 16 == 0) report?.Invoke($"Mesh {m + 1}/{meshes.Count}: {art.Name}", 0.4f + 0.55f * m / meshes.Count);
                 try
                 {
                     using var stream = File.OpenRead(art.CachePath);

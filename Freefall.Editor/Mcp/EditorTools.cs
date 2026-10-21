@@ -16,7 +16,7 @@ namespace Freefall.Editor.Mcp
         [McpServerTool(Name = "editor_status", Title = "Editor status", ReadOnly = true, OpenWorld = false)]
         [Description("Whether a project is open, which project and scene, plus fps/entity count. Call this first to check the editor is reachable and ready. " +
                      "While a project is opening, 'opening' says which step it is on and how far along it is (projectOpen is false until it is done); " +
-                     "while a game is publishing, 'publishing' does the same.")]
+                     "while a job with the progress popup runs (Publish, a build profile's Scan, texture caps), 'job' does the same.")]
         public static async Task<CallToolResult> Status()
         {
             var server = EditorCommandServer.Instance;
@@ -36,8 +36,8 @@ namespace Freefall.Editor.Mcp
 
             if (ProjectOpening.Current is { } opening)
                 info["opening"] = OpeningJson(opening);
-            if (Publishing.Publisher.Current is { } publishing)
-                info["publishing"] = PublishingJson(publishing);
+            if (ProgressJob.Running?.Current is { } job)
+                info["job"] = JobJson(job);
 
             var stats = await server.DispatchAsync("GET", "/api/engine/stats", null);
             if (stats.StatusCode == 200 && stats.Body != null)
@@ -84,10 +84,9 @@ namespace Freefall.Editor.Mcp
             return await Status();
         }
 
-        internal static JsonObject PublishingJson(Publishing.Publisher.Status s) => new()
+        internal static JsonObject JobJson(ProgressJob.Status s) => new()
         {
-            ["profile"] = s.Profile,
-            ["product"] = s.Product,
+            ["title"] = s.Title,
             ["step"] = s.Step,
             ["stepIndex"] = s.StepIndex + 1,
             ["stepCount"] = s.StepCount,
