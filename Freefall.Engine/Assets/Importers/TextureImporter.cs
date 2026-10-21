@@ -32,6 +32,7 @@ namespace Freefall.Assets.Importers
     ///   Format       – compression format (default: BC7_UNORM)
     ///   GenerateMips – generate full mipmap chain
     ///   sRGB         – treat source as sRGB color data
+    ///   MaxSize      – largest width or height; a larger source is scaled down before it is compressed
     /// </summary>
     [AssetImporter(".png", ".jpg", ".jpeg", ".tga", ".bmp", ".dds", ".psd", ".tif")]
     public class TextureImporter : IImporter
@@ -41,6 +42,16 @@ namespace Freefall.Assets.Importers
        
         // ── Configurable import settings (editable in inspector) ──
         public TextureFormat Format = TextureFormat.BC7_UNORM;
+
+        /// <summary>
+        /// Largest width or height in pixels: a larger source is scaled down to it (aspect kept) before it is
+        /// compressed, so the artifact, the packs and the GPU all hold the smaller one. 0 = the source's size.
+        /// The project's guideline is 1024 (asset_pipeline overview §1.1); the engine takes any size. DDS sources
+        /// pass through unscaled.
+        /// </summary>
+        [System.ComponentModel.Description("Largest width or height; a larger source is scaled down before it is compressed. Source = its own size")]
+        [Reflection.ValueSelect(typeof(TextureMaxSizes))]
+        public int MaxSize = 0;
 
         public bool sRGB = true;
         public bool GenerateMips = true;
@@ -123,29 +134,8 @@ namespace Freefall.Assets.Importers
 
                 try
                 {
-                    // Only auto-detect if the user hasn't manually configured settings
-                    if (!UserConfigured)
-                    {
-                        // Auto-detect: data maps (normals, roughness, etc.) should be linear, not sRGB
-                        bool isLinearData = LinearSuffixes.Any(s =>
-                            name.EndsWith(s, StringComparison.OrdinalIgnoreCase));
-                        sRGB = !isLinearData;
-
-                        // Normal maps → BC5_UNORM (two high-quality RG channels, Z reconstructed in shader)
-                        bool isNormalMap = NormalSuffixes.Any(s =>
-                            name.EndsWith(s, StringComparison.OrdinalIgnoreCase));
-                        if (isNormalMap)
-                        {
-                            Format = TextureFormat.BC5_UNORM;
-                            IsNormalMap = true;
-                        }
-                        else if (SingleChannelSuffixes.Any(s => name.EndsWith(s, StringComparison.OrdinalIgnoreCase)))
-                        {
-                            Format = TextureFormat.BC4_UNORM;
-                        }
-                    }
-
-                    ddsBytes = ConvertToDds(inputPath);
+                    GuessSettings(filepath);
+                    ddsBytes = ConvertToDds(inputPath, filepath);
                 }
                 finally
                 {
@@ -167,7 +157,39 @@ namespace Freefall.Assets.Importers
 
 //        public object GetInspectionTarget(MetaFile meta) => this;
 
-        private byte[] ConvertToDds(string sourcePath)
+        /// <summary>
+        /// Unless someone set them (UserConfigured): what the file's name says. Data maps (normals, roughness, ...) are
+        /// linear, normal maps BC5 (two good channels, Z rebuilt in the shader), single-channel maps BC4. Import applies
+        /// it, and AssetDatabase.GetImporter does for a meta with no settings saved yet.
+        /// </summary>
+        public void GuessSettings(string sourcePath)
+        {
+            if (UserConfigured) return;
+            var name = Path.GetFileNameWithoutExtension(sourcePath);
+
+            sRGB = !LinearSuffixes.Any(s => name.EndsWith(s, StringComparison.OrdinalIgnoreCase));
+            if (NormalSuffixes.Any(s => name.EndsWith(s, StringComparison.OrdinalIgnoreCase)))
+            {
+                Format = TextureFormat.BC5_UNORM;
+                IsNormalMap = true;
+            }
+            else if (SingleChannelSuffixes.Any(s => name.EndsWith(s, StringComparison.OrdinalIgnoreCase)))
+            {
+                Format = TextureFormat.BC4_UNORM;
+            }
+        }
+
+        /// <summary>The Max Size choices: Source (0), then the powers of two from 8192 down.</summary>
+        public sealed class TextureMaxSizes : Reflection.IValuesProvider
+        {
+            private static readonly Reflection.ProviderValue[] Values =
+                new[] { 0, 8192, 4096, 2048, 1024, 512, 256, 128, 64 }
+                    .Select(v => new Reflection.ProviderValue { Name = v == 0 ? "Source" : v.ToString(), Value = v }).ToArray();
+
+            public System.Collections.Generic.IList<Reflection.ProviderValue> GetValues(object context) => Values;
+        }
+
+        private byte[] ConvertToDds(string sourcePath, string originalPath)
         {
             // Resolve texconv.exe next to the running executable
             var exeDir = AppDomain.CurrentDomain.BaseDirectory;
@@ -242,6 +264,19 @@ namespace Freefall.Assets.Importers
                 if (IgnoreAlpha)
                     args += " -swizzle rgb1";
 
+                // Scaled down before compression (texconv resizes first, then builds the mips from the result)
+                if (MaxSize > 0)
+                {
+                    var size = ImageSize(sourcePath);
+                    if (size == null)
+                        Debug.LogWarning("TextureImporter", $"{Path.GetFileName(originalPath)}: size unknown, Max Size {MaxSize} not applied");
+                    else if (Math.Max(size.Value.Width, size.Value.Height) > MaxSize)
+                    {
+                        var (w, h) = ScaledSize(size.Value.Width, size.Value.Height, MaxSize);
+                        args += $" -w {w} -h {h}";
+                    }
+                }
+
                 args += $" -o \"{tempDir}\" \"{sourcePath}\"";
 
                 var psi = new ProcessStartInfo(texconvPath)
@@ -277,6 +312,65 @@ namespace Freefall.Assets.Importers
                 // Cleanup temp directory
                 try { Directory.Delete(tempDir, true); } catch { }
             }
+        }
+
+        /// <summary>
+        /// <paramref name="width"/> x <paramref name="height"/> scaled so the larger side is <paramref name="max"/>, the other
+        /// in proportion: each side a multiple of 4 (block compression wants whole 4x4 blocks), at least 4.
+        /// </summary>
+        public static (int Width, int Height) ScaledSize(int width, int height, int max)
+        {
+            double scale = max / (double)Math.Max(width, height);
+            static int Side(double v) => Math.Max(4, (int)Math.Round(v / 4) * 4);
+            return (Side(width * scale), Side(height * scale));
+        }
+
+        /// <summary>The pixel size from the file's header (PNG, BMP, TGA, JPEG), or null for another or an unreadable file.</summary>
+        public static (int Width, int Height)? ImageSize(string path)
+        {
+            try
+            {
+                using var fs = File.OpenRead(path);
+                var head = new byte[32];
+                if (fs.Read(head, 0, head.Length) < 26) return null;
+
+                static int BigEndian(byte[] b, int i) => b[i] << 24 | b[i + 1] << 16 | b[i + 2] << 8 | b[i + 3];
+
+                // PNG: IHDR width and height, big endian, right after the signature and the chunk header
+                if (head[0] == 0x89 && head[1] == 'P' && head[2] == 'N' && head[3] == 'G')
+                    return (BigEndian(head, 16), BigEndian(head, 20));
+
+                // BMP: BITMAPINFOHEADER width and height (negative height = top-down)
+                if (head[0] == 'B' && head[1] == 'M')
+                    return (BitConverter.ToInt32(head, 18), Math.Abs(BitConverter.ToInt32(head, 22)));
+
+                // JPEG: the first start-of-frame marker holds height and width
+                if (head[0] == 0xFF && head[1] == 0xD8)
+                {
+                    fs.Position = 2;
+                    var marker = new byte[4];
+                    while (fs.Read(marker, 0, 4) == 4 && marker[0] == 0xFF)
+                    {
+                        int length = marker[2] << 8 | marker[3];
+                        byte kind = marker[1];
+                        bool frame = kind >= 0xC0 && kind <= 0xCF && kind != 0xC4 && kind != 0xC8 && kind != 0xCC;
+                        if (frame)
+                        {
+                            var sof = new byte[5];
+                            if (fs.Read(sof, 0, 5) < 5) return null;
+                            return (sof[3] << 8 | sof[4], sof[1] << 8 | sof[2]);
+                        }
+                        fs.Position += length - 2;
+                    }
+                    return null;
+                }
+
+                // TGA (no signature): by extension, width and height little endian at 12 and 14
+                if (Path.GetExtension(path).Equals(".tga", StringComparison.OrdinalIgnoreCase))
+                    return (BitConverter.ToUInt16(head, 12), BitConverter.ToUInt16(head, 14));
+            }
+            catch (IOException) { }
+            return null;
         }
 
         /// <summary>

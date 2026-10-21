@@ -71,6 +71,13 @@ namespace Freefall.Assets
         Type AssetType => null;
 
         /// <summary>
+        /// For a source whose meta has no settings saved yet: set what this importer would guess from the file at
+        /// import (a texture's name: normal map, linear data), so the inspector and tools start from what an import
+        /// does, not from the bare defaults. AssetDatabase.GetImporter calls it.
+        /// </summary>
+        void GuessSettings(string sourcePath) { }
+
+        /// <summary>
         /// Returns the object the editor inspector should display when
         /// this source file is selected.
         /// If AssetType is set, loads the actual asset for inspection.

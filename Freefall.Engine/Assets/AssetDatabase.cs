@@ -955,6 +955,13 @@ namespace Freefall.Assets
                 }
                 catch { }
             }
+            else
+            {
+                // Imported before metas kept their settings: show what the import guessed, not the defaults. A tool
+                // or the inspector saving these marks a texture UserConfigured, and the defaults (BC7, sRGB) would
+                // then turn a normal map into a colour texture on its next import.
+                importer.GuessSettings(sourcePath);
+            }
 
             _importerSources.AddOrUpdate(importer, sourceGuidResolved);
             return importer;

@@ -53,7 +53,7 @@ namespace Freefall.Editor.Mcp
         [McpServerTool(Name = "asset_get_import_settings", Title = "Get import settings", ReadOnly = true, OpenWorld = false)]
         [Description("Import settings of a source file (model, texture, audio, effect, typeface, ...): its importer type and every setting " +
                      "the meta stores, with names exact for asset_set_import_settings. Model files have e.g. GenerateLODs, LODRatios, " +
-                     "LODMinTriangles, LODPixelError (generated LODs), Scale, SmoothingAngle; textures Format, sRGB, IsNormalMap.")]
+                     "LODMinTriangles, LODPixelError (generated LODs), Scale, SmoothingAngle; textures Format, MaxSize (largest side, 0 = the source's; the guideline is 1024), sRGB, IsNormalMap.")]
         public static Task<CallToolResult> GetImportSettings(
             [Description("Source file relative to Assets, or its GUID or a sub-asset's GUID (e.g. a mesh's)")] string path)
             => McpBridge.Get("/api/asset/import-settings", ("path", path));
@@ -63,7 +63,8 @@ namespace Freefall.Editor.Mcp
                      "those files; loaded assets update in place. Works for every importer; asset_get_import_settings lists the names. In a " +
                      "folder only files whose importer has every given setting change, the rest are counted as skipped (e.g. textures when " +
                      "setting LODPixelError). Nothing is saved if a value fails to convert. A texture's settings mark it UserConfigured, as " +
-                     "the texture inspector's Apply does (otherwise its import guesses sRGB and format from the file name again). The " +
+                     "the texture inspector's Apply does (otherwise its import guesses sRGB and format from the file name again); the other " +
+                     "settings keep what the import guessed (a normal map stays BC5). The " +
                      "reimport behaves as asset_reimport (progress in console_log, goes on if the call times out). Same value encodings as asset_set_properties.")]
         public static Task<CallToolResult> SetImportSettings(
             [Description("File or folder relative to Assets, or a file's GUID or a sub-asset's GUID")] string path,
