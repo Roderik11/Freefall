@@ -1351,7 +1351,15 @@ namespace Freefall.Graphics
              CommandBuffer.Execute(RenderPass.Forward, list, Engine.Device);
              PixMarker.End(list); // Forward Draws
 
-             // Pick readback: entity ID + depth + normal
+             // Pick readback: entity ID + depth + normal. A pick asked for before a resize can lie outside the new buffers
+             // (the old screen's middle): the copy then ran past the texture and failed the frame's Close with E_INVALIDARG
+             // (Alt+Enter in the player). Such a request is dropped; its caller asks again next frame.
+              if (_pickRequestX >= 0 && (_pickRequestX >= (int)EntityIdBuffer.Native.Description.Width
+                                         || _pickRequestY < 0 || _pickRequestY >= (int)EntityIdBuffer.Native.Description.Height))
+              {
+                  _pickRequestX = -1;
+                  _pickSeeThrough = null;
+              }
               if (_pickRequestX >= 0 && _entityIdReadback != null)
               {
                   var pickBox = new Vortice.Mathematics.Box(_pickRequestX, _pickRequestY, 0, _pickRequestX + 1, _pickRequestY + 1, 1);

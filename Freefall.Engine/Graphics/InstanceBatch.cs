@@ -199,6 +199,15 @@ namespace Freefall.Graphics
         private uint[] shadowExpansionSRVIndices = new uint[FrameCount];
         private CpuDescriptorHandle[] shadowExpansionCPUHandles = new CpuDescriptorHandle[FrameCount];
 
+        // Typed (R32_UINT) views of the buffers the cull clears, one bindless slot each beside the shaders' structured
+        // views: ClearUnorderedAccessViewUint takes the view in the shader-visible heap and its copy in the CPU heap
+        // (CreateClearView). Clearing through the structured views was invalid (the debug layer reported it every frame),
+        // and after a resize such a clear crashed in the driver or failed the frame's Close (E_INVALIDARG).
+        private readonly uint[] counterClearIndices = new uint[FrameCount], visibleIndicesClearIndices = new uint[FrameCount],
+            histogramClearIndices = new uint[FrameCount], drawCountClearIndices = new uint[FrameCount],
+            shadowCounterClearIndices = new uint[FrameCount], shadowVisibleIndicesClearIndices = new uint[FrameCount],
+            shadowHistogramClearIndices = new uint[FrameCount];
+
         // Point light shadows: per-instance view mask (uint4 = 128 views), made by the first CullLocalShadowAll
         private ID3D12Resource?[] localShadowMaskBuffers = new ID3D12Resource?[FrameCount];
         private uint[] localShadowMaskUAVIndices = new uint[FrameCount];
@@ -750,23 +759,11 @@ namespace Freefall.Graphics
                     counterBuffers[i], null, uavDesc, device.GetCpuHandle(counterBufferUAVIndices[i]));
 
                 var cpuHandle = _cpuHeap.GetCPUDescriptorHandleForHeapStart() + ((int)(i * handleIncrementSize));
-                device.NativeDevice.CreateUnorderedAccessView(counterBuffers[i], null, uavDesc, cpuHandle);
+                counterClearIndices[i] = CreateClearView(counterBuffers[i], MaxSubBatches, cpuHandle);
                 counterBufferCPUHandles[i] = cpuHandle;
 
                 var visibleIndicesCpuHandle = _cpuHeap.GetCPUDescriptorHandleForHeapStart() + ((int)((FrameCount + i) * handleIncrementSize));
-                var visibleUavDesc = new UnorderedAccessViewDescription
-                {
-                    Format = Vortice.DXGI.Format.Unknown,
-                    ViewDimension = UnorderedAccessViewDimension.Buffer,
-                    Buffer = new BufferUnorderedAccessView
-                    {
-                        FirstElement = 0,
-                        NumElements = (uint)capacity,
-                        StructureByteStride = sizeof(uint),
-                        Flags = BufferUnorderedAccessViewFlags.None
-                    }
-                };
-                device.NativeDevice.CreateUnorderedAccessView(visibleIndicesBuffers[i], null, visibleUavDesc, visibleIndicesCpuHandle);
+                visibleIndicesClearIndices[i] = CreateClearView(visibleIndicesBuffers[i], (uint)capacity, visibleIndicesCpuHandle);
                 visibleIndicesCPUHandles[i] = visibleIndicesCpuHandle;
 
                 visibilityFlagsBuffers[i] = device.CreateDefaultBuffer(instanceBufferSize);
@@ -790,19 +787,7 @@ namespace Freefall.Graphics
                     histogramUAVIndices[i]);
                 
                 var histogramCpuHandle = _cpuHeap.GetCPUDescriptorHandleForHeapStart() + ((int)((2 * FrameCount + i) * handleIncrementSize));
-                var histogramUavDesc = new UnorderedAccessViewDescription
-                {
-                    Format = Vortice.DXGI.Format.Unknown,
-                    ViewDimension = UnorderedAccessViewDimension.Buffer,
-                    Buffer = new BufferUnorderedAccessView
-                    {
-                        FirstElement = 0,
-                        NumElements = (uint)MeshRegistry.MaxMeshParts,
-                        StructureByteStride = sizeof(uint),
-                        Flags = BufferUnorderedAccessViewFlags.None
-                    }
-                };
-                device.NativeDevice.CreateUnorderedAccessView(histogramBuffers[i], null, histogramUavDesc, histogramCpuHandle);
+                histogramClearIndices[i] = CreateClearView(histogramBuffers[i], (uint)MeshRegistry.MaxMeshParts, histogramCpuHandle);
                 histogramCPUHandles[i] = histogramCpuHandle;
                 
                 // Draw count buffer for ExecuteIndirect count parameter
@@ -824,7 +809,7 @@ namespace Freefall.Graphics
                     drawCountBuffers[i], null, drawCountUavDesc, device.GetCpuHandle(drawCountUAVIndices[i]));
                 
                 var drawCountCpuHandle = _cpuHeap.GetCPUDescriptorHandleForHeapStart() + ((int)((3 * FrameCount + i) * handleIncrementSize));
-                device.NativeDevice.CreateUnorderedAccessView(drawCountBuffers[i], null, drawCountUavDesc, drawCountCpuHandle);
+                drawCountClearIndices[i] = CreateClearView(drawCountBuffers[i], 1, drawCountCpuHandle);
                 drawCountCPUHandles[i] = drawCountCpuHandle;
                 
                 // Depth sort keys buffer: uint2 per entry (8 bytes) for GPU distance sorting
@@ -955,13 +940,7 @@ namespace Freefall.Graphics
 
                 // CPU handle for visible indices clear
                 var visibleCpuHandle = _shadowCpuHeap.GetCPUDescriptorHandleForHeapStart() + (int)(descriptorIdx * handleIncrement);
-                var visibleUavDesc = new UnorderedAccessViewDescription
-                {
-                    Format = Vortice.DXGI.Format.Unknown,
-                    ViewDimension = UnorderedAccessViewDimension.Buffer,
-                    Buffer = new BufferUnorderedAccessView { FirstElement = 0, NumElements = (uint)capacity, StructureByteStride = sizeof(uint) }
-                };
-                device.NativeDevice.CreateUnorderedAccessView(shadowVisibleIndicesBuffers[f], null, visibleUavDesc, visibleCpuHandle);
+                shadowVisibleIndicesClearIndices[f] = CreateClearView(shadowVisibleIndicesBuffers[f], (uint)capacity, visibleCpuHandle);
                 shadowVisibleIndicesCPUHandles[f] = visibleCpuHandle;
                 descriptorIdx++;
 
@@ -977,13 +956,7 @@ namespace Freefall.Graphics
 
                 // CPU handle for counter clear
                 var counterCpuHandle = _shadowCpuHeap.GetCPUDescriptorHandleForHeapStart() + (int)(descriptorIdx * handleIncrement);
-                var counterUavDesc = new UnorderedAccessViewDescription
-                {
-                    Format = Vortice.DXGI.Format.Unknown,
-                    ViewDimension = UnorderedAccessViewDimension.Buffer,
-                    Buffer = new BufferUnorderedAccessView { FirstElement = 0, NumElements = MaxSubBatches, StructureByteStride = sizeof(uint) }
-                };
-                device.NativeDevice.CreateUnorderedAccessView(shadowCounterBuffers[f], null, counterUavDesc, counterCpuHandle);
+                shadowCounterClearIndices[f] = CreateClearView(shadowCounterBuffers[f], MaxSubBatches, counterCpuHandle);
                 shadowCounterCPUHandles[f] = counterCpuHandle;
                 descriptorIdx++;
 
@@ -994,13 +967,7 @@ namespace Freefall.Graphics
 
                 // CPU handle for histogram clear
                 var histogramCpuHandle = _shadowCpuHeap.GetCPUDescriptorHandleForHeapStart() + (int)(descriptorIdx * handleIncrement);
-                var histogramUavDesc = new UnorderedAccessViewDescription
-                {
-                    Format = Vortice.DXGI.Format.Unknown,
-                    ViewDimension = UnorderedAccessViewDimension.Buffer,
-                    Buffer = new BufferUnorderedAccessView { FirstElement = 0, NumElements = (uint)MeshRegistry.MaxMeshParts, StructureByteStride = sizeof(uint) }
-                };
-                device.NativeDevice.CreateUnorderedAccessView(shadowHistogramBuffers[f], null, histogramUavDesc, histogramCpuHandle);
+                shadowHistogramClearIndices[f] = CreateClearView(shadowHistogramBuffers[f], (uint)MeshRegistry.MaxMeshParts, histogramCpuHandle);
                 shadowHistogramCPUHandles[f] = histogramCpuHandle;
                 descriptorIdx++;
 
@@ -1055,9 +1022,29 @@ namespace Freefall.Graphics
                     _cullConstants[computeSlot] = pib.SRVIndices[frameIndex];
         }
 
-        private void ClearUav(ID3D12GraphicsCommandList list, uint uavIndex, CpuDescriptorHandle cpuHandle, ID3D12Resource buffer, int value = 0) =>
-            list.ClearUnorderedAccessViewUint(Engine.Device.GetGpuHandle(uavIndex), cpuHandle, buffer,
+        /// <summary>Fills a uint buffer with <paramref name="value"/> through its clear view (CreateClearView): the bindless slot and its CPU copy.</summary>
+        private void ClearUav(ID3D12GraphicsCommandList list, uint clearIndex, CpuDescriptorHandle cpuHandle, ID3D12Resource buffer, int value = 0) =>
+            list.ClearUnorderedAccessViewUint(Engine.Device.GetGpuHandle(clearIndex), cpuHandle, buffer,
                 new Vortice.Mathematics.Int4(value, value, value, value));
+
+        /// <summary>
+        /// A typed R32_UINT view of a buffer of <paramref name="elements"/> uints, written into <paramref name="cpuHandle"/>
+        /// (the batch's CPU heap) and into a bindless slot of its own, which it returns: the pair a UAV clear needs.
+        /// </summary>
+        private static uint CreateClearView(ID3D12Resource? buffer, uint elements, CpuDescriptorHandle cpuHandle)
+        {
+            var device = Engine.Device;
+            var desc = new UnorderedAccessViewDescription
+            {
+                Format = Vortice.DXGI.Format.R32_UInt,
+                ViewDimension = UnorderedAccessViewDimension.Buffer,
+                Buffer = new BufferUnorderedAccessView { FirstElement = 0, NumElements = elements },
+            };
+            device.NativeDevice.CreateUnorderedAccessView(buffer, null, desc, cpuHandle);
+            uint index = device.AllocateBindlessIndex();
+            device.NativeDevice.CreateUnorderedAccessView(buffer, null, desc, device.GetCpuHandle(index));
+            return index;
+        }
 
         // One barrier for all batches of a stage: every batch's next stage reads what its previous stage wrote
         private static void StageBarrier(ID3D12GraphicsCommandList list) =>
@@ -1220,10 +1207,10 @@ namespace Freefall.Graphics
             _lastCullSlot = f;
             _lastCullCount = _drawCount;
 
-            ClearUav(list, counterBufferUAVIndices[f], counterBufferCPUHandles[f], counterBuffers[f]);
-            ClearUav(list, visibleIndicesUAVIndices[f], visibleIndicesCPUHandles[f], visibleIndicesBuffers[f], unchecked((int)0xFFFFFFFF));
-            ClearUav(list, histogramUAVIndices[f], histogramCPUHandles[f], histogramBuffers[f]);
-            ClearUav(list, drawCountUAVIndices[f], drawCountCPUHandles[f], drawCountBuffers[f]);
+            ClearUav(list, counterClearIndices[f], counterBufferCPUHandles[f], counterBuffers[f]);
+            ClearUav(list, visibleIndicesClearIndices[f], visibleIndicesCPUHandles[f], visibleIndicesBuffers[f], unchecked((int)0xFFFFFFFF));
+            ClearUav(list, histogramClearIndices[f], histogramCPUHandles[f], histogramBuffers[f]);
+            ClearUav(list, drawCountClearIndices[f], drawCountCPUHandles[f], drawCountBuffers[f]);
         }
 
         // The records changed since the last camera culling, as this frame's bits (SRV index; 0 = none), then cleared
@@ -1294,7 +1281,7 @@ namespace Freefall.Graphics
             PixMarker.Begin(list, "Cascade expansion");
             int f = Engine.FrameIndex % FrameCount;
             foreach (var batch in _stageBatches)
-                batch.ClearUav(list, batch.shadowCounterUAVIndices[f], batch.shadowCounterCPUHandles[f], batch.shadowCounterBuffers[f]);
+                batch.ClearUav(list, batch.shadowCounterClearIndices[f], batch.shadowCounterCPUHandles[f], batch.shadowCounterBuffers[f]);
             StageBarrier(list);
             DispatchStage(list, culler.ExpandCascadesPSO, StageItems.Instances, 256);
             StageBarrier(list);
@@ -1319,6 +1306,9 @@ namespace Freefall.Graphics
         private void PrepareCullShadow(ID3D12GraphicsCommandList list, uint cascadeBufferSrv, uint shadowHiZSrv, float minCasterClip,
             uint receiversUav, uint cascadeCount)
         {
+            // The draw count and the counters it clears are the camera cull's (InitializeCullerResources): a batch the camera
+            // has not culled since it was made or grew (ResizeBuffers drops them) has none yet, and the clear crashed
+            InitializeCullerResources();
             InitializeShadowCullerResources();
             int f = Engine.FrameIndex % FrameCount;
 
@@ -1351,10 +1341,10 @@ namespace Freefall.Graphics
             WriteLodConstants(c);                             // main camera: shadows use the main view's LOD
             WritePerInstanceConstants(f);
 
-            ClearUav(list, shadowCounterUAVIndices[f], shadowCounterCPUHandles[f], shadowCounterBuffers[f]);
-            ClearUav(list, shadowVisibleIndicesUAVIndices[f], shadowVisibleIndicesCPUHandles[f], shadowVisibleIndicesBuffers[f], unchecked((int)0xFFFFFFFF));
-            ClearUav(list, shadowHistogramUAVIndices[f], shadowHistogramCPUHandles[f], shadowHistogramBuffers[f]);
-            ClearUav(list, drawCountUAVIndices[f], drawCountCPUHandles[f], drawCountBuffers[f]);
+            ClearUav(list, shadowCounterClearIndices[f], shadowCounterCPUHandles[f], shadowCounterBuffers[f]);
+            ClearUav(list, shadowVisibleIndicesClearIndices[f], shadowVisibleIndicesCPUHandles[f], shadowVisibleIndicesBuffers[f], unchecked((int)0xFFFFFFFF));
+            ClearUav(list, shadowHistogramClearIndices[f], shadowHistogramCPUHandles[f], shadowHistogramBuffers[f]);
+            ClearUav(list, drawCountClearIndices[f], drawCountCPUHandles[f], drawCountBuffers[f]);
         }
 
         /// <summary>
@@ -1423,6 +1413,7 @@ namespace Freefall.Graphics
         // Constants and clears of this batch's point light shadow culling
         private void PrepareCullLocalShadow(ID3D12GraphicsCommandList list, uint viewBufferSrv, uint lightBufferSrv, uint countsUav)
         {
+            InitializeCullerResources();   // the draw count it clears, as in PrepareCullShadow
             InitializeShadowCullerResources();
             int f = Engine.FrameIndex % FrameCount;
             var device = Engine.Device;
@@ -1466,9 +1457,9 @@ namespace Freefall.Graphics
             WriteLodConstants(c);                             // main camera: same LOD as the view
             WritePerInstanceConstants(f);
 
-            ClearUav(list, shadowCounterUAVIndices[f], shadowCounterCPUHandles[f], shadowCounterBuffers[f]);
-            ClearUav(list, shadowHistogramUAVIndices[f], shadowHistogramCPUHandles[f], shadowHistogramBuffers[f]);
-            ClearUav(list, drawCountUAVIndices[f], drawCountCPUHandles[f], drawCountBuffers[f]);
+            ClearUav(list, shadowCounterClearIndices[f], shadowCounterCPUHandles[f], shadowCounterBuffers[f]);
+            ClearUav(list, shadowHistogramClearIndices[f], shadowHistogramCPUHandles[f], shadowHistogramBuffers[f]);
+            ClearUav(list, drawCountClearIndices[f], drawCountCPUHandles[f], drawCountBuffers[f]);
         }
 
         #endregion
@@ -1684,6 +1675,13 @@ namespace Freefall.Graphics
                 DeferDispose(counterBuffers[i], counterBufferUAVIndices[i]);
                 counterBuffers[i] = null; counterBufferUAVIndices[i] = 0;
 
+                // The clear views go with their buffers (0: not made)
+                foreach (var clear in new[] { counterClearIndices, visibleIndicesClearIndices, histogramClearIndices, drawCountClearIndices })
+                {
+                    if (clear[i] != 0) DeferDispose(null, clear[i]);
+                    clear[i] = 0;
+                }
+
                 DeferDispose(visibilityFlagsBuffers[i], visibilityFlagsUAVIndices[i]);
                 DeferDispose(null, visibilityFlagsSRVIndices[i]);
                 visibilityFlagsBuffers[i] = null; visibilityFlagsUAVIndices[i] = 0; visibilityFlagsSRVIndices[i] = 0;
@@ -1709,6 +1707,7 @@ namespace Freefall.Graphics
             _cpuHeap?.Dispose();
             _cpuHeap = null;
             _cullerInitialized = false;
+            _boundsWritten = false;   // the new bounds buffers hold nothing yet
 
             // Defer shadow union buffers
             if (_shadowCullerInitialized)
@@ -1731,6 +1730,12 @@ namespace Freefall.Graphics
 
                     DeferDispose(shadowCounterBuffers[f], shadowCounterUAVIndices[f]);
                     shadowCounterBuffers[f] = null; shadowCounterUAVIndices[f] = 0;
+
+                    foreach (var clear in new[] { shadowCounterClearIndices, shadowVisibleIndicesClearIndices, shadowHistogramClearIndices })
+                    {
+                        if (clear[f] != 0) DeferDispose(null, clear[f]);
+                        clear[f] = 0;
+                    }
 
                     DeferDispose(shadowHistogramBuffers[f], shadowHistogramUAVIndices[f]);
                     shadowHistogramBuffers[f] = null; shadowHistogramUAVIndices[f] = 0;
@@ -1762,6 +1767,12 @@ namespace Freefall.Graphics
                 
                 counterBuffers[i]?.Dispose();
                 if (counterBufferUAVIndices[i] != 0) Engine.Device.ReleaseBindlessIndex(counterBufferUAVIndices[i]);
+
+                foreach (var clear in new[] { counterClearIndices, visibleIndicesClearIndices, histogramClearIndices, drawCountClearIndices })
+                {
+                    if (clear[i] != 0) Engine.Device.ReleaseBindlessIndex(clear[i]);
+                    clear[i] = 0;
+                }
 
                 drawCountBuffers[i]?.Dispose();
                 if (drawCountUAVIndices[i] != 0) Engine.Device.ReleaseBindlessIndex(drawCountUAVIndices[i]);
@@ -1810,6 +1821,12 @@ namespace Freefall.Graphics
 
                     shadowCounterBuffers[f]?.Dispose();
                     if (shadowCounterUAVIndices[f] != 0) Engine.Device.ReleaseBindlessIndex(shadowCounterUAVIndices[f]);
+
+                    foreach (var clear in new[] { shadowCounterClearIndices, shadowVisibleIndicesClearIndices, shadowHistogramClearIndices })
+                    {
+                        if (clear[f] != 0) Engine.Device.ReleaseBindlessIndex(clear[f]);
+                        clear[f] = 0;
+                    }
 
                     shadowHistogramBuffers[f]?.Dispose();
                     if (shadowHistogramUAVIndices[f] != 0) Engine.Device.ReleaseBindlessIndex(shadowHistogramUAVIndices[f]);

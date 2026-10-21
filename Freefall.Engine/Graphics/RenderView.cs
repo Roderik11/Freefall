@@ -508,7 +508,7 @@ namespace Freefall.Graphics
             }
         }
 
-        internal void WaitForGpu()
+        public void WaitForGpu()
         {
             // Schedule a Signal command in the queue
             _graphicsDevice.CommandQueue.Signal(_fence, (ulong)_fenceValue);

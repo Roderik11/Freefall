@@ -137,6 +137,8 @@ namespace Freefall.Player
 
             Log($"[Player] Closed after {sinceStart.Elapsed.TotalSeconds:0.0} s; {Artifacts.OpenedFromPacks} artifacts read from the packs, " +
                 $"{EngineFiles.ReadFromPack} engine files from {manifest.EnginePack ?? "the disk"}");
+            // The GPU may still draw the last frames with the UI's buffers and pipeline: done with them first
+            view.WaitForGpu();
             ui.Dispose();
             Engine.Shutdown();
         }

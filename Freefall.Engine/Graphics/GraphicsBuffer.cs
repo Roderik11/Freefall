@@ -16,6 +16,9 @@ namespace Freefall.Graphics
         private readonly ID3D12Resource _resource;
         private readonly CpuDescriptorHandle _clearCpuHandle;
         private readonly bool _hasClearHandle;
+        // The clear's view in the shader-visible heap (0: the UAV itself, raw already) and the CPU heap its copy lives in
+        private readonly uint _clearIndex;
+        private readonly ID3D12DescriptorHeap? _clearHeap;
         private ResourceStates _currentState;
         private bool _disposed;
 
@@ -53,7 +56,9 @@ namespace Freefall.Graphics
             ResourceStates initialState,
             CpuDescriptorHandle clearCpuHandle,
             bool hasClearHandle,
-            IntPtr mappedPtr = default)
+            IntPtr mappedPtr = default,
+            uint clearIndex = 0,
+            ID3D12DescriptorHeap? clearHeap = null)
         {
             _device = device;
             _resource = resource;
@@ -64,6 +69,8 @@ namespace Freefall.Graphics
             _currentState = initialState;
             _clearCpuHandle = clearCpuHandle;
             _hasClearHandle = hasClearHandle;
+            _clearIndex = clearIndex;
+            _clearHeap = clearHeap;
             MappedPtr = mappedPtr;
         }
 
@@ -96,7 +103,7 @@ namespace Freefall.Graphics
                 throw new InvalidOperationException("GraphicsBuffer has no UAV or was not created with ClearUAV support.");
 
             cmd.ClearUnorderedAccessViewUint(
-                _device.GetGpuHandle(UavIndex),
+                _device.GetGpuHandle(_clearIndex != 0 ? _clearIndex : UavIndex),
                 _clearCpuHandle,
                 _resource,
                 clearValue);
@@ -127,19 +134,12 @@ namespace Freefall.Graphics
             }
 
             uint uavIndex = 0;
-            CpuDescriptorHandle clearHandle = default;
-            bool hasClear = false;
             if (uav)
             {
                 uavIndex = device.AllocateBindlessIndex();
                 device.CreateStructuredBufferUAV(resource, (uint)count, (uint)stride, uavIndex);
-
-                // Create non-shader-visible CPU handle for ClearUnorderedAccessViewUint
-                clearHandle = device.AllocateClearHandle(resource, (uint)count, (uint)stride);
-                hasClear = true;
             }
-
-            return new GraphicsBuffer(device, resource, count, stride, srvIndex, uavIndex, initialState, clearHandle, hasClear);
+            return Structured(device, resource, count, stride, srvIndex, uavIndex, initialState);
         }
 
         /// <summary>
@@ -165,18 +165,30 @@ namespace Freefall.Graphics
             }
 
             uint uavIndex = 0;
-            CpuDescriptorHandle clearHandle = default;
-            bool hasClear = false;
             if (uav)
             {
                 uavIndex = device.AllocateBindlessIndex();
                 device.CreateStructuredBufferUAV(resource, (uint)count, (uint)stride, uavIndex);
-
-                clearHandle = device.AllocateClearHandle(resource, (uint)count, (uint)stride);
-                hasClear = true;
             }
+            return Structured(device, resource, count, stride, srvIndex, uavIndex, initialState);
+        }
 
-            return new GraphicsBuffer(device, resource, count, stride, srvIndex, uavIndex, initialState, clearHandle, hasClear);
+        /// <summary>
+        /// A structured buffer, clearable when it has a UAV: the clear goes through a raw view of the same bytes in a bindless
+        /// slot and a CPU heap of its own (ClearUnorderedAccessView* is not defined on structured views).
+        /// </summary>
+        private static GraphicsBuffer Structured(GraphicsDevice device, ID3D12Resource resource, int count, int stride,
+                                                 uint srvIndex, uint uavIndex, ResourceStates initialState)
+        {
+            int size = count * stride;
+            if (uavIndex == 0 || size % 4 != 0)
+                return new GraphicsBuffer(device, resource, count, stride, srvIndex, uavIndex, initialState, default, false);
+
+            uint clearIndex = device.AllocateBindlessIndex();
+            device.CreateRawBufferUAV(resource, (uint)(size / 4), clearIndex);
+            var clearHandle = device.AllocateRawClearHandle(resource, (uint)(size / 4), out var clearHeap);
+            return new GraphicsBuffer(device, resource, count, stride, srvIndex, uavIndex, initialState, clearHandle, true,
+                                      clearIndex: clearIndex, clearHeap: clearHeap);
         }
 
         /// <summary>
@@ -205,6 +217,7 @@ namespace Freefall.Graphics
             uint uavIndex = 0;
             CpuDescriptorHandle clearHandle = default;
             bool hasClear = false;
+            ID3D12DescriptorHeap? clearHeap = null;
             if (uav)
             {
                 uavIndex = device.AllocateBindlessIndex();
@@ -212,12 +225,12 @@ namespace Freefall.Graphics
 
                 if (clearable)
                 {
-                    clearHandle = device.AllocateRawClearHandle(resource, (uint)elementCount);
+                    clearHandle = device.AllocateRawClearHandle(resource, (uint)elementCount, out clearHeap);
                     hasClear = true;
                 }
             }
 
-            return new GraphicsBuffer(device, resource, elementCount, 4, srvIndex, uavIndex, initialState, clearHandle, hasClear);
+            return new GraphicsBuffer(device, resource, elementCount, 4, srvIndex, uavIndex, initialState, clearHandle, hasClear, clearHeap: clearHeap);
         }
 
         /// <summary>
@@ -360,6 +373,9 @@ namespace Freefall.Graphics
                 _device.ReleaseBindlessIndex(SrvIndex);
             if (UavIndex > 0)
                 _device.ReleaseBindlessIndex(UavIndex);
+            if (_clearIndex > 0)
+                _device.ReleaseBindlessIndex(_clearIndex);
+            _clearHeap?.Dispose();
         }
     }
 }

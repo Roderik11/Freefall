@@ -27,6 +27,9 @@ namespace Freefall.Graphics
         // Descriptor Management
         private const int MaxBindlessDescriptors = 1000000;
         private readonly Stack<uint> _freeBindlessIndices = new Stack<uint>();
+        // The same indices as a set: a release of an index already free is caught (ReleaseBindlessIndex)
+        private readonly HashSet<uint> _freeBindlessSet = new();
+        private int _badBindlessReleases;
         private uint _nextBindlessIndex = 0;
         private readonly object _bindlessLock = new object();
         private readonly object _queueLock = new object();
@@ -80,7 +83,9 @@ namespace Freefall.Graphics
 
         /// <summary>
         /// Print the D3D12 validation messages recorded so far (errors and corruption only) to stdout and
-        /// clear them. No-op unless the debug layer is on (FREEFALL_D3DDEBUG=1).
+        /// clear them: each kind once, with how often it came, so a rare one is not lost behind one that
+        /// repeats every frame (the first 40 used to be all a dump showed). No-op unless the debug layer is
+        /// on (FREEFALL_D3DDEBUG=1).
         /// </summary>
         public void DumpDebugMessages(string where)
         {
@@ -91,14 +96,17 @@ namespace Freefall.Graphics
                 if (queue == null) return;
 
                 ulong count = queue.NumStoredMessages;
-                int printed = 0;
-                for (ulong i = 0; i < count && printed < 40; i++)
+                var kinds = new Dictionary<MessageId, (string Text, MessageSeverity Severity, int Count)>();
+                for (ulong i = 0; i < count; i++)
                 {
                     var message = queue.GetMessage(i);
                     if (message.Severity != MessageSeverity.Error && message.Severity != MessageSeverity.Corruption) continue;
-                    Console.WriteLine($"[D3D12 {message.Severity}] ({where}) {message.Id}: {message.Description}");
-                    printed++;
+                    kinds[message.Id] = kinds.TryGetValue(message.Id, out var seen)
+                        ? (seen.Text, seen.Severity, seen.Count + 1)
+                        : (message.Description, message.Severity, 1);
                 }
+                foreach (var (id, (text, severity, n)) in kinds.Take(40))
+                    Console.WriteLine($"[D3D12 {severity}] ({where}) {id}{(n > 1 ? $" x{n}" : "")}: {text}");
                 queue.ClearStoredMessages();
             }
             catch (Exception ex) { Console.WriteLine($"[D3D12] message dump failed: {ex.Message}"); }
@@ -556,7 +564,11 @@ namespace Freefall.Graphics
             lock (_bindlessLock)
             {
                 if (_freeBindlessIndices.Count > 0)
-                    return _freeBindlessIndices.Pop();
+                {
+                    var reused = _freeBindlessIndices.Pop();
+                    _freeBindlessSet.Remove(reused);
+                    return reused;
+                }
 
                 if (_nextBindlessIndex >= MaxBindlessDescriptors)
                     throw new InvalidOperationException("Out of bindless descriptors.");
@@ -565,12 +577,23 @@ namespace Freefall.Graphics
             }
         }
 
+        /// <summary>
+        /// Give an index back. A second release of the same index (or of one never handed out) is ignored and logged:
+        /// pushed twice, the index would go to two owners later, and the first one's descriptor would be overwritten
+        /// under it (a UAV clear on a render target's view: the access violation in InstanceBatch.ClearUav after a resize).
+        /// </summary>
         public void ReleaseBindlessIndex(uint index)
         {
             if (SuppressBindlessRelease) return; // Intentional leak during batch eviction
 
             lock (_bindlessLock)
             {
+                if (index >= _nextBindlessIndex || !_freeBindlessSet.Add(index))
+                {
+                    if (_badBindlessReleases++ < 20)
+                        Debug.LogWarning("GraphicsDevice", $"Bindless index {index} released twice or never allocated: ignored\n{Environment.StackTrace}");
+                    return;
+                }
                 _freeBindlessIndices.Push(index);
             }
         }
@@ -970,35 +993,6 @@ namespace Freefall.Graphics
         }
 
         /// <summary>
-        /// Create a non-shader-visible CPU descriptor handle for ClearUnorderedAccessViewUint.
-        /// Allocates a single-entry CPU descriptor heap and creates a matching UAV descriptor.
-        /// </summary>
-        public CpuDescriptorHandle AllocateClearHandle(ID3D12Resource resource, uint numElements, uint stride)
-        {
-            var heap = _device.CreateDescriptorHeap(new DescriptorHeapDescription
-            {
-                Type = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView,
-                DescriptorCount = 1,
-                Flags = DescriptorHeapFlags.None
-            });
-            var handle = heap.GetCPUDescriptorHandleForHeapStart();
-            var uavDesc = new UnorderedAccessViewDescription
-            {
-                Format = Format.Unknown,
-                ViewDimension = UnorderedAccessViewDimension.Buffer,
-                Buffer = new BufferUnorderedAccessView
-                {
-                    FirstElement = 0,
-                    NumElements = numElements,
-                    StructureByteStride = stride,
-                    Flags = BufferUnorderedAccessViewFlags.None
-                }
-            };
-            _device.CreateUnorderedAccessView(resource, null, uavDesc, handle);
-            return handle;
-        }
-
-        /// <summary>
         /// Create a raw R32_Typeless UAV descriptor at a bindless index.
         /// </summary>
         public void CreateRawBufferUAV(ID3D12Resource resource, uint numElements, uint bindlessIndex)
@@ -1038,11 +1032,13 @@ namespace Freefall.Graphics
         }
 
         /// <summary>
-        /// Create a non-shader-visible CPU descriptor handle for ClearUnorderedAccessViewUint on a raw buffer.
+        /// Create a non-shader-visible CPU descriptor handle for ClearUnorderedAccessViewUint on a raw buffer (raw or typed
+        /// views only: a clear is not defined on structured ones). The caller keeps <paramref name="heap"/> alive for as long as
+        /// it clears and disposes it with the buffer: dropped, the collector frees it and the handle points at freed memory.
         /// </summary>
-        public CpuDescriptorHandle AllocateRawClearHandle(ID3D12Resource resource, uint numElements)
+        public CpuDescriptorHandle AllocateRawClearHandle(ID3D12Resource resource, uint numElements, out ID3D12DescriptorHeap heap)
         {
-            var heap = _device.CreateDescriptorHeap(new DescriptorHeapDescription
+            heap = _device.CreateDescriptorHeap(new DescriptorHeapDescription
             {
                 Type = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView,
                 DescriptorCount = 1,
