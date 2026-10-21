@@ -29,6 +29,8 @@ namespace Freefall.Editor.Mcp
                 },
                 ["scene"] = Program.EditorUI?.CurrentScenePath,
                 ["sceneGuid"] = Program.EditorUI?.CurrentScene?.Guid,
+                // What Save Changed Assets would write (a terrain after a height stamp edit, a baked navmesh)
+                ["changedAssets"] = new JsonArray(AssetCreator.ChangedAssets.Select(a => (JsonNode?)$"{a.GetType().Name} {a.Name}").ToArray()),
             });
 
             if (ProjectOpening.Current is { } opening)

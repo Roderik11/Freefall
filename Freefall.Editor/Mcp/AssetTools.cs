@@ -141,6 +141,13 @@ namespace Freefall.Editor.Mcp
         public static Task<CallToolResult> Rename(string guid, [Description("The new name, without extension")] string name)
             => McpBridge.Post("/api/asset/rename", new { guid, name });
 
+        [McpServerTool(Name = "asset_press_button", Title = "Press an asset's inspector button", OpenWorld = false)]
+        [Description("Press one of an asset's inspector buttons (a [Button] method, as the inspector shows it under the asset's fields), " +
+                     "by method name or label, like entity_press_button for components. If the press changed the asset it is saved " +
+                     "and reimported (save=false keeps it unsaved, on Save Changed Assets). An unknown name lists the asset's buttons.")]
+        public static Task<CallToolResult> PressButton(string guid, string button, bool save = true)
+            => McpBridge.Post("/api/asset/press-button", new { guid, button, save });
+
         [McpServerTool(Name = "asset_open", Title = "Open asset in its editor", Idempotent = true, OpenWorld = false)]
         [Description("Open an asset in its custom editor tab (node graphs, animation graphs, animation sets), like a double-click " +
                      "in the asset browser. Follow with screenshot target='editor' to look at it.")]

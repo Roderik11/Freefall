@@ -34,9 +34,9 @@ namespace Freefall.Assets.Loaders
 
         public Asset LoadFromCache(string cachePath, string name, AssetManager manager, string sourceGuid = null)
         {
-            // If no explicit GUID, resolve it from name
+            // A cache file is named by its GUID: no lookup by name
             if (string.IsNullOrEmpty(sourceGuid))
-                sourceGuid = AssetDatabase.ResolveGuidByName(name);
+                sourceGuid = Path.GetFileNameWithoutExtension(cachePath);
 
             try
             {
@@ -75,6 +75,9 @@ namespace Freefall.Assets.Loaders
 
                 // And the hole mask that goes with it (R8 DDS), so colliders cooked before the first bake have the holes
                 LoadBakedHoles(terrain);
+
+                // What the bakes are compared with: a bake that comes out different puts the terrain on Save Changed Assets
+                terrain.MarkMapsSaved();
 
                 Debug.Log($"[TerrainLoader] '{name}' loaded: HeightField={terrain.HeightField != null}, " +
                           $"CookedHeightField={terrain.CookedHeightField != null}");
@@ -246,6 +249,7 @@ namespace Freefall.Assets.Loaders
             {
                 // 1. Save baked heightmap (GPU readback → cache)
                 SaveBakedHeightmap(terrain);
+                terrain.MarkMapsSaved();
 
                 // 2. Save YAML definition (includes the BakedHeightmapRef GUID)
                 NativeImporter.Save(savePath, terrain);

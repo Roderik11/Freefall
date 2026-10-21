@@ -30,8 +30,9 @@ namespace Freefall.Assets.Loaders
 
         public Asset LoadFromCache(string cachePath, string name, AssetManager manager, string sourceGuid = null)
         {
+            // A cache file is named by its GUID: no lookup by name
             if (string.IsNullOrEmpty(sourceGuid))
-                sourceGuid = AssetDatabase.ResolveGuidByName(name);
+                sourceGuid = Path.GetFileNameWithoutExtension(cachePath);
 
             try
             {

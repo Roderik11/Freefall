@@ -596,6 +596,7 @@ namespace Freefall.Components
                 if (heights != null && Terrain != null)
                 {
                     Terrain.SetHeightField(heights);
+                    Terrain.CheckMapsAgainstSaved();    // on Save Changed Assets when the bake no longer equals the saved heightmap
                     _heightsReadBack = true;
                     // Surface-snapped geometry (RuntimeMesh) and projected PCG output sampled the old heights —
                     // let whatever lies in the changed region rebuild
@@ -1735,6 +1736,7 @@ namespace Freefall.Components
                 if (mask != null)
                 {
                     terrain.SetHoles(null, 0);
+                    terrain.CheckMapsAgainstSaved();
                     if (cutBefore != null) _holeChanges.AddRange(cutBefore);
                 }
                 _holeRects = new List<TerrainBaker.HoleRect>();
@@ -1753,6 +1755,7 @@ namespace Freefall.Components
                 TerrainBaker.BakeHoles(plan, mask!, cutBefore ?? [new TerrainBaker.HoleRect(0, 0, res - 1, res - 1)]);
             }
             terrain.SetHoles(mask, res);
+            terrain.CheckMapsAgainstSaved();
             _holeRects = cutNow;
 
             // What changed: where stamps cut before and where they cut now (all of it when that is not known)

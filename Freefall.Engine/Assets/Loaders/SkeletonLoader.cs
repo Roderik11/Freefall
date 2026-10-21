@@ -6,7 +6,7 @@ namespace Freefall.Assets.Loaders
 {
     /// <summary>
     /// Loads Skeleton assets from cache (.skel files).
-    /// Unpacks via SkeletonPacker â€” the unpacked Skeleton
+    /// Unpacks via SkeletonPacker — the unpacked Skeleton
     /// is already the runtime type.
     /// </summary>
     [AssetLoader(typeof(Skeleton))]
@@ -20,6 +20,15 @@ namespace Freefall.Assets.Loaders
             if (cachePath == null || !File.Exists(cachePath))
                 throw new FileNotFoundException($"Cache file not found for skeleton '{name}'");
 
+            return LoadFromCache(cachePath, name, manager);
+        }
+
+        /// <summary>
+        /// The skeleton in this cache file. Without it LoadByGuid fell back to Load(name), a lookup by the skeleton's
+        /// name, which picks whichever model file's skeleton of that name comes first ("Armature" is common).
+        /// </summary>
+        public Asset LoadFromCache(string cachePath, string name, AssetManager manager, string sourceGuid = null)
+        {
             Skeleton skeleton;
             using (var stream = File.OpenRead(cachePath))
                 skeleton = _packer.Read(stream);

@@ -603,6 +603,8 @@ namespace Freefall.Assets
 
         /// <summary>
         /// Resolve a friendly name to its source GUID (for simple assets) or subasset GUID.
+        /// For editor tools only (importers, MCP asset_resolve): engine and game code reach assets through references,
+        /// and a published game has no name index (PUBLISH_PLAN.md; .agent/knowledge/engine_internals/publishing.md).
         /// </summary>
         public static string ResolveGuidByName(string name)
         {
@@ -666,6 +668,7 @@ namespace Freefall.Assets
         /// <summary>
         /// Resolve a friendly name to a GUID, filtered by asset type: subassets first, then source files with that
         /// name whose main asset type matches (e.g. the "Full House 1" prefab next to an FBX mesh of the same name).
+        /// For editor tools only, like the overload without a type.
         /// </summary>
         public static string ResolveGuidByName(string name, string type)
         {

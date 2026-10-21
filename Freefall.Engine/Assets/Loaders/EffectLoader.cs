@@ -19,12 +19,13 @@ namespace Freefall.Assets.Loaders
             if (cachePath == null || !File.Exists(cachePath))
                 throw new FileNotFoundException($"Cache file not found for effect '{name}'");
 
-            return LoadFromCache(cachePath, name, manager, AssetDatabase.ResolveGuidByName(name));
+            return LoadFromCache(cachePath, name, manager);
         }
 
         public Asset LoadFromCache(string cachePath, string name, AssetManager manager, string sourceGuid = null)
         {
-            var guid = sourceGuid ?? AssetDatabase.ResolveGuidByName(name) ?? name;
+            // A cache file is named by its GUID: no lookup by name
+            var guid = sourceGuid ?? Path.GetFileNameWithoutExtension(cachePath);
             return Effect.FromAsset(guid, name, Read(cachePath).Source, SourcePathOf(guid));
         }
 

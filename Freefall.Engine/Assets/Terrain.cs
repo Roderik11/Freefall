@@ -120,6 +120,43 @@ namespace Freefall.Assets
             MarkForUpdate(TerrainDirtyFlags.SplatAll);
         }
 
+        // Hash of the heights and holes as last saved: read from the Cache at load, or written by a save
+        private ulong _savedMapsHash;
+
+        /// <summary>The heights and holes as they are now are the saved ones (TerrainLoader: after a load, after a save).</summary>
+        internal void MarkMapsSaved() => _savedMapsHash = MapsHash();
+
+        /// <summary>
+        /// After a bake: the heightmap and the hole mask are saved with this asset (Save Changed Assets writes them; a
+        /// published game and its ground collider load them), so when they no longer equal the saved ones the asset
+        /// goes on Save Changed Assets. Compared, not assumed from an edit: stamps and the generators that move them
+        /// also rebake while a scene loads, to the same maps. Editor only, without the splat rebake <see cref="MarkDirty"/> adds.
+        /// </summary>
+        internal void CheckMapsAgainstSaved()
+        {
+            if (Engine.IsEditor && !IsDirty && MapsHash() != _savedMapsHash)
+                base.MarkDirty();
+        }
+
+        // FNV-1a over the bits of the CPU height field and the hole mask (~10 ms for 4097²)
+        private ulong MapsHash()
+        {
+            ulong h = 14695981039346656037UL;
+            void Mix(ReadOnlySpan<byte> bytes)
+            {
+                var words = System.Runtime.InteropServices.MemoryMarshal.Cast<byte, ulong>(bytes);
+                foreach (var w in words) h = (h ^ w) * 1099511628211UL;
+                for (int i = words.Length * 8; i < bytes.Length; i++) h = (h ^ bytes[i]) * 1099511628211UL;
+                h = (h ^ (ulong)bytes.Length) * 1099511628211UL;
+            }
+            if (HeightField is { } heights)
+                Mix(System.Runtime.InteropServices.MemoryMarshal.CreateReadOnlySpan(
+                    ref System.Runtime.InteropServices.MemoryMarshal.GetArrayDataReference(heights), heights.Length * sizeof(float)));
+            if (Holes is { } holes)
+                Mix(holes);
+            return h;
+        }
+
         /// <summary>
         /// Resolution of the baked heightmap (power-of-2+1). Configurable per-terrain.
         /// </summary>

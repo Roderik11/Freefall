@@ -30,6 +30,9 @@ namespace Freefall.Editor
         /// </summary>
         public static int DirtyAssetCount => _dirtyAssets.Count(a => a.IsDirty);
 
+        /// <summary>The assets with unsaved changes: what Save Changed Assets would write.</summary>
+        public static List<Asset> ChangedAssets => _dirtyAssets.Where(a => a.IsDirty).ToList();
+
         /// <summary>
         /// Subscribe to AssetDirty messages. Call once at editor startup.
         /// </summary>

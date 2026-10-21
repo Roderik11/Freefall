@@ -728,6 +728,57 @@ namespace Freefall.Editor.Commands
     }
 
     /// <summary>
+    /// Press one of an asset's inspector buttons ([Button] methods, as GenericInspector shows them), then save + reimport
+    /// the asset if the press changed it (marked it dirty), as asset/setproperty does.
+    /// POST /api/asset/press-button
+    /// Body: {"guid":"...", "button":"CollectPieces", "save": true}
+    /// </summary>
+    [CommandRoute("POST", "/api/asset/press-button")]
+    public class PressAssetButtonCommand : EditorCommand
+    {
+        public override CommandResult Execute(CommandContext context)
+        {
+            if (string.IsNullOrEmpty(context.Body))
+                return CommandResult.BadRequest("Body required with 'guid' and 'button'");
+
+            using var doc = context.ParseBody();
+            var root = doc.RootElement;
+            string guid = root.TryGetProperty("guid", out var gp) ? gp.GetString() : null;
+            string button = root.TryGetProperty("button", out var bp) ? bp.GetString() : null;
+            if (string.IsNullOrEmpty(guid) || string.IsNullOrEmpty(button))
+                return CommandResult.BadRequest("'guid' and 'button' are required");
+
+            var assetType = AssetDatabase.GetAssetType(guid);
+            var asset = assetType == null ? null : Engine.Assets.LoadByGuid(guid, assetType);
+            if (asset == null)
+                return CommandResult.NotFound($"Asset not found: {guid}");
+
+            var entry = InspectorButtons.Find(asset.GetType(), button);
+            if (entry == null)
+            {
+                var names = InspectorButtons.Of(asset.GetType()).Select(b => b.Method.Name).ToArray();
+                return CommandResult.NotFound(names.Length == 0
+                    ? $"'{asset.GetType().Name}' has no buttons"
+                    : $"'{asset.GetType().Name}' has no button '{button}'; it has: {string.Join(", ", names)}");
+            }
+
+            if (InspectorButtons.Press(entry, new object[] { asset }) == 0)
+                return CommandResult.Error(500, $"'{entry.Method.Name}' failed; see console_log");
+
+            bool save = !root.TryGetProperty("save", out var sp) || sp.GetBoolean();
+            string savedPath = null;
+            var relativePath = AssetDatabase.GuidToPath(guid);
+            if (save && asset.IsDirty && relativePath != null && Engine.Project != null)
+            {
+                savedPath = Path.Combine(Engine.Project.AssetsDirectory, relativePath);
+                Engine.Assets.SaveAsset(asset, savedPath);
+            }
+
+            return CommandResult.Json(new { status = "pressed", guid, type = asset.GetType().Name, name = asset.Name, button = entry.Method.Name, saved = savedPath });
+        }
+    }
+
+    /// <summary>
     /// Set one or more fields on a loaded asset by reflection, then save + reimport it
     /// so the Library cache matches the source file.
     /// POST /api/asset/setproperty
