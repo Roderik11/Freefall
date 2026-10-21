@@ -18,7 +18,7 @@ namespace Freefall.Assets.Loaders
         public Asset Load(string name, AssetManager manager)
         {
             var cachePath = AssetDatabase.ResolveCachePath(name, "DdsTextureData");
-            if (cachePath == null || !File.Exists(cachePath))
+            if (cachePath == null || !Artifacts.Exists(cachePath))
                 throw new FileNotFoundException($"Cache file not found for texture '{name}'");
 
             return LoadFromCache(cachePath, name, manager);
@@ -27,7 +27,7 @@ namespace Freefall.Assets.Loaders
         public Asset LoadFromCache(string cachePath, string name, AssetManager manager, string sourceGuid = null)
         {
             DdsTextureData ddsData;
-            using (var stream = File.OpenRead(cachePath))
+            using (var stream = Artifacts.Open(cachePath))
                 ddsData = _packer.Read(stream);
 
             var cpuData = Texture.ParseDDSFromBytes(ddsData.Bytes);

@@ -178,7 +178,7 @@ namespace Freefall.Assets
             {
                 var loader = FindLoader(asset.GetType());
                 var cachePath = AssetDatabase.ResolveCachePathByGuid(guid);
-                if (loader == null || cachePath == null || !File.Exists(cachePath))
+                if (loader == null || cachePath == null || !Artifacts.Exists(cachePath))
                     continue;
 
                 try
@@ -432,7 +432,7 @@ namespace Freefall.Assets
 
             // Resolve GUID → cache file path
             var cachePath = AssetDatabase.ResolveCachePathByGuid(guid);
-            if (cachePath == null || !File.Exists(cachePath))
+            if (cachePath == null || !Artifacts.Exists(cachePath))
             {
                 Debug.LogWarning("AssetManager", $"Cannot resolve GUID '{guid}' for type {typeof(T).Name}");
                 return null;

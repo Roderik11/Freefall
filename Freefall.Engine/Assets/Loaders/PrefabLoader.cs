@@ -17,7 +17,7 @@ namespace Freefall.Assets.Loaders
         public Asset Load(string name, AssetManager manager)
         {
             var cachePath = AssetDatabase.ResolveCachePath(name, "PrefabData");
-            if (cachePath == null || !File.Exists(cachePath))
+            if (cachePath == null || !Artifacts.Exists(cachePath))
                 throw new FileNotFoundException($"Cache file not found for prefab '{name}'");
 
             return LoadFromCache(cachePath, name, manager);
@@ -26,7 +26,7 @@ namespace Freefall.Assets.Loaders
         public Asset LoadFromCache(string cachePath, string name, AssetManager manager, string sourceGuid = null)
         {
             PrefabData data;
-            using (var stream = File.OpenRead(cachePath))
+            using (var stream = Artifacts.Open(cachePath))
                 data = _packer.Read(stream);
 
             var prefab = new Prefab
@@ -49,7 +49,7 @@ namespace Freefall.Assets.Loaders
             if (existing is not Prefab prefab)
                 return false;
 
-            using (var stream = File.OpenRead(cachePath))
+            using (var stream = Artifacts.Open(cachePath))
                 prefab.SourceYaml = _packer.Read(stream).Yaml;
             return true;
         }

@@ -62,9 +62,9 @@ namespace Freefall.Editor.Publishing
         public IEnumerable<BuildArtifact> Scenes => Artifacts.Where(a => a.DataType == nameof(SceneData));
 
         public static string Size(long bytes) =>
-            bytes >= 1L << 30 ? $"{bytes / (double)(1L << 30):0.00} GB"
-            : bytes >= 1L << 20 ? $"{bytes / (double)(1L << 20):0.0} MB"
-            : $"{bytes / 1024.0:0.0} KB";
+            bytes >= 1L << 30 ? FormattableString.Invariant($"{bytes / (double)(1L << 30):0.00} GB")
+            : bytes >= 1L << 20 ? FormattableString.Invariant($"{bytes / (double)(1L << 20):0.0} MB")
+            : FormattableString.Invariant($"{bytes / 1024.0:0.0} KB");
 
         /// <summary>Totals per data type, largest first.</summary>
         public List<(string Type, int Count, long Bytes)> ByType() => Artifacts

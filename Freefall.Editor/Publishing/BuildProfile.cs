@@ -20,6 +20,19 @@ namespace Freefall.Editor.Publishing
         [Description("Folder the game is written to, absolute or relative to the project folder. Empty = Builds/<profile name>. The build report goes next to it")]
         public string OutputFolder = "";
 
+        [Description("Largest pack file in MB: the artifacts go into data0.ffpack, data1.ffpack, … in the order the scan reached them, a new pack once this size would be passed")]
+        public int PackSizeLimitMB = 2048;
+
+        /// <summary>The profile with this GUID, or at this path relative to Assets; null if there is none.</summary>
+        public static BuildProfile? Find(string key)
+        {
+            if (string.IsNullOrEmpty(key)) return null;
+            var guid = AssetDatabase.GetMeta(key) != null ? key : AssetDatabase.PathToGuid(key);
+            if (guid == null || AssetDatabase.GetAssetType(guid) is not { } type || !typeof(BuildProfile).IsAssignableFrom(type))
+                return null;
+            return Engine.Assets.LoadByGuid<BuildProfile>(guid);
+        }
+
         /// <summary>The product name, falling back to the project's.</summary>
         public string ResolvedProductName =>
             !string.IsNullOrWhiteSpace(ProductName) ? ProductName.Trim() : Engine.Project?.Name ?? Name;
@@ -49,6 +62,27 @@ namespace Freefall.Editor.Publishing
                           $"{scan.Warnings.Count} warnings, {scan.Elapsed.TotalSeconds:0.0} s. Report: {ReportPath}";
             Debug.Log(summary);
             Toast.Show($"{scan.Artifacts.Count:N0} assets, {BuildScan.Size(scan.TotalBytes)}: report written", 3f);
+        }
+
+        [Button]
+        [Description("Scan, then write the packs and the manifest into Data/ in the output folder and check every packed artifact against its Cache file (on a worker; a toast says when it is done). No executable yet")]
+        public void WritePacks()
+        {
+            var task = PackBuilder.Start(this, verify: true);
+            Toast.Show("Writing packs…", 2f);
+            task.ContinueWith(t => Engine.RunOnMainThreadAsync(() =>
+            {
+                if (t.IsFaulted)
+                {
+                    Debug.LogError($"[Build] {Name}: writing packs failed: {t.Exception?.GetBaseException().Message}");
+                    Toast.Show("Writing packs failed: see the console", 3f);
+                    return;
+                }
+                var r = t.Result;
+                Debug.Log($"[Build] {Name}: {r.Entries:N0} artifacts, {BuildScan.Size(r.Bytes)} in {r.Packs.Count} pack(s), " +
+                          $"written in {r.WriteTime.TotalSeconds:0.0} s, {r.Mismatches} mismatches, {r.Problems.Count} problems: {r.DataFolder}");
+                Toast.Show($"{r.Packs.Count} pack(s), {BuildScan.Size(r.Bytes)}, {r.Mismatches} mismatches", 3f);
+            }));
         }
     }
 }

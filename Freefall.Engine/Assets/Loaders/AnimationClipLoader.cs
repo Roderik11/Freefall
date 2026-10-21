@@ -18,7 +18,7 @@ namespace Freefall.Assets.Loaders
         public Asset Load(string name, AssetManager manager)
         {
             var cachePath = AssetDatabase.ResolveCachePath(name, "AnimationClip");
-            if (cachePath == null || !File.Exists(cachePath))
+            if (cachePath == null || !Artifacts.Exists(cachePath))
                 throw new FileNotFoundException($"Cache file not found for animation clip '{name}'");
 
             // Extract GUID from cache path (format: .../XX/{guid}.anim)
@@ -30,7 +30,7 @@ namespace Freefall.Assets.Loaders
         public Asset LoadFromCache(string cachePath, string name, AssetManager manager, string sourceGuid = null)
         {
             AnimationClip clip;
-            using (var stream = File.OpenRead(cachePath))
+            using (var stream = Artifacts.Open(cachePath))
                 clip = _packer.Read(stream);
 
             clip.Name = name;

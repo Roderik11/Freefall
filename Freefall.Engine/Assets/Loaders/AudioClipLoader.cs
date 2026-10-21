@@ -20,7 +20,7 @@ namespace Freefall.Assets.Loaders
         public Asset Load(string name, AssetManager manager)
         {
             var cachePath = AssetDatabase.ResolveCachePath(name, "AudioClipData");
-            if (cachePath == null || !File.Exists(cachePath))
+            if (cachePath == null || !Artifacts.Exists(cachePath))
                 throw new FileNotFoundException($"Cache file not found for audio clip '{name}'");
 
             return LoadFromCache(cachePath, name, manager);
@@ -34,7 +34,7 @@ namespace Freefall.Assets.Loaders
         public Asset LoadFromCache(string cachePath, string name, AssetManager manager, string sourceGuid = null)
         {
             AudioClipData clipData;
-            using (var stream = File.OpenRead(cachePath))
+            using (var stream = Artifacts.Open(cachePath))
                 clipData = _packer.Read(stream);
 
             // Kept compressed: only the length is read here (from the headers and the last page)

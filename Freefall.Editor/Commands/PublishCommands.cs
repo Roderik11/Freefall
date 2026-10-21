@@ -25,13 +25,9 @@ namespace Freefall.Editor.Commands
             if (string.IsNullOrEmpty(key))
                 return CommandResult.BadRequest("'profile' is required: the BuildProfile's GUID or its path relative to Assets");
 
-            var guid = AssetDatabase.GetMeta(key) != null ? key : AssetDatabase.PathToGuid(key);
-            if (guid == null || AssetDatabase.GetAssetType(guid) is not { } type || !typeof(BuildProfile).IsAssignableFrom(type))
-                return CommandResult.NotFound($"No BuildProfile asset at {key}");
-
-            var profile = Engine.Assets.LoadByGuid<BuildProfile>(guid);
+            var profile = BuildProfile.Find(key);
             if (profile == null)
-                return CommandResult.Error(500, $"The BuildProfile {key} did not load");
+                return CommandResult.NotFound($"No BuildProfile asset at {key}");
 
             bool compareLoaded = doc.RootElement.TryGetProperty("compareLoaded", out var cl) && cl.ValueKind == System.Text.Json.JsonValueKind.True;
 

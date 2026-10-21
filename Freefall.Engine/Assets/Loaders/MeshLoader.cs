@@ -21,7 +21,7 @@ namespace Freefall.Assets.Loaders
         public Asset Load(string name, AssetManager manager)
         {
             var cachePath = AssetDatabase.ResolveCachePath(name, "MeshData");
-            if (cachePath == null || !File.Exists(cachePath))
+            if (cachePath == null || !Artifacts.Exists(cachePath))
                 throw new FileNotFoundException($"Cache file not found for mesh '{name}'");
 
             // Extract GUID from cache path (format: .../XX/{guid}.mesh)
@@ -83,7 +83,7 @@ namespace Freefall.Assets.Loaders
         private MeshData ReadMeshData(string cachePath)
         {
             MeshData meshData;
-            using (var stream = File.OpenRead(cachePath))
+            using (var stream = Artifacts.Open(cachePath))
                 meshData = _packer.Read(stream);
 
             // Match Apex MeshReader: sort parts alphabetically by name

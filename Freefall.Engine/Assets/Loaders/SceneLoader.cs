@@ -16,7 +16,7 @@ namespace Freefall.Assets.Loaders
         public Asset Load(string name, AssetManager manager)
         {
             var cachePath = AssetDatabase.ResolveCachePath(name, nameof(SceneData));
-            if (cachePath == null || !File.Exists(cachePath))
+            if (cachePath == null || !Artifacts.Exists(cachePath))
                 throw new FileNotFoundException($"Cache file not found for scene '{name}'");
 
             return LoadFromCache(cachePath, name, manager);
@@ -25,7 +25,7 @@ namespace Freefall.Assets.Loaders
         public Asset LoadFromCache(string cachePath, string name, AssetManager manager, string sourceGuid = null)
         {
             SceneData data;
-            using (var stream = File.OpenRead(cachePath))
+            using (var stream = Artifacts.Open(cachePath))
                 data = _packer.Read(stream);
 
             var scene = new SceneAsset
@@ -47,7 +47,7 @@ namespace Freefall.Assets.Loaders
             if (existing is not SceneAsset scene)
                 return false;
 
-            using (var stream = File.OpenRead(cachePath))
+            using (var stream = Artifacts.Open(cachePath))
                 scene.Yaml = _packer.Read(stream).Yaml;
             return true;
         }

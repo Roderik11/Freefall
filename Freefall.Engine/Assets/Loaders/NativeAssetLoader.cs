@@ -19,7 +19,7 @@ namespace Freefall.Assets.Loaders
         public Asset Load(string name, AssetManager manager)
         {
             var cachePath = AssetDatabase.ResolveCachePath(name, "AssetDefinitionData");
-            if (cachePath == null || !File.Exists(cachePath))
+            if (cachePath == null || !Artifacts.Exists(cachePath))
                 throw new FileNotFoundException($"Cache file not found for asset '{name}'");
 
             return LoadFromCache(cachePath, name, manager);
@@ -28,7 +28,7 @@ namespace Freefall.Assets.Loaders
         public Asset LoadFromCache(string cachePath, string name, AssetManager manager, string sourceGuid = null)
         {
             AssetDefinitionData defData;
-            using (var stream = File.OpenRead(cachePath))
+            using (var stream = Artifacts.Open(cachePath))
                 defData = _packer.Read(stream);
 
             var yaml = Encoding.UTF8.GetString(defData.YamlBytes);
@@ -54,7 +54,7 @@ namespace Freefall.Assets.Loaders
         public bool Reload(Asset existing, string cachePath, string name, AssetManager manager, string guid)
         {
             string yaml;
-            using (var stream = File.OpenRead(cachePath))
+            using (var stream = Artifacts.Open(cachePath))
                 yaml = Encoding.UTF8.GetString(_packer.Read(stream).YamlBytes);
 
             // The reimport that follows saving this very instance: it already holds that state, and reading

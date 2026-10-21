@@ -22,7 +22,7 @@ namespace Freefall.Assets.Loaders
         public Asset Load(string name, AssetManager manager)
         {
             var cachePath = AssetDatabase.ResolveCachePath(name, "AssetDefinitionData");
-            if (cachePath == null || !File.Exists(cachePath))
+            if (cachePath == null || !Artifacts.Exists(cachePath))
                 throw new FileNotFoundException($"Cache file not found for navmesh '{name}'");
 
             return LoadFromCache(cachePath, name, manager);
@@ -37,7 +37,7 @@ namespace Freefall.Assets.Loaders
             try
             {
                 AssetDefinitionData defData;
-                using (var stream = File.OpenRead(cachePath))
+                using (var stream = Artifacts.Open(cachePath))
                     defData = _packer.Read(stream);
 
                 var yaml = Encoding.UTF8.GetString(defData.YamlBytes);
@@ -84,12 +84,12 @@ namespace Freefall.Assets.Loaders
             if (navSub == null) return;
 
             var cachePath = AssetDatabase.ResolveCachePathByGuid(navSub.Guid);
-            if (cachePath == null || !File.Exists(cachePath)) return;
+            if (cachePath == null || !Artifacts.Exists(cachePath)) return;
 
             try
             {
                 var packer = new NavMeshDataPacker();
-                using var stream = File.OpenRead(cachePath);
+                using var stream = Artifacts.Open(cachePath);
                 var data = packer.Read(stream);
 
                 var tiles = Navigation.NavMeshTileSet.FromBytes(data?.BakedBytes);

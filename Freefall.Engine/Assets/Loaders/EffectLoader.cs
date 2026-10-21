@@ -16,7 +16,7 @@ namespace Freefall.Assets.Loaders
         public Asset Load(string name, AssetManager manager)
         {
             var cachePath = AssetDatabase.ResolveCachePath(name, nameof(EffectSourceData));
-            if (cachePath == null || !File.Exists(cachePath))
+            if (cachePath == null || !Artifacts.Exists(cachePath))
                 throw new FileNotFoundException($"Cache file not found for effect '{name}'");
 
             return LoadFromCache(cachePath, name, manager);
@@ -43,7 +43,7 @@ namespace Freefall.Assets.Loaders
 
         private EffectSourceData Read(string cachePath)
         {
-            using var stream = File.OpenRead(cachePath);
+            using var stream = Artifacts.Open(cachePath);
             return _packer.Read(stream);
         }
 

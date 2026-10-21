@@ -26,7 +26,7 @@ namespace Freefall.Assets.Loaders
         public Asset Load(string name, AssetManager manager)
         {
             var cachePath = AssetDatabase.ResolveCachePath(name, "AssetDefinitionData");
-            if (cachePath == null || !File.Exists(cachePath))
+            if (cachePath == null || !Artifacts.Exists(cachePath))
                 throw new FileNotFoundException($"Cache file not found for terrain '{name}'");
 
             return LoadFromCache(cachePath, name, manager);
@@ -43,7 +43,7 @@ namespace Freefall.Assets.Loaders
                 Debug.Log($"[TerrainLoader] Loading '{name}' from {cachePath}");
 
                 AssetDefinitionData defData;
-                using (var stream = File.OpenRead(cachePath))
+                using (var stream = Artifacts.Open(cachePath))
                     defData = _packer.Read(stream);
 
                 // Deserialize YAML and auto-resolve all asset GUID references
@@ -111,10 +111,10 @@ namespace Freefall.Assets.Loaders
                 if (collisionSub == null) return;
 
                 var physxPath = AssetDatabase.ResolveCachePathByGuid(collisionSub.Guid);
-                if (physxPath == null || !File.Exists(physxPath)) return;
+                if (physxPath == null || !Artifacts.Exists(physxPath)) return;
 
                 var packer = new CollisionMeshPacker();
-                using var stream = File.OpenRead(physxPath);
+                using var stream = Artifacts.Open(physxPath);
                 var cooked = packer.Read(stream);
 
                 Debug.Log($"[TerrainLoader] Cooked bytes loaded: {cooked.CookedBytes.Length} bytes from {physxPath}");
@@ -198,13 +198,13 @@ namespace Freefall.Assets.Loaders
             if (string.IsNullOrEmpty(guid)) return null;
 
             var cachePath = AssetDatabase.ResolveCachePathByGuid(guid);
-            if (cachePath == null || !File.Exists(cachePath))
+            if (cachePath == null || !Artifacts.Exists(cachePath))
                 cachePath = BakedMapFallbackPath(guid);
-            if (!File.Exists(cachePath)) return null;
+            if (!Artifacts.Exists(cachePath)) return null;
 
             try
             {
-                using var stream = File.OpenRead(cachePath);
+                using var stream = Artifacts.Open(cachePath);
                 var data = _ddsPacker.Read(stream);
                 if (data?.Bytes == null || data.Bytes.Length == 0) return null;
 
@@ -426,10 +426,10 @@ namespace Freefall.Assets.Loaders
         public IEnumerable<ImplicitArtifact> GetImplicitDependencies(string guid)
         {
             var cachePath = AssetDatabase.ResolveCachePathByGuid(guid);
-            if (cachePath == null || !File.Exists(cachePath)) yield break;
+            if (cachePath == null || !Artifacts.Exists(cachePath)) yield break;
 
             AssetDefinitionData defData;
-            using (var stream = File.OpenRead(cachePath))
+            using (var stream = Artifacts.Open(cachePath))
                 defData = _packer.Read(stream);
 
             foreach (System.Text.RegularExpressions.Match m in BakedMapRef.Matches(Encoding.UTF8.GetString(defData.YamlBytes)))

@@ -21,7 +21,7 @@ namespace Freefall.Assets.Loaders
         public Asset Load(string name, AssetManager manager)
         {
             var cachePath = AssetDatabase.ResolveCachePath(name, "AssetDefinitionData");
-            if (cachePath == null || !File.Exists(cachePath))
+            if (cachePath == null || !Artifacts.Exists(cachePath))
                 throw new FileNotFoundException($"Cache file not found for material '{name}'");
 
             return LoadFromCache(cachePath, name, manager);
@@ -30,7 +30,7 @@ namespace Freefall.Assets.Loaders
         public Asset LoadFromCache(string cachePath, string name, AssetManager manager, string sourceGuid = null)
         {
             AssetDefinitionData defData;
-            using (var stream = File.OpenRead(cachePath))
+            using (var stream = Artifacts.Open(cachePath))
                 defData = _packer.Read(stream);
 
             // Deserialize YAML â†’ MaterialDefinition
@@ -59,7 +59,7 @@ namespace Freefall.Assets.Loaders
                 return false;
 
             MaterialDefinition def;
-            using (var stream = File.OpenRead(cachePath))
+            using (var stream = Artifacts.Open(cachePath))
                 def = NativeImporter.LoadFromString(Encoding.UTF8.GetString(_packer.Read(stream).YamlBytes)) as MaterialDefinition;
             if (def == null)
                 throw new InvalidDataException($"Failed to deserialize Material from cache: {name}");

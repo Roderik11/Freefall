@@ -91,6 +91,9 @@ namespace Freefall.Assets
             DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
         };
 
+        /// <summary>How metas are written as JSON (Library/*.meta, and the manifest of a published game).</summary>
+        internal static JsonSerializerOptions MetaJsonOptions => _jsonOptions;
+
         private static readonly JsonSerializerOptions _importerJsonOptions = new()
         {
             WriteIndented = false,
@@ -117,6 +120,24 @@ namespace Freefall.Assets
             progress?.Invoke($"{_guidToMeta.Count} assets", 1f);
             Debug.Log($"[AssetDatabase] Initialized: {_guidToMeta.Count} assets tracked, " +
                       $"{_importersByExtension.Count} importers, {_packers.Count} packers, {_guidToThumb.Count} thumbnails");
+        }
+
+        /// <summary>
+        /// Initialize for a published game: register the metas its manifest carries (the packed assets, cut down to their
+        /// packed artifacts) and nothing else. No scan of Assets/ (there is none: a scan would delete every meta whose
+        /// source is missing), no imports, no watchers, no thumbnails. The lookups the loaders make (types, friendly
+        /// names, siblings, importer settings) then answer as in the editor; the artifacts come from mounted packs
+        /// (<see cref="Artifacts.Mount"/>). <paramref name="project"/> only gives the paths that cache paths are built on.
+        /// </summary>
+        public static void InitializeFromManifest(FreefallProject project, Packs.PackManifest manifest)
+        {
+            Project = project;
+            Clear();
+            DiscoverImporters();
+            DiscoverPackers();
+            foreach (var meta in manifest.Metas)
+                RegisterMeta(meta);
+            Debug.Log($"[AssetDatabase] Initialized from the manifest: {_guidToMeta.Count} assets, {manifest.Scenes.Count} scenes");
         }
 
         /// <summary>

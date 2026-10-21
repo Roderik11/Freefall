@@ -727,7 +727,11 @@ CloudMarchResult CloudMarchClouds(CloudParams C, AtmosphereParams A, Texture3D<f
         // never past the scene's surface
         float step = voxel * 0.6 * stepScale * (0.75 + 0.5 * jitter);
         step = min(min(step, max(4.0, 0.25 * t)), tEnd - t);
-        float3 p = dir * (t + step * 0.5);
+        // Anywhere in the step, by the jitter: steps restart at the wall where an empty brick is left, so at mid-step every
+        // ray read the cloud's base at a depth set by which wall it came through. Seen from below, the bricks' vertical
+        // walls run out from the zenith: a fan of sharp wedges over every cloud overhead, standing still as the cloud
+        // drifted through the camera's bricks (user, 2026-10-21). The jitter changes every frame; the history averages it.
+        float3 p = dir * (t + step * jitter);
         float hp = CloudHeight(p);
         float2 xzp = C.CameraCloud + p.xz;
         float2 field = CloudSample(C, xzp, hp, dist, CloudWrap);
