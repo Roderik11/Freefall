@@ -22,7 +22,9 @@ namespace Freefall.Player
     /// packs, and FreefallScripts.dll (the project's scripts). It opens a window (borderless fullscreen; Alt+Enter
     /// toggles a window), starts the engine in game mode on the packs, loads the scripts, starts loading the build's
     /// first scene (SceneManager.LoadAsync, from the first frame on) and draws the game's UI (GameUI, Graphics.Overlay)
-    /// over the picture. Writes player.log next to the game.
+    /// over the picture. Writes nothing into its own folder, which an installer may have made read-only (Program Files):
+    /// what it writes goes to %LOCALAPPDATA%\&lt;Product&gt; (<see cref="UserFolder"/>): player.log (the run before is
+    /// player-prev.log) and the shader cache.
     /// Development switches: <c>--game &lt;folder&gt;</c>, <c>--windowed [WxH]</c>, <c>--screenshot &lt;seconds&gt; &lt;file.png&gt;</c>
     /// (the window that long after the first scene is ready; a negative number: that long after the window opened, while it
     /// may still load), <c>--quit &lt;seconds&gt;</c> (after the first scene is ready).
@@ -52,6 +54,7 @@ namespace Freefall.Player
         {
             Thread.CurrentThread.CurrentCulture = CultureInfo.InvariantCulture;
             ParseArgs(args);
+            UserFolder = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), ProductName());
             StartLog();
 
             try
@@ -71,6 +74,51 @@ namespace Freefall.Player
             }
         }
 
+        /// <summary>
+        /// Where the game writes: %LOCALAPPDATA%\&lt;Product&gt;. Its own folder may be read-only (installed for all users
+        /// under Program Files), and a write there threw UnauthorizedAccessException at the first line of the log.
+        /// </summary>
+        static string UserFolder = "";
+
+        // No shader compiled yet for this game on this computer: its first start (or one after the cache was cleared)
+        static bool FirstStart()
+        {
+            var cache = Path.Combine(UserFolder, "ShaderCache");
+            try { return !Directory.Exists(cache) || !Directory.EnumerateFiles(cache, "*.cso").Any(); }
+            catch (Exception) { return false; }
+        }
+
+        // What the window says while the engine starts compiling its shaders: plain WinForms text on the black window,
+        // painted before Engine.Initialize blocks the thread, and taken away before the first frame
+        static System.Windows.Forms.Label ShowPreparingNotice()
+        {
+            var notice = new System.Windows.Forms.Label
+            {
+                Text = "Preparing shaders for your graphics card\n\nThe first start takes a little longer. After that the game starts at once.",
+                Dock = DockStyle.Fill,
+                TextAlign = System.Drawing.ContentAlignment.MiddleCenter,
+                ForeColor = System.Drawing.Color.FromArgb(204, 189, 158),   // the title's worn bone, no clean white
+                BackColor = System.Drawing.Color.Black,
+                Font = new System.Drawing.Font("Segoe UI", 15f),
+            };
+            form.Controls.Add(notice);
+            form.Refresh();
+            Log("[Player] First start: compiling the shaders");
+            return notice;
+        }
+
+        // The product's name from the manifest, before anything else is read (the log goes into its folder); "Freefall"
+        // when the manifest cannot be read, which Run then reports
+        static string ProductName()
+        {
+            try
+            {
+                var product = PackManifest.Load(Path.Combine(gameFolder, "Data", PackManifest.FileName)).Product;
+                return string.IsNullOrWhiteSpace(product) ? "Freefall" : product;
+            }
+            catch (Exception) { return "Freefall"; }
+        }
+
         static void Run()
         {
             var dataFolder = Path.Combine(gameFolder, "Data");
@@ -81,7 +129,7 @@ namespace Freefall.Player
 
             // Its own shader cache, not the editor's, and the engine's files from their pack: before the engine compiles its
             // first shader (Engine.Initialize)
-            ShaderCache.SetRoot(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), product, "ShaderCache"));
+            ShaderCache.SetRoot(Path.Combine(UserFolder, "ShaderCache"));
             if (!string.IsNullOrEmpty(manifest.EnginePack))
                 EngineFiles.Mount(PackSet.Open(new[] { Path.Combine(dataFolder, manifest.EnginePack) }));
 
@@ -90,6 +138,10 @@ namespace Freefall.Player
             if (windowed) form.ClientSize = windowSize;
             else Fullscreen(true);
             form.Show();
+
+            // The first start compiles every shader the engine starts with (~100, 11 s) before the window shows anything: it
+            // says so meanwhile, in plain text, since nothing of the engine can draw yet
+            var notice = FirstStart() ? ShowPreparingNotice() : null;
 
             Engine.Initialize(form.Handle, form.ClientSize.Width, form.ClientSize.Height, editor: false);
             view = RenderView.All[0];
@@ -123,6 +175,14 @@ namespace Freefall.Player
             LoadScripts();
             CommandBuffer.PrepareCuller(Engine.Device);
             CommandBuffer.InitializeCuller(Engine.Device);
+            if (notice != null)
+            {
+                // From the first frame on the game says it itself (the loading screen, while shaders compile)
+                form.Controls.Remove(notice);
+                notice.Dispose();
+                var stats = Shader.CacheStats;
+                Log($"[Player] First start: {stats.Misses} shaders compiled before the first frame ({stats.CompileMs / 1000:0.0} s of DXC)");
+            }
 
             // Every scene's cameras draw into the window (the start scene, and any game code loads later)
             SceneManager.Loaded += (scene, entities) =>
@@ -288,17 +348,23 @@ namespace Freefall.Player
             }
         }
 
-        /// <summary>player.log next to the game: what the engine reports (warnings, errors, LogAlways) and the player's own lines.</summary>
+        /// <summary>
+        /// player.log in <see cref="UserFolder"/>: what the engine reports (warnings, errors, LogAlways) and the player's own
+        /// lines. The last run's log is kept as player-prev.log. No log at all (the game runs on) when none can be written.
+        /// </summary>
         static void StartLog()
         {
             try
             {
-                log = new StreamWriter(Path.Combine(gameFolder, "player.log"), append: false) { AutoFlush = true };
+                Directory.CreateDirectory(UserFolder);
+                var path = Path.Combine(UserFolder, "player.log");
+                if (File.Exists(path)) File.Copy(path, Path.Combine(UserFolder, "player-prev.log"), overwrite: true);
+                log = new StreamWriter(path, append: false) { AutoFlush = true };
                 Freefall.Debug.OnLog += (message, _) => Log(message);
                 AppDomain.CurrentDomain.UnhandledException += (s, e) => Log($"[Player] Unhandled: {e.ExceptionObject}");
-                Log($"[Player] {DateTime.Now:yyyy-MM-dd HH:mm:ss}, game folder {gameFolder}");
+                Log($"[Player] {DateTime.Now:yyyy-MM-dd HH:mm:ss}, game folder {gameFolder}, log {path}");
             }
-            catch (IOException) { log = null; }
+            catch (Exception) { log = null; }   // read-only, full, or denied: an IOException is not the only one
         }
 
         static readonly object logLock = new();

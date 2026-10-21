@@ -33,6 +33,10 @@ namespace Freefall.Editor.Publishing
         public static string EngineResources(string project) =>
             Path.Combine(Path.GetDirectoryName(Path.GetDirectoryName(project)!)!, "Freefall.Engine", "Resources");
 
+        /// <summary>The icon the player's exe is built with (its ApplicationIcon, the editor's icon.ico), for the installer too.</summary>
+        public static string AppIcon(string project) =>
+            Path.Combine(Path.GetDirectoryName(Path.GetDirectoryName(project)!)!, "Freefall.Editor", "icon.ico");
+
         /// <summary>Resources folders nothing reads at run time: not packed (Terrain: old splat maps).</summary>
         public static readonly string[] UnusedResources = { "Terrain" };
 

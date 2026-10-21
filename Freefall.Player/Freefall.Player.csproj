@@ -12,6 +12,8 @@
     <UseWindowsForms>false</UseWindowsForms>
     <!-- No translated framework messages (cs, de, ... folders: 17 MB of a publish) -->
     <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+    <!-- The engine's logo (the editor's icon) for the game's exe, its shortcuts and its installer -->
+    <ApplicationIcon>..\Freefall.Editor\icon.ico</ApplicationIcon>
   </PropertyGroup>
 
   <ItemGroup>

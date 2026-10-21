@@ -29,6 +29,17 @@ namespace Freefall.Editor.Publishing
         [Description("Pixels per metre a texture should keep where it shows coarsest: the report flags textures that would fall below it at the budget, the candidates for kit pieces, tiling materials or trim sheets")]
         public float TexelDensityTarget = 512;
 
+        [Category("Installer")]
+        [Description("After Publish, an installer (Inno Setup 6, which has to be installed): \"<Product> Setup.exe\" in a folder beside the game's, " +
+                     "installing it for the user who runs it (no admin prompt) with Start menu and desktop shortcuts and an uninstaller")]
+        public bool MakeInstaller;
+
+        [Description("The game's version, in the installer and Apps & features (\"0.3.1\"; up to four numbers, a tail like \"-beta\" is shown but not counted)")]
+        public string Version = "0.1.0";
+
+        [Description("Who makes the game, in Apps & features. Empty = none")]
+        public string Company = "";
+
         /// <summary>The scan's textures against <see cref="TextureBudget"/>, or null when it is 0. Worker-safe.</summary>
         public TextureBudgetResult? MeasureTextures(BuildScan scan, Action<string, float>? report = null) =>
             TextureBudget > 0 ? TextureBudgetScan.Measure(scan, TextureBudget, TexelDensityTarget, report) : null;

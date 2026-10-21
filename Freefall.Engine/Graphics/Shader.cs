@@ -31,6 +31,21 @@ namespace Freefall.Graphics
         /// Since start: compiles answered from memory / from the disk cache / run through DXC, DXC's total time in ms,
         /// and the bytecode kept in memory.
         /// </summary>
+        /// <summary>
+        /// Seconds since DXC last compiled a shader, or infinity when it has not this run: a game's first start compiles
+        /// them as they are needed (no cache yet), and its UI can say so while they come (a loading screen staying up).
+        /// </summary>
+        public static double SecondsSinceCompile
+        {
+            get
+            {
+                long t = Interlocked.Read(ref _lastCompile);
+                return t == 0 ? double.PositiveInfinity : System.Diagnostics.Stopwatch.GetElapsedTime(t).TotalSeconds;
+            }
+        }
+
+        private static long _lastCompile;
+
         public static (int Hits, int DiskHits, int Misses, double CompileMs, long Bytes) CacheStats =>
             (_memoryHits, _diskHits, _cacheMisses, _compileTicks * 1000.0 / System.Diagnostics.Stopwatch.Frequency,
              Interlocked.Read(ref _cachedBytes));
@@ -65,7 +80,9 @@ namespace Freefall.Graphics
             {
                 long start = System.Diagnostics.Stopwatch.GetTimestamp();
                 bytecode = CompileWithDxc(source, args, entryPoint, profile);
-                Interlocked.Add(ref _compileTicks, System.Diagnostics.Stopwatch.GetTimestamp() - start);
+                long end = System.Diagnostics.Stopwatch.GetTimestamp();
+                Interlocked.Add(ref _compileTicks, end - start);
+                Interlocked.Exchange(ref _lastCompile, end);
                 Interlocked.Increment(ref _cacheMisses);
                 ShaderCache.Write(key, bytecode);
             }

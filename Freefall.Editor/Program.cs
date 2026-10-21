@@ -88,6 +88,9 @@ namespace Freefall.Editor
 
             form.Show();
 
+            // Its shader cache from before it had a folder of its own (a game named Freefall shares the old one)
+            Freefall.Graphics.ShaderCache.MoveOldEditorCache();
+
             // Initialize engine WITHOUT a project (landing page first)
             Engine.Initialize(form.Handle, form.ClientSize.Width, form.ClientSize.Height);
 

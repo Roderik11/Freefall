@@ -55,7 +55,8 @@ namespace Freefall.Editor.Mcp
         [Description("Write a BuildProfile's game into its output folder (or 'output'), ready to run, as the profile's Publish button does: " +
                      "scan, compile the scripts (Release), build the player (dotnet publish, win-x64, self-contained; kept in the project's " +
                      "Library between publishes), copy it with the exe named after the product, write the packs and the manifest into Data/, " +
-                     "and append a summary to the build report next to the folder. The editor shows its modal progress popup meanwhile, and a " +
+                     "and append a summary to the build report next to the folder; with the profile's MakeInstaller (or installer=true) also " +
+                     "an Inno Setup installer in '<output> Installer'. The editor shows its modal progress popup meanwhile, and a " +
                      "popup on failure. Everything a publish wrote in the folder before is replaced; a non-empty folder without .freefall-build " +
                      "is refused. Changed assets the build reaches stop it unless saveChanged. Gigabytes: this call waits up to waitSeconds; " +
                      "editor_status reports the step meanwhile.")]
@@ -65,6 +66,7 @@ namespace Freefall.Editor.Mcp
             [Description("Read every packed artifact back and compare it with its Cache file (about 13 s for 4.7 GB)")] bool verify = false,
             [Description("Save the changed assets the build reaches first (as Save Changed Assets does)")] bool saveChanged = false,
             [Description("Start the game once it is written")] bool run = false,
+            [Description("Make the installer (Inno Setup 6) or not, whatever the profile's MakeInstaller says; omit = the profile's setting")] bool? installer = null,
             [Description("Max seconds to wait")] int waitSeconds = 900)
         {
             Task<PublishResult> task;
@@ -73,7 +75,7 @@ namespace Freefall.Editor.Mcp
                 task = await EditorCommandServer.Instance.RunOnMainThread(() =>
                 {
                     var p = BuildProfile.Find(profile) ?? throw new InvalidOperationException($"No BuildProfile asset at {profile}");
-                    return Publisher.Start(p, new PublishOptions { Output = output, Verify = verify, SaveChanged = saveChanged, Run = run });
+                    return Publisher.Start(p, new PublishOptions { Output = output, Verify = verify, SaveChanged = saveChanged, Run = run, Installer = installer });
                 });
             }
             catch (Exception ex)
@@ -114,6 +116,7 @@ namespace Freefall.Editor.Mcp
                 }).ToArray()),
                 ["verified"] = r.Packs.Verified,
                 ["mismatches"] = r.Packs.Mismatches,
+                ["installer"] = r.Installer.Length > 0 ? new JsonObject { ["setup"] = r.Installer, ["size"] = BuildScan.Size(r.InstallerBytes) } : null,
                 ["warnings"] = new JsonArray(r.Warnings.Take(30).Select(w => (JsonNode)w).ToArray()),
             });
         }

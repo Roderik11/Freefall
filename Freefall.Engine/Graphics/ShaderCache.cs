@@ -10,7 +10,8 @@ using Vortice.Dxc;
 namespace Freefall.Graphics
 {
     /// <summary>
-    /// DXC bytecode on disk, one file per compiled shader: %LOCALAPPDATA%\Freefall\ShaderCache\&lt;key&gt;.cso. The key
+    /// DXC bytecode on disk, one file per compiled shader: %LOCALAPPDATA%\Freefall\Editor\ShaderCache\&lt;key&gt;.cso for the
+    /// editor, %LOCALAPPDATA%\&lt;product&gt;\ShaderCache for a game (<see cref="SetRoot"/>). The key
     /// hashes DXC's version, the arguments and the source with its includes inlined, so a file is only ever reused
     /// for exactly what produced it; nothing needs invalidating. Shared by every editor and game build of this user
     /// (the key holds no paths). Files unused for 30 days are deleted. FREEFALL_SHADER_CACHE=0 turns it off.
@@ -22,8 +23,11 @@ namespace Freefall.Graphics
 
         private static readonly bool Enabled = Environment.GetEnvironmentVariable("FREEFALL_SHADER_CACHE") != "0";
 
-        private static string Root = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Freefall", "ShaderCache");
+        // Under Freefall\Editor since 2026-10-22: a game named Freefall keeps its own cache (and logs) in %LOCALAPPDATA%\Freefall,
+        // which its uninstaller clears, and that took the editor's cache with it
+        private static readonly string EditorRoot = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Freefall", "Editor", "ShaderCache");
+        private static string Root = EditorRoot;
 
         /// <summary>
         /// Keep the cache in another folder (a published game: %LOCALAPPDATA%\&lt;product&gt;\ShaderCache, not the editor's).
@@ -37,6 +41,25 @@ namespace Freefall.Graphics
                 return;
             }
             Root = folder;
+        }
+
+        /// <summary>
+        /// The editor, at start: the cache it kept in %LOCALAPPDATA%\Freefall\ShaderCache before 2026-10-22 moves to its
+        /// own folder once, so its shaders do not compile again. Before the first shader compiles.
+        /// </summary>
+        public static void MoveOldEditorCache()
+        {
+            var old = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Freefall", "ShaderCache");
+            if (Root != EditorRoot || Directory.Exists(EditorRoot) || !Directory.Exists(old)) return;
+            try
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(EditorRoot)!);
+                Directory.Move(old, EditorRoot);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                Debug.LogWarning("ShaderCache", $"Could not move {old} to {EditorRoot}: {ex.Message}. Shaders compile anew");
+            }
         }
 
         private static readonly Lazy<string> CompilerIdentity = new(FindCompilerIdentity);

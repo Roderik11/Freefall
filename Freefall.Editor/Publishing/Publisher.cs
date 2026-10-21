@@ -16,6 +16,8 @@ namespace Freefall.Editor.Publishing
         public bool SaveChanged;
         /// <summary>Start the game once it is written.</summary>
         public bool Run;
+        /// <summary>Make the installer (true) or not (false) whatever the profile says; null = the profile's MakeInstaller.</summary>
+        public bool? Installer;
     }
 
     /// <summary>What a publish gave.</summary>
@@ -33,6 +35,9 @@ namespace Freefall.Editor.Publishing
         public List<string> Warnings = new();
         public List<(string Step, double Seconds)> Steps = new();
         public TimeSpan Elapsed;
+        /// <summary>The installer's setup exe, when one was made; its .bin parts lie beside it when the game is over ~2 GB.</summary>
+        public string Installer = "";
+        public long InstallerBytes;
     }
 
     /// <summary>
@@ -47,6 +52,7 @@ namespace Freefall.Editor.Publishing
     /// <item>Copying the player (worker): into the output folder, the exe named after the product.</item>
     /// <item>Writing packs (worker): the assets, then the engine's own files (Data/engine.ffpack: no Resources folder in the
     /// game's), then Verifying packs if asked.</item>
+    /// <item>Building the installer (worker), when the profile asks for one (MakeInstaller): <see cref="InstallerBuild"/>.</item>
     /// </list>
     /// The editor shows a modal progress popup (ModalDialogs, the landing page's) whoever started it, the profile's
     /// button or MCP game_publish. A failure shows a message popup. The summary goes to the console and the end of the
@@ -58,15 +64,16 @@ namespace Freefall.Editor.Publishing
 
 
         const string Checking = "Checking and scanning", Scripts = "Compiling scripts", Player = "Building the player",
-                     Copying = "Copying the player", Packs = "Writing packs", Verifying = "Verifying packs";
+                     Copying = "Copying the player", Packs = "Writing packs", Verifying = "Verifying packs",
+                     Installer = "Building the installer";
 
         // Seconds measured on Freefall-Solid's Game profile (4.7 GB), as weights for the overall fraction; the packs'
         // weights are set from their size once the scan is done
         static readonly Dictionary<string, double> Weights = new()
         {
-            [Checking] = 0.6, [Scripts] = 3, [Player] = 13, [Copying] = 2, [Packs] = 24, [Verifying] = 13,
+            [Checking] = 0.6, [Scripts] = 3, [Player] = 13, [Copying] = 2, [Packs] = 24, [Verifying] = 13, [Installer] = 20,
         };
-        const double WriteBytesPerSecond = 200e6, VerifyBytesPerSecond = 370e6;
+        const double WriteBytesPerSecond = 200e6, VerifyBytesPerSecond = 370e6, InstallerBytesPerSecond = 150e6;
 
         static Task<PublishResult> _completion = Task.FromResult(new PublishResult());
 
@@ -116,14 +123,22 @@ namespace Freefall.Editor.Publishing
             var output = Path.GetFullPath(string.IsNullOrWhiteSpace(options.Output) ? profile.ResolvedOutputFolder : options.Output.Trim());
             var product = profile.ResolvedProductName;
             CheckOutputFolder(output, Engine.Project.RootDirectory);
+            string? iscc = null;
+            if (options.Installer ?? profile.MakeInstaller)
+                iscc = InstallerBuild.FindCompiler() ?? throw new InvalidOperationException(
+                    "The profile makes an installer, and Inno Setup 6 is not installed: install it (jrsoftware.org, or " +
+                    "winget install JRSoftware.InnoSetup), set FREEFALL_ISCC to its ISCC.exe, or turn MakeInstaller off");
             var steps = new List<string> { Checking, Scripts, Player, Copying, Packs };
             if (options.Verify) steps.Add(Verifying);
+            if (iscc != null) steps.Add(Installer);
             var progress = ProgressJob.Start($"Publishing {product}", "Publish", steps.Select(s => (s, Weights[s])).ToArray());
-            _completion = Task.Run(() => RunAsync(profile, options, output, playerProject, progress));
+            string scripts = Path.Combine(Engine.Project.LibraryDirectory, "Installer");
+            _completion = Task.Run(() => RunAsync(profile, options, output, playerProject, progress, iscc, scripts));
             return _completion;
         }
 
-        static async Task<PublishResult> RunAsync(BuildProfile profile, PublishOptions options, string output, string playerProject, ProgressJob progress)
+        static async Task<PublishResult> RunAsync(BuildProfile profile, PublishOptions options, string output, string playerProject, ProgressJob progress,
+                                                  string? iscc, string installerScripts)
         {
             var result = new PublishResult { Product = profile.ResolvedProductName, Output = output, Report = BuildProfile.ReportPathFor(output) };
             void Report(string detail, float fraction) => progress.Report(detail, fraction);
@@ -180,6 +195,7 @@ namespace Freefall.Editor.Publishing
                         long bytes = job.Items.Sum(i => i.Size);
                         SetWeight(Packs, bytes / WriteBytesPerSecond);
                         SetWeight(Verifying, bytes / VerifyBytesPerSecond);
+                        SetWeight(Installer, bytes / InstallerBytesPerSecond);
                     });
                 });
 
@@ -222,6 +238,15 @@ namespace Freefall.Editor.Publishing
                         int before = result.Packs.Problems.Count;
                         PackBuilder.Verify(job, result.Packs, Report);
                         result.Warnings.AddRange(result.Packs.Problems.Skip(before));
+                    }));
+
+                if (iscc != null)
+                    await Step(Installer, () => Task.Run(() =>
+                    {
+                        result.Installer = InstallerBuild.Build(iscc, profile, result.Product, output, Path.GetFileName(result.Exe), installerScripts,
+                                                                PlayerBuild.AppIcon(playerProject), Report);
+                        var folder = Path.GetDirectoryName(result.Installer)!;
+                        result.InstallerBytes = Directory.GetFiles(folder, InstallerBuild.SetupName(result.Product) + "*").Sum(f => new FileInfo(f).Length);
                     }));
 
                 result.Elapsed = progress.Elapsed;
@@ -313,6 +338,8 @@ namespace Freefall.Editor.Publishing
                           (r.Packs.Verified ? $", verified: {r.Packs.Mismatches} mismatches" : ", not verified"));
             foreach (var (file, entries, bytes) in r.Packs.Packs)
                 sb.AppendLine($"    {file}: {entries:N0} artifacts, {BuildScan.Size(bytes)}");
+            if (r.Installer.Length > 0)
+                sb.AppendLine($"  Installer: {r.Installer}, {BuildScan.Size(r.InstallerBytes)}");
             sb.AppendLine("  Steps:");
             foreach (var (step, seconds) in r.Steps)
                 sb.AppendLine($"    {seconds,6:0.0} s  {step}");
