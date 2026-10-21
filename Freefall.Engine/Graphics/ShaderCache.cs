@@ -16,14 +16,28 @@ namespace Freefall.Graphics
     /// (the key holds no paths). Files unused for 30 days are deleted. FREEFALL_SHADER_CACHE=0 turns it off.
     /// Any thread: reads and writes are independent files, a write is a rename of a finished temp file.
     /// </summary>
-    internal static class ShaderCache
+    public static class ShaderCache
     {
         private const int PruneAfterDays = 30;
 
         private static readonly bool Enabled = Environment.GetEnvironmentVariable("FREEFALL_SHADER_CACHE") != "0";
 
-        private static readonly string Root = Path.Combine(
+        private static string Root = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Freefall", "ShaderCache");
+
+        /// <summary>
+        /// Keep the cache in another folder (a published game: %LOCALAPPDATA%\&lt;product&gt;\ShaderCache, not the editor's).
+        /// Before the first shader compiles; later calls are ignored with a warning.
+        /// </summary>
+        public static void SetRoot(string folder)
+        {
+            if (Volatile.Read(ref _directoryReady) != 0)
+            {
+                Debug.LogWarning("ShaderCache", $"Shaders were cached in {Root} already; {folder} is not used");
+                return;
+            }
+            Root = folder;
+        }
 
         private static readonly Lazy<string> CompilerIdentity = new(FindCompilerIdentity);
         private static int _directoryReady;   // 0 = not yet, 1 = created and pruning started

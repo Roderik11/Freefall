@@ -156,6 +156,10 @@ namespace Freefall.Graphics
                 _swapChain = swapChain.QueryInterface<IDXGISwapChain3>();
                 _frameIndex = (int)_swapChain.CurrentBackBufferIndex;
             }
+
+            // DXGI would switch the window to exclusive fullscreen on Alt+Enter: the window's owner decides what Alt+Enter
+            // does (the player toggles borderless fullscreen; resizes always go through Resize)
+            _graphicsDevice.Factory.MakeWindowAssociation(_handle, WindowAssociationFlags.IgnoreAltEnter);
             
             // Set frame latency to 2 for optimal pacing (1 presenting, 1 in-flight)
             // This reduces the "burst-and-stall" pattern from Investigation 316

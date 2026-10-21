@@ -1,0 +1,28 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- A published Freefall game: the editor's Publish copies this exe, the engine and their dependencies next to the
+       game's Data/ (packs + manifest) and FreefallScripts.dll. References the engine only: nothing of the editor. -->
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <RootNamespace>Freefall.Player</RootNamespace>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <UseWindowsForms>false</UseWindowsForms>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\..\Squid\Squid.csproj" />
+    <ProjectReference Include="..\Freefall.Engine\Freefall.Engine.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Vortice.WinForms" Version="3.8.2" />
+    <PackageReference Include="PhysX.Net" Version="5.0.1-alpha1" GeneratePathProperty="true" />
+  </ItemGroup>
+
+  <!-- PhysX's native DLLs next to the exe, as for the editor -->
+  <Import Project="$(PkgPhysX_Net)\lib\RuntimeFiles.targets" Condition="'$(PkgPhysX_Net)' != ''" />
+
+</Project>

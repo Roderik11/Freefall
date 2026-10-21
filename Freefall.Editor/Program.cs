@@ -18,7 +18,7 @@ namespace Freefall.Editor
         [DllImport("DwmApi")]
         static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, int[] attrValue, int attrSize);
 
-        static SquidRenderer squidRenderer = null!;
+        static EditorSquidRenderer squidRenderer = null!;
         static RenderView mainView = null!;
         static RenderForm form = null!;
         static EditorCommandServer commandServer = null!;
@@ -113,7 +113,7 @@ namespace Freefall.Editor
             Freefall.Base.Time.Initialize();
 
             // --- Squid GUI setup ---
-            squidRenderer = new SquidRenderer(Engine.Device);
+            squidRenderer = new EditorSquidRenderer(Engine.Device);
             Squid.Gui.Renderer = squidRenderer;
 
             // One control's bug must not close the editor: Squid skips a control whose own draw or update throws

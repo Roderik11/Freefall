@@ -68,7 +68,7 @@ namespace Freefall.Editor
 
             name = null;
             var file = FileFor(projectPath);
-            if (File.Exists(file) && Squid.Gui.Renderer is SquidRenderer renderer)
+            if (File.Exists(file) && Squid.Gui.Renderer is EditorSquidRenderer renderer)
             {
                 try
                 {

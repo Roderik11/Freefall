@@ -8,7 +8,7 @@ using System.Runtime.InteropServices;
 using Freefall.Graphics;
 using Vortice.Mathematics;
 
-namespace Freefall.Editor
+namespace Freefall.UI
 {
     /// <summary>
     /// Rasterizes a TTF into a bitmap-font atlas at startup, for sizes we don't ship pre-baked
@@ -17,7 +17,7 @@ namespace Freefall.Editor
     /// seven fonts took 0.37 s of its first frame one after another, 2026-10-17); Upload makes the texture on
     /// first use.
     /// </summary>
-    internal static class RuntimeFont
+    public static class RuntimeFont
     {
         // ASCII + Latin-1 (umlauts in project paths) + the few typographic marks the UI uses.
         private static readonly char[] Charset =
@@ -25,7 +25,7 @@ namespace Freefall.Editor
                 .Concat("…·×—–’“”•").ToArray();
 
         /// <summary>A rasterized atlas before its texture exists (RGBA, coverage in alpha).</summary>
-        internal sealed class Raster
+        public sealed class Raster
         {
             public byte[] Pixels;
             public int Width, Height, LineHeight, LetterSpacing;

@@ -432,7 +432,7 @@ namespace Freefall.Editor
             _hueTexture = Texture.CreateFromData(Engine.Device, 1, HueSize, hueData, Vortice.DXGI.Format.R8G8B8A8_UNorm);
             _hueTexture.Name = "colorpicker_hue";
 
-            var renderer = Gui.Renderer as SquidRenderer;
+            var renderer = Gui.Renderer as EditorSquidRenderer;
             renderer?.InsertTexture("colorpicker_hue", _hueTexture);
 
             // ── SV gradient (SvSize × SvSize) — initial with hue=0 ──
@@ -469,7 +469,7 @@ namespace Freefall.Editor
 
             _svTexture = Texture.CreateFromData(Engine.Device, SvSize, SvSize, svData, Vortice.DXGI.Format.R8G8B8A8_UNorm);
             _svTexture.Name = "colorpicker_sv";
-            var renderer = Gui.Renderer as SquidRenderer;
+            var renderer = Gui.Renderer as EditorSquidRenderer;
             renderer?.InsertTexture("colorpicker_sv", _svTexture);
         }
 

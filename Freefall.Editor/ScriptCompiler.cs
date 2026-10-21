@@ -267,9 +267,15 @@ namespace Freefall.Editor
             => Directory.GetFiles(assetsDirectory, "*.dll", SearchOption.AllDirectories).Select(Path.GetFullPath).ToArray();
 
         /// <summary>
+        /// The project's scripts for a published game: Release (optimized, no DEBUG symbol: their Debug.Log calls go,
+        /// as the engine's do in its Release build). Thread-agnostic. Null on compile errors (logged as warnings).
+        /// </summary>
+        internal static BuildResult? BuildForPublish(string assetsDirectory) => Build(assetsDirectory, release: true);
+
+        /// <summary>
         /// Compile loose .cs files to memory. Thread-agnostic: touches no live state. Null on compile errors.
         /// </summary>
-        private static BuildResult? Build(string assetsDirectory)
+        private static BuildResult? Build(string assetsDirectory, bool release = false)
         {
             var build = new BuildResult { PluginPaths = FindPlugins(assetsDirectory) };
 
@@ -281,7 +287,7 @@ namespace Freefall.Editor
                 return build;
             }
 
-            if (!Compile(csFiles, build))
+            if (!Compile(csFiles, build, release))
                 return null;
             return build;
         }
@@ -447,7 +453,7 @@ namespace Freefall.Editor
             }
         }
 
-        private static bool Compile(string[] csFiles, BuildResult build)
+        private static bool Compile(string[] csFiles, BuildResult build, bool release = false)
         {
             // Parse all source files
             var syntaxTrees = new List<SyntaxTree>(csFiles.Length);
@@ -461,7 +467,7 @@ namespace Freefall.Editor
                     return false;
                 }
 
-                var parseOptions = CSharpParseOptions.Default.WithPreprocessorSymbols("DEBUG");
+                var parseOptions = release ? CSharpParseOptions.Default : CSharpParseOptions.Default.WithPreprocessorSymbols("DEBUG");
                 var tree = CSharpSyntaxTree.ParseText(code, parseOptions, path: file, encoding: System.Text.Encoding.UTF8);
                 syntaxTrees.Add(tree);
             }
@@ -477,7 +483,7 @@ namespace Freefall.Editor
                 references: references,
                 options: new CSharpCompilationOptions(
                     OutputKind.DynamicallyLinkedLibrary,
-                    optimizationLevel: OptimizationLevel.Debug,
+                    optimizationLevel: release ? OptimizationLevel.Release : OptimizationLevel.Debug,
                     allowUnsafe: true
                 )
             );

@@ -5,4 +5,5 @@
   </Folder>
   <Project Path="../../Squid/Squid.csproj" />
   <Project Path="Freefall.Editor/Freefall.Editor.csproj" />
+  <Project Path="Freefall.Player/Freefall.Player.csproj" />
 </Solution>

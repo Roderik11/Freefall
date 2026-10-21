@@ -32,6 +32,13 @@ namespace Freefall.Graphics
         // "Reloaded x.hlsl" in a row would not show and the reload would look ignored
         private static int _reloads;
 
+        /// <summary>
+        /// Off in a published game (Engine.Initialize with editor: false), before any shader loads: engine shaders come
+        /// from &lt;exe&gt;/Resources/Shaders only (no search for a source checkout above the exe, which a build inside the
+        /// repository would find), and no folder is watched.
+        /// </summary>
+        public static bool Enabled { get; set; } = true;
+
         /// <summary>Directory engine shaders are loaded from.</summary>
         public static string Directory
         {
@@ -59,7 +66,7 @@ namespace Freefall.Graphics
                 if (_directory != null) return;
 
                 // Development layout: <repo>/Freefall.Editor/bin/<config>/<tfm>/ → walk up to the repo
-                var dir = new DirectoryInfo(AppContext.BaseDirectory);
+                var dir = Enabled ? new DirectoryInfo(AppContext.BaseDirectory) : null;
                 for (int i = 0; i < 8 && dir != null; i++, dir = dir.Parent)
                 {
                     string candidate = Path.Combine(dir.FullName, "Freefall.Engine", "Resources", "Shaders");
@@ -155,6 +162,7 @@ namespace Freefall.Graphics
         /// </summary>
         public static void WatchProject(string assetsDirectory)
         {
+            if (!Enabled) return;
             lock (_lock)
             {
                 string full = Path.GetFullPath(assetsDirectory);
@@ -191,7 +199,7 @@ namespace Freefall.Graphics
 
         internal static void EnsureWatching()
         {
-            if (_watcher != null) return;
+            if (_watcher != null || !Enabled) return;
             lock (_lock)
             {
                 if (_watcher != null) return;

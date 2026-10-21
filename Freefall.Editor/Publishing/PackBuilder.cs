@@ -17,6 +17,8 @@ namespace Freefall.Editor.Publishing
         public int Mismatches;
         public List<string> Problems = new();
         public bool Verified;
+        /// <summary>Script files compiled into FreefallScripts.dll (0 = none written).</summary>
+        public int Scripts;
     }
 
     /// <summary>
@@ -31,6 +33,8 @@ namespace Freefall.Editor.Publishing
     {
         public const string MarkerFile = ".freefall-build";
         public const string DataFolderName = "Data";
+        /// <summary>The project's scripts, compiled for the game (Release), next to Data/: the player loads them from there.</summary>
+        public const string ScriptsFile = "FreefallScripts.dll";
 
         /// <summary>The write in progress (or the last one).</summary>
         public static Task<PackResult>? Current { get; private set; }
@@ -60,9 +64,31 @@ namespace Freefall.Editor.Publishing
             var items = scan.Artifacts.Select(a => (a.Guid, a.DataType, a.CachePath, a.Size)).ToList();
             long limit = Math.Max(1, profile.PackSizeLimitMB) * (1L << 20);
             var scanTime = watch.Elapsed;
+            var assetsDirectory = Engine.Project.AssetsDirectory;
 
-            Current = Task.Run(() => Write(Path.Combine(output, DataFolderName), items, manifest, limit, verify, scanTime));
+            Current = Task.Run(() =>
+            {
+                var result = Write(Path.Combine(output, DataFolderName), items, manifest, limit, verify, scanTime);
+                WriteScripts(assetsDirectory, output, result);
+                return result;
+            });
             return Current;
+        }
+
+        /// <summary>The project's scripts compiled for the game (Release) into the output folder, with their plugin DLLs. Worker.</summary>
+        static void WriteScripts(string assetsDirectory, string output, PackResult result)
+        {
+            var build = ScriptCompiler.BuildForPublish(assetsDirectory);
+            if (build?.Pe == null)
+            {
+                result.Problems.Add(build == null ? "The scripts did not compile (see the console): no " + ScriptsFile : "There are no scripts");
+                return;
+            }
+            File.WriteAllBytes(Path.Combine(output, ScriptsFile), build.Pe);
+            if (build.Pdb != null) File.WriteAllBytes(Path.Combine(output, Path.ChangeExtension(ScriptsFile, ".pdb")), build.Pdb);
+            foreach (var plugin in build.PluginPaths)
+                File.Copy(plugin, Path.Combine(output, Path.GetFileName(plugin)), overwrite: true);
+            result.Scripts = build.ScriptCount;
         }
 
         /// <summary>The metas of the packed assets, each cut down to its packed sub-assets (copies: the database's stay as they are).</summary>

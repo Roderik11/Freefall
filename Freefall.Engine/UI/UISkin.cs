@@ -35,7 +35,14 @@ namespace Freefall.UI
         [ValueRange(6, 96)]
         public int FontSize = 16;
 
+        /// <summary>Pixel height of the text game code marks over the picture (Graphics.Overlay: a prompt), drawn in <see cref="Font"/>.</summary>
+        [ValueRange(6, 96)]
+        public int MarkFontSize = 18;
+
         public List<UIStyle> Styles = [];
+
+        /// <summary>The renderer's name for the marks' font (<see cref="Font"/> at <see cref="MarkFontSize"/>), or null without a Font.</summary>
+        public string MarkFontName(IGameUIRenderer renderer) => FontName(renderer, Font, MarkFontSize);
 
         /// <summary>
         /// Writes the styles into <paramref name="skin"/>. A style that is already there is changed in

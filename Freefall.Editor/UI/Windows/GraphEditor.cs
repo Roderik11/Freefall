@@ -368,7 +368,7 @@ namespace Freefall.Editor
             //    UIScale -= .020f;
 
             UIScale = Math.Clamp(UIScale, 0.3f, 2);
-            var batch = ((SquidRenderer)Gui.Renderer).SpriteBatch;
+            var batch = ((EditorSquidRenderer)Gui.Renderer).SpriteBatch;
 
             if (UIScale == oldScale) return;
             var ratio = UIScale / oldScale;
@@ -431,7 +431,7 @@ namespace Freefall.Editor
         /// </summary>
         private void DrawWire(Point start, Point end, int startDirection, int endDirection, Color4 color)
         {
-            var batch = ((SquidRenderer)Gui.Renderer).SpriteBatch;
+            var batch = ((EditorSquidRenderer)Gui.Renderer).SpriteBatch;
 
             float reach = Math.Clamp(Math.Abs(end.x - start.x) * .5f, 40 * UIScale, 160 * UIScale);
             var p0 = new Vector2(start.x, start.y);

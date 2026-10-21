@@ -72,6 +72,7 @@ namespace Freefall.Editor.Mcp
                 ["verified"] = r.Verified,
                 ["verifySeconds"] = Math.Round(r.VerifyTime.TotalSeconds, 1),
                 ["mismatches"] = r.Mismatches,
+                ["scripts"] = r.Scripts,
                 ["problems"] = new JsonArray(r.Problems.Take(30).Select(p => (JsonNode)p).ToArray()),
             });
         }

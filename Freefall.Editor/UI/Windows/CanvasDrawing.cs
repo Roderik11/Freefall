@@ -77,7 +77,7 @@ namespace Freefall.Editor
         /// </summary>
         public static void DrawArrow(Vector2 from, Vector2 to, Color4 color, float width, float headSize)
         {
-            var batch = ((SquidRenderer)Gui.Renderer).SpriteBatch;
+            var batch = ((EditorSquidRenderer)Gui.Renderer).SpriteBatch;
             var direction = to - from;
             if (direction.LengthSquared() < 1) return;
             direction = Vector2.Normalize(direction);

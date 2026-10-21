@@ -115,12 +115,12 @@ namespace Freefall.Editor
             _previewView = new RenderView(w, h, Engine.Device);
             // Rendered by RenderGui headless loop when OnRender is set by active preview
 
-            var renderer = Gui.Renderer as SquidRenderer;
+            var renderer = Gui.Renderer as EditorSquidRenderer;
             renderer.InsertTexture(_previewTextureId, _previewView.BackBufferTexture.BindlessIndex, w, h);
 
             _previewView.OnResized += () =>
             {
-                var rend = Gui.Renderer as SquidRenderer;
+                var rend = Gui.Renderer as EditorSquidRenderer;
                 rend.UpdateTexture(_previewTextureId, _previewView.BackBufferTexture.BindlessIndex, _previewView.Width, _previewView.Height);
                 _previewImage.TextureRect = new Squid.Rectangle();
             };

@@ -1,3 +1,4 @@
+using Freefall.UI;
 using System;
 using System.Collections.Generic;
 using System.Drawing;
@@ -39,7 +40,7 @@ namespace Freefall.Editor
         public const int Radius = 16;       // 9-slice inset for the radius-14 set
         public const int RadiusSmall = 10;  // 9-slice inset for the radius-8 set
 
-        // ── Fonts (rasterized at runtime, see SquidRenderer.RegisterRuntimeFont) ──
+        // ── Fonts (rasterized at runtime, see EditorSquidRenderer.RegisterRuntimeFont) ──
         public const string FontHeadline = "landing_headline";
         public const string FontHeading = "landing_heading";
         public const string FontTitle = "landing_title";
@@ -73,12 +74,12 @@ namespace Freefall.Editor
         public static void PrefetchFonts()
         {
             foreach (var font in Fonts)
-                RuntimeFont.Prefetch(SquidRenderer.RuntimeFontPath(font.TtfFile), font.PixelSize, font.LetterSpacing);
+                RuntimeFont.Prefetch(EditorSquidRenderer.RuntimeFontPath(font.TtfFile), font.PixelSize, font.LetterSpacing);
         }
 
         public static void Ensure()
         {
-            if (_ready || Gui.Renderer is not SquidRenderer renderer) return;
+            if (_ready || Gui.Renderer is not EditorSquidRenderer renderer) return;
             _ready = true;
 
             foreach (var font in Fonts)
@@ -124,7 +125,7 @@ namespace Freefall.Editor
             }
         }
 
-        internal static void Insert(SquidRenderer renderer, string name, int width, int height, Action<System.Drawing.Graphics, RectangleF> paint)
+        internal static void Insert(EditorSquidRenderer renderer, string name, int width, int height, Action<System.Drawing.Graphics, RectangleF> paint)
         {
             using var bitmap = new Bitmap(width, height, PixelFormat.Format32bppArgb);
             using (var g = System.Drawing.Graphics.FromImage(bitmap))

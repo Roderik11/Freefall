@@ -34,6 +34,7 @@ namespace Freefall
 
         public static readonly ReadOnlyCollection<LogEntry> Lines = new ReadOnlyCollection<LogEntry>(lines);
 
+        /// <summary>Every logged line as the console shows it (category: message), with its stack where one was captured.</summary>
         public static event Action<string, StackTrace> OnLog;
 
         public static void ClearLog()
@@ -224,8 +225,9 @@ namespace Freefall
         public static void Log(string text, string message = null)
         {
             var st = new StackTrace(1, true);
-            Append(message != null ? $"{text}: {message}" : text, st);
-            OnLog?.Invoke(text, st);
+            var line = message != null ? $"{text}: {message}" : text;
+            Append(line, st);
+            OnLog?.Invoke(line, st);
         }
 
         // Warnings and errors are kept in Release builds: the editor console (and console_log over MCP) is the
@@ -233,15 +235,17 @@ namespace Freefall
         public static void LogWarning(string text, string message = null)
         {
             var st = CaptureStack();
-            Append(message != null ? $"{text}: {message}" : text, st);
-            OnLog?.Invoke(text, st);
+            var line = message != null ? $"{text}: {message}" : text;
+            Append(line, st);
+            OnLog?.Invoke(line, st);
         }
 
         public static void LogError(string text, string message = null)
         {
             var st = CaptureStack();
-            Append(message != null ? $"{text}: {message}" : text, st);
-            OnLog?.Invoke(text, st);
+            var line = message != null ? $"{text}: {message}" : text;
+            Append(line, st);
+            OnLog?.Invoke(line, st);
         }
 
         // File/line stack capture is expensive; only pay for it in DEBUG builds

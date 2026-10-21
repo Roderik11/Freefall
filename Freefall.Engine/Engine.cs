@@ -118,11 +118,22 @@ namespace Freefall
         }
 
         /// <summary>
-        /// Initialize the engine with an external window handle (for editor mode).
-        /// The caller owns the window and is responsible for resize events.
+        /// The F5–F10 debug keys (adaptive splits, debug views, Hi-Z, wireframe, VSync, frozen frustum). On in the
+        /// editor, off in a published game.
         /// </summary>
-        public static void Initialize(IntPtr handle, int width, int height)
+        public static bool DebugKeys { get; set; } = true;
+
+        /// <summary>
+        /// Initialize the engine with an external window handle. The caller owns the window and is responsible for
+        /// resize events. <paramref name="editor"/> false is a published game (the player): game code runs
+        /// (<see cref="IsEditor"/> false), no debug keys, shaders only from the build output with nothing watched.
+        /// </summary>
+        public static void Initialize(IntPtr handle, int width, int height, bool editor = true)
         {
+            // Before the first shader: a game reads its shaders from its own Resources folder only
+            Graphics.ShaderHotReload.Enabled = editor;
+            DebugKeys = editor;
+
             Kernel32.timeBeginPeriod(1);
 
             RootDirectory = AppContext.BaseDirectory;
@@ -148,10 +159,34 @@ namespace Freefall
             AudioDevice = XAudio2.XAudio2Create(ProcessorSpecifier.DefaultProcessor, true);
             _masteringVoice = AudioDevice.CreateMasteringVoice();
             Audio3D = new X3DAudio(Speakers.FrontLeft | Speakers.FrontRight);
-            Debug.Log("[Engine] Initialized (editor mode)");
-            IsEditor = true;
+            Debug.Log(editor ? "[Engine] Initialized (editor mode)" : "[Engine] Initialized (game)");
+            IsEditor = editor;
 
             PhysicsWorld.Initialize();
+        }
+
+        /// <summary>
+        /// Open a published game: the manifest in <paramref name="dataFolder"/> (Data/game.manifest), its packs mounted
+        /// (<see cref="Artifacts"/>), the asset database filled from the manifest's metas (no project folders, no scan).
+        /// The game's project is <paramref name="dataFolder"/>'s parent, by name only: nothing is read from it. Main
+        /// thread, after <see cref="Initialize(IntPtr, int, int, bool)"/>. Returns the manifest (its Scenes: the first is
+        /// the one to start in).
+        /// </summary>
+        public static Freefall.Assets.Packs.PackManifest OpenGame(string dataFolder, Freefall.Assets.Packs.PackManifest manifest = null)
+        {
+            manifest ??= Freefall.Assets.Packs.PackManifest.Load(Path.Combine(dataFolder, Freefall.Assets.Packs.PackManifest.FileName));
+            Artifacts.Mount(Freefall.Assets.Packs.PackSet.Open(manifest.Packs.Select(p => Path.Combine(dataFolder, p))));
+
+            Project = new FreefallProject
+            {
+                Name = manifest.Product,
+                RootDirectory = Path.GetFullPath(Path.Combine(dataFolder, "..")),
+            };
+            AssetDatabase.InitializeFromManifest(Project, manifest);
+            Assets.BaseDirectory = Project.AssetsDirectory;
+            Debug.LogAlways($"[Engine] Game opened: {manifest.Product}, {manifest.Packs.Count} packs, " +
+                            $"{Artifacts.Packs?.Count ?? 0} artifacts, {manifest.Scenes.Count} scenes");
+            return manifest;
         }
 
         /// <summary>
@@ -336,6 +371,18 @@ namespace Freefall
 
         private static void Update()
         {
+            if (DebugKeys)
+                UpdateDebugKeys();
+
+            // Entity logic (includes component Updates like Camera, CharacterController, etc.)
+            EntityManager.Update();
+
+            // Regenerate PCG components invalidated by edits, once the edit has finished
+            Freefall.PCG.PCGScheduler.Update();
+        }
+
+        private static void UpdateDebugKeys()
+        {
             // F5: Toggle adaptive shadow cascade splits (SDSM)
             if (Input.IsKeyPressed(Keys.F5))
             {
@@ -385,12 +432,6 @@ namespace Freefall
                     Debug.Log("[Engine] Frustum UNFROZEN - culling follows camera");
                 }
             }
-            
-            // Entity logic (includes component Updates like Camera, CharacterController, etc.)
-            EntityManager.Update();
-
-            // Regenerate PCG components invalidated by edits, once the edit has finished
-            Freefall.PCG.PCGScheduler.Update();
         }
 
         [DllImport("kernel32.dll", SetLastError = true)]

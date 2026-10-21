@@ -42,6 +42,13 @@
   </ItemGroup>
 
   <ItemGroup>
+    <!-- GDI+ (System.Drawing) for UI.RuntimeFont, which rasterizes TTFs (a UI skin's Typeface) into font atlases at
+         run time, in the editor and in a published game. A framework reference, not UseWindowsForms: that would add a
+         global using of System.Windows.Forms, whose Keys, Message and Cursor clash with the engine's. -->
+    <FrameworkReference Include="Microsoft.WindowsDesktop.App" />
+  </ItemGroup>
+
+  <ItemGroup>
     <None Update="Resources\**">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>

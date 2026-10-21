@@ -45,7 +45,7 @@ namespace Freefall.Editor
         public static string PlugArt(int diameter, bool dot)
         {
             string name = $"ui_plug_{(dot ? "dot" : "ring")}_{diameter}";
-            if (_plugArt.Add(name) && Gui.Renderer is SquidRenderer renderer)
+            if (_plugArt.Add(name) && Gui.Renderer is EditorSquidRenderer renderer)
             {
                 LandingArt.Insert(renderer, name, diameter + 2, diameter + 2, (g, r) =>
                 {
@@ -81,7 +81,7 @@ namespace Freefall.Editor
 
         private static void EnsureArt()
         {
-            if (_artReady || Gui.Renderer is not SquidRenderer renderer) return;
+            if (_artReady || Gui.Renderer is not EditorSquidRenderer renderer) return;
             _artReady = true;
 
             LandingArt.Insert(renderer, ButtonArt, 16, 16, (g, r) =>
