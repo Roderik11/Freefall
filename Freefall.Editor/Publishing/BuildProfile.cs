@@ -5,8 +5,8 @@ namespace Freefall.Editor.Publishing
 {
     /// <summary>
     /// What a published game holds: its scenes, in order (the game starts in the first), and where it is written.
-    /// Scan walks the references from the scenes (DependencyScanner) and writes the build report; publishing itself
-    /// comes later (PUBLISH_PLAN.md). Nothing references a profile, so it is never packed.
+    /// Scan walks the references from the scenes (DependencyScanner) and writes the build report; Publish writes the
+    /// game (Publisher). Nothing references a profile, so it is never packed.
     /// </summary>
     [CreateAsset("Build Profile")]
     public class BuildProfile : Asset
@@ -49,7 +49,10 @@ namespace Freefall.Editor.Publishing
         }
 
         /// <summary>The build report's file: next to the output folder, never inside it.</summary>
-        public string ReportPath => ResolvedOutputFolder.TrimEnd('\\', '/') + ".report.txt";
+        public string ReportPath => ReportPathFor(ResolvedOutputFolder);
+
+        /// <summary>The build report of a game written to <paramref name="output"/>: next to it, never inside it.</summary>
+        public static string ReportPathFor(string output) => output.TrimEnd('\\', '/') + ".report.txt";
 
         [Button]
         [Description("Walk the references from the scenes and write the build report next to the output folder. Nothing is published")]
@@ -60,29 +63,17 @@ namespace Freefall.Editor.Publishing
 
             var summary = $"[Build] {Name}: {scan.Artifacts.Count:N0} assets, {BuildScan.Size(scan.TotalBytes)}, " +
                           $"{scan.Warnings.Count} warnings, {scan.Elapsed.TotalSeconds:0.0} s. Report: {ReportPath}";
-            Debug.Log(summary);
+            Debug.LogAlways(summary);
             Toast.Show($"{scan.Artifacts.Count:N0} assets, {BuildScan.Size(scan.TotalBytes)}: report written", 3f);
         }
 
         [Button]
-        [Description("Scan, then write the packs and the manifest into Data/ in the output folder and check every packed artifact against its Cache file (on a worker; a toast says when it is done). No executable yet")]
-        public void WritePacks()
-        {
-            var task = PackBuilder.Start(this, verify: true);
-            Toast.Show("Writing packs…", 2f);
-            task.ContinueWith(t => Engine.RunOnMainThreadAsync(() =>
-            {
-                if (t.IsFaulted)
-                {
-                    Debug.LogError($"[Build] {Name}: writing packs failed: {t.Exception?.GetBaseException().Message}");
-                    Toast.Show("Writing packs failed: see the console", 3f);
-                    return;
-                }
-                var r = t.Result;
-                Debug.Log($"[Build] {Name}: {r.Entries:N0} artifacts, {BuildScan.Size(r.Bytes)} in {r.Packs.Count} pack(s), " +
-                          $"written in {r.WriteTime.TotalSeconds:0.0} s, {r.Mismatches} mismatches, {r.Problems.Count} problems: {r.DataFolder}");
-                Toast.Show($"{r.Packs.Count} pack(s), {BuildScan.Size(r.Bytes)}, {r.Mismatches} mismatches", 3f);
-            }));
-        }
+        [Description("Write the game into the output folder, ready to run: the packs, the scripts, the player and the engine's files. " +
+                     "Everything a publish wrote there before is replaced. A popup shows the steps")]
+        public void Publish() => Publisher.StartFromEditor(this, run: false);
+
+        [Button]
+        [Description("Publish, then start the game")]
+        public void PublishAndRun() => Publisher.StartFromEditor(this, run: true);
     }
 }

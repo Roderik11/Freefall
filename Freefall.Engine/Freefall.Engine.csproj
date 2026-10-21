@@ -52,10 +52,16 @@
     <None Update="Resources\**">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
-    <!-- meshoptimizer (LOD generation at import), built from ThirdParty/meshoptimizer with build.cmd -->
+    <!-- Not in a published game's folder (the player's dotnet publish): Publish packs them into Data/engine.ffpack
+         (Assets.EngineFiles), and Resources/Terrain (old splat maps) is read by nothing -->
+    <None Update="Resources\**">
+      <CopyToPublishDirectory>Never</CopyToPublishDirectory>
+    </None>
+    <!-- meshoptimizer (LOD generation at import), built from ThirdParty/meshoptimizer with build.cmd; import only, so not published -->
     <None Include="..\ThirdParty\meshoptimizer\win-x64\meshoptimizer.dll">
       <Link>meshoptimizer.dll</Link>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>Never</CopyToPublishDirectory>
     </None>
   </ItemGroup>
 

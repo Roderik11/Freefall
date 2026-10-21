@@ -25,8 +25,8 @@ namespace Freefall.Editor
         }
 
         /// <summary>
-        /// Over the picture: what game code asked for this frame through Freefall.Graphics.Overlay
-        /// (a crosshair, a prompt), then the game's UI.
+        /// Over the picture: the game's UI, whose desktop draws what game code asked for this frame through
+        /// Freefall.Graphics.Overlay (a crosshair, a prompt) under its controls.
         /// </summary>
         protected override void DrawStyle(Style style, float opacity)
         {
@@ -34,7 +34,6 @@ namespace Freefall.Editor
 
             if (View == null || Camera.Main?.Target != View) return;
 
-            Overlay.Draw(Gui.Renderer, Location, Size, opacity);
             GameUIHost.Draw(this);
         }
     }

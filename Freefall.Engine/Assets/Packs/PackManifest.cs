@@ -21,6 +21,8 @@ namespace Freefall.Assets.Packs
         public DateTime Created { get; set; }
         public List<string> Scenes { get; set; } = new();
         public List<string> Packs { get; set; } = new();
+        /// <summary>The engine's own files (shaders, default textures: EngineFiles), mounted before the engine starts; null = from the disk.</summary>
+        public string EnginePack { get; set; }
         public List<MetaFile> Metas { get; set; } = new();
 
         public void Save(string path) =>

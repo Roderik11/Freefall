@@ -31,9 +31,17 @@ namespace Freefall.UI
     /// Escape opens and closes the menu: the windows added with <c>menu: true</c> show, the cursor
     /// is free, and player control is off (scripts check <see cref="MenuOpen"/>). With the menu
     /// closed the cursor is locked to the picture and only the HUD shows.
+    ///
+    /// The desktop's bottom layer draws <see cref="Overlay"/>'s marks (crosshair, prompts) and, with
+    /// <see cref="ShowFps"/>, the frame rate: one desktop and one batch for everything over the
+    /// picture. (Two batches a frame garbled each other: the sprite batch holds a frame's sprites.)
     /// </summary>
     public static class GameUI
     {
+        // The bottom layer: always the desktop's first control, moved with the others to a new desktop.
+        // Declared before Desktop: static fields initialize in order, and NewDesktop puts it on.
+        private static readonly MarksLayer _marks = new();
+
         public static Desktop Desktop { get; private set; } = NewDesktop(null);
 
         /// <summary>The look of every control on the desktop. Re-applied when the asset is edited.</summary>
@@ -66,6 +74,9 @@ namespace Freefall.UI
 
         /// <summary>True from the first <see cref="Update"/> of a run to <see cref="Reset"/>.</summary>
         public static bool Running { get; private set; }
+
+        /// <summary>Frames per second and milliseconds per frame in the top right corner (the host or game code turns it on).</summary>
+        public static bool ShowFps { get; set; }
 
         private static UISkin _skin;
         private static bool _menuOpen;
@@ -128,7 +139,7 @@ namespace Freefall.UI
         public static void Reset()
         {
             foreach (var control in new List<Control>(Desktop.Controls))
-                control.Parent = null;
+                if (control != _marks) control.Parent = null;
             _menu.Clear();
             _menuOpen = false;
             _skin = null;
@@ -153,6 +164,8 @@ namespace Freefall.UI
             if (old != null)
                 foreach (var control in new List<Control>(old.Controls))
                     control.Parent = desktop;
+            if (_marks.Parent != desktop)
+                desktop.Controls.Insert(0, _marks);
 
             return desktop;
         }
@@ -165,6 +178,64 @@ namespace Freefall.UI
             // Controls look their style up once, when they join a desktop: a style that is new to
             // the skin reaches them only by joining again
             Desktop = NewDesktop(Desktop);
+        }
+
+        /// <summary>
+        /// Under every other control: the marks game code asked for this frame, and the frame rate. Takes
+        /// no mouse (NoEvents), so the picture under it stays the hot control.
+        /// </summary>
+        private sealed class MarksLayer : Control
+        {
+            private readonly System.Diagnostics.Stopwatch _clock = new();
+            private int _frames;
+            private string _fps = "";
+
+            public MarksLayer()
+            {
+                Dock = DockStyle.Fill;
+                NoEvents = true;
+            }
+
+            protected override void DrawStyle(Style style, float opacity)
+            {
+                Overlay.Draw(Gui.Renderer, Location, Size, opacity);
+                if (ShowFps) DrawFps(opacity);
+            }
+
+            // Averaged over half a second (a number that changes every frame cannot be read), on a dark box,
+            // in the colour of the rate: red under 90, yellow to 120, green above
+            private const int FpsFontSize = 24;
+            private double _rate;
+
+            private void DrawFps(float opacity)
+            {
+                // From the first frame drawn: the time before it (loading the scene) is no frame of the game's
+                if (!_clock.IsRunning) _clock.Start();
+                else _frames++;
+                double seconds = _clock.Elapsed.TotalSeconds;
+                if (seconds >= 0.5)
+                {
+                    _rate = _frames / seconds;
+                    _fps = $"{_rate:0} fps  {seconds * 1000 / _frames:0.0} ms";
+                    _frames = 0;
+                    _clock.Restart();
+                }
+                var renderer = Gui.Renderer;
+                var name = _skin?.FontNameAt(renderer as IGameUIRenderer, FpsFontSize);
+                int font = name != null ? renderer.GetFont(name) : -1;
+                if (_fps.Length == 0 || font < 0) return;
+
+                var extent = renderer.GetTextSize(_fps, font);
+                const int pad = 8;
+                int x = Location.x + Size.x - extent.x - 16, y = Location.y + 10;
+                renderer.DrawBox(x - pad, y - pad / 2, extent.x + 2 * pad, extent.y + pad, ColorInt.ARGB(0.6f * opacity, 0f, 0f, 0f));
+
+                int color = _rate < 90 ? ColorInt.ARGB(opacity, 1f, 0.32f, 0.26f)
+                          : _rate <= 120 ? ColorInt.ARGB(opacity, 1f, 0.84f, 0.25f)
+                          : ColorInt.ARGB(opacity, 0.4f, 0.92f, 0.4f);
+                renderer.DrawText(_fps, x + 1, y + 1, font, ColorInt.ARGB(0.8f * opacity, 0f, 0f, 0f));
+                renderer.DrawText(_fps, x, y, font, color);
+            }
         }
 
         private static void OnAssetReloaded(Freefall.Base.Message message)

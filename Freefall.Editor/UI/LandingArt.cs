@@ -125,6 +125,48 @@ namespace Freefall.Editor
             }
         }
 
+        /// <summary>The landing look's styles (landing.*) in a desktop's skin: the landing page, and the modal popups on any desktop.</summary>
+        public static void RegisterStyles(Skin skin)
+        {
+            ControlStyle TextStyle(string font, int color, Alignment align = Alignment.MiddleLeft)
+            {
+                var style = new ControlStyle();
+                style.Font = font;
+                style.TextColor = color;
+                style.TextAlign = align;
+                return style;
+            }
+
+            var background = new ControlStyle();
+            background.BackColor = Background;
+
+            var primary = TextStyle(FontBodyMedium, OnCoral, Alignment.MiddleCenter);
+            primary.Texture = RoundSmall;
+            primary.Tiling = TextureMode.Grid;
+            primary.Grid = new Margin(RadiusSmall);
+            primary.Tint = Coral;
+            primary.Hot.Tint = CoralHot;
+            primary.Pressed.Tint = CoralHot;
+
+            var ghost = TextStyle(FontBodyMedium, Text, Alignment.MiddleCenter);
+            ghost.Texture = OutlineSmall;
+            ghost.Tiling = TextureMode.Grid;
+            ghost.Grid = new Margin(RadiusSmall);
+            ghost.Tint = Rgb(0xffffff, .16f);
+            ghost.Hot.Tint = Rgb(0xffffff, .4f);
+            ghost.Pressed.Tint = Rgb(0xffffff, .4f);
+
+            skin["landing.background"] = background;
+            skin["landing.brand"] = TextStyle(FontTitle, Text);
+            skin["landing.headline"] = TextStyle(FontHeadline, Text);
+            skin["landing.sub"] = TextStyle(FontBody, Muted);
+            skin["landing.body"] = TextStyle(FontBody, Text);
+            skin["landing.small"] = TextStyle(FontSmall, Muted);
+            skin["landing.eyebrow"] = TextStyle(FontEyebrow, Muted);
+            skin["landing.primary"] = primary;
+            skin["landing.ghost"] = ghost;
+        }
+
         internal static void Insert(EditorSquidRenderer renderer, string name, int width, int height, Action<System.Drawing.Graphics, RectangleF> paint)
         {
             using var bitmap = new Bitmap(width, height, PixelFormat.Format32bppArgb);

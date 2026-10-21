@@ -312,7 +312,7 @@ namespace Freefall.Graphics
         internal void Reload()
         {
             if (_sourcePath == null) return;
-            ReloadFrom(File.ReadAllText(_sourcePath));
+            ReloadFrom(Freefall.Assets.EngineFiles.ReadAllText(_sourcePath));
         }
 
         /// <summary>
@@ -522,7 +522,7 @@ namespace Freefall.Graphics
             return false;
         }
 
-        private static string LoadWithIncludes(string path) => Flatten(File.ReadAllText(path), path);
+        private static string LoadWithIncludes(string path) => Flatten(Freefall.Assets.EngineFiles.ReadAllText(path), path);
 
         // A directive starts its line: an "#include" quoted in a comment (mesh_common.fx shows how to include
         // itself) is no include
@@ -552,7 +552,7 @@ namespace Freefall.Graphics
                 int line = 1;
                 for (int i = 0; i < match.Index; i++)
                     if (source[i] == '\n') line++;
-                string text = Flatten(File.ReadAllText(includePath), includePath, depth + 1);
+                string text = Flatten(Freefall.Assets.EngineFiles.ReadAllText(includePath), includePath, depth + 1);
                 return $"#line 1 \"{LineFileName(includePath)}\"\n{text}\n#line {line} \"{here}\"\n";
             });
 

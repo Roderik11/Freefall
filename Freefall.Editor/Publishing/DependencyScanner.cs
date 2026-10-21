@@ -95,12 +95,15 @@ namespace Freefall.Editor.Publishing
                 : parts[0] + "\\" + parts[1];
         }
 
-        /// <summary>Write the build report: totals first, then every artifact with the chain that reached it.</summary>
-        public void WriteReport(string path)
+        /// <summary>
+        /// Write the build report: totals first, then every artifact with the chain that reached it. A publish appends
+        /// its own summary at the end (<paramref name="published"/>).
+        /// </summary>
+        public void WriteReport(string path, bool published = false)
         {
             var sb = new StringBuilder();
             sb.AppendLine($"Build report: {Profile.ResolvedProductName} (profile {Profile.Name}), {Time:yyyy-MM-dd HH:mm:ss}");
-            sb.AppendLine("Scan only: nothing was published.");
+            sb.AppendLine(published ? "Published: the summary of the publish is at the end." : "Scan only: nothing was published.");
             sb.AppendLine();
 
             sb.AppendLine("Scenes (the game starts in the first):");

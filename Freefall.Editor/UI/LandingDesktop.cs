@@ -37,60 +37,16 @@ namespace Freefall.Editor
         private readonly List<RecentProjectEntry> gridItems = new();
 
         private Window importDialog;
-        private Label importTitleLabel, importStepLabel, importDetailLabel;
-        private ProgressBar importBar;
-        private ProjectOpening.Status shownStatus;
 
         public LandingDesktop()
         {
             EditorSkin.Apply(this);
             LandingArt.Ensure();
-            RegisterStyles();
+            LandingArt.RegisterStyles(Skin);
             ShowCursor = true;
             ModalColor = ColorInt.ARGB(.5f, 0f, 0f, 0f);
 
             BuildLayout();
-        }
-
-        private void RegisterStyles()
-        {
-            ControlStyle Text(string font, int color, Alignment align = Alignment.MiddleLeft)
-            {
-                var style = new ControlStyle();
-                style.Font = font;
-                style.TextColor = color;
-                style.TextAlign = align;
-                return style;
-            }
-
-            var background = new ControlStyle();
-            background.BackColor = LandingArt.Background;
-
-            var primary = Text(LandingArt.FontBodyMedium, LandingArt.OnCoral, Alignment.MiddleCenter);
-            primary.Texture = LandingArt.RoundSmall;
-            primary.Tiling = TextureMode.Grid;
-            primary.Grid = new Margin(LandingArt.RadiusSmall);
-            primary.Tint = LandingArt.Coral;
-            primary.Hot.Tint = LandingArt.CoralHot;
-            primary.Pressed.Tint = LandingArt.CoralHot;
-
-            var ghost = Text(LandingArt.FontBodyMedium, LandingArt.Text, Alignment.MiddleCenter);
-            ghost.Texture = LandingArt.OutlineSmall;
-            ghost.Tiling = TextureMode.Grid;
-            ghost.Grid = new Margin(LandingArt.RadiusSmall);
-            ghost.Tint = LandingArt.Rgb(0xffffff, .16f);
-            ghost.Hot.Tint = LandingArt.Rgb(0xffffff, .4f);
-            ghost.Pressed.Tint = LandingArt.Rgb(0xffffff, .4f);
-
-            Skin["landing.background"] = background;
-            Skin["landing.brand"] = Text(LandingArt.FontTitle, LandingArt.Text);
-            Skin["landing.headline"] = Text(LandingArt.FontHeadline, LandingArt.Text);
-            Skin["landing.sub"] = Text(LandingArt.FontBody, LandingArt.Muted);
-            Skin["landing.body"] = Text(LandingArt.FontBody, LandingArt.Text);
-            Skin["landing.small"] = Text(LandingArt.FontSmall, LandingArt.Muted);
-            Skin["landing.eyebrow"] = Text(LandingArt.FontEyebrow, LandingArt.Muted);
-            Skin["landing.primary"] = primary;
-            Skin["landing.ghost"] = ghost;
         }
 
         private void BuildLayout()
@@ -336,53 +292,14 @@ namespace Freefall.Editor
         // ── Project open progress dialog ──
 
         /// <summary>
-        /// Show the modal progress dialog of a project open. It follows ProjectOpening.Current by itself (OnUpdate):
+        /// Show the modal progress dialog of a project open (ModalDialogs). It follows ProjectOpening.Current by itself:
         /// the step, what it is doing and a bar for the whole open.
         /// </summary>
         public void ShowImportDialog(string projectName)
         {
-            importDialog = new Window
-            {
-                Style = "frame",
-                Size = new Point(560, 150),
-                Dock =  DockStyle.Center,
-                Modal = true,
-                Padding = new Margin(24, 18, 24, 18),
-            };
-
-            importTitleLabel = new Label
-            {
-                Text = $"Opening {projectName}",
-                Style = "landing.brand",
-                Size = new Point(100, 30),
-                Dock = DockStyle.Top,
-            };
-            importStepLabel = new Label
-            {
-                Text = "",
-                Style = "landing.body",
-                Size = new Point(100, 24),
-                Dock = DockStyle.Top,
-            };
-            importBar = new ProgressBar
-            {
-                Size = new Point(100, 6),
-                Dock = DockStyle.Top,
-                Margin = new Margin(0, 8, 0, 8),
-            };
-            importDetailLabel = new Label
-            {
-                Text = "",
-                Style = "landing.small",
-                Dock = DockStyle.Fill,
-            };
-            importDialog.Controls.Add(importTitleLabel);
-            importDialog.Controls.Add(importStepLabel);
-            importDialog.Controls.Add(importBar);
-            importDialog.Controls.Add(importDetailLabel);
-            shownStatus = null;
-
-            importDialog.Show(this);
+            importDialog = ModalDialogs.ShowProgress(this, () => ProjectOpening.Current is { } s
+                ? new ModalDialogs.Progress($"Opening {s.Name}", $"{s.Step}   ({s.StepIndex + 1}/{s.StepCount})", s.Detail, s.Fraction)
+                : null);
         }
 
         /// <summary>
@@ -390,45 +307,8 @@ namespace Freefall.Editor
         /// </summary>
         public void HideImportDialog()
         {
-            if (importDialog != null)
-            {
-                importDialog.Close();
-                importDialog = null;
-                importTitleLabel = importStepLabel = importDetailLabel = null;
-                importBar = null;
-                shownStatus = null;
-            }
-        }
-
-        /// <summary>Show the open's latest status (written by its workers; a new record per change).</summary>
-        private void UpdateImportDialog()
-        {
-            var status = ProjectOpening.Current;
-            if (importDialog == null || status == null || ReferenceEquals(status, shownStatus)) return;
-            shownStatus = status;
-
-            importTitleLabel.Text = $"Opening {status.Name}";
-            importStepLabel.Text = $"{status.Step}   ({status.StepIndex + 1}/{status.StepCount})";
-            importDetailLabel.Text = LandingArt.Fit(LandingArt.FontSmall, status.Detail,
-                Math.Max(40, importDetailLabel.Size.x), keepEnd: true);
-            importBar.Value = status.Fraction;
-        }
-
-        /// <summary>A thin bar: the share done of the project open.</summary>
-        private class ProgressBar : Control
-        {
-            public float Value;
-
-            protected override void DrawStyle(Style style, float opacity)
-            {
-                int x = Location.x, y = Location.y, w = Size.x, h = Size.y;
-                if (opacity == 0 || w <= 0 || h <= 0) return;
-
-                Gui.Renderer.DrawBox(x, y, w, h, LandingArt.Well);
-                int fill = (int)(w * Math.Clamp(Value, 0f, 1f));
-                if (fill > 0)
-                    Gui.Renderer.DrawBox(x, y, fill, h, LandingArt.Coral);
-            }
+            importDialog?.Close();
+            importDialog = null;
         }
 
         /// <summary>
@@ -438,57 +318,7 @@ namespace Freefall.Editor
         public void ShowErrorDialog(string title, string message, string buttonText = "OK")
         {
             HideImportDialog();
-
-            var errorWindow = new Window
-            {
-                Style = "frame",
-                Size = new Point(560, 200),
-                Dock = DockStyle.Center,
-                Modal = true,
-                Padding = new Margin(24, 18, 24, 18),
-            };
-
-            errorWindow.Controls.Add(new Label
-            {
-                Text = title,
-                Style = "landing.brand",
-                Size = new Point(100, 30),
-                Dock = DockStyle.Top,
-            });
-
-            var buttons = new Frame
-            {
-                Size = new Point(100, 36),
-                Dock = DockStyle.Bottom,
-            };
-            var okButton = new Button
-            {
-                Text = buttonText,
-                Style = "landing.primary",
-                Size = new Point(Math.Max(100, LandingArt.Measure(LandingArt.FontBodyMedium, buttonText).x + 40), 36),
-                Dock = DockStyle.Right,
-                Cursor = Cursors.Link,
-            };
-            okButton.MouseClick += (s, e) =>
-            {
-                errorWindow.Close();
-                OnErrorDismissed?.Invoke();
-            };
-            buttons.Controls.Add(okButton);
-            errorWindow.Controls.Add(buttons);
-
-            // Wrapped here: Squid wraps only at spaces, and the message is often a long path
-            int textWidth = errorWindow.Size.x - errorWindow.Padding.Left - errorWindow.Padding.Right;
-            errorWindow.Controls.Add(new Label
-            {
-                Text = LandingArt.Wrap(LandingArt.FontBody, message, textWidth),
-                Style = "landing.sub",
-                TextAlign = Alignment.TopLeft,
-                Dock = DockStyle.Fill,
-                Margin = new Margin(0, 8, 0, 8),
-            });
-
-            errorWindow.Show(this);
+            ModalDialogs.ShowMessage(this, title, message, (buttonText, () => OnErrorDismissed?.Invoke()));
         }
 
         protected override void OnUpdate()
@@ -504,7 +334,6 @@ namespace Freefall.Editor
             }
 
             UpdateColumns();
-            UpdateImportDialog();
         }
 
         private void OnOpenProjectClicked()

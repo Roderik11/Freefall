@@ -27,23 +27,29 @@ namespace Freefall.Editor.Mcp
                          "for itself too (a selected asset, an open graph)")] bool compareLoaded = false)
             => McpBridge.Post("/api/publish/scan", new { profile, compareLoaded });
 
-        [McpServerTool(Name = "publish_pack", Title = "Write a build profile's packs", OpenWorld = false)]
-        [Description("Scan a BuildProfile, then write its packs (Data/data0.ffpack, … : the Cache artifacts byte for byte, a new pack at " +
-                     "the profile's PackSizeLimitMB) and Data/game.manifest into the profile's output folder, and with verify read every " +
-                     "artifact back from the packs and compare it with its Cache file. Gigabytes: runs on a worker, this call waits for " +
-                     "it. The output folder must be empty or one Publish made (.freefall-build). No executable is written yet.")]
-        public static async Task<CallToolResult> Pack(
+        [McpServerTool(Name = "game_publish", Title = "Publish a build profile's game", OpenWorld = false)]
+        [Description("Write a BuildProfile's game into its output folder (or 'output'), ready to run, as the profile's Publish button does: " +
+                     "scan, compile the scripts (Release), build the player (dotnet publish, win-x64, self-contained; kept in the project's " +
+                     "Library between publishes), copy it with the exe named after the product, write the packs and the manifest into Data/, " +
+                     "and append a summary to the build report next to the folder. The editor shows its modal progress popup meanwhile, and a " +
+                     "popup on failure. Everything a publish wrote in the folder before is replaced; a non-empty folder without .freefall-build " +
+                     "is refused. Changed assets the build reaches stop it unless saveChanged. Gigabytes: this call waits up to waitSeconds; " +
+                     "editor_status reports the step meanwhile.")]
+        public static async Task<CallToolResult> Publish(
             [Description("The BuildProfile asset's GUID, or its path relative to Assets")] string profile,
-            [Description("Read every packed artifact back and compare it with its Cache file")] bool verify = true,
-            [Description("Max seconds to wait for the write")] int waitSeconds = 900)
+            [Description("Write the game here (absolute) instead of the profile's output folder")] string? output = null,
+            [Description("Read every packed artifact back and compare it with its Cache file (about 13 s for 4.7 GB)")] bool verify = false,
+            [Description("Save the changed assets the build reaches first (as Save Changed Assets does)")] bool saveChanged = false,
+            [Description("Start the game once it is written")] bool run = false,
+            [Description("Max seconds to wait")] int waitSeconds = 900)
         {
-            Task<PackResult> task;
+            Task<PublishResult> task;
             try
             {
                 task = await EditorCommandServer.Instance.RunOnMainThread(() =>
                 {
                     var p = BuildProfile.Find(profile) ?? throw new InvalidOperationException($"No BuildProfile asset at {profile}");
-                    return PackBuilder.Start(p, verify);
+                    return Publisher.Start(p, new PublishOptions { Output = output, Verify = verify, SaveChanged = saveChanged, Run = run });
                 });
             }
             catch (Exception ex)
@@ -52,28 +58,39 @@ namespace Freefall.Editor.Mcp
             }
 
             if (await Task.WhenAny(task, Task.Delay(TimeSpan.FromSeconds(waitSeconds))) != task)
-                return McpBridge.Error($"Still writing after {waitSeconds} s; call publish_mount (no arguments) later, or look in the output folder");
+            {
+                var s = Publisher.Current;
+                return McpBridge.Error($"Still publishing after {waitSeconds} s" + (s != null ? $" (step: {s.Step}, {s.Fraction:P0})" : "") +
+                                       "; editor_status reports it");
+            }
             if (task.IsFaulted)
-                return McpBridge.Error("Writing the packs failed: " + task.Exception!.GetBaseException().Message);
+                return McpBridge.Error("Publishing failed: " + task.Exception!.GetBaseException().Message);
 
             var r = task.Result;
             return EditorTools.Text(new JsonObject
             {
-                ["status"] = "written",
-                ["data"] = r.DataFolder,
-                ["artifacts"] = r.Entries,
-                ["size"] = BuildScan.Size(r.Bytes),
-                ["packs"] = new JsonArray(r.Packs.Select(p => (JsonNode)new JsonObject
+                ["status"] = "published",
+                ["product"] = r.Product,
+                ["output"] = r.Output,
+                ["exe"] = r.Exe,
+                ["report"] = r.Report,
+                ["seconds"] = Math.Round(r.Elapsed.TotalSeconds, 1),
+                ["steps"] = new JsonArray(r.Steps.Select(s => (JsonNode)new JsonObject
+                {
+                    ["step"] = s.Step, ["seconds"] = Math.Round(s.Seconds, 1),
+                }).ToArray()),
+                ["player"] = new JsonObject { ["files"] = r.PlayerFiles, ["size"] = BuildScan.Size(r.PlayerBytes) },
+                ["engineFiles"] = new JsonObject { ["files"] = r.EngineFiles, ["size"] = BuildScan.Size(r.EngineBytes) },
+                ["scripts"] = r.Scripts,
+                ["artifacts"] = r.Packs.Entries,
+                ["size"] = BuildScan.Size(r.Packs.Bytes),
+                ["packs"] = new JsonArray(r.Packs.Packs.Select(p => (JsonNode)new JsonObject
                 {
                     ["file"] = p.File, ["artifacts"] = p.Entries, ["size"] = BuildScan.Size(p.Bytes),
                 }).ToArray()),
-                ["scanSeconds"] = Math.Round(r.ScanTime.TotalSeconds, 2),
-                ["writeSeconds"] = Math.Round(r.WriteTime.TotalSeconds, 1),
-                ["verified"] = r.Verified,
-                ["verifySeconds"] = Math.Round(r.VerifyTime.TotalSeconds, 1),
-                ["mismatches"] = r.Mismatches,
-                ["scripts"] = r.Scripts,
-                ["problems"] = new JsonArray(r.Problems.Take(30).Select(p => (JsonNode)p).ToArray()),
+                ["verified"] = r.Packs.Verified,
+                ["mismatches"] = r.Packs.Mismatches,
+                ["warnings"] = new JsonArray(r.Warnings.Take(30).Select(w => (JsonNode)w).ToArray()),
             });
         }
 
@@ -94,7 +111,7 @@ namespace Freefall.Editor.Mcp
                     {
                         var p = BuildProfile.Find(profile ?? "") ?? throw new InvalidOperationException($"No BuildProfile asset at {profile}");
                         var data = Path.Combine(p.ResolvedOutputFolder, PackBuilder.DataFolderName);
-                        if (!Directory.Exists(data)) throw new InvalidOperationException($"No packs at {data}: publish_pack first");
+                        if (!Directory.Exists(data)) throw new InvalidOperationException($"No packs at {data}: game_publish first");
                         Artifacts.Mount(PackSet.OpenFolder(data));
                     }
                     else if (mount == false)

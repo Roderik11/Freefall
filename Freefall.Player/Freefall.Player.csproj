@@ -10,6 +10,8 @@
     <Nullable>enable</Nullable>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <UseWindowsForms>false</UseWindowsForms>
+    <!-- No translated framework messages (cs, de, ... folders: 17 MB of a publish) -->
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
   </PropertyGroup>
 
   <ItemGroup>

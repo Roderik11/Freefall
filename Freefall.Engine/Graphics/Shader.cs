@@ -149,7 +149,7 @@ namespace Freefall.Graphics
                     string filename = match.Groups[1].Value;
                     string fullPath = System.IO.Path.Combine(baseDir, filename);
                     
-                    if (!System.IO.File.Exists(fullPath))
+                    if (!Freefall.Assets.EngineFiles.Exists(fullPath))
                     {
                         Debug.LogWarning("Shader", $"Include file not found: {fullPath}");
                         return $"// #include \"{filename}\" — NOT FOUND";
@@ -158,7 +158,7 @@ namespace Freefall.Graphics
                     if (!visited.Add(fullPath))
                         return $"// #include \"{filename}\" — already included (cycle)";
                     
-                    string content = System.IO.File.ReadAllText(fullPath);
+                    string content = Freefall.Assets.EngineFiles.ReadAllText(fullPath);
                     return ResolveIncludes(content, System.IO.Path.GetDirectoryName(fullPath)!, visited);
                 },
                 System.Text.RegularExpressions.RegexOptions.Multiline);

@@ -13,6 +13,9 @@ namespace Freefall.Graphics
     /// DX12 bindless sprite batch — no geometry shader, no atlas, no vertex buffer.
     /// Each sprite is written to a StructuredBuffer and carries its own texture heap index.
     /// One draw call renders ALL sprites regardless of texture count.
+    /// One Begin/End per frame: End writes the frame's sprites to the start of the frame's buffer, so a
+    /// second End in the same frame overwrites the first one's before the GPU draws them (draw everything
+    /// over a picture in one batch, as one Squid desktop does).
     /// </summary>
     public class SpriteBatch : IDisposable
     {
@@ -41,19 +44,24 @@ namespace Freefall.Graphics
         private SpriteData[] _sprites;
         private int _spriteCount;
 
-        // GPU upload buffer (mapped persistently)
-        private ID3D12Resource _spriteBuffer = null!;
-        private IntPtr _spriteBufferPtr;
-        private uint _spriteBufferBindlessIndex;
-        private int _bufferCapacity;
-
-        // Slug glyph indirection buffer
+        // Slug glyph indirection data
         private SlugGlyphData[] _glyphData;
         private int _glyphCount;
-        private ID3D12Resource _glyphBuffer = null!;
-        private IntPtr _glyphBufferPtr;
-        private uint _glyphBufferBindlessIndex;
-        private int _glyphBufferCapacity;
+
+        // GPU upload buffers (mapped persistently), one pair per frame in flight: the GPU may still draw the frame
+        // before from its buffers while this frame's sprites are written (one shared buffer showed later frames'
+        // sprites in earlier ones). A buffer grows when its frame comes round again: RenderView.Prepare has waited
+        // for the GPU to be done with that frame by then.
+        private const int FramesInFlight = 3;   // RenderView.FrameCount
+        private sealed class UploadBuffer
+        {
+            public ID3D12Resource Resource;
+            public IntPtr Pointer;
+            public uint BindlessIndex;
+            public int Capacity;
+        }
+        private readonly UploadBuffer[] _spriteBuffers = new UploadBuffer[FramesInFlight];
+        private readonly UploadBuffer[] _glyphBuffers = new UploadBuffer[FramesInFlight];
 
         // Scissor rect (pixel coords) — initialized to max so soft clipping defaults to fully open
         public RectI Scissor = new RectI(0, 0, int.MaxValue, int.MaxValue);
@@ -65,20 +73,23 @@ namespace Freefall.Graphics
         {
             _device = device;
             _sprites = new SpriteData[InitialCapacity];
-            _bufferCapacity = InitialCapacity;
             _glyphData = new SlugGlyphData[InitialGlyphCapacity];
-            _glyphBufferCapacity = InitialGlyphCapacity;
 
             CreatePipelineState();
-            CreateSpriteBuffer(InitialCapacity);
-            CreateGlyphBuffer(InitialGlyphCapacity);
+            for (int i = 0; i < FramesInFlight; i++)
+            {
+                _spriteBuffers[i] = new UploadBuffer();
+                _glyphBuffers[i] = new UploadBuffer();
+                Ensure(_spriteBuffers[i], InitialCapacity, SpriteStride);
+                Ensure(_glyphBuffers[i], InitialGlyphCapacity, GlyphStride);
+            }
             CreateWhiteTexture();
         }
 
         private void CreatePipelineState()
         {
             string shaderPath = Path.Combine(Engine.RootDirectory, "Resources", "Shaders", "spritebatch.hlsl");
-            string source = File.ReadAllText(shaderPath);
+            string source = Freefall.Assets.EngineFiles.ReadAllText(shaderPath);
 
             var vs = new Shader(source, "VS", "vs_6_6");
             var ps = new Shader(source, "PS", "ps_6_6");
@@ -126,35 +137,30 @@ namespace Freefall.Graphics
             return desc;
         }
 
-        private void CreateSpriteBuffer(int capacity)
+        /// <summary>A buffer for at least <paramref name="count"/> elements: made, or made anew when too small (its frame's GPU work is done).</summary>
+        private void Ensure(UploadBuffer buffer, int count, int stride)
         {
-            _spriteBuffer?.Dispose();
+            if (buffer.Resource != null && buffer.Capacity >= count) return;
+            buffer.Resource?.Dispose();
 
-            int bufferSize = capacity * SpriteStride;
-            _spriteBuffer = _device.NativeDevice.CreateCommittedResource(
+            buffer.Resource = _device.NativeDevice.CreateCommittedResource(
                 new HeapProperties(HeapType.Upload),
                 HeapFlags.None,
-                ResourceDescription.Buffer((ulong)bufferSize),
+                ResourceDescription.Buffer((ulong)(count * stride)),
                 ResourceStates.GenericRead);
 
             unsafe
             {
                 void* ptr;
-                _spriteBuffer.Map(0, null, &ptr);
-                _spriteBufferPtr = (IntPtr)ptr;
+                buffer.Resource.Map(0, null, &ptr);
+                buffer.Pointer = (IntPtr)ptr;
             }
 
             // Allocate or reuse bindless index
-            if (_spriteBufferBindlessIndex == 0)
-                _spriteBufferBindlessIndex = _device.AllocateBindlessIndex();
-
-            _device.CreateStructuredBufferSRV(
-                _spriteBuffer,
-                (uint)capacity,
-                SpriteStride,
-                _spriteBufferBindlessIndex);
-
-            _bufferCapacity = capacity;
+            if (buffer.BindlessIndex == 0)
+                buffer.BindlessIndex = _device.AllocateBindlessIndex();
+            _device.CreateStructuredBufferSRV(buffer.Resource, (uint)count, (uint)stride, buffer.BindlessIndex);
+            buffer.Capacity = count;
         }
 
         private void CreateWhiteTexture()
@@ -366,13 +372,20 @@ namespace Freefall.Graphics
         {
             if (_spriteCount == 0) return;
 
+            // This frame's buffers (the GPU may still be reading the others)
+            int frame = (int)((uint)Engine.FrameIndex % FramesInFlight);
+            var sprites = _spriteBuffers[frame];
+            var glyphs = _glyphBuffers[frame];
+            Ensure(sprites, _sprites.Length, SpriteStride);
+            Ensure(glyphs, _glyphData.Length, GlyphStride);
+
             // Upload sprite data to GPU
             unsafe
             {
                 fixed (SpriteData* src = _sprites)
                 {
                     int bytes = _spriteCount * SpriteStride;
-                    Buffer.MemoryCopy(src, (void*)_spriteBufferPtr, _bufferCapacity * SpriteStride, bytes);
+                    Buffer.MemoryCopy(src, (void*)sprites.Pointer, sprites.Capacity * SpriteStride, bytes);
                 }
             }
 
@@ -384,7 +397,7 @@ namespace Freefall.Graphics
                     fixed (SlugGlyphData* src = _glyphData)
                     {
                         int bytes = _glyphCount * GlyphStride;
-                        Buffer.MemoryCopy(src, (void*)_glyphBufferPtr, _glyphBufferCapacity * GlyphStride, bytes);
+                        Buffer.MemoryCopy(src, (void*)glyphs.Pointer, glyphs.Capacity * GlyphStride, bytes);
                     }
                 }
             }
@@ -394,7 +407,7 @@ namespace Freefall.Graphics
             commandList.SetGraphicsRootSignature(_device.GlobalRootSignature);
 
             // Push constants: sprite buffer index, screen width, screen height, glyph buffer index
-            commandList.SetGraphicsRoot32BitConstant(0, _spriteBufferBindlessIndex, 0);
+            commandList.SetGraphicsRoot32BitConstant(0, sprites.BindlessIndex, 0);
 
             unsafe
             {
@@ -404,7 +417,7 @@ namespace Freefall.Graphics
                 commandList.SetGraphicsRoot32BitConstant(0, *(uint*)&h, 2);
             }
 
-            commandList.SetGraphicsRoot32BitConstant(0, _glyphBufferBindlessIndex, 3);
+            commandList.SetGraphicsRoot32BitConstant(0, glyphs.BindlessIndex, 3);
 
             // Set topology and draw
             commandList.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
@@ -415,11 +428,8 @@ namespace Freefall.Graphics
         {
             if (_spriteCount >= _sprites.Length)
             {
-                int newCapacity = _sprites.Length * 2;
-                Array.Resize(ref _sprites, newCapacity);
-
-                if (newCapacity > _bufferCapacity)
-                    CreateSpriteBuffer(newCapacity);
+                // The GPU buffers follow in End, each when its frame comes round
+                Array.Resize(ref _sprites, _sprites.Length * 2);
             }
         }
 
@@ -427,49 +437,15 @@ namespace Freefall.Graphics
         {
             if (_glyphCount >= _glyphData.Length)
             {
-                int newCapacity = _glyphData.Length * 2;
-                Array.Resize(ref _glyphData, newCapacity);
-
-                if (newCapacity > _glyphBufferCapacity)
-                    CreateGlyphBuffer(newCapacity);
+                Array.Resize(ref _glyphData, _glyphData.Length * 2);
             }
-        }
-
-        private void CreateGlyphBuffer(int capacity)
-        {
-            _glyphBuffer?.Dispose();
-
-            int bufferSize = capacity * GlyphStride;
-            _glyphBuffer = _device.NativeDevice.CreateCommittedResource(
-                new HeapProperties(HeapType.Upload),
-                HeapFlags.None,
-                ResourceDescription.Buffer((ulong)bufferSize),
-                ResourceStates.GenericRead);
-
-            unsafe
-            {
-                void* ptr;
-                _glyphBuffer.Map(0, null, &ptr);
-                _glyphBufferPtr = (IntPtr)ptr;
-            }
-
-            if (_glyphBufferBindlessIndex == 0)
-                _glyphBufferBindlessIndex = _device.AllocateBindlessIndex();
-
-            _device.CreateStructuredBufferSRV(
-                _glyphBuffer,
-                (uint)capacity,
-                GlyphStride,
-                _glyphBufferBindlessIndex);
-
-            _glyphBufferCapacity = capacity;
         }
 
         public void Dispose()
         {
             _pipelineState?.Dispose();
-            _spriteBuffer?.Dispose();
-            _glyphBuffer?.Dispose();
+            foreach (var buffer in _spriteBuffers) buffer?.Resource?.Dispose();
+            foreach (var buffer in _glyphBuffers) buffer?.Resource?.Dispose();
         }
     }
 

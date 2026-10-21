@@ -34,8 +34,9 @@ namespace Freefall.Graphics
 
         /// <summary>
         /// Off in a published game (Engine.Initialize with editor: false), before any shader loads: engine shaders come
-        /// from &lt;exe&gt;/Resources/Shaders only (no search for a source checkout above the exe, which a build inside the
-        /// repository would find), and no folder is watched.
+        /// from &lt;exe&gt;/Resources/Shaders only, which a game serves from its engine pack (Assets.EngineFiles); there is
+        /// no search for a source checkout above the exe (a build inside the repository would find one), and no folder
+        /// is watched.
         /// </summary>
         public static bool Enabled { get; set; } = true;
 
@@ -88,11 +89,11 @@ namespace Freefall.Graphics
         public static string? ResolvePath(string fileName)
         {
             string path = Path.Combine(Directory, fileName);
-            if (File.Exists(path)) return path;
+            if (Freefall.Assets.EngineFiles.Exists(path)) return path;
 
             // Build output, then next to the executable (dev convenience, as before)
             path = Path.Combine(AppContext.BaseDirectory, "Resources", "Shaders", fileName);
-            if (File.Exists(path)) return path;
+            if (Freefall.Assets.EngineFiles.Exists(path)) return path;
 
             path = Path.Combine(AppContext.BaseDirectory, fileName);
             return File.Exists(path) ? path : null;
@@ -119,17 +120,17 @@ namespace Freefall.Graphics
         public static string? ResolveInclude(string includingDirectory, string file)
         {
             string local = Path.GetFullPath(Path.Combine(includingDirectory, file));
-            if (File.Exists(local)) return local;
+            if (Freefall.Assets.EngineFiles.Exists(local)) return local;
             string engine = Path.GetFullPath(Path.Combine(Directory, file));
-            return File.Exists(engine) ? engine : null;
+            return Freefall.Assets.EngineFiles.Exists(engine) ? engine : null;
         }
 
         private static void Collect(string path, HashSet<string> set)
         {
-            if (!set.Add(path) || !File.Exists(path)) return;
+            if (!set.Add(path) || !Freefall.Assets.EngineFiles.Exists(path)) return;
 
             string text;
-            try { text = File.ReadAllText(path); }
+            try { text = Freefall.Assets.EngineFiles.ReadAllText(path); }
             catch (IOException) { return; }
 
             string dir = Path.GetDirectoryName(path) ?? "";

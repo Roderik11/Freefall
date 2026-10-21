@@ -44,6 +44,9 @@ namespace Freefall.UI
         /// <summary>The renderer's name for the marks' font (<see cref="Font"/> at <see cref="MarkFontSize"/>), or null without a Font.</summary>
         public string MarkFontName(IGameUIRenderer renderer) => FontName(renderer, Font, MarkFontSize);
 
+        /// <summary>The renderer's name for <see cref="Font"/> at <paramref name="size"/> pixels, or null without a Font.</summary>
+        public string FontNameAt(IGameUIRenderer renderer, int size) => FontName(renderer, Font, size);
+
         /// <summary>
         /// Writes the styles into <paramref name="skin"/>. A style that is already there is changed in
         /// place, so controls that use it show the change without being built again.

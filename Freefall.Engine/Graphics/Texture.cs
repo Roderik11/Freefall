@@ -587,7 +587,7 @@ void CSCopySlice(uint3 id : SV_DispatchThreadID) {
         
          private static Freefall.Assets.CpuTextureData ParseDDS(string filePath)
         {
-            var bytes = File.ReadAllBytes(filePath);
+            var bytes = Freefall.Assets.EngineFiles.ReadAllBytes(filePath);
             var result = ParseDDSFromBytes(bytes);
             result.Path = filePath;
             return result;

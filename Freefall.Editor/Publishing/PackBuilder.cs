@@ -12,83 +12,58 @@ namespace Freefall.Editor.Publishing
         public List<(string File, int Entries, long Bytes)> Packs = new();
         public int Entries;
         public long Bytes;
-        public TimeSpan ScanTime, WriteTime, VerifyTime;
+        public TimeSpan WriteTime, VerifyTime;
         /// <summary>Entries whose bytes in the pack differ from their Cache file (verify only).</summary>
         public int Mismatches;
         public List<string> Problems = new();
         public bool Verified;
-        /// <summary>Script files compiled into FreefallScripts.dll (0 = none written).</summary>
-        public int Scripts;
+    }
+
+    /// <summary>What the packs will hold: the manifest and the artifacts in the order the scan reached them.</summary>
+    public sealed class PackJob
+    {
+        public PackManifest Manifest = new();
+        public List<(string Guid, string DataType, string CachePath, long Size)> Items = new();
+        public long Limit;
     }
 
     /// <summary>
-    /// Writes a profile's packs: the scan's artifacts byte for byte into Data/data0.ffpack, data1.ffpack… (a new one at
-    /// the profile's size limit, in the order the scan reached them) and Data/game.manifest (the scenes, the packs, the
-    /// packed assets' metas cut down to their packed artifacts), inside the output folder. The scan and the metas are
-    /// taken on the main thread; writing and verifying run on a worker (gigabytes: a main-thread call would freeze the
-    /// editor and time out). The output folder is marked with <see cref="MarkerFile"/>; a folder that is not empty and
-    /// has no marker is refused, so Publish never clears a folder it did not make.
+    /// A profile's packs: the scan's artifacts byte for byte into Data/data0.ffpack, data1.ffpack… (a new one at the
+    /// profile's size limit, in the order the scan reached them) and Data/game.manifest (the scenes, the packs, the
+    /// packed assets' metas cut down to their packed artifacts). <see cref="Prepare"/> takes the metas on the main
+    /// thread; writing and verifying run on a worker (gigabytes). Publisher runs them as steps of a publish.
     /// </summary>
     public static class PackBuilder
     {
-        public const string MarkerFile = ".freefall-build";
         public const string DataFolderName = "Data";
         /// <summary>The project's scripts, compiled for the game (Release), next to Data/: the player loads them from there.</summary>
         public const string ScriptsFile = "FreefallScripts.dll";
 
-        /// <summary>The write in progress (or the last one).</summary>
-        public static Task<PackResult>? Current { get; private set; }
-
-        /// <summary>Main thread: scan and start writing. Throws if a write is running or the output folder is not Publish's.</summary>
-        public static Task<PackResult> Start(BuildProfile profile, bool verify)
+        /// <summary>Main thread: the manifest and the artifacts to pack, from a scan.</summary>
+        public static PackJob Prepare(BuildProfile profile, BuildScan scan)
         {
-            if (Current is { IsCompleted: false })
-                throw new InvalidOperationException("Packs are being written already");
-
-            var watch = Stopwatch.StartNew();
-            var scan = DependencyScanner.Scan(profile);
-            if (scan.Artifacts.Count == 0)
-                throw new InvalidOperationException("The scan found nothing to pack: " + string.Join("; ", scan.Warnings));
-
-            var output = profile.ResolvedOutputFolder;
-            PrepareOutputFolder(output);
-            scan.WriteReport(profile.ReportPath);
-
-            var manifest = new PackManifest
+            return new PackJob
             {
-                Product = profile.ResolvedProductName,
-                Created = DateTime.UtcNow,
-                Scenes = scan.Artifacts.Where(a => a.Root != null && a.DataType == nameof(SceneData)).Select(a => a.Guid).ToList(),
-                Metas = PackedMetas(scan),
+                Manifest = new PackManifest
+                {
+                    Product = profile.ResolvedProductName,
+                    Created = DateTime.UtcNow,
+                    Scenes = scan.Artifacts.Where(a => a.Root != null && a.DataType == nameof(SceneData)).Select(a => a.Guid).ToList(),
+                    EnginePack = EngineFiles.PackFile,
+                    Metas = PackedMetas(scan),
+                },
+                Items = scan.Artifacts.Select(a => (a.Guid, a.DataType, a.CachePath, a.Size)).ToList(),
+                Limit = Math.Max(1, profile.PackSizeLimitMB) * (1L << 20),
             };
-            var items = scan.Artifacts.Select(a => (a.Guid, a.DataType, a.CachePath, a.Size)).ToList();
-            long limit = Math.Max(1, profile.PackSizeLimitMB) * (1L << 20);
-            var scanTime = watch.Elapsed;
-            var assetsDirectory = Engine.Project.AssetsDirectory;
-
-            Current = Task.Run(() =>
-            {
-                var result = Write(Path.Combine(output, DataFolderName), items, manifest, limit, verify, scanTime);
-                WriteScripts(assetsDirectory, output, result);
-                return result;
-            });
-            return Current;
         }
 
-        /// <summary>The project's scripts compiled for the game (Release) into the output folder, with their plugin DLLs. Worker.</summary>
-        static void WriteScripts(string assetsDirectory, string output, PackResult result)
+        /// <summary>The project's scripts compiled for the game (Release) into the output folder, with their plugin DLLs.</summary>
+        internal static void WriteScripts(ScriptCompiler.BuildResult build, string output)
         {
-            var build = ScriptCompiler.BuildForPublish(assetsDirectory);
-            if (build?.Pe == null)
-            {
-                result.Problems.Add(build == null ? "The scripts did not compile (see the console): no " + ScriptsFile : "There are no scripts");
-                return;
-            }
-            File.WriteAllBytes(Path.Combine(output, ScriptsFile), build.Pe);
+            File.WriteAllBytes(Path.Combine(output, ScriptsFile), build.Pe!);
             if (build.Pdb != null) File.WriteAllBytes(Path.Combine(output, Path.ChangeExtension(ScriptsFile, ".pdb")), build.Pdb);
             foreach (var plugin in build.PluginPaths)
                 File.Copy(plugin, Path.Combine(output, Path.GetFileName(plugin)), overwrite: true);
-            result.Scripts = build.ScriptCount;
         }
 
         /// <summary>The metas of the packed assets, each cut down to its packed sub-assets (copies: the database's stay as they are).</summary>
@@ -113,22 +88,17 @@ namespace Freefall.Editor.Publishing
             return metas;
         }
 
-        static void PrepareOutputFolder(string output)
+        /// <summary>Worker: the packs and the manifest into <paramref name="dataFolder"/>. <paramref name="report"/> gets each artifact and the share written.</summary>
+        public static PackResult Write(string dataFolder, PackJob job, Action<string, float>? report = null)
         {
-            if (Directory.Exists(output) && Directory.EnumerateFileSystemEntries(output).Any() && !File.Exists(Path.Combine(output, MarkerFile)))
-                throw new InvalidOperationException($"{output} is not empty and was not made by Publish (no {MarkerFile}): choose another output folder");
-            Directory.CreateDirectory(output);
-            File.WriteAllText(Path.Combine(output, MarkerFile), "Written by the Freefall editor's Publish. Its contents are replaced on every publish.\n");
-        }
-
-        static PackResult Write(string dataFolder, List<(string Guid, string DataType, string CachePath, long Size)> items,
-                                PackManifest manifest, long limit, bool verify, TimeSpan scanTime)
-        {
-            var result = new PackResult { DataFolder = dataFolder, ScanTime = scanTime };
+            var result = new PackResult { DataFolder = dataFolder };
             Directory.CreateDirectory(dataFolder);
             foreach (var old in Directory.GetFiles(dataFolder, "*" + PackFormat.Extension).Append(Path.Combine(dataFolder, PackManifest.FileName)))
                 if (File.Exists(old)) File.Delete(old);
 
+            var manifest = job.Manifest;
+            manifest.Packs.Clear();
+            long total = Math.Max(1, job.Items.Sum(i => i.Size));
             var watch = Stopwatch.StartNew();
             PackWriter? writer = null;
             void Close()
@@ -140,16 +110,17 @@ namespace Freefall.Editor.Publishing
                 writer = null;
             }
 
-            foreach (var (guid, dataType, cachePath, size) in items)
+            foreach (var (guid, dataType, cachePath, size) in job.Items)
             {
                 if (!File.Exists(cachePath))
                 {
                     result.Problems.Add($"Not in the Cache, left out: {cachePath}");
                     continue;
                 }
-                if (writer != null && writer.Entries.Count > 0 && !writer.Fits(size, dataType, limit))
+                if (writer != null && writer.Entries.Count > 0 && !writer.Fits(size, dataType, job.Limit))
                     Close();
                 writer ??= new PackWriter(Path.Combine(dataFolder, $"data{result.Packs.Count}{PackFormat.Extension}"));
+                report?.Invoke($"{Path.GetFileName(writer.Path)}: {Path.GetFileName(cachePath)} ({dataType})", result.Bytes / (float)total);
                 using (var source = File.OpenRead(cachePath))
                     writer.Add(guid, dataType, source);
                 result.Entries++;
@@ -158,20 +129,44 @@ namespace Freefall.Editor.Publishing
             Close();
             manifest.Save(Path.Combine(dataFolder, PackManifest.FileName));
             result.WriteTime = watch.Elapsed;
-
-            if (verify)
-            {
-                watch.Restart();
-                Verify(dataFolder, manifest, items, result);
-                result.VerifyTime = watch.Elapsed;
-                result.Verified = true;
-            }
             return result;
         }
 
-        /// <summary>Every artifact read back from the packs and compared byte for byte with its Cache file; the manifest read back too.</summary>
-        static void Verify(string dataFolder, PackManifest manifest, List<(string Guid, string DataType, string CachePath, long Size)> items, PackResult result)
+        /// <summary>
+        /// Worker: the engine's own files (every file under <paramref name="resources"/> but <paramref name="leaveOut"/>
+        /// folders) into Data/engine.ffpack, each under the key of its path relative to Resources (EngineFiles.KeyOf),
+        /// so the game folder has no Resources folder. Returns the files and bytes packed.
+        /// </summary>
+        public static (int Files, long Bytes) WriteEngineFiles(string resources, string dataFolder, IEnumerable<string> leaveOut,
+                                                              Action<string, float>? report = null)
         {
+            var skip = leaveOut.Select(f => f.TrimEnd('\\', '/') + Path.DirectorySeparatorChar).ToList();
+            var files = Directory.GetFiles(resources, "*", SearchOption.AllDirectories)
+                .Select(f => Path.GetRelativePath(resources, f))
+                .Where(r => !skip.Any(s => r.StartsWith(s, StringComparison.OrdinalIgnoreCase)))
+                .OrderBy(r => r, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            long bytes = 0;
+            using (var writer = new PackWriter(Path.Combine(dataFolder, EngineFiles.PackFile)))
+            {
+                for (int i = 0; i < files.Count; i++)
+                {
+                    report?.Invoke($"{EngineFiles.PackFile}: {files[i]}", i / (float)Math.Max(1, files.Count));
+                    using var source = File.OpenRead(Path.Combine(resources, files[i]));
+                    writer.Add(EngineFiles.KeyOf(files[i]), EngineFiles.DataType, source);
+                    bytes += source.Length;
+                }
+            }
+            return (files.Count, bytes);
+        }
+
+        /// <summary>Worker: every artifact read back from the packs and compared byte for byte with its Cache file; the manifest read back too.</summary>
+        public static void Verify(PackJob job, PackResult result, Action<string, float>? report = null)
+        {
+            var watch = Stopwatch.StartNew();
+            var dataFolder = result.DataFolder;
+            var manifest = job.Manifest;
             var reread = PackManifest.Load(Path.Combine(dataFolder, PackManifest.FileName));
             if (reread.Metas.Count != manifest.Metas.Count || !reread.Packs.SequenceEqual(manifest.Packs) || !reread.Scenes.SequenceEqual(manifest.Scenes))
                 result.Problems.Add("The manifest does not read back as it was written");
@@ -179,9 +174,12 @@ namespace Freefall.Editor.Publishing
             using var packs = PackSet.Open(manifest.Packs.Select(p => Path.Combine(dataFolder, p)));
             var a = new byte[1 << 20];
             var b = new byte[1 << 20];
-            foreach (var (guid, dataType, cachePath, size) in items)
+            long total = Math.Max(1, result.Bytes), done = 0;
+            foreach (var (guid, dataType, cachePath, size) in job.Items)
             {
                 if (!File.Exists(cachePath)) continue;
+                report?.Invoke(Path.GetFileName(cachePath), done / (float)total);
+                done += size;
                 using var packed = packs.Open(guid);
                 if (packed == null)
                 {
@@ -197,6 +195,8 @@ namespace Freefall.Editor.Publishing
                     if (result.Problems.Count < 50) result.Problems.Add($"Differs from its Cache file: {guid} ({cachePath})");
                 }
             }
+            result.VerifyTime = watch.Elapsed;
+            result.Verified = true;
         }
 
         static bool SameBytes(Stream x, Stream y, byte[] a, byte[] b)

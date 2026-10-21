@@ -356,7 +356,7 @@ namespace Freefall.Graphics
             ShaderHotReload.Register(this);
 
             _basePath = Path.GetDirectoryName(fullPath);
-            _cachedSource = File.ReadAllText(fullPath);
+            _cachedSource = Freefall.Assets.EngineFiles.ReadAllText(fullPath);
 
             // Discover and compile kernels from #pragma kernel directives
             var kernelNames = KernelParser.ParseKernels(_cachedSource);
@@ -389,7 +389,7 @@ namespace Freefall.Graphics
         {
             if (!_compiled || _disposed || _fullPath == null) return false;
 
-            string source = File.ReadAllText(_fullPath);
+            string source = Freefall.Assets.EngineFiles.ReadAllText(_fullPath);
             var kernelNames = KernelParser.ParseKernels(source);
             if (kernelNames.Count == 0 && _defaultEntryPoint != null)
                 kernelNames.Add(_defaultEntryPoint);

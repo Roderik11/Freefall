@@ -471,28 +471,48 @@ namespace Freefall
 #endif
         }
 
+        /// <summary>The end of the process: what must be closed (audio, GPU, streaming), not every object released.</summary>
         public static void Shutdown()
         {
             _isRunning = false;
-            
-            PhysicsWorld.Shutdown();
+
+            // Silent at once: the window is gone by now, and the teardown below takes seconds (music played on through it)
+            AudioDevice?.StopEngine();
+
+            var watch = System.Diagnostics.Stopwatch.StartNew();
+            var parts = new List<string>();
+            void Done(string part)
+            {
+                parts.Add($"{part} {watch.Elapsed.TotalMilliseconds:0} ms");
+                watch.Restart();
+            }
+
+            // PhysX is not released: the process ends right after Shutdown (editor and player), and PhysX.Net releases
+            // a scene object by object, 26 s for Eldermoor's colliders (2026-10-21), while the game's window was gone
             NavMeshWorld.Shutdown();
-            
+            Done("navmesh");
+
             // Restore timer resolution
             Kernel32.timeEndPeriod(1);
-            
+
             TransformBuffer.Instance?.Dispose();
 
             StreamingManager.Instance?.Dispose();
+            Done("streaming");
 
             // Dispose all registered render views
             for (int i = RenderView.All.Count - 1; i >= 0; i--)
                 RenderView.All[i].Dispose();
+            Done("views");
 
             Assets?.Dispose();
+            Done("assets");
             _masteringVoice?.Dispose();
             AudioDevice?.Dispose();
+            Done("audio");
             Device?.Dispose();
+            Done("device");
+            Debug.LogAlways($"[Engine] Shut down: {string.Join(", ", parts)}");
         }
     }
 

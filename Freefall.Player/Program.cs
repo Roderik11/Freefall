@@ -76,8 +76,11 @@ namespace Freefall.Player
             if (manifest.Scenes.Count == 0)
                 throw new InvalidDataException("The game has no scenes (its manifest lists none)");
 
-            // Its own shader cache, not the editor's; before the engine compiles its first shader
+            // Its own shader cache, not the editor's, and the engine's files from their pack: before the engine compiles its
+            // first shader (Engine.Initialize)
             ShaderCache.SetRoot(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), product, "ShaderCache"));
+            if (!string.IsNullOrEmpty(manifest.EnginePack))
+                EngineFiles.Mount(PackSet.Open(new[] { Path.Combine(dataFolder, manifest.EnginePack) }));
 
             Application.SetHighDpiMode(HighDpiMode.PerMonitorV2);
             form = new RenderForm { Text = product, BackColor = System.Drawing.Color.Black, StartPosition = FormStartPosition.CenterScreen };
@@ -96,6 +99,7 @@ namespace Freefall.Player
 
             ui = new SquidRenderer(Engine.Device);
             Squid.Gui.Renderer = ui;
+            GameUI.ShowFps = true;   // until the game has options of its own for it
             var reported = new HashSet<string>();
             Squid.Gui.ControlException = (control, ex) =>
             {
@@ -131,7 +135,8 @@ namespace Freefall.Player
 
             RenderLoop.Run(form, Tick, true);
 
-            Log($"[Player] Closed after {sinceStart.Elapsed.TotalSeconds:0.0} s; {Artifacts.OpenedFromPacks} artifacts read from the packs");
+            Log($"[Player] Closed after {sinceStart.Elapsed.TotalSeconds:0.0} s; {Artifacts.OpenedFromPacks} artifacts read from the packs, " +
+                $"{EngineFiles.ReadFromPack} engine files from {manifest.EnginePack ?? "the disk"}");
             ui.Dispose();
             Engine.Shutdown();
         }
@@ -173,7 +178,7 @@ namespace Freefall.Player
             }
         }
 
-        /// <summary>After the picture is in the back buffer: the marks game code asked for (Graphics.Overlay), then the game's UI.</summary>
+        /// <summary>After the picture is in the back buffer: the game's UI (its desktop draws the marks game code asked for, Graphics.Overlay).</summary>
         static void DrawUI(RenderView target)
         {
             var cmd = target.CommandList;
@@ -199,10 +204,8 @@ namespace Freefall.Player
             cmd.SetScissorRect(new RectI(0, 0, target.Width, target.Height));
             ui.SetContext(cmd.Native, target.Width, target.Height);
 
-            ui.StartBatch();
-            Overlay.Draw(ui, new Squid.Point(0, 0), size);
-            ui.EndBatch(true);
-            if (GameUI.Running) GameUI.Desktop.Draw();
+            // One desktop, one batch: the game UI's desktop draws the overlay's marks and the frame rate under its controls
+            GameUI.Desktop.Draw();
         }
 
         /// <summary>Borderless over the whole screen the window is on, or back to a window.</summary>
