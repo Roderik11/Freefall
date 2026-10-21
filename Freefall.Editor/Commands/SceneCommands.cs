@@ -119,6 +119,29 @@ namespace Freefall.Editor.Commands
         }
     }
 
+    [CommandRoute("POST", "/api/scene/new")]
+    public class NewSceneCommand : EditorCommand
+    {
+        public override CommandResult Execute(CommandContext context)
+        {
+            if (!Program.IsProjectOpen || Program.EditorUI == null)
+                return CommandResult.Error(409, "No project is open");
+            if (Program.EditorUI.IsPlaying)
+                return CommandResult.Error(409, "Stop play mode before starting a new scene");
+
+            try
+            {
+                // Starts the load and returns, as /api/scene/load does (GET /api/scene/load-status)
+                Program.EditorUI.NewScene();
+                return CommandResult.Json(new { status = "loading" });
+            }
+            catch (InvalidOperationException ex)
+            {
+                return CommandResult.Error(409, ex.Message);
+            }
+        }
+    }
+
     [CommandRoute("POST", "/api/scene/save")]
     public class SaveSceneCommand : EditorCommand
     {

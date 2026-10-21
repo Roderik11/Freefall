@@ -89,12 +89,22 @@ namespace Freefall.Base
         private double _longestSliceMs;
         private int _slices;
 
-        internal SceneLoad(SceneAsset? scene, byte[] yaml)
+        private readonly bool _clearPersistent;
+
+        internal SceneLoad(SceneAsset? scene, byte[] yaml, bool clearPersistent = false)
         {
             Scene = scene;
             Name = scene?.Name ?? "(unsaved scene)";
             _yaml = yaml;
+            _clearPersistent = clearPersistent;
+            _history.TryGetValue(HistoryKey, out _previous);
         }
+
+        // When each step ended in the last load of the same scene that finished (this session): the bar's shares
+        private static readonly Dictionary<string, double[]> _history = new();
+        private readonly double[]? _previous;
+        private string HistoryKey => Scene?.Guid ?? Name;
+        private float _progress;
 
         /// <summary>Number of steps before <see cref="Step.Done"/>, for a "(3/7)".</summary>
         public const int StepCount = (int)Step.Done;
@@ -112,17 +122,47 @@ namespace Freefall.Base
             _ => "Done",
         };
 
-        /// <summary>0..1 over all steps.</summary>
+        /// <summary>
+        /// 0..1 over all steps, for a loading bar: it never goes back (a step's count of work left can grow, the woken
+        /// timber kit adds its pieces). Each step's share of the bar is the share of the time it took the last time this
+        /// scene was loaded (this session), or a fixed guess before that.
+        /// </summary>
         public float Progress
         {
             get
             {
                 if (Current == Step.Done) return 1f;
-                float done = 0f;
-                for (int i = 0; i < (int)Current; i++) done += Weights[i];
-                return done + Weights[(int)Current] * Math.Clamp(StepProgress, 0f, 1f);
+                float now = StepStart(Current) + StepShare(Current) * Math.Clamp(StepProgress, 0f, 1f);
+                _progress = Math.Max(_progress, Math.Min(now, 0.999f));
+                return _progress;
             }
         }
+
+        // Where a step starts on the bar, and how much of it it takes
+        private float StepStart(Step step)
+        {
+            if (_previous != null && _previous[^1] > 0)
+                return step == Step.Clearing ? 0f : (float)(_previous[(int)step - 1] / _previous[^1]);
+            float start = 0f;
+            for (int i = 0; i < (int)step; i++) start += Weights[i];
+            return start;
+        }
+
+        private float StepShare(Step step) => _previous != null && _previous[^1] > 0
+            ? (float)((_previous[(int)step] - (step == Step.Clearing ? 0 : _previous[(int)step - 1])) / _previous[^1])
+            : Weights[(int)step];
+
+        /// <summary>
+        /// The load needs the world drawn this frame (<see cref="SceneManager.HideWorldWhileLoading"/>): the terrain bakes
+        /// or keeps its heights in its draw (from the terrain step on: TerrainRenderer waits for every stamp to wake), and
+        /// the last frames create what the first visible frame would.
+        /// </summary>
+        internal bool WantsWorldDrawn => Current switch
+        {
+            Step.Terrain or Step.Finishing => true,
+            Step.Generating or Step.Waiting => PCGScheduler.TerrainHeightsPending,   // generated stamps rebake it
+            _ => false,
+        };
 
         private float StepProgress => Current switch
         {
@@ -192,7 +232,7 @@ namespace Freefall.Base
             switch (Current)
             {
                 case Step.Clearing:
-                    _clear ??= new EntityManager.ClearJob();
+                    _clear ??= new EntityManager.ClearJob(_clearPersistent);
                     Activity = $"Clearing the scene ({_clear.Total:N0} entities)";
                     if (!_clear.Step(deadline)) return false;
                     Cleared?.Invoke(this);
@@ -309,6 +349,8 @@ namespace Freefall.Base
             if (_waits.Count > 0) text.Append($"; waited for {string.Join(", ", _waits.ConvertAll(w => w.What))}");
             Report = _report.Finish(text.ToString());
             Debug.LogAlways(Report);
+            if (Error == null && !Superseded)
+                _history[HistoryKey] = (double[])_stepEndS.Clone();
 
             SceneManager.OnDone(this);
             Completed?.Invoke(this);

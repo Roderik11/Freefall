@@ -62,6 +62,20 @@ namespace Freefall.Editor.Mcp
             return null;
         }
 
+        [McpServerTool(Name = "scene_new", Title = "New scene", Destructive = true, OpenWorld = false)]
+        [Description("Replace the current scene with an empty one that is no file yet (File > New Scene): unsaved changes are lost, the editor camera stays. " +
+                     "Name it with the first scene_save (path relative to Assets, e.g. 'Scenes/Startup.scene'). Waits until the clear is done. Not while playing.")]
+        public static async Task<CallToolResult> NewScene(
+            [Description("Max seconds to wait")] int waitSeconds = 120)
+        {
+            var result = await McpBridge.Post("/api/scene/new", new { });
+            if (result.IsError == true) return result;
+            var done = await WaitForLoad(waitSeconds);
+            if (done == null)
+                return McpBridge.Error($"Still clearing after {waitSeconds}s; editor_status shows the step.");
+            return EditorTools.Text(new JsonObject { ["status"] = "ok", ["loadReport"] = done["lastReport"]?.DeepClone() });
+        }
+
         [McpServerTool(Name = "scene_save", Title = "Save scene", Destructive = true, OpenWorld = false)]
         [Description("Save all entities to a .scene file inside Assets and import it, returning the scene's asset GUID. Without 'path' this overwrites the currently open scene (same as File > Save Scene). Not while playing.")]
         public static Task<CallToolResult> SaveScene(

@@ -72,6 +72,22 @@ namespace Freefall.UI
 
         public static event Action MenuChanged;
 
+        /// <summary>
+        /// The menu stays open and Escape does nothing: a main menu, where there is no game to go back to. Whoever sets
+        /// it clears it again when it goes (Reset does too).
+        /// </summary>
+        public static bool MenuAlwaysOpen
+        {
+            get => _menuAlwaysOpen;
+            set
+            {
+                _menuAlwaysOpen = value;
+                if (value) MenuOpen = true;
+            }
+        }
+
+        private static bool _menuAlwaysOpen;
+
         /// <summary>True from the first <see cref="Update"/> of a run to <see cref="Reset"/>.</summary>
         public static bool Running { get; private set; }
 
@@ -91,13 +107,32 @@ namespace Freefall.UI
         public static void Add(Control control, bool menu = false)
         {
             if (control == null) return;
-            Desktop.Controls.Add(control);
+
+            // Under the top layer, also when added after it (a scene's HUD built while its loading screen shows)
+            int at = Desktop.Controls.Count;
+            foreach (var top in _top)
+                if (top.Parent == Desktop) at = Math.Min(at, Desktop.Controls.IndexOf(top));
+            Desktop.Controls.Insert(at, control);
+
             if (menu)
             {
                 _menu.Add(control);
                 control.Visible = _menuOpen;
             }
         }
+
+        /// <summary>
+        /// Puts a control over every other, also over those added after it with <see cref="Add"/>: a loading screen,
+        /// a fade to black. Taken off with <see cref="Remove"/>.
+        /// </summary>
+        public static void AddOnTop(Control control)
+        {
+            if (control == null) return;
+            Desktop.Controls.Add(control);
+            _top.Add(control);
+        }
+
+        private static readonly List<Control> _top = new();
 
         /// <summary>
         /// Takes a control off the desktop. The desktop is renewed with the rest of its controls,
@@ -109,6 +144,7 @@ namespace Freefall.UI
         {
             if (control == null) return;
             _menu.Remove(control);
+            _top.Remove(control);
             control.Parent = null;
             Desktop = NewDesktop(Desktop);
         }
@@ -129,7 +165,9 @@ namespace Freefall.UI
                 }
             }
 
-            if (Input.IsKeyPressed(Keys.Escape))
+            if (MenuAlwaysOpen)
+                MenuOpen = true;
+            else if (Input.IsKeyPressed(Keys.Escape))
                 MenuOpen = !MenuOpen;
 
             Input.IsMouseLocked = !_menuOpen;
@@ -141,7 +179,9 @@ namespace Freefall.UI
             foreach (var control in new List<Control>(Desktop.Controls))
                 if (control != _marks) control.Parent = null;
             _menu.Clear();
+            _top.Clear();
             _menuOpen = false;
+            _menuAlwaysOpen = false;
             _skin = null;
             Desktop = NewDesktop(null);
             Running = false;

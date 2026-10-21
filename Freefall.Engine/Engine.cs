@@ -59,6 +59,15 @@ namespace Freefall
             IsEditor = !playmode;
         }
 
+        /// <summary>
+        /// Game code asks to end the game (a menu's Quit). The host does it: the player closes its window, the editor
+        /// stops play mode. It happens after the current frame.
+        /// </summary>
+        public static void RequestQuit() => RunOnMainThreadAsync(() => QuitRequested?.Invoke());
+
+        /// <summary>The host's answer to <see cref="RequestQuit"/>.</summary>
+        public static event Action? QuitRequested;
+
         // Main-thread work queue for marshaling from background threads
         private sealed class WorkItem
         {
@@ -339,8 +348,9 @@ namespace Freefall
 
                         using (_cameraMarker.Auto())
                         {
+                            // A loading screen covers a half-made world: the game draws it only when the load needs it
                             var cam = Camera.Main;
-                            if (cam != null && cam.Target == view)
+                            if (cam != null && cam.Target == view && SceneManager.DrawsWorld)
                                 cam.Render(view.CommandList.Native);
 
                             view.OnAfterRender?.Invoke(view);

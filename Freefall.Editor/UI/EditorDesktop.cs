@@ -96,6 +96,23 @@ namespace Freefall.Editor
         }
 
         /// <summary>
+        /// File > New Scene, MCP scene_new: the scene is cleared to an empty one that is no file yet (the first save
+        /// names it: scene_save with a path). A load like an open, behind the progress popup; the editor camera stays.
+        /// </summary>
+        public SceneLoad NewScene()
+        {
+            if (ProgressJob.Running is { } job)
+                throw new InvalidOperationException($"Wait for it to finish: {job.Title} is running");
+
+            var empty = Encoding.UTF8.GetBytes(new Freefall.Serialization.EntitySerializer().SaveToString(Array.Empty<Entity>()));
+            var load = SceneManager.LoadAsync(null, empty);
+            CurrentScene = null;
+            load.Completed += _ => MessageDispatcher.Send(Msg.RefreshExplorer);
+            SceneLoadPopup.Follow(load, "New scene");
+            return load;
+        }
+
+        /// <summary>
         /// Write the scene's entities to <paramref name="path"/> (absolute, or relative to Assets; null: the current
         /// scene's file) and import the file, so its artifact and the loaded SceneAsset hold what was written. A new
         /// file becomes an asset here. The saved scene becomes the current one. Scenes live inside Assets.
@@ -121,7 +138,7 @@ namespace Freefall.Editor
             return CurrentScene;
         }
 
-        /// <summary>A scene game code loaded during play (SceneManager.Load): its cameras draw into the scene viewport.</summary>
+        /// <summary>A scene game code loaded during play (SceneManager.LoadAsync): its cameras draw into the scene viewport.</summary>
         private void OnSceneLoaded(SceneAsset? scene, List<Entity> entities)
         {
             if (!IsPlaying) return;
@@ -185,8 +202,9 @@ namespace Freefall.Editor
         {
             if (!IsPlaying) return;
 
-            // The game is torn down in play mode, then the editor is back (edit mode, its camera) before the scene is read
-            var load = SceneManager.LoadAsync(CurrentScene, _playSnapshot);
+            // The game is torn down in play mode, then the editor is back (edit mode, its camera) before the scene is read.
+            // What game code kept from scene to scene (DontDestroy: a loading screen) goes too.
+            var load = SceneManager.LoadAsync(CurrentScene, _playSnapshot, clearPersistent: true);
             _playSnapshot = null;
             load.Cleared += _ =>
             {
@@ -217,6 +235,9 @@ namespace Freefall.Editor
 
             ModalColor = ColorInt.ARGB(.5f, 0f, 0f, 0f);
 
+            // A game's Quit (its menu) ends play mode here
+            Engine.QuitRequested += () => { if (IsPlaying) StopPlay(); };
+
             // --- Menu Bar ---
             Frame menuBar = new Frame();
             menuBar.Style = "window";
@@ -225,7 +246,11 @@ namespace Freefall.Editor
             Controls.Add(menuBar);
 
             DropDownButton btn = CreateMenuItem(menuBar, "File");
-            AddMenuItem(btn, "New Scene", (s, a) => { });
+            AddMenuItem(btn, "New Scene", (s, a) =>
+            {
+                if (Engine.IsEditor && SceneManager.Loading == null && ProgressJob.Running == null)
+                    NewScene();
+            });
             AddMenuItem(btn, "Open Scene", (s, a) =>
             {
                 if (!Engine.IsEditor)

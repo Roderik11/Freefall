@@ -384,8 +384,11 @@ namespace Freefall.Graphics
             cmd.SetViewport(new Viewport(0, 0, Width, Height, 0.0f, 1.0f));
             cmd.SetScissorRect(new RectI(0, 0, Width, Height));
 
-            cmd.ClearRenderTargetView(BackBufferTarget, new Color4(0.39f, 0.58f, 0.93f, 1.0f));
+            cmd.ClearRenderTargetView(BackBufferTarget, ClearColor);
         }
+
+        /// <summary>What the back buffer shows where nothing is drawn: before there is a camera, while a load hides the world. The player's is black.</summary>
+        public Color4 ClearColor { get; set; } = new(0.39f, 0.58f, 0.93f, 1.0f);
         
         public void Render(Camera camera)
         {

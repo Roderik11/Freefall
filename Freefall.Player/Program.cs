@@ -20,10 +20,12 @@ namespace Freefall.Player
     /// <summary>
     /// A published Freefall game. Next to it (or in the folder <c>--game</c> names): Data/ with game.manifest and the
     /// packs, and FreefallScripts.dll (the project's scripts). It opens a window (borderless fullscreen; Alt+Enter
-    /// toggles a window), starts the engine in game mode on the packs, loads the scripts, starts the build's first scene
-    /// and draws the game's UI (GameUI, Graphics.Overlay) over the picture. Writes player.log next to the game.
+    /// toggles a window), starts the engine in game mode on the packs, loads the scripts, starts loading the build's
+    /// first scene (SceneManager.LoadAsync, from the first frame on) and draws the game's UI (GameUI, Graphics.Overlay)
+    /// over the picture. Writes player.log next to the game.
     /// Development switches: <c>--game &lt;folder&gt;</c>, <c>--windowed [WxH]</c>, <c>--screenshot &lt;seconds&gt; &lt;file.png&gt;</c>
-    /// (the window that long after the scene loaded), <c>--quit &lt;seconds&gt;</c>.
+    /// (the window that long after the first scene is ready; a negative number: that long after the window opened, while it
+    /// may still load), <c>--quit &lt;seconds&gt;</c> (after the first scene is ready).
     /// </summary>
     static class Program
     {
@@ -40,9 +42,10 @@ namespace Freefall.Player
         static string gameFolder = AppContext.BaseDirectory;
         static bool windowed;
         static System.Drawing.Size windowSize = new(1600, 900);
-        static double screenshotAfter = -1, quitAfter = -1;
+        static double screenshotAfter = double.NaN, quitAfter = -1;
         static string? screenshotFile;
-        static readonly System.Diagnostics.Stopwatch sinceStart = new();
+        static readonly System.Diagnostics.Stopwatch sinceStart = new();    // from the start scene being ready
+        static readonly System.Diagnostics.Stopwatch sinceWindow = new();   // from the first frame
 
         [STAThread]
         static int Main(string[] args)
@@ -90,6 +93,7 @@ namespace Freefall.Player
 
             Engine.Initialize(form.Handle, form.ClientSize.Width, form.ClientSize.Height, editor: false);
             view = RenderView.All[0];
+            view.ClearColor = new Color4(0f, 0f, 0f, 1f);   // before the first scene, and while a load hides the world
             form.SizeChanged += (s, e) =>
             {
                 if (form.WindowState == FormWindowState.Minimized) return;
@@ -107,6 +111,7 @@ namespace Freefall.Player
                     Freefall.Debug.LogError("[GUI]", $"{control.GetType().Name} skipped: {ex}");
             };
 
+            Engine.QuitRequested += () => form.Close();   // a menu's Quit
             Application.AddMessageFilter(new InputFilter());
             keyboard.Attach(form);
             form.KeyDown += (s, e) =>
@@ -127,11 +132,20 @@ namespace Freefall.Player
                 Log($"[Player] Scene {scene?.Name}: {entities.Count} entities");
             };
 
+            // The window shows from the first frame on while the start scene loads in slices: the game's UI draws over a
+            // black picture (a loading screen of the game's, once one of its scenes has put it up), the half-made world
+            // is not drawn. --screenshot and --quit count from the moment the start scene is ready.
+            SceneManager.HideWorldWhileLoading = true;
             var start = Engine.Assets.LoadByGuid<SceneAsset>(manifest.Scenes[0])
                 ?? throw new InvalidDataException($"The start scene {manifest.Scenes[0]} is not in the packs");
-            SceneManager.LoadNow(start);
+            var load = SceneManager.LoadAsync(start);
+            load.Completed += done =>
+            {
+                Log($"[Player] {done.Name} ready {sinceWindow.Elapsed.TotalSeconds:0.0} s after the window opened");
+                sinceStart.Start();
+            };
             view.OnAfterRender = DrawUI;
-            sinceStart.Start();
+            sinceWindow.Start();
 
             RenderLoop.Run(form, Tick, true);
 
@@ -168,12 +182,13 @@ namespace Freefall.Player
             Engine.Tick();
 
             double t = sinceStart.Elapsed.TotalSeconds;
-            if (screenshotFile != null && screenshotAfter >= 0 && t >= screenshotAfter)
+            if (screenshotFile != null && !double.IsNaN(screenshotAfter)
+                && (screenshotAfter >= 0 ? sinceStart.IsRunning && t >= screenshotAfter : sinceWindow.Elapsed.TotalSeconds >= -screenshotAfter))
             {
-                screenshotAfter = -1;
+                screenshotAfter = double.NaN;
                 Screenshot(screenshotFile);
             }
-            if (quitAfter >= 0 && t >= quitAfter)
+            if (quitAfter >= 0 && sinceStart.IsRunning && t >= quitAfter)
             {
                 quitAfter = -1;
                 form.Close();
@@ -241,7 +256,8 @@ namespace Freefall.Player
             var path = Path.GetFullPath(file);
             Directory.CreateDirectory(Path.GetDirectoryName(path)!);
             bitmap.Save(path, ImageFormat.Png);
-            Log($"[Player] Screenshot {client.Width}x{client.Height} at {sinceStart.Elapsed.TotalSeconds:0.0} s: {path}");
+            Log($"[Player] Screenshot {client.Width}x{client.Height} {sinceWindow.Elapsed.TotalSeconds:0.0} s after the window opened" +
+                (sinceStart.IsRunning ? $", {sinceStart.Elapsed.TotalSeconds:0.0} s after the start scene was ready" : ", still loading") + $": {path}");
         }
 
         static void ParseArgs(string[] args)

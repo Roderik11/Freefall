@@ -482,6 +482,11 @@ namespace Freefall.Components
             var material = Material;
             if (material == null || material.Effect == null) return;
 
+            // While a load wakes the scene its stamps are still arriving: the first bakes wait for the load's terrain
+            // step, so they see every stamp. Before, a bake during the wake-up cut the holes of the stamps awake so far
+            // (none, often), then again with all of them, and the editor took the half-cut mask for a change to save.
+            if (SceneManager.Loading is { Current: < SceneLoad.Step.Terrain }) return;
+
             int frameIndex = Engine.FrameIndex % FrameCount;
 
             // Upload saved baked heightmap from cache (skips GPU compositor if present)

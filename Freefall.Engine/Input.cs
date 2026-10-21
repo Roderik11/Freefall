@@ -42,6 +42,9 @@ namespace Freefall
         public static bool IsMouseDown(int button) => _mouseDown.Contains(button);
         public static bool IsMousePressed(int button) => _mousePressed.Contains(button);
         public static bool IsMouseReleased(int button) => _mouseReleased.Contains(button);
+
+        /// <summary>A key or a mouse button went down this frame (a title card that any of them skips).</summary>
+        public static bool AnyPressed => _keysPressed.Count > 0 || _mousePressed.Count > 0;
         public static bool Shift => IsKeyDown(Keys.ShiftKey);
         public static bool Control => IsKeyDown(Keys.ControlKey);
         public static bool Alt => IsKeyDown(Keys.Menu);

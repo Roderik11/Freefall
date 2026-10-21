@@ -54,10 +54,13 @@ namespace Freefall.Base
         internal sealed class ClearJob
         {
             private readonly List<Entity> _list;
+            private readonly bool _persistentToo;
             private int _next;
 
-            public ClearJob()
+            /// <param name="persistentToo">The DontDestroy entities go as well (the editor's Stop: the game is over).</param>
+            public ClearJob(bool persistentToo = false)
             {
+                _persistentToo = persistentToo;
                 lock (_lock)
                 {
                     CommandBuffer.Clear();
@@ -79,7 +82,7 @@ namespace Freefall.Base
                     while (_next >= 0)
                     {
                         var entity = _list[_next--];
-                        if (entity != null && !entity.DontDestroy)
+                        if (entity != null && (_persistentToo || !entity.DontDestroy))
                             entity.Destroy();
                         if (deadline != long.MaxValue && System.Diagnostics.Stopwatch.GetTimestamp() >= deadline)
                             break;

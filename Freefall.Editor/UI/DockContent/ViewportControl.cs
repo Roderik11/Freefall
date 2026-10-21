@@ -17,10 +17,13 @@ namespace Freefall.Editor
         {
             base.OnUpdate();
 
-            // The game's UI goes over the picture the main camera renders to
+            // The game's UI goes over the picture the main camera renders to. While game code loads a scene the camera
+            // comes and goes (the old one is destroyed; the new one is Main from its construction in the read, but has
+            // its target only once the read is done): the UI stays where it was, with the game's loading screen on it.
+            // Losing the viewport resets the game's UI.
             if (View != null && Camera.Main?.Target == View)
                 GameUIHost.Viewport = this;
-            else if (GameUIHost.Viewport == this)
+            else if (GameUIHost.Viewport == this && !(SceneManager.IsLoading && !Engine.IsEditor))
                 GameUIHost.Viewport = null;
         }
 
@@ -32,7 +35,7 @@ namespace Freefall.Editor
         {
             base.DrawStyle(style, opacity);
 
-            if (View == null || Camera.Main?.Target != View) return;
+            if (View == null || GameUIHost.Viewport != this) return;
 
             GameUIHost.Draw(this);
         }

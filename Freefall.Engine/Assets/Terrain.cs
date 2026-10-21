@@ -123,6 +123,7 @@ namespace Freefall.Assets
 
         // Hash of the heights and holes as last saved: read from the Cache at load, or written by a save
         private ulong _savedMapsHash;
+        private bool _checkAfterLoad;
 
         /// <summary>The heights and holes as they are now are the saved ones (TerrainLoader: after a load, after a save).</summary>
         internal void MarkMapsSaved() => _savedMapsHash = MapsHash();
@@ -136,6 +137,22 @@ namespace Freefall.Assets
         internal void CheckMapsAgainstSaved()
         {
             if (!Engine.IsEditor || IsDirty) return;
+
+            // Mid-load the maps can pass through states the scene does not end in: compared once it is ready
+            if (SceneManager.Loading is { } load)
+            {
+                if (!_checkAfterLoad)
+                {
+                    _checkAfterLoad = true;
+                    load.Completed += _ =>
+                    {
+                        _checkAfterLoad = false;
+                        CheckMapsAgainstSaved();
+                    };
+                }
+                return;
+            }
+
             if (MapsHash() != _savedMapsHash)
             {
                 base.MarkDirty();
