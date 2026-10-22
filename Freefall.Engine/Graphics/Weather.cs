@@ -45,18 +45,21 @@ namespace Freefall.Graphics
 
         /// <summary>
         /// What the weather has left on the open surfaces round the camera (0..1), for the decal pass (decals_cs.hlsl):
-        /// how wet they are (rising in the rain, a minute to soak in heavy rain; drying over ~15 minutes after), how full
-        /// rain-filled puddles are (filling once the ground is soaked, ~5 minutes in heavy rain; draining over ~40), how
-        /// much snow lies (~10 minutes of heavy snow to cover; melting over ~20 when it is warmer than the freezing level,
-        /// faster in the rain). Real seconds, not game time. Settings › OverrideWeatherSurfaces sets them by hand.
+        /// how wet they are (rising in the rain, a minute to soak in heavy rain), how full rain-filled puddles are (filling
+        /// once the ground is soaked, ~5 minutes in heavy rain), how much snow lies (~10 minutes of heavy snow to cover).
+        /// Once the rain stops they dry by evaporation: the sun on the ground and the wind speed it up (open ground ~1.7
+        /// minutes at a sunny noon with a breeze, ~5 under overcast, ~10 on a still night; puddles four times as long);
+        /// snow melts where it is warmer than the freezing level, faster in sun and rain. Real seconds, not game time.
+        /// Settings › OverrideWeatherSurfaces sets them by hand.
         /// </summary>
         public static float SurfaceWetness { get; private set; }
         public static float PuddleFill { get; private set; }
         public static float SnowCover { get; private set; }
 
-        private const float SoakSeconds = 60f, DrySeconds = 900f;
+        private const float SoakSeconds = 60f, DrySeconds = 600f;
         private const float FillSeconds = 300f, DrainSeconds = 2400f;
         private const float CoverSeconds = 600f, MeltSeconds = 1200f;
+        private const float SunLux = 60000f;    // lux of sun on level ground that counts as 1 (a clear noon gives ~1.4)
         private static float _wetness, _puddles, _snow;     // the weather's own, kept while the override is on
 
         /// <summary>The precipitation map (Texture2D RG16F: rate, hail; 0 = none yet) and the world xz of its corner.</summary>
@@ -125,14 +128,19 @@ namespace Freefall.Graphics
             Rain = Precipitation * (1f - SnowShare);
             Hail *= 1f - SnowShare;
 
-            // What it leaves on the ground: rain soaks it and fills puddles once soaked; dry weather dries and drains; snow
-            // builds a cover where it is cold enough and melts where it is not (rain melts it faster)
-            float wetting = Rain / SoakSeconds, drying = (1f - MathF.Min(Rain * 5f, 1f)) / DrySeconds;
+            // What it leaves on the ground: rain soaks it and fills puddles once soaked; dry weather evaporates it, the faster
+            // the more sun reaches the ground (its light, the clouds' shade included) and the stronger the wind (the two
+            // terms of evaporation, crudely); snow builds a cover where it is cold enough and melts where it is not (sun and
+            // rain melt it faster). Before 2026-10-22 evening drying took a fixed 15 minutes, puddles 40, whatever the
+            // weather: a sunny noon after a storm stayed soaked (user: "the ground now seems to stay wet forever")
+            float sun = Math.Clamp(Daylight.SunIlluminance() * Daylight.SunHeight() / SunLux, 0f, 1.5f);
+            float evaporation = (1f + 3f * sun + 0.2f * MathF.Min(Wind.Strength, 15f)) * (1f - MathF.Min(Rain * 5f, 1f));
+            float wetting = Rain / SoakSeconds, drying = evaporation / DrySeconds;
             _wetness = Math.Clamp(_wetness + (wetting - drying) * dt, 0f, 1f);
-            float filling = _wetness > 0.6f ? Rain / FillSeconds : 0f, draining = (1f - MathF.Min(Rain * 5f, 1f)) / DrainSeconds;
+            float filling = _wetness > 0.6f ? Rain / FillSeconds : 0f, draining = evaporation / DrainSeconds;
             _puddles = Math.Clamp(_puddles + (filling - draining) * dt, 0f, 1f);
             float covering = Snow / CoverSeconds;
-            float melting = SnowShare < 0.5f ? (1f + 3f * Rain) / MeltSeconds : 0f;
+            float melting = SnowShare < 0.5f ? (1f + 3f * Rain + 2f * sun) / MeltSeconds : 0f;
             _snow = Math.Clamp(_snow + (covering - melting) * dt, 0f, 1f);
             var settings = Engine.Settings;
             bool manual = settings != null && settings.OverrideWeatherSurfaces;
