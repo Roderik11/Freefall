@@ -148,10 +148,20 @@ float3 SurfaceAt(Texture2D<float> depthTex, int2 px, out float depth)
     return posFromDepth((float2(px) + 0.5) / ViewportSize, depth, CameraInverse).xyz;
 }
 
+// A lattice point's random value (0..1) by an integer hash (PCG's output step), with a seed for separate streams. No
+// trig: the usual frac(sin(dot(p, k)) × big) loses its float precision at Eldermoor's coordinates (thousands of
+// metres × the noise's scale), and the snow's patches came out as streaks along one axis (user, 2026-10-22).
+float HashCell(int2 cell, uint seed)
+{
+    uint h = ((uint)cell.x * 0x8DA6B343u) ^ ((uint)cell.y * 0xD8163841u) ^ (seed * 0x9E3779B9u);
+    h = h * 747796405u + 2891336453u;
+    h = ((h >> ((h >> 28u) + 4u)) ^ h) * 277803737u;
+    h = (h >> 22u) ^ h;
+    return (h & 0xFFFFFFu) / 16777216.0;
+}
+
 // Rain striking a puddle: expanding rings in cells of 0.2 m, a drop a cell at a time, three layers out of step. The
 // tilt of the water's surface in the decal's plane.
-float RippleHash(float2 p) { return frac(sin(dot(p, float2(127.1, 311.7))) * 43758.5453); }
-
 float2 RippleTilt(float2 p, float rate)
 {
     float2 tilt = 0;
@@ -159,15 +169,16 @@ float2 RippleTilt(float2 p, float rate)
     for (uint layer = 0; layer < 3; layer++)
     {
         float2 q = p * 5.0 + float2(layer * 0.37, layer * 0.71);
-        float2 cell = floor(q);
-        float h = RippleHash(cell + layer * 17.0);
+        int2 cell = (int2)floor(q);
+        float h = HashCell(cell, 1u + layer);
         // Each cell strikes about once a second in heavy rain, less often in lighter
         float t = Time * (0.5 + 0.7 * rate) + h * 7.0;
-        float drop = floor(t);
-        float age = t - drop;
-        if (RippleHash(cell + drop * 1.31) > saturate(rate * 1.2))
+        float dropTime = floor(t);
+        float age = t - dropTime;
+        uint drop = (uint)(int)dropTime * 4u + layer * 0x10000u;
+        if (HashCell(cell, drop + 11u) > saturate(rate * 1.2))
             continue;
-        float2 centre = 0.25 + 0.5 * float2(RippleHash(cell + drop), RippleHash(cell + drop + 5.3));
+        float2 centre = 0.25 + 0.5 * float2(HashCell(cell, drop + 12u), HashCell(cell, drop + 13u));
         float2 d = frac(q) - centre;
         float r = length(d);
         float x = (r - age * 0.45) / 0.05;
@@ -296,17 +307,20 @@ void ApplyDecal(uint i, float3 rel, float3 geo, float3 dx, float3 dy, uint surfa
 }
 
 // Value noise for the snow's patches while it is thin (0..1)
-float SnowHash(float2 p) { return frac(sin(dot(p, float2(41.3, 289.1))) * 15731.743); }
-float SnowNoise1(float2 p)
+float SnowNoise1(float2 p, uint seed)
 {
-    float2 i = floor(p), f = frac(p);
+    float2 i = floor(p), f = p - i;
+    int2 c = (int2)i;
     float2 u = f * f * (3.0 - 2.0 * f);
-    return lerp(lerp(SnowHash(i), SnowHash(i + float2(1, 0)), u.x), lerp(SnowHash(i + float2(0, 1)), SnowHash(i + 1.0), u.x), u.y);
+    return lerp(lerp(HashCell(c, seed), HashCell(c + int2(1, 0), seed), u.x),
+                lerp(HashCell(c + int2(0, 1), seed), HashCell(c + int2(1, 1), seed), u.x), u.y);
 }
-float SnowNoise(float2 xz) { return 0.65 * SnowNoise1(xz * 0.8) + 0.35 * SnowNoise1(xz * 3.1 + 17.0); }
+float SnowNoise(float2 xz) { return 0.65 * SnowNoise1(xz * 0.8, 101u) + 0.35 * SnowNoise1(xz * 3.1, 202u); }
 
 #define SNOW_ALBEDO float3(0.70, 0.72, 0.76)   // packed old snow, a little blue: the dark palette's near white
 #define SNOW_ROUGHNESS 0.8
+#define SNOW_RELIEF_TERRAIN 0.035                // m of relief that counts as a high spot: the terrain's layers (up to 0.05)
+#define SNOW_RELIEF_MESH 0.008                   // ... a mesh's height map (gbuffer.fx: ~0.01 m at a tile a metre)
 
 // The weather on an open surface: wet (porous surfaces darken, smooth ones and flat open ground take a water film) and
 // snow (on what faces up, patchy while it is thin, smoothing the relief)
@@ -331,16 +345,20 @@ void ApplyWeather(DecalFrame f, float3 rel, float3 geo, uint surfaceClass, inout
     float3 N = normalize(s.Normal.xyz);
     float vegetation = s.Data.a < 0.75 ? 1.0 : 0.0;
 
-    // Snow: thin, it lies where the surface's own detail faces up (the tops of the stones first); deep, it buries that
-    // detail and follows the shape alone. Not on characters (they move)
+    // Snow: thin, it lies on the surface's high spots first (the stones' tops, pebbles, clods: their relief, which the
+    // linear depth holds as its height bias, gbuffer.fx and gputerrain.fx), varied by soft drifts metres across; as it
+    // deepens it fills down into the joints and hollows and buries them. Only what faces up; not on characters (they
+    // move). A noise alone made random patches (user, 2026-10-22: "shouldnt it accumulate on the height spots first")
     float snow = 0.0;
     float cover = saturate(f.SnowCover);
     if (cover > 0.0 && surfaceClass != 3u)
     {
         float up = smoothstep(0.35, 0.85, lerp(N.y, geo.y, cover)) * smoothstep(0.2, 0.6, geo.y);
+        // How far this pixel stands up from its surface (m): the terrain's layers up to 5 cm, a mesh's ~1 cm
+        float relief = saturate(max(dot(rel, f.CameraForward) - s.Depth, 0.0) / (surfaceClass == 1u ? SNOW_RELIEF_TERRAIN : SNOW_RELIEF_MESH));
+        float drift = SnowNoise(world.xz * 0.35);
         float t = 1.0 - cover;
-        // Flat ground in patches while it is thin (the noise leads there), steeper faces only once it is deep
-        snow = smoothstep(t - 0.1, t + 0.1, up * 0.45 + SnowNoise(world.xz) * 0.55) * saturate(up * 3.0);
+        snow = smoothstep(t - 0.06, t + 0.06, up * (0.1 + 0.5 * relief + 0.4 * drift)) * saturate(up * 3.0);
     }
 
     float facing = geo.y >= 0.0 ? lerp(0.35, 1.0, geo.y) : saturate(0.35 + geo.y);
@@ -359,11 +377,14 @@ void ApplyWeather(DecalFrame f, float3 rel, float3 geo, uint surfaceClass, inout
 
     if (snow > 0.0)
     {
-        s.Albedo.rgb = lerp(s.Albedo.rgb, SNOW_ALBEDO, snow);
-        // The snow's own surface: smooth over the stones' relief (their normals, AO and displacement buried under it)
-        s.Data.rgb = lerp(s.Data.rgb, float3(SNOW_ROUGHNESS, 0.0, 1.0), snow);
-        s.Normal.xyz = normalize(lerp(N, normalize(geo + float3(0, 1, 0)), snow));
-        s.Displacement *= 1.0 - snow;
+        // A thin dusting lets the ground show through; deep snow is its own surface, smooth over the stones' relief
+        // (their normals, AO and displacement buried under it). Thin, it lies on the relief and keeps it.
+        float dust = snow * lerp(0.45, 1.0, smoothstep(0.0, 0.6, cover));
+        float buried = snow * smoothstep(0.3, 0.9, cover);
+        s.Albedo.rgb = lerp(s.Albedo.rgb, SNOW_ALBEDO, dust);
+        s.Data.rgb = lerp(s.Data.rgb, float3(SNOW_ROUGHNESS, 0.0, lerp(s.Data.b, 1.0, buried)), dust);
+        s.Normal.xyz = normalize(lerp(N, normalize(geo + float3(0, 1, 0)), buried));
+        s.Displacement *= 1.0 - buried;
     }
 }
 
