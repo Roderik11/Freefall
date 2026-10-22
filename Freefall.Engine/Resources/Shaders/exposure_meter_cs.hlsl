@@ -16,7 +16,9 @@
 // From those parts two readings, the same whichever way the camera looks, which AutoExposure takes half and half: the
 // light on a sphere there (a body's / 4, the sky's and the ground's / 2, the lamps' / 4) and the brightness round it
 // (the sky dome from the sky probe where the camera sees it, the crowns and walls round it where it does not, the
-// ground below, each lit as at the camera).
+// ground below, each lit as at the camera). Both again with the sun's cloud shadow at the taps replaced by the clouds'
+// mean round the camera (CloudDeck): AutoExposure keeps ExposureCloudShadeKeep of the difference, so a passing cloud's
+// shade stays darker than the day round it instead of being metered back to its brightness.
 //
 // Not the sun's cascades: they fit the view, and the shadow pass leaves out casters that shade nothing in view, so the
 // roof over a camera facing a wall was missing from them: a room's taps lit by a quarter of the noon sun, the room 2-3 EV
@@ -49,12 +51,12 @@ cbuffer Params : register(b4)
 #define METER_SKY_TOLERANCE 4.0 // a tap whose sky share differs from the camera's by 1/this or more does not count
 #define METER_BODY_SHARPNESS 12.0   // weight of a capture direction for a body: exp(this × (cos angle − 1))
 #define METER_SURROUND_ALBEDO 0.2   // the crowns, walls and ceilings round the camera
-#define METER_ROWS 4            // AutoExposure.MeterRows
+#define METER_ROWS 5            // AutoExposure.MeterRows
 
 SamplerState MeterWrapSampler : register(s0);       // linear wrap (the cloud noise)
 
 groupshared SkyCaptureView gViews[SKY_CAPTURE_VIEWS];
-groupshared float4 gSum[3][METER_TAPS];
+groupshared float4 gSum[4][METER_TAPS];
 groupshared float gSky[METER_TAPS];
 
 // The meshes round a tap from the sky captures: the share of the sky it sees (each direction alike, as for a level
@@ -104,6 +106,18 @@ float BodyVisible(float3 tap, float3 toLight, float open, float meshes, out floa
 
 float Luma(float3 c) { return dot(c, float3(0.2126, 0.7152, 0.0722)); }
 
+// The brightness round the camera (cd/m²) from the light on a sphere there (lux), the ground's bounce (lux), the sky's
+// upper half (cd/m²), its lower half over the clouds' base (cd/m², < 0 below it) and the share of the sky seen
+float MeterBrightness(float sphere, float bounce, float skyUpper, float skyLower, float skySeen)
+{
+    float lower = bounce / ATM_PI;
+    if (skyLower >= 0.0)
+        lower = lerp(lower, max(lower, skyLower), skySeen);
+    float surround = METER_SURROUND_ALBEDO * sphere / ATM_PI;
+    float upper = lerp(surround, skyUpper, skySeen);
+    return 0.5 * (upper + lower);
+}
+
 [numthreads(METER_TAPS, 1, 1)]
 void CSMeter(uint gi : SV_GroupIndex)
 {
@@ -121,6 +135,7 @@ void CSMeter(uint gi : SV_GroupIndex)
     GroupMemoryBarrierWithGroupSync();
 
     float4 row0 = 0, row1 = 0;
+    float sunVisRef = 0;
     if (AtmosphereIdx != 0)
     {
         AtmosphereParams A = LoadAtmosphere();
@@ -145,6 +160,10 @@ void CSMeter(uint gi : SV_GroupIndex)
         float terrain, cloud, mt, mc;
         float sunVis = BodyVisible(tap, A.SunDirection, open, meshSun, terrain, cloud);
         float moonVis = any(A.MoonIlluminance > 0) ? BodyVisible(tap, A.MoonDirection, open, meshMoon, mt, mc) : 0.0;
+        // The same sun with the clouds' mean beam round the camera for this tap's own (the day the eye adapts to)
+        float4 deck = CloudDeck();
+        float meanBeam = deck.w > 0.5 ? cloud : lerp(1.0, deck.x, CloudBelowBase(tap - CamPos));
+        sunVisRef = A.SunDirection.y > 0.0 && open > 0.0 ? open * terrain * meshSun * meanBeam : 0.0;
 
         row0 = float4(sunVis, moonVis, skyVis, open);
         row1 = float4(terrain, meshSun, cloud, skySeen);
@@ -157,6 +176,7 @@ void CSMeter(uint gi : SV_GroupIndex)
     float weight = saturate(1.0 - abs(row0.z - gSky[0]) * METER_SKY_TOLERANCE);
     gSum[0][gi] = row0 * weight;
     gSum[1][gi] = row1 * weight;
+    gSum[3][gi] = float4(sunVisRef * weight, 0, 0, 0);
 
     // The point lights round the camera: every slot, 64 at a time
     float pointSphere = 0, pointUp = 0;
@@ -206,7 +226,7 @@ void CSMeter(uint gi : SV_GroupIndex)
     {
         if (gi < stride)
         {
-            [unroll] for (uint k = 0; k < 3; k++)
+            [unroll] for (uint k = 0; k < 4; k++)
                 gSum[k][gi] += gSum[k][gi + stride];
         }
         GroupMemoryBarrierWithGroupSync();
@@ -252,7 +272,7 @@ void CSMeter(uint gi : SV_GroupIndex)
     // screen's metering); the brightness round it alone left a mountain's shade as dark as the old metering of a sunlit
     // view (the bright sky is half of it). AutoExposure takes them half and half.
     float skyUpper = skyLux / ATM_PI;    // a sky alike all over: its mean luminance is E / π
-    float lower = bounce / ATM_PI;
+    float skyLower = -1.0;               // the probe's lower half, over the clouds' base only
     if (AtmosphereIdx != 0)
     {
         AtmosphereParams A = LoadAtmosphere();
@@ -267,19 +287,22 @@ void CSMeter(uint gi : SV_GroupIndex)
             // 15 over a deck that read 16 from inside, and the deck blew out). Not lower down: there the lower half's
             // haze toward the horizon would move every view the meter was calibrated on (§7.1).
             if (CloudsOn != 0 && CamPos.y > LoadClouds().Base)
-            {
-                float skyLower = max(Luma(sh[0].rgb * 0.282095 - sh[1].rgb * 0.366452), 0.0) / max(Exposure, 1e-30);
-                lower = lerp(lower, max(lower, skyLower), parts.w);
-            }
+                skyLower = max(Luma(sh[0].rgb * 0.282095 - sh[1].rgb * 0.366452), 0.0) / max(Exposure, 1e-30);
         }
     }
-    float surround = METER_SURROUND_ALBEDO * sphere / ATM_PI;
-    float upper = lerp(surround, skyUpper, parts.w);
-    float adapt = 0.5 * (upper + lower);
+    float adapt = MeterBrightness(sphere, bounce, skyUpper, skyLower, parts.w);
+
+    // Both again with the clouds' mean beam round the camera for the sun's shadow at the taps (ExposureCloudShadeKeep)
+    float sunShareRef = gSum[3][0].x / weights;
+    float localGroundRef = localGround + sunLux * sunHeight * (sunShareRef - shares.x);
+    float bounceRef = openGround > 0.0 ? groundLux * localGroundRef / openGround : 0.0;
+    float sphereRef = sphere + sunLux * (sunShareRef - shares.x) * 0.25 + (bounceRef - bounce) * 0.5;
+    float adaptRef = MeterBrightness(sphereRef, bounceRef, skyUpper, skyLower, parts.w);
 
     RWStructuredBuffer<float4> output = ResourceDescriptorHeap[OutputUAVIdx];
     output[0] = float4(adapt, sphere, points.x, weights);
     output[1] = float4(sunLux, shares.x, moonLux, shares.y);
     output[2] = float4(skyLux, shares.z, bounce, shares.w);
     output[3] = float4(parts.x, parts.y, parts.z, skyUpper);
+    output[4] = float4(adaptRef, sphereRef, sunShareRef, 0);
 }

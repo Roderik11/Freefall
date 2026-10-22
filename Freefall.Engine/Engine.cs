@@ -794,6 +794,13 @@ namespace Freefall
          [ValueRange(0f, 16f)]
          public float ExposureDimLightEV { get; set; } = 12f;
 
+         // A passing cloud's shade: the exposure adapts to the clouds round the camera (their mean over 16 km), and of
+         // each EV the camera's own spot is darker than that this share stays in the image (a spot brighter than the
+         // mean, in the sun under broken cumulus, adapts fully). 0 = it adapts to every cloud's shadow (the shade as
+         // bright as the sun, flat and grey); an even overcast is its own mean and adapts fully whatever this is.
+         [ValueRange(0f, 1f)]
+         public float ExposureCloudShadeKeep { get; set; } = 0.5f;
+
          // The darkest and brightest the auto exposure goes: how bright a moonless night may get (MinEV) is a choice
          [ValueRange(-8f, 20f)]
          public float ExposureMinEV { get; set; } = -1f;

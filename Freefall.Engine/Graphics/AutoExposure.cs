@@ -35,7 +35,7 @@ namespace Freefall.Graphics
         private const float FieldCalibration = 1.62f;
         private const float SphereCard = 0.35f;
         private const float FieldShare = 0.5f;
-        private const int MeterRows = 4;                         // exposure_meter_cs.hlsl METER_ROWS
+        private const int MeterRows = 5;                         // exposure_meter_cs.hlsl METER_ROWS
 
         /// <summary>The exposure (EV100) of the frame being drawn.</summary>
         public static float EV => Engine.Settings.AutoExposure ? _current : Engine.Settings.ExposureEV;
@@ -70,7 +70,16 @@ namespace Freefall.Graphics
         private static readonly GraphicsBuffer?[] _meterReadback = new GraphicsBuffer?[FrameCount];
         private static readonly bool[] _meterWritten = new bool[FrameCount];
         private static readonly Vector4[] _meterRows = new Vector4[MeterRows];
-        private static float _screenEV, _incidentEV;
+        private static float _screenEV, _incidentEV, _cloudShadeEV;
+
+        // The meter's EV: the brightness round the camera (cd/m², × FieldCalibration) and the light on a sphere there (lux,
+        // as a SphereCard grey card) half and half
+        private static float IncidentEV(float brightness, float sphereLux)
+        {
+            float fieldEV = MathF.Log2(MathF.Max(brightness, 1e-9f) * FieldCalibration) + 3f;
+            float sphereEV = MathF.Log2(MathF.Max(sphereLux, 1e-9f) * SphereCard / MathF.PI) + 3f;
+            return sphereEV + (fieldEV - sphereEV) * FieldShare;
+        }
 
         private static void EnsureResources()
         {
@@ -149,12 +158,22 @@ namespace Freefall.Graphics
                 for (int i = 0; i < MeterRows; i++)
                     _meterRows[i] = rows[i];
                 MeterLuminance = _meterRows[0].X;
-                float fieldEV = MathF.Log2(MathF.Max(MeterLuminance, 1e-9f) * FieldCalibration) + 3f;
-                float sphereEV = MathF.Log2(MathF.Max(_meterRows[0].Y, 1e-9f) * SphereCard / MathF.PI) + 3f;
-                _incidentEV = sphereEV + (fieldEV - sphereEV) * FieldShare;
+                _incidentEV = IncidentEV(_meterRows[0].X, _meterRows[0].Y);
                 float range = Math.Clamp(settings.ExposureScreenRange, 0f, 8f);
                 if (range < 8f)
                     metered = range > 0f ? _incidentEV + range * MathF.Tanh((metered - _incidentEV) / range) : _incidentEV;
+
+                // A passing cloud's shade: the eye adapts to the day round it (the meter with the clouds' mean beam round
+                // the camera for the sun's shadow at the taps), and keeps a share of how much darker the camera's spot is.
+                // Adapted all the way, the shade came out as bright as the sun and flat. Only darker: in the sun under
+                // broken cumulus the spot is brighter than the mean (−0.5 EV on Clear Day), and keeping that brightened
+                // every sunny view the exposure was calibrated on. An even deck is its own mean: nothing kept.
+                _cloudShadeEV = 0f;
+                if (_meterRows[4].Y > 0f)
+                {
+                    _cloudShadeEV = IncidentEV(_meterRows[4].X, _meterRows[4].Y) - _incidentEV;
+                    metered += Math.Clamp(settings.ExposureCloudShadeKeep, 0f, 1f) * MathF.Max(_cloudShadeEV, 0f);
+                }
             }
 
             // In dim light the eye adapts only partly: a share of what the scene loses below ExposureDimLightEV stays in
@@ -268,6 +287,7 @@ namespace Freefall.Graphics
             meteredLuminance = MeteredLuminance,
             screenEV = _screenEV,
             incidentEV = _incidentEV,
+            cloudShadeEV = _cloudShadeEV,       // how much darker the camera's spot is than the clouds' mean (+ = in shade)
             meterLuminance = MeterLuminance,
             sphereLux = _meterRows[0].Y,
             skyUpperLuminance = _meterRows[3].W,
