@@ -239,8 +239,15 @@ void ApplyDecal(uint i, float3 rel, float3 geo, float3 dx, float3 dy, uint surfa
     float paint = albedo.a, water = albedo.a;
     if (S.RainFilled)
     {
+        // The water's outline from the opacity blurred (mip 3 or coarser, as the screen needs): its specks are damp spots
+        // round the puddle, not water, and once the puddle was nearly full they speckled its edge with drops
+        uint tw, th;
+        albedoTex.GetDimensions(tw, th);
+        float2 size = float2(tw, th);
+        float screenMip = log2(max(max(length(uvDx * size), length(uvDy * size)), 1e-6));
+        float body = albedoTex.SampleLevel(Sampler, uv, max(screenMip + 1.0, 3.0)).a;
         float level = 1.0 - saturate(puddleFill);
-        water = smoothstep(level, level + 0.08, albedo.a) * step(0.001, puddleFill);
+        water = smoothstep(level, level + 0.08, body) * step(0.001, puddleFill);
         paint = max(water, 0.6 * smoothstep(level - 0.25, level, albedo.a) * step(0.001, puddleFill));
     }
     float aColour = paint * fade, aShape = water * fade;
@@ -261,10 +268,12 @@ void ApplyDecal(uint i, float3 rel, float3 geo, float3 dx, float3 dy, uint surfa
         Texture2D normalTex = ResourceDescriptorHeap[NonUniformResourceIndex(S.Normal)];
         float2 nXY = (normalTex.SampleGrad(Sampler, uv, uvDx, uvDy).rg * 2.0 - 1.0) * S.NormalStrength;
         nXY.y = -nXY.y;
-        if (S.Ripples > 0.0 && rain > 0.0)
+        // The rings fade out as a pixel grows past them (~2 cm): smaller, they lit single pixels, a sparkle far off
+        float ripples = S.Ripples * (1.0 - smoothstep(0.01, 0.03, max(length(dx), length(dy))));
+        if (ripples > 0.0 && rain > 0.0)
         {
             float3 world = rel + CamPos;
-            nXY += RippleTilt(float2(dot(world, tangent), dot(world, bitangent)), rain) * S.Ripples * water;
+            nXY += RippleTilt(float2(dot(world, tangent), dot(world, bitangent)), rain) * ripples * water;
         }
         float3 n = normalize(tangent * nXY.x + bitangent * nXY.y + axis * sqrt(max(0.001, 1.0 - saturate(dot(nXY, nXY)))));
         s.Normal.xyz = S.NormalMode == 0u ? normalize(lerp(s.Normal.xyz, n, aN)) : normalize(s.Normal.xyz + (n - axis) * aN);
@@ -322,13 +331,10 @@ float SnowNoise(float2 xz) { return 0.65 * SnowNoise1(xz * 0.8, 101u) + 0.35 * S
 #define SNOW_RELIEF_TERRAIN 0.035                // m of relief that counts as a high spot: the terrain's layers (up to 0.05)
 #define SNOW_RELIEF_MESH 0.008                   // ... a mesh's height map (gbuffer.fx: ~0.01 m at a tile a metre)
 
-// The weather on an open surface: wet (porous surfaces darken, smooth ones and flat open ground take a water film) and
-// snow (on what faces up, patchy while it is thin, smoothing the relief)
-void ApplyWeather(DecalFrame f, float3 rel, float3 geo, uint surfaceClass, inout Surface s)
+// How much of the falling rain and snow reaches a surface (straight down, soft under eaves), looked for a little out
+// from it: a wall in the open is not covered by its own top, a floor under a roof is
+float SurfaceOpenness(DecalFrame f, float3 rel, float3 geo)
 {
-    // Emissive pixels (lamp glass, windows) hold their light in the albedo: left as they are
-    if (s.Albedo.a > 0.01)
-        return;
     WeatherCover c;
     c.ShelterVP = f.ShelterVP;
     c.ShelterDepth = f.ShelterDepth;
@@ -337,15 +343,26 @@ void ApplyWeather(DecalFrame f, float3 rel, float3 geo, uint surfaceClass, inout
     c.TerrainMaxHeight = f.TerrainMaxHeight;
     c.TerrainOrigin = f.TerrainOrigin;
     c.TerrainSize = f.TerrainSize;
-    // How much of the fall reaches it (straight down, soft under eaves), looked for a little out from the surface: a wall
-    // in the open is not covered by its own top, a floor under a roof is
-    float3 world = rel + CamPos;
-    float open = WeatherOpenness(c, LinearClamp, world + geo * 0.35 + float3(0, 0.05, 0), 0.1);
-    if (open <= 0.0)
+    return WeatherOpenness(c, LinearClamp, rel + CamPos + geo * 0.35 + float3(0, 0.05, 0), 0.1);
+}
+
+// The weather on an open surface (`open`: SurfaceOpenness; `normalVariance`: NormalVariance): wet (porous surfaces
+// darken, smooth ones and flat open ground take a water film) and snow (on what faces up, patchy while it is thin,
+// smoothing the relief)
+void ApplyWeather(DecalFrame f, float3 rel, float3 geo, uint surfaceClass, float open, float normalVariance, inout Surface s)
+{
+    // Emissive pixels (lamp glass, windows) hold their light in the albedo: left as they are
+    if (s.Albedo.a > 0.01 || open <= 0.0)
         return;
+    float3 world = rel + CamPos;
 
     float3 N = normalize(s.Normal.xyz);
     float vegetation = s.Data.a < 0.75 ? 1.0 : 0.0;
+    // How far this pixel stands up from its surface, 0..1: the linear depth's height bias (gbuffer.fx, gputerrain.fx)
+    // over the terrain layers' 5 cm or a mesh's ~1 cm. Snow lies on the high spots first, the rain stands in the low ones
+    float linearDepth = dot(rel, f.CameraForward);
+    float relief = saturate(max(linearDepth - s.Depth, 0.0) / (surfaceClass == 1u ? SNOW_RELIEF_TERRAIN : SNOW_RELIEF_MESH));
+    float footprint = linearDepth / f.PixelsPerMetre;   // metres a pixel spans
 
     // Snow: thin, it lies on the surface's high spots first (the stones' tops, pebbles, clods: their relief, which the
     // linear depth holds as its height bias, gbuffer.fx and gputerrain.fx), varied by soft drifts metres across; as it
@@ -356,8 +373,6 @@ void ApplyWeather(DecalFrame f, float3 rel, float3 geo, uint surfaceClass, inout
     if (cover > 0.0 && surfaceClass != 3u)
     {
         float up = smoothstep(0.35, 0.85, lerp(N.y, geo.y, cover)) * smoothstep(0.2, 0.6, geo.y);
-        // How far this pixel stands up from its surface (m): the terrain's layers up to 5 cm, a mesh's ~1 cm
-        float relief = saturate(max(dot(rel, f.CameraForward) - s.Depth, 0.0) / (surfaceClass == 1u ? SNOW_RELIEF_TERRAIN : SNOW_RELIEF_MESH));
         float drift = SnowNoise(world.xz * 0.35);
         float t = 1.0 - cover;
         snow = smoothstep(t - 0.06, t + 0.06, up * (0.1 + 0.5 * relief + 0.4 * drift)) * saturate(up * 3.0);
@@ -369,12 +384,32 @@ void ApplyWeather(DecalFrame f, float3 rel, float3 geo, uint surfaceClass, inout
     {
         float rough = s.Data.r, metal = s.Data.g;
         float porosity = saturate((rough - 0.25) / 0.6) * (1.0 - metal) * (vegetation > 0.0 ? 0.5 : 1.0);
-        s.Albedo.rgb *= lerp(1.0, 0.5, porosity * wet);
+        s.Albedo.rgb *= lerp(1.0, 0.6, porosity * wet);
         // What the wet surface's roughness tends to: a water film on smooth ones, less on porous ones (the water sinks
-        // in); flat open ground gathers a film first once it is soaked
-        float film = lerp(0.07, rough * 0.55 + 0.05, porosity);
-        film = lerp(film, 0.06, saturate((geo.y - 0.9) * 10.0) * saturate((wet - 0.6) / 0.4));
+        // in), glossier once flat open ground is soaked; never glossier than the pixel can hold of its normal map
+        // (Kaplanyan & Hoffman's filtered roughness: the lobe widened by how much the normal changes to the next
+        // pixel). Soaked flat ground went to a mirror (0.06) over the stones' bumps, and from mid distance, where the
+        // bumps change from pixel to pixel, single pixels caught the sky: the plazas sparkled into noise (user,
+        // 2026-10-23). Near, where a bump spans many pixels, the film stays glossy
+        float soaked = saturate((wet - 0.6) / 0.4) * saturate((geo.y - 0.9) * 10.0)
+                       * (surfaceClass == 3u ? 0.0 : 1.0) * (1.0 - vegetation);
+        float film = lerp(0.1, rough * 0.4 + 0.1, porosity);
+        film = lerp(film, min(film, 0.22), soaked);
+        float film2 = film * film;
+        film = sqrt(sqrt(saturate(film2 * film2 + min(2.0 * normalVariance, 0.18))));
         s.Data.r = lerp(rough, min(rough, film), wet);
+
+        // Water standing in the low spots of soaked flat ground, the joints first, rising as the rain's puddles fill:
+        // flat (the surface's own normal, not the stones'), a mirror. Where a pixel spans more than the joints the
+        // share blends instead of flickering between stone and water
+        if (soaked > 0.0)
+        {
+            float level = 0.1 + 0.25 * saturate(f.PuddleFill);
+            float soft = 0.05 + 0.3 * saturate(footprint / 0.02);
+            float water = soaked * (1.0 - smoothstep(level - soft, level + soft, relief));
+            s.Data.r = lerp(s.Data.r, 0.04, water);
+            s.Normal.xyz = normalize(lerp(s.Normal.xyz, geo, water));
+        }
     }
 
     if (snow > 0.0)
@@ -392,6 +427,20 @@ void ApplyWeather(DecalFrame f, float3 rel, float3 geo, uint surfaceClass, inout
 
 groupshared uint g_TileMask[DECAL_MASK_WORDS];
 groupshared uint g_TileAny;
+groupshared float3 g_Normals[DECAL_TILE * DECAL_TILE];
+
+// How much the surface's normal changes from this pixel to the next (screen-space variance, Kaplanyan & Hoffman's
+// filtered roughness: σ² 0.25 of a pixel's filter): the tile's normals as the opaque pass wrote them, the neighbour on
+// the other side at the tile's edge, none toward the sky or off the screen
+float NormalVariance(uint2 t, float3 n)
+{
+    uint ix = t.x + 1u < DECAL_TILE ? t.x + 1u : t.x - 1u;
+    uint iy = t.y + 1u < DECAL_TILE ? t.y + 1u : t.y - 1u;
+    float3 nx = g_Normals[t.y * DECAL_TILE + ix], ny = g_Normals[iy * DECAL_TILE + t.x];
+    float3 dx = dot(nx, nx) > 0.25 ? nx - n : 0.0;
+    float3 dy = dot(ny, ny) > 0.25 ? ny - n : 0.0;
+    return 0.25 * (dot(dx, dx) + dot(dy, dy));
+}
 
 [numthreads(DECAL_TILE, DECAL_TILE, 1)]
 void CSDecals(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint gi : SV_GroupIndex)
@@ -418,14 +467,17 @@ void CSDecals(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint gi : S
     if (g_TileAny == 0u && f.WeatherOn == 0u)
         return;
     int2 px = int2(gid.xy * DECAL_TILE + gtid.xy);
-    if (any(float2(px) >= ViewportSize))
-        return;
+    bool onScreen = all(float2(px) < ViewportSize);
 
     Texture2D<float> depthTex = ResourceDescriptorHeap[DepthTexIdx];
+    RWTexture2D<float4> normalUav = ResourceDescriptorHeap[NormalUAVIdx];
     float depth;
     float3 rel = SurfaceAt(depthTex, px, depth);
-    if (depth <= 0.0)
-        return;                                         // sky
+    // The tile's normals before anything here changes them (NormalVariance); 0 where there is no surface
+    g_Normals[gi] = onScreen && depth > 0.0 ? normalUav[px].xyz : 0.0;
+    GroupMemoryBarrierWithGroupSync();
+    if (!onScreen || depth <= 0.0)
+        return;                                         // off the screen, the sky
 
     // The geometric normal and the steps to the neighbours, from the depth: of the two neighbours on each axis the one
     // whose step is smaller (an edge of the surface lies toward the other)
@@ -442,7 +494,6 @@ void CSDecals(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint gi : S
     uint surfaceClass = ids.Load(int3(px, 0)) >> 30;
 
     RWTexture2D<float4> albedoUav = ResourceDescriptorHeap[AlbedoUAVIdx];
-    RWTexture2D<float4> normalUav = ResourceDescriptorHeap[NormalUAVIdx];
     RWTexture2D<float4> dataUav = ResourceDescriptorHeap[DataUAVIdx];
     RWTexture2D<float> depthUav = ResourceDescriptorHeap[LinearDepthUAVIdx];
     RWTexture2D<float2> heightUav = ResourceDescriptorHeap[HeightUAVIdx];
@@ -454,6 +505,8 @@ void CSDecals(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint gi : S
     s.Displacement = heightUav[px];
     Surface before = s;
 
+    // The weather reaches puddles and surfaces alike: a puddle under a stall's roof stays dry, no rings under an eave
+    float open = f.WeatherOn != 0u ? SurfaceOpenness(f, rel, geo) : 1.0;
     if (g_TileAny != 0u)
     {
         for (uint w2 = 0; w2 < words; w2++)
@@ -463,12 +516,12 @@ void CSDecals(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint gi : S
             {
                 uint b = firstbitlow(bits);
                 bits &= bits - 1u;
-                ApplyDecal(w2 * 32u + b, rel, geo, dx, dy, surfaceClass, f.Rain, f.PuddleFill, s);
+                ApplyDecal(w2 * 32u + b, rel, geo, dx, dy, surfaceClass, f.Rain * open, f.PuddleFill * open, s);
             }
         }
     }
     if (f.WeatherOn != 0u)
-        ApplyWeather(f, rel, geo, surfaceClass, s);
+        ApplyWeather(f, rel, geo, surfaceClass, open, NormalVariance(gtid.xy, before.Normal.xyz), s);
 
     if (any(s.Albedo != before.Albedo))
         albedoUav[px] = s.Albedo;

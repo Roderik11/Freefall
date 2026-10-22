@@ -130,8 +130,25 @@ void CSCompose(uint3 dispatchThreadId : SV_DispatchThreadID)
         float3 environment = SkyReflection(reflect(toPixel, N), roughness) * saturate(light.a);
         if (SSRTexIdx != 0)
         {
+            // Blurred by the roughness, twice as far down the screen as across (a wet street draws a light as a streak
+            // toward the viewer): one sharp ray a pixel gave glossy surfaces a reflection made of single pixels, hits
+            // beside misses, and soaked cobbles turned to salt and pepper (user, 2026-10-23). The texture is premultiplied
+            // by its confidence, so the taps average hits and misses into a soft one; mirrors (puddles) stay sharp
             Texture2D ssrTex = ResourceDescriptorHeap[SSRTexIdx];
-            float4 ssr = ssrTex.SampleLevel(AtmosphereLinearClamp, uv, 0);   // premultiplied by its confidence
+            float4 ssr = ssrTex.SampleLevel(AtmosphereLinearClamp, uv, 0);
+            float spread = saturate((roughness - 0.05) / 0.3) * 6.0;           // half-size texels
+            if (spread > 0.25)
+            {
+                float2 texel = 2.0 / float2(ScreenWidthIdx, ScreenHeightIdx);
+                [unroll]
+                for (uint i = 0; i < 8; i++)
+                {
+                    float a = i * 2.39996323;
+                    float2 o = float2(cos(a), 2.0 * sin(a)) * (spread * sqrt((i + 0.5) / 8.0));
+                    ssr += ssrTex.SampleLevel(AtmosphereLinearClamp, uv + o * texel, 0);
+                }
+                ssr /= 9.0;
+            }
             environment = environment * (1.0 - ssr.a) + ssr.rgb;
         }
         specular = environment * EnvBRDFApprox(f0, roughness, NoV) * occlusion;

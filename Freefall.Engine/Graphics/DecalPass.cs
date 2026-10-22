@@ -118,7 +118,8 @@ namespace Freefall.Graphics
             RanThisFrame = false;
             var registry = DecalBuffer.Instance;
             int slots = registry?.SlotCount ?? 0;
-            bool weather = Weather.SurfaceWetness > 0.001f || Weather.SnowCover > 0.001f;
+            // Puddles outlast the wet ground (they drain 4× slower) and still need the shelter
+            bool weather = Weather.SurfaceWetness > 0.001f || Weather.SnowCover > 0.001f || Weather.PuddleFill > 0.001f;
             if ((slots == 0 && !weather) || !Supported)
                 return false;
             if (renderer.Albedo.UavIndex == 0)

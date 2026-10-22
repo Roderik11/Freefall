@@ -90,7 +90,19 @@ void CSReflect(uint3 id : SV_DispatchThreadID)
 
     float2 uv = (float2(px) + 0.5) / float2(FullWidth, FullHeight);
     float3 rel = posFromDepth(uv, depth, CameraInverse).xyz;
+    // The ray follows the surface's normal averaged over ~6 × 6 pixels, wholly from roughness 0.2: one sharp ray per
+    // half-size pixel along its own bumpy normal (wet cobbles) hit the houses in one pixel and missed in the next, and
+    // the soaked plazas turned to salt and pepper (user, 2026-10-23). Averaged, neighbouring rays run nearly parallel:
+    // one wet reflection over the stones; a close stone, many pixels wide, still bends it. Mirror-flat water keeps its own
     float3 n = normalize(LoadTex(NormalTexIdx, px).xyz);
+    float3 nSum = 0;
+    [unroll]
+    for (int j = -1; j <= 1; j++)
+        [unroll]
+        for (int i = -1; i <= 1; i++)
+            nSum += LoadTex(NormalTexIdx, clamp(px + int2(i, j) * 2, 0, int2(FullWidth, FullHeight) - 1)).xyz;
+    if (dot(nSum, nSum) > 1e-4)
+        n = normalize(lerp(n, normalize(nSum), saturate(roughness * 5.0)));
     float3 v = normalize(rel);
     float3 r = reflect(v, n);
     if (dot(r, n) <= 0.0)
