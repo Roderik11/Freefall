@@ -30,6 +30,7 @@ cbuffer PushConstants : register(b3)
 };
 
 #include "common.fx"
+#include "atmosphere_common.hlsli"
 #include "decals.hlsli"
 #include "decal_settings.hlsli"
 #include "weather_cover.hlsli"
@@ -409,6 +410,78 @@ float SnowNoise(float2 xz) { return 0.65 * SnowNoise1(xz * 0.8, 101u) + 0.35 * S
 #define SNOW_ALBEDO float3(0.70, 0.72, 0.76)   // packed old snow, a little blue: the dark palette's near white
 #define SNOW_ROUGHNESS 0.8
 
+// Value noise on a unit lattice (0..1) with its gradient, quintic fade (its slope is smooth too: lit normals show no
+// lattice): x the value, yz d/dx, d/dy
+float3 NoiseGrad(float2 p, uint seed)
+{
+    float2 i = floor(p), f = p - i;
+    int2 c = (int2)i;
+    float a = HashCell(c, seed), b = HashCell(c + int2(1, 0), seed);
+    float d = HashCell(c + int2(0, 1), seed), e = HashCell(c + int2(1, 1), seed);
+    float2 u = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
+    float2 du = 30.0 * f * f * (f * (f - 2.0) + 1.0);
+    float k = a - b - d + e;
+    return float3(a + (b - a) * u.x + (d - a) * u.y + k * u.x * u.y,
+                  du * float2(b - a + k * u.y, d - a + k * u.x));
+}
+
+// Deep snow's own surface over its large-scale normal `n` (world place, metres a pixel spans): a height field's slope
+// tilting it, world-anchored so nothing swims. Drifts 20-100 cm high, 2-7 m across (value noise's typical slope is a
+// third of its peak: lower ones did not read at all); wind ripples 1.5 cm high, 30 cm apart, in patches, their heading
+// wandering slowly over the world (not today's wind, which would turn them); a fine grain,
+// gone where a pixel outgrows it. Full snow cover had no shape at all, one flat white (user, 2026-10-23). `glint`: a
+// crystal here (round, 1 in 25 cells of 6 mm, only while a pixel is smaller than a cell, so they cannot turn to noise
+// far off) with its facet half-way between the light `toLight` and the eye `toEye`: a crystal flashes when it lines up
+// so, and only ever brightens. Each with its own random tilt drew dark specks, most of them facing away from the sun.
+// The caller makes it glossy
+float3 SnowSurfaceNormal(float3 world, float3 n, float footprint, float3 toLight, float3 toEye, out float glint)
+{
+    float2 xz = world.xz;
+    float2 slope = 0;
+    float3 drift = NoiseGrad(xz / 7.0, 301u);
+    slope += drift.yz * (1.0 / 7.0);
+    float3 drift2 = NoiseGrad(xz / 2.3, 302u);
+    slope += drift2.yz * (0.2 / 2.3);
+
+    // Ripples: along their heading short (crests across it), across it longer, in patches. One prevailing heading that
+    // wanders ±17° over 400 m, a 2.5 : 1 stretch and the lattice warped: a full turn every 90 m and 5.6 : 1 drew
+    // straight parallel streaks (value noise's lattice rows) bending into swirls (user, 2026-10-23)
+    float heading = 0.6 + (NoiseGrad(xz / 400.0, 303u).x - 0.5) * 0.6;
+    float2 along = float2(cos(heading), sin(heading)), across = float2(-along.y, along.x);
+    float2 q = float2(dot(xz, along) / 0.3, dot(xz, across) / 0.75);
+    q += (float2(NoiseGrad(q * 0.37, 306u).x, NoiseGrad(q * 0.37 + 17.3, 307u).x) - 0.5) * 1.6;
+    float3 ripple = NoiseGrad(q, 304u);
+    float patches = smoothstep(0.35, 0.75, NoiseGrad(xz / 9.0, 308u).x);
+    float rippleFade = (1.0 - smoothstep(0.02, 0.06, footprint)) * patches;
+    slope += (along * (ripple.y / 0.3) + across * (ripple.z / 0.75)) * 0.015 * rippleFade;
+
+    float3 grain = NoiseGrad(xz / 0.035, 305u);
+    slope += grain.yz * (0.003 / 0.035) * (1.0 - smoothstep(0.003, 0.009, footprint));
+
+    // The height field's normal on the large-scale surface (gentle slopes: the tilt added in the ground's plane)
+    float3 sn = normalize(n - float3(slope.x, 0.0, slope.y));
+
+    // Glints
+    glint = 0.0;
+    const float cell = 0.006;
+    float glintFade = 1.0 - smoothstep(cell * 0.4, cell * 1.2, footprint);
+    if (glintFade > 0.0)
+    {
+        int2 c = (int2)floor(xz / cell);
+        if (HashCell(c, 401u) < 0.04 && toLight.y > 0.0)
+        {
+            float2 centre = 0.25 + 0.5 * float2(HashCell(c, 402u), HashCell(c, 403u));
+            float2 d = frac(xz / cell) - centre;
+            if (dot(d, d) < 0.1)
+            {
+                sn = normalize(toLight + toEye);
+                glint = glintFade;
+            }
+        }
+    }
+    return sn;
+}
+
 // How much of the falling rain and snow reaches a surface (straight down, soft under eaves), looked for a little out
 // from it: a wall in the open is not covered by its own top, a floor under a roof is. Vegetation takes only the
 // terrain's cover: a crown over its own lower branches counted as cover near the camera, where the cover map resolves
@@ -528,7 +601,17 @@ void ApplyWeather(DecalFrame f, float3 rel, float3 geo, uint surfaceClass, float
         float buried = snow * smoothstep(0.3, 0.9, cover + 0.4 * hollow);
         s.Albedo.rgb = lerp(s.Albedo.rgb, SNOW_ALBEDO, dust);
         s.Data.rgb = lerp(s.Data.rgb, float3(SNOW_ROUGHNESS, 0.0, lerp(s.Data.b, 1.0, buried)), dust);
-        s.Normal.xyz = normalize(lerp(N, geo, buried));
+        // Deep snow's own surface (drifts, ripples, grain, a few glinting crystals)
+        float glint;
+        float3 toLight = float3(0, 1, 0);
+        if (AtmosphereIdx != 0)
+        {
+            AtmosphereParams A = LoadAtmosphere();
+            toLight = A.SunDirection.y > 0.0 ? A.SunDirection : A.MoonDirection;
+        }
+        float3 snowN = SnowSurfaceNormal(world, geo, footprint, toLight, -normalize(rel), glint);
+        s.Normal.xyz = normalize(lerp(N, snowN, buried));
+        s.Data.r = lerp(s.Data.r, 0.15, glint * buried);
         s.Displacement *= 1.0 - buried;
     }
 }

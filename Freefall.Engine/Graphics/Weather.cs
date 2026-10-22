@@ -44,6 +44,18 @@ namespace Freefall.Graphics
         public static float SnowShare { get; private set; }
 
         /// <summary>
+        /// The haze the falling rain and snow make of the air: extinction per km at the ground, which Atmosphere adds to
+        /// the aerosols (their ~1.2 km scale height fills the air under the cloud base, their forward phase suits drops and
+        /// flakes, and every pass's fog, the sky and the sun's light take it). Visibility is 3.9 / extinction: heavy rain
+        /// ~1.3 km, heavy snow ~400 m (flakes scatter ~5× what drops of the same water do); light falls already show (the
+        /// rate's 0.63 power, as Marshall-Palmer's for rain). In 0.02 steps, so the atmosphere's tables are made again only
+        /// when it changes a step. Before it, a downpour or a snowstorm left the air as clear as a dry day (user, 2026-10-23).
+        /// </summary>
+        public static float HazeKm { get; private set; }
+
+        private const float RainHazeKm = 3f, SnowHazeKm = 10f, HailHazeKm = 1f;
+
+        /// <summary>
         /// What the weather has left on the open surfaces round the camera (0..1), for the decal pass (decals_cs.hlsl):
         /// how wet they are (rising in the rain, a minute to soak in heavy rain), how full rain-filled puddles are (filling
         /// once the ground is soaked, ~5 minutes in heavy rain), how much snow lies (~10 minutes of heavy snow to cover).
@@ -127,6 +139,8 @@ namespace Freefall.Graphics
             Snow = Precipitation * SnowShare;
             Rain = Precipitation * (1f - SnowShare);
             Hail *= 1f - SnowShare;
+            float haze = RainHazeKm * MathF.Pow(Rain, 0.63f) + SnowHazeKm * MathF.Pow(Snow, 0.63f) + HailHazeKm * Hail;
+            HazeKm = MathF.Round(haze * 50f) / 50f;
 
             // What it leaves on the ground: rain soaks it and fills puddles once soaked; dry weather evaporates it, the faster
             // the more sun reaches the ground (its light, the clouds' shade included) and the stronger the wind (the two
@@ -251,6 +265,7 @@ namespace Freefall.Graphics
             snow = Snow,
             hail = Hail,
             snowShare = SnowShare,
+            hazeKm = HazeKm,        // the falling rain and snow's extinction per km (visibility 3.9 / it)
             surfaces = new { wetness = SurfaceWetness, puddleFill = PuddleFill, snowCover = SnowCover },
             // What the probe measured at the camera (not eased): the rate, hail, the cloud column's depth and top (m)
             column = new { rate = _column.X, hail = _column.Y, depth = _column.Z, top = _column.W },

@@ -109,8 +109,13 @@ VSOutput VS(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
     {
         float3 relPos = core.Position - CamPos;
         float3 toEye = normalize(-relPos);
-        output.Color.rgb *= ParticleLight(SamplerLinearWrap, relPos, toEye, e.ForwardScatter, e.MultipleScattering,
-                                          ParticleBodyShadows(relPos, ParticleShadowSampler)) * output.SkyVisible
+        float3 light = ParticleLight(SamplerLinearWrap, relPos, toEye, e.ForwardScatter, e.MultipleScattering,
+                                     ParticleBodyShadows(relPos, ParticleShadowSampler));
+        // A water drop shows the sky above and behind it through itself: the sky's light from above in full, not the
+        // average with the ground's that ParticleLight gives a speck lit from every side
+        if ((e.Flags & PARTICLE_FLAG_WATER) != 0)
+            light += (SkyAmbient(float3(0, 1, 0)) - SkyAmbient(float3(0, -1, 0))) * 0.5;
+        output.Color.rgb *= light * output.SkyVisible
                           + ParticlePointLight(relPos, toEye, e.ForwardScatter, e.MultipleScattering, 0.5 * size,
                                                ParticleShadowSampler);
     }
@@ -135,6 +140,10 @@ VSOutput VS(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
     float drawSize = size, drawWidth = size;
     {
         float viewDepth = mul(float4(core.Position, 1.0), View).z;
+        // Drops right at the eye would be out of focus, a blur too faint to see: drawn, a drop a hand's width away was a
+        // white bar across the screen
+        if ((e.Flags & PARTICLE_FLAG_WATER) != 0)
+            output.Color *= smoothstep(0.5, 2.0, viewDepth);
         float minWidth = viewDepth > 0.0 ? PIXEL_FLOOR * 2.0 * viewDepth / (Projection._22 * ViewportSize.y) : 0.0;
         if (e.BillboardMode == BILLBOARD_VELOCITY)
         {

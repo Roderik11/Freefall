@@ -333,7 +333,8 @@ namespace Freefall.Graphics
 
             var s = Settings;
             float fogKm = s.FogDensity * 1000f;
-            float mieScattering = MieScatteringEarth * s.MieScale;
+            // The aerosols, and the haze of the rain and snow falling at the camera (Weather.HazeKm: scattering, white)
+            float mieScattering = MieScatteringEarth * s.MieScale + Weather.HazeKm;
             _frame = new GpuParams
             {
                 RayleighScattering = RayleighEarth * s.RayleighScale,

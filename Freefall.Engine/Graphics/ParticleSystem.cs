@@ -42,6 +42,7 @@ namespace Freefall.Graphics
         private const uint FlagVolume = 32;         // = PARTICLE_FLAG_VOLUME
         private const uint FlagWrap = 64;           // = PARTICLE_FLAG_WRAP
         private const uint FlagCover = 128;         // = PARTICLE_FLAG_COVER
+        private const uint FlagWater = 256;         // = PARTICLE_FLAG_WATER
 
         /// <summary>
         /// The weather's wind (world space), set by <see cref="EnvironmentController"/>. Emitters take
@@ -603,7 +604,8 @@ namespace Freefall.Graphics
                     | (e.SurfMist ? FlagSurfMist : 0u)
                     | (e.Volumetric && e.Lit ? FlagVolume : 0u)
                     | (e.WrapInBox && e.Shape == EmissionShape.Box ? FlagWrap : 0u)
-                    | (e.StopUnderCover ? FlagCover : 0u),
+                    | (e.StopUnderCover ? FlagCover : 0u)
+                    | (e.Water && e.Lit ? FlagWater : 0u),
                 Intensity = MathF.Max(0f, e.Intensity),
                 FadeInRate = e.FadeIn > 0f ? 1f / MathF.Min(e.FadeIn, 1f) : 0f,
                 Turbulence = turbulence,

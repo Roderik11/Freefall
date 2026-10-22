@@ -234,6 +234,12 @@ namespace Freefall.Components
                      "its luminance in nits (a flame ~40000), shown as a light source (Atmosphere.EmissiveExposure)")]
         public bool Lit = true;
 
+        [Description("Lit: water drops (rain). A drop shows the sky above and behind it through itself, like a tiny lens: it " +
+                     "takes the sky's light from above in full, not the average with the dark ground below that a speck of " +
+                     "dust takes; RGB × Intensity is how much of it comes through (~1). Diffuse-lit at 0.6 the rain vanished " +
+                     "against dark walls")]
+        public bool Water = false;
+
         [Description("Lit: how much of the sun's and moon's light the particles throw on along its way, so they glow with the " +
                      "light behind them and dim with it behind you (droplets: spray, mist, rain ~0.7; thin smoke ~0.3). " +
                      "0 = the same from every side")]

@@ -68,5 +68,6 @@ struct ParticleEmitter     // 368 bytes
 #define PARTICLE_FLAG_VOLUME          32   // Lit + Volumetric: density in the near fog volume inside its range, sprites past it
 #define PARTICLE_FLAG_WRAP            64   // shape Box + WrapInBox: a particle leaving the box sideways comes in on the far side
 #define PARTICLE_FLAG_COVER          128   // StopUnderCover: dies (and is not born) where the sky is covered over it
+#define PARTICLE_FLAG_WATER          256   // Lit + Water: a drop shows the sky above it through itself (rain)
 
 #endif
