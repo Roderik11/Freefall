@@ -22,15 +22,15 @@ namespace Freefall.Graphics
         private const int MaskWords = DecalBuffer.MaxVisible / 32;      // DECAL_MASK_WORDS
         private const int ImportanceBins = 64;                          // decal_cull.hlsl IMPORTANCE_BINS
 
-        /// <summary>The view and its weather. Must match DecalFrame in decals.hlsli (240 bytes).</summary>
+        /// <summary>The view and its weather. Must match DecalFrame in decals.hlsli (224 bytes).</summary>
         [StructLayout(LayoutKind.Sequential, Pack = 4)]
         private struct Frame
         {
             public Vector4 Plane0, Plane1, Plane2, Plane3, Plane4;
             public Vector3 CameraPosition; public float PixelsPerMetre;
             public Vector3 CameraForward; public uint TilesX;
-            public Matrix4x4 ShelterVP;
-            public uint ShelterDepth, ShelterSlice, TerrainHeightmap; public float TerrainMaxHeight;
+            public ShelterMap.LevelData Shelter0, Shelter1, Shelter2;
+            public float ShelterMinY, ShelterRangeY; public uint TerrainHeightmap; public float TerrainMaxHeight;
             public Vector3 TerrainOrigin; public float Wetness;
             public Vector2 TerrainSize; public float PuddleFill, SnowCover;
             public float Rain; public uint TilesY, WeatherOn, _pad;
@@ -227,7 +227,7 @@ namespace Freefall.Graphics
             var c0 = new Vector4(cvp.M11, cvp.M21, cvp.M31, cvp.M41);
             var c1 = new Vector4(cvp.M12, cvp.M22, cvp.M32, cvp.M42);
             var c3 = new Vector4(cvp.M14, cvp.M24, cvp.M34, cvp.M44);
-            var shelter = SkyCapture.Shelter;
+            var shelter = ShelterMap.Current;
             var terrain = Atmosphere.TerrainCover;
             *_frames[slot]!.WritePtr<Frame>() = new Frame
             {
@@ -240,9 +240,11 @@ namespace Freefall.Graphics
                 PixelsPerMetre = 0.5f * height * camera.Projection.M22,
                 CameraForward = Vector3.Normalize(camera.Forward),
                 TilesX = (uint)_tilesX,
-                ShelterVP = shelter.VP,
-                ShelterDepth = shelter.Depth,
-                ShelterSlice = shelter.Slice,
+                Shelter0 = shelter.L0,
+                Shelter1 = shelter.L1,
+                Shelter2 = shelter.L2,
+                ShelterMinY = shelter.MinY,
+                ShelterRangeY = shelter.RangeY,
                 TerrainHeightmap = terrain.Heightmap,
                 TerrainMaxHeight = terrain.MaxHeight,
                 TerrainOrigin = terrain.Origin,

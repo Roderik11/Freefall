@@ -6,6 +6,8 @@
 #ifndef DECALS_HLSLI
 #define DECALS_HLSLI
 
+#include "weather_cover.hlsli"
+
 #define MAX_VISIBLE_DECALS 4096u    // DecalBuffer.MaxVisible: the sort's key keeps 12 bits of the list's index
 #define MAX_DECAL_SLOTS    65536u   // DecalBuffer.MaxSlots: ... and 16 of the registry slot
 
@@ -27,7 +29,7 @@ struct DecalRecord
 #define DECAL_TILE 16u
 #define DECAL_MASK_WORDS (MAX_VISIBLE_DECALS / 32u)     // a bit per visible decal in each tile's mask
 
-// The view the pass runs for, and the weather it applies (DecalPass.Frame, 240 bytes)
+// The view the pass runs for, and the weather it applies (DecalPass.Frame, 224 bytes)
 struct DecalFrame
 {
     float4 Planes[5];           // camera-relative left, right, bottom, top, near; normals point in
@@ -35,9 +37,9 @@ struct DecalFrame
     float PixelsPerMetre;       // at one metre: the projection's y scale × half the view's height
     float3 CameraForward;       // linear depth = dot(camera-relative place, this)
     uint TilesX;
-    row_major float4x4 ShelterVP;   // WeatherCover, field for field
-    uint ShelterDepth;
-    uint ShelterSlice;
+    ShelterLevel Shelter[SHELTER_LEVELS];   // the cover map (WeatherShelter, field for field)
+    float ShelterMinY;
+    float ShelterRangeY;
     uint TerrainHeightmap;
     float TerrainMaxHeight;
     float3 TerrainOrigin;

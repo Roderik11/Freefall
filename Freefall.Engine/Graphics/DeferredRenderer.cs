@@ -761,7 +761,7 @@ namespace Freefall.Graphics
              // 2c. Sky captures: the meshes round the camera seen from directions of the sky, for the sky visibility
              //     (sky_capture.hlsli). Four directions per frame while any is due; after the shadows, whose per-batch
              //     culling buffers it reuses.
-             if (SkyCapture.Render(list, camera))
+             if (SkyCapture.Render(list, camera) | ShelterMap.Render(list, camera))
              {
                  list.OMSetRenderTargets(_cachedGBufferRtvHandles, Depth.DsvHandle);
                  list.RSSetViewport(vp);

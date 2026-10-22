@@ -127,6 +127,8 @@ namespace Freefall.Editor.Commands
                 sunCascades = Freefall.Components.DirectionalLight.DescribeCascades(),
                 // Sky captures (sky visibility past the meshes): their centre, groups still due, groups drawn
                 skyCaptures = Freefall.Graphics.SkyCapture.Describe(),
+                // The rain and snow's cover map: each level's square as drawn (centre x, z, size), the heights, levels due
+                shelterMap = Freefall.Graphics.ShelterMap.Describe(),
                 // Camera exposure: auto or locked, the EV in use and its target, the metered luminance, the daylight
                 exposure = Freefall.Graphics.AutoExposure.Describe(),
                 // The cloud layer as the air takes it: its mean density toward the sun and the moon, how much it hides them

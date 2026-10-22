@@ -410,18 +410,26 @@ float SnowNoise(float2 xz) { return 0.65 * SnowNoise1(xz * 0.8, 101u) + 0.35 * S
 #define SNOW_ROUGHNESS 0.8
 
 // How much of the falling rain and snow reaches a surface (straight down, soft under eaves), looked for a little out
-// from it: a wall in the open is not covered by its own top, a floor under a roof is
-float SurfaceOpenness(DecalFrame f, float3 rel, float3 geo)
+// from it: a wall in the open is not covered by its own top, a floor under a roof is. Vegetation takes only the
+// terrain's cover: a crown over its own lower branches counted as cover near the camera, where the cover map resolves
+// it, and not far off, where its coarse levels do not, so near trees stayed green and far ones white
+float SurfaceOpenness(DecalFrame f, float3 rel, float3 geo, uint surfaceClass)
 {
-    WeatherCover c;
-    c.ShelterVP = f.ShelterVP;
-    c.ShelterDepth = f.ShelterDepth;
-    c.ShelterSlice = f.ShelterSlice;
-    c.TerrainHeightmap = f.TerrainHeightmap;
-    c.TerrainMaxHeight = f.TerrainMaxHeight;
-    c.TerrainOrigin = f.TerrainOrigin;
-    c.TerrainSize = f.TerrainSize;
-    return WeatherOpenness(c, LinearClamp, rel + CamPos + geo * 0.35 + float3(0, 0.05, 0), 0.1);
+    WeatherShelter s;
+    s.Levels = f.Shelter;
+    if (surfaceClass == 2u)
+    {
+        [unroll]
+        for (uint k = 0; k < SHELTER_LEVELS; k++)
+            s.Levels[k].Size = 0.0;
+    }
+    s.MinY = f.ShelterMinY;
+    s.RangeY = f.ShelterRangeY;
+    s.TerrainHeightmap = f.TerrainHeightmap;
+    s.TerrainMaxHeight = f.TerrainMaxHeight;
+    s.TerrainOrigin = f.TerrainOrigin;
+    s.TerrainSize = f.TerrainSize;
+    return WeatherOpenness(s, LinearClamp, rel + CamPos + geo * 0.35 + float3(0, 0.05, 0), 0.1);
 }
 
 // The terrain's smooth normal at a place (world xz) from its height map: its own normal before its layers' normal maps
@@ -607,7 +615,7 @@ void CSDecals(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint gi : S
     Surface before = s;
 
     // The weather reaches puddles and surfaces alike: a puddle under a stall's roof stays dry, no rings under an eave
-    float open = f.WeatherOn != 0u ? SurfaceOpenness(f, rel, geo) : 1.0;
+    float open = f.WeatherOn != 0u ? SurfaceOpenness(f, rel, geo, surfaceClass) : 1.0;
     if (g_TileAny != 0u)
     {
         for (uint w2 = 0; w2 < words; w2++)
@@ -623,9 +631,13 @@ void CSDecals(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint gi : S
     }
     if (f.WeatherOn != 0u)
     {
+        // (vegetation: its own dome normal, gbuffer_foliage.fx / gbuffer_crossmesh.fx: the depth's normal of a far tree's
+        // vertical cards pointed sideways, and the snow stopped a few hundred metres out, far trees stood green)
         float3 largeN = geo;
         if (surfaceClass == 1u && f.TerrainHeightmap != 0)
             largeN = TerrainNormal(f, rel.xz + CamPos.xz);
+        else if (surfaceClass == 2u)
+            largeN = normalize(s.Normal.xyz);
         ApplyWeather(f, rel, largeN, surfaceClass, open, NormalVariance(gtid.xy, before.Normal.xyz), s);
     }
 

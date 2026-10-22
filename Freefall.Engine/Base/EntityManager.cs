@@ -92,6 +92,7 @@ namespace Freefall.Base
 
                 Graphics.AutoExposure.Snap();     // the next scene starts at its own exposure, not a fade from this one
                 Graphics.SkyCapture.Invalidate(); // and its sky captures are drawn anew
+                Graphics.ShelterMap.Invalidate(); // as is the rain and snow's cover map
                 return true;
             }
         }
