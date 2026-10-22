@@ -217,7 +217,7 @@ PSOutput PS(VSOutput input)
     
     // Material lookup via MaterialID indirection
     MaterialData mat = GET_MATERIAL(materialID);
-    Texture2D albedoTex = ResourceDescriptorHeap[mat.AlbedoIdx];
+    Texture2D albedoTex = ResourceDescriptorHeap[NonUniformResourceIndex(mat.AlbedoIdx)];
     
     float4 color = albedoTex.Sample(Sampler, input.TexCoord);
     color.rgb *= mat.Tint;                  // Material Tint (default white)
@@ -230,16 +230,16 @@ PSOutput PS(VSOutput input)
     
     // Sample PBR textures if bound (index 0 = not bound)
     // RoughnessIdx holds a specular map — invert to get roughness
-    if (mat.RoughnessIdx != 0) { Texture2D rTex = ResourceDescriptorHeap[mat.RoughnessIdx]; roughness = 1.0 - rTex.Sample(Sampler, input.TexCoord).r; }
-    if (mat.MetallicIdx  != 0) { Texture2D mTex = ResourceDescriptorHeap[mat.MetallicIdx];  metal     = mTex.Sample(Sampler, input.TexCoord).r; }
-    if (mat.AOIdx        != 0) { Texture2D aTex = ResourceDescriptorHeap[mat.AOIdx];        ao        = aTex.Sample(Sampler, input.TexCoord).r; }
+    if (mat.RoughnessIdx != 0) { Texture2D rTex = ResourceDescriptorHeap[NonUniformResourceIndex(mat.RoughnessIdx)]; roughness = 1.0 - rTex.Sample(Sampler, input.TexCoord).r; }
+    if (mat.MetallicIdx  != 0) { Texture2D mTex = ResourceDescriptorHeap[NonUniformResourceIndex(mat.MetallicIdx)];  metal     = mTex.Sample(Sampler, input.TexCoord).r; }
+    if (mat.AOIdx        != 0) { Texture2D aTex = ResourceDescriptorHeap[NonUniformResourceIndex(mat.AOIdx)];        ao        = aTex.Sample(Sampler, input.TexCoord).r; }
     
     // Emissive: its luminance (texture × tint × EmissiveIntensity in nits), pre-exposed, takes the albedo's place
     // where it outshines a lit surface (the composition shows it as it is there)
     float emissiveMask = 0;
     if (mat.EmissiveIdx != 0)
     {
-        Texture2D eTex = ResourceDescriptorHeap[mat.EmissiveIdx];
+        Texture2D eTex = ResourceDescriptorHeap[NonUniformResourceIndex(mat.EmissiveIdx)];
         float3 emissive = eTex.Sample(Sampler, input.TexCoord).rgb * mat.EmissiveColor * (mat.EmissiveIntensity * EmissiveExposure);
         emissiveMask = saturate(max(emissive.r, max(emissive.g, emissive.b)));
         color.rgb = lerp(color.rgb, emissive, emissiveMask);
@@ -270,7 +270,7 @@ PSOutput PS(VSOutput input)
     
     if (mat.NormalIdx != 0)
     {
-        Texture2D normalTex = ResourceDescriptorHeap[mat.NormalIdx];
+        Texture2D normalTex = ResourceDescriptorHeap[NonUniformResourceIndex(mat.NormalIdx)];
         // Decode normal map: handle BC5 (2-channel, Z reconstructed) and OpenGL Y convention
         float2 nXY = normalTex.Sample(Sampler, input.TexCoord).rg * 2.0 - 1.0;
         nXY.y = -nXY.y; // Flip Y: OpenGL (Unity) → DirectX convention
@@ -307,7 +307,7 @@ PSOutput PS(VSOutput input)
     // Blend explicit height using same visual weight
     if (mat.DetailMaskIdx != 0)
     {
-        Texture2D heightMap = ResourceDescriptorHeap[mat.DetailMaskIdx];
+        Texture2D heightMap = ResourceDescriptorHeap[NonUniformResourceIndex(mat.DetailMaskIdx)];
         float height = heightMap.Sample(TrilinearSampler, input.TexCoord).r;
         
         float uvRate = length(ddy(input.TexCoord));

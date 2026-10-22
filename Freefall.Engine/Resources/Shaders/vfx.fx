@@ -83,7 +83,7 @@ static Settings S;
 Settings LoadSettings(uint materialId)
 {
     StructuredBuffer<MaterialData> materials = ResourceDescriptorHeap[MaterialsIdx];
-    ByteAddressBuffer all = ResourceDescriptorHeap[materials[materialId].SettingsBufferIdx];
+    ByteAddressBuffer all = ResourceDescriptorHeap[NonUniformResourceIndex(materials[materialId].SettingsBufferIdx)];
     return all.Load<Settings>(materialId * 256u);
 }
 

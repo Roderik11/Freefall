@@ -86,7 +86,7 @@ PSOutput PS(VSOutput input)
 
     StructuredBuffer<MaterialData> materials = ResourceDescriptorHeap[MaterialsIdx];
     MaterialData mat = materials[input.MaterialID];
-    Texture2D albedoTex = ResourceDescriptorHeap[mat.AlbedoIdx];
+    Texture2D albedoTex = ResourceDescriptorHeap[NonUniformResourceIndex(mat.AlbedoIdx)];
     float3 color = albedoTex.Sample(Sampler, float2(0.5, 0.5)).rgb;
 
     output.Color = float4(color, 1.0);

@@ -283,7 +283,7 @@ PSOutput PS(MSOutput input)
     if (input.TextureOverride > 0)
     {
         // ── Billboard / Cross path ──
-        Texture2D texOverride = ResourceDescriptorHeap[input.TextureOverride];
+        Texture2D texOverride = ResourceDescriptorHeap[NonUniformResourceIndex(input.TextureOverride)];
         float4 texColor = texOverride.Sample(ClampSampler, input.TexCoord);
         baseColor = texColor.rgb;
         alpha = texColor.a;
@@ -313,7 +313,7 @@ PSOutput PS(MSOutput input)
 
         if (mat.AlbedoIdx > 0)
         {
-            Texture2D albedoTex = ResourceDescriptorHeap[mat.AlbedoIdx];
+            Texture2D albedoTex = ResourceDescriptorHeap[NonUniformResourceIndex(mat.AlbedoIdx)];
             float4 texColor = albedoTex.Sample(ClampSampler, input.TexCoord);
             baseColor = texColor.rgb;
             alpha = texColor.a;
@@ -532,7 +532,7 @@ void PS_Shadow_SP(ShadowMSOutput input)
 {
     if (input.TextureOverride > 0)
     {
-        Texture2D texOverride = ResourceDescriptorHeap[input.TextureOverride];
+        Texture2D texOverride = ResourceDescriptorHeap[NonUniformResourceIndex(input.TextureOverride)];
         float alpha = texOverride.SampleLevel(HeightSampler, input.TexCoord, 0).a;
         clip(alpha - 0.33);
     }
@@ -543,7 +543,7 @@ void PS_Shadow_SP(ShadowMSOutput input)
 
         if (mat.AlbedoIdx > 0)
         {
-            Texture2D albedoTex = ResourceDescriptorHeap[mat.AlbedoIdx];
+            Texture2D albedoTex = ResourceDescriptorHeap[NonUniformResourceIndex(mat.AlbedoIdx)];
             float alpha = albedoTex.SampleLevel(HeightSampler, input.TexCoord, 0).a;
 
             // Distance-based alpha threshold: tight clip up close, loose at distance

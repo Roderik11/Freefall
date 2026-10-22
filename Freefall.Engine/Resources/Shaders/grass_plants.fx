@@ -416,7 +416,7 @@ PSOutput PS(MSOutput input, bool isFrontFace : SV_IsFrontFace)
     float3 color = input.Color;
     if (input.TextureIdx != 0)
     {
-        Texture2D parts = ResourceDescriptorHeap[input.TextureIdx];
+        Texture2D parts = ResourceDescriptorHeap[NonUniformResourceIndex(input.TextureIdx)];
         // Half a mip sharper and a fixed cutoff: a lower cutoff with distance (as the cards) filled the gaps between
         // a fern's pinnae, and the fronds read as broad smooth leaves
         float4 texel = parts.SampleBias(ClampSampler, input.UV, -0.5);
@@ -498,7 +498,7 @@ void PS_Shadow(ShadowMSOutput input)
 {
     if (input.TextureIdx != 0)
     {
-        Texture2D parts = ResourceDescriptorHeap[input.TextureIdx];
+        Texture2D parts = ResourceDescriptorHeap[NonUniformResourceIndex(input.TextureIdx)];
         clip(parts.SampleLevel(ClampSampler, input.UV, 0).a - 0.5);
     }
 }

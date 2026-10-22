@@ -111,7 +111,7 @@ VSOutput VS(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_InstanceI
     
     // Per-Animator bone buffer — loaded from per-instance descriptor (shared across SMRs)
     StructuredBuffer<BoneWeight> boneWeights = ResourceDescriptorHeap[part.BoneWeightsBufferIdx];
-    StructuredBuffer<row_major matrix> bones = ResourceDescriptorHeap[desc.BoneBufferIdx];
+    StructuredBuffer<row_major matrix> bones = ResourceDescriptorHeap[NonUniformResourceIndex(desc.BoneBufferIdx)];
     
     float3 pos = positions[vertexID];
     float3 norm = normals[vertexID];
@@ -208,7 +208,7 @@ ShadowVSOutput ShadowVertex(uint primitiveVertexID, uint instanceID, bool local)
     StructuredBuffer<InstanceDescriptor> descriptors = ResourceDescriptorHeap[DescriptorBufIdx];
     InstanceDescriptor desc = descriptors[idx];
     StructuredBuffer<BoneWeight> boneWeights = ResourceDescriptorHeap[part.BoneWeightsBufferIdx];
-    StructuredBuffer<row_major matrix> bones = ResourceDescriptorHeap[desc.BoneBufferIdx];
+    StructuredBuffer<row_major matrix> bones = ResourceDescriptorHeap[NonUniformResourceIndex(desc.BoneBufferIdx)];
     
     row_major matrix World = globalTransforms[desc.TransformSlot];
 
@@ -256,7 +256,7 @@ ShadowVSOutput VS_LocalShadow(uint primitiveVertexID : SV_VertexID, uint instanc
 void PS_Shadow(ShadowVSOutput input)
 {
     MaterialData mat = GET_MATERIAL(input.MaterialID);
-    Texture2D albedoTex = ResourceDescriptorHeap[mat.AlbedoIdx];
+    Texture2D albedoTex = ResourceDescriptorHeap[NonUniformResourceIndex(mat.AlbedoIdx)];
     float alpha = albedoTex.Sample(Sampler, input.TexCoord).a;
     clip(alpha - 0.25f);
 }
@@ -269,7 +269,7 @@ PSOutput PS(VSOutput input)
     
     // Material lookup via MaterialID indirection
     MaterialData mat = GET_MATERIAL(materialID);
-    Texture2D albedoTex = ResourceDescriptorHeap[mat.AlbedoIdx];
+    Texture2D albedoTex = ResourceDescriptorHeap[NonUniformResourceIndex(mat.AlbedoIdx)];
     
     float4 color = albedoTex.Sample(Sampler, input.TexCoord);
     color.rgb *= mat.Tint;                  // Material Tint (default white)
@@ -291,16 +291,16 @@ PSOutput PS(VSOutput input)
     
     // Sample PBR textures if bound (index 0 = not bound)
     // RoughnessIdx holds a specular map — invert to get roughness
-    if (mat.RoughnessIdx != 0) { Texture2D rTex = ResourceDescriptorHeap[mat.RoughnessIdx]; roughness = 1.0 - rTex.Sample(Sampler, input.TexCoord).r; }
-    if (mat.MetallicIdx  != 0) { Texture2D mTex = ResourceDescriptorHeap[mat.MetallicIdx];  metal     = mTex.Sample(Sampler, input.TexCoord).r; }
-    if (mat.AOIdx        != 0) { Texture2D aTex = ResourceDescriptorHeap[mat.AOIdx];        ao        = aTex.Sample(Sampler, input.TexCoord).r; }
+    if (mat.RoughnessIdx != 0) { Texture2D rTex = ResourceDescriptorHeap[NonUniformResourceIndex(mat.RoughnessIdx)]; roughness = 1.0 - rTex.Sample(Sampler, input.TexCoord).r; }
+    if (mat.MetallicIdx  != 0) { Texture2D mTex = ResourceDescriptorHeap[NonUniformResourceIndex(mat.MetallicIdx)];  metal     = mTex.Sample(Sampler, input.TexCoord).r; }
+    if (mat.AOIdx        != 0) { Texture2D aTex = ResourceDescriptorHeap[NonUniformResourceIndex(mat.AOIdx)];        ao        = aTex.Sample(Sampler, input.TexCoord).r; }
     
     // Emissive: its luminance (texture × tint × EmissiveIntensity in nits), pre-exposed, takes the albedo's place
     // where it outshines a lit surface (gbuffer.fx)
     float emissiveMask = 0;
     if (mat.EmissiveIdx != 0)
     {
-        Texture2D eTex = ResourceDescriptorHeap[mat.EmissiveIdx];
+        Texture2D eTex = ResourceDescriptorHeap[NonUniformResourceIndex(mat.EmissiveIdx)];
         float3 emissive = eTex.Sample(Sampler, input.TexCoord).rgb * mat.EmissiveColor * (mat.EmissiveIntensity * EmissiveExposure);
         emissiveMask = saturate(max(emissive.r, max(emissive.g, emissive.b)));
         color.rgb = lerp(color.rgb, emissive, emissiveMask);
@@ -332,7 +332,7 @@ PSOutput PS(VSOutput input)
     
     if (mat.NormalIdx != 0)
     {
-        Texture2D normalTex = ResourceDescriptorHeap[mat.NormalIdx];
+        Texture2D normalTex = ResourceDescriptorHeap[NonUniformResourceIndex(mat.NormalIdx)];
         //float3 texNormal = normalTex.Sample(Sampler, input.TexCoord).rgb * 2.0 - 1.0;
         
         float2 nXY = normalTex.Sample(Sampler, input.TexCoord).rg * 2.0 - 1.0;

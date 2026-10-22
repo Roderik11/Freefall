@@ -721,7 +721,7 @@ void CSShade(uint3 dtid : SV_DispatchThreadID)
             uint dirIdx = iy * octResDbg + ix;
             uint dirsPerTile = octResDbg * octResDbg;
             float3 iRad; float iTrans;
-            RWByteAddressBuffer pool = ResourceDescriptorHeap[GetTPoolIdx(shadeLevel)];
+            RWByteAddressBuffer pool = ResourceDescriptorHeap[NonUniformResourceIndex(GetTPoolIdx(shadeLevel))];
             ReadTileInterval(pool, tileCorners[0], dirIdx, dirsPerTile, iRad, iTrans);
             GIOutput[dtid.xy] = float4(iRad, 1.0);
         }
@@ -758,7 +758,7 @@ void CSShade(uint3 dtid : SV_DispatchThreadID)
             uint iy = clamp(uint(octUV.y * float(octRes0)), 0, octRes0 - 1);
             uint dirIdx = iy * octRes0 + ix;
             float3 r; float t;
-            RWByteAddressBuffer pool = ResourceDescriptorHeap[GetTPoolIdx(shadeLevel)];
+            RWByteAddressBuffer pool = ResourceDescriptorHeap[NonUniformResourceIndex(GetTPoolIdx(shadeLevel))];
             ReadTileInterval(pool, tileCorners[0], dirIdx, octRes0 * octRes0, r, t);
             l0trans = t;
         }
@@ -798,7 +798,7 @@ void CSShade(uint3 dtid : SV_DispatchThreadID)
     
     uint octRes = OctResForLevel(shadeLevel);
     uint dirsPerTile = octRes * octRes;
-    RWByteAddressBuffer pool = ResourceDescriptorHeap[GetTPoolIdx(shadeLevel)];
+    RWByteAddressBuffer pool = ResourceDescriptorHeap[NonUniformResourceIndex(GetTPoolIdx(shadeLevel))];
     
     [loop]
     for (uint dy = 0; dy < SHADE_OCT_RES; dy++)

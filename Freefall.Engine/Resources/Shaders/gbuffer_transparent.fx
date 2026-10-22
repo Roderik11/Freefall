@@ -203,7 +203,7 @@ PSOutput PS(VSOutput input)
     PSOutput output;
 
     MaterialData mat = GET_MATERIAL(input.MaterialID);
-    Texture2D albedoTex = ResourceDescriptorHeap[mat.AlbedoIdx];
+    Texture2D albedoTex = ResourceDescriptorHeap[NonUniformResourceIndex(mat.AlbedoIdx)];
 
     float4 color = albedoTex.Sample(Sampler, input.TexCoord);
     color.rgb *= mat.Tint;                  // Material Tint (default white)
@@ -216,15 +216,15 @@ PSOutput PS(VSOutput input)
     float metal = 0.0;
     float ao = 1.0;
 
-    if (mat.RoughnessIdx != 0) { Texture2D rTex = ResourceDescriptorHeap[mat.RoughnessIdx]; roughness = 1.0 - rTex.Sample(Sampler, input.TexCoord).r; }
-    if (mat.MetallicIdx  != 0) { Texture2D mTex = ResourceDescriptorHeap[mat.MetallicIdx];  metal     = mTex.Sample(Sampler, input.TexCoord).r; }
-    if (mat.AOIdx        != 0) { Texture2D aTex = ResourceDescriptorHeap[mat.AOIdx];        ao        = aTex.Sample(Sampler, input.TexCoord).r; }
+    if (mat.RoughnessIdx != 0) { Texture2D rTex = ResourceDescriptorHeap[NonUniformResourceIndex(mat.RoughnessIdx)]; roughness = 1.0 - rTex.Sample(Sampler, input.TexCoord).r; }
+    if (mat.MetallicIdx  != 0) { Texture2D mTex = ResourceDescriptorHeap[NonUniformResourceIndex(mat.MetallicIdx)];  metal     = mTex.Sample(Sampler, input.TexCoord).r; }
+    if (mat.AOIdx        != 0) { Texture2D aTex = ResourceDescriptorHeap[NonUniformResourceIndex(mat.AOIdx)];        ao        = aTex.Sample(Sampler, input.TexCoord).r; }
 
     // Emissive: sample texture, apply tint/intensity
     float3 emissive = float3(0, 0, 0);
     if (mat.EmissiveIdx != 0)
     {
-        Texture2D eTex = ResourceDescriptorHeap[mat.EmissiveIdx];
+        Texture2D eTex = ResourceDescriptorHeap[NonUniformResourceIndex(mat.EmissiveIdx)];
         emissive = eTex.Sample(Sampler, input.TexCoord).rgb * mat.EmissiveColor * mat.EmissiveIntensity;
     }
 
@@ -256,7 +256,7 @@ PSOutput PS(VSOutput input)
 
     if (mat.NormalIdx != 0)
     {
-        Texture2D normalTex = ResourceDescriptorHeap[mat.NormalIdx];
+        Texture2D normalTex = ResourceDescriptorHeap[NonUniformResourceIndex(mat.NormalIdx)];
         float2 nXY = normalTex.Sample(Sampler, input.TexCoord).rg * 2.0 - 1.0;
         nXY.y = -nXY.y;
         float3 texNormal = float3(nXY, sqrt(max(0.001, 1.0 - dot(nXY, nXY))));

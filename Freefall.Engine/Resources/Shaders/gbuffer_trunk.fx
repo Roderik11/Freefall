@@ -135,7 +135,7 @@ PSOutput PS(VSOutput input)
     PSOutput output;
 
     MaterialData mat = GET_MATERIAL(input.MaterialID);
-    Texture2D albedoTex = ResourceDescriptorHeap[mat.AlbedoIdx];
+    Texture2D albedoTex = ResourceDescriptorHeap[NonUniformResourceIndex(mat.AlbedoIdx)];
 
     float4 color = albedoTex.Sample(Sampler, input.TexCoord);
     color.rgb *= mat.Tint;                  // Material Tint (default white)
@@ -145,16 +145,16 @@ PSOutput PS(VSOutput input)
     float metal = 0.0;
     float ao = 1.0;
 
-    if (mat.RoughnessIdx != 0) { Texture2D rTex = ResourceDescriptorHeap[mat.RoughnessIdx]; roughness = 1.0 - rTex.Sample(Sampler, input.TexCoord).r; }
-    if (mat.MetallicIdx  != 0) { Texture2D mTex = ResourceDescriptorHeap[mat.MetallicIdx];  metal     = mTex.Sample(Sampler, input.TexCoord).r; }
-    if (mat.AOIdx        != 0) { Texture2D aTex = ResourceDescriptorHeap[mat.AOIdx];        ao        = aTex.Sample(Sampler, input.TexCoord).r; }
+    if (mat.RoughnessIdx != 0) { Texture2D rTex = ResourceDescriptorHeap[NonUniformResourceIndex(mat.RoughnessIdx)]; roughness = 1.0 - rTex.Sample(Sampler, input.TexCoord).r; }
+    if (mat.MetallicIdx  != 0) { Texture2D mTex = ResourceDescriptorHeap[NonUniformResourceIndex(mat.MetallicIdx)];  metal     = mTex.Sample(Sampler, input.TexCoord).r; }
+    if (mat.AOIdx        != 0) { Texture2D aTex = ResourceDescriptorHeap[NonUniformResourceIndex(mat.AOIdx)];        ao        = aTex.Sample(Sampler, input.TexCoord).r; }
 
     // Emissive: its luminance (texture × tint × EmissiveIntensity in nits), pre-exposed, takes the albedo's place
     // where it outshines a lit surface (gbuffer.fx)
     float emissiveMask = 0;
     if (mat.EmissiveIdx != 0)
     {
-        Texture2D eTex = ResourceDescriptorHeap[mat.EmissiveIdx];
+        Texture2D eTex = ResourceDescriptorHeap[NonUniformResourceIndex(mat.EmissiveIdx)];
         float3 emissive = eTex.Sample(Sampler, input.TexCoord).rgb * mat.EmissiveColor * (mat.EmissiveIntensity * EmissiveExposure);
         emissiveMask = saturate(max(emissive.r, max(emissive.g, emissive.b)));
         color.rgb = lerp(color.rgb, emissive, emissiveMask);
@@ -182,7 +182,7 @@ PSOutput PS(VSOutput input)
     
     if (mat.NormalIdx != 0)
     {
-        Texture2D normalTex = ResourceDescriptorHeap[mat.NormalIdx];
+        Texture2D normalTex = ResourceDescriptorHeap[NonUniformResourceIndex(mat.NormalIdx)];
         float2 nXY = normalTex.Sample(Sampler, input.TexCoord).rg * 2.0 - 1.0;
         nXY.y = -nXY.y;
         float3 texNormal = float3(nXY, sqrt(max(0.001, 1.0 - dot(nXY, nXY))));
@@ -196,13 +196,13 @@ PSOutput PS(VSOutput input)
                 float detailTiling = mat.DetailTiling.x;
                 if (detailTiling <= 0.0) detailTiling = 5.0;
                 float2 detailUV = input.TexCoord * detailTiling;
-                Texture2D detailTex = ResourceDescriptorHeap[mat.DetailNormalIdx];
+                Texture2D detailTex = ResourceDescriptorHeap[NonUniformResourceIndex(mat.DetailNormalIdx)];
                 float2 dXY = detailTex.Sample(Sampler, detailUV).rg * 2.0 - 1.0;
                 dXY.y = -dXY.y;
                 float detailMask = 1.0;
                 if (mat.DetailMaskIdx != 0)
                 {
-                    Texture2D maskTex = ResourceDescriptorHeap[mat.DetailMaskIdx];
+                    Texture2D maskTex = ResourceDescriptorHeap[NonUniformResourceIndex(mat.DetailMaskIdx)];
                     detailMask = maskTex.Sample(Sampler, input.TexCoord).a;
                 }
                 texNormal.xy += dXY * detailMask * detailFade;
@@ -291,7 +291,7 @@ ShadowVSOutput VS_LocalShadow(uint primitiveVertexID : SV_VertexID, uint instanc
 void PS_Shadow(ShadowVSOutput input)
 {
     MaterialData mat = GET_MATERIAL(input.MaterialID);
-    Texture2D albedoTex = ResourceDescriptorHeap[mat.AlbedoIdx];
+    Texture2D albedoTex = ResourceDescriptorHeap[NonUniformResourceIndex(mat.AlbedoIdx)];
     float alpha = albedoTex.Sample(Sampler, input.TexCoord).a;
     clip(alpha - 0.25f);
 }

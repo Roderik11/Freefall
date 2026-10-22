@@ -196,7 +196,7 @@ PSOutput PS(VSOutput input)
 
     if (mat.AlbedoIdx > 0)
     {
-        Texture2D albedoTex = ResourceDescriptorHeap[mat.AlbedoIdx];
+        Texture2D albedoTex = ResourceDescriptorHeap[NonUniformResourceIndex(mat.AlbedoIdx)];
         float4 texColor = albedoTex.Sample(Sampler, input.TexCoord);
         baseColor = texColor.rgb * mat.Tint;   // Material Tint (default white)
         alpha = texColor.a;
@@ -228,7 +228,7 @@ PSOutput PS(VSOutput input)
         float invmax = rsqrt(max(dot(T, T), dot(B, B)));
         float3x3 TBN = float3x3(T * invmax, B * invmax, N);
 
-        Texture2D normalTex = ResourceDescriptorHeap[mat.NormalIdx];
+        Texture2D normalTex = ResourceDescriptorHeap[NonUniformResourceIndex(mat.NormalIdx)];
         float2 nXY = normalTex.Sample(Sampler, input.TexCoord).rg * 2.0 - 1.0;
         nXY.y = -nXY.y;
         float3 texNormal = float3(nXY, sqrt(max(0.001, 1.0 - dot(nXY, nXY))));
@@ -315,7 +315,7 @@ void PS_Shadow(ShadowVSOutput input)
     MaterialData mat = GET_MATERIAL(input.MaterialID);
     if (mat.AlbedoIdx > 0)
     {
-        Texture2D albedoTex = ResourceDescriptorHeap[mat.AlbedoIdx];
+        Texture2D albedoTex = ResourceDescriptorHeap[NonUniformResourceIndex(mat.AlbedoIdx)];
         float alpha = albedoTex.Sample(Sampler, input.TexCoord).a;
         clip(alpha - 0.25f);
     }

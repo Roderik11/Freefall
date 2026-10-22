@@ -186,6 +186,8 @@ float3 TreeSway(float3 worldPos, float3 origin)
 }
 // Material data for bindless texture lookup via Material ID indirection
 // 80 bytes — matches C# MaterialData layout exactly
+// One draw holds every instance of a mesh part, whatever its material: a wave mixes materials, so fetch these
+// indices with NonUniformResourceIndex (AMD otherwise uses one lane's descriptor for the whole wave)
 struct MaterialData
 {
     uint AlbedoIdx;
@@ -206,7 +208,8 @@ struct MaterialData
 
 // A texture in an effect's material settings or instance data: its bindless index. Declared "TextureRef Noise; //= Gray"
 // (the default an engine texture: White, Black, Gray, FlatNormal), shown as a texture slot in the material inspector
-// and saved under the .mat's Textures. Read it with: Texture2D noise = ResourceDescriptorHeap[S.Noise];
+// and saved under the .mat's Textures. Read it with: Texture2D noise = ResourceDescriptorHeap[NonUniformResourceIndex(S.Noise)];
+// (materials and instances differ within one draw, see MaterialData)
 typedef uint TextureRef;
 
 // Shadow cascade data — shared by all shadow-related shaders

@@ -294,8 +294,8 @@ float4 PS(PS_Input input) : SV_Target
         StructuredBuffer<SlugGlyphData> GlyphData = ResourceDescriptorHeap[GlyphBufferIdx];
         SlugGlyphData g = GlyphData[input.TextureIndex];
 
-        Texture2D curveTexture = ResourceDescriptorHeap[g.CurveTextureIndex];
-        Texture2D bandTexture = ResourceDescriptorHeap[g.BandTextureIndex];
+        Texture2D curveTexture = ResourceDescriptorHeap[NonUniformResourceIndex(g.CurveTextureIndex)];
+        Texture2D bandTexture = ResourceDescriptorHeap[NonUniformResourceIndex(g.BandTextureIndex)];
 
         float2 renderCoord = input.UV;
         float4 bandTransform = float4(g.BandScaleX, g.BandScaleY, g.BandOffsetX, g.BandOffsetY);
@@ -309,7 +309,7 @@ float4 PS(PS_Input input) : SV_Target
     }
     else
     {
-        Texture2D tex = ResourceDescriptorHeap[input.TextureIndex];
+        Texture2D tex = ResourceDescriptorHeap[NonUniformResourceIndex(input.TextureIndex)];
         float4 texColor = input.Type == 3 ? tex.Sample(LinearSampler, input.UV) : tex.Sample(PointSampler, input.UV);
         return texColor * input.Color;
     }

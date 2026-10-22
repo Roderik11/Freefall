@@ -166,7 +166,7 @@ PSOutput PS(VSOutput input, bool isFrontFace : SV_IsFrontFace)
     PSOutput output;
 
     MaterialData mat = GET_MATERIAL(input.MaterialID);
-    Texture2D albedoTex = ResourceDescriptorHeap[mat.AlbedoIdx];
+    Texture2D albedoTex = ResourceDescriptorHeap[NonUniformResourceIndex(mat.AlbedoIdx)];
 
     float4 color = albedoTex.Sample(Sampler, input.TexCoord);
     color.rgb *= mat.Tint * input.TreeTint; // Material Tint (default white), this tree's own colour
@@ -190,7 +190,7 @@ PSOutput PS(VSOutput input, bool isFrontFace : SV_IsFrontFace)
     if (mat.AOIdx != 0)
     {
         // If a translucency map (_t.dds) is bound, use it
-        Texture2D tTex = ResourceDescriptorHeap[mat.AOIdx];
+        Texture2D tTex = ResourceDescriptorHeap[NonUniformResourceIndex(mat.AOIdx)];
         translucency = tTex.Sample(Sampler, input.TexCoord).r;
     }
 
@@ -270,7 +270,7 @@ ShadowVSOutput VS_LocalShadow(uint primitiveVertexID : SV_VertexID, uint instanc
 void PS_Shadow(ShadowVSOutput input)
 {
     MaterialData mat = GET_MATERIAL(input.MaterialID);
-    Texture2D albedoTex = ResourceDescriptorHeap[mat.AlbedoIdx];
+    Texture2D albedoTex = ResourceDescriptorHeap[NonUniformResourceIndex(mat.AlbedoIdx)];
     float alpha = albedoTex.Sample(Sampler, input.TexCoord).a;
     clip(alpha - 0.2f);
 }

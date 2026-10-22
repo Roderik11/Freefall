@@ -135,7 +135,7 @@ PSOutput PS(VSOutput input)
     PSOutput output;
 
     MaterialData mat = GET_MATERIAL(input.MaterialID);
-    Texture2D albedoTex = ResourceDescriptorHeap[mat.AlbedoIdx];
+    Texture2D albedoTex = ResourceDescriptorHeap[NonUniformResourceIndex(mat.AlbedoIdx)];
 
     float4 color = albedoTex.Sample(Sampler, input.TexCoord);
     color.rgb *= mat.Tint * input.TreeTint; // Material Tint (default white), this tree's own colour
@@ -146,7 +146,7 @@ PSOutput PS(VSOutput input)
     float aoValue = 1.0;
     if (mat.AOIdx != 0)
     {
-        Texture2D aoTex = ResourceDescriptorHeap[mat.AOIdx];
+        Texture2D aoTex = ResourceDescriptorHeap[NonUniformResourceIndex(mat.AOIdx)];
         aoValue = aoTex.Sample(Sampler, input.TexCoord).g;
     }
 
@@ -181,7 +181,7 @@ PSOutput PS(VSOutput input)
         float invmax = rsqrt(max(dot(T, T), dot(B, B)));
         float3x3 TBN = float3x3(T * invmax, B * invmax, domeN);
 
-        Texture2D normalTex = ResourceDescriptorHeap[mat.NormalIdx];
+        Texture2D normalTex = ResourceDescriptorHeap[NonUniformResourceIndex(mat.NormalIdx)];
         float2 nXY = normalTex.Sample(Sampler, input.TexCoord).rg * 2.0 - 1.0;
         nXY.y = -nXY.y;
         float3 texNormal = float3(nXY, sqrt(max(0.001, 1.0 - dot(nXY, nXY))));
@@ -272,7 +272,7 @@ ShadowVSOutput VS_LocalShadow(uint primitiveVertexID : SV_VertexID, uint instanc
 void PS_Shadow(ShadowVSOutput input)
 {
     MaterialData mat = GET_MATERIAL(input.MaterialID);
-    Texture2D albedoTex = ResourceDescriptorHeap[mat.AlbedoIdx];
+    Texture2D albedoTex = ResourceDescriptorHeap[NonUniformResourceIndex(mat.AlbedoIdx)];
     float alpha = albedoTex.Sample(Sampler, input.TexCoord).a;
     clip(alpha - 0.2f);
 }

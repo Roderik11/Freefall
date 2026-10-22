@@ -115,7 +115,7 @@ template<typename T>
 T LoadMaterialSettings(uint materialId)
 {
     StructuredBuffer<MaterialData> materials = ResourceDescriptorHeap[MaterialsIdx];
-    ByteAddressBuffer all = ResourceDescriptorHeap[materials[materialId].SettingsBufferIdx];
+    ByteAddressBuffer all = ResourceDescriptorHeap[NonUniformResourceIndex(materials[materialId].SettingsBufferIdx)];
     return all.Load<T>(materialId * 256u);
 }
 
