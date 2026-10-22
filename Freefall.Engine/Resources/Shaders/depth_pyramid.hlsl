@@ -380,8 +380,10 @@ float ReduceShadow4(float a, float b, float c, float d)
 void WriteMipShadow(uint mip, uint2 coord, float value)
 {
     if (mip >= MipCount) return;
-    RWTexture2D<float> outMip = ResourceDescriptorHeap[GetMipUavIdx(mip)];
-    outMip[coord] = value;
+    // The views are Texture2DArray slices (FirstArraySlice = the cascade, ArraySize 1): declared as such, element 0
+    // is that slice. A RWTexture2D over an array view is undefined (GPU validation saw it as a write to slice 0).
+    RWTexture2DArray<float> outMip = ResourceDescriptorHeap[GetMipUavIdx(mip)];
+    outMip[uint3(coord, 0)] = value;
 }
 
 groupshared float gs_shadow[32][32];
@@ -503,6 +505,7 @@ void CSDownsampleShadow(uint3 id : SV_DispatchThreadID)
     float d2 = inputMip[uint3(srcCoord + uint2(0,1), 0)];
     float d3 = inputMip[uint3(srcCoord + uint2(1,1), 0)];
 
-    RWTexture2D<float> outputMip = ResourceDescriptorHeap[CounterUAVIdx];
-    outputMip[id.xy] = max(max(d0, d1), max(d2, d3));
+    // Output is a single-slice UAV (Texture2DArray with ArraySize=1), like the input
+    RWTexture2DArray<float> outputMip = ResourceDescriptorHeap[CounterUAVIdx];
+    outputMip[uint3(id.xy, 0)] = max(max(d0, d1), max(d2, d3));
 }

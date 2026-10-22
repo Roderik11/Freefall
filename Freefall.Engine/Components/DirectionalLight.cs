@@ -298,8 +298,8 @@ namespace Freefall.Components
             
             // Switch to compute pipeline via ComputeShader
             var lightCS = renderer.DirectionalLightCS;
-            commandList.SetComputeRootSignature(Engine.Device.GlobalRootSignature);
             commandList.SetDescriptorHeaps(1, s_srvHeaps ??= [Engine.Device.SrvHeap]);
+            commandList.SetComputeRootSignature(Engine.Device.GlobalRootSignature);
             
             // Push constants via ComputeShader reflection (10 slots)
             var desc = renderer.LightBuffer.Native.Description;

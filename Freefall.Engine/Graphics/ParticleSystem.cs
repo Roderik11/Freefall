@@ -737,8 +737,8 @@ namespace Freefall.Graphics
             bool simulate = _simulatedTick != Engine.TickCount;
             _simulatedTick = Engine.TickCount;
 
-            cmd.SetComputeRootSignature(device.GlobalRootSignature);
             cmd.SetDescriptorHeaps(1, _heaps!);
+            cmd.SetComputeRootSignature(device.GlobalRootSignature);
 
             CopyGrownPool(cmd);
 

@@ -115,8 +115,8 @@ namespace Freefall.Graphics
             if (_giBuffer == null) return;
 
             // Bind compute root sig + descriptor heap
-            cmd.SetComputeRootSignature(Engine.Device.GlobalRootSignature);
             cmd.SetDescriptorHeaps(1, new[] { Engine.Device.SrvHeap });
+            cmd.SetComputeRootSignature(Engine.Device.GlobalRootSignature);
 
             // Bind SceneConstants (b0) for View, Projection, CamPos, etc.
             BindSceneConstants(cmd, renderer);
@@ -332,8 +332,8 @@ namespace Freefall.Graphics
             _shader.SetPushConstant(_kComposeGI, "ScreenW", (uint)desc.Width);
             _shader.SetPushConstant(_kComposeGI, "ScreenH", (uint)desc.Height);
 
-            cmd.SetComputeRootSignature(Engine.Device.GlobalRootSignature);
             cmd.SetDescriptorHeaps(1, new[] { Engine.Device.SrvHeap });
+            cmd.SetComputeRootSignature(Engine.Device.GlobalRootSignature);
             BindSceneConstants(cmd, renderer);
 
             PixMarker.Begin(cmd, "RC ComposeGI");

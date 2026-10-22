@@ -60,8 +60,8 @@ namespace Freefall.Graphics
             var fromState = _firstFrame ? ResourceStates.Common : ResourceStates.NonPixelShaderResource;
             _firstFrame = false;
 
-            commandList.SetComputeRootSignature(Engine.Device.GlobalRootSignature);
             commandList.SetDescriptorHeaps(1, new[] { Engine.Device.SrvHeap });
+            commandList.SetComputeRootSignature(Engine.Device.GlobalRootSignature);
 
             // Camera basis vectors are the columns of the view rotation
             _shader.SetParam("ViewRight", new Vector4(viewRotation.M11, viewRotation.M21, viewRotation.M31, 0f));

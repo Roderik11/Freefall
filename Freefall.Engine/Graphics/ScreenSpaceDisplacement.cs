@@ -62,8 +62,8 @@ namespace Freefall.Graphics
 
             EnsureResources(texWidth, texHeight);
 
-            cmd.SetComputeRootSignature(Engine.Device.GlobalRootSignature);
             cmd.SetDescriptorHeaps(1, new[] { Engine.Device.SrvHeap });
+            cmd.SetComputeRootSignature(Engine.Device.GlobalRootSignature);
 
             if (Engine.Settings.UseSSDMPyramid)
                 ExecutePyramid(cmd, displacementSrvIndex, depthSrvIndex, texWidth, texHeight);

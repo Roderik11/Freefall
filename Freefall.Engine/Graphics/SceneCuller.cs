@@ -182,9 +182,9 @@ namespace Freefall.Graphics
             int f = Engine.FrameIndex % FrameCount;
             var device = Engine.Device;
 
-            commandList.SetComputeRootSignature(device.GlobalRootSignature);
             _cachedSrvHeapArray ??= new[] { device.SrvHeap };
             commandList.SetDescriptorHeaps(1, _cachedSrvHeapArray);
+            commandList.SetComputeRootSignature(device.GlobalRootSignature);
             commandList.SetComputeRootConstantBufferView(1, frustumBufferGPUAddress);
 
             // Push constants — same layout as InstanceBatch, but SRVs point to SceneBuffers
@@ -410,9 +410,9 @@ namespace Freefall.Graphics
             var device = Engine.Device;
 
             // Set shared compute state
-            commandList.SetComputeRootSignature(device.GlobalRootSignature);
             _cachedSrvHeapArray ??= new[] { device.SrvHeap };
             commandList.SetDescriptorHeaps(1, _cachedSrvHeapArray);
+            commandList.SetComputeRootSignature(device.GlobalRootSignature);
 
             // Push constants shared across all passes — SceneBuffers SRVs
             commandList.SetComputeRoot32BitConstant(0, MeshRegistry.SrvIndex, 0);

@@ -105,12 +105,33 @@ namespace Freefall.Graphics
                         ? (seen.Text, seen.Severity, seen.Count + 1)
                         : (message.Description, message.Severity, 1);
                 }
+                // Through the log, so a published game's player.log has them too
                 foreach (var (id, (text, severity, n)) in kinds.Take(40))
-                    Console.WriteLine($"[D3D12 {severity}] ({where}) {id}{(n > 1 ? $" x{n}" : "")}: {text}");
+                    Debug.LogError($"[D3D12 {severity}] ({where}) {id}{(n > 1 ? $" x{n}" : "")}: {text}");
                 queue.ClearStoredMessages();
             }
             catch (Exception ex) { Console.WriteLine($"[D3D12] message dump failed: {ex.Message}"); }
         }
+        /// <summary>
+        /// With the debug layer on, names a new resource after the code that made it (its first callers), so a
+        /// validation message about it says which one it is instead of 'Unnamed ID3D12Resource Object'. A no-op
+        /// otherwise. Returns the resource.
+        /// </summary>
+        public T NameForDebug<T>(T resource) where T : ID3D12Object
+        {
+            if (!DebugLayerEnabled || resource == null) return resource;
+            var names = new List<string>(4);
+            foreach (var frame in new System.Diagnostics.StackTrace(1, false).GetFrames())
+            {
+                var method = frame.GetMethod();
+                if (method?.DeclaringType == null) continue;
+                names.Add($"{method.DeclaringType.Name}.{method.Name}");
+                if (names.Count == 4) break;
+            }
+            resource.Name = string.Join(" < ", names);
+            return resource;
+        }
+
         private bool _deviceRemovedLogged;
 
         /// <summary>
@@ -201,11 +222,23 @@ namespace Freefall.Graphics
             // Debug layer (opt-in: FREEFALL_D3DDEBUG=1). Slow, and can itself cause a TDR on heavy scene loads, so it
             // is for hunting an invalid command (a command list that fails to Close, a device removal without a
             // page fault): DumpDebugMessages prints what the validation layer recorded. Must precede device creation.
-            DebugLayerEnabled = Environment.GetEnvironmentVariable("FREEFALL_D3DDEBUG") == "1";
+            // FREEFALL_D3DDEBUG=2 adds GPU-based validation, much slower again: it checks what the shaders reach
+            // through the bindless heap (resource states, out-of-range descriptors), which the layer alone cannot.
+            var debugMode = Environment.GetEnvironmentVariable("FREEFALL_D3DDEBUG");
+            DebugLayerEnabled = debugMode is "1" or "2";
             if (DebugLayerEnabled && D3D12GetDebugInterface(out ID3D12Debug? debugLayer).Success && debugLayer != null)
             {
                 debugLayer.EnableDebugLayer();
+                if (debugMode == "2")
+                    using (var debug1 = debugLayer.QueryInterfaceOrNull<ID3D12Debug1>())
+                        debug1?.SetEnableGPUBasedValidation(true);
                 debugLayer.Dispose();
+            }
+            else if (DebugLayerEnabled)
+            {
+                // The layer is d3d12SDKLayers.dll, which only the Windows "Graphics Tools" optional feature installs
+                Debug.LogWarning("GraphicsDevice", "FREEFALL_D3DDEBUG=1 but the D3D12 debug layer is not installed (Windows optional feature \"Graphics Tools\")");
+                DebugLayerEnabled = false;
             }
 
             // DRED (opt-in: FREEFALL_DRED=1): records auto-breadcrumbs + page-fault allocations so a device removal
@@ -300,9 +333,10 @@ namespace Freefall.Graphics
                 new StaticSamplerDescription(ShaderVisibility.All, 4, 0) { Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Wrap, AddressV = TextureAddressMode.Wrap, AddressW = TextureAddressMode.Wrap }, // Trilinear wrap for displacement/height maps
             };
 
-            // D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED = 0x400
-            // D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED = 0x800
-            var flags = RootSignatureFlags.None | (RootSignatureFlags)0x400 | (RootSignatureFlags)0x800;
+            // D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED = 0x400. Not SAMPLER_HEAP_DIRECTLY_INDEXED
+            // (0x800): no shader indexes SamplerDescriptorHeap (the samplers are the static ones above) and no
+            // sampler heap is ever bound, which that flag requires before every root signature set.
+            var flags = RootSignatureFlags.None | (RootSignatureFlags)0x400;
             
             var desc = new VersionedRootSignatureDescription(new RootSignatureDescription1(flags, rootParameters, staticSamplers));
             _globalRootSignature = _device.CreateRootSignature(desc);
@@ -870,12 +904,12 @@ namespace Freefall.Graphics
 
             try
             {
-                return _device.CreateCommittedResource(
+                return NameForDebug(_device.CreateCommittedResource(
                     new HeapProperties(HeapType.Default),
                     HeapFlags.None,
                     desc,
                     initialState,
-                    optimizedClearValue);
+                    optimizedClearValue));
             }
             catch (Exception ex)
             {
@@ -902,12 +936,12 @@ namespace Freefall.Graphics
                 Flags = flags
             };
 
-            return _device.CreateCommittedResource(
+            return NameForDebug(_device.CreateCommittedResource(
                 new HeapProperties(HeapType.Default),
                 HeapFlags.None,
                 desc,
                 initialState,
-                null);
+                null));
         }
 
         public void CreateRenderTargetView(ID3D12Resource resource, RenderTargetViewDescription? desc, CpuDescriptorHandle handle)
@@ -980,12 +1014,12 @@ namespace Freefall.Graphics
         /// </summary>
         public ID3D12Resource CreateDefaultBuffer(int size, ResourceFlags flags = ResourceFlags.AllowUnorderedAccess)
         {
-            return _device.CreateCommittedResource(
+            return NameForDebug(_device.CreateCommittedResource(
                 new HeapProperties(HeapType.Default),
                 HeapFlags.None,
                 ResourceDescription.Buffer((ulong)size, flags),
                 ResourceStates.Common,
-                null);
+                null));
         }
 
         /// <summary>

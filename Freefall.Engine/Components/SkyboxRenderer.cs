@@ -258,10 +258,14 @@ namespace Freefall.Components
             // Dispatch: 128/4 = 32 groups per axis
             var allocator = device.NativeDevice.CreateCommandAllocator(CommandListType.Direct);
             var cmd = device.NativeDevice.CreateCommandList<ID3D12GraphicsCommandList>(0, CommandListType.Direct, allocator);
-            cmd.SetComputeRootSignature(device.GlobalRootSignature);
             cmd.SetDescriptorHeaps(1, new[] { device.SrvHeap });
+            cmd.SetComputeRootSignature(device.GlobalRootSignature);
 
+            // Created in Common, which a texture is never promoted out of to UnorderedAccess; back to Common after,
+            // from which the sky's reads promote it implicitly
+            cmd.ResourceBarrierTransition(_cloudNoiseLUT.Native, ResourceStates.Common, ResourceStates.UnorderedAccess);
             shader.Dispatch(kernel, cmd, (uint)(size / 4), (uint)(size / 4), (uint)(size / 4));
+            cmd.ResourceBarrierTransition(_cloudNoiseLUT.Native, ResourceStates.UnorderedAccess, ResourceStates.Common);
 
             cmd.Close();
             device.SubmitAndWait(cmd);

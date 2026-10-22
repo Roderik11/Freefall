@@ -405,8 +405,8 @@ namespace Freefall.Graphics
             var cs = _cs!;
             var device = Engine.Device;
 
-            list.SetComputeRootSignature(device.GlobalRootSignature);
             list.SetDescriptorHeaps(1, new[] { device.SrvHeap });
+            list.SetComputeRootSignature(device.GlobalRootSignature);
             bindSceneConstants(list);
 
             var shaderRead = ResourceStates.NonPixelShaderResource | ResourceStates.PixelShaderResource;

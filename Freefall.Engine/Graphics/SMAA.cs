@@ -49,8 +49,8 @@ namespace Freefall.Graphics
             list.ResourceBarrierTransition(inputResource,
                 ResourceStates.PixelShaderResource, ResourceStates.NonPixelShaderResource);
 
-            list.SetComputeRootSignature(Engine.Device.GlobalRootSignature);
             list.SetDescriptorHeaps(1, new[] { Engine.Device.SrvHeap });
+            list.SetComputeRootSignature(Engine.Device.GlobalRootSignature);
 
             uint gx = (uint)((texWidth + 7) / 8);
             uint gy = (uint)((texHeight + 7) / 8);

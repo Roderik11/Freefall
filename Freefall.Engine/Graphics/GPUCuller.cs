@@ -515,9 +515,9 @@ namespace Freefall.Graphics
             bool firstGeneration = !pyramid.Ready;
             pyramid.Ready = true;  // Pyramid will be valid after this dispatch
             
-            commandList.SetComputeRootSignature(_device.GlobalRootSignature);
             _cachedSrvHeapArray ??= new[] { _device.SrvHeap };
             commandList.SetDescriptorHeaps(1, _cachedSrvHeapArray);
+            commandList.SetComputeRootSignature(_device.GlobalRootSignature);
             
             int spdMipCount = Math.Min(pyramid.MipCount, 6);
             uint numGroupsX = ((uint)pyramid.SourceWidth + 63) / 64;
@@ -741,9 +741,9 @@ namespace Freefall.Graphics
 
             int frameIndex = Engine.FrameIndex % FrameCount;
 
-            commandList.SetComputeRootSignature(_device.GlobalRootSignature);
             _cachedSrvHeapArray ??= new[] { _device.SrvHeap };
             commandList.SetDescriptorHeaps(1, _cachedSrvHeapArray);
+            commandList.SetComputeRootSignature(_device.GlobalRootSignature);
 
             // Set constants via ComputeShader API: all push constants (a Params cbuffer has one copy per frame, and
             // the scene and the game view each analyse their own camera)
@@ -940,9 +940,9 @@ namespace Freefall.Graphics
             }
             
             // Set compute state
-            commandList.SetComputeRootSignature(_device.GlobalRootSignature);
             _cachedSrvHeapArray ??= new[] { _device.SrvHeap };
             commandList.SetDescriptorHeaps(1, _cachedSrvHeapArray);
+            commandList.SetComputeRootSignature(_device.GlobalRootSignature);
             
             // Bind params cbuffer (slot 2 → register b1, externally managed)
             commandList.SetComputeRootConstantBufferView(2, _cascadeParamsCBs![frameIndex].Native.GPUVirtualAddress);

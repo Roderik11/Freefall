@@ -109,8 +109,8 @@ namespace Freefall.Graphics
                 || move.LengthSquared() > TeleportDistance * TeleportDistance;
 
             PixMarker.Begin(list, "Clouds");
-            list.SetComputeRootSignature(device.GlobalRootSignature);
             list.SetDescriptorHeaps(1, new[] { device.SrvHeap });
+            list.SetComputeRootSignature(device.GlobalRootSignature);
             bindSceneConstants(list);
 
             cs.SetParam("PrevCameraRelativeVP", _prevRelativeVP);

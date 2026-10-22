@@ -199,8 +199,8 @@ namespace Freefall.Graphics
             var cs = _cs!;
             var device = Engine.Device;
 
-            list.SetComputeRootSignature(device.GlobalRootSignature);
             list.SetDescriptorHeaps(1, new[] { device.SrvHeap });
+            list.SetComputeRootSignature(device.GlobalRootSignature);
 
             PixMarker.Begin(list, "Exposure histogram");
             _histogram!.Transition(list, ResourceStates.UnorderedAccess);
@@ -235,8 +235,8 @@ namespace Freefall.Graphics
             var cs = _meterCs!;
             var device = Engine.Device;
 
-            list.SetComputeRootSignature(device.GlobalRootSignature);
             list.SetDescriptorHeaps(1, new[] { device.SrvHeap });
+            list.SetComputeRootSignature(device.GlobalRootSignature);
             bindSceneConstants(list);
 
             PixMarker.Begin(list, "Exposure meter");

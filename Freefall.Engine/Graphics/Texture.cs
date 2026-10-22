@@ -110,6 +110,7 @@ namespace Freefall.Graphics
              var arr = new Texture();
              arr._resource = device.NativeDevice.CreateCommittedResource(
                  new HeapProperties(HeapType.Default), HeapFlags.None, desc, ResourceStates.CopyDest, null);
+             device.NameForDebug(arr._resource);
                  
              arr.BindlessIndex = device.AllocateBindlessIndex();
              arr.SrvCpuHandle = device.GetCpuHandle(arr.BindlessIndex);
@@ -187,6 +188,7 @@ namespace Freefall.Graphics
              var arr = new Texture();
              arr._resource = device.NativeDevice.CreateCommittedResource(
                  new HeapProperties(HeapType.Default), HeapFlags.None, arrayDesc, ResourceStates.UnorderedAccess, null);
+             device.NameForDebug(arr._resource);
 
              arr.BindlessIndex = device.AllocateBindlessIndex();
              arr.SrvCpuHandle = device.GetCpuHandle(arr.BindlessIndex);
@@ -233,8 +235,8 @@ void CSCopySlice(uint3 id : SV_DispatchThreadID) {
              using (var cmd = device.NativeDevice.CreateCommandAllocator(CommandListType.Direct))
              using (var list = device.NativeDevice.CreateCommandList<ID3D12GraphicsCommandList>(0, CommandListType.Direct, cmd))
              {
-                 list.SetComputeRootSignature(device.GlobalRootSignature);
                  list.SetDescriptorHeaps(1, new[] { device.SrvHeap });
+                 list.SetComputeRootSignature(device.GlobalRootSignature);
                  list.SetPipelineState(pso);
 
                  for (int i = 0; i < textures.Count; i++)
@@ -404,6 +406,7 @@ void CSCopySlice(uint3 id : SV_DispatchThreadID) {
                 HeapFlags.None,
                 desc,
                 ResourceStates.Common); // Implicit promotion to CopyDest will happen on CopyQueue
+            device.NameForDebug(texture._resource);
 
             // 2. Create SRV immediately (so we can bind it even if black/empty)
             texture.BindlessIndex = device.AllocateBindlessIndex();

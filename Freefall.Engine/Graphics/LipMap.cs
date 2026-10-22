@@ -31,6 +31,7 @@ namespace Freefall.Graphics
         public const float Texel = 1.0f;
 
         private ID3D12Resource? _raw, _map, _surface;
+        private bool _readable;     // false: the three still in Common as created; true: in AllShaderResource between dispatches
         private uint _rawUav, _rawSrv, _mapUav, _mapSrv, _surfaceUav, _surfaceSrv;
         private ComputeShader? _shader;
         private int _kBuild, _kSmooth;
@@ -56,6 +57,7 @@ namespace Freefall.Graphics
             _raw = CreateTexture(device, out _rawUav, out _rawSrv);
             _map = CreateTexture(device, out _mapUav, out _mapSrv);
             _surface = CreateTexture(device, out _surfaceUav, out _surfaceSrv);
+            _readable = false;
             _shader = new ComputeShader("ocean_lip_map.hlsl");
             _kBuild = _shader.FindKernel("CSLipMapBuild");
             _kSmooth = _shader.FindKernel("CSLipMapSmooth");
@@ -92,8 +94,8 @@ namespace Freefall.Graphics
         {
             if (_shader == null || _raw == null || _map == null || _surface == null || oceanDataSrv == 0) return;
             PixMarker.Begin(cmd, "Lip map");
-            cmd.SetComputeRootSignature(device.GlobalRootSignature);
             cmd.SetDescriptorHeaps(1, _heaps!);
+            cmd.SetComputeRootSignature(device.GlobalRootSignature);
             uint groups = (uint)((Size + 7) / 8);
 
             _shader.SetPushConstant("OceanData", oceanDataSrv);
@@ -101,11 +103,20 @@ namespace Freefall.Graphics
             _shader.SetPushConstant("RawSRV", _rawSrv);
             _shader.SetPushConstant("MapUAV", _mapUav);
             _shader.SetPushConstant("SurfaceUAV", _surfaceUav);
+
+            // UnorderedAccess while the kernels write, AllShaderResource for what reads them (the smooth pass reads
+            // the raw map through its SRV, the water the map and the surface). A texture is never promoted to
+            // UnorderedAccess implicitly.
+            var from = _readable ? ResourceStates.AllShaderResource : ResourceStates.Common;
+            cmd.ResourceBarrierTransition(_raw, from, ResourceStates.UnorderedAccess);
+            cmd.ResourceBarrierTransition(_surface, from, ResourceStates.UnorderedAccess);
+            cmd.ResourceBarrierTransition(_map, from, ResourceStates.UnorderedAccess);
             _shader.Dispatch(_kBuild, cmd, groups, groups);
-            cmd.ResourceBarrierUnorderedAccessView(_raw);
-            cmd.ResourceBarrierUnorderedAccessView(_surface);
+            cmd.ResourceBarrierTransition(_raw, ResourceStates.UnorderedAccess, ResourceStates.AllShaderResource);
+            cmd.ResourceBarrierTransition(_surface, ResourceStates.UnorderedAccess, ResourceStates.AllShaderResource);
             _shader.Dispatch(_kSmooth, cmd, groups, groups);
-            cmd.ResourceBarrierUnorderedAccessView(_map);
+            cmd.ResourceBarrierTransition(_map, ResourceStates.UnorderedAccess, ResourceStates.AllShaderResource);
+            _readable = true;
             PixMarker.End(cmd);
         }
 

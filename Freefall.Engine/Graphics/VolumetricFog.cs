@@ -110,8 +110,8 @@ namespace Freefall.Graphics
                 && _prevExposure > 0f;
 
             PixMarker.Begin(list, "Volumetric fog");
-            list.SetComputeRootSignature(device.GlobalRootSignature);
             list.SetDescriptorHeaps(1, new[] { device.SrvHeap });
+            list.SetComputeRootSignature(device.GlobalRootSignature);
             bindSceneConstants(list);
 
             // Halton (2, 3, 5) over 16 frames: where in each froxel this frame's sample lies

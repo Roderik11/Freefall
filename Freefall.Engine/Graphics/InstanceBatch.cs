@@ -1070,9 +1070,9 @@ namespace Freefall.Graphics
         private static void BeginStageChain(ID3D12GraphicsCommandList list)
         {
             var device = Engine.Device;
-            list.SetComputeRootSignature(device.GlobalRootSignature);
             _stageSrvHeaps ??= new[] { device.SrvHeap };
             list.SetDescriptorHeaps(1, _stageSrvHeaps);
+            list.SetComputeRootSignature(device.GlobalRootSignature);
         }
 
         /// <summary>

@@ -27,7 +27,8 @@ namespace Freefall.Player
     /// player-prev.log) and the shader cache.
     /// Development switches: <c>--game &lt;folder&gt;</c>, <c>--windowed [WxH]</c>, <c>--screenshot &lt;seconds&gt; &lt;file.png&gt;</c>
     /// (the window that long after the first scene is ready; a negative number: that long after the window opened, while it
-    /// may still load), <c>--quit &lt;seconds&gt;</c> (after the first scene is ready).
+    /// may still load), <c>--quit &lt;seconds&gt;</c> (after the first scene is ready), <c>--scene &lt;name&gt;</c> (start in that
+    /// scene of the build's instead of its first).
     /// </summary>
     static class Program
     {
@@ -46,6 +47,7 @@ namespace Freefall.Player
         static System.Drawing.Size windowSize = new(1600, 900);
         static double screenshotAfter = double.NaN, quitAfter = -1;
         static string? screenshotFile;
+        static string? startSceneName;  // --scene: start in this scene of the game's instead of its first (tests)
         static readonly System.Diagnostics.Stopwatch sinceStart = new();    // from the start scene being ready
         static readonly System.Diagnostics.Stopwatch sinceWindow = new();   // from the first frame
 
@@ -196,7 +198,14 @@ namespace Freefall.Player
             // black picture (a loading screen of the game's, once one of its scenes has put it up), the half-made world
             // is not drawn. --screenshot and --quit count from the moment the start scene is ready.
             SceneManager.HideWorldWhileLoading = true;
-            var start = Engine.Assets.LoadByGuid<SceneAsset>(manifest.Scenes[0])
+            SceneAsset? start = null;
+            if (startSceneName != null)
+            {
+                start = manifest.Scenes.Select(guid => Engine.Assets.LoadByGuid<SceneAsset>(guid))
+                    .FirstOrDefault(scene => string.Equals(scene?.Name, startSceneName, StringComparison.OrdinalIgnoreCase));
+                if (start == null) Log($"[Player] --scene {startSceneName}: the game has no such scene, starting with its first");
+            }
+            start ??= Engine.Assets.LoadByGuid<SceneAsset>(manifest.Scenes[0])
                 ?? throw new InvalidDataException($"The start scene {manifest.Scenes[0]} is not in the packs");
             var load = SceneManager.LoadAsync(start);
             load.Completed += done =>
@@ -343,6 +352,9 @@ namespace Freefall.Player
                         break;
                     case "--quit" when i + 1 < args.Length:
                         quitAfter = double.Parse(args[++i], CultureInfo.InvariantCulture);
+                        break;
+                    case "--scene" when i + 1 < args.Length:
+                        startSceneName = args[++i];
                         break;
                 }
             }

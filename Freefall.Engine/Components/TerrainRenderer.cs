@@ -199,6 +199,7 @@ namespace Freefall.Components
 
         // ───── Baked Terrain Normals (one-time) ──────────────────────────
         private ID3D12Resource? _bakedNormalTex;        // R16G16_SNORM
+        private bool _bakedNormalReadable;              // false: still in Common as created; true: in AllShaderResource
         private uint _bakedNormalUAV;
         private uint _bakedNormalSRV;
         private bool _bakedNormalsDirty = true;
@@ -1173,8 +1174,8 @@ namespace Freefall.Components
             UploadBuffer(_terrainParamBuffers[frameIndex], terrainParams);
 
             // Bind root sig + descriptor heaps + all cbuffers once (before any compute operations)
-            commandList.SetComputeRootSignature(device.GlobalRootSignature);
             commandList.SetDescriptorHeaps(1, new[] { device.SrvHeap });
+            commandList.SetComputeRootSignature(device.GlobalRootSignature);
             commandList.SetComputeRootConstantBufferView(1, _frustumPlaneBuffers[frameIndex].GPUVirtualAddress);
             commandList.SetComputeRootConstantBufferView(2, _hizParamBuffers[frameIndex].GPUVirtualAddress);
             commandList.SetComputeRootConstantBufferView(3, _terrainParamBuffers[frameIndex].GPUVirtualAddress);
@@ -1211,8 +1212,8 @@ namespace Freefall.Components
                 _heightRangePyramidBuilt = true;
 
                 // Re-bind root sig + cbuffers (mip builder may have changed PSO state)
-                commandList.SetComputeRootSignature(device.GlobalRootSignature);
                 commandList.SetDescriptorHeaps(1, new[] { device.SrvHeap });
+                commandList.SetComputeRootSignature(device.GlobalRootSignature);
                 commandList.SetComputeRootConstantBufferView(1, _frustumPlaneBuffers[frameIndex].GPUVirtualAddress);
                 commandList.SetComputeRootConstantBufferView(2, _hizParamBuffers[frameIndex].GPUVirtualAddress);
                 commandList.SetComputeRootConstantBufferView(3, _terrainParamBuffers[frameIndex].GPUVirtualAddress);
@@ -1395,8 +1396,8 @@ namespace Freefall.Components
             UploadBuffer(_shadowTerrainParamBuffers[frameIndex], shadowTerrainParams);
 
             // Clear shadow counter
-            commandList.SetComputeRootSignature(Engine.Device.GlobalRootSignature);
             commandList.SetDescriptorHeaps(1, new[] { Engine.Device.SrvHeap });
+            commandList.SetComputeRootSignature(Engine.Device.GlobalRootSignature);
             _shadowCounterBuffers[frameIndex].ClearUAV(commandList, new Vortice.Mathematics.Int4(0, 0, 0, 0));
 
             // Bind cbuffers (b0, b1 already uploaded by main pass; b2 updated above)
@@ -2353,15 +2354,11 @@ namespace Freefall.Components
                 device.NativeDevice.CreateShaderResourceView(_decoControlTex, srvDesc, device.GetCpuHandle(_decoControlSRV));
             }
 
-            // Transition control texture back to UAV for writing
-            // Fresh textures start in Common (implicit promotion to UAV).
-            // Re-dispatches need explicit SRV → UAV transition.
-            if (!freshTexture)
-            {
-                cmd.ResourceBarrier(new ResourceBarrier(
-                    new ResourceTransitionBarrier(_decoControlTex,
-                        ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess)));
-            }
+            // Transition the control texture to UAV for writing: from Common when fresh (a texture is never promoted
+            // to UnorderedAccess implicitly), from the SRV state on a re-dispatch
+            cmd.ResourceBarrier(new ResourceBarrier(
+                new ResourceTransitionBarrier(_decoControlTex,
+                    freshTexture ? ResourceStates.Common : ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess)));
 
             // Heightmap for the stamps' height/slope filters
             var heightmap = Terrain.Heightmap;
@@ -2432,8 +2429,8 @@ namespace Freefall.Components
 
             // Dispatch via ComputeShader
             _albedoBakeCS ??= new ComputeShader("terrain_albedo_bake.hlsl");
-            cmd.SetComputeRootSignature(Engine.Device.GlobalRootSignature);
             cmd.SetDescriptorHeaps(1, new[] { Engine.Device.SrvHeap });
+            cmd.SetComputeRootSignature(Engine.Device.GlobalRootSignature);
             _albedoBakeCS.SetTexture("ControlMaps", ControlMapsArray);    // Texture → BindlessIndex
             _albedoBakeCS.SetTexture("DiffuseMaps", DiffuseMapsArray);    // Texture → BindlessIndex
             _albedoBakeCS.SetPushConstant("OutputUAV", _bakedAlbedoUAV); // uint (raw UAV index)
@@ -2542,6 +2539,7 @@ namespace Freefall.Components
                 _bakedNormalTex = device.CreateTexture2D(
                     Format.R16G16_SNorm, hmW, hmH, 1, 1,
                     ResourceFlags.AllowUnorderedAccess, ResourceStates.Common);
+                _bakedNormalReadable = false;
 
                 _bakedNormalUAV = device.AllocateBindlessIndex();
                 var uavDesc = new UnorderedAccessViewDescription
@@ -2571,8 +2569,8 @@ namespace Freefall.Components
             // Ensure compute shader is initialized (independent of deco buffers)
             _grassCS ??= new ComputeShader("grass_compute.hlsl");
             if (_kBakeNormals == 0) _kBakeNormals = _grassCS.FindKernel("CS_BakeTerrainNormals");
-            cmd.SetComputeRootSignature(device.GlobalRootSignature);
             cmd.SetDescriptorHeaps(1, new[] { device.SrvHeap });
+            cmd.SetComputeRootSignature(device.GlobalRootSignature);
 
             _grassCS!.SetTexture(_kBakeNormals, "Heightmap", Terrain.Heightmap);
             _grassCS.SetPushConstant(_kBakeNormals, "BakedNormalUAV", _bakedNormalUAV);
@@ -2582,9 +2580,13 @@ namespace Freefall.Components
 
             uint groupsX = (uint)((hmW + 7) / 8);
             uint groupsY = (uint)((hmH + 7) / 8);
+            // A texture is never promoted to UnorderedAccess implicitly; after the bake the decoration compute and
+            // the terrain's pixel shaders read it
+            cmd.ResourceBarrierTransition(_bakedNormalTex,
+                _bakedNormalReadable ? ResourceStates.AllShaderResource : ResourceStates.Common, ResourceStates.UnorderedAccess);
             _grassCS.Dispatch(_kBakeNormals, cmd, groupsX, groupsY);
-
-            cmd.ResourceBarrierUnorderedAccessView(_bakedNormalTex);
+            cmd.ResourceBarrierTransition(_bakedNormalTex, ResourceStates.UnorderedAccess, ResourceStates.AllShaderResource);
+            _bakedNormalReadable = true;
             _bakedNormalsDirty = false;
             Debug.Log($"[TerrainRenderer] Terrain normals baked: {hmW}x{hmH}");
         }
@@ -2635,8 +2637,8 @@ namespace Freefall.Components
                 _decoDispatchArgsBuffer!.Transition(commandList, ResourceStates.UnorderedAccess);
 
                 // Clear instance counter
-                commandList.SetComputeRootSignature(device.GlobalRootSignature);
                 commandList.SetDescriptorHeaps(1, new[] { device.SrvHeap });
+                commandList.SetComputeRootSignature(device.GlobalRootSignature);
                 _instanceCounterBuffer.ClearUAV(commandList, new Vortice.Mathematics.Int4(0, 0, 0, 0));
                 commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(null)));
 

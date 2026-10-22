@@ -602,8 +602,8 @@ namespace Freefall.Assets
             EnsureTexture(plan.Resolution);
 
             var device = Engine.Device;
-            cmd.SetComputeRootSignature(device.GlobalRootSignature);
             cmd.SetDescriptorHeaps(1, new[] { device.SrvHeap });
+            cmd.SetComputeRootSignature(device.GlobalRootSignature);
 
             uint groups = (uint)((plan.Resolution + 7) / 8);
 
@@ -620,6 +620,12 @@ namespace Freefall.Assets
                 EnsureUpload<StampSplinePointGPU>(ref _heightStampSplineBuffer, ref _heightStampSplineCapacity, plan.SplinePoints.Count, 128);
                 Upload(_heightStampSplineBuffer, plan.SplinePoints);
             }
+
+            // The heightmap rests in Common between bakes, and a texture is never promoted to UnorderedAccess
+            // implicitly (only to the read and copy states)
+            cmd.ResourceBarrier(new ResourceBarrier(
+                new ResourceTransitionBarrier(_heightTexture,
+                    ResourceStates.Common, ResourceStates.UnorderedAccess)));
 
             _cs.SetPushConstant(_kernelClear, "Output", _heightUAV);
             _cs.Dispatch(_kernelClear, cmd, groups, groups);
@@ -1389,8 +1395,8 @@ namespace Freefall.Assets
                 ref _splatSplineBuffer, ref _splatSplineCapacity);
 
             var device = Engine.Device;
-            cmd.SetComputeRootSignature(device.GlobalRootSignature);
             cmd.SetDescriptorHeaps(1, new[] { device.SrvHeap });
+            cmd.SetComputeRootSignature(device.GlobalRootSignature);
 
             var k = _kernelSplatBake;
             _splatCS.SetBuffer(k, "StampBuf", _splatStampBuffer);
@@ -1492,8 +1498,8 @@ namespace Freefall.Assets
                 ref _decoSplineBuffer, ref _decoSplineCapacity);
 
             var device = Engine.Device;
-            cmd.SetComputeRootSignature(device.GlobalRootSignature);
             cmd.SetDescriptorHeaps(1, new[] { device.SrvHeap });
+            cmd.SetComputeRootSignature(device.GlobalRootSignature);
 
             var k = _kernelDecoControl;
             _decoCS.SetBuffer(k, "StampBuf", _decoStampBuffer);

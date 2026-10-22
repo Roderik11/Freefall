@@ -129,8 +129,8 @@ namespace Freefall.Graphics
 
             cmd.ResourceBarrierTransition(depth.Native, ResourceStates.RenderTarget, ResourceStates.NonPixelShaderResource);
 
-            cmd.SetComputeRootSignature(Engine.Device.GlobalRootSignature);
             cmd.SetDescriptorHeaps(1, new[] { Engine.Device.SrvHeap });
+            cmd.SetComputeRootSignature(Engine.Device.GlobalRootSignature);
 
             int width = (int)depth.Native.Description.Width;
             int height = (int)depth.Native.Description.Height;

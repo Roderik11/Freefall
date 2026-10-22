@@ -79,8 +79,8 @@ namespace Freefall.Graphics
 
             // Buffers decay to Common between command lists: the first write below promotes them to UAV
             PixMarker.Begin(list, "Light clusters");
-            list.SetComputeRootSignature(Engine.Device.GlobalRootSignature);
             list.SetDescriptorHeaps(1, new[] { Engine.Device.SrvHeap });
+            list.SetComputeRootSignature(Engine.Device.GlobalRootSignature);
 
             _cs.SetPushConstant("VisibleUAV", visibleUav);
             _cs.SetPushConstant("VisibleCountUAV", visibleCountUav);

@@ -200,8 +200,8 @@ namespace Freefall.Graphics
             _cs.SetPushConstant("DepthTex", depthSrv);
             _cs.SetPushConstant("LampsUAV", lampStatesUav);
 
-            list.SetComputeRootSignature(Engine.Device.GlobalRootSignature);
             list.SetDescriptorHeaps(1, new[] { Engine.Device.SrvHeap });
+            list.SetComputeRootSignature(Engine.Device.GlobalRootSignature);
 
             uint visibleGroups = (uint)(PointLightBuffer.MaxVisible / 64);
             _cs.Dispatch(_kScore, list, visibleGroups);

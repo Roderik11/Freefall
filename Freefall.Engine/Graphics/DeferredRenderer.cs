@@ -480,10 +480,8 @@ namespace Freefall.Graphics
                 bool bloom = BloomPyramid != null && Engine.Settings.EnableBloom;
                 if (bloom)
                 {
-                    // Depth to NonPixelShaderResource: the bloom prefilter masks the sky with it, and so does
-                    // the finalize pass when the bloom spreads light
-                    Transition(list, Depth.Native, ResourceStates.PixelShaderResource, ResourceStates.NonPixelShaderResource);
-
+                    // The bloom prefilter masks the sky with the depth (in ShaderRead, readable by compute), and so
+                    // does the finalize pass when the bloom spreads light
                     PixMarker.Begin(list, "Bloom");
                     DispatchBloom(list);
                     PixMarker.End(list);
@@ -493,10 +491,6 @@ namespace Freefall.Graphics
                 PixMarker.Begin(list, "Finalize");
                 Finalize(list);
                 PixMarker.End(list);
-
-                // Restore depth state for next frame
-                if (bloom)
-                    Transition(list, Depth.Native, ResourceStates.NonPixelShaderResource, ResourceStates.PixelShaderResource);
 
                 // 7. SMAA Anti-Aliasing (optional, on LDR output)
                 if (Smaa != null && Engine.Settings.EnableSMAA)
@@ -520,6 +514,13 @@ namespace Freefall.Graphics
             Current = previousCurrent;
         }
         
+        /// <summary>
+        /// The hardware depth's state while it is read: pixel and compute shaders both read it (lighting, GTAO,
+        /// screen-space shadows, fog, bloom, finalize), and a compute read of a texture in PixelShaderResource
+        /// alone is invalid (GPU-based validation flags it; drivers may decompress for one stage only).
+        /// </summary>
+        private const ResourceStates ShaderRead = ResourceStates.PixelShaderResource | ResourceStates.NonPixelShaderResource;
+
         private void Transition(ID3D12GraphicsCommandList list, ID3D12Resource res, ResourceStates before, ResourceStates after)
         {
             if (before == after) return;
@@ -576,15 +577,16 @@ namespace Freefall.Graphics
 
              PixMarker.Begin(list, "GBuffer");
              // First frame: textures start in Common state; subsequent frames: PixelShaderResource
-             var fromState = _isFirstFrame ? ResourceStates.Common : ResourceStates.PixelShaderResource;
-             var depthFromState = _isFirstFrame ? ResourceStates.Common : ResourceStates.PixelShaderResource;
+             var fromState = _isFirstFrame ? ResourceStates.Common : ShaderRead;
+             var depthFromState = _isFirstFrame ? ResourceStates.Common : ShaderRead;
              
              Transition(list, Albedo.Native, fromState, ResourceStates.RenderTarget);
              Transition(list, Normals.Native, fromState, ResourceStates.RenderTarget);
              Transition(list, Data.Native, fromState, ResourceStates.RenderTarget);
              Transition(list, DepthGBuffer.Native, fromState, ResourceStates.RenderTarget);
              Transition(list, EntityIdBuffer.Native, fromState, ResourceStates.RenderTarget);
-             Transition(list, HeightBuffer.Native, fromState, ResourceStates.RenderTarget);
+             // The height buffer ends its frame in NonPixelShaderResource (only the displacement compute reads it)
+             Transition(list, HeightBuffer.Native, _isFirstFrame ? ResourceStates.Common : ResourceStates.NonPixelShaderResource, ResourceStates.RenderTarget);
              Transition(list, Depth.Native, depthFromState, ResourceStates.DepthWrite);
 
              // Run the RenderGroup: IDraw components (ScriptDrawSystem) and draw systems enqueue their commands.
@@ -783,9 +785,9 @@ namespace Freefall.Graphics
              }
 
              // End GBuffer
-             Transition(list, Albedo.Native, ResourceStates.RenderTarget, ResourceStates.PixelShaderResource);
-             Transition(list, Normals.Native, ResourceStates.RenderTarget, ResourceStates.PixelShaderResource);
-             Transition(list, Data.Native, ResourceStates.RenderTarget, ResourceStates.PixelShaderResource);
+             Transition(list, Albedo.Native, ResourceStates.RenderTarget, ShaderRead);
+             Transition(list, Normals.Native, ResourceStates.RenderTarget, ShaderRead);
+             Transition(list, Data.Native, ResourceStates.RenderTarget, ShaderRead);
 
              // Entity ID readback: promote pending copy from previous frame (GPU has finished it by now)
              if (_pickCopyPending)
@@ -871,10 +873,10 @@ namespace Freefall.Graphics
              }
 
              // Transition GBuffer depth to PixelShaderResource for light pass sampling
-             Transition(list, DepthGBuffer.Native, ResourceStates.NonPixelShaderResource, ResourceStates.PixelShaderResource);
+             Transition(list, DepthGBuffer.Native, ResourceStates.NonPixelShaderResource, ShaderRead);
 
-             // Hardware depth to PixelShaderResource for light pass
-             Transition(list, Depth.Native, ResourceStates.DepthWrite, ResourceStates.PixelShaderResource);
+             // Hardware depth readable for the light pass and the compute passes after it
+             Transition(list, Depth.Native, ResourceStates.DepthWrite, ShaderRead);
              
              PixMarker.End(list); // GBuffer
         }
@@ -893,7 +895,7 @@ namespace Freefall.Graphics
              }
 
              // NOW transition LightBuffer to UAV for directional light (after RC has read it as SRV)
-             var fromState = _isFirstFrame ? ResourceStates.Common : ResourceStates.PixelShaderResource;
+             var fromState = _isFirstFrame ? ResourceStates.Common : ShaderRead;
              Transition(list, LightBuffer.Native, fromState, ResourceStates.UnorderedAccess);
 
              // How much sky each opaque pixel sees past the terrain and the meshes, for the directional light below
@@ -909,8 +911,8 @@ namespace Freefall.Graphics
                  _skyVisCS.SetPushConstant("OutputUAV", SkyVisibilityTex.UavIndex);
                  _skyVisCS.SetPushConstant("ScreenWidth", (uint)size.Width);
                  _skyVisCS.SetPushConstant("ScreenHeight", (uint)size.Height);
-                 list.SetComputeRootSignature(Engine.Device.GlobalRootSignature);
                  list.SetDescriptorHeaps(1, new[] { Engine.Device.SrvHeap });
+                 list.SetComputeRootSignature(Engine.Device.GlobalRootSignature);
                  BindSceneConstantsForCompute(list);
                  _skyVisCS.Dispatch(_kSkyVis, list, ((uint)size.Width + 7) / 8, ((uint)size.Height + 7) / 8);
                  Transition(list, SkyVisibilityTex.Native, ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource);
@@ -943,7 +945,7 @@ namespace Freefall.Graphics
                  list.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(LightBuffer.Native)));
              }
              
-             Transition(list, LightBuffer.Native, ResourceStates.UnorderedAccess, ResourceStates.PixelShaderResource);
+             Transition(list, LightBuffer.Native, ResourceStates.UnorderedAccess, ShaderRead);
              PixMarker.End(list); // Lighting
         }
 
@@ -971,8 +973,8 @@ namespace Freefall.Graphics
              _lightCullCS.SetPushConstant("VisibleCountUAV", _visibleLightCount!.UavIndex);
              _lightCullCS.SetPushConstant("HistogramUAV", _lightImportance!.UavIndex);
 
-             list.SetComputeRootSignature(Engine.Device.GlobalRootSignature);
              list.SetDescriptorHeaps(1, new[] { Engine.Device.SrvHeap });
+             list.SetComputeRootSignature(Engine.Device.GlobalRootSignature);
              // Lamps (OnlyWhenDark) as lit as the daylight where each hangs let them, judged last frame (2d)
              _lightCullCS.SetPushConstant("LampsUAV", registry.LampStatesUav(list));
              _visibleLightCount.ClearUAV(list, new Vortice.Mathematics.Int4(0, 0, 0, 0));
@@ -1097,8 +1099,8 @@ namespace Freefall.Graphics
              }
 
              // Bind root signature, descriptor heap, and SceneConstants cbuffer (b0)
-             list.SetComputeRootSignature(Engine.Device.GlobalRootSignature);
              list.SetDescriptorHeaps(1, new[] { Engine.Device.SrvHeap });
+             list.SetComputeRootSignature(Engine.Device.GlobalRootSignature);
 
              // Bind SceneConstants (b0) for CameraInverse + CameraRelativeVP
              foreach (var cb in matDirectionalLight.ConstantBuffers)
@@ -1143,8 +1145,8 @@ namespace Freefall.Graphics
             var fromState = _isFirstFrame ? ResourceStates.Common : ResourceStates.NonPixelShaderResource;
             Transition(list, Composite.Native, fromState, ResourceStates.UnorderedAccess);
             
-            list.SetComputeRootSignature(Engine.Device.GlobalRootSignature);
             list.SetDescriptorHeaps(1, new[] { Engine.Device.SrvHeap });
+            list.SetComputeRootSignature(Engine.Device.GlobalRootSignature);
             
             // Push constants via ComputeShader reflection
             _compositionCS.SetPushConstant("AlbedoTex", Albedo.BindlessIndex);
@@ -1187,8 +1189,8 @@ namespace Freefall.Graphics
             var bloom = BloomPyramid!;
             var settings = Engine.Settings;
 
-            list.SetComputeRootSignature(Engine.Device.GlobalRootSignature);
             list.SetDescriptorHeaps(1, new[] { Engine.Device.SrvHeap });
+            list.SetComputeRootSignature(Engine.Device.GlobalRootSignature);
 
             // Transition entire bloom texture to UAV for writing.
             // All mips are in the same state: Common (first frame) or NonPixelShaderResource (subsequent).
@@ -1281,8 +1283,8 @@ namespace Freefall.Graphics
         /// </summary>
         private void Finalize(ID3D12GraphicsCommandList list)
         {
-            list.SetComputeRootSignature(Engine.Device.GlobalRootSignature);
             list.SetDescriptorHeaps(1, new[] { Engine.Device.SrvHeap });
+            list.SetComputeRootSignature(Engine.Device.GlobalRootSignature);
 
             // Transition LdrOutput to UAV for writing
             var ldrFrom = _isFirstFrame ? ResourceStates.Common : ResourceStates.PixelShaderResource;
@@ -1337,9 +1339,9 @@ namespace Freefall.Graphics
              _compositeSnapshotFirstFrame = false;
 
 
-             // Depth is in PixelShaderResource — forward objects can sample it via bindless SRV.
+             // Depth is in ShaderRead — forward objects can sample it via bindless SRV.
              // Transition depth back to DepthWrite so forward objects can depth-test.
-             Transition(list, Depth.Native, ResourceStates.PixelShaderResource, ResourceStates.DepthWrite);
+             Transition(list, Depth.Native, ShaderRead, ResourceStates.DepthWrite);
 
              // Bind render targets for forward pass
              list.OMSetRenderTargets(new[] { Composite.RtvHandle, EntityIdBuffer.RtvHandle }, Depth.DsvHandle);
@@ -1370,23 +1372,23 @@ namespace Freefall.Graphics
                       new TextureCopyLocation(_entityIdReadback.Native, new PlacedSubresourceFootPrint { Offset = 0, Footprint = new SubresourceFootPrint(Format.R32_UInt, 1, 1, 1, 256) }),
                       0, 0, 0,
                       new TextureCopyLocation(EntityIdBuffer.Native, 0), pickBox);
-                  Transition(list, EntityIdBuffer.Native, ResourceStates.CopySource, ResourceStates.PixelShaderResource);
+                  Transition(list, EntityIdBuffer.Native, ResourceStates.CopySource, ShaderRead);
 
                   // Depth (PixelShaderResource -> CopySource -> PixelShaderResource)
-                  Transition(list, DepthGBuffer.Native, ResourceStates.PixelShaderResource, ResourceStates.CopySource);
+                  Transition(list, DepthGBuffer.Native, ShaderRead, ResourceStates.CopySource);
                   list.CopyTextureRegion(
                       new TextureCopyLocation(_depthReadback!.Native, new PlacedSubresourceFootPrint { Offset = 0, Footprint = new SubresourceFootPrint(Format.R32_Float, 1, 1, 1, 256) }),
                       0, 0, 0,
                       new TextureCopyLocation(DepthGBuffer.Native, 0), pickBox);
-                  Transition(list, DepthGBuffer.Native, ResourceStates.CopySource, ResourceStates.PixelShaderResource);
+                  Transition(list, DepthGBuffer.Native, ResourceStates.CopySource, ShaderRead);
 
                   // Normal (PixelShaderResource -> CopySource -> PixelShaderResource)
-                  Transition(list, Normals.Native, ResourceStates.PixelShaderResource, ResourceStates.CopySource);
+                  Transition(list, Normals.Native, ShaderRead, ResourceStates.CopySource);
                   list.CopyTextureRegion(
                       new TextureCopyLocation(_normalReadback!.Native, new PlacedSubresourceFootPrint { Offset = 0, Footprint = new SubresourceFootPrint(Format.R16G16B16A16_SNorm, 1, 1, 1, 256) }),
                       0, 0, 0,
                       new TextureCopyLocation(Normals.Native, 0), pickBox);
-                  Transition(list, Normals.Native, ResourceStates.CopySource, ResourceStates.PixelShaderResource);
+                  Transition(list, Normals.Native, ResourceStates.CopySource, ShaderRead);
 
                   _readbackPixelX = _pickRequestX;
                   _readbackPixelY = _pickRequestY;
@@ -1396,14 +1398,14 @@ namespace Freefall.Graphics
               }
               else
               {
-                  Transition(list, EntityIdBuffer.Native, ResourceStates.RenderTarget, ResourceStates.PixelShaderResource);
+                  Transition(list, EntityIdBuffer.Native, ResourceStates.RenderTarget, ShaderRead);
               }
 
 
              // Transition Composite to NonPixelShaderResource for compute reads (bloom + finalize)
              Transition(list, Composite.Native, ResourceStates.RenderTarget, ResourceStates.NonPixelShaderResource);
-             // Depth for PostProcess reads
-             Transition(list, Depth.Native, ResourceStates.DepthWrite, ResourceStates.PixelShaderResource);
+             // Depth for PostProcess reads (and the bloom's and finalize's compute)
+             Transition(list, Depth.Native, ResourceStates.DepthWrite, ShaderRead);
 
              // PostProcess pass — only do expensive snapshot copy + transitions if commands are queued
              if (CommandBuffer.HasPendingCommands(RenderPass.PostProcess))

@@ -110,8 +110,8 @@ namespace Freefall.Graphics
             var dispatches = BuildDispatchList(lp, viewportSize, minBounds, maxBounds);
 
             // Set up compute
-            commandList.SetComputeRootSignature(Engine.Device.GlobalRootSignature);
             commandList.SetDescriptorHeaps(1, new[] { Engine.Device.SrvHeap });
+            commandList.SetComputeRootSignature(Engine.Device.GlobalRootSignature);
 
             _shader.SetPushConstant("DepthTex", depthSrvIndex);
             _shader.SetPushConstant("OutputUAV", _output!.UavIndex);

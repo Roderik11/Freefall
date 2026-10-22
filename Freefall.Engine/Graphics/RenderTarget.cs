@@ -96,6 +96,7 @@ namespace Freefall.Graphics
                 depthDesc,
                 ResourceStates.DepthWrite,
                 new ClearValue(Format.D32_Float, 0.0f, 0));
+            _device.NameForDebug(_depthBuffer);
 
             var dsvDesc = new DepthStencilViewDescription
             {

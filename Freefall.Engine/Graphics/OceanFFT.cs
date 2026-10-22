@@ -67,6 +67,11 @@ namespace Freefall.Graphics
         private bool _initialized;
         private bool _spectrumInitialized;
 
+        // Texture states (a texture is never promoted to UnorderedAccess implicitly): the two spectra stay in
+        // UnorderedAccess once out of Common (only the kernels touch them, as UAVs); the displacement and slope maps
+        // are UnorderedAccess while the FFT and the mips write them and AllShaderResource for the water between.
+        private bool _spectraInUav, _mapsReadable;
+
         // Cached descriptor heap array for compute dispatches
         private ID3D12DescriptorHeap[]? _cachedSrvHeapArray;
 
@@ -212,6 +217,7 @@ namespace Freefall.Graphics
         private void CreateTextures()
         {
             int spectrumSlices = _numBands * 2;
+            _spectraInUav = _mapsReadable = false;
 
             // Initial spectrum: RGBA16F, N×N, numBands slices (packed H0+H0conj)
             _initialSpectrumTex = _device.CreateTexture2D(
@@ -401,9 +407,16 @@ namespace Freefall.Graphics
 
             uint groups = (uint)((N + 7) / 8);
 
-            cmd.SetComputeRootSignature(_device.GlobalRootSignature);
             _cachedSrvHeapArray ??= new[] { _device.SrvHeap };
             cmd.SetDescriptorHeaps(1, _cachedSrvHeapArray);
+            cmd.SetComputeRootSignature(_device.GlobalRootSignature);
+
+            if (!_spectraInUav)
+            {
+                cmd.ResourceBarrierTransition(_initialSpectrumTex!, ResourceStates.Common, ResourceStates.UnorderedAccess);
+                cmd.ResourceBarrierTransition(_spectrumTex!, ResourceStates.Common, ResourceStates.UnorderedAccess);
+                _spectraInUav = true;
+            }
 
             // CSInitSpectrum
             _spectrumShader!.Dispatch(_kInitSpectrum, cmd, groups, groups);
@@ -448,17 +461,17 @@ namespace Freefall.Graphics
             _device.NativeDevice.CreateShaderResourceView(_noiseTex, srvDesc, _device.GetCpuHandle(NoiseSRV));
 
             // Dispatch noise generation via ComputeShader
-            cmd.SetComputeRootSignature(_device.GlobalRootSignature);
             _cachedSrvHeapArray ??= new[] { _device.SrvHeap };
             cmd.SetDescriptorHeaps(1, _cachedSrvHeapArray);
+            cmd.SetComputeRootSignature(_device.GlobalRootSignature);
 
             _noiseShader!.SetPushConstant("Output", _noiseUAV);
             _noiseShader.SetPushConstant("TexSize", (uint)NoiseSize);
 
             uint groups = (uint)((NoiseSize + 7) / 8);
+            cmd.ResourceBarrierTransition(_noiseTex, ResourceStates.Common, ResourceStates.UnorderedAccess);
             _noiseShader.Dispatch(_kGenerateNoise, cmd, groups, groups);
-
-            cmd.ResourceBarrierUnorderedAccessView(_noiseTex);
+            cmd.ResourceBarrierTransition(_noiseTex, ResourceStates.UnorderedAccess, ResourceStates.AllShaderResource);
             Debug.Log("OceanFFT", "Noise texture generated");
         }
 
@@ -472,11 +485,15 @@ namespace Freefall.Graphics
             UpdateConstants(frameTime, deltaTime);
             BindSharedPushConstants();
 
-            cmd.SetComputeRootSignature(_device.GlobalRootSignature);
             _cachedSrvHeapArray ??= new[] { _device.SrvHeap };
             cmd.SetDescriptorHeaps(1, _cachedSrvHeapArray);
+            cmd.SetComputeRootSignature(_device.GlobalRootSignature);
 
             uint groups8 = (uint)((N + 7) / 8);
+
+            var mapsFrom = _mapsReadable ? ResourceStates.AllShaderResource : ResourceStates.Common;
+            cmd.ResourceBarrierTransition(_displacementTex!, mapsFrom, ResourceStates.UnorderedAccess);
+            cmd.ResourceBarrierTransition(_slopeTex!, mapsFrom, ResourceStates.UnorderedAccess);
 
             // 1. Evolve spectrum
             _spectrumShader!.Dispatch(_kEvolveSpectrum, cmd, groups8, groups8);
@@ -497,6 +514,11 @@ namespace Freefall.Graphics
 
             // 5. Generate mip chain for displacement and slope textures
             GenerateMips(cmd);
+
+            // The water reads them through their SRVs
+            cmd.ResourceBarrierTransition(_displacementTex!, ResourceStates.UnorderedAccess, ResourceStates.AllShaderResource);
+            cmd.ResourceBarrierTransition(_slopeTex!, ResourceStates.UnorderedAccess, ResourceStates.AllShaderResource);
+            _mapsReadable = true;
         }
 
         private void GenerateMips(ID3D12GraphicsCommandList cmd)

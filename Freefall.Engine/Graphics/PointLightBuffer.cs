@@ -243,8 +243,8 @@ namespace Freefall.Graphics
                 _kLamps = _lampsCS.FindKernel("CSLamps");
             }
 
-            list.SetComputeRootSignature(Engine.Device.GlobalRootSignature);
             list.SetDescriptorHeaps(1, new[] { Engine.Device.SrvHeap });
+            list.SetComputeRootSignature(Engine.Device.GlobalRootSignature);
             EnsureLampStates(list);
 
             var captures = SkyCapture.Current;
