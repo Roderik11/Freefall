@@ -585,13 +585,33 @@ void CSCloudShadowMap(uint3 id : SV_DispatchThreadID)
             s += CloudBrickExit(C, level, xz, h, L) + 0.5;
             continue;
         }
+        // A sample at the next point of the level's step grid along this path (s = 0 at the texel): the steps double from
+        // level to level, so a coarser grid's points are every other point of the finer one's. Through a level's blend
+        // zone the points the coarser grid lacks fade out (weight 1 − blend) and the others take their share (1 + blend),
+        // so at the reach the march is the coarser level's already. The samples sit where they sat whatever level the
+        // camera's distance picks or wherever a leap left s. Stepped on from s at the level's step instead (375-750 m
+        // far out, through clouds with ~150 m edges), a sample hit a cloud or missed it by where the march came from: a
+        // level boundary moved by a 10 m camera step or by the clouds drifting through it, or a brick going empty as they
+        // changed shape, moved the samples of every texel behind it, and the map's τ flipped by tens in blocks (the
+        // beam's edges popped; the clouds' forward light showed the rest as blotches of shade; user, 2026-10-22)
         float step = C.Levels[level].VoxelSize * 0.75;
-        float sm = s + 0.5 * step;
-        float2 xzm = C.CameraCloud + rel0 + L.xz * sm;
-        float hm = C.SlabBottom + L.y * sm + a * sm * sm;
-        tau += CloudErode(C, lut, CloudSample(C, xzm, hm, dist, CloudWrap), xzm, hm, dist) * C.Density * step;
-        s += step;
-        if (tau > 12.0)
+        float g = floor(s / step + 1e-3) + 1.0;
+        float sk = g * step;
+        float2 relK = rel0 + L.xz * sk;
+        float distK = max(abs(relK.x), abs(relK.y));
+        float blendK;
+        uint levelK = CloudLevelAt(C, distK, blendK);
+        bool odd = frac(g * 0.5) > 0.25;
+        float weight = 1.0 + (odd ? -blendK : blendK);
+        if (levelK > level)
+            weight = odd ? 0.0 : 2.0;   // past the reach: the coarser grid's points alone, as the next step takes them
+        else if (levelK < level)
+            weight = 1.0;               // back into a finer level (a path toward the camera): this coarse step's own
+        float2 xzk = C.CameraCloud + relK;
+        float hk = C.SlabBottom + L.y * sk + a * sk * sk;
+        tau += CloudErode(C, lut, CloudSample(C, xzk, hk, distK, CloudWrap), xzk, hk, distK) * C.Density * step * weight;
+        s = sk;
+        if (tau > CLOUD_SHADOW_MARCH_TAU)
             break;
     }
     if (s < sMax)

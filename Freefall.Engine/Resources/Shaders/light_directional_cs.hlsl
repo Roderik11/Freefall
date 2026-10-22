@@ -266,15 +266,15 @@ void CSDirectionalLight(uint3 dispatchThreadId : SV_DispatchThreadID)
     // camera and can miss the hill over a cave, and the sun came through between the cave kit's pieces
     float terrainOpen = TerrainOpen(worldPos.xyz + CamPos, normal);
     shadowFactor *= terrainOpen;
-    // The clouds' beam (sky_common.fx CloudTransmission .x), also past the last cascade (Sampler = linear wrap, s0): the
-    // light that comes through as the sun's direction, with the hard shadows. Of what they diffuse, the share thrown on
-    // forward (CloudForwardShare) still comes from round the sun: below as a soft light from that side of the sky; the
-    // rest reaches the surface as the sky probe's ambient (the clouds' lit bases). The shadows of things near
-    // (localShadow) gate the shadow wrap below.
+    // The clouds' beam (sky_common.fx CloudTransmissionForward .x), also past the last cascade (Sampler = linear wrap,
+    // s0): the light that comes through as the sun's direction, with the hard shadows. Of what they diffuse, the share
+    // thrown on forward (.z) still comes from round the sun: below as a soft light from that side of the sky; the rest
+    // reaches the surface as the sky probe's ambient (the clouds' lit bases). The shadows of things near (localShadow)
+    // gate the shadow wrap below.
     float localShadow = shadowFactor;
-    float2 cloudThrough = CloudTransmission(Sampler, worldPos.xyz, L);
+    float3 cloudThrough = CloudTransmissionForward(Sampler, worldPos.xyz, L);
     float cloudBeam = cloudThrough.x;
-    float cloudForward = CloudForwardShare(cloudThrough);
+    float cloudForward = cloudThrough.z;
     shadowFactor *= cloudBeam;
 
     // Debug visualization modes

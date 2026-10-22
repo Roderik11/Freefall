@@ -24,6 +24,9 @@
 #define CLOUD_COVER_TILE (CLOUD_PERIOD / 5.0)      // 51.2 km: the coverage pattern's tile
 #define CLOUD_SHADOW_TEXELS 1024    // the ground shadow map's texels each way (Clouds.ShadowMapTexels)
 #define CLOUD_SHADOW_MARGIN 1500.0  // metres inside its window's edge where it hands over to the light volume
+#define CLOUD_SHADOW_MARCH_TAU 12.0 // its march's τ past which the light volume gives the rest (clouds_cs.hlsl
+                                    // CSCloudShadowMap): above it τ jumps from texel to texel (sky_common.fx
+                                    // CloudForwardAt)
 
 struct CloudLevel
 {
@@ -284,8 +287,10 @@ float2 CloudWrapDelta(float2 d)
 // map instead, handing over to the light volume over CLOUD_SHADOW_MARGIN at its edge: a low light crosses the slab
 // kilometres away, where the light volume's texels are 0.25-1 km, and its shadows came out as blocks that flipped as its
 // levels followed the camera (the moon's glint on the sea cut by squares; user, 2026-10-20).
-float CloudShadowDepth(CloudParams C, float3 rel, float3 toLight, SamplerState wrap)
+// mapAt: where the map was read (its uv), how far the crossing is (m) and the map's share there (0 = not read).
+float CloudShadowDepthAt(CloudParams C, float3 rel, float3 toLight, SamplerState wrap, out float4 mapAt)
 {
+    mapAt = 0.0;
     if (dot(toLight, C.LightDir) < 0.99)
         return 0.0;
     float h = CloudHeight(rel);
@@ -305,7 +310,9 @@ float CloudShadowDepth(CloudParams C, float3 rel, float3 toLight, SamplerState w
             mapShare = saturate((halfSize - CLOUD_SHADOW_MARGIN - max(abs(fromCentre.x), abs(fromCentre.y)))
                                 / CLOUD_SHADOW_MARGIN);
             Texture2D<float> map = ResourceDescriptorHeap[C.ShadowMap];
-            mapTau = map.SampleLevel(wrap, xzc / (CLOUD_SHADOW_TEXELS * C.ShadowTexel), 0);
+            float2 uv = xzc / (CLOUD_SHADOW_TEXELS * C.ShadowTexel);
+            mapTau = map.SampleLevel(wrap, uv, 0);
+            mapAt = float4(uv, s, mapShare);
             if (mapShare >= 1.0)
                 return mapTau;
         }
@@ -324,6 +331,12 @@ float CloudShadowDepth(CloudParams C, float3 rel, float3 toLight, SamplerState w
     if (blend > 0.0)
         tau = lerp(tau, CloudLightDepthAt(C, level + 1, xz, h, wrap), blend);
     return lerp(tau, mapTau, mapShare);
+}
+
+float CloudShadowDepth(CloudParams C, float3 rel, float3 toLight, SamplerState wrap)
+{
+    float4 mapAt;
+    return CloudShadowDepthAt(C, rel, toLight, wrap, mapAt);
 }
 
 // Optical depth straight up (x) and down (y) from a place (camera-relative), from the sky volume of the level its

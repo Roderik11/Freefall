@@ -427,23 +427,94 @@ float CloudLayerDepth(SamplerState wrapSampler, float3 relPos, float3 toLight)
     return CLOUD_LAYER_TAU * density * smoothstep(0.05, 0.3, toLight.y);
 }
 
-// What the clouds let through from a light to a place (camera-relative), as shares of its illuminance: x the beam, y all
-// of it (CloudThrough). The volumetric clouds' τ is their light volume where the light's path crosses the slab's base
-// (cloud_common.hlsli CloudShadowDepth); for a light the volumes are not built for (a moon by day, the sun once the moon
-// lights the clouds) the means round the camera stand in (CloudDeck), below the base. wrapSampler: linear wrap.
-float2 CloudTransmission(SamplerState wrapSampler, float3 relPos, float3 toLight)
+// Of what a slab of optical depth tau lets through beyond its beam, the share that goes on forward, near the light's
+// direction: through a thin cloud (a cumulus' edge) droplets (g 0.85) throw most of what they scatter straight on; only
+// through a thick one has it spread evenly. e^(−τ/20) of it; the air takes it with the beam (CloudAirLight), surfaces as
+// a soft light from the light's side of the sky (light_directional_cs.hlsl).
+// Gone by CLOUD_SHADOW_MARCH_TAU (from half of it): there the ground shadow map's march stops and its light volume adds
+// the rest, so as the clouds change shape a texel's τ flips between ~12 and 12 + tens; the beam is gone either way, but
+// the forward light drew those flips inside the shade as blotches and stairs of the map's 31 m texels that popped (user,
+// 2026-10-22). Through that much cloud the light has spread anyway.
+float CloudForwardAt(float tau)
 {
-    float tau;
+    return max(CloudThrough(tau) - exp(-tau), 0.0) * exp(-tau / 20.0)
+         * (1.0 - smoothstep(CLOUD_SHADOW_MARCH_TAU * 0.5, CLOUD_SHADOW_MARCH_TAU, tau));
+}
+
+// One bilinear tap of the ground shadow map (clouds_cs.hlsl CSCloudShadowMap) as CloudTransmissionForward's shares, the
+// beam and the forward share from each texel's τ clamped to CLOUD_SHADOW_MARCH_TAU before the filter (both are gone past
+// it), CloudThrough from the τ itself. A texel whose march gets past that τ takes the light volume's rest on top, so as
+// the clouds change shape it flips between ~12 and 12 + tens; filtered as τ, the flip reached across into the texels
+// round it, down into the τ the forward light shows, and drew blotches of 30-60 m that popped (user, 2026-10-22).
+float3 CloudShadowMapTap(Texture2D<float> map, SamplerState wrapSampler, float2 uv)
+{
+    float2 p = uv * CLOUD_SHADOW_TEXELS - 0.5;
+    float2 f = frac(p);
+    float4 g = map.GatherRed(wrapSampler, (floor(p) + 1.0) / CLOUD_SHADOW_TEXELS);    // x (0,1) y (1,1) z (1,0) w (0,0)
+    float4 c = min(g, CLOUD_SHADOW_MARCH_TAU);
+    float tauClamped = lerp(lerp(c.w, c.z, f.x), lerp(c.x, c.y, f.x), f.y);
+    float tau = lerp(lerp(g.w, g.z, f.x), lerp(g.x, g.y, f.x), f.y);
+    return float3(exp(-tauClamped), CloudThrough(tau), CloudForwardAt(tauClamped));
+}
+
+// The ground shadow map seen through the light's disc (CloudShadowMapTap's shares): the disc's edge crosses the slab
+// radiusTexels off the middle (the penumbra: 125 m, four texels, for a cloud 27 km toward a sun 4° up), so the means over
+// it from 13 taps of a Vogel spiral. One tap of τ, which runs 0 → 30 within a few of the map's 31 m texels at a cloud's
+// edge, drew the edges as stairs of texels, and they rippled as the clouds moved (user, 2026-10-22).
+#define CLOUD_LIGHT_DISC 0.00465    // rad: the sun's (and the moon's) angular radius
+float3 CloudShadowMapDisc(CloudParams C, SamplerState wrapSampler, float2 uv, float radiusTexels)
+{
+    Texture2D<float> map = ResourceDescriptorHeap[C.ShadowMap];
+    float3 t = CloudShadowMapTap(map, wrapSampler, uv);
+    if (radiusTexels < 0.35)
+        return t;
+    float r = radiusTexels / CLOUD_SHADOW_TEXELS;
+    [unroll] for (int i = 0; i < 12; i++)
+    {
+        float a = i * 2.3999632;            // the golden angle
+        t += CloudShadowMapTap(map, wrapSampler, uv + sqrt((i + 0.5) / 12.0) * r * float2(cos(a), sin(a)));
+    }
+    return t / 13.0;
+}
+
+// Of what the clouds let through beyond their beam (t: CloudTransmission), the share that goes on forward
+// (CloudForwardAt), τ from the share passing through (CloudThrough = 1 / (1 + CLOUD_DIFFUSION τ); the beam underflows
+// past τ ~14)
+float CloudForwardShare(float2 t)
+{
+    return CloudForwardAt((1.0 / max(t.y, 1e-4) - 1.0) / CLOUD_DIFFUSION);
+}
+
+// What the clouds let through from a light to a place (camera-relative), as shares of its illuminance: x the beam, y all
+// of it (CloudThrough), z of that the share thrown on forward (CloudForwardAt). The volumetric clouds' τ is their light
+// volume where the light's path crosses the slab's base (cloud_common.hlsli CloudShadowDepth), or inside the ground
+// shadow map's window that map through the light's disc (CloudShadowMapDisc); for a light the volumes are not built for
+// (a moon by day, the sun once the moon lights the clouds) the means round the camera stand in (CloudDeck), below the
+// base. wrapSampler: linear wrap.
+float3 CloudTransmissionForward(SamplerState wrapSampler, float3 relPos, float3 toLight)
+{
+    float2 t;
     if (CloudsOn != 0)
     {
         CloudParams C = LoadClouds();
         if (dot(toLight, C.LightDir) < 0.99)
-            return lerp(1.0, CloudDeck().xy, CloudBelowBase(relPos));
-        tau = CloudShadowDepth(C, relPos, toLight, wrapSampler);
+        {
+            t = lerp(1.0, CloudDeck().xy, CloudBelowBase(relPos));
+            return float3(t, CloudForwardShare(t));
+        }
+        float4 mapAt;
+        float tau = CloudShadowDepthAt(C, relPos, toLight, wrapSampler, mapAt);
+        if (mapAt.w >= 1.0)
+            return CloudShadowMapDisc(C, wrapSampler, mapAt.xy, mapAt.z * CLOUD_LIGHT_DISC / C.ShadowTexel);
+        return float3(exp(-tau), CloudThrough(tau), CloudForwardAt(tau));
     }
-    else
-        tau = CloudLayerDepth(wrapSampler, relPos, toLight);
-    return float2(exp(-tau), CloudThrough(tau));
+    float tau = CloudLayerDepth(wrapSampler, relPos, toLight);
+    return float3(exp(-tau), CloudThrough(tau), CloudForwardAt(tau));
+}
+
+float2 CloudTransmission(SamplerState wrapSampler, float3 relPos, float3 toLight)
+{
+    return CloudTransmissionForward(wrapSampler, relPos, toLight).xy;
 }
 
 // The share of a light's beam that reaches a place through the clouds (surfaces, water, glass, the meter, particles)
@@ -466,18 +537,6 @@ float CloudSkyDimming(float4 deck)
     return saturate((1.0 - deck.y) * (1.0 - deck.x));
 }
 
-// Of what the clouds let through beyond their beam (t: CloudTransmission), the share that goes on forward, near the light's
-// direction: through a thin cloud (a cumulus' edge) droplets (g 0.85) throw most of what they scatter straight on; only
-// through a thick one has it spread evenly. e^(−τ/20) of it, τ from the share passing through (CloudThrough =
-// 1 / (1 + CLOUD_DIFFUSION τ); the beam underflows past τ ~14). The air takes it with the beam (CloudAirLight), surfaces
-// as a soft light from the light's side of the sky (light_directional_cs.hlsl).
-float CloudForwardShare(float2 t)
-{
-    float diffused = max(t.y - t.x, 0.0);
-    float tau = (1.0 / max(t.y, 1e-4) - 1.0) / CLOUD_DIFFUSION;
-    return diffused * exp(-tau / 20.0);
-}
-
 // What the clouds let through to a place in the air toward a light, as shares of its illuminance:
 //   x  the beam, which the air scatters with its phases (the Mie forward lobe is the glow round the sun);
 //   y  the light the clouds have diffused, CloudThrough − the beam, which the air scatters evenly: under a deck the sun
@@ -492,7 +551,8 @@ float CloudForwardShare(float2 t)
 // there over here's (the air under a storm came out sepia); 1 for the 2D layer.
 float3 CloudAirLight(SamplerState wrapSampler, float3 relPos, float3 toLight, float skyDimming, out float3 diffusedTint)
 {
-    float2 t = CloudTransmission(wrapSampler, relPos, toLight);
+    float3 tf = CloudTransmissionForward(wrapSampler, relPos, toLight);
+    float2 t = tf.xy;
     diffusedTint = 1.0;
     float sky;
     if (CloudsOn != 0)
@@ -526,7 +586,7 @@ float3 CloudAirLight(SamplerState wrapSampler, float3 relPos, float3 toLight, fl
     // diffused (scattered evenly) at every depth it outshone the open sun's backscatter: a bright ring round every cloud's
     // shadow in the haze seen from above.
     float diffused = max(t.y - t.x, 0.0);
-    float forward = CloudForwardShare(t);
+    float forward = min(tf.z, diffused);
     return float3(t.x + forward, diffused - forward, sky);
 }
 
