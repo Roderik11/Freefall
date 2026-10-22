@@ -639,29 +639,47 @@ float3 CloudGroundLight(float3 groundAmbient, float deckThrough, float tau)
     return groundAmbient * saturate(CloudThrough(tau) / deckThrough);
 }
 
-// How open the sky is over the ground a face sees far out toward the eye (towardEye: level, unit), from a place p
-// (camera-relative): the mean of exp(−0.3 τ up) over nine columns 4-12 km out and ±4 km across, at the place's height,
-// read from a coarse level (≥ 500 m texels: a column's edge fades over a texel, not a voxel of level 0). A deck or a
-// storm round the place covers them all; broken cumulus leave a share open. One column 8 km out decided it before, open
-// or covered: every point of a base took its own point out there, and the other clouds' footprints landed on the bases
-// as hard navy patches and stripes that slid as the camera moved (user, 2026-10-20)
+// How open the sky is over the ground a face sees far out, from a place p (camera-relative): the mean of exp(−0.3 τ up)
+// over columns at the place's height, read from a coarse level (≥ 500 m texels: a column's edge fades over a texel, not a
+// voxel of level 0). A deck or a storm round the place covers them all; broken cumulus leave a share open.
+// A face seen low faces the eye and sees the ground out toward it (towardEye: level, unit): nine columns 4-12 km out and
+// ±4 km across. A face seen from below (a base overhead) faces down and sees the ground all round it: eight columns 6 km
+// round the place. eyeShare (0..1, from the view's horizontal share) weighs the two. Toward the eye alone, overhead the
+// direction turned with the view's azimuth round the zenith, and every base overhead took a fan of sharp wedges from the
+// columns it swept (the "zenith prism", user 2026-10-22; first taken for the march's brick walls).
+// One column 8 km out decided it before, open or covered: every point of a base took its own point out there, and the
+// other clouds' footprints landed on the bases as hard navy patches and stripes that slid as the camera moved (user,
+// 2026-10-20)
 #define CLOUD_FAR_OPEN_LEVEL 3
-float CloudFarOpen(CloudParams C, float3 p, float2 towardEye)
+float CloudFarOpenAt(CloudParams C, float3 p, float2 o)
 {
-    float2 across = float2(-towardEye.y, towardEye.x);
-    float open = 0.0;
-    [unroll] for (int i = 0; i < 3; i++)
+    float3 q = p + float3(o.x, 0.0, o.y);
+    float blend;
+    uint level = max(CloudLevelAt(C, max(abs(q.x), abs(q.z)), blend), (uint)CLOUD_FAR_OPEN_LEVEL);
+    return exp(-0.3 * CloudSkyDepthAt(C, level, C.CameraCloud + q.xz, CloudHeight(q), CloudWrap).x);
+}
+
+float CloudFarOpen(CloudParams C, float3 p, float2 towardEye, float eyeShare)
+{
+    float ring = 0.0, toward = 0.0;
+    if (eyeShare < 1.0)
     {
-        [unroll] for (int j = 0; j < 3; j++)
+        [unroll] for (int k = 0; k < 8; k++)
         {
-            float2 o = towardEye * (4000.0 * (i + 1)) + across * (4000.0 * (j - 1));
-            float3 q = p + float3(o.x, 0.0, o.y);
-            float blend;
-            uint level = max(CloudLevelAt(C, max(abs(q.x), abs(q.z)), blend), (uint)CLOUD_FAR_OPEN_LEVEL);
-            open += exp(-0.3 * CloudSkyDepthAt(C, level, C.CameraCloud + q.xz, CloudHeight(q), CloudWrap).x);
+            float a = (k + 0.5) * (ATM_PI / 4.0);
+            ring += CloudFarOpenAt(C, p, float2(cos(a), sin(a)) * 6000.0);
         }
     }
-    return open / 9.0;
+    if (eyeShare > 0.0)
+    {
+        float2 across = float2(-towardEye.y, towardEye.x);
+        [unroll] for (int i = 0; i < 3; i++)
+        {
+            [unroll] for (int j = 0; j < 3; j++)
+                toward += CloudFarOpenAt(C, p, towardEye * (4000.0 * (i + 1)) + across * (4000.0 * (j - 1)));
+        }
+    }
+    return lerp(ring / 8.0, toward / 9.0, eyeShare);
 }
 
 // One view ray through the clouds (not the rain: CloudMarchRay). stepScale > 1 marches coarser (the probe's faces);
@@ -703,6 +721,8 @@ CloudMarchResult CloudMarchClouds(CloudParams C, AtmosphereParams A, Texture3D<f
     // The far ground's openness (CloudFarOpen): a wide mean, worked out once a ray (at the first face it meets, and again
     // every 2 km along it), not per sample
     float2 towardEye = -dir.xz * rsqrt(max(dot(dir.xz, dir.xz), 1e-6));
+    // How much the face seen faces the eye rather than down (CloudFarOpen): none above ~65°, all below ~25°
+    float eyeShare = smoothstep(0.3, 0.9, length(dir.xz));
     float farOpen = -1.0, farAt = 0.0;
     float t = tStart;
     [loop] for (int s = 0; s < 512 && t < tEnd; s++)
@@ -802,7 +822,7 @@ CloudMarchResult CloudMarchClouds(CloudParams C, AtmosphereParams A, Texture3D<f
                 float nearSky = exp(-0.3 * CloudSkyDepth(C, p - dir * min(1000.0, 0.5 * t), CloudWrap).x);
                 if (farOpen < 0.0 || t - farAt > 2000.0)
                 {
-                    farOpen = CloudFarOpen(C, p, towardEye);
+                    farOpen = CloudFarOpen(C, p, towardEye, eyeShare);
                     farAt = t;
                 }
                 faceSky *= max(nearSky, farOpen);
