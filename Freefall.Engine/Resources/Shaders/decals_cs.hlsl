@@ -337,9 +337,11 @@ void ApplyWeather(DecalFrame f, float3 rel, float3 geo, uint surfaceClass, inout
     c.TerrainMaxHeight = f.TerrainMaxHeight;
     c.TerrainOrigin = f.TerrainOrigin;
     c.TerrainSize = f.TerrainSize;
-    // Looked for a little out from the surface: a wall in the open is not covered by its own top, a floor under a roof is
+    // How much of the fall reaches it (straight down, soft under eaves), looked for a little out from the surface: a wall
+    // in the open is not covered by its own top, a floor under a roof is
     float3 world = rel + CamPos;
-    if (WeatherUnderCover(c, LinearClamp, world + geo * 0.35 + float3(0, 0.05, 0), 0.1))
+    float open = WeatherOpenness(c, LinearClamp, world + geo * 0.35 + float3(0, 0.05, 0), 0.1);
+    if (open <= 0.0)
         return;
 
     float3 N = normalize(s.Normal.xyz);
@@ -350,7 +352,7 @@ void ApplyWeather(DecalFrame f, float3 rel, float3 geo, uint surfaceClass, inout
     // deepens it fills down into the joints and hollows and buries them. Only what faces up; not on characters (they
     // move). A noise alone made random patches (user, 2026-10-22: "shouldnt it accumulate on the height spots first")
     float snow = 0.0;
-    float cover = saturate(f.SnowCover);
+    float cover = saturate(f.SnowCover) * open;      // less falls where it is partly sheltered
     if (cover > 0.0 && surfaceClass != 3u)
     {
         float up = smoothstep(0.35, 0.85, lerp(N.y, geo.y, cover)) * smoothstep(0.2, 0.6, geo.y);
@@ -362,7 +364,7 @@ void ApplyWeather(DecalFrame f, float3 rel, float3 geo, uint surfaceClass, inout
     }
 
     float facing = geo.y >= 0.0 ? lerp(0.35, 1.0, geo.y) : saturate(0.35 + geo.y);
-    float wet = saturate(f.Wetness) * facing * (surfaceClass == 3u ? 0.5 : 1.0) * (1.0 - snow);
+    float wet = saturate(f.Wetness) * open * facing * (surfaceClass == 3u ? 0.5 : 1.0) * (1.0 - snow);
     if (wet > 0.0)
     {
         float rough = s.Data.r, metal = s.Data.g;
