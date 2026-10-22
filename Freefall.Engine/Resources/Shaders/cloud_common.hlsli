@@ -209,13 +209,18 @@ float3 CloudLevelUvw(CloudParams C, CloudLevel L, float2 xz, float h)
     return float3(xz / (L.VoxelSize * CLOUD_TEXELS), w);
 }
 
+// A level's textures are fetched with NonUniformResourceIndex: the level comes from each sample's distance, so the
+// threads of a wave read different levels' textures. Without it AMD takes the descriptor from one thread for the whole
+// wave (it keeps descriptors in scalar registers), and the clouds came out in blocks and horizontal slices of another
+// level's density and bricks (tester's RX 7900 XT, 2026-10-22); NVIDIA let it pass.
+
 // Density and profile at a cloud-space place from one level (0 outside the slab)
 float2 CloudSampleLevel(CloudParams C, uint level, float2 xz, float h, SamplerState wrap)
 {
     if (h < C.SlabBottom || h > C.SlabTop)
         return 0;
     CloudLevel L = C.Levels[level];
-    Texture3D<float2> density = ResourceDescriptorHeap[L.DensityTex];
+    Texture3D<float2> density = ResourceDescriptorHeap[NonUniformResourceIndex(L.DensityTex)];
     return density.SampleLevel(wrap, CloudLevelUvw(C, L, xz, h), 0);
 }
 
@@ -236,7 +241,7 @@ float CloudBrickMax(CloudParams C, uint level, float2 xz, float h)
     if (h < C.SlabBottom || h > C.SlabTop)
         return 0;
     CloudLevel L = C.Levels[level];
-    Texture3D<float> bricks = ResourceDescriptorHeap[L.BrickTex];
+    Texture3D<float> bricks = ResourceDescriptorHeap[NonUniformResourceIndex(L.BrickTex)];
     float3 uvw = CloudLevelUvw(C, L, xz, h);
     int3 brick = int3(floor(uvw.xy * (CLOUD_TEXELS / CLOUD_BRICK)), min((int)(uvw.z * L.Layers) / CLOUD_BRICK, (int)(L.Layers / CLOUD_BRICK) - 1));
     brick.xy = ((brick.xy % (CLOUD_TEXELS / CLOUD_BRICK)) + (CLOUD_TEXELS / CLOUD_BRICK)) % (CLOUD_TEXELS / CLOUD_BRICK);
@@ -249,7 +254,7 @@ float CloudLightDepthAt(CloudParams C, uint level, float2 xz, float h, SamplerSt
     if (h > C.SlabTop)
         return 0.0;
     CloudLevel L = C.Levels[level];
-    Texture3D<float> light = ResourceDescriptorHeap[L.LightTex];
+    Texture3D<float> light = ResourceDescriptorHeap[NonUniformResourceIndex(L.LightTex)];
     return light.SampleLevel(wrap, CloudLevelUvw(C, L, xz, clamp(h, C.SlabBottom, C.SlabTop)), 0);
 }
 
@@ -257,7 +262,7 @@ float CloudLightDepthAt(CloudParams C, uint level, float2 xz, float h, SamplerSt
 float2 CloudSkyDepthAt(CloudParams C, uint level, float2 xz, float h, SamplerState wrap)
 {
     CloudLevel L = C.Levels[level];
-    Texture3D<float2> sky = ResourceDescriptorHeap[L.SkyTex];
+    Texture3D<float2> sky = ResourceDescriptorHeap[NonUniformResourceIndex(L.SkyTex)];
     return sky.SampleLevel(wrap, CloudLevelUvw(C, L, xz, clamp(h, C.SlabBottom, C.SlabTop)), 0);
 }
 
