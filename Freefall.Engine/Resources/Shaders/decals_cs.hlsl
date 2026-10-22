@@ -424,9 +424,27 @@ float SurfaceOpenness(DecalFrame f, float3 rel, float3 geo)
     return WeatherOpenness(c, LinearClamp, rel + CamPos + geo * 0.35 + float3(0, 0.05, 0), 0.1);
 }
 
+// The terrain's smooth normal at a place (world xz) from its height map: its own normal before its layers' normal maps
+// (gputerrain.fx GetNormal), central differences a texel each way
+float3 TerrainNormal(DecalFrame f, float2 xz)
+{
+    Texture2D<float> heights = ResourceDescriptorHeap[f.TerrainHeightmap];
+    uint w, h;
+    heights.GetDimensions(w, h);
+    float2 uv = (xz - f.TerrainOrigin.xz) / f.TerrainSize;
+    float2 du = float2(1.0 / w, 0.0), dv = float2(0.0, 1.0 / h);
+    float2 metres = 2.0 * f.TerrainSize / float2(w, h);
+    float dx = (heights.SampleLevel(LinearClamp, uv + du, 0) - heights.SampleLevel(LinearClamp, uv - du, 0)) * f.TerrainMaxHeight / metres.x;
+    float dz = (heights.SampleLevel(LinearClamp, uv + dv, 0) - heights.SampleLevel(LinearClamp, uv - dv, 0)) * f.TerrainMaxHeight / metres.y;
+    return normalize(float3(-dx, 1.0, -dz));
+}
+
 // The weather on an open surface (`open`: SurfaceOpenness; `normalVariance`: NormalVariance): wet (porous surfaces
 // darken, smooth ones and flat open ground take a water film) and snow (on what faces up, patchy while it is thin,
-// smoothing the relief)
+// smoothing the relief). `geo` is the surface's smooth large-scale normal: on the terrain its height map's, elsewhere
+// the geometric normal from the depth. On the terrain that one is flat per triangle of the CDLOD mesh: deep snow was
+// shaded in facets, steep triangles stayed bare edge to edge, and the normal bent halfway up lit the slopes that the
+// shadow map darkens, so the terrain's shadow showed as long smears on the snow (user, 2026-10-23)
 void ApplyWeather(DecalFrame f, float3 rel, float3 geo, uint surfaceClass, float open, float normalVariance, inout Surface s)
 {
     // Emissive pixels (lamp glass, windows) hold their light in the albedo: left as they are
@@ -502,7 +520,7 @@ void ApplyWeather(DecalFrame f, float3 rel, float3 geo, uint surfaceClass, float
         float buried = snow * smoothstep(0.3, 0.9, cover + 0.4 * hollow);
         s.Albedo.rgb = lerp(s.Albedo.rgb, SNOW_ALBEDO, dust);
         s.Data.rgb = lerp(s.Data.rgb, float3(SNOW_ROUGHNESS, 0.0, lerp(s.Data.b, 1.0, buried)), dust);
-        s.Normal.xyz = normalize(lerp(N, normalize(geo + float3(0, 1, 0)), buried));
+        s.Normal.xyz = normalize(lerp(N, geo, buried));
         s.Displacement *= 1.0 - buried;
     }
 }
@@ -604,7 +622,12 @@ void CSDecals(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint gi : S
         }
     }
     if (f.WeatherOn != 0u)
-        ApplyWeather(f, rel, geo, surfaceClass, open, NormalVariance(gtid.xy, before.Normal.xyz), s);
+    {
+        float3 largeN = geo;
+        if (surfaceClass == 1u && f.TerrainHeightmap != 0)
+            largeN = TerrainNormal(f, rel.xz + CamPos.xz);
+        ApplyWeather(f, rel, largeN, surfaceClass, open, NormalVariance(gtid.xy, before.Normal.xyz), s);
+    }
 
     if (any(s.Albedo != before.Albedo))
         albedoUav[px] = s.Albedo;
