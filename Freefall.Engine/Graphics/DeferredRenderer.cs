@@ -65,6 +65,8 @@ namespace Freefall.Graphics
         private uint _fogVolumeIdx;             // this frame's SceneConstants.FogVolumeIdx (0 = off)
         // Which visible point lights reach a place off the surfaces (the air, particles): SceneConstants.LightClustersIdx
         private readonly LightClusters _lightClusters = new();
+        // Decals and the weather on the G-buffer, right after the opaque pass (1b)
+        private readonly DecalPass _decals = new();
         // This view's aerial perspective volume (the far haze), sized to its target: SceneConstants.AerialPerspectiveIdx
         private readonly AerialPerspectiveVolume _aerialPerspective = new();
         // This view's volumetric clouds (half size): SceneConstants.CloudTargetIdx
@@ -267,12 +269,15 @@ namespace Freefall.Graphics
 
         private void CreateRenderTextures(int width, int height)
         {
-            Albedo = new RenderTexture2D(Engine.Device, width, height, Format.R16G16B16A16_Float);
-            Normals = new RenderTexture2D(Engine.Device, width, height, Format.R16G16B16A16_SNorm);
-            Data = new RenderTexture2D(Engine.Device, width, height, Format.R8G8B8A8_UNorm);
-            DepthGBuffer = new RenderTexture2D(Engine.Device, width, height, Format.R32_Float);
+            // Unordered access for the decal pass, which reads and writes them (DecalPass; only where the GPU can load
+            // these formats that way)
+            bool decals = DecalPass.Supported;
+            Albedo = new RenderTexture2D(Engine.Device, width, height, Format.R16G16B16A16_Float, randomWrite: decals);
+            Normals = new RenderTexture2D(Engine.Device, width, height, Format.R16G16B16A16_SNorm, randomWrite: decals);
+            Data = new RenderTexture2D(Engine.Device, width, height, Format.R8G8B8A8_UNorm, randomWrite: decals);
+            DepthGBuffer = new RenderTexture2D(Engine.Device, width, height, Format.R32_Float, randomWrite: decals);
             EntityIdBuffer = new RenderTexture2D(Engine.Device, width, height, Format.R32_UInt);
-            HeightBuffer = new RenderTexture2D(Engine.Device, width, height, Format.R16G16_Float);
+            HeightBuffer = new RenderTexture2D(Engine.Device, width, height, Format.R16G16_Float, randomWrite: decals);
             
             // 1x1 readback buffers for picking
             _entityIdReadback?.Dispose();
@@ -634,6 +639,15 @@ namespace Freefall.Graphics
                  ulong frustumGpuAddr = UploadFrustumConstants(camera, Engine.Device);
                  CommandBuffer.Execute(RenderPass.Opaque, list, Engine.Device, frustumGpuAddr);
                  PixMarker.End(list); // Opaque
+             }
+
+             // 1b. Decals and the weather (wet surfaces, snow) on the opaque G-buffer: everything that reads it later
+             //     (GTAO, the screen-space displacement, the lighting, the particles' depth collision) sees them
+             if (_decals.Render(list, camera, this, BindSceneConstantsForCompute))
+             {
+                 list.OMSetRenderTargets(_cachedGBufferRtvHandles, Depth.DsvHandle);
+                 list.RSSetViewport(vp);
+                 list.RSSetScissorRect(scissor);
              }
 
              // Point lights: the GPU culls the light registry into this frame's visible list. Before the shadow pass,
@@ -1163,6 +1177,7 @@ namespace Freefall.Graphics
             
             // Pass SSDM displacement texture to composition for ambient parallax
             _compositionCS.SetParam("AODirectStrength", Engine.Settings.GTAODirectStrength);
+            _compositionCS.SetParam("AmbientSpecular", Engine.Settings.AmbientSpecular ? 1u : 0u);
             _compositionCS.SetParam("SSDMTexIdx",Engine.Settings.EnableSSDM ? (ScreenSpaceDisplacement?.OutputSrvIndex ?? 0u) : 0u);
 
             BindSceneConstantsForCompute(list);
@@ -1522,7 +1537,9 @@ namespace Freefall.Graphics
             PickedPixelX = _readbackPixelX;
             PickedPixelY = _readbackPixelY;
 
-            PickedEntitySlot = packed >> 8;           // upper 24 bits = entity ID
+            // bits 8..29 = the transform slot; the top two are the surface's class for decals (decals_cs.hlsl: 0 static
+            // mesh, 1 terrain, 2 vegetation, 3 character)
+            PickedEntitySlot = (packed & 0x3FFFFFFFu) >> 8;
             PickSerial++;
             return PickedEntitySlot;
         }
@@ -1571,6 +1588,7 @@ namespace Freefall.Graphics
             ScreenSpaceShadows?.Dispose();
             VolumetricFog?.Dispose();
             _lightClusters.Dispose();
+            _decals.Dispose();
             _aerialPerspective.Dispose();
             _cloudView.Dispose();
             foreach (var tracer in _pointScreenShadows) tracer?.Dispose();

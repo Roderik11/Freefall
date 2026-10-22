@@ -867,7 +867,7 @@ FragmentOutput PS(VertexOutput input)
                                   min(screenUV.y, 1.0 - screenUV.y)) / margin);
     dispVector *= edgeFade;
 
-    output.EntityId = (input.TransformSlot << 8u);
+    output.EntityId = (input.TransformSlot << 8u) | (1u << 30);   // class 1: terrain (decals_cs.hlsl receivers)
     output.Displacement = dispVector;
     return output;
 }

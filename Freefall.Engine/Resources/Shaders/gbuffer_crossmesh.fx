@@ -203,7 +203,7 @@ PSOutput PS(VSOutput input)
     float treeCenterDepth = input.WorldPos.w;
     output.Depth = lerp(treeCenterDepth, input.Depth, aoValue);
     output.Displacement = float2(0, 0);
-    output.EntityId = (input.TransformSlot << 8u) | (input.MeshPartIdx & 0xFFu);
+    output.EntityId = (input.TransformSlot << 8u) | (input.MeshPartIdx & 0xFFu) | (2u << 30);   // class 2: vegetation (decals_cs.hlsl receivers)
     return output;
 }
 

@@ -201,7 +201,7 @@ PSOutput PS(VSOutput input, bool isFrontFace : SV_IsFrontFace)
     output.Data = float4(0.7, 0.0, canopyAO, 0.5); // roughness=0.7, metal=0, ao=canopy occlusion, flag=vegetation
     output.Depth = input.Depth;
     output.Displacement = float2(0,0);
-    output.EntityId = (input.TransformSlot << 8u) | (input.MeshPartIdx & 0xFFu);
+    output.EntityId = (input.TransformSlot << 8u) | (input.MeshPartIdx & 0xFFu) | (2u << 30);   // class 2: vegetation (decals_cs.hlsl receivers)
     return output;
 }
 

@@ -10,6 +10,7 @@
 
 #include "particle_common.hlsli"
 #include "ocean_surf.hlsli"
+#include "weather_cover.hlsli"
 
 // The renderer's frustum constants for this view (root slot 1). Layout = cull_instances.hlsl.
 cbuffer FrustumPlanes : register(b0)
@@ -561,35 +562,20 @@ void spawn(ParticleEmitter e, uint seed, out ParticleCore p, out ParticleVisual 
 
 #define COVER_BIAS 0.1      // m under a surface before it covers: a drop dies once it has passed into the roof it fell on
 
-// Whether something covers a place from the sky: the terrain's surface over it (a cave, the hill under the ground a drop
-// falls on) or a mesh over it in the sky captures' top-down slice (a roof, a crown, an overhang). Off screen as on it:
-// rain fell through every roof over the camera when only the screen's depth stopped it.
+// Whether something covers a place from the sky (weather_cover.hlsli): the terrain's surface over it (a cave, the hill
+// under the ground a drop falls on) or a mesh over it in the sky captures' top-down slice (a roof, a crown, an overhang).
+// Off screen as on it: rain fell through every roof over the camera when only the screen's depth stopped it.
 bool UnderCover(float3 p)
 {
-    if (TerrainHeightmapIdx != 0)
-    {
-        Texture2D<float> heights = ResourceDescriptorHeap[TerrainHeightmapIdx];
-        float2 uv = (p.xz - TerrainOrigin.xz) / TerrainSize;
-        if (all(uv >= 0.0) && all(uv <= 1.0)
-            && TerrainOrigin.y + heights.SampleLevel(LinearClampSampler, uv, 0) * TerrainMaxHeight > p.y + COVER_BIAS)
-            return true;
-    }
-    if (ShelterDepthIdx != 0)
-    {
-        float4 clip = mul(float4(p, 1.0), ShelterViewProjection);
-        float2 uv = float2(clip.x * 0.5 + 0.5, 0.5 - clip.y * 0.5);
-        if (all(uv >= 0.0) && all(uv < 1.0) && clip.z < 1.0)
-        {
-            Texture2DArray<float> depths = ResourceDescriptorHeap[ShelterDepthIdx];
-            uint w, h, n;
-            depths.GetDimensions(w, h, n);
-            float top = depths.Load(int4(int2(uv * float2(w, h)), ShelterSlice, 0));
-            // Metres under the highest mesh there: looking down, the depth grows by -VP._23 a metre
-            if ((clip.z - top) / max(-ShelterViewProjection._23, 1e-9) > COVER_BIAS)
-                return true;
-        }
-    }
-    return false;
+    WeatherCover c;
+    c.ShelterVP = ShelterViewProjection;
+    c.ShelterDepth = ShelterDepthIdx;
+    c.ShelterSlice = ShelterSlice;
+    c.TerrainHeightmap = TerrainHeightmapIdx;
+    c.TerrainMaxHeight = TerrainMaxHeight;
+    c.TerrainOrigin = TerrainOrigin;
+    c.TerrainSize = TerrainSize;
+    return WeatherUnderCover(c, LinearClampSampler, p, COVER_BIAS);
 }
 
 // ────────────── Simulation ──────────────

@@ -21,7 +21,8 @@ cbuffer Params : register(b4)
 {
     uint SSDMTexIdx;
     float AODirectStrength;   // how much GTAO also darkens direct light (0 = ambient only)
-    uint2 _compPad;
+    uint AmbientSpecular;     // 1: the sky's light reflected by every lit surface (EngineSettings.AmbientSpecular)
+    uint _compPad;
 };
 
 #include "common.fx"
@@ -35,6 +36,18 @@ float3 MultiBounceAO(float visibility, float3 albedo)
     float3 b = -4.7951 * albedo + 0.6417;
     float3 c = 2.7552 * albedo + 0.6903;
     return max(visibility, ((visibility * a + b) * visibility + c) * visibility);
+}
+
+// The split sum's environment BRDF, Karis' fit ("Physically Based Shading on Mobile", 2014): the share of the light
+// reflected from round the mirror direction, by the reflectance at normal incidence F0, the roughness and N·V
+float3 EnvBRDFApprox(float3 f0, float roughness, float NoV)
+{
+    const float4 c0 = float4(-1.0, -0.0275, -0.572, 0.022);
+    const float4 c1 = float4(1.0, 0.0425, 1.04, -0.04);
+    float4 r = roughness * c0 + c1;
+    float a004 = min(r.x * r.x, exp2(-9.28 * NoV)) * r.x + r.y;
+    float2 ab = float2(-1.04, 1.04) * a004 + r.zw;
+    return f0 * ab.x + ab.y;
 }
 
 [numthreads(8, 8, 1)]
@@ -81,6 +94,7 @@ void CSCompose(uint3 dispatchThreadId : SV_DispatchThreadID)
     // gets little
     float ao = data.b;
     float3 ambient = SkyAmbient(normal) * ao * saturate(light.a);
+    float occlusion = ao * saturate(light.a);
 
     // Screen-space AO (GTAO) — fully occludes ambient; direct light only by AODirectStrength
     // (not physically based, but keeps creases readable in sunlit areas)
@@ -90,12 +104,32 @@ void CSCompose(uint3 dispatchThreadId : SV_DispatchThreadID)
         float gtao = AOTex.Load(displaced_coord);
         ambient *= MultiBounceAO(gtao, albedo.rgb);
         light.rgb *= lerp(1.0, gtao, AODirectStrength);
+        occlusion *= gtao;
     }
-    
+
     // data.a flags: 0=unlit (skybox), >0=lit (0.5=vegetation, 1.0=standard PBR)
     float isLit = step(0.1, data.a);
     float emissiveMask = albedo.a;
-    float3 pbrLit = ambient * albedo.rgb + light.rgb;
+    float3 diffuseAlbedo = albedo.rgb;
+
+    // The sky's light reflected (WEATHER_PLAN stage 4: wet stone and puddles must show the sky): the sky probe in the
+    // mirror direction blurred by the roughness, × the environment BRDF, × the same sky visibility and AO as the ambient
+    // (a room, a cave reflects no sky). Rough surfaces get a faint sheen at grazing angles, metals their tinted
+    // reflection instead of a diffuse ambient. Before 2026-10-22 opaque surfaces had no ambient specular at all (only
+    // glass and water): a puddle at roughness 0.04 drew as a darker patch of cobbles.
+    float3 specular = 0;
+    if (AmbientSpecular != 0 && isLit > 0 && occlusion > 0.0)
+    {
+        float2 uv = (float2(px) + 0.5) / float2(ScreenWidthIdx, ScreenHeightIdx);
+        float3 toPixel = normalize(posFromDepth(uv, 1.0, CameraInverse).xyz);   // reverse Z: depth 1 = the near plane
+        float3 N = normalize(normal);
+        float NoV = saturate(dot(N, -toPixel));
+        float roughness = saturate(data.r), metal = saturate(data.g);
+        float3 f0 = lerp(0.04, albedo.rgb, metal);
+        specular = SkyReflection(reflect(toPixel, N), roughness) * EnvBRDFApprox(f0, roughness, NoV) * occlusion;
+        diffuseAlbedo *= 1.0 - metal;
+    }
+    float3 pbrLit = ambient * diffuseAlbedo + specular + light.rgb;
     // Self-illumination: where it outshines the lit surface the G-buffer holds its luminance, pre-exposed (gbuffer.fx)
     float3 emissiveGlow = albedo.rgb;
     // Unlit pixels (the sky dome) arrive pre-exposed already

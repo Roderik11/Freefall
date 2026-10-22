@@ -1,0 +1,43 @@
+// A decal material's settings (decal.fx is the effect its .mat names; decals_cs.hlsl reads the block by the decal's
+// MaterialId). Packed tightly in declaration order (Material.WriteSetting): every member carries its "//=" default, and
+// the block stays within Material.SettingsStride (256 bytes). FXParser reads the struct from decal.fx's text, which
+// includes this file.
+#ifndef DECAL_SETTINGS_HLSLI
+#define DECAL_SETTINGS_HLSLI
+
+struct Settings
+{
+    TextureRef Albedo;          //= White      -- Colour (rgb) and opacity (a). With RainFilled the opacity is the puddle's depth
+    TextureRef Normal;          //= FlatNormal -- Normal map in the decal's frame (its X right, its -Z up the texture)
+    TextureRef Mask;            //= White      -- Roughness (r), metal (g), AO (b)
+    TextureRef Height;          //= Black      -- Relief (r), 0..1 onto HeightMin..HeightMax, for the screen-space displacement
+    float3 Color;               //= 1, 1, 1    -- Multiplies the albedo map
+    uint AlbedoMode;            //= 0 [0, 1]   -- 0 Replace (paint over), 1 Darken (multiplies the surface by the colour: grime, soot, damp)
+    float AlbedoOpacity;        //= 1 [0, 1]   -- How much of the colour (0 = the surface keeps its own)
+    uint NormalMode;            //= 1 [0, 1]   -- 0 Replace (the decal's normal), 1 Detail (adds the decal's tilt: the surface's own detail stays)
+    float NormalOpacity;        //= 1 [0, 1]   -- How much of the normal
+    float NormalStrength;       //= 1 [0, 4]   -- Steepens or flattens the normal map
+    float MaskOpacity;          //= 0 [0, 1]   -- How much of roughness, metal and AO (0 = the surface keeps its own)
+    float Roughness;            //= 1 [0, 1]   -- Multiplies the mask's roughness
+    float Metal;                //= 1 [0, 1]   -- Multiplies the mask's metal
+    uint HeightMode;            //= 0 [0, 1]   -- 0 Add (on top of the surface's relief: a crack), 1 Replace (the surface's relief goes: a puddle flattens the cobbles)
+    float HeightOpacity;        //= 0 [0, 1]   -- How much of the relief (0 = none)
+    float HeightMin;            //= 0          -- Metres at the height map's 0 (negative: a dent)
+    float HeightMax;            //= 0.02       -- Metres at its 1
+    float2 AngleFade;           //= 50, 75     -- Degrees between the surface and the projection axis: full up to x, gone at y
+    float EdgeFade;             //= 0.15 [0, 0.5] -- Share of the box's height over which it fades out at the top and bottom
+    uint AtlasColumns;          //= 1          -- Tiles across the textures (Decal.Variant picks one)
+    uint AtlasRows;             //= 1          -- Tiles down
+    uint Receivers;             //= 3 [0, 15]  -- What it lands on, a bit each: 1 static meshes, 2 terrain, 4 vegetation, 8 characters
+    bool RainFilled;            //= false      -- Puddles: as full as the rain has made the ground wet (the middle, where the opacity is highest, fills first), a damp edge round the water
+    float Ripples;              //= 0 [0, 2]   -- Puddles: rings where the drops strike, as many as the rain at the camera
+};
+
+Settings LoadDecalSettings(uint materialsIdx, uint materialId)
+{
+    StructuredBuffer<MaterialData> materials = ResourceDescriptorHeap[materialsIdx];
+    ByteAddressBuffer all = ResourceDescriptorHeap[NonUniformResourceIndex(materials[materialId].SettingsBufferIdx)];
+    return all.Load<Settings>(materialId * 256u);
+}
+
+#endif

@@ -137,6 +137,7 @@ namespace Freefall
             // Initialize persistent transform buffer for GPU-driven rendering
             TransformBuffer.Initialize(Device);
             PointLightBuffer.Initialize(Device); // GPU light registry: slots follow ComponentCache<PointLight>
+            DecalBuffer.Initialize(Device);     // GPU decal registry: slots follow ComponentCache<Decal>
             
             // Initialize streaming manager before assets (AssetManager creates default textures that need it)
             var streaming = new StreamingManager(Device);
@@ -184,6 +185,7 @@ namespace Freefall
             Device = new GraphicsDevice();
             TransformBuffer.Initialize(Device);
             PointLightBuffer.Initialize(Device); // GPU light registry: slots follow ComponentCache<PointLight>
+            DecalBuffer.Initialize(Device);     // GPU decal registry: slots follow ComponentCache<Decal>
 
             var streaming = new StreamingManager(Device);
             Assets = new AssetManager(Device);
@@ -704,6 +706,12 @@ namespace Freefall
          [ValueRange(0f, 1f)]
          public float GTAODirectStrength { get; set; } = 0.5f;              // AO applied to direct light (0 = ambient only, physically correct)
 
+         /// <summary>
+         /// The sky's light reflected by opaque surfaces (composition_cs.hlsl): the sky probe in the mirror direction at the
+         /// surface's roughness, the environment BRDF, the sky visibility and AO. Wet stone and puddles show the sky with it.
+         /// </summary>
+         public bool AmbientSpecular { get; set; } = true;
+
          [ValueRange(0.5f, 4f)]
          public float GTAOPower{ get; set; } = 1.5f;                       // Visibility exponent (higher = darker)
 
@@ -884,6 +892,26 @@ namespace Freefall
          /// <summary>Direction the wind blows towards (degrees, as EnvironmentPreset) while OverrideWind is on.</summary>
          [ValueRange(0f, 360f)]
          public float OverrideWindDirection { get; set; } = 45f;
+
+         /// <summary>
+         /// Set how wet the open surfaces are, how full the rain-filled puddles and how much snow lies, instead of the
+         /// rain and snow building them up and the weather drying and melting them over minutes (Graphics.Weather), for
+         /// tuning the wet and snowy look without waiting.
+         /// </summary>
+         [Category("Weather")]
+         public bool OverrideWeatherSurfaces { get; set; } = false;
+
+         /// <summary>How wet the open surfaces are (0..1) while OverrideWeatherSurfaces is on.</summary>
+         [ValueRange(0f, 1f)]
+         public float OverrideWetness { get; set; } = 1f;
+
+         /// <summary>How full the rain-filled puddles are (0..1) while OverrideWeatherSurfaces is on.</summary>
+         [ValueRange(0f, 1f)]
+         public float OverridePuddleFill { get; set; } = 1f;
+
+         /// <summary>How much snow lies on the open ground (0..1) while OverrideWeatherSurfaces is on.</summary>
+         [ValueRange(0f, 1f)]
+         public float OverrideSnowCover { get; set; } = 0f;
 
          [Category("Debug")]
          public DebugVizMode DebugVisualizationMode { get; set; } = DebugVizMode.Off; // F5 - Debug viz

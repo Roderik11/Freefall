@@ -433,7 +433,7 @@ PSOutput PS(MSOutput input, bool isFrontFace : SV_IsFrontFace)
     output.Normal = float4(N, 1.0);
     output.Data = float4(0.9, 0.0, 1.0, 0.5);    // matte, no metal, ao 1, vegetation lighting
     output.Depth = input.Depth;
-    output.EntityId = 0;
+    output.EntityId = 2u << 30;   // class 2: vegetation (decals_cs.hlsl receivers)
     output.Displacement = float2(0, 0);
     return output;
 }

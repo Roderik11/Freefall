@@ -330,7 +330,7 @@ PSOutput PS(MSOutput input)
 
     output.Data = float4(0.95, 0.0, 1.0, 0.5);   // roughness=matte, metallic=0, ao=1, vegetation lighting
     output.Depth = dist;
-    output.EntityId = 0;
+    output.EntityId = 2u << 30;   // class 2: vegetation (decals_cs.hlsl receivers)
     output.Displacement = float2(0, 0);
 
     return output;

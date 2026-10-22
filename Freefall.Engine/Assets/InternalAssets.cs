@@ -45,6 +45,7 @@ namespace Freefall.Assets
             public const string CrossmeshEffect = "00000000000000000000000000000018";
             public const string WaterEffect = "00000000000000000000000000000019";
             public const string VfxEffect = "0000000000000000000000000000001a";   // vfx.fx: glowing meshes (beams, lasers, spells)
+            public const string DecalEffect = "0000000000000000000000000000001b"; // decal.fx: decal materials (DecalPass applies them)
 
             // materials
             public const string DefaultMaterial = "00000000000000000000000000000020";
@@ -92,6 +93,8 @@ namespace Freefall.Assets
         /// <summary>Lakes and rivers (water.fx). Drawn by the WaterBody component, which supplies its per-instance data.</summary>
         public static Effect WaterEffect { get; private set; }
         public static Effect VfxEffect { get; private set; }
+        /// <summary>Decal materials (decal.fx): their settings; the decal pass applies them (Components.Decal).</summary>
+        public static Effect DecalEffect { get; private set; }
 
         // Default materials mirror the default effects, with basic textures assigned where appropriate.
 
@@ -188,6 +191,7 @@ namespace Freefall.Assets
             CrossmeshEffect = new Effect("gbuffer_crossmesh");
             WaterEffect = new Effect("water");
             VfxEffect = new Effect("vfx");
+            DecalEffect = new Effect("decal");
 
             DefaultMaterial = new Material(DefaultEffect);
             DefaultMaterial.Name = "DefaultMaterial";
@@ -256,6 +260,7 @@ namespace Freefall.Assets
             manager.RegisterAsset(Guids.CrossmeshEffect, CrossmeshEffect);
             manager.RegisterAsset(Guids.WaterEffect, WaterEffect);
             manager.RegisterAsset(Guids.VfxEffect, VfxEffect);
+            manager.RegisterAsset(Guids.DecalEffect, DecalEffect);
 
             manager.RegisterAsset(Guids.DefaultMaterial, DefaultMaterial);
             manager.RegisterAsset(Guids.DecoratorMaterial, DecoratorMaterial);

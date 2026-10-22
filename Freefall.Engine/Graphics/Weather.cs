@@ -43,6 +43,22 @@ namespace Freefall.Graphics
         /// <summary>0..1: how much of the precipitation at the camera's height falls as snow.</summary>
         public static float SnowShare { get; private set; }
 
+        /// <summary>
+        /// What the weather has left on the open surfaces round the camera (0..1), for the decal pass (decals_cs.hlsl):
+        /// how wet they are (rising in the rain, a minute to soak in heavy rain; drying over ~15 minutes after), how full
+        /// rain-filled puddles are (filling once the ground is soaked, ~5 minutes in heavy rain; draining over ~40), how
+        /// much snow lies (~10 minutes of heavy snow to cover; melting over ~20 when it is warmer than the freezing level,
+        /// faster in the rain). Real seconds, not game time. Settings › OverrideWeatherSurfaces sets them by hand.
+        /// </summary>
+        public static float SurfaceWetness { get; private set; }
+        public static float PuddleFill { get; private set; }
+        public static float SnowCover { get; private set; }
+
+        private const float SoakSeconds = 60f, DrySeconds = 900f;
+        private const float FillSeconds = 300f, DrainSeconds = 2400f;
+        private const float CoverSeconds = 600f, MeltSeconds = 1200f;
+        private static float _wetness, _puddles, _snow;     // the weather's own, kept while the override is on
+
         /// <summary>The precipitation map (Texture2D RG16F: rate, hail; 0 = none yet) and the world xz of its corner.</summary>
         public static uint MapIndex => _mapValid ? _map!.BindlessIndex : 0u;
         public static Vector2 MapOrigin { get; private set; }
@@ -108,6 +124,21 @@ namespace Freefall.Graphics
             Snow = Precipitation * SnowShare;
             Rain = Precipitation * (1f - SnowShare);
             Hail *= 1f - SnowShare;
+
+            // What it leaves on the ground: rain soaks it and fills puddles once soaked; dry weather dries and drains; snow
+            // builds a cover where it is cold enough and melts where it is not (rain melts it faster)
+            float wetting = Rain / SoakSeconds, drying = (1f - MathF.Min(Rain * 5f, 1f)) / DrySeconds;
+            _wetness = Math.Clamp(_wetness + (wetting - drying) * dt, 0f, 1f);
+            float filling = _wetness > 0.6f ? Rain / FillSeconds : 0f, draining = (1f - MathF.Min(Rain * 5f, 1f)) / DrainSeconds;
+            _puddles = Math.Clamp(_puddles + (filling - draining) * dt, 0f, 1f);
+            float covering = Snow / CoverSeconds;
+            float melting = SnowShare < 0.5f ? (1f + 3f * Rain) / MeltSeconds : 0f;
+            _snow = Math.Clamp(_snow + (covering - melting) * dt, 0f, 1f);
+            var settings = Engine.Settings;
+            bool manual = settings != null && settings.OverrideWeatherSurfaces;
+            SurfaceWetness = manual ? Math.Clamp(settings!.OverrideWetness, 0f, 1f) : _wetness;
+            PuddleFill = manual ? Math.Clamp(settings!.OverridePuddleFill, 0f, 1f) : _puddles;
+            SnowCover = manual ? Math.Clamp(settings!.OverrideSnowCover, 0f, 1f) : _snow;
 
             // The wind: a storm's outflow, and gusts on the steady wind that grow with the rain (gust factor ~1.2 in fair
             // weather, ~1.6 in a downpour); a little sideways too, so a gust does not only push along one line
@@ -212,6 +243,7 @@ namespace Freefall.Graphics
             snow = Snow,
             hail = Hail,
             snowShare = SnowShare,
+            surfaces = new { wetness = SurfaceWetness, puddleFill = PuddleFill, snowCover = SnowCover },
             // What the probe measured at the camera (not eased): the rate, hail, the cloud column's depth and top (m)
             column = new { rate = _column.X, hail = _column.Y, depth = _column.Z, top = _column.W },
             freezingLevel = Clouds.Settings.FreezingLevel,

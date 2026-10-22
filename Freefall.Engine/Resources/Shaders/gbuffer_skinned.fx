@@ -364,7 +364,7 @@ PSOutput PS(VSOutput input)
 
     output.Data = float4(saturate(roughness), saturate(metal), saturate(ao), 1.0);
     output.Depth = input.Depth;
-    output.EntityId = (input.TransformSlot << 8u) | (input.MeshPartIdx & 0xFFu);
+    output.EntityId = (input.TransformSlot << 8u) | (input.MeshPartIdx & 0xFFu) | (3u << 30);   // class 3: characters (decals_cs.hlsl receivers)
     output.Displacement = float2(0, 0);
     
     return output;

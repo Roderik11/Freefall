@@ -239,7 +239,7 @@ PSOutput PS(VSOutput input)
     output.Normal = float4(N, 1.0);
     output.Data = float4(0.85, 0.0, 1.0, 0.5); // roughness, metallic, ao, vegetation lighting flag
     output.Depth = input.Depth;
-    output.EntityId = 0;
+    output.EntityId = 2u << 30;   // class 2: vegetation (decals_cs.hlsl receivers)
 
     return output;
 }
