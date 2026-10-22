@@ -79,6 +79,9 @@ struct CloudParams
     float ShadowTexel;      // metres a texel spans (0 = not made yet)
     float2 ShadowCentre;    // cloud-space xz the map's window is centred on (where the camera's ray toward the light
                             // crosses the slab's bottom, snapped to texels)
+    float FreezingLevel;    // the 0 °C level (m above sea level): which columns precipitate (clouds_cs.hlsl
+                            // PrecipitationAt), and as what (Graphics/Weather.cs)
+    float _precipPad0, _precipPad1, _precipPad2;
 };
 
 // A rain shaft under a raining cell (Clouds.cs PlaceRainShafts): from the clouds' base down to Bottom (the ground, or

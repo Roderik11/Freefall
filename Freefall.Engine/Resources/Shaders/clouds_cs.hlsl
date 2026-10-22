@@ -13,7 +13,9 @@
 //   CSCloudProbeFace  one face of the sky probe's clouds (64², coarser)
 //   CSCloudShadowMap  rows of the ground shadow map: the optical depth toward the light from where a ray crosses the
 //                 slab's bottom, marched through the field (the shadows on the ground, the water, the air)
-// Docs: .agent/knowledge/atmospheric_effects/volumetric_clouds.md.
+//   CSPrecipitation / CSPrecipitationProbe  what reaches the ground round the camera (Graphics/Weather.cs): the map, and
+//                 the camera's own for the CPU
+// Docs: .agent/knowledge/atmospheric_effects/volumetric_clouds.md, weather.md.
 
 #pragma kernel CSCloudBake
 #pragma kernel CSCloudLightInit
@@ -25,6 +27,8 @@
 #pragma kernel CSCloudProbeFace
 #pragma kernel CSCloudSceneDepth
 #pragma kernel CSCloudShadowMap
+#pragma kernel CSPrecipitation
+#pragma kernel CSPrecipitationProbe
 
 // What changes from dispatch to dispatch is pushed: a ComputeShader's Params buffer holds one copy per frame
 cbuffer PushConstants : register(b3)
@@ -50,6 +54,10 @@ cbuffer PushConstants : register(b3)
                                 // scene depth: the G-buffer's linear depth (SourceTexIdx's role there)
     uint PrevSceneDepthTexIdx;  // reconstruct: last frame's (0 = none)
     uint HistoryDepthTexIdx;    // reconstruct: last frame's clouds' depth (km; 0 = none)
+    uint PrecipProbeUAVIdx;     // precipitation probe: RWStructuredBuffer<float4>, the camera's (Graphics/Weather.cs)
+    uint PrecipOriginXBits;     // precipitation: asfloat, the map's corner relative to the camera (m), and its texel
+    uint PrecipOriginZBits;
+    uint PrecipTexelBits;
 };
 
 // The view's reprojection (CloudView: its own ComputeShader, so two views in a frame do not share these)
@@ -1408,4 +1416,98 @@ void CSCloudProbeFace(uint3 id : SV_DispatchThreadID)
         r.color.rgb = r.color.rgb * viewT + inFront * (1.0 - r.color.a);
     }
     target[texel] = r.color;
+}
+
+// ── Precipitation (WEATHER_PLAN.md stage 1; Graphics/Weather.cs) ──
+// What reaches the ground at a place: the ordinary layer by the column over it, the storm cells by their shafts. A column
+// precipitates when the layer's top reaches the ice (over the freezing level by PRECIP_ICE_LIFT: colder than about −6 °C
+// ice crystals grow at the droplets' cost and fall, the Bergeron process) and its cloud here is deep: a deep deck rains or
+// snows, a break in it does not, fair-weather cumulus and a thin overcast stay dry. The towers are left to their cells
+// (the layer's top decides, not theirs): they rain through the middle of their lives under the shafts the march draws
+// (CloudRain), with hail in the cores of the heaviest.
+
+#define PRECIP_STEPS 32
+#define PRECIP_ICE_LIFT 1000.0      // m over the freezing level the layer's top must reach (Weather.IceLift)
+#define PRECIP_ICE_RANGE 1500.0     // ... and how much further up it gives its most (IceRange)
+#define PRECIP_DEPTH_MIN 500.0      // m of cloud overhead before anything reaches the ground (DepthMin)
+#define PRECIP_DEPTH_FULL 2000.0    // ... and with how much the deck gives its most (DepthFull)
+
+// At a camera-relative place (xz, m): the rate (1 = heavy), the hail, the column's cloud depth (m) and its top (m above
+// sea level)
+float4 PrecipitationAt(CloudParams C, Texture3D<float4> lut, float2 rel, float groundY)
+{
+    // The column from level 0 (16 km across: the map's 4 km lie well inside)
+    float2 xz = C.CameraCloud + rel;
+    float dz = (C.SlabTop - C.SlabBottom) / PRECIP_STEPS;
+    float depth = 0.0, top = C.SlabBottom;
+    [loop] for (uint k = 0; k < PRECIP_STEPS; k++)
+    {
+        float h = C.SlabBottom + (k + 0.5) * dz;
+        float d = CloudFieldDensity(CloudSampleLevel(C, 0, xz, h, CloudWrap).x);
+        depth += d * dz;
+        if (d > 0.25)
+            top = h + 0.5 * dz;
+    }
+    // Whether the deck reaches the ice is the weather's (its top, Base + Thickness), how much falls the column's here: the
+    // top measured per column swung with the coverage, and a storm's deck stayed dry over half the town
+    float rate = saturate((C.Base + C.Thickness - C.FreezingLevel - PRECIP_ICE_LIFT) / PRECIP_ICE_RANGE)
+               * saturate((depth - PRECIP_DEPTH_MIN) / (PRECIP_DEPTH_FULL - PRECIP_DEPTH_MIN));
+
+    // The shafts at the ground, leaned downwind as they fall (CloudRain's axis), their edges frayed by the curtains'
+    // noise; virga that ends in the air gives nothing
+    float hail = 0.0;
+    if (C.RainShafts != 0)
+    {
+        StructuredBuffer<CloudRainShaft> shafts = ResourceDescriptorHeap[C.RainShafts];
+        [loop] for (uint i = 0; i < C.RainCount; i++)
+        {
+            CloudRainShaft s = shafts[i];
+            if (s.Bottom > groundY + 50.0)
+                continue;
+            float2 axis = s.Center + C.WindDir * ((C.Base - groundY) * RAIN_LEAN);
+            float dist = length(rel - axis);
+            if (dist > 1.5 * s.Radius)
+                continue;
+            float streak = lut.SampleLevel(CloudWrap, float3((rel - axis) / 900.0 + s.Seed * 13.0, s.Seed), 0).g;
+            float edge = saturate((s.Radius - dist) / (0.5 * s.Radius) + (streak - 0.5) * 0.8);
+            rate = max(rate, s.Rain * edge);
+            hail = max(hail, saturate((s.Rain - 0.7) / 0.3) * saturate((0.5 * s.Radius - dist) / (0.3 * s.Radius)));
+        }
+    }
+    return float4(rate, hail, depth, top);
+}
+
+// The map round the camera (TargetWidth² texels of PrecipTexel m from the camera-relative corner PrecipOrigin): RG16F,
+// the rate and the hail
+[numthreads(8, 8, 1)]
+void CSPrecipitation(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= TargetWidth || id.y >= TargetWidth)
+        return;
+    RWTexture2D<float2> target = ResourceDescriptorHeap[TargetUAVIdx];
+    if (CloudsOn == 0)
+    {
+        target[id.xy] = 0;
+        return;
+    }
+    CloudParams C = LoadClouds();
+    Texture3D<float4> lut = ResourceDescriptorHeap[C.NoiseLut];
+    float texel = asfloat(PrecipTexelBits);
+    float2 rel = float2(asfloat(PrecipOriginXBits), asfloat(PrecipOriginZBits)) + (float2(id.xy) + 0.5) * texel;
+    target[id.xy] = PrecipitationAt(C, lut, rel, CamPos.y).xy;
+}
+
+// The camera's own, for the CPU (Weather reads it back a few frames later)
+[numthreads(1, 1, 1)]
+void CSPrecipitationProbe(uint3 id : SV_DispatchThreadID)
+{
+    RWStructuredBuffer<float4> probe = ResourceDescriptorHeap[PrecipProbeUAVIdx];
+    if (CloudsOn == 0)
+    {
+        probe[0] = 0;
+        return;
+    }
+    CloudParams C = LoadClouds();
+    Texture3D<float4> lut = ResourceDescriptorHeap[C.NoiseLut];
+    probe[0] = PrecipitationAt(C, lut, 0.0, CamPos.y);
 }

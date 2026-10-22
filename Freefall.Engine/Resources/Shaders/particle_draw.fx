@@ -32,6 +32,8 @@ cbuffer PushConstants : register(b3)
 #define BILLBOARD_VELOCITY 1
 #define BILLBOARD_UPRIGHT  2
 
+#define PIXEL_FLOOR 1.5     // pixels: the narrowest a quad is drawn (thinner ones are widened and dimmed to match)
+
 // ────────────── Samplers ──────────────
 
 SamplerState SamplerLinearWrap : register(s0);
@@ -127,6 +129,33 @@ VSOutput VS(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
     output.TextureIdx = e.TextureIdx;
     output.SoftRange = e.SoftEnabled != 0 ? max(e.SoftRange, 0.01) : 0.0;
 
+    // Never narrower than PIXEL_FLOOR pixels: a thinner quad is drawn that wide and as much fainter, the same light over
+    // more pixels. Rain streaks a few millimetres wide and distant flakes are sub-pixel; drawn as they were, they
+    // flickered on and off as they crossed the pixel grid.
+    float drawSize = size, drawWidth = size;
+    {
+        float viewDepth = mul(float4(core.Position, 1.0), View).z;
+        float minWidth = viewDepth > 0.0 ? PIXEL_FLOOR * 2.0 * viewDepth / (Projection._22 * ViewportSize.y) : 0.0;
+        if (e.BillboardMode == BILLBOARD_VELOCITY)
+        {
+            if (size < minWidth)
+            {
+                output.Color *= size / minWidth;          // only the width grows: the streak's length is its own
+                drawWidth = minWidth;
+            }
+        }
+        else
+        {
+            float narrow = size * min(e.Aspect, 1.0);
+            if (narrow > 0.0 && narrow < minWidth)
+            {
+                float grow = minWidth / narrow;
+                output.Color /= grow * grow;              // both sides grow
+                drawSize = size * grow;
+            }
+        }
+    }
+
     // Quad corner in local space
     float2 corner = QuadCorners[vertexID % 6];
     float2 uv = QuadUVs[vertexID % 6];
@@ -174,7 +203,7 @@ VSOutput VS(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
         // Velocity pointing straight at the camera: fall back to the camera right vector
         right = rl > 1e-4 ? right / rl : float3(View._11, View._21, View._31);
 
-        float width  = size;
+        float width  = drawWidth;
         float height = size * e.Aspect + speed * e.StretchFactor;
 
         // No rotation in this mode — orientation is fully defined by velocity
@@ -217,7 +246,7 @@ VSOutput VS(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
             rotated = scaled;
         }
 
-        worldPos = core.Position + (rotated.x * right + rotated.y * up) * size;
+        worldPos = core.Position + (rotated.x * right + rotated.y * up) * drawSize;
 
         // Lean with the wind: the bottom edge stays, the top moves downwind (a flame in its basket).
         // Each sprite wavers at its own phase, or all of them would stand at one fixed slant. A flame

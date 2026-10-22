@@ -22,11 +22,12 @@ namespace Freefall.Graphics
         public float Albedo;            // single-scattering albedo
         public float Speed;             // CloudSpeed: the drift (~32 m/s × it) and the clouds' own change
         public float LightningRate;     // flashes a minute in the raining cells near the camera (0 = none)
+        public float FreezingLevel;     // m above sea level: the 0 °C level (Weather: what precipitates, and as what)
 
         public static CloudSettings Default => new()
         {
             Enabled = false, Coverage = 0.5f, Type = 1f, Base = 1800f, Thickness = 1000f, TowerShare = 0f,
-            TowerTop = 6000f, Density = 0.05f, Albedo = 0.99f, Speed = 1f, LightningRate = 0f,
+            TowerTop = 6000f, Density = 0.05f, Albedo = 0.99f, Speed = 1f, LightningRate = 0f, FreezingLevel = 2500f,
         };
     }
 
@@ -84,6 +85,7 @@ namespace Freefall.Graphics
             public uint ProbeClouds; public uint RainShafts, RainCount; public float FlashIntensity;
             public Vector3 FlashPos; public float FlashSpread;
             public uint ShadowMap; public float ShadowTexel; public Vector2 ShadowCentre;
+            public float FreezingLevel, _pad0, _pad1, _pad2;
         }
 
         // CloudRainShaft in cloud_common.hlsli
@@ -289,6 +291,8 @@ namespace Freefall.Graphics
             if (!Active)
             {
                 _paramsIdx = 0;
+                _shaftCount = 0;
+                Weather.Update(cameraPos, cloudsActive: false);
                 if (_offParams == null)
                 {
                     _offParams = GraphicsBuffer.CreateUpload<GpuParams>(1, mapped: true);
@@ -392,6 +396,7 @@ namespace Freefall.Graphics
             PlaceCells(s, slot);
             PlaceRainShafts(s, slot, cx, cz);
             UpdateFlash(s, cameraPos, cx, cz);
+            Weather.Update(cameraPos, cloudsActive: true);
             _describeCx = cx;
             _describeCz = cz;
             _describeFlash = FlashRelative(cameraPos, cx, cz);
@@ -449,6 +454,7 @@ namespace Freefall.Graphics
                 ShadowMap = _shadowMap!.BindlessIndex,
                 ShadowTexel = ShadowMapTexel,
                 ShadowCentre = centre,
+                FreezingLevel = s.FreezingLevel,
             };
             unsafe { *_params[slot]!.WritePtr<GpuParams>() = p; }
             _paramsIdx = _params[slot]!.SrvIndex;
@@ -574,6 +580,31 @@ namespace Freefall.Graphics
         {
             d -= Period * Math.Floor(d / Period);
             return d >= Period / 2 ? d - Period : d;
+        }
+
+        private const float RainLean = 0.25f;           // clouds_cs.hlsl RAIN_LEAN: metres downwind per metre fallen
+        private const float OutflowPeak = 14f;          // m/s at the edge of the heaviest rain
+
+        /// <summary>
+        /// The wind a storm's downdrafts make at the ground under the camera (xz, m/s; Weather adds it to Wind.Gust): the
+        /// rain drags cold air down its shaft, which spreads out along the ground as a gust front, calm in the core,
+        /// strongest at the rain's edge, dying out a few radii away. Virga's air sinks too (a dry downburst), weaker.
+        /// The shafts are this frame's (PlaceRainShafts), leaned downwind as the march draws them.
+        /// </summary>
+        public static Vector2 StormOutflow(float groundY)
+        {
+            var sum = Vector2.Zero;
+            var lean = Wind.GeneratedDirection * ((Settings.Base - groundY) * RainLean);
+            for (int k = 0; k < _shaftCount; k++)
+            {
+                ref var s = ref _shaftData[k];
+                var away = -(s.Center + lean);                  // from the shaft's axis at the ground to the camera
+                float r = away.Length(), radius = MathF.Max(s.Radius, 1f);
+                if (r < 1f || r > 6f * radius) continue;
+                float x = r / radius;
+                sum += away / r * (OutflowPeak * s.Rain * x * MathF.Exp(1f - x) * (s.Fade > 0f ? 0.7f : 1f));
+            }
+            return sum;
         }
 
         /// <summary>
@@ -707,6 +738,9 @@ namespace Freefall.Graphics
                 level.State = shaderRead;
             }
             PixMarker.End(list);
+
+            // What reaches the ground round the camera (the column over each place, the shafts), from the field just baked
+            Weather.Render(list);
 
             PixMarker.Begin(list, "Cloud light");
             foreach (int i in _lightLevels)

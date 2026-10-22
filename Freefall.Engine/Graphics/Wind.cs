@@ -45,6 +45,48 @@ namespace Freefall.Graphics
         }
 
         /// <summary>
+        /// What the weather adds to the steady wind near the ground (xz, m/s): a storm's outflow and the gusts
+        /// (<see cref="Weather"/>). Vegetation and the weather's particles take it (<see cref="Local"/>); the ocean's wind
+        /// sea keeps the steady wind (<see cref="Current"/>): a sea does not follow a gust, and its spectrum is rebuilt
+        /// whenever its wind changes.
+        /// </summary>
+        public static Vector2 Gust;
+
+        /// <summary>The wind near the ground with its gusts: <see cref="Current"/> plus <see cref="Gust"/> (no gusts while
+        /// the Settings › Wind override is on: tuning wants the wind it sets).</summary>
+        public static Vector3 Local
+        {
+            get
+            {
+                var v = Current;
+                var settings = Engine.Settings;
+                if (settings != null && settings.OverrideWind) return v;
+                return new Vector3(v.X + Gust.X, 0f, v.Z + Gust.Y);
+            }
+        }
+
+        /// <summary>The speed of <see cref="Local"/> (m/s).</summary>
+        public static float LocalStrength
+        {
+            get
+            {
+                var v = Local;
+                return MathF.Sqrt(v.X * v.X + v.Z * v.Z);
+            }
+        }
+
+        /// <summary>Horizontal unit vector <see cref="Local"/> blows towards; zero in a calm.</summary>
+        public static Vector3 LocalDirection
+        {
+            get
+            {
+                var v = Local;
+                float s = MathF.Sqrt(v.X * v.X + v.Z * v.Z);
+                return s > 1e-3f ? new Vector3(v.X / s, 0f, v.Z / s) : Vector3.Zero;
+            }
+        }
+
+        /// <summary>
         /// The wind's heading (radians, 0 = +x, π/2 = +z) at a game time: two smooth noises of the time, one turning it
         /// round over days, one swinging it by tens of degrees over a few hours. At hour 0 it starts near today's old
         /// fixed heading (2, 1). The same time gives the same wind everywhere (a reload, another machine).
@@ -112,8 +154,9 @@ namespace Freefall.Graphics
             double stepped = Math.Round(heading * (180.0 / Math.PI)) * (Math.PI / 180.0);
             _steppedDirection = new Vector2((float)Math.Cos(stepped), (float)Math.Sin(stepped));
 
-            var v = Current;
-            Phase += delta * (0.8f + 0.12f * Strength);
+            // The vegetation's sway and gust pattern follow the wind with its gusts
+            var v = Local;
+            Phase += delta * (0.8f + 0.12f * LocalStrength);
             if (Phase > 10000f) Phase -= 10000f * MathF.Floor(Phase / 10000f);   // keep float precision; the waves don't line up at the wrap, which is rare and brief
 
             var o = Offset + new Vector2(v.X, v.Z) * delta;

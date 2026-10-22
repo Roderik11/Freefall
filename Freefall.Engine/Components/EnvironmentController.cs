@@ -15,12 +15,13 @@ namespace Freefall.Components
     /// <see cref="TransitionDuration"/> seconds. The blended result is pushed every frame into:
     ///   • <see cref="SkyboxRenderer"/> via <c>ApplyPreset</c> (sun, atmosphere, ground fog, clouds, stars)
     ///   • <c>Graphics.AutoExposure.PresetCompensation</c> (how bright the weather reads)
-    ///   • the optional Rain / Snow / Hail / Dust <see cref="ParticleEmitter"/>s (emit rate scaled by
-    ///     the preset's per-type intensity, wind copied to the emitter, emitter parked above the camera)
+    ///   • the optional Rain / Snow / Hail / Dust <see cref="ParticleEmitter"/>s (emit rate scaled by what
+    ///     falls at the camera, wind copied to the emitter, emitter parked above the camera)
     ///
     /// Time of day stays on the <see cref="SkyboxRenderer"/> — a preset describes how a day looks,
-    /// not what time it is. Precipitation is a set of per-type intensities rather than an enum so a
-    /// rain → snow transition simply fades one out while the other fades in.
+    /// not what time it is. Rain, snow and hail are not the preset's: the clouds make them where they are
+    /// deep enough (<see cref="Graphics.Weather"/>), the preset's freezing level says which; walking out from
+    /// under a shower stops it. Dust stays the preset's DustIntensity.
     /// </summary>
     [Icon("icon_sky.png")]
     [UpdateInEditor]
@@ -38,14 +39,17 @@ namespace Freefall.Components
         public SkyboxRenderer Skybox;
 
         [Category("Weather Emitters")]
-        [Description("Emitter scaled by RainIntensity. Its EmitRate is treated as the rate at intensity 1.")]
+        [Description("Emitter scaled by the rain the clouds let fall at the camera (Weather.Rain). Its EmitRate is the rate in heavy rain.")]
         public ParticleEmitter RainEmitter;
 
-        [Description("Emitter scaled by SnowIntensity")]
+        [Description("Emitter scaled by the snow the clouds let fall at the camera (Weather.Snow)")]
         public ParticleEmitter SnowEmitter;
 
-        [Description("Emitter scaled by HailIntensity")]
+        [Description("Emitter scaled by the hail in a storm cell's core (Weather.Hail)")]
         public ParticleEmitter HailEmitter;
+
+        [Description("Emitter scaled by the rain as RainEmitter is, kept at the camera (not raised): the splashes where it lands (shape Ground)")]
+        public ParticleEmitter SplashEmitter;
 
         [Description("Emitter scaled by DustIntensity")]
         public ParticleEmitter DustEmitter;
@@ -64,7 +68,7 @@ namespace Freefall.Components
         [Description("Use the preset's wind for the emitters instead of their authored Wind")]
         public bool DriveWind = true;
 
-        [Description("Seconds of wind drift to lead by: emitters are shifted upwind by Wind * WindLead so blown particles still arrive at the camera")]
+        [Description("Seconds of wind drift to lead by: emitters are shifted upwind by Wind * WindLead so blown particles still arrive at the camera. Not for an emitter with WrapInBox (its particles stay in the box round the camera)")]
         [ValueRange(0f, 5f)]
         public float WindLead = 1.0f;
 
@@ -86,7 +90,7 @@ namespace Freefall.Components
         private bool _primed;
 
         // Emitters we touched last frame, so we can reset their runtime overrides when unassigned
-        private ParticleEmitter _lastRain, _lastSnow, _lastHail, _lastDust;
+        private ParticleEmitter _lastRain, _lastSnow, _lastHail, _lastDust, _lastSplash;
 
         protected override void Awake()
         {
@@ -181,17 +185,18 @@ namespace Freefall.Components
             Graphics.AutoExposure.PresetCompensation = _current.ExposureCompensation;
 
             // Vegetation sways in the preset's wind (grass, flowers, leaves; Graphics.Wind): its speed; the direction is
-            // the generated one, which the clouds drift in too
+            // the generated one, which the clouds drift in too; a storm's outflow and the gusts on top (Weather)
             Graphics.Wind.Speed = _current.WindStrength;
-            var wind = Graphics.Wind.Velocity;
+            var wind = Graphics.Wind.Local;
             var camPos = Camera.Main?.Position ?? Vector3.Zero;
 
             // Every other emitter takes the share of it that its WeatherWind asks for (flames, smoke)
             Graphics.ParticleSystem.WeatherWind = DriveWind ? wind : Vector3.Zero;
 
-            DriveEmitter(ref _lastRain, RainEmitter, _current.RainIntensity, wind, camPos, EmitterHeight);
-            DriveEmitter(ref _lastSnow, SnowEmitter, _current.SnowIntensity, wind, camPos, EmitterHeight);
-            DriveEmitter(ref _lastHail, HailEmitter, _current.HailIntensity, wind, camPos, EmitterHeight);
+            DriveEmitter(ref _lastRain, RainEmitter, Graphics.Weather.Rain, wind, camPos, EmitterHeight);
+            DriveEmitter(ref _lastSnow, SnowEmitter, Graphics.Weather.Snow, wind, camPos, EmitterHeight);
+            DriveEmitter(ref _lastHail, HailEmitter, Graphics.Weather.Hail, wind, camPos, EmitterHeight);
+            DriveEmitter(ref _lastSplash, SplashEmitter, Graphics.Weather.Rain, wind, camPos, 0f);
             // Dust: park it on the terrain under the camera (or a body height below the camera when
             // there is no terrain) so sheets of sand skim the ground instead of floating at eye level.
             _terrain ??= EntityManager.FindComponent<TerrainRenderer>();
@@ -222,7 +227,7 @@ namespace Freefall.Components
                 // Particles born above the camera drift downwind while they fall; spawn them upwind
                 // so the shower still passes through the view instead of blowing past it.
                 var effectiveWind = DriveWind ? wind : emitter.Wind;
-                var lead = height > 0f ? -effectiveWind * WindLead : Vector3.Zero;
+                var lead = height > 0f && !emitter.WrapInBox ? -effectiveWind * WindLead : Vector3.Zero;
                 emitter.Transform.Position = camPos + Vector3.UnitY * height + lead;
             }
         }
@@ -242,7 +247,8 @@ namespace Freefall.Components
             if (_lastSnow != null) ReleaseEmitter(_lastSnow);
             if (_lastHail != null) ReleaseEmitter(_lastHail);
             if (_lastDust != null) ReleaseEmitter(_lastDust);
-            _lastRain = _lastSnow = _lastHail = _lastDust = null;
+            if (_lastSplash != null) ReleaseEmitter(_lastSplash);
+            _lastRain = _lastSnow = _lastHail = _lastDust = _lastSplash = null;
         }
 
         private static void ReleaseEmitter(ParticleEmitter emitter)
@@ -257,6 +263,7 @@ namespace Freefall.Components
             if (_lastSnow != null) ReleaseEmitter(_lastSnow);
             if (_lastHail != null) ReleaseEmitter(_lastHail);
             if (_lastDust != null) ReleaseEmitter(_lastDust);
+            if (_lastSplash != null) ReleaseEmitter(_lastSplash);
         }
     }
 }

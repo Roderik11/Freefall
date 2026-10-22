@@ -24,11 +24,17 @@ namespace Freefall.Graphics
     /// (Material.SkyCaptureRaster). Characters (skinned batches), the terrain and the grass are left out:
     /// sky_visibility.hlsli does the terrain. Shader side: sky_capture.hlsli; sky_visibility_cs.hlsl for the opaque
     /// surfaces, sky_common.fx SkyVisibility for the rest. Docs: physical_atmosphere.md §11.
+    ///
+    /// A 17th slice looks straight down (<see cref="Shelter"/>, WEATHER_PLAN stage 2): the highest mesh over each place,
+    /// where rain and snow stop (roofs, crowns, overhangs). It is not one of the sky's directions (the visibility passes
+    /// loop over the first <see cref="ViewCount"/>) and is drawn first when the captures are due.
     /// </summary>
     public static class SkyCapture
     {
         public const int Resolution = 1024;
         public const int ViewCount = 16;            // sky_capture.hlsli SKY_CAPTURE_VIEWS
+        public const int ShelterSlice = ViewCount;  // the top-down slice after the sky's directions
+        private const int SliceCount = ViewCount + 1;
         private const int Rings = 4;
         public const float Size = 256f;             // metres the captured square spans
         public const float Step = 32f;              // its centre snaps to this grid
@@ -48,7 +54,7 @@ namespace Freefall.Graphics
         }
 
         private static readonly Vector3[] Directions = MakeDirections();
-        private static readonly View[] _views = new View[ViewCount];
+        private static readonly View[] _views = new View[SliceCount];
 
         private static DepthTextureArray2D? _depth;
         private static readonly GraphicsBuffer?[] _viewBuffers = new GraphicsBuffer?[FrameCount];
@@ -87,7 +93,7 @@ namespace Freefall.Graphics
         // Drawn in index order: one azimuth of every ring, then the next.
         private static Vector3[] MakeDirections()
         {
-            var dirs = new Vector3[ViewCount];
+            var dirs = new Vector3[SliceCount];
             int perRing = ViewCount / Rings;
             for (int k = 0; k < perRing; k++)
                 for (int r = 0; r < Rings; r++)
@@ -97,22 +103,32 @@ namespace Freefall.Graphics
                     dirs[k * Rings + r] = new Vector3(
                         MathF.Cos(elevation) * MathF.Sin(azimuth), MathF.Sin(elevation), MathF.Cos(elevation) * MathF.Cos(azimuth));
                 }
+            dirs[ShelterSlice] = Vector3.UnitY;
             return dirs;
         }
 
         private static void EnsureResources()
         {
             if (_depth != null) return;
-            _depth = new DepthTextureArray2D(Resolution, Resolution, ViewCount);
+            _depth = new DepthTextureArray2D(Resolution, Resolution, SliceCount);
             _depthState = ResourceStates.DepthWrite;
             for (int i = 0; i < FrameCount; i++)
             {
-                _viewBuffers[i] = GraphicsBuffer.CreateUpload<View>(ViewCount, mapped: true);
+                _viewBuffers[i] = GraphicsBuffer.CreateUpload<View>(SliceCount, mapped: true);
                 _cullBuffers[i] = GraphicsBuffer.CreateUpload<GPUCuller.CascadeData>(CullViews, mapped: true);
             }
-            for (int v = 0; v < ViewCount; v++)
+            for (int v = 0; v < SliceCount; v++)
                 _views[v] = new View { Direction = Directions[v] };
         }
+
+        /// <summary>
+        /// The top-down capture (rain and snow stop under what it holds): world → its clip space (orthographic, looking
+        /// down; depth grows downward), the depth array and its slice; Depth 0 until it has been drawn (or when off).
+        /// </summary>
+        public static (Matrix4x4 VP, uint Depth, uint Slice) Shelter =>
+            Enabled && _depth != null && _views[ShelterSlice].Valid > 0f
+                ? (_views[ShelterSlice].VP, _depth.BindlessIndex, (uint)ShelterSlice)
+                : (Matrix4x4.Identity, 0u, 0u);
 
         /// <summary>
         /// For the atmosphere's parameters (once per frame): this frame's view buffer (written now and again when a
@@ -137,7 +153,7 @@ namespace Freefall.Graphics
         private static unsafe void WriteViews(int slot)
         {
             var dst = _viewBuffers[slot]!.WritePtr<View>();
-            for (int v = 0; v < ViewCount; v++)
+            for (int v = 0; v < SliceCount; v++)
                 dst[v] = _views[v];
         }
 
@@ -161,14 +177,15 @@ namespace Freefall.Graphics
             if (_invalid || centre != _centre)
             {
                 _centre = centre;
-                _pending = (1 << ViewCount) - 1;
+                _pending = (1 << SliceCount) - 1;
                 _invalid = false;
             }
             if (_pending == 0)
                 return false;
             _renderedTick = Engine.TickCount;
 
-            int view = BitOperations.TrailingZeroCount(_pending);
+            // The shelter first: rain falling through a roof shows at once, a sky direction a frame late does not
+            int view = (_pending & (1 << ShelterSlice)) != 0 ? ShelterSlice : BitOperations.TrailingZeroCount(_pending);
             _pending &= ~(1 << view);
 
             _batches.Clear();
@@ -242,7 +259,8 @@ namespace Freefall.Graphics
         // centre (no shimmer when the square moves).
         private static Matrix4x4 ViewProjection(Vector3 dir, Vector3 centre)
         {
-            var rotation = Matrix4x4.CreateLookAtLeftHanded(Vector3.Zero, -dir, Vector3.UnitY);
+            // Straight down (the shelter) needs another up than the world's
+            var rotation = Matrix4x4.CreateLookAtLeftHanded(Vector3.Zero, -dir, dir.Y > 0.99f ? Vector3.UnitZ : Vector3.UnitY);
             float half = Size * 0.5f;
             var min = new Vector3(float.MaxValue);
             var max = new Vector3(float.MinValue);

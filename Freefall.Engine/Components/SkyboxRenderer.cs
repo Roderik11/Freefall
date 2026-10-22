@@ -157,6 +157,11 @@ namespace Freefall.Components
         [ValueRange(0f, 30f)]
         public float LightningRate = 0f;
 
+        [Description("The 0 °C level, metres above sea level: clouds whose tops reach 1 km over it rain or snow (Graphics." +
+                     "Weather), and what falls is snow over it, sleet in the 300 m under it, rain lower")]
+        [ValueRange(-3000f, 8000f)]
+        public float FreezingLevel = 2500f;
+
         [Button("Lightning flash")]
         [Description("A flash now in the raining storm cell nearest the camera (none without one)")]
         public void LightningFlash() => Clouds.FlashNow();
@@ -309,6 +314,7 @@ namespace Freefall.Components
                 LightningRate = LightningRate,
                 Albedo = CloudAlbedo,
                 Speed = CloudSpeed,
+                FreezingLevel = FreezingLevel,
             };
             Clouds.Advance((float)Time.Delta, Wind.GeneratedDirection, gameHours);
 
@@ -569,6 +575,7 @@ namespace Freefall.Components
             CloudTowerTop = p.CloudTowerTop;
             CloudDensity = p.CloudDensity;
             LightningRate = p.LightningRate;
+            FreezingLevel = p.FreezingLevel;
         }
 
         /// <summary>Capture the current look into a preset (inverse of ApplyPreset) — "save what I tweaked".</summary>
@@ -604,6 +611,7 @@ namespace Freefall.Components
             p.CloudTowerTop = CloudTowerTop;
             p.CloudDensity = CloudDensity;
             p.LightningRate = LightningRate;
+            p.FreezingLevel = FreezingLevel;
         }
 
         public void Draw()

@@ -22,7 +22,9 @@ namespace Freefall.Components
         Circle,      // Flat disc in the local XZ plane
         Box,         // Box of ShapeExtents (half sizes)
         Cone,        // Disc of ShapeRadius; velocity fans outward by ConeAngle
-        Surf         // Where the ocean's surf breaks, within ShapeExtents.XZ of the camera (SurfMist; particle_compute.hlsl)
+        Surf,        // Where the ocean's surf breaks, within ShapeExtents.XZ of the camera (SurfMist; particle_compute.hlsl)
+        Ground       // On whatever the sky sees within ShapeExtents.XZ of the emitter: the highest mesh (a roof, a street, a
+                     // crown) or the terrain (the sky captures' top-down view); rain's splashes
     }
 
     /// <summary>How the initial velocity direction is chosen.</summary>
@@ -112,6 +114,11 @@ namespace Freefall.Components
          Either way particles are born only where a wave breaks (EmitRate counts the slots respawned, each trying up to 16 points around the camera)")]
         public bool SurfMist = false;
 
+        [Category("Shape")]
+        [Description(@"Box shape: a particle that leaves the box sideways comes back in on the far side (rain and snow round
+         the camera: flakes blown tens of metres in their fall stay in view, whatever the wind)")]
+        public bool WrapInBox = false;
+
         // ── Motion ──
 
         [Category("Motion")]
@@ -183,6 +190,11 @@ namespace Freefall.Components
         [Description("Bounce: velocity kept after impact (0 = stop, 1 = perfect bounce)")]
         [ValueRange(0f, 1f)]
         public float Bounciness = 0.3f;
+
+        [Category("Collision")]
+        [Description(@"Rain and snow: a particle dies where something covers it from the sky (roofs, crowns, overhangs: the sky
+         captures' top-down view; the terrain's surface over a cave), on screen or off, and none is born there")]
+        public bool StopUnderCover = false;
 
         // ── Appearance ──
 

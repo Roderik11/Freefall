@@ -32,11 +32,22 @@ cbuffer FrustumPlanes : register(b0)
     uint SortDirection;
 };
 
-// Written once per frame by the view that simulates (root slot 2)
+// Written once per frame by the view that simulates (root slot 2; ParticleSystem.FrameData)
 cbuffer ParticleFrame : register(b1)
 {
     row_major float4x4 CollisionViewProjection; // VP the depth GBuffer was rendered with
+    row_major float4x4 ShelterViewProjection;   // world -> the sky captures' top-down slice (SkyCapture.Shelter)
+    uint ShelterDepthIdx;                       // Texture2DArray<float>: the captures' depth; 0 = not drawn yet
+    uint ShelterSlice;
+    uint TerrainHeightmapIdx;                   // the terrain's baked heights (sky_visibility.hlsli TerrainCover); 0 = none
+    float TerrainMaxHeight;
+    float3 TerrainOrigin;
+    float _framePad0;
+    float2 TerrainSize;
+    float2 _framePad1;
 };
+
+SamplerState LinearClampSampler : register(s2);
 
 cbuffer PushConstants : register(b3)
 {
@@ -72,6 +83,7 @@ cbuffer PushConstants : register(b3)
 #define SHAPE_BOX        4
 #define SHAPE_CONE       5
 #define SHAPE_SURF       6
+#define SHAPE_GROUND     7
 
 #define DIR_DIRECTIONAL  0
 #define DIR_RADIAL       1
@@ -414,17 +426,93 @@ bool spawn_surf(ParticleEmitter e, uint seed, inout ParticleCore p)
     return true;
 }
 
+// The surface the sky sees at a place (world xz): the highest mesh in the sky captures' top-down slice (a roof, a street,
+// a crown), the terrain, the sea's surface, whichever is highest. Over a mesh's edge (its four texels more than 0.3 m apart)
+// the nearest texel, else the four blended: a roof's slope keeps its splashes on it, an eave does not hang them in the air.
+// False when nothing is known there (no capture, no terrain, no sea).
+bool SurfaceUnderSky(float2 xz, out float height)
+{
+    height = -1e9;
+    bool found = false;
+    if (TerrainHeightmapIdx != 0)
+    {
+        Texture2D<float> heights = ResourceDescriptorHeap[TerrainHeightmapIdx];
+        float2 uv = (xz - TerrainOrigin.xz) / TerrainSize;
+        if (all(uv >= 0.0) && all(uv <= 1.0))
+        {
+            height = TerrainOrigin.y + heights.SampleLevel(LinearClampSampler, uv, 0) * TerrainMaxHeight;
+            found = true;
+        }
+    }
+    if (OceanDataIdx != 0)
+    {
+        StructuredBuffer<OceanData> oceans = ResourceDescriptorHeap[OceanDataIdx];
+        height = max(height, oceans[0].OceanPlaneY);
+        found = true;
+    }
+    if (ShelterDepthIdx != 0)
+    {
+        // Looking down the depth depends on y alone: height = (depth - depth at y 0) / VP._23
+        float4 clip0 = mul(float4(xz.x, 0.0, xz.y, 1.0), ShelterViewProjection);
+        float2 uv = float2(clip0.x * 0.5 + 0.5, 0.5 - clip0.y * 0.5);
+        if (all(uv >= 0.0) && all(uv < 1.0))
+        {
+            Texture2DArray<float> depths = ResourceDescriptorHeap[ShelterDepthIdx];
+            uint w, h, n;
+            depths.GetDimensions(w, h, n);
+            float2 t = uv * float2(w, h) - 0.5;
+            int2 i = (int2)floor(t);
+            float2 f = t - i;
+            int2 hi = int2(w, h) - 1;
+            float d00 = depths.Load(int4(clamp(i, 0, hi), ShelterSlice, 0));
+            float d10 = depths.Load(int4(clamp(i + int2(1, 0), 0, hi), ShelterSlice, 0));
+            float d01 = depths.Load(int4(clamp(i + int2(0, 1), 0, hi), ShelterSlice, 0));
+            float d11 = depths.Load(int4(clamp(i + int2(1, 1), 0, hi), ShelterSlice, 0));
+            float invY = 1.0 / ShelterViewProjection._23;
+            float4 hs = (float4(d00, d10, d01, d11) - clip0.z) * invY;
+            float mesh;
+            if (max(max(hs.x, hs.y), max(hs.z, hs.w)) - min(min(hs.x, hs.y), min(hs.z, hs.w)) < 0.3)
+                mesh = lerp(lerp(hs.x, hs.y, f.x), lerp(hs.z, hs.w, f.x), f.y);
+            else
+                mesh = f.y < 0.5 ? (f.x < 0.5 ? hs.x : hs.y) : (f.x < 0.5 ? hs.z : hs.w);
+            // A cleared texel (depth 1) is the captured box's floor: nothing there
+            if (min(min(d00, d10), min(d01, d11)) < 1.0)
+            {
+                height = max(height, mesh);
+                found = true;
+            }
+        }
+    }
+    return found;
+}
+
+// Shape Ground: born on the surface the sky sees at a random place within ShapeExtents.xz of the emitter (rain's
+// splashes: they land where the drops do, on the open surfaces, nothing under a roof). Moves off along EmitDirection at
+// SpeedRange (0 for a splash that stays where it struck). False = nothing known there: the slot stays dead.
+bool spawn_ground(ParticleEmitter e, uint seed, inout ParticleCore p)
+{
+    float2 xz = e.Position.xz + (float2(rand01(seed), rand01(seed + 1u)) * 2.0 - 1.0) * e.ShapeExtents.xz;
+    float height;
+    if (!SurfaceUnderSky(xz, height))
+        return false;
+    p.Position = float3(xz.x, height, xz.y);
+    float speed = rand_range(e.SpeedRange.x, e.SpeedRange.y, seed + 4u);
+    p.Velocity = speed > 0.0 ? rand_cone(local_to_world(e, e.EmitDirection), e.SpreadCos, seed + 5u) * speed : 0.0;
+    return true;
+}
+
 void spawn(ParticleEmitter e, uint seed, out ParticleCore p, out ParticleVisual v)
 {
     [branch]
-    if (e.Shape == SHAPE_SURF)
+    if (e.Shape == SHAPE_SURF || e.Shape == SHAPE_GROUND)
     {
         p.Age = 0.0;
         p.Position = e.Position;
         p.Velocity = 0.0;
         p.Lifetime = max(0.01, e.Lifetime * rand_range(1.0 - e.LifetimeRandomness, 1.0 + e.LifetimeRandomness, seed + 3u));
-        if (!spawn_surf(e, seed + 300u, p))
-            p.Lifetime = 0.0;                                       // nothing breaking here: the slot stays dead
+        bool born = e.Shape == SHAPE_SURF ? spawn_surf(e, seed + 300u, p) : spawn_ground(e, seed + 300u, p);
+        if (!born)
+            p.Lifetime = 0.0;                                       // nothing breaking or nothing known here: the slot stays dead
         v.SizeScale = rand_range(1.0 - e.SizeRandomness, 1.0 + e.SizeRandomness, seed + 5u);
         v.Rotation = (e.RotationRange > 0) ? rand_range(0, 6.283185, seed + 7u) : 0.0;
         v.RotationSpeed = rand_range(-e.RotationRange, e.RotationRange, seed + 8u);
@@ -469,6 +557,41 @@ void spawn(ParticleEmitter e, uint seed, out ParticleCore p, out ParticleVisual 
     v.Random = rand01(seed + 9u);
 }
 
+// ────────────── Shelter (StopUnderCover) ──────────────
+
+#define COVER_BIAS 0.1      // m under a surface before it covers: a drop dies once it has passed into the roof it fell on
+
+// Whether something covers a place from the sky: the terrain's surface over it (a cave, the hill under the ground a drop
+// falls on) or a mesh over it in the sky captures' top-down slice (a roof, a crown, an overhang). Off screen as on it:
+// rain fell through every roof over the camera when only the screen's depth stopped it.
+bool UnderCover(float3 p)
+{
+    if (TerrainHeightmapIdx != 0)
+    {
+        Texture2D<float> heights = ResourceDescriptorHeap[TerrainHeightmapIdx];
+        float2 uv = (p.xz - TerrainOrigin.xz) / TerrainSize;
+        if (all(uv >= 0.0) && all(uv <= 1.0)
+            && TerrainOrigin.y + heights.SampleLevel(LinearClampSampler, uv, 0) * TerrainMaxHeight > p.y + COVER_BIAS)
+            return true;
+    }
+    if (ShelterDepthIdx != 0)
+    {
+        float4 clip = mul(float4(p, 1.0), ShelterViewProjection);
+        float2 uv = float2(clip.x * 0.5 + 0.5, 0.5 - clip.y * 0.5);
+        if (all(uv >= 0.0) && all(uv < 1.0) && clip.z < 1.0)
+        {
+            Texture2DArray<float> depths = ResourceDescriptorHeap[ShelterDepthIdx];
+            uint w, h, n;
+            depths.GetDimensions(w, h, n);
+            float top = depths.Load(int4(int2(uv * float2(w, h)), ShelterSlice, 0));
+            // Metres under the highest mesh there: looking down, the depth grows by -VP._23 a metre
+            if ((clip.z - top) / max(-ShelterViewProjection._23, 1e-9) > COVER_BIAS)
+                return true;
+        }
+    }
+    return false;
+}
+
 // ────────────── Simulation ──────────────
 
 // Integrate one live particle. Returns false when it died this step.
@@ -493,6 +616,19 @@ bool integrate(ParticleEmitter e, inout ParticleCore p)
 
     // Carried along by a moving emitter (FollowEmitter): the flame of a torch goes where the torch goes
     float3 newPos = p.Position + e.Carry + p.Velocity * DeltaTime;
+
+    // Weather round the camera (WrapInBox): what the wind blows out of the box sideways comes back in on the far side, so
+    // the box stays full however far a flake drifts in its fall and wherever the camera goes (the box goes with it)
+    if ((e.Flags & PARTICLE_FLAG_WRAP) != 0)
+    {
+        float2 size = 2.0 * max(e.ShapeExtents.xz, 0.5);
+        float2 rel = newPos.xz - e.Position.xz;
+        newPos.xz = e.Position.xz + rel - size * round(rel / size);
+    }
+
+    // Rain and snow stop where the sky is covered: on the roof, in the crown, on the ground off screen
+    if ((e.Flags & PARTICLE_FLAG_COVER) != 0 && UnderCover(newPos))
+        return false;
 
     bool hit = false;
     float3 hitNormal = float3(0, 1, 0);
@@ -618,10 +754,14 @@ void CSSimulate(uint3 gid : SV_GroupID, uint3 dtid : SV_DispatchThreadID)
             ParticleVisual v;
             spawn(e, pcg_hash(e.RandomSeed + local * 7919u + slot * 6271u), p, v);
 
+            // None born under a roof (the box over a camera in a hall)
+            if ((e.Flags & PARTICLE_FLAG_COVER) != 0 && UnderCover(p.Position))
+                p.Lifetime = 0.0;
+
             RWStructuredBuffer<ParticleVisual> Visuals = ResourceDescriptorHeap[ParticleVisualUAVIdx];
             Visuals[slot] = v;
             Particles[slot] = p;
-            alive = p.Age < p.Lifetime;     // a Surf candidate where nothing breaks is born dead
+            alive = p.Age < p.Lifetime;     // a Surf candidate where nothing breaks is born dead, so is one under cover
         }
         else if ((e.Flags & PARTICLE_FLAG_RESET) != 0)
         {

@@ -9,8 +9,8 @@ namespace Freefall.Assets
     /// <summary>
     /// A complete look for the sky, lighting, fog and weather particles.
     /// Every field is a plain float or color so presets can be linearly blended
-    /// by <see cref="Lerp"/> — that is why precipitation is stored as one intensity
-    /// per type instead of an enum (rain can fade out while snow fades in).
+    /// by <see cref="Lerp"/>. Rain and snow are not set here: the clouds make them where they are deep enough
+    /// (Graphics.Weather), and <see cref="FreezingLevel"/> says which falls.
     ///
     /// A preset says what the air is made of and what lights it; the time of day (SkyboxRenderer.TimeOfDay) does the
     /// rest through the physical atmosphere (Graphics.Atmosphere): the same preset gives the noon, the sunset and the
@@ -137,16 +137,13 @@ namespace Freefall.Assets
         // ── Weather ──
 
         [Category("Weather")]
-        [Description("Rain emitter strength, 0 = off, 1 = the emitter's configured EmitRate")]
-        [ValueRange(0f, 2f)]
-        public float RainIntensity = 0f;
+        [Description("Height of the 0 °C level, metres above sea level. The clouds decide where it rains or snows (a deep " +
+                     "deck whose top reaches 1 km over this level, the storm cells' shafts); this decides what falls: snow " +
+                     "over it, sleet in the 300 m under it, rain lower. Winter: under the ground; summer: 3000-4000")]
+        [ValueRange(-3000f, 8000f)]
+        public float FreezingLevel = 2500f;
 
-        [ValueRange(0f, 2f)]
-        public float SnowIntensity = 0f;
-
-        [ValueRange(0f, 2f)]
-        public float HailIntensity = 0f;
-
+        [Description("Dust emitter strength, 0 = off, 1 = the emitter's configured EmitRate")]
         [ValueRange(0f, 2f)]
         public float DustIntensity = 0f;
 
@@ -201,9 +198,7 @@ namespace Freefall.Assets
 
             dest.ExposureCompensation = L(a.ExposureCompensation, b.ExposureCompensation, t);
 
-            dest.RainIntensity = L(a.RainIntensity, b.RainIntensity, t);
-            dest.SnowIntensity = L(a.SnowIntensity, b.SnowIntensity, t);
-            dest.HailIntensity = L(a.HailIntensity, b.HailIntensity, t);
+            dest.FreezingLevel = L(a.FreezingLevel, b.FreezingLevel, t);
             dest.DustIntensity = L(a.DustIntensity, b.DustIntensity, t);
 
             dest.WindStrength = L(a.WindStrength, b.WindStrength, t);

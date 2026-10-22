@@ -40,6 +40,8 @@ namespace Freefall.Graphics
         private const uint FlagLit = 8;             // = PARTICLE_FLAG_LIT
         private const uint FlagSurfMist = 16;       // = PARTICLE_FLAG_SURF_MIST
         private const uint FlagVolume = 32;         // = PARTICLE_FLAG_VOLUME
+        private const uint FlagWrap = 64;           // = PARTICLE_FLAG_WRAP
+        private const uint FlagCover = 128;         // = PARTICLE_FLAG_COVER
 
         /// <summary>
         /// The weather's wind (world space), set by <see cref="EnvironmentController"/>. Emitters take
@@ -143,6 +145,17 @@ namespace Freefall.Graphics
         private GraphicsBuffer? _visibility;   // one uint per emitter row
         private GraphicsBuffer?[] _frameConstants = new GraphicsBuffer?[CommandBuffer.FrameCount];
         private int _poolSlots;
+
+        // b1 ParticleFrame in particle_compute.hlsl, field for field; written by the view that simulates
+        [StructLayout(LayoutKind.Sequential)]
+        private struct FrameData
+        {
+            public Matrix4x4 CollisionViewProjection;   // the one the depth G-buffer was drawn with
+            public Matrix4x4 ShelterViewProjection;     // SkyCapture.Shelter: world → the top-down capture
+            public uint ShelterDepth, ShelterSlice, TerrainHeightmap; public float TerrainMaxHeight;
+            public Vector3 TerrainOrigin; public float _pad0;
+            public Vector2 TerrainSize; public Vector2 _pad1;
+        }
 
         // Pool contents still to be copied into the grown buffers
         private GraphicsBuffer? _copyCore;
@@ -578,8 +591,9 @@ namespace Freefall.Graphics
                 SoftEnabled = e.SoftParticles ? 1u : 0u,
                 SoftRange = e.SoftRange,
                 BoundsCenter = position + e.Gravity * (0.25f * life * life),
-                // Surf: born anywhere round the camera where the sea breaks, so never culled as a whole (each particle is)
-                BoundsRadius = e.Shape == EmissionShape.Surf ? 1e6f
+                // Surf: born anywhere round the camera where the sea breaks, Ground on whatever surface lies under the sky
+                // there (roofs high over the emitter, a valley floor far below), so never culled as a whole (each particle is)
+                BoundsRadius = e.Shape is EmissionShape.Surf or EmissionShape.Ground ? 1e6f
                     : shape + topSpeed * life + 0.25f * gravity * life * life + drift * life + particleRadius,
                 RenderMode = (uint)mode,
                 Flags = (entry.Reset ? FlagReset : 0u)
@@ -587,7 +601,9 @@ namespace Freefall.Graphics
                     | (e.FlipbookBlend ? FlagFlipbookBlend : 0u)
                     | (e.Lit ? FlagLit : 0u)
                     | (e.SurfMist ? FlagSurfMist : 0u)
-                    | (e.Volumetric && e.Lit ? FlagVolume : 0u),
+                    | (e.Volumetric && e.Lit ? FlagVolume : 0u)
+                    | (e.WrapInBox && e.Shape == EmissionShape.Box ? FlagWrap : 0u)
+                    | (e.StopUnderCover ? FlagCover : 0u),
                 Intensity = MathF.Max(0f, e.Intensity),
                 FadeInRate = e.FadeIn > 0f ? 1f / MathF.Min(e.FadeIn, 1f) : 0f,
                 Turbulence = turbulence,
@@ -668,7 +684,7 @@ namespace Freefall.Graphics
 
                 _drawArgs = GraphicsBuffer.CreateRaw(RenderModeCount * 4, uav: true);
                 for (int i = 0; i < _frameConstants.Length; i++)
-                    _frameConstants[i] = GraphicsBuffer.CreateConstantBuffer<Matrix4x4>();
+                    _frameConstants[i] = GraphicsBuffer.CreateConstantBuffer<FrameData>();
 
                 _emitters = new StreamingBuffer<EmitterRow>(device, 64);
                 _heaps = [device.SrvHeap];
@@ -754,9 +770,28 @@ namespace Freefall.Graphics
             bool depth = simulate && _anyDepthCollision && camera != null
                 && renderer.DepthGBuffer != null && renderer.Normals != null;
             var frameConstants = _frameConstants[Engine.FrameIndex % _frameConstants.Length]!;
+            if (simulate)
+            {
+                // What covers the weather from the sky (StopUnderCover): the meshes seen from above, the terrain's surface
+                var shelter = SkyCapture.Shelter;
+                var terrain = Atmosphere.TerrainCover;
+                unsafe
+                {
+                    *frameConstants.WritePtr<FrameData>() = new FrameData
+                    {
+                        CollisionViewProjection = depth ? camera!.ViewProjection : Matrix4x4.Identity,
+                        ShelterViewProjection = shelter.VP,
+                        ShelterDepth = shelter.Depth,
+                        ShelterSlice = shelter.Slice,
+                        TerrainHeightmap = terrain.Heightmap,
+                        TerrainMaxHeight = terrain.MaxHeight,
+                        TerrainOrigin = terrain.Origin,
+                        TerrainSize = terrain.Size,
+                    };
+                }
+            }
             if (depth)
             {
-                unsafe { *frameConstants.WritePtr<Matrix4x4>() = camera!.ViewProjection; }
                 cmd.ResourceBarrierTransition(renderer.DepthGBuffer!.Native, ResourceStates.RenderTarget, ResourceStates.NonPixelShaderResource);
                 cmd.ResourceBarrierTransition(renderer.Normals!.Native, ResourceStates.RenderTarget, ResourceStates.NonPixelShaderResource);
             }

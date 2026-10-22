@@ -163,8 +163,8 @@ namespace Freefall.Components
                 pair.Value.SetParameter("InstanceDataIdx", Graphics.InstanceData.BindlessIndex);
                 pair.Value.SetParameter("PickPixel", PickHolePixel);
                 pair.Value.SetParameter("PickThroughBones", PickHoleBones);
-                pair.Value.SetParameter("WindDirection", Graphics.Wind.Direction);
-                pair.Value.SetParameter("WindStrength", Graphics.Wind.Strength);
+                pair.Value.SetParameter("WindDirection", Graphics.Wind.LocalDirection);
+                pair.Value.SetParameter("WindStrength", Graphics.Wind.LocalStrength);
                 pair.Value.SetParameter("WindPhase", Graphics.Wind.Phase);
                 pair.Value.SetParameter("WindOffset", Graphics.Wind.Offset);
 
