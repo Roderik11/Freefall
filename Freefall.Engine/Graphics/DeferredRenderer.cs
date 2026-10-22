@@ -69,6 +69,7 @@ namespace Freefall.Graphics
         private readonly DecalPass _decals = new();
         // Screen-space reflections, after the lighting, before the composition (made on first use)
         private ScreenSpaceReflections? _ssr;
+        private PrecipitationLayers? _precipitation;
         private uint _ssrSrv;
         // This view's aerial perspective volume (the far haze), sized to its target: SceneConstants.AerialPerspectiveIdx
         private readonly AerialPerspectiveVolume _aerialPerspective = new();
@@ -1435,6 +1436,14 @@ namespace Freefall.Graphics
              // Depth for PostProcess reads (and the bloom's and finalize's compute)
              Transition(list, Depth.Native, ResourceStates.DepthWrite, ShaderRead);
 
+             // 4b. The rain and snow past the near particles, over the finished forward image (before the exposure is
+             //     measured and the bloom): layers in depth, cut by the linear depth
+             if (PrecipitationLayers.Due)
+             {
+                 _precipitation ??= new PrecipitationLayers();
+                 _precipitation.Execute(list, Composite, DepthGBuffer.BindlessIndex, camera, BindSceneConstantsForCompute);
+             }
+
              // PostProcess pass — only do expensive snapshot copy + transitions if commands are queued
              if (CommandBuffer.HasPendingCommands(RenderPass.PostProcess))
              {
@@ -1603,6 +1612,7 @@ namespace Freefall.Graphics
             _lightClusters.Dispose();
             _decals.Dispose();
             _ssr?.Dispose();
+            _precipitation?.Dispose();
             _aerialPerspective.Dispose();
             _cloudView.Dispose();
             foreach (var tracer in _pointScreenShadows) tracer?.Dispose();

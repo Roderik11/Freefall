@@ -719,6 +719,13 @@ namespace Freefall
          /// </summary>
          public bool ScreenSpaceReflections { get; set; } = true;
 
+         /// <summary>
+         /// The falling rain and snow past the near particles (precipitation_layers_cs.hlsl): layers of streaks and flakes
+         /// from 10 to 70 m, cut by the scene's depth and kept off covered places, so the fall has depth, not specks round
+         /// the camera alone.
+         /// </summary>
+         public bool PrecipitationLayers { get; set; } = true;
+
          [ValueRange(0.5f, 4f)]
          public float GTAOPower{ get; set; } = 1.5f;                       // Visibility exponent (higher = darker)
 

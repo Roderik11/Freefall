@@ -148,7 +148,7 @@ namespace Freefall.Graphics
             float ozone = Math.Clamp(heightKm < 25f ? heightKm / 15f - 2f / 3f : -heightKm / 15f + 8f / 3f, 0f, 1f);
             float fogKm = s.FogDensity * 1000f;
             return RayleighEarth * s.RayleighScale * MathF.Exp(-heightKm / RayleighHeightKm)
-                 + new Vector3((MieScatteringEarth + MieAbsorptionEarth) * s.MieScale * MathF.Exp(-heightKm / MieHeightKm))
+                 + new Vector3(((MieScatteringEarth + MieAbsorptionEarth) * s.MieScale + Weather.HazeKm) * MathF.Exp(-heightKm / MieHeightKm))
                  + new Vector3(fogKm * MathF.Exp(-heightKm / MathF.Max(s.FogHeight * 0.001f, 0.001f)))
                  + OzoneEarth * s.OzoneScale * ozone;
         }

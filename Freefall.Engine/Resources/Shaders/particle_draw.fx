@@ -140,9 +140,9 @@ VSOutput VS(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
     float drawSize = size, drawWidth = size;
     {
         float viewDepth = mul(float4(core.Position, 1.0), View).z;
-        // Drops right at the eye would be out of focus, a blur too faint to see: drawn, a drop a hand's width away was a
-        // white bar across the screen
-        if ((e.Flags & PARTICLE_FLAG_WATER) != 0)
+        // Rain and snow right at the eye would be out of focus, a blur too faint to see: drawn, a drop a hand's width away
+        // was a white bar across the screen, a flake a dark blot on the sky
+        if ((e.Flags & (PARTICLE_FLAG_WATER | PARTICLE_FLAG_COVER)) != 0)
             output.Color *= smoothstep(0.5, 2.0, viewDepth);
         float minWidth = viewDepth > 0.0 ? PIXEL_FLOOR * 2.0 * viewDepth / (Projection._22 * ViewportSize.y) : 0.0;
         if (e.BillboardMode == BILLBOARD_VELOCITY)

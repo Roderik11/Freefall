@@ -146,6 +146,24 @@ float ShelterInside(ShelterLevel l, float2 xz)
     return min(min(xz.x - l.Left, l.Left + l.Size - xz.x), min(l.Top - xz.y, xz.y - (l.Top - l.Size))) - room;
 }
 
+// The share of the sky over a place in the air (world xz at height y) that cover over it hides, 0..1: one lookup blended
+// over its four texels in the finest level that holds it, no disc (rain and snow in the air: precipitation_layers_cs.hlsl)
+float ShelterCoverAt(WeatherShelter s, SamplerState anySampler, float2 xz, float y)
+{
+    [unroll]
+    for (uint k = 0; k < SHELTER_LEVELS; k++)
+    {
+        if (ShelterInside(s.Levels[k], xz) > 0.0)
+        {
+            float4 tops, shares;
+            float2 f;
+            ShelterTexels(s, s.Levels[k], anySampler, xz, tops, shares, f);
+            return WeatherBilinear(shares * step(y, tops), f);
+        }
+    }
+    return 0.0;
+}
+
 // How much of the falling rain and snow reaches a surface (absolute world position), 0..1. Straight down: what lies on
 // the ground must not move with the wind (a fall slanted by the wind moved the snow already lying with every change of
 // the wind, user 2026-10-22). From the finest level that holds the place, blended into the next over the outer 15 % of
