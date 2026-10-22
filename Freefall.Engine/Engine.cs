@@ -28,7 +28,33 @@ namespace Freefall
         public static IXAudio2 AudioDevice { get; private set; }
         public static X3DAudio Audio3D { get; private set; }
         private static IXAudio2MasteringVoice _masteringVoice;
-        
+
+        /// <summary>
+        /// The loudness of everything the game plays, 0..1 (its options' master volume): the mastering voice's volume.
+        /// </summary>
+        public static float MasterVolume
+        {
+            get => _masterVolume;
+            set
+            {
+                _masterVolume = Math.Clamp(value, 0f, 1f);
+                _masteringVoice?.SetVolume(_masterVolume);
+            }
+        }
+        private static float _masterVolume = 1f;
+
+        /// <summary>
+        /// Where the game keeps what belongs to the player on this computer (its options, later saved games). The player
+        /// sets it: %LOCALAPPDATA%\&lt;Product&gt;, beside player.log. Null in the editor, whose play sessions keep nothing.
+        /// </summary>
+        public static string? UserFolder { get; set; }
+
+        /// <summary>
+        /// The game's own window, which the player gives (full screen or a window). Null in the editor: the game is drawn
+        /// in the editor's viewport and has no window to change.
+        /// </summary>
+        public static IGameWindow? Window { get; set; }
+
         public static int TickCount { get; private set; }
 
         // Snapshot list to avoid modification during iteration (Apex pattern)
@@ -125,6 +151,7 @@ namespace Freefall
             // Initialize Audio
             AudioDevice = XAudio2.XAudio2Create(ProcessorSpecifier.DefaultProcessor, true);
             _masteringVoice = AudioDevice.CreateMasteringVoice();
+            _masteringVoice.SetVolume(_masterVolume);
             Audio3D = new X3DAudio(Speakers.FrontLeft | Speakers.FrontRight);
             Debug.Log("[Engine] XAudio2 + X3DAudio initialized");
             
@@ -173,6 +200,7 @@ namespace Freefall
 
             AudioDevice = XAudio2.XAudio2Create(ProcessorSpecifier.DefaultProcessor, true);
             _masteringVoice = AudioDevice.CreateMasteringVoice();
+            _masteringVoice.SetVolume(_masterVolume);
             Audio3D = new X3DAudio(Speakers.FrontLeft | Speakers.FrontRight);
             Debug.Log(editor ? "[Engine] Initialized (editor mode)" : "[Engine] Initialized (game)");
             IsEditor = editor;
@@ -561,8 +589,25 @@ namespace Freefall
         On = 2,         // entries that shade no receiver are left out of the cascades
     }
 
+    /// <summary>The game's window as the player gives it to game code (Engine.Window): its options' window mode.</summary>
+    public interface IGameWindow
+    {
+        /// <summary>True: borderless over the whole screen the window is on. False: a window.</summary>
+        bool Fullscreen { get; set; }
+    }
+
     public class EngineSettings
     {
+        /// <summary>A copy of every setting: the editor keeps one while a game plays, since its options change them.</summary>
+        public EngineSettings Copy() => (EngineSettings)MemberwiseClone();
+
+        /// <summary>Every setting back as in <paramref name="from"/>.</summary>
+        public void Set(EngineSettings from)
+        {
+            foreach (var property in typeof(EngineSettings).GetProperties(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance))
+                if (property.CanRead && property.CanWrite) property.SetValue(this, property.GetValue(from));
+        }
+
          [Category("Display")]
          public bool VSync { get; set; } = true;                            // F1 - VSync
          public bool Wireframe { get; set; } = false;                       // F2 - Global wireframe

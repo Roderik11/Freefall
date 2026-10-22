@@ -1332,6 +1332,15 @@ namespace Freefall.Assets
                 }
             }
 
+            // 6b. Forget what is no longer there: the lookups keep what earlier scans registered, so an asset whose file
+            //     was deleted outside the editor stayed listed (asset_search, the browser) until the editor restarted
+            foreach (var meta in _guidToMeta.Values.ToList())
+            {
+                if (sourceFiles.ContainsKey(NormalizePath(meta.SourcePath))) continue;
+                UnregisterMeta(meta);
+                Debug.Log($"[AssetDatabase] Forgot deleted asset: {meta.SourcePath}");
+            }
+
             // 7. Create .meta for remaining untracked source files
             foreach (var (path, fileInfo) in untrackedFiles)
             {
@@ -1439,6 +1448,27 @@ namespace Freefall.Assets
                 else if (!string.IsNullOrEmpty(meta.MainAssetType))
                 {
                     _sourceGuidCacheType[meta.Guid] = meta.MainAssetType;
+                }
+            }
+        }
+
+        // What RegisterMeta put in the lookups, taken out again: its source file is gone
+        private static void UnregisterMeta(MetaFile meta)
+        {
+            var normalized = NormalizePath(meta.SourcePath);
+            _guidToPath.TryRemove(meta.Guid, out _);
+            if (_pathToGuid.TryGetValue(normalized, out var owner) && owner.Equals(meta.Guid, StringComparison.OrdinalIgnoreCase))
+                _pathToGuid.TryRemove(normalized, out _);
+            _guidToMeta.TryRemove(meta.Guid, out _);
+            _sourceGuidCacheType.TryRemove(meta.Guid, out _);
+
+            lock (meta)
+            {
+                foreach (var sub in meta.SubAssets)
+                {
+                    _subAssetToSource.TryRemove(sub.Guid, out _);
+                    if (_nameToSubAssets.TryGetValue(sub.Name, out var list))
+                        lock (list) { list.RemoveAll(s => s.Guid == sub.Guid); }
                 }
             }
         }

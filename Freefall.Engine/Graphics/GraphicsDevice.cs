@@ -134,6 +134,18 @@ namespace Freefall.Graphics
 
         private bool _deviceRemovedLogged;
 
+        /// <summary>What a device-removed reason (ID3D12Device::GetDeviceRemovedReason) means, in a few words.</summary>
+        public static string RemovedReasonName(int code) => (uint)code switch
+        {
+            0x887A0005 => "DXGI_ERROR_DEVICE_REMOVED: a page fault or an invalid command on the GPU",
+            0x887A0006 => "DXGI_ERROR_DEVICE_HUNG: the GPU took too long or hung (TDR)",
+            0x887A0007 => "DXGI_ERROR_DEVICE_RESET: a badly formed command reset the GPU",
+            0x887A0020 => "DXGI_ERROR_DRIVER_INTERNAL_ERROR: the driver failed",
+            0x887A0001 => "DXGI_ERROR_INVALID_CALL",
+            0x8007000E => "E_OUTOFMEMORY: video memory ran out",
+            _ => "unknown"
+        };
+
         /// <summary>
         /// Log the device-removed reason once, plus the DRED page-fault allocations and the last breadcrumbs of each
         /// command list when DRED is enabled. Written to stdout too, since the process usually dies right after.
@@ -145,7 +157,9 @@ namespace Freefall.Graphics
             IsDeviceLost = true;
 
             var sb = new System.Text.StringBuilder();
-            sb.AppendLine($"[DeviceRemoved] detected in {where}: reason 0x{_device.DeviceRemovedReason.Code:X8}");
+            int code = _device.DeviceRemovedReason.Code;
+            sb.AppendLine($"[DeviceRemoved] detected in {where}: reason 0x{code:X8} ({RemovedReasonName(code)})");
+            if (!DredEnabled) sb.AppendLine("  (FREEFALL_DRED=1 adds the faulting allocations and the pass the GPU was in)");
             if (DredEnabled)
             {
                 try

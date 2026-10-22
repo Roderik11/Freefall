@@ -28,7 +28,9 @@ namespace Freefall.Player
     /// Development switches: <c>--game &lt;folder&gt;</c>, <c>--windowed [WxH]</c>, <c>--screenshot &lt;seconds&gt; &lt;file.png&gt;</c>
     /// (the window that long after the first scene is ready; a negative number: that long after the window opened, while it
     /// may still load), <c>--quit &lt;seconds&gt;</c> (after the first scene is ready), <c>--scene &lt;name&gt;</c> (start in that
-    /// scene of the build's instead of its first).
+    /// scene of the build's instead of its first), <c>--remove-device &lt;seconds&gt;</c> (remove the GPU device that long after
+    /// the first scene is ready, to test how a GPU hang is reported), <c>--dred</c> (D3D12's device-removed breadcrumbs and
+    /// page-fault report, as <c>FREEFALL_DRED=1</c>: a GPU hang then names the pass and the resource in player.log).
     /// </summary>
     static class Program
     {
@@ -45,7 +47,7 @@ namespace Freefall.Player
         static string gameFolder = AppContext.BaseDirectory;
         static bool windowed;
         static System.Drawing.Size windowSize = new(1600, 900);
-        static double screenshotAfter = double.NaN, quitAfter = -1;
+        static double screenshotAfter = double.NaN, quitAfter = -1, removeDeviceAfter = -1;
         static string? screenshotFile;
         static string? startSceneName;  // --scene: start in this scene of the game's instead of its first (tests)
         static readonly System.Diagnostics.Stopwatch sinceStart = new();    // from the start scene being ready
@@ -66,8 +68,16 @@ namespace Freefall.Player
             }
             catch (Exception ex)
             {
+                // A GPU hang or fault reaches the CPU later and elsewhere: as a NullReferenceException from a Map that
+                // returned null, a failed Close or Present. Name the removal and its reason first (DRED's report with
+                // FREEFALL_DRED=1), since the exception alone says nothing about it.
+                int removed = DeviceRemovedCode();
+                if (removed != 0) Engine.Device.LogDeviceRemoved("the player's last frame");
                 Log($"[Player] Stopped by an error: {ex}");
-                MessageBox.Show(ex.Message, "The game stopped", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                var message = removed != 0
+                    ? $"The graphics card stopped responding (0x{removed:X8}, {GraphicsDevice.RemovedReasonName(removed)}).\n\nThe details are in {Path.Combine(UserFolder, "player.log")}."
+                    : ex.Message;
+                MessageBox.Show(message, "The game stopped", MessageBoxButtons.OK, MessageBoxIcon.Error);
                 return 1;
             }
             finally
@@ -81,6 +91,17 @@ namespace Freefall.Player
         /// under Program Files), and a write there threw UnauthorizedAccessException at the first line of the log.
         /// </summary>
         static string UserFolder = "";
+
+        // The device-removed reason when the GPU device is gone (0 when it is fine or was never made)
+        static int DeviceRemovedCode()
+        {
+            try
+            {
+                var reason = Engine.Device?.NativeDevice?.DeviceRemovedReason;
+                return reason is { Failure: true } r ? r.Code : 0;
+            }
+            catch (Exception) { return 0; }
+        }
 
         // No shader compiled yet for this game on this computer: its first start (or one after the cache was cleared)
         static bool FirstStart()
@@ -157,7 +178,8 @@ namespace Freefall.Player
 
             ui = new SquidRenderer(Engine.Device);
             Squid.Gui.Renderer = ui;
-            GameUI.ShowFps = true;   // until the game has options of its own for it
+            Engine.UserFolder = UserFolder;      // the game's options go there
+            Engine.Window = new PlayerWindow();  // and set its window mode through this
             var reported = new HashSet<string>();
             Squid.Gui.ControlException = (control, ex) =>
             {
@@ -262,6 +284,14 @@ namespace Freefall.Player
                 quitAfter = -1;
                 form.Close();
             }
+            if (removeDeviceAfter >= 0 && sinceStart.IsRunning && t >= removeDeviceAfter)
+            {
+                // Tests the report of a GPU hang or fault (DeviceRemovedCode): the device is gone from here on
+                removeDeviceAfter = -1;
+                Log("[Player] --remove-device: removing the GPU device");
+                using var device5 = Engine.Device.NativeDevice.QueryInterfaceOrNull<Vortice.Direct3D12.ID3D12Device5>();
+                device5?.RemoveDevice();
+            }
         }
 
         /// <summary>After the picture is in the back buffer: the game's UI (its desktop draws the marks game code asked for, Graphics.Overlay).</summary>
@@ -292,6 +322,22 @@ namespace Freefall.Player
 
             // One desktop, one batch: the game UI's desktop draws the overlay's marks and the frame rate under its controls
             GameUI.Desktop.Draw();
+        }
+
+        /// <summary>
+        /// The window to game code (Engine.Window): the options' window mode, as Alt+Enter. With <c>--windowed</c> (tests)
+        /// it stays a window, whatever the options say.
+        /// </summary>
+        sealed class PlayerWindow : IGameWindow
+        {
+            public bool Fullscreen
+            {
+                get => form.FormBorderStyle == FormBorderStyle.None;
+                set
+                {
+                    if (!windowed && value != Fullscreen) Program.Fullscreen(value);
+                }
+            }
         }
 
         /// <summary>Borderless over the whole screen the window is on, or back to a window.</summary>
@@ -355,6 +401,13 @@ namespace Freefall.Player
                         break;
                     case "--scene" when i + 1 < args.Length:
                         startSceneName = args[++i];
+                        break;
+                    case "--remove-device" when i + 1 < args.Length:
+                        removeDeviceAfter = double.Parse(args[++i], CultureInfo.InvariantCulture);
+                        break;
+                    case "--dred":
+                        // What FREEFALL_DRED=1 does (read when the device is made), as a switch a tester can put on a shortcut
+                        Environment.SetEnvironmentVariable("FREEFALL_DRED", "1");
                         break;
                 }
             }

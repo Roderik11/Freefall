@@ -175,6 +175,11 @@ namespace Freefall.Editor
             else
                 _playSnapshot = Encoding.UTF8.GetBytes(new Freefall.Serialization.EntitySerializer().SaveToString(EntityManager.Entities.ToArray()));
 
+            // The game's options change the engine's settings, which are the editor's too: Stop puts them back
+            _settingsBeforePlay = Engine.Settings.Copy();
+            _volumeBeforePlay = Engine.MasterVolume;
+            _fpsBeforePlay = Freefall.UI.GameUI.ShowFps;
+
             // The edit scene is cleared in edit mode, then the game starts: play mode and no editor camera before the
             // scene is read. OnSceneLoaded puts the game's cameras on the scene viewport.
             var load = SceneManager.LoadAsync(CurrentScene, _playSnapshot);
@@ -194,6 +199,11 @@ namespace Freefall.Editor
         // The scene as it was when a play that did not save started (StartPlay saveScene: false)
         private byte[]? _playSnapshot;
 
+        // What the game's options may change, as it was when play started
+        private EngineSettings? _settingsBeforePlay;
+        private float _volumeBeforePlay = 1f;
+        private bool _fpsBeforePlay;
+
         /// <summary>
         /// Stop button: the scene as it was saved when play started (or as it was kept in memory), with the editor
         /// camera back. Whatever scene game code loaded meanwhile is gone too.
@@ -211,6 +221,11 @@ namespace Freefall.Editor
                 Engine.SetPlaymode(false);
                 Input.StopSimulation();   // keys a tool held down are let go
                 EditorCamera.CreateCamera();
+
+                if (_settingsBeforePlay != null) Engine.Settings.Set(_settingsBeforePlay);
+                _settingsBeforePlay = null;
+                Engine.MasterVolume = _volumeBeforePlay;
+                Freefall.UI.GameUI.ShowFps = _fpsBeforePlay;
             };
             load.Read += _ =>
             {
