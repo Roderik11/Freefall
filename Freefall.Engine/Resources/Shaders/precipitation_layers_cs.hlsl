@@ -33,7 +33,8 @@ struct PrecipFrame
     float ShelterRangeY;
     float Rain;                 // Weather.Rain, Snow at the camera (0..1)
     float Snow;
-    float2 Wind;                // the wind the particles fall in (Wind.Local, xz, m/s)
+    float WindAcross;           // the steady wind across the view (m/s along +azimuth at the view's middle), eased
+    float _pad;
     float HazeKm;               // Weather.HazeKm
     float PixelAngle;           // radians a pixel spans (vertically, at the screen's middle)
 };
@@ -84,15 +85,16 @@ float LayerCoverage(float az, float el, float d, float windAcross, uint layer, b
     float many = min(cell.x * cell.y * perArea, 2.0);   // drops a drawn one stands for (1..2)
     float fall = snow ? SNOW_FALL : RAIN_FALL;
     // Cells round the sphere, a whole number of them; down it, scrolled by the fall
+    // The field in the falling air's own frame: the drops move (wind, -fall) metres a second on the sphere (x along
+    // +azimuth, y up), so a place on it at time t holds the drop that was at (x - wind t, y + fall t). A streak lies along
+    // that motion: across the field u = x + slant y holds still, down it v = y + fall t scrolls, and the drops slide down
+    // their own lean. With the shear on the scrolled v the cells fell straight down under streaks leaning the other way
+    // (user, 2026-10-23: "falling straight down ... sometimes flying against their lean"). At most 45°.
+    float slant = clamp(windAcross / fall, -1.0, 1.0);
     float around = max(1.0, round(6.2831853 * d / cell.x));
-    float u = az / 6.2831853 * around;
+    float u = az / 6.2831853 * around + slant * el * d / cell.x;
     // (the scroll wraps after 2^16 cells, an hour and more, so the cell's fraction keeps its precision)
     float v = el * d / cell.y + fmod(fall * Time / cell.y, 65536.0);
-    // Leaning and drifting with the wind across the view, one shear for the whole screen (metres sideways per metre of
-    // fall, at most 45°): the wind across each direction made each column drift at its own rate, and the field wound
-    // up into arcs as the time ran on
-    float slant = clamp(windAcross / fall, -1.0, 1.0);
-    u -= slant * v * cell.y / cell.x;
 
     int2 c = int2(floor(u), floor(v));
     c.x = (int)((uint)(c.x % (int)around + (int)around) % (uint)around);
@@ -138,9 +140,8 @@ void CSLayers(uint3 id : SV_DispatchThreadID)
     float3 dir = normalize(posFromDepth(uv, 1.0, CameraInverse).xyz);   // reverse Z: depth 1 = the near plane
     float viewZPerMetre = max(mul(float4(dir, 0.0), View).z, 1e-3);
     float az = atan2(dir.x, dir.z), el = asin(clamp(dir.y, -1.0, 1.0));
-    // The wind across the view: along the camera's right (the +azimuth direction at the screen's middle)
-    float3 right = float3(View._11, View._21, View._31);
-    float windAcross = dot(P.Wind, normalize(right.xz + 1e-6));
+    // One wind across the view for the whole screen: per direction the lattice folded where the lean changed fast
+    float windAcross = P.WindAcross;
 
     WeatherShelter s;
     s.Levels = P.Shelter;
