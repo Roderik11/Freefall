@@ -29,8 +29,13 @@ struct Settings
     uint AtlasColumns;          //= 1          -- Tiles across the textures (Decal.Variant picks one)
     uint AtlasRows;             //= 1          -- Tiles down
     uint Receivers;             //= 3 [0, 15]  -- What it lands on, a bit each: 1 static meshes, 2 terrain, 4 vegetation, 8 characters
-    bool RainFilled;            //= false      -- Puddles: as full as the rain has made the ground wet (the middle, where the opacity is highest, fills first), a damp edge round the water
+    bool RainFilled;            //= false      -- Puddles: the opacity is the hollow's depth (the middle fills first). Damp first, water once the rain's puddles are a quarter full, its surface level with the shoreline (the height settings and map are not used); drying, the water goes and a damp stain shrinks to the middle
     float Ripples;              //= 0 [0, 2]   -- Puddles: rings where the drops strike, as many as the rain at the camera
+    float DentDepth;            //= 0 [0, 0.08] -- Puddles: metres the ground sinks at the deepest, wet or dry (the screen-space displacement, sloped normals): the hollow the rain fills and the snow drifts into
+    float3 SiltColor;           //= 0.6, 0.53, 0.44 -- Puddles: the silt and grit the water leaves in the hollow, multiplying the ground (in its joints most, a dusting on the stones)
+    float SiltOpacity;          //= 0 [0, 1]   -- Puddles: how much silt covers the hollow's floor (0 = none)
+    float SiltRoughness;        //= 0.85 [0, 1] -- Puddles: the dry silt's roughness
+    float SiltFlatten;          //= 0.5 [0, 1] -- Puddles: how much the silt evens out the stones in the hollow (fills their joints)
 };
 
 Settings LoadDecalSettings(uint materialsIdx, uint materialId)

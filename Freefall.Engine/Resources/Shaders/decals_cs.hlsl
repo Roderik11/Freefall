@@ -139,7 +139,13 @@ struct Surface
     float4 Data;            // roughness, metal, AO, a the lighting model (kept)
     float Depth;            // linear depth minus the height bias
     float2 Displacement;    // the screen-space displacement vector
+    float Dent;             // metres the decals sank it (puddles' hollows): the weather's relief is measured from there
 };
+
+// Metres of relief that count as a surface's high spot: the terrain's layers (gputerrain.fx, up to 0.05), a mesh's
+// height map (gbuffer.fx: ~0.01 m at a tile a metre)
+float ReliefScale(uint surfaceClass) { return surfaceClass == 1u ? 0.035 : 0.008; }
+
 
 // Camera-relative place of the surface at a pixel (the hardware depth; 0 = sky)
 float3 SurfaceAt(Texture2D<float> depthTex, int2 px, out float depth)
@@ -189,6 +195,20 @@ float2 RippleTilt(float2 p, float rate)
     return tilt * 0.35;
 }
 
+// The screen-space displacement of the surface at `rel` raised h metres along `axis`, as gbuffer.fx writes it, faded at
+// the screen's edges (the inversion never needs off-screen sources); viewZ its undisplaced view depth
+float2 DisplacementFor(float3 rel, float3 axis, float h, out float viewZ)
+{
+    float4 clipPos = mul(float4(rel, 1.0), CameraRelativeVP);
+    float4 clipDisp = mul(float4(rel + axis * h, 1.0), CameraRelativeVP);
+    viewZ = clipPos.w;
+    float2 ndcPos = clipPos.xy / clipPos.w;
+    float2 displacement = (clipDisp.xy / clipDisp.w - ndcPos) * float2(0.5, -0.5);
+    float2 screenUV = ndcPos * float2(0.5, -0.5) + 0.5;
+    return displacement * saturate(min(min(screenUV.x, 1.0 - screenUV.x), min(screenUV.y, 1.0 - screenUV.y))
+                                   / max(length(displacement), 1e-6));
+}
+
 // One decal at this pixel: into its box, its receivers, its fades, its material, then its modes on the surface
 void ApplyDecal(uint i, float3 rel, float3 geo, float3 dx, float3 dy, uint surfaceClass, float rain, float puddleFill,
     inout Surface s)
@@ -235,31 +255,70 @@ void ApplyDecal(uint i, float3 rel, float3 geo, float3 dx, float3 dy, uint surfa
     float3 colour = albedo.rgb * S.Color * r.Tint;
 
     // The opacity of colour and roughness, and that of normal and relief: one for plain decals; for a puddle the water
-    // (all of them) and a damp edge round it (colour and roughness only)
+    // (all of them) and the damp (colour and roughness only), and its hollow and silt, there when dry too
     float paint = albedo.a, water = albedo.a;
+    float body = 0.0, bowl = 0.0, level = 1.0, silt = 0.0, rim = 0.0;
+    float2 slope = 0;
     if (S.RainFilled)
     {
-        // The water's outline from the opacity blurred (mip 3 or coarser, as the screen needs): its specks are damp spots
-        // round the puddle, not water, and once the puddle was nearly full they speckled its edge with drops
+        // The puddle's shape from the opacity blurred (mip 3 or coarser, as the screen needs): its specks are damp spots
+        // round it, not water, and once the puddle was nearly full they speckled its edge with drops. The same depth
+        // sinks the ground (DentDepth), and its slope per metre across the surface tilts the stones toward the middle
         uint tw, th;
         albedoTex.GetDimensions(tw, th);
         float2 size = float2(tw, th);
-        float screenMip = log2(max(max(length(uvDx * size), length(uvDy * size)), 1e-6));
-        float body = albedoTex.SampleLevel(Sampler, uv, max(screenMip + 1.0, 3.0)).a;
-        float level = 1.0 - saturate(puddleFill);
-        water = smoothstep(level, level + 0.08, body) * step(0.001, puddleFill);
-        paint = max(water, 0.6 * smoothstep(level - 0.25, level, albedo.a) * step(0.001, puddleFill));
+        float mip = max(log2(max(max(length(uvDx * size), length(uvDy * size)), 1e-6)) + 1.0, 3.0);
+        // (faded out over the box's sides: blurred, the specks leave the depth above 0 out to the tile's edge, and the
+        // box cut the silt off in a straight line)
+        float sides = saturate((0.5 - max(abs(local.x), abs(local.z))) / 0.06);
+        body = albedoTex.SampleLevel(Sampler, uv, mip).a * sides;
+        // The hollow itself is a wide bowl, the depth two mips blurrier: from the outline's depth (flat middles, short
+        // edges) its slope was a thin ring round the water and the hollow did not read
+        float bowlMip = mip + 2.0;
+        bowl = albedoTex.SampleLevel(Sampler, uv, bowlMip).a * sides;
+        float2 e = 1.5 * exp2(bowlMip) / size;
+        float2 grad = float2(albedoTex.SampleLevel(Sampler, uv + float2(e.x, 0), bowlMip).a - albedoTex.SampleLevel(Sampler, uv - float2(e.x, 0), bowlMip).a,
+                             albedoTex.SampleLevel(Sampler, uv + float2(0, e.y), bowlMip).a - albedoTex.SampleLevel(Sampler, uv - float2(0, e.y), bowlMip).a);
+        slope = grad / (2.0 * e) * tileSize * sqrt(float2(invLen2.x, invLen2.z)) * sides;
+        // Rain makes it damp first, the damp spreading out from the middle; water once the rain's puddles are a quarter
+        // full, its surface level with the shoreline. Drying runs back: the water goes, then the damp shrinks to the
+        // middle, a stain that outlasts the water (the fill drains 4× slower than the ground dries: Weather.PuddleFill)
+        float fill = saturate(puddleFill);
+        float waterFill = saturate((fill - 0.25) / 0.75);
+        level = 1.0 - waterFill;
+        water = smoothstep(level, level + 0.08, body) * step(0.001, waterFill);
+        float dampLevel = 1.0 - min(fill * 1.6, 1.0);
+        paint = max(water, 0.6 * smoothstep(dampLevel, dampLevel + 0.15, albedo.a) * step(0.001, fill));
+        // Dry, what the water left in the hollow: silt in the stones' joints, a dusting on their tops, and a darker line
+        // where the water stood
+        float relief = saturate((mul(float4(rel, 1.0), CameraRelativeVP).w - s.Depth) / ReliefScale(surfaceClass));
+        silt = S.SiltOpacity * smoothstep(0.04, 0.35, bowl) * lerp(1.0, 0.5, relief);
+        rim = smoothstep(0.1, 0.17, body) * (1.0 - smoothstep(0.17, 0.3, body)) * saturate(S.SiltOpacity * 2.0);
     }
     float aColour = paint * fade, aShape = water * fade;
-    if (aColour <= 0.0 && aShape <= 0.0)
+    float aDent = S.RainFilled && S.DentDepth > 0.0 ? fade * S.HeightOpacity : 0.0;
+    float aSilt = silt * fade;
+    if (aColour <= 0.0 && aShape <= 0.0 && aDent <= 0.0 && aSilt <= 0.0 && rim <= 0.0)
         return;
 
-    // Colour
+    // Colour: a puddle's silt multiplies the ground by SiltColor (a set colour was a grey haze on bright sandstone and
+    // would vanish on dark cobbles), and the water line darkens it; then the decal's colour (its water and damp darken
+    // the silt too)
+    if (aSilt > 0.0 || rim > 0.0)
+        s.Albedo.rgb = lerp(s.Albedo.rgb, s.Albedo.rgb * S.SiltColor, aSilt) * (1.0 - 0.15 * rim * fade);
     float aA = aColour * S.AlbedoOpacity;
     if (S.AlbedoMode == 1u)
         s.Albedo.rgb *= lerp(1.0, colour, aA);
     else
         s.Albedo.rgb = lerp(s.Albedo.rgb, colour, aA);
+
+    // A puddle's hollow: the silt evens out the stones in it, its slope tilts them toward the middle (a height field's
+    // normal, axis + DentDepth × the depth's slope along the tangent and bitangent, steepened by NormalStrength)
+    if (aDent > 0.0 || aSilt > 0.0)
+    {
+        float3 n0 = normalize(lerp(s.Normal.xyz, axis, aSilt * S.SiltFlatten));
+        s.Normal.xyz = normalize(n0 + (tangent * slope.x + bitangent * slope.y) * (S.DentDepth * S.NormalStrength * aDent));
+    }
 
     // Normal (the map's y flipped as gbuffer.fx does: OpenGL-convention maps), the rain's rings on a puddle's water
     float aN = aShape * S.NormalOpacity;
@@ -279,7 +338,9 @@ void ApplyDecal(uint i, float3 rel, float3 geo, float3 dx, float3 dy, uint surfa
         s.Normal.xyz = S.NormalMode == 0u ? normalize(lerp(s.Normal.xyz, n, aN)) : normalize(s.Normal.xyz + (n - axis) * aN);
     }
 
-    // Roughness, metal, AO
+    // Roughness, metal, AO (a puddle's dry silt first)
+    if (aSilt > 0.0)
+        s.Data.r = lerp(s.Data.r, S.SiltRoughness, aSilt);
     float aM = aColour * S.MaskOpacity;
     if (aM > 0.0)
     {
@@ -289,23 +350,42 @@ void ApplyDecal(uint i, float3 rel, float3 geo, float3 dx, float3 dy, uint surfa
     }
 
     // Relief for the screen-space displacement: as gbuffer.fx writes it, along the axis out of the surface
+    if (S.RainFilled)
+    {
+        // A puddle: the silt fills the stones' joints part of the way up (SiltFlatten × a high spot's relief), the
+        // hollow sinks it all by the bowl × DentDepth; the water's surface flat, level with the shoreline (about the
+        // depth at the water's edge)
+        float viewZ;
+        float hDent = -S.DentDepth * bowl;
+        float2 dent = DisplacementFor(rel, axis, hDent, viewZ);
+        if (aSilt > 0.0)
+            s.Depth = lerp(s.Depth, min(s.Depth, viewZ - S.SiltFlatten * ReliefScale(surfaceClass)), saturate(aSilt * 2.0));
+        if (aDent > 0.0)
+        {
+            s.Displacement += dent * aDent;
+            s.Depth -= hDent * aDent;
+            s.Dent -= hDent * aDent;
+        }
+        float aW = aShape * S.HeightOpacity;
+        if (aW > 0.0)
+        {
+            float hWater = -S.DentDepth * level;
+            float2 surface = DisplacementFor(rel, axis, hWater, viewZ);
+            s.Displacement = lerp(s.Displacement, surface, aW);
+            s.Depth = lerp(s.Depth, viewZ - hWater, aW);
+        }
+        return;
+    }
     float aH = aShape * S.HeightOpacity;
     if (aH > 0.0)
     {
         Texture2D heightTex = ResourceDescriptorHeap[NonUniformResourceIndex(S.Height)];
-        float h = lerp(S.HeightMin, S.HeightMax, heightTex.SampleGrad(Sampler, uv, uvDx, uvDy).r);
-        float4 clipPos = mul(float4(rel, 1.0), CameraRelativeVP);
-        float4 clipDisp = mul(float4(rel + axis * h, 1.0), CameraRelativeVP);
-        float2 ndcPos = clipPos.xy / clipPos.w;
-        float2 displacement = (clipDisp.xy / clipDisp.w - ndcPos) * float2(0.5, -0.5);
-        // Faded at the screen's edges, as gbuffer.fx: the inversion never needs off-screen sources
-        float2 screenUV = ndcPos * float2(0.5, -0.5) + 0.5;
-        displacement *= saturate(min(min(screenUV.x, 1.0 - screenUV.x), min(screenUV.y, 1.0 - screenUV.y))
-                                 / max(length(displacement), 1e-6));
+        float h = lerp(S.HeightMin, S.HeightMax, heightTex.SampleGrad(Sampler, uv, uvDx, uvDy).r), viewZ;
+        float2 displacement = DisplacementFor(rel, axis, h, viewZ);
         if (S.HeightMode == 1u)
         {
             s.Displacement = lerp(s.Displacement, displacement, aH);
-            s.Depth = lerp(s.Depth, clipPos.w - h, aH);
+            s.Depth = lerp(s.Depth, viewZ - h, aH);
         }
         else
         {
@@ -328,8 +408,6 @@ float SnowNoise(float2 xz) { return 0.65 * SnowNoise1(xz * 0.8, 101u) + 0.35 * S
 
 #define SNOW_ALBEDO float3(0.70, 0.72, 0.76)   // packed old snow, a little blue: the dark palette's near white
 #define SNOW_ROUGHNESS 0.8
-#define SNOW_RELIEF_TERRAIN 0.035                // m of relief that counts as a high spot: the terrain's layers (up to 0.05)
-#define SNOW_RELIEF_MESH 0.008                   // ... a mesh's height map (gbuffer.fx: ~0.01 m at a tile a metre)
 
 // How much of the falling rain and snow reaches a surface (straight down, soft under eaves), looked for a little out
 // from it: a wall in the open is not covered by its own top, a floor under a roof is
@@ -359,9 +437,12 @@ void ApplyWeather(DecalFrame f, float3 rel, float3 geo, uint surfaceClass, float
     float3 N = normalize(s.Normal.xyz);
     float vegetation = s.Data.a < 0.75 ? 1.0 : 0.0;
     // How far this pixel stands up from its surface, 0..1: the linear depth's height bias (gbuffer.fx, gputerrain.fx)
-    // over the terrain layers' 5 cm or a mesh's ~1 cm. Snow lies on the high spots first, the rain stands in the low ones
+    // over the terrain layers' 5 cm or a mesh's ~1 cm, from the floor of a puddle's hollow where one sank it. Snow lies
+    // on the high spots first, the rain stands in the low ones; the hollows themselves (2 cm deep and more) fill with
+    // snow before anything: it drifts into them
     float linearDepth = dot(rel, f.CameraForward);
-    float relief = saturate(max(linearDepth - s.Depth, 0.0) / (surfaceClass == 1u ? SNOW_RELIEF_TERRAIN : SNOW_RELIEF_MESH));
+    float relief = saturate(max(linearDepth - s.Depth + s.Dent, 0.0) / ReliefScale(surfaceClass));
+    float hollow = saturate(s.Dent / 0.02);
     float footprint = linearDepth / f.PixelsPerMetre;   // metres a pixel spans
 
     // Snow: thin, it lies on the surface's high spots first (the stones' tops, pebbles, clods: their relief, which the
@@ -375,7 +456,7 @@ void ApplyWeather(DecalFrame f, float3 rel, float3 geo, uint surfaceClass, float
         float up = smoothstep(0.35, 0.85, lerp(N.y, geo.y, cover)) * smoothstep(0.2, 0.6, geo.y);
         float drift = SnowNoise(world.xz * 0.35);
         float t = 1.0 - cover;
-        snow = smoothstep(t - 0.06, t + 0.06, up * (0.1 + 0.5 * relief + 0.4 * drift)) * saturate(up * 3.0);
+        snow = smoothstep(t - 0.06, t + 0.06, up * (0.1 + 0.5 * relief + 0.4 * drift + 0.7 * hollow)) * saturate(up * 3.0);
     }
 
     float facing = geo.y >= 0.0 ? lerp(0.35, 1.0, geo.y) : saturate(0.35 + geo.y);
@@ -416,8 +497,9 @@ void ApplyWeather(DecalFrame f, float3 rel, float3 geo, uint surfaceClass, float
     {
         // A thin dusting lets the ground show through; deep snow is its own surface, smooth over the stones' relief
         // (their normals, AO and displacement buried under it). Thin, it lies on the relief and keeps it.
-        float dust = snow * lerp(0.45, 1.0, smoothstep(0.0, 0.6, cover));
-        float buried = snow * smoothstep(0.3, 0.9, cover);
+        // (deeper sooner in a hollow, the snow drifted into it)
+        float dust = snow * lerp(0.45, 1.0, smoothstep(0.0, 0.6, cover + 0.4 * hollow));
+        float buried = snow * smoothstep(0.3, 0.9, cover + 0.4 * hollow);
         s.Albedo.rgb = lerp(s.Albedo.rgb, SNOW_ALBEDO, dust);
         s.Data.rgb = lerp(s.Data.rgb, float3(SNOW_ROUGHNESS, 0.0, lerp(s.Data.b, 1.0, buried)), dust);
         s.Normal.xyz = normalize(lerp(N, normalize(geo + float3(0, 1, 0)), buried));
@@ -503,6 +585,7 @@ void CSDecals(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint gi : S
     s.Data = dataUav[px];
     s.Depth = depthUav[px];
     s.Displacement = heightUav[px];
+    s.Dent = 0.0;
     Surface before = s;
 
     // The weather reaches puddles and surfaces alike: a puddle under a stall's roof stays dry, no rings under an eave
