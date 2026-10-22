@@ -160,19 +160,30 @@ namespace Freefall.Graphics
                 MeterLuminance = _meterRows[0].X;
                 _incidentEV = IncidentEV(_meterRows[0].X, _meterRows[0].Y);
                 float range = Math.Clamp(settings.ExposureScreenRange, 0f, 8f);
+                float screenOver = metered - _incidentEV;      // + = the frame is brighter than the light at the camera
                 if (range < 8f)
-                    metered = range > 0f ? _incidentEV + range * MathF.Tanh((metered - _incidentEV) / range) : _incidentEV;
+                {
+                    // Toward a darker image (sunlit land seen from the shade of a tree or a cloud) the screen may move it
+                    // ExposureScreenRangeDarken: by its 1 EV the sunlit part burnt out, exposed for the shade. Toward a
+                    // brighter one (a dark wall faced from the shade) it keeps ExposureScreenRange, so turning round in
+                    // the same shade still keeps it as bright (§7.1). One tanh each way: one for one near the meter.
+                    float r = screenOver > 0f ? MathF.Max(range, Math.Clamp(settings.ExposureScreenRangeDarken, 0f, 8f)) : range;
+                    metered = r > 0f ? _incidentEV + r * MathF.Tanh(screenOver / r) : _incidentEV;
+                }
 
                 // A passing cloud's shade: the eye adapts to the day round it (the meter with the clouds' mean beam round
                 // the camera for the sun's shadow at the taps), and keeps a share of how much darker the camera's spot is.
                 // Adapted all the way, the shade came out as bright as the sun and flat. Only darker: in the sun under
                 // broken cumulus the spot is brighter than the mean (−0.5 EV on Clear Day), and keeping that brightened
-                // every sunny view the exposure was calibrated on. An even deck is its own mean: nothing kept.
+                // every sunny view the exposure was calibrated on. An even deck is its own mean: nothing kept. Where the
+                // frame is the brighter (the screen pulled toward darker already) never past the frame's own metering: the
+                // two together darkened a sunlit view seen from a cloud's shade below what it needs.
                 _cloudShadeEV = 0f;
                 if (_meterRows[4].Y > 0f)
                 {
                     _cloudShadeEV = IncidentEV(_meterRows[4].X, _meterRows[4].Y) - _incidentEV;
-                    metered += Math.Clamp(settings.ExposureCloudShadeKeep, 0f, 1f) * MathF.Max(_cloudShadeEV, 0f);
+                    float withShade = metered + Math.Clamp(settings.ExposureCloudShadeKeep, 0f, 1f) * MathF.Max(_cloudShadeEV, 0f);
+                    metered = screenOver > 0f ? MathF.Max(metered, MathF.Min(withShade, _screenEV)) : withShade;
                 }
             }
 

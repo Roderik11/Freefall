@@ -784,6 +784,13 @@ namespace Freefall
          [ValueRange(0f, 8f)]
          public float ExposureScreenRange { get; set; } = 1f;
 
+         // The same toward a darker image, when the frame is brighter than the light at the camera (sunlit land seen from
+         // the shade of a tree or a cloud): by ExposureScreenRange alone the sunlit part burnt out, exposed for the shade.
+         // The eye adapts to a bright view fast. Never less than ExposureScreenRange. 3 = the user's pick (2026-10-22, from
+         // 1/2/3/4 in a tree's deep shade facing a sunny meadow: at 2 the meadow was still bleached).
+         [ValueRange(0f, 8f)]
+         public float ExposureScreenRangeDarken { get; set; } = 3f;
+
          // Dim light: below ExposureDimLightEV (the metered EV100 before compensation; a clear noon meters ~14.8, an
          // overcast one ~14) the exposure follows the scene only partly. Of each EV the scene loses there, this share
          // still darkens the image, so dusk reads darker than day and a moonlit night darker than dusk; 0 = the eye
