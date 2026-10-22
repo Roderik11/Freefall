@@ -712,6 +712,13 @@ namespace Freefall
          /// </summary>
          public bool AmbientSpecular { get; set; } = true;
 
+         /// <summary>
+         /// Screen-space reflections on surfaces smoother than roughness 0.45 (ssr_cs.hlsl, half resolution): puddles and
+         /// soaked flat ground mirror the houses and the lanterns; where a ray finds nothing the sky probe stays. Needs
+         /// AmbientSpecular.
+         /// </summary>
+         public bool ScreenSpaceReflections { get; set; } = true;
+
          [ValueRange(0.5f, 4f)]
          public float GTAOPower{ get; set; } = 1.5f;                       // Visibility exponent (higher = darker)
 

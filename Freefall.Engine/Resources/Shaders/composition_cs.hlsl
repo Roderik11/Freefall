@@ -22,7 +22,7 @@ cbuffer Params : register(b4)
     uint SSDMTexIdx;
     float AODirectStrength;   // how much GTAO also darkens direct light (0 = ambient only)
     uint AmbientSpecular;     // 1: the sky's light reflected by every lit surface (EngineSettings.AmbientSpecular)
-    uint _compPad;
+    uint SSRTexIdx;           // the screen-space reflections at half size (ssr_cs.hlsl: rgb × confidence, confidence); 0 = none
 };
 
 #include "common.fx"
@@ -94,7 +94,7 @@ void CSCompose(uint3 dispatchThreadId : SV_DispatchThreadID)
     // gets little
     float ao = data.b;
     float3 ambient = SkyAmbient(normal) * ao * saturate(light.a);
-    float occlusion = ao * saturate(light.a);
+    float occlusion = ao;
 
     // Screen-space AO (GTAO) — fully occludes ambient; direct light only by AODirectStrength
     // (not physically based, but keeps creases readable in sunlit areas)
@@ -112,11 +112,12 @@ void CSCompose(uint3 dispatchThreadId : SV_DispatchThreadID)
     float emissiveMask = albedo.a;
     float3 diffuseAlbedo = albedo.rgb;
 
-    // The sky's light reflected (WEATHER_PLAN stage 4: wet stone and puddles must show the sky): the sky probe in the
-    // mirror direction blurred by the roughness, × the environment BRDF, × the same sky visibility and AO as the ambient
-    // (a room, a cave reflects no sky). Rough surfaces get a faint sheen at grazing angles, metals their tinted
-    // reflection instead of a diffuse ambient. Before 2026-10-22 opaque surfaces had no ambient specular at all (only
-    // glass and water): a puddle at roughness 0.04 drew as a darker patch of cobbles.
+    // The light reflected (WEATHER_PLAN stage 4: wet stone and puddles must show the sky and the town): the screen-space
+    // reflections where their ray found something (ssr_cs.hlsl), else the sky probe in the mirror direction blurred by the
+    // roughness × the sky the surface sees (a room, a cave reflects no sky); × the environment BRDF and the AO. Rough
+    // surfaces get a faint sheen at grazing angles, metals their tinted reflection instead of a diffuse ambient. Before
+    // 2026-10-22 opaque surfaces had no ambient specular at all (only glass and water): a puddle at roughness 0.04 drew as
+    // a darker patch of cobbles.
     float3 specular = 0;
     if (AmbientSpecular != 0 && isLit > 0 && occlusion > 0.0)
     {
@@ -126,7 +127,14 @@ void CSCompose(uint3 dispatchThreadId : SV_DispatchThreadID)
         float NoV = saturate(dot(N, -toPixel));
         float roughness = saturate(data.r), metal = saturate(data.g);
         float3 f0 = lerp(0.04, albedo.rgb, metal);
-        specular = SkyReflection(reflect(toPixel, N), roughness) * EnvBRDFApprox(f0, roughness, NoV) * occlusion;
+        float3 environment = SkyReflection(reflect(toPixel, N), roughness) * saturate(light.a);
+        if (SSRTexIdx != 0)
+        {
+            Texture2D ssrTex = ResourceDescriptorHeap[SSRTexIdx];
+            float4 ssr = ssrTex.SampleLevel(AtmosphereLinearClamp, uv, 0);   // premultiplied by its confidence
+            environment = environment * (1.0 - ssr.a) + ssr.rgb;
+        }
+        specular = environment * EnvBRDFApprox(f0, roughness, NoV) * occlusion;
         diffuseAlbedo *= 1.0 - metal;
     }
     float3 pbrLit = ambient * diffuseAlbedo + specular + light.rgb;

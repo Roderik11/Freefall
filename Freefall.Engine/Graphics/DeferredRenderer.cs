@@ -67,6 +67,9 @@ namespace Freefall.Graphics
         private readonly LightClusters _lightClusters = new();
         // Decals and the weather on the G-buffer, right after the opaque pass (1b)
         private readonly DecalPass _decals = new();
+        // Screen-space reflections, after the lighting, before the composition (made on first use)
+        private ScreenSpaceReflections? _ssr;
+        private uint _ssrSrv;
         // This view's aerial perspective volume (the far haze), sized to its target: SceneConstants.AerialPerspectiveIdx
         private readonly AerialPerspectiveVolume _aerialPerspective = new();
         // This view's volumetric clouds (half size): SceneConstants.CloudTargetIdx
@@ -460,9 +463,18 @@ namespace Freefall.Graphics
             using (_lightingMarker.Auto())
                 FillLightBuffer(camera, list);
 
-            // 3. Composition (HDR — no tonemapping)
+            // 3. Composition (HDR — no tonemapping), after the screen-space reflections of this frame's lit surfaces
             using (_composeMarker.Auto())
+            {
+                bool ssr = Engine.Settings.ScreenSpaceReflections && Engine.Settings.AmbientSpecular;
+                if (ssr)
+                {
+                    _ssr ??= new ScreenSpaceReflections();
+                    _ssr.Execute(list, this, BindSceneConstantsForCompute);
+                }
+                _ssrSrv = ssr ? _ssr!.OutputSrvIndex : 0u;
                 Compose(camera, list);
+            }
 
             // 4. Forward pass — renders directly to HDR Composite with depth read.
             //    Depth is already in PixelShaderResource after FillGBuffer.
@@ -1178,6 +1190,7 @@ namespace Freefall.Graphics
             // Pass SSDM displacement texture to composition for ambient parallax
             _compositionCS.SetParam("AODirectStrength", Engine.Settings.GTAODirectStrength);
             _compositionCS.SetParam("AmbientSpecular", Engine.Settings.AmbientSpecular ? 1u : 0u);
+            _compositionCS.SetParam("SSRTexIdx", _ssrSrv);
             _compositionCS.SetParam("SSDMTexIdx",Engine.Settings.EnableSSDM ? (ScreenSpaceDisplacement?.OutputSrvIndex ?? 0u) : 0u);
 
             BindSceneConstantsForCompute(list);
@@ -1589,6 +1602,7 @@ namespace Freefall.Graphics
             VolumetricFog?.Dispose();
             _lightClusters.Dispose();
             _decals.Dispose();
+            _ssr?.Dispose();
             _aerialPerspective.Dispose();
             _cloudView.Dispose();
             foreach (var tracer in _pointScreenShadows) tracer?.Dispose();
