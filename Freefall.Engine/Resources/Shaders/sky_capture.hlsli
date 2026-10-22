@@ -41,15 +41,10 @@ float SkyCaptureOpenAt(SkyCaptureView v, uint slice, Texture2DArray<float> depth
     return visible;
 }
 
-// One direction's part: adds its weight to `total` and returns weight × how much of it is open.
-float SkyCaptureViewLight(SkyCaptureView v, uint slice, Texture2DArray<float> depths, float2 size, SamplerState clampSampler,
-    float3 worldPos, float3 N, inout float total)
+// How much of one direction's sky a surface at worldPos facing N sees past the meshes
+float SkyCaptureViewOpen(SkyCaptureView v, uint slice, Texture2DArray<float> depths, float2 size, SamplerState clampSampler,
+    float3 worldPos, float3 N)
 {
-    // The directions are spread cosine-weighted about the zenith, so for a surface facing up each counts alike. A
-    // surface facing elsewhere weighs them by its own cosine; a little for every one keeps a ceiling's average.
-    // A direction not captured yet weighs nothing.
-    float w = (max(dot(N, v.Direction), 0.0) / max(v.Direction.y, 0.05) + 0.05) * v.Valid;
-
     // Seen from 0.4 m out along the surface's normal, so that its own texels in the map are not in the way (the lift also
     // shifts the point across the map, as normal-offset shadows do). Nothing toward the sky: 0.3 m that way lifted the
     // underside of a roof and the top of a gable wall through the thin roof boards into daylight (bright bands along the
@@ -63,9 +58,32 @@ float SkyCaptureViewLight(SkyCaptureView v, uint slice, Texture2DArray<float> de
     float3 p = worldPos + N * 0.4;
     if (dot(N, v.Direction) < 0.0)
         p -= v.Direction * 0.3;
-    float visible = SkyCaptureOpenAt(v, slice, depths, size, clampSampler, p);
+    return SkyCaptureOpenAt(v, slice, depths, size, clampSampler, p);
+}
+
+// The weight of one direction for the sky's light on a surface facing N. The directions are spread cosine-weighted about
+// the zenith, so for a surface facing up each counts alike. A surface facing elsewhere weighs them by its own cosine; a
+// little for every one keeps a ceiling's average. A direction not captured yet weighs nothing.
+float SkyCaptureViewWeight(SkyCaptureView v, float3 N)
+{
+    return (max(dot(N, v.Direction), 0.0) / max(v.Direction.y, 0.05) + 0.05) * v.Valid;
+}
+
+// One direction's part: adds its weight to `total` and returns weight × how much of it is open.
+float SkyCaptureViewLight(SkyCaptureView v, uint slice, Texture2DArray<float> depths, float2 size, SamplerState clampSampler,
+    float3 worldPos, float3 N, inout float total)
+{
+    float w = SkyCaptureViewWeight(v, N);
     total += w;
-    return w * visible;
+    return w * SkyCaptureViewOpen(v, slice, depths, size, clampSampler, worldPos, N);
+}
+
+// The weight of one direction for the light from a region of the sky round toLight (unit): the directions nearest it
+// (the 16 lie 35-45° apart), as the exposure meter weighs them for the sun
+#define SKY_CAPTURE_LIGHT_SHARPNESS 12.0
+float SkyCaptureViewLightWeight(SkyCaptureView v, float3 toLight)
+{
+    return exp(SKY_CAPTURE_LIGHT_SHARPNESS * (dot(v.Direction, toLight) - 1.0)) * v.Valid;
 }
 
 // 0..1: the share of the sky's light that reaches a place past the meshes. worldPos is absolute, N the surface normal

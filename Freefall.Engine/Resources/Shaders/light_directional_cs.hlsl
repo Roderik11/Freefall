@@ -264,12 +264,17 @@ void CSDirectionalLight(uint3 dispatchThreadId : SV_DispatchThreadID)
 
     // Under the terrain (a cave) the sun cannot reach, whatever the shadow map holds: its terrain pass follows the
     // camera and can miss the hill over a cave, and the sun came through between the cave kit's pieces
-    shadowFactor *= TerrainOpen(worldPos.xyz + CamPos, normal);
-    // The clouds' beam (sky_common.fx CloudBeam), also past the last cascade (Sampler = linear wrap, s0): only the light
-    // that comes through as the sun's direction. What the clouds diffuse reaches the surface as the sky probe's ambient
-    // (the deck's lit base). The shadows of things near (localShadow) gate the shadow wrap below.
+    float terrainOpen = TerrainOpen(worldPos.xyz + CamPos, normal);
+    shadowFactor *= terrainOpen;
+    // The clouds' beam (sky_common.fx CloudTransmission .x), also past the last cascade (Sampler = linear wrap, s0): the
+    // light that comes through as the sun's direction, with the hard shadows. Of what they diffuse, the share thrown on
+    // forward (CloudForwardShare) still comes from round the sun: below as a soft light from that side of the sky; the
+    // rest reaches the surface as the sky probe's ambient (the clouds' lit bases). The shadows of things near
+    // (localShadow) gate the shadow wrap below.
     float localShadow = shadowFactor;
-    float cloudBeam = CloudBeam(Sampler, worldPos.xyz, L);
+    float2 cloudThrough = CloudTransmission(Sampler, worldPos.xyz, L);
+    float cloudBeam = cloudThrough.x;
+    float cloudForward = CloudForwardShare(cloudThrough);
     shadowFactor *= cloudBeam;
 
     // Debug visualization modes
@@ -374,11 +379,13 @@ void CSDirectionalLight(uint3 dispatchThreadId : SV_DispatchThreadID)
     // How much of the sky this surface sees past the terrain and the meshes (sky_visibility_cs.hlsl, or sky_common.fx
     // here): it gates the shadow wrap below (light bounced in from the sunlit surroundings) and goes to the composition
     // in alpha for the sky's ambient light
-    float skyVisibility;
+    float skyVisibility, lightSide = 1.0;
     if (SkyVisTexIdx != 0)
     {
-        Texture2D<float> SkyVisTex = ResourceDescriptorHeap[SkyVisTexIdx];
-        skyVisibility = SkyVisTex.Load(displaced_coord);
+        Texture2D<float2> SkyVisTex = ResourceDescriptorHeap[SkyVisTexIdx];
+        float2 vis = SkyVisTex.Load(displaced_coord);
+        skyVisibility = vis.x;
+        lightSide = vis.y;
     }
     else
         skyVisibility = SkyVisibility(worldPos.xyz + CamPos, normal);
@@ -395,6 +402,21 @@ void CSDirectionalLight(uint3 dispatchThreadId : SV_DispatchThreadID)
     // hundreds of metres wide and holds the ground round it too, and × the clouds' beam: a cloud's shadow is kilometres
     // wide and holds the surroundings as well (folded into the shadow, it raised the wrap under a cloud)
     lighting += diffuse * LightColor * LightIntensity * NdotL * (1.0 - localShadow) * cloudBeam * 0.12 * ao * skyVisibility * terrainShadow;
+
+    // The light a cloud throws on forward round the sun (cloudForward): it comes from the cloud's bright region round the
+    // sun's place, tens of degrees across, so it shades by the surface's turn toward the sun and casts soft, wide shadows:
+    // the sky captures' openness toward the sun past the meshes (sky_visibility_cs.hlsl, green), the terrain's shadow and
+    // caves; no glint (a source that wide has no sharp highlight). The captures cover SkyCapture.Size (256 m) round the
+    // camera: past them the cascades' shadow (coarse out there, so soft), or every leaf of a far crown took the full
+    // light and the trees glowed. Without any of it everything under a fair-weather cumulus went flat at once: the beam
+    // is gone there and the probe's ambient has little direction.
+    if (cloudForward > 1e-3)
+    {
+        float captured = 1.0 - smoothstep(96.0, 112.0, max(abs(worldPos.x), abs(worldPos.z)));
+        float forwardShadow = lerp(localShadow, lightSide * terrainShadow * terrainOpen, captured);
+        float forwardTurn = lerp(NdotL, saturate(rawNdotL * 0.3 + 0.5), vegetation);
+        lighting += diffuse * LightColor * LightIntensity * 3.14159 * forwardTurn * cloudForward * forwardShadow * ao;
+    }
 
     // Note: GI composition moved to separate pass (CSComposeGI in radiance_cascades.hlsl)
     // so RC trace can read direct-light-only without feedback loop

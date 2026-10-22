@@ -466,6 +466,18 @@ float CloudSkyDimming(float4 deck)
     return saturate((1.0 - deck.y) * (1.0 - deck.x));
 }
 
+// Of what the clouds let through beyond their beam (t: CloudTransmission), the share that goes on forward, near the light's
+// direction: through a thin cloud (a cumulus' edge) droplets (g 0.85) throw most of what they scatter straight on; only
+// through a thick one has it spread evenly. e^(−τ/20) of it, τ from the share passing through (CloudThrough =
+// 1 / (1 + CLOUD_DIFFUSION τ); the beam underflows past τ ~14). The air takes it with the beam (CloudAirLight), surfaces
+// as a soft light from the light's side of the sky (light_directional_cs.hlsl).
+float CloudForwardShare(float2 t)
+{
+    float diffused = max(t.y - t.x, 0.0);
+    float tau = (1.0 / max(t.y, 1e-4) - 1.0) / CLOUD_DIFFUSION;
+    return diffused * exp(-tau / 20.0);
+}
+
 // What the clouds let through to a place in the air toward a light, as shares of its illuminance:
 //   x  the beam, which the air scatters with its phases (the Mie forward lobe is the glow round the sun);
 //   y  the light the clouds have diffused, CloudThrough − the beam, which the air scatters evenly: under a deck the sun
@@ -510,15 +522,11 @@ float3 CloudAirLight(SamplerState wrapSampler, float3 relPos, float3 toLight, fl
     }
     else
         sky = 1.0 - skyDimming * CloudBelowBase(relPos);
-    // Through a thin cloud (a cumulus' edge) droplets (g 0.85) throw most of what they scatter straight on: it lights the
-    // air like the beam, with the air's phase. Taken as diffused (scattered evenly) at every depth it outshone the open
-    // sun's backscatter: a bright ring round every cloud's shadow in the haze seen from above. Only through a thick
-    // cloud has it spread evenly.
+    // What the cloud throws on forward (CloudForwardShare) lights the air like the beam, with the air's phase. Taken as
+    // diffused (scattered evenly) at every depth it outshone the open sun's backscatter: a bright ring round every cloud's
+    // shadow in the haze seen from above.
     float diffused = max(t.y - t.x, 0.0);
-    // e^(−τ/20), τ from the share passing through, CloudThrough = 1 / (1 + CLOUD_DIFFUSION τ) (the beam underflows past
-    // τ ~14)
-    float tau = (1.0 / max(t.y, 1e-4) - 1.0) / CLOUD_DIFFUSION;
-    float forward = diffused * exp(-tau / 20.0);
+    float forward = CloudForwardShare(t);
     return float3(t.x + forward, diffused - forward, sky);
 }
 

@@ -27,7 +27,7 @@ namespace Freefall.Graphics
         
         public RenderTexture2D LightBuffer = null!;
         /// <summary>How much of the sky each opaque pixel sees past the terrain and the meshes (sky_visibility_cs.hlsl),
-        /// R8; read by the directional light.</summary>
+        /// R8G8 (green: the sky toward the directional light past the meshes); read by the directional light.</summary>
         public RenderTexture2D SkyVisibilityTex = null!;
         /// <summary>Its bindless SRV this frame, 0 when not drawn (the directional light then looks it up itself).</summary>
         public uint SkyVisibilitySrv { get; private set; }
@@ -287,7 +287,7 @@ namespace Freefall.Graphics
             Depth = new DepthTexture2D(width, height, Format.D32_Float, true);
 
             LightBuffer = new RenderTexture2D(Engine.Device, width, height, Format.R16G16B16A16_Float, randomWrite: true);
-            SkyVisibilityTex = new RenderTexture2D(Engine.Device, width, height, Format.R8_UNorm, randomWrite: true);
+            SkyVisibilityTex = new RenderTexture2D(Engine.Device, width, height, Format.R8G8_UNorm, randomWrite: true);
             _skyVisState = ResourceStates.Common;
             Composite = new RenderTexture2D(Engine.Device, width, height, Format.R16G16B16A16_Float, randomWrite: true);
             LdrOutput = new RenderTexture2D(Engine.Device, width, height, Format.R8G8B8A8_UNorm, randomWrite: true);
