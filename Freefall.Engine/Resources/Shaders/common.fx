@@ -109,6 +109,25 @@ float3 TreeTint(float3 origin)
     return brightness * hue * lerp(1.0.xxx, GroundVariation(origin.xz), 0.5);
 }
 
+// A far tree's cross-mesh card hands the decal pass the share of the falling snow its pixel takes (decals_cs.hlsl
+// SurfaceOpenness) in the G-buffer's vegetation flag, Data.a: the card LODs write 0.5, the cross mesh 0.32..0.48 by its
+// exposure. The lighting reads all of it as vegetation (0.3..0.7). The cover map holds no top for vertical cards, so
+// its crown depth (weather_cover.hlsli CrownExposure) cannot be had for them
+#define FAR_TREE_FLAG_BASE  0.32
+#define FAR_TREE_FLAG_RANGE 0.16
+
+float FarTreeFlag(float exposure)
+{
+    return FAR_TREE_FLAG_BASE + FAR_TREE_FLAG_RANGE * saturate(exposure);
+}
+
+// True for a far tree's pixel (a vegetation flag under the card LODs' 0.5), with the exposure it brought
+bool FarTreeExposure(float flag, out float exposure)
+{
+    exposure = saturate((flag - FAR_TREE_FLAG_BASE) / FAR_TREE_FLAG_RANGE);
+    return flag > 0.3 && flag < 0.49;
+}
+
 // ── Wind (grass cards, blades, flowers, trees) ──
 // Every oscillation runs on WindPhase / WindOffset. Never Time x a wind-dependent frequency (it jumps by tens of
 // radians while the wind changes and scrubs the animation), never a wave over dot(position, WindDirection) (far from

@@ -198,9 +198,14 @@ PSOutput PS(VSOutput input)
     // Subtle interior darkening — just enough for depth, not crushing
     float ao = lerp(1.0, aoValue, 0.5);
 
+    // How much of the falling snow this pixel takes (common.fx FarTreeFlag, read by the decal pass): the card shows the
+    // crown from the side, its outer boughs, the shell the snow lies on, and the mask's baked sky visibility (0..0.15:
+    // shut in .. open, the brightest tenth of the crown at the top) tells them from the gaps into it
+    float snowExposure = smoothstep(0.2, 0.8, saturate(aoValue / 0.15));
+
     output.Albedo = float4(color.rgb, 0);
     output.Normal = float4(N, saturate(0.4 + aoValue * 4)); // AO as translucency for SSS backlighting
-    output.Data = float4(0.7, 0.0, saturate(0.4 + aoValue * 4), 0.5); // vegetation flag
+    output.Data = float4(0.7, 0.0, saturate(0.4 + aoValue * 4), FarTreeFlag(snowExposure)); // vegetation flag
     // Billboard depth for SS shadows: blend real geometry depth toward tree center.
     // AO shapes the blend — surface (bright) keeps real depth, interior (dark) flattens.
     float treeCenterDepth = input.WorldPos.w;

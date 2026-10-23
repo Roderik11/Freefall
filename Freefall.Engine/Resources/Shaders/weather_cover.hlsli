@@ -233,8 +233,8 @@ float WeatherOpenness(WeatherShelter s, SamplerState linearClamp, float3 p, floa
     return open;
 }
 
-#define CROWN_SHELL 1.0     // m under the top of the cover over it a leaf takes the fall in full (half a texel added)
-#define CROWN_DEPTH 3.0     // ... and none (a texel added)
+#define CROWN_SHELL 2.0     // m under the top of the cover over it a leaf takes the fall in full (half a texel added)
+#define CROWN_DEPTH 5.0     // ... and none (a texel added). 1 and 3 m left a crown only flecks at full cover (user, 2026-10-23)
 
 // By one level: how far under the highest cover over its four texels (its own crown's top, or a roof over the tree) a
 // place lies, as the share of the fall it takes. The shell widens with the level's texels: a coarse level's top is the

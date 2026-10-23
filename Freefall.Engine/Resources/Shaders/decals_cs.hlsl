@@ -512,8 +512,10 @@ float3 SnowSurfaceNormal(float3 world, float3 n, float footprint, float3 toLight
 // from it: a wall in the open is not covered by its own top, a floor under a roof is. Vegetation takes the terrain's
 // cover and how deep in its crown it lies (CrownExposure), not the crown's cover outright: that counted near the camera,
 // where the cover map resolves a crown over its own lower branches, and not far off, where its coarse levels do not, so
-// near trees stayed green and far ones white
-float SurfaceOpenness(DecalFrame f, float3 rel, float3 geo, uint surfaceClass)
+// near trees stayed green and far ones white. A far tree's cross-mesh card brings its own exposure in the vegetation
+// flag (common.fx FarTreeExposure): the map holds no top for vertical cards, so they came out white where it had none
+// and in green stripes where a card's edge had left one (user, 2026-10-23: "the snow on crossmeshes looks bad")
+float SurfaceOpenness(DecalFrame f, float3 rel, float3 geo, uint surfaceClass, float vegetationFlag)
 {
     WeatherShelter s;
     s.Levels = f.Shelter;
@@ -527,7 +529,8 @@ float SurfaceOpenness(DecalFrame f, float3 rel, float3 geo, uint surfaceClass)
     float crown = 1.0;
     if (surfaceClass == 2u)
     {
-        crown = CrownExposure(s, LinearClamp, rel + CamPos);
+        float farTree;
+        crown = FarTreeExposure(vegetationFlag, farTree) ? farTree : CrownExposure(s, LinearClamp, rel + CamPos);
         [unroll]
         for (uint k = 0; k < SHELTER_LEVELS; k++)
             s.Levels[k].Size = 0.0;
@@ -585,9 +588,15 @@ void ApplyWeather(DecalFrame f, float3 rel, float3 geo, uint surfaceClass, float
     if (cover > 0.0 && surfaceClass != 3u)
     {
         float up = smoothstep(0.35, 0.85, lerp(N.y, geo.y, cover)) * smoothstep(0.2, 0.6, geo.y);
-        float drift = SnowNoise(world.xz * 0.35);
+        // Plants: their leaves are the high spots (they have no height bias of their own, so a crown in the open took
+        // half the snow of the ground at full cover: user, 2026-10-23, "the trees dont have enough snow"), and their
+        // drifts vary up the crown too, in clumps about a metre across: by the ground's position alone every column of
+        // a crown had one value
+        bool plant = surfaceClass == 2u;
+        float lift = plant ? 1.0 : relief;
+        float drift = plant ? SnowNoise((world.xz + world.y * float2(0.7, -0.5)) * 0.8) : SnowNoise(world.xz * 0.35);
         float t = 1.0 - cover;
-        snow = smoothstep(t - 0.06, t + 0.06, up * (0.1 + 0.5 * relief + 0.4 * drift + 0.2 * hollow)) * saturate(up * 3.0);
+        snow = smoothstep(t - 0.06, t + 0.06, up * (0.1 + 0.5 * lift + 0.4 * drift + 0.2 * hollow)) * saturate(up * 3.0);
     }
 
     // Footprints (Print decals, what they left in s.Print): thin snow is scraped off down to the ground, deep snow is
@@ -771,7 +780,7 @@ void CSDecals(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint gi : S
     Surface before = s;
 
     // The weather reaches puddles and surfaces alike: a puddle under a stall's roof stays dry, no rings under an eave
-    float open = f.WeatherOn != 0u ? SurfaceOpenness(f, rel, geo, surfaceClass) : 1.0;
+    float open = f.WeatherOn != 0u ? SurfaceOpenness(f, rel, geo, surfaceClass, s.Data.a) : 1.0;
     if (g_TileAny != 0u)
     {
         for (uint w2 = 0; w2 < words; w2++)
