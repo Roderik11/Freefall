@@ -23,6 +23,17 @@ namespace Freefall.Base
 
         private static readonly IDtQueryFilter DefaultFilter = new DtQueryDefaultFilter();
 
+        /// <summary>
+        /// Most polygons one <see cref="FindPath"/> looks at. DotRecast's node pool grows without bound (C++ Detour's
+        /// stops at its maxNodes, commonly 2048), so a target the start cannot reach (another island of the navmesh,
+        /// across water) had one search walk every polygon connected to the start: 12 s and 30 MB in one frame on
+        /// Eldermoor, an animal fleeing the player (2026-10-24). Stopped here, the way leads as near the target as the
+        /// search got.
+        /// </summary>
+        public const int MaxSearchNodes = 2048;
+
+        private static bool _cappedLogged;
+
         /// <summary>True if a navmesh is loaded and ready for queries.</summary>
         public static bool IsReady => _navMesh != null;
 
@@ -33,6 +44,7 @@ namespace Freefall.Base
         {
             _navMesh = navMesh;
             _navQuery = new DtNavMeshQuery(navMesh);
+            _cappedLogged = false;
 
             // Create crowd with sane defaults
             var crowdCfg = new DtCrowdConfig(0.6f); // max agent radius
@@ -86,7 +98,8 @@ namespace Freefall.Base
 
         /// <summary>
         /// Find a path between two world positions.
-        /// Returns smoothed waypoint list, or empty if no path found.
+        /// Returns smoothed waypoint list, or empty if no path found. The search stops after
+        /// <see cref="MaxSearchNodes"/> polygons; a target out of reach gets the way to the nearest the search came.
         /// </summary>
         public static List<Vector3> FindPath(Vector3 from, Vector3 to)
         {
@@ -103,10 +116,17 @@ namespace Freefall.Base
 
             if (startRef == 0 || endRef == 0) return result;
 
-            // Find polygon path
+            // Find polygon path, by a sliced search so that it stops after MaxSearchNodes (see there)
             var pathPolys = new long[256];
-            _navQuery.FindPath(startRef, endRef, startPt, endPt, DefaultFilter,
-                pathPolys, out int pathCount, 256);
+            _navQuery.InitSlicedFindPath(startRef, endRef, startPt, endPt, DefaultFilter, 0);
+            var searched = _navQuery.UpdateSlicedFindPath(MaxSearchNodes, out _);
+            if (searched.InProgress() && !_cappedLogged)
+            {
+                _cappedLogged = true;
+                Debug.Log($"[NavMeshWorld] FindPath stopped after {MaxSearchNodes} polygons, the target out of reach or far: " +
+                          $"({from.X:F0}, {from.Z:F0}) to ({to.X:F0}, {to.Z:F0}); the way goes as near as it got (logged once per navmesh)");
+            }
+            _navQuery.FinalizeSlicedFindPath(pathPolys, out int pathCount, 256);
 
             if (pathCount == 0) return result;
 
