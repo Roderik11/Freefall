@@ -149,8 +149,9 @@ VSOutput VS(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
     {
         float viewDepth = mul(float4(core.Position, 1.0), View).z;
         // Rain and snow right at the eye would be out of focus, a blur too faint to see: drawn, a drop a hand's width away
-        // was a white bar across the screen, a flake a dark blot on the sky
-        if ((e.Flags & PARTICLE_FLAG_WATER) != 0)
+        // was a white bar across the screen, a flake a dark blot on the sky. Falling drops only (streaks): water on the
+        // ground (the rain's splashes) is seen at one's feet
+        if ((e.Flags & PARTICLE_FLAG_WATER) != 0 && e.BillboardMode == BILLBOARD_VELOCITY)
             output.Color *= smoothstep(1.0, 3.5, viewDepth);
         else if ((e.Flags & PARTICLE_FLAG_COVER) != 0)
             output.Color *= smoothstep(0.5, 2.0, viewDepth);
