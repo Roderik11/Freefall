@@ -23,14 +23,8 @@ namespace Freefall.Graphics
         {
             public ShelterMap.LevelData Shelter0, Shelter1, Shelter2;
             public float ShelterMinY, ShelterRangeY, Rain, Snow;
-            public float WindAcross, _pad, HazeKm, PixelAngle;
+            public Vector2 Wind; public float HazeKm, PixelAngle;
         }
-
-        // The steady wind across the view, eased: the far field's lean shifts its cells by lean × height, so a gust or a
-        // turn of the camera taken at once swept the far rain sideways
-        private float _windAcross;
-        private bool _windPrimed;
-        private const float WindEaseSeconds = 1.5f;
 
         private const int FrameCount = 3;
         private readonly ComputeShader _shader;
@@ -59,20 +53,14 @@ namespace Freefall.Graphics
             int width = (int)desc.Width, height = (int)desc.Height;
             int slot = Engine.FrameIndex % FrameCount;
             var shelter = ShelterMap.Current;
-            // Along +azimuth (the shader's x on the sphere) at the view's middle: (forward.z, -forward.x)
-            var forward = camera.Forward;
-            var across = new Vector2(forward.Z, -forward.X);
-            float target = across.LengthSquared() > 1e-6f
-                ? Vector2.Dot(new Vector2(Wind.Current.X, Wind.Current.Z), Vector2.Normalize(across)) : 0f;
-            float dt = Math.Clamp((float)Base.Time.Delta, 0f, 0.1f);
-            _windAcross = _windPrimed ? _windAcross + (target - _windAcross) * (1f - MathF.Exp(-dt / WindEaseSeconds)) : target;
-            _windPrimed = true;
+            // The steady wind, not the gusts: the far field's lean moves its cells by lean × height, so a gust swept it
+            var wind = Wind.Current;
             *_frames[slot].WritePtr<Frame>() = new Frame
             {
                 Shelter0 = shelter.L0, Shelter1 = shelter.L1, Shelter2 = shelter.L2,
                 ShelterMinY = shelter.MinY, ShelterRangeY = shelter.RangeY,
                 Rain = Weather.Rain, Snow = Weather.Snow,
-                WindAcross = _windAcross,
+                Wind = new Vector2(wind.X, wind.Z),
                 HazeKm = Weather.HazeKm,
                 PixelAngle = 2f / (camera.Projection.M22 * height),
             };

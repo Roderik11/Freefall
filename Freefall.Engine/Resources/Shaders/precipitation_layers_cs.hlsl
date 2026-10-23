@@ -33,8 +33,7 @@ struct PrecipFrame
     float ShelterRangeY;
     float Rain;                 // Weather.Rain, Snow at the camera (0..1)
     float Snow;
-    float WindAcross;           // the steady wind across the view (m/s along +azimuth at the view's middle), eased
-    float _pad;
+    float2 Wind;                // the steady wind (Wind.Current, xz, m/s)
     float HazeKm;               // Weather.HazeKm
     float PixelAngle;           // radians a pixel spans (vertically, at the screen's middle)
 };
@@ -68,9 +67,8 @@ float LayerHash(int3 c, uint seed)
 }
 
 // The coverage (0..1) of one layer's field at a direction: rain streaks or snow flakes. az, el: the direction's azimuth
-// and elevation; d: the layer's distance; windAcross: the wind across the view (m/s, along the camera's right, the same
-// for every pixel); layer: its index
-float LayerCoverage(float az, float el, float d, float windAcross, uint layer, bool snow, float rate, float pixelAngle)
+// and elevation; d: the layer's distance; wind: the steady wind (xz, m/s); layer: its index
+float LayerCoverage(float az, float el, float d, float2 wind, uint layer, bool snow, float rate, float pixelAngle)
 {
     // The slab of air the layer stands for (half way to its neighbours) holds density × slab drops per m² of it: cells
     // that size (in heavy rain or snow; the rate decides how many hold one), never narrower than MIN_CELL_PIXELS
@@ -89,8 +87,14 @@ float LayerCoverage(float az, float el, float d, float windAcross, uint layer, b
     // +azimuth, y up), so a place on it at time t holds the drop that was at (x - wind t, y + fall t). A streak lies along
     // that motion: across the field u = x + slant y holds still, down it v = y + fall t scrolls, and the drops slide down
     // their own lean. With the shear on the scrolled v the cells fell straight down under streaks leaning the other way
-    // (user, 2026-10-23: "falling straight down ... sometimes flying against their lean"). At most 45°.
-    float slant = clamp(windAcross / fall, -1.0, 1.0);
+    // (user, 2026-10-23: "falling straight down ... sometimes flying against their lean"). The lean of each direction is
+    // the wind across that direction (along +azimuth): fixed to the world, so turning the camera changes nothing; one
+    // lean for the screen from the wind across the view bent the far field round as the camera turned. The wind is
+    // capped at 0.8 × the fall: the field's cells across stay in order (they would fold where the lean changes faster
+    // with the azimuth than the azimuth itself, past 1 / 0.8 rad of elevation)
+    float speed = length(wind);
+    float2 capped = speed > 0.8 * fall ? wind * (0.8 * fall / speed) : wind;
+    float slant = dot(capped, float2(cos(az), -sin(az))) / fall;
     float around = max(1.0, round(6.2831853 * d / cell.x));
     float u = az / 6.2831853 * around + slant * el * d / cell.x;
     // (the scroll wraps after 2^16 cells, an hour and more, so the cell's fraction keeps its precision)
@@ -140,8 +144,6 @@ void CSLayers(uint3 id : SV_DispatchThreadID)
     float3 dir = normalize(posFromDepth(uv, 1.0, CameraInverse).xyz);   // reverse Z: depth 1 = the near plane
     float viewZPerMetre = max(mul(float4(dir, 0.0), View).z, 1e-3);
     float az = atan2(dir.x, dir.z), el = asin(clamp(dir.y, -1.0, 1.0));
-    // One wind across the view for the whole screen: per direction the lattice folded where the lean changed fast
-    float windAcross = P.WindAcross;
 
     WeatherShelter s;
     s.Levels = P.Shelter;
@@ -170,8 +172,8 @@ void CSLayers(uint3 id : SV_DispatchThreadID)
         if (open <= 0.0)
             continue;
         float fade = open * exp(-P.HazeKm * d * 0.001) * saturate((sceneZ - z) / 2.0);
-        float rain = P.Rain > 0.0 ? LayerCoverage(az, el, d, windAcross, k, false, P.Rain, P.PixelAngle) * fade : 0.0;
-        float snow = P.Snow > 0.0 ? LayerCoverage(az, el, d, windAcross, k, true, P.Snow, P.PixelAngle) * fade : 0.0;
+        float rain = P.Rain > 0.0 ? LayerCoverage(az, el, d, P.Wind, k, false, P.Rain, P.PixelAngle) * fade : 0.0;
+        float snow = P.Snow > 0.0 ? LayerCoverage(az, el, d, P.Wind, k, true, P.Snow, P.PixelAngle) * fade : 0.0;
         light += clear * (rain * rainLight + snow * snowLight);
         clear *= (1.0 - rain) * (1.0 - snow);
     }
