@@ -28,6 +28,8 @@ namespace Freefall.Editor.Publishing
         public int Scripts;
         public int PlayerFiles;
         public long PlayerBytes;
+        /// <summary>The version of the Visual C++ runtime copied beside the exe (<see cref="VCRuntime"/>).</summary>
+        public string Runtime = "";
         /// <summary>The engine's own files in Data/engine.ffpack.</summary>
         public int EngineFiles;
         public long EngineBytes;
@@ -49,7 +51,8 @@ namespace Freefall.Editor.Publishing
     /// <item>Compiling scripts (worker): the output folder cleared (only one Publish made: <see cref="MarkerFile"/>), then
     /// FreefallScripts.dll, Release without DEBUG. Compile errors stop it.</item>
     /// <item>Building the player (worker): <see cref="PlayerBuild"/>, dotnet publish into the project's Library.</item>
-    /// <item>Copying the player (worker): into the output folder, the exe named after the product.</item>
+    /// <item>Copying the player (worker): into the output folder, the exe named after the product, and the Visual C++
+    /// runtime PhysX needs beside it (<see cref="VCRuntime"/>).</item>
     /// <item>Writing packs (worker): the assets, then the engine's own files (Data/engine.ffpack: no Resources folder in the
     /// game's), then Verifying packs if asked.</item>
     /// <item>Building the installer (worker), when the profile asks for one (MakeInstaller): <see cref="InstallerBuild"/>.</item>
@@ -119,6 +122,10 @@ namespace Freefall.Editor.Publishing
             if (profile.Scenes.All(s => s == null)) throw new InvalidOperationException($"The profile {profile.Name} has no scenes");
             var playerProject = PlayerBuild.FindProject() ?? throw new InvalidOperationException(
                 "Publishing builds the player from the engine's source (Freefall.Player), and no folder above the editor's holds it");
+            var runtime = VCRuntime.Find() ?? throw new InvalidOperationException(
+                $"The game carries the Visual C++ runtime PhysX needs ({string.Join(", ", VCRuntime.Files)}), copied from Visual Studio's " +
+                "C++ redist, and no Visual Studio here has it: add \"Desktop development with C++\" (or install the Build Tools), " +
+                "or set FREEFALL_VCREDIST to a folder that holds those files");
 
             var output = Path.GetFullPath(string.IsNullOrWhiteSpace(options.Output) ? profile.ResolvedOutputFolder : options.Output.Trim());
             var product = profile.ResolvedProductName;
@@ -133,12 +140,12 @@ namespace Freefall.Editor.Publishing
             if (iscc != null) steps.Add(Installer);
             var progress = ProgressJob.Start($"Publishing {product}", "Publish", steps.Select(s => (s, Weights[s])).ToArray());
             string scripts = Path.Combine(Engine.Project.LibraryDirectory, "Installer");
-            _completion = Task.Run(() => RunAsync(profile, options, output, playerProject, progress, iscc, scripts));
+            _completion = Task.Run(() => RunAsync(profile, options, output, playerProject, runtime, progress, iscc, scripts));
             return _completion;
         }
 
-        static async Task<PublishResult> RunAsync(BuildProfile profile, PublishOptions options, string output, string playerProject, ProgressJob progress,
-                                                  string? iscc, string installerScripts)
+        static async Task<PublishResult> RunAsync(BuildProfile profile, PublishOptions options, string output, string playerProject,
+                                                  (string Folder, string Version) runtime, ProgressJob progress, string? iscc, string installerScripts)
         {
             var result = new PublishResult { Product = profile.ResolvedProductName, Output = output, Report = BuildProfile.ReportPathFor(output) };
             void Report(string detail, float fraction) => progress.Report(detail, fraction);
@@ -221,6 +228,10 @@ namespace Freefall.Editor.Publishing
                 {
                     result.Exe = Path.Combine(output, ExeName(result.Product));
                     (result.PlayerFiles, result.PlayerBytes) = PlayerBuild.Copy(publish, output, Path.GetFileName(result.Exe), Report);
+                    Report($"Visual C++ runtime {runtime.Version}", 1f);
+                    result.PlayerBytes += VCRuntime.Copy(runtime.Folder, output);
+                    result.PlayerFiles += VCRuntime.Files.Length;
+                    result.Runtime = runtime.Version;
                 }));
 
                 await Step(Packs, () => Task.Run(() =>
@@ -332,6 +343,7 @@ namespace Freefall.Editor.Publishing
             sb.AppendLine($"  Output: {r.Output}");
             sb.AppendLine($"  Exe: {Path.GetFileName(r.Exe)}");
             sb.AppendLine($"  Player: {r.PlayerFiles:N0} files, {BuildScan.Size(r.PlayerBytes)}");
+            sb.AppendLine($"  Visual C++ runtime: {r.Runtime}, beside the exe ({string.Join(", ", VCRuntime.Files)})");
             sb.AppendLine($"  Scripts: {r.Scripts} files in {PackBuilder.ScriptsFile}");
             sb.AppendLine($"  Engine files: {r.EngineFiles} in {Freefall.Assets.EngineFiles.PackFile}, {BuildScan.Size(r.EngineBytes)}");
             sb.AppendLine($"  Packs: {r.Packs.Entries:N0} artifacts, {BuildScan.Size(r.Packs.Bytes)}" +

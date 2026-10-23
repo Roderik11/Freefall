@@ -51,6 +51,9 @@ namespace Freefall.Editor.Publishing
         public static string Build(string project, string staging, Action<string, float> report)
         {
             var publish = Path.Combine(staging, "publish");
+            // dotnet publish -o adds to the folder and never takes anything out, so a file an earlier build had would ship
+            // on (the debug PhysX.Net package's PhysXGpu_64.dll, 29 MB). The build in build/ stays incremental.
+            if (Directory.Exists(publish)) Directory.Delete(publish, recursive: true);
             var info = new ProcessStartInfo("dotnet")
             {
                 UseShellExecute = false,
