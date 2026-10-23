@@ -45,12 +45,14 @@ SamplerState LinearClampS : register(s2);
 #define LAYER_STEP 1.38
 
 #define RAIN_FALL 8.0           // m/s
-#define RAIN_DENSITY 40.0       // visible drops per m³ in heavy rain (rate 1)
+#define RAIN_DENSITY 6.5        // drops per m³ in heavy rain (rate 1): the near emitter's, EmitRate / (its box's area ×
+                                // the fall speed), Eldermoor's 30000/s over 24 × 24 m at 8 m/s. At 40 the far field held
+                                // six times the near one's rain (user, 2026-10-23: "there's far more rain in the far")
 #define RAIN_CELL_DOWN 0.5      // m: a cell's height (a streak is 12-22 cm of it)
 #define RAIN_WIDTH 0.004        // m: a drop's streak
 #define RAIN_ALPHA 0.3          // as the near emitter's
 #define SNOW_FALL 1.0
-#define SNOW_DENSITY 100.0      // flakes per m³ in heavy snow (they fall slowly: many are in the air)
+#define SNOW_DENSITY 10.0       // flakes per m³ in heavy snow: the near emitter's, 6000/s over 24 × 24 m at 1 m/s
 #define SNOW_RADIUS 0.012
 #define SNOW_ALPHA 0.8
 #define MIN_CELL_PIXELS 6.0     // cells are never narrower: past that the far layers hold fewer drops than the air
