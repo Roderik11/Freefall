@@ -193,9 +193,11 @@ namespace Freefall.Components
             // Every other emitter takes the share of it that its WeatherWind asks for (flames, smoke)
             Graphics.ParticleSystem.WeatherWind = DriveWind ? wind : Vector3.Zero;
 
-            DriveEmitter(ref _lastRain, RainEmitter, Graphics.Weather.Rain, wind, camPos, EmitterHeight);
-            DriveEmitter(ref _lastSnow, SnowEmitter, Graphics.Weather.Snow, wind, camPos, EmitterHeight);
-            DriveEmitter(ref _lastHail, HailEmitter, Graphics.Weather.Hail, wind, camPos, EmitterHeight);
+            // Rain, snow and hail drift in the wind the far rain and snow lean in (Weather.FallWind: steady, capped by how
+            // fast each falls), so the near drops and the far field agree
+            DriveEmitter(ref _lastRain, RainEmitter, Graphics.Weather.Rain, FallWind(RainEmitter), camPos, EmitterHeight);
+            DriveEmitter(ref _lastSnow, SnowEmitter, Graphics.Weather.Snow, FallWind(SnowEmitter), camPos, EmitterHeight);
+            DriveEmitter(ref _lastHail, HailEmitter, Graphics.Weather.Hail, FallWind(HailEmitter), camPos, EmitterHeight);
             DriveEmitter(ref _lastSplash, SplashEmitter, Graphics.Weather.Rain, wind, camPos, 0f);
             // Dust: park it on the terrain under the camera (or a body height below the camera when
             // there is no terrain) so sheets of sand skim the ground instead of floating at eye level.
@@ -206,6 +208,10 @@ namespace Freefall.Components
         }
 
         private TerrainRenderer _terrain;
+
+        // A weather emitter's fall speed is its terminal one, gravity over drag (rain 9.8 / 1.2 ≈ 8 m/s, snow 2 / 2 = 1)
+        private static Vector3 FallWind(ParticleEmitter emitter) =>
+            emitter == null ? Vector3.Zero : Graphics.Weather.FallWind(MathF.Abs(emitter.Gravity.Y) / MathF.Max(emitter.Drag, 0.01f));
 
         /// <summary>
         /// Drive one emitter through its runtime overrides only. The authored EmitRate / Wind are never

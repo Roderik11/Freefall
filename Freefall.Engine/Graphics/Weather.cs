@@ -56,6 +56,21 @@ namespace Freefall.Graphics
         private const float RainHazeKm = 3f, SnowHazeKm = 10f, HailHazeKm = 1f;
 
         /// <summary>
+        /// The wind falling rain, snow and hail drift in, for something that falls at <paramref name="fallSpeed"/> m/s:
+        /// the steady wind (not the gusts), at most 0.8 × the fall speed, as precipitation_layers_cs.hlsl leans the far
+        /// field (it must: its cells fold past that). The near drops in the gusting wind, uncapped, fell almost sideways
+        /// next to the far field's (user, 2026-10-23).
+        /// </summary>
+        public static Vector3 FallWind(float fallSpeed)
+        {
+            var w = Wind.Current;
+            var flat = new Vector2(w.X, w.Z);
+            float speed = flat.Length(), limit = 0.8f * MathF.Max(fallSpeed, 0f);
+            if (speed > limit && speed > 1e-4f) flat *= limit / speed;
+            return new Vector3(flat.X, 0f, flat.Y);
+        }
+
+        /// <summary>
         /// What the weather has left on the open surfaces round the camera (0..1), for the decal pass (decals_cs.hlsl):
         /// how wet they are (rising in the rain, a minute to soak in heavy rain), how full rain-filled puddles are (filling
         /// once the ground is soaked, ~5 minutes in heavy rain), how much snow lies (~10 minutes of heavy snow to cover).
