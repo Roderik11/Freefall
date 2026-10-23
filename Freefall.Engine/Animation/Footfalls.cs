@@ -99,6 +99,15 @@ namespace Freefall.Animation
         // of the same step are one
         private const float Apart = 0.3f;
 
+        // A foot that swung (got away from where it left the ground, past the hips, faster than
+        // Swung, in hip heights per second) has come down only once that has slowed to Settled of
+        // its fastest. Halfway through a walk's swing the toe passes a centimetre or two over the
+        // ground, as low as a landing, but going at its fastest; at the heel strike the swing has
+        // stopped. Measured from where the foot left the ground, not by its fastest motion: a
+        // sprint kicks the foot up behind faster than it later swings it forward.
+        private const float Swung = 0.5f;
+        private const float Settled = 0.3f;
+
         // How far behind the ankle the heel meets the ground, as a share of ankle to ball
         private const float HeelBack = 0.3f;
 
@@ -156,27 +165,41 @@ namespace Freefall.Animation
             var left = new Sole(feet.LeftFoot, feet.LeftToes, model, hipHeight);
             var right = new Sole(feet.RightFoot, feet.RightToes, model, hipHeight);
 
-            // One sample per key frame
+            // One sample per key frame: how high each sole is, and where its ankle is across the
+            // ground from the hips
             int steps = Math.Clamp((int)MathF.Ceiling(duration), 8, 600);
             var leftHeight = new float[steps + 1];
             var rightHeight = new float[steps + 1];
+            var leftAcross = new Vector2[steps + 1];
+            var rightAcross = new Vector2[steps + 1];
             for (int k = 0; k <= steps; k++)
             {
                 Pose(duration * k / steps, bind: false);
                 leftHeight[k] = left.Height(model);
                 rightHeight[k] = right.Height(model);
+                var hips = feet.Hips >= 0 ? model[feet.Hips].Translation : Vector3.Zero;
+                leftAcross[k] = Across(feet.LeftFoot, model, hips);
+                rightAcross[k] = Across(feet.RightFoot, model, hips);
             }
 
             var found = new List<Footfall>();
             float perSecond = steps / (duration / ticksPerSecond);
-            if (left.Foot >= 0) Steps(leftHeight, true, hipHeight, perSecond, found);
-            if (right.Foot >= 0) Steps(rightHeight, false, hipHeight, perSecond, found);
+            if (left.Foot >= 0) Steps(leftHeight, leftAcross, true, hipHeight, perSecond, found);
+            if (right.Foot >= 0) Steps(rightHeight, rightAcross, false, hipHeight, perSecond, found);
 
             found.Sort(static (a, b) => a.Time.CompareTo(b.Time));
             return found.ToArray();
         }
 
-        private static void Steps(float[] height, bool left, float hipHeight, float samplesPerSecond, List<Footfall> found)
+        // Where a foot's ankle is across the ground (x, z) from the hips
+        private static Vector2 Across(int foot, Matrix4x4[] model, Vector3 hips)
+        {
+            if (foot < 0) return Vector2.Zero;
+            var ankle = model[foot].Translation;
+            return new Vector2(ankle.X - hips.X, ankle.Z - hips.Z);
+        }
+
+        private static void Steps(float[] height, Vector2[] across, bool left, float hipHeight, float samplesPerSecond, List<Footfall> found)
         {
             int last = height.Length - 1;
 
@@ -191,26 +214,52 @@ namespace Freefall.Animation
 
             float lifted = Lifted * hipHeight, down = Down * hipHeight, near = Near * hipHeight;
             float stopped = Stopped * hipHeight / samplesPerSecond;
+            float swung = Swung * hipHeight / samplesPerSecond;
             int apart = (int)MathF.Ceiling(Apart * samplesPerSecond);
 
             // A clip that ends where it starts goes round
             bool cyclic = MathF.Abs(height[0] - height[last]) < down;
 
             // Walk the clip with the foot up or down. `peak` is how high it got since it left
-            // the ground, `since` how many samples ago it last came down.
+            // the ground, `from` where it left it (across from the hips), `swing` the fastest it
+            // got away from there (per sample), `since` how many samples ago it last came down.
             bool up = height[0] > lifted;
             float peak = height[0];
+            Vector2 from = across[0];
+            float swing = 0f;
             int since = apart;
 
-            // Whether the foot, being up, has come down at sample k
+            // How the ankle moves past the hips at sample k (per sample); a cyclic clip's last
+            // sample is its first
+            Vector2 Moving(int k)
+            {
+                bool edge = k == 0 || k == last;
+                int before = k > 0 ? k - 1 : cyclic ? last - 1 : 0;
+                int after = k < last ? k + 1 : cyclic ? 1 : last;
+                return (across[after] - across[before]) / (edge && !cyclic ? 1f : 2f);
+            }
+
+            // How fast the foot gets away from where it left the ground at sample k (per sample)
+            float Away(int k)
+            {
+                var reach = across[k] - from;
+                float length = reach.Length();
+                return length > 1e-6f ? Vector2.Dot(Moving(k), reach) / length : 0f;
+            }
+
+            // Whether the foot, being up, has come down at sample k: low enough, and done swinging
             bool Lands(int k)
             {
                 float h = height[k];
-                if (h < down) return true;
-                if (h > near || h > (peak + down) * 0.5f) return false;
+                if (h >= down)
+                {
+                    if (h > near || h > (peak + down) * 0.5f) return false;
 
-                float next = k < last ? height[k + 1] : cyclic ? height[1] : h;
-                return h - next < stopped;
+                    float next = k < last ? height[k + 1] : cyclic ? height[1] : h;
+                    if (h - next >= stopped) return false;
+                }
+
+                return swing < swung || Away(k) < Settled * swing;
             }
 
             // Once round first, for the state the clip is entered in: that of its own end
@@ -232,11 +281,14 @@ namespace Freefall.Animation
                     {
                         up = true;
                         peak = height[k];
+                        from = across[k];
+                        swing = 0f;
                     }
                     return;
                 }
 
                 peak = MathF.Max(peak, height[k]);
+                swing = MathF.Max(swing, Away(k));
                 if (!Lands(k)) return;
 
                 up = false;
