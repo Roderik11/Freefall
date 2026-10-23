@@ -118,18 +118,18 @@ namespace Freefall.Graphics
         public const float IceStep = 0.05f;
 
         /// <summary>
-        /// How thick the ice is (0..1; 0 = open water) at a place of water <paramref name="depth"/> metres deep (over the
-        /// terrain) whose current runs at <paramref name="speed"/> m/s, at the ice amount <paramref name="ice"/>: shallow
-        /// water first, the deep middle of a lake from an ice of 0.7; a current holds it off, slowing to nothing toward the
-        /// banks (full from 0.8 m deep), so a river freezes from its banks in, and a fast deep channel never freezes.
-        /// water.fx WaterIceThickness is the same, with a little noise on the edge. Ice of <see cref="WalkableIce"/> or more
-        /// carries a walker.
+        /// How thick the ice is (0..1; 0 = open water) at a place <paramref name="shore"/> of the way from the shore to the
+        /// middle of its water (WaterBody's shore field: 0 at the shore, 1 the farthest from it) whose current runs at
+        /// <paramref name="speed"/> m/s, at the ice amount <paramref name="ice"/>: one sheet growing out from the shore, the
+        /// middle of a lake frozen over at 0.75; a current holds it off, slowing to nothing toward the banks, so a river
+        /// freezes from its banks in and a fast one keeps an open channel. The sheet's edge is thin over 0.1 of the ice.
+        /// water.fx WaterIceThickness is the same, with a jagged edge. Ice of <see cref="WalkableIce"/> or more carries a
+        /// walker.
         /// </summary>
-        public static float IceThickness(float ice, float depth, float speed)
+        public static float IceThickness(float ice, float shore, float speed)
         {
-            float current = speed * Math.Clamp(depth / 0.8f, 0f, 1f);
-            float needed = 0.15f + 0.55f * Math.Clamp(depth / 2.5f, 0f, 1f) + 0.5f * Math.Clamp(current / 2.5f, 0f, 1f);
-            return Math.Clamp((ice - needed) / 0.25f, 0f, 1f);
+            float needed = 0.15f + 0.6f * shore + 0.4f * Math.Clamp(speed * shore / 2.5f, 0f, 1f);
+            return Math.Clamp((ice - needed) / 0.1f, 0f, 1f);
         }
 
         public const float WalkableIce = 0.6f;

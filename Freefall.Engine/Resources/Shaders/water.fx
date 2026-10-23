@@ -67,19 +67,22 @@ struct WaterData
     float Flowing;              // 1 = river (open spline), 0 = lake
     float Ice;                  // Graphics.Weather.Ice: how frozen the water is, 0..1
     float SnowCover;            // Graphics.Weather.SnowCover: the snow lies on the ice too
+    uint ShoreField;            // Texture2D<float>: the share of the way from the shore to the middle (0 = none yet)
+    float2 ShoreOrigin;         // world xz of its corner
+    float2 ShoreSize;           // metres it spans
 };
 
 SamplerState WaterSampler : register(s0);
 
-// How thick the ice is (0..1; 0 = open water) where the water is depth metres deep over its bed and its current runs at
-// speed m/s, at the ice amount: shallow water first, the deep middle of a lake from 0.7; a current holds it off, slowing
-// to nothing toward the banks (full from 0.8 m deep), so a river freezes from its banks in; a fast deep channel never
-// freezes. Graphics.Weather.IceThickness has the same numbers (the ice collider, WaterBody)
-float WaterIceThickness(float ice, float depth, float speed)
+// How thick the ice is (0..1; 0 = open water) at a place shore of the way from the shore to the middle of its water
+// (WaterBody's shore field) whose current runs at speed m/s, at the ice amount: one sheet growing out from the shore, the
+// middle of a lake frozen over at 0.75; a current holds it off, slowing to nothing toward the banks, so a river freezes
+// from its banks in and a fast one keeps an open channel; the sheet's edge is thin over 0.1 of the ice.
+// Graphics.Weather.IceThickness has the same numbers (the ice collider)
+float WaterIceThickness(float ice, float shore, float speed)
 {
-    float current = speed * saturate(depth / 0.8);
-    float needed = 0.15 + 0.55 * saturate(depth / 2.5) + 0.5 * saturate(current / 2.5);
-    return saturate((ice - needed) / 0.25);
+    float needed = 0.15 + 0.6 * shore + 0.4 * saturate(speed * shore / 2.5);
+    return saturate((ice - needed) / 0.1);
 }
 
 #define ICE_ALBEDO  float3(0.28, 0.32, 0.35)    // white ice, grey with the air frozen into it (the dark palette's ice;
@@ -201,16 +204,17 @@ PSOutput PS(VSOutput input)
     float2 acrossDir = float2(-flowDir.y, flowDir.x);
     float steep = flowing ? saturate(input.Flow.z) : 0.0;
 
-    // ── Ice: how thick here, by the depth over the bed (the terrain's height map) and the current, with a ragged edge.
-    // The collider over it (WaterBody) follows the same rule without the edge ──
-    float ice = 0.0;
-    if (water.Ice > 0.0)
+    // ── Ice: how thick here, by how far out from the shore (WaterBody's shore field) and the current; the sheet's edge
+    // jagged by noises interpolated linearly (kinks, not blobs: two smooth octaves made islands of ice all over a lake
+    // whose middle sat at the threshold). The collider over it (WaterBody) follows the same rule without the edge ──
+    float ice = 0.0, shore = 1.0;
+    if (water.Ice > 0.0 && water.ShoreField != 0)
     {
-        TerrainCover terrain = LoadTerrainCover();
-        float bed = terrain.Heightmap != 0 ? TerrainHeightAt(terrain, AtmosphereLinearClamp, worldPos.xz) : worldPos.y - 10.0;
+        Texture2D<float> shoreField = ResourceDescriptorHeap[water.ShoreField];
+        shore = shoreField.SampleLevel(AtmosphereLinearClamp, (worldPos.xz - water.ShoreOrigin) / water.ShoreSize, 0);
         float speed = flowing ? water.FlowSpeed * (1.0 + 4.0 * steep) : 0.0;
-        float ragged = (MacroNoise(worldPos.xz / 7.0) + 0.5 * MacroNoise(worldPos.xz / 2.3 + 13.1) - 0.75) * 0.1;
-        ice = WaterIceThickness(water.Ice + ragged, max(worldPos.y - bed, 0.0), speed);
+        float jag = IceJag(worldPos.xz / 23.0) * 0.55 + IceJag(worldPos.xz / 7.7 + 7.3) * 0.3 + IceJag(worldPos.xz / 2.3 - 2.9) * 0.15;
+        ice = WaterIceThickness(water.Ice + jag * 0.09, shore, speed);
     }
 
     // Pattern space: lakes sample in world space; rivers in strip space (u along the flow, v across),
@@ -324,14 +328,17 @@ PSOutput PS(VSOutput input)
         float2 tilt = (float2(MacroHash(plate), MacroHash(plate + 5.3)) - 0.5) * 0.015;
         float3 Ni = normalize(float3(tilt.x + (MacroNoise(p / 9.0) - 0.5) * 0.03, 1.0, tilt.y + (MacroNoise(p / 3.1 + 7.7) - 0.5) * 0.03));
         float NdotLi = saturate(dot(Ni, L));
-        // White ice forms in irregular patches whose edges are no cracks (chosen per plate the lake read as a mosaic of
-        // tiles from above)
-        float white = smoothstep(0.42, 0.72, MacroNoise(p / 25.0) * 0.7 + MacroNoise(p / 8.0 + 4.4) * 0.3);
+        // The oldest ice, along the shore where the sheet began, has frozen whiter; out from there it is clear black ice
+        // to the newest at the sheet's edge. Mottled by frost and frozen-in air a few metres across (jagged noise). Big
+        // soft patches of white ice over the whole sheet read as smears painted on it (user, 2026-10-23: "looks roughed
+        // in"); the white of a frozen lake is its snow, laid in streaks
+        float frost = IceJag(p / 3.0) + 0.5 * IceJag(p / 1.1 + 6.1);
+        float white = smoothstep(0.4, 0.05, shore) * saturate(0.7 + frost) * smoothstep(0.5, 1.0, ice);
 
         // Thin ice is a skin over the dark water; the water under it keeps what it showed but its mirror
-        float opacity = lerp(0.25, 0.9, ice) * lerp(0.2, 1.0, white);
+        float opacity = lerp(0.35, 0.9, ice) * lerp(0.2, 1.0, white) * (1.0 + 0.3 * frost);
         float roughness = lerp(0.04, 0.15, white);
-        float3 albedo = ICE_ALBEDO * lerp(1.0, 0.6, cracks * white);
+        float3 albedo = ICE_ALBEDO * (1.0 + 0.3 * frost) * lerp(1.0, 0.6, cracks * white);
         opacity = lerp(opacity, 0.8, cracks * (1.0 - white));                  // a white crack in clear ice
         float3 lit = albedo * (sunRadiance * NdotLi + SkyAmbient(Ni) * skyVisible);
         float3 iceBody = lerp((1.0 - F) * body, lit, opacity);
@@ -339,14 +346,22 @@ PSOutput PS(VSOutput input)
         float3 iceColor = (1.0 - Fi) * iceBody + (WaterSunSpecular(Ni, V, L, sunRadiance * 3.14159, roughness)
                         + Fi * WaterSkyReflection(V, Ni, roughness) * skyVisible) * column.edgeFade;
 
-        // Snow lies on ice that holds it, in drifts, as the cover grows (on the ground: decals_cs.hlsl)
-        float drift = MacroNoise(p / 4.0 + 21.0) * 0.6 + MacroNoise(p / 1.3 - 5.0) * 0.4;
+        // Snow lies on ice that holds it, as the cover grows (on the ground: decals_cs.hlsl), in streaks the wind laid
+        // down along itself over the open sheet (round blots of noise read as foam); none on the thin ice at the edge
+        float2 windAlong = dot(WindDirection.xz, WindDirection.xz) > 1e-4 ? normalize(WindDirection.xz) : float2(1, 0);
+        float2 windFrame = float2(dot(p, windAlong), dot(p, float2(-windAlong.y, windAlong.x)));
+        float drift = MacroNoise(windFrame / float2(14.0, 3.5)) * 0.65 + MacroNoise(windFrame / float2(5.0, 1.4) + 21.0) * 0.35;
         float bare = 1.0 - saturate(water.SnowCover);
-        float snow = smoothstep(bare - 0.08, bare + 0.08, (0.35 + 0.65 * drift) * smoothstep(0.3, 0.9, ice));
+        float snow = smoothstep(bare - 0.08, bare + 0.08, (0.35 + 0.65 * drift) * smoothstep(0.5, 1.0, ice));
         float3 snowLit = SNOW_ON_ICE * (sunRadiance * saturate(L.y) + SkyAmbient(float3(0, 1, 0)) * skyVisible);
         iceColor = lerp(iceColor, snowLit, snow);
 
-        color = lerp(color, iceColor, smoothstep(0.0, 0.12, ice));
+        // The sheet's edge a line, not a blur: the rippled open water stops at the glossy ice, and along it a thin rim of
+        // grey slush (frazil the wind and the current pile against the edge), a metre or two wide
+        float rim = smoothstep(0.0, 0.02, ice) * (1.0 - smoothstep(0.04, 0.12, ice)) * saturate(0.2 + 2.0 * frost);
+        float3 slush = ICE_ALBEDO * (sunRadiance * saturate(L.y) + SkyAmbient(float3(0, 1, 0)) * skyVisible);
+        iceColor = lerp(iceColor, slush, rim * 0.8);
+        color = lerp(color, iceColor, smoothstep(0.0, 0.02, ice));
     }
 
     // ── Aerial perspective ──

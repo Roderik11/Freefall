@@ -106,6 +106,38 @@ namespace Freefall.Components
         private float[] _surfaceSteep = Array.Empty<float>();
         private int[] _surfaceTriangles = Array.Empty<int>();
         private const float IceCell = 2f;
+
+        // How far each place of the water lies from its shore, for where the ice forms first (Weather.IceThickness): a
+        // grid over the surface's bounds in world xz (ShoreCellsMax cells a side at most, none finer than a metre), each
+        // cell the distance to the nearest cell the water does not cover (the bed rises over the surface there, or there
+        // is no surface) over the farthest any cell lies: 0 at the shore, 1 in the middle of the open water. By the depth
+        // instead, a lake whose bed is flat froze everywhere at once, in blotches where the edge's noise tipped it
+        // (user, 2026-10-23: "looks roughed in"). Made on a worker when the surface is built; water.fx reads it as a
+        // texture (WaterData.ShoreField), the ice collider the array.
+        private const int ShoreCellsMax = 512;
+
+        private sealed class ShoreField
+        {
+            public required float[] Share;
+            public int Width, Height;
+            public Vector2 Origin;
+            public float Cell;
+
+            // Bilinear, 0 outside
+            public float At(float x, float z)
+            {
+                float fx = (x - Origin.X) / Cell - 0.5f, fz = (z - Origin.Y) / Cell - 0.5f;
+                int x0 = (int)MathF.Floor(fx), z0 = (int)MathF.Floor(fz);
+                float tx = fx - x0, tz = fz - z0;
+                float Get(int i, int j) => i < 0 || j < 0 || i >= Width || j >= Height ? 0f : Share[j * Width + i];
+                return (Get(x0, z0) * (1f - tx) + Get(x0 + 1, z0) * tx) * (1f - tz)
+                     + (Get(x0, z0 + 1) * (1f - tx) + Get(x0 + 1, z0 + 1) * tx) * tz;
+            }
+        }
+
+        private ShoreField? _shore;
+        private System.Threading.Tasks.Task<ShoreField?>? _shoreTask;
+        private Texture? _shoreTexture;
         private PhysX.RigidStatic? _iceActor;
         private PhysX.Shape? _iceShape;
         private PhysX.TriangleMesh? _iceMesh;
@@ -140,6 +172,11 @@ namespace Freefall.Components
             public float Flowing;       // 1 = open spline (river), 0 = closed (lake)
             public float Ice;           // Weather.Ice
             public float SnowCover;     // Weather.SnowCover: snow lies on the ice
+            public uint ShoreField;     // Texture2D<float>: the share of the way from the shore to the middle (0 = none yet)
+            public float ShoreOriginX;  // world xz of the field's corner, and the metres it spans
+            public float ShoreOriginZ;
+            public float ShoreSizeX;
+            public float ShoreSizeZ;
         }
 
         protected override void Awake()
@@ -157,6 +194,8 @@ namespace Freefall.Components
             MessageDispatcher.RemoveListener(EngineMsg.SplineChanged, OnSplineChanged);
             Weather.IceStepChanged -= OnIceStepChanged;
             ReleaseIce();
+            Engine.Device.DeferDispose(_shoreTexture);
+            _shoreTexture = null;
 
             // Deferred: a draw enqueued earlier this frame and frames still in flight reference the mesh
             Engine.Device.DeferDispose(_mesh);
@@ -183,6 +222,8 @@ namespace Freefall.Components
         {
             if (!_iceDirty || Engine.IsEditor) return;
             if (_meshDirty) RebuildMesh();
+            TakeShoreField();
+            if (_shore == null && _shoreTask != null) return;   // the field is still being made: then
             _iceDirty = false;
             bool had = _iceActor != null;
             BuildIce();
@@ -202,17 +243,18 @@ namespace Freefall.Components
             float ice = Weather.Ice;
             if (ice <= 0f || _surfaceTriangles.Length == 0) return;
 
-            var terrain = EntityManager.FindComponent<TerrainRenderer>();
             var world = Transform.WorldMatrix;
             bool flowing = _spline != null && !_spline.Closed;
             var points = new List<Vector3>();
             var triangles = new List<int>();
 
+            // As far out as the ice has come; under the banks too (the surface runs on under them), so no gap opens
+            // between the shore and the ice
+            var shore = _shore;
             bool Holds(Vector3 p, float steep)
             {
-                float bed = terrain?.GetHeight(p) ?? p.Y - 10f;
                 float speed = flowing ? FlowSpeed * (1f + 4f * steep) : 0f;
-                return Weather.IceThickness(ice, MathF.Max(p.Y - bed, 0f), speed) >= Weather.WalkableIce;
+                return Weather.IceThickness(ice, shore?.At(p.X, p.Z) ?? 1f, speed) >= Weather.WalkableIce;
             }
 
             if (flowing)
@@ -294,6 +336,97 @@ namespace Freefall.Components
             PhysicsWorld.Scene.AddActor(_iceActor);
         }
 
+        /// <summary>The shore field of the surface just built, made on a worker (the terrain's heights are only read).</summary>
+        private void StartShoreField()
+        {
+            _shore = null;
+            _shoreTask = null;
+            if (_surfaceTriangles.Length < 3) return;
+            var world = Transform.WorldMatrix;
+            var points = Array.ConvertAll(_surfacePoints, p => Vector3.Transform(p, world));
+            var triangles = _surfaceTriangles;
+            var terrain = EntityManager.FindComponent<TerrainRenderer>();
+            _shoreTask = System.Threading.Tasks.Task.Run(() => MakeShoreField(points, triangles, terrain));
+        }
+
+        /// <summary>Main thread: the finished field into its texture (water.fx), and the collider made again over it.</summary>
+        private void TakeShoreField()
+        {
+            if (_shoreTask is not { IsCompleted: true } task) return;
+            _shoreTask = null;
+            _shore = task.IsCompletedSuccessfully ? task.Result : null;
+            Engine.Device.DeferDispose(_shoreTexture);
+            _shoreTexture = null;
+            if (_shore != null)
+            {
+                var bytes = new byte[_shore.Share.Length * 4];
+                Buffer.BlockCopy(_shore.Share, 0, bytes, 0, bytes.Length);
+                _shoreTexture = Texture.CreateFromData(Engine.Device, _shore.Width, _shore.Height, bytes, Vortice.DXGI.Format.R32_Float);
+            }
+            _iceDirty = true;
+        }
+
+        // Any thread. The grid's cells whose centre lies in a surface triangle and over the bed are water, the rest shore;
+        // the distance to the shore by a two-pass chamfer (1 and √2), over its largest
+        private static ShoreField? MakeShoreField(Vector3[] points, int[] triangles, TerrainRenderer? terrain)
+        {
+            float minX = float.MaxValue, minZ = float.MaxValue, maxX = float.MinValue, maxZ = float.MinValue;
+            foreach (var p in points)
+            {
+                minX = MathF.Min(minX, p.X); maxX = MathF.Max(maxX, p.X);
+                minZ = MathF.Min(minZ, p.Z); maxZ = MathF.Max(maxZ, p.Z);
+            }
+            float cell = MathF.Max(1f, MathF.Max(maxX - minX, maxZ - minZ) / (ShoreCellsMax - 2));
+            var origin = new Vector2(minX - cell, minZ - cell);
+            int w = (int)MathF.Ceiling((maxX - minX) / cell) + 2, h = (int)MathF.Ceiling((maxZ - minZ) / cell) + 2;
+            var d = new float[w * h];
+
+            for (int t = 0; t + 2 < triangles.Length; t += 3)
+            {
+                var a = points[triangles[t]];
+                var b = points[triangles[t + 1]];
+                var c = points[triangles[t + 2]];
+                int x0 = Math.Max(0, (int)((MathF.Min(a.X, MathF.Min(b.X, c.X)) - origin.X) / cell));
+                int x1 = Math.Min(w - 1, (int)((MathF.Max(a.X, MathF.Max(b.X, c.X)) - origin.X) / cell));
+                int z0 = Math.Max(0, (int)((MathF.Min(a.Z, MathF.Min(b.Z, c.Z)) - origin.Y) / cell));
+                int z1 = Math.Min(h - 1, (int)((MathF.Max(a.Z, MathF.Max(b.Z, c.Z)) - origin.Y) / cell));
+                for (int j = z0; j <= z1; j++)
+                for (int i = x0; i <= x1; i++)
+                {
+                    var centre = origin + new Vector2(i + 0.5f, j + 0.5f) * cell;
+                    if (!Barycentric(centre, a, b, c, out var weight)) continue;
+                    float surface = a.Y * weight.X + b.Y * weight.Y + c.Y * weight.Z;
+                    float bed = terrain?.GetHeight(new Vector3(centre.X, surface, centre.Y)) ?? surface - 10f;
+                    if (bed < surface) d[j * w + i] = float.MaxValue;
+                }
+            }
+
+            const float Diagonal = 1.41421356f;
+            float At(int i, int j) => i < 0 || j < 0 || i >= w || j >= h ? 0f : d[j * w + i];
+            for (int j = 0; j < h; j++)
+            for (int i = 0; i < w; i++)
+            {
+                ref float v = ref d[j * w + i];
+                if (v == 0f) continue;
+                v = MathF.Min(v, MathF.Min(MathF.Min(At(i - 1, j) + 1f, At(i, j - 1) + 1f),
+                                           MathF.Min(At(i - 1, j - 1) + Diagonal, At(i + 1, j - 1) + Diagonal)));
+            }
+            float most = 0f;
+            for (int j = h - 1; j >= 0; j--)
+            for (int i = w - 1; i >= 0; i--)
+            {
+                ref float v = ref d[j * w + i];
+                if (v == 0f) continue;
+                v = MathF.Min(v, MathF.Min(MathF.Min(At(i + 1, j) + 1f, At(i, j + 1) + 1f),
+                                           MathF.Min(At(i + 1, j + 1) + Diagonal, At(i - 1, j + 1) + Diagonal)));
+                most = MathF.Max(most, v);
+            }
+            if (most <= 0f) return null;
+            for (int k = 0; k < d.Length; k++)
+                d[k] /= most;
+            return new ShoreField { Share = d, Width = w, Height = h, Origin = origin, Cell = cell };
+        }
+
         // The weights of a point (xz) in a triangle, false when it lies outside
         private static bool Barycentric(Vector2 p, Vector3 a, Vector3 b, Vector3 c, out Vector3 w)
         {
@@ -344,6 +477,7 @@ namespace Freefall.Components
 
             if (_spline == null || _spline.Points.Count < 2) return;
             _mesh = _spline.Closed ? BuildLake(_spline) : BuildRiver(_spline);
+            StartShoreField();
         }
 
         /// <summary>
@@ -481,7 +615,8 @@ namespace Freefall.Components
             _sunLight ??= EntityManager.FindComponent<DirectionalLight>();
             _spline ??= Entity.GetComponent<Spline>();
 
-            if (_meshDirty) RebuildMesh(); 
+            if (_meshDirty) RebuildMesh();
+            TakeShoreField();
             var mesh = _mesh;
             if (mesh == null) return;
 
@@ -538,6 +673,11 @@ namespace Freefall.Components
                 Flowing = _spline != null && !_spline.Closed ? 1f : 0f,
                 Ice = Weather.Ice,
                 SnowCover = Weather.SnowCover,
+                ShoreField = _shoreTexture?.BindlessIndex ?? 0u,
+                ShoreOriginX = _shore?.Origin.X ?? 0f,
+                ShoreOriginZ = _shore?.Origin.Y ?? 0f,
+                ShoreSizeX = _shore != null ? _shore.Width * _shore.Cell : 1f,
+                ShoreSizeZ = _shore != null ? _shore.Height * _shore.Cell : 1f,
             });
 
             CommandBuffer.Enqueue(mesh, _material, _params, Transform.TransformSlot);
