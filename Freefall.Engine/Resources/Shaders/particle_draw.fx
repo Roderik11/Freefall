@@ -121,6 +121,14 @@ VSOutput VS(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
     }
     else
         output.Color.rgb *= LightScale;
+    // A water drop is a lens over a small part of its streak: it shows the sky's light through just as much of the
+    // pixel as it hides, its alpha (premultiplied by it), each drop its own share (size, how the light catches it). With
+    // the light added in full over a 30 % alpha every streak was a white bar brighter than the sky (user, 2026-10-23)
+    if ((e.Flags & PARTICLE_FLAG_WATER) != 0)
+    {
+        output.Color.rgb *= output.Color.a;
+        output.Color *= lerp(0.3, 1.0, vis.Random);
+    }
     if (e.FadeInRate > 0.0)
         output.Color *= saturate(t * e.FadeInRate);
     // Volumetric: inside its range the near fog volume carries the particle (volumetric_fog_cs.hlsl CSFogInject), the
@@ -142,7 +150,9 @@ VSOutput VS(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
         float viewDepth = mul(float4(core.Position, 1.0), View).z;
         // Rain and snow right at the eye would be out of focus, a blur too faint to see: drawn, a drop a hand's width away
         // was a white bar across the screen, a flake a dark blot on the sky
-        if ((e.Flags & (PARTICLE_FLAG_WATER | PARTICLE_FLAG_COVER)) != 0)
+        if ((e.Flags & PARTICLE_FLAG_WATER) != 0)
+            output.Color *= smoothstep(1.0, 3.5, viewDepth);
+        else if ((e.Flags & PARTICLE_FLAG_COVER) != 0)
             output.Color *= smoothstep(0.5, 2.0, viewDepth);
         float minWidth = viewDepth > 0.0 ? PIXEL_FLOOR * 2.0 * viewDepth / (Projection._22 * ViewportSize.y) : 0.0;
         if (e.BillboardMode == BILLBOARD_VELOCITY)

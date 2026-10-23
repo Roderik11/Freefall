@@ -236,8 +236,9 @@ namespace Freefall.Components
 
         [Description("Lit: water drops (rain). A drop shows the sky above and behind it through itself, like a tiny lens: it " +
                      "takes the sky's light from above in full, not the average with the dark ground below that a speck of " +
-                     "dust takes; RGB × Intensity is how much of it comes through (~1). Diffuse-lit at 0.6 the rain vanished " +
-                     "against dark walls")]
+                     "dust takes. RGB × Intensity is how much of it comes through (~1), alpha how much of its streak the drop " +
+                     "covers (~0.35; its light is scaled by it), each drop 30-100 % of that; faded out within 1-3.5 m of the eye. " +
+                     "Diffuse-lit at 0.6 the rain vanished against dark walls")]
         public bool Water = false;
 
         [Description("Lit: how much of the sun's and moon's light the particles throw on along its way, so they glow with the " +
