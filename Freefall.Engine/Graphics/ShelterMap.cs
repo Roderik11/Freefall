@@ -77,6 +77,13 @@ namespace Freefall.Graphics
         /// <summary>Draw every level again (a scene was loaded, meshes were placed or moved).</summary>
         public static void Invalidate() => _invalid = true;
 
+        /// <summary>
+        /// Where the levels are centred while <paramref name="camera"/> draws: the main camera's place (the game's view
+        /// also in the editor's scene view). The shader blends the levels by the distance from here, not by their
+        /// snapped squares (weather_cover.hlsli ShelterBlend).
+        /// </summary>
+        public static Vector3 EyeFor(Camera camera) => (Camera.Main ?? camera).Position;
+
         /// <summary>The levels as drawn (Size 0 where not yet or when off) and the heights their maps span.</summary>
         public static (LevelData L0, LevelData L1, LevelData L2, float MinY, float RangeY) Current =>
             Enabled ? (_drawn[0], _drawn[1], _drawn[2], _minY, _maxY - _minY) : (default, default, default, 0f, 1f);
@@ -123,7 +130,7 @@ namespace Freefall.Graphics
             if (culler == null || all == null)
                 return false;
 
-            var eye = (Camera.Main ?? camera).Position;
+            var eye = EyeFor(camera);
             var terrain = Atmosphere.TerrainCover;
             float minY = terrain.Heightmap != 0 ? terrain.Origin.Y - BelowGround : MathF.Floor(eye.Y / 64f) * 64f - NoTerrainBelow;
             float maxY = terrain.Heightmap != 0 ? terrain.Origin.Y + terrain.MaxHeight + AboveGround : minY + NoTerrainBelow + NoTerrainAbove;

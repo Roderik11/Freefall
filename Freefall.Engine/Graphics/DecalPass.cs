@@ -34,7 +34,7 @@ namespace Freefall.Graphics
             public Vector3 TerrainOrigin; public float Wetness;
             public Vector2 TerrainSize; public float PuddleFill, SnowCover;
             public float Rain; public uint TilesY, WeatherOn, _pad;
-            public float Time, SnowFallen, _pad2, _pad3;
+            public float Time, SnowFallen, ShelterEyeX, ShelterEyeZ;
         }
 
         private static ComputeShader? _cullCS, _applyCS;
@@ -230,6 +230,7 @@ namespace Freefall.Graphics
             var c1 = new Vector4(cvp.M12, cvp.M22, cvp.M32, cvp.M42);
             var c3 = new Vector4(cvp.M14, cvp.M24, cvp.M34, cvp.M44);
             var shelter = ShelterMap.Current;
+            var shelterEye = ShelterMap.EyeFor(camera);
             var terrain = Atmosphere.TerrainCover;
             *_frames[slot]!.WritePtr<Frame>() = new Frame
             {
@@ -259,6 +260,8 @@ namespace Freefall.Graphics
                 WeatherOn = weather ? 1u : 0u,
                 Time = Base.Time.TotalTime,
                 SnowFallen = Weather.SnowFallen,
+                ShelterEyeX = shelterEye.X,
+                ShelterEyeZ = shelterEye.Z,
             };
         }
 

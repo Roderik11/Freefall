@@ -2703,6 +2703,16 @@ namespace Freefall.Components
                 cs.SetParam("MaxInstances", (uint)_maxDecoInstances);
                 cs.SetParam("MaxBladeInstances", (uint)MaxBladeInstances);
 
+                // The snow buries the grass and flowers (grass_compute.hlsl SnowBurial), less where the cover map keeps it off
+                var shelter = ShelterMap.Current;
+                cs.SetParam("SnowCover", Weather.SnowCover);
+                cs.SetParam("ShelterMinY", shelter.MinY);
+                cs.SetParam("ShelterRangeY", shelter.RangeY);
+                cs.SetParam("ShelterLevel0", new Vector3(shelter.L0.Left, shelter.L0.Top, shelter.L0.Size));
+                cs.SetParam("ShelterMap0", shelter.L0.Map);
+                cs.SetParam("ShelterLevel1", new Vector3(shelter.L1.Left, shelter.L1.Top, shelter.L1.Size));
+                cs.SetParam("ShelterMap1", shelter.L1.Map);
+
                 // ── Per-kernel push constants (resource indices only) ──
                 cs.SetBuffer(_kSpawnInstances, "DecoInstanceUAV", _decoInstanceBuffer);
                 cs.SetBuffer(_kSpawnInstances, "InstanceCounterUAV", _instanceCounterBuffer);

@@ -58,7 +58,7 @@ struct DecalFrame
     uint _framePad;
     float Time;                 // Time.TotalTime: spawned decals' age
     float SnowFallen;           // Weather.SnowFallen: covers' worth of snow fallen so far (prints fill with it)
-    float2 _framePad2;
+    float2 ShelterEye;          // world xz the cover map's levels are centred on (ShelterMap.EyeFor): their blend
 };
 
 // The world matrix's rows: X and Z span the decal (scaled), Y is the projection axis (scaled), T its centre

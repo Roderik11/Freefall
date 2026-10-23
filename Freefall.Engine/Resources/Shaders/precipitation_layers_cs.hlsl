@@ -180,6 +180,7 @@ void CSLayers(uint3 id : SV_DispatchThreadID)
 
     WeatherShelter s;
     s.Levels = P.Shelter;
+    s.Eye = CamPos.xz;
     s.MinY = P.ShelterMinY;
     s.RangeY = P.ShelterRangeY;
     s.TerrainHeightmap = 0;

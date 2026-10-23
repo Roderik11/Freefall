@@ -23,6 +23,7 @@
 #include "decoration_noise.hlsli"   // DecoClusterMask, DecoHeightFactor
 #include "ground_shape.hlsli"       // GroundShape, GroundShapeTint, PackGroundTint
 #include "terrain_holes.hlsli"      // TerrainHoleAt
+#include "weather_cover.hlsli"      // ShelterTexels: how much the cover map keeps the snow off a plant's root
 
 // Push constants (root parameter 0, register b3) — bindless indices only
 cbuffer PushConstants : register(b3)
@@ -144,6 +145,15 @@ cbuffer DecoParams : register(b4)
     float3 ShadowSweep;         // light direction x longest decorator shadow (0 = shadows off)
     uint   GridSize;            // cells per side of the dispatch (odd: the camera's cell in the middle)
     uint   MaxBladeInstances;
+    // The snow lying on the ground buries what grows in it (SnowBurial): Weather.SnowCover, and the cover map's two
+    // finest levels (ShelterMap: left, top, size; its map, 0 = not drawn) for where crowns and roofs keep it off
+    float  SnowCover;
+    float  ShelterMinY;
+    float  ShelterRangeY;
+    float3 ShelterLevel0;
+    uint   ShelterMap0;
+    float3 ShelterLevel1;
+    uint   ShelterMap1;
 };
 
 #define BLADE_CLUMPS_PER_AS 32  // grass_blades.fx: one AS group launches this many clump MS groups
@@ -271,6 +281,44 @@ float VariantRange(DecoratorSlot s)
 
 SamplerState HeightSampler : register(s0);
 SamplerState ClampSampler  : register(s2);
+
+// ─── Snow ──────────────────────────────────────────────────────────────────
+
+// How much of a plant's height the snow lying at its root buries, 0..1 (`vary` 0..1: this plant's own share, so they
+// do not all end at one line): the snow cover as far as the fall reaches the ground there (the cover map's share over
+// the root, as the ground's own snow takes it: a crown lets half through, a roof none). Grass and flowers stood
+// coloured in the snow out to the decoration's radius, and the white ground past it drew a line across the land (user,
+// 2026-10-23)
+float SnowBurial(float3 root, float vary)
+{
+    if (SnowCover <= 0.0)
+        return 0.0;
+    WeatherShelter s = (WeatherShelter)0;
+    s.MinY = ShelterMinY;
+    s.RangeY = ShelterRangeY;
+    ShelterLevel l;
+    l.Left = ShelterLevel0.x;
+    l.Top = ShelterLevel0.y;
+    l.Size = ShelterLevel0.z;
+    l.Map = ShelterMap0;
+    if (l.Size <= 0.0 || ShelterInside(l, root.xz) <= 0.0)
+    {
+        l.Left = ShelterLevel1.x;
+        l.Top = ShelterLevel1.y;
+        l.Size = ShelterLevel1.z;
+        l.Map = ShelterMap1;
+    }
+    float covered = 0.0;
+    if (l.Size > 0.0 && l.Map != 0u)
+    {
+        float4 tops, shares;
+        float2 f;
+        ShelterTexels(s, l, ClampSampler, root.xz, tops, shares, f);
+        covered = WeatherBilinear(shares * step(root.y + 0.5, tops), f);
+    }
+    float lying = SnowCover * (1.0 - covered);
+    return smoothstep(0.15, 0.85, lying * lerp(0.8, 1.2, vary));
+}
 
 // ─── PCG Hash ──────────────────────────────────────────────────────────────
 
@@ -737,6 +785,15 @@ void CS_SpawnInstances(uint3 gid : SV_GroupID, uint3 gtid3 : SV_GroupThreadID)
                 }
             }
             di.Mode = mode;
+
+            // Under the snow: as much shorter as it buries them, gone once it nearly does. Not the meshes: stones and
+            // bushes stand out of it
+            if (mode != MODE_MESH && SnowCover > 0.0)
+            {
+                float buried = SnowBurial(instancePos, frac(instanceSeedVal * 7.31));
+                if (buried > 0.92) continue;
+                di.Scale.y *= 1.0 - buried;
+            }
 
             if (mode == MODE_MESH)
             {

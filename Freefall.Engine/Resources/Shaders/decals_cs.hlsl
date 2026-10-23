@@ -509,26 +509,30 @@ float3 SnowSurfaceNormal(float3 world, float3 n, float footprint, float3 toLight
 }
 
 // How much of the falling rain and snow reaches a surface (straight down, soft under eaves), looked for a little out
-// from it: a wall in the open is not covered by its own top, a floor under a roof is. Vegetation takes only the
-// terrain's cover: a crown over its own lower branches counted as cover near the camera, where the cover map resolves
-// it, and not far off, where its coarse levels do not, so near trees stayed green and far ones white
+// from it: a wall in the open is not covered by its own top, a floor under a roof is. Vegetation takes the terrain's
+// cover and how deep in its crown it lies (CrownExposure), not the crown's cover outright: that counted near the camera,
+// where the cover map resolves a crown over its own lower branches, and not far off, where its coarse levels do not, so
+// near trees stayed green and far ones white
 float SurfaceOpenness(DecalFrame f, float3 rel, float3 geo, uint surfaceClass)
 {
     WeatherShelter s;
     s.Levels = f.Shelter;
-    if (surfaceClass == 2u)
-    {
-        [unroll]
-        for (uint k = 0; k < SHELTER_LEVELS; k++)
-            s.Levels[k].Size = 0.0;
-    }
+    s.Eye = f.ShelterEye;
     s.MinY = f.ShelterMinY;
     s.RangeY = f.ShelterRangeY;
     s.TerrainHeightmap = f.TerrainHeightmap;
     s.TerrainMaxHeight = f.TerrainMaxHeight;
     s.TerrainOrigin = f.TerrainOrigin;
     s.TerrainSize = f.TerrainSize;
-    return WeatherOpenness(s, LinearClamp, rel + CamPos + geo * 0.35 + float3(0, 0.05, 0), 0.1);
+    float crown = 1.0;
+    if (surfaceClass == 2u)
+    {
+        crown = CrownExposure(s, LinearClamp, rel + CamPos);
+        [unroll]
+        for (uint k = 0; k < SHELTER_LEVELS; k++)
+            s.Levels[k].Size = 0.0;
+    }
+    return crown * WeatherOpenness(s, LinearClamp, rel + CamPos + geo * 0.35 + float3(0, 0.05, 0), 0.1);
 }
 
 // The terrain's smooth normal at a place (world xz) from its height map: its own normal before its layers' normal maps
@@ -791,7 +795,12 @@ void CSDecals(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint gi : S
         if (surfaceClass == 1u && f.TerrainHeightmap != 0)
             largeN = TerrainNormal(f, rel.xz + CamPos.xz);
         else if (surfaceClass == 2u)
+        {
             largeN = normalize(s.Normal.xyz);
+            // A leaf seen from below shows its bare underside: the depth's normal (the leaf card, turned to the eye)
+            // points down. The G-buffer's normal cannot say so: two-sided cards, and the dome normal faces up on both
+            open *= smoothstep(-0.5, -0.15, geo.y);
+        }
         ApplyWeather(f, rel, largeN, surfaceClass, open, NormalVariance(gtid.xy, before.Normal.xyz), s);
     }
 

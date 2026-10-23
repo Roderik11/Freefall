@@ -62,6 +62,7 @@ struct ShelterLevel
 struct WeatherShelter
 {
     ShelterLevel Levels[SHELTER_LEVELS];
+    float2 Eye;                     // world xz the levels are centred on (ShelterMap.EyeFor): what they blend by
     float MinY;                     // the heights the maps' 16 bits span
     float RangeY;
     uint TerrainHeightmap;          // R16 heights; 0 = none
@@ -164,12 +165,49 @@ float ShelterCoverAt(WeatherShelter s, SamplerState anySampler, float2 xz, float
     return 0.0;
 }
 
+// How far from the eye a level can be read: its square is centred again every eighth of its size (ShelterMap.Steps), so
+// a circle of 7/16 of its size round the eye, less the room its lookups need, always lies inside it
+float ShelterReach(ShelterLevel l)
+{
+    return 0.4375 * l.Size - 2.0 * max(WEATHER_SEARCH, 3.0 * l.Size / SHELTER_RESOLUTION);
+}
+
+// The levels for a place (world xz): the finest that holds it, how much of it to take (w), and the next coarser one that
+// holds it (SHELTER_LEVELS: none), by the place's distance from the eye: a level in full out to 70 % of its reach, then
+// blended into the next over the rest, and the last into no cover. By the distance, not the level's square, which moves
+// in steps with the camera: a blend over the square's outer 15 % jumped at every step and drew a square round the
+// camera (user, 2026-10-23: "distance/cross fade the ground coverage map"). A level not yet drawn again for where the
+// camera is now (one a frame) is passed over where it does not reach
+void ShelterBlend(WeatherShelter s, float2 xz, out uint first, out uint second, out float w)
+{
+    float d = length(xz - s.Eye);
+    first = SHELTER_LEVELS;
+    second = SHELTER_LEVELS;
+    w = 0.0;
+    [unroll]
+    for (uint k = 0; k < SHELTER_LEVELS; k++)
+    {
+        if (s.Levels[k].Size <= 0.0 || ShelterInside(s.Levels[k], xz) <= 0.0)
+            continue;
+        float reach = ShelterReach(s.Levels[k]);
+        if (first == SHELTER_LEVELS)
+        {
+            if (d < reach)
+            {
+                first = k;
+                w = saturate((reach - d) / (0.3 * reach));
+            }
+        }
+        else if (second == SHELTER_LEVELS)
+            second = k;
+    }
+}
+
 // How much of the falling rain and snow reaches a surface (absolute world position), 0..1. Straight down: what lies on
 // the ground must not move with the wind (a fall slanted by the wind moved the snow already lying with every change of
-// the wind, user 2026-10-22). From the finest level that holds the place, blended into the next over the outer 15 % of
-// it, and out of the last into no cover, so the cover thins out with distance instead of ending at a square round the
-// camera (one 256 m capture left bare ground under the trees inside it and snow under them past it, user 2026-10-23).
-// The terrain covers outright.
+// the wind, user 2026-10-22). Blended between the levels by the distance from the eye (ShelterBlend), so the cover
+// thins out with distance instead of ending at a square round the camera (one 256 m capture left bare ground under the
+// trees inside it and snow under them past it, user 2026-10-23). The terrain covers outright.
 float WeatherOpenness(WeatherShelter s, SamplerState linearClamp, float3 p, float bias)
 {
     if (s.TerrainHeightmap != 0)
@@ -180,38 +218,54 @@ float WeatherOpenness(WeatherShelter s, SamplerState linearClamp, float3 p, floa
             && s.TerrainOrigin.y + heights.SampleLevel(linearClamp, tuv, 0) * s.TerrainMaxHeight > p.y + bias)
             return 0.0;
     }
-    float y = p.y + bias;
-    uint first = SHELTER_LEVELS;
-    float inside = 0.0;
-    [unroll]
-    for (uint k = 0; k < SHELTER_LEVELS; k++)
-    {
-        float d = ShelterInside(s.Levels[k], p.xz);
-        if (first == SHELTER_LEVELS && d > 0.0)
-        {
-            first = k;
-            inside = d;
-        }
-    }
+    uint first, second;
+    float w;
+    ShelterBlend(s, p.xz, first, second, w);
     if (first == SHELTER_LEVELS)
         return 1.0;
-    ShelterLevel l = s.Levels[first];
-    float open = ShelterLevelOpenness(s, l, linearClamp, p.xz, y, bias);
-    float w = saturate(inside / (0.15 * l.Size));
+    float y = p.y + bias;
+    float open = ShelterLevelOpenness(s, s.Levels[first], linearClamp, p.xz, y, bias);
     if (w < 1.0)
     {
-        float next = 1.0;
-        for (uint j = first + 1; j < SHELTER_LEVELS; j++)
-        {
-            if (ShelterInside(s.Levels[j], p.xz) > 0.0)
-            {
-                next = ShelterLevelOpenness(s, s.Levels[j], linearClamp, p.xz, y, bias);
-                break;
-            }
-        }
+        float next = second < SHELTER_LEVELS ? ShelterLevelOpenness(s, s.Levels[second], linearClamp, p.xz, y, bias) : 1.0;
         open = lerp(next, open, w);
     }
     return open;
+}
+
+#define CROWN_SHELL 1.0     // m under the top of the cover over it a leaf takes the fall in full (half a texel added)
+#define CROWN_DEPTH 3.0     // ... and none (a texel added)
+
+// By one level: how far under the highest cover over its four texels (its own crown's top, or a roof over the tree) a
+// place lies, as the share of the fall it takes. The shell widens with the level's texels: a coarse level's top is the
+// highest leaf over metres, and a thin shell turned far trees green again
+float CrownLevelExposure(WeatherShelter s, ShelterLevel l, SamplerState anySampler, float3 p)
+{
+    float4 tops, shares;
+    float2 f;
+    ShelterTexels(s, l, anySampler, p.xz, tops, shares, f);
+    float top = max(max(tops.x, tops.y), max(tops.z, tops.w));
+    float texel = l.Size / SHELTER_RESOLUTION;
+    return 1.0 - smoothstep(CROWN_SHELL + 0.5 * texel, CROWN_DEPTH + texel, top - p.y);
+}
+
+// How much of the fall reaches a place in a crown (absolute world position), 0..1: the snow lies on a crown's top and
+// its upper flanks, not under it or inside it. The foliage's G-buffer normal (its dome normal, gbuffer_foliage.fx) faces
+// up even under the crown, so by the normal alone a full cover turned whole trees white, from above and below and in to
+// the trunk (user, 2026-10-23). Blended between the levels as WeatherOpenness. A tree the map holds no top for takes
+// the fall in full: the far trees' cross-mesh cards are vertical and have no area seen from straight above, so the
+// cover map does not hold them (nor shelter the ground under them)
+float CrownExposure(WeatherShelter s, SamplerState anySampler, float3 p)
+{
+    uint first, second;
+    float w;
+    ShelterBlend(s, p.xz, first, second, w);
+    if (first == SHELTER_LEVELS)
+        return 1.0;
+    float exposure = CrownLevelExposure(s, s.Levels[first], anySampler, p);
+    if (w < 1.0)
+        exposure = lerp(second < SHELTER_LEVELS ? CrownLevelExposure(s, s.Levels[second], anySampler, p) : 1.0, exposure, w);
+    return exposure;
 }
 
 #endif
