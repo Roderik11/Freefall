@@ -25,9 +25,14 @@ namespace Freefall.Components
     /// Shading is shared with the ocean (water_common.fx), so all water follows time of day, sky and
     /// clouds the same way. Ripples borrow the ocean simulation's slope maps when the scene has an
     /// OceanRenderer; without one the surface is flat.
+    ///
+    /// In the cold it freezes (Graphics.Weather.Ice): water.fx draws the ice and the snow on it where the water is
+    /// shallow and slow enough (Weather.IceThickness: from the banks in, a fast deep channel stays open), and in play a
+    /// static collider over the ice that holds (Weather.WalkableIce) carries walkers on it, made again when the ice
+    /// moves a step (Weather.IceStepChanged), not every frame.
     /// </summary>
     [Icon("icon_ocean.png")]
-    public class WaterBody : Component, IDraw
+    public class WaterBody : Component, IDraw, IUpdate
     {
         [Category("Shape")]
         [ValueRange(0.5f, 100f)]
@@ -95,6 +100,17 @@ namespace Freefall.Components
         private OceanRenderer? _ocean;
         private DirectionalLight? _sunLight;
 
+        // The surface as built (mesh-local), for the ice collider: its points, how steep the river falls at each, its
+        // triangles. A lake's are the outline's (a few big triangles): its ice is laid on a grid of IceCell metres
+        private Vector3[] _surfacePoints = Array.Empty<Vector3>();
+        private float[] _surfaceSteep = Array.Empty<float>();
+        private int[] _surfaceTriangles = Array.Empty<int>();
+        private const float IceCell = 2f;
+        private PhysX.RigidStatic? _iceActor;
+        private PhysX.Shape? _iceShape;
+        private PhysX.TriangleMesh? _iceMesh;
+        private bool _iceDirty;
+
         [StructLayout(LayoutKind.Sequential)]
         public struct WaterData
         {
@@ -122,7 +138,8 @@ namespace Freefall.Components
             public uint BandA;
             public uint BandB;
             public float Flowing;       // 1 = open spline (river), 0 = closed (lake)
-            public float _pad0;
+            public float Ice;           // Weather.Ice
+            public float SnowCover;     // Weather.SnowCover: snow lies on the ice
         }
 
         protected override void Awake()
@@ -131,11 +148,15 @@ namespace Freefall.Components
             _spline = Entity.GetComponent<Spline>();
             _sunLight = EntityManager.FindComponent<DirectionalLight>();
             MessageDispatcher.AddListener(EngineMsg.SplineChanged, OnSplineChanged);
+            Weather.IceStepChanged += OnIceStepChanged;
+            _iceDirty = true;
         }
 
         public override void Destroy()
         {
             MessageDispatcher.RemoveListener(EngineMsg.SplineChanged, OnSplineChanged);
+            Weather.IceStepChanged -= OnIceStepChanged;
+            ReleaseIce();
 
             // Deferred: a draw enqueued earlier this frame and frames still in flight reference the mesh
             Engine.Device.DeferDispose(_mesh);
@@ -148,8 +169,164 @@ namespace Freefall.Components
                 _meshDirty = true;
         }
 
+        private void OnIceStepChanged() => _iceDirty = true;
+
         /// <summary>Inspector / command-server edits (Width, Depth, Expand) rebuild the surface.</summary>
         public override void OnMemberChanged() => _meshDirty = true;
+
+        // ═══════════════════════════
+        // ── Ice ──
+        // ═══════════════════════════
+
+        /// <summary>In play: the ice collider made again when the ice moved a step or the surface changed.</summary>
+        public void Update()
+        {
+            if (!_iceDirty || Engine.IsEditor) return;
+            if (_meshDirty) RebuildMesh();
+            _iceDirty = false;
+            bool had = _iceActor != null;
+            BuildIce();
+            // The walkers' controllers remember the shapes round them: a new or vanished sheet of ice is not seen
+            // otherwise (they walked through ice turned off and on again)
+            if (had || _iceActor != null)
+                PhysicsWorld.InvalidateControllerCaches();
+        }
+
+        /// <summary>
+        /// A static triangle mesh over the ice that holds a walker (world space, at the water's surface): a river's
+        /// surface triangles whose corners all freeze that far, a lake's grid cells. Nothing while it is all open water.
+        /// </summary>
+        private void BuildIce()
+        {
+            ReleaseIce();
+            float ice = Weather.Ice;
+            if (ice <= 0f || _surfaceTriangles.Length == 0) return;
+
+            var terrain = EntityManager.FindComponent<TerrainRenderer>();
+            var world = Transform.WorldMatrix;
+            bool flowing = _spline != null && !_spline.Closed;
+            var points = new List<Vector3>();
+            var triangles = new List<int>();
+
+            bool Holds(Vector3 p, float steep)
+            {
+                float bed = terrain?.GetHeight(p) ?? p.Y - 10f;
+                float speed = flowing ? FlowSpeed * (1f + 4f * steep) : 0f;
+                return Weather.IceThickness(ice, MathF.Max(p.Y - bed, 0f), speed) >= Weather.WalkableIce;
+            }
+
+            if (flowing)
+            {
+                var worldPoints = Array.ConvertAll(_surfacePoints, p => Vector3.Transform(p, world));
+                var holds = new bool[worldPoints.Length];
+                for (int i = 0; i < worldPoints.Length; i++)
+                    holds[i] = Holds(worldPoints[i], _surfaceSteep[i]);
+                points.AddRange(worldPoints);
+                for (int t = 0; t + 2 < _surfaceTriangles.Length; t += 3)
+                {
+                    int a = _surfaceTriangles[t], b = _surfaceTriangles[t + 1], c = _surfaceTriangles[t + 2];
+                    if (holds[a] && holds[b] && holds[c])
+                    {
+                        triangles.Add(a); triangles.Add(b); triangles.Add(c);
+                    }
+                }
+            }
+            else
+            {
+                // Every cell whose centre lies in a surface triangle, at the surface's height there (once: a centre on
+                // an edge two triangles share)
+                var laid = new HashSet<(int, int)>();
+                for (int t = 0; t + 2 < _surfaceTriangles.Length; t += 3)
+                {
+                    var a = _surfacePoints[_surfaceTriangles[t]];
+                    var b = _surfacePoints[_surfaceTriangles[t + 1]];
+                    var c = _surfacePoints[_surfaceTriangles[t + 2]];
+                    float minX = MathF.Min(a.X, MathF.Min(b.X, c.X)), maxX = MathF.Max(a.X, MathF.Max(b.X, c.X));
+                    float minZ = MathF.Min(a.Z, MathF.Min(b.Z, c.Z)), maxZ = MathF.Max(a.Z, MathF.Max(b.Z, c.Z));
+                    for (float x = MathF.Floor(minX / IceCell) * IceCell; x < maxX; x += IceCell)
+                    for (float z = MathF.Floor(minZ / IceCell) * IceCell; z < maxZ; z += IceCell)
+                    {
+                        var centre = new Vector2(x + IceCell * 0.5f, z + IceCell * 0.5f);
+                        if (!Barycentric(centre, a, b, c, out var w)) continue;
+                        if (!laid.Add(((int)MathF.Round(x / IceCell), (int)MathF.Round(z / IceCell)))) continue;
+                        float y = a.Y * w.X + b.Y * w.Y + c.Y * w.Z;
+                        if (!Holds(Vector3.Transform(new Vector3(centre.X, y, centre.Y), world), 0f)) continue;
+                        int first = points.Count;
+                        points.Add(Vector3.Transform(new Vector3(x, y, z), world));
+                        points.Add(Vector3.Transform(new Vector3(x + IceCell, y, z), world));
+                        points.Add(Vector3.Transform(new Vector3(x + IceCell, y, z + IceCell), world));
+                        points.Add(Vector3.Transform(new Vector3(x, y, z + IceCell), world));
+                        triangles.Add(first); triangles.Add(first + 2); triangles.Add(first + 1);
+                        triangles.Add(first); triangles.Add(first + 3); triangles.Add(first + 2);
+                    }
+                }
+            }
+            if (triangles.Count == 0) return;
+
+            // Every triangle facing up ((b − a) × (c − a) along +y): the character's sweeps leave out the back of a mesh,
+            // and a river's strip turns whichever way its spline runs (it is drawn from both sides)
+            for (int t = 0; t + 2 < triangles.Count; t += 3)
+            {
+                var a = points[triangles[t]];
+                var ab = points[triangles[t + 1]] - a;
+                var ac = points[triangles[t + 2]] - a;
+                if (ab.Z * ac.X - ab.X * ac.Z < 0f)
+                    (triangles[t + 1], triangles[t + 2]) = (triangles[t + 2], triangles[t + 1]);
+            }
+
+            var cooking = PhysicsWorld.Physics.CreateCooking();
+            try
+            {
+                using var stream = new System.IO.MemoryStream();
+                cooking.CookTriangleMesh(new PhysX.TriangleMeshDesc { Flags = 0, Triangles = triangles.ToArray(), Points = points.ToArray() }, stream);
+                stream.Position = 0;
+                _iceMesh = PhysicsWorld.Physics.CreateTriangleMesh(stream);
+            }
+            finally
+            {
+                PhysXRelease.Release(cooking);
+            }
+            _iceActor = PhysicsWorld.Physics.CreateRigidStatic();
+            _iceActor.UserData = Entity;
+            _iceActor.Flags &= ~PhysX.ActorFlag.Visualization;
+            _iceShape = PhysX.RigidActorExt.CreateExclusiveShape(_iceActor, new PhysX.TriangleMeshGeometry(_iceMesh), PhysicsWorld.DefaultMaterial);
+            _iceShape.QueryFilterData = new PhysX.FilterData(Collider.Solid, 0, 0, 0);
+            PhysicsWorld.Scene.AddActor(_iceActor);
+        }
+
+        // The weights of a point (xz) in a triangle, false when it lies outside
+        private static bool Barycentric(Vector2 p, Vector3 a, Vector3 b, Vector3 c, out Vector3 w)
+        {
+            var v0 = new Vector2(b.X - a.X, b.Z - a.Z);
+            var v1 = new Vector2(c.X - a.X, c.Z - a.Z);
+            var v2 = new Vector2(p.X - a.X, p.Y - a.Z);
+            float d = v0.X * v1.Y - v1.X * v0.Y;
+            w = default;
+            if (MathF.Abs(d) < 1e-8f) return false;
+            float u = (v2.X * v1.Y - v1.X * v2.Y) / d;
+            float v = (v0.X * v2.Y - v2.X * v0.Y) / d;
+            w = new Vector3(1f - u - v, u, v);
+            return u >= 0f && v >= 0f && u + v <= 1f;
+        }
+
+        private void ReleaseIce()
+        {
+            if (_iceActor != null)
+            {
+                PhysicsWorld.Scene.RemoveActor(_iceActor);
+                // The shape goes with its actor natively, but its wrapper stays in PhysX.Net's object table unless let go
+                // first: the next sheet's shape, made at the same address, then threw ("already a managed instance")
+                PhysXRelease.Release(_iceShape, releaseNative: false);
+                _iceShape = null;
+                PhysXRelease.Release(_iceActor);
+                _iceActor = null;
+            }
+            if (_iceMesh != null)
+            {
+                PhysXRelease.Release(_iceMesh);
+                _iceMesh = null;
+            }
+        }
 
         // ═══════════════════════════
         // ── Surface mesh ──
@@ -158,8 +335,12 @@ namespace Freefall.Components
         private void RebuildMesh()
         {
             _meshDirty = false;
+            _iceDirty = true;   // over the new surface
             Engine.Device.DeferDispose(_mesh);
             _mesh = null;
+            _surfacePoints = Array.Empty<Vector3>();
+            _surfaceSteep = Array.Empty<float>();
+            _surfaceTriangles = Array.Empty<int>();
 
             if (_spline == null || _spline.Points.Count < 2) return;
             _mesh = _spline.Closed ? BuildLake(_spline) : BuildRiver(_spline);
@@ -221,6 +402,9 @@ namespace Freefall.Components
                 }
             }
 
+            _surfacePoints = verts.ToArray();
+            _surfaceSteep = flow.ConvertAll(f => f.Y).ToArray();
+            _surfaceTriangles = indices.ConvertAll(i => (int)i).ToArray();
             return BuildSurface(verts, flow, uvs, indices);
         }
 
@@ -275,6 +459,9 @@ namespace Freefall.Components
             for (int i = triangles.Count - 1; i >= 0; i--)   // reversed: faces up
                 indices.Add((uint)triangles[i]);
 
+            _surfacePoints = verts.ToArray();
+            _surfaceSteep = new float[verts.Count];
+            _surfaceTriangles = indices.ConvertAll(i => (int)i).ToArray();
             return BuildSurface(verts, normals, uvs, indices);
         }
 
@@ -349,6 +536,8 @@ namespace Freefall.Components
                 BandA = bandA,
                 BandB = bandB,
                 Flowing = _spline != null && !_spline.Closed ? 1f : 0f,
+                Ice = Weather.Ice,
+                SnowCover = Weather.SnowCover,
             });
 
             CommandBuffer.Enqueue(mesh, _material, _params, Transform.TransformSlot);

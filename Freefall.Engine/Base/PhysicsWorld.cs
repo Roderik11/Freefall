@@ -93,6 +93,19 @@ namespace Freefall.Base
             Debug.Log("[PhysX] Initialized — gravity (0, -9.81, 0)");
         }
 
+        /// <summary>
+        /// Make every character controller forget the shapes it remembers round it. Call after static geometry was added
+        /// or taken away in play (the water's ice, WaterBody): a controller keeps what it found in a volume round it and
+        /// walks through a shape made since until it leaves that volume (2026-10-23: ice turned off and on again).
+        /// </summary>
+        public static void InvalidateControllerCaches()
+        {
+            var manager = ControllerManager;
+            if (manager == null) return;
+            foreach (var controller in manager.Controllers)
+                controller.InvalidateCache();
+        }
+
         // The PhysX Visual Debugger's default port
         private const int PvdPort = 5425;
 

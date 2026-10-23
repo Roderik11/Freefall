@@ -934,6 +934,10 @@ namespace Freefall
          [ValueRange(0f, 1f)]
          public float OverrideSnowCover { get; set; } = 0f;
 
+         /// <summary>How frozen the lakes and rivers are (0..1, Graphics.Weather.Ice) while OverrideWeatherSurfaces is on.</summary>
+         [ValueRange(0f, 1f)]
+         public float OverrideIce { get; set; } = 0f;
+
          [Category("Debug")]
          public DebugVizMode DebugVisualizationMode { get; set; } = DebugVizMode.Off; // F5 - Debug viz
          public int RCDebugSubMode { get; set; } = 1;                       // 0=off, 1=tile lookup, 2=per-level radiance, 3=constant bypass, 4=raw pool readback

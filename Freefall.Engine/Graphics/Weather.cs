@@ -101,11 +101,46 @@ namespace Freefall.Graphics
         /// </summary>
         public static float SnowFallen { get; private set; }
 
+        /// <summary>
+        /// How frozen the lakes and rivers are (0..1; WaterBody: water.fx draws the ice, its collider carries the walker).
+        /// It grows while it is below freezing at the camera (more than half of what falls there would be snow), from open
+        /// water to the deepest still water frozen over in <see cref="FreezeSeconds"/>, and thaws where it is warmer,
+        /// faster in sun and rain. Where it is enough for a place depends on the water there (<see cref="IceThickness"/>):
+        /// shallow before deep, still before flowing. Settings › OverrideWeatherSurfaces / OverrideIce set it by hand.
+        /// </summary>
+        public static float Ice { get; private set; }
+
+        /// <summary>
+        /// Raised when <see cref="Ice"/> moves a step (<see cref="IceStep"/>), for what follows it slowly (the water's ice
+        /// colliders): not every frame.
+        /// </summary>
+        public static event Action? IceStepChanged;
+        public const float IceStep = 0.05f;
+
+        /// <summary>
+        /// How thick the ice is (0..1; 0 = open water) at a place of water <paramref name="depth"/> metres deep (over the
+        /// terrain) whose current runs at <paramref name="speed"/> m/s, at the ice amount <paramref name="ice"/>: shallow
+        /// water first, the deep middle of a lake from an ice of 0.7; a current holds it off, slowing to nothing toward the
+        /// banks (full from 0.8 m deep), so a river freezes from its banks in, and a fast deep channel never freezes.
+        /// water.fx WaterIceThickness is the same, with a little noise on the edge. Ice of <see cref="WalkableIce"/> or more
+        /// carries a walker.
+        /// </summary>
+        public static float IceThickness(float ice, float depth, float speed)
+        {
+            float current = speed * Math.Clamp(depth / 0.8f, 0f, 1f);
+            float needed = 0.15f + 0.55f * Math.Clamp(depth / 2.5f, 0f, 1f) + 0.5f * Math.Clamp(current / 2.5f, 0f, 1f);
+            return Math.Clamp((ice - needed) / 0.25f, 0f, 1f);
+        }
+
+        public const float WalkableIce = 0.6f;
+
         private const float SoakSeconds = 60f, DrySeconds = 600f;
         private const float FillSeconds = 300f, DrainSeconds = 2400f;
         private const float CoverSeconds = 600f, MeltSeconds = 1200f;
+        private const float FreezeSeconds = 1200f, ThawSeconds = 1800f;
         private const float SunLux = 60000f;    // lux of sun on level ground that counts as 1 (a clear noon gives ~1.4)
-        private static float _wetness, _puddles, _snow;     // the weather's own, kept while the override is on
+        private static float _wetness, _puddles, _snow, _ice;     // the weather's own, kept while the override is on
+        private static int _iceStep = -1;
 
         /// <summary>The precipitation map (Texture2D RG16F: rate, hail; 0 = none yet) and the world xz of its corner.</summary>
         public static uint MapIndex => _mapValid ? _map!.BindlessIndex : 0u;
@@ -190,11 +225,21 @@ namespace Freefall.Graphics
             SnowFallen += covering * dt;
             float melting = SnowShare < 0.5f ? (1f + 3f * Rain + 2f * sun) / MeltSeconds : 0f;
             _snow = Math.Clamp(_snow + (covering - melting) * dt, 0f, 1f);
+            float freezing = SnowShare > 0.5f ? 1f / FreezeSeconds : 0f;
+            float thawing = SnowShare < 0.5f ? (1f + 3f * Rain + 2f * sun) / ThawSeconds : 0f;
+            _ice = Math.Clamp(_ice + (freezing - thawing) * dt, 0f, 1f);
             var settings = Engine.Settings;
             bool manual = settings != null && settings.OverrideWeatherSurfaces;
             SurfaceWetness = manual ? Math.Clamp(settings!.OverrideWetness, 0f, 1f) : _wetness;
             PuddleFill = manual ? Math.Clamp(settings!.OverridePuddleFill, 0f, 1f) : _puddles;
             SnowCover = manual ? Math.Clamp(settings!.OverrideSnowCover, 0f, 1f) : _snow;
+            Ice = manual ? Math.Clamp(settings!.OverrideIce, 0f, 1f) : _ice;
+            int iceStep = (int)MathF.Round(Ice / IceStep);
+            if (iceStep != _iceStep)
+            {
+                _iceStep = iceStep;
+                IceStepChanged?.Invoke();
+            }
 
             // The wind: a storm's outflow, and gusts on the steady wind that grow with the rain (gust factor ~1.2 in fair
             // weather, ~1.6 in a downpour); a little sideways too, so a gust does not only push along one line
@@ -303,7 +348,7 @@ namespace Freefall.Graphics
             // What the near emitters make of a heavy fall, which the far layers copy: drops per m³, fall speed (m/s)
             rainFall = new[] { RainDensity, RainFallSpeed },
             snowFall = new[] { SnowDensity, SnowFallSpeed },
-            surfaces = new { wetness = SurfaceWetness, puddleFill = PuddleFill, snowCover = SnowCover, snowFallen = SnowFallen },
+            surfaces = new { wetness = SurfaceWetness, puddleFill = PuddleFill, snowCover = SnowCover, snowFallen = SnowFallen, ice = Ice },
             // What the probe measured at the camera (not eased): the rate, hail, the cloud column's depth and top (m)
             column = new { rate = _column.X, hail = _column.Y, depth = _column.Z, top = _column.W },
             freezingLevel = Clouds.Settings.FreezingLevel,

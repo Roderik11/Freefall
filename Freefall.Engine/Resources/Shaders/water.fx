@@ -65,10 +65,62 @@ struct WaterData
     uint BandA;
     uint BandB;
     float Flowing;              // 1 = river (open spline), 0 = lake
-    float _pad0;
+    float Ice;                  // Graphics.Weather.Ice: how frozen the water is, 0..1
+    float SnowCover;            // Graphics.Weather.SnowCover: the snow lies on the ice too
 };
 
 SamplerState WaterSampler : register(s0);
+
+// How thick the ice is (0..1; 0 = open water) where the water is depth metres deep over its bed and its current runs at
+// speed m/s, at the ice amount: shallow water first, the deep middle of a lake from 0.7; a current holds it off, slowing
+// to nothing toward the banks (full from 0.8 m deep), so a river freezes from its banks in; a fast deep channel never
+// freezes. Graphics.Weather.IceThickness has the same numbers (the ice collider, WaterBody)
+float WaterIceThickness(float ice, float depth, float speed)
+{
+    float current = speed * saturate(depth / 0.8);
+    float needed = 0.15 + 0.55 * saturate(depth / 2.5) + 0.5 * saturate(current / 2.5);
+    return saturate((ice - needed) / 0.25);
+}
+
+#define ICE_ALBEDO  float3(0.28, 0.32, 0.35)    // white ice, grey with the air frozen into it (the dark palette's ice;
+                                                // 0.36..0.45 read as near white in the noon sun)
+#define SNOW_ON_ICE float3(0.70, 0.72, 0.76)    // decals_cs.hlsl SNOW_ALBEDO: the same snow as on the ground
+
+// The plates of a sheet of ice: cells round jittered points (Voronoi) of a grid of 1 (scale p to the plates' size),
+// the distance to the nearest border between two of them (F2 − F1: about the distance to the crack) and the cell's id
+float IceCells(float2 p, out float2 id)
+{
+    float2 i = floor(p), f = frac(p);
+    float d1 = 8.0, d2 = 8.0;
+    id = i;
+    [unroll] for (int y = -1; y <= 1; y++)
+    [unroll] for (int x = -1; x <= 1; x++)
+    {
+        float2 g = float2(x, y);
+        float2 r = g + 0.1 + 0.8 * float2(MacroHash(i + g), MacroHash(i + g + 17.3)) - f;
+        float d = dot(r, r);
+        if (d < d1) { d2 = d1; d1 = d; id = i + g; }
+        else if (d < d2) d2 = d;
+    }
+    return sqrt(d2) - sqrt(d1);
+}
+
+// Value noise interpolated linearly, -0.5..0.5: kinks at its lattice, not curves (the cracks' zigzag)
+float IceJag(float2 p)
+{
+    float2 i = floor(p), f = frac(p);
+    float a = MacroHash(i), b = MacroHash(i + float2(1, 0)), c = MacroHash(i + float2(0, 1)), d = MacroHash(i + 1.0);
+    return lerp(lerp(a, b, f.x), lerp(c, d, f.x), f.y) - 0.5;
+}
+
+// A crack along the plates' borders, width metres wide in a sheet of plates cell metres across, as a share of the pixel
+// it covers: no thinner than the pixel, fainter instead, so it never shimmers
+float IceCrack(float edge, float width, float cell)
+{
+    float w = width / cell;
+    float pixel = max(fwidth(edge), 1e-5);
+    return (1.0 - smoothstep(0.0, max(w, pixel), edge)) * saturate(w / pixel);
+}
 
 struct VSOutput
 {
@@ -148,6 +200,18 @@ PSOutput PS(VSOutput input)
     float2 flowDir = flowing && dot(input.Flow.xy, input.Flow.xy) > 1e-8 ? normalize(input.Flow.xy) : float2(1, 0);
     float2 acrossDir = float2(-flowDir.y, flowDir.x);
     float steep = flowing ? saturate(input.Flow.z) : 0.0;
+
+    // ── Ice: how thick here, by the depth over the bed (the terrain's height map) and the current, with a ragged edge.
+    // The collider over it (WaterBody) follows the same rule without the edge ──
+    float ice = 0.0;
+    if (water.Ice > 0.0)
+    {
+        TerrainCover terrain = LoadTerrainCover();
+        float bed = terrain.Heightmap != 0 ? TerrainHeightAt(terrain, AtmosphereLinearClamp, worldPos.xz) : worldPos.y - 10.0;
+        float speed = flowing ? water.FlowSpeed * (1.0 + 4.0 * steep) : 0.0;
+        float ragged = (MacroNoise(worldPos.xz / 7.0) + 0.5 * MacroNoise(worldPos.xz / 2.3 + 13.1) - 0.75) * 0.1;
+        ice = WaterIceThickness(water.Ice + ragged, max(worldPos.y - bed, 0.0), speed);
+    }
 
     // Pattern space: lakes sample in world space; rivers in strip space (u along the flow, v across),
     // scrolled downstream. Strip space bends with the river, so the scroll never shears.
@@ -241,6 +305,48 @@ PSOutput PS(VSOutput input)
         float3 foamLit = WaterFoamLit(float3(0.80, 0.80, 0.78) * lerp(0.7, 1.0, foamTex), NdotL, sunRadiance,
             SkyAmbient(N) * skyVisible);
         color = lerp(color, foamLit, foam * 0.9);
+    }
+
+    // ── The ice over the water, and the snow on it ──
+    if (ice > 0.0)
+    {
+        // A sheet of plates (~7 m, cracked again at ~2 m) with straight borders between their corners, jagged by a
+        // small zigzag (a smooth warp bent them into curves: "cracks mustnt be smooth curves", user); each plate tilted
+        // a little, so they catch the light each its own way. Two kinds of ice in broad patches: clear (black) ice that
+        // shows the dark water under it and mirrors the sky, and white ice, grey with the air frozen into it. A crack
+        // shows light in clear ice, dark in white ice
+        float2 p = worldPos.xz;
+        float2 bent = p + float2(IceJag(p * 3.0), IceJag(p * 3.0 + 9.1)) * 0.12 + float2(IceJag(p * 11.0 + 4.2), IceJag(p * 11.0 - 2.7)) * 0.04;
+        float2 plate, shard;
+        float plateEdge = IceCells(bent / 7.0, plate);
+        float shardEdge = IceCells(bent / 2.0 + 31.7, shard);
+        float cracks = max(IceCrack(plateEdge, 0.035, 7.0), 0.5 * IceCrack(shardEdge, 0.015, 2.0)) * smoothstep(0.3, 0.8, ice);
+        float2 tilt = (float2(MacroHash(plate), MacroHash(plate + 5.3)) - 0.5) * 0.015;
+        float3 Ni = normalize(float3(tilt.x + (MacroNoise(p / 9.0) - 0.5) * 0.03, 1.0, tilt.y + (MacroNoise(p / 3.1 + 7.7) - 0.5) * 0.03));
+        float NdotLi = saturate(dot(Ni, L));
+        // White ice forms in irregular patches whose edges are no cracks (chosen per plate the lake read as a mosaic of
+        // tiles from above)
+        float white = smoothstep(0.42, 0.72, MacroNoise(p / 25.0) * 0.7 + MacroNoise(p / 8.0 + 4.4) * 0.3);
+
+        // Thin ice is a skin over the dark water; the water under it keeps what it showed but its mirror
+        float opacity = lerp(0.25, 0.9, ice) * lerp(0.2, 1.0, white);
+        float roughness = lerp(0.04, 0.15, white);
+        float3 albedo = ICE_ALBEDO * lerp(1.0, 0.6, cracks * white);
+        opacity = lerp(opacity, 0.8, cracks * (1.0 - white));                  // a white crack in clear ice
+        float3 lit = albedo * (sunRadiance * NdotLi + SkyAmbient(Ni) * skyVisible);
+        float3 iceBody = lerp((1.0 - F) * body, lit, opacity);
+        float Fi = WaterSpecularReflectance(saturate(dot(Ni, V)), roughness);
+        float3 iceColor = (1.0 - Fi) * iceBody + (WaterSunSpecular(Ni, V, L, sunRadiance * 3.14159, roughness)
+                        + Fi * WaterSkyReflection(V, Ni, roughness) * skyVisible) * column.edgeFade;
+
+        // Snow lies on ice that holds it, in drifts, as the cover grows (on the ground: decals_cs.hlsl)
+        float drift = MacroNoise(p / 4.0 + 21.0) * 0.6 + MacroNoise(p / 1.3 - 5.0) * 0.4;
+        float bare = 1.0 - saturate(water.SnowCover);
+        float snow = smoothstep(bare - 0.08, bare + 0.08, (0.35 + 0.65 * drift) * smoothstep(0.3, 0.9, ice));
+        float3 snowLit = SNOW_ON_ICE * (sunRadiance * saturate(L.y) + SkyAmbient(float3(0, 1, 0)) * skyVisible);
+        iceColor = lerp(iceColor, snowLit, snow);
+
+        color = lerp(color, iceColor, smoothstep(0.0, 0.12, ice));
     }
 
     // ── Aerial perspective ──
