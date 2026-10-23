@@ -13,6 +13,11 @@ namespace Freefall.Graphics
     /// property setters, OnEnabledChanged), decals take and free slots as they enter and leave ComponentCache&lt;Decal&gt;,
     /// and the box comes from the entity's world matrix in the global transform buffer. Each renderer's DecalPass culls
     /// the registry and applies what is in view. Shader side: decals.hlsli.
+    ///
+    /// Spawned decals (DECALS_PLAN B3: footprints, blood, scorch; <see cref="Decals.Spawn"/>) live in a ring of
+    /// <see cref="RingSize"/> slots at the start of the registry, each with a transform slot of its own: a spawn writes
+    /// one record and one matrix, an event, never per-frame work; the cull fades it out by its age, and the oldest is
+    /// overwritten when the ring comes round. Placed decals take the slots after the ring.
     /// </summary>
     public sealed class DecalBuffer : IDisposable
     {
@@ -22,10 +27,14 @@ namespace Freefall.Graphics
         /// <summary>Registry slots the sort's key can tell apart (decals.hlsli MAX_DECAL_SLOTS).</summary>
         public const int MaxSlots = 65536;
 
+        /// <summary>Slots of the spawned ring: the newest this many spawned decals are kept.</summary>
+        public const int RingSize = 4096;
+
         private const uint Enabled = 1;                 // decals.hlsli DECAL_ENABLED
+        private const uint Spawned = 2;                 // DECAL_SPAWNED
         private const int PriorityShift = 8;            // DECAL_PRIORITY_SHIFT
 
-        /// <summary>One per decal. Must match DecalRecord in decals.hlsli (32 bytes).</summary>
+        /// <summary>One per decal. Must match DecalRecord in decals.hlsli (48 bytes).</summary>
         [StructLayout(LayoutKind.Sequential)]
         public struct Record
         {
@@ -35,6 +44,7 @@ namespace Freefall.Graphics
             public uint Variant;
             public Vector3 Tint;
             public float Opacity;
+            public float SpawnTime, Lifetime, FadeOut, SpawnSnow;
         }
 
         public static DecalBuffer? Instance { get; private set; }
@@ -42,11 +52,31 @@ namespace Freefall.Graphics
         private readonly StreamingBuffer<Record> _records;
         private readonly Stack<int> _freeSlots = new();
         private readonly object _lock = new();
-        private int _nextSlot;
+        private int _nextSlot = RingSize;
         private bool _warnedFull;
+        private int _placed;                    // placed decals registered
 
-        /// <summary>Registry slots handed out so far: the cull walks this many.</summary>
+        private int[]? _ringTransforms;         // the ring's own transform slots, taken at the first spawn
+        private int _ringNext;
+        private double _ringLiveUntil = double.NegativeInfinity;   // Time.TotalTime the last spawned one has faded by
+
+        /// <summary>Registry slots handed out so far (the ring's and the placed decals'): the cull walks this many.</summary>
         public int SlotCount => _nextSlot;
+
+        /// <summary>Whether any decal can show: a placed one, or a spawned one not yet faded out.</summary>
+        public bool Active => _placed > 0 || Base.Time.TotalTime < _ringLiveUntil;
+
+        /// <summary>Spawned decals made since the ring last started over (a scene load).</summary>
+        public int SpawnedCount => _ringNext;
+
+        /// <summary>For engine_stats.</summary>
+        public object Describe() => new
+        {
+            slots = SlotCount,
+            placed = _placed,
+            spawned = _ringNext,
+            active = Active,
+        };
 
         public uint SrvIndex => _records.SrvIndex;
 
@@ -58,11 +88,27 @@ namespace Freefall.Graphics
             ComponentCache<Decal>.Removed += Instance.Unregister;
             foreach (var decal in ComponentCache<Decal>.All)
                 Instance.Register(decal);
+
+            // What was spawned belongs to the world it was spawned in (Play and Stop are loads too)
+            SceneManager.LoadStarted += _ => Instance?.ClearSpawned();
+        }
+
+        /// <summary>Take every spawned decal away: the ring starts over.</summary>
+        public void ClearSpawned()
+        {
+            lock (_lock)
+            {
+                for (int i = 0, n = Math.Min(_ringNext, RingSize); i < n; i++)
+                    _records.Set(i, default); // disabled
+                _ringNext = 0;
+                _ringLiveUntil = double.NegativeInfinity;
+            }
         }
 
         private DecalBuffer(GraphicsDevice device)
         {
-            _records = new StreamingBuffer<Record>(device, 256);
+            _records = new StreamingBuffer<Record>(device, RingSize + 256);
+            _records.EnsureCapacity(RingSize);
         }
 
         // Called again for a decal that is already in (ComponentCache.Added may follow Initialize's walk)
@@ -82,6 +128,7 @@ namespace Freefall.Graphics
                     int slot = _freeSlots.Count > 0 ? _freeSlots.Pop() : _nextSlot++;
                     _records.EnsureCapacity(slot + 1);
                     decal.GpuSlot = slot;
+                    _placed++;
                 }
             }
 
@@ -101,6 +148,45 @@ namespace Freefall.Graphics
                 _records.Set(slot, default); // disabled
                 _freeSlots.Push(slot);
                 decal.GpuSlot = -1;
+                _placed--;
+            }
+        }
+
+        /// <summary>
+        /// A decal in the spawned ring (<see cref="Decals.Spawn"/>): its box as a world matrix (X and Z span it, Y is the
+        /// projection axis, as a Decal's entity), lasting <paramref name="lifetime"/> seconds and fading out over the last
+        /// <paramref name="fadeOut"/>; it overwrites the oldest when the ring comes round.
+        /// </summary>
+        internal void Spawn(Material material, in Matrix4x4 box, int variant, Vector3 tint, float opacity, int priority,
+            float lifetime, float fadeOut)
+        {
+            if (material == null || !IsDecalMaterial(material) || TransformBuffer.Instance == null) return;
+            lock (_lock)
+            {
+                if (_ringTransforms == null)
+                {
+                    _ringTransforms = new int[RingSize];
+                    for (int i = 0; i < RingSize; i++)
+                        _ringTransforms[i] = TransformBuffer.Instance.AllocateSlot();
+                }
+                int slot = _ringNext++ % RingSize;
+                TransformBuffer.Instance.SetTransform(_ringTransforms[slot], box);
+                double now = Base.Time.TotalTime;
+                lifetime = MathF.Max(lifetime, 0.01f);
+                _records.Set(slot, new Record
+                {
+                    TransformSlot = (uint)_ringTransforms[slot],
+                    MaterialId = (uint)Math.Max(material.MaterialID, 0),
+                    Flags = Enabled | Spawned | ((uint)Math.Clamp(priority, 0, 15) << PriorityShift),
+                    Variant = (uint)Math.Max(variant, 0),
+                    Tint = tint,
+                    Opacity = Math.Clamp(opacity, 0f, 1f),
+                    SpawnTime = (float)now,
+                    Lifetime = lifetime,
+                    FadeOut = Math.Clamp(fadeOut, 0.01f, lifetime),
+                    SpawnSnow = Weather.SnowFallen,
+                });
+                _ringLiveUntil = Math.Max(_ringLiveUntil, now + lifetime);
             }
         }
 

@@ -22,7 +22,7 @@ namespace Freefall.Graphics
         private const int MaskWords = DecalBuffer.MaxVisible / 32;      // DECAL_MASK_WORDS
         private const int ImportanceBins = 64;                          // decal_cull.hlsl IMPORTANCE_BINS
 
-        /// <summary>The view and its weather. Must match DecalFrame in decals.hlsli (224 bytes).</summary>
+        /// <summary>The view and its weather. Must match DecalFrame in decals.hlsli (240 bytes).</summary>
         [StructLayout(LayoutKind.Sequential, Pack = 4)]
         private struct Frame
         {
@@ -34,6 +34,7 @@ namespace Freefall.Graphics
             public Vector3 TerrainOrigin; public float Wetness;
             public Vector2 TerrainSize; public float PuddleFill, SnowCover;
             public float Rain; public uint TilesY, WeatherOn, _pad;
+            public float Time, SnowFallen, _pad2, _pad3;
         }
 
         private static ComputeShader? _cullCS, _applyCS;
@@ -117,7 +118,8 @@ namespace Freefall.Graphics
         {
             RanThisFrame = false;
             var registry = DecalBuffer.Instance;
-            int slots = registry?.SlotCount ?? 0;
+            // (the spawned ring's slots come first: walked only while a placed decal or a spawned one can show)
+            int slots = registry != null && registry.Active ? registry.SlotCount : 0;
             // Puddles outlast the wet ground (they drain 4× slower) and still need the shelter
             bool weather = Weather.SurfaceWetness > 0.001f || Weather.SnowCover > 0.001f || Weather.PuddleFill > 0.001f;
             if ((slots == 0 && !weather) || !Supported)
@@ -255,6 +257,8 @@ namespace Freefall.Graphics
                 Rain = Weather.Rain,
                 TilesY = (uint)_tilesY,
                 WeatherOn = weather ? 1u : 0u,
+                Time = Base.Time.TotalTime,
+                SnowFallen = Weather.SnowFallen,
             };
         }
 

@@ -36,6 +36,9 @@ struct Settings
     float SiltOpacity;          //= 0 [0, 1]   -- Puddles: how much silt covers the hollow's floor (0 = none)
     float SiltRoughness;        //= 0.85 [0, 1] -- Puddles: the dry silt's roughness
     float SiltFlatten;          //= 0.5 [0, 1] -- Puddles: how much the silt evens out the stones in the hollow (fills their joints)
+    bool Print;                 //= false      -- Footprints: the opacity is the print's depth; what it does depends on the ground: in snow it presses a dent and packs the snow (thin snow scraped off to the ground), on soft wet ground a dark damp dent, on soft dry ground a shallow dent, on dry stone nothing. The colour and the other maps are not used
+    float PrintDepth;           //= 0.03 [0, 0.1] -- Footprints: metres a print sinks in snow at its deepest (half on soft ground without snow)
+    float PrintFill;            //= 0.15 [0.01, 1] -- Footprints: covers' worth of fresh snow that fills a print in again (0.15: ~1.5 minutes of heavy snow)
 };
 
 Settings LoadDecalSettings(uint materialsIdx, uint materialId)

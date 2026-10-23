@@ -94,6 +94,13 @@ namespace Freefall.Graphics
         public static float PuddleFill { get; private set; }
         public static float SnowCover { get; private set; }
 
+        /// <summary>
+        /// How much snow has fallen at the camera since start, in covers' worth (a cover's worth: what lays SnowCover 0 → 1,
+        /// CoverSeconds of heavy snow); only grows. A footprint keeps the value it was made at, and fills with what falls
+        /// after it (decals_cs.hlsl: Print).
+        /// </summary>
+        public static float SnowFallen { get; private set; }
+
         private const float SoakSeconds = 60f, DrySeconds = 600f;
         private const float FillSeconds = 300f, DrainSeconds = 2400f;
         private const float CoverSeconds = 600f, MeltSeconds = 1200f;
@@ -180,6 +187,7 @@ namespace Freefall.Graphics
             float filling = _wetness > 0.6f ? Rain / FillSeconds : 0f, draining = evaporation / DrainSeconds;
             _puddles = Math.Clamp(_puddles + (filling - draining) * dt, 0f, 1f);
             float covering = Snow / CoverSeconds;
+            SnowFallen += covering * dt;
             float melting = SnowShare < 0.5f ? (1f + 3f * Rain + 2f * sun) / MeltSeconds : 0f;
             _snow = Math.Clamp(_snow + (covering - melting) * dt, 0f, 1f);
             var settings = Engine.Settings;
@@ -295,7 +303,7 @@ namespace Freefall.Graphics
             // What the near emitters make of a heavy fall, which the far layers copy: drops per m³, fall speed (m/s)
             rainFall = new[] { RainDensity, RainFallSpeed },
             snowFall = new[] { SnowDensity, SnowFallSpeed },
-            surfaces = new { wetness = SurfaceWetness, puddleFill = PuddleFill, snowCover = SnowCover },
+            surfaces = new { wetness = SurfaceWetness, puddleFill = PuddleFill, snowCover = SnowCover, snowFallen = SnowFallen },
             // What the probe measured at the camera (not eased): the rate, hail, the cloud column's depth and top (m)
             column = new { rate = _column.X, hail = _column.Y, depth = _column.Z, top = _column.W },
             freezingLevel = Clouds.Settings.FreezingLevel,

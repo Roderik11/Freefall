@@ -7,7 +7,8 @@
 //                   size, never by the order the GPU appends them in, which changes every frame and blinks)
 //   CSSortDecals    one group: the visible list in the order decals_cs.hlsl applies them (priority, then registry
 //                   slot: a stable key, so two overlapping decals never swap)
-// Decals under 2 pixels across are left out, fading in over the next 4.
+// Decals under 2 pixels across are left out, fading in over the next 4. Spawned decals (the ring at the registry's
+// start, DECAL_SPAWNED) fade out by their age and are left out once it passes their lifetime.
 
 #pragma kernel CSClearDecals
 #pragma kernel CSCountDecals
@@ -40,6 +41,15 @@ bool CullDecal(uint slot, DecalFrame frame, out DecalRecord r, out float importa
     fade = 0;
     if ((r.Flags & DECAL_ENABLED) == 0 || r.Opacity <= 0.0)
         return false;
+    // A spawned one fades out over the last FadeOut seconds of its Lifetime
+    float ageFade = 1.0;
+    if ((r.Flags & DECAL_SPAWNED) != 0)
+    {
+        float left = r.Lifetime - (frame.Time - r.SpawnTime);
+        if (left <= 0.0)
+            return false;
+        ageFade = saturate(left / max(r.FadeOut, 1e-3));
+    }
 
     float4x4 m = DecalMatrix(TransformsIdx, r.TransformSlot);
     float radius = 0.5 * sqrt(dot(m[0].xyz, m[0].xyz) + dot(m[1].xyz, m[1].xyz) + dot(m[2].xyz, m[2].xyz));
@@ -54,7 +64,7 @@ bool CullDecal(uint slot, DecalFrame frame, out DecalRecord r, out float importa
     float radiusPixels = radius * frame.PixelsPerMetre / max(length(p), 0.01);
     if (radiusPixels < 1.0)
         return false;
-    fade = saturate((radiusPixels - 1.0) / 2.0);
+    fade = saturate((radiusPixels - 1.0) / 2.0) * ageFade;
     importance = radiusPixels * radiusPixels;
     return true;
 }

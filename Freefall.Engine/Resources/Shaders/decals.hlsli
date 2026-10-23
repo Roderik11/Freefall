@@ -12,24 +12,29 @@
 #define MAX_DECAL_SLOTS    65536u   // DecalBuffer.MaxSlots: ... and 16 of the registry slot
 
 #define DECAL_ENABLED       1u
+#define DECAL_SPAWNED       2u      // in the spawned ring (Decals.Spawn): fades out by its age
 #define DECAL_PRIORITY_SHIFT 8u     // Flags bits 8..11: the priority (0..15), drawn in ascending order
 #define DECAL_PRIORITY_MASK 0xFu
 
-// One per Decal (DecalBuffer.Record, 32 bytes)
+// One per Decal, and one per slot of the spawned ring (DecalBuffer.Record, 48 bytes)
 struct DecalRecord
 {
-    uint TransformSlot;     // the entity's world matrix in the global transform buffer
+    uint TransformSlot;     // the world matrix in the global transform buffer (the entity's, or the ring slot's own)
     uint MaterialId;        // the decal material: its settings block (decal.fx Settings) by MaterialData
     uint Flags;
     uint Variant;           // tile of the material's atlas
     float3 Tint;            // multiplies the material's colour
     float Opacity;          // multiplies every target's opacity
+    float SpawnTime;        // spawned: Time when it was made
+    float Lifetime;         // spawned: seconds it lasts, fading out over the last FadeOut of them
+    float FadeOut;
+    float SpawnSnow;        // spawned: Weather.SnowFallen when it was made (a print fills with what falls after)
 };
 
 #define DECAL_TILE 16u
 #define DECAL_MASK_WORDS (MAX_VISIBLE_DECALS / 32u)     // a bit per visible decal in each tile's mask
 
-// The view the pass runs for, and the weather it applies (DecalPass.Frame, 224 bytes)
+// The view the pass runs for, and the weather it applies (DecalPass.Frame, 240 bytes)
 struct DecalFrame
 {
     float4 Planes[5];           // camera-relative left, right, bottom, top, near; normals point in
@@ -51,6 +56,9 @@ struct DecalFrame
     uint TilesY;
     uint WeatherOn;             // 0: no weather to apply, only the decals
     uint _framePad;
+    float Time;                 // Time.TotalTime: spawned decals' age
+    float SnowFallen;           // Weather.SnowFallen: covers' worth of snow fallen so far (prints fill with it)
+    float2 _framePad2;
 };
 
 // The world matrix's rows: X and Z span the decal (scaled), Y is the projection axis (scaled), T its centre

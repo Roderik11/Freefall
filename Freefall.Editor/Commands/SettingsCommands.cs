@@ -136,6 +136,8 @@ namespace Freefall.Editor.Commands
                 // The volumetric clouds: on, the slab's heights, this frame's bake, the wind's offset and heading, towers
                 clouds = Freefall.Graphics.Clouds.Describe(),
                 weather = Freefall.Graphics.Weather.Describe(),
+                // Decals: registry slots the cull walks, and the spawned ones (footprints, blood) since the scene loaded
+                decals = Freefall.Graphics.DecalBuffer.Instance?.Describe(),
                 // System tree in update order, one "Name  ms" line per system (indent = nesting)
                 systems = Freefall.Base.Systems.Describe().Split('\n', StringSplitOptions.RemoveEmptyEntries)
             });

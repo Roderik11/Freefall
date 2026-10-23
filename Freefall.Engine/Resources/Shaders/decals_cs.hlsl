@@ -141,6 +141,9 @@ struct Surface
     float Depth;            // linear depth minus the height bias
     float2 Displacement;    // the screen-space displacement vector
     float Dent;             // metres the decals sank it (puddles' hollows): the weather's relief is measured from there
+    float Print;            // footprints here (Print decals), 0..1 after the snow that has filled them again
+    float PrintDepth;       // metres the deepest of them sinks
+    float3 PrintTilt;       // their slope, the tilt toward their floors (the weather applies it as the ground allows)
 };
 
 // Metres of relief that count as a surface's high spot: the terrain's layers (gputerrain.fx, up to 0.05), a mesh's
@@ -212,7 +215,7 @@ float2 DisplacementFor(float3 rel, float3 axis, float h, out float viewZ)
 
 // One decal at this pixel: into its box, its receivers, its fades, its material, then its modes on the surface
 void ApplyDecal(uint i, float3 rel, float3 geo, float3 dx, float3 dy, uint surfaceClass, float rain, float puddleFill,
-    inout Surface s)
+    float snowFallen, inout Surface s)
 {
     StructuredBuffer<uint2> sorted = ResourceDescriptorHeap[SortedIdx];
     uint2 entry = sorted[i];
@@ -252,6 +255,29 @@ void ApplyDecal(uint i, float3 rel, float3 geo, float3 dx, float3 dy, uint surfa
     float2 uvDy = float2(dot(dy, lx) * invLen2.x, -dot(dy, lz) * invLen2.z) * tileSize;
 
     Texture2D albedoTex = ResourceDescriptorHeap[NonUniformResourceIndex(S.Albedo)];
+
+    // A footprint: its depth from the opacity (a mip as the screen needs, at least the second: the tread's grain is no
+    // depth), its slope the tilt toward its floor; filled in again by the snow fallen since it was made. What it does
+    // is the ground's to say, so it only leaves itself on the surface here (ApplyWeather: Prints)
+    if (S.Print)
+    {
+        uint tw, th;
+        albedoTex.GetDimensions(tw, th);
+        float2 size = float2(tw, th);
+        float mip = max(log2(max(max(length(uvDx * size), length(uvDy * size)), 1e-6)), 1.0);
+        float depth = albedoTex.SampleLevel(Sampler, uv, mip).a;
+        float2 e = 1.5 * exp2(mip) / size;
+        float2 grad = float2(albedoTex.SampleLevel(Sampler, uv + float2(e.x, 0), mip).a - albedoTex.SampleLevel(Sampler, uv - float2(e.x, 0), mip).a,
+                             albedoTex.SampleLevel(Sampler, uv + float2(0, e.y), mip).a - albedoTex.SampleLevel(Sampler, uv - float2(0, e.y), mip).a);
+        float2 pslope = grad / (2.0 * e) * tileSize * sqrt(float2(invLen2.x, invLen2.z));
+        float refill = (r.Flags & DECAL_SPAWNED) != 0 ? saturate((snowFallen - r.SpawnSnow) / max(S.PrintFill, 1e-3)) : 0.0;
+        float strength = fade * (1.0 - refill);
+        s.Print = max(s.Print, depth * strength);
+        s.PrintDepth = max(s.PrintDepth, S.PrintDepth * depth * strength);
+        s.PrintTilt += (tangent * pslope.x + bitangent * pslope.y) * (S.PrintDepth * S.NormalStrength * strength);
+        return;
+    }
+
     float4 albedo = albedoTex.SampleGrad(Sampler, uv, uvDx, uvDy);
     float3 colour = albedo.rgb * S.Color * r.Tint;
 
@@ -529,7 +555,7 @@ float3 TerrainNormal(DecalFrame f, float2 xz)
 void ApplyWeather(DecalFrame f, float3 rel, float3 geo, uint surfaceClass, float open, float normalVariance, inout Surface s)
 {
     // Emissive pixels (lamp glass, windows) hold their light in the albedo: left as they are
-    if (s.Albedo.a > 0.01 || open <= 0.0)
+    if (s.Albedo.a > 0.01 || (open <= 0.0 && s.Print <= 0.0))
         return;
     float3 world = rel + CamPos;
 
@@ -558,6 +584,19 @@ void ApplyWeather(DecalFrame f, float3 rel, float3 geo, uint surfaceClass, float
         float drift = SnowNoise(world.xz * 0.35);
         float t = 1.0 - cover;
         snow = smoothstep(t - 0.06, t + 0.06, up * (0.1 + 0.5 * relief + 0.4 * drift + 0.2 * hollow)) * saturate(up * 3.0);
+    }
+
+    // Footprints (Print decals, what they left in s.Print): thin snow is scraped off down to the ground, deep snow is
+    // packed, the dent with the snow still in it, pressed smoother and a little darker. Soft ground (the terrain) takes
+    // a shallow dent of its own, a dark damp one when wet; dry stone and paving none
+    float snowHere = snow;      // before it was trodden off: where there is snow the print sinks in full
+    float pressed = 0.0;
+    float softGround = surfaceClass == 1u ? 1.0 : 0.0;
+    if (s.Print > 0.0)
+    {
+        float deep = smoothstep(0.35, 0.85, cover);
+        pressed = s.Print * deep;
+        snow *= 1.0 - s.Print * (1.0 - deep);
     }
 
     float facing = geo.y >= 0.0 ? lerp(0.35, 1.0, geo.y) : saturate(0.35 + geo.y);
@@ -593,6 +632,13 @@ void ApplyWeather(DecalFrame f, float3 rel, float3 geo, uint surfaceClass, float
             s.Normal.xyz = normalize(lerp(s.Normal.xyz, geo, water));
         }
     }
+    // A print in wet soft ground: darker, water in it
+    if (s.Print > 0.0 && wet > 0.0 && softGround > 0.0)
+    {
+        float muddy = s.Print * wet;
+        s.Albedo.rgb *= lerp(1.0, 0.7, muddy);
+        s.Data.r = lerp(s.Data.r, min(s.Data.r, 0.2), muddy);
+    }
 
     if (snow > 0.0)
     {
@@ -613,8 +659,26 @@ void ApplyWeather(DecalFrame f, float3 rel, float3 geo, uint surfaceClass, float
         }
         float3 snowN = SnowSurfaceNormal(world, geo, footprint, toLight, -normalize(rel), glint);
         s.Normal.xyz = normalize(lerp(N, snowN, buried));
-        s.Data.r = lerp(s.Data.r, 0.15, glint * buried);
+        s.Data.r = lerp(s.Data.r, 0.15, glint * buried * (1.0 - pressed));
         s.Displacement *= 1.0 - buried;
+        // Packed by a foot: a little darker, smoother, no crystals
+        s.Albedo.rgb *= lerp(1.0, 0.86, pressed * dust);
+        s.Data.r = lerp(s.Data.r, 0.6, pressed * buried);
+    }
+
+    // The prints' dent, as deep as the ground lets it be: in full where there was snow (trodden off or packed), half on
+    // soft ground without it, none on dry stone and paving
+    if (s.PrintDepth > 0.0)
+    {
+        float give = max(softGround * 0.5, saturate(snowHere * 2.0));
+        if (give > 0.0)
+        {
+            float h = -s.PrintDepth * give, viewZ;
+            float2 disp = DisplacementFor(rel, geo, h, viewZ);
+            s.Displacement += disp;
+            s.Depth -= h;
+            s.Normal.xyz = normalize(s.Normal.xyz + s.PrintTilt * give);
+        }
     }
 }
 
@@ -697,6 +761,9 @@ void CSDecals(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint gi : S
     s.Depth = depthUav[px];
     s.Displacement = heightUav[px];
     s.Dent = 0.0;
+    s.Print = 0.0;
+    s.PrintDepth = 0.0;
+    s.PrintTilt = 0.0;
     Surface before = s;
 
     // The weather reaches puddles and surfaces alike: a puddle under a stall's roof stays dry, no rings under an eave
@@ -710,11 +777,13 @@ void CSDecals(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint gi : S
             {
                 uint b = firstbitlow(bits);
                 bits &= bits - 1u;
-                ApplyDecal(w2 * 32u + b, rel, geo, dx, dy, surfaceClass, f.Rain * open, f.PuddleFill * open, s);
+                ApplyDecal(w2 * 32u + b, rel, geo, dx, dy, surfaceClass, f.Rain * open, f.PuddleFill * open,
+                           f.SnowFallen, s);
             }
         }
     }
-    if (f.WeatherOn != 0u)
+    // (also where footprints lie in dry weather: what they do there is the ground's to say)
+    if (f.WeatherOn != 0u || s.Print > 0.0)
     {
         // (vegetation: its own dome normal, gbuffer_foliage.fx / gbuffer_crossmesh.fx: the depth's normal of a far tree's
         // vertical cards pointed sideways, and the snow stopped a few hundred metres out, far trees stood green)
