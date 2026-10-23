@@ -53,9 +53,14 @@ SamplerState LinearClampS : register(s2);
 #define SNOW_DENSITY 100.0      // flakes per m³ in heavy snow (they fall slowly: many are in the air)
 #define SNOW_RADIUS 0.012
 #define SNOW_ALPHA 0.8
-#define MIN_CELL_PIXELS 6.0     // cells are never narrower: past that each drawn drop stands for the slab's many
+#define MIN_CELL_PIXELS 6.0     // cells are never narrower: past that the far layers hold fewer drops than the air
 #define MIN_STREAK_PIXELS 10.0  // a far streak as long as a camera's exposure smears it on the screen
 #define MAX_ALPHA 0.15          // a layer's drop at most: denser, the far layers turned to static
+#define DISTANCE_FALLOFF 1.0    // a layer's drops dim as (FIRST_LAYER / d)^this: the far field a soft veil behind the
+                                // near drops. Equal in strength (more drops per pixel, each dimmer) every layer was as
+                                // intense as the first and the far field read bright and even (user, 2026-10-23)
+#define CURTAIN_WIDTH 9.0       // m across, the denser and thinner sheets of a fall
+#define CURTAIN_HEIGHT 14.0     // m up
 
 float LayerHash(int3 c, uint seed)
 {
@@ -64,6 +69,24 @@ float LayerHash(int3 c, uint seed)
     h = ((h >> ((h >> 28u) + 4u)) ^ h) * 277803737u;
     h = (h >> 22u) ^ h;
     return (h & 0xFFFFFFu) / 16777216.0;
+}
+
+// The sheets of a fall (0..1): value noise on the layer's sphere in metres, a whole number of cells round it (no
+// seam), drifting with the wind across each direction (sheets are the air's, the drops fall through them)
+float Curtain(float az, float el, float d, float drift, uint layer)
+{
+    float n = max(1.0, round(6.2831853 * d / CURTAIN_WIDTH));
+    float cellWidth = 6.2831853 * d / n;
+    float x = az / 6.2831853 * n - fmod(drift * Time / cellWidth, n);
+    float y = el * d / CURTAIN_HEIGHT;
+    float2 i = floor(float2(x, y)), f = float2(x, y) - i;
+    int x0 = (int)((uint)((int)i.x % (int)n + (int)n) % (uint)n);
+    int x1 = (int)((uint)(x0 + 1) % (uint)n);
+    int y0 = (int)i.y;
+    float a = LayerHash(int3(x0, y0, (int)layer), 21u), b = LayerHash(int3(x1, y0, (int)layer), 21u);
+    float c = LayerHash(int3(x0, y0 + 1, (int)layer), 21u), e = LayerHash(int3(x1, y0 + 1, (int)layer), 21u);
+    float2 s = f * f * (3.0 - 2.0 * f);
+    return lerp(lerp(a, b, s.x), lerp(c, e, s.x), s.y);
 }
 
 // The coverage (0..1) of one layer's field at a direction: rain streaks or snow flakes. az, el: the direction's azimuth
@@ -80,8 +103,9 @@ float LayerCoverage(float az, float el, float d, float2 wind, uint layer, bool s
         cell = max(sqrt(1.0 / perArea), MIN_CELL_PIXELS * pixelMetres).xx;
     else
         cell = float2(max(1.0 / (perArea * RAIN_CELL_DOWN), MIN_CELL_PIXELS * pixelMetres), RAIN_CELL_DOWN);
-    float many = min(cell.x * cell.y * perArea, 2.0);   // drops a drawn one stands for (1..2)
     float fall = snow ? SNOW_FALL : RAIN_FALL;
+    // Each drop dimmer with the layer's distance
+    float gain = pow(FIRST_LAYER / d, DISTANCE_FALLOFF);
     // Cells round the sphere, a whole number of them; down it, scrolled by the fall
     // The field in the falling air's own frame: the drops move (wind, -fall) metres a second on the sphere (x along
     // +azimuth, y up), so a place on it at time t holds the drop that was at (x - wind t, y + fall t). A streak lies along
@@ -104,7 +128,9 @@ float LayerCoverage(float az, float el, float d, float2 wind, uint layer, bool s
     c.x = (int)((uint)(c.x % (int)around + (int)around) % (uint)around);
     float2 f = frac(float2(u, v));
     int3 key = int3(c, (int)layer + (snow ? 64 : 0));
-    if (LayerHash(key, 11u) > saturate(rate))
+    // As many cells hold a drop as the rate, more in a curtain's dense sheets, few between them
+    float sheet = lerp(0.2, 1.6, Curtain(az, el, d, slant * fall, layer + (snow ? 64u : 0u)));
+    if (LayerHash(key, 11u) > saturate(rate * sheet))
         return 0.0;
 
     if (snow)
@@ -114,7 +140,7 @@ float LayerCoverage(float az, float el, float d, float2 wind, uint layer, bool s
         float r = SNOW_RADIUS * (0.6 + 0.8 * LayerHash(key, 16u));
         float w = max(r, 1.2 * pixelMetres);
         float2 dm = (f - centre) * cell;
-        return min(SNOW_ALPHA * exp(-2.0 * dot(dm, dm) / (w * w)) * (r * r) / (w * w) * many, MAX_ALPHA);
+        return min(SNOW_ALPHA * exp(-2.0 * dot(dm, dm) / (w * w)) * (r * r) / (w * w), MAX_ALPHA) * gain;
     }
     float x0 = 0.15 + 0.7 * LayerHash(key, 12u);
     float len = min(max(0.12 + 0.1 * LayerHash(key, 14u), MIN_STREAK_PIXELS * pixelMetres) / cell.y, 0.8);
@@ -124,7 +150,7 @@ float LayerCoverage(float az, float el, float d, float2 wind, uint layer, bool s
     float across = exp(-2.0 * dx * dx);
     float t = (f.y - y0) / len;
     float along = smoothstep(0.0, 0.25, t) * (1.0 - smoothstep(0.75, 1.0, t));
-    return min(RAIN_ALPHA * across * along * RAIN_WIDTH / w * many, MAX_ALPHA);
+    return min(RAIN_ALPHA * across * along * RAIN_WIDTH / w, MAX_ALPHA) * gain;
 }
 
 [numthreads(8, 8, 1)]
