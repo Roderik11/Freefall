@@ -158,7 +158,6 @@ namespace Freefall.Graphics
             _cs.SetParam("GridSize", new UInt3 { X = (uint)_gridW, Y = (uint)_gridH, Z = Slices });
             _cs.SetParam("ExposureRatio", useHistory ? exposure / _prevExposure : 1f);
             _cs.SetParam("TileUV", new Vector2((float)TileSize / _width, (float)TileSize / _height));
-            _cs.SetParam("SkyViewPhase", (uint)(_frame & 3));
 
             uint gx = (uint)(_gridW + 7) / 8, gy = (uint)(_gridH + 7) / 8;
 

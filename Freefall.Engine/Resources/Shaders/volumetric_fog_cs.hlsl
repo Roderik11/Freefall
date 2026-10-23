@@ -51,7 +51,7 @@ cbuffer Params : register(b4)
     uint3 GridSize;                             // froxels across, down, slices
     float ExposureRatio;                        // this frame's exposure / last frame's: the history is pre-exposed
     float2 TileUV;                              // a froxel's width and height as a share of the screen
-    uint SkyViewPhase;                          // which 4 of the 16 sky captures this frame reads (0..3)
+    float _fogPad0;
     float _fogPad;
 };
 
@@ -259,8 +259,11 @@ float CascadeShadow(float3 worldPos, float viewDepth)
     return 1.0;
 }
 
-// How much of the sky's light reaches a place in the air past the meshes: 4 of the 16 sky captures, a different 4 each
-// frame (the history averages them), seen from the place as from an up-facing surface. 1 without captures.
+// How much of the sky's light reaches a place in the air past the meshes: all 16 sky captures, seen from the place as
+// from an up-facing surface. 1 without captures. A different 4 each frame, left to the history to average, flickered
+// under crowns, where the directions differ most, and most under a deck, where the sky is all the air's light (a forest
+// in Snowfall; user and Georg, 2026-10-23): the history keeps a period-4 ripple, and drops it where the grid moves on.
+// All 16 cost 0.08 ms more (0.31 ms at 2176×1249).
 float FogMeshSkyVisibility(AtmosphereParams A, float3 worldPos)
 {
     if (A.SkyCaptureViews == 0 || A.SkyCaptureDepth == 0 || A.SkyCaptureCount != SKY_CAPTURE_VIEWS)
@@ -270,9 +273,8 @@ float FogMeshSkyVisibility(AtmosphereParams A, float3 worldPos)
     float width, height, slices;
     depths.GetDimensions(width, height, slices);
     float lit = 0, total = 0;
-    [unroll] for (uint k = 0; k < 4; k++)
+    [unroll] for (uint i = 0; i < SKY_CAPTURE_VIEWS; i++)
     {
-        uint i = k * 4 + SkyViewPhase;
         lit += SkyCaptureViewLight(views[i], i, depths, float2(width, height), AtmosphereLinearClamp, worldPos,
                                    float3(0, 1, 0), total);
     }
