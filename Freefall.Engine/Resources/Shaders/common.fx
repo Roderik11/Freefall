@@ -166,22 +166,29 @@ float WindPush(float2 p)
     return clamp(gust + 0.7 * (gust - before), -0.2, 1.4);
 }
 
-// How a grass blade, card or flower stem sways at height fraction t of a part 'height' tall rooted at 'root': a lean
-// downwind with the push (WindPush) and a flutter across it on two out-of-step rhythms, each part at its own rate,
-// harder in the gusts. 'phase' (0..2π) keeps neighbours apart. Same in the shadow passes.
-float3 GrassWind(float3 root, float t, float height, float phase)
+// GrassWind for parts rooted close together (a clump's blades, a plant's stems), with the push looked up once at
+// their common root (two gust noises per lookup, which per vertex were most of the procedural grass' cost): the sway
+// at the tip per metre of height, so GrassWind = GrassSway x t² x height
+float3 GrassSway(float push, float phase)
 {
     float s = saturate(WindStrength / 12.0);                                    // calm .. gale
     float2 dir = WindDirection.xz;
     float2 across = float2(-dir.y, dir.x);
-    float push = WindPush(root.xz);
     float lean = s * (0.25 + 0.75 * push) * 0.6;
     float rate = 0.75 + 0.5 * frac(phase * 7.13);
     float wave = sin(WindPhase * 4.0 * rate + phase) * 0.65 + sin(WindPhase * 6.7 * rate + phase * 2.3) * 0.35;
     float flutter = wave * (0.02 + 0.05 * s) * (0.3 + 0.7 * saturate(push));
     float calm = saturate(1.0 - WindStrength / 0.5);                           // no direction to flutter across
     float2 offset = dir * lean + across * flutter * (1.0 - calm) + float2(flutter, flutter * 0.5) * calm;
-    return float3(offset.x, -0.3 * lean * lean, offset.y) * (t * t * height);   // bending over costs a little height
+    return float3(offset.x, -0.3 * lean * lean, offset.y);   // bending over costs a little height
+}
+
+// How a grass blade, card or flower stem sways at height fraction t of a part 'height' tall rooted at 'root': a lean
+// downwind with the push (WindPush) and a flutter across it on two out-of-step rhythms, each part at its own rate,
+// harder in the gusts. 'phase' (0..2π) keeps neighbours apart. Same in the shadow passes.
+float3 GrassWind(float3 root, float t, float height, float phase)
+{
+    return GrassSway(WindPush(root.xz), phase) * (t * t * height);
 }
 
 // A whole tree bending about its base 'origin' (the world matrix' translation) — trunks, far crossmesh LODs and

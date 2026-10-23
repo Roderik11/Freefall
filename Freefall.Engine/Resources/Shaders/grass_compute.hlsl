@@ -234,7 +234,7 @@ struct DecoInstance
     float  FadeFactor;      // distance fade [0-1]
     float2 Scale;           // (width, height) after density + fade bias
     uint   GroundTint;      // what the ground at the root does to the plant's colour (PackGroundTint): layer, shape
-    uint   _groundTintPad;
+    float  Kept;            // share of the plants here the distance thinning kept (1 = all): the survivors grow by 1 / it
     uint   SlotIdx;         // decorator variant index (DecoratorSlot)
     uint   LOD;             // selected LOD index
     float  InstanceSeed;    // for color variation in PS
@@ -251,6 +251,11 @@ struct DecoInstance
 #define MODE_SPIKES    5
 #define MODE_FERNS     6
 #define MAX_BANDS      4
+
+// Distance thinning of the procedural plants (CS_SpawnInstances): how many of one variant's plants a steradian of view
+// holds before they thin out, and the flattest view of the ground counted (a grazing view would keep next to nothing)
+#define THIN_PLANTS_PER_SR 20000.0
+#define THIN_MIN_COS 0.02
 
 // ─── Distance bands (DecoratorVariant.Bands) ──────────────────────────────
 
@@ -275,6 +280,36 @@ float VariantRange(DecoratorSlot s)
 {
     uint n = BandCount(s);
     return n > 0 ? min(DecoRadius, BandEnd(s, n - 1)) : DecoRadius;
+}
+
+// ─── Distance thinning (CS_SpawnInstances) ─────────────────────────────────
+
+bool ThinningMode(uint mode) { return mode >= MODE_BLADES && mode <= MODE_SPIKES; }
+
+// Whether every instance of the variant is a kind the thinning takes (whatever band it is in)
+bool AlwaysThins(DecoratorSlot s)
+{
+    uint n = BandCount(s);
+    if (n == 0) return ThinningMode(s.Mode);
+    for (uint b = 0; b < n; b++)
+        if (!ThinningMode(BandMode(s, b))) return false;
+    return true;
+}
+
+// The share of a variant's plants kept at squared distance 'distSq' on ground facing the view, before saturating:
+// THIN_PLANTS_PER_SR over the plants a steradian there holds. 'weight' = the cell's highest weight (cubed coverage x
+// clumps): the same for every plant of the cell, so a cell can tell how many of its candidates any point keeps.
+float ThinFacing(float weight, DecoratorSlot s, float distSq)
+{
+    float density = weight * 64.0 * s.Density * DecorationDensity / (TileSize * TileSize);   // plants per m²
+    return THIN_PLANTS_PER_SR / max(density * distSq, 1e-6);
+}
+
+// Every variant thins out over the last 30% of its range: the share kept falls linearly to nothing
+float EndKeep(DecoratorSlot s, float dist)
+{
+    float range = VariantRange(s);
+    return saturate((range - dist) / (range * 0.3));
 }
 
 // ─── Samplers ──────────────────────────────────────────────────────────────
@@ -416,6 +451,8 @@ groupshared uint  gs_entryGroup[MAX_CELL_ENTRIES];   // its decorator (row of gs
 groupshared float gs_entryKeep[MAX_CELL_ENTRIES];    // share of the candidates kept at the highest weight (expected / count)
 groupshared float gs_entryInvMax[MAX_CELL_ENTRIES];  // 1 / that weight: a survivor is kept with probability weight / it
 groupshared float gs_entryEven[MAX_CELL_ENTRIES];    // >= 0: coverage, even around the cell; -1 bilinear; -2 + edge offset
+groupshared uint  gs_entryCount[MAX_CELL_ENTRIES];   // candidates the cell has (the thinning ranks them); it tries the first of them
+groupshared uint  gs_entryThins[MAX_CELL_ENTRIES];   // 1: every kind the variant draws thins with distance (AlwaysThins)
 groupshared uint  gs_entries;
 groupshared uint  gs_cellValid;
 groupshared uint  gs_groupMask;                      // bit N: decorator N covers one of the 3x3 texels
@@ -593,9 +630,23 @@ void CS_SpawnInstances(uint3 gid : SV_GroupID, uint3 gtid3 : SV_GroupThreadID)
                 uint count = min(64u, (uint)ceil(expected - 0.001));
                 if (count == 0) continue;
 
+                // The distance thinning keeps the lowest ranks, and a candidate's rank grows with its index: the cell
+                // tries only as many as its nearest point (horizontally: never farther than in 3D) can keep
+                uint tried = count;
+                bool thins = AlwaysThins(variant);
+                gs_entryThins[entries] = thins ? 1u : 0u;
+                if (thins)
+                {
+                    float nearest = max(0.0, sqrt(dx2 * dx2 + dz2 * dz2) - 0.71 * ts);
+                    float keepMax = saturate(ThinFacing(wMax, variant, nearest * nearest)) * EndKeep(variant, nearest);
+                    tried = min(count, (uint)ceil(keepMax * count));
+                    if (tried == 0) continue;
+                }
+
                 gs_entrySlot[entries] = variantIdx;
                 gs_entryStart[entries] = candidates;
-                candidates += count;
+                gs_entryCount[entries] = count;
+                candidates += tried;
                 gs_entryGroup[entries] = gk;
                 // How much lookup the instances need: none inside a patch (coverage within 0.03 everywhere around, the
                 // mean of the extremes), plain bilinear where it changes gently, and the edge offset (4 noises per
@@ -659,6 +710,17 @@ void CS_SpawnInstances(uint3 gid : SV_GroupID, uint3 gtid3 : SV_GroupThreadID)
             float wx = tileOrig.x + (rngX * (1.0 + 2.0 * overshoot) - overshoot) * ts;
             float wz = tileOrig.y + (rngY * (1.0 + 2.0 * overshoot) - overshoot) * ts;
 
+            // The candidate's rank in the distance thinning (below): its index in the cell's list, jittered. Where
+            // every kind the variant draws thins, the share its spot keeps on ground facing the view (the most it can
+            // keep) is known before any noise or texture is read.
+            float rank = (float(instanceIdx) + float(pcg(instSeed + 4243u)) / 4294967295.0) / float(gs_entryCount[ci]);
+            if (gs_entryThins[ci] != 0)
+            {
+                float2 flat = float2(wx, wz) - camPos.xz;
+                float flatSq = dot(flat, flat);
+                if (rank >= saturate(ThinFacing(1.0 / invMaxWeight, slot, flatSq)) * EndKeep(slot, sqrt(flatSq))) continue;
+            }
+
             // Terrain UV
             float2 texelUV = float2(
                 (wx - TerrainOrigin.x) / TerrainSize.x,
@@ -699,18 +761,53 @@ void CS_SpawnInstances(uint3 gid : SV_GroupID, uint3 gtid3 : SV_GroupThreadID)
             float3 toCam = instancePos - camPos;
             float camDistSq = dot(toCam, toCam);
             if (camDistSq >= range * range) continue;
-
-            // Thin out over the last 30% of the range instead of ending in a wall of cards at it: each instance
-            // drops out at its own distance (density falls linearly to nothing), the survivors shrink only in the
-            // last 8%. A full-density sward that stopped dead at 120 m was a hard line across every meadow.
             float camDist = sqrt(camDistSq);
-            float keep = saturate((range - camDist) / (range * 0.3));
-            if (float(pcg(instSeed + 4243u)) / 4294967295.0 > keep) continue;
+            float instanceSeedVal = float(pcg(instSeed + 991u)) / 4294967295.0;
+
+            // How this instance is drawn: the first of the variant's distance bands it is inside. Each instance
+            // switches at its own point within ±15% of a band's end, so a hand-over has no ring; the last band
+            // ends at the variant's range (the thinning below).
+            uint mode = slot.Mode;
+            if (bandCount > 0)
+            {
+                float switchAt = 0.85 + 0.3 * frac(instanceSeedVal * 13.37);
+                mode = BandMode(slot, bandCount - 1);
+                for (uint band = 0; band + 1 < bandCount; band++)
+                {
+                    if (camDist < BandEnd(slot, band) * switchAt)
+                    {
+                        mode = BandMode(slot, band);
+                        break;
+                    }
+                }
+            }
+
+            // Thinning. Procedural plants (blades, flowers, spikes) are drawn in full until they would crowd the
+            // view: past THIN_PLANTS_PER_SR of a variant's plants per steradian (the cell's density times the solid
+            // angle a square metre of ground fills, which falls with the square of the distance and with how flat
+            // the view meets the ground) the share kept falls to that, and the survivors grow to cover for the ones
+            // dropped (grass_blades.fx, grass_plants.fx: di.Kept). The meadow keeps its coverage and colour while
+            // its plants get fewer and bigger, so nothing has to switch to a card (Cook et al. 2007, "Stochastic
+            // Simplification of Aggregate Detail"). Every variant also thins out over the last 30% of its range
+            // (density falls linearly to nothing, into the sward). Each plant has a rank: it is there while the
+            // share kept is above it and shrinks away over the last quarter of the share before it leaves, so no
+            // plant pops and no two leave at the same distance. (Until 2026-10-23 grass switched to cross cards at
+            // 15 m and flowers at 20 m: the cards read as different plants. Instances dropped out at random in the
+            // last 30%, popping, and all survivors shrank in the last 8%.)
+            bool thins = ThinningMode(mode);
+            float thinFacing = thins ? ThinFacing(1.0 / invMaxWeight, slot, camDistSq) : 1.0;   // ground facing the view
+            float endKeep = EndKeep(slot, camDist);
+            if (rank >= saturate(thinFacing) * endKeep) continue;      // before the normal: ground at an angle keeps less
 
             // ── Terrain normal (R16G16_SNORM — already [-1,1]) ──
             float2 nxz = bakedNormals.SampleLevel(ClampSampler, texelUV, 0).rg;
             float ny = sqrt(max(0.0, 1.0 - nxz.x * nxz.x - nxz.y * nxz.y));
             float3 terrainNormal = normalize(float3(nxz.x, ny, nxz.y));
+
+            float thin = thins ? saturate(thinFacing * max(abs(dot(toCam, terrainNormal)) / camDist, THIN_MIN_COS)) : 1.0;
+            float keep = thin * endKeep;
+            if (rank >= keep) continue;
+            float fadeFactor = smoothstep(0.0, 1.0, (keep - rank) / (0.25 * keep));
 
             // ── LOD selection ──
             uint lod = 0;
@@ -736,8 +833,7 @@ void CS_SpawnInstances(uint3 gid : SV_GroupID, uint3 gtid3 : SV_GroupThreadID)
             if (slot.HeightNoiseScale > 0 && slot.HeightNoiseAmount > 0)
                 scaleH *= DecoHeightFactor(texelUV * TerrainSize, slot.HeightNoiseScale, saturate(slot.HeightNoiseAmount), slot.Seed);
 
-            // The last few survivors of the thinning shrink away instead of popping
-            float fadeFactor = smoothstep(0.0, 1.0, (range - camDist) / (range * 0.08));
+            // A plant the thinning is about to drop shrinks away instead of popping
             scaleH *= fadeFactor;
             scaleW *= fadeFactor;
 
@@ -752,7 +848,6 @@ void CS_SpawnInstances(uint3 gid : SV_GroupID, uint3 gtid3 : SV_GroupThreadID)
             groundTint *= SwardGrain(localXZ);       // the sward's grain, as the ground under it from afar
 
             float instanceRot = float(pcg(instSeed + 731u)) / 4294967295.0 * 6.2831853;
-            float instanceSeedVal = float(pcg(instSeed + 991u)) / 4294967295.0;
 
             // ── Append to output ──
             DecoInstance di;
@@ -762,28 +857,10 @@ void CS_SpawnInstances(uint3 gid : SV_GroupID, uint3 gtid3 : SV_GroupThreadID)
             di.FadeFactor = fadeFactor;
             di.Scale = float2(scaleW, scaleH);
             di.GroundTint = PackGroundTint(groundTint);
-            di._groundTintPad = 0;
+            di.Kept = thin;
             di.SlotIdx = slotIdx;
             di.LOD = lod;
             di.InstanceSeed = instanceSeedVal;
-
-            // How this instance is drawn: the first of the variant's distance bands it is inside. Each instance
-            // switches at its own point within ±15% of a band's end, so a hand-over has no ring; the last band
-            // ends at the variant's range (the fade above).
-            uint mode = slot.Mode;
-            if (bandCount > 0)
-            {
-                float switchAt = 0.85 + 0.3 * frac(instanceSeedVal * 13.37);
-                mode = BandMode(slot, bandCount - 1);
-                for (uint band = 0; band + 1 < bandCount; band++)
-                {
-                    if (camDist < BandEnd(slot, band) * switchAt)
-                    {
-                        mode = BandMode(slot, band);
-                        break;
-                    }
-                }
-            }
             di.Mode = mode;
 
             // Under the snow: as much shorter as it buries them, gone once it nearly does. Not the meshes: stones and

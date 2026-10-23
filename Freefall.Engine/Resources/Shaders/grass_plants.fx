@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════════════════════
-// Flowers, spikes and ferns — what plant cards become near the camera (Amplification → Mesh → Pixel)
+// Flowers, spikes and ferns — plant cards as procedural plants (Amplification → Mesh → Pixel)
 //
 // Every instance in a Flowers or Spikes distance band becomes a small plant of PLANT_STEMS stems, one in a Ferns
 // band a crown of FERN_FRONDS fronds (routing in grass_procedural.hlsli; grass blades are grass_blades.fx).
@@ -9,7 +9,7 @@
 // leaves, a frond. Each part fills most of its quad, so the alpha test wastes few pixels (a whole flower card is
 // ~15% opaque). Without an atlas the parts are flat colours from the card.
 // ═══════════════════════════════════════════════════════════════════════════
-#define PROCEDURAL_SHADOW_MODE(mode) ((mode) >= MODE_FLOWERS && (mode) <= MODE_FERNS)   // this effect's kinds
+#define PROCEDURAL_KINDS(mode) ((mode) >= MODE_FLOWERS && (mode) <= MODE_FERNS)   // this effect's kinds (AS, AS_Shadow)
 #include "grass_procedural.hlsli"
 
 #define PLANT_STEMS 3
@@ -61,6 +61,8 @@ struct PlantVertexData
     uint   Textured;        // 1 = sample the parts atlas
 };
 
+#define PLANT_MAX_GROWTH 16.0   // a thinned plant stands in for at most this many
+
 struct Stem
 {
     float3 Root;
@@ -72,16 +74,27 @@ struct Stem
     float  Phase;
     float  Width;
     float  Brightness;
+    float  Grow;            // the thinning's growth, as a length (PlantGrowth)
+    float3 Sway;            // the wind at the tip per metre of height (GrassSway, the push once per plant)
     uint   Hash;            // more randomness for the stem's parts
 };
 
-Stem MakeStem(DecoInstance di, DecoratorSlot slot, uint stem, float dist)
+// A plant the spawn's distance thinning kept (di.Kept < 1) stands in for 1 / Kept plants: its stems spread wider and
+// its blooms and spikes grow by the square root, so their area, the colour they give the meadow, by the whole. Stems
+// and leaves keep their size: the grass carries the green. 1 for ferns (not thinned).
+float PlantGrowth(DecoInstance di)
+{
+    return sqrt(min(1.0 / max(di.Kept, 1e-4), PLANT_MAX_GROWTH));
+}
+
+Stem MakeStem(DecoInstance di, DecoratorSlot slot, uint stem, float dist, float push)
 {
     uint h = pcg(asuint(di.InstanceSeed) ^ (stem * 0x9E3779B9u) ^ 0x51ED270Bu);
     Stem s;
+    s.Grow = PlantGrowth(di);
     float2 disc = float2(Rand(h), Rand(h));
     float rootAngle = disc.y * 6.2831853;
-    s.Root = di.Position + float3(cos(rootAngle), 0, sin(rootAngle)) * 0.4 * di.Scale.x * sqrt(disc.x);
+    s.Root = di.Position + float3(cos(rootAngle), 0, sin(rootAngle)) * 0.4 * di.Scale.x * s.Grow * sqrt(disc.x);
     s.Up = normalize(lerp(float3(0, 1, 0), di.TerrainNormal, abs(slot.SlopeBias)));
     s.Height = di.Scale.y * lerp(0.6, 1.0, Rand(h));
     s.Yaw = Rand(h) * 6.2831853;
@@ -90,6 +103,7 @@ Stem MakeStem(DecoInstance di, DecoratorSlot slot, uint stem, float dist)
     s.Phase = Rand(h) * 6.2831853;
     s.Width = max(0.004, dist * 0.0009);
     s.Brightness = lerp(0.8, 1.1, Rand(h));
+    s.Sway = GrassSway(push, s.Phase);
     s.Hash = h;
     return s;
 }
@@ -97,7 +111,7 @@ Stem MakeStem(DecoInstance di, DecoratorSlot slot, uint stem, float dist)
 float3 StemPoint(Stem s, float t)
 {
     return s.Root + s.Up * s.Height * t * (1.0 - 0.3 * s.Lean * t) + s.Dir * s.Height * s.Lean * t * t
-         + Wind(s.Root, t, s.Height, s.Phase);
+         + s.Sway * (t * t * s.Height);
 }
 
 float3 StemTangent(Stem s, float t)
@@ -126,7 +140,7 @@ void LeafVertex(inout PlantVertexData o, uint v, float3 base, float3 outDir, flo
 // rachis). The crown leans with the slope and a little its own way. The first version rose at 52..80 degrees with
 // every axis near vertical: every plant the same upright shuttlecock. The frond's length is the instance height;
 // its width the atlas' squeezed by FROND_WIDTH.
-PlantVertexData FernVertex(DecoInstance di, DecoratorSlot slot, uint vi)
+PlantVertexData FernVertex(DecoInstance di, DecoratorSlot slot, uint vi, float push)
 {
     uint frond = vi / FROND_VERTS;
     uint v = vi % FROND_VERTS;
@@ -171,7 +185,7 @@ PlantVertexData FernVertex(DecoInstance di, DecoratorSlot slot, uint vi)
     float halfWidth = len * FROND_HALF_U / 0.98 * FROND_WIDTH;
     float sideSign = float(column) - 1.0;              // -1, 0, 1
     p += across * sideSign * halfWidth + normal * abs(sideSign) * halfWidth * FROND_CUP;
-    p += Wind(root, t, len * 0.6, phase);
+    p += Wind(push, t, len * 0.6, phase);
 
     PlantVertexData o;
     o.WorldPos = p;
@@ -205,15 +219,15 @@ uint3 FernTriangle(uint ti)
 }
 
 // Vertex 'vi' of a flower or spike plant: per stem the stalk, the leaves, then the bloom cap or the spike strips
-PlantVertexData PlantVertex(DecoInstance di, DecoratorSlot slot, uint vi, float dist)
+PlantVertexData PlantVertex(DecoInstance di, DecoratorSlot slot, uint vi, float dist, float push)
 {
     if (di.Mode == MODE_FERNS)
-        return FernVertex(di, slot, vi);
+        return FernVertex(di, slot, vi, push);
 
     bool spikes = di.Mode == MODE_SPIKES;
     uint vertsPerStem = spikes ? SPIKE_VERTS : FLOWER_VERTS;
     uint v = vi % vertsPerStem;
-    Stem s = MakeStem(di, slot, vi / vertsPerStem, dist);
+    Stem s = MakeStem(di, slot, vi / vertsPerStem, dist, push);
 
     StructuredBuffer<float4> colors = ResourceDescriptorHeap[BladeColorsSRV];
     float4 foliage = colors[di.SlotIdx * COLORS_PER_VARIANT + COLOR_FOLIAGE];
@@ -266,7 +280,7 @@ PlantVertexData PlantVertex(DecoInstance di, DecoratorSlot slot, uint vi, float 
         float k = float(sv / 2) / SPIKE_SEGMENTS;
         float sideSign = (sv & 1) ? 1.0 : -1.0;
         float t = lerp(SPIKE_FROM, 1.0, k);
-        float halfWidth = s.Height * (1.0 - SPIKE_FROM) * SPIKE_HALF_U / 0.98;
+        float halfWidth = s.Height * (1.0 - SPIKE_FROM) * SPIKE_HALF_U / 0.98 * s.Grow;
         float3 across = strip == 0 ? float3(-s.Dir.z, 0, s.Dir.x) : s.Dir;
         o.WorldPos = StemPoint(s, t) + across * sideSign * halfWidth;
         o.Normal = normalize(cross(across, StemTangent(s, t)));
@@ -283,7 +297,7 @@ PlantVertexData PlantVertex(DecoInstance di, DecoratorSlot slot, uint vi, float 
     float3 facing = normalize(s.Up + s.Dir * lerp(0.2, 1.1, Rand(hb)));
     float3 u = normalize(cross(facing, abs(facing.y) < 0.99 ? float3(0, 1, 0) : float3(1, 0, 0)));
     float3 w = cross(facing, u);
-    float radius = clamp(s.Height * 0.1, 0.02, 0.045) * lerp(0.75, 1.15, Rand(hb));
+    float radius = clamp(s.Height * 0.1, 0.02, 0.045) * lerp(0.75, 1.15, Rand(hb)) * s.Grow;
     float spin = Rand(hb) * 6.2831853;
     float ring = v == 0 ? 0.0 : (v <= CAP_SPOKES ? 0.5 : 1.0);
     float a = spin + (v == 0 ? 0.0 : float((v - 1) % CAP_SPOKES)) * (6.2831853 / CAP_SPOKES);
@@ -336,15 +350,77 @@ uint3 PlantTriangle(uint mode, uint ti)
     return (t & 1) ? uint3(i1, o1, o0) : uint3(i0, i1, o0);
 }
 
-// What one MS group outputs for an instance: flowers, spikes and ferns only (blade clumps and padding: nothing)
-void PlantCounts(DecoInstance di, out uint verts, out uint prims)
+// Mesh groups are small, as the blades' (grass_procedural.hlsli says why): 64 threads and room for 64 vertices, a
+// run of a kind's parts (a flower's or spike's stem with its leaves and bloom, a fern's frond). A plant was a group
+// declaring room for 256 vertices.
+#define PLANT_THREADS 64
+#define PLANT_GROUP_VERTS 64
+#define PLANT_GROUP_TRIS 64
+#define MAX_GROUP_PLANTS 2      // a run of parts spans at most this many plants (PackClass)
+
+// A kind's part: its vertices and triangles, and how many a plant has
+void PartShape(uint mode, out uint verts, out uint tris, out uint parts)
 {
-    verts = 0;
-    prims = 0;
-    if (di.Scale.y <= 0) return;
-    if (di.Mode == MODE_FLOWERS) { verts = PLANT_STEMS * FLOWER_VERTS; prims = PLANT_STEMS * FLOWER_TRIS; }
-    else if (di.Mode == MODE_SPIKES) { verts = PLANT_STEMS * SPIKE_VERTS; prims = PLANT_STEMS * SPIKE_TRIS; }
-    else if (di.Mode == MODE_FERNS) { verts = FERN_VERTS; prims = FERN_TRIS; }
+    if (mode == MODE_FERNS) { verts = FROND_VERTS; tris = FROND_TRIS; parts = FERN_FRONDS; }
+    else if (mode == MODE_SPIKES) { verts = SPIKE_VERTS; tris = SPIKE_TRIS; parts = PLANT_STEMS; }
+    else { verts = FLOWER_VERTS; tris = FLOWER_TRIS; parts = PLANT_STEMS; }
+}
+
+// A plant is its parts; the parts of plants of one kind run on into each other, as many to a group as fit its 64
+// vertices (a flower's or a spike's stem, three fronds)
+uint PackClass(DecoInstance di, out uint units, out uint perGroup)
+{
+    uint verts, tris;
+    PartShape(di.Mode, verts, tris, units);
+    perGroup = min(PLANT_GROUP_VERTS / verts, (MAX_GROUP_PLANTS - 1) * units);
+    return di.Mode - MODE_FLOWERS;
+}
+
+// What a group's parts share with the rest of their plant, worked out once per plant of the group (a thread each)
+struct PlantSetup
+{
+    DecoInstance Instance;
+    uint   PartsIdx;        // the slot's parts atlas, 0 = none
+    float  Dist;
+    float  Push;            // the wind's push (WindPush: two gust noises)
+    float3 Variation;       // large-scale variation (common.fx) x the ground at the root (spawn)
+};
+
+groupshared PlantSetup gs_Plants[MAX_GROUP_PLANTS];
+
+// The group's run of parts; every thread calls it (it ends in a barrier)
+void SetupPlants(uint gtid, ProceduralPayload payload, uint cls, uint firstUnit, uint count, uint parts)
+{
+    uint firstPlant = firstUnit / parts;
+    if (gtid <= (firstUnit + count - 1) / parts - firstPlant)
+    {
+        StructuredBuffer<DecoInstance> instances = ResourceDescriptorHeap[BladeInstanceSRV];
+        StructuredBuffer<DecoratorSlot> slots = ResourceDescriptorHeap[DecoratorSlotsIdx];
+        PlantSetup p;
+        p.Instance = instances[PayloadInstance(payload, cls, firstPlant + gtid)];
+        p.PartsIdx = slots[p.Instance.SlotIdx].PlantPartsIdx;
+        p.Dist = distance(CamPos, p.Instance.Position);
+        p.Push = WindPush(p.Instance.Position.xz);
+        p.Variation = GroundVariation(p.Instance.Position.xz) * UnpackGroundTint(p.Instance.GroundTint);
+        gs_Plants[gtid] = p;
+    }
+    GroupMemoryBarrierWithGroupSync();
+}
+
+// Group vertex 'vi' (part after part): its plant in gs_Plants and its index within the plant
+void GroupVertex(uint vi, uint firstUnit, uint parts, uint partVerts, out uint plant, out uint plantVertex)
+{
+    uint unit = firstUnit + vi / partVerts;
+    plant = unit / parts - firstUnit / parts;
+    plantVertex = (unit % parts) * partVerts + vi % partVerts;
+}
+
+// Group triangle 'ti': the plant's triangle, its vertices renumbered into the group's
+uint3 GroupTriangle(uint ti, uint mode, uint firstUnit, uint parts, uint partVerts, uint partTris)
+{
+    uint unit = firstUnit + ti / partTris;
+    uint part = unit % parts;
+    return PlantTriangle(mode, part * partTris + ti % partTris) - part * partVerts + (ti / partTris) * partVerts;
 }
 
 // ─── Mesh Shader ───────────────────────────────────────────────────────────
@@ -361,42 +437,44 @@ struct MSOutput
 };
 
 [outputtopology("triangle")]
-[numthreads(MS_THREADS, 1, 1)]
+[numthreads(PLANT_THREADS, 1, 1)]
 void MS(
     uint gtid : SV_GroupThreadID,
     uint3 gid : SV_GroupID,
     in payload ProceduralPayload payload,
-    out vertices MSOutput verts[MAX_VERTS],
-    out indices uint3 tris[MAX_PRIMS])
+    out vertices MSOutput verts[PLANT_GROUP_VERTS],
+    out indices uint3 tris[PLANT_GROUP_TRIS])
 {
-    StructuredBuffer<DecoInstance> instances = ResourceDescriptorHeap[BladeInstanceSRV];
-    DecoInstance di = instances[payload.BaseInstance + gid.x];
-
-    uint vertCount, primCount;
-    PlantCounts(di, vertCount, primCount);
+    uint cls, firstUnit, count;
+    GroupRun(payload, gid.x, cls, firstUnit, count);
+    uint mode = MODE_FLOWERS + cls;
+    uint partVerts, partTris, parts;
+    PartShape(mode, partVerts, partTris, parts);
+    uint vertCount = count * partVerts;
+    uint primCount = count * partTris;
     SetMeshOutputCounts(vertCount, primCount);
+    SetupPlants(gtid, payload, cls, firstUnit, count, parts);
 
-    StructuredBuffer<DecoratorSlot> slots = ResourceDescriptorHeap[DecoratorSlotsIdx];
-    DecoratorSlot slot = slots[di.SlotIdx];
-    float dist = distance(CamPos, di.Position);
-    float3 variation = GroundVariation(di.Position.xz) * UnpackGroundTint(di.GroundTint);   // large-scale variation (common.fx) x the ground at the root (spawn)
-
-    for (uint vi = gtid; vi < vertCount; vi += MS_THREADS)
+    if (gtid < vertCount)
     {
-        PlantVertexData pv = PlantVertex(di, slot, vi, dist);
+        uint plant, plantVertex;
+        GroupVertex(gtid, firstUnit, parts, partVerts, plant, plantVertex);
+        PlantSetup p = gs_Plants[plant];
+        StructuredBuffer<DecoratorSlot> slots = ResourceDescriptorHeap[DecoratorSlotsIdx];
+        PlantVertexData pv = PlantVertex(p.Instance, slots[p.Instance.SlotIdx], plantVertex, p.Dist, p.Push);
         MSOutput o;
         o.Position = mul(float4(pv.WorldPos, 1.0), ViewProjection);
-        o.Color = pv.Color * variation;
+        o.Color = pv.Color * p.Variation;
         o.PartNormal = pv.Normal;
-        o.TerrainNormal = di.TerrainNormal;
+        o.TerrainNormal = p.Instance.TerrainNormal;
         o.Depth = o.Position.w;
         o.UV = pv.UV;
-        o.TextureIdx = pv.Textured ? slot.PlantPartsIdx : 0;
-        verts[vi] = o;
+        o.TextureIdx = pv.Textured ? p.PartsIdx : 0;
+        verts[gtid] = o;
     }
 
-    for (uint ti = gtid; ti < primCount; ti += MS_THREADS)
-        tris[ti] = PlantTriangle(di.Mode, ti);
+    if (gtid < primCount)
+        tris[gtid] = GroupTriangle(gtid, mode, firstUnit, parts, partVerts, partTris);
 }
 
 // ─── Pixel Shader ──────────────────────────────────────────────────────────
@@ -455,42 +533,44 @@ struct ShadowPrimAttribs
 };
 
 [outputtopology("triangle")]
-[numthreads(MS_THREADS, 1, 1)]
+[numthreads(PLANT_THREADS, 1, 1)]
 void MS_Shadow(
     uint gtid : SV_GroupThreadID,
     uint3 gid : SV_GroupID,
-    in payload ProceduralShadowPayload payload,
-    out vertices ShadowMSOutput verts[MAX_VERTS],
-    out indices uint3 tris[MAX_PRIMS],
-    out primitives ShadowPrimAttribs primAttribs[MAX_PRIMS])
+    in payload ProceduralPayload payload,
+    out vertices ShadowMSOutput verts[PLANT_GROUP_VERTS],
+    out indices uint3 tris[PLANT_GROUP_TRIS],
+    out primitives ShadowPrimAttribs primAttribs[PLANT_GROUP_TRIS])
 {
-    StructuredBuffer<DecoInstance> instances = ResourceDescriptorHeap[BladeInstanceSRV];
-    DecoInstance di = instances[payload.Instances[gid.x]];
-
-    uint vertCount, primCount;
-    PlantCounts(di, vertCount, primCount);
+    uint cls, firstUnit, count;
+    GroupRun(payload, gid.x, cls, firstUnit, count);
+    uint mode = MODE_FLOWERS + cls;
+    uint partVerts, partTris, parts;
+    PartShape(mode, partVerts, partTris, parts);
+    uint vertCount = count * partVerts;
+    uint primCount = count * partTris;
     SetMeshOutputCounts(vertCount, primCount);
+    SetupPlants(gtid, payload, cls, firstUnit, count, parts);
 
-    StructuredBuffer<DecoratorSlot> slots = ResourceDescriptorHeap[DecoratorSlotsIdx];
-    StructuredBuffer<CascadeData> cascades = ResourceDescriptorHeap[CascadeBufferSRVIdx];
-    DecoratorSlot slot = slots[di.SlotIdx];
-    row_major float4x4 cascadeVP = cascades[0].VP;
-    float dist = distance(CamPos, di.Position);
-
-    for (uint vi = gtid; vi < vertCount; vi += MS_THREADS)
+    if (gtid < vertCount)
     {
-        PlantVertexData pv = PlantVertex(di, slot, vi, dist);
+        uint plant, plantVertex;
+        GroupVertex(gtid, firstUnit, parts, partVerts, plant, plantVertex);
+        PlantSetup p = gs_Plants[plant];
+        StructuredBuffer<DecoratorSlot> slots = ResourceDescriptorHeap[DecoratorSlotsIdx];
+        StructuredBuffer<CascadeData> cascades = ResourceDescriptorHeap[CascadeBufferSRVIdx];
+        PlantVertexData pv = PlantVertex(p.Instance, slots[p.Instance.SlotIdx], plantVertex, p.Dist, p.Push);
         ShadowMSOutput o;
-        o.Position = mul(float4(pv.WorldPos, 1.0), cascadeVP);
+        o.Position = mul(float4(pv.WorldPos, 1.0), cascades[0].VP);
         o.UV = pv.UV;
-        o.TextureIdx = pv.Textured ? slot.PlantPartsIdx : 0;
-        verts[vi] = o;
+        o.TextureIdx = pv.Textured ? p.PartsIdx : 0;
+        verts[gtid] = o;
     }
 
-    for (uint ti = gtid; ti < primCount; ti += MS_THREADS)
+    if (gtid < primCount)
     {
-        tris[ti] = PlantTriangle(di.Mode, ti);
-        primAttribs[ti].RTIndex = 0;
+        tris[gtid] = GroupTriangle(gtid, mode, firstUnit, parts, partVerts, partTris);
+        primAttribs[gtid].RTIndex = 0;
     }
 }
 

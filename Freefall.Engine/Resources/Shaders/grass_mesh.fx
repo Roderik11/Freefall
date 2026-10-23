@@ -73,7 +73,7 @@ struct DecoInstance
     float  FadeFactor;
     float2 Scale;
     uint   GroundTint;      // what the ground at the root does to the colour (ground_shape.hlsli PackGroundTint)
-    uint   _groundTintPad;
+    float  Kept;            // distance thinning (procedural kinds only): 1 for meshes
     uint   SlotIdx;
     uint   LOD;
     float  InstanceSeed;
