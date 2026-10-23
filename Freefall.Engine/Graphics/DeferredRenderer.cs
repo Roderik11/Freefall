@@ -1437,11 +1437,13 @@ namespace Freefall.Graphics
              Transition(list, Depth.Native, ResourceStates.DepthWrite, ShaderRead);
 
              // 4b. The rain and snow past the near particles, over the finished forward image (before the exposure is
-             //     measured and the bloom): layers in depth, cut by the linear depth
+             //     measured and the bloom): layers in depth, cut by the linear depth, lit as the fog volume's air there
              if (PrecipitationLayers.Due)
              {
                  _precipitation ??= new PrecipitationLayers();
-                 _precipitation.Execute(list, Composite, DepthGBuffer.BindlessIndex, camera, BindSceneConstantsForCompute);
+                 bool fog = _fogVolumeIdx != 0;
+                 _precipitation.Execute(list, Composite, DepthGBuffer.BindlessIndex, fog ? VolumetricFog!.LitFroxels : 0u,
+                     fog ? VolumetricFog!.LitLamps : 0u, camera, BindSceneConstantsForCompute);
              }
 
              // PostProcess pass — only do expensive snapshot copy + transitions if commands are queued

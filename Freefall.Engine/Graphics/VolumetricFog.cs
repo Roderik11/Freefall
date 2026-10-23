@@ -36,6 +36,10 @@ namespace Freefall.Graphics
         private ParticleSystem? _particles;
         private readonly RenderTexture3D?[] _scatter = new RenderTexture3D?[2];
         private readonly ResourceStates[] _scatterState = new ResourceStates[2];
+        // Per froxel the lamps' light (rgb, per km × Exposure) and the share of the open sky's, the sun's and the moon's
+        // light that reaches it (a): what the far rain and snow are lit by (LitLamps)
+        private readonly RenderTexture3D?[] _lamps = new RenderTexture3D?[2];
+        private readonly ResourceStates[] _lampsState = new ResourceStates[2];
         private RenderTexture3D? _integrated;
         private ResourceStates _integratedState;
         private int _gridW, _gridH, _width = 1, _height = 1;
@@ -50,6 +54,20 @@ namespace Freefall.Graphics
 
         /// <summary>Metres of view depth the volume covers this frame (SceneConstants.FogVolumeRange).</summary>
         public float Range { get; private set; }
+
+        /// <summary>
+        /// Bindless index of this frame's lit froxels once <see cref="Render"/> has run (Texture3D, rgb = the light the air
+        /// scatters toward the camera per km × Exposure, a = its extinction per km; readable by compute); 0 before.
+        /// </summary>
+        public uint LitFroxels { get; private set; }
+
+        /// <summary>
+        /// Bindless index of this frame's froxel lamps once <see cref="Render"/> has run (Texture3D, the same grid: rgb = the
+        /// point lights' light the air scatters toward the camera per km × Exposure, a = the share of the open sky's, the
+        /// sun's and the moon's light that reaches the place past walls, roofs, crowns, shadows and the terrain); 0 before.
+        /// The far rain and snow are lit by it (precipitation_layers_cs.hlsl).
+        /// </summary>
+        public uint LitLamps { get; private set; }
 
         public VolumetricFog()
         {
@@ -76,6 +94,8 @@ namespace Freefall.Graphics
                 {
                     _scatter[i] = new RenderTexture3D(device, gw, gh, Slices, Format.R16G16B16A16_Float);
                     _scatterState[i] = ResourceStates.Common;
+                    _lamps[i] = new RenderTexture3D(device, gw, gh, Slices, Format.R16G16B16A16_Float);
+                    _lampsState[i] = ResourceStates.Common;
                 }
                 _integrated = new RenderTexture3D(device, gw, gh, Slices, Format.R16G16B16A16_Float);
                 _integratedState = ResourceStates.Common;
@@ -103,6 +123,8 @@ namespace Freefall.Graphics
             int cur = _frame & 1, prev = cur ^ 1;
             var current = _scatter[cur]!;
             var history = _scatter[prev]!;
+            var lamps = _lamps[cur]!;
+            var lampsHistory = _lamps[prev]!;
 
             float exposure = Atmosphere.Exposure;
             var move = cameraPos - _prevCameraPos;
@@ -121,6 +143,8 @@ namespace Freefall.Graphics
             _cs.SetPushConstant("ScatterUAV", current.UavIndex);
             _cs.SetPushConstant("HistoryTex", useHistory ? history.BindlessIndex : 0u);
             _cs.SetPushConstant("ScatterTex", current.BindlessIndex);
+            _cs.SetPushConstant("LampsUAV", lamps.UavIndex);
+            _cs.SetPushConstant("LampsHistory", useHistory ? lampsHistory.BindlessIndex : 0u);
             _cs.SetPushConstant("IntegratedUAV", _integrated.UavIndex);
             _cs.SetPushConstant("ShadowMap", shadowMapIdx);
             _cs.SetPushConstant("CascadeBuffer", shadowMapIdx != 0 ? DirectionalLight.CurrentCascadeSrvIndex : 0u);
@@ -160,10 +184,17 @@ namespace Freefall.Graphics
 
             // Light the froxels
             Transition(list, current, ref _scatterState[cur], ResourceStates.UnorderedAccess);
+            Transition(list, lamps, ref _lampsState[cur], ResourceStates.UnorderedAccess);
             if (useHistory)
+            {
                 Transition(list, history, ref _scatterState[prev], ResourceStates.NonPixelShaderResource);
+                Transition(list, lampsHistory, ref _lampsState[prev], ResourceStates.NonPixelShaderResource);
+            }
             _cs.Dispatch(_kScatter, list, gx, gy, Slices);
             Transition(list, current, ref _scatterState[cur], ResourceStates.NonPixelShaderResource);
+            Transition(list, lamps, ref _lampsState[cur], ResourceStates.NonPixelShaderResource);
+            LitFroxels = current.BindlessIndex;
+            LitLamps = lamps.BindlessIndex;
 
             // Sum the columns
             Transition(list, _integrated, ref _integratedState, ResourceStates.UnorderedAccess);
@@ -206,10 +237,14 @@ namespace Freefall.Graphics
 
         private void DisposeTextures()
         {
+            LitFroxels = 0;
+            LitLamps = 0;
             for (int i = 0; i < 2; i++)
             {
                 _scatter[i]?.Dispose();
                 _scatter[i] = null;
+                _lamps[i]?.Dispose();
+                _lamps[i] = null;
             }
             _integrated?.Dispose();
             _integrated = null;

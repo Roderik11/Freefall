@@ -9,7 +9,8 @@
 // particles' PIXEL_FLOOR), so the distance fills to a veil instead of lines. A layer is drawn only in front of the scene
 // (the linear depth), off covered places (the cover map at the layer's point: no rain inside an arcade seen through its
 // arch) and faded into the haze (Weather.HazeKm) with its distance. Rain takes the sky's light from above (a drop is a
-// tiny lens: the particles' Water), snow is lit as a white speck by the sky round it.
+// tiny lens: the particles' Water), snow is lit as a white speck by the sky round it; with the fog volume (FroxelLamps)
+// as much of that as gets to the place past walls, roofs, crowns and shadows, and the lamps' light near them.
 // Docs: .agent/knowledge/atmospheric_effects/weather.md §3.
 
 #pragma kernel CSLayers
@@ -19,6 +20,8 @@ cbuffer PushConstants : register(b3)
     uint CompositeUAVIdx;       // RWTexture2D<float4>: the HDR composite, pre-exposed
     uint LinearDepthIdx;        // Texture2D<float>: view depth (0 = sky)
     uint FrameIdx;              // StructuredBuffer<PrecipFrame>: [0]
+    uint LitFroxelsIdx;         // Texture3D<float4>: the fog volume's lit froxels (VolumetricFog.LitFroxels); 0 = none
+    uint LitLampsIdx;           // Texture3D<float4>: its froxel lamps (VolumetricFog.LitLamps); 0 = none
 };
 
 #include "common.fx"
@@ -154,6 +157,39 @@ float LayerCoverage(float az, float el, float d, float2 wind, uint layer, bool s
     return min(RAIN_ALPHA * across * along * RAIN_WIDTH / w, MAX_ALPHA) * gain;
 }
 
+#define SNOW_LIGHT 0.9          // a flake sends back this much of the light on it (rain: all of it, a lens)
+#define LAMP_GAIN 4.0           // a drop's light from the lamps over the air's: the air scatters it as its haze does,
+                                // sharply forward (Mie, g 0.76) and sideways six times less than evenly; a drop shows the
+                                // lamps from every side. At 8 the rain round the fountain's lights was a bright sheet
+                                // ("rain is too krass", user, 2026-10-23)
+
+// What lights a drop or a flake at view depth `viewDepth` on this pixel, from the fog volume (volumetric_fog_cs.hlsl
+// CSFogScatter's lit froxels and froxel lamps): the share of the open sky's, the sun's and the moon's light that gets to
+// the place past walls, roofs, crowns, shadows and the terrain (`share`: the far rain darker in the street's shade and
+// under the eaves), and the lamps' light there (`lamps`, × Exposure: what one of the air's particles there sends to the
+// eye, the lamps' light per km over the air's extinction per km). The sky's light itself stays the one the drops took
+// before, so in the open they look as they did: matched on the air's own light alone, the far field was darker in a
+// storm than in the snow and a white curtain once bright enough round the lamps. False without the volume or past it
+bool FroxelLamps(float2 pixel, float viewDepth, out float share, out float3 lamps)
+{
+    share = 1.0;
+    lamps = 0;
+    if (LitFroxelsIdx == 0 || LitLampsIdx == 0 || FogVolumeIdx == 0 || viewDepth >= FogVolumeRange)
+        return false;
+    Texture3D<float4> lit = ResourceDescriptorHeap[LitFroxelsIdx];
+    Texture3D<float4> lampsTex = ResourceDescriptorHeap[LitLampsIdx];
+    float w, h, n;
+    lit.GetDimensions(w, h, n);
+    // Froxel centres: x, y in tiles of FOG_TILE pixels, slice k round view depth ((k + 0.5) / n)² × the range
+    float3 uvw = float3(pixel / (FOG_TILE * float2(w, h)), sqrt(viewDepth / FogVolumeRange));
+    float extinction = lit.SampleLevel(LinearClampS, uvw, 0).a;
+    float4 l = lampsTex.SampleLevel(LinearClampS, uvw, 0);
+    share = saturate(l.a);
+    if (extinction > 1e-5)
+        lamps = l.rgb / extinction;
+    return true;
+}
+
 [numthreads(8, 8, 1)]
 void CSLayers(uint3 id : SV_DispatchThreadID)
 {
@@ -188,9 +224,9 @@ void CSLayers(uint3 id : SV_DispatchThreadID)
     s.TerrainOrigin = 0;
     s.TerrainSize = 1;
 
-    // The light the fall sends toward the eye: drops show the sky above them; flakes are white specks in the sky's light
-    float3 rainLight = SkyAmbient(float3(0, 1, 0));
-    float3 snowLight = (SkyAmbient(float3(0, 1, 0)) + SkyAmbient(float3(0, -1, 0))) * 0.5 * 0.9;
+    // Without the fog volume: drops show the sky above them; flakes are white specks in the sky's light
+    float3 skyRainLight = SkyAmbient(float3(0, 1, 0));
+    float3 skySnowLight = (skyRainLight + SkyAmbient(float3(0, -1, 0))) * 0.5 * SNOW_LIGHT;
 
     float clear = 1.0;          // how much of the scene still shows through the layers in front of it
     float3 light = 0;
@@ -210,6 +246,15 @@ void CSLayers(uint3 id : SV_DispatchThreadID)
             ? LayerCoverage(az, el, d, P.Wind, k, false, P.Rain, P.PixelAngle, P.RainDensity, P.RainFall) * fade : 0.0;
         float snow = P.Snow > 0.0
             ? LayerCoverage(az, el, d, P.Wind, k, true, P.Snow, P.PixelAngle, P.SnowDensity, P.SnowFall) * fade : 0.0;
+        if (rain + snow <= 0.0)
+            continue;
+        float3 rainLight = skyRainLight, snowLight = skySnowLight, lamps;
+        float share;
+        if (FroxelLamps(float2(id.xy) + 0.5, z, share, lamps))
+        {
+            rainLight = skyRainLight * share + lamps * LAMP_GAIN;
+            snowLight = skySnowLight * share + lamps * (LAMP_GAIN * SNOW_LIGHT);
+        }
         light += clear * (rain * rainLight + snow * snowLight);
         clear *= (1.0 - rain) * (1.0 - snow);
     }

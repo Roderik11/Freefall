@@ -46,9 +46,12 @@ namespace Freefall.Graphics
         /// <summary>
         /// Draw the layers over <paramref name="composite"/> (in NonPixelShaderResource on entry and on return); the
         /// linear depth readable by compute. The scene constants are bound by <paramref name="bindSceneConstants"/>.
+        /// <paramref name="litFroxels"/>, <paramref name="litLamps"/>: this frame's lit froxels and froxel lamps of the fog
+        /// volume (VolumetricFog.LitFroxels, LitLamps), what lights the drops and flakes: the share of the sky's, the sun's
+        /// and the moon's light that reaches them, and the lamps' (0: the fog volume is off, they take the sky's light).
         /// </summary>
         public unsafe void Execute(ID3D12GraphicsCommandList list, RenderTexture2D composite, uint linearDepthSrv,
-            Camera camera, Action<ID3D12GraphicsCommandList> bindSceneConstants)
+            uint litFroxels, uint litLamps, Camera camera, Action<ID3D12GraphicsCommandList> bindSceneConstants)
         {
             var desc = composite.Native.Description;
             int width = (int)desc.Width, height = (int)desc.Height;
@@ -74,6 +77,8 @@ namespace Freefall.Graphics
             _shader.SetPushConstant("CompositeUAV", composite.UavIndex);
             _shader.SetPushConstant("LinearDepth", linearDepthSrv);
             _shader.SetPushConstant("Frame", _frames[slot].SrvIndex);
+            _shader.SetPushConstant("LitFroxels", litFroxels);
+            _shader.SetPushConstant("LitLamps", litLamps);
 
             PixMarker.Begin(list, "Precipitation layers");
             list.ResourceBarrierTransition(composite.Native, ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess);

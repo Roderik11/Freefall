@@ -6,7 +6,10 @@
 //   CSFogInject     one thread per particle pool slot: Volumetric particles (smoke) as density in the froxels they cover
 //   CSFogScatter    one thread per froxel: the light the air there scatters toward the camera and its extinction, per km,
 //                   at a place in the froxel jittered each frame and blended with the froxel's reprojected history
-//                   (rgb × Exposure, a = σe); the sun, the moon and the point lights that reach it (light_clusters.hlsli)
+//                   (rgb × Exposure, a = σe); the sun, the moon and the point lights that reach it (light_clusters.hlsli).
+//                   Beside it the froxel lamps, for the far rain and snow (precipitation_layers_cs.hlsl): the point
+//                   lights' share of that light (rgb) and how much of the open sky's, the sun's and the moon's light gets
+//                   to the place past walls, roofs, crowns, shadows and the terrain (a)
 //   CSFogIntegrate  one thread per column, front to back: the light the air adds between the camera and the far side of
 //                   each slice (× Exposure, rgb) and the transmittance (a)
 // Read by sky_common.fx AtmosphereFog through SceneConstants.FogVolumeIdx / FogVolumeRange.
@@ -31,6 +34,9 @@ cbuffer PushConstants : register(b3)
     uint ParticleEmittersIdx;
     uint ParticleChunkMapIdx;
     uint ParticleSlots;         // slots to walk
+    uint LampsUAVIdx;           // this frame's froxel lamps (written; 0 = none): rgb = the point lights' light per km ×
+                                // Exposure, a = the share of the open sky's, the sun's and the moon's light that gets here
+    uint LampsHistoryIdx;       // last frame's froxel lamps; 0 = none
 };
 
 cbuffer Params : register(b4)
@@ -322,8 +328,11 @@ float SmokeShadow(FroxelSmoke smoke, float3 relPos, float3 ray)
     return exp(-sigmaSum * (length(stepRay) * 0.001 / FOG_DENSITY_SCALE));
 }
 
+// `openLight`: the same light where nothing but the clouds stands between the place and the body and the whole sky is seen
+// (no walls, roofs, crowns, shadows or terrain): what the place's light is a share of
 float3 FroxelBodyLight(AtmosphereParams A, AtmMedium medium, FroxelSmoke smoke, bool moon, float3 posKm, float3 worldPos,
-                       float3 relPos, float3 V, float viewDepth, float3 lightDir, float open, float sky, float skyDimming)
+                       float3 relPos, float3 V, float viewDepth, float3 lightDir, float open, float sky, float skyDimming,
+                       out float3 openLight)
 {
     float3 toLight = AtmTransmittanceToLight(A, posKm, lightDir);
     float3 diffusedTint;
@@ -341,9 +350,10 @@ float3 FroxelBodyLight(AtmosphereParams A, AtmMedium medium, FroxelSmoke smoke, 
     float lightZenithCos = dot(normalize(posKm), lightDir);
     float3 single = medium.scatteringMie * AtmMiePhase(A.MieG, cosTheta) + medium.scatteringRay * AtmRayleighPhase(cosTheta)
                   + smoke.Scattering * SmokePhase(smoke.G, cosTheta);
-    float3 diffused = medium.scattering * diffusedTint * (CloudDiffusedLight(cloud.y, lightZenithCos) * sky);
+    float3 diffusedOpen = medium.scattering * diffusedTint * CloudDiffusedLight(cloud.y, lightZenithCos);
     float3 multiple = AtmMultipleScattering(A, posKm, lightZenithCos) * (medium.scattering * cloud.z);
-    return toLight * (visible * single + diffused) + multiple * sky;
+    openLight = toLight * (cloud.x * single + diffusedOpen) + multiple;
+    return toLight * (visible * single + diffusedOpen * sky) + multiple * sky;
 }
 
 // The point lights' light scattered toward the camera per km of air (lux × σs × phase, as a body's single scattering):
@@ -391,6 +401,11 @@ void CSFogScatter(uint3 id : SV_DispatchThreadID)
     if (AtmosphereIdx == 0)
     {
         output[id] = 0;
+        if (LampsUAVIdx != 0)
+        {
+            RWTexture3D<float4> lampsOut = ResourceDescriptorHeap[LampsUAVIdx];
+            lampsOut[id] = float4(0, 0, 0, 1);
+        }
         return;
     }
     AtmosphereParams A = LoadAtmosphere();
@@ -426,12 +441,23 @@ void CSFogScatter(uint3 id : SV_DispatchThreadID)
     float sky = open > 0.0 ? open * max(FogMeshSkyVisibility(A, worldPos), A.SkyCaptureBounce) : 0.0;
 
     float skyDimming = CloudSkyDimming(CloudDeck());      // Ψ_ms under the clouds round the camera
+    float3 sunOpen, moonOpen = 0;
     float3 L = A.SunIlluminance * FroxelBodyLight(A, medium, smoke, false, posKm, worldPos, relPos, V, viewDepth,
-                                                  A.SunDirection, open, sky, skyDimming);
+                                                  A.SunDirection, open, sky, skyDimming, sunOpen);
+    float3 openL = A.SunIlluminance * sunOpen;
     if (any(A.MoonIlluminance > 0))
+    {
         L += A.MoonIlluminance * FroxelBodyLight(A, medium, smoke, true, posKm, worldPos, relPos, V, viewDepth,
-                                                 A.MoonDirection, open, sky, skyDimming);
-    L += FroxelPointLights(A, medium, smoke, relPos, V, (float2(id.xy) + Jitter.xy) * TileUV, viewDepth);
+                                                 A.MoonDirection, open, sky, skyDimming, moonOpen);
+        openL += A.MoonIlluminance * moonOpen;
+    }
+    float3 lamps = FroxelPointLights(A, medium, smoke, relPos, V, (float2(id.xy) + Jitter.xy) * TileUV, viewDepth);
+    // The far rain and snow's light (precipitation_layers_cs.hlsl): the lamps', and the share of the open sky's, the
+    // sun's and the moon's light that gets here
+    float openLum = dot(openL, float3(0.2126, 0.7152, 0.0722));
+    float share = openLum > 0.0 ? saturate(dot(L, float3(0.2126, 0.7152, 0.0722)) / openLum) : 1.0;
+    float4 currentLamps = float4(min(lamps * Exposure, 6e4), share);
+    L += lamps;
     // Within half floats: dense fog right by a big fire would pass 65504 and turn the history to inf
     float4 current = float4(min(L * Exposure, 6e4), dot(medium.extinction, 1.0 / 3.0));
 
@@ -453,10 +479,23 @@ void CSFogScatter(uint3 id : SV_DispatchThreadID)
                 h.rgb *= ExposureRatio;
                 if (all(isfinite(h)))
                     current = lerp(current, h, HistoryWeight);
+                if (LampsHistoryIdx != 0)
+                {
+                    Texture3D<float4> lampsHistory = ResourceDescriptorHeap[LampsHistoryIdx];
+                    float4 hl = lampsHistory.SampleLevel(AtmosphereLinearClamp, uvw, 0);
+                    hl.rgb *= ExposureRatio;
+                    if (all(isfinite(hl)))
+                        currentLamps = lerp(currentLamps, hl, HistoryWeight);
+                }
             }
         }
     }
     output[id] = current;
+    if (LampsUAVIdx != 0)
+    {
+        RWTexture3D<float4> lampsOut = ResourceDescriptorHeap[LampsUAVIdx];
+        lampsOut[id] = currentLamps;
+    }
 }
 
 [numthreads(8, 8, 1)]
