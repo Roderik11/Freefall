@@ -144,6 +144,12 @@ void CSLayers(uint3 id : SV_DispatchThreadID)
     float3 dir = normalize(posFromDepth(uv, 1.0, CameraInverse).xyz);   // reverse Z: depth 1 = the near plane
     float viewZPerMetre = max(mul(float4(dir, 0.0), View).z, 1e-3);
     float az = atan2(dir.x, dir.z), el = asin(clamp(dir.y, -1.0, 1.0));
+    // Toward the zenith (and the nadir) the fields' cells pinch into thinner and thinner wedges round the pole and the
+    // lean folds them past ~72°: arcs and noise looking up (user, 2026-10-23). They fade out between 50° and 65°; the
+    // near particles, falling at the eye, are the rain seen from below
+    float poleFade = 1.0 - smoothstep(0.87, 1.13, abs(el));
+    if (poleFade <= 0.0)
+        return;
 
     WeatherShelter s;
     s.Levels = P.Shelter;
@@ -171,7 +177,7 @@ void CSLayers(uint3 id : SV_DispatchThreadID)
         float open = 1.0 - ShelterCoverAt(s, LinearClampS, place.xz, place.y);
         if (open <= 0.0)
             continue;
-        float fade = open * exp(-P.HazeKm * d * 0.001) * saturate((sceneZ - z) / 2.0);
+        float fade = open * poleFade * exp(-P.HazeKm * d * 0.001) * saturate((sceneZ - z) / 2.0);
         float rain = P.Rain > 0.0 ? LayerCoverage(az, el, d, P.Wind, k, false, P.Rain, P.PixelAngle) * fade : 0.0;
         float snow = P.Snow > 0.0 ? LayerCoverage(az, el, d, P.Wind, k, true, P.Snow, P.PixelAngle) * fade : 0.0;
         light += clear * (rain * rainLight + snow * snowLight);
