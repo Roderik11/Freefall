@@ -335,7 +335,11 @@ namespace Freefall.Audio
             var at = listener.Position;
             _candidates.Clear();
             for (int i = 0; i < _everywhere.Count; i++)
-                Consider(_everywhere[i], at);
+            {
+                var entry = _everywhere[i];
+                if (entry.Source.Shape == AudioShape.Around) entry.Position = at;
+                Consider(entry, at);
+            }
 
             for (int i = 0; i < _along.Count; i++)
             {
@@ -441,14 +445,15 @@ namespace Freefall.Audio
 
         // ---- Splines ----
 
-        // Where a source is heard from by a listener at a place: its own place, or the nearest of its line
+        // Where a source is heard from by a listener at a place: its own place, the nearest of its line, or the place itself
         private static Vector3 Where(Entry entry, Vector3 at)
-            => entry.Line != null ? Nearest(entry.Line, at) : entry.Source.Transform!.WorldPosition;
+            => entry.Source.Shape == AudioShape.Around ? at
+             : entry.Line != null ? Nearest(entry.Line, at) : entry.Source.Transform!.WorldPosition;
 
         // The line of a source along its entity's Spline, or its parent's; null for a point source or without a spline to follow
         private static Line? MakeLine(AudioSource source)
         {
-            if (source.Shape == AudioShape.Point) return null;
+            if (source.Shape != AudioShape.Along && source.Shape != AudioShape.Area) return null;
             var spline = source.Entity?.GetComponent<Spline>() ?? source.Transform?.Parent?.Entity?.GetComponent<Spline>();
             if (spline == null || spline.Points.Count < 2) return null;
 
@@ -631,7 +636,8 @@ namespace Freefall.Audio
             // listener inside an area), narrowing to one point at FalloffStart
             float away = Vector3.DistanceSquared(position, listener.Position);
             float full = MathF.Max(source.FalloffStart, 0.01f);
-            float spread = entry.Line != null && away < full * full ? 1f - MathF.Sqrt(away) / full : 0f;
+            float spread = source.Shape == AudioShape.Around ? 1f
+                         : entry.Line != null && away < full * full ? 1f - MathF.Sqrt(away) / full : 0f;
             float pitch = source.Pitch;
 
             if (spread < 1f)
@@ -688,9 +694,10 @@ namespace Freefall.Audio
 
         private static long CellOf(Vector3 p) => Key((int)MathF.Floor(p.X / CellSize), (int)MathF.Floor(p.Z / CellSize));
 
-        // Where a source belongs: along its spline, everywhere (no limit) or in the cell it is in
+        // Where a source belongs: along its spline, everywhere (no limit, or all around the listener) or in the cell it is in
         private static Home HomeOf(Entry entry)
-            => entry.Line != null ? Home.Along : entry.Source.HeardWithin <= 0f ? Home.Everywhere : Home.Cell;
+            => entry.Line != null ? Home.Along
+             : entry.Source.HeardWithin <= 0f || entry.Source.Shape == AudioShape.Around ? Home.Everywhere : Home.Cell;
 
         private void Insert(Entry entry)
         {

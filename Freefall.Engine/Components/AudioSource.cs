@@ -16,6 +16,9 @@ namespace Freefall.Components
 
         /// <summary>A closed spline: all around the listener inside it (a forest, a marsh), from its edge outside. An open one is heard as Along.</summary>
         Area = 2,
+
+        /// <summary>All around the listener wherever it is, the clip's own channels as they are: the rain, the weather. No place, no distance.</summary>
+        Around = 3,
     }
 
     /// <summary>
