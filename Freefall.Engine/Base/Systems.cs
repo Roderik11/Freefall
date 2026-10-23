@@ -25,6 +25,7 @@ namespace Freefall.Base
 
         private static readonly HashSet<Assembly> _assemblies = [];
         private static ConcurrentQueue<Assembly> _pending = new();
+        private static readonly List<ISceneGizmo> _gizmos = new();
 
         static Systems()
         {
@@ -33,6 +34,9 @@ namespace Freefall.Base
 
         public static T? Get<T>() where T : EntitySystem
             => _systems.TryGetValue(typeof(T), out var system) ? (T)system : null;
+
+        /// <summary>The systems that draw scene gizmos: the editor draws them every frame, whatever is selected.</summary>
+        public static IReadOnlyList<ISceneGizmo> Gizmos => _gizmos;
 
         /// <summary>Queue an assembly; its systems are created on the main thread before the next group update.</summary>
         public static void RegisterAssembly(Assembly assembly) => _pending.Enqueue(assembly);
@@ -56,6 +60,7 @@ namespace Freefall.Base
             {
                 system.Group?.Remove(system);
                 _systems.Remove(system.GetType());
+                if (system is ISceneGizmo gizmo) _gizmos.Remove(gizmo);
 
                 if (system is SystemGroup group)
                     orphans.AddRange(group.Systems);
@@ -127,6 +132,7 @@ namespace Freefall.Base
                         system.RunsInEditor = system is SystemGroup || type.IsDefined(typeof(UpdateInEditorAttribute), false);
                         _systems[type] = system;
                         created.Add(system);
+                        if (system is ISceneGizmo gizmo) _gizmos.Add(gizmo);
                     }
                     catch (Exception ex)
                     {

@@ -17,6 +17,8 @@ namespace Freefall.Editor
         private int _gizmoSlot;
         private bool _initialized;
         private System.Func<bool>? _isDragging;
+        // Weak: a system of a script assembly must not keep it loaded after a reload
+        private readonly System.Runtime.CompilerServices.ConditionalWeakTable<ISceneGizmo, object> _failed = new();
 
         /// <summary>
         /// The shared GizmoContext. Components draw into this during DrawGizmos.
@@ -86,6 +88,19 @@ namespace Freefall.Editor
                         gizmo.DrawGizmos(_ctx);
                         hasGizmos = true;
                     }
+                }
+            }
+
+            // Systems draw every frame whatever is selected (markers over many things), in world space.
+            // One that throws is a script's: logged once, not every frame.
+            foreach (var gizmo in Systems.Gizmos)
+            {
+                _ctx.Matrix = System.Numerics.Matrix4x4.Identity;
+                try { gizmo.DrawGizmos(_ctx); }
+                catch (System.Exception ex)
+                {
+                    if (_failed.TryAdd(gizmo, string.Empty))
+                        Debug.LogWarning("Gizmos", $"{gizmo.GetType().Name}.DrawGizmos threw: {ex.Message}");
                 }
             }
 
