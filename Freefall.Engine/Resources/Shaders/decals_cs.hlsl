@@ -537,11 +537,13 @@ void ApplyWeather(DecalFrame f, float3 rel, float3 geo, uint surfaceClass, float
     float vegetation = s.Data.a < 0.75 ? 1.0 : 0.0;
     // How far this pixel stands up from its surface, 0..1: the linear depth's height bias (gbuffer.fx, gputerrain.fx)
     // over the terrain layers' 5 cm or a mesh's ~1 cm, from the floor of a puddle's hollow where one sank it. Snow lies
-    // on the high spots first, the rain stands in the low ones; the hollows themselves (2 cm deep and more) fill with
-    // snow before anything: it drifts into them
+    // on the high spots first, the rain stands in the low ones; a hollow (0..1 over 5 cm of dent) gathers a little more
+    // of it, its middle first, a little ahead of the ground round it. Saturated at 2 cm with a head start of 0.7 the
+    // whole bowl went white at a cover of 0.2 while the street was still bare (user, 2026-10-23: "the puddles fill up
+    // with snow too fast")
     float linearDepth = dot(rel, f.CameraForward);
     float relief = saturate(max(linearDepth - s.Depth + s.Dent, 0.0) / ReliefScale(surfaceClass));
-    float hollow = saturate(s.Dent / 0.02);
+    float hollow = saturate(s.Dent / 0.05);
     float footprint = linearDepth / f.PixelsPerMetre;   // metres a pixel spans
 
     // Snow: thin, it lies on the surface's high spots first (the stones' tops, pebbles, clods: their relief, which the
@@ -555,7 +557,7 @@ void ApplyWeather(DecalFrame f, float3 rel, float3 geo, uint surfaceClass, float
         float up = smoothstep(0.35, 0.85, lerp(N.y, geo.y, cover)) * smoothstep(0.2, 0.6, geo.y);
         float drift = SnowNoise(world.xz * 0.35);
         float t = 1.0 - cover;
-        snow = smoothstep(t - 0.06, t + 0.06, up * (0.1 + 0.5 * relief + 0.4 * drift + 0.7 * hollow)) * saturate(up * 3.0);
+        snow = smoothstep(t - 0.06, t + 0.06, up * (0.1 + 0.5 * relief + 0.4 * drift + 0.2 * hollow)) * saturate(up * 3.0);
     }
 
     float facing = geo.y >= 0.0 ? lerp(0.35, 1.0, geo.y) : saturate(0.35 + geo.y);
@@ -597,8 +599,8 @@ void ApplyWeather(DecalFrame f, float3 rel, float3 geo, uint surfaceClass, float
         // A thin dusting lets the ground show through; deep snow is its own surface, smooth over the stones' relief
         // (their normals, AO and displacement buried under it). Thin, it lies on the relief and keeps it.
         // (deeper sooner in a hollow, the snow drifted into it)
-        float dust = snow * lerp(0.45, 1.0, smoothstep(0.0, 0.6, cover + 0.4 * hollow));
-        float buried = snow * smoothstep(0.3, 0.9, cover + 0.4 * hollow);
+        float dust = snow * lerp(0.45, 1.0, smoothstep(0.0, 0.6, cover + 0.1 * hollow));
+        float buried = snow * smoothstep(0.3, 0.9, cover + 0.1 * hollow);
         s.Albedo.rgb = lerp(s.Albedo.rgb, SNOW_ALBEDO, dust);
         s.Data.rgb = lerp(s.Data.rgb, float3(SNOW_ROUGHNESS, 0.0, lerp(s.Data.b, 1.0, buried)), dust);
         // Deep snow's own surface (drifts, ripples, grain, a few glinting crystals)
