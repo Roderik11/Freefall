@@ -48,8 +48,14 @@ namespace Freefall.Components
         [Description("Emitter scaled by the hail in a storm cell's core (Weather.Hail)")]
         public ParticleEmitter HailEmitter;
 
-        [Description("Emitter scaled by the rain as RainEmitter is, kept at the camera (not raised): the splashes where it lands (shape Ground)")]
+        [Description("The splashes where the rain lands (shape Ground), kept at the camera (not raised). Its rate follows " +
+                     "RainEmitter's drops striking its square (SplashShare of them); its own EmitRate is the most it makes")]
         public ParticleEmitter SplashEmitter;
+
+        [Description("Of the rain emitter's drops striking the ground, the share that makes a visible splash (0.036: one in " +
+                     "27, Eldermoor's 30000 drops a second over 24 × 24 m against 3000 splashes over 40 × 40 m)")]
+        [ValueRange(0f, 0.2f)]
+        public float SplashShare = 0.036f;
 
         [Description("Emitter scaled by DustIntensity")]
         public ParticleEmitter DustEmitter;
@@ -210,6 +216,15 @@ namespace Freefall.Components
                 Graphics.Weather.SnowFallSpeed = FallSpeed(SnowEmitter);
             }
             DriveEmitter(ref _lastSplash, SplashEmitter, Graphics.Weather.Rain, wind, camPos, 0f);
+            // The splashes as many as the drops striking their square make (the rain emitter's flux, density × fall speed,
+            // × the square's area × SplashShare); at most the splash emitter's EmitRate, which sizes its particle slots
+            if (SplashEmitter != null && RainEmitter != null)
+            {
+                float flux = Graphics.Weather.RainDensity * Graphics.Weather.RainFallSpeed;
+                float area = 4f * SplashEmitter.ShapeExtents.X * SplashEmitter.ShapeExtents.Z;
+                float rate = flux * area * SplashShare * MathF.Max(0f, Graphics.Weather.Rain);
+                SplashEmitter.EmitRateScale = Math.Clamp(rate / MathF.Max(SplashEmitter.EmitRate, 1e-3f), 0f, 1f);
+            }
             // Dust: park it on the terrain under the camera (or a body height below the camera when
             // there is no terrain) so sheets of sand skim the ground instead of floating at eye level.
             _terrain ??= EntityManager.FindComponent<TerrainRenderer>();
