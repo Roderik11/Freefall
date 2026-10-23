@@ -184,14 +184,14 @@ namespace Freefall.Base
 
         // ── Crowd Management (internal, used by NavMeshAgent) ──
 
-        /// <summary>Register an agent with the crowd.</summary>
+        /// <summary>
+        /// Register an agent with the crowd. Not logged: an NPC that sleeps far from every viewer leaves the crowd and
+        /// joins again each time it wakes (NavMeshAgent.OnEnabledChanged).
+        /// </summary>
         internal static DtCrowdAgent? AddCrowdAgent(Vector3 position, DtCrowdAgentParams agentParams)
         {
             if (_crowd == null) return null;
-
-            var agent = _crowd.AddAgent(ToRc(position), agentParams);
-            Debug.Log($"[NavMeshWorld] AddCrowdAgent: idx={agent?.idx}, state={agent?.state}, pos={position}");
-            return agent;
+            return _crowd.AddAgent(ToRc(position), agentParams);
         }
 
         /// <summary>Remove an agent from the crowd.</summary>

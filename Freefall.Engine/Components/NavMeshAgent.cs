@@ -117,6 +117,27 @@ namespace Freefall.Components
 
         public override void Destroy()
         {
+            LeaveCrowd();
+        }
+
+        /// <summary>
+        /// Disabled (a body put away in a PrefabPool), it leaves the crowd, which would steer it on and steer others
+        /// round it; enabled again it joins at the place it is then, in its next update.
+        /// </summary>
+        protected override void OnEnabledChanged()
+        {
+            if (!Enabled)
+            {
+                LeaveCrowd();
+                HasPath = false;
+                IsMoving = false;
+                Velocity = Vector3.Zero;
+                _destinationPending = false;
+            }
+        }
+
+        private void LeaveCrowd()
+        {
             if (_crowdAgent != null)
             {
                 NavMeshWorld.RemoveCrowdAgent(_crowdAgent);

@@ -675,7 +675,7 @@ namespace Freefall
          /// pixel spans one of the cascade's texels, never finer than the camera's LOD and never culled
          /// (cull_instances.hlsl CascadeLodSteps). Off = every cascade draws the camera's LOD. Since 2026-10-23.
          /// </summary>
-         public bool ShadowLodPerCascade { get; set; } = true;
+         public bool ShadowLodPerCascade { get; set; } = false;
          public bool UseAdaptiveSplits { get; set; } = true;                // F4 - SDSM adaptive cascade splits
 
          /// <summary>

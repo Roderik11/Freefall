@@ -33,7 +33,8 @@
     <PackageReference Include="Vortice.XAudio2" Version="3.8.2" />
     <PackageReference Include="NVorbis" Version="0.10.5" />
     <PackageReference Include="LiteYaml" Version="0.1.1" />
-    <PackageReference Include="PhysX.Net" Version="5.0.1-alpha1" GeneratePathProperty="true" />
+    <!-- Built here in Release (ThirdParty/nuget, nuget.config): nuget.org's 5.0.1-alpha1 is a debug build -->
+    <PackageReference Include="PhysX.Net" Version="5.0.1-release1" GeneratePathProperty="true" />
   </ItemGroup>
 
   <ItemGroup>

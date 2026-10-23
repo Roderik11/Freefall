@@ -900,6 +900,24 @@ namespace Freefall.Components
             _boneBuffers.Clear();
         }
 
+        /// <summary>
+        /// Give the bone buffers back until the next pose makes them again: three committed upload
+        /// buffers per skeleton, 64 KB each however few its bones (NPC_POPULATION_PLAN P1), for a
+        /// character that sleeps far from every viewer. Its renderers must be disabled meanwhile, and
+        /// the next pose is made at once whatever the character's size on screen. Main thread, outside
+        /// the AnimatorSystem's update.
+        /// </summary>
+        public void ReleaseBuffers()
+        {
+            if (_boneBuffers.Count == 0) return;
+            foreach (var entry in _boneBuffers.Values)
+                Engine.Device.DeferDispose(entry.Buffer);
+            _boneBuffers.Clear();
+            foreach (var part in _parts)
+                if (!part.IsDestroyed) part.BoneBufferIdx = 0;
+            PosedFrame = -1;
+        }
+
         // --- Retargeting ---
 
         private void InitRetargeting()

@@ -222,17 +222,20 @@ namespace Freefall.Base
                 // What one throws is reported and the rest still update (CallbackErrors). The outer catch is for the
                 // list itself: a component that destroys its own entity in Update changes it under the foreach, and
                 // the rest of this type then waits for the next frame.
+                // A disabled component does not update (a body put away in a PrefabPool, NPC_POPULATION_PLAN)
                 try
                 {
                     if (IsParallel)
                         Parallel.ForEach(UpdateList.Collection, comp =>
                         {
+                            if (comp is Component { Enabled: false }) return;
                             try { comp.Update(); }
                             catch (Exception e) { CallbackErrors.Report(comp, nameof(IUpdate.Update), e); }
                         });
                     else
                         foreach (var comp in UpdateList.Collection)
                         {
+                            if (comp is Component { Enabled: false }) continue;
                             try { comp.Update(); }
                             catch (Exception e) { CallbackErrors.Report(comp, nameof(IUpdate.Update), e); }
                         }
@@ -251,12 +254,14 @@ namespace Freefall.Base
                 if (IsParallel)
                     Parallel.ForEach(DrawList.Collection, comp =>
                     {
+                        if (comp is Component { Enabled: false }) return;
                         try { comp.Draw(); }
                         catch (Exception e) { CallbackErrors.Report(comp, nameof(IDraw.Draw), e); }
                     });
                 else
                     foreach (var comp in DrawList.Collection)
                     {
+                        if (comp is Component { Enabled: false }) continue;
                         try { comp.Draw(); }
                         catch (Exception e) { CallbackErrors.Report(comp, nameof(IDraw.Draw), e); }
                     }

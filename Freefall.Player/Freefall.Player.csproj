@@ -23,7 +23,7 @@
 
   <ItemGroup>
     <PackageReference Include="Vortice.WinForms" Version="3.8.2" />
-    <PackageReference Include="PhysX.Net" Version="5.0.1-alpha1" GeneratePathProperty="true" />
+    <PackageReference Include="PhysX.Net" Version="5.0.1-release1" GeneratePathProperty="true" />
   </ItemGroup>
 
   <!-- PhysX's native DLLs next to the exe, as for the editor -->
