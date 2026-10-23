@@ -220,11 +220,37 @@ PSOutput PS(VSOutput input)
 struct ShadowVSOutput
 {
     float4 Position : SV_POSITION;
-    float2 TexCoord : TEXCOORD0;
+    float2 TexCoord : TEXCOORD0;            // a card laid flat (TopDown): where in its square, -1..1 both ways
     nointerpolation uint MaterialID : TEXCOORD1;
+    nointerpolation uint TopDown : TEXCOORD2;
     nointerpolation uint RTIndex : SV_RenderTargetArrayIndex;
     float4 ClipDistance : SV_ClipDistance0;
 };
+
+// Seen straight down (the cover map, ShelterMap; the sky captures' top-down slice) the cards are vertical and have no
+// area: a far tree kept neither the snow nor the rain off the ground under it. There each card is laid flat at the
+// crown's top as a square as wide as the card, and PS_Shadow keeps a disc of it, CROSS_CROWN_REACH of its half width
+// (the crown at its widest; the side view does not say more). A part's bounds are its box's centre and half diagonal
+// (ModelImporter), so a corner's height off the centre is half the card's height
+#define CROSS_CROWN_REACH 0.75
+
+bool StraightDown(row_major float4x4 vp)
+{
+    // The world's up moves nothing across the view, only in depth
+    return abs(vp._21) + abs(vp._22) < 1e-4 * (abs(vp._11) + abs(vp._12) + abs(vp._31) + abs(vp._32));
+}
+
+// A card's corner (mesh-local) laid flat: its position, and where it lies in the card's square (-1..1 both ways)
+float3 LayCardFlat(float3 pos, float3 centre, out float2 square)
+{
+    float2 along = pos.xz - centre.xz;                       // half the card's width, along it
+    float halfWidth = max(length(along), 1e-4);
+    float2 dir = along / halfWidth;
+    float2 axis = dir.x > 0.01 || (dir.x >= -0.01 && dir.y > 0.0) ? dir : -dir;   // the same at both ends
+    float side = pos.y > centre.y ? 1.0 : -1.0;              // the top edge to one side, the foot to the other
+    square = float2(dot(dir, axis), side);
+    return float3(pos.x - axis.y * side * halfWidth, centre.y + abs(pos.y - centre.y), pos.z + axis.x * side * halfWidth);
+}
 
 // Sun cascades, or point light cube faces when local
 ShadowVSOutput ShadowVertex(uint primitiveVertexID, uint instanceID, bool local)
@@ -233,6 +259,7 @@ ShadowVSOutput ShadowVertex(uint primitiveVertexID, uint instanceID, bool local)
     output.Position = float4(0, 0, 0, 1);
     output.TexCoord = float2(0, 0);
     output.MaterialID = 0;
+    output.TopDown = 0;
     output.RTIndex = 0;
 
     StructuredBuffer<uint> expansion = ResourceDescriptorHeap[ExpansionBufferIdx];
@@ -254,6 +281,17 @@ ShadowVSOutput ShadowVertex(uint primitiveVertexID, uint instanceID, bool local)
     row_major matrix World = globalTransforms[desc.TransformSlot];
 
     float3 pos = positions[vertexID];
+    output.TexCoord = uvs[vertexID];
+    output.TexCoord.y = 1 - output.TexCoord.y;
+    if (!local)
+    {
+        StructuredBuffer<CascadeData> cascades = ResourceDescriptorHeap[CascadeBufferSRVIdx];
+        if (StraightDown(cascades[view].VP))
+        {
+            pos = LayCardFlat(pos, part.LocalBounds.xyz, output.TexCoord);
+            output.TopDown = 1;
+        }
+    }
     float4 worldPos = mul(float4(pos, 1.0f), World);
 
     // Match trunk sway from VS
@@ -261,8 +299,6 @@ ShadowVSOutput ShadowVertex(uint primitiveVertexID, uint instanceID, bool local)
     worldPos.xyz += TreeSway(worldPos.xyz, float3(World._41, World._42, World._43));
 
     output.Position = ShadowClipPosition(worldPos, view, local, CascadeBufferSRVIdx, output.RTIndex, output.ClipDistance);
-    output.TexCoord = uvs[vertexID];
-    output.TexCoord.y = 1 - output.TexCoord.y;
     output.MaterialID = desc.MaterialId;
     return output;
 }
@@ -279,6 +315,12 @@ ShadowVSOutput VS_LocalShadow(uint primitiveVertexID : SV_VertexID, uint instanc
 
 void PS_Shadow(ShadowVSOutput input)
 {
+    if (input.TopDown != 0)
+    {
+        if (dot(input.TexCoord, input.TexCoord) > CROSS_CROWN_REACH * CROSS_CROWN_REACH)
+            discard;
+        return;
+    }
     MaterialData mat = GET_MATERIAL(input.MaterialID);
     Texture2D albedoTex = ResourceDescriptorHeap[NonUniformResourceIndex(mat.AlbedoIdx)];
     float alpha = albedoTex.Sample(Sampler, input.TexCoord).a;

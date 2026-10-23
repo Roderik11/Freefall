@@ -522,7 +522,9 @@ float SurfaceOpenness(DecalFrame f, float3 rel, float3 geo, uint surfaceClass, f
     s.Eye = f.ShelterEye;
     s.MinY = f.ShelterMinY;
     s.RangeY = f.ShelterRangeY;
-    s.TerrainHeightmap = f.TerrainHeightmap;
+    // The terrain's own pixels are the height field: it cannot cover them, and far off its coarse LODs lie under the
+    // height map, which counted as cover and left the far slopes bare in streaks (2026-10-23)
+    s.TerrainHeightmap = surfaceClass == 1u ? 0u : f.TerrainHeightmap;
     s.TerrainMaxHeight = f.TerrainMaxHeight;
     s.TerrainOrigin = f.TerrainOrigin;
     s.TerrainSize = f.TerrainSize;
