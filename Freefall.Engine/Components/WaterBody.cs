@@ -97,6 +97,14 @@ namespace Freefall.Components
         /// <summary>Cross-sections per spline span, and quads across the width, of a river's surface.</summary>
         private const int SegmentsPerSpan = 12;
         private const int Columns = 8;
+
+        /// <summary>
+        /// The surface is drawn as parts about this many metres across (a river's run of cross-sections, a lake's grid
+        /// cell), each with its own bounds. Water reads the sun's shadow but draws after it, so the shadow receivers mark
+        /// every tile under each part's sphere the camera saw (ShadowReceivers CSReceiverSpheres): as one part, a river's
+        /// sphere (Greyfell Beck: 210 m) covered the near cascades 320 m away and nothing was culled there (2026-10-23).
+        /// </summary>
+        private const float ChunkSize = 32f;
         private OceanRenderer? _ocean;
         private DirectionalLight? _sunLight;
 
@@ -522,8 +530,19 @@ namespace Freefall.Components
                 }
             }
 
+            // A part per ChunkSize metres along the river (the parts share the cross-section where they meet)
+            var parts = new List<MeshPart>();
+            int partStart = 0;
+            float partFrom = 0f;
             for (int i = 0; i < n - 1; i++)
             {
+                if (strip.ArcLengths[i] - partFrom >= ChunkSize && indices.Count > partStart)
+                {
+                    parts.Add(SurfacePart(partStart, indices.Count - partStart));
+                    partStart = indices.Count;
+                    partFrom = strip.ArcLengths[i];
+                }
+
                 for (int c = 0; c < Columns; c++)
                 {
                     uint bl = (uint)(i * (Columns + 1) + c);
@@ -535,11 +554,13 @@ namespace Freefall.Components
                     indices.Add(br); indices.Add(tr); indices.Add(tl);
                 }
             }
+            if (indices.Count > partStart)
+                parts.Add(SurfacePart(partStart, indices.Count - partStart));
 
             _surfacePoints = verts.ToArray();
             _surfaceSteep = flow.ConvertAll(f => f.Y).ToArray();
             _surfaceTriangles = indices.ConvertAll(i => (int)i).ToArray();
-            return BuildSurface(verts, flow, uvs, indices);
+            return BuildSurface(verts, flow, uvs, indices, parts);
         }
 
         /// <summary>The spline's outline, grown by Expand, filled and lifted by Depth.</summary>
@@ -593,16 +614,103 @@ namespace Freefall.Components
             for (int i = triangles.Count - 1; i >= 0; i--)   // reversed: faces up
                 indices.Add((uint)triangles[i]);
 
+            // The ice and the shore field take the outline's triangles as they are
             _surfacePoints = verts.ToArray();
             _surfaceSteep = new float[verts.Count];
             _surfaceTriangles = indices.ConvertAll(i => (int)i).ToArray();
-            return BuildSurface(verts, normals, uvs, indices);
+
+            // The drawn surface: the ear clipping's slivers reach across the whole lake, so split them into triangles no
+            // edge of which is longer than half a chunk (the same planes, so the same surface), then one part per grid cell
+            SplitLongEdges(verts, normals, uvs, indices, ChunkSize * 0.5f);
+            var cells = new Dictionary<(int, int), List<uint>>();
+            for (int t = 0; t + 2 < indices.Count; t += 3)
+            {
+                var centre = (verts[(int)indices[t]] + verts[(int)indices[t + 1]] + verts[(int)indices[t + 2]]) / 3f;
+                var cell = ((int)MathF.Floor(centre.X / ChunkSize), (int)MathF.Floor(centre.Z / ChunkSize));
+                if (!cells.TryGetValue(cell, out var list))
+                    cells[cell] = list = new List<uint>();
+                list.Add(indices[t]); list.Add(indices[t + 1]); list.Add(indices[t + 2]);
+            }
+            var grouped = new List<uint>(indices.Count);
+            var parts = new List<MeshPart>(cells.Count);
+            foreach (var list in cells.Values)
+            {
+                parts.Add(SurfacePart(grouped.Count, list.Count));
+                grouped.AddRange(list);
+            }
+            return BuildSurface(verts, normals, uvs, grouped, parts);
         }
 
-        private static Mesh BuildSurface(List<Vector3> verts, List<Vector3> normals, List<Vector2> uvs, List<uint> indices)
+        private static MeshPart SurfacePart(int baseIndex, int count) =>
+            new MeshPart { Name = "Surface", BaseIndex = baseIndex, NumIndices = count, MaterialSlot = 0 };
+
+        private static Mesh BuildSurface(List<Vector3> verts, List<Vector3> normals, List<Vector2> uvs, List<uint> indices,
+            List<MeshPart> parts)
         {
-            var parts = new List<MeshPart> { new MeshPart { Name = "Surface", NumIndices = indices.Count, MaterialSlot = 0 } };
-            return RuntimeMesh.BuildMesh(verts, normals, uvs, indices, parts, "WaterBody_");
+            return RuntimeMesh.BuildMesh(verts, normals, uvs, indices, parts, "WaterBody_", boundsPerPart: true);
+        }
+
+        // Splits every edge longer than maxEdge at its middle until none is, each edge once for both its triangles (so
+        // no cracks open between neighbours): a triangle with one, two or three split edges becomes two, three or four.
+        // The new points lie on the old triangles' planes, their normals and UVs the middles of the ends'.
+        private static void SplitLongEdges(List<Vector3> verts, List<Vector3> normals, List<Vector2> uvs, List<uint> indices,
+            float maxEdge)
+        {
+            float maxSq = maxEdge * maxEdge;
+            for (int pass = 0; pass < 16; pass++)
+            {
+                var middles = new Dictionary<(uint, uint), uint>();
+                uint Middle(uint a, uint b)
+                {
+                    var key = a < b ? (a, b) : (b, a);
+                    if (Vector3.DistanceSquared(verts[(int)a], verts[(int)b]) <= maxSq) return uint.MaxValue;
+                    if (!middles.TryGetValue(key, out uint m))
+                    {
+                        m = (uint)verts.Count;
+                        verts.Add((verts[(int)a] + verts[(int)b]) * 0.5f);
+                        normals.Add(Vector3.Normalize(normals[(int)a] + normals[(int)b]));
+                        uvs.Add((uvs[(int)a] + uvs[(int)b]) * 0.5f);
+                        middles[key] = m;
+                    }
+                    return m;
+                }
+
+                var next = new List<uint>(indices.Count * 2);
+                for (int t = 0; t + 2 < indices.Count; t += 3)
+                {
+                    uint a = indices[t], b = indices[t + 1], c = indices[t + 2];
+                    uint ab = Middle(a, b), bc = Middle(b, c), ca = Middle(c, a);
+                    int split = (ab != uint.MaxValue ? 1 : 0) + (bc != uint.MaxValue ? 1 : 0) + (ca != uint.MaxValue ? 1 : 0);
+                    if (split == 0) { next.Add(a); next.Add(b); next.Add(c); continue; }
+                    if (split == 3)
+                    {
+                        next.AddRange(new[] { a, ab, ca, ab, b, bc, ca, bc, c, ab, bc, ca });
+                        continue;
+                    }
+                    // One or two split edges: turn the triangle so the first split edge is a-b, then fan from its middle
+                    while (ab == uint.MaxValue)
+                    {
+                        (a, b, c) = (b, c, a);
+                        (ab, bc, ca) = (bc, ca, ab);
+                    }
+                    if (split == 1)
+                    {
+                        next.AddRange(new[] { a, ab, c, ab, b, c });
+                    }
+                    else if (bc != uint.MaxValue)
+                    {
+                        next.AddRange(new[] { a, ab, c, ab, bc, c, ab, b, bc });
+                    }
+                    else
+                    {
+                        next.AddRange(new[] { a, ab, ca, ab, b, c, ab, c, ca });
+                    }
+                }
+                bool changed = middles.Count > 0;
+                indices.Clear();
+                indices.AddRange(next);
+                if (!changed) break;
+            }
         }
 
         public void Draw()

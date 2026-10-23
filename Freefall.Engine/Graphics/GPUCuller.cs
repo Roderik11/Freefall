@@ -31,7 +31,7 @@ namespace Freefall.Graphics
         private int _localScanKernel, _blockScanKernel, _globalScatterKernel;
         private int _bitonicSortKernel, _sortIndirectionKernel, _mainKernel;
         private int _visibilityShadowKernel, _visibilityCascadesKernel;
-        private int _expandCascadesKernel, _patchExpandedKernel, _compactCommandsKernel;
+        private int _histogramCascadesKernel, _scatterCascadesKernel, _compactCommandsKernel;
         private int _computeDepthKeysKernel, _bitonicSortPairsKernel, _writeSortedIndicesKernel;
         private int _visibilityLocalShadowsKernel, _histogramLocalShadowsKernel, _scatterLocalShadowsKernel;
         
@@ -109,8 +109,8 @@ namespace Freefall.Graphics
         public ID3D12PipelineState? ClearPSO => _cullShader?.GetPSO(_clearKernel);
         public ID3D12PipelineState? VisibilityShadowPSO => _cullShader?.GetPSO(_visibilityShadowKernel);
         public ID3D12PipelineState? VisibilityCascadesPSO => _cullShader?.GetPSO(_visibilityCascadesKernel);
-        public ID3D12PipelineState? ExpandCascadesPSO => _cullShader?.GetPSO(_expandCascadesKernel);
-        public ID3D12PipelineState? PatchExpandedPSO => _cullShader?.GetPSO(_patchExpandedKernel);
+        public ID3D12PipelineState? HistogramCascadesPSO => _cullShader?.GetPSO(_histogramCascadesKernel);
+        public ID3D12PipelineState? ScatterCascadesPSO => _cullShader?.GetPSO(_scatterCascadesKernel);
         public ID3D12PipelineState? CompactCommandsPSO => _cullShader?.GetPSO(_compactCommandsKernel);
         public ID3D12PipelineState? ComputeDepthKeysPSO => _cullShader?.GetPSO(_computeDepthKeysKernel);
         public ID3D12PipelineState? BitonicSortPairsPSO => _cullShader?.GetPSO(_bitonicSortPairsKernel);
@@ -274,8 +274,8 @@ namespace Freefall.Graphics
             _mainKernel = _cullShader.FindKernel("CSMain");
             _visibilityShadowKernel = _cullShader.FindKernel("CSVisibilityShadow");
             _visibilityCascadesKernel = _cullShader.FindKernel("CSVisibilityCascades");
-            _expandCascadesKernel = _cullShader.FindKernel("CSExpandCascades");
-            _patchExpandedKernel = _cullShader.FindKernel("CSPatchExpandedCounts");
+            _histogramCascadesKernel = _cullShader.FindKernel("CSHistogramCascades");
+            _scatterCascadesKernel = _cullShader.FindKernel("CSScatterCascades");
             _compactCommandsKernel = _cullShader.FindKernel("CSCompactCommands");
             _computeDepthKeysKernel = _cullShader.FindKernel("CSComputeDepthKeys");
             _bitonicSortPairsKernel = _cullShader.FindKernel("CSBitonicSortPairs");

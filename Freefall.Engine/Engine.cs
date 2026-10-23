@@ -669,6 +669,13 @@ namespace Freefall
          /// cascades; Count = the receiver pass only counts them (engine_stats: sunShadowReceivers).
          /// </summary>
          public ShadowReceiverCulling ShadowReceiverCulling { get; set; } = ShadowReceiverCulling.On;
+
+         /// <summary>
+         /// Each sun cascade draws a caster at the detail the camera would draw it at from the distance where one screen
+         /// pixel spans one of the cascade's texels, never finer than the camera's LOD and never culled
+         /// (cull_instances.hlsl CascadeLodSteps). Off = every cascade draws the camera's LOD. Since 2026-10-23.
+         /// </summary>
+         public bool ShadowLodPerCascade { get; set; } = true;
          public bool UseAdaptiveSplits { get; set; } = true;                // F4 - SDSM adaptive cascade splits
 
          /// <summary>

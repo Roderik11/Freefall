@@ -1300,8 +1300,10 @@ namespace Freefall.Graphics
 
         /// <summary>
         /// Culls all shadow cascades for all batches, stage by stage (see Cull): CSVisibilityCascades writes the combined
-        /// visibility (union) and a cascade mask per instance, one compaction runs on the union, CSExpandCascades
-        /// expands it by the masks, and the non-empty commands are packed into each batch's opaque command buffer.
+        /// visibility and a cascade mask per instance (with each cascade's LOD steps: EngineSettings.ShadowLodPerCascade),
+        /// CSHistogramCascades counts every (instance, cascade) entry under the part that cascade draws, the prefix sum
+        /// places the parts, CSScatterCascades writes the entries, CSMain makes the commands at fixed part indices, and
+        /// the non-empty ones are packed into each batch's opaque command buffer (and its indexed commands).
         /// </summary>
         /// <param name="cascadeCount">The views in the cascade buffer to cull against (at most DirectionalLight.MaxCascades).</param>
         /// <param name="minCasterClip">Cascades 1+: smallest caster diameter in clip units (EngineSettings.ShadowMinCasterTexels * 2 / resolution; 0 = off; negative: -minCasterClip for every view).</param>
@@ -1310,7 +1312,8 @@ namespace Freefall.Graphics
             uint cascadeBufferSrv, ulong cascadeBufferGpuAddress, uint shadowHiZSrv, GPUCuller? culler, int cascadeCount,
             float minCasterClip = 0f, uint? receiversUav = null)
         {
-            if (culler?.VisibilityCascadesPSO == null || culler.MainPSO == null || culler.HistogramPSO == null) return;
+            if (culler?.VisibilityCascadesPSO == null || culler.MainPSO == null || culler.HistogramCascadesPSO == null
+                || culler.ScatterCascadesPSO == null || culler.HistogramPrefixSumPSO == null) return;
 
             _stageBatches.Clear();
             foreach (var batch in batches)
@@ -1334,33 +1337,23 @@ namespace Freefall.Graphics
             StageBarrier(list);
             PixMarker.End(list);
 
-            // One compaction of the union of the cascades
+            // The (instance, cascade) entries, each under the part its cascade draws, written straight into the
+            // expansion buffer as the point light chain does
             PixMarker.Begin(list, "Compaction");
-            DispatchStage(list, culler.HistogramPSO, StageItems.Instances, 64);
+            DispatchStage(list, culler.HistogramCascadesPSO, StageItems.Instances, 64);
             StageBarrier(list);
             DispatchStage(list, culler.HistogramPrefixSumPSO, StageItems.OneGroup);
             StageBarrier(list);
-            DispatchStage(list, culler.GlobalScatterPSO, StageItems.Instances, 256);
+            DispatchStage(list, culler.ScatterCascadesPSO, StageItems.Instances, 256);
             StageBarrier(list);
             PixMarker.End(list);
 
-            // Commands at fixed part indices (DrawCountUAVIdx = 0)
+            // Commands at fixed part indices (DrawCountUAVIdx = 0), base and count already in entries
             PixMarker.Begin(list, "Commands");
             DispatchStage(list, culler.MainPSO, StageItems.Parts, 64);
             StageBarrier(list);
             PixMarker.End(list);
-
-            // Expand the compacted instances by their cascade masks; the counters count the appends again
-            PixMarker.Begin(list, "Cascade expansion");
             int f = Engine.FrameIndex % FrameCount;
-            foreach (var batch in _stageBatches)
-                batch.ClearUav(list, batch.shadowCounterClearIndices[f], batch.shadowCounterCPUHandles[f], batch.shadowCounterBuffers[f]);
-            StageBarrier(list);
-            DispatchStage(list, culler.ExpandCascadesPSO, StageItems.Instances, 256);
-            StageBarrier(list);
-            DispatchStage(list, culler.PatchExpandedPSO, StageItems.Parts, 64);
-            StageBarrier(list);
-            PixMarker.End(list);
 
             // Pack the non-empty commands into the opaque command buffer (separate source and destination), and for
             // the batches that draw indexed into their indexed commands too (IndexedCommandsIdx)

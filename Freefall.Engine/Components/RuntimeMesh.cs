@@ -803,8 +803,11 @@ namespace Freefall.Components
         // ── Mesh Construction ──
         // ═══════════════════════════════════════
 
+        /// <param name="boundsPerPart">Bound each part by the vertices its indices reach (WaterBody's chunks: the culling
+        /// and the shadow receivers test each part's sphere); false = every part gets the whole mesh's bounds.</param>
         internal static Mesh BuildMesh(List<Vector3> verts, List<Vector3> norms,
-            List<Vector2> uvs, List<uint> indices, List<MeshPart> parts, string namePrefix = "RuntimeMesh_")
+            List<Vector2> uvs, List<uint> indices, List<MeshPart> parts, string namePrefix = "RuntimeMesh_",
+            bool boundsPerPart = false)
         {
             if (verts.Count == 0 || indices.Count == 0) return null;
 
@@ -819,12 +822,39 @@ namespace Freefall.Components
 
             foreach (var part in parts)
             {
-                part.BoundingBox = mesh.BoundingBox;
-                part.BoundingSphere = mesh.LocalBoundingSphere;
+                if (boundsPerPart)
+                    SetPartBounds(part, verts, indices);
+                else
+                {
+                    part.BoundingBox = mesh.BoundingBox;
+                    part.BoundingSphere = mesh.LocalBoundingSphere;
+                }
                 mesh.MeshParts.Add(part);
             }
 
             return mesh;
+        }
+
+        // The part's box over the vertices its indices reach, and the sphere about the box's centre that holds them
+        private static void SetPartBounds(MeshPart part, List<Vector3> verts, List<uint> indices)
+        {
+            var min = new Vector3(float.MaxValue);
+            var max = new Vector3(float.MinValue);
+            int end = Math.Min(indices.Count, part.BaseIndex + part.NumIndices);
+            for (int i = part.BaseIndex; i < end; i++)
+            {
+                var v = verts[(int)indices[i] + part.BaseVertex];
+                min = Vector3.Min(min, v);
+                max = Vector3.Max(max, v);
+            }
+            if (end <= part.BaseIndex) min = max = Vector3.Zero;
+
+            var center = (min + max) * 0.5f;
+            float radiusSq = 0f;
+            for (int i = part.BaseIndex; i < end; i++)
+                radiusSq = MathF.Max(radiusSq, Vector3.DistanceSquared(verts[(int)indices[i] + part.BaseVertex], center));
+            part.BoundingBox = new BoundingBox(min, max);
+            part.BoundingSphere = new Vector4(center, MathF.Sqrt(radiusSq));
         }
 
         // ═══════════════════════════════════════

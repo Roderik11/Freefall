@@ -472,7 +472,7 @@ namespace Freefall.Components
                 if (culler != null && allBatches != null)
                 {
                     EnsureCascadeBuffer();
-                    UploadCascadeBuffer(frameIndex);
+                    UploadCascadeBuffer(frameIndex, camera);
                     _drawnLastFrame = numCascades;
                     uint cascadeSrv = _cascadeBufferSrvIndices![frameIndex];
                     uint vpOnlySrv = _vpOnlySrvIndices![frameIndex]; // TEMP
@@ -706,11 +706,19 @@ namespace Freefall.Components
         
         // The planes cbuffer (_shadowCascadeCBs, ShadowCascadePlanes in cull_instances.hlsl) is only bound because the
         // root signature wants slot 2: the kernels read the planes from this structured buffer.
-        private unsafe void UploadCascadeBuffer(int frameIndex)
+        private unsafe void UploadCascadeBuffer(int frameIndex, Camera camera)
         {
             var dst = _cascadeBuffers![frameIndex].WritePtr<GPUCuller.CascadeData>();
             var vpDst = _vpOnlyBuffers![frameIndex].WritePtr<Matrix4x4>();
             int count = _cascadeCount;
+
+            // Shadow LOD per cascade (EngineSettings.ShadowLodPerCascade, cull_instances.hlsl CascadeLodSteps): the distance
+            // at which one of the camera's pixels spans one of the cascade's texels, per metre of texel (0 = off)
+            float distancePerTexel = 0f;
+            uint height = DeferredRenderer.Current?.DepthGBuffer?.Native.Description.Height ?? 0;
+            if (Engine.Settings.ShadowLodPerCascade && camera != null && height > 0)
+                distancePerTexel = height * MathF.Sqrt(camera.FoVFactor) * 0.5f;
+
             for (int c = 0; c < count; c++)
             {
                 var data = new GPUCuller.CascadeData();
@@ -718,7 +726,9 @@ namespace Freefall.Components
                 data.VP = _shadowVPMatrices[c];
                 // The shadow Hi-Z holds last frame's casters: none for a cascade that was not drawn then
                 data.PrevVP = c < _drawnLastFrame ? _prevShadowVPMatrices[c] : OffMapVP;
-                data.SplitDistances = cascades[c]; // X=near, Y=far
+                // X = near, Y = far; Z = that LOD distance squared
+                float lodDistance = _cascadeRadius[c] * 2f / _shadowResolution * distancePerTexel;
+                data.SplitDistances = new Vector4(cascades[c].X, cascades[c].Y, lodDistance * lodDistance, cascades[c].W);
                 dst[c] = data;
                 vpDst[c] = _shadowVPMatrices[c];
             }
