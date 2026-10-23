@@ -355,7 +355,7 @@ uint3 PlantTriangle(uint mode, uint ti)
 // declaring room for 256 vertices.
 #define PLANT_THREADS 64
 #define PLANT_GROUP_VERTS 64
-#define PLANT_GROUP_TRIS 64
+#define PLANT_GROUP_TRIS 96     // three fronds are 63 vertices but 72 triangles (more than the threads: written in a loop)
 #define MAX_GROUP_PLANTS 2      // a run of parts spans at most this many plants (PackClass)
 
 // A kind's part: its vertices and triangles, and how many a plant has
@@ -372,7 +372,7 @@ uint PackClass(DecoInstance di, out uint units, out uint perGroup)
 {
     uint verts, tris;
     PartShape(di.Mode, verts, tris, units);
-    perGroup = min(PLANT_GROUP_VERTS / verts, (MAX_GROUP_PLANTS - 1) * units);
+    perGroup = min(min(PLANT_GROUP_VERTS / verts, PLANT_GROUP_TRIS / tris), (MAX_GROUP_PLANTS - 1) * units);
     return di.Mode - MODE_FLOWERS;
 }
 
@@ -473,8 +473,8 @@ void MS(
         verts[gtid] = o;
     }
 
-    if (gtid < primCount)
-        tris[gtid] = GroupTriangle(gtid, mode, firstUnit, parts, partVerts, partTris);
+    for (uint ti = gtid; ti < primCount; ti += PLANT_THREADS)
+        tris[ti] = GroupTriangle(ti, mode, firstUnit, parts, partVerts, partTris);
 }
 
 // ─── Pixel Shader ──────────────────────────────────────────────────────────
@@ -567,10 +567,10 @@ void MS_Shadow(
         verts[gtid] = o;
     }
 
-    if (gtid < primCount)
+    for (uint ti = gtid; ti < primCount; ti += PLANT_THREADS)
     {
-        tris[gtid] = GroupTriangle(gtid, mode, firstUnit, parts, partVerts, partTris);
-        primAttribs[gtid].RTIndex = 0;
+        tris[ti] = GroupTriangle(ti, mode, firstUnit, parts, partVerts, partTris);
+        primAttribs[ti].RTIndex = 0;
     }
 }
 
