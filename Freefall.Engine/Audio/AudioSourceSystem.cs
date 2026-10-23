@@ -21,6 +21,11 @@ namespace Freefall.Audio
     /// or the quietest heard, or not at all. Per frame only the voices are worked on: where the listener
     /// hears each from, its volume and pitch, whether a one-shot has ended. A source that is not playing
     /// costs nothing.
+    ///
+    /// A source with <see cref="AudioShape.Spline"/> sounds from its spline's point nearest the listener
+    /// (a river's near bank), or all around the listener inside a closed one (an area). Its spline is
+    /// kept as a line of world points, made again when the spline is edited or moved; a listener outside
+    /// its bounds grown by HeardWithin is not looked at further.
     /// </summary>
     [UpdateInEditor]
     public sealed class AudioSourceSystem : EntitySystem
@@ -47,6 +52,16 @@ namespace Freefall.Audio
         // The last share of HeardWithin a sound fades out over (squared: from 0.8 of the way)
         const float EdgeStart = 0.64f;
 
+        // A spline's line: a point every this many metres, at most this many
+        const float LineSpacing = 2f;
+        const int MostLinePoints = 4096;
+
+        // A mono clip heard all around: each speaker at the level X3DAudio gives a sound straight ahead
+        const float Centre = 0.70710678f;
+
+        /// <summary>Where a playing source is kept, to be found by the listener.</summary>
+        internal enum Home { None, Cell, Everywhere, Along }
+
         /// <summary>What the system keeps of a source that plays.</summary>
         internal sealed class Entry
         {
@@ -54,15 +69,25 @@ namespace Freefall.Audio
             public AudioClip Clip = null!;
             public bool Looping;
             public float Started;           // Time.TotalTime when it was played
-            public Vector3 Position;
+            public Vector3 Position;        // where it is heard from (on its line, for a spline)
             public bool Moved;
-            public long Cell = long.MinValue; // in the grid, or in the list of sources heard everywhere
-            public bool Everywhere;
+            public Home Home;
+            public long Cell;
+            public Line? Line;              // Shape Spline: the spline, in world points
             public Voice? Voice;
             public float Loud;              // loudness squared at the listener, at the last choice
             public float Score;             // the same, with the edge a source that is heard keeps (Keep)
             public int PlayingIndex = -1;   // in _playing
             public int Chosen;              // the choice it was among the heard at
+        }
+
+        /// <summary>A spline in world points, with the half width of its sound at each.</summary>
+        internal sealed class Line
+        {
+            public Vector3[] Points = [];
+            public float[] HalfWidths = [];
+            public bool Closed;
+            public Vector2 Min, Max;        // XZ
         }
 
         internal sealed class Voice
@@ -75,12 +100,13 @@ namespace Freefall.Audio
             public Vector3 LastPosition;
             public readonly Emitter Emitter = new() { ChannelCount = 1, CurveDistanceScaler = 1 };
             public readonly DspSettings Dsp = new(1, 2);
-            public float[]? Folded;
+            public float[]? Matrix;
         }
 
         private readonly List<Entry> _playing = [];                 // every source that plays
         private readonly Dictionary<long, List<Entry>> _cells = [];
         private readonly List<Entry> _everywhere = [];              // HeardWithin 0: no limit
+        private readonly List<Entry> _along = [];                   // Shape Spline
         private readonly List<Entry> _moved = [];
         private readonly List<Voice> _voices = [];
         private readonly List<Entry> _candidates = [];
@@ -96,6 +122,11 @@ namespace Freefall.Audio
 
         /// <summary>Sources that play, heard or not.</summary>
         public int Playing => _playing.Count;
+
+        protected internal override void Initialize()
+        {
+            MessageDispatcher.AddListener(EngineMsg.SplineChanged, OnSplineChanged);
+        }
 
         public override void Update()
         {
@@ -115,8 +146,6 @@ namespace Freefall.Audio
                 var voice = _voices[i];
                 var entry = voice.Owner;
                 if (entry == null) continue;
-
-                var source = entry.Source;
 
                 // A one-shot that has played to its end
                 if (!entry.Looping && voice.Native.StateNoSamplesPlayed.BuffersQueued == 0)
@@ -139,8 +168,8 @@ namespace Freefall.Audio
                     voice.Fade = MathF.Min(voice.FadeTo, voice.Fade + Time.Delta / FadeTime);
 
                 heard++;
-                if (listener != null && source.Transform != null)
-                    Place(voice, entry, listener, source.Transform.WorldPosition, Time.SmoothDelta);
+                if (listener != null && entry.Source.Transform != null)
+                    Place(voice, entry, listener, Where(entry, listener.Position), Time.SmoothDelta);
             }
             Heard = heard;
         }
@@ -166,6 +195,7 @@ namespace Freefall.Audio
             // with the same clip would otherwise play in step, one sound heard from forty places
             float into = loop ? (float)((source.UID * 0x9E3779B97F4A7C15UL) >> 40) / (1 << 24) * clip.Length : 0f;
             entry.Started = Time.TotalTime - into;
+            entry.Line = MakeLine(source);
             entry.Position = source.Transform.WorldPosition;
             entry.Moved = false;
 
@@ -183,6 +213,7 @@ namespace Freefall.Audio
             var listener = AudioListener.Main?.Listener;
             if (listener == null || !source.Enabled) return;
 
+            entry.Position = Where(entry, listener.Position);
             entry.Loud = entry.Score = Loudness(entry, listener.Position);
             if (entry.Loud <= 0f) return;
 
@@ -214,14 +245,26 @@ namespace Freefall.Audio
 
         /// <summary>
         /// Enabled or a member changed: a source switched off goes quiet now, one switched on is heard
-        /// from the next choice; a changed HeardWithin moves it in the grid.
+        /// from the next choice; a changed Shape, Width or HeardWithin is taken up at once.
         /// </summary>
         internal void Changed(AudioSource source)
         {
             var entry = source.Entry;
             if (entry == null) return;
             if (entry.Voice != null && !source.Enabled) Release(entry.Voice);
-            if (entry.PlayingIndex >= 0) Rebin(entry);
+            if (entry.PlayingIndex < 0) return;
+            entry.Line = MakeLine(source);
+            if (entry.Line == null && source.Transform != null) entry.Position = source.Transform.WorldPosition;
+            Rebin(entry);
+        }
+
+        // A spline edited (points, widths, closed): the sources along it take up its new line
+        private void OnSplineChanged(Message message)
+        {
+            if (message.Data is not Spline spline) return;
+            for (int i = 0; i < _along.Count; i++)
+                if (_along[i].Source.Entity == spline.Entity)
+                    _along[i].Line = MakeLine(_along[i].Source);
         }
 
         // Stopped, ended or destroyed: out of the grid, no voice
@@ -246,13 +289,16 @@ namespace Freefall.Audio
 
         private void Select(Listener listener)
         {
-            // Sources that moved since the last choice: where they are now, and in which cell
+            // Sources that moved since the last choice: where they are now and in which cell, or their spline's new line
             for (int i = 0; i < _moved.Count; i++)
             {
                 var entry = _moved[i];
                 if (!entry.Moved) continue;
                 entry.Moved = false;
-                if (entry.Source.Transform != null)
+                if (entry.Source.Transform == null) continue;
+                if (entry.Home == Home.Along)
+                    entry.Line = MakeLine(entry.Source);
+                else
                 {
                     entry.Position = entry.Source.Transform.WorldPosition;
                     Rebin(entry);
@@ -264,6 +310,17 @@ namespace Freefall.Audio
             _candidates.Clear();
             for (int i = 0; i < _everywhere.Count; i++)
                 Consider(_everywhere[i], at);
+
+            for (int i = 0; i < _along.Count; i++)
+            {
+                var entry = _along[i];
+                var line = entry.Line!;
+                float reach = entry.Source.HeardWithin;
+                if (reach > 0f && (at.X < line.Min.X - reach || at.X > line.Max.X + reach || at.Z < line.Min.Y - reach || at.Z > line.Max.Y + reach))
+                    continue;
+                entry.Position = Nearest(line, at);
+                Consider(entry, at);
+            }
 
             if (_cells.Count > 0)
             {
@@ -356,6 +413,89 @@ namespace Freefall.Audio
             return share <= EdgeStart ? 1f : (1f - share) / (1f - EdgeStart);
         }
 
+        // ---- Splines ----
+
+        // Where a source is heard from by a listener at a place: its own place, or the nearest of its line
+        private static Vector3 Where(Entry entry, Vector3 at)
+            => entry.Line != null ? Nearest(entry.Line, at) : entry.Source.Transform!.WorldPosition;
+
+        // The line of a source along its entity's Spline; null for a point source or without a spline to follow
+        private static Line? MakeLine(AudioSource source)
+        {
+            if (source.Shape != AudioShape.Spline) return null;
+            var spline = source.Entity?.GetComponent<Spline>();
+            if (spline == null || spline.Points.Count < 2) return null;
+
+            float length = spline.GetLength(128);
+            int count = Math.Clamp((int)(length / LineSpacing), 8, MostLinePoints);
+            var line = new Line
+            {
+                Points = new Vector3[count + 1],
+                HalfWidths = new float[count + 1],
+                Closed = spline.Closed,
+                Min = new Vector2(float.MaxValue),
+                Max = new Vector2(float.MinValue),
+            };
+            float half = MathF.Max(source.Width, 0f) * 0.5f;
+            for (int i = 0; i <= count; i++)
+            {
+                float t = (float)i / count;
+                var p = spline.GetWorldPoint(t);
+                line.Points[i] = p;
+                line.HalfWidths[i] = half * spline.GetWidth(t);
+                line.Min = Vector2.Min(line.Min, new Vector2(p.X, p.Z));
+                line.Max = Vector2.Max(line.Max, new Vector2(p.X, p.Z));
+            }
+            return line;
+        }
+
+        /// <summary>
+        /// The point of a line a listener at a place hears it from, nearest on the ground (XZ): inside a
+        /// closed one the place itself; for an open one with a width, its near edge (the bank).
+        /// </summary>
+        private static Vector3 Nearest(Line line, Vector3 at)
+        {
+            var points = line.Points;
+            float best = float.MaxValue;
+            Vector3 nearest = points[0];
+            float halfWidth = 0f;
+            bool inside = false;
+
+            for (int i = 0; i + 1 < points.Length; i++)
+            {
+                var a = points[i];
+                var b = points[i + 1];
+                float abx = b.X - a.X, abz = b.Z - a.Z;
+                float length = abx * abx + abz * abz;
+                float t = length > 0f ? Math.Clamp(((at.X - a.X) * abx + (at.Z - a.Z) * abz) / length, 0f, 1f) : 0f;
+                float dx = at.X - (a.X + abx * t), dz = at.Z - (a.Z + abz * t);
+                float away = dx * dx + dz * dz;
+                if (away < best)
+                {
+                    best = away;
+                    nearest = Vector3.Lerp(a, b, t);
+                    halfWidth = line.HalfWidths[i] + (line.HalfWidths[i + 1] - line.HalfWidths[i]) * t;
+                }
+
+                // Inside a closed one: an odd number of its edges cross the line from the place towards +X
+                if (line.Closed && (a.Z > at.Z) != (b.Z > at.Z) && at.X < a.X + abx * (at.Z - a.Z) / abz)
+                    inside = !inside;
+            }
+
+            if (inside) return at;
+
+            // An open one with a width: its near bank, or the place itself when that is on the water
+            if (!line.Closed && halfWidth > 0f && best > 0f)
+            {
+                float away = MathF.Sqrt(best);
+                if (away <= halfWidth) return new Vector3(at.X, nearest.Y, at.Z);
+                float toBank = halfWidth / away;
+                nearest.X += (at.X - nearest.X) * toBank;
+                nearest.Z += (at.Z - nearest.Z) * toBank;
+            }
+            return nearest;
+        }
+
         // ---- Voices ----
 
         // A voice for this format that nothing has: one of the format, another format's made anew, or a new one
@@ -432,7 +572,7 @@ namespace Freefall.Audio
             voice.FadeTo = 1f;
 
             // Placed before the first sample, or it would play at full volume in the middle until the next update
-            var position = source.Transform!.WorldPosition;
+            var position = Where(entry, listener.Position);
             voice.LastPosition = position;
             Place(voice, entry, listener, position, 0f);
             native.Start();
@@ -451,41 +591,61 @@ namespace Freefall.Audio
         private static void Place(Voice voice, Entry entry, Listener listener, Vector3 position, float delta)
         {
             var source = entry.Source;
-            var emitter = voice.Emitter;
             var transform = source.Transform!;
-
-            emitter.Position = position;
-            emitter.Velocity = delta > 0f ? (position - voice.LastPosition) / delta : Vector3.Zero;
-            voice.LastPosition = position;
-            emitter.OrientFront = transform.Forward;
-            emitter.OrientTop = transform.Up;
-            emitter.ChannelRadius = source.Range;
-            emitter.InnerRadius = source.MinDistance;
-            emitter.CurveDistanceScaler = MathF.Max(source.FalloffStart, 0.01f);
-
-            // The emitter is one point with one channel. A clip with more is folded into it, every channel at
-            // its share (the average, as an .ogg is at import): asked for the clip's own count, X3DAudio filled
-            // the first channel's levels and left the others silent
-            var dsp = voice.Dsp;
-            Engine.Audio3D.Calculate(listener, emitter, CalculateFlags.Matrix | CalculateFlags.Doppler, dsp);
             int channels = voice.Format.Channels;
-            if (channels == 1)
-                voice.Native.SetOutputMatrix(1, 2, dsp.MatrixCoefficients);
-            else
+            if (voice.Matrix?.Length != channels * 2)
+                voice.Matrix = new float[channels * 2];
+            var matrix = voice.Matrix;
+
+            // Along a spline, near it the clip's own channels come through as they are (all around the
+            // listener inside an area), narrowing to one point at FalloffStart
+            float away = Vector3.DistanceSquared(position, listener.Position);
+            float full = MathF.Max(source.FalloffStart, 0.01f);
+            float spread = entry.Line != null && away < full * full ? 1f - MathF.Sqrt(away) / full : 0f;
+            float pitch = source.Pitch;
+
+            if (spread < 1f)
             {
-                if (voice.Folded?.Length != channels * 2)
-                    voice.Folded = new float[channels * 2];
+                var emitter = voice.Emitter;
+                emitter.Position = position;
+                // A spline's point slides along with the listener: no Doppler from that
+                emitter.Velocity = entry.Line == null && delta > 0f ? (position - voice.LastPosition) / delta : Vector3.Zero;
+                emitter.OrientFront = transform.Forward;
+                emitter.OrientTop = transform.Up;
+                emitter.ChannelRadius = source.Range;
+                emitter.InnerRadius = source.MinDistance;
+                emitter.CurveDistanceScaler = full;
+
+                // The emitter is one point with one channel. A clip with more is folded into it, every channel at
+                // its share (the average, as an .ogg is at import): asked for the clip's own count, X3DAudio filled
+                // the first channel's levels and left the others silent
+                var dsp = voice.Dsp;
+                var flags = entry.Line == null ? CalculateFlags.Matrix | CalculateFlags.Doppler : CalculateFlags.Matrix;
+                Engine.Audio3D.Calculate(listener, emitter, flags, dsp);
+                var levels = dsp.MatrixCoefficients;
 
                 // XAudio2 reads the level from channel S to speaker D at [D * channels + S]
-                var levels = dsp.MatrixCoefficients;
                 for (int d = 0; d < 2; d++)
                     for (int s = 0; s < channels; s++)
-                        voice.Folded[d * channels + s] = levels[d] / channels;
-                voice.Native.SetOutputMatrix((uint)channels, 2, voice.Folded);
+                        matrix[d * channels + s] = levels[d] / channels;
+                if (entry.Line == null) pitch *= dsp.DopplerFactor;
             }
+            voice.LastPosition = position;
 
-            float edge = Edge(source.HeardWithin, Vector3.DistanceSquared(position, listener.Position));
-            voice.Native.SetFrequencyRatio(dsp.DopplerFactor * source.Pitch, 0);
+            if (spread > 0f)
+            {
+                // The clip as it is: left to left and right to right (one channel to both, as if ahead)
+                for (int d = 0; d < 2; d++)
+                    for (int s = 0; s < channels; s++)
+                    {
+                        float flat = channels == 1 ? Centre : s % 2 == d ? 2f / channels : 0f;
+                        matrix[d * channels + s] = spread >= 1f ? flat : matrix[d * channels + s] * (1f - spread) + flat * spread;
+                    }
+            }
+            voice.Native.SetOutputMatrix((uint)channels, 2, matrix);
+
+            float edge = Edge(source.HeardWithin, away);
+            voice.Native.SetFrequencyRatio(pitch, 0);
             voice.Native.SetVolume(source.Volume * voice.Fade * edge);
         }
 
@@ -498,47 +658,61 @@ namespace Freefall.Audio
 
         private static long CellOf(Vector3 p) => Key((int)MathF.Floor(p.X / CellSize), (int)MathF.Floor(p.Z / CellSize));
 
+        // Where a source belongs: along its spline, everywhere (no limit) or in the cell it is in
+        private static Home HomeOf(Entry entry)
+            => entry.Line != null ? Home.Along : entry.Source.HeardWithin <= 0f ? Home.Everywhere : Home.Cell;
+
         private void Insert(Entry entry)
         {
-            float heardWithin = entry.Source.HeardWithin;
-            if (heardWithin <= 0f)
+            entry.Home = HomeOf(entry);
+            switch (entry.Home)
             {
-                entry.Everywhere = true;
-                _everywhere.Add(entry);
-                return;
+                case Home.Along:
+                    _along.Add(entry);
+                    break;
+                case Home.Everywhere:
+                    _everywhere.Add(entry);
+                    break;
+                default:
+                    _farthest = MathF.Max(_farthest, entry.Source.HeardWithin);
+                    entry.Cell = CellOf(entry.Position);
+                    if (!_cells.TryGetValue(entry.Cell, out var cell))
+                        _cells[entry.Cell] = cell = [];
+                    cell.Add(entry);
+                    break;
             }
-
-            _farthest = MathF.Max(_farthest, heardWithin);
-            entry.Cell = CellOf(entry.Position);
-            if (!_cells.TryGetValue(entry.Cell, out var cell))
-                _cells[entry.Cell] = cell = [];
-            cell.Add(entry);
         }
 
         private void Remove(Entry entry)
         {
-            if (entry.Everywhere)
-                _everywhere.Remove(entry);
-            else if (_cells.TryGetValue(entry.Cell, out var cell))
+            switch (entry.Home)
             {
-                cell.Remove(entry);
-                if (cell.Count == 0) _cells.Remove(entry.Cell);
+                case Home.Along:
+                    _along.Remove(entry);
+                    break;
+                case Home.Everywhere:
+                    _everywhere.Remove(entry);
+                    break;
+                case Home.Cell when _cells.TryGetValue(entry.Cell, out var cell):
+                    cell.Remove(entry);
+                    if (cell.Count == 0) _cells.Remove(entry.Cell);
+                    break;
             }
-            entry.Everywhere = false;
-            entry.Cell = long.MinValue;
+            entry.Home = Home.None;
         }
 
-        // Where it belongs now (another cell, or HeardWithin changed between grid and everywhere)
+        // Where it belongs now (another cell, or a changed Shape or HeardWithin)
         private void Rebin(Entry entry)
         {
-            bool everywhere = entry.Source.HeardWithin <= 0f;
-            if (everywhere == entry.Everywhere && (everywhere || entry.Cell == CellOf(entry.Position))) return;
+            var home = HomeOf(entry);
+            if (home == entry.Home && (home != Home.Cell || entry.Cell == CellOf(entry.Position))) return;
             Remove(entry);
             Insert(entry);
         }
 
         protected internal override void Destroy()
         {
+            MessageDispatcher.RemoveListener(EngineMsg.SplineChanged, OnSplineChanged);
             for (int i = 0; i < _voices.Count; i++)
             {
                 Release(_voices[i]);

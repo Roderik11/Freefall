@@ -5,6 +5,16 @@ using Freefall.Base;
 
 namespace Freefall.Components
 {
+    /// <summary>Where an <see cref="AudioSource"/> sounds from.</summary>
+    public enum AudioShape
+    {
+        /// <summary>The entity's place.</summary>
+        Point,
+
+        /// <summary>Along the entity's Spline: an open one from its point nearest the listener (a river), a closed one all around the listener inside it (an area) and from its edge outside.</summary>
+        Spline,
+    }
+
     /// <summary>
     /// A sound in the world: what it plays and from where. Data only: <see cref="AudioSourceSystem"/>
     /// gives the few the listener hears best a voice and plays the rest on without one, so a source
@@ -42,6 +52,21 @@ namespace Freefall.Components
         /// </summary>
         public float HeardWithin = 0;
 
+        /// <summary>
+        /// Spline: sounds along the entity's Spline instead of from its place. An open one is heard from
+        /// its point nearest the listener, a river from its near bank (<see cref="Width"/>); a closed one
+        /// all around the listener inside it, and from the nearest point of its edge outside. Near it
+        /// (within FalloffStart) the clip's own channels come through as they are, a stereo bed around
+        /// the listener, narrowing to one point further off.
+        /// </summary>
+        public AudioShape Shape = AudioShape.Point;
+
+        /// <summary>
+        /// Spline, open: how wide its sound is in metres (a river's water), so it is heard from the near
+        /// bank. The Spline's Widths scale it along the way.
+        /// </summary>
+        public float Width = 0;
+
         /// <summary>Plays (or plays on without a voice, out of hearing).</summary>
         [Freefall.Reflection.DontSerialize]
         public bool IsPlaying => Entry?.PlayingIndex >= 0;
@@ -49,6 +74,10 @@ namespace Freefall.Components
         /// <summary>Has a voice: is one of the sounds heard just now.</summary>
         [Freefall.Reflection.DontSerialize]
         public bool IsHeard => Entry?.Voice != null;
+
+        /// <summary>Where it was last heard from: its place, or its spline's point nearest the listener.</summary>
+        [Freefall.Reflection.DontSerialize]
+        public System.Numerics.Vector3 HeardFrom => Entry?.Position ?? Transform?.WorldPosition ?? default;
 
         /// <summary>What the system keeps of it while it plays.</summary>
         internal AudioSourceSystem.Entry? Entry;
@@ -112,7 +141,15 @@ namespace Freefall.Components
             Systems.Get<AudioSourceSystem>()?.Stop(this);
         }
 
-        public override void OnMemberChanged() => Systems.Get<AudioSourceSystem>()?.Changed(this);
+        public override void OnMemberChanged()
+        {
+            // A loop that plays from the start is heard as it is set up (in the inspector, from MCP): it starts,
+            // or starts again with another clip, when its settings change
+            if (Loop && PlayOnAwake && AudioClip != null && (Entry == null || Entry.PlayingIndex < 0 || Entry.Clip != AudioClip))
+                Play();
+            else
+                Systems.Get<AudioSourceSystem>()?.Changed(this);
+        }
 
         protected override void OnEnabledChanged() => Systems.Get<AudioSourceSystem>()?.Changed(this);
 
