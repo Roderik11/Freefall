@@ -71,8 +71,9 @@ namespace Freefall.Components
         // ── Emission ──
 
         [Category("Emission")]
-        [Description("Particles emitted per second")]
-        [ValueRange(0f, 20000f)]
+        [Description("Particles emitted per second. Rain and snow round the camera need tens of thousands (EmitRate × Lifetime " +
+                     "of the shared pool's 262144 slots are in use at once)")]
+        [ValueRange(0f, 100000f)]
         public float EmitRate = 100f;
 
         [Category("Emission")]

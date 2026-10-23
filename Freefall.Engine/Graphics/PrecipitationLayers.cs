@@ -17,13 +17,14 @@ namespace Freefall.Graphics
     /// </summary>
     public sealed class PrecipitationLayers : IDisposable
     {
-        /// <summary>The weather the layers draw. Must match PrecipFrame in precipitation_layers_cs.hlsl (80 bytes).</summary>
+        /// <summary>The weather the layers draw. Must match PrecipFrame in precipitation_layers_cs.hlsl (96 bytes).</summary>
         [StructLayout(LayoutKind.Sequential, Pack = 4)]
         private struct Frame
         {
             public ShelterMap.LevelData Shelter0, Shelter1, Shelter2;
             public float ShelterMinY, ShelterRangeY, Rain, Snow;
             public Vector2 Wind; public float HazeKm, PixelAngle;
+            public float RainDensity, RainFall, SnowDensity, SnowFall;
         }
 
         private const int FrameCount = 3;
@@ -62,6 +63,8 @@ namespace Freefall.Graphics
                 Rain = Weather.Rain, Snow = Weather.Snow,
                 Wind = new Vector2(wind.X, wind.Z),
                 HazeKm = Weather.HazeKm,
+                RainDensity = Weather.RainDensity, RainFall = Weather.RainFallSpeed,
+                SnowDensity = Weather.SnowDensity, SnowFall = Weather.SnowFallSpeed,
                 PixelAngle = 2f / (camera.Projection.M22 * height),
             };
 

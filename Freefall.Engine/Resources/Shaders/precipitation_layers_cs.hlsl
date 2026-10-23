@@ -25,7 +25,7 @@ cbuffer PushConstants : register(b3)
 #include "sky_common.fx"
 #include "weather_cover.hlsli"
 
-// PrecipitationLayers.Frame (80 bytes)
+// PrecipitationLayers.Frame (96 bytes)
 struct PrecipFrame
 {
     ShelterLevel Shelter[SHELTER_LEVELS];   // the cover map (WeatherShelter's levels)
@@ -36,6 +36,10 @@ struct PrecipFrame
     float2 Wind;                // the steady wind (Wind.Current, xz, m/s)
     float HazeKm;               // Weather.HazeKm
     float PixelAngle;           // radians a pixel spans (vertically, at the screen's middle)
+    float RainDensity;          // drops per m³ in a heavy fall, and the fall speed (m/s): the near emitters' own
+    float RainFall;             // (Weather.RainDensity and the rest: EmitRate over the box's area × the fall speed,
+    float SnowDensity;          // gravity over drag), so the far field holds as many drops as the near one and leans
+    float SnowFall;             // alike. Constants held six to ten times the near rain ("there's far more rain in the far")
 };
 
 SamplerState LinearClampS : register(s2);
@@ -44,15 +48,9 @@ SamplerState LinearClampS : register(s2);
 #define FIRST_LAYER 11.0        // m; each layer 1.38× the last (11, 15, 21, 29, 40 m): past them the haze is the veil
 #define LAYER_STEP 1.38
 
-#define RAIN_FALL 8.0           // m/s
-#define RAIN_DENSITY 6.5        // drops per m³ in heavy rain (rate 1): the near emitter's, EmitRate / (its box's area ×
-                                // the fall speed), Eldermoor's 30000/s over 24 × 24 m at 8 m/s. At 40 the far field held
-                                // six times the near one's rain (user, 2026-10-23: "there's far more rain in the far")
 #define RAIN_CELL_DOWN 0.5      // m: a cell's height (a streak is 12-22 cm of it)
 #define RAIN_WIDTH 0.004        // m: a drop's streak
 #define RAIN_ALPHA 0.3          // as the near emitter's
-#define SNOW_FALL 1.0
-#define SNOW_DENSITY 10.0       // flakes per m³ in heavy snow: the near emitter's, 6000/s over 24 × 24 m at 1 m/s
 #define SNOW_RADIUS 0.012
 #define SNOW_ALPHA 0.8
 #define MIN_CELL_PIXELS 6.0     // cells are never narrower: past that the far layers hold fewer drops than the air
@@ -93,19 +91,20 @@ float Curtain(float az, float el, float d, float drift, uint layer)
 
 // The coverage (0..1) of one layer's field at a direction: rain streaks or snow flakes. az, el: the direction's azimuth
 // and elevation; d: the layer's distance; wind: the steady wind (xz, m/s); layer: its index
-float LayerCoverage(float az, float el, float d, float2 wind, uint layer, bool snow, float rate, float pixelAngle)
+float LayerCoverage(float az, float el, float d, float2 wind, uint layer, bool snow, float rate, float pixelAngle,
+    float density, float fall)
 {
     // The slab of air the layer stands for (half way to its neighbours) holds density × slab drops per m² of it: cells
     // that size (in heavy rain or snow; the rate decides how many hold one), never narrower than MIN_CELL_PIXELS
     float slab = d * 0.5 * (LAYER_STEP - 1.0 / LAYER_STEP);
-    float perArea = (snow ? SNOW_DENSITY : RAIN_DENSITY) * slab;
+    float perArea = max(density, 1e-3) * slab;
     float pixelMetres = d * pixelAngle;
     float2 cell;
     if (snow)
         cell = max(sqrt(1.0 / perArea), MIN_CELL_PIXELS * pixelMetres).xx;
     else
         cell = float2(max(1.0 / (perArea * RAIN_CELL_DOWN), MIN_CELL_PIXELS * pixelMetres), RAIN_CELL_DOWN);
-    float fall = snow ? SNOW_FALL : RAIN_FALL;
+    fall = max(fall, 0.1);
     // Each drop dimmer with the layer's distance
     float gain = pow(FIRST_LAYER / d, DISTANCE_FALLOFF);
     // Cells round the sphere, a whole number of them; down it, scrolled by the fall
@@ -206,8 +205,10 @@ void CSLayers(uint3 id : SV_DispatchThreadID)
         if (open <= 0.0)
             continue;
         float fade = open * poleFade * exp(-P.HazeKm * d * 0.001) * saturate((sceneZ - z) / 2.0);
-        float rain = P.Rain > 0.0 ? LayerCoverage(az, el, d, P.Wind, k, false, P.Rain, P.PixelAngle) * fade : 0.0;
-        float snow = P.Snow > 0.0 ? LayerCoverage(az, el, d, P.Wind, k, true, P.Snow, P.PixelAngle) * fade : 0.0;
+        float rain = P.Rain > 0.0
+            ? LayerCoverage(az, el, d, P.Wind, k, false, P.Rain, P.PixelAngle, P.RainDensity, P.RainFall) * fade : 0.0;
+        float snow = P.Snow > 0.0
+            ? LayerCoverage(az, el, d, P.Wind, k, true, P.Snow, P.PixelAngle, P.SnowDensity, P.SnowFall) * fade : 0.0;
         light += clear * (rain * rainLight + snow * snowLight);
         clear *= (1.0 - rain) * (1.0 - snow);
     }

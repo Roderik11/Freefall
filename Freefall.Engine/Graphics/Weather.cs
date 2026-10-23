@@ -56,6 +56,17 @@ namespace Freefall.Graphics
         private const float RainHazeKm = 3f, SnowHazeKm = 10f, HailHazeKm = 1f;
 
         /// <summary>
+        /// What the near rain and snow emitters make of a heavy fall (rate 1): drops per m³ (EmitRate over the emitter's
+        /// box area × its fall speed) and the fall speed (m/s, gravity over drag). EnvironmentController sets them from its
+        /// emitters every frame; the far layers (PrecipitationLayers) hold as many drops and lean alike. Constants in the
+        /// layers' shader held six to ten times the near rain, and went wrong with every retune of the emitters.
+        /// </summary>
+        public static float RainDensity { get; set; } = 6.5f;
+        public static float RainFallSpeed { get; set; } = 8f;
+        public static float SnowDensity { get; set; } = 10f;
+        public static float SnowFallSpeed { get; set; } = 1f;
+
+        /// <summary>
         /// The wind falling rain, snow and hail drift in, for something that falls at <paramref name="fallSpeed"/> m/s:
         /// the steady wind (not the gusts), at most 0.8 × the fall speed, as precipitation_layers_cs.hlsl leans the far
         /// field (it must: its cells fold past that). The near drops in the gusting wind, uncapped, fell almost sideways
@@ -281,6 +292,9 @@ namespace Freefall.Graphics
             hail = Hail,
             snowShare = SnowShare,
             hazeKm = HazeKm,        // the falling rain and snow's extinction per km (visibility 3.9 / it)
+            // What the near emitters make of a heavy fall, which the far layers copy: drops per m³, fall speed (m/s)
+            rainFall = new[] { RainDensity, RainFallSpeed },
+            snowFall = new[] { SnowDensity, SnowFallSpeed },
             surfaces = new { wetness = SurfaceWetness, puddleFill = PuddleFill, snowCover = SnowCover },
             // What the probe measured at the camera (not eased): the rate, hail, the cloud column's depth and top (m)
             column = new { rate = _column.X, hail = _column.Y, depth = _column.Z, top = _column.W },

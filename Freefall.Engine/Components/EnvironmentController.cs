@@ -198,6 +198,17 @@ namespace Freefall.Components
             DriveEmitter(ref _lastRain, RainEmitter, Graphics.Weather.Rain, FallWind(RainEmitter), camPos, EmitterHeight);
             DriveEmitter(ref _lastSnow, SnowEmitter, Graphics.Weather.Snow, FallWind(SnowEmitter), camPos, EmitterHeight);
             DriveEmitter(ref _lastHail, HailEmitter, Graphics.Weather.Hail, FallWind(HailEmitter), camPos, EmitterHeight);
+            // ... and the far layers past them hold as many drops, falling as fast (Weather.RainDensity and the rest)
+            if (RainEmitter != null)
+            {
+                Graphics.Weather.RainDensity = FallDensity(RainEmitter);
+                Graphics.Weather.RainFallSpeed = FallSpeed(RainEmitter);
+            }
+            if (SnowEmitter != null)
+            {
+                Graphics.Weather.SnowDensity = FallDensity(SnowEmitter);
+                Graphics.Weather.SnowFallSpeed = FallSpeed(SnowEmitter);
+            }
             DriveEmitter(ref _lastSplash, SplashEmitter, Graphics.Weather.Rain, wind, camPos, 0f);
             // Dust: park it on the terrain under the camera (or a body height below the camera when
             // there is no terrain) so sheets of sand skim the ground instead of floating at eye level.
@@ -210,8 +221,20 @@ namespace Freefall.Components
         private TerrainRenderer _terrain;
 
         // A weather emitter's fall speed is its terminal one, gravity over drag (rain 9.8 / 1.2 ≈ 8 m/s, snow 2 / 2 = 1)
+        private static float FallSpeed(ParticleEmitter emitter) => MathF.Abs(emitter.Gravity.Y) / MathF.Max(emitter.Drag, 0.01f);
+
         private static Vector3 FallWind(ParticleEmitter emitter) =>
-            emitter == null ? Vector3.Zero : Graphics.Weather.FallWind(MathF.Abs(emitter.Gravity.Y) / MathF.Max(emitter.Drag, 0.01f));
+            emitter == null ? Vector3.Zero : Graphics.Weather.FallWind(FallSpeed(emitter));
+
+        // Drops per m³ a weather emitter makes at its full rate: what it emits a second over its box (or disc) falling
+        // through at its fall speed
+        private static float FallDensity(ParticleEmitter emitter)
+        {
+            float area = emitter.Shape == EmissionShape.Box
+                ? 4f * emitter.ShapeExtents.X * emitter.ShapeExtents.Z
+                : MathF.PI * emitter.ShapeRadius * emitter.ShapeRadius;
+            return emitter.EmitRate / MathF.Max(area * FallSpeed(emitter), 1e-3f);
+        }
 
         /// <summary>
         /// Drive one emitter through its runtime overrides only. The authored EmitRate / Wind are never
