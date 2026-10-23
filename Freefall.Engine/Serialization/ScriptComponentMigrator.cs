@@ -167,6 +167,9 @@ namespace Freefall.Serialization
             ScriptExecution.RemoveCaches(Stale);
             Entity.ForgetCacheTypes(Stale);
 
+            // The reloaded scripts' errors are new: log them in full again
+            CallbackErrors.Forget();
+
             // Restore() loads the ones a live component references again, by GUID, as the new type.
             // The rest would stay cached as instances of the old assembly and keep it from unloading.
             Engine.Assets?.EvictTypes(Stale);

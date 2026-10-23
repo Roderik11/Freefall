@@ -73,9 +73,10 @@ namespace Freefall.Editor
                     Freefall.PCG.PCGScheduler.HoldWhile(isDragging);
 
                 foreach(var comp in target.Targets)
-                {      
-                    if(comp is Component c)
-                        c.OnMemberChanged();
+                {
+                    if (comp is not Component c) continue;
+                    try { c.OnMemberChanged(); }
+                    catch (System.Exception e) { CallbackErrors.Report(c, nameof(Component.OnMemberChanged), e); }
                 }
             };
         }

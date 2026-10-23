@@ -29,7 +29,8 @@ namespace Freefall.Base
             {
                 if (_enabled == value) return;
                 _enabled = value;
-                OnEnabledChanged();
+                try { OnEnabledChanged(); }
+                catch (Exception e) { CallbackErrors.Report(this, nameof(OnEnabledChanged), e); }
             }
         }
         private bool _enabled = true;
@@ -56,14 +57,30 @@ namespace Freefall.Base
         {
             if (_awake || IsDestroyed) return;
             _awake = true;
-            Awake();
+            try { Awake(); }
+            catch (Exception e) { CallbackErrors.Report(this, nameof(Awake), e); }
         }
 
         internal void EarlyBird()
         {
             if (_early || IsDestroyed) return;
             _early = true;
-            Early();
+            try { Early(); }
+            catch (Exception e) { CallbackErrors.Report(this, nameof(Early), e); }
+        }
+
+        /// <summary>OnAttached, what it throws reported (<see cref="CallbackErrors"/>).</summary>
+        internal void Attached()
+        {
+            try { OnAttached(); }
+            catch (Exception e) { CallbackErrors.Report(this, nameof(OnAttached), e); }
+        }
+
+        /// <summary>Destroy, what it throws reported (<see cref="CallbackErrors"/>): the entity's other components still go.</summary>
+        internal void Destroyed()
+        {
+            try { Destroy(); }
+            catch (Exception e) { CallbackErrors.Report(this, nameof(Destroy), e); }
         }
 
         /// <summary>

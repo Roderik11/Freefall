@@ -176,7 +176,10 @@ namespace Freefall.Base
                 if (RemovedList.Count > 0)
                 {
                     foreach (var component in RemovedList)
-                        Removed?.Invoke(component);
+                    {
+                        try { Removed?.Invoke(component); }
+                        catch (Exception e) { CallbackErrors.Report(component, $"{Type.Name} cache Removed handler", e); }
+                    }
 
                     RemovedList.Clear();
                 }
@@ -190,7 +193,8 @@ namespace Freefall.Base
                     if (!component.IsDestroyed && !component.Announced)
                     {
                         component.Announced = true;
-                        Added?.Invoke(component);
+                        try { Added?.Invoke(component); }
+                        catch (Exception e) { CallbackErrors.Report(component, $"{Type.Name} cache Added handler", e); }
                     }
                     if (deadline != long.MaxValue && System.Diagnostics.Stopwatch.GetTimestamp() >= deadline) break;
                 }
@@ -215,10 +219,25 @@ namespace Freefall.Base
                 if (UpdateList.Count == 0) return;
                 using var _ = _marker.Auto(UpdateList.Count);
 
-                if (IsParallel)
-                    Parallel.ForEach(UpdateList.Collection, comp => comp.Update());
-                else
-                    foreach (var comp in UpdateList.Collection) comp.Update();
+                // What one throws is reported and the rest still update (CallbackErrors). The outer catch is for the
+                // list itself: a component that destroys its own entity in Update changes it under the foreach, and
+                // the rest of this type then waits for the next frame.
+                try
+                {
+                    if (IsParallel)
+                        Parallel.ForEach(UpdateList.Collection, comp =>
+                        {
+                            try { comp.Update(); }
+                            catch (Exception e) { CallbackErrors.Report(comp, nameof(IUpdate.Update), e); }
+                        });
+                    else
+                        foreach (var comp in UpdateList.Collection)
+                        {
+                            try { comp.Update(); }
+                            catch (Exception e) { CallbackErrors.Report(comp, nameof(IUpdate.Update), e); }
+                        }
+                }
+                catch (Exception e) { CallbackErrors.Report(null, $"{Type.Name} components' Update loop", e); }
             }
         }
 
@@ -227,10 +246,22 @@ namespace Freefall.Base
             if (!HasDraw || DrawList.Count == 0) return;
             using var _ = _marker.Auto(DrawList.Count);
 
-            if (IsParallel)
-                Parallel.ForEach(DrawList.Collection, comp => comp.Draw());
-            else
-                foreach (var comp in DrawList.Collection) comp.Draw();
+            try
+            {
+                if (IsParallel)
+                    Parallel.ForEach(DrawList.Collection, comp =>
+                    {
+                        try { comp.Draw(); }
+                        catch (Exception e) { CallbackErrors.Report(comp, nameof(IDraw.Draw), e); }
+                    });
+                else
+                    foreach (var comp in DrawList.Collection)
+                    {
+                        try { comp.Draw(); }
+                        catch (Exception e) { CallbackErrors.Report(comp, nameof(IDraw.Draw), e); }
+                    }
+            }
+            catch (Exception e) { CallbackErrors.Report(null, $"{Type.Name} components' Draw loop", e); }
         }
 
         public override string ToString()

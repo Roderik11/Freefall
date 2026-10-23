@@ -125,7 +125,7 @@ namespace Freefall.Base
                 Transform = t;
             }
 
-            component.OnAttached();
+            component.Attached();
 
             return component;
         }
@@ -220,7 +220,7 @@ namespace Freefall.Base
             var addMethod = cacheType.GetMethod("Add", BindingFlags.Public | BindingFlags.Static);
             addMethod?.Invoke(null, [this, component]);
 
-            component.OnAttached();
+            component.Attached();
 
             return component;
         }
@@ -242,18 +242,13 @@ namespace Freefall.Base
             if (component is Transform) return; // never remove Transform
             if (!_components.Remove(component)) return;
 
-            try
-            {
-                component.IsDestroyed = true;
-                component.Destroy();
-            }
-            finally
-            {
-                // A throwing Destroy() must not leave the component registered in its cache
-                var cacheType = GetCacheType(component.GetType());
-                var removeMethod = cacheType.GetMethod("Remove", BindingFlags.Public | BindingFlags.Static, [typeof(Entity)]);
-                removeMethod?.Invoke(null, [this]);
-            }
+            // A throwing Destroy() is reported and the component still leaves its cache
+            component.IsDestroyed = true;
+            component.Destroyed();
+
+            var cacheType = GetCacheType(component.GetType());
+            var removeMethod = cacheType.GetMethod("Remove", BindingFlags.Public | BindingFlags.Static, [typeof(Entity)]);
+            removeMethod?.Invoke(null, [this]);
         }
 
         /// <summary>
@@ -315,7 +310,7 @@ namespace Freefall.Base
             foreach (var component in _components)
             {
                 component.IsDestroyed = true;
-                component.Destroy();
+                component.Destroyed();
             }
 
             // Unregister each component from its ComponentCache<T>

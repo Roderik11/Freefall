@@ -32,6 +32,10 @@ namespace Freefall.Base
 
         internal bool RunsInEditor;
 
+        // Defined in a script assembly (collectible): what its Update throws is reported and the frame goes on
+        // (CallbackErrors). An engine system's is left to crash, since one stopped half-way can leave a frame's GPU work half-made.
+        internal bool FromScript;
+
         /// <summary>Called once on the main thread after every system of the same batch exists.</summary>
         protected internal virtual void Initialize() { }
 
@@ -71,6 +75,7 @@ namespace Freefall.Base
         internal void Add(EntitySystem system)
         {
             system.Group = this;
+            system.FromScript = system.GetType().Assembly.IsCollectible;
             _systems.Add(system);
             _sortDirty = true;
         }
@@ -93,7 +98,13 @@ namespace Freefall.Base
                 if (!system.Enabled || (editor && !system.RunsInEditor)) continue;
 
                 using var _ = system.Marker.Auto();
-                system.Update();
+                if (!system.FromScript)
+                {
+                    system.Update();
+                    continue;
+                }
+                try { system.Update(); }
+                catch (Exception e) { CallbackErrors.Report(system, nameof(Update), e); }
             }
         }
 

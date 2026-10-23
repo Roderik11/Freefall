@@ -248,6 +248,15 @@ namespace Freefall
             OnLog?.Invoke(line, st);
         }
 
+        /// <summary>An error with the exception's own stack (where it was thrown), kept in Release builds.</summary>
+        public static void LogException(string text, Exception exception)
+        {
+            var st = new StackTrace(exception, true);
+            var line = $"{text}: {exception.GetType().Name}: {exception.Message}";
+            Append(line, st);
+            OnLog?.Invoke(line, st);
+        }
+
         // File/line stack capture is expensive; only pay for it in DEBUG builds
         private static StackTrace CaptureStack()
         {
