@@ -5,14 +5,17 @@ using Freefall.Base;
 
 namespace Freefall.Components
 {
-    /// <summary>Where an <see cref="AudioSource"/> sounds from.</summary>
+    /// <summary>Where an <see cref="AudioSource"/> sounds from. The spline is the entity's own, or its parent's.</summary>
     public enum AudioShape
     {
         /// <summary>The entity's place.</summary>
-        Point,
+        Point = 0,
 
-        /// <summary>Along the entity's Spline: an open one from its point nearest the listener (a river), a closed one all around the listener inside it (an area) and from its edge outside.</summary>
-        Spline,
+        /// <summary>Along the spline, open or closed, from its point nearest the listener: a river (from its near bank), a coastline, a lake's shore.</summary>
+        Along = 1,
+
+        /// <summary>A closed spline: all around the listener inside it (a forest, a marsh), from its edge outside. An open one is heard as Along.</summary>
+        Area = 2,
     }
 
     /// <summary>
@@ -53,17 +56,18 @@ namespace Freefall.Components
         public float HeardWithin = 0;
 
         /// <summary>
-        /// Spline: sounds along the entity's Spline instead of from its place. An open one is heard from
-        /// its point nearest the listener, a river from its near bank (<see cref="Width"/>); a closed one
-        /// all around the listener inside it, and from the nearest point of its edge outside. Near it
-        /// (within FalloffStart) the clip's own channels come through as they are, a stereo bed around
-        /// the listener, narrowing to one point further off.
+        /// Along or Area: sounds along the entity's Spline (or its parent's, so a day and a night sound can
+        /// share one area) instead of from its place. Along is heard from the spline's point nearest the
+        /// listener, a river from its near bank (<see cref="Width"/>); Area all around the listener inside
+        /// it, and from the nearest point of its edge outside. Near that point (within FalloffStart) the
+        /// clip's own channels come through as they are, a stereo bed around the listener, narrowing to
+        /// one point further off.
         /// </summary>
         public AudioShape Shape = AudioShape.Point;
 
         /// <summary>
-        /// Spline, open: how wide its sound is in metres (a river's water), so it is heard from the near
-        /// bank. The Spline's Widths scale it along the way.
+        /// Along: how wide its sound is in metres (a river's water), so it is heard from the near bank.
+        /// The Spline's Widths scale it along the way.
         /// </summary>
         public float Width = 0;
 
@@ -151,7 +155,7 @@ namespace Freefall.Components
                 Systems.Get<AudioSourceSystem>()?.Changed(this);
         }
 
-        protected override void OnEnabledChanged() => Systems.Get<AudioSourceSystem>()?.Changed(this);
+        protected override void OnEnabledChanged() => Systems.Get<AudioSourceSystem>()?.EnabledChanged(this);
 
         public override void Destroy()
         {

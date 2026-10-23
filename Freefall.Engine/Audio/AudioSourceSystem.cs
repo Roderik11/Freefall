@@ -22,10 +22,11 @@ namespace Freefall.Audio
     /// hears each from, its volume and pitch, whether a one-shot has ended. A source that is not playing
     /// costs nothing.
     ///
-    /// A source with <see cref="AudioShape.Spline"/> sounds from its spline's point nearest the listener
-    /// (a river's near bank), or all around the listener inside a closed one (an area). Its spline is
-    /// kept as a line of world points, made again when the spline is edited or moved; a listener outside
-    /// its bounds grown by HeardWithin is not looked at further.
+    /// A source <see cref="AudioShape.Along"/> a spline sounds from its point nearest the listener (a
+    /// river's near bank, a coastline); one over an <see cref="AudioShape.Area"/> all around the listener
+    /// inside it. Its spline (its entity's or its parent's) is kept as a line of world points, made again
+    /// when the spline is edited or moved; a listener outside its bounds grown by HeardWithin is not
+    /// looked at further.
     /// </summary>
     [UpdateInEditor]
     public sealed class AudioSourceSystem : EntitySystem
@@ -41,6 +42,9 @@ namespace Freefall.Audio
 
         // A looped sound that gets or loses its voice fades in or out over this long
         const float FadeTime = 0.3f;
+
+        // One switched off or on (Enabled: a bed of the day giving way to the night's) over this long
+        const float SwitchFadeTime = 4f;
 
         // A voice that is heard keeps it against one up to this much louder (loudness squared: x2 = 3 dB),
         // so two fires about as far off do not swap as the listener moves between them
@@ -79,6 +83,7 @@ namespace Freefall.Audio
             public float Score;             // the same, with the edge a source that is heard keeps (Keep)
             public int PlayingIndex = -1;   // in _playing
             public int Chosen;              // the choice it was among the heard at
+            public bool SwitchedOn;         // Enabled again: its next voice fades in over SwitchFadeTime
         }
 
         /// <summary>A spline in world points, with the half width of its sound at each.</summary>
@@ -86,7 +91,8 @@ namespace Freefall.Audio
         {
             public Vector3[] Points = [];
             public float[] HalfWidths = [];
-            public bool Closed;
+            public Spline Spline = null!;
+            public bool Area;               // heard all around inside it
             public Vector2 Min, Max;        // XZ
         }
 
@@ -97,6 +103,7 @@ namespace Freefall.Audio
             public Entry? Owner;
             public float Fade = 1f;         // 0..1
             public float FadeTo = 1f;
+            public float FadeSeconds = FadeTime;
             public Vector3 LastPosition;
             public readonly Emitter Emitter = new() { ChannelCount = 1, CurveDistanceScaler = 1 };
             public readonly DspSettings Dsp = new(1, 2);
@@ -157,7 +164,7 @@ namespace Freefall.Audio
                 // Faded out: the voice is free again, the source plays on without one
                 if (voice.FadeTo < voice.Fade)
                 {
-                    voice.Fade = MathF.Max(voice.FadeTo, voice.Fade - Time.Delta / FadeTime);
+                    voice.Fade = MathF.Max(voice.FadeTo, voice.Fade - Time.Delta / voice.FadeSeconds);
                     if (voice.Fade <= 0f)
                     {
                         Release(voice);
@@ -165,7 +172,7 @@ namespace Freefall.Audio
                     }
                 }
                 else if (voice.FadeTo > voice.Fade)
-                    voice.Fade = MathF.Min(voice.FadeTo, voice.Fade + Time.Delta / FadeTime);
+                    voice.Fade = MathF.Min(voice.FadeTo, voice.Fade + Time.Delta / voice.FadeSeconds);
 
                 heard++;
                 if (listener != null && entry.Source.Transform != null)
@@ -243,19 +250,38 @@ namespace Freefall.Audio
             _moved.Add(entry);
         }
 
-        /// <summary>
-        /// Enabled or a member changed: a source switched off goes quiet now, one switched on is heard
-        /// from the next choice; a changed Shape, Width or HeardWithin is taken up at once.
-        /// </summary>
+        /// <summary>A member changed: a changed Shape, Width or HeardWithin is taken up at once.</summary>
         internal void Changed(AudioSource source)
         {
             var entry = source.Entry;
-            if (entry == null) return;
-            if (entry.Voice != null && !source.Enabled) Release(entry.Voice);
-            if (entry.PlayingIndex < 0) return;
+            if (entry == null || entry.PlayingIndex < 0) return;
             entry.Line = MakeLine(source);
             if (entry.Line == null && source.Transform != null) entry.Position = source.Transform.WorldPosition;
             Rebin(entry);
+        }
+
+        /// <summary>
+        /// Switched off: a loop that is heard fades out over a few seconds and plays on unheard, a one-shot
+        /// stops. Switched on: heard from the next choice, a loop fading in as slowly.
+        /// </summary>
+        internal void EnabledChanged(AudioSource source)
+        {
+            var entry = source.Entry;
+            if (entry == null) return;
+            if (source.Enabled)
+            {
+                entry.SwitchedOn = true;
+                if (entry.Voice != null) entry.Voice.FadeSeconds = SwitchFadeTime;
+            }
+            else if (entry.Voice != null)
+            {
+                if (!entry.Looping) Release(entry.Voice);
+                else
+                {
+                    entry.Voice.FadeTo = 0f;
+                    entry.Voice.FadeSeconds = SwitchFadeTime;
+                }
+            }
         }
 
         // A spline edited (points, widths, closed): the sources along it take up its new line
@@ -263,7 +289,7 @@ namespace Freefall.Audio
         {
             if (message.Data is not Spline spline) return;
             for (int i = 0; i < _along.Count; i++)
-                if (_along[i].Source.Entity == spline.Entity)
+                if (_along[i].Line?.Spline == spline)
                     _along[i].Line = MakeLine(_along[i].Source);
         }
 
@@ -419,11 +445,11 @@ namespace Freefall.Audio
         private static Vector3 Where(Entry entry, Vector3 at)
             => entry.Line != null ? Nearest(entry.Line, at) : entry.Source.Transform!.WorldPosition;
 
-        // The line of a source along its entity's Spline; null for a point source or without a spline to follow
+        // The line of a source along its entity's Spline, or its parent's; null for a point source or without a spline to follow
         private static Line? MakeLine(AudioSource source)
         {
-            if (source.Shape != AudioShape.Spline) return null;
-            var spline = source.Entity?.GetComponent<Spline>();
+            if (source.Shape == AudioShape.Point) return null;
+            var spline = source.Entity?.GetComponent<Spline>() ?? source.Transform?.Parent?.Entity?.GetComponent<Spline>();
             if (spline == null || spline.Points.Count < 2) return null;
 
             float length = spline.GetLength(128);
@@ -432,7 +458,8 @@ namespace Freefall.Audio
             {
                 Points = new Vector3[count + 1],
                 HalfWidths = new float[count + 1],
-                Closed = spline.Closed,
+                Spline = spline,
+                Area = source.Shape == AudioShape.Area && spline.Closed,
                 Min = new Vector2(float.MaxValue),
                 Max = new Vector2(float.MinValue),
             };
@@ -477,15 +504,15 @@ namespace Freefall.Audio
                     halfWidth = line.HalfWidths[i] + (line.HalfWidths[i + 1] - line.HalfWidths[i]) * t;
                 }
 
-                // Inside a closed one: an odd number of its edges cross the line from the place towards +X
-                if (line.Closed && (a.Z > at.Z) != (b.Z > at.Z) && at.X < a.X + abx * (at.Z - a.Z) / abz)
+                // Inside an area: an odd number of its edges cross the line from the place towards +X
+                if (line.Area && (a.Z > at.Z) != (b.Z > at.Z) && at.X < a.X + abx * (at.Z - a.Z) / abz)
                     inside = !inside;
             }
 
             if (inside) return at;
 
-            // An open one with a width: its near bank, or the place itself when that is on the water
-            if (!line.Closed && halfWidth > 0f && best > 0f)
+            // A line with a width: its near bank, or the place itself when that is on the water
+            if (!line.Area && halfWidth > 0f && best > 0f)
             {
                 float away = MathF.Sqrt(best);
                 if (away <= halfWidth) return new Vector3(at.X, nearest.Y, at.Z);
@@ -570,6 +597,8 @@ namespace Freefall.Audio
             entry.Voice = voice;
             voice.Fade = fadeIn ? 0f : 1f;
             voice.FadeTo = 1f;
+            voice.FadeSeconds = entry.SwitchedOn ? SwitchFadeTime : FadeTime;
+            entry.SwitchedOn = false;
 
             // Placed before the first sample, or it would play at full volume in the middle until the next update
             var position = Where(entry, listener.Position);
@@ -585,6 +614,7 @@ namespace Freefall.Audio
             voice.Native.FlushSourceBuffers();
             if (voice.Owner != null) voice.Owner.Voice = null;
             voice.Owner = null;
+            voice.FadeSeconds = FadeTime;
         }
 
         // Volume per speaker and pitch from where the listener is
