@@ -31,7 +31,7 @@ cbuffer PushConstants : register(b3)
 };
 
 #include "common.fx"
-// @RenderState(RenderTargets=6)
+// @RenderState(RenderTargets=6, LodFade=true)
 
 // Trunk/Branch GBuffer shader — based on gbuffer.fx with:
 // - Wind sway animation (low-frequency, large-scale)
@@ -56,6 +56,7 @@ struct VSOutput
     float Depth : TEXCOORD3;
     nointerpolation uint TransformSlot : TEXCOORD4;
     nointerpolation uint MeshPartIdx : TEXCOORD5;
+    nointerpolation uint LodFade : TEXCOORD6;   // DrawEntryFade (0 = no LOD crossfade)
 };
 
 
@@ -69,7 +70,7 @@ VSOutput VS(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_InstanceI
 
     uint dataPos = InstanceBaseOffset + instanceID;
     uint packedIdx = sortedIndices[dataPos];
-    uint idx = packedIdx & 0x7FFFFFFFu;
+    uint idx = DrawEntryIndex(packedIdx);   // and the LOD crossfade's tags (lod_fade.hlsli)
 
     InstanceDescriptor desc = descriptors[idx];
     row_major matrix World = globalTransforms[desc.TransformSlot];
@@ -115,6 +116,7 @@ VSOutput VS(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_InstanceI
     output.Depth = output.Position.w;
     output.TransformSlot = desc.TransformSlot;
     output.MeshPartIdx = desc.MeshPartIdx;
+    output.LodFade = DrawEntryFade(packedIdx);
     return output;
 }
 
@@ -133,6 +135,7 @@ SamplerState Sampler : register(s0);
 PSOutput PS(VSOutput input)
 {
     PSOutput output;
+    LodFadeClip(input.Position.xy, input.LodFade);
 
     MaterialData mat = GET_MATERIAL(input.MaterialID);
     Texture2D albedoTex = ResourceDescriptorHeap[NonUniformResourceIndex(mat.AlbedoIdx)];

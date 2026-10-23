@@ -58,6 +58,7 @@ namespace Freefall.Graphics
             if (fmt == Format.R8G8B8A8_UNorm) return 4;
             if (fmt == Format.R16G16B16A16_Float) return 8;
             if (fmt == Format.R32_Float) return 4;
+            if (fmt == Format.R8_UNorm) return 1;
             return 4; // Fallback
         }
 

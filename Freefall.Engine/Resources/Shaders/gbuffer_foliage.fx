@@ -31,7 +31,7 @@ cbuffer PushConstants : register(b3)
 };
 
 #include "common.fx"
-// @RenderState(RenderTargets=6, CullMode=None)
+// @RenderState(RenderTargets=6, CullMode=None, LodFade=true)
 
 // Foliage GBuffer shader — based on gbuffer.fx with:
 // - Two-sided rendering (CullMode=None)
@@ -63,6 +63,7 @@ struct VSOutput
     float CanopyAO : TEXCOORD6;     // 0 = deep inside / under the canopy, 1 = outer sunlit shell
     float3 DomeNormal : TEXCOORD7;  // original look (mostly up) — used for materials that have a normal map
     nointerpolation float3 TreeTint : TEXCOORD8;   // this tree's colour (common.fx TreeTint)
+    nointerpolation uint LodFade : TEXCOORD9;      // DrawEntryFade (0 = no LOD crossfade)
 };
 
 // Wind (common.fx). The crown rides its trunk's bend (TreeSway, as gbuffer_trunk.fx), and the leaves flutter about
@@ -104,7 +105,7 @@ VSOutput VS(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_InstanceI
 
     uint dataPos = InstanceBaseOffset + instanceID;
     uint packedIdx = sortedIndices[dataPos];
-    uint idx = packedIdx & 0x7FFFFFFFu;
+    uint idx = DrawEntryIndex(packedIdx);   // and the LOD crossfade's tags (lod_fade.hlsli)
 
     InstanceDescriptor desc = descriptors[idx];
     row_major matrix World = globalTransforms[desc.TransformSlot];
@@ -146,6 +147,7 @@ VSOutput VS(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_InstanceI
     output.Depth = output.Position.w;
     output.TransformSlot = desc.TransformSlot;
     output.MeshPartIdx = desc.MeshPartIdx;
+    output.LodFade = DrawEntryFade(packedIdx);
     return output;
 }
 
@@ -164,6 +166,7 @@ SamplerState Sampler : register(s0);
 PSOutput PS(VSOutput input, bool isFrontFace : SV_IsFrontFace)
 {
     PSOutput output;
+    LodFadeClip(input.Position.xy, input.LodFade);
 
     MaterialData mat = GET_MATERIAL(input.MaterialID);
     Texture2D albedoTex = ResourceDescriptorHeap[NonUniformResourceIndex(mat.AlbedoIdx)];

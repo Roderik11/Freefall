@@ -75,6 +75,13 @@ namespace Freefall.Assets
         public static Texture WhiteArray { get; private set; }
         public static Texture FlatNormalArray { get; private set; }
 
+        /// <summary>
+        /// 64 × 64 blue noise (R8, void and cluster: every 16th of the range equally often, spread as evenly as can be),
+        /// tiled over the screen by pixel: the LOD crossfade's dither (common.fx LodFadeClip, SceneConstants.BlueNoiseIdx).
+        /// Null when the file is missing; the dither then falls back to interleaved gradient noise.
+        /// </summary>
+        public static Texture? BlueNoise { get; private set; }
+
         // --- Default textures (loaded from DDS) ---
         public static Texture DefaultDiffuse { get; private set; }
         public static Texture DefaultNormal { get; private set; }
@@ -170,6 +177,13 @@ namespace Freefall.Assets
             BlackArray.Name = "BlackArray";
             FlatNormalArray = Texture.CreateTexture2DArray(device, new[] { FlatNormal });
             FlatNormalArray.Name = "FlatNormalArray";
+
+            var blueNoisePath = Path.Combine(ResourcesPath, "blue_noise_64.r8");
+            if (EngineFiles.Exists(blueNoisePath))
+            {
+                BlueNoise = Texture.CreateFromData(device, 64, 64, EngineFiles.ReadAllBytes(blueNoisePath), Format.R8_UNorm);
+                BlueNoise.Name = "BlueNoise";
+            }
 
             // --- Default textures from DDS ---
             DefaultDiffuse  = new Texture(device, Path.Combine(ResourcesPath, "default_albedo_map.dds"));

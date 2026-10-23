@@ -56,6 +56,8 @@ cbuffer SceneConstants : register(b0)
     // ── Light clusters (Graphics.LightClusters, set per view by DeferredRenderer) — light_clusters.hlsli ──
     uint LightClustersIdx;             // ByteAddressBuffer: header, z-bins and tile masks of this view's point lights; 0 = none
     uint ClusterLightsIdx;             // StructuredBuffer<PointLightData>: the visible lights in view-depth order
+
+    uint BlueNoiseIdx;                 // Texture2D<float> 64 × 64 blue noise, tiled by pixel (InternalAssets.BlueNoise); 0 = none
 }
 
 // ── Large-scale variation of the ground and what grows on it (gputerrain.fx, grass cards, blades, flowers) ──
@@ -304,6 +306,28 @@ float InterleavedGradientNoise(float2 screenPos)
 {
     float3 magic = float3(0.06711056f, 0.00583715f, 52.9829189f);
     return frac(magic.z * frac(dot(screenPos, magic.xy)));
+}
+
+#include "lod_fade.hlsli"
+
+// The LOD crossfade's dither (lod_fade.hlsli), from a pixel shader at its SV_Position with the vertex shader's
+// DrawEntryFade: the new part draws where the blue noise is under its share, the part faded from everywhere else, so
+// together they cover each pixel once. The pattern stays put on the screen.
+void LodFadeClip(float2 pixel, uint fade)
+{
+    if (fade == 0)
+        return;
+    uint n;
+    if (BlueNoiseIdx != 0)
+    {
+        Texture2D<float> noise = ResourceDescriptorHeap[BlueNoiseIdx];
+        n = (uint)(noise.Load(int3(uint2(pixel) & 63u, 0)) * 255.0 + 0.5);
+    }
+    else
+        n = (uint)(InterleavedGradientNoise(pixel) * 255.0);
+    bool newPart = n < (fade & 127u) * 2u;
+    if (newPart == ((fade & 128u) != 0))
+        discard;
 }
 
 // Vogel disk: golden-angle spiral produces well-distributed 2D samples

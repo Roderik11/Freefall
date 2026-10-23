@@ -268,10 +268,12 @@ namespace Freefall.Graphics
         {
             var state = new ShaderRenderState();
             
-            // Pattern: // @RenderState(key=value, key=value, ...)
-            string pattern = @"//\s*@RenderState\s*\(([^)]+)\)";
-            
-            var match = Regex.Match(content, pattern);
+            // Pattern: // @RenderState(key=value, key=value, ...), the comment starting its line. Not anywhere in the
+            // text: the content holds the includes before the effect's own line, and lod_fade.hlsli once quoted one in
+            // a comment, which every effect then took for its render state (2026-10-23: the sky drew black).
+            string pattern = @"^[ \t]*//\s*@RenderState\s*\(([^)]+)\)";
+
+            var match = Regex.Match(content, pattern, RegexOptions.Multiline);
             if (match.Success)
             {
                 string args = match.Groups[1].Value;
@@ -307,6 +309,9 @@ namespace Freefall.Graphics
                                 break;
                             case "RenderTargetFormat":
                                 state.RenderTargetFormat = value;  // DXGI_FORMAT name, e.g. "R16G16B16A16_Float"
+                                break;
+                            case "LodFade":
+                                state.LodFade = bool.Parse(value);
                                 break;
                         }
                     }
@@ -396,5 +401,12 @@ namespace Freefall.Graphics
         
         /// <summary>Single render target format override: "R16G16B16A16_Float" etc. Null = use default.</summary>
         public string? RenderTargetFormat { get; set; }
+
+        /// <summary>
+        /// The effect crossfades its instances between LODs (InstanceBatch, lod_fade.hlsli): its vertex shaders read the
+        /// camera's draw-list entries with DrawEntryIndex and pass DrawEntryFade on, its pixel shaders call LodFadeClip.
+        /// Without it the instances switch at once.
+        /// </summary>
+        public bool LodFade { get; set; }
     }
 }

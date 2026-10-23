@@ -31,7 +31,7 @@ cbuffer PushConstants : register(b3)
 };
 
 #include "common.fx"
-// @RenderState(RenderTargets=6)
+// @RenderState(RenderTargets=6, LodFade=true)
 
 inline MaterialData GetMaterial(uint id)
 {
@@ -58,6 +58,7 @@ struct VSOutput
     nointerpolation uint TransformSlot : TEXCOORD4;
     nointerpolation uint MeshPartIdx : TEXCOORD5;
     nointerpolation uint PickThrough : TEXCOORD6;   // 1 = part of the character the pick sees through (see PS)
+    nointerpolation uint LodFade : TEXCOORD7;       // DrawEntryFade (0 = no LOD crossfade)
 };
 
 
@@ -74,9 +75,9 @@ VSOutput VS(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_InstanceI
     // Get instance data position using InstanceBaseOffset + local instance ID
     uint dataPos = InstanceBaseOffset + instanceID;
     
-    // sortedIndices contains compacted original instanceIdx
+    // sortedIndices contains compacted original instanceIdx, and the LOD crossfade's tags (lod_fade.hlsli)
     uint packedIdx = sortedIndices[dataPos];
-    uint idx = packedIdx & 0x7FFFFFFFu;
+    uint idx = DrawEntryIndex(packedIdx);
     
     // Double-indirect: use original instance index to look up per-instance data from descriptor
     InstanceDescriptor desc = descriptors[idx];
@@ -158,6 +159,7 @@ VSOutput VS(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_InstanceI
 
     // All parts of one character draw with its animator's bone buffer, which is what tells it apart
     output.PickThrough = desc.BoneBufferIdx != 0u && any(PickThroughBones == desc.BoneBufferIdx) ? 1u : 0u;
+    output.LodFade = DrawEntryFade(packedIdx);
     return output;
 }
 
@@ -264,9 +266,10 @@ void PS_Shadow(ShadowVSOutput input)
 PSOutput PS(VSOutput input)
 {
     PSOutput output;
+    LodFadeClip(input.Position.xy, input.LodFade);
 
     uint materialID = input.MaterialID;
-    
+
     // Material lookup via MaterialID indirection
     MaterialData mat = GET_MATERIAL(materialID);
     Texture2D albedoTex = ResourceDescriptorHeap[NonUniformResourceIndex(mat.AlbedoIdx)];

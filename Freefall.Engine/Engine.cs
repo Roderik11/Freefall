@@ -629,6 +629,13 @@ namespace Freefall
          [ValueRange(0.1f, 20.0f)]
          public float LODScale { get; set; } = 1.0f;
 
+         /// <summary>
+         /// Seconds an instance takes to crossfade from one LOD to the next (dithered, for effects that declare LodFade:
+         /// InstanceBatch, lod_fade.hlsli). 0 = switch at once.
+         /// </summary>
+         [ValueRange(0f, 2f)]
+         public float LodFadeTime { get; set; } = 0.4f;
+
          [Category("Shadows")]
          public bool EnableShadows { get; set; } = true;
 

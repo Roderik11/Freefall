@@ -31,7 +31,7 @@ cbuffer PushConstants : register(b3)
 };
 
 #include "common.fx"
-// @RenderState(RenderTargets=6)
+// @RenderState(RenderTargets=6, LodFade=true)
 
 
 // Helper to get material from instance's MaterialID (override common.fx version)
@@ -55,6 +55,7 @@ struct VSOutput
     float Depth : TEXCOORD3;
     nointerpolation uint TransformSlot : TEXCOORD4;
     nointerpolation uint MeshPartIdx : TEXCOORD5;
+    nointerpolation uint LodFade : TEXCOORD6;   // DrawEntryFade (0 = no LOD crossfade)
 };
 
 struct PSOutput
@@ -79,10 +80,10 @@ VSOutput VS(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_InstanceI
     // Get instance data position using InstanceBaseOffset + local instance ID
     uint dataPos = InstanceBaseOffset + instanceID;
     
-    // sortedIndices contains compacted original instanceIdx
+    // sortedIndices contains compacted original instanceIdx, and the LOD crossfade's tags (lod_fade.hlsli)
     uint packedIdx = sortedIndices[dataPos];
-    uint idx = packedIdx & 0x7FFFFFFFu;
-    
+    uint idx = DrawEntryIndex(packedIdx);
+
     // Double-indirect: use original instance index to look up per-instance data from descriptor
     InstanceDescriptor desc = descriptors[idx];
     uint slot = desc.TransformSlot;
@@ -134,6 +135,7 @@ VSOutput VS(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_InstanceI
     output.Depth = output.Position.w; // View-space Z (linear)
     output.TransformSlot = slot;
     output.MeshPartIdx = desc.MeshPartIdx;
+    output.LodFade = DrawEntryFade(packedIdx);
     return output;
 }
 
@@ -212,7 +214,8 @@ void PS_Shadow(ShadowVSOutput input)
 PSOutput PS(VSOutput input)
 {
     PSOutput output;
-    
+    LodFadeClip(input.Position.xy, input.LodFade);
+
     uint materialID = input.MaterialID;
     
     // Material lookup via MaterialID indirection

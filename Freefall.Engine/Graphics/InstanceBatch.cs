@@ -154,6 +154,15 @@ namespace Freefall.Graphics
         private uint visibilityCacheUAVIndex;
         private int _visibilityCacheTick = -1;
 
+        // The LOD crossfade's state per instance (LodFadeState in cull_instances.hlsl: the part drawn, the part it fades
+        // from, when the fade began, this frame's word for the compaction), for batches of effects that declare LodFade
+        // (ShaderRenderState.LodFade). Like the transform cache one buffer written by the GPU only, zeroed when new: the
+        // instances then start without a fade. A fading instance has two entries in the visible indices (DrawEntries).
+        private const int LodFadeStride = 16;
+        private ID3D12Resource? lodFadeStateBuffer;
+        private uint lodFadeStateUAVIndex;
+        private int DrawEntries => capacity * 2;
+
         // One bit per persistent record changed since the last camera culling (added, swap-removed into its index,
         // skinned or no longer), uploaded for that culling (ChangedRecordsIdx) and cleared
         private uint[] _changedRecordBits = Array.Empty<uint>();
@@ -618,7 +627,7 @@ namespace Freefall.Graphics
             Array.Resize(ref _handles, capacity);
             Array.Resize(ref _changedRecordBits, (capacity + 31) / 32);
 
-            int slotSize = capacity * 4;
+            int slotSize = DrawEntries * 4;
             int commandSize = MaxSubBatches * IndirectDrawSizes.IndirectCommandSize;
 
             for (int i = 0; i < FrameCount; ++i)
@@ -626,9 +635,9 @@ namespace Freefall.Graphics
                 // GPU output: visible indices (compute shader writes)
                 visibleIndicesBuffers[i] = Engine.Device.CreateDefaultBuffer(slotSize);
                 visibleIndicesUAVIndices[i] = Engine.Device.AllocateBindlessIndex();
-                Engine.Device.CreateStructuredBufferUAV(visibleIndicesBuffers[i], (uint)capacity, 4, visibleIndicesUAVIndices[i]);
+                Engine.Device.CreateStructuredBufferUAV(visibleIndicesBuffers[i], (uint)DrawEntries, 4, visibleIndicesUAVIndices[i]);
                 visibleIndicesSRVIndices[i] = Engine.Device.AllocateBindlessIndex();
-                Engine.Device.CreateStructuredBufferSRV(visibleIndicesBuffers[i], (uint)capacity, 4, visibleIndicesSRVIndices[i]);
+                Engine.Device.CreateStructuredBufferSRV(visibleIndicesBuffers[i], (uint)DrawEntries, 4, visibleIndicesSRVIndices[i]);
 
                 // GPU output: indirect commands (compute shader writes)
                 gpuCommandBuffers[i] = Engine.Device.CreateDefaultBuffer(commandSize);
@@ -733,6 +742,11 @@ namespace Freefall.Graphics
             device.CreateStructuredBufferUAV(visibilityCacheBuffer, (uint)capacity, VisibilityCacheStride, visibilityCacheUAVIndex);
             _visibilityCacheTick = -1;
 
+            // Zeroed too: no instance has a LOD fade state yet
+            lodFadeStateBuffer = device.CreateDefaultBuffer(capacity * LodFadeStride);
+            lodFadeStateUAVIndex = device.AllocateBindlessIndex();
+            device.CreateStructuredBufferUAV(lodFadeStateBuffer, (uint)capacity, LodFadeStride, lodFadeStateUAVIndex);
+
             var cpuHeapDesc = new DescriptorHeapDescription
             {
                 Type = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView,
@@ -768,7 +782,7 @@ namespace Freefall.Graphics
                 counterBufferCPUHandles[i] = cpuHandle;
 
                 var visibleIndicesCpuHandle = _cpuHeap.GetCPUDescriptorHandleForHeapStart() + ((int)((FrameCount + i) * handleIncrementSize));
-                visibleIndicesClearIndices[i] = CreateClearView(visibleIndicesBuffers[i], (uint)capacity, visibleIndicesCpuHandle);
+                visibleIndicesClearIndices[i] = CreateClearView(visibleIndicesBuffers[i], (uint)DrawEntries, visibleIndicesCpuHandle);
                 visibleIndicesCPUHandles[i] = visibleIndicesCpuHandle;
 
                 visibilityFlagsBuffers[i] = device.CreateDefaultBuffer(instanceBufferSize);
@@ -840,6 +854,31 @@ namespace Freefall.Graphics
             constants[35] = BitConverter.SingleToUInt32Bits(position.Y);
             constants[36] = BitConverter.SingleToUInt32Bits(position.Z);
             constants[37] = BitConverter.SingleToUInt32Bits(factor);
+        }
+
+        // 1 / EngineSettings.LodFadeTime, or 0 (switch at once) after a camera cut: another main camera, or one that
+        // moved further than LodCutDistance since the last culling. Everything in view would fade at the same time.
+        private const float LodCutDistance = 25f;
+        private static int _lodRateTick = -1;
+        private static float _lodRate;
+        private static Components.Camera? _lodRateCamera;
+        private static Vector3 _lodRateCameraAt;
+
+        private static float LodFadeRate()
+        {
+            if (_lodRateTick == Engine.TickCount)
+                return _lodRate;
+            _lodRateTick = Engine.TickCount;
+
+            var camera = Components.Camera.Main;
+            var at = camera?.Position ?? default;
+            bool cut = camera == null || camera != _lodRateCamera
+                || Vector3.DistanceSquared(at, _lodRateCameraAt) > LodCutDistance * LodCutDistance;
+            _lodRateCamera = camera;
+            _lodRateCameraAt = at;
+            float seconds = Engine.Settings.LodFadeTime;
+            _lodRate = cut || seconds <= 0f ? 0f : 1f / seconds;
+            return _lodRate;
         }
 
         // The main camera's position and LOD factor (0 = no valid camera: LOD-managed instances are not drawn this frame)
@@ -1206,6 +1245,13 @@ namespace Freefall.Graphics
             c[28] = visibilityCacheUAVIndex;                                  // VisibilityCacheIdx
             c[29] = TransformBuffer.Instance?.ChangedSlotsSrvIndex ?? 0;     // ChangedSlotsIdx: slots uploaded this tick
             c[39] = UploadChangedRecords();                                   // ChangedRecordsIdx
+            // The LOD crossfade: the states, the time, the fade rate, and the records that keep a state (the
+            // persistent ones, whose indices last). Not for records a compute shader wrote.
+            bool lodFade = Key.Effect?.RenderState?.LodFade == true && !_isGPUSourced;
+            c[8] = lodFade ? lodFadeStateUAVIndex : 0u;                       // LodFadeStateIdx
+            c[14] = BitConverter.SingleToUInt32Bits(Base.Time.TotalTime);     // LodTime
+            c[15] = BitConverter.SingleToUInt32Bits(LodFadeRate());           // LodFadeRate
+            c[17] = (uint)_persistentCount;                                   // LodFadeFrom
             WriteLodConstants(c);
             WritePerInstanceConstants(f);
             _lastCullTick = Engine.TickCount;
@@ -1709,6 +1755,10 @@ namespace Freefall.Graphics
                 DeferDispose(visibilityCacheBuffer, visibilityCacheUAVIndex);
             visibilityCacheBuffer = null; visibilityCacheUAVIndex = 0;
 
+            if (lodFadeStateBuffer != null)
+                DeferDispose(lodFadeStateBuffer, lodFadeStateUAVIndex);
+            lodFadeStateBuffer = null; lodFadeStateUAVIndex = 0;
+
             _cpuHeap?.Dispose();
             _cpuHeap = null;
             _cullerInitialized = false;
@@ -1800,6 +1850,10 @@ namespace Freefall.Graphics
             visibilityCacheBuffer?.Dispose();
             if (visibilityCacheUAVIndex != 0) Engine.Device.ReleaseBindlessIndex(visibilityCacheUAVIndex);
             visibilityCacheBuffer = null; visibilityCacheUAVIndex = 0;
+
+            lodFadeStateBuffer?.Dispose();
+            if (lodFadeStateUAVIndex != 0) Engine.Device.ReleaseBindlessIndex(lodFadeStateUAVIndex);
+            lodFadeStateBuffer = null; lodFadeStateUAVIndex = 0;
 
             _cpuHeap?.Dispose();
             _cpuHeap = null;

@@ -587,6 +587,7 @@ namespace Freefall.Graphics
                  pair.Value.SetParameter("CloudSceneDepthIdx", _cloudTargetIdx != 0 ? _cloudView.SceneDepthIndex : 0u);
                  pair.Value.SetParameter("LightClustersIdx", _lightClusters.ClustersSrv);
                  pair.Value.SetParameter("ClusterLightsIdx", _lightClusters.LightsSrv);
+                 pair.Value.SetParameter("BlueNoiseIdx", Freefall.Assets.InternalAssets.BlueNoise?.BindlessIndex ?? 0u);
              }
 
              // The atmosphere's LUTs for this view (sky-view, aerial perspective, ambient): the sky dome, the

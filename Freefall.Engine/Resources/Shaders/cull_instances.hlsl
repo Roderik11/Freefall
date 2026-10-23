@@ -153,6 +153,14 @@ cbuffer PushConstants : register(b3)
 #define VisibilityCacheIdx    CascadeMaskUAVIdx
 #define ChangedSlotsIdx       ExpansionUAVIdx
 #define ChangedRecordsIdx     ShadowReceiversUAVIdx
+// The camera chain's LOD crossfade (InstanceBatch.PrepareCull; every other chain leaves slot 8 at 0, and nothing
+// reads slots 14, 15 or 17 without it)
+#define LodFadeStateIdx       CounterOffsetIdx              // slot 8  — UAV: LodFadeState per instance (0 = no fades)
+#define LodTime               asfloat(BlockSumsUAVIdx)      // slot 14 — seconds (Time.TotalTime)
+#define LodFadeRate           asfloat(NumBlocksIdx)         // slot 15 — 1 / the fade's seconds (0 = switch at once: a camera cut)
+#define LodFadeFrom           SubbatchCountIdx              // slot 17 — the persistent records, the only ones that keep a state
+
+#include "lod_fade.hlsli"
 
 // Per-subbatch instance range (extended with MeshPartId)
 struct InstanceRange
@@ -213,24 +221,10 @@ struct MeshPartLod
 // The visibility kernels store the result as (partId + 1) in the visibility flags
 // (0 = culled); CSHistogram / CSGlobalScatter / CSComputeDepthKeys read it from there.
 //-----------------------------------------------------------------------------
-uint ResolveLodPart(uint subbatchId, row_major float4x4 world, float maxScaleSq)
+
+// The part of the chain whose head is partId (its entry: lod) at k
+uint LodChainPart(StructuredBuffer<MeshPartLod> lodRegistry, uint partId, MeshPartLod lod, float k)
 {
-    uint partId = subbatchId & ~LOD_MANAGED_BIT;
-    if ((subbatchId & LOD_MANAGED_BIT) == 0)
-        return partId;
-
-    // No valid main camera this frame (none exists, or it has not updated its projection yet, as in
-    // the frames right after entering/leaving play mode): draw nothing. Falling back to the chain
-    // head would draw every instance at LOD 0 at once, which is enough to hang the GPU on a forest.
-    if (LodFactor <= 0.0)
-        return INVALID_PART;
-
-    StructuredBuffer<MeshPartLod> lodRegistry = ResourceDescriptorHeap[MeshLodRegistryIdx];
-    MeshPartLod lod = lodRegistry[partId];
-
-    float3 toCamera = mul(float4(lod.Center, 1.0), world).xyz - float3(LodCameraX, LodCameraY, LodCameraZ);
-    float k = dot(toCamera, toCamera) / max(LodFactor * maxScaleSq, 1e-12);
-
     if (lod.CullK > 0.0 && k > lod.CullK)
         return INVALID_PART;
 
@@ -248,6 +242,52 @@ uint ResolveLodPart(uint subbatchId, row_major float4x4 world, float maxScaleSq)
         lod = lodRegistry[partId];
     }
     return partId;
+}
+
+// k of an instance (see MeshPartLod) by the chain head's entry
+float LodK(MeshPartLod head, row_major float4x4 world, float maxScaleSq)
+{
+    float3 toCamera = mul(float4(head.Center, 1.0), world).xyz - float3(LodCameraX, LodCameraY, LodCameraZ);
+    return dot(toCamera, toCamera) / max(LodFactor * maxScaleSq, 1e-12);
+}
+
+uint ResolveLodPart(uint subbatchId, row_major float4x4 world, float maxScaleSq)
+{
+    uint partId = subbatchId & ~LOD_MANAGED_BIT;
+    if ((subbatchId & LOD_MANAGED_BIT) == 0)
+        return partId;
+
+    // No valid main camera this frame (none exists, or it has not updated its projection yet, as in
+    // the frames right after entering/leaving play mode): draw nothing. Falling back to the chain
+    // head would draw every instance at LOD 0 at once, which is enough to hang the GPU on a forest.
+    if (LodFactor <= 0.0)
+        return INVALID_PART;
+
+    StructuredBuffer<MeshPartLod> lodRegistry = ResourceDescriptorHeap[MeshLodRegistryIdx];
+    MeshPartLod lod = lodRegistry[partId];
+    return LodChainPart(lodRegistry, partId, lod, LodK(lod, world, maxScaleSq));
+}
+
+// k a part (or none) keeps beyond the edges of its band once it is drawn: about 5 % of the distance, so a camera
+// resting at a switch distance does not start a crossfade every frame
+#define LOD_HYSTERESIS 1.1
+
+// ResolveLodPart for an instance that drew 'held' last frame (INVALID_PART: nothing): held stays while k is within
+// LOD_HYSTERESIS of its band, that is while it is still the part at k × or ÷ LOD_HYSTERESIS. "Nothing" holds the same
+// way, so the records of one tree that hand over at one distance (the last leaves LOD, the billboard) keep doing so
+// at the same frame. A LOD-managed id and a valid camera (LodFactor > 0) only.
+uint ResolveLodPartHeld(uint subbatchId, row_major float4x4 world, float maxScaleSq, uint held)
+{
+    uint partId = subbatchId & ~LOD_MANAGED_BIT;
+    StructuredBuffer<MeshPartLod> lodRegistry = ResourceDescriptorHeap[MeshLodRegistryIdx];
+    MeshPartLod lod = lodRegistry[partId];
+    float k = LodK(lod, world, maxScaleSq);
+
+    uint part = LodChainPart(lodRegistry, partId, lod, k);
+    if (part != held && (LodChainPart(lodRegistry, partId, lod, k * LOD_HYSTERESIS) == held
+                      || LodChainPart(lodRegistry, partId, lod, k / LOD_HYSTERESIS) == held))
+        return held;
+    return part;
 }
 
 // Per-instance descriptor (matches C# InstanceDescriptor exactly: 20 bytes = 5 uints)
@@ -668,6 +708,87 @@ void CameraCullInput(uint instanceIdx, out row_major float4x4 world, out float m
 }
 
 //-----------------------------------------------------------------------------
+// LOD crossfade (the camera chain, LodFadeStateIdx != 0: batches of effects that declare LodFade). A persistent
+// instance whose part changes draws both parts for 1 / LodFadeRate seconds: the new one on a share of the pixels that
+// grows from nothing to all, the old one on the rest (LodFadeClip in common.fx: the same blue noise for both, so they
+// cover each pixel once). CSVisibility steps the state; the compaction (CSHistogram, CSGlobalScatter) adds an entry for
+// the part faded from, and tags both entries with the share (lod_fade.hlsli). The shadows draw one part and switch at
+// the middle of the fade (InstanceBounds.Part).
+// The state is kept per instance in video memory (one buffer, written by the GPU only, in queue order), and starts
+// over when the record changed (ChangedRecordsIdx: a swap-remove moved another instance into the index) or was never
+// written (a new buffer is zeroed).
+//-----------------------------------------------------------------------------
+#define LOD_FADE_WRITTEN    0x80000000u
+#define LOD_FADE_PART_MASK  0x00FFFFFFu
+
+struct LodFadeState     // 16 bytes (InstanceBatch.LodFadeStride)
+{
+    uint Part;          // the part drawn + 1 (0 = none) | LOD_FADE_WRITTEN
+    uint From;          // the part it fades from + 1 (0 = none); Part's when no fade runs
+    float Start;        // LodTime the fade began
+    uint Word;          // this frame's fade for the compaction: the share (1..127) << 24 | the part faded from + 1 when
+                        // the camera sees it; 0 = no fade
+};
+
+// The fade word CSVisibility left for an instance this frame (0 = no fade)
+uint LodFadeWord(uint instanceIdx)
+{
+    if (LodFadeStateIdx == 0 || instanceIdx >= LodFadeFrom)
+        return 0;
+    RWStructuredBuffer<LodFadeState> states = ResourceDescriptorHeap[LodFadeStateIdx];
+    return states[instanceIdx].Word;
+}
+
+// The instance's part this frame by its fade state, which it steps: a switch (with hysteresis) starts a fade, none
+// starts on a new record or a camera cut (LodFadeRate 0), and a fade that has run its time ends. fromPart and share:
+// the part faded from (INVALID_PART: nothing) and the new part's share in 128ths (0 = no fade runs).
+uint StepLodFade(inout LodFadeState state, uint instanceIdx, uint subbatchId, row_major float4x4 world, float maxScaleSq,
+                 out uint fromPart, out uint share)
+{
+    bool fresh = (state.Part & LOD_FADE_WRITTEN) == 0 || BitSet(ChangedRecordsIdx, instanceIdx);
+    uint was = state.Part & ~LOD_FADE_WRITTEN;
+    uint part;
+    if (fresh)
+        part = ResolveLodPart(subbatchId, world, maxScaleSq);
+    else
+        part = ResolveLodPartHeld(subbatchId, world, maxScaleSq, was - 1);
+    uint code = part + 1;   // INVALID_PART + 1 = 0: none
+
+    if (fresh || LodFadeRate <= 0.0)
+        state.From = code;
+    else if (code != was)
+    {
+        // From the part drawn so far. A fade still running ends there; one that turns back (to the part it came
+        // from) carries on from the share it had, the other way round.
+        float back = code == state.From ? 1.0 - saturate((LodTime - state.Start) * LodFadeRate) : 0.0;
+        state.From = was;
+        state.Start = LodTime - back / LodFadeRate;
+    }
+    state.Part = code | LOD_FADE_WRITTEN;
+
+    float fade = saturate((LodTime - state.Start) * LodFadeRate);
+    if (fade >= 1.0)
+        state.From = code;
+
+    fromPart = state.From - 1;
+    share = state.From != code ? clamp((uint)(fade * 128.0 + 0.5), 1u, 127u) : 0u;
+    return part;
+}
+
+void StoreLodFade(uint instanceIdx, LodFadeState state, uint word)
+{
+    RWStructuredBuffer<LodFadeState> states = ResourceDescriptorHeap[LodFadeStateIdx];
+    state.Word = word;
+    states[instanceIdx] = state;
+}
+
+void ClearLodFadeWord(uint instanceIdx)
+{
+    RWStructuredBuffer<LodFadeState> states = ResourceDescriptorHeap[LodFadeStateIdx];
+    states[instanceIdx].Word = 0;
+}
+
+//-----------------------------------------------------------------------------
 // Pass 1: CSVisibility - Write visibility flags (1 if visible, 0 if not)
 // Also counts visible instances per subbatch for command generation
 //-----------------------------------------------------------------------------
@@ -692,23 +813,58 @@ void CSVisibility(uint3 dispatchThreadId : SV_DispatchThreadID)
     bool skinned;
     CameraCullInput(instanceIdx, world, maxScaleSq, subbatchId, skinned);
 
-    uint subBatch = ResolveLodPart(subbatchId, world, maxScaleSq);
-    if (subBatch == INVALID_PART)
+    // The part to draw, and while a crossfade runs the part it fades from and the new part's share (0 = no fade).
+    // Without a valid camera the state waits: ResolveLodPart draws nothing then.
+    uint subBatch, fromPart = INVALID_PART, share = 0;
+    bool fades = LodFadeStateIdx != 0 && instanceIdx < LodFadeFrom && (subbatchId & LOD_MANAGED_BIT) != 0 && LodFactor > 0.0;
+    LodFadeState fadeState = (LodFadeState)0;
+    if (fades)
+    {
+        RWStructuredBuffer<LodFadeState> fadeStates = ResourceDescriptorHeap[LodFadeStateIdx];
+        fadeState = fadeStates[instanceIdx];
+        subBatch = StepLodFade(fadeState, instanceIdx, subbatchId, world, maxScaleSq, fromPart, share);
+    }
+    else
+    {
+        subBatch = ResolveLodPart(subbatchId, world, maxScaleSq);
+        // The compaction reads every persistent record's fade word: clear the one a LOD-managed record left in this
+        // index before another took its place, and all of them while there is no camera (the states wait)
+        if (LodFadeStateIdx != 0 && instanceIdx < LodFadeFrom && (LodFactor <= 0.0 || BitSet(ChangedRecordsIdx, instanceIdx)))
+            ClearLodFadeWord(instanceIdx);
+    }
+
+    // The camera tests the sphere of the part drawn, or of the part fading out when there is none
+    uint testPart = subBatch != INVALID_PART ? subBatch : fromPart;
+    if (testPart == INVALID_PART)
     {
         visibilityFlags[instanceIdx] = 0;
         WriteInstanceBounds(instanceIdx, 0, 0, INVALID_PART);
+        if (fades)
+            StoreLodFade(instanceIdx, fadeState, 0);
         return;
     }
 
     // Look up local bounding sphere from mesh registry (persistent, not per-instance)
-    float4 localSphere = meshRegistry[subBatch].LocalBounds;
+    float4 localSphere = meshRegistry[testPart].LocalBounds;
 
     // Transform sphere to world space
     float3 worldCenter = mul(float4(localSphere.xyz, 1.0), world).xyz;
     float worldRadius = localSphere.w * sqrt(maxScaleSq);
 
-    // For the point light shadow culling; skinned: the bind-pose bounds do not hold the animated pose
-    WriteInstanceBounds(instanceIdx, worldCenter, skinned ? worldRadius * 1.5 : worldRadius, subBatch);
+    // For the shadow culling, which draws one part: the one faded from until the middle of a crossfade.
+    // Skinned: the bind-pose bounds do not hold the animated pose.
+    uint shadowPart = share != 0 && share < 64 ? fromPart : subBatch;
+    if (shadowPart == testPart)
+        WriteInstanceBounds(instanceIdx, worldCenter, skinned ? worldRadius * 1.5 : worldRadius, shadowPart);
+    else if (shadowPart == INVALID_PART)
+        WriteInstanceBounds(instanceIdx, 0, 0, INVALID_PART);
+    else
+    {
+        float4 shadowSphere = meshRegistry[shadowPart].LocalBounds;
+        float shadowRadius = shadowSphere.w * sqrt(maxScaleSq);
+        WriteInstanceBounds(instanceIdx, mul(float4(shadowSphere.xyz, 1.0), world).xyz,
+                            skinned ? shadowRadius * 1.5 : shadowRadius, shadowPart);
+    }
 
     // Frustum test — save result for stats (avoid redundant re-evaluation)
     bool frustumVisible = IsVisible(worldCenter, worldRadius);
@@ -725,10 +881,14 @@ void CSVisibility(uint3 dispatchThreadId : SV_DispatchThreadID)
     }
     
     bool visible = frustumVisible && !hiZOccluded;
-    
-    // Write visibility flag: 0 = culled, otherwise resolved MeshPartId + 1
+
+    // Write visibility flag: 0 = culled, otherwise resolved MeshPartId + 1 (INVALID_PART + 1 = 0: only fading out)
     visibilityFlags[instanceIdx] = visible ? (subBatch + 1u) : 0u;
-    
+
+    // And the crossfade's word for the compaction
+    if (fades)
+        StoreLodFade(instanceIdx, fadeState, share != 0 ? (share << 24) | (visible ? fromPart + 1u : 0u) : 0u);
+
     // Update cull stats — wave-aggregated to reduce atomic contention
     if (CullStatsUAVIdx != 0)
     {
@@ -763,15 +923,15 @@ void CSHistogram(uint3 dispatchThreadId : SV_DispatchThreadID)
     // Read visibility flag from the visibility pass (0 = culled, else LOD-resolved MeshPartId + 1)
     RWStructuredBuffer<uint> visibilityFlags = ResourceDescriptorHeap[VisibilityFlagsIdx];
     uint flag = visibilityFlags[instanceIdx];
+    // A crossfade's part faded from + 1, when the camera sees it (0 = none)
+    uint from = LodFadeWord(instanceIdx) & LOD_FADE_PART_MASK;
 
-    if (flag == 0)
-        return;
-
-    uint meshPartId = flag - 1;
-    
     // Atomically increment histogram counter for this MeshPartId
     RWStructuredBuffer<uint> histogram = ResourceDescriptorHeap[HistogramIdx];
-    InterlockedAdd(histogram[meshPartId], 1);
+    if (flag != 0)
+        InterlockedAdd(histogram[flag - 1], 1);
+    if (from != 0)
+        InterlockedAdd(histogram[from - 1], 1);
 }
 
 //-----------------------------------------------------------------------------
@@ -923,14 +1083,24 @@ void CSGlobalScatter(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupId
 
     // 0 = culled, else LOD-resolved MeshPartId + 1
     uint flag = visibilityFlags[instanceIdx];
+
+    // A crossfading instance has an entry for each part, both tagged with the new part's share (lod_fade.hlsli)
+    uint word = LodFadeWord(instanceIdx);
+    uint entry = word != 0 ? instanceIdx | DRAW_FADE_BIT | ((word >> 24) << DRAW_FADE_SHIFT) : instanceIdx;
+
+    uint outputIdx;
     if (flag >= 1)
     {
         uint meshPartId = flag - 1;
-        
-        uint outputIdx;
         InterlockedAdd(counters[meshPartId], 1, outputIdx);
-        
-        visibleOut[outputIdx] = instanceIdx;
+        visibleOut[outputIdx] = entry;
+    }
+
+    uint from = word & LOD_FADE_PART_MASK;
+    if (from != 0)
+    {
+        InterlockedAdd(counters[from - 1], 1, outputIdx);
+        visibleOut[outputIdx] = entry | DRAW_FADE_OUT_BIT;
     }
 }
 
@@ -1648,15 +1818,18 @@ void CSComputeDepthKeys(uint3 dispatchThreadId : SV_DispatchThreadID)
         return;
     }
     
-    uint instanceIdx = visibleIndices[idx];
-    
+    uint entry = visibleIndices[idx];
+
     // Padding entries (0xFFFFFFFF) sort to end
-    if (instanceIdx == 0xFFFFFFFF)
+    if (entry == 0xFFFFFFFF)
     {
         sortKeys[idx] = uint2(0xFFFFFFFF, 0xFFFFFFFF);
         return;
     }
-    
+
+    // A crossfade tags the entries (lod_fade.hlsli); they keep the tags through the sort
+    uint instanceIdx = LodFadeStateIdx != 0 ? DrawEntryIndex(entry) : entry;
+
     StructuredBuffer<InstanceDescriptor> descriptors = ResourceDescriptorHeap[DescriptorBufferIdx];
     StructuredBuffer<row_major float4x4> transforms = ResourceDescriptorHeap[GlobalTransformsIdx];
     RWStructuredBuffer<uint> visibilityFlags = ResourceDescriptorHeap[VisibilityFlagsIdx];
@@ -1677,12 +1850,15 @@ void CSComputeDepthKeys(uint3 dispatchThreadId : SV_DispatchThreadID)
     if (SortDirection == 1)
         distQuantized = (~distQuantized) & 0xFFFFF;
     
-    // LOD-resolved MeshPartId + 1 (visible instances only reach here, so the flag is non-zero)
-    uint meshPartId = visibilityFlags[instanceIdx] - 1;
+    // LOD-resolved MeshPartId + 1 (visible instances only reach here, so the flag is non-zero); the entry of a
+    // crossfade's part faded from: that part's
+    uint meshPartId = (LodFadeStateIdx != 0 && (entry & DRAW_FADE_OUT_BIT) != 0)
+        ? (LodFadeWord(instanceIdx) & LOD_FADE_PART_MASK) - 1
+        : visibilityFlags[instanceIdx] - 1;
 
     // Composite key: meshPartId in upper 12 bits, distance in lower 20 bits
     uint compositeKey = (meshPartId << 20) | (distQuantized & 0xFFFFF);
-    sortKeys[idx] = uint2(compositeKey, instanceIdx);
+    sortKeys[idx] = uint2(compositeKey, entry);
 }
 
 //-----------------------------------------------------------------------------
