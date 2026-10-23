@@ -31,6 +31,7 @@ cbuffer PushConstants : register(b3)
     uint _reserved15;
     // Slot 16: Debug
     uint DebugMode;             // 16: Debug visualization mode
+    uint IndexedDraw;           // 17: 1 = an indexed draw, the vertex index is SV_VertexID (common.fx MeshVertexIndex)
 };
 
 #include "common.fx"
@@ -153,8 +154,7 @@ VSOutput VS(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_InstanceI
     StructuredBuffer<MeshPartEntry> meshRegistry = ResourceDescriptorHeap[MeshRegistryIdx];
     MeshPartEntry part = meshRegistry[MeshPartId];
 
-    StructuredBuffer<uint> indices = ResourceDescriptorHeap[part.IndexBufferIdx];
-    uint vertexID = indices[fetchID + part.BaseIndex];
+    uint vertexID = MeshVertexIndex(part, primitiveVertexID, fetchID, IndexedDraw);   // indexed: never mirrored here
 
     StructuredBuffer<float3> positions = ResourceDescriptorHeap[part.PosBufferIdx];
     StructuredBuffer<float3> normals = ResourceDescriptorHeap[part.NormBufferIdx];

@@ -41,6 +41,7 @@ cbuffer PushConstants : register(b3)
     uint _reserved14;
     uint _reserved15;
     uint DebugMode;                 // 16: Engine.Settings.DebugVisualizationMode
+    uint IndexedDraw;               // 17: 1 = an indexed draw, the vertex index is SV_VertexID (common.fx MeshVertexIndex)
 };
 
 #include "common.fx"
@@ -80,10 +81,10 @@ MeshVertex FetchMeshVertex(uint vertexId, uint instanceId)
         fetch = vertexId - corner + (corner == 1u ? 2u : (corner == 2u ? 1u : 0u));
     }
 
+    // An indexed draw hands the vertex over (the camera draws a part with a mirrored instance in view pulled)
     StructuredBuffer<MeshPartEntry> registry = ResourceDescriptorHeap[MeshRegistryIdx];
     MeshPartEntry part = registry[MeshPartId];
-    StructuredBuffer<uint> indices = ResourceDescriptorHeap[part.IndexBufferIdx];
-    uint index = indices[fetch + part.BaseIndex];
+    uint index = MeshVertexIndex(part, vertexId, fetch, IndexedDraw);
 
     StructuredBuffer<float3> positions = ResourceDescriptorHeap[part.PosBufferIdx];
     StructuredBuffer<float3> normals = ResourceDescriptorHeap[part.NormBufferIdx];

@@ -275,7 +275,7 @@ namespace Freefall.Animation
                     pb.Set(PK.State(ID, PK.LevelFrom), from);
                 }
                 else if (left > 0f)
-                    left = MathF.Max(0f, left - Base.Time.SmoothDelta / LevelFade);
+                    left = MathF.Max(0f, left - (animator?.StepDelta ?? Base.Time.SmoothDelta) / LevelFade);
                 pb.Set(PK.State(ID, PK.LevelLeft), left);
 
                 Weigh(input, level, normalizedWeights);

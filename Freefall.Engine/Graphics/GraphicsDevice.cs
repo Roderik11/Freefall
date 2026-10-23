@@ -451,6 +451,21 @@ namespace Freefall.Graphics
                 Debug.LogError("GraphicsDevice", $"Creating MeshDecoCommandSignature: {ex.Message}");
             }
 
+            // BindlessCommandSignature as an indexed draw: the 2 constants, the mesh's index buffer, DrawIndexed
+            // (IndexedDrawCommand, 48 bytes with padding)
+            var indexedArgs = new IndirectArgumentDescription[]
+            {
+                constantArg,
+                new IndirectArgumentDescription { Type = IndirectArgumentType.IndexBufferView },
+                new IndirectArgumentDescription { Type = IndirectArgumentType.DrawIndexed }
+            };
+            try {
+                _indexedCommandSignature = _device.CreateCommandSignature<ID3D12CommandSignature>(
+                    new CommandSignatureDescription(IndirectDrawSizes.IndexedCommandSize, indexedArgs), _globalRootSignature);
+            } catch (Exception ex) {
+                Debug.LogError("GraphicsDevice", $"Creating IndexedCommandSignature: {ex.Message}");
+            }
+
             // DispatchMesh command signature: 3 uints (groupsX, groupsY, groupsZ)
             var argsDispatchMesh = new IndirectArgumentDescription[]
             {
@@ -484,6 +499,7 @@ namespace Freefall.Graphics
         private ID3D12CommandSignature _drawIndexedInstancedSignature;
         private ID3D12CommandSignature _bindlessCommandSignature = null!;
         private ID3D12CommandSignature _meshDecoCommandSignature = null!;
+        private ID3D12CommandSignature? _indexedCommandSignature;
         private ID3D12CommandSignature _dispatchMeshSignature;
         private ID3D12CommandSignature _dispatchSignature;
 
@@ -493,6 +509,8 @@ namespace Freefall.Graphics
         public ID3D12CommandSignature BindlessCommandSignature => _bindlessCommandSignature;
         /// <summary>14 root constants (slots 2-15) + DrawInstanced, 72-byte stride — mesh-mode terrain decorators.</summary>
         public ID3D12CommandSignature MeshDecoCommandSignature => _meshDecoCommandSignature;
+        /// <summary>2 root constants (slots 2-3) + index buffer view + DrawIndexed, 48-byte stride (IndexedDrawCommand).</summary>
+        public ID3D12CommandSignature? IndexedCommandSignature => _indexedCommandSignature;
         /// <summary>DispatchMesh indirect command signature (3 uints: X, Y, Z)</summary>
         public ID3D12CommandSignature DispatchMeshSignature => _dispatchMeshSignature;
         /// <summary>Compute Dispatch indirect command signature (3 uints: X, Y, Z)</summary>
@@ -510,6 +528,7 @@ namespace Freefall.Graphics
             _drawIndexedInstancedSignature?.Dispose();
             _bindlessCommandSignature?.Dispose();
             _meshDecoCommandSignature?.Dispose();
+            _indexedCommandSignature?.Dispose();
             _dispatchMeshSignature?.Dispose();
             _dispatchSignature?.Dispose();
             _wicFactory?.Dispose();

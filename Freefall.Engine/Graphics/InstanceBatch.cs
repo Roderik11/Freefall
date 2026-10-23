@@ -197,6 +197,17 @@ namespace Freefall.Graphics
         private uint[] shadowVisibleIndicesSRVIndices = new uint[FrameCount];
         private ID3D12Resource[] shadowCommandBuffers = new ID3D12Resource[FrameCount];
         private uint[] shadowCommandUAVIndices = new uint[FrameCount];
+        // Indexed draws (DrawsIndexed): the commands as IndexedDrawCommands, beside the pulled ones in the opaque command
+        // buffer. The camera chain's CSMain writes a part to one of the two (the indexed ones counted in the draw count's
+        // [1]), the shadow chains' CSCompactCommands write every command to both. _indexedReady: the last chain that culled
+        // this batch wrote them. The mirrored parts: a uint per mesh part, the last camera culling (_mirrorCull) in which a
+        // visible instance of the part was mirrored; such a part stays pulled in the camera's draw.
+        private ID3D12Resource?[] indexedCommandBuffers = new ID3D12Resource?[FrameCount];
+        private uint[] indexedCommandUAVIndices = new uint[FrameCount];
+        private bool _indexedReady;
+        private ID3D12Resource? mirrorPartsBuffer;
+        private uint mirrorPartsUAVIndex;
+        private uint _mirrorCull;
         private ID3D12Resource[] shadowCounterBuffers = new ID3D12Resource[FrameCount];
         private uint[] shadowCounterUAVIndices = new uint[FrameCount];
         private ID3D12Resource[] shadowHistogramBuffers = new ID3D12Resource[FrameCount];
@@ -809,8 +820,9 @@ namespace Freefall.Graphics
                 histogramClearIndices[i] = CreateClearView(histogramBuffers[i], (uint)MeshRegistry.MaxMeshParts, histogramCpuHandle);
                 histogramCPUHandles[i] = histogramCpuHandle;
                 
-                // Draw count buffer for ExecuteIndirect count parameter
-                drawCountBuffers[i] = device.CreateDefaultBuffer(sizeof(uint));
+                // Draw count buffer for ExecuteIndirect count parameter: [0] the pulled commands, [1] the camera's indexed
+                // ones (DrawsIndexed; the shadow chains count both kinds in [0])
+                drawCountBuffers[i] = device.CreateDefaultBuffer(2 * sizeof(uint));
                 drawCountUAVIndices[i] = device.AllocateBindlessIndex();
                 var drawCountUavDesc = new UnorderedAccessViewDescription
                 {
@@ -819,7 +831,7 @@ namespace Freefall.Graphics
                     Buffer = new BufferUnorderedAccessView
                     {
                         FirstElement = 0,
-                        NumElements = 1,
+                        NumElements = 2,
                         StructureByteStride = sizeof(uint),
                         Flags = BufferUnorderedAccessViewFlags.None
                     }
@@ -828,7 +840,7 @@ namespace Freefall.Graphics
                     drawCountBuffers[i], null, drawCountUavDesc, device.GetCpuHandle(drawCountUAVIndices[i]));
                 
                 var drawCountCpuHandle = _cpuHeap.GetCPUDescriptorHandleForHeapStart() + ((int)((3 * FrameCount + i) * handleIncrementSize));
-                drawCountClearIndices[i] = CreateClearView(drawCountBuffers[i], 1, drawCountCpuHandle);
+                drawCountClearIndices[i] = CreateClearView(drawCountBuffers[i], 2, drawCountCpuHandle);
                 drawCountCPUHandles[i] = drawCountCpuHandle;
                 
                 // Depth sort keys buffer: uint2 per entry (8 bytes) for GPU distance sorting
@@ -1252,6 +1264,16 @@ namespace Freefall.Graphics
             c[14] = BitConverter.SingleToUInt32Bits(Base.Time.TotalTime);     // LodTime
             c[15] = BitConverter.SingleToUInt32Bits(LodFadeRate());           // LodFadeRate
             c[17] = (uint)_persistentCount;                                   // LodFadeFrom
+            // Indexed draws: CSMain writes a part's command as an indexed one, unless the part has a mirrored instance
+            // in view (CSVisibility marks those)
+            _indexedReady = DrawsIndexed;
+            if (_indexedReady)
+            {
+                c[12] = IndexedCommandsUav(f);                                // IndexedCommandsIdx
+                c[30] = MirrorPartsUav();                                     // MirrorPartsIdx
+                if (++_mirrorCull == 0) _mirrorCull = 1;
+                c[31] = _mirrorCull;                                          // MirrorCull
+            }
             WriteLodConstants(c);
             WritePerInstanceConstants(f);
             _lastCullTick = Engine.TickCount;
@@ -1340,16 +1362,52 @@ namespace Freefall.Graphics
             StageBarrier(list);
             PixMarker.End(list);
 
-            // Pack the non-empty commands into the opaque command buffer (separate source and destination)
+            // Pack the non-empty commands into the opaque command buffer (separate source and destination), and for
+            // the batches that draw indexed into their indexed commands too (IndexedCommandsIdx)
             PixMarker.Begin(list, "Compact commands");
             foreach (var batch in _stageBatches)
             {
                 batch._cullConstants[18] = batch.drawCountUAVIndices[f];    // DrawCountUAVIdx
                 batch._cullConstants[9] = batch.gpuCommandUAVIndices[f];    // dest = opaque command buffer
+                batch._indexedReady = batch.DrawsIndexed;
+                batch._cullConstants[12] = batch._indexedReady ? batch.IndexedCommandsUav(f) : 0u;   // IndexedCommandsIdx
             }
             DispatchStage(list, culler.CompactCommandsPSO, StageItems.Parts, 64);
             StageBarrier(list);
             PixMarker.End(list);
+        }
+
+        // The batch draws through IndexedCommandSignature (EngineSettings.IndexedDraws; Effect.DrawsIndexed)
+        private bool DrawsIndexed => Engine.Settings.IndexedDraws && Key.Effect?.DrawsIndexed == true
+            && Engine.Device.IndexedCommandSignature != null;
+
+        // This frame slot's indexed command buffer (made on first use), as a UAV
+        private uint IndexedCommandsUav(int f)
+        {
+            if (indexedCommandBuffers[f] == null)
+            {
+                var device = Engine.Device;
+                indexedCommandBuffers[f] = device.CreateDefaultBuffer(MaxSubBatches * IndirectDrawSizes.IndexedCommandSize);
+                indexedCommandUAVIndices[f] = device.AllocateBindlessIndex();
+                device.CreateStructuredBufferUAV(indexedCommandBuffers[f]!, MaxSubBatches, (uint)IndirectDrawSizes.IndexedCommandSize,
+                    indexedCommandUAVIndices[f]);
+            }
+            return indexedCommandUAVIndices[f];
+        }
+
+        // The mirrored parts (made on first use, zeroed: no culling has marked a part), as a UAV. One buffer for every
+        // frame slot: each culling marks with its own number, and the GPU runs them in order.
+        private uint MirrorPartsUav()
+        {
+            if (mirrorPartsBuffer == null)
+            {
+                var device = Engine.Device;
+                mirrorPartsBuffer = device.CreateDefaultBuffer(MeshRegistry.MaxMeshParts * sizeof(uint));
+                mirrorPartsUAVIndex = device.AllocateBindlessIndex();
+                device.CreateStructuredBufferUAV(mirrorPartsBuffer, (uint)MeshRegistry.MaxMeshParts, sizeof(uint), mirrorPartsUAVIndex);
+                _mirrorCull = 0;
+            }
+            return mirrorPartsUAVIndex;
         }
 
         // Constants and clears of this batch's cascade culling. The draw count is cleared
@@ -1446,7 +1504,8 @@ namespace Freefall.Graphics
             StageBarrier(list);
             PixMarker.End(list);
 
-            // Commands at fixed part indices, then packed into the opaque command buffer as the cascades do
+            // Commands at fixed part indices, then packed into the opaque command buffer (and the indexed ones) as the
+            // cascades do
             PixMarker.Begin(list, "Commands");
             DispatchStage(list, culler.MainPSO, StageItems.Parts, 64);
             StageBarrier(list);
@@ -1455,6 +1514,8 @@ namespace Freefall.Graphics
             {
                 batch._cullConstants[18] = batch.drawCountUAVIndices[f];    // DrawCountUAVIdx
                 batch._cullConstants[9] = batch.gpuCommandUAVIndices[f];    // dest = opaque command buffer
+                batch._indexedReady = batch.DrawsIndexed;
+                batch._cullConstants[12] = batch._indexedReady ? batch.IndexedCommandsUav(f) : 0u;   // IndexedCommandsIdx
             }
             DispatchStage(list, culler.CompactCommandsPSO, StageItems.Parts, 64);
             StageBarrier(list);
@@ -1556,27 +1617,37 @@ namespace Freefall.Graphics
             // Transition buffers for reading
             var countBuffer = drawCountBuffers[frameIndex];
 
+            // Indexed draws when the culling wrote them (DrawsIndexed), all of them: the shadow vertex shaders never swap
+            // corners. An effect that can take them reads slot 17 (IndexedDraw): 1 = the vertex index is SV_VertexID.
+            bool indexed = _indexedReady && countBuffer != null && indexedCommandBuffers[frameIndex] != null;
+            bool readsIndexedFlag = Key.Effect?.DrawsIndexed == true;
+            if (readsIndexedFlag)
+                commandList.SetGraphicsRoot32BitConstant(0, indexed ? 1u : 0u, Effect.IndexedDrawSlot);
+
             if (countBuffer != null)
             {
+                var argumentBuffer = indexed ? indexedCommandBuffers[frameIndex]! : commandBuffer;
                 commandList.Barriers(
                     new ResourceBarrier(new ResourceTransitionBarrier(shadowExpansionBuffers[frameIndex],
                         ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource)),
-                    new ResourceBarrier(new ResourceTransitionBarrier(commandBuffer,
+                    new ResourceBarrier(new ResourceTransitionBarrier(argumentBuffer,
                         ResourceStates.UnorderedAccess, ResourceStates.IndirectArgument)),
                     new ResourceBarrier(new ResourceTransitionBarrier(countBuffer,
                         ResourceStates.UnorderedAccess, ResourceStates.IndirectArgument)));
 
                 commandList.ExecuteIndirect(
-                    Engine.Device.BindlessCommandSignature,
+                    indexed ? Engine.Device.IndexedCommandSignature! : Engine.Device.BindlessCommandSignature,
                     (uint)SubBatchCount,
-                    commandBuffer,
+                    argumentBuffer,
                     0,
                     countBuffer,
                     0
                 );
+                if (indexed)
+                    commandList.SetGraphicsRoot32BitConstant(0, 0u, Effect.IndexedDrawSlot);
 
                 commandList.Barriers(
-                    new ResourceBarrier(new ResourceTransitionBarrier(commandBuffer,
+                    new ResourceBarrier(new ResourceTransitionBarrier(argumentBuffer,
                         ResourceStates.IndirectArgument, ResourceStates.UnorderedAccess)),
                     new ResourceBarrier(new ResourceTransitionBarrier(countBuffer,
                         ResourceStates.IndirectArgument, ResourceStates.UnorderedAccess)),
@@ -1645,6 +1716,14 @@ namespace Freefall.Graphics
 
             var countBuffer = drawCountBuffers[frameIndex];
 
+            // Indexed draws when the camera's culling wrote them (DrawsIndexed): the parts with a mirrored instance in
+            // view stay pulled (count [0]), the rest are indexed (count [1]). Slot 17 (IndexedDraw) tells the effect's
+            // vertex shaders which.
+            var indexedBuffer = _indexedReady ? indexedCommandBuffers[frameIndex] : null;
+            bool readsIndexedFlag = Key.Effect?.DrawsIndexed == true;
+            if (readsIndexedFlag)
+                commandList.SetGraphicsRoot32BitConstant(0, 0u, Effect.IndexedDrawSlot);
+
             if (countBuffer != null)
             {
                 // Batch all pre-draw transitions
@@ -1655,6 +1734,8 @@ namespace Freefall.Graphics
                         ResourceStates.UnorderedAccess, ResourceStates.IndirectArgument)),
                     new ResourceBarrier(new ResourceTransitionBarrier(countBuffer,
                         ResourceStates.UnorderedAccess, ResourceStates.IndirectArgument)));
+                if (indexedBuffer != null)
+                    commandList.ResourceBarrierTransition(indexedBuffer, ResourceStates.UnorderedAccess, ResourceStates.IndirectArgument);
 
                 commandList.ExecuteIndirect(
                     Engine.Device.BindlessCommandSignature,
@@ -1664,6 +1745,19 @@ namespace Freefall.Graphics
                     countBuffer,
                     0
                 );
+                if (indexedBuffer != null)
+                {
+                    commandList.SetGraphicsRoot32BitConstant(0, 1u, Effect.IndexedDrawSlot);
+                    commandList.ExecuteIndirect(
+                        Engine.Device.IndexedCommandSignature!,
+                        (uint)SubBatchCount,
+                        indexedBuffer,
+                        0,
+                        countBuffer,
+                        sizeof(uint)
+                    );
+                    commandList.SetGraphicsRoot32BitConstant(0, 0u, Effect.IndexedDrawSlot);
+                }
 
                 // Batch all post-draw transitions
                 commandList.Barriers(
@@ -1673,6 +1767,8 @@ namespace Freefall.Graphics
                         ResourceStates.IndirectArgument, ResourceStates.UnorderedAccess)),
                     new ResourceBarrier(new ResourceTransitionBarrier(visibleIndicesBuffers[frameIndex],
                         ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess)));
+                if (indexedBuffer != null)
+                    commandList.ResourceBarrierTransition(indexedBuffer, ResourceStates.IndirectArgument, ResourceStates.UnorderedAccess);
             }
             else
             {
@@ -1759,6 +1855,11 @@ namespace Freefall.Graphics
                 DeferDispose(lodFadeStateBuffer, lodFadeStateUAVIndex);
             lodFadeStateBuffer = null; lodFadeStateUAVIndex = 0;
 
+            if (mirrorPartsBuffer != null)
+                DeferDispose(mirrorPartsBuffer, mirrorPartsUAVIndex);
+            mirrorPartsBuffer = null; mirrorPartsUAVIndex = 0;
+            _indexedReady = false;
+
             _cpuHeap?.Dispose();
             _cpuHeap = null;
             _cullerInitialized = false;
@@ -1782,6 +1883,12 @@ namespace Freefall.Graphics
 
                     DeferDispose(shadowCommandBuffers[f], shadowCommandUAVIndices[f]);
                     shadowCommandBuffers[f] = null; shadowCommandUAVIndices[f] = 0;
+
+                    // The indexed commands too (made again on first use; the camera's culling uses them as well)
+                    if (indexedCommandBuffers[f] != null)
+                        DeferDispose(indexedCommandBuffers[f], indexedCommandUAVIndices[f]);
+                    indexedCommandBuffers[f] = null; indexedCommandUAVIndices[f] = 0;
+                    _indexedReady = false;
 
                     DeferDispose(shadowCounterBuffers[f], shadowCounterUAVIndices[f]);
                     shadowCounterBuffers[f] = null; shadowCounterUAVIndices[f] = 0;
@@ -1855,6 +1962,10 @@ namespace Freefall.Graphics
             if (lodFadeStateUAVIndex != 0) Engine.Device.ReleaseBindlessIndex(lodFadeStateUAVIndex);
             lodFadeStateBuffer = null; lodFadeStateUAVIndex = 0;
 
+            mirrorPartsBuffer?.Dispose();
+            if (mirrorPartsUAVIndex != 0) Engine.Device.ReleaseBindlessIndex(mirrorPartsUAVIndex);
+            mirrorPartsBuffer = null; mirrorPartsUAVIndex = 0;
+
             _cpuHeap?.Dispose();
             _cpuHeap = null;
             _cullerInitialized = false;
@@ -1877,6 +1988,10 @@ namespace Freefall.Graphics
 
                     shadowCommandBuffers[f]?.Dispose();
                     if (shadowCommandUAVIndices[f] != 0) Engine.Device.ReleaseBindlessIndex(shadowCommandUAVIndices[f]);
+
+                    indexedCommandBuffers[f]?.Dispose();
+                    if (indexedCommandUAVIndices[f] != 0) Engine.Device.ReleaseBindlessIndex(indexedCommandUAVIndices[f]);
+                    indexedCommandBuffers[f] = null; indexedCommandUAVIndices[f] = 0;
 
                     shadowCounterBuffers[f]?.Dispose();
                     if (shadowCounterUAVIndices[f] != 0) Engine.Device.ReleaseBindlessIndex(shadowCounterUAVIndices[f]);

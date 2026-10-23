@@ -22,7 +22,7 @@ cbuffer PushConstants : register(b3)
     uint _reserved15;
     // Slot 16: Debug
     uint DebugMode;             // 16: Debug visualization mode
-    uint _reserved17;
+    uint IndexedDraw;           // 17: 1 = an indexed draw, the vertex index is SV_VertexID (common.fx MeshVertexIndex)
     uint _reserved18;
     uint _reserved19;
     // Slots 20-21: Shadow pass
@@ -110,9 +110,9 @@ VSOutput VS(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_InstanceI
     StructuredBuffer<MeshPartEntry> meshRegistry = ResourceDescriptorHeap[MeshRegistryIdx];
     MeshPartEntry part = meshRegistry[MeshPartId];
     
-    // Bindless index buffer - fetchID is 0 to N-1, add BaseIndex to offset into correct mesh part
-    StructuredBuffer<uint> indices = ResourceDescriptorHeap[part.IndexBufferIdx];
-    uint vertexID = indices[fetchID + part.BaseIndex];
+    // The vertex: from the part's indices at fetchID, or handed over by an indexed draw (which never carries a
+    // mirrored instance here: those parts are drawn pulled)
+    uint vertexID = MeshVertexIndex(part, primitiveVertexID, fetchID, IndexedDraw);
     
     // Mesh data buffers - use resolved vertexID
     StructuredBuffer<float3> positions = ResourceDescriptorHeap[part.PosBufferIdx];
@@ -171,8 +171,7 @@ ShadowVSOutput ShadowVertex(uint primitiveVertexID, uint instanceID, bool local)
     StructuredBuffer<MeshPartEntry> meshRegistry = ResourceDescriptorHeap[MeshRegistryIdx];
     MeshPartEntry part = meshRegistry[MeshPartId];
     
-    StructuredBuffer<uint> indices = ResourceDescriptorHeap[part.IndexBufferIdx];
-    uint vertexID = indices[primitiveVertexID + part.BaseIndex];
+    uint vertexID = MeshVertexIndex(part, primitiveVertexID, primitiveVertexID, IndexedDraw);
 
     StructuredBuffer<float3> positions = ResourceDescriptorHeap[part.PosBufferIdx];
     StructuredBuffer<float2> uvs = ResourceDescriptorHeap[part.UVBufferIdx];

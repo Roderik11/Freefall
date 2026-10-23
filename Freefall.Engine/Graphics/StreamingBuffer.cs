@@ -44,6 +44,15 @@ namespace Freefall.Graphics
         /// </summary>
         public int LastWriteFrame = -1;
 
+        // The slot BulkWriteNext wrote last; -1 = none yet
+        private int _writtenSlot = -1;
+
+        /// <summary>
+        /// Bindless SRV index of the slot <see cref="BulkWriteNext"/> wrote last: what to draw with until the next
+        /// write. The current frame's slot before the first.
+        /// </summary>
+        public uint WrittenSrvIndex => _writtenSlot >= 0 ? _srvIndices[_writtenSlot] : SrvIndex;
+
         /// <summary>
         /// Current capacity in number of elements.
         /// </summary>
@@ -135,6 +144,22 @@ namespace Freefall.Graphics
             EnsureCapacity(data.Length);
             int frame = Engine.FrameIndex % FrameCount;
             T* dst = _mapped[frame];
+            fixed (T* src = data)
+                System.Buffer.MemoryCopy(src, dst, _capacity * _stride, data.Length * _stride);
+        }
+
+        /// <summary>
+        /// Like <see cref="BulkWrite"/>, for data that is not written every frame (a character posed every few
+        /// frames): into the slot after the one this wrote last, then drawn with <see cref="WrittenSrvIndex"/>.
+        /// The frames still on the GPU read the slot written last or the one before, never that one. BulkWrite
+        /// picks the slot by frame instead, so a write a multiple of three frames after the last would land in
+        /// the slot those frames read.
+        /// </summary>
+        public void BulkWriteNext(ReadOnlySpan<T> data)
+        {
+            EnsureCapacity(data.Length);
+            _writtenSlot = (_writtenSlot + 1) % FrameCount;
+            T* dst = _mapped[_writtenSlot];
             fixed (T* src = data)
                 System.Buffer.MemoryCopy(src, dst, _capacity * _stride, data.Length * _stride);
         }

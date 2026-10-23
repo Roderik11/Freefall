@@ -35,9 +35,10 @@ namespace Freefall.Graphics
             public float BoundsRadius;
             // Reserved fields for 72-byte struct alignment
             public uint TanBufferIdx;
-            public uint Reserved5;
-            public uint Reserved6;
-            public uint Reserved7;
+            // The mesh's index buffer for indexed indirect draws (IndexedDrawCommand: its GPU address and size)
+            public uint IndexBufferAddressLo;
+            public uint IndexBufferAddressHi;
+            public uint IndexBufferBytes;
             public uint Reserved8;
             public uint Reserved9;
         }
@@ -177,6 +178,9 @@ namespace Freefall.Graphics
                     BoundsCenterZ = bounds.Z,
                     BoundsRadius = bounds.W,
                     TanBufferIdx = mesh.TanBufferIndex,
+                    IndexBufferAddressLo = (uint)mesh.IndexBufferView.BufferLocation,
+                    IndexBufferAddressHi = (uint)(mesh.IndexBufferView.BufferLocation >> 32),
+                    IndexBufferBytes = mesh.IndexBufferView.SizeInBytes,
                 };
                 var lodEntry = BuildLodEntry(mesh, partIndex);
 

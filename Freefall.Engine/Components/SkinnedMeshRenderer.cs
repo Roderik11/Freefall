@@ -9,7 +9,7 @@ namespace Freefall.Components
     /// (see PersistentRenderer): nothing of this component runs per frame.
     ///
     /// The bone buffer is owned by the parent Animator. It is triple-buffered, so its SRV index
-    /// changes every frame; the Animator sets BoneBufferIdx after posing, which patches the index
+    /// changes with every pose; the Animator sets BoneBufferIdx after posing, which patches the index
     /// into the registered draws in place instead of re-registering them.
     ///
     /// After changing the contents of Materials in place, call OnMemberChanged().
@@ -53,7 +53,7 @@ namespace Freefall.Components
         private MaterialBlock? _params;
 
         /// <summary>
-        /// Per-Animator bone buffer SRV index for the current frame. Set by Animator.Update() each frame.
+        /// Per-Animator bone buffer SRV index of the last pose. Set by the Animator when it poses.
         /// 0 = no bones (fallback to bind pose).
         /// </summary>
         internal uint BoneBufferIdx

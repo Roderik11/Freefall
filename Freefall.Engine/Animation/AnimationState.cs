@@ -275,7 +275,7 @@ namespace Freefall.Animation
 
             float before = GetTimeElapsed(pb);
             float timeElapsed = before;
-            float step = Base.Time.SmoothDelta * Speed * rate * (animator?.SpeedFactor(SpeedParameter) ?? 1f);
+            float step = (animator?.StepDelta ?? Base.Time.SmoothDelta) * Speed * rate * (animator?.SpeedFactor(SpeedParameter) ?? 1f);
             int wraps = 0;
 
             if (Loop)

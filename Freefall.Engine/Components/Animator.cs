@@ -13,10 +13,16 @@ namespace Freefall.Components
     /// <summary>
     /// Controls animation playback for skinned meshes using an animation state machine.
     /// Owns per-Skeleton bone buffers (StreamingBuffer) that are shared across all
-    /// SkinnedMeshRenderers on this entity. Each unique Skeleton gets posed once per frame.
+    /// SkinnedMeshRenderers on this entity and under it. Each unique Skeleton gets posed once
+    /// per pose.
+    ///
+    /// Updated by <see cref="AnimatorSystem"/>: the state machine every frame while the character
+    /// is drawn and by turns when it is not (root motion and events come all at once with the
+    /// next step), the pose as often as the character is seen (<see cref="PoseEvery"/>). A
+    /// disabled Animator does neither and keeps its pose.
     /// </summary>
     [Icon("icon_animator.png")]
-    public class Animator : Component, IUpdate, IParallel
+    public class Animator : Component
     {
         /// <summary>The animation state machine (shared definition).</summary>
         public Animation.Animation Animation;
@@ -297,7 +303,69 @@ namespace Freefall.Components
 
         // --- Update ---
 
+        /// <summary>
+        /// The state machine a frame on, then the pose: what <see cref="AnimatorSystem"/> does for
+        /// every Animator (the pose only as often as the character is seen). For a tool that drives
+        /// an Animator of its own, on the main thread.
+        /// </summary>
         public void Update()
+        {
+            if (_partsVersion != AnimatorSystem.PartsVersion) FindParts();
+            StepDelta = Time.SmoothDelta;
+            Step();
+            Pose(1);
+        }
+
+        /// <summary>
+        /// Seconds the state machine moves on by in this step: a frame's, or the frames since the
+        /// last step for a character stepped by turns (AnimatorSystem).
+        /// </summary>
+        internal float StepDelta = 1f / 60f;
+
+        // Frame time not stepped yet (AnimatorSystem)
+        internal float Unstepped;
+
+        /// <summary>
+        /// A frame without a step: no root motion and no events, so whoever moves the character by
+        /// its root motion or listens to its events gets it all once, with the next step.
+        /// </summary>
+        internal void Skip()
+        {
+            _events.Clear();
+            RootMotionDelta = Vector3.Zero;
+            RootTurnDelta = 0f;
+        }
+
+        /// <summary>
+        /// How many frames apart the character is posed at the moment: 1 every frame, more the
+        /// smaller it is on screen or when it is out of view; 0 not at all (it is too small to be
+        /// drawn, or none of its renderers is shown). Set by <see cref="AnimatorSystem"/>.
+        /// </summary>
+        [Freefall.Reflection.DontSerialize]
+        public int PoseEvery { get; internal set; } = 1;
+
+        // The frame of the last pose (Time.FrameCount), -1 before the first; the frames between two poses
+        internal long PosedFrame = -1;
+        private int _poseGap = 1;
+
+        // What AnimatorSystem keeps of this Animator: its place in the system's list, its turn among those
+        // posed at the same rate, whether it is posed this frame, and a sphere round its renderers (the
+        // centre in this entity's space, the radius in the world), measured again while one has no mesh
+        internal int SystemIndex = -1;
+        internal int Stagger;
+        internal bool PoseDue;
+        internal Vector3 BoundsCenter;
+        internal float BoundsRadius;
+        internal bool Unmeasured;
+
+        /// <summary>A clip is being shown through <see cref="Preview"/>: posed every frame.</summary>
+        internal bool Previewing => _previewClip != null;
+
+        /// <summary>
+        /// The state machine on by <see cref="StepDelta"/>: parameters, transitions, the clips'
+        /// times, events and root motion.
+        /// </summary>
+        internal void Step()
         {
             _events.Clear();
 
@@ -321,9 +389,74 @@ namespace Freefall.Components
                 _previewClip = null;
                 UpdateLayers();
             }
+        }
 
+        /// <summary>
+        /// The bones of every skeleton among the character's renderers for the state the machine is
+        /// in: sampled, blended and uploaded, each skeleton once. <paramref name="every"/> is how many
+        /// frames apart it is posed now: a transition carries the motion the last pose had only from
+        /// a pose that recent.
+        /// </summary>
+        internal void Pose(int every)
+        {
+            if (Entity == null || Animation == null) return;
+
+            long frame = Base.Time.FrameCount;
+            _poseGap = Math.Max(every, 1);
             _sourceEvaluated = false;
-            WalkChildren(Entity.Transform);
+
+            for (int i = 0; i < _parts.Count; i++)
+            {
+                var smr = _parts[i];
+                var skeleton = smr.Mesh?.Skeleton;
+                if (skeleton == null || smr.IsDestroyed) continue;
+
+                var entry = EnsureBoneBuffer(skeleton);
+
+                // Pose + upload (only once per unique Skeleton per pose), into the slot no frame in
+                // flight reads (see StreamingBuffer.BulkWriteNext)
+                if (entry.Buffer.LastWriteFrame != Engine.FrameIndex)
+                {
+                    GetPose(skeleton, entry.StagingMatrices);
+                    entry.Buffer.BulkWriteNext(entry.StagingMatrices);
+                    entry.Buffer.LastWriteFrame = Engine.FrameIndex;
+                }
+
+                // The renderer draws with the slot written last until the next pose
+                smr.BoneBufferIdx = entry.Buffer.WrittenSrvIndex;
+            }
+
+            PosedFrame = frame;
+        }
+
+        // --- The character's renderers ---
+
+        // Every SkinnedMeshRenderer on the entity and under it, found again when a renderer was added
+        // or removed or anything was re-parented (AnimatorSystem.PartsVersion): not walked per pose.
+        private readonly List<SkinnedMeshRenderer> _parts = new();
+        private int _partsVersion = -1;
+
+        /// <summary>The renderers this Animator poses, as found last.</summary>
+        internal List<SkinnedMeshRenderer> Parts => _parts;
+
+        /// <summary>Whether the renderers may have changed since they were found. Main thread.</summary>
+        internal bool PartsChanged => _partsVersion != AnimatorSystem.PartsVersion;
+
+        /// <summary>Find the renderers again. Main thread (it reads the hierarchy).</summary>
+        internal void FindParts()
+        {
+            _parts.Clear();
+            _partsVersion = AnimatorSystem.PartsVersion;
+            if (Entity != null) CollectParts(Entity.Transform);
+        }
+
+        private void CollectParts(Transform parent)
+        {
+            var smr = parent?.Entity?.GetComponent<SkinnedMeshRenderer>();
+            if (smr != null) _parts.Add(smr);
+
+            foreach (Transform child in parent)
+                CollectParts(child);
         }
 
         // --- Looking at one clip ---
@@ -574,19 +707,15 @@ namespace Freefall.Components
         private float _frameRootTurn, _layerRootTurn;
         private bool _layerRootPlays;
 
-        // Un-retargeted: the first humanoid skeleton this Animator posed, and its hips
+        // Un-retargeted: the first skeleton this Animator posed that has a root to travel by, and that root
         private Skeleton _poseRootSkeleton;
         private int _poseRootBone = -1;
 
-        private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<Skeleton, System.Runtime.CompilerServices.StrongBox<int>> s_hips = new();
-
-        /// <summary>The hips of a humanoid skeleton, or -1.</summary>
-        private static int HipsOf(Skeleton skeleton) => s_hips.GetValue(skeleton, static s =>
-        {
-            var humanoid = HumanoidTemplate.Detect(s);
-            return new System.Runtime.CompilerServices.StrongBox<int>(
-                humanoid != null && humanoid.TryGetValue(HumanoidBone.Hips, out int hips) ? hips : -1);
-        }).Value;
+        /// <summary>
+        /// The bone a skeleton travels by: a humanoid's hips, or the bone all the feet of another rig hang from (an
+        /// animal's pelvis); -1 for neither (<see cref="FootTravel.RootOf"/>).
+        /// </summary>
+        private static int HipsOf(Skeleton skeleton) => FootTravel.RootOf(skeleton);
 
         /// <summary>
         /// The skeleton the clips are played on and its hips: the source skeleton when retargeting.
@@ -697,7 +826,7 @@ namespace Freefall.Components
             }
             else if (Playback.SetFade < 1f)
             {
-                Playback.SetFade = MathF.Min(1f, Playback.SetFade + Time.SmoothDelta / AnimationSetFadeSeconds);
+                Playback.SetFade = MathF.Min(1f, Playback.SetFade + StepDelta / AnimationSetFadeSeconds);
                 if (Playback.SetFade >= 1f)
                     Playback.PreviousAnimationSet = null;
             }
@@ -725,32 +854,6 @@ namespace Freefall.Components
                 RescaleStateTime(state.GetState(i), from, to);
         }
 
-        // Walk child SMRs: pose each unique Skeleton once, set BoneBufferIdx
-        void WalkChildren(Transform parent)
-        {
-            var smr = parent?.Entity?.GetComponent<SkinnedMeshRenderer>();
-            if (smr?.Mesh?.Skeleton != null)
-            {
-                var skeleton = smr.Mesh.Skeleton;
-
-                var entry = EnsureBoneBuffer(skeleton);
-
-                // Pose + upload (only once per unique Skeleton per frame)
-                if (entry.Buffer.LastWriteFrame != Engine.FrameIndex)
-                {
-                    GetPose(skeleton, entry.StagingMatrices);
-                    entry.Buffer.BulkWrite(entry.StagingMatrices);
-                    entry.Buffer.LastWriteFrame = Engine.FrameIndex;
-                }
-
-                // Set BoneBufferIdx on SMR so it passes it through to Enqueue
-                smr.BoneBufferIdx = entry.Buffer.SrvIndex;
-            }
-
-            foreach (Transform child in parent)
-                WalkChildren(child);
-        }
-
         /// <summary>
         /// The bone buffer indices this character's renderers draw with in the current frame: what
         /// a shader can tell its skin by (InstanceDescriptor.BoneBufferIdx). One per skeleton among
@@ -763,7 +866,7 @@ namespace Freefall.Components
             foreach (var entry in _boneBuffers.Values)
             {
                 if (count == found.Length) break;
-                found[count++] = (int)entry.Buffer.SrvIndex;
+                found[count++] = (int)entry.Buffer.WrittenSrvIndex;
             }
             return new Vortice.Mathematics.Int4(found[0], found[1], found[2], found[3]);
         }
@@ -1094,9 +1197,10 @@ namespace Freefall.Components
         /// <summary>
         /// Start an inertial offset at the switch: the difference as a rotation vector, and how
         /// fast the layer's pose was moving into the one it would show now (from the one it showed
-        /// last frame). The rates of the offset itself follow in <see cref="ResolveRates"/>.
+        /// last, <paramref name="dt"/> seconds ago). The rates of the offset itself follow in
+        /// <see cref="ResolveRates"/>.
         /// </summary>
-        private static void BeginInertia(ref BoneOffset offset, in BonePose reference, in BonePose last, bool fresh, float duration, float size)
+        private static void BeginInertia(ref BoneOffset offset, in BonePose reference, in BonePose last, bool fresh, float dt, float duration, float size)
         {
             var rotation = offset.Rotation;
             if (rotation.W < 0f) rotation = -rotation;
@@ -1107,7 +1211,6 @@ namespace Freefall.Components
             offset.TurnRate = offset.PositionRate = Vector3.Zero;
             offset.Moving = false;
 
-            float dt = Base.Time.SmoothDelta;
             if (!fresh || dt <= 0f) return;
 
             var step = Quaternion.Inverse(last.Rotation) * reference.Rotation;
@@ -1386,10 +1489,14 @@ namespace Freefall.Components
                             offset.Scale = reference.Scale - pose.Scale;
 
                             // Inertial: how fast the layer's pose was moving, from the pose it showed
-                            // last frame, unless that was longer ago (the layer was not posed)
+                            // last, unless that was longer ago than the character is posed apart (the
+                            // layer was not posed)
                             if (layer.Inertial)
+                            {
+                                long gap = Base.Time.FrameCount - layer.LastFrame;
                                 BeginInertia(ref offset, reference, layer.Last[boneIndex],
-                                    Base.Time.FrameCount - layer.LastFrame <= 1, layer.Duration, _pose.Size);
+                                    gap <= _poseGap, Base.Time.SmoothDelta * gap, layer.Duration, _pose.Size);
+                            }
                         }
                         else
                         {

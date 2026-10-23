@@ -159,6 +159,16 @@ cbuffer PushConstants : register(b3)
 #define LodTime               asfloat(BlockSumsUAVIdx)      // slot 14 — seconds (Time.TotalTime)
 #define LodFadeRate           asfloat(NumBlocksIdx)         // slot 15 — 1 / the fade's seconds (0 = switch at once: a camera cut)
 #define LodFadeFrom           SubbatchCountIdx              // slot 17 — the persistent records, the only ones that keep a state
+// Indexed draws (InstanceBatch.DrawsIndexed; nothing sets slot 12 otherwise, and CSLocalScan, which read it, is never
+// dispatched): UAV the commands as indexed draws (IndexedDrawCommand; 0 = none). The camera chain's CSMain writes a part's
+// command there (counted in the draw count's [1]) unless the part has a mirrored instance in view; the shadow chains'
+// CSCompactCommands write every packed command there too, at the same slot.
+#define IndexedCommandsIdx    PrefixSumUAVIdx               // slot 12
+// The camera chain only (CSVisibility, CSMain in packing mode): UAV a uint per mesh part, the last MirrorCull in which a
+// visible instance of the part was mirrored (its transform turns the triangles round, which only the pulled vertex
+// shaders undo); 0 = none. The shadow chains use these slots for their cascades and never pack in CSMain.
+#define MirrorPartsIdx        asuint(ShadowMinCasterClip)   // slot 30
+#define MirrorCull            CascadeBufferSRVIdx           // slot 31 — this culling's number (never 0)
 
 #include "lod_fade.hlsli"
 
@@ -186,9 +196,9 @@ struct MeshPartEntry
     float4 LocalBounds;  // xyz = center, w = radius
     // Reserved fields for padding to match C# layout
     uint Reserved4;
-    uint Reserved5;
-    uint Reserved6;
-    uint Reserved7;
+    uint IndexBufferAddressLo;  // the mesh's index buffer (IndexedDrawCommand)
+    uint IndexBufferAddressHi;
+    uint IndexBufferBytes;
     uint Reserved8;
     uint Reserved9;
 };
@@ -380,6 +390,46 @@ struct IndirectDrawCommand
     uint StartVertexLocation;
     uint StartInstanceLocation;
 };
+
+// The same command as an indexed draw (C# IndexedDrawCommand, 48 bytes; GraphicsDevice.IndexedCommandSignature): the
+// mesh's index buffer view, then D3D12_DRAW_INDEXED_ARGUMENTS. The vertex shader gets the vertex index in SV_VertexID.
+struct IndexedDrawCommand
+{
+    uint MeshPartId;
+    uint InstanceBaseOffset;
+    uint IndexBufferAddressLo;  // D3D12_INDEX_BUFFER_VIEW
+    uint IndexBufferAddressHi;
+    uint IndexBufferBytes;
+    uint IndexFormat;
+    uint IndexCountPerInstance; // D3D12_DRAW_INDEXED_ARGUMENTS
+    uint DrawInstanceCount;
+    uint StartIndexLocation;
+    int BaseVertexLocation;
+    uint StartInstanceLocation;
+    uint Padding;
+};
+
+#define DXGI_FORMAT_R32_UINT 42
+
+// A part's draw as an indexed command: its indices from its mesh's index buffer, through the input assembler
+IndexedDrawCommand MakeIndexedCommand(uint meshPartId, uint instanceBaseOffset, uint indexCount, uint instanceCount,
+                                      MeshPartEntry entry)
+{
+    IndexedDrawCommand cmd;
+    cmd.MeshPartId = meshPartId;
+    cmd.InstanceBaseOffset = instanceBaseOffset;
+    cmd.IndexBufferAddressLo = entry.IndexBufferAddressLo;
+    cmd.IndexBufferAddressHi = entry.IndexBufferAddressHi;
+    cmd.IndexBufferBytes = entry.IndexBufferBytes;
+    cmd.IndexFormat = DXGI_FORMAT_R32_UINT;
+    cmd.IndexCountPerInstance = indexCount;
+    cmd.DrawInstanceCount = instanceCount;
+    cmd.StartIndexLocation = entry.BaseIndex;
+    cmd.BaseVertexLocation = 0;     // the indices are the mesh's own vertex indices
+    cmd.StartInstanceLocation = 0;
+    cmd.Padding = 0;
+    return cmd;
+}
 
 //-----------------------------------------------------------------------------
 // Frustum culling helper
@@ -885,6 +935,17 @@ void CSVisibility(uint3 dispatchThreadId : SV_DispatchThreadID)
     // Write visibility flag: 0 = culled, otherwise resolved MeshPartId + 1 (INVALID_PART + 1 = 0: only fading out)
     visibilityFlags[instanceIdx] = visible ? (subBatch + 1u) : 0u;
 
+    // A mirrored instance in view keeps its parts on the pulled draw (MirrorPartsIdx): every part it draws, both of a
+    // crossfade
+    if (visible && MirrorPartsIdx != 0 && determinant((float3x3)world) < 0.0)
+    {
+        RWStructuredBuffer<uint> mirrorParts = ResourceDescriptorHeap[MirrorPartsIdx];
+        if (subBatch != INVALID_PART)
+            mirrorParts[subBatch] = MirrorCull;
+        if (share != 0 && fromPart != INVALID_PART)
+            mirrorParts[fromPart] = MirrorCull;
+    }
+
     // And the crossfade's word for the compaction
     if (fades)
         StoreLodFade(instanceIdx, fadeState, share != 0 ? (share << 24) | (visible ? fromPart + 1u : 0u) : 0u);
@@ -1329,7 +1390,29 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
     
     StructuredBuffer<MeshPartEntry> meshRegistry = ResourceDescriptorHeap[MeshRegistryIdx];
     MeshPartEntry entry = meshRegistry[meshPartId];
-    
+
+    // The camera chain's indexed draws (IndexedCommandsIdx): every part without a mirrored instance in view, packed
+    // and counted in the draw count's [1]; the rest stay pulled
+    if (DrawCountUAVIdx != 0 && IndexedCommandsIdx != 0)
+    {
+        bool mirrored = false;
+        if (MirrorPartsIdx != 0)
+        {
+            RWStructuredBuffer<uint> mirrorParts = ResourceDescriptorHeap[MirrorPartsIdx];
+            mirrored = mirrorParts[meshPartId] == MirrorCull;
+        }
+        if (!mirrored)
+        {
+            RWStructuredBuffer<uint> indexedCount = ResourceDescriptorHeap[DrawCountUAVIdx];
+            uint indexedSlot;
+            InterlockedAdd(indexedCount[1], 1, indexedSlot);
+            RWStructuredBuffer<IndexedDrawCommand> indexedOut = ResourceDescriptorHeap[IndexedCommandsIdx];
+            indexedOut[indexedSlot] = MakeIndexedCommand(meshPartId, baseOffset, entry.VertexCount,
+                visibleCount * max(1u, InstanceMultiplier), entry);
+            return;
+        }
+    }
+
     // Determine output slot
     uint outputSlot;
     if (DrawCountUAVIdx != 0)
@@ -1634,6 +1717,16 @@ void CSCompactCommands(uint3 dispatchThreadId : SV_DispatchThreadID)
     
     RWStructuredBuffer<IndirectDrawCommand> dest = ResourceDescriptorHeap[VisibleIndicesSRVIdx];
     dest[slot] = cmd;
+
+    // A batch that draws indexed (InstanceBatch.DrawsIndexed) gets the same command as an indexed draw at the same slot.
+    // The shadow vertex shaders never swap corners, so a mirrored instance needs no pulled draw here.
+    if (IndexedCommandsIdx != 0)
+    {
+        StructuredBuffer<MeshPartEntry> meshRegistry = ResourceDescriptorHeap[MeshRegistryIdx];
+        RWStructuredBuffer<IndexedDrawCommand> indexedDest = ResourceDescriptorHeap[IndexedCommandsIdx];
+        indexedDest[slot] = MakeIndexedCommand(cmd.MeshPartId, cmd.InstanceBaseOffset, cmd.VertexCountPerInstance,
+            cmd.DrawInstanceCount, meshRegistry[cmd.MeshPartId]);
+    }
 }
 
 //-----------------------------------------------------------------------------

@@ -109,6 +109,23 @@ namespace Freefall.Animation
             }
         }
 
+        /// <summary>
+        /// Put position keys on a bone's channel, keeping its rotation and scale; a new channel for a bone the clip
+        /// did not move (<see cref="FootTravel"/>).
+        /// </summary>
+        internal void SetPositionKeys(string bone, List<VectorKey> keys)
+        {
+            lock (_channels)
+            {
+                int index = _channels.FindIndex(c => c.Target == bone);
+                var old = index >= 0 ? _channels[index] : null;
+                var channel = new AnimationChannel { Target = bone, Position = new VectorKeys(keys), Rotation = old?.Rotation, Scale = old?.Scale };
+                if (index >= 0) _channels[index] = channel;
+                else _channels.Add(channel);
+                _bindings = [];
+            }
+        }
+
         public void RemoveChannel(AnimationChannel channel)
         {
             lock (_channels)
@@ -116,6 +133,47 @@ namespace Freefall.Animation
                 _channels.Remove(channel);
                 _bindings = [];
             }
+        }
+
+        /// <summary>
+        /// Keeps only the part of the clip between two times (ticks): its keys there, starting at 0, with the pose
+        /// sampled at both ends. For a take that holds several actions one after another.
+        /// </summary>
+        public void Cut(float from, float to)
+        {
+            to = MathF.Min(to, Duration);
+            if (to <= from) return;
+            lock (_channels)
+            {
+                for (int c = 0; c < _channels.Count; c++)
+                {
+                    var channel = _channels[c];
+                    _channels[c] = new AnimationChannel
+                    {
+                        Target = channel.Target,
+                        Position = channel.Position == null ? null! : new VectorKeys(Part(channel.Position.Count, i => channel.Position[i].Time, i => channel.Position[i].Value, channel.Position.GetValue, from, to, (t, v) => new VectorKey { Time = t, Value = v })),
+                        Rotation = channel.Rotation == null ? null! : new QuaternionKeys(Part(channel.Rotation.Count, i => channel.Rotation[i].Time, i => channel.Rotation[i].Value, channel.Rotation.GetValue, from, to, (t, v) => new QuaternionKey { Time = t, Value = v })),
+                        Scale = channel.Scale == null ? null! : new VectorKeys(Part(channel.Scale.Count, i => channel.Scale[i].Time, i => channel.Scale[i].Value, channel.Scale.GetValue, from, to, (t, v) => new VectorKey { Time = t, Value = v })),
+                    };
+                }
+                _bindings = [];
+            }
+            Duration = to - from;
+        }
+
+        private static List<TKey> Part<TKey, TValue>(int count, Func<int, float> timeOf, Func<int, TValue> valueOf, Func<float, TValue> sample,
+            float from, float to, Func<float, TValue, TKey> make)
+        {
+            var keys = new List<TKey>();
+            if (count == 0) return keys;
+            keys.Add(make(0f, sample(from)));
+            for (int i = 0; i < count; i++)
+            {
+                float time = timeOf(i);
+                if (time > from && time < to) keys.Add(make(time - from, valueOf(i)));
+            }
+            keys.Add(make(to - from, sample(to)));
+            return keys;
         }
 
         /// <summary>
@@ -224,15 +282,14 @@ namespace Freefall.Animation
         }
 
         /// <summary>
-        /// The travel over the ground this clip carries on a humanoid skeleton: its kind, how far
-        /// it goes and its pace. For tools; an Animator works it out for its own skeleton.
+        /// The travel over the ground this clip carries on a skeleton (on a humanoid's hips, or the bone the feet of
+        /// another rig hang from: <see cref="FootTravel.RootOf"/>): its kind, how far it goes and its pace. For
+        /// tools; an Animator works it out for its own skeleton.
         /// </summary>
         public RootMotionTrack GetRootMotion(Skeleton skeleton)
         {
-            var humanoid = HumanoidTemplate.Detect(skeleton);
-            if (humanoid == null || !humanoid.TryGetValue(HumanoidBone.Hips, out int hips))
-                return RootMotionTrack.Nothing;
-            return GetRootMotion(skeleton.Bones, hips);
+            int root = FootTravel.RootOf(skeleton);
+            return root >= 0 ? GetRootMotion(skeleton.Bones, root) : RootMotionTrack.Nothing;
         }
 
         /// <summary>

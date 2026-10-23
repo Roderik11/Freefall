@@ -636,6 +636,22 @@ namespace Freefall
          [ValueRange(0f, 2f)]
          public float LodFadeTime { get; set; } = 0.4f;
 
+         /// <summary>
+         /// Mesh batches of effects whose vertex shaders read IndexedDraw (Effect.DrawsIndexed) draw through the input
+         /// assembler with the mesh's index buffer (GraphicsDevice.IndexedCommandSignature): a vertex shared by several
+         /// triangles is shaded once instead of once per corner. Camera, sun cascades, point light faces, sky captures and
+         /// the cover map; in the camera's draws a part with a mirrored instance in view stays pulled. Off = every draw
+         /// pulls its indices in the vertex shader (the bindless DrawInstanced path). Since 2026-10-23.
+         /// </summary>
+         public bool IndexedDraws { get; set; } = true;
+
+         /// <summary>
+         /// Characters are posed less often the smaller they are on screen and when out of view, and not at all
+         /// once too small to be drawn (AnimatorSystem). Off = every character every frame.
+         /// </summary>
+         [Category("Animation")]
+         public bool PoseBySize { get; set; } = true;
+
          [Category("Shadows")]
          public bool EnableShadows { get; set; } = true;
 

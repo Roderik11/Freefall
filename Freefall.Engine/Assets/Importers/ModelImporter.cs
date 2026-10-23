@@ -61,6 +61,36 @@ namespace Freefall.Assets.Importers
         /// <summary>What is marked on the clip (AnimationClip.Events).</summary>
         public List<Freefall.Animation.AnimationEvent> Events = new();
 
+        /// <summary>
+        /// The part of the take that is the clip, in frames of the file (its ticks): a take that holds several
+        /// actions one after another, as the clip ranges of a Unity pack cut them. To 0 = the whole take. Unlike
+        /// the events it is applied at import: a change needs a reimport.
+        /// </summary>
+        public float From;
+        public float To;
+
+        /// <summary>
+        /// The clip plays in place (an animal pack's walk or run): give it the travel its feet imply, so that root
+        /// motion carries the creature at the clip's own pace with the surge of every step, and the feet that are
+        /// down stay where they are (FootTravel). Applied at import: a change needs a reimport.
+        /// </summary>
+        public bool RootFromFeet;
+
+        /// <summary>
+        /// With <see cref="RootFromFeet"/>, for a clip whose feet are hardly ever seen down (a gallop of a dozen
+        /// frames): the even travel to give it instead, in m/s and in the rig's own space as the file has it (an
+        /// animal pack's rig walks towards -Z: a gallop at 7 m/s is (0, 0, -7)). Zero: the travel from the feet.
+        /// </summary>
+        public Vector3 RootVelocity;
+
+        /// <summary>
+        /// With <see cref="RootFromFeet"/>: how far the pace may swing either way of its mean over a stride, as a share
+        /// of it. The feet's own swing is smoothed to the stride's rhythm and scaled down to this: hand-made in-place
+        /// walks stop dead where the weight passes from foot to foot. 1 or more keeps the bursts as the feet show them
+        /// (a frog's hop, a rabbit's bound).
+        /// </summary>
+        public float RootSurge = FootTravel.DefaultSurge;
+
         public override string ToString() => Name;
     }
 
@@ -1560,7 +1590,74 @@ namespace Freefall.Assets.Importers
                     ComposePivotChannels(scene, clip, bone, channels, scale);
             }
 
+            // Only a part of the take is the clip (ClipConfig.From / To)
+            var config = FindClipConfig(clip.Name);
+            if (config != null && config.To > config.From)
+                clip.Cut(config.From, config.To);
+
+            // In place: the travel its feet imply, on the root (ClipConfig.RootFromFeet). A file of clips alone has no
+            // mesh to take a skeleton from: the nodes the clip moves make one.
+            if (config != null && config.RootFromFeet)
+            {
+                var skeleton = _skeleton.Count > 0
+                    ? new Skeleton { Bones = _skeleton.ToArray(), BoneNames = _boneNames.ToArray() }
+                    : SkeletonOfNodes(scene, anim);
+                if (!FootTravel.Add(clip, skeleton, config.RootVelocity, config.RootSurge))
+                    Debug.LogWarning("ModelImporter", $"'{System.IO.Path.GetFileName(_currentFilePath)}' '{clip.Name}': RootFromFeet found no feet that slide; the clip stays in place");
+            }
+
             return clip;
+        }
+
+        /// <summary>
+        /// The nodes a clip moves and those above them as a skeleton (pivot nodes folded in, as in
+        /// <see cref="FlattenHierarchy"/>): what FootTravel reads the feet off in a file that holds clips only. Not
+        /// imported.
+        /// </summary>
+        private static Skeleton SkeletonOfNodes(Scene scene, Assimp.Animation anim)
+        {
+            var moved = new HashSet<string>();
+            foreach (var channel in anim.NodeAnimationChannels)
+            {
+                string name = channel.NodeName;
+                int pivot = name.IndexOf(PivotMarker, StringComparison.Ordinal);
+                moved.Add(pivot >= 0 ? name.Substring(0, pivot) : name);
+            }
+
+            var kept = new HashSet<Node>();
+            void Find(Node node)
+            {
+                if (moved.Contains(node.Name))
+                    for (var n = node; n != null && kept.Add(n); n = n.Parent) { }
+                if (node.HasChildren)
+                    foreach (Node child in node.Children) Find(child);
+            }
+            Find(scene.RootNode);
+
+            var bones = new List<Bone>();
+            var names = new List<string>();
+            void Add(Node node)
+            {
+                if (!kept.Contains(node)) return;
+                if (!IsPivotNode(node))
+                {
+                    var bind = CollapsedLocal(node, out Node parent);
+                    Matrix4x4.Decompose(bind, out var s, out var r, out var t);
+                    names.Add(node.Name);
+                    bones.Add(new Bone
+                    {
+                        Name = node.Name,
+                        BindPoseMatrix = bind,
+                        BindPose = new BonePose { Position = t, Rotation = r, Scale = s },
+                        Parent = parent != null ? names.IndexOf(parent.Name) : -1,
+                        OffsetMatrix = Matrix4x4.Identity,
+                    });
+                }
+                if (node.HasChildren)
+                    foreach (Node child in node.Children) Add(child);
+            }
+            Add(scene.RootNode);
+            return new Skeleton { Bones = bones.ToArray(), BoneNames = names.ToArray() };
         }
 
         private const string PivotMarker = "_$AssimpFbx$_";

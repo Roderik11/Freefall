@@ -199,7 +199,7 @@ namespace Freefall.Animation
 
             if (GetInTransition(pb))
             {
-                float transitionTime = GetTransitionTime(pb) + Base.Time.SmoothDelta;
+                float transitionTime = GetTransitionTime(pb) + (animator?.StepDelta ?? Base.Time.SmoothDelta);
                 SetTransitionTime(pb, transitionTime);
 
                 if (transitionTime >= GetTransitionDuration(pb))

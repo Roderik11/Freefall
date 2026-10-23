@@ -320,12 +320,26 @@ struct MeshPartEntry
     uint Reserved3;
     float4 LocalBounds;        // center.xyz + radius.w
     uint TanBufferIdx;
-    uint Reserved5;
-    uint Reserved6;
-    uint Reserved7;
+    uint IndexBufferAddressLo;  // the mesh's index buffer for indexed indirect draws (cull_instances.hlsl IndexedDrawCommand)
+    uint IndexBufferAddressHi;
+    uint IndexBufferBytes;
     uint Reserved8;
     uint Reserved9;
 };
+
+// The mesh vertex a mesh draw's vertex shader invocation shades. An indexed draw (InstanceBatch, the effect's push
+// constant IndexedDraw in slot 17 = 1) hands it over in SV_VertexID: the input assembler read the part's indices, and a
+// vertex the neighbouring triangles share is shaded once. A pulled draw counts the corners 0..N-1 and reads the index
+// of 'corner' (vertexId, or the corner a mirrored instance swaps it with; the camera draws the parts that have a mirrored
+// instance in view pulled, cull_instances.hlsl CSMain). Effect.DrawsIndexed: every vertex shader of the effect must
+// read IndexedDraw, or none of its batches draws indexed.
+uint MeshVertexIndex(MeshPartEntry part, uint vertexId, uint corner, uint indexedDraw)
+{
+    if (indexedDraw != 0)
+        return vertexId;
+    StructuredBuffer<uint> indices = ResourceDescriptorHeap[part.IndexBufferIdx];
+    return indices[corner + part.BaseIndex];
+}
 
 // Interleaved gradient noise — deterministic per-pixel, no banding
 float InterleavedGradientNoise(float2 screenPos)

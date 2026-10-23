@@ -62,6 +62,12 @@ namespace Freefall.Components
             }
         }
 
+        /// <summary>
+        /// Counts every change of a parent anywhere: for what keeps a list of the entities under one of its own
+        /// (an Animator its renderers) and has to know when that may have changed, without walking it every frame.
+        /// </summary>
+        internal static int HierarchyVersion;
+
         [System.ComponentModel.Browsable(false)]
         public Transform Parent
         {
@@ -72,6 +78,7 @@ namespace Freefall.Components
                 _parent?.Children.Remove(this);
                 _parent = value;
                 _parent?.Children.Add(this);
+                HierarchyVersion++;
                 SetDirty();
             }
         }
