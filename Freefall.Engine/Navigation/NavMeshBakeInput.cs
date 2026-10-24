@@ -332,6 +332,9 @@ namespace Freefall.Navigation
         /// <summary>The transform flips the winding, so triangle normals point the other way.</summary>
         public bool Mirrored;
 
+        /// <summary>Under a NavMeshBlocker: the navmesh is cleared over and round its bounds.</summary>
+        public bool Blocks;
+
         public ulong Hash;
         public Vector3 Min, Max;
     }
@@ -366,6 +369,15 @@ namespace Freefall.Navigation
             var geometryOf = new Dictionary<Mesh, int>();
             var instances = new List<MeshInstance>();
 
+            // The renderers under a blocker, found from the few blockers rather than a walk up from every renderer
+            var blocked = new HashSet<MeshRenderer>();
+            foreach (var blocker in ComponentCache<NavMeshBlocker>.All)
+            {
+                if (blocker.Entity == null || !blocker.Enabled) continue;
+                foreach (var renderer in blocker.Entity.GetComponentsInChildren<MeshRenderer>())
+                    blocked.Add(renderer);
+            }
+
             foreach (var renderer in ComponentCache<MeshRenderer>.All)
             {
                 var mesh = renderer.Mesh;
@@ -394,6 +406,7 @@ namespace Freefall.Navigation
                     Geometry = geometry,
                     World = world,
                     Mirrored = world.GetDeterminant() < 0,
+                    Blocks = blocked.Contains(renderer),
                 });
             }
 
@@ -416,6 +429,7 @@ namespace Freefall.Navigation
 
                 var world = instance.World;
                 ulong hash = NavHash.Bytes(geometry.Hash, MemoryMarshal.AsBytes(new ReadOnlySpan<Matrix4x4>(in world)));
+                if (instance.Blocks) hash = NavHash.Mix(hash, 0xB10C4E5UL);
                 instance.Hash = hash;
             }
         }

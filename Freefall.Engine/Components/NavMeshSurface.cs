@@ -146,6 +146,8 @@ namespace Freefall.Components
         [DontSerialize] [JsonIgnore]
         private int _gizmoGeneration;
 
+        private const float GizmoLift = 0.05f;
+
         protected override void Awake()
         {
             // Initialize runtime if we have baked data (loaded by NavMeshLoader)
@@ -242,6 +244,11 @@ namespace Freefall.Components
             _gizmoMaterial = null; // force rebuild with potentially new effect
 
             if (vertices == null || indices == null || vertices.Length == 0 || indices.Length == 0) return;
+
+            // Drawn a little over the polygons: they lie exactly on floors and paving at round heights (the bake
+            // keeps a surface on a cell boundary in its cell), where the overlay would z-fight with the ground
+            for (int i = 0; i < vertices.Length; i++)
+                vertices[i].Y += GizmoLift;
 
             // Build normals + UVs (flat up, zero UVs — unlit gizmo)
             var normals = new Vector3[vertices.Length];

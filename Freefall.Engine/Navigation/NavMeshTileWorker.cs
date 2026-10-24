@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Numerics;
@@ -52,6 +53,12 @@ namespace Freefall.Navigation
             // Clipping scratch: four polygons of up to 7 vertices, and the per-vertex plane distances
             private readonly float[] _clip = new float[7 * 3 * 4];
             private readonly float[] _clipDelta = new float[12];
+
+            /// <summary>Fraction of a cell height a span's end may be over a boundary and still count as on it.</summary>
+            private const float OnBoundary = 0.01f;
+
+            // The NavMeshBlockers' volumes reaching into the cell, for Recast to clear after erosion
+            private readonly Blockers _blockers = new();
 
             public TileWorker(BakeContext context)
             {
@@ -130,8 +137,13 @@ namespace Freefall.Navigation
                 _solid = solid;
 
                 RasterizeTerrain();
+                _blockers.Volumes.Clear();
                 for (int i = first; i < end; i++)
-                    RasterizeInstance(in instances[c.CellItems[i]]);
+                {
+                    ref readonly var instance = ref instances[c.CellItems[i]];
+                    RasterizeInstance(in instance);
+                    if (instance.Blocks) AddBlocker(in instance);
+                }
 
                 long t2 = Stopwatch.GetTimestamp();
                 Profile.Rasterize += t2 - t1;
@@ -144,7 +156,7 @@ namespace Freefall.Navigation
                 }
 
                 // ── Recast: filter, regions, contours, polygons, detail mesh ──
-                var result = _builder.Build(new RcContext(), tx, tz, NoGeometry.Instance, c.Config, solid, false);
+                var result = _builder.Build(new RcContext(), tx, tz, _blockers, c.Config, solid, false);
                 RecycleSpans(solid);
 
                 long t3 = Stopwatch.GetTimestamp();
@@ -341,6 +353,87 @@ namespace Freefall.Navigation
                 }
             }
 
+            // ── Blockers ──
+
+            // An octagon round a point, its sides at the agent's radius: offsets of unit radius to its corners
+            private static readonly Vector2[] Octagon = MakeOctagon();
+            private readonly Vector2[] _hullPoints = new Vector2[8 * 8];
+            private readonly Vector2[] _hull = new Vector2[8 * 8 + 1];
+
+            private static readonly Comparer<Vector2> ByXThenY =
+                Comparer<Vector2>.Create((a, b) => a.X != b.X ? a.X.CompareTo(b.X) : a.Y.CompareTo(b.Y));
+
+            private static Vector2[] MakeOctagon()
+            {
+                var corners = new Vector2[8];
+                float corner = 1f / MathF.Cos(MathF.PI / 8);
+                for (int i = 0; i < 8; i++)
+                {
+                    float a = (i + 0.5f) * MathF.PI / 4;
+                    corners[i] = new Vector2(MathF.Cos(a), MathF.Sin(a)) * corner;
+                }
+                return corners;
+            }
+
+            /// <summary>
+            /// The volume a blocking instance clears: its bounds' outline on the ground grown by the
+            /// agent's radius (the volumes are marked after erosion, which keeps agents that far from
+            /// everything else), from the climb below its bottom to just over its top.
+            /// </summary>
+            private void AddBlocker(in MeshInstance instance)
+            {
+                var geometry = _c.Input.Geometries[instance.Geometry];
+                float radius = _c.Settings.AgentRadius;
+                var points = _hullPoints;
+                int n = 0;
+
+                for (int k = 0; k < 8; k++)
+                {
+                    var corner = geometry.Center + geometry.Extents * new Vector3((k & 1) != 0 ? 1 : -1, (k & 2) != 0 ? 1 : -1, (k & 4) != 0 ? 1 : -1);
+                    var world = Vector3.Transform(corner, instance.World);
+                    for (int d = 0; d < Octagon.Length; d++)
+                        points[n++] = new Vector2(world.X, world.Z) + Octagon[d] * radius;
+                }
+
+                int count = ConvexHull(points, n, _hull);
+                var verts = new float[count * 3];
+                for (int i = 0; i < count; i++)
+                {
+                    verts[i * 3] = _hull[i].X;
+                    verts[i * 3 + 1] = instance.Min.Y;
+                    verts[i * 3 + 2] = _hull[i].Y;
+                }
+
+                _blockers.Volumes.Add(new RcConvexVolume
+                {
+                    verts = verts,
+                    hmin = instance.Min.Y - _c.Settings.MaxClimb,
+                    hmax = instance.Max.Y + _c.Settings.CellHeight,
+                    areaMod = new RcAreaModification(RcRecast.RC_NULL_AREA),
+                });
+            }
+
+            /// <summary>Convex hull of points[0..n) into hull (Andrew's monotone chain); the number of corners.</summary>
+            private static int ConvexHull(Vector2[] points, int n, Vector2[] hull)
+            {
+                Array.Sort(points, 0, n, ByXThenY);
+
+                static float Cross(Vector2 o, Vector2 a, Vector2 b) => (a.X - o.X) * (b.Y - o.Y) - (a.Y - o.Y) * (b.X - o.X);
+
+                int k = 0;
+                for (int i = 0; i < n; i++)
+                {
+                    while (k >= 2 && Cross(hull[k - 2], hull[k - 1], points[i]) <= 0) k--;
+                    hull[k++] = points[i];
+                }
+                for (int i = n - 2, lower = k + 1; i >= 0; i--)
+                {
+                    while (k >= lower && Cross(hull[k - 2], hull[k - 1], points[i]) <= 0) k--;
+                    hull[k++] = points[i];
+                }
+                return k - 1;
+            }
+
             private void ReserveVertices(int count)
             {
                 int needed = (_vertCount + count) * 3;
@@ -531,10 +624,14 @@ namespace Freefall.Navigation
                 if (spanMin < 0f) spanMin = 0f;
                 if (spanMax > fieldHeight) spanMax = fieldHeight;
 
-                // Snap to the height lattice
+                // Snap to the height lattice. The lattice is whole cell heights, and authored floors and
+                // treads lie on round heights, so a tread is often exactly on a boundary. A flat face
+                // there came out [k-1, k] or [k, k+1] (a span is at least a cell tall) by float noise
+                // alone: some treads of a stair a cell higher than the rest, and the ledge filter cut
+                // the flight at them. Within OnBoundary of a boundary, both ends count as below it.
                 float invCh = 1f / _c.Settings.CellHeight;
-                int smin = Math.Clamp((int)MathF.Floor(spanMin * invCh), 0, RcRecast.RC_SPAN_MAX_HEIGHT);
-                int smax = Math.Min(Math.Max((int)MathF.Ceiling(spanMax * invCh), smin + 1), RcRecast.RC_SPAN_MAX_HEIGHT);
+                int smin = Math.Clamp((int)MathF.Floor(spanMin * invCh - OnBoundary), 0, RcRecast.RC_SPAN_MAX_HEIGHT);
+                int smax = Math.Min(Math.Max((int)MathF.Ceiling(spanMax * invCh - OnBoundary), smin + 1), RcRecast.RC_SPAN_MAX_HEIGHT);
 
                 var spans = _solid!.spans;
                 int mergeThreshold = _c.Config.WalkableClimb;

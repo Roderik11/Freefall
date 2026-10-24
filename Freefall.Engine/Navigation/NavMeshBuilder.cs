@@ -98,7 +98,8 @@ namespace Freefall.Navigation
     public static partial class NavMeshBuilder
     {
         // Bump when a change to the bake alters its output, so stored tiles are rebuilt
-        private const int BakeVersion = 1;
+        // 2: span tops on a cell boundary stay in the cell (stairs were cut where float noise lifted a tread)
+        private const int BakeVersion = 2;
 
         private const int MaxCells = 4_000_000;
 
@@ -522,14 +523,13 @@ namespace Freefall.Navigation
         }
 
         /// <summary>
-        /// Recast asks its geometry provider for convex volumes after rasterization. The triangles
-        /// are rasterized by TileWorker, so there is nothing else to provide.
+        /// Recast asks its geometry provider for convex volumes after rasterization and erosion, and
+        /// clears their area: the NavMeshBlockers of one cell. The triangles are rasterized by
+        /// TileWorker, so there is nothing else to provide.
         /// </summary>
-        private sealed class NoGeometry : IRcInputGeomProvider
+        private sealed class Blockers : IRcInputGeomProvider
         {
-            public static readonly NoGeometry Instance = new();
-
-            private readonly List<RcConvexVolume> _volumes = [];
+            public readonly List<RcConvexVolume> Volumes = [];
             private readonly List<RcOffMeshConnection> _connections = [];
 
             public RcTriMesh GetMesh() => null!;
@@ -537,7 +537,7 @@ namespace Freefall.Navigation
             public RcVec3f GetMeshBoundsMax() => default;
             public IEnumerable<RcTriMesh> Meshes() => [];
             public void AddConvexVolume(RcConvexVolume convexVolume) { }
-            public IList<RcConvexVolume> ConvexVolumes() => _volumes;
+            public IList<RcConvexVolume> ConvexVolumes() => Volumes;
             public List<RcOffMeshConnection> GetOffMeshConnections() => _connections;
             public void AddOffMeshConnection(RcVec3f start, RcVec3f end, float radius, bool bidir, int area, int flags) { }
             public void RemoveOffMeshConnections(Predicate<RcOffMeshConnection> filter) { }
