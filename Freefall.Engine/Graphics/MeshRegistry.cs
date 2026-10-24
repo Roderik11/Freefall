@@ -27,7 +27,7 @@ namespace Freefall.Graphics
             public uint BaseIndex;
             public uint VertexCount;
             public uint BoneWeightsBufferIdx;
-            public uint Reserved3;
+            public uint PushNormBufferIdx;     // Mesh.PushNormBufferIndex: what gbuffer.fx's displacement pushes along (0 = the normals)
             // Local-space bounding sphere (center + radius) for GPU culling
             public float BoundsCenterX;
             public float BoundsCenterY;
@@ -172,7 +172,7 @@ namespace Freefall.Graphics
                     BaseIndex = (uint)part.BaseIndex,
                     VertexCount = (uint)part.NumIndices,
                     BoneWeightsBufferIdx = mesh.BoneWeightBufferIndex,
-                    Reserved3 = 0,
+                    PushNormBufferIdx = mesh.PushNormBufferIndex,
                     BoundsCenterX = bounds.X,
                     BoundsCenterY = bounds.Y,
                     BoundsCenterZ = bounds.Z,

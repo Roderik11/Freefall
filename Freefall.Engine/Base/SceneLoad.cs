@@ -375,7 +375,7 @@ namespace Freefall.Base
             "Parse YAML", "Resolve references", "Resolve assets", "Hydrate prefabs",
             "TerrainRenderer", "Terrain texture arrays", "Terrain holes", "Terrain height plan", "Terrain palettes",
             "Terrain height readback", "Terrain heights changed", "Terrain splat plan", "Terrain deco plan",
-            "Terrain heightmap upload", "RuntimeMesh generate", "RuntimeMesh upload",
+            "Terrain heightmap upload", "RuntimeMesh generate", "RuntimeMesh upload", "Push normals",
             "NavMesh world", "NavMesh gizmo mesh", "ExcludeObstacles", "ExcludeObstacles gather", "ExcludeObstacles filter",
             "Deferred disposals", "Collider find body", "Collider actor", "Collider geometry", "Collider mesh cook", "Collider shape",
             "Terrain collider samples", "Terrain collider cook", "Terrain collider height field", "Render", "Physics",

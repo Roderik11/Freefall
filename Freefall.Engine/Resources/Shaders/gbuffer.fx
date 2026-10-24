@@ -49,6 +49,7 @@ struct VSOutput
 {
     float4 Position : SV_POSITION;
     float3 Normal : NORMAL;
+    float3 PushNormal : NORMAL1;    // what the displacement pushes along (Mesh.ComputePushNormals): one way across hard edges
     float2 TexCoord : TEXCOORD0;
     float4 WorldPos : TEXCOORD1;
     nointerpolation uint MaterialID : TEXCOORD2;
@@ -129,6 +130,13 @@ VSOutput VS(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_InstanceI
     output.Position = mul(mul(worldPos, View), Projection);
     
     output.Normal = mul(norm, W3);
+    float3 push = norm;
+    if (part.PushNormBufferIdx != 0)
+    {
+        StructuredBuffer<float3> pushNormals = ResourceDescriptorHeap[part.PushNormBufferIdx];
+        push = pushNormals[vertexID];
+    }
+    output.PushNormal = mul(push, W3);
     output.TexCoord = uv;
     output.TexCoord.y = 1 - output.TexCoord.y;
     output.MaterialID = materialID;
@@ -320,7 +328,11 @@ PSOutput PS(VSOutput input)
         depth = input.Depth - height * dispScale;
 
         float4 clipPos = mul(float4(input.WorldPos), ViewProjection);
-        float4 clipDisp = mul(float4(input.WorldPos + faceNormal * height * dispScale, 1), ViewProjection);
+        // Pushed along the push normal, not the vertex normal: a hard edge splits its vertices, and the two faces pushed
+        // each along its own normal parted at the edge, where the inversion drew a band of stretched texture (the keep's
+        // stair nosings, a plinth's top edge, 2026-10-24)
+        float3 push = normalize(input.PushNormal);
+        float4 clipDisp = mul(float4(input.WorldPos.xyz + push * height * dispScale, 1), ViewProjection);
         float2 ndcPos = clipPos.xy / clipPos.w;
         float2 ndcDisp = clipDisp.xy / clipDisp.w;
         displacement = (ndcDisp - ndcPos) * float2(0.5, -0.5);

@@ -17,7 +17,7 @@ namespace Freefall.Graphics
     [AssetPacker(".mesh")]
     public class MeshPacker : AssetPacker<MeshData>
     {
-        public override int Version => 7;
+        public override int Version => 8;
 
         public override void Pack(BinaryWriter w, MeshData data)
         {
@@ -26,6 +26,8 @@ namespace Freefall.Graphics
             w.WriteArray(data.Normals);
             w.WriteArray(data.UVs);
             w.WriteArray(data.Tangents);
+            // The screen-space displacement's push normals (v8+), made here so a scene load does not weld every mesh
+            w.WriteArray(Mesh.PushNormalsOf(data) ?? Mesh.ComputePushNormals(data.Positions, data.Normals, data.Indices));
 
             // Indices
             w.WriteArray(data.Indices);
@@ -109,6 +111,13 @@ namespace Freefall.Graphics
                 data.Tangents = r.ReadVector4Array();
             else
                 data.Tangents = null;
+
+            // Push normals (v8+; older packs make them with the Mesh)
+            if (version >= 8)
+            {
+                var push = r.ReadVector3Array();
+                data.PushNormals = push.Length > 0 ? push : null;
+            }
 
             // Indices
             data.Indices = r.ReadUInt32Array();

@@ -191,7 +191,7 @@ struct MeshPartEntry
     uint BaseIndex;
     uint VertexCount;
     uint BoneWeightsBufferIdx;
-    uint Reserved3;
+    uint PushNormBufferIdx;
     // Local-space bounding sphere (center + radius) for GPU culling
     float4 LocalBounds;  // xyz = center, w = radius
     // Reserved fields for padding to match C# layout

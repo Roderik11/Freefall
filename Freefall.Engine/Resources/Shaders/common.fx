@@ -317,7 +317,7 @@ struct MeshPartEntry
     uint BaseIndex;
     uint VertexCount;
     uint BoneWeightsBufferIdx;
-    uint Reserved3;
+    uint PushNormBufferIdx;     // Mesh.PushNormBufferIndex: what gbuffer.fx's displacement pushes along (0 = the normals)
     float4 LocalBounds;        // center.xyz + radius.w
     uint TanBufferIdx;
     uint IndexBufferAddressLo;  // the mesh's index buffer for indexed indirect draws (cull_instances.hlsl IndexedDrawCommand)

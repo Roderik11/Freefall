@@ -14,6 +14,7 @@ namespace Freefall.Graphics
         public Vector3[] Positions;
         public Vector3[] Normals;
         public Vector4[] Tangents;  // XYZ = tangent direction, W = bitangent sign (±1)
+        public Vector3[]? PushNormals;  // Mesh.ComputePushNormals, made at import (MeshPacker v8); null = made with the Mesh
         public Vector2[] UVs;
         public uint[] Indices;
         public List<MeshPart> Parts = new List<MeshPart>();

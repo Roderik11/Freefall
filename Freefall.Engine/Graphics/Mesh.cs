@@ -336,6 +336,7 @@ namespace Freefall.Graphics
         private ID3D12Resource _uvBuffer = null!;
         private VertexBufferView _uvView;
         private ID3D12Resource? _tanBuffer;
+        private ID3D12Resource? _pushNormBuffer;
 
         private int _vertexCount;
         private ID3D12Resource _indexBuffer = null!;
@@ -348,6 +349,9 @@ namespace Freefall.Graphics
         public uint NormBufferIndex { get; internal set; }
         public uint UVBufferIndex { get; internal set; }
         public uint TanBufferIndex { get; internal set; }
+        /// <summary>The push normals (<see cref="ComputePushNormals"/>): what the screen-space displacement pushes a
+        /// vertex's height along (gbuffer.fx). 0 = none: it pushes along the vertex normal.</summary>
+        public uint PushNormBufferIndex { get; internal set; }
         public uint IndexBufferIndex { get; internal set; }
         
         public BoundingBox BoundingBox { get; set; }
@@ -511,13 +515,13 @@ namespace Freefall.Graphics
 
         public Mesh(GraphicsDevice device, Vector3[] positions, Vector3[] normals, Vector2[] uvs, uint[] indices)
         {
-            CreateBuffers(device, positions, normals, null, uvs, indices);
+            CreateBuffers(device, positions, normals, null, uvs, indices, null);
             MarkReady();
         }
 
         public Mesh(GraphicsDevice device, MeshData data)
         {
-            CreateBuffers(device, data.Positions, data.Normals, data.Tangents, data.UVs, data.Indices);
+            CreateBuffers(device, data.Positions, data.Normals, data.Tangents, data.UVs, data.Indices, PushNormalsOf(data));
             MeshParts.AddRange(data.Parts);
             BoundingBox = data.BoundingBox;
             if (data.LODs != null && data.LODs.Count > 0)
@@ -557,7 +561,7 @@ namespace Freefall.Graphics
             // i.e., "Quick call to CreateCommittedResource".
             // So we can reuse CreateBuffers but we need to CHANGE it to NOT do the CopyQueueWait.
             
-            mesh.CreateBuffersAsync(device, data.Positions, data.Normals, data.Tangents, data.UVs, data.Indices);
+            mesh.CreateBuffersAsync(device, data.Positions, data.Normals, data.Tangents, data.UVs, data.Indices, PushNormalsOf(data));
             
             // Bone weights?
             if (data.BoneWeights != null && data.BoneWeights.Length > 0)
@@ -569,7 +573,7 @@ namespace Freefall.Graphics
             return mesh;
         }
 
-        private void CreateBuffers(GraphicsDevice device, Vector3[] positions, Vector3[] normals, Vector4[] tangents, Vector2[] uvs, uint[] indices)
+        private void CreateBuffers(GraphicsDevice device, Vector3[] positions, Vector3[] normals, Vector4[] tangents, Vector2[] uvs, uint[] indices, Vector3[]? pushNormals)
         {
             // Legacy Synchronous Path
              _vertexCount = positions.Length;
@@ -600,6 +604,14 @@ namespace Freefall.Graphics
             UVBufferIndex = device.AllocateBindlessIndex();
             CreateStructuredBufferSRV(device, _uvBuffer, (uint)uvs.Length, 8, UVBufferIndex);
 
+            pushNormals ??= ComputePushNormals(positions, normals, indices);
+            if (pushNormals is { Length: > 0 })
+            {
+                _pushNormBuffer = uploads.Create(pushNormals);
+                PushNormBufferIndex = device.AllocateBindlessIndex();
+                CreateStructuredBufferSRV(device, _pushNormBuffer, (uint)pushNormals.Length, 12, PushNormBufferIndex);
+            }
+
             // Tangent buffer (float4, 16 bytes per vertex)
             if (tangents != null && tangents.Length > 0)
             {
@@ -619,7 +631,112 @@ namespace Freefall.Graphics
             }
         }
         
-        private void CreateBuffersAsync(GraphicsDevice device, Vector3[] positions, Vector3[] normals, Vector4[] tangents, Vector2[] uvs, uint[] indices)
+        private static readonly ProfilerMarker _pushNormalsMarker = ProfilerMarker.Get("Push normals");
+
+        /// <summary>
+        /// A mesh's push normals as its data holds them (packed at import), none for a skinned mesh (gbuffer_skinned.fx
+        /// does not displace: an empty array, so none are made), or null: made with the Mesh.
+        /// </summary>
+        public static Vector3[]? PushNormalsOf(MeshData data) =>
+            data.PushNormals ?? (data.BoneWeights is { Length: > 0 } ? Array.Empty<Vector3>() : null);
+
+        /// <summary>
+        /// What the screen-space displacement pushes each vertex's height along (gbuffer.fx): the normals of the
+        /// triangles round its position, weighted by their angle there, over every vertex at that position. A hard
+        /// edge splits its vertices, each with its own face's normal; pushed along those, the two faces parted at the
+        /// edge, no pixel landed in the gap and the inversion drew a band of stretched texture along it (a fortification
+        /// plinth's top edge, the keep's stair nosings, user, 2026-10-24). Pushed along these, both sides of an edge
+        /// move alike. A vertex keeps its own normal where the triangles round it cancel (the two sides of a card) or
+        /// point against it. Null without triangles. Imported meshes have them packed (MeshPacker v8); generated ones
+        /// (RuntimeMesh) make them here, on the main thread: the profiler's "Push normals".
+        /// </summary>
+        public static Vector3[]? ComputePushNormals(Vector3[] positions, Vector3[] normals, uint[]? indices)
+        {
+            if (positions == null || normals == null || indices == null || indices.Length < 3
+                || normals.Length != positions.Length)
+                return null;
+            int count = positions.Length;
+            using var _ = _pushNormalsMarker.Auto(count);
+
+            // Every vertex to the first at its position: open addressing on the position's bits (a Dictionary of
+            // Vector3 took twice as long as everything else here)
+            var welded = new int[count];
+            int size = (int)System.Numerics.BitOperations.RoundUpToPowerOf2((uint)Math.Max(count * 2, 16));
+            var table = new int[size];      // vertex + 1; 0 = empty
+            int mask = size - 1;
+            for (int i = 0; i < count; i++)
+            {
+                var p = positions[i];
+                int slot = (int)(PositionHash(p) & (uint)mask);
+                while (true)
+                {
+                    int held = table[slot];
+                    if (held == 0)
+                    {
+                        table[slot] = i + 1;
+                        welded[i] = i;
+                        break;
+                    }
+                    if (positions[held - 1] == p)
+                    {
+                        welded[i] = held - 1;
+                        break;
+                    }
+                    slot = (slot + 1) & mask;
+                }
+            }
+
+            var sum = new Vector3[count];
+            for (int t = 0; t + 2 < indices.Length; t += 3)
+            {
+                int a = (int)indices[t], b = (int)indices[t + 1], c = (int)indices[t + 2];
+                if (a >= count || b >= count || c >= count) continue;
+                Vector3 pa = positions[a], pb = positions[b], pc = positions[c];
+                var face = Vector3.Cross(pb - pa, pc - pa);
+                float lengthSq = face.LengthSquared();
+                if (lengthSq < 1e-24f) continue;
+                face /= MathF.Sqrt(lengthSq);
+                // Out the side the mesh's own normals face, whichever way the triangles wind
+                if (Vector3.Dot(face, normals[a] + normals[b] + normals[c]) < 0f) face = -face;
+                sum[welded[a]] += face * Corner(pb - pa, pc - pa);
+                sum[welded[b]] += face * Corner(pc - pb, pa - pb);
+                sum[welded[c]] += face * Corner(pa - pc, pb - pc);
+            }
+
+            var push = new Vector3[count];
+            for (int i = 0; i < count; i++)
+            {
+                var s = sum[welded[i]];
+                float lengthSq = s.LengthSquared();
+                push[i] = lengthSq > 1e-12f && Vector3.Dot(s, normals[i]) > 0f ? s / MathF.Sqrt(lengthSq) : normals[i];
+            }
+            return push;
+
+            // A triangle's angle at a corner (radians), acos by Abramowitz and Stegun 4.4.45 (|error| < 7e-5)
+            static float Corner(Vector3 u, Vector3 v)
+            {
+                float lengths = u.LengthSquared() * v.LengthSquared();
+                if (lengths <= 1e-30f) return 0f;
+                float x = Math.Clamp(Vector3.Dot(u, v) / MathF.Sqrt(lengths), -1f, 1f);
+                float ax = MathF.Abs(x);
+                float r = MathF.Sqrt(1f - ax) * (1.5707288f + ax * (-0.2121144f + ax * (0.0742610f - 0.0187293f * ax)));
+                return x >= 0f ? r : MathF.PI - r;
+            }
+        }
+
+        // A position's hash; -0 and 0 are one place (adding 0 turns -0 into 0)
+        private static uint PositionHash(Vector3 p)
+        {
+            uint h = BitConverter.SingleToUInt32Bits(p.X + 0f) * 0x8DA6B343u
+                   ^ BitConverter.SingleToUInt32Bits(p.Y + 0f) * 0xD8163841u
+                   ^ BitConverter.SingleToUInt32Bits(p.Z + 0f) * 0xCB1AB31Fu;
+            h ^= h >> 16;
+            h *= 0x7FEB352Du;
+            h ^= h >> 15;
+            return h;
+        }
+
+        private void CreateBuffersAsync(GraphicsDevice device, Vector3[] positions, Vector3[] normals, Vector4[] tangents, Vector2[] uvs, uint[] indices, Vector3[]? pushNormals)
         {
             // 1. Create GPU Resources (Fast, no upload)
             _vertexCount = positions.Length;
@@ -644,6 +761,15 @@ namespace Freefall.Graphics
 
             UVBufferIndex = device.AllocateBindlessIndex();
             CreateStructuredBufferSRV(device, _uvBuffer, (uint)uvs.Length, 8, UVBufferIndex);
+
+            pushNormals ??= ComputePushNormals(positions, normals, indices);
+            if (pushNormals is { Length: > 0 })
+            {
+                _pushNormBuffer = device.CreateDefaultBuffer(pushNormals.Length * 12, ResourceFlags.None);
+                PushNormBufferIndex = device.AllocateBindlessIndex();
+                CreateStructuredBufferSRV(device, _pushNormBuffer, (uint)pushNormals.Length, 12, PushNormBufferIndex);
+                StreamingManager.Instance.EnqueueBufferUpload(_pushNormBuffer, pushNormals);
+            }
 
             // Tangent buffer (float4, 16 bytes per vertex)
             if (tangents != null && tangents.Length > 0)
@@ -774,6 +900,7 @@ namespace Freefall.Graphics
             (_normBuffer, source._normBuffer) = (source._normBuffer, _normBuffer);
             (_uvBuffer, source._uvBuffer) = (source._uvBuffer, _uvBuffer);
             (_tanBuffer, source._tanBuffer) = (source._tanBuffer, _tanBuffer);
+            (_pushNormBuffer, source._pushNormBuffer) = (source._pushNormBuffer, _pushNormBuffer);
             (_indexBuffer, source._indexBuffer) = (source._indexBuffer, _indexBuffer);
             (_boneWeightBuffer, source._boneWeightBuffer) = (source._boneWeightBuffer, _boneWeightBuffer);
             (_posView, source._posView) = (source._posView, _posView);
@@ -786,6 +913,7 @@ namespace Freefall.Graphics
             (NormBufferIndex, source.NormBufferIndex) = (source.NormBufferIndex, NormBufferIndex);
             (UVBufferIndex, source.UVBufferIndex) = (source.UVBufferIndex, UVBufferIndex);
             (TanBufferIndex, source.TanBufferIndex) = (source.TanBufferIndex, TanBufferIndex);
+            (PushNormBufferIndex, source.PushNormBufferIndex) = (source.PushNormBufferIndex, PushNormBufferIndex);
             (IndexBufferIndex, source.IndexBufferIndex) = (source.IndexBufferIndex, IndexBufferIndex);
             (BoneWeightBufferIndex, source.BoneWeightBufferIndex) = (source.BoneWeightBufferIndex, BoneWeightBufferIndex);
 
@@ -894,6 +1022,7 @@ namespace Freefall.Graphics
             _indexBuffer?.Dispose();
             _boneWeightBuffer?.Dispose();
             _tanBuffer?.Dispose();
+            _pushNormBuffer?.Dispose();
 
             // Release bindless descriptor slots
             if (device != null)
@@ -904,6 +1033,7 @@ namespace Freefall.Graphics
                 if (IndexBufferIndex > 0) device.ReleaseBindlessIndex(IndexBufferIndex);
                 if (BoneWeightBufferIndex > 0) device.ReleaseBindlessIndex(BoneWeightBufferIndex);
                 if (TanBufferIndex > 0) device.ReleaseBindlessIndex(TanBufferIndex);
+                if (PushNormBufferIndex > 0) device.ReleaseBindlessIndex(PushNormBufferIndex);
             }
         }
 
