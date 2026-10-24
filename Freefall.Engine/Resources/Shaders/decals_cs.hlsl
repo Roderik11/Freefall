@@ -136,7 +136,7 @@ void CSTileDecals(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint gi
 struct Surface
 {
     float4 Albedo;          // rgb colour, a the emissive mask (kept)
-    float4 Normal;          // xyz world normal, w translucency (kept)
+    float4 Normal;          // xyz world normal, w translucency or a mesh's shape normal (common.fx PackShapeNormal; kept)
     float4 Data;            // roughness, metal, AO, a the lighting model (kept)
     float Depth;            // linear depth minus the height bias
     float2 Displacement;    // the screen-space displacement vector
@@ -557,8 +557,9 @@ float3 TerrainNormal(DecalFrame f, float2 xz)
 
 // The weather on an open surface (`open`: SurfaceOpenness; `normalVariance`: NormalVariance): wet (porous surfaces
 // darken, smooth ones and flat open ground take a water film) and snow (on what faces up, patchy while it is thin,
-// smoothing the relief). `geo` is the surface's smooth large-scale normal: on the terrain its height map's, elsewhere
-// the geometric normal from the depth. On the terrain that one is flat per triangle of the CDLOD mesh: deep snow was
+// smoothing the relief). `geo` is the surface's smooth large-scale normal: on the terrain its height map's, on meshes
+// their shape normal (gbuffer.fx), elsewhere the geometric normal from the depth. On the terrain that one is flat per
+// triangle of the CDLOD mesh (on a low-poly rock too, 2026-10-24): deep snow was
 // shaded in facets, steep triangles stayed bare edge to edge, and the normal bent halfway up lit the slopes that the
 // shadow map darkens, so the terrain's shadow showed as long smears on the snow (user, 2026-10-23)
 void ApplyWeather(DecalFrame f, float3 rel, float3 geo, uint surfaceClass, float open, float normalVariance, inout Surface s)
@@ -802,9 +803,15 @@ void CSDecals(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint gi : S
     {
         // (vegetation: its own dome normal, gbuffer_foliage.fx / gbuffer_crossmesh.fx: the depth's normal of a far tree's
         // vertical cards pointed sideways, and the snow stopped a few hundred metres out, far trees stood green)
-        float3 largeN = geo;
+        float3 largeN = geo, shapeN;
         if (surfaceClass == 1u && f.TerrainHeightmap != 0)
             largeN = TerrainNormal(f, rel.xz + CamPos.xz);
+        // Meshes: their shape without the normal map (gbuffer.fx, PackShapeNormal), smooth over the triangles as the
+        // mesh's normals are. The depth's normal is flat per triangle: on a low-poly rock the deep snow lay and shaded
+        // in facets, whole triangles white beside bare ones (user, 2026-10-24). Turned to the side the eye sees, as the
+        // depth's normal is (a two-sided mesh from behind)
+        else if (surfaceClass == 0u && UnpackShapeNormal(s.Normal.w, shapeN))
+            largeN = dot(shapeN, geo) < 0.0 ? -shapeN : shapeN;
         else if (surfaceClass == 2u)
         {
             largeN = normalize(s.Normal.xyz);

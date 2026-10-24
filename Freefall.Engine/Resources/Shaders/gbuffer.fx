@@ -337,7 +337,8 @@ PSOutput PS(VSOutput input)
     }
     
     output.Albedo = float4(color.rgb, emissiveMask);
-    output.Normal = float4(N, 1.0f);
+    // w: the shape without the normal map, for the snow (PackShapeNormal; faceNormal is the interpolated vertex normal)
+    output.Normal = float4(N, PackShapeNormal(faceNormal));
     // Geometric specular anti-aliasing (Kaplanyan 2016 / Tokuyoshi 2019)
     float3 dNdx = ddx(N), dNdy = ddy(N);
     float normalVariance = max(dot(dNdx, dNdx), dot(dNdy, dNdy));

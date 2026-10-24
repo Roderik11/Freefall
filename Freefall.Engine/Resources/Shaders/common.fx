@@ -631,4 +631,34 @@ float3 SignedOctDecode(float3 n)
     return OutN;
 }
 
+// A mesh's shape normal (its interpolated vertex normal, without the normal map) in the G-buffer normal's w, which plain
+// meshes left at 1 and only vegetation uses (its translucency): octahedral about +y, 8 bits a side as 255 × 255 steps of
+// the 16-bit SNorm, so 1 (no shape normal: every other effect) lies outside them. Deep snow follows it on meshes
+// (decals_cs.hlsl); the depth's normal it took before is flat per triangle and drew a low-poly rock's facets in the snow
+float PackShapeNormal(float3 n)
+{
+    n /= abs(n.x) + abs(n.y) + abs(n.z);
+    float2 o = n.xz;
+    if (n.y < 0.0)
+        o = (1.0 - abs(n.zx)) * float2(n.x >= 0.0 ? 1.0 : -1.0, n.z >= 0.0 ? 1.0 : -1.0);
+    uint2 q = (uint2)round(saturate(o * 0.5 + 0.5) * 254.0);
+    return ((float)(q.x * 255u + q.y) - 32512.0) / 32767.0;
+}
+
+// The shape normal PackShapeNormal wrote; false where none was (w 1). Only for meshes: vegetation keeps its translucency
+// there, which would read as a normal
+bool UnpackShapeNormal(float w, out float3 n)
+{
+    int k = (int)round(w * 32767.0) + 32512;
+    n = 0;
+    if (k < 0 || k > 65024)
+        return false;
+    float2 o = float2((uint)k / 255u, (uint)k % 255u) / 254.0 * 2.0 - 1.0;
+    n = float3(o.x, 1.0 - abs(o.x) - abs(o.y), o.y);
+    if (n.y < 0.0)
+        n.xz = (1.0 - abs(n.zx)) * float2(n.x >= 0.0 ? 1.0 : -1.0, n.z >= 0.0 ? 1.0 : -1.0);
+    n = normalize(n);
+    return true;
+}
+
 #endif // COMMON_FX
