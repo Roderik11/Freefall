@@ -83,8 +83,8 @@ namespace Freefall.Graphics
 
         /// <summary>
         /// What the weather has left on the open surfaces round the camera (0..1), for the decal pass (decals_cs.hlsl):
-        /// how wet they are (rising in the rain, a minute to soak in heavy rain), how full rain-filled puddles are (filling
-        /// once the ground is soaked, ~5 minutes in heavy rain), how much snow lies (~10 minutes of heavy snow to cover).
+        /// how wet they are (rising in the rain, ~25 s to soak in a storm), how full rain-filled puddles are (filling once
+        /// the ground is soaked, ~1.5 minutes in a storm), how much snow lies (~2.5 minutes of a snowfall to cover).
         /// Once the rain stops they dry by evaporation: the sun on the ground and the wind speed it up (open ground ~1.7
         /// minutes at a sunny noon with a breeze, ~5 under overcast, ~10 on a still night; puddles four times as long);
         /// snow melts where it is warmer than the freezing level, faster in sun and rain. Real seconds, not game time.
@@ -95,9 +95,9 @@ namespace Freefall.Graphics
         public static float SnowCover { get; private set; }
 
         /// <summary>
-        /// How much snow has fallen at the camera since start, in covers' worth (a cover's worth: what lays SnowCover 0 → 1,
-        /// CoverSeconds of heavy snow); only grows. A footprint keeps the value it was made at, and fills with what falls
-        /// after it (decals_cs.hlsl: Print).
+        /// How much snow has fallen at the camera since start, 1 per FallenSeconds of the heaviest snow (what laid SnowCover
+        /// 0 → 1 until the cover was sped up); only grows. A footprint keeps the value it was made at, and fills with what
+        /// falls after it (decals_cs.hlsl: Print).
         /// </summary>
         public static float SnowFallen { get; private set; }
 
@@ -134,9 +134,13 @@ namespace Freefall.Graphics
 
         public const float WalkableIce = 0.6f;
 
-        private const float SoakSeconds = 60f, DrySeconds = 600f;
-        private const float FillSeconds = 300f, DrainSeconds = 2400f;
-        private const float CoverSeconds = 600f, MeltSeconds = 1200f;
+        // Seconds of the heaviest rain or snow to soak the ground, fill the puddles, cover it. Until 2026-10-24 60, 300 and
+        // 600: a storm took minutes to make puddles and a snowfall a quarter of an hour to whiten the land ("nobody wants
+        // to wait that long in a game", user). Drying, draining and melting kept their pace; footprints fill by
+        // FallenSeconds, the cover's old pace, so they last as long as before
+        private const float SoakSeconds = 15f, DrySeconds = 600f;
+        private const float FillSeconds = 60f, DrainSeconds = 2400f;
+        private const float CoverSeconds = 90f, MeltSeconds = 1200f, FallenSeconds = 600f;
         private const float FreezeSeconds = 1200f, ThawSeconds = 1800f;
         private const float SunLux = 60000f;    // lux of sun on level ground that counts as 1 (a clear noon gives ~1.4)
         private static float _wetness, _puddles, _snow, _ice;     // the weather's own, kept while the override is on
@@ -222,7 +226,7 @@ namespace Freefall.Graphics
             float filling = _wetness > 0.6f ? Rain / FillSeconds : 0f, draining = evaporation / DrainSeconds;
             _puddles = Math.Clamp(_puddles + (filling - draining) * dt, 0f, 1f);
             float covering = Snow / CoverSeconds;
-            SnowFallen += covering * dt;
+            SnowFallen += Snow / FallenSeconds * dt;
             float melting = SnowShare < 0.5f ? (1f + 3f * Rain + 2f * sun) / MeltSeconds : 0f;
             _snow = Math.Clamp(_snow + (covering - melting) * dt, 0f, 1f);
             float freezing = SnowShare > 0.5f ? 1f / FreezeSeconds : 0f;
