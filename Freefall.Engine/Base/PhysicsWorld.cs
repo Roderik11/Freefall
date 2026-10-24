@@ -103,8 +103,12 @@ namespace Freefall.Base
         {
             var manager = ControllerManager;
             if (manager == null) return;
+            // The list keeps controllers whose wrapper was disposed (the project's characters dispose their capsule's actor
+            // first, then the controller): InvalidateCache on one threw, and the first water body to swap its ice after a
+            // step took the blame (2026-10-24: 'Stillwater' in the player, a fountain in the editor)
             foreach (var controller in manager.Controllers)
-                controller.InvalidateCache();
+                if (controller is { Disposed: false })
+                    controller.InvalidateCache();
         }
 
         // The PhysX Visual Debugger's default port

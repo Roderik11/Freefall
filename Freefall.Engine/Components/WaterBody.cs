@@ -28,8 +28,8 @@ namespace Freefall.Components
     ///
     /// In the cold it freezes (Graphics.Weather.Ice): water.fx draws the ice and the snow on it where the water is
     /// shallow and slow enough (Weather.IceThickness: from the banks in, a fast deep channel stays open), and in play a
-    /// static collider over the ice that holds (Weather.WalkableIce) carries walkers on it, made again when the ice
-    /// moves a step (Weather.IceStepChanged), not every frame.
+    /// static collider over the ice that holds (Weather.WalkableIce) carries walkers on it, cooked on a worker when a
+    /// step of the ice (Weather.IceStep) brings pieces in or takes them away (see Update).
     /// </summary>
     [Icon("icon_ocean.png")]
     public class WaterBody : Component, IDraw, IUpdate
@@ -146,10 +146,47 @@ namespace Freefall.Components
         private ShoreField? _shore;
         private System.Threading.Tasks.Task<ShoreField?>? _shoreTask;
         private Texture? _shoreTexture;
+
+        // The ice that can carry a walker over this surface, as it can come to be: its pieces (a river's surface
+        // triangles, a lake's IceCell squares) in world space, in the order the ice reaches them, each with the ice level
+        // from which it holds (Weather.IceHoldsFrom). The collider for any ice level is the first pieces of the list, so
+        // a step of the ice cooks only when it brings pieces in or takes them away. Made on a worker with each shore field.
+        private sealed class IceSheet
+        {
+            public required Vector3[] Points;
+            public required int[] Triangles;    // facing up, piece after piece
+            public required int[] PieceEnds;    // where each piece's triangles end in Triangles
+            public required float[] HoldsFrom;  // per piece, ascending
+
+            /// <summary>How many pieces carry a walker at this ice level.</summary>
+            public int PiecesAt(float ice)
+            {
+                int lo = 0, hi = HoldsFrom.Length;
+                while (lo < hi)
+                {
+                    int mid = (lo + hi) >> 1;
+                    if (HoldsFrom[mid] <= ice) lo = mid + 1; else hi = mid;
+                }
+                return lo;
+            }
+        }
+
+        private IceSheet? _iceSheet;
+        private System.Threading.Tasks.Task<IceSheet?>? _iceSheetTask;
+        private bool _iceSheetDirty;
+
+        // The collider: made from _iceColliderSheet's first _icePieces pieces. A cook of _iceCookPieces pieces of
+        // _iceCookSheet runs on a worker meanwhile; one water body a frame swaps its finished cook in (_iceSwapTick).
         private PhysX.RigidStatic? _iceActor;
         private PhysX.Shape? _iceShape;
         private PhysX.TriangleMesh? _iceMesh;
-        private bool _iceDirty;
+        private IceSheet? _iceColliderSheet;
+        private int _icePieces;
+        private System.Threading.Tasks.Task<System.IO.MemoryStream>? _iceCook;
+        private PhysX.Cooking? _iceCooking;
+        private IceSheet? _iceCookSheet;
+        private int _iceCookPieces;
+        private static int _iceSwapTick = -1;
 
         [StructLayout(LayoutKind.Sequential)]
         public struct WaterData
@@ -195,15 +232,20 @@ namespace Freefall.Components
             _spline = Entity.GetComponent<Spline>();
             _sunLight = EntityManager.FindComponent<DirectionalLight>();
             MessageDispatcher.AddListener(EngineMsg.SplineChanged, OnSplineChanged);
-            Weather.IceStepChanged += OnIceStepChanged;
-            _iceDirty = true;
         }
 
         public override void Destroy()
         {
             MessageDispatcher.RemoveListener(EngineMsg.SplineChanged, OnSplineChanged);
-            Weather.IceStepChanged -= OnIceStepChanged;
             ReleaseIce();
+            // A cook still running keeps its cooking object until it is done
+            if (_iceCook != null && _iceCooking != null)
+            {
+                var cooking = _iceCooking;
+                _iceCook.ContinueWith(_ => Engine.RunOnMainThreadAsync(() => PhysXRelease.Release(cooking)));
+            }
+            _iceCook = null;
+            _iceCooking = null;
             Engine.Device.DeferDispose(_shoreTexture);
             _shoreTexture = null;
 
@@ -218,8 +260,6 @@ namespace Freefall.Components
                 _meshDirty = true;
         }
 
-        private void OnIceStepChanged() => _iceDirty = true;
-
         /// <summary>Inspector / command-server edits (Width, Depth, Expand) rebuild the surface.</summary>
         public override void OnMemberChanged() => _meshDirty = true;
 
@@ -227,16 +267,109 @@ namespace Freefall.Components
         // ── Ice ──
         // ═══════════════════════════
 
-        /// <summary>In play: the ice collider made again when the ice moved a step or the surface changed.</summary>
+        /// <summary>
+        /// In play: the ice collider follows the ice. Which pieces of the surface carry a walker from which ice level is
+        /// worked out once per surface and shore field, on a worker (IceSheet); a frame then only looks up how many do at
+        /// the ice's step, and when that changes the new collider is cooked on a worker and swapped in, one water body a
+        /// frame. Until 2026-10-24 every water body walked its surface and cooked its collider on the main thread at every
+        /// step of the ice (every 12 s while it freezes): frames of 170-250 ms in Eldermoor.
+        /// </summary>
         public void Update()
         {
-            if (!_iceDirty || Engine.IsEditor) return;
+            if (Engine.IsEditor) return;
             if (_meshDirty) RebuildMesh();
             TakeShoreField();
-            if (_shore == null && _shoreTask != null) return;   // the field is still being made: then
-            _iceDirty = false;
+            if (_shoreTask != null) return;     // the field is still being made: the sheet waits for it
+            if (_iceSheetDirty) StartIceSheet();
+            TakeIceSheet();
+            TakeIceCook();
+            var sheet = _iceSheet;
+            if (sheet == null || _iceCook != null) return;
+
+            int pieces = sheet.PiecesAt(MathF.Round(Weather.Ice / Weather.IceStep) * Weather.IceStep);
+            if (pieces == _icePieces && sheet == _iceColliderSheet) return;
+            if (pieces == 0)
+            {
+                SetIceCollider(null, sheet, 0);
+                return;
+            }
+            var cooking = PhysicsWorld.Physics.CreateCooking();    // main thread: it goes into PhysX.Net's object table
+            _iceCooking = cooking;
+            _iceCookSheet = sheet;
+            _iceCookPieces = pieces;
+            _iceCook = System.Threading.Tasks.Task.Run(() => CookIce(cooking, sheet, pieces));
+        }
+
+        // The pieces the surface just built can carry, worked out on a worker (the shore field and the surface arrays are
+        // replaced, never written)
+        private void StartIceSheet()
+        {
+            _iceSheetDirty = false;
+            _iceSheetTask = null;
+            if (_surfaceTriangles.Length < 3)
+            {
+                _iceSheet = null;
+                SetIceCollider(null, null, 0);
+                return;
+            }
+            var (surface, steep, triangles, shore) = (_surfacePoints, _surfaceSteep, _surfaceTriangles, _shore);
+            var world = Transform.WorldMatrix;
+            bool flowing = _spline != null && !_spline.Closed;
+            float flowSpeed = FlowSpeed;
+            _iceSheetTask = System.Threading.Tasks.Task.Run(() => BuildIceSheet(surface, steep, triangles, world, flowing, flowSpeed, shore));
+        }
+
+        private void TakeIceSheet()
+        {
+            if (_iceSheetTask is not { IsCompleted: true } task) return;
+            _iceSheetTask = null;
+            _iceSheet = task.IsCompletedSuccessfully ? task.Result : null;
+            if (!task.IsCompletedSuccessfully)
+                Debug.LogWarning("WaterBody", $"'{Entity.Name}': working out the ice failed: {task.Exception?.GetBaseException().Message}");
+            if (_iceSheet == null)
+                SetIceCollider(null, null, 0);
+        }
+
+        // Main thread: a finished cook becomes the collider, one water body a frame
+        private void TakeIceCook()
+        {
+            if (_iceCook is not { IsCompleted: true } cook || _iceSwapTick == Engine.TickCount) return;
+            _iceSwapTick = Engine.TickCount;
+            _iceCook = null;
+            PhysXRelease.Release(_iceCooking);
+            _iceCooking = null;
+
+            PhysX.TriangleMesh? mesh = null;
+            try
+            {
+                mesh = PhysicsWorld.Physics.CreateTriangleMesh(cook.GetAwaiter().GetResult());
+                if (mesh == null) throw new InvalidOperationException("the cook made no mesh");
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning("WaterBody", $"'{Entity.Name}': cooking the ice collider ({_iceCookPieces} pieces) failed: {ex.GetBaseException().Message}");
+            }
+            // A failed cook keeps its count, so the same pieces are not cooked again until the ice moves on
+            SetIceCollider(mesh, _iceCookSheet, _iceCookPieces);
+        }
+
+        // The collider becomes this mesh (null: none), made from the first pieces of the sheet
+        private void SetIceCollider(PhysX.TriangleMesh? mesh, IceSheet? sheet, int pieces)
+        {
             bool had = _iceActor != null;
-            BuildIce();
+            ReleaseIce();
+            _iceColliderSheet = sheet;
+            _icePieces = pieces;
+            if (mesh != null)
+            {
+                _iceMesh = mesh;
+                _iceActor = PhysicsWorld.Physics.CreateRigidStatic();
+                _iceActor.UserData = Entity;
+                _iceActor.Flags &= ~PhysX.ActorFlag.Visualization;
+                _iceShape = PhysX.RigidActorExt.CreateExclusiveShape(_iceActor, new PhysX.TriangleMeshGeometry(_iceMesh), PhysicsWorld.DefaultMaterial);
+                _iceShape.QueryFilterData = new PhysX.FilterData(Collider.Solid, 0, 0, 0);
+                PhysicsWorld.Scene.AddActor(_iceActor);
+            }
             // The walkers' controllers remember the shapes round them: a new or vanished sheet of ice is not seen
             // otherwise (they walked through ice turned off and on again)
             if (had || _iceActor != null)
@@ -244,55 +377,44 @@ namespace Freefall.Components
         }
 
         /// <summary>
-        /// A static triangle mesh over the ice that holds a walker (world space, at the water's surface): a river's
-        /// surface triangles whose corners all freeze that far, a lake's grid cells. Nothing while it is all open water.
+        /// Any thread: the pieces of ice the surface can carry (world space, at the water's surface; see IceSheet). A
+        /// river's surface triangles hold from where all three corners hold; a lake is laid on a grid of IceCell squares,
+        /// each at the surface's height at its middle, whose middle lies in a surface triangle (a lake's are the outline's:
+        /// a few big ones). As far out as the ice comes, under the banks too (the surface runs on under them), so no gap
+        /// opens between the shore and the ice. Pieces that would need more than full ice are left out.
         /// </summary>
-        private void BuildIce()
+        private static IceSheet BuildIceSheet(Vector3[] surface, float[] steep, int[] surfaceTriangles, Matrix4x4 world,
+                                              bool flowing, float flowSpeed, ShoreField? shore)
         {
-            ReleaseIce();
-            float ice = Weather.Ice;
-            if (ice <= 0f || _surfaceTriangles.Length == 0) return;
-
-            var world = Transform.WorldMatrix;
-            bool flowing = _spline != null && !_spline.Closed;
             var points = new List<Vector3>();
+            var pieces = new List<(float HoldsFrom, int First, int Count)>();   // a run of triangles in 'triangles'
             var triangles = new List<int>();
-
-            // As far out as the ice has come; under the banks too (the surface runs on under them), so no gap opens
-            // between the shore and the ice
-            var shore = _shore;
-            bool Holds(Vector3 p, float steep)
-            {
-                float speed = flowing ? FlowSpeed * (1f + 4f * steep) : 0f;
-                return Weather.IceThickness(ice, shore?.At(p.X, p.Z) ?? 1f, speed) >= Weather.WalkableIce;
-            }
+            float HoldsFrom(Vector3 p, float speed) => Weather.IceHoldsFrom(shore?.At(p.X, p.Z) ?? 1f, speed);
 
             if (flowing)
             {
-                var worldPoints = Array.ConvertAll(_surfacePoints, p => Vector3.Transform(p, world));
-                var holds = new bool[worldPoints.Length];
-                for (int i = 0; i < worldPoints.Length; i++)
-                    holds[i] = Holds(worldPoints[i], _surfaceSteep[i]);
-                points.AddRange(worldPoints);
-                for (int t = 0; t + 2 < _surfaceTriangles.Length; t += 3)
+                points.AddRange(Array.ConvertAll(surface, p => Vector3.Transform(p, world)));
+                var from = new float[points.Count];
+                for (int i = 0; i < from.Length; i++)
+                    from[i] = HoldsFrom(points[i], flowSpeed * (1f + 4f * steep[i]));
+                for (int t = 0; t + 2 < surfaceTriangles.Length; t += 3)
                 {
-                    int a = _surfaceTriangles[t], b = _surfaceTriangles[t + 1], c = _surfaceTriangles[t + 2];
-                    if (holds[a] && holds[b] && holds[c])
-                    {
-                        triangles.Add(a); triangles.Add(b); triangles.Add(c);
-                    }
+                    int a = surfaceTriangles[t], b = surfaceTriangles[t + 1], c = surfaceTriangles[t + 2];
+                    float holds = MathF.Max(from[a], MathF.Max(from[b], from[c]));
+                    if (holds > 1f) continue;
+                    pieces.Add((holds, triangles.Count, 3));
+                    triangles.Add(a); triangles.Add(b); triangles.Add(c);
                 }
             }
             else
             {
-                // Every cell whose centre lies in a surface triangle, at the surface's height there (once: a centre on
-                // an edge two triangles share)
+                // Every cell whose centre lies in a surface triangle (once: a centre on an edge two triangles share)
                 var laid = new HashSet<(int, int)>();
-                for (int t = 0; t + 2 < _surfaceTriangles.Length; t += 3)
+                for (int t = 0; t + 2 < surfaceTriangles.Length; t += 3)
                 {
-                    var a = _surfacePoints[_surfaceTriangles[t]];
-                    var b = _surfacePoints[_surfaceTriangles[t + 1]];
-                    var c = _surfacePoints[_surfaceTriangles[t + 2]];
+                    var a = surface[surfaceTriangles[t]];
+                    var b = surface[surfaceTriangles[t + 1]];
+                    var c = surface[surfaceTriangles[t + 2]];
                     float minX = MathF.Min(a.X, MathF.Min(b.X, c.X)), maxX = MathF.Max(a.X, MathF.Max(b.X, c.X));
                     float minZ = MathF.Min(a.Z, MathF.Min(b.Z, c.Z)), maxZ = MathF.Max(a.Z, MathF.Max(b.Z, c.Z));
                     for (float x = MathF.Floor(minX / IceCell) * IceCell; x < maxX; x += IceCell)
@@ -302,48 +424,67 @@ namespace Freefall.Components
                         if (!Barycentric(centre, a, b, c, out var w)) continue;
                         if (!laid.Add(((int)MathF.Round(x / IceCell), (int)MathF.Round(z / IceCell)))) continue;
                         float y = a.Y * w.X + b.Y * w.Y + c.Y * w.Z;
-                        if (!Holds(Vector3.Transform(new Vector3(centre.X, y, centre.Y), world), 0f)) continue;
+                        float holds = HoldsFrom(Vector3.Transform(new Vector3(centre.X, y, centre.Y), world), 0f);
+                        if (holds > 1f) continue;
                         int first = points.Count;
                         points.Add(Vector3.Transform(new Vector3(x, y, z), world));
                         points.Add(Vector3.Transform(new Vector3(x + IceCell, y, z), world));
                         points.Add(Vector3.Transform(new Vector3(x + IceCell, y, z + IceCell), world));
                         points.Add(Vector3.Transform(new Vector3(x, y, z + IceCell), world));
+                        pieces.Add((holds, triangles.Count, 6));
                         triangles.Add(first); triangles.Add(first + 2); triangles.Add(first + 1);
                         triangles.Add(first); triangles.Add(first + 3); triangles.Add(first + 2);
                     }
                 }
             }
-            if (triangles.Count == 0) return;
 
-            // Every triangle facing up ((b − a) × (c − a) along +y): the character's sweeps leave out the back of a mesh,
-            // and a river's strip turns whichever way its spline runs (it is drawn from both sides)
-            for (int t = 0; t + 2 < triangles.Count; t += 3)
+            // In the order the ice reaches them; every triangle facing up ((b − a) × (c − a) along +y): the character's
+            // sweeps leave out the back of a mesh, and a river's strip turns whichever way its spline runs (it is drawn
+            // from both sides)
+            pieces.Sort((p, q) => p.HoldsFrom.CompareTo(q.HoldsFrom));
+            var ordered = new int[triangles.Count];
+            var ends = new int[pieces.Count];
+            var holdsFrom = new float[pieces.Count];
+            int n = 0;
+            for (int k = 0; k < pieces.Count; k++)
             {
-                var a = points[triangles[t]];
-                var ab = points[triangles[t + 1]] - a;
-                var ac = points[triangles[t + 2]] - a;
-                if (ab.Z * ac.X - ab.X * ac.Z < 0f)
-                    (triangles[t + 1], triangles[t + 2]) = (triangles[t + 2], triangles[t + 1]);
+                var piece = pieces[k];
+                for (int t = piece.First; t < piece.First + piece.Count; t += 3)
+                {
+                    int a = triangles[t], b = triangles[t + 1], c = triangles[t + 2];
+                    var ab = points[b] - points[a];
+                    var ac = points[c] - points[a];
+                    if (ab.Z * ac.X - ab.X * ac.Z < 0f) (b, c) = (c, b);
+                    ordered[n++] = a; ordered[n++] = b; ordered[n++] = c;
+                }
+                ends[k] = n;
+                holdsFrom[k] = piece.HoldsFrom;
             }
+            return new IceSheet { Points = points.ToArray(), Triangles = ordered, PieceEnds = ends, HoldsFrom = holdsFrom };
+        }
 
-            var cooking = PhysicsWorld.Physics.CreateCooking();
-            try
+        // Any thread: the collider of the sheet's first pieces, cooked from the points they use
+        private static System.IO.MemoryStream CookIce(PhysX.Cooking cooking, IceSheet sheet, int pieces)
+        {
+            int end = sheet.PieceEnds[pieces - 1];
+            var map = new int[sheet.Points.Length];
+            Array.Fill(map, -1);
+            var points = new List<Vector3>();
+            var triangles = new int[end];
+            for (int i = 0; i < end; i++)
             {
-                using var stream = new System.IO.MemoryStream();
-                cooking.CookTriangleMesh(new PhysX.TriangleMeshDesc { Flags = 0, Triangles = triangles.ToArray(), Points = points.ToArray() }, stream);
-                stream.Position = 0;
-                _iceMesh = PhysicsWorld.Physics.CreateTriangleMesh(stream);
+                int v = sheet.Triangles[i];
+                if (map[v] < 0)
+                {
+                    map[v] = points.Count;
+                    points.Add(sheet.Points[v]);
+                }
+                triangles[i] = map[v];
             }
-            finally
-            {
-                PhysXRelease.Release(cooking);
-            }
-            _iceActor = PhysicsWorld.Physics.CreateRigidStatic();
-            _iceActor.UserData = Entity;
-            _iceActor.Flags &= ~PhysX.ActorFlag.Visualization;
-            _iceShape = PhysX.RigidActorExt.CreateExclusiveShape(_iceActor, new PhysX.TriangleMeshGeometry(_iceMesh), PhysicsWorld.DefaultMaterial);
-            _iceShape.QueryFilterData = new PhysX.FilterData(Collider.Solid, 0, 0, 0);
-            PhysicsWorld.Scene.AddActor(_iceActor);
+            var stream = new System.IO.MemoryStream();
+            cooking.CookTriangleMesh(new PhysX.TriangleMeshDesc { Flags = 0, Triangles = triangles, Points = points.ToArray() }, stream);
+            stream.Position = 0;
+            return stream;
         }
 
         /// <summary>The shore field of the surface just built, made on a worker (the terrain's heights are only read).</summary>
@@ -373,7 +514,7 @@ namespace Freefall.Components
                 Buffer.BlockCopy(_shore.Share, 0, bytes, 0, bytes.Length);
                 _shoreTexture = Texture.CreateFromData(Engine.Device, _shore.Width, _shore.Height, bytes, Vortice.DXGI.Format.R32_Float);
             }
-            _iceDirty = true;
+            _iceSheetDirty = true;
         }
 
         // Any thread. The grid's cells whose centre lies in a surface triangle and over the bed are water, the rest shore;
@@ -478,7 +619,7 @@ namespace Freefall.Components
         private void RebuildMesh()
         {
             _meshDirty = false;
-            _iceDirty = true;   // over the new surface
+            _iceSheetDirty = true;   // over the new surface
             Engine.Device.DeferDispose(_mesh);
             _mesh = null;
             _surfacePoints = Array.Empty<Vector3>();

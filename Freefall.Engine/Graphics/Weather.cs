@@ -118,10 +118,9 @@ namespace Freefall.Graphics
         public static float Ice { get; private set; }
 
         /// <summary>
-        /// Raised when <see cref="Ice"/> moves a step (<see cref="IceStep"/>), for what follows it slowly (the water's ice
-        /// colliders): not every frame.
+        /// The steps in which what follows <see cref="Ice"/> slowly takes it (the water's ice colliders, WaterBody): not
+        /// every frame. While it freezes, a step every FreezeSeconds × IceStep = 12 s.
         /// </summary>
-        public static event Action? IceStepChanged;
         public const float IceStep = 0.05f;
 
         /// <summary>
@@ -133,13 +132,21 @@ namespace Freefall.Graphics
         /// water.fx WaterIceThickness is the same, with a jagged edge. Ice of <see cref="WalkableIce"/> or more carries a
         /// walker.
         /// </summary>
-        public static float IceThickness(float ice, float shore, float speed)
-        {
-            float needed = 0.15f + 0.6f * shore + 0.4f * Math.Clamp(speed * shore / 2.5f, 0f, 1f);
-            return Math.Clamp((ice - needed) / 0.1f, 0f, 1f);
-        }
+        public static float IceThickness(float ice, float shore, float speed) =>
+            Math.Clamp((ice - IceNeeded(shore, speed)) / IceEdge, 0f, 1f);
 
         public const float WalkableIce = 0.6f;
+
+        /// <summary>
+        /// The ice level from which a place carries a walker (<see cref="IceThickness"/> reaches <see cref="WalkableIce"/>):
+        /// fixed per place, so WaterBody works out its collider for every ice level once.
+        /// </summary>
+        public static float IceHoldsFrom(float shore, float speed) => IceNeeded(shore, speed) + IceEdge * WalkableIce;
+
+        // The ice level at which the sheet reaches a place, and how much more it takes there to grow to its full thickness
+        private static float IceNeeded(float shore, float speed) =>
+            0.15f + 0.6f * shore + 0.4f * Math.Clamp(speed * shore / 2.5f, 0f, 1f);
+        private const float IceEdge = 0.1f;
 
         // Seconds of the heaviest rain or snow to soak the ground, fill the puddles, cover it. Until 2026-10-24 60, 300 and
         // 600: a storm took minutes to make puddles and a snowfall a quarter of an hour to whiten the land ("nobody wants
@@ -155,7 +162,6 @@ namespace Freefall.Graphics
         private const float FreezeSeconds = 240f, ThawSeconds = 1800f;
         private const float SunLux = 60000f;    // lux of sun on level ground that counts as 1 (a clear noon gives ~1.4)
         private static float _wetness, _puddles, _snow, _ice;     // the weather's own, kept while the override is on
-        private static int _iceStep = -1;
 
         /// <summary>The precipitation map (Texture2D RG16F: rate, hail; 0 = none yet) and the world xz of its corner.</summary>
         public static uint MapIndex => _mapValid ? _map!.BindlessIndex : 0u;
@@ -256,12 +262,6 @@ namespace Freefall.Graphics
                 var current = Wind.Current;
                 var laid = new Vector2(current.X, current.Z);
                 SnowLaidAlong = laid.LengthSquared() > 1e-6f ? Vector2.Normalize(laid) : new Vector2(1f, 0f);
-            }
-            int iceStep = (int)MathF.Round(Ice / IceStep);
-            if (iceStep != _iceStep)
-            {
-                _iceStep = iceStep;
-                IceStepChanged?.Invoke();
             }
 
             // The wind: a storm's outflow, and gusts on the steady wind that grow with the rain (gust factor ~1.2 in fair
