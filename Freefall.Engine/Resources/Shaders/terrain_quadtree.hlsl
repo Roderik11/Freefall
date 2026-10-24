@@ -260,12 +260,13 @@ bool ShouldSplit(uint depth, uint localIdx, float3 nodeCenter, float3 nodeExtent
     // Geometric error: height variation in world units
     float geometricError = minmax.y - minmax.x;
 
-    // Bounding sphere center uses actual height midpoint (world units)
-    float3 sphereCenter = nodeCenter;
-    sphereCenter.y = (minmax.x + minmax.y) * 0.5;
-
-    // Distance from camera to node center
-    float dist = max(distance(cameraPos, sphereCenter), 0.001);
+    // Distance from the camera to the node's nearest point (its footprint over its height range), not to its centre:
+    // standing at the edge of a large, nearly flat node put its centre half a node away, so it stayed coarse right
+    // under the camera and the ground popped there when the threshold went up (2026-10-24, the gravel road at
+    // Eldermoor's bindstone: 10 m triangles under the feet at 128 px)
+    float3 boxMin = float3(nodeCenter.x - nodeExtents.x, minmax.x, nodeCenter.z - nodeExtents.z);
+    float3 boxMax = float3(nodeCenter.x + nodeExtents.x, minmax.y, nodeCenter.z + nodeExtents.z);
+    float dist = max(distance(cameraPos, clamp(cameraPos, boxMin, boxMax)), 0.001);
 
     // Project geometric error to screen pixels:
     //   screenError = (geometricError × screenHeight) / (2 × dist × tan(fov/2))
