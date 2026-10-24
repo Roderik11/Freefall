@@ -121,6 +121,8 @@ namespace Freefall.Components
             public Vector2 TerrainSize;public float PixelErrorThreshold; public float ScreenHeight;
             public float TanHalfFov;   public uint  TransformSlot;       public uint  MaterialId; public uint MeshPartId;
             public uint  MaxPatches;   public uint  HeightTexIdx;         public uint  Pad0, Pad1;
+            public uint  ShadowReceiversIdx;    // shadow pass: this frame's sun shadow receivers (0 = no test)
+            public uint  Pad2, Pad3, Pad4;
         }
         
         // Height range mip pyramid (one-time, not per-frame)
@@ -135,11 +137,17 @@ namespace Freefall.Components
         private Mesh _patchMesh = null!;
         private int _meshPartId;
 
-        // Texture arrays
+        // The layer weights (texture array, baked); the layers' own textures by bindless index per channel
         private Texture? ControlMapsArray;
-        private Texture? DiffuseMapsArray;
-        private Texture? NormalMapsArray;
-        private Texture? HeightMapsArray;
+        private LayerTextureIds[] _layerTextures = new LayerTextureIds[32];
+        private bool _layerHeights;     // some layer has a height map (push slot 26)
+
+        // Must match gputerrain.fx LayerTextures (cbuffer tiling)
+        [StructLayout(LayoutKind.Sequential)]
+        private struct LayerTextureIds
+        {
+            public uint Diffuse, Normals, Height, Pad;
+        }
 
         private int _totalNodes;
 
@@ -763,19 +771,16 @@ namespace Freefall.Components
             material.SetParameter("LayerTiling", _layerTiling);
             material.SetParameter("LayerTint", _layerTint);
             material.SetParameter("LayerPlantTint", _layerPlantTint);
+            material.SetParameter("LayerTextures", _layerTextures);
             material.SetParameter("DecoRadius", Terrain.DecorationRadius);
             material.SetParameter("DecoGroundTint", Terrain.DrawDetail ? Terrain.DecorationGroundTint : 0f);
 
-            // Bind textures — texture arrays MUST be valid Texture2DArray resources.
-            // The PS samples them as Texture2DArray with array index 0..3.
-            // A Texture2D fallback would cause a GPU fault (TDR).
+            // Bind textures — the control map MUST be a valid Texture2DArray (the PS samples it with a slice index;
+            // a Texture2D would cause a GPU fault). The layers' own textures go by index (LayerTextures above).
             // Bind textures if available (terrain still renders without splatmaps)
 
             if (heightmap != null) material.SetTexture("HeightTex", heightmap);
             if (ControlMapsArray != null) material.SetTexture("ControlMaps", ControlMapsArray);
-            if (DiffuseMapsArray != null) material.SetTexture("DiffuseMaps", DiffuseMapsArray);
-            if (NormalMapsArray != null) material.SetTexture("NormalMaps", NormalMapsArray);
-            if (HeightMapsArray != null) material.SetTexture("HeightMaps", HeightMapsArray);
 
             // Capture values for lambda closure
             int fi = frameIndex;
@@ -1111,8 +1116,9 @@ namespace Freefall.Components
             // Raw R32 buffers
             _counterBuffers[i] = GraphicsBuffer.CreateRaw(1, uav: true, clearable: true);
             _splitFlagsBuffers[i] = GraphicsBuffer.CreateRaw(_totalNodes, uav: true, clearable: true);
-            _indirectArgsBuffers[i] = GraphicsBuffer.CreateRaw(4, srv: true, uav: true);
-            _shadowArgsBuffers[i] = GraphicsBuffer.CreateRaw(4, uav: true);
+            // D3D12_DRAW_INDEXED_ARGUMENTS (5 uints, CSBuildDrawArgs)
+            _indirectArgsBuffers[i] = GraphicsBuffer.CreateRaw(5, srv: true, uav: true);
+            _shadowArgsBuffers[i] = GraphicsBuffer.CreateRaw(5, uav: true);
 
             // Shadow structured buffers
             _shadowDescriptorBuffers[i] = GraphicsBuffer.CreateStructured(shadowCapacity, 20, srv: true, uav: true);
@@ -1272,8 +1278,10 @@ namespace Freefall.Components
             Material!.SetPass(pass);
             Material!.Apply(commandList, device);
 
-            // Set topology
+            // Set topology; the patch mesh's indices, drawn indexed (SV_VertexID is the grid vertex): the post-transform
+            // cache shades a vertex the neighbouring triangles share once, not once per corner
             commandList.IASetPrimitiveTopology(Vortice.Direct3D.PrimitiveTopology.TriangleList);
+            commandList.IASetIndexBuffer(_patchMesh.IndexBufferView);
 
             // Set descriptor heap (Material.Apply may have changed it)
             commandList.SetDescriptorHeaps(1, new[] { device.SrvHeap });
@@ -1284,10 +1292,6 @@ namespace Freefall.Components
             // Slot 2: InstanceDescriptor SRV
             commandList.SetGraphicsRoot32BitConstant(0, _descriptorBuffers[frameIndex].SrvIndex, 2);
 
-            // Slot 7: Index buffer SRV
-            commandList.SetGraphicsRoot32BitConstant(0, _patchMesh.IndexBufferIndex, 7);
-            // Slot 8: BaseIndex (always 0 for terrain patch mesh)
-            commandList.SetGraphicsRoot32BitConstant(0, 0u, 8);
             // Slot 9: Position buffer SRV
             commandList.SetGraphicsRoot32BitConstant(0, _patchMesh.PosBufferIndex, 9);
             // Slot 15: GlobalTransformBuffer SRV
@@ -1297,14 +1301,14 @@ namespace Freefall.Components
             // Slot 21: Deco control map SRV (ground tint, debug mode 5); slot 22: the tint per decorator
             commandList.SetGraphicsRoot32BitConstant(0, _decoControlSRV, 21);
             commandList.SetGraphicsRoot32BitConstant(0, _decoratorTintBuffer?.SrvIndex ?? 0u, 22);
-            // Slot 26: HeightMapsArray SRV (SSDM per-layer displacement)
-            commandList.SetGraphicsRoot32BitConstant(0, (uint)(HeightMapsArray?.BindlessIndex ?? 0), 26);
+            // Slot 26: some layer has a height map (blend and SSDM; LayerTextures holds them)
+            commandList.SetGraphicsRoot32BitConstant(0, _layerHeights ? 1u : 0u, 26);
             // Slot 27: hole mask (HoleStamp), 0 = none
             commandList.SetGraphicsRoot32BitConstant(0, holes, 27);
 
-            // ExecuteIndirect with DrawInstancedSignature — args written by CSBuildDrawArgs
+            // ExecuteIndirect with DrawIndexedInstancedSignature — args written by CSBuildDrawArgs
             commandList.ExecuteIndirect(
-                device.DrawInstancedSignature,
+                device.DrawIndexedInstancedSignature,
                 1,
                 _indirectArgsBuffers[frameIndex].Native,
                 0,
@@ -1335,8 +1339,11 @@ namespace Freefall.Components
             // Phase 1: CSEmitLeavesShadow — per-cascade frustum culling
             // ════════════════════════════════════════════════════════════════
 
-            // Upload local-space cascade planes to StructuredBuffer<CascadeData>
+            // Upload local-space cascade planes to StructuredBuffer<CascadeData>, and the cascades' VPs from terrain-local
+            // space (the receiver test, CSEmitLeavesShadow)
             var terrainPos = Transform.Position;
+            var cascadeVPs = DirectionalLight.CascadeViewProjections;
+            var localToWorld = Matrix4x4.CreateTranslation(terrainPos);
             GPUCuller.CascadeData* cascadePtr = (GPUCuller.CascadeData*)_shadowCascadeBufferPtrs[frameIndex];
             for (int c = 0; c < cascadeCount; c++)
             {
@@ -1350,6 +1357,8 @@ namespace Freefall.Components
                 }
                 cascadePtr[c] = default;
                 cascadePtr[c].SetPlanes(localPlanes);
+                if (cascadeVPs != null && c < cascadeVPs.Length)
+                    cascadePtr[c].VP = localToWorld * cascadeVPs[c];
             }
 
             // Transition shadow output buffers to UAV (no-op if already in UAV)
@@ -1392,6 +1401,9 @@ namespace Freefall.Components
                 MeshPartId = (uint)_meshPartId,
                 MaxPatches = (uint)shadowMaxPatches,
                 HeightTexIdx = Terrain.Heightmap?.BindlessIndex ?? 0u,
+                // A patch casts into a cascade only where a surface the camera sees through it lies behind
+                // (receiver_mask_culling.md); the receivers were built from this frame's depth before this action ran
+                ShadowReceiversIdx = cascadeVPs != null ? DirectionalLight.CurrentShadowReceiversUav : 0u,
             };
             UploadBuffer(_shadowTerrainParamBuffers[frameIndex], shadowTerrainParams);
 
@@ -1449,14 +1461,13 @@ namespace Freefall.Components
             Material.Apply(commandList, device);
 
             commandList.IASetPrimitiveTopology(Vortice.Direct3D.PrimitiveTopology.TriangleList);
+            commandList.IASetIndexBuffer(_patchMesh.IndexBufferView);                             // drawn indexed, as DrawTerrain
             commandList.SetDescriptorHeaps(1, new[] { device.SrvHeap });
             commandList.SetGraphicsRoot32BitConstant(0, holes, 27);                                // HoleTexIdx
 
             // Bind shadow patch data
             commandList.SetGraphicsRoot32BitConstant(0, _shadowTerrainDataBuffers[frameIndex].SrvIndex, 1);  // TerrainDataIdx
             commandList.SetGraphicsRoot32BitConstant(0, _shadowDescriptorBuffers[frameIndex].SrvIndex, 2);   // DescriptorBufIdx
-            commandList.SetGraphicsRoot32BitConstant(0, _patchMesh.IndexBufferIndex, 7);          // IndexBufferIdx
-            commandList.SetGraphicsRoot32BitConstant(0, 0u, 8);                                   // BaseIndex
             commandList.SetGraphicsRoot32BitConstant(0, _patchMesh.PosBufferIndex, 9);            // PosBufferIdx
             commandList.SetGraphicsRoot32BitConstant(0, TransformBuffer.Instance!.SrvIndex, 15);  // GlobalTransformBufferIdx
 
@@ -1470,7 +1481,7 @@ namespace Freefall.Components
 
             // ExecuteIndirect — instance count is compacted per-cascade count
             commandList.ExecuteIndirect(
-                device.DrawInstancedSignature,
+                device.DrawIndexedInstancedSignature,
                 1,
                 _shadowArgsBuffers[frameIndex].Native,
                 0,
@@ -1708,35 +1719,46 @@ namespace Freefall.Components
         }
 
         /// <summary>
-        /// Heavy: rebuild DiffuseMapsArray, NormalMapsArray, HeightMapsArray from the palette.
-        /// Only called when TextureArrays flag is consumed (the set of layers or a layer's textures changed).
+        /// Point each palette channel at its layer's own textures (bindless indices, gputerrain.fx LayerTextures).
+        /// Called when the TextureArrays flag is consumed (the set of layers or a layer's textures changed).
         /// Also refreshes tiling since channels may have moved.
+        /// Until 2026-10-24 the textures were copied into three Texture2DArrays. Layers whose textures differ in size or
+        /// format (Eldermoor: 1024 and 2048 px; BC7, BC5, BC4, BC1) sent every array down CreateTexture2DArray's compute
+        /// path: uncompressed RGBA8 at the largest size, ~270 MB each for 12 layers, never released, and 4 to 8 times the
+        /// bytes per texel the splat shader fetched. Sampled where they are, each texture keeps its own size and format.
         /// </summary>
         private void RebuildTextureArrays()
         {
-            // The arrays are indexed by channel, so a layer without a texture gets a stand-in slice: skipped, it shifted
-            // every layer after it onto its neighbour's textures (2026-10-17: a cobble layer that lost its diffuse
-            // rendered the next layer's grass scan, untinted). No diffuse = the layer's Tint alone, no normals = flat,
-            // no height = never sampled (LayerTiling.z is 0 for it, UpdateLayerParams).
-            var diffuseList = new List<Texture>();
-            var normalList = new List<Texture>();
-            var heightList = new List<Texture>();
+            // Indexed by channel, so a layer without a texture gets a stand-in: skipped, it shifted every layer after it
+            // onto its neighbour's textures (2026-10-17: a cobble layer that lost its diffuse rendered the next layer's
+            // grass scan, untinted). No diffuse = the layer's Tint alone, no normals = flat, no height = never sampled
+            // (LayerTiling.z is 0 for it, UpdateLayerParams).
             var missingDiffuse = new List<string>();
             var missingNormals = new List<string>();
-            int diffuseCount = 0, normalCount = 0, heightCount = 0;
+            int normalCount = 0;
+            Array.Clear(_layerTextures);
+            _layerHeights = false;
 
-            foreach (var layer in _layerPalette)
+            for (int i = 0; i < _layerPalette.Count && i < _layerTextures.Length; i++)
             {
-                if (layer.Diffuse?.Native != null) { diffuseList.Add(layer.Diffuse); diffuseCount++; }
-                else { diffuseList.Add(InternalAssets.White); missingDiffuse.Add(layer.Name); }
+                var layer = _layerPalette[i];
+                var diffuse = layer.Diffuse?.Native != null ? layer.Diffuse : InternalAssets.White;
+                if (diffuse != layer.Diffuse) missingDiffuse.Add(layer.Name);
 
-                if (layer.Normals?.Native != null) { normalList.Add(layer.Normals); normalCount++; }
-                else { normalList.Add(InternalAssets.FlatNormal); missingNormals.Add(layer.Name); }
+                var normals = layer.Normals?.Native != null ? layer.Normals : InternalAssets.FlatNormal;
+                if (normals != layer.Normals) missingNormals.Add(layer.Name);
+                else normalCount++;
 
-                if (layer.Height?.Native != null) { heightList.Add(layer.Height); heightCount++; }
-                else heightList.Add(InternalAssets.Black);
+                var height = layer.Height?.Native != null ? layer.Height : InternalAssets.Black;
+                _layerHeights |= height == layer.Height;
+
+                _layerTextures[i] = new LayerTextureIds
+                {
+                    Diffuse = (uint)diffuse.BindlessIndex,
+                    Normals = (uint)normals.BindlessIndex,
+                    Height = (uint)height.BindlessIndex,
+                };
             }
-            Debug.Log($"[Terrain] RebuildTextureArrays: {diffuseCount} diffuse, {normalCount} normals, {heightCount} heights from {_layerPalette.Count} layers");
 
             if (missingDiffuse.Count > 0)
                 Debug.LogWarning("TerrainRenderer", $"Terrain layer(s) without a Diffuse texture render as their Tint: {string.Join(", ", missingDiffuse)}");
@@ -1745,21 +1767,6 @@ namespace Freefall.Components
 
             // Also refresh tiling since channels may have moved
             UpdateLayerParams();
-
-            var device = Engine.Device;
-
-            // A stand-in slice differs from the scans in size and format, so CreateTexture2DArray takes its compute
-            // path (uncompressed RGBA8) while any layer lacks a texture; with none missing it copies as before.
-            // Diffuse (no layer has one: every layer is its Tint)
-            DiffuseMapsArray = diffuseCount > 0 ? Texture.CreateTexture2DArray(device, diffuseList) : InternalAssets.WhiteArray;
-
-            // Normals
-            NormalMapsArray = normalCount > 0
-                ? Texture.CreateTexture2DArray(device, normalList, stripSrgb: true)
-                : InternalAssets.FlatNormalArray;
-
-            // Heights (SSDM per-layer displacement heights; none = no displacement)
-            HeightMapsArray = heightCount > 0 ? Texture.CreateTexture2DArray(device, heightList, stripSrgb: true) : null;
 
             // The layer weights are baked separately (SplatPack); until the first bake nothing shows
             ControlMapsArray = _packedControlTexture ?? InternalAssets.BlackArray;
@@ -2374,71 +2381,6 @@ namespace Freefall.Components
             cmd.ResourceBarrier(new ResourceBarrier(
                 new ResourceTransitionBarrier(_decoControlTex,
                     ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource)));
-        }
-
-        /// <summary>
-        /// Bakes terrain splatmap layers into a single 256×256 albedo texture
-        /// for ground color blending in vegetation shaders.
-        /// </summary>
-        private void BakeTerrainAlbedo(ID3D12GraphicsCommandList cmd)
-        {
-            return;
-
-            if (!Terrain.ConsumeFlags(TerrainDirtyFlags.AlbedoBake)) return;
-            if (ControlMapsArray == null || DiffuseMapsArray == null) return;
-
-            var device = Engine.Device;
-
-            // Upload tiling data as structured buffer
-            _tilingBuffer ??= GraphicsBuffer.CreateUpload<Vector4>(32);
-            _tilingBuffer.Upload<Vector4>(_layerTiling.AsSpan());
-
-            // Create or recreate baked albedo texture
-            if (_bakedAlbedoTex == null)
-            {
-                _bakedAlbedoTex = device.CreateTexture2D(
-                    Format.R8G8B8A8_UNorm, BakedAlbedoSize, BakedAlbedoSize, 1, 1,
-                    ResourceFlags.AllowUnorderedAccess, ResourceStates.Common);
-
-                _bakedAlbedoUAV = device.AllocateBindlessIndex();
-                var uavDesc = new UnorderedAccessViewDescription
-                {
-                    Format = Format.R8G8B8A8_UNorm,
-                    ViewDimension = UnorderedAccessViewDimension.Texture2D,
-                    Texture2D = new Texture2DUnorderedAccessView { MipSlice = 0 }
-                };
-                device.NativeDevice.CreateUnorderedAccessView(_bakedAlbedoTex, null, uavDesc, device.GetCpuHandle(_bakedAlbedoUAV));
-
-                _bakedAlbedoSRV = device.AllocateBindlessIndex();
-                var srvDesc = new ShaderResourceViewDescription
-                {
-                    Format = Format.R8G8B8A8_UNorm,
-                    ViewDimension = ShaderResourceViewDimension.Texture2D,
-                    Shader4ComponentMapping = ShaderComponentMapping.Default,
-                    Texture2D = new Texture2DShaderResourceView
-                    {
-                        MostDetailedMip = 0,
-                        MipLevels = 1
-                    }
-                };
-                device.NativeDevice.CreateShaderResourceView(_bakedAlbedoTex, srvDesc, device.GetCpuHandle(_bakedAlbedoSRV));
-            }
-
-            // Dispatch via ComputeShader
-            _albedoBakeCS ??= new ComputeShader("terrain_albedo_bake.hlsl");
-            cmd.SetDescriptorHeaps(1, new[] { Engine.Device.SrvHeap });
-            cmd.SetComputeRootSignature(Engine.Device.GlobalRootSignature);
-            _albedoBakeCS.SetTexture("ControlMaps", ControlMapsArray);    // Texture → BindlessIndex
-            _albedoBakeCS.SetTexture("DiffuseMaps", DiffuseMapsArray);    // Texture → BindlessIndex
-            _albedoBakeCS.SetPushConstant("OutputUAV", _bakedAlbedoUAV); // uint (raw UAV index)
-            _albedoBakeCS.SetBuffer("TilingBuf", _tilingBuffer);         // GraphicsBuffer → auto SRV
-
-            uint groups = (uint)((BakedAlbedoSize + 7) / 8);
-            _albedoBakeCS.Dispatch(0, cmd, groups, groups);
-
-            cmd.ResourceBarrierUnorderedAccessView(_bakedAlbedoTex);
-
-            // AlbedoBake flag already consumed in the guard above
         }
 
         /// <summary>

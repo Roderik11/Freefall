@@ -78,7 +78,10 @@ cbuffer TerrainParams : register(b2)
     float2 TerrainSize;    float PixelErrorThreshold;  float ScreenHeight;
     float  TanHalfFov;     uint  TransformSlot;         uint  MaterialId;     uint  MeshPartId;
     uint   MaxPatches;     uint  HeightTexIdx;           uint2 _terrainPad;
+    uint   ShadowReceiversIdx;  uint3 _terrainPad2;     // shadow pass: this frame's sun shadow receivers, 0 = no test
 };
+
+#include "shadow_receivers.hlsli"
 
 // Sampler for height texture reads
 SamplerState sampHeightCS : register(s2);
@@ -610,30 +613,34 @@ void CSBuildMinMaxMip(uint3 dtid : SV_DispatchThreadID)
     
     if (buildMip == 0)
     {
-        // Mip 0: sample from the source heightmap
-        // Each output texel covers a region of the heightmap; sample a 4x4 grid
-        Texture2D<float4> heightTex = ResourceDescriptorHeap[HeightTexIdx];
+        // Mip 0: the range of every heightmap texel a vertex of this node can interpolate between. The patches sample
+        // the heightmap bilinearly at uv = pos / size, texel (i, j) sitting at ((i + 0.5) / N, (j + 0.5) / N), so the
+        // node's uv square touches texels floor(uvMin N - 0.5) .. ceil(uvMax N - 0.5). Until 2026-10-24 a 4x4 grid of
+        // samples over the ~32x32 texels: a crest between the samples stood outside the node's bounding sphere, which
+        // the frustum, Hi-Z and shadow receiver tests all trust (a sub-pixel shift along long hill shadows with
+        // receiver culling). Built once per height bake, so reading them all costs nothing per frame.
+        Texture2D<float> heightTex = ResourceDescriptorHeap[HeightTexIdx];
         float maxH = MaxHeight;
-        
+        uint hmW, hmH;
+        heightTex.GetDimensions(hmW, hmH);
+
         float2 uvMin = float2(dtid.xy) / float2(outW, outH);
         float2 uvMax = float2(dtid.xy + 1) / float2(outW, outH);
-        
+        int2 lo = clamp(int2(floor(uvMin * float2(hmW, hmH) - 0.5)), int2(0, 0), int2(hmW - 1, hmH - 1));
+        int2 hi = clamp(int2(ceil(uvMax * float2(hmW, hmH) - 0.5)), int2(0, 0), int2(hmW - 1, hmH - 1));
+
         float hMin = 1e30;
         float hMax = -1e30;
-        
-        const uint SAMPLES = 4;
-        for (uint sy = 0; sy < SAMPLES; sy++)
+        for (int ty = lo.y; ty <= hi.y; ty++)
         {
-            for (uint sx = 0; sx < SAMPLES; sx++)
+            for (int tx = lo.x; tx <= hi.x; tx++)
             {
-                float2 t = (float2(sx, sy) + 0.5) / (float)SAMPLES;
-                float2 uv = lerp(uvMin, uvMax, t);
-                float h = heightTex.SampleLevel(sampHeightCS, uv, 0).r * maxH;
+                float h = heightTex.Load(int3(tx, ty, 0)) * maxH;
                 hMin = min(hMin, h);
                 hMax = max(hMax, h);
             }
         }
-        
+
         output[dtid.xy] = float2(hMin, hMax);
     }
     else
@@ -670,12 +677,15 @@ void CSBuildDrawArgs(uint3 dtid : SV_DispatchThreadID)
     // Clamp to buffer capacity
     patchCount = min(patchCount, MaxPatches);
     
-    // Write DrawInstanced args: (VertexCountPerInstance, InstanceCount, StartVertex, StartInstance)
+    // Write DrawIndexedInstanced args: (IndexCountPerInstance, InstanceCount, StartIndex, BaseVertex, StartInstance).
+    // Indexed, the hardware reuses a grid vertex its neighbouring triangles share; pulled through the index buffer
+    // (DrawInstanced until 2026-10-24) every corner ran the vertex shader: 6144 invocations per patch for 1089 vertices.
     RWByteAddressBuffer argsBuffer = ResourceDescriptorHeap[IndirectArgsUAVIdx];
-    argsBuffer.Store(0, VertexCountIdx);     // VertexCountPerInstance (mesh index count from C#)
+    argsBuffer.Store(0, VertexCountIdx);     // IndexCountPerInstance (mesh index count from C#)
     argsBuffer.Store(4, patchCount);         // InstanceCount = number of visible patches
-    argsBuffer.Store(8, 0u);                 // StartVertexLocation = 0
-    argsBuffer.Store(12, 0u);                // StartInstanceLocation = 0
+    argsBuffer.Store(8, 0u);                 // StartIndexLocation = 0
+    argsBuffer.Store(12, 0u);                // BaseVertexLocation = 0
+    argsBuffer.Store(16, 0u);                // StartInstanceLocation = 0
 }
 // ─────────────────────────────────────────────────────────────────────
 // Shadow cascade data (StructuredBuffer via push constant, shared with cull_instances.hlsl)
@@ -689,6 +699,35 @@ struct CascadeData
 };
 
 // Shadow-specific: CascadeIdxUAVIdx = GET_INDEX(5), CascadeCountIdx = GET_INDEX(13), CascadeBufferSRVIdx = GET_INDEX(14)
+
+// Whether a patch can shade anything the camera sees through cascade 'cascadeIdx': seen from the sun, a receiver of
+// that cascade (shadow_receivers.hlsli) lies at or behind the patch's nearest point under its footprint, widened by the
+// shadow filter's reach. As cull_instances.hlsl ShadesReceivers, with the VP from terrain-local space (C# puts it in
+// this cascade buffer), so the patch's local sphere goes in as it is. Before 2026-10-24 terrain patches skipped this
+// test: every cascade drew every patch in its box, the fine patches round the camera in the far cascades too, where
+// nothing visible reads them.
+bool PatchShadesReceivers(RWStructuredBuffer<uint> receivers, row_major float4x4 vp, float3 center, float radius,
+                          uint cascadeIdx, float marginUV)
+{
+    float4 clip = mul(float4(center, 1.0), vp);         // orthographic: w = 1
+    float casterNear = clip.z - radius * length(float3(vp._13, vp._23, vp._33));
+
+    float2 uv = clip.xy * float2(0.5, -0.5) + 0.5;
+    float radiusUV = 0.5 * radius * length(float3(vp._11, vp._21, vp._31)) + marginUV;
+    float2 lo = saturate(uv - radiusUV) * RECEIVER_TILES;
+    float2 hi = saturate(uv + radiusUV) * RECEIVER_TILES;
+
+    float extent = max(hi.x - lo.x, hi.y - lo.y);
+    uint level = min((uint)ceil(log2(max(extent, 1.0))), RECEIVER_LEVELS - 1u);
+    uint size = RECEIVER_TILES >> level;
+    uint2 a = min((uint2)lo >> level, size - 1u);
+    uint2 b = min((uint2)hi >> level, size - 1u);
+
+    uint base = ReceiverLevelBase(cascadeIdx, level);
+    uint deepest = max(max(receivers[base + a.y * size + a.x], receivers[base + a.y * size + b.x]),
+                       max(receivers[base + b.y * size + a.x], receivers[base + b.y * size + b.x]));
+    return deepest != 0 && casterNear <= asfloat(deepest);
+}
 
 // Test a bounding sphere against one cascade's 6 frustum planes
 bool IsCascadeVisible(float3 center, float radius, uint cascadeIdx)
@@ -817,9 +856,17 @@ void CSEmitLeavesShadow(uint3 dtid : SV_DispatchThreadID)
 
     float4 patchRect = ComputeRectExact(depth, localIdx);
 
+    // The receiver test (EngineSettings.ShadowReceiverCulling On)
+    RWStructuredBuffer<uint> receivers = ResourceDescriptorHeap[ShadowReceiversIdx];
+    StructuredBuffer<CascadeData> cascadeData = ResourceDescriptorHeap[CascadeBufferSRVIdx];
+    bool testReceivers = ShadowReceiversIdx != 0 && receivers[RECEIVER_MODE] == RECEIVER_MODE_CULL;
+    float marginUV = testReceivers ? asfloat(receivers[RECEIVER_MARGIN]) : 0.0;
+
     for (uint c = 0; c < cascadeCount; c++)
     {
         if (!IsCascadeVisible(sphereCenter, sphereRadius, c))
+            continue;
+        if (testReceivers && !PatchShadesReceivers(receivers, cascadeData[c].VP, sphereCenter, sphereRadius, c, marginUV))
             continue;
 
         uint patchIdx;

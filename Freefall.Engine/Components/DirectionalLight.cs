@@ -127,6 +127,12 @@ namespace Freefall.Components
         }
 
         /// <summary>
+        /// This frame's view-projection per cascade (world space), as the cascade buffer holds them; valid during the
+        /// shadow pass. The terrain tests its patches against the shadow receivers with them.
+        /// </summary>
+        public static Matrix4x4[]? CascadeViewProjections => _instance?._shadowVPMatrices;
+
+        /// <summary>
         /// The cascades drawn this frame (EngineSettings.ShadowCascadeCount, at most MaxCascades): decided when the
         /// shadow pass starts; everything that reads the cascades later in the frame (terrain, grass, lighting, water,
         /// fog) takes this many.

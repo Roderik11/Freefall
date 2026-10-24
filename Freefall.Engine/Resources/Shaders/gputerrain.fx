@@ -7,8 +7,8 @@ cbuffer PushConstants : register(b3)
     uint _reserved4;
     uint _reserved5;
     uint _reserved6;
-    uint IndexBufferIdx;        // 7
-    uint BaseIndex;             // 8
+    uint _reserved7;            // 7: was the patch's index buffer, pulled by the VS (drawn indexed now)
+    uint _reserved8;            // 8
     uint PosBufferIdx;          // 9
     uint _reserved10;
     uint _reserved11;
@@ -19,14 +19,14 @@ cbuffer PushConstants : register(b3)
     uint DebugMode;             // 16
     uint HeightTexIdx;          // 17
     uint ControlMapsIdx;        // 18
-    uint DiffuseMapsIdx;        // 19
-    uint NormalMapsIdx;         // 20
+    uint _reserved19;           // 19: was the layers' diffuse array (LayerTextures now)
+    uint _reserved20;           // 20: was the layers' normal array
     uint DecoControlMapIdx;     // 21: Decoration control texture
     uint DecoTintIdx;           // 22: per decorator, the colour the ground under it takes (rgb, strength)
     uint CascadeBufferSRVIdx;   // 23: SRV: StructuredBuffer<CascadeData>
     uint ShadowCascadeCount;    // 24: uint: number of cascades
     uint CascadeIdxBufIdx;      // 25: SRV: per-entry cascade index (uint)
-    uint HeightMapsIdx;         // 26: Texture2DArray for per-layer height maps (SSDM)
+    uint LayerHeights;          // 26: 1 = some layer has a height map (LayerTextures.z; height blend and SSDM)
     uint HoleTexIdx;            // 27: R8 hole mask (HoleStamp, terrain_holes.hlsli), 0 = no holes
 };
 
@@ -61,6 +61,10 @@ cbuffer tiling : register(b2)
     float4 LayerTiling[32];
     float4 LayerTint[32];      // TerrainLayer.Tint (rgb); w = TerrainLayer.TileRotation in radians
     float4 LayerPlantTint[32]; // TerrainLayer.PlantTint (rgb): what the layer does to the sward on it
+    // Each layer's own textures, bindless: diffuse, normals, height (TerrainRenderer.RebuildTextureArrays). Until
+    // 2026-10-24 copies in three Texture2DArrays, uncompressed RGBA8 at the largest size whenever the layers' textures
+    // differed in size or format (Eldermoor's do): ~800 MB, and 4..8x the bytes per tap this shader fetches.
+    uint4 LayerTextures[32];
 }
 
 SamplerState sampData : register(s0); // WrappedAnisotropic
@@ -176,11 +180,10 @@ VertexOutput VS(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_Insta
 	// Compute world matrix from patch rect — the key difference from terrain.fx
 	row_major matrix world = ComputePatchWorld(patch, entityWorld);
 
-	// Vertex position from bindless index + position buffers
-	StructuredBuffer<uint> indices = ResourceDescriptorHeap[IndexBufferIdx];
-	uint vertexID = indices[primitiveVertexID + BaseIndex];
+	// Vertex position from the bindless position buffer: drawn indexed (TerrainRenderer.DrawTerrain), SV_VertexID is
+	// the grid vertex
     StructuredBuffer<float3> positions = ResourceDescriptorHeap[PosBufferIdx];
-    float3 pos = positions[vertexID];
+    float3 pos = positions[primitiveVertexID];
 
     // Edge-stitched vertex displacement (no morphing)
     float4 rect = patch.rect;
@@ -437,20 +440,20 @@ float3 HexWeights(HexTiles h, float3 content)
 }
 
 // A layer's height through the hexagons; 'weights' returns the blend for the layer's colour and normals
-float HexHeight(Texture2DArray heights, uint layer, HexTiles h, out float3 weights)
+float HexHeight(Texture2D heights, HexTiles h, out float3 weights)
 {
     bool single = any(h.Single > 0);
     float3 hs = 0;
     [unroll] for (int i = 0; i < 3; i++)
         if (!single || h.Single[i] > 0)
-            hs[i] = heights.SampleGrad(sampTrilinear, float3(h.UV[i], layer), h.Ddx[i], h.Ddy[i]).r;
+            hs[i] = heights.SampleGrad(sampTrilinear, h.UV[i], h.Ddx[i], h.Ddy[i]).r;
     weights = single ? h.Single : HexWeights(h, hs);
     return dot(weights, hs);
 }
 
 // A layer's colour and normal tilt through the hexagons: with the given weights (from its height), or with weights from
 // the colours' brightness when 'byColor'
-void HexColorNormal(Texture2DArray diffuse, Texture2DArray normals, uint layer, HexTiles h, float3 weights, bool byColor,
+void HexColorNormal(Texture2D diffuse, Texture2D normals, HexTiles h, float3 weights, bool byColor,
                     out float4 color, out float2 tilt)
 {
     bool single = any(h.Single > 0);
@@ -463,8 +466,8 @@ void HexColorNormal(Texture2DArray diffuse, Texture2DArray normals, uint layer, 
         t[i] = 0;
         if (need[i] > 0.001)
         {
-            c[i] = diffuse.SampleGrad(sampData, float3(h.UV[i], layer), h.Ddx[i], h.Ddy[i]);
-            float2 n = normals.SampleGrad(sampData, float3(h.UV[i], layer), h.Ddx[i], h.Ddy[i]).rg * 2.0 - 1.0;
+            c[i] = diffuse.SampleGrad(sampData, h.UV[i], h.Ddx[i], h.Ddy[i]);
+            float2 n = normals.SampleGrad(sampData, h.UV[i], h.Ddx[i], h.Ddy[i]).rg * 2.0 - 1.0;
             // Back from the hexagon's rotated space. The maps are OpenGL (green = up = -v), a reflection against the
             // UVs, which turns the back-rotation Rot into its transpose: mul(n, Rot)
             t[i] = mul(n, h.Rot[i]);
@@ -479,7 +482,7 @@ void HexColorNormal(Texture2DArray diffuse, Texture2DArray normals, uint layer, 
 // 'useHex': go through the hexagons ('hex' and 'hexWeights' for the near scale, set up by the caller: the top
 // projection with the layer's height, the side projections by brightness; the far scale sets up its own, turned
 // 'farRot' with hexagons turning up to 'maxAngle').
-void SampleTwoScale(Texture2DArray diffuse, Texture2DArray normals, float2 uvNear, float2 uvFar, uint layer,
+void SampleTwoScale(Texture2D diffuse, Texture2D normals, float2 uvNear, float2 uvFar,
                     float farBlend, out float4 color, out float2 tilt,
                     HexTiles hex, float3 hexWeights, bool hexByColor, float2 dx, float2 dy, bool useHex,
                     float2x2 farRot, float maxAngle)
@@ -491,11 +494,11 @@ void SampleTwoScale(Texture2DArray diffuse, Texture2DArray normals, float2 uvNea
         float4 c;
         float2 t;
         if (useHex)
-            HexColorNormal(diffuse, normals, layer, hex, hexWeights, hexByColor, c, t);
+            HexColorNormal(diffuse, normals, hex, hexWeights, hexByColor, c, t);
         else
         {
-            c = diffuse.Sample(sampData, float3(uvNear, layer));
-            t = normals.Sample(sampData, float3(uvNear, layer)).rg * 2.0 - 1.0;
+            c = diffuse.Sample(sampData, uvNear);
+            t = normals.Sample(sampData, uvNear).rg * 2.0 - 1.0;
         }
         color += c * (1 - farBlend);
         tilt += t * (1 - farBlend);
@@ -507,13 +510,13 @@ void SampleTwoScale(Texture2DArray diffuse, Texture2DArray normals, float2 uvNea
         if (useHex)
         {
             HexTiles hexFar = HexSetup(uvFar, mul(dx / FAR_TILING, farRot), mul(dy / FAR_TILING, farRot), HEX_DOMINANT_FAR, maxAngle);
-            HexColorNormal(diffuse, normals, layer, hexFar, 0, true, c, t);
+            HexColorNormal(diffuse, normals, hexFar, 0, true, c, t);
             t = mul(t, farRot);             // back from the far sample's turn (same reflection as in HexColorNormal)
         }
         else
         {
-            c = diffuse.Sample(sampData, float3(uvFar, layer));
-            t = normals.Sample(sampData, float3(uvFar, layer)).rg * 2.0 - 1.0;
+            c = diffuse.Sample(sampData, uvFar);
+            t = normals.Sample(sampData, uvFar).rg * 2.0 - 1.0;
         }
         color += c * farBlend;
         tilt += t * 0.5 * farBlend;         // the far sample's relief is FAR_TILING x too big: flatten it halfway
@@ -540,8 +543,6 @@ FragmentOutput PS(VertexOutput input)
     float2 uvDdx = ddx(uv), uvDdy = ddy(uv);   // for SampleGrad inside the branching layer loops (tile variation)
 
     Texture2DArray ControlMaps = ResourceDescriptorHeap[ControlMapsIdx];
-    Texture2DArray DiffuseMaps = ResourceDescriptorHeap[DiffuseMapsIdx];
-    Texture2DArray NormalMaps = ResourceDescriptorHeap[NormalMapsIdx];
 
     // ControlMaps: ceil(layerCount/4) RGBA slices, each channel = one layer weight
     uint cmW, cmH, sliceCount;
@@ -594,14 +595,14 @@ FragmentOutput PS(VertexOutput input)
 
             uint layer = i * 4 + j;
             float heightVal = 0;
-            if (HeightMapsIdx != 0 && LayerTiling[layer].z > 0.5)
+            if (LayerHeights != 0 && LayerTiling[layer].z > 0.5)
             {
-                Texture2DArray HeightMaps = ResourceDescriptorHeap[HeightMapsIdx];
+                Texture2D heights = ResourceDescriptorHeap[LayerTextures[layer].z];
                 float2 texuv = uv * LayerTiling[layer].xy;
                 float3 unusedWeights;
                 heightVal = nearShows
-                    ? HexHeight(HeightMaps, layer, HexSetup(texuv, uvDdx * LayerTiling[layer].xy, uvDdy * LayerTiling[layer].xy, HEX_DOMINANT, LayerTint[layer].w), unusedWeights)
-                    : HeightMaps.SampleGrad(sampTrilinear, float3(texuv, layer), uvDdx * LayerTiling[layer].xy, uvDdy * LayerTiling[layer].xy).r;
+                    ? HexHeight(heights, HexSetup(texuv, uvDdx * LayerTiling[layer].xy, uvDdy * LayerTiling[layer].xy, HEX_DOMINANT, LayerTint[layer].w), unusedWeights)
+                    : heights.SampleGrad(sampTrilinear, texuv, uvDdx * LayerTiling[layer].xy, uvDdy * LayerTiling[layer].xy).r;
             }
             maxCombined = max(maxCombined, ew + ew * heightVal);
         }
@@ -657,16 +658,16 @@ FragmentOutput PS(VertexOutput input)
                 float heightVal = 0;
                 float3 hexWeights = 0;
                 bool hexByColor = true;     // without a height map the hexagons blend by brightness
-                if (HeightMapsIdx != 0 && LayerTiling[layer].z > 0.5)
+                if (LayerHeights != 0 && LayerTiling[layer].z > 0.5)
                 {
-                    Texture2DArray HeightMaps = ResourceDescriptorHeap[HeightMapsIdx];
+                    Texture2D heights = ResourceDescriptorHeap[LayerTextures[layer].z];
                     if (nearShows)
                     {
-                        heightVal = HexHeight(HeightMaps, layer, hex, hexWeights);
+                        heightVal = HexHeight(heights, hex, hexWeights);
                         hexByColor = false;
                     }
                     else
-                        heightVal = HeightMaps.SampleGrad(sampTrilinear, float3(texuv, layer), texDdx, texDdy).r;
+                        heightVal = heights.SampleGrad(sampTrilinear, texuv, texDdx, texDdy).r;
                 }
 
                 float bd = max(ew + ew * heightVal - dispThreshold, 0);    // a layer without a height map is flat
@@ -677,9 +678,11 @@ FragmentOutput PS(VertexOutput input)
                 if (bf <= 0) continue;
 
                 // World-space tilt of the normal (UDN) per projection: the top's tangent is +X, bitangent +Z
+                Texture2D diffuse = ResourceDescriptorHeap[LayerTextures[layer].x];
+                Texture2D normals = ResourceDescriptorHeap[LayerTextures[layer].y];
                 float4 c;
                 float2 nTop;
-                SampleTwoScale(DiffuseMaps, NormalMaps, texuv, mul(texuv / FAR_TILING, farRot), layer, farBlend, c, nTop,
+                SampleTwoScale(diffuse, normals, texuv, mul(texuv / FAR_TILING, farRot), farBlend, c, nTop,
                                hex, hexWeights, hexByColor, texDdx, texDdy, true, farRot, maxAngle);
                 float3 tilt = float3(nTop.x, 0, nTop.y) * planeWeights.y;
                 if (sideProjection)
@@ -694,7 +697,7 @@ FragmentOutput PS(VertexOutput input)
                     {
                         float2 st = sideX * sideScale, sdx = sideXDdx * sideScale, sdy = sideXDdy * sideScale;
                         HexTiles hexX = HexSetup(st, sdx, sdy, HEX_DOMINANT, maxAngle);
-                        SampleTwoScale(DiffuseMaps, NormalMaps, st, mul(st / FAR_TILING, farRot), layer, farBlend, cX, nX,
+                        SampleTwoScale(diffuse, normals, st, mul(st / FAR_TILING, farRot), farBlend, cX, nX,
                                        hexX, 0, true, sdx, sdy, true, farRot, maxAngle);
                     }
                     else { cX = 0; nX = 0; }
@@ -702,7 +705,7 @@ FragmentOutput PS(VertexOutput input)
                     {
                         float2 st = sideZ * sideScale, sdx = sideZDdx * sideScale, sdy = sideZDdy * sideScale;
                         HexTiles hexZ = HexSetup(st, sdx, sdy, HEX_DOMINANT, maxAngle);
-                        SampleTwoScale(DiffuseMaps, NormalMaps, st, mul(st / FAR_TILING, farRot), layer, farBlend, cZ, nZ,
+                        SampleTwoScale(diffuse, normals, st, mul(st / FAR_TILING, farRot), farBlend, cZ, nZ,
                                        hexZ, 0, true, sdx, sdy, true, farRot, maxAngle);
                     }
                     else { cZ = 0; nZ = 0; }
@@ -713,7 +716,7 @@ FragmentOutput PS(VertexOutput input)
 
                 c.rgb *= LayerTint[layer].rgb;
                 blendedColor += c * bf;
-                blendedMean += DiffuseMaps.SampleLevel(sampData, float3(0.5, 0.5, layer), 16).rgb * LayerTint[layer].rgb * bf;
+                blendedMean += diffuse.SampleLevel(sampData, float2(0.5, 0.5), 16).rgb * LayerTint[layer].rgb * bf;
                 blendedTilt += tilt * bf;
                 totalBlend += bf;
             }
@@ -836,8 +839,8 @@ FragmentOutput PS(VertexOutput input)
     // Debug mode 6: Height map visualization (SSDM)
     if (DebugMode == 6)
     {
-        if (HeightMapsIdx == 0)
-            output.Albedo = float4(1, 0, 0, 0); // Red = no height array bound
+        if (LayerHeights == 0)
+            output.Albedo = float4(1, 0, 0, 0); // Red = no layer has a height map
         else
             output.Albedo = float4(blendedHeight, blendedHeight, blendedHeight, 0);
     }
@@ -908,10 +911,8 @@ ShadowVSOutput VS_Shadow(uint primitiveVertexID : SV_VertexID, uint instanceID :
 
     row_major matrix world = ComputePatchWorld(patch, entityWorld);
 
-    StructuredBuffer<uint> indices = ResourceDescriptorHeap[IndexBufferIdx];
-    uint vertexID = indices[primitiveVertexID + BaseIndex];
     StructuredBuffer<float3> positions = ResourceDescriptorHeap[PosBufferIdx];
-    float3 pos = positions[vertexID];
+    float3 pos = positions[primitiveVertexID];      // drawn indexed, as VS()
 
     // Edge-stitched vertex displacement (must match VS() for consistent shadow depth)
     float4 rect = patch.rect;
