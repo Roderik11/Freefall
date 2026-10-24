@@ -168,6 +168,18 @@ namespace Freefall.Assets
             }
         }
 
+        /// <summary>
+        /// How heights and holes become the PhysX height field's samples. A cook saved with another format is not used
+        /// (<see cref="SavedCookFormat"/>): it is cooked again, and the next save writes it the new way. 2 (2026-10-24):
+        /// a cell's hole flag from the mask at the cell's middle, the samples being at the height map's texel centres
+        /// (PhysicsHelper.IsHoleCell, TerrainCollider).
+        /// </summary>
+        internal const int CookFormat = 2;
+
+        /// <summary>The <see cref="CookFormat"/> of the cook saved with this terrain (its CollisionMeshData); 0 = from before formats.</summary>
+        [Browsable(false)]
+        public int SavedCookFormat;
+
         // FNV-1a over the bits of the CPU height field and the hole mask (~10 ms for 4097²)
         private ulong MapsHash()
         {
@@ -360,8 +372,8 @@ namespace Freefall.Assets
             if (_cooking != null && _cookingMapsHash == maps)
                 return _cooking;
 
-            // The cook written by the last save, from these very maps
-            if (maps == _savedMapsHash && Loaders.TerrainLoader.LoadSavedCook(this) is { } saved)
+            // The cook written by the last save, from these very maps, the way they are cooked now
+            if (maps == _savedMapsHash && SavedCookFormat == CookFormat && Loaders.TerrainLoader.LoadSavedCook(this) is { } saved)
             {
                 SetCookedHeightField(saved, maps);
                 return Task.FromResult<PhysX.HeightField?>(saved);
@@ -477,15 +489,11 @@ namespace Freefall.Assets
         public bool IsHole(float localX, float localZ) => HoleWeight(localX, localZ) >= 0.5f;
 
         /// <summary>
-        /// True if the height-field cell between samples (x, z) and (x + 1, z + 1) is open: its centre lies in a
-        /// hole. What the PhysX height field and the navmesh leave out.
+        /// True if the PhysX height field's cell between samples (x, z) and (x + 1, z + 1) is open: its middle lies in
+        /// a hole (PhysicsHelper.IsHoleCell, which the cook uses).
         /// </summary>
-        public bool IsHoleCell(int x, int z)
-        {
-            var holes = Holes;
-            if (holes == null || x < 0 || z < 0 || x >= HoleResolution - 1 || z >= HoleResolution - 1) return false;
-            int i = z * HoleResolution + x;
-            return holes[i] + holes[i + 1] + holes[i + HoleResolution] + holes[i + HoleResolution + 1] >= 2 * 255;
-        }
+        public bool IsHoleCell(int x, int z) =>
+            Holes is { } holes && HeightField is { } heights
+            && PhysicsHelper.IsHoleCell(holes, HoleResolution, heights.GetLength(0), heights.GetLength(1), x, z);
     }
 }

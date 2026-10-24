@@ -1924,6 +1924,18 @@ namespace Freefall.Components
 
         // ───── IHeightProvider ────────────────────────────────────────────
 
+        /// <summary>
+        /// The terrain's height at a point, as it is drawn: the height map sampled bilinearly, the way the terrain's
+        /// vertex shader samples it. Texel (i, j) holds the height of the point ((i + 0.5) · size / N, (j + 0.5) · size / N)
+        /// from the terrain's corner: the height bake works at texel centres, and stamps are placed at
+        /// uv = (world − origin) / size. Outside the terrain, its own height.
+        ///
+        /// Until 2026-10-24 this took sample i at i · size / N, half a texel off, and the plane through three corners
+        /// of the cell, which extrapolates in its other half: on bumpy ground tens of centimetres from what is drawn
+        /// (animals stood in the ground). The physics height field (TerrainCollider) and the navmesh bake
+        /// (TerrainSource.SampleHeight) put their samples at the same places; the hole mask keeps a grid of its own
+        /// and is read by place (terrain_system/overview.md).
+        /// </summary>
         public float GetHeight(Vector3 position)
         {
             var heightField = Terrain?.HeightField;
@@ -1931,37 +1943,22 @@ namespace Freefall.Components
             if (Transform == null) return 0;
 
             var terrainSize = Terrain!.TerrainSize;
-            var maxHeight = Terrain.MaxHeight;
-
             position -= Transform.Position;
+            if (position.X < 0f || position.X >= terrainSize.X || position.Z < 0f || position.Z >= terrainSize.Y)
+                return Transform.Position.Y;
 
-            var dimx = heightField.GetLength(0) - 1;
-            var dimy = heightField.GetLength(1) - 1;
+            int nx = heightField.GetLength(0), nz = heightField.GetLength(1);
 
-            var fx = (dimx + 1) / terrainSize.X;
-            var fy = (dimy + 1) / terrainSize.Y;
+            // In texels, with the texel centres on whole numbers; clamped at the edges like the GPU's sampler
+            float tx = Math.Clamp(position.X / terrainSize.X * nx - 0.5f, 0f, nx - 1);
+            float tz = Math.Clamp(position.Z / terrainSize.Y * nz - 0.5f, 0f, nz - 1);
+            int x0 = (int)tx, z0 = (int)tz;
+            int x1 = Math.Min(x0 + 1, nx - 1), z1 = Math.Min(z0 + 1, nz - 1);
+            float fx = tx - x0, fz = tz - z0;
 
-            position.X *= fx;
-            position.Z *= fy;
-
-            int x = (int)Math.Floor(position.X);
-            int z = (int)Math.Floor(position.Z);
-
-            if (x < 0 || x > dimx) return Transform.Position.Y;
-            if (z < 0 || z > dimy) return Transform.Position.Y;
-
-            float xf = position.X - x;
-            float zf = position.Z - z;
-
-            float h1 = heightField[x, z];
-            float h2 = heightField[Math.Min(dimx, x + 1), z];
-            float h3 = heightField[x, Math.Min(dimy, z + 1)];
-
-            float height = h1;
-            height += (h2 - h1) * xf;
-            height += (h3 - h1) * zf;
-
-            return Transform.Position.Y + height * maxHeight;
+            float near = heightField[x0, z0] + (heightField[x1, z0] - heightField[x0, z0]) * fx;
+            float far = heightField[x0, z1] + (heightField[x1, z1] - heightField[x0, z1]) * fx;
+            return Transform.Position.Y + (near + (far - near) * fz) * Terrain.MaxHeight;
         }
 
         /// <summary>

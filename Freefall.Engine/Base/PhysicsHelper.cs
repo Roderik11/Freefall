@@ -26,8 +26,7 @@ namespace Freefall.Base
 
             var samples = new HeightFieldSample[rows * cols];
 
-            // Holes (HoleStamp) only when the mask was baked for this height field's resolution
-            bool cutHoles = holes != null && holeResolution == rows && rows == cols;
+            bool cutHoles = holes != null && holeResolution > 1;
 
             System.Threading.Tasks.Parallel.For(0, rows, i =>
             {
@@ -38,7 +37,7 @@ namespace Freefall.Base
 
                     // A sample's two materials are those of the cell it is the low corner of (row i = x, column j = z);
                     // material 127 (PxHeightFieldMaterial::eHOLE) leaves the triangle out
-                    byte material = cutHoles && IsHoleCell(holes, holeResolution, i, j) ? HoleMaterial : (byte)0;
+                    byte material = cutHoles && IsHoleCell(holes, holeResolution, rows, cols, i, j) ? HoleMaterial : (byte)0;
 
                     samples[index] = new HeightFieldSample
                     {
@@ -52,12 +51,18 @@ namespace Freefall.Base
             return samples;
         }
 
-        // Terrain.IsHoleCell on a mask
-        private static bool IsHoleCell(byte[] holes, int resolution, int x, int z)
+        /// <summary>
+        /// Whether the height-field cell with sample (x, z) as its low corner is open: the hole mask at the cell's
+        /// middle, read as the terrain shader reads it (Terrain.HoleWeight). The height field's samples sit at the height
+        /// map's texel centres, sample i at (i + 0.5) · size / N (TerrainCollider), so the cell's middle is
+        /// (i + 1) · size / N; the mask has a grid of its own (sample k at k · size / (w − 1)), so it is looked up by
+        /// place, not by index. As a share of the terrain the size drops out.
+        /// </summary>
+        public static bool IsHoleCell(byte[] holes, int holeResolution, int rows, int cols, int x, int z)
         {
-            if (x < 0 || z < 0 || x >= resolution - 1 || z >= resolution - 1) return false;
-            int i = z * resolution + x;
-            return holes[i] + holes[i + 1] + holes[i + resolution] + holes[i + resolution + 1] >= 2 * 255;
+            if (x < 0 || z < 0 || x >= rows - 1 || z >= cols - 1) return false;
+            return Freefall.Assets.Terrain.HoleWeight(holes, holeResolution, System.Numerics.Vector2.One,
+                                                      (x + 1f) / rows, (z + 1f) / cols) >= 0.5f;
         }
 
         /// <summary>PxHeightFieldMaterial::eHOLE: a height-field triangle with this material does not collide.</summary>

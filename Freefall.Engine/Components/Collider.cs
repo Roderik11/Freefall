@@ -131,6 +131,9 @@ namespace Freefall.Components
 
         public abstract PhysX.Geometry? CreateGeometry();
 
+        /// <summary>Where the geometry's origin sits in the collider's frame, before <see cref="Offset"/>: the terrain's height field starts half a texel in.</summary>
+        protected virtual Vector3 GeometryOffset => Vector3.Zero;
+
         void CreateFullActor()
         {
             // Remove old actor (its shape goes with it)
@@ -188,7 +191,7 @@ namespace Freefall.Components
 
             // Offset is in the collider's own frame; on a child of the actor's entity that frame
             // is carried into the actor's.
-            var localPose = Matrix4x4.CreateTranslation(Offset);
+            var localPose = Matrix4x4.CreateTranslation(Offset + GeometryOffset);
 
             // A PhysX capsule runs along its X axis; ours stands along the entity's Y.
             if (geometry is CapsuleGeometry)
@@ -468,12 +471,29 @@ namespace Freefall.Components
             return null;
         }
 
+        /// <summary>
+        /// The samples where the height map's texels are drawn: sample i at (i + 0.5) · size / N from the terrain's corner
+        /// (the height bake works at texel centres; TerrainRenderer.GetHeight). Until 2026-10-24 sample i sat at
+        /// i · size / (N − 1), up to half a texel off what is drawn towards the edges, so on steep ground near them a
+        /// character stood up to a metre off the drawn ground.
+        /// </summary>
         private static HeightFieldGeometry Geometry(Terrain terrain, HeightField field)
         {
             // The field was made from these heights (the cache is per version of them)
-            float fx = terrain.TerrainSize.X / (terrain.HeightField.GetLength(0) - 1);
-            float fy = terrain.TerrainSize.Y / (terrain.HeightField.GetLength(1) - 1);
+            float fx = terrain.TerrainSize.X / terrain.HeightField.GetLength(0);
+            float fy = terrain.TerrainSize.Y / terrain.HeightField.GetLength(1);
             return new HeightFieldGeometry(field, 0, terrain.MaxHeight / short.MaxValue, fx, fy);
+        }
+
+        protected override Vector3 GeometryOffset
+        {
+            get
+            {
+                var terrain = Entity?.GetComponent<TerrainRenderer>()?.Terrain;
+                var heights = terrain?.HeightField;
+                if (heights == null) return Vector3.Zero;
+                return new Vector3(0.5f * terrain!.TerrainSize.X / heights.GetLength(0), 0f, 0.5f * terrain.TerrainSize.Y / heights.GetLength(1));
+            }
         }
     }
 }

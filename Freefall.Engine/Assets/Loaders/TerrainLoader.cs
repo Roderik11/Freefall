@@ -270,12 +270,17 @@ namespace Freefall.Assets.Loaders
         {
             var baker = ComponentCache<TerrainRenderer>.All
                 .FirstOrDefault(r => r.Terrain == terrain)?.Baker;
-            if (baker == null) return;
+            var bytes = baker?.ReadbackBakedHeightmapBytes();
+            if (bytes == null || bytes.Length == 0)
+            {
+                // Not baked since the load: the maps are the saved ones. Their cook is saved again only when it was
+                // made another way (Terrain.CookFormat), from the CPU heights and holes loaded from those same maps.
+                if (terrain.SavedCookFormat != Terrain.CookFormat && terrain.HeightField != null)
+                    SaveCook(terrain);
+                return;
+            }
 
-            var bytes = baker.ReadbackBakedHeightmapBytes();
-            if (bytes == null || bytes.Length == 0) return;
-
-            int resolution = baker.BakedResolution;
+            int resolution = baker!.BakedResolution;
 
             // Ensure the BakedHeightmapRef has a GUID
             if (terrain.BakedHeightmapRef == null)
@@ -303,7 +308,15 @@ namespace Freefall.Assets.Loaders
                 terrain.BakedHolesRef = null;
             }
 
-            // Cook PhysX HeightField from the CPU HeightField (always in sync after readback)
+            SaveCook(terrain);
+        }
+
+        /// <summary>
+        /// Cooks the PhysX height field from the CPU heights and holes (in sync after a readback, or loaded from the
+        /// saved maps) and saves it as the CollisionMeshData subasset, with the format it was cooked in.
+        /// </summary>
+        private void SaveCook(Terrain terrain)
+        {
             try
             {
                 var heightMap = terrain.HeightField;
@@ -344,8 +357,9 @@ namespace Freefall.Assets.Loaders
                 var hf = PhysicsWorld.Physics.CreateHeightField(cookedStream);
                 terrain.SetCookedHeightField(hf);
 
-                // Save as CollisionMeshData subasset
+                // Save as CollisionMeshData subasset, with the format it was cooked in (written with the YAML after this)
                 SaveCollisionSubasset(terrain, cookedBytes);
+                terrain.SavedCookFormat = Terrain.CookFormat;
 
                 Debug.Log($"[TerrainLoader] PhysX HeightField cooked + saved: {rows}x{cols}, {cookedBytes.Length} bytes");
             }
