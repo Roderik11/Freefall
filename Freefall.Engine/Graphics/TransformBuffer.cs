@@ -41,6 +41,12 @@ namespace Freefall.Graphics
         public int ActiveSlots => _activeSlots;
 
         /// <summary>
+        /// The transforms the next <see cref="Upload"/> writes (the profiler's count on "Transform upload"). Upload's
+        /// cost follows it: a moved entity rewrites the slots of everything under it.
+        /// </summary>
+        public int PendingUploads => _transforms.DirtyCount;
+
+        /// <summary>
         /// Bindless SRV index for the current frame's transform buffer.
         /// </summary>
         public uint SrvIndex => _transforms.SrvIndex;

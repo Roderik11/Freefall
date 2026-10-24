@@ -58,6 +58,11 @@ namespace Freefall.Graphics
         /// </summary>
         public int Capacity => _capacity;
 
+        /// <summary>
+        /// The slots the next <see cref="Upload"/> writes: those set since the current frame's buffer was last written.
+        /// </summary>
+        public int DirtyCount => _dirtySlots[Engine.FrameIndex % FrameCount].Count;
+
         public StreamingBuffer(GraphicsDevice device, int initialCapacity = 1024)
         {
             _device = device;

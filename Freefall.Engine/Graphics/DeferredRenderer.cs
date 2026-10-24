@@ -617,7 +617,7 @@ namespace Freefall.Graphics
 
              // Upload transforms AFTER Draw() so per-frame SetTransform() calls
              // (e.g. terrain patch pool-slot reassignment) are captured before GPU reads
-             using (_transformUploadMarker.Auto())
+             using (_transformUploadMarker.Auto(TransformBuffer.Instance?.PendingUploads ?? 0))
                  TransformBuffer.Instance?.Upload();
 
              // === GBuffer Draw ===
