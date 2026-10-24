@@ -893,7 +893,10 @@ void CSEmitLeavesShadow(uint3 dtid : SV_DispatchThreadID)
         // Write TerrainPatchData
         TerrainPatchData patch;
         patch.Rect = patchRect;
-        patch.Level = float2((float)depth, asfloat(stitchMask));
+        // The mask as a value, as CSEmitLeaves writes it: VS_Shadow converts it back with (uint). Stored as
+        // asfloat(stitchMask) until 2026-10-24, a denormal that converts to 0: no shadow patch was ever stitched, so
+        // the shadow maps' terrain had T-junction cracks at every LOD seam
+        patch.Level = float2((float)depth, (float)stitchMask);
         patch.Padding = float2(0, 0);
         outTerrainData[patchIdx] = patch;
 
