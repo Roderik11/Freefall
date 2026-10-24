@@ -148,6 +148,8 @@ cbuffer PushConstants : register(b3)
 #define ShadowCascadeIdx      CascadeBufferSRVIdx
 // The cascade chain never sorts: slot 22 holds its cascade count (clamped: a stale value must not run away)
 #define ShadowCascadeCount    min(SortCountIdx, SHADOW_MAX_CASCADES)
+// ... and slot 32 holds 1 + this batch's row of caster stats in the receivers buffer (0 = not counted; the sun's only)
+#define CasterStatsRow        SortKeysUAVIdx
 // The camera chain (InstanceBatch.Cull) never reads the shadow slots 24/28/29/39, so CSVisibility takes them over
 #define CacheRefreshFrom      CombinedShadowVisUAVIdx
 #define VisibilityCacheIdx    CascadeMaskUAVIdx
@@ -1555,6 +1557,50 @@ uint CascadePart(StructuredBuffer<MeshPartLod> lodRegistry, uint part, uint mask
     return part;
 }
 
+// Adds this wave's instances to its batch's row of caster stats (EngineSettings.ShadowCasterStats): how many cascades
+// each is drawn into, and the triangles per cascade. 'mask' is the cascades it is drawn into (after the receiver test),
+// 'inBox' whether any cascade's box held it.
+void CountCasterStats(RWStructuredBuffer<uint> receivers, uint row, bool inBox, uint mask, uint part, uint lodWord,
+                      StructuredBuffer<MeshPartEntry> meshRegistry, StructuredBuffer<MeshPartLod> lodRegistry, uint cascadeCount)
+{
+    uint base = RECEIVER_CASTER_BASE + min(row, RECEIVER_CASTER_ROWS - 1u) * RECEIVER_CASTER_WORDS;
+
+    uint total = 0;
+    uint once = 0;
+    for (uint c = 0; c < cascadeCount; c++)
+    {
+        bool entry = (mask & (1u << c)) != 0;
+        uint tris = entry ? meshRegistry[CascadePart(lodRegistry, part, lodWord, c)].VertexCount / 3u : 0u;
+        if (entry && total == 0)
+            once = tris;
+        total += tris;
+        uint entries = WaveActiveCountBits(entry);
+        uint waveTris = WaveActiveSum(tris);
+        if (WaveIsFirstLane() && entries > 0)
+        {
+            InterlockedAdd(receivers[base + CASTER_ENTRIES + c], entries);
+            InterlockedAdd(receivers[base + CASTER_TRIS + c], waveTris);
+        }
+    }
+
+    uint drawnIn = countbits(mask & CASCADE_MASK_BITS);
+    for (uint n = 0; n <= cascadeCount; n++)
+    {
+        bool here = inBox && drawnIn == n;
+        uint count = WaveActiveCountBits(here);
+        uint waveTris = WaveActiveSum(here ? total : 0u);
+        if (WaveIsFirstLane() && count > 0)
+        {
+            InterlockedAdd(receivers[base + CASTER_BY_COUNT + n], count);
+            InterlockedAdd(receivers[base + CASTER_TRIS_BY_COUNT + n], waveTris);
+        }
+    }
+
+    uint waveOnce = WaveActiveSum(once);
+    if (WaveIsFirstLane() && waveOnce > 0)
+        InterlockedAdd(receivers[base + CASTER_TRIS_ONCE], waveOnce);
+}
+
 //-----------------------------------------------------------------------------
 // CSVisibilityCascades: every cascade's visibility of an instance in one dispatch (ShadowCascadeCount of them,
 // slot 22: the sun's cascades in use this frame, or the sky captures' one view).
@@ -1648,6 +1694,10 @@ void CSVisibilityCascades(uint3 dispatchThreadId : SV_DispatchThreadID)
 
         if (receivers[RECEIVER_MODE] == RECEIVER_MODE_CULL)
             mask = shades;
+
+        if (CasterStatsRow != 0)
+            CountCasterStats(receivers, CasterStatsRow - 1u, inAny, mask, meshPartId, lodWord, meshRegistry, lodRegistry,
+                             min(cascadeCount, RECEIVER_MAX_CASCADES));
     }
 
     // Combined visibility: 0 = in no cascade, otherwise the camera's MeshPartId + 1

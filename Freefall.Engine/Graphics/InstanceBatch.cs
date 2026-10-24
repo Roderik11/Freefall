@@ -1308,9 +1308,10 @@ namespace Freefall.Graphics
         /// <param name="cascadeCount">The views in the cascade buffer to cull against (at most DirectionalLight.MaxCascades).</param>
         /// <param name="minCasterClip">Cascades 1+: smallest caster diameter in clip units (EngineSettings.ShadowMinCasterTexels * 2 / resolution; 0 = off; negative: -minCasterClip for every view).</param>
         /// <param name="receiversUav">The receiver tiles to test casters against (ShadowReceivers; 0 = none); null = the sun's this frame.</param>
+        /// <param name="casterStats">Counts each batch's casters into its row of these receivers (EngineSettings.ShadowCasterStats; the sun's only).</param>
         public static void CullShadowAll(ID3D12GraphicsCommandList list, IReadOnlyList<InstanceBatch> batches,
             uint cascadeBufferSrv, ulong cascadeBufferGpuAddress, uint shadowHiZSrv, GPUCuller? culler, int cascadeCount,
-            float minCasterClip = 0f, uint? receiversUav = null)
+            float minCasterClip = 0f, uint? receiversUav = null, ShadowReceivers? casterStats = null)
         {
             if (culler?.VisibilityCascadesPSO == null || culler.MainPSO == null || culler.HistogramCascadesPSO == null
                 || culler.ScatterCascadesPSO == null || culler.HistogramPrefixSumPSO == null) return;
@@ -1329,6 +1330,9 @@ namespace Freefall.Graphics
             uint cascades = (uint)Math.Clamp(cascadeCount, 0, DirectionalLight.MaxCascades);
             foreach (var batch in _stageBatches)
                 batch.PrepareCullShadow(list, cascadeBufferSrv, shadowHiZSrv, minCasterClip, receivers, cascades);
+            if (casterStats != null && receivers != 0)
+                foreach (var batch in _stageBatches)
+                    batch._cullConstants[32] = casterStats.CasterRow(batch.ProfileName);   // CasterStatsRow (the chain never sorts)
             StageBarrier(list);
 
             // Combined flag + cascade mask per instance

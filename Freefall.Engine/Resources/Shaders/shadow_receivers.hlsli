@@ -37,6 +37,17 @@
 #define RECEIVER_MODE_CULL      2u
 #define RECEIVER_MAX_BANDS      8u      // ocean.fx BandAngles[8]
 
+// Caster stats (EngineSettings.ShadowCasterStats): after the cascade pyramids a row per batch of the sun's culling
+// (CSVisibilityCascades, push constant slot 32 = 1 + the row), counted after the receiver test
+#define RECEIVER_CASTER_BASE    (RECEIVER_HEADER_WORDS + RECEIVER_MAX_CASCADES * RECEIVER_CASCADE_WORDS)
+#define RECEIVER_CASTER_ROWS    16u
+#define RECEIVER_CASTER_WORDS   32u
+#define CASTER_BY_COUNT         0u      // 0..6: instances drawn into n cascades (n = 0: in a cascade's box, cut from all)
+#define CASTER_TRIS_BY_COUNT    8u      // 8..14: the triangles those instances draw, over all their cascades
+#define CASTER_ENTRIES          16u     // 16..21: entries drawn per cascade
+#define CASTER_TRIS             22u     // 22..27: triangles drawn per cascade
+#define CASTER_TRIS_ONCE        28u     // the triangles of each drawn instance's first cascade only (as if drawn once)
+
 // First word of a cascade's pyramid level (row-major, (RECEIVER_TILES >> level)² words)
 uint ReceiverLevelBase(uint cascadeIdx, uint level)
 {

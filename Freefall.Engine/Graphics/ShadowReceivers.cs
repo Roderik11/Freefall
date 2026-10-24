@@ -24,6 +24,11 @@ namespace Freefall.Graphics
         private const int HeaderInstances = 2, HeaderInstancesCut = 3, HeaderTiles = 4, HeaderEntries = 10,
                           HeaderEntriesCut = 16, HeaderTris = 22, HeaderTrisCut = 28, HeaderCascades = 42;
         private const uint ModeCount = 1, ModeCull = 2;
+        // Caster stats (EngineSettings.ShadowCasterStats): a row per batch after the cascade pyramids
+        private const int CasterBase = HeaderWords + MaxCascades * CascadeWords;   // RECEIVER_CASTER_BASE
+        private const int CasterRows = 16, CasterWords = 32;
+        private const int CasterByCount = 0, CasterTrisByCount = 8, CasterEntries = 16, CasterTris = 22, CasterTrisOnce = 28;
+        private const int ReadbackWords = HeaderWords + CasterRows * CasterWords;
         private const int MaxOceanBands = 8;            // RECEIVER_MAX_BANDS
         private const uint MaxVisibleLights = 4096;     // PointLightBuffer.MaxVisible
 
@@ -50,8 +55,14 @@ namespace Freefall.Graphics
         private readonly bool[] _readbackFilled = new bool[FrameCount];
         private int _lastBuildTick = -1;
 
-        // Header of the last build read back (frames behind), null before the first
+        // Header and caster rows of the last build read back (frames behind), null before the first
         private uint[]? _stats;
+
+        // The batches given a caster row in this build (CasterRow), the names that went with each readback, and those
+        // of the stats read back
+        private readonly List<string> _rowNames = new();
+        private readonly string[][] _readbackNames = new string[FrameCount][];
+        private string[] _statsNames = Array.Empty<string>();
 
         // One per renderer (scene view, game view): the stats route asks all of them
         private static readonly List<ShadowReceivers> _instances = new();
@@ -112,8 +123,11 @@ namespace Freefall.Graphics
                 if (_lastBuildTick >= 0)
                 {
                     cmd.CopyBufferRegion(_readback[f]!.Native, 0, buffer.Native, 0, HeaderWords * sizeof(uint));
+                    cmd.CopyBufferRegion(_readback[f]!.Native, HeaderWords * sizeof(uint), buffer.Native,
+                        CasterBase * sizeof(uint), CasterRows * CasterWords * sizeof(uint));
                     cmd.ResourceBarrierTransition(buffer.Native, ResourceStates.CopySource, ResourceStates.UnorderedAccess);
                     _readbackFilled[f] = true;
+                    _readbackNames[f] = _rowNames.ToArray();
                 }
             }
             else
@@ -122,6 +136,7 @@ namespace Freefall.Graphics
                 buffer.UAVBarrier(cmd);
             }
             _lastBuildTick = Engine.TickCount;
+            _rowNames.Clear();
 
             PixMarker.Begin(cmd, "Shadow receivers");
             buffer.ClearUAV(cmd, new Vortice.Mathematics.Int4(0, 0, 0, 0));
@@ -217,20 +232,33 @@ namespace Freefall.Graphics
             }
         }
 
+        /// <summary>
+        /// Push constant slot 32 of the sun's cascade culling for a batch (EngineSettings.ShadowCasterStats): 1 + the row
+        /// its caster stats go to in this build, 0 = not counted (more batches than rows).
+        /// </summary>
+        public uint CasterRow(string batchName)
+        {
+            if (_rowNames.Count >= CasterRows)
+                return 0;
+            _rowNames.Add(batchName);
+            return (uint)_rowNames.Count;
+        }
+
         private void EnsureBuffers()
         {
             if (_buffer != null) return;
-            _buffer = GraphicsBuffer.CreateStructured<uint>(HeaderWords + MaxCascades * CascadeWords, uav: true);
+            _buffer = GraphicsBuffer.CreateStructured<uint>(CasterBase + CasterRows * CasterWords, uav: true);
             for (int i = 0; i < FrameCount; i++)
-                _readback[i] = GraphicsBuffer.CreateReadback<uint>(HeaderWords);
+                _readback[i] = GraphicsBuffer.CreateReadback<uint>(ReadbackWords);
         }
 
         private unsafe void ReadStats(int index)
         {
-            _stats ??= new uint[HeaderWords];
+            _stats ??= new uint[ReadbackWords];
             uint* src = _readback[index]!.ReadPtr<uint>();
-            for (int i = 0; i < HeaderWords; i++)
+            for (int i = 0; i < ReadbackWords; i++)
                 _stats[i] = src[i];
+            _statsNames = _readbackNames[index] ?? Array.Empty<string>();
         }
 
         /// <summary>
@@ -276,7 +304,58 @@ namespace Freefall.Graphics
                 trianglesCut = trisCut,
                 trianglesCutPct = Percent(trisCut, tris),
                 cascades,
+                casters = Engine.Settings.ShadowCasterStats ? DescribeCasters(s, cascades.Length) : null,
             };
+        }
+
+        // Per batch (after the receiver test): instances by the number of cascades they are drawn into, with the
+        // triangles they draw, the entries and triangles per cascade, and the triangles drawn more than once
+        private object[] DescribeCasters(uint[] s, int cascadeCount)
+        {
+            var rows = new List<object>(_statsNames.Length);
+            for (int r = 0; r < _statsNames.Length && r < CasterRows; r++)
+            {
+                int b = HeaderWords + r * CasterWords;
+                var drawnIn = new uint[cascadeCount + 1];
+                var trisDrawnIn = new uint[cascadeCount + 1];
+                for (int n = 0; n <= cascadeCount; n++)
+                {
+                    drawnIn[n] = s[b + CasterByCount + n];
+                    trisDrawnIn[n] = s[b + CasterTrisByCount + n];
+                }
+                var entries = new uint[cascadeCount];
+                var triangles = new uint[cascadeCount];
+                ulong total = 0, entryTotal = 0;
+                for (int c = 0; c < cascadeCount; c++)
+                {
+                    entries[c] = s[b + CasterEntries + c];
+                    triangles[c] = s[b + CasterTris + c];
+                    entryTotal += entries[c];
+                    total += triangles[c];
+                }
+                ulong once = s[b + CasterTrisOnce];
+                ulong drawn = 0, inTwoOrMore = 0;
+                for (int n = 1; n <= cascadeCount; n++)
+                {
+                    drawn += drawnIn[n];
+                    if (n >= 2) inTwoOrMore += drawnIn[n];
+                }
+                rows.Add(new
+                {
+                    batch = _statsNames[r],
+                    instancesDrawn = drawn,
+                    instancesInTwoOrMore = inTwoOrMore,
+                    cascadesPerInstance = drawn == 0 ? 0 : Math.Round((double)entryTotal / drawn, 2),
+                    drawnIn,            // [n] = instances drawn into n cascades ([0]: in a cascade's box, cut from all)
+                    trisDrawnIn,        // [n] = the triangles those instances draw, over all their cascades
+                    entries,
+                    triangles,
+                    trianglesTotal = total,
+                    trianglesIfOnce = once,
+                    trianglesRepeatedPct = Percent(total - Math.Min(once, total), total),
+                });
+            }
+            return rows.ToArray();
         }
 
         private static double Percent(ulong part, ulong whole) => whole == 0 ? 0 : Math.Round(100.0 * part / whole, 1);

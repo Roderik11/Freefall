@@ -499,7 +499,8 @@ namespace Freefall.Components
                     ulong cascadeCBAddr = _shadowCascadeCBs![frameIndex].Native.GPUVirtualAddress;
                     PixMarker.Begin(commandList, "Shadow culling");
                     InstanceBatch.CullShadowAll(commandList, allBatches, cascadeSrv, cascadeCBAddr, shadowHiZSrv, culler,
-                        numCascades, minCasterClip);
+                        numCascades, minCasterClip,
+                        casterStats: Engine.Settings.ShadowCasterStats ? renderer.ShadowReceivers : null);
                     PixMarker.End(commandList);
 
                     // Phase 3: True single-pass draw — 1 ExecuteIndirect per batch for all cascades

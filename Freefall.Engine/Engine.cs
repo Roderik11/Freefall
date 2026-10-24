@@ -671,6 +671,12 @@ namespace Freefall
          public ShadowReceiverCulling ShadowReceiverCulling { get; set; } = ShadowReceiverCulling.On;
 
          /// <summary>
+         /// Per batch, how many sun cascades each caster is drawn into and the triangles per cascade (engine_stats:
+         /// sunShadowReceivers.casters). Needs ShadowReceiverCulling Count or On; counting costs a little, so off by default.
+         /// </summary>
+         public bool ShadowCasterStats { get; set; } = false;
+
+         /// <summary>
          /// Each sun cascade draws a caster at the detail the camera would draw it at from the distance where one screen
          /// pixel spans one of the cascade's texels, never finer than the camera's LOD and never culled
          /// (cull_instances.hlsl CascadeLodSteps). Off = every cascade draws the camera's LOD. Since 2026-10-23.
