@@ -12,6 +12,7 @@ namespace Freefall.Editor.Commands
             var qs = CommandHelpers.ParseQueryString(context.Path);
             int count = qs.TryGetValue("count", out var countStr) && int.TryParse(countStr, out var c) ? c : 50;
             int offset = qs.TryGetValue("offset", out var offsetStr) && int.TryParse(offsetStr, out var o) ? o : 0;
+            bool stacks = qs.TryGetValue("stacks", out var stacksStr) && bool.TryParse(stacksStr, out var s) && s;
 
             var lines = Debug.Lines;
             var total = lines.Count;
@@ -23,11 +24,10 @@ namespace Freefall.Editor.Commands
             var entries = new object[end - start];
             for (int i = start; i < end; i++)
             {
-                entries[i - start] = new
-                {
-                    index = i,
-                    message = lines[i].Message
-                };
+                // stacks=true: the line's stack where one was kept (a logged exception's; every line's in a Debug build)
+                entries[i - start] = stacks
+                    ? new { index = i, message = lines[i].Message, stack = lines[i].StackText ?? lines[i].StackTrace?.ToString() }
+                    : (object)new { index = i, message = lines[i].Message };
             }
 
             return CommandResult.Json(new

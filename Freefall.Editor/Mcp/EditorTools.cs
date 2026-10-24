@@ -188,9 +188,9 @@ namespace Freefall.Editor.Mcp
         }
 
         [McpServerTool(Name = "console_log", Title = "Read console log", ReadOnly = true, OpenWorld = false)]
-        [Description("Recent editor console lines, oldest first. 'offset' skips that many of the newest lines (for paging back).")]
-        public static Task<CallToolResult> ConsoleLog(int count = 50, int offset = 0)
-            => McpBridge.Get("/api/console/log", ("count", count), ("offset", offset));
+        [Description("Recent editor console lines, oldest first. 'offset' skips that many of the newest lines (for paging back). 'stacks' adds each line's stack where one was kept (a logged exception's, e.g. a component callback that threw).")]
+        public static Task<CallToolResult> ConsoleLog(int count = 50, int offset = 0, bool stacks = false)
+            => McpBridge.Get("/api/console/log", ("count", count), ("offset", offset), ("stacks", stacks));
 
         [McpServerTool(Name = "console_clear", Title = "Clear console", Destructive = true, Idempotent = true, OpenWorld = false)]
         [Description("Clear the editor console log (useful before an action so console_log shows only its output).")]
