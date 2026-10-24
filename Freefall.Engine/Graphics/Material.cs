@@ -352,6 +352,16 @@ namespace Freefall.Graphics
             }
             return false;
         }
+
+        /// <summary>Whether the effect has a pass of this name (named passes, e.g. "DepthPrepass").</summary>
+        public bool HasPass(string name)
+        {
+            foreach (var p in GetPasses())
+            {
+                if (p.EffectPass.Name == name) return true;
+            }
+            return false;
+        }
         
         private Dictionary<string, int> _textureSlots = new();
 

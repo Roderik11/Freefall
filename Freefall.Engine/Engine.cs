@@ -622,6 +622,13 @@ namespace Freefall
          public bool DisableDepthSort { get; set; } = true;                 // GPU doesn't order instances within a draw call — sort has no visual effect
 
          /// <summary>
+         /// Batches whose effect has DepthPrepass and Shade passes (gbuffer_foliage) write their depth before every
+         /// opaque batch, alpha test only, and then shade with an Equal depth test: one G-buffer shader run per pixel
+         /// instead of one per leaf layer.
+         /// </summary>
+         public bool DepthPrepass { get; set; } = true;
+
+         /// <summary>
          /// Global LOD distance scale. Default 1.0. Linear: 2.0 doubles every LOD and cull distance.
          /// Higher = LODs stay high-detail longer (quality). Lower = transition sooner (performance).
          /// Multiplied with per-mesh Mesh.LODBias.

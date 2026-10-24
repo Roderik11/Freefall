@@ -517,6 +517,25 @@ namespace Freefall.Graphics
                 // 7. Draw (topology set per-batch: patch for tessellation, triangle list otherwise)
                 using var draw = _drawMarker.Auto(activeBatches.Count);
 
+                // Depth pre-pass (EngineSettings.DepthPrepass): batches whose effect has DepthPrepass and Shade passes
+                // write their depth before every opaque batch, then draw Shade in Opaque's place below (Equal test)
+                if (pass == RenderPass.Opaque && Engine.Settings.DepthPrepass)
+                {
+                    PixMarker.Begin(commandList, "Depth pre-pass");
+                    foreach (var batch in activeBatches)
+                    {
+                        if (!batch.Material.HasPass("DepthPrepass") || !batch.Material.HasPass("Shade"))
+                            continue;
+                        PixMarker.Begin(commandList, batch.ProfileName);
+                        batch.Material.SetPass("DepthPrepass");
+                        batch.Material.Apply(commandList, device);
+                        batch.Draw(commandList, device);
+                        batch.Material.SetPass("Shade");
+                        PixMarker.End(commandList);
+                    }
+                    PixMarker.End(commandList);
+                }
+
                 PixMarker.Begin(commandList, "Draws");
                 foreach (var batch in activeBatches)
                 {

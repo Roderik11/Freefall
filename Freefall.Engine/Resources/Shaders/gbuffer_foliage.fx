@@ -85,6 +85,17 @@ float3 WindDisplacement(float3 worldPos, float3 localPos, float3 origin)
     return sway + float3(cos(angle), 0.4 * (seed - 0.5), sin(angle)) * wave * amount;
 }
 
+// World position with the wind, and clip position. Shared by VS and VS_Depth: the depth pre-pass and the Shade pass
+// (Equal depth test) must give bit-identical depth, so the arithmetic is precise.
+void FoliagePosition(float3 pos, row_major matrix World, out float4 worldPos, out float4 clipPos)
+{
+    precise float4 wp = mul(float4(pos, 1.0f), World);
+    wp.xyz += WindDisplacement(wp.xyz, pos, float3(World._41, World._42, World._43));
+    precise float4 cp = mul(mul(wp, View), Projection);
+    worldPos = wp;
+    clipPos = cp;
+}
+
 VSOutput VS(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_InstanceID)
 {
     VSOutput output;
@@ -113,13 +124,11 @@ VSOutput VS(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_InstanceI
     float3 norm = normals[vertexID];
     float2 uv = uvs[vertexID];
 
-    float4 worldPos = mul(float4(pos, 1.0f), World);
-    
     // Wind: the tree's bend plus the leaves' flutter (identical in VS_Shadow)
-    worldPos.xyz += WindDisplacement(worldPos.xyz, pos.xyz, float3(World._41, World._42, World._43));
-    
+    float4 worldPos;
+    FoliagePosition(pos, World, worldPos, output.Position);
+
     output.WorldPos = worldPos;
-    output.Position = mul(mul(worldPos, View), Projection);
     
     // Original canopy normal: mostly upward with a subtle outward dome from the tree origin. Kept for foliage whose
     // material has a normal map (Sweetgum, beech): those trees were authored against this look.
@@ -207,6 +216,52 @@ PSOutput PS(VSOutput input, bool isFrontFace : SV_IsFrontFace)
     return output;
 }
 
+// Depth pre-pass (EngineSettings.DepthPrepass): the leaves' depth with the alpha test and the LOD crossfade's dither,
+// nothing else. The Shade pass then runs PS only where its fragment is the one that wrote the depth (Equal), so each
+// pixel runs the G-buffer shader once instead of once per leaf layer in front of it.
+struct DepthVSOutput
+{
+    float4 Position : SV_POSITION;
+    float2 TexCoord : TEXCOORD0;
+    nointerpolation uint MaterialID : TEXCOORD1;
+    nointerpolation uint LodFade : TEXCOORD2;
+};
+
+DepthVSOutput VS_Depth(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_InstanceID)
+{
+    DepthVSOutput output;
+
+    StructuredBuffer<InstanceDescriptor> descriptors = ResourceDescriptorHeap[DescriptorBufIdx];
+    StructuredBuffer<row_major matrix> globalTransforms = ResourceDescriptorHeap[GlobalTransformBufferIdx];
+    StructuredBuffer<uint> sortedIndices = ResourceDescriptorHeap[SortedIndicesIdx];
+    StructuredBuffer<MeshPartEntry> meshRegistry = ResourceDescriptorHeap[MeshRegistryIdx];
+    MeshPartEntry part = meshRegistry[MeshPartId];
+
+    uint vertexID = MeshVertexIndex(part, primitiveVertexID, primitiveVertexID, IndexedDraw);
+    StructuredBuffer<float3> positions = ResourceDescriptorHeap[part.PosBufferIdx];
+    StructuredBuffer<float2> uvs = ResourceDescriptorHeap[part.UVBufferIdx];
+
+    uint packedIdx = sortedIndices[InstanceBaseOffset + instanceID];
+    InstanceDescriptor desc = descriptors[DrawEntryIndex(packedIdx)];
+    row_major matrix World = globalTransforms[desc.TransformSlot];
+
+    float4 worldPos;
+    FoliagePosition(positions[vertexID], World, worldPos, output.Position);
+    output.TexCoord = uvs[vertexID];
+    output.TexCoord.y = 1 - output.TexCoord.y;
+    output.MaterialID = desc.MaterialId;
+    output.LodFade = DrawEntryFade(packedIdx);
+    return output;
+}
+
+void PS_Depth(DepthVSOutput input)
+{
+    LodFadeClip(input.Position.xy, input.LodFade);
+    MaterialData mat = GET_MATERIAL(input.MaterialID);
+    Texture2D albedoTex = ResourceDescriptorHeap[NonUniformResourceIndex(mat.AlbedoIdx)];
+    clip(albedoTex.Sample(Sampler, input.TexCoord).a - 0.2f);
+}
+
 
 // Shadow pass
 struct ShadowVSOutput
@@ -282,6 +337,20 @@ technique11 GBuffer
     {
         SetVertexShader(CompileShader(vs_6_6, VS()));
         SetPixelShader(CompileShader(ps_6_6, PS()));
+    }
+    // EngineSettings.DepthPrepass: CommandBuffer draws DepthPrepass before every opaque batch, then Shade in Opaque's
+    // place. Shade keeps the PS's discards: with no depth write they do not stop the early depth test.
+    pass DepthPrepass
+    {
+        SetVertexShader(CompileShader(vs_6_6, VS_Depth()));
+        SetPixelShader(CompileShader(ps_6_6, PS_Depth()));
+        SetRenderState(RenderTargets=6, Blend=NoColor)
+    }
+    pass Shade
+    {
+        SetVertexShader(CompileShader(vs_6_6, VS()));
+        SetPixelShader(CompileShader(ps_6_6, PS()));
+        SetRenderState(RenderTargets=6, DepthWrite=false, DepthFunc=Equal)
     }
     
     pass Shadow
