@@ -8,7 +8,7 @@
 // rate: the far layers hold more per pixel, each thinner and fainter (widened to a pixel and dimmed as much, as the
 // particles' PIXEL_FLOOR), so the distance fills to a veil instead of lines. A layer is drawn only in front of the scene
 // (the linear depth), off covered places (the cover map at the layer's point: no rain inside an arcade seen through its
-// arch) and faded into the haze (Weather.HazeKm) with its distance. Rain takes the sky's light from above (a drop is a
+// arch; the terrain's heights over it: none in a cave) and faded into the haze (Weather.HazeKm) with its distance. Rain takes the sky's light from above (a drop is a
 // tiny lens: the particles' Water), snow is lit as a white speck by the sky round it; with the fog volume (FroxelLamps)
 // as much of that as gets to the place past walls, roofs, crowns and shadows, and the lamps' light near them.
 // Docs: .agent/knowledge/atmospheric_effects/weather.md §3.
@@ -45,7 +45,7 @@ struct PrecipFrame
     float SnowFall;             // alike. Constants held six to ten times the near rain ("there's far more rain in the far")
 };
 
-SamplerState LinearClampS : register(s2);
+#define LinearClampS AtmosphereLinearClamp   // s2, the linear clamp sampler (atmosphere_common.hlsli declares it)
 
 #define LAYERS 5
 #define FIRST_LAYER 11.0        // m; each layer 1.38× the last (11, 15, 21, 29, 40 m): past them the haze is the veil
@@ -238,7 +238,9 @@ void CSLayers(uint3 id : SV_DispatchThreadID)
         if (z > sceneZ - 0.5)
             break;
         float3 place = CamPos + dir * d;
-        float open = 1.0 - ShelterCoverAt(s, LinearClampS, place.xz, place.y);
+        // The hill over a cave is the terrain's, not in the cover map's meshes: without it the far field fell in the
+        // cave's air down a tunnel (user, 2026-10-24)
+        float open = (1.0 - ShelterCoverAt(s, LinearClampS, place.xz, place.y)) * TerrainOpen(place, float3(0, 1, 0));
         if (open <= 0.0)
             continue;
         float fade = open * poleFade * exp(-P.HazeKm * d * 0.001) * saturate((sceneZ - z) / 2.0);
