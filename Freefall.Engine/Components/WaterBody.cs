@@ -185,6 +185,8 @@ namespace Freefall.Components
             public float ShoreOriginZ;
             public float ShoreSizeX;
             public float ShoreSizeZ;
+            public float SnowAlongX;    // Weather.SnowLaidAlong: the way the snow's drifts on the ice run
+            public float SnowAlongZ;
         }
 
         protected override void Awake()
@@ -786,6 +788,8 @@ namespace Freefall.Components
                 ShoreOriginZ = _shore?.Origin.Y ?? 0f,
                 ShoreSizeX = _shore != null ? _shore.Width * _shore.Cell : 1f,
                 ShoreSizeZ = _shore != null ? _shore.Height * _shore.Cell : 1f,
+                SnowAlongX = Weather.SnowLaidAlong.X,
+                SnowAlongZ = Weather.SnowLaidAlong.Y,
             });
 
             CommandBuffer.Enqueue(mesh, _material, _params, Transform.TransformSlot);

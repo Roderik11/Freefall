@@ -102,6 +102,13 @@ namespace Freefall.Graphics
         public static float SnowFallen { get; private set; }
 
         /// <summary>
+        /// The way the wind laid the snow that lies (xz, unit): the steady wind's (<see cref="Wind.Current"/>) while no snow
+        /// lies, held while it does, since lying snow does not turn with the wind. The drifts on the ice run along it
+        /// (water.fx).
+        /// </summary>
+        public static Vector2 SnowLaidAlong { get; private set; }
+
+        /// <summary>
         /// How frozen the lakes and rivers are (0..1; WaterBody: water.fx draws the ice, its collider carries the walker).
         /// It grows while it is below freezing at the camera (more than half of what falls there would be snow), from open
         /// water to the deepest still water frozen over in <see cref="FreezeSeconds"/>, and thaws where it is warmer,
@@ -141,7 +148,11 @@ namespace Freefall.Graphics
         private const float SoakSeconds = 15f, DrySeconds = 600f;
         private const float FillSeconds = 60f, DrainSeconds = 2400f;
         private const float CoverSeconds = 90f, MeltSeconds = 1200f, FallenSeconds = 600f;
-        private const float FreezeSeconds = 1200f, ThawSeconds = 1800f;
+        // Seconds of frost to freeze the deepest still water over (1200 until 2026-10-24, sped up with the above), a third
+        // slower than the snow covers the land: at 180 a lake was frozen and white before the land around it ("should be
+        // in sync or a bit delayed", user). In the Snowfall preset a lake's edge starts at ~35 s, its middle is frozen
+        // over at ~3.4 minutes, the land white at ~2.7. The thaw kept its pace
+        private const float FreezeSeconds = 240f, ThawSeconds = 1800f;
         private const float SunLux = 60000f;    // lux of sun on level ground that counts as 1 (a clear noon gives ~1.4)
         private static float _wetness, _puddles, _snow, _ice;     // the weather's own, kept while the override is on
         private static int _iceStep = -1;
@@ -238,6 +249,14 @@ namespace Freefall.Graphics
             PuddleFill = manual ? Math.Clamp(settings!.OverridePuddleFill, 0f, 1f) : _puddles;
             SnowCover = manual ? Math.Clamp(settings!.OverrideSnowCover, 0f, 1f) : _snow;
             Ice = manual ? Math.Clamp(settings!.OverrideIce, 0f, 1f) : _ice;
+            // Taken while no snow lies, then held: the ice's drifts followed the gusty wind near the ground, turned about
+            // the world's origin, and slid to and fro across Lake Mere, 2 km out, with every gust (user, 2026-10-24)
+            if (SnowCover < 0.005f || SnowLaidAlong == Vector2.Zero)
+            {
+                var current = Wind.Current;
+                var laid = new Vector2(current.X, current.Z);
+                SnowLaidAlong = laid.LengthSquared() > 1e-6f ? Vector2.Normalize(laid) : new Vector2(1f, 0f);
+            }
             int iceStep = (int)MathF.Round(Ice / IceStep);
             if (iceStep != _iceStep)
             {

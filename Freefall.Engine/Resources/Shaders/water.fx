@@ -70,6 +70,7 @@ struct WaterData
     uint ShoreField;            // Texture2D<float>: the share of the way from the shore to the middle (0 = none yet)
     float2 ShoreOrigin;         // world xz of its corner
     float2 ShoreSize;           // metres it spans
+    float2 SnowAlong;           // Graphics.Weather.SnowLaidAlong: the way the snow's drifts on the ice run (xz, unit)
 };
 
 SamplerState WaterSampler : register(s0);
@@ -346,8 +347,9 @@ PSOutput PS(VSOutput input)
                         + Fi * WaterSkyReflection(V, Ni, roughness) * skyVisible) * column.edgeFade;
 
         // Snow lies on ice that holds it, as the cover grows (on the ground: decals_cs.hlsl), in streaks the wind laid
-        // down along itself over the open sheet (round blots of noise read as foam); none on the thin ice at the edge
-        float2 windAlong = dot(WindDirection.xz, WindDirection.xz) > 1e-4 ? normalize(WindDirection.xz) : float2(1, 0);
+        // down along itself over the open sheet (round blots of noise read as foam); none on the thin ice at the edge. The
+        // way it was laid, held while it lies: the gusty wind of the moment slid the drifts to and fro across the lake
+        float2 windAlong = dot(water.SnowAlong, water.SnowAlong) > 1e-4 ? normalize(water.SnowAlong) : float2(1, 0);
         float2 windFrame = float2(dot(p, windAlong), dot(p, float2(-windAlong.y, windAlong.x)));
         float drift = MacroNoise(windFrame / float2(14.0, 3.5)) * 0.65 + MacroNoise(windFrame / float2(5.0, 1.4) + 21.0) * 0.35;
         float bare = 1.0 - saturate(water.SnowCover);
