@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Numerics;
 using System.Runtime.CompilerServices;
 using PhysX;
@@ -130,15 +131,26 @@ namespace Freefall.Base
             Scene.Simulate(FixedTimestep);
             Scene.FetchResults(true);
 
-            var activeActors = Scene.GetActors(ActorTypeFlag.RigidDynamic);
-            foreach (var actor in activeActors)
+            foreach (var body in _simulated)
             {
-                if (actor is RigidDynamic dynamic && actor.UserData is Entity entity)
+                if (body.Actor is RigidDynamic dynamic && dynamic.UserData is Entity entity)
                 {
                     entity.Transform.Position = dynamic.GlobalPosePosition;
                     entity.Transform.Rotation = dynamic.GlobalPoseQuat;
                 }
             }
+        }
+
+        // The bodies the simulation moves (a RigidBody that is neither static nor kinematic): after a step their
+        // entities are put where their actors went. Kept by RigidBody, so a step walks only these: Scene.GetActors
+        // walked every dynamic actor (the characters' controllers, the animals' capsules, every door's leaf), and
+        // would have put a kinematic body back where its actor was, when it is the actor that follows the transform.
+        private static readonly HashSet<Components.RigidBody> _simulated = new();
+
+        internal static void Simulated(Components.RigidBody body, bool simulated)
+        {
+            if (simulated) _simulated.Add(body);
+            else _simulated.Remove(body);
         }
 
         public static void Flush()

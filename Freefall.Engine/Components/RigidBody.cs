@@ -36,6 +36,28 @@ namespace Freefall.Components
             }
         }
 
+        private bool _isKinematic;
+
+        /// <summary>
+        /// A body that is moved, not simulated: a door's leaf, a lift. Its actor is a kinematic RigidDynamic that
+        /// goes where its transform is put (a kinematic target per change, so what it pushes is pushed at its
+        /// speed); nothing moves it back. It may have mesh colliders, which a simulated body may not. A body that
+        /// <see cref="IsStatic"/> stays static whatever this says. Left out of the navmesh bake like any body that
+        /// is not static.
+        /// </summary>
+        public bool IsKinematic
+        {
+            get => _isKinematic;
+            set
+            {
+                if (_isKinematic == value) return;
+                _isKinematic = value;
+
+                if (_staticActor != null || _dynamicActor != null)
+                    CreateActor();
+            }
+        }
+
         protected override void Awake()
         {
             if (Engine.IsEditor)
@@ -76,14 +98,41 @@ namespace Freefall.Components
                 _staticActor?.GlobalPosePosition = translation;
                 _staticActor?.GlobalPoseQuat = rotation;
             }
+            else if (IsKinematic && _dynamicActor != null)
+            {
+                Transform.Matrix.Deconstruct(out _, out var rotation, out var translation);
+                _dynamicActor.SetKinematicTarget(Matrix4x4.CreateFromQuaternion(rotation) * Matrix4x4.CreateTranslation(translation));
+            }
         }
 
         // The colliders whose shapes are on the actor: their wrappers go before the actor does (its release takes the shapes)
         private List<Collider>? _colliders;
 
+        /// <summary>
+        /// The colliders that are this body's: its own and those of the entities below it, except below another body.
+        /// A collider belongs to its nearest body: a door's leaf with a kinematic body of its own under a house's
+        /// static one moves with its own actor, not as a shape of the house's.
+        /// </summary>
+        private List<Collider> OwnColliders()
+        {
+            var colliders = Entity.GetComponents<Collider>();
+            foreach (Transform child in Transform)
+                Gather(child.Entity, colliders);
+            return colliders;
+        }
+
+        private static void Gather(Entity entity, List<Collider> into)
+        {
+            if (entity == null || entity.GetComponent<RigidBody>() != null) return;
+            foreach (var component in entity.Components)
+                if (component is Collider collider) into.Add(collider);
+            foreach (Transform child in entity.Transform)
+                Gather(child.Entity, into);
+        }
+
         public void CreateActor()
         {
-            var colliders = Entity.GetComponentsInChildren<Collider>();
+            var colliders = OwnColliders();
             if(colliders.Count == 0)
                 return;
 
@@ -115,10 +164,11 @@ namespace Freefall.Components
             {
                 _dynamicActor = PhysicsWorld.Physics.CreateRigidDynamic();
                 _dynamicActor.UserData = Entity;
+                // Kinematic before the shapes: PhysX refuses a mesh shape on a simulated actor
+                if (IsKinematic) _dynamicActor.RigidBodyFlags |= RigidBodyFlag.Kinematic;
                 _dynamicActor.GlobalPose = matrix;
                 _dynamicActor.AngularDamping = 1f;
                 _dynamicActor.LinearDamping = 0.1f;
-                _dynamicActor.SetMassAndUpdateInertia(Mass);
                 actor = _dynamicActor;
             }
 
@@ -126,7 +176,12 @@ namespace Freefall.Components
                 collider.CreateShape(Entity, actor);
             _colliders = colliders;
 
+            // A simulated body's mass from its shapes once it has them (a kinematic one has no use for it)
+            if (_dynamicActor != null && !IsKinematic)
+                _dynamicActor.SetMassAndUpdateInertia(Mass);
+
             PhysicsWorld.Scene.AddActor(Actor!);
+            PhysicsWorld.Simulated(this, _dynamicActor != null && !IsKinematic);
         }
 
         public override void Destroy()
@@ -140,6 +195,7 @@ namespace Freefall.Components
         // Out of the scene, the shapes' wrappers first (left on the actor), then the actor with its shapes in one release
         private void ReleaseActor()
         {
+            PhysicsWorld.Simulated(this, false);
             PhysicsWorld.Scene.RemoveActor(Actor!);
             if (_colliders != null)
                 foreach (var collider in _colliders)

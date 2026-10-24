@@ -166,6 +166,14 @@ namespace Freefall.Base
         /// piece of it nothing leads to (the floor of a fountain's basin, a walled yard), and an
         /// agent sent there goes as near as a way leads and never arrives. False where there is
         /// no navmesh under <paramref name="from"/>.
+        /// <para>
+        /// From outside the circle the spread begins where a way from <paramref name="from"/> towards
+        /// the centre ends (a search bounded as <see cref="FindPath"/>'s is): Detour spreads only over
+        /// polygons inside the circle, and a start outside it gave a point on the start polygon
+        /// itself, at <paramref name="from"/>'s feet. Guards sent on their rounds to a stall 100 m
+        /// off stood still at their posts (2026-10-24). Where no way gets into the circle, the
+        /// point is as near as one leads.
+        /// </para>
         /// </summary>
         public static bool RandomReachablePoint(Vector3 from, Vector3 center, float radius, out Vector3 point)
         {
@@ -173,10 +181,24 @@ namespace Freefall.Base
             if (_navQuery == null) return false;
 
             _navQuery.FindNearestPoly(ToRc(from), QueryExtents, DefaultFilter,
-                out long startRef, out _, out _);
+                out long startRef, out var startPt, out _);
             if (startRef == 0) return false;
 
-            // Spreads from the polygon it stands on over its neighbours, as far as the circle reaches
+            var away = from - center;
+            if (away.X * away.X + away.Z * away.Z > radius * radius)
+            {
+                _navQuery.FindNearestPoly(ToRc(center), QueryExtents, DefaultFilter,
+                    out long centerRef, out var centerPt, out _);
+                if (centerRef == 0) return false;
+
+                _navQuery.InitSlicedFindPath(startRef, centerRef, startPt, centerPt, DefaultFilter, 0);
+                _navQuery.UpdateSlicedFindPath(MaxSearchNodes, out _);
+                _navQuery.FinalizeSlicedFindPath(WayPolys, out int count, WayPolys.Length);
+                if (count == 0) return false;
+                startRef = WayPolys[count - 1];
+            }
+
+            // Spreads from that polygon over its neighbours, as far as the circle reaches
             var status = _navQuery.FindRandomPointAroundCircle(startRef, ToRc(center), radius,
                 DefaultFilter, RandomSource, out long randomRef, out var randomPt);
             if (status.Failed() || randomRef == 0) return false;
@@ -186,6 +208,9 @@ namespace Freefall.Base
         }
 
         private static readonly NavRandom RandomSource = new();
+
+        // The polygons of the way into the circle (RandomReachablePoint), kept: main thread only
+        private static readonly long[] WayPolys = new long[MaxSearchNodes];
 
         private sealed class NavRandom : DotRecast.Core.IRcRand
         {
