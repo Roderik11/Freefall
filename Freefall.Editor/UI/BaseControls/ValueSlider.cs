@@ -28,6 +28,9 @@ namespace Freefall.Editor
 
         public float Value => value;
 
+        /// <summary>The user is pressing, dragging or typing into it: whatever shows a value in it waits until they are done.</summary>
+        public bool Interacting => pressed || dragging || editor.Visible;
+
         public ValueSlider()
         {
             NoEvents = false;

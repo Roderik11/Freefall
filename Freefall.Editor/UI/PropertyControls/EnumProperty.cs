@@ -108,7 +108,36 @@ namespace Freefall.Editor
 
         void Dropdown_SelectedItemChanged(Control sender, ListBoxItem value)
         {
+            if (_showing) return;   // OnUpdate showing a value set elsewhere: no edit
             property.SetValue(value.Value);
+        }
+
+        // OnUpdate is selecting the item of a value set elsewhere
+        private bool _showing;
+
+        // Shows what scripts, the game's options or the MCP set, never writing it back, and not while the list is open
+        protected override void OnUpdate()
+        {
+            Timer += Time.Delta;
+            if (Timer <= Interval || Dropdown.IsOpen || property.HasMixedValue) return;
+            Timer = 0;
+
+            object value = property.GetValue();
+            if (_isFlags)
+            {
+                string summary = BuildFlagsSummary();
+                if (Dropdown.Label.Text != summary) Dropdown.Label.Text = summary;
+                return;
+            }
+            if (value == null || (Dropdown.SelectedItem != null && value.Equals(Dropdown.SelectedItem.Value))) return;
+            foreach (ListBoxItem item in Dropdown.Items)
+            {
+                if (!value.Equals(item.Value)) continue;
+                _showing = true;
+                try { Dropdown.SelectedItem = item; }
+                finally { _showing = false; }
+                break;
+            }
         }
 
         // ── Multi-select (flags) ──
