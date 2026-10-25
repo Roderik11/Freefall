@@ -50,6 +50,12 @@ namespace Freefall
         public static string? UserFolder { get; set; }
 
         /// <summary>
+        /// The published build's version ("0.1.3"), from its manifest (the BuildProfile's Version when it was published;
+        /// a push to itch.io counts it up). Null in the editor, and in builds made before it was written.
+        /// </summary>
+        public static string? BuildVersion { get; private set; }
+
+        /// <summary>
         /// The game's own window, which the player gives (full screen or a window). Null in the editor: the game is drawn
         /// in the editor's viewport and has no window to change.
         /// </summary>
@@ -230,7 +236,8 @@ namespace Freefall
             };
             AssetDatabase.InitializeFromManifest(Project, manifest);
             Assets.BaseDirectory = Project.AssetsDirectory;
-            Debug.LogAlways($"[Engine] Game opened: {manifest.Product}, {manifest.Packs.Count} packs, " +
+            BuildVersion = string.IsNullOrWhiteSpace(manifest.BuildVersion) ? null : manifest.BuildVersion.Trim();
+            Debug.LogAlways($"[Engine] Game opened: {manifest.Product}{(BuildVersion != null ? " " + BuildVersion : "")}, {manifest.Packs.Count} packs, " +
                             $"{Artifacts.Packs?.Count ?? 0} artifacts, {manifest.Scenes.Count} scenes");
             return manifest;
         }

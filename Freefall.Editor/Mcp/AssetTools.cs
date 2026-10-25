@@ -131,7 +131,9 @@ namespace Freefall.Editor.Mcp
 
         [McpServerTool(Name = "asset_save", Title = "Save asset", Destructive = true, OpenWorld = false)]
         [Description("Write a loaded asset to its file and reimport it, so the editor's cached copy matches. " +
-                     "Use after in-memory edits, e.g. terrain changes or asset_set_properties with save=false.")]
+                     "Use after in-memory edits, e.g. terrain changes or asset_set_properties with save=false. " +
+                     "A prefab that a model file makes (prefab_apply on an instance of an FBX's prefab) has no file of its own: " +
+                     "it is kept in that file's import settings and the file is imported again.")]
         public static Task<CallToolResult> Save(string guid, [Description("Override path; default is the asset's own file")] string? path = null)
             => McpBridge.Post("/api/asset/save", new { guid, path });
 

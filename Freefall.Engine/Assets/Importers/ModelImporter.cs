@@ -95,6 +95,25 @@ namespace Freefall.Assets.Importers
     }
 
     /// <summary>
+    /// A prefab the import makes that was edited and saved (a collider added, children, members changed). It has
+    /// no file of its own, so it is kept with the file's settings, by the prefab's name, and every import builds the
+    /// prefab from it (<see cref="ModelImporter.SavePrefab"/>). Remove the entry and import again to get the prefab
+    /// as the file alone makes it.
+    /// </summary>
+    [Serializable]
+    public class PrefabConfig
+    {
+        [ReadOnly(true)]
+        public string Name = string.Empty;
+
+        /// <summary>The saved prefab, as EntitySerializer writes it.</summary>
+        [Browsable(false)]
+        public string Yaml = string.Empty;
+
+        public override string ToString() => Name;
+    }
+
+    /// <summary>
     /// Unified model importer for FBX, DAE, OBJ files.
     /// Produces all artifacts from a single source: mesh data, skeleton, and animations.
     /// Replaces MeshImporter and AnimationClipImporter for standard model files.
@@ -191,6 +210,39 @@ namespace Freefall.Assets.Importers
             }
 
             return AssetDatabase.SaveImporter(clip.Guid, importer) != null;
+        }
+
+        /// <summary>Prefabs of this file that were edited and saved, by prefab name.</summary>
+        public List<PrefabConfig> Prefabs = new();
+
+        public PrefabConfig? FindPrefabConfig(string prefabName)
+        {
+            foreach (var cfg in Prefabs)
+                if (string.Equals(cfg.Name, prefabName, StringComparison.OrdinalIgnoreCase))
+                    return cfg;
+            return null;
+        }
+
+        /// <summary>
+        /// Keep an edited prefab of a model file (Apply to Prefab on an instance of a tree, then save): its YAML goes
+        /// into the file's settings and the file is imported again, which builds the prefab from it. What the file
+        /// makes of the prefab's root stays the file's (<see cref="FileMembers"/>). False for a prefab that is not a
+        /// model file's.
+        /// </summary>
+        public static bool SavePrefab(Prefab prefab)
+        {
+            if (prefab == null || string.IsNullOrEmpty(prefab.Guid) || prefab.SourceYaml == null) return false;
+            if (AssetDatabase.GuidToPath(prefab.Guid) != null) return false;   // a .prefab file of its own
+            if (AssetDatabase.GetImporter(prefab.Guid) is not ModelImporter importer) return false;
+
+            string name = AssetDatabase.ResolveFriendlyName(prefab.Guid);
+            var config = importer.FindPrefabConfig(name);
+            if (config == null) importer.Prefabs.Add(config = new PrefabConfig { Name = name });
+            config.Yaml = prefab.ToYaml();
+
+            AssetDatabase.SaveImporterAndReimport(prefab.Guid, importer);
+            prefab.ClearDirty();
+            return true;
         }
 
         /// <summary>
@@ -428,6 +480,10 @@ namespace Freefall.Assets.Importers
                 var serializer = new EntitySerializer();
                 var yaml = serializer.SaveToString(new List<Entity> { entity });
 
+                // Edited and saved: that prefab, with what comes from the file as this import made it
+                if (FindPrefabConfig(meshName) is { Yaml.Length: > 0 } saved)
+                    yaml = saved.Yaml = WithFileMembers(saved.Yaml, yaml);
+
                 prefabs.Add(new ImportArtifact
                 {
                     Name = meshName,
@@ -441,6 +497,119 @@ namespace Freefall.Assets.Importers
 
             return prefabs;
         }
+
+        // ── Saved prefabs ──
+
+        /// <summary>
+        /// What of a saved prefab's root stays the file's, by document: its name, the place its node gives it, its mesh
+        /// and the materials the file gives the mesh. A model changed in Blender reaches its saved prefabs that way;
+        /// everything else (colliders, children, the renderer's other members) is the saved prefab's.
+        /// </summary>
+        private static readonly (string Document, string[] Members)[] FileMembers =
+        {
+            ("Entity", new[] { "Name" }),
+            ("Transform", new[] { "Position", "Rotation", "Scale" }),
+            ("MeshRenderer", new[] { "Mesh", "Materials" }),
+        };
+
+        /// <summary>
+        /// <paramref name="saved"/> with the root's <see cref="FileMembers"/> as in <paramref name="made"/>, the prefab
+        /// this import makes. Works on the text as EntitySerializer writes it (Import may run on a worker, where no
+        /// entity may be made): a document per entity and component after a "---" line, the members two spaces in.
+        /// A member the file's prefab lacks is taken out, one the saved prefab lacks is added; a document the saved
+        /// prefab took off (its renderer) stays off. UIDs stay the saved prefab's, which its children refer to.
+        /// </summary>
+        internal static string WithFileMembers(string saved, string made)
+        {
+            var savedDocuments = SplitDocuments(saved);
+            var madeDocuments = SplitDocuments(made);
+
+            foreach (var (document, members) in FileMembers)
+            {
+                var into = RootDocument(savedDocuments, document);
+                var from = RootDocument(madeDocuments, document);
+                if (into == null || from == null) continue;
+
+                foreach (var member in members)
+                {
+                    var (start, count) = FindMember(into, member);
+                    if (start >= 0) into.RemoveRange(start, count);
+
+                    var (fromStart, fromCount) = FindMember(from, member);
+                    if (fromStart >= 0)
+                        into.InsertRange(start >= 0 ? start : into.Count, from.GetRange(fromStart, fromCount));
+                }
+            }
+
+            var text = new StringBuilder();
+            foreach (var document in savedDocuments)
+            {
+                text.Append("---\n");
+                foreach (var line in document) text.Append(line).Append('\n');
+            }
+            return text.ToString();
+        }
+
+        // The documents of a prefab's YAML, each as its lines without the "---" before it
+        private static List<List<string>> SplitDocuments(string yaml)
+        {
+            var documents = new List<List<string>>();
+            List<string>? document = null;
+            foreach (var raw in yaml.TrimStart('﻿').Split('\n'))
+            {
+                var line = raw.TrimEnd('\r');
+                if (line.Trim() == "---")
+                {
+                    documents.Add(document = new List<string>());
+                    continue;
+                }
+                if (document == null)
+                {
+                    if (line.Trim().Length == 0) continue;
+                    documents.Add(document = new List<string>());
+                }
+                document.Add(line);
+            }
+
+            foreach (var d in documents)
+                while (d.Count > 0 && d[^1].Trim().Length == 0) d.RemoveAt(d.Count - 1);
+            documents.RemoveAll(d => d.Count == 0);
+            return documents;
+        }
+
+        // The document of that type among the root entity's: those from the first Entity document up to the next one
+        private static List<string>? RootDocument(List<List<string>> documents, string type)
+        {
+            int entities = 0;
+            foreach (var document in documents)
+            {
+                var header = document[0].Trim().TrimEnd(':');
+                if (header == "Entity" && ++entities > 1) break;
+                if (entities == 1 && header == type) return document;
+            }
+            return null;
+        }
+
+        // A member's lines in a document: its own and those below it up to the next member. (-1, 0) when it has none.
+        private static (int Start, int Count) FindMember(List<string> document, string member)
+        {
+            for (int i = 1; i < document.Count; i++)
+            {
+                if (!IsMemberLine(document[i])) continue;
+                int colon = document[i].IndexOf(':');
+                if (colon < 0 || document[i][..colon].Trim() != member) continue;
+
+                int end = i + 1;
+                while (end < document.Count && !IsMemberLine(document[end])) end++;
+                return (i, end - i);
+            }
+            return (-1, 0);
+        }
+
+        // A key of the document's mapping: two spaces in. A list's items ("  - ...") and anything further in belong
+        // to the key above them.
+        private static bool IsMemberLine(string line) =>
+            line.Length > 2 && line[0] == ' ' && line[1] == ' ' && line[2] != ' ' && line[2] != '-';
 
         /// <summary>
         /// Parse mesh data only (CPU arrays, no GPU). Thread-safe.

@@ -51,12 +51,86 @@ namespace Freefall.Editor.Mcp
             return EditorTools.Text(System.Text.Json.JsonSerializer.SerializeToNode(Commands.PublishScanCommand.Summary(found!, task.Result))!);
         }
 
+        [McpServerTool(Name = "publish_changes", Title = "What a push to itch.io would change", Idempotent = true, OpenWorld = false)]
+        [Description("What the next push of a BuildProfile to itch.io would bring testers since they last updated: the build compared with " +
+                     "the channel's last push (its snapshot in Library/Itch; the first time, the build still in the output folder). Assets " +
+                     "added, changed and removed by type and name, the project's scripts added, changed and removed, and the version the push " +
+                     "would go out as. Scans and hashes the Cache files on a worker (seconds); nothing is published or saved. The raw material " +
+                     "for the version's Patch Notes entry, which is written for players, not as this list.")]
+        public static async Task<CallToolResult> Changes(
+            [Description("The BuildProfile asset's GUID, or its path relative to Assets")] string profile,
+            [Description("Names listed per type and kind of change; the rest are counted")] int maxNames = 40)
+        {
+            BuildProfile p;
+            string assets, library;
+            try
+            {
+                (p, assets, library) = await EditorCommandServer.Instance.RunOnMainThread(() =>
+                {
+                    var found = BuildProfile.Find(profile) ?? throw new InvalidOperationException($"No BuildProfile asset at {profile}");
+                    if (Publisher.IsPublishing) throw new InvalidOperationException("A publish is running: ask again when it is done");
+                    if (Engine.Project == null) throw new InvalidOperationException("No project is open");
+                    return (found, Engine.Project.AssetsDirectory, Engine.Project.LibraryDirectory);
+                });
+            }
+            catch (Exception ex)
+            {
+                return McpBridge.Error(ex.GetBaseException().Message);
+            }
+
+            BuildChanges changes;
+            try
+            {
+                changes = await Task.Run(() =>
+                {
+                    var scan = DependencyScanner.Scan(p);
+                    var previous = BuildSnapshot.Load(BuildSnapshot.PathFor(p, library))
+                                   ?? BuildSnapshot.FromBuild(p.ResolvedOutputFolder, assets, p.Version);
+                    var next = BuildSnapshot.FromScan(scan, assets, ItchUpload.NextVersion(p.Version));
+                    return BuildSnapshot.Compare(previous, next);
+                });
+            }
+            catch (Exception ex)
+            {
+                return McpBridge.Error("Comparing failed: " + ex.GetBaseException().Message);
+            }
+
+            JsonNode Groups(System.Collections.Generic.List<BuildSnapshot.Item> items) => new JsonArray(items
+                .GroupBy(i => i.Type).OrderByDescending(g => g.Count())
+                .Select(g =>
+                {
+                    var names = g.Select(i => i.Name).Distinct().OrderBy(n => n).ToList();
+                    return (JsonNode)new JsonObject
+                    {
+                        ["type"] = g.Key, ["count"] = g.Count(),
+                        ["names"] = new JsonArray(names.Take(maxNames).Select(n => (JsonNode)n).ToArray()),
+                        ["more"] = Math.Max(0, names.Count - maxNames),
+                    };
+                }).ToArray());
+            JsonNode List(System.Collections.Generic.List<string> paths) => new JsonArray(paths.OrderBy(x => x).Select(x => (JsonNode)x).ToArray());
+
+            return EditorTools.Text(new JsonObject
+            {
+                ["from"] = changes.From,
+                ["to"] = changes.To,
+                ["firstPush"] = changes.First,
+                ["summary"] = changes.Short,
+                ["scriptsAdded"] = List(changes.ScriptsAdded),
+                ["scriptsChanged"] = List(changes.ScriptsChanged),
+                ["scriptsRemoved"] = List(changes.ScriptsRemoved),
+                ["added"] = Groups(changes.Added),
+                ["changed"] = Groups(changes.Changed),
+                ["removed"] = Groups(changes.Removed),
+            });
+        }
+
         [McpServerTool(Name = "game_publish", Title = "Publish a build profile's game", OpenWorld = false)]
         [Description("Write a BuildProfile's game into its output folder (or 'output'), ready to run, as the profile's Publish button does: " +
                      "scan, compile the scripts (Release), build the player (dotnet publish, win-x64, self-contained; kept in the project's " +
                      "Library between publishes), copy it with the exe named after the product, write the packs and the manifest into Data/, " +
                      "and append a summary to the build report next to the folder; with the profile's MakeInstaller (or installer=true) also " +
-                     "an Inno Setup installer in '<output> Installer'. The editor shows its modal progress popup meanwhile, and a " +
+                     "an Inno Setup installer in '<output> Installer'; with the profile's UploadToItch (or itch=true) a butler push of the folder to " +
+                     "its ItchTarget:ItchChannel (butler must be logged in). The editor shows its modal progress popup meanwhile, and a " +
                      "popup on failure. Everything a publish wrote in the folder before is replaced; a non-empty folder without .freefall-build " +
                      "is refused. Changed assets the build reaches stop it unless saveChanged. Gigabytes: this call waits up to waitSeconds; " +
                      "editor_status reports the step meanwhile.")]
@@ -67,6 +141,7 @@ namespace Freefall.Editor.Mcp
             [Description("Save the changed assets the build reaches first (as Save Changed Assets does)")] bool saveChanged = false,
             [Description("Start the game once it is written")] bool run = false,
             [Description("Make the installer (Inno Setup 6) or not, whatever the profile's MakeInstaller says; omit = the profile's setting")] bool? installer = null,
+            [Description("Push to itch.io with butler or not, whatever the profile's UploadToItch says; omit = the profile's setting")] bool? itch = null,
             [Description("Max seconds to wait")] int waitSeconds = 900)
         {
             Task<PublishResult> task;
@@ -75,7 +150,7 @@ namespace Freefall.Editor.Mcp
                 task = await EditorCommandServer.Instance.RunOnMainThread(() =>
                 {
                     var p = BuildProfile.Find(profile) ?? throw new InvalidOperationException($"No BuildProfile asset at {profile}");
-                    return Publisher.Start(p, new PublishOptions { Output = output, Verify = verify, SaveChanged = saveChanged, Run = run, Installer = installer });
+                    return Publisher.Start(p, new PublishOptions { Output = output, Verify = verify, SaveChanged = saveChanged, Run = run, Installer = installer, Itch = itch });
                 });
             }
             catch (Exception ex)
@@ -117,6 +192,8 @@ namespace Freefall.Editor.Mcp
                 ["verified"] = r.Packs.Verified,
                 ["mismatches"] = r.Packs.Mismatches,
                 ["installer"] = r.Installer.Length > 0 ? new JsonObject { ["setup"] = r.Installer, ["size"] = BuildScan.Size(r.InstallerBytes) } : null,
+                ["itch"] = r.Itch.Length > 0 ? r.Itch : null,
+                ["changes"] = r.Changes != null ? new JsonObject { ["summary"] = r.Changes.Short, ["file"] = r.ChangesFile } : null,
                 ["warnings"] = new JsonArray(r.Warnings.Take(30).Select(w => (JsonNode)w).ToArray()),
             });
         }

@@ -40,6 +40,17 @@ namespace Freefall.Editor.Publishing
         [Description("Who makes the game, in Apps & features. Empty = none")]
         public string Company = "";
 
+        [Category("itch.io")]
+        [Description("After Publish, push the game to itch.io with butler (the itch app's, or FREEFALL_BUTLER): only what changed since the channel's last build " +
+                     "is uploaded, and the itch app updates the copies installed from it. butler has to be logged in once (butler login)")]
+        public bool UploadToItch;
+
+        [Description("The itch.io project, user/game (its page is user.itch.io/game). Restricted, it is seen only by people with a download key")]
+        public string ItchTarget = "";
+
+        [Description("The channel the build goes to, one per kind of build (windows, windows-nightly); testers install from one. The build is tagged with Version")]
+        public string ItchChannel = "windows";
+
         /// <summary>The scan's textures against <see cref="TextureBudget"/>, or null when it is 0. Worker-safe.</summary>
         public TextureBudgetResult? MeasureTextures(BuildScan scan, Action<string, float>? report = null) =>
             TextureBudget > 0 ? TextureBudgetScan.Measure(scan, TextureBudget, TexelDensityTarget, report) : null;

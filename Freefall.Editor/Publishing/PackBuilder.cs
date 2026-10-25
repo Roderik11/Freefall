@@ -47,6 +47,7 @@ namespace Freefall.Editor.Publishing
                 Manifest = new PackManifest
                 {
                     Product = profile.ResolvedProductName,
+                    BuildVersion = string.IsNullOrWhiteSpace(profile.Version) ? null : profile.Version.Trim(),
                     Created = DateTime.UtcNow,
                     Scenes = scan.Artifacts.Where(a => a.Root != null && a.DataType == nameof(SceneData)).Select(a => a.Guid).ToList(),
                     EnginePack = EngineFiles.PackFile,

@@ -18,6 +18,8 @@ namespace Freefall.Assets.Packs
 
         public int Version { get; set; } = CurrentVersion;
         public string Product { get; set; }
+        /// <summary>The build's version, the BuildProfile's when it was published ("0.1.3"); null in builds before it was written.</summary>
+        public string BuildVersion { get; set; }
         public DateTime Created { get; set; }
         public List<string> Scenes { get; set; } = new();
         public List<string> Packs { get; set; } = new();

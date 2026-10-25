@@ -70,6 +70,14 @@ namespace Freefall.Editor
 
                 if (string.IsNullOrEmpty(savePath))
                 {
+                    // A model file's prefab has no file of its own: it is kept with that file's import settings
+                    if (asset is Prefab prefab && Freefall.Assets.Importers.ModelImporter.SavePrefab(prefab))
+                    {
+                        saved++;
+                        Debug.Log($"[AssetCreator] Saved: {asset.Name} → its model's import settings");
+                        continue;
+                    }
+
                     Debug.Log($"[AssetCreator] Cannot save dirty asset '{asset.Name}': no source path");
                     continue;
                 }

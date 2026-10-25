@@ -673,7 +673,21 @@ namespace Freefall.Editor.Commands
             // GUID into the Assets root.
             string savePath = root.TryGetProperty("path", out var pp) ? pp.GetString() : null;
             if (string.IsNullOrEmpty(savePath))
+            {
                 savePath = AssetDatabase.GuidToFullPath(guid);
+
+                // A model file's prefab has no file of its own: it is kept with that file's import settings
+                if (string.IsNullOrEmpty(savePath) && asset is Prefab prefab && Freefall.Assets.Importers.ModelImporter.SavePrefab(prefab))
+                    return CommandResult.Json(new
+                    {
+                        status = "saved",
+                        path = AssetDatabase.GetMeta(guid)?.SourcePath,
+                        into = "the model's import settings",
+                        type = asset.GetType().Name,
+                        name = asset.Name,
+                        guid
+                    });
+            }
             if (string.IsNullOrEmpty(savePath))
                 return CommandResult.BadRequest(
                     $"'{asset.Name}' ({asset.GetType().Name}) has no source file of its own (a sub-asset of an imported file, or a built-in asset): pass 'path' to write it somewhere");

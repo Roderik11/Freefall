@@ -90,6 +90,11 @@ namespace Freefall.Components
             OutputEntity.Flags |= EntityFlags.DontSave;
             _generators[OutputEntity] = this;
 
+            // One static actor for the whole output: the colliders its prefabs carry become shapes of it (a body gathers
+            // the colliders below it when it wakes, after this run) instead of an actor each. A prefab with a body of its
+            // own keeps it. Nothing in the editor, and no actor at all when nothing spawned has a collider.
+            OutputEntity.AddComponent<RigidBody>();
+
             // 3. Inject context into nodes that need it
             InjectContext();
 

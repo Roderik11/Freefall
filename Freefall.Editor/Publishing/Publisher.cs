@@ -18,6 +18,8 @@ namespace Freefall.Editor.Publishing
         public bool Run;
         /// <summary>Make the installer (true) or not (false) whatever the profile says; null = the profile's MakeInstaller.</summary>
         public bool? Installer;
+        /// <summary>Push to itch.io (true) or not (false) whatever the profile says; null = the profile's UploadToItch.</summary>
+        public bool? Itch;
     }
 
     /// <summary>What a publish gave.</summary>
@@ -40,6 +42,11 @@ namespace Freefall.Editor.Publishing
         /// <summary>The installer's setup exe, when one was made; its .bin parts lie beside it when the game is over ~2 GB.</summary>
         public string Installer = "";
         public long InstallerBytes;
+        /// <summary>What butler said at the end of the push to itch.io, when there was one.</summary>
+        public string Itch = "";
+        /// <summary>A push's changes since the channel's last one (<see cref="BuildSnapshot"/>); the list is in <see cref="ChangesFile"/>.</summary>
+        public BuildChanges? Changes;
+        public string ChangesFile = "";
     }
 
     /// <summary>
@@ -56,6 +63,7 @@ namespace Freefall.Editor.Publishing
     /// <item>Writing packs (worker): the assets, then the engine's own files (Data/engine.ffpack: no Resources folder in the
     /// game's), then Verifying packs if asked.</item>
     /// <item>Building the installer (worker), when the profile asks for one (MakeInstaller): <see cref="InstallerBuild"/>.</item>
+    /// <item>Uploading to itch.io (worker), when the profile asks for it (UploadToItch): <see cref="ItchUpload"/>.</item>
     /// </list>
     /// The editor shows a modal progress popup (ModalDialogs, the landing page's) whoever started it, the profile's
     /// button or MCP game_publish. A failure shows a message popup. The summary goes to the console and the end of the
@@ -68,13 +76,13 @@ namespace Freefall.Editor.Publishing
 
         const string Checking = "Checking and scanning", Scripts = "Compiling scripts", Player = "Building the player",
                      Copying = "Copying the player", Packs = "Writing packs", Verifying = "Verifying packs",
-                     Installer = "Building the installer";
+                     Installer = "Building the installer", Itch = "Uploading to itch.io";
 
         // Seconds measured on Freefall-Solid's Game profile (4.7 GB), as weights for the overall fraction; the packs'
-        // weights are set from their size once the scan is done
+        // weights are set from their size once the scan is done. The upload's is a guess: it is only what changed
         static readonly Dictionary<string, double> Weights = new()
         {
-            [Checking] = 0.6, [Scripts] = 3, [Player] = 13, [Copying] = 2, [Packs] = 24, [Verifying] = 13, [Installer] = 20,
+            [Checking] = 0.6, [Scripts] = 3, [Player] = 13, [Copying] = 2, [Packs] = 24, [Verifying] = 13, [Installer] = 20, [Itch] = 30,
         };
         const double WriteBytesPerSecond = 200e6, VerifyBytesPerSecond = 370e6, InstallerBytesPerSecond = 150e6;
 
@@ -135,19 +143,57 @@ namespace Freefall.Editor.Publishing
                 iscc = InstallerBuild.FindCompiler() ?? throw new InvalidOperationException(
                     "The profile makes an installer, and Inno Setup 6 is not installed: install it (jrsoftware.org, or " +
                     "winget install JRSoftware.InnoSetup), set FREEFALL_ISCC to its ISCC.exe, or turn MakeInstaller off");
+            string? butler = null;
+            if (options.Itch ?? profile.UploadToItch)
+            {
+                butler = ItchUpload.FindButler() ?? throw new InvalidOperationException(
+                    "The profile uploads to itch.io, and there is no butler: install the itch app (it brings butler), put butler.exe on the PATH, " +
+                    "set FREEFALL_BUTLER to it, or turn UploadToItch off");
+                if (ItchUpload.Target(profile) == null)
+                    throw new InvalidOperationException($"The profile uploads to itch.io: set ItchTarget to the project as user/game (now \"{profile.ItchTarget}\")");
+                if (!ItchUpload.HasCredentials)
+                    throw new InvalidOperationException($"butler is not logged in to itch.io (no {ItchUpload.CredentialsFile}): run \"{butler}\" login once, " +
+                                                        "in a terminal, and confirm in the browser");
+            }
+
+            // A push goes out under the next version: the profile is saved with it, and put back if the push never happens
+            string? bumpedFrom = null;
+            if (butler != null)
+            {
+                bumpedFrom = profile.Version;
+                profile.Version = ItchUpload.NextVersion(profile.Version);
+                SaveProfile(profile);
+            }
             var steps = new List<string> { Checking, Scripts, Player, Copying, Packs };
             if (options.Verify) steps.Add(Verifying);
             if (iscc != null) steps.Add(Installer);
+            if (butler != null) steps.Add(Itch);
             var progress = ProgressJob.Start($"Publishing {product}", "Publish", steps.Select(s => (s, Weights[s])).ToArray());
             string scripts = Path.Combine(Engine.Project.LibraryDirectory, "Installer");
-            _completion = Task.Run(() => RunAsync(profile, options, output, playerProject, runtime, progress, iscc, scripts));
+            string snapshotPath = BuildSnapshot.PathFor(profile, Engine.Project.LibraryDirectory);
+            _completion = Task.Run(() => RunAsync(profile, options, output, playerProject, runtime, progress, iscc, scripts, butler, bumpedFrom, snapshotPath));
             return _completion;
         }
 
+        /// <summary>Where a push's change list goes: next to the build report.</summary>
+        public static string ChangesPathFor(string output) => output.TrimEnd('\\', '/') + ".changes.txt";
+
+        /// <summary>Main thread: the profile written to its file (its Version after a bump).</summary>
+        static void SaveProfile(BuildProfile profile)
+        {
+            var path = AssetDatabase.GuidToPath(profile.Guid);
+            if (string.IsNullOrEmpty(path) || Engine.Project == null)
+                throw new InvalidOperationException($"The profile {profile.Name} has no file to keep its version in");
+            Engine.Assets.SaveAsset(profile, Path.Combine(Engine.Project.AssetsDirectory, path));
+        }
+
         static async Task<PublishResult> RunAsync(BuildProfile profile, PublishOptions options, string output, string playerProject,
-                                                  (string Folder, string Version) runtime, ProgressJob progress, string? iscc, string installerScripts)
+                                                  (string Folder, string Version) runtime, ProgressJob progress, string? iscc, string installerScripts,
+                                                  string? butler, string? bumpedFrom, string snapshotPath)
         {
             var result = new PublishResult { Product = profile.ResolvedProductName, Output = output, Report = BuildProfile.ReportPathFor(output) };
+            BuildSnapshot? next = null;
+            bool pushed = false;
             void Report(string detail, float fraction) => progress.Report(detail, fraction);
             void SetWeight(string step, double weight) => progress.SetWeight(step, weight);
             Task Step(string name, Func<Task> work) => progress.Step(name, work);
@@ -203,6 +249,18 @@ namespace Freefall.Editor.Publishing
                         SetWeight(Packs, bytes / WriteBytesPerSecond);
                         SetWeight(Verifying, bytes / VerifyBytesPerSecond);
                         SetWeight(Installer, bytes / InstallerBytesPerSecond);
+
+                        // What testers get since their last update: this build against the channel's last push (the first
+                        // time, against the build still in the output folder, read before the folder is cleared)
+                        if (butler != null)
+                        {
+                            Report("Comparing with the last push to itch.io", 0.85f);
+                            var previous = BuildSnapshot.Load(snapshotPath) ?? BuildSnapshot.FromBuild(output, assets, bumpedFrom ?? "");
+                            next = BuildSnapshot.FromScan(scan, assets, profile.Version, (d, f) => Report(d, 0.85f + 0.15f * f));
+                            result.Changes = BuildSnapshot.Compare(previous, next);
+                            result.ChangesFile = ChangesPathFor(output);
+                            File.WriteAllText(result.ChangesFile, result.Changes.Text());
+                        }
                     });
                 });
 
@@ -260,6 +318,14 @@ namespace Freefall.Editor.Publishing
                         result.InstallerBytes = Directory.GetFiles(folder, InstallerBuild.SetupName(result.Product) + "*").Sum(f => new FileInfo(f).Length);
                     }));
 
+                if (butler != null)
+                    await Step(Itch, () => Task.Run(() =>
+                    {
+                        result.Itch = ItchUpload.Push(butler, profile, output, Path.GetFileName(result.Exe), Report);
+                        pushed = true;
+                        next?.Save(snapshotPath);   // the next push compares with this one
+                    }));
+
                 result.Elapsed = progress.Elapsed;
                 result.Steps = progress.StepTimes;
                 File.AppendAllText(result.Report, Summary(result));
@@ -275,6 +341,13 @@ namespace Freefall.Editor.Publishing
             catch (Exception ex)
             {
                 var error = ProgressJob.Unwrap(ex);
+                // No tester got that version: the next push takes the number again
+                if (bumpedFrom != null && !pushed)
+                    await Engine.RunOnMainThreadAsync(() =>
+                    {
+                        profile.Version = bumpedFrom;
+                        try { SaveProfile(profile); } catch (Exception) { /* the profile shows the bumped number: harmless */ }
+                    });
                 await progress.Fail($"Could not publish {result.Product}", error);
                 throw error;
             }
@@ -352,6 +425,10 @@ namespace Freefall.Editor.Publishing
                 sb.AppendLine($"    {file}: {entries:N0} artifacts, {BuildScan.Size(bytes)}");
             if (r.Installer.Length > 0)
                 sb.AppendLine($"  Installer: {r.Installer}, {BuildScan.Size(r.InstallerBytes)}");
+            if (r.Itch.Length > 0)
+                sb.AppendLine($"  itch.io: {r.Itch}");
+            if (r.Changes != null)
+                sb.AppendLine($"  Changes: {r.Changes.Short} ({r.ChangesFile})");
             sb.AppendLine("  Steps:");
             foreach (var (step, seconds) in r.Steps)
                 sb.AppendLine($"    {seconds,6:0.0} s  {step}");
