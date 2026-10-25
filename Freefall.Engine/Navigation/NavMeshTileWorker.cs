@@ -57,7 +57,7 @@ namespace Freefall.Navigation
             /// <summary>Fraction of a cell height a span's end may be over a boundary and still count as on it.</summary>
             private const float OnBoundary = 0.01f;
 
-            // The NavMeshBlockers' volumes reaching into the cell, for Recast to clear after erosion
+            // The NavMeshAreas' and NavMeshBlockers' volumes reaching into the cell, for Recast to mark after erosion
             private readonly Blockers _blockers = new();
 
             public TileWorker(BakeContext context)
@@ -103,6 +103,13 @@ namespace Freefall.Navigation
                 }
 
                 hash = NavHash.Mix(NavHash.Mix(hash, instanceHash), (ulong)(end - first));
+
+                // The NavMeshAreas reaching into the cell (summed as the instances are)
+                ulong areaHash = 0;
+                foreach (var area in c.Input.Areas)
+                    if (area.Max.X >= minX && area.Min.X <= maxX && area.Max.Y >= minZ && area.Min.Y <= maxZ)
+                        areaHash += area.Hash;
+                if (areaHash != 0) hash = NavHash.Mix(hash, areaHash);
                 if (hash == 0) hash = 1;
                 tiles.Hashes[cell] = hash;
 
@@ -137,7 +144,20 @@ namespace Freefall.Navigation
                 _solid = solid;
 
                 RasterizeTerrain();
+
+                // Areas first: Recast marks the volumes in turn, and a blocker in a house clears what the house marked
                 _blockers.Volumes.Clear();
+                foreach (var area in c.Input.Areas)
+                {
+                    if (area.Max.X < minX || area.Min.X > maxX || area.Max.Y < minZ || area.Min.Y > maxZ) continue;
+                    _blockers.Volumes.Add(new RcConvexVolume
+                    {
+                        verts = area.Verts,
+                        hmin = area.YMin,
+                        hmax = area.YMax,
+                        areaMod = new RcAreaModification(area.Area),
+                    });
+                }
                 for (int i = first; i < end; i++)
                 {
                     ref readonly var instance = ref instances[c.CellItems[i]];
@@ -166,9 +186,9 @@ namespace Freefall.Navigation
                 if (polyMesh == null || polyMesh.npolys == 0)
                     return CellResult.Rebuilt;
 
-                // Recast leaves poly flags at 0 — set the walkable flag so queries find them
+                // Recast leaves poly flags at 0: walkable, or indoors (NavMeshArea), for the queries' filters
                 for (int i = 0; i < polyMesh.npolys; i++)
-                    polyMesh.flags[i] = 1;
+                    polyMesh.flags[i] = polyMesh.areas[i] == Base.NavMeshWorld.IndoorsArea ? Base.NavMeshWorld.IndoorsFlag : Base.NavMeshWorld.WalkFlag;
 
                 var detail = result.MeshDetail;
                 var create = new DtNavMeshCreateParams

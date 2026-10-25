@@ -524,8 +524,8 @@ namespace Freefall.Navigation
 
         /// <summary>
         /// Recast asks its geometry provider for convex volumes after rasterization and erosion, and
-        /// clears their area: the NavMeshBlockers of one cell. The triangles are rasterized by
-        /// TileWorker, so there is nothing else to provide.
+        /// marks their area: the NavMeshAreas of one cell (indoors), then its NavMeshBlockers (cleared).
+        /// The triangles are rasterized by TileWorker, so there is nothing else to provide.
         /// </summary>
         private sealed class Blockers : IRcInputGeomProvider
         {

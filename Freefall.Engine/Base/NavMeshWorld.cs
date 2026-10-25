@@ -21,7 +21,39 @@ namespace Freefall.Base
         // Half-extents for navmesh point queries (search volume)
         private static readonly RcVec3f QueryExtents = new(2f, 4f, 2f);
 
-        private static readonly IDtQueryFilter DefaultFilter = new DtQueryDefaultFilter();
+        /// <summary>Recast area ids a bake gives: walkable ground, and a building's ground floor (NavMeshArea Indoors).</summary>
+        public const int WalkArea = 1, IndoorsArea = 2;
+
+        /// <summary>Polygon flags a bake gives, by area: what the query filters include and exclude.</summary>
+        public const int WalkFlag = 1, IndoorsFlag = 2;
+
+        /// <summary>
+        /// What a metre indoors costs a way against a metre outdoors. Indoors is walkable, and a way that ends there
+        /// goes in at the nearest door; one that only passes goes round by the street unless that is this much longer
+        /// (a house a few metres deep against a detour round its block).
+        /// </summary>
+        public const float IndoorsCost = 20f;
+
+        // Ways go anywhere, indoors at its cost; points a body is put at keep outdoors (a pilgrim the crowd put on "the
+        // nearest navmesh" stood in somebody's front room, 2026-10-25)
+        private static readonly IDtQueryFilter DefaultFilter = Costly();
+        private static readonly IDtQueryFilter OutdoorsFilter = Outdoors();
+
+        // Every area at 1 a metre but indoors (Detour's DT_MAX_AREAS of them)
+        private static DtQueryDefaultFilter Costly()
+        {
+            var costs = new float[64];
+            Array.Fill(costs, 1f);
+            costs[IndoorsArea] = IndoorsCost;
+            return new DtQueryDefaultFilter(0xffff, 0, costs);
+        }
+
+        private static DtQueryDefaultFilter Outdoors()
+        {
+            var filter = new DtQueryDefaultFilter();
+            filter.SetExcludeFlags(IndoorsFlag);
+            return filter;
+        }
 
         /// <summary>
         /// Most polygons one <see cref="FindPath"/> looks at. DotRecast's node pool grows without bound (C++ Detour's
@@ -48,7 +80,7 @@ namespace Freefall.Base
 
             // Create crowd with sane defaults
             var crowdCfg = new DtCrowdConfig(0.6f); // max agent radius
-            _crowd = new DtCrowd(crowdCfg, navMesh);
+            _crowd = new DtCrowd(crowdCfg, navMesh, _ => Costly());   // its agents' ways as FindPath's
 
             // Log navmesh bounds for diagnostics
             float minX = float.MaxValue, minY = float.MaxValue, minZ = float.MaxValue;
@@ -100,6 +132,7 @@ namespace Freefall.Base
         /// Find a path between two world positions.
         /// Returns smoothed waypoint list, or empty if no path found. The search stops after
         /// <see cref="MaxSearchNodes"/> polygons; a target out of reach gets the way to the nearest the search came.
+        /// Indoors (NavMeshArea) costs <see cref="IndoorsCost"/> times as much a metre.
         /// </summary>
         public static List<Vector3> FindPath(Vector3 from, Vector3 to)
         {
@@ -108,17 +141,18 @@ namespace Freefall.Base
 
             var startPos = ToRc(from);
             var endPos = ToRc(to);
+            var filter = DefaultFilter;
 
-            _navQuery.FindNearestPoly(startPos, QueryExtents, DefaultFilter,
+            _navQuery.FindNearestPoly(startPos, QueryExtents, filter,
                 out long startRef, out var startPt, out _);
-            _navQuery.FindNearestPoly(endPos, QueryExtents, DefaultFilter,
+            _navQuery.FindNearestPoly(endPos, QueryExtents, filter,
                 out long endRef, out var endPt, out _);
 
             if (startRef == 0 || endRef == 0) return result;
 
             // Find polygon path, by a sliced search so that it stops after MaxSearchNodes (see there)
             var pathPolys = new long[256];
-            _navQuery.InitSlicedFindPath(startRef, endRef, startPt, endPt, DefaultFilter, 0);
+            _navQuery.InitSlicedFindPath(startRef, endRef, startPt, endPt, filter, 0);
             var searched = _navQuery.UpdateSlicedFindPath(MaxSearchNodes, out _);
             if (searched.InProgress() && !_cappedLogged)
             {
@@ -143,14 +177,17 @@ namespace Freefall.Base
             return result;
         }
 
-        /// <summary>Find the nearest valid navmesh point to a world position.</summary>
-        public static bool SamplePosition(Vector3 position, float radius, out Vector3 result)
+        /// <summary>
+        /// Find the nearest valid navmesh point to a world position. With <paramref name="outdoors"/>, never on a
+        /// building's ground floor (NavMeshArea): for putting a body somewhere.
+        /// </summary>
+        public static bool SamplePosition(Vector3 position, float radius, out Vector3 result, bool outdoors = false)
         {
             result = position;
             if (_navQuery == null) return false;
 
             var extents = new RcVec3f(radius, radius, radius);
-            var status = _navQuery.FindNearestPoly(ToRc(position), extents, DefaultFilter,
+            var status = _navQuery.FindNearestPoly(ToRc(position), extents, outdoors ? OutdoorsFilter : DefaultFilter,
                 out long polyRef, out var nearestPt, out _);
 
             if (status.Failed() || polyRef == 0) return false;
@@ -174,24 +211,27 @@ namespace Freefall.Base
         /// off stood still at their posts (2026-10-24). Where no way gets into the circle, the
         /// point is as near as one leads.
         /// </para>
+        /// Outdoors only: the spread does not go through a building's ground floor (NavMeshArea), and the point is
+        /// never on one. A walk about the town ends in the street, and a body put down stands there.
         /// </summary>
         public static bool RandomReachablePoint(Vector3 from, Vector3 center, float radius, out Vector3 point)
         {
             point = from;
             if (_navQuery == null) return false;
 
-            _navQuery.FindNearestPoly(ToRc(from), QueryExtents, DefaultFilter,
+            var filter = OutdoorsFilter;
+            _navQuery.FindNearestPoly(ToRc(from), QueryExtents, filter,
                 out long startRef, out var startPt, out _);
             if (startRef == 0) return false;
 
             var away = from - center;
             if (away.X * away.X + away.Z * away.Z > radius * radius)
             {
-                _navQuery.FindNearestPoly(ToRc(center), QueryExtents, DefaultFilter,
+                _navQuery.FindNearestPoly(ToRc(center), QueryExtents, filter,
                     out long centerRef, out var centerPt, out _);
                 if (centerRef == 0) return false;
 
-                _navQuery.InitSlicedFindPath(startRef, centerRef, startPt, centerPt, DefaultFilter, 0);
+                _navQuery.InitSlicedFindPath(startRef, centerRef, startPt, centerPt, filter, 0);
                 _navQuery.UpdateSlicedFindPath(MaxSearchNodes, out _);
                 _navQuery.FinalizeSlicedFindPath(WayPolys, out int count, WayPolys.Length);
                 if (count == 0) return false;
@@ -200,7 +240,7 @@ namespace Freefall.Base
 
             // Spreads from that polygon over its neighbours, as far as the circle reaches
             var status = _navQuery.FindRandomPointAroundCircle(startRef, ToRc(center), radius,
-                DefaultFilter, RandomSource, out long randomRef, out var randomPt);
+                filter, RandomSource, out long randomRef, out var randomPt);
             if (status.Failed() || randomRef == 0) return false;
 
             point = FromRc(randomPt);
@@ -243,6 +283,27 @@ namespace Freefall.Base
         internal static void RemoveCrowdAgent(DtCrowdAgent agent)
         {
             _crowd?.RemoveAgent(agent);
+        }
+
+        /// <summary>
+        /// An agent the crowd has given up on (its state invalid: where it was added, or once stood, the crowd found no
+        /// polygon within its own reach of a little over its radius) is put on the nearest polygon within
+        /// <see cref="QueryExtents"/> of <paramref name="position"/>, and walks again. The crowd never does this itself:
+        /// an invalid agent is left out of every update from then on. False where no polygon is that near.
+        /// </summary>
+        internal static bool PlaceAgent(DtCrowdAgent agent, Vector3 position)
+        {
+            if (_crowd == null) return false;
+            _crowd.GetNavMeshQuery().FindNearestPoly(ToRc(position), QueryExtents, _crowd.GetFilter(0),
+                out long polyRef, out var nearest, out _);
+            if (polyRef == 0) return false;
+
+            agent.corridor.Reset(polyRef, nearest);
+            agent.boundary.Reset();
+            agent.partial = false;
+            agent.npos = nearest;
+            agent.state = DtCrowdAgentState.DT_CROWDAGENT_STATE_WALKING;
+            return true;
         }
 
         /// <summary>

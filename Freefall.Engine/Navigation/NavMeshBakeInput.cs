@@ -339,6 +339,16 @@ namespace Freefall.Navigation
         public Vector3 Min, Max;
     }
 
+    /// <summary>A NavMeshArea's box as the bake has it: its outline on the ground (four corners, x and z), its height range.</summary>
+    internal sealed class AreaVolume
+    {
+        public float[] Verts = [];   // x, y, z of each corner, y the bottom
+        public float YMin, YMax;
+        public Vector2 Min, Max;     // level bounds
+        public int Area;             // Recast area id
+        public ulong Hash;
+    }
+
     /// <summary>
     /// Everything a bake reads from the scene, captured on the main thread so the bake itself can
     /// run on worker threads. Holds references to mesh and height arrays, never copies of them.
@@ -348,6 +358,7 @@ namespace Freefall.Navigation
         public readonly List<TerrainSource> Terrains = [];
         public readonly List<MeshGeometry> Geometries = [];
         public MeshInstance[] Instances = [];
+        public readonly List<AreaVolume> Areas = [];
 
         public static NavMeshBakeInput Collect()
         {
@@ -411,6 +422,43 @@ namespace Freefall.Navigation
             }
 
             input.Instances = instances.ToArray();
+
+            // The NavMeshAreas' boxes: their outlines on the ground and their height ranges in world space
+            foreach (var area in ComponentCache<NavMeshArea>.All)
+            {
+                if (area.Entity == null || !area.Enabled || area.Transform == null) continue;
+                var m = area.Transform.WorldMatrix;
+                var half = area.Size * 0.5f;
+                var verts = new float[12];
+                float yMin = float.MaxValue, yMax = float.MinValue;
+                var min = new Vector2(float.MaxValue);
+                var max = new Vector2(float.MinValue);
+                for (int k = 0; k < 8; k++)
+                {
+                    var corner = Vector3.Transform(area.Center + half * new Vector3((k & 1) != 0 ? 1 : -1, (k & 2) != 0 ? 1 : -1, (k & 4) != 0 ? 1 : -1), m);
+                    yMin = MathF.Min(yMin, corner.Y);
+                    yMax = MathF.Max(yMax, corner.Y);
+                    min = Vector2.Min(min, new Vector2(corner.X, corner.Z));
+                    max = Vector2.Max(max, new Vector2(corner.X, corner.Z));
+                }
+                // The outline: the box's bottom corners in turn round it (x−z−, x+z−, x+z+, x−z+)
+                ReadOnlySpan<(int x, int z)> round = [(-1, -1), (1, -1), (1, 1), (-1, 1)];
+                for (int k = 0; k < 4; k++)
+                {
+                    var corner = Vector3.Transform(area.Center + half * new Vector3(round[k].x, -1, round[k].z), m);
+                    verts[k * 3] = corner.X;
+                    verts[k * 3 + 1] = yMin;
+                    verts[k * 3 + 2] = corner.Z;
+                }
+
+                ulong hash = NavHash.Bytes(0xA4EAUL + (ulong)area.Kind, MemoryMarshal.AsBytes(new ReadOnlySpan<float>(verts)));
+                hash = NavHash.Mix(hash, ((ulong)BitConverter.SingleToUInt32Bits(yMin) << 32) | BitConverter.SingleToUInt32Bits(yMax));
+                input.Areas.Add(new AreaVolume
+                {
+                    Verts = verts, YMin = yMin, YMax = yMax, Min = min, Max = max,
+                    Area = Base.NavMeshWorld.IndoorsArea, Hash = hash,
+                });
+            }
             return input;
         }
 
