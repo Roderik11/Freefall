@@ -156,6 +156,19 @@ namespace Freefall.Animation
             pb.Set(PK.State(ID, PK.Entered), 1);
         }
 
+        /// <summary>
+        /// A loop taken up at a point of its cycle of its own, <paramref name="phase"/> (0..1) past
+        /// its <see cref="Start"/>: a character that comes into being idles out of step with the
+        /// next (<see cref="Animator.Variation"/>). A one-shot stays where it is.
+        /// </summary>
+        internal virtual void Scatter(AnimationPlayback pb, float phase)
+        {
+            var clip = pb.ClipOf(this);
+            if (!Loop || clip == null) return;
+            float at = Math.Clamp(pb.StartOf(this), 0f, 1f) + phase;
+            SetTimeElapsed(pb, clip.DurationSeconds * (at - MathF.Floor(at)));
+        }
+
         /// <summary>Whether the state plays left for right on one Animator: its own flag, turned round by a choice made when it was entered.</summary>
         internal bool IsMirrored(AnimationPlayback pb) => Mirror != pb.GetBool(PK.State(ID, PK.Mirrored));
 
@@ -275,7 +288,8 @@ namespace Freefall.Animation
 
             float before = GetTimeElapsed(pb);
             float timeElapsed = before;
-            float step = (animator?.StepDelta ?? Base.Time.SmoothDelta) * Speed * rate * (animator?.SpeedFactor(SpeedParameter) ?? 1f);
+            float step = (animator?.StepDelta ?? Base.Time.SmoothDelta) * Speed * rate * (animator?.SpeedFactor(SpeedParameter) ?? 1f)
+                         * (animator?.PlaySpeed ?? 1f);
             int wraps = 0;
 
             if (Loop)

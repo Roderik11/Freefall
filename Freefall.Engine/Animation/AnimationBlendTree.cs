@@ -91,6 +91,13 @@ namespace Freefall.Animation
                 Layers[i].Animation.Enter(animator, pb, fromPhase);
         }
 
+        /// <summary>Every child taken up at the same point of its cycle past its own start: they stay lined up.</summary>
+        internal override void Scatter(AnimationPlayback pb, float phase)
+        {
+            for (int i = 0; i < Layers.Count; i++)
+                Layers[i].Animation.Scatter(pb, phase);
+        }
+
         internal override bool Plays(AnimationPlayback pb)
         {
             for (int i = 0; i < Layers.Count; i++)

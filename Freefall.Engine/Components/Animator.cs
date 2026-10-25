@@ -30,6 +30,39 @@ namespace Freefall.Components
         /// <summary>Per-instance mutable state (time, weights, parameters).</summary>
         public readonly AnimationPlayback Playback = new();
 
+        /// <summary>
+        /// How fast this character plays all its clips, and so how fast its root motion carries it
+        /// (1 = as made). For a script that paces one character against others: one of a pair
+        /// keeping step with the other.
+        /// </summary>
+        public float Speed = 1f;
+
+        /// <summary>
+        /// Characters on the same clips do not move as one: each plays them up to this fraction
+        /// faster or slower than <see cref="Speed"/> (0.05: ±5 %), and starts the loop it begins
+        /// in at a point of its own, both drawn from its entity (the same every run). 0: all alike,
+        /// from the loop's start. Without it, NPCs that came into being or set off on the same
+        /// frame walked and idled in step, a group like clones of each other.
+        /// </summary>
+        public float Variation;
+
+        // Its own share of Variation (-1..1) and the point of the loop it began in, from its entity; whether that is set
+        private float _paceShare;
+        private bool _scattered;
+
+        /// <summary>What every clip's time goes by: <see cref="Speed"/> with this character's own share of <see cref="Variation"/>.</summary>
+        internal float PlaySpeed => Speed * (1f + Variation * _paceShare);
+
+        // 0..1 from the entity's id and a salt, the same every run
+        private float Share(ulong salt)
+        {
+            ulong x = ((Entity?.UID ?? 0) ^ salt) * 0x9E3779B97F4A7C15UL;
+            x ^= x >> 31;
+            x *= 0xBF58476D1CE4E5B9UL;
+            x ^= x >> 29;
+            return (x >> 40) / (float)(1UL << 24);
+        }
+
         private Skeleton _retargetSource;
 
         /// <summary>
@@ -387,8 +420,22 @@ namespace Freefall.Components
             else
             {
                 _previewClip = null;
+                if (!_scattered) Scatter();
                 UpdateLayers();
             }
+        }
+
+        /// <summary>
+        /// The first step: this character's share of <see cref="Variation"/>, and with one, the
+        /// loop each layer begins in taken up at a point of its own.
+        /// </summary>
+        private void Scatter()
+        {
+            _scattered = true;
+            _paceShare = Share(0x5BEEDu) * 2f - 1f;
+            if (Variation <= 0f) return;
+            for (int i = 0; i < Animation.Layers.Count; i++)
+                Animation.Layers[i].GetCurrent(Playback)?.Scatter(Playback, Share(0xF4A5Eu + (ulong)i));
         }
 
         /// <summary>
