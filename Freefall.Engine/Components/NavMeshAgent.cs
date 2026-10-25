@@ -75,6 +75,21 @@ namespace Freefall.Components
         [DontSerialize]
         public float Stalled { get; private set; }
 
+        /// <summary>
+        /// The crowd is still looking for its way (Detour's target states requesting, waiting for the queue, waiting for
+        /// the path). Meanwhile it goes along the quick search's way, and it does not count as stalled.
+        /// </summary>
+        [DontSerialize]
+        public bool Planning => HasPath && _crowdAgent != null && _crowdAgent.targetState is DtMoveRequestState.DT_CROWDAGENT_TARGET_REQUESTING
+            or DtMoveRequestState.DT_CROWDAGENT_TARGET_WAITING_FOR_QUEUE or DtMoveRequestState.DT_CROWDAGENT_TARGET_WAITING_FOR_PATH;
+
+        /// <summary>Seconds it has been Planning this time, 0 when not; the longest since it joined the crowd in LongestPlanning.</summary>
+        [DontSerialize]
+        public float PlanningFor { get; private set; }
+
+        [DontSerialize]
+        public float LongestPlanning { get; private set; }
+
         /// <summary>How often the crowd's agent was put again where its transform stands, or back on the navmesh (see Update).</summary>
         [DontSerialize]
         public int Reseated { get; private set; }
@@ -338,7 +353,12 @@ namespace Freefall.Components
             var crowdPos = NavMeshWorld.FromRc(_crowdAgent.npos);
             var crowdVel = NavMeshWorld.FromRc(_crowdAgent.vel);
 
-            // Without a path it is going nowhere, whatever speed the crowd still has it at
+            // Without a path it is going nowhere, whatever speed the crowd still has it at. While its way is being looked
+            // for (Planning) it goes on along the one it has: told to stand for that, road walkers, who aim anew every
+            // half second, stopped and started their walks over and over and skidded along the road (2026-10-26)
+            bool planning = Planning;
+            PlanningFor = planning ? PlanningFor + Time.SmoothDelta : 0f;
+            if (PlanningFor > LongestPlanning) LongestPlanning = PlanningFor;
             Position = crowdPos;
             Velocity = HasPath ? crowdVel : Vector3.Zero;
             IsMoving = HasPath && crowdVel.LengthSquared() > 0.0001f;
@@ -405,14 +425,15 @@ namespace Freefall.Components
             }
 
             // Headway: how long it has had a way to go and its transform has stayed where it was (Stalled). Asked for
-            // a new destination it keeps counting: a brain that asks again every half second is no nearer for it.
+            // a new destination it keeps counting: a brain that asks again every half second is no nearer for it. Not
+            // while its way is still being looked for: that is waiting, not getting nowhere.
             var at = Transform.WorldPosition;
             if (!HasPath || Vector3.DistanceSquared(at, _headwayFrom) > StallWithin * StallWithin)
             {
                 _headwayFrom = at;
                 Stalled = 0f;
             }
-            else Stalled += Time.SmoothDelta;
+            else if (!planning) Stalled += Time.SmoothDelta;
         }
 
         /// <summary>

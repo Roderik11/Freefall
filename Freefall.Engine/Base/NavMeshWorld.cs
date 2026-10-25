@@ -29,10 +29,11 @@ namespace Freefall.Base
 
         /// <summary>
         /// What a metre indoors costs a way against a metre outdoors. Indoors is walkable, and a way that ends there
-        /// goes in at the nearest door; one that only passes goes round by the street unless that is this much longer
-        /// (a house a few metres deep against a detour round its block).
+        /// goes in at the nearest door; one that only passes goes round by the street unless that is this much longer.
+        /// 20 was too little: round one of Eldermoor's blocks is over 120 m, and walkers went in at a house's front door
+        /// and out at its back (2026-10-25).
         /// </summary>
-        public const float IndoorsCost = 20f;
+        public const float IndoorsCost = 1000f;
 
         // Ways go anywhere, indoors at its cost; points a body is put at keep outdoors (a pilgrim the crowd put on "the
         // nearest navmesh" stood in somebody's front room, 2026-10-25)
@@ -66,6 +67,18 @@ namespace Freefall.Base
 
         private static bool _cappedLogged;
 
+        /// <summary>
+        /// Polygons the crowd's queue of ways looks at in a frame, for every agent waiting for one together (DotRecast's
+        /// 100 by default), and in the quick search a new destination gets at once (its 20). A way across a town of
+        /// Eldermoor's size looks at well over a thousand: with seventy townsfolk asking, one waited seconds, walking
+        /// meanwhile the quick search's way, which ends where it got nearest the target, often just inside a house's
+        /// door; there it stood until its walk was given up and asked for again (2026-10-25).
+        /// </summary>
+        public const int PathStepsPerFrame = 500, QuickPathSteps = 48;
+
+        /// <summary>How many crowd targets were out of reach and given as the nearest point a way leads to (SetAgentTarget).</summary>
+        public static int OutOfReach { get; private set; }
+
         /// <summary>True if a navmesh is loaded and ready for queries.</summary>
         public static bool IsReady => _navMesh != null;
 
@@ -79,7 +92,11 @@ namespace Freefall.Base
             _cappedLogged = false;
 
             // Create crowd with sane defaults
-            var crowdCfg = new DtCrowdConfig(0.6f); // max agent radius
+            var crowdCfg = new DtCrowdConfig(0.6f) // max agent radius
+            {
+                maxFindPathIterations = PathStepsPerFrame,
+                maxTargetFindPathIterations = QuickPathSteps,
+            };
             _crowd = new DtCrowd(crowdCfg, navMesh, _ => Costly());   // its agents' ways as FindPath's
 
             // Log navmesh bounds for diagnostics
@@ -247,6 +264,59 @@ namespace Freefall.Base
             return true;
         }
 
+        /// <summary>
+        /// Where the nearest way out of a building's ground floor (NavMeshArea) comes out, within <paramref name="radius"/>
+        /// of <paramref name="from"/>: a point outdoors about <paramref name="beyond"/> metres past where the way leaves the
+        /// building, which a way from <paramref name="from"/> reaches. The nearest outdoors navmesh to a point indoors is
+        /// often behind a wall, in a yard or a gap between houses no way leads to, and a townsman sent there went as near
+        /// as a way led, into a corner of the room, for good (2026-10-25). From outdoors, the navmesh under
+        /// <paramref name="from"/>. False where there is no navmesh there, or no way out within the radius.
+        /// </summary>
+        public static bool WayOutdoors(Vector3 from, float radius, out Vector3 point, float beyond = 1.5f)
+        {
+            point = from;
+            if (_navQuery == null || _navMesh == null) return false;
+
+            _navQuery.FindNearestPoly(ToRc(from), QueryExtents, DefaultFilter, out long startRef, out var startPt, out _);
+            if (startRef == 0) return false;
+            if (!Indoors(startRef))
+            {
+                point = FromRc(startPt);
+                return true;
+            }
+
+            // Spreads over the polygons round it cheapest first, a metre indoors dear: the cheapest outdoors one is where
+            // the nearest door lets out
+            var status = _navQuery.FindPolysAroundCircle(startRef, startPt, radius, DefaultFilter,
+                AroundRefs, AroundParents, AroundCosts, out int count, AroundRefs.Length);
+            if (status.Failed()) return false;
+            int best = -1;
+            for (int i = 0; i < count; i++)
+                if (!Indoors(AroundRefs[i]) && (best < 0 || AroundCosts[i] < AroundCosts[best])) best = i;
+            if (best < 0) return false;
+
+            // On it nearest the room, then a little further out over the ground outdoors (sliding along the walls)
+            long outRef = AroundRefs[best];
+            _navQuery.ClosestPointOnPoly(outRef, startPt, out var door, out _);
+            var away = new RcVec3f(door.X - startPt.X, 0f, door.Z - startPt.Z);
+            float length = MathF.Sqrt(away.X * away.X + away.Z * away.Z);
+            if (length > 1e-3f)
+            {
+                var to = new RcVec3f(door.X + away.X / length * beyond, door.Y, door.Z + away.Z / length * beyond);
+                if (_navQuery.MoveAlongSurface(outRef, door, to, OutdoorsFilter, out var moved, AroundRefs, out _, AroundRefs.Length).Succeeded())
+                    door = new RcVec3f(moved.X, door.Y, moved.Z);
+            }
+            point = FromRc(door);
+            return true;
+        }
+
+        private static bool Indoors(long polyRef) =>
+            _navMesh!.GetPolyFlags(polyRef, out int flags).Succeeded() && (flags & IndoorsFlag) != 0;
+
+        // The polygons round a point (WayOutdoors), kept: main thread only
+        private static readonly long[] AroundRefs = new long[256], AroundParents = new long[256];
+        private static readonly float[] AroundCosts = new float[256];
+
         private static readonly NavRandom RandomSource = new();
 
         // The polygons of the way into the circle (RandomReachablePoint), kept: main thread only
@@ -329,6 +399,25 @@ namespace Freefall.Base
             {
                 Debug.Log($"[NavMeshWorld] SetAgentTarget: FindNearestPoly failed for {target} (status={status}, extents={halfExtents})");
                 return false;
+            }
+
+            // Never a target out of reach: the nearest point a way leads to instead, found by a search bounded as
+            // FindPath's. The crowd's own queue searches without a bound (DotRecast's node pool grows), and re-plans a
+            // way that ends short of its target every second once near its end: a few townsfolk sent where no way led
+            // searched the whole navmesh over and over, and the rest waited behind them for their ways, up to 122 s
+            // (2026-10-25)
+            long startRef = agent.corridor.GetFirstPoly();
+            if (_navQuery != null && startRef != 0 && startRef != targetRef)
+            {
+                _navQuery.InitSlicedFindPath(startRef, targetRef, agent.npos, targetPt, DefaultFilter, 0);
+                _navQuery.UpdateSlicedFindPath(MaxSearchNodes, out _);
+                _navQuery.FinalizeSlicedFindPath(WayPolys, out int count, WayPolys.Length);
+                if (count > 0 && WayPolys[count - 1] != targetRef)
+                {
+                    targetRef = WayPolys[count - 1];
+                    _navQuery.ClosestPointOnPoly(targetRef, targetPt, out targetPt, out _);
+                    OutOfReach++;
+                }
             }
 
             onNavMesh = FromRc(targetPt);

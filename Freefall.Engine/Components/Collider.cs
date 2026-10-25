@@ -30,10 +30,24 @@ namespace Freefall.Components
         public Actor? Actor => _staticActor;
 
         /// <summary>
-        /// Where the shape sits, in metres in the entity's frame (rotated with it, not scaled).
-        /// Read when the shape is made.
+        /// Where the shape sits in the entity's frame: turned and scaled with it, so on an entity scaled
+        /// by 2 an offset of 1 is 2 m. Read when the shape is made.
         /// </summary>
         public Vector3 Offset;
+
+        /// <summary>
+        /// How big the entity is drawn along each of its axes: its scale times its parents'. Every collider
+        /// takes it into its geometry and its offset, since an actor's pose carries no scale: a tree that
+        /// PCG scaled by 1.5 has a trunk 1.5 times as thick, and its capsule with it.
+        /// </summary>
+        protected Vector3 WorldScale
+        {
+            get
+            {
+                Transform.Matrix.Deconstruct(out var scale, out _, out _);
+                return Vector3.Abs(scale);
+            }
+        }
 
         private bool _isTrigger;
 
@@ -74,6 +88,33 @@ namespace Freefall.Components
                 _groups = value;
                 if (_shape != null) _shape.QueryFilterData = new FilterData(_groups, 0, 0, 0);
             }
+        }
+
+        private bool _blocks = true;
+
+        /// <summary>
+        /// Off, the shape stays where it is but takes no part: nothing bumps into it, a character's capsule walks
+        /// through it, and no query finds it (a door's leaf standing open: an NPC between it and the wall had no way out
+        /// round it, 2026-10-25). On again, it is solid where it then is. Not saved: set in play. A trigger keeps its
+        /// flags.
+        /// </summary>
+        [Reflection.DontSerialize]
+        public bool Blocks
+        {
+            get => _blocks;
+            set
+            {
+                if (_blocks == value) return;
+                _blocks = value;
+                ApplyBlocks();
+            }
+        }
+
+        private void ApplyBlocks()
+        {
+            if (_shape == null || _isTrigger) return;
+            const ShapeFlag solid = ShapeFlag.SimulationShape | ShapeFlag.SceneQueryShape;
+            _shape.Flags = _blocks ? _shape.Flags | solid : _shape.Flags & ~solid;
         }
 
         // Kept in a field because it is set before there is a shape (a scene load, the editor).
@@ -188,10 +229,12 @@ namespace Freefall.Components
 
             if (_isTrigger)
                 ApplyTrigger();
+            if (!_blocks)
+                ApplyBlocks();
 
-            // Offset is in the collider's own frame; on a child of the actor's entity that frame
-            // is carried into the actor's.
-            var localPose = Matrix4x4.CreateTranslation(Offset + GeometryOffset);
+            // Offset is in the collider's own frame, scaled with it; on a child of the actor's entity
+            // that frame is carried into the actor's.
+            var localPose = Matrix4x4.CreateTranslation(Offset * WorldScale + GeometryOffset);
 
             // A PhysX capsule runs along its X axis; ours stands along the entity's Y.
             if (geometry is CapsuleGeometry)
@@ -249,58 +292,83 @@ namespace Freefall.Components
 
     public class BoxCollider : Collider, ISceneGizmo
     {
-        /// <summary>Full edge lengths in metres. The entity's scale does not change them.</summary>
+        /// <summary>Full edge lengths in the entity's frame, scaled with it.</summary>
         public Vector3 Size = Vector3.One;
 
         public override PhysX.Geometry? CreateGeometry()
         {
-            return new BoxGeometry(Size * 0.5f);
+            return new BoxGeometry(Size * 0.5f * WorldScale);
         }
 
         public void DrawGizmos(GizmoContext ctx)
         {
+            var scale = WorldScale;
             ctx.Color = new Color4(0.3f, 0.8f, 1f, 1f);
-            ctx.DrawWireBox(Offset, Size);
+            ctx.DrawWireBox(Offset * scale, Size * scale);
         }
     }
 
     public class SphereCollider : Collider, ISceneGizmo
     {
+        /// <summary>Scaled by the largest of the entity's scales, so the ball holds what it is put round.</summary>
         public float Radius = 0.5f;
+
+        private float ScaledRadius
+        {
+            get
+            {
+                var scale = WorldScale;
+                return Radius * MathF.Max(scale.X, MathF.Max(scale.Y, scale.Z));
+            }
+        }
+
         public override PhysX.Geometry? CreateGeometry()
         {
-            return new SphereGeometry(Radius);
+            return new SphereGeometry(ScaledRadius);
         }
 
         public void DrawGizmos(GizmoContext ctx)
         {
             ctx.Color = new Color4(0.3f, 0.8f, 1f, 1f);
-            ctx.DrawWireSphere(Offset, Radius);
+            ctx.DrawWireSphere(Offset * WorldScale, ScaledRadius);
         }
     }
 
     public class CapsuleCollider : Collider, ISceneGizmo
     {
+        /// <summary>Scaled by the larger of the entity's X and Z scales.</summary>
         public float Radius = 0.5f;
 
-        /// <summary>From end to end along the entity's Y, caps included. Never less than a ball of the radius.</summary>
+        /// <summary>
+        /// From end to end along the entity's Y, caps included, scaled by its Y scale. Never less than a ball
+        /// of the radius.
+        /// </summary>
         public float Height = 2.0f;
+
+        // Radius and height as big as the entity is drawn
+        private (float Radius, float Height) Scaled()
+        {
+            var scale = WorldScale;
+            return (Radius * MathF.Max(scale.X, scale.Z), Height * scale.Y);
+        }
 
         public override PhysX.Geometry? CreateGeometry()
         {
             // PhysX takes half the cylinder between the caps, and refuses a capsule that has
             // none: that one is a sphere.
-            float halfCylinder = Height * 0.5f - Radius;
+            var (radius, height) = Scaled();
+            float halfCylinder = height * 0.5f - radius;
             if (halfCylinder <= 0f)
-                return new SphereGeometry(Radius);
+                return new SphereGeometry(radius);
 
-            return new CapsuleGeometry(Radius, halfCylinder);
+            return new CapsuleGeometry(radius, halfCylinder);
         }
 
         public void DrawGizmos(GizmoContext ctx)
         {
+            var (radius, height) = Scaled();
             ctx.Color = new Color4(0.3f, 0.8f, 1f, 1f);
-            ctx.DrawCapsule(Offset, MathF.Max(Height, Radius * 2f), Radius);
+            ctx.DrawCapsule(Offset * WorldScale, MathF.Max(height, radius * 2f), radius);
         }
     }
 
