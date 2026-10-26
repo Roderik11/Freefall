@@ -260,9 +260,12 @@ namespace Freefall.Assets.Importers
                 if (!sRGB)
                     sourcePath = StripPngColorSpace(sourcePath, tempDir) ?? sourcePath;
 
-                // Force alpha to 1.0 — strips alpha data so mips don't bleed black
+                // Force alpha to 1.0 — strips alpha data so mips don't bleed black.
+                // texconv resizes (Max Size) before it swizzles, and its resize weights colour by alpha:
+                // every pixel whose alpha is 0 would come out black (Head01's jaw). -sepalpha resizes
+                // colour on its own; the mips are built after the swizzle, so it changes nothing there.
                 if (IgnoreAlpha)
-                    args += " -swizzle rgb1";
+                    args += " -swizzle rgb1 -sepalpha";
 
                 // Scaled down before compression (texconv resizes first, then builds the mips from the result)
                 if (MaxSize > 0)
