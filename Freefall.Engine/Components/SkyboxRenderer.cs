@@ -40,8 +40,8 @@ namespace Freefall.Components
 
         public int Day = 0;                   // days since day 0: counts on as TimeOfDay wraps, moves the moons along their orbits
 
-        [ValueRange(0.001f, 0.1f)]
-        public float TimeOfDaySpeed = 0.001f; // Hours per second (tweak for testing)
+        [ValueRange(1f, 360f)]
+        public float GameSecondsPerSecond = 3.6f;   // how fast the clock runs: 1 = real time, 60 = an hour a minute, 360 = a day in 4 min
 
         [ValueRange(0f, 360f)]
         public float SunAzimuthAngle = 30.0f;    // Compass heading for sunrise in degrees (0=+X, 90=+Z, 180=-X, 270=-Z)
@@ -291,7 +291,7 @@ namespace Freefall.Components
             // Animate time of day if enabled
             if (AnimateTimeOfDay)
             {
-                TimeOfDay += (float)Time.Delta * TimeOfDaySpeed;
+                TimeOfDay += (float)Time.Delta * GameSecondsPerSecond / 3600f;
                 if (TimeOfDay >= 24.0f) { TimeOfDay -= 24.0f; Day++; }
                 if (TimeOfDay < 0.0f) { TimeOfDay += 24.0f; Day--; }
             }
