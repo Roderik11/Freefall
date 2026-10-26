@@ -111,6 +111,7 @@ namespace Freefall.Assets
             public Vector2 UV;       // terrain UV position
             public float Height;     // normalized [0..1]
             public float HalfWidth;  // UV-space half-width
+            public float Fade;       // the stamp's start / end fade here (TerrainStamp.StartFade, EndFade), 1 = none
         }
 
         /// <summary>GPU struct matching HLSL CoverageStamp (terrain_coverage.hlsli). 112 bytes.</summary>
@@ -1823,13 +1824,18 @@ namespace Freefall.Assets
             List<StampSplinePointGPU> splinePoints,
             out uint splinePointOffset, out uint splinePointCount, out float radius, bool useWorldY = true)
             => BuildSplinePoints(stamp.GetSpline(), stamp.Radius, terrainOrigin, terrainSize, maxHeight, heightOffset,
-                splinePoints, out splinePointOffset, out splinePointCount, out radius, useWorldY);
+                splinePoints, out splinePointOffset, out splinePointCount, out radius, useWorldY, stamp.StartFade, stamp.EndFade);
 
-        /// <summary>Sample a spline into terrain UV points; each carries <paramref name="worldRadius"/> × its width.</summary>
+        /// <summary>
+        /// Sample a spline into terrain UV points; each carries <paramref name="worldRadius"/> × its width, and on an
+        /// open spline how far the stamp has faded in from its start and out towards its end (metres along it, flat
+        /// in XZ; 1 where neither fade reaches).
+        /// </summary>
         private static bool BuildSplinePoints(
             Spline? spline, float worldRadius, Vector3 terrainOrigin, Vector2 terrainSize, float maxHeight, float heightOffset,
             List<StampSplinePointGPU> splinePoints,
-            out uint splinePointOffset, out uint splinePointCount, out float radius, bool useWorldY = true)
+            out uint splinePointOffset, out uint splinePointCount, out float radius, bool useWorldY = true,
+            float startFade = 0f, float endFade = 0f)
         {
             splinePointOffset = 0xFFFFFFFF;
             splinePointCount = 0;
@@ -1842,10 +1848,15 @@ namespace Freefall.Assets
             float uvRadius = worldRadius / Math.Max(terrainSize.X, terrainSize.Y);
 
             int sampleCount = Math.Max(spline.TotalSegments, spline.Points.Count * 4);
+            int first = splinePoints.Count;
+            float along = 0f;
+            var previous = Vector3.Zero;
             for (int i = 0; i <= sampleCount; i++)
             {
                 float t = (float)i / sampleCount;
                 var worldPos = spline.GetWorldPoint(t);
+                if (i > 0) along += MathF.Sqrt((worldPos.X - previous.X) * (worldPos.X - previous.X) + (worldPos.Z - previous.Z) * (worldPos.Z - previous.Z));
+                previous = worldPos;
 
                 splinePoints.Add(new StampSplinePointGPU
                 {
@@ -1854,7 +1865,22 @@ namespace Freefall.Assets
                         (worldPos.Z - terrainOrigin.Z) / terrainSize.Y),
                     Height = ((useWorldY ? worldPos.Y - terrainOrigin.Y : 0f) + heightOffset) / maxHeight,
                     HalfWidth = uvRadius * spline.GetWidth(t),
+                    Fade = along,       // the distance along it for now, the fade below
                 });
+            }
+
+            float length = along;
+            for (int i = first; i < splinePoints.Count; i++)
+            {
+                var point = splinePoints[i];
+                float fade = 1f;
+                if (!spline.Closed)
+                {
+                    if (startFade > 0f) fade *= SmoothStep01(point.Fade / startFade);
+                    if (endFade > 0f) fade *= SmoothStep01((length - point.Fade) / endFade);
+                }
+                point.Fade = fade;
+                splinePoints[i] = point;
             }
 
             uint ptCount = (uint)(sampleCount + 1);
@@ -1865,6 +1891,12 @@ namespace Freefall.Assets
             // (sample half-width / Radius), see EvaluateStampWeight.
             radius = uvRadius;
             return true;
+        }
+
+        private static float SmoothStep01(float x)
+        {
+            x = Math.Clamp(x, 0f, 1f);
+            return x * x * (3f - 2f * x);
         }
 
         private static void EnsureUpload<T>(ref GraphicsBuffer buffer, ref int capacity, int count, int minimum)

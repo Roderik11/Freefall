@@ -43,6 +43,17 @@ namespace Freefall.Components
         /// <summary>Evaluation priority. Higher values are applied later (overwrite lower).</summary>
         public int Priority = 0;
 
+        /// <summary>
+        /// Open splines: over this many metres along the spline from its first point the stamp fades in, and its
+        /// end beyond that point (otherwise a half disc of full strength) is gone. A path that meets a road or a yard
+        /// frays out into it instead of ending in a blob; a road's grading eases back into the ground. The edge
+        /// noise breaks the fade up. 0 = none.
+        /// </summary>
+        public float StartFade = 0f;
+
+        /// <summary>The same at the spline's last point.</summary>
+        public float EndFade = 0f;
+
         /// <summary>Enable noise displacement on the falloff boundary for organic edges.</summary>
         [Category("Edge Noise")]
         public bool EnableNoise = false;

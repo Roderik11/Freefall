@@ -5,12 +5,13 @@
 #ifndef TERRAIN_STAMP_COMMON_HLSLI
 #define TERRAIN_STAMP_COMMON_HLSLI
 
-// ── Spline point (matches C# StampSplinePointGPU, 16 bytes) ──
+// ── Spline point (matches C# StampSplinePointGPU, 20 bytes) ──
 struct StampSplinePoint
 {
     float2 UV;
     float  Height;
     float  HalfWidth;
+    float  Fade;            // the stamp's start / end fade here (TerrainStamp.StartFade, EndFade): 1 = none
 };
 
 // ── Noise ──
@@ -86,6 +87,7 @@ float EvaluateStampWeightEx(
     float outlineDist = 0;      // distance to the spline itself, inside or out
     bool insideClosed = false;
     bool closedMask = false;
+    float fade = 1;             // an open spline's start / end fade at the nearest point (StampSplinePoint.Fade)
     nearestHeight = 0;
     nearestHalfWidth = radius;
 
@@ -97,6 +99,7 @@ float EvaluateStampWeightEx(
         float bestDist = 1e10;
         float bestH = 0;
         float bestHalfW = radius;
+        float bestFade = 1;
         bool inside = false;
 
         uint segCount = isClosed ? ptCount : (ptCount - 1);
@@ -117,6 +120,7 @@ float EvaluateStampWeightEx(
                 bestDist = d;
                 bestH = lerp(p0.Height, p1.Height, projT);
                 bestHalfW = lerp(p0.HalfWidth, p1.HalfWidth, projT);
+                bestFade = lerp(p0.Fade, p1.Fade, projT);
             }
 
             if (isClosed)
@@ -137,6 +141,14 @@ float EvaluateStampWeightEx(
             bestDist = length(uv - p0.UV);
             bestH = p0.Height;
             bestHalfW = p0.HalfWidth;
+            bestFade = p0.Fade;
+        }
+
+        // An open spline that fades at an end: nothing of it there, its round cap past the last point included
+        if (!isClosed)
+        {
+            fade = bestFade;
+            if (fade <= 0) return 0;
         }
 
         dist = (isClosed && inside) ? 0 : bestDist;
@@ -185,7 +197,8 @@ float EvaluateStampWeightEx(
     // Early out with noise margin
     if (dist >= totalRadius + noiseMargin) return 0;
 
-    // Noise displacement on distance field
+    // Noise displacement on distance field; the same noise breaks up a start / end fade (strongest halfway through
+    // it, none where it is complete), so a path frays out instead of thinning evenly
     if (noiseFreq > 0 && noiseAmp > 0)
     {
         float noiseScale = noiseFreq / max(totalRadius, 0.001);
@@ -193,16 +206,17 @@ float EvaluateStampWeightEx(
         float n = stamp_noise(noiseCoord);
         dist += n * noiseAmp;
         dist = max(dist, 0);
+        fade = saturate(fade + 2.0 * n * fade * (1.0 - fade));
     }
 
     if (dist >= totalRadius) return 0;
 
     // Smoothstep weight
     if (dist <= radius)
-        return 1.0;
+        return fade;
 
     float t = (dist - radius) / max(falloff, 0.001);
-    return 1.0 - t * t * (3.0 - 2.0 * t);
+    return (1.0 - t * t * (3.0 - 2.0 * t)) * fade;
 }
 
 float EvaluateStampWeight(
