@@ -2616,7 +2616,7 @@ namespace Freefall.Components
                 var shadowSweep = Vector3.Zero;
                 if (Engine.Settings.EnableShadows)
                 {
-                    var lightDir = DirectionalLight.GetLightDirection();
+                    var lightDir = DirectionalLight.GetShadowDirection();
                     if (lightDir.Y < -0.001f)
                         shadowSweep = lightDir * MathF.Min(_decoMaxReach / MathF.Max(-lightDir.Y, 0.1f), 20f);
                 }

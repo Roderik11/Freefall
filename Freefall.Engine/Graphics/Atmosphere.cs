@@ -386,9 +386,11 @@ namespace Freefall.Graphics
             // The sky probe (SkyProbe, sky_probe_cs.hlsl): the ambient light and the sky's reflections
             (_frame.SkyProbeCube, _frame.SkyProbeSH, _frame.SkyProbeMips) = SkyProbe.Indices;
             // The terrain's shadow in the air toward the sun and the moon (TerrainLightShadow, made in Render when due):
-            // the haze and the near fog in front of a mountain the light stands behind
+            // the haze and the near fog in front of a mountain the light stands behind; the directional light's body from
+            // its held shadow direction, so the map steps with the cascades (DirectionalLight.ShadowStep)
             (_frame.TerrainSunShadow, _frame.TerrainMoonShadow, _frame.TerrainShadowOrigin, _frame.TerrainShadowSize) =
-                TerrainLightShadow.Prepare(TerrainCover, _frame.SunDirection, _frame.MoonDirection, s.MoonIlluminance != Vector3.Zero);
+                TerrainLightShadow.Prepare(TerrainCover, Components.DirectionalLight.ShadowTowards(_frame.SunDirection),
+                    Components.DirectionalLight.ShadowTowards(_frame.MoonDirection), s.MoonIlluminance != Vector3.Zero);
             unsafe { *_params[slot]!.WritePtr<GpuParams>() = _frame; }
             return _params[slot]!.SrvIndex;
         }

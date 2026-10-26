@@ -153,7 +153,7 @@ namespace Freefall.Graphics
             _cs.SetParam("HistoryWeight", useHistory ? HistoryWeight : 0f);
             _cs.SetParam("Jitter", jitter);
             _cs.SetParam("FogRange", Range);
-            _cs.SetParam("ShadowLightDir", -DirectionalLight.GetLightDirection());
+            _cs.SetParam("ShadowLightDir", -DirectionalLight.GetShadowDirection());
             _cs.SetParam("CascadeCount", (uint)Math.Clamp(DirectionalLight.CascadeCount, 0, 8));
             _cs.SetParam("GridSize", new UInt3 { X = (uint)_gridW, Y = (uint)_gridH, Z = Slices });
             _cs.SetParam("ExposureRatio", useHistory ? exposure / _prevExposure : 1f);

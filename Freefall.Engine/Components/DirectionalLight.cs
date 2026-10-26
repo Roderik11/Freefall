@@ -15,7 +15,17 @@ namespace Freefall.Components
         public Color3 Color = new Color3(1, 1, 1);
         public float Intensity = 1;
         public bool CastShadows = true;
-        
+
+        /// <summary>
+        /// Degrees the light turns before its shadows follow (0 = every frame). A turning light puts the casters on a
+        /// slightly turned shadow-map grid every frame, which the texel snapping cannot hold (it holds the grid against
+        /// the camera's movement only), and every shadow edge crawls. Held, the shadows stand still and jump to the
+        /// light once it has turned this far; the shading (N·L, the sky, the sun's disc) follows it every frame. The
+        /// sun turns 0.25° in a game minute.
+        /// </summary>
+        [ValueRange(0f, 2f, 0.05f)]
+        public float ShadowStep = 0.25f;
+
         /// <summary>
         /// Fixed cascade split distances (EngineSettings.UseAdaptiveSplits off). Each value is the far boundary of that
         /// cascade: cascade 0 near..Splits[0], cascade 1 Splits[0]..Splits[1], etc. With more cascades than values the
@@ -165,6 +175,46 @@ namespace Freefall.Components
         /// Get the current directional light's forward direction.
         /// </summary>
         public static Vector3 GetLightDirection() => _instance?.Transform.Forward ?? Vector3.UnitY;
+
+        /// <summary>The current directional light's <see cref="ShadowDirection"/>.</summary>
+        public static Vector3 GetShadowDirection() => _instance?.ShadowDirection ?? Vector3.UnitY;
+
+        /// <summary>
+        /// The direction toward a light source (the sun or a moon) its shadows are cast from: the held
+        /// <see cref="ShadowDirection"/> while the directional light is that source, else the source's own.
+        /// </summary>
+        public static Vector3 ShadowTowards(Vector3 towardSource)
+        {
+            var transform = _instance?.Transform;   // none while the scene that holds it is being built
+            if (transform == null || Vector3.Dot(transform.Forward, towardSource) > -0.999999f)
+                return towardSource;
+            return -_instance!.ShadowDirection;
+        }
+
+        // The direction the shadows were last cast in (ShadowDirection)
+        private Vector3 _shadowDirection;
+        private bool _hasShadowDirection;
+
+        /// <summary>
+        /// The direction the shadows are cast in: the light's, held until the light has turned <see cref="ShadowStep"/>
+        /// from it. Everything that draws or traces this light's shadow reads it (the cascades, SDSM, screen-space
+        /// shadows, the near fog, the terrain's shadow map), so they all jump together; the shading reads Transform.Forward.
+        /// </summary>
+        public Vector3 ShadowDirection
+        {
+            get
+            {
+                if (Transform == null)
+                    return _hasShadowDirection ? _shadowDirection : Vector3.UnitY;
+                var forward = Transform.Forward;
+                if (!_hasShadowDirection || Vector3.Dot(forward, _shadowDirection) < MathF.Cos(MathF.Max(ShadowStep, 0f) * (MathF.PI / 180f)))
+                {
+                    _shadowDirection = forward;
+                    _hasShadowDirection = true;
+                }
+                return _shadowDirection;
+            }
+        }
 
         public DirectionalLight()
         {
@@ -385,7 +435,7 @@ namespace Freefall.Components
                     commandList,
                     camera,
                     cameraPosition,
-                    Transform.Forward,
+                    ShadowDirection,
                     shadowTex.Width,
                     cascadeUAV,
                     cascadeSRV);
@@ -592,8 +642,10 @@ namespace Freefall.Components
             // To avoid precision loss from adding large cameraPosition to small frustumCenter,
             // we only use the sub-texel remainder of the camera position. All arithmetic
             // stays in the small-number domain — no catastrophic cancellation.
+            // The grid holds against the light's turning too while ShadowDirection is held (ShadowStep).
+            var shadowDirection = ShadowDirection;
             var lightRotation = Matrix4x4.CreateLookAtLeftHanded(
-                Vector3.Zero, Transform.Forward, Vector3.UnitY);
+                Vector3.Zero, shadowDirection, Vector3.UnitY);
             Matrix4x4.Invert(lightRotation, out var lightRotationInv);
             
             var frustumCenterLS = Vector3.Transform(frustumCenter, lightRotation);
@@ -619,7 +671,7 @@ namespace Freefall.Components
             
             // Build camera-relative light view matrix from snapped center
             var lightView = Matrix4x4.CreateLookAtLeftHanded(
-                snappedCenter, snappedCenter + Transform.Forward, Vector3.UnitY);
+                snappedCenter, snappedCenter + shadowDirection, Vector3.UnitY);
             
             // Still need Z bounds from corners for depth range (only Z uses AABB)
             float minZ = float.MaxValue, maxZ = float.MinValue;

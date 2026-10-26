@@ -758,7 +758,7 @@ namespace Freefall.Graphics
                  _visibleLights!.UavIndex, _pointLightsCulled ? _visibleLightCount!.UavIndex : 0u,
                  LocalShadows?.AtlasIndex ?? 0u, LocalShadows?.ViewBufferSrv ?? 0u, LocalShadows?.LightBufferSrv ?? 0u,
                  ShadowMapIndex, DirectionalLight.CurrentCascadeSrvIndex, Math.Clamp(DirectionalLight.CascadeCount, 0, 8),
-                 -DirectionalLight.GetLightDirection());
+                 -DirectionalLight.GetShadowDirection());
 
              // 2c. Sky captures: the meshes round the camera seen from directions of the sky, for the sky visibility
              //     (sky_capture.hlsli). Four directions per frame while any is due; after the shadows, whose per-batch
@@ -853,7 +853,7 @@ namespace Freefall.Graphics
                  int depthWidth = (int)DepthGBuffer.Native.Description.Width;
                  int depthHeight = (int)DepthGBuffer.Native.Description.Height;
                  CommandBuffer.Culler.AnalyzeDepth(list, DepthGBuffer.BindlessIndex,
-                     depthWidth, depthHeight, camera, -DirectionalLight.GetLightDirection(), Engine.Settings.MaxShadowDistance);
+                     depthWidth, depthHeight, camera, -DirectionalLight.GetShadowDirection(), Engine.Settings.MaxShadowDistance);
                  PixMarker.End(list); // SDSM Depth Analysis
              }
              
@@ -877,7 +877,7 @@ namespace Freefall.Graphics
              {
                  PixMarker.Begin(list, "Screen-Space Shadows");
                  var cvp = Matrix4x4.CreateLookAtLeftHanded(Vector3.Zero, camera.Forward, camera.Up) * camera.Projection;
-                 var lightDir = -Components.DirectionalLight.GetLightDirection();
+                 var lightDir = -Components.DirectionalLight.GetShadowDirection();   // jumps with the cascades' shadows
                  int dw = (int)DepthGBuffer.Native.Description.Width;
                  int dh = (int)DepthGBuffer.Native.Description.Height;
                  ScreenSpaceShadows.Execute(list, DepthGBuffer.BindlessIndex, dw, dh, lightDir, cvp, camera.NearPlane);
