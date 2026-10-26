@@ -157,6 +157,7 @@ namespace Freefall.Base
             {
                 if (_earlyCursor >= WakeupList.Count) return true;
                 using var _ = _marker.Auto(WakeupList.Count - _earlyCursor);
+                SceneLoad.NoteWaking(Type, "early");
                 while (_earlyCursor < WakeupList.Count)
                 {
                     WakeupList[_earlyCursor++].EarlyBird();
@@ -172,6 +173,7 @@ namespace Freefall.Base
             {
                 if (RemovedList.Count == 0 && _awakeCursor >= _earlyCursor) return _awakeCursor >= WakeupList.Count;
                 using var _ = _marker.Auto(_earlyCursor - _awakeCursor);
+                if (_awakeCursor < _earlyCursor) SceneLoad.NoteWaking(Type, "awake");
 
                 if (RemovedList.Count > 0)
                 {

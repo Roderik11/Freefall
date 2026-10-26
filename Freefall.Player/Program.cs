@@ -220,6 +220,9 @@ namespace Freefall.Player
             // black picture (a loading screen of the game's, once one of its scenes has put it up), the half-made world
             // is not drawn. --screenshot and --quit count from the moment the start scene is ready.
             SceneManager.HideWorldWhileLoading = true;
+            // Each load's steps and the component types it wakes, line by line: a native crash (a driver, PhysX, the
+            // audio under Proton) leaves nothing else, and the last line says where it was
+            SceneLoad.LogSteps = true;
             SceneAsset? start = null;
             if (startSceneName != null)
             {

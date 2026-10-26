@@ -109,6 +109,31 @@ namespace Freefall.Base
         /// <summary>Number of steps before <see cref="Step.Done"/>, for a "(3/7)".</summary>
         public const int StepCount = (int)Step.Done;
 
+        /// <summary>
+        /// Log (Debug.LogAlways) each step of every load as it begins, each component type the first time its Early and
+        /// its Awake run in a load, and each piece of background work the load starts waiting for. The player turns it on:
+        /// a crash in native code (a driver, PhysX, the audio) ends the process before anything can be written, and the
+        /// last of these lines in player.log then says where it was. Off in the editor, whose console it would fill on
+        /// every Play and Stop.
+        /// </summary>
+        public static bool LogSteps { get; set; }
+
+        private readonly HashSet<string> _logged = new();
+
+        // Once per load: a line naming what starts now
+        private void LogOnce(string what)
+        {
+            if (LogSteps && _logged.Add(what))
+                Debug.LogAlways($"[SceneLoad] {Name}: {what} ({Seconds:F1} s)");
+        }
+
+        /// <summary>A component type's Early ("early") or Awake ("awake") is about to run (ComponentCache): logged once per load with <see cref="LogSteps"/>.</summary>
+        internal static void NoteWaking(Type type, string phase)
+        {
+            if (LogSteps && SceneManager.Loading is { IsDone: false } load)
+                load.LogOnce($"{phase} {type.Name}");
+        }
+
         /// <summary>A step's name for people.</summary>
         public static string Describe(Step step) => step switch
         {
@@ -209,7 +234,11 @@ namespace Freefall.Base
                     _stepEndS[(int)step] = Seconds;
                     Current = step + 1;
                     if (Current == Step.Done) Finish();
-                    else if (Stopwatch.GetTimestamp() >= deadline) break;
+                    else
+                    {
+                        LogOnce(Describe(Current));
+                        if (Stopwatch.GetTimestamp() >= deadline) break;
+                    }
                 }
             }
             catch (Exception ex)
@@ -298,6 +327,7 @@ namespace Freefall.Base
                         if (!task.IsCompleted)
                         {
                             Activity = what;
+                            LogOnce($"waiting for {what}");
                             return false;
                         }
                         if (task.IsFaulted)
