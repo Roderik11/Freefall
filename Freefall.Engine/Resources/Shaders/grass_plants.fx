@@ -1,15 +1,16 @@
 // ═══════════════════════════════════════════════════════════════════════════
-// Flowers, spikes and ferns — plant cards as procedural plants (Amplification → Mesh → Pixel)
+// Flowers, spikes, ferns and grain — plant cards as procedural plants (Amplification → Mesh → Pixel)
 //
 // Every instance in a Flowers or Spikes distance band becomes a small plant of PLANT_STEMS stems, one in a Ferns
-// band a crown of FERN_FRONDS fronds (routing in grass_procedural.hlsli; grass blades are grass_blades.fx).
+// band a crown of FERN_FRONDS fronds, one in a Grain band a tuft of GRAIN_STEMS culms (routing in
+// grass_procedural.hlsli; grass blades are grass_blades.fx).
 // Geometry gives the structure — stems, where blooms and leaves sit, how fronds arch, which way they face, wind — and
 // small parts of the variant's parts atlas (DecoratorVariant.PlantParts, rendered by
 // Tools/BlenderKits/build_flowers.py) give the detail: a bloom cap seen from above, a crossed pair of spike strips,
-// leaves, a frond. Each part fills most of its quad, so the alpha test wastes few pixels (a whole flower card is
-// ~15% opaque). Without an atlas the parts are flat colours from the card.
+// leaves, a frond, an ear. Each part fills most of its quad, so the alpha test wastes few pixels (a whole flower card
+// is ~15% opaque). Without an atlas the parts are flat colours from the card.
 // ═══════════════════════════════════════════════════════════════════════════
-#define PROCEDURAL_KINDS(mode) ((mode) >= MODE_FLOWERS && (mode) <= MODE_FERNS)   // this effect's kinds (AS, AS_Shadow)
+#define PROCEDURAL_KINDS(mode) ((mode) >= MODE_FLOWERS && (mode) <= MODE_GRAIN)   // this effect's kinds (AS, AS_Shadow)
 #include "grass_procedural.hlsli"
 
 #define PLANT_STEMS 3
@@ -36,6 +37,16 @@
 #define FROND_TRIS (4 * FROND_SEGMENTS)
 #define FERN_VERTS (FERN_FRONDS * FROND_VERTS)  // 210
 #define FERN_TRIS (FERN_FRONDS * FROND_TRIS)    // 240
+#define GRAIN_STEMS 6           // culms per tuft
+#define CULM_SEGMENTS 3
+#define CULM_VERTS 7            // 2 x CULM_SEGMENTS + 1
+#define CULM_TRIS 5             // 2 x CULM_SEGMENTS - 1
+#define EAR_SEGMENTS 3          // per ear strip; two strips crossed at right angles
+#define EAR_STRIP_VERTS (2 * (EAR_SEGMENTS + 1))
+#define EAR_STRIP_TRIS (2 * EAR_SEGMENTS)
+#define GRAIN_VERTS (CULM_VERTS + LEAF_VERTS + 2 * EAR_STRIP_VERTS)   // 29
+#define GRAIN_TRIS (CULM_TRIS + LEAF_TRIS + 2 * EAR_STRIP_TRIS)       // 21
+#define GRAIN_EAR 0.18          // the ear (awns included) is this share of the plant's height, above the culm
 
 // Atlas layout (build_flowers.py; UV v down): bloom from above centred at (0.25, 0.25) with radius 0.24; the leaf
 // in the top-right cell from its base at v 0.49 up to its tip at v 0.01 around u 0.75; the spike in the left half
@@ -218,11 +229,128 @@ uint3 FernTriangle(uint ti)
     return (t & 1) ? uint3(a + 1, b + 1, b) : uint3(a, a + 1, b);
 }
 
+// Vertex 'vi' of a grain tuft: GRAIN_STEMS culms, each a stalk, one narrow leaf low on it and an ear of two strips
+// crossed at right angles (the parts atlas' spike cell: the ear with its awns, from the side). A sown field is even:
+// the culms stand nearly straight and nearly as tall as each other. The ear carries on from the culm's top and bends
+// over by a nod of its own, more towards its tip, the way a ripe ear hangs; the wind sways the culm and the ear with it.
+PlantVertexData GrainVertex(DecoInstance di, DecoratorSlot slot, uint vi, float dist, float push)
+{
+    uint culm = vi / GRAIN_VERTS;
+    uint v = vi % GRAIN_VERTS;
+    uint h = pcg(asuint(di.InstanceSeed) ^ (culm * 0x9E3779B9u) ^ 0x3C6EF372u);
+    float grow = PlantGrowth(di);
+    float2 disc = float2(Rand(h), Rand(h));
+    float rootAngle = disc.y * 6.2831853;
+    float3 root = di.Position + float3(cos(rootAngle), 0, sin(rootAngle)) * 0.4 * di.Scale.x * grow * sqrt(disc.x);
+    float3 up = normalize(lerp(float3(0, 1, 0), di.TerrainNormal, abs(slot.SlopeBias)));
+    float height = di.Scale.y * lerp(0.86, 1.0, Rand(h));
+    float yaw = Rand(h) * 6.2831853;
+    float3 dir = float3(cos(yaw), 0, sin(yaw));
+    float lean = lerp(0.0, 0.08, Rand(h));
+    float nod = lerp(0.12, 0.8, Rand(h));           // radians the ear's tip bends over from the culm's top
+    float phase = Rand(h) * 6.2831853;
+    float3 tint = slot.HealthyColor * lerp(0.82, 1.08, Rand(h));
+    float culmLen = height * (1.0 - GRAIN_EAR);
+    float earLen = height * GRAIN_EAR;
+    float3 sway = GrassSway(push, phase);
+    float3 side = float3(-dir.z, 0, dir.x);
+
+    StructuredBuffer<float4> colors = ResourceDescriptorHeap[BladeColorsSRV];
+    float4 foliage = colors[di.SlotIdx * COLORS_PER_VARIANT + COLOR_FOLIAGE];
+    float4 bloom = colors[di.SlotIdx * COLORS_PER_VARIANT + COLOR_BLOOM];
+    if (foliage.a <= 0) foliage = colors[di.SlotIdx * COLORS_PER_VARIANT];     // no green texels: the root band
+    bool atlas = slot.PlantPartsIdx != 0;
+
+    PlantVertexData o;
+    o.UV = 0;
+    o.Textured = 0;
+    if (v < CULM_VERTS)
+    {
+        bool tip = v == 2 * CULM_SEGMENTS;
+        float t = tip ? 1.0 : float(v / 2) / CULM_SEGMENTS;
+        float sideSign = tip ? 0.0 : ((v & 1) ? 1.0 : -1.0);
+        float width = max(0.004, dist * 0.0009);
+        o.WorldPos = root + up * culmLen * t + dir * culmLen * lean * t * t + sway * (t * t * height)
+                   + side * sideSign * 0.5 * width * (1.0 - 0.3 * t);
+        o.Normal = normalize(cross(side, normalize(up + dir * 2.0 * lean * t)) + side * sideSign * 0.6);
+        o.Color = foliage.rgb * tint * lerp(0.6, 1.0, saturate(t / 0.3));
+        return o;
+    }
+    v -= CULM_VERTS;
+
+    if (v < LEAF_VERTS)
+    {
+        // One narrow leaf a third of the way up, leaving the culm at a low angle and drooping
+        uint hl = h;
+        float t = lerp(0.25, 0.45, Rand(hl));
+        float azimuth = yaw + 1.2 + 2.5 * Rand(hl);
+        float3 outDir = normalize(float3(cos(azimuth), 0, sin(azimuth)) * cos(0.6) + up * sin(0.6));
+        float3 base = root + up * culmLen * t + dir * culmLen * lean * t * t + sway * (t * t * height);
+        LeafVertex(o, v, base, outDir, up, height * 0.3, tint);
+        if (!atlas)
+        {
+            o.Color = foliage.rgb * tint;
+            o.Textured = 0;
+        }
+        return o;
+    }
+    v -= LEAF_VERTS;
+
+    // The ear: from the culm's top along its tangent there, bending over towards 'dir' segment by segment
+    float3 top = root + up * culmLen + dir * culmLen * lean + sway * height;
+    float3 tangent = normalize(up * culmLen + dir * 2.0 * culmLen * lean + sway * 2.0 * height);
+    float3 over = dir - tangent * dot(dir, tangent);
+    over = dot(over, over) > 1e-6 ? normalize(over) : side;
+    uint strip = v / EAR_STRIP_VERTS;
+    uint ev = v % EAR_STRIP_VERTS;
+    uint row = ev / 2;
+    float3 p = top;
+    float segLen = earLen / EAR_SEGMENTS;
+    for (uint k = 0; k < row; k++)
+    {
+        float a = nod * (k + 0.5) / EAR_SEGMENTS;
+        p += (tangent * cos(a) + over * sin(a)) * segLen;
+    }
+    float aRow = nod * float(row) / EAR_SEGMENTS;
+    float3 axis = tangent * cos(aRow) + over * sin(aRow);
+    float3 across = strip == 0 ? normalize(cross(axis, over)) : over * cos(aRow) - tangent * sin(aRow);
+    float sideSign = (ev & 1) ? 1.0 : -1.0;
+    float halfWidth = earLen * SPIKE_HALF_U / 0.98 * grow;
+    o.WorldPos = p + across * sideSign * halfWidth;
+    o.Normal = normalize(cross(across, axis));
+    o.Color = atlas ? tint : bloom.rgb * tint;
+    o.UV = float2(SPIKE_U + sideSign * SPIKE_HALF_U, 0.99 - 0.98 * float(row) / EAR_SEGMENTS);
+    o.Textured = atlas ? 1 : 0;
+    return o;
+}
+
+// Triangle 'ti' of a grain tuft: per culm the stalk, the leaf (two quads), then the two ear strips
+uint3 GrainTriangle(uint ti)
+{
+    uint t = ti % GRAIN_TRIS;
+    uint vb = (ti / GRAIN_TRIS) * GRAIN_VERTS;
+    if (t < CULM_TRIS)
+        return StripTriangle(vb, t, CULM_SEGMENTS);
+    t -= CULM_TRIS;
+    vb += CULM_VERTS;
+    if (t < LEAF_TRIS)
+    {
+        uint l = vb + (t / 2) * 2;
+        return (t & 1) ? uint3(l + 1, l + 3, l + 2) : uint3(l, l + 1, l + 2);
+    }
+    t -= LEAF_TRIS;
+    vb += LEAF_VERTS;
+    uint l = vb + (t / EAR_STRIP_TRIS) * EAR_STRIP_VERTS + ((t % EAR_STRIP_TRIS) / 2) * 2;
+    return (t & 1) ? uint3(l + 1, l + 3, l + 2) : uint3(l, l + 1, l + 2);
+}
+
 // Vertex 'vi' of a flower or spike plant: per stem the stalk, the leaves, then the bloom cap or the spike strips
 PlantVertexData PlantVertex(DecoInstance di, DecoratorSlot slot, uint vi, float dist, float push)
 {
     if (di.Mode == MODE_FERNS)
         return FernVertex(di, slot, vi, push);
+    if (di.Mode == MODE_GRAIN)
+        return GrainVertex(di, slot, vi, dist, push);
 
     bool spikes = di.Mode == MODE_SPIKES;
     uint vertsPerStem = spikes ? SPIKE_VERTS : FLOWER_VERTS;
@@ -315,6 +443,8 @@ uint3 PlantTriangle(uint mode, uint ti)
 {
     if (mode == MODE_FERNS)
         return FernTriangle(ti);
+    if (mode == MODE_GRAIN)
+        return GrainTriangle(ti);
     bool spikes = mode == MODE_SPIKES;
     uint trisPerStem = spikes ? SPIKE_TRIS : FLOWER_TRIS;
     uint t = ti % trisPerStem;
@@ -362,6 +492,7 @@ uint3 PlantTriangle(uint mode, uint ti)
 void PartShape(uint mode, out uint verts, out uint tris, out uint parts)
 {
     if (mode == MODE_FERNS) { verts = FROND_VERTS; tris = FROND_TRIS; parts = FERN_FRONDS; }
+    else if (mode == MODE_GRAIN) { verts = GRAIN_VERTS; tris = GRAIN_TRIS; parts = GRAIN_STEMS; }
     else if (mode == MODE_SPIKES) { verts = SPIKE_VERTS; tris = SPIKE_TRIS; parts = PLANT_STEMS; }
     else { verts = FLOWER_VERTS; tris = FLOWER_TRIS; parts = PLANT_STEMS; }
 }

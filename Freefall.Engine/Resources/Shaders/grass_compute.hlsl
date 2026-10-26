@@ -250,6 +250,7 @@ struct DecoInstance
 #define MODE_FLOWERS   4
 #define MODE_SPIKES    5
 #define MODE_FERNS     6
+#define MODE_GRAIN     7
 #define MAX_BANDS      4
 
 // Distance thinning of the procedural plants (CS_SpawnInstances): how many of one variant's plants a steradian of view
@@ -284,7 +285,7 @@ float VariantRange(DecoratorSlot s)
 
 // ─── Distance thinning (CS_SpawnInstances) ─────────────────────────────────
 
-bool ThinningMode(uint mode) { return mode >= MODE_BLADES && mode <= MODE_SPIKES; }
+bool ThinningMode(uint mode) { return (mode >= MODE_BLADES && mode <= MODE_SPIKES) || mode == MODE_GRAIN; }
 
 // Whether every instance of the variant is a kind the thinning takes (whatever band it is in)
 bool AlwaysThins(DecoratorSlot s)
@@ -883,7 +884,8 @@ void CS_SpawnInstances(uint3 gid : SV_GroupID, uint3 gtid3 : SV_GroupThreadID)
             }
             else if (mode >= MODE_BLADES)
             {
-                // Procedural (grass_blades.fx: blade clumps, flowers, spikes) → own buffer, counter at offset 8
+                // Procedural (grass_blades.fx: blade clumps; grass_plants.fx: flowers, spikes, ferns, grain) → own
+                // buffer, counter at offset 8
                 uint bladeIdx;
                 instCounter.InterlockedAdd(8, 1, bladeIdx);
                 if (bladeIdx >= MaxBladeInstances) continue;

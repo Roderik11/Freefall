@@ -2,7 +2,7 @@
 // Procedural decorators — cards as blades and plants (shared by grass_blades.fx and grass_plants.fx)
 //
 // CS_SpawnInstances routes the instances in a variant's procedural distance band (DecoratorVariant.Bands: Blades,
-// Flowers, Spikes or Ferns; each switching at its own point within ±15% of the band's end) into a buffer of their own.
+// Flowers, Spikes, Ferns or Grain; each switching at its own point within ±15% of the band's end) into a buffer of their own.
 // Both effects draw that buffer with the same AS; each takes only its own kinds. Two pipelines because the plants'
 // textured parts are alpha-tested, and a shader that can discard costs the blades their early depth test.
 // ═══════════════════════════════════════════════════════════════════════════
@@ -45,7 +45,7 @@ struct DecoratorSlot
     uint AlphaClip;
     float HeightNoiseScale;
     float HeightNoiseAmount;
-    uint PlantPartsIdx;         // Flowers / Spikes / Ferns: parts atlas (Tools/BlenderKits/build_flowers.py), 0 = none
+    uint PlantPartsIdx;         // Flowers / Spikes / Ferns / Grain: parts atlas (Tools/BlenderKits/build_flowers.py), 0 = none
 };
 
 struct DecoInstance
@@ -78,6 +78,7 @@ struct DecoInstance
 #define MODE_FLOWERS 4
 #define MODE_SPIKES  5
 #define MODE_FERNS   6
+#define MODE_GRAIN   7
 
 SamplerState ClampSampler : register(s2);
 
