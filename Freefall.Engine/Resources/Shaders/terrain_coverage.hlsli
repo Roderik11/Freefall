@@ -7,7 +7,7 @@
 #ifndef TERRAIN_COVERAGE_HLSLI
 #define TERRAIN_COVERAGE_HLSLI
 
-// A SplatStamp or DecoStamp as the GPU sees it (matches C# CoverageStampGPU, 96 bytes)
+// A SplatStamp or DecoStamp as the GPU sees it (matches C# CoverageStampGPU, 112 bytes)
 struct CoverageStamp
 {
     float2 Center;              // terrain UV center (radial)
@@ -29,6 +29,8 @@ struct CoverageStamp
     float  PatchCoverage;       // about the share of area covered
     float  PatchSoftness;       // 0 = hard patch edge
     uint   PatchSeed;
+    float4 Bounds;              // terrain UV (min x, min y, max x, max y) of all the shape can reach, falloff and
+                                // edge noise included; nothing outside it is tested against the shape
 };
 
 #define COVERAGE_GLOBAL 1u      // covers the whole terrain; shape fields are ignored
@@ -42,6 +44,11 @@ uint CoverageOp(CoverageStamp s) { return (s.Flags >> 8) & 0xFFu; }
 float CoverageShapeWeight(CoverageStamp s, float2 terrainUV, StructuredBuffer<StampSplinePoint> splinePoints)
 {
     if (s.Flags & COVERAGE_GLOBAL) return 1.0;
+
+    // Off the shape's box: a spline stamp's shape is a walk over every one of its segments (a forest outline has
+    // over a thousand), and every texel of the map used to take it for every stamp (2026-10-26: 1.26 s of GPU for
+    // one Eldermoor splat bake, near the 2 s at which Windows resets the device)
+    if (any(terrainUV < s.Bounds.xy) || any(terrainUV > s.Bounds.zw)) return 0.0;
 
     float nearestH, nearestHalfW;
     return EvaluateStampWeight(

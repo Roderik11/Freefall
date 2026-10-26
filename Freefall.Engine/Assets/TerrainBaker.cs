@@ -113,7 +113,7 @@ namespace Freefall.Assets
             public float HalfWidth;  // UV-space half-width
         }
 
-        /// <summary>GPU struct matching HLSL CoverageStamp (terrain_coverage.hlsli). 96 bytes.</summary>
+        /// <summary>GPU struct matching HLSL CoverageStamp (terrain_coverage.hlsli). 112 bytes.</summary>
         [StructLayout(LayoutKind.Sequential)]
         internal struct CoverageStampGPU
         {
@@ -136,6 +136,7 @@ namespace Freefall.Assets
             public float PatchCoverage;
             public float PatchSoftness;
             public uint PatchSeed;
+            public Vector4 Bounds;           // terrain UV min x, min y, max x, max y the shape can reach (CoverageBounds)
         }
 
         private const uint CoverageGlobal = 1u;
@@ -1046,20 +1047,35 @@ namespace Freefall.Assets
         }
 
         /// <summary>
-        /// Reads back the baked R16_UNorm heightmap into a CPU float[,] array.
+        /// Reads back the baked R16_UNorm heightmap into a CPU float[,] array ([x, z], texel rows along +Z).
         /// Values are normalized [0..1] — caller multiplies by MaxHeight.
         /// Returns null if no heightmap has been baked.
+        ///
+        /// With <paramref name="previous"/> (the field read back last, at this resolution) and a texel box (x0, z0
+        /// inclusive, x1, z1 exclusive), only the box is fetched: the result is a copy of 'previous' with the box
+        /// replaced. 'previous' itself is left as it is, since workers may still read it. On Eldermoor's 4097² map a
+        /// whole readback took ~190 ms of the frame it ran in, after every height stamp edit (2026-10-26).
         /// </summary>
-        public float[,] ReadbackHeightmap()
+        public float[,] ReadbackHeightmap(float[,] previous = null, int x0 = 0, int z0 = 0, int x1 = int.MaxValue, int z1 = int.MaxValue)
         {
             if (_heightTexture == null || _currentResolution == 0)
                 return null;
 
             var device = Engine.Device;
             int res = _currentResolution;
+            if (previous == null || previous.GetLength(0) != res || previous.GetLength(1) != res)
+            {
+                previous = null;
+                x0 = 0; z0 = 0; x1 = res; z1 = res;
+            }
+            x0 = Math.Clamp(x0, 0, res); x1 = Math.Clamp(x1, 0, res);
+            z0 = Math.Clamp(z0, 0, res); z1 = Math.Clamp(z1, 0, res);
+            if (previous != null && (x1 <= x0 || z1 <= z0))
+                return previous;
+            int width = x1 - x0, height = z1 - z0;
             int bytesPerPixel = 2; // R16_UNorm
-            int rowPitch = (res * bytesPerPixel + 255) & ~255; // 256-byte aligned
-            int totalBytes = rowPitch * res;
+            int rowPitch = (width * bytesPerPixel + 255) & ~255; // 256-byte aligned
+            int totalBytes = rowPitch * height;
 
             var readbackResource = device.NativeDevice.CreateCommittedResource(
                 new HeapProperties(HeapType.Readback),
@@ -1081,9 +1097,9 @@ namespace Freefall.Assets
                 var dst = new TextureCopyLocation(readbackResource, new PlacedSubresourceFootPrint
                 {
                     Offset = 0,
-                    Footprint = new SubresourceFootPrint(Format.R16_UNorm, (uint)res, (uint)res, 1, (uint)rowPitch)
+                    Footprint = new SubresourceFootPrint(Format.R16_UNorm, (uint)width, (uint)height, 1, (uint)rowPitch)
                 });
-                cmdList.CopyTextureRegion(dst, 0, 0, 0, src);
+                cmdList.CopyTextureRegion(dst, 0, 0, 0, src, new Vortice.Mathematics.Box(x0, z0, 0, x1, z1, 1));
 
                 cmdList.ResourceBarrierTransition(_heightTexture,
                     ResourceStates.CopySource, ResourceStates.Common);
@@ -1091,27 +1107,27 @@ namespace Freefall.Assets
                 cmdList.Close();
                 device.SubmitAndWait(cmdList);
 
-                var heights = new float[res, res];
+                var heights = previous != null ? (float[,])previous.Clone() : new float[res, res];
                 unsafe
                 {
                     void* pData;
                     readbackResource.Map(0, null, &pData);
 
                     var srcPtr = (byte*)pData;
-                    for (int y = 0; y < res; y++)
+                    for (int z = 0; z < height; z++)
                     {
-                        var rowStart = (byte*)(srcPtr + y * rowPitch);
-                        for (int x = 0; x < res; x++)
+                        var rowStart = (byte*)(srcPtr + z * rowPitch);
+                        for (int x = 0; x < width; x++)
                         {
                             ushort raw = *(ushort*)(rowStart + x * 2);
-                            heights[x, y] = raw / 65535.0f;
+                            heights[x0 + x, z0 + z] = raw / 65535.0f;
                         }
                     }
 
                     readbackResource.Unmap(0);
                 }
 
-                Debug.Log($"[TerrainBaker] HeightField readback: {res}x{res}");
+                Debug.Log($"[TerrainBaker] HeightField readback: {width}x{height} of {res}x{res}");
                 return heights;
             }
             finally
@@ -1305,6 +1321,7 @@ namespace Freefall.Assets
             {
                 desc.Flags |= CoverageGlobal;
                 desc.SplinePointOffset = 0xFFFFFFFF;
+                desc.Bounds = new Vector4(float.MinValue, float.MinValue, float.MaxValue, float.MaxValue);
             }
             else
             {
@@ -1335,6 +1352,7 @@ namespace Freefall.Assets
                     desc.Radius = stamp.Radius * uvScale;
                     desc.SplinePointOffset = 0xFFFFFFFF;
                 }
+                desc.Bounds = CoverageBounds(desc, splinePoints, uvScale);
             }
 
             // Filter. The ranges are always written so the shader never reads garbage.
@@ -1363,6 +1381,38 @@ namespace Freefall.Assets
             return true;
         }
 
+        /// <summary>
+        /// The terrain UV box a local coverage stamp's shape can reach: its centre or its spline's samples, grown by
+        /// what EvaluateStampWeight lets it reach past them (radius and falloff, both scaled by a sample's width;
+        /// a radius of 0 or less leaves the falloff as it is), the edge noise and a texel. The bakes skip the shape
+        /// outside it.
+        /// </summary>
+        private static Vector4 CoverageBounds(in CoverageStampGPU desc, List<StampSplinePointGPU> splinePoints, float uvScale)
+        {
+            float reachOut = desc.NoiseAmp + uvScale;
+            if (desc.SplinePointOffset == 0xFFFFFFFF)
+            {
+                float r = Math.Max(desc.Radius, 0f) + desc.Falloff + reachOut;
+                return new Vector4(desc.Center.X - r, desc.Center.Y - r, desc.Center.X + r, desc.Center.Y + r);
+            }
+
+            int first = (int)desc.SplinePointOffset;
+            int count = (int)(desc.SplinePointCount & 0x7FFFFFFF);
+            var min = new Vector2(float.MaxValue);
+            var max = new Vector2(float.MinValue);
+            float halfWidth = 0f;
+            for (int i = first; i < first + count; i++)
+            {
+                var p = splinePoints[i];
+                min = Vector2.Min(min, p.UV);
+                max = Vector2.Max(max, p.UV);
+                halfWidth = Math.Max(halfWidth, p.HalfWidth);
+            }
+            float falloff = desc.Radius > 1e-7f ? desc.Falloff * halfWidth / desc.Radius : desc.Falloff;
+            float reach = Math.Max(halfWidth, 0f) + falloff + reachOut;
+            return new Vector4(min.X - reach, min.Y - reach, max.X + reach, max.Y + reach);
+        }
+
         /// <summary>Bit N set = layer at channel N. Layers that are not in the palette have no weight anywhere.</summary>
         private static uint LayerMask(List<TerrainLayer> layers, Dictionary<TerrainLayer, int> layerIndex, out bool any)
         {
@@ -1384,11 +1434,16 @@ namespace Freefall.Assets
         /// Composite the splat stamps into the packed control array (ceil(layers / 4) RGBA slices).
         /// Clears what an earlier bake left, so a plan without stamps yields an empty array.
         /// 'topLayerUAV' (0 = none) gets the channel that shows most per texel, see ReadbackTopLayers.
+        /// 'region' (control texels: x, y, width, height; null = the whole map) is all that is redone: every texel in
+        /// it is composited from all the stamps again, the rest keeps what the last bake wrote. Only for a bake into the
+        /// same array with the same palette, after stamps changed only inside it.
         /// Render callback.
         /// </summary>
         public void BakeSplat(CoveragePlan plan, ID3D12GraphicsCommandList cmd, Terrain terrain,
-            uint heightSrv, uint controlArrayUAV, uint topLayerUAV, int resolution, int sliceCount)
+            uint heightSrv, uint controlArrayUAV, uint topLayerUAV, int resolution, int sliceCount,
+            (int x, int y, int width, int height)? region = null)
         {
+            var r = region ?? (0, 0, resolution, resolution);
             EnsureCoverageInitialized();
 
             UploadCoverage(plan, ref _splatStampBuffer, ref _splatStampBufferCapacity,
@@ -1410,9 +1465,12 @@ namespace Freefall.Assets
             _splatCS.SetParam(k, "MaxHeight", terrain.MaxHeight);
             _splatCS.SetParam(k, "TerrainSizeX", terrain.TerrainSize.X);
             _splatCS.SetPushConstant(k, "TopLayer", topLayerUAV);
+            _splatCS.SetPushConstant(k, "RegionX", (uint)r.x);
+            _splatCS.SetPushConstant(k, "RegionY", (uint)r.y);
+            _splatCS.SetPushConstant(k, "RegionW", (uint)r.width);
+            _splatCS.SetPushConstant(k, "RegionH", (uint)r.height);
 
-            uint groups = (uint)((resolution + 7) / 8);
-            _splatCS.Dispatch(k, cmd, groups, groups);
+            _splatCS.Dispatch(k, cmd, (uint)((r.width + 7) / 8), (uint)((r.height + 7) / 8));
         }
 
         /// <summary>

@@ -33,6 +33,10 @@ cbuffer PushConstants : register(b3)
     float MaxHeight;        // slot 8
     float TerrainSizeX;     // slot 9
     uint  TopLayerIdx;      // slot 10 — UAV: RWTexture2D<uint>, the channel that shows most per texel
+    uint  RegionX;          // slot 11 — the control texels this bake redoes: from (RegionX, RegionY), RegionW x RegionH
+    uint  RegionY;          // slot 12   (the whole map, or the region a local stamp's edit touched; the rest keeps
+    uint  RegionW;          // slot 13   what the last bake wrote)
+    uint  RegionH;          // slot 14
 };
 
 #define SPLAT_OP_PAINT    0u
@@ -67,15 +71,17 @@ void PaintOver(inout float raw[MAX_LAYERS], uint layer, float a, uint layerCount
 }
 
 [numthreads(8, 8, 1)]
-void CS_SplatBake(uint3 dtid : SV_DispatchThreadID)
+void CS_SplatBake(uint3 groupTexel : SV_DispatchThreadID)
 {
-    if (dtid.x >= Resolution || dtid.y >= Resolution) return;
+    if (groupTexel.x >= RegionW || groupTexel.y >= RegionH) return;
+    uint2 texel = groupTexel.xy + uint2(RegionX, RegionY);
+    if (texel.x >= Resolution || texel.y >= Resolution) return;
 
     RWTexture2DArray<float4> output = ResourceDescriptorHeap[OutputIdx];
     StructuredBuffer<CoverageStamp> stamps = ResourceDescriptorHeap[StampBufIdx];
     StructuredBuffer<StampSplinePoint> splinePoints = ResourceDescriptorHeap[SplineBufIdx];
 
-    float2 uv = (float2(dtid.xy) + 0.5) / float2(Resolution, Resolution);
+    float2 uv = (float2(texel) + 0.5) / float2(Resolution, Resolution);
 
     // The control array is Y-flipped relative to terrain UV (heightmap, stamp shapes)
     float2 terrainUV = float2(uv.x, 1.0 - uv.y);
@@ -135,7 +141,7 @@ void CS_SplatBake(uint3 dtid : SV_DispatchThreadID)
     // Every slice is written every bake, so nothing from an earlier bake survives
     uint sliceCount = min(SliceCount, 8u);
     for (uint s = 0; s < sliceCount; s++)
-        output[uint3(dtid.xy, s)] = float4(raw[s * 4], raw[s * 4 + 1], raw[s * 4 + 2], raw[s * 4 + 3]);
+        output[uint3(texel, s)] = float4(raw[s * 4], raw[s * 4 + 1], raw[s * 4 + 2], raw[s * 4 + 3]);
 
     // What the ground is here, for whoever asks on the CPU (TerrainRenderer.GetLayer): the channel
     // with the greatest visible weight, stacked as the surface shader stacks them. 255 = nothing painted.
@@ -151,6 +157,6 @@ void CS_SplatBake(uint3 dtid : SV_DispatchThreadID)
             if (visible > most) { most = visible; top = uint(c); }
             cover *= (1.0 - raw[c]);
         }
-        topLayer[dtid.xy] = top;
+        topLayer[texel] = top;
     }
 }

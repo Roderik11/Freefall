@@ -90,11 +90,60 @@ namespace Freefall.Assets
         [System.Text.Json.Serialization.JsonIgnore]
         private int _dirtyFlags = (int)TerrainDirtyFlags.All; // rebuild everything on first load
 
+        // Where the next splat bake has to composite again (world XZ): what local stamps' edits touched. A SplatPack
+        // asked for without a region (MarkForUpdate) is everywhere.
+        [Reflection.DontSerialize]
+        [System.Text.Json.Serialization.JsonIgnore]
+        private readonly object _splatRegionLock = new();
+        [Reflection.DontSerialize]
+        [System.Text.Json.Serialization.JsonIgnore]
+        private bool _splatEverywhere = true;
+        [Reflection.DontSerialize]
+        [System.Text.Json.Serialization.JsonIgnore]
+        private System.Numerics.Vector2 _splatRegionMin = new(float.MaxValue), _splatRegionMax = new(float.MinValue);
+
         /// <summary>
-        /// Atomically set one or more dirty flags. Safe to call from any thread.
+        /// Atomically set one or more dirty flags. Safe to call from any thread. A splat rebake asked for here
+        /// redoes the whole map (<see cref="MarkSplatRegion"/> for one place).
         /// </summary>
         public void MarkForUpdate(TerrainDirtyFlags flags)
-            => System.Threading.Interlocked.Or(ref _dirtyFlags, (int)flags);
+        {
+            if ((flags & TerrainDirtyFlags.SplatPack) != 0)
+                lock (_splatRegionLock) _splatEverywhere = true;
+            System.Threading.Interlocked.Or(ref _dirtyFlags, (int)flags);
+        }
+
+        /// <summary>
+        /// A splat rebake of one place (world XZ, min and max): a local stamp's edit, where it was and where it is now.
+        /// The bake composites only there; regions asked for before the bake runs add up.
+        /// </summary>
+        public void MarkSplatRegion(System.Numerics.Vector2 min, System.Numerics.Vector2 max)
+        {
+            lock (_splatRegionLock)
+            {
+                _splatRegionMin = System.Numerics.Vector2.Min(_splatRegionMin, min);
+                _splatRegionMax = System.Numerics.Vector2.Max(_splatRegionMax, max);
+            }
+            System.Threading.Interlocked.Or(ref _dirtyFlags, (int)TerrainDirtyFlags.SplatPack);
+        }
+
+        /// <summary>
+        /// Takes where the splat bake has to composite (world XZ; empty when nothing gave a region) and starts the next
+        /// one empty. False: everywhere. Call it together with consuming SplatPack.
+        /// </summary>
+        public bool TakeSplatRegion(out System.Numerics.Vector2 min, out System.Numerics.Vector2 max)
+        {
+            lock (_splatRegionLock)
+            {
+                bool local = !_splatEverywhere;
+                min = _splatRegionMin;
+                max = _splatRegionMax;
+                _splatEverywhere = false;
+                _splatRegionMin = new System.Numerics.Vector2(float.MaxValue);
+                _splatRegionMax = new System.Numerics.Vector2(float.MinValue);
+                return local;
+            }
+        }
 
         /// <summary>
         /// Check if specific flags are set (non-consuming, momentary snapshot).

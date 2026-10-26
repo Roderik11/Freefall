@@ -586,13 +586,19 @@ namespace Freefall.Components
             // ── Palette: the layers and decorators this terrain renders are whatever its stamps reference ──
             // Resolved before anything built from it (texture arrays, layer params, decorator buffers).
             // New heights change what the stamps' height/slope filters let through, so they rebake both.
-            bool splatDirty = Terrain.ConsumeFlags(TerrainDirtyFlags.SplatPack) || hasHeightWork;
+            bool splatAsked = Terrain.ConsumeFlags(TerrainDirtyFlags.SplatPack);
+            bool splatDirty = splatAsked || hasHeightWork;
             bool decoDirty = Terrain.ConsumeFlags(TerrainDirtyFlags.DecoPrepass) || splatDirty;
+            // Where the splat bake composites again: the regions local stamps' edits gave, or everywhere. New heights
+            // that no stamp asked for (terrain settings) may have moved any stamp's height or slope filter.
+            bool splatLocal = Terrain.TakeSplatRegion(out var splatRegionMin, out var splatRegionMax) && splatAsked;
 
             if (splatDirty || decoDirty)
             {
                 using var _ = _paletteMarker.Auto();
+                var paletteBefore = _layerPalette;
                 if (splatDirty) RefreshLayerPalette();
+                if (_layerPalette != paletteBefore) splatLocal = false;   // other channels: every texel changes
                 RefreshDecoratorPalette();
             }
 
@@ -647,7 +653,23 @@ namespace Freefall.Components
             {
                 _needHeightFieldReadback = false;
                 using var readbackScope = _readbackMarker.Auto();
-                var heights = _baker.ReadbackHeightmap();
+                // Only where the stamps changed it since the last readback, when a field of this size is there to
+                // copy (in texels: sample i stands at (i + 0.5) · size / N, see GetHeight; a texel more each side)
+                float[,]? heights;
+                var previousField = Terrain.HeightField;
+                if (!_heightChangeAll && previousField != null && Transform != null && _heightChangeMax.X >= _heightChangeMin.X)
+                {
+                    var origin = Transform.WorldPosition;
+                    var size = Terrain.TerrainSize;
+                    int n = previousField.GetLength(0);
+                    heights = _baker.ReadbackHeightmap(previousField,
+                        (int)MathF.Floor((_heightChangeMin.X - origin.X) / size.X * n - 0.5f) - 1,
+                        (int)MathF.Floor((_heightChangeMin.Y - origin.Z) / size.Y * n - 0.5f) - 1,
+                        (int)MathF.Ceiling((_heightChangeMax.X - origin.X) / size.X * n - 0.5f) + 2,
+                        (int)MathF.Ceiling((_heightChangeMax.Y - origin.Z) / size.Y * n - 0.5f) + 2);
+                }
+                else
+                    heights = _baker.ReadbackHeightmap();
                 if (heights != null && Terrain != null)
                 {
                     Terrain.SetHeightField(heights);
@@ -684,8 +706,26 @@ namespace Freefall.Components
                     int sliceCount = (_layerPalette.Count + 3) / 4;
 
                     // Ensure packed array exists at correct resolution/slice count
+                    var arrayBefore = _packedControlArray;
                     EnsurePackedControlArray(res, sliceCount);
                     ControlMapsArray = _packedControlTexture;
+
+                    // A local edit redoes only its region (control texels; the map is Y-flipped against the terrain's
+                    // UV), a texel more each side. A new array has nothing outside it yet.
+                    (int x, int y, int width, int height)? region = null;
+                    if (splatLocal && arrayBefore == _packedControlArray && arrayBefore != null)
+                    {
+                        var origin = Transform?.WorldPosition ?? Vector3.Zero;
+                        var size = Terrain.TerrainSize;
+                        int x0 = (int)MathF.Floor((splatRegionMin.X - origin.X) / size.X * res) - 1;
+                        int x1 = (int)MathF.Ceiling((splatRegionMax.X - origin.X) / size.X * res) + 1;
+                        int y0 = (int)MathF.Floor((1f - (splatRegionMax.Y - origin.Z) / size.Y) * res) - 1;
+                        int y1 = (int)MathF.Ceiling((1f - (splatRegionMin.Y - origin.Z) / size.Y) * res) + 1;
+                        x0 = Math.Clamp(x0, 0, res); x1 = Math.Clamp(x1, 0, res);
+                        y0 = Math.Clamp(y0, 0, res); y1 = Math.Clamp(y1, 0, res);
+                        region = (x0, y0, Math.Max(0, x1 - x0), Math.Max(0, y1 - y0));
+                    }
+                    SplatBakeTexels = region is { } r ? (long)r.width * r.height : (long)res * res;
 
                     TerrainBaker.CoveragePlan plan;
                     using (_splatPlanMarker.Auto())
@@ -710,7 +750,7 @@ namespace Freefall.Components
                             ResourceStates.Common, ResourceStates.UnorderedAccess);
 
                         PixMarker.Begin(list, "Terrain splat bake");
-                        baker.BakeSplat(plan, list, terrain, hmSrv, arrayUAV, topLayerUAV, res, sliceCount);
+                        baker.BakeSplat(plan, list, terrain, hmSrv, arrayUAV, topLayerUAV, res, sliceCount, region);
                         PixMarker.End(list);
                         list.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(packedArray)));
                         list.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(topLayerTex)));
@@ -2039,7 +2079,7 @@ namespace Freefall.Components
             public uint AlphaClip;        // mesh mode: 1 = alpha-test albedo, 0 = opaque material
             public float HeightNoiseScale;  // world size of short vs. lush patches (m), 0 = off
             public float HeightNoiseAmount; // 0 = none, 1 = 0.4x .. 1.4x height
-            public uint PlantPartsIdx;      // Flowers / Spikes: bindless index of the parts atlas, 0 = none
+            public uint PlantPartsIdx;      // Flowers / Spikes / Ferns / Grain: bindless index of the parts atlas, 0 = none
         }
 
         /// <summary>
@@ -2834,6 +2874,10 @@ namespace Freefall.Components
         /// <summary>Diagnostics: stamp / spline change events that requested a re-bake (editor debug stats).</summary>
         public static int RebakeRequestCount;
 
+        /// <summary>Diagnostics: control texels the last splat bake composited (the whole map, or a local edit's region).</summary>
+        [Reflection.DontSerialize]
+        public long SplatBakeTexels { get; private set; }
+
         // ── Changed region ──
         // Listeners of TerrainHeightsChanged (PCG, surface meshes) only rebuild if they touch the region the
         // stamps changed: where each edited stamp was at the last readback, plus where it is now.
@@ -2921,21 +2965,27 @@ namespace Freefall.Components
             _heightChangeMax = Vector2.Max(_heightChangeMax, max);
         }
 
+        /// <summary>Where a changed local stamp was and is: the region the height readback reports and the splat bake redoes.</summary>
         private void MarkStampRegion(TerrainStamp stamp)
         {
             _heightRegionMarked = true;
 
             if (_stampRegions.TryGetValue(stamp, out var old))
+            {
                 GrowHeightChange(old.min, old.max);
+                Terrain?.MarkSplatRegion(old.min, old.max);
+            }
 
             if (TryGetStampRegion(stamp, out var min, out var max))
             {
                 GrowHeightChange(min, max);
+                Terrain?.MarkSplatRegion(min, max);
                 _stampRegions[stamp] = (min, max);
             }
             else
             {
                 _heightChangeAll = true;
+                Terrain?.MarkForUpdate(TerrainDirtyFlags.SplatPack);
             }
         }
 
@@ -2958,12 +3008,15 @@ namespace Freefall.Components
         /// <summary>
         /// Request the rebakes a changed stamp needs.
         ///
-        /// Height stamps rebake everything: the splat and deco stamps' height/slope filters depend on them.
-        /// Local splat and deco stamps also go through the height path, although they leave the heights
-        /// alone: its readback is what tells PCG and surface meshes which region changed, and PCG's
-        /// ExcludeStamps depends on where the splat stamps are.
-        /// Global splat and deco stamps skip it. They have no region, so they would regenerate every
-        /// PCG component on the terrain for a change none of them can see.
+        /// Height stamps rebake everything: the splat and deco stamps' height/slope filters depend on them. The
+        /// splat bake redoes only the stamp's region (where it was and where it is), the height readback tells PCG
+        /// and surface meshes which region changed.
+        /// Splat and deco stamps leave the heights alone and skip the height path (on Eldermoor's 4097² map a height
+        /// bake and its readback cost ~50 ms of GPU and ~200 ms of CPU per edit; until 2026-10-26 every paint edit
+        /// paid it to have PCG hear of the region). A local splat stamp rebakes the paint of its region and tells
+        /// PCG at once (TerrainPaintChanged: ExcludeStamps tests the stamps' shapes on the CPU, not the bake); a local
+        /// deco stamp rebakes the ground cover. Global ones have no region: everywhere, and no message, which would
+        /// regenerate every PCG component on the terrain for a change none of them can see.
         /// </summary>
         private void RequestRebake(TerrainStamp stamp)
         {
@@ -2984,12 +3037,53 @@ namespace Freefall.Components
                 return;
             }
 
-            MarkStampRegion(stamp);
+            if (stamp is DecoStamp)
+            {
+                Terrain?.MarkForUpdate(TerrainDirtyFlags.DecoPrepass);
+                return;
+            }
+
+            if (stamp is SplatStamp)
+            {
+                var change = MarkPaintRegion(stamp);
+                Terrain?.MarkForUpdate(TerrainDirtyFlags.AlbedoBake | TerrainDirtyFlags.DecoPrepass);
+                MessageDispatcher.Send(EngineMsg.TerrainPaintChanged, change);
+                return;
+            }
+
+            MarkStampRegion(stamp);     // the splat rebake, of the stamp's region
             Terrain?.MarkForUpdate(
                 TerrainDirtyFlags.HeightBake |
-                TerrainDirtyFlags.SplatPack |
                 TerrainDirtyFlags.AlbedoBake |
                 TerrainDirtyFlags.DecoPrepass);
+        }
+
+        /// <summary>
+        /// Where a changed local splat stamp was and is: the splat bake's region, and the region the paint message
+        /// gives (everywhere when the stamp has none, e.g. a spline that lost its points).
+        /// </summary>
+        private TerrainHeightsChange MarkPaintRegion(TerrainStamp stamp)
+        {
+            var min = new Vector2(float.MaxValue);
+            var max = new Vector2(float.MinValue);
+            if (_stampRegions.TryGetValue(stamp, out var old))
+            {
+                min = Vector2.Min(min, old.min);
+                max = Vector2.Max(max, old.max);
+            }
+
+            if (TryGetStampRegion(stamp, out var newMin, out var newMax))
+            {
+                min = Vector2.Min(min, newMin);
+                max = Vector2.Max(max, newMax);
+                _stampRegions[stamp] = (newMin, newMax);
+                Terrain?.MarkSplatRegion(min, max);
+                return new TerrainHeightsChange(Terrain, false, min, max);
+            }
+
+            _stampRegions.Remove(stamp);
+            Terrain?.MarkForUpdate(TerrainDirtyFlags.SplatPack);
+            return new TerrainHeightsChange(Terrain, true, min, max);
         }
 
         private void OnStampChanged(Message msg)

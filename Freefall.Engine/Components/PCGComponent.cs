@@ -13,8 +13,9 @@ namespace Freefall.Components
     /// On Execute: destroys previous output, injects context (Spline, etc.) into source nodes,
     /// then runs the graph. SpawnPrefab nodes parent their output under this entity.
     ///
-    /// Live editing: SplineChanged, GraphChanged and TerrainHeightsChanged messages Invalidate() the component;
-    /// PCGScheduler then regenerates it once, after the edit (gizmo drag, inspector drag, build) has finished.
+    /// Live editing: SplineChanged, GraphChanged, TerrainHeightsChanged and (for graphs that keep clear of painted
+    /// ground) TerrainPaintChanged messages Invalidate() the component; PCGScheduler then regenerates it once, after
+    /// the edit (gizmo drag, inspector drag, build) has finished.
     ///
     /// The output is a function of the scene alone, whatever ran when: all components run in one order
     /// (CompareOrder), a graph only takes the output of components before it in that order into account (Sees),
@@ -243,6 +244,7 @@ namespace Freefall.Components
             MessageDispatcher.RemoveListener(EngineMsg.SplineChanged, OnSplineChanged);
             MessageDispatcher.RemoveListener(EngineMsg.GraphChanged, OnGraphChanged);
             MessageDispatcher.RemoveListener(EngineMsg.TerrainHeightsChanged, OnTerrainHeightsChanged);
+            MessageDispatcher.RemoveListener(EngineMsg.TerrainPaintChanged, OnTerrainPaintChanged);
             PCGScheduler.Cancel(this);
             RemoveOutput();
             base.Destroy();
@@ -262,6 +264,7 @@ namespace Freefall.Components
             MessageDispatcher.AddListener(EngineMsg.SplineChanged, OnSplineChanged);
             MessageDispatcher.AddListener(EngineMsg.GraphChanged, OnGraphChanged);
             MessageDispatcher.AddListener(EngineMsg.TerrainHeightsChanged, OnTerrainHeightsChanged);
+            MessageDispatcher.AddListener(EngineMsg.TerrainPaintChanged, OnTerrainPaintChanged);
 
             // Queued, not run here: components wake in no particular order, and at load before the terrain
             // heights are there. PCGScheduler runs them at the end of the frame, in order.
@@ -293,6 +296,19 @@ namespace Freefall.Components
 
             foreach (var node in Graph.Nodes)
                 if (node is TerrainProjection or MeshProjection { IncludeTerrain: true }) { Invalidate(); return; }
+        }
+
+        // A splat stamp moved, changed or went: graphs that keep clear of painted ground (ExcludeStamps) around it
+        // regenerate. Its own stamp's edits come as SplineChanged / member changes of this entity anyway.
+        private void OnTerrainPaintChanged(Message msg)
+        {
+            if (Graph == null || OutputEntity == null) return;
+            if (msg.Data is TerrainHeightsChange { All: false } change
+                && TryGetRegion(out var min, out var max) && !change.Overlaps(min, max))
+                return;
+
+            foreach (var node in Graph.Nodes)
+                if (node is ExcludeStamps) { Invalidate(); return; }
         }
 
         private void OnSplineChanged(Message msg)
