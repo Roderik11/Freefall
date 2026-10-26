@@ -287,7 +287,7 @@ float4 DecoratorGroundTint(float2 ctrlUV, float2 terrainLocal, float dist, out f
             uint packed = c < 4 ? s0[c] : s1[c - 4];
             uint group = packed >> 8;
             float coverage = (packed & 0xFF) / 255.0;
-            if (group == 255 || coverage <= 0) continue;
+            if (group >= 254 || coverage <= 0) continue;     // 255 empty, 254 names the rows (decoration_prepass.hlsl)
             if (group != cachedGroup)
             {
                 float4 even = tints[group * 2];
@@ -816,7 +816,7 @@ FragmentOutput PS(VertexOutput input)
             uint packed = slices[k / 4][k % 4];
             uint sIdx = packed >> 8;
             uint wt = packed & 0xFF;
-            if (sIdx == 255) break;
+            if (sIdx >= 254) break;                         // 255 empty, 254 names the rows
             maxWt = max(maxWt, wt);
             slotCount++;
         }

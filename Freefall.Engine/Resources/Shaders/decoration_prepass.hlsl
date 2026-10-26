@@ -97,6 +97,11 @@ void CSBuildDecoControl(uint3 dtid : SV_DispatchThreadID)
     float coverage[MAX_DECORATORS];
     for (uint d0 = 0; d0 < MAX_DECORATORS; d0++) coverage[d0] = 0;
 
+    // The rows here: those of the last Add stamp that holds the texel (weight over a half) for its decorator. A
+    // later stamp of that decorator without rows scatters it again.
+    uint rowIdx = 0;
+    uint rowSlot = COVERAGE_ALL_TARGETS;
+
     for (uint i = 0; i < StampCount; i++)
     {
         CoverageStamp stamp = stamps[i];
@@ -127,7 +132,14 @@ void CSBuildDecoControl(uint3 dtid : SV_DispatchThreadID)
         if (CoverageOp(stamp) == DECO_OP_ADD)
         {
             if (stamp.Target < decoCount)
+            {
                 coverage[stamp.Target] = max(coverage[stamp.Target], saturate(weight * stamp.Strength));
+                if (weight * stamp.Strength >= 0.5 && (stamp.Rows != 0 || stamp.Target == rowSlot))
+                {
+                    rowIdx = stamp.Rows;
+                    rowSlot = stamp.Rows != 0 ? stamp.Target : COVERAGE_ALL_TARGETS;
+                }
+            }
         }
         else
         {
@@ -186,6 +198,14 @@ void CSBuildDecoControl(uint3 dtid : SV_DispatchThreadID)
         topIdx[pos] = d;
         topWt[pos]  = weight;
         if (topCount < 8) topCount++;
+    }
+
+    // The rows' marker takes the first free channel, or the lightest decorator's
+    if (rowIdx != 0 && rowSlot < decoCount && coverage[rowSlot] > 0)
+    {
+        uint at = min(topCount, 7u);
+        topIdx[at] = DECO_ROW_MARKER;
+        topWt[at] = rowIdx;
     }
 
     // Pack: (decoratorSlot << 8) | weight

@@ -68,6 +68,14 @@ namespace Freefall.Assets
         private int _decoStampBufferCapacity;
         private GraphicsBuffer _decoSplineBuffer;
         private int _decoSplineCapacity;
+        private GraphicsBuffer _decoRowBuffer;
+        private int _decoRowCapacity;
+
+        /// <summary>
+        /// The last decoration bake's row stamps (StructuredBuffer of DecoRowGPU) for the spawn, 0 when none grows in
+        /// rows: a control texel whose channel holds slot 254 names one of them in its low byte.
+        /// </summary>
+        public uint DecoRowsSrv => _decoRowBuffer?.SrvIndex ?? 0u;
 
         /// <summary>Layers a terrain can render: 8 RGBA slices of the packed control array.</summary>
         public const int MaxLayers = 32;
@@ -114,7 +122,7 @@ namespace Freefall.Assets
             public float Fade;       // the stamp's start / end fade here (TerrainStamp.StartFade, EndFade), 1 = none
         }
 
-        /// <summary>GPU struct matching HLSL CoverageStamp (terrain_coverage.hlsli). 112 bytes.</summary>
+        /// <summary>GPU struct matching HLSL CoverageStamp (terrain_coverage.hlsli). 116 bytes.</summary>
         [StructLayout(LayoutKind.Sequential)]
         internal struct CoverageStampGPU
         {
@@ -138,7 +146,25 @@ namespace Freefall.Assets
             public float PatchSoftness;
             public uint PatchSeed;
             public Vector4 Bounds;           // terrain UV min x, min y, max x, max y the shape can reach (CoverageBounds)
+            public uint Rows;                // deco: 1 + index into CoveragePlan.Rows (0 = scattered)
         }
+
+        /// <summary>
+        /// GPU struct matching HLSL DecoRow (grass_compute.hlsl): one DecoStamp's rows. 32 bytes. The deco control
+        /// texture names the one a texel holds; the spawn moves that decorator's plants onto them.
+        /// </summary>
+        [StructLayout(LayoutKind.Sequential)]
+        internal struct DecoRowGPU
+        {
+            public Vector2 Normal;           // world XZ, across the rows
+            public float Spacing;            // metres between row centres
+            public float Width;              // metres, the band a row's plants stand in
+            public uint Slot;                // the decorator slot the rows apply to
+            public uint _pad0, _pad1, _pad2;
+        }
+
+        /// <summary>The most row stamps a decoration bake holds (texel marker 254, index in the low byte).</summary>
+        private const int MaxDecoRows = 255;
 
         private const uint CoverageGlobal = 1u;
         private const uint CoverageFilter = 2u;
@@ -1223,6 +1249,7 @@ namespace Freefall.Assets
         {
             internal readonly List<CoverageStampGPU> Stamps = new();
             internal readonly List<StampSplinePointGPU> SplinePoints = new();
+            internal readonly List<DecoRowGPU> Rows = new();     // deco: the stamps that grow in rows
 
             /// <summary>Channels (splat) or slots (deco) the stamps index into.</summary>
             public int TargetCount;
@@ -1296,10 +1323,49 @@ namespace Freefall.Assets
                 desc.Flags |= (uint)stamp.Op << 8;
                 desc.Target = target;
                 desc.Strength = stamp.Weight;
+                if (stamp.Op == DecoOp.Add && stamp.RowSpacing > 0.05f && plan.Rows.Count < MaxDecoRows)
+                {
+                    plan.Rows.Add(new DecoRowGPU
+                    {
+                        Normal = RowNormal(stamp),
+                        Spacing = stamp.RowSpacing,
+                        Width = Math.Clamp(stamp.RowWidth, 0f, stamp.RowSpacing),
+                        Slot = target,
+                    });
+                    desc.Rows = (uint)plan.Rows.Count;
+                }
                 plan.Stamps.Add(desc);
             }
 
             return plan;
+        }
+
+        /// <summary>
+        /// Across a row stamp's rows in world XZ: the rows run along its spline's longest control edge (a field is
+        /// ploughed and sown along its length), or along world +X without a spline, turned by RowAngle.
+        /// </summary>
+        private static Vector2 RowNormal(DecoStamp stamp)
+        {
+            var along = Vector2.UnitX;
+            var spline = stamp.IsSplineMode ? stamp.GetSpline() : null;
+            if (spline != null && spline.Points.Count >= 2 && spline.Transform != null)
+            {
+                var world = spline.Transform.Matrix;
+                int n = spline.Points.Count, edges = spline.Closed ? n : n - 1;
+                float longest = 0f;
+                for (int i = 0; i < edges; i++)
+                {
+                    var a = Vector3.Transform(spline.Points[i], world);
+                    var b = Vector3.Transform(spline.Points[(i + 1) % n], world);
+                    var edge = new Vector2(b.X - a.X, b.Z - a.Z);
+                    float lengthSq = edge.LengthSquared();
+                    if (lengthSq > longest) { longest = lengthSq; along = edge / MathF.Sqrt(lengthSq); }
+                }
+            }
+            float turn = stamp.RowAngle * MathF.PI / 180f;
+            float c = MathF.Cos(turn), s = MathF.Sin(turn);
+            along = new Vector2(along.X * c - along.Y * s, along.X * s + along.Y * c);
+            return new Vector2(-along.Y, along.X);
         }
 
         private static Dictionary<T, int> BuildIndex<T>(IReadOnlyList<T> items) where T : class
@@ -1555,6 +1621,18 @@ namespace Freefall.Assets
 
             UploadCoverage(plan, ref _decoStampBuffer, ref _decoStampBufferCapacity,
                 ref _decoSplineBuffer, ref _decoSplineCapacity);
+
+            // The row stamps the control texture will name, for the spawn (DecoRowsSrv) until the next bake
+            if (plan.Rows.Count > 0)
+            {
+                EnsureUpload<DecoRowGPU>(ref _decoRowBuffer, ref _decoRowCapacity, plan.Rows.Count, 8);
+                Upload(_decoRowBuffer, plan.Rows);
+            }
+            else
+            {
+                Engine.Device.DeferDispose(_decoRowBuffer);
+                _decoRowBuffer = null;
+            }
 
             var device = Engine.Device;
             cmd.SetDescriptorHeaps(1, new[] { device.SrvHeap });
@@ -1934,6 +2012,7 @@ namespace Freefall.Assets
             _splatSplineBuffer?.Dispose();
             _decoStampBuffer?.Dispose();
             _decoSplineBuffer?.Dispose();
+            _decoRowBuffer?.Dispose();
         }
     }
 }

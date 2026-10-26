@@ -56,6 +56,7 @@ cbuffer PushConstants : register(b3)
     uint LayerPlantTintIdx;         // slot 25 — SRV: StructuredBuffer<float4>, TerrainLayer.PlantTint per channel
     uint SplatLayerCount;           // slot 26 — layers in the palette (0 = no plant tint)
     uint HoleTexIdx;                // slot 27 — SRV: R8 hole mask (HoleStamp, terrain_holes.hlsli), 0 = no holes
+    uint DecoRowsIdx;               // slot 28 — SRV: StructuredBuffer<DecoRow>, 0 = nothing grows in rows
 };
 
 // Camera frustum in terrain-local space (root slot 1 → register b0, uploaded by the terrain quadtree pass).
@@ -175,6 +176,18 @@ bool CellInFrustum(float3 center, float radius)
 }
 
 // ─── GPU structs (must match grass.fx and TerrainRenderer.cs) ──────────────
+
+// A DecoStamp's rows (C# DecoRowGPU, 32 bytes): a control texel channel with slot 254 (DECO_ROW_MARKER) names one in
+// its low byte (1-based). The spawn moves its decorator's plants onto the nearest row.
+struct DecoRow
+{
+    float2 Normal;      // world XZ, across the rows
+    float  Spacing;     // metres between row centres
+    float  Width;       // the band a row's plants stand in (m)
+    uint   Slot;        // the decorator they apply to
+    uint3  _pad;
+};
+#define DECO_ROW_MARKER 254u
 
 // One TerrainDecorator: the slot index stored in the control texture. Its variants are a run of
 // DecoratorSlots.
@@ -458,6 +471,7 @@ groupshared uint  gs_entries;
 groupshared uint  gs_cellValid;
 groupshared uint  gs_groupMask;                      // bit N: decorator N covers one of the 3x3 texels
 groupshared float gs_cov[MAX_DECORATORS][9];         // coverage 0..1 per decorator at the 3x3 texel centres, row = z offset
+groupshared uint  gs_row[9];                         // per texel: 1 + the DecoRow it holds, 0 = no rows (the spawn reads [4])
 
 // The i-th cell of a square spiral around the centre cell: ring k holds the 8k cells at Chebyshev distance k.
 int2 SpiralCell(uint i)
@@ -566,6 +580,7 @@ void CS_SpawnInstances(uint3 gid : SV_GroupID, uint3 gtid3 : SV_GroupThreadID)
     if (flatThread < 9)
     {
         for (uint z = 0; z < MAX_DECORATORS; z++) gs_cov[z][flatThread] = 0;
+        gs_row[flatThread] = 0;
         int2 d = int2(flatThread % 3, flatThread / 3) - 1;                 // cell offset in x, z
         int2 texel = clamp(int2(cx + d.x, cy - d.y), int2(0, 0), int2(int(ControlWidth) - 1, int(ControlHeight) - 1));
         uint4 s0 = controlTex.Load(int4(texel, 0, 0));
@@ -575,6 +590,7 @@ void CS_SpawnInstances(uint3 gid : SV_GroupID, uint3 gtid3 : SV_GroupThreadID)
             uint packed = ch < 4 ? s0[ch] : s1[ch - 4];
             uint groupIdx = packed >> 8;
             uint coverage = packed & 0xFF;
+            if (groupIdx == DECO_ROW_MARKER && DecoRowsIdx != 0) { gs_row[flatThread] = coverage; continue; }
             if (groupIdx >= MAX_DECORATORS || coverage == 0) continue;
             gs_cov[groupIdx][flatThread] = float(coverage) / 255.0;
             InterlockedOr(gs_groupMask, 1u << groupIdx);
@@ -710,6 +726,26 @@ void CS_SpawnInstances(uint3 gid : SV_GroupID, uint3 gtid3 : SV_GroupThreadID)
             float overshoot = 0;// 0.5f * normalizedWeight;
             float wx = tileOrig.x + (rngX * (1.0 + 2.0 * overshoot) - overshoot) * ts;
             float wz = tileOrig.y + (rngY * (1.0 + 2.0 * overshoot) - overshoot) * ts;
+
+            // A crop in rows (DecoStamp.RowSpacing): the cell's texel names the rows, and a plant of their decorator
+            // moves across them onto the nearest row, somewhere within the row's width. In world XZ, so a row runs on
+            // unbroken from cell to cell; the coverage below is read where the plant ends up.
+            uint rowRef = gs_row[4];
+            if (rowRef != 0)
+            {
+                StructuredBuffer<DecoRow> rows = ResourceDescriptorHeap[DecoRowsIdx];
+                DecoRow row = rows[rowRef - 1];
+                if (row.Slot == coverGroup)
+                {
+                    float across = dot(float2(wx, wz), row.Normal);
+                    float jitter = (float(pcg(instSeed + 7577u)) / 4294967295.0 - 0.5) * row.Width;
+                    float move = round(across / row.Spacing) * row.Spacing + jitter - across;
+                    wx += row.Normal.x * move;
+                    wz += row.Normal.y * move;
+                    rngX += row.Normal.x * move / ts;
+                    rngY += row.Normal.y * move / ts;
+                }
+            }
 
             // The candidate's rank in the distance thinning (below): its index in the cell's list, jittered. Where
             // every kind the variant draws thins, the share its spot keeps on ground facing the view (the most it can

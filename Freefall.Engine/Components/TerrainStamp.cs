@@ -80,6 +80,10 @@ namespace Freefall.Components
         public override void Destroy()
         {
             Transform?.OnChanged -= Transform_OnChanged;
+            // Taken away: the ground it shaped or painted goes back to what the other stamps make of it, where it was.
+            // Until 2026-10-27 only a hole did this; any other stamp stayed baked in until some later edit rebaked,
+            // which then took every removal at once (18 farm stamps deleted, the next entity_build: a GPU timeout)
+            MessageDispatcher.Send(EngineMsg.StampChanged, this);
         }
 
         private void Transform_OnChanged()

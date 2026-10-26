@@ -25,13 +25,6 @@ namespace Freefall.Components
 
         protected override void OnEnabledChanged() => MessageDispatcher.Send(EngineMsg.StampChanged, this);
 
-        public override void Destroy()
-        {
-            base.Destroy();
-            // Taken away: whatever it cut is closed again
-            MessageDispatcher.Send(EngineMsg.StampChanged, this);
-        }
-
         protected override Color4 GizmoColor => new Color4(0.95f, 0.25f, 0.3f, 1f); // red
     }
 }

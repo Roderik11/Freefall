@@ -7,7 +7,7 @@
 #ifndef TERRAIN_COVERAGE_HLSLI
 #define TERRAIN_COVERAGE_HLSLI
 
-// A SplatStamp or DecoStamp as the GPU sees it (matches C# CoverageStampGPU, 112 bytes)
+// A SplatStamp or DecoStamp as the GPU sees it (matches C# CoverageStampGPU, 116 bytes)
 struct CoverageStamp
 {
     float2 Center;              // terrain UV center (radial)
@@ -31,7 +31,10 @@ struct CoverageStamp
     uint   PatchSeed;
     float4 Bounds;              // terrain UV (min x, min y, max x, max y) of all the shape can reach, falloff and
                                 // edge noise included; nothing outside it is tested against the shape
+    uint   Rows;                // deco: 1 + the stamp's DecoRow (grass_compute.hlsl), 0 = scattered
 };
+
+#define DECO_ROW_MARKER 254u    // a control texel channel with this slot names a DecoRow in its low byte
 
 #define COVERAGE_GLOBAL 1u      // covers the whole terrain; shape fields are ignored
 #define COVERAGE_FILTER 2u      // height/slope/layer terms can reject a texel

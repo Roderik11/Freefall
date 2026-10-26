@@ -2639,6 +2639,7 @@ namespace Freefall.Components
                 }
                 cs.SetPushConstant("SplatLayerCount", plantTints ? (uint)_layerPalette.Count : 0u);
                 cs.SetPushConstant("HoleTex", HoleSrv);   // nothing spawns in a hole
+                cs.SetPushConstant("DecoRows", _baker?.DecoRowsSrv ?? 0u);   // crops in rows (DecoStamp.RowSpacing)
 
                 // ── cbuffer DecoParams ──
                 cs.SetParam("TerrainSize", new Vector2(Terrain.TerrainSize.X, Terrain.TerrainSize.Y));
@@ -2948,8 +2949,9 @@ namespace Freefall.Components
         private static bool TryGetStampRegion(TerrainStamp stamp, out Vector2 min, out Vector2 max)
         {
             min = max = default;
-            // A global stamp has no region: whatever it changes, it can change anywhere
-            if (stamp.IsGlobal) return false;
+            // A global stamp has no region: whatever it changes, it can change anywhere. A removed one is nowhere now
+            // (its spline may already be gone with it): only where it was counts
+            if (stamp.IsGlobal || stamp.IsDestroyed) return false;
             if (stamp.IsSplineMode && stamp.GetSpline().Points.Count < 2) return false;
 
             var bounds = stamp.GetWorldBounds();
@@ -2981,6 +2983,10 @@ namespace Freefall.Components
                 GrowHeightChange(min, max);
                 Terrain?.MarkSplatRegion(min, max);
                 _stampRegions[stamp] = (min, max);
+            }
+            else if (stamp.IsDestroyed && _stampRegions.Remove(stamp))
+            {
+                // removed: where it was, marked above
             }
             else
             {
@@ -3077,6 +3083,13 @@ namespace Freefall.Components
                 min = Vector2.Min(min, newMin);
                 max = Vector2.Max(max, newMax);
                 _stampRegions[stamp] = (newMin, newMax);
+                Terrain?.MarkSplatRegion(min, max);
+                return new TerrainHeightsChange(Terrain, false, min, max);
+            }
+
+            if (stamp.IsDestroyed && _stampRegions.Remove(stamp))
+            {
+                // Removed: where it was
                 Terrain?.MarkSplatRegion(min, max);
                 return new TerrainHeightsChange(Terrain, false, min, max);
             }
