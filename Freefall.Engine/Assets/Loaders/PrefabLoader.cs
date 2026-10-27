@@ -42,15 +42,18 @@ namespace Freefall.Assets.Loaders
 
         /// <summary>
         /// Hot reload: swap in the reimported YAML so future Instantiate() calls use it.
-        /// Already-placed instances are entities and keep their component state.
+        /// Already-placed instances are entities and keep their component state, except their per-slot materials
+        /// where they still are the old prefab's (Prefab.FollowMaterialSlots).
         /// </summary>
         public bool Reload(Asset existing, string cachePath, string name, AssetManager manager, string guid)
         {
             if (existing is not Prefab prefab)
                 return false;
 
+            var old = prefab.SourceYaml;
             using (var stream = Artifacts.Open(cachePath))
                 prefab.SourceYaml = _packer.Read(stream).Yaml;
+            prefab.FollowMaterialSlots(old);
             return true;
         }
 

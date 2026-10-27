@@ -408,6 +408,60 @@ namespace Freefall.Assets
         }
 
         /// <summary>
+        /// After a hot reload of this prefab (<paramref name="oldYaml"/> = its YAML before): live instances whose
+        /// root MeshRenderer still has the old prefab's per-slot materials take the new ones. A model's own prefab
+        /// numbers its slots in the order the parts first appear in the file, so a part added to the model (an
+        /// apple tree's fruit, written after the wood) moves every later slot: the reloaded mesh's parts then drew
+        /// with their neighbours' materials until the scene was loaded again. A list an instance has changed on its
+        /// own stays as it is. Returns how many instances changed.
+        /// </summary>
+        internal int FollowMaterialSlots(byte[]? oldYaml)
+        {
+            if (oldYaml == null || oldYaml.Length == 0 || SourceYaml == null || SourceYaml.Length == 0) return 0;
+            var instances = EntityManager.Entities.Where(e => e.Prefab == this).ToList();
+            if (instances.Count == 0) return 0;
+
+            var before = new EntitySerializer { DuplicateMode = true }.LoadFromBytes(oldYaml, skipPrefabHydration: true);
+            var after = new EntitySerializer { DuplicateMode = true }.LoadFromBytes(SourceYaml, skipPrefabHydration: true);
+            int changed = 0;
+            var was = before.Count > 0 ? before[0].GetComponent<MeshRenderer>() : null;
+            var now = after.Count > 0 ? after[0].GetComponent<MeshRenderer>() : null;
+            if (was != null && now != null && !SameSlots(was.Materials, now.Materials))
+            {
+                foreach (var instance in instances)
+                {
+                    var renderer = instance.GetComponent<MeshRenderer>();
+                    if (renderer == null || !SameSlots(renderer.Materials, was.Materials)) continue;
+                    renderer.Materials = now.Materials
+                        .Select(o => new MaterialOverride { MaterialSlot = o.MaterialSlot, Material = o.Material })
+                        .ToList();
+                    changed++;
+                }
+            }
+
+            for (int i = before.Count - 1; i >= 0; i--) before[i].Destroy();
+            for (int i = after.Count - 1; i >= 0; i--) after[i].Destroy();
+            if (changed > 0)
+                Debug.Log($"[Prefab] '{Name}': {changed} of {instances.Count} instances take its new material slots");
+            return changed;
+        }
+
+        /// <summary>The same material in every slot (by asset GUID: a reload keeps the instance, a load resolves anew).</summary>
+        private static bool SameSlots(List<MaterialOverride>? a, List<MaterialOverride>? b)
+        {
+            int na = a?.Count ?? 0, nb = b?.Count ?? 0;
+            if (na != nb) return false;
+            for (int i = 0; i < na; i++)
+            {
+                var slot = a![i];
+                var other = b!.Find(o => o.MaterialSlot == slot.MaterialSlot);
+                if (other == null) return false;
+                if (!ReferenceEquals(other.Material, slot.Material) && other.Material?.Guid != slot.Material?.Guid) return false;
+            }
+            return true;
+        }
+
+        /// <summary>
         /// Copy serializable fields from source component to target component (same type).
         /// Uses Reflector.GetMapping for field discovery, skips DontSerialize/Ignored fields.
         /// Only copies fields from the concrete type — Component base fields (Entity, UID, Id, etc.)
