@@ -533,7 +533,7 @@ namespace Freefall.PCG
 
 
     [Category("Noise")]
-    public class DensityNoise : Node
+    public class DensityNoise : Node, IWorldSpaceNode
     {
         [Input]
         public SamplePointSet Input;
@@ -543,9 +543,19 @@ namespace Freefall.PCG
         [ValueRange(0f, 1f)]
         public float UpperBound = 1f;
 
-        /// <summary>World size of one noise cell in meters. Larger = broader clumps and gaps.</summary>
-        [ValueRange(0.1f, 100f)]
+        /// <summary>World size of one noise cell in meters. Larger = broader clumps and gaps (a forest's clearings: 100-200).</summary>
+        [ValueRange(0.1f, 400f)]
         public float Scale = 1f;
+
+        /// <summary>
+        /// Sample the noise at the points' world positions instead of their positions relative to the entity: areas
+        /// that share a graph get patterns of their own, and none has a gap at its pivot (the noise is 0 at the origin).
+        /// </summary>
+        public bool WorldSpace;
+
+        /// <summary>Local-to-world matrix of the PCG entity. Injected by PCGComponent.</summary>
+        [Browsable(false)] [Freefall.Reflection.DontSerialize]
+        public Matrix4x4 WorldMatrix { get; set; } = Matrix4x4.Identity;
 
         [Output]
         public SamplePointSet Output;
@@ -565,7 +575,8 @@ namespace Freefall.PCG
 
             for (int i = 0; i < result.Count; i++)
             {
-                float n = HashNoise(result.position[i].X * invScale, result.position[i].Z * invScale);
+                var p = WorldSpace ? Vector3.Transform(result.position[i], WorldMatrix) : result.position[i];
+                float n = HashNoise(p.X * invScale, p.Z * invScale);
                 float value = LowerBound + n * range;
                 result.density[i] *= value;
             }
@@ -611,8 +622,164 @@ namespace Freefall.PCG
 
         public DensityFunction DensityFunction = DensityFunction.Minimum;
 
+        /// <summary>
+        /// Metres round each point of B, times its scale, inside which A's points go (the forest's trees round an
+        /// ancient one). 0 = only A's points that sit exactly on one of B's.
+        /// </summary>
+        public float Radius;
+
         [Output]
         public SamplePointSet Output;
+
+        /// <summary>A's points that are not within Radius (times its scale) of a point of B, on the ground plane.</summary>
+        public override void Process()
+        {
+            var a = GetInputValue<SamplePointSet>("InputA");
+            var b = GetInputValue<SamplePointSet>("InputB");
+            if (a == null || a.Count == 0)
+            {
+                SetOutput("Output", SamplePointSet.Empty());
+                return;
+            }
+            if (b == null || b.Count == 0)
+            {
+                SetOutput("Output", a);
+                return;
+            }
+
+            // B's points in a grid of cells as large as the largest clearance, so each of A's looks at 3 x 3 cells
+            var reach = new float[b.Count];
+            float maxReach = 0.01f;
+            for (int j = 0; j < b.Count; j++)
+            {
+                var e = b.extents[j];
+                reach[j] = MathF.Max(Radius * MathF.Max(e.X, e.Z), 0.01f);
+                maxReach = MathF.Max(maxReach, reach[j]);
+            }
+            float invCell = 1f / maxReach;
+            var grid = new Dictionary<long, List<int>>();
+            for (int j = 0; j < b.Count; j++)
+            {
+                long key = ((long)(int)MathF.Floor(b.position[j].X * invCell) << 32) | (uint)(int)MathF.Floor(b.position[j].Z * invCell);
+                if (!grid.TryGetValue(key, out var cell)) grid[key] = cell = new List<int>();
+                cell.Add(j);
+            }
+
+            SetOutput("Output", a.Filter(i =>
+            {
+                var p = a.position[i];
+                int cx = (int)MathF.Floor(p.X * invCell), cz = (int)MathF.Floor(p.Z * invCell);
+                for (int dx = -1; dx <= 1; dx++)
+                    for (int dz = -1; dz <= 1; dz++)
+                    {
+                        if (!grid.TryGetValue(((long)(cx + dx) << 32) | (uint)(cz + dz), out var cell)) continue;
+                        foreach (int j in cell)
+                        {
+                            float ex = b.position[j].X - p.X, ez = b.position[j].Z - p.Z;
+                            if (ex * ex + ez * ez < reach[j] * reach[j]) return false;
+                        }
+                    }
+                return true;
+            }));
+        }
+    }
+
+    /// <summary>
+    /// Grows a small group round every input point: the point itself and up to MaxCount - 1 companions within Radius of
+    /// it, none closer than Spacing to another of the group (a boulder with one or two smaller ones beside it, an ore
+    /// outcrop of a few rocks). The group's size is drawn between MinCount and MaxCount, Bias above 1 making small groups
+    /// commoner; a companion is scaled by CompanionScale (a share of the leader's scale, which also scales the radius and
+    /// the spacing) and turned at random. Each group draws from a random of its own, made from the leader's position, so
+    /// editing one part of an area does not reshuffle the groups elsewhere. Put it before the terrain projection and the
+    /// filters: companions are projected and filtered like any point.
+    /// </summary>
+    [Category("Transform")]
+    public class ClusterPoints : Node
+    {
+        [Input]
+        public SamplePointSet Input;
+
+        public int MinCount = 1;
+        public int MaxCount = 4;
+
+        /// <summary>Above 1, small groups are commoner than big ones (the size is MinCount + range x r^Bias).</summary>
+        public float Bias = 1.4f;
+
+        /// <summary>Metres from the leader a companion may stand (times the leader's scale).</summary>
+        public float Radius = 4f;
+
+        /// <summary>Least distance between two of a group, metres (times the leader's scale).</summary>
+        public float Spacing = 1.8f;
+
+        /// <summary>A companion's scale as a share of the leader's, drawn between X and Y.</summary>
+        public Vector2 CompanionScale = new Vector2(0.45f, 0.85f);
+
+        [Output]
+        public SamplePointSet Output;
+
+        public override void Process()
+        {
+            var points = GetInputValue<SamplePointSet>("Input");
+            if (points == null || points.Count == 0)
+            {
+                SetOutput("Output", SamplePointSet.Empty());
+                return;
+            }
+
+            var pos = new List<Vector3>(); var ext = new List<Vector3>(); var rot = new List<Quaternion>();
+            var den = new List<float>(); var tags = new List<string>(); var nrm = new List<Vector3>();
+            int lo = Math.Max(1, MinCount), hi = Math.Max(lo, MaxCount);
+            var group = new List<Vector3>(hi);
+
+            for (int i = 0; i < points.Count; i++)
+            {
+                var p = points.position[i];
+                var rng = new Random(HashCode.Combine(Seed, (int)MathF.Floor(p.X * 8f), (int)MathF.Floor(p.Z * 8f)));
+                float leaderScale = MathF.Max(points.extents[i].X, points.extents[i].Z);
+                int n = lo + (int)MathF.Floor((hi - lo + 1) * MathF.Pow((float)rng.NextDouble(), MathF.Max(Bias, 0.01f)));
+                n = Math.Min(n, hi);
+
+                group.Clear();
+                group.Add(p);
+                Add(i, p, points.extents[i], points.rotation[i]);
+                float radius = Radius * leaderScale, spacing = Spacing * leaderScale;
+                for (int k = 1; k < n; k++)
+                {
+                    for (int attempt = 0; attempt < 12; attempt++)
+                    {
+                        float angle = (float)rng.NextDouble() * MathF.Tau;
+                        float dist = spacing + (float)rng.NextDouble() * MathF.Max(radius - spacing, 0f);
+                        var c = p + new Vector3(MathF.Cos(angle) * dist, 0f, MathF.Sin(angle) * dist);
+                        bool clear = true;
+                        foreach (var g in group)
+                        {
+                            float dx = g.X - c.X, dz = g.Z - c.Z;
+                            if (dx * dx + dz * dz < spacing * spacing) { clear = false; break; }
+                        }
+                        if (!clear) continue;
+
+                        float s = CompanionScale.X + (float)rng.NextDouble() * (CompanionScale.Y - CompanionScale.X);
+                        var yaw = Quaternion.CreateFromAxisAngle(Vector3.UnitY, (float)rng.NextDouble() * MathF.Tau);
+                        group.Add(c);
+                        Add(i, c, points.extents[i] * s, Quaternion.Normalize(points.rotation[i] * yaw));
+                        break;
+                    }
+                }
+            }
+
+            SetOutput("Output", new SamplePointSet
+            {
+                position = pos.ToArray(), extents = ext.ToArray(), rotation = rot.ToArray(), density = den.ToArray(),
+                tags = tags.ToArray(), normal = nrm.ToArray()
+            });
+
+            void Add(int src, Vector3 p, Vector3 e, Quaternion r)
+            {
+                pos.Add(p); ext.Add(e); rot.Add(r); den.Add(points.density[src]);
+                tags.Add(points.tags != null && src < points.tags.Length ? points.tags[src] : null);
+                nrm.Add(points.normal != null && src < points.normal.Length ? points.normal[src] : Vector3.UnitY);
+            }
+        }
     }
 
     [Category("Density")]
