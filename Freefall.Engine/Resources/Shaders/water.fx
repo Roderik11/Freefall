@@ -65,7 +65,7 @@ struct WaterData
     uint BandA;
     uint BandB;
     float Flowing;              // 1 = river (open spline), 0 = lake
-    float Ice;                  // Graphics.Weather.Ice: how frozen the water is, 0..1
+    float Ice;                  // WaterBody.Ice: how frozen this water is, 0..1
     float SnowCover;            // Graphics.Weather.SnowCover: the snow lies on the ice too
     uint ShoreField;            // Texture2D<float>: the share of the way from the shore to the middle (0 = none yet)
     float2 ShoreOrigin;         // world xz of its corner

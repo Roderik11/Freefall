@@ -44,6 +44,13 @@ namespace Freefall.Graphics
         public static float SnowShare { get; private set; }
 
         /// <summary>
+        /// 0..1: how much of what falls at <paramref name="height"/> (m above sea level) is snow: all of it over the
+        /// freezing level, none under its <see cref="MeltDepth"/>, sleet in between.
+        /// </summary>
+        public static float SnowShareAt(float height) =>
+            Math.Clamp((height - (Clouds.Settings.FreezingLevel - MeltDepth)) / MeltDepth, 0f, 1f);
+
+        /// <summary>
         /// The haze the falling rain and snow make of the air: extinction per km at the ground, which Atmosphere adds to
         /// the aerosols (their ~1.2 km scale height fills the air under the cloud base, their forward phase suits drops and
         /// flakes, and every pass's fog, the sky and the sun's light take it). Visibility is 3.9 / extinction: heavy rain
@@ -88,16 +95,18 @@ namespace Freefall.Graphics
         /// Once the rain stops they dry by evaporation: the sun on the ground and the wind speed it up (open ground ~1.7
         /// minutes at a sunny noon with a breeze, ~5 under overcast, ~10 on a still night; puddles four times as long);
         /// snow melts where it is warmer than the freezing level, faster in sun and rain. Real seconds, not game time.
-        /// Settings › OverrideWeatherSurfaces sets them by hand.
+        /// What falls is split into rain and snow at the ground under the camera, not at the camera: until 2026-10-27 a
+        /// camera flown over the freezing level laid snow on ground where it rained. Settings › OverrideWeatherSurfaces
+        /// sets them by hand.
         /// </summary>
         public static float SurfaceWetness { get; private set; }
         public static float PuddleFill { get; private set; }
         public static float SnowCover { get; private set; }
 
         /// <summary>
-        /// How much snow has fallen at the camera since start, 1 per FallenSeconds of the heaviest snow (what laid SnowCover
-        /// 0 → 1 until the cover was sped up); only grows. A footprint keeps the value it was made at, and fills with what
-        /// falls after it (decals_cs.hlsl: Print).
+        /// How much snow has fallen on the ground under the camera since start, 1 per FallenSeconds of the heaviest snow
+        /// (what laid SnowCover 0 → 1 until the cover was sped up); only grows. A footprint keeps the value it was made at,
+        /// and fills with what falls after it (decals_cs.hlsl: Print).
         /// </summary>
         public static float SnowFallen { get; private set; }
 
@@ -109,17 +118,35 @@ namespace Freefall.Graphics
         public static Vector2 SnowLaidAlong { get; private set; }
 
         /// <summary>
-        /// How frozen the lakes and rivers are (0..1; WaterBody: water.fx draws the ice, its collider carries the walker).
-        /// It grows while it is below freezing at the camera (more than half of what falls there would be snow), from open
-        /// water to the deepest still water frozen over in <see cref="FreezeSeconds"/>, and thaws where it is warmer,
-        /// faster in sun and rain. Where it is enough for a place depends on the water there (<see cref="IceThickness"/>):
-        /// shallow before deep, still before flowing. Settings › OverrideWeatherSurfaces / OverrideIce set it by hand.
+        /// One step of a water's ice (0..1, WaterBody.Ice: water.fx draws it, its collider carries the walker) at the height
+        /// of its surface, once per weather update (<see cref="UpdatedTick"/>): it grows while more than half of what falls
+        /// there would be snow, from open water to the deepest still water frozen over in <see cref="FreezeSeconds"/>, and
+        /// thaws where it is warmer, faster in sun and rain. Where it is enough for a place depends on the water there
+        /// (<see cref="IceThickness"/>): shallow before deep, still before flowing. Each water by its own height: until
+        /// 2026-10-27 one ice for all of them grew while it froze at the camera, and the editor's camera over 3350 m froze
+        /// every lake on a Clear Day ("lakes shouldnt take the temperature from the camera position", user).
         /// </summary>
-        public static float Ice { get; private set; }
+        public static float StepIce(float ice, float height)
+        {
+            float share = SnowShareAt(height);
+            float freezing = share > 0.5f ? 1f / FreezeSeconds : 0f;
+            float thawing = share < 0.5f ? (1f + 3f * Precipitation * (1f - share) + 2f * _sun) / ThawSeconds : 0f;
+            return Math.Clamp(ice + (freezing - thawing) * _dt, 0f, 1f);
+        }
+
+        /// <summary>The ice a water shows: its own, or Settings › OverrideIce while OverrideWeatherSurfaces is on.</summary>
+        public static float ShownIce(float ice)
+        {
+            var settings = Engine.Settings;
+            return settings != null && settings.OverrideWeatherSurfaces ? Math.Clamp(settings.OverrideIce, 0f, 1f) : ice;
+        }
+
+        /// <summary>Engine.TickCount of the last weather update: a water steps its ice once per update.</summary>
+        public static int UpdatedTick => _updatedTick;
 
         /// <summary>
-        /// The steps in which what follows <see cref="Ice"/> slowly takes it (the water's ice colliders, WaterBody): not
-        /// every frame. While it freezes, a step every FreezeSeconds × IceStep = 12 s.
+        /// The steps in which what follows a water's ice slowly takes it (its ice collider, WaterBody): not every frame.
+        /// While it freezes, a step every FreezeSeconds × IceStep = 12 s.
         /// </summary>
         public const float IceStep = 0.05f;
 
@@ -161,7 +188,9 @@ namespace Freefall.Graphics
         // over at ~3.4 minutes, the land white at ~2.7. The thaw kept its pace
         private const float FreezeSeconds = 240f, ThawSeconds = 1800f;
         private const float SunLux = 60000f;    // lux of sun on level ground that counts as 1 (a clear noon gives ~1.4)
-        private static float _wetness, _puddles, _snow, _ice;     // the weather's own, kept while the override is on
+        private static float _wetness, _puddles, _snow;     // the weather's own, kept while the override is on
+        private static float _sun, _dt;                     // the last update's, for the waters' ice steps
+        private static float _ground, _groundShare;         // the ground under the camera, the snow share there
 
         /// <summary>The precipitation map (Texture2D RG16F: rate, hail; 0 = none yet) and the world xz of its corner.</summary>
         public static uint MapIndex => _mapValid ? _map!.BindlessIndex : 0u;
@@ -224,7 +253,7 @@ namespace Freefall.Graphics
             if (Hail < 1e-4f) Hail = 0f;
 
             // Snow above the freezing level, rain under its melting layer, sleet (both) in between
-            SnowShare = Math.Clamp((cameraPos.Y - (s.FreezingLevel - MeltDepth)) / MeltDepth, 0f, 1f);
+            SnowShare = SnowShareAt(cameraPos.Y);
             Snow = Precipitation * SnowShare;
             Rain = Precipitation * (1f - SnowShare);
             Hail *= 1f - SnowShare;
@@ -235,26 +264,29 @@ namespace Freefall.Graphics
             // the more sun reaches the ground (its light, the clouds' shade included) and the stronger the wind (the two
             // terms of evaporation, crudely); snow builds a cover where it is cold enough and melts where it is not (sun and
             // rain melt it faster). Before 2026-10-22 evening drying took a fixed 15 minutes, puddles 40, whatever the
-            // weather: a sunny noon after a storm stayed soaked (user: "the ground now seems to stay wet forever")
+            // weather: a sunny noon after a storm stayed soaked (user: "the ground now seems to stay wet forever"). All by
+            // what reaches the ground under the camera, rain or snow as it is there; the waters' ice by their own heights
+            // (StepIce, from WaterBody)
+            _ground = GroundUnder(cameraPos);
+            _groundShare = SnowShareAt(_ground);
+            float rain = Precipitation * (1f - _groundShare), snow = Precipitation * _groundShare;
             float sun = Math.Clamp(Daylight.SunIlluminance() * Daylight.SunHeight() / SunLux, 0f, 1.5f);
-            float evaporation = (1f + 3f * sun + 0.2f * MathF.Min(Wind.Strength, 15f)) * (1f - MathF.Min(Rain * 5f, 1f));
-            float wetting = Rain / SoakSeconds, drying = evaporation / DrySeconds;
+            _sun = sun;
+            _dt = dt;
+            float evaporation = (1f + 3f * sun + 0.2f * MathF.Min(Wind.Strength, 15f)) * (1f - MathF.Min(rain * 5f, 1f));
+            float wetting = rain / SoakSeconds, drying = evaporation / DrySeconds;
             _wetness = Math.Clamp(_wetness + (wetting - drying) * dt, 0f, 1f);
-            float filling = _wetness > 0.6f ? Rain / FillSeconds : 0f, draining = evaporation / DrainSeconds;
+            float filling = _wetness > 0.6f ? rain / FillSeconds : 0f, draining = evaporation / DrainSeconds;
             _puddles = Math.Clamp(_puddles + (filling - draining) * dt, 0f, 1f);
-            float covering = Snow / CoverSeconds;
-            SnowFallen += Snow / FallenSeconds * dt;
-            float melting = SnowShare < 0.5f ? (1f + 3f * Rain + 2f * sun) / MeltSeconds : 0f;
+            float covering = snow / CoverSeconds;
+            SnowFallen += snow / FallenSeconds * dt;
+            float melting = _groundShare < 0.5f ? (1f + 3f * rain + 2f * sun) / MeltSeconds : 0f;
             _snow = Math.Clamp(_snow + (covering - melting) * dt, 0f, 1f);
-            float freezing = SnowShare > 0.5f ? 1f / FreezeSeconds : 0f;
-            float thawing = SnowShare < 0.5f ? (1f + 3f * Rain + 2f * sun) / ThawSeconds : 0f;
-            _ice = Math.Clamp(_ice + (freezing - thawing) * dt, 0f, 1f);
             var settings = Engine.Settings;
             bool manual = settings != null && settings.OverrideWeatherSurfaces;
             SurfaceWetness = manual ? Math.Clamp(settings!.OverrideWetness, 0f, 1f) : _wetness;
             PuddleFill = manual ? Math.Clamp(settings!.OverridePuddleFill, 0f, 1f) : _puddles;
             SnowCover = manual ? Math.Clamp(settings!.OverrideSnowCover, 0f, 1f) : _snow;
-            Ice = manual ? Math.Clamp(settings!.OverrideIce, 0f, 1f) : _ice;
             // Taken while no snow lies, then held: the ice's drifts followed the gusty wind near the ground, turned about
             // the world's origin, and slid to and fro across Lake Mere, 2 km out, with every gust (user, 2026-10-24)
             if (SnowCover < 0.005f || SnowLaidAlong == Vector2.Zero)
@@ -277,6 +309,21 @@ namespace Freefall.Graphics
             float surge = (float)(0.7 * Noise(_gustClock / 4.0) + 0.3 * Noise(_gustClock / 1.3 + 17.0)) * 2f;
             float sway = (float)Noise(_gustClock / 6.0 + 41.0);
             Wind.Gust = outflow + along * (speed * gustiness * surge) + side * (speed * 0.15f * sway);
+        }
+
+        // The ground under the camera: the terrain's height there, or the camera's own where it is lower (a cave, a cellar)
+        // or no terrain lies under it
+        private static float GroundUnder(Vector3 cameraPos)
+        {
+            foreach (var terrain in Base.ComponentCache<Components.TerrainRenderer>.All)
+            {
+                var asset = terrain.Enabled ? terrain.Terrain : null;
+                if (asset == null || terrain.Transform == null) continue;
+                var local = cameraPos - terrain.Transform.Position;
+                if (local.X < 0f || local.Z < 0f || local.X >= asset.TerrainSize.X || local.Z >= asset.TerrainSize.Y) continue;
+                return MathF.Min(cameraPos.Y, terrain.GetHeight(cameraPos));
+            }
+            return cameraPos.Y;
         }
 
         /// <summary>The deck's rule, as clouds_cs.hlsl PrecipitationAt applies it to a column: deep enough, and its top in
@@ -371,7 +418,10 @@ namespace Freefall.Graphics
             // What the near emitters make of a heavy fall, which the far layers copy: drops per m³, fall speed (m/s)
             rainFall = new[] { RainDensity, RainFallSpeed },
             snowFall = new[] { SnowDensity, SnowFallSpeed },
-            surfaces = new { wetness = SurfaceWetness, puddleFill = PuddleFill, snowCover = SnowCover, snowFallen = SnowFallen, ice = Ice },
+            // By what reaches the ground under the camera (its height, the snow share there); each water's ice is its own
+            // (WaterBody.Ice)
+            surfaces = new { ground = _ground, groundSnowShare = _groundShare, wetness = SurfaceWetness, puddleFill = PuddleFill,
+                             snowCover = SnowCover, snowFallen = SnowFallen },
             // What the probe measured at the camera (not eased): the rate, hail, the cloud column's depth and top (m)
             column = new { rate = _column.X, hail = _column.Y, depth = _column.Z, top = _column.W },
             freezingLevel = Clouds.Settings.FreezingLevel,

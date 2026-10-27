@@ -26,10 +26,10 @@ namespace Freefall.Components
     /// clouds the same way. Ripples borrow the ocean simulation's slope maps when the scene has an
     /// OceanRenderer; without one the surface is flat.
     ///
-    /// In the cold it freezes (Graphics.Weather.Ice): water.fx draws the ice and the snow on it where the water is
-    /// shallow and slow enough (Weather.IceThickness: from the banks in, a fast deep channel stays open), and in play a
-    /// static collider over the ice that holds (Weather.WalkableIce) carries walkers on it, cooked on a worker when a
-    /// step of the ice (Weather.IceStep) brings pieces in or takes them away (see Update).
+    /// In the cold at its own height it freezes (<see cref="Ice"/>): water.fx draws the ice and the snow on it where the
+    /// water is shallow and slow enough (Weather.IceThickness: from the banks in, a fast deep channel stays open), and in
+    /// play a static collider over the ice that holds (Weather.WalkableIce) carries walkers on it, cooked on a worker when
+    /// a step of the ice (Weather.IceStep) brings pieces in or takes them away (see Update).
     /// </summary>
     [Icon("icon_ocean.png")]
     public class WaterBody : Component, IDraw, IUpdate
@@ -114,6 +114,11 @@ namespace Freefall.Components
         private float[] _surfaceSteep = Array.Empty<float>();
         private int[] _surfaceTriangles = Array.Empty<int>();
         private const float IceCell = 2f;
+
+        // Its own ice (Weather.StepIce), the height it takes the cold at (a lake's surface, a river's mean), the weather
+        // update it last stepped at
+        private float _ice, _iceHeight;
+        private int _iceTick = -1;
 
         // How far each place of the water lies from its shore, for where the ice forms first (Weather.IceThickness): a
         // grid over the surface's bounds in world xz (ShoreCellsMax cells a side at most, none finer than a metre), each
@@ -215,7 +220,7 @@ namespace Freefall.Components
             public uint BandA;
             public uint BandB;
             public float Flowing;       // 1 = open spline (river), 0 = closed (lake)
-            public float Ice;           // Weather.Ice
+            public float Ice;           // WaterBody.Ice
             public float SnowCover;     // Weather.SnowCover: snow lies on the ice
             public uint ShoreField;     // Texture2D<float>: the share of the way from the shore to the middle (0 = none yet)
             public float ShoreOriginX;  // world xz of the field's corner, and the metres it spans
@@ -268,6 +273,12 @@ namespace Freefall.Components
         // ═══════════════════════════
 
         /// <summary>
+        /// How frozen this water is (0..1): it freezes and thaws by the weather at its own surface's height
+        /// (Weather.StepIce), not the camera's; Settings › OverrideWeatherSurfaces / OverrideIce set it by hand.
+        /// </summary>
+        public float Ice => Weather.ShownIce(_ice);
+
+        /// <summary>
         /// In play: the ice collider follows the ice. Which pieces of the surface carry a walker from which ice level is
         /// worked out once per surface and shore field, on a worker (IceSheet); a frame then only looks up how many do at
         /// the ice's step, and when that changes the new collider is cooked on a worker and swapped in, one water body a
@@ -286,7 +297,7 @@ namespace Freefall.Components
             var sheet = _iceSheet;
             if (sheet == null || _iceCook != null) return;
 
-            int pieces = sheet.PiecesAt(MathF.Round(Weather.Ice / Weather.IceStep) * Weather.IceStep);
+            int pieces = sheet.PiecesAt(MathF.Round(Ice / Weather.IceStep) * Weather.IceStep);
             if (pieces == _icePieces && sheet == _iceColliderSheet) return;
             if (pieces == 0)
             {
@@ -628,6 +639,10 @@ namespace Freefall.Components
 
             if (_spline == null || _spline.Points.Count < 2) return;
             _mesh = _spline.Closed ? BuildLake(_spline) : BuildRiver(_spline);
+            var world = Transform.WorldMatrix;
+            float heights = 0f;
+            foreach (var p in _surfacePoints) heights += Vector3.Transform(p, world).Y;
+            _iceHeight = _surfacePoints.Length > 0 ? heights / _surfacePoints.Length : Transform.WorldPosition.Y;
             StartShoreField();
         }
 
@@ -871,6 +886,13 @@ namespace Freefall.Components
             var mesh = _mesh;
             if (mesh == null) return;
 
+            // The ice by the weather at this water's height, once per weather update
+            if (_iceTick != Weather.UpdatedTick)
+            {
+                _iceTick = Weather.UpdatedTick;
+                _ice = Weather.StepIce(_ice, _iceHeight);
+            }
+
             var sunDir = Vector3.UnitY;
             var sunColor = Vector3.One;
             float sunIntensity = 1.0f;
@@ -922,7 +944,7 @@ namespace Freefall.Components
                 BandA = bandA,
                 BandB = bandB,
                 Flowing = _spline != null && !_spline.Closed ? 1f : 0f,
-                Ice = Weather.Ice,
+                Ice = Ice,
                 SnowCover = Weather.SnowCover,
                 ShoreField = _shoreTexture?.BindlessIndex ?? 0u,
                 ShoreOriginX = _shore?.Origin.X ?? 0f,

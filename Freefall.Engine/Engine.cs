@@ -977,7 +977,7 @@ namespace Freefall
          [ValueRange(0f, 1f)]
          public float OverrideSnowCover { get; set; } = 0f;
 
-         /// <summary>How frozen the lakes and rivers are (0..1, Graphics.Weather.Ice) while OverrideWeatherSurfaces is on.</summary>
+         /// <summary>How frozen the lakes and rivers are (0..1, every WaterBody.Ice) while OverrideWeatherSurfaces is on.</summary>
          [ValueRange(0f, 1f)]
          public float OverrideIce { get; set; } = 0f;
 
