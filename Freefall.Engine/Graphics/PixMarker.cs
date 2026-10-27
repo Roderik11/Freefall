@@ -27,6 +27,7 @@ namespace Freefall.Graphics
         /// </summary>
         public static void Begin(ID3D12GraphicsCommandList list, string name)
         {
+            FrameTrace.Step(name);
             GpuProfiler.Begin(list, name);
             try
             {
@@ -40,6 +41,7 @@ namespace Freefall.Graphics
         /// </summary>
         public static void Begin(ID3D12GraphicsCommandList list, uint color, string name)
         {
+            FrameTrace.Step(name);
             GpuProfiler.Begin(list, name);
             try
             {

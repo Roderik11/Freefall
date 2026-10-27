@@ -12,13 +12,14 @@ namespace Freefall.Graphics
         public ID3D12PipelineState Native => _pipelineState;
         public ID3D12RootSignature RootSignature => _rootSignature;
 
-        public PipelineState(GraphicsDevice device, ID3D12RootSignature rootSignature, GraphicsPipelineStateDescription description)
+        public PipelineState(GraphicsDevice device, ID3D12RootSignature rootSignature, GraphicsPipelineStateDescription description, string? name = null)
         {
             _rootSignature = rootSignature;
             description.RootSignature = rootSignature;
-            
+
             try
             {
+                FrameTrace.Pipeline("graphics", name);
                 _pipelineState = device.NativeDevice.CreateGraphicsPipelineState(description);
             }
             catch (Exception ex)
@@ -75,12 +76,13 @@ namespace Freefall.Graphics
         /// Create a PSO for mesh shader pipeline (AS → MS → PS).
         /// Uses the generic pipeline stream API (ID3D12Device2.CreatePipelineState).
         /// </summary>
-        public unsafe PipelineState(GraphicsDevice device, ID3D12RootSignature rootSignature, MeshShaderPSODescription desc)
+        public unsafe PipelineState(GraphicsDevice device, ID3D12RootSignature rootSignature, MeshShaderPSODescription desc, string? name = null)
         {
             _rootSignature = rootSignature;
 
             try
             {
+                FrameTrace.Pipeline("mesh shader", name);
                 // Pin shader bytecodes so they survive the CreatePipelineState call
                 fixed (byte* msPtr = desc.MeshShader.Span)
                 fixed (byte* asPtr = desc.AmplificationShader.Span)

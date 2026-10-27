@@ -1003,11 +1003,11 @@ namespace Freefall.Graphics
                         SampleMask = uint.MaxValue,
                     };
                     
-                    _passPipelineStates[passIndex] = new PipelineState(device, rootSignature, meshPsoDesc);
-                    
+                    _passPipelineStates[passIndex] = new PipelineState(device, rootSignature, meshPsoDesc, $"{_effect?.Name} {currentPass.Name}");
+
                     // Wireframe variant for mesh shaders
                     meshPsoDesc.RasterizerState = new RasterizerDescription(CullMode.None, FillMode.Wireframe);
-                    _passWireframePSOs[passIndex] = new PipelineState(device, rootSignature, meshPsoDesc);
+                    _passWireframePSOs[passIndex] = new PipelineState(device, rootSignature, meshPsoDesc, $"{_effect?.Name} {currentPass.Name} wireframe");
                 }
                 else
                 {
@@ -1028,7 +1028,7 @@ namespace Freefall.Graphics
                     psoDesc.RasterizerState = passRasterDesc;
                     psoDesc.BlendState = FitBlendToTargets(passBlendDesc, passRtvFormats, passWritten);
                     
-                    _passPipelineStates[passIndex] = new PipelineState(device, rootSignature, psoDesc);
+                    _passPipelineStates[passIndex] = new PipelineState(device, rootSignature, psoDesc, $"{_effect?.Name} {currentPass.Name}");
 
                     // A new description, not a copy of psoDesc: Vortice's description is a class, and the wireframe
                     // variant below rewrites psoDesc's rasterizer (a capture PSO made from it later drew in wireframe:
@@ -1056,7 +1056,7 @@ namespace Freefall.Graphics
                     }
 
                     psoDesc.RasterizerState = new RasterizerDescription(CullMode.None, FillMode.Wireframe);
-                    _passWireframePSOs[passIndex] = new PipelineState(device, rootSignature, psoDesc);
+                    _passWireframePSOs[passIndex] = new PipelineState(device, rootSignature, psoDesc, $"{_effect?.Name} {currentPass.Name} wireframe");
                 }
                 
                 // Reflection for constant buffers (from first pass for simplicity)
@@ -1346,7 +1346,7 @@ namespace Freefall.Graphics
             if (SkyCaptureRaster && _passCaptureDescs.TryGetValue(Pass, out var captureDesc))
             {
                 if (!_passCapturePSOs.TryGetValue(Pass, out var capturePso))
-                    _passCapturePSOs[Pass] = capturePso = new PipelineState(device, device.GlobalRootSignature, captureDesc);
+                    _passCapturePSOs[Pass] = capturePso = new PipelineState(device, device.GlobalRootSignature, captureDesc, $"{_effect?.Name} pass {Pass} sky capture");
                 pso = capturePso;
             }
             if (pso?.Native == null) return; // Device lost — PSO wasn't created

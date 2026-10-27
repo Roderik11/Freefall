@@ -228,7 +228,7 @@ void CSCopySlice(uint3 id : SV_DispatchThreadID) {
 }
 ";
              var shader = new Shader(shaderSource, "CSCopySlice", "cs_6_6");
-             var pso = device.CreateComputePipelineState(shader.Bytecode);
+             var pso = device.CreateComputePipelineState(shader.Bytecode, "Texture CSCopySlice");
              shader.Dispose();
 
              var tempDescriptors = new List<uint>();

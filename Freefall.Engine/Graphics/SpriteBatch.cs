@@ -110,6 +110,7 @@ namespace Freefall.Graphics
                 SampleMask = uint.MaxValue
             };
 
+            FrameTrace.Pipeline("graphics", "SpriteBatch");
             _pipelineState = _device.NativeDevice.CreateGraphicsPipelineState(psoDesc);
 
             vs.Dispose();

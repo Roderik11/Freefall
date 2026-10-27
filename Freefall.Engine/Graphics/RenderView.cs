@@ -350,6 +350,7 @@ namespace Freefall.Graphics
             if (_graphicsDevice.IsDeviceLost) return;
 
             // CPU time spent here is the GPU (or the display) being behind, not work
+            if (this == Primary) FrameTrace.Step("waiting for the GPU");
             using (_waitMarker.Auto())
             {
                 // Wait for swap chain to signal it's ready for a new frame
@@ -407,6 +408,8 @@ namespace Freefall.Graphics
 
             if (this == Primary) GpuProfiler.EndFrame(cmd.Native);
 
+            bool primary = this == Primary;
+            if (primary) FrameTrace.Step("close");
             try
             {
                 cmd.Close();
@@ -417,6 +420,7 @@ namespace Freefall.Graphics
                 _graphicsDevice.DumpDebugMessages("RenderView.Present/Close");
                 throw;
             }
+            if (primary) FrameTrace.Step("submit");
             _graphicsDevice.SubmitCommandList(cmd.Native);
             if (this == Primary) GpuProfiler.Submitted(_graphicsDevice.CommandQueue);
             _graphicsDevice.DumpDebugMessages("frame");
@@ -429,7 +433,9 @@ namespace Freefall.Graphics
                 presentFlags = PresentFlags.AllowTearing;
             }
 
+            if (primary) FrameTrace.Step("present");
             _swapChain.Present(syncInterval, presentFlags);
+            if (primary) FrameTrace.FrameDone();
 
             _frameFenceValues[_frameIndex] = _fenceValue;
             _graphicsDevice.CommandQueue.Signal(_fence, (ulong)_fenceValue);

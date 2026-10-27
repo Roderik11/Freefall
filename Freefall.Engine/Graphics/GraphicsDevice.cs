@@ -1148,13 +1148,14 @@ namespace Freefall.Graphics
         /// Create a compute pipeline state from shader bytecode.
         /// Uses the global root signature.
         /// </summary>
-        public ID3D12PipelineState CreateComputePipelineState(byte[] shaderBytecode)
+        public ID3D12PipelineState CreateComputePipelineState(byte[] shaderBytecode, string? name = null)
         {
             var desc = new ComputePipelineStateDescription
             {
                 RootSignature = _globalRootSignature,
                 ComputeShader = shaderBytecode
             };
+            FrameTrace.Pipeline("compute", name);
             return _device.CreateComputePipelineState(desc);
         }
     }

@@ -245,6 +245,7 @@ namespace Freefall.Base
                     else
                     {
                         LogOnce(Describe(Current));
+                        if (Current == Step.Terrain) Graphics.FrameTrace.BeginWorld(Name);   // the first frames that draw the world
                         if (Stopwatch.GetTimestamp() >= deadline) break;
                     }
                 }

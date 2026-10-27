@@ -273,5 +273,11 @@ namespace Freefall
             Append(text, st);
             OnLog?.Invoke(text, st);
         }
+
+        /// <summary>
+        /// A line for the log sinks only (<see cref="OnLog"/>: player.log), without the console or a stack trace:
+        /// cheap enough for <see cref="Graphics.FrameTrace"/>'s line per pipeline and per pass.
+        /// </summary>
+        public static void Trace(string text) => OnLog?.Invoke(text, null);
     }
 }

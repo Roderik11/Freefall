@@ -402,7 +402,7 @@ namespace Freefall.Graphics
                 foreach (var name in kernelNames)
                 {
                     var shader = new Shader(source, name, "cs_6_6", _basePath);
-                    compiled.Add((name, device.CreateComputePipelineState(shader.Bytecode), shader));
+                    compiled.Add((name, device.CreateComputePipelineState(shader.Bytecode, $"{Path.GetFileName(_fullPath)} {name}"), shader));
                 }
             }
             catch
@@ -446,7 +446,7 @@ namespace Freefall.Graphics
             var device = Engine.Device;
             var shader = new Shader(_cachedSource!, entryPoint, "cs_6_6", _basePath);
 
-            var pso = device.CreateComputePipelineState(shader.Bytecode);
+            var pso = device.CreateComputePipelineState(shader.Bytecode, $"{Path.GetFileName(_fullPath)} {entryPoint}");
 
             // Merge push constant slots and constant buffers from every kernel's reflection, since HLSL optimizes out
             // unused cbuffers and members per entry point (as Reload does). Taking the cbuffers from the first kernel
