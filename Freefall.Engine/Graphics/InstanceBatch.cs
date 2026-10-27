@@ -170,7 +170,12 @@ namespace Freefall.Graphics
         private StreamingBuffer<uint>? _changedRecords;
         private uint[] visibilityFlagsSRVIndices = new uint[FrameCount]; // SRV for reading previous frame's flags
         
-        private const int MaxSubBatches = 4096;
+        // Entries in the indirect command, counter and indexed command buffers: one per mesh part, since a batch's
+        // SubBatchCount is MeshRegistry.Count (Build). Grown with the registry in powers of two (EnsureSubBatchCapacity).
+        // It used to be a fixed 4096: Eldermoor registers ~4060 parts, and once anything registered more (a reimport, the
+        // animals coming out near the camera, a placed kit piece) every ExecuteIndirect asked for more commands than its
+        // buffer held and the frame's Close failed with E_INVALIDARG (the editor crashed in RenderView.Present).
+        private int _maxSubBatches = 4096;
         private bool _cullerInitialized = false;
         private ID3D12DescriptorHeap? _cpuHeap;
         
@@ -631,15 +636,34 @@ namespace Freefall.Graphics
             if (newCapacity <= capacity) return;
             capacity = newCapacity;
 
-            // Defer disposal of old GPU buffers instead of immediate destroy
-            DeferDisposeBuffers();
-
             Array.Resize(ref _draws, capacity);
             Array.Resize(ref _handles, capacity);
             Array.Resize(ref _changedRecordBits, (capacity + 31) / 32);
 
+            RecreateGpuBuffers();
+        }
+
+        /// <summary>
+        /// Room for a command per mesh part in the registry: past the current size, every buffer sized by it is made
+        /// again (the old ones go through the deferred disposal, the culler's are made on their next use).
+        /// </summary>
+        private void EnsureSubBatchCapacity()
+        {
+            int needed = MeshRegistry.Count;
+            if (needed <= _maxSubBatches) return;
+            int grown = _maxSubBatches;
+            while (grown < needed) grown <<= 1;
+            _maxSubBatches = Math.Min(grown, MeshRegistry.MaxMeshParts);
+            RecreateGpuBuffers();
+        }
+
+        private void RecreateGpuBuffers()
+        {
+            // Defer disposal of old GPU buffers instead of immediate destroy
+            DeferDisposeBuffers();
+
             int slotSize = DrawEntries * 4;
-            int commandSize = MaxSubBatches * IndirectDrawSizes.IndirectCommandSize;
+            int commandSize = _maxSubBatches * IndirectDrawSizes.IndirectCommandSize;
 
             for (int i = 0; i < FrameCount; ++i)
             {
@@ -653,7 +677,7 @@ namespace Freefall.Graphics
                 // GPU output: indirect commands (compute shader writes)
                 gpuCommandBuffers[i] = Engine.Device.CreateDefaultBuffer(commandSize);
                 gpuCommandUAVIndices[i] = Engine.Device.AllocateBindlessIndex();
-                Engine.Device.CreateStructuredBufferUAV(gpuCommandBuffers[i], MaxSubBatches,
+                Engine.Device.CreateStructuredBufferUAV(gpuCommandBuffers[i], (uint)_maxSubBatches,
                     (uint)IndirectDrawSizes.IndirectCommandSize, gpuCommandUAVIndices[i]);
             }
         }
@@ -733,7 +757,10 @@ namespace Freefall.Graphics
 
             MeshRegistry.Upload(device);
             if (!_isGPUSourced)
+            {
+                EnsureSubBatchCapacity();
                 SubBatchCount = MeshRegistry.Count;
+            }
         }
 
         #region GPU Culler
@@ -744,7 +771,7 @@ namespace Freefall.Graphics
             _cullerInitialized = true;
 
             var device = Engine.Device;
-            int counterBufferSize = MaxSubBatches * sizeof(uint);
+            int counterBufferSize = _maxSubBatches * sizeof(uint);
             int instanceBufferSize = capacity * sizeof(uint);
 
             // Zeroed on creation: every entry reads as never written, and the first culling refreshes them all
@@ -780,7 +807,7 @@ namespace Freefall.Graphics
                     Buffer = new BufferUnorderedAccessView
                     {
                         FirstElement = 0,
-                        NumElements = MaxSubBatches,
+                        NumElements = (uint)_maxSubBatches,
                         StructureByteStride = sizeof(uint),
                         Flags = BufferUnorderedAccessViewFlags.None
                     }
@@ -789,7 +816,7 @@ namespace Freefall.Graphics
                     counterBuffers[i], null, uavDesc, device.GetCpuHandle(counterBufferUAVIndices[i]));
 
                 var cpuHandle = _cpuHeap.GetCPUDescriptorHandleForHeapStart() + ((int)(i * handleIncrementSize));
-                counterClearIndices[i] = CreateClearView(counterBuffers[i], MaxSubBatches, cpuHandle);
+                counterClearIndices[i] = CreateClearView(counterBuffers[i], (uint)_maxSubBatches, cpuHandle);
                 counterBufferCPUHandles[i] = cpuHandle;
 
                 var visibleIndicesCpuHandle = _cpuHeap.GetCPUDescriptorHandleForHeapStart() + ((int)((FrameCount + i) * handleIncrementSize));
@@ -955,9 +982,9 @@ namespace Freefall.Graphics
             _shadowCullerInitialized = true;
 
             var device = Engine.Device;
-            int counterBufferSize = MaxSubBatches * sizeof(uint);
+            int counterBufferSize = _maxSubBatches * sizeof(uint);
             int instanceBufferSize = capacity * sizeof(uint);
-            int commandSize = MaxSubBatches * IndirectDrawSizes.IndirectCommandSize;
+            int commandSize = _maxSubBatches * IndirectDrawSizes.IndirectCommandSize;
             int histogramSize = MeshRegistry.MaxMeshParts * sizeof(uint);
 
             // CPU descriptor heap for ClearUnorderedAccessViewUint (4 buffers per frame: counter, visible indices, histogram, expansion)
@@ -1003,16 +1030,16 @@ namespace Freefall.Graphics
                 // Indirect commands (ONE buffer)
                 shadowCommandBuffers[f] = device.CreateDefaultBuffer(commandSize);
                 shadowCommandUAVIndices[f] = device.AllocateBindlessIndex();
-                device.CreateStructuredBufferUAV(shadowCommandBuffers[f], MaxSubBatches, (uint)IndirectDrawSizes.IndirectCommandSize, shadowCommandUAVIndices[f]);
+                device.CreateStructuredBufferUAV(shadowCommandBuffers[f], (uint)_maxSubBatches, (uint)IndirectDrawSizes.IndirectCommandSize, shadowCommandUAVIndices[f]);
 
                 // Counters (ONE buffer)
                 shadowCounterBuffers[f] = device.CreateDefaultBuffer(counterBufferSize);
                 shadowCounterUAVIndices[f] = device.AllocateBindlessIndex();
-                device.CreateStructuredBufferUAV(shadowCounterBuffers[f], MaxSubBatches, sizeof(uint), shadowCounterUAVIndices[f]);
+                device.CreateStructuredBufferUAV(shadowCounterBuffers[f], (uint)_maxSubBatches, sizeof(uint), shadowCounterUAVIndices[f]);
 
                 // CPU handle for counter clear
                 var counterCpuHandle = _shadowCpuHeap.GetCPUDescriptorHandleForHeapStart() + (int)(descriptorIdx * handleIncrement);
-                shadowCounterClearIndices[f] = CreateClearView(shadowCounterBuffers[f], MaxSubBatches, counterCpuHandle);
+                shadowCounterClearIndices[f] = CreateClearView(shadowCounterBuffers[f], (uint)_maxSubBatches, counterCpuHandle);
                 shadowCounterCPUHandles[f] = counterCpuHandle;
                 descriptorIdx++;
 
@@ -1384,9 +1411,9 @@ namespace Freefall.Graphics
             if (indexedCommandBuffers[f] == null)
             {
                 var device = Engine.Device;
-                indexedCommandBuffers[f] = device.CreateDefaultBuffer(MaxSubBatches * IndirectDrawSizes.IndexedCommandSize);
+                indexedCommandBuffers[f] = device.CreateDefaultBuffer(_maxSubBatches * IndirectDrawSizes.IndexedCommandSize);
                 indexedCommandUAVIndices[f] = device.AllocateBindlessIndex();
-                device.CreateStructuredBufferUAV(indexedCommandBuffers[f]!, MaxSubBatches, (uint)IndirectDrawSizes.IndexedCommandSize,
+                device.CreateStructuredBufferUAV(indexedCommandBuffers[f]!, (uint)_maxSubBatches, (uint)IndirectDrawSizes.IndexedCommandSize,
                     indexedCommandUAVIndices[f]);
             }
             return indexedCommandUAVIndices[f];
@@ -1842,6 +1869,13 @@ namespace Freefall.Graphics
 
                 DeferDispose(sortKeysBuffers[i], sortKeysUAVIndices[i]);
                 sortKeysBuffers[i] = null; sortKeysUAVIndices[i] = 0;
+
+                // The indexed commands (made again on first use): the camera's culling makes them too, so they go here
+                // and not with the shadow buffers below, which a batch without shadows never made. Kept, they held the
+                // old command count after EnsureSubBatchCapacity grew it.
+                if (indexedCommandBuffers[i] != null)
+                    DeferDispose(indexedCommandBuffers[i], indexedCommandUAVIndices[i]);
+                indexedCommandBuffers[i] = null; indexedCommandUAVIndices[i] = 0;
             }
 
             if (visibilityCacheBuffer != null)
@@ -1880,12 +1914,6 @@ namespace Freefall.Graphics
 
                     DeferDispose(shadowCommandBuffers[f], shadowCommandUAVIndices[f]);
                     shadowCommandBuffers[f] = null; shadowCommandUAVIndices[f] = 0;
-
-                    // The indexed commands too (made again on first use; the camera's culling uses them as well)
-                    if (indexedCommandBuffers[f] != null)
-                        DeferDispose(indexedCommandBuffers[f], indexedCommandUAVIndices[f]);
-                    indexedCommandBuffers[f] = null; indexedCommandUAVIndices[f] = 0;
-                    _indexedReady = false;
 
                     DeferDispose(shadowCounterBuffers[f], shadowCounterUAVIndices[f]);
                     shadowCounterBuffers[f] = null; shadowCounterUAVIndices[f] = 0;
@@ -1939,6 +1967,10 @@ namespace Freefall.Graphics
                 sortKeysBuffers[i]?.Dispose();
                 if (sortKeysUAVIndices[i] != 0) Engine.Device.ReleaseBindlessIndex(sortKeysUAVIndices[i]);
 
+                indexedCommandBuffers[i]?.Dispose();
+                if (indexedCommandUAVIndices[i] != 0) Engine.Device.ReleaseBindlessIndex(indexedCommandUAVIndices[i]);
+                indexedCommandBuffers[i] = null; indexedCommandUAVIndices[i] = 0;
+
                 instanceBoundsBuffers[i]?.Dispose();
                 if (instanceBoundsUAVIndices[i] != 0) Engine.Device.ReleaseBindlessIndex(instanceBoundsUAVIndices[i]);
                 instanceBoundsBuffers[i] = null; instanceBoundsUAVIndices[i] = 0;
@@ -1985,10 +2017,6 @@ namespace Freefall.Graphics
 
                     shadowCommandBuffers[f]?.Dispose();
                     if (shadowCommandUAVIndices[f] != 0) Engine.Device.ReleaseBindlessIndex(shadowCommandUAVIndices[f]);
-
-                    indexedCommandBuffers[f]?.Dispose();
-                    if (indexedCommandUAVIndices[f] != 0) Engine.Device.ReleaseBindlessIndex(indexedCommandUAVIndices[f]);
-                    indexedCommandBuffers[f] = null; indexedCommandUAVIndices[f] = 0;
 
                     shadowCounterBuffers[f]?.Dispose();
                     if (shadowCounterUAVIndices[f] != 0) Engine.Device.ReleaseBindlessIndex(shadowCounterUAVIndices[f]);

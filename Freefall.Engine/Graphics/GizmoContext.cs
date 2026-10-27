@@ -583,7 +583,7 @@ namespace Freefall.Graphics
                 PosBindless = NormBindless = UVBindless = IndexBindless = 0;
 
                 // RebuildProxy makes a new Mesh, so the old proxy's MeshRegistry entries would leak (~20 ids per
-                // selection). Sub-batch ids are registry ids and the culler holds only MaxSubBatches (4096) of them.
+                // selection). Sub-batch ids are registry ids: every batch makes an indirect command for each of them.
                 if (ProxyMesh != null)
                     device.DeferDispose(new RegistryEntries(ProxyMesh));
             }

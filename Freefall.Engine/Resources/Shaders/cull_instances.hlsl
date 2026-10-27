@@ -1281,7 +1281,7 @@ void CSBitonicSort(uint3 dispatchThreadId : SV_DispatchThreadID)
 //-----------------------------------------------------------------------------
 // Pass 5a: CSHistogramPrefixSum - Parallel prefix sum of histogram
 // 3-phase scan: (1) serial chunk prefix, (2) Blelloch scan of partials,
-// (3) propagate block offsets. Supports up to MaxMeshParts (4096).
+// (3) propagate block offsets. Any count: each of the 256 threads scans (count + 255) / 256 entries.
 // Input: histogram[k] = visible count for MeshPartId k
 // Output: counters[k] = exclusive prefix sum = StartInstance offset
 //-----------------------------------------------------------------------------
