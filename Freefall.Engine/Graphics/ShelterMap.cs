@@ -71,11 +71,62 @@ namespace Freefall.Graphics
         private static readonly List<InstanceBatch> _solid = new(), _vegetation = new();
         private static readonly ProfilerMarker _marker = ProfilerMarker.Get("Cover map");
 
+        // The finest level on the CPU (OpenAt): copied into _readback after it is drawn, taken into _cpuMap when that
+        // frame's slot comes round again (the GPU is done with it then), with the square and heights it was drawn for
+        private static GraphicsBuffer? _readback;
+        private static bool _copyWanted;
+        private static int _copyTick = -1, _copySlot;
+        private static LevelData _copyLevel;
+        private static float _copyMinY, _copyMaxY;
+        private static uint[]? _cpuMap;
+        private static LevelData _cpuLevel;
+        private static float _cpuMinY, _cpuMaxY;
+        private const int OpenAround = 2;            // OpenAt averages (2 × this + 1)² texels: 1.25 m
+        private const float CoverAbove = 0.25f;      // m over the place cover must be (not the bridge it stands on)
+
         /// <summary>Whether it is drawn and read (with the sky captures: EngineSettings.SkyVisibility and SkyCaptures).</summary>
         public static bool Enabled => SkyCapture.Enabled;
 
         /// <summary>Draw every level again (a scene was loaded, meshes were placed or moved).</summary>
-        public static void Invalidate() => _invalid = true;
+        public static void Invalidate()
+        {
+            _invalid = true;
+            _cpuLevel = _copyLevel = default;   // a copy on its way is of the old scene
+        }
+
+        /// <summary>
+        /// How much of the falling rain and snow reaches a place (0..1), as the decal pass has it: 1 in the open, 0 under a
+        /// roof, 1 − <see cref="CrownLeak"/> under a full crown. For game code that has to agree with the picture: the ground's
+        /// sounds in snow and rain (a ray up meets roofs but not crowns, which have no collider). The share of the texels
+        /// round the place (1.25 m) covered from over it, in the finest level (256 m round the camera) as last drawn, read
+        /// back each time it is drawn and a few frames late. 1 outside it, while the map is off and until the first read
+        /// back. The terrain's own cover (a cave) is not in the map: the decal pass tests the height map for it.
+        /// </summary>
+        public static float OpenAt(Vector3 place)
+        {
+            var map = _cpuMap;
+            var level = _cpuLevel;
+            if (map == null || level.Size <= 0f || !Enabled)
+                return 1f;
+            float texel = level.Size / Resolution;
+            int cx = (int)MathF.Floor((place.X - level.Left) / texel);
+            int cy = (int)MathF.Floor((level.Top - place.Z) / texel);
+            if (cx < OpenAround || cy < OpenAround || cx >= Resolution - OpenAround || cy >= Resolution - OpenAround)
+                return 1f;
+
+            // Cover counts over the place only: the packed height has to be above this
+            float over = (place.Y + CoverAbove - _cpuMinY) / MathF.Max(_cpuMaxY - _cpuMinY, 1e-3f);
+            uint above = over <= 0f ? 0u : over >= 1f ? 65535u : (uint)(over * 65535f);
+            uint covered = 0;
+            for (int y = cy - OpenAround; y <= cy + OpenAround; y++)
+                for (int x = cx - OpenAround; x <= cx + OpenAround; x++)
+                {
+                    uint v = map[y * Resolution + x];
+                    if ((v >> 16) > above) covered += v & 0xFFFFu;
+                }
+            const int Texels = (2 * OpenAround + 1) * (2 * OpenAround + 1);
+            return 1f - covered / (65535f * Texels);
+        }
 
         /// <summary>
         /// Where the levels are centred while <paramref name="camera"/> draws: the main camera's place (the game's view
@@ -125,6 +176,7 @@ namespace Freefall.Graphics
             }
             if (_renderedTick == Engine.TickCount)
                 return false;
+            ReadBack(list);
             var culler = CommandBuffer.Culler;
             var all = CommandBuffer.GetAllBatches(RenderPass.Opaque);
             if (culler == null || all == null)
@@ -205,9 +257,54 @@ namespace Freefall.Graphics
             list.ResourceBarrierTransition(map.Native, ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource);
             _mapReadable[level] = true;
             _drawn[level] = new LevelData { Left = left, Top = bottom + size, Size = size, Map = map.BindlessIndex };
+            if (level == 0)
+            {
+                _copyWanted = true;
+                ReadBack(list);
+            }
             PixMarker.End(list);
             _levelsDrawn++;
             return true;
+        }
+
+        /// <summary>
+        /// The finest level for <see cref="OpenAt"/>: a copy taken in once its frame's slot has come round (the frame's
+        /// fence was waited for then, as AutoExposure's histogram), and the level copied to the readback buffer when it has
+        /// been drawn again and no copy is on its way. 4 MB, only when the camera has moved on 32 m or the scene changed.
+        /// </summary>
+        private static unsafe void ReadBack(ID3D12GraphicsCommandList list)
+        {
+            int slot = Engine.FrameIndex % FrameCount;
+            if (_copyTick >= 0 && Engine.TickCount > _copyTick && slot == _copySlot)
+            {
+                _cpuMap ??= new uint[Resolution * Resolution];
+                long bytes = (long)_cpuMap.Length * sizeof(uint);
+                fixed (uint* to = _cpuMap)
+                    Buffer.MemoryCopy(_readback!.ReadPtr<uint>(), to, bytes, bytes);
+                _cpuLevel = _copyLevel;
+                _cpuMinY = _copyMinY;
+                _cpuMaxY = _copyMaxY;
+                _copyTick = -1;
+            }
+            if (!_copyWanted || _copyTick >= 0 || _maps[0] == null || !_mapReadable[0])
+                return;
+
+            _readback ??= GraphicsBuffer.CreateReadback<uint>(Resolution * Resolution);
+            var map = _maps[0]!.Native;
+            list.ResourceBarrierTransition(map, ResourceStates.NonPixelShaderResource, ResourceStates.CopySource);
+            var footprint = new PlacedSubresourceFootPrint
+            {
+                Offset = 0,
+                Footprint = new SubresourceFootPrint(Format.R32_UInt, Resolution, Resolution, 1, Resolution * sizeof(uint))
+            };
+            list.CopyTextureRegion(new TextureCopyLocation(_readback.Native, footprint), 0, 0, 0, new TextureCopyLocation(map, 0), null);
+            list.ResourceBarrierTransition(map, ResourceStates.CopySource, ResourceStates.NonPixelShaderResource);
+            _copyWanted = false;
+            _copyTick = Engine.TickCount;
+            _copySlot = slot;
+            _copyLevel = _drawn[0];
+            _copyMinY = _minY;
+            _copyMaxY = _maxY;
         }
 
         private static void Draw(ID3D12GraphicsCommandList list, List<InstanceBatch> batches, GraphicsBuffer cullBuffer, GPUCuller culler)
