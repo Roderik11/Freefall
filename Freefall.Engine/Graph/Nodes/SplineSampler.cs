@@ -19,7 +19,13 @@ namespace Freefall.PCG
         /// <summary>
         /// Sample points within the spline's 2D area (requires closed spline).
         /// </summary>
-        Area
+        Area,
+
+        /// <summary>
+        /// Rows over the closed spline's area, Spacing apart and Spacing between the points of a row, the rows along
+        /// the longest control edge: an orchard, a vineyard, a planted copse.
+        /// </summary>
+        Rows
     }
 
     /// <summary>
@@ -75,16 +81,71 @@ namespace Freefall.PCG
                 SamplingMode.EvenSpacing => SampleEvenSpacing(Spline),
                 SamplingMode.PerEdge => SamplePerEdge(Spline),
                 SamplingMode.Area => SampleArea(Spline),
+                SamplingMode.Rows => SampleRows(Spline),
                 _ => SamplePointSet.Empty()
             };
 
-            if ((EdgeInset != 0f || OrientOutward) && Mode != SamplingMode.Area && Spline.Closed)
+            if ((EdgeInset != 0f || OrientOutward) && Mode != SamplingMode.Area && Mode != SamplingMode.Rows && Spline.Closed)
                 ApplyEdgeFrame(result, Spline);
 
             SetOutput("Output", result);
             Debug.Log($"[SplineSampler] Produced {result.Count} samples (mode={Mode}, spacing={Spacing}m)");
         }
 
+
+        /// <summary>
+        /// Rows over a closed spline's area: points Spacing apart along rows Spacing apart, the rows running along its
+        /// longest control edge, each point facing along its row. The grid is centred on the area, so the outer rows keep
+        /// about half a spacing from the outline wherever it runs parallel to them.
+        /// </summary>
+        private SamplePointSet SampleRows(Spline spline)
+        {
+            if (!spline.Closed)
+            {
+                Debug.LogWarning("[SplineSampler] Rows sampling requires a closed spline.");
+                return SamplePointSet.Empty();
+            }
+
+            var pts = spline.Points;
+            int n = pts.Count;
+            var along = Vector2.UnitX;
+            float longest = 0f;
+            for (int i = 0; i < n; i++)
+            {
+                var a = pts[i];
+                var b = pts[(i + 1) % n];
+                var edge = new Vector2(b.X - a.X, b.Z - a.Z);
+                float lengthSq = edge.LengthSquared();
+                if (lengthSq > longest) { longest = lengthSq; along = edge / MathF.Sqrt(lengthSq); }
+            }
+            var across = new Vector2(-along.Y, along.X);
+
+            float u0 = float.MaxValue, u1 = float.MinValue, v0 = float.MaxValue, v1 = float.MinValue;
+            for (int i = 0; i < n; i++)
+            {
+                var p = new Vector2(pts[i].X, pts[i].Z);
+                float u = Vector2.Dot(p, along), v = Vector2.Dot(p, across);
+                u0 = MathF.Min(u0, u); u1 = MathF.Max(u1, u);
+                v0 = MathF.Min(v0, v); v1 = MathF.Max(v1, v);
+            }
+
+            float s = MathF.Max(Spacing, 0.1f);
+            int nu = (int)((u1 - u0) / s), nv = (int)((v1 - v0) / s);
+            float uStart = (u0 + u1) * 0.5f - nu * s * 0.5f, vStart = (v0 + v1) * 0.5f - nv * s * 0.5f;
+            var rotation = LookRotation(new Vector3(along.X, 0f, along.Y), Vector3.UnitY);
+
+            var positions = new List<Vector3>();
+            var rotations = new List<Quaternion>();
+            for (int j = 0; j <= nv; j++)
+                for (int i = 0; i <= nu; i++)
+                {
+                    var q = along * (uStart + i * s) + across * (vStart + j * s);
+                    if (!PointInPolygonXZ(q.X, q.Y, pts, n)) continue;
+                    positions.Add(new Vector3(q.X, 0f, q.Y));
+                    rotations.Add(rotation);
+                }
+            return BuildResult(positions, rotations);
+        }
 
         /// <summary>
         /// Sample points within the spline's 2D area. Only valid for closed splines.
