@@ -41,14 +41,60 @@ namespace Freefall.Assets.Loaders
 
             ApplyClipConfig(clip, sourceGuid);
 
-            return clip;
+            return Retargeted(clip, sourceGuid, manager);
         }
 
-        /// <summary>The clip's skeleton: a sibling sub-asset of the same model file, as LoadFromCache finds it.</summary>
+        /// <summary>
+        /// The clip's skeleton: a sibling sub-asset of the same model file, as LoadFromCache finds it; and for a file
+        /// whose clips are baked onto another rig (ModelImporter.RetargetTo), the two skeletons that takes.
+        /// </summary>
         public IEnumerable<ImplicitArtifact> GetImplicitDependencies(string guid)
         {
             if (FindSkeleton(guid) is { } skelEntry)
                 yield return new ImplicitArtifact(skelEntry.Guid);
+            if (RetargetOf(guid) is { } importer)
+            {
+                yield return new ImplicitArtifact(importer.RetargetTo);
+                if (!string.IsNullOrEmpty(importer.RetargetFrom))
+                    yield return new ImplicitArtifact(importer.RetargetFrom);
+            }
+        }
+
+        // The importer of a clip's file when its clips are to be baked onto another rig, else null. The settings are
+        // read back only when they name one.
+        private static Importers.ModelImporter RetargetOf(string clipGuid)
+        {
+            if (string.IsNullOrEmpty(clipGuid)) return null;
+            var settings = AssetDatabase.GetMeta(clipGuid)?.ImporterSettings;
+            if (settings == null || !settings.Contains("\"RetargetTo\"") || settings.Contains("\"RetargetTo\":\"\"")) return null;
+            return AssetDatabase.GetImporter(clipGuid) is Importers.ModelImporter importer && !string.IsNullOrEmpty(importer.RetargetTo)
+                ? importer : null;
+        }
+
+        /// <summary>
+        /// A clip of a file whose clips are made on another rig (ModelImporter.RetargetTo) as a clip of the rig named
+        /// there, with its events; the clip as it is otherwise, and when a skeleton is missing.
+        /// </summary>
+        private static AnimationClip Retargeted(AnimationClip clip, string clipGuid, AssetManager manager)
+        {
+            var importer = RetargetOf(clipGuid);
+            if (importer == null) return clip;
+
+            var source = string.IsNullOrEmpty(importer.RetargetFrom) ? clip.Skeleton : manager.LoadByGuid<Skeleton>(importer.RetargetFrom);
+            var target = manager.LoadByGuid<Skeleton>(importer.RetargetTo);
+            if (source == null || target == null)
+            {
+                Debug.LogWarning("AnimationClipLoader", $"'{clip.Name}': RetargetTo needs the skeleton it was made on and the one to bake it onto; it plays as made");
+                return clip;
+            }
+
+            var baked = ClipRetarget.Bake(clip, source, target);
+            if (baked == null)
+            {
+                Debug.LogWarning("AnimationClipLoader", $"'{clip.Name}': {source.Name} and {target.Name} share no bones; it plays as made");
+                return clip;
+            }
+            return baked;
         }
 
         private static SubAssetEntry FindSkeleton(string clipGuid) =>

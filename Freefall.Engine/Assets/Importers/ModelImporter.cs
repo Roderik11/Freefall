@@ -91,6 +91,14 @@ namespace Freefall.Assets.Importers
         /// </summary>
         public float RootSurge = FootTravel.DefaultSurge;
 
+        /// <summary>
+        /// Degrees the clip is turned about the upright through the model's origin: a take captured facing the other way
+        /// from the rest of its pack (a rider pack's mount clips, made with the horse turned round, that would end in the
+        /// saddle facing its tail). The keys of the nodes at the top of the file are turned; a node there that the clip
+        /// does not key is not. Applied at import: a change needs a reimport.
+        /// </summary>
+        public float Turn;
+
         public override string ToString() => Name;
     }
 
@@ -128,6 +136,15 @@ namespace Freefall.Assets.Importers
         public static ModelImporter OverrideSettings;
 
         public bool ConvertUnits = true;
+
+        /// <summary>
+        /// Turns the file to the engine's axes (Y up, Z ahead) from the ones an FBX says it was saved in, as Unity
+        /// imports it: the nodes at the top of the file and their keys are turned, so a Z-up file's clips (3ds Max's)
+        /// fit a Y-up rig instead of lying on their backs. Off: the file's numbers are taken as they are. Applied at
+        /// import: a change needs a reimport.
+        /// </summary>
+        public bool ConvertAxes = false;
+
         public bool Optimize = false;
         public bool LeftHanded = true;
         public bool FlipUVs = false;
@@ -265,6 +282,21 @@ namespace Freefall.Assets.Importers
         /// </summary>
         [ValueRange(0f, 30f)]
         public float LODPixelError = 8f;
+
+        /// <summary>
+        /// The clips of this file are made on another rig than the one whose clips a graph plays (a pack's rider, for
+        /// the Human graph's rig): each is baked onto the skeleton named here, a Skeleton's GUID, as it is loaded
+        /// (ClipRetarget). The graph then plays it like its own clips, blended with them on any layer. Empty = the
+        /// clips stay as made. Applied at load, like the events: a change needs no reimport.
+        /// </summary>
+        [Category("Retargeting")]
+        public string RetargetTo = string.Empty;
+
+        /// <summary>
+        /// With <see cref="RetargetTo"/>: the skeleton the clips were made on (a GUID), for a file of clips that has
+        /// none of its own (it is in the rig's model file). Empty = the file's own skeleton.
+        /// </summary>
+        public string RetargetFrom = string.Empty;
 
         /// <summary>The members above, for inspectors that show them next to a mesh.</summary>
         public static readonly string[] LODGenerationMembers =
@@ -687,6 +719,8 @@ namespace Freefall.Assets.Importers
                 if (scene == null)
                     throw new Exception($"Failed to load model from {filepath}");
 
+                if (ConvertAxes) ToEngineAxes(scene);
+
                 // Temp debug: dump node hierarchy transforms
                 //var fname = System.IO.Path.GetFileNameWithoutExtension(filepath);
                 //DumpNodeHierarchy(scene.RootNode, fname, 0);
@@ -699,6 +733,81 @@ namespace Freefall.Assets.Importers
                 if (tempBinaryFbx != null)
                     try { File.Delete(tempBinaryFbx); } catch { }
             }
+        }
+
+        /// <summary>
+        /// The file's axes (an FBX's CoordAxis, UpAxis and FrontAxis, each with a sign) turned to X right, Y up and Z
+        /// ahead (<see cref="ConvertAxes"/>): the turn is put on the nodes right under the scene's root and on their
+        /// keys, as Unity's FBX import does, so a clip's keys fit another file's rig that is already Y up. Meshes and
+        /// bones below come along; a bone's offset matrix is unchanged, as mesh and bones turn together.
+        /// </summary>
+        private void ToEngineAxes(Scene scene)
+        {
+            Vector3? Axis(string name)
+            {
+                if (scene.Metadata == null
+                    || !scene.Metadata.TryGetValue(name, out var axis) || !scene.Metadata.TryGetValue(name + "Sign", out var sign))
+                    return null;
+                int index = Convert.ToInt32(axis.Data);
+                if (index < 0 || index > 2) return null;
+                var v = Vector3.Zero;
+                if (index == 0) v.X = 1; else if (index == 1) v.Y = 1; else v.Z = 1;
+                return v * Convert.ToInt32(sign.Data);
+            }
+
+            var right = Axis("CoordAxis");
+            var up = Axis("UpAxis");
+            var ahead = Axis("FrontAxis");
+            if (right == null || up == null || ahead == null) return;
+
+            // v' = v * turn: each column is one of the file's axes, so v' = (v · right, v · up, v · ahead)
+            var turn = new Matrix4x4(
+                right.Value.X, up.Value.X, ahead.Value.X, 0,
+                right.Value.Y, up.Value.Y, ahead.Value.Y, 0,
+                right.Value.Z, up.Value.Z, ahead.Value.Z, 0,
+                0, 0, 0, 1);
+            if (turn.IsIdentity) return;
+            if (turn.GetDeterminant() < 0)
+            {
+                Debug.LogWarning("ModelImporter", $"'{System.IO.Path.GetFileName(_currentFilePath)}': its axes mirror the engine's; ConvertAxes leaves them");
+                return;
+            }
+
+            // The scene is in the engine's hand already (MakeLeftHanded mirrors Z): the turn as it is there
+            if (LeftHanded)
+            {
+                var mirror = Matrix4x4.CreateScale(1, 1, -1);
+                turn = mirror * turn * mirror;
+            }
+            var rotation = System.Numerics.Quaternion.CreateFromRotationMatrix(turn);
+
+            var top = new HashSet<string>();
+            foreach (var child in scene.RootNode.Children)
+            {
+                top.Add(child.Name);
+                child.Transform = ToAssimp(ToMatrix(child.Transform) * turn);
+            }
+
+            foreach (var anim in scene.Animations)
+                foreach (var channel in anim.NodeAnimationChannels)
+                {
+                    if (!top.Contains(channel.NodeName)) continue;
+                    var positions = channel.PositionKeys;
+                    for (int i = 0; i < positions.Count; i++)
+                    {
+                        var p = positions[i].Value;
+                        var t = Vector3.Transform(new Vector3(p.X, p.Y, p.Z), rotation);
+                        positions[i] = new Assimp.VectorKey { Time = positions[i].Time, Value = new Vector3D { X = t.X, Y = t.Y, Z = t.Z } };
+                    }
+                    var rotations = channel.RotationKeys;
+                    for (int i = 0; i < rotations.Count; i++)
+                    {
+                        var q = rotations[i].Value;
+                        // The key's own turn first, then the file's
+                        var r = rotation * new System.Numerics.Quaternion(q.X, q.Y, q.Z, q.W);
+                        rotations[i] = new Assimp.QuaternionKey { Time = rotations[i].Time, Value = new Assimp.Quaternion { W = r.W, X = r.X, Y = r.Y, Z = r.Z } };
+                    }
+                }
         }
 
         /// <summary>
@@ -1764,6 +1873,9 @@ namespace Freefall.Assets.Importers
             if (config != null && config.To > config.From)
                 clip.Cut(config.From, config.To);
 
+            if (config != null && config.Turn != 0f)
+                TurnClip(scene, clip, config.Turn);
+
             // In place: the travel its feet imply, on the root (ClipConfig.RootFromFeet). A file of clips alone has no
             // mesh to take a skeleton from: the nodes the clip moves make one.
             if (config != null && config.RootFromFeet)
@@ -1776,6 +1888,30 @@ namespace Freefall.Assets.Importers
             }
 
             return clip;
+        }
+
+        /// <summary>
+        /// The clip turned <paramref name="degrees"/> about the upright through the model's origin
+        /// (<see cref="ClipConfig.Turn"/>): the keys of every node right under the scene's root, pivot nodes passed over.
+        /// A clip made around another spot than its neighbours is moved by its state instead (AnimationState.Offset).
+        /// </summary>
+        private static void TurnClip(Scene scene, AnimationClip clip, float degrees)
+        {
+            var turn = System.Numerics.Quaternion.CreateFromAxisAngle(Vector3.UnitY, degrees * MathF.PI / 180f);
+            foreach (var channel in clip.Channels)
+            {
+                var parent = scene.RootNode.FindNode(channel.Target)?.Parent;
+                while (parent != null && IsPivotNode(parent)) parent = parent.Parent;
+                if (parent != scene.RootNode) continue;
+
+                if (channel.Position != null)
+                    for (int i = 0; i < channel.Position.Count; i++)
+                        channel.Position[i].Value = Vector3.Transform(channel.Position[i].Value, turn);
+                if (channel.Rotation != null)
+                    for (int i = 0; i < channel.Rotation.Count; i++)
+                        // The key's own turn first, then the clip's
+                        channel.Rotation[i].Value = turn * channel.Rotation[i].Value;
+            }
         }
 
         /// <summary>
@@ -2088,6 +2224,17 @@ namespace Freefall.Assets.Importers
                 m.D1, m.D2, m.D3, m.D4
             );
             return Matrix4x4.Transpose(result);
+        }
+
+        /// <summary>The way back from <see cref="ToMatrix"/>.</summary>
+        private static Assimp.Matrix4x4 ToAssimp(Matrix4x4 m)
+        {
+            var t = Matrix4x4.Transpose(m);
+            return new Assimp.Matrix4x4(
+                t.M11, t.M12, t.M13, t.M14,
+                t.M21, t.M22, t.M23, t.M24,
+                t.M31, t.M32, t.M33, t.M34,
+                t.M41, t.M42, t.M43, t.M44);
         }
 
         /// <summary>

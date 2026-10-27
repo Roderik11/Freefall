@@ -566,8 +566,8 @@ namespace Freefall.Animation
             Matrix4x4[] srcWorld, Matrix4x4[] dstWorld,
             int sourceRoot, int targetRoot)
         {
-            float srcHeight = ComputeBindHeight(source, map.SrcBindModelPos, sourceRoot);
-            float dstHeight = ComputeBindHeight(target, map.DstBindModelPos, targetRoot);
+            float srcHeight = ComputeBindHeight(source, map.SrcBindModelPos, sourceRoot, map.SourceToTarget);
+            float dstHeight = ComputeBindHeight(target, map.DstBindModelPos, targetRoot, map.TargetToSource);
             map.PositionScale = srcHeight > 1e-6f ? dstHeight / srcHeight : 1f;
 
             int srcParent = source.Bones[sourceRoot].Parent;
@@ -589,13 +589,18 @@ namespace Freefall.Animation
 
         /// <summary>
         /// Bind-pose "height": model-space distance from the root bone to the
-        /// furthest bone beneath it (typically hips → head).
+        /// furthest bone beneath it that the other rig has too (typically hips → toes),
+        /// so both rigs are measured to the same bone. An exporter's leaf nodes past
+        /// the toes or the head (a Max rig's ball_r_end_end, 33 cm on) would make a
+        /// body seem a third taller and shrink the hips' travel.
         /// </summary>
-        private static float ComputeBindHeight(Skeleton skeleton, Vector3[] positions, int rootIndex)
+        private static float ComputeBindHeight(Skeleton skeleton, Vector3[] positions, int rootIndex, int[] mapped)
         {
             float maxDist = 0;
             for (int i = 0; i < skeleton.Bones.Length; i++)
             {
+                if (mapped[i] < 0) continue;
+
                 // Only consider bones under the root
                 int current = i;
                 while (current >= 0 && current != rootIndex)
