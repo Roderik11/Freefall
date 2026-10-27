@@ -2886,7 +2886,8 @@ namespace Freefall.Components
         /// <summary>
         /// The CPU height field is missing or about to be replaced: a height bake or its readback is still
         /// outstanding. Whatever samples heights now (PCG graphs) gets flat ground or values that change in
-        /// a frame or two; TerrainHeightsChanged follows once they are in.
+        /// a frame or two; TerrainHeightsChanged follows once they are in. Not at a load that keeps the saved heights
+        /// (<see cref="KeepHeights"/>: nothing changed): there the load's <see cref="SceneLoad.HeightsIn"/> says so.
         /// </summary>
         [System.ComponentModel.Browsable(false)]
         public bool HeightsPending

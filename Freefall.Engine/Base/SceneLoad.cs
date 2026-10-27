@@ -70,6 +70,14 @@ namespace Freefall.Base
         /// <summary>The scene's entities have been read (just before <see cref="SceneManager.Loaded"/>); nothing is awake yet.</summary>
         public event Action<SceneLoad>? Read;
 
+        /// <summary>
+        /// The terrain's heights are in: the terrain step is done (or gave up waiting), nothing is generated yet. For what
+        /// stands itself on the ground as it wakes: a load that keeps the saved heights sends no TerrainHeightsChanged
+        /// (nothing changed), so whatever woke before the terrain waits for this instead. Each handler is called once and
+        /// dropped; a load that goes back to waking (a component woke more) raises it again for the ones added since.
+        /// </summary>
+        public event Action<SceneLoad>? HeightsIn;
+
         /// <summary>The [SceneLoad] summary, once done.</summary>
         public string? Report { get; private set; }
 
@@ -291,10 +299,13 @@ namespace Freefall.Base
 
                 case Step.Terrain:
                     // The terrain bakes or keeps its heights in its first draw, which a frame has to come for
-                    if (!PCGScheduler.TerrainHeightsPending) return true;
-                    Activity = "Terrain heights";
-                    if (++_terrainFrames < TerrainWaitFrames) return false;
-                    PCGScheduler.StopWaitingForTerrain();
+                    if (PCGScheduler.TerrainHeightsPending)
+                    {
+                        Activity = "Terrain heights";
+                        if (++_terrainFrames < TerrainWaitFrames) return false;
+                        PCGScheduler.StopWaitingForTerrain();
+                    }
+                    RaiseHeightsIn();
                     return true;
 
                 case Step.Generating:
@@ -360,9 +371,22 @@ namespace Freefall.Base
             Finish();
         }
 
+        private void RaiseHeightsIn()
+        {
+            var handlers = HeightsIn;
+            HeightsIn = null;
+            if (handlers == null) return;
+            foreach (Action<SceneLoad> handler in handlers.GetInvocationList())
+            {
+                try { handler(this); }
+                catch (Exception ex) { CallbackErrors.Report(handler.Target, nameof(HeightsIn), ex); }
+            }
+        }
+
         private void Finish()
         {
             _doneSeconds = Seconds;
+            HeightsIn = null;           // a load that stopped early: the handlers (scripts' too) are not kept
             if (_batchOpen)
             {
                 ObstacleCache.EndBatch();
