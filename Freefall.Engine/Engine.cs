@@ -601,7 +601,7 @@ namespace Freefall
     /// <summary>EngineSettings.Transparency: how glass, particles, trails and vfx are put together (OrderIndependentTransparency)</summary>
     public enum TransparencyMode
     {
-        Sorted = 0,             // each kind drawn in its pass, sorted within its own batch only (until 2026-10-28)
+        Sorted = 0,             // each kind drawn in its pass, sorted within its own batch only (the default until 2026-10-28)
         WeightedBlended = 1,    // one accumulation after the water, weighed by depth (McGuire & Bavoil 2013)
         Moments = 2,            // the same, weighed by the transmittance in front from a moments pass (Münstermann et al. 2018)
     }
@@ -993,10 +993,10 @@ namespace Freefall
          /// <summary>
          /// How glass, particles, trails and vfx are put together (OrderIndependentTransparency, oit.hlsli). Sorted: each
          /// kind in its own pass and order, so the ocean and the glass cover what is in front of them. The other two: all
-         /// of them in one accumulation after the water, in any order.
+         /// of them in one accumulation after the water, in any order. Moments by default since 2026-10-28.
          /// </summary>
          [Category("Transparency")]
-         public TransparencyMode Transparency { get; set; } = TransparencyMode.Sorted;
+         public TransparencyMode Transparency { get; set; } = TransparencyMode.Moments;
 
          /// <summary>A/B: the left half of the screen drawn with TransparencySplitLeft, the right half with Transparency.</summary>
          public bool TransparencySplit { get; set; } = false;
