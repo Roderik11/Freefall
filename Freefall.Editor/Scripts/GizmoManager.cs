@@ -92,15 +92,18 @@ namespace Freefall.Editor
             }
 
             // Systems draw every frame whatever is selected (markers over many things), in world space.
-            // One that throws is a script's: logged once, not every frame.
-            foreach (var gizmo in Systems.Gizmos)
+            // One that throws is a script's: logged once, not every frame. ShowSystemGizmos turns them all off.
+            if (Engine.Settings.ShowSystemGizmos)
             {
-                _ctx.Matrix = System.Numerics.Matrix4x4.Identity;
-                try { gizmo.DrawGizmos(_ctx); }
-                catch (System.Exception ex)
+                foreach (var gizmo in Systems.Gizmos)
                 {
-                    if (_failed.TryAdd(gizmo, string.Empty))
-                        Debug.LogWarning("Gizmos", $"{gizmo.GetType().Name}.DrawGizmos threw: {ex.Message}");
+                    _ctx.Matrix = System.Numerics.Matrix4x4.Identity;
+                    try { gizmo.DrawGizmos(_ctx); }
+                    catch (System.Exception ex)
+                    {
+                        if (_failed.TryAdd(gizmo, string.Empty))
+                            Debug.LogWarning("Gizmos", $"{gizmo.GetType().Name}.DrawGizmos threw: {ex.Message}");
+                    }
                 }
             }
 

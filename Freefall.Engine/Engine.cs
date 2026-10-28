@@ -622,6 +622,7 @@ namespace Freefall
          public bool Wireframe { get; set; } = false;                       // F2 - Global wireframe
          public bool EnableSMAA { get; set; } = false;                      // Anti-aliasing
          public bool ShowGrid { get; set; } = true;                      // Show editor grid in scene view
+         public bool ShowSystemGizmos { get; set; } = true;              // Markers systems draw in the scene view whatever is selected (Systems.Gizmos)
 
         [Category("Culling")]
          public bool FreezeFrustum { get; set; } = false;                   // F3 - Freeze culling frustum

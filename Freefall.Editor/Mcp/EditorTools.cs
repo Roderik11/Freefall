@@ -117,7 +117,8 @@ namespace Freefall.Editor.Mcp
 
         [McpServerTool(Name = "editor_window", Title = "Editor window size and state", OpenWorld = false)]
         [Description("Set the editor window's state ('normal', 'maximized', or 'fullscreen' = borderless over the whole screen) " +
-                     "and/or its client size in pixels (width + height, normal state). No arguments = report only. Returns the " +
+                     "and/or its client size in pixels (width + height, normal state; it may be larger than the screen, e.g. a " +
+                     "scene view the screen's full size for a capture). No arguments = report only. Returns the " +
                      "window state, client size and the scene view's size, e.g. for measuring GPU cost at a given resolution.")]
         public static async Task<CallToolResult> EditorWindow(string? state = null, int width = 0, int height = 0)
         {

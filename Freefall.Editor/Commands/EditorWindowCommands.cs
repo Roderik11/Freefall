@@ -1,4 +1,6 @@
 using System;
+using System.Drawing;
+using System.Runtime.InteropServices;
 using System.Windows.Forms;
 
 namespace Freefall.Editor.Commands
@@ -40,21 +42,48 @@ namespace Freefall.Editor.Commands
                 if (state == "fullscreen")
                 {
                     // Borderless maximized covers the taskbar too; leave maximized first so the border change takes
+                    form.MaximumSize = Size.Empty;
                     form.WindowState = FormWindowState.Normal;
                     form.FormBorderStyle = FormBorderStyle.None;
                     form.WindowState = FormWindowState.Maximized;
                 }
                 else if (state != null)
                 {
+                    form.MaximumSize = Size.Empty;
                     form.FormBorderStyle = FormBorderStyle.Sizable;
                     form.WindowState = state == "maximized" ? FormWindowState.Maximized : FormWindowState.Normal;
                 }
 
                 if (width > 0 && height > 0 && form.WindowState == FormWindowState.Normal)
-                    form.ClientSize = new System.Drawing.Size(width, height);
+                    SetClientSize(form, width, height);
             });
 
             return CommandResult.Json(new { status = "applying", state, width, height });
+        }
+
+        [DllImport("user32.dll")]
+        private static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int x, int y, int cx, int cy, uint flags);
+        private const uint SWP_NOMOVE = 0x0002, SWP_NOZORDER = 0x0004, SWP_NOACTIVATE = 0x0010;
+
+        /// <summary>
+        /// Windows keeps a window within its maximum track size (about the screen plus the frame), and WinForms'
+        /// ClientSize clamps to it too. A larger one (a scene view the screen's full height under the toolbar, for a
+        /// capture) lifts MaximumSize, which WinForms answers WM_GETMINMAXINFO with, and is set by SetWindowPos.
+        /// </summary>
+        private static void SetClientSize(Form form, int width, int height)
+        {
+            var frame = form.Size - form.ClientSize;
+            var size = new Size(width + frame.Width, height + frame.Height);
+            var max = SystemInformation.MaxWindowTrackSize;
+            if (size.Width <= max.Width && size.Height <= max.Height)
+            {
+                form.MaximumSize = Size.Empty;
+                form.ClientSize = new Size(width, height);
+                return;
+            }
+
+            form.MaximumSize = new Size(Math.Max(size.Width, max.Width), Math.Max(size.Height, max.Height));
+            SetWindowPos(form.Handle, IntPtr.Zero, 0, 0, size.Width, size.Height, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
         }
     }
 
