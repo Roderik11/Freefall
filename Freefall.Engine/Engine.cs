@@ -598,6 +598,14 @@ namespace Freefall
         On = 2,         // entries that shade no receiver are left out of the cascades
     }
 
+    /// <summary>EngineSettings.Transparency: how glass, particles, trails and vfx are put together (OrderIndependentTransparency)</summary>
+    public enum TransparencyMode
+    {
+        Sorted = 0,             // each kind drawn in its pass, sorted within its own batch only (until 2026-10-28)
+        WeightedBlended = 1,    // one accumulation after the water, weighed by depth (McGuire & Bavoil 2013)
+        Moments = 2,            // the same, weighed by the transmittance in front from a moments pass (Münstermann et al. 2018)
+    }
+
     /// <summary>The game's window as the player gives it to game code (Engine.Window): its options' window mode.</summary>
     public interface IGameWindow
     {
@@ -981,6 +989,19 @@ namespace Freefall
          /// <summary>How frozen the lakes and rivers are (0..1, every WaterBody.Ice) while OverrideWeatherSurfaces is on.</summary>
          [ValueRange(0f, 1f)]
          public float OverrideIce { get; set; } = 0f;
+
+         /// <summary>
+         /// How glass, particles, trails and vfx are put together (OrderIndependentTransparency, oit.hlsli). Sorted: each
+         /// kind in its own pass and order, so the ocean and the glass cover what is in front of them. The other two: all
+         /// of them in one accumulation after the water, in any order.
+         /// </summary>
+         [Category("Transparency")]
+         public TransparencyMode Transparency { get; set; } = TransparencyMode.Sorted;
+
+         /// <summary>A/B: the left half of the screen drawn with TransparencySplitLeft, the right half with Transparency.</summary>
+         public bool TransparencySplit { get; set; } = false;
+
+         public TransparencyMode TransparencySplitLeft { get; set; } = TransparencyMode.Sorted;
 
          [Category("Debug")]
          public DebugVizMode DebugVisualizationMode { get; set; } = DebugVizMode.Off; // F5 - Debug viz

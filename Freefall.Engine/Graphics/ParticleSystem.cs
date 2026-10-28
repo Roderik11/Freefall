@@ -734,14 +734,47 @@ namespace Freefall.Graphics
         internal void RenderTransparent(ID3D12GraphicsCommandList cmd)
         {
             _drawReady = Compute(cmd);
-            if (_drawReady) Draw(cmd, 1);
+            if (_drawReady) DrawSorted(cmd, 1);
         }
 
         /// <summary>Forward pass of the same view: Forward-mode particles from the lists built above.</summary>
         internal void RenderForward(ID3D12GraphicsCommandList cmd)
         {
-            if (_drawReady) Draw(cmd, 0);
+            if (_drawReady) DrawSorted(cmd, 0);
+            if (!OrderIndependentTransparency.Active) _drawReady = false;
+        }
+
+        /// <summary>OITMoments pass of the same view (EngineSettings.Transparency Moments): what both modes hide.</summary>
+        internal void RenderOITMoments(ID3D12GraphicsCommandList cmd)
+        {
+            if (!_drawReady) return;
+            Draw(cmd, 0, RenderPass.OITMoments);
+            Draw(cmd, 1, RenderPass.OITMoments);
+        }
+
+        /// <summary>OIT pass of the same view, after the Forward pass's water: both modes, lit as Forward-mode particles.</summary>
+        internal void RenderOIT(ID3D12GraphicsCommandList cmd)
+        {
+            if (_drawReady)
+            {
+                Draw(cmd, 0, RenderPass.OIT);
+                Draw(cmd, 1, RenderPass.OIT);
+            }
             _drawReady = false;
+        }
+
+        // A sorted draw, kept to its side of a split compare while the other side takes the particles through the OIT pass
+        private void DrawSorted(ID3D12GraphicsCommandList cmd, int mode)
+        {
+            if (!OrderIndependentTransparency.Active)
+            {
+                Draw(cmd, mode, RenderPass.Transparent);
+                return;
+            }
+            if (!OrderIndependentTransparency.Sorted) return;
+            cmd.RSSetScissorRect(OrderIndependentTransparency.SortedScissor);
+            Draw(cmd, mode, RenderPass.Transparent);
+            cmd.RSSetScissorRect(OrderIndependentTransparency.FullScissor);
         }
 
         private bool Compute(ID3D12GraphicsCommandList cmd)
@@ -859,15 +892,19 @@ namespace Freefall.Graphics
             _copyVisual = null;
         }
 
-        private void Draw(ID3D12GraphicsCommandList cmd, int mode)
+        // pass: particle_draw.fx's pass to draw with (Transparent for both sorted draws, OITMoments, OIT)
+        private void Draw(ID3D12GraphicsCommandList cmd, int mode, RenderPass pass)
         {
             if (_modeCount[mode] == 0) return;
 
             var device = Engine.Device;
+            bool oit = pass != RenderPass.Transparent;
 
             // Material.Apply handles PSO, root signature, SceneConstants and the effect's own push
             // constants; the pool's buffer indices go on top.
-            _drawMaterial!.Apply(cmd, device);
+            _drawMaterial!.SetPass(pass);
+            _drawMaterial.Apply(cmd, device);
+            _drawMaterial.SetPass(RenderPass.Transparent);
 
             cmd.SetGraphicsRoot32BitConstant(0, _core!.SrvIndex, 0);                    // ParticleCoreIdx
             cmd.SetGraphicsRoot32BitConstant(0, _visual!.SrvIndex, 1);                  // ParticleVisualIdx
@@ -876,10 +913,11 @@ namespace Freefall.Graphics
             cmd.SetGraphicsRoot32BitConstant(0, _emitters!.SrvIndex, 4);                // EmittersIdx
             cmd.SetGraphicsRoot32BitConstant(0, _chunkMap!.SrvIndex, 5);                // ChunkMapIdx
             cmd.SetGraphicsRoot32BitConstant(0, DeferredRenderer.Current?.DepthGBuffer?.BindlessIndex ?? 0u, 6); // DepthGBufIdx
-            // Forward-mode particles that are not Lit are light sources in nits; Transparent ones an albedo the composition lights
-            float lightScale = mode == 0 ? Atmosphere.EmissiveExposure : 1f;
+            // Forward-mode particles that are not Lit are light sources in nits; Transparent ones an albedo the composition
+            // lights, or in the OIT passes the shader (lit there like Lit Forward-mode ones, fogged there too)
+            float lightScale = mode == 0 || oit ? Atmosphere.EmissiveExposure : 1f;
             cmd.SetGraphicsRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(lightScale), 7);  // LightScale
-            cmd.SetGraphicsRoot32BitConstant(0, mode == 0 ? 1u : 0u, 8);                          // ApplyFog
+            cmd.SetGraphicsRoot32BitConstant(0, mode == 0 || oit ? 1u : 0u, 8);                   // ApplyFog
 
             cmd.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
 
@@ -902,6 +940,8 @@ namespace Freefall.Graphics
         private ParticleSystem? _particles;
         private Action<ID3D12GraphicsCommandList>? _transparent;
         private Action<ID3D12GraphicsCommandList>? _forward;
+        private Action<ID3D12GraphicsCommandList>? _oitMoments;
+        private Action<ID3D12GraphicsCommandList>? _oit;
 
         protected internal override void Initialize()
         {
@@ -909,6 +949,8 @@ namespace Freefall.Graphics
             if (_particles == null) return;
             _transparent = _particles.RenderTransparent;
             _forward = _particles.RenderForward;
+            _oitMoments = _particles.RenderOITMoments;
+            _oit = _particles.RenderOIT;
         }
 
         public override void Update()
@@ -917,6 +959,11 @@ namespace Freefall.Graphics
 
             CommandBuffer.Enqueue(RenderPass.Transparent, _transparent!);
             CommandBuffer.EnqueueLate(RenderPass.Forward, _forward!);
+            // Without order (EngineSettings.Transparency): this view's split is known before the draw systems run
+            if (OrderIndependentTransparency.MomentsDue && OrderIndependentTransparency.Active)
+                CommandBuffer.Enqueue(RenderPass.OITMoments, _oitMoments!);
+            if (OrderIndependentTransparency.Active)
+                CommandBuffer.Enqueue(RenderPass.OIT, _oit!);
         }
     }
 }

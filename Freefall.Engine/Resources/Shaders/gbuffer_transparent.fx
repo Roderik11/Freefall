@@ -36,6 +36,7 @@ cbuffer PushConstants : register(b3)
 
 #include "common.fx"
 #include "sky_common.fx"
+#include "oit.hlsli"
 
 // Glass effects enabled for every material using this shader (bit mask, see "Feature mask" in PS):
 // 1 = specular, 2 = refraction, 4 = sky reflection. 0 = base only: a plain alpha-blended lit surface, the
@@ -454,6 +455,19 @@ PSOutput PS(VSOutput input)
     return output;
 }
 
+// Order-independent transparency (EngineSettings.Transparency, oit.hlsli). The blend above is premultiplied
+// (BlendDescription.AlphaBlend = One / InvSrcAlpha), so the colour goes in as it is. The refraction's snapshot is
+// taken after the water there. Not pickable: no EntityId target.
+OITMomentTargets PS_OITMoments(VSOutput input)
+{
+    return OITMoments(PS(input).Color.a, input.Depth);
+}
+
+OITTargets PS_OIT(VSOutput input)
+{
+    return OITAccumulate(PS(input).Color, input.Depth, input.Position.xy);
+}
+
 technique11 GBuffer
 {
     pass Forward
@@ -461,5 +475,17 @@ technique11 GBuffer
         SetRenderState(RenderTargets=2, DepthWrite=false, Blend=AlphaBlend);
         SetVertexShader(CompileShader(vs_6_6, VS()));
         SetPixelShader(CompileShader(ps_6_6, PS()));
+    }
+    pass OITMoments
+    {
+        SetRenderState(RenderTargets=2, RenderTargetFormat=OITMoments, Blend=OIT, DepthWrite=false);
+        SetVertexShader(CompileShader(vs_6_6, VS()));
+        SetPixelShader(CompileShader(ps_6_6, PS_OITMoments()));
+    }
+    pass OIT
+    {
+        SetRenderState(RenderTargets=2, RenderTargetFormat=OIT, Blend=OIT, DepthWrite=false);
+        SetVertexShader(CompileShader(vs_6_6, VS()));
+        SetPixelShader(CompileShader(ps_6_6, PS_OIT()));
     }
 }

@@ -536,11 +536,22 @@ namespace Freefall.Graphics
                     PixMarker.End(commandList);
                 }
 
+                // Effects with an OIT pass draw there (OrderIndependentTransparency): here only on the side of a split
+                // compare that shows the sorted draws, else not at all. Still built and culled above, as the shadow
+                // receivers read their culling.
+                bool oitAside = pass == RenderPass.Forward && OrderIndependentTransparency.Active;
+
                 PixMarker.Begin(commandList, "Draws");
                 foreach (var batch in activeBatches)
                 {
+                    bool viaOIT = oitAside && batch.Material.HasPass(RenderPass.OIT);
+                    if (viaOIT && !OrderIndependentTransparency.Sorted)
+                        continue;
+
                     using var batchScope = batch.ProfileMarker.Auto(batch.DrawCount);
                     PixMarker.Begin(commandList, batch.ProfileName);
+                    if (viaOIT)
+                        commandList.RSSetScissorRect(OrderIndependentTransparency.SortedScissor);
 
                     // Apply Material (PSO)
                     batch.Material.Apply(commandList, device);
@@ -550,7 +561,7 @@ namespace Freefall.Graphics
                     // Forward pass: set slots 0-1 for transparent shaders (shadow map + composite snapshot)
                     // These are 'reserved' in opaque/sky shaders and harmless to overwrite.
                     // Custom actions (ocean) run before batches and set their own root state.
-                    if (pass == RenderPass.Forward)
+                    if (pass is RenderPass.Forward or RenderPass.OIT or RenderPass.OITMoments)
                     {
                         var renderer = DeferredRenderer.Current;
                         if (renderer != null)
@@ -561,6 +572,8 @@ namespace Freefall.Graphics
                     }
 
                     batch.Draw(commandList, device);
+                    if (viaOIT)
+                        commandList.RSSetScissorRect(OrderIndependentTransparency.FullScissor);
                     PixMarker.End(commandList);
                 }
                 PixMarker.End(commandList);

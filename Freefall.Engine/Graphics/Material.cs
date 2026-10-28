@@ -753,8 +753,19 @@ namespace Freefall.Graphics
             or Format.R16_SInt or Format.R8_UInt or Format.R8_SInt or Format.R32G32_UInt or Format.R16G16_UInt
             or Format.R8G8B8A8_UInt or Format.R32G32B32A32_UInt or Format.R16G16B16A16_UInt;
 
+        /// <summary>
+        /// Blend "OIT": every target added, colour and alpha (OrderIndependentTransparency's accumulation and moments
+        /// targets). Not "Additive": its two-blend constructor is not documented to add the alpha too.
+        /// </summary>
+        private static BlendDescription AccumulateAll() => new(Blend.One, Blend.One, Blend.One, Blend.One);
+
         private static Format[] TargetFormats(int count, string? overrideFormat)
         {
+            // The order-independent transparency's targets (OrderIndependentTransparency, oit.hlsli)
+            if (overrideFormat == "OIT")
+                return new[] { Format.R16G16B16A16_Float, Format.R16G16B16A16_Float };
+            if (overrideFormat == "OITMoments")
+                return new[] { Format.R32_Float, Format.R32G32B32A32_Float };
             if (overrideFormat != null && count <= 1 && Enum.TryParse<Format>(overrideFormat, true, out var single))
                 return new[] { single };
             return count switch
@@ -964,6 +975,7 @@ namespace Freefall.Graphics
                         "Additive" => new BlendDescription(Blend.One, Blend.One),
                         "AlphaBlend" => BlendDescription.AlphaBlend,
                         "NoColor" => NoColorWrites(),
+                        "OIT" => AccumulateAll(),
                         _ => blendDesc
                     };
                 }

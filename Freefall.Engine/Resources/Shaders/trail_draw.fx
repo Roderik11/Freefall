@@ -10,6 +10,7 @@
 
 #include "common.fx"
 #include "sky_common.fx"
+#include "oit.hlsli"
 
 SamplerState TrailWrapSampler : register(s0);      // linear wrap (the clouds' volumes, ParticleLight)
 SamplerComparisonState TrailShadowSampler : register(s3);   // less-equal: the sun's cascades, point light shadows
@@ -128,7 +129,7 @@ VSOutput VS(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
     return output;
 }
 
-float4 PS(VSOutput input) : SV_Target0
+float4 RibbonColor(VSOutput input, bool fogged)
 {
     // Full along the middle, nothing at the edges. A blade's sheet: full at the tip's edge, fading
     // out towards the other, faster at first
@@ -139,12 +140,28 @@ float4 PS(VSOutput input) : SV_Target0
     if (max(color.a, max(color.r, max(color.g, color.b))) < 0.002) discard;
 
     // The air in front (premultiplied, as in particle_draw); the light was scaled in VS
-    if (FogEnabled > 0.0 && AtmosphereIdx != 0)
+    if (fogged && FogEnabled > 0.0 && AtmosphereIdx != 0)
     {
         float4 fog = AtmosphereFog(input.Position.xy, input.Depth, input.SkyVisible);   // no lit haze in a cave
         color.rgb = color.rgb * fog.a + fog.rgb * color.a;
     }
     return color;
+}
+
+float4 PS(VSOutput input) : SV_Target0
+{
+    return RibbonColor(input, true);
+}
+
+// Order-independent transparency (EngineSettings.Transparency, oit.hlsli)
+OITMomentTargets PS_OITMoments(VSOutput input)
+{
+    return OITMoments(RibbonColor(input, false).a, input.Depth);
+}
+
+OITTargets PS_OIT(VSOutput input)
+{
+    return OITAccumulate(RibbonColor(input, true), input.Depth, input.Position.xy);
 }
 
 technique11 Trails
@@ -153,5 +170,17 @@ technique11 Trails
     {
         SetVertexShader(CompileShader(vs_6_6, VS()));
         SetPixelShader(CompileShader(ps_6_6, PS()));
+    }
+    pass OITMoments
+    {
+        SetVertexShader(CompileShader(vs_6_6, VS()));
+        SetPixelShader(CompileShader(ps_6_6, PS_OITMoments()));
+        SetRenderState(RenderTargets=2, RenderTargetFormat=OITMoments, Blend=OIT, DepthWrite=false);
+    }
+    pass OIT
+    {
+        SetVertexShader(CompileShader(vs_6_6, VS()));
+        SetPixelShader(CompileShader(ps_6_6, PS_OIT()));
+        SetRenderState(RenderTargets=2, RenderTargetFormat=OIT, Blend=OIT, DepthWrite=false);
     }
 }

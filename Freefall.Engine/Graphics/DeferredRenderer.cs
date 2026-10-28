@@ -70,6 +70,8 @@ namespace Freefall.Graphics
         // Screen-space reflections, after the lighting, before the composition (made on first use)
         private ScreenSpaceReflections? _ssr;
         private PrecipitationLayers? _precipitation;
+        // Glass, particles, trails and vfx without order, after the Forward pass's water (EngineSettings.Transparency)
+        private readonly OrderIndependentTransparency _oit = new();
         private uint _ssrSrv;
         // This view's aerial perspective volume (the far haze), sized to its target: SceneConstants.AerialPerspectiveIdx
         private readonly AerialPerspectiveVolume _aerialPerspective = new();
@@ -574,9 +576,12 @@ namespace Freefall.Graphics
              _cloudTargetIdx = _cloudView.Prepare((int)compositeSize.Width, (int)compositeSize.Height);
              // ... and its light clusters (built in 2b below, after the point light shadow selection)
              _lightClusters.Prepare((int)compositeSize.Width, (int)compositeSize.Height);
+             // ... and which of its columns take the transparents without order (before the draw systems enqueue)
+             _oit.Begin(camera, (int)compositeSize.Width, (int)compositeSize.Height);
 
              foreach (var pair in Effect.MasterEffects)
              {
+                 _oit.SetParameters(pair.Value);
                  pair.Value.SetParameter("CameraInverse", cameraInverse);
                  pair.Value.SetParameter("CameraRelativeVP", relativeVP);
                  pair.Value.SetParameter("FogVolumeIdx", _fogVolumeIdx);
@@ -1347,12 +1352,10 @@ namespace Freefall.Graphics
             Transition(list, LdrOutput.Native, ResourceStates.UnorderedAccess, ResourceStates.PixelShaderResource);
         }
 
-        private void RenderForward(Camera camera, ID3D12GraphicsCommandList list)
+        /// <summary>Copy the composite (a render target, before and after) into CompositeSnapshot, which the forward passes read.</summary>
+        private void SnapshotComposite(ID3D12GraphicsCommandList list)
         {
-             PixMarker.Begin(list, "Forward");
-             // Snapshot the Composite buffer for forward-pass shaders to read
-             // (avoids read/write hazard — ocean writes to Composite while reading the snapshot)
-             if (CompositeSnapshot == null) 
+             if (CompositeSnapshot == null)
              {
                  CompositeSnapshot = new RenderTexture2D(Engine.Device,
                      (int)Composite.Native.Description.Width,
@@ -1360,13 +1363,21 @@ namespace Freefall.Graphics
                      Composite.Native.Description.Format);
              }
              Transition(list, Composite.Native, ResourceStates.RenderTarget, ResourceStates.CopySource);
-             Transition(list, CompositeSnapshot.Native, 
-                 _compositeSnapshotFirstFrame ? ResourceStates.Common : ResourceStates.PixelShaderResource, 
+             Transition(list, CompositeSnapshot.Native,
+                 _compositeSnapshotFirstFrame ? ResourceStates.Common : ResourceStates.PixelShaderResource,
                  ResourceStates.CopyDest);
              list.CopyResource(CompositeSnapshot.Native, Composite.Native);
              Transition(list, CompositeSnapshot.Native, ResourceStates.CopyDest, ResourceStates.PixelShaderResource);
              Transition(list, Composite.Native, ResourceStates.CopySource, ResourceStates.RenderTarget);
              _compositeSnapshotFirstFrame = false;
+        }
+
+        private void RenderForward(Camera camera, ID3D12GraphicsCommandList list)
+        {
+             PixMarker.Begin(list, "Forward");
+             // Snapshot the Composite buffer for forward-pass shaders to read
+             // (avoids read/write hazard — ocean writes to Composite while reading the snapshot)
+             SnapshotComposite(list);
 
 
              // Depth is in ShaderRead — forward objects can sample it via bindless SRV.
@@ -1382,6 +1393,15 @@ namespace Freefall.Graphics
              PixMarker.Begin(list, "Forward Draws");
              CommandBuffer.Execute(RenderPass.Forward, list, Engine.Device);
              PixMarker.End(list); // Forward Draws
+
+             // Glass, particles, trails and vfx without order, over the water just drawn (EngineSettings.Transparency).
+             // The glass refracts a snapshot taken after the water, so a window shows the sea behind it
+             if (OrderIndependentTransparency.Active)
+             {
+                 SnapshotComposite(list);
+                 _oit.Render(list, Composite, Depth);
+                 list.OMSetRenderTargets(new[] { Composite.RtvHandle, EntityIdBuffer.RtvHandle }, Depth.DsvHandle);
+             }
 
              // Pick readback: entity ID + depth + normal. A pick asked for before a resize can lie outside the new buffers
              // (the old screen's middle): the copy then ran past the texture and failed the frame's Close with E_INVALIDARG
@@ -1616,6 +1636,7 @@ namespace Freefall.Graphics
             _decals.Dispose();
             _ssr?.Dispose();
             _precipitation?.Dispose();
+            _oit.Dispose();
             _aerialPerspective.Dispose();
             _cloudView.Dispose();
             foreach (var tracer in _pointScreenShadows) tracer?.Dispose();

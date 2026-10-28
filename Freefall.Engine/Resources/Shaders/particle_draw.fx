@@ -7,11 +7,16 @@
 // only says how much of the background the particle hides. Alpha 0 = additive, and everything that
 // fades a particle has to scale RGB along with alpha.
 //
+// Order-independent transparency (EngineSettings.Transparency, oit.hlsli): both render modes are drawn in the OITMoments
+// and OIT passes after the water, Transparent-mode particles lit here like Forward-mode ones (there is no composition
+// after them to light an albedo).
+//
 // @RenderState(RenderTargets=1, DepthWrite=false, Blend=AlphaBlend, CullMode=None)
 
 #include "common.fx"
 #include "sky_common.fx"
 #include "particle_common.hlsli"
+#include "oit.hlsli"
 
 // ────────────── Push Constants ──────────────
 
@@ -77,7 +82,11 @@ struct VSOutput
     nointerpolation float SkyVisible : TEXCOORD6;  // how much sky the particle sees past the terrain (scales the haze in front)
 };
 
-VSOutput VS(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
+#define DRAW_SORTED   0     // the Transparent and Forward passes
+#define DRAW_COVERAGE 1     // OITMoments: only what the particle hides, no light
+#define DRAW_OIT      2     // OIT: both modes lit as Forward-mode particles
+
+VSOutput DrawVS(uint vertexID, uint instanceID, uint draw)
 {
     VSOutput output = (VSOutput)0;
 
@@ -104,8 +113,10 @@ VSOutput VS(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
     // colour is an albedo under the sky, the sun (through their shadows) and the point lights that reach it, else a
     // luminance (nits) pre-exposed as a light source. Transparent mode writes an albedo the composition lights
     // (LightScale 1).
-    output.SkyVisible = e.RenderMode == PARTICLE_MODE_FORWARD ? SkyVisibility(core.Position, float3(0, 1, 0)) : 1.0;
-    if (e.RenderMode == PARTICLE_MODE_FORWARD && (e.Flags & PARTICLE_FLAG_LIT) != 0)
+    bool forward = e.RenderMode == PARTICLE_MODE_FORWARD || draw != DRAW_SORTED;
+    output.SkyVisible = forward ? SkyVisibility(core.Position, float3(0, 1, 0)) : 1.0;
+    bool lit = (e.Flags & PARTICLE_FLAG_LIT) != 0 || e.RenderMode != PARTICLE_MODE_FORWARD;
+    if (draw != DRAW_COVERAGE && forward && lit)
     {
         float3 relPos = core.Position - CamPos;
         float3 toEye = normalize(-relPos);
@@ -291,7 +302,11 @@ VSOutput VS(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
     return output;
 }
 
-float4 PS(VSOutput input) : SV_Target0
+VSOutput VS(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID) { return DrawVS(vertexID, instanceID, DRAW_SORTED); }
+VSOutput VS_Coverage(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID) { return DrawVS(vertexID, instanceID, DRAW_COVERAGE); }
+VSOutput VS_OIT(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID) { return DrawVS(vertexID, instanceID, DRAW_OIT); }
+
+float4 ParticleColor(VSOutput input, bool fogged)
 {
     // Emitters of one draw use different textures
     Texture2D ParticleTex = ResourceDescriptorHeap[NonUniformResourceIndex(input.TextureIdx)];
@@ -326,12 +341,27 @@ float4 PS(VSOutput input) : SV_Target0
     if (max(finalColor.a, max(finalColor.r, max(finalColor.g, finalColor.b))) < 0.004) discard;
 
     // The air in front dims the particle's own light and adds its haze over the part of the background it hides
-    if (ApplyFog != 0 && FogEnabled > 0.0 && AtmosphereIdx != 0)
+    if (fogged && FogEnabled > 0.0 && AtmosphereIdx != 0)
     {
         float4 fog = AtmosphereFog(input.Position.xy, input.Depth, input.SkyVisible);   // no lit haze in a cave
         finalColor.rgb = finalColor.rgb * fog.a + fog.rgb * finalColor.a;
     }
     return finalColor;
+}
+
+float4 PS(VSOutput input) : SV_Target0
+{
+    return ParticleColor(input, ApplyFog != 0);
+}
+
+OITMomentTargets PS_OITMoments(VSOutput input)
+{
+    return OITMoments(ParticleColor(input, false).a, input.Depth);
+}
+
+OITTargets PS_OIT(VSOutput input)
+{
+    return OITAccumulate(ParticleColor(input, true), input.Depth, input.Position.xy);
 }
 
 // ────────────── Technique ──────────────
@@ -342,5 +372,17 @@ technique11 Particles
     {
         SetVertexShader(CompileShader(vs_6_6, VS()));
         SetPixelShader(CompileShader(ps_6_6, PS()));
+    }
+    pass OITMoments
+    {
+        SetVertexShader(CompileShader(vs_6_6, VS_Coverage()));
+        SetPixelShader(CompileShader(ps_6_6, PS_OITMoments()));
+        SetRenderState(RenderTargets=2, RenderTargetFormat=OITMoments, Blend=OIT, DepthWrite=false);
+    }
+    pass OIT
+    {
+        SetVertexShader(CompileShader(vs_6_6, VS_OIT()));
+        SetPixelShader(CompileShader(ps_6_6, PS_OIT()));
+        SetRenderState(RenderTargets=2, RenderTargetFormat=OIT, Blend=OIT, DepthWrite=false);
     }
 }

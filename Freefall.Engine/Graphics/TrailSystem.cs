@@ -421,8 +421,28 @@ namespace Freefall.Graphics
             return _prepared = true;
         }
 
-        /// <summary>Forward pass: every trail of this frame in one draw.</summary>
+        /// <summary>Forward pass: every trail of this frame in one draw (kept to its side of a split compare while the
+        /// other takes them through the OIT pass, EngineSettings.Transparency).</summary>
         internal void Render(ID3D12GraphicsCommandList cmd)
+        {
+            if (!OrderIndependentTransparency.Active)
+            {
+                Draw(cmd, RenderPass.Forward);
+                return;
+            }
+            if (!OrderIndependentTransparency.Sorted) return;
+            cmd.RSSetScissorRect(OrderIndependentTransparency.SortedScissor);
+            Draw(cmd, RenderPass.Forward);
+            cmd.RSSetScissorRect(OrderIndependentTransparency.FullScissor);
+        }
+
+        /// <summary>OITMoments pass: what the trails hide.</summary>
+        internal void RenderOITMoments(ID3D12GraphicsCommandList cmd) => Draw(cmd, RenderPass.OITMoments);
+
+        /// <summary>OIT pass, after the Forward pass's water.</summary>
+        internal void RenderOIT(ID3D12GraphicsCommandList cmd) => Draw(cmd, RenderPass.OIT);
+
+        private void Draw(ID3D12GraphicsCommandList cmd, RenderPass pass)
         {
             if (_uploadedPoints < 2) return;
 
@@ -430,7 +450,9 @@ namespace Freefall.Graphics
             float viewHeight = DeferredRenderer.Current?.Composite?.Native.Description.Height ?? 1080f;
 
             cmd.SetDescriptorHeaps(1, _heaps!);
-            _material!.Apply(cmd, device);
+            _material!.SetPass(pass);
+            _material.Apply(cmd, device);
+            _material.SetPass(RenderPass.Forward);
 
             cmd.SetGraphicsRoot32BitConstant(0, _buffer!.SrvIndex, 0);                              // PointsIdx
             cmd.SetGraphicsRoot32BitConstant(0, BitConverter.SingleToUInt32Bits(viewHeight), 1);    // ViewHeight
@@ -453,12 +475,16 @@ namespace Freefall.Graphics
     {
         private TrailSystem? _trails;
         private Action<ID3D12GraphicsCommandList>? _render;
+        private Action<ID3D12GraphicsCommandList>? _oitMoments;
+        private Action<ID3D12GraphicsCommandList>? _oit;
 
         protected internal override void Initialize()
         {
             _trails = Systems.Get<TrailSystem>();
             if (_trails == null) return;
             _render = _trails.Render;
+            _oitMoments = _trails.RenderOITMoments;
+            _oit = _trails.RenderOIT;
         }
 
         public override void Update()
@@ -467,6 +493,11 @@ namespace Freefall.Graphics
 
             // After the pass's batches, so the ocean (a batch) does not cover the ribbons in front of it
             CommandBuffer.EnqueueLate(RenderPass.Forward, _render!);
+            // Without order (EngineSettings.Transparency): this view's split is known before the draw systems run
+            if (OrderIndependentTransparency.MomentsDue && OrderIndependentTransparency.Active)
+                CommandBuffer.Enqueue(RenderPass.OITMoments, _oitMoments!);
+            if (OrderIndependentTransparency.Active)
+                CommandBuffer.Enqueue(RenderPass.OIT, _oit!);
         }
     }
 }

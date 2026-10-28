@@ -58,6 +58,14 @@ cbuffer SceneConstants : register(b0)
     uint ClusterLightsIdx;             // StructuredBuffer<PointLightData>: the visible lights in view-depth order
 
     uint BlueNoiseIdx;                 // Texture2D<float> 64 × 64 blue noise, tiled by pixel (InternalAssets.BlueNoise); 0 = none
+
+    // ── Order-independent transparency (Graphics.OrderIndependentTransparency, set per view by DeferredRenderer) — oit.hlsli ──
+    uint OITZerothIdx;                 // Texture2D<float>: Σ absorbance from the moments pass; 0 = no moments this view
+    uint OITMomentsIdx;                // Texture2D<float4>: Σ absorbance × (z, z², z³, z⁴) of the warped depth
+    float OITMomentsFrom;              // pixel columns from here ...
+    float OITMomentsTo;                // ... up to here are weighed by the moments; elsewhere by WBOIT's depth weight
+    float OITLogNear;                  // ln of the near plane: the warped depth's −1
+    float OITLogScale;                 // 2 / (ln far − ln near): the warp to [−1, 1]
 }
 
 // ── Large-scale variation of the ground and what grows on it (gputerrain.fx, grass cards, blades, flowers) ──

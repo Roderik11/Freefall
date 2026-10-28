@@ -44,6 +44,7 @@ cbuffer PushConstants : register(b3)
 
 #include "common.fx"
 #include "sky_common.fx"
+#include "oit.hlsli"
 
 // @RenderState(RenderTargets=1, DepthWrite=false, Blend=Additive, CullMode=None, RenderTargetFormat=R16G16B16A16_Float)
 
@@ -358,11 +359,23 @@ float4 PS(VSOutput input) : SV_Target0
     return float4(light, 1.0);
 }
 
+// Order-independent transparency (EngineSettings.Transparency, oit.hlsli): light that hides nothing, so no moments pass
+OITTargets PS_OIT(VSOutput input)
+{
+    return OITAccumulate(float4(PS(input).rgb, 0.0), input.Depth, input.Position.xy);
+}
+
 technique11 Vfx
 {
     pass Forward
     {
         SetVertexShader(CompileShader(vs_6_6, VS()));
         SetPixelShader(CompileShader(ps_6_6, PS()));
+    }
+    pass OIT
+    {
+        SetVertexShader(CompileShader(vs_6_6, VS()));
+        SetPixelShader(CompileShader(ps_6_6, PS_OIT()));
+        SetRenderState(RenderTargets=2, RenderTargetFormat=OIT, Blend=OIT, DepthWrite=false);
     }
 }
