@@ -132,6 +132,17 @@ namespace Freefall.Graphics
             return resource;
         }
 
+        /// <summary>
+        /// With the debug layer on, names a new pipeline state as FrameTrace logs it (effect and pass, or file and
+        /// kernel), so a GPU-based validation message names the shader where it says 'Unnamed ID3D12PipelineState
+        /// Object'; without debug info in the shaders it gives no file location. A no-op otherwise.
+        /// </summary>
+        public ID3D12PipelineState NamePipeline(ID3D12PipelineState pipeline, string? name)
+        {
+            if (DebugLayerEnabled && pipeline != null && name != null) pipeline.Name = name;
+            return pipeline!;
+        }
+
         private bool _deviceRemovedLogged;
 
         /// <summary>What a device-removed reason (ID3D12Device::GetDeviceRemovedReason) means, in a few words.</summary>
@@ -1156,7 +1167,7 @@ namespace Freefall.Graphics
                 ComputeShader = shaderBytecode
             };
             FrameTrace.Pipeline("compute", name);
-            return _device.CreateComputePipelineState(desc);
+            return NamePipeline(_device.CreateComputePipelineState(desc), name);
         }
     }
 

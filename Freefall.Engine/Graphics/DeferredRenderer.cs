@@ -704,18 +704,20 @@ namespace Freefall.Graphics
                      CommandBuffer.Culler.GenerateShadowHiZPyramid(
                          list, ShadowTextureArray.BindlessIndex, ShadowHiZPyramid, DirectionalLight.CascadeCount);
                      
-                     // Transition to PixelShaderResource for light pass sampling
+                     // Readable from both stages for the rest of the frame: the light pass samples it, and compute
+                     // reads it too (the near fog volume, ...); a compute read in PixelShaderResource is a layout
+                     // error GBV reports and AMD's drivers act on (stability/amd_close_failure.md)
                      list.ResourceBarrierTransition(ShadowTextureArray.Native,
-                         ResourceStates.NonPixelShaderResource, ResourceStates.PixelShaderResource);
+                         ResourceStates.NonPixelShaderResource, ShaderRead);
                      PixMarker.End(list); // Shadow Hi-Z
                  }
                  else
                  {
-                     // No Hi-Z — transition directly to PixelShaderResource for light pass
+                     // No Hi-Z: straight to readable from both stages
                      list.ResourceBarrierTransition(ShadowTextureArray.Native,
-                         ResourceStates.DepthWrite, ResourceStates.PixelShaderResource);
+                         ResourceStates.DepthWrite, ShaderRead);
                  }
-                 _shadowMapState = ResourceStates.PixelShaderResource;
+                 _shadowMapState = ShaderRead;
                  _shadowsRendered = true;
 
                  // Shadow pass changes render targets and viewport for depth rendering.

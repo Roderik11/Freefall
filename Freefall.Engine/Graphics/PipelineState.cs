@@ -20,7 +20,7 @@ namespace Freefall.Graphics
             try
             {
                 FrameTrace.Pipeline("graphics", name);
-                _pipelineState = device.NativeDevice.CreateGraphicsPipelineState(description);
+                _pipelineState = device.NamePipeline(device.NativeDevice.CreateGraphicsPipelineState(description), name);
             }
             catch (Exception ex)
             {
@@ -105,7 +105,7 @@ namespace Freefall.Graphics
 
                     // ID3D12Device2 is required for pipeline stream PSO creation (mesh shaders)
                     using var device2 = device.NativeDevice.QueryInterface<ID3D12Device2>();
-                    _pipelineState = device2.CreatePipelineState(stream);
+                    _pipelineState = device.NamePipeline(device2.CreatePipelineState(stream), name);
                 }
             }
             catch (Exception ex)

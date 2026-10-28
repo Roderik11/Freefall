@@ -2621,6 +2621,10 @@ namespace Freefall.Components
                 _instanceCounterBuffer.ClearUAV(commandList, new Vortice.Mathematics.Int4(0, 0, 0, 0));
                 commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(null)));
 
+                // The registry as this frame has it: a custom action runs before its pass's batches, whose Build is
+                // what uploads it otherwise, so in a load's first world frame its index was still 0 (GBV)
+                MeshRegistry.Upload(device);
+
                 // ── Push constants: bindless resource indices only ──
                 cs.SetBuffer("DecoratorSlots", _decoratorSlotsBuffer!);
                 cs.SetBuffer("LODTable", _decoratorLODTableBuffer!);

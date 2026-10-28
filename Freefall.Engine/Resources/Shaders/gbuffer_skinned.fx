@@ -109,38 +109,43 @@ VSOutput VS(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_InstanceI
     StructuredBuffer<float3> normals = ResourceDescriptorHeap[part.NormBufferIdx];
     StructuredBuffer<float2> uvs = ResourceDescriptorHeap[part.UVBufferIdx];
     
-    // Per-Animator bone buffer — loaded from per-instance descriptor (shared across SMRs)
-    StructuredBuffer<BoneWeight> boneWeights = ResourceDescriptorHeap[part.BoneWeightsBufferIdx];
-    StructuredBuffer<row_major matrix> bones = ResourceDescriptorHeap[NonUniformResourceIndex(desc.BoneBufferIdx)];
-    
     float3 pos = positions[vertexID];
     float3 norm = normals[vertexID];
     float2 uv = uvs[vertexID];
-    BoneWeight bw = boneWeights[vertexID];
-    
-    // Bone matrices — direct index, no offset!
-    // Each Animator owns its own buffer, bones start at index 0.
-    matrix bone0 = bones[(uint)bw.BoneIDs.x];
-    matrix bone1 = bones[(uint)bw.BoneIDs.y];
-    matrix bone2 = bones[(uint)bw.BoneIDs.z];
-    matrix bone3 = bones[(uint)bw.BoneIDs.w];
-    
-    // Skinning transformation
-    float4 skinned = float4(0, 0, 0, 0);
-    float3 skinnedNormal = float3(0, 0, 0);
-    
-    skinned += mul(float4(pos, 1), bone0) * bw.Weights.x;
-    skinned += mul(float4(pos, 1), bone1) * bw.Weights.y;
-    skinned += mul(float4(pos, 1), bone2) * bw.Weights.z;
-    skinned += mul(float4(pos, 1), bone3) * bw.Weights.w;
-    
-    skinnedNormal += mul(norm, (float3x3)bone0) * bw.Weights.x;
-    skinnedNormal += mul(norm, (float3x3)bone1) * bw.Weights.y;
-    skinnedNormal += mul(norm, (float3x3)bone2) * bw.Weights.z;
-    skinnedNormal += mul(norm, (float3x3)bone3) * bw.Weights.w;
-    
-    pos = skinned.xyz;
-    norm = normalize(skinnedNormal);
+
+    // Per-Animator bone buffer — loaded from per-instance descriptor (shared across SMRs). 0 = no pose yet (an
+    // Animator that has not posed, or none): the bind pose, as SkinnedMeshRenderer.BoneBufferIdx says; reading
+    // descriptor 0 instead was an invalid resource to GPU-based validation.
+    if (desc.BoneBufferIdx != 0u)
+    {
+        StructuredBuffer<BoneWeight> boneWeights = ResourceDescriptorHeap[part.BoneWeightsBufferIdx];
+        StructuredBuffer<row_major matrix> bones = ResourceDescriptorHeap[NonUniformResourceIndex(desc.BoneBufferIdx)];
+        BoneWeight bw = boneWeights[vertexID];
+
+        // Bone matrices — direct index, no offset!
+        // Each Animator owns its own buffer, bones start at index 0.
+        matrix bone0 = bones[(uint)bw.BoneIDs.x];
+        matrix bone1 = bones[(uint)bw.BoneIDs.y];
+        matrix bone2 = bones[(uint)bw.BoneIDs.z];
+        matrix bone3 = bones[(uint)bw.BoneIDs.w];
+
+        // Skinning transformation
+        float4 skinned = float4(0, 0, 0, 0);
+        float3 skinnedNormal = float3(0, 0, 0);
+
+        skinned += mul(float4(pos, 1), bone0) * bw.Weights.x;
+        skinned += mul(float4(pos, 1), bone1) * bw.Weights.y;
+        skinned += mul(float4(pos, 1), bone2) * bw.Weights.z;
+        skinned += mul(float4(pos, 1), bone3) * bw.Weights.w;
+
+        skinnedNormal += mul(norm, (float3x3)bone0) * bw.Weights.x;
+        skinnedNormal += mul(norm, (float3x3)bone1) * bw.Weights.y;
+        skinnedNormal += mul(norm, (float3x3)bone2) * bw.Weights.z;
+        skinnedNormal += mul(norm, (float3x3)bone3) * bw.Weights.w;
+
+        pos = skinned.xyz;
+        norm = normalize(skinnedNormal);
+    }
     
     // Apply world transform
     float4 worldPos = mul(float4(pos, 1.0f), World);
@@ -208,9 +213,7 @@ ShadowVSOutput ShadowVertex(uint primitiveVertexID, uint instanceID, bool local)
     // Per-Animator bone buffer from per-instance descriptor
     StructuredBuffer<InstanceDescriptor> descriptors = ResourceDescriptorHeap[DescriptorBufIdx];
     InstanceDescriptor desc = descriptors[idx];
-    StructuredBuffer<BoneWeight> boneWeights = ResourceDescriptorHeap[part.BoneWeightsBufferIdx];
-    StructuredBuffer<row_major matrix> bones = ResourceDescriptorHeap[NonUniformResourceIndex(desc.BoneBufferIdx)];
-    
+
     row_major matrix World = globalTransforms[desc.TransformSlot];
 
     uint vertexID = MeshVertexIndex(part, primitiveVertexID, primitiveVertexID, IndexedDraw);
@@ -219,20 +222,27 @@ ShadowVSOutput ShadowVertex(uint primitiveVertexID, uint instanceID, bool local)
     StructuredBuffer<float2> uvs = ResourceDescriptorHeap[part.UVBufferIdx];
 
     float3 pos = positions[vertexID];
-    BoneWeight bw = boneWeights[vertexID];
 
-    // Direct bone index — no offset
-    matrix bone0 = bones[(uint)bw.BoneIDs.x];
-    matrix bone1 = bones[(uint)bw.BoneIDs.y];
-    matrix bone2 = bones[(uint)bw.BoneIDs.z];
-    matrix bone3 = bones[(uint)bw.BoneIDs.w];
+    // 0 = no pose yet: the bind pose (VS above)
+    if (desc.BoneBufferIdx != 0u)
+    {
+        StructuredBuffer<BoneWeight> boneWeights = ResourceDescriptorHeap[part.BoneWeightsBufferIdx];
+        StructuredBuffer<row_major matrix> bones = ResourceDescriptorHeap[NonUniformResourceIndex(desc.BoneBufferIdx)];
+        BoneWeight bw = boneWeights[vertexID];
 
-    float4 skinned = float4(0, 0, 0, 0);
-    skinned += mul(float4(pos, 1), bone0) * bw.Weights.x;
-    skinned += mul(float4(pos, 1), bone1) * bw.Weights.y;
-    skinned += mul(float4(pos, 1), bone2) * bw.Weights.z;
-    skinned += mul(float4(pos, 1), bone3) * bw.Weights.w;
-    pos = skinned.xyz;
+        // Direct bone index — no offset
+        matrix bone0 = bones[(uint)bw.BoneIDs.x];
+        matrix bone1 = bones[(uint)bw.BoneIDs.y];
+        matrix bone2 = bones[(uint)bw.BoneIDs.z];
+        matrix bone3 = bones[(uint)bw.BoneIDs.w];
+
+        float4 skinned = float4(0, 0, 0, 0);
+        skinned += mul(float4(pos, 1), bone0) * bw.Weights.x;
+        skinned += mul(float4(pos, 1), bone1) * bw.Weights.y;
+        skinned += mul(float4(pos, 1), bone2) * bw.Weights.z;
+        skinned += mul(float4(pos, 1), bone3) * bw.Weights.w;
+        pos = skinned.xyz;
+    }
 
     float4 worldPos = mul(float4(pos, 1.0f), World);
     output.Position = ShadowClipPosition(worldPos, view, local, CascadeBufferSRVIdx, output.RTIndex, output.ClipDistance);

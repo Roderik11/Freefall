@@ -684,7 +684,8 @@ namespace Freefall.Graphics
                 _drawEffect = new Effect("particle_draw");
                 _drawMaterial = new Material(_drawEffect);
 
-                _drawArgs = GraphicsBuffer.CreateRaw(RenderModeCount * 4, uav: true);
+                // Structured, as both kernels declare it (RWStructuredBuffer<uint>): a raw view was a stride mismatch (GBV)
+                _drawArgs = GraphicsBuffer.CreateStructured<uint>(RenderModeCount * 4, uav: true);
                 for (int i = 0; i < _frameConstants.Length; i++)
                     _frameConstants[i] = GraphicsBuffer.CreateConstantBuffer<FrameData>();
 
