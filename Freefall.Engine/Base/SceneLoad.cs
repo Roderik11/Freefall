@@ -276,6 +276,13 @@ namespace Freefall.Base
                 Finish();
             }
 
+            // What has woken stands posed in the frames the load draws, not in its bind pose (the animators are paused)
+            if (Current > Step.Reading)
+            {
+                try { Systems.Get<Freefall.Animation.AnimatorSystem>()?.PoseFirst(); }
+                catch (Exception ex) { Debug.LogError("SceneLoad", $"First poses in '{Name}': {ex.Message}"); }
+            }
+
             double sliceMs = Stopwatch.GetElapsedTime(sliceStart).TotalMilliseconds;
             _slices++;
             if (sliceMs > _longestSliceMs) _longestSliceMs = sliceMs;

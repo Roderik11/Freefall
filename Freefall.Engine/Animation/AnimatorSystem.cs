@@ -172,6 +172,39 @@ namespace Freefall.Animation
             }
         }
 
+        /// <summary>
+        /// Every Animator not posed yet, posed now where its state machine begins (a step of no time): for a scene load,
+        /// which pauses this system (SceneLoad, after each slice from the wake-up on). Without it the frames a load draws
+        /// show characters in their bind pose: the player and the people a load now brings out round it, with the camera
+        /// behind the player from the wake-up on (the project's ThirdPersonCamera, 2026-10-28).
+        /// </summary>
+        internal void PoseFirst()
+        {
+            _stepped.Clear();
+            for (int i = 0; i < _animators.Count; i++)
+            {
+                var animator = _animators[i];
+                if (animator.PosedFrame >= 0 || !animator.Enabled || animator.IsDestroyed || animator.Entity == null || animator.Animation == null)
+                    continue;
+                if (animator.PartsChanged || animator.Unmeasured) Measure(animator);
+                if (animator.Parts.Count > 0) _stepped.Add(animator);
+            }
+            if (_stepped.Count == 0) return;
+
+            Parallel.For(0, _stepped.Count, i =>
+            {
+                var animator = _stepped[i];
+                try
+                {
+                    animator.StepDelta = 0f;
+                    animator.Step();
+                    animator.Pose(1);
+                }
+                catch (Exception e) { CallbackErrors.Report(animator, nameof(Animator.Update), e); }
+            });
+            _stepped.Clear();
+        }
+
         /// <summary>How many frames apart to pose a character now: 0 for not at all.</summary>
         private static int Every(Animator animator, in View view)
         {
