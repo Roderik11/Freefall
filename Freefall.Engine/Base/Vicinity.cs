@@ -156,6 +156,17 @@ namespace Freefall.Base
         /// <summary>Look at the rings at the next update, not after the usual wait (a viewer was put somewhere else).</summary>
         public static void LookSoon() => s_sinceLook = EvaluateEvery;
 
+        /// <summary>
+        /// Look at the rings now: for a scene load's own work (SceneLoad.WaitFor), which brings out what is near the
+        /// viewers before the world's first frame. The world is paused while a load runs, and VicinitySystem with it.
+        /// </summary>
+        public static void LookNow()
+        {
+            if (s_count == 0) return;
+            s_sinceLook = 0f;
+            Look();
+        }
+
         /// <summary>Called by <see cref="VicinitySystem"/> every frame.</summary>
         internal static void Update()
         {

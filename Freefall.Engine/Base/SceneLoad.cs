@@ -93,6 +93,8 @@ namespace Freefall.Base
         private bool _batchOpen;
         private int _terrainFrames, _finishFrames, _woken;
         private readonly List<(Task Task, string What)> _waits = new();
+        private readonly List<(Func<long, bool> Work, string What)> _work = new();
+        private readonly List<string> _workDone = new();
         private readonly SceneLoadReport _report = new();
         private double _longestSliceMs;
         private int _slices;
@@ -204,7 +206,8 @@ namespace Freefall.Base
             Step.Waking => Fraction(_woken, ScriptExecution.PendingWakeups()),
             Step.Terrain => (float)_terrainFrames / 10f,
             Step.Generating => Fraction(_ranTotal, PCGScheduler.PendingCount),
-            Step.Waiting => Fraction(_waits.FindAll(w => w.Task.IsCompleted).Count, _waits.FindAll(w => !w.Task.IsCompleted).Count),
+            Step.Waiting => Fraction(_waits.FindAll(w => w.Task.IsCompleted).Count + _workDone.Count,
+                                     _waits.FindAll(w => !w.Task.IsCompleted).Count + _work.Count),
             Step.Finishing => (float)_finishFrames / FinishFrames,
             _ => 1f,
         };
@@ -219,6 +222,20 @@ namespace Freefall.Base
         {
             if (task == null || IsDone) return;
             _waits.Add((task, what));
+        }
+
+        /// <summary>
+        /// Make the load do work on the main thread before it is ready: what game code would otherwise do in the world's
+        /// first frames (bring out the NPCs near the player), done while the world is still paused and hidden. Called in
+        /// the waiting step, once the background work (<see cref="WaitFor(Task, string)"/>) is done, with the slice's
+        /// deadline (a Stopwatch timestamp), slice after slice until it returns true. Components it wakes or PCG it
+        /// queues are seen to before it is called again. A throw goes to CallbackErrors and counts as done. The
+        /// delegate is let go of when the load ends, so a script's never pins its assembly.
+        /// </summary>
+        public void WaitFor(Func<long, bool> work, string what)
+        {
+            if (work == null || IsDone) return;
+            _work.Add((work, what));
         }
 
         /// <summary>
@@ -345,13 +362,36 @@ namespace Freefall.Base
                         if (task.IsFaulted)
                             Debug.LogWarning("SceneLoad", $"'{Name}': {what} failed: {task.Exception?.GetBaseException().Message}");
                     }
+
+                    // Then the main thread's work (in the order it was given), until the slice is over
+                    while (_work.Count > 0 && Stopwatch.GetTimestamp() < deadline)
+                    {
+                        var (work, what) = _work[0];
+                        Activity = what;
+                        LogOnce($"working on {what}");
+                        bool done;
+                        try { done = work(deadline); }
+                        catch (Exception ex)
+                        {
+                            CallbackErrors.Report(work.Target, what, ex);
+                            done = true;
+                        }
+                        if (done)
+                        {
+                            _work.RemoveAt(0);
+                            _workDone.Add(what);
+                        }
+                        // What it made wakes first
+                        if (!done || ScriptExecution.PendingWakeups() > 0 || PCGScheduler.PendingCount > 0) break;
+                    }
+
                     // Work that finished on the main thread may have added components or PCG requests
                     if (ScriptExecution.PendingWakeups() > 0 || PCGScheduler.PendingCount > 0)
                     {
                         Current = Step.Waking;
                         return false;
                     }
-                    return true;
+                    return _work.Count == 0;
                 }
 
                 case Step.Finishing:
@@ -401,7 +441,10 @@ namespace Freefall.Base
             for (int i = 0; i < _stepMs.Length; i++)
                 text.Append($" {(Step)i} {_stepMs[i]:F0}/{_stepEndS[i]:F1}");
             text.Append($"); {_slices} slices, longest {_longestSliceMs:F0} ms; PCG {_ranTotal} runs");
-            if (_waits.Count > 0) text.Append($"; waited for {string.Join(", ", _waits.ConvertAll(w => w.What))}");
+            _work.Clear();   // a script's work is not kept (the last load stays referenced: SceneManager.LastLoad)
+            var waited = _waits.ConvertAll(w => w.What);
+            waited.AddRange(_workDone);
+            if (waited.Count > 0) text.Append($"; waited for {string.Join(", ", waited)}");
             Report = _report.Finish(text.ToString());
             Debug.LogAlways(Report);
             if (Error == null && !Superseded)
