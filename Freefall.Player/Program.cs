@@ -188,6 +188,7 @@ namespace Freefall.Player
             };
 
             Engine.QuitRequested += () => form.Close();   // a menu's Quit
+            form.FormClosing += (s, e) => Engine.NotifyGameEnding();   // any close: game code saves while the world is there
             Application.AddMessageFilter(new InputFilter());
             keyboard.Attach(form);
             form.KeyDown += (s, e) =>

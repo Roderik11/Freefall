@@ -212,6 +212,9 @@ namespace Freefall.Editor
         {
             if (!IsPlaying) return;
 
+            // The game ends as a player's would, while its world is still there (game code saves)
+            Engine.NotifyGameEnding();
+
             // The game is torn down in play mode, then the editor is back (edit mode, its camera) before the scene is read.
             // What game code kept from scene to scene (DontDestroy: a loading screen) goes too.
             var load = SceneManager.LoadAsync(CurrentScene, _playSnapshot, clearPersistent: true);

@@ -100,6 +100,28 @@ namespace Freefall
         /// <summary>The host's answer to <see cref="RequestQuit"/>.</summary>
         public static event Action? QuitRequested;
 
+        /// <summary>
+        /// The game is about to end: the player's window is closing (a menu's Quit, the close box, Alt+F4) or the editor
+        /// stops play mode. The world is still there, so game code can keep what must outlast the game (the player's
+        /// save). The player's shutdown runs no component's Destroy: this is the last word game code gets.
+        /// </summary>
+        public static event Action? GameEnding;
+
+        /// <summary>
+        /// The host's, right before the game ends: raises <see cref="GameEnding"/>. What one handler throws is logged and
+        /// the others still run, so a broken script never keeps the window from closing.
+        /// </summary>
+        public static void NotifyGameEnding()
+        {
+            var handlers = GameEnding;
+            if (handlers == null) return;
+            foreach (Action handler in handlers.GetInvocationList())
+            {
+                try { handler(); }
+                catch (Exception e) { Debug.LogError("Engine", $"GameEnding: {handler.Method.DeclaringType?.Name}.{handler.Method.Name} threw: {e}"); }
+            }
+        }
+
         // Main-thread work queue for marshaling from background threads
         private sealed class WorkItem
         {
