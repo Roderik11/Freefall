@@ -244,6 +244,35 @@ namespace Freefall.Components
         [Browsable(false)]
         public IReadOnlyList<TerrainDecorator> DecoratorPalette => _decoratorPalette;
 
+        /// <summary>
+        /// The decorators' far colours (CS_DecoratorTints) as a bindless SRV: two float4 per palette slot, the colour
+        /// of its plants seen from afar with their strength, and its clumps. What the ground under a decorator takes,
+        /// and a field's far canopy (CropCanopy). 0 until the decorator buffers are built.
+        /// </summary>
+        [Browsable(false)]
+        public uint DecoratorTintSrv => _decoratorTintBuffer?.SrvIndex ?? 0u;
+
+        /// <summary>A decorator's slot in <see cref="DecoratorPalette"/> (its group of the tint buffer); -1 if it grows nowhere here.</summary>
+        public int DecoratorSlotOf(TerrainDecorator decorator) => _decoratorPalette.IndexOf(decorator);
+
+        /// <summary>
+        /// The colours the decorators' variants are drawn with (CS_BladeColors) as a bindless SRV: six float4 (rgb,
+        /// coverage) per variant slot, four height bands root → tip, the foliage and the bloom. Read in vertex, mesh and
+        /// compute stages only (it rests in NonPixelShaderResource). 0 until built.
+        /// </summary>
+        [Browsable(false)]
+        public uint BladeColorsSrv => _bladeColorBuffer?.SrvIndex ?? 0u;
+
+        /// <summary>A variant's slot in the decorator buffers (its colours in <see cref="BladeColorsSrv"/>); -1 if not drawn here.</summary>
+        public int VariantSlotOf(DecoratorVariant variant) => _variantSlots.TryGetValue(variant, out int slot) ? slot : -1;
+        private readonly Dictionary<DecoratorVariant, int> _variantSlots = new();
+
+        /// <summary>
+        /// After the decorator buffers were rebuilt: the palette, a decorator's variants or the terrain's decoration
+        /// settings changed, and the tint buffer may be a new one. What reads them (CropCanopy) takes them again.
+        /// </summary>
+        public static event Action<TerrainRenderer>? DecoratorsRebuilt;
+
         /// <summary>Problems found while resolving the palette (too many layers, stamps that cannot apply).</summary>
         [Browsable(false)]
         public IReadOnlyList<string> PaletteWarnings => _layerWarnings.Concat(_decoWarnings).ToList();
@@ -2114,6 +2143,7 @@ namespace Freefall.Components
             if (Terrain == null) return;
 
             // Flat list — all variants go into a single header.
+            _variantSlots.Clear();
             var headers = new List<ChannelHeader>();
             var slots = new List<DecoratorSlotGPU>();
             var groups = new List<DecoratorGroupGPU>();
@@ -2219,6 +2249,7 @@ namespace Freefall.Components
                     float cy = MathF.Cos(ry), sy = MathF.Sin(ry);
                     float cz = MathF.Cos(rz), sz = MathF.Sin(rz);
 
+                    _variantSlots[variant] = slots.Count;
                     slots.Add(new DecoratorSlotGPU
                     {
                         Density = variant.Density,
@@ -2318,6 +2349,7 @@ namespace Freefall.Components
                 _decoratorTintBuffer = GraphicsBuffer.CreateStructured(tintCount, 16, srv: true, uav: true);
             }
             _bladeColorsDirty = true;
+            DecoratorsRebuilt?.Invoke(this);
         }
 
         /// <summary>One procedural decorator pipeline over the procedural instance buffer (grass_procedural.hlsli).</summary>

@@ -85,7 +85,7 @@ namespace Freefall.Assets
 
         // ── GPU structs ──
 
-        /// <summary>GPU struct matching HLSL HeightStampDescriptor. 104 bytes (26 x uint/float).</summary>
+        /// <summary>GPU struct matching HLSL HeightStampDescriptor. 132 bytes (33 x uint/float).</summary>
         [StructLayout(LayoutKind.Sequential)]
         internal struct HeightStampDescriptorGPU
         {
@@ -110,6 +110,11 @@ namespace Freefall.Assets
             public uint MaskPointCount;      // 0 = no mask, else count | closed bit
             public Vector2 BoundsMin;        // terrain UV box outside which the stamp's weight is 0 (StampBounds)
             public Vector2 BoundsMax;
+            public Vector2 RidgeAcross;      // ridge and furrow (HeightStamp.RidgeSpacing): unit vector across the ridges
+            public float RidgeSpacing;       // UV between crests (0 = no ridges)
+            public float RidgeHeight;        // normalized furrow-to-crest height
+            public float RidgeBend;          // UV the ridges swing aside at the field's ends
+            public Vector2 RidgeAlong;       // the stamp's extent along the ridges: min, max of dot(uv, along)
         }
 
         /// <summary>GPU struct matching HLSL StampSplinePoint. 16 bytes.</summary>
@@ -541,6 +546,35 @@ namespace Freefall.Assets
             }
 
             StampBounds(ref desc, splinePoints, outside);
+
+            // Ridge and furrow: across the ridges, and how far the stamp reaches along them (for the bend at the ends)
+            if (stamp.RidgeSpacing > 0.5f && stamp.RidgeHeight > 0f)
+            {
+                var along = AlongLongestEdge(stamp, stamp.RidgeAngle);
+                desc.RidgeAcross = new Vector2(-along.Y, along.X);
+                desc.RidgeSpacing = stamp.RidgeSpacing * uvScale;
+                desc.RidgeHeight = stamp.RidgeHeight / maxHeight;
+                desc.RidgeBend = stamp.RidgeBend * uvScale;
+                float from = float.MaxValue, to = float.MinValue;
+                if (desc.SplinePointOffset != 0xFFFFFFFF)
+                {
+                    int start = (int)desc.SplinePointOffset;
+                    int end = start + (int)(desc.SplinePointCount & 0x7FFFFFFF);
+                    for (int i = start; i < end; i++)
+                    {
+                        float d = Vector2.Dot(splinePoints[i].UV, along);
+                        from = MathF.Min(from, d);
+                        to = MathF.Max(to, d);
+                    }
+                }
+                else
+                {
+                    float d = Vector2.Dot(desc.Center, along);
+                    from = d - desc.Radius - desc.Falloff;
+                    to = d + desc.Radius + desc.Falloff;
+                }
+                desc.RidgeAlong = new Vector2(from, to);
+            }
             return true;
         }
 
@@ -1344,7 +1378,17 @@ namespace Freefall.Assets
         /// Across a row stamp's rows in world XZ: the rows run along its spline's longest control edge (a field is
         /// ploughed and sown along its length), or along world +X without a spline, turned by RowAngle.
         /// </summary>
-        private static Vector2 RowNormal(DecoStamp stamp)
+        internal static Vector2 RowNormal(DecoStamp stamp)
+        {
+            var along = AlongLongestEdge(stamp, stamp.RowAngle);
+            return new Vector2(-along.Y, along.X);
+        }
+
+        /// <summary>
+        /// Along a stamp's spline's longest control edge in world XZ (a field is ploughed and sown along its length), or
+        /// world +X without a spline, turned by <paramref name="angleDegrees"/>: the direction of a field's rows and ridges.
+        /// </summary>
+        internal static Vector2 AlongLongestEdge(TerrainStamp stamp, float angleDegrees)
         {
             var along = Vector2.UnitX;
             var spline = stamp.IsSplineMode ? stamp.GetSpline() : null;
@@ -1362,10 +1406,9 @@ namespace Freefall.Assets
                     if (lengthSq > longest) { longest = lengthSq; along = edge / MathF.Sqrt(lengthSq); }
                 }
             }
-            float turn = stamp.RowAngle * MathF.PI / 180f;
+            float turn = angleDegrees * MathF.PI / 180f;
             float c = MathF.Cos(turn), s = MathF.Sin(turn);
-            along = new Vector2(along.X * c - along.Y * s, along.X * s + along.Y * c);
-            return new Vector2(-along.Y, along.X);
+            return new Vector2(along.X * c - along.Y * s, along.X * s + along.Y * c);
         }
 
         private static Dictionary<T, int> BuildIndex<T>(IReadOnlyList<T> items) where T : class

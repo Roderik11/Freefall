@@ -72,6 +72,34 @@ namespace Freefall.Components
         public float Strength = 50f;
 
         /// <summary>
+        /// Ridge and furrow, as a field ploughed the same way year after year: the ground rises in long ridges this far
+        /// apart (metres, crest to crest) with furrows between, faded out over Falloff towards the edge, the headland
+        /// the plough team turned on. They read from far off as stripes of light and shade. 0 = none. With BlendMode
+        /// Add and no HeightOffset the stamp only ploughs: the ridges' mean height is the ground's.
+        /// </summary>
+        [System.ComponentModel.Category("Ridges")]
+        [ValueRange(0f, 20f)]
+        public float RidgeSpacing = 0f;
+
+        /// <summary>Height from the bottom of a furrow to the crest of a ridge (m).</summary>
+        [ValueRange(0f, 2f)]
+        public float RidgeHeight = 0.4f;
+
+        /// <summary>
+        /// The ridges' direction in degrees, turned from the spline's longest control edge (0 = along the field's
+        /// length), or from world +X without a spline.
+        /// </summary>
+        [ValueRange(-180f, 180f)]
+        public float RidgeAngle = 0f;
+
+        /// <summary>
+        /// How far the ridges swing to the side towards the field's ends (m): the reverse S of a plough team that began
+        /// to turn before the headland. 0 = straight.
+        /// </summary>
+        [ValueRange(0f, 20f)]
+        public float RidgeBend = 2f;
+
+        /// <summary>
         /// The closed spline that confines this stamp: the parent entity's, when this is a round local stamp with no
         /// spline of its own. Null otherwise.
         /// </summary>

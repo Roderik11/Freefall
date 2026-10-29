@@ -525,7 +525,25 @@ struct HeightStampDescriptor
     uint   MaskPointCount;     // 0 = no mask
     float2 BoundsMin;          // terrain UV box outside which the weight is 0 (TerrainBaker.StampBounds)
     float2 BoundsMax;
+    float2 RidgeAcross;        // ridge and furrow (HeightStamp.RidgeSpacing): unit vector across the ridges
+    float  RidgeSpacing;       // UV between crests (0 = no ridges)
+    float  RidgeHeight;        // normalized furrow-to-crest height
+    float  RidgeBend;          // UV the ridges swing aside at the field's ends
+    float2 RidgeAlong;         // the stamp's extent along the ridges: min, max of dot(uv, along)
 };
+
+// Ridge and furrow at a terrain UV, around 0 (the ridges' mean is the ground's): broad crowns and narrower furrows
+// (sin^0.6, whose mean is 0.73), running along the field and swinging aside towards its ends in a reverse S as the
+// plough team began to turn before the headland
+float RidgeRelief(HeightStampDescriptor stamp, float2 uv)
+{
+    float2 along = float2(stamp.RidgeAcross.y, -stamp.RidgeAcross.x);
+    float s = saturate((dot(uv, along) - stamp.RidgeAlong.x) / max(stamp.RidgeAlong.y - stamp.RidgeAlong.x, 1e-7));
+    float bend = 2.0 * s - 1.0;
+    float across = dot(uv, stamp.RidgeAcross) + stamp.RidgeBend * bend * bend * bend;
+    float crown = pow(sin(3.14159265 * frac(across / stamp.RidgeSpacing)), 0.6);
+    return stamp.RidgeHeight * (crown - 0.73);
+}
 
 [numthreads(8, 8, 1)]
 void CS_InfluenceLayer(uint3 dtid : SV_DispatchThreadID)
@@ -594,6 +612,10 @@ void CS_InfluenceLayer(uint3 dtid : SV_DispatchThreadID)
             // InvertShape turns the relief upside down: the texture digs (lake depths, craters)
             targetH += (stamp.InvertShape & 1u) ? -relief : relief;
         }
+
+        // Ridge and furrow (HeightStamp.RidgeSpacing), faded towards the edge with the rest of the stamp
+        if (stamp.RidgeSpacing > 0)
+            targetH += RidgeRelief(stamp, uv);
 
         // Combine with the height built so far, then fade by the stamp weight
         float blended = targetH;                                             // Set
