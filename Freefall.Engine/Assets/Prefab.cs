@@ -36,6 +36,9 @@ namespace Freefall.Assets
         private static readonly ProfilerMarker _instantiateMarker = ProfilerMarker.Get("Prefab.Instantiate");
         private static readonly ProfilerMarker _applyMarker = ProfilerMarker.Get("Prefab.ApplyTo");
 
+        // The prefabs ApplyTo is inside of, outermost first: a prefab that holds itself, at any depth, stops there
+        [ThreadStatic] private static List<string>? _applying;
+
         // What parsing SourceYaml does, recorded at the first instance and replayed for the next ones (PCG and kits
         // instantiate the same prefab thousands of times). Tied to the YAML array it was recorded from: a new
         // SourceYaml (reimport, prefab update) records again, and so does a script reload (Recording.IsCurrent).
@@ -125,6 +128,29 @@ namespace Freefall.Assets
             var prefabEntities = LoadEntities(skipPrefabHydration: true);
 
             if (prefabEntities.Count == 0) return;
+
+            // The prefab's children that are prefab instances themselves (a building made of its model's own prefabs)
+            // are saved as references only, so they need their prefab's components too. Read without hydration, a
+            // scene load brought them back as bare Transforms: Eldermoor's bank lost its plinth and safe at the first
+            // reload (2026-10-29). Instantiate() hydrated them, so it showed only after a load.
+            _applying ??= new List<string>();
+            _applying.Add(Guid);
+            try
+            {
+                for (int i = 1; i < prefabEntities.Count; i++)
+                {
+                    var child = prefabEntities[i];
+                    var guid = child.Prefab?.Guid;
+                    if (string.IsNullOrEmpty(guid) || _applying.Contains(guid)) continue;
+                    if (Engine.Assets?.LoadByGuid(guid, typeof(Prefab)) is not Prefab nested) continue;
+                    child.Prefab = nested;
+                    nested.ApplyTo(child);
+                }
+            }
+            finally
+            {
+                _applying.RemoveAt(_applying.Count - 1);
+            }
 
             // Copy non-Transform components from the prefab's root entity to the target
             // Detach first: the deserializer registered them in ComponentCache under the temporary root, and a
