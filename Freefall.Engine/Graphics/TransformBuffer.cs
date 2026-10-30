@@ -27,6 +27,7 @@ namespace Freefall.Graphics
 
         // Slot allocation. Slots are allocated lazily on first Transform.TransformSlot access, which
         // happens inside the parallel draw loop (ComponentCache.Draw) — the allocator must be thread-safe.
+        private const int MaxPickableSlots = 1 << 22;   // EntityId: part in bits 0..7, slot in 8..29, the decals' class in 30..31
         private readonly object _slotLock = new();
         private readonly Stack<int> _freeSlots = new();
         private int _nextSlot = 0;
@@ -91,6 +92,8 @@ namespace Freefall.Graphics
                 else
                 {
                     slot = _nextSlot++;
+                    if (slot == MaxPickableSlots)
+                        Debug.LogWarning("TransformBuffer", $"{slot:N0} slots: the G-buffer's EntityId holds 22 bits of slot, so from here on picking (the game's crosshair, the editor's clicks) and the decals' receivers read the wrong entity");
                     _transforms.EnsureCapacity(_nextSlot);
                     _materials.EnsureCapacity(_nextSlot);
                 }

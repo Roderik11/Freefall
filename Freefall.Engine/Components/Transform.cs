@@ -165,7 +165,9 @@ namespace Freefall.Components
             {
                 // First access usually happens in the parallel draw loop, possibly from two components
                 // of the same entity at once: double-checked so exactly one slot gets allocated.
-                if (_transformSlot < 0 && TransformBuffer.Instance != null)
+                // Never for a destroyed one: Entity.Destroy clears the parent after the slot is released, SetDirty
+                // reads this, and a slot taken then is never given back (a whole scene's slots at every load).
+                if (_transformSlot < 0 && !IsDestroyed && TransformBuffer.Instance != null)
                 {
                     lock (_slotInitLock)
                     {
