@@ -506,6 +506,27 @@ namespace Freefall.Components
                 CollectParts(child);
         }
 
+        /// <summary>
+        /// Renderers were added under this character just now (it changed clothes): they draw with the last
+        /// pose from this frame on. Left alone they would show their bind pose until the next pose, because
+        /// the poses come before the scripts. Main thread, outside the AnimatorSystem's update.
+        /// </summary>
+        public void ShowLastPose()
+        {
+            // Not through FindParts: the AnimatorSystem still has to see the change and measure them
+            _parts.Clear();
+            if (Entity != null) CollectParts(Entity.Transform);
+            if (PosedFrame < 0) return;
+
+            for (int i = 0; i < _parts.Count; i++)
+            {
+                var smr = _parts[i];
+                var skeleton = smr.Mesh?.Skeleton;
+                if (skeleton != null && !smr.IsDestroyed)
+                    smr.BoneBufferIdx = EnsureBoneBuffer(skeleton).Buffer.WrittenSrvIndex;
+            }
+        }
+
         // --- Looking at one clip ---
 
         private AnimationClip _previewClip;
