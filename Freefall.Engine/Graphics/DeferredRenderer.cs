@@ -1345,6 +1345,14 @@ namespace Freefall.Graphics
             _finalizeCS.SetPushConstant(_kFinalize, "BloomSpreads", bloomActive && Engine.Settings.BloomSpreadsLight ? 1u : 0u);
             _finalizeCS.SetPushConstant(_kFinalize, "BloomCapBits", BitConverter.SingleToUInt32Bits(MathF.Max(Engine.Settings.BloomMaxBrightness, 0f)));
 
+            _finalizeCS.SetPushConstant(_kFinalize, "GradeExposureBits", BitConverter.SingleToUInt32Bits(ScreenGrade.Exposure));
+            _finalizeCS.SetPushConstant(_kFinalize, "GradeTint", ScreenGrade.Pack(ScreenGrade.Tint, ScreenGrade.TintAmount));
+            _finalizeCS.SetPushConstant(_kFinalize, "GradeVignette", ScreenGrade.Pack(ScreenGrade.VignetteColor, ScreenGrade.Vignette));
+            _finalizeCS.SetPushConstant(_kFinalize, "GradeDesaturateBits", BitConverter.SingleToUInt32Bits(ScreenGrade.Desaturate));
+            _finalizeCS.SetPushConstant(_kFinalize, "GradeBlurBits", BitConverter.SingleToUInt32Bits(ScreenGrade.Blur));
+            _finalizeCS.SetPushConstant(_kFinalize, "GradeOverlay", ScreenGrade.Overlay?.BindlessIndex ?? 0u);
+            _finalizeCS.SetPushConstant(_kFinalize, "GradeOverlayAmountBits", BitConverter.SingleToUInt32Bits(ScreenGrade.OverlayAmount));
+
             uint groupsX = ((uint)desc.Width + 7) / 8;
             uint groupsY = ((uint)desc.Height + 7) / 8;
             _finalizeCS.Dispatch(_kFinalize, list, groupsX, groupsY);

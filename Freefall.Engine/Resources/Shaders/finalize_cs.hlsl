@@ -22,9 +22,36 @@ cbuffer PushConstants : register(b3)
     uint BloomMipCount;     // mips the upsample chain added into mip 0
     uint BloomSpreads;      // 1 = the bloom spreads a share of each pixel's light, 0 = it adds on top
     uint BloomCapBits;      // BloomMaxBrightness: the light a pixel can give the bloom (bloom.hlsli BloomSource; 0 = no cap)
+    // ScreenGrade: what happens to whoever is looking
+    uint GradeExposureBits;
+    uint GradeTint;         // rgb + amount, 8 bits each
+    uint GradeVignette;     // rgb + how far the sight has closed
+    uint GradeDesaturateBits;
+    uint GradeBlurBits;     // radius as a share of the screen's height
+    uint GradeOverlayIdx;   // 0 = none
+    uint GradeOverlayAmountBits;
 };
 
 SamplerState LinearClampSampler : register(s2);
+
+float4 UnpackGrade(uint packed)
+{
+    return float4(packed & 255u, (packed >> 8) & 255u, (packed >> 16) & 255u, packed >> 24) / 255.0;
+}
+
+// The picture smeared over a ring of samples turned by a noise of the pixel: a daze, no real blur, at about no cost
+float3 SmearedInput(Texture2D<float4> input, uint2 px, float radius, float noise)
+{
+    float3 sum = 0;
+    for (int i = 0; i < 12; i++)
+    {
+        float a = (i + noise) * 0.5235988;   // a twelfth of a turn
+        float r = radius * (0.35 + 0.65 * frac(i * 0.618 + noise));
+        float2 uv = (float2(px) + 0.5 + float2(cos(a), sin(a)) * r) / float2(ScreenWidth, ScreenHeight);
+        sum += min(max(input.SampleLevel(LinearClampSampler, uv, 0).rgb, 0), 65504.0);
+    }
+    return sum / 12.0;
+}
 
 [numthreads(8, 8, 1)]
 void CSFinalize(uint3 dispatchThreadId : SV_DispatchThreadID)
@@ -41,7 +68,11 @@ void CSFinalize(uint3 dispatchThreadId : SV_DispatchThreadID)
     // Sanitize NaN/Inf from HDR input (e.g. point light specular overflow)
     finalColor = max(finalColor, 0);
     finalColor = min(finalColor, 65504.0);
-    
+
+    float gradeBlur = asfloat(GradeBlurBits);
+    if (gradeBlur > 0.0)
+        finalColor = SmearedInput(Input, px, gradeBlur * ScreenHeight, frac(sin(dot(float2(px), float2(12.9898, 78.233))) * 43758.5453));
+
     // Add bloom (HDR, before tonemapping)
     if (BloomTexIdx != 0)
     {
@@ -66,6 +97,9 @@ void CSFinalize(uint3 dispatchThreadId : SV_DispatchThreadID)
             finalColor += bloom * bloomIntensity;
     }
     
+    // A dazzled or darkened eye: before the tone curve, so a flash burns the picture out rather than painting over it
+    finalColor *= asfloat(GradeExposureBits);
+
     // ACES Filmic Tone Mapping (Narkowicz 2015 approximation)
     float3 x = finalColor;
     finalColor = (x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14);
@@ -80,7 +114,33 @@ void CSFinalize(uint3 dispatchThreadId : SV_DispatchThreadID)
     
     // Final Gamma Correction (Linear → sRGB)
     finalColor = pow(abs(finalColor), 1.0f / 2.2f);
-    
+
+    // ScreenGrade, on the picture as it shows
+    float desaturate = asfloat(GradeDesaturateBits);
+    if (desaturate > 0.0)
+        finalColor = lerp(finalColor, dot(finalColor, float3(0.2126, 0.7152, 0.0722)).xxx, saturate(desaturate));
+
+    float4 vignette = UnpackGrade(GradeVignette);
+    if (vignette.a > 0.0)
+    {
+        float2 centred = (float2(px) + 0.5 - 0.5 * float2(ScreenWidth, ScreenHeight)) / float(ScreenHeight);
+        float away = length(centred);
+        float clear = lerp(1.05, -0.3, vignette.a);   // how far out the sight is still clear
+        finalColor = lerp(finalColor, vignette.rgb, smoothstep(clear, clear + 0.3, away));
+    }
+
+    float overlayAmount = asfloat(GradeOverlayAmountBits);
+    if (GradeOverlayIdx != 0 && overlayAmount > 0.0)
+    {
+        Texture2D<float4> overlay = ResourceDescriptorHeap[GradeOverlayIdx];
+        float4 painted = overlay.SampleLevel(LinearClampSampler, (float2(px) + 0.5) / float2(ScreenWidth, ScreenHeight), 0);
+        finalColor = lerp(finalColor, painted.rgb, saturate((painted.a - 1.0 + overlayAmount) / 0.12));
+    }
+
+    float4 tint = UnpackGrade(GradeTint);
+    if (tint.a > 0.0)
+        finalColor = lerp(finalColor, tint.rgb, tint.a);
+
     // Dithering — break up color banding in smooth gradients (sky)
     float Time = asfloat(TimeBits);
     float2 seed = float2(px) + float2(frac(Time * 0.1), frac(Time * 0.31));
