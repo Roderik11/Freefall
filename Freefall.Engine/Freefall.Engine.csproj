@@ -34,7 +34,7 @@
     <PackageReference Include="NVorbis" Version="0.10.5" />
     <PackageReference Include="LiteYaml" Version="0.1.1" />
     <!-- Built here in Release (ThirdParty/nuget, nuget.config): nuget.org's 5.0.1-alpha1 is a debug build -->
-    <PackageReference Include="PhysX.Net" Version="5.0.1-release1" GeneratePathProperty="true" />
+    <PackageReference Include="PhysX.Net" Version="5.0.1-release2" GeneratePathProperty="true" />
   </ItemGroup>
 
   <ItemGroup>

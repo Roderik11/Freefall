@@ -67,5 +67,11 @@ namespace Freefall.Base
 
         /// <summary>PxHeightFieldMaterial::eHOLE: a height-field triangle with this material does not collide.</summary>
         public const byte HoleMaterial = 127;
+
+        /// <summary>
+        /// A sample as HeightField.ModifySamples takes it, one int the way PxHeightFieldSample lies in memory: the height,
+        /// then the material of each of the cell's two triangles, the first with the tessellation flag as in ToSamples.
+        /// </summary>
+        public static int PackedSample(short height, byte material) => (ushort)height | (material | 0x80) << 16 | material << 24;
     }
 }
