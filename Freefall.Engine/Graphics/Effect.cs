@@ -216,6 +216,7 @@ namespace Freefall.Graphics
             Dependencies = ShaderHotReload.CollectDependencies(_sourcePath);
 
             // Register in MasterEffects (Apex pattern)
+            TakeFrameParameters();
             MasterEffects[hash] = this;
             lock (_instances) _instances.Add(new WeakReference<Effect>(this));
             ShaderHotReload.EnsureWatching();
@@ -283,9 +284,22 @@ namespace Freefall.Graphics
             if (_sourcePath != null)
                 Dependencies = ShaderHotReload.CollectDependencies(_sourcePath);
 
+            TakeFrameParameters();
             MasterEffects[key.GetHashCode()] = this;
             lock (_instances) _instances.Add(new WeakReference<Effect>(this));
             ShaderHotReload.EnsureWatching();
+        }
+
+        // What every effect is handed once a frame (Camera.SetShaderParams, the renderer, the light). An effect made later
+        // in that frame (CropCanopy's, in its first AddDraws) missed it and would draw the frame with InstanceDataIdx,
+        // AtmosphereIdx and the rest at 0, reading descriptor 0. So it starts from another effect's values.
+        private void TakeFrameParameters()
+        {
+            foreach (var other in MasterEffects.Values)
+            {
+                _materialBlock.CopyFrom(other._materialBlock);
+                return;
+            }
         }
 
         // ── Hot reload ──

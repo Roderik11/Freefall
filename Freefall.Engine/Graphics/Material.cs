@@ -1545,7 +1545,8 @@ namespace Freefall.Graphics
         public int PushConstantSlot = -1;
         public abstract void SetToTarget(Material target);
         public abstract void SetToTarget(ConstantBuffer cb);
-        
+        public ParameterValue Copy() => (ParameterValue)MemberwiseClone();
+
         /// <summary>Copy raw bytes of the value into dest at the given offset. Returns bytes written.</summary>
         public virtual int CopyToStaging(byte[] dest, int offset) => 0;
         /// <summary>Number of array elements (for ArrayParameterValue). 0 for scalars/textures.</summary>
@@ -1619,6 +1620,13 @@ namespace Freefall.Graphics
         {
             _parameters.Clear();
             Changed?.Invoke();
+        }
+
+        /// <summary>Takes a copy of every value of <paramref name="other"/> (arrays stay shared, as SetParameterArray keeps them).</summary>
+        public void CopyFrom(MaterialBlock other)
+        {
+            foreach (var (hash, param) in other._parameters)
+                _parameters[hash] = param.Copy();
         }
 
         public void SetParameter<T>(string name, T value) where T : unmanaged
