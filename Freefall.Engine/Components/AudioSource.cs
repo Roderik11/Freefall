@@ -80,6 +80,12 @@ namespace Freefall.Components
         /// </summary>
         public bool Outdoors;
 
+        /// <summary>
+        /// A sound of the air inside an <see cref="AudioVolume"/> (a draught, a hum under the hill): heard only there, coming
+        /// up as the <see cref="Outdoors"/> go down.
+        /// </summary>
+        public bool Indoors;
+
         /// <summary>Plays (or plays on without a voice, out of hearing).</summary>
         [Freefall.Reflection.DontSerialize]
         public bool IsPlaying => Entry?.PlayingIndex >= 0;

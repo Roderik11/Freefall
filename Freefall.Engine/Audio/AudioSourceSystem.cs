@@ -451,9 +451,12 @@ namespace Freefall.Audio
 
             float full = MathF.Max(source.FalloffStart, 0.01f);
             float curve = away > full * full ? full * full / away : 1f;
-            float volume = source.Volume * (source.Outdoors ? _outside : 1f);
+            float volume = source.Volume * Share(source);
             return volume * volume * curve * edge * edge;
         }
+
+        // What the AudioVolumes round the listener leave of a source
+        private static float Share(AudioSource source) => source.Outdoors ? _outside : source.Indoors ? 1f - _outside : 1f;
 
         // 1 well within hearing, falling to 0 over the last fifth of HeardWithin (0 = no limit)
         private static float Edge(float heardWithin, float away)
@@ -703,7 +706,7 @@ namespace Freefall.Audio
 
             float edge = Edge(source.HeardWithin, away);
             voice.Native.SetFrequencyRatio(pitch, 0);
-            voice.Native.SetVolume(source.Volume * (source.Outdoors ? _outside : 1f) * voice.Fade * edge);
+            voice.Native.SetVolume(source.Volume * Share(source) * voice.Fade * edge);
         }
 
         private static bool SameFormat(WaveFormat a, WaveFormat b)

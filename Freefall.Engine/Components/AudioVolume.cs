@@ -46,8 +46,9 @@ namespace Freefall.Components
 
         public void DrawGizmos(GizmoContext ctx)
         {
+            // The gizmo matrix has no scale in it
             ctx.Color = new Color4(0.5f, 1f, 0.6f, 1f);
-            ctx.DrawWireBox(Vector3.Zero, Vector3.One);
+            ctx.DrawWireBox(Vector3.Zero, Transform.WorldScale);
         }
     }
 }
