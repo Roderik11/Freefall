@@ -67,6 +67,7 @@ namespace Freefall.Editor.Tools
 
         // Unity material name → Freefall GUID mapping (populated during import)
         private static Dictionary<string, string> _materialNameToGuid = new(StringComparer.OrdinalIgnoreCase);
+        private static Dictionary<string, string> _meshInModel = new(StringComparer.OrdinalIgnoreCase);
 
 
         // Texture slot priority (first match wins for each Freefall slot)
@@ -865,6 +866,7 @@ namespace Freefall.Editor.Tools
             }
 
             int created = 0, skipped = 0;
+            _meshInModel = BuildMeshInModelMap();
 
             foreach (var exportPrefab in data.Prefabs)
             {
@@ -941,6 +943,25 @@ namespace Freefall.Editor.Tools
             }
         }
 
+        private static string MeshInModelKey(string model, string mesh) => model + "\0" + mesh;
+
+        /// <summary>
+        /// Every model's meshes by (model file name, mesh name), for a lookup that a mesh of the same name in
+        /// another model cannot answer.
+        /// </summary>
+        private static Dictionary<string, string> BuildMeshInModelMap()
+        {
+            var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var meta in AssetDatabase.GetAllMeta())
+            {
+                var model = Path.GetFileNameWithoutExtension(meta.SourcePath);
+                foreach (var sub in meta.SubAssets)
+                    if (sub.Type == nameof(MeshData))
+                        map.TryAdd(MeshInModelKey(model, sub.Name), sub.Guid);
+            }
+            return map;
+        }
+
         /// <summary>
         /// Resolve a mesh name to its MeshData sub-asset GUID and attach a MeshRenderer.
         /// Loads the companion PrefabData sub-asset (built by ModelImporter.PostImport)
@@ -948,9 +969,14 @@ namespace Freefall.Editor.Tools
         /// </summary>
         private static void AttachMeshRenderer(Entity entity, string meshName, List<string> materialNames = null, string meshAlt = null)
         {
-            // Try alt name first (internal mesh node name — more specific for multi-mesh FBX files)
+            // The export names the model file and the mesh in it, in either order: its branch for a LODGroup
+            // with several renderers writes the mesh first. Only the pair says which mesh it is. A name alone can
+            // be a mesh called like its file (Cooking Stand 1.fbx) or another model's mesh of that name.
             string meshGuid = null;
-            if (!string.IsNullOrEmpty(meshAlt))
+            if (!string.IsNullOrEmpty(meshAlt)
+                && !_meshInModel.TryGetValue(MeshInModelKey(meshName, meshAlt), out meshGuid))
+                _meshInModel.TryGetValue(MeshInModelKey(meshAlt, meshName), out meshGuid);
+            if (meshGuid == null && !string.IsNullOrEmpty(meshAlt))
                 meshGuid = AssetDatabase.ResolveGuidByName(meshAlt, nameof(MeshData));
             if (meshGuid == null)
                 meshGuid = AssetDatabase.ResolveGuidByName(meshName, nameof(MeshData));
