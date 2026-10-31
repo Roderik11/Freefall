@@ -126,6 +126,98 @@ float IceCrack(float edge, float width, float cell)
     return (1.0 - smoothstep(0.0, max(w, pixel), edge)) * saturate(w / pixel);
 }
 
+// Water the sky does not reach (a flooded hall, a sea cave) has no sky to mirror, and it was a flat black sheet nobody could
+// see (user, 2026-10-31). What stands round it is mirrored instead: one ray over the screen from the surface, walked as
+// ssr_cs.hlsl walks them, steps growing with the distance, each compared with the linear depth there, a hit refined by
+// halving; the scene's own picture at the hit is what the water shows. A ray that leaves the screen or meets nothing stays dark.
+#define WATER_RAY_STEPS 36
+#define WATER_RAY_FIRST 0.12    // m, growing by WATER_RAY_GROWTH a step (36 steps reach ~60 m)
+#define WATER_RAY_GROWTH 1.12
+#define WATER_RAY_REFINE 4
+
+// The screen place (0..1) and view depth of a camera-relative place; false behind the camera
+bool WaterRayProject(float3 rel, out float2 uv, out float viewZ)
+{
+    float4 clip = mul(float4(rel, 1.0), CameraRelativeVP);
+    viewZ = clip.w;
+    uv = 0;
+    if (clip.w <= 0.05)
+        return false;
+    uv = clip.xy / clip.w * float2(0.5, -0.5) + 0.5;
+    return true;
+}
+
+float3 WaterSceneReflection(WaterData water, float3 rel, float3 V, float3 N, float2 pixel)
+{
+    float3 r = reflect(-V, N);
+    if (water.DepthGBufferSRV == 0 || water.CompositeSRV == 0 || r.y <= 0.0)
+        return 0;
+    Texture2D<float> depth = ResourceDescriptorHeap[water.DepthGBufferSRV];
+    float2 size = 1.0 / water.InvViewportSize;
+
+    // The steps' start dithered per pixel, so their bands do not line up
+    float dither = frac(52.9829189 * frac(dot(pixel, float2(0.06711056, 0.00583715))));
+    float stepLen = WATER_RAY_FIRST * (0.5 + dither);
+    float t = stepLen, lastT = 0.0;
+    [loop]
+    for (uint i = 0; i < WATER_RAY_STEPS; i++)
+    {
+        float2 uv;
+        float rayZ;
+        if (!WaterRayProject(rel + r * t, uv, rayZ) || any(uv < 0.0) || any(uv >= 1.0))
+            return 0;
+        float sceneZ = depth.Load(int3(int2(uv * size), 0));
+        // In front of the surface by less than a step's thickness: a hit (else the ray passed behind something)
+        if (sceneZ > 0.0 && rayZ > sceneZ && rayZ - sceneZ < max(0.2, stepLen * 2.0))
+        {
+            float lo = lastT, hi = t;
+            [unroll]
+            for (uint k = 0; k < WATER_RAY_REFINE; k++)
+            {
+                float mid = 0.5 * (lo + hi);
+                float2 mp;
+                float midZ;
+                WaterRayProject(rel + r * mid, mp, midZ);
+                float midScene = depth.Load(int3(clamp(int2(mp * size), 0, int2(size) - 1), 0));
+                if (midScene > 0.0 && midZ > midScene) hi = mid; else lo = mid;
+            }
+            float hz;
+            WaterRayProject(rel + r * hi, uv, hz);
+            Texture2D<float4> composite = ResourceDescriptorHeap[water.CompositeSRV];
+            float edge = saturate(min(min(uv.x, 1.0 - uv.x), min(uv.y, 1.0 - uv.y)) / 0.08);
+            return composite.SampleLevel(AtmosphereLinearClamp, uv, 0).rgb * edge;
+        }
+        lastT = t;
+        stepLen *= WATER_RAY_GROWTH;
+        t += stepLen;
+    }
+    return 0;
+}
+
+// The point lights' glints, as the sun's on open water: the lights that reach the place (light_clusters.hlsli). No shadows:
+// a glint a pillar should hide costs nothing, a lookup per light per pixel of water would. rel: camera-relative.
+float3 WaterPointSpecular(float3 rel, float3 N, float3 V, float alpha, float2 uv, float viewDepth)
+{
+    if (LightClustersIdx == 0 || ClusterLightsIdx == 0)
+        return 0;
+    ByteAddressBuffer clusters = ResourceDescriptorHeap[LightClustersIdx];
+    StructuredBuffer<PointLightData> lights = ResourceDescriptorHeap[ClusterLightsIdx];
+    LightClusterWalk walk;
+    if (!LightClusterBegin(clusters, uv, viewDepth, walk))
+        return 0;
+    float3 sum = 0;
+    uint s;
+    [loop] while (LightClusterNext(clusters, walk, s))
+    {
+        PointLightData light = lights[s];
+        float3 toLight = light.Position - rel;
+        float3 E = PointLightIlluminance(light, toLight, 0.25);
+        if (any(E > 0.0))
+            sum += WaterSunSpecular(N, V, normalize(toLight), E, alpha);
+    }
+    return sum * Exposure;
+}
+
 struct VSOutput
 {
     float4 Position : SV_POSITION;
@@ -263,6 +355,16 @@ PSOutput PS(VSOutput input)
     float F = WaterSpecularReflectance(NdotV, alpha);
     float3 reflectColor = WaterSkyReflection(V, N, alpha) * skyVisible;   // no sky to mirror under a hill
     float3 specular = WaterSunSpecular(N, V, L, sunRadiance * 3.14159, alpha);
+
+    // Where the sky is mostly hidden, what stands round the water takes its place. Nothing from half the sky on: open
+    // lakes keep their sky alone and pay for no ray
+    float covered = saturate(1.0 - skyVisible * 2.0);
+    if (covered > 0.0)
+    {
+        float3 rel = worldPos - camPos;
+        reflectColor += WaterSceneReflection(water, rel, V, N, input.Position.xy) * covered;
+        specular += WaterPointSpecular(rel, N, V, alpha, input.Position.xy * water.InvViewportSize, input.Depth) * covered;
+    }
 
     WaterColumn column = GetWaterColumn(WaterSampler, water.DepthGBufferSRV, water.CompositeSRV,
         input.Position.xy * water.InvViewportSize, input.Depth, dist, abs(camPos.y - worldPos.y), N,
