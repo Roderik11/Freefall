@@ -317,6 +317,7 @@ namespace Freefall.Editor.Commands
     /// Aligns an entity to the terrain surface using its mesh bounds.
     /// Samples terrain under the entity's footprint, computes best-fit plane,
     /// and adjusts Y position + rotation to match slope.
+    /// Works in world space, so a child of a moved or turned group lands under where it stands.
     /// POST /api/entity/{id}/alignToTerrain
     /// </summary>
     [CommandRoute("POST", "/api/entity/{id}/alignToTerrain")]
@@ -340,9 +341,10 @@ namespace Freefall.Editor.Commands
             if (meshRenderer?.Mesh != null)
                 localBounds = meshRenderer.Mesh.BoundingBox;
 
-            var pos = entity.Transform.Position;
-            var scale = entity.Transform.Scale;
-            var rot = entity.Transform.Rotation;
+            var transform = entity.Transform;
+            var pos = transform.WorldPosition;
+            var scale = transform.WorldScale;
+            var rot = WorldRotation(transform);
 
             float halfX, halfZ;
             if (localBounds.HasValue)
@@ -429,10 +431,21 @@ namespace Freefall.Editor.Commands
             // Compute rotation from slope normal
             var terrainNormal = Vector3.Normalize(new Vector3(-slopeX, 1, -slopeZ));
             var slopeRotation = RotationFromNormal(terrainNormal, yaw);
+            var groundPosition = new Vector3(pos.X, avgH, pos.Z);
+
+            // Everything above is in world space; a child's transform is relative to its parent
+            if (transform.Parent is { } parent)
+            {
+                if (!Matrix4x4.Invert(parent.Matrix, out var toParent))
+                    return CommandResult.BadRequest($"Parent of entity {entityId} has a zero scale");
+
+                groundPosition = Vector3.Transform(groundPosition, toParent);
+                slopeRotation = Quaternion.Normalize(Quaternion.Inverse(WorldRotation(parent)) * slopeRotation);
+            }
 
             // Set the entity's position (center height) and rotation
-            entity.Transform.Position = new Vector3(pos.X, avgH, pos.Z);
-            entity.Transform.Rotation = slopeRotation;
+            transform.Position = groundPosition;
+            transform.Rotation = slopeRotation;
 
             float slopeAngle = MathF.Atan(MathF.Sqrt(slopeX * slopeX + slopeZ * slopeZ)) * (180f / MathF.PI);
 
@@ -441,8 +454,8 @@ namespace Freefall.Editor.Commands
                 status = "aligned",
                 id = entity.Id, uid = entity.UID.ToString(),
                 name = entity.Name,
-                position = CommandHelpers.Vec3(entity.Transform.Position),
-                rotation = CommandHelpers.Quat(entity.Transform.Rotation),
+                position = CommandHelpers.Vec3(transform.Position),
+                rotation = CommandHelpers.Quat(transform.Rotation),
                 slope = new
                 {
                     angle = slopeAngle,
@@ -451,6 +464,17 @@ namespace Freefall.Editor.Commands
                 footprint = new { halfX, halfZ },
                 sampledHeights = new { min = heights.Min(), max = heights.Max(), average = avgH }
             });
+        }
+
+        /// <summary>
+        /// The rotation of a transform in the world: its own, then each parent's.
+        /// </summary>
+        private static Quaternion WorldRotation(Transform transform)
+        {
+            var rotation = transform.Rotation;
+            for (var parent = transform.Parent; parent != null; parent = parent.Parent)
+                rotation = parent.Rotation * rotation;
+            return rotation;
         }
 
         /// <summary>
