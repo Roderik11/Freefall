@@ -51,6 +51,18 @@ float TerrainOpenAt(TerrainCover t, SamplerState linearClamp, float3 worldPos, f
     return 1.0 - smoothstep(tolerance, tolerance + 4.0, under);
 }
 
+// The open factor past the meshes' share of the sky: below the terrain's surface, where the meshes leave no sky, a place
+// is underground however near the surface it lies. The open factor's tolerance is for the terrain's own surface and what
+// stands on it, SkyCaptureBounce for rooms above ground: in a sealed hall roofed a metre under the ground that 4 % of the
+// sky turned the top six metres white at an underground exposure (the Undercourt, 2026-10-31).
+float RoofedOpen(TerrainCover t, SamplerState linearClamp, float3 worldPos, float open, float meshes)
+{
+    if (t.Heightmap == 0 || open <= 0.0)
+        return open;
+    float under = saturate(TerrainHeightAt(t, linearClamp, worldPos.xz) - worldPos.y - 0.5);
+    return open * lerp(1.0, smoothstep(0.0, 0.05, meshes), under);
+}
+
 // How much of the sky's light reaches a surface past the terrain, 0..1: from the look point the highest terrain horizon
 // in 8 directions, sampled 2, 6, 18 and 54 m out. The cosine-weighted sky above a horizon at angle h is
 // cos²h = 1 / (1 + tan²h). A cave under a hill sees none of it (the heightmap keeps the hill's surface over a terrain

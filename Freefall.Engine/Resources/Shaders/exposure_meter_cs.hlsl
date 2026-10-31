@@ -154,6 +154,7 @@ void CSMeter(uint gi : SV_GroupIndex)
         float terrainOpen, portal;
         float terrainSky = SkyVisibilityParts(LoadTerrainCover(), AtmosphereLinearClamp, tap, up,
             TerrainTolerance(distance(tap, CamPos)), terrainOpen, portal);
+        terrainOpen = RoofedOpen(LoadTerrainCover(), AtmosphereLinearClamp, tap, terrainOpen, meshSky);
         float caveSky = min(portal, CaveMeshShare(meshSky, portal));
         float skyVis = lerp(caveSky, terrainSky * max(meshSky, A.SkyCaptureBounce), terrainOpen);
         float skySeen = lerp(caveSky, terrainSky * meshSky, terrainOpen);

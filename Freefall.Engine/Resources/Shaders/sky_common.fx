@@ -206,6 +206,7 @@ float SkyVisibilityWith(float3 worldPos, float3 N, float meshes)
     float open, portal;
     float sky = SkyVisibilityParts(LoadTerrainCover(), AtmosphereLinearClamp, worldPos, N,
         TerrainTolerance(distance(worldPos, CamPos)), open, portal);
+    open = RoofedOpen(LoadTerrainCover(), AtmosphereLinearClamp, worldPos, open, meshes);
     float bounce = AtmosphereIdx != 0 ? LoadAtmosphere().SkyCaptureBounce : 0.0;
     return lerp(min(portal, CaveMeshShare(meshes, portal)), sky * max(meshes, bounce), open);
 }

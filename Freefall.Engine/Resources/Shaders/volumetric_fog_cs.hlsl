@@ -440,7 +440,9 @@ void CSFogScatter(uint3 id : SV_DispatchThreadID)
     // only the share of the sky that they leave, never less than the light bouncing in (SkyCaptureBounce)
     TerrainCover terrain = LoadTerrainCover();
     float open = TerrainOpenAt(terrain, AtmosphereLinearClamp, worldPos, float3(0, 1, 0), TerrainTolerance(length(relPos)));
-    float sky = open > 0.0 ? open * max(FogMeshSkyVisibility(A, worldPos), A.SkyCaptureBounce) : 0.0;
+    float fogMeshes = open > 0.0 ? FogMeshSkyVisibility(A, worldPos) : 0.0;
+    open = RoofedOpen(terrain, AtmosphereLinearClamp, worldPos, open, fogMeshes);
+    float sky = open > 0.0 ? open * max(fogMeshes, A.SkyCaptureBounce) : 0.0;
 
     float skyDimming = CloudSkyDimming(CloudDeck());      // Ψ_ms under the clouds round the camera
     float3 sunOpen, moonOpen = 0;
