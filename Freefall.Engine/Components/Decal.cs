@@ -72,11 +72,12 @@ namespace Freefall.Components
 
         public void DrawGizmos(GizmoContext ctx)
         {
-            // The box, and the way it projects (down its Y axis onto what lies below)
+            // The box, and the way it projects (down its Y axis onto what lies below). The gizmo matrix has no scale in it
+            var size = Transform.WorldScale;
             ctx.Color = new Color4(0.4f, 0.8f, 1f, 1f);
-            ctx.DrawWireBox(Vector3.Zero, Vector3.One);
+            ctx.DrawWireBox(Vector3.Zero, size);
             ctx.Color = new Color4(1f, 0.85f, 0.3f, 1f);
-            ctx.DrawRay(new Vector3(0, 0.5f, 0), -Vector3.UnitY, 1f);
+            ctx.DrawRay(new Vector3(0, 0.5f * size.Y, 0), -Vector3.UnitY, size.Y);
         }
     }
 }
