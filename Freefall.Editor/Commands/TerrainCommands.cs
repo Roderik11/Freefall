@@ -363,10 +363,9 @@ namespace Freefall.Editor.Commands
                 halfZ = 2f;
             }
 
-            // Get entity's Y rotation for oriented sampling
-            float yaw = MathF.Atan2(
-                2 * (rot.W * rot.Y + rot.X * rot.Z),
-                1 - 2 * (rot.Y * rot.Y + rot.Z * rot.Z));
+            // Get entity's Y rotation for oriented sampling: the turn about Y left once its tilt is taken out,
+            // the yaw RotationFromNormal builds with, so aligning again keeps it
+            float yaw = 2 * MathF.Atan2(rot.Y, rot.W);
             float cosR = MathF.Cos(yaw);
             float sinR = MathF.Sin(yaw);
 
