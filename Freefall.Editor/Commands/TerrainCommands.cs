@@ -384,8 +384,8 @@ namespace Freefall.Editor.Commands
                     float lx = -halfX + 2 * halfX * ix / (grid - 1);
                     float lz = -halfZ + 2 * halfZ * iz / (grid - 1);
 
-                    float wx = pos.X + lx * cosR - lz * sinR;
-                    float wz = pos.Z + lx * sinR + lz * cosR;
+                    float wx = pos.X + lx * cosR + lz * sinR;
+                    float wz = pos.Z - lx * sinR + lz * cosR;
 
                     float h = terrain.GetHeight(new Vector3(wx, 0, wz));
                     heights[idx] = h;
@@ -428,8 +428,11 @@ namespace Freefall.Editor.Commands
                         + (sumLx * sumLz - sumLxLz * n) * sumLxH) / det);
             }
 
-            // Compute rotation from slope normal
-            var terrainNormal = Vector3.Normalize(new Vector3(-slopeX, 1, -slopeZ));
+            // Compute rotation from slope normal. The fit is along the entity's turned axes, the normal is a world direction
+            var terrainNormal = Vector3.Normalize(new Vector3(
+                -(slopeX * cosR + slopeZ * sinR),
+                1,
+                -(slopeZ * cosR - slopeX * sinR)));
             var slopeRotation = RotationFromNormal(terrainNormal, yaw);
             var groundPosition = new Vector3(pos.X, avgH, pos.Z);
 
@@ -504,7 +507,7 @@ namespace Freefall.Editor.Commands
                 tilt = Quaternion.CreateFromAxisAngle(cross, angle);
             }
 
-            // Tilt first, then apply yaw
+            // Yaw first, then the tilt: the right-hand quaternion applies first
             return Quaternion.Normalize(tilt * yawQuat);
         }
     }
