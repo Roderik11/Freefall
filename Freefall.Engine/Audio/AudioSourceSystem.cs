@@ -46,6 +46,9 @@ namespace Freefall.Audio
         // One switched off or on (Enabled: a bed of the day giving way to the night's) over this long
         const float SwitchFadeTime = 4f;
 
+        // A change of the outdoors' share (AudioVolume) is heard over this long: a box's edge without a Fade crossfades
+        const float OutsideEase = 1f;
+
         // A voice that is heard keeps it against one up to this much louder (loudness squared: x2 = 3 dB),
         // so two fires about as far off do not swap as the listener moves between them
         const float Keep = 2f;
@@ -121,6 +124,8 @@ namespace Freefall.Audio
         private float _farthest;                                    // the longest HeardWithin of a source in the grid
         private float _sinceSelect = SelectEvery;
         private int _choice;
+        private static float _outside = 1f;                         // what an Outdoors source is heard at, where the listener is
+        private float _outsideTo = 1f;                              // ... and what that is going to (AudioVolume)
 
         private static readonly Comparison<Entry> Louder = (a, b) => b.Score.CompareTo(a.Score);
 
@@ -144,8 +149,10 @@ namespace Freefall.Audio
             if (_sinceSelect >= SelectEvery && listener != null)
             {
                 _sinceSelect = 0f;
+                _outsideTo = OutsideAt(listener.Position);
                 Select(listener);
             }
+            _outside += Math.Clamp(_outsideTo - _outside, -Time.Delta / OutsideEase, Time.Delta / OutsideEase);
 
             int heard = 0;
             for (int i = 0; i < _voices.Count; i++)
@@ -400,6 +407,19 @@ namespace Freefall.Audio
             }
         }
 
+        // How much of the outdoors is heard at a place: the quietest of the volumes it is in
+        private static float OutsideAt(Vector3 at)
+        {
+            float share = 1f;
+            var volumes = ComponentCache<AudioVolume>.All;
+            for (int i = 0; i < volumes.Count; i++)
+            {
+                var volume = volumes[i];
+                if (volume != null && volume.Enabled) share = MathF.Min(share, volume.ShareAt(at));
+            }
+            return share;
+        }
+
         private void Consider(Entry entry, Vector3 at)
         {
             var source = entry.Source;
@@ -431,7 +451,8 @@ namespace Freefall.Audio
 
             float full = MathF.Max(source.FalloffStart, 0.01f);
             float curve = away > full * full ? full * full / away : 1f;
-            return source.Volume * source.Volume * curve * edge * edge;
+            float volume = source.Volume * (source.Outdoors ? _outside : 1f);
+            return volume * volume * curve * edge * edge;
         }
 
         // 1 well within hearing, falling to 0 over the last fifth of HeardWithin (0 = no limit)
@@ -682,7 +703,7 @@ namespace Freefall.Audio
 
             float edge = Edge(source.HeardWithin, away);
             voice.Native.SetFrequencyRatio(pitch, 0);
-            voice.Native.SetVolume(source.Volume * voice.Fade * edge);
+            voice.Native.SetVolume(source.Volume * (source.Outdoors ? _outside : 1f) * voice.Fade * edge);
         }
 
         private static bool SameFormat(WaveFormat a, WaveFormat b)

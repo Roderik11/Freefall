@@ -74,6 +74,12 @@ namespace Freefall.Components
         /// </summary>
         public float Width = 0;
 
+        /// <summary>
+        /// A sound of the open air (a forest's birds, the wind, a river): an <see cref="AudioVolume"/> round the listener
+        /// quietens it. A fire or a step in the same place is not one.
+        /// </summary>
+        public bool Outdoors;
+
         /// <summary>Plays (or plays on without a voice, out of hearing).</summary>
         [Freefall.Reflection.DontSerialize]
         public bool IsPlaying => Entry?.PlayingIndex >= 0;
