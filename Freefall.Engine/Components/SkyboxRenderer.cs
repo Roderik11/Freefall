@@ -13,8 +13,8 @@ using Description = System.ComponentModel.DescriptionAttribute;
 namespace Freefall.Components
 {
     /// <summary>
-    /// The sky: time of day, the sun and the moons, the atmosphere they shine through, the stars and the cloud layer.
-    /// Every frame it hands the atmosphere its settings (<see cref="Atmosphere.Settings"/>: the one source of the sky's
+    /// The sky: the sun and the moons where <see cref="GameClock"/> puts them, the atmosphere they shine through, the stars
+    /// and the cloud layer. Every frame it hands the atmosphere its settings (<see cref="Atmosphere.Settings"/>: the one source of the sky's
     /// light, the sun's light on the ground, the ambient and the fog, made on the GPU by atmosphere_cs.hlsl) and points
     /// the one directional light at the sun, or at night at the moon that gives the most light, with the illuminance that
     /// reaches the camera through the air. Below the horizon the sun gives no direct light at all: twilight is the
@@ -32,17 +32,7 @@ namespace Freefall.Components
         private Material Material = InternalAssets.SkyboxMaterial;
         private MaterialBlock Params = new MaterialBlock();
 
-        [Category("Time of Day")]
-        public bool AnimateTimeOfDay = false;
-
-        [ValueRange(0f, 24f)]
-        public float TimeOfDay = 16f;         // 0-24 hours
-
-        public int Day = 0;                   // days since day 0: counts on as TimeOfDay wraps, moves the moons along their orbits
-
-        [ValueRange(1f, 360f)]
-        public float GameSecondsPerSecond = 3.6f;   // how fast the clock runs: 1 = real time, 60 = an hour a minute, 360 = a day in 4 min
-
+        [Category("Sun's Path")]
         [ValueRange(0f, 360f)]
         public float SunAzimuthAngle = 30.0f;    // Compass heading for sunrise in degrees (0=+X, 90=+Z, 180=-X, 270=-Z)
 
@@ -288,19 +278,9 @@ namespace Freefall.Components
             // Move with camera to simulate infinite distance
             Transform.Position = Camera.Main.Position;
 
-            // Animate time of day if enabled
-            if (AnimateTimeOfDay)
-            {
-                TimeOfDay += (float)Time.Delta * GameSecondsPerSecond / 3600f;
-                if (TimeOfDay >= 24.0f) { TimeOfDay -= 24.0f; Day++; }
-                if (TimeOfDay < 0.0f) { TimeOfDay += 24.0f; Day--; }
-            }
-
             CloudTime += (float)Time.Delta * CloudSpeed;
 
             // The volumetric clouds (Graphics.Clouds): the wind's direction follows the game time, and carries them
-            double gameHours = Day * 24.0 + TimeOfDay;
-            Wind.GameHours = gameHours;
             Clouds.Settings = new CloudSettings
             {
                 Enabled = Enabled,
@@ -316,7 +296,7 @@ namespace Freefall.Components
                 Speed = CloudSpeed,
                 FreezingLevel = FreezingLevel,
             };
-            Clouds.Advance((float)Time.Delta, Wind.GeneratedDirection, gameHours);
+            Clouds.Advance((float)Time.Delta, Wind.GeneratedDirection, GameClock.Hours);
 
             CurrentCloudCoverage = CloudCoverage;
             CurrentCloudTime = CloudTime;
@@ -364,7 +344,7 @@ namespace Freefall.Components
         /// </summary>
         private void UpdateSunLight(float cameraHeight)
         {
-            SunDirection = ComputeSunDirection(TimeOfDay, SunAzimuthAngle, MaxSunElevation, out _, out _);
+            SunDirection = ComputeSunDirection(GameClock.TimeOfDay, SunAzimuthAngle, MaxSunElevation, out _, out _);
             CurrentSunDirection = SunDirection;
 
             UpdateMoons();
@@ -435,14 +415,15 @@ namespace Freefall.Components
             _moonCount = 0;
             Span<int> textures = stackalloc int[MaxMoons];
             Span<int> normals = stackalloc int[MaxMoons];
-            double days = Day + TimeOfDay / 24.0;
+            double days = GameClock.Hours / 24.0;
+            float timeOfDay = GameClock.TimeOfDay;
             foreach (var moon in Moons)
             {
                 if (moon == null || _moonCount == MaxMoons) continue;
 
                 double cycle = days / Math.Max(moon.PeriodDays, 0.01f) + moon.PhaseOffset;
                 float phase = (float)(cycle - Math.Floor(cycle));
-                float hour = TimeOfDay - phase * 24f;
+                float hour = timeOfDay - phase * 24f;
                 if (hour < 0f) hour += 24f;
                 Vector3 dir = ComputeSunDirection(hour, moon.Azimuth, moon.MaxElevation, out _, out _);
 
@@ -527,7 +508,7 @@ namespace Freefall.Components
                 pole = -pole;
 
             static float Turn(float hours) => (hours - 6f) / 24f * MathF.Tau;
-            _starRotation = Matrix4x4.CreateFromAxisAngle(pole, -Turn(TimeOfDay));
+            _starRotation = Matrix4x4.CreateFromAxisAngle(pole, -Turn(GameClock.TimeOfDay));
 
             Vector3 zenith = Vector3.TransformNormal(Vector3.UnitY, Matrix4x4.CreateFromAxisAngle(pole, -Turn(24f)));
             Vector3 meridian = Vector3.Cross(zenith, pole);     // normal of the plane through the pole and that zenith
@@ -539,7 +520,7 @@ namespace Freefall.Components
 
         /// <summary>
         /// Overwrite every look parameter (sun, atmosphere, fog, clouds, stars) from a preset.
-        /// Time of day, azimuth and max elevation are left alone — they describe *when*,
+        /// The sun's path is left alone, as the time is (GameClock): they describe *when*,
         /// the preset describes *how it looks*. Called every frame by EnvironmentController
         /// with its blended preset.
         /// </summary>

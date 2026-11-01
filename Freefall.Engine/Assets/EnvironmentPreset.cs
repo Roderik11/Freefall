@@ -12,12 +12,12 @@ namespace Freefall.Assets
     /// by <see cref="Lerp"/>. Rain and snow are not set here: the clouds make them where they are deep enough
     /// (Graphics.Weather), and <see cref="FreezingLevel"/> says which falls.
     ///
-    /// A preset says what the air is made of and what lights it; the time of day (SkyboxRenderer.TimeOfDay) does the
+    /// A preset says what the air is made of and what lights it; the time of day (Base.GameClock) does the
     /// rest through the physical atmosphere (Graphics.Atmosphere): the same preset gives the noon, the sunset and the
     /// night, with nothing per time of day.
     ///
-    /// Presets are applied by <c>EnvironmentController</c>, which pushes the blended
-    /// result into <c>SkyboxRenderer</c> and the weather emitters.
+    /// Presets are applied by <c>EnvironmentController</c>, from a <see cref="Climate"/>, held, or from the
+    /// <c>WeatherZone</c> the camera is in; it pushes the blended result into <c>SkyboxRenderer</c> and the weather emitters.
     /// </summary>
     [CreateAsset("Environment Preset")]
     public class EnvironmentPreset : Asset

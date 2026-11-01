@@ -328,7 +328,7 @@ namespace Freefall.Graphics
 
         /// <summary>The deck's rule, as clouds_cs.hlsl PrecipitationAt applies it to a column: deep enough, and its top in
         /// the ice (over the freezing level by <see cref="IceLift"/>, the Bergeron process).</summary>
-        private static float DeckRate(float depth, float top, float freezingLevel)
+        internal static float DeckRate(float depth, float top, float freezingLevel)
             => Math.Clamp((top - freezingLevel - IceLift) / IceRange, 0f, 1f)
              * Math.Clamp((depth - DepthMin) / (DepthFull - DepthMin), 0f, 1f);
 

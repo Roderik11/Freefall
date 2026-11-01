@@ -136,6 +136,10 @@ namespace Freefall.Editor.Commands
                 // The volumetric clouds: on, the slab's heights, this frame's bake, the wind's offset and heading, towers
                 clouds = Freefall.Graphics.Clouds.Describe(),
                 weather = Freefall.Graphics.Weather.Describe(),
+                // The game time, and what the weather is made of now: the climate's spell, a held preset, the zones
+                clock = new { day = GameClock.Day, timeOfDay = GameClock.TimeOfDay, hours = GameClock.Hours, running = GameClock.Running, GameClock.GameSecondsPerSecond },
+                environment = ComponentCache<Freefall.Components.EnvironmentController>.All.Count > 0
+                    ? ComponentCache<Freefall.Components.EnvironmentController>.All[0].Describe() : null,
                 // Decals: registry slots the cull walks, and the spawned ones (footprints, blood) since the scene loaded
                 decals = Freefall.Graphics.DecalBuffer.Instance?.Describe(),
                 // System tree in update order, one "Name  ms" line per system (indent = nesting)

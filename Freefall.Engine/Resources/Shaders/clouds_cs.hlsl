@@ -212,11 +212,49 @@ float2 CloudTowers(CloudParams C, float2 xz, float h, float turret, float lobe, 
     return env;
 }
 
+// The layer at a cloud-space place: where a region lies, its own. Everything the field makes of the layer then follows
+// from the place's numbers (a storm's rough deck, fair weather's fields). The regions stand in the world while the
+// clouds drift through them, as a cap stands on a mountain: the rolling bake keeps their edges in place. The edge is
+// pushed about by two octaves of noise (~4 km and ~1.6 km) that drift with the clouds, and the deck keeps its heights
+// nearly out to it, only its coverage fading: heights fading with it bowed the base up toward the rim, and a storm
+// stood over its place as a smooth lens
+void CloudApplyRegions(inout CloudParams C, float2 xz)
+{
+    if (C.RegionCount == 0)
+        return;
+    StructuredBuffer<CloudRegion> regions = ResourceDescriptorHeap[C.Regions];
+    float2 rel = xz - C.CameraCloud;
+    rel -= CLOUD_PERIOD * round(rel / CLOUD_PERIOD);
+    [loop] for (uint i = 0; i < C.RegionCount; i++)
+    {
+        CloudRegion r = regions[i];
+        float2 d = rel - r.Center;
+        float2 box = abs(float2(dot(d, r.Axis), dot(d, float2(-r.Axis.y, r.Axis.x)))) - r.HalfSize;
+        float outside = length(max(box, 0.0));
+        if (outside >= r.Reach * 1.5)
+            continue;
+        Texture3D<float4> lut = ResourceDescriptorHeap[C.NoiseLut];
+        float rough = lut.SampleLevel(CloudWrap, float3(xz / (CLOUD_PERIOD / 60.0), 0.29), 0).r;
+        float fine = lut.SampleLevel(CloudWrap, float3(xz / (CLOUD_PERIOD / 160.0), 0.53), 0).r;
+        outside += r.Reach * ((rough - 0.5) * 1.4 + (fine - 0.5) * 0.5);
+        float inside = 1.0 - saturate(outside / r.Reach);
+        if (inside <= 0.0)
+            continue;
+        float cover = inside * inside * (3.0 - 2.0 * inside);
+        float layer = saturate(inside * 4.0);
+        C.Coverage = lerp(C.Coverage, r.Coverage, cover);
+        C.Type = lerp(C.Type, r.Type, layer);
+        C.Base = lerp(C.Base, r.Base, layer);
+        C.Thickness = lerp(C.Thickness, r.Thickness, layer);
+    }
+}
+
 // The cloud field at a cloud-space place: density 0..1 (before CloudDensity) and the profile, after Nubis: the base
 // shape (Perlin-Worley eroded by Worley FBM) against the envelope (the layer's coverage × its height profile, or a
 // tower's), the detail left to the march
 float2 CloudFieldAt(CloudParams C, float2 xz, float h)
 {
+    CloudApplyRegions(C, xz);
     Texture3D<float4> lut = ResourceDescriptorHeap[C.NoiseLut];
     float3 slide = float3(0.7, 0.3, 0.4) * (C.Evolution * 3.0);         // the noise slides through the shapes
     float4 n = lut.SampleLevel(CloudWrap, (float3(xz.x, h, xz.y) + slide) / CLOUD_BASE_TILE, 0);
@@ -752,6 +790,7 @@ CloudMarchResult CloudMarchClouds(CloudParams C, AtmosphereParams A, Texture3D<f
     // How much the face seen faces the eye rather than down (CloudFarOpen): none above ~65°, all below ~25°
     float eyeShare = smoothstep(0.3, 0.9, length(dir.xz));
     float farOpen = -1.0, farAt = 0.0;
+    float rayDeck = -1.0;
     float t = tStart;
     [loop] for (int s = 0; s < 512 && t < tEnd; s++)
     {
@@ -824,7 +863,14 @@ CloudMarchResult CloudMarchClouds(CloudParams C, AtmosphereParams A, Texture3D<f
             // light entered at the face, as reddened as the sample's own (from higher up, a low sun's gold came out
             // white).
             float seeThrough = saturate(0.5 + 1.5 * cosTheta);
-            float deck = smoothstep(0.55, 0.9, C.Coverage);
+            // ... by the coverage where the ray met the cloud: a region's deck under a fair-weather sky is lit as a deck
+            if (rayDeck < 0.0)
+            {
+                CloudParams place = C;
+                CloudApplyRegions(place, xzp);
+                rayDeck = smoothstep(0.55, 0.9, place.Coverage);
+            }
+            float deck = rayDeck;
             float passing = lerp(seeThrough * 0.4 * CloudThrough(tau) * exp(-0.2 * skyTau.y), CloudThrough(tau), deck)
                           * saturate(lightDir.y);
             float reflected = (1.0 - deck) * (1.0 - seeThrough) * (1.0 - CloudThrough(tau + skyTau.y)) * exp(-0.1 * tau);

@@ -242,11 +242,16 @@ namespace Freefall.Graphics
             public float TerrainShadowSize;
 
             /// <summary>The part the transmittance and multiple scattering LUTs depend on</summary>
+            // Within half a percent of the medium the tables were made for: a change of weather turns these for many
+            // minutes, and the tables should not be made again every frame of it
             public bool SameMedium(in GpuParams o) =>
-                RayleighScattering == o.RayleighScattering && MieScattering == o.MieScattering &&
-                MieExtinction == o.MieExtinction && OzoneAbsorption == o.OzoneAbsorption &&
-                FogScattering == o.FogScattering && FogExtinction == o.FogExtinction && GroundAlbedo == o.GroundAlbedo &&
-                RayleighExpScale == o.RayleighExpScale && MieExpScale == o.MieExpScale && FogExpScale == o.FogExpScale;
+                Near(RayleighScattering, o.RayleighScattering) && Near(MieScattering, o.MieScattering) &&
+                Near(MieExtinction, o.MieExtinction) && Near(OzoneAbsorption, o.OzoneAbsorption) &&
+                Near(FogScattering, o.FogScattering) && Near(FogExtinction, o.FogExtinction) && Near(GroundAlbedo, o.GroundAlbedo) &&
+                Near(RayleighExpScale, o.RayleighExpScale) && Near(MieExpScale, o.MieExpScale) && Near(FogExpScale, o.FogExpScale);
+
+            private static bool Near(Vector3 a, Vector3 b) => Near(a.X, b.X) && Near(a.Y, b.Y) && Near(a.Z, b.Z);
+            private static bool Near(float a, float b) => MathF.Abs(a - b) <= 0.005f * MathF.Max(MathF.Abs(a), MathF.Abs(b));
         }
 
         private const int FrameCount = 3;

@@ -81,7 +81,24 @@ struct CloudParams
                             // crosses the slab's bottom, snapped to texels)
     float FreezingLevel;    // the 0 °C level (m above sea level): which columns precipitate (clouds_cs.hlsl
                             // PrecipitationAt), and as what (Graphics/Weather.cs)
-    float _precipPad0, _precipPad1, _precipPad2;
+    uint Regions;           // StructuredBuffer<CloudRegion>: places with clouds of their own (RegionCount of them)
+    uint RegionCount;
+    float _precipPad2;
+};
+
+// A place with clouds of its own (a WeatherZone, Clouds.cs PlaceRegions): the layer the bake makes there instead of the
+// weather's, so its weather can be seen from afar
+struct CloudRegion
+{
+    float2 Center;          // camera-relative xz (m)
+    float2 Axis;            // the box's x axis in world xz (unit)
+    float2 HalfSize;        // the box's half width and depth (m)
+    float Reach;            // metres past the box over which it fades into the sky round it
+    float Coverage;         // the layer: as CloudParams
+    float Type;
+    float Base;
+    float Thickness;
+    float _regionPad;
 };
 
 // A rain shaft under a raining cell (Clouds.cs PlaceRainShafts): from the clouds' base down to Bottom (the ground, or

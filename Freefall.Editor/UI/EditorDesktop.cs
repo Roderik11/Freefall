@@ -724,6 +724,7 @@ namespace Freefall.Editor
         {
             var entity = new Entity("New Sky");
             entity.AddComponent<SkyboxRenderer>();
+            new Entity("Clock").AddComponent<WorldClock>();
             MessageDispatcher.Send(Msg.RefreshExplorer);
         }
 

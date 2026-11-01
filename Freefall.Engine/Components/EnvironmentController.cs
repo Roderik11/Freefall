@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Numerics;
 using Freefall.Assets;
 using Freefall.Base;
@@ -10,15 +11,19 @@ namespace Freefall.Components
     /// <summary>
     /// Drives the sky, sun, fog and weather particle emitters from <see cref="EnvironmentPreset"/> assets.
     ///
-    /// Pick a <see cref="Preset"/> in the inspector (or call <see cref="TransitionTo"/> from code) and the
-    /// controller cross-fades from whatever is currently shown to the new preset over
-    /// <see cref="TransitionDuration"/> seconds. The blended result is pushed every frame into:
+    /// The weather comes in layers, each laid over the last:
+    ///   • <see cref="Climate"/>: the world's weather, which moves on by itself with <see cref="GameClock"/>
+    ///   • <see cref="Preset"/>: a weather held in its place while one is set, for a scene that keeps one look
+    ///     or to look at one (or call <see cref="TransitionTo"/> from code)
+    ///   • every <see cref="WeatherZone"/> the camera is in
+    /// A change of <see cref="Preset"/> cross-fades from whatever is shown over <see cref="TransitionDuration"/> seconds.
+    /// The blended result is pushed every frame into:
     ///   • <see cref="SkyboxRenderer"/> via <c>ApplyPreset</c> (sun, atmosphere, ground fog, clouds, stars)
     ///   • <c>Graphics.AutoExposure.PresetCompensation</c> (how bright the weather reads)
     ///   • the optional Rain / Snow / Hail / Dust <see cref="ParticleEmitter"/>s (emit rate scaled by what
     ///     falls at the camera, wind copied to the emitter, emitter parked above the camera)
     ///
-    /// Time of day stays on the <see cref="SkyboxRenderer"/> — a preset describes how a day looks,
+    /// The time is <see cref="GameClock"/>'s — a preset describes how a day looks,
     /// not what time it is. Rain, snow and hail are not the preset's: the clouds make them where they are
     /// deep enough (<see cref="Graphics.Weather"/>), the preset's freezing level says which; walking out from
     /// under a shower stops it. Dust stays the preset's DustIntensity.
@@ -27,8 +32,11 @@ namespace Freefall.Components
     [UpdateInEditor]
     public class EnvironmentController : Component, IUpdate
     {
-        [Category("Preset")]
-        [Description("Environment preset to show. Changing it starts a cross-fade from the current look.")]
+        [Category("Weather")]
+        [Description("How the weather goes with the game time. It only moves while the clock runs (WorldClock)")]
+        public Climate Climate;
+
+        [Description("A weather held in the climate's place. Empty = the climate decides. Changing it starts a cross-fade from the current look.")]
         public EnvironmentPreset Preset;
 
         [Description("Seconds a preset change takes to fully blend in")]
@@ -71,7 +79,7 @@ namespace Freefall.Components
         [ValueRange(0f, 20f)]
         public float DustHeight = 0.5f;
 
-        [Description("Use the preset's wind for the emitters instead of their authored Wind")]
+        [Description("Use the weather's wind for the emitters instead of their authored Wind")]
         public bool DriveWind = true;
 
         [Description("Seconds of wind drift to lead by: emitters are shifted upwind by Wind * WindLead so blown particles still arrive at the camera. Not for an emitter with WrapInBox (its particles stay in the box round the camera)")]
@@ -89,11 +97,17 @@ namespace Freefall.Components
         public bool IsTransitioning => TransitionProgress < 1f;
 
         private readonly EnvironmentPreset _from = new();     // look at the moment the last transition started
+        private readonly EnvironmentPreset _world = new();    // this frame's weather: the climate or the held preset, zones over it
         private readonly EnvironmentPreset _current = new();  // blended output
-        private EnvironmentPreset _target;                    // preset asset we are heading toward
+        private EnvironmentPreset _held;                      // the Preset the last transition went to (null: the climate)
+        private EnvironmentPreset _climateFrom, _climateTo;   // for Describe
+        private float _climateBlend;
         private float _elapsed;
         private float _duration;
         private bool _primed;
+        private bool _driving;
+        private readonly List<WeatherZone> _zones = new();
+        private static readonly Comparison<WeatherZone> ByPriority = (a, b) => a.Priority.CompareTo(b.Priority);
 
         // Emitters we touched last frame, so we can reset their runtime overrides when unassigned
         private ParticleEmitter _lastRain, _lastSnow, _lastHail, _lastDust, _lastSplash;
@@ -106,71 +120,109 @@ namespace Freefall.Components
         public override void OnMemberChanged()
         {
             // Inspector changed something — if it was the preset, start a cross-fade to it
-            if (Preset != _target)
+            if (Preset != _held)
                 TransitionTo(Preset, TransitionDuration);
         }
 
         /// <summary>
-        /// Cross-fade to <paramref name="preset"/> over <paramref name="duration"/> seconds
-        /// (negative = use <see cref="TransitionDuration"/>, 0 = snap). Safe to call mid-transition:
+        /// Cross-fade to <paramref name="preset"/> over <paramref name="duration"/> seconds and hold it (null: back to the
+        /// climate; negative duration = use <see cref="TransitionDuration"/>, 0 = snap). Safe to call mid-transition:
         /// the fade restarts from whatever is on screen right now, so there is no pop.
         /// </summary>
         public void TransitionTo(EnvironmentPreset preset, float duration = -1f)
         {
-            if (preset == null) return;
-
             Preset = preset;
-            _target = preset;
+            _held = preset;
             _duration = duration < 0f ? TransitionDuration : duration;
             _elapsed = 0f;
 
             if (_primed)
             {
-                // Continue from the current blend. Altitude is cross-faded rather than lerped, so pick
-                // whichever layer was dominating on screen as the "from" layer.
+                // Continue from the current blend. The 2D layer's altitude is cross-faded rather than lerped, so
+                // pick whichever layer was dominating on screen as the "from" layer.
                 _fromAltitude = _altitudeBlend >= 0.5f ? _toAltitude : _fromAltitude;
                 _from.CopyFrom(_current);
             }
-            else
-            {
-                _from.CopyFrom(preset);         // first preset ever: snap, nothing to fade from
-                _fromAltitude = preset.CloudAltitude;
-            }
-
-            _toAltitude = preset.CloudAltitude;
-            _primed = true;
         }
 
         private float _fromAltitude, _toAltitude, _altitudeBlend = 1f;
 
         public void Update()
         {
-            // Disabled or preset unassigned: stop driving the sky. Without this the last target kept being
+            // Disabled or nothing to show: stop driving the sky. Without this the last target kept being
             // re-applied every frame, so an unassigned preset "lingered" and SkyboxRenderer edits were overwritten.
-            if (!Enabled || Preset == null)
+            if (!Enabled || (Preset == null && (Climate == null || !Climate.HasWeather)))
             {
                 Release();
                 return;
             }
 
-            if (!_primed)
+            // First frame with a weather (scene load): straight to it, nothing to fade from
+            bool first = !_primed;
+            if (first)
             {
-                if (Preset == null) return;
-                // First frame with a preset (scene load) — snap straight to it
-                TransitionTo(Preset, 0f);
+                _primed = true;
+                _held = Preset;
+                _duration = 0f;
             }
-            else if (Preset != _target)
+            else if (Preset != _held)
             {
                 // Field was swapped from code without going through TransitionTo
                 TransitionTo(Preset, TransitionDuration);
             }
 
-            if (_target == null) return;
-
+            _driving = true;
             _elapsed += (float)Time.Delta;
-            EnvironmentPreset.Lerp(_from, _target, TransitionProgress, _current);
+            MakeWorld(first);
+            if (TransitionProgress < 1f)
+                EnvironmentPreset.Lerp(_from, _world, TransitionProgress, _current);
+            else
+                _current.CopyFrom(_world);
 
+            _toAltitude = _world.CloudAltitude;
+            if (first) _fromAltitude = _toAltitude;
             ApplyCurrent();
+        }
+
+        // This frame's weather, whatever a running transition still hides: the climate or the held preset, then the zones
+        // the camera is in, from the lowest priority up
+        private void MakeWorld(bool first)
+        {
+            _climateFrom = _climateTo = null;
+            if (Preset != null)
+                _world.CopyFrom(Preset);
+            else if (Climate.Sample(GameClock.Hours, out _climateFrom, out _climateTo, out _climateBlend))
+                EnvironmentPreset.Lerp(_climateFrom, _climateTo, _climateBlend, _world);
+
+            var place = Camera.Main?.Position ?? Vector3.Zero;
+            _zones.Clear();
+            foreach (var zone in ComponentCache<WeatherZone>.All)
+                _zones.Add(zone);
+            _zones.Sort(ByPriority);
+            foreach (var zone in _zones)
+            {
+                float weight = zone.Step(place, (float)Time.Delta, first);
+                if (weight > 0f)
+                    EnvironmentPreset.Lerp(_world, zone.Preset, weight, _world);
+            }
+        }
+
+        /// <summary>For engine_stats: what the weather is made of now.</summary>
+        public object Describe()
+        {
+            var zones = new List<object>();
+            foreach (var zone in _zones)
+                if (zone.Weight > 0f) zones.Add(new { zone = zone.Entity?.Name, preset = zone.Preset?.Name, weight = zone.Weight });
+            return new
+            {
+                climate = Climate?.Name,
+                held = Preset?.Name,
+                from = _climateFrom?.Name,
+                to = _climateTo?.Name,
+                blend = _climateBlend,
+                nextChangeAt = _climateTo != null ? Climate?.SpellEnds : null,
+                zones,
+            };
         }
 
         private void ApplyCurrent()
@@ -180,17 +232,20 @@ namespace Freefall.Components
             {
                 Skybox.ApplyPreset(_current);
 
-                // Altitude: cross-fade two cloud layers instead of zooming the pattern
+                // The 2D layer's altitude: cross-fade two cloud layers instead of zooming the pattern. The volumetric
+                // clouds take the blended height: at the new one's height from the first frame, as this gave both until
+                // a change of weather took game hours, they would drop to it as the change began
                 _altitudeBlend = TransitionProgress;
-                Skybox.CloudAltitude = _toAltitude;
-                Skybox.CloudAltitudeFrom = _fromAltitude;
-                Skybox.CloudAltitudeBlend = _altitudeBlend;
+                bool layers = !Engine.Settings.VolumetricClouds;
+                Skybox.CloudAltitude = layers ? _toAltitude : _current.CloudAltitude;
+                Skybox.CloudAltitudeFrom = layers ? _fromAltitude : _current.CloudAltitude;
+                Skybox.CloudAltitudeBlend = layers ? _altitudeBlend : 1f;
             }
 
             // How bright this weather reads: added to the auto exposure's metering
             Graphics.AutoExposure.PresetCompensation = _current.ExposureCompensation;
 
-            // Vegetation sways in the preset's wind (grass, flowers, leaves; Graphics.Wind): its speed; the direction is
+            // Vegetation sways in the weather's wind (grass, flowers, leaves; Graphics.Wind): its speed; the direction is
             // the generated one, which the clouds drift in too; a storm's outflow and the gusts on top (Weather)
             Graphics.Wind.Speed = _current.WindStrength;
             var wind = Graphics.Wind.Local;
@@ -282,8 +337,9 @@ namespace Freefall.Components
         /// </summary>
         private void Release()
         {
-            if (_target == null) return;
-            _target = null;
+            if (!_driving) return;
+            _driving = false;
+            _held = null;
             Graphics.AutoExposure.PresetCompensation = 0f;
             Graphics.ParticleSystem.WeatherWind = Vector3.Zero;
             Graphics.Wind.Speed = Graphics.Wind.DefaultSpeed;

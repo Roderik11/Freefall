@@ -306,6 +306,7 @@ namespace Freefall
             TickCount++;
 
             Time.Update();
+            if (!SceneManager.IsLoading) GameClock.Advance(Time.Delta);
             Graphics.Wind.Advance(Time.Delta);
             Input.Update();
 

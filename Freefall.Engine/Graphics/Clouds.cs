@@ -85,7 +85,16 @@ namespace Freefall.Graphics
             public uint ProbeClouds; public uint RainShafts, RainCount; public float FlashIntensity;
             public Vector3 FlashPos; public float FlashSpread;
             public uint ShadowMap; public float ShadowTexel; public Vector2 ShadowCentre;
-            public float FreezingLevel, _pad0, _pad1, _pad2;
+            public float FreezingLevel;
+            public uint Regions, RegionCount; public float _pad2;
+        }
+
+        // CloudRegion in cloud_common.hlsli
+        [StructLayout(LayoutKind.Sequential, Pack = 4)]
+        private struct GpuRegion
+        {
+            public Vector2 Center, Axis, HalfSize;
+            public float Reach, Coverage, Type, Base, Thickness, _pad;
         }
 
         // CloudRainShaft in cloud_common.hlsli
@@ -171,6 +180,14 @@ namespace Freefall.Graphics
         private static readonly float[] _shaftDistance = new float[MaxRainShafts];
         private static int _shaftCount;
 
+        // The weather zones' own clouds (PlaceRegions), with what falls from them and the ground they stand on
+        private const int MaxRegions = 16;
+        private static readonly GraphicsBuffer?[] _regions = new GraphicsBuffer?[FrameCount];
+        private static readonly GpuRegion[] _regionData = new GpuRegion[MaxRegions];
+        private static readonly float[] _regionRain = new float[MaxRegions];
+        private static readonly float[] _regionGround = new float[MaxRegions];
+        private static int _regionCount;
+
         // Lightning: one flash at a time in a raining cell, a few strokes over 0.05-0.3 s
         private const float FlashPeakCandela = 5e9f;   // a stroke's luminous intensity (lightning: ~1e9-1e10 cd)
         private static readonly Random _flashRandom = new(20261019);
@@ -235,6 +252,7 @@ namespace Freefall.Graphics
                 _params[i] = GraphicsBuffer.CreateUpload<GpuParams>(1, mapped: true);
                 _cells[i] = GraphicsBuffer.CreateUpload<GpuCell>(_cellData.Length, mapped: true);
                 _rainShafts[i] = GraphicsBuffer.CreateUpload<GpuRainShaft>(MaxRainShafts, mapped: true);
+                _regions[i] = GraphicsBuffer.CreateUpload<GpuRegion>(MaxRegions, mapped: true);
             }
 
             // Optical depths, half floats as the light volumes
@@ -307,13 +325,22 @@ namespace Freefall.Graphics
             int slot = Engine.FrameIndex % FrameCount;
             var s = Settings;
 
-            // The heights the volumes span: the layer and the towers, snapped so a preset blend rebakes rarely
-            // (a storm's rough base hangs up to BaseDip lower in places: clouds_cs.hlsl CloudBaseRough, CLOUD_BASE_DIP)
+            PlaceRegions(s, cameraPos, slot);
+
+            // The heights the volumes span: the layer, the towers and the regions' layers, snapped so a preset blend
+            // rebakes rarely (a storm's rough base hangs up to BaseDip lower in places: clouds_cs.hlsl CloudBaseRough,
+            // CLOUD_BASE_DIP)
             float top = MathF.Max(s.Base + s.Thickness, s.TowerShare > 0f ? s.TowerTop * 1.12f : 0f);
             // and a tower's ragged base up to 250 m lower: clouds_cs.hlsl CloudTowerEnvelope)
-            float rough = Math.Clamp((s.Coverage - 0.6f) / 0.25f, 0f, 1f) * Math.Clamp((s.Type - 0.4f) / 0.3f, 0f, 1f);
-            float dip = MathF.Max(BaseDip * rough, s.TowerShare > 0f ? 250f : 0f);
-            float slabBottom = MathF.Floor(MathF.Max(s.Base - dip, 0f) / 250f) * 250f;
+            float dip = MathF.Max(BaseDip * BaseRough(s.Coverage, s.Type), s.TowerShare > 0f ? 250f : 0f);
+            float bottom = MathF.Max(s.Base - dip, 0f);
+            for (int i = 0; i < _regionCount; i++)
+            {
+                ref var r = ref _regionData[i];
+                top = MathF.Max(top, r.Base + r.Thickness);
+                bottom = MathF.Min(bottom, MathF.Max(r.Base - BaseDip * BaseRough(r.Coverage, r.Type), 0f));
+            }
+            float slabBottom = MathF.Floor(bottom / 250f) * 250f;
             float slabTop = MathF.Max(MathF.Ceiling(top / 250f) * 250f, slabBottom + 250f);
             bool rebuild = slabBottom != _slabBottom || slabTop != _slabTop
                 || double.IsNaN(_lastHours) || Math.Abs(_gameHours - _lastHours) > 0.25;
@@ -455,10 +482,60 @@ namespace Freefall.Graphics
                 ShadowTexel = ShadowMapTexel,
                 ShadowCentre = centre,
                 FreezingLevel = s.FreezingLevel,
+                Regions = _regions[slot]!.SrvIndex,
+                RegionCount = (uint)_regionCount,
             };
             unsafe { *_params[slot]!.WritePtr<GpuParams>() = p; }
             _paramsIdx = _params[slot]!.SrvIndex;
             return _paramsIdx;
+        }
+
+        // How rough a deck's base is: clouds_cs.hlsl CloudBaseRough
+        private static float BaseRough(float coverage, float type) =>
+            Math.Clamp((coverage - 0.6f) / 0.25f, 0f, 1f) * Math.Clamp((type - 0.4f) / 0.3f, 0f, 1f);
+
+        /// <summary>
+        /// Every <see cref="Components.WeatherZone"/> with a CloudReach as a place with clouds of its own: its preset's layer
+        /// over its box, fading into the sky round it, so that from afar a zone is seen as weather over there and not
+        /// only felt on walking in. A preset whose deck rains or snows has a curtain under it too (PlaceRainShafts). With
+        /// the camera in a zone the whole sky has gone over to its preset (EnvironmentController), and its region is
+        /// the same clouds. No zones, no cost: the bake's look at the regions stops at the count.
+        /// </summary>
+        private static void PlaceRegions(in CloudSettings s, Vector3 cameraPos, int slot)
+        {
+            _regionCount = 0;
+            foreach (var zone in Base.ComponentCache<Components.WeatherZone>.All)
+            {
+                if (_regionCount == MaxRegions) break;
+                var preset = zone.Preset;
+                if (!zone.Enabled || preset == null || zone.CloudReach <= 0f || zone.Transform == null) continue;
+
+                var world = zone.Transform.WorldMatrix;
+                var place = zone.Transform.WorldPosition;
+                var size = zone.Transform.WorldScale;
+                var axis = new Vector2(world.M11, world.M13);
+                axis = axis.LengthSquared() > 1e-8f ? Vector2.Normalize(axis) : Vector2.UnitX;
+                int i = _regionCount++;
+                _regionData[i] = new GpuRegion
+                {
+                    Center = new Vector2(place.X - cameraPos.X, place.Z - cameraPos.Z),
+                    Axis = axis,
+                    HalfSize = new Vector2(size.X, size.Z) * 0.5f,
+                    Reach = zone.CloudReach,
+                    Coverage = preset.CloudCoverage,
+                    Type = preset.CloudType,
+                    Base = preset.CloudAltitude,
+                    Thickness = preset.CloudThickness,
+                };
+                float depth = preset.CloudThickness * SmoothStep(0.6f, 0.95f, preset.CloudCoverage);
+                _regionRain[i] = Weather.DeckRate(depth, preset.CloudAltitude + preset.CloudThickness, preset.FreezingLevel);
+                _regionGround[i] = place.Y;
+            }
+            unsafe
+            {
+                var dst = _regions[slot]!.WritePtr<GpuRegion>();
+                for (int k = 0; k < _regionCount; k++) dst[k] = _regionData[k];
+            }
         }
 
         private static long WrapDelta(long d, long period)
@@ -554,26 +631,51 @@ namespace Freefall.Graphics
                         // Virga thins out over its lower 30 %; rain that reaches the ground or the sea ends there
                         Fade = virga < 0.35f ? 0.3f * (s.Base - bottom) : 0f,
                     };
-                    // Keep the nearest: insert in order of distance
-                    int k = Math.Min(_shaftCount, MaxRainShafts - 1);
-                    if (_shaftCount == MaxRainShafts && dist >= _shaftDistance[k])
-                        continue;
-                    while (k > 0 && _shaftDistance[k - 1] > dist)
-                    {
-                        _shaftData[k] = _shaftData[k - 1];
-                        _shaftDistance[k] = _shaftDistance[k - 1];
-                        k--;
-                    }
-                    _shaftData[k] = shaft;
-                    _shaftDistance[k] = dist;
-                    if (_shaftCount < MaxRainShafts) _shaftCount++;
+                    AddShaft(shaft, dist);
                 }
             }
+
+            // Under a region whose deck rains or snows, a curtain as wide as the box and a third of the clouds past it (no
+            // less than a storm cell's: 800 m across at RAIN_SIGMA hardly showed), the axis set upwind so that it lands there,
+            // as the shaft leans downwind on its way down. Under the hail's rate, which is for storm cells' cores
+            for (int i = 0; i < _regionCount; i++)
+            {
+                float rain = _regionRain[i];
+                if (rain <= 0.02f) continue;
+                ref var region = ref _regionData[i];
+                var center = region.Center - Wind.GeneratedDirection * ((s.Base - _regionGround[i]) * RainLean);
+                AddShaft(new GpuRainShaft
+                {
+                    Center = center,
+                    Radius = MathF.Max(MathF.Min(region.HalfSize.X, region.HalfSize.Y) + region.Reach / 3f, 1800f),
+                    Rain = MathF.Min(rain, 0.7f),
+                    Bottom = floor,
+                    Seed = (i + 1) * 0.37f % 1f,
+                }, center.Length());
+            }
+
             unsafe
             {
                 var dst = _rainShafts[slot]!.WritePtr<GpuRainShaft>();
                 for (int k = 0; k < _shaftCount; k++) dst[k] = _shaftData[k];
             }
+        }
+
+        // Keep the nearest: insert in order of distance
+        private static void AddShaft(in GpuRainShaft shaft, float dist)
+        {
+            int k = Math.Min(_shaftCount, MaxRainShafts - 1);
+            if (_shaftCount == MaxRainShafts && dist >= _shaftDistance[k])
+                return;
+            while (k > 0 && _shaftDistance[k - 1] > dist)
+            {
+                _shaftData[k] = _shaftData[k - 1];
+                _shaftDistance[k] = _shaftDistance[k - 1];
+                k--;
+            }
+            _shaftData[k] = shaft;
+            _shaftDistance[k] = dist;
+            if (_shaftCount < MaxRainShafts) _shaftCount++;
         }
 
         private static double WrapDelta(double d)
@@ -876,6 +978,7 @@ namespace Freefall.Graphics
             lightLevelsThisFrame = _lightLevels.Count,
             litBy = _lightIsMoon ? "moon" : "sun",
             rainShafts = _shaftCount,
+            regions = _regionCount,     // weather zones with clouds of their own
             nearestRainKm = _shaftCount > 0 ? _shaftDistance[0] / 1000f : -1f,
             flashCandela = FlashIntensityNow(),
             nextFlashInSeconds = Settings.LightningRate > 0f ? _nextFlashIn : -1f,
