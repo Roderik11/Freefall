@@ -1,13 +1,14 @@
 using System;
+using Freefall.Assets;
 using Vortice.Direct3D12;
 using Vortice.DXGI;
 
 namespace Freefall.Graphics
 {
     /// <summary>
-    /// SMAA 1x — Enhanced Subpixel Morphological Anti-Aliasing.
+    /// SMAA 1x — Enhanced Subpixel Morphological Anti-Aliasing, the reference's High preset.
     /// Three compute passes: edge detection, blend weight calculation, neighborhood blend.
-    /// Uses analytical blend weights (no LUT textures needed for SMAA 1x).
+    /// The weights come from the reference's area and search tables (InternalAssets.SmaaArea, SmaaSearch).
     /// </summary>
     public class SMAA : IDisposable
     {
@@ -78,6 +79,8 @@ namespace Freefall.Graphics
 
                 _shader.SetPushConstant(_kBlendWeights, "BlendUAV", _blendTex!.UavIndex);
                 _shader.SetPushConstant(_kBlendWeights, "EdgesSRV", _edgesTex!.BindlessIndex);
+                _shader.SetPushConstant(_kBlendWeights, "AreaTex", InternalAssets.SmaaArea!.BindlessIndex);
+                _shader.SetPushConstant(_kBlendWeights, "SearchTex", InternalAssets.SmaaSearch!.BindlessIndex);
                 _shader.SetPushConstant(_kBlendWeights, "ScreenWidth", (uint)texWidth);
                 _shader.SetPushConstant(_kBlendWeights, "ScreenHeight", (uint)texHeight);
 

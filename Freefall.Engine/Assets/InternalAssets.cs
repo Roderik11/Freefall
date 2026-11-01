@@ -82,6 +82,12 @@ namespace Freefall.Assets
         /// </summary>
         public static Texture? BlueNoise { get; private set; }
 
+        /// <summary>SMAA's area table: 160 × 560 RG8, as the reference ships it (MIT, Jimenez et al.; smaa_cs.hlsl).</summary>
+        public static Texture? SmaaArea { get; private set; }
+
+        /// <summary>SMAA's search table: 64 × 16 R8, as the reference ships it.</summary>
+        public static Texture? SmaaSearch { get; private set; }
+
         // --- Default textures (loaded from DDS) ---
         public static Texture DefaultDiffuse { get; private set; }
         public static Texture DefaultNormal { get; private set; }
@@ -184,6 +190,11 @@ namespace Freefall.Assets
                 BlueNoise = Texture.CreateFromData(device, 64, 64, EngineFiles.ReadAllBytes(blueNoisePath), Format.R8_UNorm);
                 BlueNoise.Name = "BlueNoise";
             }
+
+            SmaaArea = Texture.CreateFromData(device, 160, 560, EngineFiles.ReadAllBytes(Path.Combine(ResourcesPath, "smaa_area.rg8")), Format.R8G8_UNorm);
+            SmaaArea.Name = "SmaaArea";
+            SmaaSearch = Texture.CreateFromData(device, 64, 16, EngineFiles.ReadAllBytes(Path.Combine(ResourcesPath, "smaa_search.r8")), Format.R8_UNorm);
+            SmaaSearch.Name = "SmaaSearch";
 
             // --- Default textures from DDS ---
             DefaultDiffuse  = new Texture(device, Path.Combine(ResourcesPath, "default_albedo_map.dds"));
