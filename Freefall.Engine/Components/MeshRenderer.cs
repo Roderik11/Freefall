@@ -120,7 +120,7 @@ namespace Freefall.Components
         /// Checks sparse overrides first, falls back to default Material.
         /// When Material is null, unmatched slots are invisible (mixed-mesh mode).
         /// </summary>
-        private Material? GetMaterial(int materialSlot)
+        internal Material? GetMaterial(int materialSlot)
         {
             if (_materials != null)
             {

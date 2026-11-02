@@ -53,3 +53,4 @@ dotnet-tools.json
 Tools/TerrainMigration/migrate-to-stamps.mjs
 /Tools/ModularCharacters
 /References
+/Tools/CharacterGen

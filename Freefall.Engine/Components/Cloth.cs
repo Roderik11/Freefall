@@ -7,19 +7,23 @@ using Freefall.Animation;
 using Freefall.Assets;
 using Freefall.Base;
 using Freefall.Graphics;
-using Vortice.Direct3D12;
 using Category = System.ComponentModel.CategoryAttribute;
 using Description = System.ComponentModel.DescriptionAttribute;
 
 namespace Freefall.Components
 {
     /// <summary>
-    /// A skinned piece of clothing whose lower part moves as cloth, simulated on the GPU (cloth.hlsl): it swings with
-    /// the body's motion, falls against the body's parts (the Animator's body without the cloth, BodyShape) and the
-    /// wind takes it. What hangs free and how it moves is its <see cref="Settings"/>. Goes on the entity of the
-    /// SkinnedMeshRenderer; the skinned vertex shader draws the simulated places instead of skinning (struct Instance
-    /// ClothVertices). Simulated while the character is posed every frame and within <see cref="SimulatedWithin"/> of
-    /// the camera; further off it is plain skinning.
+    /// A piece that moves as cloth, simulated on the GPU by <see cref="ClothSystem"/> (cloth.hlsl): clothing on a skinned
+    /// character (it swings with the body's motion and falls against the body's parts: the Animator's body without the
+    /// cloth, BodyShape), or a banner or a flag on a static mesh. The wind takes it by how square it meets it. What hangs
+    /// free and how it moves is its <see cref="Settings"/>; <see cref="MaterialSlot"/> keeps it to one part of the mesh (a
+    /// banner's cloth, not its bar).
+    ///
+    /// Goes on the entity of a SkinnedMeshRenderer, or of a MeshRenderer: a static mesh is drawn by a skinned twin the
+    /// cloth makes (not saved), since only the skinned vertex shader reads the simulated places (struct Instance
+    /// ClothVertices). Every LOD moves with it: LOD 0 is simulated, the others' vertices follow the particle nearest
+    /// them. Simulated while it is in view and big enough on screen to be seen moving (and, on a character, while it is
+    /// posed every frame); out of view it stands as it was last.
     /// </summary>
     [Icon("icon_skinnedmesh.png")]
     public class Cloth : Component
@@ -28,266 +32,161 @@ namespace Freefall.Components
         [Description("How it moves and what of it hangs free: a Cloth Settings asset, shared by the pieces that move alike. Empty = the defaults (a tabard's).")]
         public ClothSettings Settings;
 
-        /// <summary>Metres from the camera within which it is simulated.</summary>
-        public const float SimulatedWithin = 30f;
+        [Description("Only the parts of the mesh in this material slot are cloth; the rest (a banner's bar and irons) stays as it is. -1: all of it.")]
+        public int MaterialSlot = -1;
 
-        // The most particles a cloth may have (one thread group does them all)
-        private const int MostParticles = 16384;
-
-        /// <summary>Being simulated this frame.</summary>
+        /// <summary>Simulated this frame or the last.</summary>
         [Freefall.Reflection.DontSerialize]
-        public bool Simulating { get; private set; }
+        public bool Simulating => SimulatedTick >= Engine.TickCount - 1;
 
         /// <summary>Particles its mesh's LOD 0 makes (vertices at one place are one).</summary>
         [Freefall.Reflection.DontSerialize]
-        public int Particles => _mesh?.ParticleCount ?? 0;
+        public int Particles => ClothMesh?.ParticleCount ?? 0;
+
+        // ClothSystem's: its row in the system, the mesh made into cloth it simulates, the tick it was simulated last
+        internal int SystemIndex = -1;
+        internal ClothMesh? ClothMesh;
+        internal long SimulatedTick = long.MinValue;
 
         private SkinnedMeshRenderer _renderer;
+        private MeshRenderer _static;
+        private Entity _twin;
         private Animator _animator;
-        private ClothMesh _mesh;
-        private GraphicsBuffer _maxAway, _state, _output;
-        private readonly GraphicsBuffer[] _frames = new GraphicsBuffer[3];
-        private (float Anchor, float Slope, float Most, float Tether) _maxAwayFor;
-        private long _simulatedTick = -10;
-        private bool _shown;
 
-        private static ComputeShader s_compute;
-        private static int s_kernel;
-        private static long s_tick = -1;
+        // A static mesh's materials made over for the skinned effect, once each
+        private static readonly ConditionalWeakTable<Material, Material> s_twins = new();
+
+        /// <summary>The skinned renderer it moves (FindRenderer first).</summary>
+        internal SkinnedMeshRenderer Renderer => _renderer;
+
+        /// <summary>The Animator that poses it, on a character; null on a static mesh.</summary>
+        internal Animator Animator => _animator;
 
         public override void Destroy()
         {
-            Hide();
-            var device = Engine.Device;
-            device?.DeferDispose(_maxAway);
-            device?.DeferDispose(_state);
-            device?.DeferDispose(_output);
-            for (int i = 0; i < _frames.Length; i++)
-            {
-                device?.DeferDispose(_frames[i]);
-                _frames[i] = null;
-            }
-            _maxAway = _state = _output = null;
-            _mesh = null;
+            if (_twin != null && !_twin.Transform.IsDestroyed) _twin.Destroy();
+            _twin = null;
+            _renderer = null;
+            if (_static != null && !_static.IsDestroyed) _static.DrawnElsewhere = false;
+            _static = null;
+            ClothMesh = null;
         }
 
-        // ---- Every frame (DeferredRenderer, once a tick, before anything is drawn) ----
-
-        /// <summary>Every cloth near enough, a dispatch each: their places for this frame's draws and shadows.</summary>
-        internal static void SimulateAll(ID3D12GraphicsCommandList cmd)
+        /// <summary>
+        /// The skinned renderer the cloth moves: its own entity's, or for a static mesh a twin it makes under its entity
+        /// (DontSave) with the mesh and its materials made over for the skinned effect, the static one drawing nothing
+        /// meanwhile (PersistentRenderer.DrawnElsewhere, not saved).
+        /// </summary>
+        internal bool FindRenderer()
         {
-            if (s_tick == Engine.TickCount) return;
-            s_tick = Engine.TickCount;
+            if (_renderer != null && !_renderer.IsDestroyed) return true;
 
-            var all = ComponentCache<Cloth>.All;
-            if (all.Count == 0) return;
-
-            bool bound = false;
-            for (int i = 0; i < all.Count; i++)
+            _renderer = Entity.GetComponent<SkinnedMeshRenderer>();
+            if (_renderer != null)
             {
-                var cloth = all[i];
-                if (cloth == null || cloth.IsDestroyed) continue;
-                try
-                {
-                    if (!cloth.Ready())
-                    {
-                        cloth.Hide();
-                        continue;
-                    }
-                    if (!bound)
-                    {
-                        var device = Engine.Device;
-                        cmd.SetDescriptorHeaps(1, new[] { device.SrvHeap });
-                        cmd.SetComputeRootSignature(device.GlobalRootSignature);
-                        bound = true;
-                    }
-                    cloth.Simulate(cmd);
-                }
-                catch (Exception e)
-                {
-                    CallbackErrors.Report(cloth, nameof(Simulate), e);
-                    cloth.Hide();
-                }
-            }
-        }
-
-        // Near enough and posed every frame, its mesh made into cloth and its buffers there
-        private bool Ready()
-        {
-            _renderer ??= Entity.GetComponent<SkinnedMeshRenderer>();
-            var mesh = _renderer?.Mesh;
-            if (_renderer == null || mesh == null || !Enabled || !_renderer.Enabled) return false;
-
-            _animator ??= Entity.GetComponentInParents<Animator>();
-            if (_animator != null && _animator.PoseEvery != 1) return false;
-
-            var camera = Camera.Main;
-            if (camera == null || Vector3.DistanceSquared(camera.Position, Transform.WorldPosition) > SimulatedWithin * SimulatedWithin)
-                return false;
-
-            if (_mesh == null || _mesh.Mesh != mesh)
-            {
-                Destroy();
-                _mesh = ClothMesh.Of(mesh);
-            }
-            if (_mesh == null || _mesh.ParticleCount == 0 || _mesh.ParticleCount > MostParticles) return false;
-
-            if (s_compute == null)
-            {
-                s_compute = new ComputeShader("cloth.hlsl");
-                s_kernel = s_compute.FindKernel("CSCloth");
+                _animator ??= Entity.GetComponentInParents<Animator>();
+                return true;
             }
 
-            _state ??= GraphicsBuffer.CreateStructured<Vector4>(_mesh.ParticleCount * 6, uav: true);
-            _output ??= GraphicsBuffer.CreateStructured<Vector4>(_mesh.VertexCount * 2, srv: true, uav: true);
-            for (int i = 0; i < _frames.Length; i++)
-                _frames[i] ??= GraphicsBuffer.CreateUpload<FrameData>(1, mapped: true);
+            _static ??= Entity.GetComponent<MeshRenderer>();
+            var mesh = _static?.Mesh;
+            if (mesh == null) return false;
 
-            var settings = Settings ?? ClothSettings.Default;
-            var want = (settings.Anchor, settings.Slope, settings.MostAway, settings.Tether);
-            if (_maxAway == null || want != _maxAwayFor)
-            {
-                _maxAway ??= GraphicsBuffer.CreateUpload<Vector4>(_mesh.ParticleCount, mapped: true);
-                _mesh.WriteLimits(_maxAway, settings);
-                _maxAwayFor = want;
-            }
+            int slots = 0;
+            foreach (var part in mesh.MeshParts) slots = Math.Max(slots, part.MaterialSlot + 1);
+            var materials = new List<Material>(slots);
+            for (int slot = 0; slot < slots; slot++) materials.Add(Twin(_static.GetMaterial(slot)));
+
+            _twin = new Entity(Entity.Name + " (cloth)");
+            _twin.Flags |= EntityFlags.DontSave;
+            _twin.Transform.Parent = Transform;
+            _renderer = _twin.AddComponent(new SkinnedMeshRenderer { Mesh = mesh, Materials = materials });
+            _static.DrawnElsewhere = true;
             return true;
         }
 
-        private unsafe void Simulate(ID3D12GraphicsCommandList cmd)
+        /// <summary>A material made over for the skinned effect: its textures and values (Tint, emissive, detail).</summary>
+        private static Material Twin(Material material)
         {
-            var settings = Settings ?? ClothSettings.Default;
-            var world = _renderer.Transform.Matrix;
-            Matrix4x4.Invert(world, out var toObject);
-
-            // Started over where the bones put it: the first frame, after a pause
-            bool reset = Engine.TickCount - _simulatedTick > 2;
-            _simulatedTick = Engine.TickCount;
-
-            int substeps = Math.Clamp(settings.Substeps, 1, 8);
-            float frameSeconds = Math.Clamp(Time.SmoothDelta, 1f / 240f, 1f / 30f);
-
-            var frame = _frames[Engine.FrameIndex % _frames.Length];
-            var data = frame.WritePtr<FrameData>();
-            *data = new FrameData
+            var skinned = InternalAssets.SkinnedEffect;
+            if (material == null || skinned == null || material.Effect == skinned) return material;
+            return s_twins.GetValue(material, m =>
             {
-                World = world,
-                ToObject = toObject,
-                Gravity = new Vector3(0f, -9.81f, 0f),
-                Dt = frameSeconds / substeps,
-                Wind = Wind.Local,
-                Drag = settings.Drag,
-                Damping = settings.Damping,
-                Stiffness = settings.Stiffness,
-                Bending = settings.Bending,
-                Thickness = settings.Thickness,
-                Substeps = (uint)substeps,
-                Iterations = (uint)Math.Clamp(settings.Iterations, 1, 32),
-                Reset = reset ? 1u : 0u,
-                Backstop = settings.Backstop,
-            };
-
-            // The body without the clothes that are cloth, round cones as thick on average as its oval parts
-            uint parts = 0;
-            if (_animator != null && _animator.TryGetBareBodyFrames(out var body, out var frames))
-            {
-                for (int i = 0; i < body.Parts.Length && parts < FrameData.MostParts; i++)
-                {
-                    var part = body.Parts[i];
-                    float thick = MathF.Sqrt(part.Depth);
-                    var from = Vector3.Transform(part.From, frames[i]);
-                    var to = Vector3.Transform(part.To, frames[i]);
-                    int at = (int)parts * 4;
-                    data->PartFrom[at] = from.X; data->PartFrom[at + 1] = from.Y; data->PartFrom[at + 2] = from.Z;
-                    data->PartFrom[at + 3] = part.RadiusFrom * thick;
-                    data->PartTo[at] = to.X; data->PartTo[at + 1] = to.Y; data->PartTo[at + 2] = to.Z;
-                    data->PartTo[at + 3] = part.RadiusTo * thick;
-                    parts++;
-                }
-            }
-            data->PartCount = parts;
-
-            // Named without their "Idx" (ComputeShader drops it from the cbuffer's names)
-            var cs = s_compute;
-            cs.SetPushConstant("Particles", _mesh.Particles.SrvIndex);
-            cs.SetPushConstant("Links", _mesh.Links.SrvIndex);
-            cs.SetPushConstant("Vertices", _mesh.Vertices.SrvIndex);
-            cs.SetPushConstant("VertexTris", _mesh.VertexTris.SrvIndex);
-            cs.SetPushConstant("MaxAway", _maxAway.SrvIndex);
-            cs.SetPushConstant("StateUAV", _state.UavIndex);
-            cs.SetPushConstant("OutputUAV", _output.UavIndex);
-            cs.SetPushConstant("Frame", frame.SrvIndex);
-            cs.SetPushConstant("Bones", _renderer.BoneBufferIdx);
-            cs.SetPushConstant("ParticleCount", (uint)_mesh.ParticleCount);
-            cs.SetPushConstant("VertexCount", (uint)_mesh.VertexCount);
-
-            _state.Transition(cmd, ResourceStates.UnorderedAccess);
-            _output.Transition(cmd, ResourceStates.UnorderedAccess);
-            cs.Dispatch(s_kernel, cmd, 1);
-            _output.Transition(cmd, ResourceStates.NonPixelShaderResource);
-
-            // The vertex shaders read the places from now on (not saved with the renderer: a bindless index)
-            _renderer.WriteInstance("ClothVertices", new Vector4(_output.SrvIndex, 0f, 0f, 0f));
-            _renderer.WriteInstance("ClothFirst", new Vector4(_mesh.VertexFirst, 0f, 0f, 0f));
-            _renderer.WriteInstance("ClothCount", new Vector4(_mesh.VertexCount, 0f, 0f, 0f));
-            _shown = true;
-            Simulating = true;
-        }
-
-        // Plain skinning again
-        private void Hide()
-        {
-            Simulating = false;
-            if (!_shown) return;
-            _shown = false;
-            if (_renderer != null && !_renderer.IsDestroyed) _renderer.WriteInstance("ClothVertices", Vector4.Zero);
-        }
-
-        [StructLayout(LayoutKind.Sequential)]
-        private unsafe struct FrameData
-        {
-            public const int MostParts = 16;
-
-            public Matrix4x4 World;
-            public Matrix4x4 ToObject;
-            public Vector3 Gravity;
-            public float Dt;
-            public Vector3 Wind;
-            public float Drag;
-            public float Damping;
-            public float Stiffness;
-            public float Bending;
-            public float Thickness;
-            public uint Substeps;
-            public uint Iterations;
-            public uint PartCount;
-            public uint Reset;
-            public float Backstop;
-            public float Pad0, Pad1, Pad2;
-            public fixed float PartFrom[MostParts * 4];
-            public fixed float PartTo[MostParts * 4];
+                var twin = new Material(skinned);
+                foreach (var (name, texture) in m.Textures)
+                    if (texture != null) twin.SetTexture(name, texture);
+                foreach (var property in m.MaterialProperties)
+                    if (twin.GetProperty(property.Name) is { } own && own.ValueType == property.ValueType) own.CopyFrom(property);
+                return twin;
+            });
         }
     }
 
     /// <summary>
-    /// A mesh made into cloth, once per mesh (cloth.hlsl): its LOD 0's vertices welded into particles (vertices at one
-    /// place, seams in the UVs, are one), the links between them (the edges, and across two triangles to keep it from
-    /// folding), and for every vertex its particle and the triangles round it (for its normal). Up on the GPU in
-    /// upload buffers, written once.
+    /// A mesh (or one material slot of it) made into cloth, once (cloth.hlsl): its LOD 0's vertices welded into
+    /// particles (vertices at one place, seams in the UVs, are one), the links between them (the edges, and across two
+    /// triangles to keep it from folding), for every vertex of LOD 0 its particle and the triangles round it (its
+    /// normal), and for every vertex of the other LODs the particle nearest it, which it follows. Up on the GPU in
+    /// upload buffers, written once, and made again when the mesh's geometry is (a reimport replaces it in the same Mesh:
+    /// the old cloth's particles would be drawn over the new mesh's vertices).
     /// </summary>
     internal sealed class ClothMesh
     {
         public Mesh Mesh;
+        public int Slot;
+        public int Version;                 // the mesh's GeometryVersion it was made from
         public int ParticleCount, VertexFirst, VertexCount;
         public GraphicsBuffer Particles, Links, Vertices, VertexTris;
 
-        // Each particle's place in the rig's rest pose, and the hips' height, for what hangs free and the tethers
+        // Each particle's place at rest (the mesh's space), and the hips' height, for what hangs free and the tethers
         private Vector3[] _rest;
         private float _hipsY;
 
-        private static readonly ConditionalWeakTable<Mesh, ClothMesh> s_meshes = new();
+        // Each particle's limits by the settings that decide them, shared by every cloth of this mesh with those values
+        private readonly Dictionary<LimitsKey, GraphicsBuffer> _limits = new();
 
-        public static ClothMesh Of(Mesh mesh) => s_meshes.GetValue(mesh, Build);
+        private static readonly ConditionalWeakTable<Mesh, Dictionary<int, ClothMesh>> s_meshes = new();
+
+        public static ClothMesh Of(Mesh mesh, int slot)
+        {
+            var bySlot = s_meshes.GetOrCreateValue(mesh);
+            lock (bySlot)
+            {
+                if (bySlot.TryGetValue(slot, out var cloth) && cloth.Version == mesh.GeometryVersion) return cloth;
+                cloth?.Release();
+                bySlot[slot] = cloth = Build(mesh, slot);
+                return cloth;
+            }
+        }
+
+        // Its buffers, once the frames that read them are done
+        private void Release()
+        {
+            var device = Engine.Device;
+            device?.DeferDispose(Particles);
+            device?.DeferDispose(Links);
+            device?.DeferDispose(Vertices);
+            device?.DeferDispose(VertexTris);
+            foreach (var buffer in _limits.Values) device?.DeferDispose(buffer);
+            _limits.Clear();
+        }
+
+        /// <summary>What decides a particle's limits (WriteLimits), from a Cloth Settings asset.</summary>
+        public readonly record struct LimitsKey(ClothHold Held, float Anchor, Vector3 HeldToward, float HeldWithin, float Slope,
+                                                float MostAway, float Tether)
+        {
+            public static LimitsKey Of(ClothSettings s) => new(s.Held, s.Anchor, s.HeldToward, s.HeldWithin, s.Slope, s.MostAway, s.Tether);
+        }
+
+        /// <summary>Its particles' limits for these settings: made the first time they are asked for.</summary>
+        public GraphicsBuffer LimitsFor(LimitsKey key, ClothSettings settings)
+        {
+            if (_limits.TryGetValue(key, out var buffer)) return buffer;
+            buffer = GraphicsBuffer.CreateUpload<Vector4>(Math.Max(1, ParticleCount), mapped: true);
+            WriteLimits(buffer, settings);
+            _limits[key] = buffer;
+            return buffer;
+        }
 
         [StructLayout(LayoutKind.Sequential)]
         private struct Particle
@@ -297,7 +196,8 @@ namespace Freefall.Components
             public Vector4 BoneIds;
             public Vector4 Weights;
             public uint Count;
-            public uint Pad0, Pad1, Pad2;
+            public uint Vertex;   // a vertex of LOD 0 it is (relative to the range): where its normal is read from
+            public uint Pad0, Pad1;
         }
 
         [StructLayout(LayoutKind.Sequential)]
@@ -315,39 +215,50 @@ namespace Freefall.Components
             public uint X, Y, Z, W;
         }
 
-        private static ClothMesh Build(Mesh mesh)
+        // Vertices.W: a vertex of another LOD, which follows its particle
+        private const uint Follows = 2u;
+
+        private static ClothMesh Build(Mesh mesh, int slot)
         {
-            var cloth = new ClothMesh { Mesh = mesh };
+            var cloth = new ClothMesh { Mesh = mesh, Slot = slot, Version = mesh.GeometryVersion };
             var positions = mesh.Positions;
             var indices = mesh.CpuIndices;
             var weights = mesh.BoneWeights;
-            if (positions == null || indices == null || weights == null) return cloth;
+            if (positions == null || indices == null) return cloth;
 
-            // LOD 0's triangles, as vertex numbers
-            var parts = new List<int>();
+            // LOD 0's parts are simulated, the other LODs' follow; of the one material slot only, when one is named
+            var lod0 = new HashSet<int>();
             if (mesh.LODs.Count > 0)
             {
-                parts.AddRange(mesh.LODs[0].MeshPartIndices);
-                if (mesh.NonLodPartIndices != null) parts.AddRange(mesh.NonLodPartIndices);
+                foreach (int index in mesh.LODs[0].MeshPartIndices) lod0.Add(index);
+                if (mesh.NonLodPartIndices != null)
+                    foreach (int index in mesh.NonLodPartIndices) lod0.Add(index);
             }
             else
             {
-                for (int i = 0; i < mesh.MeshParts.Count; i++) parts.Add(i);
+                for (int i = 0; i < mesh.MeshParts.Count; i++) lod0.Add(i);
             }
 
             var triangles = new List<(int A, int B, int C)>();
+            var others = new List<int>();
             int first = int.MaxValue, last = -1;
-            foreach (int index in parts)
+            for (int index = 0; index < mesh.MeshParts.Count; index++)
             {
-                if ((uint)index >= (uint)mesh.MeshParts.Count) continue;
                 var part = mesh.MeshParts[index];
-                if (!part.Enabled) continue;
+                if (!part.Enabled || (slot >= 0 && part.MaterialSlot != slot)) continue;
+                bool simulated = lod0.Contains(index);
                 int end = Math.Min(part.BaseIndex + part.NumIndices, indices.Length) - 2;
                 for (int i = part.BaseIndex; i < end; i += 3)
                 {
                     int a = (int)indices[i] + part.BaseVertex, b = (int)indices[i + 1] + part.BaseVertex, c = (int)indices[i + 2] + part.BaseVertex;
                     if ((uint)a >= (uint)positions.Length || (uint)b >= (uint)positions.Length || (uint)c >= (uint)positions.Length) continue;
-                    triangles.Add((a, b, c));
+                    if (simulated) triangles.Add((a, b, c));
+                    else
+                    {
+                        others.Add(a);
+                        others.Add(b);
+                        others.Add(c);
+                    }
                     first = Math.Min(first, Math.Min(a, Math.Min(b, c)));
                     last = Math.Max(last, Math.Max(a, Math.Max(b, c)));
                 }
@@ -361,6 +272,7 @@ namespace Freefall.Components
             var byPlace = new Dictionary<(int, int, int), int>();
             var rest = new List<Vector3>();
             var bones = new List<BoneWeight>();
+            var vertexOf = new List<int>();
             int Weld(int vertex)
             {
                 int local = vertex - first;
@@ -372,7 +284,8 @@ namespace Freefall.Components
                     particle = rest.Count;
                     byPlace[key] = particle;
                     rest.Add(p);
-                    bones.Add(weights[vertex]);
+                    bones.Add(weights != null && vertex < weights.Length ? weights[vertex] : default);
+                    vertexOf.Add(local);
                 }
                 particleOf[local] = particle;
                 return particle;
@@ -417,19 +330,7 @@ namespace Freefall.Components
             foreach (var (_, far) in edges)
                 if (far.Count == 2) Join(far[0], far[1], true);
 
-            // Which way the triangles are wound: the normal most of them make points away from the line through the
-            // middle of the body (cloth hangs round it)
-            double outward = 0;
-            foreach (var t in welded)
-            {
-                var a = rest[t.A];
-                var normal = Vector3.Cross(rest[t.B] - a, rest[t.C] - a);
-                var centre = (a + rest[t.B] + rest[t.C]) / 3f;
-                outward += Vector3.Dot(normal, new Vector3(centre.X, 0f, centre.Z));
-            }
-            uint flip = outward < 0 ? 1u : 0u;
-
-            // Each vertex's triangles, as particles
+            // Each LOD 0 vertex's triangles, as particles
             var trianglesOf = new List<int>[vertexCount];
             for (int i = 0; i < welded.Count; i++)
             {
@@ -437,6 +338,50 @@ namespace Freefall.Components
                 (trianglesOf[t.Va - first] ??= new List<int>(6)).Add(i);
                 (trianglesOf[t.Vb - first] ??= new List<int>(6)).Add(i);
                 (trianglesOf[t.Vc - first] ??= new List<int>(6)).Add(i);
+            }
+
+            // The other LODs' vertices: the particle nearest each, by a grid of 5 cm cells over the particles
+            var follows = new int[vertexCount];
+            Array.Fill(follows, -1);
+            if (others.Count > 0)
+            {
+                const float Cell = 0.05f;
+                var grid = new Dictionary<(int, int, int), List<int>>();
+                (int, int, int) CellOf(Vector3 p) => ((int)MathF.Floor(p.X / Cell), (int)MathF.Floor(p.Y / Cell), (int)MathF.Floor(p.Z / Cell));
+                for (int i = 0; i < count; i++)
+                {
+                    var key = CellOf(rest[i]);
+                    if (!grid.TryGetValue(key, out var list)) grid[key] = list = new List<int>(4);
+                    list.Add(i);
+                }
+                foreach (int vertex in others)
+                {
+                    int local = vertex - first;
+                    if (particleOf[local] >= 0 || follows[local] >= 0) continue;
+                    var p = positions[vertex];
+                    var (cx, cy, cz) = CellOf(p);
+                    int best = -1;
+                    float nearest = float.MaxValue;
+                    for (int reach = 1; reach <= 8 && best < 0; reach *= 2)
+                        for (int x = cx - reach; x <= cx + reach; x++)
+                        for (int y = cy - reach; y <= cy + reach; y++)
+                        for (int z = cz - reach; z <= cz + reach; z++)
+                        {
+                            if (!grid.TryGetValue((x, y, z), out var list)) continue;
+                            foreach (int i in list)
+                            {
+                                float d = Vector3.DistanceSquared(p, rest[i]);
+                                if (d < nearest) { nearest = d; best = i; }
+                            }
+                        }
+                    if (best < 0)
+                        for (int i = 0; i < count; i++)
+                        {
+                            float d = Vector3.DistanceSquared(p, rest[i]);
+                            if (d < nearest) { nearest = d; best = i; }
+                        }
+                    follows[local] = best;
+                }
             }
 
             // Up onto the GPU
@@ -457,7 +402,11 @@ namespace Freefall.Components
                 for (int i = 0; i < count; i++)
                 {
                     var w = bones[i];
-                    particleData[i] = new Particle { Rest = rest[i], First = (uint)next, BoneIds = w.BoneIDs, Weights = w.Weights, Count = (uint)linksOf[i].Count };
+                    particleData[i] = new Particle
+                    {
+                        Rest = rest[i], First = (uint)next, BoneIds = w.BoneIDs, Weights = w.Weights,
+                        Count = (uint)linksOf[i].Count, Vertex = (uint)vertexOf[i],
+                    };
                     foreach (var link in linksOf[i]) linkData[next++] = link;
                 }
 
@@ -467,17 +416,17 @@ namespace Freefall.Components
                 for (int v = 0; v < vertexCount; v++)
                 {
                     var list = trianglesOf[v];
-                    if (particleOf[v] < 0 || list == null)
+                    if (particleOf[v] >= 0 && list != null)
                     {
-                        vertexData[v] = new UInt4 { X = uint.MaxValue };
-                        continue;
+                        vertexData[v] = new UInt4 { X = (uint)particleOf[v], Y = (uint)nextTri, Z = (uint)list.Count };
+                        foreach (int t in list)
+                        {
+                            var tri = welded[t];
+                            triData[nextTri++] = new UInt4 { X = (uint)tri.A, Y = (uint)tri.B, Z = (uint)tri.C };
+                        }
                     }
-                    vertexData[v] = new UInt4 { X = (uint)particleOf[v], Y = (uint)nextTri, Z = (uint)list.Count, W = flip };
-                    foreach (int t in list)
-                    {
-                        var tri = welded[t];
-                        triData[nextTri++] = new UInt4 { X = (uint)tri.A, Y = (uint)tri.B, Z = (uint)tri.C };
-                    }
+                    else if (follows[v] >= 0) vertexData[v] = new UInt4 { X = (uint)follows[v], W = Follows };
+                    else vertexData[v] = new UInt4 { X = uint.MaxValue };
                 }
             }
 
@@ -498,18 +447,28 @@ namespace Freefall.Components
         }
 
         /// <summary>
-        /// Each particle's limits, by the settings: how far it may leave its bones' place (by the line and the slope),
-        /// and its tether: the held particle nearest it at rest and how far from it it may get (-1: none).
+        /// Each particle's limits, by the settings: how far it may leave its held place (by its distance from the hips'
+        /// line, or from the held edge), and its tether: the held particle nearest it at rest and how far from it it may
+        /// get (-1: none).
         /// </summary>
-        public unsafe void WriteLimits(GraphicsBuffer buffer, ClothSettings settings)
+        private unsafe void WriteLimits(GraphicsBuffer buffer, ClothSettings settings)
         {
             var data = buffer.WritePtr<Vector4>();
-            float line = _hipsY + settings.Anchor;
             var most = new float[ParticleCount];
+
+            // How far each particle is from what holds it
+            var toward = settings.HeldToward.LengthSquared() > 1e-8f ? Vector3.Normalize(settings.HeldToward) : Vector3.UnitY;
+            float edge = float.MinValue;
+            if (settings.Held == ClothHold.Edge)
+                for (int i = 0; i < ParticleCount; i++) edge = MathF.Max(edge, Vector3.Dot(_rest[i], toward));
+
             var held = new List<int>();
             for (int i = 0; i < ParticleCount; i++)
             {
-                most[i] = Math.Clamp((line - _rest[i].Y) * settings.Slope, 0f, settings.MostAway);
+                float away = settings.Held == ClothHold.Edge
+                    ? edge - settings.HeldWithin - Vector3.Dot(_rest[i], toward)
+                    : _hipsY + settings.Anchor - _rest[i].Y;
+                most[i] = Math.Clamp(away * settings.Slope, 0f, settings.MostAway);
                 if (most[i] <= 0f) held.Add(i);
             }
 

@@ -139,18 +139,43 @@ namespace Freefall.Components
         }
 
         /// <summary>
-        /// Writes an instance value where the draws read it without keeping it as the object's own: not saved, and gone
-        /// (the effect's default again) at the next refresh of the slots. For what only the running game knows, written
-        /// again every frame it holds: a bindless index (Cloth's vertices) saved with a scene would name some other
-        /// resource after the next load.
+        /// Writes an instance value where the draws read it without keeping it as the object's own: not saved, but kept
+        /// for the running game and written again into every slot made later (a refresh of the draws), until
+        /// <see cref="ForgetInstance"/>. For what only the running game knows: a bindless index (ClothSystem's pool)
+        /// saved with a scene would name some other resource after the next load. Write it when it changes.
         /// </summary>
         internal void WriteInstance(string name, Vector4 value)
         {
+            _runtimeInstance ??= new List<InstanceValue>();
+            int index = IndexOf(_runtimeInstance, name);
+            if (index >= 0) _runtimeInstance[index].Value = value;
+            else _runtimeInstance.Add(new InstanceValue { Name = name, Value = value });
+
             foreach (var (effect, slot) in _instanceSlots)
             {
                 var member = effect.InstanceParams.Find(p => p.Name == name);
                 if (member != null) InstanceData.Write(slot, member, value);
             }
+        }
+
+        /// <summary>Drops a value written by <see cref="WriteInstance"/>: the object's own or the effect's default again.</summary>
+        internal void ForgetInstance(string name)
+        {
+            if (_runtimeInstance == null) return;
+            int index = IndexOf(_runtimeInstance, name);
+            if (index < 0) return;
+            _runtimeInstance.RemoveAt(index);
+            foreach (var (effect, slot) in _instanceSlots) WriteInstanceSlot(effect, slot);
+        }
+
+        // Values the running game wrote (WriteInstance): never saved
+        private List<InstanceValue>? _runtimeInstance;
+
+        private static int IndexOf(List<InstanceValue> values, string name)
+        {
+            for (int i = 0; i < values.Count; i++)
+                if (values[i].Name == name) return i;
+            return -1;
         }
 
         public void SetInstance(string name, float value) => SetInstance(name, new Vector4(value, 0f, 0f, 0f));
@@ -213,7 +238,7 @@ namespace Freefall.Components
             return made;
         }
 
-        // Defaults first, then this object's own values, in the effect's layout
+        // Defaults first, then this object's own values, then the running game's, in the effect's layout
         private void WriteInstanceSlot(Effect effect, int slot)
         {
             InstanceData.WriteDefaults(slot, effect.InstanceParams);
@@ -221,6 +246,12 @@ namespace Freefall.Components
             {
                 var member = effect.InstanceParams.Find(p => p.Name == own.Name);
                 if (member != null) InstanceData.Write(slot, member, own.Value);
+            }
+            if (_runtimeInstance == null) return;
+            foreach (var runtime in _runtimeInstance)
+            {
+                var member = effect.InstanceParams.Find(p => p.Name == runtime.Name);
+                if (member != null) InstanceData.Write(slot, member, runtime.Value);
             }
         }
 
@@ -270,6 +301,24 @@ namespace Freefall.Components
             BoundingSphere = new BoundingSphere(center, MathF.Sqrt(radiusSquared));
         }
 
+        // Drawn by something else for the time being (Cloth's skinned twin of a mesh): no draws of its own. Not saved
+        private bool _drawnElsewhere;
+
+        /// <summary>
+        /// Something else draws this object for now (Cloth draws a static mesh as a skinned twin it can move): it
+        /// registers no draws of its own. Runtime only, never saved; whoever sets it clears it.
+        /// </summary>
+        internal bool DrawnElsewhere
+        {
+            get => _drawnElsewhere;
+            set
+            {
+                if (_drawnElsewhere == value) return;
+                _drawnElsewhere = value;
+                Invalidate();
+            }
+        }
+
         /// <summary>
         /// Queue a RefreshDraws before the next frame is rendered. Thread-safe and cheap to call
         /// repeatedly: only the first call until the refresh runs queues anything.
@@ -304,7 +353,7 @@ namespace Freefall.Components
             Unregister();
 
             var mesh = RenderMesh;
-            if (!_live || !Enabled || mesh == null || Transform == null) return;
+            if (!_live || !Enabled || _drawnElsewhere || mesh == null || Transform == null) return;
 
             int slot = Transform.TransformSlot;
             if (slot < 0)

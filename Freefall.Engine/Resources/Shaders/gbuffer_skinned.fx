@@ -51,9 +51,10 @@ struct BoneWeight
 // cloth.hlsl) hands over where its vertices are this frame, written by the running game and never saved.
 struct Instance
 {
-    uint ClothVertices;      //= 0               -- The cloth's places and normals this frame (bindless, 2 float4 a vertex); 0 = skinned. Set by Cloth while it is simulated.
+    uint ClothVertices;      //= 0               -- The cloth's places and normals this frame (bindless, 2 float4 a vertex); 0 = skinned. Set by ClothSystem while it is simulated.
     uint ClothFirst;         //= 0               -- The first vertex they hold
     uint ClothCount;         //= 0               -- How many vertices they hold
+    uint ClothBase;          //= 0               -- Where they start in that buffer (float4s): every cloth shares one pool
 };
 
 Instance LoadInstance(uint slot)
@@ -73,11 +74,11 @@ bool ClothVertex(uint slot, uint vertexID, out float3 pos, out float3 norm)
     if (inst.ClothVertices == 0u || vertexID < inst.ClothFirst || local >= inst.ClothCount)
         return false;
     StructuredBuffer<float4> cloth = ResourceDescriptorHeap[NonUniformResourceIndex(inst.ClothVertices)];
-    float4 place = cloth[local * 2u];
+    float4 place = cloth[inst.ClothBase + local * 2u];
     if (place.w <= 0.0)
         return false;
     pos = place.xyz;
-    norm = cloth[local * 2u + 1u].xyz;
+    norm = cloth[inst.ClothBase + local * 2u + 1u].xyz;
     return true;
 }
 
