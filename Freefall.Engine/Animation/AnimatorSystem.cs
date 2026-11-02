@@ -130,6 +130,9 @@ namespace Freefall.Animation
 
                     if (animator.PartsChanged || animator.Unmeasured) Measure(animator);
 
+                    // A body that has fallen: its parts' poses for this frame, and the entity under its pelvis
+                    animator.Ragdoll?.Sample();
+
                     int every = bySize && view.Valid && !animator.Previewing ? Every(animator, view) : 1;
                     animator.PoseEvery = every;
 
@@ -138,7 +141,11 @@ namespace Freefall.Animation
                     bool due = animator.Parts.Count > 0 && (animator.PosedFrame < 0
                         || every > 0 && ((frame + animator.Stagger) % every == 0 || frame - animator.PosedFrame > every));
                     animator.PoseDue = due;
-                    if (due) posed++;
+                    if (due)
+                    {
+                        posed++;
+                        animator.NotePose();
+                    }
 
                     // Not drawn: the state machine too only by turns, by the time since its last step
                     animator.Unstepped += Time.SmoothDelta;

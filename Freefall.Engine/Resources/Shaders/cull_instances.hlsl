@@ -201,7 +201,7 @@ struct MeshPartEntry
     uint IndexBufferAddressLo;  // the mesh's index buffer (IndexedDrawCommand)
     uint IndexBufferAddressHi;
     uint IndexBufferBytes;
-    uint Reserved8;
+    uint CullBone;              // a skinned part's bone with most of its vertices + 1, 0 = none (SkinnedCentre)
     uint Reserved9;
 };
 
@@ -334,6 +334,18 @@ void WriteInstanceBounds(uint instanceIdx, float3 center, float radius, uint par
     bounds[instanceIdx] = b;
 }
 
+// A part's sphere centre in its mesh's space. Skinned and posed: put through the skinning matrix of the bone that
+// carries most of the part (MeshPartEntry.CullBone), as the vertex shader moves its vertices; the bind pose's centre
+// held a body lying where it fell to where its parts stood, and its head was culled by the head's place standing.
+float3 SkinnedCentre(uint boneBufferIdx, MeshPartEntry part)
+{
+    float3 centre = part.LocalBounds.xyz;
+    if (boneBufferIdx == 0u || part.CullBone == 0u)
+        return centre;
+    StructuredBuffer<row_major float4x4> bones = ResourceDescriptorHeap[NonUniformResourceIndex(boneBufferIdx)];
+    return mul(float4(centre, 1.0), bones[part.CullBone - 1u]).xyz;
+}
+
 // A shadow caster's world sphere and LOD part (returned; INVALID_PART = not drawn at this LOD) from its descriptor,
 // transform, LOD chain and mesh registry entry: what CSVisibility does before it writes InstanceBounds.
 uint GatherShadowCasterSphere(uint instanceIdx, out float3 worldCenter, out float worldRadius)
@@ -357,9 +369,10 @@ uint GatherShadowCasterSphere(uint instanceIdx, out float3 worldCenter, out floa
         return INVALID_PART;
 
     float4 localSphere = meshRegistry[meshPartId].LocalBounds;
-    worldCenter = mul(float4(localSphere.xyz, 1.0), world).xyz;
+    uint boneBufferIdx = descriptors[instanceIdx].BoneBufferIdx;
+    worldCenter = mul(float4(SkinnedCentre(boneBufferIdx, meshRegistry[meshPartId]), 1.0), world).xyz;
     worldRadius = localSphere.w * sqrt(maxScaleSq);
-    if (descriptors[instanceIdx].BoneBufferIdx != 0)
+    if (boneBufferIdx != 0)
         worldRadius *= 1.5; // skinned: the bind-pose bounds do not hold the animated pose
     return meshPartId;
 }
@@ -899,8 +912,14 @@ void CSVisibility(uint3 dispatchThreadId : SV_DispatchThreadID)
     // Look up local bounding sphere from mesh registry (persistent, not per-instance)
     float4 localSphere = meshRegistry[testPart].LocalBounds;
 
-    // Transform sphere to world space
-    float3 worldCenter = mul(float4(localSphere.xyz, 1.0), world).xyz;
+    // Transform sphere to world space; a skinned part's centre goes with its bone first
+    uint boneBufferIdx = 0u;
+    if (skinned)
+    {
+        StructuredBuffer<InstanceDescriptor> descriptors = ResourceDescriptorHeap[DescriptorBufferIdx];
+        boneBufferIdx = descriptors[instanceIdx].BoneBufferIdx;
+    }
+    float3 worldCenter = mul(float4(SkinnedCentre(boneBufferIdx, meshRegistry[testPart]), 1.0), world).xyz;
     float worldRadius = localSphere.w * sqrt(maxScaleSq);
 
     // For the shadow culling, which draws one part: the one faded from until the middle of a crossfade.
@@ -914,7 +933,7 @@ void CSVisibility(uint3 dispatchThreadId : SV_DispatchThreadID)
     {
         float4 shadowSphere = meshRegistry[shadowPart].LocalBounds;
         float shadowRadius = shadowSphere.w * sqrt(maxScaleSq);
-        WriteInstanceBounds(instanceIdx, mul(float4(shadowSphere.xyz, 1.0), world).xyz,
+        WriteInstanceBounds(instanceIdx, mul(float4(SkinnedCentre(boneBufferIdx, meshRegistry[shadowPart]), 1.0), world).xyz,
                             skinned ? shadowRadius * 1.5 : shadowRadius, shadowPart);
     }
 
@@ -1498,9 +1517,9 @@ void CSVisibilityShadow(uint3 dispatchThreadId : SV_DispatchThreadID)
         return;
     }
 
-    // Bounding sphere from mesh registry, transformed to world space
+    // Bounding sphere from mesh registry, transformed to world space (a skinned part's centre with its bone first)
     float4 localSphere = meshRegistry[meshPartId].LocalBounds;
-    float3 worldCenter = mul(float4(localSphere.xyz, 1.0), world).xyz;
+    float3 worldCenter = mul(float4(SkinnedCentre(descriptors[instanceIdx].BoneBufferIdx, meshRegistry[meshPartId]), 1.0), world).xyz;
     float worldRadius = localSphere.w * sqrt(maxScaleSq);
 
     // For skinned meshes (BoneBufferIdx != 0), the bounding sphere is static (bind pose)

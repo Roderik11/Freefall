@@ -138,6 +138,21 @@ namespace Freefall.Components
             }
         }
 
+        /// <summary>
+        /// Writes an instance value where the draws read it without keeping it as the object's own: not saved, and gone
+        /// (the effect's default again) at the next refresh of the slots. For what only the running game knows, written
+        /// again every frame it holds: a bindless index (Cloth's vertices) saved with a scene would name some other
+        /// resource after the next load.
+        /// </summary>
+        internal void WriteInstance(string name, Vector4 value)
+        {
+            foreach (var (effect, slot) in _instanceSlots)
+            {
+                var member = effect.InstanceParams.Find(p => p.Name == name);
+                if (member != null) InstanceData.Write(slot, member, value);
+            }
+        }
+
         public void SetInstance(string name, float value) => SetInstance(name, new Vector4(value, 0f, 0f, 0f));
         public void SetInstance(string name, Vector2 value) => SetInstance(name, new Vector4(value, 0f, 0f));
         public void SetInstance(string name, Vector3 value) => SetInstance(name, new Vector4(value, 0f));

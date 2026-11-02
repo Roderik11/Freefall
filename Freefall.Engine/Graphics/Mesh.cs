@@ -896,6 +896,7 @@ namespace Freefall.Graphics
         /// </summary>
         public void ReplaceGeometry(Mesh source)
         {
+            _cullBones = null;
             (_posBuffer, source._posBuffer) = (source._posBuffer, _posBuffer);
             (_normBuffer, source._normBuffer) = (source._normBuffer, _normBuffer);
             (_uvBuffer, source._uvBuffer) = (source._uvBuffer, _uvBuffer);
@@ -999,6 +1000,58 @@ namespace Freefall.Graphics
         /// </summary>
         public void Draw(ID3D12GraphicsCommandList commandList) => DrawIndexed(commandList);
         
+        // Per part, the bone that carries most of its vertices + 1 (0: none), worked out once
+        private uint[]? _cullBones;
+
+        /// <summary>
+        /// The bone that carries most of a skinned part's vertices, + 1; 0 for a part without bone weights. The GPU
+        /// culler puts the part's bind-pose sphere through that bone's skinning matrix (MeshRegistry.MeshPartEntry).
+        /// </summary>
+        internal uint CullBoneOf(int partIndex)
+        {
+            var weights = BoneWeights;
+            var indices = CpuIndices;
+            if (weights == null || indices == null || (uint)partIndex >= (uint)MeshParts.Count) return 0;
+
+            var bones = _cullBones;
+            if (bones == null || bones.Length != MeshParts.Count)
+            {
+                bones = new uint[MeshParts.Count];
+                var sums = new Dictionary<int, float>();
+                for (int p = 0; p < bones.Length; p++)
+                {
+                    sums.Clear();
+                    var part = MeshParts[p];
+                    int end = Math.Min(part.BaseIndex + part.NumIndices, indices.Length);
+                    for (int i = part.BaseIndex; i < end; i++)
+                    {
+                        long v = indices[i] + (long)part.BaseVertex;
+                        if ((ulong)v >= (ulong)weights.Length) continue;
+                        var w = weights[v];
+                        Add(sums, w.BoneIDs.X, w.Weights.X);
+                        Add(sums, w.BoneIDs.Y, w.Weights.Y);
+                        Add(sums, w.BoneIDs.Z, w.Weights.Z);
+                        Add(sums, w.BoneIDs.W, w.Weights.W);
+                    }
+
+                    int best = -1;
+                    float most = 0f;
+                    foreach (var (bone, sum) in sums)
+                        if (sum > most) { most = sum; best = bone; }
+                    bones[p] = best >= 0 ? (uint)best + 1u : 0u;
+                }
+                _cullBones = bones;
+            }
+            return bones[partIndex];
+
+            static void Add(Dictionary<int, float> sums, float bone, float weight)
+            {
+                if (weight <= 0f) return;
+                int index = (int)bone;
+                sums[index] = sums.TryGetValue(index, out float sum) ? sum + weight : weight;
+            }
+        }
+
         public void CreateBoneWeightBuffer(GraphicsDevice device)
         {
             if (BoneWeights == null || BoneWeights.Length == 0) return;

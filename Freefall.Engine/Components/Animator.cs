@@ -21,7 +21,7 @@ namespace Freefall.Components
     /// disabled Animator does neither and keeps its pose.
     /// </summary>
     [Icon("icon_animator.png")]
-    public class Animator : Component
+    public class Animator : Component, ISceneGizmo
     {
         /// <summary>The animation state machine (shared definition).</summary>
         public Animation.Animation Animation;
@@ -349,6 +349,7 @@ namespace Freefall.Components
             if (_partsVersion != AnimatorSystem.PartsVersion) FindParts();
             StepDelta = Time.SmoothDelta;
             Step();
+            NotePose();
             Pose(1);
         }
 
@@ -674,10 +675,59 @@ namespace Freefall.Components
 
         // ---- Where the bones are: for what hangs on the character ----
 
-        // Model matrices of the character's skeleton as last posed; kept once someone has asked
-        private bool _keepBonePoses;
+        // Model matrices of the character's skeleton as last posed. Kept from the start: the body's parts (hitboxes)
+        // are asked for by whatever flies near, and a character asked only then would have none for a pose
+        private bool _keepBonePoses = true;
         private Matrix4x4[] _bonePoses;
         private Skeleton _bonePoseSkeleton;
+
+        // The pose before that, and for both where the entity was and when (Time.TotalTime): how fast each part moved.
+        // The next pose's are noted on the main thread before the poses (NotePose), for the pose on its worker
+        private Matrix4x4[] _previousBonePoses;
+        private Matrix4x4 _poseWorld, _previousPoseWorld, _nextPoseWorld;
+        private float _poseTime, _previousPoseTime, _nextPoseTime;
+
+        /// <summary>Where the entity is and the time, for the pose about to be made. Main thread.</summary>
+        internal void NotePose()
+        {
+            _nextPoseWorld = Transform.Matrix;
+            _nextPoseTime = Base.Time.TotalTime;
+        }
+
+        /// <summary>
+        /// How fast each part of the body moved between the last two poses, in the world: metres and radians a second.
+        /// What a body that falls carries on with (Ragdoll): a runner's trunk goes on forwards, an arm on with its swing.
+        /// False without two poses close enough in time (a character not seen for a while).
+        /// </summary>
+        internal bool TryGetBodyMotion(BodyShape body, Vector3[] linear, Vector3[] angular)
+        {
+            var now = _bonePoses;
+            var before = _previousBonePoses;
+            float span = _poseTime - _previousPoseTime;
+            int count = body.Parts.Length;
+            if (now == null || before == null || before.Length != now.Length || span <= 1e-4f || span > 0.3f
+                || linear.Length < count || angular.Length < count)
+                return false;
+
+            var then = new Matrix4x4[count];
+            var frames = new Matrix4x4[count];
+            if (!body.Frames(before, _previousPoseWorld, then) || !body.Frames(now, _poseWorld, frames)) return false;
+
+            for (int i = 0; i < count; i++)
+            {
+                Matrix4x4.Decompose(then[i], out _, out var turnBefore, out var atBefore);
+                Matrix4x4.Decompose(frames[i], out _, out var turn, out var at);
+                linear[i] = (at - atBefore) / span;
+
+                // The turn between them, in the world, as an axis times its angle
+                var delta = Quaternion.Normalize(turn * Quaternion.Inverse(turnBefore));
+                if (delta.W < 0f) delta = Quaternion.Negate(delta);
+                float half = MathF.Acos(Math.Clamp(delta.W, -1f, 1f));
+                float sin = MathF.Sin(half);
+                angular[i] = sin > 1e-5f ? new Vector3(delta.X, delta.Y, delta.Z) / sin * (2f * half / span) : Vector3.Zero;
+            }
+            return true;
+        }
 
         private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<Skeleton, Dictionary<HumanoidBone, int>> s_humanoid = new();
 
@@ -828,6 +878,247 @@ namespace Freefall.Components
 
             frame = Matrix4x4.CreateFromQuaternion(Quaternion.Normalize(rotation)) * Matrix4x4.CreateTranslation(position);
             return true;
+        }
+
+        // ---- The body: what a blow meets ----
+
+        /// <summary>The ragdoll on the character (Ragdoll), whose bodies the parts' bones follow while it is down.</summary>
+        internal Ragdoll Ragdoll;
+
+        // The shape fitted from the meshes it wears, the key of that set, and its parts in the world as last asked
+        private BodyShape _body;
+        private ulong _bodyKey;
+        private readonly List<Mesh> _bodyMeshes = new();
+        private Matrix4x4[] _bodyFrames;
+        private long _bodyFramesPosed = -1;
+        private Matrix4x4 _bodyFramesWorld;
+
+        /// <summary>
+        /// The shape of the character's body as the meshes it wears make it (<see cref="BodyShape"/>), or null: a
+        /// skeleton that is not a humanoid's, or a character not posed yet. Fitted again when it changes clothes.
+        /// Asking keeps the bone poses from then on. Main thread.
+        /// </summary>
+        [Freefall.Reflection.DontSerialize]
+        public BodyShape Body
+        {
+            get
+            {
+                _keepBonePoses = true;
+                var skeleton = _bonePoseSkeleton;
+                if (skeleton == null) return null;
+
+                // The shown meshes it wears now, as a key
+                ulong key = 14695981039346656037UL ^ (ulong)System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(skeleton);
+                for (int i = 0; i < _parts.Count; i++)
+                {
+                    var smr = _parts[i];
+                    var mesh = smr.IsDestroyed || !smr.Enabled ? null : smr.Mesh;
+                    if (mesh != null) key = (key ^ (ulong)mesh.GetInstanceId()) * 1099511628211UL;
+                }
+
+                if (key != _bodyKey || (_body != null && !ReferenceEquals(_body.Skeleton, skeleton)))
+                {
+                    _bodyMeshes.Clear();
+                    for (int i = 0; i < _parts.Count; i++)
+                    {
+                        var smr = _parts[i];
+                        if (!smr.IsDestroyed && smr.Enabled && smr.Mesh != null) _bodyMeshes.Add(smr.Mesh);
+                    }
+                    _body = _bodyMeshes.Count > 0 ? BodyShape.Of(skeleton, _bodyMeshes, key) : null;
+                    _bodyKey = key;
+                    _bodyFramesPosed = -1;
+                }
+                return _body;
+            }
+        }
+
+        /// <summary>
+        /// The body's parts in the world as the character was last posed (<see cref="BodyShape.Frames"/>). False with
+        /// no <see cref="Body"/>, and before the first pose after it was first asked for: a character too small to be
+        /// drawn has none, and whoever asks keeps to a capsule. Main thread.
+        /// </summary>
+        public bool TryGetBodyFrames(out BodyShape body, out Matrix4x4[] frames)
+        {
+            frames = null;
+            body = Body;
+            var poses = _bonePoses;
+            if (body == null || poses == null || !ReferenceEquals(_bonePoseSkeleton, body.Skeleton)) return false;
+
+            var world = Transform.Matrix;
+            if (_bodyFrames == null || _bodyFrames.Length != body.Parts.Length)
+            {
+                _bodyFrames = new Matrix4x4[body.Parts.Length];
+                _bodyFramesPosed = -1;
+            }
+            if (_bodyFramesPosed != PosedFrame || world != _bodyFramesWorld)
+            {
+                if (!body.Frames(poses, world, _bodyFrames)) return false;
+                _bodyFramesPosed = PosedFrame;
+                _bodyFramesWorld = world;
+            }
+            frames = _bodyFrames;
+            return true;
+        }
+
+        // The body without the clothes that move as cloth, for those to fall against (Cloth): fitted with them, a tabard's
+        // flaps would be inside the thighs it hangs over
+        private BodyShape _bareBody;
+        private ulong _bareKey;
+        private Matrix4x4[] _bareFrames;
+        private long _bareFramesPosed = -1;
+        private Matrix4x4 _bareFramesWorld;
+
+        /// <summary>
+        /// The body's parts in the world as last posed, fitted from the meshes that are not cloth (renderers without a
+        /// <see cref="Cloth"/>): what cloth falls against. Main thread.
+        /// </summary>
+        internal bool TryGetBareBodyFrames(out BodyShape body, out Matrix4x4[] frames)
+        {
+            frames = null;
+            body = null;
+            var skeleton = _bonePoseSkeleton;
+            var poses = _bonePoses;
+            if (skeleton == null || poses == null) return false;
+
+            // Keyed as Body is: without cloth on the character, both are the same fit
+            ulong key = 14695981039346656037UL ^ (ulong)System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(skeleton);
+            for (int i = 0; i < _parts.Count; i++)
+            {
+                var smr = _parts[i];
+                var mesh = smr.IsDestroyed || !smr.Enabled || smr.Entity?.GetComponent<Cloth>() != null ? null : smr.Mesh;
+                if (mesh != null) key = (key ^ (ulong)mesh.GetInstanceId()) * 1099511628211UL;
+            }
+            if (key != _bareKey || _bareBody == null || !ReferenceEquals(_bareBody.Skeleton, skeleton))
+            {
+                var meshes = new List<Mesh>();
+                for (int i = 0; i < _parts.Count; i++)
+                {
+                    var smr = _parts[i];
+                    if (!smr.IsDestroyed && smr.Enabled && smr.Mesh != null && smr.Entity?.GetComponent<Cloth>() == null) meshes.Add(smr.Mesh);
+                }
+                _bareBody = meshes.Count > 0 ? BodyShape.Of(skeleton, meshes, key) : null;
+                _bareKey = key;
+                _bareFramesPosed = -1;
+            }
+            body = _bareBody;
+            if (body == null) return false;
+
+            var world = Transform.Matrix;
+            if (_bareFrames == null || _bareFrames.Length != body.Parts.Length)
+            {
+                _bareFrames = new Matrix4x4[body.Parts.Length];
+                _bareFramesPosed = -1;
+            }
+            if (_bareFramesPosed != PosedFrame || world != _bareFramesWorld)
+            {
+                if (!body.Frames(poses, world, _bareFrames)) return false;
+                _bareFramesPosed = PosedFrame;
+                _bareFramesWorld = world;
+            }
+            frames = _bareFrames;
+            return true;
+        }
+
+        /// <summary>
+        /// The first part of the body a ray meets (from <paramref name="origin"/> along <paramref name="direction"/>,
+        /// up to <paramref name="distance"/>; <paramref name="thickness"/> thick), in the world: hitboxes. False when
+        /// it meets none, and when there is no posed body to meet (<see cref="TryGetBodyFrames"/>).
+        /// </summary>
+        public bool RaycastBody(Vector3 origin, Vector3 direction, float distance, float thickness, out BodyHit hit)
+        {
+            hit = default;
+            float length = direction.Length();
+            if (length < 1e-8f || !TryGetBodyFrames(out var body, out var frames)) return false;
+            return body.Raycast(frames, origin, direction / length, distance, thickness, out hit);
+        }
+
+        /// <summary>
+        /// The part of the body a stretch touches (from <paramref name="a"/> to <paramref name="b"/>,
+        /// <paramref name="thickness"/> thick, going <paramref name="travel"/>), in the world: a blade's edge between
+        /// two frames. False when it touches none, and when there is no posed body.
+        /// </summary>
+        public bool TouchesBody(Vector3 a, Vector3 b, float thickness, Vector3 travel, out BodyHit hit)
+        {
+            hit = default;
+            if (!TryGetBodyFrames(out var body, out var frames)) return false;
+            return body.Touches(frames, a, b, thickness, travel, out hit);
+        }
+
+        /// <summary>Draw the body's parts while the character is selected (the hitboxes, as posed last).</summary>
+        [Freefall.Reflection.DontSerialize]
+        public bool ShowBody { get; set; }
+
+        public void DrawGizmos(GizmoContext ctx)
+        {
+            if (!ShowBody || !TryGetBodyFrames(out var body, out var frames)) return;
+
+            var saved = ctx.Matrix;
+            var color = ctx.Color;
+            ctx.Matrix = Matrix4x4.Identity;
+            for (int i = 0; i < body.Parts.Length; i++)
+            {
+                var part = body.Parts[i];
+                ctx.Color = part.Zone switch
+                {
+                    BodyZone.Head => new Vortice.Mathematics.Color4(1f, 0.3f, 0.3f, 1f),
+                    BodyZone.Torso => new Vortice.Mathematics.Color4(1f, 0.85f, 0.3f, 1f),
+                    BodyZone.Arm => new Vortice.Mathematics.Color4(0.4f, 0.8f, 1f, 1f),
+                    _ => new Vortice.Mathematics.Color4(0.5f, 1f, 0.5f, 1f),
+                };
+                DrawPart(ctx, part, frames[i]);
+            }
+            ctx.Matrix = saved;
+            ctx.Color = color;
+        }
+
+        // A part as rings at its ends and halfway, joined by four lines, and its round ends as arcs
+        private static void DrawPart(GizmoContext ctx, BodyPart part, in Matrix4x4 frame)
+        {
+            const int Segments = 16;
+            var from = Vector3.Transform(part.From, frame);
+            var to = Vector3.Transform(part.To, frame);
+            var forward = Vector3.TransformNormal(part.Forward, frame) * part.Depth;
+            var across = Vector3.TransformNormal(part.Across, frame);
+            var axis = to - from;
+            float length = axis.Length();
+            axis = length > 1e-6f ? axis / length : Vector3.UnitY;
+
+            Vector3 Ring(Vector3 centre, float radius, float angle)
+                => centre + (across * MathF.Cos(angle) + forward * MathF.Sin(angle)) * radius;
+
+            for (int ring = 0; ring < 3; ring++)
+            {
+                float t = ring * 0.5f;
+                var centre = Vector3.Lerp(from, to, t);
+                float radius = part.RadiusFrom + (part.RadiusTo - part.RadiusFrom) * t;
+                for (int s = 0; s < Segments; s++)
+                    ctx.DrawLine(Ring(centre, radius, s * MathF.Tau / Segments), Ring(centre, radius, (s + 1) * MathF.Tau / Segments));
+            }
+            for (int s = 0; s < 4; s++)
+            {
+                float angle = s * MathF.PI * 0.5f;
+                ctx.DrawLine(Ring(from, part.RadiusFrom, angle), Ring(to, part.RadiusTo, angle));
+            }
+
+            // Half rings over each end, across and front to back
+            for (int end = 0; end < 2; end++)
+            {
+                var centre = end == 0 ? from : to;
+                float radius = end == 0 ? part.RadiusFrom : part.RadiusTo;
+                var outward = (end == 0 ? -axis : axis) * radius;
+                for (int plane = 0; plane < 2; plane++)
+                {
+                    var side = (plane == 0 ? across : forward) * radius;
+                    var last = centre + side;
+                    for (int s = 1; s <= Segments / 2; s++)
+                    {
+                        float angle = s * MathF.PI / (Segments / 2);
+                        var next = centre + side * MathF.Cos(angle) + outward * MathF.Sin(angle);
+                        ctx.DrawLine(last, next);
+                        last = next;
+                    }
+                }
+            }
         }
 
         // In the model space of the skeleton root motion is taken from
@@ -1901,11 +2192,22 @@ namespace Freefall.Components
                 feet.Solve(legs, bones, flipXZ, leftDown, rightDown, own, Base.Time.SmoothDelta * _poseGap);
             }
 
+            // Fallen as a body: the parts' bones lie as the ragdoll does, before anything reads the pose
+            var ragdoll = Ragdoll;
+            if (ragdoll != null && ragdoll.Posing && !_previewing) ragdoll.Apply(target, bones);
+
             OnPostHierarchy?.Invoke(skeleton, bones);
 
             // For TryGetBonePose
             if (_keepBonePoses && own)
             {
+                // The pose kept until now becomes the one before it, with where the entity was and when (BodyMotion)
+                (_previousBonePoses, _bonePoses) = (_bonePoses, _previousBonePoses);
+                _previousPoseWorld = _poseWorld;
+                _previousPoseTime = _poseTime;
+                _poseWorld = _nextPoseWorld;
+                _poseTime = _nextPoseTime;
+
                 var kept = _bonePoses;
                 if (kept == null || kept.Length != count) kept = new Matrix4x4[count];
                 Array.Copy(bones, kept, count);

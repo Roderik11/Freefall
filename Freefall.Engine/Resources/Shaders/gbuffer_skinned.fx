@@ -47,6 +47,40 @@ struct BoneWeight
     float4 Weights;
 };
 
+// What one renderer gives the effect (PersistentRenderer, InstanceData): a piece that moves as cloth (Components/Cloth,
+// cloth.hlsl) hands over where its vertices are this frame, written by the running game and never saved.
+struct Instance
+{
+    uint ClothVertices;      //= 0               -- The cloth's places and normals this frame (bindless, 2 float4 a vertex); 0 = skinned. Set by Cloth while it is simulated.
+    uint ClothFirst;         //= 0               -- The first vertex they hold
+    uint ClothCount;         //= 0               -- How many vertices they hold
+};
+
+Instance LoadInstance(uint slot)
+{
+    ByteAddressBuffer all = ResourceDescriptorHeap[InstanceDataIdx];
+    return all.Load<Instance>(slot * 128u);
+}
+
+// A vertex of a piece that moves as cloth: its simulated place and normal in object space, in place of skinning. False
+// for a renderer that is not cloth this frame, and for a vertex the cloth does not hold (another LOD: w = 0).
+bool ClothVertex(uint slot, uint vertexID, out float3 pos, out float3 norm)
+{
+    pos = 0;
+    norm = float3(0, 1, 0);
+    Instance inst = LoadInstance(slot);
+    uint local = vertexID - inst.ClothFirst;
+    if (inst.ClothVertices == 0u || vertexID < inst.ClothFirst || local >= inst.ClothCount)
+        return false;
+    StructuredBuffer<float4> cloth = ResourceDescriptorHeap[NonUniformResourceIndex(inst.ClothVertices)];
+    float4 place = cloth[local * 2u];
+    if (place.w <= 0.0)
+        return false;
+    pos = place.xyz;
+    norm = cloth[local * 2u + 1u].xyz;
+    return true;
+}
+
 struct VSOutput
 {
     float4 Position : SV_POSITION;
@@ -115,8 +149,15 @@ VSOutput VS(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_InstanceI
 
     // Per-Animator bone buffer — loaded from per-instance descriptor (shared across SMRs). 0 = no pose yet (an
     // Animator that has not posed, or none): the bind pose, as SkinnedMeshRenderer.BoneBufferIdx says; reading
-    // descriptor 0 instead was an invalid resource to GPU-based validation.
-    if (desc.BoneBufferIdx != 0u)
+    // descriptor 0 instead was an invalid resource to GPU-based validation. A piece that moves as cloth has its
+    // vertices' places from the simulation instead.
+    float3 clothPos, clothNorm;
+    if (ClothVertex(desc.CustomDataIdx, vertexID, clothPos, clothNorm))
+    {
+        pos = clothPos;
+        norm = clothNorm;
+    }
+    else if (desc.BoneBufferIdx != 0u)
     {
         StructuredBuffer<BoneWeight> boneWeights = ResourceDescriptorHeap[part.BoneWeightsBufferIdx];
         StructuredBuffer<row_major matrix> bones = ResourceDescriptorHeap[NonUniformResourceIndex(desc.BoneBufferIdx)];
@@ -223,8 +264,11 @@ ShadowVSOutput ShadowVertex(uint primitiveVertexID, uint instanceID, bool local)
 
     float3 pos = positions[vertexID];
 
-    // 0 = no pose yet: the bind pose (VS above)
-    if (desc.BoneBufferIdx != 0u)
+    // 0 = no pose yet: the bind pose (VS above); cloth: the simulated place
+    float3 clothPos, clothNorm;
+    if (ClothVertex(desc.CustomDataIdx, vertexID, clothPos, clothNorm))
+        pos = clothPos;
+    else if (desc.BoneBufferIdx != 0u)
     {
         StructuredBuffer<BoneWeight> boneWeights = ResourceDescriptorHeap[part.BoneWeightsBufferIdx];
         StructuredBuffer<row_major matrix> bones = ResourceDescriptorHeap[NonUniformResourceIndex(desc.BoneBufferIdx)];

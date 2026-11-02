@@ -331,7 +331,7 @@ struct MeshPartEntry
     uint IndexBufferAddressLo;  // the mesh's index buffer for indexed indirect draws (cull_instances.hlsl IndexedDrawCommand)
     uint IndexBufferAddressHi;
     uint IndexBufferBytes;
-    uint Reserved8;
+    uint CullBone;              // a skinned part's bone with most of its vertices + 1, 0 = none (cull_instances.hlsl)
     uint Reserved9;
 };
 

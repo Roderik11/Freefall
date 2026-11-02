@@ -307,7 +307,6 @@ namespace Freefall.Components
 
             UpdateSunLight(Camera.Main.Position.Y);
             UpdateStarSphere();
-            Daylight.Update((float)Time.Delta);
         }
 
         /// <summary>

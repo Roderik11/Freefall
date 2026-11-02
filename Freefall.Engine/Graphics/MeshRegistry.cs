@@ -39,7 +39,9 @@ namespace Freefall.Graphics
             public uint IndexBufferAddressLo;
             public uint IndexBufferAddressHi;
             public uint IndexBufferBytes;
-            public uint Reserved8;
+            // A skinned part's bone that carries most of its vertices, + 1 (0: none): the culler moves the part's sphere
+            // with it, so that a pose far from the bind pose (a body lying where it fell) is culled where it is drawn
+            public uint CullBone;
             public uint Reserved9;
         }
 
@@ -181,6 +183,7 @@ namespace Freefall.Graphics
                     IndexBufferAddressLo = (uint)mesh.IndexBufferView.BufferLocation,
                     IndexBufferAddressHi = (uint)(mesh.IndexBufferView.BufferLocation >> 32),
                     IndexBufferBytes = mesh.IndexBufferView.SizeInBytes,
+                    CullBone = mesh.CullBoneOf(partIndex),
                 };
                 var lodEntry = BuildLodEntry(mesh, partIndex);
 

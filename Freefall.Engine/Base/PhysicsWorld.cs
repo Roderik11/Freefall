@@ -32,8 +32,23 @@ namespace Freefall.Base
 
     public class PhysXFilterShader : SimulationFilterShader
     {
+        /// <summary>
+        /// Word 0 of a shape's simulation filter data: a part of a ragdoll (Ragdoll), whose word 1 says which ragdoll.
+        /// It meets nothing of its own ragdoll (the joints hold the parts together) and no kinematic actor (characters'
+        /// capsules, door leaves): the living walk through a corpse rather than kicking it about.
+        /// </summary>
+        public const uint RagdollPart = 1u;
+
+        // PxFilterObjectFlag::eKINEMATIC in the attributes of either side
+        private const int Kinematic = 1 << 4;
+
         public override FilterResult Filter(int attributes0, FilterData filterData0, int attributes1, FilterData filterData1)
         {
+            bool ragdoll0 = (filterData0.Word0 & RagdollPart) != 0, ragdoll1 = (filterData1.Word0 & RagdollPart) != 0;
+            if ((ragdoll0 && ragdoll1 && filterData0.Word1 == filterData1.Word1)
+                || (ragdoll0 && (attributes1 & Kinematic) != 0) || (ragdoll1 && (attributes0 & Kinematic) != 0))
+                return new FilterResult { FilterFlag = FilterFlag.Kill, PairFlags = 0 };
+
             return new FilterResult
             {
                 FilterFlag = FilterFlag.Default,
@@ -125,6 +140,19 @@ namespace Freefall.Base
             return false;
         }
 
+        /// <summary>Steps the simulation has taken: what moved in the last one changes when this does.</summary>
+        public static long Steps { get; private set; }
+
+        /// <summary>
+        /// How far the picture is into the step after the last one, 0..1: what moves by the simulation is drawn that
+        /// share of the way from where the step before the last left it to where the last did (Ragdoll), so that it
+        /// moves smoothly at more frames a second than the simulation's 60.
+        /// </summary>
+        public static float StepFraction => Math.Clamp(_accumulator / FixedTimestep, 0f, 1f);
+
+        /// <summary>Seconds a step covers.</summary>
+        public static float StepSeconds => FixedTimestep;
+
         public static void Update(float deltaTime)
         {
             _accumulator += deltaTime;
@@ -134,6 +162,7 @@ namespace Freefall.Base
             _accumulator -= FixedTimestep;
             Scene.Simulate(FixedTimestep);
             Scene.FetchResults(true);
+            Steps++;
 
             foreach (var body in _simulated)
             {

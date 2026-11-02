@@ -451,6 +451,10 @@ namespace Freefall.Graphics
             // Ensure Materials buffer is bound (creates SRV for bindless access)
             Material.BindMaterialsBuffer(list, Engine.Device);
 
+            // Cloth for this frame, once a tick, before anything draws it: it also tells the skinned vertex shader
+            // where its places are (struct Instance), so before that is uploaded
+            Components.Cloth.SimulateAll(list);
+
             // Per-object effect data (struct Instance) that changed since the last frame
             InstanceData.Upload(Engine.Device);
 

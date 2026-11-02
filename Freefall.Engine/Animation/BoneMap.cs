@@ -592,11 +592,14 @@ namespace Freefall.Animation
         /// furthest bone beneath it that the other rig has too (typically hips → toes),
         /// so both rigs are measured to the same bone. An exporter's leaf nodes past
         /// the toes or the head (a Max rig's ball_r_end_end, 33 cm on) would make a
-        /// body seem a third taller and shrink the hips' travel.
+        /// body seem a third taller and shrink the hips' travel. Bones below the root
+        /// only, where there are any: a rig bound in a true T has its fingertips further
+        /// off than its toes (1.09 m against 0.96 on UnityMan), which measures how the arms
+        /// are held, not the body, and took 13 % off the travel of every clip made on it.
         /// </summary>
         private static float ComputeBindHeight(Skeleton skeleton, Vector3[] positions, int rootIndex, int[] mapped)
         {
-            float maxDist = 0;
+            float maxDist = 0, maxBelow = 0;
             for (int i = 0; i < skeleton.Bones.Length; i++)
             {
                 if (mapped[i] < 0) continue;
@@ -607,10 +610,12 @@ namespace Freefall.Animation
                     current = skeleton.Bones[current].Parent;
                 if (current != rootIndex) continue;
 
-                float dist = (positions[i] - positions[rootIndex]).Length();
+                var offset = positions[i] - positions[rootIndex];
+                float dist = offset.Length();
                 if (dist > maxDist) maxDist = dist;
+                if (offset.Y < 0f && dist > maxBelow) maxBelow = dist;
             }
-            return maxDist;
+            return maxBelow > 0f ? maxBelow : maxDist;
         }
     }
 }
