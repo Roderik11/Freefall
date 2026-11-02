@@ -30,6 +30,31 @@ namespace Freefall.Animation
         }
     }
 
+    /// <summary>
+    /// When each foot of a clip is on the ground: what <see cref="Footfalls.Find"/> worked out
+    /// walking the clip, a sample per key frame. A foot counts as down from its footfall until it
+    /// has left the ground again, the toe's last push included. A height alone would not do: halfway
+    /// through a walk's swing the toe passes a centimetre or two over the ground.
+    /// </summary>
+    internal sealed class FootStance
+    {
+        private readonly bool[] _left, _right;
+
+        public FootStance(bool[] left, bool[] right)
+        {
+            _left = left;
+            _right = right;
+        }
+
+        /// <summary>Whether a foot is down at a point of the clip, 0 to 1.</summary>
+        public bool Down(bool left, float point)
+        {
+            var track = left ? _left : _right;
+            int last = track.Length - 1;
+            return track[Math.Clamp((int)(point * last + 0.5f), 0, last)];
+        }
+    }
+
     /// <summary>The bones of a humanoid skeleton that say where its feet are; a part it does not have is -1.</summary>
     internal sealed class FootBones
     {
@@ -119,9 +144,11 @@ namespace Freefall.Animation
         /// that move with the foot bone and are on the ground in the bind pose: one under the
         /// ball of the foot (the toe joint) and one under the heel. Whichever is lower counts,
         /// so a heel strike in a walk and a landing on the forefoot in a sprint are both found.
+        /// <paramref name="stance"/> is when each foot is down, null with no feet to go by.
         /// </summary>
-        public static Footfall[] Find(Bone[] bones, AnimationChannel[] channels, FootBones feet, float duration, float ticksPerSecond)
+        public static Footfall[] Find(Bone[] bones, AnimationChannel[] channels, FootBones feet, float duration, float ticksPerSecond, out FootStance stance)
         {
+            stance = null;
             if (feet == null || duration <= 0f || ticksPerSecond <= 0f) return Array.Empty<Footfall>();
             if (feet.LeftFoot < 0 && feet.RightFoot < 0) return Array.Empty<Footfall>();
 
@@ -184,8 +211,11 @@ namespace Freefall.Animation
 
             var found = new List<Footfall>();
             float perSecond = steps / (duration / ticksPerSecond);
-            if (left.Foot >= 0) Steps(leftHeight, leftAcross, true, hipHeight, perSecond, found);
-            if (right.Foot >= 0) Steps(rightHeight, rightAcross, false, hipHeight, perSecond, found);
+            var leftDown = new bool[steps + 1];
+            var rightDown = new bool[steps + 1];
+            if (left.Foot >= 0) Steps(leftHeight, leftAcross, true, hipHeight, perSecond, found, leftDown);
+            if (right.Foot >= 0) Steps(rightHeight, rightAcross, false, hipHeight, perSecond, found, rightDown);
+            stance = new FootStance(leftDown, rightDown);
 
             found.Sort(static (a, b) => a.Time.CompareTo(b.Time));
             return found.ToArray();
@@ -199,7 +229,7 @@ namespace Freefall.Animation
             return new Vector2(ankle.X - hips.X, ankle.Z - hips.Z);
         }
 
-        private static void Steps(float[] height, Vector2[] across, bool left, float hipHeight, float samplesPerSecond, List<Footfall> found)
+        private static void Steps(float[] height, Vector2[] across, bool left, float hipHeight, float samplesPerSecond, List<Footfall> found, bool[] onGround)
         {
             int last = height.Length - 1;
 
@@ -269,8 +299,12 @@ namespace Freefall.Animation
                     Step(k, record: false);
             }
 
+            onGround[0] = !up;
             for (int k = 1; k <= last; k++)
+            {
                 Step(k, record: true);
+                onGround[k] = !up;
+            }
 
             void Step(int k, bool record)
             {
@@ -313,12 +347,16 @@ namespace Freefall.Animation
         }
 
         // The two points of a foot that meet the ground, fixed to the foot bone
-        private readonly struct Sole
+        internal readonly struct Sole
         {
             public readonly int Foot;
             private readonly bool _twoPoints;
             private readonly Vector3 _heel, _ball;   // in the foot bone's space
             private readonly float _ground;          // where both stand in the bind pose
+
+            /// <summary>The points under the heel and the ball of the foot, in the foot bone's space (both the ankle's place on a foot without a toe joint).</summary>
+            public Vector3 Heel => _heel;
+            public Vector3 Ball => _ball;
 
             public Sole(int foot, int toes, Matrix4x4[] bind, float hipHeight)
             {

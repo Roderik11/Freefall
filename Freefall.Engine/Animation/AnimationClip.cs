@@ -49,8 +49,9 @@ namespace Freefall.Animation
             // Worked out when root motion is first asked for; replaced as a whole
             public RootBinding Root;
 
-            // Worked out when first asked for
+            // Worked out when first asked for; Stance is set first, Footfalls says both are there
             public Footfall[] Footfalls;
+            public FootStance Stance;
         }
 
         /// <summary>
@@ -298,16 +299,26 @@ namespace Freefall.Animation
         /// Found from the clip itself, once per skeleton. The same array comes back every time:
         /// do not change it.
         /// </summary>
-        public Footfall[] GetFootfalls(Skeleton skeleton)
+        public Footfall[] GetFootfalls(Skeleton skeleton) => FootsOn(skeleton).Footfalls;
+
+        /// <summary>When each foot is on the ground in this clip on a humanoid skeleton; null for a skeleton without feet.</summary>
+        internal FootStance GetStance(Skeleton skeleton) => FootsOn(skeleton).Stance;
+
+        private Binding FootsOn(Skeleton skeleton)
         {
             var binding = BindingFor(skeleton.Bones);
-            var found = binding.Footfalls;
-            if (found != null) return found;
+            if (binding.Footfalls != null) return binding;
 
             lock (_channels)
             {
-                return binding.Footfalls ??= Footfalls.Find(binding.Bones, binding.Channels, FootBones.Of(skeleton), Duration, TicksPerSecond);
+                if (binding.Footfalls == null)
+                {
+                    var found = Footfalls.Find(binding.Bones, binding.Channels, FootBones.Of(skeleton), Duration, TicksPerSecond, out var stance);
+                    binding.Stance = stance;
+                    binding.Footfalls = found;
+                }
             }
+            return binding;
         }
 
         /// <summary>

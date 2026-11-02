@@ -4,10 +4,10 @@ using System.Numerics;
 namespace Freefall.Animation
 {
     /// <summary>
-    /// Analytical two-bone IK solver (e.g. thigh → shin → foot).
-    /// Uses the cosine rule to compute joint rotations that place the
-    /// end-effector (tip) at a target position with a pole-vector hint
-    /// to control the mid-joint (knee/elbow) orientation.
+    /// Analytical two-bone IK solver (e.g. thigh → shin → foot). Finds where the mid joint
+    /// (knee/elbow) goes from the lengths of the two bones and a pole that says on which side it
+    /// bends, then the two rotations that put the bones there. Because the joint's place comes from
+    /// the pole and not from how the chain is bent now, a chain held straight bends the right way.
     /// </summary>
     public static class TwoBoneIK
     {
@@ -18,126 +18,87 @@ namespace Freefall.Animation
         /// <param name="mid">Position of the mid joint (e.g. knee).</param>
         /// <param name="tip">Position of the end effector (e.g. foot/ankle).</param>
         /// <param name="target">Desired end-effector position.</param>
-        /// <param name="poleTarget">Pole vector hint — the knee/elbow should point toward this.</param>
-        /// <param name="rootCorrection">Output rotation correction for the root bone (hip).</param>
-        /// <param name="midCorrection">Output rotation correction for the mid bone (knee).</param>
+        /// <param name="poleTarget">Pole vector hint — the knee/elbow bends toward this.</param>
+        /// <param name="soft">
+        /// How far short of full length the chain starts to slow down, so that it comes to its full
+        /// length gradually instead of snapping straight; never less than the chain is stretched
+        /// already. 0: not at all.
+        /// </param>
+        /// <param name="rootCorrection">Rotation of the root bone about the root (hip).</param>
+        /// <param name="midCorrection">Rotation of the lower bone about the mid joint where it ends up, after <paramref name="rootCorrection"/>.</param>
+        /// <param name="newMid">Where the mid joint ends up.</param>
+        /// <param name="newTip">Where the end effector ends up: the target, or as near as the chain gets.</param>
         /// <returns>True if a valid solution was found.</returns>
         public static bool Solve(
             Vector3 root, Vector3 mid, Vector3 tip,
-            Vector3 target, Vector3 poleTarget,
-            out Quaternion rootCorrection, out Quaternion midCorrection)
+            Vector3 target, Vector3 poleTarget, float soft,
+            out Quaternion rootCorrection, out Quaternion midCorrection,
+            out Vector3 newMid, out Vector3 newTip)
         {
             rootCorrection = Quaternion.Identity;
             midCorrection = Quaternion.Identity;
+            newMid = mid;
+            newTip = tip;
 
             float lenUpper = Vector3.Distance(root, mid);
             float lenLower = Vector3.Distance(mid, tip);
-            float lenChain = lenUpper + lenLower;
 
-            // Direction from root to target
             Vector3 rootToTarget = target - root;
             float distToTarget = rootToTarget.Length();
 
-            // Early out: target unreachable or chain is degenerate
+            // Early out: the chain is degenerate
             if (distToTarget < 0.001f || lenUpper < 0.001f || lenLower < 0.001f)
                 return false;
 
-            // Clamp — if target is beyond reach, extend fully
-            distToTarget = Math.Min(distToTarget, lenChain - 0.001f);
+            Vector3 along = rootToTarget / distToTarget;
 
-            // Current chain direction and target direction
-            Vector3 rootToTip = tip - root;
-            float rootToTipLen = rootToTip.Length();
-            if (rootToTipLen < 0.001f)
-                return false;
+            float reach = Reach(distToTarget, Vector3.Distance(root, tip), lenUpper + lenLower, soft);
+            reach = Math.Max(reach, Math.Abs(lenUpper - lenLower) + 0.001f);
 
-            Vector3 rootToTargetDir = Vector3.Normalize(rootToTarget);
-            Vector3 rootToTipDir = Vector3.Normalize(rootToTip);
+            // ---- Where the mid joint goes: the triangle's height over the root → target line, on the pole's side ----
+            float toFoot = (lenUpper * lenUpper - lenLower * lenLower + reach * reach) / (2f * reach);
+            float height = MathF.Sqrt(MathF.Max(lenUpper * lenUpper - toFoot * toFoot, 0f));
 
-            // ---- Step 1: Cosine rule for the knee angle ----
-            // Triangle sides: lenUpper, lenLower, distToTarget
-            // Angle at the mid joint (knee)
-            float cosAngleMid = (lenUpper * lenUpper + lenLower * lenLower - distToTarget * distToTarget)
-                                / (2f * lenUpper * lenLower);
-            cosAngleMid = Math.Clamp(cosAngleMid, -1f, 1f);
-            float angleMid = MathF.Acos(cosAngleMid);
+            Vector3 side = Across(poleTarget - root, along);
+            if (side.LengthSquared() < 1e-8f) side = Across(mid - root, along);
+            if (side.LengthSquared() < 1e-8f)
+                side = Across(MathF.Abs(along.X) < 0.9f ? Vector3.UnitX : Vector3.UnitY, along);
+            side = Vector3.Normalize(side);
 
-            // Current knee angle
-            Vector3 midToRoot = Vector3.Normalize(root - mid);
-            Vector3 midToTip = Vector3.Normalize(tip - mid);
-            float cosCurrentMid = Vector3.Dot(midToRoot, midToTip);
-            cosCurrentMid = Math.Clamp(cosCurrentMid, -1f, 1f);
-            float currentAngleMid = MathF.Acos(cosCurrentMid);
+            newMid = root + along * toFoot + side * height;
+            newTip = root + along * reach;
 
-            // Mid correction: rotate around the knee bend axis
-            float midDelta = angleMid - currentAngleMid;
-            if (MathF.Abs(midDelta) > 0.0001f)
-            {
-                Vector3 midAxis = Vector3.Cross(midToRoot, midToTip);
-                if (midAxis.LengthSquared() < 0.0001f)
-                {
-                    // Fallback axis from pole target
-                    midAxis = Vector3.Normalize(Vector3.Cross(midToRoot, poleTarget - mid));
-                }
-                else
-                {
-                    midAxis = Vector3.Normalize(midAxis);
-                }
+            // ---- The rotations that put the two bones there ----
+            rootCorrection = RotationBetween(Vector3.Normalize(mid - root), Vector3.Normalize(newMid - root));
 
-                midCorrection = Quaternion.CreateFromAxisAngle(midAxis, midDelta);
-            }
-
-            // ---- Step 2: Apply mid correction and recompute tip ----
-            Vector3 newMidToTip = Vector3.Transform(tip - mid, midCorrection);
-            Vector3 newTip = mid + newMidToTip;
-
-            // ---- Step 3: Root rotation to aim the chain at the target ----
-            Vector3 newRootToTip = newTip - root;
-            float newLen = newRootToTip.Length();
-
-            if (newLen > 0.001f)
-            {
-                Vector3 newRootToTipDir = Vector3.Normalize(newRootToTip);
-                rootCorrection = RotationBetween(newRootToTipDir, rootToTargetDir);
-            }
-
-            // ---- Step 4: Pole target twist ----
-            // After aiming, twist around the root→target axis so the knee points toward poleTarget
-            Vector3 afterMid = root + Vector3.Transform(mid - root, rootCorrection);
-            Vector3 chainAxis = rootToTargetDir;
-
-            Vector3 currentPole = afterMid - root;
-            currentPole -= Vector3.Dot(currentPole, chainAxis) * chainAxis;
-
-            Vector3 desiredPole = poleTarget - root;
-            desiredPole -= Vector3.Dot(desiredPole, chainAxis) * chainAxis;
-
-            if (currentPole.LengthSquared() > 0.0001f && desiredPole.LengthSquared() > 0.0001f)
-            {
-                currentPole = Vector3.Normalize(currentPole);
-                desiredPole = Vector3.Normalize(desiredPole);
-
-                float poleDot = Math.Clamp(Vector3.Dot(currentPole, desiredPole), -1f, 1f);
-                float poleAngle = MathF.Acos(poleDot);
-
-                if (MathF.Abs(poleAngle) > 0.001f)
-                {
-                    Vector3 poleAxis = Vector3.Cross(currentPole, desiredPole);
-                    if (poleAxis.LengthSquared() > 0.0001f)
-                    {
-                        poleAxis = Vector3.Normalize(poleAxis);
-                        // Ensure rotation is around the chain axis direction
-                        if (Vector3.Dot(poleAxis, chainAxis) < 0)
-                            poleAngle = -poleAngle;
-
-                        Quaternion poleTwist = Quaternion.CreateFromAxisAngle(chainAxis, poleAngle);
-                        rootCorrection = poleTwist * rootCorrection;
-                    }
-                }
-            }
+            Vector3 lower = Vector3.Transform(tip - mid, rootCorrection);
+            midCorrection = RotationBetween(Vector3.Normalize(lower), Vector3.Normalize(newTip - newMid));
 
             return true;
         }
+
+        /// <summary>
+        /// How far from the root the chain gets for a target at <paramref name="distance"/>. Up to
+        /// the point it starts to slow down it gets there; past that it closes on its
+        /// <paramref name="length"/> and never quite reaches it.
+        /// </summary>
+        private static float Reach(float distance, float stretched, float length, float soft)
+        {
+            float start = Math.Max(length - soft, Math.Min(stretched, length));
+            if (distance <= start) return distance;
+
+            float left = length - start;
+            return left > 1e-5f
+                ? start + left * (1f - MathF.Exp(-(distance - start) / left))
+                : length;
+        }
+
+        /// <summary>The longest a chain may be asked to stand for a target without slowing down (see <paramref name="soft"/> of <see cref="Solve"/>).</summary>
+        public static float FreeReach(float stretched, float length, float soft)
+            => Math.Max(length - soft, Math.Min(stretched, length));
+
+        // The part of a vector across a direction of length 1
+        private static Vector3 Across(Vector3 v, Vector3 along) => v - Vector3.Dot(v, along) * along;
 
         /// <summary>
         /// Computes the shortest rotation from direction a to direction b.
@@ -147,7 +108,7 @@ namespace Freefall.Animation
         {
             float dot = Vector3.Dot(a, b);
 
-            if (dot > 0.9999f)
+            if (dot > 0.9999999f)
                 return Quaternion.Identity;
 
             if (dot < -0.9999f)

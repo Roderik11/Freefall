@@ -41,6 +41,10 @@ namespace Freefall.Animation
         /// </summary>
         public int ShiftBone;
         public Vector3 Shift;
+
+        /// <summary>When the clip's feet are down, and how far through it this sample is (0 to 1), for a pose that asked (<see cref="StateSamples.WantStance"/>).</summary>
+        public FootStance Stance;
+        public float Point;
     }
 
     /// <summary>
@@ -60,6 +64,9 @@ namespace Freefall.Animation
 
         /// <summary>The skeleton being posed: a mirrored clip looks up its bone pairs by it.</summary>
         public Skeleton Skeleton;
+
+        /// <summary>The pose stands its feet on the ground: the clips say when each foot is down (see <see cref="Down"/>).</summary>
+        public bool WantStance;
 
         public int Count => _count;
 
@@ -94,6 +101,41 @@ namespace Freefall.Animation
                 pose.Rotation = Quaternion.Lerp(pose.Rotation, other.Rotation, share);
             }
 
+            return true;
+        }
+
+        /// <summary>
+        /// How much each foot is on the ground in these clips, 0 to 1, shared out the way the clips
+        /// share the pose. Each of a blend's clips has its own moment for it, so between two gaits
+        /// a foot comes down over the stretch where they differ. False when there are none.
+        /// </summary>
+        public bool Down(out float left, out float right)
+        {
+            left = right = 1f;
+            if (_count == 0) return false;
+
+            var items = _items;
+            for (int i = 0; i < _count; i++)
+            {
+                ref var sample = ref items[i];
+                var stance = sample.Stance;
+                float l = stance == null || stance.Down(true, sample.Point) ? 1f : 0f;
+                float r = stance == null || stance.Down(false, sample.Point) ? 1f : 0f;
+
+                // Played left for right, the clip's left foot is the right one
+                if (sample.Mirror != null) (l, r) = (r, l);
+
+                if (i == 0)
+                {
+                    left = l;
+                    right = r;
+                }
+                else
+                {
+                    left += (l - left) * sample.Share;
+                    right += (r - right) * sample.Share;
+                }
+            }
             return true;
         }
 

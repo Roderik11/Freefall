@@ -7,7 +7,6 @@ using Freefall.Graphics;
 
 namespace Freefall.Components
 {
-    public delegate void BoneTransformHandler(Bone bone, ref Matrix4x4 matrix);
     public delegate void PostHierarchyHandler(Bone[] skeleton, Matrix4x4[] bones);
 
     /// <summary>
@@ -117,11 +116,15 @@ namespace Freefall.Components
         private const float AnimationSetFadeSeconds = 0.2f;
         private bool _animationSetApplied;
 
-        /// <summary>Event fired when a bone transform is calculated.</summary>
-        public event BoneTransformHandler OnBoneTransform;
-
         /// <summary>Event fired after hierarchy multiplication — bones are in model space.</summary>
         public event PostHierarchyHandler OnPostHierarchy;
+
+        /// <summary>
+        /// Stands the feet on what is under them. Null: they go where the clips have them, and
+        /// nothing of it is paid for.
+        /// </summary>
+        [Freefall.Reflection.DontSerialize]
+        public FootPlacement Feet { get; set; }
 
         /// <summary>
         /// Report each foot coming down as an event named <see cref="AnimationEvent.Footfall"/>,
@@ -708,6 +711,64 @@ namespace Freefall.Components
 
             pose = Matrix4x4.CreateFromQuaternion(rotation) * Matrix4x4.CreateTranslation(position);
             return true;
+        }
+
+        /// <summary>
+        /// Where a foot was when the character was last posed, in the entity's own space: the
+        /// points under its heel and the ball of the foot, as footfalls measure them, and the
+        /// ankle. False until it has been posed once after the first call.
+        /// </summary>
+        internal bool TryGetSole(bool left, out Vector3 heel, out Vector3 ball, out Vector3 ankle)
+        {
+            heel = ball = ankle = default;
+            _keepBonePoses = true;
+
+            var skeleton = _bonePoseSkeleton;
+            var poses = _bonePoses;
+            if (skeleton == null || poses == null) return false;
+
+            var legs = LegChain.Of(skeleton);
+            if (legs == null) return false;
+
+            var leg = left ? legs.Left : legs.Right;
+            ref readonly var foot = ref poses[leg.Foot];
+            heel = Vector3.Transform(leg.Sole.Heel, foot);
+            ball = Vector3.Transform(leg.Sole.Ball, foot);
+            ankle = foot.Translation;
+
+            if (skeleton.FlipXZ)
+            {
+                heel = new Vector3(-heel.X, heel.Y, -heel.Z);
+                ball = new Vector3(-ball.X, ball.Y, -ball.Z);
+                ankle = new Vector3(-ankle.X, ankle.Y, -ankle.Z);
+            }
+            return true;
+        }
+
+        /// <summary>
+        /// How much each foot is on the ground in the pose just blended: the clips' stance, through
+        /// the layers the way their poses go over each other at the foot.
+        /// </summary>
+        private void ReadStance(Skeleton clipSkeleton, out float left, out float right)
+        {
+            left = right = 1f;
+            var feet = FootBones.Of(clipSkeleton);
+            var layers = _pose.Layers;
+            for (int i = 0; i < layers.Length; i++)
+            {
+                ref var layer = ref layers[i];
+                if (layer.Weight <= 0f || !layer.Samples.Down(out float l, out float r)) continue;
+
+                float share = layer.Weight * layer.Coverage;
+                float leftShare = share, rightShare = share;
+                if (layer.MaskWeights != null)
+                {
+                    leftShare *= feet.LeftFoot >= 0 ? layer.MaskWeights[feet.LeftFoot] : 0f;
+                    rightShare *= feet.RightFoot >= 0 ? layer.MaskWeights[feet.RightFoot] : 0f;
+                }
+                left += (l - left) * leftShare;
+                right += (r - right) * rightShare;
+            }
         }
 
         /// <summary>
@@ -1406,6 +1467,7 @@ namespace Freefall.Components
                 pose.PreviousSamples.RootBone = state.RootBone;
                 pose.Samples.Skeleton = skeleton;
                 pose.PreviousSamples.Skeleton = skeleton;
+                pose.Samples.WantStance = Feet != null && Feet.Active;
 
                 pose.Weight = layer.GetWeight(this);
 
@@ -1775,11 +1837,11 @@ namespace Freefall.Components
             if (_boneMap == null && !_previewing)
                 FinishLayers();
 
-            if (OnBoneTransform != null)
-            {
-                for (int i = 0; i < count; i++)
-                    OnBoneTransform(skeleton[i], ref bones[i]);
-            }
+            // Feet on the ground: the pelvis lowered as the pose goes up the hierarchy, by what the
+            // last pose found it needs, and the legs moved at the end
+            var feet = Feet;
+            var legs = feet != null && feet.Active && !_previewing ? LegChain.Of(target) : null;
+            int pelvis = legs != null ? legs.Hips : -1;
 
             // Up the hierarchy into model space. Where the upper body or the head is asked to face
             // another way, the bones of the spine and neck are turned as they are reached, each by
@@ -1800,6 +1862,8 @@ namespace Freefall.Components
             {
                 if (skeleton[i].Parent > -1)
                     bones[i] = bones[i] * bones[skeleton[i].Parent];
+
+                if (i == pelvis) bones[i].M42 += feet.Drop;
 
                 if (aim == null) continue;
 
@@ -1827,11 +1891,20 @@ namespace Freefall.Components
                 aimedYaw += yaw;
             }
 
+            // The skeleton the character itself is posed on (the one it is retargeted to, or the
+            // first with hips)
+            bool own = ReferenceEquals(target, _boneMap != null ? _boneMap.Target : _poseRootSkeleton ?? target);
+
+            if (legs != null)
+            {
+                ReadStance(_boneMap != null ? _boneMap.Source : target, out float leftDown, out float rightDown);
+                feet.Solve(legs, bones, flipXZ, leftDown, rightDown, own, Base.Time.SmoothDelta * _poseGap);
+            }
+
             OnPostHierarchy?.Invoke(skeleton, bones);
 
-            // For TryGetBonePose: the skeleton the character itself is posed on (the one it is
-            // retargeted to, or the first with hips)
-            if (_keepBonePoses && ReferenceEquals(target, _boneMap != null ? _boneMap.Target : _poseRootSkeleton ?? target))
+            // For TryGetBonePose
+            if (_keepBonePoses && own)
             {
                 var kept = _bonePoses;
                 if (kept == null || kept.Length != count) kept = new Matrix4x4[count];

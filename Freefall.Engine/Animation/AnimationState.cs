@@ -398,6 +398,8 @@ namespace Freefall.Animation
             sample.Ticks = clip.TicksAt(Reverse ? MathF.Max(0f, clip.DurationSeconds - time) : time);
             sample.Share = share;
             sample.PreviousChannels = null;
+            sample.Stance = samples.WantStance && samples.Skeleton != null ? clip.GetStance(samples.Skeleton) : null;
+            sample.Point = clip.Duration > 0f ? sample.Ticks / clip.Duration : 0f;
 
             // A slot of the samples is used again and again: both are set every time
             sample.ShiftBone = -1;
