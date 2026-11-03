@@ -389,6 +389,14 @@ namespace Freefall.Components
             lightCS.Dispatch(0, commandList, groupsX, groupsY);
         }
 
+        // The CPU profiler's sections of the shadow pass, named as its PIX regions (DrawShadows runs as a custom action of
+        // the ShadowMap pass, which times nothing of its own)
+        private static readonly ProfilerMarker _cascadesMarker = ProfilerMarker.Get("Shadow cascades");
+        private static readonly ProfilerMarker _receiversMarker = ProfilerMarker.Get("Shadow receivers");
+        private static readonly ProfilerMarker _cullingMarker = ProfilerMarker.Get("Shadow culling");
+        private static readonly ProfilerMarker _drawsMarker = ProfilerMarker.Get("Shadow draws");
+        private static readonly ProfilerMarker _terrainMarker = ProfilerMarker.Get("Terrain + decorators");
+
         private void DrawShadows(ID3D12GraphicsCommandList commandList)
         {
             CurrentShadowReceiversUav = 0;   // built below on the CPU-cascade path only
@@ -518,13 +526,14 @@ namespace Freefall.Components
 
                 // Draw each cascade using GPU-driven rendering
                 // Phase 1: Compute cascade matrices and frustum planes
+                using (_cascadesMarker.Auto(numCascades))
                 for (int i = 0; i < numCascades; i++)
                     SetupCascade(i, camera, cameraPosition, shadowTex);
-                
+
                 // Phase 2: GPU-driven cull all cascades per batch (unified visibility pass)
                 var allBatches = CommandBuffer.GetAllBatches(RenderPass.Opaque);
                 int frameIndex = Engine.FrameIndex % FrameCount;
-                
+
                 if (culler != null && allBatches != null)
                 {
                     EnsureCascadeBuffer();
@@ -542,21 +551,26 @@ namespace Freefall.Components
                     // Where this frame's visible surfaces sample each cascade (the opaque pass has written the linear
                     // depth): the culling tests every cascade entry against it (EngineSettings.ShadowReceiverCulling)
                     var renderer = DeferredRenderer.Current!;
+                    using (_receiversMarker.Auto())
                     CurrentShadowReceiversUav = renderer.ShadowReceivers?.Build(commandList, camera, renderer,
                         cascadeSrv, numCascades, shadowTex.Width) ?? 0;
 
                     // Cull all cascades for each batch using unified visibility pass
                     ulong cascadeCBAddr = _shadowCascadeCBs![frameIndex].Native.GPUVirtualAddress;
-                    PixMarker.Begin(commandList, "Shadow culling");
-                    InstanceBatch.CullShadowAll(commandList, allBatches, cascadeSrv, cascadeCBAddr, shadowHiZSrv, culler,
-                        numCascades, minCasterClip,
-                        casterStats: Engine.Settings.ShadowCasterStats ? renderer.ShadowReceivers : null);
-                    PixMarker.End(commandList);
+                    using (_cullingMarker.Auto(allBatches.Count))
+                    {
+                        PixMarker.Begin(commandList, "Shadow culling");
+                        InstanceBatch.CullShadowAll(commandList, allBatches, cascadeSrv, cascadeCBAddr, shadowHiZSrv, culler,
+                            numCascades, minCasterClip,
+                            casterStats: Engine.Settings.ShadowCasterStats ? renderer.ShadowReceivers : null);
+                        PixMarker.End(commandList);
+                    }
 
                     // Phase 3: True single-pass draw — 1 ExecuteIndirect per batch for all cascades
                     // Bind full-array DSV (all slices at once)
                     commandList.OMSetRenderTargets(0, (CpuDescriptorHandle[]?)null, false, shadowTex.FullArrayDsvHandle);
 
+                    var drawsSection = _drawsMarker.Auto(allBatches.Count);
                     PixMarker.Begin(commandList, "Shadow draws");
                     foreach (var batch in allBatches)
                     {
@@ -569,12 +583,16 @@ namespace Freefall.Components
                         PixMarker.End(commandList);
                     }
                     PixMarker.End(commandList);
+                    drawsSection.Dispose();
 
                     // Custom shadow actions (grass) — single-pass via AS/MS cascade expansion
                     // FullArrayDsvHandle is already bound from batch shadows above
-                    PixMarker.Begin(commandList, "Terrain + decorators");
-                    CommandBuffer.ExecuteCustomActions(RenderPass.Shadow, commandList);
-                    PixMarker.End(commandList);
+                    using (_terrainMarker.Auto())
+                    {
+                        PixMarker.Begin(commandList, "Terrain + decorators");
+                        CommandBuffer.ExecuteCustomActions(RenderPass.Shadow, commandList);
+                        PixMarker.End(commandList);
+                    }
                     CommandBuffer.ClearCustomActions(RenderPass.Shadow);
                 }
                 else
@@ -711,10 +729,7 @@ namespace Freefall.Components
             lightSpace[index] = lightVP;
             
             // Extract frustum planes for GPU culling (absolute-world space)
-            var shadowFrustum = new Frustum(shadowVP);
-            var planes = shadowFrustum.GetPlanesAsVector4();
-            for (int i = 0; i < 6; i++)
-                cascadeFrustumPlanes[index][i] = planes[i];
+            new Frustum(shadowVP).GetPlanes(cascadeFrustumPlanes[index]);
             
             // Upload shadow SceneConstants with offset shadowView for VS_Shadow
             EnsureShadowSceneConstantsBuffer();

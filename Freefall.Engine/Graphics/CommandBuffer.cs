@@ -291,7 +291,7 @@ namespace Freefall.Graphics
             /// <summary>
             /// Upload simple frustum planes (no Hi-Z) for non-opaque passes.
             /// </summary>
-            private static ulong UploadSimpleFrustumPlanes(GraphicsDevice device, Vector4[] frustumPlanes, Vector3 cameraPosition, uint sortDirection)
+            private static ulong UploadSimpleFrustumPlanes(GraphicsDevice device, ReadOnlySpan<Vector4> frustumPlanes, Vector3 cameraPosition, uint sortDirection)
             {
                 EnsureFrustumBuffers(device);
                 
@@ -476,15 +476,15 @@ namespace Freefall.Graphics
                 // GPU culling requires Culler to be initialized
                 bool usingGPUPath = Culler != null && pass == RenderPass.Opaque;
 
-                // 2. Build frustum if not provided externally
+                // 2. Build frustum if not provided externally (only the batches read it: none, none built)
                 ulong frustumBufferGPUAddress = frustumGpuAddr;
-                if (frustumBufferGPUAddress == 0)
+                if (frustumBufferGPUAddress == 0 && activeBatches.Count > 0)
                 {
-                    var vpMatrix = Engine.Settings.FreezeFrustum 
-                        ? Engine.Settings.FrozenViewProjection 
+                    var vpMatrix = Engine.Settings.FreezeFrustum
+                        ? Engine.Settings.FrozenViewProjection
                         : Camera.Main.ViewProjection;
-                    var frustum = new Frustum(vpMatrix);
-                    var frustumPlanes = frustum.GetPlanesAsVector4();
+                    Span<Vector4> frustumPlanes = stackalloc Vector4[6];
+                    new Frustum(vpMatrix).GetPlanes(frustumPlanes);
                     // Sort direction: 0 = front-to-back (opaque), 1 = back-to-front (transparent/forward)
                     uint sortDir = (pass == RenderPass.Forward) ? 1u : 0u;
                     frustumBufferGPUAddress = UploadSimpleFrustumPlanes(device, frustumPlanes, Camera.Main.Position, sortDir);

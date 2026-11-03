@@ -9,7 +9,14 @@ namespace Freefall.Graphics
     /// </summary>
     public struct Frustum
     {
-        private Plane[] planes;
+        // The six planes held in the struct itself: making a frustum allocates nothing
+        [System.Runtime.CompilerServices.InlineArray(6)]
+        private struct Planes
+        {
+            private Plane _plane;
+        }
+
+        private Planes planes;
 
         /// <summary>
         /// Extracts 6 frustum planes from a combined View-Projection matrix.
@@ -18,8 +25,6 @@ namespace Freefall.Graphics
         /// </summary>
         public Frustum(Matrix4x4 viewProj)
         {
-            planes = new Plane[6];
-
             // Left plane
             planes[2].Normal.X = -viewProj.M14 - viewProj.M11;
             planes[2].Normal.Y = -viewProj.M24 - viewProj.M21;
@@ -72,11 +77,18 @@ namespace Freefall.Graphics
         public Vector4[] GetPlanesAsVector4()
         {
             var result = new Vector4[6];
-            for (int i = 0; i < 6; i++)
-            {
-                result[i] = new Vector4(planes[i].Normal, planes[i].D);
-            }
+            GetPlanes(result);
             return result;
+        }
+
+        /// <summary>
+        /// The planes into the caller's buffer of at least 6 (a stackalloc, a kept array), as GetPlanesAsVector4 has them,
+        /// without allocating.
+        /// </summary>
+        public readonly void GetPlanes(Span<Vector4> into)
+        {
+            for (int i = 0; i < 6; i++)
+                into[i] = new Vector4(planes[i].Normal, planes[i].D);
         }
         
         /// <summary>

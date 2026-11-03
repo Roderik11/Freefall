@@ -187,7 +187,7 @@ namespace Freefall.Graphics
             // Cascade split distances: X=near, Y=far, ZW=unused
             public Vector4 SplitDistances;
             
-            public void SetPlanes(Vector4[] planes)
+            public void SetPlanes(ReadOnlySpan<Vector4> planes)
             {
                 if (planes.Length < 6) return;
                 Plane0 = planes[0];
@@ -501,6 +501,23 @@ namespace Freefall.Graphics
                 new ResourceBarrier(
                     new ResourceTransitionBarrier(sortedIndicesBuffer, ResourceStates.NonPixelShaderResource, ResourceStates.Common)));
         }
+
+        // The pyramids' push constant names Mip0UAV..Mip12UAV and their barriers' array: kept, so that building a pyramid
+        // allocates nothing
+        private static readonly string[] MipUavNames =
+        {
+            "Mip0UAV", "Mip1UAV", "Mip2UAV", "Mip3UAV", "Mip4UAV", "Mip5UAV", "Mip6UAV",
+            "Mip7UAV", "Mip8UAV", "Mip9UAV", "Mip10UAV", "Mip11UAV", "Mip12UAV",
+        };
+        private readonly ResourceBarrier[] _pyramidBarriers = new ResourceBarrier[8];
+
+        // The first count of _pyramidBarriers, then cleared: they reference resources, which are not to be kept alive here
+        private void SubmitPyramidBarriers(ID3D12GraphicsCommandList list, int count)
+        {
+            list.ResourceBarrier((uint)count, _pyramidBarriers);
+            Array.Clear(_pyramidBarriers, 0, count);
+        }
+
         /// <summary>
         /// Generate the Hi-Z depth pyramid from the current depth buffer.
         /// Call after GBuffer pass, when depth is in PixelShaderResource state.
@@ -528,7 +545,7 @@ namespace Freefall.Graphics
             // Batch transition: all SPD mips to UAV + counter buffer on first frame
             var beforeState = firstGeneration ? ResourceStates.Common : ResourceStates.NonPixelShaderResource;
             int barrierCount = firstGeneration ? spdMipCount + 1 : spdMipCount;
-            var spdBarriers = new ResourceBarrier[barrierCount];
+            var spdBarriers = _pyramidBarriers;
             for (int mip = 0; mip < spdMipCount; mip++)
             {
                 spdBarriers[mip] = new ResourceBarrier(
@@ -545,7 +562,7 @@ namespace Freefall.Graphics
                         ResourceStates.Common,
                         ResourceStates.UnorderedAccess));
             }
-            commandList.ResourceBarrier(spdBarriers);
+            SubmitPyramidBarriers(commandList, barrierCount);
             
             // Clear SPD atomic counter
             commandList.ClearUnorderedAccessViewUint(
@@ -569,12 +586,12 @@ namespace Freefall.Graphics
             // Bind per-mip UAVs
             ps.SetPushConstant(_spdKernel, "Mip0UAV", pyramid.MipUAVs[0]);
             for (int m = 1; m < spdMipCount && m <= 12; m++)
-                ps.SetPushConstant(_spdKernel, $"Mip{m}UAV", pyramid.MipUAVs[m]);
+                ps.SetPushConstant(_spdKernel, MipUavNames[m], pyramid.MipUAVs[m]);
             
             ps.Dispatch(_spdKernel, commandList, numGroupsX, numGroupsY, 1);
             
             // Batch transition: all SPD mips back to SRV
-            var spdBarriersBack = new ResourceBarrier[spdMipCount];
+            var spdBarriersBack = _pyramidBarriers;
             for (int mip = 0; mip < spdMipCount; mip++)
             {
                 spdBarriersBack[mip] = new ResourceBarrier(
@@ -583,7 +600,7 @@ namespace Freefall.Graphics
                         ResourceStates.NonPixelShaderResource,
                         (uint)mip));
             }
-            commandList.ResourceBarrier(spdBarriersBack);
+            SubmitPyramidBarriers(commandList, spdMipCount);
             
             // --- Per-mip fallback for mips 6+ (tiny dispatches, negligible cost) ---
             if (pyramid.MipCount > 6)
@@ -649,7 +666,7 @@ namespace Freefall.Graphics
             {
                 // Transition SPD mips (0 to spdMipCount-1) for this slice to UAV
                 var beforeState = firstGeneration ? ResourceStates.Common : ResourceStates.NonPixelShaderResource;
-                var barriers = new ResourceBarrier[spdMipCount];
+                var barriers = _pyramidBarriers;
                 for (int mip = 0; mip < spdMipCount; mip++)
                 {
                     // Subresource index for Texture2DArray: mip + slice * MipCount
@@ -660,7 +677,7 @@ namespace Freefall.Graphics
                             ResourceStates.UnorderedAccess,
                             subresource));
                 }
-                commandList.ResourceBarrier(barriers);
+                SubmitPyramidBarriers(commandList, spdMipCount);
 
                 // Push constants via ComputeShader API
                 var ps = _pyramidShader!;
@@ -674,7 +691,7 @@ namespace Freefall.Graphics
                 // Mip UAVs
                 ps.SetPushConstant(_shadowSpdKernel, "Mip0UAV", pyramid.GetMipUAV(slice, 0));
                 for (int m = 1; m < spdMipCount && m <= 12; m++)
-                    ps.SetPushConstant(_shadowSpdKernel, $"Mip{m}UAV", pyramid.GetMipUAV(slice, m));
+                    ps.SetPushConstant(_shadowSpdKernel, MipUavNames[m], pyramid.GetMipUAV(slice, m));
                 ps.SetPushConstant(_shadowSpdKernel, "SliceIndex", (uint)slice);
 
                 ps.Dispatch(_shadowSpdKernel, commandList, numGroupsX, numGroupsY, 1);
@@ -689,7 +706,7 @@ namespace Freefall.Graphics
                             ResourceStates.NonPixelShaderResource,
                             subresource));
                 }
-                commandList.ResourceBarrier(barriers);
+                SubmitPyramidBarriers(commandList, spdMipCount);
 
                 // Mips 6+ via per-mip fallback
                 if (pyramid.MipCount > 6 && _pyramidShader != null)

@@ -40,6 +40,9 @@ namespace Freefall.Components
         private const int MinPatches = 32768;
 
         private Vector4[] _layerTiling = new Vector4[32];
+
+        // The bindless heap as SetDescriptorHeaps takes it, made once instead of per dispatch
+        private ID3D12DescriptorHeap[]? _srvHeaps;
         private Vector4[] _layerTint = Enumerable.Repeat(Vector4.One, 32).ToArray();   // TerrainLayer.Tint per channel
         private Vector4[] _layerPlantTint = Enumerable.Repeat(Vector4.One, 32).ToArray();   // TerrainLayer.PlantTint per channel
         private GraphicsBuffer? _plantTintBuffer;   // _layerPlantTint for the decorator spawn (grass_compute.hlsl LayerPlantTint)
@@ -1249,7 +1252,7 @@ namespace Freefall.Components
             UploadBuffer(_terrainParamBuffers[frameIndex], terrainParams);
 
             // Bind root sig + descriptor heaps + all cbuffers once (before any compute operations)
-            commandList.SetDescriptorHeaps(1, new[] { device.SrvHeap });
+            commandList.SetDescriptorHeaps(1, _srvHeaps ??= new[] { Engine.Device.SrvHeap });
             commandList.SetComputeRootSignature(device.GlobalRootSignature);
             commandList.SetComputeRootConstantBufferView(1, _frustumPlaneBuffers[frameIndex].GPUVirtualAddress);
             commandList.SetComputeRootConstantBufferView(2, _hizParamBuffers[frameIndex].GPUVirtualAddress);
@@ -1287,7 +1290,7 @@ namespace Freefall.Components
                 _heightRangePyramidBuilt = true;
 
                 // Re-bind root sig + cbuffers (mip builder may have changed PSO state)
-                commandList.SetDescriptorHeaps(1, new[] { device.SrvHeap });
+                commandList.SetDescriptorHeaps(1, _srvHeaps ??= new[] { Engine.Device.SrvHeap });
                 commandList.SetComputeRootSignature(device.GlobalRootSignature);
                 commandList.SetComputeRootConstantBufferView(1, _frustumPlaneBuffers[frameIndex].GPUVirtualAddress);
                 commandList.SetComputeRootConstantBufferView(2, _hizParamBuffers[frameIndex].GPUVirtualAddress);
@@ -1353,7 +1356,7 @@ namespace Freefall.Components
             commandList.IASetIndexBuffer(_patchMesh.IndexBufferView);
 
             // Set descriptor heap (Material.Apply may have changed it)
-            commandList.SetDescriptorHeaps(1, new[] { device.SrvHeap });
+            commandList.SetDescriptorHeaps(1, _srvHeaps ??= new[] { Engine.Device.SrvHeap });
 
             // Set root constants for push constant slots used by the vertex shader
             // Slot 1: TerrainPatchData SRV
@@ -1414,9 +1417,9 @@ namespace Freefall.Components
             var cascadeVPs = DirectionalLight.CascadeViewProjections;
             var localToWorld = Matrix4x4.CreateTranslation(terrainPos);
             GPUCuller.CascadeData* cascadePtr = (GPUCuller.CascadeData*)_shadowCascadeBufferPtrs[frameIndex];
+            Span<Vector4> localPlanes = stackalloc Vector4[6];
             for (int c = 0; c < cascadeCount; c++)
             {
-                var localPlanes = new Vector4[6];
                 for (int p = 0; p < 6; p++)
                 {
                     var plane = allPlanes[c][p];
@@ -1477,7 +1480,7 @@ namespace Freefall.Components
             UploadBuffer(_shadowTerrainParamBuffers[frameIndex], shadowTerrainParams);
 
             // Clear shadow counter
-            commandList.SetDescriptorHeaps(1, new[] { Engine.Device.SrvHeap });
+            commandList.SetDescriptorHeaps(1, _srvHeaps ??= new[] { Engine.Device.SrvHeap });
             commandList.SetComputeRootSignature(Engine.Device.GlobalRootSignature);
             _shadowCounterBuffers[frameIndex].ClearUAV(commandList, new Vortice.Mathematics.Int4(0, 0, 0, 0));
 
@@ -1531,7 +1534,7 @@ namespace Freefall.Components
 
             commandList.IASetPrimitiveTopology(Vortice.Direct3D.PrimitiveTopology.TriangleList);
             commandList.IASetIndexBuffer(_patchMesh.IndexBufferView);                             // drawn indexed, as DrawTerrain
-            commandList.SetDescriptorHeaps(1, new[] { device.SrvHeap });
+            commandList.SetDescriptorHeaps(1, _srvHeaps ??= new[] { Engine.Device.SrvHeap });
             commandList.SetGraphicsRoot32BitConstant(0, holes, 27);                                // HoleTexIdx
 
             // Bind shadow patch data
@@ -1569,8 +1572,8 @@ namespace Freefall.Components
             var vpMatrix = Engine.Settings.FreezeFrustum
                 ? FrozenViewProjection
                 : Camera.Main!.ViewProjection;
-            var frustum = new Frustum(vpMatrix);
-            var planes = frustum.GetPlanesAsVector4();
+            Span<Vector4> planes = stackalloc Vector4[6];
+            new Frustum(vpMatrix).GetPlanes(planes);
 
             // Transform frustum planes from world to terrain local space
             var terrainPos = Transform.Position;
@@ -2580,7 +2583,7 @@ namespace Freefall.Components
             // Ensure compute shader is initialized (independent of deco buffers)
             _grassCS ??= new ComputeShader("grass_compute.hlsl");
             if (_kBakeNormals == 0) _kBakeNormals = _grassCS.FindKernel("CS_BakeTerrainNormals");
-            cmd.SetDescriptorHeaps(1, new[] { device.SrvHeap });
+            cmd.SetDescriptorHeaps(1, _srvHeaps ??= new[] { Engine.Device.SrvHeap });
             cmd.SetComputeRootSignature(device.GlobalRootSignature);
 
             _grassCS!.SetTexture(_kBakeNormals, "Heightmap", Terrain.Heightmap);
@@ -2648,7 +2651,7 @@ namespace Freefall.Components
                 _decoDispatchArgsBuffer!.Transition(commandList, ResourceStates.UnorderedAccess);
 
                 // Clear instance counter
-                commandList.SetDescriptorHeaps(1, new[] { device.SrvHeap });
+                commandList.SetDescriptorHeaps(1, _srvHeaps ??= new[] { Engine.Device.SrvHeap });
                 commandList.SetComputeRootSignature(device.GlobalRootSignature);
                 _instanceCounterBuffer.ClearUAV(commandList, new Vortice.Mathematics.Int4(0, 0, 0, 0));
                 commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(null)));

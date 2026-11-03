@@ -371,9 +371,9 @@ namespace Freefall.Graphics
             var vpMatrix = Engine.Settings.FreezeFrustum 
                 ? Engine.Settings.FrozenViewProjection 
                 : camera.ViewProjection;
-            var frustum = new Frustum(vpMatrix);
-            var frustumPlanes = frustum.GetPlanesAsVector4();
-            
+            Span<Vector4> frustumPlanes = stackalloc Vector4[6];
+            new Frustum(vpMatrix).GetPlanes(frustumPlanes);
+
             var constants = new GPUCuller.FrustumConstants
             {
                 Plane0 = frustumPlanes[0],
@@ -431,6 +431,7 @@ namespace Freefall.Graphics
         private static readonly ProfilerMarker _transformUploadMarker = ProfilerMarker.Get("Transform upload");
         private static readonly ProfilerMarker _opaqueMarker = ProfilerMarker.Get("Opaque");
         private static readonly ProfilerMarker _shadowsMarker = ProfilerMarker.Get("Shadows");
+        private static readonly ProfilerMarker _shadowHiZMarker = ProfilerMarker.Get("Shadow Hi-Z");
         private static readonly ProfilerMarker _skyMarker = ProfilerMarker.Get("Sky");
         private static readonly ProfilerMarker _transparentMarker = ProfilerMarker.Get("Transparent");
         private static readonly ProfilerMarker _lightingMarker = ProfilerMarker.Get("Lighting");
@@ -700,6 +701,7 @@ namespace Freefall.Graphics
                  // Generate shadow Hi-Z pyramid from this frame's shadow depth
                  if (ShadowHiZPyramid != null && CommandBuffer.Culler != null)
                  {
+                     using var hiZ = _shadowHiZMarker.Auto();
                      PixMarker.Begin(list, "Shadow Hi-Z");
                      // Merge barriers: skip intermediate PixelShaderResource state
                      list.ResourceBarrierTransition(ShadowTextureArray.Native,
