@@ -203,8 +203,9 @@ namespace Freefall.Animation
         internal bool Active => _weight > 0f || Drop != 0f;
 
         /// <summary>
-        /// Find the ground under both feet and hand it on, on the main thread once the character
-        /// has moved. With <paramref name="wanted"/> false (in the air, seated, out of sight) it
+        /// Find the ground under both feet and hand it on, once the character has moved. Any thread,
+        /// one placement at a time each, while nothing writes the physics scene (its rays write into a
+        /// buffer per thread). With <paramref name="wanted"/> false (in the air, seated, out of sight) it
         /// casts nothing and what it did fades out.
         /// </summary>
         public void Update(bool wanted)
@@ -347,35 +348,52 @@ namespace Freefall.Animation
                 : new Vector3(heel.X, heelY, heel.Z);
         }
 
+        // A foot's ray's hits: Scene.RaycastInto writes them here instead of making an object per hit (PhysX.Net's
+        // callback raycast made 6–20 KB a frame with a crowd near the camera). One buffer per thread: the project places
+        // every character's feet at once on workers (CharacterSystem's Feet), while nothing writes the physics scene
+        [ThreadStatic] private static RaycastHitData[] t_rayHits;
+
         private bool Ray(float x, float z, float feetY, out float y, out Vector3 normal)
         {
             float top = feetY + ReachUp, length = ReachUp + ReachDown;
             _hitAt = length;
             _hitNormal = Vector3.UnitY;
             _hitAny = false;
-            _onHits ??= OnHits;
-            PhysicsWorld.Scene?.Raycast(new Vector3(x, top, z), -Vector3.UnitY, length, 8, _onHits, HitFlag.Normal);
+            var scene = PhysicsWorld.Scene;
+            if (scene != null)
+            {
+                var from = new Vector3(x, top, z);
+                var hits = t_rayHits ??= new RaycastHitData[16];
+                int count = scene.RaycastInto(from, -Vector3.UnitY, length, hits, out bool full, HitFlag.Normal);
+                if (full)   // more hits than the buffer holds (the nearest may be among those left out): the old way
+                    scene.Raycast(from, -Vector3.UnitY, length, 8, _onHits ??= OnHits, HitFlag.Normal);
+                else
+                    for (int i = 0; i < count; i++)
+                        Hit(hits[i].Distance, hits[i].Shape, hits[i].Normal);
+            }
             y = top - _hitAt;
             normal = _hitNormal;
             return _hitAny;
         }
 
-        // The nearest solid thing a Collider made, what a character stands on: never a capsule, its
-        // own least of all, nor a trigger. A ray that starts inside something (a wall it brushes)
-        // meets it where it starts: no ground.
         private bool OnHits(RaycastHit[] hits)
         {
             if (hits == null) return true;
             foreach (var hit in hits)
-            {
-                if (hit == null || hit.Distance >= _hitAt || hit.Distance <= 0.001f) continue;
-                var shape = hit.Shape;
-                if (shape == null || (shape.Flags & ShapeFlag.TriggerShape) != 0 || shape.UserData is not Collider) continue;
-                _hitAt = hit.Distance;
-                _hitNormal = hit.Normal;
-                _hitAny = true;
-            }
+                if (hit != null) Hit(hit.Distance, hit.Shape, hit.Normal);
             return true;
+        }
+
+        // The nearest solid thing a Collider made, what a character stands on: never a capsule, its
+        // own least of all, nor a trigger. A ray that starts inside something (a wall it brushes)
+        // meets it where it starts: no ground.
+        private void Hit(float distance, Shape shape, Vector3 normal)
+        {
+            if (distance >= _hitAt || distance <= 0.001f) return;
+            if (shape == null || (shape.Flags & ShapeFlag.TriggerShape) != 0 || shape.UserData is not Collider) return;
+            _hitAt = distance;
+            _hitNormal = normal;
+            _hitAny = true;
         }
 
         /// <summary>
