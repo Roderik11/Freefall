@@ -1,7 +1,6 @@
 using System;
 using System.Collections.Generic;
 using System.Numerics;
-using System.Threading.Tasks;
 using Freefall.Base;
 using Freefall.Components;
 using Freefall.Graphics;
@@ -165,18 +164,33 @@ namespace Freefall.Animation
             Posed = posed;
 
             using (PosesMarker.Auto(posed))
+                ParallelWork.For(_stepped.Count, _stepOne ??= StepOne);
+        }
+
+        // The parallel loops' bodies, made once: ParallelWork.For allocates nothing with a kept delegate
+        private Action<int>? _stepOne, _poseFirstOne;
+
+        private void StepOne(int i)
+        {
+            var animator = _stepped[i];
+            try
             {
-                Parallel.For(0, _stepped.Count, i =>
-                {
-                    var animator = _stepped[i];
-                    try
-                    {
-                        animator.Step();
-                        if (animator.PoseDue) animator.Pose(animator.PoseEvery);
-                    }
-                    catch (Exception e) { CallbackErrors.Report(animator, nameof(Animator.Update), e); }
-                });
+                animator.Step();
+                if (animator.PoseDue) animator.Pose(animator.PoseEvery);
             }
+            catch (Exception e) { CallbackErrors.Report(animator, nameof(Animator.Update), e); }
+        }
+
+        private void PoseFirstOne(int i)
+        {
+            var animator = _stepped[i];
+            try
+            {
+                animator.StepDelta = 0f;
+                animator.Step();
+                animator.Pose(1);
+            }
+            catch (Exception e) { CallbackErrors.Report(animator, nameof(Animator.Update), e); }
         }
 
         /// <summary>
@@ -198,17 +212,7 @@ namespace Freefall.Animation
             }
             if (_stepped.Count == 0) return;
 
-            Parallel.For(0, _stepped.Count, i =>
-            {
-                var animator = _stepped[i];
-                try
-                {
-                    animator.StepDelta = 0f;
-                    animator.Step();
-                    animator.Pose(1);
-                }
-                catch (Exception e) { CallbackErrors.Report(animator, nameof(Animator.Update), e); }
-            });
+            ParallelWork.For(_stepped.Count, _poseFirstOne ??= PoseFirstOne);
             _stepped.Clear();
         }
 
