@@ -823,7 +823,7 @@ namespace Freefall
          public float GTAOPower{ get; set; } = 1.5f;                       // Visibility exponent (higher = darker)
 
          [ValueRange(1, 8)]
-         public int GTAOSlices { get; set; } = 8;                           // Horizon slices per pixel (quality vs cost)
+         public int GTAOSlices { get; set; } = 4;                           // Horizon slices per pixel (quality vs cost)
 
          /// <summary>
          /// Trace and denoise AO at half resolution, then upsample it depth-aware to the screen. At 3 slices it shimmered
