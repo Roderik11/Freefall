@@ -109,6 +109,11 @@ namespace Freefall.Base
             };
             _crowd = new DtCrowd(crowdCfg, navMesh, _ => Costly());   // its agents' ways as FindPath's
 
+            // The phases that work on one agent at a time run on workers (our DotRecast: a query per thread), and every
+            // phase shows in the profiler under Navigation, with its threads where it has them
+            _crowd.ParallelFor = ParallelWork.For;
+            _crowd.Telemetry().Observer = CrowdPhases.Instance;
+
             // Log navmesh bounds for diagnostics
             float minX = float.MaxValue, minY = float.MaxValue, minZ = float.MaxValue;
             float maxX = float.MinValue, maxY = float.MinValue, maxZ = float.MinValue;
@@ -589,5 +594,46 @@ namespace Freefall.Base
 
         internal static RcVec3f ToRc(Vector3 v) => new(v.X, v.Y, v.Z);
         internal static Vector3 FromRc(RcVec3f v) => new(v.X, v.Y, v.Z);
+    }
+
+    /// <summary>
+    /// The crowd's phases as profiler sections under Navigation ("Crowd plan velocity", ...), from DotRecast's telemetry
+    /// as each begins and ends (our DotRecast: <see cref="IDtCrowdPhaseObserver"/>). The path queue's update runs inside
+    /// the move requests', so the open sections are kept as a stack.
+    /// </summary>
+    internal sealed class CrowdPhases : IDtCrowdPhaseObserver
+    {
+        public static readonly CrowdPhases Instance = new();
+
+        private readonly Dictionary<DtCrowdTimerLabel, ProfilerMarker> _markers = new();
+        private readonly ProfilerScope[] _open = new ProfilerScope[8];
+        private int _depth;
+
+        public void Begin(DtCrowdTimerLabel phase)
+        {
+            if (!_markers.TryGetValue(phase, out var marker))
+                _markers[phase] = marker = ProfilerMarker.Get("Crowd " + Words(phase.Label));
+            if (_depth < _open.Length) _open[_depth] = marker.Auto();
+            _depth++;
+        }
+
+        public void End(DtCrowdTimerLabel phase)
+        {
+            if (_depth == 0) return;
+            if (--_depth < _open.Length) _open[_depth].Dispose();
+        }
+
+        // "PlanVelocity" → "plan velocity"
+        private static string Words(string label)
+        {
+            var text = new System.Text.StringBuilder(label.Length + 4);
+            for (int i = 0; i < label.Length; i++)
+            {
+                char c = label[i];
+                if (char.IsUpper(c) && i > 0) text.Append(' ');
+                text.Append(char.ToLowerInvariant(c));
+            }
+            return text.ToString();
+        }
     }
 }
