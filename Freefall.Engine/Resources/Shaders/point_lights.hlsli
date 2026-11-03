@@ -54,7 +54,7 @@ float PointLightInner(float innerRadius, float d2)
 
 // The camera and frame, per renderer, for the light cull and the shadow selection (not SceneConstants: those
 // are set for lighting later in the frame, and by whichever renderer ran last). Must match C#
-// PointLightBuffer.FrameParams (224 bytes).
+// PointLightBuffer.FrameParams (228 bytes).
 struct PointLightFrame
 {
     row_major float4x4 CameraRelativeVP;    // camera-relative world -> clip (view without translation)
@@ -74,6 +74,7 @@ struct PointLightFrame
     float2 TerrainSize;
     float SunHeight;                        // sine of the sun's (moon's) elevation, 0 below the horizon: SunLight × it = level ground
     float LampFadeStep;                     // lamp fade per frame (Δt / Daylight.LampFadeSeconds)
+    float Exposure;                         // the frame's pre-exposure (Atmosphere.Exposure): luminance × it = what the HDR targets store
 };
 
 // Per registry slot: the daylight where each enabled light hangs, and whether a light marked OnlyWhenDark is lit

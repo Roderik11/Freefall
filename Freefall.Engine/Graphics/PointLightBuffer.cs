@@ -57,7 +57,7 @@ namespace Freefall.Graphics
             public float Score;
         }
 
-        /// <summary>The camera and frame for the cull and the shadow selection. Must match PointLightFrame (224 bytes).</summary>
+        /// <summary>The camera and frame for the cull and the shadow selection. Must match PointLightFrame (228 bytes).</summary>
         [StructLayout(LayoutKind.Sequential)]
         public struct FrameParams
         {
@@ -78,6 +78,7 @@ namespace Freefall.Graphics
             public Vector2 TerrainSize;
             public float SunHeight;         // Daylight.SunHeight: SunLight × it = the sun's lux on level ground
             public float LampFadeStep;      // Δt / Daylight.LampFadeSeconds
+            public float Exposure;          // Atmosphere.Exposure: a hidden light's shadow only if its light could show (selection)
         }
 
         /// <summary>Per registry slot: whether a lamp (OnlyWhenDark) is lit. Must match LampState in point_lights.hlsli (16 bytes).</summary>

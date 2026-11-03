@@ -8,7 +8,9 @@
 //              how much the light outshines the daylight on the surfaces round it (LampState.SurfaceLux, judged
 //              last frame by point_light_lamps.hlsl past the terrain and the walls and roofs). A street lamp at
 //              clear noon gets none, a cave lamp that day keeps its shadow, a room light gets one once the room is
-//              darker than its light, an overcast or night street gets them. Score histogram.
+//              darker than its light, an overcast or night street gets them. A hidden light's sun factor is at most
+//              what the camera's exposure could show of its light (ShownFactor): the cave lamp seen from the sunlit
+//              ground above gets none. Score histogram.
 // CSGather     per visible light: the lights in the histogram's top bins (at least the budget) and those still
 //              fading out become candidates, with their visible faces and preferred tier.
 // CSSelect     one group: sorts the candidates (bitonic), then one thread fits them into the atlas in rank order
@@ -198,6 +200,12 @@ uint PreferredTier(float radiusPixels, uint stateTier)
     return radiusPixels > to512 ? 0u : radiusPixels > to256 ? 1u : 2u;
 }
 
+// The light's lux a third of its range out (candela / d², its window leaves 0.975 there)
+float OwnLux(PointLightData light)
+{
+    return light.Score * 0.975 * 9.0 / max(light.Range * light.Range, 1e-4);   // the cull's luminance × base candela
+}
+
 // How much the light outshines the daylight around it: 0 when the daylight drowns it, 1 when the light rules its
 // surroundings. In lux: the light's a third of its range out (candela / d², its window leaves 0.975 there) against the
 // daylight on the surfaces round it (LampState.SurfaceLux: sun and sky past the terrain and the sky captures, with the
@@ -212,9 +220,22 @@ float SunFactor(PointLightData light)
     LampState judged = lamps[light.Slot];
     if (judged.Seen == 0)
         return 0.0;
-    float own = light.Score * 0.975 * 9.0 / max(light.Range * light.Range, 1e-4);   // the cull's luminance × base candela
+    float own = OwnLux(light);
     float dominance = own / max(own + judged.SurfaceLux, 1e-6);
     return smoothstep(0.25, 0.5, dominance);
+}
+
+// A light hidden behind what the camera sees (CentreHidden) shows only on the surfaces in front of it, where the
+// camera's exposure was set, so its shadow is worth a slot only if its light could show at that exposure. Its lux a
+// third of its range out on a white surface, pre-exposed, against the metered luminance, which Exposure = 1 / (1.2 · 2^EV)
+// with EV = log2(L) + 3 puts at 1/9.6 (before the compensations): none below 4 % of it, full from 8 %. The Undercourt's
+// well fires (220,000 lm, 70 m), 30 m under the ground and seen by day from the meadow 400 m off, came to 1.5 % and
+// took all 12 shadows (2026-11-03); at night, or from inside the Undercourt, the exposure opens and they keep them:
+// their shadow is what holds their light under the ground above.
+float ShownFactor(PointLightData light, PointLightFrame frame)
+{
+    float shown = OwnLux(light) / 3.14159265 * frame.Exposure * 9.6;
+    return smoothstep(0.04, 0.08, shown);
 }
 
 // ── CSScore ──────────────────────────────────────────────────────────────────
@@ -247,11 +268,14 @@ void CSScore(uint3 dtid : SV_DispatchThreadID)
         if (RadiusPixels(light, frame) >= MIN_RADIUS_PIXELS && light.Range > 2.0 * NEAR_PLANE)
         {
             state.SunFactor = SunFactor(light);
+            bool hidden = state.SunFactor > 0.0 && CentreHidden(light.Position, light.Range, frame);
+            if (hidden)
+                state.SunFactor = min(state.SunFactor, ShownFactor(light, frame));
             float near = max(length(light.Position), 0.25 * light.Range);
             score = light.Score * light.Range * light.Range / (near * near) * state.SunFactor;
             if (state.Fade > 0.0)
                 score *= STICKY_BONUS;
-            if (score > 0.0 && CentreHidden(light.Position, light.Range, frame))
+            if (hidden)
                 score *= HIDDEN_FACTOR;
         }
         states[light.Slot] = state;

@@ -1073,6 +1073,7 @@ namespace Freefall.Graphics
                  TerrainSize = terrain.Size,
                  SunHeight = Daylight.SunHeight(),
                  LampFadeStep = Math.Clamp(Time.Delta, 0f, 0.1f) / Daylight.LampFadeSeconds,
+                 Exposure = Atmosphere.Exposure,
              };
         }
 
