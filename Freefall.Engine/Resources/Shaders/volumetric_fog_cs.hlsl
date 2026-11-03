@@ -263,19 +263,26 @@ float CascadeShadow(float3 worldPos, float viewDepth)
 // from an up-facing surface. 1 without captures. A different 4 each frame, left to the history to average, flickered
 // under crowns, where the directions differ most, and most under a deck, where the sky is all the air's light (a forest
 // in Snowfall; user and Georg, 2026-10-23): the history keeps a period-4 ripple, and drops it where the grid moves on.
-// All 16 cost 0.08 ms more (0.31 ms at 2176×1249).
+// All 16 cost 0.08 ms more (0.31 ms at 2176×1249). The views come from group shared memory, loaded once per group by
+// CSFogScatter (as sky_visibility_cs does): each froxel reading all 16 from the structured buffer was most of the cost.
+groupshared SkyCaptureView gFogViews[SKY_CAPTURE_VIEWS];
+
+bool FogHasCaptures(AtmosphereParams A)
+{
+    return A.SkyCaptureViews != 0 && A.SkyCaptureDepth != 0 && A.SkyCaptureCount == SKY_CAPTURE_VIEWS;
+}
+
 float FogMeshSkyVisibility(AtmosphereParams A, float3 worldPos)
 {
-    if (A.SkyCaptureViews == 0 || A.SkyCaptureDepth == 0 || A.SkyCaptureCount != SKY_CAPTURE_VIEWS)
+    if (!FogHasCaptures(A))
         return 1.0;
-    StructuredBuffer<SkyCaptureView> views = ResourceDescriptorHeap[A.SkyCaptureViews];
     Texture2DArray<float> depths = ResourceDescriptorHeap[A.SkyCaptureDepth];
     float width, height, slices;
     depths.GetDimensions(width, height, slices);
     float lit = 0, total = 0;
     [unroll] for (uint i = 0; i < SKY_CAPTURE_VIEWS; i++)
     {
-        lit += SkyCaptureViewLight(views[i], i, depths, float2(width, height), AtmosphereLinearClamp, worldPos,
+        lit += SkyCaptureViewLight(gFogViews[i], i, depths, float2(width, height), AtmosphereLinearClamp, worldPos,
                                    float3(0, 1, 0), total);
     }
     return total > 0.0 ? lit / total : 1.0;
@@ -395,8 +402,20 @@ float3 FroxelPointLights(AtmosphereParams A, AtmMedium medium, FroxelSmoke smoke
 }
 
 [numthreads(8, 8, 1)]
-void CSFogScatter(uint3 id : SV_DispatchThreadID)
+void CSFogScatter(uint3 id : SV_DispatchThreadID, uint groupIndex : SV_GroupIndex)
 {
+    // The sky capture views, once per group (FogMeshSkyVisibility); every thread reaches the barrier
+    if (AtmosphereIdx != 0 && groupIndex < SKY_CAPTURE_VIEWS)
+    {
+        AtmosphereParams A = LoadAtmosphere();
+        if (FogHasCaptures(A))
+        {
+            StructuredBuffer<SkyCaptureView> views = ResourceDescriptorHeap[A.SkyCaptureViews];
+            gFogViews[groupIndex] = views[groupIndex];
+        }
+    }
+    GroupMemoryBarrierWithGroupSync();
+
     if (any(id >= GridSize))
         return;
     RWTexture3D<float4> output = ResourceDescriptorHeap[ScatterUAVIdx];
