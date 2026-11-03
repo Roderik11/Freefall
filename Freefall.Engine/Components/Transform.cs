@@ -194,10 +194,16 @@ namespace Freefall.Components
             }
         }
 
+        /// <summary>
+        /// Position and rotation at once: one SetDirty (its children, the transform upload, OnChanged) instead of one
+        /// per setter, for whatever moves and turns every frame.
+        /// </summary>
         public void Set(Vector3 position, Quaternion rotation)
         {
-            Position = position;
-            Rotation = rotation;
+            if (_position == position && _rotation == rotation) return;
+            _position = position;
+            _rotation = rotation;
+            SetDirty();
         }
 
         public void RotateLocal(Vector3 axis, float angle)
