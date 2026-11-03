@@ -793,8 +793,8 @@ namespace Freefall.Graphics
         /// re-registering the draws each frame would defeat the point of persistent draws.
         ///
         /// Safe without a lock from the (parallel) update phase: it only writes this group's own
-        /// records in the staging arrays, which are re-uploaded in full when the pass executes, and
-        /// batches are only restructured during rendering (FlushPersistent, bucket merge).
+        /// records in the staging arrays and marks them (atomically) for the next upload of every frame
+        /// slot, and batches are only restructured during rendering (FlushPersistent, bucket merge).
         /// Records not applied yet (group registered this frame) get the value from their DrawCall.
         /// </summary>
         public static void SetBoneBuffer(DrawGroup group, uint boneBufferIdx)

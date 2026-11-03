@@ -90,9 +90,12 @@ namespace Freefall.Graphics
             public int Capacity; // in slots
             public int ElementsPerInstance; // e.g. numBones
             public int ElementStride; // bytes per element
-            public bool Dirty;
-            
-            // CPU staging buffer â€” filled during MergeFromBucket, uploaded in one MemoryCopy
+            // This frame's enqueued draws wrote it (MergeFromBucket): records [PersistentCount, DrawCount) are uploaded
+            public bool Enqueued;
+            // Per frame slot: its GPU buffer was made since its last upload, which then writes every record
+            public bool[] Stale = new bool[FrameCount];
+
+            // CPU staging buffer: persistent records (AddPersistent) and this frame's enqueued draws (MergeFromBucket)
             public byte[] StagingData = Array.Empty<byte>();
             public int StagingCapacity; // in slots (matches Capacity growth)
         }
@@ -168,6 +171,13 @@ namespace Freefall.Graphics
         private uint[] _changedRecordBits = Array.Empty<uint>();
         private bool _anyRecordChanged;
         private StreamingBuffer<uint>? _changedRecords;
+
+        // Per frame slot, one bit per persistent record whose staged data changed since that slot's last upload, which
+        // writes those records (and this frame's enqueued draws) into the slot's GPU copy and clears them. Sized with
+        // the capacity, never resized while set: SetPersistentBoneBuffer marks from the parallel update phase.
+        private readonly uint[][] _writtenRecordBits = new uint[FrameCount][];
+        private readonly bool[] _anyRecordWritten = new bool[FrameCount];
+        private readonly List<(int Start, int End)> _writtenRanges = new();
         private uint[] visibilityFlagsSRVIndices = new uint[FrameCount]; // SRV for reading previous frame's flags
         
         // Entries in the indirect command, counter and indexed command buffers: one per mesh part, since a batch's
@@ -276,10 +286,10 @@ namespace Freefall.Graphics
             _maxTransformSlot = 0;
             _isGPUSourced = false;
             _boundsWritten = false;
-            // The staging arrays are re-uploaded in full every frame (one memcpy per channel), so the
-            // triple-buffered GPU copies never need per-slot dirty tracking.
+            // Persistent records reach the triple-buffered GPU copies as they change (_writtenRecordBits), not by
+            // re-uploading every record each frame
             foreach (var buf in _perInstanceBuffers.Values)
-                buf.Dirty = _persistentCount > 0;
+                buf.Enqueued = false;
         }
 
         /// <summary>
@@ -458,9 +468,12 @@ namespace Freefall.Graphics
             fixed (byte* ptr = &pib.StagingData[offset])
             {
                 var descriptor = (InstanceDescriptor*)ptr;
+                if (descriptor->BoneBufferIdx == boneBufferIdx) return;
                 // The camera culling's transform cache keeps whether the instance is skinned, not the index
                 if ((descriptor->BoneBufferIdx != 0) != (boneBufferIdx != 0))
                     MarkRecordChanged(index);
+                else
+                    MarkRecordWritten(index);
                 descriptor->BoneBufferIdx = boneBufferIdx;
             }
         }
@@ -471,6 +484,17 @@ namespace Freefall.Graphics
         {
             System.Threading.Interlocked.Or(ref _changedRecordBits[index >> 5], 1u << (index & 31));
             _anyRecordChanged = true;
+            MarkRecordWritten(index);
+        }
+
+        // A persistent record's index whose staged data changed: every frame slot's GPU copy takes it at its next upload
+        private void MarkRecordWritten(int index)
+        {
+            for (int f = 0; f < FrameCount; f++)
+            {
+                System.Threading.Interlocked.Or(ref _writtenRecordBits[f][index >> 5], 1u << (index & 31));
+                _anyRecordWritten[f] = true;
+            }
         }
 
         private static void EnsureStaging(PerInstanceBuffer pib, int slots)
@@ -561,9 +585,8 @@ namespace Freefall.Graphics
                 };
                 _perInstanceBuffers[hash] = pib;
             }
-            // Override the SRV index for this frame with the GPU-generated buffer
+            // Override the SRV index for this frame with the GPU-generated buffer (UploadInstanceData skips the batch)
             pib.SRVIndices[frameIndex] = srvIndex;
-            pib.Dirty = false; // Don't upload CPU data
         }
 
 
@@ -618,7 +641,7 @@ namespace Freefall.Graphics
                 // Block-copy from bucket staging into batch staging
                 int srcBytes = staging.Count * bytesPerInst;
                 Buffer.BlockCopy(staging.Data, 0, pib.StagingData, startIdx * bytesPerInst, srcBytes);
-                pib.Dirty = true;
+                pib.Enqueued = true;
             }
             
             // Track max transform slot for bone buffer sizing
@@ -639,6 +662,8 @@ namespace Freefall.Graphics
             Array.Resize(ref _draws, capacity);
             Array.Resize(ref _handles, capacity);
             Array.Resize(ref _changedRecordBits, (capacity + 31) / 32);
+            for (int f = 0; f < FrameCount; f++)
+                Array.Resize(ref _writtenRecordBits[f], (capacity + 31) / 32);
 
             RecreateGpuBuffers();
         }
@@ -692,35 +717,97 @@ namespace Freefall.Graphics
             UploadPerInstanceBuffers(frameIndex);
         }
 
-        private void UploadPerInstanceBuffers(int frameIndex)
+        // Into this frame slot's GPU copy of each channel: the persistent records written since the slot's last upload,
+        // and this frame's enqueued draws. A slot whose buffer was just made takes every record.
+        private unsafe void UploadPerInstanceBuffers(int frameIndex)
         {
             if (_drawCount == 0) return;
             int requiredSlots = _drawCount; // Dense: per-instance data is indexed by instance, not TransformSlot
+            int persistent = _persistentCount;
+            CollectWrittenRanges(frameIndex, persistent);
 
             foreach (var (hash, pib) in _perInstanceBuffers)
             {
-                if (!pib.Dirty) continue;
                 if (pib.ElementStride == 0 || pib.ElementsPerInstance == 0) continue;
+                bool enqueued = pib.Enqueued && requiredSlots > persistent;
+                if (persistent == 0 && !enqueued) continue;
 
                 // Ensure GPU buffer capacity
                 EnsurePerInstanceBuffer(pib, requiredSlots);
 
-                // Single MemoryCopy from pre-staged byte array â€” no iteration, no reflection
                 int bytesPerSlot = pib.ElementsPerInstance * pib.ElementStride;
-                int uploadBytes = requiredSlots * bytesPerSlot;
-                if (uploadBytes > pib.StagingData.Length)
-                    uploadBytes = pib.StagingData.Length;
-
-                var buf = pib.Buffers[frameIndex];
-                unsafe
+                byte* mapped = null;
+                fixed (byte* staging = pib.StagingData)
                 {
-                    byte* pData;
-                    buf.Map(0, null, (void**)&pData);
-                    fixed (byte* pSrc = pib.StagingData)
-                        Buffer.MemoryCopy(pSrc, pData, uploadBytes, uploadBytes);
-                    buf.Unmap(0);
+                    if (pib.Stale[frameIndex])
+                    {
+                        CopyRecords(pib, frameIndex, ref mapped, staging, 0, requiredSlots, bytesPerSlot);
+                        pib.Stale[frameIndex] = false;
+                    }
+                    else
+                    {
+                        foreach (var (start, end) in _writtenRanges)
+                            CopyRecords(pib, frameIndex, ref mapped, staging, start, Math.Min(end, persistent), bytesPerSlot);
+                        if (enqueued)
+                            CopyRecords(pib, frameIndex, ref mapped, staging, persistent, requiredSlots, bytesPerSlot);
+                    }
+                }
+                if (mapped != null)
+                    pib.Buffers[frameIndex].Unmap(0);
+            }
+        }
+
+        // Records [start, end) of a channel's staging into this frame slot's GPU copy, mapping it on the first copy
+        private static unsafe void CopyRecords(PerInstanceBuffer pib, int frameIndex, ref byte* mapped, byte* staging,
+            int start, int end, int bytesPerSlot)
+        {
+            int from = start * bytesPerSlot;
+            int to = Math.Min(end * bytesPerSlot, pib.StagingData.Length);
+            if (to <= from) return;
+            if (mapped == null)
+            {
+                byte* pData;
+                pib.Buffers[frameIndex].Map(0, null, (void**)&pData);
+                mapped = pData;
+            }
+            Buffer.MemoryCopy(staging + from, mapped + from, to - from, to - from);
+        }
+
+        // This frame slot's written persistent records as runs [Start, End) in _writtenRanges, cleared from its bits.
+        // Bits past the persistent records (records removed since) are left: an index added again is marked again.
+        private void CollectWrittenRanges(int frameIndex, int persistent)
+        {
+            _writtenRanges.Clear();
+            if (!_anyRecordWritten[frameIndex]) return;
+            _anyRecordWritten[frameIndex] = false;
+
+            var bits = _writtenRecordBits[frameIndex];
+            int words = Math.Min((persistent + 31) >> 5, bits.Length);
+            int start = -1;
+            for (int w = 0; w < words; w++)
+            {
+                uint word = bits[w];
+                if (word == 0 && start < 0) continue;
+                bits[w] = 0;
+                if (word == ~0u)
+                {
+                    if (start < 0) start = w << 5;
+                    continue;
+                }
+                for (int b = 0; b < 32; b++)
+                {
+                    bool set = (word & (1u << b)) != 0;
+                    if (set && start < 0)
+                        start = (w << 5) + b;
+                    else if (!set && start >= 0)
+                    {
+                        _writtenRanges.Add((start, (w << 5) + b));
+                        start = -1;
+                    }
                 }
             }
+            if (start >= 0)
+                _writtenRanges.Add((start, words << 5));
         }
 
         private void EnsurePerInstanceBuffer(PerInstanceBuffer pib, int requiredSlots)
@@ -746,6 +833,7 @@ namespace Freefall.Graphics
                     (uint)pib.ElementStride,
                     pib.SRVIndices[i]);
             }
+            Array.Fill(pib.Stale, true);
 
             pib.Capacity = requiredSlots;
         }
