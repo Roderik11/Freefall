@@ -104,7 +104,7 @@ namespace Freefall.Editor
                 // ── Workers: the asset database ──
                 await Step(0, Runs.Worker, () => Engine.OpenProject(path, Report));
                 Rename(Engine.Project.Name);
-                await OnMain("Recent projects", () => RecentProjects.Add(Engine.Project.Name, path));
+                await OnMain("Recent projects", () => RecentProjects.Add(Engine.Project.Name, Engine.Project.RootDirectory));
 
                 await StepAsync(1, () => AssetDatabase.ImportAllAsync((detail, fraction) =>
                 {

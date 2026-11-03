@@ -27,6 +27,10 @@ namespace Freefall.Assets
         /// </summary>
         public static FreefallProject Open(string path)
         {
+            // One spelling of the root: paths built on it are compared with the file system's ("D:/x" from a
+            // caller left every file the asset browser lists without its GUID)
+            path = Path.TrimEndingDirectorySeparator(Path.GetFullPath(path));
+
             string projectFile;
             string rootDir;
 

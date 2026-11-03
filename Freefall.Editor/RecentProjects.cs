@@ -76,10 +76,10 @@ namespace Freefall.Editor
 
         public static void Add(string name, string path)
         {
-            var previous = Entries.Find(e => string.Equals(e.Path, path, StringComparison.OrdinalIgnoreCase));
+            var previous = Entries.Find(e => SamePath(e.Path, path));
 
-            // Remove existing entry for same path (case-insensitive)
-            Entries.RemoveAll(e => string.Equals(e.Path, path, StringComparison.OrdinalIgnoreCase));
+            // Remove existing entry for same folder, however it was spelled
+            Entries.RemoveAll(e => SamePath(e.Path, path));
 
             // Insert at top
             Current = new RecentProjectEntry
@@ -101,8 +101,18 @@ namespace Freefall.Editor
 
         public static void Remove(string path)
         {
-            Entries.RemoveAll(e => string.Equals(e.Path, path, StringComparison.OrdinalIgnoreCase));
+            Entries.RemoveAll(e => SamePath(e.Path, path));
             Save();
+        }
+
+        /// <summary>One folder however it is spelled ("D:/x" and "D:\x\"), ignoring case.</summary>
+        private static bool SamePath(string a, string b) =>
+            string.Equals(FullPath(a), FullPath(b), StringComparison.OrdinalIgnoreCase);
+
+        private static string FullPath(string path)
+        {
+            try { return Path.TrimEndingDirectorySeparator(Path.GetFullPath(path)); }
+            catch { return path; }
         }
     }
 }
