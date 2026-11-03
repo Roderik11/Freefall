@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Runtime.ExceptionServices;
 using System.Threading;
@@ -18,9 +19,31 @@ namespace Freefall
     ///
     /// The profiler hears of every call: the section open around it shows how many threads took part and the time they
     /// spent in its bodies together (Profiler.Parallel), so what runs threaded shows without marking it by hand.
+    ///
+    /// Code that must not run inside a body (it changes what several threads may be reading: entities, components,
+    /// shared places) calls <see cref="AssertSerial"/>, which logs the first call from each place that breaks the rule.
     /// </summary>
     public static class ParallelWork
     {
+        // How deep this thread is in bodies of For: on a helper, and on the calling thread while it takes its share
+        [ThreadStatic] private static int t_inBody;
+
+        /// <summary>This thread is running a body of <see cref="For"/> (a helper, or the caller taking its share).</summary>
+        public static bool InBody => t_inBody > 0;
+
+        private static readonly ConcurrentDictionary<string, bool> _reported = new();
+
+        /// <summary>
+        /// For code that changes what a parallel loop's bodies may read at the same time (entities and components made or
+        /// removed, shared places taken): logs once per <paramref name="what"/>, with the call stack, when called from a
+        /// body of <see cref="For"/>. Nothing else: the call goes on. Costs one thread-static read when it is not.
+        /// </summary>
+        public static void AssertSerial(string what)
+        {
+            if (t_inBody > 0 && _reported.TryAdd(what, true))
+                Debug.LogError("ParallelWork", $"{what} from a parallel loop's body: it changes what other threads read. "
+                                              + Environment.StackTrace);
+        }
         // Indices still to be claimed, counted down: a helper that comes late (its call already done) claims a negative
         // number and goes, and the next call sets the count anew. No call starts before every index of the last one has
         // been processed, so a valid claim always belongs to the body that is set.
@@ -59,8 +82,13 @@ namespace Freefall
             if (alone || Interlocked.CompareExchange(ref _busy, 1, 0) != 0)
             {
                 long start = Stopwatch.GetTimestamp();
-                for (int i = 0; i < count; i++)
-                    body(i);
+                t_inBody++;
+                try
+                {
+                    for (int i = 0; i < count; i++)
+                        body(i);
+                }
+                finally { t_inBody--; }
                 // In order on this thread. A call inside another's body is part of that one's work, already counted
                 if (alone) Profiler.Parallel(Stopwatch.GetTimestamp() - start, 1);
                 return;
@@ -110,6 +138,7 @@ namespace Freefall
             // Counted before its first body, so the call cannot end before this thread has added its time
             Interlocked.Increment(ref _adding);
             long start = Stopwatch.GetTimestamp();
+            t_inBody++;
             do
             {
                 try { _body!(index); }
@@ -119,6 +148,7 @@ namespace Freefall
                     _done.Set();
             }
             while ((index = Interlocked.Decrement(ref _unclaimed)) >= 0);
+            t_inBody--;
 
             Interlocked.Add(ref _workTicks, Stopwatch.GetTimestamp() - start);
             Interlocked.Increment(ref _threads);

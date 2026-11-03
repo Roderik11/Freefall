@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Numerics;
+using System.Threading;
 using Freefall.Base;
 using Freefall.Graphics;
 using Vortice.Mathematics;
@@ -68,7 +69,7 @@ namespace Freefall.Components
         public int Depth => _parent != null ? _parent.Depth + 1 : 0;
         public int GetChildCount() => Children.Count;
         public Transform GetChild(int i) => Children.Count > i ? Children[i] : null;
-        public bool IsDirty => _isDirty ? true : (_parent != null ? _parent.IsDirty : false);
+        public bool IsDirty => Volatile.Read(ref _isDirty) || (_parent != null && _parent.IsDirty);
         public Vector3 WorldPosition => IsDirty ? Matrix.Translation : _worldPosition;
         public Vector3 WorldScale => _parent != null ? _scale * _parent.WorldScale : _scale;
         public Vector3 Up => Vector3.Normalize(new Vector3(Matrix.M21, Matrix.M22, Matrix.M23));
@@ -164,7 +165,9 @@ namespace Freefall.Components
         }
 
         /// <summary>
-        /// Cached world matrix — lazy recompute only when dirty.
+        /// Cached world matrix — lazy recompute only when dirty. Safe to read from several threads at once while nobody
+        /// writes the transform (a parallel loop reading others'): it is computed whole and stored before the flag is
+        /// cleared, so a reader that finds it clean finds the new values, and two that find it dirty compute the same.
         /// </summary>
         [System.ComponentModel.Browsable(false)]
         public Matrix4x4 Matrix
@@ -173,10 +176,13 @@ namespace Freefall.Components
             {
                 if (IsDirty)
                 {
-                    _isDirty = false;
-                    _localTransform = Matrix4x4.CreateScale(_scale) * Matrix4x4.CreateFromQuaternion(_rotation) * Matrix4x4.CreateTranslation(_position);
-                    _matrix = _parent != null ? _localTransform * _parent.Matrix : _localTransform;
-                    _worldPosition = _matrix.Translation;
+                    var local = Matrix4x4.CreateScale(_scale) * Matrix4x4.CreateFromQuaternion(_rotation) * Matrix4x4.CreateTranslation(_position);
+                    var matrix = _parent != null ? local * _parent.Matrix : local;
+                    _localTransform = local;
+                    _matrix = matrix;
+                    _worldPosition = matrix.Translation;
+                    Volatile.Write(ref _isDirty, false);
+                    return matrix;
                 }
 
                 return _matrix;

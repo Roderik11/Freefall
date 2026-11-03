@@ -115,6 +115,7 @@ namespace Freefall.Base
 
         public T AddComponent<T>(T component) where T : Component
         {
+            ParallelWork.AssertSerial("Entity.AddComponent");   // the component caches other threads iterate
             _components.Add(component);
             component.Entity = this;
             
@@ -239,6 +240,7 @@ namespace Freefall.Base
         /// </summary>
         public void RemoveComponent(Component component)
         {
+            ParallelWork.AssertSerial("Entity.RemoveComponent");
             if (component is Transform) return; // never remove Transform
             if (!_components.Remove(component)) return;
 
@@ -298,6 +300,7 @@ namespace Freefall.Base
         /// </summary>
         public void Destroy()
         {
+            ParallelWork.AssertSerial("Entity.Destroy");
             IsBeingDestroyed = true;
             var childCount = Transform.Count;
 

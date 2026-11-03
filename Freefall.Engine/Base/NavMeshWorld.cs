@@ -16,7 +16,6 @@ namespace Freefall.Base
     public static class NavMeshWorld
     {
         private static DtNavMesh? _navMesh;
-        private static DtNavMeshQuery? _navQuery;
         private static DtCrowd? _crowd;
 
         // Half-extents for navmesh point queries (search volume)
@@ -95,9 +94,8 @@ namespace Freefall.Base
         public static void Initialize(DtNavMesh navMesh)
         {
             _navMesh = navMesh;
-            _navQuery = new DtNavMeshQuery(navMesh);
             _wayQuery = new DtNavMeshQuery(navMesh);
-            _wayAsked.Clear();
+            ClearAsks();
             _waySearching = null;
             _cappedLogged = false;
 
@@ -147,9 +145,8 @@ namespace Freefall.Base
         public static void Shutdown()
         {
             _crowd = null;
-            _navQuery = null;
             _wayQuery = null;
-            _wayAsked.Clear();
+            ClearAsks();
             _waySearching = null;
             _navMesh = null;
             Debug.Log("[NavMeshWorld] Shutdown");
@@ -178,42 +175,44 @@ namespace Freefall.Base
 
         /// <summary>
         /// <see cref="FindPath(Vector3, Vector3)"/> into the caller's list, emptied first, without allocating. False when
-        /// no way was found. Main thread only.
+        /// no way was found. Any thread (a query of its own, <see cref="Local"/>).
         /// </summary>
         public static bool FindPath(Vector3 from, Vector3 to, List<Vector3> into)
         {
             into.Clear();
-            if (_navQuery == null) return false;
+            var local = Local();
+            if (local == null) return false;
+            var query = local.Query;
             using var timed = FindPathMarker.Auto();
 
             var startPos = ToRc(from);
             var endPos = ToRc(to);
             var filter = DefaultFilter;
 
-            _navQuery.FindNearestPoly(startPos, QueryExtents, filter,
+            query.FindNearestPoly(startPos, QueryExtents, filter,
                 out long startRef, out var startPt, out _);
-            _navQuery.FindNearestPoly(endPos, QueryExtents, filter,
+            query.FindNearestPoly(endPos, QueryExtents, filter,
                 out long endRef, out var endPt, out _);
 
             if (startRef == 0 || endRef == 0) return false;
 
             // Find polygon path, by a sliced search so that it stops after MaxSearchNodes (see there)
-            var pathPolys = PathPolys;
-            _navQuery.InitSlicedFindPath(startRef, endRef, startPt, endPt, filter, 0);
-            var searched = _navQuery.UpdateSlicedFindPath(MaxSearchNodes, out _);
+            var pathPolys = local.PathPolys;
+            query.InitSlicedFindPath(startRef, endRef, startPt, endPt, filter, 0);
+            var searched = query.UpdateSlicedFindPath(MaxSearchNodes, out _);
             if (searched.InProgress() && !_cappedLogged)
             {
                 _cappedLogged = true;
                 Debug.Log($"[NavMeshWorld] FindPath stopped after {MaxSearchNodes} polygons, the target out of reach or far: " +
                           $"({from.X:F0}, {from.Z:F0}) to ({to.X:F0}, {to.Z:F0}); the way goes as near as it got (logged once per navmesh)");
             }
-            _navQuery.FinalizeSlicedFindPath(pathPolys, out int pathCount, pathPolys.Length);
+            query.FinalizeSlicedFindPath(pathPolys, out int pathCount, pathPolys.Length);
 
             if (pathCount == 0) return false;
 
             // Build straight path (smoothed waypoints)
-            var straightPath = PathCorners;
-            _navQuery.FindStraightPath(startPt, endPt, pathPolys, pathCount,
+            var straightPath = local.PathCorners;
+            query.FindStraightPath(startPt, endPt, pathPolys, pathCount,
                 straightPath, out int straightCount, straightPath.Length, 0);
 
             for (int i = 0; i < straightCount; i++)
@@ -224,9 +223,39 @@ namespace Freefall.Base
             return into.Count > 0;
         }
 
-        // FindPath's polygons and corners, kept: main thread only. 256 polygons of a way, as it always had
-        private static readonly long[] PathPolys = new long[256];
-        private static readonly DtStraightPath[] PathCorners = new DtStraightPath[256];
+        /// <summary>
+        /// A thread's query and the scratch of the queries here (a query's node pools, open list and queues are its own):
+        /// any thread may ask FindPath, SamplePosition, RandomReachablePoint, WayOutdoors and IsOnNavMesh at once, while
+        /// the navmesh is not changed (its tiles are put in on the main thread, between the parallel loops). Made on a
+        /// thread's first ask, and again for a new navmesh.
+        /// </summary>
+        private sealed class QueryScratch
+        {
+            public DtNavMesh? Mesh;
+            public DtNavMeshQuery Query = null!;
+            public readonly long[] PathPolys = new long[256];                      // FindPath's: 256 polygons of a way, as it always had
+            public readonly DtStraightPath[] PathCorners = new DtStraightPath[256];
+            public readonly long[] WayPolys = new long[MaxSearchNodes];            // the way into RandomReachablePoint's circle
+            public readonly long[] AroundRefs = new long[256], AroundParents = new long[256];   // WayOutdoors' polygons round a point
+            public readonly float[] AroundCosts = new float[256];
+            public readonly NavRandom Random = new();
+        }
+
+        [ThreadStatic] private static QueryScratch? t_query;
+
+        // This thread's query for the navmesh there is now, or null when there is none
+        private static QueryScratch? Local()
+        {
+            var mesh = _navMesh;
+            if (mesh == null) return null;
+            var local = t_query ??= new QueryScratch();
+            if (local.Mesh != mesh)
+            {
+                local.Mesh = mesh;
+                local.Query = new DtNavMeshQuery(mesh);
+            }
+            return local;
+        }
 
         /// <summary>
         /// Find the nearest valid navmesh point to a world position. With <paramref name="outdoors"/>, never on a
@@ -235,10 +264,11 @@ namespace Freefall.Base
         public static bool SamplePosition(Vector3 position, float radius, out Vector3 result, bool outdoors = false)
         {
             result = position;
-            if (_navQuery == null) return false;
+            var local = Local();
+            if (local == null) return false;
 
             var extents = new RcVec3f(radius, radius, radius);
-            var status = _navQuery.FindNearestPoly(ToRc(position), extents, outdoors ? OutdoorsFilter : DefaultFilter,
+            var status = local.Query.FindNearestPoly(ToRc(position), extents, outdoors ? OutdoorsFilter : DefaultFilter,
                 out long polyRef, out var nearestPt, out _);
 
             if (status.Failed() || polyRef == 0) return false;
@@ -268,31 +298,34 @@ namespace Freefall.Base
         public static bool RandomReachablePoint(Vector3 from, Vector3 center, float radius, out Vector3 point)
         {
             point = from;
-            if (_navQuery == null) return false;
+            var local = Local();
+            if (local == null) return false;
+            var query = local.Query;
             using var timed = RandomPointMarker.Auto();
 
             var filter = OutdoorsFilter;
-            _navQuery.FindNearestPoly(ToRc(from), QueryExtents, filter,
+            query.FindNearestPoly(ToRc(from), QueryExtents, filter,
                 out long startRef, out var startPt, out _);
             if (startRef == 0) return false;
 
             var away = from - center;
             if (away.X * away.X + away.Z * away.Z > radius * radius)
             {
-                _navQuery.FindNearestPoly(ToRc(center), QueryExtents, filter,
+                query.FindNearestPoly(ToRc(center), QueryExtents, filter,
                     out long centerRef, out var centerPt, out _);
                 if (centerRef == 0) return false;
 
-                _navQuery.InitSlicedFindPath(startRef, centerRef, startPt, centerPt, filter, 0);
-                _navQuery.UpdateSlicedFindPath(MaxSearchNodes, out _);
-                _navQuery.FinalizeSlicedFindPath(WayPolys, out int count, WayPolys.Length);
+                var wayPolys = local.WayPolys;
+                query.InitSlicedFindPath(startRef, centerRef, startPt, centerPt, filter, 0);
+                query.UpdateSlicedFindPath(MaxSearchNodes, out _);
+                query.FinalizeSlicedFindPath(wayPolys, out int count, wayPolys.Length);
                 if (count == 0) return false;
-                startRef = WayPolys[count - 1];
+                startRef = wayPolys[count - 1];
             }
 
             // Spreads from that polygon over its neighbours, as far as the circle reaches
-            var status = _navQuery.FindRandomPointAroundCircle(startRef, ToRc(center), radius,
-                filter, RandomSource, out long randomRef, out var randomPt);
+            var status = query.FindRandomPointAroundCircle(startRef, ToRc(center), radius,
+                filter, local.Random, out long randomRef, out var randomPt);
             if (status.Failed() || randomRef == 0) return false;
 
             point = FromRc(randomPt);
@@ -310,12 +343,15 @@ namespace Freefall.Base
         public static bool WayOutdoors(Vector3 from, float radius, out Vector3 point, float beyond = 1.5f)
         {
             point = from;
-            if (_navQuery == null || _navMesh == null) return false;
+            var local = Local();
+            if (local == null) return false;
+            var query = local.Query;
+            var mesh = local.Mesh!;
             using var timed = WayOutMarker.Auto();
 
-            _navQuery.FindNearestPoly(ToRc(from), QueryExtents, DefaultFilter, out long startRef, out var startPt, out _);
+            query.FindNearestPoly(ToRc(from), QueryExtents, DefaultFilter, out long startRef, out var startPt, out _);
             if (startRef == 0) return false;
-            if (!Indoors(startRef))
+            if (!Indoors(mesh, startRef))
             {
                 point = FromRc(startPt);
                 return true;
@@ -323,40 +359,33 @@ namespace Freefall.Base
 
             // Spreads over the polygons round it cheapest first, a metre indoors dear: the cheapest outdoors one is where
             // the nearest door lets out
-            var status = _navQuery.FindPolysAroundCircle(startRef, startPt, radius, DefaultFilter,
-                AroundRefs, AroundParents, AroundCosts, out int count, AroundRefs.Length);
+            var aroundRefs = local.AroundRefs;
+            var aroundCosts = local.AroundCosts;
+            var status = query.FindPolysAroundCircle(startRef, startPt, radius, DefaultFilter,
+                aroundRefs, local.AroundParents, aroundCosts, out int count, aroundRefs.Length);
             if (status.Failed()) return false;
             int best = -1;
             for (int i = 0; i < count; i++)
-                if (!Indoors(AroundRefs[i]) && (best < 0 || AroundCosts[i] < AroundCosts[best])) best = i;
+                if (!Indoors(mesh, aroundRefs[i]) && (best < 0 || aroundCosts[i] < aroundCosts[best])) best = i;
             if (best < 0) return false;
 
             // On it nearest the room, then a little further out over the ground outdoors (sliding along the walls)
-            long outRef = AroundRefs[best];
-            _navQuery.ClosestPointOnPoly(outRef, startPt, out var door, out _);
+            long outRef = aroundRefs[best];
+            query.ClosestPointOnPoly(outRef, startPt, out var door, out _);
             var away = new RcVec3f(door.X - startPt.X, 0f, door.Z - startPt.Z);
             float length = MathF.Sqrt(away.X * away.X + away.Z * away.Z);
             if (length > 1e-3f)
             {
                 var to = new RcVec3f(door.X + away.X / length * beyond, door.Y, door.Z + away.Z / length * beyond);
-                if (_navQuery.MoveAlongSurface(outRef, door, to, OutdoorsFilter, out var moved, AroundRefs, out _, AroundRefs.Length).Succeeded())
+                if (query.MoveAlongSurface(outRef, door, to, OutdoorsFilter, out var moved, aroundRefs, out _, aroundRefs.Length).Succeeded())
                     door = new RcVec3f(moved.X, door.Y, moved.Z);
             }
             point = FromRc(door);
             return true;
         }
 
-        private static bool Indoors(long polyRef) =>
-            _navMesh!.GetPolyFlags(polyRef, out int flags).Succeeded() && (flags & IndoorsFlag) != 0;
-
-        // The polygons round a point (WayOutdoors), kept: main thread only
-        private static readonly long[] AroundRefs = new long[256], AroundParents = new long[256];
-        private static readonly float[] AroundCosts = new float[256];
-
-        private static readonly NavRandom RandomSource = new();
-
-        // The polygons of the way into the circle (RandomReachablePoint), kept: main thread only
-        private static readonly long[] WayPolys = new long[MaxSearchNodes];
+        private static bool Indoors(DtNavMesh mesh, long polyRef) =>
+            mesh.GetPolyFlags(polyRef, out int flags).Succeeded() && (flags & IndoorsFlag) != 0;
 
         private sealed class NavRandom : DotRecast.Core.IRcRand
         {
@@ -464,15 +493,46 @@ namespace Freefall.Base
         private static readonly long[] _wayPolys = new long[MaxSearchNodes];
         private static readonly DtStraightPath[] _wayCorners = new DtStraightPath[256];
 
-        /// <summary>Agents waiting for their way, the one being searched for included.</summary>
+        /// <summary>Agents waiting for their way, the one being searched for included (asks since the last gathering not counted).</summary>
         public static int WaysWaiting => _wayAsked.Count + (_waySearching != null ? 1 : 0);
 
-        /// <summary>The agent's way is looked for by the path service, once however often it asks before its turn.</summary>
+        // Some agent has asked since the service last gathered the asks
+        private static volatile bool _asksWaiting;
+
+        /// <summary>
+        /// The agent's way is looked for by the path service, once however often it asks before its turn. Any thread (a
+        /// brain's think on a worker): the ask only marks the agent, and the service gathers the marked ones in the agents'
+        /// order as it begins its frame (<see cref="GatherAsks"/>), so the queue's order is the same every run.
+        /// </summary>
         internal static void AskWay(NavMeshAgent agent)
         {
             if (agent.WayAsked) return;
             agent.WayAsked = true;
-            _wayAsked.Enqueue(agent);
+            _asksWaiting = true;
+        }
+
+        // The queue emptied (a navmesh replaced or gone): those in it are no longer asking, and may ask again
+        private static void ClearAsks()
+        {
+            while (_wayAsked.TryDequeue(out var agent))
+                agent.WayQueued = agent.WayAsked = agent.WayOnly = false;
+            if (_waySearching != null) _waySearching.WayAsked = _waySearching.WayOnly = false;
+            _asksWaiting = false;
+        }
+
+        // The agents that have asked and are not in the queue yet, in the agents' order (their component cache's)
+        private static void GatherAsks()
+        {
+            if (!_asksWaiting) return;
+            _asksWaiting = false;
+            var agents = ComponentCache<NavMeshAgent>.All;
+            for (int i = 0; i < agents.Count; i++)
+            {
+                var agent = agents[i];
+                if (agent == null || !agent.WayAsked || agent.WayQueued || agent == _waySearching) continue;
+                agent.WayQueued = true;
+                _wayAsked.Enqueue(agent);
+            }
         }
 
         /// <summary>
@@ -481,7 +541,9 @@ namespace Freefall.Base
         /// </summary>
         internal static void ServeWays()
         {
-            if (_crowd == null || _wayQuery == null || WaysWaiting == 0) return;
+            if (_crowd == null || _wayQuery == null) return;
+            GatherAsks();
+            if (WaysWaiting == 0) return;
             using var timed = WaysMarker.Auto(WaysWaiting);
 
             long until = System.Diagnostics.Stopwatch.GetTimestamp() + (long)(WayMilliseconds * System.Diagnostics.Stopwatch.Frequency / 1000.0);
@@ -518,6 +580,7 @@ namespace Freefall.Base
         {
             while (_wayAsked.TryDequeue(out var agent))
             {
+                agent.WayQueued = false;
                 if (!agent.WayWanted(out _, out _))
                 {
                     agent.WayAsked = false;

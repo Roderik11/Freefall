@@ -201,9 +201,11 @@ namespace Freefall.Components
         private Vector3 _targetPt;
         private readonly List<Vector3> _way = new();
 
-        // With the path service (NavMeshWorld.AskWay): asked for, or under way; only the way, the crowd's target staying
+        // With the path service (NavMeshWorld.AskWay): asked for, or under way; only the way, the crowd's target staying;
+        // in the service's queue (gathered, its turn not come yet: NavMeshWorld.GatherAsks)
         internal bool WayAsked;
         internal bool WayOnly;
+        internal bool WayQueued;
         internal DtCrowdAgent? CrowdAgent => _crowdAgent;
         private float _remainingSquared;
         private Vector3 _headwayFrom;     // where its transform was when it last made headway (Stalled)
