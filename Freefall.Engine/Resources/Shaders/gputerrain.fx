@@ -341,6 +341,9 @@ float4 DecoratorGroundTint(float2 ctrlUV, float2 terrainLocal, float dist, out f
 // became swirls, so a pattern that runs one way turns only a few degrees, and its far scale turns as little.
 static const float FAR_TILING = 4.0;        // see PS: two scales per layer
 static const float FAR_ANGLE = 0.6458;      // 37°: the far scale's turn against the near one, for a layer that may turn fully
+static const float PLANE_MIN = 0.2;         // a projection with less of the blend than this is left out (see PS)
+static const float SIDE_FADE_START = 500.0; // metres: from here the side projections give way to the top one...
+static const float SIDE_FADE_END = 700.0;   // ...which is alone from here (see PS)
 
 static const float HEX_CONTRAST = 0.6;      // how much the samples' content steers the blend (Mikkelsen's 0.6)
 static const float HEX_EXPONENT = 7.0;      // sharpness of the blend between hexagons (Mikkelsen's 7; HexSetup hard-codes w^7)
@@ -614,8 +617,17 @@ FragmentOutput PS(VertexOutput input)
 
     // Steep ground also takes the layers projected from the side (along world X and Z), weighted by the slope's
     // normal: a top-down projection stretches a 6 m rock tile into streaks down a cliff. Image up = world up.
+    // Each projection is a full two-scale, hex-tiled sample, so only those that show are taken: far out the top
+    // projection alone (its streaks down a cliff are mip-averaged colour there), and a projection with under PLANE_MIN
+    // of the blend drops out, the rest rescaled so the crossover stays continuous, only narrower. Before 2026-11-03 a
+    // slope from ~20° sampled every side over 1 % and the top even on cliffs: 0.53 ms of 1.56 looking at Eldermoor's
+    // mountains from 140 m; these two saved 0.20 (the fade) and 0.29 (the dead zone), and split frames from there showed
+    // no change (not yet judged on a cliff at eye height, where the narrower crossover would show first).
     float3 planeWeights = pow(abs(faceNormal), 4.0);
     planeWeights /= planeWeights.x + planeWeights.y + planeWeights.z;
+    planeWeights = lerp(float3(0, 1, 0), planeWeights, 1.0 - smoothstep(SIDE_FADE_START, SIDE_FADE_END, viewDist));
+    planeWeights = saturate((planeWeights - PLANE_MIN) / (1.0 - PLANE_MIN));
+    planeWeights /= planeWeights.x + planeWeights.y + planeWeights.z;   // the largest is at least 1/3: never all out
     bool sideProjection = planeWeights.y < 0.98;
     if (!sideProjection) planeWeights = float3(0, 1, 0);
     float2 sideX = float2(input.WorldPos.z, -input.WorldPos.y);     // seen along X: u = +Z, v = up
@@ -682,8 +694,10 @@ FragmentOutput PS(VertexOutput input)
                 Texture2D normals = ResourceDescriptorHeap[LayerTextures[layer].y];
                 float4 c;
                 float2 nTop;
-                SampleTwoScale(diffuse, normals, texuv, mul(texuv / FAR_TILING, farRot), farBlend, c, nTop,
-                               hex, hexWeights, hexByColor, texDdx, texDdy, true, farRot, maxAngle);
+                if (planeWeights.y > 0)
+                    SampleTwoScale(diffuse, normals, texuv, mul(texuv / FAR_TILING, farRot), farBlend, c, nTop,
+                                   hex, hexWeights, hexByColor, texDdx, texDdy, true, farRot, maxAngle);
+                else { c = 0; nTop = 0; }   // a cliff: the sides alone (its height above came from the top all the same)
                 float3 tilt = float3(nTop.x, 0, nTop.y) * planeWeights.y;
                 if (sideProjection)
                 {
@@ -693,7 +707,7 @@ FragmentOutput PS(VertexOutput input)
                     float2 sideScale = LayerTiling[layer].xy / TerrainSize;     // 1 / metres per tile
                     float4 cX, cZ;
                     float2 nX, nZ;
-                    if (planeWeights.x > 0.01)
+                    if (planeWeights.x > 0)
                     {
                         float2 st = sideX * sideScale, sdx = sideXDdx * sideScale, sdy = sideXDdy * sideScale;
                         HexTiles hexX = HexSetup(st, sdx, sdy, HEX_DOMINANT, maxAngle);
@@ -701,7 +715,7 @@ FragmentOutput PS(VertexOutput input)
                                        hexX, 0, true, sdx, sdy, true, farRot, maxAngle);
                     }
                     else { cX = 0; nX = 0; }
-                    if (planeWeights.z > 0.01)
+                    if (planeWeights.z > 0)
                     {
                         float2 st = sideZ * sideScale, sdx = sideZDdx * sideScale, sdy = sideZDdy * sideScale;
                         HexTiles hexZ = HexSetup(st, sdx, sdy, HEX_DOMINANT, maxAngle);
