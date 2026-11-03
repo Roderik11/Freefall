@@ -267,9 +267,9 @@ namespace Freefall.Components
         private void TrackTransform(Transform? transform)
         {
             if (_trackedTransform == transform) return;
-            if (_trackedTransform != null) _trackedTransform.OnChanged -= UpdateBounds;
+            if (_trackedTransform != null) _trackedTransform.OnChangedInPlace -= UpdateBounds;
             _trackedTransform = transform;
-            if (_trackedTransform != null) _trackedTransform.OnChanged += UpdateBounds;
+            if (_trackedTransform != null) _trackedTransform.OnChangedInPlace += UpdateBounds;   // its own bounds only: safe on a worker
         }
 
         /// <summary>

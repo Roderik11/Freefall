@@ -41,11 +41,18 @@ namespace Freefall
         }
     }
 
-    /// <summary>One frame of a node.</summary>
-    public readonly record struct ProfilerSample(float Ms, int AllocBytes, int Calls, int Items);
+    /// <summary>
+    /// One frame of a node. <see cref="Threads"/> and <see cref="WorkMs"/> are set when a ParallelWork.For ran inside the
+    /// node: the threads that took part (the caller included) and the time all of them spent in its bodies together.
+    /// </summary>
+    public readonly record struct ProfilerSample(float Ms, int AllocBytes, int Calls, int Items, int Threads, float WorkMs);
 
-    /// <summary>A node over the last frames: averages are per frame, Max is the slowest frame.</summary>
-    public readonly record struct ProfilerStats(float AvgMs, float MaxMs, float AvgAllocBytes, float AvgCalls, float AvgItems);
+    /// <summary>
+    /// A node over the last frames: averages are per frame, Max is the slowest frame. AvgThreads is over the frames in
+    /// which a parallel loop ran in it (0: it never did), AvgWorkMs per frame like the time.
+    /// </summary>
+    public readonly record struct ProfilerStats(float AvgMs, float MaxMs, float AvgAllocBytes, float AvgCalls, float AvgItems,
+        float AvgThreads, float AvgWorkMs);
 
     /// <summary>
     /// A marker at one place in the call tree. The same marker reached from two parents is two nodes; one
@@ -69,12 +76,16 @@ namespace Freefall
         private readonly int[] _alloc = new int[Profiler.HistoryLength];
         private readonly int[] _calls = new int[Profiler.HistoryLength];
         private readonly int[] _items = new int[Profiler.HistoryLength];
+        private readonly byte[] _threads = new byte[Profiler.HistoryLength];
+        private readonly float[] _workMs = new float[Profiler.HistoryLength];
 
         // The frame in progress
         internal long Ticks;
         internal long Alloc;
         internal int Calls;
         internal int Items;
+        internal int Threads;      // most threads a parallel loop inside it used (Profiler.Parallel)
+        internal long WorkTicks;   // their time in its bodies, all threads together
 
         private long _lastHit;
         private int _hint;
@@ -97,7 +108,7 @@ namespace Freefall
         {
             if (!HasFrame(frame)) return default;
             int slot = Profiler.Slot(frame);
-            return new ProfilerSample(_ms[slot], _alloc[slot], _calls[slot], _items[slot]);
+            return new ProfilerSample(_ms[slot], _alloc[slot], _calls[slot], _items[slot], _threads[slot], _workMs[slot]);
         }
 
         /// <summary>Over the last <paramref name="frames"/> recorded frames.</summary>
@@ -106,9 +117,9 @@ namespace Freefall
             long end = Profiler.FrameCount;
             long start = Math.Max(end - Math.Min(frames, Profiler.HistoryLength), 0);
 
-            int n = 0;
-            float sumMs = 0, maxMs = 0;
-            long alloc = 0, calls = 0, items = 0;
+            int n = 0, parallelFrames = 0;
+            float sumMs = 0, maxMs = 0, workMs = 0;
+            long alloc = 0, calls = 0, items = 0, threads = 0;
             for (long f = start; f < end; f++)
             {
                 if (IsGpu && !Profiler.IsGpuRecorded(f)) continue;
@@ -121,10 +132,17 @@ namespace Freefall
                 alloc += _alloc[slot];
                 calls += _calls[slot];
                 items += _items[slot];
+                workMs += _workMs[slot];
+                if (_threads[slot] > 0)
+                {
+                    threads += _threads[slot];
+                    parallelFrames++;
+                }
             }
 
             if (n == 0) return default;
-            return new ProfilerStats(sumMs / n, maxMs, (float)alloc / n, (float)calls / n, (float)items / n);
+            return new ProfilerStats(sumMs / n, maxMs, (float)alloc / n, (float)calls / n, (float)items / n,
+                parallelFrames > 0 ? (float)threads / parallelFrames : 0, workMs / n);
         }
 
         internal ProfilerNode Child(ProfilerMarker marker)
@@ -156,11 +174,13 @@ namespace Freefall
                 _alloc[slot] = (int)Math.Min(Alloc, int.MaxValue);
                 _calls[slot] = Calls;
                 _items[slot] = Items;
+                _threads[slot] = (byte)Math.Min(Threads, byte.MaxValue);
+                _workMs[slot] = (float)(WorkTicks * msPerTick);
             }
 
             if (Calls > 0) _lastHit = frame;
-            Ticks = Alloc = 0;
-            Calls = Items = 0;
+            Ticks = Alloc = WorkTicks = 0;
+            Calls = Items = Threads = 0;
             _hint = 0;
 
             for (int i = _children.Count - 1; i >= 0; i--)
@@ -306,6 +326,19 @@ namespace Freefall
             _allocStart[_depth] = GC.GetAllocatedBytesForCurrentThread();
             _start[_depth] = Stopwatch.GetTimestamp();
             return new ProfilerScope(++_depth);
+        }
+
+        /// <summary>
+        /// A ParallelWork.For has run inside the innermost open section: <paramref name="threads"/> threads took part
+        /// (the caller included) and spent <paramref name="workTicks"/> (Stopwatch ticks, all together) in its bodies.
+        /// The section's own time stays its wall time. Called by ParallelWork itself, on the caller's thread.
+        /// </summary>
+        internal static void Parallel(long workTicks, int threads)
+        {
+            if (Environment.CurrentManagedThreadId != _mainThread || _depth == 0) return;
+            var node = _stack[_depth - 1];
+            node.WorkTicks += workTicks;
+            if (threads > node.Threads) node.Threads = threads;
         }
 
         internal static void End(int depth)

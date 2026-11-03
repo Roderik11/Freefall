@@ -2,6 +2,8 @@ using System;
 using System.Collections.Generic;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using System.Numerics;
+using System.Threading;
 using Vortice.Direct3D12;
 
 namespace Freefall.Graphics
@@ -22,9 +24,13 @@ namespace Freefall.Graphics
         private T*[] _mapped = new T*[FrameCount]; // persistently mapped pointers
         private uint[] _srvIndices = new uint[FrameCount];
 
-        // Dirty tracking: per-frame lists of modified slot indices
-        private HashSet<int>[] _dirtySlots = new HashSet<int>[FrameCount];
+        // Dirty tracking, per frame buffer: a bit per slot, set by Set from any thread without a lock, and walked by Upload
+        // for the frame it uploads. A lock and a HashSet per frame buffer made the characters' transform writes on workers
+        // slower than one thread doing them all: every child transform took the three locks (2026-11-03). After a Grow a
+        // frame buffer is wholly dirty.
+        private uint[][] _dirtyBits = new uint[FrameCount][];
         private bool[] _anyDirty = new bool[FrameCount];
+        private bool[] _allDirty = new bool[FrameCount];
 
         // Capacity
         private int _capacity;
@@ -61,7 +67,17 @@ namespace Freefall.Graphics
         /// <summary>
         /// The slots the next <see cref="Upload"/> writes: those set since the current frame's buffer was last written.
         /// </summary>
-        public int DirtyCount => _dirtySlots[Engine.FrameIndex % FrameCount].Count;
+        public int DirtyCount
+        {
+            get
+            {
+                int frame = Engine.FrameIndex % FrameCount;
+                if (_allDirty[frame]) return _capacity;
+                int count = 0;
+                foreach (uint word in _dirtyBits[frame]) count += BitOperations.PopCount(word);
+                return count;
+            }
+        }
 
         public StreamingBuffer(GraphicsDevice device, int initialCapacity = 1024)
         {
@@ -71,7 +87,7 @@ namespace Freefall.Graphics
             _staging = new T[initialCapacity];
 
             for (int f = 0; f < FrameCount; f++)
-                _dirtySlots[f] = new HashSet<int>();
+                _dirtyBits[f] = new uint[(initialCapacity + 31) / 32];
 
             AllocateGPUResources(initialCapacity);
         }
@@ -85,14 +101,15 @@ namespace Freefall.Graphics
         {
             _staging[slot] = value;
 
-            // Mark dirty for all 3 frame buffers
+            // Dirty for all 3 frame buffers: a bit already set costs a read, a new one an atomic or (two threads may set
+            // two bits of one word). Upload never runs beside a Set: it is the main thread's, between parallel work.
+            int word = slot >> 5;
+            uint bit = 1u << (slot & 31);
             for (int f = 0; f < FrameCount; f++)
             {
-                lock (_dirtySlots[f])
-                {
-                    _dirtySlots[f].Add(slot);
-                    _anyDirty[f] = true;
-                }
+                ref uint bits = ref _dirtyBits[f][word];
+                if ((bits & bit) == 0) Interlocked.Or(ref bits, bit);
+                _anyDirty[f] = true;
             }
         }
 
@@ -115,27 +132,36 @@ namespace Freefall.Graphics
 
             if (!_anyDirty[frame]) return 0;
 
-            HashSet<int> dirty;
-            lock (_dirtySlots[frame])
-            {
-                dirty = _dirtySlots[frame];
-            }
-
             T* dst = _mapped[frame];
-            foreach (int slot in dirty)
+            var bits = _dirtyBits[frame];
+            int count = 0;
+            if (_allDirty[frame])
             {
-                dst[slot] = _staging[slot];
+                for (int slot = 0; slot < _capacity; slot++) dst[slot] = _staging[slot];
+                if (uploadedBits != null)
+                    for (int slot = 0; slot < _capacity; slot++) uploadedBits[slot >> 5] |= 1u << (slot & 31);
+                count = _capacity;
+                Array.Clear(bits);
+                _allDirty[frame] = false;
             }
-            if (uploadedBits != null)
-                foreach (int slot in dirty)
-                    uploadedBits[slot >> 5] |= 1u << (slot & 31);
-            int count = dirty.Count;
-
-            lock (_dirtySlots[frame])
+            else
             {
-                dirty.Clear();
-                _anyDirty[frame] = false;
+                for (int w = 0; w < bits.Length; w++)
+                {
+                    uint word = bits[w];
+                    if (word == 0) continue;
+                    bits[w] = 0;
+                    if (uploadedBits != null) uploadedBits[w] |= word;
+                    while (word != 0)
+                    {
+                        int slot = (w << 5) + BitOperations.TrailingZeroCount(word);
+                        dst[slot] = _staging[slot];
+                        word &= word - 1;
+                        count++;
+                    }
+                }
             }
+            _anyDirty[frame] = false;
             return count;
         }
 
@@ -195,16 +221,12 @@ namespace Freefall.Graphics
             _capacity = target;
             AllocateGPUResources(target);
 
-            // Re-upload all existing data to new buffers
-            // Mark everything as dirty for all frames
+            // Re-upload all existing data to new buffers: everything dirty for all frames
             for (int f = 0; f < FrameCount; f++)
             {
-                lock (_dirtySlots[f])
-                {
-                    for (int i = 0; i < _capacity; i++)
-                        _dirtySlots[f].Add(i);
-                    _anyDirty[f] = true;
-                }
+                Array.Resize(ref _dirtyBits[f], (target + 31) / 32);
+                _allDirty[f] = true;
+                _anyDirty[f] = true;
             }
         }
 

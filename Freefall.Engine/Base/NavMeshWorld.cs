@@ -4,6 +4,7 @@ using System.Numerics;
 using DotRecast.Core.Numerics;
 using DotRecast.Detour;
 using DotRecast.Detour.Crowd;
+using Freefall.Components;
 
 namespace Freefall.Base
 {
@@ -20,6 +21,12 @@ namespace Freefall.Base
 
         // Half-extents for navmesh point queries (search volume)
         private static readonly RcVec3f QueryExtents = new(2f, 4f, 2f);
+
+        // The searches, in the profiler under whoever asks (main thread)
+        private static readonly ProfilerMarker FindPathMarker = ProfilerMarker.Get("NavMesh find path");
+        private static readonly ProfilerMarker RandomPointMarker = ProfilerMarker.Get("NavMesh random point");
+        private static readonly ProfilerMarker WayOutMarker = ProfilerMarker.Get("NavMesh way outdoors");
+        private static readonly ProfilerMarker WaysMarker = ProfilerMarker.Get("NavMesh agents' ways");
 
         /// <summary>Recast area ids a bake gives: walkable ground, and a building's ground floor (NavMeshArea Indoors).</summary>
         public const int WalkArea = 1, IndoorsArea = 2;
@@ -76,7 +83,7 @@ namespace Freefall.Base
         /// </summary>
         public const int PathStepsPerFrame = 500, QuickPathSteps = 48;
 
-        /// <summary>How many crowd targets were out of reach and given as the nearest point a way leads to (SetAgentTarget).</summary>
+        /// <summary>How many crowd targets were out of reach and given as the nearest point a way leads to (the path service).</summary>
         public static int OutOfReach { get; private set; }
 
         /// <summary>True if a navmesh is loaded and ready for queries.</summary>
@@ -89,6 +96,9 @@ namespace Freefall.Base
         {
             _navMesh = navMesh;
             _navQuery = new DtNavMeshQuery(navMesh);
+            _wayQuery = new DtNavMeshQuery(navMesh);
+            _wayAsked.Clear();
+            _waySearching = null;
             _cappedLogged = false;
 
             // Create crowd with sane defaults
@@ -133,6 +143,9 @@ namespace Freefall.Base
         {
             _crowd = null;
             _navQuery = null;
+            _wayQuery = null;
+            _wayAsked.Clear();
+            _waySearching = null;
             _navMesh = null;
             Debug.Log("[NavMeshWorld] Shutdown");
         }
@@ -154,7 +167,19 @@ namespace Freefall.Base
         public static List<Vector3> FindPath(Vector3 from, Vector3 to)
         {
             var result = new List<Vector3>();
-            if (_navQuery == null) return result;
+            FindPath(from, to, result);
+            return result;
+        }
+
+        /// <summary>
+        /// <see cref="FindPath(Vector3, Vector3)"/> into the caller's list, emptied first, without allocating. False when
+        /// no way was found. Main thread only.
+        /// </summary>
+        public static bool FindPath(Vector3 from, Vector3 to, List<Vector3> into)
+        {
+            into.Clear();
+            if (_navQuery == null) return false;
+            using var timed = FindPathMarker.Auto();
 
             var startPos = ToRc(from);
             var endPos = ToRc(to);
@@ -165,10 +190,10 @@ namespace Freefall.Base
             _navQuery.FindNearestPoly(endPos, QueryExtents, filter,
                 out long endRef, out var endPt, out _);
 
-            if (startRef == 0 || endRef == 0) return result;
+            if (startRef == 0 || endRef == 0) return false;
 
             // Find polygon path, by a sliced search so that it stops after MaxSearchNodes (see there)
-            var pathPolys = new long[256];
+            var pathPolys = PathPolys;
             _navQuery.InitSlicedFindPath(startRef, endRef, startPt, endPt, filter, 0);
             var searched = _navQuery.UpdateSlicedFindPath(MaxSearchNodes, out _);
             if (searched.InProgress() && !_cappedLogged)
@@ -177,22 +202,26 @@ namespace Freefall.Base
                 Debug.Log($"[NavMeshWorld] FindPath stopped after {MaxSearchNodes} polygons, the target out of reach or far: " +
                           $"({from.X:F0}, {from.Z:F0}) to ({to.X:F0}, {to.Z:F0}); the way goes as near as it got (logged once per navmesh)");
             }
-            _navQuery.FinalizeSlicedFindPath(pathPolys, out int pathCount, 256);
+            _navQuery.FinalizeSlicedFindPath(pathPolys, out int pathCount, pathPolys.Length);
 
-            if (pathCount == 0) return result;
+            if (pathCount == 0) return false;
 
             // Build straight path (smoothed waypoints)
-            var straightPath = new DtStraightPath[256];
+            var straightPath = PathCorners;
             _navQuery.FindStraightPath(startPt, endPt, pathPolys, pathCount,
-                straightPath, out int straightCount, 256, 0);
+                straightPath, out int straightCount, straightPath.Length, 0);
 
             for (int i = 0; i < straightCount; i++)
             {
-                result.Add(FromRc(straightPath[i].pos));
+                into.Add(FromRc(straightPath[i].pos));
             }
 
-            return result;
+            return into.Count > 0;
         }
+
+        // FindPath's polygons and corners, kept: main thread only. 256 polygons of a way, as it always had
+        private static readonly long[] PathPolys = new long[256];
+        private static readonly DtStraightPath[] PathCorners = new DtStraightPath[256];
 
         /// <summary>
         /// Find the nearest valid navmesh point to a world position. With <paramref name="outdoors"/>, never on a
@@ -235,6 +264,7 @@ namespace Freefall.Base
         {
             point = from;
             if (_navQuery == null) return false;
+            using var timed = RandomPointMarker.Auto();
 
             var filter = OutdoorsFilter;
             _navQuery.FindNearestPoly(ToRc(from), QueryExtents, filter,
@@ -276,6 +306,7 @@ namespace Freefall.Base
         {
             point = from;
             if (_navQuery == null || _navMesh == null) return false;
+            using var timed = WayOutMarker.Auto();
 
             _navQuery.FindNearestPoly(ToRc(from), QueryExtents, DefaultFilter, out long startRef, out var startPt, out _);
             if (startRef == 0) return false;
@@ -377,55 +408,173 @@ namespace Freefall.Base
         }
 
         /// <summary>
-        /// Set an agent's move target. <paramref name="onNavMesh"/> is the target put on the
-        /// navmesh: the point the crowd steers for.
+        /// A destination put on the navmesh for the crowd, with the crowd's own query, filter and extents (what it checks
+        /// its ways against): the polygon and the point on it. False where no navmesh is near enough. The way there is
+        /// the path service's (<see cref="AskWay"/>).
         /// </summary>
-        internal static bool SetAgentTarget(DtCrowdAgent agent, Vector3 target, out Vector3 onNavMesh)
+        internal static bool TargetOnNavMesh(Vector3 target, out long polyRef, out Vector3 onNavMesh)
         {
+            polyRef = 0;
             onNavMesh = target;
             if (_crowd == null) return false;
 
-            // Use the crowd's own query, filter, and extents — must match what
-            // the crowd uses internally for path validation (see DotRecast demo).
-            var navQuery = _crowd.GetNavMeshQuery();
-            var filter = _crowd.GetFilter(0);
-            var halfExtents = _crowd.GetQueryExtents();
-
-            var pos = ToRc(target);
-            var status = navQuery.FindNearestPoly(pos, halfExtents, filter,
-                out long targetRef, out var targetPt, out _);
-
-            if (targetRef == 0)
+            var status = _crowd.GetNavMeshQuery().FindNearestPoly(ToRc(target), _crowd.GetQueryExtents(), _crowd.GetFilter(0),
+                out polyRef, out var point, out _);
+            if (polyRef == 0)
             {
-                Debug.Log($"[NavMeshWorld] SetAgentTarget: FindNearestPoly failed for {target} (status={status}, extents={halfExtents})");
+                Debug.Log($"[NavMeshWorld] TargetOnNavMesh: FindNearestPoly failed for {target} (status={status})");
                 return false;
             }
+            onNavMesh = FromRc(point);
+            return true;
+        }
 
-            // Never a target out of reach: the nearest point a way leads to instead, found by a search bounded as
-            // FindPath's. The crowd's own queue searches without a bound (DotRecast's node pool grows), and re-plans a
-            // way that ends short of its target every second once near its end: a few townsfolk sent where no way led
-            // searched the whole navmesh over and over, and the rest waited behind them for their ways, up to 122 s
-            // (2026-10-25)
-            long startRef = agent.corridor.GetFirstPoly();
-            if (_navQuery != null && startRef != 0 && startRef != targetRef)
+        // ── The agents' ways: the path service ──
+        //
+        // An agent's destination is put on the navmesh at once (TargetOnNavMesh). The search for the way there runs here,
+        // served by NavMeshAgentSystem: one agent at a time in the order they asked, on a query of its own, for up to
+        // WayMilliseconds of a frame for all of them together, a search carried over frames where it takes more. Its end
+        // is the crowd's target and its corners the agent's Way. Searched on the spot, as SetDestination did, a target out
+        // of reach (all of MaxSearchNodes) took 7 ms of a frame with 400 characters about (2026-11-03). A budget of 256
+        // polygons a frame was too little where hundreds ask at once (a scene's people, a crowd spawned): some waited
+        // most of a minute for their ways.
+        //
+        // Never a target out of reach: the nearest point a way leads to instead, found by a search bounded as
+        // FindPath's. The crowd's own queue searches without a bound (DotRecast's node pool grows), and re-plans a way
+        // that ends short of its target every second once near its end: a few townsfolk sent where no way led searched
+        // the whole navmesh over and over, and the rest waited behind them for their ways, up to 122 s (2026-10-25).
+
+        /// <summary>Milliseconds of a frame the path service searches for, for every agent waiting together.</summary>
+        public const double WayMilliseconds = 1.0;
+
+        // Polygons a search goes on by between two looks at the clock
+        private const int WaySlice = 64;
+
+        private static DtNavMeshQuery? _wayQuery;
+        private static readonly Queue<NavMeshAgent> _wayAsked = new();
+        private static NavMeshAgent? _waySearching;    // whose search is under way, carried over frames
+        private static long _wayTarget;                 // what it searches for: the target's polygon and point
+        private static RcVec3f _wayFrom, _wayTargetPt;
+        private static int _waySearched;                // polygons looked at so far
+        private static readonly long[] _wayPolys = new long[MaxSearchNodes];
+        private static readonly DtStraightPath[] _wayCorners = new DtStraightPath[256];
+
+        /// <summary>Agents waiting for their way, the one being searched for included.</summary>
+        public static int WaysWaiting => _wayAsked.Count + (_waySearching != null ? 1 : 0);
+
+        /// <summary>The agent's way is looked for by the path service, once however often it asks before its turn.</summary>
+        internal static void AskWay(NavMeshAgent agent)
+        {
+            if (agent.WayAsked) return;
+            agent.WayAsked = true;
+            _wayAsked.Enqueue(agent);
+        }
+
+        /// <summary>
+        /// The path service's frame (NavMeshAgentSystem, ahead of the agents): searches for WayMilliseconds at most. In the
+        /// profiler as "NavMesh agents' ways", its items the agents waiting as it began.
+        /// </summary>
+        internal static void ServeWays()
+        {
+            if (_crowd == null || _wayQuery == null || WaysWaiting == 0) return;
+            using var timed = WaysMarker.Auto(WaysWaiting);
+
+            long until = System.Diagnostics.Stopwatch.GetTimestamp() + (long)(WayMilliseconds * System.Diagnostics.Stopwatch.Frequency / 1000.0);
+            while (System.Diagnostics.Stopwatch.GetTimestamp() < until)
             {
-                _navQuery.InitSlicedFindPath(startRef, targetRef, agent.npos, targetPt, DefaultFilter, 0);
-                _navQuery.UpdateSlicedFindPath(MaxSearchNodes, out _);
-                _navQuery.FinalizeSlicedFindPath(WayPolys, out int count, WayPolys.Length);
-                if (count > 0 && WayPolys[count - 1] != targetRef)
+                var agent = _waySearching;
+                if (agent == null)
                 {
-                    targetRef = WayPolys[count - 1];
-                    _navQuery.ClosestPointOnPoly(targetRef, targetPt, out targetPt, out _);
+                    if (!BeginNextWay()) return;
+                    continue;
+                }
+
+                // Gone, stopped, or sent somewhere else since its search began: dropped, or begun again for there
+                if (!agent.WayWanted(out long target, out var targetPt))
+                {
+                    agent.WayAsked = false;
+                    _waySearching = null;
+                    continue;
+                }
+                if (target != _wayTarget || ToRc(targetPt) != _wayTargetPt)
+                {
+                    BeginWay(agent);
+                    continue;
+                }
+
+                var status = _wayQuery.UpdateSlicedFindPath(Math.Min(WaySlice, MaxSearchNodes - _waySearched), out int done);
+                _waySearched += Math.Max(done, 1);
+                if (status.InProgress() && _waySearched < MaxSearchNodes) continue;   // on next frame once the time is spent
+                FinishWay(agent, searched: true);
+            }
+        }
+
+        private static bool BeginNextWay()
+        {
+            while (_wayAsked.TryDequeue(out var agent))
+            {
+                if (!agent.WayWanted(out _, out _))
+                {
+                    agent.WayAsked = false;
+                    continue;
+                }
+                BeginWay(agent);
+                return true;
+            }
+            return false;
+        }
+
+        private static void BeginWay(NavMeshAgent agent)
+        {
+            var crowdAgent = agent.CrowdAgent!;
+            agent.WayWanted(out _wayTarget, out var targetPt);
+            _wayTargetPt = ToRc(targetPt);
+            _wayFrom = crowdAgent.npos;
+            _waySearched = 0;
+            _waySearching = agent;
+
+            long start = crowdAgent.corridor.GetFirstPoly();
+            if (start == 0 || start == _wayTarget)
+            {
+                FinishWay(agent, searched: false);   // on the target's polygon already, or not on the navmesh: straight there
+                return;
+            }
+            _wayQuery!.InitSlicedFindPath(start, _wayTarget, _wayFrom, _wayTargetPt, DefaultFilter, 0);
+        }
+
+        private static void FinishWay(NavMeshAgent agent, bool searched)
+        {
+            _waySearching = null;
+            long targetRef = _wayTarget;
+            var targetPt = _wayTargetPt;
+
+            int count = 0;
+            if (searched)
+            {
+                _wayQuery!.FinalizeSlicedFindPath(_wayPolys, out count, _wayPolys.Length);
+                if (count > 0 && _wayPolys[count - 1] != targetRef)
+                {
+                    targetRef = _wayPolys[count - 1];
+                    _wayQuery.ClosestPointOnPoly(targetRef, targetPt, out targetPt, out _);
                     OutOfReach++;
                 }
             }
 
-            onNavMesh = FromRc(targetPt);
-            bool ok = _crowd.RequestMoveTarget(agent, targetRef, targetPt);
-            if (!ok)
-                Debug.Log($"[NavMeshWorld] SetAgentTarget: RequestMoveTarget failed (agent={agent.idx}, targetRef={targetRef})");
+            // Its corners, from where it stood when the search began
+            int corners = 0;
+            if (count > 0)
+                _wayQuery!.FindStraightPath(_wayFrom, targetPt, _wayPolys, count, _wayCorners, out corners, _wayCorners.Length, 0);
+            if (corners == 0)
+            {
+                _wayCorners[0] = new DtStraightPath(_wayFrom, DtStraightPathFlags.DT_STRAIGHTPATH_START, 0);
+                _wayCorners[1] = new DtStraightPath(targetPt, DtStraightPathFlags.DT_STRAIGHTPATH_END, targetRef);
+                corners = 2;
+            }
 
-            return ok;
+            bool ok = agent.WayOnly || _crowd!.RequestMoveTarget(agent.CrowdAgent!, targetRef, targetPt);
+            if (!ok)
+                Debug.Log($"[NavMeshWorld] RequestMoveTarget failed (agent={agent.CrowdAgent!.idx}, targetRef={targetRef})");
+            agent.WayFound(ok, FromRc(targetPt), _wayCorners.AsSpan(0, corners));
         }
 
         /// <summary>Stop an agent.</summary>

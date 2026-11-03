@@ -1,6 +1,8 @@
 using System;
+using System.Collections.Generic;
 using System.Numerics;
 using DotRecast.Core.Numerics;
+using DotRecast.Detour;
 using DotRecast.Detour.Crowd;
 using Freefall.Base;
 using Freefall.Reflection;
@@ -12,10 +14,11 @@ namespace Freefall.Components
 {
     /// <summary>
     /// Steers an entity along the navmesh toward a destination.
-    /// Uses DtCrowd for local avoidance between agents.
+    /// Uses DtCrowd for local avoidance between agents. Its frame (<see cref="Update"/>) is run by
+    /// <see cref="NavMeshAgentSystem"/>, not as an IUpdate.
     /// </summary>
     [Icon("icon_nav_agent.png")]
-    public class NavMeshAgent : Component, IUpdate
+    public class NavMeshAgent : Component
     {
         [Category("Agent")]
         [ValueRange(0.1f, 2f)]
@@ -76,12 +79,31 @@ namespace Freefall.Components
         public float Stalled { get; private set; }
 
         /// <summary>
-        /// The crowd is still looking for its way (Detour's target states requesting, waiting for the queue, waiting for
-        /// the path). Meanwhile it goes along the quick search's way, and it does not count as stalled.
+        /// Its way is still being looked for: by the path service (<see cref="FindingWay"/>), then by the crowd (Detour's
+        /// target states requesting, waiting for the queue, waiting for the path). Meanwhile it goes along the way it had,
+        /// then the quick search's, and it does not count as stalled.
         /// </summary>
         [DontSerialize]
-        public bool Planning => HasPath && _crowdAgent != null && _crowdAgent.targetState is DtMoveRequestState.DT_CROWDAGENT_TARGET_REQUESTING
-            or DtMoveRequestState.DT_CROWDAGENT_TARGET_WAITING_FOR_QUEUE or DtMoveRequestState.DT_CROWDAGENT_TARGET_WAITING_FOR_PATH;
+        public bool Planning => HasPath && (FindingWay || _crowdAgent != null && _crowdAgent.targetState is DtMoveRequestState.DT_CROWDAGENT_TARGET_REQUESTING
+            or DtMoveRequestState.DT_CROWDAGENT_TARGET_WAITING_FOR_QUEUE or DtMoveRequestState.DT_CROWDAGENT_TARGET_WAITING_FOR_PATH);
+
+        /// <summary>
+        /// The way to its destination is waiting for the path service (NavMeshWorld, served by NavMeshAgentSystem a budget
+        /// a frame): its crowd target comes with it, in this frame or a later one.
+        /// </summary>
+        [DontSerialize]
+        public bool FindingWay => WayAsked && !WayOnly;
+
+        /// <summary>
+        /// The corners of its way, as the path service found it: from where it stood when it was looked for to where it
+        /// ends (the destination, or as near as a way leads). Empty while a new destination's is looked for, and once it
+        /// has stopped. <see cref="WayVersion"/> goes up with every way found.
+        /// </summary>
+        [DontSerialize]
+        public IReadOnlyList<Vector3> Way => _way;
+
+        [DontSerialize]
+        public int WayVersion { get; private set; }
 
         /// <summary>Seconds it has been Planning this time, 0 when not; the longest since it joined the crowd in LongestPlanning.</summary>
         [DontSerialize]
@@ -89,6 +111,12 @@ namespace Freefall.Components
 
         [DontSerialize]
         public float LongestPlanning { get; private set; }
+
+        /// <summary>The longest it has waited for the path service (FindingWay), in seconds, since it joined: part of LongestPlanning.</summary>
+        [DontSerialize]
+        public float LongestFindingWay { get; private set; }
+
+        private float _findingFor;
 
         /// <summary>How often the crowd's agent was put again where its transform stands, or back on the navmesh (see Update).</summary>
         [DontSerialize]
@@ -169,6 +197,14 @@ namespace Freefall.Components
         private bool _destinationPending;
         private Vector3 _pendingTarget;
         private Vector3 _goal;            // Destination put on the navmesh: what the crowd steers for
+        private long _targetRef;          // Destination put on the navmesh, as the path service searches for it
+        private Vector3 _targetPt;
+        private readonly List<Vector3> _way = new();
+
+        // With the path service (NavMeshWorld.AskWay): asked for, or under way; only the way, the crowd's target staying
+        internal bool WayAsked;
+        internal bool WayOnly;
+        internal DtCrowdAgent? CrowdAgent => _crowdAgent;
         private float _remainingSquared;
         private Vector3 _headwayFrom;     // where its transform was when it last made headway (Stalled)
 
@@ -251,6 +287,8 @@ namespace Freefall.Components
                 Velocity = Vector3.Zero;
                 Stalled = 0f;
                 _destinationPending = false;
+                WayAsked = WayOnly = false;
+                _way.Clear();
             }
         }
 
@@ -265,26 +303,49 @@ namespace Freefall.Components
 
         // ── API ──
 
-        /// <summary>Set a new destination. Path is computed by the crowd.</summary>
+        /// <summary>
+        /// Set a new destination. It is put on the navmesh at once: with no navmesh near it there is no way (HasPath false,
+        /// OnPathFailed) as soon as this returns. The way there is the path service's, in this frame or a later one
+        /// (<see cref="FindingWay"/>, then <see cref="Way"/>); it then becomes the crowd's target, and meanwhile the agent
+        /// goes on along the way it had.
+        /// </summary>
         public void SetDestination(Vector3 target)
         {
             Destination = target;
 
             if (_crowdAgent != null && NavMeshWorld.IsReady)
             {
-                HasPath = NavMeshWorld.SetAgentTarget(_crowdAgent, target, out _goal);
+                HasPath = NavMeshWorld.TargetOnNavMesh(target, out _targetRef, out _targetPt);
                 if (!HasPath)
                 {
                     // Nowhere to go: not on to where it was going before, either
+                    WayAsked = WayOnly = false;
+                    _way.Clear();
                     NavMeshWorld.ResetAgentTarget(_crowdAgent);
                     OnPathFailed?.Invoke();
+                    return;
                 }
+                _goal = _targetPt;
+                WayOnly = false;
+                _way.Clear();
+                NavMeshWorld.AskWay(this);
             }
             else
             {
                 _destinationPending = true;
                 _pendingTarget = target;
             }
+        }
+
+        /// <summary>
+        /// The way to its destination looked for again from where it stands now, its crowd target left as it is: for a
+        /// walker that has lost the way it set off on. Its <see cref="Way"/> stays until the new one comes.
+        /// </summary>
+        public void FindWay()
+        {
+            if (!HasPath || _crowdAgent == null) return;
+            if (!WayAsked) WayOnly = true;   // a new destination's ask, waiting already, finds the way too
+            NavMeshWorld.AskWay(this);
         }
 
         /// <summary>Stop moving and clear the current path.</summary>
@@ -294,9 +355,42 @@ namespace Freefall.Components
             IsMoving = false;
             Velocity = Vector3.Zero;
             Stalled = 0f;
+            WayAsked = WayOnly = false;
+            _way.Clear();
 
             if (_crowdAgent != null)
                 NavMeshWorld.ResetAgentTarget(_crowdAgent);
+        }
+
+        /// <summary>Whether the path service still has to look for its way, and for where (the destination on the navmesh).</summary>
+        internal bool WayWanted(out long target, out Vector3 at)
+        {
+            target = _targetRef;
+            at = _targetPt;
+            return WayAsked && HasPath && _crowdAgent != null && Enabled && !IsDestroyed;
+        }
+
+        /// <summary>
+        /// The path service's answer: the way's corners and where it ends; and whether the crowd took that as its target
+        /// (always, with WayOnly). The crowd refusing it is no way, as the target used to be refused at once.
+        /// </summary>
+        internal void WayFound(bool taken, Vector3 end, ReadOnlySpan<DtStraightPath> corners)
+        {
+            bool only = WayOnly;
+            WayAsked = WayOnly = false;
+            _way.Clear();
+            for (int i = 0; i < corners.Length; i++) _way.Add(NavMeshWorld.FromRc(corners[i].pos));
+            WayVersion++;
+            if (only) return;
+
+            _goal = end;
+            if (!taken)
+            {
+                HasPath = false;
+                _way.Clear();
+                if (_crowdAgent != null) NavMeshWorld.ResetAgentTarget(_crowdAgent);
+                OnPathFailed?.Invoke();
+            }
         }
 
         /// <summary>Warp to a position on the navmesh (teleport).</summary>
@@ -359,6 +453,8 @@ namespace Freefall.Components
             bool planning = Planning;
             PlanningFor = planning ? PlanningFor + Time.SmoothDelta : 0f;
             if (PlanningFor > LongestPlanning) LongestPlanning = PlanningFor;
+            _findingFor = FindingWay ? _findingFor + Time.SmoothDelta : 0f;
+            if (_findingFor > LongestFindingWay) LongestFindingWay = _findingFor;
             Position = crowdPos;
             Velocity = HasPath ? crowdVel : Vector3.Zero;
             IsMoving = HasPath && crowdVel.LengthSquared() > 0.0001f;
@@ -410,9 +506,10 @@ namespace Freefall.Components
             // lead to. The crowd is told to stop: left with its target it keeps making for the
             // exact point, and a character that follows the agent's velocity but moves by its
             // clips walks past it, is sent back, and turns to and fro on the spot.
+            // While the path service looks for its way the crowd's target is still the last one: the new destination counts.
             if (HasPath)
             {
-                var end = _crowdAgent.targetState == DtMoveRequestState.DT_CROWDAGENT_TARGET_VALID
+                var end = !FindingWay && _crowdAgent.targetState == DtMoveRequestState.DT_CROWDAGENT_TARGET_VALID
                     ? NavMeshWorld.FromRc(_crowdAgent.corridor.GetTarget())
                     : _goal;
 

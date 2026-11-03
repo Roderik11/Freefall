@@ -22,10 +22,48 @@ namespace Freefall.Components
         private readonly List<Transform> Children = new List<Transform>();
 
         /// <summary>
-        /// Fired when any local property changes (position, rotation, scale, parent).
-        /// Renderers subscribe to push dirty data to GPU buffers.
+        /// Fired when any local property changes (position, rotation, scale, parent). In place on the main thread. A change
+        /// made inside <see cref="ParallelWork.For"/> on one of its helpers fires it on the main thread, once per transform,
+        /// as that call returns: its handlers may touch what other threads must not (a collider's or a rigid body's PhysX
+        /// actor, the audio system's lists). Nobody calls anything for it.
         /// </summary>
         public event Action OnChanged;
+
+        /// <summary>
+        /// As <see cref="OnChanged"/>, but in place on whatever thread made the change: for a handler that touches nothing
+        /// but its own object's fields (a renderer's bounds), so a write from a worker owes the main thread nothing for it.
+        /// </summary>
+        internal event Action OnChangedInPlace;
+
+        // Changed on a worker with OnChanged still to fire (FireChangesFromWorkers), each transform once
+        private static readonly List<Transform> _changedOnWorkers = new();
+        private static readonly List<Transform> _firing = new();
+        private bool _changeOwed;
+
+        /// <summary>
+        /// Fires <see cref="OnChanged"/> for the transforms changed on other threads since the last call, on the main
+        /// thread: <see cref="ParallelWork.For"/> as it returns, and <c>Engine.Tick</c> after the update group for a change
+        /// from any other thread.
+        /// </summary>
+        internal static void FireChangesFromWorkers()
+        {
+            if (_changedOnWorkers.Count == 0) return;
+            lock (_changedOnWorkers)
+            {
+                _firing.AddRange(_changedOnWorkers);
+                _changedOnWorkers.Clear();
+            }
+            for (int i = 0; i < _firing.Count; i++)
+            {
+                var t = _firing[i];
+                t._changeOwed = false;
+                if (t.IsDestroyed || t._isFiringChanged) continue;
+                t._isFiringChanged = true;
+                try { t.OnChanged?.Invoke(); }
+                finally { t._isFiringChanged = false; }
+            }
+            _firing.Clear();
+        }
 
         public int Depth => _parent != null ? _parent.Depth + 1 : 0;
         public int GetChildCount() => Children.Count;
@@ -57,7 +95,19 @@ namespace Freefall.Components
             if (!_isFiringChanged)
             {
                 _isFiringChanged = true;
-                try { OnChanged?.Invoke(); }
+                try
+                {
+                    OnChangedInPlace?.Invoke();
+                    if (OnChanged != null)
+                    {
+                        if (Engine.OnMainThread) OnChanged.Invoke();
+                        else if (!_changeOwed)
+                        {
+                            _changeOwed = true;   // only this transform's own thread writes it
+                            lock (_changedOnWorkers) _changedOnWorkers.Add(this);
+                        }
+                    }
+                }
                 finally { _isFiringChanged = false; }
             }
         }

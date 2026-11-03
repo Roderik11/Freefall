@@ -7,7 +7,8 @@ namespace Freefall.Editor.Commands
     /// <summary>
     /// The <see cref="Profiler"/> call tree: average and max ms over the last 'frames' recorded frames, or
     /// one frame ('slowest' = the slowest of them, 'frame' = one by index from 'longFrames'). Children sorted by
-    /// time; sections under 'minMs' are left out.
+    /// time; sections under 'minMs' are left out. A section a ParallelWork.For ran in has 'threads' (that took part,
+    /// the caller included) and 'workMs' (their time in its bodies together); 'ms' stays its wall time.
     /// </summary>
     [CommandRoute("GET", "/api/debug/profiler")]
     public class GetProfilerCommand : EditorCommand
@@ -83,6 +84,11 @@ namespace Freefall.Editor.Commands
                 if (sample.AllocBytes >= 52) result["allocKB"] = Math.Round(sample.AllocBytes / 1024.0, 1);
                 if (sample.Items > 0) result["items"] = sample.Items;
                 if (sample.Calls > 1) result["calls"] = sample.Calls;
+                if (sample.Threads > 0)
+                {
+                    result["threads"] = sample.Threads;
+                    result["workMs"] = Math.Round(sample.WorkMs, 3);
+                }
             }
             else
             {
@@ -92,6 +98,12 @@ namespace Freefall.Editor.Commands
                 if (stats.AvgAllocBytes >= 52) result["allocKB"] = Math.Round(stats.AvgAllocBytes / 1024.0, 1);
                 if (stats.AvgItems > 0) result["items"] = Math.Round(stats.AvgItems, 1);
                 if (stats.AvgCalls > 1.01f) result["calls"] = Math.Round(stats.AvgCalls, 1);
+                // A ParallelWork.For ran in it: the threads that took part and their time in its bodies together
+                if (stats.AvgThreads > 0)
+                {
+                    result["threads"] = Math.Round(stats.AvgThreads, 1);
+                    result["workMs"] = Math.Round(stats.AvgWorkMs, 3);
+                }
             }
 
             var children = new List<(ProfilerNode Node, float Ms, float Max)>();

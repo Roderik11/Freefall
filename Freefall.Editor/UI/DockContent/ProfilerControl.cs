@@ -7,14 +7,16 @@ namespace Freefall.Editor
     /// <summary>
     /// The <see cref="Profiler"/>: a frame-time graph over the recorded history and the CPU and GPU trees,
     /// averaged over the last <see cref="WindowFrames"/> frames, or one frame picked in the graph (which
-    /// pauses recording). Children are sorted by time; numbers refresh a few times per second.
+    /// pauses recording). Children are sorted by time; numbers refresh a few times per second. A section that ran a
+    /// ParallelWork.For shows the threads that took part and their time in its bodies together (Work ms).
     /// </summary>
     public class ProfilerControl : Frame
     {
         private const int WindowFrames = 120;
         private const long RefreshMs = 250;
 
-        // Value columns, right to left: count, alloc, max, ms
+        // Value columns, right to left: count, alloc, work, threads, max, ms
+        private const int ThreadsWidth = 64;
         private const int CountWidth = 56;
         private const int AllocWidth = 72;
         private const int MsWidth = 60;
@@ -26,7 +28,7 @@ namespace Freefall.Editor
             public ProfilerNode Node = null!;
             public bool HasChildren;
             public bool Expanded;
-            public string Ms = "", Max = "", Alloc = "", Count = "";
+            public string Ms = "", Max = "", Threads = "", Work = "", Alloc = "", Count = "";
         }
 
         private readonly Button pauseButton;
@@ -104,6 +106,10 @@ namespace Freefall.Editor
             };
             header.Controls.Add(HeaderLabel("Count", CountWidth));
             header.Controls.Add(HeaderLabel("Alloc", AllocWidth));
+            header.Controls.Add(HeaderLabel("Work ms", MsWidth,
+                "A parallel loop's time on all its threads together (ParallelWork.For); ms is its wall time"));
+            header.Controls.Add(HeaderLabel("Threads", ThreadsWidth,
+                "Threads a parallel loop in this section ran on, the calling thread included; empty: one after another"));
             header.Controls.Add(HeaderLabel("Max ms", MsWidth));
             header.Controls.Add(HeaderLabel("ms", MsWidth));
             header.Controls.Add(new Label { Style = "header", Text = "Section", Dock = DockStyle.Fill, NoEvents = true });
@@ -128,7 +134,7 @@ namespace Freefall.Editor
             Controls.Add(list);
         }
 
-        private static Label HeaderLabel(string text, int width) => new()
+        private static Label HeaderLabel(string text, int width, string? tooltip = null) => new()
         {
             Style = "header",
             Text = text,
@@ -136,7 +142,8 @@ namespace Freefall.Editor
             Margin = new Margin(0, 0, ValueGap, 0),
             Dock = DockStyle.Right,
             TextAlign = Alignment.MiddleRight,
-            NoEvents = true
+            Tooltip = tooltip ?? "",
+            NoEvents = tooltip == null
         };
 
         protected override void OnUpdate()
@@ -243,6 +250,8 @@ namespace Freefall.Editor
                 row.Max = "";
                 row.Alloc = FormatBytes(sample.AllocBytes);
                 row.Count = FormatCount(sample.Items, sample.Calls);
+                row.Threads = sample.Threads > 0 ? sample.Threads.ToString() : "";
+                row.Work = sample.Threads > 0 ? sample.WorkMs.ToString("F2") : "";
             }
             else
             {
@@ -251,6 +260,8 @@ namespace Freefall.Editor
                 row.Max = stats.AvgCalls > 0 ? stats.MaxMs.ToString("F2") : "";
                 row.Alloc = FormatBytes((long)stats.AvgAllocBytes);
                 row.Count = FormatCount(stats.AvgItems, stats.AvgCalls);
+                row.Threads = stats.AvgThreads > 0 ? stats.AvgThreads.ToString(stats.AvgThreads % 1 == 0 ? "F0" : "F1") : "";
+                row.Work = stats.AvgThreads > 0 ? stats.AvgWorkMs.ToString("F2") : "";
             }
 
             if (!row.Expanded) return;
@@ -316,7 +327,7 @@ namespace Freefall.Editor
         {
             private readonly Control indent;
             private readonly ImageControl foldout;
-            private readonly Label name, ms, max, alloc, count;
+            private readonly Label name, ms, max, threads, work, alloc, count;
 
             public Row? Row { get; private set; }
 
@@ -340,6 +351,8 @@ namespace Freefall.Editor
 
                 count = Value(CountWidth);
                 alloc = Value(AllocWidth);
+                work = Value(MsWidth);
+                threads = Value(ThreadsWidth);
                 max = Value(MsWidth);
                 ms = Value(MsWidth);
                 name = new Label { Style = "item", NoEvents = true, Dock = DockStyle.Fill, AutoEllipsis = true };
@@ -348,6 +361,8 @@ namespace Freefall.Editor
                 Elements.Add(foldout);
                 Elements.Add(count);
                 Elements.Add(alloc);
+                Elements.Add(work);
+                Elements.Add(threads);
                 Elements.Add(max);
                 Elements.Add(ms);
                 Elements.Add(name);
@@ -371,6 +386,8 @@ namespace Freefall.Editor
                 name.Text = row.Node.Name;
                 ms.Text = row.Ms;
                 max.Text = row.Max;
+                threads.Text = row.Threads;
+                work.Text = row.Work;
                 alloc.Text = row.Alloc;
                 count.Text = row.Count;
             }
@@ -382,6 +399,8 @@ namespace Freefall.Editor
                 name.State = State;
                 ms.State = State;
                 max.State = State;
+                threads.State = State;
+                work.State = State;
                 alloc.State = State;
                 count.State = State;
             }

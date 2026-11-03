@@ -154,6 +154,8 @@ namespace Freefall
         /// </summary>
         public static void Initialize()
         {
+            MainThreadId = Environment.CurrentManagedThreadId;
+
             // Set high-resolution timer for smooth high-FPS gameplay
             Kernel32.timeBeginPeriod(1);
             
@@ -202,6 +204,7 @@ namespace Freefall
         public static void Initialize(IntPtr handle, int width, int height, bool editor = true)
         {
             // Before the first shader: a game reads its shaders from its own Resources folder only
+            MainThreadId = Environment.CurrentManagedThreadId;
             Graphics.ShaderHotReload.Enabled = editor;
             DebugKeys = editor;
 
@@ -301,8 +304,15 @@ namespace Freefall
         private static readonly ProfilerMarker _cameraMarker = ProfilerMarker.Get("Camera");
         private static readonly ProfilerMarker _queueMarker = ProfilerMarker.Get("Main thread queue");
 
+        /// <summary>The thread that runs the engine's frame (the one that first called <see cref="Tick"/>).</summary>
+        public static int MainThreadId { get; private set; } = -1;
+
+        /// <summary>Whether the calling thread is the one that runs the frame.</summary>
+        public static bool OnMainThread => Environment.CurrentManagedThreadId == MainThreadId;
+
         public static void Tick()
         {
+            if (MainThreadId < 0) MainThreadId = Environment.CurrentManagedThreadId;
             TickCount++;
 
             Time.Update();
@@ -354,6 +364,7 @@ namespace Freefall
                 try
                 {
                     if (!loading) Update();
+                    Transform.FireChangesFromWorkers();   // what parallel work moved and its systems did not fire yet
                 }
                 catch when (!Device.IsDeviceLost && Device.NativeDevice.DeviceRemovedReason.Failure)
                 {
