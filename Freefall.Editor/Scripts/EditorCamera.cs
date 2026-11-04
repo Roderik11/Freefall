@@ -71,14 +71,14 @@ namespace Freefall.Editor
 
             // Right-mouse drag to orbit (allow when mouse isn't captured by UI)
             if (!EditorUI.MouseCaptured && Input.IsMouseDown(1))
-                newAngle += new Vector2(Input.MouseDelta.X, Input.MouseDelta.Y) * (float)Time.Delta;
+                newAngle += new Vector2(Input.MouseDelta.X, Input.MouseDelta.Y) * (float)Time.RealDelta;
 
-            angle += (newAngle - angle) * (float)Time.Delta * smoothness;
+            angle += (newAngle - angle) * (float)Time.RealDelta * smoothness;
             Entity.Transform.Rotation = Quaternion.CreateFromYawPitchRoll(angle.X, angle.Y, 0);
 
             // Scroll wheel to dolly forward/back
             if (!EditorUI.MouseCaptured)
-                Entity.Transform.Position += Entity.Transform.Forward * Input.MouseWheelDelta * (float)Time.Delta * 4;
+                Entity.Transform.Position += Entity.Transform.Forward * Input.MouseWheelDelta * (float)Time.RealDelta * 4;
 
             // WASD movement (only when keyboard isn't captured by UI text fields)
             if (!EditorUI.KeyboardCaptured)
@@ -87,7 +87,7 @@ namespace Freefall.Editor
                 if (Input.Shift)
                     speed = Math.Max(20, Entity.Transform.Position.Y);
 
-                speed *= (float)Time.Delta;
+                speed *= (float)Time.RealDelta;
 
                 if (Input.IsKeyDown(Keys.W))
                     Entity.Transform.Position += Entity.Transform.Forward * speed;

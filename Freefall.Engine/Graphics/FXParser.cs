@@ -390,7 +390,7 @@ namespace Freefall.Graphics
         /// <summary>Whether depth testing is enabled</summary>
         public bool DepthTest { get; set; } = true;
         
-        /// <summary>Blend mode: "Opaque", "Additive", "AlphaBlend"</summary>
+        /// <summary>Blend mode: "Opaque", "Additive", "AlphaBlend", "Premultiplied"</summary>
         public string BlendMode { get; set; } = "Opaque";
         
         /// <summary>Cull mode: "None", "Front", "Back" (default: Back)</summary>

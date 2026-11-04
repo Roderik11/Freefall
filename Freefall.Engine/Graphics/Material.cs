@@ -759,6 +759,9 @@ namespace Freefall.Graphics
         /// </summary>
         private static BlendDescription AccumulateAll() => new(Blend.One, Blend.One, Blend.One, Blend.One);
 
+        /// <summary>Blend "Premultiplied": the colour as given plus what its alpha lets through of what is there (vfx_volume.fx).</summary>
+        private static BlendDescription Premultiplied() => new(Blend.One, Blend.InverseSourceAlpha, Blend.One, Blend.InverseSourceAlpha);
+
         private static Format[] TargetFormats(int count, string? overrideFormat)
         {
             // The order-independent transparency's targets (OrderIndependentTransparency, oit.hlsli)
@@ -828,6 +831,7 @@ namespace Freefall.Graphics
             {
                 "Additive" => new BlendDescription(Blend.One, Blend.One),
                 "AlphaBlend" => BlendDescription.AlphaBlend,
+                "Premultiplied" => Premultiplied(),
                 _ => effect.BlendState == BlendState.Additive 
                     ? new BlendDescription(Blend.One, Blend.One)
                     : effect.BlendState == BlendState.AlphaBlend 
@@ -974,6 +978,7 @@ namespace Freefall.Graphics
                     {
                         "Additive" => new BlendDescription(Blend.One, Blend.One),
                         "AlphaBlend" => BlendDescription.AlphaBlend,
+                        "Premultiplied" => Premultiplied(),
                         "NoColor" => NoColorWrites(),
                         "OIT" => AccumulateAll(),
                         _ => blendDesc

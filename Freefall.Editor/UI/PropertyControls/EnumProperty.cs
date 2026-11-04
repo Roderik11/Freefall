@@ -118,7 +118,7 @@ namespace Freefall.Editor
         // Shows what scripts, the game's options or the MCP set, never writing it back, and not while the list is open
         protected override void OnUpdate()
         {
-            Timer += Time.Delta;
+            Timer += Time.RealDelta;
             if (Timer <= Interval || Dropdown.IsOpen || property.HasMixedValue) return;
             Timer = 0;
 

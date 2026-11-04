@@ -60,9 +60,9 @@ namespace Freefall.Animation
 
         /// <summary>
         /// Changes when a skinned renderer was added or removed anywhere, or anything was re-parented: an
-        /// Animator then finds its renderers again.
+        /// Animator then finds its renderers again, and whatever follows a body's parts (a glowing shell drawn over them).
         /// </summary>
-        internal static int PartsVersion => _rendererChanges + Transform.HierarchyVersion;
+        public static int PartsVersion => _rendererChanges + Transform.HierarchyVersion;
 
         /// <summary>Animators stepped in the last frame.</summary>
         public int Stepped { get; private set; }

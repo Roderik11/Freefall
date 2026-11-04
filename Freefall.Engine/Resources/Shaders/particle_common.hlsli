@@ -26,7 +26,7 @@ struct ParticleVisual      // 16 bytes — per-particle variation, everything el
 
 // One row per emitter, rewritten by the CPU every frame (ParticleSystem.EmitterRow in C#).
 // Laid out in 16-byte rows so no vector straddles a boundary and the C# struct maps 1:1.
-struct ParticleEmitter     // 368 bytes
+struct ParticleEmitter     // 384 bytes
 {
     float3 Position;       float  ParticleRadius;      // largest half-extent of one particle quad
     float3 EmitDirection;  float  SpreadCos;           // emitter-local, normalized / cos(spread half-angle)
@@ -51,7 +51,8 @@ struct ParticleEmitter     // 368 bytes
     float  Turbulence;     float  TurbulenceFrequency; float WindLean;           float Follow;       // m/s² / 1 / swirl size / m of lean at the sprite's top per m/s of Wind / FollowEmitter
     float3 Carry;          float  PivotX;              // how far live particles move along with the emitter this frame (FollowEmitter)
     float3 LeanWind;       float  PivotY;              // the wind a sprite leans in: Wind less the emitter's own motion it follows / quad offset in its sizes
-    float  ForwardScatter; float  MultipleScattering;  float _pad1;              float _pad2;        // lit: Henyey-Greenstein g of the light (ParticleLight) / its even share (ParticlePhase)
+    float  ForwardScatter; float  MultipleScattering;  float PyroFire;           float PyroTemperature; // lit: Henyey-Greenstein g of the light (ParticleLight) / its even share (ParticlePhase) / pyro: the fire's nits and kelvin at its brightest
+    uint   MotionTextureIdx; float MotionStrength;     float _pad3;              float _pad4;        // the flipbook's motion atlas (0 = none) / its full-scale motion in shares of a frame
 };
 
 // ParticleEmitter.RenderMode
@@ -69,5 +70,6 @@ struct ParticleEmitter     // 368 bytes
 #define PARTICLE_FLAG_WRAP            64   // shape Box + WrapInBox: a particle leaving the box sideways comes in on the far side
 #define PARTICLE_FLAG_COVER          128   // StopUnderCover: dies (and is not born) where the sky is covered over it
 #define PARTICLE_FLAG_WATER          256   // Lit + Water: a drop shows the sky above it through itself (rain)
+#define PARTICLE_FLAG_PYRO           512   // the texture is a pyro bake: R fire, G smoke coverage, B smoke key light, A fire glow in the smoke
 
 #endif

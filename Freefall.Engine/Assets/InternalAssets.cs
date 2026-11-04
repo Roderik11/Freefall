@@ -46,6 +46,8 @@ namespace Freefall.Assets
             public const string WaterEffect = "00000000000000000000000000000019";
             public const string VfxEffect = "0000000000000000000000000000001a";   // vfx.fx: glowing meshes (beams, lasers, spells)
             public const string DecalEffect = "0000000000000000000000000000001b"; // decal.fx: decal materials (DecalPass applies them)
+            public const string VfxVolumeEffect = "0000000000000000000000000000001c"; // vfx_volume.fx: fire, smoke and vapour as a volume in a sphere
+            public const string VfxLayersEffect = "0000000000000000000000000000001d"; // vfx_layers.fx: fire, magic and smoke from layered textures on a mesh
 
             // materials
             public const string DefaultMaterial = "00000000000000000000000000000020";
@@ -106,6 +108,10 @@ namespace Freefall.Assets
         /// <summary>Lakes and rivers (water.fx). Drawn by the WaterBody component, which supplies its per-instance data.</summary>
         public static Effect WaterEffect { get; private set; }
         public static Effect VfxEffect { get; private set; }
+        /// <summary>Fire, smoke and glowing vapour marched through the ball a SphereMesh covers (vfx_volume.fx).</summary>
+        public static Effect VfxVolumeEffect { get; private set; }
+        /// <summary>Fire, magic and smoke from scrolled, multiplied, eroded textures on a mesh, coloured by a gradient map (vfx_layers.fx).</summary>
+        public static Effect VfxLayersEffect { get; private set; }
         /// <summary>Decal materials (decal.fx): their settings; the decal pass applies them (Components.Decal).</summary>
         public static Effect DecalEffect { get; private set; }
 
@@ -216,6 +222,8 @@ namespace Freefall.Assets
             CrossmeshEffect = new Effect("gbuffer_crossmesh");
             WaterEffect = new Effect("water");
             VfxEffect = new Effect("vfx");
+            VfxVolumeEffect = new Effect("vfx_volume");
+            VfxLayersEffect = new Effect("vfx_layers");
             DecalEffect = new Effect("decal");
 
             DefaultMaterial = new Material(DefaultEffect);
@@ -285,6 +293,8 @@ namespace Freefall.Assets
             manager.RegisterAsset(Guids.CrossmeshEffect, CrossmeshEffect);
             manager.RegisterAsset(Guids.WaterEffect, WaterEffect);
             manager.RegisterAsset(Guids.VfxEffect, VfxEffect);
+            manager.RegisterAsset(Guids.VfxVolumeEffect, VfxVolumeEffect);
+            manager.RegisterAsset(Guids.VfxLayersEffect, VfxLayersEffect);
             manager.RegisterAsset(Guids.DecalEffect, DecalEffect);
 
             manager.RegisterAsset(Guids.DefaultMaterial, DefaultMaterial);

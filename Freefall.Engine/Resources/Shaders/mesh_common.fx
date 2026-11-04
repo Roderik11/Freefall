@@ -33,7 +33,7 @@ cbuffer PushConstants : register(b3)
     uint MeshRegistryIdx;           // 6: StructuredBuffer<MeshPartEntry>
     uint MaterialsIdx;              // 7: StructuredBuffer<MaterialData>
     uint GlobalTransformBufferIdx;  // 8: StructuredBuffer<row_major matrix>
-    uint _reserved9;
+    uint SceneDepthIdx;             // 9: Texture2D<float> of the scene's linear view depth (0 = sky), Forward pass only; 0 = none
     uint _reserved10;
     uint _reserved11;
     uint _reserved12;

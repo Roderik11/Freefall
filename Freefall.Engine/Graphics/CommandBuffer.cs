@@ -558,8 +558,10 @@ namespace Freefall.Graphics
                     // Push constant slot 16: debug mode (not touched by command signature slots 2-15)
                     commandList.SetGraphicsRoot32BitConstant(0, (uint)Engine.Settings.DebugVisualizationMode, 16);
                     
-                    // Forward pass: set slots 0-1 for transparent shaders (shadow map + composite snapshot)
-                    // These are 'reserved' in opaque/sky shaders and harmless to overwrite.
+                    // Forward pass: set slots 0-1 for transparent shaders (shadow map + composite snapshot) and 9 (the
+                    // scene's linear view depth: soft edges, volumes that end at the ground; mesh_common.fx SceneDepthIdx).
+                    // These are 'reserved' in opaque/sky shaders and harmless to overwrite; a batch that binds a
+                    // per-instance buffer to slot 9 sets it after this, in Draw.
                     // Custom actions (ocean) run before batches and set their own root state.
                     if (pass is RenderPass.Forward or RenderPass.OIT or RenderPass.OITMoments)
                     {
@@ -568,6 +570,7 @@ namespace Freefall.Graphics
                         {
                             commandList.SetGraphicsRoot32BitConstant(0, renderer.ShadowMapIndex, 0);
                             commandList.SetGraphicsRoot32BitConstant(0, renderer.CompositeSnapshot?.BindlessIndex ?? 0u, 1);
+                            commandList.SetGraphicsRoot32BitConstant(0, renderer.DepthGBuffer?.BindlessIndex ?? 0u, 9);
                         }
                     }
 

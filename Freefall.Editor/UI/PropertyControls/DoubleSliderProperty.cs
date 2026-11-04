@@ -43,7 +43,7 @@ namespace Freefall.Editor
         // Shows what scripts or the MCP set, without writing it back (notify: false) and not while the user drags or types
         protected override void OnUpdate()
         {
-            Timer += Time.Delta;
+            Timer += Time.RealDelta;
             if (Timer <= Interval || Slider.Interacting || property.HasMixedValue) return;
             Timer = 0;
             object value = property.GetValue();

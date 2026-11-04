@@ -69,19 +69,19 @@ namespace Freefall.Editor
             for (int i = 0; i < activeToasts.Count; i++)
             {
                 var toast = activeToasts[i];
-                toast.Duration -= Time.Delta;
+                toast.Duration -= Time.RealDelta;
 
                 if (toast.Duration <= 0)
                 {
                     if (toast.Opacity > 0)
                     {
-                        toast.Opacity -= Time.Delta * 2; // Fade out over 0.5 seconds
+                        toast.Opacity -= Time.RealDelta * 2; // Fade out over 0.5 seconds
                         break;
                     }
                     else if (toast.Size.y > 0)
                     {
                         float height = toast.Size.y;
-                        height -= (Time.Delta * 2); // Fade out over 0.5 seconds
+                        height -= (Time.RealDelta * 2); // Fade out over 0.5 seconds
                         toast.Size = new Point(toast.Size.x, Math.Max(0, (int)height));
                         break;
                     }
@@ -92,7 +92,7 @@ namespace Freefall.Editor
             for (int i = activeToasts.Count - 1; i >= 0; i--)
             {
                 var toast = activeToasts[i];
-                toast.Duration -= Time.Delta;
+                toast.Duration -= Time.RealDelta;
 
                 if (toast.Duration > 0)
                     continue;

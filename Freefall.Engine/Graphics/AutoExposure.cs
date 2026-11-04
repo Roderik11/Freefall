@@ -117,7 +117,7 @@ namespace Freefall.Graphics
             if (!_wasAuto)
                 _snapSeconds = SnapSeconds; // turned on (or first frame): start where the scene is, without a fade
             _wasAuto = true;
-            float dt = Math.Clamp((float)Base.Time.Delta, 0f, 0.1f);
+            float dt = Math.Clamp((float)Base.Time.RealDelta, 0f, 0.1f);   // the eye adapts on the real clock: a paused game (Time.Scale 0) still meters
 
             int slot = Engine.FrameIndex % FrameCount;
             if (!_written[slot]) return;

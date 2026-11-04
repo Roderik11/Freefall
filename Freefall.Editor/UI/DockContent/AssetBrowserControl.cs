@@ -667,6 +667,8 @@ namespace Freefall.Editor
             Add("CrossmeshEffect", "Effect", IA.Guids.CrossmeshEffect, typeof(Effect));
             Add("WaterEffect", "Effect", IA.Guids.WaterEffect, typeof(Effect));
             Add("VfxEffect", "Effect", IA.Guids.VfxEffect, typeof(Effect));
+            Add("VfxVolumeEffect", "Effect", IA.Guids.VfxVolumeEffect, typeof(Effect));
+            Add("VfxLayersEffect", "Effect", IA.Guids.VfxLayersEffect, typeof(Effect));
 
             // Materials
             Add("DefaultMaterial",   "Material", IA.Guids.DefaultMaterial,   typeof(Material));

@@ -80,7 +80,26 @@ struct VSOutput
     float2 NextTexCoord : TEXCOORD4;               // the following flipbook frame
     nointerpolation float FrameBlend : TEXCOORD5;  // 0..1 towards it; 0 = no cross-fade
     nointerpolation float SkyVisible : TEXCOORD6;  // how much sky the particle sees past the terrain (scales the haze in front)
+    nointerpolation float2 Pyro : TEXCOORD7;       // a pyro bake: the fire's light at its brightest (pre-exposed) and its kelvin; x 0 = not pyro
+    nointerpolation uint MotionIdx : TEXCOORD8;    // the flipbook's motion atlas, 0 = none
+    nointerpolation float3 Motion : TEXCOORD9;     // its full-scale motion in atlas UV (x across, y down: a frame's size times the strength), z unused
 };
+
+// The colour of a body at t kelvin, linear sRGB, its largest channel 1 (Planckian locus, Kim et al. 2002, 1000-15000 K)
+float3 PyroBlackbody(float t)
+{
+    t = clamp(t, 1000.0, 15000.0);
+    float t2 = t * t;
+    float u = (0.860117757 + 1.54118254e-4 * t + 1.28641212e-7 * t2) / (1.0 + 8.42420235e-4 * t + 7.08145163e-7 * t2);
+    float v = (0.317398726 + 4.22806245e-5 * t + 4.20481691e-8 * t2) / (1.0 - 2.89741816e-5 * t + 1.61456053e-7 * t2);
+    float d = 2.0 * u - 8.0 * v + 4.0;
+    float x = 3.0 * u / d, y = 2.0 * v / d;
+    float3 XYZ = float3(x / y, 1.0, (1.0 - x - y) / y);
+    float3 rgb = max(float3( 3.2404542 * XYZ.x - 1.5371385 * XYZ.y - 0.4985314 * XYZ.z,
+                            -0.9692660 * XYZ.x + 1.8760108 * XYZ.y + 0.0415560 * XYZ.z,
+                             0.0556434 * XYZ.x - 0.2040259 * XYZ.y + 1.0572252 * XYZ.z), 0.0);
+    return rgb / max(max(rgb.r, rgb.g), max(rgb.b, 1e-4));
+}
 
 #define DRAW_SORTED   0     // the Transparent and Forward passes
 #define DRAW_COVERAGE 1     // OITMoments: only what the particle hides, no light
@@ -116,6 +135,11 @@ VSOutput DrawVS(uint vertexID, uint instanceID, uint draw)
     bool forward = e.RenderMode == PARTICLE_MODE_FORWARD || draw != DRAW_SORTED;
     output.SkyVisible = forward ? SkyVisibility(core.Position, float3(0, 1, 0)) : 1.0;
     bool lit = (e.Flags & PARTICLE_FLAG_LIT) != 0 || e.RenderMode != PARTICLE_MODE_FORWARD;
+    // A pyro bake's fire is light of its own, faded with the particle as its smoke is (Color.a)
+    // (the coverage pass draws no light, but its smoke still hides by the bake's coverage)
+    if ((e.Flags & PARTICLE_FLAG_PYRO) != 0)
+        output.Pyro = float2(draw == DRAW_COVERAGE ? 0.0 : e.PyroFire * EmissiveExposure * output.Color.a * (e.FadeInRate > 0.0 ? saturate(t * e.FadeInRate) : 1.0),
+                             max(e.PyroTemperature, 1000.0));
     if (draw != DRAW_COVERAGE && forward && lit)
     {
         float3 relPos = core.Position - CamPos;
@@ -211,7 +235,11 @@ VSOutput DrawVS(uint vertexID, uint instanceID, uint draw)
         uv = float2((float)(frame % flipCols), (float)(frame / flipCols)) * uvSize + uv * uvSize;
 
         if ((e.Flags & PARTICLE_FLAG_FLIPBOOK_BLEND) != 0)
+        {
             output.FrameBlend = frac(position);
+            output.MotionIdx = e.MotionTextureIdx;
+            output.Motion = float3(uvSize * e.MotionStrength, 0.0);
+        }
     }
     output.TexCoord = uv;
     output.NextTexCoord = nextUV;
@@ -314,11 +342,33 @@ float4 ParticleColor(VSOutput input, bool fogged)
     // Both frames are the same size on screen: one set of gradients, taken outside the branch
     float2 dx = ddx(input.TexCoord);
     float2 dy = ddy(input.TexCoord);
-    float4 texColor = ParticleTex.SampleGrad(SamplerLinearWrap, input.TexCoord, dx, dy);
+    float2 here = input.TexCoord, next = input.NextTexCoord;
+    if (input.MotionIdx != 0u && input.FrameBlend > 0.0)
+    {
+        // Each frame pushed towards the other along the way its pixels go, by the share of the step still to come or
+        // already gone: the motion flows instead of one frame fading into the next
+        Texture2D MotionTex = ResourceDescriptorHeap[NonUniformResourceIndex(input.MotionIdx)];
+        float2 way = (MotionTex.SampleGrad(SamplerLinearWrap, here, dx, dy).rg * 2.0 - 1.0) * input.Motion.xy;
+        here -= way * input.FrameBlend;
+        next += way * (1.0 - input.FrameBlend);
+    }
+    float4 texColor = ParticleTex.SampleGrad(SamplerLinearWrap, here, dx, dy);
     if (input.FrameBlend > 0.0)
-        texColor = lerp(texColor, ParticleTex.SampleGrad(SamplerLinearWrap, input.NextTexCoord, dx, dy), input.FrameBlend);
+        texColor = lerp(texColor, ParticleTex.SampleGrad(SamplerLinearWrap, next, dx, dy), input.FrameBlend);
 
     float4 finalColor = texColor * input.Color;
+
+    // A pyro bake: smoke lit as the particle is (Color, its key-light shadows darkening it), the fire's light coloured as a
+    // body that hot (its faint parts cooler and far dimmer), and the fire's glow in its own smoke
+    if (input.Pyro.x > 0.0 || input.Pyro.y > 0.0)
+    {
+        float fire = texColor.r, cover = texColor.g, key = texColor.b, glow = texColor.a;
+        float3 smoke = input.Color.rgb * cover * lerp(0.3, 1.0, key);
+        float heat = input.Pyro.y * lerp(0.42, 1.0, fire);
+        float3 flame = PyroBlackbody(heat) * (fire * fire * sqrt(fire)) * input.Pyro.x;
+        float3 lit = PyroBlackbody(input.Pyro.y * 0.62) * (glow * cover * 0.12) * input.Pyro.x;
+        finalColor = float4(smoke + flame + lit, input.Color.a * cover);
+    }
 
     // Soft particles: fade near opaque surfaces
     // DepthGBuffer = R32_Float linear view-space depth, 0 = sky/empty

@@ -81,7 +81,7 @@ namespace Freefall.Editor
             foreach (var box in boxes)
                 if (Desktop.FocusedControl == box) return;
 
-            Timer += Time.Delta;
+            Timer += Time.RealDelta;
             if (Timer <= Interval) return;
             Timer = 0;
 

@@ -1061,7 +1061,7 @@ namespace Freefall.Graphics
                  CameraPosition = camera.Position,
                  Time = Time.TotalTime,
                  PixelsPerMetre = 0.5f * Albedo.Native.Description.Height * camera.Projection.M22,
-                 FadeStep = Math.Clamp(Time.Delta, 0f, 0.1f) / PointShadowFadeSeconds,
+                 FadeStep = Math.Clamp(Time.RealDelta, 0f, 0.1f) / PointShadowFadeSeconds,
                  SunLight = Daylight.SunIlluminance(),
                  Ambient = Daylight.SkyIlluminance(),
                  ShadowBudget = (uint)Math.Clamp(Engine.Settings.MaxShadowedPointLights, 0, LocalShadows.MaxLights),

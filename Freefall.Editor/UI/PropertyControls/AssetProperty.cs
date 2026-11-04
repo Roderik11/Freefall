@@ -137,7 +137,7 @@ namespace Freefall.Editor
 
         protected override void OnUpdate()
         {
-            Timer += Time.Delta;
+            Timer += Time.RealDelta;
             if (Timer > Interval)
             {
                 Timer = 0;

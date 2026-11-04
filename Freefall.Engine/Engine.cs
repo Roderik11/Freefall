@@ -89,6 +89,7 @@ namespace Freefall
         public static void SetPlaymode(bool playmode)
         {
             IsEditor = !playmode;
+            Time.Scale = 1f;    // a tool's pause or slow motion (Time.Scale) ends with the mode it was set in
         }
 
         /// <summary>

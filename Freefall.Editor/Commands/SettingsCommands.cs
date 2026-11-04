@@ -95,7 +95,7 @@ namespace Freefall.Editor.Commands
         {
             return CommandResult.Json(new
             {
-                fps = (int)(1f / Math.Max(Time.Delta, 0.001)),
+                fps = (int)(1f / Math.Max(Time.RealDelta, 0.001)),
                 deltaMs = Time.DeltaMilliseconds,
                 entityCount = EntityManager.Entities.Count,
                 frameIndex = Engine.FrameIndex,

@@ -99,7 +99,7 @@ namespace Freefall.Editor
             if (Desktop.FocusedControl == Textbox2) return;
             if (Desktop.FocusedControl == Textbox3) return;
 
-            Timer += Time.Delta;
+            Timer += Time.RealDelta;
 
             if (Timer > Interval)
             {

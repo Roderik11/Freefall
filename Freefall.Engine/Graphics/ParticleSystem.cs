@@ -43,6 +43,7 @@ namespace Freefall.Graphics
         private const uint FlagWrap = 64;           // = PARTICLE_FLAG_WRAP
         private const uint FlagCover = 128;         // = PARTICLE_FLAG_COVER
         private const uint FlagWater = 256;         // = PARTICLE_FLAG_WATER
+        private const uint FlagPyro = 512;          // = PARTICLE_FLAG_PYRO
 
         /// <summary>
         /// The weather's wind (world space), set by <see cref="EnvironmentController"/>. Emitters take
@@ -76,7 +77,8 @@ namespace Freefall.Graphics
             public float Turbulence;       public float TurbulenceFrequency; public float WindLean;         public float Follow;
             public Vector3 Carry;          public float PivotX;
             public Vector3 LeanWind;       public float PivotY;
-            public float ForwardScatter;   public float MultipleScattering; public float Pad1;              public float Pad2;
+            public float ForwardScatter;   public float MultipleScattering; public float PyroFire;          public float PyroTemperature;
+            public uint MotionTextureIdx;  public float MotionStrength;     public float Pad3;              public float Pad4;
         }
 
         /// <summary>Everything the system keeps per emitter. The component itself only holds authored data.</summary>
@@ -212,8 +214,8 @@ namespace Freefall.Graphics
 
         protected internal override void Initialize()
         {
-            if (Unsafe.SizeOf<EmitterRow>() != 368)
-                throw new InvalidOperationException("EmitterRow must match struct ParticleEmitter in particle_common.hlsli (368 bytes)");
+            if (Unsafe.SizeOf<EmitterRow>() != 384)
+                throw new InvalidOperationException("EmitterRow must match struct ParticleEmitter in particle_common.hlsli (384 bytes)");
 
             ComponentCache<ParticleEmitter>.Added += OnAdded;
             ComponentCache<ParticleEmitter>.Removed += OnRemoved;
@@ -584,6 +586,8 @@ namespace Freefall.Graphics
                 Aspect = aspect,
                 StretchFactor = stretch,
                 TextureIdx = e.ParticleTexture?.BindlessIndex ?? 0u,
+                MotionTextureIdx = e.FlipbookBlend ? e.FlipbookMotion?.BindlessIndex ?? 0u : 0u,
+                MotionStrength = MathF.Max(0f, e.FlipbookMotionStrength),
                 FlipbookCols = (uint)Math.Max(1, e.FlipbookColumns),
                 FlipbookRows = (uint)Math.Max(1, e.FlipbookRows),
                 FlipbookFrameCount = (uint)Math.Max(0, e.FlipbookFrameCount),
@@ -605,7 +609,8 @@ namespace Freefall.Graphics
                     | (e.Volumetric && e.Lit ? FlagVolume : 0u)
                     | (e.WrapInBox && e.Shape == EmissionShape.Box ? FlagWrap : 0u)
                     | (e.StopUnderCover ? FlagCover : 0u)
-                    | (e.Water && e.Lit ? FlagWater : 0u),
+                    | (e.Water && e.Lit ? FlagWater : 0u)
+                    | (e.Pyro ? FlagPyro | FlagLit : 0u),
                 Intensity = MathF.Max(0f, e.Intensity),
                 FadeInRate = e.FadeIn > 0f ? 1f / MathF.Min(e.FadeIn, 1f) : 0f,
                 Turbulence = turbulence,
@@ -618,6 +623,8 @@ namespace Freefall.Graphics
                 PivotY = e.Pivot.Y,
                 ForwardScatter = Math.Clamp(e.ForwardScatter, 0f, 0.9f),
                 MultipleScattering = Math.Clamp(e.MultipleScattering, 0f, 1f),
+                PyroFire = MathF.Max(0f, e.PyroFire),
+                PyroTemperature = Math.Clamp(e.PyroTemperature, 1000f, 15000f),
             };
 
             if (capacity > 0)

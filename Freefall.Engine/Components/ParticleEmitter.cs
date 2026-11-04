@@ -302,6 +302,29 @@ namespace Freefall.Components
         [Description("Cross-fade from frame to frame instead of stepping")]
         public bool FlipbookBlend = false;
 
+        [Description("Flipbook Blend: the motion from each frame to the next (an atlas like the flipbook's, RG the way each " +
+                     "pixel goes, 0.5 = still; pyro_flipbook.py bakes one): the two frames are pushed towards each other as " +
+                     "they blend, so the motion flows instead of cross-fading")]
+        public Texture? FlipbookMotion;
+
+        [Description("Flipbook Motion: the motion at full scale (RG 0 or 1), in shares of a frame's width (pyro_flipbook.py: 0.08)")]
+        [ValueRange(0f, 1f)]
+        public float FlipbookMotionStrength = 0.08f;
+
+        [Description("The texture is a pyro bake (Tools/BlenderKits/pyro_flipbook.py): R the fire's light, G the smoke's " +
+                     "coverage, B how lit the smoke is by a light from above, A the fire's glow in its smoke. The smoke is " +
+                     "lit like a Lit particle (Color is its albedo, Intensity on it), the fire shines on its own: Pyro Fire " +
+                     "nits at its brightest, coloured as a body that hot, cooling to a dull red where it is faint")]
+        public bool Pyro = false;
+
+        [Description("Pyro: nits of the fire's light at its brightest (a fireball ~60000)")]
+        [ValueRange(0f, 500000f)]
+        public float PyroFire = 60000f;
+
+        [Description("Pyro: kelvin at the fire's brightest (1800 orange, 2600 yellow, 4000 yellow-white); fainter parts are cooler")]
+        [ValueRange(1000f, 15000f)]
+        public float PyroTemperature = 2600f;
+
         // ── Rendering ──
 
         [Category("Rendering")]

@@ -4,14 +4,20 @@
 // inspector and saved with the .mat), so one effect serves every such look:
 //
 //   - a colour at an intensity, thick where the surface faces the eye and thinning towards its outline
-//     (Body), with an optional rim (Rim, RimPower);
+//     (Body), with an optional rim (Rim, RimPower), ramping to a hotter colour in its brightest parts (Heat);
 //   - noise that scrolls over the surface (NoiseScale, NoiseScroll, NoiseAmount, NoiseContrast), as soft
-//     clouds or thin strands (NoiseRidge), wound round the mesh (NoiseTwist), its coordinates bent by a second
-//     noise (Warp...), or eating it away (Dissolve, DissolveEdge); its detail fades where its cells grow
-//     too small on screen, so it does not sparkle from afar;
-//   - the ends of the mesh fading (FadeEnds: share of V at the foot and the head);
-//   - vertices pushed along their normal by noise (Push...), and kept wide enough to be seen from afar
-//     (MinWidth).
+//     clouds, thin strands (NoiseRidge) or the lines where cells meet (NoiseCells), wound round the mesh
+//     (NoiseTwist), its coordinates bent by a second noise (Warp...), or eating it away (Dissolve,
+//     DissolveEdge); over the UVs or through the mesh's own space (NoiseSpace: a body, whose UVs are islands);
+//     its detail fades where its cells grow too small on screen, so it does not sparkle from afar;
+//   - the ends of the mesh fading (FadeEnds: share of V at the foot and the head), and where it meets what is
+//     behind it (SoftEdge);
+//   - vertices pushed along their normal by noise (Push...) and as a whole (Inflate), and kept wide enough to
+//     be seen from afar (MinWidth);
+//   - a ring of light spreading from where the object was struck (Ripple..., the instance's Hit).
+//
+// A SkinnedMeshRenderer may draw it: its vertices are skinned by the draw's bone buffer, and the noise in the
+// mesh's own space is the bind pose's, so it stays on the body as it moves (a shell over a character).
 //
 // Something travelling (a pulse up a beam, a bolt) is a mesh of its own that a script moves, sized by its
 // entity's scale: a sphere stretched into a capsule shades right (normals by the inverse transpose).
@@ -31,7 +37,7 @@ cbuffer PushConstants : register(b3)
     uint MeshRegistryIdx;           // 6: StructuredBuffer<MeshPartEntry>
     uint MaterialsIdx;              // 7
     uint GlobalTransformBufferIdx;  // 8
-    uint _reserved9;
+    uint SceneDepthIdx;             // 9: the scene's linear view depth (R32, 0 = sky), Forward pass only; 0 = none
     uint _reserved10;
     uint _reserved11;
     uint _reserved12;
@@ -46,7 +52,10 @@ cbuffer PushConstants : register(b3)
 #include "sky_common.fx"
 #include "oit.hlsli"
 
-// @RenderState(RenderTargets=1, DepthWrite=false, Blend=Additive, CullMode=None, RenderTargetFormat=R16G16B16A16_Float)
+SamplerState SamplerWrap : register(s0);    // anisotropic x16, wrap (the Pattern)
+
+// Premultiplied: its light plus what its smoke hides (alpha). Without Smoke the alpha is 0, which is additive exactly
+// @RenderState(RenderTargets=1, DepthWrite=false, Blend=Premultiplied, CullMode=None, RenderTargetFormat=R16G16B16A16_Float)
 
 // The material's settings, one block per material, loaded by each instance's MaterialID (LoadSettings):
 // draws are batched by effect, so a per-material cbuffer would only ever be the batch's first material's.
@@ -63,13 +72,13 @@ struct Settings
     float  RimPower;         //= 3               -- How tight that rim is
     float  MinWidth;         //= 0               -- Milliradians: never narrower on screen than this, so it stays seen from afar (its radius taken from the local Y axis if Axial, else from the centre)
     float2 FadeEnds;         //= 0, 0            -- Share of the length over which it fades in at the foot (x) and out at the head (y)
-    float2 NoiseScale;       //= 4, 4            -- Noise cells round the mesh (U, rounded to whole cells) and along it (V)
-    float2 NoiseScroll;      //= 0, 0            -- How fast the noise moves, in cells a second (positive V = towards the head)
+    float2 NoiseScale;       //= 4, 4            -- Noise cells round the mesh (U, rounded to whole cells) and along it (V); with Noise Space 1, cells a metre across (x) and along local Y (y)
+    float2 NoiseScroll;      //= 0, 0            -- How fast the noise moves, in cells a second (positive V = towards the head); with Noise Space 1, x is radians a second round local Y (a swirl) and y cells a second up it
     float  NoiseAmount;      //= 0 [0, 1]        -- 0 = no noise; 1 = the noise sets the brightness entirely
     float  NoiseContrast;    //= 1               -- Above 1 the noise has harder light and dark parts (with NoiseRidge: thinner strands)
     float  NoiseRidge;       //= 0 [0, 1]        -- 0 = soft clouds; 1 = thin bright strands where the noise crosses its middle (energy, plasma, lightning)
-    float  NoiseTwist;       //= 0 [-1, 1]       -- Cells round the mesh the noise turns per cell along it: strands wind round a tube, and flow along their winding
-    float2 WarpScale;       //= 2, 2            -- Cells of the second noise, which bends the first
+    float  NoiseTwist;       //= 0 [-1, 1]       -- Cells round the mesh the noise turns per cell along it: strands wind round a tube, and flow along their winding (Noise Space 1: radians round local Y per cell up it)
+    float2 WarpScale;        //= 2, 2            -- Cells of the second noise, which bends the first
     float2 WarpScroll;       //= 0, 0            -- Its speed, in cells a second
     float  Warp;             //= 0               -- How far it bends the first noise, in that noise's cells
     float  Dissolve;         //= 0 [0, 1]        -- 0..1: where the noise is below this the surface is gone
@@ -77,6 +86,29 @@ struct Settings
     float  Push;             //= 0               -- Metres: vertices pushed along their normal by noise
     float2 PushScale;        //= 3, 3            -- Cells of that noise round and along the mesh
     float2 PushScroll;       //= 0, 0            -- Its speed, in cells a second
+    float  NoiseSpace;       //= 0 [0, 1]        -- 0 = the noise runs over the mesh's UVs; 1 = through the mesh's own space in metres (3D), so it stays put on a body whose UVs are islands (a skinned shell keeps the bind pose's)
+    float  NoiseCells;       //= 0 [0, 1]        -- 0 = smooth noise; 1 = cells, bright where two meet: facets of ice, cracks, plates, veins
+    float  Inflate;          //= 0               -- Metres the whole surface is pushed out along its normal: a shell over a body that never fights it for depth
+    float  SoftEdge;         //= 0               -- Metres: it fades out where it comes this close to what is behind it (a ring on the ground, a dome meeting a wall); 0 = a hard cut
+    float3 HotColor;         //= 1, 1, 1         -- The colour of its brightest parts, which Heat ramps to (the yellow-white heart of a flame)
+    float  Heat;             //= 0 [0, 1]        -- 0 = Color throughout; 1 = Color in the dim parts ramping to Hot Color in the brightest (fire, molten edges, a white-hot core)
+    float  RippleGlow;       //= 0               -- How bright a ring spreading from where it was struck is (the instance's Hit), against its body; 0 = none
+    float  RippleSpeed;      //= 5               -- Metres a second that ring spreads at
+    float  RippleWidth;      //= 0.2             -- Metres: how wide it is
+    float  RippleLasts;      //= 0.7             -- Seconds until it has faded
+    TextureRef Pattern;      //= White           -- A greyscale texture (its red) over the mesh's UVs, mixed into the noise by Pattern Amount: fire streaks, smoke wisps, filaments (Effects/Textures)
+    float  PatternAmount;    //= 0 [0, 1]        -- 0 = the procedural noise alone; 1 = the pattern alone (the noise's contrast, ridges, dissolve and heat ramp work on it either way)
+    float2 PatternScale;     //= 1, 1            -- Repeats of the pattern round the mesh (U) and along it (V)
+    float2 PatternScroll;    //= 0, 0.5          -- Repeats a second it moves (positive V = towards the head); a second, finer layer of it moves slower against repetition
+    float  PatternWarp;      //= 0               -- How far the warp noise (Warp Scale, Warp Scroll) bends it, in its repeats: licking, swirling
+    float2 Flare;            //= 1, 1            -- Axial: its radius at the foot (x) and the head (y), times the entity's: a flame narrow at its source widening as it trails
+    float  FlareCurve;       //= 1               -- How the radius goes from foot to head: 1 evenly, below 1 widening at once, above 1 late
+    float  Bend;             //= 0               -- Axial: radians it bends over its length, towards its local +X: a swept arc
+    float2 ErodeAlong;       //= 0, 0            -- Added to Dissolve at the foot (x) and the head (y): solid at its source, torn apart where it trails
+    float3 SmokeColor;       //= 0.06, 0.055, 0.05 -- What it turns into where it has cooled, lit by the sky and its own fire
+    float  Smoke;            //= 0 [0, 1]        -- How much of what is behind its smoke hides: 0 = none (light only, additive)
+    float2 SmokeAlong;       //= 0.5, 1          -- Share of the length where it begins to turn to smoke (x) and is smoke alone (y)
+    float  Cooling;          //= 0               -- How it dims and reddens along its length, (1 - V) to this power: 0 = the same all along, 1 evenly, 2 quickly (a flame cooling behind its source); its smoke does not dim
 };
 
 // This draw's settings, loaded at the start of VS and PS
@@ -97,6 +129,7 @@ struct Instance
 {
     float3 Color;            //= 1, 1, 1         -- Multiplies the material's Color, for this object alone
     float  Intensity;        //= 1 [0, 4]        -- Multiplies the material's Intensity, for this object alone (fade it in and out, flash it)
+    float4 Hit;              //= 0, 0, 0, -1000  -- Where it was struck last (world xyz) and when (w: seconds of the shaders' clock, Time): a ring spreads from there (Ripple...)
 };
 
 static Instance I;
@@ -121,14 +154,50 @@ float DayFactor()
 
 // ── Noise ──
 
-// A random direction for a lattice point. An integer hash: a float one (frac of a product) loses its
-// precision as the scrolled coordinates grow, and goes blocky after a while.
+float VfxSq(float x) { return x * x; }
+
+// An integer hash of a lattice point: a float one (frac of a product) loses its precision as the scrolled
+// coordinates grow, and goes blocky after a while
+uint VfxHash(int2 cell)
+{
+    uint2 q = uint2(cell) * uint2(1597334673u, 3812015801u);
+    return (q.x ^ q.y) * 1597334673u;
+}
+
+uint VfxHash3(int3 cell)
+{
+    uint3 q = uint3(cell) * uint3(1597334673u, 3812015801u, 2798796415u);
+    return (q.x ^ q.y ^ q.z) * 1597334673u;
+}
+
+// A random direction for a lattice point
 float2 VfxGradient(float2 cell)
 {
-    uint2 q = uint2(int2(cell)) * uint2(1597334673u, 3812015801u);
-    uint n = (q.x ^ q.y) * 1597334673u;
-    float a = float(n) * (6.2831853 / 4294967296.0);
+    float a = float(VfxHash(int2(cell))) * (6.2831853 / 4294967296.0);
     return float2(cos(a), sin(a));
+}
+
+float3 VfxGradient3(int3 cell)
+{
+    uint n = VfxHash3(cell);
+    float z = float(n & 0xFFFFu) * (2.0 / 65535.0) - 1.0;
+    float a = float(n >> 16) * (6.2831853 / 65536.0);
+    float r = sqrt(saturate(1.0 - z * z));
+    return float3(r * cos(a), r * sin(a), z);
+}
+
+// A point inside a lattice cell, 0..1 each way (the cells' seeds)
+float2 VfxJitter(int2 cell)
+{
+    uint n = VfxHash(cell);
+    return float2(float(n & 0xFFFFu), float(n >> 16)) * (1.0 / 65535.0);
+}
+
+float3 VfxJitter3(int3 cell)
+{
+    uint n = VfxHash3(cell);
+    uint m = n * 747796405u + 2891336453u;
+    return float3(float(n & 0xFFFFu), float(n >> 16), float(m >> 16)) * (1.0 / 65535.0);
 }
 
 // Gradient noise (0..1, mostly near 0.5), periodic in x with the given period (whole cells), so it wraps round a
@@ -148,6 +217,66 @@ float VfxNoise(float2 p, float period)
     return lerp(lerp(a, b, s.x), lerp(c, d, s.x), s.y) * 0.7071 + 0.5;
 }
 
+// The same in three dimensions (not periodic): through a mesh's own space
+float VfxNoise3(float3 p)
+{
+    float3 i = floor(p);
+    float3 f = p - i;
+    float3 s = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
+    int3 c = int3(i);
+    float n000 = dot(VfxGradient3(c), f);
+    float n100 = dot(VfxGradient3(c + int3(1, 0, 0)), f - float3(1, 0, 0));
+    float n010 = dot(VfxGradient3(c + int3(0, 1, 0)), f - float3(0, 1, 0));
+    float n110 = dot(VfxGradient3(c + int3(1, 1, 0)), f - float3(1, 1, 0));
+    float n001 = dot(VfxGradient3(c + int3(0, 0, 1)), f - float3(0, 0, 1));
+    float n101 = dot(VfxGradient3(c + int3(1, 0, 1)), f - float3(1, 0, 1));
+    float n011 = dot(VfxGradient3(c + int3(0, 1, 1)), f - float3(0, 1, 1));
+    float n111 = dot(VfxGradient3(c + int3(1, 1, 1)), f - float3(1, 1, 1));
+    float x00 = lerp(n000, n100, s.x), x10 = lerp(n010, n110, s.x);
+    float x01 = lerp(n001, n101, s.x), x11 = lerp(n011, n111, s.x);
+    return lerp(lerp(x00, x10, s.y), lerp(x01, x11, s.y), s.z) * 0.8 + 0.5;
+}
+
+// Cells (Worley): 1 where two cells meet, falling quickly to 0 inside them (thin lines), periodic in x like VfxNoise. The distance to the
+// nearest seed against the second nearest, so the lines keep one width whatever the cells' sizes.
+float VfxCells(float2 p, float period)
+{
+    float2 i = floor(p);
+    float2 f = p - i;
+    float f1 = 8.0, f2 = 8.0;
+    [unroll] for (int y = -1; y <= 1; y++)
+    [unroll] for (int x = -1; x <= 1; x++)
+    {
+        float cx = i.x + x;
+        cx -= period * floor(cx / period);
+        float2 d = float2(x, y) + VfxJitter(int2(cx, i.y + y)) - f;
+        float dd = dot(d, d);
+        if (dd < f1) { f2 = f1; f1 = dd; }
+        else if (dd < f2) f2 = dd;
+    }
+    float apart = saturate((sqrt(f2) - sqrt(f1)) * 5.0);
+    return (1.0 - apart) * (1.0 - apart);
+}
+
+float VfxCells3(float3 p)
+{
+    float3 i = floor(p);
+    float3 f = p - i;
+    int3 c = int3(i);
+    float f1 = 8.0, f2 = 8.0;
+    [unroll] for (int z = -1; z <= 1; z++)
+    [unroll] for (int y = -1; y <= 1; y++)
+    [unroll] for (int x = -1; x <= 1; x++)
+    {
+        float3 d = float3(x, y, z) + VfxJitter3(c + int3(x, y, z)) - f;
+        float dd = dot(d, d);
+        if (dd < f1) { f2 = f1; f1 = dd; }
+        else if (dd < f2) f2 = dd;
+    }
+    float apart = saturate((sqrt(f2) - sqrt(f1)) * 5.0);
+    return (1.0 - apart) * (1.0 - apart);
+}
+
 // How far apart two cells of a noise are on screen fades its detail (FootprintOf): an octave whose cells
 // shrink below a few pixels would only sparkle, so it gives way to its mean
 float OctaveFade(float footprint)
@@ -158,19 +287,37 @@ float OctaveFade(float footprint)
 // Three octaves, each twice as fine and shifted so their lattices do not line up; stays periodic since the
 // period doubles with the frequency (a shift keeps a periodic noise periodic). footprint is
 // the first octave's cells per pixel (0 = no fading: the vertex shader); the finer two fade with it, the
-// first is left to the caller (it fades the shaped noise, NoiseAt).
-float VfxFbm(float2 p, float period, float footprint)
+// first is left to the caller (it fades the shaped noise, NoiseAt). With cells, the first octave is cells.
+float VfxFbm(float2 p, float period, float footprint, float cells)
 {
     float sum = 0.0, weight = 0.5, total = 0.0;
     [unroll] for (int o = 0; o < 3; o++)
     {
         float n = VfxNoise(p, period);
+        if (o == 0 && cells > 0.0) n = lerp(n, VfxCells(p, period), cells);
         if (o > 0) n = lerp(n, 0.5, OctaveFade(footprint));
         sum += weight * n;
         total += weight;
         p = p * 2.0 + float2(0.43, 0.71);
         period *= 2.0;
-        weight *= 0.5;
+        weight *= cells > 0.0 ? 0.35 : 0.5;     // cells keep their lines: the finer octaves only roughen them
+        footprint *= 2.0;
+    }
+    return sum / total;
+}
+
+float VfxFbm3(float3 p, float footprint, float cells)
+{
+    float sum = 0.0, weight = 0.5, total = 0.0;
+    [unroll] for (int o = 0; o < 3; o++)
+    {
+        float n = VfxNoise3(p);
+        if (o == 0 && cells > 0.0) n = lerp(n, VfxCells3(p), cells);
+        if (o > 0) n = lerp(n, 0.5, OctaveFade(footprint));
+        sum += weight * n;
+        total += weight;
+        p = p * 2.0 + float3(0.43, 0.71, 0.29);
+        weight *= cells > 0.0 ? 0.35 : 0.5;
         footprint *= 2.0;
     }
     return sum / total;
@@ -181,13 +328,25 @@ float CellsRound(float2 scale) { return max(round(scale.x), 1.0); }
 
 // Noise at a point of the surface: cells round and along, wound round by twist (cells round per cell along),
 // moving at scroll cells a second
-float SurfaceNoise(float2 uv, float2 scale, float2 scroll, float twist, float footprint)
+float SurfaceNoise(float2 uv, float2 scale, float2 scroll, float twist, float footprint, float cells)
 {
     float cellsU = CellsRound(scale);
     float2 p = uv * float2(cellsU, scale.y);
     p.x += p.y * twist;
     p -= scroll * Time;
-    return VfxFbm(p, cellsU, footprint);
+    return VfxFbm(p, cellsU, footprint, cells);
+}
+
+// A point of the mesh's own space (metres) in noise cells: scale across (x) and up local Y (y), wound round Y by
+// twist (radians a cell up), swirling round Y at scroll.x radians a second and rising at scroll.y cells a second
+float3 SpaceCells(float3 space, float2 scale, float2 scroll, float twist)
+{
+    float3 p = space * float3(scale.x, scale.y, scale.x);
+    float turn = p.y * twist + scroll.x * Time;
+    float c = cos(turn), s = sin(turn);
+    p.xz = float2(p.x * c - p.z * s, p.x * s + p.z * c);
+    p.y -= scroll.y * Time;
+    return p;
 }
 
 // Cells of a noise (scale, twist) per pixel at this pixel: the larger of round and along. U's derivative is taken
@@ -198,6 +357,40 @@ float FootprintOf(float2 uv, float2 scale, float twist)
     float du = min(fwidth(uv.x), fwidth(frac(uv.x + 0.5)));
     float dv = fwidth(uv.y) * scale.y;
     return max(du * CellsRound(scale) + dv * abs(twist), dv);
+}
+
+// The same through the mesh's own space: how many cells of the scaled space a pixel spans
+float FootprintOf3(float3 space, float2 scale)
+{
+    float3 w = fwidth(space) * float3(scale.x, scale.y, scale.x);
+    return max(max(w.x, w.y), w.z);
+}
+
+// ── Skinning ──
+
+// Per-vertex bone weights (Mesh.cs BoneWeight, as gbuffer_skinned.fx reads them)
+struct BoneWeight
+{
+    float4 BoneIDs;
+    float4 Weights;
+};
+
+// A vertex of a skinned draw in its pose (the draw's bone buffer, InstanceDescriptor.BoneBufferIdx; 0 = no pose
+// yet: the bind pose, as gbuffer_skinned.fx keeps it)
+void SkinVertex(InstanceDescriptor desc, MeshPartEntry part, uint vertexID, inout float3 pos, inout float3 norm)
+{
+    if (desc.BoneBufferIdx == 0u || part.BoneWeightsBufferIdx == 0u) return;
+    StructuredBuffer<BoneWeight> boneWeights = ResourceDescriptorHeap[part.BoneWeightsBufferIdx];
+    StructuredBuffer<row_major matrix> bones = ResourceDescriptorHeap[NonUniformResourceIndex(desc.BoneBufferIdx)];
+    BoneWeight bw = boneWeights[vertexID];
+    matrix b0 = bones[(uint)bw.BoneIDs.x];
+    matrix b1 = bones[(uint)bw.BoneIDs.y];
+    matrix b2 = bones[(uint)bw.BoneIDs.z];
+    matrix b3 = bones[(uint)bw.BoneIDs.w];
+    float4 p = float4(pos, 1.0);
+    pos = (mul(p, b0) * bw.Weights.x + mul(p, b1) * bw.Weights.y + mul(p, b2) * bw.Weights.z + mul(p, b3) * bw.Weights.w).xyz;
+    norm = normalize(mul(norm, (float3x3)b0) * bw.Weights.x + mul(norm, (float3x3)b1) * bw.Weights.y
+                   + mul(norm, (float3x3)b2) * bw.Weights.z + mul(norm, (float3x3)b3) * bw.Weights.w);
 }
 
 // ── Vertex shader ──
@@ -212,6 +405,7 @@ struct VSOutput
     float3 Axis     : TEXCOORD3;    // the mesh's local Y in world space (Axial)
     nointerpolation uint MaterialId : TEXCOORD4;   // whose settings the pixel shader loads
     nointerpolation uint InstanceSlot : TEXCOORD5; // and whose per-object values
+    float3 Space    : TEXCOORD6;    // the point in the mesh's own space, in metres (its bind pose if skinned): Noise Space 1
 };
 
 VSOutput VS(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_InstanceID)
@@ -241,20 +435,50 @@ VSOutput VS(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_InstanceI
     float3 norm = normals[vertexID];
     float2 uv = uvs[vertexID];
 
-    float3 worldPos = mul(float4(pos, 1.0), World).xyz;
+    // The noise's space is the bind pose's, scaled and turned by the entity, so it stays on a moving body
+    float3 space = mul(pos, W3);
+    SkinVertex(desc, part, vertexID, pos, norm);
 
-    // The normal by the inverse transpose (the cofactors, the same up to scale): a sphere stretched into a
-    // capsule keeps normals square to its surface, so its outline fades where it really is edge-on
-    float3 N = normalize(norm.x * cross(W3[1], W3[2]) + norm.y * cross(W3[2], W3[0]) + norm.z * cross(W3[0], W3[1]));
-    float3 axis = mul(float3(0.0, 1.0, 0.0), W3);
+    float3 worldPos, N, axis;
+    if (S.Axial > 0.0 && (S.Bend != 0.0 || any(S.Flare != 1.0)))
+    {
+        // A tube shaped as it goes along (V): its radius from Flare x to y, its axis bent into an arc of Bend radians
+        // towards local +X, in world units so the entity's scale stays a length and a radius
+        float v = saturate(uv.y);
+        float span = length(W3[1]), sx = length(W3[0]), sz = length(W3[2]);
+        float3 Y = W3[1] / max(span, 1e-6), X = W3[0] / max(sx, 1e-6), Z = W3[2] / max(sz, 1e-6);
+        float grow = lerp(S.Flare.x, S.Flare.y, pow(v, max(S.FlareCurve, 0.01)));
+        float turn = S.Bend * v;
+        float3 centre = abs(S.Bend) > 1e-4
+            ? World[3].xyz + Y * (span / S.Bend * sin(turn)) + X * (span / S.Bend * (1.0 - cos(turn)))
+            : World[3].xyz + Y * (span * v);
+        float3 side = X * cos(turn) - Y * sin(turn);
+        axis = Y * cos(turn) + X * sin(turn);
+        worldPos = centre + side * (pos.x * sx * grow) + Z * (pos.z * sz * grow);
+        N = normalize(side * (norm.x * sz) + Z * (norm.z * sx));
+    }
+    else
+    {
+        worldPos = mul(float4(pos, 1.0), World).xyz;
+
+        // The normal by the inverse transpose (the cofactors, the same up to scale): a sphere stretched into a
+        // capsule keeps normals square to its surface, so its outline fades where it really is edge-on
+        N = normalize(norm.x * cross(W3[1], W3[2]) + norm.y * cross(W3[2], W3[0]) + norm.z * cross(W3[0], W3[1]));
+        axis = mul(float3(0.0, 1.0, 0.0), W3);
+    }
 
     // The radius here, in world units: the distance from the mesh's local Y axis (tubes, cones), else from its centre
     float radius = S.Axial > 0.0 ? length(mul(float3(pos.x, 0.0, pos.z), W3)) : length(mul(pos, W3));
 
-    // Pushed outwards by noise
-    float push = 0.0;
+    // Pushed outwards as a whole, and by noise
+    float push = S.Inflate;
     if (S.Push != 0.0)
-        push += S.Push * (SurfaceNoise(uv, S.PushScale, S.PushScroll, 0.0, 0.0) * 2.0 - 1.0);
+    {
+        float n = S.NoiseSpace > 0.5
+            ? VfxNoise3(SpaceCells(space, S.PushScale, S.PushScroll, 0.0))
+            : SurfaceNoise(uv, S.PushScale, S.PushScroll, 0.0, 0.0, 0.0);
+        push += S.Push * (n * 2.0 - 1.0);
+    }
 
     // Never thinner on screen than MinWidth: widened where the camera is far
     if (S.MinWidth > 0.0)
@@ -271,10 +495,43 @@ VSOutput VS(uint primitiveVertexID : SV_VertexID, uint instanceID : SV_InstanceI
     output.ToEye = CamPos - worldPos;
     output.Depth = output.Position.w;
     output.Axis = axis;
+    output.Space = space;
     return output;
 }
 
 // ── Pixel shader ──
+
+// The raw noise here, before its contrast and shape: over the UVs or through the mesh's space, bent by the warp
+// noise; footprint gets its cells per pixel
+float RawNoise(VSOutput input, out float footprint)
+{
+    if (S.NoiseSpace > 0.5)
+    {
+        float3 p = SpaceCells(input.Space, S.NoiseScale, S.NoiseScroll, S.NoiseTwist);
+        footprint = FootprintOf3(input.Space, S.NoiseScale);
+        if (S.Warp != 0.0)
+        {
+            float3 w = SpaceCells(input.Space, S.WarpScale, S.WarpScroll, 0.0);
+            float warpFootprint = FootprintOf3(input.Space, S.WarpScale);
+            float3 bend = float3(VfxFbm3(w, warpFootprint, 0.0), VfxFbm3(w + 17.3, warpFootprint, 0.0), VfxFbm3(w - 9.1, warpFootprint, 0.0));
+            p += (bend * 2.0 - 1.0) * S.Warp;
+        }
+        return VfxFbm3(p, footprint, S.NoiseCells);
+    }
+
+    float2 uv = input.TexCoord;
+    float2 q = uv;
+    if (S.Warp != 0.0)
+    {
+        // Its fine octaves fade with distance too: aliasing in the coordinates speckles what they bend
+        float warpFootprint = FootprintOf(uv, S.WarpScale, 0.0);
+        float wu = SurfaceNoise(uv, S.WarpScale, S.WarpScroll, 0.0, warpFootprint, 0.0);
+        float wv = SurfaceNoise(uv + 0.37, S.WarpScale, S.WarpScroll, 0.0, warpFootprint, 0.0);
+        q += (float2(wu, wv) * 2.0 - 1.0) * S.Warp / max(float2(CellsRound(S.NoiseScale), S.NoiseScale.y), 1e-3);
+    }
+    footprint = FootprintOf(uv, S.NoiseScale, S.NoiseTwist);
+    return SurfaceNoise(q, S.NoiseScale, S.NoiseScroll, S.NoiseTwist, footprint, S.NoiseCells);
+}
 
 float4 PS(VSOutput input) : SV_Target0
 {
@@ -302,43 +559,52 @@ float4 PS(VSOutput input) : SV_Target0
     float body = S.Body > 0.0 ? pow(facing, S.Body) : 1.0;
     float rim = S.Rim > 0.0 ? S.Rim * pow(1.0 - facing, S.RimPower) : 0.0;
 
-    // Noise, its coordinates bent by the warp noise, shaped into strands (NoiseRidge), and giving way to its
-    // mean where its cells are too small on screen to show: from afar it would only sparkle
+    // Noise, shaped into strands (NoiseRidge), and giving way to its mean where its cells are too small on screen
+    // to show: from afar it would only sparkle
     float noise = 1.0;
-    if (S.NoiseAmount > 0.0 || S.Dissolve > 0.0)
+    if (S.NoiseAmount > 0.0 || S.Dissolve > 0.0 || S.RippleGlow > 0.0)
     {
-        float2 p = uv;
-        if (S.Warp != 0.0)
+        float footprint;
+        noise = RawNoise(input, footprint);
+        if (S.PatternAmount > 0.0)
         {
-            // Its fine octaves fade with distance too: aliasing in the coordinates speckles what they bend
-            float warpFootprint = FootprintOf(uv, S.WarpScale, 0.0);
-            float wu = SurfaceNoise(uv, S.WarpScale, S.WarpScroll, 0.0, warpFootprint);
-            float wv = SurfaceNoise(uv + 0.37, S.WarpScale, S.WarpScroll, 0.0, warpFootprint);
-            p += (float2(wu, wv) * 2.0 - 1.0) * S.Warp / max(float2(CellsRound(S.NoiseScale), S.NoiseScale.y), 1e-3);
+            // The texture over the UVs, bent by the warp noise, as two layers at different scales and speeds: one repeat
+            // would show where it starts again
+            float2 p = input.TexCoord;
+            if (S.PatternWarp != 0.0)
+            {
+                float warpFootprint = FootprintOf(p, S.WarpScale, 0.0);
+                float2 bend = float2(SurfaceNoise(p, S.WarpScale, S.WarpScroll, 0.0, warpFootprint, 0.0),
+                                     SurfaceNoise(p + 0.37, S.WarpScale, S.WarpScroll, 0.0, warpFootprint, 0.0)) * 2.0 - 1.0;
+                p += bend * S.PatternWarp / max(S.PatternScale, 1e-3);
+            }
+            Texture2D pattern = ResourceDescriptorHeap[NonUniformResourceIndex(S.Pattern)];
+            float a = pattern.Sample(SamplerWrap, p * S.PatternScale - S.PatternScroll * Time).r;
+            float b = pattern.Sample(SamplerWrap, p * S.PatternScale * 1.73 + 0.31 - S.PatternScroll * 0.62 * Time).r;
+            noise = lerp(noise, saturate(a * lerp(0.5, 1.5, b)), S.PatternAmount);   // a product: its dark gaps stay dark
         }
-        float footprint = FootprintOf(uv, S.NoiseScale, S.NoiseTwist);
-        noise = SurfaceNoise(p, S.NoiseScale, S.NoiseScroll, S.NoiseTwist, footprint);
         float contrast = max(S.NoiseContrast, 0.0);
         noise = saturate((noise - 0.5) * contrast + 0.5);
-        float mean = 0.5;
+        float mean = lerp(0.5, 0.4, S.NoiseCells);
         if (S.NoiseRidge > 0.0)
         {
             // Bright where the noise crosses its middle: lines winding through it, thinner the higher the contrast
             float ridge = 1.0 - abs(noise * 2.0 - 1.0);
             noise = lerp(noise, ridge * ridge, S.NoiseRidge);
-            mean = lerp(0.5, 0.65 / max(contrast, 1.0), S.NoiseRidge);   // roughly what the strands average to
+            mean = lerp(mean, 0.65 / max(contrast, 1.0), S.NoiseRidge);   // roughly what the strands average to
         }
         noise = lerp(noise, mean, OctaveFade(footprint));
     }
     float shade = lerp(1.0, noise, S.NoiseAmount);
 
-    // Eaten away where the noise is below Dissolve, with a glowing edge
-    float edge = 0.0;
-    if (S.Dissolve > 0.0)
+    // Eaten away where the noise is below Dissolve (more along its length by Erode Along), with a glowing edge
+    float edge = 0.0, kept = 1.0;
+    float eaten = S.Dissolve + lerp(S.ErodeAlong.x, S.ErodeAlong.y, saturate(uv.y));
+    if (eaten > 0.0)
     {
-        float keep = smoothstep(S.Dissolve, S.Dissolve + max(S.DissolveEdge, 1e-4), noise);
-        edge = (1.0 - keep) * step(S.Dissolve - max(S.DissolveEdge, 1e-4), noise);
-        shade *= keep;
+        kept = smoothstep(eaten, eaten + max(S.DissolveEdge, 1e-4), noise);
+        edge = (1.0 - kept) * step(eaten - max(S.DissolveEdge, 1e-4), noise);
+        shade *= kept;
     }
 
     // The ends fade in and out
@@ -346,23 +612,75 @@ float4 PS(VSOutput input) : SV_Target0
     if (S.FadeEnds.x > 0.0) ends *= smoothstep(0.0, S.FadeEnds.x, uv.y);
     if (S.FadeEnds.y > 0.0) ends *= 1.0 - smoothstep(1.0 - S.FadeEnds.y, 1.0, uv.y);
 
+    // Where it meets what is behind it, it fades out over SoftEdge metres of view depth
+    if (S.SoftEdge > 0.0 && SceneDepthIdx != 0u)
+    {
+        Texture2D<float> sceneDepth = ResourceDescriptorHeap[SceneDepthIdx];
+        float behind = sceneDepth.Load(int3(int2(input.Position.xy), 0));
+        if (behind > 0.0)
+            ends *= saturate((behind - input.Depth) / S.SoftEdge);
+    }
+
+    // A ring of light spreading from where it was struck, lighting the noise as it passes, and a flash at the point
+    float ripple = 0.0;
+    float age = Time - I.Hit.w;
+    if (S.RippleGlow > 0.0 && age >= 0.0 && age < S.RippleLasts)
+    {
+        float3 worldPos = CamPos - input.ToEye;
+        float d = distance(worldPos, I.Hit.xyz);
+        float front = age * S.RippleSpeed;
+        float ring = exp(-VfxSq((d - front) / max(S.RippleWidth, 1e-3)));
+        float behindFront = saturate(1.0 - (front - d) / max(S.RippleWidth * 4.0, 1e-3)) * step(d, front);
+        float fade = VfxSq(1.0 - age / S.RippleLasts);
+        float flash = exp(-VfxSq(d / max(S.RippleWidth * 2.0, 1e-3))) * VfxSq(saturate(1.0 - age * 5.0));
+        ripple = S.RippleGlow * fade * (ring * (0.35 + noise * 1.3) + behindFront * noise * 0.3 + flash * 2.0);
+    }
+
+    // How bright this point is, and its colour: ramping from Color in the dim parts to Hot Color in the brightest; cooling
+    // along its length (Cooling) dims and reddens it
+    float cooled = S.Cooling > 0.0 ? pow(saturate(1.0 - uv.y), S.Cooling) : 1.0;
+    float value = ((body * shade + rim) * ends + edge * 2.0) * cooled;
+    float3 color = S.Color;
+    if (S.Heat > 0.0)
+        color = lerp(S.Color, S.HotColor, smoothstep(0.25, 1.0, saturate(value)) * S.Heat);
+
     float intensity = S.Intensity * lerp(1.0, S.DayIntensity, DayFactor()) * I.Intensity;
-    float3 light = S.Color * I.Color * intensity * gain * ((body * shade + rim) * ends + edge * 2.0);
+    float3 light = color * I.Color * intensity * gain * (value + ripple * ends);
 
     // Luminance in nits, pre-exposed as a light source seen directly (Atmosphere.EmissiveExposure)
     light *= EmissiveExposure;
 
-    // Additive, so it hides nothing: the air in front only dims it
-    if (FogEnabled > 0 && AtmosphereIdx != 0)
-        light *= AtmosphereFog(input.Position.xy, input.Depth, 1.0).a;
+    // Where it has cooled it is smoke: thick where the noise is, thin at the outline, eaten away as the flame is, lit by
+    // the sky and, where it is still near the fire, by the fire's own light
+    float cover = 0.0;
+    if (S.Smoke > 0.0)
+    {
+        float cool = smoothstep(S.SmokeAlong.x, max(S.SmokeAlong.y, S.SmokeAlong.x + 1e-3), saturate(uv.y));
+        cover = saturate(S.Smoke * I.Intensity * cool * noise * kept * ends * sqrt(facing));
+        float3 sky = (SkyAmbient(float3(0, 1, 0)) + SkyAmbient(float3(0, -1, 0))) * 0.5;
+        float3 glow = S.Color * I.Color * (intensity * EmissiveExposure * 0.01);   // its own fire, all along it
+        light = light * (1.0 - cover) + S.SmokeColor * (sky + glow) * cover;
+    }
 
-    return float4(light, 1.0);
+    // The air in front dims its light, and its haze shows over what its smoke hides
+    if (FogEnabled > 0 && AtmosphereIdx != 0)
+    {
+        float4 fog = AtmosphereFog(input.Position.xy, input.Depth, 1.0);
+        light = light * fog.a + fog.rgb * cover;
+    }
+
+    return float4(light, cover);
 }
 
-// Order-independent transparency (EngineSettings.Transparency, oit.hlsli): light that hides nothing, so no moments pass
+// Order-independent transparency (EngineSettings.Transparency, oit.hlsli): its light, and what its smoke hides
+OITMomentTargets PS_OITMoments(VSOutput input)
+{
+    return OITMoments(PS(input).a, input.Depth);
+}
+
 OITTargets PS_OIT(VSOutput input)
 {
-    return OITAccumulate(float4(PS(input).rgb, 0.0), input.Depth, input.Position.xy);
+    return OITAccumulate(PS(input), input.Depth, input.Position.xy);
 }
 
 technique11 Vfx
@@ -371,6 +689,12 @@ technique11 Vfx
     {
         SetVertexShader(CompileShader(vs_6_6, VS()));
         SetPixelShader(CompileShader(ps_6_6, PS()));
+    }
+    pass OITMoments
+    {
+        SetVertexShader(CompileShader(vs_6_6, VS()));
+        SetPixelShader(CompileShader(ps_6_6, PS_OITMoments()));
+        SetRenderState(RenderTargets=2, RenderTargetFormat=OITMoments, Blend=OIT, DepthWrite=false);
     }
     pass OIT
     {
