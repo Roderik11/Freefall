@@ -287,6 +287,17 @@ namespace Freefall.Serialization
                 return;
             }
 
+            // List of enums → ints, as a single enum is written (any underlying type)
+            if (eltype.IsEnum)
+            {
+                emitter.WriteString(field.Name);
+                emitter.BeginSequence();
+                for (int i = 0; i < list.Count; i++)
+                    emitter.WriteInt32(Convert.ToInt32(list[i]));
+                emitter.EndSequence();
+                return;
+            }
+
             // List of [Serializable] objects
             if (Reflector.GetAttribute<SerializableAttribute>(eltype) != null)
             {
@@ -797,8 +808,9 @@ namespace Freefall.Serialization
                 return;
             }
 
-            // Primitive/converter lists
-            if (_converters.TryGetValue(eltype.FullName!, out var conv))
+            // Primitive/converter lists, and enum lists (ints as written; a name is read too)
+            _converters.TryGetValue(eltype.FullName!, out var conv);
+            if (conv != null || eltype.IsEnum)
             {
                 parser.Read(); // SequenceStart
 
@@ -806,7 +818,10 @@ namespace Freefall.Serialization
                 var temp = new List<object>();
                 while (parser.CurrentEventType != ParseEventType.SequenceEnd)
                 {
-                    temp.Add(conv.Read(ref parser));
+                    if (conv != null)
+                        temp.Add(conv.Read(ref parser));
+                    else if (ReadEnum(ref parser, eltype) is { } member)
+                        temp.Add(member);
                 }
 
                 parser.Read(); // consume SequenceEnd
@@ -915,6 +930,14 @@ namespace Freefall.Serialization
         }
 
         // ── Helpers ───────────────────────────────────────────────
+
+        /// <summary>An enum list's element: its number, or its name in a hand-written file; null (left out) when neither.</summary>
+        private static object ReadEnum(ref YamlParser parser, Type type)
+        {
+            var text = parser.ReadScalarAsString();
+            if (int.TryParse(text, out var number)) return Enum.ToObject(type, number);
+            return Enum.TryParse(type, text, true, out var named) ? named : null;
+        }
 
         private void WriteFieldName(Field field, Type valueType, ref Utf8YamlEmitter emitter)
         {
