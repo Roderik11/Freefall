@@ -34,6 +34,8 @@ cbuffer ObjectConstants : register(b1)
     float4 MoonColor[4];         // rgb: cd/m² of the surface where the sun shines straight on it, per unit of relative albedo
     uint4 MoonTextures;          // bindless surface texture per moon, 0 = a plain disc
     uint4 MoonNormals;           // bindless tangent-space normal map per moon (red east, green up on the disc), 0 = smooth
+    uint4 MoonBrokenTex;         // a broken moon's picture (Graphics/BrokenMoons.cs, moon_broken_cs.hlsl), 0 = drawn whole
+    float4 MoonBrokenRect[4];    // the rectangle of the disc frame it covers: corner xy, size zw, in moon radii (y up)
     // Star sphere (SkyboxRenderer): turns with the time of day round the sun path's pole
     row_major float4x4 StarRotation;   // world direction → direction on the star sphere
     float3 GalaxyPole;           // normal of the Milky Way's plane on the star sphere
@@ -197,6 +199,24 @@ float3 MoonsAndStars(float3 viewDir, float3 sunDir, float3 stars, out float3 moo
         float2 uv = float2(p.x, -p.y) * 0.5 + 0.5;
         float2 uvDx = ddx(uv), uvDy = ddy(uv);
         float edge = max(fwidth(r), 1e-4);
+
+        // A broken moon: its picture holds the moon lit by the sun (before its colour), its pieces and its dust,
+        // premultiplied
+        uint brokenTex = MoonBrokenTex[m];
+        if (brokenTex != 0)
+        {
+            float4 rect = MoonBrokenRect[m];
+            float2 t = (p - rect.xy) / rect.zw;
+            if (local.z > 0 && all(t > 0) && all(t < 1))
+            {
+                Texture2D picture = ResourceDescriptorHeap[brokenTex];
+                float4 c = picture.SampleLevel(linearWrap, float2(t.x, 1 - t.y), 0) * smoothstep(-0.002, 0.002, viewDir.y);
+                moons = moons * (1 - c.a) + c.rgb * MoonColor[m].rgb;
+                starsVisible *= 1 - c.a;
+            }
+            continue;
+        }
+
         float cover = (1 - smoothstep(1 - edge, 1, r)) * step(0, local.z) * smoothstep(-0.002, 0.002, viewDir.y);
         if (cover <= 0)
             continue;

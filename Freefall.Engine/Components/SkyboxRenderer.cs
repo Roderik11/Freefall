@@ -196,6 +196,8 @@ namespace Freefall.Components
         private readonly Vector4[] _moonColor = new Vector4[MaxMoons];
         private Int4 _moonTextures;
         private Int4 _moonNormals;
+        private Int4 _moonBrokenTex;                                    // Graphics.BrokenMoons' pictures, 0 = drawn whole
+        private readonly Vector4[] _moonBrokenRect = new Vector4[MaxMoons];
         private int _moonCount;
 
         private int _lightSource = -1;      // -1 = the sun, else an index into _moonLights
@@ -229,6 +231,7 @@ namespace Freefall.Components
         {
             // Deferred: the sky draw of the frames in flight still references the mesh
             Engine.Device.DeferDispose(Mesh);
+            Graphics.BrokenMoons.ReleaseAll();
             CurrentCloudCoverage = 0.0f;     // no 2D layer, and none of its shadows, without a sky
             Clouds.Settings = CloudSettings.Default;
             Atmosphere.Settings = AtmosphereSettings.Default;
@@ -414,6 +417,13 @@ namespace Freefall.Components
             _moonCount = 0;
             Span<int> textures = stackalloc int[MaxMoons];
             Span<int> normals = stackalloc int[MaxMoons];
+            Span<int> broken = stackalloc int[MaxMoons];
+
+            // Pixels a degree spans on screen (a broken moon's picture is made to the moon's size there)
+            var camera = Camera.Main;
+            float pixelsPerRadian = camera != null
+                ? (camera.Target?.Height ?? 1080) * 0.5f / MathF.Tan(camera.FieldOfView * 0.5f * (MathF.PI / 180f))
+                : 1000f;
             double days = GameClock.Hours / 24.0;
             float timeOfDay = GameClock.TimeOfDay;
             foreach (var moon in Moons)
@@ -444,9 +454,20 @@ namespace Freefall.Components
                 _moonColor[i] = new Vector4(moon.Tint.R, moon.Tint.G, moon.Tint.B, 0f) * (moon.Brightness * fullLuminance);
                 textures[i] = (int)(moon.Texture?.BindlessIndex ?? 0u);
                 normals[i] = (int)(moon.NormalMap?.BindlessIndex ?? 0u);
+
+                // A broken moon is drawn from its picture: the sun across it in its disc frame (as mesh_skybox.fx has it)
+                Vector3 discRight = Vector3.Normalize(Vector3.Cross(MathF.Abs(dir.Y) < 0.999f ? Vector3.UnitY : Vector3.UnitZ, dir));
+                Vector3 discUp = Vector3.Cross(dir, discRight);
+                var sunAcross = new Vector3(Vector3.Dot(SunDirection, discRight), Vector3.Dot(SunDirection, discUp), Vector3.Dot(SunDirection, dir));
+                var (picture, rect) = Graphics.BrokenMoons.Prepare(i, moon, sunAcross, MathF.Tan(radius) * pixelsPerRadian, dir.Y > -0.25f);
+                broken[i] = (int)picture;
+                _moonBrokenRect[i] = rect;
             }
+            for (int i = _moonCount; i < MaxMoons; i++)
+                Graphics.BrokenMoons.Release(i);
             _moonTextures = new Int4(textures[0], textures[1], textures[2], textures[3]);
             _moonNormals = new Int4(normals[0], normals[1], normals[2], normals[3]);
+            _moonBrokenTex = new Int4(broken[0], broken[1], broken[2], broken[3]);
         }
 
         /// <summary>
@@ -611,6 +632,8 @@ namespace Freefall.Components
             Material.SetParameter("MoonColor", _moonColor);
             Material.SetParameter("MoonTextures", _moonTextures);
             Material.SetParameter("MoonNormals", _moonNormals);
+            Material.SetParameter("MoonBrokenTex", _moonBrokenTex);
+            Material.SetParameter("MoonBrokenRect", _moonBrokenRect);
             Material.SetParameter("MoonCount", (uint)_moonCount);
             Material.SetParameter("StarRotation", _starRotation);
             Material.SetParameter("GalaxyPole", _galaxyPole);
