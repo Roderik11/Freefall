@@ -734,20 +734,22 @@ namespace Freefall.Components
                 // Only where the stamps changed it since the last readback, when a field of this size is there to
                 // copy (in samples: sample i stands at i · size / (N − 1), see GetHeight; a sample more each side)
                 float[,]? heights;
+                (int x0, int z0, int x1, int z1)? changed;
                 var previousField = Terrain.HeightField;
-                if (!_heightChangeAll && previousField != null && Transform != null && _heightChangeMax.X >= _heightChangeMin.X)
+                bool regional = !_heightChangeAll && previousField != null && Transform != null && _heightChangeMax.X >= _heightChangeMin.X;
+                if (regional)
                 {
-                    var origin = Transform.WorldPosition;
+                    var origin = Transform!.WorldPosition;
                     var size = Terrain.TerrainSize;
-                    int cells = previousField.GetLength(0) - 1;
-                    heights = _baker.ReadbackHeightmap(previousField,
+                    int cells = previousField!.GetLength(0) - 1;
+                    heights = _baker.ReadbackHeightmap(out changed, previousField,
                         (int)MathF.Floor((_heightChangeMin.X - origin.X) / size.X * cells) - 1,
                         (int)MathF.Floor((_heightChangeMin.Y - origin.Z) / size.Y * cells) - 1,
                         (int)MathF.Ceiling((_heightChangeMax.X - origin.X) / size.X * cells) + 2,
                         (int)MathF.Ceiling((_heightChangeMax.Y - origin.Z) / size.Y * cells) + 2);
                 }
                 else
-                    heights = _baker.ReadbackHeightmap();
+                    heights = _baker.ReadbackHeightmap(out changed);
                 if (heights != null && Terrain != null)
                 {
                     Terrain.SetHeightField(heights);
@@ -755,10 +757,16 @@ namespace Freefall.Components
                     Terrain.CheckMapsAgainstSaved();    // on Save Changed Assets when the bake no longer equals the saved heightmap
                     _heightsReadBack = true;
                     // Surface-snapped geometry (RuntimeMesh) and projected PCG output sampled the old heights —
-                    // let whatever lies in the changed region rebuild
-                    var change = new TerrainHeightsChange(Terrain, _heightChangeAll, _heightChangeMin, _heightChangeMax);
+                    // let whatever lies in the changed region rebuild. A regional readback names only the samples that
+                    // differ from the field they sampled, or nothing when none does: a stamp edit that bakes the same
+                    // heights (Opacity 1 → 1 on Eldermoor's rolling ground: 196 pages) regenerated every PCG component
+                    // over its region before, 2.7 s.
+                    var change = regional
+                        ? ChangedSamplesRegion(changed, heights.GetLength(0) - 1, heights.GetLength(1) - 1)
+                        : new TerrainHeightsChange(Terrain, _heightChangeAll, _heightChangeMin, _heightChangeMax);
                     Debug.Log($"[Terrain] Heights read back (tick {Engine.TickCount}): " +
-                              (change.All ? "all" : $"x {change.Min.X:0}..{change.Max.X:0}, z {change.Min.Y:0}..{change.Max.Y:0}") +
+                              (change == null ? "unchanged" : change.All ? "all" : $"x {change.Min.X:0}..{change.Max.X:0}, z {change.Min.Y:0}..{change.Max.Y:0}") +
+                              (regional ? $" (stamps x {_heightChangeMin.X:0}..{_heightChangeMax.X:0}, z {_heightChangeMin.Y:0}..{_heightChangeMax.Y:0})" : "") +
                               $", {System.Threading.Volatile.Read(ref _heightBakesPending)} bake(s) pending");
 
                     // A bake that is enqueued but has not run yet (at load: this readback is of the cached
@@ -770,8 +778,11 @@ namespace Freefall.Components
                         _heightChangeMax = new Vector2(float.MinValue);
                         SnapshotStampRegions();
                     }
-                    using (_heightsChangedMarker.Auto())
-                        MessageDispatcher.Send(EngineMsg.TerrainHeightsChanged, change);
+                    if (change != null)
+                    {
+                        using (_heightsChangedMarker.Auto())
+                            MessageDispatcher.Send(EngineMsg.TerrainHeightsChanged, change);
+                    }
                 }
             }
 
@@ -3075,7 +3086,27 @@ namespace Freefall.Components
 
         // ── Changed region ──
         // Listeners of TerrainHeightsChanged (PCG, surface meshes) only rebuild if they touch the region the
-        // stamps changed: where each edited stamp was at the last readback, plus where it is now.
+        // stamps changed: where each edited stamp was at the last readback, plus where it is now. The readback goes
+        // over that region and tells them only where samples came out different (ChangedSamplesRegion).
+
+        /// <summary>
+        /// The world XZ region a regional readback changed: the box of samples that differ from the field before
+        /// (<see cref="TerrainBaker.ReadbackHeightmap"/>), widened by how far from a sample its height is read. A height
+        /// between samples comes from the samples either side (<see cref="GetHeight"/>), so a sample reaches a spacing
+        /// each way, and normals are taken from heights up to half a metre apart (TerrainProjection): a metre more.
+        /// Null when no sample differs.
+        /// </summary>
+        private TerrainHeightsChange? ChangedSamplesRegion((int x0, int z0, int x1, int z1)? changed, int cellsX, int cellsZ)
+        {
+            if (changed is not { } box) return null;
+            const float normalReach = 1f;
+            var origin = Transform!.WorldPosition;
+            var size = Terrain.TerrainSize;
+            float sx = size.X / cellsX, sz = size.Y / cellsZ;
+            var min = new Vector2(origin.X + (box.x0 - 1) * sx - normalReach, origin.Z + (box.z0 - 1) * sz - normalReach);
+            var max = new Vector2(origin.X + box.x1 * sx + normalReach, origin.Z + box.z1 * sz + normalReach);
+            return new TerrainHeightsChange(Terrain, false, min, max);
+        }
 
         /// <summary>
         /// The CPU height field is missing or about to be replaced: a height bake or its readback is still

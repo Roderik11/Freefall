@@ -1348,6 +1348,8 @@ namespace Freefall.Assets
             }
         }
 
+        private static readonly ProfilerMarker _copyMarker = ProfilerMarker.Get("Terrain height copy and compare");
+
         /// <summary>
         /// Reads back the baked R16_UNorm heightmap into a CPU float[,] array ([x, z], texel rows along +Z).
         /// Values are normalized [0..1] — caller multiplies by MaxHeight.
@@ -1357,9 +1359,16 @@ namespace Freefall.Assets
         /// inclusive, x1, z1 exclusive), only the box is fetched: the result is a copy of 'previous' with the box
         /// replaced. 'previous' itself is left as it is, since workers may still read it. On Eldermoor's 4097² map a
         /// whole readback took ~190 ms of the frame it ran in, after every height stamp edit (2026-10-26).
+        ///
+        /// <paramref name="changed"/> is the box of the samples (x0, z0 inclusive, x1, z1 exclusive) whose value is not
+        /// the one 'previous' held, compared as they are copied, or null when every sample read back is as it was. A
+        /// stamp edit that bakes the same heights (an Opacity set to what it was) then changes nothing on the CPU.
+        /// Without a field of this size to compare with, it is the whole map.
         /// </summary>
-        public float[,] ReadbackHeightmap(float[,] previous = null, int x0 = 0, int z0 = 0, int x1 = int.MaxValue, int z1 = int.MaxValue)
+        public float[,] ReadbackHeightmap(out (int x0, int z0, int x1, int z1)? changed,
+            float[,] previous = null, int x0 = 0, int z0 = 0, int x1 = int.MaxValue, int z1 = int.MaxValue)
         {
+            changed = null;
             if (_heightTexture == null || _currentResolution == 0)
                 return null;
 
@@ -1410,26 +1419,50 @@ namespace Freefall.Assets
                 device.SubmitAndWait(cmdList);
 
                 var heights = previous != null ? (float[,])previous.Clone() : new float[res, res];
+                int cx0 = int.MaxValue, cx1 = int.MinValue, cz0 = int.MaxValue, cz1 = int.MinValue;
                 unsafe
                 {
                     void* pData;
                     readbackResource.Map(0, null, &pData);
 
-                    var srcPtr = (byte*)pData;
-                    for (int z = 0; z < height; z++)
+                    // Each sample is written only where it differs from what the copy of 'previous' holds there (a
+                    // fresh field holds zeros, which a zero sample leaves as they are), and the row's first and last
+                    // such sample widen the box
+                    using (_copyMarker.Auto())
                     {
-                        var rowStart = (byte*)(srcPtr + z * rowPitch);
-                        for (int x = 0; x < width; x++)
+                        var srcPtr = (byte*)pData;
+                        for (int z = 0; z < height; z++)
                         {
-                            ushort raw = *(ushort*)(rowStart + x * 2);
-                            heights[x0 + x, z0 + z] = raw / 65535.0f;
+                            var row = (ushort*)(srcPtr + z * rowPitch);
+                            int hz = z0 + z, first = -1, last = -1;
+                            for (int x = 0; x < width; x++)
+                            {
+                                float value = row[x] / 65535.0f;
+                                ref float sample = ref heights[x0 + x, hz];
+                                if (sample != value)
+                                {
+                                    sample = value;
+                                    if (first < 0) first = x;
+                                    last = x;
+                                }
+                            }
+                            if (last >= 0)
+                            {
+                                cx0 = Math.Min(cx0, x0 + first);
+                                cx1 = Math.Max(cx1, x0 + last + 1);
+                                cz0 = Math.Min(cz0, hz);
+                                cz1 = hz + 1;
+                            }
                         }
                     }
 
                     readbackResource.Unmap(0);
                 }
 
-                Debug.Log($"[TerrainBaker] HeightField readback: {width}x{height} of {res}x{res}");
+                if (previous == null) changed = (0, 0, res, res);
+                else if (cx1 > cx0) changed = (cx0, cz0, cx1, cz1);
+                Debug.Log($"[TerrainBaker] HeightField readback: {width}x{height} of {res}x{res}, " +
+                          (changed is { } box ? $"changed x {box.x0}..{box.x1}, z {box.z0}..{box.z1}" : "nothing changed"));
                 return heights;
             }
             finally
