@@ -45,7 +45,7 @@ struct DecalFrame
     ShelterLevel Shelter[SHELTER_LEVELS];   // the cover map (WeatherShelter, field for field)
     float ShelterMinY;
     float ShelterRangeY;
-    uint TerrainHeightmap;
+    uint TerrainPages;
     float TerrainMaxHeight;
     float3 TerrainOrigin;
     float Wetness;              // Weather.SurfaceWetness: how wet the open surfaces are

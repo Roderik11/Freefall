@@ -245,7 +245,7 @@ PSOutput PS(DSOutput input)
     float shallowFade = 0.0;
     float2 terrainSize = float2(ocean.TerrainSizeX, ocean.TerrainSizeZ);
     float2 clampedUV = 0.5;
-    if (ocean.HeightmapSRV != 0)
+    if (ocean.TerrainPages != 0)
     {
         float2 terrainUV = (worldPos.xz - float2(ocean.TerrainOriginX, ocean.TerrainOriginZ)) / terrainSize;
         clampedUV = clamp(terrainUV, 0.002, 0.998);
@@ -255,8 +255,7 @@ PSOutput PS(DSOutput input)
         seabedFade = smoothstep(0.0, 60.0, min(toBorder.x, toBorder.y));
         if (outside < 150.0)
         {
-            Texture2D<float> heightmap = ResourceDescriptorHeap[ocean.HeightmapSRV];
-            float h = OceanTerrainHeight01(heightmap, OceanSampler, clampedUV, 0);
+            float h = OceanTerrainHeight01(ocean.TerrainPages, clampedUV);
             float terrainY = ocean.TerrainBaseY + h * ocean.MaxTerrainHeight;
             terrainDepth = worldPos.y - terrainY;
             stillDepth = ocean.OceanPlaneY - terrainY;
@@ -288,7 +287,7 @@ PSOutput PS(DSOutput input)
     // Light scattered back from a bright shallow bed: the turquoise shelf along the coast
     float3 skyAmbient = input.SkyAmbient.rgb * skyVisible;
     float shallow = exp(-max(bedDepth, 0.0) / max(0.01, ocean.ShoreFadeDepth)) * saturate(pathLen);
-    shallow *= (ocean.HeightmapSRV != 0) ? shallowFade : 1.0;
+    shallow *= (ocean.TerrainPages != 0) ? shallowFade : 1.0;
     body += ocean.ShallowColor * (sunRadiance * saturate(L.y) + WaterSkyIrradiance(skyAmbient)) * 0.08 * shallow;
 
     // Light through the crests: a wind wave's crest is a thin wall of water. Sky light (and the sun's, strongest when
@@ -352,16 +351,15 @@ PSOutput PS(DSOutput input)
         float beachSlope = 0.1;
         float2 downhill = float2(0.0, 1.0);
         float laceDepth = min(bedDepth, bufDepth);
-        bool hasBeach = ocean.HeightmapSRV != 0 && terrainDepth < 999.0;
+        bool hasBeach = ocean.TerrainPages != 0 && terrainDepth < 999.0;
         if (hasBeach && laceDepth < 1.0)
         {
-            Texture2D<float> heightmap = ResourceDescriptorHeap[ocean.HeightmapSRV];
             float2 slopeStep = 3.0 / terrainSize;
             float2 uphill = float2(
-                OceanTerrainHeight01(heightmap, OceanSampler, clampedUV + float2(slopeStep.x, 0), 0)
-              - OceanTerrainHeight01(heightmap, OceanSampler, clampedUV - float2(slopeStep.x, 0), 0),
-                OceanTerrainHeight01(heightmap, OceanSampler, clampedUV + float2(0, slopeStep.y), 0)
-              - OceanTerrainHeight01(heightmap, OceanSampler, clampedUV - float2(0, slopeStep.y), 0));
+                OceanTerrainHeight01(ocean.TerrainPages, clampedUV + float2(slopeStep.x, 0))
+              - OceanTerrainHeight01(ocean.TerrainPages, clampedUV - float2(slopeStep.x, 0)),
+                OceanTerrainHeight01(ocean.TerrainPages, clampedUV + float2(0, slopeStep.y))
+              - OceanTerrainHeight01(ocean.TerrainPages, clampedUV - float2(0, slopeStep.y)));
             float steepness = length(uphill);
             downhill = -uphill / max(steepness, 1e-6);
             beachSlope = clamp(steepness * ocean.MaxTerrainHeight / 6.0, 0.03, 1.0);

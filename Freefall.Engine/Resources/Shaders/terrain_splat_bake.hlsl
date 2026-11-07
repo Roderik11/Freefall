@@ -24,7 +24,7 @@ cbuffer PushConstants : register(b3)
 {
     uint  StampBufIdx;      // slot 0 — SRV: StructuredBuffer<CoverageStamp>, sorted by priority
     uint  OutputIdx;        // slot 1 — UAV: RWTexture2DArray<float4> packed control array
-    uint  HeightTexIdx;     // slot 2 — SRV: baked heightmap (0 = none yet: height/slope read as 0)
+    uint  TerrainPagesIdx;  // slot 2 — the terrain's TerrainPagesParams (terrain_pages.hlsli); 0 = none yet: height/slope read as 0
     uint  SplineBufIdx;     // slot 3 — SRV: StructuredBuffer<StampSplinePoint>
     uint  StampCount;       // slot 4
     uint  Resolution;       // slot 5
@@ -87,11 +87,8 @@ void CS_SplatBake(uint3 groupTexel : SV_DispatchThreadID)
     float2 terrainUV = float2(uv.x, 1.0 - uv.y);
 
     float heightNorm = 0, slopeDeg = 0;
-    if (HeightTexIdx != 0)
-    {
-        Texture2D heightTex = ResourceDescriptorHeap[HeightTexIdx];
-        SampleTerrainHeightSlope(heightTex, sampHeightFilter, terrainUV, MaxHeight, TerrainSizeX, heightNorm, slopeDeg);
-    }
+    if (TerrainPagesIdx != 0)
+        SampleTerrainHeightSlope(LoadTerrain(TerrainPagesIdx), terrainUV, heightNorm, slopeDeg);
 
     uint layerCount = min(LayerCount, (uint)MAX_LAYERS);
 

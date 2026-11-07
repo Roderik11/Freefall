@@ -184,8 +184,8 @@ namespace Freefall.Graphics
 
             var eye = EyeFor(camera);
             var terrain = Atmosphere.TerrainCover;
-            float minY = terrain.Heightmap != 0 ? terrain.Origin.Y - BelowGround : MathF.Floor(eye.Y / 64f) * 64f - NoTerrainBelow;
-            float maxY = terrain.Heightmap != 0 ? terrain.Origin.Y + terrain.MaxHeight + AboveGround : minY + NoTerrainBelow + NoTerrainAbove;
+            float minY = terrain.Pages != 0 ? terrain.Origin.Y - BelowGround : MathF.Floor(eye.Y / 64f) * 64f - NoTerrainBelow;
+            float maxY = terrain.Pages != 0 ? terrain.Origin.Y + terrain.MaxHeight + AboveGround : minY + NoTerrainBelow + NoTerrainAbove;
             if (_invalid || minY != _minY || maxY != _maxY)
             {
                 _minY = minY;
@@ -343,7 +343,7 @@ namespace Freefall.Graphics
         }
 
         private static void Reduce(ID3D12GraphicsCommandList list, RenderTexture2D map, bool merge, float left, float top, float size,
-            (uint Heightmap, float MaxHeight, Vector3 Origin, Vector2 Size) terrain)
+            (uint Pages, float MaxHeight, Vector3 Origin, Vector2 Size) terrain)
         {
             var cs = _reduce!;
             list.SetDescriptorHeaps(1, new[] { Engine.Device.SrvHeap });
@@ -352,7 +352,7 @@ namespace Freefall.Graphics
             cs.SetPushConstant("OutputUAV", map.UavIndex);
             cs.SetPushConstant("Merge", merge ? 1u : 0u);
             cs.SetPushConstant("Resolution", (uint)Resolution);
-            cs.SetPushConstant("TerrainHeightmap", terrain.Heightmap);
+            cs.SetPushConstant("TerrainPages", terrain.Pages);
             cs.SetParam("TerrainMaxHeight", terrain.MaxHeight);
             cs.SetParam("TerrainOriginX", terrain.Origin.X);
             cs.SetParam("TerrainOriginY", terrain.Origin.Y);

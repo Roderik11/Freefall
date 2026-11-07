@@ -30,7 +30,7 @@ namespace Freefall.Graphics
             public Vector3 CameraPosition; public float PixelsPerMetre;
             public Vector3 CameraForward; public uint TilesX;
             public ShelterMap.LevelData Shelter0, Shelter1, Shelter2;
-            public float ShelterMinY, ShelterRangeY; public uint TerrainHeightmap; public float TerrainMaxHeight;
+            public float ShelterMinY, ShelterRangeY; public uint TerrainPages; public float TerrainMaxHeight;
             public Vector3 TerrainOrigin; public float Wetness;
             public Vector2 TerrainSize; public float PuddleFill, SnowCover;
             public float Rain; public uint TilesY, WeatherOn, _pad;
@@ -248,7 +248,7 @@ namespace Freefall.Graphics
                 Shelter2 = shelter.L2,
                 ShelterMinY = shelter.MinY,
                 ShelterRangeY = shelter.RangeY,
-                TerrainHeightmap = terrain.Heightmap,
+                TerrainPages = terrain.Pages,
                 TerrainMaxHeight = terrain.MaxHeight,
                 TerrainOrigin = terrain.Origin,
                 Wetness = Weather.SurfaceWetness,

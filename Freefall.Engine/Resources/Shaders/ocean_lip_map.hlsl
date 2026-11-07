@@ -37,7 +37,7 @@ void CSLipMapBuild(uint3 id : SV_DispatchThreadID)
     float4 result = 0.0;
     float4 surface = 0.0;
     OceanShore shore = ShoreAt(ocean, xz);
-    if (ocean.WarpOmega.x + ocean.WarpOmega.y > 0.0 && ocean.HeightmapSRV != 0 && shore.shoreDepth < 1e3)
+    if (ocean.WarpOmega.x + ocean.WarpOmega.y > 0.0 && ocean.TerrainPages != 0 && shore.shoreDepth < 1e3)
     {
         // The smooth swell over the whole coast, where the lip's crest, face and trough end can lie
         OceanShore smoothShore;

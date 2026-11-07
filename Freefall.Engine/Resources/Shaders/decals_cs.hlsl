@@ -524,7 +524,7 @@ float SurfaceOpenness(DecalFrame f, float3 rel, float3 geo, uint surfaceClass, f
     s.RangeY = f.ShelterRangeY;
     // The terrain's own pixels are the height field: it cannot cover them, and far off its coarse LODs lie under the
     // height map, which counted as cover and left the far slopes bare in streaks (2026-10-23)
-    s.TerrainHeightmap = surfaceClass == 1u ? 0u : f.TerrainHeightmap;
+    s.TerrainPages = surfaceClass == 1u ? 0u : f.TerrainPages;
     s.TerrainMaxHeight = f.TerrainMaxHeight;
     s.TerrainOrigin = f.TerrainOrigin;
     s.TerrainSize = f.TerrainSize;
@@ -540,18 +540,15 @@ float SurfaceOpenness(DecalFrame f, float3 rel, float3 geo, uint surfaceClass, f
     return crown * WeatherOpenness(s, LinearClamp, rel + CamPos + geo * 0.35 + float3(0, 0.05, 0), 0.1);
 }
 
-// The terrain's smooth normal at a place (world xz) from its height map: its own normal before its layers' normal maps
-// (gputerrain.fx GetNormal), central differences a texel each way
+// The terrain's smooth normal at a place (world xz) from its heights (terrain_pages.hlsli): its own normal before its
+// layers' normal maps (gputerrain.fx GetNormal), central differences a sample each way
 float3 TerrainNormal(DecalFrame f, float2 xz)
 {
-    Texture2D<float> heights = ResourceDescriptorHeap[f.TerrainHeightmap];
-    uint w, h;
-    heights.GetDimensions(w, h);
-    float2 uv = TerrainHeightUV((xz - f.TerrainOrigin.xz) / f.TerrainSize, float2(w, h));
-    float2 du = float2(1.0 / w, 0.0), dv = float2(0.0, 1.0 / h);
-    float2 metres = 2.0 * TerrainSampleSpacing(f.TerrainSize, float2(w, h));
-    float dx = (heights.SampleLevel(LinearClamp, uv + du, 0) - heights.SampleLevel(LinearClamp, uv - du, 0)) * f.TerrainMaxHeight / metres.x;
-    float dz = (heights.SampleLevel(LinearClamp, uv + dv, 0) - heights.SampleLevel(LinearClamp, uv - dv, 0)) * f.TerrainMaxHeight / metres.y;
+    TerrainPagesParams t = LoadTerrain(f.TerrainPages);
+    float2 s = (xz - t.Origin.xz) / t.Spacing;
+    float scale = t.MaxHeight / (2.0 * t.Spacing);
+    float dx = (TerrainHeight01AtSample(t, s + float2(1, 0)) - TerrainHeight01AtSample(t, s - float2(1, 0))) * scale;
+    float dz = (TerrainHeight01AtSample(t, s + float2(0, 1)) - TerrainHeight01AtSample(t, s - float2(0, 1))) * scale;
     return normalize(float3(-dx, 1.0, -dz));
 }
 
@@ -804,7 +801,7 @@ void CSDecals(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint gi : S
         // (vegetation: its own dome normal, gbuffer_foliage.fx / gbuffer_crossmesh.fx: the depth's normal of a far tree's
         // vertical cards pointed sideways, and the snow stopped a few hundred metres out, far trees stood green)
         float3 largeN = geo, shapeN;
-        if (surfaceClass == 1u && f.TerrainHeightmap != 0)
+        if (surfaceClass == 1u && f.TerrainPages != 0)
             largeN = TerrainNormal(f, rel.xz + CamPos.xz);
         // Meshes: their shape without the normal map (gbuffer.fx, PackShapeNormal), smooth over the triangles as the
         // mesh's normals are. The depth's normal is flat per triangle: on a low-poly rock the deep snow lay and shaded

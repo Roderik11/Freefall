@@ -13,7 +13,7 @@
 // What changes from dispatch to dispatch (the light, the reach) is pushed: the Params buffer holds one copy per frame
 cbuffer PushConstants : register(b3)
 {
-    uint HeightmapIdx;          // the terrain's baked heightmap (R16)
+    uint TerrainPagesIdx;       // the terrain's TerrainPagesParams (terrain_pages.hlsli)
     uint SourceTexIdx;          // M(k)
     uint TargetUAVIdx;          // M(k+1)
     uint LightDirXBits;         // asfloat: the light's direction across the ground, unit (texel x = world x,
@@ -57,7 +57,7 @@ void CSShadowInit(uint3 id : SV_DispatchThreadID)
     if (any(id.xy >= MapResolution))
         return;
     TerrainCover t;
-    t.Heightmap = HeightmapIdx;
+    t.Pages = TerrainPagesIdx;
     t.MaxHeight = TerrainMaxHeight;
     t.Origin = TerrainOrigin;
     t.Size = TerrainSize;

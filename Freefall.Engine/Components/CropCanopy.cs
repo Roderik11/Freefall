@@ -265,7 +265,6 @@ namespace Freefall.Components
             SetInstance("VariantSlot", (float)Math.Max(0, variantSlot));
             SetInstance("HealthyColor", new Vector3(crop.HealthyColor.X, crop.HealthyColor.Y, crop.HealthyColor.Z));
             SetInstance("TerrainCorner", new Vector2(origin.X, origin.Z));
-            SetInstance("Heightmap", (float)(terrain.Terrain.Heightmap?.BindlessIndex ?? 0u));
             SetInstance("TerrainSize", terrain.Terrain.TerrainSize);
             SetInstance("MaxHeight", terrain.Terrain.MaxHeight);
 

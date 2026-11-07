@@ -94,6 +94,18 @@ namespace Freefall.Components
         /// <summary>Terrain shadow entries (patch × cascade) drawn in the last frame read back.</summary>
         [Reflection.DontSerialize]
         public uint ShadowPatches { get; private set; }
+
+        /// <summary>
+        /// This frame's <c>TerrainPagesParams</c> for this terrain (terrain_pages.hlsli <c>LoadTerrain</c>): its bindless
+        /// index, 0 while its heights are not in a pool yet. The scene's terrain goes to every shader as
+        /// Graphics.Atmosphere.TerrainIdx; this terrain's own passes use their own.
+        /// </summary>
+        public uint GpuTerrainIdx()
+        {
+            if (_baker == null || Terrain == null || Transform == null) return 0;
+            return _baker.Pool.WriteParams(Transform.WorldPosition, Terrain.TerrainSize, Terrain.MaxHeight,
+                                           (uint)TerrainBaker.HeightVersion);
+        }
         private GraphicsBuffer[] _indirectArgsBuffers = new GraphicsBuffer[FrameCount];
 
         private GraphicsBuffer[] _shadowArgsBuffers = new GraphicsBuffer[FrameCount];
@@ -149,7 +161,7 @@ namespace Freefall.Components
             public Vector3 RootExtents;public uint  TotalNodes;
             public Vector2 TerrainSize;public float PixelErrorThreshold; public float ScreenHeight;
             public float TanHalfFov;   public uint  TransformSlot;       public uint  MaterialId; public uint MeshPartId;
-            public uint  MaxPatches;   public uint  HeightTexIdx;         public uint  FrameTag, WalkCapacity;
+            public uint  MaxPatches;   public uint  TerrainPagesIdx;      public uint  FrameTag, WalkCapacity;
             public uint  ShadowReceiversIdx;    // shadow pass: this frame's sun shadow receivers (0 = no test)
             public uint  Pad2, Pad3, Pad4;
         }
@@ -559,6 +571,9 @@ namespace Freefall.Components
                                  $"{Assets.Terrain.PatchQuads} x {Terrain.VertexSpacing} m x a power of two: the vertices miss the height samples");
             }
 
+            // The heights live in the terrain asset's pool, which outlives this renderer (a reload keeps them)
+            _baker.AttachPool(Terrain);
+
             // While a load wakes the scene its stamps are still arriving: the first bakes wait for the load's terrain
             // step, so they see every stamp. Before, a bake during the wake-up cut the holes of the stamps awake so far
             // (none, often), then again with all of them, and the editor took the half-cut mask for a change to save.
@@ -579,10 +594,8 @@ namespace Freefall.Components
 
                 if (cachedRes == expectedRes)
                 {
-                    var tex = baker.UploadBakedHeightmap(bytes, expectedRes);
-                    if (tex != null)
+                    if (baker.UploadBakedHeightmap(bytes, expectedRes))
                     {
-                        Terrain.BakedHeightmap = tex;
                         Terrain.HeightmapStampsHash = Terrain.BakedStampsHash;
                         Terrain.ConsumeFlags(TerrainDirtyFlags.HeightBake); // loaded from cache, skip bake
                         _heightRangePyramidBuilt = false;
@@ -598,7 +611,7 @@ namespace Freefall.Components
                 }
             }
 
-            // The Terrain asset is shared across scene loads, so its BakedHeightmap may hold another scene's
+            // The Terrain asset is shared across scene loads, so its height pool may hold another scene's
             // (or an older) stamp result, and stamps only send StampChanged when edited, not when loaded.
             // Bake once per renderer so this scene's stamps always win, unless the heights in place were baked from
             // stamps that hash the same (below: KeepsHeights).
@@ -723,9 +736,6 @@ namespace Freefall.Components
                 });
             }
 
-            // Capture heightmap AFTER cache upload / bake — BakedHeightmap may have just been set above
-            var heightmap = Terrain.Heightmap;
-
             // Debounced CPU heightfield readback — only when baking has settled (not while a stamp is dragged)
             if (_needHeightFieldReadback && !Terrain.NeedsUpdate(TerrainDirtyFlags.HeightBake))
             {
@@ -829,9 +839,8 @@ namespace Freefall.Components
                     var renderer = this;
                     CommandBuffer.Enqueue(RenderPass.Opaque, (list) =>
                     {
-                        // The height bake enqueued above has run by now, so this reads the new heights
-                        var hm = terrain.Heightmap;
-                        uint hmSrv = hm != null ? (uint)hm.BindlessIndex : 0;
+                        // The height bake enqueued above has run by now, so this reads the new heights (the pages)
+                        uint hmSrv = renderer.GpuTerrainIdx();
 
                         list.ResourceBarrierTransition(packedArray,
                             ResourceStates.Common, ResourceStates.UnorderedAccess);
@@ -892,7 +901,6 @@ namespace Freefall.Components
 
             // Set shared material params
             material.SetParameter("CameraPos", Camera.Main.Position);
-            material.SetParameter("HeightTexel", 1.0f / (heightmap != null ? Terrain.EffectiveHeightmapResolution : 1024));
             material.SetParameter("MaxHeight", Terrain.MaxHeight);
             material.SetParameter("BlendDepth", Terrain.LayerBlendDepth);
             material.SetParameter("TerrainSize", Terrain.TerrainSize);
@@ -908,7 +916,8 @@ namespace Freefall.Components
             // a Texture2D would cause a GPU fault). The layers' own textures go by index (LayerTextures above).
             // Bind textures if available (terrain still renders without splatmaps)
 
-            if (heightmap != null) material.SetTexture("HeightTex", heightmap);
+            // The heights: this terrain's pages (terrain_pages.hlsli), this frame's parameters
+            material.SetTextureIndex("TerrainPages", GpuTerrainIdx());
             if (ControlMapsArray != null) material.SetTexture("ControlMaps", ControlMapsArray);
 
             // Capture values for lambda closure
@@ -1330,7 +1339,7 @@ namespace Freefall.Components
                 MaterialId = (uint)(Material?.MaterialID ?? 0),
                 MeshPartId = (uint)_meshPartId,
                 MaxPatches = (uint)Math.Max(MaxPatches, MinPatches),
-                HeightTexIdx = Terrain?.Heightmap?.BindlessIndex ?? 0u,
+                TerrainPagesIdx = GpuTerrainIdx(),
                 FrameTag = _quadtreeTag,
                 WalkCapacity = WalkCapacity,
             };
@@ -1343,7 +1352,10 @@ namespace Freefall.Components
             commandList.SetComputeRootConstantBufferView(2, _hizParamBuffers[frameIndex].GPUVirtualAddress);
             commandList.SetComputeRootConstantBufferView(3, _terrainParamBuffers[frameIndex].GPUVirtualAddress);
 
-            // Clear the counter; the split flags only once, when made (they hold a tag, MarkSplit)
+            // Clear the counter; the split flags only once, when made (they hold a tag, MarkSplit). The counter is put in
+            // UnorderedAccess first: the clear would promote it there unseen by its tracked state, and the count's copy
+            // below would then name Common as the state it leaves (GBV: ResourceBarrierBeforeAfterMismatch on frame 1)
+            _counterBuffers[frameIndex].Transition(commandList, ResourceStates.UnorderedAccess);
             _counterBuffers[frameIndex].ClearUAV(commandList, new Vortice.Mathematics.Int4(0, 0, 0, 0));
             if (_splitFlagsFresh[frameIndex])
             {
@@ -1372,8 +1384,7 @@ namespace Freefall.Components
                 StreamingManager.Instance?.Flush();
                 Engine.Device.WaitForCopyQueue();
 
-                var hmIdx = Terrain?.Heightmap?.BindlessIndex ?? 0u;
-                Debug.Log($"[TerrainRenderer] Pyramid build in QuadtreeEval: HeightTexIdx={terrainParams.HeightTexIdx} HM.Idx={hmIdx} BakedHM={Terrain?.BakedHeightmap != null}");
+                Debug.Log($"[TerrainRenderer] Pyramid build in QuadtreeEval: TerrainPagesIdx={terrainParams.TerrainPagesIdx} pool filled={_baker?.Pool.Filled}");
 
                 BuildHeightRangePyramid(commandList);
                 _heightRangePyramidBuilt = true;
@@ -1567,7 +1578,7 @@ namespace Freefall.Components
                 MaterialId = (uint)(Material?.MaterialID ?? 0),
                 MeshPartId = (uint)_meshPartId,
                 MaxPatches = (uint)shadowMaxPatches,
-                HeightTexIdx = Terrain.Heightmap?.BindlessIndex ?? 0u,
+                TerrainPagesIdx = GpuTerrainIdx(),
                 // This frame's flags and leaves, from the walk in the opaque pass (DispatchQuadtreeEval)
                 FrameTag = _frameTags[frameIndex],
                 WalkCapacity = WalkCapacity,
@@ -1580,6 +1591,7 @@ namespace Freefall.Components
             // Clear shadow counter
             commandList.SetDescriptorHeaps(1, _srvHeaps ??= new[] { Engine.Device.SrvHeap });
             commandList.SetComputeRootSignature(Engine.Device.GlobalRootSignature);
+            _shadowCounterBuffers[frameIndex].Transition(commandList, ResourceStates.UnorderedAccess);   // as the main counter
             _shadowCounterBuffers[frameIndex].ClearUAV(commandList, new Vortice.Mathematics.Int4(0, 0, 0, 0));
 
             // Bind cbuffers (b0, b1 already uploaded by main pass; b2 updated above)
@@ -2574,9 +2586,8 @@ namespace Freefall.Components
                 new ResourceTransitionBarrier(_decoControlTex,
                     freshTexture ? ResourceStates.Common : ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess)));
 
-            // Heightmap for the stamps' height/slope filters
-            var heightmap = Terrain.Heightmap;
-            uint heightSrv = heightmap != null ? (uint)heightmap.BindlessIndex : 0;
+            // The heights for the stamps' height/slope filters: this terrain's pages
+            uint heightSrv = GpuTerrainIdx();
 
             // Packed layer weights for the stamps' layer filters — the same array the surface shader
             // samples, already rebaked this frame if the splat stamps changed
@@ -2675,12 +2686,12 @@ namespace Freefall.Components
         private void BakeTerrainNormals(ID3D12GraphicsCommandList cmd)
         {
             if (!_bakedNormalsDirty) return;
-            if (Terrain?.Heightmap == null) return;
+            if (Terrain == null || _baker?.Pool.Texture == null) return;
 
             var device = Engine.Device;
-            var hmDesc = Terrain.Heightmap.Native.Description;
-            int hmW = (int)hmDesc.Width;
-            int hmH = (int)hmDesc.Height;
+            // A normal per height sample
+            int hmW = _baker.Pool.Resolution;
+            int hmH = _baker.Pool.Resolution;
 
             // Create normal map texture (R16G16_SNORM: stores XZ, Y reconstructed)
             if (_bakedNormalTex == null)
@@ -2721,7 +2732,7 @@ namespace Freefall.Components
             cmd.SetDescriptorHeaps(1, _srvHeaps ??= new[] { Engine.Device.SrvHeap });
             cmd.SetComputeRootSignature(device.GlobalRootSignature);
 
-            _grassCS!.SetTexture(_kBakeNormals, "Heightmap", Terrain.Heightmap);
+            _grassCS!.SetPushConstant(_kBakeNormals, "TerrainPages", GpuTerrainIdx());
             _grassCS.SetPushConstant(_kBakeNormals, "BakedNormalUAV", _bakedNormalUAV);
             _grassCS.SetParam("TerrainSize", new Vector2(Terrain.TerrainSize.X, Terrain.TerrainSize.Y));
             _grassCS.SetParam("MaxHeight", Terrain.MaxHeight);
@@ -2747,8 +2758,8 @@ namespace Freefall.Components
         {
             if (!_computeInitialized) return; // Destroyed between enqueue and execute
             if (DecoratorMaterial?.Effect == null || Terrain == null) return;
-            // A freshly created terrain has no heightmap until its first bake; decorators need it for placement.
-            if (Terrain.Heightmap == null) return;
+            // A freshly created terrain has no heights until its first bake; decorators need them for placement.
+            if (_baker?.Pool.Texture == null) return;
 
             // GPU prepass: composite the deco stamps into the control texture (when they changed)
             PixMarker.Begin(commandList, "Control prepass");
@@ -2800,7 +2811,7 @@ namespace Freefall.Components
                 cs.SetBuffer("LODTable", _decoratorLODTableBuffer!);
                 cs.SetBuffer("DecoratorGroups", _decoratorGroupsBuffer!);
                 cs.SetPushConstant("MeshRegistry", MeshRegistry.SrvIndex);
-                if (Terrain.Heightmap != null) cs.SetTexture("Heightmap", Terrain.Heightmap);
+                cs.SetPushConstant("TerrainPages", GpuTerrainIdx());
                 cs.SetPushConstant("DecoControl", _decoControlSRV);
                 cs.SetPushConstant("BakedNormal", _bakedNormalSRV);
 
@@ -2840,8 +2851,7 @@ namespace Freefall.Components
                 cs.SetParam("ControlWidth", (uint)controlW);
                 cs.SetParam("ControlHeight", (uint)controlH);
                 cs.SetParam("SlotCount", (uint)_decoVariantCount);
-                var hmDesc2 = Terrain.Heightmap!.Native.Description;
-                cs.SetParam("HeightmapSize", new Vortice.Mathematics.UInt2((uint)hmDesc2.Width, (uint)hmDesc2.Height));
+                cs.SetParam("HeightmapSize", new Vortice.Mathematics.UInt2((uint)_baker.Pool.Resolution, (uint)_baker.Pool.Resolution));
 
                 // ── Camera-centered grid: K rings of cells around the camera's cell (the spawn walks it as a spiral) ──
                 int camTileX = (int)MathF.Floor((camPos.X - Transform.WorldPosition.X) / tileSize);
@@ -3073,14 +3083,21 @@ namespace Freefall.Components
         {
             if (Terrain == null) return;
             var plan = _baker.PrepareHeight(Terrain, this);
-            var (inPlace, bDiffers, cDiffers, maxStep, aMs, bMs) = _baker.CheckPageBake(Terrain, plan);
+            var (inPlace, bDiffers, cDiffers, borderDiffers, maxStep, aMs, bMs) = _baker.CheckPageBake(Terrain, plan);
             int pages = plan.Pages * plan.Pages;
-            PageBakeCheck = (inPlace == 0 && bDiffers == 0 && cDiffers == 0 ? "equal" : "DIFFERENT") +
-                            $": {pages} pages; against every stamp over the whole map, {inPlace} samples of the map in place " +
-                            $"differ, all pages at once {bDiffers}, page by page {cDiffers}" +
+            PageBakeCheck = (inPlace == 0 && bDiffers == 0 && cDiffers == 0 && borderDiffers == 0 ? "equal" : "DIFFERENT") +
+                            $": {pages} pages; against every stamp on every page, {inPlace} texels of the pool in place " +
+                            $"differ, all pages at once {bDiffers}, page by page {cDiffers}; {borderDiffers} border or " +
+                            "shared-edge texels differ from the page their sample belongs to" +
                             (maxStep > 0 ? $" (up to {maxStep} steps of 65535)" : "") +
                             $"; whole map with every stamp {aMs:0.0} ms, pages with their own {bMs:0.0} ms (on the queue, " +
                             "less a copy alone)";
+            if (Transform != null)
+            {
+                var (atSamples, between) = _baker.CompareReads(Terrain, Transform.WorldPosition);
+                PageBakeCheck += $"; reads through the pool against the same bilinear in float on the CPU: {atSamples * 1000f:0.####} mm " +
+                                 $"at most on samples, {between * 1000f:0.####} mm between them";
+            }
             Debug.LogAlways($"[Terrain] '{Terrain.Name}' page bake check: {PageBakeCheck}");
         }
 
@@ -3134,7 +3151,8 @@ namespace Freefall.Components
         /// </summary>
         private bool KeepsHeights(TerrainBaker.HeightPlan plan)
         {
-            if (Terrain.Heightmap == null || Terrain.HeightField == null) return false;
+            if (_baker?.Pool is not { Filled: true } || _baker.Pool.Resolution != plan.Resolution || Terrain.HeightField == null)
+                return false;
             ulong hash = plan.Hash;
             return hash == Terrain.HeightmapStampsHash && hash == Terrain.HeightFieldStampsHash;
         }

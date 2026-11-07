@@ -322,7 +322,7 @@ namespace Freefall.Components
             public uint TileScalesSRV;
             public float DisplacementAtten;
             public float NormalAtten;
-            public uint HeightmapSRV;
+            public uint TerrainPages;
             public float ShoreDepth;
             public float MaxTerrainHeight;
             public float OceanPlaneY;
@@ -942,7 +942,7 @@ namespace Freefall.Components
                 TileScalesSRV = _tileScalesBuffer?.SrvIndex ?? 0,
                 DisplacementAtten = 1.0f,
                 NormalAtten = 1.0f,
-                HeightmapSRV = _terrain?.Terrain?.Heightmap?.BindlessIndex ?? 0,
+                TerrainPages = _terrain?.GpuTerrainIdx() ?? 0,
                 ShoreDepth = ShoreDepth,
                 MaxTerrainHeight = _terrain?.Terrain?.MaxHeight ?? 0,
                 OceanPlaneY = Transform.WorldPosition.Y,

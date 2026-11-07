@@ -68,11 +68,18 @@ namespace Freefall.Graphics
         public static float ReferenceExposure => 1f / (1.2f * MathF.Pow(2f, ReferenceEV));
         public static float Exposure => 1f / (1.2f * MathF.Pow(2f, AutoExposure.EV));
         /// <summary>
-        /// The terrain the sky visibility reads this frame (sky_visibility.hlsli TerrainCover): heightmap bindless index (0 =
+        /// The terrain the sky visibility reads this frame (sky_visibility.hlsli TerrainCover): its pages (TerrainIdx; 0 =
         /// none, or Engine.Settings.SkyVisibility off), metres at 1, the terrain's corner, the metres it spans.
         /// </summary>
-        public static (uint Heightmap, float MaxHeight, Vector3 Origin, Vector2 Size) TerrainCover =>
-            (_frame.TerrainHeightmap, _frame.TerrainMaxHeight, _frame.TerrainOrigin, new Vector2(_frame.TerrainSizeX, _frame.TerrainSizeZ));
+        public static (uint Pages, float MaxHeight, Vector3 Origin, Vector2 Size) TerrainCover =>
+            (_frame.TerrainPages, _frame.TerrainMaxHeight, _frame.TerrainOrigin, new Vector2(_frame.TerrainSizeX, _frame.TerrainSizeZ));
+
+        /// <summary>
+        /// The scene's terrain this frame (TERRAIN_PAGES_PLAN.md 4a): its <c>TerrainPagesParams</c> buffer, for
+        /// terrain_pages.hlsli <c>LoadTerrain</c>; 0 = none. The first enabled TerrainRenderer whose heights are in, chosen
+        /// with the frame (PrepareFrame); effects get it as SceneConstants.TerrainIdx, compute passes as a push constant.
+        /// </summary>
+        public static uint TerrainIdx { get; private set; }
 
         /// <summary>The directional light (physical lux in the older units' encoding) × this = pre-exposed.</summary>
         public static float SunLightScale => Exposure / ReferenceExposure;
@@ -234,7 +241,7 @@ namespace Freefall.Graphics
             public Vector3 MoonDirection; public uint SkyViewPastMoonLut;
             public Vector3 MoonIlluminance; public float AirglowLuminance;
             public uint TransmittanceLut, MultiScatLut, SkyViewSunLut, SkyViewMoonLut;
-            public uint AerialPerspective, Ambient, TerrainHeightmap; public float TerrainMaxHeight;
+            public uint AerialPerspective, Ambient, TerrainPages; public float TerrainMaxHeight;
             public Vector3 TerrainOrigin; public float TerrainSizeX;
             public float TerrainSizeZ; public uint SkyCaptureViews, SkyCaptureDepth, SkyCaptureCount;
             public float SkyCaptureBounce; public uint SkyProbeCube, SkyProbeSH; public float SkyProbeMips;
@@ -371,19 +378,27 @@ namespace Freefall.Graphics
                 AerialPerspective = 0,      // each view has its own (SceneConstants.AerialPerspectiveIdx)
                 Ambient = _ambient!.SrvIndex,
             };
-            // Sky visibility (sky_common.fx SkyVisibility): the terrain shades the sky's light where hills rise round a
-            // place or over it (a cave under a hill)
+            // The scene's terrain: its pages' parameters for this frame (terrain_pages.hlsli)
+            TerrainIdx = 0;
+            Components.TerrainRenderer? scene = null;
             foreach (var terrain in Base.ComponentCache<Components.TerrainRenderer>.All)
             {
-                if (!Engine.Settings.SkyVisibility) break;
-                var heightmap = terrain.Enabled ? terrain.Terrain?.Heightmap : null;
-                if (heightmap == null) continue;
-                _frame.TerrainHeightmap = heightmap.BindlessIndex;
-                _frame.TerrainMaxHeight = terrain.Terrain!.MaxHeight;
-                _frame.TerrainOrigin = terrain.Transform!.WorldPosition;
-                _frame.TerrainSizeX = terrain.Terrain.TerrainSize.X;
-                _frame.TerrainSizeZ = terrain.Terrain.TerrainSize.Y;
+                if (!terrain.Enabled) continue;
+                uint idx = terrain.GpuTerrainIdx();
+                if (idx == 0) continue;
+                TerrainIdx = idx;
+                scene = terrain;
                 break;
+            }
+            // Sky visibility (sky_common.fx SkyVisibility): the terrain shades the sky's light where hills rise round a
+            // place or over it (a cave under a hill)
+            if (scene != null && Engine.Settings.SkyVisibility)
+            {
+                _frame.TerrainPages = TerrainIdx;
+                _frame.TerrainMaxHeight = scene.Terrain!.MaxHeight;
+                _frame.TerrainOrigin = scene.Transform!.WorldPosition;
+                _frame.TerrainSizeX = scene.Terrain.TerrainSize.X;
+                _frame.TerrainSizeZ = scene.Terrain.TerrainSize.Y;
             }
             // ... and the meshes round the camera: walls, roofs, tree crowns (SkyCapture, sky_capture.hlsli)
             (_frame.SkyCaptureViews, _frame.SkyCaptureDepth, _frame.SkyCaptureCount) = SkyCapture.PrepareFrame(slot);

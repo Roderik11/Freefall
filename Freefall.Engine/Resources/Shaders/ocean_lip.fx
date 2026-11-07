@@ -85,7 +85,7 @@ HullConstantOutput LipPatchConstantFunc(InputPatch<ControlPoint, 3> patch, uint 
 
     StructuredBuffer<OceanData> oceanData = ResourceDescriptorHeap[OceanDataIdx];
     OceanData ocean = oceanData[patch[0].InstanceIdx];
-    if (ocean.ShoreWarpSRV == 0 || ocean.HeightmapSRV == 0 || ocean.LipMapSRV == 0) return output;
+    if (ocean.ShoreWarpSRV == 0 || ocean.TerrainPages == 0 || ocean.LipMapSRV == 0) return output;
 
     float3 p0 = patch[0].WorldPos, p1 = patch[1].WorldPos, p2 = patch[2].WorldPos;
     float3 mid = (p0 + p1 + p2) / 3.0;
@@ -497,12 +497,11 @@ LipPSOutput PS_Lip(LipOutput input)
 
     // Light back from a bright shallow bed: the turquoise shelf, by the depth of the bed under this point
     float bedDepth = column.bufDepth;
-    if (ocean.HeightmapSRV != 0)
+    if (ocean.TerrainPages != 0)
     {
-        Texture2D<float> heightmap = ResourceDescriptorHeap[ocean.HeightmapSRV];
         float2 uv = clamp((worldPos.xz - float2(ocean.TerrainOriginX, ocean.TerrainOriginZ))
                           / float2(ocean.TerrainSizeX, ocean.TerrainSizeZ), 0.002, 0.998);
-        bedDepth = worldPos.y - (ocean.TerrainBaseY + OceanTerrainHeight01(heightmap, OceanSampler, uv, 0) * ocean.MaxTerrainHeight);
+        bedDepth = worldPos.y - (ocean.TerrainBaseY + OceanTerrainHeight01(ocean.TerrainPages, uv) * ocean.MaxTerrainHeight);
     }
     float shallow = exp(-max(bedDepth, 0.0) / max(0.01, ocean.ShoreFadeDepth)) * saturate(column.pathLen);
     body += ocean.ShallowColor * (sunRadiance * saturate(L.y) + WaterSkyIrradiance(skyAmbient)) * 0.08 * shallow;

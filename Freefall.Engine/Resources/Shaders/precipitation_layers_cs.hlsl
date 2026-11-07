@@ -219,7 +219,7 @@ void CSLayers(uint3 id : SV_DispatchThreadID)
     s.Eye = CamPos.xz;
     s.MinY = P.ShelterMinY;
     s.RangeY = P.ShelterRangeY;
-    s.TerrainHeightmap = 0;
+    s.TerrainPages = 0;
     s.TerrainMaxHeight = 0;
     s.TerrainOrigin = 0;
     s.TerrainSize = 1;

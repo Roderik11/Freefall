@@ -5,24 +5,26 @@
 #ifndef GROUND_SHAPE_HLSLI
 #define GROUND_SHAPE_HLSLI
 
-// How far the ground at 'uv' lies below (+) or above (-) its surroundings, in metres: the mean height of a ring
-// of four points 'radius' texels away minus the height here. Hollows and gullies come out positive, ridges negative.
-float GroundCavity(Texture2D heightTex, SamplerState samp, float2 uv, float texel, float maxHeight, float radius)
+#include "terrain_pages.hlsli"
+
+// How far the ground at a place lies below (+) or above (-) its surroundings, in metres: the mean height of a ring
+// of four points 'radius' samples away minus the height here. Hollows and gullies come out positive, ridges negative.
+float GroundCavity(TerrainPagesParams t, float2 worldXZ, float radius)
 {
-    float d = radius * texel;
-    float ring = heightTex.SampleLevel(samp, uv + float2(d, 0), 0).r
-               + heightTex.SampleLevel(samp, uv - float2(d, 0), 0).r
-               + heightTex.SampleLevel(samp, uv + float2(0, d), 0).r
-               + heightTex.SampleLevel(samp, uv - float2(0, d), 0).r;
-    return (ring * 0.25 - heightTex.SampleLevel(samp, uv, 0).r) * maxHeight;
+    float d = radius * t.Spacing;
+    float ring = TerrainHeight01(t, worldXZ + float2(d, 0))
+               + TerrainHeight01(t, worldXZ - float2(d, 0))
+               + TerrainHeight01(t, worldXZ + float2(0, d))
+               + TerrainHeight01(t, worldXZ - float2(0, d));
+    return (ring * 0.25 - TerrainHeight01(t, worldXZ)) * t.MaxHeight;
 }
 
-// Rings at ~6 m (gullies, crevices in rock) and ~24 m (hollows between hills), with a 1 m texel; about +-1 for a
-// metre or two of relief
-float GroundShape(Texture2D heightTex, SamplerState samp, float2 uv, float texel, float maxHeight)
+// Rings at ~6 m (gullies, crevices in rock) and ~24 m (hollows between hills), with a 1 m sample spacing; about +-1 for
+// a metre or two of relief
+float GroundShape(TerrainPagesParams t, float2 worldXZ)
 {
-    return GroundCavity(heightTex, samp, uv, texel, maxHeight, 6.0) * 0.8
-         + GroundCavity(heightTex, samp, uv, texel, maxHeight, 24.0) * 0.25;
+    return GroundCavity(t, worldXZ, 6.0) * 0.8
+         + GroundCavity(t, worldXZ, 24.0) * 0.25;
 }
 
 // Colour multiplier for a GroundShape value: hollows collect shade, damp and soil and read darker and lusher, ridges

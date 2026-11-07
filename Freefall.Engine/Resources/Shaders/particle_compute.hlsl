@@ -40,7 +40,7 @@ cbuffer ParticleFrame : register(b1)
     row_major float4x4 ShelterViewProjection;   // world -> the sky captures' top-down slice (SkyCapture.Shelter)
     uint ShelterDepthIdx;                       // Texture2DArray<float>: the captures' depth; 0 = not drawn yet
     uint ShelterSlice;
-    uint TerrainHeightmapIdx;                   // the terrain's baked heights (sky_visibility.hlsli TerrainCover); 0 = none
+    uint TerrainPagesIdx;                   // the terrain's baked heights (sky_visibility.hlsli TerrainCover); 0 = none
     float TerrainMaxHeight;
     float3 TerrainOrigin;
     float _framePad0;
@@ -435,15 +435,12 @@ bool SurfaceUnderSky(float2 xz, out float height)
 {
     height = -1e9;
     bool found = false;
-    if (TerrainHeightmapIdx != 0)
+    if (TerrainPagesIdx != 0)
     {
-        Texture2D<float> heights = ResourceDescriptorHeap[TerrainHeightmapIdx];
         float2 uv = (xz - TerrainOrigin.xz) / TerrainSize;
         if (all(uv >= 0.0) && all(uv <= 1.0))
         {
-            uint hmW, hmH;
-            heights.GetDimensions(hmW, hmH);
-            height = TerrainOrigin.y + heights.SampleLevel(LinearClampSampler, TerrainHeightUV(uv, float2(hmW, hmH)), 0) * TerrainMaxHeight;
+            height = TerrainHeight(LoadTerrain(TerrainPagesIdx), xz);
             found = true;
         }
     }
@@ -573,7 +570,7 @@ bool UnderCover(float3 p)
     c.ShelterVP = ShelterViewProjection;
     c.ShelterDepth = ShelterDepthIdx;
     c.ShelterSlice = ShelterSlice;
-    c.TerrainHeightmap = TerrainHeightmapIdx;
+    c.TerrainPages = TerrainPagesIdx;
     c.TerrainMaxHeight = TerrainMaxHeight;
     c.TerrainOrigin = TerrainOrigin;
     c.TerrainSize = TerrainSize;

@@ -155,7 +155,7 @@ namespace Freefall.Graphics
         {
             public Matrix4x4 CollisionViewProjection;   // the one the depth G-buffer was drawn with
             public Matrix4x4 ShelterViewProjection;     // SkyCapture.Shelter: world → the top-down capture
-            public uint ShelterDepth, ShelterSlice, TerrainHeightmap; public float TerrainMaxHeight;
+            public uint ShelterDepth, ShelterSlice, TerrainPages; public float TerrainMaxHeight;
             public Vector3 TerrainOrigin; public float _pad0;
             public Vector2 TerrainSize; public Vector2 _pad1;
         }
@@ -826,7 +826,7 @@ namespace Freefall.Graphics
                         ShelterViewProjection = shelter.VP,
                         ShelterDepth = shelter.Depth,
                         ShelterSlice = shelter.Slice,
-                        TerrainHeightmap = terrain.Heightmap,
+                        TerrainPages = terrain.Pages,
                         TerrainMaxHeight = terrain.MaxHeight,
                         TerrainOrigin = terrain.Origin,
                         TerrainSize = terrain.Size,

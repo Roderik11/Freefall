@@ -1067,7 +1067,7 @@ namespace Freefall.Graphics
                  ShadowBudget = (uint)Math.Clamp(Engine.Settings.MaxShadowedPointLights, 0, LocalShadows.MaxLights),
                  Frame = _lightFrame,
                  Lamps = Daylight.Lamps,
-                 TerrainHeightmap = terrain.Heightmap,
+                 TerrainPages = terrain.Pages,
                  TerrainMaxHeight = terrain.MaxHeight,
                  TerrainOrigin = terrain.Origin,
                  TerrainSize = terrain.Size,

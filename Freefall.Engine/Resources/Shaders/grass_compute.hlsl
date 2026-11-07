@@ -32,7 +32,7 @@ cbuffer PushConstants : register(b3)
     uint DecoratorSlotsIdx;         // slot 0  — SRV
     uint LODTableIdx;               // slot 1  — SRV
     uint MeshRegistryIdx;           // slot 2  — SRV
-    uint HeightmapIdx;              // slot 3  — SRV
+    uint TerrainPagesIdx;           // slot 3  — this terrain's TerrainPagesParams (terrain_pages.hlsli): its heights
     uint DecoControlIdx;            // slot 4  — SRV
     uint BakedNormalIdx;            // slot 5  — SRV
     uint BakedNormalUAVIdx;         // slot 6  — UAV (bake kernel)
@@ -415,20 +415,20 @@ float2 hash22(float2 p)
 [numthreads(8, 8, 1)]
 void CS_BakeTerrainNormals(uint3 dtid : SV_DispatchThreadID)
 {
-    Texture2D heightTex = ResourceDescriptorHeap[HeightmapIdx];
+    TerrainPagesParams pages = LoadTerrain(TerrainPagesIdx);
     RWTexture2D<float2> normalOut = ResourceDescriptorHeap[BakedNormalUAVIdx];
 
     uint hmW = HeightmapSize.x;
     uint hmH = HeightmapSize.y;
     if (dtid.x >= hmW || dtid.y >= hmH) return;
 
-    float2 uv = (float2(dtid.xy) + 0.5) / float2(hmW, hmH);
-    float texelStep = 1.0 / float(hmW);
-
-    float hL = heightTex.SampleLevel(HeightSampler, uv + float2(-texelStep, 0), 0).r;
-    float hR = heightTex.SampleLevel(HeightSampler, uv + float2( texelStep, 0), 0).r;
-    float hD = heightTex.SampleLevel(HeightSampler, uv + float2(0, -texelStep), 0).r;
-    float hU = heightTex.SampleLevel(HeightSampler, uv + float2(0,  texelStep), 0).r;
+    // Normal texel i is height sample i; its neighbours a sample either side, clamped to the terrain's edges (they
+    // wrapped round to the far edge before the pool, the sampler being a wrapping one)
+    int2 i = int2(dtid.xy);
+    float hL = TerrainSample01(pages, i + int2(-1, 0));
+    float hR = TerrainSample01(pages, i + int2( 1, 0));
+    float hD = TerrainSample01(pages, i + int2(0, -1));
+    float hU = TerrainSample01(pages, i + int2(0,  1));
 
     // Central difference spans two samples (hL-hR, hD-hU). Normal texel i is height sample i (terrain_grid.hlsli)
     float texelWorldSize = TerrainSize.x / float(hmW - 1);
@@ -559,9 +559,9 @@ void CS_SpawnInstances(uint3 gid : SV_GroupID, uint3 gtid3 : SV_GroupThreadID)
         // decorator; two cells of slack cover the slope across the cell.
         if (tileValid)
         {
-            Texture2D heightTex2 = ResourceDescriptorHeap[HeightmapIdx];
+            TerrainPagesParams cellPages = LoadTerrain(TerrainPagesIdx);
             float2 cellLocal = (float2(cellX, cellZ) + 0.5) * ts;
-            float h = heightTex2.SampleLevel(HeightSampler, cellLocal / TerrainSize, 0).r * MaxHeight;
+            float h = TerrainHeight01AtSample(cellPages, cellLocal / cellPages.Spacing) * MaxHeight;
             if (!CellInFrustum(float3(cellLocal.x, h + 0.5 * DecoReach, cellLocal.y), 2.0 * ts + DecoReach))
                 tileValid = false;
             else if (HiZSrvIdx != 0 && IsCellOccluded(float3(cellLocal.x, h, cellLocal.y), ts * 0.707 + MaxHeight * 0.05))
@@ -692,7 +692,7 @@ void CS_SpawnInstances(uint3 gid : SV_GroupID, uint3 gtid3 : SV_GroupThreadID)
     RWByteAddressBuffer instCounter = ResourceDescriptorHeap[InstanceCounterUAVIdx];
     uint maxInst = MaxInstances;
 
-    Texture2D heightTex = ResourceDescriptorHeap[HeightmapIdx];
+    TerrainPagesParams pages = LoadTerrain(TerrainPagesIdx);
     Texture2D<float2> bakedNormals = ResourceDescriptorHeap[BakedNormalIdx];
 
     // All of the cell's candidates as one list, 64 threads over it. One pass per variant left most threads idle in
@@ -792,8 +792,8 @@ void CS_SpawnInstances(uint3 gid : SV_GroupID, uint3 gtid3 : SV_GroupThreadID)
             if (TerrainHoleAt(HoleTexIdx, ClampSampler, localXZ, TerrainSize)) continue;
 
             // ── Heightmap sample ──
-            float2 heightUV = TerrainHeightUV(texelUV, float2(HeightmapSize));     // the height grid (and the normals')
-            float h = heightTex.SampleLevel(HeightSampler, heightUV, 0).r;
+            float2 heightUV = TerrainHeightUV(texelUV, float2(HeightmapSize));     // the baked normals' texel of the place
+            float h = TerrainHeight01AtSample(pages, texelUV * (float)pages.Cells);
             float3 instancePos = float3(wx, TerrainOrigin.z + h * MaxHeight, wz);
 
             // Distance cull (squared — avoids sqrt for rejected instances)
@@ -882,7 +882,7 @@ void CS_SpawnInstances(uint3 gid : SV_GroupID, uint3 gtid3 : SV_GroupThreadID)
             float3 groundTint = 1.0.xxx;
             if (SplatLayerCount > 0 && SplatControlIdx != 0 && LayerPlantTintIdx != 0)
                 groundTint = LayerPlantTint(float2(texelUV.x, 1.0 - texelUV.y));
-            groundTint *= GroundShapeTint(GroundShape(heightTex, ClampSampler, heightUV, 1.0 / float(HeightmapSize.x), MaxHeight),
+            groundTint *= GroundShapeTint(GroundShape(pages, pages.Origin.xz + texelUV * pages.Size),
                                           smoothstep(0.7, 0.9, terrainNormal.y));
             groundTint *= SwardGrain(localXZ);       // the sward's grain, as the ground under it from afar
 

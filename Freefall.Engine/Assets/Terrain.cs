@@ -310,11 +310,14 @@ namespace Freefall.Assets
             TerrainSize.X == TerrainSize.Y && MathF.Abs(PatchQuads * VertexSpacing * (1 << QuadtreeDepth) - TerrainSize.X) < 1e-3f;
 
         /// <summary>
-        /// GPU-baked heightmap texture (runtime only, regenerated from the height stamps in the scene).
+        /// The baked heights on the GPU: pages in one array (terrain_pages.hlsli, TERRAIN_PAGES_PLAN.md 4a; until
+        /// 2026-11-07 the flat BakedHeightmap texture). Runtime only, kept with the asset as that texture was, so a scene
+        /// reloaded with the same stamps keeps its heights without a bake (TerrainRenderer.KeepsHeights). Made by the
+        /// renderer's baker (TerrainBaker.AttachPool).
         /// </summary>
         [Reflection.DontSerialize]
         [JsonIgnore]
-        public Texture BakedHeightmap;
+        internal Graphics.HeightPool? HeightPool;
 
         /// <summary>
         /// Serialized GUID reference to the saved baked heightmap DDS subasset.
@@ -347,14 +350,6 @@ namespace Freefall.Assets
         [Reflection.DontSerialize]
         [JsonIgnore]
         internal byte[] PendingBakedHeightmapBytes;
-
-        /// <summary>
-        /// The final heightmap. All consumers (renderer, physics, decorators) should read this.
-        /// Null until the first bake (or cache upload) has run.
-        /// </summary>
-        [Reflection.DontSerialize]
-        [JsonIgnore]
-        public Texture Heightmap => BakedHeightmap;
 
         // ── Terrain dimensions ──
         public Vector2 TerrainSize = new(1700, 1700);

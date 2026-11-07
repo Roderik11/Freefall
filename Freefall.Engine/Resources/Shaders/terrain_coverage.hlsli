@@ -8,6 +8,7 @@
 #define TERRAIN_COVERAGE_HLSLI
 
 #include "terrain_grid.hlsli"
+#include "terrain_pages.hlsli"
 
 // A SplatStamp or DecoStamp as the GPU sees it (matches C# CoverageStampGPU, 116 bytes)
 struct CoverageStamp
@@ -107,25 +108,20 @@ float CoverageTerrainFilter(CoverageStamp s, float heightNorm, float slopeDeg, f
     return m;
 }
 
-// Normalized height and slope in degrees at a terrain UV. The one definition of slope for terrain
-// filters: central differences over two height samples, as gputerrain.fx GetNormal.
-void SampleTerrainHeightSlope(Texture2D heightTex, SamplerState samp, float2 terrainUV,
-                              float maxHeight, float terrainSizeX,
-                              out float heightNorm, out float slopeDeg)
+// Normalized height and slope in degrees at a terrain UV, from the terrain's pages (terrain_pages.hlsli). The one
+// definition of slope for terrain filters: central differences over two height samples, as gputerrain.fx GetNormal.
+void SampleTerrainHeightSlope(TerrainPagesParams t, float2 terrainUV, out float heightNorm, out float slopeDeg)
 {
-    uint hmW, hmH;
-    heightTex.GetDimensions(hmW, hmH);
-    float texel = 1.0 / float(hmW);
-    float2 uv = TerrainHeightUV(terrainUV, float2(hmW, hmH));
+    float2 s = terrainUV * (float)t.Cells;
 
-    heightNorm = heightTex.SampleLevel(samp, uv, 0).r;
+    heightNorm = TerrainHeight01AtSample(t, s);
 
-    float hS = heightTex.SampleLevel(samp, uv + float2(0, -texel), 0).r;
-    float hW = heightTex.SampleLevel(samp, uv + float2(-texel, 0), 0).r;
-    float hE = heightTex.SampleLevel(samp, uv + float2(texel, 0), 0).r;
-    float hN = heightTex.SampleLevel(samp, uv + float2(0, texel), 0).r;
+    float hS = TerrainHeight01AtSample(t, s + float2(0, -1));
+    float hW = TerrainHeight01AtSample(t, s + float2(-1, 0));
+    float hE = TerrainHeight01AtSample(t, s + float2(1, 0));
+    float hN = TerrainHeight01AtSample(t, s + float2(0, 1));
 
-    float heightScale = maxHeight / (2.0 * terrainSizeX / float(hmW - 1));
+    float heightScale = t.MaxHeight / (2.0 * t.Spacing);
 
     float3 n = normalize(float3((hW - hE) * heightScale, 1.0, (hS - hN) * heightScale));
     slopeDeg = acos(saturate(n.y)) * (180.0 / 3.14159265);

@@ -76,7 +76,6 @@ struct Instance
     uint   TintBuffer;        //= 0        -- The terrain's decorator far colours, TerrainRenderer.DecoratorTintSrv (set by CropCanopy)
     uint   Group;             //= 0        -- The crop decorator's slot on the terrain (set by CropCanopy)
     float2 TerrainCorner;     //= 0, 0     -- World XZ of the terrain's corner (set by CropCanopy)
-    uint   Heightmap;         //= 0        -- The terrain's heightmap (set by CropCanopy)
     float2 TerrainSize;       //= 4096, 4096 -- The terrain's size, m (set by CropCanopy)
     float  MaxHeight;         //= 600      -- The terrain's height range, m (set by CropCanopy)
     float2 RowAcross;         //= 0, 0     -- Unit vector across the way the field was sown, rows or not (set by CropCanopy)
@@ -271,31 +270,28 @@ Fetched FetchVertex(uint primitiveVertexID, InstanceDescriptor desc)
     return f;
 }
 
-// The ground's slope at a height map UV over 'reach' height samples either side (central differences, as
+// The ground's slope at a place given in height samples, over 'reach' samples either side (central differences, as
 // gputerrain.fx GetNormal takes them over one): metres down per metre along x and z
-float2 GroundSlope(Texture2D heights, float2 uv, float2 texel, float reach, Instance inst)
+float2 GroundSlope(TerrainPagesParams t, float2 s, float reach)
 {
-    float2 d = texel * reach;
-    float hl = heights.SampleLevel(SamplerClamp, uv - float2(d.x, 0), 0).r;
-    float hr = heights.SampleLevel(SamplerClamp, uv + float2(d.x, 0), 0).r;
-    float hb = heights.SampleLevel(SamplerClamp, uv - float2(0, d.y), 0).r;
-    float hf = heights.SampleLevel(SamplerClamp, uv + float2(0, d.y), 0).r;
-    return float2(hl - hr, hb - hf) * inst.MaxHeight / (2.0 * reach * TerrainSampleSpacing(inst.TerrainSize, 1.0 / texel));
+    float hl = TerrainHeight01AtSample(t, s - float2(reach, 0));
+    float hr = TerrainHeight01AtSample(t, s + float2(reach, 0));
+    float hb = TerrainHeight01AtSample(t, s - float2(0, reach));
+    float hf = TerrainHeight01AtSample(t, s + float2(0, reach));
+    return float2(hl - hr, hb - hf) * t.MaxHeight / (2.0 * reach * t.Spacing);
 }
 
 // The ground under the crop: its normal, with the relief of a few metres (ridge and furrow) exaggerated, since the
 // vegetation lighting answers a third as strongly as the ground's to a turned normal; and how far the point lies
-// below (+) or above (-) the ground 3 m round it (ground_shape.hlsli GroundCavity: furrows +, crests -)
+// below (+) or above (-) the ground 3 m round it (ground_shape.hlsli GroundCavity: furrows +, crests -). From the
+// scene's terrain (SceneConstants.TerrainIdx; until 2026-11-07 a heightmap index per instance, read non-uniformly).
 float3 GroundUnderCrop(float2 local, Instance inst, out float cavity)
 {
-    Texture2D heights = ResourceDescriptorHeap[NonUniformResourceIndex(inst.Heightmap)];
-    uint w, h;
-    heights.GetDimensions(w, h);
-    float2 texel = 1.0 / float2(w, h);
-    float2 uv = TerrainHeightUV(local / inst.TerrainSize, float2(w, h));
-    float2 broad = GroundSlope(heights, uv, texel, 4.0, inst);
-    float2 fine = GroundSlope(heights, uv, texel, 1.0, inst);
-    cavity = GroundCavity(heights, SamplerClamp, uv, texel.x, inst.MaxHeight, 3.0);
+    TerrainPagesParams t = LoadTerrain(TerrainIdx);
+    float2 s = local / t.Spacing;
+    float2 broad = GroundSlope(t, s, 4.0);
+    float2 fine = GroundSlope(t, s, 1.0);
+    cavity = GroundCavity(t, t.Origin.xz + local, 3.0);
     float2 slope = broad + (fine - broad) * 2.5;
     return normalize(float3(slope.x, 1.0, slope.y));
 }
@@ -324,7 +320,7 @@ Look CanopyLook(float3 world, float3 normal, Instance inst)
     look.Standing = 1.0;
 
     // The ground's relief: the crop greener and darker in the furrows, drier and paler on the crests
-    if (inst.Heightmap != 0)
+    if (TerrainIdx != 0)
     {
         float cavity;
         float3 ground = GroundUnderCrop(local, inst, cavity);

@@ -83,11 +83,12 @@ cbuffer TerrainParams : register(b2)
     float3 RootExtents;    uint  TotalNodes;
     float2 TerrainSize;    float PixelErrorThreshold;  float ScreenHeight;
     float  TanHalfFov;     uint  TransformSlot;         uint  MaterialId;     uint  MeshPartId;
-    uint   MaxPatches;     uint  HeightTexIdx;           uint  FrameTag;    uint WalkCapacity;   // FrameTag: MarkSplit
+    uint   MaxPatches;     uint  TerrainPagesIdx;        uint  FrameTag;    uint WalkCapacity;   // FrameTag: MarkSplit; TerrainPagesIdx: terrain_pages.hlsli
     uint   ShadowReceiversIdx;  uint3 _terrainPad2;     // shadow pass: this frame's sun shadow receivers, 0 = no test
 };
 
 #include "shadow_receivers.hlsli"
+#include "terrain_pages.hlsli"
 
 // Sampler for height texture reads
 SamplerState sampHeightCS : register(s2);
@@ -620,15 +621,15 @@ void CSBuildMinMaxMip(uint3 dtid : SV_DispatchThreadID)
         // 2026-10-24 a 4x4 grid of samples over the ~32x32: a crest between them stood outside the node's bounding
         // sphere, which the frustum, Hi-Z and shadow receiver tests all trust. Built once per height bake, so reading
         // them all costs nothing per frame.
-        Texture2D<float> heightTex = ResourceDescriptorHeap[HeightTexIdx];
+        // The samples come from the terrain's pages (terrain_pages.hlsli, TERRAIN_PAGES_PLAN.md 4a)
+        TerrainPagesParams pages = LoadTerrain(TerrainPagesIdx);
         float maxH = MaxHeight;
-        uint hmW, hmH;
-        heightTex.GetDimensions(hmW, hmH);
+        int cells = (int)pages.Cells;
 
         float2 uvMin = float2(dtid.xy) / float2(outW, outH);
         float2 uvMax = float2(dtid.xy + 1) / float2(outW, outH);
-        int2 lo = clamp(int2(floor(uvMin * float2(hmW - 1, hmH - 1))), int2(0, 0), int2(hmW - 1, hmH - 1));
-        int2 hi = clamp(int2(ceil(uvMax * float2(hmW - 1, hmH - 1))), int2(0, 0), int2(hmW - 1, hmH - 1));
+        int2 lo = clamp(int2(floor(uvMin * cells)), 0, cells);
+        int2 hi = clamp(int2(ceil(uvMax * cells)), 0, cells);
 
         float hMin = 1e30;
         float hMax = -1e30;
@@ -636,7 +637,7 @@ void CSBuildMinMaxMip(uint3 dtid : SV_DispatchThreadID)
         {
             for (int tx = lo.x; tx <= hi.x; tx++)
             {
-                float h = heightTex.Load(int3(tx, ty, 0)) * maxH;
+                float h = TerrainSample01(pages, int2(tx, ty)) * maxH;
                 hMin = min(hMin, h);
                 hMax = max(hMax, h);
             }

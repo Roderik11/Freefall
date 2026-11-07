@@ -5,22 +5,21 @@
 #define SKY_VISIBILITY_HLSLI
 
 #include "terrain_grid.hlsli"
+#include "terrain_pages.hlsli"
 
-// The terrain's baked heightmap (R16, 0 = no terrain) and where it lies
+// The terrain's heights (its TerrainPagesParams, terrain_pages.hlsli; 0 = no terrain) and where it lies
 struct TerrainCover
 {
-    uint Heightmap;
+    uint Pages;
     float MaxHeight;        // metres at 1
     float3 Origin;          // world position of the terrain's corner (y = its base)
     float2 Size;            // metres it spans in x and z
 };
 
+// The ground's world Y at a place, from the terrain's pages (the sampler is no longer used: kept for the callers)
 float TerrainHeightAt(TerrainCover t, SamplerState linearClamp, float2 xz)
 {
-    Texture2D<float> heights = ResourceDescriptorHeap[t.Heightmap];
-    uint w, h;
-    heights.GetDimensions(w, h);
-    return t.Origin.y + heights.SampleLevel(linearClamp, TerrainHeightUV((xz - t.Origin.xz) / t.Size, float2(w, h)), 0) * t.MaxHeight;
+    return TerrainHeight(LoadTerrain(t.Pages), xz);
 }
 
 // How far below the heightmap a surface may be drawn and still be the terrain's surface, not a cave: the terrain is
@@ -48,7 +47,7 @@ float3 SkyLookPoint(TerrainCover t, SamplerState linearClamp, float3 worldPos, f
 // shadow pass can miss the hill over a cave).
 float TerrainOpenAt(TerrainCover t, SamplerState linearClamp, float3 worldPos, float3 N, float tolerance)
 {
-    if (t.Heightmap == 0)
+    if (t.Pages == 0)
         return 1;
     float under;
     SkyLookPoint(t, linearClamp, worldPos, N, tolerance, under);
@@ -61,7 +60,7 @@ float TerrainOpenAt(TerrainCover t, SamplerState linearClamp, float3 worldPos, f
 // sky turned the top six metres white at an underground exposure (the Undercourt, 2026-10-31).
 float RoofedOpen(TerrainCover t, SamplerState linearClamp, float3 worldPos, float open, float meshes)
 {
-    if (t.Heightmap == 0 || open <= 0.0)
+    if (t.Pages == 0 || open <= 0.0)
         return open;
     float under = saturate(TerrainHeightAt(t, linearClamp, worldPos.xz) - worldPos.y - 0.5);
     return open * lerp(1.0, smoothstep(0.0, 0.05, meshes), under);
@@ -80,7 +79,7 @@ float SkyVisibilityParts(TerrainCover t, SamplerState linearClamp, float3 worldP
 {
     open = 1;
     portal = 0;
-    if (t.Heightmap == 0)
+    if (t.Pages == 0)
         return 1;
     float under;
     float3 p = SkyLookPoint(t, linearClamp, worldPos, N, tolerance, under);

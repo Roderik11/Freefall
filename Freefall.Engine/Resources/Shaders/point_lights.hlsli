@@ -68,7 +68,7 @@ struct PointLightFrame
     uint Frame;                             // this renderer's frame count, from 1
     float Ambient;                          // lux from the whole sky on level ground
     float Lamps;                            // Daylight.Lamps (open ground): for a lamp not judged yet (LampState.Seen 0)
-    uint TerrainHeightmap;                  // sky_visibility.hlsli: the daylight a light competes with is the sky and
+    uint TerrainPages;                  // sky_visibility.hlsli: the daylight a light competes with is the sky and
     float TerrainMaxHeight;                 // sun that reach it (a cave lamp in daytime gets its shadow); 0 = no terrain
     float3 TerrainOrigin;
     float2 TerrainSize;

@@ -72,7 +72,7 @@ namespace Freefall.Graphics
             public uint Frame;
             public float Ambient;           // lux from the whole sky on level ground
             public float Lamps;             // Daylight.Lamps: for a lamp UpdateLamps has not judged yet
-            public uint TerrainHeightmap;   // sky_visibility.hlsli: daylight reaches a light only past the terrain
+            public uint TerrainPages;   // sky_visibility.hlsli: daylight reaches a light only past the terrain
             public float TerrainMaxHeight;  // (Atmosphere.TerrainCover); 0 = no terrain
             public Vector3 TerrainOrigin;
             public Vector2 TerrainSize;

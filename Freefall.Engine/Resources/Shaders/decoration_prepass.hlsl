@@ -23,7 +23,7 @@ cbuffer PushConstants : register(b3)
     uint  ControlUAVIdx;    // slot 1 — UAV: output RWTexture2DArray<uint4>
     uint  DecoratorCount;   // slot 2 — number of decorator slots (palette size)
     uint  Resolution;       // slot 3 — control texture width/height
-    uint  HeightTexIdx;     // slot 4 — SRV: baked heightmap (0 = none: height/slope read as 0)
+    uint  TerrainPagesIdx;  // slot 4 — the terrain's TerrainPagesParams (terrain_pages.hlsli); 0 = none: height/slope read as 0
     uint  SplineBufIdx;     // slot 5 — SRV: StructuredBuffer<StampSplinePoint>
     uint  LayerCount;       // slot 6 — number of texture layers in the packed control array
     uint  ControlMapsIdx;   // slot 7 — SRV: packed layer weights (same array the surface shader samples)
@@ -54,11 +54,8 @@ void CSBuildDecoControl(uint3 dtid : SV_DispatchThreadID)
     float2 terrainUV = float2(uv.x, 1.0 - uv.y);
 
     float heightNorm = 0, slopeDeg = 0;
-    if (HeightTexIdx != 0)
-    {
-        Texture2D heightTex = ResourceDescriptorHeap[HeightTexIdx];
-        SampleTerrainHeightSlope(heightTex, ClampSampler, terrainUV, MaxHeight, TerrainSizeX, heightNorm, slopeDeg);
-    }
+    if (TerrainPagesIdx != 0)
+        SampleTerrainHeightSlope(LoadTerrain(TerrainPagesIdx), terrainUV, heightNorm, slopeDeg);
 
     // ── Layer weights from the packed control array (final splat result) ──
     // raw = the weight as painted; visible = what shows after the layers above it:

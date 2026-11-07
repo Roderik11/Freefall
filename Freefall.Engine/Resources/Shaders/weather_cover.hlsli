@@ -7,13 +7,14 @@
 #define WEATHER_COVER_HLSLI
 
 #include "terrain_grid.hlsli"
+#include "terrain_pages.hlsli"
 
 struct WeatherCover
 {
     row_major float4x4 ShelterVP;   // world -> the top-down slice's clip space (orthographic, looking down)
     uint ShelterDepth;              // Texture2DArray<float>: the sky captures' depth; 0 = not drawn yet
     uint ShelterSlice;
-    uint TerrainHeightmap;          // sky_visibility.hlsli TerrainCover: R16 heights; 0 = none
+    uint TerrainPages;          // sky_visibility.hlsli TerrainCover: R16 heights; 0 = none
     float TerrainMaxHeight;
     float3 TerrainOrigin;
     float2 TerrainSize;
@@ -22,15 +23,10 @@ struct WeatherCover
 // True where something covers the place (absolute world position) more than `bias` metres over it
 bool WeatherUnderCover(WeatherCover c, SamplerState linearClamp, float3 p, float bias)
 {
-    if (c.TerrainHeightmap != 0)
+    if (c.TerrainPages != 0)
     {
-        Texture2D<float> heights = ResourceDescriptorHeap[c.TerrainHeightmap];
         float2 uv = (p.xz - c.TerrainOrigin.xz) / c.TerrainSize;
-        uint hmW, hmH;
-        heights.GetDimensions(hmW, hmH);
-        if (all(uv >= 0.0) && all(uv <= 1.0)
-            && c.TerrainOrigin.y + heights.SampleLevel(linearClamp, TerrainHeightUV(uv, float2(hmW, hmH)), 0) * c.TerrainMaxHeight
-               > p.y + bias)
+        if (all(uv >= 0.0) && all(uv <= 1.0) && TerrainHeight(LoadTerrain(c.TerrainPages), p.xz) > p.y + bias)
             return true;
     }
     if (c.ShelterDepth != 0)
@@ -70,7 +66,7 @@ struct WeatherShelter
     float2 Eye;                     // world xz the levels are centred on (ShelterMap.EyeFor): what they blend by
     float MinY;                     // the heights the maps' 16 bits span
     float RangeY;
-    uint TerrainHeightmap;          // R16 heights; 0 = none
+    uint TerrainPages;          // R16 heights; 0 = none
     float TerrainMaxHeight;
     float3 TerrainOrigin;
     float2 TerrainSize;
@@ -217,15 +213,10 @@ void ShelterBlend(WeatherShelter s, float2 xz, out uint first, out uint second, 
 // trees inside it and snow under them past it, user 2026-10-23). The terrain covers outright.
 float WeatherOpenness(WeatherShelter s, SamplerState linearClamp, float3 p, float bias)
 {
-    if (s.TerrainHeightmap != 0)
+    if (s.TerrainPages != 0)
     {
-        Texture2D<float> heights = ResourceDescriptorHeap[s.TerrainHeightmap];
         float2 tuv = (p.xz - s.TerrainOrigin.xz) / s.TerrainSize;
-        uint hmW, hmH;
-        heights.GetDimensions(hmW, hmH);
-        if (all(tuv >= 0.0) && all(tuv <= 1.0)
-            && s.TerrainOrigin.y + heights.SampleLevel(linearClamp, TerrainHeightUV(tuv, float2(hmW, hmH)), 0) * s.TerrainMaxHeight
-               > p.y + bias)
+        if (all(tuv >= 0.0) && all(tuv <= 1.0) && TerrainHeight(LoadTerrain(s.TerrainPages), p.xz) > p.y + bias)
             return 0.0;
     }
     uint first, second;

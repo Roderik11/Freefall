@@ -41,7 +41,7 @@ struct AtmosphereParams
     float3 MoonDirection;       uint SkyViewPastMoonLut;
     float3 MoonIlluminance;     float AirglowLuminance;    // lux (phase and colour included); cd/m² of the night sky
     uint TransmittanceLut;      uint MultiScatLut;         uint SkyViewSunLut;     uint SkyViewMoonLut;
-    uint AerialPerspective;     uint Ambient;              uint TerrainHeightmap;  float TerrainMaxHeight;   // sky visibility: the terrain's baked heightmap (R16, 0 = none); metres at 1
+    uint AerialPerspective;     uint Ambient;              uint TerrainPages;  float TerrainMaxHeight;   // sky visibility: the terrain's baked heightmap (R16, 0 = none); metres at 1
     float3 TerrainOrigin;       float TerrainSizeX;        // world position of the terrain's corner (y = its base); metres it spans in x
     float TerrainSizeZ;         uint SkyCaptureViews;      uint SkyCaptureDepth;   uint SkyCaptureCount;     // sky visibility past the meshes (sky_capture.hlsli; 0 = none)
     float SkyCaptureBounce;                                // the least share of the sky a place the meshes cover keeps (light bouncing in)

@@ -109,7 +109,7 @@ TerrainCover LoadTerrainCover()
     if (AtmosphereIdx == 0)
         return t;
     AtmosphereParams A = LoadAtmosphere();
-    t.Heightmap = A.TerrainHeightmap;
+    t.Pages = A.TerrainPages;
     t.MaxHeight = A.TerrainMaxHeight;
     t.Origin = A.TerrainOrigin;
     t.Size = float2(A.TerrainSizeX, A.TerrainSizeZ);
@@ -158,7 +158,7 @@ float TerrainLightShadow(float3 worldPos, float3 toLight)
     if (y + bias >= top + 3.0)              // lit already: the heightmap can only lift it further (most of the screen)
         return 1.0;
     TerrainCover t = LoadTerrainCover();
-    if (t.Heightmap != 0)
+    if (t.Pages != 0)
     {
         float h = TerrainHeightAt(t, AtmosphereLinearClamp, worldPos.xz);
         if (h - y < TerrainTolerance(distance(worldPos, CamPos)))

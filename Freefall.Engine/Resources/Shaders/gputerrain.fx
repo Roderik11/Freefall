@@ -17,7 +17,7 @@ cbuffer PushConstants : register(b3)
     uint _reserved14;
     uint GlobalTransformBufferIdx; // 15
     uint DebugMode;             // 16
-    uint HeightTexIdx;          // 17
+    uint TerrainPagesIdx;       // 17: this terrain's TerrainPagesParams (terrain_pages.hlsli): its heights
     uint ControlMapsIdx;        // 18
     uint _reserved19;           // 19: was the layers' diffuse array (LayerTextures now)
     uint _reserved20;           // 20: was the layers' normal array
@@ -48,7 +48,6 @@ struct TerrainPatchData
 cbuffer terrain : register(b1)
 {
     float3 CameraPos;
-    float HeightTexel;  // 1 / the height map's samples: a sample's step in its UV (terrain_grid.hlsli)
     float MaxHeight;
     float BlendDepth;   // layer transition softness in weight space (Terrain.LayerBlendDepth)
     float2 TerrainSize;
@@ -112,10 +111,15 @@ float3 StitchVertex(float3 pos, float2 rect_xy, float2 rect_size, uint stitchMas
     uv.y = 1.0 - uv.y;
     outHeightUV = rect_xy + uv * rect_size;
 
-    // Sample height: outHeightUV is the terrain UV (paint is read there too); the vertex's own sample is at
-    // TerrainHeightUV of it, so every vertex of a leaf patch lands on a sample
-    Texture2D HeightTex = ResourceDescriptorHeap[HeightTexIdx];
-    float h = HeightTex.SampleLevel(sampHeightFilter, TerrainHeightUV(outHeightUV, 1.0 / HeightTexel), 0).r * MaxHeight;
+    // Sample height: outHeightUV is the terrain UV (paint is read there too). Every vertex of a patch lies on a sample
+    // (terrain_grid.hlsli), so it reads that sample: within a thousandth of one, the place is taken as on it, as the
+    // texture filter's 8-bit weights took it before the pool
+    TerrainPagesParams pages = LoadTerrain(TerrainPagesIdx);
+    float2 s = outHeightUV * (float)pages.Cells;
+    float2 onSample = round(s);
+    if (all(abs(s - onSample) < 1e-3))
+        s = onSample;
+    float h = TerrainHeight01AtSample(pages, s) * MaxHeight;
 
     float3 result;
     result.xz = gridPos - float2(16, 16);
@@ -226,17 +230,16 @@ struct FragmentOutput
 float3 GetNormal(float2 terrainUV)
 {
 	float4 h;
-	Texture2D HeightTex = ResourceDescriptorHeap[HeightTexIdx];
-    float2 uv = TerrainHeightUV(terrainUV, 1.0 / HeightTexel);
+    TerrainPagesParams pages = LoadTerrain(TerrainPagesIdx);
+    float2 s = terrainUV * (float)pages.Cells;
 
-    h[0] = HeightTex.SampleLevel(sampHeightFilter, uv + float2(0, -HeightTexel), 0).r;
-    h[1] = HeightTex.SampleLevel(sampHeightFilter, uv + float2(-HeightTexel, 0), 0).r;
-    h[2] = HeightTex.SampleLevel(sampHeightFilter, uv + float2(HeightTexel, 0), 0).r;
-    h[3] = HeightTex.SampleLevel(sampHeightFilter, uv + float2(0, HeightTexel), 0).r;
+    h[0] = TerrainHeight01AtSample(pages, s + float2(0, -1));
+    h[1] = TerrainHeight01AtSample(pages, s + float2(-1, 0));
+    h[2] = TerrainHeight01AtSample(pages, s + float2(1, 0));
+    h[3] = TerrainHeight01AtSample(pages, s + float2(0, 1));
 
     // Central difference spans two samples (h[1]-h[2], h[0]-h[3])
-    float texelWorldSize = TerrainSampleSpacing(TerrainSize, 1.0 / HeightTexel).x;
-    float heightScale = MaxHeight / (2.0 * texelWorldSize);
+    float heightScale = MaxHeight / (2.0 * pages.Spacing);
     
 	float3 n;
 	n.z = (h[0] - h[3]) * heightScale;
@@ -806,9 +809,8 @@ FragmentOutput PS(VertexOutput input)
     color.rgb *= lerp(1.0.xxx, variation, macroReach);
 
     // The shape of the land in its colour (ground_shape.hlsli; the grass standing here takes the same tint)
-    Texture2D HeightTex = ResourceDescriptorHeap[HeightTexIdx];
-    color.rgb *= GroundShapeTint(GroundShape(HeightTex, sampHeightFilter, TerrainHeightUV(input.UV2, 1.0 / HeightTexel),
-                                             HeightTexel, MaxHeight), growing);
+    TerrainPagesParams pages = LoadTerrain(TerrainPagesIdx);
+    color.rgb *= GroundShapeTint(GroundShape(pages, pages.Origin.xz + input.UV2 * pages.Size), growing);
     output.Albedo = float4(color.rgb, 0);
     output.Normals = float4(terrainNormal.xyz, 1);
     output.Data = float4(0.95, 0.0, 1.0, lerp(1.0, 0.5, swardLighting)); // matte, metal 0, ao 1, lit: PBR .. vegetation

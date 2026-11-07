@@ -1,72 +1,90 @@
-// terrain_height_bake.hlsl — Composites the terrain's height stamps into a final R16_UNorm heightmap.
+// terrain_height_bake.hlsl — Composites the terrain's height stamps into the terrain's height pool (R16_UNorm pages).
 //
-// TerrainBaker walks the height stamps in priority order and dispatches one kernel per step:
+// TerrainBaker walks the height stamps in priority order and dispatches one kernel per step and page:
 //   CS_InfluenceLayer  a run of HeightStamps (flatten / heightmap pattern, radial or spline)
 //   CS_ImportLayer     a global HeightStamp with a heightmap (whole-terrain import)
 //   CS_NoiseLayer      a HeightNoiseStamp
-// CS_Clear zeroes the heightmap first.
+// CS_Clear zeroes the page first. CS_CompareReads is a check (TerrainBaker.CompareReads).
 //
-// Every kernel bakes a box of the terrain's grid (RegionX/Y/W/H), page by page (TERRAIN_PAGES_PLAN.md stage 3): a
-// sample is a function of the stamps and of its integer index in the grid alone, never of the box it was baked in,
-// so a page baked on its own equals the same samples of a whole bake to the bit. No kernel reads a neighbour.
+// Every kernel bakes a box of the terrain's grid (RegionX/Y/W/H), a page with its border (TERRAIN_PAGES_PLAN.md stages 3
+// and 4a): a sample is a function of the stamps and of its integer index in the grid alone, never of the box it was
+// baked in, so a page baked on its own equals the same samples of a whole bake to the bit, and a page's border equals
+// its neighbour's samples. No kernel reads a neighbour. Sample s is written at pool texel s + (OutX, OutY) of OutSlice.
 //
-// Uses push constants (b3) matching engine convention.
+// Uses push constants (b3) matching engine convention; a step's parameters are in the plan's step buffer.
 
 #pragma kernel CS_ImportLayer
 #pragma kernel CS_Clear
 #pragma kernel CS_NoiseLayer
 #pragma kernel CS_InfluenceLayer
+#pragma kernel CS_CompareReads
 
 // Push constants (root parameter 0, register b3) — bindless indices + params
 cbuffer PushConstants : register(b3)
 {
-    uint SourceIdx;          // 0  SRV: the imported heightmap (import)
-    uint OutputIdx;          // 1  UAV: the heightmap, RWTexture2D<float>
-    uint StampBufIdx;        // 2  SRV: StructuredBuffer<HeightStampDescriptor>, every descriptor of the bake (influence)
-    uint StampListIdx;       // 3  SRV: StructuredBuffer<uint>, the pages' stamp lists (influence)
-    uint SplineBufIdx;       // 4  SRV: StructuredBuffer<StampSplinePoint> (influence)
-    uint ListStart;          // 5  this page's stamps of this run: list entries ListStart .. ListStart + ListCount
-    uint ListCount;          // 6
-    uint BlendMode;          // 7  0=Set, 1=Add, 2=Max, 3=Lerp, 4=Min (import, noise)
-    float Opacity;           // 8  step opacity [0..1] (import, noise)
+    uint OutputIdx;          // 0  UAV: the height pool, RWTexture2DArray<float>
+    uint StampBufIdx;        // 1  SRV: StructuredBuffer<HeightStampDescriptor>, every descriptor of the bake (influence)
+    uint StampListIdx;       // 2  SRV: StructuredBuffer<uint>, the pages' stamp lists (influence)
+    uint SplineBufIdx;       // 3  SRV: StructuredBuffer<StampSplinePoint> (influence)
+    uint StepBufIdx;         // 4  SRV: StructuredBuffer<BakeStep>, the plan's steps (import, noise)
+    uint StepIndex;          // 5  this dispatch's step in it
+    uint ListStart;          // 6  this page's stamps of this run: list entries ListStart .. ListStart + ListCount
+    uint ListCount;          // 7
 
-    uint RegionX;            // 9  the box baked: its first sample in the terrain's grid and its size, in samples
-    uint RegionY;            // 10
-    uint RegionW;            // 11
-    uint RegionH;            // 12
-    uint GridSamples;        // 13 samples across the terrain (N): sample i at terrain UV i / (N - 1)
-    float OriginX;           // 14 world X and Z of sample (0, 0), metres
-    float OriginZ;           // 15
-    float Spacing;           // 16 metres between samples (Terrain.VertexSpacing)
+    int  RegionX;            // 8  the box baked: its first sample in the terrain's grid (before the terrain, in a border)
+    int  RegionY;            // 9
+    uint RegionW;            // 10 and its size, in samples
+    uint RegionH;            // 11
+    int  OutX;               // 12 sample s is written at pool texel s + (OutX, OutY) of slice OutSlice
+    int  OutY;               // 13
+    uint OutSlice;           // 14
 
-    // ── Import (CS_ImportLayer) ──
-    float ImportScale;       // 17 the source's value times this, plus ImportBias (both normalized to MaxHeight)
-    float ImportBias;        // 18
-    float ImportMinX;        // 19 world X and Z where the source's first sample lies, metres
-    float ImportMinZ;        // 20
-    float ImportInvSizeX;    // 21 1 / the metres from its first sample to its last
-    float ImportInvSizeZ;    // 22
+    uint GridSamples;        // 15 samples across the terrain (N): sample i at terrain UV i / (N - 1)
+    float OriginX;           // 16 world X and Z of sample (0, 0), metres
+    float OriginZ;           // 17
+    float Spacing;           // 18 metres between samples (Terrain.VertexSpacing)
 
-    // ── Noise (CS_NoiseLayer) ──
-    uint NoiseLUTIdx;        // 23 SRV: the tileable noise LUT
-    uint NoiseType;          // 24 0=Simplex, 1=Perlin, 2=Ridged, 3=Billow
-    uint Octaves;            // 25 number of fBm octaves
-    float Frequency;         // 26 LUT units per metre: 1 / (16 x HeightNoiseStamp.FeatureSize)
-    float Amplitude;         // 27 output amplitude, normalized to MaxHeight
-    float Lacunarity;        // 28 per-octave frequency multiplier
-    float Persistence;       // 29 per-octave amplitude decay
-    float OffsetX;           // 30 metres the pattern is panned by
-    float OffsetZ;           // 31
-    uint NoiseSeed;          // 32 seed for noise permutation
-    uint TerraceSteps;       // 33 0=disabled, N = number of terrace shelves
-    float TerraceSmoothness; // 34 0=sharp, 1=fully rounded transitions
-    float MaskCenterX;       // 35 world X and Z of the radial mask's centre, metres
-    float MaskCenterZ;       // 36
-    float MaskRadius;        // 37 metres, 0 = no mask (the whole terrain)
-    float MaskFalloff;       // 38 mask edge falloff exponent
+    float ClearValue;        // 19 what CS_Clear writes: 0 for a bake (TerrainBaker.CheckPageBake fills with another)
+    uint NoiseLUTIdx;        // 20 SRV: the tileable noise LUT
 
-    float ClearValue;        // 39 what CS_Clear writes: 0 for a bake (TerrainBaker.CheckPageBake fills with another)
+    // ── CS_CompareReads (TerrainBaker.CompareReads): terrain_pages.hlsli's reads, for the CPU to check ──
+    uint TerrainParamsIdx;   // 21 StructuredBuffer<TerrainPagesParams>
+    uint CompareUAVIdx;      // 22 UAV: RWStructuredBuffer<float4> (height, 0, x, z)
+    uint CompareCount;       // 23
 };
+
+// One step of the plan (C# TerrainBaker.HeightStepGPU), 96 bytes
+struct BakeStep
+{
+    uint   BlendMode;          // 0=Set, 1=Add, 2=Max, 3=Lerp, 4=Min
+    float  Opacity;            // [0..1]
+    // Import (CS_ImportLayer)
+    uint   Source;             // SRV: the imported heightmap
+    float  ImportScale;        // the source's value times this, plus ImportBias (both normalized to MaxHeight)
+    float  ImportBias;
+    float2 ImportMin;          // world X and Z where the source's first sample lies, metres
+    float2 ImportInvSize;      // 1 / the metres from its first sample to its last
+    // Noise (CS_NoiseLayer)
+    uint   NoiseType;          // 0=Simplex, 1=Perlin, 2=Ridged, 3=Billow
+    uint   Octaves;            // number of fBm octaves
+    float  Frequency;          // LUT units per metre: 1 / (16 x HeightNoiseStamp.FeatureSize)
+    float  Amplitude;          // output amplitude, normalized to MaxHeight
+    float  Lacunarity;         // per-octave frequency multiplier
+    float  Persistence;        // per-octave amplitude decay
+    float2 Offset;             // metres the pattern is panned by
+    uint   Seed;               // seed for noise permutation
+    uint   TerraceSteps;       // 0=disabled, N = number of terrace shelves
+    float  TerraceSmoothness;  // 0=sharp, 1=fully rounded transitions
+    float2 MaskCenter;         // world X and Z of the radial mask's centre, metres
+    float  MaskRadius;         // metres, 0 = no mask (the whole terrain)
+    float  MaskFalloff;        // mask edge falloff exponent
+};
+
+BakeStep LoadStep()
+{
+    StructuredBuffer<BakeStep> steps = ResourceDescriptorHeap[StepBufIdx];
+    return steps[StepIndex];
+}
 
 SamplerState sampLinear : register(s0);
 
@@ -85,23 +103,31 @@ float Blend(float prev, float value, uint mode, float opacity)
 }
 
 #include "terrain_grid.hlsli"
+#include "terrain_pages.hlsli"
 
-// The sample this thread bakes: its index in the terrain's grid. False past the box.
-bool RegionSample(uint3 dtid, out uint2 sid)
+// The sample this thread bakes: its index in the terrain's grid (negative in the border before the terrain). False past
+// the box.
+bool RegionSample(uint3 dtid, out int2 sid)
 {
-    sid = uint2(RegionX, RegionY) + dtid.xy;
+    sid = int2(RegionX, RegionY) + int2(dtid.xy);
     return dtid.x < RegionW && dtid.y < RegionH;
+}
+
+// Where sample s of this page is written in the pool
+uint3 OutTexel(int2 sid)
+{
+    return uint3(uint2(sid + int2(OutX, OutY)), OutSlice);
 }
 
 // The terrain UV of height sample (x, y): one sample on every vertex, sample i at i / (N - 1), the first and the last on
 // the terrain's edges (terrain_grid.hlsli). Until 2026-11-07, (i + 0.5) / N, between the vertices.
-float2 SampleTerrainUV(uint2 sid)
+float2 SampleTerrainUV(int2 sid)
 {
     return float2(sid) / float(GridSamples - 1);
 }
 
 // The world X, Z of height sample (x, y), metres: from its integer index, so every box computes it alike
-float2 SampleWorldXZ(uint2 sid)
+float2 SampleWorldXZ(int2 sid)
 {
     return float2(OriginX, OriginZ) + float2(sid) * Spacing;
 }
@@ -110,10 +136,10 @@ float2 SampleWorldXZ(uint2 sid)
 [numthreads(8, 8, 1)]
 void CS_Clear(uint3 dtid : SV_DispatchThreadID)
 {
-    uint2 sid;
+    int2 sid;
     if (!RegionSample(dtid, sid)) return;
-    RWTexture2D<float> Output = ResourceDescriptorHeap[OutputIdx];
-    Output[sid] = ClearValue;
+    RWTexture2DArray<float> Output = ResourceDescriptorHeap[OutputIdx];
+    Output[OutTexel(sid)] = ClearValue;
 }
 
 // ── CS_ImportLayer: Blend a heightmap laid over a rectangle of the world ──
@@ -123,18 +149,44 @@ void CS_Clear(uint3 dtid : SV_DispatchThreadID)
 [numthreads(8, 8, 1)]
 void CS_ImportLayer(uint3 dtid : SV_DispatchThreadID)
 {
-    uint2 sid;
+    int2 sid;
     if (!RegionSample(dtid, sid)) return;
-    RWTexture2D<float> Output = ResourceDescriptorHeap[OutputIdx];
+    RWTexture2DArray<float> Output = ResourceDescriptorHeap[OutputIdx];
+    BakeStep step = LoadStep();
 
-    Texture2D<float> Source = ResourceDescriptorHeap[SourceIdx];
+    Texture2D<float> Source = ResourceDescriptorHeap[step.Source];
     uint sw, sh;
     Source.GetDimensions(sw, sh);
-    float2 rectUV = (SampleWorldXZ(sid) - float2(ImportMinX, ImportMinZ)) * float2(ImportInvSizeX, ImportInvSizeZ);
-    float src = Source.SampleLevel(sampLinear, TerrainHeightUV(rectUV, float2(sw, sh)), 0) * ImportScale + ImportBias;
+    float2 rectUV = (SampleWorldXZ(sid) - step.ImportMin) * step.ImportInvSize;
+    float src = Source.SampleLevel(sampLinear, TerrainHeightUV(rectUV, float2(sw, sh)), 0) * step.ImportScale + step.ImportBias;
 
-    float prev = Output[sid];
-    Output[sid] = Blend(prev, src, BlendMode, Opacity);
+    uint3 at = OutTexel(sid);
+    float prev = Output[at];
+    Output[at] = Blend(prev, src, step.BlendMode, step.Opacity);
+}
+
+uint CompareHash(uint v)
+{
+    uint state = v * 747796405u + 2891336453u;
+    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+// ── CS_CompareReads: the height at a place through terrain_pages.hlsli, over the terrain and 3 m round it, for the CPU
+// to compare with its own bilinear of the samples read back; every second place on a sample, where a vertex reads ──
+[numthreads(64, 1, 1)]
+void CS_CompareReads(uint3 dtid : SV_DispatchThreadID)
+{
+    if (dtid.x >= CompareCount) return;
+    TerrainPagesParams t = LoadTerrain(TerrainParamsIdx);
+    uint h0 = CompareHash(dtid.x * 2u), h1 = CompareHash(dtid.x * 2u + 1u);
+    float2 r = float2(h0 >> 8, h1 >> 8) / 16777216.0;
+    float2 xz = t.Origin.xz - 3.0 + r * (t.Size + 6.0);
+    if (dtid.x & 1u)
+        xz = t.Origin.xz + round((xz - t.Origin.xz) / t.Spacing) * t.Spacing;
+
+    RWStructuredBuffer<float4> o = ResourceDescriptorHeap[CompareUAVIdx];
+    o[dtid.x] = float4(TerrainHeight01(t, xz), 0, xz);
 }
 
 // Sample the tileable noise LUT (R16G16_Float) at a given position.
@@ -229,41 +281,43 @@ float fbmNoise(Texture2D<float2> lut, float2 p, uint type, uint octaves,
 [numthreads(8, 8, 1)]
 void CS_NoiseLayer(uint3 dtid : SV_DispatchThreadID)
 {
-    uint2 sid;
+    int2 sid;
     if (!RegionSample(dtid, sid)) return;
-    RWTexture2D<float> Output = ResourceDescriptorHeap[OutputIdx];
+    RWTexture2DArray<float> Output = ResourceDescriptorHeap[OutputIdx];
+    BakeStep step = LoadStep();
 
     Texture2D<float2> NoiseLUT = ResourceDescriptorHeap[NoiseLUTIdx];
 
     float2 world = SampleWorldXZ(sid);
-    float2 p = (world + float2(OffsetX, OffsetZ)) * Frequency;
+    float2 p = (world + step.Offset) * step.Frequency;
 
-    float noise = fbmNoise(NoiseLUT, p, NoiseType, Octaves, Lacunarity, Persistence, (float)NoiseSeed);
+    float noise = fbmNoise(NoiseLUT, p, step.NoiseType, step.Octaves, step.Lacunarity, step.Persistence, (float)step.Seed);
 
     // ── Terracing post-process ──
-    if (TerraceSteps > 0)
+    if (step.TerraceSteps > 0)
     {
-        float steps = (float)TerraceSteps;
+        float steps = (float)step.TerraceSteps;
         float quantized = floor(noise * steps) / steps;
         float frac_part = frac(noise * steps);
         // Smooth-step between shelves for natural-looking ledges
         float smooth_frac = smoothstep(0.0, 1.0, frac_part) / steps;
-        noise = lerp(quantized, quantized + smooth_frac, TerraceSmoothness);
+        noise = lerp(quantized, quantized + smooth_frac, step.TerraceSmoothness);
     }
 
-    float value = noise * Amplitude;
+    float value = noise * step.Amplitude;
 
     // ── Spatial mask (radial falloff) ──
-    if (MaskRadius > 0.0)
+    if (step.MaskRadius > 0.0)
     {
-        float2 delta = world - float2(MaskCenterX, MaskCenterZ);
+        float2 delta = world - step.MaskCenter;
         float dist = length(delta);
-        float mask = 1.0 - saturate(pow(dist / MaskRadius, MaskFalloff));
+        float mask = 1.0 - saturate(pow(dist / step.MaskRadius, step.MaskFalloff));
         value *= mask;
     }
 
-    float prev = Output[sid];
-    Output[sid] = Blend(prev, value, BlendMode, Opacity);
+    uint3 at = OutTexel(sid);
+    float prev = Output[at];
+    Output[at] = Blend(prev, value, step.BlendMode, step.Opacity);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -322,16 +376,17 @@ float RidgeRelief(HeightStampDescriptor stamp, float2 uv)
 [numthreads(8, 8, 1)]
 void CS_InfluenceLayer(uint3 dtid : SV_DispatchThreadID)
 {
-    uint2 sid;
+    int2 sid;
     if (!RegionSample(dtid, sid)) return;
-    RWTexture2D<float> Output = ResourceDescriptorHeap[OutputIdx];
+    RWTexture2DArray<float> Output = ResourceDescriptorHeap[OutputIdx];
 
     StructuredBuffer<HeightStampDescriptor> Stamps = ResourceDescriptorHeap[StampBufIdx];
     StructuredBuffer<uint> StampList = ResourceDescriptorHeap[StampListIdx];
     StructuredBuffer<StampSplinePoint> SplinePoints = ResourceDescriptorHeap[SplineBufIdx];
 
+    uint3 at = OutTexel(sid);
     float2 uv = SampleTerrainUV(sid);
-    float currentHeight = Output[sid];
+    float currentHeight = Output[at];
     bool modified = false;
 
     for (uint j = ListStart; j < ListStart + ListCount; j++)
@@ -402,5 +457,5 @@ void CS_InfluenceLayer(uint3 dtid : SV_DispatchThreadID)
     }
 
     if (modified)
-        Output[sid] = currentHeight;
+        Output[at] = currentHeight;
 }

@@ -4,14 +4,14 @@
 #define OCEAN_SURF_HLSLI
 
 #include "terrain_grid.hlsli"
+#include "terrain_pages.hlsli"
 
-// The terrain's height map at a terrain UV, 0..1 of its MaxHeight: read on the height grid (terrain_grid.hlsli), every
-// ocean read of the seabed goes through this
-float OceanTerrainHeight01(Texture2D<float> heightmap, SamplerState s, float2 terrainUV, float lod)
+// The terrain's height at a terrain UV, 0..1 of its MaxHeight, from its pages (terrain_pages.hlsli: OceanData.TerrainPages);
+// every ocean read of the seabed goes through this
+float OceanTerrainHeight01(uint terrainPages, float2 terrainUV)
 {
-    uint w, h;
-    heightmap.GetDimensions(w, h);
-    return heightmap.SampleLevel(s, TerrainHeightUV(terrainUV, float2(w, h)), lod);
+    TerrainPagesParams t = LoadTerrain(terrainPages);
+    return TerrainHeight01AtSample(t, terrainUV * (float)t.Cells);
 }
 
 struct OceanData
@@ -34,7 +34,7 @@ struct OceanData
     uint TileScalesSRV;      // bindless SRV to float[] buffer
     float DisplacementAtten;
     float NormalAtten;
-    uint HeightmapSRV;      // bindless SRV to terrain heightmap
+    uint TerrainPages;      // the terrain's TerrainPagesParams (terrain_pages.hlsli); 0 = none
     float ShoreDepth;       // water depth (meters) for full wave strength
     float MaxTerrainHeight; // terrain MaxHeight scale
     float OceanPlaneY;      // ocean entity world Y
@@ -101,7 +101,7 @@ OceanShore ShoreAt(OceanData ocean, float2 worldXZ)
     s.shoreDepth = 1e4;
     s.waterDepth = 1e4;
     s.surfUV = 0.5;
-    if (ocean.HeightmapSRV == 0) return s;
+    if (ocean.TerrainPages == 0) return s;
 
     float2 terrainSize = float2(ocean.TerrainSizeX, ocean.TerrainSizeZ);
     float2 terrainUV = (worldXZ - float2(ocean.TerrainOriginX, ocean.TerrainOriginZ)) / terrainSize;
@@ -114,8 +114,7 @@ OceanShore ShoreAt(OceanData ocean, float2 worldXZ)
     float outside = length((terrainUV - clampedUV) * terrainSize);
     if (outside < 150.0)
     {
-        Texture2D<float> heightmap = ResourceDescriptorHeap[ocean.HeightmapSRV];
-        float h = OceanTerrainHeight01(heightmap, OceanSampler, clampedUV, 0);
+        float h = OceanTerrainHeight01(ocean.TerrainPages, clampedUV);
         float terrainWorldY = ocean.TerrainBaseY + h * ocean.MaxTerrainHeight;
 
         // Water depth = ocean surface - terrain surface (positive = water exists)
@@ -421,7 +420,7 @@ float3 OceanSurfaceDisplacement(OceanData ocean, float2 worldXZ, float camDist, 
     // Sample FFT displacement from all bands (with distance-based mips), each as far as the shore lets it stand, the
     // surf's bands where their waves were out at sea
     float3 displacement = SampleDisplacement(ocean, worldXZ, ocean.DisplacementAtten, camDist, shore.waveAtten, shoreDepth,
-                                             shore.surfUV, ocean.HeightmapSRV != 0, surf);
+                                             shore.surfUV, ocean.TerrainPages != 0, surf);
 
     if (ocean.ShoreWarpSRV != 0 && shoreDepth < 1e3)
     {
@@ -491,15 +490,14 @@ static const float LIP_MIN = 0.05;
 // and where it faded the half-bent face stood as a shelf
 void LipBed(OceanData ocean, float2 xz, out float depth, out float slope)
 {
-    Texture2D<float> heightmap = ResourceDescriptorHeap[ocean.HeightmapSRV];
     float2 size = float2(ocean.TerrainSizeX, ocean.TerrainSizeZ);
     float2 uv = clamp((xz - float2(ocean.TerrainOriginX, ocean.TerrainOriginZ)) / size, 0.002, 0.998);
     float2 near = 6.0 / size, far = 12.0 / size;
-    float c = OceanTerrainHeight01(heightmap, OceanSampler, uv, 0);
-    float e1 = OceanTerrainHeight01(heightmap, OceanSampler, uv + float2(near.x, 0), 0), w1 = OceanTerrainHeight01(heightmap, OceanSampler, uv - float2(near.x, 0), 0);
-    float n1 = OceanTerrainHeight01(heightmap, OceanSampler, uv + float2(0, near.y), 0), s1 = OceanTerrainHeight01(heightmap, OceanSampler, uv - float2(0, near.y), 0);
-    float e2 = OceanTerrainHeight01(heightmap, OceanSampler, uv + float2(far.x, 0), 0), w2 = OceanTerrainHeight01(heightmap, OceanSampler, uv - float2(far.x, 0), 0);
-    float n2 = OceanTerrainHeight01(heightmap, OceanSampler, uv + float2(0, far.y), 0), s2 = OceanTerrainHeight01(heightmap, OceanSampler, uv - float2(0, far.y), 0);
+    float c = OceanTerrainHeight01(ocean.TerrainPages, uv);
+    float e1 = OceanTerrainHeight01(ocean.TerrainPages, uv + float2(near.x, 0)), w1 = OceanTerrainHeight01(ocean.TerrainPages, uv - float2(near.x, 0));
+    float n1 = OceanTerrainHeight01(ocean.TerrainPages, uv + float2(0, near.y)), s1 = OceanTerrainHeight01(ocean.TerrainPages, uv - float2(0, near.y));
+    float e2 = OceanTerrainHeight01(ocean.TerrainPages, uv + float2(far.x, 0)), w2 = OceanTerrainHeight01(ocean.TerrainPages, uv - float2(far.x, 0));
+    float n2 = OceanTerrainHeight01(ocean.TerrainPages, uv + float2(0, far.y)), s2 = OceanTerrainHeight01(ocean.TerrainPages, uv - float2(0, far.y));
     float h = (2.0 * c + e1 + w1 + n1 + s1) / 6.0;
     depth = max(ocean.OceanPlaneY - (ocean.TerrainBaseY + h * ocean.MaxTerrainHeight), 0.0);
     float2 gradient = 0.5 * (float2(e1 - w1, n1 - s1) / 12.0 + float2(e2 - w2, n2 - s2) / 24.0);
@@ -583,7 +581,7 @@ float LipAmount(OceanData ocean, float2 xz, SurfWave wave, float depth, float ca
 {
     age = 0.0;
     float omega = LipSecondBand(wave) ? ocean.WarpOmega.y : ocean.WarpOmega.x;
-    if (omega <= 0.05 || ocean.HeightmapSRV == 0 || depth > 1e3) return 0.0;
+    if (omega <= 0.05 || ocean.TerrainPages == 0 || depth > 1e3) return 0.0;
     float bedDepth, bedSlope;
     LipBed(ocean, xz, bedDepth, bedSlope);
     float height = 2.0 * SurfEnvelope(wave);

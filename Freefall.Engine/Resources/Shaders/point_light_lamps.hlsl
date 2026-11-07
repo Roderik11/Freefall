@@ -64,7 +64,7 @@ groupshared float gOpen[LAMPS_PER_GROUP][LAMP_TAPS][SKY_CAPTURE_VIEWS];
 float LightDaylight(float3 worldPos, float meshes, PointLightFrame frame, out float surfaceLux)
 {
     TerrainCover terrain;
-    terrain.Heightmap = frame.TerrainHeightmap;
+    terrain.Pages = frame.TerrainPages;
     terrain.MaxHeight = frame.TerrainMaxHeight;
     terrain.Origin = frame.TerrainOrigin;
     terrain.Size = frame.TerrainSize;

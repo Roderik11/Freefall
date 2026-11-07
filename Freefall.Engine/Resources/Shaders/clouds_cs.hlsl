@@ -778,7 +778,7 @@ CloudMarchResult CloudMarchClouds(CloudParams C, AtmosphereParams A, Texture3D<f
     // through there instead (CloudGroundLight)
     float deckThrough = max(ambientBuffer[4].y, 0.05);
     // The terrain's shadow toward the light (a peak shades the cloud behind it): only below the terrain's top
-    float terrainTop = A.TerrainHeightmap != 0 ? A.TerrainOrigin.y + A.TerrainMaxHeight : -1e9;
+    float terrainTop = A.TerrainPages != 0 ? A.TerrainOrigin.y + A.TerrainMaxHeight : -1e9;
     bool moonLight = C.LightIsMoon != 0;
 
     float3 L = 0;

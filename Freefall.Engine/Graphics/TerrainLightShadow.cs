@@ -32,8 +32,7 @@ namespace Freefall.Graphics
             public bool Due;                // to be made in this frame's Render
             public int Settle;              // frames to make it again after a bake (the bake may land after it)
             public Vector3 Direction;
-            public int Version = -1;
-            public uint Heightmap;
+            public int Version = -1;        // TerrainBaker.HeightVersion it was made for: every bake and upload moves it
 
             // The first step writes A, each doubling the other one
             public uint Result => Valid ? (Steps % 2 == 0 ? A!.BindlessIndex : B!.BindlessIndex) : 0u;
@@ -42,7 +41,7 @@ namespace Freefall.Graphics
         private static ComputeShader? _cs;
         private static int _kInit, _kStep;
         private static readonly Map _sun = new(), _moon = new();
-        private static (uint Heightmap, float MaxHeight, Vector3 Origin, Vector2 Size) _terrain;
+        private static (uint Pages, float MaxHeight, Vector3 Origin, Vector2 Size) _terrain;
         private static Vector2 _origin;
         private static float _size;
 
@@ -53,10 +52,10 @@ namespace Freefall.Graphics
         /// moon's map (0 = none: no terrain, the light below the horizon), the maps' corner and size.
         /// </summary>
         public static (uint Sun, uint Moon, Vector2 Origin, float Size) Prepare(
-            (uint Heightmap, float MaxHeight, Vector3 Origin, Vector2 Size) terrain, Vector3 sunDir, Vector3 moonDir, bool moonLit)
+            (uint Pages, float MaxHeight, Vector3 Origin, Vector2 Size) terrain, Vector3 sunDir, Vector3 moonDir, bool moonLit)
         {
             _terrain = terrain;
-            if (terrain.Heightmap == 0)
+            if (terrain.Pages == 0)
                 return (0, 0, Vector2.Zero, 0f);
             _size = MathF.Max(terrain.Size.X, terrain.Size.Y) + 2f * Margin;
             _origin = new Vector2(terrain.Origin.X, terrain.Origin.Z) - new Vector2(Margin);
@@ -77,14 +76,15 @@ namespace Freefall.Graphics
             int version = Assets.TerrainBaker.HeightVersion;
             if (version != map.Version)
                 map.Settle = 2;
-            bool moved = !map.Valid || Vector3.Dot(dir, map.Direction) < RebuildCos || map.Heightmap != _terrain.Heightmap;
+            // The terrain's pages index changes every frame (one params buffer per frame in flight): a new terrain or new
+            // heights show as a new HeightVersion instead
+            bool moved = !map.Valid || Vector3.Dot(dir, map.Direction) < RebuildCos;
             map.Due = moved || map.Settle > 0;
             if (map.Due)
             {
                 EnsureTextures(map);
                 map.Direction = dir;
                 map.Version = version;
-                map.Heightmap = _terrain.Heightmap;
                 map.Valid = true;           // made in Render before anything reads it
                 if (map.Settle > 0) map.Settle--;
             }
@@ -128,7 +128,7 @@ namespace Freefall.Graphics
             float tan = horizontal > 1e-4f ? dir.Y / horizontal : 1e4f;
 
             // Params: the same for every dispatch of the frame (one copy per frame); the light and the reach are pushed
-            cs.SetPushConstant("Heightmap", _terrain.Heightmap);
+            cs.SetPushConstant("TerrainPages", _terrain.Pages);
             cs.SetParam("MapOrigin", _origin);
             cs.SetParam("MapSize", _size);
             cs.SetParam("MapResolution", (uint)Resolution);

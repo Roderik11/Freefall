@@ -8,6 +8,7 @@
 #pragma kernel CSReduce
 
 #include "terrain_grid.hlsli"
+#include "terrain_pages.hlsli"
 
 cbuffer PushConstants : register(b3)
 {
@@ -15,7 +16,7 @@ cbuffer PushConstants : register(b3)
     uint OutputUAVIdx;          // RWTexture2D<uint>: the level's map, (height << 16) | share
     uint Merge;                 // 0: the solid meshes, written; 1: the vegetation, merged in
     uint Resolution;            // the map's texels a side (the depth has twice as many)
-    uint TerrainHeightmap;      // R16 heights; 0 = no terrain (nothing is dropped as low)
+    uint TerrainPages;      // R16 heights; 0 = no terrain (nothing is dropped as low)
     float TerrainMaxHeight;
     float TerrainOriginX;
     float TerrainOriginY;
@@ -68,15 +69,11 @@ void CSReduce(uint3 id : SV_DispatchThreadID)
         // The sample's place: u along +x, v down from the top edge (−z)
         float2 uv = (float2(p) + 0.5) / (2.0 * Resolution);
         float2 xz = float2(Left + uv.x * Size, Top - uv.y * Size);
-        if (TerrainHeightmap != 0)
+        if (TerrainPages != 0)
         {
-            Texture2D<float> heights = ResourceDescriptorHeap[TerrainHeightmap];
             float2 tuv = (xz - float2(TerrainOriginX, TerrainOriginZ)) / float2(TerrainSizeX, TerrainSizeZ);
-            uint hmW, hmH;
-            heights.GetDimensions(hmW, hmH);
             if (all(tuv >= 0.0) && all(tuv <= 1.0)
-                && y < TerrainOriginY + heights.SampleLevel(LinearClamp, TerrainHeightUV(tuv, float2(hmW, hmH)), 0) * TerrainMaxHeight
-                       + MinAboveGround)
+                && y < TerrainHeight(LoadTerrain(TerrainPages), xz) + MinAboveGround)
                 continue;
         }
         top = max(top, y);
