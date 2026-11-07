@@ -231,6 +231,7 @@ struct ShadowVSOutput
 };
 
 SamplerState Sampler : register(s0);
+SamplerState TrilinearSampler : register(s4);  // displacement/height maps — no aniso
 
 // Shadow vertex shader - skinned, single-pass multi-view via expansion buffer
 // (sun cascades, or point light cube faces when local)
@@ -419,9 +420,39 @@ PSOutput PS(VSOutput input)
     roughness = sqrt(saturate(roughness * roughness + min(2.0 * normalVariance, 0.18)));
 
     output.Data = float4(saturate(roughness), saturate(metal), saturate(ao), 1.0);
-    output.Depth = input.Depth;
+
+    // Screen-space displacement as gbuffer.fx has it, from the material's DetailMask (height, 1.0 = 0.01 of the UV
+    // span's world size): pushed along the interpolated vertex normal, since skinned meshes have no push normals
+    // (a hard edge parts; the armour pieces are smooth). No DetailMask: nothing changes.
+    float depth = input.Depth;
+    float2 displacement = float2(0, 0);
+    if (mat.DetailMaskIdx != 0)
+    {
+        Texture2D heightMap = ResourceDescriptorHeap[NonUniformResourceIndex(mat.DetailMaskIdx)];
+        float height = heightMap.Sample(TrilinearSampler, input.TexCoord).r;
+
+        float uvRate = length(ddy(input.TexCoord));
+        float worldRate = length(ddy(input.WorldPos));
+        float uvPerMeter = uvRate / max(worldRate, 0.001);
+        float dispScale = 0.01 / uvPerMeter;
+
+        depth = input.Depth - height * dispScale;
+
+        float4 clipPos = mul(float4(input.WorldPos.xyz, 1), ViewProjection);
+        float4 clipDisp = mul(float4(input.WorldPos.xyz + faceNormal * height * dispScale, 1), ViewProjection);
+        float2 ndcPos = clipPos.xy / clipPos.w;
+        float2 ndcDisp = clipDisp.xy / clipDisp.w;
+        displacement = (ndcDisp - ndcPos) * float2(0.5, -0.5);
+
+        // fade at the screen's edges so the inversion never needs off-screen sources
+        float2 screenUV = ndcPos * float2(0.5, -0.5) + 0.5;
+        float margin = length(displacement);
+        float edgeFade = saturate(min(min(screenUV.x, 1.0 - screenUV.x), min(screenUV.y, 1.0 - screenUV.y)) / max(margin, 1e-5));
+        displacement *= edgeFade;
+    }
+    output.Depth = depth;
     output.EntityId = (input.TransformSlot << 8u) | (input.MeshPartIdx & 0xFFu) | (3u << 30);   // class 3: characters (decals_cs.hlsl receivers)
-    output.Displacement = float2(0, 0);
+    output.Displacement = displacement;
     
     return output;
 }
