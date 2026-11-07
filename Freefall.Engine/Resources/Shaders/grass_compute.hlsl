@@ -24,6 +24,7 @@
 #include "ground_shape.hlsli"       // GroundShape, GroundShapeTint, PackGroundTint
 #include "terrain_holes.hlsli"      // TerrainHoleAt
 #include "terrain_grid.hlsli"       // TerrainHeightUV: where the height map holds a place's height
+#include "terrain_paint.hlsli"      // the layers' weights for the plants' tint, from the paint pages
 #include "weather_cover.hlsli"      // ShelterTexels: how much the cover map keeps the snow off a plant's root
 
 // Push constants (root parameter 0, register b3) — bindless indices only
@@ -53,7 +54,7 @@ cbuffer PushConstants : register(b3)
     uint BladeInstanceUAVIdx;       // slot 21 — UAV: card instances near the camera, drawn as blade clumps
     uint BladeColorsUAVIdx;         // slot 22 — UAV: per card variant, blade colour root → tip (CS_BladeColors)
     uint DecoratorTintsUAVIdx;      // slot 23 — UAV: per decorator, the colour the ground under it takes (CS_DecoratorTints)
-    uint SplatControlIdx;           // slot 24 — SRV: the terrain's layer weights (Texture2DArray, 4 layers per slice)
+    uint SplatControlIdx;           // slot 24 — unused since 5b: the layer weights come from the paint pages (terrain_paint.hlsli)
     uint LayerPlantTintIdx;         // slot 25 — SRV: StructuredBuffer<float4>, TerrainLayer.PlantTint per channel
     uint SplatLayerCount;           // slot 26 — layers in the palette (0 = no plant tint)
     uint HoleTexIdx;                // slot 27 — SRV: R8 hole mask (HoleStamp, terrain_holes.hlsli), 0 = no holes
@@ -495,17 +496,18 @@ int2 SpiralCell(uint i)
 
 // The layers' plant tints (TerrainLayer.PlantTint) where they show, weighted as the terrain surface weights the
 // layers: a later channel covers the ones before it (gputerrain.fx, without its height blend). Ground no layer
-// covers tints nothing. controlUV: control-array space (Y flipped against terrain UV).
-float3 LayerPlantTint(float2 controlUV)
+// covers tints nothing. The weights from the paint pages (terrain_paint.hlsli) at a place in terrain UV.
+float3 LayerPlantTint(float2 terrainUV)
 {
-    Texture2DArray controlMaps = ResourceDescriptorHeap[SplatControlIdx];
     StructuredBuffer<float4> plantTints = ResourceDescriptorHeap[LayerPlantTintIdx];
     uint layerCount = min(SplatLayerCount, 32u);
+    float4 weights[8];
+    PaintWeights(LoadPaint(LoadTerrain(TerrainPagesIdx)), terrainUV, ClampSampler, weights);
     float3 tint = 0;
     float remaining = 1.0;
     for (int slice = int((layerCount + 3) / 4) - 1; slice >= 0; slice--)
     {
-        float4 w = controlMaps.SampleLevel(ClampSampler, float3(controlUV, slice), 0);
+        float4 w = weights[min(slice, 7)];
         for (int c = 3; c >= 0; c--)
         {
             uint layer = uint(slice) * 4 + uint(c);
@@ -882,8 +884,8 @@ void CS_SpawnInstances(uint3 gid : SV_GroupID, uint3 gtid3 : SV_GroupThreadID)
             // on it), then the shape of the land as the terrain's own colour takes it (ground_shape.hlsli), so the
             // pattern of the bare ground past the decoration radius runs on through the sward
             float3 groundTint = 1.0.xxx;
-            if (SplatLayerCount > 0 && SplatControlIdx != 0 && LayerPlantTintIdx != 0)
-                groundTint = LayerPlantTint(float2(texelUV.x, 1.0 - texelUV.y));
+            if (SplatLayerCount > 0 && LayerPlantTintIdx != 0)
+                groundTint = LayerPlantTint(texelUV);
             groundTint *= GroundShapeTint(GroundShape(pages, pages.Origin.xz + texelUV * pages.Size),
                                           smoothstep(0.7, 0.9, terrainNormal.y));
             groundTint *= SwardGrain(localXZ);       // the sward's grain, as the ground under it from afar

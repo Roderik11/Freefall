@@ -40,7 +40,8 @@ namespace Freefall.Assets
         private static bool _initialized;
 
         private static ComputeShader _splatCS;
-        private static int _kernelSplatBake;
+        private static int _kernelSplatBake;      // CS_SplatBakePage: one paint page into its slot
+        private static int _kernelSplatBakeFlat;  // CS_SplatBakeFlat: the whole map into a flat array (Check Paint Pages)
         private static ComputeShader _decoCS;
         private static int _kernelDecoControl;
         private static bool _coverageInitialized;
@@ -206,7 +207,8 @@ namespace Freefall.Assets
         {
             if (_coverageInitialized) return;
             _splatCS = new ComputeShader("terrain_splat_bake.hlsl");
-            _kernelSplatBake = _splatCS.FindKernel("CS_SplatBake");
+            _kernelSplatBake = _splatCS.FindKernel("CS_SplatBakePage");
+            _kernelSplatBakeFlat = _splatCS.FindKernel("CS_SplatBakeFlat");
             _decoCS = new ComputeShader("decoration_prepass.hlsl");
             _kernelDecoControl = _decoCS.FindKernel("CSBuildDecoControl");
             _coverageInitialized = true;
@@ -851,7 +853,7 @@ namespace Freefall.Assets
             cmd.SetDescriptorHeaps(1, new[] { device.SrvHeap });
             cmd.SetComputeRootSignature(device.GlobalRootSignature);
 
-            bool fresh = _pool.Ensure(plan.Resolution, cmd);
+            bool fresh = _pool.Ensure(plan.Resolution, PoolCapacity, cmd);
             // Another grid or height range than the last bake's moves every sample, whatever region the caller saw
             var grid = (plan.Resolution, plan.Origin, plan.Spacing, plan.MaxHeight);
             bool gridChanged = _bakedGrid is { } last && last != grid;
@@ -859,15 +861,74 @@ namespace Freefall.Assets
             var box = fresh || gridChanged || pages == null ? (0, 0, plan.PagesAcross, plan.PagesAcross) : pages.Value;
 
             UploadHeightPlan(plan);
+            _lastPlan = plan;
+
+            // The resident pages bake in place; the others are owed to the readback, which bakes them into scratch slots
+            // (a streaming pool, TERRAIN_PAGES_PLAN.md 5a)
+            var resident = new List<(int px, int py, int slot)>((box.Item3 - box.Item1) * (box.Item4 - box.Item2));
+            for (int py = box.Item2; py < box.Item4; py++)
+                for (int px = box.Item1; px < box.Item3; px++)
+                {
+                    int slot = _pool.SlotOf(0, px, py);
+                    if (slot >= 0)
+                    {
+                        resident.Add((px, py, slot));
+                        _pool.MarkWritten(slot);
+                    }
+                    else
+                        _owed.Add(py * plan.PagesAcross + px);
+                }
 
             // The pool rests in Common between bakes, and a texture is never promoted to UnorderedAccess implicitly (only
             // to the read and copy states); back to Common, so its readers promote it to SRV implicitly
             cmd.ResourceBarrierTransition(_pool.Texture, ResourceStates.Common, ResourceStates.UnorderedAccess);
-            RecordHeight(plan, cmd, box, wholeRuns: false);
+            RecordHeight(plan, cmd, resident, wholeRuns: false);
             cmd.ResourceBarrierTransition(_pool.Texture, ResourceStates.UnorderedAccess, ResourceStates.Common);
-            _pool.Filled = true;
+            if (_pool.AllResident) _pool.Filled = true;
             HeightVersion++;
         }
+
+        /// <summary>
+        /// Page slots the pool is made with (TerrainHeightResidency.CapacityFor): 0 = every level 0 page resident at its
+        /// own index. Set by the renderer before it bakes; a change makes a new pool.
+        /// </summary>
+        public int PoolCapacity { get; set; }
+
+        /// <summary>
+        /// Make the pool for this many samples a side at <see cref="PoolCapacity"/> now, on a list of its own, when the one
+        /// there is not that (the detail radius changed). True when it was made: nothing is in it, and the owed pages go
+        /// with the old one (the renderer fills the new one from the CPU store). Blocks. Main thread.
+        /// </summary>
+        public bool EnsurePoolNow(int resolution)
+        {
+            if (_pool.Matches(resolution, PoolCapacity)) return false;
+            var device = Engine.Device;
+            var allocator = device.NativeDevice.CreateCommandAllocator(CommandListType.Direct);
+            var cmd = device.NativeDevice.CreateCommandList<ID3D12GraphicsCommandList>(0, CommandListType.Direct, allocator, null);
+            try
+            {
+                _pool.Ensure(resolution, PoolCapacity, cmd);
+                cmd.Close();
+                device.SubmitAndWait(cmd);
+            }
+            finally
+            {
+                cmd.Dispose();
+                allocator.Dispose();
+            }
+            _owed.Clear();
+            return true;
+        }
+
+        // The plan of the last bake: the readback bakes owed pages with it
+        private HeightPlan? _lastPlan;
+
+        // Level 0 pages (index py · across + px) a bake did not write, not being resident: their CPU heights are behind
+        // until a readback bakes them into scratch slots and reads them back
+        private readonly HashSet<int> _owed = new();
+
+        /// <summary>Level 0 pages a bake owes the CPU store (not resident when it ran).</summary>
+        public int OwedPages => _owed.Count;
 
         /// <summary>
         /// The plan's steps, descriptors, spline points and page lists, into upload buffers of their own once per plan.
@@ -909,16 +970,27 @@ namespace Freefall.Assets
             return (first.x0, first.y0, last.x1, last.y1);
         }
 
+        /// <summary>Every page of a box with the slot it is resident at (every page of an AllResident pool).</summary>
+        private List<(int px, int py, int slot)> ResidentPages((int px0, int py0, int px1, int py1) pages)
+        {
+            var list = new List<(int px, int py, int slot)>();
+            for (int py = pages.py0; py < pages.py1; py++)
+                for (int px = pages.px0; px < pages.px1; px++)
+                    if (_pool.SlotOf(0, px, py) is var slot && slot >= 0) list.Add((px, py, slot));
+            return list;
+        }
+
         /// <summary>
-        /// Record a plan's bake over a box of pages into the pool, which is in UnorderedAccess: each page cleared, then
-        /// every step over each page, border included. An influence run takes the page's list, or, with
+        /// Record a plan's bake of these pages, each into its slot, into the pool, which is in UnorderedAccess: each page
+        /// cleared, then every step over each page, border included. An influence run takes the page's list, or, with
         /// <paramref name="wholeRuns"/>, every descriptor of the run (CheckPageBake). Pages write texels of their own, so
-        /// there is a barrier between steps only.
+        /// there is a barrier between steps only. The slot need not be the page's resident one: the readback bakes owed
+        /// pages into scratch slots.
         /// </summary>
         private void RecordHeight(HeightPlan plan, ID3D12GraphicsCommandList cmd,
-            (int px0, int py0, int px1, int py1) pages, bool wholeRuns)
+            IReadOnlyList<(int px, int py, int slot)> pages, bool wholeRuns)
         {
-            if (pages.px1 <= pages.px0 || pages.py1 <= pages.py0) return;
+            if (pages.Count == 0) return;
 
             // Where the samples lie, the same for every kernel
             _cs.SetPushConstant("Output", _pool.Uav);
@@ -929,9 +1001,8 @@ namespace Freefall.Assets
             _cs.SetBuffer("StepBuf", _heightStepBuffer);
 
             _cs.SetParam(_kernelClear, "ClearValue", 0f);
-            for (int py = pages.py0; py < pages.py1; py++)
-                for (int px = pages.px0; px < pages.px1; px++)
-                    DispatchPage(_kernelClear, cmd, plan, px, py);
+            foreach (var (px, py, slot) in pages)
+                DispatchPage(_kernelClear, cmd, plan, px, py, slot);
             cmd.ResourceBarrierUnorderedAccessView(_pool.Texture);
 
             for (int s = 0; s < plan.Steps.Count; s++)
@@ -951,30 +1022,29 @@ namespace Freefall.Assets
                     }
                     _cs.SetPushConstant(k, "StepIndex", (uint)s);
                     float lastSample = Math.Max(plan.Resolution - 1, 1);
-                    for (int py = pages.py0; py < pages.py1; py++)
-                        for (int px = pages.px0; px < pages.px1; px++)
+                    foreach (var (px, py, slot) in pages)
+                    {
+                        // Noise along a spline: only the pages its corridor reaches (a river's walk over every
+                        // sample of the map would cost as much as every stamp of it together)
+                        if (step.MaskSplineCount != 0)
                         {
-                            // Noise along a spline: only the pages its corridor reaches (a river's walk over every
-                            // sample of the map would cost as much as every stamp of it together)
-                            if (step.MaskSplineCount != 0)
-                            {
-                                var box = plan.PageBox(px, py);
-                                if (box.x1 / lastSample < step.MaskBoundsMin.X || box.x0 / lastSample > step.MaskBoundsMax.X ||
-                                    box.y1 / lastSample < step.MaskBoundsMin.Y || box.y0 / lastSample > step.MaskBoundsMax.Y)
-                                    continue;
-                            }
-                            DispatchPage(k, cmd, plan, px, py);
+                            var box = plan.PageBox(px, py);
+                            if (box.x1 / lastSample < step.MaskBoundsMin.X || box.x0 / lastSample > step.MaskBoundsMax.X ||
+                                box.y1 / lastSample < step.MaskBoundsMin.Y || box.y0 / lastSample > step.MaskBoundsMax.Y)
+                                continue;
                         }
+                        DispatchPage(k, cmd, plan, px, py, slot);
+                    }
                 }
                 cmd.ResourceBarrierUnorderedAccessView(_pool.Texture);
             }
         }
 
-        /// <summary>One dispatch of a kernel over page (px, py) with its border, written at the page's slot.</summary>
-        private void DispatchPage(int k, ID3D12GraphicsCommandList cmd, HeightPlan plan, int px, int py)
+        /// <summary>One dispatch of a kernel over page (px, py) with its border, written at a slot.</summary>
+        private void DispatchPage(int k, ID3D12GraphicsCommandList cmd, HeightPlan plan, int px, int py, int slot)
         {
             var box = plan.PageBox(px, py);
-            var (slice, cx, cy) = _pool.PageCorner(px, py);
+            var (slice, cx, cy) = HeightPool.SlotCorner(slot);
             // Sample s goes to texel s + Out: the box's first sample, a border before the page's, at the slot's corner
             _cs.SetPushConstant(k, "OutX", unchecked((uint)(cx - box.x0)));
             _cs.SetPushConstant(k, "OutY", unchecked((uint)(cy - box.y0)));
@@ -995,7 +1065,7 @@ namespace Freefall.Assets
         }
 
         private void DispatchInfluence(ID3D12GraphicsCommandList cmd, HeightPlan plan, in HeightStep step,
-            (int px0, int py0, int px1, int py1) pages, bool wholeRuns)
+            IReadOnlyList<(int px, int py, int slot)> pages, bool wholeRuns)
         {
             var k = _kernelInfluenceLayer;
             _cs.SetBuffer(k, "StampBuf", _heightStampBuffer);
@@ -1003,17 +1073,16 @@ namespace Freefall.Assets
             _cs.SetPushConstant(k, "SplineBuf",
                 plan.SplinePoints.Count > 0 && _heightStampSplineBuffer != null ? _heightStampSplineBuffer.SrvIndex : 0u);
 
-            for (int py = pages.py0; py < pages.py1; py++)
-                for (int px = pages.px0; px < pages.px1; px++)
-                {
-                    var (start, count) = wholeRuns
-                        ? (plan.AllStamps + step.Start, step.Count)
-                        : plan.PageRuns[step.PageRuns + py * plan.PagesAcross + px];
-                    if (count == 0) continue;
-                    _cs.SetPushConstant(k, "ListStart", (uint)start);
-                    _cs.SetPushConstant(k, "ListCount", (uint)count);
-                    DispatchPage(k, cmd, plan, px, py);
-                }
+            foreach (var (px, py, slot) in pages)
+            {
+                var (start, count) = wholeRuns
+                    ? (plan.AllStamps + step.Start, step.Count)
+                    : plan.PageRuns[step.PageRuns + py * plan.PagesAcross + px];
+                if (count == 0) continue;
+                _cs.SetPushConstant(k, "ListStart", (uint)start);
+                _cs.SetPushConstant(k, "ListCount", (uint)count);
+                DispatchPage(k, cmd, plan, px, py, slot);
+            }
         }
 
         /// <summary>
@@ -1029,12 +1098,20 @@ namespace Freefall.Assets
             CheckPageBake(Terrain terrain, HeightPlan plan)
         {
             if (plan == null || !plan.HasWork) return default;
+            if (PoolCapacity != 0 || (_pool.Texture != null && !_pool.AllResident))
+            {
+                Debug.LogWarning("TerrainBaker", "Check Page Bake compares every page: set TerrainDetailRadius to 0 (every page resident) first");
+                return default;
+            }
             EnsureInitialized();
             EnsureNoiseLUT();
             var device = Engine.Device;
             int res = plan.Resolution;
             int pagesAcross = plan.PagesAcross;
-            var all = (0, 0, pagesAcross, pagesAcross);
+            var all = new List<(int px, int py, int slot)>(pagesAcross * pagesAcross);
+            for (int py = 0; py < pagesAcross; py++)
+                for (int px = 0; px < pagesAcross; px++)
+                    all.Add((px, py, py * pagesAcross + px));   // every page at its own index (AllResident)
 
             var allocator = device.NativeDevice.CreateCommandAllocator(CommandListType.Direct);
             ID3D12Resource[] readbacks = null;
@@ -1051,7 +1128,7 @@ namespace Freefall.Assets
                     var cmd = device.NativeDevice.CreateCommandList<ID3D12GraphicsCommandList>(0, CommandListType.Direct, allocator, null);
                     cmd.SetDescriptorHeaps(1, new[] { device.SrvHeap });
                     cmd.SetComputeRootSignature(device.GlobalRootSignature);
-                    _pool.Ensure(res, cmd);
+                    _pool.Ensure(res, 0, cmd);
                     if (readbacks == null)
                     {
                         readbacks = new ID3D12Resource[4];
@@ -1071,17 +1148,13 @@ namespace Freefall.Assets
                         // pages one by one in a shuffled order: a texel no page bakes keeps it
                         _cs.SetPushConstant("Output", _pool.Uav);
                         _cs.SetParam(_kernelClear, "ClearValue", 1f);
-                        for (int py = 0; py < pagesAcross; py++)
-                            for (int px = 0; px < pagesAcross; px++)
-                                DispatchPage(_kernelClear, cmd, plan, px, py);
+                        foreach (var (px, py, slot) in all)
+                            DispatchPage(_kernelClear, cmd, plan, px, py, slot);
                         cmd.ResourceBarrierUnorderedAccessView(_pool.Texture);
                         var order = Enumerable.Range(0, pagesAcross * pagesAcross).ToArray();
                         new Random(7).Shuffle(order);
                         foreach (int p in order)
-                        {
-                            int px = p % pagesAcross, py = p / pagesAcross;
-                            RecordHeight(plan, cmd, (px, py, px + 1, py + 1), wholeRuns: false);
-                        }
+                            RecordHeight(plan, cmd, new[] { all[p] }, wholeRuns: false);
                     }
 
                     cmd.ResourceBarrierTransition(_pool.Texture, ResourceStates.UnorderedAccess, ResourceStates.CopySource);
@@ -1420,6 +1493,7 @@ namespace Freefall.Assets
         public bool UploadPages(TerrainPages pages)
         {
             if (pages is not { HasHeights: true }) return false;
+            if (PoolCapacity != 0) return false;   // streaming: TerrainHeightResidency fills the windows
 
             var device = Engine.Device;
             int resolution = pages.Resolution;
@@ -1447,7 +1521,7 @@ namespace Freefall.Assets
                         uploadResource.Map(0, null, &pData);
                         var basePtr = (IntPtr)pData;
                         System.Threading.Tasks.Parallel.For(0, n, k =>
-                            FillPage(pages, first + k, new Span<ushort>((byte*)basePtr + (long)k * pageBytes, pageBytes / 2), rowPitch / 2));
+                            pages.FillPoolPage(0, (first + k) % across, (first + k) / across, new Span<ushort>((byte*)basePtr + (long)k * pageBytes, pageBytes / 2), rowPitch / 2, HeightPool.Border, HeightPool.PageTexels));
                         uploadResource.Unmap(0);
                     }
 
@@ -1455,7 +1529,7 @@ namespace Freefall.Assets
                     var cmdList = device.NativeDevice.CreateCommandList<ID3D12GraphicsCommandList>(0, CommandListType.Direct, allocator, null);
                     try
                     {
-                        if (first == 0) _pool.Ensure(resolution, cmdList);
+                        if (first == 0) _pool.Ensure(resolution, 0, cmdList);
                         cmdList.ResourceBarrierTransition(_pool.Texture, ResourceStates.Common, ResourceStates.CopyDest);
                         for (int k = 0; k < n; k++)
                         {
@@ -1471,6 +1545,8 @@ namespace Freefall.Assets
                         cmdList.ResourceBarrierTransition(_pool.Texture, ResourceStates.CopyDest, ResourceStates.Common);
                         cmdList.Close();
                         device.SubmitAndWait(cmdList);
+                        for (int k = 0; k < n; k++)
+                            _pool.MarkWritten(first + k, submitted: true);   // every page at its own index
                     }
                     finally
                     {
@@ -1492,35 +1568,6 @@ namespace Freefall.Assets
 
         /// <summary>Pages that go up through the upload buffer at a time (<see cref="UploadPages"/>): 128 pages, 25 MB.</summary>
         private const int UploadBatch = 128;
-
-        // Page i's texels as the pool holds them, border included, into rows of `pitch` values: its own samples copied a
-        // row at a time, the border's from the pages beside it
-        private static void FillPage(TerrainPages pages, int i, Span<ushort> into, int pitch)
-        {
-            const int border = HeightPool.Border, texels = HeightPool.PageTexels;
-            int across = pages.PagesAcross;
-            int px = i % across, pz = i / across;
-            var (x0, z0, w, h) = pages.PageExtent(px, pz);
-            var own = pages.HeightPage(px, pz);
-            for (int tz = 0; tz < texels; tz++)
-            {
-                var row = into.Slice(tz * pitch, texels);
-                int z = tz - border;
-                if (z >= 0 && z < h && !own.IsEmpty)
-                {
-                    own.Slice(z * TerrainPages.PageSamples, w).CopyTo(row.Slice(border, w));
-                    for (int tx = 0; tx < border; tx++)
-                        row[tx] = pages.Sample(x0 + tx - border, z0 + z);
-                    for (int tx = border + w; tx < texels; tx++)
-                        row[tx] = pages.Sample(x0 + tx - border, z0 + z);
-                }
-                else
-                {
-                    for (int tx = 0; tx < texels; tx++)
-                        row[tx] = pages.Sample(x0 + tx - border, z0 + z);
-                }
-            }
-        }
 
         private static readonly ProfilerMarker _copyMarker = ProfilerMarker.Get("Terrain height copy and compare");
 
@@ -1560,10 +1607,37 @@ namespace Freefall.Assets
                 return previous;
 
             var (px0, pz0, px1, pz1) = basis.PagesOf(x0, z0, x1, z1);
-            var pageList = new List<(int px, int pz)>((px1 - px0) * (pz1 - pz0));
+            int across = basis.PagesAcross;
+            var inBox = new HashSet<int>();
+            var pageList = new List<(int px, int pz, int slot)>((px1 - px0) * (pz1 - pz0));
             for (int pz = pz0; pz < pz1; pz++)
                 for (int px = px0; px < px1; px++)
-                    pageList.Add((px, pz));
+                {
+                    inBox.Add(pz * across + px);
+                    pageList.Add((px, pz, -1));
+                }
+            // Pages a bake owed the CPU store, wherever they are
+            foreach (int owed in _owed)
+                if (owed < across * across && inBox.Add(owed))
+                    pageList.Add((owed % across, owed / across, -1));
+
+            // Where each page is read from: its slot when it is resident, written on a list already handed to the GPU and
+            // not skipped by a bake since; else it is baked into a scratch slot with the last bake's plan first
+            // (TERRAIN_PAGES_PLAN.md 5a). Without that plan such a page keeps what the store had.
+            var plan = _lastPlan is { } p && p.Resolution == res ? p : null;
+            int skipped = 0;
+            for (int i = pageList.Count - 1; i >= 0; i--)
+            {
+                var (px, pz, _) = pageList[i];
+                int slot = _pool.SlotOf(0, px, pz);
+                bool readable = _pool.AllResident
+                    ? slot >= 0
+                    : slot >= 0 && _pool.Settled(slot) && !_owed.Contains(pz * across + px);
+                if (readable) pageList[i] = (px, pz, slot);
+                else if (plan == null) { pageList.RemoveAt(i); skipped++; }
+            }
+            if (pageList.Count == 0)
+                return compare ? previous : null;
 
             // A page's rows 256-byte aligned, each page at a 512-byte boundary (the placed footprint's alignment); a
             // batch of pages per copy, so a large terrain needs no readback buffer the size of its map
@@ -1584,10 +1658,30 @@ namespace Freefall.Assets
 
             try
             {
+                int baked = 0;
                 for (int first = 0; first < pageList.Count; first += batch)
                 {
                     int count = Math.Min(batch, pageList.Count - first);
+
+                    // The batch's pages with no readable slot: baked into scratch slots on a list of their own first
+                    var bake = new List<(int px, int py, int slot)>();
+                    for (int k = 0; k < count; k++)
+                    {
+                        var (px, pz, slot) = pageList[first + k];
+                        if (slot >= 0) continue;
+                        int scratch = _pool.ScratchSlot(bake.Count);
+                        bake.Add((px, pz, scratch));
+                        pageList[first + k] = (px, pz, scratch);
+                    }
+                    if (bake.Count > 0)
+                    {
+                        BakeIntoScratch(plan!, bake);
+                        baked += bake.Count;
+                    }
+
                     ReadPoolPages(readbackResource, pageList, first, count, rowPitch, pageBytes, basis);
+                    for (int k = 0; k < count; k++)
+                        _owed.Remove(pageList[first + k].pz * across + pageList[first + k].px);
 
                     unsafe
                     {
@@ -1597,7 +1691,7 @@ namespace Freefall.Assets
                         {
                             for (int k = 0; k < count; k++)
                             {
-                                var (px, pz) = pageList[first + k];
+                                var (px, pz, _) = pageList[first + k];
                                 var (sx, sz, w, h) = basis.PageExtent(px, pz);
                                 var before = compare ? basis.HeightPage(px, pz) : default;
                                 var src = (byte*)pData + (long)k * pageBytes;
@@ -1643,7 +1737,7 @@ namespace Freefall.Assets
                 if (!compare) changed = (0, 0, res, res);
                 else if (cx1 > cx0) changed = (cx0, cz0, cx1, cz1);
                 Debug.Log($"[TerrainBaker] Heights read back: {pageList.Count} of {pages.PagesAcross * pages.PagesAcross} pages, " +
-                          $"{replaced} new, " +
+                          $"{replaced} new, {baked} baked in scratch slots, {skipped} not resident and no plan to bake them, " +
                           (changed is { } box ? $"changed x {box.x0}..{box.x1}, z {box.z0}..{box.z1}" : "nothing changed"));
                 return pages;
             }
@@ -1654,10 +1748,39 @@ namespace Freefall.Assets
         }
 
         /// <summary>
-        /// Copy whole pages of the pool (each its own samples, no border) into a readback buffer, page k at k × pageBytes,
-        /// rows of <paramref name="rowPitch"/> bytes. Its own command list; blocks until the GPU is done.
+        /// Bake these pages of a plan into the scratch slots they were given (a streaming pool, TERRAIN_PAGES_PLAN.md 5a), on
+        /// a list of their own: the readback's way to the heights of pages that are not resident. Blocks until the GPU is
+        /// done.
         /// </summary>
-        private void ReadPoolPages(ID3D12Resource readback, List<(int px, int pz)> pages, int first, int count,
+        private void BakeIntoScratch(HeightPlan plan, List<(int px, int py, int slot)> pages)
+        {
+            var device = Engine.Device;
+            EnsureInitialized();
+            var allocator = device.NativeDevice.CreateCommandAllocator(CommandListType.Direct);
+            var cmd = device.NativeDevice.CreateCommandList<ID3D12GraphicsCommandList>(0, CommandListType.Direct, allocator, null);
+            try
+            {
+                cmd.SetDescriptorHeaps(1, new[] { device.SrvHeap });
+                cmd.SetComputeRootSignature(device.GlobalRootSignature);
+                UploadHeightPlan(plan);
+                cmd.ResourceBarrierTransition(_pool.Texture, ResourceStates.Common, ResourceStates.UnorderedAccess);
+                RecordHeight(plan, cmd, pages, wholeRuns: false);
+                cmd.ResourceBarrierTransition(_pool.Texture, ResourceStates.UnorderedAccess, ResourceStates.Common);
+                cmd.Close();
+                device.SubmitAndWait(cmd);
+            }
+            finally
+            {
+                cmd.Dispose();
+                allocator.Dispose();
+            }
+        }
+
+        /// <summary>
+        /// Copy whole pages of the pool (each its own samples, no border) from their slots into a readback buffer, page k at
+        /// k × pageBytes, rows of <paramref name="rowPitch"/> bytes. Its own command list; blocks until the GPU is done.
+        /// </summary>
+        private void ReadPoolPages(ID3D12Resource readback, List<(int px, int pz, int slot)> pages, int first, int count,
             int rowPitch, int pageBytes, TerrainPages layout)
         {
             var device = Engine.Device;
@@ -1668,9 +1791,9 @@ namespace Freefall.Assets
                 cmdList.ResourceBarrierTransition(_pool.Texture, ResourceStates.Common, ResourceStates.CopySource);
                 for (int k = 0; k < count; k++)
                 {
-                    var (px, pz) = pages[first + k];
+                    var (px, pz, slot) = pages[first + k];
                     var (_, _, w, h) = layout.PageExtent(px, pz);
-                    var (slice, cx, cy) = _pool.PageCorner(px, pz);
+                    var (slice, cx, cy) = HeightPool.SlotCorner(slot);
                     int tx = cx + HeightPool.Border, tz = cy + HeightPool.Border;
                     var dst = new TextureCopyLocation(readback, new PlacedSubresourceFootPrint
                     {
@@ -1697,6 +1820,9 @@ namespace Freefall.Assets
         /// <summary>Counts the baked heightmaps' changes (a bake, an upload from the cache): what is made from the heights
         /// (Graphics.TerrainLightShadow) is made again when it moves on.</summary>
         public static int HeightVersion { get; private set; }
+
+        /// <summary>The pool's heights changed some other way than a bake (filled from the CPU store).</summary>
+        internal static void NoteHeightsChanged() => HeightVersion++;
 
         // ═══════════════════════════════════════════════════════════════════
         // ── Coverage (splat + decoration) ──
@@ -1970,125 +2096,251 @@ namespace Freefall.Assets
         }
 
         /// <summary>
-        /// Composite the splat stamps into the packed control array (ceil(layers / 4) RGBA slices).
-        /// Clears what an earlier bake left, so a plan without stamps yields an empty array.
-        /// 'topLayerUAV' (0 = none) gets the channel that shows most per texel, see ReadbackTopLayers.
-        /// 'region' (control texels: x, y, width, height; null = the whole map) is all that is redone: every texel in
-        /// it is composited from all the stamps again, the rest keeps what the last bake wrote. Only for a bake into the
-        /// same array with the same palette, after stamps changed only inside it.
-        /// Render callback.
+        /// Bake these paint pages into their slots of the paint pool (TERRAIN_PAGES_PLAN.md 5b): every texel of a page,
+        /// border included, composited from all the stamps (a coarse page averages a 4 × 4 grid over each texel), every
+        /// layer slice and the top layer written. The plan's stamps go up once per plan. Render callback, on the frame's
+        /// list after the heights; the slots count as written by this frame.
         /// </summary>
-        public void BakeSplat(CoveragePlan plan, ID3D12GraphicsCommandList cmd, Terrain terrain,
-            uint terrainPagesIdx, uint controlArrayUAV, uint topLayerUAV, int resolution, int sliceCount,
-            (int x, int y, int width, int height)? region = null)
+        public void BakeSplatPages(CoveragePlan plan, ID3D12GraphicsCommandList cmd, Terrain terrain, uint terrainPagesIdx,
+            Graphics.PaintPool pool, IReadOnlyList<(int level, int px, int py, int slot)> pages)
         {
-            var r = region ?? (0, 0, resolution, resolution);
+            if (pages.Count == 0 || pool.Weights == null) return;
             EnsureCoverageInitialized();
-
-            UploadCoverage(plan, ref _splatStampBuffer, ref _splatStampBufferCapacity,
-                ref _splatSplineBuffer, ref _splatSplineCapacity);
+            if (!ReferenceEquals(_uploadedSplatPlan, plan))
+            {
+                UploadCoverage(plan, ref _splatStampBuffer, ref _splatStampBufferCapacity,
+                    ref _splatSplineBuffer, ref _splatSplineCapacity);
+                _uploadedSplatPlan = plan;
+            }
 
             var device = Engine.Device;
             cmd.SetDescriptorHeaps(1, new[] { device.SrvHeap });
             cmd.SetComputeRootSignature(device.GlobalRootSignature);
+            cmd.ResourceBarrierTransition(pool.Weights, ResourceStates.Common, ResourceStates.UnorderedAccess);
+            cmd.ResourceBarrierTransition(pool.TopLayer, ResourceStates.Common, ResourceStates.UnorderedAccess);
 
             var k = _kernelSplatBake;
             _splatCS.SetBuffer(k, "StampBuf", _splatStampBuffer);
-            _splatCS.SetPushConstant(k, "Output", controlArrayUAV);
+            _splatCS.SetPushConstant(k, "Output", pool.WeightsUav);
             _splatCS.SetPushConstant(k, "TerrainPages", terrainPagesIdx);
             _splatCS.SetPushConstant(k, "SplineBuf", _splatSplineBuffer.SrvIndex);
             _splatCS.SetPushConstant(k, "StampCount", (uint)plan.StampCount);
-            _splatCS.SetPushConstant(k, "Resolution", (uint)resolution);
-            _splatCS.SetPushConstant(k, "SliceCount", (uint)sliceCount);
+            _splatCS.SetPushConstant(k, "Resolution", (uint)pool.Texels);
+            _splatCS.SetPushConstant(k, "SliceCount", (uint)pool.LayerSlices);
             _splatCS.SetPushConstant(k, "LayerCount", (uint)plan.TargetCount);
             _splatCS.SetParam(k, "MaxHeight", terrain.MaxHeight);
             _splatCS.SetParam(k, "TerrainSizeX", terrain.TerrainSize.X);
-            _splatCS.SetPushConstant(k, "TopLayer", topLayerUAV);
-            _splatCS.SetPushConstant(k, "RegionX", (uint)r.x);
-            _splatCS.SetPushConstant(k, "RegionY", (uint)r.y);
-            _splatCS.SetPushConstant(k, "RegionW", (uint)r.width);
-            _splatCS.SetPushConstant(k, "RegionH", (uint)r.height);
+            _splatCS.SetPushConstant(k, "TopLayer", pool.TopUav);
+            uint groups = (uint)((Graphics.PaintPool.SlotTexels + 7) / 8);
+            foreach (var (level, px, py, slot) in pages)
+            {
+                var (x, y, weightSlice, topSlice) = pool.SlotPlace(slot);
+                _splatCS.SetPushConstant(k, "PageX", unchecked((uint)px));
+                _splatCS.SetPushConstant(k, "PageY", unchecked((uint)py));
+                _splatCS.SetPushConstant(k, "Level", (uint)level);
+                _splatCS.SetPushConstant(k, "OutX", (uint)x);
+                _splatCS.SetPushConstant(k, "OutY", (uint)y);
+                _splatCS.SetPushConstant(k, "OutSlice", (uint)weightSlice);
+                _splatCS.SetPushConstant(k, "OutTopSlice", (uint)topSlice);
+                _splatCS.Dispatch(k, cmd, groups, groups);
+                pool.Slots.MarkWritten(slot);
+            }
 
-            _splatCS.Dispatch(k, cmd, (uint)((r.width + 7) / 8), (uint)((r.height + 7) / 8));
+            cmd.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(pool.Weights)));
+            cmd.ResourceBarrierTransition(pool.Weights, ResourceStates.UnorderedAccess, ResourceStates.Common);
+            cmd.ResourceBarrierTransition(pool.TopLayer, ResourceStates.UnorderedAccess, ResourceStates.Common);
         }
 
+        // The splat plan whose stamps are in the upload buffers
+        private CoveragePlan? _uploadedSplatPlan;
+
         /// <summary>
-        /// Reads back the splat bake's top-layer map (R8_UINT, in Common state): one byte per control
-        /// texel, row by row, holding the palette channel that shows most there (255 = none).
-        /// Blocks until the GPU has caught up, like <see cref="ReadbackHeightmap"/>. Main thread.
+        /// A paint page's top layer (the channel that shows most per texel, 255 = none) read back from its slot: 256 × 256
+        /// bytes, row by row along +Z, the page's own texels without the border. Blocks until the GPU is done; only for a
+        /// slot whose bake was handed to the GPU before this frame. Main thread.
         /// </summary>
-        public static byte[] ReadbackTopLayers(ID3D12Resource topLayerTex, int res)
+        public static byte[]? ReadbackTopPage(Graphics.PaintPool pool, int slot)
         {
-            if (topLayerTex == null || res <= 0)
-                return null;
-
+            if (pool.TopLayer == null || !pool.Slots.Settled(slot)) return null;
+            const int texels = Graphics.PaintPool.PageTexels;
+            const int rowPitch = (texels + 255) & ~255;
             var device = Engine.Device;
-            int rowPitch = (res + 255) & ~255; // 256-byte aligned
-            int totalBytes = rowPitch * res;
-
-            var readbackResource = device.NativeDevice.CreateCommittedResource(
-                new HeapProperties(HeapType.Readback),
-                HeapFlags.None,
-                ResourceDescription.Buffer((ulong)totalBytes),
-                ResourceStates.CopyDest,
-                null);
-
+            var readback = device.NativeDevice.CreateCommittedResource(new HeapProperties(HeapType.Readback), HeapFlags.None,
+                ResourceDescription.Buffer((ulong)(rowPitch * texels)), ResourceStates.CopyDest, null);
             var allocator = device.NativeDevice.CreateCommandAllocator(CommandListType.Direct);
-            var cmdList = device.NativeDevice.CreateCommandList<ID3D12GraphicsCommandList>(
-                0, CommandListType.Direct, allocator, null);
-
+            var cmd = device.NativeDevice.CreateCommandList<ID3D12GraphicsCommandList>(0, CommandListType.Direct, allocator, null);
             try
             {
-                cmdList.ResourceBarrierTransition(topLayerTex,
-                    ResourceStates.Common, ResourceStates.CopySource);
-
-                var src = new TextureCopyLocation(topLayerTex, 0);
-                var dst = new TextureCopyLocation(readbackResource, new PlacedSubresourceFootPrint
+                var (x, y, _, topSlice) = pool.SlotPlace(slot);
+                int tx = x + Graphics.PaintPool.Border, ty = y + Graphics.PaintPool.Border;
+                cmd.ResourceBarrierTransition(pool.TopLayer, ResourceStates.Common, ResourceStates.CopySource);
+                cmd.CopyTextureRegion(new TextureCopyLocation(readback, new PlacedSubresourceFootPrint
                 {
                     Offset = 0,
-                    Footprint = new SubresourceFootPrint(Format.R8_UInt, (uint)res, (uint)res, 1, (uint)rowPitch)
-                });
-                cmdList.CopyTextureRegion(dst, 0, 0, 0, src);
+                    Footprint = new SubresourceFootPrint(Format.R8_UInt, texels, texels, 1, rowPitch)
+                }), 0, 0, 0, new TextureCopyLocation(pool.TopLayer, (uint)topSlice),
+                    new Vortice.Mathematics.Box(tx, ty, 0, tx + texels, ty + texels, 1));
+                cmd.ResourceBarrierTransition(pool.TopLayer, ResourceStates.CopySource, ResourceStates.Common);
+                cmd.Close();
+                device.SubmitAndWait(cmd);
 
-                cmdList.ResourceBarrierTransition(topLayerTex,
-                    ResourceStates.CopySource, ResourceStates.Common);
-
-                cmdList.Close();
-                device.SubmitAndWait(cmdList);
-
-                var layers = new byte[res * res];
+                var layers = new byte[texels * texels];
                 unsafe
                 {
-                    void* pData;
-                    readbackResource.Map(0, null, &pData);
-
-                    fixed (byte* dstPtr = layers)
-                    {
-                        for (int y = 0; y < res; y++)
-                            Buffer.MemoryCopy((byte*)pData + (long)y * rowPitch, dstPtr + (long)y * res, res, res);
-                    }
-
-                    readbackResource.Unmap(0);
+                    void* data;
+                    readback.Map(0, null, &data);
+                    fixed (byte* dst = layers)
+                        for (int r = 0; r < texels; r++)
+                            Buffer.MemoryCopy((byte*)data + (long)r * rowPitch, dst + (long)r * texels, texels, texels);
+                    readback.Unmap(0);
                 }
-
                 return layers;
             }
             finally
             {
-                cmdList.Dispose();
+                cmd.Dispose();
                 allocator.Dispose();
-                readbackResource.Dispose();
+                readback.Dispose();
+            }
+        }
+
+        /// <summary>
+        /// Every level 0 paint page resident in the pool (all of them with EngineSettings.TerrainPaintPages 0) against the
+        /// whole-map bake there was before 5b (CS_SplatBakeFlat, Y-flipped), baked over the same texels: their weights byte for
+        /// byte. Returns the texels and pages that differ, the largest difference of a channel (of 255), the texel slices
+        /// compared and the pages checked. Blocks. Main thread.
+        /// </summary>
+        public unsafe (long texels, int pages, int maxStep, long compared, int checkedPages) CheckPaintPages(CoveragePlan plan, Terrain terrain,
+            uint terrainPagesIdx, Graphics.PaintPool pool)
+        {
+            if (pool.Weights == null) return (-1, -1, -1, 0, 0);
+            EnsureCoverageInitialized();
+            UploadCoverage(plan, ref _splatStampBuffer, ref _splatStampBufferCapacity, ref _splatSplineBuffer, ref _splatSplineCapacity);
+            _uploadedSplatPlan = plan;
+
+            const int texels = Graphics.PaintPool.PageTexels;
+            int res = pool.Texels, g = pool.LayerSlices, across = pool.Slots.PagesAcross;
+            const int rowPitch = texels * 4;   // 1024, 256-aligned
+            const int sliceBytes = rowPitch * texels;
+            var device = Engine.Device;
+            var flat = device.CreateTexture2D(Format.R8G8B8A8_UNorm, texels, texels, g, 1, ResourceFlags.AllowUnorderedAccess, ResourceStates.Common);
+            uint flatUav = device.AllocateBindlessIndex();
+            device.NativeDevice.CreateUnorderedAccessView(flat, null, new UnorderedAccessViewDescription
+            {
+                Format = Format.R8G8B8A8_UNorm,
+                ViewDimension = UnorderedAccessViewDimension.Texture2DArray,
+                Texture2DArray = new Texture2DArrayUnorderedAccessView { MipSlice = 0, FirstArraySlice = 0, ArraySize = (uint)g },
+            }, device.GetCpuHandle(flatUav));
+            var readback = device.NativeDevice.CreateCommittedResource(new HeapProperties(HeapType.Readback), HeapFlags.None,
+                ResourceDescription.Buffer((ulong)sliceBytes * (ulong)g * 2), ResourceStates.CopyDest, null);
+            var allocator = device.NativeDevice.CreateCommandAllocator(CommandListType.Direct);
+            long differ = 0, compared = 0;
+            int differPages = 0, maxStep = 0, checkedPages = 0;
+            try
+            {
+                for (int pz = 0; pz < across; pz++)
+                    for (int px = 0; px < across; px++)
+                    {
+                        int x0 = px * texels, j0 = pz * texels;
+                        int w = Math.Min(texels, res - x0), h = Math.Min(texels, res - j0);
+                        if (w <= 0 || h <= 0) continue;
+                        int y0 = res - j0 - h;   // the flat array's rows of these texel rows (flipped)
+                        int slot = pool.Slots.SlotOf(0, px, pz);
+                        if (slot < 0 || !pool.Slots.Settled(slot)) continue;   // not resident at level 0 (streaming), or its bake not run
+                        checkedPages++;
+                        var (sx, sy, weightSlice, _) = pool.SlotPlace(slot);
+
+                        var cmd = device.NativeDevice.CreateCommandList<ID3D12GraphicsCommandList>(0, CommandListType.Direct, allocator, null);
+                        cmd.SetDescriptorHeaps(1, new[] { device.SrvHeap });
+                        cmd.SetComputeRootSignature(device.GlobalRootSignature);
+                        cmd.ResourceBarrierTransition(flat, ResourceStates.Common, ResourceStates.UnorderedAccess);
+                        var k = _kernelSplatBakeFlat;
+                        _splatCS.SetBuffer(k, "StampBuf", _splatStampBuffer);
+                        _splatCS.SetPushConstant(k, "Output", flatUav);
+                        _splatCS.SetPushConstant(k, "TerrainPages", terrainPagesIdx);
+                        _splatCS.SetPushConstant(k, "SplineBuf", _splatSplineBuffer.SrvIndex);
+                        _splatCS.SetPushConstant(k, "StampCount", (uint)plan.StampCount);
+                        _splatCS.SetPushConstant(k, "Resolution", (uint)res);
+                        _splatCS.SetPushConstant(k, "SliceCount", (uint)g);
+                        _splatCS.SetPushConstant(k, "LayerCount", (uint)plan.TargetCount);
+                        _splatCS.SetParam(k, "MaxHeight", terrain.MaxHeight);
+                        _splatCS.SetParam(k, "TerrainSizeX", terrain.TerrainSize.X);
+                        _splatCS.SetPushConstant(k, "TopLayer", 0u);
+                        _splatCS.SetPushConstant(k, "RegionX", (uint)x0);
+                        _splatCS.SetPushConstant(k, "RegionY", (uint)y0);
+                        _splatCS.SetPushConstant(k, "RegionW", (uint)w);
+                        _splatCS.SetPushConstant(k, "RegionH", (uint)h);
+                        _splatCS.Dispatch(k, cmd, (uint)((w + 7) / 8), (uint)((h + 7) / 8));
+                        cmd.ResourceBarrierTransition(flat, ResourceStates.UnorderedAccess, ResourceStates.CopySource);
+                        cmd.ResourceBarrierTransition(pool.Weights, ResourceStates.Common, ResourceStates.CopySource);
+                        for (int s = 0; s < g; s++)
+                        {
+                            cmd.CopyTextureRegion(new TextureCopyLocation(readback, new PlacedSubresourceFootPrint
+                            {
+                                Offset = (ulong)((long)s * sliceBytes),
+                                Footprint = new SubresourceFootPrint(Format.R8G8B8A8_UNorm, texels, texels, 1, rowPitch)
+                            }), 0, 0, 0, new TextureCopyLocation(flat, (uint)s), new Vortice.Mathematics.Box(0, 0, 0, w, h, 1));
+                            int bx = sx + Graphics.PaintPool.Border, by = sy + Graphics.PaintPool.Border;
+                            cmd.CopyTextureRegion(new TextureCopyLocation(readback, new PlacedSubresourceFootPrint
+                            {
+                                Offset = (ulong)((long)(g + s) * sliceBytes),
+                                Footprint = new SubresourceFootPrint(Format.R8G8B8A8_UNorm, texels, texels, 1, rowPitch)
+                            }), 0, 0, 0, new TextureCopyLocation(pool.Weights, (uint)(weightSlice + s)),
+                                new Vortice.Mathematics.Box(bx, by, 0, bx + w, by + h, 1));
+                        }
+                        cmd.ResourceBarrierTransition(flat, ResourceStates.CopySource, ResourceStates.Common);
+                        cmd.ResourceBarrierTransition(pool.Weights, ResourceStates.CopySource, ResourceStates.Common);
+                        cmd.Close();
+                        device.SubmitAndWait(cmd);
+                        cmd.Dispose();
+                        allocator.Reset();
+
+                        void* data;
+                        readback.Map(0, null, &data);
+                        var bytes = (byte*)data;
+                        long before = differ;
+                        for (int s = 0; s < g; s++)
+                            for (int ty = 0; ty < h; ty++)
+                            {
+                                // Flat region row ty holds texel row j0 + h - 1 - ty: the page's local row h - 1 - ty
+                                byte* f = bytes + (long)s * sliceBytes + (long)ty * rowPitch;
+                                byte* p = bytes + (long)(g + s) * sliceBytes + (long)(h - 1 - ty) * rowPitch;
+                                for (int tx = 0; tx < w; tx++)
+                                {
+                                    bool same = true;
+                                    for (int c = 0; c < 4; c++)
+                                    {
+                                        int d = Math.Abs(f[tx * 4 + c] - p[tx * 4 + c]);
+                                        if (d != 0) { same = false; maxStep = Math.Max(maxStep, d); }
+                                    }
+                                    if (!same) differ++;
+                                    compared++;
+                                }
+                            }
+                        readback.Unmap(0);
+                        if (differ > before) differPages++;
+                    }
+                return (differ, differPages, maxStep, compared, checkedPages);
+            }
+            finally
+            {
+                allocator.Dispose();
+                readback.Dispose();
+                device.DeferDispose(flat);
+                device.DeferReleaseBindlessIndex(flatUav);
             }
         }
 
         /// <summary>
         /// Composite the deco stamps into the decoration control texture (top 8 decorators per texel).
-        /// 'controlMapsSrv' is the finished splat result the layer filters read (0 = no layers).
+        /// The layer filters read the paint pages through <paramref name="terrainPagesIdx"/> (TerrainPagesParams.PaintIdx).
+        /// <paramref name="region"/>: the control texels baked again (the rest keep what the last bake wrote).
         /// Render callback; the control texture must be in UnorderedAccess state.
         /// </summary>
         public void BakeDecoControl(CoveragePlan plan, ID3D12GraphicsCommandList cmd, Terrain terrain,
-            uint terrainPagesIdx, uint controlMapsSrv, uint decoControlUAV, int resolution)
+            uint terrainPagesIdx, uint decoControlUAV, int resolution, (int x, int y, int width, int height) region)
         {
+            if (region.width <= 0 || region.height <= 0) return;
             EnsureCoverageInitialized();
 
             UploadCoverage(plan, ref _decoStampBuffer, ref _decoStampBufferCapacity,
@@ -2118,13 +2370,15 @@ namespace Freefall.Assets
             _decoCS.SetPushConstant(k, "TerrainPages", terrainPagesIdx);
             _decoCS.SetPushConstant(k, "SplineBuf", _decoSplineBuffer.SrvIndex);
             _decoCS.SetPushConstant(k, "LayerCount", (uint)plan.LayerCount);
-            _decoCS.SetPushConstant(k, "ControlMaps", controlMapsSrv);
             _decoCS.SetParam(k, "MaxHeight", terrain.MaxHeight);
             _decoCS.SetParam(k, "TerrainSizeX", terrain.TerrainSize.X);
             _decoCS.SetPushConstant(k, "StampCount", (uint)plan.StampCount);
+            _decoCS.SetPushConstant(k, "RegionX", (uint)region.x);
+            _decoCS.SetPushConstant(k, "RegionY", (uint)region.y);
+            _decoCS.SetPushConstant(k, "RegionW", (uint)region.width);
+            _decoCS.SetPushConstant(k, "RegionH", (uint)region.height);
 
-            uint groups = (uint)((resolution + 7) / 8);
-            _decoCS.Dispatch(k, cmd, groups, groups);
+            _decoCS.Dispatch(k, cmd, (uint)((region.width + 7) / 8), (uint)((region.height + 7) / 8));
         }
 
         private void UploadCoverage(CoveragePlan plan,

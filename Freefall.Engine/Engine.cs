@@ -704,6 +704,33 @@ namespace Freefall
          public bool IndexedDraws { get; set; } = true;
 
          /// <summary>
+         /// Metres round the camera in which a terrain's heights are at full detail (level 0 pages); twice and four times
+         /// that the next two levels, coarser beyond (TerrainHeightResidency, TERRAIN_PAGES_PLAN.md 5a). 0 = every level 0
+         /// page stays in the height pool, the default until paint and the near maps bake per page (5b, 5c): baked
+         /// whole-map from the pool, they read coarse heights away from the camera.
+         /// </summary>
+         [Category("Terrain")]
+         [ValueRange(0f, 16384f)]
+         public float TerrainDetailRadius { get; set; } = 0f;
+
+         /// <summary>Height pages uploaded into the pool in a frame while a terrain streams (TerrainDetailRadius above 0).</summary>
+         [ValueRange(1, 256)]
+         public int TerrainPageUploadsPerFrame { get; set; } = 16;
+
+         /// <summary>
+         /// Paint pages (the layers' blend weights, 256 texels a side) a side of the window round the camera at every level,
+         /// each level's pages twice the last's size (TerrainPaintResidency, TERRAIN_PAGES_PLAN.md 5b): the paint is baked
+         /// from the stamps as pages arrive. 0 = every level 0 page in the pool, the whole map at full paint as before 5b.
+         /// </summary>
+         [ValueRange(0, 32)]
+         public int TerrainPaintPages { get; set; } = 5;
+
+         /// <summary>Paint pages baked in a frame as they arrive or change away from the camera's own window (the level 0
+         /// pages an edit touches near the camera bake at once).</summary>
+         [ValueRange(1, 64)]
+         public int TerrainPaintBakesPerFrame { get; set; } = 4;
+
+         /// <summary>
          /// Characters are posed less often the smaller they are on screen and when out of view, and not at all
          /// once too small to be drawn (AnimatorSystem). Off = every character every frame.
          /// </summary>

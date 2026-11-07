@@ -169,6 +169,80 @@ namespace Freefall.Assets
             return Height01(localX / terrainSize.X * last, localZ / terrainSize.Y * last);
         }
 
+        /// <summary>
+        /// The texels of height pool page (px, py) at a level (Graphics.HeightPool: <paramref name="texels"/> a side, the
+        /// page's 257 samples inside a border of <paramref name="border"/>) into rows of <paramref name="pitch"/> values: a
+        /// level L page holds every 2^L-th sample from (px, py) · 256 · 2^L, its border the samples beyond its edges at
+        /// that spacing, clamped to the terrain (past its edge nothing reads them). Level 0 copies its own rows. Any thread.
+        /// </summary>
+        public void FillPoolPage(int level, int px, int py, Span<ushort> into, int pitch, int border, int texels)
+        {
+            int step = 1 << level;
+            int x0 = (px << PageShift) << level, z0 = (py << PageShift) << level;
+            if (level == 0 && px < PagesAcross && py < PagesAcross)
+            {
+                var (_, _, w, h) = PageExtent(px, py);
+                var own = HeightPage(px, py);
+                for (int tz = 0; tz < texels; tz++)
+                {
+                    var row = into.Slice(tz * pitch, texels);
+                    int z = tz - border;
+                    if (z >= 0 && z < h && !own.IsEmpty)
+                    {
+                        own.Slice(z * PageSamples, w).CopyTo(row.Slice(border, w));
+                        for (int tx = 0; tx < border; tx++)
+                            row[tx] = Sample(x0 + tx - border, z0 + z);
+                        for (int tx = border + w; tx < texels; tx++)
+                            row[tx] = Sample(x0 + tx - border, z0 + z);
+                    }
+                    else
+                        for (int tx = 0; tx < texels; tx++)
+                            row[tx] = Sample(x0 + tx - border, z0 + z);
+                }
+                return;
+            }
+            for (int tz = 0; tz < texels; tz++)
+            {
+                var row = into.Slice(tz * pitch, texels);
+                int sz = z0 + (tz - border) * step;
+                for (int tx = 0; tx < texels; tx++)
+                    row[tx] = Sample(x0 + (tx - border) * step, sz);
+            }
+        }
+
+        /// <summary>The lowest and highest sample of a box (x0, z0 to x1, z1, all inclusive, clamped to the terrain), as the
+        /// R16 values held. (65535, 0) when the box is empty or no heights are in. Any thread.</summary>
+        public (ushort min, ushort max) MinMax(int x0, int z0, int x1, int z1)
+        {
+            int last = Resolution - 1;
+            x0 = Math.Clamp(x0, 0, last); x1 = Math.Clamp(x1, 0, last);
+            z0 = Math.Clamp(z0, 0, last); z1 = Math.Clamp(z1, 0, last);
+            ushort lo = ushort.MaxValue, hi = 0;
+            for (int z = z0; z <= z1; z++)
+            {
+                int pz = Math.Min(z >> PageShift, PagesAcross - 1);
+                int x = x0;
+                while (x <= x1)
+                {
+                    int px = Math.Min(x >> PageShift, PagesAcross - 1);
+                    int pageEnd = px == PagesAcross - 1 ? last : ((px + 1) << PageShift) - 1;
+                    int run = Math.Min(x1, pageEnd) - x + 1;
+                    var page = _heights[pz * PagesAcross + px];
+                    if (page != null)
+                    {
+                        var span = page.AsSpan((z - (pz << PageShift)) * PageSamples + x - (px << PageShift), run);
+                        foreach (var v in span)
+                        {
+                            if (v < lo) lo = v;
+                            if (v > hi) hi = v;
+                        }
+                    }
+                    x += run;
+                }
+            }
+            return (lo, hi);
+        }
+
         // ── Holes ──
 
         /// <summary>

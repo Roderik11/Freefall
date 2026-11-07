@@ -104,8 +104,10 @@ namespace Freefall.Components
         public uint GpuTerrainIdx()
         {
             if (_baker == null || Terrain == null || Transform == null) return 0;
+            // The paint pages ride along (terrain_paint.hlsli LoadPaint): 0 while there is no paint
+            uint paintIdx = _splatPlan != null && _layerPalette.Count > 0 ? _paintPool.WriteParams(_layerPalette.Count) : 0u;
             return _baker.Pool.WriteParams(Transform.WorldPosition, Terrain.TerrainSize, Terrain.MaxHeight,
-                                           (uint)TerrainBaker.HeightVersion);
+                                           (uint)TerrainBaker.HeightVersion, paintIdx);
         }
         private GraphicsBuffer[] _indirectArgsBuffers = new GraphicsBuffer[FrameCount];
 
@@ -179,8 +181,7 @@ namespace Freefall.Components
         private Mesh _patchMesh = null!;
         private int _meshPartId;
 
-        // The layer weights (texture array, baked); the layers' own textures by bindless index per channel
-        private Texture? ControlMapsArray;
+        // The layers' own textures by bindless index per channel (their weights: the paint pages, _paintPool)
         private LayerTextureIds[] _layerTextures = new LayerTextureIds[32];
         private bool _layerHeights;     // some layer has a height map (push slot 26)
 
@@ -326,27 +327,42 @@ namespace Freefall.Components
         // ───── Height Bake (GPU layer compositor) ─────────────────────────
         private bool _needHeightFieldReadback;
 
-        // ───── Cached Packed Splatmap Array ────────────────────────────────
-        private ID3D12Resource _packedControlArray;
-        private Texture _packedControlTexture;     // stable wrapper for ControlMapsArray
-        private uint _packedControlSRV;
-        private uint[] _packedSliceUAVs;            // per-slice UAVs for direct packing
-        private uint _packedControlArrayUAV;        // full-array UAV for stamp overlay
-        private int _packedArrayResolution;
-        private int _packedSliceCount;
+        // ───── Paint pages (TERRAIN_PAGES_PLAN.md 5b) ───────────────────────
+        // The layer weights as pages in a pool, baked from the splat stamps as pages arrive round the camera or change
+        // (EngineSettings.TerrainPaintPages; 0 = every level 0 page, the whole map at full paint as before 5b).
+        private readonly Graphics.PaintPool _paintPool = new();
+        private Graphics.TerrainPaintResidency? _paintResidency;
+        private TerrainBaker.CoveragePlan? _splatPlan;            // the stamps every paint page bakes from
+        private List<TerrainLayer> _paintPalette = new();         // the palette _splatPlan was laid out for
+        private bool _paintPoolWarned;
+        private static readonly ProfilerMarker _paintResidencyMarker = ProfilerMarker.Get("Terrain paint residency");
 
-        // ───── Top Layer Map (which layer is where, for GetLayer) ──────────
-        // One texel per control texel: the palette channel that shows most there. The splat bake
-        // writes it with the weights; the CPU copy is fetched only once somebody has asked.
-        private ID3D12Resource? _topLayerTex;      // R8_UINT
-        private uint _topLayerUAV;
-        private byte[]? _topLayers;                // row by row, as the control array lies (Y-flipped)
-        private int _topLayersResolution;
-        private List<TerrainLayer> _topLayersPalette = new();   // what the channels in _topLayers mean
-        private List<TerrainLayer> _bakedPalette = new();       // what they mean in the texture
-        private int _bakedTopLayerResolution;
-        private bool _topLayersWanted;
-        private volatile bool _topLayersStale;     // a bake has run since the CPU copy was fetched
+        private Graphics.TerrainPaintResidency PaintResidency => _paintResidency ??= new(_paintPool);
+
+        // Per slot: a serial bumped each time a bake of it is put on a list, and the palette it was baked with (what its
+        // channels mean), so GetLayer's copies know when they are old
+        private long[] _paintSlotSerial = Array.Empty<long>();
+        private List<TerrainLayer>?[] _paintSlotPalette = Array.Empty<List<TerrainLayer>?>();
+        private long _paintSerial;
+
+        // Level 0 paint pages baked since the decoration control texture last saw them, in terrain UV: their ground is
+        // baked into it again (a page that arrives replaces the coarse paint the deco filters read before)
+        private Vector2 _decoRedoMin = new(float.MaxValue), _decoRedoMax = new(float.MinValue);
+        private TerrainBaker.CoveragePlan? _lastDecoPlan;
+
+        // ───── Top layers (which layer is where, for GetLayer) ──────────────
+        // Per resident paint page asked about: its top layer (the channel that shows most per texel), read back from the
+        // pool once somebody has asked about a place on it and its bake has gone to the GPU.
+        private sealed class TopPage
+        {
+            public required byte[] Layers;               // 256 x 256, row by row along +Z
+            public required List<TerrainLayer> Palette;  // what the channels mean
+            public int Slot;
+            public long Serial;
+        }
+        private readonly Dictionary<(int level, int px, int py), TopPage> _topPages = new();
+        private readonly HashSet<(int level, int px, int py)> _topWanted = new();
+        private const int TopPagesPerFrame = 4;
 
         // ───── Holes (HoleStamp) ───────────────────────────────────────────
         // The mask itself is in Terrain.Pages, baked on the CPU (TerrainBaker.BakeHoles) because the PhysX height
@@ -473,18 +489,12 @@ namespace Freefall.Components
             device?.DeferDispose(_tilingBuffer);
             device?.DeferDispose(_plantTintBuffer);
 
-            // ── Packed control array ──
-            device?.DeferDispose(_packedControlArray);
-            if (_packedControlSRV != 0) device?.DeferReleaseBindlessIndex(_packedControlSRV);
-            if (_packedSliceUAVs != null)
-                foreach (var idx in _packedSliceUAVs)
-                    if (idx != 0) device?.DeferReleaseBindlessIndex(idx);
-            if (_packedControlArrayUAV != 0) device?.DeferReleaseBindlessIndex(_packedControlArrayUAV);
-
-            // ── Top layer map ──
-            device?.DeferDispose(_topLayerTex);
-            if (_topLayerUAV != 0) device?.DeferReleaseBindlessIndex(_topLayerUAV);
-            _topLayers = null;
+            // ── Paint pages and the top layers read from them ──
+            if (device != null) _paintPool.Dispose();
+            _paintResidency = null;
+            _splatPlan = null;
+            _topPages.Clear();
+            _topWanted.Clear();
 
             // ── Hole mask (the CPU mask stays with the Terrain asset, like its heights) ──
             device?.DeferDispose(_holeTex);
@@ -566,16 +576,26 @@ namespace Freefall.Components
             if (material == null || material.Effect == null) return;
 
             EnsureQuadtreeDepth(Math.Min(Terrain.QuadtreeDepth, MaxQuadtreeDepth));
-            // Every page is loaded until pages stream (TERRAIN_PAGES_PLAN.md stage 5): a pool past D3D12's array cap cannot
-            // be made (16 km at 0.5 m per vertex needs 4,096 slices), so nothing is drawn rather than the device failing
-            if (Graphics.HeightPool.SlicesFor(Terrain.EffectiveHeightmapResolution) is var slices && slices > Graphics.HeightPool.MaxSlices)
+
+            // The pool's layout: every level 0 page, or the windows round the camera (EngineSettings.TerrainDetailRadius,
+            // TERRAIN_PAGES_PLAN.md 5a)
+            int poolCapacity = Graphics.TerrainHeightResidency.CapacityFor(Terrain.EffectiveHeightmapResolution, Terrain.VertexSpacing,
+                Engine.Settings.TerrainDetailRadius);
+            _baker.PoolCapacity = poolCapacity;
+
+            // With every page resident a pool past D3D12's array cap cannot be made (16 km at 0.5 m per vertex needs 4,096
+            // slices), so nothing is drawn rather than the device failing; a detail radius brings it down to the windows
+            int slices = poolCapacity == 0
+                ? Graphics.HeightPool.SlicesFor(Terrain.EffectiveHeightmapResolution)
+                : (poolCapacity + Graphics.HeightPool.ScratchSlots + 3) / 4;
+            if (slices > Graphics.HeightPool.MaxSlices)
             {
                 if (!_poolWarned)
                 {
                     _poolWarned = true;
                     Debug.LogError("[TerrainRenderer]", $"{Terrain.Name}: {Terrain.TerrainSize.X} m at {Terrain.VertexSpacing} m per vertex needs " +
                                    $"{slices} slices of height pages, past D3D12's {Graphics.HeightPool.MaxSlices}: not drawn. " +
-                                   "Use a coarser MetresPerVertex until pages stream.");
+                                   "Set a TerrainDetailRadius (the pages stream round the camera) or a coarser MetresPerVertex.");
                 }
                 return;
             }
@@ -604,17 +624,42 @@ namespace Freefall.Components
                 Terrain.PendingPagesUpload = false; // consumed
 
                 // The loader keeps only pages of the terrain's own density
-                if (Terrain.Pages is { HasHeights: true } saved && saved.Resolution == Terrain.EffectiveHeightmapResolution
-                    && _baker.UploadPages(saved))
+                if (FillPoolFromCpu())
                 {
-                    Terrain.HeightmapStampsHash = Terrain.BakedStampsHash;
                     Terrain.ConsumeFlags(TerrainDirtyFlags.HeightBake); // loaded from the file, skip bake
-                    _heightRangePyramidBuilt = false;
                     Terrain.MarkForUpdate(TerrainDirtyFlags.AlbedoBake);
                     _needHeightFieldReadback = true;
                 }
                 else
                     Terrain.MarkForUpdate(TerrainDirtyFlags.HeightBake);
+            }
+            // The detail radius changed: a pool of the new layout, filled from the CPU store (a bake owing pages to it bakes
+            // again: what the old pool owed is gone with it)
+            else if (_baker.Pool.Texture != null && !_baker.Pool.Matches(Terrain.EffectiveHeightmapResolution, poolCapacity))
+            {
+                bool owed = _baker.OwedPages > 0;
+                if (!FillPoolFromCpu() || owed)
+                    Terrain.MarkForUpdate(TerrainDirtyFlags.HeightBake);
+            }
+
+            // Streaming: the windows follow the camera, a few pages a frame, on this frame's list before its bake; a pool a
+            // bake made with nothing in it is filled once the heights are read back
+            if (poolCapacity != 0 && _baker.Pool.Texture != null
+                && Terrain.Pages is { HasHeights: true } cpuPages && cpuPages.Resolution == _baker.Pool.Resolution)
+            {
+                if (!_baker.Pool.Filled)
+                    FillPoolFromCpu();
+                else
+                {
+                    using (_residencyMarker.Auto())
+                        Residency.Update(cpuPages, CameraLocal(), Terrain.VertexSpacing, Engine.Settings.TerrainDetailRadius,
+                            Engine.Settings.TerrainPageUploadsPerFrame);
+                    if (Residency.HasWork)
+                    {
+                        var residency = Residency;
+                        CommandBuffer.Enqueue(RenderPass.Opaque, list => residency.Record(list));
+                    }
+                }
             }
 
             // The Terrain asset is shared across scene loads, so its height pool may hold another scene's
@@ -746,100 +791,46 @@ namespace Freefall.Components
             if (_needHeightFieldReadback && !Terrain.NeedsUpdate(TerrainDirtyFlags.HeightBake))
                 ReadBackHeights();
 
-            // ── Splat: composite the splat stamps into the packed layer weights ──
+            // ── Paint: the splat stamps laid out once, baked into the paint pool page by page (TERRAIN_PAGES_PLAN.md 5b) ──
+            // An edit marks the pages over its region dirty; new heights or another palette mark every page (they may move
+            // any stamp's height or slope filter, or what every channel means). The pages bake below as they arrive or
+            // come up dirty.
             if (splatDirty)
             {
                 if (_layerPalette.Count > 0)
                 {
-                    int res = Terrain.EffectiveSplatmapResolution;
-                    int sliceCount = (_layerPalette.Count + 3) / 4;
-
-                    // Ensure packed array exists at correct resolution/slice count
-                    var arrayBefore = _packedControlArray;
-                    EnsurePackedControlArray(res, sliceCount);
-                    ControlMapsArray = _packedControlTexture;
-
-                    // A local edit redoes only its region (control texels; the map is Y-flipped against the terrain's
-                    // UV), a texel more each side. A new array has nothing outside it yet.
-                    (int x, int y, int width, int height)? region = null;
-                    if (splatLocal && arrayBefore == _packedControlArray && arrayBefore != null)
+                    using (_splatPlanMarker.Auto())
+                        _splatPlan = _baker.PrepareSplat(Terrain, this, _splatEntries, _layerPalette);
+                    if (splatLocal && ReferenceEquals(_paintPalette, _layerPalette))
                     {
                         var origin = Transform?.WorldPosition ?? Vector3.Zero;
                         var size = Terrain.TerrainSize;
+                        int res = Terrain.EffectiveSplatmapResolution;
                         int x0 = (int)MathF.Floor((splatRegionMin.X - origin.X) / size.X * res) - 1;
                         int x1 = (int)MathF.Ceiling((splatRegionMax.X - origin.X) / size.X * res) + 1;
-                        int y0 = (int)MathF.Floor((1f - (splatRegionMax.Y - origin.Z) / size.Y) * res) - 1;
-                        int y1 = (int)MathF.Ceiling((1f - (splatRegionMin.Y - origin.Z) / size.Y) * res) + 1;
-                        x0 = Math.Clamp(x0, 0, res); x1 = Math.Clamp(x1, 0, res);
-                        y0 = Math.Clamp(y0, 0, res); y1 = Math.Clamp(y1, 0, res);
-                        region = (x0, y0, Math.Max(0, x1 - x0), Math.Max(0, y1 - y0));
+                        int z0 = (int)MathF.Floor((splatRegionMin.Y - origin.Z) / size.Y * res) - 1;
+                        int z1 = (int)MathF.Ceiling((splatRegionMax.Y - origin.Z) / size.Y * res) + 1;
+                        PaintResidency.MarkDirty(Math.Clamp(x0, 0, res), Math.Clamp(z0, 0, res), Math.Clamp(x1, 0, res), Math.Clamp(z1, 0, res));
                     }
-                    SplatBakeTexels = region is { } r ? (long)r.width * r.height : (long)res * res;
-
-                    TerrainBaker.CoveragePlan plan;
-                    using (_splatPlanMarker.Auto())
-                        plan = _baker.PrepareSplat(Terrain, this, _splatEntries, _layerPalette);
-                    var baker = _baker;
-                    var terrain = Terrain;
-                    var packedArray = _packedControlArray;
-                    var arrayUAV = _packedControlArrayUAV;
-                    var topLayerTex = _topLayerTex!;
-                    var topLayerUAV = _topLayerUAV;
-                    var palette = _layerPalette;   // replaced, never changed, when the layers change
-                    var renderer = this;
-                    CommandBuffer.Enqueue(RenderPass.Opaque, (list) =>
-                    {
-                        // The height bake enqueued above has run by now, so this reads the new heights (the pages)
-                        uint hmSrv = renderer.GpuTerrainIdx();
-
-                        list.ResourceBarrierTransition(packedArray,
-                            ResourceStates.Common, ResourceStates.UnorderedAccess);
-                        list.ResourceBarrierTransition(topLayerTex,
-                            ResourceStates.Common, ResourceStates.UnorderedAccess);
-
-                        PixMarker.Begin(list, "Terrain splat bake");
-                        baker.BakeSplat(plan, list, terrain, hmSrv, arrayUAV, topLayerUAV, res, sliceCount, region);
-                        PixMarker.End(list);
-                        list.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(packedArray)));
-                        list.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(topLayerTex)));
-
-                        // Back to common for shader reads (and for the copy GetLayer's readback makes)
-                        list.ResourceBarrierTransition(packedArray,
-                            ResourceStates.UnorderedAccess, ResourceStates.Common);
-                        list.ResourceBarrierTransition(topLayerTex,
-                            ResourceStates.UnorderedAccess, ResourceStates.Common);
-
-                        terrain.MarkForUpdate(TerrainDirtyFlags.AlbedoBake);
-
-                        renderer._bakedPalette = palette;
-                        renderer._bakedTopLayerResolution = res;
-                        renderer._topLayersStale = true;
-                    });
+                    else
+                        PaintResidency.MarkAllDirty();
+                    _paintPalette = _layerPalette;   // replaced, never changed, when the layers change
                 }
                 else
                 {
                     // No splat stamp references a layer: nothing to render the surface with
-                    ControlMapsArray = InternalAssets.BlackArray;
-                    _topLayers = null;
-                    _topLayersStale = false;
+                    _splatPlan = null;
+                    _paintPalette = _layerPalette;
                 }
             }
 
-            // The CPU copy of which layer is where, once somebody has asked (GetLayer) and the bakes have
-            // settled: the same blocking fetch as the height field's, so not while a stamp is dragged.
-            if (_topLayersWanted && _topLayersStale && !splatDirty && _topLayerTex != null
-                && _bakedTopLayerResolution == _packedArrayResolution)
-            {
-                _topLayersStale = false;
-                var palette = _bakedPalette;
-                var layers = TerrainBaker.ReadbackTopLayers(_topLayerTex, _bakedTopLayerResolution);
-                if (layers != null)
-                {
-                    _topLayersPalette = palette;
-                    _topLayersResolution = _bakedTopLayerResolution;
-                    _topLayers = layers;
-                }
-            }
+            if (_splatPlan != null && _layerPalette.Count > 0)
+                UpdatePaintPages();
+
+            // GetLayer's copies of the pages it was asked about, a few a frame, once their bakes have gone to the GPU (not
+            // while a stamp is dragged: the page bakes again every frame and the old answer stands)
+            if (_topWanted.Count > 0)
+                FetchTopPages();
 
             // ── Decoration coverage: laid out here, run by the decorator dispatch below ──
             if (decoDirty)
@@ -867,8 +858,8 @@ namespace Freefall.Components
             // Bind textures if available (terrain still renders without splatmaps)
 
             // The heights: this terrain's pages (terrain_pages.hlsli), this frame's parameters
+            // (and through them the paint pages, TerrainPagesParams.PaintIdx)
             material.SetTextureIndex("TerrainPages", GpuTerrainIdx());
-            if (ControlMapsArray != null) material.SetTexture("ControlMaps", ControlMapsArray);
 
             // Capture values for lambda closure
             int fi = frameIndex;
@@ -1075,103 +1066,120 @@ namespace Freefall.Components
         }
 
         /// <summary>
-        /// Ensures the packed RGBA Texture2DArray exists at the right resolution/slice count.
-        /// Only recreates when the configuration changes (layer count or resolution).
+        /// This frame's paint pages (TERRAIN_PAGES_PLAN.md 5b): the pool made at the layout EngineSettings.TerrainPaintPages
+        /// asks (made again when the map's size, the layers' slices or the layout change, and then baked whole), the pages
+        /// round the camera given slots, and those arriving or dirty baked on this frame's list after the heights. Main
+        /// thread.
         /// </summary>
-        private void EnsurePackedControlArray(int resolution, int sliceCount)
+        private void UpdatePaintPages()
         {
-            if (_packedControlArray != null && _packedArrayResolution == resolution && _packedSliceCount == sliceCount)
-                return;
+            int texels = Terrain.EffectiveSplatmapResolution;
+            int layerSlices = (_layerPalette.Count + 3) / 4;
+            int pagesPerSide = Math.Max(0, Engine.Settings.TerrainPaintPages);
+            int capacity = Graphics.TerrainPaintResidency.CapacityFor(texels, pagesPerSide);
 
-            var device = Engine.Device;
-
-            // Retire the old array. Deferred: the splat bake and the terrain draws of the frames in flight still
-            // reference it. Its slots go the same way; every reader takes them from the fields again each
-            // frame (they used to be overwritten below without being returned).
-            device.DeferDispose(_packedControlArray);
-            device.DeferReleaseBindlessIndex(_packedControlSRV);
-            if (_packedSliceUAVs != null)
-                foreach (var idx in _packedSliceUAVs)
-                    device.DeferReleaseBindlessIndex(idx);
-            device.DeferReleaseBindlessIndex(_packedControlArrayUAV);
-
-            // Create Texture2DArray: RGBA8, resolution × resolution, sliceCount array slices
-            var desc = ResourceDescription.Texture2D(
-                Format.R8G8B8A8_UNorm, (uint)resolution, (uint)resolution,
-                (ushort)sliceCount, 1, 1, 0, ResourceFlags.AllowUnorderedAccess);
-
-            _packedControlArray = device.NativeDevice.CreateCommittedResource(
-                new HeapProperties(HeapType.Default), HeapFlags.None, desc, ResourceStates.Common, null);
-
-            // Create SRV over full array
-            _packedControlSRV = device.AllocateBindlessIndex();
-            device.NativeDevice.CreateShaderResourceView(_packedControlArray,
-                new ShaderResourceViewDescription
-                {
-                    Format = Format.R8G8B8A8_UNorm,
-                    ViewDimension = ShaderResourceViewDimension.Texture2DArray,
-                    Shader4ComponentMapping = ShaderComponentMapping.Default,
-                    Texture2DArray = new Texture2DArrayShaderResourceView
-                    {
-                        MipLevels = 1,
-                        ArraySize = (uint)sliceCount,
-                        FirstArraySlice = 0
-                    }
-                }, device.GetCpuHandle(_packedControlSRV));
-
-            // Create per-slice UAVs for compute packing
-            _packedSliceUAVs = new uint[sliceCount];
-            for (int i = 0; i < sliceCount; i++)
+            if (!_paintPool.Matches(texels, layerSlices, capacity))
             {
-                _packedSliceUAVs[i] = device.AllocateBindlessIndex();
-                device.NativeDevice.CreateUnorderedAccessView(_packedControlArray, null,
-                    new UnorderedAccessViewDescription
+                int across = Graphics.PaintPool.PagesAcrossFor(texels);
+                int slots = capacity > 0 ? capacity : across * across;
+                int slices = Graphics.PaintPool.WeightSlicesFor(slots, layerSlices);
+                if (slices > Graphics.HeightPool.MaxSlices)
+                {
+                    if (!_paintPoolWarned)
                     {
-                        Format = Format.R8G8B8A8_UNorm,
-                        ViewDimension = UnorderedAccessViewDimension.Texture2DArray,
-                        Texture2DArray = new Texture2DArrayUnorderedAccessView
-                        {
-                            MipSlice = 0,
-                            FirstArraySlice = (uint)i,
-                            ArraySize = 1
-                        }
-                    }, device.GetCpuHandle(_packedSliceUAVs[i]));
+                        _paintPoolWarned = true;
+                        Debug.LogError("[TerrainRenderer]", $"{Terrain.Name}: {slots} paint pages of {_layerPalette.Count} layers need {slices} " +
+                                       $"array slices, past D3D12's {Graphics.HeightPool.MaxSlices}: not painted. Set TerrainPaintPages " +
+                                       "(the pages stream round the camera) or a lower PaintPixelsPerMetre.");
+                    }
+                    return;
+                }
+                _paintPool.Ensure(texels, layerSlices, capacity, null);   // the table goes up on the bake's list
+                _paintSlotSerial = new long[_paintPool.Capacity];
+                _paintSlotPalette = new List<TerrainLayer>?[_paintPool.Capacity];
+                _topPages.Clear();
+                Debug.Log("[Terrain]", $"'{Terrain.Name}': paint pool {(capacity == 0 ? "of every page" : $"of {capacity} slots, {pagesPerSide} pages a side per level")}, " +
+                          $"{across}x{across} pages of {Graphics.PaintPool.PageTexels} texels, {slices} slices");
             }
 
-            // Full-array UAV for stamp overlay (covers all slices)
-            _packedControlArrayUAV = device.AllocateBindlessIndex();
-            device.NativeDevice.CreateUnorderedAccessView(_packedControlArray, null,
-                new UnorderedAccessViewDescription
+            IReadOnlyList<(int level, int px, int py, int slot)> bakes;
+            using (_paintResidencyMarker.Auto())
+                bakes = PaintResidency.Update(CameraPaintTexels(texels), pagesPerSide, Math.Max(1, Engine.Settings.TerrainPaintBakesPerFrame));
+            if (bakes.Count == 0 && !_paintPool.Slots.TableDirty) return;
+
+            var pages = new (int level, int px, int py, int slot)[bakes.Count];
+            for (int i = 0; i < pages.Length; i++)
+            {
+                var b = bakes[i];
+                pages[i] = b;
+                _paintSlotSerial[b.slot] = ++_paintSerial;
+                _paintSlotPalette[b.slot] = _layerPalette;
+                if (b.level == 0)
                 {
-                    Format = Format.R8G8B8A8_UNorm,
-                    ViewDimension = UnorderedAccessViewDimension.Texture2DArray,
-                    Texture2DArray = new Texture2DArrayUnorderedAccessView
-                    {
-                        MipSlice = 0,
-                        FirstArraySlice = 0,
-                        ArraySize = (uint)sliceCount
-                    }
-                }, device.GetCpuHandle(_packedControlArrayUAV));
+                    // Its ground goes into the decoration control texture again, from the paint now in place
+                    float m = Graphics.PaintPool.PageTexels / (float)texels;
+                    _decoRedoMin = Vector2.Min(_decoRedoMin, new Vector2(b.px * m, b.py * m));
+                    _decoRedoMax = Vector2.Max(_decoRedoMax, new Vector2((b.px + 1) * m, (b.py + 1) * m));
+                }
+            }
+            SplatBakeTexels = (long)pages.Length * Graphics.PaintPool.SlotTexels * Graphics.PaintPool.SlotTexels;
 
-            // Create stable Texture wrapper (never replaced unless array is recreated)
-            _packedControlTexture = Texture.WrapNative(_packedControlArray, _packedControlSRV);
-            _packedArrayResolution = resolution;
-            _packedSliceCount = sliceCount;
+            var plan = _splatPlan!;
+            var pool = _paintPool;
+            var baker = _baker;
+            var terrain = Terrain;
+            var renderer = this;
+            CommandBuffer.Enqueue(RenderPass.Opaque, list =>
+            {
+                pool.Slots.RecordTable(list);
+                if (pages.Length == 0) return;
+                // The height bake enqueued before has run by now, so the filters read the new heights
+                PixMarker.Begin(list, "Terrain paint bake");
+                baker.BakeSplatPages(plan, list, terrain, renderer.GpuTerrainIdx(), pool, pages);
+                PixMarker.End(list);
+            });
+        }
 
-            // The top layer map goes with the array: same texels, filled by the same bake
-            device.DeferDispose(_topLayerTex);
-            device.DeferReleaseBindlessIndex(_topLayerUAV);
+        // The camera in level 0 paint texels (terrain UV × texels)
+        private Vector2 CameraPaintTexels(int texels)
+        {
+            var local = CameraLocal();
+            return new Vector2(local.X / Terrain.TerrainSize.X * texels, local.Y / Terrain.TerrainSize.Y * texels);
+        }
 
-            _topLayerTex = device.CreateTexture2D(Format.R8_UInt, resolution, resolution, 1, 1,
-                ResourceFlags.AllowUnorderedAccess, ResourceStates.Common);
-            _topLayerUAV = device.AllocateBindlessIndex();
-            device.NativeDevice.CreateUnorderedAccessView(_topLayerTex, null,
-                new UnorderedAccessViewDescription
-                {
-                    Format = Format.R8_UInt,
-                    ViewDimension = UnorderedAccessViewDimension.Texture2D,
-                    Texture2D = new Texture2DUnorderedAccessView { MipSlice = 0 }
-                }, device.GetCpuHandle(_topLayerUAV));
+        // GetLayer's copies of the pages it asked about: read back once the page's last bake has gone to the GPU
+        private void FetchTopPages()
+        {
+            if (_paintPool.TopLayer == null) { _topWanted.Clear(); return; }
+            var slots = _paintPool.Slots;
+            int fetched = 0;
+            List<(int, int, int)>? done = null;
+            foreach (var key in _topWanted)
+            {
+                if (fetched >= TopPagesPerFrame) break;
+                int slot = slots.SlotOf(key.level, key.px, key.py);
+                if (slot < 0) { (done ??= new()).Add(key); continue; }   // gone: asked about again when it is back
+                if (!slots.Settled(slot)) continue;
+                long serial = _paintSlotSerial[slot];
+                var palette = _paintSlotPalette[slot];
+                var layers = TerrainBaker.ReadbackTopPage(_paintPool, slot);
+                fetched++;
+                (done ??= new()).Add(key);
+                if (layers == null || palette == null) continue;
+                _topPages[key] = new TopPage { Layers = layers, Palette = palette, Slot = slot, Serial = serial };
+            }
+            if (done != null)
+                foreach (var key in done) _topWanted.Remove(key);
+
+            // Copies of pages that left the pool go (64 KB each; a flight over the map would keep them all)
+            if (_topPages.Count > 64)
+            {
+                List<(int, int, int)>? gone = null;
+                foreach (var (key, page) in _topPages)
+                    if (slots.SlotOf(key.level, key.px, key.py) != page.Slot) (gone ??= new()).Add(key);
+                if (gone != null)
+                    foreach (var key in gone) _topPages.Remove(key);
+            }
         }
 
         // ───── Compute Pipeline ───────────────────────────────────────────
@@ -1358,8 +1366,18 @@ namespace Freefall.Components
             cs.SetPushConstant(_kBuildDrawArgs, "VertexCount", (uint)_patchMesh.IndexCount);
             cs.SetBuffer(_kBuildDrawArgs, "IndirectArgsUAV", _indirectArgsBuffers[frameIndex]);
 
-            // ── One-time: Build height range mip pyramid ──
-            if (!_heightRangePyramidBuilt)
+            // ── Height range mip pyramid: from the CPU store while the pages stream, else built from the pool ──
+            if (_baker.PoolCapacity != 0)
+            {
+                if (_cpuRangesPending && Terrain?.Pages is { HasHeights: true } rangePages
+                    && rangePages.Resolution == Terrain.EffectiveHeightmapResolution)
+                {
+                    UploadCpuRanges(commandList, rangePages);
+                    _cpuRangesPending = false;
+                }
+                _heightRangePyramidBuilt = true;
+            }
+            else if (!_heightRangePyramidBuilt)
             {
                 StreamingManager.Instance?.Flush();
                 Engine.Device.WaitForCopyQueue();
@@ -1815,10 +1833,10 @@ namespace Freefall.Components
 
             for (int mip = 0; mip < _heightRangeMipCount; mip++)
             {
-                // Transition this mip to UAV for writing
+                // Transition this mip to UAV for writing, from where the last build or upload left it
                 commandList.ResourceBarrier(new ResourceBarrier(
                     new ResourceTransitionBarrier(_heightRangePyramid,
-                        ResourceStates.Common,
+                        _pyramidState,
                         ResourceStates.UnorderedAccess,
                         (uint)mip)));
 
@@ -1844,6 +1862,172 @@ namespace Freefall.Components
             }
 
             // All mips are now in NonPixelShaderResource — ready for SampleLevel in CSMarkSplits/CSEmitLeaves
+            _pyramidState = ResourceStates.NonPixelShaderResource;
+        }
+
+        // The state every mip of the height-range pyramid is in (all mips move together): Common as made
+        private ResourceStates _pyramidState = ResourceStates.Common;
+
+        // ───── Streaming heights (TERRAIN_PAGES_PLAN.md 5a) ──────────────
+
+        private Graphics.TerrainHeightResidency? _residency;
+        private static readonly ProfilerMarker _residencyMarker = ProfilerMarker.Get("Terrain height residency");
+        private static readonly ProfilerMarker _cpuRangesMarker = ProfilerMarker.Get("Terrain height ranges on the CPU");
+
+        // The residency of the pool the baker holds now (a terrain asset's pool outlives its renderers)
+        private Graphics.TerrainHeightResidency Residency =>
+            _residency != null && ReferenceEquals(_residency.Pool, _baker.Pool) ? _residency : (_residency = new(_baker.Pool));
+
+        // The camera in terrain-local metres on the ground plane
+        private Vector2 CameraLocal()
+        {
+            var p = (Camera.Main?.Position ?? Vector3.Zero) - (Transform?.WorldPosition ?? Vector3.Zero);
+            return new Vector2(p.X, p.Z);
+        }
+
+        /// <summary>
+        /// The pool made, or made again, at the layout the detail radius asks (<see cref="TerrainBaker.PoolCapacity"/>), and
+        /// filled from the CPU store: every page, or the windows round the camera. False when the store has no heights of
+        /// the terrain's size.
+        /// </summary>
+        private bool FillPoolFromCpu()
+        {
+            if (Terrain.Pages is not { HasHeights: true } cpu || cpu.Resolution != Terrain.EffectiveHeightmapResolution) return false;
+            if (_baker.PoolCapacity == 0)
+            {
+                if (!_baker.UploadPages(cpu)) return false;
+            }
+            else
+            {
+                _baker.EnsurePoolNow(cpu.Resolution);
+                Residency.FillNow(cpu, CameraLocal(), Terrain.VertexSpacing, Engine.Settings.TerrainDetailRadius);
+                if (!_baker.Pool.Filled) return false;
+                TerrainBaker.NoteHeightsChanged();
+                _cpuRangesAll = true;
+                _cpuRangesPending = true;
+                Debug.LogAlways($"[Terrain] '{Terrain.Name}': height pages stream, {Residency.UploadedLastFrame} filled round the camera " +
+                                $"({_baker.Pool.Capacity} slots, {_baker.Pool.Slices} slices, detail radius {Engine.Settings.TerrainDetailRadius} m)");
+            }
+            Terrain.HeightmapStampsHash = Terrain.PagesStampsHash;
+            _heightRangePyramidBuilt = false;
+            return true;
+        }
+
+        // The quadtree's height ranges built on the CPU from the CPU store while the pages stream: the GPU build reads every
+        // sample through the pool, which away from the camera holds coarse pages only. Per mip, (min, max) per texel.
+        private float[][]? _cpuRanges;
+        private bool _cpuRangesPending;
+        private bool _cpuRangesAll = true;
+        private (int x0, int z0, int x1, int z1)? _cpuRangesBox;
+
+        // The heights changed over these samples (x0, z0 inclusive, x1, z1 exclusive): their ranges are built again
+        private void MarkCpuRanges(int x0, int z0, int x1, int z1)
+        {
+            _cpuRangesBox = _cpuRangesBox is { } b
+                ? (Math.Min(b.x0, x0), Math.Min(b.z0, z0), Math.Max(b.x1, x1), Math.Max(b.z1, z1))
+                : (x0, z0, x1, z1);
+            _cpuRangesPending = true;
+        }
+
+        /// <summary>
+        /// The height-range pyramid from the CPU store: mip 0 one texel per finest node, the min and max (× MaxHeight) of
+        /// the samples its patch's vertices read, as CSBuildMinMaxMip takes them (samples floor(uvMin · cells) ..
+        /// ceil(uvMax · cells)); the mips above min of mins and max of maxes. Only the nodes over the changed samples when
+        /// there was a build before. Copied up on this list.
+        /// </summary>
+        private unsafe void UploadCpuRanges(ID3D12GraphicsCommandList cmd, TerrainPages pages)
+        {
+            using var scope = _cpuRangesMarker.Auto();
+            int size = 1 << MaxDepth;
+            int mips = _heightRangeMipCount;
+            if (_cpuRanges == null || _cpuRanges.Length != mips || _cpuRanges[0].Length != size * size * 2)
+            {
+                _cpuRanges = new float[mips][];
+                for (int m = 0; m < mips; m++)
+                {
+                    int w = Math.Max(1, size >> m);
+                    _cpuRanges[m] = new float[w * w * 2];
+                }
+                _cpuRangesAll = true;
+            }
+
+            long cells = pages.Resolution - 1;
+            float maxH = Terrain.MaxHeight;
+            int lx0 = 0, lz0 = 0, lx1 = size - 1, lz1 = size - 1;
+            if (!_cpuRangesAll && _cpuRangesBox is { } b)
+            {
+                lx0 = Math.Clamp((int)(b.x0 * (long)size / cells) - 1, 0, size - 1);
+                lz0 = Math.Clamp((int)(b.z0 * (long)size / cells) - 1, 0, size - 1);
+                lx1 = Math.Clamp((int)((b.x1 * (long)size + cells - 1) / cells) + 1, 0, size - 1);
+                lz1 = Math.Clamp((int)((b.z1 * (long)size + cells - 1) / cells) + 1, 0, size - 1);
+            }
+            var mip0 = _cpuRanges[0];
+            System.Threading.Tasks.Parallel.For(lz0, lz1 + 1, z =>
+            {
+                int sz0 = (int)(z * cells / size), sz1 = (int)(((z + 1) * cells + size - 1) / size);
+                for (int x = lx0; x <= lx1; x++)
+                {
+                    int sx0 = (int)(x * cells / size), sx1 = (int)(((x + 1) * cells + size - 1) / size);
+                    var (lo, hi) = pages.MinMax(sx0, sz0, sx1, sz1);
+                    mip0[(z * size + x) * 2] = lo / 65535.0f * maxH;
+                    mip0[(z * size + x) * 2 + 1] = hi / 65535.0f * maxH;
+                }
+            });
+            for (int m = 1; m < mips; m++)
+            {
+                var src = _cpuRanges[m - 1];
+                var dst = _cpuRanges[m];
+                int sw = Math.Max(1, size >> (m - 1)), w = Math.Max(1, size >> m);
+                for (int z = 0; z < w; z++)
+                    for (int x = 0; x < w; x++)
+                    {
+                        int a = ((2 * z) * sw + 2 * x) * 2, c = ((2 * z + 1) * sw + 2 * x) * 2;
+                        dst[(z * w + x) * 2] = MathF.Min(MathF.Min(src[a], src[a + 2]), MathF.Min(src[c], src[c + 2]));
+                        dst[(z * w + x) * 2 + 1] = MathF.Max(MathF.Max(src[a + 1], src[a + 3]), MathF.Max(src[c + 1], src[c + 3]));
+                    }
+            }
+            _cpuRangesAll = false;
+            _cpuRangesBox = null;
+
+            // Every mip up, each at a 512-byte boundary with 256-byte rows
+            var offsets = new long[mips];
+            var pitches = new int[mips];
+            long total = 0;
+            for (int m = 0; m < mips; m++)
+            {
+                int w = Math.Max(1, size >> m);
+                pitches[m] = (w * 8 + 255) & ~255;
+                offsets[m] = total;
+                total += ((long)pitches[m] * w + 511) & ~511L;
+            }
+            var device = Engine.Device;
+            var upload = device.NativeDevice.CreateCommittedResource(new HeapProperties(HeapType.Upload), HeapFlags.None,
+                ResourceDescription.Buffer((ulong)total), ResourceStates.GenericRead, null);
+            void* data;
+            upload.Map(0, null, &data);
+            for (int m = 0; m < mips; m++)
+            {
+                int w = Math.Max(1, size >> m);
+                for (int z = 0; z < w; z++)
+                    fixed (float* row = &_cpuRanges[m][z * w * 2])
+                        Buffer.MemoryCopy(row, (byte*)data + offsets[m] + (long)z * pitches[m], w * 8, w * 8);
+            }
+            upload.Unmap(0);
+            for (int m = 0; m < mips; m++)
+            {
+                int w = Math.Max(1, size >> m);
+                cmd.ResourceBarrier(new ResourceBarrier(new ResourceTransitionBarrier(_heightRangePyramid, _pyramidState, ResourceStates.CopyDest, (uint)m)));
+                cmd.CopyTextureRegion(new TextureCopyLocation(_heightRangePyramid, (uint)m), 0, 0, 0,
+                    new TextureCopyLocation(upload, new PlacedSubresourceFootPrint
+                    {
+                        Offset = (ulong)offsets[m],
+                        Footprint = new SubresourceFootPrint(Format.R32G32_Float, (uint)w, (uint)w, 1, (uint)pitches[m])
+                    }), null);
+                cmd.ResourceBarrier(new ResourceBarrier(new ResourceTransitionBarrier(_heightRangePyramid, ResourceStates.CopyDest,
+                    ResourceStates.NonPixelShaderResource, (uint)m)));
+            }
+            _pyramidState = ResourceStates.NonPixelShaderResource;
+            device.DeferDispose(upload);   // read when the list runs
         }
 
         // ───── Helpers ────────────────────────────────────────────────────
@@ -1873,6 +2057,9 @@ namespace Freefall.Components
             }
             CreateHeightRangePyramid(device);
             _heightRangePyramidBuilt = false;
+            _pyramidState = ResourceStates.Common;
+            _cpuRangesAll = true;
+            _cpuRangesPending = true;
             Debug.Log($"[TerrainRenderer] Quadtree depth {depth} ({Terrain?.Name}): {_totalNodes} nodes");
         }
 
@@ -1964,11 +2151,8 @@ namespace Freefall.Components
             if (missingNormals.Count > 0 && normalCount > 0)
                 Debug.LogWarning("TerrainRenderer", $"Terrain layer(s) without a Normals texture render flat: {string.Join(", ", missingNormals)}");
 
-            // Also refresh tiling since channels may have moved
+            // Also refresh tiling since channels may have moved (the weights are the paint pages, baked on SplatPack)
             UpdateLayerParams();
-
-            // The layer weights are baked separately (SplatPack); until the first bake nothing shows
-            ControlMapsArray = _packedControlTexture ?? InternalAssets.BlackArray;
         }
 
         // ───── Holes ───────────────────────────────────────────────────────
@@ -2175,17 +2359,14 @@ namespace Freefall.Components
 
         /// <summary>
         /// The layer that shows most at a place on the terrain (X and Z of the position), or null:
-        /// off the terrain, nothing painted there, or not known yet. The answer comes from a CPU copy
-        /// of the splat bake's result that is only fetched once somebody asks, so the first calls after
-        /// a load return null for a frame or two; after the stamps changed, the old answer stands until
-        /// the new one has been fetched. One array lookup; main thread.
+        /// off the terrain, nothing painted there, or not known yet. The answer comes from a CPU copy of the finest paint
+        /// page resident over the place (TERRAIN_PAGES_PLAN.md 5b), fetched only once somebody asks about a place on it,
+        /// so the first calls about a page return null for a frame or two; after the stamps changed, the old answer stands
+        /// until the new one has been fetched. A dictionary lookup; main thread.
         /// </summary>
         public TerrainLayer? GetLayer(Vector3 position)
         {
-            _topLayersWanted = true;
-
-            var layers = _topLayers;
-            if (layers == null || Terrain == null || Transform == null) return null;
+            if (Terrain == null || Transform == null || _paintPool.Weights == null || _splatPlan == null) return null;
 
             var size = Terrain.TerrainSize;
             var origin = Transform.Position;
@@ -2193,14 +2374,32 @@ namespace Freefall.Components
             float v = (position.Z - origin.Z) / size.Y;
             if (!(u >= 0f && u < 1f && v >= 0f && v < 1f)) return null;
 
-            // The control array is Y-flipped relative to terrain UV (see terrain_splat_bake.hlsl)
-            int res = _topLayersResolution;
-            int x = Math.Min((int)(u * res), res - 1);
-            int y = Math.Min((int)((1f - v) * res), res - 1);
+            // The finest resident page over the place, and the texel in it (pages lie in terrain UV, +Z up). Its copy is asked
+            // for when there is none or it is old; until it comes, a coarser resident page's copy answers (a page that
+            // arrives at the camera replaces a coarse one), and an old copy of the same page stands.
+            var slots = _paintPool.Slots;
+            int texels = _paintPool.Texels;
+            int x = Math.Min((int)(u * texels), texels - 1), z = Math.Min((int)(v * texels), texels - 1);
+            int px0 = x / Graphics.PaintPool.PageTexels, pz0 = z / Graphics.PaintPool.PageTexels;
+            bool asked = false;
+            for (int level = 0; level < slots.Levels; level++)
+            {
+                int px = px0 >> level, pz = pz0 >> level;
+                int slot = slots.SlotOf(level, px, pz);
+                if (slot < 0) continue;
 
-            int channel = layers[y * res + x];
-            var palette = _topLayersPalette;
-            return channel < palette.Count ? palette[channel] : null;
+                var key = (level, px, pz);
+                bool known = _topPages.TryGetValue(key, out var page) && page!.Slot == slot;
+                if (!asked && (!known || page!.Serial != _paintSlotSerial[slot]))
+                    _topWanted.Add(key);
+                asked = true;
+                if (!known) continue;
+
+                int lx = (x >> level) - px * Graphics.PaintPool.PageTexels, lz = (z >> level) - pz * Graphics.PaintPool.PageTexels;
+                int channel = page!.Layers[lz * Graphics.PaintPool.PageTexels + lx];
+                return channel < page.Palette.Count ? page.Palette[channel] : null;
+            }
+            return null;
         }
 
         // ───── Ground Coverage Decorator ──────────────────────────────────
@@ -2519,8 +2718,19 @@ namespace Freefall.Components
         /// </summary>
         private void DispatchDecoControlPrepass(ID3D12GraphicsCommandList cmd)
         {
+            if (Terrain == null || _baker == null) return;
             var plan = System.Threading.Interlocked.Exchange(ref _pendingDecoPlan, null);
-            if (plan == null || Terrain == null || _baker == null) return;
+            bool whole = plan != null;
+            plan ??= _lastDecoPlan;
+            // Without a new plan, only the ground of level 0 paint pages baked since: what the layer filters read there
+            // was the coarse paint before
+            bool redo = _decoRedoMax.X > _decoRedoMin.X;
+            if (plan == null || (!whole && !redo)) return;
+            var redoMin = _decoRedoMin;
+            var redoMax = _decoRedoMax;
+            _decoRedoMin = new Vector2(float.MaxValue);
+            _decoRedoMax = new Vector2(float.MinValue);
+            _lastDecoPlan = plan;
 
             var device = Engine.Device;
             int resolution = Terrain.EffectiveDecorationMapResolution;
@@ -2575,12 +2785,21 @@ namespace Freefall.Components
             // The heights for the stamps' height/slope filters: this terrain's pages
             uint heightSrv = GpuTerrainIdx();
 
-            // Packed layer weights for the stamps' layer filters — the same array the surface shader
-            // samples, already rebaked this frame if the splat stamps changed
-            uint controlMapsSrv = plan.LayerCount > 0 && _packedControlTexture != null
-                ? (uint)_packedControlTexture.BindlessIndex : 0;
+            // The layer filters read the paint pages through the same parameters (already baked this frame where the splat
+            // stamps changed). A redo covers the pages' texels, a texel more each side; the control texture is Y-flipped
+            // against terrain UV.
+            (int x, int y, int width, int height) region = (0, 0, resolution, resolution);
+            if (!whole && !freshTexture)
+            {
+                int x0 = Math.Clamp((int)MathF.Floor(redoMin.X * resolution) - 1, 0, resolution);
+                int x1 = Math.Clamp((int)MathF.Ceiling(redoMax.X * resolution) + 1, 0, resolution);
+                int y0 = Math.Clamp((int)MathF.Floor((1f - redoMax.Y) * resolution) - 1, 0, resolution);
+                int y1 = Math.Clamp((int)MathF.Ceiling((1f - redoMin.Y) * resolution) + 1, 0, resolution);
+                region = (x0, y0, x1 - x0, y1 - y0);
+            }
+            DecoBakeTexels = (long)region.width * region.height;
 
-            _baker.BakeDecoControl(plan, cmd, Terrain, heightSrv, controlMapsSrv, _decoControlUAV, resolution);
+            _baker.BakeDecoControl(plan, cmd, Terrain, heightSrv, _decoControlUAV, resolution, region);
 
             cmd.ResourceBarrierUnorderedAccessView(_decoControlTex);
 
@@ -2829,13 +3048,11 @@ namespace Freefall.Components
                 cs.SetPushConstant("DecoControl", _decoControlSRV);
                 cs.SetPushConstant("BakedNormal", _bakedNormalSRV);
 
-                // The layer weights and the layers' plant tints: each plant takes the colour of the ground it stands on
-                bool plantTints = ControlMapsArray != null && _plantTintBuffer != null && _layerPalette.Count > 0;
+                // The layers' plant tints over the paint pages (through TerrainPages): each plant takes the colour of the
+                // ground it stands on
+                bool plantTints = _splatPlan != null && _plantTintBuffer != null && _layerPalette.Count > 0;
                 if (plantTints)
-                {
-                    cs.SetTexture("SplatControl", ControlMapsArray!);
                     cs.SetBuffer("LayerPlantTint", _plantTintBuffer!);
-                }
                 cs.SetPushConstant("SplatLayerCount", plantTints ? (uint)_layerPalette.Count : 0u);
                 cs.SetPushConstant("HoleTex", HoleSrv);   // nothing spawns in a hole
                 cs.SetPushConstant("DecoRows", _baker?.DecoRowsSrv ?? 0u);   // crops in rows (DecoStamp.RowSpacing)
@@ -3074,9 +3291,20 @@ namespace Freefall.Components
         /// <summary>Diagnostics: stamp / spline change events that requested a re-bake (editor debug stats).</summary>
         public static int RebakeRequestCount;
 
-        /// <summary>Diagnostics: control texels the last splat bake composited (the whole map, or a local edit's region).</summary>
+        /// <summary>Diagnostics: paint texels the last paint bake composited (its pages', border included).</summary>
         [Reflection.DontSerialize]
         public long SplatBakeTexels { get; private set; }
+
+        /// <summary>Diagnostics: decoration control texels the last deco bake composited (the whole map, or the ground of
+        /// paint pages that arrived).</summary>
+        [Reflection.DontSerialize]
+        public long DecoBakeTexels { get; private set; }
+
+        /// <summary>Diagnostics: paint pages resident, waiting for a slot or bake, and baked last frame.</summary>
+        [Reflection.DontSerialize]
+        public string PaintPages => _paintPool.Weights == null ? "none"
+            : $"{(_paintPool.Slots.AllResident ? _paintPool.Capacity : _paintPool.Capacity - _paintPool.Slots.FreeSlots)} of {_paintPool.Capacity} slots, " +
+              $"{PaintResidency.Waiting} waiting, {PaintResidency.BakedLastFrame} baked last frame";
 
         /// <summary>Diagnostics: height pages the last height bake went over (all of them, or a local edit's).</summary>
         [Reflection.DontSerialize]
@@ -3114,6 +3342,34 @@ namespace Freefall.Components
                                  $"at most on samples, {between * 1000f:0.####} mm between them";
             }
             Debug.LogAlways($"[Terrain] '{Terrain.Name}' page bake check: {PageBakeCheck}");
+        }
+
+        /// <summary>Diagnostics: <see cref="GetLayer"/> under the main camera (asked again every time it is read, so the
+        /// page under it is fetched; "?" until it has been).</summary>
+        [Reflection.DontSerialize]
+        public string LayerUnderCamera => Camera.Main == null ? "" : GetLayer(Camera.Main.Position)?.Name ?? "?";
+
+        /// <summary>Diagnostics: what the last Check Paint Pages found.</summary>
+        [Reflection.DontSerialize]
+        public string PaintPagesCheck { get; private set; } = "";
+
+        /// <summary>
+        /// Every level 0 paint page resident (all of them with EngineSettings.TerrainPaintPages 0) against the whole-map splat
+        /// bake there was before 5b, baked over the same texels: their weights byte for byte (TerrainBaker.CheckPaintPages).
+        /// Blocks for the bakes.
+        /// </summary>
+        [Button("Check Paint Pages")]
+        [System.ComponentModel.Description("Compare the level 0 paint pages in place with the whole-map splat bake over the same texels")]
+        public void CheckPaintPages()
+        {
+            if (Terrain == null || _splatPlan == null) { PaintPagesCheck = "no paint"; return; }
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            var (texels, pages, maxStep, compared, checkedPages) = _baker.CheckPaintPages(_splatPlan, Terrain, GpuTerrainIdx(), _paintPool);
+            PaintPagesCheck = texels < 0 ? "the pool is not ready"
+                : (texels == 0 ? "equal" : "DIFFERENT") + $": {checkedPages} of {_paintPool.Slots.PagesAcross * _paintPool.Slots.PagesAcross} level 0 " +
+                  $"pages in place, {compared:N0} texel slices compared, {texels:N0} differ on {pages} pages" +
+                  (maxStep > 0 ? $" (up to {maxStep} of 255)" : "") + $"; {sw.ElapsedMilliseconds} ms";
+            Debug.LogAlways($"[Terrain] '{Terrain.Name}' paint pages check: {PaintPagesCheck}");
         }
 
         // ── Changed region ──
@@ -3189,6 +3445,13 @@ namespace Freefall.Components
             {
                 Terrain.SetPages(heights);
                 Terrain.PagesStampsHash = Terrain.HeightmapStampsHash;   // read back from the map as it is now
+                // Streaming: the resident pages over what changed go up again (the coarse ones and those that came in
+                // from the store before this readback), and the height ranges there are built again
+                if (_baker.PoolCapacity != 0 && changed is { } moved)
+                {
+                    Residency.MarkStale(moved.x0, moved.z0, moved.x1, moved.z1);
+                    MarkCpuRanges(moved.x0, moved.z0, moved.x1, moved.z1);
+                }
                 // Holes cut at another size do not go over to a store of this one: the stamps cut them again
                 if (previousPages is { HasHoles: true } && previousPages.Resolution != heights.Resolution)
                     Terrain.MarkForUpdate(TerrainDirtyFlags.HoleBake);

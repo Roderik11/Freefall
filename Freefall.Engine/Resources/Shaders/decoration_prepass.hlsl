@@ -16,6 +16,7 @@
 
 #include "terrain_stamp_common.hlsli"
 #include "terrain_coverage.hlsli"
+#include "terrain_paint.hlsli"   // the layer weights the layer filters read, from the paint pages
 
 cbuffer PushConstants : register(b3)
 {
@@ -25,11 +26,15 @@ cbuffer PushConstants : register(b3)
     uint  Resolution;       // slot 3 — control texture width/height
     uint  TerrainPagesIdx;  // slot 4 — the terrain's TerrainPagesParams (terrain_pages.hlsli); 0 = none: height/slope read as 0
     uint  SplineBufIdx;     // slot 5 — SRV: StructuredBuffer<StampSplinePoint>
-    uint  LayerCount;       // slot 6 — number of texture layers in the packed control array
-    uint  ControlMapsIdx;   // slot 7 — SRV: packed layer weights (same array the surface shader samples)
+    uint  LayerCount;       // slot 6 — layers in the palette (the paint pages' channels)
+    uint  ControlMapsIdx;   // slot 7 — unused since 5b: the layer weights come from the paint pages (terrain_paint.hlsli)
     float MaxHeight;        // slot 8
     float TerrainSizeX;     // slot 9
     uint  StampCount;       // slot 10
+    uint  RegionX;          // slot 11 — the texels this bake redoes: from (RegionX, RegionY), RegionW x RegionH (the
+    uint  RegionY;          // slot 12   whole map, or the ground a paint page that arrived or changed covers; the rest
+    uint  RegionW;          // slot 13   keeps what the last bake wrote)
+    uint  RegionH;          // slot 14
 };
 
 #define DECO_OP_ADD      0u
@@ -41,12 +46,14 @@ cbuffer PushConstants : register(b3)
 SamplerState ClampSampler : register(s2);
 
 [numthreads(8, 8, 1)]
-void CSBuildDecoControl(uint3 dtid : SV_DispatchThreadID)
+void CSBuildDecoControl(uint3 groupTexel : SV_DispatchThreadID)
 {
     RWTexture2DArray<uint4> controlTex = ResourceDescriptorHeap[ControlUAVIdx];
     StructuredBuffer<CoverageStamp> stamps = ResourceDescriptorHeap[StampBufIdx];
     StructuredBuffer<StampSplinePoint> splinePoints = ResourceDescriptorHeap[SplineBufIdx];
 
+    if (groupTexel.x >= RegionW || groupTexel.y >= RegionH) return;
+    uint3 dtid = uint3(groupTexel.xy + uint2(RegionX, RegionY), 0);
     if (dtid.x >= Resolution || dtid.y >= Resolution) return;
 
     // Control texture space is Y-flipped relative to terrain UV (heightmap, stamp shapes)
@@ -60,7 +67,8 @@ void CSBuildDecoControl(uint3 dtid : SV_DispatchThreadID)
     // ── Layer weights from the packed control array (final splat result) ──
     // raw = the weight as painted; visible = what shows after the layers above it:
     // visible[i] = raw[i] * product(1 - raw[k]) for all k > i, as in gputerrain.fx
-    uint layerCount = ControlMapsIdx != 0 ? min(LayerCount, (uint)MAX_LAYERS) : 0;
+    TerrainPaintParams paint = LoadPaint(LoadTerrain(TerrainPagesIdx));   // nothing (no paint) without a terrain
+    uint layerCount = PaintPresent(paint) ? min(LayerCount, (uint)MAX_LAYERS) : 0;
 
     float rawWeight[MAX_LAYERS];
     float visibleWeight[MAX_LAYERS];
@@ -68,11 +76,12 @@ void CSBuildDecoControl(uint3 dtid : SV_DispatchThreadID)
 
     if (layerCount > 0)
     {
-        Texture2DArray controlMaps = ResourceDescriptorHeap[ControlMapsIdx];
-        uint sliceCount = (layerCount + 3) / 4;
+        float4 paintWeights[8];
+        PaintWeights(paint, terrainUV, ClampSampler, paintWeights);
+        uint sliceCount = min((layerCount + 3) / 4, 8u);
         for (uint si = 0; si < sliceCount; si++)
         {
-            float4 weights = controlMaps.SampleLevel(ClampSampler, float3(uv, si), 0);
+            float4 weights = paintWeights[si];
             for (uint sj = 0; sj < 4; sj++)
             {
                 uint layerIdx = si * 4 + sj;

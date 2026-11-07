@@ -18,7 +18,7 @@ cbuffer PushConstants : register(b3)
     uint GlobalTransformBufferIdx; // 15
     uint DebugMode;             // 16
     uint TerrainPagesIdx;       // 17: this terrain's TerrainPagesParams (terrain_pages.hlsli): its heights
-    uint ControlMapsIdx;        // 18
+    uint ControlMapsIdx;        // 18: unused since 5b (the paint pages come through TerrainPagesParams.PaintIdx)
     uint _reserved19;           // 19: was the layers' diffuse array (LayerTextures now)
     uint _reserved20;           // 20: was the layers' normal array
     uint DecoControlMapIdx;     // 21: Decoration control texture
@@ -34,6 +34,7 @@ cbuffer PushConstants : register(b3)
 #include "terrain_grid.hlsli"
 #include "ground_shape.hlsli"
 #include "decoration_noise.hlsli"     // DecoEdgeWarp: the ground tint keeps the edge the spawn kernel draws
+#include "terrain_paint.hlsli"         // the layers' weights, from the paint pages
 // @RenderState(RenderTargets=6)
 
 // TerrainPatchData: per-instance data written by terrain_quadtree.hlsl compute shader.
@@ -552,11 +553,9 @@ FragmentOutput PS(VertexOutput input)
     uv.y = 1 - uv.y;
     float2 uvDdx = ddx(uv), uvDdy = ddy(uv);   // for SampleGrad inside the branching layer loops (tile variation)
 
-    Texture2DArray ControlMaps = ResourceDescriptorHeap[ControlMapsIdx];
-
-    // ControlMaps: ceil(layerCount/4) RGBA slices, each channel = one layer weight
-    uint cmW, cmH, sliceCount;
-    ControlMaps.GetDimensions(cmW, cmH, sliceCount);
+    // The paint: the layers' weights from the paint pages (terrain_paint.hlsli, TERRAIN_PAGES_PLAN.md 5b), sampled
+    // anisotropically along the screen's derivatives of terrain UV, as the whole-map control array was
+    TerrainPaintParams paint = LoadPaint(LoadTerrain(TerrainPagesIdx));
 
     // Height-based texture blending with back-to-front masking.
     // Later layers mask earlier layers (matching sequential lerp priority),
@@ -570,10 +569,8 @@ FragmentOutput PS(VertexOutput input)
     float blendedHeight = 0;
 
     // Read all slice weights
-    uint clampedSlices = min(sliceCount, 8u);
     float4 sliceWeights[8];
-    for (uint s = 0; s < clampedSlices; s++)
-        sliceWeights[s] = ControlMaps.Sample(sampData, float3(uv, s));
+    uint clampedSlices = PaintWeightsGrad(paint, input.UV2, ddx(input.UV2), ddy(input.UV2), sampData, sliceWeights);
 
     // Back-to-front: later layers mask earlier layers (same priority as sequential lerp)
     // effective[i] = raw[i] * product(1 - raw[k]) for all k > i
