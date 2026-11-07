@@ -39,8 +39,13 @@ namespace Freefall.Components
         // Not a setting since 2026-11-07 (TERRAIN_PAGES_PLAN.md stage 1); scenes that still hold one are not read.
         private int MaxDepth = 7;
         private bool _gridWarned;
+        // The walk packs a node as (depth << 28) | its index in the level (≤ 14), and the split flags take 4 bytes a node of
+        // the whole tree: 22 MB a frame at depth 11 (32 km at 0.5 m), 4 times that a level deeper
+        private const int MaxQuadtreeDepth = 12;
         private int MaxPatches = 32768;
         private const int MinPatches = 32768;
+        // Entries in each of the walk's lists: a level's nodes, the leaves (terrain_quadtree.hlsl CSWalk)
+        private const int WalkCapacity = 32768;
 
         private Vector4[] _layerTiling = new Vector4[32];
 
@@ -60,7 +65,7 @@ namespace Freefall.Components
 
         // Compute pipeline — restricted quadtree (auto-discovers all #pragma kernel entries)
         private ComputeShader? _quadtreeCS;
-        private int _kMarkSplits, _kEmitLeaves, _kBuildMinMaxMip, _kBuildDrawArgs, _kEmitLeavesShadow;
+        private int _kWalk, _kEmitLeaves, _kBuildMinMaxMip, _kBuildDrawArgs, _kEmitLeavesShadow;
         private bool _computeInitialized;
         private bool _firstDispatch = true; // skip Hi-Z on first frame (no valid _previousFrameViewProjection yet)
 
@@ -71,6 +76,24 @@ namespace Freefall.Components
         private GraphicsBuffer[] _terrainDataBuffers = new GraphicsBuffer[FrameCount];
         private GraphicsBuffer[] _counterBuffers = new GraphicsBuffer[FrameCount];
         private GraphicsBuffer[] _splitFlagsBuffers = new GraphicsBuffer[FrameCount];
+
+        // The quadtree's walk (terrain_quadtree.hlsl CSWalk): its lists and its leaves, which the shadow pass takes too
+        private GraphicsBuffer[] _walkBuffers = new GraphicsBuffer[FrameCount];
+        // Split flags hold the tag of the evaluation that split a node (MarkSplit), so they are cleared only when made
+        private readonly bool[] _splitFlagsFresh = new bool[FrameCount];
+        private uint _quadtreeTag;
+        private readonly uint[] _frameTags = new uint[FrameCount];
+        // The main and shadow patch counts of each frame, read back when its slot comes round again
+        private readonly ID3D12Resource?[] _countReadbacks = new ID3D12Resource?[FrameCount];
+        private readonly IntPtr[] _countReadbackPtrs = new IntPtr[FrameCount];
+
+        /// <summary>Terrain patches drawn in the last frame read back (a few frames old).</summary>
+        [Reflection.DontSerialize]
+        public uint Patches { get; private set; }
+
+        /// <summary>Terrain shadow entries (patch × cascade) drawn in the last frame read back.</summary>
+        [Reflection.DontSerialize]
+        public uint ShadowPatches { get; private set; }
         private GraphicsBuffer[] _indirectArgsBuffers = new GraphicsBuffer[FrameCount];
 
         private GraphicsBuffer[] _shadowArgsBuffers = new GraphicsBuffer[FrameCount];
@@ -126,7 +149,7 @@ namespace Freefall.Components
             public Vector3 RootExtents;public uint  TotalNodes;
             public Vector2 TerrainSize;public float PixelErrorThreshold; public float ScreenHeight;
             public float TanHalfFov;   public uint  TransformSlot;       public uint  MaterialId; public uint MeshPartId;
-            public uint  MaxPatches;   public uint  HeightTexIdx;         public uint  Pad0, Pad1;
+            public uint  MaxPatches;   public uint  HeightTexIdx;         public uint  FrameTag, WalkCapacity;
             public uint  ShadowReceiversIdx;    // shadow pass: this frame's sun shadow receivers (0 = no test)
             public uint  Pad2, Pad3, Pad4;
         }
@@ -371,6 +394,8 @@ namespace Freefall.Components
                 device?.DeferDispose(_terrainDataBuffers[i]);
                 device?.DeferDispose(_counterBuffers[i]);
                 device?.DeferDispose(_splitFlagsBuffers[i]);
+                device?.DeferDispose(_walkBuffers[i]);
+                device?.DeferDispose(_countReadbacks[i]);
                 device?.DeferDispose(_indirectArgsBuffers[i]);
                 device?.DeferDispose(_shadowArgsBuffers[i]);
 
@@ -526,7 +551,7 @@ namespace Freefall.Components
             var material = Material;
             if (material == null || material.Effect == null) return;
 
-            EnsureQuadtreeDepth(Terrain.QuadtreeDepth);
+            EnsureQuadtreeDepth(Math.Min(Terrain.QuadtreeDepth, MaxQuadtreeDepth));
             if (!Terrain.GridIsExact && !_gridWarned)
             {
                 _gridWarned = true;
@@ -1146,7 +1171,7 @@ namespace Freefall.Components
             var device = Engine.Device;
 
             _quadtreeCS = new ComputeShader("terrain_quadtree.hlsl");
-            _kMarkSplits       = _quadtreeCS.FindKernel("CSMarkSplits");
+            _kWalk             = _quadtreeCS.FindKernel("CSWalk");
             _kEmitLeaves       = _quadtreeCS.FindKernel("CSEmitLeaves");
             _kBuildMinMaxMip   = _quadtreeCS.FindKernel("CSBuildMinMaxMip");
             _kBuildDrawArgs    = _quadtreeCS.FindKernel("CSBuildDrawArgs");
@@ -1199,6 +1224,17 @@ namespace Freefall.Components
             // Raw R32 buffers
             _counterBuffers[i] = GraphicsBuffer.CreateRaw(1, uav: true, clearable: true);
             _splitFlagsBuffers[i] = GraphicsBuffer.CreateRaw(_totalNodes, uav: true, clearable: true);
+            _splitFlagsFresh[i] = true;
+            // A header of 4 uints and four lists of WalkCapacity entries (terrain_quadtree.hlsl WalkList)
+            _walkBuffers[i] = GraphicsBuffer.CreateRaw(4 + 4 * WalkCapacity, uav: true);
+            _countReadbacks[i] = Engine.Device.NativeDevice.CreateCommittedResource(
+                new HeapProperties(HeapType.Readback), HeapFlags.None, ResourceDescription.Buffer(8), ResourceStates.CopyDest, null);
+            unsafe
+            {
+                void* pData;
+                _countReadbacks[i]!.Map(0, null, &pData);
+                _countReadbackPtrs[i] = (IntPtr)pData;
+            }
             // D3D12_DRAW_INDEXED_ARGUMENTS (5 uints, CSBuildDrawArgs)
             _indirectArgsBuffers[i] = GraphicsBuffer.CreateRaw(5, srv: true, uav: true);
             _shadowArgsBuffers[i] = GraphicsBuffer.CreateRaw(5, uav: true);
@@ -1222,6 +1258,21 @@ namespace Freefall.Components
 
             var device = Engine.Device;
             var cs = _quadtreeCS!;
+
+            // The counts this slot's last frame drew (the GPU is done with it: this slot's buffers are being reused)
+            unsafe
+            {
+                if (_countReadbackPtrs[frameIndex] != IntPtr.Zero)
+                {
+                    uint* counts = (uint*)_countReadbackPtrs[frameIndex];
+                    Patches = Math.Min(counts[0], (uint)Math.Max(MaxPatches, MinPatches));
+                    ShadowPatches = counts[1];
+                }
+            }
+
+            // This evaluation's tag: a split flag holding it is split (terrain_quadtree.hlsl MarkSplit); never 0
+            _quadtreeTag = _quadtreeTag == uint.MaxValue ? 1u : _quadtreeTag + 1u;
+            _frameTags[frameIndex] = _quadtreeTag;
 
             // Transition buffers to UAV
             _descriptorBuffers[frameIndex].Transition(commandList, ResourceStates.UnorderedAccess);
@@ -1259,6 +1310,8 @@ namespace Freefall.Components
                 MeshPartId = (uint)_meshPartId,
                 MaxPatches = (uint)Math.Max(MaxPatches, MinPatches),
                 HeightTexIdx = Terrain?.Heightmap?.BindlessIndex ?? 0u,
+                FrameTag = _quadtreeTag,
+                WalkCapacity = WalkCapacity,
             };
             UploadBuffer(_terrainParamBuffers[frameIndex], terrainParams);
 
@@ -1269,10 +1322,13 @@ namespace Freefall.Components
             commandList.SetComputeRootConstantBufferView(2, _hizParamBuffers[frameIndex].GPUVirtualAddress);
             commandList.SetComputeRootConstantBufferView(3, _terrainParamBuffers[frameIndex].GPUVirtualAddress);
 
-            // Clear counter and splitFlags
+            // Clear the counter; the split flags only once, when made (they hold a tag, MarkSplit)
             _counterBuffers[frameIndex].ClearUAV(commandList, new Vortice.Mathematics.Int4(0, 0, 0, 0));
-            commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(null)));
-            _splitFlagsBuffers[frameIndex].ClearUAV(commandList, new Vortice.Mathematics.Int4(0, 0, 0, 0));
+            if (_splitFlagsFresh[frameIndex])
+            {
+                _splitFlagsBuffers[frameIndex].ClearUAV(commandList, new Vortice.Mathematics.Int4(0, 0, 0, 0));
+                _splitFlagsFresh[frameIndex] = false;
+            }
             commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(null)));
 
             // Push constants — bindless indices only (slots 0-14)
@@ -1282,6 +1338,7 @@ namespace Freefall.Components
             cs.SetBuffer("OutputTerrainDataUAV", _terrainDataBuffers[frameIndex]);
             cs.SetBuffer("CounterUAV", _counterBuffers[frameIndex]);
             cs.SetBuffer("SplitFlagsUAV", _splitFlagsBuffers[frameIndex]);
+            cs.SetBuffer("WalkUAV", _walkBuffers[frameIndex]);
             cs.SetPushConstant("HeightRangeSRV", _heightRangePyramidSRV);
 
             // Per-kernel overrides for CSBuildDrawArgs
@@ -1308,16 +1365,14 @@ namespace Freefall.Components
                 commandList.SetComputeRootConstantBufferView(3, _terrainParamBuffers[frameIndex].GPUVirtualAddress);
             }
 
-            uint threadGroups = (uint)((_totalNodes + 255) / 256);
-
-            // ── Pass 1: Mark splits + enforce restricted quadtree ──
-            cs.Dispatch(_kMarkSplits, commandList, threadGroups);
+            // ── Pass 1: the walk from the root into a list of leaves (one group: terrain_quadtree.hlsl CSWalk) ──
+            cs.Dispatch(_kWalk, commandList, 1);
 
             // UAV barrier
             commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(null)));
 
-            // ── Pass 2: Emit leaves with inline frustum + Hi-Z culling ──
-            cs.Dispatch(_kEmitLeaves, commandList, threadGroups);
+            // ── Pass 2: Emit leaves with inline frustum + Hi-Z culling (a thread a leaf; the rest leave at once) ──
+            cs.Dispatch(_kEmitLeaves, commandList, (WalkCapacity + 255) / 256);
 
             // UAV barrier
             commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(null)));
@@ -1330,6 +1385,14 @@ namespace Freefall.Components
 
             // Transition indirect args buffer for ExecuteIndirect
             _indirectArgsBuffers[frameIndex].Transition(commandList, ResourceStates.IndirectArgument);
+
+            // The patch count, for Patches when this slot comes round again
+            if (_countReadbacks[frameIndex] is { } countReadback)
+            {
+                _counterBuffers[frameIndex].Transition(commandList, ResourceStates.CopySource);
+                commandList.CopyBufferRegion(countReadback, 0, _counterBuffers[frameIndex].Native, 0, 4);
+                _counterBuffers[frameIndex].Transition(commandList, ResourceStates.UnorderedAccess);
+            }
 
             // Transition output buffers from UAV to SRV for vertex shader reads
             _descriptorBuffers[frameIndex].Transition(commandList, ResourceStates.NonPixelShaderResource);
@@ -1484,6 +1547,9 @@ namespace Freefall.Components
                 MeshPartId = (uint)_meshPartId,
                 MaxPatches = (uint)shadowMaxPatches,
                 HeightTexIdx = Terrain.Heightmap?.BindlessIndex ?? 0u,
+                // This frame's flags and leaves, from the walk in the opaque pass (DispatchQuadtreeEval)
+                FrameTag = _frameTags[frameIndex],
+                WalkCapacity = WalkCapacity,
                 // A patch casts into a cascade only where a surface the camera sees through it lies behind
                 // (receiver_mask_culling.md); the receivers were built from this frame's depth before this action ran
                 ShadowReceiversIdx = cascadeVPs != null ? DirectionalLight.CurrentShadowReceiversUav : 0u,
@@ -1508,12 +1574,13 @@ namespace Freefall.Components
             cs.SetBuffer(kShadow, "CounterUAV", _shadowCounterBuffers[frameIndex]);
             cs.SetBuffer(kShadow, "CascadeIdxUAV", _shadowCascadeIdxBuffers[frameIndex]);
             cs.SetBuffer(kShadow, "SplitFlagsUAV", _splitFlagsBuffers[frameIndex]);
+            cs.SetBuffer(kShadow, "WalkUAV", _walkBuffers[frameIndex]);
             cs.SetPushConstant(kShadow, "HeightRangeSRV", _heightRangePyramidSRV);
             cs.SetPushConstant(kShadow, "CascadeCount", (uint)cascadeCount);
             cs.SetPushConstant(kShadow, "CascadeBufferSRV", _shadowCascadeBufferSrvs[frameIndex]);
 
-            // Dispatch CSEmitLeavesShadow
-            uint threadGroups = (uint)((_totalNodes + 255) / 256);
+            // Dispatch CSEmitLeavesShadow: a thread a leaf of the walk's list
+            uint threadGroups = (WalkCapacity + 255) / 256;
             cs.Dispatch(kShadow, commandList, threadGroups);
 
             // UAV barrier
@@ -1527,6 +1594,14 @@ namespace Freefall.Components
 
             // UAV barrier
             commandList.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(null)));
+
+            // The shadow entry count, for ShadowPatches when this slot comes round again
+            if (_countReadbacks[frameIndex] is { } countReadback)
+            {
+                _shadowCounterBuffers[frameIndex].Transition(commandList, ResourceStates.CopySource);
+                commandList.CopyBufferRegion(countReadback, 4, _shadowCounterBuffers[frameIndex].Native, 0, 4);
+                _shadowCounterBuffers[frameIndex].Transition(commandList, ResourceStates.UnorderedAccess);
+            }
 
             // Transition shadow output to SRV for VS_Shadow
             _shadowDescriptorBuffers[frameIndex].Transition(commandList, ResourceStates.NonPixelShaderResource);
@@ -1779,7 +1854,10 @@ namespace Freefall.Components
             MaxDepth = depth;
             _totalNodes = CalculateTotalNodes(depth);
             for (int i = 0; i < FrameCount; i++)
+            {
                 _splitFlagsBuffers[i] = GraphicsBuffer.CreateRaw(_totalNodes, uav: true, clearable: true);
+                _splitFlagsFresh[i] = true;
+            }
             CreateHeightRangePyramid(device);
             _heightRangePyramidBuilt = false;
             Debug.Log($"[TerrainRenderer] Quadtree depth {depth} ({Terrain?.Name}): {_totalNodes} nodes");

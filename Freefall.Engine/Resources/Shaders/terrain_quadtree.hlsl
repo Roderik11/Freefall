@@ -1,10 +1,15 @@
-// GPU-Driven Quadtree Terrain — Restricted Quadtree (Three-Pass)
-// Pass 1 (CSMarkSplits): Each thread evaluates its node, marks split flags, and forces
-//   spatial neighbors to split (restricted quadtree constraint: ≤1 level difference).
-// Pass 2 (CSEmitLeaves): Reads enforced split flags and emits visible leaf patches
-//   with inline Hi-Z occlusion culling.
+// GPU-Driven Quadtree Terrain — Restricted Quadtree, walked from the root (TERRAIN_PAGES_PLAN.md stage 2, 2026-11-07)
+// Pass 1 (CSWalk): one group walks the tree level by level, testing only the children of nodes that split, so the
+//   cost follows what is drawn and not the size of the terrain; then applies the neighbour rule (restricted quadtree:
+//   ≤1 level difference) and walks again by the final flags into a list of leaves.
+// Pass 2 (CSEmitLeaves): the leaves in view, with inline Hi-Z occlusion culling, as patches.
 // Pass 3 (CSBuildDrawArgs): Single-thread pass that reads the append counter and writes
 //   DrawInstanced indirect arguments for ExecuteIndirect.
+// The shadow pass (CSEmitLeavesShadow) takes the same leaves, per cascade.
+// Until this date every pass swept every node of the tree (CSMarkSplits): 21,845 at depth 7, 1.4 million at depth 10.
+// The walk drew the same patches at depths 7, 8 and 10; on an RTX 4080 it costs 0.054 ms at depth 10 against the
+// sweep's 0.044 (the sweep's cost hardly grows with the nodes there), and is kept because its cost follows what is
+// drawn, which a smaller GPU and a deeper tree feel, and because stage 4's split by residency fits a walk from the root.
 
 // Must match Terrain.TerrainPatchData in C#
 struct TerrainPatchData
@@ -24,7 +29,7 @@ struct InstanceDescriptor
     uint BoneBufferIdx;
 };
 
-#pragma kernel CSMarkSplits
+#pragma kernel CSWalk
 #pragma kernel CSEmitLeaves
 #pragma kernel CSBuildMinMaxMip
 #pragma kernel CSBuildDrawArgs
@@ -48,6 +53,7 @@ cbuffer PushConstants : register(b3)
     uint VertexCountIdx;            // slot 12 — uint: mesh index count (CSBuildDrawArgs)
     uint CascadeCountIdx;           // slot 13 — uint: number of cascades (shadow)
     uint CascadeBufferSRVIdx;       // slot 14 — SRV: StructuredBuffer<CascadeData> (shadow)
+    uint WalkUAVIdx;                // slot 15 — UAV: the walk's lists and its leaves (CSWalk)
 };
 
 // ── Frustum planes (root slot 1, register b0) ──
@@ -77,7 +83,7 @@ cbuffer TerrainParams : register(b2)
     float3 RootExtents;    uint  TotalNodes;
     float2 TerrainSize;    float PixelErrorThreshold;  float ScreenHeight;
     float  TanHalfFov;     uint  TransformSlot;         uint  MaterialId;     uint  MeshPartId;
-    uint   MaxPatches;     uint  HeightTexIdx;           uint2 _terrainPad;
+    uint   MaxPatches;     uint  HeightTexIdx;           uint  FrameTag;    uint WalkCapacity;   // FrameTag: MarkSplit
     uint   ShadowReceiversIdx;  uint3 _terrainPad2;     // shadow pass: this frame's sun shadow receivers, 0 = no test
 };
 
@@ -169,33 +175,6 @@ uint LevelStart(uint depth)
     return ((1u << (2u * depth)) - 1u) / 3u;
 }
 
-// Decompose a flat node index into (depth, localIndex within that depth level).
-// Returns depth, sets localIdx.
-uint DecomposeIndex(uint flatIndex, out uint localIdx)
-{
-    // Walk levels to find which depth this index belongs to
-    uint depth = 0;
-    uint levelSize = 1; // 4^0 = 1
-    uint levelOffset = 0;
-    
-    uint maxDepth = MaxDepth;
-    
-    for (uint d = 0; d <= maxDepth; d++)
-    {
-        if (flatIndex < levelOffset + levelSize)
-        {
-            depth = d;
-            localIdx = flatIndex - levelOffset;
-            return depth;
-        }
-        levelOffset += levelSize;
-        levelSize *= 4;
-    }
-    
-    // Should not reach here if flatIndex < TotalNodes
-    localIdx = 0;
-    return maxDepth;
-}
 
 // Given a depth and local index, compute the node's center and extents in terrain space.
 // The local index encodes the quadrant path as pairs of 2 bits.
@@ -308,16 +287,21 @@ float4 ComputeRectExact(uint depth, uint localIdx)
 // Split flag helpers
 // ─────────────────────────────────────────────────────────────────────
 
-// Mark a node as split in the split flags buffer (atomic OR).
+// Mark a node as split for this evaluation: its flag holds this evaluation's tag (FrameTag, never 0), so a flag an
+// earlier frame wrote reads as not split and the buffer is never cleared (it was, every frame, until 2026-11-07: 5.6 MB
+// at depth 10). Every writer stores the same value, so no atomic is needed.
 void MarkSplit(uint depth, uint localIdx)
 {
     if (depth > MaxDepth) return;
-    
+
     uint flatIdx = LevelStart(depth) + localIdx;
     RWByteAddressBuffer splitFlags = ResourceDescriptorHeap[SplitFlagsUAVIdx];
-    
-    uint dummy;
-    splitFlags.InterlockedOr(flatIdx * 4, 1u, dummy);
+    splitFlags.Store(flatIdx * 4, FrameTag);
+}
+
+bool IsSplit(RWByteAddressBuffer splitFlags, uint depth, uint localIdx)
+{
+    return splitFlags.Load((LevelStart(depth) + localIdx) * 4) == FrameTag;
 }
 
 // Encode (ix, iz) grid coordinates back to localIdx at given depth.
@@ -348,88 +332,184 @@ void DecodeGridPos(uint depth, uint localIdx, out uint ix, out uint iz)
     }
 }
 
-// Ensure a neighbor EXISTS in the tree by forcing its ancestry to split.
-// Does NOT force the neighbor itself to split — it becomes a leaf at 'depth',
-// which is at most 1 level coarser than our children at depth+1.
-// The per-vertex CDLOD morph handles this 1-level transition seamlessly.
-void ForceNeighborExist(uint depth, int neighborIx, int neighborIz)
+// ─────────────────────────────────────────────────────────────────────
+// Pass 1: the walk (TERRAIN_PAGES_PLAN.md stage 2)
+// ─────────────────────────────────────────────────────────────────────
+
+// The walk's buffer (WalkUAV, raw): a header of 4 uints, then four lists of WalkCapacity entries: two that take turns
+// as one level's nodes and the next's, the nodes the screen error split, the leaves. An entry is a node packed as
+// (depth << 28) | localIdx, so depth ≤ 14.
+static const uint WALK_LEAVES = 0;          // header: leaves listed
+static const uint WALK_SPLITS = 4;          // header: nodes the screen error split, listed
+static const uint WALK_LIST_SPLITS = 2;
+static const uint WALK_LIST_LEAVES = 3;
+uint WalkList(uint list) { return 16 + list * WalkCapacity * 4; }
+uint PackNode(uint depth, uint localIdx) { return (depth << 28) | localIdx; }
+void UnpackNode(uint entry, out uint depth, out uint localIdx) { depth = entry >> 28; localIdx = entry & 0x0FFFFFFFu; }
+
+// The neighbour rule (restricted quadtree): a node the screen error splits needs its four neighbours at its depth to
+// exist, so that its children never border a leaf two levels coarser; so their parents split. The sweep (until
+// 2026-11-07, ForceNeighborExist) marked a neighbour's whole ancestry, but above the parent it has split already: by this same
+// rule applied to the node's own parent, which split too, since a parent's screen error is never below its child's
+// (its height range holds the child's, its nearest point is no further).
+void MarkNeighbourParent(uint depth, int nix, int niz)
 {
+    if (depth == 0) return;
     uint gridSize = 1u << depth;
-    
-    if (neighborIx < 0 || (uint)neighborIx >= gridSize) return;
-    if (neighborIz < 0 || (uint)neighborIz >= gridSize) return;
-    
-    uint nix = (uint)neighborIx;
-    uint niz = (uint)neighborIz;
-    
-    // Force entire ancestry chain so the neighbor exists as a leaf
-    for (uint d = depth; d > 0; d--)
+    if (nix < 0 || (uint)nix >= gridSize || niz < 0 || (uint)niz >= gridSize) return;
+    MarkSplit(depth - 1, EncodeLocalIdx(depth - 1, (uint)nix >> 1, (uint)niz >> 1));
+}
+
+#define WALK_THREADS 1024
+groupshared uint gsListed[2];   // entries in the two level lists
+groupshared uint gsSplits;
+groupshared uint gsLeaves;
+
+// One group walks the tree from the root, level by level: a few thousand nodes, where the sweep tested every node of
+// the tree. Three steps: the screen-error test, top-down, visiting only the children of nodes that split (the same
+// nodes split as when every node is tested, for the reason above); the neighbour rule over the nodes it split; the tree
+// again from the root by the final flags, into the list of leaves the emission passes take. A level that would
+// overflow the lists keeps its nodes as leaves.
+[numthreads(WALK_THREADS, 1, 1)]
+void CSWalk(uint gi : SV_GroupIndex)
+{
+    RWByteAddressBuffer walk = ResourceDescriptorHeap[WalkUAVIdx];
+    RWByteAddressBuffer splitFlags = ResourceDescriptorHeap[SplitFlagsUAVIdx];
+    uint cap = WalkCapacity;
+    uint maxDepth = MaxDepth;
+
+    // 1. The screen-error test, top-down
+    if (gi == 0)
     {
-        nix >>= 1;
-        niz >>= 1;
-        MarkSplit(d - 1, EncodeLocalIdx(d - 1, nix, niz));
+        walk.Store(WalkList(0), PackNode(0, 0));
+        gsListed[0] = 1;
+        gsListed[1] = 0;
+        gsSplits = 0;
+        gsLeaves = 0;
+    }
+    AllMemoryBarrierWithGroupSync();
+
+    uint cur = 0;
+    [loop] for (uint depth = 0; depth < maxDepth; depth++)
+    {
+        uint count = min(gsListed[cur], cap);
+        uint next = cur ^ 1u;
+        for (uint i = gi; i < count; i += WALK_THREADS)
+        {
+            uint d, localIdx;
+            UnpackNode(walk.Load(WalkList(cur) + i * 4), d, localIdx);
+            float3 center, extents;
+            ComputeNodeBounds(depth, localIdx, RootCenter, RootExtents, center, extents);
+            if (!ShouldSplit(depth, localIdx, center, extents, CameraPos, maxDepth))
+                continue;
+
+            uint slot;
+            InterlockedAdd(gsListed[next], 4u, slot);
+            if (slot >= cap)
+                continue;
+            MarkSplit(depth, localIdx);
+            uint s;
+            InterlockedAdd(gsSplits, 1u, s);
+            if (s < cap)
+                walk.Store(WalkList(WALK_LIST_SPLITS) + s * 4, PackNode(depth, localIdx));
+            for (uint q = 0; q < 4; q++)
+                walk.Store(WalkList(next) + (slot + q) * 4, PackNode(depth + 1, (localIdx << 2) | q));
+        }
+        AllMemoryBarrierWithGroupSync();
+        if (gi == 0)
+            gsListed[cur] = 0;
+        AllMemoryBarrierWithGroupSync();
+        cur = next;
+    }
+
+    // 2. The neighbour rule
+    uint splits = min(gsSplits, cap);
+    for (uint i = gi; i < splits; i += WALK_THREADS)
+    {
+        uint depth, localIdx;
+        UnpackNode(walk.Load(WalkList(WALK_LIST_SPLITS) + i * 4), depth, localIdx);
+        uint ix, iz;
+        DecodeGridPos(depth, localIdx, ix, iz);
+        MarkNeighbourParent(depth, (int)ix - 1, (int)iz);
+        MarkNeighbourParent(depth, (int)ix + 1, (int)iz);
+        MarkNeighbourParent(depth, (int)ix, (int)iz - 1);
+        MarkNeighbourParent(depth, (int)ix, (int)iz + 1);
+    }
+    AllMemoryBarrierWithGroupSync();
+
+    // 3. The leaves, by the final flags
+    if (gi == 0)
+    {
+        walk.Store(WalkList(0), PackNode(0, 0));
+        gsListed[0] = 1;
+        gsListed[1] = 0;
+    }
+    AllMemoryBarrierWithGroupSync();
+
+    cur = 0;
+    [loop] for (uint level = 0; level <= maxDepth; level++)
+    {
+        uint count = min(gsListed[cur], cap);
+        uint next = cur ^ 1u;
+        for (uint i = gi; i < count; i += WALK_THREADS)
+        {
+            uint d, localIdx;
+            UnpackNode(walk.Load(WalkList(cur) + i * 4), d, localIdx);
+            if (level < maxDepth && IsSplit(splitFlags, level, localIdx))
+            {
+                uint slot;
+                InterlockedAdd(gsListed[next], 4u, slot);
+                if (slot < cap)
+                {
+                    for (uint q = 0; q < 4; q++)
+                        walk.Store(WalkList(next) + (slot + q) * 4, PackNode(level + 1, (localIdx << 2) | q));
+                    continue;
+                }
+            }
+            uint leaf;
+            InterlockedAdd(gsLeaves, 1u, leaf);
+            if (leaf < cap)
+                walk.Store(WalkList(WALK_LIST_LEAVES) + leaf * 4, PackNode(level, localIdx));
+        }
+        AllMemoryBarrierWithGroupSync();
+        if (gi == 0)
+            gsListed[cur] = 0;
+        AllMemoryBarrierWithGroupSync();
+        cur = next;
+    }
+
+    if (gi == 0)
+    {
+        walk.Store(WALK_LEAVES, min(gsLeaves, cap));
+        walk.Store(WALK_SPLITS, splits);
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────
-// Pass 1: Mark split decisions + ensure neighbor existence
-// Standard CDLOD with neighbor ancestry enforcement to prevent
-// multi-level gaps. Neighbors are never forced to split themselves.
-// ─────────────────────────────────────────────────────────────────────
-
-[numthreads(256, 1, 1)]
-void CSMarkSplits(uint3 dtid : SV_DispatchThreadID)
+// Which sides of a leaf border a coarser one: the neighbour at its depth does not exist (its parent did not split).
+// Bits: 0 = S (-Z), 1 = E (+X), 2 = N (+Z), 3 = W (-X)
+uint StitchMask(RWByteAddressBuffer splitFlags, uint depth, uint localIdx)
 {
-    uint nodeIndex = dtid.x;
-    
-    if (nodeIndex >= TotalNodes)
-        return;
-    
-    uint maxDepth = MaxDepth;
-    float3 cameraPos = CameraPos;
-    float3 rootCenter = RootCenter;
-    float3 rootExtents = RootExtents;
-    
-    // Decompose flat index into depth level and local index
-    uint localIdx;
-    uint depth = DecomposeIndex(nodeIndex, localIdx);
-    
-    // Can't split at max depth
-    if (depth >= MaxDepth)
-        return;
-    
-    // Compute this node's bounds
-    float3 nodeCenter, nodeExtents;
-    ComputeNodeBounds(depth, localIdx, rootCenter, rootExtents, nodeCenter, nodeExtents);
-    
-    // Screen-space error split check
-    if (!ShouldSplit(depth, localIdx, nodeCenter, nodeExtents, cameraPos, maxDepth))
-        return;
-    
-    // Mark this node as split
-    MarkSplit(depth, localIdx);
-    
-    // Decode grid position for ancestry + neighbor enforcement
+    if (depth == 0) return 0;
     uint ix, iz;
     DecodeGridPos(depth, localIdx, ix, iz);
-    
-    // Mark full ancestry so this node exists in the tree
-    uint ax = ix, az = iz;
-    for (uint d = depth; d > 0; d--)
-    {
-        ax >>= 1;
-        az >>= 1;
-        MarkSplit(d - 1, EncodeLocalIdx(d - 1, ax, az));
-    }
-    
-    // Ensure cardinal neighbors exist at this depth (ancestry only).
-    // This prevents multi-level gaps: our children at depth+1 will be
-    // adjacent to these neighbors at depth — a 1-level diff that the
-    // CDLOD morph handles naturally.
-    ForceNeighborExist(depth, (int)ix - 1, (int)iz);
-    ForceNeighborExist(depth, (int)ix + 1, (int)iz);
-    ForceNeighborExist(depth, (int)ix,     (int)iz - 1);
-    ForceNeighborExist(depth, (int)ix,     (int)iz + 1);
+    uint gridSize = 1u << depth;
+    uint mask = 0;
+    if (iz > 0 && !IsSplit(splitFlags, depth - 1, EncodeLocalIdx(depth, ix, iz - 1) >> 2)) mask |= 1u;
+    if (ix + 1 < gridSize && !IsSplit(splitFlags, depth - 1, EncodeLocalIdx(depth, ix + 1, iz) >> 2)) mask |= 2u;
+    if (iz + 1 < gridSize && !IsSplit(splitFlags, depth - 1, EncodeLocalIdx(depth, ix, iz + 1) >> 2)) mask |= 4u;
+    if (ix > 0 && !IsSplit(splitFlags, depth - 1, EncodeLocalIdx(depth, ix - 1, iz) >> 2)) mask |= 8u;
+    return mask;
+}
+
+// The leaf a thread of the emission passes takes: the walk's leaf number 'id', if there are that many
+bool TakeLeaf(uint id, out uint depth, out uint localIdx)
+{
+    depth = 0;
+    localIdx = 0;
+    RWByteAddressBuffer walk = ResourceDescriptorHeap[WalkUAVIdx];
+    if (id >= walk.Load(WALK_LEAVES)) return false;
+    UnpackNode(walk.Load(WalkList(WALK_LIST_LEAVES) + id * 4), depth, localIdx);
+    return true;
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -439,49 +519,14 @@ void CSMarkSplits(uint3 dtid : SV_DispatchThreadID)
 [numthreads(256, 1, 1)]
 void CSEmitLeaves(uint3 dtid : SV_DispatchThreadID)
 {
-    uint nodeIndex = dtid.x;
-    
-    if (nodeIndex >= TotalNodes)
+    RWByteAddressBuffer splitFlags = ResourceDescriptorHeap[SplitFlagsUAVIdx];
+    uint depth, localIdx;
+    if (!TakeLeaf(dtid.x, depth, localIdx))
         return;
-    
+
     uint maxDepth = MaxDepth;
     float3 rootCenter = RootCenter;
     float3 rootExtents = RootExtents;
-    
-    // Decompose flat index into depth level and local index
-    uint localIdx;
-    uint depth = DecomposeIndex(nodeIndex, localIdx);
-    
-    // Read split flags
-    RWByteAddressBuffer splitFlags = ResourceDescriptorHeap[SplitFlagsUAVIdx];
-    uint mySplitFlag = splitFlags.Load(nodeIndex * 4);
-    
-    // A node is a visible leaf if:
-    //   - Its parent is split (so this node exists) AND
-    //   - It is NOT split itself, OR it's at max depth
-    
-    bool iAmLeaf;
-    
-    if (depth == 0)
-    {
-        // Root node: leaf only if it's not split
-        iAmLeaf = (mySplitFlag == 0);
-    }
-    else
-    {
-        // Check parent's split flag
-        uint parentLocalIdx = localIdx >> 2;
-        uint parentFlatIdx = LevelStart(depth - 1) + parentLocalIdx;
-        uint parentSplitFlag = splitFlags.Load(parentFlatIdx * 4);
-        
-        bool parentIsSplit = (parentSplitFlag != 0);
-        bool iAmSplit = (mySplitFlag != 0);
-        
-        iAmLeaf = parentIsSplit && (!iAmSplit || depth == maxDepth);
-    }
-    
-    if (!iAmLeaf)
-        return;
 
     // Compute this node's bounds for frustum + Hi-Z tests
     float3 nodeCenter, nodeExtents;
@@ -533,54 +578,8 @@ void CSEmitLeaves(uint3 dtid : SV_DispatchThreadID)
     RWStructuredBuffer<uint> outSubbatchIds = ResourceDescriptorHeap[OutputSubbatchIdsUAVIdx];
     outSubbatchIds[patchIdx] = MeshPartId;
     
-    // ── Compute stitch mask ──
-    // Check each cardinal neighbor: if the neighbor at the same depth does NOT exist
-    // (parent wasn't split), the neighbor is coarser → set stitch bit.
-    // Bits: 0=S(-Z), 1=E(+X), 2=N(+Z), 3=W(-X)
-    uint ix, iz;
-    DecodeGridPos(depth, localIdx, ix, iz);
-    uint gridSize = 1u << depth;
-    uint stitchMask = 0;
-
-    if (depth > 0)
-    {
-        // South neighbor (iz - 1)
-        if (iz > 0)
-        {
-            uint nIdx = LevelStart(depth) + EncodeLocalIdx(depth, ix, iz - 1);
-            uint nParentLocal = (EncodeLocalIdx(depth, ix, iz - 1)) >> 2;
-            uint nParentFlat = LevelStart(depth - 1) + nParentLocal;
-            uint nParentSplit = splitFlags.Load(nParentFlat * 4);
-            if (nParentSplit == 0) stitchMask |= 1u;  // neighbor is coarser
-        }
-
-        // East neighbor (ix + 1)
-        if (ix + 1 < gridSize)
-        {
-            uint nParentLocal = (EncodeLocalIdx(depth, ix + 1, iz)) >> 2;
-            uint nParentFlat = LevelStart(depth - 1) + nParentLocal;
-            uint nParentSplit = splitFlags.Load(nParentFlat * 4);
-            if (nParentSplit == 0) stitchMask |= 2u;
-        }
-
-        // North neighbor (iz + 1)
-        if (iz + 1 < gridSize)
-        {
-            uint nParentLocal = (EncodeLocalIdx(depth, ix, iz + 1)) >> 2;
-            uint nParentFlat = LevelStart(depth - 1) + nParentLocal;
-            uint nParentSplit = splitFlags.Load(nParentFlat * 4);
-            if (nParentSplit == 0) stitchMask |= 4u;
-        }
-
-        // West neighbor (ix - 1)
-        if (ix > 0)
-        {
-            uint nParentLocal = (EncodeLocalIdx(depth, ix - 1, iz)) >> 2;
-            uint nParentFlat = LevelStart(depth - 1) + nParentLocal;
-            uint nParentSplit = splitFlags.Load(nParentFlat * 4);
-            if (nParentSplit == 0) stitchMask |= 8u;
-        }
-    }
+    // ── Stitch mask: the sides that border a coarser leaf ──
+    uint stitchMask = StitchMask(splitFlags, depth, localIdx);
 
     // Write TerrainPatchData
     RWStructuredBuffer<TerrainPatchData> outTerrainData = ResourceDescriptorHeap[OutputTerrainDataUAVIdx];
@@ -763,36 +762,15 @@ bool IsCascadeVisible(float3 center, float radius, uint cascadeIdx)
 [numthreads(256, 1, 1)]
 void CSEmitLeavesShadow(uint3 dtid : SV_DispatchThreadID)
 {
-    uint nodeIndex = dtid.x;
-
-    if (nodeIndex >= TotalNodes)
+    // The leaves of this frame's walk (CSWalk ran in the opaque pass, before the shadow maps)
+    RWByteAddressBuffer splitFlags = ResourceDescriptorHeap[SplitFlagsUAVIdx];
+    uint depth, localIdx;
+    if (!TakeLeaf(dtid.x, depth, localIdx))
         return;
 
     uint maxDepth = MaxDepth;
-    float3 cameraPos = CameraPos;
     float3 rootCenter = RootCenter;
     float3 rootExtents = RootExtents;
-
-    // Decompose flat index into depth level and local index
-    uint localIdx;
-    uint depth = DecomposeIndex(nodeIndex, localIdx);
-
-    // Read split flags
-    RWByteAddressBuffer splitFlags = ResourceDescriptorHeap[SplitFlagsUAVIdx];
-    uint flatIdx = LevelStart(depth) + localIdx;
-    uint isSplit = splitFlags.Load(flatIdx * 4);
-
-    // A leaf is a node that is NOT split (and exists in the tree)
-    if (depth > 0)
-    {
-        uint parentLocal = localIdx >> 2;
-        uint parentFlat = LevelStart(depth - 1) + parentLocal;
-        uint parentSplit = splitFlags.Load(parentFlat * 4);
-        if (parentSplit == 0) return; // parent not split → this node doesn't exist
-    }
-
-    if (isSplit != 0 && depth < maxDepth)
-        return; // interior node, not a leaf
 
     // Compute this node's bounds
     float3 nodeCenter, nodeExtents;
@@ -823,38 +801,8 @@ void CSEmitLeavesShadow(uint3 dtid : SV_DispatchThreadID)
     uint materialId = MaterialId;
     uint meshPartId = MeshPartId;
 
-    // Stitch mask (same as CSEmitLeaves)
-    uint ix, iz;
-    DecodeGridPos(depth, localIdx, ix, iz);
-    uint gridSize = 1u << depth;
-    uint stitchMask = 0;
-    if (depth > 0)
-    {
-        if (iz > 0)
-        {
-            uint nParentLocal = (EncodeLocalIdx(depth, ix, iz - 1)) >> 2;
-            uint nParentFlat = LevelStart(depth - 1) + nParentLocal;
-            if (splitFlags.Load(nParentFlat * 4) == 0) stitchMask |= 1u;
-        }
-        if (ix + 1 < gridSize)
-        {
-            uint nParentLocal = (EncodeLocalIdx(depth, ix + 1, iz)) >> 2;
-            uint nParentFlat = LevelStart(depth - 1) + nParentLocal;
-            if (splitFlags.Load(nParentFlat * 4) == 0) stitchMask |= 2u;
-        }
-        if (iz + 1 < gridSize)
-        {
-            uint nParentLocal = (EncodeLocalIdx(depth, ix, iz + 1)) >> 2;
-            uint nParentFlat = LevelStart(depth - 1) + nParentLocal;
-            if (splitFlags.Load(nParentFlat * 4) == 0) stitchMask |= 4u;
-        }
-        if (ix > 0)
-        {
-            uint nParentLocal = (EncodeLocalIdx(depth, ix - 1, iz)) >> 2;
-            uint nParentFlat = LevelStart(depth - 1) + nParentLocal;
-            if (splitFlags.Load(nParentFlat * 4) == 0) stitchMask |= 8u;
-        }
-    }
+    // Stitch mask (as CSEmitLeaves)
+    uint stitchMask = StitchMask(splitFlags, depth, localIdx);
 
     float4 patchRect = ComputeRectExact(depth, localIdx);
 
