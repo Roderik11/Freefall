@@ -706,12 +706,13 @@ namespace Freefall
          /// <summary>
          /// Metres round the camera in which a terrain's heights are at full detail (level 0 pages); twice and four times
          /// that the next two levels, coarser beyond (TerrainHeightResidency, TERRAIN_PAGES_PLAN.md 5a). 0 = every level 0
-         /// page stays in the height pool, the default until paint and the near maps bake per page (5b, 5c): baked
-         /// whole-map from the pool, they read coarse heights away from the camera.
+         /// page stays in the height pool. 4096 by default since 5c (2026-11-08), when the paint, the decoration control and
+         /// the decorations' normals came to pages or the heights round the camera: until then they were baked whole-map
+         /// from the pool and would have read coarse heights away from the camera.
          /// </summary>
          [Category("Terrain")]
          [ValueRange(0f, 16384f)]
-         public float TerrainDetailRadius { get; set; } = 0f;
+         public float TerrainDetailRadius { get; set; } = 4096f;
 
          /// <summary>Height pages uploaded into the pool in a frame while a terrain streams (TerrainDetailRadius above 0).</summary>
          [ValueRange(1, 256)]
@@ -719,7 +720,7 @@ namespace Freefall
 
          /// <summary>
          /// Paint pages (the layers' blend weights, 256 texels a side) a side of the window round the camera at every level,
-         /// each level's pages twice the last's size (TerrainPaintResidency, TERRAIN_PAGES_PLAN.md 5b): the paint is baked
+         /// each level's pages twice the last's size (TerrainMapResidency, TERRAIN_PAGES_PLAN.md 5b): the paint is baked
          /// from the stamps as pages arrive. 0 = every level 0 page in the pool, the whole map at full paint as before 5b.
          /// </summary>
          [ValueRange(0, 32)]
@@ -729,6 +730,26 @@ namespace Freefall
          /// pages an edit touches near the camera bake at once).</summary>
          [ValueRange(1, 64)]
          public int TerrainPaintBakesPerFrame { get; set; } = 4;
+
+         /// <summary>
+         /// Decoration control pages (the top 8 decorators per metre, 256 a side) a side of the window round the camera at every
+         /// level (TerrainMapResidency, TERRAIN_PAGES_PLAN.md 5c): full detail where plants are spawned, coarser beyond for the
+         /// sward's colour on the far ground. 0 = every level 0 page, the whole map as before 5c.
+         /// </summary>
+         [ValueRange(0, 32)]
+         public int TerrainDecoPages { get; set; } = 5;
+
+         /// <summary>Decoration control pages baked in a frame as they arrive or change away from the camera's own window.</summary>
+         [ValueRange(1, 64)]
+         public int TerrainDecoBakesPerFrame { get; set; } = 4;
+
+         /// <summary>
+         /// Metres round each viewer (Vicinity.Viewers, else the main camera) within which the terrain has collision: a height
+         /// field per page, cooked on workers as pages come in range, dropped a quarter further out (TERRAIN_PAGES_PLAN.md 5c).
+         /// 0 = every page, as before 5c.
+         /// </summary>
+         [ValueRange(0f, 16384f)]
+         public float TerrainCollisionRadius { get; set; } = 1024f;
 
          /// <summary>
          /// Characters are posed less often the smaller they are on screen and when out of view, and not at all

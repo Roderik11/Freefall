@@ -13,7 +13,6 @@
 // Output: StructuredBuffer<DecoInstance> consumed by the lean AS/MS in grass.fx and grass_blades.fx
 // ═══════════════════════════════════════════════════════════════════════════
 
-#pragma kernel CS_BakeTerrainNormals
 #pragma kernel CS_SpawnInstances
 #pragma kernel CS_BuildDrawArgs
 #pragma kernel CS_BinMeshInstances
@@ -23,8 +22,9 @@
 #include "decoration_noise.hlsli"   // DecoClusterMask, DecoHeightFactor
 #include "ground_shape.hlsli"       // GroundShape, GroundShapeTint, PackGroundTint
 #include "terrain_holes.hlsli"      // TerrainHoleAt
-#include "terrain_grid.hlsli"       // TerrainHeightUV: where the height map holds a place's height
+#include "terrain_grid.hlsli"       // the terrain's grid of samples
 #include "terrain_paint.hlsli"      // the layers' weights for the plants' tint, from the paint pages
+#include "terrain_deco.hlsli"       // the top 8 decorators per metre, from the decoration pages
 #include "weather_cover.hlsli"      // ShelterTexels: how much the cover map keeps the snow off a plant's root
 
 // Push constants (root parameter 0, register b3) — bindless indices only
@@ -34,9 +34,9 @@ cbuffer PushConstants : register(b3)
     uint LODTableIdx;               // slot 1  — SRV
     uint MeshRegistryIdx;           // slot 2  — SRV
     uint TerrainPagesIdx;           // slot 3  — this terrain's TerrainPagesParams (terrain_pages.hlsli): its heights
-    uint DecoControlIdx;            // slot 4  — SRV
-    uint BakedNormalIdx;            // slot 5  — SRV
-    uint BakedNormalUAVIdx;         // slot 6  — UAV (bake kernel)
+    uint DecoControlIdx;            // slot 4  — the decoration pages' TerrainDecoParams (terrain_deco.hlsli)
+    uint _unusedSlot5;              // slot 5  — was the baked normals (gone in 5c: from the heights, below)
+    uint _unusedSlot6;              // slot 6  — was their bake's UAV
     uint DecoMapsIdx;               // slot 7  — SRV
     uint DecoInstanceUAVIdx;        // slot 8  — UAV (spawn kernel)
     uint InstanceCounterUAVIdx;     // slot 9  — UAV
@@ -57,7 +57,7 @@ cbuffer PushConstants : register(b3)
     uint SplatControlIdx;           // slot 24 — unused since 5b: the layer weights come from the paint pages (terrain_paint.hlsli)
     uint LayerPlantTintIdx;         // slot 25 — SRV: StructuredBuffer<float4>, TerrainLayer.PlantTint per channel
     uint SplatLayerCount;           // slot 26 — layers in the palette (0 = no plant tint)
-    uint HoleTexIdx;                // slot 27 — SRV: R8 hole mask (HoleStamp, terrain_holes.hlsli), 0 = no holes
+    uint HoleTexIdx;                // slot 27 — the hole pages' TerrainHoleParams (HoleStamp, terrain_holes.hlsli), 0 = no holes
     uint DecoRowsIdx;               // slot 28 — SRV: StructuredBuffer<DecoRow>, 0 = nothing grows in rows
 };
 
@@ -406,48 +406,6 @@ float2 hash22(float2 p)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Stage 0: CS_BakeTerrainNormals
-//
-// One-time prepass: heightmap → R16G16_SNORM normal map.
-// Dispatched once (or when heightmap changes).
-// Stores only XZ components; Y is reconstructed as sqrt(1 - x² - z²).
-// ═══════════════════════════════════════════════════════════════════════════
-
-[numthreads(8, 8, 1)]
-void CS_BakeTerrainNormals(uint3 dtid : SV_DispatchThreadID)
-{
-    TerrainPagesParams pages = LoadTerrain(TerrainPagesIdx);
-    RWTexture2D<float2> normalOut = ResourceDescriptorHeap[BakedNormalUAVIdx];
-
-    uint hmW = HeightmapSize.x;
-    uint hmH = HeightmapSize.y;
-    if (dtid.x >= hmW || dtid.y >= hmH) return;
-
-    // Normal texel i is height sample i·step: one a sample, or every second where that would pass D3D12's 16,384 texels
-    // (16 km at 1 m per vertex; TerrainRenderer.BakedNormalSize). Its neighbours a step either side, clamped to the
-    // terrain's edges (they wrapped round to the far edge before the pool, the sampler being a wrapping one)
-    int step = int(pages.Cells / (hmW - 1));
-    int2 i = int2(dtid.xy) * step;
-    float hL = TerrainSample01(pages, i + int2(-step, 0));
-    float hR = TerrainSample01(pages, i + int2( step, 0));
-    float hD = TerrainSample01(pages, i + int2(0, -step));
-    float hU = TerrainSample01(pages, i + int2(0,  step));
-
-    // Central difference spans two texels (hL-hR, hD-hU); a texel is step samples (terrain_grid.hlsli)
-    float texelWorldSize = TerrainSize.x / float(hmW - 1);
-    float heightScale = MaxHeight / (2.0 * texelWorldSize);
-
-    float3 n = normalize(float3(
-        (hL - hR) * heightScale,
-        1.0,
-        (hD - hU) * heightScale
-    ));
-
-    // Store XZ in R16G16_SNORM; Y is reconstructed as sqrt(1 - x² - z²)
-    normalOut[dtid.xy] = float2(n.x, n.z);
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
 // CS_SpawnInstances — Single-pass instance spawning
 //
 // Dispatch(N, N, 1) where N = GridSize = cells per side around the camera, walked as a spiral from its cell.
@@ -476,6 +434,12 @@ groupshared uint  gs_cellValid;
 groupshared uint  gs_groupMask;                      // bit N: decorator N covers one of the 3x3 texels
 groupshared float gs_cov[MAX_DECORATORS][9];         // coverage 0..1 per decorator at the 3x3 texel centres, row = z offset
 groupshared uint  gs_row[9];                         // per texel: 1 + the DecoRow it holds, 0 = no rows (the spawn reads [4])
+
+// The heights round the cell (normalized), for the plants' normals: samples from a metre before the cell to a metre past it
+// (a plant moved onto a crop row may leave its cell), and one more each side for the central differences. At most 10 a side
+// (0.5 m per vertex); NORMAL_GRID a side of room.
+#define NORMAL_GRID 12
+groupshared float gs_h[NORMAL_GRID * NORMAL_GRID];
 
 // The i-th cell of a square spiral around the centre cell: ring k holds the 8k cells at Chebyshev distance k.
 int2 SpiralCell(uint i)
@@ -531,12 +495,9 @@ void CS_SpawnInstances(uint3 gid : SV_GroupID, uint3 gtid3 : SV_GroupThreadID)
     int cellX = BaseTileX + int(GridSize / 2) + spiral.x;
     int cellZ = BaseTileZ + int(GridSize / 2) + spiral.y;
 
-    // Control texture (dimensions from cbuffer)
-    Texture2DArray<uint4> controlTex = ResourceDescriptorHeap[DecoControlIdx];
-
-    // Control map texel — same Y-flip as gputerrain.fx debug overlay
-    int cx = cellX;
-    int cy = int(ControlHeight) - 1 - cellZ;
+    // The decoration pages (terrain_deco.hlsli): a cell is a level 0 texel, (cellX, cellZ), +Z up (the whole-map texture
+    // before 5c was Y-flipped)
+    TerrainDecoParams deco = LoadDeco(DecoControlIdx);
 
     // Check tile validity — no early return before the barrier
     float ts = TileSize;
@@ -547,7 +508,7 @@ void CS_SpawnInstances(uint3 gid : SV_GroupID, uint3 gtid3 : SV_GroupThreadID)
     float dz2 = tileWorldZ - camPos.z;
     float maxR = DecoRadius + ts;
 
-    bool tileValid = (cx >= 0 && cx < int(ControlWidth) && cy >= 0 && cy < int(ControlHeight))
+    bool tileValid = (cellX >= 0 && cellX < int(ControlWidth) && cellZ >= 0 && cellZ < int(ControlHeight))
                   && (dx2 * dx2 + dz2 * dz2 <= maxR * maxR);
 
     // ── Thread 0 reads BAKED control texture and populates groupshared ──
@@ -581,15 +542,14 @@ void CS_SpawnInstances(uint3 gid : SV_GroupID, uint3 gtid3 : SV_GroupThreadID)
     // texel centres around it, so a patch of decorators ends in a ramp instead of a staircase of 1 m squares that
     // are each all in or all out. Each thread owns one column of the per-decorator table (clears it, then writes its
     // texel's decorators), so nothing is merged serially: a thread-0 merge of the 72 channels cost as much as the old
-    // spawn did. (RGBA16_UINT is uncompressed: Load is valid; edges clamp.)
+    // spawn did.
     if (flatThread < 9)
     {
         for (uint z = 0; z < MAX_DECORATORS; z++) gs_cov[z][flatThread] = 0;
         gs_row[flatThread] = 0;
         int2 d = int2(flatThread % 3, flatThread / 3) - 1;                 // cell offset in x, z
-        int2 texel = clamp(int2(cx + d.x, cy - d.y), int2(0, 0), int2(int(ControlWidth) - 1, int(ControlHeight) - 1));
-        uint4 s0 = controlTex.Load(int4(texel, 0, 0));
-        uint4 s1 = controlTex.Load(int4(texel, 1, 0));
+        uint4 s0, s1;
+        DecoTexel(deco, int2(cellX + d.x, cellZ + d.y), s0, s1);   // edges clamp
         [unroll] for (uint ch = 0; ch < 8; ch++)
         {
             uint packed = ch < 4 ? s0[ch] : s1[ch - 4];
@@ -697,7 +657,20 @@ void CS_SpawnInstances(uint3 gid : SV_GroupID, uint3 gtid3 : SV_GroupThreadID)
     uint maxInst = MaxInstances;
 
     TerrainPagesParams pages = LoadTerrain(TerrainPagesIdx);
-    Texture2D<float2> bakedNormals = ResourceDescriptorHeap[BakedNormalIdx];
+
+    // The heights round the cell into group memory (gs_h): samples hBase .. hBase + hSide - 1 a side, from a metre before
+    // the cell to a metre past it and one more each side, clamped to the terrain. A plant's normal is made from them below
+    // as the baked normal map made it (central differences at the samples, bilinear between); since 5c there is no map
+    // (it took every second sample past 16 km at 1 m, and 1 GB there).
+    float2 cellSample0 = float2(cellX, cellZ) * ts / pages.Spacing;
+    int2 hBase = int2(floor(cellSample0 - 1.0 / pages.Spacing)) - 1;
+    int2 hEnd = int2(floor(cellSample0 + (ts + 1.0) / pages.Spacing)) + 2;
+    int2 hSides = hEnd - hBase + 1;   // the two axes can differ by one where a cell starts between samples (2 m)
+    int hSide = min(max(hSides.x, hSides.y), NORMAL_GRID);
+    for (uint hk = flatThread; hk < uint(hSide * hSide); hk += 64)
+        gs_h[hk] = TerrainSample01(pages, hBase + int2(hk % uint(hSide), hk / uint(hSide)));
+    GroupMemoryBarrierWithGroupSync();
+    float normalScale = MaxHeight / (2.0 * pages.Spacing);
 
     // All of the cell's candidates as one list, 64 threads over it. One pass per variant left most threads idle in
     // each (a sparse variant has a candidate or two) while every pass still paid a full round of texture latency.
@@ -796,7 +769,6 @@ void CS_SpawnInstances(uint3 gid : SV_GroupID, uint3 gtid3 : SV_GroupThreadID)
             if (TerrainHoleAt(HoleTexIdx, ClampSampler, localXZ, TerrainSize)) continue;
 
             // ── Heightmap sample ──
-            float2 heightUV = TerrainHeightUV(texelUV, float2(HeightmapSize));     // the baked normals' texel of the place
             float h = TerrainHeight01AtSample(pages, texelUV * (float)pages.Cells);
             float3 instancePos = float3(wx, TerrainOrigin.z + h * MaxHeight, wz);
 
@@ -842,9 +814,20 @@ void CS_SpawnInstances(uint3 gid : SV_GroupID, uint3 gtid3 : SV_GroupThreadID)
             float endKeep = EndKeep(slot, camDist);
             if (rank >= saturate(thinFacing) * endKeep) continue;      // before the normal: ground at an angle keeps less
 
-            // ── Terrain normal (R16G16_SNORM — already [-1,1]) ──
-            float2 nxz = bakedNormals.SampleLevel(ClampSampler, heightUV, 0).rg;
-            float ny = sqrt(max(0.0, 1.0 - nxz.x * nxz.x - nxz.y * nxz.y));
+            // ── Terrain normal: the four samples' round the plant, bilinear (gs_h above) ──
+            float2 sc = texelUV * (float)pages.Cells;
+            int2 sAt = int2(floor(sc));
+            float2 sf = sc - float2(sAt);
+            float2 nxz = 0;
+            [unroll] for (uint nk = 0; nk < 4; nk++)
+            {
+                int2 o = int2(nk & 1, nk >> 1);
+                int2 g = clamp(sAt + o - hBase, 1, hSide - 2);
+                float hL = gs_h[g.y * hSide + g.x - 1], hR = gs_h[g.y * hSide + g.x + 1];
+                float hD = gs_h[(g.y - 1) * hSide + g.x], hU = gs_h[(g.y + 1) * hSide + g.x];
+                float3 sn = normalize(float3((hL - hR) * normalScale, 1.0, (hD - hU) * normalScale));
+                nxz += sn.xz * ((o.x ? sf.x : 1.0 - sf.x) * (o.y ? sf.y : 1.0 - sf.y));
+            }            float ny = sqrt(max(0.0, 1.0 - nxz.x * nxz.x - nxz.y * nxz.y));
             float3 terrainNormal = normalize(float3(nxz.x, ny, nxz.y));
 
             float thin = thins ? saturate(thinFacing * max(abs(dot(toCam, terrainNormal)) / camDist, THIN_MIN_COS)) : 1.0;

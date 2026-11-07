@@ -19,8 +19,11 @@ namespace Freefall.Graphics
     /// are <see cref="PageSlots"/>'s. Shaders read it only through terrain_paint.hlsli, from <c>TerrainPaintParams</c>,
     /// whose index the terrain's height params carry (<c>TerrainPagesParams.PaintIdx</c>).
     /// </summary>
-    public sealed class PaintPool : IDisposable
+    public sealed class PaintPool : IDisposable, IPagedMap
     {
+        object? IPagedMap.Resource => Weights;
+        int IPagedMap.Border => Border;
+
         /// <summary>Paint texels a page holds a side.</summary>
         public const int PageTexels = 256;
         /// <summary>Texels round a page, so filtering near its edge (anisotropic in the terrain's shader) stays in it.</summary>

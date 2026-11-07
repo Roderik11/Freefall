@@ -113,6 +113,13 @@ namespace Freefall.Assets
         /// <summary>Page (px, pz)'s hole bytes, or null where no hole cuts it.</summary>
         public ReadOnlySpan<byte> HolePage(int px, int pz) => _holes[pz * PagesAcross + px];
 
+        /// <summary>
+        /// What page (px, pz) is made of: its height and hole arrays. A store is never changed once made and an edit makes a
+        /// new array for every page it changes, so another reference means the page changed (TerrainCollider cooks again
+        /// only those).
+        /// </summary>
+        internal (object? heights, object? holes) PageIdentity(int px, int pz) => (_heights[pz * PagesAcross + px], _holes[pz * PagesAcross + px]);
+
         // The page that holds the cell (x, z) to (x + 1, z + 1) and the cell's corner on it; the far edge's samples
         // fall on the last page
         private int PageOf(int x, int z, out int local)

@@ -210,7 +210,7 @@ namespace Freefall.Components
 
         // ───── Compute Prepass (grass_compute.hlsl) ──────────────────────
         private ComputeShader? _grassCS;
-        private int _kBakeNormals, _kSpawnInstances, _kBuildDecoDrawArgs, _kBinMeshInstances;
+        private int _kSpawnInstances, _kBuildDecoDrawArgs, _kBinMeshInstances;
         private GraphicsBuffer? _decoInstanceBuffer;    // StructuredBuffer<DecoInstance> = 64 bytes
         private GraphicsBuffer? _instanceCounterBuffer; // RWByteAddressBuffer (3 uints: card, mesh, blade clump counts)
         private GraphicsBuffer? _decoDispatchArgsBuffer; // RWByteAddressBuffer (7 uints: card DispatchMesh, mesh count, blade DispatchMesh at 16)
@@ -248,18 +248,20 @@ namespace Freefall.Components
         private ID3D12Resource? _instanceCounterReadback;
         private IntPtr _instanceCounterReadbackPtr;
 
-        // ───── Baked Terrain Normals (one-time) ──────────────────────────
-        private ID3D12Resource? _bakedNormalTex;        // R16G16_SNORM, BakedNormalSize a side
-        private int _bakedNormalTexSize;                // the size it was made at: a density change makes it again
-        private bool _bakedNormalReadable;              // false: still in Common as created; true: in AllShaderResource
-        private uint _bakedNormalUAV;
-        private uint _bakedNormalSRV;
-        private bool _bakedNormalsDirty = true;
+        // ───── Decoration pages (TERRAIN_PAGES_PLAN.md 5c) ─────────────────
+        // The top 8 decorators per metre as pages in a pool, baked from the deco stamps as pages arrive round the camera or
+        // change (EngineSettings.TerrainDecoPages; 0 = every level 0 page, the whole map as before 5c). The decorations'
+        // normals come from the height pages in the spawn (the baked normal map went with 5c).
+        private readonly Graphics.DecoPool _decoPool = new();
+        private Graphics.TerrainMapResidency? _decoResidency;
+        private TerrainBaker.CoveragePlan? _decoPlan;             // the stamps every decoration page bakes from
+        private bool _decoPoolWarned;
+        private static readonly ProfilerMarker _decoResidencyMarker = ProfilerMarker.Get("Terrain deco residency");
 
-        // ───── Decoration Control Prepass ─────────────────────────────────
-        private ID3D12Resource? _decoControlTex;     // RGBA16_UINT, 2 slices
-        private uint _decoControlUAV;
-        private uint _decoControlSRV;
+        private Graphics.TerrainMapResidency DecoResidency => _decoResidency ??= new(_decoPool);
+
+        /// <summary>This frame's TerrainDecoParams (terrain_deco.hlsli), 0 while there are no decoration pages.</summary>
+        private uint DecoParamsIdx() => _decoPlan != null ? _decoPool.WriteParams() : 0u;
 
         // ───── Baked Terrain Albedo ───────────────────────────────────────
         private ComputeShader? _albedoBakeCS;
@@ -321,9 +323,6 @@ namespace Freefall.Components
         [Browsable(false)]
         public IReadOnlyList<string> PaletteWarnings => _layerWarnings.Concat(_decoWarnings).ToList();
 
-        // Decoration coverage bake prepared on the main thread, run by the next decorator dispatch
-        private TerrainBaker.CoveragePlan? _pendingDecoPlan;
-
         // ───── Height Bake (GPU layer compositor) ─────────────────────────
         private bool _needHeightFieldReadback;
 
@@ -331,24 +330,19 @@ namespace Freefall.Components
         // The layer weights as pages in a pool, baked from the splat stamps as pages arrive round the camera or change
         // (EngineSettings.TerrainPaintPages; 0 = every level 0 page, the whole map at full paint as before 5b).
         private readonly Graphics.PaintPool _paintPool = new();
-        private Graphics.TerrainPaintResidency? _paintResidency;
+        private Graphics.TerrainMapResidency? _paintResidency;
         private TerrainBaker.CoveragePlan? _splatPlan;            // the stamps every paint page bakes from
         private List<TerrainLayer> _paintPalette = new();         // the palette _splatPlan was laid out for
         private bool _paintPoolWarned;
         private static readonly ProfilerMarker _paintResidencyMarker = ProfilerMarker.Get("Terrain paint residency");
 
-        private Graphics.TerrainPaintResidency PaintResidency => _paintResidency ??= new(_paintPool);
+        private Graphics.TerrainMapResidency PaintResidency => _paintResidency ??= new(_paintPool);
 
         // Per slot: a serial bumped each time a bake of it is put on a list, and the palette it was baked with (what its
         // channels mean), so GetLayer's copies know when they are old
         private long[] _paintSlotSerial = Array.Empty<long>();
         private List<TerrainLayer>?[] _paintSlotPalette = Array.Empty<List<TerrainLayer>?>();
         private long _paintSerial;
-
-        // Level 0 paint pages baked since the decoration control texture last saw them, in terrain UV: their ground is
-        // baked into it again (a page that arrives replaces the coarse paint the deco filters read before)
-        private Vector2 _decoRedoMin = new(float.MaxValue), _decoRedoMax = new(float.MinValue);
-        private TerrainBaker.CoveragePlan? _lastDecoPlan;
 
         // ───── Top layers (which layer is where, for GetLayer) ──────────────
         // Per resident paint page asked about: its top layer (the channel that shows most per texel), read back from the
@@ -367,13 +361,11 @@ namespace Freefall.Components
         // ───── Holes (HoleStamp) ───────────────────────────────────────────
         // The mask itself is in Terrain.Pages, baked on the CPU (TerrainBaker.BakeHoles) because the PhysX height
         // field, the navmesh and PCG need it there; this is its copy for the shaders (terrain_holes.hlsli).
-        private ID3D12Resource? _holeTex;          // R8_UNorm, one texel per height sample
-        private uint _holeSRV;
-        private int _holeTexResolution;
+        private readonly Graphics.HolePool _holePool = new();   // the pages a hole cuts (since 2026-11-08; one flat R8 map before)
         private List<TerrainBaker.HoleRect>? _holeRects;   // what the last hole bake cut; null = not known (mask from the cache)
 
         /// <summary>The hole mask the shaders read (bindless SRV), 0 when nothing opens the terrain.</summary>
-        private uint HoleSrv => Terrain is { HasHoles: true } && _holeTex != null ? _holeSRV : 0u;
+        private uint HoleSrv() => Terrain is { HasHoles: true } ? _holePool.WriteParams() : 0u;
 
         // ───── Lifecycle ──────────────────────────────────────────────────
 
@@ -472,15 +464,10 @@ namespace Freefall.Components
             if (_heightRangePyramidSRV != 0)
                 device?.DeferReleaseBindlessIndex(_heightRangePyramidSRV);
 
-            // ── Baked normals ──
-            device?.DeferDispose(_bakedNormalTex);
-            if (_bakedNormalUAV != 0) device?.DeferReleaseBindlessIndex(_bakedNormalUAV);
-            if (_bakedNormalSRV != 0) device?.DeferReleaseBindlessIndex(_bakedNormalSRV);
-
-            // ── Decoration control prepass ──
-            device?.DeferDispose(_decoControlTex);
-            if (_decoControlUAV != 0) device?.DeferReleaseBindlessIndex(_decoControlUAV);
-            if (_decoControlSRV != 0) device?.DeferReleaseBindlessIndex(_decoControlSRV);
+            // ── Decoration pages ──
+            if (device != null) _decoPool.Dispose();
+            _decoResidency = null;
+            _decoPlan = null;
 
             // ── Baked albedo ──
             device?.DeferDispose(_bakedAlbedoTex);
@@ -497,10 +484,7 @@ namespace Freefall.Components
             _topWanted.Clear();
 
             // ── Hole mask (the CPU mask stays with the Terrain asset, like its heights) ──
-            device?.DeferDispose(_holeTex);
-            if (_holeSRV != 0) device?.DeferReleaseBindlessIndex(_holeSRV);
-            _holeTex = null;
-            _holeSRV = 0;
+            if (device != null) _holePool.Dispose();
 
             // ── Decorator buffers ──
             device?.DeferDispose(_decoratorHeadersBuffer);
@@ -728,18 +712,24 @@ namespace Freefall.Components
             // New heights change what the stamps' height/slope filters let through, so they rebake both.
             bool splatAsked = Terrain.ConsumeFlags(TerrainDirtyFlags.SplatPack);
             bool splatDirty = splatAsked || hasHeightWork;
-            bool decoDirty = Terrain.ConsumeFlags(TerrainDirtyFlags.DecoPrepass) || splatDirty;
+            bool decoAsked = Terrain.ConsumeFlags(TerrainDirtyFlags.DecoPrepass);
+            bool decoDirty = decoAsked || splatDirty;
             // Where the splat bake composites again: the regions local stamps' edits gave, or everywhere. New heights
             // that no stamp asked for (terrain settings) may have moved any stamp's height or slope filter.
             bool splatLocal = Terrain.TakeSplatRegion(out var splatRegionMin, out var splatRegionMax) && splatAsked;
 
+            bool decoEverywhere = false;
             if (splatDirty || decoDirty)
             {
                 using var _ = _paletteMarker.Auto();
                 var paletteBefore = _layerPalette;
+                var decoPaletteBefore = _decoratorPalette;
                 if (splatDirty) RefreshLayerPalette();
                 if (_layerPalette != paletteBefore) splatLocal = false;   // other channels: every texel changes
                 RefreshDecoratorPalette();
+                // The decoration pages bake again everywhere for a deco edit, new heights or other layers or decorators;
+                // a splat edit alone reaches them through the paint pages it bakes (UpdatePaintPages)
+                decoEverywhere = decoAsked || hasHeightWork || _layerPalette != paletteBefore || _decoratorPalette != decoPaletteBefore;
             }
 
             if (Terrain.ConsumeFlags(TerrainDirtyFlags.TextureArrays) || !_textureArraysInitialized)
@@ -780,10 +770,6 @@ namespace Freefall.Components
                     _heightRangePyramidBuilt = false; // force rebuild with new heights
                     terrain.MarkForUpdate(TerrainDirtyFlags.AlbedoBake); // re-bake albedo with new terrain shape
                     _needHeightFieldReadback = true; // read the heights back into the CPU store next frame
-                    renderer._bakedNormalsDirty = true; // normals depend on height
-                    PixMarker.Begin(list, "Terrain normals bake");
-                    renderer.BakeTerrainNormals(list);
-                    PixMarker.End(list);
                 });
             }
 
@@ -832,13 +818,20 @@ namespace Freefall.Components
             if (_topWanted.Count > 0)
                 FetchTopPages();
 
-            // ── Decoration coverage: laid out here, run by the decorator dispatch below ──
+            // ── Decoration pages: the deco stamps laid out once, baked into the decoration pool page by page (5c) ──
             if (decoDirty)
             {
-                using var _ = _decoPlanMarker.Auto();
-                var decoPlan = _baker.PrepareDeco(Terrain, this, _decoEntries, _decoratorPalette, _layerPalette);
-                System.Threading.Interlocked.Exchange(ref _pendingDecoPlan, decoPlan);
+                if (_decoratorPalette.Count > 0)
+                {
+                    using (_decoPlanMarker.Auto())
+                        _decoPlan = _baker.PrepareDeco(Terrain, this, _decoEntries, _decoratorPalette, _layerPalette);
+                    if (decoEverywhere) DecoResidency.MarkAllDirty();
+                }
+                else
+                    _decoPlan = null;
             }
+            if (_decoPlan != null && Terrain.DrawDetail)
+                UpdateDecoPages();
 
             // Set shared material params
             material.SetParameter("CameraPos", Camera.Main.Position);
@@ -1076,7 +1069,7 @@ namespace Freefall.Components
             int texels = Terrain.EffectiveSplatmapResolution;
             int layerSlices = (_layerPalette.Count + 3) / 4;
             int pagesPerSide = Math.Max(0, Engine.Settings.TerrainPaintPages);
-            int capacity = Graphics.TerrainPaintResidency.CapacityFor(texels, pagesPerSide);
+            int capacity = Graphics.TerrainMapResidency.CapacityFor(texels, pagesPerSide);
 
             if (!_paintPool.Matches(texels, layerSlices, capacity))
             {
@@ -1104,7 +1097,7 @@ namespace Freefall.Components
 
             IReadOnlyList<(int level, int px, int py, int slot)> bakes;
             using (_paintResidencyMarker.Auto())
-                bakes = PaintResidency.Update(CameraPaintTexels(texels), pagesPerSide, Math.Max(1, Engine.Settings.TerrainPaintBakesPerFrame));
+                bakes = PaintResidency.Update(CameraTexels(texels), pagesPerSide, Math.Max(1, Engine.Settings.TerrainPaintBakesPerFrame));
             if (bakes.Count == 0 && !_paintPool.Slots.TableDirty) return;
 
             var pages = new (int level, int px, int py, int slot)[bakes.Count];
@@ -1114,12 +1107,13 @@ namespace Freefall.Components
                 pages[i] = b;
                 _paintSlotSerial[b.slot] = ++_paintSerial;
                 _paintSlotPalette[b.slot] = _layerPalette;
-                if (b.level == 0)
+                // The decoration pages over its ground bake again from the paint now in place (their layer filters read it):
+                // a level 0 paint page at every level, a coarse one only the coarse decoration pages (the near ones read
+                // level 0 paint)
+                if (_decoPlan != null)
                 {
-                    // Its ground goes into the decoration control texture again, from the paint now in place
-                    float m = Graphics.PaintPool.PageTexels / (float)texels;
-                    _decoRedoMin = Vector2.Min(_decoRedoMin, new Vector2(b.px * m, b.py * m));
-                    _decoRedoMax = Vector2.Max(_decoRedoMax, new Vector2((b.px + 1) * m, (b.py + 1) * m));
+                    float m = (Graphics.PaintPool.PageTexels << b.level) / (float)texels;
+                    MarkDecoOver(new Vector2(b.px * m, b.py * m), new Vector2((b.px + 1) * m, (b.py + 1) * m), b.level == 0 ? 0 : 1);
                 }
             }
             SplatBakeTexels = (long)pages.Length * Graphics.PaintPool.SlotTexels * Graphics.PaintPool.SlotTexels;
@@ -1140,8 +1134,77 @@ namespace Freefall.Components
             });
         }
 
-        // The camera in level 0 paint texels (terrain UV × texels)
-        private Vector2 CameraPaintTexels(int texels)
+        /// <summary>
+        /// This frame's decoration pages (TERRAIN_PAGES_PLAN.md 5c), as the paint's: the pool at the layout
+        /// EngineSettings.TerrainDecoPages asks, the pages round the camera given slots, and those arriving or dirty baked on
+        /// this frame's list after the paint (whose layer weights their filters read). Main thread.
+        /// </summary>
+        private void UpdateDecoPages()
+        {
+            int texels = Terrain.EffectiveDecorationMapResolution;
+            int pagesPerSide = Math.Max(0, Engine.Settings.TerrainDecoPages);
+            int capacity = Graphics.TerrainMapResidency.CapacityFor(texels, pagesPerSide);
+
+            if (!_decoPool.Matches(texels, capacity))
+            {
+                int across = Graphics.TerrainMapResidency.PagesAcrossFor(texels);
+                int slots = capacity > 0 ? capacity : across * across;
+                int slices = Graphics.DecoPool.SlicesFor(slots);
+                if (slices > Graphics.HeightPool.MaxSlices)
+                {
+                    if (!_decoPoolWarned)
+                    {
+                        _decoPoolWarned = true;
+                        Debug.LogError("[TerrainRenderer]", $"{Terrain.Name}: {slots} decoration pages need {slices} array slices, past " +
+                                       $"D3D12's {Graphics.HeightPool.MaxSlices}: no decorations. Set TerrainDecoPages (the pages stream " +
+                                       "round the camera).");
+                    }
+                    return;
+                }
+                _decoPool.Ensure(texels, capacity);   // the table goes up on the bake's list
+                Debug.Log("[Terrain]", $"'{Terrain.Name}': decoration pool {(capacity == 0 ? "of every page" : $"of {capacity} slots, {pagesPerSide} pages a side per level")}, " +
+                          $"{across}x{across} pages of {Graphics.DecoPool.PageTexels} texels, {slices} slices");
+            }
+
+            IReadOnlyList<(int level, int px, int py, int slot)> bakes;
+            using (_decoResidencyMarker.Auto())
+                bakes = DecoResidency.Update(CameraTexels(texels), pagesPerSide, Math.Max(1, Engine.Settings.TerrainDecoBakesPerFrame));
+            if (bakes.Count == 0 && !_decoPool.Slots.TableDirty) return;
+
+            var pages = new (int level, int px, int py, int slot)[bakes.Count];
+            for (int i = 0; i < pages.Length; i++) pages[i] = bakes[i];
+            if (pages.Length > 0)
+                DecoBakeTexels = (long)pages.Length * Graphics.DecoPool.SlotTexels * Graphics.DecoPool.SlotTexels;
+
+            var plan = _decoPlan!;
+            var pool = _decoPool;
+            var baker = _baker;
+            var terrain = Terrain;
+            var renderer = this;
+            CommandBuffer.Enqueue(RenderPass.Opaque, list =>
+            {
+                pool.Slots.RecordTable(list);
+                if (pages.Length == 0) return;
+                PixMarker.Begin(list, "Terrain deco bake");
+                baker.BakeDecoPages(plan, list, terrain, renderer.GpuTerrainIdx(), pool, pages);
+                PixMarker.End(list);
+            });
+        }
+
+        // The decoration pages over this ground (terrain UV) bake again, at every level from minLevel
+        private void MarkDecoOver(Vector2 uvMin, Vector2 uvMax, int minLevel)
+        {
+            if (_decoPool.Control == null) return;
+            int texels = _decoPool.Texels;
+            int x0 = Math.Clamp((int)MathF.Floor(uvMin.X * texels) - 1, 0, texels);
+            int x1 = Math.Clamp((int)MathF.Ceiling(uvMax.X * texels) + 1, 0, texels);
+            int z0 = Math.Clamp((int)MathF.Floor(uvMin.Y * texels) - 1, 0, texels);
+            int z1 = Math.Clamp((int)MathF.Ceiling(uvMax.Y * texels) + 1, 0, texels);
+            DecoResidency.MarkDirty(x0, z0, x1, z1, minLevel);
+        }
+
+        // The camera in level 0 texels of a map of this many texels a side (terrain UV × texels)
+        private Vector2 CameraTexels(int texels)
         {
             var local = CameraLocal();
             return new Vector2(local.X / Terrain.TerrainSize.X * texels, local.Y / Terrain.TerrainSize.Y * texels);
@@ -1447,7 +1510,7 @@ namespace Freefall.Components
             var device = Engine.Device;
 
             // Holes: the depth prepass needs its variant that can discard (see the technique in gputerrain.fx)
-            uint holes = HoleSrv;
+            uint holes = HoleSrv();
             if (holes != 0 && pass == "DepthPrepass") pass = "DepthPrepass_Holes";
 
             // Apply material PSO and textures (the pass explicitly: the shadow draw changes it)
@@ -1474,8 +1537,8 @@ namespace Freefall.Components
             commandList.SetGraphicsRoot32BitConstant(0, TransformBuffer.Instance!.SrvIndex, 15);
             // Slot 16: Debug mode
             commandList.SetGraphicsRoot32BitConstant(0, (uint)Engine.Settings.DebugVisualizationMode, 16);
-            // Slot 21: Deco control map SRV (ground tint, debug mode 5); slot 22: the tint per decorator
-            commandList.SetGraphicsRoot32BitConstant(0, _decoControlSRV, 21);
+            // Slot 21: the decoration pages' TerrainDecoParams (ground tint, debug mode 5); slot 22: the tint per decorator
+            commandList.SetGraphicsRoot32BitConstant(0, DecoParamsIdx(), 21);
             commandList.SetGraphicsRoot32BitConstant(0, _decoratorTintBuffer?.SrvIndex ?? 0u, 22);
             // Slot 26: some layer has a height map (blend and SSDM; LayerTextures holds them)
             commandList.SetGraphicsRoot32BitConstant(0, _layerHeights ? 1u : 0u, 26);
@@ -1644,7 +1707,7 @@ namespace Freefall.Components
             // ════════════════════════════════════════════════════════════════
 
             // Where a hole opens the terrain it casts no shadow: light falls into the cave mouth
-            uint holes = HoleSrv;
+            uint holes = HoleSrv();
             if (holes != 0) Material.SetPass("Shadow_Holes");
             else Material.SetPass(RenderPass.Shadow);
             Material.Apply(commandList, device);
@@ -2195,6 +2258,7 @@ namespace Freefall.Components
                     terrain.CheckMapsAgainstSaved();
                     if (cutBefore != null) _holeChanges.AddRange(cutBefore);
                 }
+                _holePool.Clear();
                 _holeRects = new List<TerrainBaker.HoleRect>();
                 return;
             }
@@ -2218,10 +2282,21 @@ namespace Freefall.Components
 
             // What changed: where stamps cut before and where they cut now (all of it when that is not known)
             var changed = cutBefore != null ? cutBefore.Concat(cutNow).Distinct().ToList() : null;
-            // The texture holds only what was uploaded since it was made, and nothing that was cut while no
-            // holes were: all of it then
-            bool created = EnsureHoleTexture(res);
-            UploadHoles(baked, res, created || !hadHoles ? null : changed);
+            // The shaders' hole pages: those the changed rects reach go up again (all of them when that is not known, or
+            // nothing was cut before), new cut pages get a slice, pages left without holes leave
+            HashSet<int>? changedPages = null;
+            if (changed != null && hadHoles)
+            {
+                changedPages = new HashSet<int>();
+                foreach (var r in changed)
+                {
+                    var (px0, pz0, px1, pz1) = baked.PagesOf(r.X0, r.Z0, r.X1 + 1, r.Z1 + 1);
+                    for (int pz = pz0; pz < pz1; pz++)
+                        for (int px = px0; px < px1; px++)
+                            changedPages.Add(pz * baked.PagesAcross + px);
+                }
+            }
+            _holePool.Sync(baked, changedPages);
             if (changed != null)
                 foreach (var rect in changed)
                     if (!_holeChanges.Contains(rect)) _holeChanges.Add(rect);
@@ -2230,68 +2305,111 @@ namespace Freefall.Components
         // Rects whose holes changed and whose listeners have not heard of it yet (sent once the bakes settle)
         private readonly List<TerrainBaker.HoleRect> _holeChanges = new();
 
-        /// <summary>The R8 texture for the hole mask; true if it was (re)created and holds nothing yet.</summary>
-        private bool EnsureHoleTexture(int resolution)
-        {
-            if (_holeTex != null && _holeTexResolution == resolution) return false;
+        /// <summary>Diagnostics: what the last Check Hole Pages found.</summary>
+        [Reflection.DontSerialize]
+        public string HolePagesCheck { get; private set; } = "";
 
-            var device = Engine.Device;
-            device.DeferDispose(_holeTex);
-            if (_holeSRV != 0) device.DeferReleaseBindlessIndex(_holeSRV);
-
-            _holeTex = device.CreateTexture2D(Format.R8_UNorm, resolution, resolution, 1, 1,
-                ResourceFlags.None, ResourceStates.Common);
-            _holeSRV = device.AllocateBindlessIndex();
-            device.NativeDevice.CreateShaderResourceView(_holeTex,
-                new ShaderResourceViewDescription
-                {
-                    Format = Format.R8_UNorm,
-                    ViewDimension = ShaderResourceViewDimension.Texture2D,
-                    Shader4ComponentMapping = ShaderComponentMapping.Default,
-                    Texture2D = new Texture2DShaderResourceView { MostDetailedMip = 0, MipLevels = 1 }
-                }, device.GetCpuHandle(_holeSRV));
-            _holeTexResolution = resolution;
-            return true;
-        }
+        /// <summary>Diagnostics: pages a hole cuts, in the shaders' hole pool.</summary>
+        [Reflection.DontSerialize]
+        public int HolePages => _holePool.Count;
 
         /// <summary>
-        /// Copy rects of the store's holes into the hole texture (null = all of it), one flat R8 map until the GPU holds
-        /// hole pages. The rows are copied into upload buffers here.
+        /// The hole pages (Graphics.HolePool, terrain_holes.hlsli) against the whole-map R8 texture there was before
+        /// 2026-11-08, built from the CPU store for the check and read the old way: whether each is open, at 16 points per
+        /// cell over the whole terrain (terrain_holes_check.hlsl). Only a terrain of at most 16,384 samples a side (the
+        /// flat map cannot be made larger). Blocks.
         /// </summary>
-        private unsafe void UploadHoles(TerrainPages pages, int res, List<TerrainBaker.HoleRect>? rects)
+        [Button("Check Hole Pages")]
+        [System.ComponentModel.Description("Compare the hole pages with the whole-map hole texture they replaced, at 16 points per cell")]
+        public unsafe void CheckHolePages()
         {
+            var pages = Terrain?.Pages;
+            if (pages is not { HasHoles: true }) { HolePagesCheck = "no holes"; return; }
+            int res = pages.Resolution;
+            if (res > MaxTextureSize) { HolePagesCheck = $"{res} samples a side: the flat map cannot be made"; return; }
+            var sw = System.Diagnostics.Stopwatch.StartNew();
             var device = Engine.Device;
-            var tex = _holeTex!;
-            rects ??= [new TerrainBaker.HoleRect(0, 0, res - 1, res - 1)];
+            const int steps = 4;
 
-            foreach (var r in rects)
+            // The old flat map, from the store
+            var flat = device.CreateTexture2D(Format.R8_UNorm, res, res, 1, 1, ResourceFlags.None, ResourceStates.Common);
+            uint flatSrv = device.AllocateBindlessIndex();
+            device.NativeDevice.CreateShaderResourceView(flat, new ShaderResourceViewDescription
             {
-                int w = r.X1 - r.X0 + 1, h = r.Z1 - r.Z0 + 1;
-                int rowPitch = (w + 255) & ~255;
-                var upload = device.NativeDevice.CreateCommittedResource(
-                    new HeapProperties(HeapType.Upload), HeapFlags.None,
-                    ResourceDescription.Buffer((ulong)(rowPitch * h)), ResourceStates.GenericRead, null);
+                Format = Format.R8_UNorm,
+                ViewDimension = ShaderResourceViewDimension.Texture2D,
+                Shader4ComponentMapping = ShaderComponentMapping.Default,
+                Texture2D = new Texture2DShaderResourceView { MostDetailedMip = 0, MipLevels = 1 }
+            }, device.GetCpuHandle(flatSrv));
+            int rowPitch = (res + 255) & ~255;
+            var upload = device.NativeDevice.CreateCommittedResource(new HeapProperties(HeapType.Upload), HeapFlags.None,
+                ResourceDescription.Buffer((ulong)rowPitch * (ulong)res), ResourceStates.GenericRead, null);
+            void* data;
+            upload.Map(0, null, &data);
+            pages.CopyHoles(0, 0, res, res, new Span<byte>(data, rowPitch * res), rowPitch);
+            upload.Unmap(0);
 
-                void* data;
-                upload.Map(0, null, &data);
-                pages.CopyHoles(r.X0, r.Z0, w, h, new Span<byte>(data, rowPitch * h), rowPitch);
-                upload.Unmap(0);
-
-                var footprint = new PlacedSubresourceFootPrint
+            var result = GraphicsBuffer.CreateRaw(4, uav: true, clearable: true);
+            var readback = device.NativeDevice.CreateCommittedResource(new HeapProperties(HeapType.Readback), HeapFlags.None,
+                ResourceDescription.Buffer(16), ResourceStates.CopyDest, null);
+            var allocator = device.NativeDevice.CreateCommandAllocator(CommandListType.Direct);
+            var cmd = device.NativeDevice.CreateCommandList<ID3D12GraphicsCommandList>(0, CommandListType.Direct, allocator, null);
+            try
+            {
+                cmd.SetDescriptorHeaps(1, new[] { device.SrvHeap });
+                cmd.SetComputeRootSignature(device.GlobalRootSignature);
+                cmd.ResourceBarrierTransition(flat, ResourceStates.Common, ResourceStates.CopyDest);
+                cmd.CopyTextureRegion(new TextureCopyLocation(flat, 0), 0, 0, 0, new TextureCopyLocation(upload, new PlacedSubresourceFootPrint
                 {
                     Offset = 0,
-                    Footprint = new SubresourceFootPrint(Format.R8_UNorm, (uint)w, (uint)h, 1, (uint)rowPitch)
-                };
-                uint x0 = (uint)r.X0, z0 = (uint)r.Z0;
-                CommandBuffer.Enqueue(RenderPass.Opaque, list =>
-                {
-                    list.ResourceBarrierTransition(tex, ResourceStates.Common, ResourceStates.CopyDest);
-                    list.CopyTextureRegion(new TextureCopyLocation(tex, 0), x0, z0, 0, new TextureCopyLocation(upload, footprint));
-                    list.ResourceBarrierTransition(tex, ResourceStates.CopyDest, ResourceStates.Common);
-                });
-                device.DeferDispose(upload);   // until the frames that copy from it are done
+                    Footprint = new SubresourceFootPrint(Format.R8_UNorm, (uint)res, (uint)res, 1, (uint)rowPitch)
+                }));
+                cmd.ResourceBarrierTransition(flat, ResourceStates.CopyDest, ResourceStates.NonPixelShaderResource);
+                result.Transition(cmd, ResourceStates.UnorderedAccess);
+                result.ClearUAV(cmd, new Vortice.Mathematics.Int4(0, 0, 0, 0));
+                cmd.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(result.Native)));
+
+                _holeCheckCS ??= new ComputeShader("terrain_holes_check.hlsl");
+                int k = _holeCheckCS.FindKernel("CS_CheckHoles");
+                _holeCheckCS.SetPushConstant(k, "HoleParams", _holePool.WriteParams());
+                _holeCheckCS.SetPushConstant(k, "Flat", flatSrv);
+                _holeCheckCS.SetPushConstant(k, "Result", result.UavIndex);
+                _holeCheckCS.SetPushConstant(k, "Cells", (uint)(res - 1));
+                _holeCheckCS.SetPushConstant(k, "Steps", (uint)steps);
+                _holeCheckCS.SetParam(k, "SizeX", Terrain!.TerrainSize.X);
+                _holeCheckCS.SetParam(k, "SizeZ", Terrain.TerrainSize.Y);
+                uint groups = (uint)(((res - 1) * steps + 7) / 8);
+                _holeCheckCS.Dispatch(k, cmd, groups, groups);
+
+                cmd.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(result.Native)));
+                result.Transition(cmd, ResourceStates.CopySource);
+                cmd.CopyBufferRegion(readback, 0, result.Native, 0, 16);
+                cmd.ResourceBarrierTransition(flat, ResourceStates.NonPixelShaderResource, ResourceStates.Common);
+                cmd.Close();
+                device.SubmitAndWait(cmd);
+
+                uint* counts;
+                readback.Map(0, null, (void**)&counts);
+                uint differ = counts[0], open = counts[1], far = counts[2];
+                readback.Unmap(0);
+                long points = (long)(res - 1) * steps * (res - 1) * steps;
+                HolePagesCheck = (differ == 0 ? "equal" : far == 0 ? "equal but at the edge" : "DIFFERENT") + $": {points:N0} points over {res - 1}² cells, {open:N0} open by the " +
+                                 $"flat map, {differ:N0} differ ({far:N0} of them more than 2/256 from the edge, the rest where the hardware filter's 1/256 steps tip it); {_holePool.Count} cut pages in the pool; {sw.ElapsedMilliseconds} ms";
             }
+            finally
+            {
+                cmd.Dispose();
+                allocator.Dispose();
+                readback.Dispose();
+                device.DeferDispose(upload);
+                device.DeferDispose(flat);
+                device.DeferReleaseBindlessIndex(flatSrv);
+                device.DeferDispose(result);
+            }
+            Debug.LogAlways($"[Terrain] '{Terrain.Name}' hole pages check: {HolePagesCheck}");
         }
+
+        private ComputeShader? _holeCheckCS;
 
         /// <summary>
         /// Tell what samples the ground (PCG's TerrainProjection drops points in holes) that the holes changed in
@@ -2713,103 +2831,6 @@ namespace Freefall.Components
         }
 
         /// <summary>
-        /// Runs the decoration coverage bake when one is pending: composites the deco stamps (laid out
-        /// on the main thread, see Draw) into the top-8 RGBA16_UINT control texture the spawn kernel reads.
-        /// </summary>
-        private void DispatchDecoControlPrepass(ID3D12GraphicsCommandList cmd)
-        {
-            if (Terrain == null || _baker == null) return;
-            var plan = System.Threading.Interlocked.Exchange(ref _pendingDecoPlan, null);
-            bool whole = plan != null;
-            plan ??= _lastDecoPlan;
-            // Without a new plan, only the ground of level 0 paint pages baked since: what the layer filters read there
-            // was the coarse paint before
-            bool redo = _decoRedoMax.X > _decoRedoMin.X;
-            if (plan == null || (!whole && !redo)) return;
-            var redoMin = _decoRedoMin;
-            var redoMax = _decoRedoMax;
-            _decoRedoMin = new Vector2(float.MaxValue);
-            _decoRedoMax = new Vector2(float.MinValue);
-            _lastDecoPlan = plan;
-
-            var device = Engine.Device;
-            int resolution = Terrain.EffectiveDecorationMapResolution;
-
-            // Create or recreate control texture only when resolution changes
-            bool freshTexture = false;
-            if (_decoControlTex == null || (int)_decoControlTex.Description.Width != resolution)
-            {
-                freshTexture = true;
-                device.DeferDispose(_decoControlTex); // frames in flight may still read it
-                _decoControlTex = device.CreateTexture2D(
-                    Format.R16G16B16A16_UInt, resolution, resolution, 2, 1,
-                    ResourceFlags.AllowUnorderedAccess, ResourceStates.Common);
-
-                _decoControlUAV = device.AllocateBindlessIndex();
-                var uavDesc = new UnorderedAccessViewDescription
-                {
-                    Format = Format.R16G16B16A16_UInt,
-                    ViewDimension = UnorderedAccessViewDimension.Texture2DArray,
-                    Texture2DArray = new Texture2DArrayUnorderedAccessView
-                    {
-                        MipSlice = 0,
-                        FirstArraySlice = 0,
-                        ArraySize = 2
-                    }
-                };
-                device.NativeDevice.CreateUnorderedAccessView(_decoControlTex, null, uavDesc, device.GetCpuHandle(_decoControlUAV));
-
-                _decoControlSRV = device.AllocateBindlessIndex();
-                var srvDesc = new ShaderResourceViewDescription
-                {
-                    Format = Format.R16G16B16A16_UInt,
-                    ViewDimension = ShaderResourceViewDimension.Texture2DArray,
-                    Shader4ComponentMapping = ShaderComponentMapping.Default,
-                    Texture2DArray = new Texture2DArrayShaderResourceView
-                    {
-                        MostDetailedMip = 0,
-                        MipLevels = 1,
-                        FirstArraySlice = 0,
-                        ArraySize = 2
-                    }
-                };
-                device.NativeDevice.CreateShaderResourceView(_decoControlTex, srvDesc, device.GetCpuHandle(_decoControlSRV));
-            }
-
-            // Transition the control texture to UAV for writing: from Common when fresh (a texture is never promoted
-            // to UnorderedAccess implicitly), from the SRV state on a re-dispatch
-            cmd.ResourceBarrier(new ResourceBarrier(
-                new ResourceTransitionBarrier(_decoControlTex,
-                    freshTexture ? ResourceStates.Common : ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess)));
-
-            // The heights for the stamps' height/slope filters: this terrain's pages
-            uint heightSrv = GpuTerrainIdx();
-
-            // The layer filters read the paint pages through the same parameters (already baked this frame where the splat
-            // stamps changed). A redo covers the pages' texels, a texel more each side; the control texture is Y-flipped
-            // against terrain UV.
-            (int x, int y, int width, int height) region = (0, 0, resolution, resolution);
-            if (!whole && !freshTexture)
-            {
-                int x0 = Math.Clamp((int)MathF.Floor(redoMin.X * resolution) - 1, 0, resolution);
-                int x1 = Math.Clamp((int)MathF.Ceiling(redoMax.X * resolution) + 1, 0, resolution);
-                int y0 = Math.Clamp((int)MathF.Floor((1f - redoMax.Y) * resolution) - 1, 0, resolution);
-                int y1 = Math.Clamp((int)MathF.Ceiling((1f - redoMin.Y) * resolution) + 1, 0, resolution);
-                region = (x0, y0, x1 - x0, y1 - y0);
-            }
-            DecoBakeTexels = (long)region.width * region.height;
-
-            _baker.BakeDecoControl(plan, cmd, Terrain, heightSrv, _decoControlUAV, resolution, region);
-
-            cmd.ResourceBarrierUnorderedAccessView(_decoControlTex);
-
-            // Transition from UAV → SRV so the spawn shader and terrain debug overlay can read correctly
-            cmd.ResourceBarrier(new ResourceBarrier(
-                new ResourceTransitionBarrier(_decoControlTex,
-                    ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource)));
-        }
-
-        /// <summary>
         /// Create an upload GraphicsBuffer from a list and upload the data.
         /// </summary>
         private static GraphicsBuffer CreateAndUpload<T>(List<T> data) where T : unmanaged
@@ -2834,11 +2855,12 @@ namespace Freefall.Components
             if (_decoBuffersCreated) return;
 
             int resolution = Terrain?.EffectiveDecorationMapResolution ?? 256;
-            int maxTiles = resolution * resolution;
+            long maxTiles = (long)resolution * resolution;
 
             // Worst-case instances: ~64 per tile max (64 threads/group)
-            // But realistically with density, far fewer. Use maxTiles * 8 as reasonable upper bound.
-            _maxDecoInstances = Math.Min(maxTiles * 8, 1024 * 1024); // cap at 1M
+            // But realistically with density, far fewer. Use maxTiles * 8 as reasonable upper bound. In longs: 16 km
+            // (16,384 tiles a side) times 8 is one past int.MaxValue, and the negative count failed every Draw (2026-11-08)
+            _maxDecoInstances = (int)Math.Min(maxTiles * 8, 1024 * 1024); // cap at 1M
 
             _decoInstanceBuffer = GraphicsBuffer.CreateStructured(_maxDecoInstances, 64, srv: true, uav: true); // 64 bytes per DecoInstance
             _instanceCounterBuffer = GraphicsBuffer.CreateRaw(3, uav: true, clearable: true); // card, mesh, blade clump counts
@@ -2853,7 +2875,6 @@ namespace Freefall.Components
 
             // Initialize compute shader and find kernels
             _grassCS ??= new ComputeShader("grass_compute.hlsl");
-            _kBakeNormals       = _grassCS.FindKernel("CS_BakeTerrainNormals");
             _kSpawnInstances    = _grassCS.FindKernel("CS_SpawnInstances");
             _kBuildDecoDrawArgs = _grassCS.FindKernel("CS_BuildDrawArgs");
             _kBinMeshInstances  = _grassCS.FindKernel("CS_BinMeshInstances");
@@ -2888,103 +2909,6 @@ namespace Freefall.Components
         private const int MaxTextureSize = 16384;
 
         /// <summary>
-        /// Texels a side of the baked normals (the decorations' ground normal): one a height sample, or every second
-        /// (fourth, ...) sample where one a sample would pass <see cref="MaxTextureSize"/>: 16 km at 1 m per vertex is
-        /// 16,385 samples, and the texture failed to be made (E_INVALIDARG, the editor crashed loading TestWorld). The
-        /// bake kernel reads the step back as cells / (size - 1).
-        /// </summary>
-        private static int BakedNormalSize(int samples)
-        {
-            int step = 1;
-            while ((samples - 1) / step + 1 > MaxTextureSize) step *= 2;
-            return (samples - 1) / step + 1;
-        }
-
-        /// <summary>
-        /// One-time bake: heightmap → R16G16_SNORM terrain normal map.
-        /// Eliminates 5-tap normal computation per instance in the spawn kernel.
-        /// </summary>
-        private void BakeTerrainNormals(ID3D12GraphicsCommandList cmd)
-        {
-            if (!_bakedNormalsDirty) return;
-            if (Terrain == null || _baker?.Pool.Texture == null) return;
-
-            var device = Engine.Device;
-            // A normal per height sample, or per every second one past the largest texture
-            int hmW = BakedNormalSize(_baker.Pool.Resolution);
-            int hmH = hmW;
-
-            // Made again at another size (a density change): it was kept at the first size, and the bake wrote past it.
-            // New views at new indices: frames in flight may still read the old ones
-            if (_bakedNormalTex != null && _bakedNormalTexSize != hmW)
-            {
-                device.DeferDispose(_bakedNormalTex);
-                device.DeferReleaseBindlessIndex(_bakedNormalUAV);
-                device.DeferReleaseBindlessIndex(_bakedNormalSRV);
-                _bakedNormalTex = null;
-                _bakedNormalUAV = _bakedNormalSRV = 0;
-            }
-
-            // Create normal map texture (R16G16_SNORM: stores XZ, Y reconstructed)
-            if (_bakedNormalTex == null)
-            {
-                _bakedNormalTex = device.CreateTexture2D(
-                    Format.R16G16_SNorm, hmW, hmH, 1, 1,
-                    ResourceFlags.AllowUnorderedAccess, ResourceStates.Common);
-                _bakedNormalTexSize = hmW;
-                _bakedNormalReadable = false;
-
-                _bakedNormalUAV = device.AllocateBindlessIndex();
-                var uavDesc = new UnorderedAccessViewDescription
-                {
-                    Format = Format.R16G16_SNorm,
-                    ViewDimension = UnorderedAccessViewDimension.Texture2D,
-                    Texture2D = new Texture2DUnorderedAccessView { MipSlice = 0 }
-                };
-                device.NativeDevice.CreateUnorderedAccessView(_bakedNormalTex, null, uavDesc, device.GetCpuHandle(_bakedNormalUAV));
-
-                _bakedNormalSRV = device.AllocateBindlessIndex();
-                var srvDesc = new ShaderResourceViewDescription
-                {
-                    Format = Format.R16G16_SNorm,
-                    ViewDimension = ShaderResourceViewDimension.Texture2D,
-                    Shader4ComponentMapping = ShaderComponentMapping.Default,
-                    Texture2D = new Texture2DShaderResourceView
-                    {
-                        MostDetailedMip = 0,
-                        MipLevels = 1
-                    }
-                };
-                device.NativeDevice.CreateShaderResourceView(_bakedNormalTex, srvDesc, device.GetCpuHandle(_bakedNormalSRV));
-            }
-
-            // Dispatch CS_BakeTerrainNormals
-            // Ensure compute shader is initialized (independent of deco buffers)
-            _grassCS ??= new ComputeShader("grass_compute.hlsl");
-            if (_kBakeNormals == 0) _kBakeNormals = _grassCS.FindKernel("CS_BakeTerrainNormals");
-            cmd.SetDescriptorHeaps(1, _srvHeaps ??= new[] { Engine.Device.SrvHeap });
-            cmd.SetComputeRootSignature(device.GlobalRootSignature);
-
-            _grassCS!.SetPushConstant(_kBakeNormals, "TerrainPages", GpuTerrainIdx());
-            _grassCS.SetPushConstant(_kBakeNormals, "BakedNormalUAV", _bakedNormalUAV);
-            _grassCS.SetParam("TerrainSize", new Vector2(Terrain.TerrainSize.X, Terrain.TerrainSize.Y));
-            _grassCS.SetParam("MaxHeight", Terrain.MaxHeight);
-            _grassCS.SetParam("HeightmapSize", new Vortice.Mathematics.UInt2((uint)hmW, (uint)hmH));
-
-            uint groupsX = (uint)((hmW + 7) / 8);
-            uint groupsY = (uint)((hmH + 7) / 8);
-            // A texture is never promoted to UnorderedAccess implicitly; after the bake the decoration compute and
-            // the terrain's pixel shaders read it
-            cmd.ResourceBarrierTransition(_bakedNormalTex,
-                _bakedNormalReadable ? ResourceStates.AllShaderResource : ResourceStates.Common, ResourceStates.UnorderedAccess);
-            _grassCS.Dispatch(_kBakeNormals, cmd, groupsX, groupsY);
-            cmd.ResourceBarrierTransition(_bakedNormalTex, ResourceStates.UnorderedAccess, ResourceStates.AllShaderResource);
-            _bakedNormalReadable = true;
-            _bakedNormalsDirty = false;
-            Debug.Log($"[TerrainRenderer] Terrain normals baked: {hmW}x{hmH}");
-        }
-
-        /// <summary>
         /// Dispatches the compute prepass (3 stages) + lean AS/MS for decoration rendering.
         /// </summary>
         private void DispatchDecorator(ID3D12GraphicsCommandList commandList, int frameIndex, RenderPass pass = RenderPass.Opaque)
@@ -2994,23 +2918,17 @@ namespace Freefall.Components
             // A freshly created terrain has no heights until its first bake; decorators need them for placement.
             if (_baker?.Pool.Texture == null) return;
 
-            // GPU prepass: composite the deco stamps into the control texture (when they changed)
-            PixMarker.Begin(commandList, "Control prepass");
-            DispatchDecoControlPrepass(commandList);
-            PixMarker.End(commandList);
-
             if (!_decoBuffersCreated) return;
             if (_decoratorSlotsBuffer == null || _decoratorLODTableBuffer == null || _decoratorGroupsBuffer == null) return;
-            // Nothing to spawn from until the first coverage bake has run
-            if (_decoControlTex == null) return;
+            // Nothing to spawn from until the decoration pages are there (baked in Draw, UpdateDecoPages)
+            if (_decoPool.Control == null || _decoPlan == null) return;
 
             var device = Engine.Device;
             var camPos = Camera.Main!.Position;
             var cs = _grassCS!;
 
             float range = Terrain.DecorationRadius;
-            int controlW = _decoControlTex != null ? (int)_decoControlTex.Description.Width : Terrain.EffectiveDecorationMapResolution;
-            int controlH = _decoControlTex != null ? (int)_decoControlTex.Description.Height : Terrain.EffectiveDecorationMapResolution;
+            int controlW = _decoPool.Texels, controlH = _decoPool.Texels;
             float tileSize = Terrain.TerrainSize.X / controlW;
 
 
@@ -3045,8 +2963,7 @@ namespace Freefall.Components
                 cs.SetBuffer("DecoratorGroups", _decoratorGroupsBuffer!);
                 cs.SetPushConstant("MeshRegistry", MeshRegistry.SrvIndex);
                 cs.SetPushConstant("TerrainPages", GpuTerrainIdx());
-                cs.SetPushConstant("DecoControl", _decoControlSRV);
-                cs.SetPushConstant("BakedNormal", _bakedNormalSRV);
+                cs.SetPushConstant("DecoControl", DecoParamsIdx());   // the decoration pages' TerrainDecoParams
 
                 // The layers' plant tints over the paint pages (through TerrainPages): each plant takes the colour of the
                 // ground it stands on
@@ -3054,7 +2971,7 @@ namespace Freefall.Components
                 if (plantTints)
                     cs.SetBuffer("LayerPlantTint", _plantTintBuffer!);
                 cs.SetPushConstant("SplatLayerCount", plantTints ? (uint)_layerPalette.Count : 0u);
-                cs.SetPushConstant("HoleTex", HoleSrv);   // nothing spawns in a hole
+                cs.SetPushConstant("HoleTex", HoleSrv());   // nothing spawns in a hole
                 cs.SetPushConstant("DecoRows", _baker?.DecoRowsSrv ?? 0u);   // crops in rows (DecoStamp.RowSpacing)
 
                 // ── cbuffer DecoParams ──
@@ -3082,8 +2999,6 @@ namespace Freefall.Components
                 cs.SetParam("ControlWidth", (uint)controlW);
                 cs.SetParam("ControlHeight", (uint)controlH);
                 cs.SetParam("SlotCount", (uint)_decoVariantCount);
-                int normals = BakedNormalSize(_baker.Pool.Resolution);
-                cs.SetParam("HeightmapSize", new Vortice.Mathematics.UInt2((uint)normals, (uint)normals));
 
                 // ── Camera-centered grid: K rings of cells around the camera's cell (the spawn walks it as a spiral) ──
                 int camTileX = (int)MathF.Floor((camPos.X - Transform.WorldPosition.X) / tileSize);
@@ -3295,10 +3210,37 @@ namespace Freefall.Components
         [Reflection.DontSerialize]
         public long SplatBakeTexels { get; private set; }
 
-        /// <summary>Diagnostics: decoration control texels the last deco bake composited (the whole map, or the ground of
-        /// paint pages that arrived).</summary>
+        /// <summary>Diagnostics: decoration control texels the last deco bake composited (its pages', border included).</summary>
         [Reflection.DontSerialize]
         public long DecoBakeTexels { get; private set; }
+
+        /// <summary>Diagnostics: decoration pages resident, waiting for a slot or bake, and baked last frame.</summary>
+        [Reflection.DontSerialize]
+        public string DecoPages => _decoPool.Control == null ? "none"
+            : $"{(_decoPool.Slots.AllResident ? _decoPool.Capacity : _decoPool.Capacity - _decoPool.Slots.FreeSlots)} of {_decoPool.Capacity} slots, " +
+              $"{DecoResidency.Waiting} waiting, {DecoResidency.BakedLastFrame} baked last frame";
+
+        /// <summary>Diagnostics: what the last Check Deco Pages found.</summary>
+        [Reflection.DontSerialize]
+        public string DecoPagesCheck { get; private set; } = "";
+
+        /// <summary>
+        /// Every level 0 decoration page resident (all of them with EngineSettings.TerrainDecoPages 0) against the whole-map
+        /// prepass there was before 5c, baked over the same texels: both slices value for value (TerrainBaker.CheckDecoPages).
+        /// Blocks for the bakes.
+        /// </summary>
+        [Button("Check Deco Pages")]
+        [System.ComponentModel.Description("Compare the level 0 decoration pages in place with the whole-map prepass over the same texels")]
+        public void CheckDecoPages()
+        {
+            if (Terrain == null || _decoPlan == null) { DecoPagesCheck = "no decorations"; return; }
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            var (texels, pages, compared, checkedPages) = _baker.CheckDecoPages(_decoPlan, Terrain, GpuTerrainIdx(), _decoPool);
+            DecoPagesCheck = texels < 0 ? "the pool is not ready"
+                : (texels == 0 ? "equal" : "DIFFERENT") + $": {checkedPages} of {_decoPool.Slots.PagesAcross * _decoPool.Slots.PagesAcross} level 0 " +
+                  $"pages in place, {compared:N0} texels compared, {texels:N0} differ on {pages} pages; {sw.ElapsedMilliseconds} ms";
+            Debug.LogAlways($"[Terrain] '{Terrain.Name}' deco pages check: {DecoPagesCheck}");
+        }
 
         /// <summary>Diagnostics: paint pages resident, waiting for a slot or bake, and baked last frame.</summary>
         [Reflection.DontSerialize]
@@ -3529,7 +3471,7 @@ namespace Freefall.Components
         /// <summary>
         /// Skip the first bake: no GPU bake, no readback and no TerrainHeightsChanged (nothing changed). What the bake
         /// would have left behind is set up here: the heights count as read back, the stamp regions are where the
-        /// stamps are, and this renderer's normals are baked from the map in place. At load this saves a full-terrain
+        /// stamps are. At load this saves a full-terrain
         /// bake (~1.5 s of GPU on Eldermoor) and the readback that waited for it.
         /// </summary>
         private void KeepHeights()
@@ -3540,15 +3482,6 @@ namespace Freefall.Components
             _heightChangeMin = new Vector2(float.MaxValue);
             _heightChangeMax = new Vector2(float.MinValue);
             SnapshotStampRegions();
-
-            _bakedNormalsDirty = true;
-            var renderer = this;
-            CommandBuffer.Enqueue(RenderPass.Opaque, (list) =>
-            {
-                PixMarker.Begin(list, "Terrain normals bake");
-                renderer.BakeTerrainNormals(list);
-                PixMarker.End(list);
-            });
             Debug.LogAlways($"[Terrain] '{Terrain.Name}': heights kept, the stamps are those they were baked from");
         }
 

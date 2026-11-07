@@ -343,6 +343,40 @@ namespace Freefall.Assets
             Debug.Log($"[AssetManager] Discovered {Importers.Count} legacy asset importers");
         }
 
+        // ── Load timing (2026-11-07): what a cold scene load spends its "Loading assets" step on ──
+        // Each asset type's loads are a profiler section ("Load Material", nested as the loads nest), and a single load
+        // that takes SlowLoadMs or more of its own time (without the assets it loads in turn) is logged once.
+        private const double SlowLoadMs = 250;
+        private static readonly ConcurrentDictionary<Type, ProfilerMarker> _loadMarkers = new();
+        [ThreadStatic] private static long t_nestedTicks;   // time the loads nested in the current one took
+
+        private readonly struct LoadTiming
+        {
+            public readonly long Start, OuterNested;
+            public readonly ProfilerScope Scope;
+            public LoadTiming(long start, long outerNested, ProfilerScope scope) { Start = start; OuterNested = outerNested; Scope = scope; }
+        }
+
+        private static LoadTiming BeginTimed(Type assetType)
+        {
+            var marker = _loadMarkers.GetOrAdd(assetType, t => ProfilerMarker.Get("Load " + t.Name));
+            var timing = new LoadTiming(System.Diagnostics.Stopwatch.GetTimestamp(), t_nestedTicks, marker.Auto());
+            t_nestedTicks = 0;
+            return timing;
+        }
+
+        private static void EndTimed(in LoadTiming timing, Type assetType, string name)
+        {
+            timing.Scope.Dispose();
+            long total = System.Diagnostics.Stopwatch.GetTimestamp() - timing.Start;
+            long own = total - t_nestedTicks;
+            t_nestedTicks = timing.OuterNested + total;
+            double ownMs = own * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+            if (ownMs >= SlowLoadMs)
+                Debug.LogAlways($"[Assets] slow load: {assetType.Name} '{name}' {ownMs:0} ms of its own " +
+                                $"({total * 1000.0 / System.Diagnostics.Stopwatch.Frequency:0} ms with what it loads)");
+        }
+
         /// <summary>
         /// Load an asset by name or path. Tries cache-based loaders first,
         /// falls back to legacy source-file importers.
@@ -376,6 +410,7 @@ namespace Freefall.Assets
                 var loader = FindLoader(assetType);
                 if (loader != null)
                 {
+                    var timing = BeginTimed(assetType);
                     try
                     {
                         asset = (T)loader.Load(path, this);
@@ -384,6 +419,10 @@ namespace Freefall.Assets
                     {
                         // Cache miss — fall through to legacy importer
                         Debug.Log("AssetManager", $"Cache miss for {assetType.Name} '{path}', trying legacy importer");
+                    }
+                    finally
+                    {
+                        EndTimed(timing, assetType, path);
                     }
                 }
 
@@ -460,9 +499,15 @@ namespace Freefall.Assets
                     // Use the friendly name from AssetDatabase for display
                     var name = AssetDatabase.ResolveFriendlyName(guid);
 
-
-                    asset = (T)loader.LoadFromCache(cachePath, name, this, guid);
-
+                    var timing = BeginTimed(assetType);
+                    try
+                    {
+                        asset = (T)loader.LoadFromCache(cachePath, name, this, guid);
+                    }
+                    finally
+                    {
+                        EndTimed(timing, assetType, name);
+                    }
                 }
                 catch (Exception ex)
                 {

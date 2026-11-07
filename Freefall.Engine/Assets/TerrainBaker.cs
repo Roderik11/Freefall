@@ -43,7 +43,8 @@ namespace Freefall.Assets
         private static int _kernelSplatBake;      // CS_SplatBakePage: one paint page into its slot
         private static int _kernelSplatBakeFlat;  // CS_SplatBakeFlat: the whole map into a flat array (Check Paint Pages)
         private static ComputeShader _decoCS;
-        private static int _kernelDecoControl;
+        private static int _kernelDecoControl;   // the whole-map prepass over a region, for Check Deco Pages
+        private static int _kernelDecoPage;
         private static bool _coverageInitialized;
 
         // ── Instance: per-terrain GPU resources ──
@@ -211,6 +212,7 @@ namespace Freefall.Assets
             _kernelSplatBakeFlat = _splatCS.FindKernel("CS_SplatBakeFlat");
             _decoCS = new ComputeShader("decoration_prepass.hlsl");
             _kernelDecoControl = _decoCS.FindKernel("CSBuildDecoControl");
+            _kernelDecoPage = _decoCS.FindKernel("CSBuildDecoPage");
             _coverageInitialized = true;
         }
 
@@ -2332,21 +2334,54 @@ namespace Freefall.Assets
         }
 
         /// <summary>
-        /// Composite the deco stamps into the decoration control texture (top 8 decorators per texel).
-        /// The layer filters read the paint pages through <paramref name="terrainPagesIdx"/> (TerrainPagesParams.PaintIdx).
-        /// <paramref name="region"/>: the control texels baked again (the rest keep what the last bake wrote).
-        /// Render callback; the control texture must be in UnorderedAccess state.
+        /// Bake these decoration pages into their slots of the decoration pool (TERRAIN_PAGES_PLAN.md 5c): every texel of a
+        /// page, border included, the top 8 decorators (a coarse page averages each decorator's coverage over a 4 × 4 grid
+        /// per texel). The layer filters read the paint pages through <paramref name="terrainPagesIdx"/>
+        /// (TerrainPagesParams.PaintIdx). The plan's stamps and its rows (the spawn's DecoRowsSrv) go up once per plan.
+        /// Render callback, on the frame's list after the paint; the slots count as written by this frame.
         /// </summary>
-        public void BakeDecoControl(CoveragePlan plan, ID3D12GraphicsCommandList cmd, Terrain terrain,
-            uint terrainPagesIdx, uint decoControlUAV, int resolution, (int x, int y, int width, int height) region)
+        public void BakeDecoPages(CoveragePlan plan, ID3D12GraphicsCommandList cmd, Terrain terrain, uint terrainPagesIdx,
+            Graphics.DecoPool pool, IReadOnlyList<(int level, int px, int py, int slot)> pages)
         {
-            if (region.width <= 0 || region.height <= 0) return;
+            if (pages.Count == 0 || pool.Control == null) return;
+            UploadDecoPlan(plan);
+
+            var device = Engine.Device;
+            cmd.SetDescriptorHeaps(1, new[] { device.SrvHeap });
+            cmd.SetComputeRootSignature(device.GlobalRootSignature);
+            cmd.ResourceBarrierTransition(pool.Control, ResourceStates.Common, ResourceStates.UnorderedAccess);
+
+            var k = _kernelDecoPage;
+            SetDecoConstants(k, plan, terrain, terrainPagesIdx, pool.ControlUav, pool.Texels);
+            uint groups = (uint)((Graphics.DecoPool.SlotTexels + 7) / 8);
+            foreach (var (level, px, py, slot) in pages)
+            {
+                var (x, y, slice) = pool.SlotPlace(slot);
+                _decoCS.SetPushConstant(k, "PageX", unchecked((uint)px));
+                _decoCS.SetPushConstant(k, "PageY", unchecked((uint)py));
+                _decoCS.SetPushConstant(k, "Level", (uint)level);
+                _decoCS.SetPushConstant(k, "OutX", (uint)x);
+                _decoCS.SetPushConstant(k, "OutY", (uint)y);
+                _decoCS.SetPushConstant(k, "OutSlice", (uint)slice);
+                _decoCS.Dispatch(k, cmd, groups, groups);
+                pool.Slots.MarkWritten(slot);
+            }
+
+            cmd.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(pool.Control)));
+            cmd.ResourceBarrierTransition(pool.Control, ResourceStates.UnorderedAccess, ResourceStates.Common);
+        }
+
+        // The decoration plan whose stamps and rows are in the upload buffers
+        private CoveragePlan? _uploadedDecoPlan;
+
+        private void UploadDecoPlan(CoveragePlan plan)
+        {
             EnsureCoverageInitialized();
+            if (ReferenceEquals(_uploadedDecoPlan, plan)) return;
+            _uploadedDecoPlan = plan;
+            UploadCoverage(plan, ref _decoStampBuffer, ref _decoStampBufferCapacity, ref _decoSplineBuffer, ref _decoSplineCapacity);
 
-            UploadCoverage(plan, ref _decoStampBuffer, ref _decoStampBufferCapacity,
-                ref _decoSplineBuffer, ref _decoSplineCapacity);
-
-            // The row stamps the control texture will name, for the spawn (DecoRowsSrv) until the next bake
+            // The row stamps the pages name, for the spawn (DecoRowsSrv) until the next plan
             if (plan.Rows.Count > 0)
             {
                 EnsureUpload<DecoRowGPU>(ref _decoRowBuffer, ref _decoRowCapacity, plan.Rows.Count, 8);
@@ -2357,28 +2392,132 @@ namespace Freefall.Assets
                 Engine.Device.DeferDispose(_decoRowBuffer);
                 _decoRowBuffer = null;
             }
+        }
 
-            var device = Engine.Device;
-            cmd.SetDescriptorHeaps(1, new[] { device.SrvHeap });
-            cmd.SetComputeRootSignature(device.GlobalRootSignature);
-
-            var k = _kernelDecoControl;
+        private void SetDecoConstants(int k, CoveragePlan plan, Terrain terrain, uint terrainPagesIdx, uint outputUav, int texels)
+        {
             _decoCS.SetBuffer(k, "StampBuf", _decoStampBuffer);
-            _decoCS.SetPushConstant(k, "ControlUAV", decoControlUAV);
+            _decoCS.SetPushConstant(k, "ControlUAV", outputUav);
             _decoCS.SetPushConstant(k, "DecoratorCount", (uint)plan.TargetCount);
-            _decoCS.SetPushConstant(k, "Resolution", (uint)resolution);
+            _decoCS.SetPushConstant(k, "Resolution", (uint)texels);
             _decoCS.SetPushConstant(k, "TerrainPages", terrainPagesIdx);
             _decoCS.SetPushConstant(k, "SplineBuf", _decoSplineBuffer.SrvIndex);
             _decoCS.SetPushConstant(k, "LayerCount", (uint)plan.LayerCount);
             _decoCS.SetParam(k, "MaxHeight", terrain.MaxHeight);
             _decoCS.SetParam(k, "TerrainSizeX", terrain.TerrainSize.X);
             _decoCS.SetPushConstant(k, "StampCount", (uint)plan.StampCount);
-            _decoCS.SetPushConstant(k, "RegionX", (uint)region.x);
-            _decoCS.SetPushConstant(k, "RegionY", (uint)region.y);
-            _decoCS.SetPushConstant(k, "RegionW", (uint)region.width);
-            _decoCS.SetPushConstant(k, "RegionH", (uint)region.height);
+        }
 
-            _decoCS.Dispatch(k, cmd, (uint)((region.width + 7) / 8), (uint)((region.height + 7) / 8));
+        /// <summary>
+        /// Every level 0 decoration page resident and settled in the pool against the whole-map prepass there was before 5c
+        /// (CSBuildDecoControl, Y-flipped), baked over the same texels: both slices value for value. Returns the texels and
+        /// pages that differ, the texels compared and the pages checked. Blocks. Main thread.
+        /// </summary>
+        public unsafe (long texels, int pages, long compared, int checkedPages) CheckDecoPages(CoveragePlan plan, Terrain terrain,
+            uint terrainPagesIdx, Graphics.DecoPool pool)
+        {
+            if (pool.Control == null) return (-1, -1, 0, 0);
+            UploadDecoPlan(plan);
+
+            const int texels = Graphics.DecoPool.PageTexels;
+            int res = pool.Texels, across = pool.Slots.PagesAcross;
+            const int rowPitch = texels * 8;   // RGBA16: 2048, 256-aligned
+            const int sliceBytes = rowPitch * texels;
+            var device = Engine.Device;
+            var flat = device.CreateTexture2D(Format.R16G16B16A16_UInt, texels, texels, 2, 1, ResourceFlags.AllowUnorderedAccess, ResourceStates.Common);
+            uint flatUav = device.AllocateBindlessIndex();
+            device.NativeDevice.CreateUnorderedAccessView(flat, null, new UnorderedAccessViewDescription
+            {
+                Format = Format.R16G16B16A16_UInt,
+                ViewDimension = UnorderedAccessViewDimension.Texture2DArray,
+                Texture2DArray = new Texture2DArrayUnorderedAccessView { MipSlice = 0, FirstArraySlice = 0, ArraySize = 2 },
+            }, device.GetCpuHandle(flatUav));
+            var readback = device.NativeDevice.CreateCommittedResource(new HeapProperties(HeapType.Readback), HeapFlags.None,
+                ResourceDescription.Buffer((ulong)sliceBytes * 4), ResourceStates.CopyDest, null);
+            var allocator = device.NativeDevice.CreateCommandAllocator(CommandListType.Direct);
+            long differ = 0, compared = 0;
+            int differPages = 0, checkedPages = 0;
+            try
+            {
+                for (int pz = 0; pz < across; pz++)
+                    for (int px = 0; px < across; px++)
+                    {
+                        int x0 = px * texels, j0 = pz * texels;
+                        int w = Math.Min(texels, res - x0), h = Math.Min(texels, res - j0);
+                        if (w <= 0 || h <= 0) continue;
+                        int slot = pool.Slots.SlotOf(0, px, pz);
+                        if (slot < 0 || !pool.Slots.Settled(slot)) continue;   // not resident at level 0, or its bake not run
+                        checkedPages++;
+                        int y0 = res - j0 - h;   // the flat bake's rows of these texel rows (flipped)
+                        var (sx, sy, slice) = pool.SlotPlace(slot);
+
+                        var cmd = device.NativeDevice.CreateCommandList<ID3D12GraphicsCommandList>(0, CommandListType.Direct, allocator, null);
+                        cmd.SetDescriptorHeaps(1, new[] { device.SrvHeap });
+                        cmd.SetComputeRootSignature(device.GlobalRootSignature);
+                        cmd.ResourceBarrierTransition(flat, ResourceStates.Common, ResourceStates.UnorderedAccess);
+                        var k = _kernelDecoControl;
+                        SetDecoConstants(k, plan, terrain, terrainPagesIdx, flatUav, res);
+                        _decoCS.SetPushConstant(k, "RegionX", (uint)x0);
+                        _decoCS.SetPushConstant(k, "RegionY", (uint)y0);
+                        _decoCS.SetPushConstant(k, "RegionW", (uint)w);
+                        _decoCS.SetPushConstant(k, "RegionH", (uint)h);
+                        _decoCS.Dispatch(k, cmd, (uint)((w + 7) / 8), (uint)((h + 7) / 8));
+                        cmd.ResourceBarrierTransition(flat, ResourceStates.UnorderedAccess, ResourceStates.CopySource);
+                        cmd.ResourceBarrierTransition(pool.Control, ResourceStates.Common, ResourceStates.CopySource);
+                        for (int s = 0; s < 2; s++)
+                        {
+                            cmd.CopyTextureRegion(new TextureCopyLocation(readback, new PlacedSubresourceFootPrint
+                            {
+                                Offset = (ulong)((long)s * sliceBytes),
+                                Footprint = new SubresourceFootPrint(Format.R16G16B16A16_UInt, texels, texels, 1, rowPitch)
+                            }), 0, 0, 0, new TextureCopyLocation(flat, (uint)s), new Vortice.Mathematics.Box(0, 0, 0, w, h, 1));
+                            int bx = sx + Graphics.DecoPool.Border, by = sy + Graphics.DecoPool.Border;
+                            cmd.CopyTextureRegion(new TextureCopyLocation(readback, new PlacedSubresourceFootPrint
+                            {
+                                Offset = (ulong)((long)(2 + s) * sliceBytes),
+                                Footprint = new SubresourceFootPrint(Format.R16G16B16A16_UInt, texels, texels, 1, rowPitch)
+                            }), 0, 0, 0, new TextureCopyLocation(pool.Control, (uint)(slice + s)),
+                                new Vortice.Mathematics.Box(bx, by, 0, bx + w, by + h, 1));
+                        }
+                        cmd.ResourceBarrierTransition(flat, ResourceStates.CopySource, ResourceStates.Common);
+                        cmd.ResourceBarrierTransition(pool.Control, ResourceStates.CopySource, ResourceStates.Common);
+                        cmd.Close();
+                        device.SubmitAndWait(cmd);
+                        cmd.Dispose();
+                        allocator.Reset();
+
+                        void* data;
+                        readback.Map(0, null, &data);
+                        var bytes = (byte*)data;
+                        long before = differ;
+                        for (int ty = 0; ty < h; ty++)
+                        {
+                            // Flat region row ty holds texel row j0 + h - 1 - ty: the page's local row h - 1 - ty
+                            for (int tx = 0; tx < w; tx++)
+                            {
+                                bool same = true;
+                                for (int s = 0; s < 2 && same; s++)
+                                {
+                                    ulong* f = (ulong*)(bytes + (long)s * sliceBytes + (long)ty * rowPitch) + tx;
+                                    ulong* p = (ulong*)(bytes + (long)(2 + s) * sliceBytes + (long)(h - 1 - ty) * rowPitch) + tx;
+                                    if (*f != *p) same = false;
+                                }
+                                if (!same) differ++;
+                                compared++;
+                            }
+                        }
+                        readback.Unmap(0);
+                        if (differ > before) differPages++;
+                    }
+                return (differ, differPages, compared, checkedPages);
+            }
+            finally
+            {
+                allocator.Dispose();
+                readback.Dispose();
+                device.DeferDispose(flat);
+                device.DeferReleaseBindlessIndex(flatUav);
+            }
         }
 
         private void UploadCoverage(CoveragePlan plan,

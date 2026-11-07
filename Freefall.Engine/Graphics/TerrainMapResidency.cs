@@ -5,17 +5,35 @@ using System.Numerics;
 namespace Freefall.Graphics
 {
     /// <summary>
-    /// Which paint pages a <see cref="PaintPool"/> holds and which to bake this frame (TERRAIN_PAGES_PLAN.md 5b): N pages a
-    /// side per level round the camera (<c>EngineSettings.TerrainPaintPages</c>), every page of the levels that have fewer;
-    /// a page is let go half a page beyond its window. Pages are baked on arrival from the stamps, the coarsest and nearest
-    /// first, <c>TerrainPaintBakesPerFrame</c> a frame; a page arrives over a coarser one already baked, so the ground is
-    /// never unpainted once the first fill is done. Pages over an edit (or new heights) are dirty and bake again: in the
-    /// level 0 window at once, so an edit shows as it is dragged, the rest within the budget. With N = 0 every level 0 page
-    /// is resident (the whole map at full paint, as before 5b).
+    /// A terrain map kept as pages of <see cref="TerrainMapResidency.PageTexels"/> texels a side in a pool (the paint,
+    /// <see cref="PaintPool"/>; the decoration control, <see cref="DecoPool"/>): which page is in which slot, the border
+    /// round each page, and the resource whose replacement means a new, empty pool.
     /// </summary>
-    public sealed class TerrainPaintResidency
+    public interface IPagedMap
     {
-        private readonly PaintPool _pool;
+        PageSlots Slots { get; }
+        /// <summary>The pool's texture: another object means the pool was made again and holds nothing yet.</summary>
+        object? Resource { get; }
+        /// <summary>Texels round a page.</summary>
+        int Border { get; }
+    }
+
+    /// <summary>
+    /// Which pages of a paged terrain map (<see cref="IPagedMap"/>: the paint, TERRAIN_PAGES_PLAN.md 5b; the decoration
+    /// control, 5c) its pool holds and which to bake this frame: N pages a side per level round the camera
+    /// (<c>EngineSettings.TerrainPaintPages</c>, <c>TerrainDecoPages</c>), every page of the levels that have fewer; a page
+    /// is let go half a page beyond its window. Pages are baked on arrival from the stamps, the coarsest and nearest first,
+    /// a budget a frame; a page arrives over a coarser one already baked, so the ground is never without the map once the
+    /// first fill is done. Pages over an edit (or new heights) are dirty and bake again: in the level 0 window at once, so
+    /// an edit shows as it is dragged, the rest within the budget. With N = 0 every level 0 page is resident (the whole
+    /// map at full detail).
+    /// </summary>
+    public sealed class TerrainMapResidency
+    {
+        /// <summary>Texels a page holds a side, at every level and for every map.</summary>
+        public const int PageTexels = 256;
+
+        private readonly IPagedMap _pool;
         private readonly HashSet<(int level, int px, int py)> _dirty = new();
         private readonly List<(int level, int px, int py, int slot)> _bakes = new();
         private readonly List<(float key, int level, int px, int py)> _candidates = new();
@@ -23,9 +41,9 @@ namespace Freefall.Graphics
         private Vector2 _chosenAt = new(float.NaN);
         private int _chosenSide = -1;
 
-        public TerrainPaintResidency(PaintPool pool) => _pool = pool;
+        public TerrainMapResidency(IPagedMap pool) => _pool = pool;
 
-        public PaintPool Pool => _pool;
+        public IPagedMap Pool => _pool;
 
         /// <summary>Pages waiting for a slot or a bake after the last <see cref="Update"/>.</summary>
         public int Waiting { get; private set; }
@@ -33,14 +51,17 @@ namespace Freefall.Graphics
         /// <summary>Pages baked last frame.</summary>
         public int BakedLastFrame { get; private set; }
 
+        /// <summary>Level 0 pages a side for a map of this many texels.</summary>
+        public static int PagesAcrossFor(int texels) => Math.Max(1, (texels + PageTexels - 1) / PageTexels);
+
         /// <summary>
-        /// Page slots the windows can hold for a map of this many paint texels and N pages a side per level: 0 when N is 0 or
+        /// Page slots the windows can hold for a map of this many texels and N pages a side per level: 0 when N is 0 or
         /// the level 0 window would take every level 0 page anyway (every page resident).
         /// </summary>
         public static int CapacityFor(int texels, int pagesPerSide)
         {
             if (pagesPerSide <= 0 || texels <= 0) return 0;
-            int across = PaintPool.PagesAcrossFor(texels);
+            int across = PagesAcrossFor(texels);
             int side = pagesPerSide + 1;   // half a page of hysteresis each side
             if (side >= across) return 0;
             int levels = PageSlots.LevelsFor(across), total = 0;
@@ -61,15 +82,15 @@ namespace Freefall.Graphics
             return MathF.Max(dx, dy);
         }
 
-        /// <summary>The paint changed over these level 0 texels (x0, z0 inclusive, x1, z1 exclusive; terrain UV × texels): the
-        /// resident pages over them, at every level, bake again.</summary>
-        public void MarkDirty(int x0, int z0, int x1, int z1)
+        /// <summary>The map changed over these level 0 texels (x0, z0 inclusive, x1, z1 exclusive; terrain UV × texels): the
+        /// resident pages over them, at every level from <paramref name="minLevel"/>, bake again.</summary>
+        public void MarkDirty(int x0, int z0, int x1, int z1, int minLevel = 0)
         {
             var slots = _pool.Slots;
-            if (_pool.Weights == null) return;
-            for (int l = 0; l < slots.Levels; l++)
+            if (_pool.Resource == null) return;
+            for (int l = minLevel; l < slots.Levels; l++)
             {
-                int n = slots.PagesAcrossAt(l), span = PaintPool.PageTexels << l, border = PaintPool.Border << l;
+                int n = slots.PagesAcrossAt(l), span = PageTexels << l, border = _pool.Border << l;
                 int px0 = Math.Clamp((x0 - border) / span, 0, n - 1), px1 = Math.Clamp((x1 + border) / span, 0, n - 1);
                 int pz0 = Math.Clamp((z0 - border) / span, 0, n - 1), pz1 = Math.Clamp((z1 + border) / span, 0, n - 1);
                 for (int py = pz0; py <= pz1; py++)
@@ -82,7 +103,7 @@ namespace Freefall.Graphics
         public void MarkAllDirty()
         {
             var slots = _pool.Slots;
-            if (_pool.Weights == null) return;
+            if (_pool.Resource == null) return;
             for (int l = 0; l < slots.Levels; l++)
             {
                 int n = slots.PagesAcrossAt(l);
@@ -93,19 +114,19 @@ namespace Freefall.Graphics
         }
 
         /// <summary>
-        /// This frame's paint work: pages beyond their window let go, wanted ones given slots, and the list of pages to bake
+        /// This frame's work: pages beyond their window let go, wanted ones given slots, and the list of pages to bake
         /// (arrivals and dirty ones), each with its slot. A new pool bakes every page it wants at once. Main thread.
-        /// <paramref name="camera"/>: the camera in level 0 paint texels (terrain UV × texels).
+        /// <paramref name="camera"/>: the camera in level 0 texels (terrain UV × texels).
         /// </summary>
         public IReadOnlyList<(int level, int px, int py, int slot)> Update(Vector2 camera, int pagesPerSide, int budget)
         {
             _bakes.Clear();
             var slots = _pool.Slots;
-            if (_pool.Weights == null) return _bakes;
-            bool fresh = !ReferenceEquals(_poolTexture, _pool.Weights);
+            if (_pool.Resource == null) return _bakes;
+            bool fresh = !ReferenceEquals(_poolTexture, _pool.Resource);
             if (fresh)
             {
-                _poolTexture = _pool.Weights;
+                _poolTexture = _pool.Resource;
                 _dirty.Clear();
                 _chosenAt = new Vector2(float.NaN);
             }
@@ -140,9 +161,9 @@ namespace Freefall.Graphics
             {
                 _candidates.Clear();
                 foreach (var (l, px, py) in _dirty)
-                    _candidates.Add((Distance(camera, px, py, PaintPool.PageTexels << l) - l * 1e7f, l, px, py));
+                    _candidates.Add((Distance(camera, px, py, PageTexels << l) - l * 1e7f, l, px, py));
                 _candidates.Sort((a, b) => a.key.CompareTo(b.key));
-                float near = (h + 0.5f) * PaintPool.PageTexels;
+                float near = (h + 0.5f) * PageTexels;
                 foreach (var (key, l, px, py) in _candidates)
                 {
                     bool now = l == 0 && key <= near;
@@ -163,7 +184,7 @@ namespace Freefall.Graphics
             for (int l = 0; l < slots.Levels; l++)
             {
                 int n = slots.PagesAcrossAt(l);
-                float m = PaintPool.PageTexels << l, keep = (h + 0.5f) * m;
+                float m = PageTexels << l, keep = (h + 0.5f) * m;
                 for (int py = 0; py < n; py++)
                     for (int px = 0; px < n; px++)
                         if (slots.SlotOf(l, px, py) >= 0 && Distance(camera, px, py, m) > keep)
@@ -177,7 +198,7 @@ namespace Freefall.Graphics
             for (int l = slots.Levels - 1; l >= 0; l--)
             {
                 int n = slots.PagesAcrossAt(l);
-                float m = PaintPool.PageTexels << l, want = h * m;
+                float m = PageTexels << l, want = h * m;
                 for (int py = 0; py < n; py++)
                     for (int px = 0; px < n; px++)
                     {

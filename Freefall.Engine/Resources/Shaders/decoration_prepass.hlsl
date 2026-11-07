@@ -1,4 +1,4 @@
-// decoration_prepass.hlsl — Composites the terrain's DecoStamps into the decoration control texture.
+// decoration_prepass.hlsl — Composites the terrain's DecoStamps into the decoration control map.
 // SM 6.6 bindless, push constants at b3
 //
 // For each texel: walks the deco stamps in priority order and builds one coverage weight per
@@ -11,7 +11,12 @@
 //
 // A slot is a TerrainDecorator, not one of its variants: the weight here is pure coverage. Density and
 // clumping are per variant and are applied by the spawn kernel (grass_compute.hlsl).
+//
+// Since 5c (TERRAIN_PAGES_PLAN.md, 2026-11-07) the map is baked page by page into the decoration pool (terrain_deco.hlsli):
+// CSBuildDecoPage bakes one page into its slot. CSBuildDecoControl is the whole-map bake there was before, over a region,
+// Y-flipped and written from its output's corner, kept only for Check Deco Pages. Both composite through DecoCoverage().
 
+#pragma kernel CSBuildDecoPage
 #pragma kernel CSBuildDecoControl
 
 #include "terrain_stamp_common.hlsli"
@@ -21,9 +26,9 @@
 cbuffer PushConstants : register(b3)
 {
     uint  StampBufIdx;      // slot 0 — SRV: StructuredBuffer<CoverageStamp>, sorted by priority
-    uint  ControlUAVIdx;    // slot 1 — UAV: output RWTexture2DArray<uint4>
+    uint  ControlUAVIdx;    // slot 1 — UAV: RWTexture2DArray<uint4>, the decoration pool (flat: the check's array)
     uint  DecoratorCount;   // slot 2 — number of decorator slots (palette size)
-    uint  Resolution;       // slot 3 — control texture width/height
+    uint  Resolution;       // slot 3 — texels a side of the whole map at level 0
     uint  TerrainPagesIdx;  // slot 4 — the terrain's TerrainPagesParams (terrain_pages.hlsli); 0 = none: height/slope read as 0
     uint  SplineBufIdx;     // slot 5 — SRV: StructuredBuffer<StampSplinePoint>
     uint  LayerCount;       // slot 6 — layers in the palette (the paint pages' channels)
@@ -31,10 +36,16 @@ cbuffer PushConstants : register(b3)
     float MaxHeight;        // slot 8
     float TerrainSizeX;     // slot 9
     uint  StampCount;       // slot 10
-    uint  RegionX;          // slot 11 — the texels this bake redoes: from (RegionX, RegionY), RegionW x RegionH (the
-    uint  RegionY;          // slot 12   whole map, or the ground a paint page that arrived or changed covers; the rest
-    uint  RegionW;          // slot 13   keeps what the last bake wrote)
+    uint  RegionX;          // slot 11 — flat: the texels this bake does, from (RegionX, RegionY), RegionW x RegionH
+    uint  RegionY;          // slot 12
+    uint  RegionW;          // slot 13
     uint  RegionH;          // slot 14
+    int   PageX;            // slot 15 — page: which page, at which level
+    int   PageY;            // slot 16
+    uint  Level;            // slot 17
+    uint  OutX;             // slot 18 — page: its slot's quarter corner in the slice (texels)
+    uint  OutY;             // slot 19
+    uint  OutSlice;         // slot 20 — page: the array slice of its first slice
 };
 
 #define DECO_OP_ADD      0u
@@ -43,28 +54,23 @@ cbuffer PushConstants : register(b3)
 #define MAX_LAYERS     32
 #define MAX_DECORATORS 32
 
+#define DECO_PAGE_TEXELS 256
+#define DECO_BORDER      1
+#define DECO_SLOT_TEXELS 258
+
 SamplerState ClampSampler : register(s2);
 
-[numthreads(8, 8, 1)]
-void CSBuildDecoControl(uint3 groupTexel : SV_DispatchThreadID)
+// Every deco stamp at a place (terrain UV): each decorator's coverage, and the rows of the last Add stamp that holds it
+void DecoCoverage(float2 terrainUV, uint decoCount, out float coverage[MAX_DECORATORS], out uint rowIdx, out uint rowSlot)
 {
-    RWTexture2DArray<uint4> controlTex = ResourceDescriptorHeap[ControlUAVIdx];
     StructuredBuffer<CoverageStamp> stamps = ResourceDescriptorHeap[StampBufIdx];
     StructuredBuffer<StampSplinePoint> splinePoints = ResourceDescriptorHeap[SplineBufIdx];
-
-    if (groupTexel.x >= RegionW || groupTexel.y >= RegionH) return;
-    uint3 dtid = uint3(groupTexel.xy + uint2(RegionX, RegionY), 0);
-    if (dtid.x >= Resolution || dtid.y >= Resolution) return;
-
-    // Control texture space is Y-flipped relative to terrain UV (heightmap, stamp shapes)
-    float2 uv = (float2(dtid.xy) + 0.5) / float2(Resolution, Resolution);
-    float2 terrainUV = float2(uv.x, 1.0 - uv.y);
 
     float heightNorm = 0, slopeDeg = 0;
     if (TerrainPagesIdx != 0)
         SampleTerrainHeightSlope(LoadTerrain(TerrainPagesIdx), terrainUV, heightNorm, slopeDeg);
 
-    // ── Layer weights from the packed control array (final splat result) ──
+    // ── Layer weights from the paint pages (final splat result) ──
     // raw = the weight as painted; visible = what shows after the layers above it:
     // visible[i] = raw[i] * product(1 - raw[k]) for all k > i, as in gputerrain.fx
     TerrainPaintParams paint = LoadPaint(LoadTerrain(TerrainPagesIdx));   // nothing (no paint) without a terrain
@@ -98,15 +104,12 @@ void CSBuildDecoControl(uint3 groupTexel : SV_DispatchThreadID)
     }
 
     // ── Composite the stamps into one coverage weight per decorator ──
-    uint decoCount = min(DecoratorCount, (uint)MAX_DECORATORS);
-
-    float coverage[MAX_DECORATORS];
     for (uint d0 = 0; d0 < MAX_DECORATORS; d0++) coverage[d0] = 0;
 
     // The rows here: those of the last Add stamp that holds the texel (weight over a half) for its decorator. A
     // later stamp of that decorator without rows scatters it again.
-    uint rowIdx = 0;
-    uint rowSlot = COVERAGE_ALL_TARGETS;
+    rowIdx = 0;
+    rowSlot = COVERAGE_ALL_TARGETS;
 
     for (uint i = 0; i < StampCount; i++)
     {
@@ -161,8 +164,12 @@ void CSBuildDecoControl(uint3 groupTexel : SV_DispatchThreadID)
             }
         }
     }
+}
 
-    // ── Collect top 8 decorators by weight (descending) ──
+// The top 8 decorators by weight (descending), packed (decoratorSlot << 8) | weight; the rows' marker takes the first free
+// channel, or the lightest decorator's
+void PackTop8(float coverage[MAX_DECORATORS], uint decoCount, uint rowIdx, uint rowSlot, out uint4 packed0, out uint4 packed1)
+{
     uint topIdx[8];
     uint topWt[8];
     [unroll] for (uint k = 0; k < 8; k++)
@@ -206,7 +213,6 @@ void CSBuildDecoControl(uint3 groupTexel : SV_DispatchThreadID)
         if (topCount < 8) topCount++;
     }
 
-    // The rows' marker takes the first free channel, or the lightest decorator's
     if (rowIdx != 0 && rowSlot < decoCount && coverage[rowSlot] > 0)
     {
         uint at = min(topCount, 7u);
@@ -214,14 +220,74 @@ void CSBuildDecoControl(uint3 groupTexel : SV_DispatchThreadID)
         topWt[at] = rowIdx;
     }
 
-    // Pack: (decoratorSlot << 8) | weight
-    uint4 packed0, packed1;
     [unroll] for (uint ch = 0; ch < 4; ch++)
     {
         packed0[ch] = (topIdx[ch] << 8) | topWt[ch];
         packed1[ch] = (topIdx[ch + 4] << 8) | topWt[ch + 4];
     }
+}
 
-    controlTex[uint3(dtid.xy, 0)] = packed0;
-    controlTex[uint3(dtid.xy, 1)] = packed1;
+// One page of the decoration pool, border included: texel t of the slot is level-L texel page * 256 + t - border. A level
+// 0 texel is its centre's coverage; a coarser one averages each decorator's coverage over a 4 x 4 grid of points on its
+// footprint (2^L metres a side) and keeps the top 8. Crop rows only at level 0 (only the spawn reads them, near).
+[numthreads(8, 8, 1)]
+void CSBuildDecoPage(uint3 dtid : SV_DispatchThreadID)
+{
+    if (dtid.x >= DECO_SLOT_TEXELS || dtid.y >= DECO_SLOT_TEXELS) return;
+    RWTexture2DArray<uint4> controlTex = ResourceDescriptorHeap[ControlUAVIdx];
+
+    uint decoCount = min(DecoratorCount, (uint)MAX_DECORATORS);
+    float2 j = float2(int2(PageX, PageY) * DECO_PAGE_TEXELS + int2(dtid.xy) - DECO_BORDER);   // level L texel
+    float invTexels = 1.0 / float(Resolution);
+
+    float coverage[MAX_DECORATORS];
+    uint rowIdx = 0, rowSlot = COVERAGE_ALL_TARGETS;
+    if (Level == 0)
+        DecoCoverage((j + 0.5) * invTexels, decoCount, coverage, rowIdx, rowSlot);
+    else
+    {
+        const uint S = 4;
+        float span = float(1u << Level);
+        for (uint z = 0; z < MAX_DECORATORS; z++) coverage[z] = 0;
+        for (uint b = 0; b < S; b++)
+            for (uint a = 0; a < S; a++)
+            {
+                float2 c = (j + (float2(a, b) + 0.5) / S) * span;   // level 0 texels
+                float sub[MAX_DECORATORS];
+                uint subRow, subSlot;
+                DecoCoverage(c * invTexels, decoCount, sub, subRow, subSlot);
+                for (uint d = 0; d < decoCount; d++) coverage[d] += sub[d];
+            }
+        for (uint d2 = 0; d2 < decoCount; d2++) coverage[d2] *= 1.0 / float(S * S);
+    }
+
+    uint4 packed0, packed1;
+    PackTop8(coverage, decoCount, rowIdx, rowSlot, packed0, packed1);
+    uint2 at = uint2(OutX, OutY) + dtid.xy;
+    controlTex[uint3(at, OutSlice)] = packed0;
+    controlTex[uint3(at, OutSlice + 1)] = packed1;
+}
+
+// The whole-map bake before 5c (Y-flipped against terrain UV, row 0 at the far edge), over a region, written from the
+// output's corner: only Check Deco Pages bakes it now, to compare every level 0 page with it to the texel
+[numthreads(8, 8, 1)]
+void CSBuildDecoControl(uint3 groupTexel : SV_DispatchThreadID)
+{
+    if (groupTexel.x >= RegionW || groupTexel.y >= RegionH) return;
+    uint2 texel = groupTexel.xy + uint2(RegionX, RegionY);
+    if (texel.x >= Resolution || texel.y >= Resolution) return;
+    RWTexture2DArray<uint4> controlTex = ResourceDescriptorHeap[ControlUAVIdx];
+
+    // Row y holds level 0 texel row Resolution - 1 - y: its place computed as the page kernel computes it, so the two
+    // agree to the bit (before 5c: 1 - (y + 0.5) / Resolution, the same place within a float's last bit)
+    float2 j = float2(texel.x, Resolution - 1 - texel.y);
+    uint decoCount = min(DecoratorCount, (uint)MAX_DECORATORS);
+    float coverage[MAX_DECORATORS];
+    uint rowIdx, rowSlot;
+    DecoCoverage((j + 0.5) * (1.0 / float(Resolution)), decoCount, coverage, rowIdx, rowSlot);
+
+    uint4 packed0, packed1;
+    PackTop8(coverage, decoCount, rowIdx, rowSlot, packed0, packed1);
+    controlTex[uint3(groupTexel.xy, 0)] = packed0;
+    controlTex[uint3(groupTexel.xy, 1)] = packed1;
 }

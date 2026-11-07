@@ -17,7 +17,7 @@ namespace Freefall.Components
     {
         private RigidStatic? _staticActor;
         private Shape? _shape;
-        private Shape[]? _pieces;   // a collider of several shapes (CreateGeometries: the terrain's pages); else null
+        private List<Shape>? _pieces;   // a collider of several shapes (CreateGeometries, AddPiece: the terrain's pages); else null
 
         // Where play mode's start goes (a wake-up of thousands of colliders)
         private static readonly ProfilerMarker _findBodyMarker = ProfilerMarker.Get("Collider find body");
@@ -292,16 +292,42 @@ namespace Freefall.Components
 
             using var shapeScope = _shapeMarker.Auto();
             var frame = FrameInRoot(root);
-            var shapes = new Shape[pieces.Count];
+            var shapes = new List<Shape>(pieces.Count);
             for (int i = 0; i < pieces.Count; i++)
             {
-                shapes[i] = NewShape(actor, pieces[i].Geometry);
+                var shape = NewShape(actor, pieces[i].Geometry);
                 var localPose = Matrix4x4.CreateTranslation(Offset * WorldScale + GeometryOffset + pieces[i].Position) * frame;
                 if (!localPose.IsIdentity)
-                    shapes[i].LocalPose = localPose;
+                    shape.LocalPose = localPose;
+                shapes.Add(shape);
             }
             _pieces = shapes;
             _shapeHost = root;
+        }
+
+        /// <summary>
+        /// One more piece on the actor the collider's shapes are on (<see cref="ShapeActor"/>), its origin at
+        /// <paramref name="position"/> in the collider's frame: for a collider whose pieces come and go (TerrainCollider:
+        /// the pages round the viewers, TERRAIN_PAGES_PLAN.md 5c). Null before the collider has an actor. Main thread.
+        /// </summary>
+        protected Shape? AddPiece(PhysX.Geometry geometry, Vector3 position)
+        {
+            if (ShapeActor == null || ShapeActor.Disposed || ShapeRoot == null) return null;
+            using var shapeScope = _shapeMarker.Auto();
+            var shape = NewShape(ShapeActor, geometry);
+            var localPose = Matrix4x4.CreateTranslation(Offset * WorldScale + GeometryOffset + position) * FrameInRoot(ShapeRoot);
+            if (!localPose.IsIdentity)
+                shape.LocalPose = localPose;
+            (_pieces ??= new()).Add(shape);
+            _shapeHost = ShapeRoot;
+            return shape;
+        }
+
+        /// <summary>A piece <see cref="AddPiece"/> made, taken off its actor and released. Main thread.</summary>
+        protected void RemovePiece(Shape shape)
+        {
+            if (_pieces == null || !_pieces.Remove(shape)) return;
+            PhysXRelease.Release(shape, true);   // an exclusive shape's release detaches it
         }
 
         // The collider's frame in the actor's: identity on its own actor
@@ -566,76 +592,349 @@ namespace Freefall.Components
         }
     }
 
+    /// <summary>
+    /// The terrain's collision: a PhysX height field per page (TERRAIN_PAGES_PLAN.md 4c), only for the pages within
+    /// <c>EngineSettings.TerrainCollisionRadius</c> of a viewer (Vicinity.Viewers, else the main camera; 5c), each a piece
+    /// on the actor at its page's corner, the fields sharing their edge samples. Pages are cooked on workers as they come in
+    /// range (<see cref="TerrainCollisionSystem"/> looks a few times a second) and dropped a quarter further out; an edit
+    /// cooks again only the pages whose heights or holes changed (the store's page arrays are never changed, so a changed
+    /// page is a new array). A scene load waits until the pages round the viewers are in, so nothing walks or falls before
+    /// there is ground. Until 4c one field spanned the whole terrain; until 5c every page was cooked at play.
+    /// </summary>
     public class TerrainCollider : Collider
     {
         private static readonly IReadOnlyList<(PhysX.Geometry, Vector3)> NoPieces = Array.Empty<(PhysX.Geometry, Vector3)>();
 
-        /// <summary>Made of pieces: <see cref="CreateGeometries"/>.</summary>
+        /// <summary>A page that has collision: its piece, its field, and the arrays it was cooked from.</summary>
+        private sealed class PagePiece
+        {
+            public required Shape Shape;
+            public required HeightField Field;
+            public object? Heights, Holes;
+        }
+
+        private readonly Dictionary<int, PagePiece> _pages = new();   // by page index (pz · across + px)
+        private RigidActor? _pagesActor;      // the actor the pieces are on: another one (a body made again) starts over
+        private TerrainPages? _pagesStore;    // the store whose layout the pieces follow
+        private Cook? _cook;                  // a batch cooking on workers
+        private float _sinceLook = float.MaxValue;
+        private Vector3 _lookedFrom = new(float.NaN);
+
+        /// <summary>Pages with collision now.</summary>
+        [Reflection.DontSerialize]
+        public int CollisionPages => _pages.Count;
+
+        /// <summary>Made of pieces: <see cref="CreateGeometries"/>, then <see cref="AddPiece"/> per page.</summary>
         public override PhysX.Geometry? CreateGeometry() => null;
 
         /// <summary>
-        /// A height field per page (Terrain.CollisionAsync: made once per version of the heights and holes), each at its
-        /// page's corner, the fields sharing their edge samples. When they still have to be cooked there are no shapes
-        /// yet: they are put on the actor once the cook is done, and a scene load waits for that, so nothing walks or
-        /// falls before there is ground. Until 4c (2026-11-07) one field spanned the whole terrain.
+        /// No pieces at first: the pages come as the system finds them round the viewers. A scene load waits for the first
+        /// pages round them (its waiting step, when every entity, the player's camera and its viewer included, is awake).
         /// </summary>
         protected override IReadOnlyList<(PhysX.Geometry Geometry, Vector3 Position)>? CreateGeometries()
         {
-            var terrainRenderer = Entity?.GetComponent<TerrainRenderer>();
-            var terrain = terrainRenderer?.Terrain;
-
-            if (terrain == null)
-            {
-                Debug.Log("[RigidBody] No Terrain found");
-                return NoPieces;
-            }
-
-            if (terrain.Pages is not { HasHeights: true })
-            {
-                Debug.Log("[RigidBody] No terrain heights yet");
-                return NoPieces;
-            }
-
-            var cooked = terrain.CollisionAsync();
-            if (cooked.IsCompleted)
-                return cooked.Result is { } collision ? Pieces(terrain, collision) : NoPieces;
-
-            var (root, actor) = (ShapeRoot!, ShapeActor!);
-            var attach = cooked.ContinueWith(_ => Engine.RunOnMainThreadAsync(() =>
-            {
-                // Still wanted on that actor: not destroyed, not replaced, no shape made meanwhile
-                if (IsDestroyed || actor.Disposed || ShapeHost != null) return;
-                if (cooked.Result != null) CreateShape(root, actor);
-            })).Unwrap();
-            SceneManager.Loading?.WaitFor(attach, "Terrain collision");
+            TerrainCollisionSystem.Register(this);
+            _sinceLook = float.MaxValue;
+            SceneManager.Loading?.WaitFor(_ => UpdatePages(Engine.Settings.TerrainCollisionRadius, force: true), "Terrain collision");
             return NoPieces;
         }
 
-        /// <summary>
-        /// The samples where the terrain's vertices are drawn: sample i at i · size / (N − 1) from the terrain's corner,
-        /// one on every vertex (terrain_grid.hlsli; TerrainRenderer.GetHeight), so the fields span the terrain exactly.
-        /// Page (px, pz)'s field starts at its first sample. From 2026-10-24 to 2026-11-07 the bake put sample i at
-        /// (i + 0.5) · size / N and the field followed, half a sample in from the corner; before that it sat on
-        /// i · size / (N − 1) while the bake did not.
-        /// </summary>
-        private static List<(PhysX.Geometry Geometry, Vector3 Position)> Pieces(Terrain terrain, TerrainCollision collision)
+        public override void Destroy()
         {
-            // The fields were made from these pages (the collision is per version of them)
-            var pages = collision.Pages;
-            int samples = pages.Resolution;
-            float fx = terrain.TerrainSize.X / (samples - 1);
-            float fy = terrain.TerrainSize.Y / (samples - 1);
-            float heightScale = terrain.MaxHeight / short.MaxValue;
+            TerrainCollisionSystem.Unregister(this);
+            base.Destroy();   // the pieces go with the actor or are detached (Collider.ReleaseShape)
+            foreach (var page in _pages.Values) PhysXRelease.Release(page.Field);
+            _pages.Clear();
+            _cook?.Abandon();
+            _cook = null;
+        }
 
-            var pieces = new List<(PhysX.Geometry, Vector3)>(collision.Fields.Length);
-            for (int pz = 0; pz < pages.PagesAcross; pz++)
-                for (int px = 0; px < pages.PagesAcross; px++)
+        /// <summary>
+        /// Bring the pages round the viewers in and let go of those beyond them: a finished cook is put on the actor, the
+        /// pages wanted and not cooked from the store as it is now go to the workers (one batch at a time). Returns true
+        /// when every wanted page has its piece. <paramref name="force"/>: look now, not only every quarter second or once
+        /// the viewers have moved. Main thread (TerrainCollisionSystem, a scene load's waiting step).
+        /// </summary>
+        internal bool UpdatePages(float radius, bool force = false)
+        {
+            if (IsDestroyed || ShapeActor == null || ShapeActor.Disposed) return true;
+            var terrain = Entity?.GetComponent<TerrainRenderer>()?.Terrain;
+            if (terrain?.Pages is not { HasHeights: true } store || Transform == null) return true;   // no ground to make
+
+            // Pieces made on an actor since replaced are gone with it
+            if (!ReferenceEquals(_pagesActor, ShapeActor))
+            {
+                foreach (var page in _pages.Values) PhysXRelease.Release(page.Field);
+                _pages.Clear();
+                _pagesActor = ShapeActor;
+            }
+            // Another layout (a terrain of another size or density): every page again
+            if (_pagesStore != null && (_pagesStore.Resolution != store.Resolution))
+                DropAll();
+            _pagesStore = store;
+
+            // Ground under a viewer at once: a page within UnderFoot metres of one that has no collision (a teleport, a
+            // portal, a bindstone) is cooked here on the main thread, ~20 ms a page, rather than fallen through while a
+            // batch cooks
+            var viewers = ViewersLocal(terrain);
+            CookUnderViewers(store, terrain, viewers);
+
+            if (_cook != null)
+            {
+                if (!_cook.Task.IsCompleted) return false;
+                Apply(_cook, terrain);
+                _cook = null;
+                force = true;   // what changed while it cooked is seen at once
+            }
+
+            // Look a few times a second, or when asked, or when the viewers have moved a tenth of the radius
+            Vector3 lead = viewers.Count > 0 ? viewers[0] : Vector3.Zero;
+            _sinceLook += Time.Delta;
+            if (!force && _sinceLook < 0.25f && Vector3.DistanceSquared(lead, _lookedFrom) < (radius * 0.1f) * (radius * 0.1f))
+                return _cook == null;
+            _sinceLook = 0f;
+            _lookedFrom = lead;
+
+            int across = store.PagesAcross;
+            float fx = terrain.TerrainSize.X / (store.Resolution - 1), fz = terrain.TerrainSize.Y / (store.Resolution - 1);
+            bool all = radius <= 0f;
+            float keep = radius * 1.25f;
+            List<int>? wanted = null;
+            List<int>? gone = null;
+            for (int pz = 0; pz < across; pz++)
+                for (int px = 0; px < across; px++)
                 {
-                    if (collision.Fields[pz * pages.PagesAcross + px] is not { } field) continue;
-                    var (x0, z0, _, _) = pages.PageExtent(px, pz);
-                    pieces.Add((new HeightFieldGeometry(field, 0, heightScale, fx, fy), new Vector3(x0 * fx, 0, z0 * fy)));
+                    int index = pz * across + px;
+                    var (x0, z0, w, h) = store.PageExtent(px, pz);
+                    float d = all ? 0f : Distance(viewers, x0 * fx, z0 * fz, (x0 + w - 1) * fx, (z0 + h - 1) * fz);
+                    bool has = _pages.TryGetValue(index, out var piece);
+                    if (has && d > keep) { (gone ??= new()).Add(index); continue; }
+                    if (d > radius && !all) continue;
+                    var (heights, holes) = store.PageIdentity(px, pz);
+                    if (has && ReferenceEquals(piece!.Heights, heights) && ReferenceEquals(piece.Holes, holes)) continue;
+                    if (heights == null) continue;   // nothing in that page yet
+                    (wanted ??= new()).Add(index);
                 }
-            return pieces;
+
+            if (gone != null)
+                foreach (int index in gone)
+                {
+                    var piece = _pages[index];
+                    RemovePiece(piece.Shape);
+                    PhysXRelease.Release(piece.Field);
+                    _pages.Remove(index);
+                }
+
+            if (wanted == null) return true;
+            _cook = Cook.Start(store, wanted, terrain.Name);
+            return false;
+        }
+
+        private void DropAll()
+        {
+            foreach (var piece in _pages.Values)
+            {
+                RemovePiece(piece.Shape);
+                PhysXRelease.Release(piece.Field);
+            }
+            _pages.Clear();
+        }
+
+        // The viewers on the terrain's ground plane, in terrain-local metres (x, _, z)
+        private List<Vector3> ViewersLocal(Terrain terrain)
+        {
+            var origin = Transform.WorldPosition;
+            var list = new List<Vector3>(Math.Max(1, Vicinity.Viewers.Count));
+            foreach (var viewer in Vicinity.Viewers)
+                if (viewer != null && !viewer.IsDestroyed) list.Add(viewer.WorldPosition - origin);
+            if (list.Count == 0 && Camera.Main != null) list.Add(Camera.Main.Position - origin);
+            return list;
+        }
+
+        // The nearest viewer's distance to a page's square on the ground (0 inside it)
+        private static float Distance(List<Vector3> viewers, float x0, float z0, float x1, float z1)
+        {
+            float best = float.MaxValue;
+            foreach (var v in viewers)
+            {
+                float dx = MathF.Max(0f, MathF.Max(x0 - v.X, v.X - x1));
+                float dz = MathF.Max(0f, MathF.Max(z0 - v.Z, v.Z - z1));
+                best = MathF.Min(best, MathF.Sqrt(dx * dx + dz * dz));
+            }
+            return best;
+        }
+
+        /// <summary>Metres round a viewer within which a page without collision is cooked at once.</summary>
+        private const float UnderFoot = 64f;
+
+        private void CookUnderViewers(TerrainPages store, Terrain terrain, List<Vector3> viewers)
+        {
+            int across = store.PagesAcross;
+            float fx = terrain.TerrainSize.X / (store.Resolution - 1), fz = terrain.TerrainSize.Y / (store.Resolution - 1);
+            float pageX = TerrainPages.PageCells * fx, pageZ = TerrainPages.PageCells * fz;
+            List<int>? urgent = null;
+            foreach (var v in viewers)
+            {
+                int px0 = Math.Clamp((int)MathF.Floor((v.X - UnderFoot) / pageX), 0, across - 1);
+                int px1 = Math.Clamp((int)MathF.Floor((v.X + UnderFoot) / pageX), 0, across - 1);
+                int pz0 = Math.Clamp((int)MathF.Floor((v.Z - UnderFoot) / pageZ), 0, across - 1);
+                int pz1 = Math.Clamp((int)MathF.Floor((v.Z + UnderFoot) / pageZ), 0, across - 1);
+                for (int pz = pz0; pz <= pz1; pz++)
+                    for (int px = px0; px <= px1; px++)
+                    {
+                        int index = pz * across + px;
+                        if (_pages.ContainsKey(index) || store.PageIdentity(px, pz).heights == null) continue;
+                        if (urgent == null || !urgent.Contains(index)) (urgent ??= new()).Add(index);
+                    }
+            }
+            if (urgent == null) return;
+
+            long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
+            var cooking = PhysicsWorld.Physics.CreateCooking();
+            try
+            {
+                foreach (int index in urgent)
+                {
+                    int px = index % across, pz = index / across;
+                    var (_, _, w, h) = store.PageExtent(px, pz);
+                    var desc = new PhysX.HeightFieldDesc { NumberOfRows = w, NumberOfColumns = h, Samples = store.PhysXSamples(px, pz) };
+                    var stream = new System.IO.MemoryStream(w * h * 4 + 1024);
+                    cooking.CookHeightField(desc, stream);
+                    stream.Position = 0;
+                    Attach(index, PhysicsWorld.Physics.CreateHeightField(stream), store, terrain);
+                }
+            }
+            finally
+            {
+                PhysXRelease.Release(cooking);
+            }
+            Debug.LogAlways($"[Terrain] '{terrain.Name}': collision for {urgent.Count} page(s) under a viewer cooked at once in " +
+                            $"{System.Diagnostics.Stopwatch.GetElapsedTime(t0).TotalMilliseconds:0} ms");
+        }
+
+        // A field for a page put on the actor as its piece; the piece it replaces goes
+        private void Attach(int index, HeightField field, TerrainPages store, Terrain terrain)
+        {
+            int across = store.PagesAcross;
+            float fx = terrain.TerrainSize.X / (store.Resolution - 1), fz = terrain.TerrainSize.Y / (store.Resolution - 1);
+            int px = index % across, pz = index / across;
+            var (x0, z0, _, _) = store.PageExtent(px, pz);
+            var shape = AddPiece(new HeightFieldGeometry(field, 0, terrain.MaxHeight / short.MaxValue, fx, fz), new Vector3(x0 * fx, 0, z0 * fz));
+            if (shape == null)
+            {
+                PhysXRelease.Release(field);
+                return;
+            }
+            if (_pages.TryGetValue(index, out var old))
+            {
+                RemovePiece(old.Shape);
+                PhysXRelease.Release(old.Field);   // shapes still on it keep it alive (PhysX counts references)
+            }
+            var (heights, holes) = store.PageIdentity(px, pz);
+            _pages[index] = new PagePiece { Shape = shape, Field = field, Heights = heights, Holes = holes };
+        }
+
+        // A finished batch: each page still in the store as it was cooked gets its field and piece (one it replaces goes)
+        private void Apply(Cook cook, Terrain terrain)
+        {
+            var streams = cook.Task.IsCompletedSuccessfully ? cook.Task.Result : null;
+            cook.ReleaseCookings();
+            if (streams == null)
+            {
+                Debug.LogWarning("Terrain", $"'{terrain.Name}': cooking the collision failed: {cook.Task.Exception?.GetBaseException().Message}");
+                return;
+            }
+            long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
+            for (int i = 0; i < cook.Pages.Count; i++)
+                if (streams[i] != null)
+                    Attach(cook.Pages[i], PhysicsWorld.Physics.CreateHeightField(streams[i]), cook.Store, terrain);
+            double makeMs = System.Diagnostics.Stopwatch.GetElapsedTime(t0).TotalMilliseconds;
+            Debug.LogAlways($"[Terrain] '{terrain.Name}': collision for {cook.Pages.Count} page(s) cooked on {cook.Workers} workers in " +
+                            $"{cook.CookMs:0} ms, {makeMs:0} ms making the fields and pieces; {_pages.Count} page(s) with collision");
+        }
+
+        /// <summary>
+        /// Height fields cooked on workers, each with a cooking object of its own (PhysX.Net makes those, and the height
+        /// fields, on the main thread: its object table is not thread-safe). PhysX.Net's HeightFieldSample is a class, so each
+        /// worker fills one array of them again page by page.
+        /// </summary>
+        private sealed class Cook
+        {
+            public required TerrainPages Store;
+            public required List<int> Pages;
+            public required Task<System.IO.MemoryStream?[]> Task;
+            public required PhysX.Cooking[] Cookings;
+            public int Workers => Cookings.Length;
+            public double CookMs;
+            private bool _released;
+
+            public static Cook Start(TerrainPages store, List<int> pages, string name)
+            {
+                int workers = Math.Clamp(Environment.ProcessorCount - 1, 1, pages.Count);
+                var cookings = new PhysX.Cooking[workers];
+                for (int k = 0; k < workers; k++)
+                    cookings[k] = PhysicsWorld.Physics.CreateCooking();
+                int across = store.PagesAcross;
+                Cook? cook = null;
+                long started = System.Diagnostics.Stopwatch.GetTimestamp();
+                var task = System.Threading.Tasks.Task.Run(() =>
+                {
+                    var streams = new System.IO.MemoryStream?[pages.Count];
+                    System.Threading.Tasks.Parallel.For(0, workers, k =>
+                    {
+                        PhysX.HeightFieldSample[]? reuse = null;
+                        for (int i = k; i < pages.Count; i += workers)
+                        {
+                            int px = pages[i] % across, pz = pages[i] / across;
+                            var (_, _, w, h) = store.PageExtent(px, pz);
+                            var samples = store.PhysXSamples(px, pz, reuse);
+                            if (samples.Length == TerrainPages.PageLength) reuse = samples;
+                            var desc = new PhysX.HeightFieldDesc { NumberOfRows = w, NumberOfColumns = h, Samples = samples };
+                            var stream = new System.IO.MemoryStream(w * h * 4 + 1024);
+                            cookings[k].CookHeightField(desc, stream);
+                            stream.Position = 0;
+                            streams[i] = stream;
+                        }
+                    });
+                    if (cook != null) cook.CookMs = System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalMilliseconds;
+                    return streams;
+                });
+                cook = new Cook { Store = store, Pages = pages, Task = task, Cookings = cookings };
+                return cook;
+            }
+
+            public void ReleaseCookings()
+            {
+                if (_released) return;
+                _released = true;
+                foreach (var cooking in Cookings) PhysXRelease.Release(cooking);
+            }
+
+            /// <summary>The collider went: the cookings are released once the workers are done with them.</summary>
+            public void Abandon() => Task.ContinueWith(_ => Engine.RunOnMainThreadAsync(ReleaseCookings));
+        }
+    }
+
+    /// <summary>
+    /// Keeps every TerrainCollider's pages round the viewers (TERRAIN_PAGES_PLAN.md 5c). Play mode only: the editor makes no
+    /// colliders.
+    /// </summary>
+    public sealed class TerrainCollisionSystem : EntitySystem
+    {
+        private static readonly List<TerrainCollider> s_colliders = new();
+
+        internal static void Register(TerrainCollider collider)
+        {
+            if (!s_colliders.Contains(collider)) s_colliders.Add(collider);
+        }
+
+        internal static void Unregister(TerrainCollider collider) => s_colliders.Remove(collider);
+
+        public override void Update()
+        {
+            float radius = Engine.Settings.TerrainCollisionRadius;
+            for (int i = s_colliders.Count - 1; i >= 0; i--)
+                s_colliders[i].UpdatePages(radius);
         }
     }
 }

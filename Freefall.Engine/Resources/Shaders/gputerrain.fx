@@ -21,13 +21,13 @@ cbuffer PushConstants : register(b3)
     uint ControlMapsIdx;        // 18: unused since 5b (the paint pages come through TerrainPagesParams.PaintIdx)
     uint _reserved19;           // 19: was the layers' diffuse array (LayerTextures now)
     uint _reserved20;           // 20: was the layers' normal array
-    uint DecoControlMapIdx;     // 21: Decoration control texture
+    uint DecoControlMapIdx;     // 21: the decoration pages' TerrainDecoParams (terrain_deco.hlsli), 0 = none
     uint DecoTintIdx;           // 22: per decorator, the colour the ground under it takes (rgb, strength)
     uint CascadeBufferSRVIdx;   // 23: SRV: StructuredBuffer<CascadeData>
     uint ShadowCascadeCount;    // 24: uint: number of cascades
     uint CascadeIdxBufIdx;      // 25: SRV: per-entry cascade index (uint)
     uint LayerHeights;          // 26: 1 = some layer has a height map (LayerTextures.z; height blend and SSDM)
-    uint HoleTexIdx;            // 27: R8 hole mask (HoleStamp, terrain_holes.hlsli), 0 = no holes
+    uint HoleTexIdx;            // 27: the hole pages' TerrainHoleParams (HoleStamp, terrain_holes.hlsli), 0 = no holes
 };
 
 #include "common.fx"
@@ -35,6 +35,7 @@ cbuffer PushConstants : register(b3)
 #include "ground_shape.hlsli"
 #include "decoration_noise.hlsli"     // DecoEdgeWarp: the ground tint keeps the edge the spawn kernel draws
 #include "terrain_paint.hlsli"         // the layers' weights, from the paint pages
+#include "terrain_deco.hlsli"          // the top 8 decorators per metre, from the decoration pages
 // @RenderState(RenderTargets=6)
 
 // TerrainPatchData: per-instance data written by terrain_quadtree.hlsl compute shader.
@@ -262,17 +263,21 @@ float3 GetNormal(float2 terrainUV)
 // staying for texture near the camera; clumped plants (ferns, between them bare floor) nothing while they are drawn,
 // then exactly as the spawn thins them out over the last 30% of their range, so they hand over without a band.
 // Returns rgb and that strength; 'growth' is the strength without the distance ramp (where something grows).
-float4 DecoratorGroundTint(float2 ctrlUV, float2 terrainLocal, float dist, out float growth)
+float4 DecoratorGroundTint(float2 terrainUV, float2 terrainLocal, float dist, out float growth)
 {
-    Texture2DArray<uint4> decoCtrl = ResourceDescriptorHeap[DecoControlMapIdx];
+    growth = 0;
+    TerrainDecoParams deco = LoadDeco(DecoControlMapIdx);
+    if (!DecoPresent(deco)) return 0;
     StructuredBuffer<float4> tints = ResourceDescriptorHeap[DecoTintIdx];      // 2 per decorator (CS_DecoratorTints)
-    uint w, h, slices;
-    decoCtrl.GetDimensions(w, h, slices);
-    float2 warp = DecoEdgeWarp(terrainLocal);
-    ctrlUV += float2(warp.x, -warp.y) / TerrainSize;     // control rows run against terrain Z
-    float2 p = ctrlUV * float2(w, h) - 0.5;
+    terrainUV += DecoEdgeWarp(terrainLocal) / TerrainSize;   // the pages run with terrain Z (the map before 5c against it)
+    // The four texels round the point in the finest page resident there, at that page's level (a coarse page far off:
+    // its texels are 2^level metres); edges clamp as the whole map's did
+    float2 c = terrainUV * float(deco.Texels);
+    DecoPage page = DecoPageAt(deco, int2(floor(c)));
+    float2 p = c / float(1u << page.level) - 0.5;
     int2 i0 = int2(floor(p));
     float2 f = p - floor(p);
+    int levelLast = int((deco.Texels + (1u << page.level) - 1) >> page.level) - 1;
     float2 clumpPos = float2(terrainLocal.x, TerrainSize.y - terrainLocal.y);   // the spawn's frame for the clumps
 
     float evenRamp = lerp(0.2, 1.0, smoothstep(10.0, 70.0, dist));
@@ -287,9 +292,8 @@ float4 DecoratorGroundTint(float2 ctrlUV, float2 terrainLocal, float dist, out f
     {
         int2 offset = int2(k & 1, k >> 1);
         float bilinear = (offset.x ? f.x : 1 - f.x) * (offset.y ? f.y : 1 - f.y);
-        int2 texel = clamp(i0 + offset, int2(0, 0), int2(w - 1, h - 1));
-        uint4 s0 = decoCtrl.Load(int4(texel, 0, 0));
-        uint4 s1 = decoCtrl.Load(int4(texel, 1, 0));
+        uint4 s0, s1;
+        DecoLoad(deco, page, clamp(i0 + offset, 0, levelLast), s0, s1);
         [unroll] for (uint c = 0; c < 8; c++)
         {
             uint packed = c < 4 ? s0[c] : s1[c - 4];
@@ -329,7 +333,6 @@ float4 DecoratorGroundTint(float2 ctrlUV, float2 terrainLocal, float dist, out f
             coverageSum += bilinear * coverage;
         }
     }
-    growth = 0;
     if (coverageSum <= 0) return 0;
     float cover = saturate(coverageSum);
     float cover3 = cover * cover * cover;
@@ -770,7 +773,7 @@ FragmentOutput PS(VertexOutput input)
     {
         float dist = distance(input.WorldPos, CameraPos);
         float growth;
-        float4 tint = DecoratorGroundTint(uv, input.WorldPos.xz - TerrainOrigin, dist, growth);
+        float4 tint = DecoratorGroundTint(input.UV2, input.WorldPos.xz - TerrainOrigin, dist, growth);
         plantCover = saturate(growth * 3.0);
         float3 plantTint = 0;
         float covered = 0;
@@ -818,14 +821,9 @@ FragmentOutput PS(VertexOutput input)
     // Debug mode 5: Decoration control map overlay
     if (DebugMode == 5 && DecoControlMapIdx != 0)
     {
-        Texture2DArray<uint4> decoCtrl = ResourceDescriptorHeap[DecoControlMapIdx];
-        uint dW, dH, dS;
-        decoCtrl.GetDimensions(dW, dH, dS);
-        float2 ctrlUV = float2(input.UV2.x, 1.0 - input.UV2.y);
-        int2 ctrlTexel = clamp(int2(ctrlUV * float2(dW, dH)), int2(0,0), int2(dW-1, dH-1));
-
-        uint4 s0 = decoCtrl.Load(int4(ctrlTexel, 0, 0));
-        uint4 s1 = decoCtrl.Load(int4(ctrlTexel, 1, 0));
+        TerrainDecoParams deco = LoadDeco(DecoControlMapIdx);
+        uint4 s0, s1;
+        DecoTexel(deco, int2(input.UV2 * float(deco.Texels)), s0, s1);
         uint maxWt = 0;
         uint slotCount = 0;
         uint4 slices[2] = { s0, s1 };
