@@ -404,6 +404,7 @@ namespace Freefall.Editor
             AddMenuItem(sub, "Height", (s, a) => CreateStamp<HeightStamp>("New Height Stamp"));
             AddMenuItem(sub, "Splat", (s, a) => CreateStamp<SplatStamp>("New Splat Stamp"));
             AddMenuItem(sub, "Deco", (s, a) => CreateStamp<DecoStamp>("New Deco Stamp"));
+            AddMenuItem(sub, "Biome", (s, a) => CreateStamp<BiomeStamp>("New Biome Stamp"));
             AddMenuItem(sub, "Hole", (s, a) => CreateStamp<HoleStamp>("New Hole Stamp"));
 
             sub = AddMenuItem(btn, "3D Primitive...", null);

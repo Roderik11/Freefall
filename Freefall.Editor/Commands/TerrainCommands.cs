@@ -92,8 +92,8 @@ namespace Freefall.Editor.Commands
     /// <summary>
     /// Returns terrain metadata: dimensions, resolution, height range, world bounds, and the palette —
     /// the layers and decorators the terrain renders, which are derived from the stamps in the scene
-    /// (a TerrainLayer gets a channel when a SplatStamp references it, a TerrainDecorator a slot when
-    /// a DecoStamp adds it).
+    /// (a TerrainLayer gets a channel when a SplatStamp or a placed Biome's rule references it, a TerrainDecorator a
+    /// slot when a DecoStamp or a Biome's rule adds it), and the biomes the BiomeStamps place.
     /// GET /api/terrain/info
     /// </summary>
     [CommandRoute("GET", "/api/terrain/info")]
@@ -144,6 +144,19 @@ namespace Freefall.Editor.Commands
                     guid = d.Guid,
                     variants = d.Variants.Count,
                 }),
+                // BiomeStamps: which biomes are placed on this terrain, by how many stamps, in bake order of first use
+                biomes = TerrainBaker.CollectStamps<BiomeStamp>(terrainRenderer)
+                    .Where(s => s.Biome != null)
+                    .GroupBy(s => s.Biome)
+                    .Select(g => new
+                    {
+                        name = g.Key.Name,
+                        guid = g.Key.Guid,
+                        stamps = g.Count(),
+                        global = g.Count(s => s.IsGlobal),
+                        layerRules = g.Key.Layers.Count,
+                        decoratorRules = g.Key.Decorators.Count,
+                    }),
                 // HoleStamps: how many cut this terrain, and how much ground they open (samples at or over 0.5)
                 holes = new
                 {

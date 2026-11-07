@@ -269,12 +269,12 @@ namespace Freefall.Components
 
         // ───── Palette ──────────────────────────────────────────────────
         // What this terrain renders is derived from the stamps in scope, never stored: the layers its
-        // splat stamps reference (one channel of the packed control array each, in bake order) and the
-        // decorators its deco stamps add (one slot of the decoration control texture each).
+        // splat stamps and biome stamps' rules reference (one channel of the packed control array each, in bake
+        // order) and the decorators its deco stamps and biome rules add (one slot of the decoration control texture each).
         private List<TerrainLayer> _layerPalette = new();
         private List<TerrainDecorator> _decoratorPalette = new();
-        private List<SplatStamp> _splatStamps = new();   // in bake order, collected with the palette
-        private List<DecoStamp> _decoStamps = new();
+        private List<SplatEntry> _splatEntries = new();   // in bake order, collected with the palette (CoverageEntries)
+        private List<DecoEntry> _decoEntries = new();
         private readonly List<string> _layerWarnings = new();
         private readonly List<string> _decoWarnings = new();
 
@@ -847,7 +847,7 @@ namespace Freefall.Components
 
                     TerrainBaker.CoveragePlan plan;
                     using (_splatPlanMarker.Auto())
-                        plan = _baker.PrepareSplat(Terrain, this, _splatStamps, _layerPalette);
+                        plan = _baker.PrepareSplat(Terrain, this, _splatEntries, _layerPalette);
                     var baker = _baker;
                     var terrain = Terrain;
                     var packedArray = _packedControlArray;
@@ -914,7 +914,7 @@ namespace Freefall.Components
             if (decoDirty)
             {
                 using var _ = _decoPlanMarker.Auto();
-                var decoPlan = _baker.PrepareDeco(Terrain, this, _decoStamps, _decoratorPalette, _layerPalette);
+                var decoPlan = _baker.PrepareDeco(Terrain, this, _decoEntries, _decoratorPalette, _layerPalette);
                 System.Threading.Interlocked.Exchange(ref _pendingDecoPlan, decoPlan);
             }
 
@@ -975,22 +975,28 @@ namespace Freefall.Components
         // ───── Palette ────────────────────────────────────────────────────
 
         /// <summary>
-        /// Collect the splat stamps that apply to this terrain and derive the layers it renders: each
-        /// distinct TerrainLayer gets a channel, in the order the stamps first use them. Raises the
-        /// texture-array rebuild when the set changes.
+        /// Collect the splat stamps and biome stamps that apply to this terrain into the paint entries, and derive the
+        /// layers it renders: each distinct TerrainLayer gets a channel, in the order the entries first use them.
+        /// Raises the texture-array rebuild when the set changes.
         /// </summary>
         private void RefreshLayerPalette()
         {
             _layerWarnings.Clear();
-            _splatStamps = TerrainBaker.CollectStamps<SplatStamp>(this);
+            var biomes = TerrainBaker.CollectStamps<BiomeStamp>(this);
+            _splatEntries = CoverageEntries.Splat(TerrainBaker.CollectStamps<SplatStamp>(this), biomes);
 
             var palette = new List<TerrainLayer>();
             var dropped = new HashSet<TerrainLayer>();
-            int unassigned = 0;
-            foreach (var stamp in _splatStamps)
+            int unassigned = 0, unassignedRules = 0;
+            foreach (var entry in _splatEntries)
             {
-                var layer = stamp.Layer;
-                if (layer == null) { unassigned++; continue; }
+                var layer = entry.Layer;
+                if (layer == null)
+                {
+                    if (entry.Shape is BiomeStamp) unassignedRules++;
+                    else unassigned++;
+                    continue;
+                }
                 if (palette.Contains(layer)) continue;
 
                 if (palette.Count >= TerrainBaker.MaxLayers) dropped.Add(layer);
@@ -999,11 +1005,17 @@ namespace Freefall.Components
 
             if (unassigned > 0)
                 _layerWarnings.Add($"{unassigned} splat stamp(s) have no Layer and paint nothing.");
+            if (unassignedRules > 0)
+                _layerWarnings.Add($"{unassignedRules} biome layer rule(s) have no Layer and paint nothing.");
+            int noBiome = biomes.Count(b => b.Biome == null);
+            if (noBiome > 0)
+                _layerWarnings.Add($"{noBiome} biome stamp(s) have no Biome and place nothing.");
             if (dropped.Count > 0)
                 _layerWarnings.Add($"Too many terrain layers: {palette.Count + dropped.Count} are referenced, " +
                                    $"{TerrainBaker.MaxLayers} can be rendered. Not rendered: " +
                                    string.Join(", ", dropped.Select(l => l.Name)));
             WarnAboutStrayGlobals(ComponentCache<SplatStamp>.All, _layerWarnings);
+            WarnAboutStrayGlobals(ComponentCache<BiomeStamp>.All, _layerWarnings);
             ReportWarnings(_layerWarnings, ref _lastLayerWarning);
 
             if (!palette.SequenceEqual(_layerPalette))
@@ -1014,22 +1026,23 @@ namespace Freefall.Components
         }
 
         /// <summary>
-        /// Collect the deco stamps that apply to this terrain and derive the decorators it renders:
-        /// each decorator some stamp adds gets a slot. Raises the decorator buffer rebuild when the
-        /// set changes.
+        /// Collect the deco stamps and biome stamps that apply to this terrain into the ground cover entries, and
+        /// derive the decorators it renders: each decorator some entry adds gets a slot. Raises the decorator buffer
+        /// rebuild when the set changes.
         /// </summary>
         private void RefreshDecoratorPalette()
         {
             _decoWarnings.Clear();
-            _decoStamps = TerrainBaker.CollectStamps<DecoStamp>(this);
+            _decoEntries = CoverageEntries.Deco(TerrainBaker.CollectStamps<DecoStamp>(this),
+                                                TerrainBaker.CollectStamps<BiomeStamp>(this));
 
             var palette = new List<TerrainDecorator>();
             var dropped = new HashSet<TerrainDecorator>();
-            foreach (var stamp in _decoStamps)
+            foreach (var entry in _decoEntries)
             {
-                // Only an Add stamp puts a decorator on the terrain; Multiply merely scales what is there
-                var decorator = stamp.Decorator;
-                if (decorator == null || stamp.Op != DecoOp.Add || palette.Contains(decorator)) continue;
+                // Only an Add entry puts a decorator on the terrain; Multiply merely scales what is there
+                var decorator = entry.Decorator;
+                if (decorator == null || entry.Op != DecoOp.Add || palette.Contains(decorator)) continue;
 
                 if (palette.Count >= TerrainBaker.MaxDecorators) dropped.Add(decorator);
                 else palette.Add(decorator);
@@ -1088,6 +1101,23 @@ namespace Freefall.Components
                 Terrain.MarkForUpdate(TerrainDirtyFlags.TextureArrays | TerrainDirtyFlags.LayerParams | TerrainDirtyFlags.AlbedoBake);
             else if (msg.Data is TerrainDecorator decorator && _decoratorPalette.Contains(decorator))
                 Terrain.MarkForUpdate(TerrainDirtyFlags.DecoStructure | TerrainDirtyFlags.DecoParams);
+            else if (msg.Data is Biome biome && PlacesBiome(biome))
+            {
+                // Its rules are paint and ground cover wherever its stamps are: the palettes again (SplatPack refreshes
+                // both), the paint and the ground cover everywhere, since a rule's layer may take another channel
+                RebakeRequestCount++;
+                Terrain.MarkForUpdate(TerrainDirtyFlags.SplatPack | TerrainDirtyFlags.AlbedoBake | TerrainDirtyFlags.DecoPrepass);
+            }
+        }
+
+        /// <summary>Whether a biome stamp that applies to this terrain places the biome.</summary>
+        private bool PlacesBiome(Biome biome)
+        {
+            var stamps = ComponentCache<BiomeStamp>.All;
+            for (int i = 0; i < stamps.Count; i++)
+                if (stamps[i] is { } stamp && stamp.Biome == biome && stamp.AppliesTo(this))
+                    return true;
+            return false;
         }
 
         /// <summary>
@@ -1098,7 +1128,7 @@ namespace Freefall.Components
         private void OnAssetReloaded(Message msg)
         {
             if (Terrain == null) return;
-            if (msg.Data is TerrainLayer or TerrainDecorator)
+            if (msg.Data is TerrainLayer or TerrainDecorator or Biome)
             {
                 OnAssetDirty(msg);
                 return;
@@ -3283,6 +3313,7 @@ namespace Freefall.Components
             foreach (var stamp in ComponentCache<HeightStamp>.All) Snapshot(stamp);
             foreach (var stamp in ComponentCache<HeightNoiseStamp>.All) Snapshot(stamp);
             foreach (var stamp in ComponentCache<SplatStamp>.All) Snapshot(stamp);
+            foreach (var stamp in ComponentCache<BiomeStamp>.All) Snapshot(stamp);
             foreach (var stamp in ComponentCache<DecoStamp>.All) Snapshot(stamp);
 
             void Snapshot(TerrainStamp stamp)
@@ -3330,7 +3361,8 @@ namespace Freefall.Components
                 return;
             }
 
-            if (stamp is SplatStamp)
+            // A biome stamp is paint and ground cover too (its rules), never the height path below
+            if (stamp is SplatStamp or BiomeStamp)
             {
                 var change = MarkPaintRegion(stamp);
                 Terrain?.MarkForUpdate(TerrainDirtyFlags.AlbedoBake | TerrainDirtyFlags.DecoPrepass);

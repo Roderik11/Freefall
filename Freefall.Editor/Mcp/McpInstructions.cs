@@ -34,7 +34,9 @@ namespace Freefall.Editor.Mcp
               asset. Shape=Local is a circle or the entity's Spline; Shape=Global covers the terrain the entity is parented
               under and is limited by the stamp's filter (HeightRange, SlopeRange, RequireLayers, ExcludeLayers) — that is
               how terrain-wide rules are written. Stamps composite in ascending Priority: a later SplatStamp paints over an
-              earlier one. terrain_info lists the layers and decorators the stamps currently put on the terrain.
+              earlier one. A BiomeStamp places a Biome asset (a list of layer rules and decorator rules, each with its own
+              filter): its rules paint and grow inside the stamp's shape as splat/deco stamps would, at its Priority.
+              terrain_info lists the layers, decorators and biomes the stamps currently put on the terrain.
 
             Assets
             - The editor loads assets from its Library cache: editing .asset files on disk does NOT reach it. Use asset_set_properties

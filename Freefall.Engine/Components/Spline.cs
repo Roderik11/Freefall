@@ -184,6 +184,8 @@ namespace Freefall.Components
                 if (height != null) reference = MathF.Max(reference, height.Radius);
                 var splat = Entity.GetComponent<SplatStamp>();
                 if (splat != null) reference = MathF.Max(reference, splat.Radius);
+                var biome = Entity.GetComponent<BiomeStamp>();
+                if (biome != null) reference = MathF.Max(reference, biome.Radius);
                 var mesh = Entity.GetComponent<RuntimeMesh>();
                 if (mesh != null) reference = MathF.Max(reference, mesh.Width * 0.5f);
                 var water = Entity.GetComponent<WaterBody>();

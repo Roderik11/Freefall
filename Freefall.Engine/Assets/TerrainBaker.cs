@@ -1721,27 +1721,28 @@ namespace Freefall.Assets
         }
 
         /// <summary>
-        /// Lay out a splat bake from the terrain's splat stamps (already in bake order).
-        /// 'layers' is the terrain's palette: a stamp's Layer becomes the index of its channel.
+        /// Lay out a splat bake from the terrain's paint entries (already in bake order: the splat stamps and the biome
+        /// stamps' layer rules, <see cref="CoverageEntries.Splat"/>).
+        /// 'layers' is the terrain's palette: an entry's Layer becomes the index of its channel.
         /// Main thread.
         /// </summary>
         public CoveragePlan PrepareSplat(Terrain terrain, TerrainRenderer renderer,
-            IReadOnlyList<SplatStamp> stamps, IReadOnlyList<TerrainLayer> layers)
+            IReadOnlyList<SplatEntry> entries, IReadOnlyList<TerrainLayer> layers)
         {
             var plan = new CoveragePlan { TargetCount = layers.Count, LayerCount = layers.Count };
             var layerIndex = BuildIndex(layers);
             var terrainOrigin = renderer.Transform?.WorldPosition ?? Vector3.Zero;
 
-            foreach (var stamp in stamps)
+            foreach (var entry in entries)
             {
-                if (stamp.Layer == null || !layerIndex.TryGetValue(stamp.Layer, out int channel)) continue;
+                if (entry.Layer == null || !layerIndex.TryGetValue(entry.Layer, out int channel)) continue;
 
-                if (!TryBuildCoverage(stamp, terrain, terrainOrigin, layerIndex, plan.SplinePoints, out var desc))
+                if (!TryBuildCoverage(entry.Shape, entry.Filter, terrain, terrainOrigin, layerIndex, plan.SplinePoints, out var desc))
                     continue;
 
-                desc.Flags |= (uint)stamp.Op << 8;
+                desc.Flags |= (uint)entry.Op << 8;
                 desc.Target = (uint)channel;
-                desc.Strength = stamp.Strength;
+                desc.Strength = entry.Strength;
                 plan.Stamps.Add(desc);
             }
 
@@ -1749,12 +1750,13 @@ namespace Freefall.Assets
         }
 
         /// <summary>
-        /// Lay out a decoration coverage bake from the terrain's deco stamps (already in bake order).
+        /// Lay out a decoration coverage bake from the terrain's ground cover entries (already in bake order: the deco
+        /// stamps and the biome stamps' decorator rules, <see cref="CoverageEntries.Deco"/>).
         /// 'decorators' is the terrain's decorator palette; 'layers' its layer palette (for filters).
         /// Main thread.
         /// </summary>
         public CoveragePlan PrepareDeco(Terrain terrain, TerrainRenderer renderer,
-            IReadOnlyList<DecoStamp> stamps, IReadOnlyList<TerrainDecorator> decorators,
+            IReadOnlyList<DecoEntry> entries, IReadOnlyList<TerrainDecorator> decorators,
             IReadOnlyList<TerrainLayer> layers)
         {
             var plan = new CoveragePlan { TargetCount = decorators.Count, LayerCount = layers.Count };
@@ -1762,34 +1764,34 @@ namespace Freefall.Assets
             var decoratorIndex = BuildIndex(decorators);
             var terrainOrigin = renderer.Transform?.WorldPosition ?? Vector3.Zero;
 
-            foreach (var stamp in stamps)
+            foreach (var entry in entries)
             {
                 uint target;
-                if (stamp.Decorator == null)
+                if (entry.Decorator == null)
                 {
-                    // No decorator: a Multiply stamp thins or boosts everything; an Add stamp has nothing to add
-                    if (stamp.Op != DecoOp.Multiply) continue;
+                    // No decorator: a Multiply entry thins or boosts everything; an Add entry has nothing to add
+                    if (entry.Op != DecoOp.Multiply) continue;
                     target = AllTargets;
                 }
-                else if (decoratorIndex.TryGetValue(stamp.Decorator, out int slot))
+                else if (decoratorIndex.TryGetValue(entry.Decorator, out int slot))
                 {
                     target = (uint)slot;
                 }
                 else continue;
 
-                if (!TryBuildCoverage(stamp, terrain, terrainOrigin, layerIndex, plan.SplinePoints, out var desc))
+                if (!TryBuildCoverage(entry.Shape, entry.Filter, terrain, terrainOrigin, layerIndex, plan.SplinePoints, out var desc))
                     continue;
 
-                desc.Flags |= (uint)stamp.Op << 8;
+                desc.Flags |= (uint)entry.Op << 8;
                 desc.Target = target;
-                desc.Strength = stamp.Weight;
-                if (stamp.Op == DecoOp.Add && stamp.RowSpacing > 0.05f && plan.Rows.Count < MaxDecoRows)
+                desc.Strength = entry.Weight;
+                if (entry is { Op: DecoOp.Add, Rows: { RowSpacing: > 0.05f } rows } && plan.Rows.Count < MaxDecoRows)
                 {
                     plan.Rows.Add(new DecoRowGPU
                     {
-                        Normal = RowNormal(stamp),
-                        Spacing = stamp.RowSpacing,
-                        Width = Math.Clamp(stamp.RowWidth, 0f, stamp.RowSpacing),
+                        Normal = RowNormal(rows),
+                        Spacing = rows.RowSpacing,
+                        Width = Math.Clamp(rows.RowWidth, 0f, rows.RowSpacing),
                         Slot = target,
                     });
                     desc.Rows = (uint)plan.Rows.Count;
@@ -1845,8 +1847,11 @@ namespace Freefall.Assets
             return index;
         }
 
-        /// <summary>Shape, edge noise and filter of a coverage stamp. Op, target and strength are the caller's.</summary>
-        private static bool TryBuildCoverage(CoverageStamp stamp, Terrain terrain, Vector3 terrainOrigin,
+        /// <summary>
+        /// Shape and edge noise of a coverage entry's stamp (a splat or deco stamp, or the biome stamp of a rule) and the
+        /// entry's filter. Op, target and strength are the caller's.
+        /// </summary>
+        private static bool TryBuildCoverage(TerrainStamp stamp, StampFilter filter, Terrain terrain, Vector3 terrainOrigin,
             Dictionary<TerrainLayer, int> layerIndex, List<StampSplinePointGPU> splinePoints, out CoverageStampGPU desc)
         {
             desc = new CoverageStampGPU();
@@ -1892,24 +1897,24 @@ namespace Freefall.Assets
             }
 
             // Filter. The ranges are always written so the shader never reads garbage.
-            desc.HeightMin = stamp.HeightRange.X;
-            desc.HeightMax = stamp.HeightRange.Y;
-            desc.HeightBlend = stamp.HeightBlend;
-            desc.SlopeMin = stamp.SlopeRange.X;
-            desc.SlopeMax = stamp.SlopeRange.Y;
-            desc.SlopeBlend = stamp.SlopeBlend;
-            desc.PatchSize = stamp.PatchSize;
-            desc.PatchCoverage = stamp.PatchCoverage;
-            desc.PatchSoftness = stamp.PatchSoftness;
-            desc.PatchSeed = (uint)stamp.PatchSeed;
+            desc.HeightMin = filter.HeightRange.X;
+            desc.HeightMax = filter.HeightRange.Y;
+            desc.HeightBlend = filter.HeightBlend;
+            desc.SlopeMin = filter.SlopeRange.X;
+            desc.SlopeMax = filter.SlopeRange.Y;
+            desc.SlopeBlend = filter.SlopeBlend;
+            desc.PatchSize = filter.PatchSize;
+            desc.PatchCoverage = filter.PatchCoverage;
+            desc.PatchSoftness = filter.PatchSoftness;
+            desc.PatchSeed = (uint)filter.PatchSeed;
 
-            if (stamp.HasFilter)
+            if (filter.HasFilter)
             {
                 desc.Flags |= CoverageFilter;
-                desc.RequireMask = LayerMask(stamp.RequireLayers, layerIndex, out bool anyRequired);
-                desc.ExcludeMask = LayerMask(stamp.ExcludeLayers, layerIndex, out _);
+                desc.RequireMask = LayerMask(filter.RequireLayers, layerIndex, out bool anyRequired);
+                desc.ExcludeMask = LayerMask(filter.ExcludeLayers, layerIndex, out _);
 
-                // Requires layers, but none of them is on this terrain: the stamp can never apply
+                // Requires layers, but none of them is on this terrain: the entry can never apply
                 if (anyRequired && desc.RequireMask == 0)
                     return false;
             }
