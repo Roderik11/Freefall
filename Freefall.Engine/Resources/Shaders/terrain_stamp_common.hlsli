@@ -102,6 +102,16 @@ float EvaluateStampWeightEx(
         float bestFade = 1;
         bool inside = false;
 
+        // Height, width and fade come from the segments nearly as near as the nearest, weighted by
+        // ((nearest + e) / (d + e))^6, not from the nearest alone. Taken from the nearest segment, they jumped where
+        // another segment became the nearest: on the inside of every bend (the bisector) and between a meander's arms,
+        // where the two feet lie far apart along the spline. With per-point widths (a river widening seaward) that
+        // jump in reach left steps up to 6 m in the ground beside the Great River's valley (TestWorld, 2026-11-07).
+        // On the spline the nearest segment rules; one at 1.5x the distance weighs under 0.1. Built up in the one walk:
+        // when a nearer segment turns up, what was gathered is rescaled to it.
+        const float blendEps = 1e-7;    // terrain UV, ~2 mm on 16 km: keeps the ratio defined on the spline itself
+        float accW = 0, accH = 0, accHalfW = 0, accFade = 0;
+
         uint segCount = isClosed ? ptCount : (ptCount - 1);
 
         for (uint s = 0; s < segCount; s++)
@@ -117,11 +127,19 @@ float EvaluateStampWeightEx(
 
             if (d < bestDist)
             {
+                float r = (d + blendEps) / (bestDist + blendEps);
+                float r2 = r * r;
+                float rescale = r2 * r2 * r2;
+                accW *= rescale; accH *= rescale; accHalfW *= rescale; accFade *= rescale;
                 bestDist = d;
-                bestH = lerp(p0.Height, p1.Height, projT);
-                bestHalfW = lerp(p0.HalfWidth, p1.HalfWidth, projT);
-                bestFade = lerp(p0.Fade, p1.Fade, projT);
             }
+            float q = (bestDist + blendEps) / (d + blendEps);
+            float q2 = q * q;
+            float w = q2 * q2 * q2;
+            accW += w;
+            accH += w * lerp(p0.Height, p1.Height, projT);
+            accHalfW += w * lerp(p0.HalfWidth, p1.HalfWidth, projT);
+            accFade += w * lerp(p0.Fade, p1.Fade, projT);
 
             if (isClosed)
             {
@@ -133,6 +151,13 @@ float EvaluateStampWeightEx(
                         inside = !inside;
                 }
             }
+        }
+
+        if (accW > 0)
+        {
+            bestH = accH / accW;
+            bestHalfW = accHalfW / accW;
+            bestFade = accFade / accW;
         }
 
         if (ptCount == 1)
