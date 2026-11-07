@@ -52,6 +52,7 @@ namespace Freefall.Editor
         public static int SaveChangedAssets()
         {
             int saved = 0;
+            var failed = new List<Asset>();   // still changed: listed again after the clear below
 
             // A copy: saving imports again and may mark further assets dirty. Assets saved since they were edited
             // (inspector edit then MCP save, or asset_set_properties, which marks and saves) are skipped: saving a
@@ -93,10 +94,12 @@ namespace Freefall.Editor
                 catch (Exception ex)
                 {
                     Debug.Log($"[AssetCreator] Failed to save '{asset.Name}': {ex.Message}");
+                    failed.Add(asset);
                 }
             }
 
             _dirtyAssets.Clear();
+            _dirtyAssets.UnionWith(failed);
 
             if (saved > 0)
                 MessageDispatcher.Send(Msg.RefreshAssets);

@@ -422,15 +422,17 @@ void CS_BakeTerrainNormals(uint3 dtid : SV_DispatchThreadID)
     uint hmH = HeightmapSize.y;
     if (dtid.x >= hmW || dtid.y >= hmH) return;
 
-    // Normal texel i is height sample i; its neighbours a sample either side, clamped to the terrain's edges (they
-    // wrapped round to the far edge before the pool, the sampler being a wrapping one)
-    int2 i = int2(dtid.xy);
-    float hL = TerrainSample01(pages, i + int2(-1, 0));
-    float hR = TerrainSample01(pages, i + int2( 1, 0));
-    float hD = TerrainSample01(pages, i + int2(0, -1));
-    float hU = TerrainSample01(pages, i + int2(0,  1));
+    // Normal texel i is height sample i·step: one a sample, or every second where that would pass D3D12's 16,384 texels
+    // (16 km at 1 m per vertex; TerrainRenderer.BakedNormalSize). Its neighbours a step either side, clamped to the
+    // terrain's edges (they wrapped round to the far edge before the pool, the sampler being a wrapping one)
+    int step = int(pages.Cells / (hmW - 1));
+    int2 i = int2(dtid.xy) * step;
+    float hL = TerrainSample01(pages, i + int2(-step, 0));
+    float hR = TerrainSample01(pages, i + int2( step, 0));
+    float hD = TerrainSample01(pages, i + int2(0, -step));
+    float hU = TerrainSample01(pages, i + int2(0,  step));
 
-    // Central difference spans two samples (hL-hR, hD-hU). Normal texel i is height sample i (terrain_grid.hlsli)
+    // Central difference spans two texels (hL-hR, hD-hU); a texel is step samples (terrain_grid.hlsli)
     float texelWorldSize = TerrainSize.x / float(hmW - 1);
     float heightScale = MaxHeight / (2.0 * texelWorldSize);
 

@@ -1128,8 +1128,8 @@ namespace Freefall.Assets
                                     if (va != vc) { cDiffers++; maxStep = Math.Max(maxStep, Math.Abs(va - vc)); }
 
                                     // The rest only where the texel holds a sample of the terrain: a pool filled from the
-                                    // saved map (UploadBakedHeightmap) leaves the border beyond the edge unwritten, as
-                                    // nothing reads it
+                                    // saved pages (UploadPages) holds the edge sample again in the border beyond the
+                                    // terrain's edge, where the bake writes what its stamps give there; nothing reads it
                                     int sx = px * Terrain.PageCells - HeightPool.Border + tx;
                                     int sy = py * Terrain.PageCells - HeightPool.Border + ty;
                                     if (sx < 0 || sy < 0 || sx >= res || sy >= res) continue;
@@ -1410,124 +1410,115 @@ namespace Freefall.Assets
         }
 
         /// <summary>
-        /// Uploads pre-saved R16_UNorm baked heightmap bytes (the flat map Save writes) into the pool, page by page, each
-        /// with the samples of its border that lie on the terrain (the border beyond the terrain's edge is never read:
-        /// terrain_pages.hlsli clamps to the edge). Used at load time when the baked heightmap was persisted to cache.
+        /// Uploads the CPU store's heights (Terrain.Pages, read from the pages file at load) into the pool, page by page,
+        /// each with its border of <see cref="HeightPool.Border"/> samples from its neighbours (clamped to the terrain's
+        /// edges, past which nothing reads). Pages go up <see cref="UploadBatch"/> at a time through one upload buffer,
+        /// each in its own place in it, so no copy is wider than a page: until 4c (2026-11-07) the flat map Save wrote went
+        /// up through one footprint as wide as the map, and D3D12 takes none wider than 16,384 texels (16 km at 1 m per
+        /// vertex is 16,385 samples). Used at load in place of a bake.
         /// </summary>
-        public bool UploadBakedHeightmap(byte[] pixels, int resolution)
+        public bool UploadPages(TerrainPages pages)
         {
-            if (pixels == null || pixels.Length == 0) return false;
+            if (pages is not { HasHeights: true }) return false;
 
             var device = Engine.Device;
-            int bytesPerPixel = 2; // R16_UNorm
-            int rowPitch = (resolution * bytesPerPixel + 255) & ~255;
-            int totalBytes = rowPitch * resolution;
+            int resolution = pages.Resolution;
+            int across = pages.PagesAcross, count = across * across;
+            const int texels = HeightPool.PageTexels;
+            int rowPitch = (texels * 2 + 255) & ~255;
+            int pageBytes = (rowPitch * texels + 511) & ~511;
+            int batch = Math.Min(UploadBatch, count);
 
             var uploadResource = device.NativeDevice.CreateCommittedResource(
                 new HeapProperties(HeapType.Upload),
                 HeapFlags.None,
-                ResourceDescription.Buffer((ulong)totalBytes),
+                ResourceDescription.Buffer((ulong)pageBytes * (ulong)batch),
                 ResourceStates.GenericRead,
                 null);
 
-            var allocator = device.NativeDevice.CreateCommandAllocator(CommandListType.Direct);
-            var cmdList = device.NativeDevice.CreateCommandList<ID3D12GraphicsCommandList>(
-                0, CommandListType.Direct, allocator, null);
-
             try
             {
-                unsafe
+                for (int first = 0; first < count; first += batch)
                 {
-                    void* pData;
-                    uploadResource.Map(0, null, &pData);
+                    int n = Math.Min(batch, count - first);
+                    unsafe
+                    {
+                        void* pData;
+                        uploadResource.Map(0, null, &pData);
+                        var basePtr = (IntPtr)pData;
+                        System.Threading.Tasks.Parallel.For(0, n, k =>
+                            FillPage(pages, first + k, new Span<ushort>((byte*)basePtr + (long)k * pageBytes, pageBytes / 2), rowPitch / 2));
+                        uploadResource.Unmap(0);
+                    }
 
-                    int srcRowBytes = resolution * bytesPerPixel;
-                    var dstPtr = (byte*)pData;
-                    for (int y = 0; y < resolution; y++)
-                        Marshal.Copy(pixels, y * srcRowBytes, (IntPtr)(dstPtr + y * rowPitch), srcRowBytes);
-
-                    uploadResource.Unmap(0);
+                    var allocator = device.NativeDevice.CreateCommandAllocator(CommandListType.Direct);
+                    var cmdList = device.NativeDevice.CreateCommandList<ID3D12GraphicsCommandList>(0, CommandListType.Direct, allocator, null);
+                    try
+                    {
+                        if (first == 0) _pool.Ensure(resolution, cmdList);
+                        cmdList.ResourceBarrierTransition(_pool.Texture, ResourceStates.Common, ResourceStates.CopyDest);
+                        for (int k = 0; k < n; k++)
+                        {
+                            int i = first + k;
+                            var (slice, cx, cy) = _pool.PageCorner(i % across, i / across);
+                            var src = new TextureCopyLocation(uploadResource, new PlacedSubresourceFootPrint
+                            {
+                                Offset = (ulong)((long)k * pageBytes),
+                                Footprint = new SubresourceFootPrint(Format.R16_UNorm, texels, texels, 1, (uint)rowPitch)
+                            });
+                            cmdList.CopyTextureRegion(new TextureCopyLocation(_pool.Texture, (uint)slice), (uint)cx, (uint)cy, 0, src, null);
+                        }
+                        cmdList.ResourceBarrierTransition(_pool.Texture, ResourceStates.CopyDest, ResourceStates.Common);
+                        cmdList.Close();
+                        device.SubmitAndWait(cmdList);
+                    }
+                    finally
+                    {
+                        cmdList.Dispose();
+                        allocator.Dispose();
+                    }
                 }
 
-                var src = new TextureCopyLocation(uploadResource, new PlacedSubresourceFootPrint
-                {
-                    Offset = 0,
-                    Footprint = new SubresourceFootPrint(Format.R16_UNorm, (uint)resolution, (uint)resolution, 1, (uint)rowPitch)
-                });
-
-                _pool.Ensure(resolution, cmdList);
-                cmdList.ResourceBarrierTransition(_pool.Texture, ResourceStates.Common, ResourceStates.CopyDest);
-                for (int py = 0; py < _pool.PagesAcross; py++)
-                    for (int px = 0; px < _pool.PagesAcross; px++)
-                    {
-                        int bx = px * Terrain.PageCells - HeightPool.Border, by = py * Terrain.PageCells - HeightPool.Border;
-                        int x0 = Math.Max(bx, 0), y0 = Math.Max(by, 0);
-                        int x1 = Math.Min(bx + HeightPool.PageTexels, resolution), y1 = Math.Min(by + HeightPool.PageTexels, resolution);
-                        if (x1 <= x0 || y1 <= y0) continue;
-                        var (slice, cx, cy) = _pool.PageCorner(px, py);
-                        cmdList.CopyTextureRegion(new TextureCopyLocation(_pool.Texture, (uint)slice),
-                            (uint)(cx + x0 - bx), (uint)(cy + y0 - by), 0, src,
-                            new Vortice.Mathematics.Box(x0, y0, 0, x1, y1, 1));
-                    }
-                cmdList.ResourceBarrierTransition(_pool.Texture, ResourceStates.CopyDest, ResourceStates.Common);
-
-                cmdList.Close();
-                device.SubmitAndWait(cmdList);
-
-                Debug.Log($"[TerrainBaker] Uploaded baked heightmap from cache: {resolution}x{resolution} ({pixels.Length} bytes)");
+                Debug.Log($"[TerrainBaker] Uploaded {count} pages: {resolution}x{resolution}");
                 _pool.Filled = true;
                 HeightVersion++;
                 return true;
             }
             finally
             {
-                cmdList.Dispose();
-                allocator.Dispose();
                 uploadResource.Dispose();
             }
         }
 
-        /// <summary>
-        /// Read a box of samples (x0, z0 inclusive, x1, z1 exclusive) out of the pool into a readback buffer laid out as a
-        /// flat map of the box, rows of <paramref name="rowPitch"/> bytes: each page's own samples (no border; the last page
-        /// in a row or column also the far edge). Its own command list; blocks until the GPU is done.
-        /// </summary>
-        private void ReadPoolBox(ID3D12Resource readback, int rowPitch, int x0, int z0, int x1, int z1)
+        /// <summary>Pages that go up through the upload buffer at a time (<see cref="UploadPages"/>): 128 pages, 25 MB.</summary>
+        private const int UploadBatch = 128;
+
+        // Page i's texels as the pool holds them, border included, into rows of `pitch` values: its own samples copied a
+        // row at a time, the border's from the pages beside it
+        private static void FillPage(TerrainPages pages, int i, Span<ushort> into, int pitch)
         {
-            var device = Engine.Device;
-            int res = _pool.Resolution;
-            var allocator = device.NativeDevice.CreateCommandAllocator(CommandListType.Direct);
-            var cmdList = device.NativeDevice.CreateCommandList<ID3D12GraphicsCommandList>(0, CommandListType.Direct, allocator, null);
-            try
+            const int border = HeightPool.Border, texels = HeightPool.PageTexels;
+            int across = pages.PagesAcross;
+            int px = i % across, pz = i / across;
+            var (x0, z0, w, h) = pages.PageExtent(px, pz);
+            var own = pages.HeightPage(px, pz);
+            for (int tz = 0; tz < texels; tz++)
             {
-                var dst = new TextureCopyLocation(readback, new PlacedSubresourceFootPrint
+                var row = into.Slice(tz * pitch, texels);
+                int z = tz - border;
+                if (z >= 0 && z < h && !own.IsEmpty)
                 {
-                    Offset = 0,
-                    Footprint = new SubresourceFootPrint(Format.R16_UNorm, (uint)(x1 - x0), (uint)(z1 - z0), 1, (uint)rowPitch)
-                });
-                cmdList.ResourceBarrierTransition(_pool.Texture, ResourceStates.Common, ResourceStates.CopySource);
-                int pages = _pool.PagesAcross;
-                for (int py = 0; py < pages; py++)
-                    for (int px = 0; px < pages; px++)
-                    {
-                        var own = HeightPlan.PageSamples(px, py, pages, res);
-                        int ax = Math.Max(own.x0, x0), az = Math.Max(own.y0, z0);
-                        int bx = Math.Min(own.x1, x1), bz = Math.Min(own.y1, z1);
-                        if (bx <= ax || bz <= az) continue;
-                        var (slice, cx, cy) = _pool.PageCorner(px, py);
-                        int tx = cx + HeightPool.Border + ax - own.x0, tz = cy + HeightPool.Border + az - own.y0;
-                        cmdList.CopyTextureRegion(dst, (uint)(ax - x0), (uint)(az - z0), 0,
-                            new TextureCopyLocation(_pool.Texture, (uint)slice),
-                            new Vortice.Mathematics.Box(tx, tz, 0, tx + bx - ax, tz + bz - az, 1));
-                    }
-                cmdList.ResourceBarrierTransition(_pool.Texture, ResourceStates.CopySource, ResourceStates.Common);
-                cmdList.Close();
-                device.SubmitAndWait(cmdList);
-            }
-            finally
-            {
-                cmdList.Dispose();
-                allocator.Dispose();
+                    own.Slice(z * TerrainPages.PageSamples, w).CopyTo(row.Slice(border, w));
+                    for (int tx = 0; tx < border; tx++)
+                        row[tx] = pages.Sample(x0 + tx - border, z0 + z);
+                    for (int tx = border + w; tx < texels; tx++)
+                        row[tx] = pages.Sample(x0 + tx - border, z0 + z);
+                }
+                else
+                {
+                    for (int tx = 0; tx < texels; tx++)
+                        row[tx] = pages.Sample(x0 + tx - border, z0 + z);
+                }
             }
         }
 
@@ -1697,53 +1688,6 @@ namespace Freefall.Assets
             {
                 cmdList.Dispose();
                 allocator.Dispose();
-            }
-        }
-
-        /// <summary>
-        /// Reads back the baked heights (the pool) as one flat map of raw R16_UNorm bytes, for DDS persistence (Save).
-        /// Returns null if no heights have been baked.
-        /// </summary>
-        public byte[] ReadbackBakedHeightmapBytes()
-        {
-            if (_pool.Texture == null)
-                return null;
-
-            var device = Engine.Device;
-            int res = _pool.Resolution;
-            int bytesPerPixel = 2; // R16_UNorm
-            int rowPitch = (res * bytesPerPixel + 255) & ~255;
-            int totalBytes = rowPitch * res;
-
-            var readbackResource = device.NativeDevice.CreateCommittedResource(
-                new HeapProperties(HeapType.Readback),
-                HeapFlags.None,
-                ResourceDescription.Buffer((ulong)totalBytes),
-                ResourceStates.CopyDest,
-                null);
-
-            try
-            {
-                ReadPoolBox(readbackResource, rowPitch, 0, 0, res, res);
-
-                int srcRowBytes = res * bytesPerPixel;
-                byte[] pixels = new byte[srcRowBytes * res];
-                unsafe
-                {
-                    void* pData;
-                    readbackResource.Map(0, null, &pData);
-                    var srcPtr = (byte*)pData;
-                    for (int y = 0; y < res; y++)
-                        Marshal.Copy((IntPtr)(srcPtr + y * rowPitch), pixels, y * srcRowBytes, srcRowBytes);
-                    readbackResource.Unmap(0);
-                }
-
-                Debug.Log($"[TerrainBaker] Baked heightmap bytes readback: {res}x{res}, {pixels.Length} bytes");
-                return pixels;
-            }
-            finally
-            {
-                readbackResource.Dispose();
             }
         }
 

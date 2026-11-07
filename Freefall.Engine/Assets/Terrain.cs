@@ -166,10 +166,13 @@ namespace Freefall.Assets
         /// <summary>The heights and holes as they are now are the saved ones (TerrainLoader: after a load, after a save).</summary>
         internal void MarkMapsSaved() => _savedMapsHash = MapsHash();
 
+        /// <summary>The heights and holes are those last read from the pages file or written to it.</summary>
+        internal bool MapsAreSaved => MapsHash() == _savedMapsHash;
+
         /// <summary>
-        /// After a bake: the heightmap and the hole mask are saved with this asset (Save Changed Assets writes them; a
-        /// published game and its ground collider load them), so when they no longer equal the saved ones the asset
-        /// goes on Save Changed Assets. Compared, not assumed from an edit: stamps and the generators that move them
+        /// After a bake: the heights and holes are saved with this asset (its pages file: Save Changed Assets writes it,
+        /// a published game and its ground collider load it), so when they no longer equal the saved ones the asset goes
+        /// on Save Changed Assets. A terrain saved before 4c has no pages file, so its first bake puts it there. Compared, not assumed from an edit: stamps and the generators that move them
         /// also rebake while a scene loads, to the same maps. Editor only, without the splat rebake <see cref="MarkDirty"/> adds.
         /// </summary>
         internal void CheckMapsAgainstSaved()
@@ -205,19 +208,6 @@ namespace Freefall.Assets
                 base.MarkDirty();
             }
         }
-
-        /// <summary>
-        /// How heights and holes become the PhysX height field's samples. A cook saved with another format is not used
-        /// (<see cref="SavedCookFormat"/>): it is cooked again, and the next save writes it the new way. 2 (2026-10-24):
-        /// a cell's hole flag from the mask at the cell's middle, the samples being at the height map's texel centres
-        /// (PhysicsHelper.IsHoleCell, TerrainCollider). 3 (2026-11-07): one sample on every vertex, sample i at
-        /// i × VertexSpacing from the corner (TERRAIN_PAGES_PLAN.md stage 1).
-        /// </summary>
-        internal const int CookFormat = 3;
-
-        /// <summary>The <see cref="CookFormat"/> of the cook saved with this terrain (its CollisionMeshData); 0 = from before formats.</summary>
-        [Browsable(false)]
-        public int SavedCookFormat;
 
         // FNV-1a over the CPU store's heights and holes, page by page (TerrainPages.Hash)
         private ulong MapsHash() => Pages?.Hash() ?? 14695981039346656037UL;
@@ -304,15 +294,18 @@ namespace Freefall.Assets
         internal Graphics.HeightPool? HeightPool;
 
         /// <summary>
-        /// Serialized GUID reference to the saved baked heightmap DDS subasset.
-        /// TerrainLoader loads this on startup so the game doesn't need to rebake.
+        /// The GUID of the file the heights and holes are saved in, page by page (<see cref="TerrainPagesFile"/>, the
+        /// Cache root's {guid}.pages): what a load reads instead of baking, and a game without a renderer (the server)
+        /// has its ground from. Null until the first save. Since 4c (2026-11-07); before, BakedHeightmapRef and
+        /// BakedHolesRef named a flat R16 heightmap and a flat hole mask, and a cooked PhysX height field of the whole
+        /// terrain was saved beside them.
         /// </summary>
         [Browsable(false)]
-        public Texture BakedHeightmapRef;
+        public string? PagesGuid;
 
         /// <summary>
-        /// The height stamps the saved heightmap was baked from, as <see cref="TerrainBaker.HeightPlan.Hash"/>. A scene
-        /// whose stamps hash the same keeps the saved map as it is: no bake and no readback at load. 0 = not known.
+        /// The height stamps the saved heights were baked from, as <see cref="TerrainBaker.HeightPlan.Hash"/>. A scene
+        /// whose stamps hash the same keeps the saved heights as they are: no bake and no readback at load. 0 = not known.
         /// </summary>
         [Browsable(false)]
         public ulong BakedStampsHash;
@@ -328,12 +321,12 @@ namespace Freefall.Assets
         internal ulong PagesStampsHash;
 
         /// <summary>
-        /// Pending baked heightmap bytes loaded from cache, awaiting GPU upload.
-        /// Consumed by TerrainRenderer on the next Draw frame.
+        /// The pages in <see cref="Pages"/> came from the saved file and the GPU pool has yet to get them: TerrainRenderer
+        /// uploads them (TerrainBaker.UploadPages) on its next Draw instead of baking.
         /// </summary>
         [Reflection.DontSerialize]
         [JsonIgnore]
-        internal byte[] PendingBakedHeightmapBytes;
+        internal bool PendingPagesUpload;
 
         // ── Terrain dimensions ──
         public Vector2 TerrainSize = new(1700, 1700);
@@ -385,88 +378,112 @@ namespace Freefall.Assets
         internal void SetPages(TerrainPages? pages) => Pages = pages;
 
         /// <summary>
-        /// The PhysX height field of the heights and holes as they were when it was made (TerrainCollider's geometry).
-        /// Use <see cref="CookedHeightFieldAsync"/>, which makes it again when they have changed.
+        /// The terrain's collision as it was last made (TerrainCollider's shapes): a PhysX height field per page. Use
+        /// <see cref="CollisionAsync"/>, which makes it again when the heights or holes have changed.
         /// </summary>
         [JsonIgnore]
-        public PhysX.HeightField CookedHeightField { get; private set; }
+        internal TerrainCollision? Collision { get; private set; }
 
-        // MapsHash of the heights and holes the cooked height field, and the cook under way, were made from. A hash, not
-        // a count of changes: during a load the hole mask goes empty (stamps not awake yet) and back to the same cuts.
-        private ulong _cookedMapsHash;
-        private Task<PhysX.HeightField?>? _cooking;
+        // MapsHash of the heights and holes the collision, and the cook under way, were made from. A hash, not a count of
+        // changes: during a load the hole mask goes empty (stamps not awake yet) and back to the same cuts.
+        private ulong _collisionMapsHash;
+        private Task<TerrainCollision?>? _cooking;
         private ulong _cookingMapsHash;
 
-        /// <summary>
-        /// Set the cooked PhysX height field, made from the heights and holes as they are now (TerrainLoader on save).
-        /// The one it replaces is released; shapes still on it keep it alive (PhysX counts references).
-        /// </summary>
-        internal void SetCookedHeightField(PhysX.HeightField hf) => SetCookedHeightField(hf, MapsHash());
-
-        private void SetCookedHeightField(PhysX.HeightField hf, ulong mapsHash)
+        private void SetCollision(TerrainCollision collision, ulong mapsHash)
         {
-            if (CookedHeightField != null && CookedHeightField != hf)
-                PhysXRelease.Release(CookedHeightField);
-            CookedHeightField = hf;
-            _cookedMapsHash = mapsHash;
+            // The fields it replaces are released; shapes still on them keep them alive (PhysX counts references)
+            if (Collision != null && Collision != collision)
+                foreach (var field in Collision.Fields)
+                    if (field != null) PhysXRelease.Release(field);
+            Collision = collision;
+            _collisionMapsHash = mapsHash;
         }
 
         /// <summary>
-        /// The PhysX height field of the heights and holes as they are now, for TerrainCollider. Play used to cook it
-        /// every time on the main thread: ~5.4 s for 4097² on Eldermoor. Now, in order: the one in memory, when it was
-        /// made from these maps; the cook saved with the terrain, when they are the saved ones; a cook on a worker (the
-        /// samples and PhysX cooking; creating the PhysX object stays on the main thread, PhysX.Net's object table is not
-        /// thread-safe). Null without heights. Main thread.
+        /// The terrain's collision for the heights and holes as they are now: a PhysX height field per page, cooked on
+        /// workers side by side, each with a cooking object of its own (PhysX.Net makes those, and the height fields, on
+        /// the main thread: its object table is not thread-safe). The one in memory when it was made from these maps.
+        /// Nothing is saved: until 4c (2026-11-07) one field of the whole terrain was cooked when the terrain was saved
+        /// and again when its file was imported (1.07 GB at 16 km and 1 m per vertex), and a published game never found
+        /// that cook anyway (it has no metas) and cooked on a worker. Null without heights. Main thread.
         /// </summary>
-        internal Task<PhysX.HeightField?> CookedHeightFieldAsync()
+        internal Task<TerrainCollision?> CollisionAsync()
         {
             var pages = Pages;
             if (pages is not { HasHeights: true })
-                return Task.FromResult<PhysX.HeightField?>(null);
+                return Task.FromResult<TerrainCollision?>(null);
 
             ulong maps = MapsHash();
-            if (CookedHeightField != null && _cookedMapsHash == maps)
-                return Task.FromResult<PhysX.HeightField?>(CookedHeightField);
+            if (Collision != null && _collisionMapsHash == maps)
+                return Task.FromResult<TerrainCollision?>(Collision);
             if (_cooking != null && _cookingMapsHash == maps)
                 return _cooking;
 
-            // The cook written by the last save, from these very maps, the way they are cooked now
-            if (maps == _savedMapsHash && SavedCookFormat == CookFormat && Loaders.TerrainLoader.LoadSavedCook(this) is { } saved)
-            {
-                SetCookedHeightField(saved, maps);
-                return Task.FromResult<PhysX.HeightField?>(saved);
-            }
+            // The store is never changed once made: the workers read it as it is now
+            int across = pages.PagesAcross, count = across * across;
+            int workers = Math.Clamp(Environment.ProcessorCount - 1, 1, count);
+            var cookings = new PhysX.Cooking[workers];
+            for (int k = 0; k < workers; k++)
+                cookings[k] = PhysicsWorld.Physics.CreateCooking();
+            var done = new TaskCompletionSource<TerrainCollision?>(TaskCreationOptions.RunContinuationsAsynchronously);
+            long started = System.Diagnostics.Stopwatch.GetTimestamp();
 
-            // The store is never changed once made: the worker reads it as it is now
-            var cooking = PhysicsWorld.Physics.CreateCooking();
-            var done = new TaskCompletionSource<PhysX.HeightField?>(TaskCreationOptions.RunContinuationsAsynchronously);
-
+            long samplesTicks = 0, cookTicks = 0;
             Task.Run(() =>
             {
-                var desc = new PhysX.HeightFieldDesc
+                var streams = new System.IO.MemoryStream[count];
+                Parallel.For(0, workers, k =>
                 {
-                    NumberOfRows = pages.Resolution,
-                    NumberOfColumns = pages.Resolution,
-                    Samples = pages.ToSamples(),
-                };
-                var stream = new System.IO.MemoryStream();
-                cooking.CookHeightField(desc, stream);
-                stream.Position = 0;
-                return stream;
+                    long mine = 0, mineCook = 0;
+                    PhysX.HeightFieldSample[]? reuse = null;   // this worker's sample objects, filled again page by page
+                    for (int i = k; i < count; i += workers)
+                    {
+                        int px = i % across, pz = i / across;
+                        var (_, _, w, h) = pages.PageExtent(px, pz);
+                        long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
+                        var samples = pages.PhysXSamples(px, pz, reuse);
+                        if (samples.Length == TerrainPages.PageLength) reuse = samples;
+                        var desc = new PhysX.HeightFieldDesc
+                        {
+                            NumberOfRows = w,
+                            NumberOfColumns = h,
+                            Samples = samples,
+                        };
+                        var stream = new System.IO.MemoryStream(w * h * 4 + 1024);
+                        long t1 = System.Diagnostics.Stopwatch.GetTimestamp();
+                        cookings[k].CookHeightField(desc, stream);
+                        mine += t1 - t0;
+                        mineCook += System.Diagnostics.Stopwatch.GetTimestamp() - t1;
+                        stream.Position = 0;
+                        streams[i] = stream;
+                    }
+                    System.Threading.Interlocked.Add(ref samplesTicks, mine);
+                    System.Threading.Interlocked.Add(ref cookTicks, mineCook);
+                });
+                return streams;
             }).ContinueWith(cook => Engine.RunOnMainThreadAsync(() =>
             {
-                // Always completes: a scene load waits for the shape made from it
+                // Always completes: a scene load waits for the shapes made from it
                 try
                 {
-                    PhysXRelease.Release(cooking);
-                    var field = PhysicsWorld.Physics.CreateHeightField(cook.Result);
-                    SetCookedHeightField(field, maps);   // maps changed meanwhile: the next request cooks again
-                    Debug.LogAlways($"[Terrain] '{Name}': collision height field cooked on a worker");
-                    done.SetResult(field);
+                    foreach (var cooking in cookings) PhysXRelease.Release(cooking);
+                    double cookMs = System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalMilliseconds;
+                    var streams = cook.Result;
+                    var fields = new PhysX.HeightField?[count];
+                    for (int i = 0; i < count; i++)
+                        fields[i] = PhysicsWorld.Physics.CreateHeightField(streams[i]);
+                    var collision = new TerrainCollision(pages, fields);
+                    SetCollision(collision, maps);   // maps changed meanwhile: the next request cooks again
+                    double perWorker = 1000.0 / System.Diagnostics.Stopwatch.Frequency / workers;
+                    Debug.LogAlways($"[Terrain] '{Name}': collision cooked on {workers} workers, {count} page(s), " +
+                                    $"{cookMs:0} ms cooking (per worker {samplesTicks * perWorker:0} ms samples, {cookTicks * perWorker:0} ms PhysX), " +
+                                    $"{System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalMilliseconds - cookMs:0} ms making the fields");
+                    done.SetResult(collision);
                 }
                 catch (Exception ex)
                 {
-                    Debug.LogWarning("Terrain", $"'{Name}': cooking the collision height field failed: {ex.GetBaseException().Message}");
+                    Debug.LogWarning("Terrain", $"'{Name}': cooking the collision failed: {ex.GetBaseException().Message}");
                     done.SetResult(null);
                 }
             }));
@@ -477,13 +494,6 @@ namespace Freefall.Assets
         }
 
         // ── Holes (HoleStamp) ──
-
-        /// <summary>
-        /// Serialized GUID reference to the saved hole mask (R8 DDS subasset, saved next to the baked heightmap).
-        /// Null when the terrain had no holes when it was saved.
-        /// </summary>
-        [Browsable(false)]
-        public Texture BakedHolesRef;
 
         // Where the hole stamps cut the terrain is in Pages: one byte per height sample, 0 = ground, 255 = fully cut, the
         // edge of a hole where it crosses 128; a page no hole cuts holds none. Baked on the CPU (TerrainBaker.BakeHoles)
@@ -502,5 +512,22 @@ namespace Freefall.Assets
 
         /// <summary>True where the ground is open at a terrain-local position.</summary>
         public bool IsHole(float localX, float localZ) => HoleWeight(localX, localZ) >= 0.5f;
+    }
+
+    /// <summary>
+    /// A terrain's collision: a PhysX height field per page (TERRAIN_PAGES_PLAN.md 4c), made from <see cref="Pages"/>,
+    /// whose layout places them. Page (px, pz)'s field is <see cref="Fields"/>[pz · PagesAcross + px] and spans that
+    /// page's samples (TerrainPages.PageExtent), sharing its edge samples with the next page's.
+    /// </summary>
+    public sealed class TerrainCollision
+    {
+        public TerrainPages Pages { get; }
+        public PhysX.HeightField?[] Fields { get; }
+
+        public TerrainCollision(TerrainPages pages, PhysX.HeightField?[] fields)
+        {
+            Pages = pages;
+            Fields = fields;
+        }
     }
 }

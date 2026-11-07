@@ -3,6 +3,7 @@ using Freefall.Base;
 using Freefall.Graphics;
 using PhysX;
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Numerics;
 using System.Runtime.InteropServices;
@@ -16,6 +17,7 @@ namespace Freefall.Components
     {
         private RigidStatic? _staticActor;
         private Shape? _shape;
+        private Shape[]? _pieces;   // a collider of several shapes (CreateGeometries: the terrain's pages); else null
 
         // Where play mode's start goes (a wake-up of thousands of colliders)
         private static readonly ProfilerMarker _findBodyMarker = ProfilerMarker.Get("Collider find body");
@@ -87,6 +89,8 @@ namespace Freefall.Components
             {
                 _groups = value;
                 if (_shape != null) _shape.QueryFilterData = new FilterData(_groups, 0, 0, 0);
+                if (_pieces != null)
+                    foreach (var piece in _pieces) piece.QueryFilterData = new FilterData(_groups, 0, 0, 0);
             }
         }
 
@@ -112,9 +116,16 @@ namespace Freefall.Components
 
         private void ApplyBlocks()
         {
-            if (_shape == null || _isTrigger) return;
+            if (_isTrigger) return;
+            if (_shape != null) ApplyBlocks(_shape);
+            if (_pieces != null)
+                foreach (var piece in _pieces) ApplyBlocks(piece);
+        }
+
+        private void ApplyBlocks(Shape shape)
+        {
             const ShapeFlag solid = ShapeFlag.SimulationShape | ShapeFlag.SceneQueryShape;
-            _shape.Flags = _blocks ? _shape.Flags | solid : _shape.Flags & ~solid;
+            shape.Flags = _blocks ? shape.Flags | solid : shape.Flags & ~solid;
         }
 
         // Kept in a field because it is set before there is a shape (a scene load, the editor).
@@ -122,14 +133,19 @@ namespace Freefall.Components
         // change in one assignment.
         private void ApplyTrigger()
         {
-            if (_shape == null) return;
+            if (_shape != null) ApplyTrigger(_shape);
+            if (_pieces != null)
+                foreach (var piece in _pieces) ApplyTrigger(piece);
+        }
 
-            var flags = _shape.Flags;
-            _shape.Flags = _isTrigger
+        private void ApplyTrigger(Shape shape)
+        {
+            var flags = shape.Flags;
+            shape.Flags = _isTrigger
                 ? (flags & ~ShapeFlag.SimulationShape) | ShapeFlag.TriggerShape
                 : (flags & ~ShapeFlag.TriggerShape) | ShapeFlag.SimulationShape;
 
-            if (_isTrigger && (_shape.Flags & ShapeFlag.TriggerShape) == 0)
+            if (_isTrigger && (shape.Flags & ShapeFlag.TriggerShape) == 0)
                 Debug.LogWarning($"[Collider] {Entity?.Name}: a {GetType().Name} cannot be a trigger, it stays solid");
         }
 
@@ -172,7 +188,14 @@ namespace Freefall.Components
 
         public abstract PhysX.Geometry? CreateGeometry();
 
-        /// <summary>Where the geometry's origin sits in the collider's frame, before <see cref="Offset"/>: the terrain's height field starts half a texel in.</summary>
+        /// <summary>
+        /// The pieces of a collider made of several shapes, each a geometry and where its origin sits in the collider's
+        /// frame (TerrainCollider: a height field per page, since 2026-11-07). Null for a collider of one shape, which
+        /// <see cref="CreateGeometry"/> makes; empty for one with no shape yet.
+        /// </summary>
+        protected virtual IReadOnlyList<(PhysX.Geometry Geometry, Vector3 Position)>? CreateGeometries() => null;
+
+        /// <summary>Where the geometry's origin sits in the collider's frame, before <see cref="Offset"/>.</summary>
         protected virtual Vector3 GeometryOffset => Vector3.Zero;
 
         void CreateFullActor()
@@ -212,6 +235,16 @@ namespace Freefall.Components
         {
             ShapeRoot = root;
             ShapeActor = actor;
+
+            IReadOnlyList<(PhysX.Geometry Geometry, Vector3 Position)>? pieces;
+            using (_geometryMarker.Auto())
+                pieces = CreateGeometries();
+            if (pieces != null)
+            {
+                CreatePieces(root, actor, pieces);
+                return;
+            }
+
             PhysX.Geometry? geometry;
             using (_geometryMarker.Auto())
                 geometry = CreateGeometry();
@@ -219,18 +252,8 @@ namespace Freefall.Components
                 return;
 
             using var shapeScope = _shapeMarker.Auto();
-            _shape = RigidActorExt.CreateExclusiveShape(actor, geometry, PhysicsWorld.DefaultMaterial);
+            _shape = NewShape(actor, geometry);
             _shapeHost = root;
-
-            // Whose shape this is: under a RigidBody all colliders share the body's actor, whose
-            // UserData is the body's entity, so a query's hit can only tell the piece by its shape
-            _shape.UserData = this;
-            _shape.QueryFilterData = new FilterData(_groups, 0, 0, 0);
-
-            if (_isTrigger)
-                ApplyTrigger();
-            if (!_blocks)
-                ApplyBlocks();
 
             // Offset is in the collider's own frame, scaled with it; on a child of the actor's entity
             // that frame is carried into the actor's.
@@ -240,22 +263,62 @@ namespace Freefall.Components
             if (geometry is CapsuleGeometry)
                 localPose = Matrix4x4.CreateRotationZ(MathF.PI / 2) * localPose;
 
-            if(root != Entity)
-            {
-                // The actor's frame is the root's place and turn in the world without its scale (a
-                // PhysX pose carries none), so the shape is placed in that frame: in metres. Taken
-                // relative to the root's scaled matrix, a root (or anything above it) scaled by s put
-                // every shape s times too near the root's pivot.
-                root.Transform.Matrix.Deconstruct(out _, out var rootRotation, out var rootTranslation);
-                var rootFrame = Matrix4x4.CreateFromQuaternion(rootRotation) * Matrix4x4.CreateTranslation(rootTranslation);
-                Matrix4x4.Invert(rootFrame, out var rootInverse);
-                var relative = Matrix4x4.Multiply(Transform.Matrix, rootInverse);
-                relative.Deconstruct(out _, out var shapeRotation, out var shapeTranslation);
-                localPose *= Matrix4x4.CreateFromQuaternion(shapeRotation) * Matrix4x4.CreateTranslation(shapeTranslation);
-            }
-
+            localPose *= FrameInRoot(root);
             if (!localPose.IsIdentity)
                 _shape.LocalPose = localPose;
+        }
+
+        // A shape of this collider on the actor, with its groups, trigger and blocking as set
+        private Shape NewShape(RigidActor actor, PhysX.Geometry geometry)
+        {
+            var shape = RigidActorExt.CreateExclusiveShape(actor, geometry, PhysicsWorld.DefaultMaterial);
+
+            // Whose shape this is: under a RigidBody all colliders share the body's actor, whose
+            // UserData is the body's entity, so a query's hit can only tell the piece by its shape
+            shape.UserData = this;
+            shape.QueryFilterData = new FilterData(_groups, 0, 0, 0);
+
+            if (_isTrigger)
+                ApplyTrigger(shape);
+            if (!_blocks && !_isTrigger)
+                ApplyBlocks(shape);
+            return shape;
+        }
+
+        // Every piece's shape, each where CreateGeometries put it in the collider's frame
+        private void CreatePieces(Entity root, RigidActor actor, IReadOnlyList<(PhysX.Geometry Geometry, Vector3 Position)> pieces)
+        {
+            if (pieces.Count == 0) return;
+
+            using var shapeScope = _shapeMarker.Auto();
+            var frame = FrameInRoot(root);
+            var shapes = new Shape[pieces.Count];
+            for (int i = 0; i < pieces.Count; i++)
+            {
+                shapes[i] = NewShape(actor, pieces[i].Geometry);
+                var localPose = Matrix4x4.CreateTranslation(Offset * WorldScale + GeometryOffset + pieces[i].Position) * frame;
+                if (!localPose.IsIdentity)
+                    shapes[i].LocalPose = localPose;
+            }
+            _pieces = shapes;
+            _shapeHost = root;
+        }
+
+        // The collider's frame in the actor's: identity on its own actor
+        private Matrix4x4 FrameInRoot(Entity root)
+        {
+            if (root == Entity) return Matrix4x4.Identity;
+
+            // The actor's frame is the root's place and turn in the world without its scale (a
+            // PhysX pose carries none), so the shape is placed in that frame: in metres. Taken
+            // relative to the root's scaled matrix, a root (or anything above it) scaled by s put
+            // every shape s times too near the root's pivot.
+            root.Transform.Matrix.Deconstruct(out _, out var rootRotation, out var rootTranslation);
+            var rootFrame = Matrix4x4.CreateFromQuaternion(rootRotation) * Matrix4x4.CreateTranslation(rootTranslation);
+            Matrix4x4.Invert(rootFrame, out var rootInverse);
+            var relative = Matrix4x4.Multiply(Transform.Matrix, rootInverse);
+            relative.Deconstruct(out _, out var shapeRotation, out var shapeTranslation);
+            return Matrix4x4.CreateFromQuaternion(shapeRotation) * Matrix4x4.CreateTranslation(shapeTranslation);
         }
 
         public override void Destroy()
@@ -285,6 +348,9 @@ namespace Freefall.Components
         {
             PhysXRelease.Release(_shape, native);
             _shape = null;
+            if (_pieces != null)
+                foreach (var piece in _pieces) PhysXRelease.Release(piece, native);
+            _pieces = null;
             _shapeHost = null;
         }
     }
@@ -502,12 +568,18 @@ namespace Freefall.Components
 
     public class TerrainCollider : Collider
     {
+        private static readonly IReadOnlyList<(PhysX.Geometry, Vector3)> NoPieces = Array.Empty<(PhysX.Geometry, Vector3)>();
+
+        /// <summary>Made of pieces: <see cref="CreateGeometries"/>.</summary>
+        public override PhysX.Geometry? CreateGeometry() => null;
+
         /// <summary>
-        /// The terrain's height field (Terrain.CookedHeightFieldAsync: made once per version of the heights and holes).
-        /// When it still has to be cooked, there is no shape yet: it is put on the actor once the cook is done, and a
-        /// scene load waits for that, so nothing walks or falls before there is ground.
+        /// A height field per page (Terrain.CollisionAsync: made once per version of the heights and holes), each at its
+        /// page's corner, the fields sharing their edge samples. When they still have to be cooked there are no shapes
+        /// yet: they are put on the actor once the cook is done, and a scene load waits for that, so nothing walks or
+        /// falls before there is ground. Until 4c (2026-11-07) one field spanned the whole terrain.
         /// </summary>
-        public override PhysX.Geometry? CreateGeometry()
+        protected override IReadOnlyList<(PhysX.Geometry Geometry, Vector3 Position)>? CreateGeometries()
         {
             var terrainRenderer = Entity?.GetComponent<TerrainRenderer>();
             var terrain = terrainRenderer?.Terrain;
@@ -515,18 +587,18 @@ namespace Freefall.Components
             if (terrain == null)
             {
                 Debug.Log("[RigidBody] No Terrain found");
-                return null;
+                return NoPieces;
             }
 
             if (terrain.Pages is not { HasHeights: true })
             {
                 Debug.Log("[RigidBody] No terrain heights yet");
-                return null;
+                return NoPieces;
             }
 
-            var cooked = terrain.CookedHeightFieldAsync();
+            var cooked = terrain.CollisionAsync();
             if (cooked.IsCompleted)
-                return cooked.Result is { } field ? Geometry(terrain, field) : null;
+                return cooked.Result is { } collision ? Pieces(terrain, collision) : NoPieces;
 
             var (root, actor) = (ShapeRoot!, ShapeActor!);
             var attach = cooked.ContinueWith(_ => Engine.RunOnMainThreadAsync(() =>
@@ -536,22 +608,34 @@ namespace Freefall.Components
                 if (cooked.Result != null) CreateShape(root, actor);
             })).Unwrap();
             SceneManager.Loading?.WaitFor(attach, "Terrain collision");
-            return null;
+            return NoPieces;
         }
 
         /// <summary>
         /// The samples where the terrain's vertices are drawn: sample i at i · size / (N − 1) from the terrain's corner,
-        /// one on every vertex (terrain_grid.hlsli; TerrainRenderer.GetHeight), so the field spans the terrain exactly.
-        /// From 2026-10-24 to 2026-11-07 the bake put sample i at (i + 0.5) · size / N and this field followed, half a
-        /// sample in from the corner; before that it sat on i · size / (N − 1) while the bake did not.
+        /// one on every vertex (terrain_grid.hlsli; TerrainRenderer.GetHeight), so the fields span the terrain exactly.
+        /// Page (px, pz)'s field starts at its first sample. From 2026-10-24 to 2026-11-07 the bake put sample i at
+        /// (i + 0.5) · size / N and the field followed, half a sample in from the corner; before that it sat on
+        /// i · size / (N − 1) while the bake did not.
         /// </summary>
-        private static HeightFieldGeometry Geometry(Terrain terrain, HeightField field)
+        private static List<(PhysX.Geometry Geometry, Vector3 Position)> Pieces(Terrain terrain, TerrainCollision collision)
         {
-            // The field was made from these heights (the cache is per version of them)
-            int samples = terrain.Pages!.Resolution;
+            // The fields were made from these pages (the collision is per version of them)
+            var pages = collision.Pages;
+            int samples = pages.Resolution;
             float fx = terrain.TerrainSize.X / (samples - 1);
             float fy = terrain.TerrainSize.Y / (samples - 1);
-            return new HeightFieldGeometry(field, 0, terrain.MaxHeight / short.MaxValue, fx, fy);
+            float heightScale = terrain.MaxHeight / short.MaxValue;
+
+            var pieces = new List<(PhysX.Geometry, Vector3)>(collision.Fields.Length);
+            for (int pz = 0; pz < pages.PagesAcross; pz++)
+                for (int px = 0; px < pages.PagesAcross; px++)
+                {
+                    if (collision.Fields[pz * pages.PagesAcross + px] is not { } field) continue;
+                    var (x0, z0, _, _) = pages.PageExtent(px, pz);
+                    pieces.Add((new HeightFieldGeometry(field, 0, heightScale, fx, fy), new Vector3(x0 * fx, 0, z0 * fy)));
+                }
+            return pieces;
         }
     }
 }

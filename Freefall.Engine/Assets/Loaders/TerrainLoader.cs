@@ -1,28 +1,26 @@
 using System;
 using System.IO;
 using System.Linq;
-using System.Runtime.InteropServices;
 using System.Text;
 using Freefall.Assets.Packers;
 using Freefall.Base;
 using Freefall.Components;
-using Freefall.Graphics;
 using Freefall.Serialization;
-using PhysX;
 
 namespace Freefall.Assets.Loaders
 {
     /// <summary>
     /// Loads and saves Terrain assets.
-    /// Load: unpacks AssetDefinitionData (YAML) from cache, deserializes Terrain,
-    ///       resolves GUID references, loads the baked heightmap subasset.
-    /// Save: reads the baked heightmap back from the GPU into the cache, then writes the YAML.
+    /// Load: unpacks AssetDefinitionData (YAML) from cache, deserializes Terrain, resolves GUID references, then reads
+    ///       the heights and holes from its pages file (<see cref="TerrainPagesFile"/>) into the CPU store.
+    /// Save: writes the CPU store's heights and holes into the pages file, then the YAML. Since 4c (2026-11-07); before, a
+    ///       save read the whole map back from the GPU into a flat R16 DDS, wrote the hole mask as a flat R8 DDS and cooked
+    ///       one PhysX height field of the whole terrain beside them.
     /// </summary>
     [AssetLoader(typeof(Terrain), ".terrain")]
     public class TerrainLoader : IAssetLoader
     {
         private readonly AssetDefinitionPacker _packer = new();
-        private readonly DdsTexturePacker _ddsPacker = new();
 
         public Asset Load(string name, AssetManager manager)
         {
@@ -35,10 +33,6 @@ namespace Freefall.Assets.Loaders
 
         public Asset LoadFromCache(string cachePath, string name, AssetManager manager, string sourceGuid = null)
         {
-            // A cache file is named by its GUID: no lookup by name
-            if (string.IsNullOrEmpty(sourceGuid))
-                sourceGuid = Path.GetFileNameWithoutExtension(cachePath);
-
             try
             {
                 Debug.Log($"[TerrainLoader] Loading '{name}' from {cachePath}");
@@ -65,20 +59,14 @@ namespace Freefall.Assets.Loaders
 
                 terrain.Name = name;
 
-                // Pre-cooked PhysX cache skipped — always cook from CPU HeightField at play time
-                // LoadCookedHeightField(terrain, sourceGuid);
-
-                // Load persisted baked heightmap (R16_UNorm DDS)
-                LoadBakedHeightmap(terrain);
-
-                // And the hole mask that goes with it (R8 DDS), so colliders cooked before the first bake have the holes
-                LoadBakedHoles(terrain);
+                // The heights and holes as saved, so GetHeight, the collider's cook and a server have them before (or
+                // without) a render
+                LoadPages(terrain);
 
                 // What the bakes are compared with: a bake that comes out different puts the terrain on Save Changed Assets
                 terrain.MarkMapsSaved();
 
-                Debug.Log($"[TerrainLoader] '{name}' loaded: heights={terrain.Pages is { HasHeights: true }}, holes={terrain.HasHoles}, " +
-                          $"CookedHeightField={terrain.CookedHeightField != null}");
+                Debug.Log($"[TerrainLoader] '{name}' loaded: heights={terrain.Pages is { HasHeights: true }}, holes={terrain.HasHoles}");
 
                 MessageDispatcher.Send("TerrainLoaded", terrain);
 
@@ -92,152 +80,59 @@ namespace Freefall.Assets.Loaders
         }
 
         /// <summary>
-        /// The PhysX height field cooked when <paramref name="terrain"/> was last saved (its CollisionMeshData subasset),
-        /// or null. It holds the heights and holes as they were saved: Terrain.CookedHeightFieldAsync takes it only while
-        /// they still are. Main thread.
+        /// Reads the pages file into the CPU store (Terrain.Pages) and leaves its heights for the renderer to upload
+        /// (Terrain.PendingPagesUpload). A terrain never saved since 4c has none: its stamps bake it, and the first bake
+        /// puts it on Save Changed Assets. Pages of another density than the terrain's (changed and not saved) are left
+        /// for the stamps too.
         /// </summary>
-        internal static PhysX.HeightField LoadSavedCook(Terrain terrain)
-        {
-            var guid = terrain?.Guid;
-            try
-            {
-                if (string.IsNullOrEmpty(guid)) return null;
-
-                var meta = AssetDatabase.GetMeta(guid);
-                if (meta == null) return null;
-
-                var collisionSub = meta.SubAssets.FirstOrDefault(
-                    s => s.Type == nameof(CollisionMeshData));
-                if (collisionSub == null) return null;
-
-                var physxPath = AssetDatabase.ResolveCachePathByGuid(collisionSub.Guid);
-                if (physxPath == null || !Artifacts.Exists(physxPath)) return null;
-
-                var packer = new CollisionMeshPacker();
-                using var stream = Artifacts.Open(physxPath);
-                var cooked = packer.Read(stream);
-
-                var hf = PhysicsWorld.Physics.CreateHeightField(new MemoryStream(cooked.CookedBytes));
-                Debug.LogAlways($"[TerrainLoader] '{terrain.Name}': collision height field from the saved cook ({cooked.CookedBytes.Length / 1024} KB)");
-                return hf;
-            }
-            catch (Exception ex)
-            {
-                Debug.LogWarning("TerrainLoader", $"Failed to load cooked HeightField '{guid}': {ex.Message}");
-                return null;
-            }
-        }
-
-        /// <summary>
-        /// Loads the saved baked heightmap DDS into PendingBakedHeightmapBytes for GPU upload, and cuts it into the CPU
-        /// store's pages (Terrain.Pages) at once, so GetHeight() works before the first render.
-        /// </summary>
-        private void LoadBakedHeightmap(Terrain terrain)
+        private static void LoadPages(Terrain terrain)
         {
             terrain.SetPages(null);
-            if (terrain.BakedHeightmapRef == null || string.IsNullOrEmpty(terrain.BakedHeightmapRef.Guid))
+            terrain.PendingPagesUpload = false;
+            if (string.IsNullOrEmpty(terrain.PagesGuid))
                 return;
 
-            var bytes = LoadDdsBytes(terrain.BakedHeightmapRef.Guid);
-            if (bytes == null) return;
-
-            terrain.PendingBakedHeightmapBytes = bytes;
-
-            int pixelDataLen = bytes.Length;
-            int resolution = (int)Math.Sqrt(pixelDataLen / 2);
-            if (resolution * resolution * 2 == pixelDataLen)
+            var path = TerrainPagesFile.PathOf(terrain.PagesGuid);
+            if (!Artifacts.Exists(path))
             {
-                terrain.SetPages(TerrainPages.FromFlat(MemoryMarshal.Cast<byte, ushort>(bytes), resolution));
-                terrain.PagesStampsHash = terrain.BakedStampsHash;   // the saved map's heights, from the saved map's stamps
-                Debug.Log($"[TerrainLoader] Baked heightmap loaded into {terrain.Pages!.PagesAcross}² pages: {resolution}x{resolution}");
-            }
-            else
-            {
-                Debug.Log($"[TerrainLoader] Baked heightmap loaded: {bytes.Length} bytes, not a square R16 map (no CPU heights until a readback)");
-            }
-        }
-
-        /// <summary>
-        /// Loads the saved hole mask (one byte per height sample, row by row along +Z) into the CPU store's pages. The
-        /// renderer rebakes it from the hole stamps once it draws; until then (and in a process that never draws) this is
-        /// what holds. A mask of another size than the heights is left out: the stamps cut it again.
-        /// </summary>
-        private void LoadBakedHoles(Terrain terrain)
-        {
-            if (terrain.BakedHolesRef == null || string.IsNullOrEmpty(terrain.BakedHolesRef.Guid))
-                return;
-
-            var bytes = LoadDdsBytes(terrain.BakedHolesRef.Guid);
-            if (bytes == null) return;
-
-            int resolution = (int)Math.Sqrt(bytes.Length);
-            if (resolution * resolution != bytes.Length)
-            {
-                Debug.LogWarning("TerrainLoader", $"Hole mask of '{terrain.Name}' is {bytes.Length} bytes, not a square R8 image; ignored");
+                Debug.LogWarning("TerrainLoader", $"'{terrain.Name}': its pages file {terrain.PagesGuid} is missing; the stamps bake the heights");
                 return;
             }
-            if (terrain.Pages is { } pages && pages.Resolution != resolution)
-            {
-                Debug.LogWarning("TerrainLoader", $"Hole mask of '{terrain.Name}' is {resolution}², its heights {pages.Resolution}²; left for the stamps to cut again");
-                return;
-            }
-
-            var edit = (terrain.Pages ?? TerrainPages.Empty(resolution)).Edit();
-            edit.SetHolesFlat(bytes);
-            terrain.SetPages(edit.Done());
-            Debug.Log($"[TerrainLoader] Hole mask loaded: {resolution}x{resolution}, {terrain.Pages!.HolePages} page(s) with holes");
-        }
-
-        /// <summary>
-        /// Reads raw DDS bytes from a subasset cache file by GUID.
-        /// </summary>
-        private byte[] LoadDdsBytes(string guid)
-        {
-            if (string.IsNullOrEmpty(guid)) return null;
-
-            var cachePath = AssetDatabase.ResolveCachePathByGuid(guid);
-            if (cachePath == null || !Artifacts.Exists(cachePath))
-                cachePath = BakedMapFallbackPath(guid);
-            if (!Artifacts.Exists(cachePath)) return null;
 
             try
             {
-                using var stream = Artifacts.Open(cachePath);
-                var data = _ddsPacker.Read(stream);
-                if (data?.Bytes == null || data.Bytes.Length == 0) return null;
+                long started = System.Diagnostics.Stopwatch.GetTimestamp();
+                TerrainPages pages;
+                using (var stream = Artifacts.Open(path))
+                    pages = TerrainPagesFile.Read(stream);
 
-                var bytes = data.Bytes;
-
-                // Check if bytes start with DDS magic ("DDS " = 0x20534444).
-                // If so, strip the DDS header to get raw pixel data.
-                if (bytes.Length > 128 && BitConverter.ToInt32(bytes, 0) == 0x20534444)
+                if (pages.Resolution != terrain.EffectiveHeightmapResolution)
                 {
-                    int headerSize = 128;
-                    // Check for DX10 extended header
-                    if (bytes.Length > 148 && BitConverter.ToInt32(bytes, 84) == 0x30315844)
-                        headerSize = 148;
-
-                    int pixelDataLen = bytes.Length - headerSize;
-                    Debug.Log($"[TerrainLoader] LoadDdsBytes '{guid}': stripped {headerSize}-byte DDS header, {pixelDataLen} pixel bytes");
-                    var pixels = new byte[pixelDataLen];
-                    Array.Copy(bytes, headerSize, pixels, 0, pixelDataLen);
-                    return pixels;
+                    Debug.Log($"[TerrainLoader] '{terrain.Name}': pages saved for {pages.Resolution}² samples, the terrain has {terrain.EffectiveHeightmapResolution}²; the stamps bake it");
+                    return;
                 }
 
-                Debug.Log($"[TerrainLoader] LoadDdsBytes '{guid}': {bytes.Length} raw bytes (no DDS header)");
-                return bytes;
+                terrain.SetPages(pages);
+                terrain.PendingPagesUpload = pages.HasHeights;
+                terrain.PagesStampsHash = terrain.BakedStampsHash;   // the saved heights, from the saved stamps
+                Debug.LogAlways($"[TerrainLoader] '{terrain.Name}': {pages.PagesAcross}² pages read ({pages.HolePages} with holes) " +
+                                $"in {System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalMilliseconds:0} ms");
             }
             catch (Exception ex)
             {
-                Debug.LogWarning("TerrainLoader", $"Failed to load DDS subasset '{guid}': {ex.Message}");
-                return null;
+                Debug.LogWarning("TerrainLoader", $"'{terrain.Name}': reading its pages file failed ({ex.Message}); the stamps bake the heights");
+                terrain.SetPages(null);
+                terrain.PendingPagesUpload = false;
             }
         }
 
         // ── Save ──
 
         /// <summary>
-        /// Save the baked heightmap to cache, then the terrain YAML.
+        /// Save the heights and holes into the pages file, then the terrain YAML. A failure is thrown on, so the asset
+        /// stays changed (AssetManager.SaveAsset clears it only after a save that returned) and the caller reports it:
+        /// swallowed, the editor took a terrain that had not been written off its changed list (16 km at 1 m per
+        /// vertex, 2026-11-07).
         /// </summary>
         public void Save(Asset asset, string savePath)
         {
@@ -245,201 +140,60 @@ namespace Freefall.Assets.Loaders
 
             try
             {
-                // 1. Save baked heightmap (GPU readback → cache)
-                SaveBakedHeightmap(terrain);
+                SavePages(terrain);
                 terrain.MarkMapsSaved();
 
-                // 2. Save YAML definition (includes the BakedHeightmapRef GUID)
+                // The YAML names the pages file (PagesGuid) and the stamps its heights came from
                 NativeImporter.Save(savePath, terrain);
                 Debug.Log($"[TerrainLoader] YAML saved: {savePath}");
             }
             catch (Exception ex)
             {
                 Debug.LogWarning("TerrainLoader", $"Failed to save terrain: {ex.Message}");
+                throw;
             }
         }
 
         /// <summary>
-        /// Reads back baked heightmap from GPU, saves as DDS subasset,
-        /// and cooks + saves the PhysX HeightField as a CollisionMeshData subasset.
+        /// Writes the CPU store into the pages file: the heights the GPU baked (read back once its bakes have settled; a
+        /// readback that is due runs now) and the holes. Nothing to write when nothing changed since the file was read or
+        /// written, or when there are no heights (nothing baked or loaded).
         /// </summary>
-        private void SaveBakedHeightmap(Terrain terrain)
+        private static void SavePages(Terrain terrain)
         {
-            var baker = ComponentCache<TerrainRenderer>.All
-                .FirstOrDefault(r => r.Terrain == terrain)?.Baker;
-            var bytes = baker?.ReadbackBakedHeightmapBytes();
-            if (bytes == null || bytes.Length == 0)
-            {
-                // Not baked since the load: the maps are the saved ones. Their cook is saved again only when it was
-                // made another way (Terrain.CookFormat), from the CPU heights and holes loaded from those same maps.
-                if (terrain.SavedCookFormat != Terrain.CookFormat && terrain.Pages is { HasHeights: true })
-                    SaveCook(terrain);
+            var renderer = ComponentCache<TerrainRenderer>.All.FirstOrDefault(r => r.Terrain == terrain);
+            renderer?.FinishHeightsForSave();
+
+            var pages = terrain.Pages;
+            if (pages is not { HasHeights: true })
                 return;
-            }
 
-            int resolution = baker!.BakedResolution;
+            if (terrain.PagesStampsHash != 0)
+                terrain.BakedStampsHash = terrain.PagesStampsHash;
 
-            // Ensure the BakedHeightmapRef has a GUID
-            if (terrain.BakedHeightmapRef == null)
-                terrain.BakedHeightmapRef = new Texture();
-            if (string.IsNullOrEmpty(terrain.BakedHeightmapRef.Guid))
-                terrain.BakedHeightmapRef.Guid = System.Guid.NewGuid().ToString("N");
+            string path = string.IsNullOrEmpty(terrain.PagesGuid) ? null : TerrainPagesFile.PathOf(terrain.PagesGuid);
+            if (path != null && terrain.MapsAreSaved && File.Exists(path))
+                return;
 
-            // Save baked heightmap DDS, and what it was baked from (written with the YAML after this)
-            SaveDdsSubasset(terrain.BakedHeightmapRef.Guid, bytes);
-            terrain.BakedStampsHash = terrain.HeightmapStampsHash;
-            Debug.Log($"[TerrainLoader] Baked heightmap saved: {bytes.Length} bytes, res={resolution}");
-
-            // The hole mask next to it (CPU data, nothing to read back). No holes = no reference, so a load finds none.
-            if (terrain.Pages is { HasHoles: true } holePages)
+            if (path == null)
             {
-                if (terrain.BakedHolesRef == null)
-                    terrain.BakedHolesRef = new Texture();
-                if (string.IsNullOrEmpty(terrain.BakedHolesRef.Guid))
-                    terrain.BakedHolesRef.Guid = System.Guid.NewGuid().ToString("N");
-                SaveDdsSubasset(terrain.BakedHolesRef.Guid, holePages.FlatHoles()!);   // one flat mask until the pages file (4c)
-                Debug.Log($"[TerrainLoader] Hole mask saved: {holePages.Resolution}x{holePages.Resolution}");
-            }
-            else
-            {
-                terrain.BakedHolesRef = null;
+                terrain.PagesGuid = Guid.NewGuid().ToString("N");
+                path = TerrainPagesFile.PathOf(terrain.PagesGuid);
             }
 
-            SaveCook(terrain);
+            long started = System.Diagnostics.Stopwatch.GetTimestamp();
+            long bytes = TerrainPagesFile.Write(path, pages);
+            Debug.LogAlways($"[TerrainLoader] '{terrain.Name}': {pages.PagesAcross}² pages saved ({pages.HolePages} with holes), " +
+                            $"{bytes / 1048576.0:0.0} MB in {System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalMilliseconds:0} ms");
         }
 
-        /// <summary>
-        /// Cooks the PhysX height field from the CPU heights and holes (in sync after a readback, or loaded from the
-        /// saved maps) and saves it as the CollisionMeshData subasset, with the format it was cooked in.
-        /// </summary>
-        private void SaveCook(Terrain terrain)
-        {
-            try
-            {
-                var pages = terrain.Pages;
-                if (pages is not { HasHeights: true })
-                {
-                    Debug.LogWarning("TerrainLoader", "No CPU heights available for PhysX cooking");
-                    return;
-                }
-
-                int rows = pages.Resolution;
-                int cols = pages.Resolution;
-
-                // Diagnostic: the range of the heights
-                int hMin = ushort.MaxValue, hMax = 0;
-                for (int pz = 0; pz < pages.PagesAcross; pz++)
-                    for (int px = 0; px < pages.PagesAcross; px++)
-                    {
-                        var (_, _, w, h) = pages.PageExtent(px, pz);
-                        var page = pages.HeightPage(px, pz);
-                        for (int z = 0; z < h; z++)
-                            foreach (ushort v in page.Slice(z * TerrainPages.PageSamples, w))
-                            {
-                                if (v < hMin) hMin = v;
-                                if (v > hMax) hMax = v;
-                            }
-                    }
-                Debug.Log($"[TerrainLoader] Heights at save: {rows}x{cols}, range=[{hMin / 65535f:F6}..{hMax / 65535f:F6}]");
-
-                var samples = pages.ToSamples();
-                var hfDesc = new HeightFieldDesc
-                {
-                    NumberOfRows = rows,
-                    NumberOfColumns = cols,
-                    Samples = samples,
-                };
-                var cooking = PhysicsWorld.Physics.CreateCooking();
-                var cookedStream = new MemoryStream();
-                cooking.CookHeightField(hfDesc, cookedStream);
-                var cookedBytes = cookedStream.ToArray();
-
-                // Update in-memory CookedHeightField so collider stays in sync
-                cookedStream.Position = 0;
-                var hf = PhysicsWorld.Physics.CreateHeightField(cookedStream);
-                terrain.SetCookedHeightField(hf);
-
-                // Save as CollisionMeshData subasset, with the format it was cooked in (written with the YAML after this)
-                SaveCollisionSubasset(terrain, cookedBytes);
-                terrain.SavedCookFormat = Terrain.CookFormat;
-
-                Debug.Log($"[TerrainLoader] PhysX HeightField cooked + saved: {rows}x{cols}, {cookedBytes.Length} bytes");
-            }
-            catch (Exception ex)
-            {
-                Debug.LogWarning("TerrainLoader", $"Failed to cook/save PhysX HeightField: {ex.Message}");
-            }
-        }
-
-        /// <summary>
-        /// Saves cooked PhysX bytes to the collision subasset in cache.
-        /// Uses AssetDatabase.AddOrUpdateSubAsset to find or create the entry.
-        /// </summary>
-        private void SaveCollisionSubasset(Terrain terrain, byte[] cookedBytes)
-        {
-            if (string.IsNullOrEmpty(terrain.Guid)) return;
-
-            // Find existing or create new CollisionMeshData subasset
-            var meta = AssetDatabase.GetMeta(terrain.Guid);
-            if (meta == null) return;
-
-            var collisionSub = meta.SubAssets.FirstOrDefault(
-                s => s.Type == nameof(CollisionMeshData));
-
-            string subGuid;
-            if (collisionSub != null)
-            {
-                subGuid = collisionSub.Guid;
-            }
-            else
-            {
-                subGuid = AssetDatabase.AddOrUpdateSubAsset(
-                    terrain.Guid, nameof(CollisionMeshData), terrain.Name, hidden: true);
-                if (subGuid == null) return;
-            }
-
-            // Write cooked bytes to cache
-            var cachePath = AssetDatabase.ResolveCachePathByGuid(subGuid);
-            if (cachePath == null)
-            {
-                var cacheDir = AssetDatabase.Project.CacheDirectory;
-                var bucket = subGuid[..2];
-                cachePath = Path.Combine(cacheDir, bucket, $"{subGuid}.physx");
-                Directory.CreateDirectory(Path.GetDirectoryName(cachePath));
-            }
-
-            var packer = new CollisionMeshPacker();
-            using var stream = File.Create(cachePath);
-            packer.Write(stream, new CollisionMeshData { CookedBytes = cookedBytes });
-        }
-
-        /// <summary>
-        /// Writes raw pixel bytes as a DDS subasset to the cache.
-        /// </summary>
-        private void SaveDdsSubasset(string guid, byte[] pixels)
-        {
-            if (string.IsNullOrEmpty(guid) || pixels == null) return;
-
-            var cachePath = AssetDatabase.ResolveCachePathByGuid(guid) ?? BakedMapFallbackPath(guid);
-
-            using var stream = File.Create(cachePath);
-            _ddsPacker.Write(stream, new DdsTextureData(pixels));
-        }
-
-        /// <summary>
-        /// Where a baked map (heightmap, hole mask) lives: no meta lists these GUIDs, so the database does not
-        /// resolve them and they sit in the Cache root as {guid}.dds.
-        /// </summary>
-        private static string BakedMapFallbackPath(string guid) =>
-            Path.Combine(AssetDatabase.Project.CacheDirectory, $"{guid}.dds");
-
-        private static readonly System.Text.RegularExpressions.Regex BakedMapRef = new(
-            @"^\s*(?:BakedHeightmapRef|BakedHolesRef):\s*""?([0-9a-fA-F]{32})""?\s*$",
+        private static readonly System.Text.RegularExpressions.Regex PagesRef = new(
+            @"^\s*PagesGuid:\s*""?([0-9a-fA-F]{32})""?\s*$",
             System.Text.RegularExpressions.RegexOptions.Multiline);
 
         /// <summary>
-        /// The terrain's baked heightmap and hole mask (BakedHeightmapRef, BakedHolesRef), read from its YAML the way
-        /// LoadDdsBytes finds them: through the database, or the Cache-root file no meta lists.
+        /// The terrain's pages file (PagesGuid), read from its YAML: no meta lists it, so the hook gives its path in the
+        /// Cache root, where LoadPages finds it.
         /// </summary>
         public IEnumerable<ImplicitArtifact> GetImplicitDependencies(string guid)
         {
@@ -450,12 +204,10 @@ namespace Freefall.Assets.Loaders
             using (var stream = Artifacts.Open(cachePath))
                 defData = _packer.Read(stream);
 
-            foreach (System.Text.RegularExpressions.Match m in BakedMapRef.Matches(Encoding.UTF8.GetString(defData.YamlBytes)))
+            foreach (System.Text.RegularExpressions.Match m in PagesRef.Matches(Encoding.UTF8.GetString(defData.YamlBytes)))
             {
-                var mapGuid = m.Groups[1].Value;
-                yield return AssetDatabase.ResolveCachePathByGuid(mapGuid) != null
-                    ? new ImplicitArtifact(mapGuid)
-                    : new ImplicitArtifact(mapGuid, BakedMapFallbackPath(mapGuid), nameof(DdsTextureData));
+                var pagesGuid = m.Groups[1].Value;
+                yield return new ImplicitArtifact(pagesGuid, TerrainPagesFile.PathOf(pagesGuid), "TerrainPages");
             }
         }
     }

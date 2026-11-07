@@ -77,24 +77,15 @@ namespace Freefall.Assets
         }
 
         /// <summary>
-        /// The heights of a flat R16 map (row by row along +Z, the saved heightmap's layout), cut into pages, with the holes
-        /// of <paramref name="holesFrom"/> when it is of this size.
+        /// A store of these pages (TerrainPagesFile.Read): one entry per page, row by row along +Z, each PageLength long or
+        /// null. They are the store's from then on.
         /// </summary>
-        public static TerrainPages FromFlat(ReadOnlySpan<ushort> samples, int resolution, TerrainPages? holesFrom = null)
+        internal static TerrainPages FromPages(int resolution, bool hasHeights, ushort[]?[] heights, byte[]?[] holes)
         {
-            if (samples.Length < resolution * resolution)
-                throw new ArgumentException($"{samples.Length} samples for a terrain of {resolution}²");
-            var edit = (holesFrom != null && holesFrom.Resolution == resolution ? holesFrom : Empty(resolution)).Edit();
-            for (int pz = 0; pz < edit.PagesAcross; pz++)
-                for (int px = 0; px < edit.PagesAcross; px++)
-                {
-                    var page = new ushort[PageLength];
-                    var (x0, z0, w, h) = edit.Store.PageExtent(px, pz);
-                    for (int z = 0; z < h; z++)
-                        samples.Slice((z0 + z) * resolution + x0, w).CopyTo(page.AsSpan(z * PageSamples, w));
-                    edit.SetHeights(px, pz, page);
-                }
-            return edit.Done(hasHeights: true);
+            int count = PagesFor(resolution) * PagesFor(resolution);
+            if (heights.Length != count || holes.Length != count)
+                throw new ArgumentException($"{heights.Length} height and {holes.Length} hole pages for {count}");
+            return new TerrainPages(resolution, hasHeights, heights, holes);
         }
 
         /// <summary>The samples page (px, pz) holds: its first sample and how many along X and Z (PageSamples, fewer on a
@@ -261,43 +252,40 @@ namespace Freefall.Assets
             }
         }
 
-        /// <summary>The hole mask as one flat map (Resolution², row by row along +Z), or null without holes.</summary>
-        public byte[]? FlatHoles()
-        {
-            if (_holePages == 0) return null;
-            var flat = new byte[Resolution * Resolution];
-            CopyHoles(0, 0, Resolution, Resolution, flat, Resolution);
-            return flat;
-        }
-
         // ── PhysX ──
 
         /// <summary>
-        /// The PhysX height field's samples (Resolution², row i = x, column j = z): each height as a 16-bit share of
-        /// MaxHeight, each cell's triangles left out where a hole opens its middle. Rows in parallel. Any thread.
+        /// Page (px, pz)'s PhysX height field samples, the page's own extent (<see cref="PageExtent"/>: w × h, row i = x,
+        /// column j = z, so the field lies along the terrain's X and Z): each height as a 15-bit share of MaxHeight, each
+        /// cell's triangles left out where a hole opens its middle. A page's field and its neighbour's share their edge
+        /// samples, so the ground has no seam. Until 4c (2026-11-07) one field held the whole terrain (ToSamples). Any
+        /// thread.
+        ///
+        /// PhysX.Net's HeightFieldSample is a class, an object per sample: <paramref name="reuse"/>, an array this gave
+        /// before whose cook is done (PhysX.Net copies the samples out when it cooks), is filled again when it is the
+        /// size this page needs. Allocated anew, the samples took 10.5 of a worker's 17 s cooking a 16 km terrain at 1 m
+        /// per vertex (268 million objects).
         /// </summary>
-        public HeightFieldSample[] ToSamples()
+        public HeightFieldSample[] PhysXSamples(int px, int pz, HeightFieldSample[]? reuse = null)
         {
-            int n = Resolution;
-            var samples = new HeightFieldSample[n * n];
-            System.Threading.Tasks.Parallel.For(0, n, i =>
-            {
-                for (int j = 0; j < n; j++)
+            var (x0, z0, w, h) = PageExtent(px, pz);
+            var page = _heights[pz * PagesAcross + px];
+            var samples = reuse != null && reuse.Length == w * h ? reuse : new HeightFieldSample[w * h];
+            for (int i = 0; i < w; i++)
+                for (int j = 0; j < h; j++)
                 {
                     // As from the float[,] before 4b: the share as a float, then to 15 bits
-                    short storedHeight = (short)(Sample01(i, j) * short.MaxValue);
+                    float share = page != null ? page[j * PageSamples + i] / 65535.0f : 0f;
+                    short storedHeight = (short)(share * short.MaxValue);
 
                     // A sample's two materials are those of the cell it is the low corner of; material 127
-                    // (PxHeightFieldMaterial::eHOLE) leaves the triangle out
-                    byte material = IsHoleCell(i, j) ? PhysicsHelper.HoleMaterial : (byte)0;
-                    samples[i * n + j] = new HeightFieldSample
-                    {
-                        MaterialIndex0 = new BitAndByte(material, true),
-                        MaterialIndex1 = new BitAndByte(material, false),
-                        Height = storedHeight,
-                    };
+                    // (PxHeightFieldMaterial::eHOLE) leaves the triangle out. The far row and column have no cell here.
+                    byte material = i < w - 1 && j < h - 1 && IsHoleCell(x0 + i, z0 + j) ? PhysicsHelper.HoleMaterial : (byte)0;
+                    var sample = samples[i * h + j] ??= new HeightFieldSample();
+                    sample.MaterialIndex0 = new BitAndByte(material, true);
+                    sample.MaterialIndex1 = new BitAndByte(material, false);
+                    sample.Height = storedHeight;
                 }
-            });
             return samples;
         }
 
@@ -360,28 +348,8 @@ namespace Freefall.Assets
                 _holes[pz * PagesAcross + px] = page;
             }
 
-            /// <summary>Every page's holes from a flat mask of this size (row by row along +Z); null or all ground = none.</summary>
-            public void SetHolesFlat(ReadOnlySpan<byte> mask)
-            {
-                int res = Resolution;
-                for (int pz = 0; pz < PagesAcross; pz++)
-                    for (int px = 0; px < PagesAcross; px++)
-                    {
-                        byte[]? page = null;
-                        if (!mask.IsEmpty)
-                        {
-                            var (x0, z0, w, h) = Store.PageExtent(px, pz);
-                            for (int z = 0; z < h; z++)
-                            {
-                                var row = mask.Slice((z0 + z) * res + x0, w);
-                                if (page == null && row.IndexOfAnyExcept((byte)0) < 0) continue;
-                                page ??= new byte[PageLength];
-                                row.CopyTo(page.AsSpan(z * PageSamples, w));
-                            }
-                        }
-                        _holes[pz * PagesAcross + px] = page;
-                    }
-            }
+            /// <summary>No hole anywhere from now on.</summary>
+            public void ClearHoles() => Array.Clear(_holes);
 
             /// <summary>Page (px, pz)'s holes as they stand in this edit.</summary>
             public byte[]? Holes(int px, int pz) => _holes[pz * PagesAcross + px];

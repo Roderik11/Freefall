@@ -718,7 +718,10 @@ namespace Freefall.Graphics
                 _commandQueue.ExecuteCommandList(commandList);
                 _commandQueue.Signal(fence, 1);
             }
-            // Use event-based wait instead of spin-polling — yields CPU to GPU driver
+            // Use event-based wait instead of spin-polling — yields CPU to GPU driver. Until the list has run, however
+            // long the work queued before it takes: callers read what it wrote as soon as this returns. A 5 s cap
+            // returned early behind a 16 km terrain's bake at 1 m per vertex, and the height readback read its first
+            // batch of pages before the copy into it ran (all zeros: the first row of pages saved flat, 2026-11-07).
             if (fence.CompletedValue < 1)
             {
                 if (fence.CompletedValue == ulong.MaxValue) { IsDeviceLost = true; }
@@ -726,7 +729,15 @@ namespace Freefall.Graphics
                 {
                     using var waitEvent = new AutoResetEvent(false);
                     fence.SetEventOnCompletion(1, waitEvent.SafeWaitHandle.DangerousGetHandle());
-                    waitEvent.WaitOne(5000);
+                    long waitStarted = System.Diagnostics.Stopwatch.GetTimestamp();
+                    while (!waitEvent.WaitOne(5000))
+                    {
+                        ulong done = fence.CompletedValue;
+                        if (done == ulong.MaxValue || _device.DeviceRemovedReason.Failure) { IsDeviceLost = true; break; }
+                        if (done >= 1) break;
+                        Debug.LogWarning("GraphicsDevice",
+                            $"SubmitAndWait: the GPU is still busy after {System.Diagnostics.Stopwatch.GetElapsedTime(waitStarted).TotalSeconds:0} s; waiting on");
+                    }
                     if (fence.CompletedValue == ulong.MaxValue) IsDeviceLost = true;
                 }
             }
