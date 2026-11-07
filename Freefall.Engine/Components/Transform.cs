@@ -168,8 +168,12 @@ namespace Freefall.Components
         /// Cached world matrix — lazy recompute only when dirty. Safe to read from several threads at once while nobody
         /// writes the transform (a parallel loop reading others'): it is computed whole and stored before the flag is
         /// cleared, so a reader that finds it clean finds the new values, and two that find it dirty compute the same.
+        /// Setting it decomposes it into scale, rotation and position, which rounds them: derived, never saved
+        /// (DontSerialize). The scene loader copied it after Position, Rotation and Scale until 2026-11-07, so every load
+        /// moved rotations and scales by a float bit (EntitySerializer.CopyFields).
         /// </summary>
         [System.ComponentModel.Browsable(false)]
+        [Freefall.Reflection.DontSerialize]
         public Matrix4x4 Matrix
         {
             get
@@ -204,6 +208,7 @@ namespace Freefall.Components
         /// Backward-compatible alias for Matrix property.
         /// </summary>
         [System.ComponentModel.Browsable(false)]
+        [Freefall.Reflection.DontSerialize]
         public Matrix4x4 WorldMatrix
         {
             get => Matrix;

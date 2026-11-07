@@ -559,7 +559,11 @@ namespace Freefall.Serialization
             var mapping = Reflector.GetMapping(source.GetType());
             foreach (var field in mapping)
             {
-                if (!field.CanWrite) continue;
+                // What was read, as the writer chose it: a member that is not saved is derived from those that are. The
+                // transform's Matrix and WorldMatrix were copied after Position, Rotation and Scale, and their setter
+                // decomposes, so every load moved rotations and scales by a float bit (2026-11-07: 38 of TestWorld's
+                // height stamps, whose hash then differed from the saved heights' and the terrain baked again in play)
+                if (!field.CanWrite || field.Ignored) continue;
                 // Never overwrite Entity backref — it's set by AddComponent
                 if (field.Name == "Entity") continue;
                 var value = field.GetValue(source);
