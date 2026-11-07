@@ -44,6 +44,19 @@ namespace Freefall.Components
         [Description(@"Height of the surface above the spline, i.e. the water depth when the spline carries the bed heights")]
         public float Depth = 0.9f;
 
+        [ValueRange(0f, 1.5f)]
+        [Description(@"River: how the depth grows with the spline's width (Spline.Widths): Depth x width ^ this. 0 = the same
+         depth everywhere; 1 = in proportion; about 0.7 for a river that deepens as it widens. The spline's Y is then
+         the surface less that depth at each point")]
+        public float DepthWithWidth = 0f;
+
+        /// <summary>
+        /// The water's depth over the spline where the spline's width multiplier is <paramref name="width"/>
+        /// (<see cref="Depth"/> scaled by <see cref="DepthWithWidth"/>).
+        /// </summary>
+        public float DepthAt(float width) =>
+            DepthWithWidth > 0f ? Depth * MathF.Pow(MathF.Max(width, 1e-3f), DepthWithWidth) : Depth;
+
         [ValueRange(-20f, 50f)]
         [Description(@"Lake: grows the surface outward from the spline by this many meters,
          so the water reaches up the shore past the bed outline")]
@@ -662,11 +675,19 @@ namespace Freefall.Components
             var uvs = new List<Vector2>(n * (Columns + 1));
             var indices = new List<uint>((n - 1) * Columns * 6);
 
+            // The water's depth at each cross-section: the same everywhere, or growing with the spline's width there
+            // (DepthWithWidth), so a river can deepen as it widens while its surface keeps falling
+            var depths = new float[n];
+            for (int i = 0; i < n; i++)
+                depths[i] = DepthAt(strip.HalfWidths[i] * 2f / MathF.Max(Width, 1e-3f));
+
             for (int i = 0; i < n; i++)
             {
-                // Fall of the centre line across the two neighbouring cross-sections
+                // Fall of the surface's centre line across the two neighbouring cross-sections (not the bed's: where the
+                // depth changes along the river they differ)
                 int a = Math.Max(0, i - 1), b = Math.Min(n - 1, i + 1);
                 var run = strip.Points[b] - strip.Points[a];
+                run.Y += depths[b] - depths[a];
                 float ground = MathF.Sqrt(run.X * run.X + run.Z * run.Z);
                 float steep = ground > 1e-4f ? MathF.Abs(run.Y) / ground : 0f;
 
@@ -682,7 +703,7 @@ namespace Freefall.Components
                 {
                     float f = (float)c / Columns;
                     var p = Vector3.Lerp(left, right, f);
-                    p.Y += Depth;
+                    p.Y += depths[i];
                     verts.Add(p);
                     flow.Add(new Vector3(dir.X, steep, dir.Y));
                     uvs.Add(new Vector2(strip.ArcLengths[i], f * across));

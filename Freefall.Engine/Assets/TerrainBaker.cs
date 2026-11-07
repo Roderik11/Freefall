@@ -262,6 +262,14 @@ namespace Freefall.Assets
             public Vector2 Offset, MaskCenter;
             public float MaskRadius, MaskFalloff;
 
+            // Noise along the entity's spline instead of the circle (HeightNoiseStamp on a spline): its samples in the
+            // plan's spline points, radius and falloff in terrain UV (scaled by the spline's widths as any spline stamp's),
+            // and the UV box it reaches; pages outside the box are not dispatched
+            public uint MaskSplineOffset, MaskSplineCount;
+            public float MaskSplineRadius, MaskSplineFalloff;
+            public Vector2 MaskBoundsMin, MaskBoundsMax;
+            public uint Centred;            // HeightNoiseStamp.Centred: the noise around 0
+
             public HeightStepGPU ToGpu() => new()
             {
                 BlendMode = BlendMode, Opacity = Opacity,
@@ -270,10 +278,14 @@ namespace Freefall.Assets
                 Lacunarity = Lacunarity, Persistence = Persistence, Offset = Offset, Seed = Seed,
                 TerraceSteps = TerraceSteps, TerraceSmoothness = TerraceSmoothness,
                 MaskCenter = MaskCenter, MaskRadius = MaskRadius, MaskFalloff = MaskFalloff,
+                MaskSplineOffset = MaskSplineOffset, MaskSplineCount = MaskSplineCount,
+                MaskSplineRadius = MaskSplineRadius, MaskSplineFalloff = MaskSplineFalloff,
+                MaskBoundsMin = MaskBoundsMin, MaskBoundsMax = MaskBoundsMax,
+                NoiseCentred = Centred,
             };
         }
 
-        /// <summary>A step's parameters for the GPU: terrain_height_bake.hlsl BakeStep, 96 bytes.</summary>
+        /// <summary>A step's parameters for the GPU: terrain_height_bake.hlsl BakeStep, 144 bytes.</summary>
         [StructLayout(LayoutKind.Sequential)]
         internal struct HeightStepGPU
         {
@@ -289,6 +301,11 @@ namespace Freefall.Assets
             public float TerraceSmoothness;
             public Vector2 MaskCenter;
             public float MaskRadius, MaskFalloff;
+            public uint MaskSplineOffset, MaskSplineCount;
+            public float MaskSplineRadius, MaskSplineFalloff;
+            public Vector2 MaskBoundsMin, MaskBoundsMax;
+            public uint NoiseCentred;
+            public uint _pad0, _pad1, _pad2;
         }
 
         /// <summary>
@@ -518,8 +535,31 @@ namespace Freefall.Assets
                             Seed = (uint)noise.Seed,
                             TerraceSteps = (uint)Math.Max(0, noise.TerraceSteps),
                             TerraceSmoothness = noise.TerraceSmoothness,
+                            Centred = noise.Centred ? 1u : 0u,
                         };
-                        if (!noise.IsGlobal)
+                        if (!noise.IsGlobal && noise.IsSplineMode)
+                        {
+                            // Along the entity's spline: its corridor (or closed area) with Radius and Falloff scaled by
+                            // the spline's widths, weighed as any spline stamp's shape (EvaluateStampWeightEx), e.g. pools
+                            // and bars along a river's bed. A spline with too few points makes no noise at all
+                            if (!BuildSplinePoints(noise, terrainOrigin, terrainSize, maxHeight, 0f, plan.SplinePoints,
+                                    out uint offset, out uint count, out float uvRadius))
+                                break;
+                            float uvScale = 1f / Math.Max(terrainSize.X, terrainSize.Y);
+                            step.MaskSplineOffset = offset;
+                            step.MaskSplineCount = count;
+                            step.MaskSplineRadius = uvRadius;
+                            step.MaskSplineFalloff = noise.Falloff * uvScale;
+                            var reach = new HeightStampDescriptorGPU
+                            {
+                                Radius = uvRadius, Falloff = step.MaskSplineFalloff,
+                                SplinePointOffset = offset, SplinePointCount = count,
+                            };
+                            StampBounds(ref reach, plan.SplinePoints, false);
+                            step.MaskBoundsMin = reach.BoundsMin;
+                            step.MaskBoundsMax = reach.BoundsMax;
+                        }
+                        else if (!noise.IsGlobal)
                         {
                             // Radial fade around the entity: full strength at the centre, gone at Radius + Falloff.
                             // The kernel's mask is 1 - (dist / radius)^exponent; a short falloff means a hard edge.
@@ -906,11 +946,25 @@ namespace Freefall.Assets
                     {
                         EnsureNoiseLUT();
                         _cs.SetPushConstant(k, "NoiseLUT", _noiseLUTSRV);
+                        _cs.SetPushConstant(k, "SplineBuf",
+                            plan.SplinePoints.Count > 0 && _heightStampSplineBuffer != null ? _heightStampSplineBuffer.SrvIndex : 0u);
                     }
                     _cs.SetPushConstant(k, "StepIndex", (uint)s);
+                    float lastSample = Math.Max(plan.Resolution - 1, 1);
                     for (int py = pages.py0; py < pages.py1; py++)
                         for (int px = pages.px0; px < pages.px1; px++)
+                        {
+                            // Noise along a spline: only the pages its corridor reaches (a river's walk over every
+                            // sample of the map would cost as much as every stamp of it together)
+                            if (step.MaskSplineCount != 0)
+                            {
+                                var box = plan.PageBox(px, py);
+                                if (box.x1 / lastSample < step.MaskBoundsMin.X || box.x0 / lastSample > step.MaskBoundsMax.X ||
+                                    box.y1 / lastSample < step.MaskBoundsMin.Y || box.y0 / lastSample > step.MaskBoundsMax.Y)
+                                    continue;
+                            }
                             DispatchPage(k, cmd, plan, px, py);
+                        }
                 }
                 cmd.ResourceBarrierUnorderedAccessView(_pool.Texture);
             }

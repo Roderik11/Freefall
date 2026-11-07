@@ -53,7 +53,7 @@ cbuffer PushConstants : register(b3)
     uint CompareCount;       // 23
 };
 
-// One step of the plan (C# TerrainBaker.HeightStepGPU), 96 bytes
+// One step of the plan (C# TerrainBaker.HeightStepGPU), 144 bytes
 struct BakeStep
 {
     uint   BlendMode;          // 0=Set, 1=Add, 2=Max, 3=Lerp, 4=Min
@@ -78,6 +78,15 @@ struct BakeStep
     float2 MaskCenter;         // world X and Z of the radial mask's centre, metres
     float  MaskRadius;         // metres, 0 = no mask (the whole terrain)
     float  MaskFalloff;        // mask edge falloff exponent
+    // Noise along the entity's spline (HeightNoiseStamp on a spline) instead of the circle
+    uint   MaskSplineOffset;   // its samples in the spline buffer
+    uint   MaskSplineCount;    // 0 = no spline (high bit = closed area)
+    float  MaskSplineRadius;   // terrain UV, scaled by the samples' widths as any spline stamp's
+    float  MaskSplineFalloff;
+    float2 MaskBoundsMin;      // terrain UV box it reaches
+    float2 MaskBoundsMax;
+    uint   NoiseCentred;       // HeightNoiseStamp.Centred: the noise around 0 (-1 .. 1), so Add digs as much as it raises
+    uint   _pad0, _pad1, _pad2;
 };
 
 BakeStep LoadStep()
@@ -277,6 +286,8 @@ float fbmNoise(Texture2D<float2> lut, float2 p, uint type, uint octaves,
     #undef OCTAVE_UV
 }
 
+#include "terrain_stamp_common.hlsli"
+
 // ── CS_NoiseLayer: fractal noise in world metres (a pattern that stays where it is whatever the terrain's size) ──
 [numthreads(8, 8, 1)]
 void CS_NoiseLayer(uint3 dtid : SV_DispatchThreadID)
@@ -285,6 +296,20 @@ void CS_NoiseLayer(uint3 dtid : SV_DispatchThreadID)
     if (!RegionSample(dtid, sid)) return;
     RWTexture2DArray<float> Output = ResourceDescriptorHeap[OutputIdx];
     BakeStep step = LoadStep();
+
+    // Along a spline: weighed by its shape as a spline stamp is, the result faded in by that weight (so Set and Min
+    // fade at the edges too); nothing at all outside its reach
+    float splineWeight = 1.0;
+    if (step.MaskSplineCount != 0)
+    {
+        float2 uv = SampleTerrainUV(sid);
+        if (any(uv < step.MaskBoundsMin) || any(uv > step.MaskBoundsMax)) return;
+        StructuredBuffer<StampSplinePoint> splinePoints = ResourceDescriptorHeap[SplineBufIdx];
+        float nearestH, nearestHalfW;
+        splineWeight = EvaluateStampWeightEx(uv, float2(0, 0), step.MaskSplineRadius, step.MaskSplineFalloff,
+            step.MaskSplineOffset, step.MaskSplineCount, 0, 0, 0, splinePoints, nearestH, nearestHalfW, false, false);
+        if (splineWeight <= 0) return;
+    }
 
     Texture2D<float2> NoiseLUT = ResourceDescriptorHeap[NoiseLUTIdx];
 
@@ -304,6 +329,10 @@ void CS_NoiseLayer(uint3 dtid : SV_DispatchThreadID)
         noise = lerp(quantized, quantized + smooth_frac, step.TerraceSmoothness);
     }
 
+    // Centred: around 0, so Add digs as much as it raises (the LUT and the fBm are 0..1)
+    if (step.NoiseCentred != 0)
+        noise = noise * 2.0 - 1.0;
+
     float value = noise * step.Amplitude;
 
     // ── Spatial mask (radial falloff) ──
@@ -317,7 +346,7 @@ void CS_NoiseLayer(uint3 dtid : SV_DispatchThreadID)
 
     uint3 at = OutTexel(sid);
     float prev = Output[at];
-    Output[at] = Blend(prev, value, step.BlendMode, step.Opacity);
+    Output[at] = lerp(prev, Blend(prev, value, step.BlendMode, step.Opacity), splineWeight);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

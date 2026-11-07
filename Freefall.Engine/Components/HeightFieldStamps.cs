@@ -12,9 +12,11 @@ namespace Freefall.Components
 
     /// <summary>
     /// Procedural terrain relief: fractal noise composited into the heightmap at this stamp's Priority.
-    /// Global covers the terrain; Local fades the noise out over Radius + Falloff around the entity
-    /// (a spline on the entity is ignored). A global noise stamp with BlendMode Set at the lowest
-    /// priority is the classic generated base terrain.
+    /// Global covers the terrain; Local fades the noise out over Radius + Falloff around the entity, or, when the
+    /// entity has a Spline, along it as any spline stamp's shape: an open spline's corridor or a closed one's area,
+    /// Radius and Falloff scaled by the spline's Widths (since 2026-11-07: pools and bars along a river's bed, on the
+    /// river's own entity). A global noise stamp with BlendMode Set at the lowest priority is the classic generated
+    /// base terrain.
     ///
     /// The pattern lies in world metres (since 2026-11-07; it was laid over the terrain's UV), so it stays where it is
     /// whatever the terrain's size and a page of the terrain bakes it by itself (TERRAIN_PAGES_PLAN.md stage 3).
@@ -45,6 +47,13 @@ namespace Freefall.Components
         /// <summary>Amplitude of the noise, as a fraction of the terrain's MaxHeight.</summary>
         [ValueRange(0f, 1f)]
         public float Amplitude = 0.3f;
+
+        /// <summary>
+        /// The noise around 0 (-Amplitude .. +Amplitude) instead of 0 .. Amplitude, so Add digs as much as it raises:
+        /// pools and bars along a river's bed. Off, Add only ever raises (by about half the Amplitude on average:
+        /// fractal noise averages its octaves towards the middle).
+        /// </summary>
+        public bool Centred = false;
 
         /// <summary>Per-octave frequency multiplier (lacunarity).</summary>
         [ValueRange(1f, 4f)]
