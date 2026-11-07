@@ -15,6 +15,9 @@ namespace Freefall.Components
     /// Global covers the terrain; Local fades the noise out over Radius + Falloff around the entity
     /// (a spline on the entity is ignored). A global noise stamp with BlendMode Set at the lowest
     /// priority is the classic generated base terrain.
+    ///
+    /// The pattern lies in world metres (since 2026-11-07; it was laid over the terrain's UV), so it stays where it is
+    /// whatever the terrain's size and a page of the terrain bakes it by itself (TERRAIN_PAGES_PLAN.md stage 3).
     /// </summary>
     [Icon("icon_heightstamp.png")]
     public class HeightNoiseStamp : TerrainStamp
@@ -32,9 +35,12 @@ namespace Freefall.Components
         [ValueRange(1, 12)]
         public int Octaves = 6;
 
-        /// <summary>Base frequency. Lower = broader features.</summary>
-        [ValueRange(0.01f, 5f)]
-        public float Frequency = 0.5f;
+        /// <summary>
+        /// The width of the broadest features, in metres: a cell of the first octave. Each octave after it is
+        /// Lacunarity times finer. Eldermoor's rolling ground is 170.67 (it had Frequency 1.5 over 4096 m).
+        /// </summary>
+        [ValueRange(10f, 5000f)]
+        public float FeatureSize = 500f;
 
         /// <summary>Amplitude of the noise, as a fraction of the terrain's MaxHeight.</summary>
         [ValueRange(0f, 1f)]
@@ -48,7 +54,7 @@ namespace Freefall.Components
         [ValueRange(0f, 1f)]
         public float Persistence = 0.5f;
 
-        /// <summary>Offset for panning the noise pattern (terrain UV units).</summary>
+        /// <summary>Metres the pattern is moved by, along world X and Z.</summary>
         public Vector2 Offset = Vector2.Zero;
 
         /// <summary>Seed for the noise permutation (separate from the edge-noise seed).</summary>
@@ -64,88 +70,5 @@ namespace Freefall.Components
         public float TerraceSmoothness = 0.3f;
 
         protected override Color4 GizmoColor => new Color4(0.55f, 0.85f, 0.35f, 1f);
-    }
-
-    /// <summary>
-    /// Noise-based erosion filter (runevision Advanced Terrain Erosion Filter): carves branching gullies
-    /// into the height built by lower-priority stamps. Single GPU dispatch.
-    ///
-    /// Always covers the whole terrain; the stamp's shape is ignored. Put it above the stamps that
-    /// build the relief and below roads and building pads, which should stay smooth.
-    /// </summary>
-    [Icon("icon_heightstamp.png")]
-    public class HeightErosionStamp : TerrainStamp
-    {
-        [Category("Blend")]
-        public HeightBlendMode BlendMode = HeightBlendMode.Set;
-
-        [ValueRange(0f, 1f)]
-        public float Opacity = 1.0f;
-
-        /// <summary>Overall horizontal + vertical scale of erosion features.</summary>
-        [Category("Erosion")]
-        [ValueRange(0.01f, 1f)]
-        public float Scale = 0.15f;
-
-        /// <summary>Erosion magnitude. Higher = deeper gullies and sharper ridges.</summary>
-        [ValueRange(0.01f, 1f)]
-        public float Strength = 0.22f;
-
-        /// <summary>Gully visibility weight. 0 = sharp peaks only, 1 = full gullies.</summary>
-        [ValueRange(0f, 1f)]
-        public float GullyWeight = 0.5f;
-
-        /// <summary>Detail level. Lower values restrict fine gullies to steep slopes.</summary>
-        [ValueRange(0.1f, 5f)]
-        public float Detail = 1.5f;
-
-        /// <summary>Number of gully octaves. More = finer branching detail.</summary>
-        [ValueRange(1, 8)]
-        public int Octaves = 5;
-
-        /// <summary>Frequency multiplier per octave.</summary>
-        [ValueRange(1.5f, 4f)]
-        public float Lacunarity = 2.0f;
-
-        /// <summary>Amplitude decay per octave.</summary>
-        [ValueRange(0.1f, 1f)]
-        public float Gain = 0.5f;
-
-        /// <summary>Rounding of ridges (mountain crests). 0 = sharp, higher = softer.</summary>
-        [Category("Rounding")]
-        [ValueRange(0f, 2f)]
-        public float RidgeRounding = 0.1f;
-
-        /// <summary>Rounding of creases (valley bottoms). 0 = sharp V-shaped, higher = smoother.</summary>
-        [ValueRange(0f, 2f)]
-        public float CreaseRounding = 0f;
-
-        /// <summary>Phacelle cell size relative to stripe width. ~0.7 is a good default.</summary>
-        [Category("Advanced")]
-        [ValueRange(0.3f, 1.5f)]
-        public float CellScale = 0.7f;
-
-        /// <summary>Normalization of gully magnitudes. Higher = more consistent ridges, risk of loop artifacts.</summary>
-        [ValueRange(0f, 1f)]
-        public float Normalization = 0.5f;
-
-        /// <summary>Slope onset threshold: how quickly erosion ramps up with slope.</summary>
-        [ValueRange(0.1f, 5f)]
-        public float SlopeOnset = 1.25f;
-
-        /// <summary>Assumed slope magnitude for gully directions (overrides actual gradient).</summary>
-        [ValueRange(0f, 2f)]
-        public float AssumedSlope = 0.7f;
-
-        /// <summary>Amount to use assumed slope vs actual gradient. 0 = actual, 1 = fully assumed.</summary>
-        [ValueRange(0f, 1f)]
-        public float AssumedSlopeAmount = 1.0f;
-
-        public HeightErosionStamp()
-        {
-            Shape = StampShape.Global;
-        }
-
-        protected override Color4 GizmoColor => new Color4(0.75f, 0.55f, 0.3f, 1f);
     }
 }

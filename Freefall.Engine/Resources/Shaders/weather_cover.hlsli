@@ -88,7 +88,9 @@ void ShelterTexels(WeatherShelter s, ShelterLevel l, SamplerState anySampler, fl
     shares = 0.0;
     if (any(uv < 0.0) || any(uv >= 1.0))
         return;
-    Texture2D<uint> map = ResourceDescriptorHeap[l.Map];
+    // The level differs between lanes (ShelterBlend's first and second by the distance from the eye; grass_compute's
+    // SnowBurial picks level 0 or 1 per root): unmarked, AMD reads one lane's map for the whole wave
+    Texture2D<uint> map = ResourceDescriptorHeap[NonUniformResourceIndex(l.Map)];
     uint4 v = map.GatherRed(anySampler, uv);
     shares = float4(v & 0xFFFFu) / 65535.0;
     tops = s.MinY + float4(v >> 16) / 65535.0 * s.RangeY - (1.0 - step(1e-6, shares)) * 1e9;

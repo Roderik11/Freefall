@@ -4,74 +4,68 @@
 //   CS_InfluenceLayer  a run of HeightStamps (flatten / heightmap pattern, radial or spline)
 //   CS_ImportLayer     a global HeightStamp with a heightmap (whole-terrain import)
 //   CS_NoiseLayer      a HeightNoiseStamp
-//   CS_ErosionFilter   a HeightErosionStamp
 // CS_Clear zeroes the heightmap first.
+//
+// Every kernel bakes a box of the terrain's grid (RegionX/Y/W/H), page by page (TERRAIN_PAGES_PLAN.md stage 3): a
+// sample is a function of the stamps and of its integer index in the grid alone, never of the box it was baked in,
+// so a page baked on its own equals the same samples of a whole bake to the bit. No kernel reads a neighbour.
 //
 // Uses push constants (b3) matching engine convention.
 
 #pragma kernel CS_ImportLayer
 #pragma kernel CS_Clear
 #pragma kernel CS_NoiseLayer
-#pragma kernel CS_ErosionFilter
 #pragma kernel CS_InfluenceLayer
 
 // Push constants (root parameter 0, register b3) — bindless indices + params
 cbuffer PushConstants : register(b3)
 {
-    uint SourceIdx;       // slot 0 — SRV: source heightmap texture (import) / current heightmap (erosion)
-    uint OutputIdx;       // slot 1 — UAV: output RWTexture2D<float>
-    uint StampBufIdx;     // slot 2 — SRV: StructuredBuffer<HeightStampDescriptor> (influence)
-    uint BlendMode;       // slot 3 — 0=Set, 1=Add, 2=Max, 3=Lerp, 4=Min
-    float Opacity;        // slot 4 — step opacity [0..1]
-    uint StampCount;      // slot 5 — number of stamp descriptors in this run (influence)
-    float BrushRadius;    // slot 6 — reused per kernel, see the aliases below
-    float BrushFalloff;   // slot 7 — reused per kernel
-    float BrushTargetHeight; // slot 8 — import: height bias (normalized); erosion: assumed slope amount
+    uint SourceIdx;          // 0  SRV: the imported heightmap (import)
+    uint OutputIdx;          // 1  UAV: the heightmap, RWTexture2D<float>
+    uint StampBufIdx;        // 2  SRV: StructuredBuffer<HeightStampDescriptor>, every descriptor of the bake (influence)
+    uint StampListIdx;       // 3  SRV: StructuredBuffer<uint>, the pages' stamp lists (influence)
+    uint SplineBufIdx;       // 4  SRV: StructuredBuffer<StampSplinePoint> (influence)
+    uint ListStart;          // 5  this page's stamps of this run: list entries ListStart .. ListStart + ListCount
+    uint ListCount;          // 6
+    uint BlendMode;          // 7  0=Set, 1=Add, 2=Max, 3=Lerp, 4=Min (import, noise)
+    float Opacity;           // 8  step opacity [0..1] (import, noise)
 
-    // Slots 9..19 are unused (they carried the paint brush raycast); kept so the slots below stay put.
-    float _unused9;
-    float _unused10;
-    float _unused11;
-    float _unused12;
-    float _unused13;
-    float _unused14;
-    float _unused15;
-    float _unused16;
-    float _unused17;
-    float _unused18;
-    float _unused19;
-    uint StampStart;        // slot 20 — first stamp descriptor of this run (influence)
+    uint RegionX;            // 9  the box baked: its first sample in the terrain's grid and its size, in samples
+    uint RegionY;            // 10
+    uint RegionW;            // 11
+    uint RegionH;            // 12
+    uint GridSamples;        // 13 samples across the terrain (N): sample i at terrain UV i / (N - 1)
+    float OriginX;           // 14 world X and Z of sample (0, 0), metres
+    float OriginZ;           // 15
+    float Spacing;           // 16 metres between samples (Terrain.VertexSpacing)
 
-    // ── Noise layer params (CS_NoiseLayer) ──
-    uint NoiseType;       // slot 21 — 0=Simplex, 1=Perlin, 2=Ridged, 3=Billow
-    uint Octaves;         // slot 22 — number of fBm octaves
-    float Frequency;      // slot 23 — base frequency
-    float Amplitude;      // slot 24 — output amplitude scale
-    float Lacunarity;     // slot 25 — per-octave frequency multiplier
-    float Persistence;    // slot 26 — per-octave amplitude decay
-    float OffsetX;        // slot 27 — world-space noise offset X
-    float OffsetY;        // slot 28 — world-space noise offset Y
-    uint NoiseSeed;       // slot 29 — seed for noise permutation
-    uint ErosionMode;     // slot 30 — 0=Hydraulic, 1=Thermal, 2=Both (reused as NoiseLUTIdx for CS_NoiseLayer)
+    // ── Import (CS_ImportLayer) ──
+    float ImportScale;       // 17 the source's value times this, plus ImportBias (both normalized to MaxHeight)
+    float ImportBias;        // 18
+    float ImportMinX;        // 19 world X and Z where the source's first sample lies, metres
+    float ImportMinZ;        // 20
+    float ImportInvSizeX;    // 21 1 / the metres from its first sample to its last
+    float ImportInvSizeZ;    // 22
 
-    // ── Noise terrace + mask params (CS_NoiseLayer only) ──
-    uint TerraceSteps;    // slot 31 — 0=disabled, N = number of terrace shelves
-    float TerraceSmoothness; // slot 32 — 0=sharp, 1=fully rounded transitions
-    float MaskCenterX;    // slot 33 — UV-space mask center X
-    float MaskCenterY;    // slot 34 — UV-space mask center Y
-    float MaskRadius;     // slot 35 — UV-space radius, 0=disabled (full terrain)
-    float MaskFalloff;    // slot 36 — mask edge falloff exponent
+    // ── Noise (CS_NoiseLayer) ──
+    uint NoiseLUTIdx;        // 23 SRV: the tileable noise LUT
+    uint NoiseType;          // 24 0=Simplex, 1=Perlin, 2=Ridged, 3=Billow
+    uint Octaves;            // 25 number of fBm octaves
+    float Frequency;         // 26 LUT units per metre: 1 / (16 x HeightNoiseStamp.FeatureSize)
+    float Amplitude;         // 27 output amplitude, normalized to MaxHeight
+    float Lacunarity;        // 28 per-octave frequency multiplier
+    float Persistence;       // 29 per-octave amplitude decay
+    float OffsetX;           // 30 metres the pattern is panned by
+    float OffsetZ;           // 31
+    uint NoiseSeed;          // 32 seed for noise permutation
+    uint TerraceSteps;       // 33 0=disabled, N = number of terrace shelves
+    float TerraceSmoothness; // 34 0=sharp, 1=fully rounded transitions
+    float MaskCenterX;       // 35 world X and Z of the radial mask's centre, metres
+    float MaskCenterZ;       // 36
+    float MaskRadius;        // 37 metres, 0 = no mask (the whole terrain)
+    float MaskFalloff;       // 38 mask edge falloff exponent
 
-    // ── Erosion params (CS_ErosionStep, reuses slots 23-28 since never concurrent) ──
-    // RainRate      → slot 23 (Frequency)
-    // SedimentCap   → slot 24 (Amplitude)
-    // DepositionRate→ slot 25 (Lacunarity)
-    // DissolutionRate→slot 26 (Persistence)
-    // Evaporation   → slot 27 (OffsetX)
-    // TalusAngle    → slot 28 (OffsetY)
-    // ThermalRate   → slot 6  (BrushRadius)
-    // Erosion aux UAVs: WaterIdx=slot 2 (StampBufIdx), SedimentIdx=slot 5 (StampCount)
-    // PingPong source SRV: SourceIdx=slot 0
+    float ClearValue;        // 39 what CS_Clear writes: 0 for a bake (TerrainBaker.CheckPageBake fills with another)
 };
 
 SamplerState sampLinear : register(s0);
@@ -92,47 +86,56 @@ float Blend(float prev, float value, uint mode, float opacity)
 
 #include "terrain_grid.hlsli"
 
-// The terrain UV of height sample (x, y): one sample on every vertex, sample i at i / (N - 1), the first and the last on
-// the terrain's edges (terrain_grid.hlsli). Until 2026-11-07, (i + 0.5) / N, between the vertices.
-float2 SampleTerrainUV(uint2 texel, uint w, uint h)
+// The sample this thread bakes: its index in the terrain's grid. False past the box.
+bool RegionSample(uint3 dtid, out uint2 sid)
 {
-    return float2(texel) / float2(w - 1, h - 1);
+    sid = uint2(RegionX, RegionY) + dtid.xy;
+    return dtid.x < RegionW && dtid.y < RegionH;
 }
 
-// ── CS_Clear: Zero the output heightmap ──
+// The terrain UV of height sample (x, y): one sample on every vertex, sample i at i / (N - 1), the first and the last on
+// the terrain's edges (terrain_grid.hlsli). Until 2026-11-07, (i + 0.5) / N, between the vertices.
+float2 SampleTerrainUV(uint2 sid)
+{
+    return float2(sid) / float(GridSamples - 1);
+}
+
+// The world X, Z of height sample (x, y), metres: from its integer index, so every box computes it alike
+float2 SampleWorldXZ(uint2 sid)
+{
+    return float2(OriginX, OriginZ) + float2(sid) * Spacing;
+}
+
+// ── CS_Clear: Zero the box (ClearValue) ──
 [numthreads(8, 8, 1)]
 void CS_Clear(uint3 dtid : SV_DispatchThreadID)
 {
+    uint2 sid;
+    if (!RegionSample(dtid, sid)) return;
     RWTexture2D<float> Output = ResourceDescriptorHeap[OutputIdx];
-    uint w, h;
-    Output.GetDimensions(w, h);
-    if (dtid.x >= w || dtid.y >= h) return;
-    Output[dtid.xy] = 0;
+    Output[sid] = ClearValue;
 }
 
-// ── CS_ImportLayer: Blend a heightmap stretched over the whole terrain ──
-// value = source * Amplitude + BrushTargetHeight (scale and bias, both normalized to MaxHeight). The source is read as
-// a height map is: its first and last samples on the terrain's edges (terrain_grid.hlsli), so one of the terrain's own
-// size imports sample for sample.
+// ── CS_ImportLayer: Blend a heightmap laid over a rectangle of the world ──
+// value = source * ImportScale + ImportBias (scale and bias, both normalized to MaxHeight). The source is read as a
+// height map is: its first and last samples on the rectangle's edges (terrain_grid.hlsli), so one of the terrain's own
+// size laid over the terrain imports sample for sample.
 [numthreads(8, 8, 1)]
 void CS_ImportLayer(uint3 dtid : SV_DispatchThreadID)
 {
+    uint2 sid;
+    if (!RegionSample(dtid, sid)) return;
     RWTexture2D<float> Output = ResourceDescriptorHeap[OutputIdx];
-    uint w, h;
-    Output.GetDimensions(w, h);
-    if (dtid.x >= w || dtid.y >= h) return;
 
     Texture2D<float> Source = ResourceDescriptorHeap[SourceIdx];
     uint sw, sh;
     Source.GetDimensions(sw, sh);
-    float2 uv = TerrainHeightUV(SampleTerrainUV(dtid.xy, w, h), float2(sw, sh));
-    float src = Source.SampleLevel(sampLinear, uv, 0) * Amplitude + BrushTargetHeight;
+    float2 rectUV = (SampleWorldXZ(sid) - float2(ImportMinX, ImportMinZ)) * float2(ImportInvSizeX, ImportInvSizeZ);
+    float src = Source.SampleLevel(sampLinear, TerrainHeightUV(rectUV, float2(sw, sh)), 0) * ImportScale + ImportBias;
 
-    float prev = Output[dtid.xy];
-    Output[dtid.xy] = Blend(prev, src, BlendMode, Opacity);
+    float prev = Output[sid];
+    Output[sid] = Blend(prev, src, BlendMode, Opacity);
 }
-
-#define NoiseLUTIdx ErosionMode
 
 // Sample the tileable noise LUT (R16G16_Float) at a given position.
 // R and G hold two independent noise fields for per-octave decorrelation.
@@ -222,18 +225,18 @@ float fbmNoise(Texture2D<float2> lut, float2 p, uint type, uint octaves,
     #undef OCTAVE_UV
 }
 
+// ── CS_NoiseLayer: fractal noise in world metres (a pattern that stays where it is whatever the terrain's size) ──
 [numthreads(8, 8, 1)]
 void CS_NoiseLayer(uint3 dtid : SV_DispatchThreadID)
 {
+    uint2 sid;
+    if (!RegionSample(dtid, sid)) return;
     RWTexture2D<float> Output = ResourceDescriptorHeap[OutputIdx];
-    uint w, h;
-    Output.GetDimensions(w, h);
-    if (dtid.x >= w || dtid.y >= h) return;
 
     Texture2D<float2> NoiseLUT = ResourceDescriptorHeap[NoiseLUTIdx];
 
-    float2 uv = SampleTerrainUV(dtid.xy, w, h);
-    float2 p = (uv + float2(OffsetX, OffsetY)) * Frequency;
+    float2 world = SampleWorldXZ(sid);
+    float2 p = (world + float2(OffsetX, OffsetZ)) * Frequency;
 
     float noise = fbmNoise(NoiseLUT, p, NoiseType, Octaves, Lacunarity, Persistence, (float)NoiseSeed);
 
@@ -253,268 +256,26 @@ void CS_NoiseLayer(uint3 dtid : SV_DispatchThreadID)
     // ── Spatial mask (radial falloff) ──
     if (MaskRadius > 0.0)
     {
-        float2 delta = uv - float2(MaskCenterX, MaskCenterY);
+        float2 delta = world - float2(MaskCenterX, MaskCenterZ);
         float dist = length(delta);
         float mask = 1.0 - saturate(pow(dist / MaskRadius, MaskFalloff));
         value *= mask;
     }
 
-    float prev = Output[dtid.xy];
-    Output[dtid.xy] = Blend(prev, value, BlendMode, Opacity);
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// CS_ErosionFilter — Single-pass noise-based erosion filter
-// ═══════════════════════════════════════════════════════════════════════════
-//
-// Ported from "Advanced Terrain Erosion Filter" by Rune Skovbo Johansen
-// (https://www.shadertoy.com/view/wXcfWn) — MPL-2.0 licensed.
-//
-// Uses Phacelle Noise to generate gradient-aligned gullies that produce
-// crisp branching patterns in a single dispatch (no iterative simulation).
-//
-// Slot reuse (erosion filter kernels, never concurrent with noise/stamps):
-//   SourceIdx          (0)  → SRV: current baked heightmap
-//   OutputIdx          (1)  → UAV: output heightmap
-//   BrushRadius        (6)  → EF Scale
-//   BrushFalloff       (7)  → EF AssumedSlopeValue
-//   BrushTargetHeight  (8)  → EF AssumedSlopeAmount
-//   Frequency          (23) → EF Strength
-//   Amplitude          (24) → EF GullyWeight
-//   Lacunarity         (25) → EF Detail
-//   Persistence        (26) → EF Lacunarity
-//   OffsetX            (27) → EF Gain
-//   OffsetY            (28) → EF CellScale
-//   NoiseSeed          (29) → EF Octaves (uint)
-//   ErosionMode        (30) → EF Normalization (asfloat)
-//   TerraceSteps       (31) → EF RidgeRounding (asfloat)
-//   TerraceSmoothness  (32) → EF CreaseRounding
-//   MaskCenterX        (33) → EF RoundingInputMult
-//   MaskCenterY        (34) → EF RoundingOctaveMult
-//   MaskRadius         (35) → EF OnsetInput
-//   MaskFalloff        (36) → EF OnsetOctave
-
-// Aliases for readability
-#define EFScale           BrushRadius
-#define EFAssumedVal      BrushFalloff
-#define EFAssumedAmt      BrushTargetHeight
-#define EFStrength        Frequency
-#define EFGullyWeight     Amplitude
-#define EFDetail          Lacunarity
-#define EFLacunarity      Persistence
-#define EFGain            OffsetX
-#define EFCellScale       OffsetY
-#define EFOctaves         NoiseSeed
-#define EFNormalization   asfloat(ErosionMode)
-#define EFRidgeRounding   asfloat(TerraceSteps)
-#define EFCreaseRounding  TerraceSmoothness
-#define EFRoundInputMul   MaskCenterX
-#define EFRoundOctMul     MaskCenterY
-#define EFOnsetInput      MaskRadius
-#define EFOnsetOctave     MaskFalloff
-
-#define EF_TAU 6.28318530717959
-
-// ── Hash function (algebraic, no texture lookups) ──
-float2 ef_hash(float2 x) {
-    const float2 k = float2(0.3183099, 0.3678794);
-    x = x * k + k.yx;
-    return -1.0 + 2.0 * frac(16.0 * k * frac(x.x * x.y * (x.x + x.y)));
-}
-
-// ── Phacelle Noise: directional stripe noise aligned with input vector ──
-// Produces cosine/sine wave pairs blended across Worley-like cells.
-// Copyright (c) 2025 Rune Skovbo Johansen — MPL-2.0
-float4 EF_PhacelleNoise(float2 p, float2 normDir, float freq, float offset, float normalization) {
-    float2 sideDir = normDir.yx * float2(-1.0, 1.0) * freq * EF_TAU;
-    offset *= EF_TAU;
-
-    float2 pInt = floor(p);
-    float2 pFrac = frac(p);
-    float2 phaseDir = 0;
-    float weightSum = 0;
-
-    [unroll]
-    for (int i = -1; i <= 2; i++) {
-        [unroll]
-        for (int j = -1; j <= 2; j++) {
-            float2 gridOffset = float2(i, j);
-            float2 gridPoint = pInt + gridOffset;
-            float2 randomOffset = ef_hash(gridPoint) * 0.5;
-            float2 vectorFromCellPoint = pFrac - gridOffset - randomOffset;
-
-            float sqrDist = dot(vectorFromCellPoint, vectorFromCellPoint);
-            float weight = exp(-sqrDist * 2.0);
-            weight = max(0.0, weight - 0.01111);
-            weightSum += weight;
-
-            float waveInput = dot(vectorFromCellPoint, sideDir) + offset;
-            phaseDir += float2(cos(waveInput), sin(waveInput)) * weight;
-        }
-    }
-
-    float2 interpolated = phaseDir / weightSum;
-    float magnitude = sqrt(dot(interpolated, interpolated));
-    magnitude = max(1.0 - normalization, magnitude);
-    return float4(interpolated / magnitude, sideDir);
-}
-
-// ── Helper functions ──
-
-float ef_pow_inv(float t, float power) {
-    return 1.0 - pow(1.0 - saturate(t), power);
-}
-
-float ef_ease_out(float t) {
-    float v = 1.0 - saturate(t);
-    return 1.0 - v * v;
-}
-
-float ef_smooth_start(float t, float smoothing) {
-    if (t >= smoothing)
-        return t - 0.5 * smoothing;
-    return 0.5 * t * t / smoothing;
-}
-
-float2 ef_safe_normalize(float2 n) {
-    float l = length(n);
-    return (abs(l) > 1e-10) ? (n / l) : n;
-}
-
-// ── Advanced Terrain Erosion Filter ──
-// Copyright (c) 2025 Rune Skovbo Johansen — MPL-2.0
-//
-// Returns float4(heightDelta, slopeDelta.xy, magnitude).
-float4 EF_ErosionFilter(
-    float2 p, float3 heightAndSlope, float fadeTarget,
-    float strength, float gullyWeight, float detail,
-    float4 rounding, float2 onset, float2 assumedSlope,
-    float scale, uint octaves, float lacunarity,
-    float gain, float cellScale, float normalization
-) {
-    strength *= scale;
-    fadeTarget = clamp(fadeTarget, -1.0, 1.0);
-
-    float3 inputHeightAndSlope = heightAndSlope;
-    float freq = 1.0 / (scale * cellScale);
-    float slopeLength = max(length(heightAndSlope.yz), 1e-10);
-    float magnitude = 0.0;
-    float roundingMult = 1.0;
-
-    float roundingForInput = lerp(rounding.y, rounding.x, saturate(fadeTarget + 0.5)) * rounding.z;
-    float combiMask = ef_ease_out(ef_smooth_start(slopeLength * onset.x, roundingForInput * onset.x));
-
-    // Gully slope: mix of actual slope and assumed slope
-    float2 gullySlope = lerp(heightAndSlope.yz,
-        heightAndSlope.yz / slopeLength * assumedSlope.x, assumedSlope.y);
-
-    for (uint i = 0; i < octaves && i < 8; i++) {
-        float4 phacelle = EF_PhacelleNoise(p * freq, ef_safe_normalize(gullySlope),
-            cellScale, 0.25, normalization);
-        phacelle.zw *= -freq;
-        float sloping = abs(phacelle.y);
-
-        // Add normalized slope for gully direction (straight gullies technique)
-        gullySlope += sign(phacelle.y) * phacelle.zw * strength * gullyWeight;
-
-        // Gullies: height offset (x) and derivative (yz)
-        float3 gullies = float3(phacelle.x, phacelle.y * phacelle.zw);
-        // Fade towards fadeTarget based on combiMask
-        float3 fadedGullies = lerp(float3(fadeTarget, 0, 0), gullies * gullyWeight, combiMask);
-        heightAndSlope += fadedGullies * strength;
-        magnitude += strength;
-
-        // Update fadeTarget for next octave (stacked fading)
-        fadeTarget = fadedGullies.x;
-
-        // Update mask with this octave's ridge/crease contribution
-        float roundingForOctave = lerp(rounding.y, rounding.x,
-            saturate(phacelle.x + 0.5)) * roundingMult;
-        float newMask = ef_ease_out(ef_smooth_start(sloping * onset.y,
-            roundingForOctave * onset.y));
-        combiMask = ef_pow_inv(combiMask, detail) * newMask;
-
-        // Prepare next octave
-        strength *= gain;
-        freq *= lacunarity;
-        roundingMult *= rounding.w;
-    }
-
-    float3 heightAndSlopeDelta = heightAndSlope - inputHeightAndSlope;
-    return float4(heightAndSlopeDelta, magnitude);
-}
-
-// ── CS_ErosionFilter: Single-dispatch erosion filter applied to baked heightmap ──
-[numthreads(8, 8, 1)]
-void CS_ErosionFilter(uint3 dtid : SV_DispatchThreadID)
-{
-    RWTexture2D<float> Output = ResourceDescriptorHeap[OutputIdx];
-    uint w, h;
-    Output.GetDimensions(w, h);
-    if (dtid.x >= w || dtid.y >= h) return;
-
-    Texture2D<float> Source = ResourceDescriptorHeap[SourceIdx];
-    float2 uv = (float2(dtid.xy) + 0.5) / float2(w, h);
-    float2 texel = 1.0 / float2(w, h);
-
-    // Sample height and compute gradient via finite differences
-    float hC = Source.SampleLevel(sampLinear, uv, 0);
-    float hL = Source.SampleLevel(sampLinear, uv - float2(texel.x, 0), 0);
-    float hR = Source.SampleLevel(sampLinear, uv + float2(texel.x, 0), 0);
-    float hD = Source.SampleLevel(sampLinear, uv - float2(0, texel.y), 0);
-    float hU = Source.SampleLevel(sampLinear, uv + float2(0, texel.y), 0);
-    float2 gradient = float2(hR - hL, hU - hD) * 0.5 / texel;
-
-    // heightAndSlope: (height, dh/dx, dh/dy)
-    float3 heightAndSlope = float3(hC, gradient);
-
-    // Fade target: map height [0,1] → [-1,1] (valleys→peaks)
-    float fadeTarget = clamp(hC * 2.0 - 1.0, -1.0, 1.0);
-
-    // Rounding: (ridgeRounding, creaseRounding, inputMult, octaveMult)
-    float4 rounding = float4(EFRidgeRounding, EFCreaseRounding, EFRoundInputMul, EFRoundOctMul);
-    float2 onset = float2(EFOnsetInput, EFOnsetOctave);
-    float2 assumedSlope = float2(EFAssumedVal, EFAssumedAmt);
-
-    // Run the erosion filter
-    float4 erosion = EF_ErosionFilter(
-        uv, heightAndSlope, fadeTarget,
-        EFStrength, EFGullyWeight, EFDetail,
-        rounding, onset, assumedSlope,
-        EFScale, EFOctaves, EFLacunarity,
-        EFGain, EFCellScale, EFNormalization
-    );
-
-    // erosion.x = height delta, erosion.w = magnitude
-    // Offset to preserve peaks/valleys: raise valleys, lower peaks
-    float offset = -fadeTarget * erosion.w;
-    float eroded = hC + erosion.x + offset;
-
-    float prev = Output[dtid.xy];
-    Output[dtid.xy] = Blend(prev, eroded, BlendMode, Opacity);
+    float prev = Output[sid];
+    Output[sid] = Blend(prev, value, BlendMode, Opacity);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
 // CS_InfluenceLayer — Applies terrain influences (roads, rivers, buildings)
 // ═══════════════════════════════════════════════════════════════════════════
 //
-// Push constant slot reuse (influence kernel, never concurrent with noise/erosion):
-//   OutputIdx     (1)  → UAV: output heightmap
-//   StampBufIdx   (2)  → SRV: StructuredBuffer<HeightStampDescriptor> (every run of this bake)
-//   StampCount    (5)  → number of descriptors in this run
-//   StampStart    (20) → first descriptor of this run
-//   BrushRadius   (6)  → SRV: StructuredBuffer<StampSplinePoint> (spline data)
-//   NOTE: BrushRadius is repurposed as a uint (bindless index) via asuint/asfloat.
-//         The kernel reads it as SplineBufIdx below.
-
-// Alias push constant slots for readability
-#define StampDescBufIdx  StampBufIdx
-#define StampDescCount   StampCount
-#define SplineBufIdx     asuint(BrushRadius)
+// One run of HeightStamps over one page: the page's stamp list holds, in bake order, the descriptors whose bounds
+// reach the page (TerrainBaker.BuildPageLists); this run's are entries ListStart .. ListStart + ListCount of it.
 
 #include "terrain_stamp_common.hlsli"
 
-// Per-stamp descriptor (matches C# HeightStampDescriptorGPU, 104 bytes)
+// Per-stamp descriptor (matches C# HeightStampDescriptorGPU, 132 bytes)
 struct HeightStampDescriptor
 {
     float2 Center;             // terrain UV center (radial mode)
@@ -561,21 +322,21 @@ float RidgeRelief(HeightStampDescriptor stamp, float2 uv)
 [numthreads(8, 8, 1)]
 void CS_InfluenceLayer(uint3 dtid : SV_DispatchThreadID)
 {
+    uint2 sid;
+    if (!RegionSample(dtid, sid)) return;
     RWTexture2D<float> Output = ResourceDescriptorHeap[OutputIdx];
-    uint w, h;
-    Output.GetDimensions(w, h);
-    if (dtid.x >= w || dtid.y >= h) return;
 
-    StructuredBuffer<HeightStampDescriptor> Stamps = ResourceDescriptorHeap[StampDescBufIdx];
+    StructuredBuffer<HeightStampDescriptor> Stamps = ResourceDescriptorHeap[StampBufIdx];
+    StructuredBuffer<uint> StampList = ResourceDescriptorHeap[StampListIdx];
     StructuredBuffer<StampSplinePoint> SplinePoints = ResourceDescriptorHeap[SplineBufIdx];
 
-    float2 uv = SampleTerrainUV(dtid.xy, w, h);
-    float currentHeight = Output[dtid.xy];
+    float2 uv = SampleTerrainUV(sid);
+    float currentHeight = Output[sid];
     bool modified = false;
 
-    for (uint i = StampStart; i < StampStart + StampDescCount; i++)
+    for (uint j = ListStart; j < ListStart + ListCount; j++)
     {
-        HeightStampDescriptor stamp = Stamps[i];
+        HeightStampDescriptor stamp = Stamps[StampList[j]];
         // Out of the stamp's reach: skip it without walking its spline
         if (any(uv < stamp.BoundsMin) || any(uv > stamp.BoundsMax)) continue;
 
@@ -641,5 +402,5 @@ void CS_InfluenceLayer(uint3 dtid : SV_DispatchThreadID)
     }
 
     if (modified)
-        Output[dtid.xy] = currentHeight;
+        Output[sid] = currentHeight;
 }

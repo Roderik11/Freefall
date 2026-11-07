@@ -633,11 +633,19 @@ namespace Freefall.Components
                     heightPlan = _baker.PrepareHeight(Terrain, this);
             }
             bool hasHeightWork = heightPlan is { HasWork: true };
+            (int px0, int py0, int px1, int py1)? heightPages = null;
             if (heightBake)
             {
                 // A bake nobody gave a region for (first bake, terrain settings) may change anything
-                if (!_heightRegionMarked) _heightChangeAll = true;
+                if (!_heightRegionMarked) { _heightChangeAll = true; _heightBakeAll = true; }
                 _heightRegionMarked = false;
+
+                // The pages where the stamps changed since the last bake was laid out, or all of them
+                if (heightPlan != null && !_heightBakeAll && _heightBakeMax.X >= _heightBakeMin.X)
+                    heightPages = heightPlan.PagesOf(_heightBakeMin, _heightBakeMax);
+                _heightBakeAll = false;
+                _heightBakeMin = new Vector2(float.MaxValue);
+                _heightBakeMax = new Vector2(float.MinValue);
             }
 
             // The first bake of this renderer, of a map that is already right: keep it
@@ -695,12 +703,14 @@ namespace Freefall.Components
                 var terrain = Terrain;
                 var plan = heightPlan!;
                 var renderer = this;
+                var pages = heightPages;
+                HeightBakePages = pages is { } p ? (p.px1 - p.px0) * (p.py1 - p.py0) : plan.Pages * plan.Pages;
                 System.Threading.Interlocked.Increment(ref _heightBakesPending);
                 CommandBuffer.Enqueue(RenderPass.Opaque, (list) =>
                 {
                     System.Threading.Interlocked.Decrement(ref renderer._heightBakesPending);
                     PixMarker.Begin(list, "Terrain height bake");
-                    baker.BakeHeight(terrain, plan, list);
+                    baker.BakeHeight(terrain, plan, list, pages);
                     PixMarker.End(list);
                     terrain.HeightmapStampsHash = plan.Hash;
                     _heightRangePyramidBuilt = false; // force rebuild with new heights
@@ -3032,6 +3042,37 @@ namespace Freefall.Components
         [Reflection.DontSerialize]
         public long SplatBakeTexels { get; private set; }
 
+        /// <summary>Diagnostics: height pages the last height bake went over (all of them, or a local edit's).</summary>
+        [Reflection.DontSerialize]
+        public int HeightBakePages { get; private set; }
+
+        /// <summary>Diagnostics: what the last Check Page Bake found.</summary>
+        [Reflection.DontSerialize]
+        public string PageBakeCheck { get; private set; } = "";
+
+        /// <summary>
+        /// Bake the heights three ways and compare them sample by sample with each other and with the map in place
+        /// (TerrainBaker.CheckPageBake): every stamp over the whole map, every page at once with its own stamps, and page
+        /// after page alone. They must be equal to the bit (TERRAIN_PAGES_PLAN.md stage 3); the map in place too, after
+        /// edits that rebaked only their pages. Blocks for the bakes.
+        /// </summary>
+        [Button("Check Page Bake")]
+        [System.ComponentModel.Description("Bake the heights over the whole map and page by page, and compare them sample by sample")]
+        public void CheckPageBake()
+        {
+            if (Terrain == null) return;
+            var plan = _baker.PrepareHeight(Terrain, this);
+            var (inPlace, bDiffers, cDiffers, maxStep, aMs, bMs) = _baker.CheckPageBake(Terrain, plan);
+            int pages = plan.Pages * plan.Pages;
+            PageBakeCheck = (inPlace == 0 && bDiffers == 0 && cDiffers == 0 ? "equal" : "DIFFERENT") +
+                            $": {pages} pages; against every stamp over the whole map, {inPlace} samples of the map in place " +
+                            $"differ, all pages at once {bDiffers}, page by page {cDiffers}" +
+                            (maxStep > 0 ? $" (up to {maxStep} steps of 65535)" : "") +
+                            $"; whole map with every stamp {aMs:0.0} ms, pages with their own {bMs:0.0} ms (on the queue, " +
+                            "less a copy alone)";
+            Debug.LogAlways($"[Terrain] '{Terrain.Name}' page bake check: {PageBakeCheck}");
+        }
+
         // ── Changed region ──
         // Listeners of TerrainHeightsChanged (PCG, surface meshes) only rebuild if they touch the region the
         // stamps changed: where each edited stamp was at the last readback, plus where it is now.
@@ -3100,6 +3141,12 @@ namespace Freefall.Components
         private Vector2 _heightChangeMin = new(float.MaxValue);
         private Vector2 _heightChangeMax = new(float.MinValue);
 
+        // The pages the next height bake goes over: where stamps changed since the last bake was laid out. The readback's
+        // region above gathers until the heights are read back, over several bakes while a stamp is dragged.
+        private bool _heightBakeAll = true;
+        private Vector2 _heightBakeMin = new(float.MaxValue);
+        private Vector2 _heightBakeMax = new(float.MinValue);
+
         private static bool TryGetStampRegion(TerrainStamp stamp, out Vector2 min, out Vector2 max)
         {
             min = max = default;
@@ -3107,6 +3154,9 @@ namespace Freefall.Components
             // (its spline may already be gone with it): only where it was counts
             if (stamp.IsGlobal || stamp.IsDestroyed) return false;
             if (stamp.IsSplineMode && stamp.GetSpline().Points.Count < 2) return false;
+            // Nor does a stamp covering what lies beyond its outline (the seabed): its spline's box is where it is not
+            if (stamp is HeightStamp { Outside: true, IsSplineMode: true } outside && outside.GetSpline() is { Closed: true })
+                return false;
 
             var bounds = stamp.GetWorldBounds();
             float pad = 2f + (stamp.EnableNoise ? stamp.NoiseAmplitude : 0f);
@@ -3119,6 +3169,8 @@ namespace Freefall.Components
         {
             _heightChangeMin = Vector2.Min(_heightChangeMin, min);
             _heightChangeMax = Vector2.Max(_heightChangeMax, max);
+            _heightBakeMin = Vector2.Min(_heightBakeMin, min);
+            _heightBakeMax = Vector2.Max(_heightBakeMax, max);
         }
 
         /// <summary>Where a changed local stamp was and is: the region the height readback reports and the splat bake redoes.</summary>
@@ -3145,6 +3197,7 @@ namespace Freefall.Components
             else
             {
                 _heightChangeAll = true;
+                _heightBakeAll = true;
                 Terrain?.MarkForUpdate(TerrainDirtyFlags.SplatPack);
             }
         }
@@ -3154,7 +3207,6 @@ namespace Freefall.Components
             _stampRegions.Clear();
             foreach (var stamp in ComponentCache<HeightStamp>.All) Snapshot(stamp);
             foreach (var stamp in ComponentCache<HeightNoiseStamp>.All) Snapshot(stamp);
-            foreach (var stamp in ComponentCache<HeightErosionStamp>.All) Snapshot(stamp);
             foreach (var stamp in ComponentCache<SplatStamp>.All) Snapshot(stamp);
             foreach (var stamp in ComponentCache<DecoStamp>.All) Snapshot(stamp);
 

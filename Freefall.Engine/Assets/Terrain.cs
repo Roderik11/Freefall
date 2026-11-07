@@ -257,6 +257,13 @@ namespace Freefall.Assets
         /// <summary>Quads along a side of the quadtree's patch (33 × 33 vertices): a leaf node spans this many vertices.</summary>
         public const int PatchQuads = 32;
 
+        /// <summary>
+        /// Cells along a side of a page, whatever the density (TERRAIN_PAGES_PLAN.md "Pages"): 256 m at 1 m per vertex. The
+        /// height bake goes page by page (TerrainBaker.HeightPlan): page p holds samples p × PageCells up to the next
+        /// page's first, the last page in a row also the terrain's far edge.
+        /// </summary>
+        public const int PageCells = 256;
+
         /// <summary>0.5, 1 or 2.</summary>
         public static float DensityValue(TerrainDensity density) => density switch
         {
